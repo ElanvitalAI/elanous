@@ -18,7 +18,7 @@ export const SETUP_LINKS: readonly SetupLinkCard[] = [
   {
     anchor: 'channels',
     label: 'Channels',
-    description: 'Telegram / Discord / Slack 봇 연결',
+    description: 'Telegram / Discord 봇 연결',
     primary: true,
   },
   {

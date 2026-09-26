@@ -79,13 +79,13 @@ describe('planDevPipeline — 순수 정규화/검증/디스패치(계약 SSOT)'
     expect(p).toMatchObject({ completion: 'worktree-only', completionSource: 'default', autoReview: false, autoReviewSource: 'default', dispatch: 'self-mission', wired: true });
   });
 
-  it('self graph authority on/off은 orchestrator 옵션까지 전달하고 생략 시 필드를 만들지 않는다', () => {
-    for (const graphAuthoritative of [true, false]) {
-      const options = toSelfImplementOptions('기능 X', planDevPipeline(T({ self: { graphAuthoritative } })), {} as SelfImplementSeams);
-      expect(options.graphAuthoritative).toBe(graphAuthoritative);
-    }
-    expect(toSelfImplementOptions('기능 X', planDevPipeline(T()), {} as SelfImplementSeams))
-      .not.toHaveProperty('graphAuthoritative');
+  it('self-mission 디스패치는 그래프 권위 필드를 전달하지 않는다', async () => {
+    let received: SelfImplementOptions | undefined;
+    await runDevPipeline(T(), {
+      buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+      runSelfImplement: async (options) => { received = options; return { ok: true } as SelfImplementResult; },
+    });
+    expect(received).not.toHaveProperty('graphAuthoritative');
   });
 
   it('relaunch 입력은 absent·false·true를 계획까지 바이트 보존한다', () => {

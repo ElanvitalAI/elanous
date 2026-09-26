@@ -223,8 +223,6 @@ describe('diff palette helpers', () => {
       maxLineWidth: 300,
       syntax: true,
       colorTier: '256',
-      adaptiveBg: false,
-      syntaxPerHunk: false,
     });
     expect(variant).toEqual({
       cols: 120,
@@ -233,7 +231,6 @@ describe('diff palette helpers', () => {
       syntax: true,
       colorTier: '256',
       isLight: false,
-      syntaxPerHunk: false,
       inlineWordDiff: false,
     });
   });
@@ -246,10 +243,9 @@ describe('diff palette helpers', () => {
       syntax: true,
       colorTier: 'auto',
       isLight: false,
-      syntaxPerHunk: true,
       inlineWordDiff: false,
     });
-    expect(key).toBe('cols:80|no:1|max:2000|syn:1|tier:auto|light:0|perHunk:1|wd:0');
+    expect(key).toBe('cols:80|no:1|max:2000|syn:1|tier:auto|light:0|wd:0');
   });
 
   test('inlineWordDiff flag flows into the variant + cache key', () => {
@@ -276,14 +272,14 @@ describe('diff render cache', () => {
   );
 
   test('re-rendering the same hunk and variant records a cache hit', () => {
-    renderEditBlock(result, { noColor: true, cache: true, cols: 80 });
+    renderEditBlock(result, { noColor: true, cols: 80 });
     expect(_getDiffRenderCacheStatsForTesting()).toEqual({
       hits: 0,
       misses: 1,
       evictions: 0,
     });
 
-    renderEditBlock(result, { noColor: true, cache: true, cols: 80 });
+    renderEditBlock(result, { noColor: true, cols: 80 });
     expect(_getDiffRenderCacheStatsForTesting()).toEqual({
       hits: 1,
       misses: 1,
@@ -292,8 +288,8 @@ describe('diff render cache', () => {
   });
 
   test('variant changes produce cache misses instead of stale reuse', () => {
-    renderEditBlock(result, { noColor: true, cache: true, cols: 80 });
-    renderEditBlock(result, { noColor: true, cache: true, cols: 120 });
+    renderEditBlock(result, { noColor: true, cols: 80 });
+    renderEditBlock(result, { noColor: true, cols: 120 });
     expect(_getDiffRenderCacheStatsForTesting()).toEqual({
       hits: 0,
       misses: 2,
@@ -303,14 +299,14 @@ describe('diff render cache', () => {
 
   test('bounded cache evicts the oldest variant after the cap', () => {
     const widths = [60, 70, 80, 90, 100];
-    for (const cols of widths) renderEditBlock(result, { noColor: true, cache: true, cols });
+    for (const cols of widths) renderEditBlock(result, { noColor: true, cols });
     expect(_getDiffRenderCacheStatsForTesting()).toEqual({
       hits: 0,
       misses: 5,
       evictions: 1,
     });
 
-    renderEditBlock(result, { noColor: true, cache: true, cols: 60 });
+    renderEditBlock(result, { noColor: true, cols: 60 });
     expect(_getDiffRenderCacheStatsForTesting()).toEqual({
       hits: 0,
       misses: 6,
@@ -325,9 +321,9 @@ describe('renderEditBlock — inlineWordDiff (Phase 5)', () => {
       oldStart: 1, oldLines: 1, newStart: 1, newLines: 1,
       lines: ['-const x = 1;', '+const x = 2;'],
     }]);
-    const rows = renderEditBlock(r, { cache: false });
+    const rows = renderEditBlock(r);
     const joined = rows.join('\n');
-    // No chalk.inverse escape (`\x1b[7m`) anywhere when the option
+    // No chalk.inverse escape (`\x1b[7m`) anywhere when inlineWordDiff
     // is off — the option is strictly additive.
     expect(joined).not.toContain('\x1b[7m');
   });
@@ -337,7 +333,7 @@ describe('renderEditBlock — inlineWordDiff (Phase 5)', () => {
       oldStart: 1, oldLines: 1, newStart: 1, newLines: 1,
       lines: ['-const x = 1;', '+const x = 2;'],
     }]);
-    const rows = renderEditBlock(r, { cache: false, inlineWordDiff: true });
+    const rows = renderEditBlock(r, { inlineWordDiff: true });
     const joined = rows.join('\n');
     // chalk.bold.inverse = `\x1b[1m\x1b[7m…` — we just assert inverse
     // appears, which only happens on the word-diff path.
@@ -349,7 +345,7 @@ describe('renderEditBlock — inlineWordDiff (Phase 5)', () => {
       oldStart: 1, oldLines: 1, newStart: 1, newLines: 1,
       lines: ['-a', '+b'],
     }]);
-    const rows = renderEditBlock(r, { noColor: true, cache: false, inlineWordDiff: true });
+    const rows = renderEditBlock(r, { noColor: true, inlineWordDiff: true });
     const joined = rows.join('\n');
     expect(joined).not.toContain('\x1b[');
   });
@@ -359,7 +355,7 @@ describe('renderEditBlock — inlineWordDiff (Phase 5)', () => {
       oldStart: 1, oldLines: 2, newStart: 1, newLines: 1,
       lines: ['-a', ' b'],
     }]);
-    const rows = renderEditBlock(r, { cache: false, inlineWordDiff: true });
+    const rows = renderEditBlock(r, { inlineWordDiff: true });
     // Should not throw; output should mention `-` marker and `b`.
     const joined = rows.join('\n');
     expect(joined).toContain('-');

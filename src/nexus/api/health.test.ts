@@ -293,3 +293,28 @@ describe('/v1/health identity', () => {
     expectLegacyPayload(body, state);
   });
 });
+
+describe('/v1/health setup mode', () => {
+  test('mode true 만 setupMode 와 setupMissing 을 싣고, false·없음은 두 칸이 없다', async () => {
+    const state = createNexusState({ nexusVersion: 'test', phase: 'health' });
+    const registry = new TabRegistry(state);
+
+    const on = await healthBody(handleHealth(state, registry, {
+      setup: { mode: true, missing: ['LLM provider'] },
+    }));
+    const off = await healthBody(handleHealth(state, registry, {
+      setup: { mode: false, missing: [] },
+    }));
+    const absent = await healthBody(handleHealth(state, registry));
+
+    expect(on.setupMode).toBe(true);
+    expect(on.setupMissing).toEqual(['LLM provider']);
+    expect(off.setupMode).toBeUndefined();
+    expect(off.setupMissing).toBeUndefined();
+    expect(absent.setupMode).toBeUndefined();
+    expect(absent.setupMissing).toBeUndefined();
+    expectLegacyPayload(on, state);
+    expectLegacyPayload(off, state);
+    expectLegacyPayload(absent, state);
+  });
+});

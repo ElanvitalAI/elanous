@@ -254,7 +254,9 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
     provider: config.provider,
     setSessionId,
     setProvider: (p: string) => setConfig({ provider: p }),
-  }), [client, config.provider, sessionId, setConfig, setSessionId]);
+    daemon: { baseUrl: config.baseUrl, ...(config.token ? { token: config.token } : {}) },
+    messages,
+  }), [client, config.baseUrl, config.provider, config.token, messages, sessionId, setConfig, setSessionId]);
 
   const handleAttached = useCallback((entries: AttachmentMeta[]): void => {
     setPendingAttachments((prev) => [...prev, ...entries]);

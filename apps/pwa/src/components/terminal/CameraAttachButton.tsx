@@ -18,7 +18,7 @@ import { Camera, Loader2 } from 'lucide-react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { toast } from 'sonner';
 import { debugLog } from '@/lib/debug';
-import type { AttachmentMeta } from '@/lib/upload-attachment';
+import { uploadAttachment, type AttachmentMeta } from '@/lib/upload-attachment';
 
 interface Props {
   /** Optional callback when upload succeeds. Caller can promote the
@@ -48,22 +48,19 @@ export function CameraAttachButton({ onAttached }: Props) {
       size: file.size,
       type: file.type,
     });
-    const form = new FormData();
-    form.append('file', file, file.name);
-    form.append('filename', file.name);
     try {
-      const res = await fetch(`${config.baseUrl}/v1/attachments`, {
-        method: 'POST',
-        body: form,
-        ...(config.token ? { headers: { authorization: `Bearer ${config.token}` } } : {}),
+      const result = await uploadAttachment({
+        baseUrl: config.baseUrl,
+        ...(config.token ? { token: config.token } : {}),
+        file,
+        filename: file.name,
       });
-      if (!res.ok) {
-        const detail = await res.text().catch(() => '');
-        debugLog('webterm.attach.error', { status: res.status, detail: detail.slice(0, 200) });
-        toast.error(`업로드 실패 (${res.status})`);
+      if (!result.ok) {
+        debugLog('webterm.attach.error', { status: result.status, detail: result.reason.slice(0, 200) });
+        toast.error(`업로드 실패 (${result.status})`);
         return;
       }
-      const meta = (await res.json()) as AttachmentMeta;
+      const { meta } = result;
       debugLog('webterm.attach.ok', { id: meta.id, size: meta.size });
       toast.success(`📎 ${meta.filename} (${(meta.size / 1024).toFixed(1)} kB)`);
       onAttached?.(meta);

@@ -86,8 +86,6 @@ export interface DevSelfOpts {
   naturalLanguageDispatch?: boolean;
   /** 호출 단위 구현 자식 두뇌(provider/model 원자 선택). 미지정 시 orchestrator 기본·승격 티어를 보존한다. */
   childLlm?: ChildLlmSelection;
-  /** 런 단위 graph authority override. 미지정이면 orchestrator가 config를 해석한다. */
-  graphAuthoritative?: boolean;
   /** Optional opaque ID for joining this request with correlated execution records. */
   correlationId?: string;
   /** Optional opaque ID for the parent correlation in a nested request. */
@@ -585,7 +583,6 @@ export function toSelfImplementOptions(text: string, plan: ResolvedDevPlan, seam
     ...(s.naturalLanguageDispatch ? { naturalLanguageDispatch: true } : {}),
     ...(s.childLlm ? { childLlm: s.childLlm } : {}),
     ...(s.correlationId !== undefined ? { correlationId: s.correlationId } : {}),
-    ...(s.graphAuthoritative !== undefined ? { graphAuthoritative: s.graphAuthoritative } : {}),
     ...(s.branchName ? { branchName: s.branchName } : {}),
     ...(s.maxReworkRounds !== undefined ? { maxReworkRounds: s.maxReworkRounds } : {}),
   };

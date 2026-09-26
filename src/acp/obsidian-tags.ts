@@ -56,7 +56,10 @@ export interface FindTagsOpts {
  * also excludes a leading `#` immediately before our `#` to keep
  * headings out (regex starts with `(?<![A-Za-z0-9_/#])`).
  */
-export const TAG_PATTERN = String.raw`(?<![A-Za-z0-9_/#])#[A-Za-z][A-Za-z0-9_/-]*`;
+// 문자는 유니코드(\p{L}) — 한글 태그 `#시험`·`#AI요약` 을 영문만 보던 옛 패턴이 조용히 버렸다(2026-09-26 격리 PWA 실측).
+// rg(Rust regex)는 \p{} 를 그대로 받는다 · JS 에서 쓸 땐 `u` 플래그가 필요하다.
+export const TAG_PATTERN = String.raw`(?<![\p{L}\p{N}_/#])#\p{L}[\p{L}\p{N}_/-]*`;
+const TAG_BODY = /^\p{L}[\p{L}\p{N}_/-]*$/u;
 
 /**
  * Skip strings that aren't really tags even after pattern match:
@@ -70,7 +73,7 @@ function isValidTag(tag: string): boolean {
   if (tag.length < 2) return false;
   // Trim a trailing slash (`#foo/` → `foo` — Obsidian normalises away
   // the dangling separator).
-  return /^[A-Za-z][A-Za-z0-9_/-]*$/.test(tag);
+  return TAG_BODY.test(tag);
 }
 
 const SKIP_DIR_NAMES = new Set(['node_modules', '.git', '.obsidian', '.trash']);
@@ -142,7 +145,7 @@ export function extractFrontmatterTags(content: string): string[] {
     // unusual frontmatter shapes and the spec doesn't define merge.
     break;
   }
-  return tags.filter(t => /^[A-Za-z][A-Za-z0-9_/-]*$/.test(t));
+  return tags.filter(t => TAG_BODY.test(t));
 }
 
 /** C5 — walk the vault, read each .md file's frontmatter, populate

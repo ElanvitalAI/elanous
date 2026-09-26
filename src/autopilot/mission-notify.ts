@@ -6,6 +6,7 @@
 // (caller 가 sendOutbound 폴백). 봇 토큰은 저장 안 하고 config 에서만 읽는다.
 
 import { getUserConfig } from '../user-config.js';
+import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { canUseUxAgent } from '../ux/ux-config.js';
 import { notifyMissionHitlViaUx } from './mission-ux-live.js';
 import { spawnSync } from 'node:child_process';
@@ -41,12 +42,13 @@ export function resolveTelegramBotToken(botId?: string): string | null {
       testChannel?: { botToken?: string };
     } | undefined;
     if (!tg) return null;
-    const candidates = [tg.botToken, tg.reportChannel?.botToken, tg.testChannel?.botToken]
+    const mainToken = resolveChannelBotToken('telegram', getUserConfig())?.token;
+    const candidates = [mainToken, tg.reportChannel?.botToken, tg.testChannel?.botToken]
       .filter((t): t is string => typeof t === 'string' && t.length > 0);
     if (botId) {
       return candidates.find((t) => t.split(':')[0] === botId) ?? null;
     }
-    return tg.botToken ?? null;
+    return mainToken ?? null;
   } catch { return null; }
 }
 

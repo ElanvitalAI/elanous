@@ -5,12 +5,16 @@
 // tested without re-running the CLI via Bun.spawn.
 
 import { existsSync, readFileSync } from 'node:fs';
+import { defaultAcpTokenPath } from '../nexus/api/connect-info.js';
 import {
   RemotesStore,
   deriveNameFromHost,
   normalizeHost,
   type RemoteEntry,
 } from './remotes.js';
+
+/** 이 기계를 가리키는 주소 — 토큰 파일을 직접 읽어도 되는 경우(같은 uid). */
+const LOOPBACK_BOOTSTRAP_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
 export interface ConnectRemoteOpts {
   host: string;
@@ -24,6 +28,8 @@ export interface ConnectRemoteOpts {
   ping?: boolean;
   /** Test seam — fetch override. */
   fetchImpl?: typeof fetch;
+  /** Test seam — same-host token file (default `~/.elanous/acp-token`). */
+  localTokenPath?: string;
   /** Test seam — store override (alternate paths). */
   store?: RemotesStore;
   /** Stdout sink (test). */
@@ -95,8 +101,20 @@ export async function connectRemote(opts: ConnectRemoteOpts): Promise<number> {
     token = readFileSync(opts.tokenFile, 'utf-8').trim();
   }
   if (!token && autoToken) {
+    // 옛 서버(원문을 싣던 판)와의 호환 — 새 서버는 늘 null 이다.
     token = autoToken;
     out.log(`auto_token loaded from ${parsed.host} (loopback bootstrap).`);
+  }
+  if (!token && LOOPBACK_BOOTSTRAP_HOSTS.has(parsed.host)) {
+    // 🔐 같은 기계 · 같은 uid — 서버에게 원문을 받지 않고 토큰 파일을 직접 읽는다.
+    const localTokenPath = opts.localTokenPath ?? defaultAcpTokenPath();
+    if (existsSync(localTokenPath)) {
+      const local = readFileSync(localTokenPath, 'utf-8').trim();
+      if (local) {
+        token = local;
+        out.log(`token loaded from ${localTokenPath} (same-host bootstrap).`);
+      }
+    }
   }
   if (!token) {
     out.error(

@@ -256,10 +256,6 @@ describe('mountTailscaleServe — error paths', () => {
 describe('mountTailscaleServe — useSudo opt-out (legacy https-443 path)', () => {
   test('useSudo:false skips sudo wrapper · matches pre-lift defaultServe behavior', async () => {
     const calls: ServeCall[] = [];
-    // We provide a custom serveCmdFn so we can verify the binary
-    // passed in (which is the tailscale path) is invoked directly,
-    // not via sudo. The actual sudo wrapper lives in the default
-    // serveCmdFn — opting out replaces that wrapper.
     await mountTailscaleServe({
       mode: { kind: 'https-443' },
       upstreamPort: 31415,
@@ -267,13 +263,133 @@ describe('mountTailscaleServe — useSudo opt-out (legacy https-443 path)', () =
       probeFn: makeProbe(),
       serveCmdFn: makeServeCmd([{ exitCode: 0 }], calls),
     });
-    // The serveCmdFn seam receives the binary directly + args. Sudo
-    // wrapping is invisible to the seam (it would happen inside the
-    // default serveCmdFn we replaced). So the contract here is that
-    // the helper accepts both seams + opts without throwing — the
-    // sudo wrapping is exercised in the default path test below.
-    expect(calls).toHaveLength(1);
-    expect(calls[0].args[0]).toBe('serve');
+    expect(calls).toEqual([{
+      binary: 'tailscale', args: ['serve', '--bg', '--https=443', 'http://localhost:31415'],
+    }]);
+  });
+});
+
+describe('mutation privilege fallback', () => {
+  const mountOpts = { mode: { kind: 'tls-tcp' as const, port: 31420 }, upstreamPort: 31420, probeFn: makeProbe() };
+  const offArgs = ['serve', '--tls-terminated-tcp', '31420', 'off'];
+  const onArgs = ['serve', '--bg', '--tls-terminated-tcp', '31420', 'tcp://localhost:31420'];
+
+  test('mount succeeds directly without invoking sudo', async () => {
+    const calls: ServeCall[] = [];
+    const result = await mountTailscaleServe({ ...mountOpts, serveCmdFn: makeServeCmd([{ exitCode: 0 }], calls) });
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual([{ binary: 'tailscale', args: onArgs }]);
+  });
+
+  test('mount retries once with sudo -n only after a permission error', async () => {
+    const calls: ServeCall[] = [];
+    const result = await mountTailscaleServe({
+      ...mountOpts,
+      serveCmdFn: makeServeCmd([{ exitCode: 1, stderr: 'permission denied' }, { exitCode: 0 }], calls),
+    });
+    expect(result.ok).toBe(true);
+    expect(calls).toEqual([
+      { binary: 'tailscale', args: onArgs },
+      { binary: 'sudo', args: ['-n', 'tailscale', ...onArgs] },
+    ]);
+  });
+
+  test('mount preserves failure reasons and never escalates unrelated errors', async () => {
+    for (const [responses, reason, count] of [
+      [[{ exitCode: 2, stderr: 'serve already running' }], 'serve-cmd-failed', 1],
+      [[{ exitCode: 1, stderr: 'operation not permitted' }, { exitCode: 1, stderr: 'sudo: a password is required' }], 'sudo-required', 2],
+    ] as const) {
+      const calls: ServeCall[] = [];
+      const result = await mountTailscaleServe({ ...mountOpts, serveCmdFn: makeServeCmd([...responses], calls) });
+      expect(result.reason).toBe(reason);
+      expect(calls).toHaveLength(count);
+    }
+  });
+
+  test('swap retries only the permission-denied prior-port off before mounting', async () => {
+    writeFileSync(statePath, JSON.stringify({ version: 1, mode: { kind: 'tls-tcp', port: 31420 }, upstreamPort: 31420 }));
+    const calls: ServeCall[] = [];
+    const result = await mountTailscaleServe({
+      mode: { kind: 'tls-tcp', port: 31421 }, upstreamPort: 31421, statePath, probeFn: makeProbe(),
+      serveCmdFn: makeServeCmd([{ exitCode: 1, stderr: 'access denied' }, { exitCode: 0 }, { exitCode: 0 }], calls),
+    });
+    expect(result.swappedFrom?.mode).toEqual({ kind: 'tls-tcp', port: 31420 });
+    expect(calls).toEqual([
+      { binary: 'tailscale', args: offArgs },
+      { binary: 'sudo', args: ['-n', 'tailscale', ...offArgs] },
+      { binary: 'tailscale', args: ['serve', '--bg', '--tls-terminated-tcp', '31421', 'tcp://localhost:31421'] },
+    ]);
+  });
+
+  test('explicit useSudo true invokes sudo immediately; false never retries', async () => {
+    const sudoCalls: ServeCall[] = [];
+    const sudoResult = await mountTailscaleServe({
+      ...mountOpts, useSudo: true, serveCmdFn: makeServeCmd([{ exitCode: 0 }], sudoCalls),
+    });
+    expect(sudoResult.ok).toBe(true);
+    expect(sudoCalls).toEqual([{ binary: 'sudo', args: ['-n', 'tailscale', ...onArgs] }]);
+
+    const directCalls: ServeCall[] = [];
+    const directResult = await mountTailscaleServe({
+      ...mountOpts, useSudo: false,
+      serveCmdFn: makeServeCmd([{ exitCode: 1, stderr: 'permission denied' }], directCalls),
+    });
+    expect(directResult.reason).toBe('serve-cmd-failed');
+    expect(directCalls).toEqual([{ binary: 'tailscale', args: onArgs }]);
+  });
+
+  test('port-specific unmount tries direct then sudo once; preserves sudo-required and state', async () => {
+    writeFileSync(statePath, JSON.stringify({ version: 1, mode: mountOpts.mode, upstreamPort: 31420 }));
+    const calls: ServeCall[] = [];
+    const opts = { mode: mountOpts.mode, upstreamPort: 31420, statePath, probeFn: makeProbe() };
+    const failed = await unmountTailscaleServe({
+      ...opts,
+      serveCmdFn: makeServeCmd([{ exitCode: 1, stderr: 'EPERM' }, { exitCode: 1, stderr: 'sudo: a password is required' }], calls),
+    });
+    expect(failed.reason).toBe('sudo-required');
+    expect(existsSync(statePath)).toBe(true);
+    expect(calls).toEqual([
+      { binary: 'tailscale', args: offArgs },
+      { binary: 'sudo', args: ['-n', 'tailscale', ...offArgs] },
+    ]);
+    const successCalls: ServeCall[] = [];
+    const success = await unmountTailscaleServe({
+      ...opts, serveCmdFn: makeServeCmd([{ exitCode: 0 }], successCalls),
+    });
+    expect(success.ok).toBe(true);
+    expect(successCalls).toEqual([{ binary: 'tailscale', args: offArgs }]);
+    expect(existsSync(statePath)).toBe(false);
+  });
+
+  test('ghost port removal retries only its off command, not read-only status', async () => {
+    const calls: ServeCall[] = [];
+    const result = await cleanGhostTailscaleServe({
+      port: 31420, probeFn: makeProbe(),
+      socketTableFn: async () => '',
+      serveCmdFn: makeServeCmd([
+        { exitCode: 0, stdout: JSON.stringify({ TCP: { '31420': {} } }) },
+        { exitCode: 1, stderr: 'permission denied' },
+        { exitCode: 0 },
+      ], calls),
+    });
+    expect(result.reason).toBe('cleaned');
+    expect(calls).toEqual([
+      { binary: 'tailscale', args: ['serve', 'status', '--json'] },
+      { binary: 'tailscale', args: offArgs },
+      { binary: 'sudo', args: ['-n', 'tailscale', ...offArgs] },
+    ]);
+  });
+
+  test('port-specific unmount does not retry unrelated failure or explicit false', async () => {
+    for (const [useSudo, stderr] of [[undefined, 'mapping not found'], [false, 'permission denied']] as const) {
+      const calls: ServeCall[] = [];
+      const result = await unmountTailscaleServe({
+        mode: mountOpts.mode, upstreamPort: 31420, probeFn: makeProbe(), useSudo,
+        serveCmdFn: makeServeCmd([{ exitCode: 2, stderr }], calls),
+      });
+      expect(result.reason).toBe('serve-cmd-failed');
+      expect(calls).toEqual([{ binary: 'tailscale', args: offArgs }]);
+    }
   });
 });
 

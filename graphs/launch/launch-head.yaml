@@ -1,0 +1,66 @@
+# 🧭 발사 앞 공통 머리 — 표준 가족(엘라누스 개발 하니스 · 제너럴 개발 · 복합형) «전부»의 entry 앞에 붙는다
+#
+# 대표 2026-09-26: *"capability 가 풀로 필요하면 → 로드밸런서 판단 노드가 앞 → 예산 판단 → 실행 공간 분배"* ·
+#   *"멀티 머신이 등록됐을 때만 부하분산 로직이 켜진다"* · *"이 분산이 관제 통합이 나서는 자리"*.
+# 📄 설계 = 🅢 채널 #16815(20:0x) ⊕ 🅣 답(20:1x) · 우산 RFC one-loop-engine §3.6(예산 게이트) · RFC 관제 평면(대장·임대)
+# 🧩 노드 recipe 는 전부 카탈로그 역할 — graphs/catalog/catalog.yaml · 소유: capability-check·load-balance·place = 🅢 · budget-gate = 🅣
+# ⚠️ 이 판은 «선언»이다 — 몸은 소유 트랙이 짓는다(역할마다 «신설»). 러너가 걷는 것은 C3 뒤.
+# ⭐ 되돌아가는 간선 하나만: budget-gate:next-provider → load-balance(프로바이더가 기계에 매인 경우만 순위가 바뀐다 · max_visits 2)
+graph_id: launch-head
+version: 1
+entry_node: capability
+terminal_nodes: [done, failed]
+
+nodes:
+  - node_id: capability
+    kind: judge
+    recipe: capability-check
+    max_visits: 1
+  - node_id: balance
+    kind: judge
+    recipe: load-balance
+    max_visits: 2
+  - node_id: budget
+    kind: judge
+    recipe: budget-gate
+    max_visits: 3
+  - node_id: split
+    kind: judge
+    recipe: decompose            # 조각마다 머리를 다시 탄다(조각이 작아지면 다른 칸이 맞을 수 있다)
+    max_visits: 1
+  - node_id: wait
+    kind: hitl
+    recipe: approval             # 리셋까지 기다림 — 사람 판단이 아니라 «대기 표시»(태세 «경계»와 같은 뜻 · defer)
+    max_visits: 1
+  - node_id: place
+    kind: judge
+    recipe: place
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    recipe: none
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    recipe: none
+    max_visits: 1
+
+edges:
+  - from: capability
+    on: outcome
+    map: { local-only: place, any: balance }
+  - from: balance
+    on: outcome
+    map: { ranked: budget, skipped: budget }
+  - from: budget
+    on: outcome
+    map: { proceed: place, decompose: split, wait-reset: wait, next-provider: balance }
+  - from: split
+    on: outcome
+    map: { decomposed: done, single-no-subtasks: place, missing-research-context: failed, grounding-empty: failed, authored-empty: failed, llm-failed: failed }
+  - from: wait
+    on: outcome
+    map: { approved: budget, rejected: failed }
+  - from: place
+    on: outcome
+    map: { placed: done, no-slot: wait }

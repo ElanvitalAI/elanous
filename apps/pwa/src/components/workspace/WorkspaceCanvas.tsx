@@ -13,7 +13,7 @@ import { ChatPanel } from '@/components/chat/ChatPanel';
 import { TerminalPanel } from '@/components/terminal/TerminalPanel';
 // Phase 2 (PWA chat ↔ voice 일원화 · 2026-05-07) — VoicePanel deleted.
 // Voice now folds into ChatLayout via the header mic toggle (Phase 1).
-import { IntakePanel } from '@/components/intake/IntakePanel';
+import { IntakeFrontDoor } from '@/components/intake/IntakeFrontDoor';
 import { TaskManagerPanel } from '@/components/tasks/TaskManagerPanel';
 // Surface-unification v2.2 V2.2-6 (2026-05-11) — SchedulerPanel removed.
 // Scheduling is now a workflow scheduleTrigger node; the dedicated panel
@@ -31,7 +31,7 @@ function PanelForTab({ tab }: { tab: WorkspaceTab }) {
     case 'term':
       return <TerminalPanel />;
     case 'intake':
-      return <IntakePanel />;
+      return <IntakeFrontDoor />;
     case 'tasks':
       return <TaskManagerPanel />;
     case 'control':

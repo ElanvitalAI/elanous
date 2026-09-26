@@ -7,7 +7,6 @@ import { buildUserConfig, resetUserConfig } from '../src/user-config.js';
 import { buildDevCliSpec, type DevCliExecutor } from '../src/self-dev/dev-cli.js';
 import { planDevPipeline, toSelfImplementOptions } from '../src/self-dev/dev-pipeline.js';
 import { runSelfImplement } from '../src/self-implement/orchestrator.js';
-import { parseRunControlValue } from '../src/self-implement/run-controls.js';
 import { seams } from '../src/self-implement/test-seams.js';
 
 const SELF: DevCliExecutor = { kind: 'self' };
@@ -19,7 +18,6 @@ type AuthorityObservation = {
 
 async function runThroughExistingEntry(input: {
   configValue?: boolean;
-  graphFlag?: 'on' | 'off';
   goalType?: 'research';
   changedFiles?: readonly string[];
   runId: string;
@@ -39,14 +37,7 @@ async function runThroughExistingEntry(input: {
     }
     resetUserConfig();
 
-    const parsedFlag = input.graphFlag === undefined
-      ? undefined
-      : parseRunControlValue('graph', input.graphFlag) as boolean;
-    const spec = buildDevCliSpec(
-      { text: 'graph authority execution entry' },
-      SELF,
-      parsedFlag === undefined ? {} : { graph: parsedFlag },
-    );
+    const spec = buildDevCliSpec({ text: 'graph authority execution entry' }, SELF, {});
     const goalFile = input.goalType === undefined
       ? undefined
       : join(configDir, 'GOAL.md');
@@ -91,60 +82,28 @@ describe('graph authority default and source ladder', () => {
     expect(observed.nodeNames).toEqual(['implement', 'gate', 'open-pr']);
   });
 
-  test('default graph authority intentionally skips the gate for research document-only changes, while --graph off preserves it', async () => {
+  test('default graph authority intentionally skips the gate for research document-only changes', async () => {
     const defaultOn = await runThroughExistingEntry({
-      goalType: 'research',
-      changedFiles: ['docs/RESEARCH-x.md'],
-      runId: 'run-graph-default-research-docs',
+      goalType: 'research', changedFiles: ['docs/research.md'], runId: 'run-default-docs-skip',
     });
-    const flagOff = await runThroughExistingEntry({
-      goalType: 'research',
-      graphFlag: 'off',
-      changedFiles: ['docs/RESEARCH-x.md'],
-      runId: 'run-graph-off-research-docs',
-    });
-
     expect(defaultOn.authority).toMatchObject({ graphAuthoritative: true, graphAuthoritativeSource: 'default' });
     expect(defaultOn.gateExecuted).toBe(false);
-    expect(flagOff.authority).toMatchObject({ graphAuthoritative: false, graphAuthoritativeSource: 'flag' });
-    expect(flagOff.gateExecuted).toBe(true);
   });
 
-  test('explicit config on and off survive as distinct config observations', async () => {
-    const enabled = await runThroughExistingEntry({ configValue: true, runId: 'run-graph-config-on' });
-    const disabled = await runThroughExistingEntry({ configValue: false, runId: 'run-graph-config-off' });
-    expect(enabled.authority).toMatchObject({ graphAuthoritative: true, graphAuthoritativeSource: 'config' });
-    expect(disabled.authority).toMatchObject({ graphAuthoritative: false, graphAuthoritativeSource: 'config' });
-  });
-
-  test('--graph off traverses CLI adapters and overrides explicit config with flag provenance', async () => {
-    const observed = await runThroughExistingEntry({
-      configValue: true,
-      graphFlag: 'off',
-      runId: 'run-graph-flag-off',
-    });
-    expect(observed.authority).toMatchObject({
-      graphAuthoritative: false,
-      graphAuthoritativeSource: 'flag',
-    });
-  });
-
-  test('flag, config, and default remain three distinguishable provenance values', async () => {
-    // The config-dir override is process-global, so these entry runs are deliberately serial.
-    const byDefault = await runThroughExistingEntry({ runId: 'run-source-default' });
-    const byConfig = await runThroughExistingEntry({ configValue: false, runId: 'run-source-config' });
-    const byFlag = await runThroughExistingEntry({ configValue: true, graphFlag: 'off', runId: 'run-source-flag' });
-    expect(new Set([
-      byDefault.authority.graphAuthoritativeSource,
-      byConfig.authority.graphAuthoritativeSource,
-      byFlag.authority.graphAuthoritativeSource,
-    ])).toEqual(new Set(['default', 'config', 'flag']));
+  // 🆕 2026-09-26 설정 졸업 — 그래프 권위는 항상 켬: 끄는 길(설정 키 · `--graph` 플래그)이 사라졌다.
+  //   옛 설정 `graphAuthoritative: false` 가 남아 있어도 권위는 켜져 있고 출처는 `default` 다(은퇴 키).
+  test('retired config false no longer turns authority off — enabled with default provenance', async () => {
+    const enabled = await runThroughExistingEntry({ configValue: true, runId: 'run-config-on' });
+    const retiredOff = await runThroughExistingEntry({ configValue: false, runId: 'run-config-off' });
+    expect(enabled.authority).toMatchObject({ graphAuthoritative: true, graphAuthoritativeSource: 'default' });
+    expect(retiredOff.authority).toMatchObject({ graphAuthoritative: true, graphAuthoritativeSource: 'default' });
   });
 
   test('adjacent selfImplement defaults remain unchanged', () => {
     const config = buildUserConfig('/definitely/missing/graph-authority-default.json');
+    // 2026-09-26 졸업: graphAuthoritative 키는 은퇴했다(항상 켬) — 설정에 더는 없다.
+    expect(config.tools.selfImplement).not.toHaveProperty('graphAuthoritative');
     expect(config.tools.selfImplement).toMatchObject({
-      graphAuthoritative: true,
       observeOnly: false,
       fabricDecompose: false,
       autoOpenPr: true,

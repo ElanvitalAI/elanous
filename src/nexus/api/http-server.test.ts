@@ -11,6 +11,12 @@ import {
   startNexusHttpServer,
 } from './http-server.js';
 import { NexusEventBus } from './event-bus.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
+import { resetUserConfig } from '../../user-config.js';
+import { useBackend } from '../config/secrets/index.js';
 
 const envelope: FeedbackEnvelope = {
   envelopeVersion: 1,
@@ -30,6 +36,37 @@ function serverFixture() {
   state.bus = eventBus;
   return { state, eventBus, registry: new TabRegistry(state) };
 }
+
+test('channel-bot GET and authenticated POST reach HTTP handlers without leaking the token', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'channel-bot-http-'));
+  setElanousConfigDir(dir);
+  useBackend('file');
+  resetUserConfig();
+  const server = startNexusHttpServer({
+    ...serverFixture(), startPort: uniquePort(), metaApi: { bearerToken: 'auth', noAuth: false },
+  });
+  try {
+    const headers = { authorization: 'Bearer auth', 'sec-fetch-site': 'cross-site' };
+    const get = await fetch(`${server.url}/v1/setup/channel-bots`, { headers });
+    expect(get.status).toBe(200);
+    expect((await get.json() as { platforms: unknown[] }).platforms).toHaveLength(2);
+    const unauthorized = await fetch(`${server.url}/v1/setup/channel-bot`, {
+      method: 'POST', headers: { 'sec-fetch-site': 'cross-site' }, body: '{}',
+    });
+    expect(unauthorized.status).toBe(401);
+    const post = await fetch(`${server.url}/v1/setup/channel-bot`, {
+      method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ platform: 'discord', allowedUsers: ['123'] }),
+    });
+    expect(post.status).toBe(200);
+    expect(await post.json()).toEqual({ ok: true, restartNeeded: true });
+  } finally {
+    server.stop();
+    resetUserConfig();
+    resetElanousConfigDir();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 function uniquePort(): number {
   return 43000 + Math.floor(Math.random() * 2000);

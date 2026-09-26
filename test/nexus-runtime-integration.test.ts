@@ -13,7 +13,7 @@
 // no real ACP runtime spawn).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -26,6 +26,7 @@ let tmpRoot: string;
 let prevNexusDir: string | undefined;
 let prevHome: string | undefined;
 let activeHandle: RunNexusHandle | undefined;
+let prevVault: string | undefined;
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'elanous-nexus-runtime-int-'));
@@ -37,6 +38,11 @@ beforeEach(() => {
   // os.homedir() at module-load; we additionally swap the singleton
   // so the test sees an isolated in-memory store.
   process.env.HOME = tmpRoot;
+  // ⛔ 볼트도 임시로 «명시»한다 — Bun 의 os.homedir() 는 실행 중 HOME 변경을 따르지 않아(2026-09-26 실측),
+  //   HOME 만 바꾸면 discoverObsidianVault 가 실제 볼트를 찾았다 → 이 시험이 실제 볼트에 Route-guard 노트 87개를 썼다.
+  prevVault = process.env.ELANOUS_OBSIDIAN_VAULT;
+  process.env.ELANOUS_OBSIDIAN_VAULT = join(tmpRoot, 'vault');
+  mkdirSync(join(tmpRoot, 'vault'), { recursive: true });
   setIntakeStoreForTest(createIntakeStore({ archiveDir: null, replayOnInit: false }));
 });
 
@@ -49,6 +55,8 @@ afterEach(async () => {
   else process.env.ELANOUS_NEXUS_DIR = prevNexusDir;
   if (prevHome === undefined) delete process.env.HOME;
   else process.env.HOME = prevHome;
+  if (prevVault === undefined) delete process.env.ELANOUS_OBSIDIAN_VAULT;
+  else process.env.ELANOUS_OBSIDIAN_VAULT = prevVault;
   setIntakeStoreForTest(null);
   try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* swallow */ }
 });
@@ -502,11 +510,10 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
     }
   });
 
-  test('runtime opt-out (skipRuntimeApi=true) preserves PR e/f/h 503 stub contract', async () => {
+  test('runtime opt-out (skipRuntimeApi=true) refuses an unauthenticated request before the stub', async () => {
+    // 보안 강화(09-26) 뒤 인증 검사가 스텁보다 앞선다 — 런타임을 안 이은 경로도 무인증이면 401 이다(503 스텁은 인증 뒤의 일).
     const h = await bootNexus({ skipRuntimeApi: true });
     const res = await fetch(`${h.httpServer!.url}/v1/sessions`);
-    expect(res.status).toBe(503);
-    const body = await res.json() as { error: string };
-    expect(body.error).toBe('meta-api-runtime-not-wired');
+    expect(res.status).toBe(401);
   });
 });

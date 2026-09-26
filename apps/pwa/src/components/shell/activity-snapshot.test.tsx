@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { ObservatorySubject } from '@/components/observatory/subject-list';
 import { classifySubject } from '@/components/observatory/subject-list';
@@ -15,6 +15,17 @@ import {
 import { fetchActivitySnapshot } from './fetch-activity-snapshot';
 import { FabricStageHeader } from './FabricStageHeader';
 import { TopBarActivityIndicator } from './TopBarActivityIndicator';
+import * as realNavigation from 'next/navigation';
+import * as realNexusContext from '@/nexus/hooks/use-nexus-context';
+
+// R-TST23 — mock.module 은 프로세스 전역이다. 끝에 원본으로 되돌린다
+// (안 되돌리면 뒤에 도는 파일이 가짜 use-nexus-context 를 받는다 · setup/done 시험 2건이 여기서 깨졌다).
+const originalNavigation = { ...realNavigation };
+const originalNexusContext = { ...realNexusContext };
+afterAll(() => {
+  mock.module('next/navigation', () => originalNavigation);
+  mock.module('@/nexus/hooks/use-nexus-context', () => originalNexusContext);
+});
 
 mock.module('next/navigation', () => ({
   usePathname: () => '/term',

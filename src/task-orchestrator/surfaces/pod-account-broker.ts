@@ -5,19 +5,59 @@
 //    «모른다»라서 뒤로 보내되 빼지 않는다(못 읽었다고 갈 곳을 없애지 않는다 — 회전 규칙과 같다).
 // ⛔ `--pod-account` 를 명시하면 브로커를 쓰지 않는다 — 사람의 의도가 이긴다.
 
-import type { RotationCandidate } from '../../oauth/codex-account-rotation.js';
+import { codexAccountThresholdPercent, type RotationCandidate } from '../../oauth/codex-account-rotation.js';
 
 export const POD_ACCOUNT_EXCLUDE_AT_PERCENT = 95;
 
 export interface PodAccountPlan { usable: string[]; excluded: Array<{ name: string; why: string }> }
 
-export function planPodAccounts(candidates: readonly RotationCandidate[], excludeAt = POD_ACCOUNT_EXCLUDE_AT_PERCENT): PodAccountPlan {
+export type PodProviderPlan =
+  | { provider: 'openai-codex'; accounts: string[]; excluded: PodAccountPlan['excluded'] }
+  | { provider: 'grok'; excluded: PodAccountPlan['excluded'] }
+  | { provider: null; reasons: string[] };
+
+/** Pod 의 codex → grok 선택. 자격 종류는 과금 동의와 별도로 판단한다. */
+export function planPodProvider(input: {
+  codexCandidates: readonly RotationCandidate[];
+  grokSubscription: boolean;
+  grokApiKey: boolean;
+  grokApiKeyOptIn: boolean;
+  excludeAt?: number;
+  thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
+}): PodProviderPlan {
+  const accounts = planPodAccounts(input.codexCandidates, {
+    excludeAt: input.excludeAt,
+    thresholdPercentByAccount: input.thresholdPercentByAccount,
+  });
+  if (accounts.usable.length) return { provider: 'openai-codex', accounts: accounts.usable, excluded: accounts.excluded };
+  if (input.grokSubscription || (input.grokApiKey && input.grokApiKeyOptIn)) return { provider: 'grok', excluded: accounts.excluded };
+  return {
+    provider: null,
+    reasons: [
+      `codex: ${accounts.excluded.map((e) => `${e.name}(${e.why})`).join(' · ') || '계정 0개'}`,
+      `grok: 구독 자격 없음 · ${input.grokApiKey ? 'API 키 opt-in 꺼짐' : 'API 키 없음'}`,
+    ],
+  };
+}
+
+export function planPodAccounts(
+  candidates: readonly RotationCandidate[],
+  options: number | {
+    thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
+    excludeAt?: number;
+  } = {},
+): PodAccountPlan {
+  const { thresholdPercentByAccount, excludeAt = POD_ACCOUNT_EXCLUDE_AT_PERCENT } =
+    typeof options === 'number' ? { excludeAt: options } : options;
   const excluded: PodAccountPlan['excluded'] = [];
   const known: RotationCandidate[] = [];
   const unknown: RotationCandidate[] = [];
   for (const c of candidates) {
+    const threshold = typeof options === 'number'
+      ? excludeAt
+      : codexAccountThresholdPercent(c.name, { thresholdPercent: excludeAt, thresholdPercentByAccount });
     if (c.reached === true) { excluded.push({ name: c.name, why: 'quota reached' }); continue; }
-    if (c.usedPercent !== undefined && c.usedPercent >= excludeAt) { excluded.push({ name: c.name, why: `used ${c.usedPercent}% ≥ ${excludeAt}%` }); continue; }
+    if (c.usedPercent !== undefined && c.usedPercent >= threshold) { excluded.push({ name: c.name, why: `used ${c.usedPercent}% ≥ ${threshold}%` }); continue; }
     (c.usedPercent === undefined ? unknown : known).push(c);
   }
   known.sort((a, b) => (a.usedPercent! - b.usedPercent!) || a.name.localeCompare(b.name));

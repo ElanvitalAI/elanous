@@ -43,7 +43,7 @@ export interface ReplayPreviewOpts {
   perMessageLines?: number;
   /** Streaming-path wrap options forwarded to `formatResponse`. Pass
    *  `getUserConfig().chat.rendering.wrap` to match the live render. */
-  wrapOpts?: { urlAware?: boolean; preserveOsc8?: boolean };
+  wrapOpts?: { urlAware?: boolean };
 }
 
 /** Extract the displayable text from a chat-history message. Handles

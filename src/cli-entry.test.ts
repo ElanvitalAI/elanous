@@ -88,11 +88,11 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
     expect(status).not.toBe(0);
   }, SPAWN_TIMEOUT_MS);
 
-  test('harness ask --graph maybe는 한 줄의 허용값 오류로 거부하고 stack을 노출하지 않는다', () => {
+  test('harness ask --graph is no longer accepted', () => {
     const { stdout, stderr, status } = runBin(['--test', 'harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run']);
     expect(status).toBe(1);
     expect(stdout).toBe('');
-    expect(stderr.trim()).toBe('❌ --graph 값은 on 또는 off여야 함: maybe');
+    expect(stderr).toContain("error: unknown option '--graph'");
     expect(stderr).not.toMatch(/\bat\s+.*\(/);
   }, SPAWN_TIMEOUT_MS);
 
@@ -478,8 +478,9 @@ describe('provider codex status — 실물 산출', () => {
           { ...isoEnv, XDG_CONFIG_HOME: cfgDir });
         if (bad.status !== 0) throw new Error(`status 실패(회귀): ${bad.stderr.slice(0, 300)}`);
         const parsedBad = JSON.parse(bad.stdout) as { rotation: { thresholdPercent: number } };
-        // ⭐ 설정은 0 인데 «판정기가 쓰는 값»은 95 다 — 화면이 0 이라 말하면 거짓말이다
-        expect(parsedBad.rotation.thresholdPercent).toBe(95);
+        // ⭐ 설정은 0 인데 «판정기가 쓰는 값»은 정규화된 값이다 — 화면이 0 이라 말하면 거짓말이다.
+        //   격리 환경의 현재 계정은 `default` 라 대표 원칙(«default 는 60% 까지만» · min(60, 전역 95))으로 60 이다.
+        expect(parsedBad.rotation.thresholdPercent).toBe(60);
 
         // ⛔⭐⭐ 그리고 «유효값»도 문다 — 이것이 없으면 「설정이 아예 안 읽히는」 회귀를 못 잡는다.
         //   0 만 주면 배선이 죽어도(0 → undefined → 95) 같은 답이 나와 통과한다.

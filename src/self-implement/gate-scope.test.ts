@@ -93,6 +93,23 @@ describe('elanous 런타임 산출물 분리와 출력 관측', () => {
     expect(scope.elanousRuntimeArtifacts).toEqual(['.elanous/debug/debug-x.log', '.elanous-child-liveness.hb']);
   });
 
+  // 🩸 2026-09-26 run-7dd4cce6 — 실패 시험 0 인데 «미검증 2»로 두 라운드 실패: 지운 시험 파일 · import 하는 시험이 돈 소스.
+  test('지운 파일은 미검증이 아니고, 실행 집합의 시험이 import 하는 소스는 커버로 센다', () => {
+    const present = new Set(['test/dashboard-acp-boot.test.ts', 'test/voice-telegram-voice-adapter.test.ts', 'src/voice/channel-adapters/telegram-voice-adapter.ts']);
+    const exists = (p: string) => present.has(p);
+    const index = { testsBySource: new Map([['src/voice/channel-adapters/telegram-voice-adapter.ts', ['test/voice-telegram-voice-adapter.test.ts']]]), unresolvedRelativeSpecifiers: 0 };
+    const changed = ['test/dashboard-acp-boot-localdaemon.test.ts', 'test/dashboard-acp-boot.test.ts', 'test/voice-telegram-voice-adapter.test.ts', 'src/voice/channel-adapters/telegram-voice-adapter.ts'];
+    const fixed = resolveGateScope(changed, exists, index, { isDeleted: (p) => !present.has(p) });
+    expect(fixed.reason).toBe('changed-tests');
+    expect(fixed.unverified).toEqual([]);
+    // 옛 동작(isDeleted 없음 · 색인 없음)은 둘 다 미검증으로 셌다 — 이 대조가 수리를 문다.
+    const before = resolveGateScope(changed, exists);
+    expect(before.unverified).toEqual(['test/dashboard-acp-boot-localdaemon.test.ts', 'src/voice/channel-adapters/telegram-voice-adapter.ts']);
+    // 색인이 있어도 그 시험이 «실행 집합에 없으면» 커버가 아니다.
+    const notRun = resolveGateScope(['src/voice/channel-adapters/telegram-voice-adapter.ts', 'test/dashboard-acp-boot.test.ts'], exists, index);
+    expect(notRun.unverified).toContain('src/voice/channel-adapters/telegram-voice-adapter.ts');
+  });
+
   test('산출물만 변경돼도 버리지 않고 unverified 0과 산출물 수를 따로 출력한다', () => {
     const scope = resolveGateScope(['.elanous/debug/chat-x.log', '.elanous-child-liveness.hb'], none);
 

@@ -32,6 +32,7 @@ import { getUserConfig, reloadUserConfig, userConfigPath, type UserConfig } from
 import { setElanousConfigDir } from './elanous-config-dir.js';
 import { syncTestConfig, isTestConfigStale } from './cli/config-test-sync.js';
 import { DiscordBot } from './discord.js';
+import { resolveChannelBotToken } from './channel-bot-token.js';
 import { debug } from './debug/log.js';
 
 /** Canonical isolated-state dir for the Discord test bot. */
@@ -98,7 +99,7 @@ export async function runDiscordTestMessenger(opts: DiscordTestRunnerOpts = {}):
       + '(the dedicated guild text channel, e.g. #elanous_test) or pass --channel.',
     );
   }
-  const token = (opts.token?.trim()) || testChannel?.botToken?.trim() || prod.discord.botToken?.trim() || '';
+  const token = (opts.token?.trim()) || testChannel?.botToken?.trim() || resolveChannelBotToken('discord', prod)?.token.trim() || '';
   if (!token) {
     throw new Error('discord-test: no token. Set `discord.botToken` (same-app default) or `discord.testChannel.botToken`.');
   }

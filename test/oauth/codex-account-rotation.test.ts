@@ -21,7 +21,8 @@ mock.module('../../src/domains/outbound-alert.js', () => ({
   },
 }));
 import {
-  decideCodexRotation, applyRotation, observeRotation, codexAccountRotationEnabled, readCodexAccountRotationConfig, rotatedChildEnv, type RotationCandidate,
+  decideCodexRotation, applyRotation, observeRotation, codexAccountRotationEnabled, readCodexAccountRotationConfig, rotatedChildEnv,
+  DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT, codexAccountThresholdPercent, type RotationCandidate,
 } from '../../src/oauth/codex-account-rotation';
 import { quotaSignalDir } from '../../src/budget/codex-reset-credit-state';
 import { debug } from '../../src/debug/log';
@@ -202,6 +203,17 @@ describe('회전 판정 — 결정 넷', () => {
     expect(d.to?.name).toBe('team');
   });
 
+  test('동명 후보 20%·100%는 개별 상태를 적용해 첫 후보를 고른다', () => {
+    const first = cand('team', undefined, '/h/team-first', 20);
+    const second = cand('team', undefined, '/h/team-second', 100);
+    const decision = decideCodexRotation({ ...base, candidates: [first, second] });
+    expect(decision.reason).toBe('rotated');
+    expect(decision.to).toBe(first);
+    expect(decision.accountThresholds?.map(({ status }) => status)).toEqual([
+      'reached', 'below-threshold', 'threshold-reached',
+    ]);
+  });
+
   test('⛔ 임계와 같으면 전환하고, 임계 이상 후보는 고르지 않는다', () => {
     const d = decideCodexRotation({
       ...base,
@@ -228,6 +240,48 @@ describe('회전 판정 — 결정 넷', () => {
         candidates: [cand('team', undefined)],
       }).reason).toBe('rotated');
     }
+  });
+
+  test('default 계정 기본 60%와 계정별 명시값·전역 95%의 우선순위', () => {
+    expect(DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT).toEqual({ default: 60 });
+    expect(codexAccountThresholdPercent('default', {})).toBe(60);
+    expect(codexAccountThresholdPercent('default', { thresholdPercent: 80 })).toBe(60);
+    expect(codexAccountThresholdPercent('team', {})).toBe(95);
+    expect(codexAccountThresholdPercent('team', { thresholdPercent: 80 })).toBe(80);
+    expect(codexAccountThresholdPercent('default', { thresholdPercentByAccount: { default: 50 } })).toBe(50);
+    expect(codexAccountThresholdPercent('default', { thresholdPercentByAccount: { default: 0 } })).toBe(60);
+    expect(codexAccountThresholdPercent('team', { thresholdPercent: 80, thresholdPercentByAccount: { team: 101 } })).toBe(80);
+    expect(codexAccountThresholdPercent('toString', {})).toBe(95);
+  });
+
+  test('판정에 사용한 default 기본값·계정별 설정·전역 임계와 후보 상태를 함께 낸다', () => {
+    const decision = decideCodexRotation({
+      ...base, currentReached: undefined, currentUsedPercent: 60,
+      thresholdPercent: 90,
+      thresholdPercentByAccount: { alpha: 70, team: 0 },
+      candidates: [cand('alpha', undefined, '/h/alpha', 70), cand('team', undefined, '/h/team', 85)],
+    });
+    expect(decision.reason).toBe('rotated');
+    expect(decision.to?.name).toBe('team');
+    expect(decision.accountThresholds).toEqual([
+      { name: 'default', thresholdPercent: 60, source: 'account-default', status: 'threshold-reached', usedPercent: 60 },
+      { name: 'alpha', thresholdPercent: 70, source: 'account-override', status: 'threshold-reached', usedPercent: 70 },
+      { name: 'team', thresholdPercent: 90, source: 'global', status: 'below-threshold', usedPercent: 85 },
+    ]);
+  });
+
+  test('default 60% 도달은 떠나고 후보에서도 제외하며 team 은 전역 95%까지 쓴다', () => {
+    const leaving = decideCodexRotation({
+      ...base, currentReached: undefined, currentUsedPercent: 60,
+      candidates: [cand('team', undefined, '/h/team', 60)],
+    });
+    expect(leaving.reason).toBe('rotated');
+    expect(leaving.to?.name).toBe('team');
+    const fromTeam = decideCodexRotation({
+      ...base, current: { ...current, name: 'team' }, currentReached: true,
+      candidates: [cand('default', undefined, '/h/A', 60)],
+    });
+    expect(fromTeam.reason).toBe('no-candidate');
   });
 
   test('⭐ 계정별 정수 임계는 현재 계정의 회전 시작과 후보 제외에 각각 적용한다', () => {
@@ -736,7 +790,39 @@ describe('계정별 임계 설정 배선 — store 판정에 전달된다', () =
   const { tmpdir } = require('node:os') as typeof import('node:os');
   const { join } = require('node:path') as typeof import('node:path');
 
-  test('⭐ 현재 계정 override는 회전시키고, 누락 계정은 전역 임계로 폴백한다', async () => {
+  test('default 핀은 60%에 해제되어 다른 계정으로 넘어간다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'rotation-default-pin-'));
+    const prior = { state: process.env.ELANOUS_STATE_DIR, home: process.env.CODEX_HOME, run: process.env.ELANOUS_RUN_ID };
+    const storeModule = await import('../../src/oauth/codex-account-store');
+    try {
+      process.env.ELANOUS_STATE_DIR = root;
+      process.env.ELANOUS_RUN_ID = 'run-default-60-pin';
+      const homeA = join(root, 'home-A'); const homeB = join(root, 'home-B');
+      mkdirSync(homeA, { recursive: true }); mkdirSync(homeB, { recursive: true });
+      process.env.CODEX_HOME = homeA;
+      const store = join(root, 'auth.json');
+      const { saveTokens } = await import('../../src/oauth/store');
+      const token = { accessToken: 'a', refreshToken: 'r', expiresAt: null };
+      saveTokens('openai-codex', token, { mirrorCodex: false, codexHome: homeA }, store);
+      saveTokens('openai-codex:team', token, { mirrorCodex: false, codexHome: homeB }, store);
+      const { writeQuotaSignal } = await import('../../src/budget/codex-reset-credit-state');
+      storeModule._setRotationConfigReaderForTesting(() => ({}));
+      storeModule._resetCodexRotationPinForTesting();
+      writeQuotaSignal(undefined, 59, homeA);
+      writeQuotaSignal(undefined, 0, homeB);
+      expect(storeModule.resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe('default');
+      writeQuotaSignal(undefined, 60, homeA);
+      expect(storeModule.inspectCodexRotation(process.env, { storePath: store }).thresholdPercent).toBe(60);
+      expect(storeModule.resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe('team');
+    } finally {
+      storeModule._setRotationConfigReaderForTesting(null);
+      storeModule._resetCodexRotationPinForTesting();
+      _restore(prior);
+      try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
+  test('⭐ 현재 계정 override는 회전시키고, 명시된 다른 임계는 default 기본값보다 우선한다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'rotation-threshold-by-account-'));
     const prior = { state: process.env.ELANOUS_STATE_DIR, home: process.env.CODEX_HOME, run: process.env.ELANOUS_RUN_ID };
     const storeModule = await import('../../src/oauth/codex-account-store');
@@ -764,7 +850,7 @@ describe('계정별 임계 설정 배선 — store 판정에 전달된다', () =
 
       storeModule._setRotationConfigReaderForTesting(() => ({ llm: {
         codexAccountRotationThresholdPercent: 95,
-        codexAccountRotationThresholdPercentByAccount: { team: 80 },
+        codexAccountRotationThresholdPercentByAccount: { default: 95, team: 80 },
       } }));
       storeModule._resetCodexRotationPinForTesting();
       expect(storeModule.resolveCodexAccountForRun(process.env, { storePath: store }).name).toBe('default');
@@ -1402,5 +1488,15 @@ describe('Codex 계정 이벤트 outbound', () => {
       if (prior.home === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prior.home;
       try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
+  });
+});
+
+describe('default 계정 60% 는 «상한» — 더 엄한 전역을 따른다 (2026-09-27 지시)', () => {
+  test('전역 없음·95 → 60 · 전역 42 → 42 · 계정별 명시가 이긴다 · 다른 계정은 전역', () => {
+    expect(codexAccountThresholdPercent('default', {})).toBe(60);
+    expect(codexAccountThresholdPercent('default', { thresholdPercent: 95 })).toBe(60);
+    expect(codexAccountThresholdPercent('default', { thresholdPercent: 42 })).toBe(42);
+    expect(codexAccountThresholdPercent('default', { thresholdPercent: 42, thresholdPercentByAccount: { default: 80 } })).toBe(80);
+    expect(codexAccountThresholdPercent('team', { thresholdPercent: 0 })).toBe(95);
   });
 });

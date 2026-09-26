@@ -1,14 +1,15 @@
 import { describe, expect, test } from 'bun:test';
 import { fileURLToPath } from 'node:url';
-import { readFileSync, readdirSync } from 'node:fs';
+import { readFileSync, readdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { buildDocumentGuardianIndex } from './document-guardian-index.js';
 import {
   activeImplementTemplate, activeTemplate, auditTestConsumedDocumentCoverage, discardedNodeFieldsSummary, frontObservationTemplate, graphAuthorityFields,
-  graphTemplateIssuesObservation, nodeNameForStage, repositoryTestSources, resolveGraphAuthority, routeGate, templateHasNode,
+  graphTemplateIssuesObservation, nodeNameForStage, repositoryTestSources, resolveGraphAuthority, resolveGraphAuthorityForUserConfig, routeGate, templateHasNode,
 } from './graph-authority.js';
 import { GRAPH_SPECS, GRAPH_TEMPLATES, compileGraphTemplate, type GraphTemplate } from './graph-templates.js';
-import { GOAL_TYPES } from './goal-author.js';
+import { buildUserConfig } from '../user-config.js';
+import { tmpdir } from 'node:os';
 
 const REPO = join(import.meta.dir, '../..');
 
@@ -34,26 +35,39 @@ describe('exported document-coverage audit — current repository callers', () =
   }, 15_000);
 });
 
-describe('RFC §5 1단계 승격 — 선언을 실행 권위로 (⛔ 실험 · 🆕 2026-09-10 부터 기본 «켜짐»)', () => {
-  test('⛔ 범용 run-control 기본은 «꺼짐»이고 출처가 default 다', () => {
-    // ⛔ 기본이 뒤집혔다 — 그러나 «출처»는 여전히 default 로 갈린다(그것이 이 줄이 지키는 것).
-    expect(resolveGraphAuthority({})).toEqual({ enabled: true, source: 'default' });
-    // ⭐ 그리고 «명시로 끄는 길»이 여전히 먹는다 — 이것이 뒤집기의 안전 조건이다.
-    expect(resolveGraphAuthority({ config: false })).toEqual({ enabled: false, source: 'config' });
-    expect(resolveGraphAuthority({ flag: false, config: true })).toEqual({ enabled: false, source: 'flag' });
+describe('2026-09-26 설정 졸업 — 선언은 항상 실행 권위', () => {
+  test('운영 매뉴얼은 끄는 옵션을 더는 안내하지 않는다', () => {
+    const manual = readFileSync(join(REPO, 'docs/manual/MANUAL-graph-operations-2026-09-10.md'), 'utf8');
+    expect(manual).toContain('2026-09-26 설정 졸업 — 그래프 권위는 항상 켬');
+    expect(manual).not.toContain('--no-graph');
+    expect(manual).not.toContain('graphAuthoritative: false');
   });
 
-  test('⭐ 첫째 반증 — «꺼진» 상태에서는 골 종류와 무관하게 implement-loop 이다', () => {
-    const off = resolveGraphAuthority({ config: false });   // ⛔ 「꺼진 상태」는 이제 «명시»로 만든다
-    for (const goalType of GOAL_TYPES) {
-      expect({ goalType, graphId: activeTemplate(goalType, off).graphId })
-        .toEqual({ goalType, graphId: 'self-implement' });
+  test('config/flag가 false여도 두 resolver는 항상 켜진 default를 반환한다', () => {
+    const expected = { enabled: true, source: 'default' as const };
+    for (const input of [{}, { config: false }, { flag: false, config: true }, { flag: true, config: false }]) {
+      expect(resolveGraphAuthority(input)).toEqual(expected);
     }
-    expect(activeTemplate(undefined, off).graphId).toBe('self-implement');
+    const dir = mkdtempSync(join(tmpdir(), 'graph-authority-'));
+    try {
+      const path = join(dir, 'config.json');
+      writeFileSync(path, JSON.stringify({ tools: { selfImplement: { graphAuthoritative: false } } }));
+      const config = buildUserConfig(path);
+      expect(config.tools.selfImplement).not.toHaveProperty('graphAuthoritative');
+      expect(resolveGraphAuthorityForUserConfig()).toEqual(expected);
+      expect(resolveGraphAuthorityForUserConfig(config)).toEqual(expected);
+      expect(resolveGraphAuthorityForUserConfig(config, false)).toEqual(expected);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('종류를 모르면 implement-loop을 선택한다', () => {
+    expect(activeTemplate(undefined, resolveGraphAuthority({})).graphId).toBe('self-implement');
   });
 
   test('앞단 관측은 implement 골의 활성 YAML 템플릿 정체성을 쓴다', () => {
-    expect(activeImplementTemplate()).toBe(activeTemplate('implement', resolveGraphAuthority({ config: false })));
+    expect(activeImplementTemplate().graphId).toBe(activeTemplate('implement', resolveGraphAuthority({})).graphId);
     expect(activeImplementTemplate().graphId).toBe('self-implement');
   });
 
@@ -63,17 +77,9 @@ describe('RFC §5 1단계 승격 — 선언을 실행 권위로 (⛔ 실험 · �
     expect(frontObservationTemplate(undefined).graphId).toBe('default-loop');
   });
 
-  test('⭐ 꺼진 상태에서는 «이름도» 안 갈린다 — 오늘과 같은 걸음이어야 한다', () => {
-    const off = resolveGraphAuthority({ config: false });   // ⛔ 「꺼진 상태」는 이제 «명시»로 만든다
-    const template = activeTemplate('research', off);
-    for (const stage of ['implement', 'gate', 'review', 'rework', 'main-sync', 'regate', 'open-pr', 'merge']) {
-      expect(nodeNameForStage(stage, template)).toBe(stage);
-    }
-  });
-
-  test('config 로 켜면 research 만 research-loop 으로 간다 — implement 는 그대로다', () => {
-    const on = resolveGraphAuthority({ config: true });
-    expect(on).toEqual({ enabled: true, source: 'config' });
+  test('항상 켜진 권위는 골 종류에 맞는 템플릿을 고른다', () => {
+    const on = resolveGraphAuthority({});
+    expect(on).toEqual({ enabled: true, source: 'default' });
     expect(activeTemplate('research', on).graphId).toBe('research-loop');
     expect(activeTemplate('implement', on).graphId).toBe('self-implement');
     // ⛔ 템플릿이 «없는» 종류는 implement-loop 으로 떨어진다 — 없는 길로 보내지 않는다.
@@ -89,11 +95,6 @@ describe('RFC §5 1단계 승격 — 선언을 실행 권위로 (⛔ 실험 · �
     }
     expect(templateHasNode(template, 'gate')).toBe(true);
     expect(templateHasNode(template, 'regate')).toBe(true);
-  });
-
-  test('⛔ 플래그가 config 를 «이긴다» — 그리고 출처가 그것을 말한다', () => {
-    expect(resolveGraphAuthority({ flag: false, config: true })).toEqual({ enabled: false, source: 'flag' });
-    expect(resolveGraphAuthority({ flag: true, config: false })).toEqual({ enabled: true, source: 'flag' });
   });
 
   test('⭐ 둘째 반증 — 켠 research 런은 gate 를 «조건부로» 갖고 착지 경로를 «전부» 갖는다', () => {
@@ -134,7 +135,7 @@ describe('RFC §5 1단계 승격 — 선언을 실행 권위로 (⛔ 실험 · �
     expect(fields)
       .toEqual({
         graphAuthoritative: true,
-        graphAuthoritativeSource: 'config',
+        graphAuthoritativeSource: 'default',
         activeGraphId: 'research-loop',
         graphTemplatesSource: 'yaml',
         graphTemplatesIssueCount: 4,
@@ -148,13 +149,11 @@ describe('RFC §5 1단계 승격 — 선언을 실행 권위로 (⛔ 실험 · �
         discardedNodeFields: compileGraphTemplate(GRAPH_SPECS['research-loop']!).discardedNodeFields,
       });
     expect(JSON.stringify(fields)).toContain('계약(inputs·tools·outputs)이 없다');
-    const off = resolveGraphAuthority({ config: false });   // ⛔ 「꺼진 상태」는 이제 «명시»로 만든다
-    const implementTemplate = activeTemplate('research', off);
-    expect(graphAuthorityFields(off, implementTemplate))
+    const unknownTemplate = activeTemplate(undefined, on);
+    expect(graphAuthorityFields(on, unknownTemplate))
       .toEqual({
-        graphAuthoritative: false,
-        // ⛔ 「꺼짐」이 «명시»라 출처는 config 다 — 이 줄이 지키는 것은 「출처가 실린다」이지 특정 값이 아니다.
-        graphAuthoritativeSource: 'config',
+        graphAuthoritative: true,
+        graphAuthoritativeSource: 'default',
         activeGraphId: 'self-implement',
         graphTemplatesSource: 'yaml',
         graphTemplatesIssueCount: 4,
@@ -176,17 +175,15 @@ describe('RFC §5 1단계 승격 — 선언을 실행 권위로 (⛔ 실험 · �
   });
 
   test('대응 스펙이 없으면 던지지 않고 null로 남겨 빈 선언 손실과 구별한다', () => {
-    const authority = resolveGraphAuthority({ config: false });   // ⛔ 「꺼진 상태」를 «명시»로
+    const authority = resolveGraphAuthority({});
     const missingSpecTemplate: GraphTemplate = {
       ...GRAPH_TEMPLATES['self-implement']!,
       graphId: 'no-such-graph',
     };
 
     expect(graphAuthorityFields(authority, missingSpecTemplate)).toEqual({
-      graphAuthoritative: false,
-      // ⛔ 「꺼짐」을 «명시»로 만들었으므로 출처는 config 다 — 이 시험이 지키는 것은
-      //   「원장이 «출처»를 실어 「안 켰다」와 「켰는데 안 먹었다」를 가른다」이지 특정 값이 아니다.
-      graphAuthoritativeSource: 'config',
+      graphAuthoritative: true,
+      graphAuthoritativeSource: 'default',
       activeGraphId: 'no-such-graph',
       graphTemplatesSource: 'yaml',
       graphTemplatesIssueCount: 4,
@@ -198,14 +195,6 @@ describe('RFC §5 1단계 승격 — 선언을 실행 권위로 (⛔ 실험 · �
       ],
       graphTemplatesIssuesTruncated: false,
       discardedNodeFields: null,
-    });
-    expect(graphAuthorityFields(authority, missingSpecTemplate)).not.toEqual({
-      graphAuthoritative: false,
-      graphAuthoritativeSource: 'default',
-      activeGraphId: 'no-such-graph',
-      graphTemplatesSource: 'yaml',
-      graphTemplatesIssueCount: 4,
-      discardedNodeFields: [],
     });
   });
 

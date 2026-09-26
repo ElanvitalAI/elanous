@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, realpathSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
+import { effectiveInstanceRoot, normRoot } from './instance/resolve.js';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
@@ -13,12 +14,12 @@ export const LOCAL_AGENTS_DIR = join(REMOTE_HOME, '.claude/agents');
  * 가변 상태(`plugin-trust.json` · `market-posture.json` · `execution-history.json` · `sync.db` …)의 폴더.
  * 🩸 2026-09-24: 종전엔 늘 «코드 옆» `<코드>/data` 였다. 운영이 설치본(`~/.local/share/elanous/versions/<판>`)으로 옮기자
  *    판마다 빈 `data/` 가 새로 생기고 야간 정리가 옛 판을 지우며 같이 지워졌다(플러그인 신뢰 승인·시장 자세 last-good).
- *    ⇒ 운영 코드(설치본 · 리더 트리)는 상태 폴더 `~/.elanous/data` 를 쓴다. 다른 워크트리는 종전대로 자기 `data/`.
+ *    ⇒ 설치본 또는 운영 우주는 `~/.elanous/data`, 격리 소스 트리는 자기 `data/`를 쓴다.
  *    `ELANOUS_DATA_DIR` 가 있으면 그것이 이긴다.
  */
 export function resolveDataDir(
   codeRoot: string = resolve(import.meta.dir, '..'),
-  deps: { env?: NodeJS.ProcessEnv; home?: string; leaderTree?: () => string | null; hasGit?: (dir: string) => boolean } = {},
+  deps: { env?: NodeJS.ProcessEnv; home?: string; instanceRoot?: () => string; hasGit?: (dir: string) => boolean } = {},
 ): string {
   const env = deps.env ?? process.env;
   const override = env.ELANOUS_DATA_DIR?.trim();
@@ -37,17 +38,11 @@ export function resolveDataDir(
     return false;
   });
   if (isInstalledPackagePath(root) && !hasGit(root)) return stateData;   // 설치본(설치기 · npm)
-  const leaderTree = deps.leaderTree ?? (() => {
-    try {
-      const raw = JSON.parse(readFileSync(join(home, '.elanous', 'leader.json'), 'utf-8')) as { tree?: unknown };
-      return typeof raw.tree === 'string' ? raw.tree : null;
-    } catch { return null; }
-  });
-  const leader = leaderTree();
-  if (leader && real(leader) === root) return stateData;   // 리더(운영) 트리
+  if (normRoot((deps.instanceRoot ?? effectiveInstanceRoot)()) === normRoot(join(home, '.elanous'))) return stateData;
   return join(codeRoot, 'data');
 }
 
+// Module consumers of DATA_DIR/DB_PATH use the same resolved universe as the CLI.
 export const DATA_DIR = resolveDataDir();
 export const DB_PATH = join(DATA_DIR, 'sync.db');
 

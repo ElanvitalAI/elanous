@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import {
   canonicalGraphJson, edgeMapOf, graphVersionHash, loadGraphTemplates, parseGraphTemplateYaml,
-  type GraphTemplateSpec,
+  type GraphNodeKind, type GraphTemplateSpec,
 } from './graph-yaml.js';
 import { compileGraphTemplate } from './graph-templates.js';
 import { FRONT_NODE_IDS } from '../self-dev/graph-front-nodes.js';
@@ -12,6 +12,24 @@ import { PIPELINE_EDGES_BY_NODE, TERMINAL_STAGES_BY_NODE } from './pipeline-shap
 const GRAPHS_DIR = join(import.meta.dir, '../../graphs');
 
 describe('RFC §5 0단계 — YAML 파서', () => {
+  test('새 종류 observe·hitl·subgraph 를 받으며 알 수 없는 종류는 거절한다', () => {
+    for (const kind of ['observe', 'hitl', 'subgraph'] satisfies GraphNodeKind[]) {
+      const result = parseGraphTemplateYaml(`
+graph_id: t
+version: 1
+entry_node: a
+terminal_nodes: [a]
+nodes: [{ node_id: a, kind: ${kind}, recipe: none, max_visits: 1 }]
+edges: []
+`);
+      expect(result.errors).toEqual([]);
+      expect(result.template?.nodes[0]?.kind).toBe(kind);
+    }
+    const unknown = parseGraphTemplateYaml('graph_id: t\nversion: 1\nentry_node: a\nterminal_nodes: [a]\nnodes: [{ node_id: a, kind: alien, recipe: none, max_visits: 1 }]\nedges: []');
+    expect(unknown.template).toBeUndefined();
+    expect(unknown.errors.some((error) => error.path.endsWith('/kind'))).toBe(true);
+  });
+
   test('⛔ 던지지 않는다 — 깨진 YAML 도 «구조화 오류»로 나온다', () => {
     const result = parseGraphTemplateYaml('graph_id: [unclosed\n  bad: :', 'bad.yaml');
     expect(result.template).toBeUndefined();

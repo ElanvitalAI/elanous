@@ -670,7 +670,7 @@ export async function askAnswerPriority(
 /** Built-in presets, in the order shown to the user. Sprint 10
  *  (2026-04-28) — claudecode promoted to default · new priority based
  *  on user feedback (claudecode → codex → openclaw → hermes → opencode). */
-const SKILL_PRESETS: { key: SkillSetName; label: string; dir: string | null }[] =
+export const SKILL_PRESETS: { key: SkillSetName; label: string; dir: string | null }[] =
   (['claudecode', 'codex', 'openclaw', 'hermes', 'opencode'] as SkillSetName[])
     .map(k => ({ key: k, label: k, dir: skillSetDir(k) }));
 

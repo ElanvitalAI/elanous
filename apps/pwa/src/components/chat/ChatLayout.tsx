@@ -323,6 +323,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     provider: config.provider,
     setSessionId,
     setProvider: (p) => setConfig({ provider: p }),
+    daemon: { baseUrl: config.baseUrl, ...(config.token ? { token: config.token } : {}) },
+    messages,
   };
 
   const append = (msg: ChatMessage): void => {

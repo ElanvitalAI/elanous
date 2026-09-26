@@ -89,7 +89,6 @@ export function renderSourceDeltaFilePreview(
   const rows = renderEditBlock(sourceDeltaFileToEditResult(file), {
     cols: opts.cols ?? 96,
     syntax: false,
-    cache: true,
     headerStyle: 'edited',
   });
   const maxLines = Math.max(4, opts.maxLines ?? 36);

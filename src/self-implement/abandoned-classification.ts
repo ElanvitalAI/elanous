@@ -40,7 +40,7 @@ export interface QuotaAccountAvailabilityEvidence {
 
 import type { SelfImplementCompletionDisposition } from './seams.js';
 
-export type AbandonedClassification = 'report-deficit' | 'implementation-deficit' | 'artifact-deficit' | 'contract-conflict' | 'goal-unconvergeable-candidate' | 'pr-declined' | 'merge-approved-abandoned' | 'quota-exhausted' | 'credential-failure' | 'provider-error' | 'already-satisfied';
+export type AbandonedClassification = 'report-deficit' | 'implementation-deficit' | 'artifact-deficit' | 'contract-conflict' | 'goal-unconvergeable-candidate' | 'pr-declined' | 'merge-approved-abandoned' | 'run-deadline-exceeded' | 'quota-exhausted' | 'credential-failure' | 'provider-error' | 'already-satisfied';
 
 const ABANDONED_CLASSIFICATION_VALUES = {
   'report-deficit': true,
@@ -50,6 +50,7 @@ const ABANDONED_CLASSIFICATION_VALUES = {
   'goal-unconvergeable-candidate': true,
   'pr-declined': true,
   'merge-approved-abandoned': true,
+  'run-deadline-exceeded': true,
   'quota-exhausted': true,
   'credential-failure': true,
   'provider-error': true,
@@ -65,6 +66,8 @@ type AbandonedClassificationBasis =
   | 'supervisor-unconvergeable-goal-candidate'
   | 'pr-declined-stage'
   | 'merge-approval-received'
+  // 기한 사망은 호스트가 읽은 Job 종료 이유다. 사후 쿼터 상관보다 앞선다.
+  | 'substrate-deadline-outranks-postmortem-quota'
   // 🩸 2026-09-20: 이 셋은 분류 «이름을 되풀이»했다 — 근거 칸이 동어반복이면 중재를 못 한다.
   //   📏 실물(block 아티팩트)에서 네 칸이 2:2 로 갈렸다:
   //        reason·stage = 게이트   ↔   중단원인·classification = 쿼타
@@ -109,6 +112,9 @@ interface AbandonedClassificationInput {
   readonly goalCauseObserved?: true;
   /** Preserved when the merge decision authorized automatic merge before this run was abandoned. */
   readonly mergeApprovalReceived?: boolean;
+  /** 호스트가 k8s Job 종료 reason `DeadlineExceeded` 를 읽었을 때만 참이다.
+   *  ⛔ 사후 쿼터 상관(`quotaExhausted`)보다 앞선다 — 기한 사망을 할당량 소진으로 읽지 않는다. */
+  readonly substrateDeadlineExceeded?: boolean;
   /** ⭐ provider 쿼터가 «찬 것으로 관측»되었을 때만 참이다.
    *  ⛔ 이 값은 «추론하지 않는다» — 호출자가 provider 응답(`rateLimitReachedType`)을 읽어 넘긴다.
    *  ⚠️ 그 읽기는 런이 죽은 «뒤»에 일어나므로 「죽은 원인」이 아니라 「죽을 무렵 쿼터가 찼다」는 상관이다.
@@ -201,6 +207,10 @@ export function classifyAbandonedRun(input: AbandonedClassificationInput): Aband
         //   ⛔ 다만 머지 승인보다는 «뒤»다 — 승인은 「이 물건은 합격이었다」는 더 강한 완료 주장이고,
         //     쿼터 사실은 그 경우에도 결과 payload 에 그대로 실려 잃지 않는다.
         // 결정적 요청 거부는 계정 가용성보다 앞선다 — 회전 후보 부재는 요청 오류의 원인이 아니다.
+        // 기한 사망은 호스트가 읽은 종료 이유다. 사후 쿼터·자격·provider 오류보다 앞이고,
+        // 머지 승인·계약 충돌·pr-declined 보다는 뒤다. 쿼터 사실은 결과에 그대로 남긴다.
+        : input.substrateDeadlineExceeded === true
+        ? 'run-deadline-exceeded'
         : input.providerError === true && input.providerErrorCategory === 'request'
         ? 'provider-error'
         : input.quotaExhausted === true
@@ -228,6 +238,7 @@ export function classifyAbandonedRun(input: AbandonedClassificationInput): Aband
       case 'goal-unconvergeable-candidate': return 'supervisor-unconvergeable-goal-candidate';
       case 'pr-declined': return 'pr-declined-stage';
       case 'merge-approved-abandoned': return 'merge-approval-received';
+      case 'run-deadline-exceeded': return 'substrate-deadline-outranks-postmortem-quota';
       // ⛔ 분류 이름을 되풀이하지 않는다 — 근거는 «왜 그것이 이겼나»를 말해야 한다.
       case 'quota-exhausted': return 'environment-quota-outranks-run-stage-evidence';
       case 'credential-failure': return 'environment-credential-outranks-run-stage-evidence';

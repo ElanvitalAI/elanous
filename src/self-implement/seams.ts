@@ -1692,7 +1692,9 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         trackedFiles.filter(isTestPath),
         [...new Set([...trackedFiles, ...changedAll, ...observationChangedFiles])].filter((file) => /\.(?:[cm]?[jt]sx?)$/.test(file)),
       );
-      const scope = resolveGateScope(changedAll, isFile, importerTestIndex ?? undefined, postsync ? { mode: 'postsync' } : undefined);
+      // 워크트리에 없는 변경 경로 = 지운 파일 — 미검증으로 세지 않는다(gate-scope `isDeleted` · 2026-09-26 run-7dd4cce6).
+      const isDeleted = (path: string): boolean => !isFile(path);
+      const scope = resolveGateScope(changedAll, isFile, importerTestIndex ?? undefined, postsync ? { mode: 'postsync', isDeleted } : { isDeleted });
       const comparisonFailureReason = observationChanges.comparisonBaseStatus === 'unavailable'
         ? 'comparison-base-unavailable'
         : observationChanges.comparisonBaseStatus === 'comparison-failed'
@@ -2613,7 +2615,17 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const baseRefName = typeof parsed.baseRefName === 'string' && parsed.baseRefName.trim() ? parsed.baseRefName.trim() : undefined;
       const merged = prState === 'MERGED';
       debug.log('self-implement', 'merge.gh', { number, mergeExit: m.status, stateExit: state.status, prState: prState || null, merged, ...(baseRefName ? { baseRefName } : {}) });
-      if (merged) return { merged: true, ...(baseRefName ? { baseRefName } : {}) };
+      if (merged) {
+        let mergeCommit: string | undefined;
+        try {
+          const commit = runSpawnSync('gh', ['pr', 'view', String(number), '--json', 'mergeCommit'], { cwd, encoding: 'utf8', timeout: 30_000 });
+          if (commit.status === 0) {
+            const parsedCommit = JSON.parse(commit.stdout ?? '') as { mergeCommit?: { oid?: unknown } | null };
+            if (typeof parsedCommit?.mergeCommit?.oid === 'string') mergeCommit = parsedCommit.mergeCommit.oid.trim() || undefined;
+          }
+        } catch { /* Optional commit lookup must not change the confirmed merge result. */ }
+        return { merged: true, ...(baseRefName ? { baseRefName } : {}), ...(mergeCommit ? { mergeCommit } : {}) };
+      }
       const detail = state.status === 0
         ? `PR state is ${prState || 'unknown'} after merge command`
         : `${mergeOutput}${state.stdout ?? ''}${state.stderr ?? ''}`;

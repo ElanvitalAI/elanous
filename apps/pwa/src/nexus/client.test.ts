@@ -1,7 +1,7 @@
 // PWA · Nexus client tests (Phase N-4 PR ν)
 
 import { describe, test, expect, spyOn } from 'bun:test';
-import { createNexusClient, NexusApiError } from './client';
+import { createNexusClient, NexusApiError, NexusTimeoutError, type AnswerPriorityResponse } from './client';
 
 interface MockFetchCall {
   url: string;
@@ -46,6 +46,24 @@ describe('createNexusClient · base + fetchImpl wiring', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe(`${BASE}/v1/health`);
   });
+});
+
+test('channel-bot setup client uses GET status and authenticated POST without echoing token', async () => {
+  const { fetchImpl, calls } = makeMockFetch({
+    '/v1/setup/channel-bots': () => ({ status: 200, body: { platforms: [
+      { platform: 'telegram', configured: false, source: null, allowedUsers: [] },
+    ] } }),
+    '/v1/setup/channel-bot': () => ({ status: 200, body: { ok: true, botName: 'bot', restartNeeded: true } }),
+  });
+  const client = createNexusClient({ baseUrl: BASE, token: 'nexus-auth', fetchImpl });
+  expect((await client.getChannelBots()).platforms[0]?.configured).toBe(false);
+  expect(await client.setChannelBot({ platform: 'telegram', token: 'private', allowedUsers: ['19'] }))
+    .toEqual({ ok: true, botName: 'bot', restartNeeded: true });
+  expect(calls.map(call => [call.url, call.init?.method])).toEqual([
+    [`${BASE}/v1/setup/channel-bots`, 'GET'], [`${BASE}/v1/setup/channel-bot`, 'POST'],
+  ]);
+  expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({ platform: 'telegram', token: 'private', allowedUsers: ['19'] });
+  expect(JSON.stringify(calls[1]?.init?.headers)).toContain('nexus-auth');
 });
 
 describe('Read endpoints', () => {
@@ -288,6 +306,51 @@ describe('validateWorkflow · external AbortSignal (Caveat #5)', () => {
   });
 });
 
+describe('Authorization header', () => {
+  function authHeader(init?: RequestInit): string | undefined {
+    const headers = init?.headers as Record<string, string> | undefined;
+    return headers?.authorization;
+  }
+
+  test('token-bearing getHealth (GET, no body) sends authorization Bearer', async () => {
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/health': () => ({ status: 200, body: { ok: true } }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl, token: 'tok-1' });
+    await client.getHealth();
+    expect(authHeader(calls[0].init)).toBe('Bearer tok-1');
+    const getHeaders = calls[0].init?.headers as Record<string, string> | undefined;
+    expect(getHeaders?.['content-type']).toBeUndefined();
+    expect(calls[0].init?.body).toBeUndefined();
+  });
+
+  test('token-bearing putSwitch sends authorization Bearer', async () => {
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/config/switches/global.tools': () => ({ status: 200, body: { outcome: 'hot', switchId: 'global.tools' } }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl, token: 'tok-1' });
+    await client.putSwitch('global.tools', { value: 'readonly' });
+    expect(authHeader(calls[0].init)).toBe('Bearer tok-1');
+    const putHeaders = calls[0].init?.headers as Record<string, string>;
+    expect(putHeaders['content-type']).toBe('application/json');
+  });
+
+  test('client created without a token sends no authorization header', async () => {
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/health': () => ({ status: 200, body: { ok: true } }),
+      '/v1/config/switches/global.tools': () => ({ status: 200, body: { outcome: 'hot', switchId: 'global.tools' } }),
+      '/v1/setup/obsidian-skills': () => ({ status: 200, body: { obsidian: {}, skills: {} } }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl });
+    await client.getHealth();
+    await client.putSwitch('global.tools', { value: 'readonly' });
+    await client.getObsidianSkills();
+    for (const call of calls) {
+      expect(authHeader(call.init)).toBeUndefined();
+    }
+  });
+});
+
 describe('Error handling', () => {
   test('non-2xx throws NexusApiError', async () => {
     const { fetchImpl } = makeMockFetch({
@@ -299,6 +362,141 @@ describe('Error handling', () => {
     expect(err).toBeInstanceOf(NexusApiError);
     expect((err as NexusApiError).status).toBe(404);
     expect((err as NexusApiError).body).toEqual({ error: 'tab-not-found' });
+  });
+});
+
+describe('request timeout and retry', () => {
+  const timeoutMs = 10;
+  const abortError = new DOMException('signal is aborted without reason', 'AbortError');
+  function slowFetch(calls: RequestInit[], succeedOn?: number): typeof fetch {
+    return (async (_input: unknown, init?: RequestInit) => {
+      calls.push(init ?? {});
+      if (calls.length === succeedOn) return new Response('{"ok":true}', { status: 200 });
+      return new Promise<Response>((_resolve, reject) => {
+        if (init?.signal?.aborted) return reject(abortError);
+        init?.signal?.addEventListener('abort', () => reject(abortError), { once: true });
+      });
+    }) as typeof fetch;
+  }
+
+  test('GET times out once and returns the second response', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowFetch(calls, 2), timeoutMs });
+    expect((await client.getHealth()).ok).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].signal).not.toBe(calls[1].signal);
+  });
+
+  test('GET times out twice with a path-bearing NexusTimeoutError', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowFetch(calls), timeoutMs });
+    let caught: unknown;
+    try { await client.getHealth(); } catch (err) { caught = err; }
+    expect(caught).toBeInstanceOf(NexusTimeoutError);
+    expect((caught as NexusTimeoutError).path).toBe('/v1/health');
+    expect((caught as NexusTimeoutError).timeoutMs).toBe(timeoutMs);
+    expect((caught as NexusTimeoutError).message).toBe('NEXUS 가 0.01초 안에 답하지 않았습니다 (/v1/health) — 방금 켰다면 잠시 뒤 다시 시도하세요.');
+    expect(calls).toHaveLength(2);
+  });
+
+  test('POST times out without a retry', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowFetch(calls), timeoutMs });
+    await expect(client.createTab({ kind: 'chat' })).rejects.toBeInstanceOf(NexusTimeoutError);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe('POST');
+  });
+
+  test('caller abort before timeout remains the original AbortError', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowFetch(calls), timeoutMs });
+    const ctrl = new AbortController();
+    const pending = client.getTriggersSnapshot({ signal: ctrl.signal });
+    ctrl.abort();
+    let caught: unknown;
+    try { await pending; } catch (err) { caught = err; }
+    expect(caught).toBe(abortError);
+    expect(caught).not.toBeInstanceOf(NexusTimeoutError);
+    expect(calls).toHaveLength(1);
+  });
+
+  function slowBodyFetch(calls: RequestInit[], succeedOn?: number): typeof fetch {
+    return (async (_input: unknown, init?: RequestInit) => {
+      calls.push(init ?? {});
+      if (calls.length === succeedOn) return new Response('{"ok":true}', { status: 200 });
+      return {
+        ok: true,
+        json: () => new Promise<unknown>((_resolve, reject) => {
+          if (init?.signal?.aborted) return reject(abortError);
+          init?.signal?.addEventListener('abort', () => reject(abortError), { once: true });
+        }),
+      } as Response;
+    }) as typeof fetch;
+  }
+
+  test('GET retries when the first response body times out', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowBodyFetch(calls, 2), timeoutMs });
+    expect((await client.getHealth()).ok).toBe(true);
+    expect(calls).toHaveLength(2);
+  });
+
+  test('GET reports a timeout when both response bodies time out', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowBodyFetch(calls), timeoutMs });
+    let caught: unknown;
+    try { await client.getHealth(); } catch (err) { caught = err; }
+    expect(caught).toBeInstanceOf(NexusTimeoutError);
+    expect((caught as NexusTimeoutError).path).toBe('/v1/health');
+    expect(calls).toHaveLength(2);
+  });
+
+  test('POST does not retry when its response body times out', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowBodyFetch(calls), timeoutMs });
+    await expect(client.createTab({ kind: 'chat' })).rejects.toBeInstanceOf(NexusTimeoutError);
+    expect(calls).toHaveLength(1);
+  });
+
+  test('caller cancellation while reading the body preserves the AbortError', async () => {
+    const calls: RequestInit[] = [];
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl: slowBodyFetch(calls), timeoutMs });
+    const ctrl = new AbortController();
+    const pending = client.getTriggersSnapshot({ signal: ctrl.signal });
+    await Promise.resolve(); // Let fetch return its response before aborting the body read.
+    ctrl.abort();
+    let caught: unknown;
+    try { await pending; } catch (err) { caught = err; }
+    expect(caught).toBe(abortError);
+    expect(caught).not.toBeInstanceOf(NexusTimeoutError);
+    expect(calls).toHaveLength(1);
+  });
+
+  test('invalid JSON on HTTP error retains the null body and original message', async () => {
+    let calls = 0;
+    const fetchImpl = (async () => {
+      calls++;
+      return new Response('not json', { status: 503 });
+    }) as unknown as typeof fetch;
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl, timeoutMs });
+    let caught: unknown;
+    try { await client.getHealth(); } catch (err) { caught = err; }
+    expect(caught).toBeInstanceOf(NexusApiError);
+    expect((caught as NexusApiError).body).toBeNull();
+    expect((caught as NexusApiError).message).toBe('nexus 503 on /v1/health: null');
+    expect(calls).toBe(1);
+  });
+
+  test('HTTP error keeps its original message and is not retried', async () => {
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/health': () => ({ status: 503, body: { error: 'unavailable' } }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl, timeoutMs });
+    let caught: unknown;
+    try { await client.getHealth(); } catch (err) { caught = err; }
+    expect(caught).toBeInstanceOf(NexusApiError);
+    expect((caught as NexusApiError).message).toBe('nexus 503 on /v1/health: {"error":"unavailable"}');
+    expect(calls).toHaveLength(1);
   });
 });
 
@@ -505,6 +703,26 @@ describe('createNexusClient · getChatBackendDetection', () => {
 });
 
 describe('/setup wizard wire (Phase 1 · 2026-05-19)', () => {
+  test('answer priority GET and POST use the authenticated setup endpoint', async () => {
+    const sample: AnswerPriorityResponse = { value: null, effective: 'balanced', choices: [
+      { value: 'cost', label: '비용', description: '적은 도구' },
+    ] };
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/setup/answer-priority': (init) => init?.method === 'POST'
+        ? { status: 200, body: { value: 'quality' } }
+        : { status: 200, body: sample },
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl, token: 'setup-token' });
+    expect(await client.getAnswerPriority()).toEqual(sample);
+    expect(await client.setAnswerPriority('quality')).toEqual({ value: 'quality' });
+    expect(calls.map((call) => call.init?.method)).toEqual(['GET', 'POST']);
+    expect(calls.map((call) => call.url)).toEqual([
+      `${BASE}/v1/setup/answer-priority`, `${BASE}/v1/setup/answer-priority`,
+    ]);
+    expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({ value: 'quality' });
+    expect(JSON.stringify(calls[1]?.init?.headers)).toContain('Bearer setup-token');
+  });
+
   test('getLlmProviders surfaces catalog', async () => {
     const sample = {
       providers: [

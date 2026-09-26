@@ -4,7 +4,6 @@ import { describe, expect, it } from 'bun:test';
 import {
   createTelegramVoiceAdapter,
   TelegramVoiceUnavailableError,
-  isTelegramVoiceEnabled,
   normalizeTelegramVoiceReplyMode,
   type TelegramVoiceCodec,
 } from '../src/voice/channel-adapters/telegram-voice-adapter';
@@ -177,23 +176,6 @@ describe('createTelegramVoiceAdapter — generateReply replyMode resolution', ()
     const reply = await a.generateReply('안녕', { fromVoice: true });
     expect(reply.voiceOgg).toBeNull();
     expect(reply.text).toBe('안녕');
-  });
-});
-
-describe('isTelegramVoiceEnabled', () => {
-  const ORIGINAL = process.env.ELANOUS_TELEGRAM_VOICE;
-  it('false when unset', () => {
-    delete process.env.ELANOUS_TELEGRAM_VOICE;
-    expect(isTelegramVoiceEnabled()).toBe(false);
-    if (ORIGINAL !== undefined) process.env.ELANOUS_TELEGRAM_VOICE = ORIGINAL;
-  });
-  it('true for 1/true/on/yes (case-insensitive)', () => {
-    for (const v of ['1', 'true', 'on', 'YES', 'On']) {
-      process.env.ELANOUS_TELEGRAM_VOICE = v;
-      expect(isTelegramVoiceEnabled()).toBe(true);
-    }
-    if (ORIGINAL !== undefined) process.env.ELANOUS_TELEGRAM_VOICE = ORIGINAL;
-    else delete process.env.ELANOUS_TELEGRAM_VOICE;
   });
 });
 

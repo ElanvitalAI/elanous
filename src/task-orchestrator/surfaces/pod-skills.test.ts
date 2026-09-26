@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
@@ -77,6 +77,7 @@ describe('pod skills — code into the image, keys only into the run', () => {
     const applied: string[] = [];
     const kubectl: Kubectl = (args, input) => {
       if (input) applied.push(input);
+      if (args.includes('current-context')) return { status: 0, stdout: 'k3d-elanous-h1\n', stderr: '' };   // 컨텍스트 확인(Pod Job 이 어느 클러스터로 가나)
       if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
@@ -108,4 +109,22 @@ describe('pod skills — code into the image, keys only into the run', () => {
     expect(podImageFreshness({ run, skillsDigest: () => 'old' })).toMatchObject({ fresh: true });
     expect(podImageFreshness({ run })).toMatchObject({ fresh: true });   // 주입 시험은 스킬을 안 잰다
   });
+});
+
+// 🔐 2026-09-27: 개인 데이터·상태(data/ · .elanous/ · DB 파일)는 이미지로 가지 않는다 — 코드와 참조 자료만.
+test('podSkillFiles leaves out personal data dirs and database files but keeps code and references', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'elanous-pod-skill-'));
+  try {
+    for (const d of ['data/prep', '.elanous/debug', 'references', 'scripts']) mkdirSync(join(dir, d), { recursive: true });
+    writeFileSync(join(dir, 'SKILL.md'), '#');
+    writeFileSync(join(dir, 'scripts', 'run.sh'), 'echo');
+    writeFileSync(join(dir, 'references', 'ref.md'), 'r');
+    writeFileSync(join(dir, 'data', 'yt-vault.db'), 'x');
+    writeFileSync(join(dir, 'data', 'prep', 'a.json'), '{}');
+    writeFileSync(join(dir, '.elanous', 'debug', 'x.jsonl'), '{}');
+    writeFileSync(join(dir, 'cache.sqlite3'), 'x');
+    expect(podSkillFiles(dir)).toEqual(['SKILL.md', 'references/ref.md', 'scripts/run.sh']);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

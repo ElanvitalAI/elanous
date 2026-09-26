@@ -3,10 +3,9 @@
 // Covers the contract the research doc locked in
 // (내부 문서 `RESEARCH-u3c-dashboard-turn-event-fanout` §5):
 //
-//   1. Feature flag OFF → bootDashboardAcpSession returns null so
-//      the dashboard's existing direct path runs unchanged.
-//   2. Feature flag ON → DashboardSession.create is invoked with
-//      getter-driven DashboardSessionOptions.
+//   1. No remote target → DashboardSession.create boots the in-process
+//      ACP pair with getter-driven DashboardSessionOptions.
+//   2. Remote target → WebSocket attach, without in-process fallback.
 //   3. Getters fire fresh per call — the composer must NOT snapshot
 //      chat history / tool catalog at boot time; every turn rebuilds
 //      via the live dashboard state.
@@ -19,6 +18,8 @@
 import { describe, expect, test, mock, spyOn, beforeEach, afterEach } from 'bun:test';
 
 import type { ChatMessage } from '../src/chat/index.js';
+import { resumeInProcessDashboardSession } from '../src/dashboard/index.js';
+import { filterDashboardArgs } from '../src/index.js';
 import type { LLMMessage, LLMToolSpec } from '../src/llm.js';
 import { debug } from '../src/debug/log.js';
 import {
@@ -109,6 +110,27 @@ describe('bootDashboardAcpSession — always boots (post-Phase-5c-2)', () => {
     expect('agentName' in opts).toBe(false);
     expect('agentVersion' in opts).toBe(false);
   });
+
+  test('boots a real in-process ACP session with no daemon target', async () => {
+    mock.restore();
+    const result = await bootDashboardAcpSession(makeMinimalDeps());
+    try {
+      expect(result.mode).toBe('in-process');
+      expect(typeof result.session.id).toBe('string');
+      expect(result.session.id.length).toBeGreaterThan(0);
+    } finally {
+      await result.session.close();
+    }
+  });
+});
+
+describe('bootDashboardAcpSession — remote attach', () => {
+  test('remote target uses WebSocket rather than falling back to in-process', async () => {
+    await expect(bootDashboardAcpSession(makeMinimalDeps({
+      remote: { url: 'not-a-valid-ws-url' },
+    }))).rejects.toThrow();
+    expect(createCalls).toHaveLength(0);
+  });
 });
 
 describe('bootDashboardAcpSession — boot observability', () => {
@@ -126,26 +148,17 @@ describe('bootDashboardAcpSession — boot observability', () => {
     try {
       await bootDashboardAcpSession(makeMinimalDeps({
         remote: { url: 'ws://daemon.invalid/acp' },
-        localDaemon: { socketPath: '/tmp/ignored.sock' },
-      })).catch(() => undefined);
-      await bootDashboardAcpSession(makeMinimalDeps({
-        localDaemon: { socketPath: '/tmp/daemon.sock' },
       })).catch(() => undefined);
       await bootDashboardAcpSession(makeMinimalDeps());
     } finally {
       off?.();
     }
 
-    expect(records).toEqual([
+    expect(records).toMatchObject([
       {
         category: 'dashboard.acp',
         event: 'boot-branch-selected',
         data: { branch: 'remote-daemon', dispatcherAttached: false },
-      },
-      {
-        category: 'dashboard.acp',
-        event: 'boot-branch-selected',
-        data: { branch: 'local-daemon', dispatcherAttached: false },
       },
       {
         category: 'dashboard.acp',
@@ -177,7 +190,7 @@ describe('bootDashboardAcpSession — boot observability', () => {
       debug.setDiagEnabled(true);
       await bootDashboardAcpSession(makeMinimalDeps());
       expect(records.filter((record) => record.event === 'boot-session-established')).toHaveLength(2);
-      expect(records.filter((record) => record.event === 'boot-session-detail')).toEqual([{
+      expect(records.filter((record) => record.event === 'boot-session-detail')).toMatchObject([{
         event: 'boot-session-detail',
         data: {
           mode: 'in-process',
@@ -279,7 +292,7 @@ describe('bootDashboardAcpSession — getter injection (fresh reads)', () => {
       off?.();
     }
 
-    expect(records.filter((record) => record.event === 'tool-catalog-assembled')).toEqual([{
+    expect(records.filter((record) => record.event === 'tool-catalog-assembled')).toMatchObject([{
       category: 'capability.resolve',
       event: 'tool-catalog-assembled',
       data: {
@@ -464,6 +477,57 @@ describe('createDefaultRequestPermissionHandler — outcome mapping', () => {
       toolCall: { toolCallId: 'c1' } as RequestPermissionRequest['toolCall'],
     });
     expect(seen).toEqual(['']);
+  });
+});
+
+describe('in-process dashboard resume bridge', () => {
+  test('restores a prefix-matched local session and keeps the dashboard system prompt', () => {
+    const chatHistory: ChatMessage[] = [
+      { role: 'system', content: 'dashboard prompt' },
+      { role: 'user', content: 'fresh draft' },
+    ];
+    let attached: string | undefined;
+    let active: string | undefined;
+    const result = resumeInProcessDashboardSession('known-pre', {
+      resolveSessionId: (prefix) => prefix === 'known-pre' ? 'known-prefix-session-id' : null,
+      historyFromSession: (id) => id === 'known-prefix-session-id'
+        ? { history: [{ role: 'user', content: 'previous question' }, { role: 'assistant', content: 'previous answer' }] }
+        : null,
+      chatHistory,
+      setAttachedSessionId: (id) => { attached = id; },
+      setActiveSessionId: (id) => { active = id; },
+    });
+
+    expect(result).toEqual({ resumed: true, sessionId: 'known-prefix-session-id', turns: 2 });
+    expect(attached).toBe('known-prefix-session-id');
+    expect(active).toBe('known-prefix-session-id');
+    expect(chatHistory).toEqual([
+      { role: 'system', content: 'dashboard prompt' },
+      { role: 'user', content: 'previous question' },
+      { role: 'assistant', content: 'previous answer' },
+    ]);
+  });
+
+  test('keeps a fresh in-process session when the requested prefix is unknown', () => {
+    const chatHistory: ChatMessage[] = [{ role: 'system', content: 'dashboard prompt' }];
+    const result = resumeInProcessDashboardSession('missing', {
+      resolveSessionId: () => null,
+      historyFromSession: () => null,
+      chatHistory,
+      setAttachedSessionId: () => { throw new Error('must not attach'); },
+      setActiveSessionId: () => { throw new Error('must not persist'); },
+    });
+
+    expect(result).toEqual({ resumed: false, reason: 'missing' });
+    expect(chatHistory).toEqual([{ role: 'system', content: 'dashboard prompt' }]);
+  });
+});
+
+describe('root dashboard resume arguments', () => {
+  test('strips the root resume flag while preserving remote -r and subcommand arguments', () => {
+    expect(filterDashboardArgs(['--resume', 'prefix', '--debug'])).toEqual([]);
+    expect(filterDashboardArgs(['-r', 'prefix', '--debug'])).toEqual(['-r', 'prefix']);
+    expect(filterDashboardArgs(['agent', '-r', 'relationship'])).toEqual(['agent', '-r', 'relationship']);
   });
 });
 

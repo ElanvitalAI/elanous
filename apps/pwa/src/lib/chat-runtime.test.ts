@@ -17,6 +17,7 @@ import { parseElanousFeedbackEnvelope } from './elanous-feedback-envelope';
 import { FEEDBACK_KINDS } from './feedback-envelope';
 import * as feedbackBlockAccumulator from './feedback-block-accumulator';
 import {
+  dispatchMeta,
   isMetaCommand,
   newMetaMessage,
   newUserMessage,
@@ -25,6 +26,7 @@ import {
   runChatTurn,
   runChatTurnAcp,
   type ChatBlock,
+  type ChatMessage,
   type ChatRuntimeContext,
 } from './chat-runtime';
 
@@ -1034,6 +1036,98 @@ describe('runAcpForeignTurnObserver — CV-1 cross-surface mirror', () => {
     dispose();
     await new Promise((r) => setTimeout(r, 60));
     expect(finalizes).toEqual([]);
+  });
+});
+
+describe(':budget · :history · :help', () => {
+  const budgetBody = {
+    status: 'ok',
+    percent: null,
+    notifyAtPct: 80,
+    monthSoFarUsd: 0,
+    monthYYYYMM: '2026-09',
+  };
+
+  function ctxWith(
+    extra: Partial<ChatRuntimeContext> = {},
+  ): ChatRuntimeContext {
+    return { ...makeCtx(), ...extra };
+  }
+
+  it(':budget prints the fake status as one line', async () => {
+    globalThis.fetch = mockResponse({ status: 200, body: budgetBody });
+    const result = await dispatchMeta(':budget', ctxWith({
+      daemon: { baseUrl: 'http://localhost:31415', token: 'tok' },
+    }));
+    expect(result?.text).toBe('budget 2026-09: $0.00 · 알림 80%');
+    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/budget/status');
+    expect(result?.text).not.toContain('TODO');
+  });
+
+  it(':budget says the status could not be read when fetch returns null', async () => {
+    globalThis.fetch = mockResponse({ status: 503, body: { error: 'down' } });
+    const result = await dispatchMeta(':budget', ctxWith({
+      daemon: { baseUrl: 'http://localhost:31415' },
+    }));
+    expect(result?.text).toBe('예산 상태를 읽지 못했습니다');
+  });
+
+  it(':budget says the status could not be read when daemon settings are absent', async () => {
+    const result = await dispatchMeta(':budget', ctxWith());
+    expect(result?.text).toBe('예산 상태를 읽지 못했습니다');
+    expect(calls).toHaveLength(0);
+  });
+
+  it(':history summarizes the local buffer as role: first 80 chars and does not call the server', async () => {
+    const long = '가'.repeat(90);
+    const messages: ChatMessage[] = [
+      { id: 'u1', role: 'user', text: long, timestamp: 1 },
+      { id: 'a1', role: 'assistant', text: '짧은 답', timestamp: 2 },
+    ];
+    const result = await dispatchMeta(':history', ctxWith({ messages }));
+    expect(result?.text).toBe(`user: ${'가'.repeat(80)}\nassistant: 짧은 답`);
+    expect(calls).toHaveLength(0);
+  });
+
+  it(':history on an empty buffer says there is no conversation yet', async () => {
+    const result = await dispatchMeta(':history', ctxWith({ messages: [] }));
+    expect(result?.text).toBe('아직 대화가 없습니다');
+  });
+
+  it(':history defaults to the last 10 turns', async () => {
+    const messages: ChatMessage[] = Array.from({ length: 12 }, (_, i) => ({
+      id: `m${i}`,
+      role: i % 2 === 0 ? 'user' as const : 'assistant' as const,
+      text: `turn-${i}`,
+      timestamp: i,
+    }));
+    const result = await dispatchMeta(':history', ctxWith({ messages }));
+    const lines = result?.text.split('\n') ?? [];
+    expect(lines).toHaveLength(10);
+    expect(lines[0]).toBe('user: turn-2');
+    expect(lines[9]).toBe('assistant: turn-11');
+  });
+
+  it(':help output contains no TODO and describes :budget and :history', async () => {
+    const result = await dispatchMeta(':help', ctxWith());
+    expect(result?.text).not.toContain('TODO');
+    expect(result?.text).toContain(':budget');
+    expect(result?.text).toContain(':history');
+    expect(result?.text).toContain(':session');
+    expect(result?.text).toContain(':fork');
+    expect(result?.text).toContain(':provider');
+    expect(result?.text).toContain(':clear');
+  });
+
+  it(':session · :provider · :clear keep their previous replies', async () => {
+    const ctx = ctxWith();
+    expect((await dispatchMeta(':session', ctx))?.text).toBe('session = session-1');
+    expect((await dispatchMeta(':provider', ctx))?.text).toBe('current provider = anthropic');
+    expect((await dispatchMeta(':provider grok', ctx))?.newProvider).toBe('grok');
+    expect((await dispatchMeta(':clear', ctx))?.text).toBe('__CLEAR__');
+    const forked = await dispatchMeta(':fork', ctx);
+    expect(forked?.newSessionId).toBeTruthy();
+    expect(forked?.text).toContain('forked → new session');
   });
 });
 

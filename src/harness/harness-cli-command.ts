@@ -4,12 +4,13 @@ import { resolve } from 'node:path';
 import { Command, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, parseGoalType, type GoalType } from '../self-implement/goal-author.js';
-import { parseRunControlValue } from '../self-implement/run-controls.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { loadFederatedRunLedger, loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
 import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
+import { debug } from '../debug/log.js';
+import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
@@ -79,7 +80,6 @@ export interface HarnessAskSayOptions {
   observeOnly?: boolean;
   supervise?: boolean;
   supervisorSource?: HarnessSupervisorSource;
-  graph?: boolean;
   goalType?: GoalType;
   correlation?: string;
 }
@@ -145,11 +145,6 @@ function registerHarnessCommonOptions(command: Command): Command {
     .addOption(new Option('--no-auto-merge', 'self: PR 생성 후 자동 병합을 끔'))
     .option('--observe-only', 'elanous: child boot부터 SelfImplement 호출을 기록만 한다')
     .addOption(new Option('--no-supervise', 'self: supervisor 재개를 끔').hideHelp())
-    .option('--graph <on|off>', 'self: graph authority를 이번 런에만 설정', (value: string) => {
-      const parsed = parseRunControlValue('graph', value);
-      if (parsed === undefined) throw new HarnessCliInputError(`--graph 값은 on 또는 off여야 함: ${value}`);
-      return parsed as boolean;
-    })
     .option('--dry-run', '변경 없이 발사 계획만 출력');
 }
 
@@ -210,7 +205,6 @@ function printHarnessLaunchDryRun(preview: {
   readonly wouldStart: string;
   readonly goalPath?: string;
   readonly goalType?: GoalType;
-  readonly graph?: boolean;
   readonly target?: string;
 }): void {
   console.log(`[dry-run] 입력: ${preview.input}`);
@@ -218,7 +212,6 @@ function printHarnessLaunchDryRun(preview: {
   console.log(`[dry-run] 시작 예정: ${preview.wouldStart}`);
   console.log('[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
   printHarnessAskMarkerDryRun(preview.goalPath);
-  if (preview.graph !== undefined) console.log(`[dry-run] graph authority: ${preview.graph ? 'on' : 'off'}`);
   if (preview.goalPath) console.log(renderGoalTemplateDryRun(preview.goalPath, preview.goalType));
   if (preview.target !== undefined) {
     const target = resolveHarnessTarget(preview.target);
@@ -234,7 +227,10 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .option('--force-preflight', '전제 검사 막힘을 명시 요청으로 우회(관측에 남음)')
     .option('--child-llm-provider <id>', 'self: 구현 자식 LLM provider(--child-llm-model과 함께)')
     .option('--child-llm-model <id>', 'self: 구현 자식 LLM model(--child-llm-provider와 함께)')
-    .option('--child-llm-effort <level>', 'self: 구현 자식 추론 노력 minimal|low|medium|high|xhigh|max — 모델 상한을 넘으면 «거부»한다(--child-llm-provider와 함께)');
+    .option('--child-llm-effort <level>', 'self: 구현 자식 추론 노력 minimal|low|medium|high|xhigh|max — 모델 상한을 넘으면 «거부»한다(--child-llm-provider와 함께)')
+    .addOption(new Option('--substrate <kind>', '실행 칸 — local(기본 · 이 기계) | pod(k8s Pod · 같은 그래프가 원격에서 돈다 · 풀·이미지 판·계정은 자동)').choices(['local', 'pod']))
+    .option('--pod-pool <spec>', 'pod: 풀 — 컨텍스트[@ssh호스트][:상한] 쉼표로(앞이 우선) · 없으면 ELANOUS_POD_POOL · 그것도 없으면 현재 컨텍스트')
+    .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께');
 }
 
 function registerHarnessPlanOptions(command: Command): Command {
@@ -259,7 +255,6 @@ function normalizeHarnessCommonOptions(opts: HarnessAskSayOptions): HarnessAskSa
     ...(opts.target !== undefined ? { target: opts.target } : {}),
     ...(opts.autoMerge === false ? { autoMerge: false } : {}),
     ...(opts.observeOnly ? { observeOnly: true } : {}),
-    ...(opts.graph !== undefined ? { graph: opts.graph } : {}),
     ...(opts.goalType !== undefined ? { goalType: opts.goalType } : {}),
     ...resolveHarnessSupervisor(opts),
   };
@@ -298,6 +293,25 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 }
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
+type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string };
+function podSubstrate(opts: unknown): boolean {
+  return (opts as HarnessSubstrateOpts).substrate === 'pod';
+}
+/** ⭐ 런 계약의 실행 칸 = pod — 호스트는 그래프를 안 돌리고 Pod 로 보낸다(harness-pod-dispatch.ts). */
+async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-say', input: string): Promise<void> {
+  const o = opts as HarnessSubstrateOpts;
+  if (o.target !== undefined) {
+    debug.log('harness.pod', 'target-refused', { target: o.target });
+    console.error('`--target` 은 Pod 경로에서 아직 지원하지 않는다 — 로컬로 돌리거나 `--target` 을 빼라');
+    console.error('Pod 로 특정 원천을 주려면 `--source`');
+    process.exitCode = 2;
+    return;
+  }
+  const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
+  const status = dispatchHarnessOnPod({ entrance, input, ...(o.podPool ? { podPool: o.podPool } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) });
+  if (status !== 0) process.exitCode = status;
+}
+
 async function dispatchHarnessAskSay(
   opts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts,
   dryRunPreview: {
@@ -1151,6 +1165,61 @@ function defaultListHarnessWorktreePaths(): HarnessWorktreeListObservation {
   }
 }
 
+/** 사람 모드 한 줄. JSON 은 호출자가 마지막 줄에 따로 찍는다. */
+export function formatBudgetLine(decision: BudgetDecision): string {
+  const who = decision.provider
+    ? `${decision.provider}${decision.model ? `/${decision.model}` : ''}`
+    : '(provider 없음)';
+  const why = decision.reasons.length > 0 ? decision.reasons.join(' · ') : '(이유 없음)';
+  return `budget: ${decision.action} ${who} — ${why}`;
+}
+
+/** 마지막 줄 JSON. `outcome` 은 그래프 러너가 간선을 고르는 칸과 같은 이름이다. */
+export function budgetOutcomeJson(decision: BudgetDecision): string {
+  return JSON.stringify({
+    outcome: decision.action,
+    provider: decision.provider ?? null,
+    model: decision.model ?? null,
+    reasons: [...decision.reasons],
+  });
+}
+
+/**
+ * `elanous harness budget [--json]`.
+ * 읽기(`readBudgetInputs`)와 판정(`decideBudget`)을 이 순서로 부른다.
+ * dev-cli·흡수 크론에 자동 적용하지 않는다.
+ */
+export async function runHarnessBudget(opts: { json?: boolean } = {}, io: {
+  log: (line: string) => void;
+  read?: () => BudgetInputs | Promise<BudgetInputs>;
+} = { log: (line) => console.log(line) }): Promise<BudgetDecision> {
+  const inputs = await (io.read ?? readBudgetInputsLive)();
+  const decision = decideBudget(inputs);
+  try {
+    debug.log('harness.budget-gate', 'decided', {
+      action: decision.action,
+      provider: decision.provider,
+      reasons: [...decision.reasons],
+    });
+  } catch { /* observation must not block the decision */ }
+  if (opts.json) {
+    io.log(budgetOutcomeJson(decision));
+  } else {
+    io.log(formatBudgetLine(decision));
+  }
+  return decision;
+}
+
+function installHarnessBudgetCommand(harnessCmd: Command): Command {
+  return harnessCmd
+    .command('budget')
+    .description('선호·사용량·상한으로 이번 판을 돌릴지 정한다. --json 이면 마지막 줄이 outcome JSON.')
+    .option('--json', '마지막 줄에 { outcome, provider, model, reasons } 를 찍는다')
+    .action(async (opts: { json?: boolean }) => {
+      await runHarnessBudget({ json: opts.json === true });
+    });
+}
+
 function installHarnessProcessObservationCommand(
   harnessCmd: Command,
   deps: HarnessProcessObservationDeps = {},
@@ -1198,6 +1267,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   installHarnessCliSinkHook(harnessCmd, deps.registerSink, deps.resolveSurface);
   installDeliverableVerifyCliCommand(harnessCmd, deps.deliverableVerify);
   installHarnessProcessObservationCommand(harnessCmd, deps.processObservation);
+  installHarnessBudgetCommand(harnessCmd);
 
   const ask = deps.ask;
   if (ask) {
@@ -1211,10 +1281,16 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             wouldStart: '워크트리 · 브랜치 · 자식 · 파이프라인',
             goalPath,
             ...(opts.goalType !== undefined ? { goalType: opts.goalType } : {}),
-            ...(opts.graph !== undefined ? { graph: opts.graph } : {}),
             ...(opts.target !== undefined ? { target: opts.target } : {}),
           },
-          () => ask(goalPath, normalizeHarnessAskSayOptions(opts)),
+          () => {
+            if (!podSubstrate(opts) && (opts as { source?: string }).source !== undefined) {
+              console.error('`--source` 는 `--substrate pod` 와 함께');
+              process.exitCode = 2;
+              return Promise.resolve();
+            }
+            return podSubstrate(opts) ? onPod(opts, 'cli-harness-ask', goalPath) : ask(goalPath, normalizeHarnessAskSayOptions(opts));
+          },
         );
       });
   }
@@ -1229,10 +1305,16 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             input: sentence.join(' '),
             entrance: 'cli-harness-say',
             wouldStart: '골 문서 · 워크트리 · 브랜치 · 자식 · 파이프라인',
-            ...(opts.graph !== undefined ? { graph: opts.graph } : {}),
             ...(opts.target !== undefined ? { target: opts.target } : {}),
           },
-          () => say(sentence, normalizeHarnessAskSayOptions(opts)),
+          () => {
+            if (!podSubstrate(opts) && (opts as { source?: string }).source !== undefined) {
+              console.error('`--source` 는 `--substrate pod` 와 함께');
+              process.exitCode = 2;
+              return Promise.resolve();
+            }
+            return podSubstrate(opts) ? onPod(opts, 'cli-harness-say', sentence.join(' ')) : say(sentence, normalizeHarnessAskSayOptions(opts));
+          },
         );
       });
   }

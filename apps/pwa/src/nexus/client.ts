@@ -12,6 +12,7 @@
 //
 // SSE: subscribeEvents({topics, onEvent}) returns an Unsubscribe function.
 
+import { reportAuthRequired } from '../lib/auth-required';
 import { debugLog } from '../lib/debug';
 import type {
   NexusHealth,
@@ -29,6 +30,13 @@ export class NexusApiError extends Error {
   ) {
     super(`nexus ${status} on ${path}: ${stringify(body)}`);
     this.name = 'NexusApiError';
+  }
+}
+
+export class NexusTimeoutError extends Error {
+  constructor(public readonly path: string, public readonly timeoutMs: number) {
+    super(`NEXUS 가 ${timeoutMs / 1000}초 안에 답하지 않았습니다 (${path}) — 방금 켰다면 잠시 뒤 다시 시도하세요.`);
+    this.name = 'NexusTimeoutError';
   }
 }
 
@@ -76,6 +84,8 @@ export interface NexusClientOpts {
   baseUrl: string;
   /** Test seam — defaults to globalThis.fetch. */
   fetchImpl?: typeof fetch;
+  /** Bearer credential sent on every request when present. */
+  token?: string;
   /** Default request timeout (ms). 0 = no timeout. Default 8000. */
   timeoutMs?: number;
 }
@@ -171,6 +181,15 @@ export interface NexusClient {
   /** PWA `/setup` Phase 1 — apply provider + apiKey. apiKey-flow + auto-
    *  flow only · codex / local surface 422 with TUI hint (Phase 1b). */
   setLlmProvider(body: SetLlmProviderBody): Promise<SetLlmProviderResponse>;
+  getObsidianSkills(): Promise<ObsidianSkillsState>;
+  setObsidian(body: { vault: string }): Promise<{ ok: true; obsidian: { vault: string }; warning?: string }>;
+  setSkills(body: { activeSet: string } | { dirs: string[] }): Promise<{ ok: true; skills: { activeSet: string; dirs: string[] } }>;
+  getChannelBots(): Promise<ChannelBotsResponse>;
+  setChannelBot(body: ChannelBotSetBody): Promise<ChannelBotSetResponse>;
+  getChildLlmPreference(): Promise<ChildLlmPreferenceResponse>;
+  setChildLlmPreference(body: ChildLlmPreferenceBody): Promise<{ resolved: ChildLlmResolved }>;
+  getAnswerPriority(): Promise<AnswerPriorityResponse>;
+  setAnswerPriority(value: AnswerPriorityValue): Promise<{ value: AnswerPriorityValue }>;
   // ---- /settings PersonaCard (Phase 3 · 2026-05-19) ----
   /** §6.4 (existing) — list loaded personas + descriptions. */
   getPersonas(): Promise<PersonasListResponse>;
@@ -427,6 +446,51 @@ export interface SetLlmProviderResponse {
   };
 }
 
+export type AnswerPriorityValue = 'cost' | 'balanced' | 'quality' | 'exhaustive';
+export interface AnswerPriorityResponse {
+  value: AnswerPriorityValue | null;
+  effective: AnswerPriorityValue;
+  choices: Array<{ value: AnswerPriorityValue; label: string; description: string }>;
+}
+
+export type ChildLlmMode = 'pinned' | 'auto';
+export type ChildLlmOnShortfall = 'decompose' | 'wait-reset' | 'next-provider' | 'proceed';
+
+export interface ChildLlmChainEntry {
+  provider: string;
+  model?: string;
+}
+
+export interface ChildLlmResolved {
+  mode: ChildLlmMode;
+  chain: ChildLlmChainEntry[];
+  budgetGate: {
+    minHeadroomPercent: number;
+    onShortfall: ChildLlmOnShortfall;
+  };
+  source: { mode: 'explicit' | 'inferred'; chain: 'config' | 'pinned' | 'fallbackChain' };
+}
+
+export interface ChildLlmPreferenceResponse {
+  resolved: ChildLlmResolved;
+  providers: string[];
+}
+
+export interface ChildLlmPreferenceBody {
+  mode?: ChildLlmMode;
+  chain?: ChildLlmChainEntry[];
+  budgetGate?: { minHeadroomPercent?: number; onShortfall?: ChildLlmOnShortfall };
+}
+
+export interface ObsidianSkillsState {
+  obsidian: { vault: string; exists: boolean; looksLikeVault: boolean };
+  skills: {
+    activeSet: string;
+    dirs: string[];
+    presets: Array<{ key: string; label: string; dir: string | null; exists: boolean }>;
+  };
+}
+
 // /settings PersonaCard (Phase 3 · 2026-05-19) — wire types for persona
 // list + description PATCH. Mirror of `src/nexus/api/personas.ts`
 // `PersonaWire` (subset of `PersonaProfile`).
@@ -454,6 +518,17 @@ export interface PersonaPatchResponse {
 // BACKLOG #2 — GET /v1/platforms wire format. Mirrors
 // `src/nexus/api/platforms.ts:PlatformEntry`. Server never returns
 // secret values; `detail` and `hint` are human-readable strings.
+export type ChannelBotPlatform = 'telegram' | 'discord';
+export interface ChannelBotState {
+  platform: ChannelBotPlatform;
+  configured: boolean;
+  source: 'tokenRef' | 'env' | 'plaintext' | null;
+  allowedUsers: string[];
+}
+export interface ChannelBotsResponse { platforms: ChannelBotState[] }
+export interface ChannelBotSetBody { platform: ChannelBotPlatform; token?: string; allowedUsers?: string[] }
+export interface ChannelBotSetResponse { ok: true; botName?: string; restartNeeded: true }
+
 export type PlatformId = 'discord' | 'telegram' | 'pushcut' | 'acp' | 'tailscale';
 export type PlatformStatus = 'connected' | 'not-configured';
 export interface PlatformEntry {
@@ -755,6 +830,7 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
   const baseUrl = opts.baseUrl.replace(/\/$/, '');
   const fetchImpl = opts.fetchImpl ?? fetch;
   const defaultTimeoutMs = opts.timeoutMs ?? 8000;
+  const optsToken = opts.token;
 
   async function request<T>(
     method: string,
@@ -763,41 +839,77 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     opts?: { signal?: AbortSignal },
   ): Promise<T> {
     const url = `${baseUrl}${path}`;
-    // Compose: timeout signal (internal) + caller-supplied signal (optional).
-    // Either firing aborts the fetch.
-    const ctrl = defaultTimeoutMs > 0 || opts?.signal ? new AbortController() : null;
-    const timer = ctrl && defaultTimeoutMs > 0
-      ? setTimeout(() => ctrl.abort(), defaultTimeoutMs)
-      : null;
-    let cleanupExternalAbort: (() => void) | null = null;
-    if (ctrl && opts?.signal) {
-      const ext = opts.signal;
-      if (ext.aborted) {
-        ctrl.abort();
-      } else {
-        const onAbort = () => ctrl.abort();
-        ext.addEventListener('abort', onAbort);
-        cleanupExternalAbort = () => ext.removeEventListener('abort', onAbort);
+    for (let attempt = 0; ; attempt++) {
+      // Each attempt owns its timer and abort bridge; a timed-out signal cannot
+      // leak into the retry, and caller cancellation always wins if it fires first.
+      const ctrl = defaultTimeoutMs > 0 || opts?.signal ? new AbortController() : null;
+      let timedOut = false;
+      let cleanupExternalAbort: (() => void) | null = null;
+      if (ctrl && opts?.signal) {
+        const ext = opts.signal;
+        if (ext.aborted) {
+          ctrl.abort();
+        } else {
+          const onAbort = () => ctrl.abort();
+          ext.addEventListener('abort', onAbort);
+          cleanupExternalAbort = () => ext.removeEventListener('abort', onAbort);
+        }
       }
-    }
-    try {
-      const res = await fetchImpl(url, {
-        method,
-        ...(ctrl ? { signal: ctrl.signal } : {}),
-        ...(body !== undefined
-          ? {
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify(body),
-            }
-          : {}),
+      const timer = ctrl && defaultTimeoutMs > 0
+        ? setTimeout(() => {
+          if (!ctrl.signal.aborted) {
+            timedOut = true;
+            ctrl.abort();
+          }
+        }, defaultTimeoutMs)
+        : null;
+      try {
+        const res = await fetchImpl(url, {
+          method,
+          ...(ctrl ? { signal: ctrl.signal } : {}),
+          ...((body !== undefined || optsToken) ? {
+            headers: {
+              ...(body !== undefined ? { 'content-type': 'application/json' } : {}),
+              ...(optsToken ? { authorization: `Bearer ${optsToken}` } : {}),
+            },
+          } : {}),
+          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        });
+        if (res.status === 401) reportAuthRequired(path);
+        let parsed: unknown = null;
+        try {
+          parsed = await res.json();
+        } catch (err) {
+          // Only malformed JSON keeps the old null body; an interrupted read
+          // reaches the outer timeout/caller-cancellation handler.
+          if (!(err instanceof SyntaxError)) throw err;
+        }
+        if (!res.ok) throw new NexusApiError(res.status, path, parsed);
+        return parsed as T;
+      } catch (err) {
+        if (!timedOut || !(err instanceof Error) || err.name !== 'AbortError') throw err;
+        if (method !== 'GET' || attempt > 0) throw new NexusTimeoutError(path, defaultTimeoutMs);
+      } finally {
+        if (timer != null) clearTimeout(timer);
+        cleanupExternalAbort?.();
+      }
+      await new Promise<void>((resolve, reject) => {
+        const ext = opts?.signal;
+        if (ext?.aborted) {
+          reject(new DOMException('aborted', 'AbortError'));
+          return;
+        }
+        const onAbort = () => {
+          clearTimeout(delay);
+          ext?.removeEventListener('abort', onAbort);
+          reject(new DOMException('aborted', 'AbortError'));
+        };
+        const delay = setTimeout(() => {
+          ext?.removeEventListener('abort', onAbort);
+          resolve();
+        }, 100);
+        ext?.addEventListener('abort', onAbort, { once: true });
       });
-      let parsed: unknown = null;
-      try { parsed = await res.json(); } catch { /* not JSON */ }
-      if (!res.ok) throw new NexusApiError(res.status, path, parsed);
-      return parsed as T;
-    } finally {
-      if (timer != null) clearTimeout(timer);
-      if (cleanupExternalAbort) cleanupExternalAbort();
     }
   }
 
@@ -871,6 +983,15 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     // ---- /setup wizard (Phase 1 · 2026-05-19) ----
     getLlmProviders: () => request<LlmProvidersResponse>('GET', '/v1/setup/llm-providers'),
     setLlmProvider: (body) => request<SetLlmProviderResponse>('POST', '/v1/setup/llm-provider', body),
+    getObsidianSkills: () => request<ObsidianSkillsState>('GET', '/v1/setup/obsidian-skills'),
+    setObsidian: (body) => request('POST', '/v1/setup/obsidian', body),
+    setSkills: (body) => request('POST', '/v1/setup/skills', body),
+    getChannelBots: () => request<ChannelBotsResponse>('GET', '/v1/setup/channel-bots'),
+    setChannelBot: (body) => request<ChannelBotSetResponse>('POST', '/v1/setup/channel-bot', body),
+    getChildLlmPreference: () => request<ChildLlmPreferenceResponse>('GET', '/v1/setup/child-llm'),
+    setChildLlmPreference: (body) => request<{ resolved: ChildLlmResolved }>('POST', '/v1/setup/child-llm', body),
+    getAnswerPriority: () => request<AnswerPriorityResponse>('GET', '/v1/setup/answer-priority'),
+    setAnswerPriority: (value) => request<{ value: AnswerPriorityValue }>('POST', '/v1/setup/answer-priority', { value }),
     // ---- /settings PersonaCard (Phase 3 · 2026-05-19) ----
     getPersonas: () => request<PersonasListResponse>('GET', '/v1/personas'),
     patchPersonaDescription: (personaId, description) =>

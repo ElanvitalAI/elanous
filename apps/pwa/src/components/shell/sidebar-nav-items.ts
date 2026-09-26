@@ -16,6 +16,7 @@ import {
   Layers2,
   Lightbulb,
   LineChart,
+  Inbox,
   MessageSquare,
   Settings,
   Sliders,
@@ -62,7 +63,6 @@ export interface NonMenuSidebarRoute {
 
 /** 메뉴 밖 주소의 분류와 대표 결정. 동적 주소는 런타임 진입 parent를 기록한다. */
 export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
-  { href: '/intake', category: 'retired', reason: '"intake=장소" 대신 "말하면 미션이 된다"는 보이지 않는 게이트로 흡수.' },
   { href: '/share', category: 'system-share-target', reason: '운영체제가 공유 동작으로 호출하는 Share Target 진입점.' },
   { href: '/missions', category: 'dynamic-route-parent', reason: '`[id]`를 받는 동적 주소이며 부모 경로 자체는 없다.' },
   { href: '/setup', category: 'provider-onboarding', reason: 'LLM provider 온보딩 진입점.' },
@@ -76,6 +76,7 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   // 기존 분류는 은퇴·시스템 진입·동적 부모·온보딩·하위 흐름·루트·오류·미배선뿐이라,
   // 일반 목적지가 아닌 이 진단 화면을 나타낼 분류가 없어 diagnostic-readonly를 추가한다.
   { href: '/design-check', category: 'diagnostic-readonly', reason: 'DESIGN.md 규칙집 상태를 확인하는 순수 읽기 진단 화면.' },
+  { href: '/botlab', category: 'diagnostic-readonly', reason: '봇 화면 «벽»을 한 자리에서 보는 읽기 진단 화면(#15390 · 봇 운영자용).' },
 ];
 
 /** 사용자 빈도순 (Terminal · Chat 최상단). Phase 2 (PWA chat ↔ voice
@@ -84,13 +85,11 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
 export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { href: '/term', label: 'Terminal', hint: '터미널 + agent dock', icon: TerminalSquare, kind: 'term' },
   { href: '/chat', label: 'Chat', hint: '채팅 (스트리밍 · multimodal · mic)', icon: MessageSquare, kind: 'chat' },
+  // 2026-09-26 대표 결정으로 되살림 · RFC-pwa-intake-front-door
+  { href: '/intake', label: 'Intake', hint: '넣으면 흡수 · 작업 · 그래프로 (URL · 미션 · 메모)', icon: Inbox, kind: null },
   { href: '/showroom', label: 'Showroom', hint: 'multi-agent 동시 비교 (broadcast · CV-3)', icon: LayoutGrid, kind: null },
   { href: '/bots', label: 'Bots', hint: '봇 신원 + 공통 명령 카탈로그 (읽기 전용)', icon: Bot, kind: null },
   { href: '/observatory', label: 'Observatory', hint: 'subject 관측 (talk · screen · agent)', icon: Telescope, kind: null },
-  // Intake 탭 제거(2026-07-09 · narrow-waist V3) — "intake=장소"가 아니라 "말하면
-  // 미션이 된다"는 보이지 않는 게이트로 흡수. 포착은 Autopilot Missions 골던지기
-  // 컴포저(PWA) + 텔레그램 "미션:" 마커. /intake 는 /autopilot 으로 리다이렉트.
-  // 설계: 내부 문서 `DESIGN-intent-narrow-waist-2026-07-09` §3·§8.
   // Autopilot (2026-07-09 · 겹침 해소 F2) — 미션 지휘 센터(PFC Layer2).
   // Missions(사람+자율 미션 계보·인라인 골 던지기)·Repo Watch·자율행동·루프 4 서브탭.
   // 구 Triage 탭은 Missions 인라인 컴포저로 흡수(intake 와 "두 문" 겹침 해소). kind=null 직접 진입.

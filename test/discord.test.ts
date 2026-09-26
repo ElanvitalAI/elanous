@@ -219,6 +219,35 @@ describe('DiscordBot', () => {
     await p;
   });
 
+  test('reaction emoji start and completion stay on without a config switch', async () => {
+    for (const fails of [false, true]) {
+      MockWs.instances.length = 0;
+      const { fetchImpl, calls } = makeStubFetch((call) => {
+        if (call.url.endsWith('/users/@me')) return { id: 'bot', username: 'b' };
+        if (call.method === 'POST' && call.url.includes('/messages')) return { id: 'new-msg' };
+        return {};
+      });
+      const bot = new DiscordBot({
+        token: 'xyz', allowedUsers: ['user-42'],
+        onMessage: async () => { if (fails) throw new Error('oops'); return 'ok'; },
+        fetchImpl, wsImpl: MockWs as any,
+      });
+      const p = bot.start();
+      await new Promise(r => setTimeout(r, 5));
+      const ws = MockWs.instances[0]!;
+      ws.fire({ op: 10, d: { heartbeat_interval: 41250 } });
+      ws.fire({ op: 0, t: 'MESSAGE_CREATE', s: 1, d: {
+        id: 'm1', channel_id: 'C1', content: 'hello', author: { id: 'user-42', username: 'alice', bot: false },
+      } });
+      await new Promise(r => setTimeout(r, 50));
+      bot.stop();
+      ws.close();
+      await p;
+      const emojis = calls.filter(c => c.method === 'PUT' && c.url.includes('/reactions/')).map(c => decodeURIComponent(c.url.split('/reactions/')[1]!.split('/')[0]!));
+      expect(emojis).toEqual(['👀', fails ? '❌' : '✅']);
+    }
+  });
+
   test('DM from allowed user posts placeholder + routes reply to onMessage', async () => {
     MockWs.instances.length = 0;
     const { fetchImpl, calls } = makeStubFetch((call) => {

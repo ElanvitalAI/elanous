@@ -10,10 +10,13 @@
 //
 // 변환은 **raw JSON 레벨** — 정규화(getUserConfig)를 거치지 않아 미지 필드가
 // 보존된다(정규화 저장이 필드를 조용히 떨어뜨리는 사고 클래스 회피). 정책은
-// buildTestSafeDaemonConfig 와 동일 의미론(파리티 테스트로 고정):
+// buildTestSafeDaemonConfig 와 아웃바운드 정책 파리티(시험으로 고정), 추가로 평문 비밀 제거:
 //   • telegram.botToken → testChannel.botToken (없으면 telegram off)
 //   • 운영 아웃바운드 경로 제거 (reportChannel · homeChannel · channels)
-//   • discord off
+//   • discord off · 평문 비밀 필드 재귀 제거
+//   • 채널 탭(telegram:* · discord:*)의 tokenRef 제거 — 🩸 2026-09-27: 봇 토큰이 탭 tokenRef 로 옮겨간 뒤(#20732)
+//     `resolveChannelBotToken` 이 tokenRef 를 먼저 풀어 «시험 봇 스왑»을 무시하고 운영 봇을 격리 우주에 줬다.
+//   • secrets.json 은 «그대로»가 아니라 아웃바운드 자격(채널 탭 봇 토큰 · 웹 푸시 VAPID)을 뺀 사본으로.
 //
 // 부속 파일 복사 정책(대표 지시 "현재 그대로 복사"):
 //   • 복사 = 연산/인바운드에 필요한 것 (LLM 키·oauth·identity)
@@ -21,9 +24,11 @@
 //     무장류(autopilot/finance mandate — 부재 시 fail-closed=DISARMED 가 테스트의
 //     안전 기본값) · 상태 DB(테스트는 빈 우주에서 시작)
 
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { debug } from '../debug/log.js';
+import { isSecretRef, secretIdFromRef } from '../nexus/config/types.js';
 
 /** 운영 config 루트(항상 실 운영 — --config-dir 오버라이드와 무관하게 원본을 읽는다). */
 export function prodConfigDir(): string {
@@ -32,7 +37,7 @@ export function prodConfigDir(): string {
 
 /** 그대로 복사할 부속 파일 (운영 config dir 상대). 없는 파일은 조용히 스킵. */
 export const TEST_SYNC_AUX_FILES: readonly string[] = [
-  'secrets.json',      // LLM/서비스 키 — 에이전트 턴에 필요
+  'secrets.json',      // LLM/서비스 키 — 에이전트 턴에 필요 (아웃바운드 자격은 빼고 쓴다 — testSyncExcludedSecretIds)
   'llm-fallback.json', // 모델 폴백 체인
   'auth.json',         // oauth 자격 (LLM provider)
   'identity.json',     // self identity — 무해·자기인식 일관
@@ -47,8 +52,27 @@ export const TEST_SYNC_EXCLUDED: ReadonlyArray<{ file: string; reason: string }>
   { file: 'finance-trade-mandate.json', reason: '매매 무장 — 동상' },
 ];
 
-/** raw JSON dict 레벨 test-safe 변환 — buildTestSafeDaemonConfig 와 의미론 동일
- *  (파리티 테스트로 고정), 단 미지 필드 보존. 순수. */
+const SECRET_KEY_PATTERN = /^(apiKey|botToken|token|secret|password|clientSecret|webhookSecret|accessToken|refreshToken)$/i;
+
+/** 봇 토큰을 tokenRef 로 드는 채널 탭 id(`telegram:1` · `discord:1` …). */
+const CHANNEL_TAB_ID = /^(telegram|discord):/;
+/** 웹 푸시 VAPID 쌍 — 격리 우주는 부재 시 자기 쌍을 새로 만든다(`src/web-push/vapid-keys.ts`). */
+const VAPID_SECRET_PREFIX = 'pwa-push-vapid-';
+
+/** 운영 secrets.json 에서 격리 사본에 넣지 않을 비밀 id — 채널 탭이 참조하는 봇 토큰 ⊕ VAPID. */
+export function testSyncExcludedSecretIds(raw: Record<string, unknown>, secretIds: readonly string[]): string[] {
+  const refd = new Set<string>();
+  const tabs = raw.tabs && typeof raw.tabs === 'object' && !Array.isArray(raw.tabs) ? raw.tabs as Record<string, unknown> : {};
+  for (const [id, tab] of Object.entries(tabs)) {
+    if (!CHANNEL_TAB_ID.test(id) || !tab || typeof tab !== 'object') continue;
+    const ref = (tab as Record<string, unknown>).tokenRef;
+    const sid = isSecretRef(ref) ? secretIdFromRef(ref as string) : null;
+    if (sid) refd.add(sid);
+  }
+  return secretIds.filter((sid) => refd.has(sid) || /^(telegram|discord)_\d+__tokenRef$/.test(sid) || sid.startsWith(VAPID_SECRET_PREFIX));
+}
+
+/** raw JSON dict 레벨 test-safe 변환 — 미지 필드는 보존하고 평문 비밀만 제거한다. */
 export function buildTestSafeRawConfig(raw: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = { ...raw };
   const tg = { ...((raw.telegram ?? {}) as Record<string, unknown>) };
@@ -61,12 +85,51 @@ export function buildTestSafeRawConfig(raw: Record<string, unknown>): Record<str
   } else {
     tg.enabled = false;
   }
+  if (tg.testChannel && typeof tg.testChannel === 'object' && !Array.isArray(tg.testChannel)) {
+    const safeTestChannel = { ...testChannel };
+    if (testToken.length > 0 && !testToken.startsWith('secret://')) delete safeTestChannel.botToken;
+    tg.testChannel = safeTestChannel;
+  }
   delete tg.reportChannel;
   delete tg.homeChannel;
   delete tg.channels;
   out.telegram = tg;
   out.discord = { ...((raw.discord ?? {}) as Record<string, unknown>), enabled: false };
-  return out;
+
+  const paths: string[] = [];
+  if (raw.tabs && typeof raw.tabs === 'object' && !Array.isArray(raw.tabs)) {
+    const tabs: Record<string, unknown> = {};
+    for (const [id, tab] of Object.entries(raw.tabs as Record<string, unknown>)) {
+      if (CHANNEL_TAB_ID.test(id) && tab && typeof tab === 'object' && !Array.isArray(tab) && 'tokenRef' in tab) {
+        const { tokenRef: _dropped, ...rest } = tab as Record<string, unknown>;
+        paths.push(`tabs.${id}.tokenRef`);
+        Object.defineProperty(tabs, id, { value: rest, enumerable: true, writable: true, configurable: true });
+      } else {
+        Object.defineProperty(tabs, id, { value: tab, enumerable: true, writable: true, configurable: true });
+      }
+    }
+    out.tabs = tabs;
+  }
+  const strip = (value: unknown, path: string): unknown => {
+    if (Array.isArray(value)) return value.map((item, i) => strip(item, `${path}[${i}]`));
+    if (value === null || typeof value !== 'object') return value;
+    const result: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value)) {
+      const childPath = path ? `${path}.${key}` : key;
+      if (SECRET_KEY_PATTERN.test(key) && typeof child === 'string' && !child.startsWith('secret://')
+        && !(path === 'telegram' && key === 'botToken' && testToken.length > 0)) {
+        paths.push(childPath);
+        continue;
+      }
+      // `__proto__` 등 특수 키도 «자기 필드»로 보존한다(대입은 프로토타입을 바꾸고 필드를 잃는다).
+      Object.defineProperty(result, key, { value: strip(child, childPath), enumerable: true, writable: true, configurable: true });
+    }
+    return result;
+  };
+  const safe = strip(out, '') as Record<string, unknown>;
+  safe._testSecretsStripped = paths.length;
+  debug.log('config.test-sync', 'secrets-stripped', { count: paths.length, paths });
+  return safe;
 }
 
 export interface TestSyncResult {
@@ -76,6 +139,8 @@ export interface TestSyncResult {
   /** 대상이 이미 바이트 동일해 복사하지 않은 파일(읽기 전용 대상도 여기로 — EACCES 로 뒤 파일이 끊기지 않게). */
   skippedIdentical: string[];
   telegramMode: 'test-token' | 'disabled';
+  /** 사본의 _testSecretsStripped (syncTestConfig 가 채운다). */
+  testSecretsStripped?: number;
 }
 
 /** cwd 에서 위로 걸어 올라가 레포 루트(.git 보유 dir)를 찾는다. 못 찾으면 null. */
@@ -102,7 +167,7 @@ function atomicWriteJson(path: string, value: unknown): void {
 export function syncTestConfig(testDir: string, srcDir: string = prodConfigDir()): TestSyncResult {
   const srcPath = join(srcDir, 'config.json');
   const raw = JSON.parse(readFileSync(srcPath, 'utf-8')) as Record<string, unknown>;
-  const transformed = buildTestSafeRawConfig(raw);
+  const transformed = buildTestSafeRawConfig(raw); // 운영 비밀을 제거한 뒤에만 사본을 저장한다.
   transformed._testSyncedFrom = srcPath;
   transformed._testSyncedAt = new Date().toISOString();
   const testConfigPath = join(testDir, 'config.json');
@@ -115,11 +180,29 @@ export function syncTestConfig(testDir: string, srcDir: string = prodConfigDir()
     const from = join(srcDir, f);
     if (!existsSync(from)) { skippedMissing.push(f); continue; }
     const to = join(testDir, f);
+    if (f === 'secrets.json') {
+      const store = JSON.parse(readFileSync(from, 'utf-8')) as { secrets?: Record<string, unknown> } & Record<string, unknown>;
+      const all = store.secrets && typeof store.secrets === 'object' ? store.secrets : {};
+      const excluded = new Set(testSyncExcludedSecretIds(raw, Object.keys(all)));
+      const kept: Record<string, unknown> = {};
+      for (const [sid, v] of Object.entries(all)) if (!excluded.has(sid)) kept[sid] = v;
+      const body = JSON.stringify(store.secrets && typeof store.secrets === 'object' ? { ...store, secrets: kept } : store, null, 2);
+      debug.log('config.test-sync', 'secrets-file-filtered', { kept: Object.keys(kept).length, excluded: [...excluded] });
+      if (existsSync(to) && readFileSync(to, 'utf-8') === body) { chmodSync(to, 0o600); skippedIdentical.push(f); continue; }
+      mkdirSync(dirname(to), { recursive: true });
+      const tmp = `${to}.tmp-${process.pid}`;
+      writeFileSync(tmp, body, { mode: 0o600 });
+      renameSync(tmp, to);
+      chmodSync(to, 0o600);
+      copied.push(excluded.size ? `${f}(아웃바운드 자격 ${excluded.size}개 뺌)` : f);
+      continue;
+    }
     // 🩸 2026-09-24: 대상 `llm-fallback.json` 이 읽기 전용(0444)이라 copyFileSync 가 EACCES 로 던졌고,
     //   목록 뒤의 `auth.json`(codex 로그인)이 복사되지 않아 격리 우주의 자식이 codex 를 못 썼다.
     //   ⇒ 이미 같은 바이트면 건너뛴다(멱등) — 다르면 종전처럼 복사한다(실패는 그대로 드러난다).
-    if (existsSync(to) && readFileSync(from).equals(readFileSync(to))) { skippedIdentical.push(f); continue; }
+    if (existsSync(to) && readFileSync(from).equals(readFileSync(to))) { chmodSync(to, 0o600); skippedIdentical.push(f); continue; }
     copyFileSync(from, to);
+    chmodSync(to, 0o600);
     copied.push(f);
   }
   const tg = transformed.telegram as Record<string, unknown>;
@@ -129,6 +212,7 @@ export function syncTestConfig(testDir: string, srcDir: string = prodConfigDir()
     skippedMissing,
     skippedIdentical,
     telegramMode: tg.enabled === false ? 'disabled' : 'test-token',
+    testSecretsStripped: transformed._testSecretsStripped as number,
   };
 }
 
@@ -268,7 +352,7 @@ export function runConfigSyncTest(opts: { repo?: string; stateDir?: string; json
     }
     console.log(`운영 config → ${r.testConfigPath}`);
     console.log(`  telegram: ${r.telegramMode === 'test-token' ? '테스트 봇 토큰으로 스왑 · report/home/channels 제거' : 'testChannel 없음 → off'}`);
-    console.log(`  discord: off`);
+    console.log(`  discord: off · 비밀 칸 ${r.testSecretsStripped}개 뺌`);
     console.log(`  부속 복사: ${r.copied.join(', ') || '없음'}${r.skippedMissing.length ? ` (부재 스킵: ${r.skippedMissing.join(', ')})` : ''}${r.skippedIdentical.length ? ` (동일 스킵: ${r.skippedIdentical.join(', ')})` : ''}`);
     console.log(`  제외(정책): ${TEST_SYNC_EXCLUDED.map((e) => e.file).join(', ')}`);
     console.log(`격리 루트: ${basename(testDir) === '.elanous-test' ? basename(dirname(testDir)) : testDir} — 테스트 인스턴스 재기동 시 반영`);

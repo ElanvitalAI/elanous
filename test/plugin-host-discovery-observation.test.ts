@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
+import { dashboardMatches, dashboardSourceLocations, readDashboardSources } from './helpers/dashboard-source.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { debug } from '../src/debug/log.js';
@@ -43,8 +44,9 @@ afterEach(() => {
 
 describe('PluginHost discovery observation', () => {
   test('is wired through dashboard bootstrap PluginHost.discover()', () => {
-    const dashboard = readFileSync(join(import.meta.dir, '../src/dashboard/index.ts'), 'utf8');
-    expect(dashboard).toMatch(/pluginHost\s*=\s*new PluginHost\([\s\S]*?await pluginHost\.discover\(\)/);
+    const sources = readDashboardSources();
+    const matches = dashboardMatches(/pluginHost\s*=\s*new PluginHost\([\s\S]*?await pluginHost\.discover\(\)/, sources);
+    expect(matches.length, `PluginHost discovery not wired in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
   });
 
   test('records existing empty and missing directories with distinct existence states', async () => {

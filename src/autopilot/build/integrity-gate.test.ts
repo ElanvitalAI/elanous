@@ -2,7 +2,8 @@ import { readFileSync, rmSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../../debug/log.js';
 import { createRunCmd, defaultRunCmd, runIntegrityGate } from './integrity-gate.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'ignore-term-tree.js');
@@ -179,6 +180,85 @@ describe('integrity gate process-tree timeout cleanup', () => {
     // 상한: timeout(200) + TERMINATION_GRACE(2000) + REAP_DEADLINE(2000) + 여유.
     expect(elapsed).toBeLessThan(8_000);
   }, 15_000);
+
+  test('그룹 신호와 존재 탐침의 EPERM을 기록하고 기존 데드라인 뒤 게이트 타임아웃 실패로 반환한다', async () => {
+    if (process.platform === 'win32') return;
+    const originalKill = process.kill.bind(process);
+    const calls: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+    const kill = spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (signal === 'SIGTERM' || signal === 'SIGKILL') {
+        calls.push({ pid, signal });
+        throw Object.assign(new Error('Operation not permitted'), { code: 'EPERM' });
+      }
+      return originalKill(pid, signal);
+    });
+    const log = spyOn(debug, 'log').mockImplementation(() => undefined);
+    let probeCalls = 0;
+    const groupExists = (): boolean => {
+      probeCalls += 1;
+      throw Object.assign(new Error('Operation not permitted'), { code: 'EPERM' });
+    };
+    const runCmd = createRunCmd(groupExists);
+    const started = Date.now();
+    try {
+      const gate = await runIntegrityGate(process.cwd(), {
+        steps: ['test'],
+        runCmd: (_cmd, _args, cwd) => runCmd('sleep', ['30'], cwd, 100),
+      });
+      expect(Date.now() - started).toBeLessThan(8_000);
+      expect(gate.passed).toBe(false);
+      expect(gate.steps[0]?.summary.startsWith('timeout (')).toBe(true);
+      expect(gate.steps[0]?.summary.includes('code=124')).toBe(true);
+      expect(gate.steps[0]).toMatchObject({ name: 'test', status: 'failed', ok: false });
+      expect(probeCalls).toBeGreaterThan(0);
+      const groupTerm = calls.find(({ pid, signal }) => pid < 0 && signal === 'SIGTERM');
+      expect(groupTerm).toBeDefined();
+      const leader = -groupTerm!.pid;
+      expect(calls).toEqual([
+        { pid: -leader, signal: 'SIGTERM' }, { pid: leader, signal: 'SIGTERM' },
+        { pid: -leader, signal: 'SIGKILL' }, { pid: leader, signal: 'SIGKILL' },
+      ]);
+      expect(log).toHaveBeenCalledWith('integrity-gate', 'signal-eperm', { pid: leader, signal: 'SIGTERM' }, { level: 'warn' });
+      expect(log).toHaveBeenCalledWith('integrity-gate', 'signal-eperm', { pid: leader, signal: 'SIGKILL' }, { level: 'warn' });
+      expect(log).toHaveBeenCalledWith('integrity-gate', 'group-unkillable', { pid: leader }, { level: 'warn' });
+    } finally {
+      kill.mockRestore();
+      log.mockRestore();
+      const groupTerm = calls.find(({ pid, signal }) => pid < 0 && signal === 'SIGTERM');
+      if (groupTerm) killProcessGroup(-groupTerm.pid);
+    }
+  }, 10_000);
+
+  test('그룹 신호의 ESRCH는 무시하고 그 밖의 오류는 그대로 전달한다', async () => {
+    if (process.platform === 'win32') return;
+    const originalKill = process.kill.bind(process);
+    const calls: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+    let groupError = 'ESRCH';
+    const kill = spyOn(process, 'kill').mockImplementation((pid, signal) => {
+      if (signal === 'SIGTERM' || signal === 'SIGKILL') {
+        calls.push({ pid, signal });
+        if (pid < 0) throw Object.assign(new Error(groupError), { code: groupError });
+      }
+      return originalKill(pid, signal);
+    });
+    try {
+      const gone = await createRunCmd(() => false)('sleep', ['30'], process.cwd(), 100);
+      expect(gone).toMatchObject({ code: 124, timedOut: true });
+      expect(calls.some(({ pid }) => pid > 0)).toBe(false);
+      groupError = 'EIO';
+      for (const { pid } of calls) if (pid < 0) {
+        try { originalKill(pid, 'SIGKILL'); } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+        }
+      }
+      calls.length = 0;
+      await expect(createRunCmd(() => false)('sleep', ['30'], process.cwd(), 100)).rejects.toMatchObject({ code: 'EIO' });
+      expect(calls.some(({ pid }) => pid > 0)).toBe(false);
+    } finally {
+      kill.mockRestore();
+      for (const { pid } of calls) if (pid < 0) killProcessGroup(-pid);
+    }
+  }, 10_000);
 
   test('정상 exit 0과 exit 1의 code·stdout·stderr·timedOut 계약을 보존한다', async () => {
     await expect(defaultRunCmd(process.execPath, ['-e', "process.stdout.write('out'); process.stderr.write('err'); process.exit(0)"], process.cwd(), 500)).resolves.toEqual({

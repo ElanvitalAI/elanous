@@ -11,6 +11,7 @@
 // the report channel while interactive Q&A stays on the main bot.
 
 import { TelegramBot } from './telegram.js';
+import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { UserConfig } from './user-config.js';
 import { findSessionByTelegramChat, createSession, appendMessage } from './session/index.js';
 
@@ -55,7 +56,7 @@ export interface ReportTarget {
 export function resolveReportTarget(cfg: UserConfig): ReportTarget | null {
   const rc = cfg.telegram.reportChannel;
   if (!rc || !Number.isFinite(rc.chatId)) return null;
-  const botToken = rc.botToken ?? cfg.telegram.botToken;
+  const botToken = rc.botToken ?? resolveChannelBotToken('telegram', cfg)?.token;
   if (!botToken) return null;
   return { botToken, chatId: rc.chatId };
 }

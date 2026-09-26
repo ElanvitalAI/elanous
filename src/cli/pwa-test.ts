@@ -26,27 +26,29 @@
 //     personal :443 forwards).
 //
 // Auto port collision recovery:
-//   - NEXUS port: prefer 31415 → 31420 (skip 31416-31419 to keep the
-//     classic +5 NEXUS spacing) → 31421+. Skip if production daemon
-//     (`~/.elanous/nexus/.lock`) holds it OR an unrelated process binds
-//     it (lsof check).
+//   - NEXUS port: coordinator lease in 31450–31499; if the coordinator is
+//     absent or answers with any error, fall back to the machine-local
+//     test-band lease (`leaseTestPort`, 31450–31499). Never pick
+//     production-reserved ports (31413 · 31415 · 31420).
 //   - Next dev port (HMR mode only): prefer 3210 → 3211 → 3212+.
 //     Skip if any process binds the port.
 //   - Stale `<repo>/.elanous-test/.lock` is an idempotent reuse — the
 //     command refuses with a clear hint unless `--force` is passed.
 
+import { leaseTestPort } from './port-lease-local.js';
+import { debug } from '../debug/log.js';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:net';
 import { dirname, join as joinPath, resolve as resolvePath } from 'node:path';
 
-import { setTestStateRoot, getTestStateRoot } from '../nexus/paths.js';
+import { setTestStateRoot } from '../nexus/paths.js';
+import { PORT_BANDS } from '../control-plane/ports.js';
+import { PORT_LEASE_TTL_MS } from '../control-plane/port-lease-heartbeat.js';
+import { readMemberToken } from '../control-plane/member.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { runPwaStart, type PwaStartMode, type PwaStartOpts, type PwaStartResult } from './pwa-start.js';
 import { runPwaStop, type PwaStopOpts, type PwaStopResult } from './pwa-stop.js';
-import {
-  isAliveNexusLock,
-  readNexusLock,
-  type NexusLockMeta,
-} from '../nexus/supervisor/lock.js';
+import { isAliveNexusLock, type NexusLockMeta } from '../nexus/supervisor/lock.js';
 import {
   mountTailscaleServe,
   unmountTailscaleServe,
@@ -123,13 +125,16 @@ export interface PwaTestOpts {
   // ─── Test seams ─────────────────────────────────────────────
   /** Override the repo root resolution from `argvBin`. */
   repoRoot?: string;
-  /** Replace the production-daemon lock probe. Defaults to reading
-   *  `~/.elanous/nexus/.lock` via the public helpers. */
-  productionLockProbeFn?: () => NexusLockMeta | null;
-  /** Replace the production-daemon liveness check. */
+  /** Replace the lock liveness check used for stale project locks. */
   productionLockAliveFn?: (meta: NexusLockMeta) => boolean;
-  /** Replace the port collision probe. Defaults to `lsof -ti :<port>`. */
-  portInUseFn?: (port: number) => boolean;
+  /** Replace the port collision probe. Defaults to a local bind probe. */
+  portInUseFn?: (port: number) => boolean | Promise<boolean>;
+  /** Coordinator request seam; null means coordinator unavailable. A lease must carry its id. */
+  leasePortFn?: (excluded?: readonly number[]) => Promise<CoordinatorPortLease | null>;
+  /** Release a failed central claim before retrying. */
+  releasePortFn?: (port: number) => Promise<void>;
+  /** Test seam — lease directory for the local test-band port lease (default: OS tmp). */
+  leaseDir?: string;
   /** Replace the runPwaStart dependency (the underlying daemon + dev
    *  bring-up · we compose this rather than reimplement). */
   pwaStartFn?: (opts: PwaStartOpts) => Promise<PwaStartResult>;
@@ -165,8 +170,6 @@ export interface PwaTestResult {
   tailscaleMounted?: boolean;
 }
 
-const DEFAULT_NEXUS_PORT = 31415;
-const NEXUS_FALLBACK_PORTS = [31420, 31421, 31422, 31423, 31424];
 const DEFAULT_DEV_PORT = 3210;
 const DEV_FALLBACK_RANGE = [3211, 3212, 3213, 3214, 3215];
 
@@ -209,18 +212,12 @@ function resolveLayout(opts: PwaTestOpts): RepoLayout | null {
   };
 }
 
-function defaultPortInUse(port: number): boolean {
-  try {
-    // `lsof -ti :<port>` exits 0 + prints PIDs when something is
-    // listening; exits 1 with empty stdout when free.
-    const stdout = execFileSync('lsof', ['-ti', `:${port}`, '-sTCP:LISTEN'], {
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 3000,
-    });
-    return String(stdout).trim().length > 0;
-  } catch {
-    return false;
-  }
+async function defaultPortInUse(port: number): Promise<boolean> {
+  return new Promise(resolve => {
+    const server = createServer();
+    server.once('error', () => resolve(true));
+    server.listen(port, '0.0.0.0', () => server.close(() => resolve(false)));
+  });
 }
 
 function readProjectLock(lockPath: string): NexusLockMeta | null {
@@ -236,81 +233,127 @@ function readProjectLock(lockPath: string): NexusLockMeta | null {
   }
 }
 
-function pickNexusPort(
+const coordinatorUrl = `http://127.0.0.1:${PORT_BANDS.reserved[0]}`;
+
+async function coordinatorPortRequest(path: string, method: string, body?: unknown, token = readMemberToken(effectiveInstanceRoot())): Promise<Response | null> {
+  if (!token) return null;
+  try {
+    return await fetch(`${coordinatorUrl}${path}`, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+      signal: AbortSignal.timeout(1000),
+    });
+  } catch { return null; }
+}
+
+export type CoordinatorPortLease = { port: number; leaseId: string };
+
+export async function requestCoordinatorPort(
+  excluded: readonly number[] = [],
+  send: typeof coordinatorPortRequest = coordinatorPortRequest,
+): Promise<CoordinatorPortLease | null> {
+  const response = await send('/v1/leases/port', 'POST', {
+    machine: process.env.HOSTNAME || 'local', purpose: 'nexus-test', ttlMs: PORT_LEASE_TTL_MS, excluded,
+  });
+  if (!response) return null;
+  if (response.status === 409) {
+    const body: unknown = await response.json();
+    if ((body as { error?: unknown })?.error === 'no-port') return null;
+  }
+  if (!response.ok) throw new Error(`coordinator port lease HTTP ${response.status}`);
+  const body: unknown = await response.json();
+  const port = (body as { port?: unknown })?.port;
+  const leaseId = (body as { lease?: { attrs?: { leaseId?: unknown } } })?.lease?.attrs?.leaseId;
+  if (typeof port !== 'number' || !Number.isInteger(port) || port < PORT_BANDS.test.start || port > PORT_BANDS.test.end ||
+      typeof leaseId !== 'string' || !leaseId) {
+    throw new Error('invalid coordinator port lease');
+  }
+  return { port, leaseId };
+}
+
+async function releaseCoordinatorPort(lease: CoordinatorPortLease, token = readMemberToken(effectiveInstanceRoot())): Promise<void> {
+  if (!token) return;
+  const response = await fetch(`${coordinatorUrl}/v1/leases/port/${lease.port}`, {
+    method: 'DELETE', headers: { Authorization: `Bearer ${token}`, 'x-port-lease-id': lease.leaseId },
+    signal: AbortSignal.timeout(1000),
+  }).catch(() => null);
+  if (!response?.ok && response?.status !== 404 && response?.status !== 403) throw new Error(`coordinator port release ${response ? `HTTP ${response.status}` : 'unavailable'}`);
+}
+
+async function pickNexusPort(
   preferred: number | undefined,
   layout: RepoLayout,
   opts: PwaTestOpts,
-): { port: number; reason: string } | { error: string } {
+): Promise<{ port: number; reason: string; leaseId?: string } | { error: string }> {
   const inUseFn = opts.portInUseFn ?? defaultPortInUse;
-  const productionProbeFn =
-    opts.productionLockProbeFn ?? readNexusLock;
-  const productionAliveFn = opts.productionLockAliveFn ?? isAliveNexusLock;
-
+  // ⓐ 명시 `--port` 가 이긴다(불변).
   if (preferred !== undefined) {
-    if (inUseFn(preferred)) {
-      return { error: `port ${preferred} already in use (lsof match)` };
-    }
+    if (await inUseFn(preferred)) return { error: `port ${preferred} already in use` };
     return { port: preferred, reason: 'explicit --port' };
   }
-
-  // Default: 31415. Production daemon (`~/.elanous/nexus/.lock`) takes
-  // precedence — we never want to clobber the user's primary daemon.
-  const candidates = [DEFAULT_NEXUS_PORT, ...NEXUS_FALLBACK_PORTS];
-
-  // Production probe must read `~/.elanous/nexus/.lock`, not our test
-  // lock. Temporarily clear any in-process test state override so
-  // `readNexusLock` falls through to the default config-dir path.
-  // (Same-process re-entry only — fresh `elanous` invocations start
-  // with testStateRoot=undefined automatically.)
-  const savedTestStateRoot = getTestStateRoot();
-  setTestStateRoot(null);
-  let prodLock: NexusLockMeta | null = null;
-  try { prodLock = productionProbeFn(); } catch { /* swallow */ }
-  finally {
-    if (savedTestStateRoot !== undefined) setTestStateRoot(savedTestStateRoot);
-  }
-  const productionAlive = prodLock && productionAliveFn(prodLock);
-
-  // Project test lock — distinct path; reuse when alive (idempotent
-  // start = informative status), force-take when --force.
-  const projectLock = readProjectLock(layout.lockPath);
-
-  for (const port of candidates) {
-    if (port === DEFAULT_NEXUS_PORT && productionAlive) continue;
-    if (inUseFn(port)) {
-      // The test lock might describe THIS port — if so, it's our own
-      // prior instance and the orchestrator's flow handles that
-      // separately (errors with reuse/force hint at the entry point).
-      if (
-        projectLock
-        && projectLock.pid !== prodLock?.pid
-        && opts.force !== true
-      ) {
-        // We can't tell which port the prior test was on without
-        // reading runtime.json — leave that to the entry point.
-        // Continue to next candidate so a second port lookup keeps
-        // working when the prior is stale.
-      }
-      continue;
-    }
-    return {
-      port,
-      reason:
-        port === DEFAULT_NEXUS_PORT
-          ? 'default :31415 free'
-          : productionAlive
-            ? `:31415 taken by production daemon (pid ${prodLock!.pid}) → fallback`
-            : 'collision · auto-pick',
-    };
-  }
-  return { error: `no free port in [${candidates.join(', ')}]` };
+  // ⓑ 관제부 임대 — 없거나(null) «어떤 오류든»(409 no-port · 503 · 네트워크 · 잘못된 응답) ⓒ 로 넘어간다.
+  const central = await pickCoordinatorPort(opts, inUseFn);
+  if (central) return central;
+  // ⓒ 기계 안 로컬 임대(#20864) — 시험 대역(31450~31499)에서만 준다. 운영 대역(31413·31415·31420)은 절대 안 고른다.
+  const claim = await leaseTestPort({
+    owner: layout.repoRoot,
+    ...(opts.leaseDir ? { dir: opts.leaseDir } : {}),
+    ...(opts.portInUseFn ? { inUse: opts.portInUseFn } : {}),
+  });
+  if ('error' in claim) return { error: '시험 대역에 빈 포트가 없습니다 (31450..31499)' };
+  return { port: claim.port, reason: `시험 대역에서 :${claim.port} 임대` };
 }
 
-function pickDevPort(opts: PwaTestOpts): number | { error: string } {
+async function releaseCentral(opts: PwaTestOpts, lease: CoordinatorPortLease): Promise<void> {
+  if (opts.releasePortFn) await opts.releasePortFn(lease.port);
+  else await releaseCoordinatorPort(lease);
+}
+
+/** 관제부에서 시험 대역 포트를 받는다. 받지 못하면(관제부 부재·오류·잘못된 응답·대역 소진) null — 호출자가 로컬 임대로 넘어간다. */
+async function pickCoordinatorPort(
+  opts: PwaTestOpts,
+  inUseFn: (port: number) => boolean | Promise<boolean>,
+): Promise<{ port: number; reason: string; leaseId: string } | null> {
+  const request = opts.leasePortFn ?? requestCoordinatorPort;
+  const excluded: number[] = [];
+  for (let attempt = PORT_BANDS.test.start; attempt <= PORT_BANDS.test.end; attempt++) {
+    let claimed: CoordinatorPortLease | null;
+    try { claimed = await request(excluded); }
+    catch (err) {
+      debug.log('nexus.port-lease', 'coordinator-fallback', { reason: 'coordinator-error', error: err instanceof Error ? err.message : String(err) });
+      return null;
+    }
+    if (claimed === null) {
+      debug.log('nexus.port-lease', 'coordinator-fallback', { reason: 'coordinator-unavailable-or-no-port' });
+      return null;
+    }
+    const { port, leaseId } = claimed;
+    if (!Number.isInteger(port) || port < PORT_BANDS.test.start || port > PORT_BANDS.test.end
+        || (PORT_BANDS.reserved as readonly number[]).includes(port) || excluded.includes(port)
+        || typeof leaseId !== 'string' || !leaseId) {
+      debug.log('nexus.port-lease', 'coordinator-fallback', { reason: 'invalid-lease', port });
+      return null;
+    }
+    let occupied: boolean;
+    try { occupied = await inUseFn(port); }
+    catch (err) {
+      await releaseCentral(opts, claimed);
+      throw err;
+    }
+    if (!occupied) return { port, reason: 'coordinator lease', leaseId };
+    await releaseCentral(opts, claimed);
+    excluded.push(port);
+  }
+  debug.log('nexus.port-lease', 'coordinator-fallback', { reason: 'coordinator-band-exhausted' });
+  return null;
+}
+
+async function pickDevPort(opts: PwaTestOpts): Promise<number | { error: string }> {
   const inUseFn = opts.portInUseFn ?? defaultPortInUse;
   const candidates = [DEFAULT_DEV_PORT, ...DEV_FALLBACK_RANGE];
   for (const port of candidates) {
-    if (!inUseFn(port)) return port;
+    if (!await inUseFn(port)) return port;
   }
   return { error: `no free Next dev port in [${candidates.join(', ')}]` };
 }
@@ -436,18 +479,38 @@ async function runStart(
     }
   }
 
-  const nexusPick = pickNexusPort(opts.port, layout, opts);
+  let nexusPick: Awaited<ReturnType<typeof pickNexusPort>>;
+  try { nexusPick = await pickNexusPort(opts.port, layout, opts); }
+  catch (err) {
+    out.error(`✗ coordinator port lease failed: ${err instanceof Error ? err.message : String(err)}`);
+    return { exitCode: 1 };
+  }
   if ('error' in nexusPick) {
     out.error(`✗ ${nexusPick.error}`);
     return { exitCode: 1 };
   }
   const nexusPort = nexusPick.port;
+  // Snapshot the credential before switching config to the project-local test root.
+  const coordinatorToken = nexusPick.reason === 'coordinator lease' && !opts.leasePortFn
+    ? readMemberToken(effectiveInstanceRoot()) : undefined;
+  const releasePickedLease = async (): Promise<void> => {
+    if (nexusPick.reason === 'coordinator lease') {
+      if (opts.releasePortFn) await opts.releasePortFn(nexusPort);
+      else if (nexusPick.leaseId) await releaseCoordinatorPort({ port: nexusPort, leaseId: nexusPick.leaseId }, coordinatorToken);
+    }
+  };
 
   let devPort: number | undefined;
   if (isHmr) {
-    const devPick = pickDevPort(opts);
+    let devPick: Awaited<ReturnType<typeof pickDevPort>>;
+    try { devPick = await pickDevPort(opts); }
+    catch (error) {
+      await releasePickedLease();
+      throw error;
+    }
     if (typeof devPick !== 'number') {
       out.error(`✗ ${devPick.error}`);
+      await releasePickedLease();
       return { exitCode: 1 };
     }
     devPort = devPick;
@@ -477,6 +540,7 @@ async function runStart(
     }
   } catch (e) {
     out.error(`✗ config 격리 실패: ${e instanceof Error ? e.message : String(e)} — 운영 오염 위험이라 기동 중단`);
+    await releasePickedLease();
     return { exitCode: 1 };
   }
 
@@ -494,6 +558,7 @@ async function runStart(
     mode,
     httpHost,
     httpPort: nexusPort,
+    ...(nexusPick.reason === 'coordinator lease' ? { coordinatorLeasePort: nexusPort, ...(coordinatorToken ? { coordinatorLeaseToken: coordinatorToken } : {}), ...(nexusPick.leaseId ? { coordinatorLeaseId: nexusPick.leaseId } : {}) } : {}),
     out,
     ...(opts.force ? { force: true } : {}),
     ...(opts.toolCwd !== undefined ? { toolCwd: opts.toolCwd } : {}),
@@ -512,8 +577,16 @@ async function runStart(
     // tailscale-serve.ts (TLS-tcp mode · WS-friendly).
     readShareSwitchFn: () => 'disabled',
   };
-  const startRes = await pwaStartFn(startOpts);
-  if (startRes.exitCode !== 0) return { exitCode: startRes.exitCode };
+  let startRes: PwaStartResult;
+  try { startRes = await pwaStartFn(startOpts); }
+  catch (err) {
+    await releasePickedLease();
+    throw err;
+  }
+  if (startRes.exitCode !== 0) {
+    await releasePickedLease();
+    return { exitCode: startRes.exitCode };
+  }
 
   let url: string | undefined;
   let tailscaleMounted = false;

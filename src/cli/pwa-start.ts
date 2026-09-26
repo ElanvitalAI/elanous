@@ -11,7 +11,8 @@ import {
   readSwitchValue,
   readUserConfig,
 } from '../nexus/config/user-config.js';
-import { registerPwaInstance, listPwaInstances, type PwaRegistryEntry } from './pwa-registry.js';
+import { registerPwaInstance, listPwaInstances, type PwaRegistryEntry, type PwaLauncherProvenance } from './pwa-registry.js';
+import { debug } from '../debug/log.js';
 import { runPwaBuild, checkPwaBuildDeps, resolvePwaCwd, type PwaBuildResult } from './pwa-build.js';
 import { runPwaInstall, type PwaInstallResult } from './pwa-install.js';
 import { runPwaStop, type PwaStopOpts, type PwaStopResult } from './pwa-stop.js';
@@ -19,6 +20,8 @@ import { checkPwaStaleness } from './pwa-staleness.js';
 import { unmountTailscaleServe, type UnmountTailscaleServeResult } from './tailscale-serve.js';
 import { nexusRootDir } from '../nexus/paths.js';
 import { resolveCurrentInstance } from '../instance/current.js';
+import { leaseTestPort, releaseTestPort, transferTestPort } from './port-lease-local.js';
+import { isPidAlive } from '../process/pid-liveness.js';
 import type { InstanceResolution } from '../instance/resolve.js';
 
 type ShareTailnetValue = 'ask' | 'enabled' | 'disabled';
@@ -73,6 +76,10 @@ export interface PwaStartOpts {
   historyDir?: string;
   httpHost?: string;
   httpPort?: number;
+  /** Coordinator lease passed to the detached daemon (not used for explicit ports). */
+  coordinatorLeasePort?: number;
+  coordinatorLeaseToken?: string;
+  coordinatorLeaseId?: string;
   /** P3 (2026-05-10) — read UserConfig fallback for ports. Default
    *  reads `global.nexus.pwa.{port,devPort}`. Test seam to inject a
    *  fixture without touching disk. */
@@ -123,6 +130,7 @@ export interface PwaStartOpts {
   bgLaunchFn?: (opts: {
     force?: boolean;
     forwardArgs?: string[];
+    childEnv?: Record<string, string>;
     out?: { log: (s: string) => void; error: (s: string) => void };
   }) => Promise<BgLaunchResult>;
   /** P-2D.3' — replace the dev BG launcher (default = runPwaDevBgLaunch). */
@@ -179,9 +187,11 @@ export interface PwaStartOpts {
    *  `runPwaStop`. */
   stopFn?: (opts: PwaStopOpts) => Promise<PwaStopResult>;
   /** Read pwa-registry for the same-tree collision check. */
-  listInstancesFn?: () => Array<{ cwd: string; alive: boolean; daemonDir: string }>;
+  listInstancesFn?: () => Array<{ cwd: string; alive: boolean; daemonDir: string; pid?: number; launcherProvenance?: PwaLauncherProvenance }>;
   /** Resolve the current process instance. Test seam for registry kind. */
   resolveCurrentInstanceFn?: () => InstanceResolution;
+  /** Isolate local test leases in a temporary directory in tests. */
+  leaseDir?: string;
 }
 
 export interface PwaStartResult {
@@ -397,9 +407,9 @@ async function maybeAutoBuild(
 
 /** Same-tree restart helper — when bg-launch reports a port collision,
  *  check the pwa-registry for an alive instance in our cwd (or our
- *  daemonDir) and stop it before retrying. Returns `true` when a restart
- *  was attempted (caller should re-invoke bgLaunch once); `false` when
- *  cross-tree / no holder found / autoRestart=false. */
+ *  daemonDir) and stop it before retrying, unless a service manager
+ *  supervises it. Returns `true` when a restart was attempted (caller
+ *  should re-invoke bgLaunch once); `false` otherwise. */
 async function maybeAutoRestart(
   opts: PwaStartOpts,
   out: NonNullable<PwaStartOpts['out']>,
@@ -407,7 +417,7 @@ async function maybeAutoRestart(
   // opt-in at the lib level; CLI flips default on
   if (opts.autoRestart !== true) return false;
   const listFn = opts.listInstancesFn ?? (() => listPwaInstances({ prune: false }));
-  let instances: Array<{ cwd: string; alive: boolean; daemonDir: string }> = [];
+  let instances: ReturnType<NonNullable<PwaStartOpts['listInstancesFn']>> = [];
   try {
     instances = listFn();
   } catch {
@@ -415,9 +425,18 @@ async function maybeAutoRestart(
   }
   const ourCwd = process.cwd();
   const ourDaemonDir = nexusRootDir();
-  const sameTree = instances.find((i) =>
+  const sameTreeInstances = instances.filter((i) =>
     i.alive && (i.cwd === ourCwd || i.daemonDir === ourDaemonDir),
   );
+  const supervised = sameTreeInstances.find((i) => i.launcherProvenance?.kind === 'service-manager');
+  if (supervised?.launcherProvenance?.kind === 'service-manager') {
+    const serviceName = supervised.launcherProvenance.serviceName;
+    const supervisor = serviceName === 'systemd' ? 'systemd' : 'launchd';
+    out.error(`이 데몬은 ${supervisor} 가 감독한다 — 멈추지 않았다. 재시작이 필요한지 먼저 \`elanous nexus restart-needed\` · 필요하면 운영자에게 알린 뒤 감독자로 재시작. 시험 데몬은 \`--test --port <격리 포트>\``);
+    debug.log('nexus.auto-restart', 'refused-supervised', { serviceName, pid: supervised.pid });
+    return false;
+  }
+  const sameTree = sameTreeInstances[0];
   if (!sameTree) return false;
   out.log('');
   out.log(`  auto-restart: same-tree daemon detected (cwd=${sameTree.cwd}) — stopping then retrying...`);
@@ -526,7 +545,7 @@ export async function runPwaStart(opts: PwaStartOpts = {}): Promise<PwaStartResu
   const out = opts.out ?? console;
   const mode: PwaStartMode = opts.mode ?? 'static';
   const bgLaunchFn = opts.bgLaunchFn ?? runBgLaunch;
-  const { httpPort, devPort } = resolvePorts(opts);
+  const ports = resolvePorts(opts);
   let registryKind: PwaRegistryEntry['kind'] = 'production';
   try {
     if ((opts.resolveCurrentInstanceFn ?? resolveCurrentInstance)().kind === 'test') {
@@ -534,37 +553,81 @@ export async function runPwaStart(opts: PwaStartOpts = {}): Promise<PwaStartResu
     }
   } catch { /* instance resolution is best-effort — registry writes still proceed */ }
 
+  let httpPort = ports.httpPort;
+  const devPort = ports.devPort;
+  let leased = false;
+  if (registryKind === 'test' && opts.httpPort === undefined) {
+    const claim = await leaseTestPort({ owner: process.cwd(), ...(opts.leaseDir ? { dir: opts.leaseDir } : {}) });
+    if ('error' in claim) {
+      out.error('시험 대역에 빈 포트가 없습니다 (31450..31499).');
+      return { exitCode: 1 };
+    }
+    httpPort = claim.port;
+    leased = true;
+    out.log(`시험 대역에서 :${httpPort} 임대`);
+  }
+  const dropLauncherLease = () => {
+    if (leased) releaseTestPort(httpPort, process.pid, opts.leaseDir);
+  };
   // A · staleness / forced rebuild — runs once before the daemon spawns
   //   so the very first request after start serves the new bundle.
-  const buildExit = await maybeAutoBuild(opts, out, mode);
-  if (buildExit !== 0) return { exitCode: buildExit };
-
+  let buildExit: number;
+  try {
+    buildExit = await maybeAutoBuild(opts, out, mode);
+  } catch (err) {
+    dropLauncherLease();
+    throw err;
+  }
+  if (buildExit !== 0) {
+    dropLauncherLease();
+    return { exitCode: buildExit };
+  }
   // Preflight — proactively unmount a stale Tailscale serve binding so
   // the bind below doesn't lose interface ownership to a zombie.
-  await preflightCleanStaleServe(opts, out, httpPort);
+  try {
+    await preflightCleanStaleServe(opts, out, httpPort);
+  } catch (err) {
+    dropLauncherLease();
+    throw err;
+  }
 
-  let bg = await bgLaunchFn({
-    ...(opts.force ? { force: true } : {}),
-    forwardArgs: collectForwardArgs(opts, httpPort),
-    out,
-  });
+  let bg: BgLaunchResult;
+  try {
+    bg = await bgLaunchFn({
+      ...(opts.force ? { force: true } : {}),
+      forwardArgs: collectForwardArgs(opts, httpPort),
+      ...(opts.coordinatorLeasePort !== undefined ? { childEnv: { ELANOUS_TEST_COORDINATOR_LEASE_PORT: String(opts.coordinatorLeasePort), ...(opts.coordinatorLeaseToken ? { ELANOUS_TEST_COORDINATOR_LEASE_TOKEN: opts.coordinatorLeaseToken } : {}), ...(opts.coordinatorLeaseId ? { ELANOUS_TEST_COORDINATOR_LEASE_ID: opts.coordinatorLeaseId } : {}) } } : {}),
+      out,
+    });
+  } catch (err) {
+    dropLauncherLease();
+    throw err;
+  }
 
   // B · same-tree auto-restart — when bg-launch trips the existing-lock
-  //   path AND the live holder lives in our cwd/daemonDir, stop it and
-  //   retry once. Cross-tree collisions still hit the 4-option hint
+  //   path AND the live holder lives in our cwd/daemonDir, maybeAutoRestart
+  //   refuses supervised holders; only unsupervised holders are stopped and
+  //   retried once. Cross-tree collisions still hit the 4-option hint
   //   below so a user with multiple trees can't accidentally kill the
   //   other one's daemon.
   if (bg.exitCode !== 0) {
-    const retried = await maybeAutoRestart(opts, out);
-    if (retried) {
-      bg = await bgLaunchFn({
-        ...(opts.force ? { force: true } : {}),
-        forwardArgs: collectForwardArgs(opts, httpPort),
-        out,
-      });
+    const shouldRetry = await maybeAutoRestart(opts, out);
+    if (shouldRetry) {
+      try {
+        bg = await bgLaunchFn({
+          ...(opts.force ? { force: true } : {}),
+          forwardArgs: collectForwardArgs(opts, httpPort),
+          ...(opts.coordinatorLeasePort !== undefined ? { childEnv: { ELANOUS_TEST_COORDINATOR_LEASE_PORT: String(opts.coordinatorLeasePort), ...(opts.coordinatorLeaseToken ? { ELANOUS_TEST_COORDINATOR_LEASE_TOKEN: opts.coordinatorLeaseToken } : {}), ...(opts.coordinatorLeaseId ? { ELANOUS_TEST_COORDINATOR_LEASE_ID: opts.coordinatorLeaseId } : {}) } } : {}),
+          out,
+        });
+      } catch (err) {
+        dropLauncherLease();
+        throw err;
+      }
     }
   }
   if (bg.exitCode !== 0) {
+    dropLauncherLease();
     // P3 collision hint — bgLaunch typically exits non-zero when an
     // existing lock holder occupies our port. The user-facing diagnostic
     // for a clean recovery path: take over (`--force`), pick another
@@ -578,6 +641,14 @@ export async function runPwaStart(opts: PwaStartOpts = {}): Promise<PwaStartResu
     out.error('         · or stop the existing daemon: `elanous nexus pwa stop`');
     out.error('         · permanent: `elanous config set global.nexus.pwa.port <n>`');
     return { exitCode: bg.exitCode };
+  }
+  if (leased) {
+    if (typeof bg.pid === 'number' && isPidAlive(bg.pid)) {
+      transferTestPort(httpPort, process.pid, bg.pid, opts.leaseDir);
+    } else {
+      // A launcher reporting success without a live daemon must not retain a claim.
+      dropLauncherLease();
+    }
   }
   if (mode !== 'hmr') {
     // Static mode: nexus is up, no dev BG. Verify the daemon actually

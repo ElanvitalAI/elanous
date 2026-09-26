@@ -763,6 +763,27 @@ export function buildReworkFeature(
   return `${feature}\n\n[라운드 ${round}/${effectiveMax}${escalateHint} — 아래를 반드시 고쳐 통과시켜라. 참조한 심볼/필드는 정의·선언까지 완성(소비만 하고 미정의 금지)]${refuteGrammar}\n${boundedGuidance}${priorSection}${evidenceReminder}`;
 }
 
+/** 🩸 2026-09-26 run-7dd4cce6 — 실패 시험 0건인데 «같은 미검증 파일 집합»으로 gate 가 거듭 빨갛고,
+ *  반복 감지는 리뷰 지적(심볼 인용)만 비교해서 `incomparable` 로 흘려 rework 를 헛돌았다.
+ *  ⭐ 반복 열쇠 = 정렬한 미검증 집합. 직전 gate 실패 라운드와 같고 실패 시험이 0이면 «재작업이 그 신호를 못 바꾼다».
+ *  첫 등장은 반복이 아니다(자식이 시험을 더해 풀 수도 있다) — `previousKey` 가 없으면 false. */
+export function unverifiedRepeatKey(unverified: readonly string[] | undefined): string | undefined {
+  if (!unverified || unverified.length === 0) return undefined;
+  return [...new Set(unverified)].sort().join('\n');
+}
+
+export function isRepeatedUnverifiedOnlyGateFailure(input: {
+  previousKey: string | undefined;
+  unverified: readonly string[] | undefined;
+  gateLog: string | undefined;
+  introduced?: number;
+}): boolean {
+  const key = unverifiedRepeatKey(input.unverified);
+  if (key === undefined || input.previousKey === undefined || key !== input.previousKey) return false;
+  if ((input.introduced ?? 0) > 0) return false;
+  return failIndicator('gate', input.gateLog, 0) === 0;
+}
+
 /** gate/review 실패 지표 추출(순수·적응형 입력) — gate log 의 "N fail" 합 또는 review mustFix 수. */
 export function failIndicator(kind: SupervisionReworkSource, gateLog: string | undefined, mustFixCount: number): number {
   if (kind === 'review') return Math.max(0, mustFixCount);

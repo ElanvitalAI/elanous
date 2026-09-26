@@ -13,6 +13,8 @@ export interface SelfUpdateOptions {
   keep?: number;
   /** 실패(exit≠0)를 알림으로도 보낸다 — 무인(크론) 실행용. 🩸 없으면 pilot 이 더럽거나 설치가 실패해도 조용히 며칠씩 멈춘다. */
   alert?: boolean;
+  /** 명시적으로 요청한 경우에만 체크아웃 설치 전 PWA 빌드를 건너뛴다. */
+  skipPwaBuild?: boolean;
   /** 설치된 릴리스에서만 사용한다. 체크아웃 갱신에는 적용하지 않는다. */
   version?: string;
 }
@@ -21,7 +23,7 @@ export interface SelfUpdateDeps {
   cliRoot?: string;
   git?: (cwd: string, args: string[]) => { status: number | null; stdout: string; stderr: string };
   decide?: (opts: { to: string; cwd: string; out: { log: (s: string) => void; error: (s: string) => void } }) => Promise<RestartNeededResult>;
-  run?: (command: string, args: string[], cwd: string) => { status: number | null; stderr: string };
+  run?: (command: string, args: string[], cwd: string, options?: { timeout?: number }) => { status: number | null; stderr: string; stdout?: string };
   installedVersion?: () => string;
   /** 재시작 뒤 데몬이 이 커밋으로 떴나(주입 안 하면 `/v1/health` 를 최대 90초 폴링). */
   verifyRestart?: (expectedCommit: string) => Promise<VerifyRestartResult>;
@@ -48,6 +50,9 @@ export interface SelfUpdateResult {
   decision: RestartNeededResult | null;
   restarted: boolean;
   reason: string;
+  /** 체크아웃에서 PWA 빌드가 성공한 HEAD 커밋(12자)과 빌드 시각. */
+  pwaBuiltCommit?: string;
+  pwaBuiltAt?: string;
   /** 설치 뒤 옛 판 정리 결과. 정리를 건너뛰었으면 `skipped` 에 이유. */
   prune?: VersionPruneOutcome;
   /** 재시작 뒤 건강 — ok · rolled-back(직전 판으로 되돌려 회복) · rollback-failed · no-rollback-target. */
@@ -267,8 +272,8 @@ export function childPath(env: NodeJS.ProcessEnv = process.env, execPath: string
   return current.split(':').includes(bunDir) ? current : [bunDir, current].filter(Boolean).join(':');
 }
 
-const execute = (command: string, args: string[], cwd: string) => {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', env: { ...process.env, PATH: childPath() } });
+const execute = (command: string, args: string[], cwd: string, options?: { timeout?: number }) => {
+  const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout: options?.timeout, maxBuffer: options?.timeout ? 64 * 1024 * 1024 : undefined, env: { ...process.env, PATH: childPath() } });
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.error?.message ?? result.stderr ?? '' };
 };
 
@@ -452,8 +457,10 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
   const alertOnce = (text: string): void => { alerted = true; sendAlert(text); };
   let relayOutcome: RelayUpdateOutcome | undefined;
   let runnerOutcome: RelayUpdateOutcome | undefined;
+  let pwaBuild: Pick<SelfUpdateResult, 'pwaBuiltCommit' | 'pwaBuiltAt'> | undefined;
   const emit = (raw: SelfUpdateResult): SelfUpdateResult => {
-    const withRelay: SelfUpdateResult = relayOutcome && !raw.relay ? { ...raw, relay: relayOutcome } : raw;
+    const withBuild: SelfUpdateResult = pwaBuild ? { ...raw, ...pwaBuild } : raw;
+    const withRelay: SelfUpdateResult = relayOutcome && !withBuild.relay ? { ...withBuild, relay: relayOutcome } : withBuild;
     const result: SelfUpdateResult = runnerOutcome && !withRelay.telegramRunner ? { ...withRelay, telegramRunner: runnerOutcome } : withRelay;
     // ⭐ 셀프힐(되돌림) 로직이라 관측을 logs.db 에 남긴다 — /tmp 로그 한 줄로는 `elanous logs` 가 못 본다.
     //   조회: elanous logs --category self-update --event finished
@@ -488,6 +495,26 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
       decision = await (deps.decide ?? decideRestartNeeded)({ to: head.stdout.trim(), cwd: checkout, out: silence });
     } catch (error) {
       decision = { exitCode: 2, reason: `판정 실패: ${String(error)}` };
+    }
+    if (!options.skipPwaBuild) {
+      const commit = head.stdout.trim().slice(0, 12);
+      const started = Date.now();
+      let ok = false;
+      let tail = '';
+      try {
+        const build = run('bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 15 * 60_000 });
+        ok = build.status === 0;
+        tail = (build.stderr?.trim() || build.stdout?.trim() || '').split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim().slice(0, 500) ?? '';
+      } catch (error) {
+        tail = String(error).split(/\r?\n/).at(-1)?.trim().slice(0, 500) ?? '';
+      }
+      const ms = Date.now() - started;
+      try {
+        debug.log('self-update', 'pwa-build', { ok, commit, ms });
+        debug.log('self-update', 'pwa-build-tail', { commit, tail: tail || '출력 없음' });
+      } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+      if (!ok) return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `PWA 빌드 실패: ${tail || '출력 없음'}` });
+      pwaBuild = { pwaBuiltCommit: commit, pwaBuiltAt: new Date().toISOString() };
     }
     let install: ReturnType<NonNullable<SelfUpdateDeps['run']>>;
     try {

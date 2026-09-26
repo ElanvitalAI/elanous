@@ -4,7 +4,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { GOAL_TYPES, type GoalType } from './goal-author.js';
-import { edgeMapOf, loadGraphTemplates, type GraphNodeContract, type GraphNodeSpec, type GraphTemplateSpec } from './graph-yaml.js';
+import type { GraphRunContractSpec } from './graph-run-contract.js';
+import { edgeMapOf, loadGraphTemplates, type GraphNodeContract, type GraphNodeKind, type GraphNodeSpec, type GraphTemplateSpec } from './graph-yaml.js';
 
 /** ⭐ RFC §5 «3단계» — 템플릿을 «데이터»로 둔다(RFC §4.1 어휘).
  *
@@ -13,8 +14,8 @@ import { edgeMapOf, loadGraphTemplates, type GraphNodeContract, type GraphNodeSp
  *  이 선언은 한때 그림자였으나, 승격 게이트 넷이 2026-09-08에 모두 서서 대표 승인으로 승격했다.
  *  정정 이력과 게이트 근거는 `내부 문서 `RFC-graph-engineering-for-the-harness-2026-09-07``를 따른다.
  *
- *  ⛔ `kind` 어휘는 «늘리지 않는다»(RFC §7). 늘어도 되는 것은 `node_id` 다(§4.2a). */
-export type GraphNodeKind = 'agent' | 'gate' | 'git' | 'judge';
+ *  ⛔ RFC §7 의 kind 어휘 제한은 2026-09-26 지시로 열렸다. 정의는 graph-yaml.ts 한 곳이다. */
+export type { GraphNodeKind } from './graph-yaml.js';
 
 export interface GraphTemplateNode {
   readonly nodeId: string;
@@ -34,6 +35,8 @@ export interface GraphTemplate {
   readonly terminalNodes: readonly string[];
   /** YAML 템플릿이 선언한 문서 전용 변경의 gate 건너뛰기 정책. */
   readonly docsOnlyGateSkip?: boolean;
+  /** 선언된 런 계약(선택) — 런 시작 때 발사 인자·부모 계약과 함께 한 번 해석된다. */
+  readonly runContract?: GraphRunContractSpec;
   readonly nodes: readonly GraphTemplateNode[];
   readonly edges: Readonly<Record<string, readonly string[]>>;
 }
@@ -126,9 +129,10 @@ export function compileGraphTemplate(spec: GraphTemplateSpec): GraphTemplateComp
       entryNode: spec.entryNode,
       terminalNodes: spec.terminalNodes,
       ...(spec.docsOnlyGateSkip !== undefined ? { docsOnlyGateSkip: spec.docsOnlyGateSkip } : {}),
+      ...(spec.runContract !== undefined ? { runContract: spec.runContract } : {}),
       nodes: spec.nodes.map((n) => ({
         nodeId: n.nodeId,
-        kind: n.kind as GraphNodeKind,
+        kind: n.kind,
         maxVisits: n.maxVisits,
         ...(n.recipe === undefined ? {} : { recipe: n.recipe }),
         ...(n.contract === undefined ? {} : { contract: n.contract }),

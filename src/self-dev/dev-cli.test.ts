@@ -22,9 +22,25 @@ import { defaultSeams } from '../self-implement/seams.js';
 import type { AcpRunResult } from './dev-pipeline.js';
 import type { AgentMissionResult } from '../agent-mission/driver.js';
 import type { SelfDevJobResult } from './orchestrate.js';
-import { setUserConfigOverlay } from '../user-config.js';
+import { buildUserConfig, parseChildLlmPreference, resetUserConfig, setUserConfigOverlay, type UserConfig } from '../user-config.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { readHarnessScreen } from '../harness/harness-screen.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
+
+/** 오버레이가 raw 만 바꿔도 파싱된 childLlm 을 같이 싣는다. 발사 경로는 raw 를 다시 읽지 않는다. */
+function withParsedChildLlm(config: UserConfig, rawChildLlm: unknown): UserConfig {
+  const parsed = parseChildLlmPreference(rawChildLlm);
+  return {
+    ...config,
+    tools: {
+      ...config.tools,
+      selfImplement: {
+        ...config.tools.selfImplement,
+        ...(parsed ? { childLlm: parsed } : {}),
+      },
+    },
+  };
+}
 
 const IN = { text: '기능' };
 const SELF: DevCliExecutor = { kind: 'self' };
@@ -153,19 +169,11 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(uncorrelated).not.toHaveProperty('correlationId');
   });
 
-  it('graph on/off을 self-mission→SelfImplementOptions.graphAuthoritative로 보존하고 생략 시 config 해석을 위해 비워 둔다', () => {
-    for (const graph of [true, false]) {
-      const spec = buildDevCliSpec(IN, SELF, { graph });
-      expect(spec.self).toEqual({ graphAuthoritative: graph });
-      expect(toSelfImplementOptions('기능', planDevPipeline(spec), {} as SelfImplementSeams).graphAuthoritative).toBe(graph);
-    }
-    expect(toSelfImplementOptions('기능', planDevPipeline(buildDevCliSpec(IN, SELF, {})), {} as SelfImplementSeams))
+  it('self-mission은 그래프 권위 옵션을 생성하지 않는다', () => {
+    const spec = buildDevCliSpec(IN, SELF, {});
+    expect(spec.self).not.toHaveProperty('graphAuthoritative');
+    expect(toSelfImplementOptions('기능', planDevPipeline(spec), {} as SelfImplementSeams))
       .not.toHaveProperty('graphAuthoritative');
-  });
-
-  it('graph은 self-mission 외 경로에서 기존 unknown-option rejection으로 거부한다', () => {
-    expect(() => buildDevCliSpec(IN, PTY, { branch: 'wt/x', graph: true }))
-      .toThrow(/무효한 옵션.*graph/);
   });
 
   // ⭐ 2026-09-02 (대표) — provider «만» 줘도 그 provider 의 기본 모델이 채워진다.
@@ -3240,6 +3248,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(calls).toEqual([
       ['gh', 'pr', 'merge', '9', '--squash', '--match-head-commit', 'checked-head-sha'],
       ['gh', 'pr', 'view', '9', '--json', 'state,baseRefName'],
+      // 병합 뒤 병합 커밋을 읽는다(#20905 · 릴리스 노트 조각의 mergeSha) — 실패해도 병합 결과는 그대로다.
+      ['gh', 'pr', 'view', '9', '--json', 'mergeCommit'],
     ]);
   });
 
@@ -3284,6 +3294,15 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     const spec = buildDevCliSpec(IN, SELF, { openPr: true, autoMerge: false });
     expect(spec).toMatchObject({ completion: 'pr', completionSource: 'request' });
     expect(planDevPipeline(spec)).toMatchObject({ completion: 'pr', completionSource: 'request' });
+  });
+
+  // UX 15′(2026-09-26 베어 Ubuntu 26.04): 사람이 친 플래그가 아니면 출처는 default — 원격 없는 저장소의 워크트리 자동 강등이 걸려야 한다.
+  it('completion 출처는 «사람이 친» --open-pr·--auto-merge 일 때만 request', () => {
+    expect(buildDevCliSpec(IN, SELF, { autoMerge: true }, ['file'])).toMatchObject({ completion: 'auto-merge', completionSource: 'default' });
+    expect(buildDevCliSpec(IN, SELF, { autoMerge: true }, ['autoMerge'])).toMatchObject({ completion: 'auto-merge', completionSource: 'request' });
+    expect(buildDevCliSpec(IN, SELF, { openPr: true, autoMerge: false }, ['openPr'])).toMatchObject({ completion: 'pr', completionSource: 'request' });
+    // 목록이 없으면(프로그램 호출) 종전대로 request
+    expect(buildDevCliSpec(IN, SELF, { autoMerge: true })).toMatchObject({ completionSource: 'request' });
   });
 
   it('self + --auto-review(+PR) → autoReview:true', () => {
@@ -4427,13 +4446,13 @@ describe('buildChildLlmSelection — config-backed child LLM when flags are abse
       setUserConfigOverlay(null);
     }
 
-    setUserConfigOverlay((config) => ({
+    setUserConfigOverlay((config) => withParsedChildLlm({
       ...config,
       raw: {
         ...config.raw,
         tools: { selfImplement: { childLlm: { provider: 'grok' } } },
       },
-    }));
+    }, { provider: 'grok' }));
     try {
       expect(readChildLlmConfigFromUserConfig()).toEqual({ provider: 'grok' });
       expect(buildChildLlmSelection({})).toEqual({
@@ -4447,10 +4466,10 @@ describe('buildChildLlmSelection — config-backed child LLM when flags are abse
   });
 
   it.each(['exhausted', 'usable', 'unknown'] as const)('config grok 잔량 %s: 발사 전 경고는 소진에서만 한 번 내고 dispatch는 계속된다', (quota) => {
-    setUserConfigOverlay((config) => ({
+    setUserConfigOverlay((config) => withParsedChildLlm({
       ...config,
       raw: { ...config.raw, tools: { selfImplement: { childLlm: { provider: 'grok', model: 'grok-4.7' } } } },
-    }));
+    }, { provider: 'grok', model: 'grok-4.7' }));
     const lines: string[] = [];
     const write = spyOn(process.stderr, 'write').mockImplementation((chunk) => {
       lines.push(typeof chunk === 'string' ? chunk : String(chunk));
@@ -4491,13 +4510,13 @@ describe('buildChildLlmSelection — config-backed child LLM when flags are abse
   });
 
   it('설정만 있으면 buildDevCliSpec 이 config 출처 선택을 싣고 해석 줄에 selection=config 를 남긴다', () => {
-    setUserConfigOverlay((config) => ({
+    setUserConfigOverlay((config) => withParsedChildLlm({
       ...config,
       raw: {
         ...config.raw,
         tools: { selfImplement: { childLlm: { provider: 'grok' } } },
       },
-    }));
+    }, { provider: 'grok' }));
     const chunks: string[] = [];
     const write = spyOn(process.stderr, 'write').mockImplementation((chunk) => {
       chunks.push(typeof chunk === 'string' ? chunk : String(chunk));
@@ -4518,13 +4537,13 @@ describe('buildChildLlmSelection — config-backed child LLM when flags are abse
   });
 
   it('플래그가 있으면 설정 overlay 가 있어도 플래그가 이기고 기본 리더를 타지 않는다', () => {
-    setUserConfigOverlay((config) => ({
+    setUserConfigOverlay((config) => withParsedChildLlm({
       ...config,
       raw: {
         ...config.raw,
         tools: { selfImplement: { childLlm: { provider: 'grok', model: 'grok-4.6' } } },
       },
-    }));
+    }, { provider: 'grok', model: 'grok-4.6' }));
     try {
       const spec = buildDevCliSpec(IN, SELF, {
         childLlmProvider: 'anthropic',
@@ -4564,72 +4583,117 @@ describe('buildChildLlmSelection — config-backed child LLM when flags are abse
     }
   });
 
-  it('잘못된 타입의 설정 provider 는 플래그와 같은 문면으로 거절하고 형식 오류도 접지하지 않는다', () => {
-    setUserConfigOverlay((config) => ({
-      ...config,
-      raw: {
-        ...config.raw,
-        tools: { selfImplement: { childLlm: { provider: 42, model: 'grok-4.6' } } },
-      },
+  it('잘못된 타입의 설정 provider 는 경고 후 버리고 발사를 막지 않는다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'child-llm-bad-provider-'));
+    const path = join(dir, 'config.json');
+    writeFileSync(path, JSON.stringify({
+      tools: { selfImplement: { childLlm: { provider: 42, model: 'grok-4.6' } } },
     }));
+    const warnings: string[] = [];
+    const write = spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      warnings.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    });
+    setElanousConfigDir(dir);
+    resetUserConfig();
     try {
-      expect(() => readChildLlmConfigFromUserConfig()).toThrow(/--child-llm-provider 알 수 없음: 42/);
-      expect(() => buildChildLlmSelection({})).toThrow(/--child-llm-provider 알 수 없음: 42/);
+      const loaded = buildUserConfig(path);
+      expect(loaded.tools.selfImplement.childLlm).toBeUndefined();
+      expect(warnings.some((line) => line.includes('provider') && line.includes('42'))).toBe(true);
+      expect(() => buildDevCliSpec(IN, SELF, {})).not.toThrow();
+      expect(buildDevCliSpec(IN, SELF, {}).self).toBeUndefined();
     } finally {
-      setUserConfigOverlay(null);
+      write.mockRestore();
+      resetElanousConfigDir();
+      resetUserConfig();
+      rmSync(dir, { recursive: true, force: true });
     }
 
-    setUserConfigOverlay((config) => ({
-      ...config,
-      raw: {
-        ...config.raw,
-        tools: { selfImplement: { childLlm: 'grok' } },
-      },
-    }));
+    setUserConfigOverlay((config) => withParsedChildLlm(config, 'grok'));
     try {
-      expect(() => readChildLlmConfigFromUserConfig()).toThrow(/tools.selfImplement.childLlm 형식 오류: object 여야 합니다/);
-      expect(() => buildChildLlmSelection({})).toThrow(/tools.selfImplement.childLlm 형식 오류: object 여야 합니다/);
-    } finally {
-      setUserConfigOverlay(null);
-    }
-  });
-
-  it('잘못된 모델 타입은 기본 모델로 접지하지 않고 플래그와 같은 문면으로 거절한다', () => {
-    setUserConfigOverlay((config) => ({
-      ...config,
-      raw: {
-        ...config.raw,
-        tools: { selfImplement: { childLlm: { provider: 'grok', model: 42 } } },
-      },
-    }));
-    try {
-      expect(() => readChildLlmConfigFromUserConfig()).toThrow(/--child-llm-model 알 수 없음: 42/);
-      expect(() => buildChildLlmSelection({})).toThrow(/--child-llm-model 알 수 없음: 42/);
+      expect(parseChildLlmPreference('grok')).toBeUndefined();
+      expect(readChildLlmConfigFromUserConfig()).toBeUndefined();
+      expect(buildChildLlmSelection({})).toBeUndefined();
     } finally {
       setUserConfigOverlay(null);
     }
   });
 
-  it('잘못된 tools·selfImplement 타입은 설정 부재가 아니라 형식 오류로 거절한다', () => {
-    setUserConfigOverlay((config) => ({
-      ...config,
-      raw: { ...config.raw, tools: 42 },
-    }));
+  it('잘못된 모델 타입은 경고 후 버리고 provider 기본 모델로 진행한다', () => {
+    setUserConfigOverlay((config) => withParsedChildLlm(config, { provider: 'grok', model: 42 }));
     try {
-      expect(() => readChildLlmConfigFromUserConfig()).toThrow(/tools.selfImplement.childLlm 형식 오류: tools 는 object 여야 합니다/);
-      expect(() => buildChildLlmSelection({})).toThrow(/tools.selfImplement.childLlm 형식 오류: tools 는 object 여야 합니다/);
+      expect(readChildLlmConfigFromUserConfig()).toEqual({ provider: 'grok' });
+      expect(buildChildLlmSelection({})).toEqual({
+        provider: 'grok',
+        model: defaultChildLlmModel('grok'),
+        source: 'config',
+      });
     } finally {
       setUserConfigOverlay(null);
     }
+  });
 
+  it('파서가 버린 provider:123 은 raw 가 남아도 발사를 막지 않고 기본으로 진행한다', () => {
     setUserConfigOverlay((config) => ({
-      ...config,
-      raw: { ...config.raw, tools: { selfImplement: 42 } },
+      ...withParsedChildLlm(config, { provider: 123 }),
+      raw: {
+        ...config.raw,
+        tools: { selfImplement: { childLlm: { provider: 123 } } },
+      },
     }));
     try {
-      expect(() => readChildLlmConfigFromUserConfig()).toThrow(/tools.selfImplement.childLlm 형식 오류: selfImplement 는 object 여야 합니다/);
-      expect(() => buildChildLlmSelection({})).toThrow(/tools.selfImplement.childLlm 형식 오류: selfImplement 는 object 여야 합니다/);
+      expect(readChildLlmConfigFromUserConfig()).toBeUndefined();
+      expect(buildChildLlmSelection({})).toBeUndefined();
     } finally {
+      setUserConfigOverlay(null);
+    }
+  });
+
+  it('기존 model-only 설정은 mode 를 auto 로 두고 발사 경계에서만 종전 거절 문면을 낸다', () => {
+    const parsed = parseChildLlmPreference({ model: 'grok-4.6' });
+    expect(parsed?.mode).toBeUndefined();
+    expect(parsed?.provider).toBeUndefined();
+    setUserConfigOverlay((config) => withParsedChildLlm(config, { model: 'grok-4.6' }));
+    try {
+      expect(() => readChildLlmConfigFromUserConfig()).toThrow(/--child-llm-provider 필요\(--child-llm-model과 함께\)/);
+      expect(() => buildChildLlmSelection({})).toThrow(/--child-llm-provider 필요\(--child-llm-model과 함께\)/);
+      expect(() => buildDevCliSpec(IN, SELF, {})).toThrow(/--child-llm-provider 필요\(--child-llm-model과 함께\)/);
+    } finally {
+      setUserConfigOverlay(null);
+    }
+  });
+
+  it('발사 인자 없이 mode auto chain grok 이면 해석된 provider 가 grok 이고 인자가 있으면 인자가 이긴다', () => {
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      events.push({ category, event, data });
+    });
+    setUserConfigOverlay((config) => withParsedChildLlm({
+      ...config,
+      llm: { ...config.llm, fallbackChain: ['codex-rotate', 'grok'] },
+    }, { mode: 'auto', chain: [{ provider: 'grok' }] }));
+    try {
+      const fromChain = buildDevCliSpec(IN, SELF, {});
+      expect(fromChain.self?.childLlm?.provider).toBe('grok');
+      expect(fromChain.self?.childLlm?.source).toBe('config');
+      const resolved = events.filter((event) => event.category === 'harness.child-llm-preference' && event.event === 'resolved');
+      expect(resolved.length).toBeGreaterThan(0);
+      expect(resolved.at(-1)?.data).toMatchObject({
+        mode: 'auto',
+        chain: ['grok'],
+        source: { chain: 'config' },
+      });
+      const fromFlag = buildDevCliSpec(IN, SELF, {
+        childLlmProvider: 'openai-codex',
+        childLlmModel: 'gpt-6-sol',
+      });
+      expect(fromFlag.self?.childLlm).toEqual({
+        provider: 'openai-codex',
+        model: 'gpt-6-sol',
+        source: 'flag',
+      });
+    } finally {
+      log.mockRestore();
       setUserConfigOverlay(null);
     }
   });

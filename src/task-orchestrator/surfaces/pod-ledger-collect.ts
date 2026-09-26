@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { debug } from '../../debug/log.js';
 import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
@@ -61,12 +61,14 @@ export function parsePodLedgerChunks(logs: string): ParseResult {
   return error.length ? { error, ledgers } : ledgers;
 }
 
-/** Never replace a host ledger, even if another collector races this one. */
+/** Never replace a host ledger, even if another collector races this one —
+ *  except a ledger that THIS run's live follower created (`replace`): that one is a partial copy and the final is complete. */
 export function collectPodLedgers(
   logs: string,
-  { dir = runLedgerDir(), log = (c, e, d) => debug.log(c, e, d) }: {
+  { dir = runLedgerDir(), log = (c, e, d) => debug.log(c, e, d), replace = new Set<string>() }: {
     dir?: string;
     log?: (category: string, event: string, data: Record<string, unknown>) => void;
+    replace?: ReadonlySet<string>;
   } = {},
 ): void {
   const parsed = parsePodLedgerChunks(logs);
@@ -77,11 +79,63 @@ export function collectPodLedgers(
   for (const { runId, jsonl } of ledgers) {
     try {
       mkdirSync(dir, { recursive: true });
-      writeFileSync(runLedgerPath(runId, dir), jsonl, { flag: 'wx' });
+      writeFileSync(runLedgerPath(runId, dir), jsonl, { flag: replace.has(runId) ? 'w' : 'wx' });
       log('self-implement.pod', 'ledger-collected', { runId, lines: jsonl.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(jsonl) });
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EEXIST') log('self-implement.pod', 'ledger-collect-skipped', { runId, reason: 'exists' });
-      else log('self-implement.pod', 'ledger-collect-incomplete', { runId, reason: e instanceof Error ? e.message : String(e) });
+      if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+        // A reattached Job may have already delivered this exact complete snapshot.
+        // An unrelated host ledger (or a partial copy) must still remain untouched.
+        try {
+          const existing = readFileSync(runLedgerPath(runId, dir));
+          log('self-implement.pod', existing.equals(Buffer.from(jsonl)) ? 'ledger-collect-already-complete' : 'ledger-collect-skipped', { runId, reason: 'exists' });
+        } catch (readError) {
+          log('self-implement.pod', 'ledger-collect-incomplete', { runId, reason: readError instanceof Error ? readError.message : String(readError) });
+        }
+      } else log('self-implement.pod', 'ledger-collect-incomplete', { runId, reason: e instanceof Error ? e.message : String(e) });
     }
   }
+}
+
+/** ⭐ 런 «도중» 원장 증분 회수(🅣 요청 2026-09-26 · 힐 루프의 runtime 성형이 Pod 판에서 성립하는 전제).
+ *  호스트 폴링(15초)마다 Pod 안 `run-ledger/<runId>.jsonl` 의 «새 바이트»만 가져와 «완성된 줄»만 호스트 원장에 잇는다.
+ *  ⛔ 원장 줄만 — 값·비밀·화면은 안 가져온다. ⛔ 호스트에 «남이 만든» 같은 원장이 있으면 손대지 않는다(종료 회수의 wx 규칙과 같은 뜻).
+ *  ⭐ 이 추종기가 만든 파일은 종료 때 완본으로 교체된다(`owned` → collectPodLedgers 의 replace). */
+export function createPodLedgerFollower(opts: {
+  runId: string;
+  /** Pod 안에서 셸 한 줄을 실행해 stdout 을 돌려준다(kubectl exec). */
+  exec: (script: string) => { status: number | null; stdout: string; stderr: string };
+  dir?: string;
+  log?: (category: string, event: string, data: Record<string, unknown>) => void;
+}): { poll(): void; readonly owned: boolean } {
+  const dir = opts.dir ?? runLedgerDir();
+  const log = opts.log ?? ((c, e, d) => debug.log(c, e, d));
+  const path = runLedgerPath(opts.runId, dir);   // runId 검증(경로·셸에 안전한 문자만)도 여기서 된다
+  let offset = 0;
+  let pending = '';
+  let owned = false;
+  let disabled = false;
+  return {
+    get owned() { return owned; },
+    poll() {
+      if (disabled) return;
+      if (!owned && existsSync(path)) {
+        disabled = true;
+        log('self-implement.pod', 'ledger-live-skipped', { runId: opts.runId, reason: 'host-ledger-exists' });
+        return;
+      }
+      const r = opts.exec(`f="\${ELANOUS_STATE_DIR:-$HOME/.elanous}/run-ledger/${opts.runId}.jsonl"; [ -f "$f" ] || exit 0; tail -c +${offset + 1} "$f"`);
+      if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); return; }
+      if (!r.stdout) return;
+      offset += Buffer.byteLength(r.stdout);
+      const text = pending + r.stdout;
+      const cut = text.lastIndexOf('\n');
+      if (cut < 0) { pending = text; return; }
+      const complete = text.slice(0, cut + 1);
+      pending = text.slice(cut + 1);
+      mkdirSync(dir, { recursive: true });
+      appendFileSync(path, complete);
+      owned = true;
+      log('self-implement.pod', 'ledger-live-appended', { runId: opts.runId, lines: complete.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(complete), offset });
+    },
+  };
 }

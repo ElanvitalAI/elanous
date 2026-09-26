@@ -16,7 +16,21 @@ function okSetup(): SetupCheckResult {
 function badSetup(): SetupCheckResult {
   return {
     ok: false,
-    required: [{ id: 'llm', label: 'LLM provider', passed: false, hint: 'run `elanous setup llm`' }],
+    required: [
+      { id: 'llm', label: 'LLM provider', passed: false, hint: 'run `elanous setup llm`' },
+      { id: 'pwa-build', label: 'PWA build', passed: false, hint: 'run `elanous nexus build`' },
+    ],
+    recommended: [],
+  };
+}
+
+function llmOnlySetup(): SetupCheckResult {
+  return {
+    ok: false,
+    required: [
+      { id: 'llm', label: 'LLM provider', passed: false, hint: 'run `elanous setup llm`' },
+      { id: 'pwa-build', label: 'PWA build', passed: true, hint: 'run `elanous nexus build`' },
+    ],
     recommended: [],
   };
 }
@@ -84,6 +98,25 @@ describe('Q.1 · runBgLaunch', () => {
     expect(spawnCalls).toBe(0);
     expect(out.errors.join('\n')).toContain('setup incomplete');
     expect(out.logs.join('\n')).toContain('Run `elanous nexus` (interactive) once');
+  });
+
+  test('LLM 만 빠짐 → exit 하지 않고 ELANOUS_NEXUS_SETUP_MODE=1 + /setup', async () => {
+    const out = sink();
+    let env: Record<string, string | undefined> | undefined;
+    const result = await runBgLaunch({
+      setupStatus: llmOnlySetup(),
+      out,
+      spawnFn: (_cmd, _args, opts) => {
+        env = opts.env as Record<string, string | undefined>;
+        return { pid: 77, unref() {} };
+      },
+      sleepFn: async () => {},
+      probeChildFn: () => 'alive',
+    });
+    expect(result.exitCode).not.toBe(1);
+    expect(env?.ELANOUS_NEXUS_SETUP_MODE).toBe('1');
+    expect(out.logs.join('\n')).toContain('/setup');
+    expect(out.logs.join('\n')).toContain('셋업 모드로 떴습니다');
   });
 
   test('log path 가 ~/.elanous/nexus/logs/ 아래', async () => {

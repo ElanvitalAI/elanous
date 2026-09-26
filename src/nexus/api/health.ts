@@ -19,6 +19,17 @@ export type HealthTestUniverse = boolean | typeof UNKNOWN;
 /** Bind identity the HTTP server selected for Bun.listen. */
 export interface HealthBindContext {
   bindHost?: string;
+  /**
+   * 기동 때 한 번 정한 셋업 상태. `handleHealth` 의 선택 셋업 인자다.
+   * mode 가 참일 때만 health JSON 에 setupMode·setupMissing 을 싣는다.
+   */
+  setup?: HealthSetupContext;
+}
+
+/** 기동 때 한 번 정한 셋업 상태. mode 가 참일 때만 health JSON 에 칸을 싣는다. */
+export interface HealthSetupContext {
+  mode: boolean;
+  missing: string[];
 }
 
 interface HealthIdentityResolvers {
@@ -102,6 +113,7 @@ export function handleHealth(
   for (const t of tabs) {
     byStatus[t.status] = (byStatus[t.status] ?? 0) + 1;
   }
+  const setup = bind?.setup;
   return jsonResponse({
     ok: true,
     nexusVersion: state.nexusVersion,
@@ -116,5 +128,8 @@ export function handleHealth(
     universeRoot: safeUniverseRoot(),
     testUniverse: safeTestUniverse(),
     bindHost: safeBindHost(bind),
+    ...(setup?.mode === true
+      ? { setupMode: true as const, setupMissing: setup.missing }
+      : {}),
   });
 }

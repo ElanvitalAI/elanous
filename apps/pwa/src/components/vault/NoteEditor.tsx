@@ -3,7 +3,7 @@
 // ── Obsidian 노트 에디터 (OP2 · 2026-07-09) ───────────────────────────────
 //
 // iPad CodeMirror 에디터를 PWA에 이식(경량 textarea + 라이브 프리뷰). 로드→편집→저장
-// (/v1/notes/save·409 mtime conflict 처리)·auto-save(debounce)·wikilink 자동완성(OP3 seam).
+// (/v1/vault/file·409 mtime conflict 처리)·auto-save(debounce)·wikilink 자동완성(OP3 seam).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { VaultMarkdown } from '@/components/vault/VaultMarkdown';
@@ -37,17 +37,18 @@ export function NoteEditor({ path, onClose }: { path: string; onClose: () => voi
     void api.read(path, 8 * 1024 * 1024).then((r) => {
       if (!alive) return;
       setText(r.content ?? '');
-      mtimeRef.current = undefined; // read 엔드포인트는 mtime 미반환 → 첫 저장은 force
+      mtimeRef.current = r.mtimeMs;
       setLoaded(true); setSave('clean');
     }).catch(() => { if (alive) { setErr('노트를 불러오지 못했습니다'); setLoaded(true); } });
     return () => { alive = false; if (saveTimer.current) clearTimeout(saveTimer.current); };
   }, [api, path]);
 
-  const doSave = useCallback(async (force = false) => {
+  const doSave = useCallback(async (force = false, content = text) => {
     setSave('saving'); setErr(null);
     try {
-      const r = await api.saveNote({ path, markdown: text, ...(force ? {} : (mtimeRef.current != null ? { lastKnownMtime: mtimeRef.current } : {})) });
-      if (r.error && r.currentMtime != null) { setSave('conflict'); mtimeRef.current = r.currentMtime; return; }
+      const r = await api.writeNote({ path, content, ...(force ? {} : (mtimeRef.current != null ? { lastKnownMtime: mtimeRef.current } : {})) });
+      // 삭제된 노트는 currentMtime 없이 409 mtime_conflict 가 온다 — 코드로 가른다.
+      if (r.error === 'mtime_conflict' || (r.error && r.currentMtime != null)) { setSave('conflict'); return; }
       if (r.error) { setSave('error'); setErr(r.error); return; }
       if (r.mtimeMs != null) mtimeRef.current = r.mtimeMs;
       setSave('saved');
@@ -75,7 +76,7 @@ export function NoteEditor({ path, onClose }: { path: string; onClose: () => voi
     setText(v); setSave('dirty');
     refreshAutocomplete(v, caret);
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(() => { void doSave(false); }, 2500);
+    saveTimer.current = setTimeout(() => { void doSave(false, v); }, 2500);
   }, [doSave, refreshAutocomplete]);
 
   const pickWikilink = useCallback((note: VaultNote) => {
@@ -122,7 +123,7 @@ export function NoteEditor({ path, onClose }: { path: string; onClose: () => voi
         <div className="mb-2 flex items-center gap-2 rounded border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-200">
           <span>디스크의 노트가 외부에서 변경됐습니다.</span>
           <Button size="sm" variant="outline" onClick={() => void doSave(true)}>강제 덮어쓰기</Button>
-          <Button size="sm" variant="ghost" onClick={() => void api.read(path, 8 * 1024 * 1024).then((r) => { setText(r.content ?? ''); setSave('clean'); })}>디스크 버전 로드</Button>
+          <Button size="sm" variant="ghost" onClick={() => void api.read(path, 8 * 1024 * 1024).then((r) => { setText(r.content ?? ''); mtimeRef.current = r.mtimeMs; setSave('clean'); })}>디스크 버전 로드</Button>
         </div>
       )}
       {err && <div className="mb-2 text-xs text-rose-400">{err}</div>}

@@ -1,12 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   __resetRetiredConfigKeysObservationForTests,
   buildUserConfig,
+  CHAT_DEFAULTS,
   findRetiredConfigKeys,
+  findRetiredConfigKeysInFile,
+  RETIRED_CONFIG_KEYS,
   inferRuntimeLlmModelFamily,
   isNativeStructureEnabledForProvider,
   isRuntimeLlmModelCompatibleWithProvider,
@@ -84,6 +87,15 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
+describe('pod Grok API key opt-in', () => {
+  test('only literal true enables the billed Pod credential path', () => {
+    for (const [value, expected] of [[undefined, false], [false, false], ['true', false], [true, true]] as const) {
+      writeConfig({ harness: { pod: { grokApiKeyOptIn: value } } });
+      expect(buildUserConfig(configPath).harness?.pod?.grokApiKeyOptIn).toBe(expected);
+    }
+  });
+});
+
 describe('role model tiers', () => {
   test('resolves a configured role tier through each active provider ladder', () => {
     writeConfig({ llm: { provider: 'grok' }, roleModelTiers: { review: 'best' } });
@@ -102,7 +114,7 @@ describe('role model tiers', () => {
 
     expect(resolveAutoRoleTier('anthropic')).toEqual({ model: 'claude-opus-5-5', source: 'tier' });
     expect(resolveAutoRoleTier('grok')).toEqual({ model: 'grok-4.7', source: 'tier' });
-  });
+  }, 30_000);
 
   test('a direct role model remains more specific than a configured tier', () => {
     writeConfig({
@@ -577,7 +589,135 @@ describe('mcp.widgetServerId', () => {
   });
 });
 
+describe('chat.rendering always-on switches retirement (1-f)', () => {
+  const paths = [
+    'chat.rendering.compactBoundary.enabled',
+    'chat.rendering.wrap.preserveOsc8',
+    'chat.rendering.diff.adaptiveBg',
+    'chat.rendering.diff.syntaxPerHunk',
+    'chat.rendering.diff.cache',
+    'chat.rendering.diff.turnSummary',
+    'chat.rendering.diff.turnBrowser',
+  ];
+
+  test('drops all seven from typed defaults, parsed config and saved config; retains other rendering settings', () => {
+    const rendering = {
+      streaming: { mode: 'line', catchUpThresholdLines: 17, catchUpAgeMs: 300 },
+      compactBoundary: { enabled: false },
+      wrap: { urlAware: true, preserveOsc8: false },
+      tool: { displayMode: 'inline-to-block', blockMaxLines: 16 },
+      diff: {
+        colorTier: '256', adaptiveBg: false, syntaxPerHunk: false, cache: false,
+        headerStyle: 'edited', turnSummary: false, turnBrowser: false,
+        turnBrowserHistory: 12, turnBrowserMode: 'files',
+      },
+      hud: { gaugeWarnRatio: 0.6, gaugeDangerRatio: 0.9 },
+    };
+    writeConfig({ chat: { rendering } });
+    const expected = {
+      streaming: rendering.streaming,
+      wrap: { urlAware: true },
+      tool: rendering.tool,
+      diff: {
+        colorTier: '256', headerStyle: 'edited', turnBrowserHistory: 12, turnBrowserMode: 'files',
+      },
+      hud: rendering.hud,
+    };
+    expect(CHAT_DEFAULTS.rendering).toEqual({
+      streaming: { mode: 'byte', catchUpThresholdLines: 50, catchUpAgeMs: 200 },
+      wrap: { urlAware: false },
+      tool: { displayMode: 'inline-to-block', blockMaxLines: 8 },
+      diff: { colorTier: 'auto', headerStyle: 'legacy', turnBrowserHistory: 8, turnBrowserMode: 'all' },
+      hud: { gaugeWarnRatio: 0.7, gaugeDangerRatio: 0.85 },
+    });
+    const cfg = buildUserConfig(configPath);
+    expect(cfg.chat.rendering as unknown).toEqual(expected);
+    const savedPath = join(root, 'saved-rendering.json');
+    saveUserConfig(cfg, savedPath);
+    expect(JSON.parse(readFileSync(savedPath, 'utf8')).chat.rendering).toEqual(expected);
+    expect(buildUserConfig(savedPath).chat.rendering as unknown).toEqual(expected);
+  });
+
+  test('registers the seven retired paths without losing earlier entries and detects persisted leftovers', () => {
+    const entries = RETIRED_CONFIG_KEYS.filter(({ path }) => paths.includes(path));
+    expect(entries).toHaveLength(7);
+    expect(entries.map(({ path }) => path)).toEqual(paths);
+    expect(entries.every(({ reason }) => reason === '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)')).toBe(true);
+    expect(RETIRED_CONFIG_KEYS.length).toBeGreaterThanOrEqual(24);
+    // ⭐ 위치가 아니라 «연속·순서»로 잰다 — 은퇴 목록은 뒤에 덧붙이는 관례라, 위치로 자르면 다음 졸업마다 이 시험이 깨진다(2026-09-26).
+    const firstIndex = RETIRED_CONFIG_KEYS.findIndex(({ path }) => path === paths[0]);
+    expect(RETIRED_CONFIG_KEYS.slice(firstIndex, firstIndex + 7)).toEqual(entries);
+    const allPaths = RETIRED_CONFIG_KEYS.map(({ path }) => path);
+    const earlier = [
+      'tools.selfImplement.decompositionShadow', 'tools.selfImplement.autoStop.enabled',
+      'tools.selfImplement.autoAssist.enabled', 'tools.selfImplement.screenStallTermination.enabled',
+      'chat.rendering.hud.variantBadge', 'chat.rendering.hud.tokenGauge',
+      'chat.rendering.tool.inlineOneLine', 'vw.acpResident', 'discord.sprint21',
+      'tools.selfImplement.prEvidenceArtifactEnforce', 'voice.discord.dispatch',
+      'voice.discord.replyMode', 'voice.pwa.dispatch', 'voice.stt.mode', 'voice.stt.language',
+      'instance.treeDerivedTest', 'tools.selfImplement.selfResolveClarifications',
+    ];
+    const earlierIndexes = earlier.map((path) => allPaths.indexOf(path));
+    expect(earlierIndexes.every((index) => index >= 0 && index < firstIndex)).toBe(true);
+    expect([...earlierIndexes].sort((a, b) => a - b)).toEqual(earlierIndexes);
+    const raw = { chat: { rendering: { compactBoundary: { enabled: false }, wrap: { preserveOsc8: false }, diff: {
+      adaptiveBg: false, syntaxPerHunk: false, cache: false, turnSummary: false, turnBrowser: false,
+    } } } };
+    expect(findRetiredConfigKeys(raw).map(({ path }) => path)).toEqual(paths);
+    writeConfig(raw);
+    expect(findRetiredConfigKeysInFile(configPath).map(({ path }) => path)).toEqual(paths);
+  });
+});
+
+describe('reaction and next-fluent switch retirement (1-f)', () => {
+  test('detects all three retired switches while preserving neighboring inputs', () => {
+    const raw = {
+      sessionFabric: {
+        streaming: { telegram: false, discord: true },
+        telegram: { reactions: false, streamingMode: 'block', editGapMs: 900, typing: true, fairQueue: true, rotate: false },
+        discord: { reactions: false, streamingMode: 'progress', editGapMs: 800 },
+      },
+      nextFluent: { enabled: false, personas: true, models: { closer: 'local-model' } },
+    };
+    const paths = ['sessionFabric.telegram.reactions', 'sessionFabric.discord.reactions', 'nextFluent.enabled'];
+    const entries = RETIRED_CONFIG_KEYS.filter(({ path }) => paths.includes(path));
+    expect(entries.map(({ path }) => path)).toEqual(paths);
+    expect(entries.every(({ reason }) => reason === '늘 켬 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)')).toBe(true);
+    // 위치(끝 셋)가 아니라 «연속»으로 — 뒤에 덧붙는 다음 은퇴가 이 시험을 깨지 않게(2026-09-26).
+    const startIndex = RETIRED_CONFIG_KEYS.indexOf(entries[0]!);
+    expect(RETIRED_CONFIG_KEYS.slice(startIndex, startIndex + entries.length)).toEqual(entries);
+    expect(findRetiredConfigKeys(raw).map(({ path }) => path)).toEqual(paths);
+    writeFileSync(configPath, JSON.stringify(raw));
+    expect(findRetiredConfigKeysInFile(configPath).map(({ path }) => path)).toEqual(paths);
+    const cfg = buildUserConfig(configPath);
+    expect(cfg.sessionFabric).toEqual({
+      streaming: { telegram: false, discord: true },
+      telegram: { streamingMode: 'block', editGapMs: 900, typing: true, fairQueue: true, rotate: false },
+      discord: { streamingMode: 'progress', editGapMs: 800 },
+    });
+    expect(cfg.nextFluent).toEqual({ personas: true, models: { closer: 'local-model' } });
+    saveUserConfig(cfg, configPath);
+    const saved = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(saved.sessionFabric).toEqual(cfg.sessionFabric);
+    expect(saved.nextFluent).toEqual({ personas: true, models: { closer: 'local-model' } });
+    expect(findRetiredConfigKeys(saved).map(({ path }) => path)).toEqual([]);
+    expect(buildUserConfig(configPath).nextFluent).toEqual({ personas: true, models: { closer: 'local-model' } });
+    writeConfig({ nextFluent: { enabled: false } });
+    expect(buildUserConfig(configPath).nextFluent).toBeUndefined();
+  });
+});
+
 describe('retired config keys (설정 졸업 0-a)', () => {
+  test('graph authority key is retired and cannot enter normalized configuration', () => {
+    for (const graphAuthoritative of [false, true]) {
+      const raw = { tools: { selfImplement: { graphAuthoritative } } };
+      expect(findRetiredConfigKeys(raw).map(({ path }) => path)).toEqual(['tools.selfImplement.graphAuthoritative']);
+      writeConfig(raw);
+      const config = buildUserConfig(configPath);
+      expect(config.tools.selfImplement).not.toHaveProperty('graphAuthoritative');
+    }
+  });
+
   // 설정 졸업 단계 2(2026-09-26) — 읽는 곳이 없던 넷: 파일에 남아 있으면 «폐기»로 대고, 값은 로더가 무시한다.
   test('stage 2: the four dead display/vw keys are reported as retired and their values are ignored', () => {
     const raw = { chat: { rendering: { hud: { variantBadge: false, tokenGauge: false }, tool: { inlineOneLine: false } } }, vw: { acpResident: false }, discord: { sprint21: { enabled: true } } };

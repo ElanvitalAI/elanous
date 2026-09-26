@@ -13,29 +13,29 @@ import {
 
 describe('TAG_PATTERN regex', () => {
   test('matches a simple inline tag', () => {
-    const re = new RegExp(TAG_PATTERN, 'g');
+    const re = new RegExp(TAG_PATTERN, 'gu');
     const matches = 'this is a #ideas tag'.match(re);
     expect(matches).toEqual(['#ideas']);
   });
 
   test('matches nested tag with /', () => {
-    const re = new RegExp(TAG_PATTERN, 'g');
+    const re = new RegExp(TAG_PATTERN, 'gu');
     expect('see #project/q4-planning'.match(re)).toEqual(['#project/q4-planning']);
   });
 
   test('matches tag with hyphen', () => {
-    const re = new RegExp(TAG_PATTERN, 'g');
+    const re = new RegExp(TAG_PATTERN, 'gu');
     expect('a #q4-2026 deadline'.match(re)).toEqual(['#q4-2026']);
   });
 
   test('does NOT match a heading (## Foo)', () => {
-    const re = new RegExp(TAG_PATTERN, 'g');
+    const re = new RegExp(TAG_PATTERN, 'gu');
     expect('## Heading'.match(re)).toBeNull();
     expect('### Sub'.match(re)).toBeNull();
   });
 
   test('does NOT match a hex color (#aaaaaa) — starts with hex but needs letters', () => {
-    const re = new RegExp(TAG_PATTERN, 'g');
+    const re = new RegExp(TAG_PATTERN, 'gu');
     // Note: the pattern requires the first char to be a letter, so #fff
     // (hex letters only) WILL match. This is a limitation we accept —
     // Obsidian itself behaves the same way. Document for clarity.
@@ -44,8 +44,16 @@ describe('TAG_PATTERN regex', () => {
     expect('#123456'.match(re)).toBeNull();
   });
 
+  test('한글·한영 혼합 태그를 잡는다 · 단어 중간 # 은 태그가 아니다', () => {
+    const re = new RegExp(TAG_PATTERN, 'gu');
+    expect('로 간다 #시험 그리고 #AI요약 #프로젝트/사분기-4'.match(re)).toEqual(['#시험', '#AI요약', '#프로젝트/사분기-4']);
+    expect('한국어#태그아님'.match(re)).toBeNull();
+    expect('## 제목'.match(re)).toBeNull();
+    expect('#123'.match(re)).toBeNull();
+  });
+
   test('does NOT match pure-numeric tag', () => {
-    const re = new RegExp(TAG_PATTERN, 'g');
+    const re = new RegExp(TAG_PATTERN, 'gu');
     expect('issue #1234'.match(re)).toBeNull();
   });
 });
@@ -154,6 +162,22 @@ describe('findTags · live rg over tmpdir vault', () => {
   });
 
   // C5 (2026-05-17) — frontmatter tags surface alongside inline tags.
+  test('한글 태그 — 본문 #시험 과 frontmatter 목록 AI요약 이 모두 집계된다(rg 실물)', async () => {
+    writeFileSync(join(vault, 'ko.md'), `---
+tags:
+  - "AI요약"
+  - 비디오_로딩_오류
+---
+
+[[두번째]] 로 간다 #시험
+`);
+    const result = await findTags({ vaultRoot: vault });
+    const names = result.tags.map(t => t.tag);
+    expect(names).toContain('시험');
+    expect(names).toContain('AI요약');
+    expect(names).toContain('비디오_로딩_오류');
+  });
+
   test('frontmatter inline-array tags counted', async () => {
     writeFileSync(join(vault, 'fm-array.md'), `---
 title: x

@@ -53,12 +53,9 @@ export interface TailscaleServeOpts {
   upstreamPort: number;
   /** Path component of the surfaced URL (default `/app/showroom/`). */
   urlPath?: string;
-  /** Whether to wrap `tailscale serve` invocations in `sudo -n`.
-   *  - Default `true` — required for `tls-terminated-tcp` mode on
-   *    macOS (binds a Tailscale-daemon-mediated TCP listener).
-   *  - Pass `false` for `https-443` legacy `pwa share enable` flow,
-   *    where the GUI Tailscale CLI typically handles permissions
-   *    interactively without sudo (matches pre-lift behavior). */
+  /** Mutation privilege policy: by default try without sudo, then retry
+   *  once with `sudo -n` only on a permission error. `true` uses sudo
+   *  immediately; `false` runs without sudo and never retries. */
   useSudo?: boolean;
   /** Test seam — replace `probeTailscale`. */
   probeFn?: () => Promise<TailscaleProbe>;
@@ -217,10 +214,6 @@ function buildDefaultServeCmd(useSudo: boolean): (
   args: readonly string[],
 ) => Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return (binary, args) => new Promise((resolve) => {
-    // tls-terminated-tcp mode requires sudo on macOS; legacy
-    // https-443 mode usually works without sudo (the GUI Tailscale
-    // CLI handles privileged binds interactively). Caller chooses via
-    // `useSudo`.
     const cmd = useSudo ? 'sudo' : binary;
     const argv = useSudo ? ['-n', binary, ...args] : [...args];
     execFile(cmd, argv, { timeout: 15000 }, (err, stdout, stderr) => {
@@ -235,7 +228,7 @@ function buildDefaultServeCmd(useSudo: boolean): (
       resolve({
         exitCode: code,
         stdout: String(stdout ?? ''),
-        stderr: String(stderr ?? (err as Error).message ?? ''),
+        stderr: String(stderr || (err as Error).message || ''),
       });
     });
   });
@@ -244,6 +237,29 @@ function buildDefaultServeCmd(useSudo: boolean): (
 function isSudoFailure(res: { exitCode: number; stderr: string }): boolean {
   if (res.exitCode === 0) return false;
   return /password is required|a password is required|sudo:.*password/i.test(res.stderr);
+}
+
+function isPermissionFailure(res: { exitCode: number; stderr: string }): boolean {
+  return res.exitCode !== 0
+    && /permission denied|operation not permitted|access denied|requires? (?:root|sudo|administrator)|must (?:be root|run as root)|EACCES|EPERM/i.test(res.stderr);
+}
+
+function mutationServeCmd(opts: Pick<TailscaleServeOpts, 'useSudo' | 'serveCmdFn'>): (
+  binary: string,
+  args: readonly string[],
+) => Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const serveCmdFn = opts.serveCmdFn;
+  const direct = serveCmdFn ?? buildDefaultServeCmd(false);
+  const sudo = serveCmdFn
+    ? (binary: string, args: readonly string[]) => serveCmdFn('sudo', ['-n', binary, ...args])
+    : buildDefaultServeCmd(true);
+  return async (binary, args) => {
+    if (opts.useSudo === true) return sudo(binary, args);
+    const result = await direct(binary, args);
+    return opts.useSudo === undefined && isPermissionFailure(result)
+      ? sudo(binary, args)
+      : result;
+  };
 }
 
 /** Build the `tailscale serve …` argv for the chosen mode. */
@@ -295,8 +311,7 @@ export async function mountTailscaleServe(
   const hostname = probe.magicDnsHost ?? probe.hostname ?? null;
   if (!hostname) return { ok: false, url: null, reason: 'magic-dns-unknown' };
   const binary = probe.binary ?? 'tailscale';
-  const useSudo = opts.useSudo !== false;
-  const serveCmd = opts.serveCmdFn ?? buildDefaultServeCmd(useSudo);
+  const serveCmd = mutationServeCmd(opts);
   const urlPath = opts.urlPath ?? DEFAULT_URL_PATH;
 
   // Singleton swap — when state describes a different mode/port,
@@ -385,8 +400,7 @@ export async function unmountTailscaleServe(
     return { ok: false, reason: 'tailscale-missing' };
   }
   const binary = probe.binary ?? 'tailscale';
-  const useSudo = opts.useSudo !== false;
-  const serveCmd = opts.serveCmdFn ?? buildDefaultServeCmd(useSudo);
+  const serveCmd = mutationServeCmd(opts);
   const offRes = await serveCmd(binary, unmountArgs(mode));
   if (offRes.exitCode !== 0) {
     if (isSudoFailure(offRes)) {
@@ -545,7 +559,7 @@ export async function cleanGhostTailscaleServe(
   // Do not reuse unmountTailscaleServe here: its legacy lifecycle contract
   // uses `serve reset`, which would remove unrelated live mappings. This
   // preflight has a stricter contract and turns off only the verified port.
-  const offRes = await serveCmd(binary, ['serve', '--tls-terminated-tcp', String(opts.port), 'off']);
+  const offRes = await mutationServeCmd(opts)(binary, ['serve', '--tls-terminated-tcp', String(opts.port), 'off']);
   if (offRes.exitCode !== 0) {
     return {
       ok: false,

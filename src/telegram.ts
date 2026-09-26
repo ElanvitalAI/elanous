@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import { buildTurnOutputTextBlocks } from './input/turn-output-block.js';
 import { selectTurnOutputTextForSink } from './input/turn-output-sink-registry.js';
 import { debug } from './debug/log.js';
+import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { TelegramVoiceAdapter } from './voice/channel-adapters/telegram-voice-adapter.js';
 import { createTelegramSurfaceHitl, type TelegramSurfaceHitl } from './hitl/telegram-surface-hitl.js';
 import { beginCancelableTurn, endCancelableTurn, cancelAcpTurn } from './acp/turn-runner.js';
@@ -564,7 +565,7 @@ export class TelegramBot {
     });
   }
 
-  /** §C5-enh reactions-as-status — 사용자 메시지에 이모지 리액션(👀 큐 → ✅/❌). 편집보다 저비용
+  /** §C5-enh reactions-as-status — 사용자 메시지에 이모지 리액션(👀 큐 → 👍/👎). 편집보다 저비용
    *  상태채널(hermes/openclaw 선례). emoji=null 이면 리액션 제거. Bot API 7.0+ setMessageReaction.
    *  fail-soft(리액션 실패가 배달을 막지 않음). */
   async setMessageReaction(chatId: number, messageId: number, emoji: string | null): Promise<void> {
@@ -1656,8 +1657,9 @@ export class TelegramBot {
     debug.log('telegram.deliver', 'route', {
       chatId: ctx.chatId, path: streamingFlip ? 'flip-fanout' : 'legacy', streamingCfgOn, daemonBound: daemonBoundForFlip,
     });
-    // §C5-enh reactions-as-status — 턴 시작 👀(저비용 상태채널). 완료 ✅ / 실패 ❌ 는 아래. fail-soft.
-    const reactionsOn = getUserConfig().sessionFabric?.telegram?.reactions === true;
+    // §C5-enh reactions-as-status — 턴 시작 👀(저비용 상태채널). 종료 👍/👎는 Bot API 허용 집합에 따른다.
+    // https://core.telegram.org/bots/api#reactiontypeemoji — ✅/❌는 ReactionTypeEmoji에 없다.
+    const reactionsOn = true;
     debug.log('telegram.deliver', 'reaction', { chatId: ctx.chatId, phase: 'start', emoji: '👀', on: reactionsOn });
     if (reactionsOn && ctx.messageId != null) void this.setMessageReaction(ctx.chatId, ctx.messageId, '👀');
 
@@ -1835,15 +1837,14 @@ export class TelegramBot {
       } else {
         debug.log('telegram.deliver', 'flip-suppress-legacy', { chatId: ctx.chatId, chars: reply.length });
       }
-      // §C5-enh reactions — 완료 👍. ⚠️ 텔레그램은 리액션 이모지가 제한 세트(✅/❌ 불가·REACTION_INVALID)
-      // → 유효 이모지(👀/👍/👎/🎉/😢…) 사용. fail-soft.
+      // §C5-enh reactions — 완료 👍 (Bot API ReactionTypeEmoji). fail-soft.
       debug.log('telegram.deliver', 'reaction', { chatId: ctx.chatId, phase: 'done', emoji: '👍', on: reactionsOn });
       if (reactionsOn && ctx.messageId != null) void this.setMessageReaction(ctx.chatId, ctx.messageId, '👍');
       recordStreamingSlashHandled('completed');
     } catch (err: any) {
       streamer?.flushCancel();
       recordStreamingSlashHandled(streamingSlashResult ?? 'post-processing-failed');
-      // §C5-enh reactions — 실패 👎(텔레그램 유효 세트).
+      // §C5-enh reactions — 실패 👎 (Bot API ReactionTypeEmoji).
       debug.log('telegram.deliver', 'reaction', { chatId: ctx.chatId, phase: 'fail', emoji: '👎', on: reactionsOn });
       if (reactionsOn && ctx.messageId != null) void this.setMessageReaction(ctx.chatId, ctx.messageId, '👎');
       this.log(`telegram handler error: ${err?.message ?? String(err)}`);
@@ -2302,7 +2303,8 @@ export interface BotDaemonBridge {
 export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
   const tg = opts.userConfig.telegram;
   if (!tg.enabled) throw new Error('telegram disabled in user-config');
-  if (!tg.botToken) throw new Error('telegram.botToken missing in user-config');
+  const botToken = opts.telegramBotOpts?.token ?? resolveChannelBotToken('telegram', opts.userConfig)?.token;
+  if (!botToken) throw new Error('telegram.botToken missing in user-config');
   const log = opts.log ?? (() => {});
   const cap = opts.maxAttachments ?? 8;
   const runTurnImpl = opts.runTurnImpl ?? runTurn;
@@ -2603,7 +2605,7 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
   const voiceAdapter = buildTelegramVoiceAdapterFromConfig(opts.userConfig, opts.log);
 
   botRef = new TelegramBot({
-    token: tg.botToken,
+    token: botToken,
     allowedUsers: tg.allowedUsers,
     homeChannel: tg.homeChannel,
     onMessage: handler,

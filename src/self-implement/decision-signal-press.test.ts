@@ -273,3 +273,16 @@ describe('pressDecisionSignal', () => {
     })).toThrow('press unavailable');
   });
 });
+
+// METHOD v116 — 그래프 원장 값 신호가 검사기를 통과한다(읽기만) · 실행하는 것은 여전히 거부.
+import { parseSafeDecisionSignalCommand as parseV116 } from './decision-signal-press.js';
+describe('METHOD v116 graph ledger observations', () => {
+  test('logs --event … --json and graph status <id> --json are read-only observations', () => {
+    expect(parseV116('bun bin/elanous.mjs logs --event pipeline-node-entry --json --since 1h')).toMatchObject({ executable: 'bun' });
+    expect(parseV116('bun bin/elanous.mjs graph status docs-publish --json')).toMatchObject({ executable: 'bun' });
+  });
+  test('graph run (even --dry-run) and logs without --json stay rejected', () => {
+    expect(parseV116('bun bin/elanous.mjs graph run graphs/ops/docs-publish.yaml --dry-run --json')).toEqual({ reason: 'not-allowlisted' });
+    expect(parseV116('bun bin/elanous.mjs logs --event pipeline-node-entry')).toEqual({ reason: 'not-allowlisted' });
+  });
+});

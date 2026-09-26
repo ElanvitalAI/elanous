@@ -240,12 +240,8 @@ describe('user-config defaults', () => {
         catchUpThresholdLines: 50,
         catchUpAgeMs: 200,
       },
-      compactBoundary: {
-        enabled: true,
-      },
       wrap: {
         urlAware: false,
-        preserveOsc8: true,
       },
       tool: {
         displayMode: 'inline-to-block',
@@ -257,12 +253,7 @@ describe('user-config defaults', () => {
       },
       diff: {
         colorTier: 'auto',
-        adaptiveBg: true,
-        syntaxPerHunk: true,
-        cache: true,
         headerStyle: 'legacy',
-        turnSummary: true,
-        turnBrowser: true,
         turnBrowserHistory: 8,
         turnBrowserMode: 'all',
       },
@@ -538,7 +529,7 @@ describe('user-config lsp section (Phase L4)', () => {
     });
   });
 
-  test('chat.rendering parses streaming and compactBoundary knobs', () => {
+  test('chat.rendering parses streaming while ignoring the retired compactBoundary switch', () => {
     write({
       chat: {
         rendering: {
@@ -559,12 +550,8 @@ describe('user-config lsp section (Phase L4)', () => {
         catchUpThresholdLines: 1,
         catchUpAgeMs: 10_000,
       },
-      compactBoundary: {
-        enabled: false,
-      },
       wrap: {
         urlAware: false,
-        preserveOsc8: true,
       },
       tool: {
         displayMode: 'inline-to-block',
@@ -576,12 +563,7 @@ describe('user-config lsp section (Phase L4)', () => {
       },
       diff: {
         colorTier: 'auto',
-        adaptiveBg: true,
-        syntaxPerHunk: true,
-        cache: true,
         headerStyle: 'legacy',
-        turnSummary: true,
-        turnBrowser: true,
         turnBrowserHistory: 8,
         turnBrowserMode: 'all',
       },
@@ -601,7 +583,6 @@ describe('user-config lsp section (Phase L4)', () => {
     });
     expect(buildUserConfig(cfgPath).chat.rendering.wrap).toEqual({
       urlAware: true,
-      preserveOsc8: false,
     });
   });
 
@@ -659,12 +640,7 @@ describe('user-config lsp section (Phase L4)', () => {
     });
     expect(buildUserConfig(cfgPath).chat.rendering.diff).toEqual({
       colorTier: 'ansi16',
-      adaptiveBg: false,
-      syntaxPerHunk: false,
-      cache: false,
       headerStyle: 'edited',
-      turnSummary: false,
-      turnBrowser: false,
       turnBrowserHistory: 20,
       turnBrowserMode: 'files',
     });
@@ -1006,31 +982,16 @@ describe('user-config extended schema', () => {
           catchUpThresholdLines: 25,
           catchUpAgeMs: 150,
         },
-        compactBoundary: {
-          enabled: false,
-        },
         wrap: {
           urlAware: true,
-          preserveOsc8: false,
         },
         tool: {
           displayMode: 'inline-to-block',
           blockMaxLines: 12,
         },
         diff: {
-          // FU8 PR #6 (2026-05-12) — `ChatRenderingDiffConfig` gained 5
-          // new fields (`headerStyle`, `turnSummary`, `turnBrowser`,
-          // `turnBrowserHistory`, `turnBrowserMode`) for the turn-diff
-          // browser arc. Fixture extended with defaults matching the
-          // schema's expected production values so reload smoke stays
-          // honest.
           colorTier: '256',
-          adaptiveBg: false,
-          syntaxPerHunk: false,
-          cache: false,
           headerStyle: 'legacy',
-          turnSummary: true,
-          turnBrowser: true,
           turnBrowserHistory: 8,
           turnBrowserMode: 'all',
         },
@@ -1094,12 +1055,8 @@ describe('user-config extended schema', () => {
         catchUpThresholdLines: 25,
         catchUpAgeMs: 150,
       },
-      compactBoundary: {
-        enabled: false,
-      },
       wrap: {
         urlAware: true,
-        preserveOsc8: false,
       },
       tool: {
         displayMode: 'inline-to-block',
@@ -1107,12 +1064,7 @@ describe('user-config extended schema', () => {
       },
       diff: {
         colorTier: '256',
-        adaptiveBg: false,
-        syntaxPerHunk: false,
-        cache: false,
         headerStyle: 'legacy',
-        turnSummary: true,
-        turnBrowser: true,
         turnBrowserHistory: 8,
         turnBrowserMode: 'all',
       },

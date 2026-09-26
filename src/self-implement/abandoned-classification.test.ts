@@ -209,6 +209,26 @@ describe('classifyAbandonedRun', () => {
     expect(classifyAbandonedRun({ ...base, quotaExhausted: true, stage: 'pr-declined' }).classification).toBe('pr-declined');
     expect(classifyAbandonedRun({ ...base, quotaExhausted: true, supervisorVerdict: 'CONTRACT-CONFLICT' }).classification).toBe('contract-conflict');
   });
+  test('substrate deadline outranks postmortem quota, credential, and provider error and keeps the quota fact', () => {
+    const base = { worktreePorcelain: ' M src/file.ts\n', mustFixReported: true } as const;
+    expect(classifyAbandonedRun({
+      ...base,
+      substrateDeadlineExceeded: true,
+      quotaExhausted: true,
+      credentialFailure: true,
+      providerError: true,
+    })).toMatchObject({
+      classification: 'run-deadline-exceeded',
+      classificationBasis: 'substrate-deadline-outranks-postmortem-quota',
+      quotaExhausted: true,
+      credentialFailure: true,
+      providerError: true,
+    });
+    expect(classifyAbandonedRun({ ...base, substrateDeadlineExceeded: true, mergeApprovalReceived: true }).classification).toBe('merge-approved-abandoned');
+    expect(classifyAbandonedRun({ ...base, substrateDeadlineExceeded: true, stage: 'pr-declined' }).classification).toBe('pr-declined');
+    expect(classifyAbandonedRun({ ...base, substrateDeadlineExceeded: true, supervisorVerdict: 'CONTRACT-CONFLICT' }).classification).toBe('contract-conflict');
+    expect(classifyAbandonedRun({ ...base, substrateDeadlineExceeded: false }).classification).not.toBe('run-deadline-exceeded');
+  });
 
   test('omitting the quota input leaves both classification and payload untouched', () => {
     const base = { worktreePorcelain: '', mustFixReported: false } as const;

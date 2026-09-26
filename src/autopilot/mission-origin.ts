@@ -10,6 +10,7 @@
 import { mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { elanousStateRoot } from './state-paths.js';
 import { getUserConfig } from '../user-config.js';
+import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { join } from 'node:path';
 
 export interface MissionOrigin {
@@ -59,14 +60,13 @@ export function loadMissionOrigin(missionId: string): MissionOrigin | null {
  */
 export function defaultTelegramOrigin(): MissionOrigin | null {
   try {
-    const tg = getUserConfig().telegram as {
-      homeChannel?: number | { chatId?: number };
-      botToken?: string;
-    } | undefined;
+    const cfg = getUserConfig();
+    const tg = cfg.telegram as { homeChannel?: number | { chatId?: number } } | undefined;
     if (!tg) return null;
     const chatId = typeof tg.homeChannel === 'number' ? tg.homeChannel : tg.homeChannel?.chatId;
     if (typeof chatId !== 'number') return null;
-    const botId = typeof tg.botToken === 'string' && tg.botToken.length > 0 ? tg.botToken.split(':')[0] : undefined;
+    const token = resolveChannelBotToken('telegram', cfg)?.token;
+    const botId = token ? token.split(':')[0] : undefined;
     return { channel: 'telegram', chatId, ...(botId ? { botId } : {}) };
   } catch { return null; }
 }

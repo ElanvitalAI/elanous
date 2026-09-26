@@ -8,6 +8,7 @@ import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
 import { LOGS_SINCE_OPTION } from './cli/logs-cli.js';
 import { readPipedStdin } from './cli/piped-stdin.js';
 import { writeStdoutJson } from './cli/stdout-json.js';
+import { writeStdoutFully } from './cli/stdout-flush.js';
 import { shellQuoteRemote } from './ssh/ssh-fs.js';
 // ⛔ 도움말이 접두를 «다시 리터럴로» 복제하면 상수와 갈린다(무인 리뷰 should-fix) ⇒ 상수에서 만든다.
 import { WORKTREE_BRANCH_PREFIX as WORKTREE_BRANCH_PREFIX_HELP } from './harness/worktree-branch-prefix.js';
@@ -30,7 +31,6 @@ import { CLI_HARNESS_DOGFOOD_ENTRANCE, CLI_HARNESS_ORCHESTRATE_ENTRANCE, describ
 import { collectCommandEntrances, renderCommandEntrances } from './self-dev/entrance-inventory.js';
 import { applyDocumentReferences, applyHarnessPolicy, DOCUMENT_REFERENCES_ENV, HARNESS_POLICY_ENV } from './self-implement/harness-policy.js';
 import { isGoalAuthorFileName } from './self-implement/goal-document.js';
-import { parseRunControlValue } from './self-implement/run-controls.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surface.js';
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
 import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
@@ -41,14 +41,18 @@ import { registerRepoCommands } from './cli/repo-cli.js';
 import { registerReviewLoopOptions, buildReviewLoopOpts } from './agent-mission/review-loop-cli.js';
 import { agentBackendNames } from './agent-mission/driver.js';
 import { registerWhereCommand } from './cli/where-cli.js';
+import { registerPodCommands } from './cli/pod-cli.js';
 import { registerBrowserAnnotateCommand } from './cli/browser-annotate-cli.js';
 import { registerPendingQuestionsCommand } from './cli/pending-questions-cli.js';
 import { registerUsageCommand } from './cli/usage-cli.js';
 import { registerReleaseCommands } from './cli/release-cli.js';
 import { registerModelWatchCommand } from './cli/model-watch-cli.js';
 import { registerDoctorCommand } from './cli/doctor-cli.js';
+import { registerControlCommands } from './cli/control-cli.js';
 import { registerSetupCommand } from './cli/setup-cli.js';
+import { registerGroundingSourcesCli } from './grounding/sources-cli.js';
 import { registerGraphCommands } from './graph-runner/graph-cli.js';
+import { registerLaunchHeadCommands } from './launch-head/launch-head-cli.js';
 // IMPORTANT: parse `--config-dir <dir>` + `--test-state-dir <dir>`
 // BEFORE Commander loads — the resolvers are read at module-init
 // time by several config-touching imports below, so the override
@@ -172,9 +176,9 @@ export { cliVersion, setInstallMetadataRootForTesting };
 export const program = new Command();
 program.enablePositionalOptions();
 
-export const SELF_SEND_RECENT_FRAME_WINDOW_MS = 24 * 60 * 60 * 1000;
-export const SELF_SEND_STALE_HEARTBEAT_MS = 5 * 60 * 1000;
-
+export { SELF_SEND_RECENT_FRAME_WINDOW_MS, SELF_SEND_STALE_HEARTBEAT_MS, formatSelfSendCandidateDisplay } from './harness/self-send-decide.js';
+export type { SelfSendCandidate, SelfSendCandidateDisplay } from './harness/self-send-decide.js';
+import { decideSelfSend, type SelfSendCandidate } from './harness/self-send-decide.js';
 type RunDevAskBuildDevCliSpec = typeof import('./self-dev/dev-cli.js')['buildDevCliSpec'];
 type RunDevAskExecuteDevSelfRun = typeof import('./self-dev/dev-cli.js')['executeDevSelfRun'];
 type RunDevAskStartDraftTriage = typeof import('./self-dev/dev-cli.js')['startDraftTriage'];
@@ -518,7 +522,6 @@ function harnessAskSayOptionsToDevCliOpts(opts: HarnessAskSayOptions & {
     ...(opts.childLlmEffort !== undefined ? { childLlmEffort: opts.childLlmEffort } : {}),
     ...(opts.correlation !== undefined ? { correlation: opts.correlation } : {}),
     ...(opts.target !== undefined ? { target: opts.target } : {}),
-    ...(opts.graph !== undefined ? { graph: opts.graph } : {}),
     ...(Array.isArray(opts.roleLlm) && opts.roleLlm.length > 0 ? { roleLlm: opts.roleLlm } : {}),
   };
 }
@@ -813,105 +816,13 @@ async function runDevSayFromWords(
   if (!ok) runDevAskFromGoalFileDeps.setExitCode(2);
 }
 
-export interface SelfSendCandidate {
-  readonly spaceId: string;
-  readonly mtimeMs?: number;
-  readonly liveness?: 'alive' | 'dead' | 'unknown';
-  readonly heartbeatAtMs?: number;
-}
-
-export interface SelfSendCandidateDisplay {
-  readonly lines: readonly string[];
-  readonly hiddenStaleCount: number;
-}
-
-const SELF_SEND_GOAL_ATTEMPT_SUFFIX = /^(.*)-[0-9a-f]{8}$/;
-
-/** Shared goal prefix: strip the trailing 8-hex attempt hash. IDs without that tail do not group. */
-function selfSendGoalPrefix(spaceId: string): string | undefined {
-  return SELF_SEND_GOAL_ATTEMPT_SUFFIX.exec(spaceId)?.[1];
-}
-
-/**
- * Newest attempt in a same-goal group. Returns undefined unless every member's mtimeMs is finite —
- * duplicate IDs with an unknown time are not collapsed away.
- */
-function newestSelfSendAttempt(members: readonly SelfSendCandidate[]): SelfSendCandidate | undefined {
-  if (members.length === 0) return undefined;
-  for (const member of members) {
-    if (!Number.isFinite(member.mtimeMs)) return undefined;
-  }
-  let newest = members[0]!;
-  for (const member of members) {
-    if (member.mtimeMs! > newest.mtimeMs!) newest = member;
-  }
-  return newest;
-}
-
-function formatSelfSendHeartbeatAge(heartbeatAtMs: number, now: number): string | undefined {
-  if (!Number.isFinite(heartbeatAtMs)) return undefined;
-  const seconds = Math.floor(Math.max(0, now - heartbeatAtMs) / 1_000);
-  if (seconds < 60) return `${seconds}초 전`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}분 전`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}시간 전`;
-  return `${Math.floor(hours / 24)}일 전`;
-}
-
-/** Display-only policy for an already-ambiguous self-send target set. */
-export function formatSelfSendCandidateDisplay(
-  candidates: readonly SelfSendCandidate[],
-  { includeStale = false, now }: { includeStale?: boolean; now: number },
-): SelfSendCandidateDisplay {
-  const recent: SelfSendCandidate[] = [];
-  const stale: SelfSendCandidate[] = [];
-  for (const candidate of candidates) {
-    const mtimeMs = candidate.mtimeMs;
-    if (Number.isFinite(mtimeMs) && mtimeMs! >= now - SELF_SEND_RECENT_FRAME_WINDOW_MS && mtimeMs! <= now) recent.push(candidate);
-    else stale.push(candidate);
-  }
-  const displayed = includeStale ? [...recent, ...stale] : recent;
-  const groups = new Map<string, SelfSendCandidate[]>();
-  for (const candidate of candidates) {
-    const prefix = selfSendGoalPrefix(candidate.spaceId);
-    if (prefix === undefined) continue;
-    const members = groups.get(prefix);
-    if (members) members.push(candidate);
-    else groups.set(prefix, [candidate]);
-  }
-  return {
-    lines: displayed.map((candidate) => {
-      const timestamp = Number.isFinite(candidate.mtimeMs) ? new Date(candidate.mtimeMs!).toISOString() : '알 수 없음';
-      const prefix = selfSendGoalPrefix(candidate.spaceId);
-      const members = prefix === undefined ? undefined : groups.get(prefix);
-      let annotation = '';
-      if (members && new Set(members.map((member) => member.spaceId)).size >= 2) {
-        annotation = '  · 같은 골의 다른 시도';
-        const newest = newestSelfSendAttempt(members);
-        if (newest !== undefined && candidate.mtimeMs === newest.mtimeMs) {
-          annotation += ' · 가장 최근';
-        }
-      }
-      const liveness = candidate.liveness ?? 'unknown';
-      const heartbeatAge = liveness === 'alive' && candidate.heartbeatAtMs !== undefined
-        ? formatSelfSendHeartbeatAge(candidate.heartbeatAtMs, now)
-        : undefined;
-      const livenessAnnotation = liveness === 'alive'
-        ? `  · 자식 생존${heartbeatAge === undefined ? '' : ` (heartbeat ${heartbeatAge})`}`
-        : liveness === 'dead'
-          ? '  · 자식 사망 (heartbeat alive=false)'
-          : '';
-      return `  ${candidate.spaceId}  마지막 프레임: ${timestamp}${annotation}${livenessAnnotation}`;
-    }),
-    hiddenStaleCount: includeStale ? 0 : stale.length,
-  };
-}
 registerPtyTakeoverCommands(program);
-registerLeaderCommands(program);
 registerPrCommands(program);
 registerRepoCommands(program);
+// CLI entry: where action → resolveCurrentInstance → resolveInstance (instance universe).
 registerWhereCommand(program);
+registerLeaderCommands(program);
+registerPodCommands(program);
 // 🎨 봇이 모는 브라우저 페이지 «안»에 그린다 — `src/browser-annotate/` 원장의 «문»(42차).
 registerBrowserAnnotateCommand(program);
 registerPendingQuestionsCommand(program);
@@ -919,8 +830,12 @@ registerUsageCommand(program);
 registerReleaseCommands(program);
 registerModelWatchCommand(program);
 registerDoctorCommand(program);
+// runCli() → main() → program.parseAsync() dispatches control serve and resources where|list.
+registerControlCommands(program);
 registerSetupCommand(program);
+registerGroundingSourcesCli(program);
 registerGraphCommands(program);
+registerLaunchHeadCommands(program);
 
 const pythonCmd = program.command('python').description('elanous 가 쓰는 파이썬(해석 · 점검 · elanous venv 셋업) — RFC-doctor-fix-build-toolchain-and-python-by-distro');
 pythonCmd.command('where').description('어느 파이썬을 쓰나(ELANOUS_PYTHON > elanous venv > pyenv .python-version > PATH)').option('--json').option('--path', '경로만 한 줄(스크립트·스킬용)').action(async (o: { json?: boolean; path?: boolean }) => {
@@ -942,8 +857,9 @@ program.command('self-update')
   .option('--json', '결과 JSON 출력')
   .option('--keep <n>', '설치 뒤 남길 최근 판 수(설치본은 current·직전 판, 체크아웃은 current·데몬 판 보호 · 0 이면 정리 안 함)', '3')
   .option('--alert', '실패(exit≠0)를 알림으로도 보냄 — 크론(무인) 실행용')
+  .option('--skip-pwa-build', '체크아웃 설치 전 PWA 빌드를 명시적으로 건너뜀')
   .option('--auto <on|off|status>', '자동 갱신 — macOS launchd · Linux systemd 타이머가 매일 04:17 에 `self-update --restart --alert` (크론이 이미 부르면 켜지 않는다)')
-  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; auto?: string }) => {
+  .action(async (opts: { from?: string; version?: string; restart?: boolean; json?: boolean; keep?: string; alert?: boolean; skipPwaBuild?: boolean; auto?: string }) => {
     if (opts.auto !== undefined) {
       if (!['on', 'off', 'status'].includes(opts.auto)) { console.error(`--auto 는 on · off · status 중 하나: ${opts.auto}`); process.exitCode = 2; return; }
       const { runAutoUpdate } = await import('./cli/update-auto.js');
@@ -954,7 +870,7 @@ program.command('self-update')
     // ⭐ 한 번 도는 CLI 는 logs.db 싱크를 스스로 붙여야 `debug.log('self-update', …)` 가 저장된다(없으면 조용히 사라진다 · 09-24 실측).
     try { const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js'); await registerStandaloneLogSink('self-update'); } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
     const keep = Number.parseInt(opts.keep ?? '3', 10);
-    const result = await runUpdateForInstallation({ ...opts, keep: Number.isFinite(keep) ? keep : 3 }, { cliRoot: REPOSITORY_ROOT });
+    const result = await runUpdateForInstallation({ ...opts, skipPwaBuild: opts.skipPwaBuild, keep: Number.isFinite(keep) ? keep : 3 }, { cliRoot: REPOSITORY_ROOT });
     process.exitCode = result.exitCode;
   });
 
@@ -4114,9 +4030,9 @@ const selfOrchestrateCmd = selfCmd
   .option('--open-pr', 'S3 — 각 잡: gate/리뷰 통과 시 draft PR 개설(각 self-implement 에 --open-pr·승격이 리뷰노드 경유→disposition 내부 각인)')
   .option('--base <branch>', '각 잡 PR base 브랜치')
   .option('--decompose', 'S2 — goal 1개를 LLM 으로 의존성 서브-DAG(위상 병렬 + hot-file 직렬)로 분해 후 실행')
-  .option('--pod-skill-env', 'pod: 필수 스킬(설정 pod-skills.txt)의 키(.env)를 이 런의 Secret 으로 넘긴다 — 명시 opt-in(유료 크레딧) · 이미지엔 안 들어간다')
-  .option('--pod-pool <spec>', 'pod 풀 — 컨텍스트[@ssh호스트][:상한] 을 쉼표로, 앞이 우선(예 pool-node-b@node-b:12,pool-node-c@node-c:3) · 없으면 ELANOUS_POD_POOL · 그것도 없으면 현재 컨텍스트 하나')
-  .option('--reduce', '끝에 PR 을 연 조각들을 통합 브랜치 하나로 모아(게이트 한 번) PR 하나 — `--open-pr` 과 짝 · `--auto-merge` 와는 함께 못 쓴다(elanous self reduce)')
+  .addOption(new Option('--pod-skill-env', 'pod: 필수 스킬(설정 pod-skills.txt)의 키(.env)를 이 런의 Secret 으로 넘긴다 — 명시 opt-in(유료 크레딧) · 이미지엔 안 들어간다').hideHelp())
+  .addOption(new Option('--pod-pool <spec>', 'pod 풀 — 컨텍스트[@ssh호스트][:상한] 을 쉼표로, 앞이 우선(예 pool-node-b@node-b:12,pool-node-c@node-c:3) · 없으면 ELANOUS_POD_POOL · 그것도 없으면 현재 컨텍스트 하나').hideHelp())
+  .addOption(new Option('--reduce', '끝에 PR 을 연 조각들을 통합 브랜치 하나로 모아(게이트 한 번) PR 하나 — `--open-pr` 과 짝 · `--auto-merge` 와는 함께 못 쓴다(elanous self reduce)').hideHelp())
   .option('--substrate <kind>', '실행 칸: local(기본 · 격리 워크트리) | pod(k8s Job · docker/harness 이미지 · MANUAL-pods-for-elanous-ops-and-dev)')
   .option('--pod-account <name>', 'pod: codex 계정(~/.elanous/auth.json openai-codex:<name> · refresh 제외 사본) · 없으면 브로커가 Job 마다 잔량 많은 계정을 돌려 준다')
   .option('--no-pod-rebuild', 'pod: 이미지 판(elanous.commit)이 HEAD 와 달라도 다시 굽지 않는다 — 측정은 «이미지 판»을 잰다')
@@ -4279,7 +4195,13 @@ const selfOrchestrateCmd = selfCmd
         if (!ready.ok) { ui.error(`--substrate pod: ${ready.reason}`); process.exit(2); }
         // ⛔ Pod 의 elanous 는 이미지 판이다 — HEAD 와 다르면 다시 굽는다(BACKLOG E6 · 09-25 세 판이 옛 판을 쟀다).
         const { podImageFreshness } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
-        let image = podImageFreshness();
+        // ☸️ 풀이 «원격 노드뿐»이면 이 기계의 이미지는 아무도 안 쓴다 — 로컬 판정·굽기를 건너뛰고 기준 판 = HEAD 로 노드 동기화만 한다.
+        //   🩸 2026-09-26 실측: 원격 전용 풀인데 로컬 이미지가 없다고 로컬에서 굽다가 로컬 클러스터(elanous-h1)가 없어 런이 시작도 전에 죽었다.
+        const remoteOnlyPool = poolMembers.length > 0 && poolMembers.every((m) => Boolean(m.sshHost));
+        const headCommit = remoteOnlyPool ? ((await import('node:child_process')).spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout?.trim() || null) : null;
+        let image = remoteOnlyPool
+          ? { imageCommit: headCommit, headCommit, fresh: true, reason: 'remote-only pool — 노드 쪽에서 맞춘다' }
+          : podImageFreshness();
         if (!image.fresh) {
           if ((opts as { podRebuild?: boolean }).podRebuild === false) {
             ui.warn(`--substrate pod: 이미지가 낡았다(${image.reason}) — --no-pod-rebuild 라 그대로 쓴다. 측정은 «이미지 판»을 잰다.`);
@@ -4297,30 +4219,71 @@ const selfOrchestrateCmd = selfCmd
         if (pool) {
           const synced: typeof poolMembers = [];
           // ⭐ 노드들을 «동시에» — 노드 쪽 빌드(바뀐 층만) 1순위 · 실패하면 통째 전송.
-          const syncs = await poolMod.syncPoolImages(poolMembers, 'elanous-harness:local', image.imageCommit);
+          const { podSkillsDigest, resolvePodSkills } = await import('./task-orchestrator/surfaces/pod-skills.js');
+          const syncs = await poolMod.syncPoolImages(poolMembers, 'elanous-harness:local', image.imageCommit, { localSkillsDigest: podSkillsDigest(resolvePodSkills().skills).digest });
           for (const m of poolMembers) {
             const r = syncs.get(m.context)!;
             debug.log('self-implement.pod', 'pool-image-sync', { context: m.context, ...r });
-            if (r.ok) synced.push(m); else ui.warn(`[pod-pool] ${m.context} 뺌 — 이미지 판을 못 맞췄다: ${r.detail}`);
+            if (r.ok) synced.push(r.imageRef ? { ...m, imageRef: r.imageRef } : m); else ui.warn(`[pod-pool] ${m.context} 뺌 — 이미지 판을 못 맞췄다: ${r.detail}`);
             if (!opts.json && (r.action === 'shipped' || r.action === 'built')) ui.info(`[pod-pool] ${m.context} 이미지 ${r.action === 'built' ? '노드 쪽 빌드' : '보냄'} ${r.detail} · ${Math.round(r.ms / 1000)}초`);
           }
           if (synced.length === 0) { ui.error('--substrate pod: 이미지를 맞춘 풀 노드가 없다'); process.exit(2); }
           pool = new poolMod.PodPoolScheduler(synced);
           poolMembers = synced;
         }
-        const passEnv = String((opts as { podPassEnv?: string }).podPassEnv ?? '').split(',').map((k) => k.trim()).filter(Boolean);
-        // 계정 — 명시하면 그 하나 · 아니면 브로커가 Job 마다 잔량 많은 계정을 돌려 준다(로드맵 09-26 #7).
+        const requestedPassEnv = String((opts as { podPassEnv?: string }).podPassEnv ?? '').split(',').map((k) => k.trim()).filter(Boolean);
+        const grokKeyNames = ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'];
+        // 명시 계정은 사람의 선택 — 공급자 폴백과 계정 브로커를 우회한다.
         const explicitPodAccount = (opts as { podAccount?: string }).podAccount;
         let accountBroker: (() => string) | undefined;
-        if (!explicitPodAccount) {
+        let podProvider: 'openai-codex' | 'grok' = 'openai-codex';
+        let grokApiKeyOptIn = false;
+        if (!explicitPodAccount && !benchArms) {
           const { inspectCodexRotation } = await import('./oauth/codex-account-store.js');
-          const { planPodAccounts, makePodAccountBroker } = await import('./task-orchestrator/surfaces/pod-account-broker.js');
-          const plan = planPodAccounts(inspectCodexRotation().candidates);
-          debug.log('self-implement.pod', 'account-plan', { usable: plan.usable, excluded: plan.excluded });
-          try { accountBroker = makePodAccountBroker(plan); } catch (e) { ui.error(String((e as Error).message)); process.exit(2); }
-          if (!opts.json) ui.info(`[pod] 계정 배분(잔량 순 · 돌려 가며): ${plan.usable.join(' → ')}${plan.excluded.length ? ` · 뺌 ${plan.excluded.map((x) => `${x.name}(${x.why})`).join(', ')}` : ''}`);
+          const { planPodProvider, makePodAccountBroker } = await import('./task-orchestrator/surfaces/pod-account-broker.js');
+          const { resolveGrokCredential } = await import('./grok/credential.js');
+          const { getUserConfig } = await import('./user-config.js');
+          const { defaultGrokModel } = await import('./grok/models.js');
+          grokApiKeyOptIn = getUserConfig().harness?.pod?.grokApiKeyOptIn === true;
+          const credential = resolveGrokCredential();
+          const plan = planPodProvider({
+            codexCandidates: inspectCodexRotation().candidates,
+            grokSubscription: credential?.kind === 'subscription',
+            grokApiKey: credential?.kind === 'api_key',
+            grokApiKeyOptIn,
+          });
+          if (plan.provider === null) { ui.error(`pod: 쓸 codex 계정이 없다 — ${plan.reasons.join(' · ')} · 계정을 명시하려면 --pod-account <이름>`); process.exit(2); }
+          podProvider = plan.provider;
+          if (plan.provider === 'openai-codex') {
+            accountBroker = makePodAccountBroker({ usable: plan.accounts, excluded: plan.excluded });
+            debug.log('self-implement.pod', 'account-plan', { usable: plan.accounts, excluded: plan.excluded });
+            if (!opts.json) ui.info(`[pod] 계정 배분(잔량 순 · 돌려 가며): ${plan.accounts.join(' → ')}${plan.excluded.length ? ` · 뺌 ${plan.excluded.map((x) => `${x.name}(${x.why})`).join(', ')}` : ''}`);
+          } else {
+            const model = defaultGrokModel().id;
+            debug.log('self-implement.pod', 'provider-fallback', { from: 'openai-codex', to: 'grok', excluded: plan.excluded, model });
+            if (!opts.json) ui.info(`[pod] codex 계정 모두 95% 이상 → grok 으로(모델 ${model})`);
+          }
         }
-        const podBase = { account: explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}) };
+        const passEnv = podProvider === 'grok' ? requestedPassEnv.filter((key) => !grokKeyNames.includes(key)) : requestedPassEnv;
+        const podSourceSpec = (opts as { podSource?: string }).podSource;
+        let podSource: import('./task-orchestrator/surfaces/pod-source-receive.js').PodSource | undefined;
+        if (podSourceSpec) {
+          const { parsePodSourceSpec, resolvePodSource } = await import('./task-orchestrator/surfaces/pod-source-spec.js');
+          const { elanousStateRoot } = await import('./autopilot/state-paths.js');
+          const { join } = await import('node:path');
+          let parsed: ReturnType<typeof parsePodSourceSpec>;
+          try { parsed = parsePodSourceSpec(podSourceSpec); }
+          catch (e) { ui.error(`--pod-source: ${e instanceof Error ? e.message : String(e)}`); process.exit(2); }
+          const outDir = join(elanousStateRoot(), 'pod-sources', runId);
+          const baseRef = opts.base ?? 'origin/HEAD';
+          try { podSource = resolvePodSource(parsed, { base: baseRef, outDir }); }
+          catch (e) { ui.error(`--pod-source: ${e instanceof Error ? e.message : String(e)}`); process.exit(2); }
+          debug.log('self-implement.pod', 'source', {
+            kind: podSource.kind,
+            ...(podSource.kind === 'bundle' ? { headCommit: podSource.headCommit, sizeBytes: podSource.sizeBytes } : {}),
+          });
+        }
+        const podBase = { ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), account: podProvider === 'grok' ? 'grok' : explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker } : {}), ...(podProvider === 'grok' ? { provider: 'grok' as const, grokApiKeyOptIn } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
@@ -4328,7 +4291,7 @@ const selfOrchestrateCmd = selfCmd
           podSpawn = podSelfImplementSpawn(podBase);
         }
         // ⭐ 팔 선언은 «runId 가 붙는» 이 줄에 싣는다 — 위의 `bench-arms` 줄은 runId 해석 «전»이라 비어 있다(09-25 실측) · 보고서(scripts/bench-report.ts)가 이 줄로 잇는다.
-        debug.log('self-dev.orchestrate', 'substrate', { substrate, account: (opts as { podAccount?: string }).podAccount ?? 'team', passEnv, context: ready.reason, imageCommit: image.imageCommit, imageFresh: image.fresh, ...(benchArms ? { benchArms: benchArms.map((a) => ({ id: a.id, provider: a.provider, model: a.model ?? null, modelSource: a.modelSource ?? null, passEnv: a.passEnv })) } : {}) });
+        debug.log('self-dev.orchestrate', 'substrate', { substrate, account: podProvider === 'grok' ? 'grok' : (opts as { podAccount?: string }).podAccount ?? 'team', passEnv, context: ready.reason, imageCommit: image.imageCommit, imageFresh: image.fresh, ...(benchArms ? { benchArms: benchArms.map((a) => ({ id: a.id, provider: a.provider, model: a.model ?? null, modelSource: a.modelSource ?? null, passEnv: a.passEnv })) } : {}) });
       } else if (substrate !== 'local') {
         ui.error(`--substrate: local | pod (받은 값: ${substrate})`); process.exit(2);
       }
@@ -4425,7 +4388,8 @@ selfOrchestrateCmd
   .addOption(new Option('--fabric-decompose', '--decompose 와 «함께» — 기본 분해기 대신 Fabric grounding/RFC 어댑터로 분해한다(ACP 툴 인자 `fabric_decompose` 와 동형)').hideHelp())
   .addOption(new Option('--no-supervise', '⛔ 런 슈퍼바이저를 «끈다»(대표 2026-08-22 ***기본 ON***) — 켜져 있으면 런이 끝나면 실패를 «트리아지»해서 다시 걸 것이 있으면 «스스로» 재개한다(골루프처럼 끝까지). 정지 사유는 converged|needs-human|max-rounds|no-progress 로 각각 «다른 값»으로 말한다. 관측=elanous logs --category self-dev.supervisor').hideHelp())
   .addOption(new Option('--supervise-rounds <n>', '슈퍼바이저 재개 라운드 상한 (기본 3 · 끄려면 --no-supervise)').hideHelp())
-  .addOption(new Option('--json', '구조화 출력 [{taskId, feature, status, stage?, prUrl?, merged?, error?}]').hideHelp());
+  .addOption(new Option('--json', '구조화 출력 [{taskId, feature, status, stage?, prUrl?, merged?, error?}]').hideHelp())
+  .addOption(new Option('--pod-source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · 없으면 기본 clone').hideHelp());
 
 function formatRelativeAge(updatedAt: number, now = Date.now()): string {
   const seconds = Math.floor(Math.max(0, now - updatedAt) / 1000);
@@ -4593,188 +4557,58 @@ selfCmd
   .option('--include-stale', '모호한 대상 목록에 오래된 마지막 프레임 후보도 표시')
   .option('--read-wait <seconds>', '--memo·--stop 뒤 자식이 읽을 때까지 기다리는 최대 초(0 = 기다리지 않음)', '10')
   .action(async (space: string | undefined, opts: { stop?: boolean; memo?: string; run?: string; includeStale?: boolean; readWait?: string }) => {
-    if (space !== undefined && opts.run !== undefined) {
-      process.stderr.write('--run 과 space 는 함께 사용할 수 없습니다.\n');
-      process.exit(2);
-    }
-    if (opts.run !== undefined && opts.run.trim() === '') {
-      process.stderr.write('--run 에 빈 runId 를 줄 수 없습니다.\n');
-      process.exit(2);
-    }
-    let requestedSpace = space;
-    if (opts.run !== undefined) {
-      const { classifyRunScreenMissing, queryRunScreenKey } = await import('./self-implement/run-ledger.js');
-      const resolved = queryRunScreenKey(opts.run);
-      if (resolved.logStoreStatus !== 'read') {
-        process.stderr.write(`run 화면 해석 불가: 로그 스토어 ${resolved.logStoreStatus} (${resolved.logStorePath})\n`);
-        process.exit(1);
-      }
-      if (!resolved.screenKey) {
-        const last = resolved.lastEvent;
-        const lastDetail = last
-          ? ` 마지막 이벤트: ${last.category}/${last.event} (${Number.isFinite(Date.parse(last.timestamp)) ? `${Math.max(0, Math.floor((Date.now() - Date.parse(last.timestamp)) / 60_000))}분 전` : '시각 알 수 없음'})`
-          : ' 마지막 이벤트: 없음';
-        const status = classifyRunScreenMissing(last);
-        const guidance = status === 'awaiting-start'
-          ? '아직 화면을 띄우기 전입니다. 되묻기에 답하거나 저작이 끝날 때까지 기다리세요.'
-          : status === 'pipeline-failed'
-            ? '파이프라인이 오류로 멈췄습니다. 해당 error를 읽어 원인을 수리하세요.'
-            : status === 'cleaned'
-              ? '하니스가 정리되어 화면이 없습니다. 필요하면 새 런을 시작하세요.'
-              : status === 'not-found'
-                ? '이 runId의 이벤트가 없습니다. runId와 인스턴스 우주를 확인하세요.'
-                : '화면을 아직 분류할 수 없습니다. 마지막 이벤트를 조사하세요.';
-        process.stderr.write(`run 화면 해석 불가: ${guidance}${lastDetail} (${opts.run})\n`);
-        process.exit(1);
-      }
-      requestedSpace = normalizeSpaceId(resolved.screenKey);
-    }
-    const hasMemo = opts.memo !== undefined;
-    if (opts.stop && hasMemo) {
-      process.stderr.write('self send에서는 --stop 과 --memo를 함께 사용할 수 없습니다.\n');
-      process.exit(2);
-    }
-    if (!opts.stop && !hasMemo) {
-      process.stderr.write('self send에는 --stop 또는 --memo <sentence>가 필요합니다.\n');
-      process.exit(2);
-    }
-    if (space !== undefined) {
-      const { getPtyManifest, listPtyManifestRows } = await import('./pty-shell/pty-manifest.js');
-      const resolution = resolveSelfSendTarget(space, { getPtyManifest, listPtyManifestRows });
-      if (resolution.kind === 'refuse') {
-        const hint = resolution.hint === undefined ? '' : ` 대신 space ${resolution.hint}를 지정하세요.`;
-        const reason = resolution.reason === 'tui-self-report-has-no-inbox-reader'
-          ? 'tui 자기 보고 대상에는 control inbox를 읽는 쪽이 없습니다.'
-          : resolution.reason === 'pty-not-found'
-            ? '지정한 PTY를 찾을 수 없습니다.'
-            : '지정한 PTY에 연결된 harness space가 없습니다.';
-        process.stderr.write(`self send 대상 거절: ${reason}${hint}\n`);
-        process.exit(2);
-      }
-      requestedSpace = resolution.spaceId;
-    }
-    // Pod fragments have their own container inbox; never enqueue into the host worktree inbox.
-    if (requestedSpace !== undefined) {
-      const { readPodFragment, podFragmentFinished, dispatchPodSelfSend } = await import('./harness/self-send-target.js');
-      const record = readPodFragment(requestedSpace);
-      if (record || podFragmentFinished(requestedSpace)) {
-        try {
-          if (hasMemo) {
-            if (!opts.memo || /[\r\n]/.test(opts.memo)) throw new Error('control inbox memo must be a non-empty single line');
-            const urgent = opts.memo.startsWith('[urgent] ');
-            dispatchPodSelfSend(requestedSpace, { memo: { version: 1, kind: 'supervisor', urgency: urgent ? 'urgent' : 'normal', body: urgent ? opts.memo.slice('[urgent] '.length) : opts.memo } });
-          } else dispatchPodSelfSend(requestedSpace, { stop: true });
-          ui.info(`Pod 조각에 ${hasMemo ? '감독 메모' : 'soft stop'} 기록: ${requestedSpace} (${record?.job ?? 'finished'})`);
-          return;
-        } catch (error) {
-          process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-          process.exit(1);
-        }
-      }
-    }
+    const { classifyRunScreenMissing, queryRunScreenKey, listRunLedgers } = await import('./self-implement/run-ledger.js');
+    const { getPtyManifest, listPtyManifestRows } = await import('./pty-shell/pty-manifest.js');
+    const { readPodFragment, podFragmentFinished, dispatchPodSelfSend } = await import('./harness/self-send-target.js');
     const { listHarnessScreens, readHarnessHeartbeat } = await import('./harness/harness-screen.js');
-    const screens = listHarnessScreens().map((screen): SelfSendCandidate => {
-      const heartbeat = readHarnessHeartbeat(screen.spaceId);
-      let liveness: SelfSendCandidate['liveness'] = 'unknown';
-      let heartbeatAtMs: number | undefined;
-      if (heartbeat !== null) {
-        try {
-          const parsed: unknown = JSON.parse(heartbeat);
-          if (typeof parsed === 'object' && parsed !== null && 'alive' in parsed) {
-            const heartbeatState = parsed as { alive?: unknown; at?: unknown };
-            liveness = heartbeatState.alive === true ? 'alive'
-              : heartbeatState.alive === false ? 'dead'
-                : 'unknown';
-            if (heartbeatState.alive === true && typeof heartbeatState.at === 'number' && Number.isFinite(heartbeatState.at)) {
-              heartbeatAtMs = heartbeatState.at;
+    const decision = decideSelfSend({ space, opts, now: Date.now() }, {
+      resolveRunScreen: (runId) => {
+        const resolved = queryRunScreenKey(runId);
+        return { ...resolved, missingStatus: resolved.screenKey ? undefined : classifyRunScreenMissing(resolved.lastEvent) };
+      },
+      resolveTarget: (target) => resolveSelfSendTarget(target, { getPtyManifest, listPtyManifestRows }),
+      isPodFragment: (spaceId) => Boolean(readPodFragment(spaceId) || podFragmentFinished(spaceId)),
+      screens: () => listHarnessScreens().map((screen): SelfSendCandidate => {
+        const heartbeat = readHarnessHeartbeat(screen.spaceId);
+        let liveness: SelfSendCandidate['liveness'] = 'unknown';
+        let heartbeatAtMs: number | undefined;
+        if (heartbeat !== null) {
+          try {
+            const parsed: unknown = JSON.parse(heartbeat);
+            if (typeof parsed === 'object' && parsed !== null && 'alive' in parsed) {
+              const heartbeatState = parsed as { alive?: unknown; at?: unknown };
+              liveness = heartbeatState.alive === true ? 'alive' : heartbeatState.alive === false ? 'dead' : 'unknown';
+              if (heartbeatState.alive === true && typeof heartbeatState.at === 'number' && Number.isFinite(heartbeatState.at)) heartbeatAtMs = heartbeatState.at;
             }
-          }
-        } catch { /* malformed heartbeat is unknown */ }
-      }
-      return { ...screen, liveness, heartbeatAtMs };
+          } catch { /* malformed heartbeat is unknown */ }
+        }
+        return { ...screen, liveness, heartbeatAtMs };
+      }),
+      ledgers: () => listRunLedgers().matches,
+      runScreenKey: (runId) => queryRunScreenKey(runId).screenKey,
     });
-    const explicitScreen = requestedSpace === undefined ? undefined : screens.find((screen) => screen.spaceId === requestedSpace);
-    if (requestedSpace !== undefined && !explicitScreen) {
-      const candidates = screens.length === 0
-        ? '  (후보 없음)'
-        : screens.map((screen) => `  ${screen.spaceId}`).join('\n');
-      if (opts.run !== undefined) {
-        process.stderr.write(`run 화면 해석 불가: 해석한 화면이 없습니다: ${requestedSpace} (${opts.run})\n`);
+    if (decision.kind === 'refuse') {
+      process.stderr.write(decision.message);
+      process.exit(decision.exitCode);
+    }
+    const target = decision.spaceId;
+    const hasMemo = opts.memo !== undefined;
+    if (decision.channel === 'pod') {
+      const record = readPodFragment(target);
+      try {
+        if (hasMemo) {
+          if (!opts.memo || /[\r\n]/.test(opts.memo)) throw new Error('control inbox memo must be a non-empty single line');
+          const urgent = opts.memo.startsWith('[urgent] ');
+          dispatchPodSelfSend(target, { memo: { version: 1, kind: 'supervisor', urgency: urgent ? 'urgent' : 'normal', body: urgent ? opts.memo.slice('[urgent] '.length) : opts.memo } });
+        } else dispatchPodSelfSend(target, { stop: true });
+        ui.info(`Pod 조각에 ${hasMemo ? '감독 메모' : 'soft stop'} 기록: ${target} (${record?.job ?? 'finished'})`);
+        return;
+      } catch (error) {
+        process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
         process.exit(1);
       }
-      process.stderr.write(`알 수 없는 self send 대상 space: ${requestedSpace}. 후보 중 하나를 지정하세요:\n${candidates}\n`);
-      process.exit(2);
     }
-    if (space !== undefined && explicitScreen) {
-      const goalPrefix = selfSendGoalPrefix(explicitScreen.spaceId);
-      const sameGoalAttempts = goalPrefix === undefined
-        ? []
-        : screens.filter((screen) => selfSendGoalPrefix(screen.spaceId) === goalPrefix);
-      const newest = newestSelfSendAttempt(sameGoalAttempts);
-      if (newest !== undefined && newest.spaceId !== explicitScreen.spaceId && newest.mtimeMs! > explicitScreen.mtimeMs!) {
-        process.stderr.write(`지정한 self send 대상은 같은 골의 더 최근 시도로 교체되었습니다: ${explicitScreen.spaceId} → ${newest.spaceId}. 더 최근 space를 지정해 다시 보내세요.\n`);
-        process.exit(2);
-      }
-    }
-    if (requestedSpace === undefined && screens.length !== 1) {
-      const display = formatSelfSendCandidateDisplay(screens, { includeStale: opts.includeStale, now: Date.now() });
-      const candidates = screens.length === 0
-        ? '  (후보 없음)'
-        : [
-          ...display.lines,
-          ...(display.hiddenStaleCount > 0 ? [`  오래된 후보 ${display.hiddenStaleCount}개 숨김 (--include-stale로 표시)`] : []),
-        ].join('\n');
-      process.stderr.write(`soft stop 대상이 모호합니다. space를 지정하세요. 후보와 마지막 프레임 시각:\n${candidates}\n`);
-      process.exit(2);
-    }
-    const selectedScreen = requestedSpace === undefined ? screens[0]! : explicitScreen!;
-    if (hasMemo) {
-      const { listRunLedgers, queryRunScreenKey } = await import('./self-implement/run-ledger.js');
-      const classifyLifecycle = (entries: readonly { event: string; data: Record<string, unknown> }[]): 'continuing' | 'terminal' | 'unknown' => {
-        let lifecycle: 'continuing' | 'terminal' | 'unknown' = 'unknown';
-        for (const entry of entries) {
-          if (entry.event === 'start' || entry.event === 'run-start' || (entry.event === 'run-status' && entry.data.runStatus === 'running')) lifecycle = 'continuing';
-          else if (entry.event === 'terminal' || entry.event === 'run-status') lifecycle = 'terminal';
-        }
-        return lifecycle;
-      };
-      let runId = opts.run;
-      let lifecycle: 'continuing' | 'terminal' | 'unknown' = 'unknown';
-      try {
-        const ledgers = listRunLedgers().matches;
-        if (runId === undefined) {
-          for (const candidate of ledgers) {
-            if (normalizeSpaceId(queryRunScreenKey(candidate.runId).screenKey ?? '') === selectedScreen.spaceId) {
-              runId = candidate.runId;
-              break;
-            }
-          }
-        }
-        if (runId !== undefined) {
-          const ledger = ledgers.find((candidate) => candidate.runId === runId)?.entries;
-          if (ledger !== undefined) lifecycle = classifyLifecycle(ledger);
-        }
-      } catch { /* unreadable lifecycle evidence remains unknown */ }
-      if (lifecycle === 'terminal') {
-        process.stderr.write(`self send 대상 런이 이미 종료되었습니다: ${runId ?? selectedScreen.spaceId}. 메모를 기록하지 않았습니다. 새 런을 시작해 다시 보내세요.\n`);
-        process.exit(2);
-      }
-      if (lifecycle === 'unknown') {
-        process.stderr.write(`경고: self send 대상 런의 lifecycle 상태를 알 수 없습니다: ${runId ?? selectedScreen.spaceId}. 기록은 계속합니다.\n`);
-      }
-    } else if (selectedScreen.liveness === 'dead') {
-      process.stderr.write(`self send 대상 자식이 heartbeat alive=false로 사망한 상태입니다: ${selectedScreen.spaceId}. 메모를 기록하지 않았습니다. 새 런을 시작하거나 살아 있는 space를 지정해 다시 보내세요.\n`);
-      process.exit(2);
-    }
-    if (selectedScreen.liveness === 'unknown') {
-      process.stderr.write(`경고: self send 대상의 heartbeat 상태를 알 수 없습니다: ${selectedScreen.spaceId}. 기록은 계속합니다.\n`);
-    }
-    if (selectedScreen.liveness === 'alive'
-      && selectedScreen.heartbeatAtMs !== undefined
-      && Date.now() - selectedScreen.heartbeatAtMs > SELF_SEND_STALE_HEARTBEAT_MS) {
-      process.stderr.write(`경고: self send 대상 space가 죽어 보입니다: ${selectedScreen.spaceId}. heartbeat가 5분보다 오래되어 메모가 전달되지 않을 수 있습니다.\n`);
-    }
-    const target = selectedScreen.spaceId;
+    for (const warning of decision.warnings) process.stderr.write(warning);
     const { controlInboxPath, enqueueControlMemo, enqueueSoftStop } = await import('./harness/control-inbox.js');
     const explicitInboxDir = controlInboxPath(target);
     if (hasMemo) {
@@ -6377,6 +6211,198 @@ intakeCmd
         console.log(renderIntakeAuthorOutcomes(authoring));
       }
     }
+  });
+
+// 정기 외부 흡수 원장 — RFC-regular-external-intake-and-normalization-pipeline §3 (① 모양 · ② 중복).
+intakeCmd
+  .command('ingest')
+  .description('수집기 산출(JSONL · 한 줄 = {url,title,text,kind,signals,…})을 흡수 원장에 모양 맞춰 넣는다 — 같은 항목은 합친다')
+  .requiredOption('--source <source>', 'x | youtube | github | telegram-saved | telegram-bot | memo')
+  .option('--file <path>', 'JSONL 경로 (없으면 표준입력)')
+  .option('--json', '구조화 출력')
+  .action(async (opts: { source: string; file?: string; json?: boolean }) => {
+    const { INTAKE_SOURCES, ingestIntakeItems, parseRawIntakeJsonl } = await import('./intake-plane/items.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    if (!(INTAKE_SOURCES as readonly string[]).includes(opts.source)) {
+      console.error(`알 수 없는 입력원: ${opts.source} (${INTAKE_SOURCES.join(' · ')})`);
+      process.exitCode = 2;
+      return;
+    }
+    const { readFileSync } = await import('node:fs');
+    const { readPipedStdin } = await import('./cli/piped-stdin.js');
+    const text = opts.file ? readFileSync(opts.file, 'utf8') : (await readPipedStdin()) ?? '';
+    const { raws, bad } = parseRawIntakeJsonl(text);
+    const result = ingestIntakeItems(effectiveInstanceRoot(), opts.source as (typeof INTAKE_SOURCES)[number], raws);
+    const out = { source: opts.source, inputLines: raws.length + bad, badInputLines: bad, ...result };
+    if (opts.json) await writeStdoutFully(JSON.stringify(out, null, 2));
+    else console.log(`흡수 원장 · ${opts.source}: 새 ${result.added} · 합침 ${result.merged} · 이미 끝난 것 ${result.seen} · 버림 ${result.skipped}${bad ? ` · 깨진 입력 ${bad}` : ''}${result.badLines ? ` · 깨진 원장 줄 ${result.badLines}` : ''}`);
+  });
+
+intakeCmd
+  .command('items')
+  .description('흡수 원장 항목 보기 (최근 본 순)')
+  .option('--status <status>', 'new | queued | absorbed | checked | routed | discarded | deferred')
+  .option('--source <source>', '입력원으로 거르기')
+  .option('--limit <n>', '최대 줄 수 (기본 30)')
+  .option('--json', '구조화 출력')
+  .action(async (opts: { status?: string; source?: string; limit?: string; json?: boolean }) => {
+    const { listIntakeItems } = await import('./intake-plane/items.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    const all = listIntakeItems(effectiveInstanceRoot(), {
+      ...(opts.status ? { status: opts.status as never } : {}),
+      ...(opts.source ? { source: opts.source as never } : {}),
+    });
+    const limit = Math.max(1, Number(opts.limit ?? 30) || 30);
+    const shown = all.slice(0, limit);
+    if (opts.json) { await writeStdoutFully(JSON.stringify({ total: all.length, items: shown }, null, 2)); return; }
+    console.log(`흡수 원장 ${all.length}건${all.length > limit ? ` (앞 ${limit})` : ''}`);
+    // 개인 메모(user-private)는 본문을 찍지 않는다 — 제목·URL 만.
+    for (const i of shown) console.log(`${i.id}  ${i.status.padEnd(9)} ${i.sources.join('+').padEnd(16)} ${(i.title ?? i.url ?? (i.privacy === 'user-private' ? '(개인 메모)' : i.text ?? '')).slice(0, 90)}`);
+  });
+
+intakeCmd
+  .command('mark <id>')
+  .description('흡수 원장 항목의 상태·산출을 갱신한다 (예: 흡수 뒤 absorbed ⊕ 노트 경로)')
+  .requiredOption('--status <status>', 'new | queued | absorbed | checked | routed | discarded | deferred')
+  .option('--output <kind:ref>', '산출 (note|goal|manual|release|grounding):<경로·번호>')
+  .action(async (id: string, opts: { status: string; output?: string }) => {
+    const { INTAKE_STATUSES, markIntakeItem } = await import('./intake-plane/items.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    if (!(INTAKE_STATUSES as readonly string[]).includes(opts.status)) { console.error(`알 수 없는 상태: ${opts.status}`); process.exitCode = 2; return; }
+    const m = opts.output?.match(/^(note|goal|manual|release|grounding):(.+)$/);
+    if (opts.output && !m) { console.error('--output 은 <kind>:<ref> (kind = note|goal|manual|release|grounding)'); process.exitCode = 2; return; }
+    const ok = markIntakeItem(effectiveInstanceRoot(), id, {
+      status: opts.status as never,
+      ...(m ? { output: { kind: m[1] as 'note', ref: m[2] } } : {}),
+    });
+    if (!ok) { console.error(`원장에 없는 id: ${id}`); process.exitCode = 1; return; }
+    console.log(`${id} → ${opts.status}${m ? ` · ${m[1]}:${m[2]}` : ''}`);
+  });
+
+intakeCmd
+  .command('digest')
+  .description('흡수 하루 다이제스트 — 그날 흡수한 것을 축별로 · 노트의 한 줄 결론 · 골 후보. 노트 절(마크다운) 또는 텔레그램 보고 채널로')
+  .option('--day <YYYY-MM-DD>', 'KST 날짜 (기본 오늘)')
+  .option('--json', '구조화 출력')
+  .option('--telegram', '텔레그램 보고 채널(telegram.reportChannel)로 짧은 판을 보낸다')
+  .option('--vault <root>', '옵시디언 볼트 뿌리 — 텔레그램 판에 노트 열기 주소를 싣는다')
+  .option('--note <path>', '열기 주소가 가리킬 노트(그날 트렌드 노트)')
+  .action(async (opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string }) => {
+    const { buildIntakeDigest, renderDigestMarkdown, renderDigestTelegram } = await import('./intake-plane/digest.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    const day = opts.day ?? new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
+    const d = buildIntakeDigest(effectiveInstanceRoot(), day);
+    if (opts.telegram) {
+      if (!d.absorbed.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return; }
+      const { sendTelegramReport } = await import('./telegram-report.js');
+      const { getUserConfig } = await import('./user-config.js');
+      const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
+      const sent = await sendTelegramReport(getUserConfig(), text, { markdown: true });
+      debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length, sent });
+      console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');
+      if (!sent) process.exitCode = 3;
+      return;
+    }
+    if (opts.json) { await writeStdoutFully(JSON.stringify(d, null, 2)); return; }
+    await writeStdoutFully(renderDigestMarkdown(d));
+  });
+
+intakeCmd
+  .command('route <id>')
+  .description('흡수가 끝난 항목의 대조 결과(intake check --json)를 산출 큐로 나눈다 — 없음→goals · 문서뿐인 판단 필요→manual · 노트→grounding 후보')
+  .requiredOption('--check-json <path>', '`elanous intake check --file <노트> --json` 산출 파일')
+  .option('--dry-run', '큐·상태를 바꾸지 않고 건수만')
+  .option('--json', '구조화 출력')
+  .action(async (id: string, opts: { checkJson: string; dryRun?: boolean; json?: boolean }) => {
+    const { routeIntakeItem } = await import('./intake-plane/route.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    const { readFileSync } = await import('node:fs');
+    let check;
+    try { check = JSON.parse(readFileSync(opts.checkJson, 'utf8')); } catch (e) { console.error(`대조 산출을 못 읽었다: ${String((e as Error).message ?? e)}`); process.exitCode = 2; return; }
+    if (!check || !Array.isArray(check.items)) { console.error('대조 산출 모양이 아니다(items 칸 없음)'); process.exitCode = 2; return; }
+    const res = routeIntakeItem(effectiveInstanceRoot(), id, check, opts.dryRun ? { dryRun: true } : {});
+    if (opts.json) { await writeStdoutFully(JSON.stringify(res, null, 2)); return; }
+    if (res.skipped) { console.log(`${id}: 건너뜀 — ${res.skipped}`); if (res.skipped.startsWith('원장에 없는')) process.exitCode = 1; return; }
+    console.log(`${id} → 골 후보 ${res.goals} · 매뉴얼 후보 ${res.manual} · 판단 필요 ${res.review} · 그라운딩 후보 ${res.grounding}${res.dryRun ? ' (dry-run)' : ''}`);
+  });
+
+intakeCmd
+  .command('grounding-sync')
+  .description('흡수 그라운딩 후보 큐의 노트를 등록 가능한 단일 문서 폴더로 복사한다 (레지스트리는 읽기만)')
+  .option('--dry-run', '복사·삭제·폴더 생성을 하지 않고 건수만 계산한다')
+  .option('--json', '결과와 미등록 시 등록 명령을 JSON 한 줄로 출력한다')
+  .action(async (opts: { dryRun?: boolean; json?: boolean }) => {
+    const { syncIntakeGroundingDocs } = await import('./intake-plane/grounding-docs.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    const { listGroundingSources } = await import('./grounding/sources.js');
+    const result = syncIntakeGroundingDocs(effectiveInstanceRoot(), { dryRun: opts.dryRun });
+    const registered = listGroundingSources(getUserConfig()).some((source) => source.path === result.dir);
+    const registrationCommand = registered ? undefined : `elanous grounding sources add ${result.dir} --kind local-docs --tag intake --sync daily`;
+    if (opts.json) {
+      await writeStdoutFully(JSON.stringify({ ...result, ...(registrationCommand ? { registrationCommand } : {}) }) + '\n');
+      return;
+    }
+    console.log(`그라운딩 동기화: copied ${result.copied} · skipped ${result.skipped} · removed ${result.removed} · unchanged ${result.unchanged}${opts.dryRun ? ' (dry-run)' : ''}`);
+    if (registrationCommand) console.log(registrationCommand);
+  });
+
+intakeCmd
+  .command('queue')
+  .description('자동 흡수 대기열 — 원장의 new 항목에서 하루 상한까지 골라 queued 로 옮긴다 (사용자가 남긴 것 → 여러 입력원 → 점수 순)')
+  .option('--max <n>', '상한 (기본 10 — 대표 결정 2026-09-26)')
+  .option('--kind <kind>', 'video | repo | post | article | note')
+  .option('--dry-run', '고르기만 하고 상태를 안 바꾼다')
+  .option('--json', '구조화 출력 (한 줄 = {id,url,title,sources})')
+  .action(async (opts: { max?: string; kind?: string; dryRun?: boolean; json?: boolean }) => {
+    const { pickAbsorbQueue } = await import('./intake-plane/items.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    const picked = pickAbsorbQueue(effectiveInstanceRoot(), {
+      max: Math.max(0, Number(opts.max ?? 10) || 0),
+      ...(opts.kind ? { kind: opts.kind as never } : {}),
+      ...(opts.dryRun ? { dryRun: true } : {}),
+    });
+    if (opts.json) { await writeStdoutFully(picked.map((i) => JSON.stringify({ id: i.id, url: i.url, title: i.title, sources: i.sources })).join('\n')); return; }
+    console.log(`흡수 대기열 ${picked.length}건${opts.dryRun ? ' (dry-run)' : ''}`);
+    for (const i of picked) console.log(`${i.id}  ${i.sources.join('+').padEnd(16)} ${i.url}`);
+  });
+
+intakeCmd
+  .command('collect-telegram-saved')
+  .description('텔레그램 «저장된 메시지»를 읽기만 해 흡수 원장에 넣는다 (커서 이후만 · 호스트 전용 · 개인 메모는 user-private)')
+  .option('--max <n>', '한 번에 읽을 메시지 수 상한 (기본 300 — 쌓인 것은 판마다 따라잡는다)')
+  .option('--dry-run', '원장·커서를 바꾸지 않고 건수만')
+  .option('--json', '구조화 출력')
+  .action(async (opts: { max?: string; dryRun?: boolean; json?: boolean }) => {
+    const { collectTelegramSaved, gramjsFetchSaved } = await import('./intake-plane/collect-telegram-saved.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    let conn: Awaited<ReturnType<typeof gramjsFetchSaved>>;
+    try { conn = await gramjsFetchSaved(); } catch (e) { console.error(String((e as Error).message ?? e)); process.exitCode = 2; return; }
+    try {
+      const res = await collectTelegramSaved(effectiveInstanceRoot(), conn.fetch, { max: Math.max(1, Number(opts.max ?? 300) || 300), ...(opts.dryRun ? { dryRun: true } : {}) });
+      if (opts.json) await writeStdoutFully(JSON.stringify(res, null, 2));
+      else console.log(`텔레그램 저장된 메시지: 메시지 ${res.messages} · 원장 입력 ${res.raws} · 커서 ${res.cursorBefore} → ${res.cursorAfter}${res.dryRun ? ' (dry-run · 안 씀)' : res.ingest ? ` · 새 ${res.ingest.added} · 합침 ${res.ingest.merged} · 이미 끝난 것 ${res.ingest.seen}` : ''}`);
+    } finally {
+      await conn.close();
+    }
+  });
+
+intakeCmd
+  .command('collect-github')
+  .description('관심 주제의 GitHub 저장소를 별 순으로 모아 흡수 원장에 넣는다 (최근 생성·푸시만 · 별 스냅숏으로 증가량)')
+  .option('--days <n>', '최근 이 일수 안에 만들어졌거나 푸시된 저장소만 (기본 30)')
+  .option('--per-query <n>', '질의마다 별 순 상위 몇 개 (기본 20)')
+  .option('--dry-run', '스냅숏·원장을 바꾸지 않고 질의별 받은 수와 저장소 목록만')
+  .option('--json', '구조화 출력')
+  .action(async (opts: { days?: string; perQuery?: string; dryRun?: boolean; json?: boolean }) => {
+    const { collectGithubStars, ghApiSearchRepos, DEFAULT_GITHUB_STAR_DAYS, DEFAULT_GITHUB_STAR_PER_QUERY } = await import('./intake-plane/collect-github.js');
+    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
+    const days = Math.max(1, Number(opts.days ?? DEFAULT_GITHUB_STAR_DAYS) || DEFAULT_GITHUB_STAR_DAYS);
+    const perQuery = Math.max(1, Number(opts.perQuery ?? DEFAULT_GITHUB_STAR_PER_QUERY) || DEFAULT_GITHUB_STAR_PER_QUERY);
+    const res = await collectGithubStars(effectiveInstanceRoot(), ghApiSearchRepos, {
+      days, perQuery, ...(opts.dryRun ? { dryRun: true } : {}),
+    });
+    if (opts.json) await writeStdoutFully(JSON.stringify(res, null, 2));
+    else console.log(`GitHub star: 저장소 ${res.repos.length} · 질의 ${res.queries.map((q) => `${q.query}=${q.received}`).join(' · ')}${res.dryRun ? ' (dry-run · 안 씀)' : res.ingest ? ` · 새 ${res.ingest.added} · 합침 ${res.ingest.merged} · 이미 끝난 것 ${res.ingest.seen}` : ''}`);
   });
 
 // ── logs (통합 로그 패브릭 LF3 — adb logcat 동형 · 2026-07-13) ──
@@ -8253,11 +8279,6 @@ const selfDevCmd = program
   //   ⛔ 걸리면 «이름을 대며» 멈춘다(조용히 진행하지 않는다). 우회는 --force-preflight 이고 그 사실이 관측에 남는다.
   .option('--ask <path>', 'ask 파일로 골을 저작하고, 발사 전 전제 검사(열린 PR·도는 런)를 통과하면 그대로 발사한다')
   .option('--say <text>', '문장으로 골을 저작하고 --ask와 같은 전제 검사·발사 경로를 탄다')
-  .option('--graph <on|off>', 'self: graph authority를 이번 런에만 설정', (value: string) => {
-    const parsed = parseRunControlValue('graph', value);
-    if (parsed === undefined) throw new HarnessCliInputError(`--graph 값은 on 또는 off여야 함: ${value}`);
-    return parsed as boolean;
-  })
   .option('--force-preflight', '--ask/--say 전제 검사에서 막혀도 발사한다(우회 사실을 관측에 남긴다)')
   .option('--allow-no-evidence', 'file 골의 REQUIRED EVIDENCE 태그 0개 사전 거부를 명시적으로 우회(관측 기록)')
   .option('--allow-superseded-goal', 'file 골의 Superseded-By 사전 거부를 명시적으로 우회(관측 기록)')
@@ -8734,12 +8755,11 @@ const selfDevCmd = program
         json: opts.json,
       });
       if (!suppressHoldJsonWrapper) {
-        console.log(opts.json
-          ? JSON.stringify(preparedWorktree ? { result: jsonResult, autoWorktree: preparedWorktree } : jsonResult, null, 2)
-          : renderDevCompletionLine({
-            kind: r.kind, ok, runId: completionRunId, base: r.plan.base, result: r.kind === 'self' ? r.result : undefined,
-            supervisorStopReason,
-          }));
+        if (opts.json) await writeStdoutFully(JSON.stringify(preparedWorktree ? { result: jsonResult, autoWorktree: preparedWorktree } : jsonResult, null, 2));
+        else console.log(renderDevCompletionLine({
+          kind: r.kind, ok, runId: completionRunId, base: r.plan.base, result: r.kind === 'self' ? r.result : undefined,
+          supervisorStopReason,
+        }));
       }
       // ⛔ 종전엔 CLI 가 `planDevPipeline(spec)` 를 따로 불러 이 값을 얻었는데, 그 호출이
       //   **잔여 관측보다 먼저 던질 수 있어** 관측을 건너뛰게 했다(무인 리뷰 must-fix).
@@ -11724,9 +11744,8 @@ const nexusRunCmd = nexusCmd
     // 0. --test mode: route to project-local isolated daemon. Test mode
     //    is interactive-only by design (you're verifying changes from a
     //    TTY); no auto-detect needed.
-    // ★ P4 거부 게이트(DESIGN §6) — **비-리더 트리가 운영 싱글턴을 접수하려 할 때만** 막는다.
-    //   `--test` 는 뿌리가 운영이 아니므로 게이트가 스스로 통과시킨다(아래 분기보다 위에 둬도 안전).
-    //   ⚠️ fail-open: 권위 미지정·판정 불가·게이트 예외는 전부 통과 → launchd KeepAlive 크래시 루프 회피.
+    // 운영 우주는 설치본 또는 명시 운영 루트로 실행한 경우에만 접수한다.
+    // `--test` 격리 우주는 통과하고 게이트 예외는 데몬 기동을 막지 않는다.
     {
       const { evaluateNexusRunRefusal } = await import('./instance/nexus-run-refusal.js');
       const refusal = evaluateNexusRunRefusal();
@@ -11783,10 +11802,25 @@ const nexusRunCmd = nexusCmd
     // 3. Resolve --port (canonical) ← --http-port (compat) ← env.
     const envPortRaw = process.env.ELANOUS_NEXUS_HTTP_PORT?.trim();
     const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : NaN;
-    const resolvedPort = opts.port
+    let resolvedPort = opts.port
       ?? opts.httpPort
       ?? (Number.isFinite(envPort) && envPort > 0 ? envPort : undefined);
     const resolvedHttpHost = opts.httpHost ?? process.env.ELANOUS_NEXUS_HTTP_HOST?.trim() ?? undefined;
+    // Inline non-TTY daemons do not pass through runPwaStart. Reserve before
+    // runNexus so the test universe never falls through to the prod port.
+    if (resolvedPort === undefined && !opts.hmr && process.env.ELANOUS_NEXUS_BG_PARENT !== '1' && !process.stdin.isTTY
+      && (await import('./instance/current.js')).resolveCurrentInstance().kind === 'test') {
+      const { leaseTestPort, releaseTestPort } = await import('./cli/port-lease-local.js');
+      const lease = await leaseTestPort({ owner: process.cwd() });
+      if ('error' in lease) {
+        console.error('시험 대역에 빈 포트가 없습니다 (31450..31499).');
+        process.exitCode = 1;
+        return;
+      }
+      resolvedPort = lease.port;
+      console.log(`시험 대역에서 :${lease.port} 임대`);
+      process.once('exit', () => releaseTestPort(lease.port, lease.pid));
+    }
 
     // 4. Legacy TUI mode 제거됨 (T3 · PLAN-tui-redundancy-cleanup
     //    2026-05-16). `--legacy-tui` / `--tui` flag 가 NEXUS TUI shell
@@ -11848,6 +11882,12 @@ const nexusRunCmd = nexusCmd
           ...(opts.rebuild ? { rebuild: true } : {}),
         });
         process.exit(result.exitCode);
+      }
+      if (bgChild && resolvedPort !== undefined) {
+        // The detached child owns the lease after its launcher exits. Release
+        // only its own PID on orderly shutdown; SIGKILL is reclaimed on next lease.
+        const { releaseTestPort } = await import('./cli/port-lease-local.js');
+        process.once('exit', () => releaseTestPort(resolvedPort, process.pid));
       }
       const { runNexus } = await import('./nexus/index.js');
       await runNexus({
@@ -12858,66 +12898,6 @@ async function runSyncFlow(fromDashboard: boolean): Promise<void> {
   closeTui();
 }
 
-// ── M1.5 A.3 — daemon-attach mode resolver ──
-//
-// Reads `ELANOUS_USE_DAEMON` / `ELANOUS_NO_DAEMON` env, optionally
-// auto-spawns a local daemon, and returns the socket path the
-// dashboard should attach to. Returns `null` when the dashboard
-// should boot in-process (default, unchanged behavior).
-//
-// Sequence:
-//   1. ELANOUS_NO_DAEMON=1                     → null  (force in-process)
-//   2. ELANOUS_USE_DAEMON unset                → null  (default in-process)
-//   3. ELANOUS_USE_DAEMON=1 + socket alive     → { socketPath }
-//   4. ELANOUS_USE_DAEMON=1 + socket absent    → spawn `elanous serve --background`,
-//                                              wait up to 5s, then { socketPath }
-async function resolveDaemonAttachMode(): Promise<{ socketPath: string } | null> {
-  if (process.env.ELANOUS_NO_DAEMON === '1') return null;
-  if (process.env.ELANOUS_USE_DAEMON !== '1') return null;
-
-  const { elanousDaemonSocketPath } = await import('./elanous-daemon.js');
-  const { isUnixSocketAlive } = await import('./tui-client/acp-transport-unix-client.js');
-  const socketPath = elanousDaemonSocketPath();
-
-  if (await isUnixSocketAlive(socketPath)) {
-    return { socketPath };
-  }
-
-  // Auto-spawn a detached daemon. Caller blocks up to 5s on socket
-  // readiness so the dashboard can attach right after spawn returns.
-  console.log(`[elanous] no daemon at ${socketPath} — auto-spawning…`);
-  const ok = await spawnDaemonAndWait(socketPath);
-  if (!ok) {
-    console.error(`[elanous] auto-spawned daemon did not bind ${socketPath} within 5s`);
-    console.error(`[elanous] falling back to in-process dashboard.`);
-    return null;
-  }
-  console.log(`[elanous] daemon started (${socketPath}).`);
-  return { socketPath };
-}
-
-async function spawnDaemonAndWait(socketPath: string): Promise<boolean> {
-  const { spawn } = await import('node:child_process');
-  // argv[0] = bun/node binary, argv[1] = elanous entry script.
-  const child = spawn(
-    process.argv[0]!,
-    [process.argv[1]!, 'serve', '--background'],
-    {
-      detached: true,
-      stdio: 'ignore',
-      env: process.env,
-    },
-  );
-  child.unref();
-  const { isUnixSocketAlive } = await import('./tui-client/acp-transport-unix-client.js');
-  const start = Date.now();
-  while (Date.now() - start < 5000) {
-    if (await isUnixSocketAlive(socketPath)) return true;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  return false;
-}
-
 // ── voice command group (M1-4 · friction-free model selection) ──
 //
 // `elanous voice status` prints the resolved STT tier + model + projected
@@ -13169,15 +13149,8 @@ async function main(): Promise<void> {
     if (resolved) remote = resolved;
   }
 
-  // M1.5 A.3 — local daemon-attach (opt-in via ELANOUS_USE_DAEMON).
-  // When set AND no `remote` is active, the dashboard becomes a
-  // thin client over the local daemon's unix socket. ELANOUS_NO_DAEMON=1
-  // forces in-process even when a daemon is alive. Mechanism only;
-  // true default flip waits for A.4+ write-side tools on the daemon.
-  const localDaemon = remote ? null : await resolveDaemonAttachMode();
-
-  // Root dashboard resume accepts the long form and `-r`. Only a
-  // leading launch flag is owned here: a subcommand's later `-r` stays
+  // Root dashboard resume accepts `--resume`. Only a
+  // leading launch flag is owned here: a subcommand's `-r` stays
   // with that subcommand until Commander parses it.
   const resumeFlagIdx = rawArgs.findIndex((arg, index) =>
     // ⛔ `-r` 은 «더 이상» resume 의 별칭이 아니다 — 원격 북마크(`--remote`)의 단축형이다.
@@ -13211,10 +13184,9 @@ async function main(): Promise<void> {
     rich: rawArgs.includes('--rich'),
     benchmark,
     ...(remote ? { remote } : {}),
-    ...(localDaemon ? { localDaemon } : {}),
     ...(resumeSessionId ? { resumeSessionId } : {}),
   };
-  // Strip root `--resume <id>` / `-r <id>` before Commander parses.
+  // Strip root `--resume <id>` before Commander parses.
   // The dashboard-only two-token form must not become a subcommand
   // selector; subcommand-owned `-r` is preserved by filterDashboardArgs.
   // DASHBOARD_FLAGS are dashboard LAUNCH flags — only strip them in the
@@ -13292,22 +13264,6 @@ async function main(): Promise<void> {
     if (resumeSessionId) {
       console.log(`[elanous] resuming daemon session: ${resumeSessionId}`);
     }
-  } else if (localDaemon) {
-    console.log(`[elanous] dashboard attached to daemon at ${localDaemon.socketPath}`);
-    if (resumeSessionId) {
-      console.log(`[elanous] resuming daemon session: ${resumeSessionId}`);
-    }
-    // A.1 + A.2 are now in main, so the sidecar carries historyDir +
-    // tools. Surface them so the user knows what's active without
-    // running `elanous serve --status` separately.
-    try {
-      const { readElanousDaemonRuntime } = await import('./elanous-daemon.js');
-      const rt = readElanousDaemonRuntime();
-      if (rt?.historyDir) console.log(`[elanous] history: disk(${rt.historyDir})`);
-      if (rt?.tools === 'readonly') {
-        console.log(`[elanous] tool surface: readonly (Read · Grep · WebSearch)`);
-      }
-    } catch { /* status echo is best-effort */ }
   }
 
   // Tier 1 Phase 3 양방향 sync — when a daemon is reachable on the
@@ -13333,13 +13289,6 @@ async function main(): Promise<void> {
   // P3(대표 2026-07-26) — footgun 관측을 logs.db 에 도달시킨다. 초반(arg 파싱 前) warnProdSpawnFootgun 은
   //   StoreSink 등록 前이라 debug.log 가 logs.db 미도달이었다(순서 갭). sink 등록 직후 관측만 재발행(stderr 중복 X).
   try { (await import('./instance-root-coherence.js')).warnProdSpawnFootgun({ emit: 'log' }); } catch { /* fail-open */ }
-  // P1(2026-07-26) — 운영 리더 권위 부트스트랩 + 3축 드리프트 관측. **거부하지 않는다**(P4 가 거부).
-  // sink 등록 後라 debug.log 가 logs.db 에 닿는다(`elanous logs --category instance.leader`).
-  try {
-    const L = await import('./instance/leader.js');
-    L.bootstrapLeader(new Date().toISOString());
-    L.observeLeaderAtBoot({ emit: 'log' });
-  } catch { /* fail-open — 리더 관측 실패가 부팅을 막지 않는다 */ }
 
   // Self-observation (PLAN P1b · S1) — the interactive TUI self-reports
   // its rendered frames to the ChannelBus + cross-process pty-manifest,

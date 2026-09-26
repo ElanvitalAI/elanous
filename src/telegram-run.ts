@@ -12,6 +12,7 @@
 
 import { debug } from './debug/log.js';
 import { getUserConfig } from './user-config.js';
+import { resolveChannelBotToken } from './channel-bot-token.js';
 import { forwardTelegramDispatch } from './telegram-dispatch-forward.js';
 import type { NexusTelegramQaPollerWireHandle } from './nexus/index.js';
 
@@ -40,11 +41,23 @@ export async function retryingAcquire<T extends { ok: boolean }>(
   }
 }
 
+let pollLockForTesting: {
+  acquire: typeof import('./telegram-poll-lock.js').acquireTelegramPollLock;
+  retry: typeof retryingAcquire;
+} | undefined;
+
+export function setTelegramPollLockForTesting(deps: typeof pollLockForTesting): () => void {
+  const previous = pollLockForTesting;
+  pollLockForTesting = deps;
+  return () => { pollLockForTesting = previous; };
+}
+
 /** 폴러를 띄우고 핸들을 돌려준다(시험용으로 분리 — 대기는 `runTelegramPoller` 가 한다). */
 export async function startTelegramPollers(): Promise<TelegramRunResult> {
   const cfg = getUserConfig();
-  if (!cfg.telegram.enabled || !cfg.telegram.botToken) {
-    throw new Error('telegram run: telegram.enabled 가 꺼져 있거나 telegram.botToken 이 없다');
+  const mainToken = resolveChannelBotToken('telegram', cfg)?.token;
+  if (!cfg.telegram.enabled || !mainToken) {
+    throw new Error('telegram run: telegram.enabled 가 꺼져 있거나 bot token 이 없다');
   }
   if (cfg.telegram.poller !== 'standalone') {
     console.warn('[telegram run] ⚠️ telegram.poller 가 standalone 이 아니다 — 넥서스도 같은 토큰을 폴링하려 한다. 토큰 잠금이 먼저 잡은 쪽만 띄운다.');
@@ -57,12 +70,12 @@ export async function startTelegramPollers(): Promise<TelegramRunResult> {
     import('./telegram-poll-lock.js'),
   ]);
   // 토큰마다 잠금을 «먼저» 기다려 잡는다(넥서스 재시작 겹침이면 30초 안에 풀린다).
-  const tokens = channels.interactivePollerTokens(channels.resolveTelegramChannels(cfg.telegram)).map((c) => c.botToken);
+  const tokens = channels.interactivePollerTokens(channels.resolveTelegramChannels({ ...cfg.telegram, botToken: mainToken })).map((c) => c.botToken);
   const held = new Map<string, () => void>();
   const refusedBotIds: string[] = [];
   const late: NexusTelegramQaPollerWireHandle[] = [];
   for (const token of tokens) {
-    const r = await lock.acquireTelegramPollLock(token, 'telegram-run');
+    const r = await (pollLockForTesting?.acquire ?? lock.acquireTelegramPollLock)(token, 'telegram-run');
     if (r.ok) held.set(token, r.release);
     else refusedBotIds.push(lock.telegramBotId(token));
   }
@@ -79,7 +92,7 @@ export async function startTelegramPollers(): Promise<TelegramRunResult> {
         return release ? { ok: true, release } : { ok: false };
       },
       // 처음에 못 잡은 토큰 — 잡힐 때까지 되풀이한다(넥서스가 놓는 순간 이어받는다).
-      acquire: (token) => retryingAcquire(() => lock.acquireTelegramPollLock(token, 'telegram-run'), {
+      acquire: (token) => (pollLockForTesting?.retry ?? retryingAcquire)(() => lock.acquireTelegramPollLock(token, 'telegram-run'), {
         onRetry: (attempt) => { if (attempt === 1 || attempt % 20 === 0) debug.log('telegram.run', 'late-acquire-retry', { botId: lock.telegramBotId(token), attempt }); },
       }),
     },

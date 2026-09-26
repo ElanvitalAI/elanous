@@ -308,6 +308,7 @@ function isMissingDeliveryResolver(
 ): boolean {
   return dispatched.absenceReason === 'no-capable-peer'
     || dispatched.absenceReason === 'no-delivery-resolver'
+    || dispatched.absenceReason === 'no-tui-deps-no-resolver'
     // Compatibility for dispatch implementations that predate absenceReason.
     || /requires a HITL resolver, but none is installed in this surface/i.test(dispatched.output);
 }

@@ -25,7 +25,6 @@ describe('urlAwareWrap', () => {
     const close = '\x1b]8;;\x07';
     const lines = urlAwareWrap(`see ${open}https://example.com/very/long/path${close} now`, 12, {
       urlAware: true,
-      preserveOsc8: true,
     });
     expect(lines[1]).toContain(open);
     expect(lines[1]).toContain(close);

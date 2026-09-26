@@ -24,6 +24,8 @@ import type { FeedbackEnvelopeWire } from './feedback-envelope';
 import { parseElanousFeedbackEnvelope } from './elanous-feedback-envelope';
 import { forkSession } from './daemon-session';
 import { debugLog } from './debug';
+import { fetchBudgetStatus, type BudgetStatusBody } from './budget-status';
+import type { DaemonHttpConfig } from './model-tier-sync';
 import { isMcpAppHtmlMime } from '../../../../src/tool-runtime/mcp-app-mime';
 import { mcpResultImages, mcpAppResourceUriOf } from '../../../../src/feedback/media';
 
@@ -382,6 +384,33 @@ export interface ChatRuntimeContext {
   provider: string;
   setSessionId: (id: string) => void;
   setProvider: (p: string) => void;
+  /** Daemon HTTP settings for `:budget`. Injected when the caller has them
+   *  outside this context (tests, or a surface that does not hold DaemonConfig). */
+  daemon?: DaemonHttpConfig;
+  /** Current screen message buffer. `:history` summarizes this; it does not
+   *  query the server. */
+  messages?: readonly ChatMessage[];
+}
+
+const HISTORY_DEFAULT_N = 10;
+const HISTORY_PREVIEW_CHARS = 80;
+const EMPTY_HISTORY_TEXT = '아직 대화가 없습니다';
+const BUDGET_UNREAD_TEXT = '예산 상태를 읽지 못했습니다';
+
+export function formatBudgetLine(body: BudgetStatusBody): string {
+  const usd = Number.isFinite(body.monthSoFarUsd) ? body.monthSoFarUsd : 0;
+  return `budget ${body.monthYYYYMM}: $${usd.toFixed(2)} · 알림 ${body.notifyAtPct}%`;
+}
+
+export function formatHistoryLines(
+  messages: readonly ChatMessage[],
+  n = HISTORY_DEFAULT_N,
+): string {
+  if (messages.length === 0) return EMPTY_HISTORY_TEXT;
+  const recent = messages.slice(Math.max(0, messages.length - n));
+  return recent
+    .map((message) => `${message.role}: ${message.text.slice(0, HISTORY_PREVIEW_CHARS)}`)
+    .join('\n');
 }
 
 const HELP_TEXT = [
@@ -390,8 +419,8 @@ const HELP_TEXT = [
   '  :session         Show current session id',
   '  :fork            Allocate a fresh session id',
   '  :provider <name> Set default provider for this session',
-  '  :budget          Show running budget (TODO)',
-  '  :history         Show recent turns (TODO — uses local state)',
+  '  :budget          Show this month spend and the notify threshold',
+  '  :history [N]     Summarize the last N local turns (default 10) as role: first 80 chars',
   '  :clear           Clear local message buffer',
 ].join('\n');
 
@@ -410,8 +439,18 @@ const META_HANDLERS: Record<
     if (!p) return { text: `current provider = ${ctx.provider || '(server default)'}` };
     return { text: `provider → ${p}`, newProvider: p };
   },
-  ':budget': async () => ({ text: 'budget: TODO (wired in WT-L slice)' }),
-  ':history': async () => ({ text: 'use local message list (above) — server history view TODO' }),
+  ':budget': async (_args, ctx) => {
+    const cfg = ctx.daemon;
+    if (!cfg?.baseUrl) return { text: BUDGET_UNREAD_TEXT };
+    const body = await fetchBudgetStatus(cfg);
+    if (!body) return { text: BUDGET_UNREAD_TEXT };
+    return { text: formatBudgetLine(body) };
+  },
+  ':history': async (args, ctx) => {
+    const requested = Number(args[0]);
+    const n = Number.isFinite(requested) && requested > 0 ? Math.floor(requested) : HISTORY_DEFAULT_N;
+    return { text: formatHistoryLines(ctx.messages ?? [], n) };
+  },
   ':clear': async () => ({ text: '__CLEAR__' }), // sentinel; UI clears its buffer
 };
 

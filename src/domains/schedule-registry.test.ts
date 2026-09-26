@@ -846,16 +846,28 @@ import { cronRepoRoot } from './schedule-registry.js';
 describe('cronRepoRoot', () => {
   const installed = '/home/u/.local/share/elanous/versions/1.0.0-abc/node_modules/elanous';
   const noGit = (p: string) => !p.endsWith('.git') || false;
-  test('installed copy with a leader tree → the leader tree (where crons always cd-ed)', () => {
-    expect(cronRepoRoot(installed, { exists: (p) => p === '/src/pilot', readLeader: () => '/src/pilot' })).toBe('/src/pilot');
+  test('installed copy reads ops.cronRepoRoot from a loaded config file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cron-config-'));
+    const { getUserConfig } = require('../user-config.js') as typeof import('../user-config.js');
+    try {
+      const path = join(dir, 'config.json');
+      writeFileSync(path, JSON.stringify({ ops: { cronRepoRoot: '/configured/root' } }));
+      expect(getUserConfig(path).ops?.cronRepoRoot).toBe('/configured/root');
+      expect(cronRepoRoot(installed, { exists: () => false, configuredRoot: () => getUserConfig(path).ops?.cronRepoRoot })).toBe('/configured/root');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
-  test('installed copy without a leader → the stable current path, never the version dir', () => {
-    expect(cronRepoRoot(installed, { exists: () => false, readLeader: () => null })).toBe('/home/u/.local/share/elanous/current/node_modules/elanous');
-    expect(cronRepoRoot(installed, { exists: () => false, readLeader: () => '/gone' })).toBe('/home/u/.local/share/elanous/current/node_modules/elanous');
+  test('installed copy uses configured ops.cronRepoRoot when set', () => {
+    expect(cronRepoRoot(installed, { exists: () => false, configuredRoot: () => '/src/pilot' })).toBe('/src/pilot');
+  });
+  test('installed copy without configuration uses the stable current path, never the version dir', () => {
+    expect(cronRepoRoot(installed, { exists: () => false, configuredRoot: () => undefined })).toBe('/home/u/.local/share/elanous/current/node_modules/elanous');
+    expect(cronRepoRoot(installed, { exists: () => false, configuredRoot: () => '   ' })).toBe('/home/u/.local/share/elanous/current/node_modules/elanous');
   });
   test('a checkout is returned unchanged', () => {
-    expect(cronRepoRoot('/src/pilot', { exists: noGit, readLeader: () => '/elsewhere' })).toBe('/src/pilot');
-    expect(cronRepoRoot('/src/app/versions/x/node_modules/elanous', { exists: (p) => p === '/src/app/.git', readLeader: () => null })).toBe('/src/app/versions/x/node_modules/elanous');
+    expect(cronRepoRoot('/src/pilot', { exists: noGit, configuredRoot: () => '/elsewhere' })).toBe('/src/pilot');
+    expect(cronRepoRoot('/src/app/versions/x/node_modules/elanous', { exists: (p) => p === '/src/app/.git', configuredRoot: () => undefined })).toBe('/src/app/versions/x/node_modules/elanous');
   });
 });
 

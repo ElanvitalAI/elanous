@@ -61,8 +61,8 @@ export function NexusClientProvider({ children }: { children: ReactNode }) {
 
   const client = useMemo(() => {
     if (!snap.baseUrl) return null;
-    return createNexusClient({ baseUrl: snap.baseUrl });
-  }, [snap.baseUrl]);
+    return createNexusClient({ baseUrl: snap.baseUrl, ...(snap.token ? { token: snap.token } : {}) });
+  }, [snap.baseUrl, snap.token]);
 
   if (!client) return <>{children}</>;
   return <NexusProvider client={client}>{children}</NexusProvider>;

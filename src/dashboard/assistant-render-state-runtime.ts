@@ -8,9 +8,9 @@ export interface ToggleDashboardAssistantRenderStateDeps {
   state: DashboardAssistantRenderState;
   termCols: number;
   // chat.rendering.wrap 는 boolean 이 아니라 wrap 옵션 오브젝트로 이관됨.
-  wrapOpts: { urlAware?: boolean; preserveOsc8?: boolean };
+  wrapOpts: { urlAware?: boolean };
   chatLines: string[];
-  formatResponse: (full: string, width: number, wrapOpts?: { urlAware?: boolean; preserveOsc8?: boolean }) => string[];
+  formatResponse: (full: string, width: number, wrapOpts?: { urlAware?: boolean }) => string[];
   text: (line: string) => string;
 }
 

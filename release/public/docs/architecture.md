@@ -49,6 +49,8 @@ Branches (gate → rework / review / main-sync / open-pr) and loops (rework → 
 
 **What the declaration does not do yet:** it does not *drive* execution. The orchestrator (TypeScript) still controls the run; the YAML declares the shape, and observed steps are compared against it and any divergence is reported (a "shadow" check). Handing execution authority to the declaration is a risky change and is intentionally staged.
 
+**Where this is going:** a standard template is fixed and reviewed; each run's graph is shaped once at launch and again while running, when the run supervisor adds a response node picked from a catalog and checked by code. A separate graph runner (`elanous graph run`) already walks graphs with approval pauses and resume. See [Graph engineering and self-healing loops](graph-engineering.md) for the model and what ships today.
+
 Not every declared graph is walked in practice. To see which ones actually run:
 
 ```bash
@@ -68,6 +70,8 @@ elanous logs --event pipeline-node-entry --limit 40 --all --include-test --json 
 
 **Intake has three live entrances** — Telegram, the terminal UI, and an internal API path used by system repair. Other channels (PWA, voice, CLI) are declared but have no producer yet. In particular, `elanous harness say` from a terminal goes straight to the harness and **does not pass through intake** (no triage, domain or phase decomposition).
 
+**The intended shape:** intake turns a sentence into tasks, the task manager runs a task by starting a graph, and a workflow is the body of one node in that graph. That joins the two missing links without building a new engine — see [Graph engineering](graph-engineering.md#workflows-tasks-and-intake).
+
 **How connected are they?** The mission machinery and the task store are tightly coupled. The workflow engine is not isolated, just the most thinly attached: the harness core does not use it directly, and intake does not reach it. Today the harness uses one workflow for one judgment (the rework-budget decision). "Making workflows first-class" means joining those two missing links, not building something new.
 
 ## 4. Self-healing: the harness triages and cleans up after itself
@@ -81,6 +85,8 @@ elanous logs --event pipeline-node-entry --limit 40 --all --include-test --json 
 | Repair signals | `elanous self repair-signals` · `elanous self parked` |
 
 The vocabulary is rich; how often the triage is *right* has not been measured yet.
+
+**The resolution ladder (in progress):** when a step fails, a heal graph raises its own resolution — the failure signature first, then closer observation (logs, the run ledger, screens, a verbose re-run), then outside grounding (the web, developer documentation), and a person only when the ladder is exhausted. See [Graph engineering](graph-engineering.md#resolution-rises-with-difficulty).
 
 ## 5. Four universes
 

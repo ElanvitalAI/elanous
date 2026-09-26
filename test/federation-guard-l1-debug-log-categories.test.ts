@@ -28,6 +28,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { dashboardMatches, dashboardSourceLocations, readDashboardSources } from './helpers/dashboard-source.js';
 
 const ROOT = process.cwd();
 
@@ -40,7 +41,7 @@ interface CategoryRequirement {
 const REQUIRED: readonly CategoryRequirement[] = [
   {
     category: 'dashboard.input.visibility',
-    files: ['src/dashboard/index.ts'],
+    files: ['src/dashboard/**/*.ts'],
     why: 'exposed the input ownership toggling between overlay-input and chat-main in #1401 picker-flicker RCA',
   },
   {
@@ -99,22 +100,34 @@ describe('L1 federation guard · critical debug.log categories must exist', () =
       let found = false;
       let foundIn: string | null = null;
       for (const rel of req.files) {
-        const text = readFileSync(join(ROOT, rel), 'utf8');
-        if (pattern.test(text)) {
-          found = true;
-          foundIn = rel;
-          break;
+        if (rel === 'src/dashboard/**/*.ts') {
+          const sources = readDashboardSources();
+          const match = dashboardMatches(pattern, sources)[0];
+          if (match) {
+            found = true;
+            foundIn = `${match.path}:${match.line}`;
+          } else {
+            foundIn = `searched ${dashboardSourceLocations(sources)}`;
+          }
+        } else {
+          const text = readFileSync(join(ROOT, rel), 'utf8');
+          const match = pattern.exec(text);
+          if (match) {
+            found = true;
+            foundIn = `${rel}:${text.slice(0, match.index).split('\n').length}`;
+          }
         }
+        if (found) break;
       }
       if (!found) {
         throw new Error(
-          `Required debug.log category '${req.category}' not found in any of: ${req.files.join(', ')}.\n`
+          `Required debug.log category '${req.category}' not found in any of: ${req.files.join(', ')} (${foundIn}).\n`
           + `Why this matters: ${req.why}.\n`
           + `Per CLAUDE.md "Debug instrumentation — default on, at every critical junction".\n`
           + `Removing critical instrumentation breaks the "log alone → 30-min RCA" guarantee that #1401 demonstrated.`,
         );
       }
-      expect(foundIn).not.toBeNull();
+      expect(foundIn, `Required category '${req.category}' at ${foundIn}`).not.toBeNull();
     });
   }
 });

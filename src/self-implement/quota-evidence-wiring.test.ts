@@ -34,6 +34,24 @@ describe('readQuotaExhausted — 스냅샷을 좁히지 않고 증거로 옮긴�
     expect(readQuotaExhausted(inspector, 'openai-codex').exhausted).toBe(false);
   });
 
+  // P6(2026-09-26 Pod 실물): 계정이 «구성되지 않은» 곳(Pod)의 no-candidate 는 소진이 아니다 — 대조군 = 계정이 있는데 전부 찬 호스트.
+  it('⛔ 아는 계정이 0개인 no-candidate 는 «모름»이다 — 계정이 있는데 쓸 게 없을 때만 소진', () => {
+    const noCandidate = (known: number) => () => ({ reason: 'no-candidate', candidateCount: 0, to: undefined, candidates: [], freshByHome: {}, thresholdPercent: 95, knownAccountCount: known }) as any;
+    expect(readQuotaExhausted(noCandidate(0), 'openai-codex').exhausted).toBeUndefined();
+    expect(readQuotaExhausted(noCandidate(0), 'openai-codex').accountAvailability?.reason).toBe('no-candidate');   // 증거는 남긴다
+    expect(readQuotaExhausted(noCandidate(3), 'openai-codex').exhausted).toBe(true);
+  });
+
+  // P2 #20869(2026-09-27 Pod 실물): Pod 는 배분 계정 «하나»만 안다 — 그 계정이 찼다는 증거 없이는 소진이 아니다.
+  it('⛔ 아는 계정이 1개인 no-candidate 는 그 계정의 상태를 모르면 «모름»이다', () => {
+    const single = (extra: Record<string, unknown>) => () => ({ reason: 'no-candidate', candidateCount: 0, to: undefined, candidates: [], freshByHome: {}, thresholdPercent: 95, knownAccountCount: 1, ...extra }) as any;
+    expect(readQuotaExhausted(single({}), 'openai-codex').exhausted).toBeUndefined();
+    expect(readQuotaExhausted(single({}), 'openai-codex').accountAvailability?.reason).toBe('no-candidate');   // 증거는 남긴다
+    expect(readQuotaExhausted(single({ currentUsedPercent: 40 }), 'openai-codex').exhausted).toBe(false);
+    expect(readQuotaExhausted(single({ currentUsedPercent: 97 }), 'openai-codex').exhausted).toBe(true);
+    expect(readQuotaExhausted(single({ currentReached: true }), 'openai-codex').exhausted).toBe(true);
+  });
+
   it('codex 가 아니면 증거를 안 낸다(종전 계약 보존)', () => {
     const r = readQuotaExhausted(inspector, 'anthropic');
     expect(r.exhausted).toBeUndefined();

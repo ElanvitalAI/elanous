@@ -154,10 +154,13 @@ export function parseSafeDecisionSignalCommand(command: string): ParsedDecisionS
   if (executable === 'bun' && args[0] === 'bin/elanous.mjs') {
     const elanousArgs = args.slice(1);
     const [command, subcommand, reference, output] = elanousArgs;
+    // METHOD v116(🅢 · 2026-09-26): 그래프 원장 값 신호(`pipeline-node-entry`·`graph.heal` 등)는 `--event` 로 읽는다 — v115 가 권한 모양.
     const logsObservation =
       command === 'logs' &&
-      elanousArgs.includes('--category') &&
+      (elanousArgs.includes('--category') || elanousArgs.includes('--event')) &&
       (elanousArgs.includes('--json') || elanousArgs.includes('--json-data'));
+    // 그래프 판 상태 «읽기»만 — `graph run` 은 dry-run 이어도 실행 상태 파일을 쓰므로 받지 않는다.
+    const graphStatus = command === 'graph' && subcommand === 'status' && reference !== undefined && output === '--json' && elanousArgs.length === 4;
     const ptySnapshot = command === 'pty' && subcommand === 'snapshot' && reference !== undefined && elanousArgs.length === 3;
     const ptyLineage =
       command === 'pty' &&
@@ -171,7 +174,7 @@ export function parseSafeDecisionSignalCommand(command: string): ParsedDecisionS
       reference === '--json' &&
       elanousArgs.length === 3;
 
-    if (logsObservation || ptySnapshot || ptyLineage || selfObservation) {
+    if (logsObservation || graphStatus || ptySnapshot || ptyLineage || selfObservation) {
       return { executable, args };
     }
   }

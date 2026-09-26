@@ -33,7 +33,8 @@ describe('T4.A · isLoopbackHost', () => {
 });
 
 describe('T4.A · buildConnectInfo · loopback auto_token', () => {
-  test('loopback + token file present → auto_token populated', () => {
+  // 🔐 2026-09-26: 토큰 파일이 있어도 HTTP 로 원문을 싣지 않는다(tailnet serve 가 localhost 로 프록시 → 루프백 바인드로 못 가른다).
+  test('loopback + token file present → auto_token still null (never ships the raw bearer)', () => {
     const tmp = mkdtempSync(joinPath(tmpdir(), 'elanous-connect-info-'));
     const tokenPath = joinPath(tmp, 'acp-token');
     writeFileSync(tokenPath, 'mySecretBearer\n', { mode: 0o600 });
@@ -46,9 +47,9 @@ describe('T4.A · buildConnectInfo · loopback auto_token', () => {
     const body = buildConnectInfo(ctx);
     expect(body.acp_url).toBe('ws://127.0.0.1:31415/v1/acp');
     expect(body.voice_url).toBe('ws://127.0.0.1:31415/v1/voice/ws');
-    expect(body.auto_token).toBe('mySecretBearer');
-    expect(body.token_required).toBe(false);
-    expect(body.token_hint).toContain('auto-loaded');
+    expect(body.auto_token).toBeNull();
+    expect(JSON.stringify(body)).not.toContain('mySecretBearer');
+    expect(body.token_required).toBe(true);
     rmSync(tmp, { recursive: true });
   });
 
@@ -132,7 +133,7 @@ describe('T4.A · handleConnectInfoGet HTTP shape', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('application/json');
     const body = (await res.json()) as { auto_token: string | null; acp_url: string };
-    expect(body.auto_token).toBe('tokenABC');
+    expect(body.auto_token).toBeNull();
     expect(body.acp_url).toBe('ws://127.0.0.1:31415/v1/acp');
   });
 });
@@ -269,9 +270,8 @@ describe('T4.A · advertised host · wildcard bind uses request Host', () => {
     expect(body.acp_url).toBe('ws://127.0.0.1:31415/v1/acp');
     expect(body.voice_url).toBe('ws://127.0.0.1:31415/v1/voice/ws');
     expect(body.server_label).toBe('127.0.0.1 (NEXUS 0.17.0)');
-    expect(body.auto_token).toBe('tokenABC');
-    expect(body.token_required).toBe(false);
-    expect(body.token_hint).toContain('auto-loaded');
+    expect(body.auto_token).toBeNull();
+    expect(body.token_required).toBe(true);
   });
 
   test('two different Hosts on the same wildcard bind advertise different acp_url', () => {

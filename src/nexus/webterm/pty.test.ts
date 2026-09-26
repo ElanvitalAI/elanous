@@ -5,6 +5,7 @@
 //   (mock.module 은 프로세스 전역 오염 → 타 테스트 getPty 파괴하므로 금지).
 import { test, expect, describe } from 'bun:test';
 import {
+  resolveWebtermCwd,
   createRegistryBackend, signalNumberToName, terminatePty,
   type PtyBackend, type RegistryBackendDeps,
 } from './pty.js';
@@ -167,5 +168,24 @@ describe('createRegistryBackend — 공유 registry 버스 어댑트 (P0b)', () 
     b.kill('SIGTERM');
     expect(s.handle.writes).toEqual(['ls\n']);
     expect(s.handle.kills).toEqual(['SIGTERM']);
+  });
+});
+
+describe('resolveWebtermCwd — 격리 웹 터미널이 사람 트리에서 열리지 않는다', () => {
+  const prod = { kind: 'prod' as const, root: '/home/u/.elanous' };
+  const iso = { kind: 'test' as const, root: '/iso/root' };
+  test('탭 cwd 가 이긴다', () => {
+    expect(resolveWebtermCwd({ tabCwd: '/tab', toolCwd: '/tool', instance: iso, processCwd: '/human' })).toEqual({ cwd: '/tab', source: 'tab' });
+  });
+  test('탭 cwd 가 없으면 데몬의 tool cwd', () => {
+    expect(resolveWebtermCwd({ toolCwd: '/tool', instance: iso, processCwd: '/human' })).toEqual({ cwd: '/tool', source: 'tool-cwd' });
+  });
+  test('격리 우주에서 tool cwd 도 없으면 우주 뿌리 — 사람 트리(process.cwd)가 아니다', () => {
+    const r = resolveWebtermCwd({ instance: iso, processCwd: '/human' });
+    expect(r.cwd).not.toBe('/human');
+    expect(r).toEqual({ cwd: '/iso/root', source: 'isolated-root' });
+  });
+  test('대조군: 운영 우주에서 아무것도 없으면 종전대로 process.cwd', () => {
+    expect(resolveWebtermCwd({ instance: prod, processCwd: '/human' })).toEqual({ cwd: '/human', source: 'process-cwd' });
   });
 });

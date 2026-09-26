@@ -16,8 +16,7 @@ import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaS
 import { getUserConfig } from '../user-config.js';
 import {
   decideCodexRotation, observeRotation, applyRotation, readCodexAccountRotationConfig, rotatedChildEnv,
-  codexAccountRotationThresholdOverridePercent,
-  normalizedRotationThresholdPercent,
+  codexAccountThresholdPercent,
   type RotationCandidate,
 } from './codex-account-rotation.js';
 import { debug } from '../debug/log.js';
@@ -221,9 +220,10 @@ function pinnedAccountExhausted(home: string, accountName: string): boolean {
   const used = readQuotaSignalUsedPercent(now, home);
   if (typeof used !== 'number' || !Number.isFinite(used)) return false;
   // ⛔ 판정이 쓰는 «같은 자»를 쓴다 — 여기서 임계를 다시 지으면 핀과 판정이 갈린다.
-  const threshold = codexAccountRotationThresholdOverridePercent(
-    rotationThresholdsByAccountFromConfig()?.[accountName],
-    normalizedRotationThresholdPercent(rotationThresholdFromConfig()));
+  const threshold = codexAccountThresholdPercent(accountName, {
+    thresholdPercent: rotationThresholdFromConfig(),
+    thresholdPercentByAccount: rotationThresholdsByAccountFromConfig(),
+  });
   return used >= threshold;
 }
 
@@ -460,6 +460,7 @@ export function inspectCodexRotation(
   /** Pure rotation authority's account-availability evidence. */
   readonly reason: string;
   readonly candidateCount: number | undefined;
+  readonly accountThresholds: ReturnType<typeof decideCodexRotation>['accountThresholds'];
   readonly to: string | undefined;
 } {
   const path = deps.storePath ?? authStorePath();
@@ -494,11 +495,11 @@ export function inspectCodexRotation(
     currentObservedAt: currentHome ? readQuotaSignalObservedAtRaw(now, currentHome) : undefined,
     currentSignalFresh: currentHome ? readQuotaSignalObservedAt(now, currentHome) !== undefined : false,
     explicit, enabled,
-    // ⛔ «정규화된» 임계 — 판정기가 실제로 쓴 값이다
-    thresholdPercent: normalizedRotationThresholdPercent(rawThreshold),
+    // ⛔ 계정에 적용한 «실효» 임계 — 판정기가 실제로 쓴 값이다
+    thresholdPercent: codexAccountThresholdPercent(current.name, { thresholdPercent: rawThreshold, thresholdPercentByAccount }),
     candidates, observedAtByHome, freshByHome,
     knownAccountCount: listCodexAccountsInStore(path).length,
-    reason: decision.reason, candidateCount: decision.candidateCount, to: decision.to?.name,
+    reason: decision.reason, candidateCount: decision.candidateCount, accountThresholds: decision.accountThresholds, to: decision.to?.name,
   };
 }
 

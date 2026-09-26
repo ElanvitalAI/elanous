@@ -934,6 +934,7 @@ describe('runSelfImplement — 파이프라인 시퀀싱', () => {
       const result = await runSelfImplement({
         feature: 'x',
         seams: okSeams({
+          inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 0 })) as SelfImplementSeams['inspectCodexRotation'],
           implement: async () => ({ ok: false, summary: '완료 보고가 사라짐', completionDisposition: 'completed-without-changes' }),
         }),
       });

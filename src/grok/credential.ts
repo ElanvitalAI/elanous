@@ -26,7 +26,7 @@
 //   「Using auth.json for API Access」 절이 유일한 문서다. ⇒ 조용히 깨질 수 있으니
 //   호출자는 실패를 fail-soft 로 접고 API 키 경로로 떨어질 수 있어야 한다.
 
-import { existsSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -136,6 +136,15 @@ function readSubscriptionToken(
   return best ? { token: best.token, expiresAt: best.expiresAt, userId: best.userId } : null;
 }
 
+/** 호스트 발급 문이 응답에 실을 access. user id 는 반환하지 않는다. */
+export function readGrokSubscriptionAccess(
+  home?: string,
+): { key: string; expiresAt: string | null } | null {
+  const sub = readSubscriptionToken(grokAuthFilePath(home));
+  if (!sub) return null;
+  return { key: sub.token, expiresAt: sub.expiresAt };
+}
+
 /** 프록시 필수 헤더. ⛔ `x-grok-client-version` 을 빼면 426 이다(실측). */
 export function grokSubscriptionHeaders(opts: {
   model?: string;
@@ -155,12 +164,121 @@ export function grokSubscriptionHeaders(opts: {
   return headers;
 }
 
+/** Pod 가 호스트에 새 access 를 묻는 창. 이 안이면 URL 이 있을 때만 다시 받는다. */
+export const POD_CREDENTIAL_REFRESH_WINDOW_MS = 15 * 60 * 1000;
+export const POD_CREDENTIAL_URL_ENV = 'ELANOUS_POD_CREDENTIAL_URL';
+export const POD_CREDENTIAL_TOKEN_ENV = 'ELANOUS_POD_CREDENTIAL_TOKEN';
+
+interface PodCredentialRefresh {
+  readonly ok: boolean;
+  readonly reason: 'refreshed' | 'not-expiring' | 'no-env' | 'request-failed' | 'bad-body' | 'write-failed';
+}
+
+function observePodCredentialRefresh(ok: boolean, reason: PodCredentialRefresh['reason']): void {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { debug } = require('../debug/log.js') as typeof import('../debug/log.js');
+    debug.log('llm.grok', 'pod-credential-refresh', { ok, reason });
+  } catch { /* fail-open — 관측이 자격 해석을 막지 않는다 */ }
+}
+
+/** auth.json 의 access 만 갈아 끼운다. refresh·계정 id 는 건드리지 않고, 실패하면 원본 바이트를 남긴다. */
+function rewriteAuthAccessKey(path: string, key: string, expiresAt: string): boolean {
+  let original: string;
+  try { original = readFileSync(path, 'utf-8'); } catch { return false; }
+  let parsed: unknown;
+  try { parsed = JSON.parse(original); } catch { return false; }
+  if (!parsed || typeof parsed !== 'object') return false;
+  const record = parsed as Record<string, unknown>;
+  let target: string | null = null;
+  let bestMs = Number.NEGATIVE_INFINITY;
+  for (const [name, scope] of Object.entries(record)) {
+    if (!scope || typeof scope !== 'object') continue;
+    const s = scope as GrokAuthScope;
+    if (typeof s.key !== 'string' || s.key.length === 0) continue;
+    const ms = typeof s.expires_at === 'string' ? Date.parse(s.expires_at) : Number.NEGATIVE_INFINITY;
+    const finite = Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms;
+    if (target === null || finite > bestMs) { target = name; bestMs = finite; }
+  }
+  if (target === null) return false;
+  const scope = record[target];
+  if (!scope || typeof scope !== 'object') return false;
+  const next = { ...(scope as Record<string, unknown>), key, expires_at: expiresAt };
+  const body = JSON.stringify({ ...record, [target]: next });
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, body, { encoding: 'utf-8', mode: 0o600 });
+    renameSync(tmp, path);
+    chmodSync(path, 0o600);
+    return true;
+  } catch {
+    try { writeFileSync(path, original, { encoding: 'utf-8', mode: 0o600 }); } catch { /* 원본이 그대로면 충분 */ }
+    return false;
+  }
+}
+
+/**
+ * Pod 안에서만 — 두 env 가 있고 access 가 15분 안이면 호스트에 새 key 를 받아 auth.json 을 0600 으로 다시 쓴다.
+ * env 가 없거나, 창 밖이거나, 요청이 실패하면 기존 바이트를 유지한다. refresh 는 보내지도 저장하지도 않는다.
+ */
+async function maybeRefreshPodCredential(opts: {
+  env: NodeJS.ProcessEnv;
+  home?: string;
+  now?: () => number;
+  fetchImpl?: typeof fetch;
+}): Promise<void> {
+  const url = opts.env[POD_CREDENTIAL_URL_ENV];
+  const token = opts.env[POD_CREDENTIAL_TOKEN_ENV];
+  if (!url || !token) return;
+  const path = grokAuthFilePath(opts.home);
+  const sub = readSubscriptionToken(path);
+  if (!sub?.expiresAt) {
+    observePodCredentialRefresh(false, 'not-expiring');
+    return;
+  }
+  const ms = Date.parse(sub.expiresAt);
+  if (!Number.isFinite(ms) || (opts.now ?? Date.now)() + POD_CREDENTIAL_REFRESH_WINDOW_MS < ms) {
+    observePodCredentialRefresh(false, 'not-expiring');
+    return;
+  }
+  let res: Response;
+  try {
+    res = await (opts.fetchImpl ?? fetch)(url, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}` },
+    });
+  } catch {
+    observePodCredentialRefresh(false, 'request-failed');
+    return;
+  }
+  if (!res.ok) {
+    observePodCredentialRefresh(false, 'request-failed');
+    return;
+  }
+  let body: unknown;
+  try { body = await res.json(); } catch {
+    observePodCredentialRefresh(false, 'bad-body');
+    return;
+  }
+  const key = body && typeof body === 'object' ? (body as { key?: unknown }).key : undefined;
+  const expiresAt = body && typeof body === 'object' ? (body as { expires_at?: unknown }).expires_at : undefined;
+  if (typeof key !== 'string' || key.length === 0 || typeof expiresAt !== 'string' || expiresAt.length === 0) {
+    observePodCredentialRefresh(false, 'bad-body');
+    return;
+  }
+  if (!rewriteAuthAccessKey(path, key, expiresAt)) {
+    observePodCredentialRefresh(false, 'write-failed');
+    return;
+  }
+  observePodCredentialRefresh(true, 'refreshed');
+}
+
 /** ⭐ 단일 규칙 — 구독이 있으면 구독, 없을 때만 API 키.
  *
  *  ⛔ 만료를 여기서 «막지 않는다** — access token 이 지나도 refresh_token 이
  *  살아 있으면 grok 바이너리가 갱신한다. 만료를 불가용으로 접으면 멀쩡한 구독을
  *  API 키로 떨어뜨려 «지갑이 열린다**. 401 이 실제로 나면 호출자가 강등한다. */
-export function resolveGrokCredential(opts: {
+function readGrokCredential(opts: {
   env?: NodeJS.ProcessEnv;
   home?: string;
   model?: string;
@@ -197,7 +315,42 @@ export function resolveGrokCredential(opts: {
   return null;
 }
 
-/** 갱신 유도 결과. ⛔ 「갱신됐다」와 「안 됐다」와 「못 했다」를 다른 값으로. */
+export interface ResolveGrokCredentialOpts {
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+  model?: string;
+  cliVersion?: string;
+  /** 구독을 «건너뛴다** — 401 을 맞은 뒤 호출자가 강등할 때만 쓴다. */
+  skipSubscription?: boolean;
+  now?: () => number;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * 자격 해석.
+ * 두 Pod env 가 없으면 동기 `GrokCredential | null` — 종전 호출이 받는 값과 같다.
+ * 둘 다 있으면 Promise. access 가 15분 안일 때만 호스트 URL 의 새 key 로 auth.json 을
+ * 0600(tmp→rename) 다시 쓴 뒤 읽는다. 창 밖·실패는 파일을 그대로 두고 옛 키를 resolve 한다.
+ * 호스트 프로세스는 두 env 를 갖지 않으므로 이 오버로드의 Promise 갈래를 타지 않는다.
+ */
+export function resolveGrokCredential(opts: ResolveGrokCredentialOpts & {
+  env: NodeJS.ProcessEnv & Record<typeof POD_CREDENTIAL_URL_ENV, string> & Record<typeof POD_CREDENTIAL_TOKEN_ENV, string>;
+}): Promise<GrokCredential | null>;
+export function resolveGrokCredential(opts?: ResolveGrokCredentialOpts): GrokCredential | null;
+export function resolveGrokCredential(opts: ResolveGrokCredentialOpts = {}): GrokCredential | null | Promise<GrokCredential | null> {
+  const env = opts.env ?? process.env;
+  if (opts.skipSubscription === true || !env[POD_CREDENTIAL_URL_ENV] || !env[POD_CREDENTIAL_TOKEN_ENV]) {
+    return readGrokCredential(opts);
+  }
+  return maybeRefreshPodCredential({
+    env,
+    ...(opts.home !== undefined ? { home: opts.home } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
+    ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
+  }).then(() => readGrokCredential(opts));
+}
+
+/** 갱신 유도 결과. ⛔ 「갱신됐다」와 «안 됐다»와 «못 했다»를 다른 값으로. */
 export type GrokRefreshOutcome = 'refreshed' | 'unchanged' | 'failed' | 'no-credential';
 
 /** 토큰의 만료 시각만 뽑는다(비교용). ⛔ 토큰 값은 안 낸다. */
@@ -352,7 +505,7 @@ export interface ResolveFreshGrokOpts {
  */
 export function resolveFreshGrokCredential(opts: ResolveFreshGrokOpts = {}): GrokCredential | null {
   const { execImpl, now, ...resolveOpts } = opts;
-  const cred = resolveGrokCredential(resolveOpts);
+  const cred = readGrokCredential(resolveOpts);
   // API 키는 만료 개념이 없다 · 자격이 없으면 갱신할 것도 없다.
   if (!cred || cred.kind !== 'subscription') return cred;
 
@@ -392,7 +545,7 @@ export function resolveFreshGrokCredential(opts: ResolveFreshGrokOpts = {}): Gro
     blockedMs: clock() - startedAt, timeoutMs: GROK_REFRESH_TIMEOUT_MS,
   });
   // ⛔ 「돌았다」가 아니라 「값이 변했다」로 판정한다 — refreshGrokSubscriptionToken 의 계약 그대로.
-  if (outcome === 'refreshed') return resolveGrokCredential(resolveOpts);
+  if (outcome === 'refreshed') return readGrokCredential(resolveOpts);
 
   // ⛔⭐⭐ 갱신이 실패해도 ***구독을 유지한다*** — 여기서 API 키로 강등하지 «않는다».
   //

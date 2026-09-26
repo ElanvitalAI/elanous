@@ -228,6 +228,21 @@ export function createRegistryBackend(
   };
 }
 
+/** 웹 터미널 셸이 열릴 작업 디렉토리를 정한다(실행 맥락 SSOT: 맥락은 «한 번» 정해지고 인자로 내려간다).
+ *  순서: 탭이 명시한 cwd → 데몬이 정한 tool cwd → (격리 우주면) 우주 뿌리 → 데몬 프로세스 cwd.
+ *  ⛔ 격리(test) 우주에서 `process.cwd()` 로 떨어지면 셸이 «사람 작업 트리»에서 열린다(🅕 실측 2026-09-26). */
+export function resolveWebtermCwd(input: {
+  tabCwd?: string;
+  toolCwd?: string;
+  instance: { kind: 'prod' | 'test'; root: string };
+  processCwd: string;
+}): { cwd: string; source: 'tab' | 'tool-cwd' | 'isolated-root' | 'process-cwd' } {
+  if (input.tabCwd) return { cwd: input.tabCwd, source: 'tab' };
+  if (input.toolCwd) return { cwd: input.toolCwd, source: 'tool-cwd' };
+  if (input.instance.kind === 'test') return { cwd: input.instance.root, source: 'isolated-root' };
+  return { cwd: input.processCwd, source: 'process-cwd' };
+}
+
 /** Build the per-tab spawn factory used by `runNexus({webtermSpawn})`.
  *  The runtime calls this once per webterm tab with `{id, cwd}` so the
  *  factory can apply per-tab overrides (e.g. tab-specific cwd). P0b:

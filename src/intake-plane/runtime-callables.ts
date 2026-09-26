@@ -188,7 +188,8 @@ export function buildIntakeDocumentStageCallables(
     const lines = document.split('\n');
     let inCheck = false;
     const external = lines.filter((line) => {
-      if (/^##\s+🧭\s+elanous 점검\s*$/.test(line.trim())) {
+      // 개명(2026-09-26) 전에 쓴 노트는 옛 제목을 그대로 갖고 있다 — 둘 다 빼야 자기 점검을 다시 읽지 않는다.
+      if (/^##\s+🧭\s+(?:elanous|monad) 점검\s*$/.test(line.trim())) {
         inCheck = true;
         return false;
       }

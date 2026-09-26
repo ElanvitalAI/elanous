@@ -31,7 +31,7 @@ import {
 } from './admin-dev-proxy.js';
 import { handleDevProxyHttpRequest, pathMatchesDevProxy } from './dev-proxy.js';
 import { OPENAI_RELAY_PATH, tryHandleOpenAiRelay } from './openai-relay.js';
-import { handleHealth } from './health.js';
+import { handleHealth, type HealthSetupContext } from './health.js';
 import { handleTabsList, handleTabDetail, handleNexusSnapshot } from './tabs.js';
 import { handleSseEvents } from './events.js';
 import { dispatchIntentPredictionRoute } from './intent-prediction.js';
@@ -142,6 +142,7 @@ import {
 } from './autopilot-api.js';
 import {
   handleVaultGet,
+  handleVaultFilePut,
   handleTemplateExpand,
   parseVaultPath,
 } from './vault-api.js';
@@ -157,6 +158,10 @@ import {
   handleLlmProvidersList,
   handleLlmProviderSet,
 } from './setup-llm-provider.js';
+import { handleObsidianSkillsGet, handleObsidianSet, handleSkillsSet } from './setup-obsidian-skills.js';
+import { handleChildLlmGet, handleChildLlmSet } from './setup-child-llm.js';
+import { handleAnswerPriorityGet, handleAnswerPrioritySet } from './setup-answer-priority.js';
+import { handleChannelBotsGet, handleChannelBotSet } from './setup-channel-bot.js';
 import { handleLlmRoutePredict } from './llm-route-predict.js';
 import type { MissionRouter } from '../../llm/mission-router.js';
 import { handleContextFetchUrl } from './context-url.js';
@@ -219,7 +224,7 @@ import {
   parseErrorsPath,
 } from './errors.js';
 import { handleChatBackendDetection } from './chat-backend-detection.js';
-import { handleConnectInfoGet, handleConnectTokenMint, type ConnectInfoCtx } from './connect-info.js';
+import { connectInfoTokenAllowed, handleConnectInfoGet, handleConnectTokenMint, type ConnectInfoCtx } from './connect-info.js';
 import { handleStaticAppRequest, pathMatchesStaticPrefix } from './static-app.js';
 import {
   createWsBridge,
@@ -244,6 +249,9 @@ import {
 } from './meta-api.js';
 import { handleIntakePipelinePreviewPost } from './intake-pipeline-preview.js';
 import { handleIntakePipelineCommitPost } from './intake-pipeline-commit.js';
+import { handleIntakeRoutePost } from './intake-route.js';
+import { corsPreflight, jsonResponse } from './json-response.js';
+import { isPublicRoute } from './public-routes.js';
 import { handleSchedulesActionPost } from './schedules-action.js';
 import { handleIntakeRunsList } from './intake-runs.js';
 import { handleMissionsList, handleMissionDetail } from './missions.js';
@@ -345,6 +353,7 @@ import {
   parseAgentCliSessionPath,
 } from './agent-cli.js';
 import { handleSessionTurnControl, SESSION_TURN_CONTROL_PATH } from '../../session/session-turn-control.js';
+import { authenticatePodCredential, handlePodGrokCredential, POD_CREDENTIAL_GROK_PATH } from './pod-credential-api.js';
 import { handleOutboundReport } from './outbound-report.js';
 import { handleSelfEvent } from './self-event.js';
 /** 매매 «실행»은 애드온이다(대표 09-20 결정 ③ · 별도 상용 저장소 · release/trading-export.yaml) — 공개 코어엔 없다.
@@ -456,6 +465,8 @@ export interface NexusHttpServerOpts {
   portRange?: number;
   /** Hostname to bind. Defaults to '127.0.0.1' (loopback). */
   hostname?: string;
+  /** 넥서스 기동 때 한 번 정한 셋업 상태. `/v1/health` 가 요청마다 다시 읽지 않고 이 값을 싣는다. */
+  setup?: HealthSetupContext;
   /** Optional occupancy probe asked before each bind. Default is a short
    *  localhost GET of `/v1/health`. Occupied ports are skipped; probe
    *  failures and timeouts fail open as available. */
@@ -790,6 +801,23 @@ async function routeRequest(
   const { pathname } = url;
   const method = req.method;
 
+  // Default-deny for every `/v1/` path that is not on PUBLIC_ROUTES.
+  // Reuses checkAuth (same-origin exemption + constant-time bearer).
+  // setupMode is not implemented on this server (P24b) — pass false.
+  // Per-route checkAuth calls below stay in place.
+  // OPTIONS is a CORS preflight and cannot carry Authorization; existing
+  // handlers answer it themselves, so the gate does not swallow it.
+  if (
+    method !== 'OPTIONS'
+    && pathname.startsWith('/v1/')
+    && !isPublicRoute(method, pathname, { setupMode: false })
+  ) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) {
+      debug.log('nexus.auth', 'default-deny', { method, pathname });
+      return jsonResponse({ error: 'unauthorized' }, 401);
+    }
+  }
+
   // FU2 (2026-05-12) — root-level browser conveniences. The PWA serves
   // its assets under `/app/*`, but browsers still probe the origin root
   // for `/favicon.ico` and bookmark `/`. Without these two handlers the
@@ -1083,6 +1111,12 @@ async function routeRequest(
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
   if (method !== 'GET') {
+    // Pod grok access 재발급. 넥서스 bearer 가 아니라 llm-credential 토큰을 본문 파싱 전에 검증한다.
+    if (pathname === POD_CREDENTIAL_GROK_PATH && method === 'POST') {
+      const gate = await authenticatePodCredential(req);
+      if (!gate.ok) return gate.response;
+      return handlePodGrokCredential(req);
+    }
     if (pathname === '/v1/harness/ask' && method === 'POST') {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
       if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
@@ -1200,7 +1234,10 @@ async function routeRequest(
         return handleRuntimeToolCall(req, opts.metaApi, restToolId);
       }
     }
+    // ⛔ 설정 쓰기 여섯(스위치·모델 티어·LLM provider·LLM 호스트·회전·미션 제어)은 인증 없이 핸들러에 닿았다
+    //   (2026-09-26 🅢 비파괴 탐침: 무인증 PUT → 404/400 · 같은 조건 /v1/config/secrets → 401). PWA 는 same-origin 으로 통과.
     if (pathname.startsWith('/v1/config/switches/') && method === 'PUT') {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       const switchId = pathname.slice('/v1/config/switches/'.length);
       return handleSwitchPut(req, makeConfigCtx(opts), switchId);
     }
@@ -1213,6 +1250,7 @@ async function routeRequest(
     // sub-trees into UserConfig (Path A). Validation lives in the
     // handler so invalid tier strings can't pollute the file.
     if (pathname === '/v1/config/model-tier' && method === 'PUT') {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       const { handleModelTierPut } = await import('./config-model-tier.js');
       return handleModelTierPut(req);
     }
@@ -1252,12 +1290,14 @@ async function routeRequest(
     // PUT + DELETE in the mutation block; GET sits in the GET-only
     // block alongside /v1/llm/models.
     if (pathname === '/v1/llm/hosts' && (method === 'OPTIONS' || method === 'PUT' || method === 'DELETE')) {
+      if (method !== 'OPTIONS') { if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401); }
       return handleLlmHostsConfig(req);
     }
     // iOS Phase 1.5 (2026-05-13) — provider rotation advance. POST
     // here in the mutation block (memory `feedback_post_route_must_be_in_method_block`),
     // GET sibling in the GET block below.
     if (pathname === '/v1/llm/rotation/next' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'POST') { if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401); }
       return handleLlmRotationNext(req);
     }
     if (pathname === '/v1/llm/rotation' && method === 'OPTIONS') {
@@ -1267,10 +1307,34 @@ async function routeRequest(
     // POST 는 mutation 블록 안에서 등록 (memory `feedback_post_route_must_be_in_method_block`).
     // GET sibling 은 아래 GET-only 블록에 등록.
     if (pathname === '/v1/setup/llm-provider' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'POST') { if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401); }
       return handleLlmProviderSet(req);
     }
     if (pathname === '/v1/setup/llm-providers' && method === 'OPTIONS') {
       return handleLlmProvidersList(req);
+    }
+    if (pathname === '/v1/setup/obsidian' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleObsidianSet(req);
+    }
+    if (pathname === '/v1/setup/skills' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleSkillsSet(req);
+    }
+    if (pathname === '/v1/setup/obsidian-skills' && method === 'OPTIONS') return corsPreflight('GET, OPTIONS');
+    if (pathname === '/v1/setup/channel-bot' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleChannelBotSet(req);
+    }
+    if (pathname === '/v1/setup/channel-bots' && method === 'OPTIONS') return corsPreflight('GET, OPTIONS');
+    if ((pathname === '/v1/setup/child-llm' || pathname === '/v1/setup/answer-priority')
+      && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('GET, POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return pathname === '/v1/setup/child-llm' ? handleChildLlmSet(req) : handleAnswerPrioritySet(req);
     }
     // PWA `/settings` Phase 3 (2026-05-19) — persona description PATCH.
     // dispatchPersonaRoute 가 PATCH 분기를 자체 처리. GET sibling 은
@@ -1580,6 +1644,12 @@ async function routeRequest(
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
       return handleIntakePipelineCommitPost(req, opts.metaApi);
     }
+    // I1 — 판정만. `/v1/intake/` 세션 id 캐치올보다 앞에 둔다(pipeline-preview 와 같은 자리).
+    if (pathname === '/v1/intake/route' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleIntakeRoutePost(req);
+    }
     if (pathname.startsWith('/v1/intake/')) {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
       const suffix = pathname.slice('/v1/intake/'.length);
@@ -1765,10 +1835,27 @@ async function routeRequest(
       return handleTriagePreview(req);
     }
     if (pathname === '/v1/autopilot/mission-action' && method === 'POST') {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       return handleMissionAction(req);
+    }
+    // 흡수 원장 입구(RFC-pwa-intake-front-door A3 absorb) — 넣기·추적 둘 다 인증(PWA 칸은 user-private).
+    if (pathname === '/v1/intake-ledger/items' && method === 'POST') {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      const { handleIntakeLedgerPost } = await import('./intake-ledger-api.js');
+      return handleIntakeLedgerPost(req);
+    }
+    if (pathname === '/v1/vault/file' && (method === 'PUT' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('PUT, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleVaultFilePut(req);
+    }
+    {
+      const vaultSeg = parseVaultPath(pathname);
+      if (vaultSeg !== null && method === 'OPTIONS') return corsPreflight('GET, OPTIONS');
     }
     // Obsidian Vault PWA 이식 OP0 (2026-07-09) — 템플릿 전개(POST). GET reads 는 아래.
     if (pathname === '/v1/vault/template-expand' && method === 'POST') {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       return handleTemplateExpand(req);
     }
     // B outbound — unified send: openclaw reports + Conatus alerts POST here
@@ -1838,7 +1925,10 @@ async function routeRequest(
     return jsonResponse({ error: 'static-not-wired' }, 404);
   }
   if (pathname === '/v1/health') {
-    return handleHealth(opts.state, opts.registry, { bindHost: bind.hostname });
+    return handleHealth(opts.state, opts.registry, {
+      bindHost: bind.hostname,
+      ...(opts.setup ? { setup: opts.setup } : {}),
+    });
   }
   if (pathname === '/v1/nexus') return handleNexusSnapshot(opts.state, opts.registry);
   if (pathname === '/v1/nexus/tabs') return handleTabsList(opts.registry, url);
@@ -2044,6 +2134,7 @@ async function routeRequest(
   {
     const seg = parseVaultPath(pathname);
     if (seg !== null) {
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
       return handleVaultGet(req, seg);
     }
   }
@@ -2071,6 +2162,18 @@ async function routeRequest(
   // POST sibling (`/v1/setup/llm-provider`) 는 위 mutation 블록.
   if (pathname === '/v1/setup/llm-providers') {
     return handleLlmProvidersList(req);
+  }
+  if (pathname === '/v1/setup/obsidian-skills') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleObsidianSkillsGet();
+  }
+  if (pathname === '/v1/setup/channel-bots') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleChannelBotsGet();
+  }
+  if (pathname === '/v1/setup/child-llm' || pathname === '/v1/setup/answer-priority') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return pathname === '/v1/setup/child-llm' ? handleChildLlmGet() : handleAnswerPriorityGet();
   }
   // P1-FU1 (2026-05-14) — mission router prediction is POST-only.
   // GET reaches here AFTER the mutation block (which only fires when
@@ -2105,6 +2208,12 @@ async function routeRequest(
   if (pathname === '/v1/intake') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
     return handleIntakeListGet(req, url, opts.metaApi);
+  }
+  // 흡수 원장 추적 — 인증 필수(PWA 칸은 user-private · 넣기는 위 method!=='GET' 블록).
+  if (pathname.startsWith('/v1/intake-ledger/items/')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    const { handleIntakeLedgerGet } = await import('./intake-ledger-api.js');
+    return handleIntakeLedgerGet(decodeURIComponent(pathname.slice('/v1/intake-ledger/items/'.length)));
   }
   // I10 (2026-05-12) — dogfood retrospective. Reads recent rows from
   // ~/.elanous/intake/pipeline-runs.jsonl + aggregates across the full
@@ -2286,6 +2395,7 @@ async function routeRequest(
       ...(ci?.acpTokenPath !== undefined ? { acpTokenPath: ci.acpTokenPath } : {}),
       ...(ci?.acpTokenOverride !== undefined ? { acpTokenOverride: ci.acpTokenOverride } : {}),
       ...(requestHost ? { requestHost } : {}),
+      allowAutoToken: connectInfoTokenAllowed(req.headers.get('origin'), requestHost || null),
     };
     return handleConnectInfoGet(ctx);
   }
@@ -2442,36 +2552,4 @@ export function parseTelegramDispatchEvent(body: unknown): TelegramEvent | null 
   };
 }
 
-export function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      // micro.1 (2026-05-09 · FU.4 envelope audit recommendation #2
-      // enforce-by-default) — every JSON envelope now carries the
-      // CORS allow-origin wildcard so PWA dev (cross-port) + future
-      // remote dogfood (Tailscale URL) reach the daemon without
-      // per-endpoint patching. Production same-origin is unaffected
-      // (browsers ignore the header on same-origin requests). elanous
-      // daemon uses bearer-token auth only (no cookies), so the
-      // wildcard does not conflict with `credentials: include`.
-      'access-control-allow-origin': '*',
-    },
-  });
-}
-
-/** OPTIONS preflight response for JSON-body POST/PUT/DELETE routes
- *  in the mutation block. Mirrors the audio-stt + role-judge pattern
- *  so any new POST endpoint gets cross-origin support with one line:
- *  `if (... && method === 'OPTIONS') return corsPreflight();`. */
-export function corsPreflight(allowedMethods = 'POST, PUT, DELETE, OPTIONS'): Response {
-  return new Response(null, {
-    status: 204,
-    headers: {
-      'access-control-allow-origin': '*',
-      'access-control-allow-methods': allowedMethods,
-      'access-control-allow-headers': 'content-type, authorization',
-      'access-control-max-age': '600',
-    },
-  });
-}
+export { corsPreflight, jsonResponse } from './json-response.js';

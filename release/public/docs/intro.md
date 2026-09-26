@@ -13,4 +13,6 @@ curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/insta
 elanous harness say "add a --json flag to the status command"
 ```
 
+Under the hood every job is one loop — observe, understand, heal — drawn as a graph that elanous reshapes while it runs, with posture deciding how hard it looks and how widely it grounds itself. See [Graph engineering and self-healing loops](graph-engineering.md).
+
 Start with [Install](install.md) and the [Quickstart](quickstart.md).

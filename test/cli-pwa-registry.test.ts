@@ -59,6 +59,29 @@ describe('pwa-registry launcher provenance', () => {
     }, isTTY: true })).toEqual({ kind: 'autonomous-run', runId: 'run-42' });
   });
 
+  test('recognizes only elanous XPC services and preserves autonomous-run precedence', () => {
+    expect(resolvePwaLauncherProvenance({ env: { XPC_SERVICE_NAME: 'com.elanous.nexus' }, isTTY: false }))
+      .toEqual({ kind: 'service-manager', serviceName: 'com.elanous.nexus' });
+    expect(resolvePwaLauncherProvenance({ env: { XPC_SERVICE_NAME: 'com.apple.Terminal' }, isTTY: false }))
+      .toEqual({ kind: 'unknown' });
+    expect(resolvePwaLauncherProvenance({ env: { XPC_SERVICE_NAME: 'com.apple.Terminal' }, isTTY: true }))
+      .toEqual({ kind: 'human-terminal' });
+    expect(resolvePwaLauncherProvenance({ env: {
+      ELANOUS_RUN_ID: 'run-42', XPC_SERVICE_NAME: 'com.elanous.nexus', INVOCATION_ID: 'id', SYSTEMD_EXEC_PID: '42',
+    }, isTTY: false })).toEqual({ kind: 'autonomous-run', runId: 'run-42' });
+  });
+
+  test('requires INVOCATION_ID plus a systemd execution signal', () => {
+    for (const signal of ['SYSTEMD_EXEC_PID', 'JOURNAL_STREAM'] as const) {
+      expect(resolvePwaLauncherProvenance({ env: { INVOCATION_ID: 'id', [signal]: 'value' }, isTTY: false }))
+        .toEqual({ kind: 'service-manager', serviceName: 'systemd' });
+      expect(resolvePwaLauncherProvenance({ env: { [signal]: 'value' }, isTTY: false }))
+        .toEqual({ kind: 'unknown' });
+    }
+    expect(resolvePwaLauncherProvenance({ env: { INVOCATION_ID: 'id' }, isTTY: false }))
+      .toEqual({ kind: 'unknown' });
+  });
+
   test('distinguishes service manager, background child, terminal, and unknown signals', () => {
     expect(resolvePwaLauncherProvenance({ env: { LAUNCH_JOB_NAME: 'com.elanous.nexus' }, isTTY: true }))
       .toEqual({ kind: 'service-manager', serviceName: 'com.elanous.nexus' });
@@ -102,6 +125,19 @@ describe('pwa-registry · register + list + prune', () => {
         pid: process.pid,
         launcherProvenance,
       })]);
+    } finally { cleanup(); }
+  });
+
+  test('detected launchd provenance persists in the version-1 registry', () => {
+    const { path, cleanup } = tmpRegistry();
+    try {
+      const launcherProvenance = resolvePwaLauncherProvenance({ env: { XPC_SERVICE_NAME: 'com.elanous.nexus' }, isTTY: false });
+      registerPwaInstance(fixtureEntry({ pid: process.pid, launcherProvenance }), { registryPath: path });
+      const raw = JSON.parse(readFileSync(path, 'utf8'));
+      expect(Object.keys(raw).sort()).toEqual(['instances', 'version']);
+      expect(raw.version).toBe(1);
+      expect(raw.instances[0].launcherProvenance).toEqual(launcherProvenance);
+      expect(listPwaInstances({ registryPath: path, prune: false })[0]?.launcherProvenance).toEqual(launcherProvenance);
     } finally { cleanup(); }
   });
 

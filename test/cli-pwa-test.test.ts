@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
-import { runPwaTest, type PwaTestOpts } from '../src/cli/pwa-test';
+import { requestCoordinatorPort, runPwaTest, type PwaTestOpts } from '../src/cli/pwa-test';
 import type { PwaStartOpts } from '../src/cli/pwa-start';
 
 interface CapturedOut {
@@ -43,16 +43,21 @@ beforeEach(() => {
   pwaOutDir = joinPath(repoRoot, 'apps', 'pwa', 'out');
   mkdirSync(pwaOutDir, { recursive: true });
   writeFileSync(joinPath(pwaOutDir, 'index.html'), '<html></html>');
+  mkdirSync(joinPath(repoRoot, '.elanous-test'), { recursive: true });
+  writeFileSync(joinPath(repoRoot, '.elanous-test', 'config.json'), '{}');
+  baseSeams.leaseDir = mkdtempSync(joinPath(tmpdir(), 'elanous-pwa-test-lease-'));
 });
 
 afterEach(() => {
   try { rmSync(repoRoot, { recursive: true, force: true }); } catch { /* swallow */ }
+  if (baseSeams.leaseDir) try { rmSync(baseSeams.leaseDir, { recursive: true, force: true }); } catch { /* swallow */ }
   // Restore env we may have polluted.
   delete process.env.ELANOUS_NEXUS_DIR;
 });
 
+// 🔐 임대 파일은 시험마다 새 폴더에 — 실제 OS 임시 폴더(진짜 격리 데몬의 임대)와 섞이지 않고, 시험끼리 대역을 나눠 먹지 않게.
 const baseSeams: Partial<PwaTestOpts> = {
-  productionLockProbeFn: () => null,
+  leasePortFn: async () => null,
   productionLockAliveFn: () => false,
   portInUseFn: () => false,
   pwaStartFn: async () => ({ exitCode: 0 }),
@@ -90,7 +95,8 @@ describe('runPwaTest — repo layout resolution', () => {
       ...baseSeams,
     });
     expect(r.exitCode).toBe(0);
-    expect(r.picked?.nexusPort).toBe(31415);
+    expect(r.picked?.nexusPort).toBeGreaterThanOrEqual(31450);
+    expect(r.picked?.nexusPort).toBeLessThanOrEqual(31499);
   });
 });
 
@@ -112,47 +118,192 @@ describe('runPwaTest — tool cwd forwarding', () => {
     expect(r.exitCode).toBe(0);
     expect(received!.toolCwd).toBe('/tmp/isolated-tool-cwd');
     expect(received!.httpHost).toBe('0.0.0.0');
-    expect(received!.httpPort).toBe(31415);
+    expect(received!.httpPort).toBeGreaterThanOrEqual(31450);
+    expect(received!.httpPort).toBeLessThanOrEqual(31499);
+  });
+});
+
+const inTestBand = (port: number | undefined): boolean => port !== undefined && port >= 31450 && port <= 31499;
+const PRODUCTION_PORTS = [31413, 31415, 31420, 31421, 31422, 31423, 31424];
+
+describe('coordinator lease response', () => {
+  test('409 no-port falls through to the local test-band lease', async () => {
+    const exhausted = async () => Response.json({ error: 'no-port' }, { status: 409 });
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: excluded => requestCoordinatorPort(excluded, exhausted),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.picked?.nexusPort).toBe(31450);
+  });
+
+  test('503 from the coordinator falls through to the local test-band lease instead of dying', async () => {
+    const unavailable = async () => new Response('down', { status: 503 });
+    const out = makeOut();
+    const r = await runPwaTest({ repoRoot, out, ...baseSeams,
+      leasePortFn: excluded => requestCoordinatorPort(excluded, unavailable),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.picked?.nexusPort).toBe(31450);
+    expect(out.errors.some(line => line.includes('coordinator port lease failed'))).toBe(false);
+  });
+
+  test('a malformed coordinator body falls through to the local lease', async () => {
+    const garbage = async () => new Response('not json', { status: 200 });
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: excluded => requestCoordinatorPort(excluded, garbage),
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.picked?.nexusPort).toBe(31450);
+  });
+
+  test('requestCoordinatorPort itself still reports non-no-port errors (the picker is what falls back)', async () => {
+    await expect(requestCoordinatorPort([], async () => Response.json({ error: 'not-owner' }, { status: 409 })))
+      .rejects.toThrow('coordinator port lease HTTP 409');
+    await expect(requestCoordinatorPort([], async () => Response.json({ error: 'unauthorized' }, { status: 401 })))
+      .rejects.toThrow('coordinator port lease HTTP 401');
+    await expect(requestCoordinatorPort([], async () => new Response('down', { status: 503 })))
+      .rejects.toThrow('coordinator port lease HTTP 503');
   });
 });
 
 describe('runPwaTest — port collision auto-recovery', () => {
-  test('default :31415 used when free + no production daemon', async () => {
-    const out = makeOut();
-    const r = await runPwaTest({
-      repoRoot, out,
-      ...baseSeams,
+  // 🔐 2026-09-27(🅕 실측 · 격리 데몬이 31421 을 받음): `--port` 가 없으면 운영 대역이 아니라 시험 대역 임대.
+  test('without --port and without a coordinator the test daemon leases from the test band — never the production band', async () => {
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams });
+    expect(r.exitCode).toBe(0);
+    expect(r.picked?.nexusPort).toBe(31450);
+    for (const reserved of PRODUCTION_PORTS) expect(r.picked?.nexusPort).not.toBe(reserved);
+  });
+
+  test('local fallback skips occupied test-band ports without probing reserved ports', async () => {
+    const seen: number[] = [];
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      portInUseFn: port => { seen.push(port); return port === 31450; },
+    });
+    expect(r.picked?.nexusPort).toBe(31451);
+    for (const reserved of PRODUCTION_PORTS) expect(seen).not.toContain(reserved);
+  });
+
+  test('coordinator lease uses the test band without probing reserved ports', async () => {
+    const seen: number[] = [];
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async () => ({ port: 31460, leaseId: 'lease-a' }),
+      portInUseFn: port => { seen.push(port); return false; },
+    });
+    expect(r.picked?.nexusPort).toBe(31460);
+    expect(seen).toEqual([31460]);
+  });
+
+  test('occupied central port is released, excluded and replaced by next test port', async () => {
+    const exclusions: number[][] = [];
+    const released: number[] = [];
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async (excluded = []) => {
+        exclusions.push([...excluded]);
+        return excluded.includes(31450) ? { port: 31451, leaseId: 'lease-b' } : { port: 31450, leaseId: 'lease-a' };
+      },
+      releasePortFn: async port => { released.push(port); },
+      portInUseFn: port => port === 31450,
     });
     expect(r.exitCode).toBe(0);
+    expect(r.picked?.nexusPort).toBe(31451);
+    expect(exclusions).toEqual([[], [31450]]);
+    expect(released).toEqual([31450]);
+  });
+
+  test('a repeated occupied lease cannot loop — it falls back to the local lease, never to reserved ports', async () => {
+    const released: number[] = [];
+    let calls = 0;
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async () => { calls++; return { port: 31450, leaseId: 'lease-a' }; },
+      releasePortFn: async port => { released.push(port); },
+      portInUseFn: port => port === 31450,
+    });
+    expect(calls).toBe(2);
+    expect(released).toEqual([31450]);
+    expect(r.exitCode).toBe(0);
+    expect(r.picked?.nexusPort).toBe(31451);
+  });
+
+  test('passes the coordinator lease identity through to daemon startup', async () => {
+    let started: PwaStartOpts | undefined;
+    await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async () => ({ port: 31450, leaseId: 'distinct-run-id' }),
+      pwaStartFn: async opts => { started = opts; return { exitCode: 0 }; },
+    });
+    expect(started?.coordinatorLeasePort).toBe(31450);
+    expect(started?.coordinatorLeaseId).toBe('distinct-run-id');
+  });
+
+  test('hands the central claim to daemon startup but never hands local-lease ports over', async () => {
+    let central: PwaStartOpts | undefined;
+    let local: PwaStartOpts | undefined;
+    await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async () => ({ port: 31450, leaseId: 'lease-a' }),
+      pwaStartFn: async opts => { central = opts; return { exitCode: 0 }; },
+    });
+    await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      pwaStartFn: async opts => { local = opts; return { exitCode: 0 }; },
+    });
+    expect(central?.coordinatorLeasePort).toBe(31450);
+    expect(central?.coordinatorLeaseToken).toBeUndefined();
+    expect(inTestBand(local?.httpPort)).toBe(true);
+    expect(local?.coordinatorLeasePort).toBeUndefined();
+  });
+
+  test('central lease is released when daemon startup fails', async () => {
+    const released: number[] = [];
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async () => ({ port: 31450, leaseId: 'lease-a' }),
+      releasePortFn: async port => { released.push(port); },
+      pwaStartFn: async () => ({ exitCode: 1 }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(released).toEqual([31450]);
+  });
+
+  test('explicit --port 31415 wins without requesting a lease', async () => {
+    let calls = 0;
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams, port: 31415,
+      leasePortFn: async () => { calls++; return { port: 31450, leaseId: 'lease-a' }; },
+    });
     expect(r.picked?.nexusPort).toBe(31415);
+    expect(calls).toBe(0);
   });
 
-  test('falls back to :31420 when production daemon owns :31415', async () => {
-    const out = makeOut();
-    const r = await runPwaTest({
-      repoRoot, out,
-      ...baseSeams,
-      productionLockProbeFn: () => ({
-        pid: 12345,
-        host: 'mbp.local',
-        startedAt: new Date().toISOString(),
-        nexusVersion: '0.17.0',
-      } as ReturnType<NonNullable<PwaTestOpts['productionLockProbeFn']>>),
-      productionLockAliveFn: () => true,
+  test('an out-of-band coordinator response is not trusted — local test-band lease instead', async () => {
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async () => ({ port: 31415, leaseId: 'lease-a' }),
     });
     expect(r.exitCode).toBe(0);
-    expect(r.picked?.nexusPort).toBe(31420);
+    expect(r.picked?.nexusPort).toBe(31450);
   });
 
-  test('falls back beyond :31420 when both default + first fallback occupied externally', async () => {
-    const out = makeOut();
-    const r = await runPwaTest({
-      repoRoot, out,
-      ...baseSeams,
-      portInUseFn: (p) => p === 31415 || p === 31420,
+  test('a lease without an id is not trusted — local test-band lease instead', async () => {
+    const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+      leasePortFn: async () => ({ port: 31460, leaseId: '' }),
     });
     expect(r.exitCode).toBe(0);
-    expect(r.picked?.nexusPort).toBe(31421);
+    expect(r.picked?.nexusPort).toBe(31450);
+  });
+
+  test('a thrown coordinator refusal falls back to the local test-band lease', async () => {
+    const out = makeOut();
+    const r = await runPwaTest({ repoRoot, out, ...baseSeams,
+      leasePortFn: async () => { throw new Error('no-port'); },
+    });
+    expect(r.exitCode).toBe(0);
+    expect(r.picked?.nexusPort).toBe(31450);
+  });
+
+  test('errors when the local test band is exhausted', async () => {
+    const out = makeOut();
+    const r = await runPwaTest({ repoRoot, out, ...baseSeams,
+      portInUseFn: port => port >= 31450 && port <= 31499,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(r.picked).toBeUndefined();
+    expect(out.errors.some(line => line.includes('31450..31499'))).toBe(true);
   });
 
   test('errors when --port collides with an external occupant', async () => {
@@ -233,7 +384,7 @@ describe('runPwaTest — Tailscale Serve --https opt-in', () => {
     expect(r.tailscaleMounted).toBeFalsy();
     expect(called).toBe(0);
     // HTTP URL guide should be present.
-    expect(out.logs.some((l) => l.includes('http://localhost:31415'))).toBe(true);
+    expect(out.logs.some((l) => /http:\/\/localhost:314[5-9]\d\b/.test(l))).toBe(true);
   });
 
   test('--https mounts Tailscale Serve + surfaces HTTPS URL', async () => {
@@ -270,7 +421,7 @@ describe('runPwaTest — Tailscale Serve --https opt-in', () => {
     expect(r.exitCode).toBe(1);
     expect(out.errors.some((e) => e.includes('Tailscale Serve mount failed'))).toBe(true);
     expect(out.errors.some((e) => e.includes('sudo-required'))).toBe(true);
-    expect(out.errors.some((e) => e.includes('http://localhost:31415'))).toBe(true);
+    expect(out.errors.some((e) => /http:\/\/localhost:314[5-9]\d\b/.test(e))).toBe(true);
   });
 });
 
@@ -362,7 +513,8 @@ describe('runPwaTest — project-local state', () => {
     expect(existsSync(stateFile)).toBe(true);
     const parsed = JSON.parse(readFileSync(stateFile, 'utf8'));
     expect(parsed.mode).toBe('static');
-    expect(parsed.nexusPort).toBe(31415);
+    expect(parsed.nexusPort).toBeGreaterThanOrEqual(31450);
+    expect(parsed.nexusPort).toBeLessThanOrEqual(31499);
     expect(parsed.https).toBe(false);
   });
 

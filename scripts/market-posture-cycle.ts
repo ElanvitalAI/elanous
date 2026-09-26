@@ -20,10 +20,11 @@ import { join } from 'node:path';
 import { latestRegimeVector, openRegimeDb } from '../src/domains/regime-store.js';
 import type { RegimeVector } from '../src/domains/regime-synth.js';
 import {
-  deriveMarketPosture,
-  type DeriveMarketPostureInput, type ThreatDriver, type TripwireInputs,
+  deriveMarketPosture, progressiveDefcon, tripwireDefcon, normalizeLeveragedReturn, DEFAULT_DEFCON_THRESHOLDS,
+  type DeriveMarketPostureInput, type MarketPosture, type ThreatDriver, type TripwireInputs,
 } from '../src/domains/market-posture.js';
-import { publishMarketPosture, type PublishResult } from '../src/domains/market-posture-store.js';
+import { loadMarketPosture, publishMarketPosture, type PublishResult } from '../src/domains/market-posture-store.js';
+import { debug, redactSecretText } from '../src/debug/log.js';
 import { decideLeverage, type LeveragePlan } from '../src/domains/capstone-leverage.js';
 import type { CapstoneTarget } from '../src/domains/capstone-signals.js';
 
@@ -73,6 +74,7 @@ export interface MarketPostureCycleDeps {
   readEmergency?: () => TripwireInputs | null;
   now?: () => number;
   publish?: (posture: ReturnType<typeof deriveMarketPosture>) => PublishResult;
+  load?: () => MarketPosture | null;
 }
 
 /** 입력 조립(순수·dep 주입) — regime+capstone+emergency 융합 → DeriveMarketPostureInput. */
@@ -104,13 +106,66 @@ export function assembleMarketPostureInput(regime: RegimeVector, deps: MarketPos
 
 export interface MarketPostureCycleResult { published: boolean; defcon?: number; note: string; }
 
+function postureLog(event: string, data: unknown, warn = false): void {
+  try { debug.log('posture.defcon', event, data, warn ? { level: 'warn' } : undefined); }
+  catch { /* 관측 실패가 산정·게시를 막지 않는다. */ }
+}
+
 /** 생산자 사이클 — regime+capstone+emergency 융합 → derive → publish(단일 canonical sink). */
 export function runMarketPostureCycle(deps: MarketPostureCycleDeps = {}): MarketPostureCycleResult {
   const regime = (deps.loadRegime ?? defaultLoadRegime)();
-  if (!regime) return { published: false, note: 'regime.db 최신 벡터 없음 — posture 미산정(입력 결측·게시 스킵)' };
+  if (!regime) {
+    postureLog('skipped', { reason: 'regime-missing' });
+    return { published: false, note: 'regime.db 최신 벡터 없음 — posture 미산정(입력 결측·게시 스킵)' };
+  }
   const input = assembleMarketPostureInput(regime, deps);
   const posture = deriveMarketPosture(input);
+  // Before publication: the canonical/last-good reader is the source of the previous value.
+  let previousDefcon: MarketPosture['defcon'] | null = null;
+  try { previousDefcon = (deps.load ?? loadMarketPosture)()?.defcon ?? null; }
+  catch { /* 관측용 이전값 읽기 실패는 게시를 막지 않는다. */ }
+  const changed = previousDefcon !== null && previousDefcon !== posture.defcon;
+  let cause: 'tripwire' | 'drivers' = 'drivers';
+  let tripwires: Array<{ type: string; name?: string; value?: number }> = [];
+  try {
+    const thresholds = { ...DEFAULT_DEFCON_THRESHOLDS, ...input.thresholds };
+    cause = tripwireDefcon(input.tripwire, thresholds) < progressiveDefcon(input.drivers, thresholds)
+      ? 'tripwire' : 'drivers';
+    const tw = input.tripwire;
+    tripwires = [
+      ...(tw?.indices ?? []).filter(index => index.circuitBreaker ||
+        (Number.isFinite(index.dayReturn) && index.dayReturn <= thresholds.indexLevel2)).map(index => ({
+        type: 'index', name: redactSecretText(index.symbol), value: index.dayReturn,
+      })),
+      ...(tw?.spots ?? []).filter(spot => Number.isFinite(spot.dayReturn) && spot.dayReturn <= thresholds.spotLevel2)
+        .map(spot => ({ type: 'spot', name: redactSecretText(spot.symbol), value: spot.dayReturn })),
+      ...(tw?.leveragedEtfs ?? []).filter(etf => {
+        const equivalent = normalizeLeveragedReturn(etf.dayReturn, etf.leverage);
+        return Number.isFinite(equivalent) && equivalent <= thresholds.leverageEquivalentLevel2 + 1e-9;
+      }).map(etf => ({
+        type: 'leveragedEtf', name: redactSecretText(etf.symbol),
+        value: normalizeLeveragedReturn(etf.dayReturn, etf.leverage),
+      })),
+      ...(tw?.futures ?? []).filter(future => future.limitDown || future.gapDown)
+        .map(future => ({ type: 'future', name: redactSecretText(future.symbol) })),
+      ...(tw?.systemCrisis ? [{ type: 'systemCrisis' }] : []),
+    ];
+  } catch { /* 관측용 원인·트립와이어 투영 실패는 게시를 막지 않는다. */ }
+  try {
+    postureLog('computed', {
+      defcon: posture.defcon, previousDefcon, changed,
+      regimeLabel: redactSecretText(regime.regimeLabel),
+      drivers: (input.drivers ?? []).map(d => ({ name: redactSecretText(d.key), value: d.contribution, weight: d.weight })),
+      tripwires,
+      freshness: input.freshness,
+    });
+  } catch { /* 관측용 페이로드 실패는 게시를 막지 않는다. */ }
   const r = (deps.publish ?? publishMarketPosture)(posture);
+  if (r?.ok && changed) postureLog('changed', { from: previousDefcon, to: posture.defcon, cause });
+  if (!r?.ok) {
+    try { postureLog('publish-rejected', { reason: redactSecretText(r?.reason ?? '알 수 없음') }, true); }
+    catch { /* 관측용 사유 투영 실패는 결과를 바꾸지 않는다. */ }
+  }
   return {
     published: !!r?.ok, defcon: posture.defcon,
     note: r?.ok
@@ -126,6 +181,10 @@ function defaultLoadRegime(): RegimeVector | null {
 
 // CLI 진입 — 크론이 직접 실행(scripts/market-posture-cycle.ts). import 시엔 실행 안 함.
 if (import.meta.main) {
+  try {
+    const { registerStandaloneLogSink } = await import('../src/domains/standalone-log-sink.js');
+    await registerStandaloneLogSink('market-posture-cycle');
+  } catch { /* 로그 싱크 장애는 사이클을 막지 않는다. */ }
   // ★ 루프 에이전트 자기등록(대표 2026-07-16 점검) — DEFCON 국면 감시 루프(autonomous 생산자)를
   //   loop-agent-registry 에 매 실행 자기등록(계약루프 패턴 동일). 부팅마다 supersede·좀비 감지·
   //   elanous loops 자산 원장 신선. 미션(apm)·크론(schedule id) 귀속. fail-soft(등록 실패가 사이클 안 막음).

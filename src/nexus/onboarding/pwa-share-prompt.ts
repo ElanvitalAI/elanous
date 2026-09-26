@@ -156,17 +156,26 @@ export async function runPwaSharePrompt(
  *  responsible for prompting the user / running `sudo -v` ahead.
  *  The external signature is kept so existing callers in
  *  `pwa-start` / `pwa-share` and their tests do not move. */
-export async function defaultServe(binary: string, port: number): Promise<{ exitCode: number }> {
+export type ServeMountResult = { exitCode: number; ladderExhausted?: boolean };
+
+async function serveViaMount(
+  binary: string,
+  port: number,
+  useSudo: true | undefined,
+): Promise<ServeMountResult> {
   const { mountTailscaleServe } = await import('../../cli/tailscale-serve.js');
   // The unified helper expects to discover the binary via probe; we
   // already have the binary path from the caller (pwa-start /
   // pwa-share probe earlier). Inject the binary as a no-op probe so
   // the helper doesn't repeat the discovery — keeps the contract
   // exactly the same as the legacy execFile call.
+  // `useSudo` is omitted when undefined so mountTailscaleServe's own
+  // ladder runs: no sudo first, then `sudo -n` once on permission failure.
+  // `false` is never passed — that would drop the sudo retry.
   const res = await mountTailscaleServe({
     mode: { kind: 'tls-tcp', port },
     upstreamPort: port,
-    useSudo: true,
+    ...(useSudo === undefined ? {} : { useSudo }),
     probeFn: async () => ({
       installed: true,
       alive: true,
@@ -175,12 +184,24 @@ export async function defaultServe(binary: string, port: number): Promise<{ exit
       binary,
     }),
   });
-  if (res.ok) return { exitCode: 0 };
+  if (res.ok) return { exitCode: 0, ladderExhausted: false };
+  if (res.reason === 'sudo-required') return { exitCode: 1, ladderExhausted: true };
   if (res.reason === 'serve-cmd-failed') {
     // Best-effort exit-code recovery from `detail` (which carries
     // stderr in the legacy contract callers consume).
     const m = /exit (\d+)/.exec(res.detail ?? '');
-    return { exitCode: m ? Number.parseInt(m[1]!, 10) : 1 };
+    return { exitCode: m ? Number.parseInt(m[1]!, 10) : 1, ladderExhausted: false };
   }
   return { exitCode: 1 };
+}
+
+export async function defaultServe(binary: string, port: number): Promise<ServeMountResult> {
+  return serveViaMount(binary, port, true);
+}
+
+/** Daemon auto-mount. Leaves `useSudo` undefined so the existing
+ *  ladder tries without sudo first and `sudo -n` only once on a
+ *  permission failure. Manual paths stay on `defaultServe`. */
+export async function autoServe(binary: string, port: number): Promise<ServeMountResult> {
+  return serveViaMount(binary, port, undefined);
 }

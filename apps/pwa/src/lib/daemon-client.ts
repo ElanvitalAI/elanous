@@ -13,6 +13,7 @@
  * frame protocol so the / page keeps working unchanged.
  */
 
+import { reportAuthRequired } from './auth-required';
 import { buildAcpWsUrl, buildVoiceWsUrl, type DaemonConfig } from './daemon-config';
 import { debugLog } from './debug';
 import {
@@ -369,10 +370,12 @@ export class DaemonClient {
    *  helper 밖에 없어서 그 목록이 통째로 버려졌고 위젯이 죽은 껍데기가 됐다.
    *  ⇒ URL 조립과 인증은 여전히 «이 한 집»에 있고, 머리를 읽어야 하는 쪽만 이 문으로 온다. */
   async fetchResponse(path: string, init?: RequestInit): Promise<Response> {
-    return fetch(this.url(path), {
+    const res = await fetch(this.url(path), {
       ...init,
       headers: { ...this.authHeaders(), ...(init?.headers ?? {}) },
     });
+    if (res.status === 401) reportAuthRequired(path);
+    return res;
   }
 
   async fetchJson<T = unknown>(path: string, init?: RequestInit): Promise<T> {
@@ -402,6 +405,7 @@ export class DaemonClient {
       headers: { 'content-type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify(req),
     });
+    if (res.status === 401) reportAuthRequired('/v1/prompt');
     if (!res.ok) throw new Error(`prompt ${res.status}: ${await res.text()}`);
     return res.json() as Promise<PromptResponse>;
   }
@@ -445,6 +449,7 @@ export class DaemonClient {
     void (async () => {
       try {
         const res = await fetch(url, init);
+        if (res.status === 401) reportAuthRequired('/v1/chat/events');
         if (!res.ok || !res.body) {
           handlers.onError?.({
             error: 'observer_failed',
@@ -511,6 +516,7 @@ export class DaemonClient {
           headers: { accept: 'text/event-stream', ...this.authHeaders() },
           signal: ac.signal,
         });
+        if (res.status === 401) reportAuthRequired('/v1/events');
         if (!res.ok || !res.body) {
           handlers.onError?.({
             error: 'agent_status_failed',
@@ -556,6 +562,7 @@ export class DaemonClient {
           headers: { accept: 'text/event-stream', ...this.authHeaders() },
           signal: ac.signal,
         });
+        if (res.status === 401) reportAuthRequired('/v1/events');
         if (!res.ok || !res.body) {
           handlers.onError?.({
             error: 'hud_segment_failed',
@@ -612,6 +619,7 @@ export class DaemonClient {
           headers: { accept: 'text/event-stream', ...this.authHeaders() },
           signal: ac.signal,
         });
+        if (res.status === 401) reportAuthRequired('/v1/events');
         if (!res.ok || !res.body) {
           const message = `${res.status}: ${await res.text()}`;
           handlers.agentStatus.onError?.({ error: 'agent_status_failed', message });
@@ -664,6 +672,7 @@ export class DaemonClient {
       ? '/v1/prompt/stream?debug-tap=on'
       : '/v1/prompt/stream';
     const res = await fetch(this.url(path), init);
+    if (res.status === 401) reportAuthRequired(path);
     if (!res.ok || !res.body) {
       throw new Error(`prompt/stream ${res.status}: ${await res.text()}`);
     }
@@ -774,6 +783,7 @@ export class DaemonClient {
       headers: { 'content-type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify({ action }),
     });
+    if (res.status === 401) reportAuthRequired(`/v1/terminals/${safe}/control`);
     let body: unknown;
     try {
       body = await res.json();
@@ -813,6 +823,7 @@ export class DaemonClient {
       headers: { 'content-type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify({ name }),
     });
+    if (res.status === 401) reportAuthRequired(`/v1/terminals/${safe}/rename`);
     let body: unknown;
     try {
       body = await res.json();
@@ -964,6 +975,7 @@ export class DaemonClient {
     };
     if (handlers.signal) init.signal = handlers.signal;
     const res = await fetch(this.url('/v1/agent-cli/prompt'), init);
+    if (res.status === 401) reportAuthRequired('/v1/agent-cli/prompt');
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       throw new Error(`agent-cli/prompt ${res.status}: ${detail}`);
@@ -1212,6 +1224,7 @@ export class DaemonClient {
       method: 'GET',
       headers: { ...this.authHeaders() },
     });
+    if (res.status === 401) reportAuthRequired('/v1/llm/models');
     if (!res.ok) {
       return { models: [], error: `http-${res.status}` };
     }
@@ -1266,6 +1279,7 @@ export class DaemonClient {
       headers: { ...this.authHeaders() },
       body: form,
     });
+    if (res.status === 401) reportAuthRequired('/v1/audio/stt');
     if (!res.ok) {
       let detail = '';
       try { detail = await res.text(); } catch { /* ignore */ }
@@ -1297,6 +1311,7 @@ export class DaemonClient {
       headers: { 'content-type': 'application/json', ...this.authHeaders() },
       body: JSON.stringify(body),
     });
+    if (res.status === 401) reportAuthRequired('/v1/showroom/role-judge');
     if (!res.ok) {
       throw new Error(`role-judge http ${res.status}`);
     }

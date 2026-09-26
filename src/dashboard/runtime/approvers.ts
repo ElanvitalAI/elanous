@@ -204,7 +204,6 @@ export function createCodeEditApprover(): (req: CodeEditApprovalRequest) => Prom
       }, {
         cols,
         syntax: false,
-        cache: true,
         headerStyle: 'edited',
       });
       detail = [

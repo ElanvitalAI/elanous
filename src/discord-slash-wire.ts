@@ -21,6 +21,7 @@ import { makeCommandRest } from './discord/slash-registry.js';
 import { normalizeInteractionPayload } from './discord/slash-router.js';
 import type { SlashCommandSchema } from './discord/slash-types.js';
 import { debug } from './debug/log.js';
+import { resolveChannelBotToken } from './channel-bot-token.js';
 
 const REST_BASE = 'https://discord.com/api/v10';
 
@@ -111,7 +112,7 @@ export interface DiscordSlashWire {
 export function buildDiscordSlashWire(deps: DiscordSlashWireDeps): DiscordSlashWire {
   const log = deps.log ?? ((m: string): void => { console.log(m); });
   const fetchImpl = deps.__fetchImpl ?? fetch;
-  const token = deps.userConfig.discord.botToken?.trim() ?? '';
+  const token = resolveChannelBotToken('discord', deps.userConfig)?.token.trim() ?? '';
 
   async function registerCommands(): Promise<void> {
     if (!token) { log('[slash] no bot token — skip registration'); return; }

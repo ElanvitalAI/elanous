@@ -32,6 +32,7 @@ type AbandonedClassification =
   | 'report-deficit'
   | 'goal-unconvergeable-candidate'
   | 'contract-conflict'
+  | 'run-deadline-exceeded'
   | 'quota-exhausted'
   | 'provider-error'
   | 'credential-failure'
@@ -45,6 +46,7 @@ const ABANDONED_CLASSIFICATIONS = new Set<AbandonedClassification>([
   'report-deficit',
   'goal-unconvergeable-candidate',
   'contract-conflict',
+  'run-deadline-exceeded',
   'quota-exhausted',
   'provider-error',
   'credential-failure',
@@ -79,6 +81,10 @@ export const CLASSIFICATION_HINTS: Record<AbandonedClassification, { system: str
   'contract-conflict': {
     system: '계약 충돌 다발 — goal 계약·하니스 정책의 상충을 점검.',
     goal: '계약 충돌 단발 — 해당 goal의 상충하는 수용 기준을 정정.',
+  },
+  'run-deadline-exceeded': {
+    system: '수명 상한 사망 다발 — 브랜치/PR 이 있으면 수확하고, 없으면 골을 재분해한다. 할당량 소진으로 읽지 않는다.',
+    goal: '수명 상한 사망 단발 — 산출이 있으면 수확하고, 없으면 그 골을 재분해한다.',
   },
   'quota-exhausted': {
     system: '쿼터 소진 다발 — provider 회전·용량 정책을 점검.',

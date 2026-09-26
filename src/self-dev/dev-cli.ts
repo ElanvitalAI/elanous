@@ -41,7 +41,8 @@ import type { SelfImplementResult } from '../self-implement/orchestrator.js';
 import { buildDeliverableTargets } from './deliverable-target-wiring.js';
 import { observeDeliverables, type DeliverableObservationResult, type DeliverableObservationTarget } from '../harness/deliverable-observation.js';
 import { debug } from '../debug/log.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig, type UserConfig } from '../user-config.js';
+import { resolveChildLlmPreference, type ChildLlmPreferenceInput, type ResolvedChildLlmPreference } from '../self-implement/child-llm-preference.js';
 import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
 import { queryAbandonedDraftPrs, type AbandonedDraftPr } from '../cli/logs-abandoned-draft-prs.js';
 import { resolveLogTargets } from '../cli/logs-cli.js';
@@ -111,7 +112,6 @@ export interface DevCliOpts {
   childLlmModel?: string;
   childLlmEffort?: string;
   roleLlm?: string[];
-  graph?: boolean;
   correlation?: string;
   parentCorrelationId?: string;
   evidence?: string;
@@ -1442,53 +1442,58 @@ export function defaultChildLlmModel(provider: string): string {
 
 export type ChildLlmConfigSnapshot = { provider?: string; model?: string };
 
-function requireChildLlmConfigObject(value: unknown, field: 'tools' | 'selfImplement' | 'childLlm'): Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new DevPipelineError(
-      field === 'childLlm'
-        ? 'tools.selfImplement.childLlm 형식 오류: object 여야 합니다'
-        : `tools.selfImplement.childLlm 형식 오류: ${field} 는 object 여야 합니다`,
-    );
-  }
-  return value as Record<string, unknown>;
+/** 해석된 선호를 발사 관측에 남긴다. chain 은 provider 이름만. 파일 안에서만 쓴다. */
+function logResolvedChildLlmPreference(resolved: ResolvedChildLlmPreference): void {
+  debug.log('harness.child-llm-preference', 'resolved', {
+    mode: resolved.mode,
+    chain: resolved.chain.map((entry) => entry.provider),
+    source: resolved.source,
+    budgetGate: resolved.budgetGate,
+  });
 }
 
-function readChildLlmConfigString(value: unknown, flag: '--child-llm-provider' | '--child-llm-model'): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'string') {
-    throw new DevPipelineError(`${flag} 알 수 없음: ${String(value)}`);
-  }
-  return value;
+/** 발사 인자가 없을 때의 첫 칸. auto 도 지금은 chain[0] — 예산을 보고 고르는 것은 P15.
+ *  provider 없는 칸은 스냅샷이 아니다. model-only 거절은 발사 경계가 따로 한다. */
+function childLlmSnapshotFromPreference(resolved: ResolvedChildLlmPreference): ChildLlmConfigSnapshot | undefined {
+  const first = resolved.chain[0];
+  if (!first?.provider?.trim()) return undefined;
+  return {
+    provider: first.provider,
+    ...(first.model !== undefined ? { model: first.model } : {}),
+  };
 }
 
-/** 실제 설정을 읽는 기본 리더. 전역 `llm.provider` 는 부모 축이라 여기 쓰지 않는다.
- *  부재만 `undefined`. 읽기 실패·잘못된 타입은 조용히 접지하지 않고 거절한다. */
+/** 파싱된 설정을 그대로 해석 입력으로 쓴다. raw 재검사는 하지 않는다 —
+ *  buildUserConfig 가 경고 후 버린 값을 다시 읽어 발사를 막지 않기 위해서다. */
+function childLlmPreferenceInputFromUserConfig(config: UserConfig): ChildLlmPreferenceInput {
+  return config;
+}
+
+/** 기존 `{ model }` 만 있는 고정 설정. mode 는 auto 로 남기고, 발사만 종전 문면으로 거절한다. */
+function rejectModelOnlyChildLlmConfig(config: UserConfig): void {
+  const childLlm = config.tools.selfImplement.childLlm;
+  if (childLlm?.model !== undefined && !childLlm.provider?.trim() && !childLlm.mode && !(childLlm.chain && childLlm.chain.length > 0)) {
+    throw new DevPipelineError('--child-llm-provider 필요(--child-llm-model과 함께)');
+  }
+}
+
+/** 실제 설정을 해석 함수로 읽는다. 전역 `llm.provider` 는 부모 축이라 여기 쓰지 않는다.
+ *  부재·빈 사슬·버린 비객체 설정은 `undefined`(기본으로 발사). 읽기 실패는 조용히 접지하지 않고 거절한다. */
 export function readChildLlmConfigFromUserConfig(): ChildLlmConfigSnapshot | undefined {
-  let raw: Record<string, unknown>;
+  const read = () => getUserConfig();
+  let config: UserConfig;
   try {
-    raw = getUserConfig().raw;
+    config = read();
   } catch (err) {
     if (err instanceof DevPipelineError) throw err;
     throw new DevPipelineError(
       `tools.selfImplement.childLlm 읽기 실패: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-  const tools = raw.tools;
-  if (tools === undefined) return undefined;
-  const toolsObj = requireChildLlmConfigObject(tools, 'tools');
-  const selfImplement = toolsObj.selfImplement;
-  if (selfImplement === undefined) return undefined;
-  const selfImplementObj = requireChildLlmConfigObject(selfImplement, 'selfImplement');
-  const childLlm = selfImplementObj.childLlm;
-  if (childLlm === undefined) return undefined;
-  const snapshot = requireChildLlmConfigObject(childLlm, 'childLlm');
-  const provider = readChildLlmConfigString(snapshot.provider, '--child-llm-provider');
-  const model = readChildLlmConfigString(snapshot.model, '--child-llm-model');
-  if (provider === undefined && model === undefined) return undefined;
-  return {
-    ...(provider !== undefined ? { provider } : {}),
-    ...(model !== undefined ? { model } : {}),
-  };
+  rejectModelOnlyChildLlmConfig(config);
+  const resolved = resolveChildLlmPreference(childLlmPreferenceInputFromUserConfig(config));
+  logResolvedChildLlmPreference(resolved);
+  return childLlmSnapshotFromPreference(resolved);
 }
 
 function resolveChildLlmFromParts(
@@ -1516,9 +1521,13 @@ function resolveChildLlmFromParts(
 }
 
 export function buildChildLlmSelection(
-  opts: Pick<DevCliOpts, 'childLlmProvider' | 'childLlmModel' | 'childLlmEffort'>,
+  opts: Pick<DevCliOpts, 'childLlmProvider' | 'childLlmModel' | 'childLlmEffort'> & {
+    /** 발사 인자가 있을 때 관측용 선호를 읽는다. 없으면 getUserConfig. 기존 두 인자 시그니처는 그대로다. */
+    readPreference?: () => UserConfig;
+  },
   readChildLlmConfig: () => ChildLlmConfigSnapshot | undefined = readChildLlmConfigFromUserConfig,
 ): ChildLlmSelection | undefined {
+  const readResolvedPreference = opts.readPreference ?? (() => getUserConfig());
   const provider = opts.childLlmProvider;
   const model = opts.childLlmModel;
   const hasFlag = provider !== undefined || model !== undefined || opts.childLlmEffort !== undefined;
@@ -1533,6 +1542,9 @@ export function buildChildLlmSelection(
   };
   if (hasFlag) {
     const selected = resolveChildLlmFromParts(provider, model, 'flag');
+    if (selected) {
+      try { logResolvedChildLlmPreference(resolveChildLlmPreference(childLlmPreferenceInputFromUserConfig(readResolvedPreference()))); } catch { /* 관측이 발사를 막지 않는다 */ }
+    }
     return selected ? withEffort(selected) : undefined;
   }
   const configured = readChildLlmConfig();
@@ -1784,7 +1796,12 @@ export function buildDevCliSpec(
   if (opts.base !== undefined) Object.defineProperty(spec, 'baseExplicit', { value: true, enumerable: true });
   if (supportsCompletion && completion !== undefined) {
     spec.completion = completion;
-    spec.completionSource = 'request';
+    // ⛔ 출처는 «사람이 친 플래그»일 때만 request 다(2026-09-26 베어 Ubuntu 26.04 실측 · UX 15′).
+    //   TUI `/harness ask` 의 분리 발사(`dev --file`)는 아무 플래그도 안 쳤는데 request 로 찍혀, 원격 없는 저장소의
+    //   «워크트리로 자동 강등»(`resolveTargetRemoteCompletion`)이 안 걸리고 거부됐다. 목록이 없으면(프로그램 호출) 종전대로 request.
+    const typed = explicitOptionNames === undefined
+      || explicitOptionNames.some((name) => name === 'autoMerge' || name === 'openPr');
+    spec.completionSource = typed ? 'request' : 'default';
   }
   if (path === 'plan-staged') return { ...spec, plan: true };
   if (path === 'elanous-tui') {
@@ -1833,7 +1850,7 @@ export function buildDevCliSpec(
   }
 
   if (path === 'self-mission') {
-    const childLlm = buildChildLlmSelection(opts);
+    const childLlm = buildChildLlmSelection({ ...opts, readPreference: () => getUserConfig() });
     // 잔량 조회(약 3초)는 한 발사에 한 번만 — 자식·부모가 같은 값을 쓴다.
     let grokQuotaOnce: ReturnType<typeof readCachedGrokQuota> | undefined;
     const readGrokQuotaOnce = () => (grokQuotaOnce ??= readGrokQuota());
@@ -1845,7 +1862,6 @@ export function buildDevCliSpec(
       ...(opts.draft === false ? { draft: false } : {}),
       ...(childLlm ? { childLlm } : {}),
       ...(opts.correlation !== undefined ? { correlationId: opts.correlation } : {}),
-      ...(opts.graph !== undefined ? { graphAuthoritative: opts.graph } : {}),
       ...(opts.maxWait !== undefined ? { maxWaitSec: parsePositiveInt(opts.maxWait, '--max-wait') } : {}),
       ...(opts.activityGrace !== undefined ? { activityGraceSec: parseActivityGraceSec(opts.activityGrace) } : {}),
       ...(opts.ground !== undefined ? { ground: opts.ground } : {}),

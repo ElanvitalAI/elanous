@@ -1771,15 +1771,8 @@ export interface ShowDashboardOptions {
    *  (resolved in `main()`). Tool dispatch + history live on the
    *  daemon side; the local TUI is a thin client. */
   remote?: { url: string; token?: string; label?: string };
-  /** M1.5 A.3 — local daemon counterpart of `remote`. When set, the
-   *  dashboard's ACP session attaches to a running local daemon over
-   *  unix socket instead of booting an in-process server. Driven by
-   *  `ELANOUS_USE_DAEMON=1` env (resolved in `main()`). `ELANOUS_NO_DAEMON=1`
-   *  force-disables even when a daemon is alive. `remote` (above)
-   *  takes precedence when both are somehow set. */
-  localDaemon?: { socketPath: string };
-  /** Tier 1 daemon-resume — when set together with `remote` /
-   *  `localDaemon`, the dashboard attaches to this existing
+  /** Tier 1 daemon-resume — when set together with `remote`,
+   *  the dashboard attaches to this existing
    *  daemon-side sessionId instead of minting a new one. The boot
    *  also fetches the session's prior turns via REST (when an HTTP
    *  endpoint is reachable, derived from `remote.url`) and replays
@@ -2979,12 +2972,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     browserMode?: 'all' | 'files' | 'turns',
   ): Promise<boolean> => {
     const diffCfg = getUserConfig().chat.rendering.diff;
-    if (!diffCfg.turnBrowser) {
-      pushDebugLine(C.muted('  source delta browser disabled by chat.rendering.diff.turnBrowser=false'));
-      chatScrollOffset = -1;
-      draw();
-      return false;
-    }
     const { getSourceDeltaManager, createSourceDeltaBrowserPopup } = await import('../code-edit/index.js');
     const turns = mode === 'latest'
       ? getSourceDeltaManager().recentTurns(1)
@@ -4368,9 +4355,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         cols: termSize().cols,
         syntax: true,
         colorTier: diffRendering.colorTier,
-        adaptiveBg: diffRendering.adaptiveBg,
-        syntaxPerHunk: diffRendering.syntaxPerHunk,
-        cache: diffRendering.cache,
         headerStyle: diffRendering.headerStyle,
       })
         .then((rows) => {
@@ -17416,7 +17400,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     acpPtyAvailable = (await import('../pty-shell/registry.js')).ptyAvailable;
     const dashboardAcpBootResult = await bootDashboardAcpSession({
         ...(opts.remote ? { remote: opts.remote } : {}),
-        ...(opts.localDaemon ? { localDaemon: opts.localDaemon } : {}),
         ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
         getCwd: () => getSessionCwd(),
         getChatHistory: () => chat.history,
@@ -17630,18 +17613,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     try { acpSessionIdRef.current = dashboardAcpSession.currentSessionId ?? null; } catch { /* 없으면 넣지 않는다 */ }
     pushDebugLine(C.muted('[acp-boot] dashboard ACP session ready'));
     // User-visible mode indicator. Without this, a user who set
-    // ELANOUS_REMOTE / ELANOUS_USE_DAEMON has no way to tell whether the
-    // Attach actually succeeded — attached daemon modes are useful
+    // ELANOUS_REMOTE has no way to tell whether the
+    // attach actually succeeded — the attached daemon mode is useful
     // chat transcript context, but the local in-process fallback is
     // runtime plumbing and belongs in the debug log instead.
     if (opts.remote) {
       const authNote = opts.remote.token ? 'token' : 'no-auth';
       const labelNote = opts.remote.label ? ` · ${opts.remote.label}` : '';
       chatLines.push(C.success(`  ✓ attached to remote daemon: ${opts.remote.url} (${authNote})${labelNote}`));
-    } else if (opts.localDaemon) {
-      chatLines.push(C.success(`  ✓ attached to local daemon: ${opts.localDaemon.socketPath}`));
     } else {
-      pushDebugLine(C.muted('  in-process ACP (no daemon attach · set ELANOUS_REMOTE or ELANOUS_USE_DAEMON to attach)'));
+      pushDebugLine(C.muted('  in-process ACP (no daemon attach · set ELANOUS_REMOTE to attach)'));
     }
     // Tier 1 daemon-resume status. Three branches:
     //   - resumed: attachExisting succeeded · the daemon's prior
@@ -17655,9 +17636,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     if (dashboardAcpBootResult.mode === 'resumed' && dashboardAcpBootResult.sessionId) {
       const sid = dashboardAcpBootResult.sessionId;
       chatLines.push(C.success(`  ✓ resumed daemon session: ${sid}`));
-      // Best-effort REST history replay — only the remote (HTTP/WS)
-      // path has a derivable HTTP base. Local-daemon (unix socket)
-      // can't fetch over REST today; that's a follow-up.
+      // Best-effort REST history replay over the remote HTTP/WS endpoint.
       if (opts.remote) {
         const httpBase = deriveDaemonHttpBase(opts.remote.url);
         if (httpBase) {
@@ -17693,8 +17672,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             chatLines.push(C.muted(`    no prior turns found for ${sid}.`));
           }
         }
-      } else {
-        chatLines.push(C.muted('    (history replay over unix socket is a follow-up — REST endpoint required)'));
       }
     } else if (dashboardAcpBootResult.mode === 'new' && dashboardAcpBootResult.resumeFallbackReason) {
       // The user asked to resume but the daemon rejected the id —
@@ -17704,7 +17681,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       const reason = dashboardAcpBootResult.resumeFallbackReason;
       const newId = dashboardAcpBootResult.sessionId ?? '(unknown)';
       chatLines.push(C.warning(`  ⚠ resume failed (${reason}); started new session: ${newId}`));
-    } else if (opts.resumeSessionId && !opts.remote && !opts.localDaemon) {
+    } else if (opts.resumeSessionId && !opts.remote) {
       // Match `/session load <prefix>` for in-process boot: resolve the
       // local prefix, preserve the stock system prompt, and attach the
       // restored session for subsequent persistence.
@@ -19800,7 +19777,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
               compact: {
                 getHistory: () => chat.history as unknown as { role: string; [k: string]: unknown }[],
-                compactBoundaryEnabled: () => getUserConfig().chat.rendering.compactBoundary.enabled,
               },
               skill: {
                 triggersSlashRuntime: skillTriggersSlashRuntime,
@@ -20262,9 +20238,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               sessionSlash: {
                 remoteDaemon: () => opts.remote
                   ? { url: opts.remote.url, token: opts.remote.token }
-                  : null,
-                localDaemon: () => opts.localDaemon
-                  ? { socketPath: opts.localDaemon.socketPath }
                   : null,
                 acpSwapTo: (sessionId, cwd) => dashboardAcpSession.swapTo(sessionId, cwd),
               },
@@ -21151,7 +21124,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 userMsg: userMsg as ChatMessage,
                 model: inspectActiveProvider().model,
                 autoCompactConfig: userConfig.chat.autoCompact,
-                compactBoundaryEnabled: userConfig.chat.rendering.compactBoundary.enabled,
                 shouldAutoCompact,
                 compactConversation: async (history) => compactConversation(history),
                 compactConversationPartial: async (history, opts) => compactConversationPartial(history, opts),
@@ -21314,7 +21286,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             },
             runCodeEditPostTurn: async () => {
               await runDashboardCodeEditPostTurn({
-                turnSummaryEnabled: getUserConfig().chat.rendering.diff.turnSummary,
                 pushChatLine: (line) => { chatLines.push(line); },
                 setChatScrollBottom: () => { chatScrollOffset = -1; },
                 importCodeEdit: () => import('../code-edit/index.js'),

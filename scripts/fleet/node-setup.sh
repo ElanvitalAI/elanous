@@ -56,16 +56,50 @@ elif [ $CHECK = 1 ]; then todo "k3d 설치"
 else R 'brew install k3d >/tmp/fleet-k3d.log 2>&1' && ok "k3d (설치)" || bad "k3d 설치 실패"; fi
 # 6. 클러스터 elanous-pool — API 를 0.0.0.0:<포트> 로 · 인증서 SAN = 호스트 이름 ⊕ tailnet 이름
 TSNAME="$(R '(tailscale status --self --json 2>/dev/null || /Applications/Tailscale.app/Contents/MacOS/Tailscale status --self --json 2>/dev/null) | python3 -c "import json,sys;print(json.load(sys.stdin)[\"Self\"][\"DNSName\"].rstrip(\".\"))"' 2>/dev/null)"
+# 5b. 노드 로컬 레지스트리 — 델타 판올림(대표 2026-09-26): 원격 빌드가 여기로 push 하면 «없는 층만» 올라가고
+#     Pod 는 커밋 태그로 pull 한다(종전 `k3d image import` 는 4GB 전체를 클러스터 저장소로 매번 복사했다).
+REGISTRY="${ELANOUS_FLEET_REGISTRY:-elanous-registry}"; REG_PORT="${ELANOUS_FLEET_REGISTRY_PORT:-5050}"
+# ⛔ 레지스트리는 노드의 «루프백»에만 연다 — 🩸 2026-09-26: `0.0.0.0:5050` 이라 tailnet 의 누구든 인증 없이 목록·푸시가 됐다
+#   (Pod 는 커밋 태그로 pull 하므로 그 태그를 덮으면 곧 공급망 위험). 노드 안 빌드는 localhost 로 푸시하고, 클러스터는 docker 내부 이름으로 받는다.
+REG_BIND="$(R "docker port k3d-$REGISTRY 5000/tcp" 2>/dev/null | head -1)"
+if [ -n "$REG_BIND" ] && [ "${REG_BIND#127.0.0.1:}" != "$REG_BIND" ]; then ok "레지스트리 k3d-$REGISTRY :$REG_PORT (루프백)"
+elif [ -n "$REG_BIND" ] && [ $CHECK = 1 ]; then bad "레지스트리 k3d-$REGISTRY 가 $REG_BIND 에 열려 있다 — 루프백으로 다시 만들어야 한다"
+elif [ -n "$REG_BIND" ]; then R "k3d registry delete $REGISTRY >/dev/null 2>&1; k3d registry create $REGISTRY --port 127.0.0.1:$REG_PORT >/tmp/fleet-registry.log 2>&1 && (docker network connect k3d-$CLUSTER k3d-$REGISTRY 2>/dev/null || true)" && ok "레지스트리 k3d-$REGISTRY 를 루프백으로 다시 만들었다(이미지는 다음 동기화에서 다시 푸시)" || { bad "레지스트리 재생성 실패 — 원격 /tmp/fleet-registry.log"; exit 1; }
+elif [ $CHECK = 1 ]; then todo "레지스트리 k3d-$REGISTRY :$REG_PORT 생성(루프백)"
+else R "k3d registry create $REGISTRY --port 127.0.0.1:$REG_PORT >/tmp/fleet-registry.log 2>&1" && ok "레지스트리 k3d-$REGISTRY :$REG_PORT (생성 · 루프백)" || { bad "레지스트리 생성 실패 — 원격 /tmp/fleet-registry.log"; exit 1; }
+# ⛔ 레지스트리는 클러스터 네트워크에도 붙어 있어야 Pod 가 `k3d-<레지스트리>` 이름을 푼다 — 🩸 2026-09-26: 루프백으로 다시 만든 레지스트리가
+#   `bridge` 에만 붙어 kubelet 이 `lookup k3d-elanous-registry: no such host` → Pod `ImagePullBackOff`(🅕 첫 Pod 사용에서 발견). 멱등.
+[ $CHECK = 1 ] || R "docker network inspect k3d-$CLUSTER >/dev/null 2>&1 && (docker network connect k3d-$CLUSTER k3d-$REGISTRY 2>/dev/null || true)" >/dev/null 2>&1
+fi
+# 클러스터가 그 레지스트리를 쓰나 — 안 쓰면(옛 클러스터) 돌고 있는 Job 이 없을 때만 다시 만든다.
+REG_WIRED=0; R "docker exec k3d-$CLUSTER-server-0 cat /etc/rancher/k3s/registries.yaml 2>/dev/null | grep -q k3d-$REGISTRY" && REG_WIRED=1
+if R "k3d cluster list $CLUSTER" >/dev/null 2>&1 && [ $REG_WIRED = 0 ]; then
+  RUNNING="$(R "KUBECONFIG=\$(k3d kubeconfig write $CLUSTER) kubectl get jobs -A --no-headers 2>/dev/null | grep -vc Complete || true" 2>/dev/null | tail -1)"; RUNNING="${RUNNING:-0}"
+  if [ $CHECK = 1 ]; then todo "클러스터 $CLUSTER 가 레지스트리를 안 쓴다 — 다시 만든다(도는 Job ${RUNNING:-?}개)"
+  elif [ "${RUNNING:-0}" != "0" ]; then bad "클러스터 $CLUSTER 를 다시 만들어야 하는데 도는 Job 이 ${RUNNING}개 — 끝난 뒤 다시"; exit 1
+  else R "k3d cluster delete $CLUSTER >/dev/null 2>&1" && ok "클러스터 $CLUSTER (레지스트리 연결 위해 지움)"; fi
+fi
 if R "k3d cluster list $CLUSTER" >/dev/null 2>&1; then ok "클러스터 $CLUSTER"
-elif [ $CHECK = 1 ]; then todo "클러스터 $CLUSTER 생성($K3S_IMAGE · API :$API_PORT · SAN $HOST ${TSNAME:-})"
+elif [ $CHECK = 1 ]; then todo "클러스터 $CLUSTER 생성($K3S_IMAGE · API :$API_PORT · SAN $HOST ${TSNAME:-} · 레지스트리 k3d-$REGISTRY:$REG_PORT)"
 else
   SAN="--k3s-arg --tls-san=$HOST@server:0"; [ -n "$TSNAME" ] && SAN="$SAN --k3s-arg --tls-san=$TSNAME@server:0"
-  R "k3d cluster create $CLUSTER --image $K3S_IMAGE --no-lb --api-port 0.0.0.0:$API_PORT $SAN --wait --timeout 300s >/tmp/fleet-k3d-create.log 2>&1" && ok "클러스터 $CLUSTER (생성)" || { bad "클러스터 생성 실패 — 원격 /tmp/fleet-k3d-create.log"; exit 1; }
+  R "k3d cluster create $CLUSTER --image $K3S_IMAGE --no-lb --api-port 0.0.0.0:$API_PORT $SAN --registry-use k3d-$REGISTRY:$REG_PORT --wait --timeout 300s >/tmp/fleet-k3d-create.log 2>&1" && ok "클러스터 $CLUSTER (생성 · 레지스트리 k3d-$REGISTRY)" || { bad "클러스터 생성 실패 — 원격 /tmp/fleet-k3d-create.log"; exit 1; }
 fi
 # 7. 이 맥 kubeconfig 에 컨텍스트 pool-<호스트>
-if kubectl config get-contexts -o name 2>/dev/null | grep -qx "$CTX"; then ok "kubeconfig 컨텍스트 $CTX"
-elif [ $CHECK = 1 ]; then todo "kubeconfig 에 $CTX 추가"
+# ⛔ «있다»로 끝내지 않는다 — 클러스터를 다시 만들면 인증서가 바뀌어 옛 컨텍스트가 x509 로 죽는다(2026-09-26 node-b:
+#   monad-pool → elanous-pool 재생성 뒤 «✓ 컨텍스트» 라 말하고 모든 kubectl 이 실패했다). 붙는지까지 잰다.
+CTX_STATE=absent
+if kubectl config get-contexts -o name 2>/dev/null | grep -qx "$CTX"; then
+  if kubectl --context "$CTX" version --request-timeout=8s >/dev/null 2>&1; then CTX_STATE=ok; else CTX_STATE=stale; fi
+fi
+if [ $CTX_STATE = ok ]; then ok "kubeconfig 컨텍스트 $CTX"
+elif [ $CHECK = 1 ]; then todo "kubeconfig 에 $CTX $([ $CTX_STATE = stale ] && echo '갱신(붙지 않는다 — 인증서가 바뀌었다)' || echo '추가')"
 else
+  if [ $CTX_STATE = stale ]; then
+    # 병합은 «앞 파일이 이긴다» — 옛 항목을 먼저 지워야 새 인증서가 들어간다.
+    cp ~/.kube/config ~/.kube/config.bak-fleet-"$HOST"-stale-"$(date +%Y%m%d%H%M%S)"
+    kubectl config delete-context "$CTX" >/dev/null 2>&1; kubectl config delete-cluster "$CTX" >/dev/null 2>&1; kubectl config delete-user "admin@$CTX" >/dev/null 2>&1
+  fi
   TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
   R "k3d kubeconfig get $CLUSTER" > "$TMP/kc.yaml" || { bad "kubeconfig 못 받음"; exit 1; }
   python3 - "$TMP/kc.yaml" "$HOST" "$API_PORT" <<'PY'

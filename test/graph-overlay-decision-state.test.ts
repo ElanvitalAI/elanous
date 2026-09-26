@@ -72,7 +72,6 @@ describe('graph overlay decision observation state', () => {
     await runSelfImplement({
       feature: 'graph overlay observation execution path',
       goalId: 'goal-x',
-      graphAuthoritative: true,
       seams: seams({
         writeRunLedger: (entry) => ledger.push(entry),
       }),

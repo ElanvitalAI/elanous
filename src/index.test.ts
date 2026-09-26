@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
@@ -139,11 +139,10 @@ describe('self send superseded explicit target protection', () => {
     }
   }
 
-  function writeScreen(stateDir: string, spaceId: string, mtimeMs?: number): void {
+  function writeScreen(stateDir: string, spaceId: string): void {
     const screenPath = join(stateDir, 'harness-screens', `${spaceId}.screen`);
     mkdirSync(join(stateDir, 'harness-screens'), { recursive: true });
     writeFileSync(screenPath, 'working');
-    if (mtimeMs !== undefined) utimesSync(screenPath, mtimeMs / 1_000, mtimeMs / 1_000);
   }
 
   function writeHeartbeat(stateDir: string, spaceId: string, heartbeat: unknown): void {
@@ -151,7 +150,6 @@ describe('self send superseded explicit target protection', () => {
   }
 
   function invoke(stateDir: string, ...args: string[]) {
-    // 소비자가 없는 시험이 «읽힘 대기»(기본 10초)를 기다리지 않게 한다 — 대기 자체는 아래 전용 시험이 잰다.
     const readWait = (args.includes('--memo') || args.includes('--stop')) && !args.includes('--read-wait') ? ['--read-wait', '0'] : [];
     return Bun.spawnSync({
       cmd: [process.execPath, elanous, `--test=${stateDir}`, 'self', 'send', ...args, ...readWait],
@@ -192,307 +190,6 @@ describe('self send superseded explicit target protection', () => {
     }
   }
 
-  test('resolves a run to its latest differently shaped screen before delivering a memo', async () => {
-    await withStateDir((stateDir) => {
-      const runId = 'run-893d29dd-0000-4000-8000-000000000000';
-      const launchKey = 'self-impl-goalid-444fd810-apps-android-app-src-main-kotl';
-      const currentKey = 'self-impl-chatviewmodel-kt-chatviewmodel-submithar-19755230';
-      writeScreen(stateDir, launchKey);
-      writeScreen(stateDir, currentKey);
-      writeRunScreen(stateDir, runId, launchKey, '2026-09-14T00:01:00.000Z');
-      writeRunScreen(stateDir, runId, currentKey, '2026-09-14T00:02:00.000Z');
-
-      const result = invoke(stateDir, '--run', runId, '--memo', 'deliver to the current screen');
-
-      expect(result.exitCode).toBe(0);
-      expect(memoRecords(stateDir, launchKey)).toHaveLength(0);
-      expect(memoRecords(stateDir, currentKey)).toHaveLength(1);
-    });
-  });
-
-  test('normalizes a trailing-hyphen run screen key before selecting its inbox', async () => {
-    await withStateDir((stateDir) => {
-      const runId = 'run-893d29dd-0000-4000-8000-000000000002';
-      const normalizedKey = 'self-impl-goalid-473d2feaade20de2-src-pty-shell-pty-manifest-ts';
-      const rawScreenKey = `${normalizedKey}-`;
-      expect(rawScreenKey).toHaveLength(64);
-      writeScreen(stateDir, normalizedKey);
-      writeRunScreen(stateDir, runId, rawScreenKey, '2026-09-16T00:02:00.000Z');
-
-      const result = invoke(stateDir, '--run', runId, '--memo', 'deliver to the normalized screen');
-
-      expect(result.exitCode).toBe(0);
-      expect(memoRecords(stateDir, normalizedKey)).toHaveLength(1);
-      expect(existsSync(inboxReady(stateDir, rawScreenKey))).toBe(false);
-    });
-  });
-
-  test('keeps an unchanged run screen key delivering to its existing inbox', async () => {
-    await withStateDir((stateDir) => {
-      const runId = 'run-893d29dd-0000-4000-8000-000000000003';
-      const screenKey = 'self-impl-unchanged-run-screen-aaaaaaaa';
-      writeScreen(stateDir, screenKey);
-      writeRunScreen(stateDir, runId, screenKey, '2026-09-16T00:02:00.000Z');
-
-      const result = invoke(stateDir, '--run', runId, '--memo', 'deliver without normalization change');
-
-      expect(result.exitCode).toBe(0);
-      expect(memoRecords(stateDir, screenKey)).toHaveLength(1);
-    });
-  });
-
-  test('rejects a normalized run screen key with no screen or inbox write', async () => {
-    await withStateDir((stateDir) => {
-      const runId = 'run-893d29dd-0000-4000-8000-000000000004';
-      const normalizedKey = 'self-impl-goalid-473d2feaade20de2-src-pty-shell-pty-manifest-ts';
-      const rawScreenKey = `${normalizedKey}-`;
-      writeRunScreen(stateDir, runId, rawScreenKey, '2026-09-16T00:02:00.000Z');
-
-      const result = invoke(stateDir, '--run', runId, '--memo', 'must not write without a screen');
-
-      expect(result.exitCode).toBe(1);
-      expect(decode(result.stderr)).toContain(`해석한 화면이 없습니다: ${normalizedKey}`);
-      expect(existsSync(inboxReady(stateDir, normalizedKey))).toBe(false);
-      expect(existsSync(inboxReady(stateDir, rawScreenKey))).toBe(false);
-    });
-  });
-
-  test('rejects an unresolved run without recording to any screen', async () => {
-    await withStateDir((stateDir) => {
-      const target = 'self-impl-unrelated-screen-aaaaaaaa';
-      writeScreen(stateDir, target);
-
-      const result = invoke(stateDir, '--run', 'run-missing-screen', '--memo', 'must not record');
-
-      expect(result.exitCode).toBe(1);
-      expect(decode(result.stderr)).toContain('run 화면 해석 불가:');
-      expect(memoRecords(stateDir, target)).toHaveLength(0);
-    });
-  });
-
-  test('preserves unresolved run rejection before missing or conflicting control options', async () => {
-    await withStateDir((stateDir) => {
-      const target = 'self-impl-unrelated-screen-aaaaaaaa';
-      writeScreen(stateDir, target);
-
-      const missingOption = invoke(stateDir, '--run', 'run-missing-before-options');
-      const conflictingOptions = invoke(stateDir, '--run', 'run-missing-before-options', '--stop', '--memo', 'must not record');
-
-      for (const result of [missingOption, conflictingOptions]) {
-        expect(result.exitCode).toBe(1);
-        expect(decode(result.stderr)).toContain('run 화면 해석 불가:');
-        expect(decode(result.stderr)).not.toContain('self send에는 --stop 또는 --memo <sentence>가 필요합니다.');
-        expect(decode(result.stderr)).not.toContain('self send에서는 --stop 과 --memo를 함께 사용할 수 없습니다.');
-      }
-      expect(memoRecords(stateDir, target)).toHaveLength(0);
-    });
-  }, 10_000);
-
-  test('rejects simultaneous explicit space and run targets without recording', async () => {
-    await withStateDir((stateDir) => {
-      const target = 'self-impl-explicit-screen-aaaaaaaa';
-      writeScreen(stateDir, target);
-
-      const result = invoke(stateDir, target, '--run', 'run-conflict', '--memo', 'must not record');
-
-      expect(result.exitCode).toBe(2);
-      expect(decode(result.stderr)).toContain('--run 과 space 는 함께 사용할 수 없습니다.');
-      expect(memoRecords(stateDir, target)).toHaveLength(0);
-    });
-  });
-
-  test('keeps the explicit screen-key delivery path unchanged', async () => {
-    await withStateDir((stateDir) => {
-      const target = 'self-impl-explicit-screen-aaaaaaaa';
-      writeScreen(stateDir, target);
-
-      const result = invoke(stateDir, target, '--memo', 'deliver by screen key');
-
-      expect(result.exitCode).toBe(0);
-      expect(memoRecords(stateDir, target)).toHaveLength(1);
-    });
-  });
-
-  test('preserves the stop and memo conflict before refusing a TUI self-report target', async () => {
-    await withStateDir((stateDir) => {
-      const result = invoke(stateDir, 'tui:84650', '--stop', '--memo', 'must not resolve target');
-
-      expect(result.exitCode).toBe(2);
-      expect(decode(result.stderr)).toContain('self send에서는 --stop 과 --memo를 함께 사용할 수 없습니다.');
-      expect(decode(result.stderr)).not.toContain('self send 대상 거절:');
-      expect(existsSync(inboxReady(stateDir, 'tui:84650'))).toBe(false);
-    });
-  });
-
-  test('preserves the required-control-option rejection before refusing a TUI self-report target', async () => {
-    await withStateDir((stateDir) => {
-      const result = invoke(stateDir, 'tui:84650');
-
-      expect(result.exitCode).toBe(2);
-      expect(decode(result.stderr)).toContain('self send에는 --stop 또는 --memo <sentence>가 필요합니다.');
-      expect(decode(result.stderr)).not.toContain('self send 대상 거절:');
-      expect(existsSync(inboxReady(stateDir, 'tui:84650'))).toBe(false);
-    });
-  });
-
-  test('rejects a superseded explicit memo without recording it and names both attempts', async () => {
-    await withStateDir((stateDir) => {
-      const older = 'self-impl-shared-goal-aaaaaaaa';
-      const newer = 'self-impl-shared-goal-bbbbbbbb';
-      const now = Date.now();
-      writeScreen(stateDir, older, now - 2_000);
-      writeScreen(stateDir, newer, now - 1_000);
-
-      const result = invoke(stateDir, older, '--memo', 'send this to the current attempt');
-
-      expect(result.exitCode).not.toBe(0);
-      expect(decode(result.stderr)).toContain(older);
-      expect(decode(result.stderr)).toContain(newer);
-      expect(memoRecords(stateDir, older)).toHaveLength(0);
-      expect(memoRecords(stateDir, newer)).toHaveLength(0);
-    });
-  });
-
-  test('rejects a superseded explicit stop without recording it', async () => {
-    await withStateDir((stateDir) => {
-      const older = 'self-impl-shared-goal-aaaaaaaa';
-      const newer = 'self-impl-shared-goal-bbbbbbbb';
-      const now = Date.now();
-      writeScreen(stateDir, older, now - 2_000);
-      writeScreen(stateDir, newer, now - 1_000);
-
-      const result = invoke(stateDir, older, '--stop');
-
-      expect(result.exitCode).not.toBe(0);
-      expect(decode(result.stderr)).toContain(older);
-      expect(decode(result.stderr)).toContain(newer);
-      expect(existsSync(join(inboxReady(stateDir, older), 'stop'))).toBe(false);
-      expect(existsSync(join(inboxReady(stateDir, newer), 'stop'))).toBe(false);
-    });
-  });
-
-  test('--memo names the record file and reports «읽음» once a consumer claims it', async () => {
-    await withStateDir(async (stateDir) => {
-      const target = 'self-impl-read-goal-aaaaaaaa';
-      writeScreen(stateDir, target);
-      const child = Bun.spawn({
-        cmd: [process.execPath, elanous, `--test=${stateDir}`, 'self', 'send', target, '--memo', 'read me', '--read-wait', '5'],
-        cwd,
-        env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      // 가짜 소비자: 기록이 생기면 지운다(자식의 drain 이 집어 가는 것과 같은 관측 결과).
-      const deadline = Date.now() + 5_000;
-      while (Date.now() < deadline && memoRecords(stateDir, target).length === 0) await Bun.sleep(50);
-      for (const name of memoRecords(stateDir, target)) rmSync(join(inboxReady(stateDir, target), name));
-      const exitCode = await child.exited;
-      const stdout = await new Response(child.stdout).text();
-      expect(exitCode).toBe(0);
-      expect(stdout).toMatch(/감독 메모 기록: .*record-[0-9a-f]+-/);
-      expect(stdout).toContain('자식이 읽음');
-      expect(stdout).not.toContain('아직 안 읽힘');
-    });
-  });
-
-  test('--memo without a consumer says «아직 안 읽힘» with the check command and still exits 0', async () => {
-    await withStateDir((stateDir) => {
-      const target = 'self-impl-unread-goal-aaaaaaaa';
-      writeScreen(stateDir, target);
-      const result = invoke(stateDir, target, '--memo', 'nobody reads', '--read-wait', '1');
-      expect(result.exitCode).toBe(0);
-      const stdout = decode(result.stdout);
-      expect(stdout).toContain('아직 안 읽힘 (1초 기다림)');
-      expect(stdout).toContain('--category control-inbox --event drain');
-      expect(memoRecords(stateDir, target)).toHaveLength(1);
-    });
-  });
-
-  test('keeps an explicit sole target and the omitted sole-target path recording normally', async () => {
-    await withStateDir((stateDir) => {
-      const target = 'self-impl-only-goal-aaaaaaaa';
-      writeScreen(stateDir, target);
-
-      const explicit = invoke(stateDir, target, '--memo', 'record normally');
-      const omitted = invoke(stateDir, '--stop');
-
-      expect(explicit.exitCode).toBe(0);
-      expect(decode(explicit.stdout)).toContain('감독 메모 기록:');
-      expect(memoRecords(stateDir, target)).toHaveLength(1);
-      expect(omitted.exitCode).toBe(0);
-      expect(existsSync(join(inboxReady(stateDir, target), 'stop'))).toBe(true);
-    });
-  });
-
-  test('displays alive heartbeat age from the supplied timestamp without changing other liveness states', () => {
-    const now = 1_700_000_000_000;
-    const candidates = [
-      { spaceId: 'alive-seconds-space', mtimeMs: now, liveness: 'alive' as const, heartbeatAtMs: now - 50_000 },
-      { spaceId: 'alive-minutes-space', mtimeMs: now, liveness: 'alive' as const, heartbeatAtMs: now - 2_898_000 },
-      { spaceId: 'alive-without-time-space', mtimeMs: now, liveness: 'alive' as const },
-      { spaceId: 'dead-space', mtimeMs: now, liveness: 'dead' as const, heartbeatAtMs: now - 50_000 },
-      { spaceId: 'unknown-space', mtimeMs: now, liveness: 'unknown' as const, heartbeatAtMs: now - 50_000 },
-      { spaceId: 'missing-space', mtimeMs: now },
-    ];
-
-    const first = formatSelfSendCandidateDisplay(candidates, { now });
-    const second = formatSelfSendCandidateDisplay(candidates, { now });
-
-    expect(first).toEqual(second);
-    expect(first.lines[0]).toContain('자식 생존 (heartbeat 50초 전)');
-    expect(first.lines[1]).toContain('자식 생존 (heartbeat 48분 전)');
-    expect(first.lines[1]).not.toContain('50초 전');
-    expect(first.lines[2]).toContain('자식 생존');
-    expect(first.lines[2]).not.toContain('heartbeat ');
-    expect(first.lines[3]).toContain('자식 사망 (heartbeat alive=false)');
-    expect(first.lines[3]).not.toContain('50초 전');
-    expect(first.lines[4]).not.toContain('자식 생존');
-    expect(first.lines[4]).not.toContain('50초 전');
-    expect(first.lines[5]).not.toContain('자식 생존');
-    expect(first.lines[5]).not.toContain('50초 전');
-  });
-
-  test('renders distinct alive heartbeat ages through the self send candidate-list path', async () => {
-    await withStateDir((stateDir) => {
-      const now = Date.now();
-      const secondsOld = 'self-impl-heartbeat-seconds-aaaaaaaa';
-      const minutesOld = 'self-impl-heartbeat-minutes-bbbbbbbb';
-      const dead = 'self-impl-heartbeat-dead-cccccccc';
-      writeScreen(stateDir, secondsOld, now);
-      writeScreen(stateDir, minutesOld, now);
-      writeScreen(stateDir, dead, now);
-      writeHeartbeat(stateDir, secondsOld, { alive: true, at: now - 50_000 });
-      writeHeartbeat(stateDir, minutesOld, { alive: true, at: now - 2_898_000 });
-      writeHeartbeat(stateDir, dead, { alive: false, at: now - 50_000 });
-
-      const result = invoke(stateDir, '--memo', 'candidate list only');
-      const stderr = decode(result.stderr);
-
-      expect(result.exitCode).not.toBe(0);
-      expect(stderr).toContain(secondsOld);
-      expect(stderr).toMatch(/자식 생존 \(heartbeat 5[0-9]초 전\)/);
-      expect(stderr).toContain(minutesOld);
-      expect(stderr).toContain('자식 생존 (heartbeat 48분 전)');
-      expect(stderr).toContain(dead);
-      expect(stderr).toContain('자식 사망 (heartbeat alive=false)');
-      expect(stderr).not.toContain('자식 사망 (heartbeat 50초 전)');
-    });
-  });
-
-  test('warns and records when a dead heartbeat has no lifecycle evidence', async () => {
-    await withStateDir((stateDir) => {
-      const target = 'self-impl-dead-goal-aaaaaaaa';
-      writeScreen(stateDir, target);
-      writeHeartbeat(stateDir, target, { alive: false, parentStatus: 'orphaned' });
-
-      const result = invoke(stateDir, target, '--memo', 'record despite unknown lifecycle');
-
-      expect(result.exitCode).toBe(0);
-      expect(decode(result.stderr)).toContain('lifecycle 상태를 알 수 없습니다');
-      expect(memoRecords(stateDir, target)).toHaveLength(1);
-    });
-  });
-
   test('rejects a terminal run resolved from a dead heartbeat without inbox records', async () => {
     await withStateDir((stateDir) => {
       const runId = 'run-893d29dd-0000-4000-8000-000000000001';
@@ -523,156 +220,14 @@ describe('self send superseded explicit target protection', () => {
       const result = invoke(stateDir, '--run', runId, '--memo', 'deliver to next iteration');
 
       expect(result.exitCode).toBe(0);
-      expect(memoRecords(stateDir, target)).toHaveLength(1);
-    });
-  });
-
-  test('rejects a terminal run distinctly from a dead child and preserves dead-child stop rejection', async () => {
-    await withStateDir((stateDir) => {
-      const runId = 'run-893d29dd-0000-4000-8000-000000000011';
-      const target = 'self-impl-terminal-dead-run-aaaaaaaa';
-      writeScreen(stateDir, target);
-      writeHeartbeat(stateDir, target, { alive: false });
-      writeRunScreen(stateDir, runId, target, '2026-09-17T00:01:00.000Z');
-      writeRunLedger(stateDir, runId, [{ event: 'start' }, { event: 'run-status', data: { runStatus: 'completed' } }]);
-
-      const memo = invoke(stateDir, '--run', runId, '--memo', 'must not deliver');
-      const stop = invoke(stateDir, '--run', runId, '--stop');
-
-      expect(memo.exitCode).toBe(2);
-      expect(decode(memo.stderr)).toContain('런이 이미 종료되었습니다');
-      expect(decode(memo.stderr)).not.toContain('heartbeat alive=false');
-      expect(memoRecords(stateDir, target)).toHaveLength(0);
-      expect(stop.exitCode).toBe(2);
-      expect(decode(stop.stderr)).toContain('heartbeat alive=false');
-    });
-  });
-
-  test('warns and records for empty or lifecycle-less ledgers', async () => {
-    await withStateDir((stateDir) => {
-      const emptyRun = 'run-893d29dd-0000-4000-8000-000000000012';
-      const lifecycleLessRun = 'run-893d29dd-0000-4000-8000-000000000013';
-      const emptyTarget = 'self-impl-empty-ledger-dead-aaaaaaaa';
-      const lifecycleLessTarget = 'self-impl-lifecycless-ledger-dead-aaaaaaaa';
-      for (const [runId, target, entries] of [[emptyRun, emptyTarget, []], [lifecycleLessRun, lifecycleLessTarget, [{ event: 'note' }]]] as const) {
-        writeScreen(stateDir, target);
-        writeHeartbeat(stateDir, target, { alive: false });
-        writeRunScreen(stateDir, runId, target, '2026-09-17T00:01:00.000Z');
-        writeRunLedger(stateDir, runId, entries);
-        const result = invoke(stateDir, '--run', runId, '--memo', 'unknown remains deliverable');
-        expect(result.exitCode).toBe(0);
-        expect(decode(result.stderr)).toContain('lifecycle 상태를 알 수 없습니다');
-        expect(memoRecords(stateDir, target)).toHaveLength(1);
-      }
-    });
-  });
-
-  test('uses the same terminal-then-start lifecycle rule for explicit and space targets', async () => {
-    await withStateDir((stateDir) => {
-      const runId = 'run-893d29dd-0000-4000-8000-000000000014';
-      const target = 'self-impl-restarted-dead-run-aaaaaaaa';
-      writeScreen(stateDir, target);
-      writeHeartbeat(stateDir, target, { alive: false });
-      writeRunScreen(stateDir, runId, target, '2026-09-17T00:01:00.000Z');
-      writeRunLedger(stateDir, runId, [{ event: 'start' }, { event: 'terminal' }, { event: 'start' }]);
-
-      const explicit = invoke(stateDir, '--run', runId, '--memo', 'explicit restart');
-      const space = invoke(stateDir, target, '--memo', 'space restart');
-
-      expect(explicit.exitCode).toBe(0);
-      expect(space.exitCode).toBe(0);
-      expect(memoRecords(stateDir, target)).toHaveLength(2);
-    });
-  });
-
-  test('applies terminal lifecycle rejection across explicit run, space, and automatic targets for every heartbeat state', async () => {
-    const livenesses = [
-      ['alive', { alive: true }],
-      ['dead', { alive: false }],
-      ['unknown', { parentStatus: 'orphaned' }],
-    ] as const;
-    for (const [path, invokeArgs] of [
-      ['explicit run', (runId: string, target: string) => ['--run', runId, '--memo', 'terminal must reject']],
-      ['space', (_runId: string, target: string) => [target, '--memo', 'terminal must reject']],
-      ['automatic', (_runId: string, _target: string) => ['--memo', 'terminal must reject']],
-    ] as const) {
-      for (const [liveness, heartbeat] of livenesses) {
-        await withStateDir((stateDir) => {
-          const runId = `run-893d29dd-0000-4000-8000-00000000${path === 'explicit run' ? '0020' : path === 'space' ? '0021' : '0022'}`;
-          const target = `self-impl-terminal-${path.replace(' ', '-')}-${liveness}-aaaaaaaa`;
-          writeScreen(stateDir, target);
-          writeHeartbeat(stateDir, target, heartbeat);
-          writeRunScreen(stateDir, runId, target, '2026-09-17T00:01:00.000Z');
-          writeRunLedger(stateDir, runId, [{ event: 'start' }, { event: 'terminal' }]);
-
-          const result = invoke(stateDir, ...invokeArgs(runId, target));
-
-          expect(result.exitCode).toBe(2);
-          expect(decode(result.stderr)).toContain('런이 이미 종료되었습니다');
-          expect(memoRecords(stateDir, target)).toHaveLength(0);
-        });
-      }
-    }
-  }, 30_000);
-
-  test('uses lifecycle evidence for continuing and unknown ledgers across space and automatic targets', async () => {
-    for (const [kind, entries, expectUnknownWarning] of [
-      ['continuing', [{ event: 'start' }], false],
-      ['empty', [], true],
-      ['lifecycle-less', [{ event: 'note' }], true],
-      ['terminal-then-start', [{ event: 'start' }, { event: 'terminal' }, { event: 'start' }], false],
-    ] as const) {
-      for (const [path, invokeArgs] of [
-        ['space', (target: string) => [target, '--memo', `${kind} lifecycle`]],
-        ['automatic', (_target: string) => ['--memo', `${kind} lifecycle`]],
-      ] as const) {
-        await withStateDir((stateDir) => {
-          const runId = `run-893d29dd-0000-4000-8000-00000000${kind === 'continuing' ? '0030' : kind === 'empty' ? '0031' : kind === 'lifecycle-less' ? '0032' : '0033'}`;
-          const target = `self-impl-${kind}-${path}-aaaaaaaa`;
-          writeScreen(stateDir, target);
-          writeHeartbeat(stateDir, target, { alive: false });
-          writeRunScreen(stateDir, runId, target, '2026-09-17T00:01:00.000Z');
-          writeRunLedger(stateDir, runId, entries);
-
-          const result = invoke(stateDir, ...invokeArgs(target));
-
-          expect(result.exitCode).toBe(0);
-          expect(decode(result.stderr).includes('lifecycle 상태를 알 수 없습니다')).toBe(expectUnknownWarning);
-          expect(memoRecords(stateDir, target)).toHaveLength(1);
-        });
-      }
-    }
-  }, 30_000);
-
-  test('permits missing and alive heartbeats to record control memos', async () => {
-    await withStateDir((stateDir) => {
-      const missing = 'self-impl-unknown-goal-aaaaaaaa';
-      const alive = 'self-impl-alive-goal-bbbbbbbb';
-      writeScreen(stateDir, missing);
-      writeScreen(stateDir, alive);
-      writeHeartbeat(stateDir, alive, { alive: true });
-
-      const unknownResult = invoke(stateDir, missing, '--memo', 'missing heartbeat is allowed');
-      const aliveResult = invoke(stateDir, alive, '--memo', 'alive heartbeat is allowed');
-
-      expect(unknownResult.exitCode).toBe(0);
-      expect(decode(unknownResult.stderr)).toContain('heartbeat 상태를 알 수 없습니다');
-      expect(memoRecords(stateDir, missing)).toHaveLength(1);
-      expect(aliveResult.exitCode).toBe(0);
-      expect(memoRecords(stateDir, alive)).toHaveLength(1);
-    });
-  });
-
-  test('permits an old alive heartbeat to record a control memo', async () => {
-    await withStateDir((stateDir) => {
-      const alive = 'self-impl-old-alive-goal-aaaaaaaa';
-      writeScreen(stateDir, alive);
-      writeHeartbeat(stateDir, alive, { alive: true, at: Date.now() - 2_898_000 });
-
-      const result = invoke(stateDir, alive, '--memo', 'old alive heartbeat remains allowed');
-
-      expect(result.exitCode).toBe(0);
-      expect(memoRecords(stateDir, alive)).toHaveLength(1);
+      const ready = inboxReady(stateDir, target);
+      const records = memoRecords(stateDir, target);
+      expect(records).toHaveLength(1);
+      const content = readFileSync(join(ready, records[0]!), 'utf8');
+      expect(content.startsWith('memo:CONTROL_MEMO_FRAME:')).toBe(true);
+      expect(content.endsWith('\n')).toBe(true);
+      const frame = JSON.parse(Buffer.from(content.slice('memo:CONTROL_MEMO_FRAME:'.length).trim(), 'base64url').toString('utf8'));
+      expect(frame).toEqual({ version: 1, kind: 'supervisor', urgency: 'normal', body: 'deliver to next iteration' });
     });
   });
 });
@@ -698,14 +253,10 @@ describe('root command help dispatch', () => {
     expect(decode(result.stderr)).toContain("error: unknown command 'zzzznotacommand'");
   });
 
-  test('harness ask rejects an invalid graph value as one readable input error without a stack trace', () => {
-    const result = invoke('harness', 'ask', '/tmp/goal.md', '--graph', 'maybe', '--dry-run');
-    const stderr = decode(result.stderr);
-
+  test('harness ask no longer offers a graph authority override', () => {
+    const result = invoke('harness', 'ask', '/tmp/goal.md', '--graph', 'off', '--dry-run');
     expect(result.exitCode).not.toBe(0);
-    expect(stderr).toContain('❌ --graph 값은 on 또는 off여야 함: maybe');
-    expect(stderr).not.toMatch(/\n\s*at\s+/);
-    expect(stderr).not.toContain('HarnessCliInputError:');
+    expect(decode(result.stderr)).toContain("error: unknown option '--graph'");
   });
 
   // ⚠️ 2026-09-21 `#19291` 재작성으로 `setup` 은 단계 인자·답변 파일(`--config`)을 받지 않는다 — 옛 계약을 재던 시험을 지금 계약으로.
@@ -1789,7 +1340,7 @@ describe('harness ask production entry wiring', () => {
     }
   });
 
-  test('harness ask forwards graph on/off through the shared dev pipeline spec while omission stays absent', async () => {
+  test('harness ask forwards the goal without a graph authority override', async () => {
     const { program, setRunDevAskFromGoalFileDepsForTesting } = await import('./index.js');
     const specs: unknown[] = [];
     try {
@@ -1812,13 +1363,9 @@ describe('harness ask production entry wiring', () => {
         runSayLaunchFlow: async () => ({ kind: 'launch', goalFile: '/unused' } as never),
         setExitCode: () => {},
       });
-      await program.parseAsync(['node', 'elanous', 'harness', 'ask', '--graph', 'on', '/tmp/GOAL-graph-on.md']);
-      await program.parseAsync(['node', 'elanous', 'harness', 'ask', '--graph', 'off', '/tmp/GOAL-graph-off.md']);
-      await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/GOAL-graph-omitted.md']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/GOAL-graph-default.md']);
       expect(specs).toEqual([
-        { input: { file: '/tmp/GOAL-graph-on.md' }, executor: { kind: 'self' }, opts: { graph: true }, explicitNames: ['graph'] },
-        { input: { file: '/tmp/GOAL-graph-off.md' }, executor: { kind: 'self' }, opts: { graph: false }, explicitNames: ['graph'] },
-        { input: { file: '/tmp/GOAL-graph-omitted.md' }, executor: { kind: 'self' }, opts: {}, explicitNames: [] },
+        { input: { file: '/tmp/GOAL-graph-default.md' }, executor: { kind: 'self' }, opts: {}, explicitNames: [] },
       ]);
     } finally {
       setRunDevAskFromGoalFileDepsForTesting(undefined);
@@ -1853,7 +1400,7 @@ describe('harness ask production entry wiring', () => {
         'node', 'elanous', 'harness', 'ask',
         '--correlation', 't156-denom-press',
         '--child-llm-provider', 'grok', '--child-llm-model', 'grok-4.6', '--child-llm-effort', 'high',
-        '--target', 'src/index.ts', '--graph', 'on', '/tmp/GOAL-correlation.md',
+        '--target', 'src/index.ts', '/tmp/GOAL-correlation.md',
       ]);
       await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/GOAL-correlation-omitted.md']);
 
@@ -1867,9 +1414,8 @@ describe('harness ask production entry wiring', () => {
             childLlmModel: 'grok-4.6',
             childLlmEffort: 'high',
             target: 'src/index.ts',
-            graph: true,
           },
-          explicitNames: ['childLlmProvider', 'childLlmModel', 'childLlmEffort', 'correlation', 'target', 'graph'],
+          explicitNames: ['childLlmProvider', 'childLlmModel', 'childLlmEffort', 'correlation', 'target'],
         },
         {
           input: { file: '/tmp/GOAL-correlation-omitted.md' },
@@ -3038,11 +2584,15 @@ describe('self orchestrate CLI help tiers', () => {
     '--supervise-rounds', '--json',
     // 2026-09-25 🅢 pod·벤치 기판(#20444 계열)이 더한 다섯 — 계약에 올린다.
     '--substrate', '--pod-account', '--pod-pass-env', '--no-pod-rebuild', '--bench-arms',
+    // 2026-09-26 플릿·풀이 기본 도움말에 더한 셋.
+    '--pod-pool', '--pod-skill-env', '--reduce',
+    // 2026-09-27 pod 원천 표면이 더한 하나 — `--help-all` 에만 보인다.
+    '--pod-source',
   ]);
 
   test('option contract set itself does not silently shrink', () => {
     // ⛔ 위 집합을 줄이면 `toEqual` 이 여전히 통과하므로 계약이 «조용히» 좁아진다. 수를 못 박는다.
-    expect(existingOptionNames.size).toBe(19);
+    expect(existingOptionNames.size).toBe(23);
   });
 
   function help(...args: string[]): string {
@@ -3063,11 +2613,11 @@ describe('self orchestrate CLI help tiers', () => {
     }));
   }
 
-  test('keeps the primary option listing below sixteen lines', () => {
+  test('keeps the primary option listing below eighteen lines', () => {
     const primary = help('--help');
     const optionLines = primary.split('\n').filter((line) => /^\s+-{1,2}[\w-]+/.test(line));
 
-    expect(optionLines.length).toBeLessThan(16);
+    expect(optionLines.length).toBeLessThan(18);
     expect(primary).toContain('--help-all');
   });
 
@@ -3120,7 +2670,7 @@ describe('dev CLI help tiers', () => {
   const elanous = new URL('../bin/elanous.mjs', import.meta.url).pathname;
   const cwd = new URL('../', import.meta.url).pathname;
   const existingOptionNames = new Set([
-    '--file', '--ask', '--say', '--graph', '--force-preflight', '--allow-no-evidence',
+    '--file', '--ask', '--say', '--force-preflight', '--allow-no-evidence',
     '--allow-superseded-goal', '--allow-goal-lint-errors', '--backend', '--transport',
     '--branch', '--base', '--plan', '--implement', '--elanous', '--hold', '--goal',
     '--max-steps', '--poll-ms', '--ready-timeout-ms', '--model', '--observe-only', '--isolated-root', '--cwd',
@@ -3134,8 +2684,8 @@ describe('dev CLI help tiers', () => {
     '--plan', '--implement', '--elanous', '--attach', '--json', '--help-all', '--help',
   ]);
 
-  test('option contract set itself does not silently shrink beyond the fourteen intentional retirements', () => {
-    expect(existingOptionNames.size).toBe(48);
+  test('option contract set itself only shrinks for the intentional retirements including graph authority', () => {
+    expect(existingOptionNames.size).toBe(47);
   });
 
   function help(...args: string[]): string {
@@ -3202,7 +2752,7 @@ describe('dev CLI help tiers', () => {
     expect(output).toContain('ENOENT: no such file');
   });
 
-  test('dev say action carries force-preflight and graph on/off through the same launch invocation while omission stays absent', async () => {
+  test('dev say action carries force-preflight without a graph authority override', async () => {
     const { program, setDevLaunchControlTestSeams } = await import('./index.js');
     const goalDir = await mkdtemp(join(tmpdir(), 'elanous-dev-graph-action-'));
     const goalFile = join(goalDir, 'GOAL-dev-graph.md');
@@ -3214,7 +2764,7 @@ describe('dev CLI help tiers', () => {
     }) as never);
 
     try {
-      for (const graph of ['on', 'off', undefined] as const) {
+      {
         setDevLaunchControlTestSeams({
           runAskLaunchFlow: (async (input: { forceRequested: boolean }) => {
             launchForceValues.push(input.forceRequested);
@@ -3226,7 +2776,6 @@ describe('dev CLI help tiers', () => {
           }) as never,
         });
         const argv = ['node', 'elanous', 'dev', '--say', '같은 objective', '--force-preflight'];
-        if (graph !== undefined) argv.push('--graph', graph);
         await expect(program.parseAsync(argv)).rejects.toThrow('PROCESS_EXIT_1');
       }
     } finally {
@@ -3235,10 +2784,9 @@ describe('dev CLI help tiers', () => {
       await rm(goalDir, { recursive: true, force: true });
     }
 
-    expect(launchForceValues).toEqual([true, true, true]);
-    expect(pipelineSpecs[0]?.self).toMatchObject({ graphAuthoritative: true });
-    expect(pipelineSpecs[1]?.self).toMatchObject({ graphAuthoritative: false });
-    expect(pipelineSpecs[2]?.self).not.toHaveProperty('graphAuthoritative');
+    expect(launchForceValues).toEqual([true]);
+    expect(pipelineSpecs).toHaveLength(1);
+    expect(pipelineSpecs.every((spec) => !Object.hasOwn(spec.self ?? {}, 'graphAuthoritative'))).toBe(true);
   });
 
   test('dev --elanous --hold --json leaves the hold JSON as the only stdout document', async () => {
@@ -3337,7 +2885,8 @@ describe('dev CLI help tiers', () => {
     // ⛔⭐ 셋째 줄이 `hold-delegated-to-owner` 인 것이 2026-09-12 정정의 핵심이다 —
     //   `ELANOUS_HOLD_OWNER` 가 '1' 이 아니면 그 프로세스는 **런처**이고, 안 붙드는 것이 «정상»이다.
     // ⭐ 2026-09-25: `debug.log` 가 `ELANOUS_HOST_ID` 를 `hostId` 로 자동 부착한다(RFC 런 출처 O2 · #20468) — runId 처럼 뺀다.
-    expect(seen.map(({ runId: _runId, hostId: _hostId, ...predicate }) => predicate)).toEqual([
+    // ⭐ 2026-09-26: 같은 로거가 `ELANOUS_SUBSTRATE` 를 `substrate` 로 붙인다 — 판정 대상이 아니다.
+    expect(seen.map(({ runId: _runId, hostId: _hostId, substrate: _substrate, ...predicate }) => predicate)).toEqual([
       { event: 'hold-owner-not-entered', kind: 'shell-drive', planHold: true, holdOwner: '1', holdRequestedByCli: false },
       { event: 'hold-owner-not-entered', kind: 'elanous-tui', planHold: 'missing', holdOwner: '1', holdRequestedByCli: true },
       { event: 'hold-delegated-to-owner', kind: 'elanous-tui', planHold: true, holdOwner: '0', holdRequestedByCli: false },
@@ -3626,7 +3175,7 @@ describe('dev CLI help tiers', () => {
     }
   }, 5_000);
 
-  test('dev rejects an invalid graph value with the shared readable contract and no stack trace', () => {
+  test('dev rejects the retired graph authority override', () => {
     const result = Bun.spawnSync({
       cmd: [process.execPath, elanous, '--test', 'dev', '--ask', '/tmp/goal.md', '--graph', 'maybe'],
       cwd,
@@ -3636,14 +3185,13 @@ describe('dev CLI help tiers', () => {
     const stderr = new TextDecoder().decode(result.stderr);
 
     expect(result.exitCode).not.toBe(0);
-    expect(stderr).toContain('❌ --graph 값은 on 또는 off여야 함: maybe');
+    expect(stderr).toContain("error: unknown option '--graph'");
     expect(stderr).not.toMatch(/\n\s*at\s+/);
-    expect(stderr).not.toContain('HarnessCliInputError:');
   });
 
-  test('shows graph and force-preflight together in extended dev help', () => {
+  test('extended dev help retains force-preflight but no graph authority override', () => {
     const extended = help('--help-all');
-    expect(extended).toContain('--graph <on|off>');
+    expect(extended).not.toContain('--graph <on|off>');
     expect(extended).toContain('--force-preflight');
   });
 

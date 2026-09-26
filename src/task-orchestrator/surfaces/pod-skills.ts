@@ -19,14 +19,22 @@ import { homedir } from 'node:os';
 import { join, relative } from 'node:path';
 import { LOCAL_SKILLS_DIR } from '../../config.js';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
+import { prodInstanceRoot } from '../../instance/resolve.js';
 
 const SKILL_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/u;
 
-/** 이미지로 가면 안 되는 것 — 비밀 ⊕ 재생성물. 이름(경로 조각) 기준. */
-const EXCLUDED_NAME = /^(\.env(\..*)?|.*\.(pem|key|p12|pfx)|auth[^/]*\.json|credentials[^/]*\.json|token[^/]*\.json|node_modules|\.venv|venv|__pycache__|\.cache|\.git|\.DS_Store|.*\.log)$/iu;
+/** 이미지로 가면 안 되는 것 — 비밀 ⊕ 재생성물 ⊕ «개인 데이터·상태». 이름(경로 조각) 기준.
+ *  🔐 2026-09-27(🅞 짚음): 스킬 폴더의 `data/`(yt-vault 413MB · 구독·흡수 이력 DB) · `.elanous/`(스킬이 쓴 관측·상태) · DB 파일이
+ *  이미지(→ node-b 레지스트리)에 구워질 뻔했다 — 코드만 이미지로, 데이터는 런이 산출 폴더로 받는다. */
+const EXCLUDED_NAME = /^(\.env(\..*)?|.*\.(pem|key|p12|pfx)|auth[^/]*\.json|credentials[^/]*\.json|token[^/]*\.json|node_modules|\.venv|venv|__pycache__|\.cache|\.git|\.DS_Store|.*\.log|data|\.elanous|\.monad|.*\.(db|sqlite|sqlite3|db-wal|db-shm|sqlite-wal|sqlite-shm))$/iu;
 
 export function podSkillsListPath(configDir: string = getElanousConfigDir()): string {
-  return join(configDir, 'pod-skills.txt');
+  const here = join(configDir, 'pod-skills.txt');
+  if (configDir !== getElanousConfigDir() || existsSync(here)) return here;
+  // 스킬 목록은 «이 기계 사용자»의 설정이다(스킬도 ~/.claude/skills 에 있다) — 워크트리의 시험 우주에서 빌드해도
+  //   운영 목록을 읽는다(2026-09-26 실측: 워크트리 빌드가 목록을 못 찾아 스킬 0개로 이미지를 구웠다).
+  const prod = join(prodInstanceRoot(), 'pod-skills.txt');
+  return existsSync(prod) ? prod : here;
 }
 
 /** 목록 해석: `ELANOUS_POD_SKILLS` → 설정 파일 → 빈 목록. 이름 규칙 밖은 버리지 않고 오류로 낸다. */

@@ -19,7 +19,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u2' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: true,
       shouldAutoCompact: () => ({
         fire: true,
         partial: false,
@@ -53,7 +52,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u1' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: false,
       shouldAutoCompact: () => ({
         fire: true,
         partial: false,
@@ -94,7 +92,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u2' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: false,
       shouldAutoCompact: () => ({
         fire: false, partial: false, preserveLastN: 0,
         reason: 'below threshold', ratio: 0.1, usedTokens: 100, maxTokens: 1000,
@@ -150,7 +147,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u1' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: false,
       shouldAutoCompact: () => ({
         fire: false, partial: false, preserveLastN: 0,
         reason: 'no', ratio: 0, usedTokens: 0, maxTokens: 1,
@@ -200,7 +196,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u1' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: false,
       shouldAutoCompact: () => ({
         fire: false, partial: false, preserveLastN: 0,
         reason: 'no', ratio: 0, usedTokens: 0, maxTokens: 1,
@@ -233,7 +228,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u2' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: false,
       shouldAutoCompact: () => ({
         fire: false, partial: false, preserveLastN: 0,
         reason: 'below', ratio: 0, usedTokens: 0, maxTokens: 1,
@@ -287,7 +281,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u2' } as any,
       model: 'claude-opus-4-7',
       autoCompactConfig: {},
-      compactBoundaryEnabled: true,
       shouldAutoCompact: () => ({
         fire: true, partial: false, preserveLastN: 1,
         reason: 'budget', ratio: 0.9, usedTokens: 900, maxTokens: 1000,
@@ -353,7 +346,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u2' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: true,
       shouldAutoCompact: () => ({
         fire: true, partial: false, preserveLastN: 1,
         reason: 'budget', ratio: 0.95, usedTokens: 950, maxTokens: 1000,
@@ -405,7 +397,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u2' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: false,
       shouldAutoCompact: () => ({
         fire: true, partial: false, preserveLastN: 1,
         reason: 'budget', ratio: 0.9, usedTokens: 900, maxTokens: 1000,
@@ -457,7 +448,6 @@ describe('runDashboardAutoCompact', () => {
       userMsg: { role: 'user', content: 'u1' } as any,
       model: 'gpt-5',
       autoCompactConfig: {},
-      compactBoundaryEnabled: false,
       shouldAutoCompact: () => ({
         fire: true, partial: false, preserveLastN: 0,
         reason: 'budget', ratio: 0.9, usedTokens: 900, maxTokens: 1000,

@@ -181,6 +181,22 @@ test('document preprocess excludes the elanous check section but retains followi
   expect(prompt).not.toContain('## 🧭 elanous 점검');
 });
 
+test('a check section written before the rename is also kept out of preprocessing', async () => {
+  const deps = fixture();
+  let prompt = '';
+  const stages = buildIntakeDocumentStageCallables({
+    resolveRoleProvider: () => ({ provider: { name: 'fixture' } }),
+    streamLLM: async (messages) => {
+      prompt = messages[0]?.content ?? '';
+      return JSON.stringify({ claims: [], discards: [{ quote: 'external', reason: 'not a claim' }] });
+    },
+  });
+  const document = '# 노트\n- 외부 사실만\n## 🧭 monad 점검\n- 옛 판정 문장\n## 다음 절\n- 다음 절 외부 문장\n';
+  await runIntakeCheckDocument([], { ...deps, preprocess: stages.preprocess }, { document });
+  expect(prompt).toContain('다음 절 외부 문장');
+  expect(prompt).not.toContain('옛 판정 문장');
+});
+
 test('a same-named root file alone does not make a dotted identifier present', () => {
   const deps = fixture();
   writeFileSync(join(deps.root, 'system.status'), 'root file\n');

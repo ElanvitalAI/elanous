@@ -1,7 +1,6 @@
 import type { SourceDeltaTurnSnapshot } from '../code-edit/index.js';
 
 export interface DashboardCodeEditPostTurnRuntimeDeps {
-  turnSummaryEnabled: boolean;
   pushChatLine: (line: string) => void;
   setChatScrollBottom: () => void;
   importCodeEdit: () => Promise<{
@@ -20,7 +19,7 @@ export async function runDashboardCodeEditPostTurn(
   try {
     const { getSourceDeltaManager, renderSourceDeltaTurnSummary } = await deps.importCodeEdit();
     const turn = getSourceDeltaManager().endTurn();
-    const rows = deps.turnSummaryEnabled ? renderSourceDeltaTurnSummary(turn) : [];
+    const rows = renderSourceDeltaTurnSummary(turn);
     for (const row of rows) deps.pushChatLine(row);
     if (rows.length > 0) deps.setChatScrollBottom();
   } catch {

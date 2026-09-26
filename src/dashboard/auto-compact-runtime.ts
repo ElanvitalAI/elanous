@@ -20,7 +20,6 @@ export interface DashboardAutoCompactRuntimeDeps {
   userMsg: ChatMessage;
   model: string;
   autoCompactConfig: ChatAutoCompactConfig;
-  compactBoundaryEnabled: boolean;
   shouldAutoCompact: (
     messages: LLMMessage[],
     model: string,
@@ -148,15 +147,13 @@ export async function runDashboardAutoCompact(
           deps.chatHistory.length = 0;
           for (const m of newHistory) deps.chatHistory.push(m);
           deps.chatHistory.push(deps.userMsg);
-          if (deps.compactBoundaryEnabled) {
-            const tag = layer3
-              ? `pipeline:${result.diagnostics.layer3SummaryModel || 'self'}`
-              : 'fallback';
-            deps.pushChatLine(deps.renderCompactBoundary(
-              'auto',
-              `${autoDecision.reason} ${(autoDecision.ratio * 100).toFixed(1)}% (${tag})`,
-            ));
-          }
+          const tag = layer3
+            ? `pipeline:${result.diagnostics.layer3SummaryModel || 'self'}`
+            : 'fallback';
+          deps.pushChatLine(deps.renderCompactBoundary(
+            'auto',
+            `${autoDecision.reason} ${(autoDecision.ratio * 100).toFixed(1)}% (${tag})`,
+          ));
           deps.pushDebugLine(deps.muted(
             `[auto-compact pipeline: ${autoDecision.reason} ${autoDecision.usedTokens}/${autoDecision.maxTokens} (${(autoDecision.ratio * 100).toFixed(1)}%)${layer3 ? '' : ' fallback'}]`,
           ));
@@ -218,12 +215,10 @@ export async function runDashboardAutoCompact(
       content: `Compacted conversation summary:\n\n${summary}`,
     } as ChatMessage);
     for (const entry of tail) deps.chatHistory.push(entry as unknown as ChatMessage);
-    if (deps.compactBoundaryEnabled) {
-      deps.pushChatLine(deps.renderCompactBoundary(
-        'auto',
-        `${autoDecision.reason} ${(autoDecision.ratio * 100).toFixed(1)}%${autoDecision.partial ? `, kept last ${autoDecision.preserveLastN}` : ''}`,
-      ));
-    }
+    deps.pushChatLine(deps.renderCompactBoundary(
+      'auto',
+      `${autoDecision.reason} ${(autoDecision.ratio * 100).toFixed(1)}%${autoDecision.partial ? `, kept last ${autoDecision.preserveLastN}` : ''}`,
+    ));
     deps.chatHistory.push(deps.userMsg);
     deps.pushDebugLine(deps.muted(
       `[auto-compact: ${autoDecision.reason} ${autoDecision.usedTokens}/${autoDecision.maxTokens} (${(autoDecision.ratio * 100).toFixed(1)}%)${autoDecision.partial ? `, kept last ${autoDecision.preserveLastN}` : ''}]`,

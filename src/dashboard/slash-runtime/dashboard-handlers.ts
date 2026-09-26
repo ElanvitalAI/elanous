@@ -881,7 +881,6 @@ export interface DashboardSlashContext {
   // case used via `as unknown as LLMMessage[]`).
   compact: {
     getHistory(): { role: string; [k: string]: unknown }[];
-    compactBoundaryEnabled(): boolean;
   };
 
   // B-2.s additions — /provider · /p rotation switcher. Most logic
@@ -1228,8 +1227,6 @@ export interface DashboardSlashContext {
   sessionSlash: {
     /** opts.remote — when the dashboard is attached to a remote daemon. */
     remoteDaemon(): { url: string; token: string | undefined } | null;
-    /** opts.localDaemon — when the dashboard runs on a local daemon socket. */
-    localDaemon(): { socketPath: string } | null;
     /** Swap ACP session id via the existing connection (no restart). */
     acpSwapTo(sessionId: string, cwd: string): Promise<void>;
   };
@@ -4314,12 +4311,11 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     // Originally inline; the session/index.js + acp-boot.js + replay-
     // preview.js helpers are now static-imported in this module.
     // Host-local refs (attachedSessionId / attachedChatId mutable +
-    // opts.remote / opts.localDaemon ref + dashboardAcpSession.swapTo)
+    // opts.remote ref + dashboardAcpSession.swapTo)
     // are threaded via ctx.sessionSlash + the four top-level
     // get/setAttached* fields.
     const seSub = (args[0] ?? 'list').toLowerCase();
     const remote = ctx.sessionSlash.remoteDaemon();
-    const localDaemon = ctx.sessionSlash.localDaemon();
 
     if (seSub === 'list' || seSub === 'ls') {
       const limit = args[1] ? Math.max(1, Math.min(50, Number(args[1]) || 10)) : 10;
@@ -4395,11 +4391,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
           resolved: resolvedId,
           error: resolveErr,
           attachedSessionId: ctx.getAttachedSessionId(),
-          daemon: remote
-            ? `remote:${remote.url}`
-            : localDaemon
-              ? `local:${localDaemon.socketPath}`
-              : 'in-process',
+          daemon: remote ? `remote:${remote.url}` : 'in-process',
         });
       }
       if (resolveErr) {
@@ -4445,9 +4437,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
                 return;
               }
               // Swap succeeded — replay history if the daemon exposes
-              // it via REST. Local-daemon (unix socket) has no REST
-              // endpoint today, so this branch is remote-only by
-              // design; an empty history just leaves chat.history
+              // it via REST; an empty history just leaves chat.history
               // as-is (no destructive wipe on miss).
               const past = await fetchDaemonSessionHistory(httpBase, match.id, remote.token);
               const chatHistory = ctx.compactSlash.chatHistory;
@@ -4483,10 +4473,8 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
           }
         }
         ctx.chatLines.push(ctx.warning(`  No session matches prefix "${prefix}"`));
-        if (remote || localDaemon) {
-          const daemonNote = remote
-            ? `remote daemon ${remote.url}`
-            : `local daemon ${localDaemon!.socketPath}`;
+        if (remote) {
+          const daemonNote = `remote daemon ${remote.url}`;
           ctx.chatLines.push(ctx.muted(`    note: TUI's /session store is local-only.`));
           ctx.chatLines.push(ctx.muted(`    sessions minted by web/PWA or other clients live on the ${daemonNote},`));
           ctx.chatLines.push(ctx.muted(`    not in TUI storage — full daemon-side resume is a follow-up.`));
@@ -6139,12 +6127,10 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
       history.length = 0;
       if (sys) history.push(sys);
       for (const t of tail) history.push(t);
-      if (ctx.compact.compactBoundaryEnabled()) {
-        ctx.pushChatLine(renderCompactBoundary(
-          partial ? 'partial' : 'manual',
-          partial && preserveLastN > 0 ? `last ${preserveLastN}` : undefined,
-        ));
-      }
+      ctx.pushChatLine(renderCompactBoundary(
+        partial ? 'partial' : 'manual',
+        partial && preserveLastN > 0 ? `last ${preserveLastN}` : undefined,
+      ));
       ctx.pushDebugLine(ctx.muted(`[compact] history reset${preserveLastN ? ` (kept last ${preserveLastN} turns)` : ''}`));
     } catch (err) {
       ctx.pushDebugLine(ctx.warning(`[compact] failed: ${err instanceof Error ? err.message : String(err)}`));

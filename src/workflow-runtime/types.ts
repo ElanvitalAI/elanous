@@ -508,6 +508,8 @@ export interface NodeExecContext {
   toolPolicy: ToolPolicy;
   /** Optional abort signal (forwarded to bash / LLM calls). */
   signal?: AbortSignal;
+  /** Optional environment for bash nodes. */
+  env?: NodeJS.ProcessEnv;
   /** Current screen observation, supplied only to judgment nodes that declare it. */
   screen?: unknown;
   /** Surface-unification v2.2 (V2.2-1 · 2026-05-12) — token streaming
@@ -599,7 +601,7 @@ export interface WorkflowDeps {
   /** Run a bash one-liner / heredoc. */
   runBash: (
     body: string,
-    opts: { timeoutMs?: number; signal?: AbortSignal; cwd?: string }
+    opts: { timeoutMs?: number; signal?: AbortSignal; cwd?: string; env?: NodeJS.ProcessEnv }
   ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
   /** Invoke a registered skill by slug. */
   runSkill?: (slug: string, args: string) => Promise<string>;

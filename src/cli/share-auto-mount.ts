@@ -29,7 +29,7 @@
 //     3. macOS NOPASSWD entry for `tailscale serve` (long-term daemon
 //        operators)
 
-import { defaultServe } from '../nexus/onboarding/pwa-share-prompt.js';
+import { autoServe } from '../nexus/onboarding/pwa-share-prompt.js';
 import { probeTailscale, type TailscaleProbe } from '../nexus/onboarding/tailscale-probe.js';
 import { readSwitchValue, readUserConfig } from '../nexus/config/user-config.js';
 import { debug } from '../debug/log.js';
@@ -59,7 +59,7 @@ export interface MountShareOpts {
   // ─── Test seams ─────────────────────────────────────────────────
   readShareSwitchFn?: () => ShareTailnetValue;
   shareProbeFn?: () => Promise<TailscaleProbe>;
-  shareServeFn?: (binary: string, port: number) => Promise<{ exitCode: number }>;
+  shareServeFn?: (binary: string, port: number) => Promise<{ exitCode: number; ladderExhausted?: boolean }>;
 }
 
 /** Read `global.nexus.pwa.shareTailnet` switch (default 'ask' when unset). */
@@ -106,17 +106,21 @@ export async function mountShareIfEnabled(opts: MountShareOpts): Promise<ShareMo
     return { outcome: 'skipped', reason: 'tailscale-down' };
   }
 
-  const serveFn = opts.shareServeFn ?? defaultServe;
+  const serveFn = opts.shareServeFn ?? autoServe;
   const serve = await serveFn(probe.binary ?? 'tailscale', opts.httpPort);
   if (serve.exitCode !== 0) {
-    // Most common cause in fork+detach: `sudo -n` cache empty → exit
-    // 1. Tag the trace so the recovery paths (see module doc above)
-    //    are obvious from the log alone.
+    // Only a caller that actually saw the ladder fail through sudo
+    // (`ladderExhausted === true`) may claim the cache was empty.
+    // Unknown or false leaves the hint off.
     trace('failed', {
       reason: 'serve-error',
       serveExitCode: serve.exitCode,
-      likelyCause: 'sudo-cache-empty-in-fork-detach',
-      recoveryHint: 'run `sudo -v` once in a TTY then restart, or `elanous nexus pwa share enable`',
+      ...(serve.ladderExhausted === true
+        ? {
+            likelyCause: 'sudo-cache-empty-in-fork-detach',
+            recoveryHint: 'run `sudo -v` once in a TTY then restart, or `elanous nexus pwa share enable`',
+          }
+        : {}),
     });
     return { outcome: 'failed', reason: 'serve-error', serveExitCode: serve.exitCode };
   }

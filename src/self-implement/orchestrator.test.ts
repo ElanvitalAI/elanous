@@ -8,7 +8,7 @@ import type { ReviewArtifactInput } from '../agent-substrate/review-artifact.js'
 import { MAX_OFF_DIFF_EVIDENCE_RESULT_CHARS } from './off-diff-evidence.js';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { defaultSeams, preservationHasChanges, parseBehindCount, removeMatchingGoalCopy, toReviewIntentInput } from './seams.js';
@@ -44,7 +44,11 @@ afterAll(() => {
   rmSync(isolatedStateDir, { recursive: true, force: true });
 });
 
-import { seams } from './test-seams.js';
+import { seams as baseSeams } from './test-seams.js';
+const seams = (over: Parameters<typeof baseSeams>[0]): SelfImplementSeams => baseSeams({
+  inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 0 })) as SelfImplementSeams['inspectCodexRotation'],
+  ...over,
+});
 import type { DecisionSignalPressResult } from './decision-signal-press.js';
 import type { SoftStopRequestRead } from '../harness/control-inbox.js';
 
@@ -947,7 +951,6 @@ describe('runSelfImplement — gate execution observation', () => {
       await runSelfImplement({
         feature: 'research goal skips the gate',
         goalFile,
-        graphAuthoritative: true,          // ⛔ 플래그가 config 를 이긴다 — 운영 설정에 안 기댄다
         seams: seams({
           gate: async () => { gateCalls++; return { passed: true, log: 'gate' }; },
           // ⛔ 라우터의 입력을 «주입»한다 — 문서만 바뀐 판이어야 건너뛴다(못 세면 fail-safe 로 «돈다»).
@@ -959,13 +962,19 @@ describe('runSelfImplement — gate execution observation', () => {
       rmSync(goalFile, { force: true });
     }
 
+    // 실행 경로가 남긴 실제 권위 이벤트의 칸과 값은 그대로다.
+    const resolved = events.filter((entry) => entry.event === 'graph-authority-resolved').map((entry) => entry.data);
+    expect(resolved).toHaveLength(1);
+    expect(resolved[0]).toEqual(expect.objectContaining({
+      graphAuthoritative: true, graphAuthoritativeSource: 'default', activeGraphId: 'research-loop',
+    }));
     // ⑴ 게이트 «심»이 한 번도 안 불렸다 — 이름만 안 남긴 것이 아니다.
     expect(gateCalls).toBe(0);
-    // ⑵ 그 사실이 원장에 «값»으로 남는다(출처가 flag 임도 같이).
+    // ⑵ 그 사실이 원장에 «값»으로 남는다(출처는 항상 default).
     const skipped = events.filter((entry) => entry.event === 'gate-skipped-by-graph').map((entry) => entry.data);
     expect(skipped.length).toBeGreaterThan(0);
     expect(skipped[0]).toEqual(expect.objectContaining({
-      graphAuthoritative: true, graphAuthoritativeSource: 'flag', activeGraphId: 'research-loop',
+      graphAuthoritative: true, graphAuthoritativeSource: 'default', activeGraphId: 'research-loop',
       reason: 'documents-only', changedFileCount: 1,
     }));
     // ⑶ 「통과」와 「실행 여부」가 갈린다.
@@ -988,7 +997,6 @@ describe('runSelfImplement — gate execution observation', () => {
       await runSelfImplement({
         feature: 'research goal that touches code still gates',
         goalFile,
-        graphAuthoritative: true,
         seams: seams({
           gate: async () => { gateCalls++; return { passed: true, log: 'gate' }; },
           changedFilesForGateRoute: () => ['docs/RESEARCH-x.md', 'src/x.ts'],   // ← 코드가 섞였다
@@ -1023,7 +1031,6 @@ describe('runSelfImplement — gate execution observation', () => {
       await runSelfImplement({
         feature: 'graph identity follows the active template',
         goalFile,
-        graphAuthoritative: true,
         seams: seams({
           gate: async () => ({ passed: true, log: 'gate' }),
           changedFilesForGateRoute: () => ['docs/RESEARCH-x.md'],
@@ -1272,9 +1279,7 @@ describe('runSelfImplement — Fix A rework', () => {
     const start = ledger.find((entry) => entry.event === 'start')!.data;
     const path = runLedgerPath('run-active-provider-identity', isolatedStateDir);
     const ledgerStart = JSON.parse(readFileSync(path, 'utf8').split('\n').find((line) => JSON.parse(line).event === 'start')!).data;
-    const jq = spawnSync('jq', ['-r', 'select(.event=="start")|.data|{provider,model}', path], { encoding: 'utf8' });
-    expect(jq.status).toBe(0);
-    expect(jq.stdout.trim()).toBe('{\n  "provider": "grok",\n  "model": "grok-4.6-heavy"\n}');
+    expect({ provider: ledgerStart.provider, model: ledgerStart.model }).toEqual({ provider: 'grok', model: 'grok-4.6-heavy' });
     expect(ledgerStart).toMatchObject({ provider: 'grok', model: 'grok-4.6-heavy' });
     expect(start).toMatchObject({ provider: 'grok', model: 'grok-4.6-heavy', auth: 'oauth' });
     for (const key of ['base', 'branch', 'draft', 'feature', 'goalFile', 'goalId', 'goalSource', 'nestDepth', 'parentSessionId', 'runId', 'willFork']) {
@@ -1291,6 +1296,49 @@ describe('runSelfImplement — Fix A rework', () => {
         if (value === undefined) delete process.env[name];
         else process.env[name] = value;
       }
+    }
+  });
+
+  test('start ledger persists the launch repository root and an absolute launch-cwd goal path', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'start-target-root-'));
+    const launch = join(directory, 'repo');
+    const launchCwd = join(launch, 'nested');
+    const relativeGoal = 'docs/goals/x.md';
+    const previousCwd = process.cwd();
+    const runId = 'run-start-target-root';
+    try {
+      mkdirSync(join(launch, '.git'), { recursive: true });
+      mkdirSync(join(launchCwd, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(launchCwd, relativeGoal), '# Goal\n');
+      process.chdir(launchCwd);
+      await runSelfImplement({ feature: 'launch target root', runId, goalFile: relativeGoal, memory: false,
+        writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
+        seams: seams({ writeRunLedger: (entry) => appendRunLedgerEntry(entry, directory) }),
+      });
+      const start = JSON.parse(readFileSync(runLedgerPath(runId, directory), 'utf8').split('\n').find((line) => line && JSON.parse(line).event === 'start')!).data;
+      // 실행 경로는 실제 경로(cwd)를 적는다 — macOS 는 tmpdir 이 /var → /private/var 조상 링크라 realpath 로 비교한다(골 점검표 ⑨).
+      expect(start).toMatchObject({ targetRoot: realpathSync(launch), goalFile: join(realpathSync(launchCwd), relativeGoal), goalSource: 'authored-goal-file' });
+      expect(start).toHaveProperty('branch');
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('start ledger uses absolute launch cwd when there is no git repository', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'start-nongit-root-'));
+    const previousCwd = process.cwd();
+    const runId = 'run-start-nongit-root';
+    try {
+      process.chdir(directory);
+      await runSelfImplement({ feature: 'non-git target root', runId, memory: false,
+        seams: seams({ writeRunLedger: (entry) => appendRunLedgerEntry(entry, directory) }),
+      });
+      const start = JSON.parse(readFileSync(runLedgerPath(runId, directory), 'utf8').split('\n').find((line) => line && JSON.parse(line).event === 'start')!).data;
+      expect(start).toMatchObject({ targetRoot: realpathSync(directory), goalFile: null, goalSource: 'no-goal-file' });
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
@@ -1437,7 +1485,7 @@ describe('runSelfImplement — Fix A rework', () => {
       feature,
       base: null,
       draft: true,
-      goalFile,
+      goalFile: resolve(goalFile),
       goalSource: 'authored-goal-file',
       correlationId: 'request-start-zzz',
     });
@@ -1534,7 +1582,7 @@ describe('runSelfImplement — Fix A rework', () => {
         base: null,
         draft: true,
         goalSource: 'authored-goal-file',
-        goalFile,
+        goalFile: resolve(goalFile),
       }),
     }));
   });
@@ -2903,7 +2951,7 @@ describe('runSelfImplement — Fix A rework', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 20_000); // 📏 2026-09-26: 부하 아래 5~6초 — 기본 5초에 걸려 하루 세 번 «통합 깨짐»·기준선 오진을 냈다(run-c6292393 등)
 
   test('rework note 전문을 artifact로 보존하고 기존 tail·감독 입력을 유지한다', async () => {
     const original = (debug as { log: typeof debug.log }).log;
@@ -4687,6 +4735,54 @@ describe('runSelfImplement — traversal shadow wiring', () => {
     expect(withGraph).toHaveLength(seen.length);
   });
 
+  test.each(['pod', undefined] as const)('node entry compares the pod run contract on %s substrate without blocking', async (substrate) => {
+    const originalContract = process.env.ELANOUS_RUN_CONTRACT;
+    const originalSubstrate = process.env.ELANOUS_SUBSTRATE;
+    const originalLog = debug.log;
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const log: Array<{ event: string; data: Record<string, unknown>; level: unknown }> = [];
+    process.env.ELANOUS_RUN_CONTRACT = JSON.stringify({ substrate: 'pod', profile: 'test-profile', effects: 'draft-pr' });
+    if (substrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+    else process.env.ELANOUS_SUBSTRATE = substrate;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data, options) => {
+      log.push({ event, data: data as Record<string, unknown>, level: options?.level });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({
+        feature: 'contract node entry', runId: `run-contract-entry-${substrate ?? 'local'}`, memory: false,
+        seams: seams({ writeRunLedger: ({ event, data }) => { ledger.push({ event, data }); } }),
+      });
+      expect(result.node).toBe('open-pr');
+      const entries = ledger.filter(({ event }) => event === 'pipeline-node-entry');
+      expect(entries.length).toBeGreaterThan(0);
+      const honored = substrate === 'pod';
+      for (const { data } of entries) {
+        expect(data).toMatchObject({
+          contractSubstrate: 'pod', actualSubstrate: substrate ?? 'local', contractHonored: honored,
+          profile: 'test-profile', effects: 'draft-pr', effectsHonored: 'unmeasured',
+        });
+      }
+      expect(ledger.filter(({ event }) => event === 'graph-run-contract-resolved')).toHaveLength(1);
+      const violations = log.filter(({ event }) => event === 'graph-contract-violation');
+      expect(ledger.filter(({ event }) => event === 'graph-contract-violation')).toHaveLength(honored ? 0 : entries.length);
+      expect(violations).toHaveLength(honored ? 0 : entries.length);
+      for (const violation of violations) {
+        expect(violation.level).toBe('warn');
+        expect(violation.data).toMatchObject({
+          node: expect.any(String), round: expect.any(Number),
+          contractSubstrate: 'pod', actualSubstrate: 'local',
+        });
+      }
+      expect(violations.map(({ data }) => [data.node, data.round])).toEqual(entries.filter(() => !honored).map(({ data }) => [data.node, data.round]));
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+      if (originalContract === undefined) delete process.env.ELANOUS_RUN_CONTRACT;
+      else process.env.ELANOUS_RUN_CONTRACT = originalContract;
+      if (originalSubstrate === undefined) delete process.env.ELANOUS_SUBSTRATE;
+      else process.env.ELANOUS_SUBSTRATE = originalSubstrate;
+    }
+  });
+
   test('0단계 — pipeline-node-entry가 현재 그래프의 노드 선언 판정을 기록한다', async () => {
     const seen: Array<{ event: string; data: Record<string, unknown> }> = [];
     await runSelfImplement({
@@ -4710,16 +4806,12 @@ describe('runSelfImplement — traversal shadow wiring', () => {
   });
 
   test('enabling additive traversal instrumentation preserves result and every existing observation', async () => {
-    const run = async (
-      graphAuthoritative: boolean | undefined,
-      observePipeline: SelfImplementSeams['observePipeline'],
-    ) => {
+    const run = async (observePipeline: SelfImplementSeams['observePipeline']) => {
       const { events, restore } = capturePipelineEvents();
       const pipelineEvents: Array<{ event: string; data: Record<string, unknown> }> = [];
       try {
         const result = await runSelfImplement({
           feature: 'invariance', runId: 'run-pipeline-invariance', memory: false,
-          ...(graphAuthoritative === undefined ? {} : { graphAuthoritative }),
           seams: seams({ observePipeline: observePipeline === false ? false : (event, data) => { pipelineEvents.push({ event, data }); } }),
         });
         return { result, existing: events, pipelineEvents };
@@ -4728,9 +4820,8 @@ describe('runSelfImplement — traversal shadow wiring', () => {
       }
     };
 
-    for (const graphAuthoritative of [false, undefined] as const) {
-      const disabled = await run(graphAuthoritative, false);
-      const enabled = await run(graphAuthoritative, () => {});
+    const disabled = await run(false);
+    const enabled = await run(() => {});
       expect(enabled.result).toEqual(disabled.result);
       const withoutTerminalSequence = (entries: typeof enabled.existing) => entries.map(({ data, ...entry }) => {
         const { terminalSeq: _terminalSeq, ...existingData } = data;
@@ -4744,9 +4835,7 @@ describe('runSelfImplement — traversal shadow wiring', () => {
         expect.objectContaining({ event: 'pipeline-traversal-shadow', data: expect.objectContaining({ classification: 'legal-terminal-match', terminalNode: 'open-pr', runId: 'run-pipeline-invariance' }) }),
       ]);
       const budgetEvents = enabled.pipelineEvents.filter(({ event }) => event === 'graph-visit-budget');
-      if (graphAuthoritative === false) expect(budgetEvents).toEqual([]);
-      else expect(budgetEvents.map(({ data }) => data.node)).toEqual(['implement', 'gate', 'open-pr']);
-    }
+      expect(budgetEvents.map(({ data }) => data.node)).toEqual(['implement', 'gate', 'open-pr']);
   });
 
   test('checker and pipeline observer failures are fail-soft', async () => {
@@ -4949,15 +5038,107 @@ describe('runSelfImplement — terminal pipeline nodes', () => {
     }
   });
 
-  test('post-sync introduced regression remains an integration-break interruption', async () => {
+  test.each([
+    ['timeout', { introduced: 0, preexisting: 0, unknown: 0, timedOut: 1 }],
+    ['flaky rerun', { introduced: 0, preexisting: 0, unknown: 0, timedOut: 0, flakyRerun: 1 }],
+  ] as const)('post-sync %s only without child attribution continues under human confirmation', async (_label, facts) => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => { events.push({ event, data: data as Record<string, unknown> }); }) as typeof debug.log;
+    let approvals = 0;
+    let merges = 0;
+    try {
+      const s = terminalG2Seams({ mergeStatus: 'merged', gateResults: [true, false] });
+      s.gate = async (_cwd, ctx) => ctx?.mode === 'postsync'
+        ? { passed: false, log: 'timed out', reflectGateFacts: facts }
+        : { passed: true, log: 'ok' };
+      s.reviewDiff = async () => ({ verdict: 'warn', mustFix: [], shouldFix: [], summary: 'reviewed', reviewed: true, diffTruncated: false });
+      s.approvePr = async () => { approvals++; return true; };
+      s.mergePr = async () => { merges++; return { merged: true }; };
+      const result = await runSelfImplement({ feature: 'post-sync timeout human confirmation', autoMerge: true, seams: s });
+      expect(result).toMatchObject({ stage: 'pr-opened', mergeReason: GATE_TIMEOUT_UNMEASURED_MERGE_REASON, gate: { passed: false } });
+      expect(approvals).toBe(1);
+      expect(merges).toBe(0);
+      expect(events.filter(({ event }) => event === 'post-sync-gate-timeout-only-continued')).toHaveLength(1);
+      expect(events.find(({ event }) => event === 'post-sync-gate-timeout-only-continued')?.data)
+        .toMatchObject({ introduced: 0, unknown: 0, timedOut: facts.timedOut });
+      expect(events.filter(({ event }) => event === 'merge-decision')).toHaveLength(1);
+      expect(events.filter(({ event }) => event === 'merge-decision').at(-1)?.data).toMatchObject({ decision: 'hitl', reason: GATE_TIMEOUT_UNMEASURED_MERGE_REASON });
+    } finally { (debug as { log: typeof debug.log }).log = original; }
+  });
+
+  test('post-sync timeout-only after LLM conflict resolution also continues without automatic merge', async () => {
+    const s = terminalG2Seams({ mergeStatus: 'llm-resolved', gateResults: [true, false] });
+    s.gate = async (_cwd, ctx) => ctx?.mode === 'postsync'
+      ? { passed: false, log: 'timeout', reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 0, timedOut: 1 } }
+      : { passed: true, log: 'ok' };
+    s.reviewDiff = async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true, diffTruncated: false });
+    let merged = 0;
+    s.mergePr = async () => { merged++; return { merged: true }; };
+    const result = await runSelfImplement({ feature: 'llm-resolved timeout-only', autoMerge: true, seams: s });
+    expect(result).toMatchObject({ stage: 'pr-opened', gate: { passed: false }, mergeReason: GATE_TIMEOUT_UNMEASURED_MERGE_REASON });
+    expect(merged).toBe(0);
+  });
+
+  test('post-sync timeout-only regate requires human approval before opening an auto-authorized PR', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => { events.push({ event, data: data as Record<string, unknown> }); }) as typeof debug.log;
+    try {
+      const s = terminalG2Seams({ mergeStatus: 'merged', gateResults: [true, false] });
+      let approvals = 0;
+      s.approvePr = async () => { approvals++; return false; };
+      s.reviewDiff = async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true, diffTruncated: false });
+      let opened = 0;
+      s.openPr = async () => { opened++; return { url: 'https://pr/unexpected', number: 99 }; };
+      s.gate = async (_cwd, ctx) => {
+        expect(events.filter(({ event }) => event === 'merge-decision')).toHaveLength(0);
+        return ctx?.mode === 'postsync'
+          ? { passed: false, log: 'timeout', reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 0, timedOut: 1 } }
+          : { passed: true, log: 'ok' };
+      };
+      const result = await runSelfImplement({ feature: 'post-sync timeout declined approval', autoMerge: true, seams: s });
+      expect(result).toMatchObject({ stage: 'pr-declined', mergeReason: GATE_TIMEOUT_UNMEASURED_MERGE_REASON });
+      expect(result.mergeApprovalReceived).toBeUndefined();
+      expect(approvals).toBe(1);
+      expect(events.filter(({ event }) => event === 'merge-decision')).toHaveLength(1);
+      expect(events.find(({ event }) => event === 'merge-decision')?.data).toMatchObject({ decision: 'hitl', reason: GATE_TIMEOUT_UNMEASURED_MERGE_REASON });
+      expect(events.find(({ event }) => event === 'post-sync-gate-timeout-only-continued')?.data).toMatchObject({ introduced: 0, unknown: 0, timedOut: 1 });
+      expect(opened).toBe(0);
+    } finally { (debug as { log: typeof debug.log }).log = original; }
+  });
+
+  test('human approval of the initial gate does not approve a later post-sync timeout', async () => {
     const s = terminalG2Seams({ mergeStatus: 'merged', gateResults: [true, false] });
+    const approvals: Array<string | undefined> = [];
+    let opened = 0;
+    s.approvePr = async ({ gateLog }) => {
+      approvals.push(gateLog);
+      return approvals.length === 1;
+    };
+    s.openPr = async () => { opened++; return { url: 'https://pr/unexpected', number: 99 }; };
+    s.gate = async (_cwd, ctx) => ctx?.mode === 'postsync'
+      ? { passed: false, log: 'post-sync timeout', reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 0, timedOut: 1 } }
+      : { passed: true, log: 'initial gate passed' };
+    const result = await runSelfImplement({ feature: 'initial approval cannot authorize later timeout', seams: s });
+    expect(approvals).toEqual(['initial gate passed', expect.stringContaining('post-sync timeout')]);
+    expect(approvals[1]).toContain(`post-sync gate timeout-only (introduced=0, unknown=0, timedOut=1, flakyRerun=unmeasured); merge reason: ${GATE_TIMEOUT_UNMEASURED_MERGE_REASON}`);
+    expect(result).toMatchObject({ ok: false, stage: 'pr-declined', mergeReason: GATE_TIMEOUT_UNMEASURED_MERGE_REASON, gate: { passed: false } });
+    expect(opened).toBe(0);
+  });
+
+  test('post-sync introduced regression remains an integration-break interruption even with timeout evidence', async () => {
+    const ledger: Array<{ event: string }> = [];
+    const s = terminalG2Seams({ mergeStatus: 'merged', gateResults: [true, false] });
+    s.writeRunLedger = (entry) => { ledger.push(entry); };
     let call = 0;
     s.gate = async () => call++ === 0
       ? { passed: true, log: 'gate' }
-      : { passed: false, log: 'introduced regression', reflectGateFacts: { introduced: 1, preexisting: 0, unknown: 0, timedOut: 0 } };
+      : { passed: false, log: 'introduced regression', reflectGateFacts: { introduced: 1, preexisting: 0, unknown: 0, timedOut: 1, childResponsibility: 'none' } };
     const result = await runSelfImplement({ feature: 'introduced regate regression', seams: s });
     expect(result).toMatchObject({ ok: false, stage: 'gate-failed', node: 'regate' });
     expect(result.detail).toContain('integration break');
+    expect(ledger.filter(({ event }) => event === 'post-sync-gate-timeout-only-continued')).toHaveLength(0);
   });
 });
 
@@ -5037,6 +5218,68 @@ describe('판정 입력 배관 — 생산에서 실제로 닿는가', () => {
       event: 'gate-failed-child-unrelated-escalated',
       data: expect.objectContaining({ round: 0, childResponsibility: 'none', introduced: 0, preexisting: 0, unknown: 1, unknownReason: 'module-load-error' }),
     }));
+  });
+
+  test('실패 시험 0건에 같은 미검증 집합이 두 라운드 연속이면 재작업을 멈추고 사람에게 올린다(run-7dd4cce6)', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const original = (debug as { log: typeof debug.log }).log;
+    const features: string[] = [];
+    let gates = 0;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      const result = await runSelfImplement({
+        feature: 'F',
+        maxReworkRounds: 4,
+        seams: seams({
+          features,
+          gate: async () => {
+            gates++;
+            // 순서가 바뀌어도 같은 집합이다.
+            const unverified = gates % 2 ? ['src/b.ts', 'src/a.ts'] : ['src/a.ts', 'src/b.ts'];
+            return { passed: false, log: '[test] 0 fail · unverified 2', unverified, reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 0, childResponsibility: 'none' } };
+          },
+        }),
+      });
+      expect(result).toMatchObject({ stage: 'gate-failed', node: 'rework', outcome: 'abandoned' });
+      expect(result.detail).toContain('same 2 unverified file(s)');
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+    expect(gates).toBe(2);
+    expect(features).toHaveLength(2);
+    expect(events).toContainEqual(expect.objectContaining({
+      event: 'gate-failed-unverified-repeat-escalated',
+      data: expect.objectContaining({ round: 1, unverified: ['src/a.ts', 'src/b.ts'], unverifiedCount: 2 }),
+    }));
+  });
+
+  test('미검증 집합이 바뀌거나 실패 시험이 있으면 반복으로 세지 않는다', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const original = (debug as { log: typeof debug.log }).log;
+    let gates = 0;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      await runSelfImplement({
+        feature: 'F',
+        maxReworkRounds: 2,
+        seams: seams({
+          gate: async () => {
+            gates++;
+            if (gates === 1) return { passed: false, log: '[test] 0 fail', unverified: ['src/a.ts'], reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 0, childResponsibility: 'none' } };
+            if (gates === 2) return { passed: false, log: '[test] 0 fail', unverified: ['src/a.ts', 'src/c.ts'], reflectGateFacts: { introduced: 0, preexisting: 0, unknown: 0, childResponsibility: 'none' } };
+            return { passed: false, log: '[test] 1 fail', unverified: ['src/a.ts', 'src/c.ts'], reflectGateFacts: { introduced: 1, preexisting: 0, unknown: 0 } };
+          },
+        }),
+      });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+    expect(gates).toBe(3);
+    expect(events).not.toContainEqual(expect.objectContaining({ event: 'gate-failed-unverified-repeat-escalated' }));
   });
 
   test('baseline 예산 초과는 환경 결손으로 부르지 않고 예산과 범위 파일 수를 원장·종료 사유에 남긴다', async () => {
@@ -6074,6 +6317,7 @@ function revSeams(opts: {
   const s: SelfImplementSeams = {
     stdinIsInteractive: () => false,
     refreshCodexQuotaSignals: async () => ({ accounts: [] }),
+    inspectCodexRotation: (() => ({ reason: 'no-candidate', candidateCount: 0, knownAccountCount: 0 })) as SelfImplementSeams['inspectCodexRotation'],
     escalateGoalClarifications: async () => ({ output: '{}', result: { answers: {} } }),
     queryRunChain: () => ({ entries: [] }),
     writeRunLedger: () => {},
@@ -7001,6 +7245,47 @@ describe('runSelfImplement — review-gated merge', () => {
     expect(attached.abandonedClassification?.classification).not.toBe('quota-exhausted');
   });
 
+  test('codex no-candidate cannot mask a grok child UNCONVERGEABLE verdict; default codex still exhausts', async () => {
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      for (const childLlm of [{ provider: 'grok', model: 'grok-4.7', source: 'flag' } as const, undefined]) {
+        const s = revSeams({ reviews: [
+          { verdict: 'fail', mustFix: ['first blocking finding'] },
+          { verdict: 'fail', mustFix: ['repeated blocking finding'] },
+        ] });
+        s.currentProviderName = () => 'openai-codex';
+        s.inspectCodexRotation = (() => ({ reason: 'no-candidate', candidateCount: 3, knownAccountCount: 3,
+          currentUsedPercent: 95, thresholdPercent: 95 })) as SelfImplementSeams['inspectCodexRotation'];
+        let supervisorVerdicts = 0;
+        s.diagnose = async ({ purpose }) => {
+          if (purpose === 'escalation-triage') return 'TRIAGE: retry';
+          supervisorVerdicts++;
+          return supervisorVerdicts === 1
+            ? 'BUDGET: EXTEND\nREASON: establish a comparison round'
+            : 'BUDGET: UNCONVERGEABLE\nREASON: repeated findings cannot converge';
+        };
+        s.judgmentCallLLM = async () => 'UNCONVERGEABLE';
+        s.decomposeShadowGoals = async () => ({
+          goals: [{ id: 'one', feature: 'first independent goal' }, { id: 'two', feature: 'second independent goal' }],
+          decomposition: { recommendedMaxTasks: 6, actualTaskCount: 2, truncatedAtHardMax: false, exceededRecommendedMax: false, outcome: 'decomposed' as const },
+        });
+        const result = await runSelfImplement({ feature: 'run provider quota attribution', maxReworkRounds: 2, reworkBudgetShadowStop: false, ...(childLlm ? { childLlm } : {}), seams: s });
+        expect(supervisorVerdicts).toBe(2);
+        expect(result).toMatchObject({ stage: 'review-blocked', outcome: 'abandoned', supervisorVerdict: 'UNCONVERGEABLE' });
+        expect(result.abandonedClassification?.classification).toBe(childLlm ? 'goal-unconvergeable-candidate' : 'quota-exhausted');
+        expect(result.quotaExhaustionAssessment?.exhausted).toBe(childLlm ? undefined : true);
+        expect(events.filter(({ category, event }) => category === 'self-implement.abandoned' && event === 'quota-provider').at(-1)?.data)
+          .toMatchObject({ runProvider: childLlm?.provider ?? 'openai-codex', defaultProvider: 'openai-codex', used: !childLlm });
+      }
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
   test('actual abandoned orchestration paths use the injected rotation authority and retain account grounds', async () => {
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const original = (debug as { log: typeof debug.log }).log;
@@ -7172,17 +7457,55 @@ describe('defaultSeams — pinned auto-merge', () => {
       .rejects.toThrow(`git diff fixed commits failed: ${missingLabel} SHA ${missingSha} is missing from remote repository (HTTP 404)`);
   });
 
-  test('confirmed merge는 gh merge 성공 뒤 MERGED 상태와 관측 base를 확인한다', async () => {
+  test('confirmed merge는 gh merge 성공 뒤 MERGED 상태와 관측 base 및 merge commit을 확인한다', async () => {
     const calls: string[][] = [];
     const run = ((command: string, args: readonly string[]) => {
       calls.push([command, ...args]);
+      if (args.includes('mergeCommit')) return { status: 0, stdout: '{"mergeCommit":{"oid":"merged-sha"}}\n', stderr: '' };
       if (args[0] === 'pr' && args[1] === 'view') return { status: 0, stdout: '{"state":"MERGED","baseRefName":"actual-parent-branch"}\n', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     }) as typeof spawnSync;
     const result = await defaultSeams({ spawnSync: run }).mergePr!({ number: 9, cwd: '/wt', matchHeadCommit: 'checked-head-sha' });
-    expect(result).toEqual({ merged: true, baseRefName: 'actual-parent-branch' });
+    expect(result).toEqual({ merged: true, baseRefName: 'actual-parent-branch', mergeCommit: 'merged-sha' });
     expect(calls).toEqual([
       ['gh', 'pr', 'merge', '9', '--squash', '--match-head-commit', 'checked-head-sha'],
+      ['gh', 'pr', 'view', '9', '--json', 'state,baseRefName'],
+      ['gh', 'pr', 'view', '9', '--json', 'mergeCommit'],
+    ]);
+  });
+
+  test.each([
+    ['command failure', 1, '', 'network unavailable'],
+    ['malformed JSON', 0, '{broken', ''],
+    ['missing SHA', 0, '{"mergeCommit":null}', ''],
+  ])('confirmed merge keeps its result when mergeCommit lookup has %s', async (_case, status, stdout, stderr) => {
+    const calls: string[][] = [];
+    const run = ((command: string, args: readonly string[]) => {
+      calls.push([command, ...args]);
+      if (args.includes('mergeCommit')) return { status, stdout, stderr };
+      if (args[1] === 'view') return { status: 0, stdout: '{"state":"MERGED","baseRefName":"main"}', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    }) as typeof spawnSync;
+    expect(await defaultSeams({ spawnSync: run }).mergePr!({ number: 9, cwd: '/wt' }))
+      .toEqual({ merged: true, baseRefName: 'main' });
+    expect(calls).toEqual([
+      ['gh', 'pr', 'merge', '9', '--squash'],
+      ['gh', 'pr', 'view', '9', '--json', 'state,baseRefName'],
+      ['gh', 'pr', 'view', '9', '--json', 'mergeCommit'],
+    ]);
+  });
+
+  test('state가 OPEN이면 merge commit을 조회하지 않고 실패 결과를 유지한다', async () => {
+    const calls: string[][] = [];
+    const run = ((command: string, args: readonly string[]) => {
+      calls.push([command, ...args]);
+      if (args[1] === 'view') return { status: 0, stdout: '{"state":"OPEN","baseRefName":"main"}', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    }) as typeof spawnSync;
+    expect(await defaultSeams({ spawnSync: run }).mergePr!({ number: 9, cwd: '/wt' }))
+      .toEqual({ merged: false, detail: 'PR state is OPEN after merge command' });
+    expect(calls).toEqual([
+      ['gh', 'pr', 'merge', '9', '--squash'],
       ['gh', 'pr', 'view', '9', '--json', 'state,baseRefName'],
     ]);
   });
@@ -8215,9 +8538,16 @@ describe('B 근본수리 — 단계 wall-clock 가드(6h 좀비 차단·관측·
 
   test('auto-approved merge decision followed by main-sync timeout is merge-approved-abandoned, not implementation-deficit', async () => {
     const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    let regates = 0;
+    let opened = 0;
+    const originalGate = s.gate;
+    s.gate = async (...args) => { regates++; return originalGate(...args); };
+    s.openPr = async () => { opened++; return { url: 'https://pr/unexpected', number: 42 }; };
     s.commitWork = () => {};
     s.mergeMain = () => new Promise(() => {}) as Promise<never>;
     const r = await runSelfImplement({ feature: 'F', autoMerge: true, stepTimeouts: { merge: 40 }, seams: s });
+    expect(regates).toBe(1);
+    expect(opened).toBe(0);
     expect(r).toMatchObject({
       stage: 'timed-out',
       mergeApprovalReceived: true,
@@ -10837,6 +11167,92 @@ describe('runSelfImplement — rework budget judgment', () => {
     delete (s as { judgmentCallLLM?: unknown }).judgmentCallLLM;
     await expect(runSelfImplement({ feature: 'F', maxReworkRounds: 2, seams: s }))
       .rejects.toThrow('rework-budget@v1 requires a judgment provider');
+  });
+
+  test('unsupported classification falls back once to the adaptive cap and completes the next round', async () => {
+    const events: Array<{ event: string; data: Record<string, unknown>; level?: string }> = [];
+    const features: string[] = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data, opt) => {
+      events.push({ event, data: data as Record<string, unknown>, level: opt?.level });
+    }) as typeof debug.log;
+    try {
+      const s = seams({ features, gateResults: [false, true] });
+      s.diagnose = async () => 'BUDGET: EXTEND\nREASON: repair gate';
+      s.judgmentCallLLM = async () => 'unknown';
+      const result = await runSelfImplement({ feature: 'unsupported classification once', maxReworkRounds: 1, seams: s });
+      expect(result).toMatchObject({ stage: 'pr-opened', ok: true });
+      expect(features).toHaveLength(2);
+      expect(features[1]).toContain('[라운드 1/1');
+      const fallback = events.filter(({ event }) => event === 'rework-budget-unresolved-fallback');
+      expect(fallback).toHaveLength(1);
+      expect(fallback[0]).toMatchObject({ level: 'warn', data: { round: 1, consecutive: 1, error: expect.stringContaining('classification did not resolve a supported class') } });
+      expect(String(fallback[0]!.data.error).length).toBeLessThanOrEqual(200);
+    } finally { (debug as { log: typeof debug.log }).log = original; }
+  });
+
+  test('two consecutive unsupported classifications preserve the draft and decomposition instead of throwing', async () => {
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const features: string[] = [];
+    const opened: Array<{ draft?: boolean; body: string }> = [];
+    let decomposeCalls = 0;
+    const repo = mkdtempSync(join(tmpdir(), 'unresolved-budget-preservation-'));
+    const preservedBodyPath = join(repo, 'blocked-draft-body.md');
+    const git = (...args: string[]) => spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
+    try {
+      expect(git('init', '-q').status).toBe(0);
+      expect(git('config', 'user.email', 'test@example.com').status).toBe(0);
+      expect(git('config', 'user.name', 'Test').status).toBe(0);
+      writeFileSync(join(repo, 'artifact.ts'), 'export const baseline = true;\n');
+      expect(git('add', 'artifact.ts').status).toBe(0);
+      expect(git('commit', '-qm', 'baseline').status).toBe(0);
+      const base = git('rev-parse', 'HEAD').stdout.trim();
+      const artifact = 'export const preservedWork = "unresolved-budget";\n';
+      const s = seams({ features, gateResults: [false, false, false] });
+      s.createWorktree = async ({ branch }) => ({ path: repo, branch, resolvedBase: base });
+      s.implement = async ({ feature }) => { features.push(feature); writeFileSync(join(repo, 'artifact.ts'), artifact); return { ok: true, summary: 'preserved artifact.ts' }; };
+      s.preservationHasChanges = ({ cwd, base: preservationBase }) => preservationHasChanges(cwd, preservationBase);
+      s.writeRunLedger = ({ event, data }) => { ledger.push({ event, data }); };
+      s.diagnose = async () => 'BUDGET: EXTEND\nREASON: try repair';
+      s.judgmentCallLLM = async () => 'unknown';
+      s.decomposeShadowGoals = async () => { decomposeCalls++; return { goals: [], decomposition: { recommendedMaxTasks: 6, actualTaskCount: 0, truncatedAtHardMax: false, exceededRecommendedMax: false, outcome: 'single-no-subtasks' } }; };
+      s.openPr = async ({ draft, body, cwd }) => {
+        expect(cwd).toBe(repo);
+        expect(readFileSync(join(cwd, 'artifact.ts'), 'utf8')).toBe(artifact);
+        writeFileSync(preservedBodyPath, body);
+        opened.push({ draft, body });
+        return { url: 'https://pr/unresolved', number: 81 };
+      };
+      const result = await runSelfImplement({ feature: 'src/a.ts and docs/b.md', maxReworkRounds: 3, seams: s });
+      expect(result).toMatchObject({ stage: 'gate-failed', node: 'rework', worktreePath: repo, prUrl: 'https://pr/unresolved', supervisorVerdict: 'UNCONVERGEABLE' });
+      expect(result.detail).toContain('rework-budget classification unresolved ×2');
+      expect(readFileSync(join(result.worktreePath!, 'artifact.ts'), 'utf8')).toBe(artifact);
+      expect(git('diff', base, '--', 'artifact.ts').stdout).toContain('preservedWork');
+      expect(features).toHaveLength(2);
+      expect(opened).toHaveLength(1);
+      expect(opened[0]).toMatchObject({ draft: true, body: expect.stringContaining('rework-budget classification unresolved ×2') });
+      expect(readFileSync(preservedBodyPath, 'utf8')).toContain('rework-budget classification unresolved ×2');
+      expect(readFileSync(preservedBodyPath, 'utf8')).toContain('preserved artifact.ts');
+      expect(decomposeCalls).toBe(1);
+      expect(ledger.filter(({ event }) => event === 'rework-budget-unresolved-fallback').map(({ data }) => data.consecutive)).toEqual([1, 2]);
+      expect(ledger.filter(({ event }) => event === 'rework-blocked-draft-pr')).toHaveLength(1);
+    } finally { rmSync(repo, { recursive: true, force: true }); }
+  });
+
+  test('an explicitly unsupported class error uses the same bounded fallback', async () => {
+    const features: string[] = [];
+    const ledger: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const s = seams({ features, gateResults: [false, true] });
+    s.writeRunLedger = ({ event, data }) => { ledger.push({ event, data }); };
+    s.diagnose = async () => 'BUDGET: EXTEND\nREASON: retry';
+    const failure = `rework-budget@v1 returned unsupported class '${'x'.repeat(240)}'`;
+    s.judgmentCallLLM = async () => { throw new Error(failure); };
+    const result = await runSelfImplement({ feature: 'unsupported class', maxReworkRounds: 1, seams: s });
+    expect(result.stage).toBe('pr-opened');
+    expect(features).toHaveLength(2);
+    expect(ledger.filter(({ event }) => event === 'rework-budget-unresolved-fallback')).toEqual([
+      expect.objectContaining({ data: expect.objectContaining({ round: 1, consecutive: 1, error: failure.slice(0, 200) }) }),
+    ]);
   });
 
   test('judgment executor 오류는 fail-soft diagnose 경로로 삼켜지지 않는다', async () => {
@@ -14877,6 +15293,7 @@ describe('declared-scope-diff 관측 착지 — 완주·중단 판정은 그대�
         declaredScopeOutsideNames: ['src/outside.ts'],
         declaredScopeOutsideNameCapReached: false,
       });
+      expect(events.some((entry) => entry.event === 'boundary-violated')).toBe(false);
     } finally {
       (debug as { log: typeof debug.log }).log = original;
       rmSync(root, { recursive: true, force: true });
@@ -14911,6 +15328,56 @@ describe('declared-scope-diff 관측 착지 — 완주·중단 판정은 그대�
       (debug as { log: typeof debug.log }).log = original;
     }
   });
+
+  test('하나도 안 만든 사람 줄은 그대로 두고, 그 옆에서 경계 글로브에 닿은 파일을 말한다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'scope-diff-boundary-'));
+    const repo = join(root, 'repo');
+    const goalFile = join(root, 'GOAL-boundary.txt');
+    mkdirSync(repo);
+    const progress: Array<{ stage: string; message: string }> = [];
+    try {
+      spawnSync('git', ['init', '-q', '-b', 'main'], { cwd: repo });
+      spawnSync('git', ['config', 'user.email', 't@t'], { cwd: repo });
+      spawnSync('git', ['config', 'user.name', 't'], { cwd: repo });
+      mkdirSync(join(repo, 'src', 'nexus'), { recursive: true });
+      writeFileSync(join(repo, 'src', 'kept.ts'), 'export const kept = true;\n');
+      spawnSync('git', ['add', '-A'], { cwd: repo });
+      spawnSync('git', ['commit', '-qm', 'seed'], { cwd: repo });
+      spawnSync('git', ['update-ref', 'refs/remotes/origin/main', 'HEAD'], { cwd: repo });
+      writeFileSync(goalFile, [
+        goalDocumentWithDeclaredTargets('src/kept.ts · src/also.ts'),
+        '',
+        '경계: `src/nexus/**` 는 이 골이 아니다.',
+      ].join('\n'), 'utf8');
+
+      const result = await runSelfImplement({
+        feature: 'declared scope boundary beside unmade',
+        goalFile,
+        seams: seams({
+          implement: async ({ cwd }) => {
+            writeFileSync(join(cwd, 'src', 'nexus', 'gateway.ts'), 'export const leaked = true;\n');
+            writeFileSync(join(cwd, 'note.md'), 'outside and not a boundary\n');
+            return { ok: true, summary: 'impl' };
+          },
+          createWorktree: async () => ({ path: repo, branch: 'se/scope-diff-boundary', resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
+          commitWork: (cwd, message) => { spawnSync('git', ['add', '-A'], { cwd }); spawnSync('git', ['commit', '-qm', message], { cwd }); },
+          mergeMain: async () => ({ status: 'up-to-date' }),
+          reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'pass', reviewed: true }),
+          onProgress: (event) => { progress.push(event); },
+        }),
+      });
+
+      expect(result).toMatchObject({ ok: true, stage: 'pr-opened', outcome: 'completed' });
+      const unmade = progress.find((entry) => entry.stage === 'declared-targets-unmade');
+      expect(unmade?.message).toContain('하나도');
+      expect(unmade?.message).toContain('src/kept.ts');
+      const violated = progress.find((entry) => entry.stage === 'boundary-violated');
+      expect(violated?.message).toContain('src/nexus/gateway.ts');
+      expect(violated?.message).not.toContain('note.md');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
 
 describe('runSelfImplement — 예산 판정기는 must-fix 문장을 받는다', () => {

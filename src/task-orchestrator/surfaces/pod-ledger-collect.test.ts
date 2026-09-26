@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
-import { collectPodLedgers, parsePodLedgerChunks } from './pod-ledger-collect.js';
+import { collectPodLedgers, createPodLedgerFollower, parsePodLedgerChunks } from './pod-ledger-collect.js';
+import { writeFileSync } from 'node:fs';
 
 const runId = 'run-12345678-1234-1234-1234-123456789abc';
 const otherId = 'run-87654321-1234-1234-1234-123456789abc';
@@ -73,6 +74,19 @@ describe('pod run-ledger collection', () => {
     } finally { rmSync(f.source, { recursive: true, force: true }); rmSync(f.destination, { recursive: true, force: true }); }
   });
 
+  test('collecting an identical complete snapshot again is distinct from a conflicting host ledger', () => {
+    const f = fixture();
+    try {
+      const dir = runLedgerDir(f.destination);
+      const events: string[] = [];
+      const collect = () => collectPodLedgers(f.lines.join('\n'), { dir, log: (_c, event) => events.push(event) });
+      collect();
+      collect();
+      expect(readFileSync(runLedgerPath(runId, dir)).equals(f.original)).toBe(true);
+      expect(events).toEqual(['ledger-collected', 'ledger-collect-already-complete']);
+    } finally { rmSync(f.source, { recursive: true, force: true }); rmSync(f.destination, { recursive: true, force: true }); }
+  });
+
   test('duplicate or malformed parts and unsafe run ids never write files', () => {
     const dest = mkdtempSync(join(tmpdir(), 'pod-ledger-unsafe-'));
     try {
@@ -92,5 +106,53 @@ describe('pod run-ledger collection', () => {
     expect(parsePodLedgerChunks([single, conflicting].join('\n'))).toMatchObject({
       error: [{ runId, reason: 'invalid or duplicate chunk' }], ledgers: [],
     });
+  });
+});
+
+// 🅣 요청(2026-09-26): 런 «도중» 원장 증분 회수 — 호스트 슈퍼바이저가 Pod 걸음을 실시간으로 본다.
+describe('pod ledger live follower', () => {
+  const noLog = () => {};
+  test('appends only complete lines, remembers the byte offset, and asks only for new bytes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-live-'));
+    const podFile = ['{"a":1}\n{"b":', '2}\n{"c":3}\n'];
+    let served = 0;
+    const scripts: string[] = [];
+    const f = createPodLedgerFollower({ runId, dir, log: noLog, exec: (script) => { scripts.push(script); return { status: 0, stdout: podFile[served++] ?? '', stderr: '' }; } });
+    f.poll();
+    expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('{"a":1}\n');   // 반쪽 줄은 잡아 둔다
+    f.poll();
+    expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('{"a":1}\n{"b":2}\n{"c":3}\n');
+    expect(scripts[0]).toContain('tail -c +1 ');
+    expect(scripts[1]).toContain(`tail -c +${Buffer.byteLength(podFile[0]!) + 1} `);
+    expect(f.owned).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('never touches a host ledger someone else made', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-live-'));
+    writeFileSync(runLedgerPath(runId, dir), 'HOST\n');
+    let calls = 0;
+    const events: string[] = [];
+    const f = createPodLedgerFollower({ runId, dir, log: (_c, e) => events.push(e), exec: () => { calls++; return { status: 0, stdout: 'x\n', stderr: '' }; } });
+    f.poll(); f.poll();
+    expect(calls).toBe(0);
+    expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('HOST\n');
+    expect(events).toEqual(['ledger-live-skipped']);
+    expect(f.owned).toBe(false);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('the final collection replaces the partial live copy (and only that one)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-live-'));
+    const full = '{"a":1}\n{"b":2}\n{"done":true}\n';
+    const f = createPodLedgerFollower({ runId, dir, log: noLog, exec: () => ({ status: 0, stdout: '{"a":1}\n', stderr: '' }) });
+    f.poll();
+    collectPodLedgers(transfer(runId, full).join('\n'), { dir, log: noLog, replace: new Set(f.owned ? [runId] : []) });
+    expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(full);
+    // 대조군: 교체 허용이 없으면 종전처럼 덮지 않는다
+    writeFileSync(runLedgerPath(otherId, dir), 'HOST\n');
+    collectPodLedgers(transfer(otherId, full).join('\n'), { dir, log: noLog });
+    expect(readFileSync(runLedgerPath(otherId, dir), 'utf8')).toBe('HOST\n');
+    rmSync(dir, { recursive: true, force: true });
   });
 });

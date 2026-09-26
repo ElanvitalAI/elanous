@@ -5,11 +5,11 @@ export interface DashboardAssistantSampleDeps {
   chatLines: string[];
   text: string;
   termCols: number;
-  wrapEnabled: { urlAware?: boolean; preserveOsc8?: boolean };
+  wrapEnabled: { urlAware?: boolean };
   formatResponse: (
     full: string,
     width: number,
-    wrapOpts?: { urlAware?: boolean; preserveOsc8?: boolean },
+    wrapOpts?: { urlAware?: boolean },
   ) => string[];
   renderTextLine: (line: string) => string;
 }

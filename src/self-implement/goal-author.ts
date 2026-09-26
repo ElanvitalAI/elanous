@@ -3784,6 +3784,26 @@ export function verbatimOriginalAsk(document: string): string | null {
   return extractVerbatimOriginalAsk(document)?.ask ?? null;
 }
 
+/** One header under which a fragment copies its parent document's `경계:` lines verbatim.
+ *  Not a markdown heading: a `##` line inside SCOPE BOUNDARY splits the required-block order. */
+export const PARENT_BOUNDARY_HEADER = 'Parent boundary lines:';
+
+/** `경계:` lines of one document, in source order, with surrounding whitespace removed and nothing else rewritten. */
+export function boundaryLinesVerbatim(document: string): string[] {
+  const ask = verbatimOriginalAsk(document) ?? document;
+  return ask.split(/\r?\n/).flatMap((line) => {
+    const trimmed = line.trim();
+    return trimmed.startsWith('경계:') ? [trimmed] : [];
+  });
+}
+
+/** When a fragment has a parent, one header followed by that parent's `경계:` lines; otherwise nothing. */
+export function parentBoundaryLines(parentDocument: string | undefined): string[] {
+  if (parentDocument === undefined) return [];
+  const lines = boundaryLinesVerbatim(parentDocument);
+  return lines.length === 0 ? [] : [PARENT_BOUNDARY_HEADER, ...lines];
+}
+
 /** 재저작이 «사람의 ask» 를 지켰는지 — 부모 골과 자식 골의 원래 ask 블록을 마주 세운다.
  *
  *  ⭐ 왜 있나(2026-08-11 72차): 되묻기에 답하면 재저작이 «일어나는» 것까지는 관측(`ask-reauthored`)이
@@ -5231,6 +5251,7 @@ async function authorGoalWithSupersededRootIntent(
   ];
   const scopeBoundarySection = [
     ...scopeCandidates,
+    ...parentBoundaryLines(deps.parentDocument),
     ...authorBoundaryMatches.flatMap((candidate) => [
       `- Boundary decision: ${candidate.value}`, 
       ...(isNormalizedAskMatch(candidate) ? [`  - Normalized ask marker: original=${JSON.stringify(candidate.original)}; normalized=${JSON.stringify(candidate.normalized)}`] : []),

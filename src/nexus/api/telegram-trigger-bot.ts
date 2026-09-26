@@ -16,7 +16,7 @@
 //
 // Distinct from HITL Telegram bot (`hitl-telegram-channel.ts`):
 //   • HITL bot    = ELANOUS_TELEGRAM_HITL_BOT_TOKEN · interaction-only
-//   • Trigger bot = cfg.telegram.botToken          · message tap
+//   • Trigger bot = resolved channel token        · message tap
 // Production typically uses two separate Telegram bots so the
 // allowlists / chat scopes don't bleed.
 
@@ -39,8 +39,7 @@ import { formatTablesAndRules } from '../../discord-markdown.js';
 
 export interface NexusTelegramTriggerBotOpts {
   /** Bot token (without `Bot ` prefix). Production reads
-   *  `cfg.telegram.botToken` (env-bridge populates from
-   *  `ELANOUS_TELEGRAM_BOT_TOKEN` when set). */
+   *  the channel token resolved by the NEXUS caller. */
   token: string;
   /** Allowlist of Telegram user ids — empty array refuses everyone
    *  (see `src/telegram.ts` allowedUsers gate). */
@@ -174,6 +173,7 @@ export function createNexusTelegramTriggerBot(
         log,
         ...(opts.runTurnImpl ? { runTurnImpl: opts.runTurnImpl } : {}),
         telegramBotOpts: {
+          token: opts.token,
           onTriggerTap,
           ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
         },

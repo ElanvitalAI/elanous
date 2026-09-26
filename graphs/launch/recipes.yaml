@@ -1,0 +1,8 @@
+# 발사 앞 머리 — capability-check · load-balance · budget-gate 몸.
+# place 는 아직 이 골의 대상이 아니다.
+capability-check:
+  command: 'bun "${ELANOUS_ENTRY:-bin/elanous.mjs}" launch-head capability'
+load-balance:
+  command: 'bun "${ELANOUS_ENTRY:-bin/elanous.mjs}" launch-head balance'
+budget-gate:
+  command: 'bun "${ELANOUS_ENTRY:-bin/elanous.mjs}" harness budget --json'

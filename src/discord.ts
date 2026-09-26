@@ -795,7 +795,7 @@ export class DiscordBot {
     const dcStreamingFlip = getUserConfig().sessionFabric?.streaming?.discord === true;
     debug.log('discord.deliver', 'route', { channelId: ctx.channelId, path: dcStreamingFlip ? 'flip-fanout' : 'legacy' });
     // §C5-enh reactions-as-status — 턴 시작 👀. 완료 ✅ / 실패 ❌ 는 아래. fail-soft.
-    const dcReactionsOn = getUserConfig().sessionFabric?.discord?.reactions === true;
+    const dcReactionsOn = true;
     debug.log('discord.deliver', 'reaction', { channelId: ctx.channelId, phase: 'start', emoji: '👀', on: dcReactionsOn });
     if (dcReactionsOn && ctx.messageId) void this.addReaction(ctx.channelId, ctx.messageId, '👀');
 

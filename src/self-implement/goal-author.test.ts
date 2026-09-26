@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { authorGoal, classifyAbsentFirstPathPresence, defaultGoalAuthorDeps, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
+import { authorGoal, boundaryLinesVerbatim, classifyAbsentFirstPathPresence, defaultGoalAuthorDeps, PARENT_BOUNDARY_HEADER, parentBoundaryLines, _setGoalAuthorPersistentGroundingDepsForTesting, resolveGoalAuthorPersistentGrounding, rfcGoalProseSection, classifyAcceptanceCriterionEvidence, classifyGoalCommandExecution, classifyGroundingFailure, countAuthoredGroundingPathSections, countMissingAuthoredConstraintMarkers, goalFileName, goalContextEvidence, groundForGoalAuthor, GOAL_RULES_POLICY, EVIDENCE_LOCATION_REQUIREMENT, IMPLEMENTATION_TARGET_CLARIFICATION, inspectArtifactLaunchDeclaration, linesOutsideFencedCode, inspectAskBoundaryMarker, inspectAskDecisionSignalMarker, inspectAskInvariantMarker, inspectTestScenarioDeclaration, lintGoalFile, markUntranscribedCriteria, markdownSection, parseArtifactLaunchDeclaration, parseAskFile, parseGoalId, parseRootIntent, parseTestScenarioDeclaration, planGateSignals, requiresImplementationTargetClarification, tracedPathReferences, writeAuthoredGoal, type GoalAuthorDeps, ASK_INVARIANT_MARKER, ASK_DECISION_SIGNAL_MARKER, ASK_BOUNDARY_MARKER, askSectionCountInformation, hasUnmetRequirementOutsidePreservationClause, WIRING_CRITERION_LINE, extractVerbatimOriginalAsk, verbatimOriginalAsk, ORIGINAL_ASK_MARKER, GOAL_FILE_LINT_ORIGINS, formatGoalFileLintFinding, allNegativeSignalsLintMessage, unreadableSignalsLintMessage, type GoalFileLintTag, summarizeGroundingFileKinds} from './goal-author.js';
 import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
 import { setMissionSlugStreamForTest } from '../autopilot/mission-registry.js';
@@ -7227,6 +7227,44 @@ ${report}`);
     expect(parseRootIntent(child.document)).toBe(rootIntent);
     expect(parseRootIntent(grandchild.document)).toBe(rootIntent);
     expect(grandchild.document.match(/^- RootIntent: /gm)).toHaveLength(1);
+  });
+
+  test('appends a parent document 경계: lines verbatim under one header when the fragment has a parent', async () => {
+    const first = '  경계: src/self-implement/goal-author.ts만 고친다.  ';
+    const second = '경계:  부모 경계의  내부 공백과 punctuation: 그대로.';
+    const parent = [
+      'Parent goal',
+      '- GoalId: 0123456789abcdef',
+      '- RootIntent: Parent root purpose',
+      '- GoalType: implement',
+      '',
+      '## SCOPE BOUNDARY',
+      '- Boundary decision: rewritten parent decision must not be copied.',
+      first,
+      'not a boundary: 경계 가 줄 가운데 있다',
+      second,
+      '경계 : malformed spacing is not a boundary line',
+      '',
+    ].join('\n');
+    const fragment = await authorGoal('Child fragment.', {
+      ...deps,
+      parent: { goalFile: 'docs/goals/parent.txt', questionId: 'child' },
+      parentDocument: parent,
+    });
+    const scope = fragment.document.slice(
+      fragment.document.indexOf('## SCOPE BOUNDARY'),
+      fragment.document.indexOf('## 답하지 못하는 것'),
+    );
+    const headerAt = scope.indexOf(PARENT_BOUNDARY_HEADER);
+    expect(headerAt).toBeGreaterThanOrEqual(0);
+    expect(scope.indexOf(PARENT_BOUNDARY_HEADER, headerAt + 1)).toBe(-1);
+    const copied = scope.slice(headerAt).split('\n').slice(1, 3);
+    expect(copied).toEqual([first.trim(), second.trim()]);
+    expect(scope).not.toContain('rewritten parent decision');
+    expect(scope).not.toContain('malformed spacing');
+    expect(boundaryLinesVerbatim(parent)).toEqual([first.trim(), second.trim()]);
+    expect(parentBoundaryLines(undefined)).toEqual([]);
+    expect(parentBoundaryLines('Parent goal\n- RootIntent: Parent root purpose\n')).toEqual([]);
   });
 
   test('rejects incomplete or caller-supplied parent RootIntent inputs and requires an explicit legacy value', async () => {

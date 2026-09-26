@@ -324,10 +324,16 @@ describe('MemoIntakePreview · source-level wiring', () => {
     expect(PREVIEW_SRC).toMatch(/commitToTox \? 'text-rose-700 dark:text-rose-400' : ''/);
   });
 
-  test('intake page mounts both Inbox and Memo modes behind a tablist', () => {
-    expect(PAGE_SRC).toContain('IntakePanel');
-    expect(PAGE_SRC).toContain('MemoIntakePreview');
-    expect(PAGE_SRC).toContain('role="tablist"');
+  test('optional initialMemo seeds the field and onClose runs from reset; omitted props keep the preview path', () => {
+    expect(PREVIEW_SRC).toContain('initialMemo?: string');
+    expect(PREVIEW_SRC).toContain('onClose?: () => void');
+    expect(PREVIEW_SRC).toContain("useState(initialMemo ?? '')");
+    expect(PREVIEW_SRC).toContain('onClose?.()');
+    expect(PREVIEW_SRC).toContain('api.preview(');
+    expect(API_SRC).toContain("'/v1/intake/pipeline-preview'");
+    expect(PAGE_SRC).toContain('<IntakeFrontDoor />');
+    expect(PAGE_SRC).not.toContain('router.replace');
+    expect(PAGE_SRC).not.toContain("'/autopilot'");
   });
 });
 

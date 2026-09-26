@@ -1565,7 +1565,6 @@ describe('B-1.h · session/context cluster', () => {
     // sessionSlash 는 이 테스트에서만 최소 스텁 — 다른 테스트 무영향.)
     (ctx as unknown as { sessionSlash: unknown }).sessionSlash = {
       remoteDaemon: () => null,
-      localDaemon: () => null,
     };
     const r = await reg.dispatch('resume', ['zzz-no-such'], ctx);
     expect(r.kind).toBe('continue');

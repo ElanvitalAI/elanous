@@ -2,7 +2,9 @@ import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
+import * as podDispatch from './harness-pod-dispatch.js';
 import { Command } from 'commander';
 import {
   DEFAULT_HARNESS_PROCESS_THRESHOLDS,
@@ -147,17 +149,12 @@ describe('harness CLI command', () => {
     return captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'processes']));
   }
 
-  test('parses --graph through the shared registry and passes it to ask', async () => {
+  test('ask keeps its default options without graph authority forwarding', async () => {
     const received: unknown[] = [];
     const { program } = install(async (_goalPath, options) => { received.push(options); });
-    await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--graph', 'on']);
-    await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--graph', 'off']);
-    expect(received).toEqual([
-      { graph: true, supervise: true, supervisorSource: 'default' },
-      { graph: false, supervise: true, supervisorSource: 'default' },
-    ]);
-    await expect(program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--graph', 'invalid']))
-      .rejects.toThrow('--graph 값은 on 또는 off여야 함: invalid');
+    await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md']);
+    expect(received).toEqual([{ supervise: true, supervisorSource: 'default' }]);
+    expect(program.commands.find((command) => command.name() === 'harness')?.commands.find((command) => command.name() === 'ask')?.options.some((option) => option.long === '--graph')).toBe(false);
   });
 
   test('exposes and forwards force-preflight only when ask or say explicitly requests it', async () => {
@@ -210,6 +207,52 @@ describe('harness CLI command', () => {
     ]);
   });
 
+  test('pod ask/say refuse --target with code 2 before dispatch; target-free ask still dispatches', async () => {
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation(() => 0);
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log);
+    const localCalls: string[] = [];
+    const { program } = install(
+      async () => { localCalls.push('ask'); },
+      async () => { localCalls.push('say'); },
+    );
+    const previousExit = process.exitCode;
+    try {
+      for (const [entrance, args, target] of [
+        ['ask', ['/tmp/goal.md'], '/x'],
+        ['say', ['write', 'goal'], '/tmp/other'],
+      ] as const) {
+        process.exitCode = 0;
+        const errors = await captureError(() => program.parseAsync([
+          'node', 'elanous', 'harness', entrance, ...args, '--substrate', 'pod', '--target', target,
+        ]));
+        expect(errors).toEqual([
+          '`--target` 은 Pod 경로에서 아직 지원하지 않는다 — 로컬로 돌리거나 `--target` 을 빼라',
+          'Pod 로 특정 원천을 주려면 `--source`',
+        ]);
+        expect(process.exitCode).toBe(2);
+        expect(dispatch).toHaveBeenCalledTimes(0);
+        expect(localCalls).toEqual([]);
+      }
+      expect(events.filter(({ category, event }) => category === 'harness.pod' && event === 'target-refused'))
+        .toEqual([
+          { category: 'harness.pod', event: 'target-refused', data: { target: '/x' } },
+          { category: 'harness.pod', event: 'target-refused', data: { target: '/tmp/other' } },
+        ]);
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod']);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: '/tmp/goal.md' });
+      expect(process.exitCode).toBe(0);
+    } finally {
+      dispatch.mockRestore();
+      log.mockRestore();
+      process.exitCode = previousExit;
+    }
+  });
+
   test('ask and say expose and forward opaque --correlation without exposing it to plan or mission', async () => {
     const received: unknown[] = [];
     const { program, harness } = install(
@@ -257,14 +300,14 @@ describe('harness CLI command', () => {
       .rejects.toThrow(/implement.*research.*document.*operate/);
   });
 
-  test('ask dry-run displays the requested graph authority without dispatching', async () => {
+  test('ask dry-run does not show a configurable graph authority or dispatch', async () => {
     const received: unknown[] = [];
     const { program } = install(async (_goalPath, options) => { received.push(options); });
     const lines = await captureLog(() => program.parseAsync([
-      'node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--graph', 'on', '--dry-run',
+      'node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--dry-run',
     ]));
     expect(received).toEqual([]);
-    expect(lines).toContain('[dry-run] graph authority: on');
+    expect(lines.some((line) => line.includes('graph authority:'))).toBe(false);
   });
 
   test('registers the RFC-only plan entrance while retaining ask/say handlers', async () => {

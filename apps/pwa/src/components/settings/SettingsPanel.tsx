@@ -27,10 +27,14 @@ import {
   type NotificationStatus,
 } from '@/lib/web-push';
 import { QuickSetupCard } from './QuickSetupCard';
+import { ObsidianSkillsCard } from './ObsidianSkillsCard';
+import { ChildLlmPreferenceCard } from './ChildLlmPreferenceCard';
+import { AnswerDepthCard } from './AnswerDepthCard';
 import { WelcomeCard } from './WelcomeCard';
 import { AdvancedSetupMap } from './AdvancedSetupMap';
 import { ConnectTokenCard } from './ConnectTokenCard';
 import { PlatformConnectionsCard } from './PlatformConnectionsCard';
+import { ChannelBotSetupCard } from './ChannelBotSetupCard';
 import { PushcutSettingsCard } from './PushcutSettingsCard';
 import { IntentPanelSettingsCard } from './IntentPanelSettingsCard';
 import { ChatRoutingCard } from './ChatRoutingCard';
@@ -530,6 +534,9 @@ export function SettingsPanel() {
           a chat backend without dropping into the desktop TUI.
           Reads the NexusClient from context (NexusProvider in app/layout.tsx). */}
       <QuickSetupCard />
+      <ObsidianSkillsCard />
+      <ChildLlmPreferenceCard />
+      <AnswerDepthCard />
 
       {/* Phase 3 anchor — `/setup/done` link cards 의 도착 지점. SETUP_LINKS
           inventory test (apps/pwa/src/app/setup/done/page.test.ts) 가 동일
@@ -540,6 +547,7 @@ export function SettingsPanel() {
           Reads GET /v1/platforms · 30s refetch. Silently no-op when
           NexusClient absent (SSR / dev). */}
       <PlatformConnectionsCard />
+      <ChannelBotSetupCard />
 
       {/* Phase 3 anchor — `/setup/done` link cards 도착 지점 (advanced). */}
       <div id="advanced" className="scroll-mt-8" aria-hidden />

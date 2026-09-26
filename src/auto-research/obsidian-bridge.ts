@@ -14,6 +14,7 @@
 // src/agent/loader.ts uses; we duplicate the logic here so the
 // auto-research module stays free of agent-subsystem coupling.
 
+import { assertVaultWriteAllowed } from '../obsidian/vault-write-guard.js';
 import {
   existsSync,
   mkdirSync,
@@ -98,6 +99,7 @@ export function writeNote(
   frontmatter?: Record<string, unknown>,
 ): void {
   const path = join(vault.root, relPath);
+  assertVaultWriteAllowed(path);   // ⛔ 격리 우주는 운영 볼트에 쓰지 않는다
   ensureDir(dirname(path));
   const fmText = frontmatter ? renderFrontmatter(frontmatter) : '';
   const full = fmText + body;

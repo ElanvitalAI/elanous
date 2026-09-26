@@ -71,6 +71,10 @@ import {
 } from './plugins/adapters/claude-package.js';
 // ⭐ provider↔credential SSOT — provider 를 바꾸는 자리가 키도 함께 해석해야 401 이 안 난다(escalate 근본수리).
 import { resolveProviderCredential, observeCredentialResolution } from './llm/provider-credentials.js';
+import {
+  parseGroundingSources,
+  type GroundingConfig,
+} from './grounding/sources.js';
 
 // ── SkillRouter (existing) ───────────────────────────────────────────
 
@@ -680,7 +684,11 @@ function skillsDefaults(): SkillsConfig {
 
 // ── Obsidian ─────────────────────────────────────────────────────────
 
-export interface ObsidianConfig { vault: string; }
+export interface ObsidianConfig {
+  vault: string;
+  /** 격리(test) 우주의 «쓰기 시험» 볼트(예 `elantest`) — 읽기는 늘 `vault`. 볼트 쓰기 가드의 허용 목록에 든다(대표·🅞 2026-09-26). */
+  testVault?: string;
+}
 
 function obsidianDefaults(): ObsidianConfig {
   return { vault: process.env.OBSIDIAN_VAULT || join(REMOTE_HOME, 'Obsidian', 'ElanvitalAI') };
@@ -941,6 +949,53 @@ export interface SelfImplementClarificationEscalationConfig {
 
 export type SelfImplementChildInstanceMode = 'isolated' | 'inherit';
 
+/** 자식 LLM 선호. `pinned` = 기존 provider·model 한 칸. `auto` = 사용자 `chain` 순서. */
+export type ChildLlmPreferenceMode = 'pinned' | 'auto';
+
+export interface ChildLlmChainEntry {
+  provider: string;
+  model?: string;
+}
+
+export interface ChildLlmPreferenceConfig {
+  /** 있으면 pinned 의 값. 기존 고정 설정. */
+  provider?: string;
+  /** 기존 고정 설정. provider 없이 model 만 있으면 mode 는 auto 다. */
+  model?: string;
+  /** 없으면 provider 가 있을 때 pinned, 없을 때 auto. model 만 있어도 provider 가 없으면 auto. */
+  mode?: ChildLlmPreferenceMode;
+  /** auto 일 때의 사용자 순서. 원소는 { provider, model? }. */
+  chain?: ChildLlmChainEntry[];
+}
+
+/** 예산이 모자랄 때의 행동. 판정(P15)은 이 칸을 읽기만 한다. */
+export type BudgetGateOnShortfall = 'decompose' | 'wait-reset' | 'next-provider' | 'proceed';
+
+/** 프로바이더별 사용률 상한(0~100). 이 값 이상이면 그 칸을 안 쓴다. */
+export type BudgetGateMaxUsedPercent = { readonly [provider: string]: number };
+
+/**
+ * 대표 2026-09-26 상한. codex 계정은 95% 이상이면 그 계정을 안 쓰고,
+ * grok 은 주간 최대 50% 중 🅢 가드 48% 에서 멈춘다.
+ * 🅞 흡수 크론의 «codex ≥80%» 는 이 판정의 상한이 아니다.
+ */
+export const DEFAULT_BUDGET_GATE_MAX_USED_PERCENT: BudgetGateMaxUsedPercent = {
+  'openai-codex': 95,
+  grok: 48,
+};
+
+export interface HarnessBudgetGateConfig {
+  /** 0~100. 기본 15. 범위 밖이면 경고와 함께 기본. */
+  minHeadroomPercent: number;
+  /** 기본 next-provider. 모르는 값이면 경고와 함께 기본. */
+  onShortfall: BudgetGateOnShortfall;
+  /**
+   * 선택. 없으면 `DEFAULT_BUDGET_GATE_MAX_USED_PERCENT`.
+   * 프로바이더 값이 0~100 밖이면 그 칸만 경고 후 기본.
+   */
+  maxUsedPercent?: BudgetGateMaxUsedPercent;
+}
+
 export interface SelfImplementToolConfig {
   /** Absolute root that holds per-repository child worktree directories. */
   worktreeRoot: string;
@@ -961,8 +1016,6 @@ export interface SelfImplementToolConfig {
   goalAuthorPersistentGrounding?: boolean;
   /** Uses the Fabric decomposer for SelfOrchestrate requests that omit `fabric_decompose`. */
   fabricDecompose: boolean;
-  /** ⛔⭐ 그래프 선언을 «실행 권위»로 올린다(RFC §5 1단계 · 대표 2026-09-08). 기본 켬(`TOOLS_DEFAULTS` · 끄려면 `false` 또는 `--no-graph`). */
-  graphAuthoritative: boolean;
   /** Normalized SelfOrchestrate goal count that automatically selects Fabric; null disables auto-selection. */
   fabricDecomposeAutoPathThreshold: number | null;
   autoStop: SelfImplementAutoStopConfig;
@@ -972,6 +1025,8 @@ export interface SelfImplementToolConfig {
   decompositionShadow: SelfImplementDecompositionShadowConfig;
   /** Opt-in delivery of authored goal clarifications from unattended dev runs. */
   clarificationEscalation: SelfImplementClarificationEscalationConfig;
+  /** 사용자 자식 모델 선호. 없으면 해석기가 auto + fallbackChain 으로 만든다. */
+  childLlm?: ChildLlmPreferenceConfig;
   /** ⭐ PR-open 사전 승인 (2026-07-26 · 대표 결정 "오토 선호 · 기본 ON").
    *
    *  self-build 가 gate 를 통과하면 **PR 을 자동 개설**한다(기본 `true`).
@@ -1056,7 +1111,7 @@ const TOOLS_DEFAULTS: ToolsConfig = {
   selfOrchestrate: {},
   nativeStructure: { enabled: false },
   // 대표 결정(2026-07-26): 오토 선호 — 기본 ON.
-  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, fabricDecompose: false, graphAuthoritative: true, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
+  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
 };
 
 // ── Debug ────────────────────────────────────────────────────────────
@@ -1238,13 +1293,11 @@ export interface ChatRenderingStreamingConfig {
   catchUpAgeMs: number;
 }
 
-export interface ChatRenderingCompactBoundaryConfig {
-  enabled: boolean;
-}
+/** Legacy exported type name; the compact boundary no longer has configurable fields. */
+export interface ChatRenderingCompactBoundaryConfig {}
 
 export interface ChatRenderingWrapConfig {
   urlAware: boolean;
-  preserveOsc8: boolean;
 }
 
 export type ChatRenderingToolDisplayMode = 'legacy' | 'inline-to-block';
@@ -1260,12 +1313,7 @@ export type ChatRenderingDiffTurnBrowserMode = 'all' | 'files' | 'turns';
 
 export interface ChatRenderingDiffConfig {
   colorTier: ChatRenderingDiffColorTier;
-  adaptiveBg: boolean;
-  syntaxPerHunk: boolean;
-  cache: boolean;
   headerStyle: ChatRenderingDiffHeaderStyle;
-  turnSummary: boolean;
-  turnBrowser: boolean;
   turnBrowserHistory: number;
   turnBrowserMode: ChatRenderingDiffTurnBrowserMode;
 }
@@ -1277,7 +1325,6 @@ export interface ChatRenderingHudConfig {
 
 export interface ChatRenderingConfig {
   streaming: ChatRenderingStreamingConfig;
-  compactBoundary: ChatRenderingCompactBoundaryConfig;
   wrap: ChatRenderingWrapConfig;
   tool: ChatRenderingToolConfig;
   diff: ChatRenderingDiffConfig;
@@ -1355,28 +1402,19 @@ export const CHAT_DEFAULTS: ChatConfig = {
       catchUpThresholdLines: 50,
       catchUpAgeMs: 200,
     },
-    compactBoundary: {
-      enabled: true,
-    },
     wrap: {
       urlAware: false,
-      preserveOsc8: true,
     },
     tool: {
       displayMode: 'inline-to-block',
       blockMaxLines: 8,
     },
-      diff: {
-        colorTier: 'auto',
-        adaptiveBg: true,
-        syntaxPerHunk: true,
-        cache: true,
-        headerStyle: 'legacy',
-        turnSummary: true,
-        turnBrowser: true,
-        turnBrowserHistory: 8,
-        turnBrowserMode: 'all',
-      },
+    diff: {
+      colorTier: 'auto',
+      headerStyle: 'legacy',
+      turnBrowserHistory: 8,
+      turnBrowserMode: 'all',
+    },
     hud: {
       gaugeWarnRatio: 0.7,
       gaugeDangerRatio: 0.85,
@@ -1687,13 +1725,12 @@ export interface SessionFabricConfig {
    *  acp(C5d·최고위험) = ACP broadcast 를 통합 fan-out 으로 흡수 — ON 시 push 가 fanOutSessionChunk
    *  경로로(byte-identical parity 후) + ACP 턴이 tg/dc/pwa 로 미러. 기본 부재=OFF. */
   streaming?: { telegram?: boolean; discord?: boolean; acp?: boolean };
-  /** C5-enh 서피스 특유 노브(reactions-as-status·스트리밍 모드 등). reactions ON = 턴 시작 👀 →
-   *  완료 ✅/실패 ❌(편집보다 저비용 상태채널·hermes/openclaw 선례). streamingMode = off|progress|
-   *  partial|block(§6-8·기본 partial=현 full stream). editGapMs = 편집 간격(기본 1100).
+  /** C5-enh 서피스 특유 노브. streamingMode = off|progress|partial|block(§6-8·기본 partial=현 full stream).
+   *  editGapMs = 편집 간격(기본 1100). 반응(👀 → 완료/실패)은 늘 켬.
    *  텔레그램 강화(§5.2·§10-2·전부 기본 off·라이브 무접촉): typing = sendChatAction liveness ·
    *  fairQueue = supergroup 다중토픽 라운드로빈 · rotate = scroll-jump post-new-then-delete. 기본 부재=OFF. */
-  telegram?: { reactions?: boolean; streamingMode?: StreamingMode; editGapMs?: number; typing?: boolean; fairQueue?: boolean; rotate?: boolean };
-  discord?: { reactions?: boolean; streamingMode?: StreamingMode; editGapMs?: number };
+  telegram?: { streamingMode?: StreamingMode; editGapMs?: number; typing?: boolean; fairQueue?: boolean; rotate?: boolean };
+  discord?: { streamingMode?: StreamingMode; editGapMs?: number };
 }
 // ── taste (Layer2 substrate · P4 중앙 진입점 수집 · 2026-07-18) ──────────
 // 기본 부재(=OFF·opt-in). captureEnabled=true 면 intent-gate submitIntent 최상단이
@@ -1776,8 +1813,7 @@ function parseSessionFabricConfig(raw: unknown): SessionFabricConfig | undefined
     const raw = r[surf];
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       const s = raw as Record<string, unknown>;
-      const surfCfg: { reactions?: boolean; streamingMode?: StreamingMode; editGapMs?: number; typing?: boolean; fairQueue?: boolean; rotate?: boolean } = {};
-      if (typeof s.reactions === 'boolean') surfCfg.reactions = s.reactions;
+      const surfCfg: { streamingMode?: StreamingMode; editGapMs?: number; typing?: boolean; fairQueue?: boolean; rotate?: boolean } = {};
       if (isStreamingMode(s.streamingMode)) surfCfg.streamingMode = s.streamingMode;
       if (typeof s.editGapMs === 'number' && Number.isFinite(s.editGapMs) && s.editGapMs > 0) surfCfg.editGapMs = s.editGapMs;
       // 텔레그램 전용 강화 노브(§5.2·§10-2). discord 에 오면 무시(파서는 관대·sink 가 미사용).
@@ -1788,6 +1824,19 @@ function parseSessionFabricConfig(raw: unknown): SessionFabricConfig | undefined
       }
       if (Object.keys(surfCfg).length > 0) out[surf] = surfCfg;
     }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function parseNextFluentConfig(raw: unknown): UserConfig['nextFluent'] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: NonNullable<UserConfig['nextFluent']> = {};
+  if (typeof r.personas === 'boolean') out.personas = r.personas;
+  if (r.models && typeof r.models === 'object' && !Array.isArray(r.models)) {
+    out.models = Object.fromEntries(
+      Object.entries(r.models).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+    );
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -2333,9 +2382,6 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     ? selfImplRaw.goalAuthorPersistentGrounding
     : undefined;
   const fabricDecompose = selfImplRaw.fabricDecompose === true;
-  const graphAuthoritative = typeof selfImplRaw.graphAuthoritative === 'boolean'
-    ? selfImplRaw.graphAuthoritative
-    : TOOLS_DEFAULTS.selfImplement.graphAuthoritative;
   const fabricDecomposeAutoPathThresholdRaw = selfImplRaw.fabricDecomposeAutoPathThreshold;
   const fabricDecomposeAutoPathThreshold = fabricDecomposeAutoPathThresholdRaw === null
     ? null
@@ -2429,6 +2475,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     enabled: clarificationEscalationRaw.enabled === true,
     ...(clarificationTimeoutMs === undefined ? {} : { timeoutMs: clarificationTimeoutMs }),
   };
+  const childLlm = parseChildLlmPreference(selfImplRaw.childLlm);
   // ⭐ 관측(리뷰 should-fix) — 오타/비-boolean 은 기본값(ON)으로 수렴하는데, 그게 조용하면
   //   "껐다고 믿었는데 자동 개설되는" 운영 사고가 된다. 값이 **있는데 boolean 이 아닐 때만**
   //   경고한다(부재는 정상). 로거 대신 stderr — 이 파일의 기존 경고와 동형(부트 시점·의존 0).
@@ -2451,8 +2498,135 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalAuthorPersistentGrounding, fabricDecompose, graphAuthoritative, fabricDecomposeAutoPathThreshold, autoOpenPr, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}) },
   };
+}
+
+const CHILD_LLM_MODES = ['pinned', 'auto'] as const;
+
+/** 잘못된 값은 경고와 함께 버린다 — 설정 한 줄이 발사를 막지 않는다. 없으면 undefined(해석기가 기본).
+ *  비객체·비문자열 provider/model 도 경고 후 버리고 기본으로 진행한다. 발사를 막지 않는다. */
+export function parseChildLlmPreference(raw: unknown): ChildLlmPreferenceConfig | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnUserConfigDrop('tools.selfImplement.childLlm', `객체가 아니다(${JSON.stringify(raw)}) — 버리고 기본으로 진행`);
+    return undefined;
+  }
+  const v = raw as Record<string, unknown>;
+  const out: ChildLlmPreferenceConfig = {};
+  let droppedInvalidProvider = false;
+  if (v.provider !== undefined) {
+    if (typeof v.provider === 'string') out.provider = v.provider;
+    else {
+      droppedInvalidProvider = true;
+      warnUserConfigDrop('tools.selfImplement.childLlm.provider', `문자열이 아니다(${JSON.stringify(v.provider)}) — 버림`);
+    }
+  }
+  if (v.model !== undefined) {
+    if (typeof v.model === 'string') out.model = v.model;
+    else warnUserConfigDrop('tools.selfImplement.childLlm.model', `문자열이 아니다(${JSON.stringify(v.model)}) — 버림`);
+  }
+  if (v.mode !== undefined) {
+    if ((CHILD_LLM_MODES as readonly string[]).includes(v.mode as string)) out.mode = v.mode as ChildLlmPreferenceMode;
+    else warnUserConfigDrop('tools.selfImplement.childLlm.mode', `pinned|auto 가 아니다(${JSON.stringify(v.mode)}) — 기본으로 진행`);
+  }
+  if (v.chain !== undefined) {
+    if (!Array.isArray(v.chain)) {
+      warnUserConfigDrop('tools.selfImplement.childLlm.chain', `배열이 아니다(${JSON.stringify(v.chain)}) — 버림`);
+    } else {
+      const chain: ChildLlmChainEntry[] = [];
+      for (const [index, item] of v.chain.entries()) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) {
+          warnUserConfigDrop('tools.selfImplement.childLlm.chain', `[${index}] 객체가 아니다(${JSON.stringify(item)}) — 건너뜀`);
+          continue;
+        }
+        const entry = item as Record<string, unknown>;
+        if (typeof entry.provider !== 'string' || !entry.provider.trim()) {
+          warnUserConfigDrop('tools.selfImplement.childLlm.chain', `[${index}].provider 가 빈 문자열이 아니다(${JSON.stringify(entry.provider)}) — 건너뜀`);
+          continue;
+        }
+        if (entry.model !== undefined && typeof entry.model !== 'string') {
+          warnUserConfigDrop('tools.selfImplement.childLlm.chain', `[${index}].model 이 문자열이 아니다(${JSON.stringify(entry.model)}) — 건너뜀`);
+          continue;
+        }
+        chain.push({
+          provider: entry.provider,
+          ...(typeof entry.model === 'string' ? { model: entry.model } : {}),
+        });
+      }
+      out.chain = chain;
+    }
+  }
+  // mode 추론은 여기 하지 않는다. provider 가 없으면 auto — model 만 남은 설정도 같다.
+  // 기존 model-only 거절 문면은 발사 경계가 따로 보존한다.
+  // 잘못된 provider 를 버린 뒤에 model 만 남으면 그 거절이 발사를 막는다.
+  // 그 한 줄은 경고로 끝내고 기본으로 진행한다.
+  if (droppedInvalidProvider && out.model !== undefined && out.provider === undefined && out.mode === undefined && out.chain === undefined) {
+    delete out.model;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+export const BUDGET_GATE_ON_SHORTFALL = ['decompose', 'wait-reset', 'next-provider', 'proceed'] as const;
+export const DEFAULT_BUDGET_GATE: HarnessBudgetGateConfig = {
+  minHeadroomPercent: 15,
+  onShortfall: 'next-provider',
+  maxUsedPercent: { ...DEFAULT_BUDGET_GATE_MAX_USED_PERCENT },
+};
+
+function percentInRange(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100;
+}
+
+/** 칸마다 0~100. 범위 밖·비수치는 경고 후 그 칸의 기본. 객체가 아니면 기본 전체. */
+export function parseBudgetGateMaxUsedPercent(raw: unknown): BudgetGateMaxUsedPercent {
+  const fallback = { ...DEFAULT_BUDGET_GATE_MAX_USED_PERCENT };
+  if (raw === undefined) return fallback;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnUserConfigDrop('harness.budgetGate.maxUsedPercent', `객체가 아니다(${JSON.stringify(raw)}) — 기본 ${JSON.stringify(fallback)} 로 진행`);
+    return fallback;
+  }
+  const out: { [provider: string]: number } = { ...fallback };
+  for (const [provider, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!provider.trim()) continue;
+    if (percentInRange(value)) out[provider] = value;
+    else {
+      const kept = fallback[provider];
+      warnUserConfigDrop(
+        `harness.budgetGate.maxUsedPercent.${provider}`,
+        `0~100 이 아니다(${JSON.stringify(value)}) — ${kept === undefined ? '버림' : `기본 ${kept} 로 진행`}`,
+      );
+    }
+  }
+  return out;
+}
+
+/** 범위 밖·모르는 값은 경고와 함께 기본. 섹션이 없어도 기본을 돌려준다. */
+export function parseHarnessBudgetGate(raw: unknown): HarnessBudgetGateConfig {
+  const fallback = {
+    minHeadroomPercent: DEFAULT_BUDGET_GATE.minHeadroomPercent,
+    onShortfall: DEFAULT_BUDGET_GATE.onShortfall,
+    maxUsedPercent: { ...DEFAULT_BUDGET_GATE_MAX_USED_PERCENT },
+  };
+  if (raw === undefined) return fallback;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    warnUserConfigDrop('harness.budgetGate', `객체가 아니다(${JSON.stringify(raw)}) — 기본 ${fallback.minHeadroomPercent}/${fallback.onShortfall} 로 진행`);
+    return fallback;
+  }
+  const v = raw as Record<string, unknown>;
+  let minHeadroomPercent = fallback.minHeadroomPercent;
+  if (v.minHeadroomPercent !== undefined) {
+    const n = v.minHeadroomPercent;
+    if (percentInRange(n)) minHeadroomPercent = n;
+    else warnUserConfigDrop('harness.budgetGate.minHeadroomPercent', `0~100 이 아니다(${JSON.stringify(n)}) — 기본 ${fallback.minHeadroomPercent} 로 진행`);
+  }
+  let onShortfall = fallback.onShortfall;
+  if (v.onShortfall !== undefined) {
+    if ((BUDGET_GATE_ON_SHORTFALL as readonly string[]).includes(v.onShortfall as string)) onShortfall = v.onShortfall as BudgetGateOnShortfall;
+    else warnUserConfigDrop('harness.budgetGate.onShortfall', `허용값이 아니다(${JSON.stringify(v.onShortfall)}) — 기본 ${fallback.onShortfall} 로 진행`);
+  }
+  const maxUsedPercent = parseBudgetGateMaxUsedPercent(v.maxUsedPercent);
+  return { minHeadroomPercent, onShortfall, maxUsedPercent };
 }
 
 function parseRegistryConfig(raw: unknown): RegistryConfig {
@@ -3109,17 +3283,13 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
   return { model: resolved.model, source };
 }
 
-export function graphAuthoritativeConfigValue(config: Pick<UserConfig, 'raw' | 'tools'>): boolean | undefined {
-  const tools = config.raw.tools;
-  if (!tools || typeof tools !== 'object' || Array.isArray(tools)) return undefined;
-  const selfImplement = (tools as Record<string, unknown>).selfImplement;
-  if (!selfImplement || typeof selfImplement !== 'object' || Array.isArray(selfImplement)) return undefined;
-  return typeof (selfImplement as Record<string, unknown>).graphAuthoritative === 'boolean'
-    ? config.tools.selfImplement.graphAuthoritative
-    : undefined;
-}
 
 export interface UserConfig {
+  /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
+   *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
+  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig };
+  /** ☸️ Pod 실행 칸 — `pool` = 기본 풀(`컨텍스트[@ssh호스트][:상한]` 쉼표 · 앞이 우선). `harness say/ask --substrate pod` 가 인자·ELANOUS_POD_POOL 다음으로 읽는다. */
+  pod?: { pool?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -3206,14 +3376,18 @@ export interface UserConfig {
    *  an active auto-mode goal on idle. Off by default: this ignites
    *  self-firing turns, so it stays opt-in. */
   dispatch?: { enabled?: boolean };
-  /** next-fluent(태스크 완료 시 다음 액션 1-클릭 칩·2026-07-15). 기본 OFF — 켜면 done/failed 페이즈
-   *  카드에 mission-fabric 액션(rebuild·split·revise…) 칩 표시. `personas` 켜면 로컬 LLM 이유 부여
-   *  (기본 결정론·무비용). config-over-env(thunk 로 매 호출 read → 데몬 재시작 불요). */
-  nextFluent?: { enabled?: boolean; personas?: boolean; models?: Record<string, string> };
+  /** next-fluent(태스크 완료 시 다음 액션 1-클릭 칩·2026-07-15). 라우트는 늘 켬.
+   *  `personas` 켜면 로컬 LLM 이유 부여(기본 결정론·무비용). */
+  nextFluent?: { personas?: boolean; models?: Record<string, string> };
   /** Ops Observability P3 — 셀프교정 자율 경계. health check 크론이 이상 감지 시
    *  자동 개입(재큐/재시작)까지 할지. 기본 disarmed(관측+알림만·HITL). 매매/재부팅은
    *  이 게이트가 armed 여도 항상 제외. 대표 결정 전까지 undefined=false. */
-  ops?: { selfHeal?: { armed?: boolean } };
+  ops?: { selfHeal?: { armed?: boolean }; cronRepoRoot?: string };
+  /** 하니스 예산 게이트 설정. 판정은 P15 — 여기선 칸만 싣는다. 파서는 항상 기본을 채운다.
+   *  선택이다 — 기존 UserConfig 리터럴이 이 칸 없이 컴파일되게 한다. 해석기는 없으면 기본을 쓴다.
+   *  타입 칸은 위 `harness.budgetGate` 한 곳이다(중복 선언 금지). */
+  /** 그라운딩 출처 레지스트리. 잘못된 항목은 경고와 함께 건너뛴다. 없으면 빈 목록. */
+  grounding?: GroundingConfig;
   raw: Record<string, unknown>;
   // Phase 2 (PLAN-config-unification-elanous-root-2026-05-10):
   //   NEXUS schema co-resident at root of `~/.elanous/config.json`.
@@ -3348,8 +3522,7 @@ function parseAutoReviewConfig(raw: unknown): AutoReviewConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Copy `ops`. `ops.selfHeal.armed` is boolean only; anything else is dropped
- *  with one warning line and left absent. */
+/** Parse optional ops fields independently; invalid settings cannot silently select a cron cwd. */
 function parseOpsConfig(raw: unknown): UserConfig['ops'] | undefined {
   if (raw === undefined) return undefined;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -3357,18 +3530,23 @@ function parseOpsConfig(raw: unknown): UserConfig['ops'] | undefined {
     return undefined;
   }
   const v = raw as Record<string, unknown>;
-  if (v.selfHeal === undefined) return undefined;
-  if (!v.selfHeal || typeof v.selfHeal !== 'object' || Array.isArray(v.selfHeal)) {
-    warnUserConfigDrop('ops.selfHeal', `객체가 아니다(${JSON.stringify(v.selfHeal)}) — 버림`);
-    return undefined;
+  const parsed: NonNullable<UserConfig['ops']> = {};
+  if (v.selfHeal !== undefined) {
+    if (!v.selfHeal || typeof v.selfHeal !== 'object' || Array.isArray(v.selfHeal)) {
+      warnUserConfigDrop('ops.selfHeal', `객체가 아니다(${JSON.stringify(v.selfHeal)}) — 버림`);
+    } else {
+      const armed = (v.selfHeal as Record<string, unknown>).armed;
+      if (armed !== undefined) {
+        if (typeof armed === 'boolean') parsed.selfHeal = { armed };
+        else warnUserConfigDrop('ops.selfHeal.armed', `불리언이 아니다(${JSON.stringify(armed)}) — 버림`);
+      }
+    }
   }
-  const armed = (v.selfHeal as Record<string, unknown>).armed;
-  if (armed === undefined) return undefined;
-  if (typeof armed !== 'boolean') {
-    warnUserConfigDrop('ops.selfHeal.armed', `불리언이 아니다(${JSON.stringify(armed)}) — 버림`);
-    return undefined;
+  if (v.cronRepoRoot !== undefined) {
+    if (typeof v.cronRepoRoot === 'string' && v.cronRepoRoot.trim()) parsed.cronRepoRoot = v.cronRepoRoot.trim();
+    else warnUserConfigDrop('ops.cronRepoRoot', `비어 있거나 문자열이 아니다(${JSON.stringify(v.cronRepoRoot)}) — 버림`);
   }
-  return { selfHeal: { armed } };
+  return Object.keys(parsed).length ? parsed : undefined;
 }
 
 function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
@@ -3418,7 +3596,6 @@ function defaultConfig(): UserConfig {
       toolDeny: [],
       rendering: {
         streaming: { ...CHAT_DEFAULTS.rendering.streaming },
-        compactBoundary: { ...CHAT_DEFAULTS.rendering.compactBoundary },
         wrap: { ...CHAT_DEFAULTS.rendering.wrap },
         tool: { ...CHAT_DEFAULTS.rendering.tool },
         diff: { ...CHAT_DEFAULTS.rendering.diff },
@@ -3464,6 +3641,8 @@ function defaultConfig(): UserConfig {
       nativeStructure: { ...TOOLS_DEFAULTS.nativeStructure },
       selfImplement: { ...TOOLS_DEFAULTS.selfImplement },
     },
+    harness: { budgetGate: { ...DEFAULT_BUDGET_GATE } },
+    grounding: { sources: [] },
     raw: {},
   };
 }
@@ -3815,6 +3994,17 @@ export const RETIRED_CONFIG_KEYS: readonly RetiredConfigKey[] = [
   // 설정 졸업 1-d(2026-09-26): 3층(트리 파생)은 늘 켠다 — 리더 미지정이면 운영으로 떨어지므로 새 설치의 동작은 같다.
   { path: 'instance.treeDerivedTest', reason: '늘 켬으로 졸업 — 지워도 된다 (2026-09-26 설정 졸업 1-d)' },
   { path: 'tools.selfImplement.selfResolveClarifications', reason: '늘 켬으로 졸업 — 지워도 된다 (2026-09-26 설정 졸업 1-c · self author 도 harness 와 같이 되묻기를 자동 답변)' },
+  { path: 'chat.rendering.compactBoundary.enabled', reason: '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'chat.rendering.wrap.preserveOsc8', reason: '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'chat.rendering.diff.adaptiveBg', reason: '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'chat.rendering.diff.syntaxPerHunk', reason: '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'chat.rendering.diff.cache', reason: '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'chat.rendering.diff.turnSummary', reason: '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'chat.rendering.diff.turnBrowser', reason: '늘 켜짐 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'sessionFabric.telegram.reactions', reason: '늘 켬 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'sessionFabric.discord.reactions', reason: '늘 켬 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'nextFluent.enabled', reason: '늘 켬 — 옵션 졸업 (2026-09-26 설정 졸업 1-f)' },
+  { path: 'tools.selfImplement.graphAuthoritative', reason: '2026-09-26 설정 졸업 — 그래프 권위는 항상 켬 · 지워도 된다' },
 ];
 
 /** 설정 원문(JSON 객체)에서 폐기 키가 «있는» 항목만 돌려준다. 순수. */
@@ -3864,6 +4054,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return defaultConfigWithRuntimeProvider();
   const rawObj = raw as Record<string, unknown>;
   observeRetiredConfigKeysOnce(rawObj);
+  const harness = rawObj.harness && typeof rawObj.harness === 'object' && !Array.isArray(rawObj.harness) ? rawObj.harness as Record<string, unknown> : {};
+  const harnessPod = harness.pod && typeof harness.pod === 'object' && !Array.isArray(harness.pod) ? harness.pod as Record<string, unknown> : {};
 
   const sr = (rawObj.skillRouter ?? {}) as Record<string, unknown>;
   let llm = (rawObj.llm ?? {}) as Record<string, unknown>;
@@ -3912,7 +4104,6 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const chatSystemPrompt = (chat.systemPrompt ?? {}) as Record<string, unknown>;
   const chatRendering = (chat.rendering ?? {}) as Record<string, unknown>;
   const chatRenderingStreaming = (chatRendering.streaming ?? {}) as Record<string, unknown>;
-  const chatRenderingCompactBoundary = (chatRendering.compactBoundary ?? {}) as Record<string, unknown>;
   const chatRenderingWrap = (chatRendering.wrap ?? {}) as Record<string, unknown>;
   const chatRenderingDiff = (chatRendering.diff ?? {}) as Record<string, unknown>;
   const chatRenderingHud = (chatRendering.hud ?? {}) as Record<string, unknown>;
@@ -3948,6 +4139,14 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const rawNotifications = rawGlobalObj?.notifications ?? rawObj.notifications;
 
   return {
+    harness: {
+      pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
+      budgetGate: parseHarnessBudgetGate(
+        rawObj.harness && typeof rawObj.harness === 'object' && !Array.isArray(rawObj.harness)
+          ? (rawObj.harness as Record<string, unknown>).budgetGate
+          : undefined,
+      ),
+    },
     skillRouter: {
       autoRoute: sr.autoRoute === true,
       autoRouteCountdownMs: clampNum(sr.autoRouteCountdownMs, SR_DEFAULTS.autoRouteCountdownMs, 0, 10000),
@@ -4060,6 +4259,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     },
     obsidian: {
       vault: str(ob.vault) ?? obsidianDefaults().vault,
+      ...(str(ob.testVault) ? { testVault: str(ob.testVault)! } : {}),
     },
     telegram: {
       enabled: tg.enabled === true,
@@ -4293,16 +4493,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
             10_000,
           ),
         },
-        compactBoundary: {
-          enabled: chatRenderingCompactBoundary.enabled === false
-            ? false
-            : CHAT_DEFAULTS.rendering.compactBoundary.enabled,
-        },
         wrap: {
           urlAware: chatRenderingWrap.urlAware === true,
-          preserveOsc8: chatRenderingWrap.preserveOsc8 === false
-            ? false
-            : CHAT_DEFAULTS.rendering.wrap.preserveOsc8,
         },
         tool: {
           displayMode: normalizeChatRenderingToolDisplayMode(
@@ -4321,22 +4513,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         },
         diff: {
           colorTier: normalizeChatRenderingDiffColorTier(chatRenderingDiff.colorTier),
-          adaptiveBg: chatRenderingDiff.adaptiveBg === false
-            ? false
-            : CHAT_DEFAULTS.rendering.diff.adaptiveBg,
-          syntaxPerHunk: chatRenderingDiff.syntaxPerHunk === false
-            ? false
-            : CHAT_DEFAULTS.rendering.diff.syntaxPerHunk,
-          cache: chatRenderingDiff.cache === false
-            ? false
-            : CHAT_DEFAULTS.rendering.diff.cache,
           headerStyle: normalizeChatRenderingDiffHeaderStyle(chatRenderingDiff.headerStyle),
-          turnSummary: chatRenderingDiff.turnSummary === false
-            ? false
-            : CHAT_DEFAULTS.rendering.diff.turnSummary,
-          turnBrowser: chatRenderingDiff.turnBrowser === false
-            ? false
-            : CHAT_DEFAULTS.rendering.diff.turnBrowser,
           turnBrowserHistory: clampNum(
             chatRenderingDiff.turnBrowserHistory,
             CHAT_DEFAULTS.rendering.diff.turnBrowserHistory,
@@ -4579,6 +4756,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     // resolvers fall through to zero-config defaults.
     ...spreadIfDefined('modelTier', parseModelTierConfig(rawObj.modelTier)),
     ...spreadIfDefined('sessionFabric', parseSessionFabricConfig(rawObj.sessionFabric)),
+    ...spreadIfDefined('nextFluent', parseNextFluentConfig(rawObj.nextFluent)),
     ...spreadIfDefined('taste', parseTasteConfig(rawObj.taste)),
     ...spreadIfDefined('webSearch', parseWebSearchConfig(rawObj.webSearch)),
     ...spreadIfDefined('budget', parseBudgetConfig(rawObj.budget)),
@@ -4588,6 +4766,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     ...spreadIfDefined('roleLlm', parseRoleLlmConfig(rawObj.roleLlm)),
     ...spreadIfDefined('autoReview', parseAutoReviewConfig(rawObj.autoReview)),
     ...spreadIfDefined('ops', parseOpsConfig(rawObj.ops)),
+    grounding: parseGroundingSources(rawObj.grounding),
     ...spreadIfDefined('notifications', parseNotificationsConfig(rawNotifications)),
     ...spreadIfDefined('mcp', parseMcpConfig(rawObj.mcp)),
     ...spreadIfDefined('backgroundReasoning', parseBackgroundReasoningConfig(rawObj.backgroundReasoning)),
@@ -5090,10 +5269,6 @@ export function saveUserConfig(
       ...CHAT_DEFAULTS.rendering.streaming,
       ...(cfg.chat.rendering?.streaming ?? {}),
     },
-    compactBoundary: {
-      ...CHAT_DEFAULTS.rendering.compactBoundary,
-      ...(cfg.chat.rendering?.compactBoundary ?? {}),
-    },
     wrap: {
       ...CHAT_DEFAULTS.rendering.wrap,
       ...(cfg.chat.rendering?.wrap ?? {}),
@@ -5140,9 +5315,11 @@ export function saveUserConfig(
   // parsers; strip from raw so stale copies don't double-write.
   delete rawRest.modelTier;
   delete rawRest.sessionFabric;
+  delete rawRest.nextFluent;
   delete rawRest.taste;
   delete rawRest.budget;
   delete rawRest.smartDefaults;
+  delete rawRest.grounding;
 
   const out: Record<string, unknown> = {
     ...rawRest,
@@ -5216,7 +5393,7 @@ export function saveUserConfig(
       includeClaudePackageSkills: cfg.skills.includeClaudePackageSkills === true ? true : undefined,
       includeClaudePackageCommands: cfg.skills.includeClaudePackageCommands === true ? true : undefined,
     }),
-    obsidian: { vault: cfg.obsidian.vault },
+    obsidian: { vault: cfg.obsidian.vault, ...(cfg.obsidian.testVault ? { testVault: cfg.obsidian.testVault } : {}) },
     telegram: stripUndef({
       enabled: cfg.telegram.enabled,
       botToken: cfg.telegram.botToken,
@@ -5315,12 +5492,8 @@ export function saveUserConfig(
           catchUpThresholdLines: chatRendering.streaming.catchUpThresholdLines,
           catchUpAgeMs: chatRendering.streaming.catchUpAgeMs,
         }),
-        compactBoundary: stripUndef({
-          enabled: chatRendering.compactBoundary.enabled,
-        }),
         wrap: stripUndef({
           urlAware: chatRendering.wrap.urlAware,
-          preserveOsc8: chatRendering.wrap.preserveOsc8,
         }),
         tool: stripUndef({
           displayMode: chatRendering.tool.displayMode,
@@ -5328,12 +5501,7 @@ export function saveUserConfig(
         }),
         diff: stripUndef({
           colorTier: chatRendering.diff.colorTier,
-          adaptiveBg: chatRendering.diff.adaptiveBg,
-          syntaxPerHunk: chatRendering.diff.syntaxPerHunk,
-          cache: chatRendering.diff.cache,
           headerStyle: chatRendering.diff.headerStyle,
-          turnSummary: chatRendering.diff.turnSummary,
-          turnBrowser: chatRendering.diff.turnBrowser,
           turnBrowserHistory: chatRendering.diff.turnBrowserHistory,
           turnBrowserMode: chatRendering.diff.turnBrowserMode,
         }),
@@ -5450,10 +5618,14 @@ export function saveUserConfig(
     // users' file clean (no empty modelTier:{} blobs).
     ...(cfg.modelTier ? { modelTier: cfg.modelTier } : {}),
     ...(cfg.sessionFabric ? { sessionFabric: cfg.sessionFabric } : {}),
+    ...(cfg.nextFluent ? { nextFluent: cfg.nextFluent } : {}),
     ...(cfg.taste ? { taste: cfg.taste } : {}),
     ...(cfg.webSearch ? { webSearch: cfg.webSearch } : {}),
     ...(cfg.budget ? { budget: cfg.budget } : {}),
     ...(cfg.smartDefaults ? { smartDefaults: cfg.smartDefaults } : {}),
+    ...(cfg.grounding && cfg.grounding.sources.length > 0
+      ? { grounding: { sources: cfg.grounding.sources } }
+      : {}),
   };
   mkdirSync(dirname(path), { recursive: true });
   // FU3: lock-protected atomic write. Path B's patchUserConfig acquires

@@ -1,9 +1,8 @@
 // ── next-fluent 데몬 배선 (2026-07-15) ───────────────────────────────────────
 //
 // startNexusHttpServer 의 nextFluent 라우트 opts 를 구성한다. mission-fabric-aware source(페이즈 실
-// 상태 역추적) + config-gated enabled thunk(기본 OFF·live) + 옵션 로컬 페르소나 lane. intentPrediction
-// 과 같은 자리(nexus/index.ts)에서 호출. 항상 배선하므로 route 는 더는 503(not-wired) 안 낸다 —
-// config OFF 면 enabled()=false → 409 → PWA 칩 조용히 숨김(disabled).
+// 상태 역추적) + always-on enabled thunk + 옵션 로컬 페르소나 lane. intentPrediction
+// 과 같은 자리(nexus/index.ts)에서 호출. 항상 배선하므로 route 는 더는 503(not-wired) 안 낸다.
 
 import type { NextFluentRouteOpts } from './next-fluent.js';
 import {
@@ -50,13 +49,12 @@ export async function dispatchPhaseAction(refId: string, action: string): Promis
   } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
 }
 
-/** nextFluent config 읽기 — typed 우선, 없으면 `raw` passthrough(파서 미등록 root 키·dispatch 선례 동형). */
-function readNextFluentCfg(): { enabled?: boolean; personas?: boolean } {
-  const c = getUserConfig();
-  return c.nextFluent ?? (c.raw?.nextFluent as { enabled?: boolean; personas?: boolean } | undefined) ?? {};
+/** nextFluent 페르소나 옵션은 검증된 typed 설정에서만 읽는다. */
+function readNextFluentCfg(): { personas?: boolean } {
+  return getUserConfig().nextFluent ?? {};
 }
 
-/** nextFluent 라우트 opts — 항상 배선(enabled thunk 가 게이트). personas 는 build-time(재시작 반영). */
+/** nextFluent 라우트 opts — 항상 배선. personas 는 build-time(재시작 반영). */
 export function buildNextFluentRouteOpts(
   deps: { lookupPhase?: (refId: string) => PhaseActionState | null } = {},
 ): NextFluentRouteOpts {
@@ -65,7 +63,7 @@ export function buildNextFluentRouteOpts(
   return {
     deps: {
       source: createMissionNextActionSource({ lookupPhase: lookup }),
-      enabled: () => readNextFluentCfg().enabled === true, // live thunk(raw fallback·재시작 불요)
+      enabled: () => true,
       ...(personasOn ? { laneCallable: createLocalShowroomLaneCallable() } : {}),
     },
     dispatch: dispatchPhaseAction,

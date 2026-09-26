@@ -2064,7 +2064,7 @@ export function buildContext(ctx: DashboardContext): string {
 export function formatResponse(
   text: string,
   maxWidth: number,
-  wrapOpts: { urlAware?: boolean; preserveOsc8?: boolean } = {},
+  wrapOpts: { urlAware?: boolean } = {},
 ): string[] {
   // Apply markdown styling first
   const rendered = renderMarkdown(text);

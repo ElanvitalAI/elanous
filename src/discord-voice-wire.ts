@@ -35,6 +35,7 @@
 // gate. Production behavior is unchanged until the operator opts in.
 
 import type { UserConfig } from './user-config.js';
+import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { runTurn } from './session/chat.js';
 import type { DiscordBot, DcIncoming, DiscordVoiceDispatchTap } from './discord.js';
 import { createSession } from './session/index.js';
@@ -280,7 +281,7 @@ export function buildDiscordVoiceWire(deps: DiscordVoiceWireDeps): DiscordVoiceW
   function discover(): Promise<{ guildId: string | null; voiceChannelId: string | null }> {
     if (discovered) return discovered;
     discovered = (async () => {
-      const token = cfg.discord.botToken?.trim();
+      const token = resolveChannelBotToken('discord', cfg)?.token.trim();
       if (!token) return { guildId: null, voiceChannelId: null };
       try {
         const auth = { headers: { Authorization: `Bot ${token}` } };

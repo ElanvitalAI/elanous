@@ -1,0 +1,16 @@
+# 몸은 저장소 밖 스킬(yt-vault)이다 — 자리는 YT_VAULT_DIR 로 받는다(크론이 준다).
+intake-trend:
+  command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" trend'
+  timeout_ms: 1200000
+intake-ingest:
+  command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" ingest'
+  timeout_ms: 300000
+intake-telegram:
+  command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" telegram'
+  timeout_ms: 300000
+intake-github:
+  command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" github'
+  timeout_ms: 600000
+intake-absorb:
+  command: 'zsh "${YT_VAULT_DIR:?YT_VAULT_DIR 필요}/scripts/intake-daily.sh" absorb'
+  timeout_ms: 21600000   # 자동 흡수 상한 10편 × enriched(한 편 수 분~수십 분)

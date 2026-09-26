@@ -13,6 +13,7 @@ import { parseTestOutput } from '../../agent-mission/parse.js';
 import { androidFilesIn } from '../../../scripts/ci-android-unit-tests.js';
 import { iosFilesIn } from '../../../scripts/ci-ios-unit-tests.js';
 import { tscEnv } from '../../typecheck-ratchet.js';
+import { debug } from '../../debug/log.js';
 
 export interface CmdResult {
   code: number;
@@ -46,7 +47,11 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
     if (process.platform === 'win32') process.kill(pid, signal);
     else process.kill(-pid, signal);
   } catch (error: unknown) {
-    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ESRCH') return;
+    if (code !== 'EPERM') throw error;
+    debug.log('integrity-gate', 'signal-eperm', { pid, signal }, { level: 'warn' });
+    try { process.kill(pid, signal); } catch { /* best-effort leader fallback */ }
   }
 }
 
@@ -57,6 +62,7 @@ function processGroupExists(pid: number): boolean {
     return true;
   } catch (error: unknown) {
     if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    if ((error as NodeJS.ErrnoException).code === 'EPERM') return true;
     throw error;
   }
 }
@@ -130,10 +136,18 @@ const runCmdImpl = (
     cleanup();
     reject(error);
   };
+  const groupStillExists = (pid: number): boolean => {
+    try {
+      return groupExists(pid);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'EPERM') return true;
+      throw error;
+    }
+  };
   const settleAfterReap = () => {
     if (!closed || terminationReason === undefined) return;
     try {
-      if (processGroupId !== undefined && groupExists(processGroupId)) return;
+      if (processGroupId !== undefined && groupStillExists(processGroupId)) return;
       settle();
     } catch (error: unknown) {
       fail(error);
@@ -153,7 +167,16 @@ const runCmdImpl = (
     // ⭐ 종료 경로 전체의 상한(리뷰 must-fix) — TERM 유예 + KILL 후 reap 대기까지 다 지나면
     //   그룹이 남아 있어도 **무조건 결과를 낸다**. 데드라인이 없으면 좀비 하나가 게이트를
     //   영구히 멈춘다(이 파일이 고치려는 바로 그 실패 형태).
-    reapDeadlineTimer = setTimeout(settle, TERMINATION_GRACE_MS + REAP_DEADLINE_MS);
+    reapDeadlineTimer = setTimeout(() => {
+      try {
+        if (processGroupId !== undefined && groupStillExists(processGroupId)) {
+          debug.log('integrity-gate', 'group-unkillable', { pid: processGroupId }, { level: 'warn' });
+        }
+        settle();
+      } catch (error: unknown) {
+        fail(error);
+      }
+    }, TERMINATION_GRACE_MS + REAP_DEADLINE_MS);
     killTimer = setTimeout(() => {
       try {
         if (processGroupId !== undefined) signalProcessGroup(processGroupId, 'SIGKILL');
@@ -263,7 +286,7 @@ export async function runIntegrityGate(
   opts: { steps?: GateStepName[]; runCmd?: RunCmd; failFast?: boolean; testArgs?: string[]; previousPassCount?: number } = {},
 ): Promise<GateResult> {
   const steps = opts.steps ?? DEFAULT_GATE_STEPS;
-  const runCmd = opts.runCmd ?? defaultRunCmd;
+  const runCmd = opts.runCmd ?? createRunCmd();
   const results: GateStep[] = [];
   const logs: string[] = [];
   let passed = true;

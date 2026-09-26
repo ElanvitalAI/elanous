@@ -41,8 +41,8 @@ export interface DashboardTurnStreamRuntimeDeps {
   pinChatTail: () => void;
   termCols: () => number;
   // chat.rendering.wrap 는 boolean 이 아니라 wrap 옵션 오브젝트로 이관됨.
-  wrapOpts: { urlAware?: boolean; preserveOsc8?: boolean };
-  formatResponse: (full: string, width: number, wrapOpts?: { urlAware?: boolean; preserveOsc8?: boolean }) => string[];
+  wrapOpts: { urlAware?: boolean };
+  formatResponse: (full: string, width: number, wrapOpts?: { urlAware?: boolean }) => string[];
   text: (line: string) => string;
   muted: (text: string) => string;
   ptyCallLine: (name: string, args: Record<string, unknown>) => string | null;

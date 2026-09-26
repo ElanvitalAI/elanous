@@ -1,0 +1,19 @@
+# 힐 판 역할 → 결정론 실행. 접두 없는 recipe 가 카탈로그 역할이고 여기 `{ command }` 가 있을 때만 러너가 실행한다.
+observe-ledger:
+  command: "bun scripts/heal/run-role.ts observe-ledger"
+triage:
+  command: "bun scripts/heal/run-role.ts triage"
+verify-classification-evidence:
+  command: "bun scripts/heal/run-role.ts verify-classification-evidence"
+verify:
+  command: "bun scripts/heal/run-role.ts verify"
+acknowledge-untestable:
+  command: "bun scripts/heal/run-role.ts acknowledge-untestable"
+rework-note:
+  command: "bun scripts/heal/run-role.ts rework-note"
+revise-goal:
+  command: "bun scripts/heal/run-role.ts revise-goal"
+observe-deeper:
+  command: "bun scripts/heal/run-role.ts observe-deeper"
+ground-external:
+  command: "bun scripts/heal/run-role.ts ground-external"

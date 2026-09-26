@@ -8,6 +8,8 @@
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { ChildLlmPreferenceCard } from '@/components/settings/ChildLlmPreferenceCard';
+import { AnswerDepthCard } from '@/components/settings/AnswerDepthCard';
 import { ApiKeyField, validateApiKey } from '@/components/ui/api-key-field';
 import { Button } from '@/components/ui/button';
 import type {
@@ -145,6 +147,8 @@ export default function SetupPage() {
           위에서 provider 를 선택해주세요.
         </p>
       )}
+      <ChildLlmPreferenceCard />
+      <AnswerDepthCard />
     </div>
   );
 }

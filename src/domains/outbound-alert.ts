@@ -13,6 +13,7 @@ import { spillLongContent } from '../storage/content-spill.js';
 import { openSurfaceEventsDb, recordEvent } from './surface-events.js';
 import { latestUserIntentTs } from '../user-intent/index.js';
 import { getUserConfig } from '../user-config.js';
+import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { debug } from '../debug/log.js';
 // ★ origin 되돌림(대표 2026-07-12) — 미션 알림을 발신 채널(메인 Q&A 봇)로 되돌린다. type-only
 //   import 라 런타임 순환 없음(발송 로직은 이 파일에 self-contained). origin 없으면 report 폴백.
@@ -122,10 +123,11 @@ function resolveBotToken(botId?: string): string | null {
       botToken?: string; reportChannel?: { botToken?: string }; testChannel?: { botToken?: string };
     } | undefined;
     if (!tg) return null;
-    const candidates = [tg.botToken, tg.reportChannel?.botToken, tg.testChannel?.botToken]
+    const mainToken = resolveChannelBotToken('telegram', getUserConfig())?.token;
+    const candidates = [mainToken, tg.reportChannel?.botToken, tg.testChannel?.botToken]
       .filter((t): t is string => typeof t === 'string' && t.length > 0);
     if (botId) { const m = candidates.find((t) => t.split(':')[0] === botId); if (m) return m; }
-    return tg.botToken ?? candidates[0] ?? null;
+    return mainToken ?? candidates[0] ?? null;
   } catch { return null; }
 }
 

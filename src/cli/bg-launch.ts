@@ -8,6 +8,7 @@ import { isPidAlive } from '../process/pid-liveness.js';
 import {
   checkSetupStatus,
   renderSetupStatus,
+  setupBootMode,
   type SetupCheckResult,
 } from '../nexus/setup-status.js';
 import {
@@ -60,6 +61,7 @@ function lastMeaningfulLogLine(logPath: string): string | undefined {
 
 export interface BgLaunchOpts {
   forwardArgs?: string[];
+  childEnv?: Record<string, string>;
   force?: boolean;
   spawnFn?: (cmd: string, args: string[], opts: SpawnOptions) => BgChildHandle;
   logPathFn?: (stamp: string) => string;
@@ -117,13 +119,15 @@ export async function runBgLaunch(opts: BgLaunchOpts = {}): Promise<BgLaunchResu
   }
 
   const setup = opts.setupStatus ?? checkSetupStatus({ argvBin: process.argv[1] ?? '' });
-  if (!setup.ok) {
+  const boot = setupBootMode(setup);
+  if (boot.mode === 'refuse') {
     out.error('✗ elanous nexus --bg: setup incomplete');
     renderSetupStatus(setup, out);
     out.log('');
     out.log('  Run `elanous nexus` (interactive) once to walk through the wizard.');
     return { exitCode: 1 };
   }
+  const setupMode = boot.mode === 'setup';
 
   const argvBin = process.argv[1] ?? '';
   if (!argvBin) {
@@ -166,7 +170,15 @@ export async function runBgLaunch(opts: BgLaunchOpts = {}): Promise<BgLaunchResu
     const child = spawnFn(process.execPath, args, {
       detached: true,
       stdio: ['ignore', logFd, logFd],
-      env: { ...process.env, ELANOUS_NEXUS_BG_PARENT: '1' },
+      env: {
+        ...process.env,
+        ELANOUS_TEST_COORDINATOR_LEASE_PORT: undefined,
+        ELANOUS_TEST_COORDINATOR_LEASE_TOKEN: undefined,
+        ELANOUS_TEST_COORDINATOR_LEASE_ID: undefined,
+        ...opts.childEnv,
+        ELANOUS_NEXUS_BG_PARENT: '1',
+        ...(setupMode ? { ELANOUS_NEXUS_SETUP_MODE: '1' } : {}),
+      },
     });
     child.unref();
     await (opts.sleepFn ?? sleep)(opts.childProbeDelayMs ?? DEFAULT_CHILD_PROBE_DELAY_MS);
@@ -177,6 +189,9 @@ export async function runBgLaunch(opts: BgLaunchOpts = {}): Promise<BgLaunchResu
       if (lastLine) out.error(`  reason    ${lastLine}`);
       out.error(`  log       ${logPath}`);
       return { exitCode: 1, pid: child.pid, logPath };
+    }
+    if (setupMode) {
+      out.log(`셋업 모드로 떴습니다 — 브라우저로 셋업: ${httpSummary(opts)}/setup (빠진 것: ${boot.missing.join(', ')})`);
     }
     out.log('elanous nexus: started in background');
     out.log(`  pid       ${child.pid ?? '(unknown)'}`);

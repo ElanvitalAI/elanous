@@ -1,5 +1,16 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { dashboardMatches, dashboardSourceLocations, readDashboardSources, type DashboardSource } from './helpers/dashboard-source.js';
+
+const MOUNT_IMPORT = /import\s*{[^}]*\bmountScenarioIntoTarget\b[^}]*}\s*from ['"](?:\.\.\/)+tool-runtime\/scenario-target-mount\.js['"]/;
+const MOUNT_CALL = /\(\s*deps\.mountIntoTarget\s*\?\?\s*mountScenarioIntoTarget\s*\)\s*\(/;
+
+function sharedMountSources(sources: readonly DashboardSource[]): DashboardSource[] {
+  // This is a same-module source contract; proving boot reachability belongs to the later import-graph stage.
+  return sources.filter(({ text }) => MOUNT_IMPORT.test(text) && MOUNT_CALL.test(text));
+}
 
 function text(path: string): string {
   return readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -18,19 +29,32 @@ describe('ui foundation · R9.U-5(b) target boundary source truth', () => {
   });
 
   test('dashboard uses the shared target mount helper instead of an ad-hoc target-kind switch', () => {
-    // 🪞⭐ 2026-08-26 — 소비자가 ***추출***됐다: src/dashboard/index.ts → src/dashboard/scenario-runtime-boot.ts
-    //   그리고 «좋아졌다» — 이제 주입 가능하다(`deps.mountIntoTarget ?? mountScenarioIntoTarget`).
-    //   ⇒ 계약(“대시보드는 ad-hoc switch 대신 «공유 헬퍼»를 쓴다”)은 «내내» 지켜지고 있었다.
-    //   ⛔ 늙은 것은 ***「어느 파일이 그 소비자인가」***라는 좌표다.
-    const src = text('../src/dashboard/scenario-runtime-boot.ts');
-    expect(src).toContain("from '../tool-runtime/scenario-target-mount.js'");
-    expect(src).toContain('mountScenarioIntoTarget');
-    // ⛔⭐ 주입 이음매가 «있어도» 실물 기본이 공유 헬퍼여야 한다 — 그게 이 계약의 요점이다.
-    expect(src).toMatch(/\(\s*deps\.mountIntoTarget\s*\?\?\s*mountScenarioIntoTarget\s*\)\s*\(/);
-    // ⛔ ad-hoc 분기가 «되살아나지» 않았는지는 ***대시보드 두 파일 모두***에서 문다 —
-    //   한 파일만 보면 추출로 «옮겨 간» 분기를 놓친다.
-    for (const rel of ['../src/dashboard/scenario-runtime-boot.ts', '../src/dashboard/index.ts']) {
-      expect(text(rel)).not.toContain('is not supported by the dashboard mount path yet');
+    const sources = readDashboardSources();
+    const shared = sharedMountSources(sources);
+    expect(shared.length, `Missing shared target mount import and default call in the same file: ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
+    expect(dashboardMatches(MOUNT_IMPORT, shared).length,
+      `Missing shared mount import in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
+    expect(dashboardMatches(/mountScenarioIntoTarget/, shared).length,
+      `Missing shared mount identifier in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
+    expect(dashboardMatches(MOUNT_CALL, shared).length,
+      `Missing shared mount call in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
+    const unsupported = dashboardMatches(/is not supported by the dashboard mount path yet/, sources);
+    expect(unsupported, `Unexpected ad-hoc branch at ${unsupported.map(({ path, line }) => `${path}:${line}`).join(', ')}`).toEqual([]);
+  });
+
+  test('does not combine an unused mount import with another module’s mount call', () => {
+    const root = mkdtempSync(join(tmpdir(), 'dashboard-mount-contract-'));
+    const dir = join(root, 'src/dashboard');
+    mkdirSync(dir, { recursive: true });
+    try {
+      writeFileSync(join(dir, 'index.ts'), 'export {};\n');
+      writeFileSync(join(dir, 'unused.ts'), "import { mountScenarioIntoTarget } from '../tool-runtime/scenario-target-mount.js';\n");
+      writeFileSync(join(dir, 'other.ts'), '(deps.mountIntoTarget ?? mountScenarioIntoTarget)(widgets, target, deps);\n');
+      expect(sharedMountSources(readDashboardSources(dir))).toEqual([]);
+      writeFileSync(join(dir, 'other.ts'), "import { mountScenarioIntoTarget } from '../tool-runtime/scenario-target-mount.js';\n(deps.mountIntoTarget ?? mountScenarioIntoTarget)(widgets, target, deps);\n");
+      expect(sharedMountSources(readDashboardSources(dir))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

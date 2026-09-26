@@ -37,7 +37,7 @@ import type { AcpTransportConnection } from '../acp/transport/index.js';
 import { debug } from '../debug/log.js';
 import { recordDashboardToolCatalog } from './tool-catalog-observability.js';
 
-type DashboardAcpBootBranch = 'remote-daemon' | 'local-daemon' | 'in-process';
+type DashboardAcpBootBranch = 'remote-daemon' | 'in-process';
 
 function recordDashboardAcpBootBranch(
   branch: DashboardAcpBootBranch,
@@ -83,15 +83,8 @@ export interface DashboardAcpBootDeps {
    *  callbacks become unused — the daemon's `runTurn` owns those.
    *  `getCwd()` is still consulted to populate `newSession(cwd)`. */
   remote?: { url: string; token?: string; label?: string };
-  /** M1.5 A.3 — when set, the dashboard attaches to a running local
-   *  daemon over the supplied unix socket instead of booting an
-   *  in-process ACP server. Same trade-off as `remote` (above) but
-   *  for the local-machine path. Either field activates the thin-
-   *  client branch in `bootDashboardAcpSession`; setting both is a
-   *  caller error (`remote` wins). */
-  localDaemon?: { socketPath: string };
-  /** Tier 1 daemon-resume — when set together with `remote` or
-   *  `localDaemon`, the boot flips from `DashboardSession.attach()`
+  /** Tier 1 daemon-resume — when set together with `remote`,
+   *  the boot flips from `DashboardSession.attach()`
    *  (which mints a new sessionId) to `attachExisting({sessionId})`
    *  (which calls ACP `session/load` so the daemon's existing
    *  history is reused). The daemon must advertise
@@ -101,7 +94,7 @@ export interface DashboardAcpBootDeps {
    *
    *  Driven by the `--resume <id>` CLI flag or
    *  `ELANOUS_RESUME_SESSION` env (resolved in `main()`). Has no
-   *  effect when neither `remote` nor `localDaemon` is set —
+   *  effect when `remote` is not set —
    *  in-process resume goes through the existing TUI session
    *  store (`/session load`), not this path. */
   resumeSessionId?: string;
@@ -172,18 +165,16 @@ export interface DashboardAcpBootResult {
   resumeFallbackReason?: string;
 }
 
-/** Boot a dashboard-owned `DashboardSession`. Three paths:
- *    - `deps.remote` set    → M2.4 thin attach over WebSocket
- *    - `deps.localDaemon` set → M1.5 A.3 thin attach over unix socket
- *    - neither set          → in-process ACP server + client pair (default)
- *  Both attach branches share the same shape (`DashboardSession.attach`
- *  with the gateway forwarded); only the connect call differs. The
- *  returned handle stays hot for the dashboard's lifetime — `close()`
+/** Boot a dashboard-owned `DashboardSession`. Two paths:
+ *    - `deps.remote` set → M2.4 thin attach over WebSocket
+ *    - otherwise         → in-process ACP server + client pair (default)
+ *  The remote branch uses `DashboardSession.attach` with the gateway
+ *  forwarded. The returned handle stays hot for the dashboard's lifetime — `close()`
  *  tears down the local pair (or drops the daemon connection while
  *  the daemon survives).
  *
  *  Tier 1 daemon-resume — when `deps.resumeSessionId` is set together
- *  with a daemon transport, the boot calls `attachExisting()` instead
+ *  with `deps.remote`, the boot calls `attachExisting()` instead
  *  of `attach()`. On daemon-side `loadSession` failure (unknown id,
  *  capability missing) the boot logs + transparently falls back to
  *  `attach()` so the user gets a working session even with a stale
@@ -215,23 +206,6 @@ export async function bootDashboardAcpSession(
           ...(deps.remote!.token ? { token: deps.remote!.token } : {}),
           ...(deps.remote!.label ? { label: deps.remote!.label } : {}),
         }),
-    });
-    recordDashboardAcpBootOutcome(result);
-    return result;
-  }
-
-  if (deps.localDaemon) {
-    recordDashboardAcpBootBranch('local-daemon', false);
-    // M1.5 A.3 — thin attach over unix socket. Same trade-off as
-    // remote; tool dispatch + history owned by the daemon.
-    const { connectUnixSocket } = await import(
-      '../tui-client/acp-transport-unix-client.js'
-    );
-    const result = await attachWithOptionalResume({
-      cwd: deps.getCwd(),
-      resumeSessionId: deps.resumeSessionId,
-      onPerm,
-      connect: () => connectUnixSocket({ path: deps.localDaemon!.socketPath }),
     });
     recordDashboardAcpBootOutcome(result);
     return result;
@@ -272,8 +246,7 @@ export async function bootDashboardAcpSession(
 
 // ─── Tier 1 daemon-resume helpers ────────────────────────────────
 
-/** Shared attach path for the two daemon transports (remote WS / local
- *  unix-socket). When `resumeSessionId` is set, calls
+/** Remote daemon attach path. When `resumeSessionId` is set, calls
  *  `DashboardSession.attachExisting()` so the daemon's prior turns are
  *  preserved. Falls back to fresh `attach()` on any failure (unknown
  *  id · loadSession unsupported · transport hiccup) so the user always

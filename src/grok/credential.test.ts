@@ -190,6 +190,66 @@ describe('refreshGrokSubscriptionToken — ⭐ 강등보다 «앞»에 오는 �
       .toBe('no-credential');
   });
 
+  it('Pod env + 만료 10분 전 access 는 중계의 새 key 로 0600 다시 쓰기를 하고, 500 이면 옛 key 를 유지한다', async () => {
+    const now = Date.parse('2026-09-26T12:00:00Z');
+    const soon = new Date(now + 10 * 60 * 1000).toISOString();
+    const home = homeWithAuth({
+      's::c': { key: 'old-access', expires_at: soon, refresh_token: 'do-not-send', user_id: 'acct-1' },
+    });
+    const seenAuth: string[] = [];
+    const ok = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        seenAuth.push(req.headers.get('authorization') ?? '');
+        return Response.json({ key: 'new-access', expires_at: '2026-09-26T18:00:00.000Z' });
+      },
+    });
+    try {
+      const env = {
+        ELANOUS_POD_CREDENTIAL_URL: ok.url.href,
+        ELANOUS_POD_CREDENTIAL_TOKEN: 'pod-token',
+      } as NodeJS.ProcessEnv;
+      const cred = await resolveGrokCredential({ home, env, now: () => now });
+      expect(cred?.token).toBe('new-access');
+      expect(seenAuth).toEqual(['Bearer pod-token']);
+      const path = join(home, '.grok', 'auth.json');
+      const mode = (await import('node:fs')).statSync(path).mode & 0o777;
+      expect(mode).toBe(0o600);
+      const written = JSON.parse((await import('node:fs')).readFileSync(path, 'utf-8')) as {
+        's::c': { key: string; refresh_token: string };
+      };
+      expect(written['s::c'].key).toBe('new-access');
+      expect(written['s::c'].refresh_token).toBe('do-not-send');
+    } finally {
+      ok.stop(true);
+    }
+
+    const stale = homeWithAuth({
+      's::c': { key: 'keep-me', expires_at: soon, refresh_token: 'stay' },
+    });
+    const bad = Bun.serve({
+      port: 0,
+      fetch() { return new Response('no', { status: 500 }); },
+    });
+    try {
+      const cred = await resolveGrokCredential({
+        home: stale,
+        env: {
+          ELANOUS_POD_CREDENTIAL_URL: bad.url.href,
+          ELANOUS_POD_CREDENTIAL_TOKEN: 'pod-token',
+        } as NodeJS.ProcessEnv,
+        now: () => now,
+      });
+      expect(cred?.token).toBe('keep-me');
+      const body = JSON.parse((await import('node:fs')).readFileSync(join(stale, '.grok', 'auth.json'), 'utf-8')) as {
+        's::c': { key: string };
+      };
+      expect(body['s::c'].key).toBe('keep-me');
+    } finally {
+      bad.stop(true);
+    }
+  });
+
   it('⛔ 읽기 전용 명령을 쓴다 — 쿼터를 태우는 추론이 아니다', () => {
     let seen: string[] = [];
     const home = homeWithAuth({ 's::c': { key: 'k', expires_at: '2026-01-01T00:00:00Z' } });

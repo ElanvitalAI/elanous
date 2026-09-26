@@ -29,6 +29,8 @@ import type { ShellActivitySnapshot } from './activity-snapshot';
 import { useShellActivity } from './use-shell-activity';
 import { InstallBanner } from '@/components/install-banner';
 import { WorkspaceProvider } from '@/components/workspace/WorkspaceProvider';
+import { SetupModeBanner } from './SetupModeBanner';
+import { AuthRequiredBanner } from './AuthRequiredBanner';
 
 const SIDEBAR_KEY = 'elanous.pwa.sidebarOpen';
 
@@ -74,6 +76,8 @@ export function AppShell({
     // useWorkspaceOptional() 호출자는 영향 없음 (provider 가 항상 mount).
     <WorkspaceProvider>
       <div className="flex h-screen w-full flex-col bg-background text-foreground">
+        <AuthRequiredBanner />
+        <SetupModeBanner />
         <TopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} />
         <div className="flex flex-1 min-h-0">
           {/* md+ inline sidebar — expanded: w-56 with labels, collapsed:

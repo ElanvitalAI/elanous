@@ -968,8 +968,22 @@ describe('rework 예산 — UNCONVERGEABLE 종료 근거', () => {
 });
 
 // 대표 09-25 BACKLOG B9 — 재작업 승급은 codex·anthropic 이 아닐 때만.
-import { escalationAllowedForProvider } from './rework-policy.js';
+import { escalationAllowedForProvider, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey } from './rework-policy.js';
 it('escalation is suppressed for codex and anthropic only', () => {
   for (const p of ['openai-codex', 'anthropic', 'auto:openai-codex']) expect(escalationAllowedForProvider(p)).toBe(false);
   for (const p of ['grok', 'openrouter', 'local', 'gemini', undefined]) expect(escalationAllowedForProvider(p)).toBe(true);
+});
+
+describe('isRepeatedUnverifiedOnlyGateFailure — 미검증 집합이 반복 열쇠', () => {
+  const prev = unverifiedRepeatKey(['src/b.ts', 'src/a.ts']);
+  it('같은 집합(순서 무관) ⊕ 실패 0 이면 반복', () => {
+    expect(isRepeatedUnverifiedOnlyGateFailure({ previousKey: prev, unverified: ['src/a.ts', 'src/b.ts'], gateLog: '0 fail' })).toBe(true);
+  });
+  it('첫 등장·빈 집합·다른 집합·실패 시험·도입 실패는 반복이 아니다', () => {
+    expect(isRepeatedUnverifiedOnlyGateFailure({ previousKey: undefined, unverified: ['src/a.ts'], gateLog: '' })).toBe(false);
+    expect(isRepeatedUnverifiedOnlyGateFailure({ previousKey: prev, unverified: [], gateLog: '' })).toBe(false);
+    expect(isRepeatedUnverifiedOnlyGateFailure({ previousKey: prev, unverified: ['src/a.ts'], gateLog: '' })).toBe(false);
+    expect(isRepeatedUnverifiedOnlyGateFailure({ previousKey: prev, unverified: ['src/a.ts', 'src/b.ts'], gateLog: '2 fail' })).toBe(false);
+    expect(isRepeatedUnverifiedOnlyGateFailure({ previousKey: prev, unverified: ['src/a.ts', 'src/b.ts'], gateLog: '', introduced: 1 })).toBe(false);
+  });
 });

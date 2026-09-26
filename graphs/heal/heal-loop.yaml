@@ -1,0 +1,150 @@
+# 🩺 힐 표준 템플릿 — 실패가 났을 때 «다음에 무엇을 할지»를 그래프가 정한다 (H0 · 표준 · 고정)
+#
+# 📄 설계 = 내부 문서 `RFC-the-heal-loop-is-a-graph-that-raises-its-own-resolution-2026-09-26` §3.1 · §3.4 · §7
+# 🧩 노드 recipe 는 전부 카탈로그 역할이다 — graphs/catalog/catalog.yaml (test/graph-heal-standard.test.ts 가 확인)
+# ⚠️ 이 판은 «선언»이다 — ③ runner 가 역할 recipe 를 실행하는 것은 다음 단계(H1 · 카탈로그 역할 실행). 지금은 파싱·카탈로그·결과 간선·도달성을 시험이 확인한다.
+#
+# ⭐⭐ 관측 · 인지 · 힐링 3구조 ⊕ 루프 엔지니어링(대표 2026-09-26 · 제1원칙)
+#   관측  = kind observe  — collect(L0 실패 서명) · observe-deeper(L1 면밀 관측) · ground-external(L2 외부 그라운딩)
+#   인지  = kind judge    — triage: 원인을 가르고 «다음 해상도»를 정한다
+#   힐링  = heal-harness(하니스가 직접) · acknowledge · rework-note(표적 재작업) · replan(골 개정)
+#   루프  = 힐링 결과가 다시 관측이 되어 triage 로 되돌아온다(SCQA ⑥ A→S 되접기) · 방문 예산이 루프의 끝을 정한다
+#   해상도 변경 = triage 가 방문 수·반복 열쇠로 L0 → L1 → L2 로 올린다 · 다 쓰면 failed(사람 — 마지막 칸)
+# ⭐ 표준 가족(self-implement · impl-standard · composite-standard) 셋 모두가 gate/review 실패 자리에서 이 한 판을 부른다(역할 heal · kind subgraph).
+# ⭐ 결과는 종결 `done` ⊕ 마지막 노드 산출의 `next`(gate · review · implement · replan)로 돌려준다 — ③ runner 종결 어휘가 done/failed 둘이라서다.
+#    `failed` = 사다리를 다 썼다(needs-human) — 트리아지 산출(evidence) 전부를 싣고 사람에게 간다. 대표 «사람은 마지막 칸».
+# ⭐ 해상도 사다리: triage 가 모호하면 observe-deeper(관측 해상도 +1) → 그래도 모호하거나 외부 동작 의존이면 ground-external(+2).
+#    triage 는 방문 수·반복 열쇠를 보고 스스로 `needs-deeper-observation` / `needs-grounding` / `exhausted` 를 고른다.
+# ⭐ 이 파일은 «표준»이다 — 런 슈퍼바이저는 이 파일을 고치지 않고, 카탈로그 원형(spawn: runtime)을 판 상태 패치로 얹는다(§3.4 G1·G2).
+graph_id: heal-loop
+version: 1
+entry_node: collect
+terminal_nodes: [done, failed]
+
+nodes:
+  - node_id: collect
+    kind: observe
+    recipe: observe-ledger          # 실패 서명: gate facts · 미검증 집합 · importer 미실행 · 반복 열쇠 · 원장 이력
+    max_visits: 1
+    contract:
+      inputs: [failure-signature]
+      outputs: [entries]
+
+  - node_id: triage
+    kind: judge
+    recipe: triage                  # 결정론 먼저 · 모호할 때만 LLM
+    max_visits: 5
+    contract:
+      inputs: [failure-signature, entries, observations, citations]
+      outputs: [failure_kind, evidence]
+
+  - node_id: verify-evidence
+    kind: judge
+    recipe: verify-classification-evidence  # 환경 분류(할당량·자격·기판)의 증거가 «있는데 찼다»인가 «아예 없다»인가 — 🅢 Pod 실물 2026-09-26: 3/3 오분류(계정 0 → «소진» · node 없음 127 → «소진»)
+    max_visits: 2
+    contract:
+      inputs: [failure_kind, evidence]
+      outputs: [confirmed, corrected-kind, next]
+
+  - node_id: heal-harness
+    kind: gate
+    recipe: verify                  # 하니스가 직접: importer 시험을 실행 집합에 넣어 재검 · 분류 교정
+    max_visits: 2
+    contract:
+      inputs: [worktree, changed-files]
+      outputs: [passed, gate-log, unverified]
+
+  - node_id: acknowledge
+    kind: judge
+    recipe: acknowledge-untestable  # 시험 불가 파일(문서·설정·데이터)을 근거와 함께 통과 기록 → review 로
+    max_visits: 1
+    contract:
+      inputs: [unverified, evidence]
+      outputs: [acknowledged, next]
+
+  - node_id: rework-note
+    kind: judge
+    recipe: rework-note             # 파일·심볼을 «이름으로 짚은» 재작업 노트 → implement 로
+    max_visits: 2
+    contract:
+      inputs: [failure_kind, evidence]
+      outputs: [rework-note, next]
+
+  - node_id: replan
+    kind: judge
+    recipe: revise-goal             # 골이 틀렸다 — 골 문서 개정 제안 → author/plan 재진입
+    max_visits: 1
+    contract:
+      inputs: [goal_path, evidence]
+      outputs: [revised-goal, next]
+
+  - node_id: observe-deeper
+    kind: observe
+    recipe: observe-deeper          # 로그·원장·화면·실패 시험 verbose 재실행 (해상도 +1)
+    max_visits: 2
+    contract:
+      inputs: [failure-signature]
+      outputs: [observations]
+
+  - node_id: ground-external
+    kind: observe
+    recipe: ground-external         # omni-crawl · fc-dev · 공식 문서 — 근거를 인용으로 (해상도 +2)
+    max_visits: 1
+    contract:
+      inputs: [question]
+      outputs: [citations, summary]
+
+  - node_id: done
+    kind: gate
+    recipe: none                    # 종결 — ③ runner 는 recipe 없는 노드를 none 으로 읽는다
+    max_visits: 1
+
+  - node_id: failed
+    kind: gate
+    recipe: none                    # 종결 — 사다리를 다 썼다(사람 · 마지막 칸)
+    max_visits: 1
+
+edges:
+  - from: collect
+    on: outcome
+    map: { ok: triage, empty: triage }
+
+  - from: triage
+    on: outcome
+    map:
+      harness-fixable: heal-harness
+      untestable: acknowledge
+      child-fixable: rework-note
+      goal-wrong: replan
+      environment-claimed: verify-evidence
+      needs-deeper-observation: observe-deeper
+      needs-grounding: ground-external
+      exhausted: failed
+
+  - from: verify-evidence
+    on: outcome
+    map: { confirmed: done, corrected: triage }   # 확인된 환경 원인 → done ⊕ next: defer(기다렸다 다시 · 감독 어휘 defer) — 사람 아님
+
+  - from: heal-harness
+    on: outcome
+    map: { pass: done, fail: triage }
+
+  - from: acknowledge
+    on: outcome
+    map: { ok: done, fail: triage }
+
+  - from: rework-note
+    on: outcome
+    map: { ok: done, fail: triage }
+
+  - from: replan
+    on: outcome
+    map: { ok: done, fail: failed }
+
+  - from: observe-deeper
+    on: outcome
+    map: { ok: triage, empty: triage }
+
+  - from: ground-external
+    on: outcome
+    map: { ok: triage, empty: triage }

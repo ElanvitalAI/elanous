@@ -1,3 +1,4 @@
+import { parseGraphRunContract, type GraphRunContractSpec } from './graph-run-contract.js';
 import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,7 +10,7 @@ import { parse as parseYaml } from 'yaml';
  *    (`playground-scenario/yaml-parser.ts` 의 계약을 따른다 · 재발명 0).
  *  ⛔⭐ **뿌리를 «인자»로 받는다** — `import.meta.url` 로 코드 트리에 묶지 않는다.
  *    🩸 §4.6 이 지목한 병: `mission-capabilities/registry.ts` 가 그 방식이라 `--root` 격리가 불가능하다. */
-export type GraphNodeKind = 'agent' | 'gate' | 'git' | 'judge';
+export type GraphNodeKind = 'agent' | 'gate' | 'git' | 'judge' | 'observe' | 'hitl' | 'subgraph';
 
 export interface GraphNodeContract {
   readonly inputs: readonly string[];
@@ -50,6 +51,8 @@ export interface GraphTemplateSpec {
   /** 문서 전용 변경이면 gate 노드를 건너뛸 수 있다는 템플릿 정책. */
   readonly docsOnlyGateSkip?: boolean;
   readonly state?: readonly string[];
+  /** ⭐ 런 계약(선택) — 이 그래프가 «기본으로» 요구하는 실행 칸 등. 발사 인자가 덮는다(graph-run-contract.ts). */
+  readonly runContract?: GraphRunContractSpec;
   readonly nodes: readonly GraphNodeSpec[];
   readonly edges: readonly GraphEdgeSpec[];
 }
@@ -65,7 +68,7 @@ export interface GraphParseResult {
   readonly warnings: readonly GraphParseIssue[];
 }
 
-const KINDS = new Set<GraphNodeKind>(['agent', 'gate', 'git', 'judge']);
+const KINDS = new Set<GraphNodeKind>(['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'subgraph']);
 /** ⚠️ YAML 함정 — `no`/`off`/`yes`/`on` 이 boolean 으로 파싱된다(Norway 문제). 노드 이름에 쓰면 조용히 깨진다. */
 const YAML_TRAP_WORDS = new Set(['true', 'false', 'yes', 'no', 'on', 'off', 'null', '~']);
 
@@ -194,12 +197,15 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
   if (entryNode !== undefined && !known.has(entryNode)) errors.push({ path: `${label}/entry_node`, message: `'${entryNode}' 는 선언된 노드가 아니다` });
   for (const t of terminalNodes) if (!known.has(t)) errors.push({ path: `${label}/terminal_nodes`, message: `'${t}' 는 선언된 노드가 아니다` });
 
+  const runContract = parseGraphRunContract(doc.run_contract);
+  if (runContract.error) errors.push({ path: `${label}/run_contract`, message: runContract.error });
   if (errors.length > 0) return { errors, warnings };
   return {
     template: {
       graphId: graphId!, version: version!, entryNode: entryNode!, terminalNodes, nodes, edges,
       ...(typeof doc.docs_only_gate_skip === 'boolean' ? { docsOnlyGateSkip: doc.docs_only_gate_skip } : {}),
       ...(Array.isArray(doc.state) ? { state: doc.state.filter((v): v is string => typeof v === 'string') } : {}),
+      ...(runContract.spec ? { runContract: runContract.spec } : {}),
     },
     errors, warnings,
   };

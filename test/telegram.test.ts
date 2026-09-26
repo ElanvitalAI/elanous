@@ -342,6 +342,48 @@ describe('TelegramBot', () => {
     expect(calls.every(c => c.url.includes('/sendMessage'))).toBe(true);
   });
 
+  test('reaction emoji start and success stay on without a config switch', async () => {
+    const updates = [{ update_id: 1, message: { message_id: 1, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: 'hello' } }];
+    let served = false;
+    let bot: TelegramBot;
+    const { fetchImpl, calls } = makeStubFetch((call) => {
+      if (call.url.endsWith('getUpdates')) {
+        if (!served) { served = true; return updates; }
+        bot.stop();
+        return [];
+      }
+      if (call.url.endsWith('/sendMessage')) return { message_id: 777 };
+      return {};
+    });
+    bot = new TelegramBot({ token: 't', allowedUsers: [42], onMessage: async () => 'ok', fetchImpl, ...FAST_TG_OPTS });
+    await bot.start();
+    expect(calls.filter(c => c.url.endsWith('/setMessageReaction')).map(c => c.body)).toEqual([
+      { chat_id: 42, message_id: 1, reaction: [{ type: 'emoji', emoji: '👀' }] },
+      { chat_id: 42, message_id: 1, reaction: [{ type: 'emoji', emoji: '👍' }] },
+    ]);
+  });
+
+  test('reaction emoji start and failure stay on without a config switch', async () => {
+    const updates = [{ update_id: 1, message: { message_id: 1, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: 'hello' } }];
+    let served = false;
+    let bot: TelegramBot;
+    const { fetchImpl, calls } = makeStubFetch((call) => {
+      if (call.url.endsWith('getUpdates')) {
+        if (!served) { served = true; return updates; }
+        bot.stop();
+        return [];
+      }
+      if (call.url.endsWith('/sendMessage')) return { message_id: 777 };
+      return {};
+    });
+    bot = new TelegramBot({ token: 't', allowedUsers: [42], onMessage: async () => { throw new Error('oops'); }, fetchImpl, ...FAST_TG_OPTS });
+    await bot.start();
+    expect(calls.filter(c => c.url.endsWith('/setMessageReaction')).map(c => c.body)).toEqual([
+      { chat_id: 42, message_id: 1, reaction: [{ type: 'emoji', emoji: '👀' }] },
+      { chat_id: 42, message_id: 1, reaction: [{ type: 'emoji', emoji: '👎' }] },
+    ]);
+  });
+
   test('poll loop routes updates to onMessage + sends reply', async () => {
     const updates = [
       { update_id: 1, message: { message_id: 1, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: 'hello' } },
@@ -1489,7 +1531,7 @@ describe('botFromConfig end-to-end', () => {
         userConfig: cfg,
         fetchImpl: fetchImplWithVoiceDownload,
         telegramBotOpts: { ...FAST_TG_OPTS, voiceAdapter },
-        runTurnImpl: async () => ({ text: 'should not run' }),
+        runTurnImpl: async () => { throw new Error('should not run'); },
       });
       await bot.start();
     } finally {
@@ -1527,13 +1569,11 @@ describe('botFromConfig end-to-end', () => {
     };
     const restoreStt = setDaemonSttProviderForTesting(sttProvider);
     const restoreTts = setDaemonTtsProviderForTesting(ttsProvider);
+    const oggToPcm16k = async (ogg: Buffer) => Buffer.from(`pcm16:${ogg.toString()}`);
+    const pcm24kToOgg = async (pcm: Buffer) => Buffer.from(`ogg:${pcm.toString()}`);
     const codec: TelegramVoiceCodec = {
-      async oggToPcm16k(ogg: Buffer) {
-        return Buffer.from(`pcm16:${ogg.toString()}`);
-      },
-      async pcm24kToOgg(pcm: Buffer) {
-        return Buffer.from(`ogg:${pcm.toString()}`);
-      },
+      oggToPcm16k, pcm24kToOgg,
+      inputToPcm16k: oggToPcm16k, pcm24kToOutput: pcm24kToOgg,
     };
 
     try {

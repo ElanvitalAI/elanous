@@ -52,6 +52,7 @@
 //   - sha256(prompt+ts) for deterministic uniqueness without random
 //   - .png because gpt-image-2 default; future variants pick by mime
 
+import { assertVaultWriteAllowed } from '../../obsidian/vault-write-guard.js';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -251,6 +252,7 @@ export async function handleImageGenerate(
   const relPath = buildRelPath({ ts, prompt });
   const absPath = join(opts.vault.root, relPath);
   try {
+    assertVaultWriteAllowed(absPath);   // ⛔ 격리 우주는 운영 볼트에 쓰지 않는다(아래 catch 가 500 과 사유로 돌려준다)
     mkdirSync(dirname(absPath), { recursive: true });
     const bytes = Buffer.from(b64, 'base64');
     writeFileSync(absPath, bytes);
@@ -441,6 +443,7 @@ export async function handleImageEdit(
   const relPath = buildRelPath({ ts, prompt: `edit:${prompt}` });
   const absPath = join(opts.vault.root, relPath);
   try {
+    assertVaultWriteAllowed(absPath);   // ⛔ 격리 우주는 운영 볼트에 쓰지 않는다(아래 catch 가 500 과 사유로 돌려준다)
     mkdirSync(dirname(absPath), { recursive: true });
     const bytes = Buffer.from(b64, 'base64');
     writeFileSync(absPath, bytes);

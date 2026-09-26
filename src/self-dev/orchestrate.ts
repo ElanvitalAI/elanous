@@ -533,7 +533,10 @@ export function classifyFailure(
 ): FailureKind | null {
   const ledgerKind = result.failureClassification === undefined
     ? undefined
-    : LEDGER_FAILURE_KIND[result.failureClassification];
+    : result.failureClassification === 'run-deadline-exceeded'
+      // 기한 사망은 transient 가 아니다. 브랜치/PR 이 있으면 수확(false-failure), 없으면 재분해.
+      ? (result.branch || result.prUrl || result.prNumber !== undefined ? 'false-failure' : 'unconverged-decomposable')
+      : LEDGER_FAILURE_KIND[result.failureClassification];
 
   // ⭐ 수렴 실패인데 하니스가 «쪼개는 법»을 이미 냈으면 그것은 다른 처방이다.
   //   ⛔ 조각이 둘 미만인 제안은 채우는 자가 이미 걸러낸다(decompose-proposal.ts).
@@ -563,6 +566,8 @@ export function classifyFailure(
     return result.error?.code === 'DEP_FAILED' ? 'blocked-upstream' : 'unclassified';
   }
   if (result.status !== 'failed') return null;
+  // 기한 사망은 단계·일시 실패 어휘보다 앞선다. 브랜치/PR 이면 수확, 없으면 재분해. transient 가 아니다.
+  if (result.failureClassification === 'run-deadline-exceeded') return ledgerKind!;
   if (result.stage === 'merged' || result.stage === 'pr-opened') return 'false-failure';
   // main 정합 실패는 구현 결함이 아니다. 원장(report-deficit 등 → unconverged → rework)보다 앞선다.
   if (result.stage === 'merge-conflict') return 'main-sync-blocked';

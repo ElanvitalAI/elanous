@@ -7,14 +7,14 @@
  *
  * 자는 원천을 읽어서 만든다. 원천이 바뀌면 코드를 고치지 않아도 따라간다.
  *   능력  catalog/resources.yaml required_for ⊕ catalog/external-commands.yaml
- *   표면  src/index.ts 의 program.command 등록 ⊕ .option 이름·설명 (self entrances --json 과 같은 원천)
+ *   표면  src/index.ts ⊕ src/cli 아래 TypeScript 파일의 .command 등록 ⊕ .option 이름·설명
  *   약속  내부 문서 `FAQ` ⊕ docs/PRFAQ-… §4(⬜)·§5
  *   기억  surface-events FTS — 코드·문서와 다른 칸
  */
 import { requirePosixShellCommand } from '../platform/default-shell.js';
 import { execFileSync, spawnSync } from 'node:child_process';
 import ts from 'typescript';
-import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
@@ -459,33 +459,53 @@ export function deriveRuler(deps: IntakeCheckDeps): IntakeCheckRuler {
     }
   }
 
-  const indexRead = read('src/index.ts');
-  const index = indexRead.body;
-  if (indexRead.failure && indexRead.failure.length > 0) {
+  const cliDir = 'src/cli';
+  const cliSources: string[] = [];
+  const walkCli = (rel: string): void => {
+    for (const entry of readdirSync(resolve(deps.root, rel), { withFileTypes: true })) {
+      const path = `${rel}/${entry.name}`;
+      if (entry.isDirectory()) walkCli(path);
+      else if (entry.isFile() && entry.name.endsWith('.ts') && !entry.name.endsWith('.test.ts')) cliSources.push(path);
+    }
+  };
+  try {
+    walkCli(cliDir);
+  } catch (error) {
     failures.push({
       axis: 'surface',
-      summary: 'src/index.ts 를 읽지 못했다',
-      failure: indexRead.failure,
-      pattern: 'src/index.ts',
+      summary: `${cliDir} 를 읽지 못했다`,
+      failure: error instanceof Error ? error.message : String(error),
+      pattern: cliDir,
     });
   }
-  if (index !== undefined && index.length > 0) {
-    const lines = index.split('\n');
+  for (const rel of ['src/index.ts', ...cliSources.sort()]) {
+    const loaded = read(rel);
+    if (loaded.failure && loaded.failure.length > 0) {
+      failures.push({
+        axis: 'surface',
+        summary: `${rel} 를 읽지 못했다`,
+        failure: loaded.failure,
+        pattern: rel,
+      });
+    }
+    const body = loaded.body;
+    if (body === undefined || body.length === 0) continue;
+    const lines = body.split('\n');
     lines.forEach((text, i) => {
       const match = text.match(/\.command\('([^']+)'\)/);
       if (!match?.[1]) return;
       const name = match[1].split(/\s+/)[0] ?? match[1];
       if (!surfaces.some((s) => s.name === name)) {
-        surfaces.push({ name, source: 'src/index.ts', line: i + 1 });
+        surfaces.push({ name, source: rel, line: i + 1 });
       }
     });
     const optionRe = /\.option\(\s*(['"])(--[a-z][a-z0-9-]*)[^'"]*\1(?:\s*,\s*(['"])([\s\S]*?)\3)?/gi;
-    for (const option of index.matchAll(optionRe)) {
+    for (const option of body.matchAll(optionRe)) {
       const flagName = option[2] ?? '';
       const description = (option[4] ?? '').replace(/\\'/g, "'").replace(/\s+/g, ' ').trim();
-      const at = index.slice(0, option.index ?? 0).split('\n').length;
+      const at = body.slice(0, option.index ?? 0).split('\n').length;
       if (!flagName || surfaces.some((s) => s.name === flagName && s.description === description)) continue;
-      surfaces.push({ name: flagName, source: 'src/index.ts', line: at, ...(description ? { description } : {}) });
+      surfaces.push({ name: flagName, source: rel, line: at, ...(description ? { description } : {}) });
     }
   }
 

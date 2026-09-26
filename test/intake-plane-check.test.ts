@@ -144,6 +144,7 @@ describe('intake check verdicts', () => {
 
   test('a gap writes a real goal draft whose first line is 대상 경로: and never launches harness', () => {
     const root = tempDir();
+    mkdirSync(join(root, 'src/cli'), { recursive: true });
     const draftDir = join(root, 'docs', 'goals', 'intake-check');
     let launches = 0;
     const launchHarness = (_goalPath: string): void => { launches += 1; };

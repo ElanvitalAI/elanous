@@ -91,6 +91,7 @@ export function TerminalPaneLayout({
   terminalIds,
   activeId = null,
   visible = true,
+  clearRequests,
 }: {
   layout: PaneLayoutResult;
   sessionId: string;
@@ -98,6 +99,7 @@ export function TerminalPaneLayout({
   terminalIds?: readonly string[];
   activeId?: string | null;
   visible?: boolean;
+  clearRequests?: Readonly<Record<string, number>>;
 }) {
   const slots = layout.layouts.flatMap((entry) => entry.slots);
   const slotById = new Map(slots.map((slot) => [slot.terminalId, slot]));
@@ -134,6 +136,7 @@ export function TerminalPaneLayout({
               key={terminalId}
               sessionId={sessionId}
               terminalId={terminalId}
+              clearRequest={clearRequests?.[terminalId] ?? 0}
               onForeignInputActivity={onForeignInputActivity}
             />
           </div>
@@ -163,6 +166,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   // ChromeOS tablet mode) toggle as the user docks/undocks.
   const { isCoarsePointer } = usePointerCapability();
   const [terminalId, setTerminalId] = useState<string | null>(null);
+  const [clearRequests, setClearRequests] = useState<Readonly<Record<string, number>>>({});
   const [tabIds, setTabIds] = useState<readonly string[]>([]);
   const [ptyTabSelection, setPtyTabSelection] = useState<{ id: string; nonce: number } | null>(null);
   const pendingPtyUrlSelectionRef = useRef<DaemonTerminalSummary | null>(null);
@@ -717,7 +721,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         />
         <TerminalControls
           terminalId={terminalId}
-          onClear={() => { /* clear-screen wiring lands with sticky REPL (WT-A-3) */ }}
+          onClear={() => setClearRequests((current) => ({ ...current, [terminalId]: (current[terminalId] ?? 0) + 1 }))}
           onRecordingChange={setRecording}
           onAttached={handleAttached}
           voice={controlsVoiceProp}
@@ -738,6 +742,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
           sessionId={sessionId}
           terminalIds={tabIds}
           activeId={terminalId}
+          clearRequests={clearRequests}
           visible={terminalId !== null && panelView === 'terminal'}
           onForeignInputActivity={() => setForeignActivityTick((n) => n + 1)}
         />

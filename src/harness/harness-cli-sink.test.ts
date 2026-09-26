@@ -252,7 +252,6 @@ describe('harness CLI sink hook', () => {
       '--no-auto-merge',
       '--observe-only',
       '--no-supervise',
-      '--graph',
       '--dry-run',
       '--target',
       '--correlation',
@@ -261,6 +260,9 @@ describe('harness CLI sink hook', () => {
       '--child-llm-provider',
       '--child-llm-model',
       '--child-llm-effort',
+      '--substrate',
+      '--pod-pool',
+      '--source',
     ]);
   });
 
@@ -336,7 +338,6 @@ describe('harness CLI sink hook', () => {
       '--no-auto-merge',
       '--observe-only',
       '--no-supervise',
-      '--graph',
       '--dry-run',
       '--target',
       '--correlation',
@@ -345,6 +346,9 @@ describe('harness CLI sink hook', () => {
       '--child-llm-provider',
       '--child-llm-model',
       '--child-llm-effort',
+      '--substrate',
+      '--pod-pool',
+      '--source',
     ]);
   });
 
@@ -422,7 +426,6 @@ describe('harness CLI sink hook', () => {
       '--no-auto-merge',
       '--observe-only',
       '--no-supervise',
-      '--graph',
       '--dry-run',
       '--role-llm',
     ]);
@@ -499,7 +502,7 @@ describe('harness CLI sink hook', () => {
     expect(measured.helpVisible).toEqual(Array.from(new Set(measured.helpVisible)));
     expect(measured.argumentRequiringCommands).toContain('deliverable-verify');
     expect(measured.excludedNoArgumentCommands.length).toBeGreaterThan(0);
-  }, 15_000);
+  }, 60_000);   // CLI 를 서브명령마다 띄운다 — 부하 높은 기계에서 15초는 19초로 넘었다(2026-09-26 load 285)
 
   test('help-derived entrance measurement automatically reaches a newly help-visible argument-requiring subcommand and reports no-argument exclusions', () => {
     const help = [

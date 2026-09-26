@@ -1,7 +1,7 @@
 // T4.B — RemotesStore + cli action tests.
 
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, statSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, statSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
@@ -171,6 +171,39 @@ describe('T4.B · connectRemote action', () => {
     expect(file.remotes['mbp-tailnet']?.acp_url).toBe('ws://mbp.tailnet:31415/v1/acp');
     expect(logs.some((l) => l.includes('auto_token loaded'))).toBe(true);
     cleanup();
+  });
+
+  // 🔐 2026-09-26: 새 서버는 auto_token 을 늘 null 로 준다 — 같은 기계(루프백)면 CLI 가 토큰 파일을 직접 읽는다.
+  test('loopback host + server auto_token null → reads the same-host token file', async () => {
+    const { store, cleanup } = mkStore();
+    const { out, logs } = captureOut();
+    const dir = mkdtempSync(joinPath(tmpdir(), 'elanous-acp-token-'));
+    const tokenPath = joinPath(dir, 'acp-token');
+    writeFileSync(tokenPath, 'localBearer\n', { mode: 0o600 });
+    const code = await connectRemote({
+      host: '127.0.0.1', ping: true, setDefault: true, localTokenPath: tokenPath,
+      fetchImpl: makeFetchOk({ acp_url: 'ws://127.0.0.1:31415/v1/acp', token_required: true, server_label: 'local', auto_token: null }),
+      store, stdout: out,
+    });
+    expect(code).toBe(0);
+    expect(logs.some((l) => l.includes('same-host bootstrap'))).toBe(true);
+    rmSync(dir, { recursive: true }); cleanup();
+  });
+
+  test('non-loopback host + server auto_token null → does not read the local token file (token required)', async () => {
+    const { store, cleanup } = mkStore();
+    const { out, errors } = captureOut();
+    const dir = mkdtempSync(joinPath(tmpdir(), 'elanous-acp-token-'));
+    const tokenPath = joinPath(dir, 'acp-token');
+    writeFileSync(tokenPath, 'localBearer\n', { mode: 0o600 });
+    const code = await connectRemote({
+      host: 'mbp.tailnet', ping: true, setDefault: true, localTokenPath: tokenPath,
+      fetchImpl: makeFetchOk({ acp_url: 'ws://mbp.tailnet:31415/v1/acp', token_required: true, server_label: 'x', auto_token: null }),
+      store, stdout: out,
+    });
+    expect(code).toBe(1);
+    expect(errors.some((l) => l.includes('token required'))).toBe(true);
+    rmSync(dir, { recursive: true }); cleanup();
   });
 
   test('--token-file overrides auto_token', async () => {

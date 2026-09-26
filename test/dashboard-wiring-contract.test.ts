@@ -1,17 +1,18 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, extname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
+import { dashboardSourceLocations, readDashboardSources, type DashboardSource } from './helpers/dashboard-source.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DASHBOARD_DIR = resolve(HERE, '..', 'src', 'dashboard');
-const DASHBOARD_INDEX = readFileSync(resolve(DASHBOARD_DIR, 'index.ts'), 'utf8');
 const WIRING_EXPORT = /^(?:boot|register|wire|arm)\w*Dashboard\w*$/;
 const DECLARATION_EXPORT = /export\s+(?:default\s+)?(?:async\s+)?(?:function|class)\s+(\w+)/g;
 const VARIABLE_EXPORT = /export\s+(?:const|let|var)\s+([^;]+);/g;
 const VARIABLE_DECLARATION = /(?:^|,)\s*(\w+)\s*(?::[^=,]+)?=/g;
-const NAMED_EXPORT = /export\s*{([^}]+)}\s*(?:from\s*['"]([^'"]+)['"])?/g;
+const NAMED_EXPORT = /export\s*{([^}]+)}\s*(?:from\s*['"][^'"]+['"])?/g;
 const EXPORT_STAR = /export\s*\*\s*from\s*['"]([^'"]+)['"]/g;
 
 function modulePath(path: string, specifier: string): string {
@@ -41,9 +42,6 @@ function exportedWiringNames(path: string, visited = new Set<string>()): string[
   }
   for (const match of source.matchAll(NAMED_EXPORT)) {
     for (const name of namesFromSpecifiers(match[1])) names.add(name);
-    if (match[2]) {
-      for (const name of namesFromSpecifiers(match[1])) names.add(name);
-    }
   }
   for (const match of source.matchAll(EXPORT_STAR)) {
     for (const name of exportedWiringNames(modulePath(path, match[1]), visited)) names.add(name);
@@ -51,13 +49,27 @@ function exportedWiringNames(path: string, visited = new Set<string>()): string[
   return [...names];
 }
 
-function missingWiringNames(names: readonly string[], indexSource: string): string[] {
-  return names.filter((name) => !new RegExp(`\\b${name}\\s*\\(`).test(indexSource));
+// This counts call sites across the directory, not boot reachability (reserved for import-graph checks).
+function missingWiringNames(names: readonly string[], sources: readonly DashboardSource[]): string[] {
+  const calls = new Set<string>();
+  for (const { path, text } of sources) {
+    const sf = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+        // A function recursively calling itself does not prove any dashboard wiring.
+        let owner: ts.Node | undefined = node.parent;
+        while (owner && !ts.isFunctionDeclaration(owner)) owner = owner.parent;
+        if (!owner || owner.name?.text !== node.expression.text) calls.add(node.expression.text);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+  }
+  return names.filter((name) => !calls.has(name));
 }
 
-const dashboardWiringNames = readdirSync(DASHBOARD_DIR)
-  .filter((entry) => extname(entry) === '.ts' && entry !== 'index.ts')
-  .flatMap((entry) => exportedWiringNames(resolve(DASHBOARD_DIR, entry)))
+const dashboardWiringNames = readDashboardSources(DASHBOARD_DIR)
+  .flatMap(({ path }) => exportedWiringNames(resolve(HERE, '..', path)))
   .sort();
 
 describe('dashboard wiring contract', () => {
@@ -65,10 +77,11 @@ describe('dashboard wiring contract', () => {
     expect(dashboardWiringNames).not.toHaveLength(0);
   });
 
-  test('calls every derived dashboard wiring export from dashboard/index.ts', () => {
-    const missingNames = missingWiringNames(dashboardWiringNames, DASHBOARD_INDEX);
+  test('calls every derived dashboard wiring export from dashboard sources', () => {
+    const sources = readDashboardSources();
+    const missingNames = missingWiringNames(dashboardWiringNames, sources);
 
-    expect(missingNames, `dashboard/index.ts does not call: ${missingNames.join(', ')}`).toEqual([]);
+    expect(missingNames, `dashboard sources do not call: ${missingNames.join(', ')}; searched ${dashboardSourceLocations(sources)}`).toEqual([]);
   });
 
   test('derives named local exports and named re-exports, then identifies each missing call', () => {
@@ -88,8 +101,24 @@ describe('dashboard wiring contract', () => {
         ...exportedWiringNames(variablesPath),
       ].sort();
       expect(names).toEqual(['bootDashboardLocal', 'bootDashboardSecond', 'wireDashboardRemote']);
-      expect(missingWiringNames(names, 'bootDashboardLocal()\nbootDashboardSecond()')).toEqual(['wireDashboardRemote']);
-      expect(missingWiringNames(names, 'bootDashboardLocal()\nwireDashboardRemote()')).toEqual(['bootDashboardSecond']);
+      expect(missingWiringNames(names, [{ path: 'local.ts', text: 'bootDashboardLocal()\nbootDashboardSecond()' }])).toEqual(['wireDashboardRemote']);
+      expect(missingWiringNames(names, [{ path: 'remote.ts', text: 'bootDashboardLocal()\nwireDashboardRemote()' }])).toEqual(['bootDashboardSecond']);
+      expect(missingWiringNames(names, [{ path: 'remote.ts', text: 'export function wireDashboardRemote() {}' }])).toEqual(['bootDashboardLocal', 'bootDashboardSecond', 'wireDashboardRemote']);
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test('does not credit a recursive self-call in an unused module as a wiring call', () => {
+    const fixtureDir = mkdtempSync(resolve(tmpdir(), 'dashboard-wiring-self-call-'));
+    try {
+      const entry = resolve(fixtureDir, 'index.ts');
+      const unused = resolve(fixtureDir, 'unused.ts');
+      writeFileSync(entry, 'export {};\n');
+      writeFileSync(unused, 'export function bootDashboardUnused() { bootDashboardUnused(); }\n');
+      expect(missingWiringNames(exportedWiringNames(unused), readDashboardSources(fixtureDir))).toEqual(['bootDashboardUnused']);
+      writeFileSync(entry, "import { bootDashboardUnused } from './unused.js';\nbootDashboardUnused();\n");
+      expect(missingWiringNames(exportedWiringNames(unused), readDashboardSources(fixtureDir))).toEqual([]);
     } finally {
       rmSync(fixtureDir, { recursive: true, force: true });
     }

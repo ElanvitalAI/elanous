@@ -51,6 +51,14 @@ interface RotationDecision {
   readonly disabledProvenance?: CodexAccountRotationConfigState;
   /** 판정 시점에 받은 원본 후보 수. 후보를 만들기 전 조기 관측이면 없다. */
   readonly candidateCount?: number;
+  /** 실제 판정에 적용한 계정별 임계와 그 출처. */
+  readonly accountThresholds?: readonly {
+    readonly name: string;
+    readonly thresholdPercent: number;
+    readonly source: 'account-override' | 'account-default' | 'global';
+    readonly status: 'reached' | 'threshold-reached' | 'below-threshold' | 'unknown';
+    readonly usedPercent: number | undefined;
+  }[];
   /** 넘겼을 때만 있다. */
   readonly to?: RotationCandidate;
 }
@@ -75,7 +83,7 @@ interface RotationInput {
   readonly resetCreditAvailability: ResetCreditAvailability;
   /** 회전을 시작·후보를 제외하는 전역 임계. 유효하지 않으면 기본 95를 쓴다. */
   readonly thresholdPercent?: unknown;
-  /** 계정별 임계 오버라이드. 유효하지 않은 값은 정규화된 전역 임계로 되돌린다. */
+  /** 계정별 임계 오버라이드. 유효하지 않은 값은 계정 기본값 또는 전역 임계로 되돌린다. */
   readonly thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
   /** 지금 계정을 «뺀» 후보들. */
   readonly candidates: readonly RotationCandidate[];
@@ -91,6 +99,10 @@ interface RotationInput {
  *   「왜 이 계정인가」를 사후에 못 재구성한다.
  */
 const DEFAULT_ROTATION_THRESHOLD_PERCENT = 95;
+
+// 대표 "첫 번째 계정의 경우 멀티 계정이 있을 때 50% 이상은 소모하지 않도록 해 주세요. 외부에서 코딩 용도가 아니라 다른 용도로도 많이 사용하고 있습니다."
+// 공유 default 계정에 여유를 남기기 위한 기본 임계 60%; 명시적 계정별 설정이 우선한다.
+export const DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT = { default: 60 } as const;
 
 /** ⛔⭐⭐ 표면이 «판정기가 실제로 쓴» 임계를 보여야 한다(리뷰 must-fix) — raw config 를 그대로
  *  찍으면 `0`·`101`·`NaN` 같은 값에서 ***판정은 95 를 쓰는데 화면은 다른 수를 말한다.***
@@ -113,18 +125,59 @@ export function codexAccountRotationThresholdOverridePercent(value: unknown, fal
     : fallback;
 }
 
+/** 명시적 계정별 임계 → 계정 기본 임계 → 정규화된 전역 임계. 판정과 핀에서 같은 자를 쓴다. */
+export function codexAccountThresholdPercent(
+  accountName: string,
+  { thresholdPercent, thresholdPercentByAccount }: {
+    readonly thresholdPercent?: unknown;
+    readonly thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
+  },
+): number {
+  const globalThreshold = normalizedRotationThresholdPercent(thresholdPercent);
+  // 대표 «default 는 60% 까지만» = 상한이다 — 전역을 더 엄하게(예 42) 주면 그것을 따른다(min). 계정별 명시가 이긴다.
+  const accountDefault = Object.prototype.hasOwnProperty.call(DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT, accountName)
+    ? Math.min(DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT[accountName as keyof typeof DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT], globalThreshold)
+    : globalThreshold;
+  return codexAccountRotationThresholdOverridePercent(thresholdPercentByAccount?.[accountName], accountDefault);
+}
+
+function accountThreshold(
+  name: string,
+  input: Pick<RotationInput, 'thresholdPercent' | 'thresholdPercentByAccount'>,
+): { thresholdPercent: number; source: 'account-override' | 'account-default' | 'global' } {
+  const thresholdPercent = codexAccountThresholdPercent(name, input);
+  const override = input.thresholdPercentByAccount?.[name];
+  const hasDefault = Object.prototype.hasOwnProperty.call(DEFAULT_ROTATION_THRESHOLD_PERCENT_BY_ACCOUNT, name);
+  return {
+    thresholdPercent,
+    source: thresholdPercent === override ? 'account-override' : hasDefault ? 'account-default' : 'global',
+  };
+}
+
 export function decideCodexRotation(input: RotationInput): RotationDecision {
   const candidateCount = input.candidates.length;
-  if (input.explicit) return { reason: 'explicit', candidateCount };
-  if (!input.enabled) return { reason: 'disabled', candidateCount, ...(input.disabledProvenance ? { disabledProvenance: input.disabledProvenance } : {}) };
-  const thresholdPercent = codexAccountRotationThresholdPercent(input.thresholdPercent);
-  const thresholdFor = (accountName: string): number =>
-    codexAccountRotationThresholdOverridePercent(input.thresholdPercentByAccount?.[accountName], thresholdPercent);
-  const reachedThreshold = (usedPercent: number | undefined, accountName: string): boolean =>
-    typeof usedPercent === 'number' && Number.isFinite(usedPercent) && usedPercent >= thresholdFor(accountName);
+  const otherCandidates = input.candidates.filter((candidate) => candidate.name !== input.current.name);
+  const accounts = [
+    { name: input.current.name, reached: input.currentReached, usedPercent: input.currentUsedPercent },
+    ...otherCandidates,
+  ];
+  const accountThresholds = accounts.map((account) => {
+    const threshold = accountThreshold(account.name, input);
+    const usedPercent = account.usedPercent;
+    const status = account.reached === true ? 'reached'
+      : typeof usedPercent !== 'number' || !Number.isFinite(usedPercent) ? 'unknown'
+      : usedPercent >= threshold.thresholdPercent ? 'threshold-reached' : 'below-threshold';
+    return { name: account.name, ...threshold, usedPercent, status } as const;
+  });
+  if (input.explicit) return { reason: 'explicit', candidateCount, accountThresholds };
+  if (!input.enabled) return { reason: 'disabled', candidateCount, accountThresholds, ...(input.disabledProvenance ? { disabledProvenance: input.disabledProvenance } : {}) };
   const currentUsageUnknown = input.currentReached === undefined && input.currentUsedPercent == null;
-  if (input.currentReached !== true && !currentUsageUnknown && !reachedThreshold(input.currentUsedPercent, input.current.name)) return { reason: 'not-reached', candidateCount };
+  if (input.currentReached !== true && !currentUsageUnknown && accountThresholds[0]?.status !== 'threshold-reached') {
+    return { reason: 'not-reached', candidateCount, accountThresholds };
+  }
   const resetCreditUnknown = input.resetCreditAvailability === 'unknown';
+  const candidateStatuses = otherCandidates
+    .map((candidate, index) => ({ candidate, status: accountThresholds[index + 1]?.status }));
 
     // ⛔⭐ 순서는 ***설정이 이기고, 없으면 이름 코드포인트***다.
     //   🩸 2026-09-24(대표 지시): 「third 부터 소진하고 그다음 team」 — 이름순(default<new<third)으로는
@@ -136,9 +189,10 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
       const i = order.indexOf(name);
       return i >= 0 ? i : order.length;
     };
-  const usable = input.candidates
-    .filter((c) => c.name !== input.current.name && c.home.length > 0 && c.reached !== true && !reachedThreshold(c.usedPercent, c.name))
-    .slice()
+  const usable = candidateStatuses
+    .filter(({ candidate, status }) => candidate.home.length > 0
+      && status !== 'reached' && status !== 'threshold-reached')
+    .map(({ candidate }) => candidate)
     .sort((a, b) => {
       const ra = rank(a.name); const rb = rank(b.name);
       if (ra !== rb) return ra - rb;
@@ -146,11 +200,11 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
     });
   const to = usable[0];
   if (!to) {
-    if (input.resetCreditAvailability === 'available') return { reason: 'reset-credit-available', candidateCount };
-    return { reason: 'no-candidate', candidateCount };
+    if (input.resetCreditAvailability === 'available') return { reason: 'reset-credit-available', candidateCount, accountThresholds };
+    return { reason: 'no-candidate', candidateCount, accountThresholds };
   }
-  if (resetCreditUnknown) return { reason: 'reset-credit-unknown', candidateCount, to };
-  return { reason: 'rotated', candidateCount, to };
+  if (resetCreditUnknown) return { reason: 'reset-credit-unknown', candidateCount, accountThresholds, to };
+  return { reason: 'rotated', candidateCount, accountThresholds, to };
 }
 
 /**
@@ -188,6 +242,9 @@ export function observeRotation(decision: RotationDecision, from: string): void 
       ? { disabledProvenance: decision.disabledProvenance }
       : {}),
   }, { level: decision.reason === 'rotated' || decision.reason === 'reset-credit-unknown' ? 'warn' : 'debug' });
+  for (const account of decision.accountThresholds ?? []) {
+    debug.log('oauth.codex-account', 'rotation-account-threshold', account);
+  }
 }
 
 /** 회전 결과를 계정 해석으로 접는다. ⛔ 안 넘겼으면 «그대로» 돌려준다. */

@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 
+import { debug } from '../debug/log.js';
 import { buildUserConfig, type UserConfig as MainUserConfig } from '../user-config.js';
 import { decideProviderForConfig } from '../llm.js';
 import { resolveGrokCredential } from '../grok/credential.js';
@@ -27,6 +28,63 @@ export interface SetupCheckResult {
   required: SetupItem[];
   recommended: SetupItem[];
   ok: boolean;
+}
+
+export type SetupBootMode = 'normal' | 'setup' | 'refuse';
+
+export interface SetupBootDecision {
+  mode: SetupBootMode;
+  missing: string[];
+}
+
+/** LLM 만 빠졌으면 PWA `/setup` 으로 채울 수 있다. PWA 빌드가 없으면 셋업 화면 자체가 없다. */
+export function setupBootMode(result: SetupCheckResult): SetupBootDecision {
+  const missing = result.required.filter((item) => !item.passed).map((item) => item.label);
+  const pwaMissing = result.required.some((item) => item.id === 'pwa-build' && !item.passed);
+  const onlyLlmMissing = missing.length > 0
+    && result.required.every((item) => item.passed || item.id === 'llm');
+  const mode: SetupBootMode = missing.length === 0
+    ? 'normal'
+    : (pwaMissing ? 'refuse' : (onlyLlmMissing ? 'setup' : 'refuse'));
+  debug.log('nexus.boot', 'setup-mode', { mode, missing });
+  return { mode, missing };
+}
+
+export interface SetupModeBootPlan {
+  skipTabKinds: string[];
+  skipCrons: string[];
+}
+
+/** 셋업 모드면 채널 봇·데몬 탭과 탐색·기기 크론을 띄우지 않는다. pwa-host 는 셋업 화면이라 남긴다. */
+export function setupModeBootPlan(setupMode: boolean): SetupModeBootPlan {
+  if (!setupMode) return { skipTabKinds: [], skipCrons: [] };
+  return {
+    skipTabKinds: ['daemon', 'channel-bot'],
+    skipCrons: ['discovery', 'devices'],
+  };
+}
+
+export interface NexusSetupModeRead {
+  setupMode: boolean;
+  setupMissing: string[];
+}
+
+/**
+ * 기동 때 한 번. `ELANOUS_NEXUS_SETUP_MODE === '1'` 이면
+ * `setupBootMode(checkSetupStatus()).missing` 을 읽는다.
+ * `check` 는 테스트가 LLM 만 빠진 설정을 주입할 때 쓴다. 기동 경로는 넘기지 않는다.
+ */
+export function readNexusSetupMode(
+  env: NodeJS.ProcessEnv,
+  check: () => SetupCheckResult = () => checkSetupStatus(),
+): NexusSetupModeRead {
+  if (env.ELANOUS_NEXUS_SETUP_MODE !== '1') {
+    return { setupMode: false, setupMissing: [] };
+  }
+  return {
+    setupMode: true,
+    setupMissing: setupBootMode(check()).missing,
+  };
 }
 
 export interface SetupCheckOpts {

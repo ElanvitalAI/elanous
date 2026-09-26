@@ -536,25 +536,23 @@ export function installedCronRoot(
  * 크론 `cd` 대상. 🩸 2026-09-24: 전역 `elanous`·데몬이 설치본으로 옮긴 뒤 `import.meta.dir` 는 판 폴더
  * (`~/.local/share/elanous/versions/<판>/node_modules/elanous`)로 풀린다 — 그 경로를 크론에 박으면
  * 야간 정리(#20214)가 그 판을 지우는 날 크론이 조용히 죽는다.
- * ⇒ 설치본이면 ① 리더 트리(`~/.elanous/leader.json` — 종전 크론이 `cd` 하던 체크아웃) ② 없으면 고정 경로 `current`.
+ * ⇒ 설치본이면 설정 `ops.cronRepoRoot` 우선, 없으면 고정 경로 `current`.
  * 설치본이 아니면(체크아웃) 그대로.
  */
 export function cronRepoRoot(
   codeRoot: string,
-  deps: { home?: string; exists?: (p: string) => boolean; readLeader?: () => string | null } = {},
+  deps: { exists?: (p: string) => boolean; configuredRoot?: () => string | undefined } = {},
 ): string {
   const exists = deps.exists ?? existsSync;
   const m = /^(.*)\/versions\/[^/]+\/node_modules\/elanous\/?$/.exec(codeRoot.replace(/\\/g, '/'));
   if (!m || hasGitAbove(codeRoot, exists)) return codeRoot;
-  const home = deps.home ?? homedir();
-  const leader = (deps.readLeader ?? (() => {
+  const configured = (deps.configuredRoot ?? (() => {
     try {
-      const raw = JSON.parse(readFileSync(join(home, '.elanous', 'leader.json'), 'utf-8')) as { tree?: unknown };
-      return typeof raw.tree === 'string' ? raw.tree : null;
-    } catch { return null; }
-  }))();
-  if (leader && exists(leader)) return leader;
-  return `${m[1]}/current/node_modules/elanous`;
+      const { getUserConfig } = require('../user-config.js') as typeof import('../user-config.js');
+      return getUserConfig().ops?.cronRepoRoot;
+    } catch { return undefined; }
+  }))()?.trim();
+  return configured || `${m[1]}/current/node_modules/elanous`;
 }
 
 function hasGitAbove(dir: string, exists: (p: string) => boolean): boolean {
@@ -585,7 +583,7 @@ export function buildCronLine(
   cron: string, command: string,
   opts: { repo?: string; bun?: string; logName?: string } = {},
 ): string {
-  const repo = opts.repo ?? repoRoot();
+  const repo = opts.repo ?? repoRoot(); // default cron cwd → cronRepoRoot → ops.cronRepoRoot or installed current
   const bun = opts.bun ?? process.execPath; // 데몬은 bun 하에서 구동
   const cmd = command.trim();
   // cron의 기본 PATH에는 ~/.bun/bin이 없을 수 있다. 직접 실행과 cd/세미콜론 뒤의

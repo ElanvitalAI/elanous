@@ -2,7 +2,6 @@ import { visibleWidth } from '../tui.js';
 
 export interface WrapOptions {
   urlAware?: boolean;
-  preserveOsc8?: boolean;
 }
 
 interface Unit {
@@ -18,7 +17,7 @@ function isOsc8Sequence(raw: string): boolean {
   return raw.startsWith('\x1b]8;;');
 }
 
-function readEscapeSequence(input: string, start: number, preserveOsc8: boolean): { raw: string; next: number } {
+function readEscapeSequence(input: string, start: number): { raw: string; next: number } {
   if (input[start] !== '\x1b') return { raw: input[start] ?? '', next: start + 1 };
   const next = input[start + 1];
   if (next === '[') {
@@ -30,7 +29,7 @@ function readEscapeSequence(input: string, start: number, preserveOsc8: boolean)
     }
     return { raw: input.slice(start, i), next: i };
   }
-  if (next === ']' && preserveOsc8) {
+  if (next === ']') {
     const bel = input.indexOf('\x07', start + 2);
     const st = input.indexOf(OSC_TERMINATOR, start + 2);
     if (bel >= 0 && (st < 0 || bel < st)) return { raw: input.slice(start, bel + 1), next: bel + 1 };
@@ -39,14 +38,14 @@ function readEscapeSequence(input: string, start: number, preserveOsc8: boolean)
   return { raw: input.slice(start, Math.min(input.length, start + 2)), next: Math.min(input.length, start + 2) };
 }
 
-function toUnits(input: string, preserveOsc8: boolean): Unit[] {
+function toUnits(input: string): Unit[] {
   const units: Unit[] = [];
   let pendingEsc = '';
   for (let i = 0; i < input.length; i++) {
     const ch = input[i]!;
     if (ch === '\x1b') {
-      const esc = readEscapeSequence(input, i, preserveOsc8);
-      if (preserveOsc8 && isOsc8Sequence(esc.raw)) units.push({ raw: esc.raw, plain: '', width: 0 });
+      const esc = readEscapeSequence(input, i);
+      if (isOsc8Sequence(esc.raw)) units.push({ raw: esc.raw, plain: '', width: 0 });
       else pendingEsc += esc.raw;
       i = esc.next - 1;
       continue;
@@ -145,11 +144,10 @@ function splitTokenByWidth(token: Unit[], maxWidth: number): Unit[][] {
 
 export function urlAwareWrap(text: string, cols: number, opts: WrapOptions = {}): string[] {
   const width = Math.max(1, cols);
-  const preserveOsc8 = opts.preserveOsc8 !== false;
   const urlAware = opts.urlAware === true;
   const lines: string[] = [];
   for (const paragraph of text.split('\n')) {
-    const tokens = splitTokens(toUnits(paragraph, preserveOsc8));
+    const tokens = splitTokens(toUnits(paragraph));
     if (tokens.length === 0) {
       lines.push('');
       continue;

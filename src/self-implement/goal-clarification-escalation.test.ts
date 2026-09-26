@@ -883,6 +883,31 @@ describe('escalateGoalDocumentClarifications', () => {
     }
   });
 
+  test('falls back and records a pending question when neither TUI deps nor a resolver are available', async () => {
+    const file = goalFile(unresolvedGoal);
+    try {
+      const surfaced: string[] = [];
+      const pending: ReturnType<typeof createPendingQuestion>[] = [];
+      const result = await escalateGoalDocumentClarifications({
+        goalFile: file.path,
+        dispatch: async () => ({
+          output: 'AskUserQuestion failed: no TUI dependencies or resolver available',
+          absenceReason: 'no-tui-deps-no-resolver',
+        }),
+        fallback: (message) => surfaced.push(message),
+        pendingQuestionPersistence: { create: createPendingQuestion, write: (question) => { pending.push(question); } },
+      });
+      expect(result).toEqual({ unanswered: 1, escalated: 1, delivery: 'modal', outcome: 'fallback', answeredBy: 'none', fallbackSurface: 'terminal' });
+      expect(surfaced).toEqual([expect.stringContaining('Which human surface should receive this?')]);
+      expect(pending).toEqual([expect.objectContaining({
+        id: `goal-clarification:${file.path}:delivery_scope`,
+        questions: [expect.objectContaining({ id: 'delivery_scope' })],
+      })]);
+    } finally {
+      file.clean();
+    }
+  });
+
   test('does not swallow a real resolver failure as an absence fallback', async () => {
     const file = goalFile(unresolvedGoal);
     try {

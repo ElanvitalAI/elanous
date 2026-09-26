@@ -26,7 +26,7 @@ import { normalizeTabs } from '../panes/syntax-color.js';
 import { computeInlineWordDiff, hasIntraLineChange, type WordDiffPart } from '../panes/word-diff.js';
 import type { EditResult, StructuredPatchHunk } from './types.js';
 import {
-  detectLanguage, highlightCode, type HighlightedLines, type SyntaxToken,
+  detectLanguage, highlightCode, type SyntaxToken,
 } from './syntax-highlight.js';
 
 export type DiffColorTier = 'auto' | 'truecolor' | '256' | 'ansi16';
@@ -55,16 +55,8 @@ export interface DiffRenderOptions {
   syntax?: boolean;
   /** R2 — palette selection. */
   colorTier?: DiffColorTier;
-  /** R2 — when true (default), background lightness may switch the
-   *  palette to a light-friendly variant. */
-  adaptiveBg?: boolean;
   /** R2 — explicit terminal background override. */
   isLight?: boolean;
-  /** R2 — syntax highlight only the concatenated hunk text instead of
-   *  the full file. */
-  syntaxPerHunk?: boolean;
-  /** R3 — reuse per-hunk rendered rows when the same variant repeats. */
-  cache?: boolean;
   /** Source-delta presentation header style. */
   headerStyle?: DiffHeaderStyle;
   /** Phase 5 — when true AND `noColor=false`, adjacent `-`/`+` pairs
@@ -83,7 +75,6 @@ export interface DiffRenderVariant {
   syntax: boolean;
   colorTier: DiffColorTier;
   isLight: boolean;
-  syntaxPerHunk: boolean;
   inlineWordDiff: boolean;
 }
 
@@ -171,7 +162,6 @@ type HunkRenderCache = Map<string, string[]>;
 
 interface ResolvedDiffRenderOptions {
   variant: DiffRenderVariant;
-  cache: boolean;
   headerStyle: DiffHeaderStyle;
 }
 
@@ -212,14 +202,9 @@ export async function renderEditBlockAsync(result: EditResult, opts: DiffRenderO
   let newHL: HighlightLineMap | null = null;
   let oldHL: HighlightLineMap | null = null;
   try {
-    if (opts.syntaxPerHunk === false) {
-      newHL = linesToMap(await highlightCode(result.newContent, lang));
-      oldHL = linesToMap(await highlightCode(result.originalContent, lang));
-    } else {
-      const maps = await highlightHunks(result.structuredPatch, lang);
-      newHL = maps.newLines;
-      oldHL = maps.oldLines;
-    }
+    const maps = await highlightHunks(result.structuredPatch, lang);
+    newHL = maps.newLines;
+    oldHL = maps.oldLines;
   } catch {
     newHL = null;
     oldHL = null;
@@ -273,7 +258,6 @@ function renderEditBlockCore(
       maxLineWidth: variant.maxLineWidth,
       palette,
       newHL, oldHL,
-      cache: opts.cache,
       cacheKey: buildDiffRenderCacheKey(variant),
       syntax: variant.syntax,
       inlineWordDiff: variant.inlineWordDiff,
@@ -291,14 +275,13 @@ interface HunkCtx {
   palette: DiffPalette;
   newHL: HighlightLineMap | null;
   oldHL: HighlightLineMap | null;
-  cache: boolean;
   cacheKey: string;
   syntax: boolean;
   inlineWordDiff: boolean;
 }
 
 function renderHunkCached(hunk: StructuredPatchHunk, ctx: HunkCtx, out: string[]): void {
-  if (!ctx.cache || (ctx.syntax && !hasHighlightCoverage(hunk, ctx.newHL, ctx.oldHL))) {
+  if (ctx.syntax && !hasHighlightCoverage(hunk, ctx.newHL, ctx.oldHL)) {
     renderHunk(hunk, ctx, out);
     return;
   }
@@ -455,12 +438,6 @@ function paintTailPad(raw: string, padded: string, bg: typeof chalk | null): str
   return bg ? bg(pad) : pad;
 }
 
-function linesToMap(lines: HighlightedLines): HighlightLineMap {
-  const out = new Map<number, SyntaxToken[]>();
-  for (let i = 0; i < lines.length; i++) out.set(i, lines[i]!);
-  return out;
-}
-
 async function highlightHunks(
   hunks: readonly StructuredPatchHunk[],
   lang: string,
@@ -500,8 +477,7 @@ export function resolveDiffRenderVariant(opts: DiffRenderOptions): DiffRenderVar
     maxLineWidth: opts.maxLineWidth ?? CODE_PREVIEW_MAX_LINE_WIDTH,
     syntax: opts.syntax === true,
     colorTier: opts.colorTier ?? 'auto',
-    isLight: opts.isLight ?? (opts.adaptiveBg === false ? false : detectTerminalBgLightness() ?? false),
-    syntaxPerHunk: opts.syntaxPerHunk !== false,
+    isLight: opts.isLight ?? (detectTerminalBgLightness() ?? false),
     inlineWordDiff: opts.inlineWordDiff === true,
   };
 }
@@ -509,7 +485,6 @@ export function resolveDiffRenderVariant(opts: DiffRenderOptions): DiffRenderVar
 function resolveDiffRenderOptions(opts: DiffRenderOptions): ResolvedDiffRenderOptions {
   return {
     variant: resolveDiffRenderVariant(opts),
-    cache: opts.cache !== false,
     headerStyle: opts.headerStyle ?? 'legacy',
   };
 }
@@ -522,7 +497,6 @@ export function buildDiffRenderCacheKey(opts: DiffRenderVariant): string {
     `syn:${opts.syntax ? 1 : 0}`,
     `tier:${opts.colorTier}`,
     `light:${opts.isLight ? 1 : 0}`,
-    `perHunk:${opts.syntaxPerHunk ? 1 : 0}`,
     `wd:${opts.inlineWordDiff ? 1 : 0}`,
   ].join('|');
 }

@@ -10,11 +10,9 @@
 //     auto_token:     string | null,    // 자동 mint 시 raw bearer
 //   }
 //
-// `auto_token` 정책:
-//   - server hostname = 127.0.0.1/localhost (loopback only) → 기존
-//     `~/.elanous/acp-token` 파일 내용을 그대로 노출. Loopback 호출자는
-//     이미 같은 user uid 로 file 을 읽을 수 있으므로 추가 leak 없음.
-//   - 그 외 (LAN/Tailscale) → null. 사용자가 token 을 paste 해야 함.
+// `auto_token` 정책: 언제나 null (칸은 호환용으로 남긴다).
+//   종전엔 «서버 바인드가 루프백이면» 토큰 파일 원문을 실었는데, tailnet 공유(serve → localhost 프록시)에서는
+//   tailnet 기기·Pod 가 Origin 없는 GET 한 번으로 관리 토큰을 얻었다(🅣 전수 2026-09-26). 같은 기계의 CLI 는 파일을 직접 읽는다.
 //
 // `elanous nexus connect <host>` (T4.B) 가 처음 실행할 때 본 endpoint 를
 // 호출 → metadata 로 bookmark 만들고 token 을 저장. 이후 일상 사용
@@ -42,6 +40,10 @@ export interface ConnectInfoCtx {
   serverLabel?: string;
   /** Test seam — when present, used instead of file read. */
   acpTokenOverride?: string | null;
+  /** ⛔ false 면 토큰을 싣지 않는다 — 다른 웹사이트(교차 출처)의 요청(🅢 2026-09-26 실측: `Origin: https://evil.example` 에
+   *  200 ⊕ `access-control-allow-origin: *` ⊕ `auto_token` 원문 → 브라우저로 연 아무 페이지가 관리 토큰을 읽을 수 있었다).
+   *  허용 판정은 호출자(`connectInfoTokenAllowed`)가 한다. 생략 = 종전(시험 호환). */
+  allowAutoToken?: boolean;
   /**
    * Incoming request Host (header or URL host). Used only when `hostname`
    * is a wildcard bind (`0.0.0.0` / `::` / empty) so advertised URLs are
@@ -168,27 +170,12 @@ export function buildConnectInfo(ctx: ConnectInfoCtx): ConnectInfoBody {
   const voiceUrl = `ws://${hostForUrl}:${port}/v1/voice/ws`;
   const serverLabel = ctx.serverLabel ?? `${host} (NEXUS ${ctx.nexusVersion})`;
 
-  let autoToken: string | null = null;
-  if (isLoopbackHost(ctx.hostname)) {
-    if (ctx.acpTokenOverride !== undefined) {
-      autoToken = ctx.acpTokenOverride;
-    } else {
-      const path = ctx.acpTokenPath ?? defaultAcpTokenPath();
-      if (existsSync(path)) {
-        try {
-          autoToken = readFileSync(path, 'utf-8').trim();
-          if (autoToken.length === 0) autoToken = null;
-        } catch {
-          autoToken = null;
-        }
-      }
-    }
-  }
-
+  // 🔐 2026-09-26(🅣 전수): 원시 bearer 를 HTTP 로 내보내지 않는다. «바인드가 루프백»은 «요청자가 이 기계»를 뜻하지 않는다 —
+  //   `tailscale serve --tls-terminated-tcp` 는 tailnet 요청을 localhost 로 프록시하므로 상대 주소도 127.0.0.1 로 보이고,
+  //   Origin 이 없는 요청(curl·Pod)은 교차 출처 검사를 안 탄다. 같은 uid 의 로컬 도구는 토큰 파일을 직접 읽는다(remotes-cli).
+  const autoToken: string | null = null;
   const tokenRequired = autoToken === null;
-  const tokenHint = autoToken
-    ? '~/.elanous/acp-token (auto-loaded · loopback only)'
-    : '~/.elanous/acp-token on the server host (paste content into bearer)';
+  const tokenHint = '~/.elanous/acp-token on the server host (paste content into bearer · same-host CLI reads the file)';
 
   return {
     acp_url: acpUrl,
@@ -281,4 +268,15 @@ export function handleConnectTokenMint(ctx: ConnectInfoCtx): Response {
     });
   }
   return jsonResponse(body, 201);
+}
+
+/** 관리 토큰을 connect-info 에 실어도 되는 요청인가 — Origin 이 없거나(로컬 프로세스 · 토큰 파일을 어차피 읽을 수 있다),
+ *  이 데몬이 서빙한 페이지(Origin 호스트 == 요청 Host)거나, 루프백 출처(PWA 개발 서버)일 때만.
+ *  브라우저는 Origin 을 위조할 수 없으므로 다른 웹사이트는 셋 다 아니다. */
+export function connectInfoTokenAllowed(origin: string | null, requestHost: string | null): boolean {
+  if (!origin || origin === 'null') return origin === null;
+  let o: URL;
+  try { o = new URL(origin); } catch { return false; }
+  if (requestHost && o.host === requestHost) return true;
+  return o.hostname === 'localhost' || o.hostname === '127.0.0.1' || o.hostname === '[::1]' || o.hostname === '::1';
 }

@@ -3,6 +3,7 @@ import { appendRunLedgerEntry, cleanupUnfinishedRunLedgers, classifyFederatedLed
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
 
 
@@ -1330,6 +1331,40 @@ describe('unfinished run ledger terminal vocabulary', () => {
       .toEqual([expect.objectContaining({ runId: id, lastActivityTimestamp: '2026-08-12T00:03:00.000Z', lifecycle: 'terminal-run-status-superseded' })]);
   });
 
+  it('treats trailing bookkeeping after the last valid run-status as finished and keeps later non-bookkeeping unfinished', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'run-ledger-trailing-bookkeeping-'));
+    directories.push(directory);
+    const finishedId = runId('9101');
+    const resumedId = runId('9102');
+    const missingStatusId = runId('9103');
+    const line = (id: string, timestamp: string, event: string, data: Record<string, unknown> = {}) =>
+      JSON.stringify({ timestamp, runId: id, event, data });
+    writeFileSync(join(directory, `${finishedId}.jsonl`), [
+      line(finishedId, '2026-09-26T00:00:00.000Z', 'start'),
+      line(finishedId, '2026-09-26T00:01:00.000Z', 'run-status', { runStatus: 'completed' }),
+      line(finishedId, '2026-09-26T00:02:00.000Z', 'run-rollup'),
+      line(finishedId, '2026-09-26T00:03:00.000Z', 'progress-delivery'),
+      line(finishedId, '2026-09-26T00:04:00.000Z', 'pipeline-traversal-shadow'),
+    ].join('\n'), 'utf8');
+    writeFileSync(join(directory, `${resumedId}.jsonl`), [
+      line(resumedId, '2026-09-26T00:00:00.000Z', 'start'),
+      line(resumedId, '2026-09-26T00:01:00.000Z', 'run-status', { runStatus: 'failed', stage: 'aborted' }),
+      line(resumedId, '2026-09-26T00:02:00.000Z', 'run-rollup'),
+      line(resumedId, '2026-09-26T00:03:00.000Z', 'role'),
+      line(resumedId, '2026-09-26T00:04:00.000Z', 'quota-refresh'),
+    ].join('\n'), 'utf8');
+    writeFileSync(join(directory, `${missingStatusId}.jsonl`), [
+      line(missingStatusId, '2026-09-26T00:00:00.000Z', 'start'),
+      line(missingStatusId, '2026-09-26T00:01:00.000Z', 'pipeline-node-entry'),
+    ].join('\n'), 'utf8');
+
+    const query = queryUnfinishedRunLedgers({ dir: directory, goalsDir: directory });
+    const unfinishedIds = query.entries.map((entry) => entry.runId);
+    expect(unfinishedIds).not.toContain(finishedId);
+    expect(unfinishedIds).toEqual(expect.arrayContaining([resumedId, missingStatusId]));
+    expect(query.terminalByTrailingRunStatus).toBe(1);
+  });
+
   afterAll(() => {
     for (const directory of directories) rmSync(directory, { recursive: true, force: true });
   });
@@ -1590,6 +1625,53 @@ describe('unfinished run ledger cleanup disposition', () => {
 
   afterAll(() => {
     for (const directory of directories) rmSync(directory, { recursive: true, force: true });
+  });
+});
+
+describe('unfinished run ledger target-root goal lookup', () => {
+  it('reads target-relative and branch goals from A while retaining caller-cwd lookup for legacy ledgers', () => {
+    const root = mkdtempSync(join(tmpdir(), 'run-ledger-target-'));
+    const target = join(root, 'target-A');
+    const caller = join(root, 'caller-B');
+    const directory = join(root, 'ledgers');
+    const goalDirectory = join(target, 'docs', 'goals');
+    const relativeGoal = join('docs', 'goals', 'relative.md');
+    const branchGoal = join(goalDirectory, 'GOAL-branch-a1b2c3d4-2026-09-27.txt');
+    const ids = [1, 2, 3].map((index) => `run-00000000-0000-4000-8000-00000000010${index}`);
+    const previousCwd = process.cwd();
+    const originalLog = debug.log;
+    const observations: Array<{ category: string; event: string; data: unknown }> = [];
+    try {
+      mkdirSync(goalDirectory, { recursive: true });
+      mkdirSync(caller);
+      mkdirSync(directory);
+      writeFileSync(join(target, relativeGoal), '## TRACED PATHS\n1. src/relative.ts — target\n');
+      writeFileSync(branchGoal, '## TRACED PATHS\n1. src/branch.ts — target\n');
+      for (const [index, id] of ids.entries()) {
+        appendRunLedgerEntry({ runId: id!, event: 'start', data: {
+          branch: 'self-impl-a1b2c3d4',
+          ...(index < 2 ? { targetRoot: target } : {}),
+          ...(index !== 1 ? { goalFile: relativeGoal } : {}),
+        } }, directory);
+      }
+      process.chdir(caller);
+      (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+        observations.push({ category, event, data });
+      }) as typeof debug.log;
+      const result = queryUnfinishedRunLedgers({ dir: directory });
+      expect(result.entries).toEqual([
+        expect.objectContaining({ runId: ids[0], goalLookupBasis: 'ledger-target', plannedPathStatus: 'found-ledger-goal-file', goalDocumentPath: join(target, relativeGoal), plannedPaths: ['src/relative.ts'], goalDocumentSearchDirectory: null }),
+        expect.objectContaining({ runId: ids[1], goalLookupBasis: 'ledger-target', plannedPathStatus: 'found-branch-fallback', goalDocumentPath: branchGoal, plannedPaths: ['src/branch.ts'], goalDocumentSearchDirectory: goalDirectory }),
+        expect.objectContaining({ runId: ids[2], goalLookupBasis: 'caller-cwd', plannedPathStatus: 'goal-document-unreadable', goalDocumentPath: relativeGoal, goalDocumentSearchDirectory: null }),
+      ]);
+      expect(observations).toContainEqual({ category: 'self-implement.run-ledger', event: 'goal-lookup-basis', data: { ledgerTarget: 2, callerCwd: 1 } });
+      const federated = queryFederatedUnfinishedRunLedgers({ ledgerDirectories: [directory] });
+      expect(federated.entries.map(({ runId, goalLookupBasis, plannedPathStatus }) => ({ runId, goalLookupBasis, plannedPathStatus }))).toEqual(result.entries.map(({ runId, goalLookupBasis, plannedPathStatus }) => ({ runId, goalLookupBasis, plannedPathStatus })));
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

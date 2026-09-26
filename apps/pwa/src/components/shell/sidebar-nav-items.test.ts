@@ -31,6 +31,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/',
   '/404',
   '/autopilot',
+  '/botlab',
   '/bots',
   '/chat',
   '/control',
@@ -140,9 +141,19 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
     expect(ws!.kind).toBeNull();
   });
 
-  it('Showroom 은 Chat 바로 다음 슬롯 · kind=null · href=/showroom (CV-3 P1)', () => {
+  it('Intake 는 Chat 바로 다음 · href=/intake · kind=null · 되살린 힌트', () => {
+    const intakeIdx = SIDEBAR_NAV_ITEMS.findIndex((i) => i.href === '/intake');
+    expect(intakeIdx).toBe(2);
+    const intake = SIDEBAR_NAV_ITEMS[intakeIdx]!;
+    expect(intake.label).toBe('Intake');
+    expect(intake.kind).toBeNull();
+    expect(intake.hint).toBe('넣으면 흡수 · 작업 · 그래프로 (URL · 미션 · 메모)');
+    expect(NON_MENU_SIDEBAR_ROUTES.some((route) => route.href === '/intake')).toBe(false);
+  });
+
+  it('Showroom 은 Intake 다음 슬롯 · kind=null · href=/showroom (CV-3 P1)', () => {
     const showroomIdx = SIDEBAR_NAV_ITEMS.findIndex((i) => i.label === 'Showroom');
-    expect(showroomIdx).toBe(2);
+    expect(showroomIdx).toBe(3);
     const sr = SIDEBAR_NAV_ITEMS[showroomIdx]!;
     expect(sr.href).toBe('/showroom');
     expect(sr.kind).toBeNull();
@@ -167,7 +178,7 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
     expect(worktrees.kind).toBeNull();
     expect(worktrees.hint).toContain('작업 트리');
     expect(worktrees.icon).toBeDefined();
-    expect(SIDEBAR_NAV_ITEMS).toHaveLength(17);
+    expect(SIDEBAR_NAV_ITEMS).toHaveLength(18);
   });
 
   it('Bots 항목 · href=/bots · kind=null · 읽기 전용 카탈로그 안내', () => {
@@ -250,7 +261,7 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
   it('확인된 비메뉴 주소는 각자의 서로 다른 이유 분류를 유지함', () => {
     const categoryByHref = new Map(NON_MENU_SIDEBAR_ROUTES.map((route) => [route.href, route.category]));
 
-    expect(categoryByHref.get('/intake')).toBe('retired');
+    expect(categoryByHref.get('/intake')).toBeUndefined();
     expect(categoryByHref.get('/share')).toBe('system-share-target');
     expect(categoryByHref.get('/missions')).toBe('dynamic-route-parent');
     expect(categoryByHref.get('/setup')).toBe('provider-onboarding');

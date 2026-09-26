@@ -1,7 +1,12 @@
 'use client';
 
+import { useContext, useEffect } from 'react';
 import Link from 'next/link';
+import { usePathname, useRouter } from 'next/navigation';
+import { AppRouterContext } from 'next/dist/shared/lib/app-router-context.shared-runtime';
 import { cn } from '@/lib/utils';
+import { useNexusHealthIfMounted } from '@/nexus/hooks/use-nexus-state';
+import { setupModeRedirect } from '@/lib/setup-mode';
 import {
   NON_MENU_SIDEBAR_ROUTES,
   SIDEBAR_NAV_ITEMS,
@@ -89,6 +94,27 @@ export function RouteGuidanceList({ ariaLabel }: { ariaLabel: string }) {
 }
 
 export function WelcomeHome() {
+  const routerContext = useContext(AppRouterContext);
+  if (routerContext == null) return <WelcomeHomeView />;
+  return <WelcomeHomeRedirect />;
+}
+
+function WelcomeHomeRedirect() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const healthQuery = useNexusHealthIfMounted();
+  const redirectTo = pathname == null || healthQuery.isError || healthQuery.isPending || healthQuery.isLoading
+    ? null
+    : setupModeRedirect(healthQuery.data, pathname);
+
+  useEffect(() => {
+    if (redirectTo === '/setup') router.replace('/setup');
+  }, [redirectTo, router]);
+
+  return <WelcomeHomeView />;
+}
+
+function WelcomeHomeView() {
   return (
     <main data-testid="welcome-home" className="min-h-screen bg-gradient-to-b from-background via-background to-muted/40 px-6 py-12 sm:px-10">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-10">

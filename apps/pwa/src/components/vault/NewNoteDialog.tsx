@@ -1,7 +1,7 @@
 'use client';
 
 // 새 노트 생성 (OP3c · 2026-07-09) — 빈 노트 / 템플릿 적용 / 오늘 데일리노트.
-// iPad 데일리노트·템플릿 이식. 백엔드 /v1/vault/{templates,template-expand} + /v1/notes/save.
+// iPad 데일리노트·템플릿 이식. 백엔드 /v1/vault/{templates,template-expand,file}.
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
@@ -36,13 +36,12 @@ export function NewNoteDialog({ onClose, onCreated }: { onClose: () => void; onC
       } else if (opts.daily) {
         markdown = `# ${name}\n\n## 오늘\n\n- \n`;
       }
-      const path = opts.daily ? `Daily/${name}.md` : undefined;
-      const r = await api.saveNote({ markdown, title: name, ...(path ? { path } : {}) });
-      if (r.error) { setErr(r.error); setBusy(false); return; }
-      if (r.path) onCreated(r.path.replace(/^.*\/Obsidian\/[^/]+\//, ''));
-      else onClose();
+      const path = opts.daily ? `Daily/${name}.md` : `${name}.md`;
+      const r = await api.writeNote({ path, content: markdown, createOnly: true });
+      if (r.error) { setErr(r.error === 'file_exists' ? '이미 존재하는 노트입니다' : r.error); setBusy(false); return; }
+      onCreated(path);
     } catch (e) { setErr(e instanceof Error ? e.message : String(e)); setBusy(false); }
-  }, [api, title, tpl, onCreated, onClose]);
+  }, [api, title, tpl, onCreated]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>

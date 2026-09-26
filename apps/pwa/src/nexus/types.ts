@@ -71,6 +71,10 @@ export interface NexusHealth {
   startedAt: number;
   uptimeMs: number;
   tabs: { total: number; byStatus: Record<NexusTabStatus, number> };
+  /** Present only when the daemon booted in setup mode (P24b). Old daemons omit it. */
+  setupMode?: boolean;
+  /** Names of required slots still missing (e.g. `['llm']`). Absent when the daemon does not report them. */
+  setupMissing?: string[];
 }
 
 export interface NexusRuntimeMeta {

@@ -19,6 +19,7 @@ import {
   type PrEvidenceInput,
 } from './pr-evidence-artifact.js';
 import { assessImplementationArtifactCompleteness } from './implementation-artifact-completeness.js';
+import { runContractAtNode, type RunContract } from './graph-run-contract.js';
 export {
   PR_EVIDENCE_AXES,
   composePrEvidenceArtifact,
@@ -73,6 +74,7 @@ import { parseAskProseTitle } from '../self-dev/launch-preflight.js';
 import { classifyReviewProviderFailure } from '../self-dev/review-provider-fallback.js';
 import { classifyError } from '../session-runtime/retry-policy.js';
 import { decomposeSelfDevGoal, inferHotPaths, type SelfDevDecomposeOptions } from '../self-dev/decompose.js';
+import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
 import type { SelfDevGoalType } from '../self-dev/orchestrate.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE, gateGitResidue, observeGitResidue } from '../git-fs/worktree.js';
@@ -86,11 +88,12 @@ import { originObservationFields } from '../agent/origin-observation.js';
 import { getHarnessSpace, normalizeSpaceId, resolveRunIdentity } from '../harness/harness-space.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { harnessReleaseNote, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment } from '../release-loop/release-note.js';
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 export { slugifyFeature } from '../harness/worktree-branch-prefix.js';
 import { resolveAutoReviewLabels } from './context-capsule.js';
 import { GOAL_TYPES, extractVerbatimOriginalAsk, leadingGoalMetadata, parseAskFile, parseGoalType, type GoalType } from './goal-author.js';
-import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
+import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import { classifyReworkBudgetShadow } from './classify-shadow.js';
 import { createReworkBudgetJudgment, REWORK_BUDGET_JUDGMENT, reworkBudgetEvidenceForObservation, reworkBudgetWorkflow } from './rework-budget-judgment.js';
@@ -429,21 +432,30 @@ export function decideGateFailureDisposition(facts: {
   return 'rework';
 }
 
+function postSyncTimeoutOnly(facts: { introduced?: number; unknown?: number; timedOut?: number; flakyRerun?: number; childResponsibility?: string } | undefined): boolean {
+  // Post-sync attribution may omit childResponsibility; zero introduced/unknown with only
+  // timeout evidence is sufficient here, without weakening the main-loop predicate.
+  return (facts?.childResponsibility === undefined || facts.childResponsibility === 'none')
+    && isTimeoutOnlyUnmeasuredGate(facts && { ...facts, childResponsibility: 'none' });
+}
+
 function postSyncGatePolicy(
   passed: boolean,
-  childResponsibility: string | undefined,
+  facts: { introduced?: number; unknown?: number; timedOut?: number; flakyRerun?: number; childResponsibility?: string } | undefined,
   syncStatus: PostSyncStatus,
 ): PostSyncGatePolicy {
-  const exemptionWithheld = !passed
-    && childResponsibility === 'none'
+  const timeoutOnly = !passed && postSyncTimeoutOnly(facts);
+  const introduced = (facts?.introduced ?? 0) > 0;
+  const childResponsibility = facts?.childResponsibility;
+  const exemptionWithheld = !timeoutOnly && !passed
+    && !introduced && childResponsibility === 'none'
     && syncStatus === 'llm-resolved';
   const exempted = !passed
-    && childResponsibility === 'none'
-    && syncStatus === 'merged';
+    && (timeoutOnly || (!introduced && childResponsibility === 'none' && syncStatus === 'merged'));
   return {
     exempted,
     exemptionWithheld,
-    mustStop: !passed && (childResponsibility !== 'none' || exemptionWithheld),
+    mustStop: !passed && !timeoutOnly && (introduced || childResponsibility !== 'none' || exemptionWithheld),
   };
 }
 
@@ -455,7 +467,7 @@ export function postSyncGateObservation(
     testStepExecuted?: boolean;
     measuredFileCount?: number;
     comparisonBase?: string | null;
-    reflectGateFacts?: { introduced: number; preexisting: number; unknown: number; timedOut?: number; childResponsibility?: string };
+    reflectGateFacts?: { introduced: number; preexisting: number; unknown: number; timedOut?: number; flakyRerun?: number; childResponsibility?: string };
   },
   branch: string,
   detectModuleLoadFailure: (output: string) => boolean,
@@ -464,7 +476,7 @@ export function postSyncGateObservation(
   const facts = regate.reflectGateFacts;
   const { exempted, exemptionWithheld } = postSyncGatePolicy(
     regate.passed,
-    facts?.childResponsibility,
+    facts,
     syncStatus,
   );
   return {
@@ -789,6 +801,13 @@ function observeDeclaredScopeDiff(
   // ⭐ 관측은 «언제나» 남기고, ***사람 줄은 「하나도 안 만들었을 때만»*** 낸다.
   const line = declaredScopeUnmadeLine(diff);
   if (line !== null) input.progress?.('declared-targets-unmade', line);
+  // ⭐ 그 옆 — `경계:` 글로브에 닿은 변경. 못 읽었거나 변경 목록이 없으면 조용하다.
+  if (goalDocument !== null && input.changedFiles !== undefined) {
+    const violations = boundaryViolations(boundaryGlobs(goalDocument), input.changedFiles);
+    if (violations.length > 0) {
+      input.progress?.('boundary-violated', `⚠️ 경계로 선언한 경로를 고쳤다 — ${violations.join(' · ')}`);
+    }
+  }
 }
 
 /**
@@ -978,7 +997,7 @@ export interface SelfImplementSeams {
   readPrDiff?: (opts: { number: number; cwd: string; baseCommit: string; headCommit: string }) => Promise<string>;
   /** ★ ⑦ 병합 seam(2026-07-21·auto-merge) — 열린 PR 을 실제 병합(gh pr merge --squash). `matchHeadCommit`이 있으면
    * 검사한 고정 head 뒤 변경을 gh가 거부한다. autoMerge + 리뷰 clean 일 때만 호출(outward-facing·main 자율병합). */
-  mergePr?: (opts: { number: number; cwd: string; matchHeadCommit?: string }) => Promise<{ merged: boolean; baseRefName?: string; detail?: string }>;
+  mergePr?: (opts: { number: number; cwd: string; matchHeadCommit?: string }) => Promise<{ merged: boolean; baseRefName?: string; mergeCommit?: string; detail?: string }>;
   /** Post-merge cleanup is opt-in and injectable so tests never touch the filesystem. */
   postMergeCleanup?: {
     enabled: boolean;
@@ -1052,6 +1071,8 @@ export const SELF_IMPLEMENT_PROGRESS_STAGES = [
   //    ⛔ 기존 단계 이름을 «빌려 쓰지 않는다» — `progress()` 는 단계 이름으로 원장 행을 만들므로
   //       빌려 쓰면 그 단계 집계가 오염된다([T] 2026-09-12 · `#17767` 이후 계약).
   'declared-targets-unmade',
+  // ⭐ `경계:` 글로브에 실제로 닿은 변경. 막지 않고 이름만 낸다.
+  'boundary-violated',
 ] as const;
 
 export type SelfImplementProgressStage = typeof SELF_IMPLEMENT_PROGRESS_STAGES[number];
@@ -1899,13 +1920,6 @@ export interface SelfImplementOptions {
    *    ⇒ 런 슈퍼바이저는 「시도의 요약 판정」만 보고 「어떻게 걸었나」를 «못 봤다».
    *  ⛔ 관측용이다 — 흐름을 바꾸지 않는다. ⛔ 던져도 런이 안 죽는다(호출부가 감싼다). */
   onNodeEntry?: (node: PipelineNodeId, round: number) => void;
-  /** ⛔⭐ 실험 — 그래프 선언을 «실행 권위»로 올린다(RFC §5 1단계). config 를 «이긴다».
-   *
-   *  📌 이 칸이 있는 이유가 둘이다:
-   *    ⓐ 「건너뛰는 쪽」을 시험에서 «누를 수» 있어야 한다 — 없으면 그 갈래는 실물로만 확인된다.
-   *    ⓑ `resolveGraphAuthority` 의 `source: 'flag'` 가 «아무도 안 쓰는» 퇴화 축이었다
-   *       (같은 날 `goalTypeSource` 가 같은 병을 앓았다 — 값이 언제나 하나면 그 축은 아무것도 안 가른다). */
-  graphAuthoritative?: boolean;
   /** 시험이 런치 오버레이를 빼 «지금 YAML 예산»을 읽게 할 때 쓴다. 생략하면 디스크 오버레이다. */
   graphOverlays?: readonly GraphOverlaySpec[];
   /** ★ K run-identity — 이 self-implement 호출의 per-run join anchor. 미지정 시 상속(env)→canonical mint.
@@ -2443,7 +2457,30 @@ function formatGoalFileForPrBody(goalFile: string, cwd = process.cwd()): string 
   return relative(canonicalRoot, canonicalGoal).split(sep).join('/');
 }
 
-function prBody(feature: string, implSummary: string, gateLog?: string, review?: SelfImplementReview, reviewIntent?: string, autoReviewDeclineReasons?: readonly string[], evidence?: string, goalFile?: string, planRevision?: ReworkPlanRevision): string {
+export class MergedReleaseNoteWriteError extends Error {
+  readonly prNumber: number;
+  readonly prUrl: string;
+  readonly directory: string;
+  readonly fragment: ReleaseNoteFragment;
+
+  constructor(prUrl: string, directory: string, fragment: ReleaseNoteFragment, cause: unknown) {
+    super(`PR #${fragment.pr} was merged, but its release note could not be written to ${directory}: ${safeErrorDescription(cause)}`, { cause });
+    this.name = 'MergedReleaseNoteWriteError';
+    this.prNumber = fragment.pr;
+    this.prUrl = prUrl;
+    this.directory = directory;
+    this.fragment = fragment;
+  }
+}
+
+function goalDocumentForReleaseNote(goalFile?: string): string {
+  if (!goalFile) return '';
+  try { return readFileSync(goalFile, 'utf8'); }
+  catch { return ''; }
+}
+
+function prBody(feature: string, implSummary: string, gateLog?: string, review?: SelfImplementReview, reviewIntent?: string, autoReviewDeclineReasons?: readonly string[], evidence?: string, goalFile?: string, planRevision?: ReworkPlanRevision, releaseNote?: ReturnType<typeof harnessReleaseNote>): string {
+  const note = releaseNote ?? harnessReleaseNote(goalDocumentForReleaseNote(goalFile), prTitle(feature));
   const relaxation = planRevision?.relaxation
     ? ['', '## 감독 수용 기준 완화', `- 대상: ${planRevision.relaxation.target}`, `- 이전: ${planRevision.relaxation.expected}`, `- 완화: ${planRevision.relaxation.replacement}`, `- 이유: ${planRevision.reason}`, `- 적용: ${planRevision.application?.status ?? 'failed'}${planRevision.application?.detail ? ` (${planRevision.application.detail})` : ''}`, ...(planRevision.disposition ? [`- 충돌 처분: ${planRevision.disposition}`] : [])]
     : [];
@@ -2454,6 +2491,8 @@ function prBody(feature: string, implSummary: string, gateLog?: string, review?:
     '',
     '## 구현 요약',
     implSummary.trim() || '(요약 없음)',
+    '',
+    renderReleaseNoteSection(note).trimEnd(),
     // ★ I-9 — 성공 경로도 수확본을 싣는다. blocked 쪽만 실으면 **통과한 PR 에서 증거가 사라진다**.
     ...(evidence ? ['', '## 자식이 남긴 증거 (EVIDENCE/RESULT · 화면 전체에서 수확)', '```', evidence, '```'] : []),
     ...(reviewIntent ? ['', '## 리뷰 intent', reviewIntent] : []),
@@ -3314,6 +3353,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   };
   let loopRegistered = false;
   let mergeApprovalReceived = false;
+  let autoMergeAuthorizedBeforeSync = false;
   let lastParsedSupervisorVerdict: ReworkBudgetVerdict | undefined;
   let lastParsedSupervisorReason: string | undefined;
   let providerErrorCount = 0;
@@ -3379,6 +3419,13 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   const progressDelivery = { delivered: 0, unwired: 0, callbackFailed: 0 };
   let capturedPrNumber: number | undefined;
   let openPrInvoked = false;
+  const defaultProviderName = opts.seams.currentProviderName?.() ?? currentProviderName();
+  const runProviderName = opts.childLlm?.provider ?? defaultProviderName;
+  const logQuotaProvider = (assessment: QuotaExhaustionAssessment | undefined): void => {
+    debug.log('self-implement.abandoned', 'quota-provider', {
+      runProvider: runProviderName, defaultProvider: defaultProviderName, used: assessment?.exhausted !== undefined,
+    });
+  };
   const instrumentedOpts: SelfImplementOptions = {
     ...opts,
     seams: {
@@ -3418,6 +3465,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   /** ⭐ 방문 예산을 읽으려면 «지금 도는 선언»이 필요하다 — 신원과 «같은 패턴»으로 한 번 심는다.
    *  ⛔ 걸음(`traversedNodes`)은 이 스코프에 있고 선언은 안쪽에서 정해지므로, 둘을 잇는 자리가 여기다. */
   let runGraphTemplate: GraphTemplate | undefined;
+  let runContract: RunContract | undefined;
   let runGraphIdentity: { graphId: string; graphVersion: string } | undefined;
   const setRunGraphIdentity = (identity: { graphId: string; graphVersion: string }): void => {
     runGraphIdentity = identity;
@@ -3469,6 +3517,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
     traversedNodes.push(node);
     if (node === 'implement') roundCount++;
     const fallbackGraphIdentity = observedGraphIdentity();
+    const contractAtNode = runContract === undefined ? undefined : runContractAtNode(runContract);
     observePipeline('pipeline-node-entry', {
       ...pipelineNodeEntryPayload(
         runGraphTemplate ?? { graphId: fallbackGraphIdentity.graphId, version: fallbackGraphIdentity.graphVersion, nodes: [] },
@@ -3476,7 +3525,15 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       ),
       node,
       round,
+      ...contractAtNode,
     });
+    if (contractAtNode?.contractHonored === false) {
+      observeOuter('graph-contract-violation', {
+        node, round,
+        contractSubstrate: contractAtNode.contractSubstrate,
+        actualSubstrate: contractAtNode.actualSubstrate,
+      }, { level: 'warn' });
+    }
   };
   const observeRoundClassification = (classification: LifecycleScreenComparison): void => {
     roundClassifications.push(classification);
@@ -3731,6 +3788,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       }),
       instrumentedOpts.seams.reworkBudgetReviewFindingRecurrence ?? (() => null),
       () => { mergeApprovalReceived = true; },
+      () => { autoMergeAuthorizedBeforeSync = true; },
       (verdict) => { lastParsedSupervisorVerdict = verdict; },
       (reason) => { lastParsedSupervisorReason = reason; },
       (base) => { resolvedBase = base ?? undefined; },
@@ -3743,6 +3801,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       observeOuter,
       (active) => { runActiveProvider = active; },
       (sessionId) => { terminalSessionId = sessionId; },
+      (contract) => { runContract = contract; },
     );
     terminalNode = result.node;
     await mergeChildProviderErrors();
@@ -3752,8 +3811,9 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       providerErrorCount > 0,
       credentialFailureCount > 0,
       opts.seams.inspectCodexRotation,
-      opts.seams.currentProviderName?.(),
+      runProviderName,
     );
+    if (isAbandonedClassificationOutcome(addressedResult.outcome)) logQuotaProvider(addressedResult.quotaExhaustionAssessment);
     observeOuter('child-provider-error-query', { status: childProviderErrorQueryStatus });
     if (lastProviderError) {
       observeOuter('provider-error-observed', { count: providerErrorCount, ...lastProviderError });
@@ -3823,14 +3883,15 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
         branch,
         ...(worktreePath ? { worktreePath } : {}),
         ...(lastParsedSupervisorReason ? { supervisorReason: lastParsedSupervisorReason } : {}),
-        ...(mergeApprovalReceived ? { mergeApprovalReceived: true } : {}),
+        ...(mergeApprovalReceived || (e.step === 'merge' && autoMergeAuthorizedBeforeSync) ? { mergeApprovalReceived: true } : {}),
         detail: worktreePath
           ? `자율 단계 '${e.step}' wall-clock ${e.ms}ms 초과 — hang 방지 종결(worktree 회수 경로: ${worktreePath})`
           : `자율 단계 '${e.step}' wall-clock ${e.ms}ms 초과 — hang 방지 종결(worktree 생성 전)`,
       };
       terminalNode = result.node;
       await mergeChildProviderErrors();
-      const addressedResult = attachAbandonedClassification(attachReviewReflectionOutcome({ ...result, ...providerErrorsForResult() }), opts.goalFile, providerErrorCount > 0, credentialFailureCount > 0, opts.seams.inspectCodexRotation, opts.seams.currentProviderName?.());
+      const addressedResult = attachAbandonedClassification(attachReviewReflectionOutcome({ ...result, ...providerErrorsForResult() }), opts.goalFile, providerErrorCount > 0, credentialFailureCount > 0, opts.seams.inspectCodexRotation, runProviderName);
+      logQuotaProvider(addressedResult.quotaExhaustionAssessment);
       observeOuter('child-provider-error-query', { status: childProviderErrorQueryStatus });
       if (lastProviderError) {
         observeOuter('provider-error-observed', { count: providerErrorCount, ...lastProviderError });
@@ -4012,12 +4073,24 @@ export function readQuotaExhausted(
     // ⛔⭐⭐⭐ 그리고 이 신호는 **codex 전용**이다(2R must-fix) — provider 를 «안 보면»
     //   Claude·Grok 으로 돈 런까지 codex 쿼터로 «오분류»한다. 그건 이 PR 이 고치려던
     //   「잡통」의 «반대 방향» 오류다.
-    //   ⚠️ 한계: 이것은 «부모의 현재 설정»이지 그 런이 실제로 쓴 provider 가 아니다
-    //     (자식이 tier 를 올렸을 수 있다). 그 정확한 귀속은 자식 계측이 선결이라 별개 축이다.
+    //   호출자는 구현 자식 provider 를 우선 넘긴다. 자식 선택이 없으면 프로세스 기본 provider 로 귀속한다.
+    //   부모(리뷰·감독)의 별도 폴백이나 자식 내부 전환은 이 평가의 범위 밖이다.
     const snapshot = rotationInspector();
     // ⭐ 좁히지 않는다 — 스냅샷이 «이미 아는» 것을 증거로 그대로 옮긴다(`quotaAvailabilityEvidence`).
     // ⛔⭐ 「언제 읽었나」를 «값으로» 박는다 — 이 읽기는 런이 «끝난 뒤»다(타입 머리말 참조).
-    return assessQuotaExhaustion(providerName, { ...quotaAvailabilityEvidence(snapshot), readPoint: 'postmortem' });
+    const evidence = { ...quotaAvailabilityEvidence(snapshot), readPoint: 'postmortem' as const };
+    // ⛔⭐ 정본 스토어가 아는 계정이 «0개»면 회전이 구성되지 않은 것이다 — 「쓸 계정 없음」을 소진으로 읽지 않는다.
+    //   🩸 P6(2026-09-26 Pod 실물): Pod 는 계정 사본 하나만 받고 회전 목록이 없어 no-candidate → 「할당량 소진」으로
+    //     분류됐다. 진짜 원인(게이트의 tsc 127 · P5)이 그 오분류에 가려졌다. 호스트의 진짜 소진(계정은 있는데 전부 찼다)은 그대로다.
+    if (snapshot.knownAccountCount === 0) return { exhausted: undefined, accountAvailability: evidence };
+    // ⛔⭐ 아는 계정이 «하나»뿐이면 no-candidate 는 «돌릴 곳이 원래 없다»는 뜻이지 «찼다»가 아니다.
+    //   🩸 P2 #20869(2026-09-27 Pod 실물): Pod 는 배분받은 계정 사본 «하나»(third · 잔량 넉넉)만 갖고 그 계정의 사용률 신호가
+    //     없었다 → 회전은 no-candidate → 「할당량 소진」으로 분류돼 진짜 원인(리뷰 UNCONVERGEABLE)을 가렸다.
+    //   ⇒ 그 한 계정의 사용률도 도달 신호도 없으면 «모름». 사용률을 알면 종전 판정(임계 미만=false · 이상=true)에 맡긴다.
+    if (snapshot.knownAccountCount === 1 && evidence.reason === 'no-candidate' && snapshot.currentUsedPercent === undefined && snapshot.currentReached !== true) {
+      return { exhausted: undefined, accountAvailability: evidence };
+    }
+    return assessQuotaExhaustion(providerName, evidence);
   } catch {
     return { exhausted: undefined, accountAvailability: undefined };   // fail-soft — 관측은 결론을 막지 않는다
   }
@@ -4268,6 +4341,7 @@ async function runSelfImplementInner(
    *  이제 null 이면 measureReviewFindingRecurrence 가 «실제로» 잰다. */
   reworkBudgetReviewFindingRecurrence: () => ReviewFindingRecurrence | null = () => null,
   onMergeApprovalReceived: () => void = () => {},
+  onAutoMergeAuthorizedBeforeSync: () => void = () => {},
   onSupervisorVerdictParsed: (verdict: ReworkBudgetVerdict) => void = () => {},
   onSupervisorReasonParsed: (reason: string | undefined) => void = () => {},
   onResolvedBase: (base: string | null) => void = () => {},
@@ -4282,16 +4356,15 @@ async function runSelfImplementInner(
    *  (그러면 「런이 끝날 무렵의 provider」가 되어 `F45` 를 그대로 밟는다). 시작 시점 값을 넘긴다. */
   onActiveProvider: (active: { provider?: string; model?: string; auth?: string }) => void = () => {},
   onSessionCreated: (sessionId: string) => void = () => {},
+  onRunContractResolved: (contract: RunContract) => void = () => {},
 ): Promise<Omit<SelfImplementResult, 'runId'>> {
   const s = opts.seams;
   const pipelineStartedAtMs = Date.now();
-  // Graph authority defaults ON and preserves flag → config → default provenance.
+  // Graph authority is always ON; retain the resolved event with default provenance.
   // For research documents, its declared docs-only routing intentionally skips the gate.
-  const userConfig = (await import('../user-config.js')).getUserConfig();
-  const graphAuthority = resolveGraphAuthorityForUserConfig(userConfig, opts.graphAuthoritative);
+  const graphAuthority = resolveGraphAuthorityForUserConfig();
   // ⛔ 골 파일이 «없을 수» 있다 — 그때는 골 종류를 모르므로 implement-loop 으로 간다(없는 길로 안 보낸다).
   // ⭐ 대표 지시 ② «변형» — 「최초 결정 시 해당 템플릿 변형을 한다」.
-  //   ⛔ 승격이 꺼져 있으면 `decideTemplate` 은 `activeTemplate` 과 «같은 값»을 낸다(고르지도 않는다).
   const graphGoalType = opts.goalFile === undefined ? undefined : (goalTypeFields(opts.goalFile).goalType as GoalType | undefined);
   // ⛔ 오버레이는 «한 번» 읽는다 — 라운드마다 디스크를 읽으면 도는 중에 파일이 바뀌어 걸음이 갈린다.
   // ⛔ 이름이 `graph`인 이유: launch(②)·runtime(③) «둘 다» 이 목록에서 고른다. 단계는 인자로 갈린다.
@@ -4308,24 +4381,28 @@ async function runSelfImplementInner(
   // ⛔⭐ `let` 인 이유는 ③ «다이나믹»이다 — 라운드마다 runtime 오버레이가 «앞을 보는 것»만 바꾼다.
   //   ⛔ 지난 노드를 재정의하지 않는다(RFC §6: 그러면 원장을 사후에 해석할 수 없다).
   let graphTemplate = graphDecision.template;
-  /** 단계 이름 → 그 템플릿의 노드 이름. ⛔ 꺼져 있으면 «항등»이다. */
+  /** 단계 이름 → 그 템플릿의 노드 이름. */
   const node = (stage: PipelineNodeId): PipelineNodeId => nodeNameForStage(stage, graphTemplate) as PipelineNodeId;
   // ⛔⭐ 맥락이 정해진 «직후» 관측기에 심는다 — 이 줄이 없으면 걸음은 YAML 을 따르고 «신원은 안 따른다».
   onGraphResolved(graphIdentityOf(graphTemplate));
-  // ⭐ 제어 «출처»를 런마다 «한 번» 남긴다 — ⛔ 승격 여부와 무관하게 «언제나».
-  //   🩸 2026-09-08: 이 값은 `gate-skipped-by-graph` «한 자리»에서만 났고, 그 사건은
-  //     research-loop 이 문서만 바꿨을 때만 난다 ⇒ ***대부분의 런에서 「무엇이 켰나」가 원장에 없었다***.
-  //   ⛔ 그래서 A/B 의 관문(「두 팔이 갈렸나」)이 «원리상» 답을 못 얻었다.
-  //   ⛔ 「켜짐」만 남기지 않는다 — `source` 가 「안 켰다」와 「켰는데 안 먹었다」를 가른다.
+  // 권위는 항상 켜지지만 이벤트의 필드 모양은 유지하고 출처를 default로 기록한다.
   observe('graph-authority-resolved', graphAuthorityFields(graphAuthority, graphTemplate));
+  // ⭐ 런 계약 — 런 시작 «한 번» 해석한다(대표 2026-09-26 «초반 계약을 노드가 준수»). 해석 출처(source)와
+  //   실제 칸(actualSubstrate)을 같이 남겨 「계약이 Pod 인데 로컬에서 돌았나」를 원장이 답하게 한다.
+  //   노드 진입 대조는 관측만 하며 실행을 막지 않는다.
+  {
+    const { resolveRunContract } = await import('./graph-run-contract.js');
+    const runContract = resolveRunContract({ ...(graphTemplate.runContract ? { graph: graphTemplate.runContract } : {}), env: process.env });
+    onRunContractResolved(runContract);
+    observe('graph-run-contract-resolved', { ...graphIdentityOf(graphTemplate), ...runContract, ...runContractAtNode(runContract) });
+  }
   // ⛔ 승격이 꺼져 있으면 «심지 않는다» — 그러면 예산 관측도 안 난다(운영 원장이 오늘과 같다).
   if (graphAuthority.enabled) onGraphTemplateResolved(graphTemplate);
   // ⛔ 선택을 «전부» 싣는다 — 얹힌 것만 실으면 「왜 안 얹혔나」를 사후에 못 묻는다.
-  //   ⛔ 「없음」과 「안 봤음」을 가른다: 승격이 꺼졌으면 selections 가 «빈 배열»이고 그것이 값이다.
   /** ⭐ ③ «다이나믹» — 라운드마다 runtime 오버레이를 다시 고른다.
    *  ⛔ **매번 «기준 선언»에서 다시 얹는다** — 이전 라운드 결과 위에 겹쳐 얹으면
    *    「이 걸음을 무엇이 만들었나」가 «누적»이 되어 사후에 못 푼다.
-   *  ⛔ 승격이 꺼져 있으면 아무 일도 안 한다(오늘과 같은 걸음). */
+   *  오버레이 적용은 기존 실행 경로를 그대로 따른다. */
   const applyRuntimeOverlays = (round: number): void => {
     if (!graphAuthority.enabled) return;
     // ⛔ 「지금 아는 것」만 준다 — 없는 값을 0 으로 지어내지 않는다(key-absent 가 그것을 말한다).
@@ -4406,11 +4483,13 @@ async function runSelfImplementInner(
   // ⭐ 관측 이벤트와 «같은 값»을 원장으로도 보낸다 — 로그에만 있으면 원장 질의가 못 센다(`F12`).
   try { onActiveProvider(activeProvider); } catch { /* 보조 기록이 런을 죽이지 않는다 */ }
   const boundedFeature = boundReadableText(opts.feature, RUN_START_FEATURE_MAX_CHARS);
+  const launchCwd = resolve(process.cwd());
   observe('start', {
     feature: boundedFeature.text, featureTruncated: boundedFeature.truncated, featureOriginalChars: boundedFeature.originalChars,
     branch, base: opts.base ?? null, draft: opts.draft ?? true,
     willFork: !!(opts.parentSessionId && s.forkSession), parentSessionId: opts.parentSessionId ?? null,
-    nestDepth: nestInfo().depth, goalSource, goalFile: opts.goalFile ?? null, ...originObservationFields(),
+    nestDepth: nestInfo().depth, goalSource, goalFile: opts.goalFile === undefined ? null : resolve(launchCwd, opts.goalFile),
+    targetRoot: gitRootOf(launchCwd) ?? launchCwd, ...originObservationFields(),
     provider: activeProvider.provider ?? null, model: activeProvider.model ?? null, auth: activeProvider.auth ?? null,
     ...(opts.correlationId !== undefined ? { correlationId: opts.correlationId } : {}),
   });
@@ -4777,12 +4856,15 @@ async function runSelfImplementInner(
     return occurrencePattern.test(reason) && roundsPattern.test(reason);
   };
   const failCounts: number[] = [];
+  // 직전 gate 실패 라운드의 미검증 집합(정렬 키). 통과하면 비운다 — «연속» 반복만 센다.
+  let lastGateUnverifiedKey: string | undefined;
   const reworkHistory: string[] = [];
   const supervisorDecisionHistory: Array<{ round: number; verdict: ReworkBudgetVerdict; reason: string }> = [];
   let judgedEffectiveMax: number | undefined;
   let lastReworkVerdict: ReworkBudgetVerdict | undefined;
   let lastSupervisorVerdict: ReworkBudgetVerdict | undefined;
   let lastSupervisorReason: string | undefined;
+  let consecutiveUnresolvedBudget = 0;
   let pendingPlanRevision: ReworkPlanRevision | undefined;
   let lastPlanRevision: ReworkPlanRevision | undefined;
   const isReviewRework = (source: SupervisionReworkSource): boolean => {
@@ -4996,9 +5078,10 @@ async function runSelfImplementInner(
     }
   };
   let preservationBase = wt.resolvedBase;
+  const runProviderName = opts.childLlm?.provider ?? (s.currentProviderName?.() ?? currentProviderName());
   let cachedQuotaExhaustionAssessment: QuotaExhaustionAssessment | undefined;
   const quotaExhaustionAssessmentForRun = (): QuotaExhaustionAssessment => {
-    cachedQuotaExhaustionAssessment ??= readQuotaExhausted(s.inspectCodexRotation, s.currentProviderName?.());
+    cachedQuotaExhaustionAssessment ??= readQuotaExhausted(s.inspectCodexRotation, runProviderName);
     return cachedQuotaExhaustionAssessment;
   };
   const classifyUnfinishedRun = (stage: SelfImplementStage, verdict?: ReworkBudgetVerdict, decomposition?: TerminalDecomposition): AbandonedClassificationResult => {
@@ -5437,36 +5520,48 @@ async function runSelfImplementInner(
         const judgmentCallLLM = s.judgmentCallLLM;
         if (diagnosedDecision?.verdict !== 'CONTRACT-CONFLICT' && !judgmentCallLLM) throw new Error('rework-budget@v1 requires a judgment provider');
         const judgmentProvider = judgmentCallLLM ? createReworkBudgetJudgment(judgmentCallLLM) : undefined;
-        const result = diagnosedDecision?.verdict === 'CONTRACT-CONFLICT'
-          ? undefined
-          : await withStepTimeout(
-            runWorkflowToCompletion(
-              {
-                workflow: reworkBudgetWorkflow,
-                arguments: diagnosis,
-                artifactsDir: '',
-                persistRun: false,
-                judgmentContext: { kind: reworkKind, history: priorHistory },
-              },
-              {
-                callLLM: judgmentCallLLM!,
-                runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
-                runJudgment: judgmentProvider!,
-              },
-            ),
-            T.review,
-            'review',
-          );
-        if (result) {
-          const classified = result.outputs['rework-budget'];
-          if (!result.ok || !classified?.ok || typeof classified.output !== 'string') {
-            throw new Error(classified?.error ?? 'rework-budget@v1 judgment failed');
+        try {
+          const result = diagnosedDecision?.verdict === 'CONTRACT-CONFLICT'
+            ? undefined
+            : await withStepTimeout(
+              runWorkflowToCompletion(
+                {
+                  workflow: reworkBudgetWorkflow,
+                  arguments: diagnosis,
+                  artifactsDir: '',
+                  persistRun: false,
+                  judgmentContext: { kind: reworkKind, history: priorHistory },
+                },
+                {
+                  callLLM: judgmentCallLLM!,
+                  runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+                  runJudgment: judgmentProvider!,
+                },
+              ),
+              T.review,
+              'review',
+            );
+          if (result) {
+            const classified = result.outputs['rework-budget'];
+            if (!result.ok || !classified?.ok || typeof classified.output !== 'string') {
+              throw new Error(classified?.error ?? 'rework-budget@v1 judgment failed');
+            }
+            const picked = classified.output === 'EXTEND' || classified.output === 'SUFFICIENT' || classified.output === 'UNCONVERGEABLE'
+              ? classified.output
+              : undefined;
+            if (!picked) throw new Error(`rework-budget@v1 returned unsupported class '${String(classified.output)}'`);
+            parsedDecision = { verdict: picked, reason: diagnosedDecision?.reason ?? 'workflow-fabric classification' };
           }
-          const picked = classified.output === 'EXTEND' || classified.output === 'SUFFICIENT' || classified.output === 'UNCONVERGEABLE'
-            ? classified.output
+          consecutiveUnresolvedBudget = 0;
+        } catch (error) {
+          const message = safeErrorDescription(error);
+          if (!message.startsWith('rework-budget@v1 classification did not resolve a supported class')
+            && !message.startsWith('rework-budget@v1 returned unsupported class')) throw error;
+          consecutiveUnresolvedBudget++;
+          observe('rework-budget-unresolved-fallback', { round, error: message.slice(0, 200), consecutive: consecutiveUnresolvedBudget }, { level: 'warn' });
+          parsedDecision = consecutiveUnresolvedBudget >= 2
+            ? { verdict: 'UNCONVERGEABLE', reason: 'rework-budget classification unresolved ×2' }
             : undefined;
-          if (!picked) throw new Error(`rework-budget@v1 returned unsupported class '${String(classified.output)}'`);
-          parsedDecision = { verdict: picked, reason: diagnosedDecision?.reason ?? 'workflow-fabric classification' };
         }
         let fabricObservation: Record<string, unknown> | undefined;
         if (s.classifyCallLLM) {
@@ -5497,7 +5592,7 @@ async function runSelfImplementInner(
           selfImplementConfig.reworkBudget.maxRounds,
           reworkKind,
           priorHistory.length,
-          shadowStop,
+          consecutiveUnresolvedBudget >= 2 ? false : shadowStop,
           supervisorDecisionHistory.at(-1)?.verdict,
         );
         effectiveMax = budgetDecision.effectiveMax;
@@ -5699,7 +5794,10 @@ async function runSelfImplementInner(
         }
       } catch (error) {
         if (judgmentStarted) throw error;
+        consecutiveUnresolvedBudget = 0;
       }
+    } else if (round > 0) {
+      consecutiveUnresolvedBudget = 0;
     }
     if (round > effectiveMax) {
       finalizeSupervisorDeliveries('rework-round-limit');
@@ -6111,6 +6209,7 @@ async function runSelfImplementInner(
     progress('gated', !runsGate
       ? `gate 미실행 — 이 그래프(${graphTemplate.graphId})는 gate 노드를 갖지 않는다`
       : gate.passed ? 'gate 통과' : `gate 실패(라운드 ${round})`);
+    if (gate.passed) lastGateUnverifiedKey = undefined;
     if (!gate.passed) {
       const facts = gate.reflectGateFacts;
       const failureDisposition = decideGateFailureDisposition(facts);
@@ -6183,6 +6282,23 @@ async function runSelfImplementInner(
         const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate, salvageStatusExpected: false });
         return { ok: false, stage: 'gate-failed', node: 'rework', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
       }
+      // ⭐ 반복 열쇠 = 미검증 집합. 실패 시험 0건인데 직전 gate 실패와 «같은» 집합이면 재작업이 그 신호를 못 바꾼다
+      //   (run-7dd4cce6: 리뷰 지적 비교는 incomparable · 점수 1/3 · 예산 판정 EXTEND 로 헛돌았다).
+      if (isRepeatedUnverifiedOnlyGateFailure({ previousKey: lastGateUnverifiedKey, unverified: gate.unverified, gateLog: gate.log, ...(facts ? { introduced: facts.introduced } : {}) })) {
+        finalizeSupervisorDeliveries('gate-failed-unverified-repeat');
+        const unverifiedFiles = [...new Set(gate.unverified ?? [])].sort();
+        const reason = `gate failed twice in a row with no failing test and the same ${unverifiedFiles.length} unverified file(s); rework cannot change that signal — escalating without rework`;
+        observe('gate-failed-unverified-repeat-escalated', {
+          round,
+          unverified: unverifiedFiles.slice(0, 20),
+          unverifiedCount: unverifiedFiles.length,
+          reason,
+        }, { level: 'warn' });
+        progress('gate-failed', `중단 — 실패 시험 0건 · 같은 미검증 파일 ${unverifiedFiles.length}개가 되풀이(재작업으로 안 바뀐다 · 사람 판단 대기)`);
+        const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate, salvageStatusExpected: false });
+        return { ok: false, stage: 'gate-failed', node: 'rework', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+      }
+      lastGateUnverifiedKey = unverifiedRepeatKey(gate.unverified);
       round++;
       continue;
       }
@@ -6507,7 +6623,7 @@ async function runSelfImplementInner(
   const { latestSignalIncomplete } = signalIncompleteState(roundClassifications);
   const autoMerge = autoMergeEnabled(opts);
   const gateTimeoutUnmeasured = isTimeoutOnlyUnmeasuredGate(gate.reflectGateFacts);
-  const canAuto = !gateTimeoutUnmeasured && autoMerge && reviewReal && review!.verdict !== 'fail' && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
+  let canAuto = !gateTimeoutUnmeasured && autoMerge && reviewReal && review!.verdict !== 'fail' && reviewDiffComplete && !requiredEvidenceMissing && !latestSignalIncomplete && !decisionSignalRed;
   // ⭐⭐ 통과의 «이유»를 둘로 가른다 — ⛔ 막지는 «않는다»(대표 판단 2026-08-11: ⓐ 문면만).
   //   📏 근거(`JDG-T36` · merge-decision 300건 전수): `verifyByBreaking` 이 실린 8건의 auto 중 ***5건***이
   //     ***ran=true 인데 distinguishes=0***(아무것도 안 가르는 자기검증)이었고, 그 다섯이 «전부»
@@ -6518,7 +6634,7 @@ async function runSelfImplementInner(
   //     그건 `skippedReason` 이 이미 가른다. 그래서 여기 조건에 넣지 않는다.
   const verifyInconclusive = gate.verifyByBreaking?.ran === true && (gate.verifyByBreaking.distinguishes ?? 0) === 0;
   const verifyNothingAtBase = verifyInconclusive && (gate.verifyByBreaking?.missingAtBase ?? 0) > 0;
-  const mergeReason = canAuto ? (verifyNothingAtBase ? 'review-clean-verify-nothing-at-base' : verifyInconclusive ? 'review-clean-verify-inconclusive' : 'review-clean-armed')
+  let mergeReason = canAuto ? (verifyNothingAtBase ? 'review-clean-verify-nothing-at-base' : verifyInconclusive ? 'review-clean-verify-inconclusive' : 'review-clean-armed')
     : gateTimeoutUnmeasured ? GATE_TIMEOUT_UNMEASURED_MERGE_REASON
     : !autoMerge ? 'no-auto-flag'
       : requiredEvidenceMissing ? 'required-evidence-uncovered'
@@ -6528,9 +6644,9 @@ async function runSelfImplementInner(
           : review!.verdict === 'fail' ? 'review-must-fix'
             : review!.diffTruncated === true ? 'review-diff-truncated'
               : 'review-diff-budget-unknown';
-  const mergeSkipReason = canAuto ? undefined : mergeReason;
-  if (canAuto) onMergeApprovalReceived();
-  observe('merge-decision', {
+  let mergeSkipReason = canAuto ? undefined : mergeReason;
+  if (canAuto) onAutoMergeAuthorizedBeforeSync();
+  const mergeDecisionObservation = {
     autoMerge, reviewed: reviewReal, verdict: review?.verdict ?? 'none',
     decision: canAuto ? 'auto' : 'hitl', reason: mergeReason,
     ...mergeDecisionEvidenceCoverage(evidenceCoverage),
@@ -6552,8 +6668,15 @@ async function runSelfImplementInner(
     ...(gate.verifyByBreaking ? { verifyByBreaking: gate.verifyByBreaking } : {}),
     ...(decisionSignalPress ? { decisionSignalPress, decisionSignalBaselineOnly } : {}),
     ...(decisionSignalPressReason ? { decisionSignalPressReason } : {}),
-  });
+  };
+  const recordMergeDecision = () => {
+    observe('merge-decision', {
+      ...mergeDecisionObservation,
+      decision: canAuto ? 'auto' : 'hitl', reason: mergeReason,
+    });
+  };
   if (opts.completion === 'worktree-only' && !decisionSignalRed) {
+    recordMergeDecision();
     progress('worktree-completed', '✅ 작업 트리 완료 — PR 생성 없이 worktree 보존');
     observe('worktree-completed', { branch: wt.branch, hadApprover: !!s.approvePr });
     return {
@@ -6561,10 +6684,11 @@ async function runSelfImplementInner(
       detail: 'worktree-only completion: PR creation skipped',
     };
   }
-  const approved = canAuto ? true : (s.approvePr
+  let approved = canAuto ? true : (s.approvePr
     ? await s.approvePr({ branch: wt.branch, ...(gate.log ? { gateLog: gate.log } : {}), implSummary: impl.summary, ...(review ? { review } : {}) })
     : false);
   if (!approved) {
+    recordMergeDecision();
     observe('pr-declined', { branch: wt.branch, hadApprover: !!s.approvePr });
     return {
       ok: false, stage: 'pr-declined', node: 'open-pr', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), ...(mergeSkipReason ? { mergeReason: mergeSkipReason } : {}),
@@ -6585,6 +6709,9 @@ async function runSelfImplementInner(
         ...(resolvedTarget.error === undefined ? {} : { resolveError: resolvedTarget.error }),
       });
       progress('merge-conflict', '⚠️ 기본 브랜치 해석 실패 — 자동병합 차단(수동 정합 필요·HITL 결정)');
+      canAuto = false;
+      mergeReason = 'default-branch-unresolved';
+      recordMergeDecision();
       return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), detail: 'pre-PR main sync default-branch-unresolved' };
     }
     progress('gating', `최신 ${mergeTarget} 정합 (병렬 드리프트·LLM 충돌해결)…`);
@@ -6593,6 +6720,9 @@ async function runSelfImplementInner(
     observe('pre-pr-sync', mainSyncObservation(sync, mergeTarget, opts.base, wt.branch));
     if (sync.status === 'conflict-unresolved' || sync.status === 'error') {
       progress('merge-conflict', `⚠️ ${mergeTarget} 정합 ${sync.status}${sync.errorStep === undefined ? '' : ` (${sync.errorStep})`} — 자동병합 차단(수동 정합 필요·HITL 결정)`);
+      canAuto = false;
+      mergeReason = `main-sync-${sync.status}`;
+      recordMergeDecision();
       return { ok: false, stage: 'merge-conflict', node: 'main-sync', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), detail: `pre-PR main sync ${sync.status}` };
     }
     if (sync.status === 'llm-resolved' || sync.status === 'merged') {
@@ -6604,12 +6734,30 @@ async function runSelfImplementInner(
       const regate = await withStepTimeout(s.gate(wt.path, { runId, mode: 'postsync' }), T.gate, 'gate');
       // `mode` name/meaning stay: `full` = existing gate including tests. Both
       // conflict-resolved and clean-merge reuse this same `s.gate` invocation.
+      const timeoutOnlyPostSync = !regate.passed && postSyncTimeoutOnly(regate.reflectGateFacts);
       const postSyncPolicy = postSyncGatePolicy(
         regate.passed,
-        regate.reflectGateFacts?.childResponsibility,
+        regate.reflectGateFacts,
         sync.status,
       );
       observe('gate.postsync', postSyncGateObservation(regate, wt.branch, hasModuleLoadFailure, sync.status));
+      if (timeoutOnlyPostSync) {
+        const facts = regate.reflectGateFacts!;
+        observe('post-sync-gate-timeout-only-continued', {
+          introduced: facts.introduced, unknown: facts.unknown, timedOut: facts.timedOut ?? 0,
+        }, { level: 'warn' });
+        canAuto = false;
+        mergeReason = GATE_TIMEOUT_UNMEASURED_MERGE_REASON;
+        mergeSkipReason = mergeReason;
+        approved = s.approvePr
+          ? await s.approvePr({
+            branch: wt.branch,
+            gateLog: [regate.log, `post-sync gate timeout-only (introduced=${facts.introduced}, unknown=${facts.unknown}, timedOut=${facts.timedOut ?? 'unmeasured'}, flakyRerun=${facts.flakyRerun ?? 'unmeasured'}); merge reason: ${GATE_TIMEOUT_UNMEASURED_MERGE_REASON}`].filter(Boolean).join('\n'),
+            implSummary: impl.summary,
+            ...(review ? { review } : {}),
+          })
+          : false;
+      }
       if (postSyncPolicy.mustStop) {
         progress('gate-failed', sync.status === 'llm-resolved'
           ? '중단 — main 충돌해결 후 gate 실패(면책 보류·통합 깨짐)'
@@ -6619,16 +6767,27 @@ async function runSelfImplementInner(
           : sync.status === 'llm-resolved'
             ? 'gate failed after main-sync (conflict-resolved integration break)'
             : 'gate failed after main-sync (clean-merge integration break)';
+        canAuto = false;
+        mergeReason = 'post-sync-gate-failed';
+        recordMergeDecision();
         const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate: regate, salvageStatusExpected: false });
         return { ok: false, stage: 'gate-failed', node: 'regate', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate: regate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(review ? { review } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
       }
       if (!regate.passed) {
-        progress('gating', 'main 정합 후 gate 실패는 자식 책임 없음으로 면책 — 통합 깨짐으로 중단하지 않고 계속 진행');
+        progress('gating', timeoutOnlyPostSync
+          ? 'main 정합 후 gate 타임아웃만 — 사람 확인으로 진행'
+          : 'main 정합 후 gate 실패는 자식 책임 없음으로 면책 — 통합 깨짐으로 중단하지 않고 계속 진행');
       }
       gate = regate;
     }
   }
 
+  recordMergeDecision();
+  if (!approved) {
+    observe('pr-declined', { branch: wt.branch, hadApprover: !!s.approvePr });
+    return { ok: false, stage: 'pr-declined', node: 'open-pr', ...resolveRunOutcome({ termination: 'abandoned' }), ...decisionSignalResult, sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, detail: s.approvePr ? 'PR not approved' : 'no approvePr seam — fail-closed(자동승인 금지)' };
+  }
+  if (canAuto) onMergeApprovalReceived();
   const extractedOriginalAsk = extractVerbatimOriginalAsk(opts.feature);
   const { labels, declineReasons, eligibility } = resolveAutoReviewLabels(!!opts.autoReview, {
     objective: opts.feature,
@@ -6695,9 +6854,10 @@ async function runSelfImplementInner(
     ...(prEvidenceDecision.reason ? { reason: prEvidenceDecision.reason } : {}),
     ...(prEvidenceDecision.body ? { bodyChars: prEvidenceDecision.body.length } : {}),
   });
+  const releaseNote = harnessReleaseNote(goalDocumentForReleaseNote(opts.goalFile), prTitle(opts.feature));
   const preparedPrBody = preparePrBody(
     [
-      prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, declineReasons, harvestedForPr(), opts.goalFile, lastPlanRevision),
+      prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, declineReasons, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote),
       ...(prEvidenceDecision.body ? ['', '---', '', prEvidenceDecision.body] : []),
     ].join('\n'),
     s.persistPrBodyArtifact,
@@ -6790,6 +6950,19 @@ async function runSelfImplementInner(
     const m = await withStepTimeout(s.mergePr({ number: pr.number, cwd: wt.path, matchHeadCommit: checkedHeadCommit! }), T.pr, 'pr');
     observe('merged', { number: pr.number, merged: m.merged, detail: m.detail ?? null });
     if (m.merged) {
+      const directory = releaseNotesDir(elanousStateRoot());
+      const fragment: ReleaseNoteFragment = {
+        pr: pr.number,
+        ...releaseNote,
+        source: 'harness',
+        ...(m.mergeCommit ? { mergeSha: m.mergeCommit } : {}),
+      };
+      try {
+        writeReleaseNote(directory, fragment);
+      } catch (error) {
+        observe('release-note-write-failed', { number: pr.number, prUrl: pr.url, directory, fragment, error: safeErrorDescription(error) }, { level: 'error' });
+        throw new MergedReleaseNoteWriteError(pr.url, directory, fragment, error);
+      }
       const mergedBase = m.baseRefName?.trim() || observedPrBase;
       const defaultBranch = resolveDefaultBranchTarget(s.defaultBranchRef ?? defaultBranchRef, wt.path).target ?? undefined;
       progress('merged', formatAutoMergeSuccessMessage({ prNumber: pr.number, mergedBase, defaultBranch }));

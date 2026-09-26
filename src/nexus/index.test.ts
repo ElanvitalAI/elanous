@@ -2,7 +2,7 @@
 // is present. Executes buildNexusWsBridgeAuth — the unit runNexus uses
 // when assembling wsBridgeOpts (same shape as src/boot/acp-server.ts).
 
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -166,13 +166,79 @@ describe('runNexus · headless auto-mount share unmount on exit', () => {
     return { disableCalls, ...(mountedPort !== undefined ? { mountedPort } : {}) };
   }
 
-  test('serving auto-mount is walked on clean exit with that httpPort only', async () => {
-    const { disableCalls, mountedPort } = await runHeadlessShareLifecycle({
-      mount: { outcome: 'serving', url: 'https://mbp.tailnet.ts.net:31415/app/' },
+  test('serving auto-mount is revisited after 60 seconds by the default coordinator, then walked on clean exit', async () => {
+    let now = 0;
+    const intervals = new Map<ReturnType<typeof setInterval>, { callback: () => void; ms: number; next: number }>();
+    const intervalSpy = spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void, ms: number) => {
+      const timer = { unref: () => timer } as unknown as ReturnType<typeof setInterval>;
+      intervals.set(timer, { callback, ms, next: now + ms });
+      return timer;
+    }) as typeof setInterval);
+    const clearSpy = spyOn(globalThis, 'clearInterval').mockImplementation(((timer: ReturnType<typeof setInterval>) => {
+      intervals.delete(timer);
+    }) as typeof clearInterval);
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const mountPorts: number[] = [];
+    const disablePorts: number[] = [];
+    let shareTimer: ReturnType<typeof setInterval> | undefined;
+    const boot = runNexus({
+      headless: true,
+      skipHeadlessSetupCheckForTesting: true,
+      headlessDoneForTesting: done,
+      skipHttpServer: false,
+      skipSupervisor: true,
+      skipRuntimeApi: true,
+      autoMountShare: true,
+      mountShareIfEnabledFn: async ({ httpPort }) => {
+        mountPorts.push(httpPort);
+        return { outcome: 'serving', url: `https://host.tailnet.ts.net:${httpPort}/app/` };
+      },
+      pwaShareDisableFn: async ({ port } = {}) => {
+        if (port !== undefined) disablePorts.push(port);
+        return { exitCode: 0 };
+      },
     });
-    expect(disableCalls).toHaveLength(1);
-    expect(disableCalls[0]?.port).toBe(mountedPort);
-    expect(mountedPort).toBeGreaterThan(0);
+    try {
+      const deadline = Date.now() + 8_000;
+      while (!process.listeners('SIGINT').some((listener) => listener.name === 'onSigint') && Date.now() < deadline) {
+        await Bun.sleep(5);
+      }
+      expect(process.listeners('SIGINT').some((listener) => listener.name === 'onSigint')).toBe(true);
+      expect(mountPorts).toHaveLength(1);
+      expect(mountPorts[0]).toBeGreaterThan(0);
+      // Advance a virtual interval clock, not just a spy on an unrelated 60s timer.
+      const advance = async (ms: number): Promise<void> => {
+        const end = now + ms;
+        while (true) {
+          const next = Math.min(...[...intervals.values()].map((interval) => interval.next));
+          if (next > end) break;
+          now = next;
+          for (const [timer, interval] of intervals) {
+            if (interval.next !== now) continue;
+            interval.next += interval.ms;
+            const callsBefore = mountPorts.length;
+            interval.callback();
+            if (mountPorts.length > callsBefore) shareTimer = timer;
+          }
+          await Promise.resolve();
+        }
+        now = end;
+        await Promise.resolve();
+      };
+      await advance(59_999);
+      expect(mountPorts).toHaveLength(1);
+      await advance(1);
+      expect(mountPorts).toEqual([mountPorts[0], mountPorts[0]]);
+    } finally {
+      finish();
+      await boot;
+      clearSpy.mockRestore();
+      intervalSpy.mockRestore();
+    }
+    expect(disablePorts).toEqual([mountPorts[0]]);
+    expect(shareTimer).toBeDefined();
+    expect(intervals.has(shareTimer!)).toBe(false);
   });
 
   test('skipped auto-mount does not call pwaShareDisable on exit', async () => {
@@ -188,6 +254,136 @@ describe('runNexus · headless auto-mount share unmount on exit', () => {
     });
     expect(disableCalls).toHaveLength(0);
   });
+
+  test('a later reconciliation mounts the live port after boot was skipped', async () => {
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const mountPorts: number[] = [];
+    const disablePorts: number[] = [];
+    const boot = runNexus({
+      headless: true,
+      skipHeadlessSetupCheckForTesting: true,
+      headlessDoneForTesting: done,
+      skipSupervisor: true,
+      skipRuntimeApi: true,
+      skipHttpServer: false,
+      autoMountShare: true,
+      shareCoordinatorIntervalMsForTesting: 15,
+      mountShareIfEnabledFn: async ({ httpPort }) => {
+        mountPorts.push(httpPort);
+        return mountPorts.length === 1
+          ? { outcome: 'skipped', reason: 'tailscale-down' }
+          : { outcome: 'serving', url: `https://host.tailnet.ts.net:${httpPort}/app/` };
+      },
+      pwaShareDisableFn: async ({ port } = {}) => {
+        if (port !== undefined) disablePorts.push(port);
+        return { exitCode: 0 };
+      },
+    });
+    try {
+      const deadline = Date.now() + 8_000;
+      while (mountPorts.length < 2 && Date.now() < deadline) await Bun.sleep(5);
+      expect(mountPorts.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      finish();
+      await boot;
+    }
+    expect(disablePorts).toEqual([mountPorts[0]!]);
+  }, 15_000);
+
+  test('in-flight reconciliation completes before port unmount', async () => {
+    let finish!: () => void;
+    let mountStarted!: () => void;
+    let finishMount!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const started = new Promise<void>((resolve) => { mountStarted = resolve; });
+    const mountFinished = new Promise<void>((resolve) => { finishMount = resolve; });
+    const mountPorts: number[] = [];
+    const disablePorts: number[] = [];
+    const boot = runNexus({
+      headless: true,
+      skipHeadlessSetupCheckForTesting: true,
+      skipSupervisor: true,
+      skipRuntimeApi: true,
+      autoMountShare: true,
+      shareCoordinatorIntervalMsForTesting: 15,
+      mountShareIfEnabledFn: async ({ httpPort }) => {
+        mountPorts.push(httpPort);
+        if (mountPorts.length === 2) {
+          mountStarted();
+          await mountFinished;
+        }
+        return { outcome: 'serving', url: 'https://host.tailnet.ts.net/app/' };
+      },
+      pwaShareDisableFn: async ({ port } = {}) => {
+        if (port !== undefined) disablePorts.push(port);
+        return { exitCode: 0 };
+      },
+      headlessDoneForTesting: done,
+      skipHttpServer: false,
+    });
+    try {
+      await started;
+      finish();
+      await Bun.sleep(20);
+      expect(disablePorts).toHaveLength(0);
+      finishMount();
+      await boot;
+      expect(disablePorts).toEqual([mountPorts[0]!]);
+    } finally {
+      finishMount();
+      finish();
+      await boot;
+    }
+  });
+
+  test('boot-mounted share is reconciled on the configured cadence, and shutdown clears the timer without changing per-port unmount', async () => {
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const mountPorts: number[] = [];
+    const disablePorts: number[] = [];
+    const intervalSpy = spyOn(globalThis, 'setInterval');
+    const clearIntervalSpy = spyOn(globalThis, 'clearInterval');
+    const boot = runNexus({
+      headless: true,
+      skipHeadlessSetupCheckForTesting: true,
+      headlessDoneForTesting: done,
+      skipHttpServer: false,
+      skipSupervisor: true,
+      skipRuntimeApi: true,
+      autoMountShare: true,
+      shareCoordinatorIntervalMsForTesting: 15,
+      mountShareIfEnabledFn: async ({ httpPort }) => {
+        mountPorts.push(httpPort);
+        return { outcome: 'serving', url: `https://host.tailnet.ts.net:${httpPort}/app/` };
+      },
+      pwaShareDisableFn: async ({ port } = {}) => {
+        if (port !== undefined) disablePorts.push(port);
+        return { exitCode: 0 };
+      },
+    });
+    try {
+      const deadline = Date.now() + 8_000;
+      while (mountPorts.length < 2 && Date.now() < deadline) await Bun.sleep(5);
+      expect(mountPorts.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      finish();
+      await boot;
+    }
+    try {
+      const shareTimer = intervalSpy.mock.results.find((_result, index) =>
+        intervalSpy.mock.calls[index]?.[1] === 15)?.value;
+      expect(shareTimer).toBeDefined();
+      expect(clearIntervalSpy.mock.calls.some(([timer]) => timer === shareTimer)).toBe(true);
+    } finally {
+      clearIntervalSpy.mockRestore();
+      intervalSpy.mockRestore();
+    }
+    expect(disablePorts).toEqual([mountPorts[0]!]);
+    const callsAfterExit = mountPorts.length;
+    await Bun.sleep(50);
+    expect(mountPorts).toHaveLength(callsAfterExit);
+  }, 15_000);
 
   test('pwaShareDisable failure is announced and does not block clean exit', async () => {
     const { disableCalls } = await runHeadlessShareLifecycle({
@@ -243,6 +439,7 @@ describe('runNexus · fallback signal share unmount', () => {
     disable?: (deps: PwaShareDeps) => Promise<PwaShareResult>;
   }): Promise<{ disableCalls: PwaShareDeps[]; mountedPort?: number; completed: boolean; exitCodes: number[] }> {
     const disableCalls: PwaShareDeps[] = [];
+    const mountPorts: number[] = [];
     const exitCodes: number[] = [];
     let mountedPort: number | undefined;
     let observed!: () => void;
@@ -251,8 +448,6 @@ describe('runNexus · fallback signal share unmount', () => {
       exitCodes.push(code ?? 0);
       return undefined as never;
     }) as typeof process.exit;
-    const sigtermBefore = process.listenerCount('SIGTERM');
-    const sigintBefore = process.listenerCount('SIGINT');
     const boot = runNexus({
       headless: false,
       autoMountShare: true,
@@ -270,7 +465,9 @@ describe('runNexus · fallback signal share unmount', () => {
       registerDaemonTab: false,
       registerSettingsTab: false,
       mcpEnabled: false,
+      shareCoordinatorIntervalMsForTesting: 15,
       mountShareIfEnabledFn: async ({ httpPort }) => {
+        mountPorts.push(httpPort);
         mountedPort = httpPort;
         observed();
         return args.mount;
@@ -283,16 +480,19 @@ describe('runNexus · fallback signal share unmount', () => {
     });
     await mounted;
     await waitFor(
-      () => args.signal === 'SIGTERM'
-        ? process.listenerCount('SIGTERM') > sigtermBefore
-        : process.listenerCount('SIGINT') > sigintBefore,
+      () => process.listeners(args.signal).some((listener) => listener.name === (args.signal === 'SIGTERM' ? 'onSigterm' : 'onSigint')),
       `${args.signal} handler`,
     );
-    const previous = args.signal === 'SIGTERM' ? previousSigterm : previousSigint;
-    const added = process.listeners(args.signal).filter((listener) => !previous.includes(listener as (...args: unknown[]) => void));
-    expect(added.length).toBeGreaterThan(0);
-    for (const listener of added) (listener as () => void)();
+    await waitFor(() => mountPorts.length >= 2, 'share reconciliation tick');
+    const nexusSignalHandler = process.listeners(args.signal).find((listener) =>
+      listener.name === (args.signal === 'SIGTERM' ? 'onSigterm' : 'onSigint'));
+    expect(nexusSignalHandler).toBeDefined();
+    (nexusSignalHandler as () => void)();
     await boot;
+    const callsAfterExit = mountPorts.length;
+    await Bun.sleep(50);
+    expect(mountPorts).toHaveLength(callsAfterExit);
+    expect(process.listeners(args.signal)).not.toContain(nexusSignalHandler);
     return {
       disableCalls,
       completed: true,

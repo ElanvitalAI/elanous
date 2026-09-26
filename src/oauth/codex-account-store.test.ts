@@ -9,6 +9,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeAvailabilityState, writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
+import { debug } from '../debug/log.js';
 import { saveTokens } from './store.js';
 import {
   _resetCodexRotationPinForTesting,
@@ -58,6 +59,57 @@ function stripStoredHome(storePath: string, storeKey: string): void {
   delete parsed.providers[storeKey]?.codexHome;
   writeFileSync(storePath, `${JSON.stringify(parsed, null, 2)}\n`);
 }
+
+describe('회전 임계 관측 — 설정에서 판정까지', () => {
+  test('inspect는 계정별 실효 임계와 상태를 내고 로그를 남기지 않으며 실행은 계정마다 기록한다', () => {
+    const root = isolatedRoot('codex-threshold-observation-');
+    const defaultHome = join(root, 'default-home');
+    const teamHome = join(root, 'team-home');
+    const thirdHome = join(root, 'third-home');
+    for (const home of [defaultHome, teamHome, thirdHome]) mkdirSync(home, { recursive: true });
+    process.env.CODEX_HOME = defaultHome;
+    const store = join(root, 'auth.json');
+    saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: defaultHome }, store);
+    saveTokens('openai-codex:team', tokens(), { mirrorCodex: false, codexHome: teamHome }, store);
+    saveTokens('openai-codex:third', tokens(), { mirrorCodex: false, codexHome: thirdHome }, store);
+    writeQuotaSignal(undefined, 70, defaultHome);
+    writeQuotaSignal(undefined, 80, teamHome);
+    writeQuotaSignal(undefined, 85, thirdHome);
+    _setRotationConfigReaderForTesting(() => ({ llm: {
+      codexAccountRotationThresholdPercent: 90,
+      codexAccountRotationThresholdPercentByAccount: { default: 75, team: 80, third: 0 },
+    } }));
+    const originalLog = debug.log;
+    const recorded: Record<string, unknown>[] = [];
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data: Record<string, unknown>) => {
+      if (category === 'oauth.codex-account' && event === 'rotation-account-threshold') recorded.push(data);
+    }) as typeof debug.log;
+    try {
+      const first = inspectCodexRotation({ CODEX_HOME: defaultHome }, { storePath: store });
+      expect(first.reason).toBe('not-reached');
+      expect(first.thresholdPercent).toBe(75);
+      expect(first.accountThresholds).toEqual([
+        { name: 'default', thresholdPercent: 75, source: 'account-override', status: 'below-threshold', usedPercent: 70 },
+        { name: 'team', thresholdPercent: 80, source: 'account-override', status: 'threshold-reached', usedPercent: 80 },
+        { name: 'third', thresholdPercent: 90, source: 'global', status: 'below-threshold', usedPercent: 85 },
+      ]);
+      expect(recorded).toHaveLength(0);
+      writeQuotaSignal(undefined, 75, defaultHome);
+      const inspected = inspectCodexRotation({ CODEX_HOME: defaultHome }, { storePath: store });
+      expect(inspected.reason).toBe('reset-credit-unknown');
+      expect(inspected.to).toBe('third');
+      expect(recorded).toHaveLength(0);
+      expect(resolveCodexAccountForRun({ CODEX_HOME: defaultHome }, { storePath: store }).name).toBe('third');
+      expect(recorded).toEqual([
+        { name: 'default', thresholdPercent: 75, source: 'account-override', status: 'threshold-reached', usedPercent: 75 },
+        { name: 'team', thresholdPercent: 80, source: 'account-override', status: 'threshold-reached', usedPercent: 80 },
+        { name: 'third', thresholdPercent: 90, source: 'global', status: 'below-threshold', usedPercent: 85 },
+      ]);
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+    }
+  });
+});
 
 describe('usageSnapshotForStore — 홈이 기록되지 않은 기본 계정', () => {
   test('ⓐ 기본 계정의 usedPercent·resetCreditAvailability 가 미지가 아니다', () => {

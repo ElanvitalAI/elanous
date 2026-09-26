@@ -9,6 +9,7 @@ type IntervalCallback = () => void;
 const require = createRequire(import.meta.url);
 const react = require('react') as {
   createElement: (type: unknown, props?: unknown, ...children: unknown[]) => unknown;
+  Fragment: unknown;
   __CLIENT_INTERNALS_DO_NOT_USE_OR_WARN_USERS_THEY_CANNOT_UPGRADE?: { H: unknown };
 };
 const harness = createReactHookHarness(react);
@@ -16,6 +17,13 @@ const listeners = new Set<StateListener>();
 let now = 0;
 let nextIntervalId = 1;
 const intervals = new Map<number, IntervalCallback>();
+let onTerminalData: ((data: string) => void) | undefined;
+let sendInput: (data: string, sessionId: string) => Promise<unknown> = async () => ({});
+let onAcpSession: ((sessionId: string) => void) | undefined;
+let capabilityResponse = '';
+const terminals: Terminal[] = [];
+const logs: Array<{ event: string; details: unknown }> = [];
+let sends: string[] = [];
 
 Object.defineProperty(globalThis, 'window', {
   value: {
@@ -37,17 +45,23 @@ const element = (type: unknown, props?: Record<string, unknown>) => {
   return react.createElement(type, props);
 };
 
-mock.module('react/jsx-dev-runtime', () => ({ jsxDEV: element }));
-mock.module('react/jsx-runtime', () => ({ jsx: element, jsxs: element }));
+mock.module('react/jsx-dev-runtime', () => ({ jsxDEV: element, Fragment: react.Fragment }));
+mock.module('react/jsx-runtime', () => ({ jsx: element, jsxs: element, Fragment: react.Fragment }));
 
 class Terminal {
+  constructor() { terminals.push(this); }
+  clearCount = 0;
+  clear(): void { this.clearCount += 1; }
   cols = 80;
   rows = 24;
   unicode = { activeVersion: '' };
   loadAddon(): void {}
   open(): void {}
   write(): void {}
-  onData(): { dispose(): void } { return { dispose() {} }; }
+  onData(callback: (data: string) => void): { dispose(): void } {
+    onTerminalData = callback;
+    return { dispose() { onTerminalData = undefined; } };
+  }
   onResize(): { dispose(): void } { return { dispose() {} }; }
   dispose(): void {}
 }
@@ -57,12 +71,12 @@ mock.module('@xterm/addon-fit', () => ({ FitAddon: class { fit(): void {} } }));
 mock.module('@xterm/addon-web-links', () => ({ WebLinksAddon: class {} }));
 mock.module('@xterm/addon-unicode11', () => ({ Unicode11Addon: class {} }));
 mock.module('@xterm/addon-serialize', () => ({ SerializeAddon: class { serialize(): string { return ''; } } }));
-mock.module('@/lib/debug', () => ({ debugLog: () => {} }));
+mock.module('@/lib/debug', () => ({ debugLog: (event: string, details: unknown) => { logs.push({ event, details }); } }));
 mock.module('@/lib/elanous-term-envelope', () => ({ parseElanousTermEnvelope: () => null }));
 mock.module('@/lib/peer-id', () => ({ getPeerId: () => 'peer' }));
 mock.module('@/lib/snapshot', () => ({ loadSnapshot: () => null, saveSnapshot: () => {}, snapshotKey: () => 'snapshot' }));
 mock.module('@/lib/xterm-resize-controller', () => ({ createXtermResizeController: () => ({ dispose: () => {} }) }));
-mock.module('@/lib/xterm-capability-filter', () => ({ isXtermCapabilityResponse: () => false }));
+mock.module('@/lib/xterm-capability-filter', () => ({ isXtermCapabilityResponse: (data: string) => data === capabilityResponse }));
 
 const acp = {
   ready: Promise.resolve('s1'),
@@ -71,17 +85,26 @@ const acp = {
     listeners.add(listener);
     return () => listeners.delete(listener);
   },
-  send: () => Promise.resolve({}),
+  send: (method: string, params: unknown) => {
+    sends.push(method);
+    if (method !== 'terminal/input') return Promise.resolve({});
+    const { data, sessionId } = params as { data: string; sessionId: string };
+    return sendInput(data, sessionId);
+  },
   close: () => {},
 };
 
 const daemon = {
-  client: { connectAcp: () => acp },
+  client: { connectAcp: (options: { onSession: (sessionId: string) => void }) => {
+    onAcpSession = options.onSession;
+    return acp;
+  } },
   config: { baseUrl: 'http://127.0.0.1:4242' },
   setSessionId: () => {},
 };
 
-mock.module('@/components/providers/DaemonProvider', () => ({ useDaemon: () => daemon }));
+const actualDaemonProvider = { ...(await import('@/components/providers/DaemonProvider')) };
+mock.module('@/components/providers/DaemonProvider', () => ({ ...actualDaemonProvider, useDaemon: () => daemon }));
 
 const { XtermView } = await import('./XtermView');
 
@@ -112,8 +135,8 @@ function liveTextOf(value: unknown): string {
   return children.map(liveTextOf).find(Boolean) ?? '';
 }
 
-function render(terminalId = 't1'): unknown {
-  harness.render(() => XtermView({ sessionId: 's1', terminalId }));
+function render(terminalId = 't1', clearRequest = 0): unknown {
+  harness.render(() => XtermView({ sessionId: 's1', terminalId, clearRequest }));
   return harness.find((element) => element.type === 'div' && element.props.className === 'relative h-full w-full bg-[#0d0c08]');
 }
 
@@ -127,7 +150,44 @@ function resetState(): void {
   listeners.clear();
   intervals.clear();
   now = 0;
+  onTerminalData = undefined;
+  onAcpSession = undefined;
+  sendInput = async () => ({});
+  capabilityResponse = '';
+  terminals.length = 0;
+  logs.length = 0;
+  sends = [];
 }
+
+describe('XtermView local clear', () => {
+  test('clears only its xterm once per changed request and never sends shell input', async () => {
+    if (!process.env.ELANOUS_XTERM_CLEAR_ISOLATED) {
+      const run = Bun.spawnSync(['bun', 'test', import.meta.path, '-t', 'clears only its xterm once per changed request and never sends shell input'], {
+        cwd: process.cwd(),
+        env: { ...process.env, ELANOUS_XTERM_CLEAR_ISOLATED: '1' },
+        stdout: 'pipe', stderr: 'pipe',
+      });
+      expect(new TextDecoder().decode(run.stderr)).toContain('1 pass');
+      expect(run.exitCode).toBe(0);
+      return;
+    }
+    resetState();
+    render('terminal-a', 0);
+    await harness.settle();
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]!.clearCount).toBe(0);
+    sends = [];
+    render('terminal-a', 1);
+    expect(terminals[0]!.clearCount).toBe(1);
+    expect(logs.filter(({ event }) => event === 'webterm.controls.clear.applied')).toEqual([
+      { event: 'webterm.controls.clear.applied', details: { terminalId: 'terminal-a' } },
+    ]);
+    render('terminal-a', 1);
+    expect(terminals[0]!.clearCount).toBe(1);
+    expect(sends).toEqual([]);
+    harness.unmount();
+  });
+});
 
 describe('XtermView ACP status surface', () => {
   test('shows deterministic connecting duration, target, and daemon address, then hides them after opening', () => {
@@ -174,6 +234,60 @@ describe('XtermView ACP status surface', () => {
     cleanup();
     expect(listeners.size).toBe(0);
     expect(intervals.size).toBe(0);
+  });
+
+  test('swallows capability responses but forwards ordinary input', async () => {
+    resetState();
+    const sent: string[] = [];
+    capabilityResponse = 'capability-response';
+    sendInput = async (data) => { sent.push(data); return {}; };
+    const cleanup = mount('terminal-a');
+    await harness.settle();
+    onTerminalData?.(capabilityResponse);
+    onTerminalData?.('ordinary');
+    await harness.settle();
+    expect(sent).toEqual(['ordinary']);
+    cleanup();
+  });
+
+  test('forwards later input with the session announced by ACP onSession', async () => {
+    resetState();
+    const sent: Array<{ data: string; sessionId: string }> = [];
+    sendInput = async (data, sessionId) => { sent.push({ data, sessionId }); return {}; };
+    const cleanup = mount('terminal-a');
+    await harness.settle();
+    onAcpSession?.('new-session');
+    onTerminalData?.('after-session');
+    await harness.settle();
+    onAcpSession?.('s1');
+    onTerminalData?.('back-to-initial');
+    await harness.settle();
+    expect(sent).toEqual([
+      { data: 'after-session', sessionId: 'new-session' },
+      { data: 'back-to-initial', sessionId: 's1' },
+    ]);
+    cleanup();
+  });
+
+  test('shows discarded input as an alert and accepts later input', async () => {
+    resetState();
+    const sent: string[] = [];
+    sendInput = async (data) => {
+      sent.push(data);
+      if (data === 'lost') throw new Error('offline');
+      return {};
+    };
+    const cleanup = mount('terminal-a');
+    await harness.settle();
+    onTerminalData?.('lost');
+    await harness.settle();
+    const alert = harness.find((element) => element.props.role === 'alert');
+    expect(harness.textOf(alert)).toContain('4바이트가 버려졌습니다');
+    onTerminalData?.('later');
+    await harness.settle();
+    expect(sent).toEqual(['lost', 'later']);
+    expect(harness.textOf(harness.find((element) => element.props.role === 'alert'))).toContain('버려졌습니다');
+    cleanup();
   });
 
   test('renders a replacement terminal as connecting before its replacement effects run', () => {

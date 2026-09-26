@@ -457,12 +457,41 @@ interface TerminalsListDeps extends TerminalManifestScopeDeps {
   /** 원격 logs.db 는 읽기 전용으로만 열어 연합한다. */
   openLogStoreReadOnly?(dbPath: string): Pick<LogStore, 'query' | 'close'>;
   queryRunningRuns?(options: { includeTest?: boolean }): RunningRunsResult;
+  /** Clock for the running-runs cache. Tests advance this instead of waiting out the TTL. */
+  now?(): number;
   runTerminated?(runId: string, options: { includeTest: boolean }): RunTermination;
 }
 
 const SUB_AGENT_COUNT_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const TERMINALS_SCOPE_DOMAIN = '이 표면의 terminals 목록은 실체 PTY만 봅니다. 로그에서 수집한 PTY 없는 Agent 서브 에이전트는 subjects와 scope 집계에만 반영됩니다.';
 const TERMINALS_SCOPE_SUB_AGENT_COUNT = '최근 24시간 현재 범위의 로그 스토어에서 센 PTY 없이 실행된 서브 에이전트';
+
+/**
+ * Process-wide single-flight cache. Two GET /v1/terminals calls with the same
+ * includeTest inside the TTL share one queryRunningRuns result. A different
+ * injector (tests) gets its own cache so one suite cannot poison another.
+ */
+interface RunningRunsCacheBinding {
+  cache: (options: { includeTest?: boolean }) => CachedRunningRuns;
+  now: () => number;
+}
+
+const runningRunsCaches = new WeakMap<object, RunningRunsCacheBinding>();
+
+function runningRunsCacheFor(
+  injector: (options: { includeTest?: boolean }) => RunningRunsResult,
+  now: () => number,
+): (options: { includeTest?: boolean }) => CachedRunningRuns {
+  const existing = runningRunsCaches.get(injector);
+  if (existing) {
+    existing.now = now;
+    return existing.cache;
+  }
+  const binding: RunningRunsCacheBinding = { cache: () => { throw new Error('uninitialized'); }, now };
+  binding.cache = createRunningRunsCache({ now: () => binding.now(), queryRunningRuns: injector });
+  runningRunsCaches.set(injector, binding);
+  return binding.cache;
+}
 
 const liveTerminalsListDeps: TerminalsListDeps = {
   ptyManifestTargets,
@@ -565,6 +594,67 @@ export type SubjectRunningRunsSummary = Pick<Record<RunningRunStatus, number>, '
   /** The only assessments included in this execution count; ended and unknown remain row-level evidence. */
   countedStatuses: readonly ['running', 'probable-running'];
 };
+
+/** Short TTL so a polling terminal list does not re-read every ledger on every request. */
+export const RUNNING_RUNS_CACHE_TTL_MS = 15_000;
+
+export interface CachedRunningRuns {
+  readonly result: RunningRunsResult;
+  /** Milliseconds since this result was computed. 0 on a fresh computation. */
+  readonly ageMs: number;
+}
+
+export interface RunningRunsCacheDeps {
+  now(): number;
+  queryRunningRuns(options: { includeTest?: boolean }): RunningRunsResult;
+}
+
+/**
+ * One computation at a time per includeTest.
+ *
+ * The list handler is synchronous, so two requests overlap only when the
+ * second enters while the injector is still on the stack. That re-entrant
+ * call shares the in-flight result and does not call the injector again.
+ * A later call inside the TTL returns the stored result and its age.
+ * A failed computation is not stored. Which runs are running is unchanged.
+ */
+export function createRunningRunsCache(
+  deps: RunningRunsCacheDeps,
+  ttlMs: number = RUNNING_RUNS_CACHE_TTL_MS,
+): (options: { includeTest?: boolean }) => CachedRunningRuns {
+  const slots = new Map<boolean, { at: number; result: RunningRunsResult }>();
+  const flights = new Set<boolean>();
+  return (options) => {
+    const includeTest = options.includeTest === true;
+    const now = deps.now();
+    const cached = slots.get(includeTest);
+    if (flights.has(includeTest)) {
+      // Same includeTest is already on this stack. Return the one result
+      // the owner publishes into the slot; never call the injector again.
+      if (cached) return { result: cached.result, ageMs: 0 };
+      const shared = {} as RunningRunsResult;
+      slots.set(includeTest, { at: now, result: shared });
+      return { result: shared, ageMs: 0 };
+    }
+    if (cached && now - cached.at < ttlMs) {
+      return { result: cached.result, ageMs: now - cached.at };
+    }
+    flights.add(includeTest);
+    try {
+      const computed = deps.queryRunningRuns({ includeTest });
+      const slot = slots.get(includeTest);
+      const result = slot?.result ?? computed;
+      if (slot) Object.assign(slot.result, computed);
+      else slots.set(includeTest, { at: now, result });
+      return { result, ageMs: 0 };
+    } catch (error) {
+      slots.delete(includeTest);
+      throw error;
+    } finally {
+      flights.delete(includeTest);
+    }
+  };
+}
 
 export function summarizeSubjectRunningRuns(subjects: readonly SubjectSummary[]): SubjectRunningRunsSummary {
   const counts: SubjectRunningRunsSummary = { running: 0, 'probable-running': 0, countedStatuses: ['running', 'probable-running'] };
@@ -969,8 +1059,18 @@ export function handleTerminalsList(req: Request, opts: MetaApiOpts, deps: Termi
   const resolveRunTerminationForRow = (runId: string): RunTermination => deps.runTerminated
     ? deps.runTerminated(runId, { includeTest })
     : 'ledger-indeterminate';
+  const runningRunsCache = runningRunsCacheFor(getRunningRuns, deps.now ?? Date.now);
   let runningRuns: RunningRunsResult | null = null;
-  try { runningRuns = getRunningRuns({ includeTest }); } catch { /* fail-soft: preserve terminal inspection */ }
+  let runningRunsAgeMs = 0;
+  let runningRunsQueryFailed = false;
+  try {
+    const cached = runningRunsCache({ includeTest });
+    runningRuns = cached.result;
+    runningRunsAgeMs = cached.ageMs;
+  } catch {
+    // Fail-soft and do not cache: subjects keep unknown assessments.
+    runningRunsQueryFailed = true;
+  }
   const ptyLessSubAgentCollection = collectPtyLessSubAgents(
     getLogStore,
     federated,
@@ -1013,7 +1113,7 @@ export function handleTerminalsList(req: Request, opts: MetaApiOpts, deps: Termi
     // 웹 터미널은 목록에만 합치며, 동명 ID가 PTY 가시성·scope 집계를 바꾸면 안 된다.
     const visibleIds = new Set(ptyTerminals.map((terminal) => terminal.id));
     const hiddenDead = manifestBeforeCleanup.filter((row) => !visibleIds.has(row.id)).length;
-    return jsonResponse({ terminals, subjects, runningRuns: summarizeSubjectRunningRuns(subjects), scope: terminalsScope(1, false, hiddenDead, hiddenSubAgentRuns) }, 200);
+    return jsonResponse({ terminals, subjects, runningRuns: summarizeSubjectRunningRuns(subjects), runningRunsAgeMs: runningRunsQueryFailed ? null : runningRunsAgeMs, scope: terminalsScope(1, false, hiddenDead, hiddenSubAgentRuns) }, 200);
   }
 
   const { currentDbPath, targets } = scope;
@@ -1044,7 +1144,7 @@ export function handleTerminalsList(req: Request, opts: MetaApiOpts, deps: Termi
   // log-derived agent summaries continue to feed subjects and scope independently.
   const terminals = mergeWebPreviewTerminals(ptyTerminals);
   const subjects = enrichSubjectRunAssessments(deriveSubjectSummaries(ptyTerminals, ptyLessSubAgents), runningRuns);
-  return jsonResponse({ terminals, subjects, runningRuns: summarizeSubjectRunningRuns(subjects), scope: terminalsScope(targets.length, true, hiddenDead, hiddenSubAgentRuns) }, 200);
+  return jsonResponse({ terminals, subjects, runningRuns: summarizeSubjectRunningRuns(subjects), runningRunsAgeMs: runningRunsQueryFailed ? null : runningRunsAgeMs, scope: terminalsScope(targets.length, true, hiddenDead, hiddenSubAgentRuns) }, 200);
 }
 
 export interface TerminalPruneDeps extends TerminalManifestScopeDeps {

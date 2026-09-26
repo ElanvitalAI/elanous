@@ -1941,6 +1941,22 @@ describe('triageRun — 실패를 «다음 행동»으로 옮긴다', () => {
     } as never)).toBe('unclassified');
   });
 
+  test('run-deadline-exceeded 는 transient 가 아니다 — 브랜치/PR 이면 수확, 없으면 재분해', () => {
+    const base = {
+      status: 'failed',
+      stage: 'aborted',
+      error: { code: 'pod-deadline-exceeded', message: 'Job si 이 수명 상한 10800초에 닿았다' },
+      failureClassification: 'run-deadline-exceeded',
+    } as const;
+    expect(classifyFailure({ ...base, taskId: 'bare', feature: 'bare' } as never)).toBe('unconverged-decomposable');
+    expect(triageActionFor('unconverged-decomposable')).toBe('decompose-and-retry');
+    for (const extra of [{ branch: 'si/deadline' }, { prUrl: 'https://github.com/o/r/pull/3' }, { prNumber: 3 }]) {
+      expect(classifyFailure({ ...base, taskId: 'kept', feature: 'kept', ...extra } as never)).toBe('false-failure');
+    }
+    expect(triageActionFor('false-failure')).toBe('no-action');
+    expect(classifyFailure({ ...base, taskId: 'quota', feature: 'quota', failureClassification: 'quota-exhausted' } as never)).toBe('transient');
+  });
+
   test('자식 disposition의 failureClassification은 buildResults를 거쳐 트리아지 입력으로 전달된다', async () => {
     const records: LogRecord[] = [];
     const off = debug.registerSink({

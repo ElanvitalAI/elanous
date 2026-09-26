@@ -1,9 +1,8 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, normalize } from 'node:path/posix';
 import type { GoalType } from './goal-author.js';
-import { graphAuthoritativeConfigValue, type UserConfig } from '../user-config.js';
+import type { UserConfig } from '../user-config.js';
 import ts from 'typescript';
-import { resolveRunControl } from './run-controls.js';
 import {
   GRAPH_SPECS,
   GRAPH_TEMPLATES,
@@ -19,50 +18,37 @@ import { applyGraphOverlays, selectOverlays, type GraphOverlaySpec, type Overlay
 import type { OverlayPatch } from './graph-overlay.js';
 import type { GraphTemplateSpec } from './graph-yaml.js';
 
-/** ⭐ RFC §5 «1단계 승격» — 선언을 «실행 권위»로 올리는 스위치.
- *
- *  ⭐ **실행 기본은 user-config adapter에서 켜짐**이다. 명시로 끈 상태에서는 종전과
- *    «같은» 걸음이어야 한다 — 그것이 이 모듈의 첫째 반증이다.
- *
- *  ⛔ **「아무도 정하지 않았다」와 「명시로 켰다/껐다」를 가른다** — `source` 가 그 축이다.
- *    (`observeOnlySource` 의 선례를 그대로 따른다: 그것을 안 갈라서 측정이 한 번 무효가 됐다.) */
-export type GraphAuthoritySource = 'flag' | 'config' | 'default';
+/** 2026-09-26 설정 졸업 — 그래프 권위는 항상 켬. 관측 출처는 default로 고정한다. */
+export type GraphAuthoritySource = 'default';
 
 export interface GraphAuthority {
   readonly enabled: boolean;
   readonly source: GraphAuthoritySource;
 }
 
-/** 플래그 → config → 범용 run-control 기본 순으로 해석한다. 실행 기본은 user-config adapter가 공급한다. */
-export function resolveGraphAuthority(input: {
+/** 옛 호출자의 입력은 해석하지 않는다. 권위는 항상 켜져 있다. */
+export function resolveGraphAuthority(_input: {
   readonly flag?: boolean | undefined;
   readonly config?: boolean | undefined;
-}): GraphAuthority {
-  const resolved = resolveRunControl('graph', {
-    ...(input.flag === undefined ? {} : { flag: { graph: input.flag } }),
-    ...(input.config === undefined ? {} : { config: { graph: input.config } }),
-  });
-  return { enabled: resolved.value as boolean, source: resolved.source === 'prefix' ? 'flag' : resolved.source };
+} = {}): GraphAuthority {
+  return { enabled: true, source: 'default' };
 }
 
 export function resolveGraphAuthorityForUserConfig(
-  config: UserConfig,
-  flag?: boolean,
+  _config?: UserConfig,
+  _flag?: boolean,
 ): GraphAuthority {
-  const graphConfig = graphAuthoritativeConfigValue(config);
-  if (flag !== undefined) return resolveGraphAuthority({ flag, ...(graphConfig === undefined ? {} : { config: graphConfig }) });
-  if (graphConfig !== undefined) return resolveGraphAuthority({ config: graphConfig });
-  return { enabled: config.tools.selfImplement.graphAuthoritative, source: 'default' };
+  return { enabled: true, source: 'default' };
 }
 
-/** 이 런이 실제로 따를 템플릿. ⛔ 꺼져 있으면 «언제나» implement-loop 다(골 종류와 무관하게). */
+/** 이 런이 실제로 따를 템플릿. 기존 비권위 입력을 직접 주입한 호출은 구현 루프로 폴백한다. */
 export function activeTemplate(goalType: GoalType | undefined, authority: GraphAuthority): GraphTemplate {
   const implementLoop = GRAPH_TEMPLATES['self-implement'] as GraphTemplate;
   if (!authority.enabled) return implementLoop;
   return templateForGoalType(goalType) ?? implementLoop;
 }
 
-/** 앞단 관측의 구현 골 정체성. 권위 스위치 상태와 무관하게 implement의 활성 템플릿을 사용한다. */
+/** 앞단 관측의 구현 골 정체성. implement의 활성 템플릿을 사용한다. */
 export function activeImplementTemplate(): GraphTemplate {
   return activeTemplate('implement', resolveGraphAuthority({}));
 }
@@ -292,8 +278,7 @@ export function graphAuthorityFields(authority: GraphAuthority, template: GraphT
  *    목적지 목록으로 접어 버려서 패치 포인터가 가리킬 자리가 «없다».
  *  ⛔ **선택을 «전부» 낸다** — 얹힌 것만 내면 「왜 안 얹혔나」를 못 묻는다
  *    (`wrong-stage` · `does-not-apply` · `key-absent` · `unparseable` 이 서로 다른 처방이다).
- *  ⛔ **거절은 조용하지 않다** — 패치가 안 물면 `rejections` 로 나오고 «기준 선언»이 그대로 산다.
- *  ⛔ 승격이 꺼져 있으면 «변형도 없다» — 오늘과 같은 걸음이어야 한다(이 모듈의 첫째 반증). */
+ *  ⛔ **거절은 조용하지 않다** — 패치가 안 물면 `rejections` 로 나오고 «기준 선언»이 그대로 산다. */
 /** 오버레이 조건이 «읽을 수 있는» 상태 키. ⛔ 여기 없는 키는 원장에 값이 안 실린다.
  *  🔑 그래서 «떨어뜨리되 말은 한다» — 아래 `stateExtraKeys` 가 그 이름을 남긴다. */
 export const OVERLAY_STATE_KEYS = ['attempts', 'goal_id'] as const;

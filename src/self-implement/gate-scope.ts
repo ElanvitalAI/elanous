@@ -274,7 +274,7 @@ export function resolveGateScope(
   changed: readonly string[],
   exists: (path: string) => boolean,
   importerTestIndex?: ImporterTestIndex,
-  opts?: { mode?: GateScopeMode },
+  opts?: { mode?: GateScopeMode; isDeleted?: (path: string) => boolean },
 ): GateScopeDecision {
   // ⚠️ **실존 검증(리뷰 must-fix 4R)** — `gitChangedFiles` 는 `git diff --name-only HEAD` 라
   //   **삭제·rename 前 경로도 포함**한다. 그걸 그대로 `testArgs` 로 넘기면 필터가 아무것도 매치하지
@@ -310,8 +310,14 @@ export function resolveGateScope(
    * unverified 에서 빠졌다. **실행되지 않은 테스트는 검증이 아니다.**
    */
   const relatedFor = (f: string): readonly string[] => deriveRelatedTests([f], exists);
+  // 🩸 2026-09-26 실물(run-7dd4cce6): 실패 시험 0 인데 게이트가 두 라운드 «미검증 2»로 실패했다 —
+  //   ① 지운 시험 파일(없는 파일은 돌릴 수 없다 · 자식이 무엇을 해도 «검증»될 수 없다)
+  //   ② 함수만 지운 소스 — 그 파일을 import 하는 시험이 «실제로 돌았는데» 이름 짝(`x.ts`↔`x.test.ts`)만 봐서 커버로 안 셌다.
+  //   ⇒ «지운» 파일은 미검증이 아니다(호출자가 `opts.isDeleted` 로 알린다 · 남은 참조는 tsc·남은 시험이 문다) · 실행 집합의 시험이 import 하면 커버다(importer 색인).
   const coveredBy = (runSet: readonly string[]) => (f: string): boolean => {
     if (runSet.includes(f)) return true;
+    if (opts?.isDeleted?.(f)) return true;
+    if (importerTestIndex && (importerTestIndex.testsBySource.get(f) ?? []).some((t) => runSet.includes(t))) return true;
     const related = relatedFor(f);
     return related.length > 0 && related.every((t) => runSet.includes(t));
   };

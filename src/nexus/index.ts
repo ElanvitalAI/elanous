@@ -28,6 +28,9 @@ import {
 import { nexusLockPath, nexusRuntimePath, nexusRootDir } from './paths.js';
 import { createPwaRegistration, type PwaRegistrationDeps } from './pwa-registration.js';
 import { resolveCurrentInstance } from '../instance/current.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { startPortLeaseHeartbeat } from '../control-plane/port-lease-heartbeat.js';
+import { PORT_BANDS } from '../control-plane/ports.js';
 import { createNexusState } from './state/state.js';
 import { TabRegistry } from './state/tab-registry.js';
 import { createChatTabSpec } from './kinds/chat.js';
@@ -71,7 +74,7 @@ import { registerAllCloudBackends } from './config/secrets/register-cloud.js';
 // → nexus/webterm/pty.ts 통합. `MiniTerminal` class + `createMiniTermSpawn`
 // 은 TUI-only 였고 T4 이후 dead → 정리. `PtyBackend` + `createWebtermSpawn`
 // 만 살아남아 iOS/PWA webterm 의 PTY substrate 로 사용.
-import { type PtyBackend, createWebtermSpawn } from './webterm/pty.js';
+import { type PtyBackend, createWebtermSpawn, resolveWebtermCwd } from './webterm/pty.js';
 import { SettingsTabController } from './config/settings-controller.js';
 import { tryRegisterSettings } from './boot/register-settings.js';
 import { registerMcpClients, type McpClientsHandle } from './boot/register-mcp-clients.js';
@@ -104,6 +107,8 @@ import {
 import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-runtime/discovery.js';
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
+import { startControlServer } from '../control-plane/server.js';
+import { readMemberToken, startMemberHeartbeat } from '../control-plane/member.js';
 import { cleanGhostTailscaleServe } from '../cli/tailscale-serve.js';
 import { buildNextFluentRouteOpts } from './api/next-fluent-wiring.js';
 import { bootDefaultOcrProviders, type OcrRegistry } from '../ocr/index.js';
@@ -208,6 +213,7 @@ import { fetchCodexPlugins } from '../acp/codex-plugins.js';
 import { globalAgentCliConversationStore } from './api/agent-cli-conversation-store.js';
 import { globalMissionRouter } from '../llm/mission-router.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
+import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { debug } from '../debug/log.js';
 import { createNotificationActionLoopback } from '../web-push/notification-action-loopback.js';
 import {
@@ -237,7 +243,7 @@ import type { HealthProbeBackend } from './supervisor/health.js';
 import { gracefulExit, cleanExit } from './supervisor/graceful-exit.js';
 import { restoreFromPending } from './supervisor/restore-state.js';
 import { resolveHeadlessMode } from './headless-mode.js';
-import { checkSetupStatus, renderSetupStatus } from './setup-status.js';
+import { checkSetupStatus, readNexusSetupMode, renderSetupStatus, setupBootMode, setupModeBootPlan } from './setup-status.js';
 import { probeTailscale } from './onboarding/tailscale-probe.js';
 import {
   runPwaSharePrompt,
@@ -285,11 +291,10 @@ export function wireNexusTelegramQaPollers(
   deps: NexusTelegramQaPollerWireDeps,
 ): NexusTelegramQaPollerWireHandle[] {
   const handles: NexusTelegramQaPollerWireHandle[] = [];
-  const pollers = deps.interactivePollerTokens(deps.resolveTelegramChannels(cfg.telegram));
+  const mainToken = resolveChannelBotToken('telegram', cfg)?.token;
+  const pollers = deps.interactivePollerTokens(deps.resolveTelegramChannels({ ...cfg.telegram, botToken: mainToken }));
   for (const channelConfig of pollers) {
-    const channelScopedConfig = channelConfig.botToken === cfg.telegram.botToken
-      ? cfg
-      : { ...cfg, telegram: { ...cfg.telegram, botToken: channelConfig.botToken } };
+    const channelScopedConfig = { ...cfg, telegram: { ...cfg.telegram, botToken: channelConfig.botToken } };
     const start = (release?: () => void): NexusTelegramQaPollerWireHandle | null => {
       const handle = deps.createTriggerBot({
         token: channelConfig.botToken,
@@ -392,6 +397,8 @@ export interface RunNexusOptions {
   skipHttpServer?: boolean;
   /** Override starting port for the HTTP server. Defaults to 31415. */
   httpStartPort?: number;
+  /** Control-plane port; passing 0 also enables an isolated listener in detached tests. */
+  controlPort?: number;
   /** Override host for the HTTP server. Defaults to '127.0.0.1'. */
   httpHost?: string;
   /** Test seam for the best-effort stale Tailscale Serve cleanup before bind. */
@@ -551,6 +558,8 @@ export interface RunNexusOptions {
   mountShareIfEnabledFn?: (opts: { httpPort: number }) => Promise<import('../cli/share-auto-mount.js').ShareMountResult>;
   /** Test-only replacement for the headless Tailscale Serve unmount on shutdown. */
   pwaShareDisableFn?: typeof import('../cli/pwa-share.js').pwaShareDisable;
+  /** Test-only share reconciliation cadence; production checks every 60 seconds. */
+  shareCoordinatorIntervalMsForTesting?: number;
   /** Test-only completion signal that lets the real headless branch exit without a process signal. */
   headlessDoneForTesting?: Promise<void>;
   /** Skip the interactive setup prerequisite only while exercising the real headless branch in tests. */
@@ -703,6 +712,29 @@ export function buildNexusWsBridgeAuth(
   };
 }
 
+/**
+ * 관제부가 준 포트 임대(`ELANOUS_TEST_COORDINATOR_LEASE_PORT`)로 뜨는 자식이 «그 포트로만» 뜨는지 Nexus 락을 잡기 «전»에 확인한다.
+ * 임대가 없으면 undefined, 있으면 그 포트를 돌려준다 — 조건이 하나라도 어긋나면 throw.
+ */
+export function checkLauncherLeaseBoot(
+  opts: Pick<RunNexusOptions, 'httpStartPort' | 'skipHttpServer' | 'detachForTesting'>,
+  env: NodeJS.ProcessEnv,
+  instanceKind: () => string,
+): number | undefined {
+  const launcherLease = env.ELANOUS_TEST_COORDINATOR_LEASE_PORT;
+  if (launcherLease === undefined) return undefined;
+  const leasePort = Number(launcherLease);
+  if (!env.ELANOUS_TEST_COORDINATOR_LEASE_ID?.trim()) throw new Error('missing coordinator lease id');
+  if (instanceKind() !== 'test' ||
+      !Number.isInteger(leasePort) ||
+      leasePort < PORT_BANDS.test.start || leasePort > PORT_BANDS.test.end ||
+      opts.httpStartPort !== leasePort ||
+      (opts.skipHttpServer ?? !!opts.detachForTesting)) {
+    throw new Error('coordinator port lease boot mismatch');
+  }
+  return leasePort;
+}
+
 export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHandle | undefined> {
   if (opts.status) {
     await printStatus();
@@ -712,6 +744,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     stopExisting();
     return undefined;
   }
+
+  const leasePortFromLauncher = checkLauncherLeaseBoot(opts, process.env, () => resolveCurrentInstance().kind);
 
   // 설치본 전환 RFC 0b — 키는 launchd plist 가 아니라 키 캐시에서(캐시 우선 · 자식도 물려받는다). 값은 안 찍고 «이름만».
   if (!opts.detachForTesting) {
@@ -723,13 +757,34 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   const headless = resolveHeadlessMode({ ...(opts.headless !== undefined ? { headless: opts.headless } : {}) });
   if (headless && !opts.detachForTesting && !opts.skipHeadlessSetupCheckForTesting) {
     const setup = checkSetupStatus({ argvBin: process.argv[1] ?? '' });
-    if (!setup.ok) {
+    const boot = setupBootMode(setup);
+    if (boot.mode === 'refuse') {
       console.error('✗ elanous nexus --headless: setup incomplete');
       renderSetupStatus(setup, console);
       console.log('');
       console.log('  Run `elanous nexus` (interactive) once to walk through the wizard.');
       process.exit(1);
     }
+    if (boot.mode === 'setup') {
+      process.env.ELANOUS_NEXUS_SETUP_MODE = '1';
+      const host = opts.httpHost ?? '127.0.0.1';
+      const port = opts.httpStartPort ?? 31415;
+      console.log(`셋업 모드로 떴습니다 — 브라우저로 셋업: http://${host}:${port}/setup (빠진 것: ${boot.missing.join(', ')})`);
+    }
+  }
+
+  // 기동 때 한 번. 요청마다 다시 읽지 않고 이 값을 탭·크론·health 에 넘긴다.
+  // 셋업이 채워진 뒤 정상 모드로 넘어가는 것은 재시작 한 번이다 — 자동 전환은 짓지 않는다.
+  const nexusSetup = readNexusSetupMode(process.env);
+  const setupPlan = setupModeBootPlan(nexusSetup.setupMode);
+  debug.log('nexus.boot', 'setup-mode-plan', {
+    setupMode: nexusSetup.setupMode,
+    setupMissing: nexusSetup.setupMissing,
+    skipTabKinds: setupPlan.skipTabKinds,
+    skipCrons: setupPlan.skipCrons,
+  });
+  if (nexusSetup.setupMode) {
+    console.log('셋업 모드 — 채널 봇·크론은 셋업 뒤 재시작 때 켜진다');
   }
 
   // #24 — 이벤트루프 stall watchdog(2026-07-21). 데몬 메인스레드가 무한루프로 굶으면(telegram 폴링
@@ -816,6 +871,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     return run;
   };
 
+  let stopCoordinatorLease: (() => Promise<void>) | undefined;
+  let leaseReleasePending: Promise<void> | undefined;
+
   let release: () => void;
   try {
     release = acquireNexusLock({ label: 'nexus', ...(opts.force ? { force: true } : {}) });
@@ -837,6 +895,22 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       process.exit(1);
     }
     throw err;
+  }
+
+  if (leasePortFromLauncher !== undefined) {
+    try {
+      stopCoordinatorLease = await startPortLeaseHeartbeat(leasePortFromLauncher, process.env.ELANOUS_TEST_COORDINATOR_LEASE_ID!, {
+        ...(process.env.ELANOUS_TEST_COORDINATOR_LEASE_TOKEN ? { token: process.env.ELANOUS_TEST_COORDINATOR_LEASE_TOKEN } : {}),
+        onError: error => debug.log('control.port-lease', 'renew-failed', { port: leasePortFromLauncher, reason: error.message }, { level: 'warn' }),
+        onLeaseLost: error => {
+          try { debug.log('control.port-lease', 'lease-lost', { port: leasePortFromLauncher, reason: error.message }, { level: 'error' }); }
+          finally { process.exit(1); }
+        },
+      });
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
 
   const startedAt = new Date().toISOString();
@@ -1116,6 +1190,18 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
 
   const skipHttp = opts.skipHttpServer ?? !!opts.detachForTesting;
   let httpServer: NexusHttpServer | undefined;
+  let stopMemberHeartbeat: (() => void) | undefined;
+  // ⛔ 관제부는 운영 넥서스와 «별도 프로세스»다(RFC 관제 평면 A2 · P0 골 경계) — 넥서스는 기본으로 띄우지 않는다.
+  //   🩸 2026-09-27: 넥서스 부팅이 31413 을 늘 잡고 실패하면 throw 해서, 운영이 31413 을 쥔 뒤엔 모든 격리 데몬(`nexus run --test`)이
+  //   부팅에서 죽을 뻔했다. 명시(`controlPort`)일 때만 띄우고, 실패해도 넥서스 부팅은 막지 않는다(관측만).
+  let controlServer: ReturnType<typeof startControlServer> | undefined;
+  if (opts.controlPort !== undefined) {
+    try {
+      controlServer = startControlServer({ port: opts.controlPort });
+    } catch (err) {
+      debug.log('control.server', 'start-failed-in-nexus', { port: opts.controlPort, reason: (err as Error).message }, { level: 'warn' });
+    }
+  }
   // Surface-unification v2.1 FU-3 (2026-05-11) — workflow-runtime
   // daemon. Owns trigger source lifecycle (schedule/webhook/discord/
   // telegram/chat). Schedule + webhook + chat fire from in-process
@@ -1822,7 +1908,16 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     if (!tab || tab.spec.kind !== 'webterm') return;
     const cwdMeta = (tab.spec.meta as { cwd?: string } | undefined)?.cwd;
     const backendFactory = effectiveWebtermSpawn
-      ? () => effectiveWebtermSpawn({ id: tab.spec.id, ...(cwdMeta ? { cwd: cwdMeta } : {}) })
+      ? () => {
+          const decided = resolveWebtermCwd({
+            ...(cwdMeta ? { tabCwd: cwdMeta } : {}),
+            ...(runtimeToolCwd ? { toolCwd: runtimeToolCwd } : {}),
+            instance: resolveCurrentInstance(),
+            processCwd: process.cwd(),
+          });
+          debug.log('nexus.webterm', 'spawn-cwd', { tabId: tab.spec.id, cwd: decided.cwd, source: decided.source });
+          return effectiveWebtermSpawn({ id: tab.spec.id, cwd: decided.cwd });
+        }
       : undefined;
     const session = new NexusWebtermSession({
       ...(backendFactory ? { spawn: backendFactory } : {}),
@@ -2412,13 +2507,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         // so `discordTrigger` nodes fire from real traffic. Skipped
         // when `cfg.discord.enabled` is false or the bot token isn't
         // set. The HITL Discord bot (token = ELANOUS_DISCORD_HITL_*) is
-        // a separate Discord application; this trigger bot uses the
-        // main `cfg.discord.botToken` populated from
-        // ELANOUS_DISCORD_BOT_TOKEN via env-bridge.
+        // a separate Discord application; the trigger bot resolves the
+        // main credential via tokenRef, env, then legacy plaintext.
         try {
           const userConfigMod = await import('../user-config.js');
           const cfg = userConfigMod.getUserConfig();
-          if (cfg.discord.enabled && cfg.discord.botToken && !isAutonomousRunContext()) {
+          const discordToken = resolveChannelBotToken('discord', cfg)?.token;
+          if (cfg.discord.enabled && discordToken && !isAutonomousRunContext()) {
             // M4b (2026-07-12) — the production discord bot answers DMs
             // with the elanous self turn + /cc·/cdx·/gem interweaving
             // (텔레그램 동형·대표 확정: 기본 self·명시 위임). The
@@ -2465,7 +2560,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
               allowedUsers: [...cfg.discord.allowedUsers],
             });
             const handle = createNexusDiscordTriggerBot({
-              token: cfg.discord.botToken,
+              token: discordToken,
               allowedUsers: [...cfg.discord.allowedUsers],
               dispatch: (event) => workflowDaemon!.dispatchDiscord(event),
               onMessage: composedOnMessage,
@@ -2484,32 +2579,30 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
               });
             }
           }
-          // V2.2-4 (2026-05-12) — parallel Telegram wire. Reuses the
-          // same `cfg.telegram.botToken` / `allowedUsers` shape via
-          // env-bridge so ELANOUS_TELEGRAM_BOT_TOKEN populates the
-          // config under the standard flow.
+          // V2.2-4 (2026-05-12) — parallel Telegram wire. Uses the
+          // resolved main token alongside the existing allowedUsers.
           // 2026-07-05 — unified inbound: pass `userConfig` so the ONE
           // nexus telegram bot answers Q&A (onMessage → runTurn) on top
           // of firing workflow triggers. A separate Q&A poller would 409
           // against this one (single getUpdates consumer per token).
-          if (cfg.telegram.enabled && cfg.telegram.botToken && !isAutonomousRunContext()) {
+          const telegramToken = resolveChannelBotToken('telegram', cfg)?.token;
+          if (cfg.telegram.enabled && telegramToken && !isAutonomousRunContext()) {
             // T1 (2026-07-05) — give the Q&A bot the full agent tool surface;
             // A0 folds in the finance analyst orientation only when
             // cfg.finance.enabled (optional domain pack).
             //
             // ★ 멀티 채널(2026-07-09 대표 지시): resolveTelegramChannels 로 채널 목록을
             //   얻고, interactivePollerTokens 로 **봇 토큰당 폴러 1개**만 띄운다(토큰별
-            //   dedup → 409 자기충돌 원천차단). botFromConfig 가 userConfig.telegram.
-            //   botToken 을 읽으므로(telegram.ts), 각 폴러엔 그 채널 토큰으로 덮어쓴
-            //   userConfig 를 넘겨 **올바른 토큰을 폴링**하게 한다(오늘 토큰 버그 정타).
+            //   dedup → 409 자기충돌 원천차단). 각 폴러엔 채널 토큰을 명시로
+            //   넘겨 **올바른 토큰을 폴링**하게 한다(오늘 토큰 버그 정타).
             //   interactive:false(noti-only) 채널은 폴러 없이 발송 전용.
             const { makeTelegramAgentRunTurn } = await import('../telegram-agent.js');
             const { resolveTelegramChannels, interactivePollerTokens } = await import('../domains/telegram-channels.js');
             const { tryAcquireTelegramPollLock, acquireTelegramPollLock } = await import('../telegram-poll-lock.js');
             const adopt = ({ channel, handle }: NexusTelegramQaPollerWireHandle): void => {
               telegramPollerHandles.push(handle);
-              if (channel.botToken === cfg.telegram.botToken) workflowTelegramBot = handle;
-              console.log(`[nexus] telegram 채널 '${channel.name}' Q&A 폴러 활성 (${channel.botToken.slice(0, 8)}…·roles ${channel.roles.join('/')})`);
+              if (channel.botToken === telegramToken) workflowTelegramBot = handle;
+              console.log(`[nexus] telegram 채널 '${channel.name}' Q&A 폴러 활성 (roles ${channel.roles.join('/')})`);
             };
             if (cfg.telegram.poller === 'standalone') {
               // 폴링은 `elanous telegram run` 이 맡는다 — 넥서스는 보내기만 한다. 배달 싱크는 «프로세스 안» 등록이라
@@ -2523,7 +2616,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
               });
               for (const { channel, handle } of sendOnly) {
                 telegramPollerHandles.push(handle);
-                if (channel.botToken === cfg.telegram.botToken) workflowTelegramBot = handle;
+                if (channel.botToken === telegramToken) workflowTelegramBot = handle;
               }
               console.log(`[nexus] telegram Q&A 폴러를 띄우지 않는다 (telegram.poller=standalone — elanous telegram run 이 폴링) · 보내기 전용 싱크 ${sendOnly.length}개`);
             } else {
@@ -2671,13 +2764,17 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     // off; today the only flag is the source's missing-file path
     // (returns empty fleet → no-change tick → no router call).
     try {
-      devicesSubstrateHandle = buildDevicesSubstrate({
-        ...(outboundSubstrate?.router ? { router: outboundSubstrate.router } : {}),
-      });
-      if (devicesSubstrateHandle.skipReason) {
-        console.warn(`[nexus] devices cron skipped (${devicesSubstrateHandle.skipReason}): ${devicesSubstrateHandle.detail ?? ''}`);
+      if (setupPlan.skipCrons.includes('devices')) {
+        debug.log('nexus.boot', 'setup-mode-skip-cron', { cron: 'devices' });
       } else {
-        console.info('[nexus] devices fleet cron started');
+        devicesSubstrateHandle = buildDevicesSubstrate({
+          ...(outboundSubstrate?.router ? { router: outboundSubstrate.router } : {}),
+        });
+        if (devicesSubstrateHandle.skipReason) {
+          console.warn(`[nexus] devices cron skipped (${devicesSubstrateHandle.skipReason}): ${devicesSubstrateHandle.detail ?? ''}`);
+        } else {
+          console.info('[nexus] devices fleet cron started');
+        }
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -2756,9 +2853,11 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       state,
       registry,
       eventBus,
+      setup: { mode: nexusSetup.setupMode, missing: nexusSetup.setupMissing },
       ...(supervisor ? { supervisor } : {}),
       ...(outboundSubstrate ? { outboundTokens: { tokenStore: outboundSubstrate.tokenStore } } : {}),
       ...(opts.httpStartPort !== undefined ? { startPort: opts.httpStartPort } : {}),
+      ...(leasePortFromLauncher !== undefined ? { portRange: 1 } : {}),
       ...(opts.httpHost !== undefined ? { hostname: opts.httpHost } : {}),
       editInPwa: editInPwaCtx,
       ...(wsBridgeOpts ? { wsBridge: wsBridgeOpts } : {}),
@@ -2769,7 +2868,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       ...(pwaStaticDir ? { staticDir: pwaStaticDir } : {}),
       ...(runtimeIntentPrediction ? { intentPrediction: runtimeIntentPrediction } : {}),
       // next-fluent(태스크 완료 → 다음 액션 1-클릭 칩·2026-07-15) — mission-fabric-aware source +
-      // config-gated enabled thunk(기본 OFF). 항상 배선 → route 는 더는 503(not-wired) 안 냄.
+      // 항상 켜진 라우트(기본 ON). personas 만 선택 사항이며, route 는 503(not-wired) 안 냄.
       nextFluent: buildNextFluentRouteOpts(),
       // iPhone Showroom Phase 1 P1-4 (2026-05-14) + FU1 (2026-05-14) —
       // mission router DI seam. Pass a configProvider thunk so user
@@ -2889,9 +2988,37 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     // have moved us off startPort).
     editInPwaCtx.audience = `${httpServer.hostname}:${httpServer.port}`;
     editInPwaCtx.nexusOrigin = httpServer.url;
+    if (leasePortFromLauncher !== undefined && httpServer.port !== leasePortFromLauncher) {
+      httpServer.stop();
+      await stopCoordinatorLease?.();
+      release();
+      throw new Error('coordinator port lease boot mismatch');
+    }
     runtime.httpPort = httpServer.port;
     runtime.httpHost = httpServer.hostname;
     runtime.httpAuth = 'off';
+    // The actual bound port (not the requested port or registry entry) is the member endpoint.
+    try {
+      const token = readMemberToken();
+      const configured = (getUserConfig().raw?.nexus as { primary?: unknown } | undefined)?.primary;
+      const coordinatorUrl = configured === undefined || configured === '' ? 'http://127.0.0.1:31413' : configured;
+      if (!token || typeof coordinatorUrl !== 'string' || !coordinatorUrl.trim()) {
+        try { debug.log('control.member', 'start-skipped', { reason: !token ? 'member-token-missing' : 'coordinator-url-missing' }); } catch { /* fail-soft */ }
+      } else {
+        const machineId = `machine:${hostname()}`;
+        stopMemberHeartbeat = startMemberHeartbeat({
+          coordinatorUrl, token,
+          machine: { id: machineId, name: hostname() },
+          instance: {
+            id: `instance:${hostname()}:${effectiveInstanceRoot()}`, name: 'nexus',
+            endpoint: httpServer.url,
+            attrs: { port: httpServer.port, pid: process.pid },
+          },
+        });
+      }
+    } catch {
+      try { debug.log('control.member', 'start-skipped', { reason: 'member-configuration-invalid' }); } catch { /* fail-soft */ }
+    }
     pwaRegistration.register({
       pid: process.pid,
       port: httpServer.port,
@@ -2930,7 +3057,11 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       // FU A8 — boot the discovery cron alongside the reflection
       // scheduler. Dormant when env unset (zero CPU/network cost on
       // a fresh install).
-      discoveryCron = startDiscoveryCron();
+      if (setupPlan.skipCrons.includes('discovery')) {
+        debug.log('nexus.boot', 'setup-mode-skip-cron', { cron: 'discovery' });
+      } else {
+        discoveryCron = startDiscoveryCron();
+      }
       // Mission Fabric 통합 U4d (2026-07-09) — schedule-runner 은퇴(B안 완성).
       // 모든 예약잡이 fabric Schedule Trigger(run_via='trigger')로 이관됨 →
       // 정시 발화=workflow 데몬, 놓친발화 복구=catchUpTriggerJobs(위 U4b). run_via=
@@ -2985,6 +3116,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       opts: {
         ...(opts.autoStartDaemonTab !== undefined ? { autoStartDaemonTab: opts.autoStartDaemonTab } : {}),
         ...(opts.detachForTesting !== undefined ? { detachForTesting: opts.detachForTesting } : {}),
+        ...(setupPlan.skipTabKinds.includes('daemon') ? { autoStartDaemonTab: false } : {}),
       },
     });
 
@@ -3009,6 +3141,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       opts: {
         ...(opts.autoStartChannelBots !== undefined ? { autoStartChannelBots: opts.autoStartChannelBots } : {}),
         ...(opts.detachForTesting !== undefined ? { detachForTesting: opts.detachForTesting } : {}),
+        ...(setupPlan.skipTabKinds.includes('channel-bot') ? { autoStartChannelBots: false } : {}),
       },
     });
 
@@ -3022,6 +3155,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         for (const entry of templateTabs) {
           if (entry.start === false) continue;
           if (entry.kind !== 'daemon' && entry.kind !== 'pwa-host' && entry.kind !== 'channel-bot') continue;
+          if (setupPlan.skipTabKinds.includes(entry.kind)) continue;
           if (!autoStart) continue;
           const id = entry.id ?? '';
           if (!id || !registry.has(id)) continue;
@@ -3031,7 +3165,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     }
   }
 
+  let shareCoordinatorTimer: ReturnType<typeof setInterval> | undefined;
+  let shareCoordinatorStopped = false;
+  let shareCoordinatorPending: Promise<void> | undefined;
   const wrappedRelease = (): void => {
+    shareCoordinatorStopped = true;
+    if (shareCoordinatorTimer) { clearInterval(shareCoordinatorTimer); shareCoordinatorTimer = undefined; }
     pushEvent(state, { kind: 'nexus.shutdown' });
     pwaRegistration.unregister();
     try { unsubscribeWebtermTabLifecycle(); } catch { /* swallow */ }
@@ -3190,6 +3329,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       }
     };
     void disposeMcp().catch(() => { /* swallow */ });
+    try { stopMemberHeartbeat?.(); } catch { /* best-effort shutdown */ }
+    if (stopCoordinatorLease) {
+      const stopLease = stopCoordinatorLease;
+      stopCoordinatorLease = undefined;
+      leaseReleasePending = stopLease().catch(error => debug.log('control.port-lease', 'release-failed', { port: leasePortFromLauncher, reason: String(error) }, { level: 'warn' }));
+    }
+    controlServer?.stop();
     httpServer?.stop();
     try { deleteNexusRuntime(); } catch { /* best-effort */ }
     release();
@@ -3228,8 +3374,14 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   };
 
   const releaseWithShareUnmount = async (): Promise<void> => {
-    await unmountAutoMountedShare();
-    wrappedRelease();
+    shareCoordinatorStopped = true;
+    if (shareCoordinatorTimer) { clearInterval(shareCoordinatorTimer); shareCoordinatorTimer = undefined; }
+    await shareCoordinatorPending;
+    try { await unmountAutoMountedShare(); }
+    finally {
+      wrappedRelease();
+      await leaseReleasePending;
+    }
   };
 
   const recordShareMount = (result: Awaited<ReturnType<NonNullable<RunNexusOptions['mountShareIfEnabledFn']>>>): void => {
@@ -3320,29 +3472,37 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     try {
       const mountShareIfEnabled = opts.mountShareIfEnabledFn
         ?? (await import('../cli/share-auto-mount.js')).mountShareIfEnabled;
-      const r = await mountShareIfEnabled({ httpPort });
-      if (r.outcome === 'serving') {
-        shareMounted = true;
-        autoMountedSharePort = httpPort;
-        recordShareMount(r);
-        console.log(`  share        ON   ${r.url ?? '(tailnet host unknown)'}   (Tailscale Serve · auto-managed)`);
-      } else if (r.outcome === 'failed') {
-        // FU2 — most common fail in fork+detach is `sudo -n` cache
-        // empty (bg-launch child inherits parent sudo cache; cache
-        // expires after ~5-15min). Surface both recovery paths so
-        // the user doesn't have to guess between "fix Tailscale" and
-        // "run sudo -v".
-        console.log(`  share        ERR  serve exit ${r.serveExitCode ?? '?'} (likely sudo cache empty in bg-launch child)`);
-        console.log('               recover with EITHER:');
-        console.log('                 a) `sudo -v` once in a TTY, then `elanous nexus stop && elanous nexus run`');
-        console.log('                 b) `elanous nexus pwa share enable` (parent-side mount · independent of daemon)');
-      } else if (r.reason === 'tailscale-missing') {
-        console.log('  share        OFF  Tailscale not installed — https://tailscale.com/download');
-      } else if (r.reason === 'tailscale-down') {
-        console.log('  share        OFF  Tailscale not active — start Tailscale, then `pwa share enable`');
-      }
-      // switch-disabled / switch-ask: stay quiet (user choice or fresh
-      // install where the wizard hasn't run yet).
+      const reconcileShare = (): Promise<void> => {
+        if (shareCoordinatorStopped || shareCoordinatorPending) return shareCoordinatorPending ?? Promise.resolve();
+        const pending = (async (): Promise<void> => {
+          try {
+            const r = await mountShareIfEnabled({ httpPort });
+            if (r.outcome === 'serving') {
+              shareMounted = true;
+              autoMountedSharePort = httpPort;
+              recordShareMount(r);
+              console.log(`  share        ON   ${r.url ?? '(tailnet host unknown)'}   (Tailscale Serve · auto-managed)`);
+            } else if (r.outcome === 'failed') {
+              console.log(`  share        ERR  serve exit ${r.serveExitCode ?? '?'} (likely sudo cache empty in bg-launch child)`);
+              console.log('               recover with EITHER:');
+              console.log('                 a) `sudo -v` once in a TTY, then `elanous nexus stop && elanous nexus run`');
+              console.log('                 b) `elanous nexus pwa share enable` (parent-side mount · independent of daemon)');
+            } else if (r.reason === 'tailscale-missing') {
+              console.log('  share        OFF  Tailscale not installed — https://tailscale.com/download');
+            } else if (r.reason === 'tailscale-down') {
+              console.log('  share        OFF  Tailscale not active — start Tailscale, then `pwa share enable`');
+            }
+          } catch (err) {
+            console.error(`  share        ERR  ${(err as Error).message}`);
+          }
+        })();
+        shareCoordinatorPending = pending;
+        void pending.then(() => { if (shareCoordinatorPending === pending) shareCoordinatorPending = undefined; });
+        return pending;
+      };
+      await reconcileShare();
+      shareCoordinatorTimer = setInterval(() => { void reconcileShare(); }, opts.shareCoordinatorIntervalMsForTesting ?? 60_000);
+      shareCoordinatorTimer.unref?.();
     } catch (err) {
       console.error(`  share        ERR  ${(err as Error).message}`);
     }
@@ -3390,17 +3550,19 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     console.log('  elanous nexus: headless mode (TUI suppressed) — Ctrl-C / SIGTERM to exit.\n');
     let resolveDone: () => void = () => {};
     const done = new Promise<void>((r) => { resolveDone = r; });
+    let sigtermExit: Promise<void> | undefined;
     const onSigterm = (): void => {
       console.error('\nelanous nexus: received SIGTERM, graceful restart pending (exit 75)...');
       if (pwaWatchHandle) { try { pwaWatchHandle.stop(); } catch { /* */ } }
       // R1(재시작 최소화 RFC) — 이미 텔레그램에 «확인»된 턴이 재시작으로 말없이 사라지지 않게,
       //   SIGTERM 을 받은 «지금부터» 상한 안에서 봇의 대기 턴을 비운 뒤 나간다(부팅 시각 기준이 아니다).
-      void drainTelegramThen(() => gracefulExit({
+      sigtermExit = drainTelegramThen(() => gracefulExit({
         state,
         registry,
         ...(supervisor ? { supervisor } : {}),
         release: releaseWithShareUnmount,
       }));
+      resolveDone();
     };
     const onSigint = (): void => {
       console.error('\nelanous nexus: received SIGINT, shutting down...');
@@ -3413,7 +3575,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     process.removeListener('SIGINT', onSigint);
     process.removeListener('SIGTERM', onSigterm);
 
-    await cleanExit({
+    if (sigtermExit) await sigtermExit;
+    else await cleanExit({
       state,
       registry,
       ...(supervisor ? { supervisor } : {}),
@@ -3450,9 +3613,10 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   console.log('  elanous nexus: TUI mount path deprecated (T4) — Ctrl-C / SIGTERM to exit.\n');
   let resolveDone: () => void = () => {};
   const done = new Promise<void>((r) => { resolveDone = r; });
+  let sigtermExit: Promise<void> | undefined;
   const onSigterm = (): void => {
     console.error('\nelanous nexus: received SIGTERM, graceful restart pending (exit 75)...');
-    void drainTelegramThen(() => gracefulExit({
+    sigtermExit = drainTelegramThen(() => gracefulExit({
       state,
       registry,
       ...(supervisor ? { supervisor } : {}),
@@ -3467,10 +3631,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   process.once('SIGINT', onSigint);
   process.once('SIGTERM', onSigterm);
   await done;
+  process.removeListener('SIGINT', onSigint);
+  process.removeListener('SIGTERM', onSigterm);
 
-  // SIGINT path — clean exit 0, clears any leftover restart-state so the
-  // OS supervisor doesn't respawn after an explicit user stop.
-  await cleanExit({
+  // SIGTERM completes its graceful exit; SIGINT clears restart-state.
+  if (sigtermExit) await sigtermExit;
+  else await cleanExit({
     state,
     registry,
     ...(supervisor ? { supervisor } : {}),

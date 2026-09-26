@@ -1,0 +1,50 @@
+# 정기 흡수 한 판 — RFC-regular-external-intake-and-normalization-pipeline §5.1 (1판: cmd 노드만).
+# 입력원 하나가 실패해도 판은 끝까지 간다(수집 노드의 fail 도 다음 노드로) — 각 단계가 «못 모음»을 로그에 남긴다.
+# 몸 = yt-vault 의 scripts/intake-daily.sh <step> · 크론이 `elanous graph run graphs/intake/intake-daily.yaml` 로 부른다.
+graph_id: intake-daily
+version: 1
+entry_node: trend
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: trend
+    kind: agent
+    recipe: cmd:intake-trend
+    max_visits: 1
+  - node_id: ingest
+    kind: agent
+    recipe: cmd:intake-ingest
+    max_visits: 1
+  - node_id: telegram
+    kind: agent
+    recipe: cmd:intake-telegram
+    max_visits: 1
+  - node_id: github
+    kind: agent
+    recipe: cmd:intake-github
+    max_visits: 1
+  - node_id: absorb
+    kind: agent
+    recipe: cmd:intake-absorb
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: trend
+    on: outcome
+    map: { ok: ingest, fail: telegram }
+  - from: ingest
+    on: outcome
+    map: { ok: telegram, fail: telegram }
+  - from: telegram
+    on: outcome
+    map: { ok: github, fail: github }
+  - from: github
+    on: outcome
+    map: { ok: absorb, fail: absorb }
+  - from: absorb
+    on: outcome
+    map: { ok: done, fail: failed }

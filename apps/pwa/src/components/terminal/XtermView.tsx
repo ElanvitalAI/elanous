@@ -38,10 +38,13 @@ import {
 } from '@/lib/snapshot';
 import { createXtermResizeController } from '@/lib/xterm-resize-controller';
 import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
+import { createTerminalInputSender } from './terminal-input-sender';
+import { shouldClear } from './terminal-clear';
 
 interface Props {
   sessionId: string;
   terminalId: string;
+  clearRequest?: number;
   /** Default false at WT-A-2a — keyboard input flows back to PTY via
    *  ACP `terminal/input`. Pass `readOnly={true}` for view-only modes
    *  (e.g. multi-device viewer that shouldn't compete on stdin). */
@@ -52,8 +55,15 @@ interface Props {
   onForeignInputActivity?: (info: { peerId: string; bytes: number; timestamp: number }) => void;
 }
 
-export function XtermView({ sessionId, terminalId, readOnly = false, onForeignInputActivity }: Props) {
+export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = false, onForeignInputActivity }: Props) {
   const ref = useRef<HTMLDivElement>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const previousClearRequestRef = useRef<number | undefined>(undefined);
+  const clearTerminalIdRef = useRef(terminalId);
+  if (clearTerminalIdRef.current !== terminalId) {
+    clearTerminalIdRef.current = terminalId;
+    previousClearRequestRef.current = undefined;
+  }
   // Latest sessionId snapshot for use inside the (deps-frozen) effect.
   // Without this, terminal/input frames after handshake still need the
   // up-to-date daemon-issued id, but we can't include `sessionId` in
@@ -76,6 +86,8 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
     connectingSince: number;
   }>(() => ({ state: 'CONNECTING', terminalId, connectingSince: Date.now() }));
   const [now, setNow] = useState(() => Date.now());
+  const [inputError, setInputError] = useState<{ terminalId: string; dropped: number } | null>(null);
+  const visibleInputError = inputError?.terminalId === terminalId ? inputError : null;
   const acpState = acpStatus.terminalId === terminalId ? acpStatus.state : 'CONNECTING';
   const connectingSince = acpStatus.terminalId === terminalId ? acpStatus.connectingSince : now;
 
@@ -144,6 +156,7 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
 
     term.unicode.activeVersion = '11';
     term.open(ref.current);
+    termRef.current = term;
     fit.fit();
 
     // BACKLOG #3 — restore prior scrollback before the daemon streams
@@ -163,9 +176,14 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
     // session/new). The daemon-issued sessionId comes back via the
     // onSession callback; we sync it into DaemonProvider so chat /
     // intake / control surfaces share the same session.
+    let confirmInputSession: (sid: string) => void = () => {};
     const acp = client.connectAcp({
       ...(sessionId ? { sessionId } : {}),
       onSession: (sid) => {
+        if (sid) {
+          sessionIdRef.current = sid;
+          confirmInputSession(sid);
+        }
         if (sid && sid !== sessionId) {
           debugLog('webterm.acp.session.adopted', { from: sessionId, to: sid });
           setSessionId(sid);
@@ -251,6 +269,19 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
       }
     });
 
+    const inputSender = createTerminalInputSender({
+      send: (method, params) => acp.send(method, params),
+      ready: acp.ready,
+      getSessionId: () => sessionIdRef.current,
+      terminalId,
+      getPeerId,
+      log: (event, details) => {
+        debugLog(event, details);
+        if (details.dropped > 0) setInputError({ terminalId, dropped: details.dropped });
+      },
+    });
+    confirmInputSession = inputSender.confirmSession;
+
     // WT-A-2a — keyboard input writeback. xterm.js `onData` emits the
     // standard terminal byte sequence for every key (modifyOtherKeys
     // v2 / kitty keyboard protocol when caps allow), bracketed paste
@@ -275,17 +306,7 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
             return;
           }
           debugLog('webterm.xterm.onData', { terminalId, bytes: data.length });
-          // Latest daemon-issued sessionId — sessionIdRef captures the
-          // post-handshake value without forcing this effect to re-run
-          // on sessionId changes.
-          void acp
-            .send('terminal/input', {
-              sessionId: sessionIdRef.current,
-              terminalId,
-              data,
-              peerId: getPeerId(),
-            })
-            .catch((e) => debugLog('webterm.input.send-error', { reason: String(e) }));
+          inputSender.push(data);
         });
 
     // WT-A-2a — resize → ACP `terminal/resize`. xterm.js fires onResize
@@ -341,11 +362,13 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
         debugLog('webterm.xterm.snapshot.error', { reason: String(e) });
       }
       try { resizeController.dispose(); } catch { /* swallow */ }
+      inputSender.dispose();
       offUpdate();
       offState();
       try { dataDisposable?.dispose(); } catch { /* swallow */ }
       try { resizeDisposable?.dispose(); } catch { /* swallow */ }
       try { acp.close(); } catch { /* swallow */ }
+      if (termRef.current === term) termRef.current = null;
       try { term.dispose(); } catch { /* swallow */ }
       debugLog('webterm.xterm.teardown', { terminalId });
     };
@@ -355,6 +378,14 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalId, readOnly, client]);
 
+  useEffect(() => {
+    if (shouldClear(previousClearRequestRef.current, clearRequest) && termRef.current) {
+      termRef.current.clear();
+      debugLog('webterm.controls.clear.applied', { terminalId });
+    }
+    previousClearRequestRef.current = clearRequest;
+  }, [clearRequest, terminalId]);
+
   const statusLabel = acpState === 'CONNECTING' ? '연결 중' : acpState === 'OPEN' ? '연결됨' : acpState === 'FAILED' ? '연결 실패' : '연결 종료';
   const statusTone = acpState === 'OPEN' ? 'text-emerald-300' : acpState === 'CONNECTING' ? 'text-amber-300' : 'text-red-300';
   const connectionTarget = terminalId.trim() || '대상 미지정';
@@ -363,6 +394,11 @@ export function XtermView({ sessionId, terminalId, readOnly = false, onForeignIn
   return (
     <div className="relative h-full w-full bg-[#0d0c08]">
       <div ref={ref} className="h-full w-full" />
+      {visibleInputError && (
+        <div role="alert" className="pointer-events-none absolute bottom-2 left-2 right-2 rounded bg-red-950/95 px-3 py-2 text-sm text-red-100">
+          터미널 입력 전송 실패: {visibleInputError.dropped}바이트가 버려졌습니다. 명령이 일부만 실행됐을 수 있습니다. 입력을 확인하고 다시 입력하세요.
+        </div>
+      )}
       <span aria-live="polite" className="sr-only">ACP: {statusLabel}</span>
       <span className={`pointer-events-none absolute right-2 top-2 rounded bg-black/70 px-2 py-1 text-xs ${statusTone}`}>
         ACP: {statusLabel}

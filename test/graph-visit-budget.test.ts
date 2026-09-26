@@ -126,7 +126,6 @@ async function walkResearchLoop(graphOverlays: readonly GraphOverlaySpec[] | und
       goalFile,
       goalId: '8890a94958dde35e',
       runId,
-      graphAuthoritative: true,
       ...(graphOverlays === undefined ? {} : { graphOverlays }),
       maxReworkRounds: 4,
       seams: seams({

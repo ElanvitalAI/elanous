@@ -1,7 +1,7 @@
 /**
  * Obsidian Vault REST surface (OP1 · 2026-07-09).
  * iPad Obsidian 기능을 PWA에 이식. 백엔드 /v1/vault/* (기존 obsidian 헬퍼 wrap) +
- * /v1/notes/save(write). daemon-client.fetchJson 패턴(autopilot-api 동형).
+ * /v1/vault/file(write). 읽기 API 는 fetchJson, 저장 API 는 409 본문을 살리기 위해 fetchResponse.
  */
 
 import type { DaemonClient } from './daemon-client';
@@ -9,7 +9,7 @@ import type { DaemonClient } from './daemon-client';
 export interface VaultInfo { available: boolean; root?: string; source: string }
 export interface VaultEntry { name: string; isDir: boolean; relPath: string }
 export interface VaultListResult { cwd: string; base: string; entries: VaultEntry[]; error?: string }
-export interface VaultReadResult { path: string; mime: string; size: number; truncated: boolean; content?: string; bytes?: string; error?: string }
+export interface VaultReadResult { path: string; mime: string; size: number; truncated: boolean; mtimeMs: number; content?: string; bytes?: string; error?: string }
 export interface SearchMatch { path: string; snippet: string; lineNumber: number }
 export interface VaultNote { name: string; relPath: string }
 export interface Backlink { path: string; lineNumber: number; snippet: string; headingAnchor?: string }
@@ -59,12 +59,35 @@ export class VaultApi {
     });
   }
 
-  /** 노트 저장(기존 검증된 엔드포인트·409 mtime conflict → currentMtime). */
-  saveNote(payload: { path?: string; markdown: string; title?: string; lastKnownMtime?: number }): Promise<{ path?: string; mtimeMs?: number; currentMtime?: number; error?: string }> {
-    return this.client.fetchJson('/v1/notes/save', {
+  /** Vault editor write; 409 retains the conflict body for the editor. */
+  async writeNote(payload: { path: string; content: string; lastKnownMtime?: number; createOnly?: boolean }): Promise<{ path?: string; mtimeMs?: number; currentMtime?: number; lastKnownMtime?: number; error?: string }> {
+    const res = await this.client.fetchResponse('/v1/vault/file', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const ctype = res.headers.get('content-type') ?? '';
+    const body = ctype.includes('application/json') ? await res.json() : await res.text();
+    if (!res.ok && res.status !== 409) {
+      // 서버가 사람용 문장(`message` · 예: 격리 우주 쓰기 가드 403)을 주면 그것을 보인다 — 코드만 보이면 이유를 모른다.
+      const msg = typeof body === 'string' ? body : (body?.message ?? body?.reason ?? body?.error ?? `${res.status}`);
+      throw new Error(String(msg));
+    }
+    return body as { path?: string; mtimeMs?: number; currentMtime?: number; lastKnownMtime?: number; error?: string };
+  }
+
+  /** Camera-intake save; keep its established endpoint and conflict contract. */
+  async saveNote(payload: { path?: string; markdown: string; title?: string; lastKnownMtime?: number }): Promise<{ path?: string; mtimeMs?: number; currentMtime?: number; error?: string }> {
+    const res = await this.client.fetchResponse('/v1/notes/save', {
       method: 'POST', headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
     });
+    const ctype = res.headers.get('content-type') ?? '';
+    const body = ctype.includes('application/json') ? await res.json() : await res.text();
+    if (!res.ok && res.status !== 409) {
+      const msg = typeof body === 'string' ? body : (body?.reason ?? body?.error ?? `${res.status}`);
+      throw new Error(String(msg));
+    }
+    return body as { path?: string; mtimeMs?: number; currentMtime?: number; error?: string };
   }
 }
 

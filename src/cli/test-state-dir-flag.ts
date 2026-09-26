@@ -107,7 +107,7 @@ export function applyIsolatedRoot(dir: string): void {
       const { join } = require('node:path') as typeof import('node:path');
       if (!existsSync(join(dir, 'config.json'))) {
         const r = sync.syncTestConfig(dir);
-        console.log(`[test-isolation] 운영 config 물질화 → ${r.testConfigPath} (telegram=${r.telegramMode})`);
+        console.error(`[test-isolation] 운영 config 물질화 → ${r.testConfigPath} (telegram=${r.telegramMode})`);
       } else if (sync.isTestConfigStale(dir)) {
         console.error(`[test-isolation] ⚠️ 운영 config 가 테스트 사본보다 최신 — 'elanous config sync-test' 로 갱신 권장`);
       }

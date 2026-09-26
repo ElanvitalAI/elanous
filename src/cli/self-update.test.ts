@@ -269,11 +269,83 @@ describe('self-update — injected commands only', () => {
     expect(result).toMatchObject({ exitCode: 0, installedVersion: '1.0.0-abcdef123456', restarted: true, decision: { verdict: 'restart' } });
     expect(f.calls).toEqual([
       'git rev-parse --show-toplevel', 'git rev-parse --verify HEAD', 'git diff --quiet HEAD --',
-      `decide ${sha} ${checkout}`, `bash ${checkout}/scripts/install.sh --no-modify-path`,
+      `decide ${sha} ${checkout}`, 'bun bin/elanous.mjs nexus build', `bash ${checkout}/scripts/install.sh --no-modify-path`,
       'prune 1.0.0-abcdef123456  3', 'launchctl kickstart -k gui/501/com.elanous.nexus', 'verify abcdef123456',
     ]);
     expect(JSON.parse(f.lines[0]!)).toEqual(result);
   });
+  test('a failed PWA build returns the output tail and alerts once without installing, relinking or restarting', async () => {
+    const f = fixture();
+    const alerts: string[] = [];
+    const sideEffects: string[] = [];
+    f.deps.run = (cmd, args, cwd, options) => {
+      expect([cmd, args, cwd, options]).toEqual(['bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 900_000 }]);
+      f.calls.push('bun build failed');
+      return { status: 1, stdout: 'first line\n', stderr: 'build error\nfinal diagnostic\n' };
+    };
+    const result = await runSelfUpdate({ restart: true, alert: true }, {
+      ...f.deps,
+      installedVersion: () => { sideEffects.push('installedVersion'); return 'new'; },
+      pruneVersions: () => { sideEffects.push('prune'); return { removed: [], kept: [] }; },
+      relinkCurrent: () => { sideEffects.push('relink'); },
+      verifyRestart: async () => { sideEffects.push('verify'); return { ok: true }; },
+      alert: (text) => alerts.push(text),
+    });
+    expect(result).toMatchObject({ exitCode: 1, installedVersion: null, restarted: false, reason: 'PWA 빌드 실패: final diagnostic' });
+    expect(result.pwaBuiltCommit).toBeUndefined();
+    expect(result.reason.split('\n')).toHaveLength(1);
+    expect(f.calls).toContain('bun build failed');
+    expect(sideEffects).toEqual([]);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain(result.reason);
+  });
+
+  test('a successful build precedes install and carries checkout HEAD and build timestamp through JSON result', async () => {
+    const f = fixture();
+    f.deps.run = (cmd, args, cwd, options) => {
+      f.calls.push(`${cmd} ${args.join(' ')}`);
+      if (cmd === 'bun') {
+        expect([args, cwd, options]).toEqual([['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 900_000 }]);
+      }
+      return { status: 0, stderr: '' };
+    };
+    const before = Date.now();
+    const result = await runSelfUpdate({ json: true }, f.deps);
+    expect(f.calls.filter((c) => c === 'bun bin/elanous.mjs nexus build')).toHaveLength(1);
+    expect(f.calls.indexOf('bun bin/elanous.mjs nexus build')).toBeLessThan(f.calls.indexOf(`bash ${checkout}/scripts/install.sh --no-modify-path`));
+    expect(result.pwaBuiltCommit).toBe(sha.slice(0, 12));
+    expect(Date.parse(result.pwaBuiltAt!)).toBeGreaterThanOrEqual(before);
+    expect(Date.parse(result.pwaBuiltAt!)).toBeLessThanOrEqual(Date.now());
+    expect(JSON.parse(f.lines[0]!)).toEqual(result);
+  });
+
+  test('explicit --skip-pwa-build preserves the checkout install path without running a build', async () => {
+    const f = fixture();
+    f.deps.run = (cmd, args) => {
+      expect(cmd).not.toBe('bun');
+      f.calls.push(`${cmd} ${args.join(' ')}`);
+      return { status: 0, stderr: '' };
+    };
+    const result = await runSelfUpdate({ skipPwaBuild: true }, f.deps);
+    expect(result).toMatchObject({ exitCode: 0, installedVersion: '1.0.0-abcdef123456' });
+    expect(result.pwaBuiltCommit).toBeUndefined();
+    expect(result.pwaBuiltAt).toBeUndefined();
+    expect(f.calls).toContain(`bash ${checkout}/scripts/install.sh --no-modify-path`);
+  });
+
+  test('installation routing forwards explicit skip to the checkout', async () => {
+    const f = fixture();
+    f.deps.run = (cmd, args) => {
+      expect(cmd).not.toBe('bun');
+      f.calls.push(`${cmd} ${args.join(' ')}`);
+      return { status: 0, stderr: '' };
+    };
+    const result = await runUpdateForInstallation({ from: checkout, skipPwaBuild: true }, { checkout: f.deps });
+    expect(result.exitCode).toBe(0);
+    expect(f.calls).toContain(`bash ${checkout}/scripts/install.sh --no-modify-path`);
+    expect(f.calls.some((call) => call.startsWith('bun '))).toBe(false);
+  });
+
   test('no --restart means no service command and an explicit reason', async () => {
     const f = fixture();
     const result = await runSelfUpdate({}, f.deps);
@@ -328,7 +400,7 @@ describe('self-update — injected commands only', () => {
     const f = fixture();
     f.deps.run = (cmd, args) => {
       f.calls.push(`${cmd} ${args.join(' ')}`);
-      return { status: cmd === 'bash' ? 0 : 1, stderr: 'service failed' };
+      return { status: cmd === 'launchctl' ? 1 : 0, stderr: 'service failed' };
     };
     const result = await runSelfUpdate({ restart: true }, f.deps);
     expect(result).toMatchObject({ exitCode: 1, installedVersion: '1.0.0-abcdef123456', restarted: false });

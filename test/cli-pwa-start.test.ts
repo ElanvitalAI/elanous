@@ -1,8 +1,26 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { runPwaStart } from '../src/cli/pwa-start.js';
+import { releaseTestPort } from '../src/cli/port-lease-local.js';
 import type { TailscaleProbe } from '../src/nexus/onboarding/tailscale-probe.js';
 import type { InstanceResolution } from '../src/instance/resolve.js';
+
+test('central PWA lease is forwarded to the detached NEXUS child, not local test ports', async () => {
+  let childEnv: Record<string, string> | undefined;
+  const result = await runPwaStart({ ...NO_SHARE, httpPort: 31450, coordinatorLeasePort: 31450, coordinatorLeaseToken: 'fixture-token', coordinatorLeaseId: 'run-identity',
+    bgLaunchFn: async opts => { childEnv = opts.childEnv; return { exitCode: 0 }; },
+  });
+  expect(result.exitCode).toBe(0);
+  expect(childEnv).toEqual({ ELANOUS_TEST_COORDINATOR_LEASE_PORT: '31450', ELANOUS_TEST_COORDINATOR_LEASE_TOKEN: 'fixture-token', ELANOUS_TEST_COORDINATOR_LEASE_ID: 'run-identity' });
+  childEnv = undefined;
+  await runPwaStart({ ...NO_SHARE, httpPort: 31500,
+    bgLaunchFn: async opts => { childEnv = opts.childEnv; return { exitCode: 0 }; },
+  });
+  expect(childEnv).toBeUndefined();
+});
 
 const TS_ALIVE: TailscaleProbe = {
   installed: true,
@@ -18,6 +36,7 @@ const TS_MISSING: TailscaleProbe = { installed: false, alive: false };
 /** Share-disabled seam reused by tests that don't exercise the share
  *  tail. Stops the default `probeTailscale()` from doing real exec. */
 const NO_SHARE = {
+  resolveCurrentInstanceFn: () => instanceResolution('prod'),
   readShareSwitchFn: () => 'disabled' as const,
   shareProbeFn: async () => TS_MISSING,
   shareServeFn: async () => ({ exitCode: 0 }),
@@ -47,6 +66,101 @@ const fetchAlwaysOk = (async () =>
 function instanceResolution(kind: InstanceResolution['kind']): InstanceResolution {
   return { kind, root: '/tmp/instance', layer: 'default', why: 'test seam' };
 }
+
+const leaseDirs: string[] = [];
+const makeLeaseDir = () => { const dir = mkdtempSync(join(tmpdir(), 'pwa-start-lease-')); leaseDirs.push(dir); return dir; };
+afterEach(() => { for (const dir of leaseDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+describe('runPwaStart — local test-port lease', () => {
+  test('test instance without explicit port leases first, forwards it and transfers to daemon PID', async () => {
+    const dir = makeLeaseDir();
+    const out = makeOut();
+    let forwardArgs: string[] = [];
+    const result = await runPwaStart({
+      ...NO_SHARE, out, leaseDir: dir,
+      resolveCurrentInstanceFn: () => instanceResolution('test'),
+      readConfigPortFn: () => 31415,
+      bgLaunchFn: async opts => { forwardArgs = opts.forwardArgs ?? []; return { exitCode: 0, pid: process.pid }; },
+      registerInstanceFn: () => {},
+    });
+    expect(result.exitCode).toBe(0);
+    expect(out.logs[0]).toBe('시험 대역에서 :31450 임대');
+    expect(forwardArgs.slice(-2)).toEqual(['--http-port', '31450']);
+    expect(JSON.parse(readFileSync(join(dir, '31450.json'), 'utf8'))).toMatchObject({ port: 31450, pid: process.pid });
+    releaseTestPort(31450, process.pid, dir);
+  });
+
+  test('prod config/default and explicit test port keep their previous precedence without leases', async () => {
+    const dir = makeLeaseDir();
+    const ports: string[] = [];
+    for (const opts of [
+      { resolveCurrentInstanceFn: () => instanceResolution('prod'), readConfigPortFn: () => 41000 },
+      { resolveCurrentInstanceFn: () => instanceResolution('prod'), readConfigPortFn: () => undefined },
+      { resolveCurrentInstanceFn: () => instanceResolution('test'), httpPort: 31460, readConfigPortFn: () => 41000 },
+    ]) {
+      await runPwaStart({ ...NO_SHARE, leaseDir: dir, ...opts,
+        bgLaunchFn: async arg => { ports.push(arg.forwardArgs!.at(-1)!); return { exitCode: 0 }; },
+      });
+    }
+    expect(ports).toEqual(['41000', '31415', '31460']);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test('first output announces the lease even when a stale bundle needs building', async () => {
+    const dir = makeLeaseDir();
+    const out = makeOut();
+    const result = await runPwaStart({ ...NO_SHARE, out, leaseDir: dir,
+      resolveCurrentInstanceFn: () => instanceResolution('test'),
+      autoBuild: true, resolvePwaCwdFn: () => '/tmp/pwa',
+      stalenessFn: () => ({ stale: true, reason: 'fixture' }),
+      buildFn: async () => ({ exitCode: 1, cwd: '/tmp/pwa', durationMs: 0 }),
+      bgLaunchFn: async () => { throw new Error('should not launch'); },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(out.logs[0]).toBe('시험 대역에서 :31450 임대');
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  test('successful launch transfers ownership and the child can release the lease', async () => {
+    const dir = makeLeaseDir();
+    const out = makeOut();
+    const daemonPid = process.pid + 100;
+    const originalKill = process.kill;
+    // A real child PID is unnecessary here: check the persisted daemon owner
+    // while keeping the test process isolated from daemon execution.
+    try {
+      process.kill = ((pid: number, signal?: NodeJS.Signals | number) => {
+        if (pid === daemonPid && signal === 0) return true;
+        return originalKill(pid, signal);
+      }) as typeof process.kill;
+      const result = await runPwaStart({ ...NO_SHARE, out, leaseDir: dir,
+        resolveCurrentInstanceFn: () => instanceResolution('test'),
+        bgLaunchFn: async () => ({ exitCode: 0, pid: daemonPid }),
+        registerInstanceFn: () => {},
+      });
+      expect(result.exitCode).toBe(0);
+      expect(JSON.parse(readFileSync(join(dir, '31450.json'), 'utf8')).pid).toBe(daemonPid);
+      releaseTestPort(31450, process.pid, dir);
+      expect(readdirSync(dir)).toEqual(['31450.json']);
+      releaseTestPort(31450, daemonPid, dir);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      process.kill = originalKill;
+    }
+  });
+
+  test('failed daemon startup releases the launcher lease', async () => {
+    const dir = makeLeaseDir();
+    const out = makeOut();
+    const result = await runPwaStart({ ...NO_SHARE, out, leaseDir: dir,
+      resolveCurrentInstanceFn: () => instanceResolution('test'),
+      bgLaunchFn: async () => ({ exitCode: 7 }),
+    });
+    expect(result.exitCode).toBe(7);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+});
 
 describe('runPwaStart — static mode (default)', () => {
   test('starts background nexus with webterm surface, NO dev tail', async () => {
@@ -510,6 +624,7 @@ describe('runPwaStart — share tail (switch + tailscale lifecycle)', () => {
     const r = await runPwaStart({
       mode: 'static',
       out,
+      resolveCurrentInstanceFn: () => instanceResolution('prod'),
       bgLaunchFn: async () => ({ exitCode: 0 }),
       readShareSwitchFn: () => 'enabled',
       shareProbeFn: async () => TS_ALIVE,
@@ -529,6 +644,7 @@ describe('runPwaStart — share tail (switch + tailscale lifecycle)', () => {
     const out = makeOut();
     let servePort: number | undefined;
     await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       httpPort: 51111,
@@ -544,6 +660,7 @@ describe('runPwaStart — share tail (switch + tailscale lifecycle)', () => {
     const out = makeOut();
     let serveCalls = 0;
     await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       bgLaunchFn: async () => ({ exitCode: 0 }),
@@ -559,6 +676,7 @@ describe('runPwaStart — share tail (switch + tailscale lifecycle)', () => {
     const out = makeOut();
     let serveCalls = 0;
     await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       bgLaunchFn: async () => ({ exitCode: 0 }),
@@ -574,6 +692,7 @@ describe('runPwaStart — share tail (switch + tailscale lifecycle)', () => {
     const out = makeOut();
     let serveCalls = 0;
     await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       bgLaunchFn: async () => ({ exitCode: 0 }),
@@ -589,6 +708,7 @@ describe('runPwaStart — share tail (switch + tailscale lifecycle)', () => {
     const out = makeOut();
     let serveCalls = 0;
     await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       bgLaunchFn: async () => ({ exitCode: 0 }),
@@ -603,6 +723,7 @@ describe('runPwaStart — share tail (switch + tailscale lifecycle)', () => {
   test('serve failure does NOT fail the start — exitCode 0, banner reports ERR', async () => {
     const out = makeOut();
     const r = await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       bgLaunchFn: async () => ({ exitCode: 0 }),
@@ -639,14 +760,14 @@ describe('runPwaStart — P4 registry hookup', () => {
     await runPwaStart({
       ...NO_SHARE,
       mode: 'static',
-      bgLaunchFn: async () => ({ exitCode: 0, pid: 1 }),
+      bgLaunchFn: async () => ({ exitCode: 0, pid: 1 }), leaseDir: makeLeaseDir(),
       registerInstanceFn,
       resolveCurrentInstanceFn,
     });
     await runPwaStart({
       ...NO_SHARE,
       mode: 'hmr',
-      bgLaunchFn: async () => ({ exitCode: 0, pid: 2 }),
+      bgLaunchFn: async () => ({ exitCode: 0, pid: 2 }), leaseDir: makeLeaseDir(),
       devLaunchFn: async () => ({ exitCode: 0 }),
       fetchFn: fetchAlwaysOk,
       sleepFn: async () => {},
@@ -668,14 +789,14 @@ describe('runPwaStart — P4 registry hookup', () => {
     await runPwaStart({
       ...NO_SHARE,
       mode: 'static',
-      bgLaunchFn: async () => ({ exitCode: 0, pid: 1 }),
+      bgLaunchFn: async () => ({ exitCode: 0, pid: 1 }), leaseDir: makeLeaseDir(),
       registerInstanceFn,
       resolveCurrentInstanceFn: () => instanceResolution('prod'),
     });
     const result = await runPwaStart({
       ...NO_SHARE,
       mode: 'hmr',
-      bgLaunchFn: async () => ({ exitCode: 0, pid: 2 }),
+      bgLaunchFn: async () => ({ exitCode: 0, pid: 2 }), leaseDir: makeLeaseDir(),
       devLaunchFn: async () => ({ exitCode: 0 }),
       fetchFn: fetchAlwaysOk,
       sleepFn: async () => {},
@@ -753,6 +874,83 @@ describe('runPwaStart — P3 port config fallback + collision hint', () => {
     expect(forwardArgs).toContain('31415');
   });
 
+  test('same-tree supervised collision refuses to stop or retry and keeps the collision hint', async () => {
+    for (const serviceName of ['com.elanous.nexus', 'systemd']) {
+      const out = makeOut();
+      let launches = 0;
+      let stops = 0;
+      const r = await runPwaStart({
+        ...NO_SHARE,
+        out,
+        autoRestart: true,
+        bgLaunchFn: async () => { launches++; return { exitCode: 7 }; },
+        listInstancesFn: () => [{
+          pid: 42, cwd: process.cwd(), daemonDir: '/other', alive: true,
+          launcherProvenance: { kind: 'service-manager', serviceName },
+        }],
+        stopFn: async () => { stops++; return { exitCode: 0, devKilled: true, nexusStopped: true, shareReset: false, shareUnmount: { status: 'skipped', reason: 'pwa-port-unknown' } }; },
+      });
+      expect(r.exitCode).toBe(7);
+      expect(launches).toBe(1);
+      expect(stops).toBe(0);
+      expect(out.errors.filter((e) => e.includes('가 감독한다 — 멈추지 않았다'))).toEqual([
+        `이 데몬은 ${serviceName === 'systemd' ? 'systemd' : 'launchd'} 가 감독한다 — 멈추지 않았다. 재시작이 필요한지 먼저 \`elanous nexus restart-needed\` · 필요하면 운영자에게 알린 뒤 감독자로 재시작. 시험 데몬은 \`--test --port <격리 포트>\``,
+      ]);
+      expect(out.errors.some((e) => e.includes('failed to claim port'))).toBe(true);
+    }
+  });
+
+  test('same-tree supervised daemon later in registry refuses stop even after an unsupervised entry', async () => {
+    const out = makeOut();
+    let launches = 0;
+    let stops = 0;
+    const r = await runPwaStart({
+      ...NO_SHARE,
+      out,
+      autoRestart: true,
+      bgLaunchFn: async () => { launches++; return { exitCode: 7 }; },
+      listInstancesFn: () => [{
+        pid: 41, cwd: process.cwd(), daemonDir: '/other', alive: true,
+        launcherProvenance: { kind: 'human-terminal' },
+      }, {
+        pid: 42, cwd: process.cwd(), daemonDir: '/other', alive: false,
+        launcherProvenance: { kind: 'service-manager', serviceName: 'com.elanous.dead' },
+      }, {
+        pid: 43, cwd: process.cwd(), daemonDir: '/other', alive: true,
+        launcherProvenance: { kind: 'service-manager', serviceName: 'com.elanous.nexus' },
+      }],
+      stopFn: async () => { stops++; return { exitCode: 0, devKilled: true, nexusStopped: true, shareReset: false, shareUnmount: { status: 'skipped', reason: 'pwa-port-unknown' } }; },
+    });
+    expect(r.exitCode).toBe(7);
+    expect(launches).toBe(1);
+    expect(stops).toBe(0);
+    expect(out.errors.filter((e) => e.includes('가 감독한다 — 멈추지 않았다'))).toHaveLength(1);
+    expect(out.errors.some((e) => e.includes('failed to claim port'))).toBe(true);
+  });
+
+  test('same-tree unsupervised collision still stops and retries', async () => {
+    for (const kind of ['human-terminal', 'background-child', 'unknown'] as const) {
+      let launches = 0;
+      let stops = 0;
+      const r = await runPwaStart({
+        ...NO_SHARE,
+        autoRestart: true,
+        bgLaunchFn: async () => ({ exitCode: ++launches === 1 ? 7 : 0 }),
+        listInstancesFn: () => [{
+          pid: 42, cwd: '/other', daemonDir: '/other', alive: true,
+          launcherProvenance: { kind },
+        }, {
+          pid: 43, cwd: process.cwd(), daemonDir: '/other', alive: true,
+          launcherProvenance: { kind },
+        }],
+        stopFn: async () => { stops++; return { exitCode: 0, devKilled: true, nexusStopped: true, shareReset: false, shareUnmount: { status: 'skipped', reason: 'pwa-port-unknown' } }; },
+      });
+      expect(r.exitCode).toBe(0);
+      expect(launches).toBe(2);
+      expect(stops).toBe(1);
+    }
+  });
+
   test('bgLaunch fail surfaces P3 collision hint with port + remediation', async () => {
     const out = makeOut();
     const r = await runPwaStart({
@@ -777,6 +975,7 @@ describe('runPwaStart — P2 --https flag (force-enable for this run)', () => {
     const saveCalls: string[] = [];
     let serveCalls = 0;
     const r = await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       https: true,
@@ -797,6 +996,7 @@ describe('runPwaStart — P2 --https flag (force-enable for this run)', () => {
     const out = makeOut();
     let serveCalls = 0;
     const r = await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       https: true,
@@ -813,6 +1013,7 @@ describe('runPwaStart — P2 --https flag (force-enable for this run)', () => {
     const out = makeOut();
     let serveCalls = 0;
     const r = await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       https: true,
@@ -831,6 +1032,7 @@ describe('runPwaStart — P2 --https flag (force-enable for this run)', () => {
     const out = makeOut();
     let serveCalls = 0;
     const r = await runPwaStart({
+      resolveCurrentInstanceFn: () => instanceResolution('prod'), // 트리 환경(비-리더 = test)에 따라 실제 임대 폴더를 건드리지 않게
       mode: 'static',
       out,
       bgLaunchFn: async () => ({ exitCode: 0 }),

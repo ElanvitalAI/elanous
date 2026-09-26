@@ -1,4 +1,6 @@
 import { nativeBuildEnv, nativeBuildShimDir } from '../native/native-build-env.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { fixPrivateFiles, scanPrivateFiles } from './doctor-private-files.js';
 import { checkPythonEnv, runPythonSetup } from './python-cli.js';
 import { remediesFor } from './doctor-distro.js';
 import { installManagedPython, installStaticTool, linuxArch, staticToolBinDir, STATIC_TOOLS, type StaticToolName } from './doctor-static-tools.js';
@@ -14,6 +16,7 @@ export interface DoctorFixDeps {
   env?: NodeJS.ProcessEnv;
   home?: string;
   cacheDir?: string;
+  configDir?: string;
   readiness?: ReadinessDeps;
   readdir?: (path: string) => string[];
   exists?: (path: string) => boolean;
@@ -53,7 +56,7 @@ export interface DoctorFixDeps {
 }
 
 export interface DoctorFixItem {
-  id: 'install-path' | 'key-cache-permissions' | 'bun-tmpdir' | 'service-file' | 'service-secrets' | 'node-pty-rebuild' | 'python-env' | 'static-tools' | 'python-managed';
+  id: 'private-files' | 'install-path' | 'key-cache-permissions' | 'bun-tmpdir' | 'service-file' | 'service-secrets' | 'node-pty-rebuild' | 'python-env' | 'static-tools' | 'python-managed';
   path: string;
   action: string;
   status: 'fixable' | 'skipped' | 'failed';
@@ -66,7 +69,7 @@ export interface DoctorFixResult {
   exitCode: number;
 }
 
-type IO = Required<Omit<DoctorFixDeps, 'readiness' | 'keyNames' | 'realpath' | 'runCommand' | 'verifyNodePty' | 'pythonSetup' | 'recheckPythonEnv' | 'shimDir' | 'removeTree' | 'arch' | 'installStaticTool' | 'installManagedPython'>> & { readiness: ReadinessDeps; keyNames: readonly string[] | undefined };
+type IO = Required<Omit<DoctorFixDeps, 'configDir' | 'readiness' | 'keyNames' | 'realpath' | 'runCommand' | 'verifyNodePty' | 'pythonSetup' | 'recheckPythonEnv' | 'shimDir' | 'removeTree' | 'arch' | 'installStaticTool' | 'installManagedPython'>> & { readiness: ReadinessDeps; keyNames: readonly string[] | undefined };
 const cachePath = Symbol('cachePath');
 type InternalFixItem = DoctorFixItem & { [cachePath]?: string };
 const START = '# >>> elanous installer PATH >>>';
@@ -443,8 +446,17 @@ function nodePtyItem(deps: DoctorFixDeps): InternalFixItem | undefined {
   return { id: 'node-pty-rebuild', path: plan.versionDir, action: `${envText}bun add ${plan.spec} (in ${plan.versionDir}) — then require('node-pty')`, status: 'fixable' };
 }
 
+function privateFilesItem(deps: DoctorFixDeps, fs: IO): DoctorFixItem | undefined {
+  const configDir = deps.configDir ?? (deps.home ? join(deps.home, '.elanous') : getElanousConfigDir());
+  const scan = scanPrivateFiles(configDir, fs);
+  if (scan.dirMode === null || (scan.dirMode === 0o700 && scan.loose.length === 0)) return undefined;
+  return { id: 'private-files', path: configDir, action: 'chmod directory 700 and restrict private files', status: 'fixable',
+    reason: `directory ${scan.dirMode.toString(8)} · files ${scan.loose.length}` };
+}
+
 export function planDoctorFixes(deps: DoctorFixDeps = {}): DoctorFixPlan {
   const fs = io(deps);
+  const privateFiles = privateFilesItem(deps, fs);
   const path = pathItem(fs);
   const tmpdir = tmpdirItem(fs);
   const service = serviceItem(fs);
@@ -454,7 +466,7 @@ export function planDoctorFixes(deps: DoctorFixDeps = {}): DoctorFixPlan {
   const staticTools = staticToolsItem(deps, fs);
   const pythonManaged = pythonManagedItem(deps, fs);
   return {
-    items: [...(path ? [path] : []), ...(tmpdir ? [tmpdir] : []), ...(secrets ? [secrets] : []), ...(service ? [service] : []), ...(nodePty ? [nodePty] : []), ...(staticTools ? [staticTools] : []), ...(pythonManaged ? [pythonManaged] : []), ...(python ? [python] : []), ...cacheItems(fs)],
+    items: [...(path ? [path] : []), ...(tmpdir ? [tmpdir] : []), ...(secrets ? [secrets] : []), ...(service ? [service] : []), ...(nodePty ? [nodePty] : []), ...(staticTools ? [staticTools] : []), ...(pythonManaged ? [pythonManaged] : []), ...(python ? [python] : []), ...cacheItems(fs), ...(privateFiles ? [privateFiles] : [])],
     manual: checkReadiness(fs.readiness).items.filter((item) => item.status === 'manual'),
   };
 }
@@ -478,7 +490,17 @@ export function applyDoctorFixes(deps: DoctorFixDeps = {}, yes = false): DoctorF
       continue;
     }
     try {
-      if (item.id === 'install-path') {
+      if (item.id === 'private-files') {
+        const scan = scanPrivateFiles(item.path, fs);
+        if (scan.dirMode === null || (scan.dirMode === 0o700 && !scan.loose.length)) {
+          items.push({ ...item, result: 'skipped', reason: 'permissions already private' });
+          continue;
+        }
+        fixPrivateFiles(scan, fs);
+        const after = scanPrivateFiles(item.path, fs);
+        const repaired = after.dirMode === 0o700 && after.loose.length === 0;
+        items.push({ ...item, result: repaired ? 'fixed' : 'failed', reason: repaired ? 'permissions restricted' : 'permissions remain loose' });
+      } else if (item.id === 'install-path') {
         // Reinspect immediately before writing; a competing installer may have changed it.
         const current = pathItem(fs);
         if (current?.status !== 'fixable') {
@@ -585,7 +607,7 @@ export function applyDoctorFixes(deps: DoctorFixDeps = {}, yes = false): DoctorF
         items.push({ ...item, result: repaired ? 'fixed' : 'failed', reason: repaired ? 'permissions are 600' : 'permissions remain different from 600' });
       }
     } catch {
-      items.push({ ...item, result: 'failed', reason: item.id === 'key-cache-permissions' ? 'could not chmod or recheck cache file' : item.id === 'service-secrets' ? 'could not migrate cache or back up, write or recheck service file' : 'could not back up, write or recheck startup file' });
+      items.push({ ...item, result: 'failed', reason: item.id === 'key-cache-permissions' ? 'could not chmod or recheck cache file' : item.id === 'service-secrets' ? 'could not migrate cache or back up, write or recheck service file' : item.id === 'private-files' ? 'could not chmod or recheck private files' : 'could not back up, write or recheck startup file' });
     }
   }
   return { items, exitCode: items.some((item) => item.result === 'failed') ? 1 : 0 };

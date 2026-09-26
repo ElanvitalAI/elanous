@@ -90,11 +90,17 @@ const DECISION_TO_VERDICT: Record<Exclude<SwipeDecision, 'expand'>, CardVerdict>
 const PLACEHOLDER =
   '- 스크린 레코딩 능력 흡수\n     https://github.com/siddharthvaddem/openscreen\n- 이미지 바로 보기 안 되는 이유 분석\n\n==== 다이어그램 강화 ====\n위젯 surface · Mermaid · DrawIO repo 확인';
 
-export function MemoIntakePreview() {
+export function MemoIntakePreview({
+  initialMemo,
+  onClose,
+}: {
+  initialMemo?: string;
+  onClose?: () => void;
+} = {}) {
   const { client } = useDaemon();
   const api = useMemo(() => new IntakePipelineApi(client), [client]);
 
-  const [rawText, setRawText] = useState('');
+  const [rawText, setRawText] = useState(initialMemo ?? '');
   const [busy, setBusy] = useState(false);
   const [response, setResponse] = useState<PipelinePreviewResponse | null>(null);
   const [verdicts, setVerdicts] = useState<Record<string, CardVerdict>>({});
@@ -153,7 +159,8 @@ export function MemoIntakePreview() {
     setRegistered(null);
     setRefineOpen(false);
     setRefineHint('');
-  }, []);
+    onClose?.();
+  }, [onClose]);
 
   const handlePhotoPick = useCallback((): void => {
     photoInputRef.current?.click();

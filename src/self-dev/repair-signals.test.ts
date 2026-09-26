@@ -210,6 +210,15 @@ describe('analyzeRepairSignals (G7 · 관측→수리 신호)', () => {
     expect(byPattern.get('gate-failed')).toMatchObject({ kind: 'goal', count: 1 });
   });
 
+  test('run-deadline-exceeded 는 수확·재분해 힌트이고 할당량 소진으로 읽지 않는다', () => {
+    const signal = analyzeRepairSignals([
+      pg('deadline', { stage: 'aborted', failureClassification: 'run-deadline-exceeded' } as unknown as Partial<ParkedGoal>),
+    ])[0]!;
+    expect(signal.pattern).toBe('run-deadline-exceeded');
+    expect(signal.hypothesis).toContain('수확');
+    expect(signal.hypothesis).toContain('재분해');
+    expect(signal.hypothesis).not.toContain('쿼터');
+  });
   test('already-satisfied repair advice says there is nothing to fix and does not ask to reinforce evidence', () => {
     const signal = analyzeRepairSignals([
       pg('already there', { stage: 'review-blocked', failureClassification: 'already-satisfied' } as unknown as Partial<ParkedGoal>),

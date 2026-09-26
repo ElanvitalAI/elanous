@@ -7,7 +7,6 @@ describe('runDashboardCodeEditPostTurn', () => {
     const events: string[] = [];
 
     await runDashboardCodeEditPostTurn({
-      turnSummaryEnabled: true,
       pushChatLine: (line) => { events.push(`line:${line}`); },
       setChatScrollBottom: () => { events.push('scroll'); },
       importCodeEdit: async () => ({
@@ -35,7 +34,6 @@ describe('runDashboardCodeEditPostTurn', () => {
 
   test('swallows bootstrap failures', async () => {
     await expect(runDashboardCodeEditPostTurn({
-      turnSummaryEnabled: true,
       pushChatLine: () => {},
       setChatScrollBottom: () => {},
       importCodeEdit: async () => {

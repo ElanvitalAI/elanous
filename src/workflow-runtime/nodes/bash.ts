@@ -24,6 +24,7 @@ export async function executeBashNode(
       timeoutMs: node.idle_timeout,
       signal: ctx.signal,
       cwd: process.cwd(),
+      ...(ctx.env ? { env: ctx.env } : {}),
     });
     if (r.exitCode !== 0) {
       return {

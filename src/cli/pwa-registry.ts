@@ -50,6 +50,12 @@ export function resolvePwaLauncherProvenance(
 
   const serviceName = env.LAUNCH_JOB_NAME;
   if (serviceName) return { kind: 'service-manager', serviceName };
+  if (env.XPC_SERVICE_NAME?.startsWith('com.elanous.')) {
+    return { kind: 'service-manager', serviceName: env.XPC_SERVICE_NAME };
+  }
+  if (env.INVOCATION_ID && (env.SYSTEMD_EXEC_PID || env.JOURNAL_STREAM)) {
+    return { kind: 'service-manager', serviceName: 'systemd' };
+  }
 
   if (env.ELANOUS_NEXUS_BG_PARENT) return { kind: 'background-child' };
   if (isTTY) return { kind: 'human-terminal' };
