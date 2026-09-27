@@ -4,6 +4,7 @@
 
 import { createHash } from 'node:crypto';
 import type { LLMUsage } from './prompt-cache/types.js';
+import type { ModelRole } from './user-config.js';
 // ⭐ grok 자격 해석 — 구독(OAuth) 1순위 · API 키 2순위. ACP 경로와 «같은» 규칙.
 import { isGrokUnauthorized, refreshGrokSubscriptionToken, resolveFreshGrokCredential, resolveGrokCredential } from './grok/credential.js';
 import {
@@ -323,7 +324,9 @@ export interface LLMOpts {
   signal?: AbortSignal;
   /** Optional per-request usage telemetry from the provider stream. */
   onUsage?(usage: LLMUsage): void;
-    /**
+  /** Optional model role attached to this request's usage observation. */
+  usageRole?: ModelRole;
+  /**
    * ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — ***턴 «안»으로 들어오는 사용자 발화의 배수구.***
    *
    * 대표: *"큐잉된게 설계된 타이밍에 들어가서 인터럽트? 비슷한게 걸리면서 기존 작업을 트리아지 해야"*
@@ -4489,6 +4492,11 @@ export async function streamLLM(
     );
     const full = consumed.full;
     if (consumed.ok) {
+      if (consumed.usage !== 'unmeasured') {
+        try {
+          logAgentTurnUsage(activeModel, consumed.usage, { providerName: activeProvider.name, site: 'stream-llm', role: opts.usageRole });
+        } catch { /* best-effort observation */ }
+      }
       debug.log('llm.router.done', 'streamLLM', {
         provider: activeProvider.name,
         model: activeModel,
@@ -7803,7 +7811,6 @@ export function getInspectBudgetThreshold(messages: readonly LLMMessage[], model
 //  ⛔ 사람이 «실제로 친» 말(interjection)과 툴 결과는 여기 해당하지 않는다 — 그것은 보여야 한다.
 export const LOOP_SELF_NOTE_ROLE = 'system' as const;
 
-/** One `llm.usage` observation per provider usage event of the main tool loop (same shape as the side sites). */
 /** 과금 경로 — 자격 종류에서 파생(BACKLOG C6). oauth=구독 · local · apikey=API · 그 밖=모름. */
 export function billingRouteForProvider(provider: string | undefined, model: string): import('./budget/llm-cost.js').BillingRoute {
   if (!provider) return 'unknown';
@@ -7818,11 +7825,16 @@ export function billingRouteForProvider(provider: string | undefined, model: str
   }
 }
 
-export function logAgentTurnUsage(model: string, usage: LLMUsage, providerName?: string): void {
+/** Observe usage with optional site/role metadata; a provider-name string remains supported. */
+export function logAgentTurnUsage(model: string, usage: LLMUsage, providerNameOrOptions?: string | { providerName?: string; site?: string; role?: ModelRole }): void {
   try {
+    const providerName = typeof providerNameOrOptions === 'string' ? providerNameOrOptions : providerNameOrOptions?.providerName;
+    const site = (typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.site) ?? 'agent-turn';
+    const role = typeof providerNameOrOptions === 'string' ? undefined : providerNameOrOptions?.role;
     const billing = billingRouteForProvider(providerName, model);
     debug.log('llm.usage', 'llm-usage', {
-      site: 'agent-turn',
+      site,
+      ...(role !== undefined ? { role } : {}),
       model,
       ...(usage.provider !== undefined && { provider: usage.provider }),
       // ⭐ `provider` 는 «선 어댑터»(openai/anthropic)다 — 과금 주체는 별칭 칸으로(BACKLOG B10).
@@ -8464,7 +8476,7 @@ export async function streamLLMWithTools(
         // ⭐ 주 에이전트 턴의 토큰·비용을 «게이트 없이» 남긴다(2026-09-24 실측: 이 줄이 없어 3시간 `llm.usage`
         //   18행이 전부 곁가지 두 자리였고, 하니스 런 비용의 거의 전부가 관측 밖이었다). 곁가지와 같은 모양 ·
         //   모르는 모델은 금액 대신 `cost.kind='unknown'`. runId 는 debug.log 가 붙인다. 실패해도 턴은 계속.
-        logAgentTurnUsage(activeModel, ev.usage, activeProvider.name);
+        logAgentTurnUsage(activeModel, ev.usage, { providerName: activeProvider.name, role: opts.usageRole });
         // Wave A1 (2026-05-04) — turn-level cache hit rate forensic.
         // Each provider's usage event carries inputTokens / outputTokens
         // / cacheReadInputTokens (when cache hit). Emit the per-turn

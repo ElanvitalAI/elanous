@@ -467,3 +467,31 @@ describe('defaultGitMergeSeam — 실 git 으로 원격추적 ref 가 «갱신�
     expect(seam.isConfiguredRemote(work, 'feature')).toBe(false);
   });
 });
+
+// 🅢 2026-09-27 #21086 — 라우터가 공급자 전부 실패 시 돌려준 오류 문구가 2만 줄 파일의 «내용»이 됐다.
+describe('해결본이 파일이 아닐 때 — 공급자 오류 문구 · 크기 붕괴', () => {
+  const lines = (n: number, tag = 'x') => Array.from({ length: n }, (_, i) => `const ${tag}${i} = ${i};`).join('\n');
+  const PROVIDER_TEXT = '[LLM PROVIDER BLOCKED] fallback candidates exhausted\n- openai-codex: Codex API 429: usage_limit_reached\n';
+
+  test('해결기가 공급자 오류 문구를 돌려주면 abort 하고 쓰지도 commit 하지도 않는다', async () => {
+    const { git, calls, written } = gitSeam({ mergeConflict: true, files: ['src/dashboard/index.ts'] });
+    const result = await mergeMainWithLlmResolve('/wt', 'main', async () => PROVIDER_TEXT, git);
+    expect(result).toMatchObject({ status: 'conflict-unresolved', resolvedFiles: [], providerFailure: ['src/dashboard/index.ts'] });
+    expect(calls).toContain('abort');
+    expect(calls).not.toContain('commit');
+    expect(written['/wt/src/dashboard/index.ts']).toBeUndefined();
+  });
+
+  test('양쪽 판보다 절반 넘게 작아지면 abort 한다 — 50줄 미만 파일은 판정하지 않는다', async () => {
+    const big = gitSeam({ mergeConflict: true, files: ['src/big.ts'], indexStageContents: { ':2:src/big.ts': lines(400, 'a'), ':3:src/big.ts': lines(420, 'b') } });
+    const collapsed = await mergeMainWithLlmResolve('/wt', 'main', async () => `${lines(3)}\n`, big.git);
+    expect(collapsed).toMatchObject({ status: 'conflict-unresolved', sizeCollapse: [{ file: 'src/big.ts', ours: 400, theirs: 420, merged: 3 }] });
+    expect(big.calls).not.toContain('commit');
+
+    const ok = gitSeam({ mergeConflict: true, files: ['src/big.ts'], indexStageContents: { ':2:src/big.ts': lines(400, 'a'), ':3:src/big.ts': lines(420, 'b') } });
+    expect((await mergeMainWithLlmResolve('/wt', 'main', async () => `${lines(410)}\n`, ok.git)).status).toBe('llm-resolved');
+
+    const small = gitSeam({ mergeConflict: true, files: ['src/small.ts'], indexStageContents: { ':2:src/small.ts': lines(20, 'a'), ':3:src/small.ts': lines(20, 'b') } });
+    expect((await mergeMainWithLlmResolve('/wt', 'main', async () => `${lines(2)}\n`, small.git)).status).toBe('llm-resolved');
+  });
+});

@@ -3,6 +3,7 @@ import { registerAllDefaultToolRuntimes } from './index.js';
 import {
   _resetToolRuntimeRegistryForTest,
   dispatchToolByName,
+  getToolRuntime,
   listToolRuntimes,
 } from './registry.js';
 import { SELF_COGNITION_TOOL_NAMES } from './self-cognition-runtimes.js';
@@ -16,6 +17,16 @@ describe('self-cognition runtime registry wiring', () => {
   test('lists every ledger entry for MCP', () => {
     const mcpNames = new Set(listToolRuntimes('mcp').map(runtime => runtime.id));
     for (const name of SELF_COGNITION_TOOL_NAMES) expect(mcpNames).toContain(name);
+  });
+
+  test('omits retired virtual-window control and context runtimes on every surface', () => {
+    for (const id of [
+      'control_window_resize', 'control_pane_resize', 'control_pane_layout',
+      'context_windows_list', 'context_window_detail', 'context_pane_detail',
+    ]) expect(getToolRuntime(id)).toBeUndefined();
+    for (const id of ['control_tool_toggle', 'control_prompt_append', 'control_prompt_clear', 'dashboard_state', 'context_bootstrap']) {
+      expect(getToolRuntime(id)?.id).toBe(id);
+    }
   });
 
   test('keeps browser runtimes out of the MCP proxy registry', () => {

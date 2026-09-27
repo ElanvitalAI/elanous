@@ -167,7 +167,7 @@ export interface RenderOpts {
   colorByAgent?: boolean;
   /** When true, foldHint appends the rich-mode "press f to expand"
    *  invitation. Omitted/false = count-only (essential/unknown).
-   *  Callers that know DashboardUiMode pass `mode === 'rich'`. */
+   *  The essential dashboard passes false. */
   expandHint?: boolean;
 }
 

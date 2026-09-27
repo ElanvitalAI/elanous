@@ -227,12 +227,16 @@ function pinnedAccountExhausted(home: string, accountName: string): boolean {
   return used >= threshold;
 }
 
-function buildRotationCandidates(path: string, now: number): RotationCandidate[] {
+function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessEnv = process.env): RotationCandidate[] {
   return listCodexAccountsInStore(path)
     .map((row) => {
       const stored = loadTokens(row.storeKey, path);
-      // ⛔ 홈을 모르는 계정은 후보가 «아니다» — 모르는 곳으로 넘기지 않는다.
-      const home = stored?.codexHome;
+      // ⛔ 홈을 모르는 «이름» 계정은 후보가 «아니다» — 모르는 곳으로 넘기지 않는다.
+      // ⭐ 기본 계정(`openai-codex`)은 정본에 홈을 안 적는다 — 그 홈은 «기본 위치»(`CODEX_HOME` 또는 `~/.codex`)로
+      //    이미 정해져 있다(`resolveCodexAccount` · `effectiveCodexHome` 과 같은 해석). 종전엔 이 계정이 후보에서
+      //    통째로 빠져, Pod 배분이 default 를 1% 로 두고 «codex 모두 95% 이상 → grok» 으로 갔다(🅢 2026-09-27).
+      const home = stored?.codexHome
+        ?? (row.storeKey === 'openai-codex' ? resolveCodexAccount({ CODEX_HOME: env.CODEX_HOME } as unknown as NodeJS.ProcessEnv).home : undefined); // CODEX_HOME 한 칸만(이름 계정 설정을 안 끼운다 · 🅢 #21079 의도) — unknown 단언: Next 타입은 ProcessEnv 에 NODE_ENV 를 필수로 더해 PWA 빌드가 깨졌다
       if (!home) return null;
       const usedPercent = readQuotaSignalUsedPercent(now, home);
       return {
@@ -473,7 +477,7 @@ export function inspectCodexRotation(
   const enabled = rotationConfig.enabled;
   const currentHomeInfo = effectiveCodexHome(current, loadTokens(current.storeKey, path), env);
   const currentHome = currentHomeInfo.home;
-  const candidates = buildRotationCandidates(path, now);
+  const candidates = buildRotationCandidates(path, now, env);
   const currentSignalAttributable = signalAttributableToAccount(currentHomeInfo);
   const currentReached = currentSignalAttributable && currentHome ? readQuotaSignal(now, currentHome) : undefined;
   const currentUsedPercent = currentSignalAttributable && currentHome ? readQuotaSignalUsedPercent(now, currentHome) : undefined;
@@ -561,7 +565,7 @@ export function resolveCodexAccountForRun(
   const now = Date.now();
   const currentHomeInfo = effectiveCodexHome(current, loadTokens(current.storeKey, path), env);
   const currentHome = currentHomeInfo.home;
-  const candidates = buildRotationCandidates(path, now);
+  const candidates = buildRotationCandidates(path, now, env);
   const currentSignalAttributable = signalAttributableToAccount(currentHomeInfo);
 
   const decision = decideCodexRotation({

@@ -217,11 +217,28 @@ export interface WebhookTriggerNode extends DagNodeBase {
     method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
     /** Path under the daemon's HTTP server. Must begin with `/`. */
     path: string;
-    /** v1 auth: omitted = open. */
+    /** v1 auth: omitted = open. `hmac` verifies a provider signature over
+     *  the raw body (Linear `linear-signature` · GitHub `x-hub-signature-256`
+     *  with prefix `sha256=` · Asana `x-hook-signature`). `secretRef` names a
+     *  secret-store id — the secret itself never sits in the workflow YAML. */
     auth?:
       | { type: 'bearer'; token: string }
-      | { type: 'basic'; username: string; password: string };
+      | { type: 'basic'; username: string; password: string }
+      | WebhookHmacAuth;
   };
+}
+
+export interface WebhookHmacAuth {
+  type: 'hmac';
+  /** Request header carrying the signature (case-insensitive). */
+  header: string;
+  secretRef: string;
+  /** Default 'sha256'. */
+  algorithm?: 'sha256' | 'sha1';
+  /** Default 'hex'. */
+  encoding?: 'hex' | 'base64';
+  /** Literal text before the digest in the header, e.g. 'sha256='. */
+  prefix?: string;
 }
 /** Node-catalog N4.4 (2026-05-11 · scheduler-retirement R6) — Discord
  *  trigger. v1 = schema + executor pass-through. Daemon-side AXON
@@ -422,6 +439,45 @@ export interface ShowroomNode extends DagNodeBase {
   };
 }
 
+/** TOX task from a workflow (RFC external tasks §A8 · X5b). Every field is
+ *  interpolated. `external` is required — a workflow task always carries
+ *  where it came from, and therefore waits for approval like any other
+ *  external task unless `tox.external.autoRun` matches. */
+export interface TaskNode extends DagNodeBase {
+  task: {
+    title: string;
+    description?: string;
+    /** low | medium | high (urgent needs acceptance checks — not here). */
+    priority?: string;
+    /** Idempotency key for the event that produced this task. */
+    eventId?: string;
+    external: {
+      /** asana | linear | telegram | github | other */
+      provider: string;
+      ref: string;
+      url?: string;
+      project?: string;
+      team?: string;
+      assignee?: string;
+    };
+  };
+}
+
+export interface WorkflowTaskRequest {
+  title: string;
+  description?: string;
+  priority?: 'low' | 'medium' | 'high';
+  eventId?: string;
+  external: { provider: string; ref: string; url?: string; project?: string; team?: string; assignee?: string };
+}
+
+export interface WorkflowTaskResult {
+  taskId?: string;
+  deduplicated?: boolean;
+  /** Why no task was created (validation or TOX unavailable). */
+  error?: string;
+}
+
 export type DagNode =
   | (PromptNode & { kind?: undefined })
   | (BashNode & { kind?: undefined })
@@ -438,6 +494,7 @@ export type DagNode =
   | (TemplateNode & { kind?: undefined })
   | (HttpRequestNode & { kind?: undefined })
   | (ShowroomNode & { kind?: undefined })
+  | (TaskNode & { kind?: undefined })
   | (ScheduleTriggerNode & { kind?: undefined })
   | (WebhookTriggerNode & { kind?: undefined })
   | (DiscordTriggerNode & { kind?: undefined })
@@ -603,6 +660,9 @@ export interface WorkflowDeps {
     body: string,
     opts: { timeoutMs?: number; signal?: AbortSignal; cwd?: string; env?: NodeJS.ProcessEnv }
   ) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+  /** Create a TOX task (`task` node). Omitted = the in-process TOX
+   *  `dispatchTaskCreate`. */
+  createTask?: (req: WorkflowTaskRequest) => Promise<WorkflowTaskResult>;
   /** Invoke a registered skill by slug. */
   runSkill?: (slug: string, args: string) => Promise<string>;
   /** Invoke a CFT method by name. */

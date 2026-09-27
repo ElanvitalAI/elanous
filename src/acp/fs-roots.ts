@@ -13,7 +13,7 @@
 //
 // Obsidian resolution chain (config wipe-resilient — see user feedback
 // 2026-05-16): live user config → env vars → ~/.elanous backup chain →
-// default ~/Obsidian/ElanvitalAI → ~/Obsidian/* auto-discovery via
+// default ~/Documents/Obsidian → ~/Obsidian/* auto-discovery via
 // .obsidian/ signature → unavailable. The first **existsSync** hit
 // wins; result is cached at process scope so a mid-session config.json
 // wipe (test harness, restoration) cannot strand a running daemon.
@@ -21,6 +21,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
 import { getUserConfig } from '../user-config.js';
+import { fallbackObsidianVault } from '../obsidian/default-vault.js';
 
 export type FsRootKind = 'cwd' | 'obsidian';
 
@@ -28,7 +29,7 @@ export type ObsidianSource =
   | 'config'      // live ~/.elanous/config.json
   | 'env'         // OBSIDIAN_VAULT or ELANOUS_OBSIDIAN_VAULT
   | 'backup'      // ~/.elanous/config.json.{bak,backup-*,PRESERVED-*,*.json}
-  | 'default'     // ~/Obsidian/ElanvitalAI present on disk
+  | 'default'     // ~/Documents/Obsidian present on disk
   | 'discovery'   // ~/Obsidian/* containing a .obsidian/ subdirectory
   | 'none';       // nothing found — `available: false`
 
@@ -130,7 +131,7 @@ function computeObsidianResolution(): ObsidianResolution {
   if (fromBackup) return { root: resolvePath(fromBackup), available: true, source: 'backup' };
   // 4. Conventional default — old elanous installs and the obsidianDefaults()
   //    fallback both pin this path.
-  const def = join(home, 'Obsidian', 'ElanvitalAI');
+  const def = fallbackObsidianVault(home);
   if (existsSync(def)) return { root: resolvePath(def), available: true, source: 'default' };
   // 5. Auto-discovery — last-resort scan for any vault-shaped sibling.
   const discovered = discoverObsidianFromHome(home);

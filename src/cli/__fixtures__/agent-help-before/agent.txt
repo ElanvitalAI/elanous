@@ -1,0 +1,18 @@
+Usage: elanous agent [options] [command] [text...]
+
+Single-turn agent — same as `chat` but with the tool loop on by default
+(Read/Grep/Glob/ListDir/Edit/Write + Bash). Use this when the LLM needs to
+inspect files / run commands / debug itself.
+
+Arguments:
+  text                                            Prompt text for the single-turn agent.
+
+Options:
+  --new                                           Force a new session instead of using the active one
+  --session <id>                                  Continue an explicit session (id or unique prefix). Overrides --new and active session.
+  --json                                          Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.
+  --no-tools                                      Disable the tool loop and fall back to text-only chat (for benchmarking / parity with `chat`).
+  -h, --help                                      display help for command
+
+Commands:
+  dispatch [options] <subagent_type> <prompt...>  Spawn one sub-agent from the terminal and print its final message. Observe with `elanous logs --category agent.spawn` / `--category agent.done` — the printed cid pairs the two.

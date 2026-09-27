@@ -173,6 +173,36 @@ describe('createDaemonRunTurn — dispatch context userText', () => {
     return dispatchContexts.at(-1)!;
   }
 
+  test('ACP tool dispatch uses each session cwd instead of the boot default', async () => {
+    streamImpl = async ({ handlers }) => {
+      await handlers.dispatchTool('CaptureCtx', {}, { callId: 'call-1' });
+      return '';
+    };
+    const runTurn = createDaemonRunTurn(new DaemonSessionHistory(), {
+      tools: 'readonly', toolCwd: '/tmp/boot', acpSessionCwd: true,
+    });
+    await runTurn(makeTurnCtx({ sessionId: 'a', cwd: '/tmp/a' }));
+    await runTurn(makeTurnCtx({ sessionId: 'b', cwd: '/tmp/b' }));
+    expect(dispatchContexts.map((ctx) => ctx.cwd)).toEqual(['/tmp/a', '/tmp/b']);
+    expect(dispatchContexts.map((ctx) => ctx.resolveWriteCwd!())).toEqual(['/tmp/a', '/tmp/b']);
+  });
+
+  test('concurrent ACP turns keep their own cwd across asynchronous tool calls', async () => {
+    streamImpl = async ({ handlers }) => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await handlers.dispatchTool('CaptureCtx', {}, { callId: 'call-1' });
+      return '';
+    };
+    const runTurn = createDaemonRunTurn(new DaemonSessionHistory(), {
+      tools: 'readonly', toolCwd: '/tmp/boot', acpSessionCwd: true,
+    });
+    await Promise.all([
+      runTurn(makeTurnCtx({ sessionId: 'a', cwd: '/tmp/a' })),
+      runTurn(makeTurnCtx({ sessionId: 'b', cwd: '/tmp/b' })),
+    ]);
+    expect(new Set(dispatchContexts.map((ctx) => ctx.cwd))).toEqual(new Set(['/tmp/a', '/tmp/b']));
+  });
+
   test('forwards multi-line human source text while preserving dispatch fields', async () => {
     const userText = '첫 번째 줄\n둘 번째 줄';
     const dispatchCtx = await dispatchFromTurn(makeTurnCtx({ sessionId: 'sess-user-text', userText }));
@@ -235,7 +265,7 @@ describe('createDaemonRunTurn — dispatch context userText', () => {
   test('ACP boot composition root injects the real non-detached PTY killer', () => {
     const source = readFileSync(joinPath(REPO_ROOT, 'src/index.ts'), 'utf8');
     expect(source).toContain("const { killNonDetached: killNonDetachedPty } = await import('./pty-shell/registry.js');");
-    expect(source).toContain('createDaemonRuntime({ killNonDetachedPty })');
+    expect(source).toContain('createDaemonRuntime({\n      acpSessionCwd: true,\n      killNonDetachedPty,');
   });
 
   test('Nexus preload lets createDaemonRuntime resolve its lazy composer and fan multi-LLM targets out', async () => {

@@ -15,25 +15,11 @@ describe('ui foundation · R6 interaction bridge source truth', () => {
     expect(src).toContain('onShowContextMenu?:');
   });
 
-  test('dashboard routes vw pane-title right click through ctxMenuWire with vw-pane-title hitTarget', () => {
-    // 2026-07-07 · dashboard decomposition: the onShowContextMenu
-    // callback + vw-pane-title hitTarget moved to
-    // src/dashboard/virtual-window-input-runtime.ts, the
-    // registerVirtualWindowContextMenus registration moved to
-    // src/dashboard/context-menu-provider-boot.ts (arg renamed
-    // ctxMenuProviders → providers inside the boot module), and
-    // dashboard/index.ts keeps the ctxMenuWire routing seam
-    // (routeContextMenu → ctxMenuWire.onMouse) + boots the provider
-    // registry. Same invariant, asserted across the three files.
-    const vwInputRuntime = read('src/dashboard/virtual-window-input-runtime.ts');
-    expect(vwInputRuntime).toContain('onShowContextMenu: (windowId, paneId, col, row) => {');
-    expect(vwInputRuntime).toContain("hitTarget: { kind: 'vw-pane-title'");
-
+  test('dashboard boots the remaining context-menu provider registry', () => {
     const ctxMenuBoot = read('src/dashboard/context-menu-provider-boot.ts');
     expect(ctxMenuBoot).toContain('registerVirtualWindowContextMenus(providers, {');
 
     const dashboard = read('src/dashboard/index.ts');
     expect(dashboard).toContain('const ctxMenuProviders = bootDashboardContextMenuProviders({');
-    expect(dashboard).toContain('routeContextMenu: (req) => ctxMenuWire.onMouse(req)');
   });
 });

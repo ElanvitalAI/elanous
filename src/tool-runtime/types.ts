@@ -48,11 +48,16 @@ export interface ToolRuntimeContext {
    *  stay fail-CLOSED. Opt-in, default undefined (false). See
    *  `ConfirmOpts.failOpen` in `src/hitl/confirm.ts`. */
   failOpen?: boolean;
+  /** MCP only — the connected client's `clientInfo.name` from `initialize`
+   *  (e.g. `claude-code`, `codex-mcp-client`). Unset on other surfaces. */
+  mcpClient?: string;
   /** Cancellation — forwarded to underlying dispatcher when
    *  supported (e.g. streaming fetch, long-running agent calls). */
   signal?: AbortSignal;
   /** Parent catalog and dispatcher inherited by an Agent runtime's child. */
   agentHostTools?: LLMToolSpec[];
+  /** Host-selected working directory for an Agent spawned through MCP. */
+  agentCwd?: string;
   agentDispatchTool?: (name: string, args: Record<string, unknown>) => Promise<unknown>;
   buildChildToolCatalog?: (cwd: string) => {
     specs: LLMToolSpec[];

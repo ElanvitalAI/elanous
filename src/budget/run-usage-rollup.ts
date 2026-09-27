@@ -3,6 +3,8 @@ import type { BillingRoute } from './llm-cost.js';
 export interface RunUsageInput {
   runId?: string | null;
   hostId?: string | null;
+  site?: string | null;
+  role?: string | null;
   model?: string | null;
   billingProvider?: string | null;
   billing?: BillingRoute | null;
@@ -16,6 +18,8 @@ export interface RunUsageInput {
 
 export interface RunUsageRow {
   runId: string;
+  role?: string;
+  site?: string;
   model: string;
   billingProvider: string;
   billing: string;
@@ -33,18 +37,21 @@ export interface RunUsageRow {
 }
 
 /** Aggregate llm-usage observations without turning unavailable prices into a known zero. */
-export function rollupRunUsage(rows: readonly RunUsageInput[]): RunUsageRow[] {
+export function rollupRunUsage(...[rows, opts]: [rows: readonly RunUsageInput[], opts?: { by?: 'run' | 'role' }]): RunUsageRow[] {
   const groups = new Map<string, RunUsageRow>();
+  const byRole = opts?.by === 'role';
   for (const data of rows) {
-    const runId = data.runId ?? '(none)';
+    const runId = byRole ? '(all)' : data.runId ?? '(none)';
+    const role = data.role ?? '(none)';
+    const site = data.site ?? '(none)';
     const model = data.model ?? '(none)';
     const billingProvider = data.billingProvider ?? '(none)';
     const billing = data.billing ?? '(none)';
-    const key = JSON.stringify([runId, model, billingProvider, billing]);
+    const key = JSON.stringify(byRole ? [role, site, model, billingProvider, billing] : [runId, model, billingProvider, billing]);
     let row = groups.get(key);
     if (!row) {
       row = {
-        runId, model, billingProvider, billing, hostIds: [], calls: 0,
+        runId, ...(byRole ? { role, site } : {}), model, billingProvider, billing, hostIds: [], calls: 0,
         inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0,
         cacheCreationInputTokens: 0, reasoningOutputTokens: 0,
         usdKnown: 0, unknownCostCalls: 0, includedCalls: 0, apiEquivalentUsd: 0,

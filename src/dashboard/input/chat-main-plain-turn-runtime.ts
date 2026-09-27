@@ -22,8 +22,6 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
   chatLines: string[];
   contextRegistry: unknown;
   sessionRegistry: unknown;
-  virtualWindowBook: unknown;
-  virtualWindowRegistry: unknown;
   sync: unknown;
   chatFooterLine: { current: string | null };
   /** Essential-mode completion footer supplied by the actual route resolver. */
@@ -63,8 +61,6 @@ export interface DashboardChatMainPlainTurnRuntimeDeps {
     contextText: string;
     contextRegistry: unknown;
     terminalRegistry: unknown;
-    addressBook: unknown;
-    windowRegistry: unknown;
     blockAttach: DashboardTurnBlockAttachLike;
     pushChatLine: (line: string) => void;
   }) => { userMsg: { content: unknown } };
@@ -232,8 +228,6 @@ export async function runDashboardChatMainPlainTurn(
       contextText: deps.contextText,
       contextRegistry: deps.contextRegistry,
       terminalRegistry: deps.sessionRegistry,
-      addressBook: deps.virtualWindowBook,
-      windowRegistry: deps.virtualWindowRegistry,
       blockAttach: deps.blockAttach,
       pushChatLine: deps.pushChatLine,
     });

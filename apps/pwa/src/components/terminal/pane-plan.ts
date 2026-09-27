@@ -30,18 +30,20 @@ function newestAliveChild(
 
 /**
  * Produces a pure placement description from verified run membership.
- * Rows without a run value, or a run without a unique newest live member,
- * remain explicit unknowns rather than receiving an invented placement.
+ * Rows without a run value are ordinary terminals, outside run placement.
+ * A run without a unique newest live member remains explicitly unknown.
  */
 export function panePlan(terminals: readonly DaemonTerminalSummary[]): PanePlan {
   const rowsByRunId = new Map<string, DaemonTerminalSummary[]>();
   const unknownIds = new Set<string>();
+  const seenIds = new Set<string>();
+  const uniqueRows: DaemonTerminalSummary[] = [];
   for (const terminal of terminals) {
+    if (seenIds.has(terminal.id)) continue;
+    seenIds.add(terminal.id);
+    uniqueRows.push(terminal);
     const runId = terminal.runId?.trim();
-    if (!runId) {
-      unknownIds.add(terminal.id);
-      continue;
-    }
+    if (!runId) continue;
     const rows = rowsByRunId.get(runId) ?? [];
     rows.push(terminal);
     rowsByRunId.set(runId, rows);
@@ -63,7 +65,7 @@ export function panePlan(terminals: readonly DaemonTerminalSummary[]): PanePlan 
   }
 
   const placedIds = new Set(layouts.flatMap(({ split, tabs }) => [split, ...tabs]));
-  const unknown = terminals
+  const unknown = uniqueRows
     .filter(({ id }) => unknownIds.has(id) && !placedIds.has(id))
     .map(({ id }) => ({ id, reason: 'relationship-unavailable' as const }));
 

@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { isAbsolute } from 'node:path';
 import { debug } from '../debug/log.js';
+import { getUserConfig, type UserConfig } from '../user-config.js';
+import { resolveDaemonHarnessTarget } from './harness-target.js';
 import {
   applyClarifyAnswerToDraft,
 } from './clarify.js';
@@ -49,6 +53,8 @@ export interface IntakeSlashDeps {
   runPipeline?: (input: { rawText: string; intakeId: string }, callables: PipelinePhaseCallables) => Promise<PipelineRunResult>;
   pipelineCallables?: PipelinePhaseCallables;
   harnessContext?: DaemonToolDispatchCtx;
+  harnessConfig?: Pick<UserConfig, 'harness'>;
+  isGitRepo?: (path: string) => boolean;
   dispatchHarness?: (args: { objective: string }, context?: DaemonToolDispatchCtx) => Promise<{ output: string }>;
 }
 
@@ -470,6 +476,27 @@ export async function resolveIntakeSlash(
     if (!intakeId) return { output: '/intake implement: no intake sessions yet' };
     const session = store.getSession(intakeId);
     if (!session) return { output: `/intake implement: session '${intakeId}' not found` };
+    const cwd = deps.harnessContext?.cwd ?? process.cwd();
+    const configuredRepo = (deps.harnessConfig ?? getUserConfig()).harness?.defaultRepo;
+    const target = resolveDaemonHarnessTarget({
+      configured: typeof configuredRepo === 'string' && isAbsolute(configuredRepo) ? configuredRepo : undefined,
+      cwd,
+      isGitRepo: deps.isGitRepo ?? ((path) => {
+        try {
+          return execFileSync('git', ['rev-parse', '--is-inside-work-tree'], {
+            cwd: path, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+          }).trim() === 'true';
+        } catch {
+          return false;
+        }
+      }),
+    });
+    debug.log('intake-plane.slash', 'harness-target', {
+      ok: target.ok,
+      source: target.ok ? target.source : undefined,
+      reason: target.ok ? undefined : target.reason,
+    });
+    if (!target.ok) return { output: target.reason, action: 'noop', session };
     const runPipeline = deps.runPipeline ?? runIntakePipelinePhases;
     const pipelineCallables = deps.pipelineCallables ?? buildRealIntakeCallables();
     const pipeline = await runPipeline({ rawText: session.raw.rawText, intakeId }, pipelineCallables);
@@ -485,10 +512,11 @@ export async function resolveIntakeSlash(
     // inference would lose; mandatory clarify would unnecessarily block grounded
     // tasks. One task is therefore dispatched as one independent goal, in order.
     const dispatchHarness = deps.dispatchHarness ?? dispatchHarnessViaSelfImplement;
-    const harnessContext = deps.harnessContext ?? {
-      cwd: process.cwd(),
+    const harnessContext = {
       signal: new AbortController().signal,
       userText: `/intake implement ${intakeId}`,
+      ...deps.harnessContext,
+      cwd: target.repo,
     };
     const outcomes: Array<{ task: EnrichedTask; output: string; launched: boolean }> = [];
     for (const task of tasks) {

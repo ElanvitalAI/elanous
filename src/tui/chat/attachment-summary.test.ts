@@ -8,6 +8,19 @@ import { renderDashboardAttachmentSummary as fromTui } from './attachment-summar
 import { renderDashboardAttachmentSummary as fromShim } from '../../dashboard/attachment-summary.js';
 
 describe('attachment-summary — tui/ 이전 shim', () => {
+  it('keeps essential attachment summary without scratch callbacks', () => {
+    const lines: string[] = [];
+    const rows: Array<[number, number]> = [];
+    const attachment = { kind: 'image', id: 1, token: '[Image #1]', filename: 'image.png', sourcePath: '/tmp/image.png', sizeBytes: 8 };
+    fromTui([{ attachment, isNew: true }] as Parameters<typeof fromTui>[0], {
+      formatNewLine: (item) => item.token,
+      formatExistingLine: () => 'existing',
+      pushLine: (line) => { lines.push(line); return lines.length - 1; },
+      trackRow: (row, id) => { rows.push([row, id]); },
+    });
+    expect(lines).toEqual(['[Image #1]']);
+    expect(rows).toEqual([[0, 1]]);
+  });
   it('tui/chat/ 가 렌더러를 export 한다', () => {
     expect(typeof fromTui).toBe('function');
   });

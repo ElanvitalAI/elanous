@@ -10,11 +10,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { XtermView } from './XtermView';
+import { PtyLiveView } from './PtyLiveView';
 import { TerminalTabs, type InitialTerminalState } from './TerminalTabs';
 import { initialTerminalNotice } from './initial-terminal-notice';
 import { TuiMirrorView } from './TuiMirrorView';
 import { TerminalControls } from './TerminalControls';
-import { TerminalRepl } from './TerminalRepl';
 import { ModifierBar } from './ModifierBar';
 import { MultiDeviceIndicator } from './MultiDeviceIndicator';
 import { TerminalDropZone } from './TerminalDropZone';
@@ -24,11 +24,10 @@ import { usePointerCapability } from '@/lib/use-pointer-capability';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { checkSecureContext } from '@/lib/secure-context-guard';
 import type { AttachmentMeta } from '@/lib/upload-attachment';
-import type { ReplMirrorKind } from '@/lib/dock-history-mirror';
 import { injectAttachmentPathsToTerminal } from '@/lib/inject-attachment-paths';
 import { useVoiceController } from '@/voice/use-voice-controller';
 import { VOICE_DOT_COLOR, VOICE_PHASE_LABEL } from '@/voice/voice-phase-styles';
-import { getPeerId } from '@/lib/peer-id';
+import { sendToTerminal } from './terminal-input-registry';
 import { debugLog } from '@/lib/debug';
 import type { DaemonClient, DaemonTerminalDetailOptions, DaemonTerminalsScope, DaemonTerminalSummary } from '@/lib/daemon-client';
 import {
@@ -62,7 +61,6 @@ import {
 const ACTIVE_KEY = 'elanous.webterm.activeId';
 const MINIMIZED_KEY = 'elanous.webterm.panelsMinimized';
 const CHAT_DOCK_KEY = 'elanous.webterm.chatDockOpen';
-const REPL_OPEN_KEY = 'elanous.webterm.replOpen';
 // A bounded snapshot shows enough recent terminal context without making a list click expensive.
 const PTY_SCROLLBACK_LINES = 100;
 
@@ -154,7 +152,7 @@ export function TerminalPaneLayout({
 export interface TerminalPanelProps {
   /** PTY id read by the page from `?pty=`; an id chooses a row only when unique across roots. */
   initialPtyId?: string | null;
-  /** Called only for a direct list-row click, never while applying the initial URL value. */
+  /** Called for a direct list-row click, not the initial URL selection. */
   onPtySelection?: (terminal: DaemonTerminalSummary) => void;
 }
 
@@ -168,8 +166,8 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const [terminalId, setTerminalId] = useState<string | null>(null);
   const [clearRequests, setClearRequests] = useState<Readonly<Record<string, number>>>({});
   const [tabIds, setTabIds] = useState<readonly string[]>([]);
-  const [ptyTabSelection, setPtyTabSelection] = useState<{ id: string; nonce: number } | null>(null);
-  const pendingPtyUrlSelectionRef = useRef<DaemonTerminalSummary | null>(null);
+  const [liveDismissed, setLiveDismissed] = useState(false);
+  const [livePty, setLivePty] = useState<DaemonTerminalSummary | null>(null);
   const [initialTerminalState, setInitialTerminalState] = useState<InitialTerminalState>({ status: 'pending' });
   // ⛔ 렌더당 «한 번»만 계산한다 — 두 번 부르면 화면 분기와 배너가 서로 다른 결과를 쓸 수 있다
   //    (무인 리뷰 should-fix · 2026-08-18 `#10105`).
@@ -188,8 +186,8 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const selectPanelView = useCallback((selected: TerminalPanelView) => {
     setPanelView((current) => nextTerminalPanelView(current, selected));
   }, []);
-  // Keep the initial view local so opening the list never exposes other instances unexpectedly.
-  const [includeAllPtyInstances, setIncludeAllPtyInstances] = useState(false);
+  // Direct links search every instance; opening the list without a link remains local.
+  const [includeAllPtyInstances, setIncludeAllPtyInstances] = useState(Boolean(initialPtyId));
   const [ptyRows, setPtyRows] = useState<DaemonTerminalSummary[]>([]);
   const [ptyScope, setPtyScope] = useState<DaemonTerminalsScope>();
   const [ptyProgress, setPtyProgress] = useState<ReadonlyMap<string, PtyProgressSummary>>(new Map());
@@ -202,8 +200,8 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   //    ptyRows 는 [] 이고, 그것을 그대로 해석기에 넣으면 reason 이 'empty-terminal-list' 로
   //    나와 ***화면이 「목록이 비었다」는 «틀린 사실»을 말한다***(리뷰 must-fix 2026-08-19).
   const [initialPtyResolution, setInitialPtyResolution] = useState<PtyTerminalIdResolution | { kind: 'list-unavailable' } | null>(null);
-  // URL PTY selection is independently initialized once after the first ready list;
-  // it selects the PTY row, not the terminal tab chosen by initialTerminalSelection.
+  // URL PTY selection initializes once after the federated list resolves;
+  // it opens the live view without activating a shell tab.
   const initialPtyPickDoneRef = useRef(false);
   const selectedPtyId = selectedPty?.id ?? null;
   const selectedPtyKey = selectedPty ? ptyRowKey(selectedPty) : null;
@@ -214,11 +212,6 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const [ptyLineage, setPtyLineage] = useState<PtyLineageState>({ status: 'unrequested' });
   const ptySnapshotRequestRef = useRef(0);
   const ptyLineageRequestRef = useRef(0);
-  const injectAcpRef = useRef<ReturnType<typeof client.connectAcp> | null>(null);
-  useEffect(() => () => {
-    try { injectAcpRef.current?.close(); } catch { /* swallow */ }
-    injectAcpRef.current = null;
-  }, []);
   useEffect(() => {
     if (panelView !== 'terminal' && panelView !== 'pty-list') return;
     let cancelled = false;
@@ -286,15 +279,14 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
       debugLog('webterm.pty-list.frame.error', { id, reason: String(error) });
     });
   }, [client]);
-  // The clicked row travels whole rather than as an id. The row carries the source
-  // root that makes a foreign-universe PTY readable, and an id alone silently
-  // resolves against the current root; looking the row back up by id could also
-  // miss and leave the lineage pinned at 'loading' with nothing to resolve it.
+  // Preserve the clicked row for details and the live view. Duplicate ids across
+  // manifest roots must not silently select a different row.
   const handlePtySelection = useCallback((terminal: DaemonTerminalSummary, direct = false): void => {
     const { id } = terminal;
     if (direct) {
-      pendingPtyUrlSelectionRef.current = terminal;
-      setPtyTabSelection((current) => ({ id, nonce: (current?.nonce ?? 0) + 1 }));
+      setLiveDismissed(false);
+      setLivePty(terminal);
+      onPtySelection?.(terminal);
     }
     // Re-selecting the same ROW is idempotent; a same-id row from another root is
     // a different row and must select.
@@ -324,13 +316,18 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     // ⛔ 목록 조회가 «실패»했으면 빈 목록을 근거로 판정하지 않는다 — 「없다」와 「못 읽었다」는 다른 값이다.
     if (ptyListState === 'error') {
       setInitialPtyResolution({ kind: 'list-unavailable' });
+      setPanelView('pty-list');
       debugLog('webterm.initial-pty-selection', { ptyId: initialPtyId, kind: 'list-unavailable', reason: 'pty-list-error' });
       return;
     }
     const resolution = resolvePtyTerminalId(initialPtyId, ptyRows);
     setInitialPtyResolution(resolution);
+    if (resolution.kind !== 'selected') setPanelView('pty-list');
     debugLog('webterm.initial-pty-selection', { ptyId: initialPtyId, kind: resolution.kind, reason: resolution.reason });
-    if (resolution.kind === 'selected') handlePtySelection(resolution.terminal);
+    if (resolution.kind === 'selected') {
+      handlePtySelection(resolution.terminal);
+      setLivePty(resolution.terminal);
+    }
   }, [handlePtySelection, initialPtyId, ptyListState, ptyRows]);
   const handlePtyViewMode = useCallback((mode: PtyTerminalViewMode): void => {
     if (mode === ptyViewMode) return;
@@ -376,13 +373,18 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   //  ⭐ 선택된 터미널이 속한 런으로 좁힌다 — 창분할(#115)은 «그 런 안에서» 그대로 유지된다.
   //  ⛔ 선택이 어느 런에도 없으면 좁힌 결과가 비고, 렌더가 단일 XtermView 로 «떨어진다».
   const terminalPaneLayout = useMemo(
-    () => paneLayoutForSelection(paneLayout(panePlan(ptyRows)), terminalId ?? ''),
-    [ptyRows, terminalId],
+    () => paneLayoutForSelection(
+      (livePty !== null || (initialPtyId !== null && !liveDismissed))
+        ? paneLayout(panePlan(ptyRows.filter((row) => row.id !== (livePty?.id ?? initialPtyId) && tabIds.includes(row.id))))
+        : paneLayout(panePlan(ptyRows)),
+      terminalId ?? '',
+    ),
+    [ptyRows, tabIds, livePty, liveDismissed, initialPtyId, terminalId],
   );
   // ⛔⭐ 첫 화면이 «클라이언트가 지어낸» preview-1 에 갇히지 않게 (대표 2026-08-17).
   //  저장된 선택이 있으면 이 효과는 «아무것도 안 한다»(위 restore 가 ref 를 세운다).
   useEffect(() => {
-    if (initialPickDoneRef.current) return;
+    if (initialPickDoneRef.current || initialPtyId) return;
     if (ptyListState === 'loading') return;
     // ⛔ 「목록이 비어서 안 골랐다」도 «값으로» 남긴다 — 조용히 빠져나가면
     //   다음 사람이 「자동 선택이 왜 안 돌았나」를 물을 자리가 없다(실측으로 걸렸다).
@@ -407,7 +409,6 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const [foreignActivityTick, setForeignActivityTick] = useState(0);
   const [panelsMinimized, setPanelsMinimized] = useState(false);
   const [chatDockOpen, setChatDockOpen] = useState(true);
-  const [replOpen, setReplOpen] = useState(false);
   const [recording, setRecording] = useState(false);
   const [peerCount, setPeerCount] = useState(0);
   const [tabIntent, setTabIntent] = useState<{ intent: 'next' | 'prev' | number; nonce: number } | null>(null);
@@ -415,15 +416,11 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     setTabIntent({ intent, nonce: Date.now() });
   }, []);
   const dockRef = useRef<TerminalChatDockHandle>(null);
-  const handleReplMirror = useCallback((event: ReplMirrorKind): void => {
-    dockRef.current?.appendMirrored(event);
-  }, []);
-
   // Phase 2 (webterm voice control · PLAN v1.1) — TerminalPanel is
   // voice owner. Single useVoiceController instance · 3 mic entry
   // points share it · activeMicSource decides STT-final routing:
   //   'dock'     → :agent auto-send via TerminalChatDock.submitVoiceTranscript
-  //   'controls' → terminal/input stdin inject (TUI Alt+V dictation 흡수)
+  //   'controls' → registered terminal input sender (TUI Alt+V dictation 흡수)
   // ref pattern (latestRouteRef) keeps the long-lived voice callback
   // pointing at the latest closure (mirrors ChatLayout `handleSubmitRef`).
   const [activeMicSource, setActiveMicSource] = useState<'none' | 'dock' | 'controls'>('none');
@@ -431,8 +428,6 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   activeMicSourceRef.current = activeMicSource;
   const terminalIdRef = useRef(terminalId);
   terminalIdRef.current = terminalId;
-  const sessionIdRef = useRef(sessionId);
-  sessionIdRef.current = sessionId;
 
   const handleVoiceTranscript = useCallback((text: string): void => {
     const trimmed = text.trim();
@@ -443,26 +438,20 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
       // dictations don't collide ('ls' + 'la' becoming 'lsla'). The
       // user still presses Enter manually, mirroring claude-code style
       // dictation: voice types, human commits.
-      const sid = sessionIdRef.current;
       const tid = terminalIdRef.current;
-      if (!sid) return;
-      if (!injectAcpRef.current) injectAcpRef.current = client.connectAcp({ sessionId: sid });
-      const acp = injectAcpRef.current;
-      void acp.send('terminal/input', {
-        sessionId: sid,
-        terminalId: tid,
-        data: trimmed + ' ',
-        peerId: getPeerId(),
-      }).catch((e) => {
-        debugLog('webterm.voice.stdin-inject.error', { reason: String(e) });
-      });
+      if (!tid) return;
+      if (!sendToTerminal(tid, trimmed + ' ')) {
+        debugLog('webterm.voice.stdin-inject-failed', { len: trimmed.length, terminalId: tid, reason: 'no-sender' });
+        toast.error('터미널 입력 전송 실패 — 터미널 연결을 확인하고 다시 말해 주세요.');
+        return;
+      }
       debugLog('webterm.voice.stdin-inject', { len: trimmed.length, terminalId: tid });
     } else if (source === 'dock') {
       dockRef.current?.submitVoiceTranscript(trimmed);
     } else {
       debugLog('webterm.voice.transcript-no-source', { len: trimmed.length });
     }
-  }, [client]);
+  }, []);
 
   const voiceWsUrl = client.voiceWsUrl();
   const voice = useVoiceController({
@@ -552,7 +541,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const stored = window.localStorage.getItem(ACTIVE_KEY);
-    if (stored && stored.length > 0) {
+    if (stored && stored.length > 0 && (!initialPtyId || stored !== initialPtyId)) {
       setTerminalId(stored);
       initialPickDoneRef.current = true; // 사람이 고른 것이 있다 — 자동 선택은 «안 돈다»
     }
@@ -560,17 +549,10 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     if (minStored === '1') setPanelsMinimized(true);
     const dockStored = window.localStorage.getItem(CHAT_DOCK_KEY);
     if (dockStored === '0') setChatDockOpen(false);
-    const replStored = window.localStorage.getItem(REPL_OPEN_KEY);
-    if (replStored === '1') setReplOpen(true);
   }, []);
 
   const onActiveChange = (next: string): void => {
     setTerminalId(next);
-    const pendingPty = pendingPtyUrlSelectionRef.current;
-    if (pendingPty?.id === next) {
-      pendingPtyUrlSelectionRef.current = null;
-      onPtySelection?.(pendingPty);
-    }
     if (typeof window !== 'undefined') {
       window.localStorage.setItem(ACTIVE_KEY, next);
     }
@@ -583,13 +565,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
       debugLog('webterm.attach.no-path', { count: entries.length });
       return;
     }
-    if (!injectAcpRef.current) injectAcpRef.current = client.connectAcp({ sessionId });
-    const result = await injectAttachmentPathsToTerminal({
-      acp: injectAcpRef.current,
-      sessionId,
-      terminalId,
-      paths,
-    });
+    const result = await injectAttachmentPathsToTerminal({ terminalId, paths });
     if (result.injected) {
       const summary = paths.length === 1
         ? '터미널에 path 첨부됨'
@@ -646,26 +622,11 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     });
   };
 
-  const toggleRepl = (): void => {
-    setReplOpen((prev) => {
-      const next = !prev;
-      if (typeof window !== 'undefined') {
-        window.localStorage.setItem(REPL_OPEN_KEY, next ? '1' : '0');
-        // Same rationale as toggleChatDock — repl mount/unmount
-        // changes the xterm container height; force fit() next frame.
-        requestAnimationFrame(() => {
-          window.dispatchEvent(new Event('resize'));
-        });
-      }
-      return next;
-    });
-  };
-
   return (
     <div className="flex h-full flex-col">
       <TerminalTabs
         activeId={terminalId}
-        onActiveChange={onActiveChange}
+        onActiveChange={(id) => { onActiveChange(id); setLivePty(null); setLiveDismissed(true); setPanelView('terminal'); }}
         onInitialTerminalState={handleInitialTerminalState}
         minimized={panelsMinimized}
         onToggleMinimize={toggleMinimized}
@@ -674,8 +635,8 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         chatDockOpen={chatDockOpen}
         onToggleChatDock={toggleChatDock}
         tabIntent={tabIntent}
-        ptyTabSelection={ptyTabSelection}
         onTabsChange={setTabIds}
+        suspendInitialSpawn={Boolean(initialPtyId) && !liveDismissed}
       />
       {initialNotice.fallbackBanner && (
         <p className="border-b border-amber-700/50 bg-amber-950/30 px-3 py-1 text-xs text-amber-200" role="status">
@@ -691,7 +652,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         <button
           type="button"
           aria-pressed={panelState.buttons[0].selected}
-          onClick={() => selectPanelView('terminal')}
+          onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('terminal'); }}
           className={`rounded px-2 py-1 text-xs ${panelState.buttons[0].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
         >
           터미널
@@ -699,7 +660,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         <button
           type="button"
           aria-pressed={panelState.buttons[1].selected}
-          onClick={() => selectPanelView('observe')}
+          onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('observe'); }}
           className={`rounded px-2 py-1 text-xs ${panelState.buttons[1].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
           title="자기신고하는 elanous 대시보드 TUI 를 라이브로 관측(읽기 전용)"
         >
@@ -708,13 +669,13 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         <button
           type="button"
           aria-pressed={panelState.buttons[2].selected}
-          onClick={() => selectPanelView('pty-list')}
+          onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('pty-list'); }}
           className={`rounded px-2 py-1 text-xs ${panelState.buttons[2].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
         >
           PTY 목록
         </button>
       </div>
-      {terminalId ? <div className={panelsMinimized || panelView !== 'terminal' ? 'hidden' : 'contents'}>
+      {terminalId ? <div className={panelsMinimized || panelView !== 'terminal' || livePty !== null || (initialPtyId && !liveDismissed) ? 'hidden' : 'contents'}>
         <MultiDeviceIndicator
           foreignActivityTick={foreignActivityTick}
           onPeerCountChange={setPeerCount}
@@ -726,13 +687,6 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
           onAttached={handleAttached}
           voice={controlsVoiceProp}
         />
-        {replOpen && (
-          <TerminalRepl
-            terminalId={terminalId}
-            onTabIntent={handleTabIntent}
-            onMirror={handleReplMirror}
-          />
-        )}
         {isCoarsePointer && <ModifierBar terminalId={terminalId} />}
         <TerminalDropZone onAttached={handleAttached} />
       </div> : null}
@@ -740,13 +694,14 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         <TerminalPaneLayout
           layout={terminalPaneLayout}
           sessionId={sessionId}
-          terminalIds={tabIds}
-          activeId={terminalId}
+          terminalIds={tabIds.filter((id) => id !== livePty?.id && (liveDismissed || id !== initialPtyId))}
+          activeId={terminalId && (terminalId === livePty?.id || (!liveDismissed && terminalId === initialPtyId)) ? null : terminalId}
           clearRequests={clearRequests}
-          visible={terminalId !== null && panelView === 'terminal'}
+          visible={terminalId !== null && panelView === 'terminal' && livePty === null && (!initialPtyId || liveDismissed)}
           onForeignInputActivity={() => setForeignActivityTick((n) => n + 1)}
         />
-        {!terminalId ? (
+        {livePty && <PtyLiveView key={ptyRowKey(livePty)} terminal={livePty} client={client} onClose={() => { setLiveDismissed(true); setLivePty(null); selectPanelView('terminal'); }} />}
+        {!livePty && panelView === 'terminal' && (!terminalId || (initialPtyId && !liveDismissed)) ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-sm text-muted-foreground" role="status" aria-live="polite">
             {/* ⛔ 목록 조회가 «실패»했는데 주소가 PTY 를 가리키고 있었다면, 그 사실이 여기서도 보여야 한다.
                 종전엔 이 갈래가 일반 안내만 내서 ***「못 읽었다」가 사람에게 «전혀» 닿지 않았다***
@@ -758,7 +713,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
             )}
             <span>{initialNotice.placeholder}</span>
           </div>
-        ) : panelView === 'pty-list' ? (
+        ) : livePty ? null : panelView === 'pty-list' ? (
           <div className="h-full overflow-auto p-3" aria-label="데몬 PTY 목록">
             <label className="mb-3 flex items-center gap-2 text-sm">
               <input
@@ -816,7 +771,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
                   const summary = ptyTerminalRowSummary(terminal);
                   const activity = ptyProgress.get(terminal.id);
                   return (
-                    <li key={terminal.id} className={`rounded border p-2 text-sm ${item.selected ? 'border-emerald-500' : 'border-border'}`}>
+                    <li key={ptyRowKey(terminal)} className={`rounded border p-2 text-sm ${item.selected ? 'border-emerald-500' : 'border-border'}`}>
                       <button
                         type="button"
                         className="w-full text-left"
@@ -903,13 +858,12 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
           <TuiMirrorView key={sessionId} sessionId={sessionId} />
         ) : null}
       </div>
-      {terminalId && !panelsMinimized && panelView !== 'pty-list' && (
+      {terminalId && !panelsMinimized && panelView === 'terminal' && !livePty && (!initialPtyId || liveDismissed) && (
         <TerminalChatDock
           ref={dockRef}
           terminalId={terminalId}
           open={chatDockOpen}
-          replOpen={replOpen}
-          onToggleRepl={toggleRepl}
+          onTabIntent={handleTabIntent}
           voice={dockVoiceProp}
         />
       )}

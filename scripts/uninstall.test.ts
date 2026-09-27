@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -49,6 +49,35 @@ describe('scripts/uninstall.sh', () => {
   });
 
   // 🩸 09-25 — 기억 저장소 기본 위치가 설치 폴더 안(~/.local/share/elanous/memory)이라 통째로 지우면 기억이 사라졌다.
+  test('removes bin/elanous whether it is the old symlink or the installed sh wrapper, without deleting memory', () => {
+    for (const kind of ['symlink', 'wrapper']) {
+      const f = fixture();
+      const elanous = join(f.prefix, 'bin', 'elanous');
+      mkdirSync(join(f.prefix, 'memory'));
+      writeFileSync(join(f.prefix, 'memory', 'MEMORY.md'), 'keep\n');
+      if (kind === 'symlink') symlinkSync('../current/node_modules/.bin/elanous', elanous);
+      else writeFileSync(elanous, '#!/bin/sh\nexit 0\n');
+      const removed = run(f);
+      expect(removed.status, removed.stderr).toBe(0);
+      expect(existsSync(elanous)).toBe(false);
+      expect(existsSync(join(f.prefix, 'bin'))).toBe(false);
+      expect(readFileSync(join(f.prefix, 'memory', 'MEMORY.md'), 'utf8')).toBe('keep\n');
+    }
+  });
+
+  test('removes only a marked eln wrapper and preserves a foreign eln', () => {
+    for (const owned of [true, false]) {
+      const f = fixture();
+      const eln = join(f.prefix, 'bin', 'eln');
+      const body = owned ? '#!/bin/sh\n# elanous-wrapper\nexit 0\n' : '#!/bin/sh\necho other\n';
+      writeFileSync(eln, body);
+      const removed = run(f);
+      expect(removed.status, removed.stderr).toBe(0);
+      expect(existsSync(eln)).toBe(!owned);
+      if (!owned) expect(readFileSync(eln, 'utf8')).toBe(body);
+    }
+  });
+
   test('keeps what is not part of the installation (memory/) and says so; removes only the four install items', () => {
     const f = fixture();
     mkdirSync(join(f.prefix, 'memory'), { recursive: true });

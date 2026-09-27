@@ -1,7 +1,6 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 
 import { bootDashboardShellRunner } from '../src/dashboard/shell-runner-boot.js';
-import { setUserConfigOverlay } from '../src/user-config.js';
 
 type Rollup = { running: number; backgrounded: number };
 type Handle = { id: string };
@@ -17,7 +16,6 @@ type BootHarness = {
   registeredKinds: string[];
   externalTerminalSpec?: Record<string, unknown>;
   fileEngines: unknown[];
-  spawned: Array<{ label: string; host: Host }>;
   runnerFactoryDeps?: {
     getSessionCwd: () => string;
     initialSize: () => { cols: number; rows: number };
@@ -30,6 +28,8 @@ type BootHarness = {
     ptyHostFactory?: (req: RunnerRequest) => Host | null;
   };
   runnerFactoryReqs: RunnerRequest[];
+  /** 부팅에 주입한 의존성 함수가 불린 총 횟수 — `onSpawn` 이 어떤 표면(VW 창 등)도 부르지 않음을 잰다. */
+  depCalls: () => number;
   evicted: string[];
   onUpdate?: (rollup: Rollup) => void;
   onRegister?: (handle: Handle) => void;
@@ -39,11 +39,6 @@ type BootHarness = {
 };
 
 function bootHarness(): BootHarness {
-  setUserConfigOverlay((cfg) => ({
-    ...cfg,
-    dashboard: { ...cfg.dashboard, uiMode: 'rich' },
-  }));
-
   const harness: BootHarness = {
     rollups: [],
     tracked: [],
@@ -51,14 +46,20 @@ function bootHarness(): BootHarness {
     wiredRegistries: [],
     registeredKinds: [],
     fileEngines: [],
-    spawned: [],
     runnerFactoryReqs: [],
+    depCalls: () => 0,
     evicted: [],
   };
   const registry = { kind: 'registry' };
   const fileEngine = { kind: 'file-engine' };
 
-  bootDashboardShellRunner<RunnerRequest, Handle, Host>({
+  let calls = 0;
+  harness.depCalls = () => calls;
+  const countCalls = <T extends object>(deps: T): T => Object.fromEntries(Object.entries(deps).map(([k, v]) =>
+    [k, typeof v === 'function' ? (...args: unknown[]) => { calls += 1; return (v as (...a: unknown[]) => unknown)(...args); } : v])) as T;
+
+  type BootDeps = Parameters<typeof bootDashboardShellRunner<RunnerRequest, Handle, Host>>[0];
+  bootDashboardShellRunner<RunnerRequest, Handle, Host>(countCalls<BootDeps>({
     createBackgroundSurface: (deps) => {
       harness.onUpdate = deps.onUpdate;
       return {
@@ -106,18 +107,13 @@ function bootHarness(): BootHarness {
     termSize: () => ({ cols: 120, rows: 40 }),
     setLatestShellRollup: (rollup) => { harness.rollups.push(rollup); },
     onSpawnError: () => {},
-    spawnVirtualWindowTerminal: (label, host) => { harness.spawned.push({ label, host }); },
     subscribeVirtualWindowClose: (cb) => { harness.subscribed = cb; },
-  });
+  }));
 
   return harness;
 }
 
 describe('bootDashboardShellRunner', () => {
-  afterEach(() => {
-    setUserConfigOverlay(null);
-  });
-
   test('wires rollup updates into latest shell rollup storage', () => {
     const harness = bootHarness();
 
@@ -163,7 +159,6 @@ describe('bootDashboardShellRunner', () => {
     const harness = bootHarness();
 
     const host = harness.shellRunnerDeps?.ptyHostFactory?.({ label: 'job-1' });
-
     expect(harness.fileEngines).toEqual([{ kind: 'file-engine' }]);
     expect(harness.shellRunnerDeps?.registry).toEqual({ kind: 'registry' });
     expect(harness.shellRunnerDeps?.fileEngine).toEqual({ kind: 'file-engine' });
@@ -171,7 +166,10 @@ describe('bootDashboardShellRunner', () => {
     expect(harness.runnerFactoryDeps?.initialSize()).toEqual({ cols: 120, rows: 40 });
     expect(harness.runnerFactoryReqs).toEqual([{ label: 'job-1' }]);
     expect(host).toEqual({ host: 'pty:job-1' });
-    expect(harness.spawned).toEqual([{ label: 'job-1', host: { host: 'pty:job-1' } }]);
+    // essential 은 셸 작업을 헤드리스로 돌린다 — onSpawn 은 주입된 어떤 의존성(VW 창 띄우기 등)도 부르지 않는다.
+    const beforeSpawn = harness.depCalls();
+    harness.runnerFactoryDeps?.onSpawn('job-1', host!);
+    expect(harness.depCalls()).toBe(beforeSpawn);
   });
 
   test('evicts runner hosts when their virtual window closes', () => {

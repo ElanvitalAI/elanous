@@ -26,10 +26,10 @@ export function resolveTextInputTextAction(
   state: InlineEditorState,
   key: Pick<Key, 'name' | 'ctrl' | 'shift'>,
 ): TextInputTextAction {
-  if (key.ctrl) {
+  if (key.ctrl && key.name !== 'w' && key.name !== 'left' && key.name !== 'right') {
     return { kind: 'none' };
   }
-  if (NON_TEXT_NAMED_KEYS.has(key.name)) {
+  if (!key.ctrl && NON_TEXT_NAMED_KEYS.has(key.name)) {
     return { kind: 'none' };
   }
 

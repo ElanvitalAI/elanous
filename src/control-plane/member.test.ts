@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -7,6 +7,7 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import { runNexus } from '../nexus/index.js';
 import { setTestStateRoot } from '../nexus/paths.js';
 import { measureLoad, readMemberToken, startMemberHeartbeat } from './member.js';
+import { resolvePrimary, writePrimaryJoin } from './primary.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -43,8 +44,9 @@ test('registers machine and actual-port instance once, then sends two load heart
       '/v1/resources/register', '/v1/resources/register',
       '/v1/resources/machine%3Alocal/heartbeat', '/v1/resources/machine%3Alocal/heartbeat',
     ]);
-    expect(calls[0]?.body).toMatchObject({ id: 'machine:local', kind: 'machine', machine: 'machine:local' });
+    expect(calls[0]?.body).toMatchObject({ id: 'machine:local', kind: 'machine', machine: 'local' });
     expect(calls[1]?.body).toMatchObject({ kind: 'instance', endpoint: options.instance.endpoint, attrs: { port: 43210 } });
+    expect(calls.slice(0, 2).map(call => call.auth)).toEqual(Array(2).fill(`Bearer ${options.token}`));
     for (const call of calls.slice(2)) {
       expect(call.body.attrs.load).toMatchObject({ loadAvg: expect.any(Array), cpuCount: expect.any(Number), observedAt: 1234 });
       expect(call.auth).toBe(`Bearer ${options.token}`);
@@ -246,6 +248,28 @@ test('404 heartbeat re-registers both records before resuming', async () => {
   } finally { stop(); }
 });
 
+test('member credential prefers the joined member scope, with a read-only local fallback', () => {
+  const root = mkdtempSync(join(tmpdir(), 'control-member-choice-'));
+  roots.push(root);
+  const local = 'a'.repeat(64);
+  const joined = 'b'.repeat(64);
+  mkdirSync(join(root, 'control'));
+  writeFileSync(join(root, 'control', 'tokens.json'), JSON.stringify({ member: local }));
+  expect(readMemberToken(root)).toBe(local);
+  writePrimaryJoin({ url: 'https://primary.example', tokens: { member: joined } }, root);
+  expect(readMemberToken(root)).toBe(joined);
+  writePrimaryJoin({ url: 'https://primary.example', tokens: { query: 'c'.repeat(64) } }, root);
+  expect(readMemberToken(root)).toBe(local);
+  expect(resolvePrimary({ root, role: 'member' }).token).toBeUndefined();
+  chmodSync(join(root, 'control', 'join.json'), 0o644);
+  expect(readMemberToken(root)).toBe(local);
+  writeFileSync(join(root, 'control', 'tokens.json'), JSON.stringify({ member: 'invalid' }));
+  expect(readMemberToken(root)).toBeUndefined();
+  writePrimaryJoin({ url: 'https://primary.example', tokens: { member: joined } }, root);
+  expect(readMemberToken(root)).toBe(joined);
+  expect(existsSync(join(root, 'control', 'member-tokens.json'))).toBe(false);
+});
+
 test('missing member token keeps Nexus registration off despite an HTTP listener', async () => {
   const root = mkdtempSync(join(tmpdir(), 'control-member-missing-'));
   roots.push(root);
@@ -264,6 +288,53 @@ test('missing member token keeps Nexus registration off despite an HTTP listener
     expect(logSpy.mock.calls.filter(([category, event]) =>
       category === 'control.member' && event === 'start-skipped')).toHaveLength(1);
   } finally { nexus?.release(); fetchSpy.mockRestore(); logSpy.mockRestore(); }
+});
+
+test('Nexus registers to the joined Primary with its member credential', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'control-member-joined-'));
+  roots.push(root);
+  setTestStateRoot(root);
+  setElanousConfigDir(root);
+  const joined = 'b'.repeat(64);
+  mkdirSync(join(root, 'control'));
+  writeFileSync(join(root, 'control', 'tokens.json'), JSON.stringify({ member: 'a'.repeat(64) }));
+  writePrimaryJoin({ url: 'https://primary.example:31413', tokens: { member: joined } }, root);
+  const calls: Array<{ url: string; auth: string | null; body: any }> = [];
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(Object.assign(
+    async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push({ url: String(input), auth: new Headers(init?.headers).get('authorization'), body: JSON.parse(String(init?.body)) });
+      return Response.json({});
+    }, { preconnect: globalThis.fetch.preconnect },
+  ));
+  let nexus: Awaited<ReturnType<typeof runNexus>>;
+  try {
+    nexus = await runNexus({ detachForTesting: true, skipHttpServer: false, skipSupervisor: true,
+      skipRuntimeApi: true, registerDaemonTab: false, registerSettingsTab: false, mcpEnabled: false });
+    await until(() => calls.length === 2);
+    expect(calls.map(call => call.url)).toEqual(Array(2).fill('https://primary.example:31413/v1/resources/register'));
+    expect(calls.map(call => call.auth)).toEqual(Array(2).fill(`Bearer ${joined}`));
+    expect(calls[0]?.body.kind).toBe('machine');
+    expect(calls[1]?.body).toMatchObject({ kind: 'instance', endpoint: nexus?.httpServer?.url });
+    expect(readMemberToken(root)).toBe(joined);
+  } finally { nexus?.release(); fetchSpy.mockRestore(); }
+});
+
+test('Nexus does not send a local member credential to a joined Primary without member scope', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'control-member-scoped-'));
+  roots.push(root);
+  setTestStateRoot(root);
+  setElanousConfigDir(root);
+  mkdirSync(join(root, 'control'));
+  writeFileSync(join(root, 'control', 'tokens.json'), JSON.stringify({ member: 'a'.repeat(64) }));
+  writePrimaryJoin({ url: 'https://primary.example:31413', tokens: { query: 'c'.repeat(64) } }, root);
+  const fetchSpy = spyOn(globalThis, 'fetch');
+  let nexus: Awaited<ReturnType<typeof runNexus>>;
+  try {
+    nexus = await runNexus({ detachForTesting: true, skipHttpServer: false, skipSupervisor: true,
+      skipRuntimeApi: true, registerDaemonTab: false, registerSettingsTab: false, mcpEnabled: false });
+    await Bun.sleep(30);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  } finally { nexus?.release(); fetchSpy.mockRestore(); }
 });
 
 test('Nexus registers after binding the actual port without waiting for an unresponsive coordinator, and stops on release', async () => {

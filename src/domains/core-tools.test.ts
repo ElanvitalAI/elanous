@@ -66,7 +66,7 @@ describe('L2 배선 가드 (서피스 무관 코어 노출)', () => {
   // ★ turn 조립기 통일 Phase 0(2026-07-22) — CLI/daemon 은 core 를 buildSharedAppTools(core+finance 단일
   //   조립기) 경유로 상속(직접 buildCoreTools 대신). shared-app-tools 가 buildCoreTools 를 품는다(아래 별도 가드).
   test('CLI(buildCliAgentTools)가 core 를 buildSharedAppTools 로 상속', () => {
-    const src = read('../index.ts');
+    const src = read('../cli/agent-cli.ts');
     expect(src).toContain('buildSharedAppTools(cfg)');
   });
   test('daemon toolSurface(PWA/iOS/discord/TUI)가 core 를 buildSharedAppTools 로 상속', () => {

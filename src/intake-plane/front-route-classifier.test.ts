@@ -11,6 +11,7 @@ const resolveRoleProvider = (role: string) => {
 const reply = (response: string): StreamLlmFn => async (_messages, _onChunk, opts) => {
   expect(opts?.provider?.name).toBe('stub');
   expect(opts?.model).toBe('test-model');
+  expect(opts?.usageRole).toBe('classify');
   return response;
 };
 

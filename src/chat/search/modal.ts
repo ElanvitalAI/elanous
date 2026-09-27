@@ -157,6 +157,7 @@ export function createSearchModal(spec: SearchModalSpec): SearchModalHandle {
   const submitCurrent = (): void => {
     const item = items[cursor];
     if (item) spec.onAccept(item, query);
+    else spec.onCancel?.();
   };
 
   // SelectView as the paint engine. Filtering stays with the caller
@@ -255,8 +256,19 @@ export function createSearchModal(spec: SearchModalSpec): SearchModalHandle {
 
   // KX3 — coordinator.routeKey drives this directly. Unknown keys
   // still return 'consumed' so the modal behaves as a keyboard trap
-  // (matches legacy router contract).
-  const onKey = (ev: KeyEvent): 'consumed' | 'passthrough' => routeSearchModalKeyInput(ev, handle);
+  // (matches legacy router contract). Accept alternate terminal key names
+  // before delegating the ordinary keys to the shared router.
+  const onKey = (ev: KeyEvent): 'consumed' | 'passthrough' => {
+    if (ev.name === 'esc' || ev.name === '\x1b' || ev.sequence === '\x1b') {
+      handle.cancel();
+      return 'consumed';
+    }
+    if (ev.name === 'return') {
+      handle.accept();
+      return 'consumed';
+    }
+    return routeSearchModalKeyInput(ev, handle);
+  };
 
   const onMouse = (ev: DisplayMouseEvent): Action => {
     const localX = ev.col - spec.bounds.col;

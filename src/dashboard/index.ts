@@ -295,24 +295,10 @@ export interface RegisterDashboardGlobalKeysDeps {
   register: (binding: DashboardGlobalKeyRegistration) => void;
   openSurfaceCatalog: () => void;
   surfaceCatalogWhen?: () => boolean;
-  dispatchVirtualWindowChord: (event: DisplayKeyEvent) => void;
 }
 
-/** Registers optional dashboard controls and the core VW controls that must always remain available. */
+/** Registers optional dashboard controls. */
 export function registerDashboardGlobalKeys(deps: RegisterDashboardGlobalKeysDeps): void {
-  const registerVwChord = (id: string, key: string, event: DisplayKeyEvent): void => {
-    deps.register({
-      id: `dashboard:vw-chord:${id}`,
-      chordPrefix: 'C-b',
-      key,
-      scope: 'global',
-      handler: () => deps.dispatchVirtualWindowChord(event),
-    });
-  };
-  const vwKey = (name: string, mods: Partial<DisplayKeyEvent> = {}): DisplayKeyEvent => ({
-    name, ctrl: false, shift: false, alt: false, ...mods,
-  });
-
   if (deps.enableSupplementalGlobalKeys) {
     deps.register({
       id: 'dashboard:open-surface-catalog',
@@ -321,14 +307,7 @@ export function registerDashboardGlobalKeys(deps: RegisterDashboardGlobalKeysDep
       handler: deps.openSurfaceCatalog,
       when: deps.surfaceCatalogWhen,
     });
-    registerVwChord('picker', '0', vwKey('0'));
-    registerVwChord('close-window', 'S-x', vwKey('x', { shift: true }));
-    registerVwChord('last-pane', 'tab', vwKey('tab'));
   }
-
-  registerVwChord('new-window', 'c', vwKey('c'));
-  registerVwChord('close-pane', 'x', vwKey('x'));
-  registerVwChord('zoom-toggle', 'z', vwKey('z'));
 }
 
 export type ForkableSessionTurn = {
@@ -515,7 +494,6 @@ import {
 import { defaultTimelineBaseDir } from '../tool-runtime/recording-runtimes-paths.js';
 import { layoutsDir } from '../virtual-windows/layout/persistence.js';
 import { createVisualStateStore } from '../panes/visual-state.js';
-import { skipWindowWhenStorePredicate } from '../panes/alt-skip-predicate.js';
 import { composeIdentityHooks } from '../display/modal-identity-wiring.js';
 import { composeWorkspaceHostHooks } from '../display/workspace-host-wiring.js';
 import {
@@ -650,7 +628,6 @@ import {
   matchDashboardChordAction,
 } from './input/dashboard-chord-actions.js';
 import { createDashboardChordRuntime } from './input/dashboard-chord-runtime.js';
-import { createMouseDockRuntime } from './input/mouse-dock-runtime.js';
 import { handleDashboardDisplayKeyRoute } from './input/dashboard-display-key-route.js';
 import { routeDashboardPriorityKey } from './input/dashboard-priority-key-route.js';
 import { shouldPassthroughDashboardHostOwnedInputCoreAction } from './input/input-core-host-action.js';
@@ -915,15 +892,12 @@ import {
 import { globalVoiceCostTracker } from '../voice/cost-tracker.js';
 import { createDashboardMouseWiring } from './input/mouse-wiring.js';
 import { createMouseConversationPopupRuntime } from './input/mouse-conversation-popup-runtime.js';
-import { createMouseHoverRuntime } from './input/mouse-hover-runtime.js';
 import { createMouseModalHitRuntime } from './input/mouse-modal-hit-runtime.js';
 import { createMouseModalSurfaceRuntime } from './input/mouse-modal-surface-runtime.js';
 import { createMouseModeSwitchRuntime } from './input/mouse-mode-switch-runtime.js';
 import { createMousePaneHitRuntime } from './input/mouse-pane-hit-runtime.js';
 import { createMousePickerRuntime } from './input/mouse-picker-runtime.js';
-import { createMousePillContextRuntime } from './input/mouse-pill-context-runtime.js';
 import { createMouseShellRollupRuntime } from './input/mouse-shell-rollup-runtime.js';
-import { createMouseWorkspaceRestoreRuntime } from './input/mouse-workspace-restore-runtime.js';
 import { createDashboardPluginBaseRuntime } from './plugin-base-runtime.js';
 import { createDashboardPluginExecutionRuntime } from './plugin-execution-runtime.js';
 import { createDashboardPluginPaneRuntime } from './plugin-pane-runtime.js';
@@ -987,7 +961,6 @@ import { runDashboardSkillByName } from './skill-runtime.js';
 import { createDashboardClipboardActions } from './clipboard-actions.js';
 import {
   buildDashboardEditorOpenPayload,
-  buildDashboardScratchDumpLines,
 } from './clipboard-message-runtime.js';
 import { createDashboardCopyRuntime } from './copy-runtime.js';
 import { createDashboardMediaRuntime } from './media-runtime.js';
@@ -998,7 +971,6 @@ import { createDashboardContextMenuFeedbackRuntime } from './context-menu-feedba
 import { createDashboardStatusFeedbackRuntime } from './status-feedback-runtime.js';
 import { createDashboardTransferFeedbackRuntime } from './transfer-feedback-runtime.js';
 import { createDashboardFinderFeedbackRuntime } from './finder-feedback-runtime.js';
-import { createDashboardWindowSlashRuntime } from './window-slash-runtime.js';
 import { createDashboardBenchSlashRuntime } from './bench-slash-runtime.js';
 import { createDashboardTermSlashRuntime } from './term-slash-runtime.js';
 import { createDashboardShellSlashRuntime } from './shell-slash-runtime.js';
@@ -1006,10 +978,8 @@ import { createDashboardRunSkillSlashRuntime } from './run-skill-slash-runtime.j
 import { createDashboardSkillTriggersSlashRuntime } from './skill-triggers-slash-runtime.js';
 import { createDashboardProviderSlashRuntime } from './provider-slash-runtime.js';
 import { createDashboardPreviewSlashRuntime } from './preview-slash-runtime.js';
-import { createDashboardScratchSlashRuntime } from './scratch-slash-runtime.js';
-import { createDashboardCompanionSlashRuntime } from './companion-slash-runtime.js';
+import { createDashboardCompanionSlashRuntime } from './companion-messages-runtime.js';
 import { createDashboardAgentsSlashRuntime } from './agents-slash-runtime.js';
-import { createDashboardViewSlashRuntime } from './view-slash-runtime.js';
 import { createDashboardControlSignalSlashRuntime } from './control-signal-slash-runtime.js';
 import { createDashboardBrowserCdpSlashRuntime } from './browser-cdp-slash-runtime.js';
 import { collectGroundingFactsViaCdp } from '../product-grounding/cdp-collect.js';
@@ -1025,9 +995,6 @@ import { resolveDashboardMediaSlash } from './media-slash-runtime.js';
 import { createDashboardMemoCompanionRuntime } from './memo-companion-runtime.js';
 import { createDashboardDetailViewerRuntime } from './detail-viewer-runtime.js';
 import { createDashboardCompanionWidgetRuntime } from './companion-widget-runtime.js';
-import { createDashboardScratchWidgetRuntime } from './scratch-widget-runtime.js';
-import { createDashboardScratchStateRuntime } from './scratch-state-runtime.js';
-import { createRichScratchViewers } from './rich-scratch-viewers.js';
 import { createDashboardClipboardHistoryRuntime } from './clipboard-history-runtime.js';
 import { createDashboardClipboardCompanionRuntime } from './clipboard-companion-runtime.js';
 import { createDashboardMemoWidgetRuntime } from './memo-widget-runtime.js';
@@ -1108,15 +1075,10 @@ import type { SurfaceUx } from '../agent/surface-ux/types.js';
 import { getDefaultQuestionChannels, type QuestionChannel } from '../hitl/question.js';
 import { getDefaultCompactProvider, scheduleArchiveRetentionOnce } from '../compact/index.js';
 import { attachDashboardWorkingDirSelection } from './working-dir-selection-attachment.js';
-import { createDashboardVirtualWindowControlRuntime } from './virtual-window-control-runtime.js';
-import { createDashboardVirtualWindowHelpRuntime } from './virtual-window-help-runtime.js';
 import { createBrowserHelpRuntime } from './browser-help-runtime.js';
 import { createBrowserChordRuntime } from './browser-chord-runtime.js';
 import { summarizeFileWithLLM } from './browser-llm-summary.js';
-import { createDashboardVirtualWindowInputRuntime } from './virtual-window-input-runtime.js';
 import { resolveDashboardHostChromePolicy } from './host-chrome-policy.js';
-import { createDashboardVirtualWindowMutationRuntime } from './virtual-window-mutation-runtime.js';
-import { createDashboardVirtualWindowSplitRuntime } from './virtual-window-split-runtime.js';
 import {
   bootDashboardPlanModeRuntime,
   cleanupDashboardWorktreeSessions,
@@ -1156,7 +1118,6 @@ import {
   type VirtualWindowTitleMenuPayload,
 } from '../virtual-window-context-menu.js';
 // writeClipboard imported below with other clipboard helpers (line ~185).
-import { registerVwFastSwitchBindings } from './windowing/fast-switch.js';
 import {
   renderPaneNav, paneAtColumn, paneNavLabel,
   type PaneNavHitArea,
@@ -1204,15 +1165,9 @@ import { createInteractiveTerminalModal } from '../interactive-terminal-modal.js
 import { showToast } from './render/toast.js';
 import {
   browserWidgetInstanceIdForView,
-  renderPaneModalHint,
   shortcutFor,
-  SHORTCUT_TABLE as PANE_SHORTCUT_TABLE,
-  PANE_MODAL_CHORD_TIMEOUT_MS,
 } from './modals/pane.js';
-// FU-2 — routeVirtualWindowKey import removed. VW chord 는 coordinator
-// 의 registerKeyBinding chord 경로로 이전. imperative 호출용 파일은
-// dashboard-virtual-window-key-router.ts 에 그대로 유지.
-import { showTransientTerminalModal } from './modals/transient.js';
+import { showTransientTerminalModal, currentTransientTerminalModal } from './modals/transient.js';
 import { showPaneMultiModal, showLivePaneMultiModal, currentPaneMultiModal, type PaneMultiModalHandle } from './modals/pane-multi.js';
 import {
   resolveCompanionPopupChrome,
@@ -1246,8 +1201,6 @@ import {
   createVwExitPaneCloser,
   installVwLifecycleHandlers,
 } from './windowing/lifecycle.js';
-import { parseWindowCompanionSlash } from './windowing/companion-slash.js';
-import { createVisibilityChordHandler } from './windowing/visibility-chord.js';
 import { createPaneContent } from '../virtual-windows/pane-content.js';
 import type { PaneId } from '../virtual-windows/addressing.js';
 import {
@@ -1322,19 +1275,11 @@ import {
   DASHBOARD_MAIN_WORKSPACE_ID,
   workspaceOwnerIdForVirtualWindow,
 } from '../display/workspace-affinity.js';
-import { createVwSelectorPopup } from '../virtual-windows/vw-selector-popup.js';
-import { createVwLocalInputTargetPopup } from '../virtual-windows/vw-local-input-target-popup.js';
-import { createVwRenameModal } from '../virtual-windows/vw-rename-modal.js';
 import { spawnLLMBenchmark, MAX_BENCHMARK_PANES } from '../virtual-windows/benchmark-preset.js';
 import { PROVIDERS as LLM_PROVIDERS } from '../llm.js';
 import { initDashboardHitl, stopDashboardHitl } from './runtime/hitl.js';
-import { openDashboardWindowPickerPopup } from './window-picker-popup.js';
 import { createIulSidebarShellPaneContent } from '../iul/sidebar-shell.js';
 import { openDashboardShellRollupPopup } from './shell-rollup-popup.js';
-import {
-  openVwLocalInputTargetPopupLauncher,
-  openVwRenameModalLauncher,
-} from './vw-popup-openers.js';
 import { expandPromptReferences } from '../prompt/references.js';
 import { spawnCodingAgent, CodingAgentBinaryMissing } from '../terminal/coding-agent.js';
 import type { TerminalSession } from '../terminal/session-registry.js';
@@ -1367,7 +1312,7 @@ import { enqueuePendingUserInput } from '../session/pending-input.js';
 import { createAttachmentRowMap } from '../log-pane/attachment-row-map.js';
 import { createAttachmentPopup, type AttachmentPopupAction } from '../log-pane/attachment-popup.js';
 import { findLogMatches, type LogSearchResult } from '../log-pane/search.js';
-import { createLogSearchModal } from '../log-pane/search-modal.js';
+import { createLogSearchModal, type LogSearchModalOpts } from '../log-pane/search-modal.js';
 // U-4.3 · direct imports of tryAttachmentHitAtBodyRow /
 // tryHandleLogAreaClick are gone · wd-log.onMouse owns the hit-test.
 // LogClickDispatchDeps type still needed for buildLogClickDeps +
@@ -1379,7 +1324,7 @@ import {
 import { fileColor, fileIcon, sizeStr, dirColor } from '../panes/file-icons.js';
 import { canPreview } from '../panes/preview-pane.js';
 import { colorLine } from '../panes/syntax-color.js';
-import { createHud, setSegment, clearSegment, renderHud } from '../panes/hud.js';
+import { createHud, setSegment, clearSegment } from '../panes/hud.js';
 import {
   paneHeightBeforeTargetRow,
   paneHeightForTargetRows,
@@ -1496,7 +1441,7 @@ import { buildAstGrepHostTool } from '../skills/tools/ast-grep.js';
 import { buildLspHostTool } from '../skills/tools/lsp/index.js';
 import { PluginHost } from '../plugins/core/host.js';
 import { registerDashboardPaneHostTools } from './panes/host-tools.js';
-import { DEFAULT_THEME_TOKENS, mergeThemeTokens, resolveThemeTokens, type ThemeTokenInput } from '../theme/tokens.js';
+import { DEFAULT_THEME_TOKENS, mergeThemeTokens, resolveThemeTokens, type ThemeTokenInput, type ThemeTokens } from '../theme/tokens.js';
 import { resolveActiveTheme, setActivePresetInConfig } from './render/theme-resolver.js';
 import { getTheme, listThemes } from '../themes/index.js';
 import type { PaneFocus, PreviewSource, WorkingDirView } from '../workspace-types.js';
@@ -1558,7 +1503,6 @@ import {
   pruneSurfaceCatalogForCompactMode,
   productCompactModeForViewport,
 } from '../views/product-compact-mode.js';
-import { isDashboardHeavyFeatureEnabled, resolveDashboardUiMode, type DashboardUiMode } from '../views/ui-mode.js';
 import { readScopedRenderLogs, resolveRenderSuppressed, readScopedDebugLevel, resolveStartupDebugLevel, hotPathGateOpen } from '../mss/logging/scoped-level.js';
 import { resolveCurrentInstance } from '../instance/current.js';
 import { createPushLog } from '../push-log.js';
@@ -1752,10 +1696,6 @@ export interface ShowDashboardOptions {
    *  input). Useful on tablets where the 3-pane grid is too narrow
    *  to read. Toggle at runtime with /chat or the chord in the HUD. */
   chatOnly?: boolean;
-  /** TUI 부활 T0 — CLI `--rich`. 이번 실행만 uiMode 를 rich 로 강제
-   *  (config 무변). essential 이 기본이 된 뒤 기존 full dashboard 로
-   *  들어가는 탈출구. 해석은 views/ui-mode.ts resolveDashboardUiMode. */
-  rich?: boolean;
   /** Flip code-edit policy to unsupervised at boot — every Edit/Write
    *  from the LLM applies without an approval modal. Equivalent to
    *  typing `/code-edit policy unsupervised` right after launch.
@@ -1894,18 +1834,16 @@ export function renderDashboardCoordinatorModalOverlay(display: Pick<DisplayCoor
  *  ⭐⭐⭐ **essential 은 커서 값을 Z축에 묻지 않는다**(2026-08-02 · RFC essential-z-axis-off).
  *  입력 루프가 끝나면 `setCursor(null)` 로 소유가 비므로 물어보면 빈손이고, 그래서 턴이 도는
  *  동안 커서가 사라졌다(라이브 14 표본 전부 `visible false`). ⇒ 모달이 **실제로 claim** 했으면
- *  그 값을 쓰고, 아니면 **프롬프트 caret** 을 쓴다. 프롬프트가 감춰졌으면 숨긴다.
- *  ⚠️ rich 는 Z축을 실제로 쓰므로 종전 동작(조율자가 정한 값)을 그대로 둔다. */
+ *  그 값을 쓰고, 아니면 **프롬프트 caret** 을 쓴다. 프롬프트가 감춰졌으면 숨긴다. */
 export interface DashboardFrameInput {
   overlay: string;
   force: boolean;
-  essential: boolean;
   /** ⭐ Z축이 **실제로 누구에게** 커서를 준 결정. essential 은 `modal`·`terminal` 일 때만
    *  그 값에 양보한다 — `coordinator` fallback 은 소유자가 없다는 뜻이지 claim 이 아니다. */
   cursorOwner: CursorDecision['owner'];
   claimedCursor: CursorState | null;
-  /** rich 전용 — `#6528` 까지의 동작을 그대로 보존한다(조율자가 emit 하던 값). */
-  coordinatorCursor: CursorState | null;
+  /** essential 결정이 커서를 안 낼 때(null)의 폴백 — 조율자가 emit 하던 값(종전 동작 보존). */
+  coordinatorCursor?: CursorState | null;
   promptCaret: CursorState | null;
   suppressPromptArea: boolean;
   onEssentialFrameCursorDecision?: (observation: EssentialFrameCursorObservation) => void;
@@ -1941,31 +1879,27 @@ export function createDashboardEssentialCursorObserver(deps: DashboardEssentialC
 
 export function renderDashboardFrame(
   lines: string[],
-  input: DashboardFrameInput & { onEssentialFrameCursorDecision?: (observation: EssentialFrameCursorObservation) => void },
+  input: DashboardFrameInput,
   renderFrame: DashboardFrameRenderer = render,
 ): void {
   const cursorDecisionExists = input.cursorOwner !== 'none';
-  const essentialDecision = input.essential
-    ? resolveEssentialFrameCursorDecision({
-        claimedCursor: cursorDecisionExists ? input.claimedCursor : null,
-        promptCaret: input.promptCaret,
-        suppressPromptArea: input.suppressPromptArea,
-      })
-    : null;
+  const essentialDecision = resolveEssentialFrameCursorDecision({
+    claimedCursor: cursorDecisionExists ? input.claimedCursor : null,
+    promptCaret: input.promptCaret,
+    suppressPromptArea: input.suppressPromptArea,
+  });
   renderFrame(lines, {
     overlay: input.overlay,
     force: input.force,
-    cursor: paintCursor(essentialDecision?.cursor ?? input.coordinatorCursor),
+    cursor: paintCursor(essentialDecision.cursor ?? input.coordinatorCursor ?? null),
   });
-  if (essentialDecision) {
-    input.onEssentialFrameCursorDecision?.({
-      caret: essentialDecision.cursor,
-      cursorOwner: input.cursorOwner,
-      reason: essentialDecision.reason,
-      source: essentialDecision.source,
-      suppressPromptArea: input.suppressPromptArea,
-    });
-  }
+  input.onEssentialFrameCursorDecision?.({
+    caret: essentialDecision.cursor,
+    cursorOwner: input.cursorOwner,
+    reason: essentialDecision.reason,
+    source: essentialDecision.source,
+    suppressPromptArea: input.suppressPromptArea,
+  });
 }
 
 /** Production frame input: append coordinator modals after every dashboard-owned overlay. */
@@ -2166,6 +2100,47 @@ export async function dispatchDashboardAdSlash(
 ): Promise<void> {
   await runtime.run(args);
   afterRun();
+}
+
+export function createDashboardLogSearchOpener(deps: {
+  display: () => DisplayCoordinator;
+  linesGetter: LogSearchModalOpts['linesGetter'];
+  initialQuery: () => string;
+  termSize: () => { cols: number; rows: number };
+  computePaneH: (rows: number) => number;
+  currentThemeTokens: () => ThemeTokens;
+  currentWorkspaceOwnerId: () => string;
+  draw: () => void;
+  onJump: LogSearchModalOpts['onJump'];
+  onCancel: NonNullable<LogSearchModalOpts['onCancel']>;
+}): () => void {
+  return () => {
+    let modalHandle: { dispose(): void } | null = null;
+    const closeLogSearchModal = (): void => { modalHandle?.dispose(); modalHandle = null; };
+    const { cols: tc, rows: tr } = deps.termSize();
+    const anchorRow = Math.max(1, deps.computePaneH(tr) + 2);
+    const anchorCol = Math.max(2, Math.floor(tc / 4));
+    const popup = createLogSearchModal({
+      linesGetter: deps.linesGetter,
+      initialQuery: deps.initialQuery(),
+      termCols: tc,
+      termRows: tr,
+      anchorRow,
+      anchorCol,
+      theme: deps.currentThemeTokens(),
+      onJump: (result, query) => {
+        closeLogSearchModal();
+        deps.onJump(result, query);
+      },
+      onCancel: query => {
+        closeLogSearchModal();
+        deps.onCancel(query);
+      },
+    });
+    attachSurfaceToWorkspace(popup.surface, deps.currentWorkspaceOwnerId());
+    modalHandle = deps.display().pushModal(popup.surface);
+    deps.draw();
+  };
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
@@ -2397,10 +2372,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
    *  same file isn't re-loading twice. Repeats inside the same call
    *  (same id appearing twice in `added`) are also collapsed.
    *
-  *  Image attachments push a chafa-rendered preview into the
-  *  detail viewer (set via setScratchImage) so the user sees what
-  *  they grabbed without an intrusive modal — only on the first
-  *  appearance to keep `(already attached)` cases quiet. */
+   *  Image attachments stay in the chat log without a scratch preview. */
   const renderAttachmentSummary = (added: { attachment: Attachment; isNew: boolean }[]): void => {
     renderDashboardAttachmentSummary(added, {
       formatNewLine: (attachment) =>
@@ -2412,16 +2384,6 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
         return chatLines.length - 1;
       },
       trackRow: (row, attachmentId) => { attachmentRowMap.track(row, attachmentId); },
-      // TUI 부활 T4 — attach 시 detail viewer(scratch) 프리뷰 push 는
-      // rich 전용. essential 은 chat log 의 attachment summary 줄만
-      // (codex 패리티 · dogfood: @픽커 Tab attach 가 프리뷰 팝업을 띄워
-      // 흐름을 끊는다는 피드백). 런타임 /ui 전환을 따르도록 호출 시점 게이트.
-      setScratchImage: async (...args: Parameters<typeof setScratchImage>) => {
-        if (isDashboardHeavyFeatureEnabled(dashboardUiMode, 'scratch-image')) await setScratchImage(...args);
-      },
-      setScratchFile: (...args: Parameters<typeof setScratchFile>) => {
-        if (isDashboardHeavyFeatureEnabled(dashboardUiMode, 'scratch-file')) setScratchFile(...args);
-      },
     });
   };
 
@@ -2565,7 +2527,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
         });
       },
       foldMode: logFoldMode,
-      expandHint: dashboardUiMode === 'rich',
+      expandHint: false,
     });
 
   // Session-scoped skill decline memory (session 21). When the user
@@ -2626,32 +2588,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
         pushDebugLine(C.muted(`  \u251c\u2500 `) + C.text(att.token) + ' ' + C.subtext('(already attached)'));
       }
       clearSegment(hud, 'clipimg');
-      // Push a chafa preview into the detail viewer — only on
-      // first registration so repeat Ctrl+V on the same clipboard
-      // doesn't churn the pane. TUI 부활 T4 — rich 전용 (essential 은
-      // summary 줄 + [Image #N] 토큰만 · codex 패리티).
-      if (isNew && isDashboardHeavyFeatureEnabled(dashboardUiMode, 'scratch-image')) void setScratchImage(att.sourcePath, att.filename);
-      // P3 — also pop a transient centered modal so the user gets
-      // immediate confirmation that the paste landed (scratch pane
-      // may be out of view on narrow layouts). 2.5s TTL, replaces
-      // any prior image modal in flight.
-      //
-      // Clipboard confirmation preview: routes through showPreviewModal
-      // (previewFile → handler pipeline). Identical result for PNG
-      // clips; forward-compat for non-image clipboard drops (PDFs /
-      // SVGs / archives) once the extractor grows those types.
-      // TUI 부활 T4 — 확인용 transient 모달도 rich 전용. essential 은
-      // attach summary 줄이 이미 즉시 확인을 제공한다.
-      if (isNew && isDashboardHeavyFeatureEnabled(dashboardUiMode, 'clipboard-preview-modal')) {
-        const { rows: tr, cols: tc } = termSize();
-        void showPreviewModal(att.sourcePath, {
-          coordinator: display,
-          termCols: tc,
-          termRows: tr,
-          title: att.filename,
-          ttlMs: 2500,
-        }).catch(() => { /* modal render failure is non-fatal */ });
-      }
+      // The attachment summary confirms the paste without a scratch preview or modal.
       return `${att.token} `;
     } catch (err: any) {
       // grabClipboardImage now throws with the osascript diagnostic
@@ -2668,19 +2605,21 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
     }
   };
 
-  const renderContextList = (): void => {
+  const renderContextList = (): string[] => {
     const items = ctxList(contextRegistry);
+    const lines: string[] = [];
+    const output = (line: string): void => { pushDebugLine(line); lines.push(line); };
     pushDebugBlank();
-    pushDebugLine(C.accent('\u276f /context'));
+    output(C.accent('\u276f /context'));
     if (!items.length) {
-      pushDebugLine(C.muted('  (empty)'));
-      return;
+      output(C.muted('  (empty)'));
+      return lines;
     }
     const totalBytes = ctxTotalBytes(contextRegistry);
     const total = fmtBytes(totalBytes);
-    pushDebugLine(C.muted(`  ${items.length} items, ${total} total`));
+    output(C.muted(`  ${items.length} items, ${total} total`));
     if (totalBytes > CTX_WARN_BYTES) {
-      pushDebugLine(C.warning(`  ⚠ ${total} exceeds 10MB — consider /context clear big`));
+      output(C.warning(`  ⚠ ${total} exceeds 10MB — consider /context clear big`));
     }
 
     // Table columns: ✓  id   kind   filename(trunc)   size   [source-tail]
@@ -2688,7 +2627,7 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
     // left indent; filename gets the slack column so long paths just clip.
     const { cols } = termSize();
     const filenameMax = Math.max(18, cols - 36);
-    pushDebugLine(C.muted(
+    output(C.muted(
       `  ${'  '}${'id'.padEnd(4)}${'kind'.padEnd(7)}${'file'.padEnd(filenameMax)}${'size'.padStart(8)}`
     ));
     for (const a of items) {
@@ -2697,8 +2636,9 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
       const kindCol = (KIND_DISPLAY[a.kind] ?? a.kind).padEnd(7);
       const file    = ellipsize(a.filename, filenameMax).padEnd(filenameMax);
       const size    = fmtBytes(a.sizeBytes).padStart(8);
-      pushDebugLine(`  ${mark} ${C.muted(idCol)}${C.muted(kindCol)}${C.text(file)}${C.subtext(size)}`);
+      output(`  ${mark} ${C.muted(idCol)}${C.muted(kindCol)}${C.text(file)}${C.subtext(size)}`);
     }
+    return lines;
   };
 
   const chat = createChatState(
@@ -2856,40 +2796,30 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     const target = logSearchResults[logSearchCursor]!;
     scrollToSearchResult(target);
   };
-  const openLogSearchModal = (): void => {
-    const { cols: tc, rows: tr } = termSize();
-    const pH = computePaneH(tr);
-    // Anchor near the top of the log pane for predictable placement.
-    const anchorRow = Math.max(1, pH + 2);
-    const anchorCol = Math.max(2, Math.floor(tc / 4));
-    const popup = createLogSearchModal({
-      linesGetter: () => chatLines,
-      initialQuery: logSearchQuery,
-      termCols: tc,
-      termRows: tr,
-      anchorRow,
-      anchorCol,
-      theme: currentThemeTokens(),
-      onJump: (result, query) => {
-        applyLogSearch(query);
-        // Position cursor on the picked result. applyLogSearch reset
-        // it to 0; advance to the one the user actually picked.
-        const idx = logSearchResults.findIndex(r => r.lineIdx === result.lineIdx);
-        logSearchCursor = idx >= 0 ? idx : 0;
-        scrollToSearchResult(result);
-        draw();
-      },
-      onCancel: (query) => {
-        // Keep the query so n/N still works after cancel — tmux
-        // `copy-mode -s` convention.
-        if (query.trim()) applyLogSearch(query);
-        draw();
-      },
-    });
-    attachSurfaceToWorkspace(popup.surface, currentWorkspaceOwnerId());
-    display.pushModal(popup.surface);
-    draw();
-  };
+  const openLogSearchModal = createDashboardLogSearchOpener({
+    display: () => display,
+    linesGetter: () => chatLines,
+    initialQuery: () => logSearchQuery,
+    termSize,
+    computePaneH: rows => computePaneH(rows),
+    currentThemeTokens: () => currentThemeTokens(),
+    currentWorkspaceOwnerId: () => currentWorkspaceOwnerId(),
+    draw: () => draw(),
+    onJump: (result, query) => {
+      applyLogSearch(query);
+      // Position cursor on the picked result. applyLogSearch reset
+      // it to 0; advance it to the result the user actually picked.
+      const idx = logSearchResults.findIndex(r => r.lineIdx === result.lineIdx);
+      logSearchCursor = idx >= 0 ? idx : 0;
+      scrollToSearchResult(result);
+      draw();
+    },
+    onCancel: query => {
+      // Keep the query so n/N still works after cancel — tmux convention.
+      if (query.trim()) applyLogSearch(query);
+      draw();
+    },
+  });
 
   // TUI 부활 S-a — /resume 세션 픽커 (codex 패리티). chat 세션 스토어를
   // 필터형 모달로 띄우고, 선택 시 기존 `/session load <id>` slash 를
@@ -2913,7 +2843,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       draw();
       return;
     }
-    // C-d-1 — essential 은 composer 자리(하단 슬롯) · rich 는 중앙 플로팅.
+    // Pickers share the composer bottom slot.
     const placement = resolveDecisionPickerPlacement({ height: 16 });
     const modalWidth = placement.width;
     const fmtRow = (m: (typeof rows)[number]): string => {
@@ -3271,7 +3201,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       })
       .reverse(); // 최신 턴 먼저
     const items: SearchItem[] = turnItems;
-    // C-d-1 — essential 은 composer 자리(하단 슬롯) · rich 는 중앙 플로팅.
+    // Pickers share the composer bottom slot.
     const placement = resolveDecisionPickerPlacement({ height: 16 });
     const modalWidth = placement.width;
     const handle = createSearchModal({
@@ -3337,7 +3267,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         ...HITL_REVISE_PRESETS.map((p): SearchItem => ({ label: `${p.label} — 재분해`, payload: `preset:${p.action}` })),
         { label: '✏️ 직접입력 — 정정 코멘트 작성', payload: 'custom' },
       ];
-      // C-d-1 — essential 은 composer 자리(하단 슬롯) · rich 는 중앙 플로팅.
+      // Pickers share the composer bottom slot.
       const placement = resolveDecisionPickerPlacement({ height: 14 });
       const modalWidth = placement.width;
       const handle = createSearchModal({
@@ -3668,33 +3598,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let lastAssistantRaw: string | null = null;
   let lastAssistantRange: { start: number; end: number } | null = null;
   let lastAssistantMode: 'rendered' | 'raw' = 'rendered';
-  // Vim/tmux-style log pane resize. 0 = default 6:3:1 split; positive
-  // grows the log at the expense of the 3-pane grid, negative shrinks
-  // the log. Clamped inside computeVLayout so paneH >= 5 and logH >= 3.
+  // Log-pane resize remains available when chatOnlyMode is toggled off.
   let logHeightBias = 0;
-  // TUI 부활 T0 (PLAN-tui-revival-essentials-2026-07-12) — 단일 UI 모드
-  // 축. essential(기본) = codex/claude-code 패리티 chat-first; rich =
-  // 기존 full dashboard. `--rich` CLI > config `dashboard.uiMode` >
-  // 레거시 `defaultMode` 매핑 > 기본 essential. T1(chrome 게이트)·
-  // T3(VW 게이트)가 이 값을 소비한다. `let` — T2 의 `/ui` 런타임
-  // 전환이 재할당.
-  let dashboardUiMode = resolveDashboardUiMode({
-    cliRich: opts.rich,
-    configUiMode: getUserConfig().dashboard.uiMode,
-    legacyDefaultMode: getUserConfig().dashboard.defaultMode,
-  });
   // Chat-only mode: 3-pane grid collapses, log pane owns all space above
   // the input. Toggled by /chat or /dashboard. Input loop stays alive
   // across Escape while this is true — feels like a dedicated LLM REPL.
-  // Seeded from the launch flag so `elanous --chat-only` / `elanous --debug`
-  // lands straight in this layout (tablet-friendly — debug events need
-  // screen real estate). T0 이후 essential uiMode 가 기본 시드 —
-  // essential 이면 chat 전체화면으로 부팅한다 (레거시
-  // `dashboard.defaultMode: 'chat'` 은 uiMode 해석에 흡수됨).
-  let chatOnlyMode = opts.chatOnly === true
-    || opts.debug === true
-    || opts.benchmark === true
-    || dashboardUiMode === 'essential';
+  // Essential layout starts chat-only; /chat and /dashboard still toggle it.
+  let chatOnlyMode = true;
 
   // Debug log — auto-start forensic file capture so every run has a
   // tail-able JSONL trail without the user thinking about it. Default
@@ -3726,12 +3636,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     debug.setFileEnabled(dbgCfg.file);
     // OH9 — 렌더 로그 무음 시드(레벨과 직교). 우선순위:
     //   level.json.render(명시) > config.debug.renderLogs(true=override) >
-    //   uiMode essential(억제). essential 부팅이면 렌더 노이즈를 자동으로
+    //   essential 기본 억제. 부팅 시 렌더 노이즈를 자동으로
     //   끄고, 대표가 diag 로 올려도 진단은 그대로 흐른다.
     debug.setRenderSuppressed(resolveRenderSuppressed({
       scopedRender: readScopedRenderLogs(),
       configRenderLogs: dbgCfg.renderLogs,
-      uiModeEssential: dashboardUiMode === 'essential',
+      defaultSuppressed: true,
     }));
     // Announce the path so the user knows where to tail. Prefixed
     // with (muted) so it doesn't compete with real chat output.
@@ -3758,9 +3668,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     debugScrollOffset = -1;
     mirrorDrawThrottle.request();
   });
-  // --debug launch flag: force both sinks ON and announce it in the
-  // log pane. The caller has already set chatOnlyMode=true above so
-  // the mirror feed is actually visible.
+  // --debug launch flag: force both sinks ON and announce it in the log pane.
   if (opts.debug) {
     debug.setFileEnabled(true);
     debug.enable();
@@ -3823,14 +3731,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   };
   // ── Plugin host (Phase 2) ──
   const hud = createHud();
-
-  // FU-3 (2026-05-05) — wire goal + plan-mode HUD pills. Subscribes
-  // to both registries so the status reflects state changes without
-  // dashboard polling. Idempotent on attach (paints current state).
-  void (async () => {
-    const { wireGoalPlanHudBridge } = await import('./goal-plan-hud-bridge.js');
-    wireGoalPlanHudBridge({ hud, draw: () => { try { draw(); } catch { /* draw not yet defined during boot */ } } });
-  })();
 
   // Reasoning HUD segment — provider-agnostic emoji + label that
   // sits in the top transient HUD row (next to voice / streaming
@@ -3915,42 +3815,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   };
   const toggleChatOnlyLayout = (opts: { announce?: boolean } = {}): void => {
     setChatOnlyLayout(!chatOnlyMode, opts);
-  };
-  // TUI 부활 T2 — /ui 런타임 전환. uiMode 재할당 + chat-only 동기 +
-  // config persist(dashboard.uiMode). T1 chrome 게이트(·T3 VW 게이트)가
-  // draw 마다 dashboardUiMode 를 읽으므로 재할당만으로 다음 프레임 반영.
-  // draw 는 아래에서 늦게 바인딩되는 let — 슬래시 시점엔 실체 존재.
-  const applyDashboardUiMode = (
-    mode: DashboardUiMode,
-    applyOpts: { persist?: boolean; announce?: boolean } = {},
-  ): void => {
-    dashboardUiMode = mode;
-    setChatOnlyLayout(mode === 'essential');
-    // OH9 — /ui 전환 즉시 렌더 무음 시드 재해석(전환이 바로 반영되게).
-    // level.json.render / config.renderLogs 명시가 있으면 uiMode 보다 우선
-    // (resolveRenderSuppressed) — /ui essential 이 사용자 override 를 안 덮는다.
-    debug.setRenderSuppressed(resolveRenderSuppressed({
-      scopedRender: readScopedRenderLogs(),
-      configRenderLogs: getUserConfig().debug.renderLogs,
-      uiModeEssential: mode === 'essential',
-    }));
-    if (applyOpts.announce) {
-      chatLines.push(C.muted(mode === 'essential'
-        ? '-- ui: essential (chat 전체화면) — /ui rich 로 전체 대시보드 --'
-        : '-- ui: rich (full dashboard) — /ui essential 로 복귀 --'));
-      chatScrollOffset = -1;
-    }
-    if (applyOpts.persist) {
-      try {
-        const cfg = getUserConfig();
-        cfg.dashboard.uiMode = mode;
-        saveUserConfig(cfg);
-      } catch {
-        chatLines.push(C.warning('  ui mode config persist 실패 — 이번 세션만 적용'));
-      }
-    }
-    resetRenderCache();
-    draw();
   };
   // Mirror chatOnly launch flag into the HUD pill (same style /chat
   // toggle uses) so the user sees "mode: chat" from the first frame.
@@ -4640,35 +4504,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           chatScrollOffset = -1;
           try { draw(); } catch { /* TUI torn down */ }
         },
-        spawnVirtualWindowTerminal: (label, host) => {
-          const extSpec = {
-            kind: 'external-terminal',
-            preview: host,
-            title: label,
-            label,
-            focusPolicy: 'output-only',
-            onTerminalMouseIntent: (event: {
-              paneId: string;
-              paneKind: 'external-terminal';
-              mouseType: DisplayMouseEvent['type'];
-              row: number;
-              col: number;
-              exposure: TerminalExposureSnapshot;
-              interactionPolicy: TerminalInteractionPolicy;
-            }) => {
-              emitTerminalMouseIntent({
-                surfaceId: event.paneId,
-                paneKind: event.paneKind,
-                mouseType: event.mouseType,
-                row: event.row,
-                col: event.col,
-                exposure: event.exposure,
-                interactionPolicy: event.interactionPolicy,
-              });
-            },
-          } as any;
-          virtualWindows.registry.spawn({ title: label, initialContent: extSpec });
-        },
         subscribeVirtualWindowClose: (cb) => {
           virtualWindows.registry.subscribe((ev) => {
             cb({
@@ -4919,92 +4754,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let browserPaneRegistry!: BrowserPaneRegistry;
   let previewPaneRegistry!: PreviewPaneRegistry;
 
-  // T1-P1 — virtual-windows init. Spins up the AddressBook +
-  // VWEventBus + WindowRegistry, wires PaneCapture's pane→content
-  // lookup, registers the skill-runner tool singletons, and creates
-  // the navigation router. Host UI callbacks (picker / new /
-  // split / help / close-window) are intentionally left as no-ops
-  // here — they are follow-ups (VW §10.2, §10.6). The chord still
-  // works for digits, arrows, n/p, x/X, etc. which don't need UI.
-  const vwInputRuntime = createDashboardVirtualWindowInputRuntime({
-    getRegistry: () => virtualWindows.registry,
-    pushMutedLine: (line) => {
-      chatLines.push(C.muted(line));
-      chatScrollOffset = -1;
-    },
-    openLocalInputTargetPopup: openVwLocalInputTargetPopup,
-    openSelectorPopup: openVwSelectorPopup,
-    routeContextMenu: (req) => ctxMenuWire.onMouse(req),
-    skipWindowWhen: skipWindowWhenStorePredicate(paneVisualStateStore),
-    resolvePaneVisibility: (windowId, paneId) =>
-      paneVisualStateStore.snapshot({ windowId: String(windowId), paneId }).visibility,
-    termSize,
-  });
-  const vwControlRuntime = createDashboardVirtualWindowControlRuntime({
-    openWindowPicker,
-    getCurrentWindow: () => virtualWindows.registry.current(),
-    closeWindow: (windowId) => { virtualWindows.registry.close(windowId); },
-    pushMutedLine: (line) => {
-      chatLines.push(C.muted(line));
-      chatScrollOffset = -1;
-    },
-    draw,
-  });
-  const vwMutationRuntime = createDashboardVirtualWindowMutationRuntime({
-    spawnWindow: () => virtualWindows.registry.spawn({
-      title: 'terminal',
-      initialContent: { kind: 'terminal' },
-      foreground: true,
-    }),
-    getForegroundSession: () => sessionRegistry.foreground(),
-    detachSession: (id) => {
-      sessionRegistry.detach(id);
-    },
-    getLatestBackgroundSession: () =>
-      sessionRegistry.list()
-        .filter(s => s.state === 'background')
-        .sort((a, b) => b.lastFocusedAt - a.lastFocusedAt)[0] ?? null,
-    attachSession: (id, dims) => {
-      sessionRegistry.attach(id, dims);
-    },
-    termSize,
-    getCurrentWindow: () => virtualWindows.registry.current(),
-    renameWindow: (windowId, next) => virtualWindows.registry.renameWindow(windowId, next),
-    renamePane: (windowId, paneId, next) => { virtualWindows.registry.renamePane(windowId, paneId, next); },
-    openRenameModal: openVwRenameModal,
-    pushMutedLine: (line) => {
-      chatLines.push(C.muted(line));
-      chatScrollOffset = -1;
-    },
-    pushWarningLine: (line) => {
-      chatLines.push(C.warning(line));
-      chatScrollOffset = -1;
-    },
-    draw,
-  });
-  const vwHelpRuntime = createDashboardVirtualWindowHelpRuntime({
-    termSize,
-    registrationState: {
-      supplementalGlobalKeys: getUserConfig().dashboard.enableSupplementalGlobalKeys,
-      virtualWindowSwitchKeys: getUserConfig().dashboard.enableVirtualWindowSwitchKeys,
-    },
-    keyLabel: (key, desc) => `  ${C.key(pad(key, 14))} ${C.text(desc)}`,
-    sectionLabel: (title) => C.bold(title),
-    muted: (text) => C.muted(text),
-    showHelpModal: ({ title, lines, termCols, termRows, ttlMs, group }) => {
-      showTransientTerminalModal({
-        title,
-        lines,
-        coordinator: display,
-        termCols,
-        termRows,
-        ttlMs,
-        group,
-      });
-    },
-  });
-  // Yazi-style browser-pane help (`~`). Same shape as vwHelpRuntime —
-  // shares the showTransientTerminalModal primitive.
+  // Browser-pane help (`~`) uses the transient modal primitive.
   const browserHelpRuntime = createBrowserHelpRuntime({
     termSize,
     keyLabel: (key, desc) => `  ${C.key(pad(key, 14))} ${C.text(desc)}`,
@@ -5022,68 +4772,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       });
     },
   });
-  const vwSplitRuntime = createDashboardVirtualWindowSplitRuntime({
-    getCurrentWindow: () => virtualWindows.registry.current(),
-    spawnTerminal: ({ title, cwd }) => terminalMatrix.spawn({ title, cwd }),
-    cwd: () => workingDir.cwd,
-    detachSession: (id) => {
-      try { sessionRegistry.detach(id); } catch {}
-    },
-    getCurrentTerminalModalId: () => terminalModalRouter.current()?.id ?? null,
-    clearCurrentTerminalModal: () => { terminalModalRouter.set(null); },
-    createTerminalSlotContent: ({ terminalId, title }) => createPaneContent({
-      kind: 'terminal-slot',
-      terminalId,
-      title,
-    }),
-    bindSlot: (slotKey, paneId) => { vwSlotBindings.set(slotKey, paneId); },
-    setPlacement: (terminalId, placement) => { terminalMatrix.setPlacement(terminalId, placement); },
-    pushMutedLine: (line) => {
-      chatLines.push(C.muted(line));
-      chatScrollOffset = -1;
-    },
-    pushWarningLine: (line) => {
-      chatLines.push(C.warning(line));
-      chatScrollOffset = -1;
-    },
-    draw,
-  });
-
   // TUI 부활 T3 (2026-07-12) — VW 는 essential 에서 "실질 OFF" 게이트.
   // 설계 노트: init 자체는 유지한다 (빈 레지스트리 + 이벤트버스 뿐 —
   // 부팅 시 무조건적 윈도우 스폰이 없어 타이머/렌더 비용 0 확인).
   // 완전 스킵(no-op registry)을 택하지 않은 이유: WindowRegistry 는
   // private 필드를 가진 concrete class 라 구조적 타입 위조가 불가하고,
-  // 부팅 시 registry 참조를 캡처하는 소비처들이 stale no-op 을 물게 돼
-  // /ui rich 런타임 전환이 재시작 없이는 불가능해진다. 대신 사용자
-  // 노출 표면 3곳을 uiMode 로 게이트: ① ^B chord 깔때기(vwBody) ②
-  // draw 의 workspace frame 합성 ③ /workspace slash. essential 에서
-  // LLM tool 이 프로그래매틱하게 스폰한 윈도우는 레지스트리에 남고
-  // /ui rich 전환 시 그대로 보인다 (의도 — 비파괴).
+  // Keep the virtual-window registry for programmatic consumers; the essential
+  // dashboard does not paint its frame or expose workspace slash/chord controls.
   virtualWindows = initDashboardVirtualWindows({
     coordinator: display,
     injectApprover: createPaneInjectApprover(),
     broadcastApprover: createBroadcastApprover(),
-    // Per-window local composer submit. Route through the pane-level
-    // broadcast contract so mixed PTY/chat/markdown lanes share the
-    // same submit semantics instead of falling back to raw PTY bytes.
-    onLocalInputSubmit: vwInputRuntime.onLocalInputSubmit,
-    onOpenLocalInputTargetPicker: vwInputRuntime.onOpenLocalInputTargetPicker,
-    onShowSelector: vwInputRuntime.onShowSelector,
-    onShowContextMenu: vwInputRuntime.onShowContextMenu,
-    // B-7-α — PaneVisualStateStore-driven Alt+N skip predicate.
-    // Composed (OR) with the built-in !hasInteractableFocus() default
-    // in dashboard-virtual-windows.ts. When every pane in a window is
-    // skip-eligible (focusPolicy=skip/no-focus · visibility=hidden/
-    // dormant), Alt+N/P cycling bypasses the window. LLM's
-    // SetFocusPolicy tool becomes a real effect on cycling.
-    extraSkipWindowWhen: vwInputRuntime.extraSkipWindowWhen,
-    // B-7-γ — per-window resolver that reads PaneVisualStateStore so
-    // paintPane can stamp a visibility badge on the focused pane's
-    // label (`·H·` / `·D·` / `·ᴸ·`). The store is written by the LLM
-    // `SetFocusPolicy` tool (B-1) and the `^B H` chord (B-7-β);
-    // this factory is the consumer that makes those writes visible.
-    visibilityResolverFactory: vwInputRuntime.visibilityResolverFactory,
     // T2-P5 — wire llm-chat panes to the same provider set the
     // rest of the app uses. spawnLLMBenchmark now routes to a real
     // backend; unknown providers surface as an error line inside
@@ -5128,25 +4827,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         );
       },
     },
-    defaultBounds: vwInputRuntime.defaultBounds,
-    callbacks: {
-      // FU-2 — chord help popup. Shows a grouped keybinding cheatsheet
-      // as a transient modal instead of a single muted chat line, so
-      // the user actually gets to read + reference it while experimenting.
-      // Auto-dismisses after 8 s; spawning the popup again while it's
-      // open replaces the prior instance (group='vw-chord-help').
-      onHelp: vwHelpRuntime.onHelp,
-      onPicker: vwControlRuntime.onPicker,
-      onCloseWindow: vwControlRuntime.onCloseWindow,
-      onNewWindow: vwMutationRuntime.onNewWindow,
-      onModalWindowToggle: vwMutationRuntime.onModalWindowToggle,
-      onSyncInputBarToggle: vwControlRuntime.onSyncInputBarToggle,
-      onZoomToggle: vwControlRuntime.onZoomToggle,
-      onLastFocusedPane: vwControlRuntime.onLastFocusedPane,
-      onRenameWindow: vwMutationRuntime.onRenameWindow,
-      onRenamePane: vwMutationRuntime.onRenamePane,
-      onSplit: vwSplitRuntime.onSplit,
-    },
   });
   // Phase T3b-b1 — install the VW placement adapter. matrix.move()
   // with kind='vw' now routes through the VW registry's splitFocused
@@ -5167,11 +4847,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         terminalId,
         title: `term:${terminalId}`,
       });
-      // Adapter-driven splits default to horizontal. The chord flow
-      // chooses axis itself and bypasses the adapter — see onSplit
-      // above. This default is fine because users who care about the
-      // axis press the chord; users who call `/term move <id> vw:w/s`
-      // typically just want a slot.
+      // Adapter-driven terminal slots default to horizontal splits.
       const newPaneId = w.splitFocused('h', content);
       vwSlotBindings.set(`${windowId}/${slotId}`, newPaneId);
     },
@@ -5238,27 +4914,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       display.workspaceHostAPI().removeMember(ownerId, companionSurfaceId(ownerId, key));
     }
   });
-  // TR-P3: pane-modal chord (Ctrl+M <key>) — pops a deferred pane
-  // as a transient modal when the viewport is too narrow to show it
-  // inline. Chord state lives with the dashboard; hint line rendered
-  // by renderPaneModalHint in the frame loop.
-  // FU-1 — pane-modal-chord 상태는 이제 coordinator 의 chordArmed
-  // 필드가 소유. createPaneModalChord 인스턴스는 더 이상 필요 없음.
-
-  // Phase C/D — now that virtualWindows.registry exists, augment the
-  // context.* + control.* deps so ContextWindowsList / WindowDetail /
-  // PaneDetail + ControlWindowResize / ControlPaneLayout see live
-  // windows. Safe to call again — set*RuntimeDeps replaces the
-  // stored record wholesale.
+  // Refresh context runtime deps after the dashboard session registry is ready.
   try {
-    const { setContextRuntimeDeps, setControlRuntimeDeps } = await import('../tool-runtime/index.js');
-    // Surface-unification v2.2 V2.2-5 (2026-05-11) — scheduler store
-    // wire retired (scheduler view + `context.jobs.list` polychord
-    // both gone). Workflows now own scheduled work end-to-end.
+    const { setContextRuntimeDeps } = await import('../tool-runtime/index.js');
     bootDashboardContextWindowRuntime({
-      setControlRuntimeDeps,
       setContextRuntimeDeps,
-      registry: virtualWindows.registry,
       // WD7 — context runtime cwd follows SWD.
       cwd: getSessionCwd(),
       getTerminalSessions: () => sessionRegistry.list().map((s) => ({
@@ -6604,25 +6264,19 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // 페인트를 멈춰 하단 영역의 단일 소유자를 보장(codex mod.rs:1674 · CC
   // REPL.tsx:4894 동형). 키는 기존 blocking-modal 라우팅 그대로 뷰가 소비.
   const bottomSlotModalActive = (): boolean => topBlockingForegroundModal()?.slot === 'bottom';
-  // 픽커류의 배치 결정 — essential 은 composer 자리(하단 슬롯), rich 는 기존
-  // 중앙 플로팅 유지(/ui 왕복 즉시 반영 — 호출 시점 게이트 패턴).
+  // Pickers occupy the composer bottom slot.
   const resolveDecisionPickerPlacement = (desired: { height: number }): {
     bounds: { row: number; col: number; width: number; height: number };
     slot?: 'bottom';
     width: number;
   } => {
     const { cols: tc, rows: tr } = termSize();
-    if (dashboardUiMode !== 'rich') {
-      const bounds = resolveBottomSlotBounds({
-        termCols: tc, termRows: tr,
-        promptFrame: currentPromptFrame(tr),
-        height: desired.height,
-      });
-      return { bounds, slot: 'bottom', width: bounds.width };
-    }
-    const width = Math.min(84, Math.max(48, tc - 6));
-    const col = Math.max(2, Math.floor((tc - width) / 2));
-    return { bounds: { row: 3, col, width, height: desired.height }, width };
+    const bounds = resolveBottomSlotBounds({
+      termCols: tc, termRows: tr,
+      promptFrame: currentPromptFrame(tr),
+      height: desired.height,
+    });
+    return { bounds, slot: 'bottom', width: bounds.width };
   };
   const topBottomAreaFreezeModal = (
     termRows = termSize().rows,
@@ -8239,7 +7893,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // Scratch visibility (Phase S5). When closed, the workingDir
   // layouts drop the scratch cell so the remaining panes expand
   // to fill the reclaimed columns — useful on narrow terminals.
-  // Reopen via the /scratch open slash or the ^B ^S chord.
+  // Reopen via the ^B ^S chord.
   let scratchClosed = false;
   const dashboardViewRegistryOptions = () => ({
     extraPanes: pluginHost.activeDashboardPanes().map(p => p.paneId),
@@ -9604,27 +9258,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       try { debug.log('agent-status.mirror.activate-failed', String(err), { level: 'error' }); } catch { /* swallow */ }
     }
   })();
-  // PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M3 — TUI HUD strip
-  // mirrors to daemon's HudStore via `POST /v1/hud-segment` so PWA
-  // `<ChatHud>` (M4) hydrates from dashboard-only writers (token gauge
-  // · ssh-remote · agent-activity · reasoning level · variant badge).
-  // Same probe-once + fire-and-forget contract as agent-status mirror.
-  void (async () => {
-    try {
-      const { activateHudMirrorIfReachable } = await import('./hud-mirror.js');
-      const handle = await activateHudMirrorIfReachable({
-        hud,
-        log: (m) => { try { debug.log('hud.mirror', m); } catch { /* swallow */ } },
-      });
-      if (handle.active) {
-        process.once('beforeExit', () => {
-          try { handle.deactivate(); } catch { /* ignore */ }
-        });
-      }
-    } catch (err) {
-      try { debug.log('hud.mirror.activate-failed', String(err), { level: 'error' }); } catch { /* swallow */ }
-    }
-  })();
   const disposeConversationWidgetLiveBridge = createConversationWidgetLiveBridge({
     widgetHost,
     listSessions: () => listLiveEmbodiedSessions().map((entry) => ({
@@ -10872,24 +10505,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         });
       }
     }
-    const scratch = widgetHost.get('wd-scratch') as any;
-    if (scratch) {
-      const displayScratch = display.scratchState();
-      const focused = workingDir.focus === 'scratch';
-      // Arc Z — push dashboard source-of-truth state into the scratch
-      // widget. Native scratch modes (memo / preview) hand their
-      // structured state over.
-      // Surface-unification v2.2 V2.2-5 Part 2 (2026-05-11) — view=4
-      // scheduler scratch projection retired (scheduler view 폐기).
-      scratchWidgetRuntime.projectPreview(
-        scratch,
-        focused,
-        scratchOffset,
-        scratchTitle,
-        scratchLines,
-        displayScratch && displayScratch.mode !== 'agents' ? displayScratch : null,
-      );
-    }
     const clipboardWidget = widgetHost.get('wd-clipboard') as any;
     companionWidgetRuntime.projectClipboardWidget(
       clipboardWidget,
@@ -11899,14 +11514,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           });
           return;
         }
-        case 'vw.selector': {
-          const payload = result.payload as VirtualWindowTitleMenuPayload | undefined;
-          if (!payload) return;
-          const windowId = Number.parseInt(payload.windowId, 10);
-          if (!Number.isFinite(windowId)) return;
-          openVwSelectorPopup(windowId, _ev.col, _ev.row);
-          return;
-        }
         case 'vw.clipboard-companion': {
           const payload = result.payload as VirtualWindowTitleMenuPayload | undefined;
           if (!payload) return;
@@ -12115,13 +11722,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     pushChatLine: (line) => { chatLines.push(line); },
     setChatScrollBottom: () => { chatScrollOffset = -1; },
   });
-  const windowSlashRuntime = createDashboardWindowSlashRuntime({
-    accent: C.accent,
-    muted: C.muted,
-    success: C.success,
-    error: C.error,
-    warning: C.warning,
-  });
   const benchSlashRuntime = createDashboardBenchSlashRuntime({
     accent: C.accent,
     muted: C.muted,
@@ -12166,10 +11766,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     muted: C.muted,
     warning: C.warning,
   });
-  const scratchSlashRuntime = createDashboardScratchSlashRuntime({
-    muted: C.muted,
-    warning: C.warning,
-  });
   const companionSlashRuntime = createDashboardCompanionSlashRuntime({
     muted: C.muted,
     warning: C.warning,
@@ -12178,24 +11774,19 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     muted: C.muted,
     warning: C.warning,
   });
-  const viewSlashRuntime = createDashboardViewSlashRuntime({
+  const controlSignalSlashRuntime = createDashboardControlSignalSlashRuntime({
+    accent: C.accent,
     muted: C.muted,
-    success: C.success,
     warning: C.warning,
+    observer: defaultControlSignalObserver(),
+    signalBus: dashboardControlSignals,
   });
-    const controlSignalSlashRuntime = createDashboardControlSignalSlashRuntime({
-      accent: C.accent,
-      muted: C.muted,
-      warning: C.warning,
-      observer: defaultControlSignalObserver(),
-      signalBus: dashboardControlSignals,
-    });
-    const browserCdpSlashRuntime = createDashboardBrowserCdpSlashRuntime({
-      accent: C.accent,
-      muted: C.muted,
-      warning: C.warning,
-      signalBus: dashboardControlSignals,
-    });
+  const browserCdpSlashRuntime = createDashboardBrowserCdpSlashRuntime({
+    accent: C.accent,
+    muted: C.muted,
+    warning: C.warning,
+    signalBus: dashboardControlSignals,
+  });
   const simSlashRuntime = createDashboardSimSlashRuntime({
     accent: C.accent,
     muted: C.muted,
@@ -12235,27 +11826,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const companionFeedbackRuntime = createDashboardCompanionFeedbackRuntime({
     muted: C.muted,
     warning: C.warning,
-  });
-  const mouseDockRuntime = createMouseDockRuntime({
-    listDockWindowPanes: () =>
-      panesForDashboardView(activeViewDef()).filter((pane) => pane !== 'input'),
-    paneLabel,
-    openDockWindow: (pane) => openDashboardPaneModal(pane),
-    compactSurfaceHost,
-    listVirtualWindows: () =>
-      virtualWindows.registry.list().map((window) => ({
-        id: window.id,
-        title: window.title,
-      })),
-    getCurrentVirtualWindowId: () => virtualWindows.registry.current()?.id ?? null,
-    switchToVirtualWindow: (windowId) => {
-      virtualWindows.registry.switchTo(windowId);
-    },
-    focusDashboardMain: () => {
-      virtualWindows.registry.backgroundCurrent();
-      setWorkingFocus(firstPaneOfView(workingDir.view), 'dock-vw-mover-main');
-    },
-    redraw: () => { draw(); },
   });
   const mousePickerRuntime = createMousePickerRuntime({
     getRotation: () => getUserConfig().llm.rotation ?? [],
@@ -12306,40 +11876,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     syncConversationPopupModals,
     redraw: () => { draw(); },
   });
-  const mouseWorkspaceRestoreRuntime = createMouseWorkspaceRestoreRuntime({
-    workspaceHost: display.workspaceHostAPI(),
-    companionPopupHost,
-    // Lazy wrapper — `openDebugWindow` is declared as a `const` further
-    // down (~line 11521), so a shorthand reference here triggers a TDZ
-    // ReferenceError when this deps object is built during boot. Same
-    // pattern as the PR #1111 fix on `applyFocusToInputTransition` /
-    // `draw` for `createDashboardVoiceRuntime`. The arrow defers the
-    // name lookup until the callback actually runs.
-    openDebugWindow: () => openDebugWindow(),
-    openDebugWorkbenchModal: () => { openDebugWorkbenchModal(); },
-    syncCompanionPopups,
-    openConversationModal,
-    redraw: () => { draw(); },
-  });
   const mouseModeSwitchRuntime = createMouseModeSwitchRuntime({
     getActiveMode: () => inputCoreActiveMode(),
     getModeAction: (actionId) => getInputCoreAction(actionId),
     setMode: (next) => inputCoreSetMode(next),
-  });
-  const mouseHoverRuntime = createMouseHoverRuntime({
-    dispatchHoverToWidget: (paneId, event) => {
-      widgetHost.dispatchHover(
-        paneId,
-        event,
-      );
-    },
-    setConversationHoverLabel: (label) => {
-      setSegment(hud, 'conv-hover', C.muted(label), 4);
-    },
-    clearConversationHoverLabel: () => {
-      clearSegment(hud, 'conv-hover');
-    },
-    conversationHoverHudLabel,
   });
   const mouseModalHitRuntime = createMouseModalHitRuntime({
     getTopSurface: () => {
@@ -12350,260 +11890,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     },
   });
   const mouseModalSurfaceRuntime = createMouseModalSurfaceRuntime({
-    openWindowPicker,
     getFocusStack: () => display.modalStack(),
     surfaceAt: (id) =>
       display.surface(id) as import('../display/modal-stack.js').ModalSurface | null | undefined,
     getTopBlockingModalSurface: topBlockingForegroundModal,
     routeModalMouse: (surface, ev) => display.routeMouseToSurface(surface, ev),
-  });
-  const mousePillContextRuntime = createMousePillContextRuntime({
-    handleForPill: (name) => {
-      const handle = handleForPill(name as Parameters<typeof handleForPill>[0]);
-      // 2026-05-05 — model pill 만: 우클릭 직전에 menu 의 title 을 활성
-      // rotation entry 라벨로 갱신해 "어떤 모델이 픽 되었는지" 정확히
-      // 보여준다. 라벨도 짧게 (Switch / Remove / Settings…) 해서 메뉴
-      // 폭을 status bar pill 인접 폭에 가깝게 유지.
-      if (handle && name === 'model') {
-        try {
-          const reg = getDashboardContextMenuRegistry();
-          const current = mousePickerRuntime.getCurrentModelEntry?.() ?? null;
-          const activeLabel = current ? rotationEntryLabel(current) : '(none)';
-          reg.updateMenu(handle as never, buildPillMenu({
-            pillName: 'Model',
-            title: `Model · ${activeLabel}`,
-            canSwitch: true,
-            canRemove: true,
-            canOpenSettings: false,
-            switchLabel: 'Switch',
-            removeLabel: 'Remove',
-          }));
-        } catch { /* dynamic update is best-effort */ }
-      }
-      return handle;
-    },
-    showMenu: (handle, pos) =>
-      getDashboardContextMenuRegistry().showMenu(
-        handle as Parameters<ReturnType<typeof getDashboardContextMenuRegistry>['showMenu']>[0],
-        pos,
-        // 2026-05-05 — pill 우클릭 메뉴를 CMX-2 의 일반 context-menu wire
-        // 와 같은 path 로 정렬: singleInstance + ownerWorkspaceId. 이전엔
-        // 옵션 미지정으로 surface 가 dashboard-main workspace 에 attach 만
-        // 됐고 (default), singleInstance 도 false 라 매번 새 surface id.
-        // 키보드 ↑/↓ 가 routeKey 까지 도달하지 못하던 사용자 피드백 대응.
-        { singleInstance: true, ownerWorkspaceId: 'dashboard-main' },
-      ),
-    // 2026-05-05 — pill 우클릭 메뉴 결과 wire. 현재 model pill 만 액션
-    // 매핑되어 있다 (`Switch Model…` · `Remove from rotation`). 좌클릭은
-    // 그대로 cycle (mouse-wiring 의 pill click branch). 다른 pill 은
-    // legacy 동작 — 추후 wire 추가 시 여기 분기 늘리기.
-    onPillMenuPick: async (name, value, pos) => {
-      if (debug.enabled) {
-        debug.log('mouse.pill.context.dispatch', 'enter', { name, value, pos });
-      }
-      if (name !== 'model') return;
-      // Pill 우클릭 위치 → vw picker 의 PopupPlacement. status row 는
-      // pos.y+1 (mouse-pill-context-runtime 가 0-indexed y 로 ev.row-1
-      // 보냈음 — 1-indexed 로 복귀). anchor col 도 동일.
-      const pillPickerPlacement = (origin: { x: number; y: number }): PopupPlacement => {
-        const { rows: termRows, cols: termCols } = termSize();
-        const anchorCol = origin.x + 1;
-        return {
-          anchorStartCol: anchorCol,
-          anchorEndCol: anchorCol,
-          statusRow: origin.y + 1,
-          termCols,
-          termRows,
-        };
-      };
-      if (value === 'pill.switch') {
-        // 좌클릭 cycle 과 동일 — 다음 rotation entry 로 switch.
-        const ring = mousePickerRuntime.getRotation();
-        if (ring.length === 0) {
-          pushModeToast?.('No rotation configured · /provider add', 'warning');
-          return;
-        }
-        const current = mousePickerRuntime.getCurrentModelEntry?.() ?? null;
-        let nextIdx = 0;
-        if (current) {
-          const cIdx = ring.findIndex((e) =>
-            e.provider === current.provider
-            && (e.model ?? null) === (current.model ?? null),
-          );
-          nextIdx = cIdx < 0 ? 0 : (cIdx + 1) % ring.length;
-        }
-        const nextEntry = ring[nextIdx]!;
-        await Promise.resolve(mousePickerRuntime.setActiveModel(nextEntry));
-        pushModeToast?.(`▸ ${rotationEntryLabel(nextEntry)}`, 'success');
-        draw();
-        return;
-      }
-      if (value === 'pill.remove') {
-        const current = mousePickerRuntime.getCurrentModelEntry?.() ?? null;
-        if (debug.enabled) {
-          debug.log('mouse.pill.context.dispatch', 'remove.start', {
-            hasCurrent: !!current,
-            currentLabel: current ? rotationEntryLabel(current) : null,
-          });
-        }
-        // 2026-05-05 — `currentRotationIndex(cfg)` 사용. 이전 PR 들은
-        // (1) `removeRotationEntry(needle)` — 합성 라벨이 단일 필드와
-        //     매칭 안 됨
-        // (2) 직접 `(provider, model)` 튜플 — 사용자 지적: "디스플레이
-        //     시 provider 이름 생략 루틴" 때문에 cfg.llm.provider/model
-        //     이 entry 와 그대로 매칭 안 됨
-        // currentRotationIndex 는 이미 검증된 active-entry 매칭 로직을
-        // 가짐 — provider 동일 + (양쪽 model 다 있고 다르면 skip · 한쪽
-        // 만 있으면 같은 provider 의 entry 면 OK). cfg.llm 으로부터 직접
-        // 인덱스 산출하므로 derived label 변환 영향 받지 않음.
-        const cfg = getUserConfig();
-        const ring = cfg.llm?.rotation ?? [];
-        const idx = currentRotationIndex(cfg);
-        if (debug.enabled) {
-          debug.log('mouse.pill.context.dispatch', 'remove.result', {
-            matchedIndex: idx,
-            rotationLengthBefore: ring.length,
-            cfgProvider: cfg.llm?.provider ?? null,
-            cfgModel: cfg.llm?.model ?? null,
-          });
-        }
-        if (idx < 0) {
-          pushModeToast?.(
-            `Active model not in rotation: ${current ? rotationEntryLabel(current) : '(none)'}`,
-            'warning',
-          );
-          return;
-        }
-        // 2026-05-05 — Confirm popup (vw picker 스타일). 사용자 요청:
-        // "테마가 vw picker 스타일로 깔끔하게 될것 같은데" — context-
-        // menu widget 대신 createActionPickerRecipe 를 사용해 model
-        // picker / window picker 같은 정돈된 chrome 으로 통일.
-        const targetLabel = rotationEntryLabel(ring[idx]!);
-        const placement = pillPickerPlacement(pos);
-        const confirmValue = await new Promise<string | null>((resolve) => {
-          let resolved = false;
-          let handle: ReturnType<typeof createActionPickerRecipe> | null = null;
-          handle = createActionPickerRecipe<string>({
-            id: 'pill-remove-confirm',
-            title: `Remove from rotation?`,
-            // 단일 preview row — primary CTA 가 이 entry 의 value 로 fire.
-            items: [
-              { value: 'confirm.remove', label: targetLabel },
-            ],
-            placement,
-            // CTA 버튼 명시 (사용자 요청). primary='Remove' · cancel='Cancel'.
-            actionButtons: true,
-            primaryActionLabel: 'Remove',
-            cancelActionLabel: 'Cancel',
-            filterable: false,
-            initialIndex: 0,
-            // 2026-05-06 — dock submenu 와 동일 row look 차용. parent
-            // role = highlight 색상으로 cursor/selected row · 사용자 요청:
-            // "dock area 매뉴 subitem 들의 UI/UX (포커스시와 아닐시 look)
-            // 그것을 차용".
-            theme: deriveSubmenuPopupRoleTheme(currentThemeTokens(), 'parent'),
-            shadow: { theme: currentThemeTokens() },
-            onPick: (value) => {
-              if (resolved) return;
-              resolved = true;
-              try { handle?.dispose(); } catch { /* swallow */ }
-              resolve(value);
-            },
-            onCancel: () => {
-              if (resolved) return;
-              resolved = true;
-              try { handle?.dispose(); } catch { /* swallow */ }
-              resolve(null);
-            },
-          });
-          display.pushModal(handle.surface);
-          draw();
-        });
-        if (debug.enabled) {
-          debug.log('mouse.pill.context.dispatch', 'remove.confirm', {
-            value: confirmValue ?? '(cancelled)',
-          });
-        }
-        if (confirmValue !== 'confirm.remove') {
-          // Cancelled / escaped — toast 으로 회복 신호. 사용자 피드백:
-          // "Remove Confirm 팝업에서 Cancel 을 선택하면 아래 회복 방법
-          // 이 없음" — 액션이 안 됐다는 visible feedback 가 필요.
-          pushModeToast?.(
-            `Cancelled · '${targetLabel}' still in rotation`,
-            'info',
-          );
-          return;
-        }
-        const removed = ring[idx]!;
-        const nextRing = ring.slice(0, idx).concat(ring.slice(idx + 1));
-        const nextCfg = {
-          ...cfg,
-          llm: {
-            ...cfg.llm,
-            rotation: nextRing.length > 0 ? nextRing : undefined,
-          },
-        };
-        try {
-          saveUserConfig(nextCfg);
-          reloadUserConfig();
-          if (debug.enabled) {
-            debug.log('mouse.pill.context.dispatch', 'remove.persisted', {
-              rotationLength: nextRing.length,
-            });
-          }
-        } catch (err) {
-          if (debug.enabled) {
-            debug.log('mouse.pill.context.dispatch', 'remove.persist-failed', {
-              err: err instanceof Error ? err.message : String(err),
-            }, { level: 'error' });
-          }
-          pushModeToast?.('Save failed', 'warning');
-          return;
-        }
-        // 후속: 새 rotation 의 첫 entry 로 switch (있으면).
-        const liveRing = mousePickerRuntime.getRotation();
-        if (liveRing.length > 0) {
-          await Promise.resolve(mousePickerRuntime.setActiveModel(liveRing[0]!));
-        }
-        pushModeToast?.(
-          `🗑 Removed ${rotationEntryLabel(removed)} · ${liveRing.length} left`,
-          'success',
-        );
-        draw();
-        // 2026-05-05 — 정보 popup (vw picker 스타일). 사용자 요청:
-        // "실제 지웠을때 인포 팝업도 만들어주세요" + "테마 vw picker
-        // 스타일". confirm 과 동일한 createActionPickerRecipe 패턴 ·
-        // 단일 'OK' 항목 (Enter/Esc 로 close).
-        let infoHandle: ReturnType<typeof createActionPickerRecipe> | null = null;
-        const closeInfo = (): void => {
-          try { infoHandle?.dispose(); } catch { /* swallow */ }
-        };
-        infoHandle = createActionPickerRecipe<string>({
-          id: 'pill-remove-info',
-          title: '🗑 Removed from rotation',
-          // 두 정보 row · primary CTA = 'OK'. items value 는 onPick callback
-          // 으로 들어오지만 모두 동일 closeInfo 로 라우팅.
-          items: [
-            { value: 'info.removed', label: rotationEntryLabel(removed) },
-            { value: 'info.remaining', label: `${liveRing.length} entries left` },
-          ],
-          placement: pillPickerPlacement(pos),
-          // CTA 버튼 명시. info popup 은 primary='OK' · cancel='Close'.
-          actionButtons: true,
-          primaryActionLabel: 'OK',
-          cancelActionLabel: 'Close',
-          filterable: false,
-          initialIndex: 0,
-          theme: currentThemeTokens(),
-          shadow: { theme: currentThemeTokens() },
-          onPick: closeInfo,
-          onCancel: closeInfo,
-        });
-        display.pushModal(infoHandle.surface);
-        draw();
-        return;
-      }
-    },
   });
   const mousePaneHitRuntime = createMousePaneHitRuntime({
     getPaneNavRow: () => paneNavRow,
@@ -12633,29 +11924,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
   const mouseWiring = createDashboardMouseWiring({
     termSize: () => termSize(),
-    // TUI 부활 T4 — hover 팝업(툴팁 자동 표시)은 rich UI 전용.
-    // /ui 런타임 전환을 따르도록 predicate 로 배선.
-    hoverPopupsEnabled: () => isDashboardHeavyFeatureEnabled(dashboardUiMode, 'hover-popups'),
+    hoverPopupsEnabled: () => false,
     getRotation: mousePickerRuntime.getRotation,
     getCurrentModelEntry: mousePickerRuntime.getCurrentModelEntry,
     setActiveModel: mousePickerRuntime.setActiveModel,
     getRecentWds: mousePickerRuntime.getRecentWds,
     setSessionWd: mousePickerRuntime.setSessionWd,
-    getDockMenuWindowTargets: mouseDockRuntime.getDockMenuWindowTargets,
-    onOpenDockWindow: mouseDockRuntime.onOpenDockWindow,
-    getDockMenuSurfaceTargets: mouseDockRuntime.getDockMenuSurfaceTargets,
-    onOpenDockSurface: mouseDockRuntime.onOpenDockSurface,
-    onToggleChatOnly: mouseDockRuntime.onToggleChatOnly,
     onExitProgram: async () => {
       exitDashboardTui();
       setTimeout(() => process.exit(0), 0);
     },
-    getDashboardViews: mouseDockRuntime.getDashboardViews,
-    onApplyDashboardView: mouseDockRuntime.onApplyDashboardView,
-    getVirtualWindows: mouseDockRuntime.getVirtualWindows,
-    onSwitchVirtualWindow: mouseDockRuntime.onSwitchVirtualWindow,
-    getVirtualWindowMover: mouseDockRuntime.getVirtualWindowMover,
-    onMoveVirtualWindow: mouseDockRuntime.onMoveVirtualWindow,
     pushModalSurface: surface => display.pushModal(surface),
     // DS-2b (2026-04-21) — drag-session routing hook. Adapter lives
     // in src/display/drag-dispatch.ts (PR #319); this single line is
@@ -12664,10 +11942,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // the existing chain (0 overhead path). See PLAN-drag-session-
     // primitive.md §3.3 and PR #319 for the contract.
     dragDispatch: (ev) => dragDispatch(ev, display.dragManagerAPI()),
-    // CMX-2 (2026-04-22) — non-pill right-click dispatch. Pill path
-    // (line ~7590-ish onPillRightClick) keeps the legacy direct
-    // handleForPill lookup; this hook serves pane-body / pane-title
-    // / input / VW right-clicks via MenuProviderRegistry. Unconsumed
+    // CMX-2 (2026-04-22) — non-pill right-click dispatch. This hook
+    // serves pane-body / pane-title / input / VW right-clicks via
+    // MenuProviderRegistry. Unconsumed
     // (no provider matches) falls through to modal forwarding.
     contextMenuDispatch: (ev) => ctxMenuWire.onMouse(ev),
     // DS-3a (2026-04-21) — chat input hit classifier. Routes clicks
@@ -12687,18 +11964,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     updateModalBounds: (id, bounds) => display.updateModalBounds(id, bounds),
     redraw: () => { draw(); },
     requestRender: () => { requestDashboardRender(); },
-    // IDX-F5d Phase 2 (2026-04-22) — pane-body hover dispatcher.
-    // Mouse wiring subscribes to its internal HoverTracker; we bridge
-    // pane-body hover events to `widgetHost.dispatchHover` so each
-    // widget's `onHover` override fires when the pointer enters /
-    // leaves / hovers stable over one of its items. `paneId` matches
-    // `widgetInstanceId` in the current grid (getPaneHitTarget wires
-    // them 1:1 in dashboard.ts:7852).
-    dispatchHoverToWidget: mouseHoverRuntime.dispatchHoverToWidget,
-    onPaneHoverEvent: mouseHoverRuntime.onPaneHoverEvent,
     conversationPopupHost,
     onConversationPopupPick: mouseConversationPopupRuntime.onConversationPopupPick,
-    onWindowPillClick: mouseModalSurfaceRuntime.onWindowPillClick,
     // SRF-4 — shell rollup pill click → popup listing live handles.
     // Handles are fetched at click time so the popup always reflects
     // the current ShellRegistry state (not a frozen snapshot).
@@ -12726,13 +11993,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getTheme: () => currentThemeTokens(),
     suppressHoverHints: true,
     workspaceHost: display.workspaceHostAPI(),
-    onWorkspaceRestore: mouseWorkspaceRestoreRuntime.onWorkspaceRestore,
-    // IDX-5 Phase 2 — right-click on a pill → context-menu registry.
-    // Registry is initialised just below (after mouseWiring is built
-    // so the presenter can use `display.pushModal`). The handler is a
-    // closure that resolves the right registry handle at call time so
-    // the one-off bootstrap order works out.
-    onPillRightClick: mousePillContextRuntime.onPillRightClick,
     // IDX-5 Phase 3 B-4 — classify clicks outside the status-bar pill
     // row into broader pane regions so lastClickHitKind can carry
     // 'pane-nav' / 'pane-title' / 'pane-body' values (previously only
@@ -12799,16 +12059,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // values are cheap no-ops (one field comparison per key).
     publishFocusContextKeysFromService(workingDir.focus);
 
-    // TR-P3: refresh the pane-modal hint segment each draw. When the
-    // viewport is at tabletMini/tabletTwo and there are deferred
-    // panes, a "Ctrl+M p=preview l=log" segment appears on the HUD.
-    // Clears on wider viewports so the hint doesn't stick around.
-    {
-      const vis = activePaneVisibility();
-      const hint = renderPaneModalHint(vis, cols, effectiveTabletMode());
-      if (hint) setSegment(hud, 'tr-pane-modal', C.muted(hint), 4);
-      else clearSegment(hud, 'tr-pane-modal');
-    }
 
     // T3-B1: agent-activity HUD segment. Pulsing glyph + running
     // count drives awareness that sub-agent work is in flight —
@@ -12946,9 +12196,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }
     const suppressPromptArea = hostChromePolicy.suppressPromptArea;
     const suppressStatusArea = hostChromePolicy.suppressStatusArea;
-    const suppressHudArea = hostChromePolicy.suppressHudArea;
     const suppressDashboardBackground = hostChromePolicy.suppressDashboardBackground;
-    const suppressDockArea = hostChromePolicy.suppressDockArea;
     if (suppressPromptArea) display.setCursor(null);
     // ── Zone list (top-to-bottom) ──
     // Replaces the old inline `termRows - N` arithmetic and hand-rolled
@@ -13018,18 +12266,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       });
     }
 
-    // HUD — reserves 1 row in rich mode. Empty string when no active
-    // segments. TUI 부활 T1: essential 모드는 HUD pill 행 자체를 생략
-    // (codex 패리티 — 하단 chrome 은 status line 1줄만). zoneRows 소비처
-    // (`zoneRows.get('hud')` 류)는 missing zone 을 안전 처리하는 설계
-    // (§MX11b 코멘트)라 생략이 안전하다.
-    if (isDashboardHeavyFeatureEnabled(dashboardUiMode, 'hud')) {
-      zones.push({
-        id: 'hud',
-        height: 1,
-        render: (_h, c) => [suppressHudArea ? '' : (renderHud(hud, c) || '')],
-      });
-    }
+    // Essential chrome uses only the status line, not a HUD row.
 
     // Input block.
     let promptCaret: CursorState | null = null;
@@ -13059,24 +12296,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       render: (_h, c) => [suppressPromptArea ? ' '.repeat(c) : hLine(c)],
     });
 
-    // Bottom areas: 1-row gap → status area → 1-row gap → dock area.
-    // TUI 부활 T1: essential 은 status line 1줄만 유지(대표 확정 ①) —
-    // gap-mid·dock 행 생략으로 chat log 가 2행 더 얻는다. dock 클릭
-    // 라우팅은 setDockRow(null) 경로로 자연 비활성.
+    // Essential bottom area: status line only; no dock row.
     zones.push({ id: 'status-gap-top', height: 1, render: () => [''] });
     zones.push({
       id: 'status',
       height: 1,
       render: () => [suppressStatusArea ? '' : buildStatusLine()],
     });
-    if (isDashboardHeavyFeatureEnabled(dashboardUiMode, 'dock')) {
-      zones.push({ id: 'status-gap-mid', height: 1, render: () => [''] });
-      zones.push({
-        id: 'dock',
-        height: 1,
-        render: () => [suppressDockArea ? '' : mouseWiring.buildDockLine()],
-      });
-    }
 
     // Compose.
     const composed = composeVertical(zones, { rows: termRows, cols: totalW });
@@ -13135,11 +12361,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // is one of the easiest ways to see a flash under tmux.
     let modalFrame = '';
     let modalKey = '';
-    // TUI 부활 T3 — essential 은 VW frame 합성 스킵 (rich 에서 스폰된
-    // 윈도우가 남아 있어도 essential 로 전환하면 그리지 않는다).
-    const foregroundWorkspaceFrame = isDashboardHeavyFeatureEnabled(dashboardUiMode, 'workspace-frame')
-      ? (virtualWindows.registry.current()?.render() ?? '')
-      : '';
     if (effectiveLayout && effectiveLayout.modals.length > 0) {
       const m = effectiveLayout.modals[0]!;
       modalKey = `${m.id}:${m.widgetInstanceId}:${JSON.stringify(m.position)}:${m.size?.width ?? ''}x${m.size?.height ?? ''}`;
@@ -13147,15 +12368,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         termRows, termCols: cols, theme: currentThemeTokens(),
       });
     }
-    if (foregroundWorkspaceFrame.length > 0) {
-      modalFrame += foregroundWorkspaceFrame;
-    }
     if (debug.isKeyTraceEnabled() && blockingForegroundModal) {
       debug.log('dashboard.frame-compose', 'blocking-modal', {
         modalId: blockingForegroundModal.id,
         baseLineCount: baseLines.length,
         overlayLen: modalFrame.length,
-        hasForegroundWorkspaceFrame: foregroundWorkspaceFrame.length > 0,
+        hasForegroundWorkspaceFrame: false,
       });
     }
     try {
@@ -13167,15 +12385,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // propagated request.force (e.g. popModal / closeSurface on a
     // coordinator-owned modal). Before V3 only the layout-modal signal
     // was honored, so coordinator modal closes left residual pixels.
-    // ⭐ 단일 flush 지점 — essential 은 프롬프트 caret 을 스스로 정하고, rich 는 종전 그대로다.
+    // ⭐ Single flush: resolve the prompt caret after overlays.
     const frameCursorDecision = display.cursorDecision();
     renderDashboardFrame(baseLines, composeDashboardFrameWithCoordinatorModal(display, {
       overlay: modalFrame,
       force: forceFromCoordinator || modalKey !== lastModalKey,
-      essential: dashboardUiMode === 'essential',
       cursorOwner: frameCursorDecision.owner,
       claimedCursor: frameCursorDecision.cursor,
-      // ⛔ rich 는 #6528 까지의 값을 그대로 쓴다 — 이 PR 은 essential 축만 바꾼다.
       coordinatorCursor: display.getCursor(),
       promptCaret,
       suppressPromptArea,
@@ -14093,42 +13309,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     when: () => agentSearchModal === null,
   });
 
-  // FU-1 — pane-modal-chord port. Each pane letter from SHORTCUT_TABLE
-  // registers as a chord binding under `Ctrl+M,Ctrl+ㅡ`. The `when`
-  // guard keeps a pane's binding inactive unless it's currently in
-  // the deferred list, so mistyped letters still fall through.
-  const openDeferredPane = (pane: PaneFocus): void => {
-    const { cols: tc, rows: tr } = termSize();
-    const captured = captureDeferredPane(pane);
-    showTransientTerminalModal({
-      title: `${pane} (modal)`,
-      lines: captured.split('\n'),
-      coordinator: display,
-      termCols: tc,
-      termRows: tr,
-      ttlMs: 8000,
-      group: 'pane-modal',
-    });
-  };
-  for (const [pane, letter] of Object.entries(PANE_SHORTCUT_TABLE) as Array<[PaneFocus, string]>) {
-    display.registerKeyBinding({
-      id: `dashboard:pane-modal-chord:${pane}`,
-      chordPrefix: 'C-m',
-      key: letter,
-      chordTimeoutMs: PANE_MODAL_CHORD_TIMEOUT_MS,
-      scope: 'global',
-      handler: () => openDeferredPane(pane),
-      when: () => activePaneVisibility().modalDeferred.includes(pane),
-    });
-  }
-
-  // Task 2 · T-3 / T-4 — `Ctrl+M B` (shift) opens the 2×1 modal with
-  // browser + preview side-by-side. Complementary to the lowercase
-  // single-pane chord above. T-4 saves the pre-modal focus and
-  // restores it on dispose (→ log when tablet mode is active, the
-  // default "keep user where they were" otherwise). narrow terminals
-  // get a 1-column fallback automatically via showPaneMultiModal's
-  // MIN_WIDE_WIDTH gate.
   let debugWorkbenchHandle: PaneMultiModalHandle | null = null;
   let debugWindowHandle: PaneMultiModalHandle | null = null;
   let debugWindowHoverActive = false;
@@ -14453,14 +13633,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       onContextMenuMouse: (ev) => ctxMenuWire.onMouse(ev),
     });
   };
-  display.registerKeyBinding({
-    id: 'dashboard:pane-modal-chord:browser+preview',
-    chordPrefix: 'C-m',
-    key: 'S-b',
-    chordTimeoutMs: PANE_MODAL_CHORD_TIMEOUT_MS,
-    scope: 'global',
-    handler: openBrowserPreviewModal,
-  });
   const openBrowserOnlyModal = (): void => {
     const { cols: tc, rows: tr } = termSize();
     const liveMode = resolveBrowserPreviewModalLiveMode(process.env.ELANOUS_PANE_MODAL_LIVE);
@@ -14481,14 +13653,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       onCancel: () => { draw(); },
     });
   };
-  display.registerKeyBinding({
-    id: 'dashboard:pane-modal-chord:browser-only',
-    chordPrefix: 'C-m',
-    key: 'S-w',
-    chordTimeoutMs: PANE_MODAL_CHORD_TIMEOUT_MS,
-    scope: 'global',
-    handler: openBrowserOnlyModal,
-  });
   const openPreviewOnlyModal = (): void => {
     const { cols: tc, rows: tr } = termSize();
     const liveMode = (process.env.ELANOUS_PANE_MODAL_LIVE ?? 'on').toLowerCase() !== 'off';
@@ -14506,221 +13670,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       onCancel: () => { draw(); },
     });
   };
-  display.registerKeyBinding({
-    id: 'dashboard:pane-modal-chord:preview-only',
-    chordPrefix: 'C-m',
-    key: 'S-p',
-    chordTimeoutMs: PANE_MODAL_CHORD_TIMEOUT_MS,
-    scope: 'global',
-    handler: openPreviewOnlyModal,
-  });
-
-  // FU-2 — virtual-window chord port (last remaining hard branch).
-  // Each body key of the Ctrl+B chord registers as its own coordinator
-  // binding; the handler synthesises a KeyEvent and forwards it to
-  // NavigationRouter.dispatchArmed so the actual routing logic stays
-  // in one place (tests still target NavigationRouter directly).
-  const VW_CHORD_PREFIX = 'C-b';
-  // TUI 부활 T3 — essential 은 VW 키 표면 OFF. 모든 ^B chord body 가
-  // 이 단일 깔때기를 지나므로 여기 한 곳 게이트로 비가시 윈도우
-  // 생성/조작(^B c 등)을 차단한다. /ui rich 런타임 전환 즉시 복원.
-  const vwBody = (ev: DisplayKeyEvent): void => {
-    if (dashboardUiMode !== 'rich') {
-      chatLines.push(C.muted('  (virtual workspace 는 rich 모드 전용 — /ui rich 로 전환)'));
-      chatScrollOffset = -1;
-      draw();
-      return;
-    }
-    virtualWindows.router.dispatchArmed(ev);
-  };
-  const vwKey = (name: string, mods: Partial<DisplayKeyEvent> = {}): DisplayKeyEvent => ({
-    name, ctrl: false, shift: false, alt: false, ...mods,
-  });
-  const registerVwChord = (id: string, key: string, ev: DisplayKeyEvent): void => {
-    display.registerKeyBinding({
-      id: `dashboard:vw-chord:${id}`,
-      chordPrefix: VW_CHORD_PREFIX,
-      key,
-      scope: 'global',
-      handler: () => vwBody(ev),
-    });
-  };
   registerDashboardGlobalKeys({
     enableSupplementalGlobalKeys: getUserConfig().dashboard.enableSupplementalGlobalKeys,
     register: (binding) => { display.registerKeyBinding(binding); },
     openSurfaceCatalog: () => openSurfaceCatalogPopup(),
     surfaceCatalogWhen: () => agentSearchModal === null,
-    dispatchVirtualWindowChord: vwBody,
   });
-  // 1-9 / C-1..C-9 → switch to Nth window (router
-
-  // does the registry lookup internally).
-  if (getUserConfig().dashboard.enableVirtualWindowSwitchKeys) {
-  for (let n = 1; n <= 9; n++) {
-    // Q4 (substrate Occam): no per-binding pipe alias. Plain digit
-    // and Ctrl+digit are distinct chord bodies — register each.
-    registerVwChord(`digit-${n}`, `${n}`, vwKey(`${n}`));
-    registerVwChord(`ctrl-digit-${n}`, `C-${n}`, vwKey(`${n}`));
-  }
-  // Cycle next / previous — multiple aliases share a body action.
-  registerVwChord('next-n',      'n', vwKey('n'));
-  registerVwChord('next-dot',    '.', vwKey('.'));
-  registerVwChord('next-angle',  '>', vwKey('>'));
-  registerVwChord('prev-p',      'p', vwKey('p'));
-  registerVwChord('prev-comma',  ',', vwKey(','));
-  registerVwChord('prev-angle',  '<', vwKey('<'));
-  }
-  // Window lifecycle + toggles + splits + help + sync.
-  registerVwChord('modal-toggle',     't', vwKey('t'));
-  registerVwChord('hsplit-pct',       '%', vwKey('%'));
-  registerVwChord('hsplit-s',         's', vwKey('s'));
-  registerVwChord('vsplit-quote',     '"', vwKey('"'));
-  registerVwChord('vsplit-v',         'v', vwKey('v'));
-  registerVwChord('help',             '?', vwKey('?'));
-  registerVwChord('sync-input-bar',   'i', vwKey('i'));
-  // Focus direction (arrow + vim).
-  registerVwChord('focus-up',    'up|k',    vwKey('up'));
-  registerVwChord('focus-down',  'down|j',  vwKey('down'));
-  registerVwChord('focus-left',  'left|h',  vwKey('left'));
-  registerVwChord('focus-right', 'right|l', vwKey('right'));
-  // VW-U5 — last-focused pane is registered by registerDashboardGlobalKeys.
-  // VW-B1/B2 — rename chord bodies. Shift qualifier is accepted for
-  // muscle-memory (`^B R` = `^B Shift+r` in many layouts).
-  registerVwChord('rename-window', 'r|S-r', vwKey('r'));
-  registerVwChord('rename-pane',   'S-a',   vwKey('a', { shift: true }));
-
-  // N2 — `^B S` opens the shell-runner rollup popup (keyboard parity
-  // with the mouse-clickable 🐚 pill). Shift-qualified to avoid
-  // collision with `^B s` (hsplit); this convention matches VW-B1's
-  // `^B R` rename-window.
-  display.registerKeyBinding({
-    id: 'dashboard:vw-chord:shell-rollup',
-    chordPrefix: VW_CHORD_PREFIX,
-    key: 'S-s',
-    scope: 'global',
-    handler: () => { void openShellRollupPopup(); },
-  });
-
-  // Bundle B-9 — `^B h` toggles the focused pane's visibility in the
-  // shared PaneVisualStateStore between `visible` and `hidden`. First
-  // user-writable path into the store (the LLM `SetFocusPolicy` tool
-  // from B-1 was the only writer before this). Alt+N window-skip
-  // (B-7-α) already consumes the store, so hiding every pane in a
-  // window removes it from the cycle. PLAN: PLAN-vw-term-bundle-b9-
-  // visibility-user-toggle.md. Handler factory lives in
-  // src/dashboard-vw-visibility-chord.ts for unit testability.
-  display.registerKeyBinding({
-    id: 'dashboard:vw-chord:visibility-toggle',
-    chordPrefix: VW_CHORD_PREFIX,
-    // `h` is already taken as the vim alias for focus-left
-    // (`registerVwChord('focus-left', 'left|h', ...)`); use Shift+H
-    // instead so the "H for Hide" mnemonic survives without collision.
-    key: 'S-h',
-    scope: 'global',
-    handler: createVisibilityChordHandler({
-      getCurrentWindow: () => {
-        const w = virtualWindows.registry.current();
-        return w ? { id: w.id, focused: w.focused } : null;
-      },
-      store: paneVisualStateStore,
-      showToast: (title, lines) => {
-        const { cols: tc, rows: tr } = termSize();
-        showToast({ title, lines, coordinator: display, termCols: tc, termRows: tr, ttlMs: 1500 });
-        try { draw(); } catch { /* TUI torn down */ }
-      },
-    }),
-  });
-
-  // SP-D — `^B !` toggles the focused pane's focusPolicy between
-  // 'output-only' and 'interactive'. Doesn't go through NavigationRouter
-  // because the operation is pane-local, not window-level. Silent no-op
-  // when the focused pane doesn't advertise a focusPolicy (plain chat/
-  // markdown panes).
-  display.registerKeyBinding({
-    id: 'dashboard:vw-chord:focus-policy-toggle',
-    chordPrefix: VW_CHORD_PREFIX,
-    key: '!',
-    scope: 'global',
-    handler: () => {
-      const { cols: tc, rows: tr } = termSize();
-      const win = virtualWindows.registry.current();
-      if (!win) {
-        showToast({ title: 'focus policy', lines: ['no foreground window'], coordinator: display, termCols: tc, termRows: tr, ttlMs: 1500 });
-        return;
-      }
-      const pane = win.getFocusedPane();
-      type Togglable = {
-        focusPolicy?: 'output-only' | 'interactive';
-        setFocusPolicy?: (p: 'output-only' | 'interactive') => unknown;
-      };
-      const t = (pane ?? {}) as Togglable;
-      if (!t.setFocusPolicy || !t.focusPolicy) {
-        showToast({ title: 'focus policy', lines: ['pane has no focus policy'], coordinator: display, termCols: tc, termRows: tr, ttlMs: 1500 });
-        return;
-      }
-      const next = t.focusPolicy === 'output-only' ? 'interactive' : 'output-only';
-      t.setFocusPolicy(next);
-      const label = pane ? win.getPaneDisplayTitle(pane.id) : '';
-      showToast({
-        title: 'focus policy',
-        lines: [`${label || 'pane'} → ${next}`],
-        coordinator: display,
-        termCols: tc,
-        termRows: tr,
-        ttlMs: 1500,
-      });
-      try { draw(); } catch { /* TUI torn down */ }
-    },
-  });
-
-  // VW-U2 — chord-free Alt+N/P/1..9/0 fast-switch (helper in
-  // src/dashboard-vw-fast-switch.ts so tests can exercise the
-  // bindings without spinning up the whole dashboard).
-  registerVwFastSwitchBindings({
-    display,
-    registry: virtualWindows.registry,
-    openPicker: () => openWindowPicker(),
-    enableWindowSwitchKeys: getUserConfig().dashboard.enableVirtualWindowSwitchKeys,
-    // B-7-δ — expose the same PaneVisualStateStore the chord writer
-    // (B-7-β) and badge reader (B-7-γ) consume, so Alt+o/Alt+O can
-    // skip hidden/dormant panes within the current window.
-    store: paneVisualStateStore,
-  });
-
-  /** T2-P4 / T2-P5 — open the VW window picker. Called from the
-   *  NavigationRouter onPicker callback (^B 0) and from /window
-   *  picker. Empty-list short-circuit writes a hint to chatLines
-   *  so the user knows why nothing popped. Uses the same
-   *  agentSearchModal routing path as the agent-roster search
-   *  modal so the readKey loop forwards keys into it unchanged. */
-  function openWindowPicker(): void {
-    const currentWindow = virtualWindows.registry.current();
-    const ownerWorkspaceId = currentWindow
-      ? workspaceOwnerIdForVirtualWindow(currentWindow.id)
-      : DASHBOARD_MAIN_WORKSPACE_ID;
-    openDashboardWindowPickerPopup({
-      registry: virtualWindows.registry,
-      ownerWorkspaceId,
-      termSize,
-      getTheme: () => currentThemeTokens(),
-      pushModalSurface: (surface) => display.pushModal(surface),
-      setAgentSearchModal: (modal) => {
-        agentSearchModal = modal;
-      },
-      onEmptyWindows: () => {
-      pushDebugLine(C.muted('No virtual windows. Use /window new (or WindowCreate tool) first.'));
-      chatScrollOffset = -1;
-      },
-      onAcceptMain: () => {
-        virtualWindows.registry.backgroundCurrent();
-        setWorkingFocus(firstPaneOfView(workingDir.view), 'window-picker-main');
-      },
-      onAcceptWindow: (w) => {
-        virtualWindows.registry.switchTo(w.id);
-      },
-      redraw: draw,
-    });
-  }
 
   function currentWorkspaceOwnerId(): string {
     const currentWindow = virtualWindows.registry.current();
@@ -14785,108 +13740,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       onWarning: (message) => {
         pushDebugLine(C.warning(`  ${message}`));
         chatScrollOffset = -1;
-      },
-      redraw: draw,
-    });
-  }
-
-  /** VW-U4 — open the right-click pane/window selector popup. Called
-   *  from virtualWindows.registry's onShowSelector bridge. The popup
-   *  covers panes of the source VW + every other window; Enter switches,
-   *  Esc cancels. Uses the mouseWiring active-popup protocol (setting
-   *  `surface.onKey = handle.handleKey`) so coordinator.routeKey feeds
-   *  keys straight to the SelectView wrapper. */
-  let vwSelectorDispose: (() => void) | null = null;
-  function openVwSelectorPopup(windowId: number, col: number, row: number): void {
-    // Close any previous popup so rapid right-clicks don't stack.
-    if (vwSelectorDispose) {
-      try { vwSelectorDispose(); } catch { /* ignore */ }
-      vwSelectorDispose = null;
-    }
-    const { cols: tc, rows: tr } = termSize();
-    const handle = createVwSelectorPopup({
-      registry: virtualWindows.registry,
-      sourceWindowId: windowId,
-      col, row,
-      termCols: tc,
-      termRows: tr,
-      onFocusPane: (w, p) => {
-        const win = virtualWindows.registry.get(w);
-        if (win) win.setFocus(p);
-        draw();
-      },
-      onSwitchWindow: (w) => {
-        virtualWindows.registry.switchTo(w);
-      },
-      onCancel: () => { draw(); },
-    });
-    if (!handle) return;
-    handle.surface.onKey = (ev) => handle.handleKey(ev);
-    const modalHandle = display.pushModal(handle.surface);
-    vwSelectorDispose = () => {
-      try { handle.dispose(); } catch { /* ignore */ }
-      try { modalHandle.dispose(); } catch { /* ignore */ }
-    };
-    draw();
-  }
-
-  let vwLocalInputTargetDispose: (() => void) | null = null;
-  const vwLocalInputTargetState = new Map<number, { query: string; cursor: number }>();
-  function openVwLocalInputTargetPopup(windowId: number, seedQuery?: string): void {
-    openVwLocalInputTargetPopupLauncher({
-      registry: virtualWindows.registry,
-      windowId,
-      seedQuery,
-      stateStore: vwLocalInputTargetState,
-      getCurrentDispose: () => vwLocalInputTargetDispose,
-      setCurrentDispose: (dispose) => {
-        vwLocalInputTargetDispose = dispose;
-      },
-      termSize,
-      pushModalSurface: (surface) => {
-        attachSurfaceToWorkspace(surface, currentWorkspaceOwnerId());
-        return display.pushModal(surface);
-      },
-      onTargetPick: (target) => {
-        const win = virtualWindows.registry.get(windowId);
-        if (win) {
-          win.setLocalInputTarget(target);
-          win.consumeLocalComposerMentionTargetToken();
-        }
-      },
-      redraw: draw,
-    });
-  }
-
-  /** VW-B1/B2 — shared helper that pops an input modal for renaming
-   *  either a window or a pane. Disposes any previous rename modal so
-   *  typing R twice just re-opens with the latest title. */
-  let vwRenameDispose: (() => void) | null = null;
-  function openVwRenameModal(opts: {
-    title: string;
-    current: string;
-    onSubmit: (next: string) => void;
-    onCancel?: () => void;
-  }): void {
-    openVwRenameModalLauncher({
-      title: opts.title,
-      current: opts.current,
-      onSubmit: (next) => {
-        vwRenameDispose = null;
-        opts.onSubmit(next);
-      },
-      onCancel: () => {
-        vwRenameDispose = null;
-        opts.onCancel?.();
-      },
-      getCurrentDispose: () => vwRenameDispose,
-      setCurrentDispose: (dispose) => {
-        vwRenameDispose = dispose;
-      },
-      termSize,
-      pushModalSurface: (surface) => {
-        attachSurfaceToWorkspace(surface, currentWorkspaceOwnerId());
-        return display.pushModal(surface);
       },
       redraw: draw,
     });
@@ -15025,11 +13878,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     return memoWidgetRuntime.readLines(widgetHost.get('wd-memo') as any);
   };
   const publishMemoLines = (lines: string[]): void => {
-      const next = scratchStateRuntime.replace('Memo', lines);
-      scratchTitle = next.title;
-      scratchLines = next.lines;
-      scratchOffset = next.offset;
-      publishScratchSurface('dashboard:memo', 'preview', scratchTitle, scratchLines);
+    scratchTitle = 'Memo';
+    scratchLines = [...lines];
+    scratchOffset = 0;
+    publishScratchSurface('dashboard:memo', 'preview', scratchTitle, scratchLines);
   };
   const memoCompanionRuntime = createDashboardMemoCompanionRuntime({
     readLines: readMemoWidgetLines,
@@ -15119,8 +13971,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     requestRender: () => { requestDashboardRender('detail'); },
   });
   const companionWidgetRuntime = createDashboardCompanionWidgetRuntime();
-  const scratchWidgetRuntime = createDashboardScratchWidgetRuntime();
-  const scratchStateRuntime = createDashboardScratchStateRuntime();
   const clipboardHistoryRuntime = createDashboardClipboardHistoryRuntime();
   const memoWidgetRuntime = createDashboardMemoWidgetRuntime();
   const logWidgetRuntime = createDashboardLogWidgetRuntime();
@@ -15463,25 +14313,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
    *  display coordinator. The coordinator coalesces this with any
    *  plugin/widget updates and repaints the prompt after the frame. */
   const setScratch = (title: string, lines: string[]): void => {
-    const next = scratchStateRuntime.replace(title, lines);
-    scratchTitle = next.title;
-    scratchLines = next.lines;
-    scratchOffset = next.offset;
+    scratchTitle = title;
+    scratchLines = [...lines];
+    scratchOffset = 0;
     publishScratchSurface('dashboard:scratch', 'preview', title, scratchLines);
   };
-
-  const currentScratchForCommand = (): { title: string; lines: string[] } => {
-    return scratchStateRuntime.resolveCommandSnapshot(display.scratchState(), {
-      title: scratchTitle,
-      lines: scratchLines,
-    });
-  };
-
-  const { setScratchImage, setScratchFile } = createRichScratchViewers({
-    setDetailViewer,
-    termSize,
-    fmtBytes,
-  });
 
   // ── Execute sync inline (output to log pane) ──
   const runSyncInline = async (
@@ -17298,8 +16134,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       }
 
       // Ctrl+W (no chord armed — chord would have consumed the
-      // key earlier) closes the scratch pane. Reopen via
-      // /scratch open or the ^B ^S chord target.
+      // key earlier) closes the scratch pane. Reopen via the ^B ^S chord.
       if (key.ctrl && (key.name === 'w' || key.name === 'ㅈ')) {
         scratchClosed = true;
         userClosedPanes.add('scratch');
@@ -17420,7 +16255,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 pluginTools: pluginHost.activePluginLLMTools(),
                 optionalTools: acpTurnRef.optionalSpecs,
                 surface: acpTurnRef.turnProfile?.surface,
-                rich: dashboardUiMode === 'rich',
+                rich: false,
               })
             : [];
           return buildDashboardTurnPreamble({
@@ -17434,7 +16269,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             // codex-only behavioral addendum (fix L-1) inside the
             // universal preamble.
             modelFamily: getModelFamily(inspectActiveProvider().model),
-            rich: dashboardUiMode === 'rich',
+            rich: false,
             enabledTools: tools.map(t => t.name),
           });
         },
@@ -17448,7 +16283,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             pluginTools: pluginHost.activePluginLLMTools(),
             optionalTools: acpTurnRef.optionalSpecs,
             surface: acpTurnRef.turnProfile?.surface,
-            rich: dashboardUiMode === 'rich',
+            rich: false,
           });
           // ⭐ Remember this turn's catalog so a spawned sub-agent can inherit it.
           //
@@ -17723,6 +16558,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       const key: import('../tui.js').Key = wdAutoInput
         ? { name: CHAT_MAIN_AUTO_ENTRY_KEY_NAME, ctrl: false, shift: false }
         : await readKey();
+      const helpModal = currentTransientTerminalModal('dashboard-help');
+      if (key.name === 'escape' && helpModal) {
+        helpModal.dispose();
+        draw();
+        continue;
+      }
 
       // U-0 · recompute ViewMode at the top of every key dispatch
       // loop iteration. This is the one natural "mode re-evaluation"
@@ -18046,23 +16887,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           if (result === 'closed') draw();
           return true;
         },
-        routeVwTerminalKey: (routeKey) => {
-          // Claim when the foreground VW's focused pane is a live
-          // terminal — forward the key directly to the pane's PTY
-          // and skip every later step (input-core, chord, global,
-          // layout). The pane's onKey returns an Action; we only
-          // care about triggering a redraw on 'refresh'.
-          const vw = virtualWindows.registry.current();
-          if (!vw) return false;
-          const focusedPane = vw.getFocusedPane();
-          if (!focusedPane) return false;
-          const isTerminalKind = focusedPane.kind === 'terminal' || focusedPane.kind === 'terminal-slot';
-          if (!isTerminalKind) return false;
-          const ev = toDashboardKeyEvent(routeKey);
-          const action = focusedPane.onKey(ev);
-          if (action.type === 'refresh') draw();
-          return true;
-        },
         routeArmedChordKey: async (routeKey) => {
           if (!isChordArmed(chord)) return false;
           disarmChordHud();
@@ -18111,44 +16935,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           if (routeKey.name === 'ㅃ') return true;
           return false;
         },
-        // Step 0a — Alt+W close. Replaces the removed Ctrl+Shift+T close
-        // chord (which collided with shell-level Ctrl+T finders). Fires
-        // from popup terminal modal AND VW with terminal pane focused.
-        // Korean ㅈ is the W-position jamo on 2-bul, included for IME
-        // parity. Does nothing when neither a popup nor a VW-terminal
-        // is active — the chord is targeted at popup-style surfaces.
-        routePopupCloseChord: (routeKey) => {
-          if (!routeKey.alt) return false;
-          const isW = routeKey.name === 'w' || routeKey.name === 'W' || routeKey.name === 'ㅈ';
-          if (!isW) return false;
-          // Popup terminal modal close
-          if (terminalModalRouter.current() !== null) {
-            if (debug.enabled) {
-              debug.log('window.terminalModalRouter.handleKey.close', 'alt-w', {
-                id: terminalModalRouter.current()?.id,
-              });
-            }
-            terminalModalRouter.close();
-            draw();
-            return true;
-          }
-          // VW with terminal pane focused — close the VW
-          const vwForClose = virtualWindows.registry.current();
-          if (vwForClose) {
-            const focusedPane = vwForClose.getFocusedPane();
-            if (focusedPane && (focusedPane.kind === 'terminal' || focusedPane.kind === 'terminal-slot')) {
-              if (debug.enabled) {
-                debug.log('window.vw.close', 'alt-w', {
-                  windowId: vwForClose.id, paneKind: focusedPane.kind,
-                });
-              }
-              virtualWindows.registry.close(vwForClose.id);
-              draw();
-              return true;
-            }
-          }
-          return false;
-        },
         // PR-S1V.4-wiring · Step 0x — voice mode entry chord.
         // Fires only when voice mode is currently `idle`; once active
         // the next step (routeVoiceModeKey) takes over. Skipping when
@@ -18183,7 +16969,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         // experiment/voice-chat-realtime-rebind · Step 0s — modal-A
         // swallow while voice-chat is active. Returns true when the
         // controller is non-idle so any key not already claimed above
-        // (force-quit · Alt+W · Alt+digit · chord toggle) is consumed
+        // (force-quit · Alt+W · chord toggle) is consumed
         // — typing doesn't leak into chat input, Space doesn't toggle
         // pickers, etc. ESC explicitly exits. Idle controller returns
         // false so legacy dispatch is reachable.
@@ -18299,36 +17085,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           })();
           return true;
         },
-        // Step 0b — Alt+digit VW switch. Single-keystroke window
-        // navigation that survives the popup-terminal / VW-terminal
-        // priority forwarding. Alt+1 → 1st VW (sorted ascending by
-        // numeric id), Alt+2 → 2nd, …, Alt+9 → 9th. Alt+0 is
-        // intentionally omitted (digit-argument convention conflict
-        // is rare; reserve for future use).
-        routeVwSwitchChord: (routeKey) => {
-          if (!routeKey.alt) return false;
-          if (routeKey.name.length !== 1) return false;
-          const digit = routeKey.name.charCodeAt(0);
-          if (digit < 0x31 || digit > 0x39) return false; // '1' .. '9'
-          const ordinal = digit - 0x30; // 1..9
-          const windows = virtualWindows.registry.list().sort((a, b) => a.id - b.id);
-          const target = windows[ordinal - 1];
-          if (!target) {
-            if (debug.enabled) {
-              debug.log('window.vw.switch.miss', `alt-${ordinal}`, {
-                ordinal, windowCount: windows.length,
-              });
-            }
-            return true; // claim anyway so it doesn't leak to the child
-          }
-          if (debug.enabled) {
-            debug.log('window.vw.switch', `alt-${ordinal}`, {
-              ordinal, targetId: target.id,
-            });
-          }
-          virtualWindows.registry.switchTo(target.id);
-          return true;
-        },
         // Step 6 hard-quit — only reached when no popup terminal is
         // active. Plain Ctrl+Q stays as the dashboard-mode shortcut
         // so muscle memory survives outside the popup. Inside the
@@ -18336,12 +17092,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         // to force-quit instead).
         isHardQuitKey: (routeKey) => routeKey.ctrl && !routeKey.shift && (routeKey.name === 'q' || routeKey.name === 'ㅂ'),
         matchGlobalAction: (routeKey) => matchTextInputGlobalAction(routeKey, {
-          allowSpawnTerminalModal: !(workingDir.focus === 'preview'
-            && previewTerminal
-            && (previewTerminal as PreviewTerminal).isAlive),
-          allowToggleLogZoom: !(workingDir.focus === 'preview'
-            && previewTerminal
-            && (previewTerminal as PreviewTerminal).isAlive),
+          allowSpawnTerminalModal: false,
+          allowToggleLogZoom: false,
         }),
         runGlobalAction: async (action) => {
           await runChatMainGlobalAction(action);
@@ -18889,8 +17641,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             textInputOpts: {
               // TUI 부활 후속 — Esc·Esc = /rewind 픽커 (codex backtrack
               // 제스처 · resolveEscEscRewind 순수 판정). 빈 버퍼에서만
-              // prime · 1.5s 창 · rich 모드는 Esc 가 입력 루프를 이탈
-              // 하므로 사실상 essential 전용(의도). 힌트는 세션 1회.
+              // prime · 1.5s 창. 힌트는 세션 1회.
               onEscape: (bufferText) => {
                 const decision = resolveEscEscRewind({
                   bufferText: bufferText ?? '',
@@ -19193,6 +17944,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               hasActiveStatusPopup: () => mouseWiring.hasActivePopup(),
               hasTerminalModal: () => terminalModalRouter.current() !== null,
               shouldRouteForegroundModalKey: (key) => {
+                if (key.name === 'escape' && currentTransientTerminalModal('dashboard-help')) return true;
                 const topModalId = display.modalStack().at(-1) ?? null;
                 const topModal = topModalId ? display.surface(topModalId) : null;
                 const topModalSurface =
@@ -19219,7 +17971,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               toKeyEvent: toDashboardKeyEvent,
               routeStatusPopupKey: key => mouseWiring.routeKey(key as never),
               handleTerminalModalKey: keyEvent => terminalModalRouter.handleKey(keyEvent),
-              tryRouteForegroundModalKey: keyEvent => display.tryRouteKeyToTopModalAsync(keyEvent),
+              tryRouteForegroundModalKey: async keyEvent => {
+                if (keyEvent.name === 'escape') {
+                  const helpModal = currentTransientTerminalModal('dashboard-help');
+                  if (helpModal) {
+                    helpModal.dispose();
+                    draw();
+                    return 'consumed';
+                  }
+                }
+                return display.tryRouteKeyToTopModalAsync(keyEvent);
+              },
               redraw: draw,
               dispatchMouse: runTextInputOnMouseUnifiedDispatch,
             }),
@@ -19581,6 +18343,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               closeTui,
               exitTui: exitDashboardTui,
               showHelp,
+              showHelpModal: ({ title, lines }) => {
+                const { cols, rows } = termSize();
+                showTransientTerminalModal({ title, lines: [...lines], coordinator: display, termCols: cols, termRows: rows, ttlMs: 0, group: 'dashboard-help' });
+              },
               clearLogSearch,
               clearLogFilter,
               forkAttachedSessionFromChatHistory,
@@ -19605,6 +18371,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               controlSignalSlashRuntime,
               browserCdpSlashRuntime,
               widgetHost,
+              backgroundTasksTextOnly: true,
               widgetModalPopup: {
                 open: (s) => {
                   // Wave P4b-1 — bridge slash → widget-modal-popup.
@@ -19661,10 +18428,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 attachClipboardImage,
                 setNextInitial: (token) => { nextInitial = token; },
               },
-              uiModeSlash: {
-                getMode: () => dashboardUiMode,
-                setMode: (mode) => { applyDashboardUiMode(mode, { persist: true, announce: true }); },
-              },
               sessionResume: {
                 openPicker: () => { openSessionResumePicker(); },
               },
@@ -19686,22 +18449,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 refresh: refreshInputHistory,
                 openDetailViewer: (title, lines) => { setDetailViewer(title, lines); },
               },
-              terminal: {
-                fullscreenMissingLine: () => termSlashRuntime.fullscreenMissingLine(),
-                showFullscreenToast: (opts) => {
-                  const { cols: tc, rows: tr } = termSize();
-                  showToast({ title: opts.title, lines: opts.lines, coordinator: display, termCols: tc, termRows: tr });
-                },
-              },
               undo: {
                 refreshGitDirty: () => { refreshGitDirty(getSessionCwd(), { force: true }); },
                 bold: C.bold,
-              },
-              ptyPane: {
-                spawnPtyTailWindow: (opts) => virtualWindows.registry.spawn({
-                  title: opts.title,
-                  initialContent: { kind: 'pty-tail', ptyId: opts.ptyId },
-                }),
               },
               delta: {
                 openBrowserPopup: (scope, limit, browserMode) =>
@@ -19878,37 +18628,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 focusPopup: (direction) => focusConversationPopup(direction),
                 openModal: (sessionId) => openConversationModal(sessionId),
               },
-              scratch: {
-                slashRuntime: scratchSlashRuntime,
-                isClosed: () => scratchClosed,
-                open: () => {
-                  scratchClosed = false;
-                  userClosedPanes.delete('scratch');
-                  setWorkingFocus('scratch', 'slash-scratch-open');
-                },
-                close: () => {
-                  scratchClosed = true;
-                  userClosedPanes.add('scratch');
-                  if (workingDir.focus === 'scratch') {
-                    applyFocusToPaneTransition(resolveFocusToPaneTransition({
-                      targetPane: 'log',
-                      reason: 'slash-scratch-close',
-                    }));
-                  }
-                },
-                clear: () => { setScratch('', []); },
-                currentForCommand: () => currentScratchForCommand(),
-                snapshotForAppend: () => ({ title: scratchTitle, lines: scratchLines }),
-                setText: (title, lines) => { setScratch(title, [...lines]); },
-                buildDumpLines: (lines) => buildDashboardScratchDumpLines([...lines]),
-                popup: {
-                  open: () => { setCompanionPopupOpen('scratch', true); },
-                  close: () => { setCompanionPopupOpen('scratch', false); },
-                  toggle: () => toggleCompanionPopup('scratch'),
-                  promote: () => { promoteCompanionPopup('scratch'); },
-                },
-                openMemo: () => { openMemoCompanion(); },
-              },
               sim: {
                 slashRuntime: simSlashRuntime,
                 spawnVirtualWindow: () => spawnSimVirtualWindow(),
@@ -19934,39 +18653,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   ]);
                   return aliases.get(target) ?? null;
                 },
-              },
-              view: {
-                slashRuntime: viewSlashRuntime,
-                buildListItems: () => viewRegistry.allViews.map((v) => ({
-                  active: activeViewId === v.id,
-                  id: v.id,
-                  label: v.label,
-                  enabled: v.enabled,
-                  shortcut: v.shortcut,
-                  // List-entry contract types baseView as a display string;
-                  // the registry holds it as a WorkingDirView number.
-                  baseView: String(v.baseView),
-                })),
-                closedPaneLabels: () => closedStarterPanes().map((pane) => paneLabel(pane)),
-                next: () => { setActiveDashboardView(nextDashboardView(viewRegistry, activeViewId, 1)); },
-                prev: () => { setActiveDashboardView(nextDashboardView(viewRegistry, activeViewId, -1)); },
-                reload: () => {
-                  reloadUserConfig();
-                  reloadDashboardViews();
-                },
-                save: () => { saveDashboardViewsConfig(); },
-                restoreAllClosed: () => { restoreAllClosedDashboardPanes(); },
-                reset: () => { resetDashboardViewsConfig(); },
-                exportConfigJson: () => JSON.stringify(serializeDashboardViewsConfig(viewRegistry), null, 2),
-                openByQuery: (query) => {
-                  const def = findDashboardView(viewRegistry, query);
-                  if (def) {
-                    setActiveDashboardView(def);
-                    return true;
-                  }
-                  return false;
-                },
-                openDetailViewer: (title, lines) => { setDetailViewer(title, lines); },
               },
               intake: {
                 runSlash: async (intakeArgs) => {
@@ -19995,7 +18681,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                       },
                     };
                     const r = await resolveIntakeSlash([...intakeArgs], {
-                      getScratchSnapshot: currentScratchForCommand,
+                      getScratchSnapshot: () => {
+                        const snapshot = display.scratchState();
+                        return snapshot && snapshot.mode !== 'agents'
+                          ? { title: snapshot.title, lines: [...snapshot.lines] }
+                          : { title: scratchTitle, lines: [...scratchLines] };
+                      },
                     });
                     if (shouldOpenDashboardIntakeSessionPicker([...intakeArgs], r)) {
                       openDashboardIntakeSessionPicker(r.sessions, intakeUiDeps);
@@ -20250,24 +18941,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   const hit = all.find(w => virtualWindows.registry.spawnTitleOf(w.id) === label);
                   return hit ? hit.id : null;
                 },
-              },
-              workspaceSlash: {
-                slashRuntime: windowSlashRuntime,
-                registry: virtualWindows.registry as unknown as DashboardSlashContext['workspaceSlash']['registry'],
-                spawnScratchVirtualWindow,
-                spawnBrowserVirtualWindow,
-                spawnPreviewVirtualWindow,
-                spawnBrowserPreviewVirtualWindow,
-                spawnIulVirtualWindow,
-                spawnAcpVirtualWindow,
-                spawnSimVirtualWindow,
-                openWindowPicker: () => openWindowPicker(),
-                toggleVwCompanion: (windowId, key) => toggleVwCompanion(windowId, key as Parameters<typeof toggleVwCompanion>[1]),
-                setVwCompanionOpen: (windowId, key, open) => setVwCompanionOpen(windowId, key as Parameters<typeof setVwCompanionOpen>[1], open),
-              },
-              acpVwSlash: {
-                cwd: () => workingDir.cwd,
-                vwRegistry: virtualWindows.registry,
               },
               termSlash: {
                 slashRuntime: termSlashRuntime,
@@ -20558,7 +19231,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               // B-2.l migrated: /agents /agent /ag → registry handler.
               // B-1.f migrated: /clipboard /clip /cb · /memo /note /me ·
               // /detail /report /dv → registry handlers (companion ctx field).
-              // B-2.v migrated: /scratch /sc → registry handler.
               // B-2.o migrated: /intake → registry handler.
               // B-1.g migrated: /signals /signal → registry handler (controlSignalSlashRuntime ctx field).
               case 'media':
@@ -20710,7 +19382,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   chatLines.push(C.warning(`/${cmdLower} has moved; use ${retiredHarnessCommand}`));
                 } else {
                   chatLines.push(C.warning(`Unknown command: /${cmdLower}`));
-                  chatLines.push(C.muted('Available: /view /preview /scratch /intake /run-skill /skill-triggers /skill-reload /provider /context /paste /sync /widget /plugin /chat /clear /help /quit /research'));
+                  chatLines.push(C.muted('Type /help for the list of commands.'));
                 }
                 chatScrollOffset = -1;
                 continue; // stay in input mode
@@ -21025,8 +19697,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             contextRegistry,
             loadAttachments: (reg) => loadAllAttachments(reg as Parameters<typeof loadAllAttachments>[0]),
             sessionRegistry,
-            virtualWindowBook: virtualWindows.book,
-            virtualWindowRegistry: virtualWindows.registry,
             sync,
             chatFooterLine,
             routeFooter: () => {
@@ -21064,8 +19734,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               contextText: args.contextText,
               contextRegistry: args.contextRegistry as typeof contextRegistry,
               terminalRegistry: args.terminalRegistry as typeof sessionRegistry,
-              addressBook: args.addressBook as typeof virtualWindows.book,
-              windowRegistry: args.windowRegistry as typeof virtualWindows.registry,
               blockAttach: args.blockAttach,
               pushChatLine: args.pushChatLine,
             }),
@@ -21092,7 +19760,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                     pluginTools: pluginHost.activePluginLLMTools(),
                     optionalTools: acpTurnRef.optionalSpecs,
                     surface: acpTurnRef.turnProfile?.surface,
-                    rich: dashboardUiMode === 'rich',
+                    rich: false,
                   })
                 : [];
               return buildDashboardTurnPreamble({
@@ -21100,7 +19768,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 cwd: args.cwd,
                 turnProfile: args.turnProfile as SessionTurnProfile,
                 userConfig: args.userConfig,
-                rich: dashboardUiMode === 'rich',
+                rich: false,
                 enabledTools: tools.map(t => t.name),
               });
             },
@@ -21162,7 +19830,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               createDashboardTurnStreamRuntimeEscBoundary(escAbortToolState);
               const toolRendering = {
                 ...getUserConfig().chat.rendering.tool,
-                expandHint: dashboardUiMode === 'rich',
+                expandHint: false,
               };
               const renderedToolRuntime = createDashboardRenderedToolRuntime({
                 chatLines,

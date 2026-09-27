@@ -19,6 +19,7 @@
 
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { debug } from '../debug/log.js';
 import { join } from 'node:path';
 import {
   ALL_HOOK_EVENTS,
@@ -106,10 +107,15 @@ export class HookDispatcher {
     if (handler.priority <= RESERVED_PRIORITY_MAX) {
       // Advisory only — built-in Andon/Budget/Termination own this
       // range. User plugins must stay ≥10.
-      this.warn(
-        `hook '${handler.id}' registered with reserved priority ${handler.priority} ` +
-        `(range 0-${RESERVED_PRIORITY_MAX} is reserved for built-ins)`,
-      );
+      const message = `hook '${handler.id}' registered with reserved priority ${handler.priority} ` +
+        `(range 0-${RESERVED_PRIORITY_MAX} is reserved for built-ins)`;
+      // 내장 훅(`core:*`)은 이 구간의 «주인»이다 — 경고 대상이 아니다. 종전엔 `core:andon` 만 뺐고
+      // `core:route-banner`·`core:missions` 경고가 TUI 입력줄 위로 새어 화면을 깼다(🅢 2026-09-27 실측 · /research status).
+      if (handler.id.startsWith('core:')) {
+        debug.log('plugin-hooks', 'reserved-priority', { message });
+      } else {
+        this.warn(message);
+      }
     }
     list.push(handler);
     this.handlers.set(handler.event, list);

@@ -221,7 +221,17 @@ try {
   New-Item -ItemType Directory -Force -Path $binDirectory | Out-Null
   $shimPath = Join-Path $binDirectory 'elanous.cmd'
   # The shim names bun by its absolute path so `elanous` works in a shell whose PATH lacks ~\.bun\bin.
-  Set-Content -LiteralPath $shimPath -Value "@echo off`r`n`"$bunPath`" `"%~dp0..\current\node_modules\elanous\bin\elanous.mjs`" %*`r`n" -NoNewline -Encoding ascii
+  $shimContent = "@echo off`r`nrem elanous-wrapper`r`n`"$bunPath`" `"%~dp0..\current\node_modules\elanous\bin\elanous.mjs`" %*`r`n"
+  Set-Content -LiteralPath $shimPath -Value $shimContent -NoNewline -Encoding ascii
+  $elnShim = Join-Path $binDirectory 'eln.cmd'
+  $pathEln = Get-Command eln -ErrorAction SilentlyContinue
+  if (($pathEln -and $pathEln.Source -ne $elnShim) -or
+      ((Test-Path -LiteralPath $elnShim) -and ((Get-Item -LiteralPath $elnShim -Force).Attributes -band [IO.FileAttributes]::ReparsePoint -or
+        (Read-Text $elnShim) -notmatch '(?m)^rem elanous-wrapper\r?$'))) {
+    Write-Output 'WARNING eln: another command already exists; use elanous instead'
+  } else {
+    Set-Content -LiteralPath $elnShim -Value $shimContent -NoNewline -Encoding ascii
+  }
 
   $installedPackage = Join-Path $Prefix 'current\node_modules\elanous\package.json'
   if (-not (Test-Path -LiteralPath $installedPackage)) { Fail "package version missing: $installedPackage" 1 }

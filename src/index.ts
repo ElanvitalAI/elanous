@@ -5,22 +5,15 @@ import { WORKFLOW_NODE_VARIANT_KEYS } from './workflow-runtime/schema.js';
 import { accessSync, constants as fsConstants, existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, statSync } from 'node:fs';
 import type { SelfDevRunParticipant, SelfDevRunState } from './self-dev/run-store.js';
 import { applyConfigDirFlagFromArgv } from './cli/config-dir-flag.js';
-import { LOGS_SINCE_OPTION } from './cli/logs-cli.js';
+import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
+import { registerDocsCommands } from './cli/docs-cli.js';
+import { registerFleetCommands } from './cli/fleet-cli.js';
 import { readPipedStdin } from './cli/piped-stdin.js';
 import { writeStdoutJson } from './cli/stdout-json.js';
 import { writeStdoutFully } from './cli/stdout-flush.js';
-import { shellQuoteRemote } from './ssh/ssh-fs.js';
 // ⛔ 도움말이 접두를 «다시 리터럴로» 복제하면 상수와 갈린다(무인 리뷰 should-fix) ⇒ 상수에서 만든다.
 import { WORKTREE_BRANCH_PREFIX as WORKTREE_BRANCH_PREFIX_HELP } from './harness/worktree-branch-prefix.js';
 import { ensureRunIdentity, getHarnessSpace, normalizeSpaceId } from './harness/harness-space.js';
-import { encodeDetachedProgressFrame } from './harness/dispatch-detached.js';
-import type { FeedbackEnvelope } from './feedback/envelope.js';
-import {
-  buildMarkStepDoneTool,
-  buildPlanTool,
-  dispatchMarkStepDone,
-  dispatchPlan,
-} from './boot/daemon-tools/index.js';
 // ★ B1 — ⛔ 가드는 dev 액션의 «첫 비동기 작업보다 앞»에 서야 한다. 동적 import 로 가져오면
 //   그 import 자체가 첫 비동기 작업이 되어, 그것이 거부되면 가드 없이 끝난다(무인 리뷰 must-fix).
 //   ⇒ «정적» import 로 올린다. 이 모듈은 부작용이 없어 부팅 비용이 사실상 0 이다.
@@ -29,7 +22,6 @@ import { buildOrchestrateDecomposePrepareArgs, normalizeOrchestrateRequest, spli
 import { CLI_ENTRANCE_BASELINE, evaluateCommandEntranceBaseline } from './self-dev/entrance-baseline.js';
 import { CLI_HARNESS_DOGFOOD_ENTRANCE, CLI_HARNESS_ORCHESTRATE_ENTRANCE, describeEntranceCommand, listEntrancesWithModelExposure, renderLaunchEntrances, summarizeEntrances, type EntranceId } from './self-dev/entrance-registry.js';
 import { collectCommandEntrances, renderCommandEntrances } from './self-dev/entrance-inventory.js';
-import { applyDocumentReferences, applyHarnessPolicy, DOCUMENT_REFERENCES_ENV, HARNESS_POLICY_ENV } from './self-implement/harness-policy.js';
 import { isGoalAuthorFileName } from './self-implement/goal-document.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surface.js';
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
@@ -38,7 +30,18 @@ import { registerPtyTakeoverCommands } from './cli/pty-takeover-cli.js';
 import { registerLeaderCommands } from './cli/leader-cli.js';
 import { registerPrCommands } from './cli/pr-cli.js';
 import { registerRepoCommands } from './cli/repo-cli.js';
+import { registerAgentCommands, runChatTurnCli, emitDetachedProgress } from './cli/agent-cli.js';
+export { runChatTurnCli, buildCliAgentTools, setCliAgentDispatchForTesting, emitDetachedProgress, emitHarnessFeedbackProgress } from './cli/agent-cli.js';
+import { registerOpsCommands } from './cli/ops-cli.js';
+import { registerPublishCommands } from './cli/publish-cli.js';
+import { registerAutopilotCommands } from './cli/autopilot-cli.js';
+import { registerRoleCommands } from './cli/role-cli.js';
+import { registerMachineCommands } from './cli/machine-cli.js';
+import { registerScheduleCommands } from './cli/schedule-cli.js';
+export { runSchedule, scheduleCreatePlan } from './cli/schedule-cli.js';
+export type { ScheduleDispatch } from './cli/schedule-cli.js';
 import { registerReviewLoopOptions, buildReviewLoopOpts } from './agent-mission/review-loop-cli.js';
+import { registerCapabilitiesCommand } from './agent-mission/capabilities-cli.js';
 import { agentBackendNames } from './agent-mission/driver.js';
 import { registerWhereCommand } from './cli/where-cli.js';
 import { registerPodCommands } from './cli/pod-cli.js';
@@ -47,8 +50,13 @@ import { registerPendingQuestionsCommand } from './cli/pending-questions-cli.js'
 import { registerUsageCommand } from './cli/usage-cli.js';
 import { registerReleaseCommands } from './cli/release-cli.js';
 import { registerModelWatchCommand } from './cli/model-watch-cli.js';
+import { registerIntakeCommands } from './cli/intake-cli.js';
+import { registerTasksCommands } from './cli/tasks-cli.js';
 import { registerDoctorCommand } from './cli/doctor-cli.js';
+import { registerProviderCommands } from './cli/provider-cli.js';
+export { buildCodexAccountImportGuidance, setCodexAccountLogSinkModuleForTesting } from './cli/provider-cli.js';
 import { registerControlCommands } from './cli/control-cli.js';
+import { registerHooksCommands } from './cli/hooks-cli.js';
 import { registerSetupCommand } from './cli/setup-cli.js';
 import { registerGroundingSourcesCli } from './grounding/sources-cli.js';
 import { registerGraphCommands } from './graph-runner/graph-cli.js';
@@ -98,11 +106,7 @@ import type { SyncMode } from './types.js';
 import { runOnboarding, runOnboardingStep, runOnboardingNonInteractive, needsOnboarding, type OnboardingStepId } from './onboarding.js';
 import {
   getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig,
-  backupUserConfig, restoreUserConfig, backupConfigPath,
-  rotateNextProvider, jumpToRotationEntry, addRotationEntry,
-  removeRotationEntry, rotationEntryLabel, currentRotationIndex,
-  type RotationEntry,
-  PROVIDER_DEFAULT_MODEL as USER_CONFIG_PROVIDER_DEFAULT_MODEL,
+  backupUserConfig, backupConfigPath, addRotationEntry, type RotationEntry,
   resolveRoleLlm,
 } from './user-config.js';
 import { reviewReasoningEffort } from './model-tier/review-effort.js';
@@ -113,11 +117,10 @@ import {
   lastConversationMessage, isSessionSource,
 } from './session/index.js';
 import { requestSessionTurnControl } from './session/session-turn-control.js';
-import { runTurn, ensureCliSession, sessionBudget } from './session/chat.js';
+import { ensureCliSession, sessionBudget } from './session/chat.js';
 import { botFromConfig, TelegramBot } from './telegram.js';
 import { acquireTelegramLock, TelegramLockError, defaultLockPath, safeReadLock } from './telegram-lock.js';
-import { basename, dirname as _dirname, join as _joinPath, resolve } from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { basename, join as _joinPath, resolve } from 'node:path';
 import * as nodeReadline from 'node:readline/promises';
 import { stdin as procStdin, stdout as procStdout } from 'node:process';
 
@@ -142,10 +145,11 @@ import { auditKeybindings, renderKeymapAudit } from './keymap-audit.js';
 import { runCodexSetup } from './codex/setup.js';
 import { renderAllModels } from './codex/models.js';
 import { realIO } from './onboarding.js';
-import { inspectActiveProvider, renderProviderStatus, oneLineProvider } from './provider-summary.js';
+import { inspectActiveProvider, oneLineProvider } from './provider-summary.js';
 import { renderStatusLines, renderPrimaryStatus, renderSecondaryStatus } from './status/bar.js';
 import { initSessionWorkingDir } from './session/working-dir.js';
 import { rewriteBareNexusToStatus } from './cli/nexus-entry.js';
+import { registerIngestTokenCommands } from './cli/ingest-token-cli.js';
 import type { ReviewImage } from './agent-substrate/pr-reviewer.js';
 import {
   describeMissionRouting,
@@ -155,7 +159,6 @@ import {
 } from './cli/mission-config.js';
 import { DEFAULT_THEME_TOKENS, resolveThemeTokens } from './theme/tokens.js';
 import { conatusPath } from './domains/conatus-data-dir.js';
-import { knownLogAxes } from './mss/logging/log-axis.js';
 import {
   saveMemory, loadMemory, listMemories, deleteMemory, searchMemories,
   readIndex, memoryRoot, memoryIndexPath,
@@ -497,6 +500,7 @@ function harnessAskSayOptionsToDevCliOpts(opts: HarnessAskSayOptions & {
   json?: boolean;
   base?: string;
   autoMerge?: boolean;
+  mergeByHost?: boolean;
   observeOnly?: boolean;
   supervise?: boolean;
   childLlmProvider?: string;
@@ -511,6 +515,7 @@ function harnessAskSayOptionsToDevCliOpts(opts: HarnessAskSayOptions & {
     ...(opts.json ? { json: true } : {}),
     ...(opts.base !== undefined ? { base: opts.base } : {}),
     ...(opts.autoMerge === false ? { autoMerge: false } : {}),
+    ...(opts.mergeByHost === true ? { mergeByHost: true } : {}),
     ...(opts.observeOnly ? { observeOnly: true } : {}),
     ...(opts.forcePreflight === true ? { forcePreflight: true } : {}),
     ...(opts.childLlmProvider !== undefined ? { childLlmProvider: opts.childLlmProvider } : {}),
@@ -819,6 +824,8 @@ async function runDevSayFromWords(
 registerPtyTakeoverCommands(program);
 registerPrCommands(program);
 registerRepoCommands(program);
+registerRoleCommands(program);
+registerMachineCommands(program);
 // CLI entry: where action → resolveCurrentInstance → resolveInstance (instance universe).
 registerWhereCommand(program);
 registerLeaderCommands(program);
@@ -832,10 +839,44 @@ registerModelWatchCommand(program);
 registerDoctorCommand(program);
 // runCli() → main() → program.parseAsync() dispatches control serve and resources where|list.
 registerControlCommands(program);
+registerHooksCommands(program);
 registerSetupCommand(program);
 registerGroundingSourcesCli(program);
 registerGraphCommands(program);
 registerLaunchHeadCommands(program);
+
+const connectorCmd = program.command('connector').description('External task connectors');
+const linearCmd = connectorCmd.command('linear').description('Linear issues to TOX tasks');
+linearCmd.command('sync').requiredOption('--team <key>', 'Linear team key')
+  .option('--prefix <text>', 'Issue title prefix or label').option('--dry-run', 'Do not post or record events').option('--json', 'JSON output')
+  .action(async (opts: { team: string; prefix?: string; dryRun?: boolean; json?: boolean }) => {
+    const { runLinearSync } = await import('./cli/connector-cli.js');
+    try { process.exitCode = await runLinearSync(opts); }
+    catch (error) { console.error(`connector linear sync: ${(error as Error).message}`); process.exitCode = 1; }
+  });
+linearCmd.command('receive').description('Internal signed webhook receiver; read raw payload from stdin')
+  .requiredOption('--signature <hex>', 'Linear-Signature header')
+  .requiredOption('--delivery <id>', 'Linear-Delivery header')
+  .action(async (opts: { signature: string; delivery: string }) => {
+    const { runLinearWebhook } = await import('./cli/connector-cli.js');
+    try {
+      const chunks: Buffer[] = [];
+      for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+      process.exitCode = await runLinearWebhook({ rawBody: Buffer.concat(chunks), signature: opts.signature, deliveryId: opts.delivery });
+    } catch { console.error('connector linear receive: unable to apply event'); process.exitCode = 1; }
+  });
+linearCmd.command('set-webhook-secret').description('Read Linear webhook signing secret from stdin and store in secrets')
+  .action(async () => {
+    const { runLinearSetWebhookSecret } = await import('./cli/connector-cli.js');
+    try { process.exitCode = await runLinearSetWebhookSecret(); }
+    catch { console.error('connector.linear.webhookSecret: could not save secret'); process.exitCode = 1; }
+  });
+linearCmd.command('set-key').description('Read Linear API key from stdin and store in secrets')
+  .action(async () => {
+    const { runLinearSetKey } = await import('./cli/connector-cli.js');
+    try { process.exitCode = await runLinearSetKey(); }
+    catch { console.error('connector.linear.apiKey: could not save key'); process.exitCode = 1; }
+  });
 
 const pythonCmd = program.command('python').description('elanous 가 쓰는 파이썬(해석 · 점검 · elanous venv 셋업) — RFC-doctor-fix-build-toolchain-and-python-by-distro');
 pythonCmd.command('where').description('어느 파이썬을 쓰나(ELANOUS_PYTHON > elanous venv > pyenv .python-version > PATH)').option('--json').option('--path', '경로만 한 줄(스크립트·스킬용)').action(async (o: { json?: boolean; path?: boolean }) => {
@@ -1357,152 +1398,7 @@ program
     }
   });
 
-// ── autopilot ──
-//
-// ROADMAP-ipad-companion-autopilot-priority §D1.3 — headless mission
-// runner. Spawns an ACP backend, opens a single session, runs the
-// AutopilotLoopDriver against the mission, prints agent deltas on
-// stdout + envelope/termination summary on stderr.
-const autopilotCmd = program
-  .command('autopilot')
-  .description('Mission-driven autopilot — runs an ACP agent against a single mission with safety + budget guards');
-
-autopilotCmd
-  .command('run <mission...>')
-  .description('Run a single mission. The mission is sent as the first prompt to the ACP backend; subsequent turns require a planner (deferred to D1.4+).')
-  .option('-b, --backend <id>', 'ACP backend id (claude / codex / gemini …)', 'claude')
-  .option('-i, --max-iterations <n>', 'Max loop iterations', '1')
-  .option('-w, --max-wallclock-ms <ms>', 'Wall-clock budget in milliseconds', '0')
-  .option('-c, --max-output-chars <n>', 'Cumulative output character budget (token proxy)', '0')
-  .option('-d, --cwd <path>', 'Working directory for the spawned backend (default: elanous session cwd)')
-  .option('-v, --verbose', 'Mirror ACP subprocess log lines to stderr')
-  .option('-p, --auto-plan', 'Parse mission numbered/bulleted list into AutopilotPlan (D1.4b heuristic · no LLM)')
-  .action(async (
-    missionParts: string[],
-    opts: {
-      backend: string;
-      maxIterations: string;
-      maxWallclockMs: string;
-      maxOutputChars: string;
-      cwd?: string;
-      verbose?: boolean;
-      autoPlan?: boolean;
-    },
-  ) => {
-    const { runAutopilotMission } = await import('./cli/autopilot-run.js');
-    const mission = missionParts.join(' ').trim();
-    if (!mission) {
-      process.stderr.write('autopilot run: mission text is required\n');
-      process.exit(2);
-    }
-    const wallClock = parseInt(opts.maxWallclockMs, 10);
-    const outputChars = parseInt(opts.maxOutputChars, 10);
-    try {
-      const outcome = await runAutopilotMission({
-        mission,
-        backend: opts.backend,
-        maxIterations: parseInt(opts.maxIterations, 10) || 1,
-        maxWallClockMs: wallClock > 0 ? wallClock : undefined,
-        maxOutputChars: outputChars > 0 ? outputChars : undefined,
-        cwd: opts.cwd,
-        verbose: opts.verbose,
-        autoPlan: opts.autoPlan,
-      });
-      process.exit(outcome.exitCode);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`autopilot run: ${msg}\n`);
-      process.exit(1);
-    }
-  });
-
-autopilotCmd
-  .command('rerun <missionId>')
-  .description('미션 유지·재실행 — 페이즈를 backlog 로 리셋하고 run-mission 재spawn(멀티페이즈 순회 재개). --from 으로 특정 페이즈부터(그 이후 전부 재실행).')
-  .option('-f, --from <index>', '재실행 시작 페이즈 인덱스(0=처음부터·기본)', '0')
-  .action(async (missionId: string, opts: { from: string }) => {
-    const { rerunMission } = await import('./autopilot/mission-lifecycle.js');
-    const r = rerunMission(missionId, { fromPhaseIndex: parseInt(opts.from, 10) || 0 });
-    if (r.ok) {
-      process.stdout.write(`🔄 재실행: ${r.reset}/${r.total} 페이즈 리셋(from ${r.fromIndex})·집행 시작\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`autopilot rerun: ${r.error ?? '실패'}\n`);
-    process.exit(1);
-  });
-
-autopilotCmd
-  .command('signal <missionId> <kind>')
-  .description('★CW3 signal control — 실행 중(mid-phase) walker 에 신호를 graceful 발신(SIGTERM kill 아님). kind=abort(중단·부분결과 반환)|pause(정지)|clear(신호 해제)|peek(현재 신호 조회). walker turn 루프가 다음 turn 폴링·graceful 수신(autopilot.coordinatorControl ON 필요). audit #59 (b) mid-phase 양방향 채널.')
-  .option('--reason <r>', '신호 사유(관측·표면화용)')
-  .option('--phase <id>', '★신호 대상 페이즈(task:xxxx) — 지정 시 그 페이즈에만 스코프(다른 페이즈 누수 차단). 미지정=global(TTL만·최대 15분 후 만료)')
-  .action(async (missionId: string, kind: string, opts: { reason?: string; phase?: string }) => {
-    const { sendMissionSignal, peekMissionSignal, clearMissionSignal } = await import('./autopilot/pipeline/mission-signal.js');
-    if (kind === 'peek') {
-      const s = peekMissionSignal(missionId);
-      process.stdout.write(s ? `현재 신호: ${s.kind}${s.reason ? ` · ${s.reason}` : ''}\n` : '신호 없음\n');
-      process.exit(0);
-    }
-    if (kind === 'clear') {
-      clearMissionSignal(missionId);
-      process.stdout.write(`🧹 신호 클리어: ${missionId}\n`);
-      process.exit(0);
-    }
-    if (kind !== 'abort' && kind !== 'pause') {
-      process.stderr.write(`autopilot signal: kind 는 abort|pause|clear|peek (받음: ${kind})\n`);
-      process.exit(1);
-    }
-    const sig = sendMissionSignal(missionId, kind, { ...(opts.reason ? { reason: opts.reason } : {}), ...(opts.phase ? { phaseId: opts.phase } : {}) });
-    process.stdout.write(`📡 신호 발신: ${sig.kind}${sig.reason ? ` · ${sig.reason}` : ''}${sig.phaseId ? ` · phase=${sig.phaseId}` : ' · global(TTL 15분)'} → ${missionId}\n   walker 가 다음 turn 에 graceful 수신(autopilot.coordinatorControl ON 필요).\n`);
-    process.exit(0);
-  });
-
-autopilotCmd
-  .command('review <missionId>')
-  .description('완료 미션 리뷰 요약 재발송 — 보존된 PR + 자동 비평 요약을 origin(텔레그램)으로 다시 보내고 [🔧 비평 재반영] 버튼 첨부(지적 있을 때). 콘솔에도 출력.')
-  .action(async (missionId: string) => {
-    const { buildMissionReviewMessage } = await import('./autopilot/mission-lifecycle.js');
-    const { TaskStore } = await import('./task-orchestrator/store.js');
-    const { loadMissionOrigin } = await import('./autopilot/mission-origin.js');
-    const { notifyMissionReviewSummary } = await import('./autopilot/mission-notify.js');
-    const store = new TaskStore();
-    try {
-      const { text, hasCritiques, hasMergeable } = buildMissionReviewMessage(missionId, store);
-      process.stdout.write(`${text}\n`);
-      const origin = loadMissionOrigin(missionId);
-      const sent = notifyMissionReviewSummary(origin, missionId, text, { hasCritiques, hasMergeable });
-      process.stdout.write(sent !== null ? '📨 텔레그램 origin 으로 재발송됨(반영/재반영 버튼 포함).\n' : '(텔레그램 origin 없음 — 콘솔 출력만)\n');
-    } finally { store.close(); }
-    process.exit(0);
-  });
-
-autopilotCmd
-  .command('rereflect <missionId>')
-  .description('비평 재반영 — 완료 미션의 자동 비평 지적이 있는 페이즈만 골라 재구현(비평→[REBUILD]·이전 PR close·개선된 새 PR). clean 페이즈 유지. 머지는 HITL.')
-  .action(async (missionId: string) => {
-    const { rebuildCritiquedPhases } = await import('./autopilot/mission-lifecycle.js');
-    const r = rebuildCritiquedPhases(missionId);
-    if (r.ok) {
-      process.stdout.write(`🔧 비평 재반영: ${r.rebuilt}개 페이즈 재구현 시작\n${r.phases.map((t) => `· ${t}`).join('\n')}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`autopilot rereflect: ${r.error ?? '실패'}\n`);
-    process.exit(1);
-  });
-
-autopilotCmd
-  .command('merge <missionId>')
-  .description('반영(머지) — 완료 미션의 clean PR(자동 비평 지적 없음)을 squash 머지(gh). 비평 FAIL/WARN 페이즈는 머지 안 함(재반영 먼저). 대표 트리거·unattended 아님.')
-  .action(async (missionId: string) => {
-    const { mergeMissionPhases } = await import('./autopilot/mission-lifecycle.js');
-    const r = mergeMissionPhases(missionId);
-    if (r.ok) {
-      process.stdout.write(`✅ 반영(머지): ${r.merged}개 clean PR 머지${r.skipped ? `·${r.skipped} 실패` : ''}\n${r.prs.map((u) => `· ${u}`).join('\n')}\n`);
-      process.exit(0);
-    }
-    process.stderr.write(`autopilot merge: ${r.error ?? '실패'}\n`);
-    process.exit(1);
-  });
+registerAutopilotCommands(program);
 
 // ── memory ──
 const memCmd = program.command('memory').description('Persistent memories injected into every chat turn (user / feedback / project / reference)');
@@ -2056,35 +1952,6 @@ const harnessCmd = installHarnessCliCommand(program, {
   missionLoop: runHarnessMissionLoop,
 });
 
-export function emitDetachedProgress(
-  env: FeedbackEnvelope,
-  writeLine: (line: string) => void = (line) => process.stdout.write(line),
-): void {
-  const payloadLines = 'lines' in env.payload && Array.isArray(env.payload.lines) ? env.payload.lines : undefined;
-  const humanLine = payloadLines?.[0] ?? env.asciiFallback[0] ?? '';
-  const normalizedHumanLine = String(humanLine).replace(/\n/g, ' ');
-  if (humanLine) writeLine(`PROGRESS:${normalizedHumanLine}\n`);
-  const sharedFrame = {
-    version: 1 as const,
-    planId: env.blockId,
-    seq: env.seq,
-    ...(humanLine ? { humanLine: normalizedHumanLine } : {}),
-  };
-  const stepId = 'stepId' in env.payload && typeof env.payload.stepId === 'string'
-    ? env.payload.stepId
-    : env.phase;
-  const frame = env.kind === 'agent.plan'
-    ? { ...sharedFrame, kind: 'plan' as const }
-    : { ...sharedFrame, kind: 'step' as const, stepId };
-  writeLine(`${encodeDetachedProgressFrame(frame)}\n`);
-}
-
-export function emitHarnessFeedbackProgress(
-  env: FeedbackEnvelope,
-  writeLine: (line: string) => void = (line) => process.stdout.write(line),
-): void {
-  emitDetachedProgress(env, writeLine);
-}
 // (internal) 데몬이 dev-harness 를 subprocess 로 위임(#24 A) — 하니스 동기 op 가 데몬 이벤트루프를
 //   굶기지 않게 별도 프로세스에서 실행. base64 JSON 인자·auto_drive on 전제(비인터랙티브)·결과는 RESULT: 라인.
 harnessCmd
@@ -2132,6 +1999,21 @@ harnessCmd
     } catch (e) {
       try { process.stdout.write(`\nRESULT:RunDevHarness ⚠️ run-detached 실패: ${String((e as { message?: string })?.message ?? e).slice(0, 200)}\n`, () => process.exit(1)); }
       catch { process.exit(1); }
+    }
+  });
+harnessCmd
+  .command('stop <runId>')
+  .description('런 하나를 멈춘다 — 오케스트레이터 프로세스(pid.json 의 시작 시각이 맞을 때만) ⊕ 라벨 elanous.run=<runId> Pod Job')
+  .option('--context <ctx...>', 'kube 문맥(여러 번 · 기본 = 알려진 문맥 전부)')
+  .option('--json', 'JSON 출력')
+  .action(async (runId: string, opts: { context?: string[]; json?: boolean }) => {
+    const { stopHarnessRun, defaultHarnessStopDeps, formatHarnessStop } = await import('./harness/harness-stop.js');
+    try {
+      const result = await stopHarnessRun(runId, defaultHarnessStopDeps(), opts.context);
+      process.stdout.write(`${opts.json ? JSON.stringify(result) : formatHarnessStop(result)}\n`);
+    } catch (error) {
+      process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+      process.exitCode = 2;
     }
   });
 harnessCmd
@@ -2775,7 +2657,7 @@ export interface HarnessOrchestrateExecutionDeps {
   readonly runCommand?: (input: {
     goals: HarnessOrchestratePlanGoal[];
     concurrency?: number;
-    runtime: { teardown?: boolean; resumeFrom?: HarnessOrchestrateRunResult[]; onSnapshot?: (tasks: unknown) => void; checkpoint?: (results: HarnessOrchestrateRunResult[]) => void };
+    runtime: { runId?: string; teardown?: boolean; resumeFrom?: HarnessOrchestrateRunResult[]; onSnapshot?: (tasks: unknown) => void; checkpoint?: (results: HarnessOrchestrateRunResult[]) => void };
     supervise?: { rounds?: number };
   }) => Promise<HarnessOrchestrateOutcome>;
   readonly resolveStart?: (input: {
@@ -2816,7 +2698,7 @@ export async function runHarnessOrchestrateExecution(
   const now = deps.now ?? (() => Date.now());
   const pid = deps.pid ?? process.pid;
   let goals = plan.goals;
-  const runtime: { teardown?: boolean; resumeFrom?: HarnessOrchestrateRunResult[]; onSnapshot?: (tasks: unknown) => void; checkpoint?: (results: HarnessOrchestrateRunResult[]) => void } = {
+  const runtime: { runId?: string; teardown?: boolean; resumeFrom?: HarnessOrchestrateRunResult[]; onSnapshot?: (tasks: unknown) => void; checkpoint?: (results: HarnessOrchestrateRunResult[]) => void } = {
     ...(plan.runtime.teardown ? { teardown: true } : {}),
   };
   const request = normalizeOrchestrateRequest(parts);
@@ -2896,6 +2778,7 @@ export async function runHarnessOrchestrateExecution(
     onPersistenceFailure: reportPersistenceFailure,
   });
   runtime.checkpoint = checkpoint;
+  runtime.runId = runId;
   if (prior) runtime.resumeFrom = prior.results;
   if (goals.length === 0) {
     writeError(`[self-dev] 돌릴 goal 이 없다 — ${plan.runtime.resume ? `체크포인트 '${plan.runtime.resume}' 에 goal 원형이 없고(옛 판) 인자도 안 줬다. goal 을 인자로 주십시오` : 'goal 을 인자로 주십시오'}`);
@@ -3400,7 +3283,7 @@ selfCmd
   .action(async (opts: { json?: boolean; includeTest?: boolean }) => {
     try {
       const { queryRunningRuns, renderRunningRuns } = await import('./self-implement/running-runs.js');
-      const result = queryRunningRuns({ includeTest: opts.includeTest });
+      const result = queryRunningRuns({ includeTest: opts.includeTest, caller: 'cli' });
       const output = `${opts.json ? JSON.stringify(result) : renderRunningRuns(result)}\n`;
       await writeStdoutJson(output);
     } catch (error) {
@@ -3458,7 +3341,37 @@ selfCmd
     }
   });
 
-const selfLedgerCmd = selfCmd.command('ledger').description('하니스 원장 검사(읽기 전용)');
+const selfLedgerCmd = selfCmd.command('ledger').description('하니스 원장 검사 및 보관');
+selfLedgerCmd
+  .command('compact')
+  .description('오래된 종료 런 원장을 월별 gzip 보관소로 옮긴다')
+  .option('--dry-run', '변경 없이 계획만 출력한다')
+  .option('--min-age-hours <hours>', '마지막 기록 후 최소 경과 시간', '24')
+  .option('--json', '계획과 결과를 JSON으로 출력한다')
+  .action(async (opts: { dryRun?: boolean; minAgeHours: string; json?: boolean }) => {
+    try {
+      if (!/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(opts.minAgeHours) || !Number.isFinite(Number(opts.minAgeHours))) {
+        throw new Error(`--min-age-hours must be a finite non-negative number: ${opts.minAgeHours}`);
+      }
+      const { planLedgerCompaction, applyLedgerCompaction } = await import('./self-implement/run-ledger-compact.js');
+      const plan = planLedgerCompaction({ minAgeHours: Number(opts.minAgeHours) });
+      const result = opts.dryRun ? {
+        moved: plan.move.length, kept: plan.keep.length,
+        bytesBefore: plan.move.reduce((sum, item) => sum + statSync(item.from).size, 0),
+        bytesAfter: 0, failures: [],
+      } : applyLedgerCompaction(plan);
+      if (opts.json) await writeStdoutJson(JSON.stringify({ dryRun: Boolean(opts.dryRun), plan, ...result }) + '\n');
+      else {
+        const counts = (reason: string) => plan.keep.filter((item) => item.reason === reason).length;
+        console.log(`옮김 ${result.moved} · 남김 ${result.kept}(미완 ${counts('unfinished')} · 최근 ${counts('too-recent')} · 못 읽음 ${counts('unreadable')}${counts('restore-conflict') ? ` · 복귀 충돌 ${counts('restore-conflict')}` : ''}) · 크기 ${result.bytesBefore}→${opts.dryRun ? '미측정' : result.bytesAfter}${opts.dryRun ? ' (dry-run)' : ''}`);
+        if (result.failures.length) console.error(`압축 실패: ${JSON.stringify(result.failures)}`);
+      }
+      if (result.failures.length) process.exitCode = 1;
+    } catch (error) {
+      console.error(`❌ ledger compact failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+  });
 selfLedgerCmd
   .command('lint')
   .description('docs/harness 원장 항목의 status-vocab·four-lines·linkage 위반을 보고한다')
@@ -3918,6 +3831,7 @@ selfCmd
   .option('--no-draft', 'non-draft PR (기본 draft)')
   .option('--open-pr', 'gate 통과 후 push + draft PR open (기본: PR 안 열고 worktree 보존·fail-closed). 이 플래그가 HITL 명시 승인.')
   .option('--auto-merge', '★ 내부 리뷰가 clean(실제 리뷰 완료·verdict≠fail)이면 자동 병합(squash). must-fix 있으면 무시(hold·rework). outward-facing(main 병합)이라 명시 opt-in. 미지정=리뷰 후 HITL/draft.')
+  .option('--merge-by-host', 'Pod 자식: 병합 직전 merge-ready 로 끝내 호스트가 재게이트한 뒤 병합')
   .option('--auto-review', '★ G8 자기판단 — PR 에 auto-review opt-in 라벨 부착(저위험·객관게이트 통과 작업만·fail-safe 거부권). 붙으면 L3 폴러(agent-mission review-watch)가 이후 리뷰를 무인 완결(rework→심판→머지). 외부배포·실주문·설계분기·파괴·보안·리뷰 must-fix 면 플래그 있어도 안 붙음.')
   .option('--max-wait <sec>', '구현(goal-loop) 최대 대기 초')
   .option('--enhance', '★ elanous 내부 프롬프트 인핸싱 ON(원문 verbatim 보존 + 커버리지 체크리스트·anti-drift). 기본 off — CLI 는 외부 창구라 external-verbatim(외부가 프롬프트 엔지니어) 존중. 켜면 elanous-apparatus 로 인핸싱.')
@@ -4021,6 +3935,11 @@ selfCmd
 // self orchestrate — 병렬 self-dev(S1·2026-07-21) — N개 독립 goal 을 각자 `elanous self implement` 서브프로세스로
 //   TOX 디스패처 위에서 동시성캡 병렬 실행. 각 잡=자기 프로세스=자기 harness-space(병렬안전). 엔진(그래프/
 //   디스패처)은 기존 재사용·새 조각=self-implement surface 어댑터. [[PLAN-parallel-self-dev-orchestrator-2026-07-21]].
+let selfOrchestrateSpawnForTesting: import('./task-orchestrator/surfaces/self-implement.js').SelfImplementJobSpawn | undefined;
+export function setSelfOrchestrateSpawnForTesting(spawn: typeof selfOrchestrateSpawnForTesting): void {
+  selfOrchestrateSpawnForTesting = spawn;
+}
+
 const selfOrchestrateCmd = selfCmd
   .command('orchestrate [goals...]')
   .description('병렬 self-dev — 여러 goal 을 각자 격리 worktree self-implement 서브프로세스로 동시성캡 병렬 실행. goal 은 `;;` 로 구분(또는 각 인자 1 goal). --concurrency 로 동시 잡 수(기본 2).')
@@ -4108,7 +4027,8 @@ const selfOrchestrateCmd = selfCmd
         onInfo: (message) => ui.info(message),
       });
       const prior = restored.prior;
-      goals = restored.goals;
+      const { withOrchestrateGoalKey } = await import('./self-dev/orchestrate.js');
+      goals = restored.goals.map(withOrchestrateGoalKey);
       // ⛔ 「스킵」 수를 status 로 세면 «리뷰에 막혀 아무것도 착지 못 한» 조각까지 스킵이라 말한다.
       //   실제 재개 판정은 classifyResumeDisposition 이 한다 — 화면도 «같은 판정»을 쓴다(재발명 0).
       const { classifyResumeDisposition } = await import('./self-dev/orchestrate.js');
@@ -4172,6 +4092,7 @@ const selfOrchestrateCmd = selfCmd
       // ☸️ 실행 칸 — pod 면 self-implement 자식을 k8s Job 으로(계약 동일 · 슈퍼바이저 무수정).
       const substrate = (opts as { substrate?: string }).substrate ?? 'local';
       let podSpawn: import('./task-orchestrator/surfaces/self-implement.js').SelfImplementJobSpawn | undefined;
+      let podTargets: { context: string; namespace: string }[] | undefined;
       if (substrate === 'pod') {
         const { podSelfImplementSpawn, podSubstrateReady, defaultKubectl } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
         const poolMod = await import('./task-orchestrator/surfaces/pod-pool.js');
@@ -4236,6 +4157,7 @@ const selfOrchestrateCmd = selfCmd
         // 명시 계정은 사람의 선택 — 공급자 폴백과 계정 브로커를 우회한다.
         const explicitPodAccount = (opts as { podAccount?: string }).podAccount;
         let accountBroker: (() => string) | undefined;
+        let rotationAccounts: readonly string[] | undefined;
         let podProvider: 'openai-codex' | 'grok' = 'openai-codex';
         let grokApiKeyOptIn = false;
         if (!explicitPodAccount && !benchArms) {
@@ -4256,6 +4178,7 @@ const selfOrchestrateCmd = selfCmd
           podProvider = plan.provider;
           if (plan.provider === 'openai-codex') {
             accountBroker = makePodAccountBroker({ usable: plan.accounts, excluded: plan.excluded });
+            rotationAccounts = plan.accounts;
             debug.log('self-implement.pod', 'account-plan', { usable: plan.accounts, excluded: plan.excluded });
             if (!opts.json) ui.info(`[pod] 계정 배분(잔량 순 · 돌려 가며): ${plan.accounts.join(' → ')}${plan.excluded.length ? ` · 뺌 ${plan.excluded.map((x) => `${x.name}(${x.why})`).join(', ')}` : ''}`);
           } else {
@@ -4283,20 +4206,25 @@ const selfOrchestrateCmd = selfCmd
             ...(podSource.kind === 'bundle' ? { headCommit: podSource.headCommit, sizeBytes: podSource.sizeBytes } : {}),
           });
         }
-        const podBase = { ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), account: podProvider === 'grok' ? 'grok' : explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker } : {}), ...(podProvider === 'grok' ? { provider: 'grok' as const, grokApiKeyOptIn } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
+        const podBase = { hostSupervised: opts.supervise === true, ...(remoteOnlyPool ? { imageCommit: image.imageCommit } : {}), account: podProvider === 'grok' ? 'grok' : explicitPodAccount ?? 'team', ...(accountBroker ? { accountBroker, rotationAccounts } : {}), ...(podProvider === 'grok' ? { provider: 'grok' as const, grokApiKeyOptIn } : {}), passEnv, ...(pool ? { pool } : {}), ...((opts as { podSkillEnv?: boolean }).podSkillEnv ? { skillEnv: true } : {}), ...(podSource ? { source: podSource } : {}) };
         if (benchArms) {
           const { benchPodSpawn } = await import('./task-orchestrator/surfaces/self-implement-pod.js');
           podSpawn = benchPodSpawn(benchArms, podBase);
         } else {
           podSpawn = podSelfImplementSpawn(podBase);
         }
+        podTargets = poolMembers.length > 0
+          ? poolMembers.map(({ context }) => ({ context, namespace: 'elanous-test' }))
+          : [{ context: defaultKubectl(['config', 'current-context']).stdout.trim(), namespace: 'elanous-test' }];
         // ⭐ 팔 선언은 «runId 가 붙는» 이 줄에 싣는다 — 위의 `bench-arms` 줄은 runId 해석 «전»이라 비어 있다(09-25 실측) · 보고서(scripts/bench-report.ts)가 이 줄로 잇는다.
         debug.log('self-dev.orchestrate', 'substrate', { substrate, account: podProvider === 'grok' ? 'grok' : (opts as { podAccount?: string }).podAccount ?? 'team', passEnv, context: ready.reason, imageCommit: image.imageCommit, imageFresh: image.fresh, ...(benchArms ? { benchArms: benchArms.map((a) => ({ id: a.id, provider: a.provider, model: a.model ?? null, modelSource: a.modelSource ?? null, passEnv: a.passEnv })) } : {}) });
       } else if (substrate !== 'local') {
         ui.error(`--substrate: local | pod (받은 값: ${substrate})`); process.exit(2);
       }
       const runtime: import('./self-dev/dev-pipeline.js').OrchestrateRuntime = {
-        ...(podSpawn ? { spawn: podSpawn } : {}),
+        runId,
+        ...(podTargets ? { podTargets } : {}),
+        ...(selfOrchestrateSpawnForTesting ? { spawn: selfOrchestrateSpawnForTesting } : podSpawn ? { spawn: podSpawn } : {}),
         ...(opts.teardown ? { teardown: true } : {}),
         ...(prior ? { resumeFrom: prior.results } : {}),
         ...(onSnapshot ? { onSnapshot } : {}),
@@ -5207,701 +5135,7 @@ program
     }
   });
 
-// ── provider (active LLM status + one-shot switcher) ──
-const providerCmd = program
-  .command('provider')
-  .alias('providers')
-  .description('Show the currently active LLM provider + model + auth status')
-  .action(() => {
-    ui.header('Active LLM provider');
-    console.log(renderProviderStatus());
-  });
-
-// ── provider codex (계정·쿼터·리셋 크레딧 · READ 는 안전 · redeem 은 «소비»한다) ──
-//   canonical = 내부 문서 `MANUAL-llm-provider-operations-2026-08-05` · 규칙 = .rules/70-llm-provider/
-//   ⛔⭐ 이름이 최상위 `codex` 가 «아니다» — 그 이름은 이미 `agent-mission` 의 «별칭»이고,
-//     최상위 `provider` 도 이미 있다(둘 다 commander 가 «실행 시점»에 거부해서 알았다).
-//     ⇒ 그래서 기존 `provider` 명령의 «하위»로 붙인다. `elanous provider` 는 종전대로 상태를 보여준다.
-const codexCmd = providerCmd.command('codex').description('Codex — 사용량·리밋·리셋 크레딧 조회와 사용');
-
-/**
- * Import succeeds through the account store, but its two immediate follow-up
- * commands use different entrances: usage resolves the stored home from
- * --account, while one-run execution resolves the per-run account env.
- */
-export function buildCodexAccountImportGuidance(name: string, home: string): readonly [quota: string, execution: string] {
-  // POSIX quoting stays centralized in shellQuoteRemote; do not recreate it here.
-  return [
-    `쿼터를 재려면: bun bin/elanous.mjs provider codex usage --account ${shellQuoteRemote(name)}`,
-    `이 계정으로 «한 런만» 쓰려면: ELANOUS_CODEX_ACCOUNT=${shellQuoteRemote(name)} ELANOUS_CODEX_ACCOUNT_HOME=${shellQuoteRemote(home)} bun bin/elanous.mjs <명령>`,
-  ];
-}
-
-codexCmd
-  .command('usage')
-  .description('현재 Codex 쿼터·리밋을 provider 응답 그대로 읽어 보여준다 (READ-ONLY)')
-  .option('--json', 'JSON 으로 출력')
-  .option('--account <name>', '그 계정의 홈으로 잰다 (정본이 아는 계정 이름 · 생략하면 지금 환경의 홈)')
-  .action(async (opts: { json?: boolean; account?: string }) => {
-    const { createCodexFetcher } = await import('./budget/fetchers/codex.js');
-    // ⛔⭐ 계정을 이름으로 주면 «그 계정의 홈»을 정본 기록에서 찾아 잰다.
-    //   env 를 바꾸지 않는다 — 자식 env 로만 내려간다(전역 오염 금지).
-    let codexHome: string | undefined;
-    if (opts.account) {
-      const { codexStoreKey } = await import('./oauth/codex-account.js');
-      const { loadTokens } = await import('./oauth/store.js');
-      const stored = loadTokens(codexStoreKey(opts.account));
-      codexHome = stored?.codexHome;
-      if (!codexHome) {
-        console.error(`계정 '${opts.account}' 의 홈을 정본이 모른다 — 먼저 account import 하라 (⛔ 다른 계정을 대신 재지 않는다)`);
-        process.exitCode = 1; return;
-      }
-    }
-    try {
-      const snap = await createCodexFetcher(codexHome ? { codexHome } : {}).fetch();
-      if (opts.json) { await writeStdoutJson(JSON.stringify(snap, null, 2) + '\n'); return; }
-      console.log(`provider   ${snap.provider}${snap.plan ? ` · plan=${snap.plan}` : ''}`);
-      // ⛔ 「찼다」는 공급자가 «말한 것»만 적는다 — used 로 추론하지 않는다(R-LLM1).
-      console.log(`리밋 도달   ${snap.rateLimitReached ?? '(provider 가 말하지 않음)'}`);
-      if (snap.credits) console.log(`크레딧     balance=${snap.credits.balance} hasCredits=${snap.credits.hasCredits} unlimited=${snap.credits.unlimited}`);
-      for (const w of snap.windows) {
-        const resets = w.resetsAt ? new Date(w.resetsAt).toLocaleString() : '(모름)';
-        console.log(`  ${w.kind.padEnd(7)} ${String(w.windowMinutes).padStart(6)}분  used=${String(w.used).padStart(3)}%  리셋=${resets}${w.model ? `  [${w.model}]` : ''}`);
-      }
-      if (snap.windows.length === 0) console.log('  (창 없음 — provider 가 아무 창도 주지 않았다)');
-    } catch (error) {
-      console.error(`codex usage 실패: ${error instanceof Error ? error.message : String(error)}`);
-      process.exitCode = 1;
-    }
-  });
-
-// ⛔⭐⭐⭐⭐ **한 화면** — 이 축의 진단 시간 대부분이 「어느 우주에서 무엇을 보고 있나」를
-//   손으로 맞추는 데 갔다(2026-08-07). 그 셋(우주·신호 나이·회전 dry-run)이 여기 같이 뜬다.
-// ⛔ READ-ONLY 이고 «네트워크를 안 친다» — 디스크 신호만 읽는다. 사용량을 «새로 재려면»
-//   `provider codex usage --account <이름>` 를 따로 부른다(그건 자식을 띄운다).
-codexCmd
-  .command('status')
-  .description('회전·신호·우주를 «한 화면»으로 본다 (READ-ONLY · 네트워크 안 침 · 관측 안 남김)')
-  .option('--json', 'JSON 으로 출력')
-  .action(async (opts: { json?: boolean }) => {
-    const { inspectCodexRotation } = await import('./oauth/codex-account-store.js');
-    const { authStorePath } = await import('./oauth/store.js');
-    // ⛔⭐⭐⭐ 우주는 «정식 resolver»로 잡는다(리뷰 must-fix) — env 로 재구성하면 `--test`·
-    //   `--test-state-dir`(setTestStateRoot 경유) 격리를 «놓친다». 표면이 런타임과 다른 자를
-    //   쓰면 안 된다는 이 축의 규칙이 여기에도 그대로 걸린다.
-    const { elanousStateRoot } = await import('./autopilot/state-paths.js');
-    // 쿼터 신호는 계정 자격에서 파생된 공유 사실이므로 인스턴스 격리 축이 아니라 자격 뿌리를 따른다.
-    const { quotaSignalDir } = await import('./budget/codex-reset-credit-state.js');
-    const now = Date.now();
-    const s = inspectCodexRotation(process.env, { now });
-    const instanceRoot = elanousStateRoot();
-    const signalDir = quotaSignalDir();
-    const { findOrphanQuotaSignals } = await import('./budget/orphan-quota-signals.js');
-    const { codexCredentialRoot } = await import('./budget/codex-reset-credit-state.js');
-    const orphans = findOrphanQuotaSignals(instanceRoot, codexCredentialRoot(), now);
-    // ⛔⭐ 「후보」는 판정기가 «자기 자신을 뺀» 것이다 — 표면이 현재 계정을 후보로 보여 주면
-    //   ***있지도 않은 선택지를 말한다***(리뷰 must-fix). 판정기와 같은 기준(storeKey)으로 거른다.
-    const shownCandidates = s.candidates.filter((c) => c.storeKey !== s.current.storeKey);
-    const ageMinOf = (home: string | undefined): number | null => {
-      if (!home) return null;
-      const at = home === s.currentHome ? s.currentObservedAt : s.observedAtByHome[home];
-      return at === undefined ? null : Math.round((now - at) / 60000);
-    };
-    // ⛔⭐⭐ 「만료」와 「없음」을 «가른다»(리뷰 must-fix) — 만료면 «나이를 보여 준다».
-    //   「65분 전(곧 갱신)」과 「3일 전(갱신이 죽었다)」은 완전히 다른 진단이다.
-    const freshOf = (home: string | undefined): boolean =>
-      home === undefined ? false : (home === s.currentHome ? s.currentSignalFresh : (s.freshByHome[home] ?? false));
-    const ageOf = (home: string | undefined): string => {
-      const m = ageMinOf(home);
-      if (m === null) return '⛔ 없음 (신호 파일이 아예 없다 ⇒ 판정은 「모른다」)';
-      return freshOf(home) ? `${m}분 전` : `⛔ ${m}분 전 — «만료»(⇒ 판정은 「모른다」 ⇒ 회전 안 섬)`;
-    };
-    if (opts.json) {
-      await writeStdoutJson(JSON.stringify({
-        universe: {
-          instanceRoot, signalDir, authStore: authStorePath(),
-          // ⭐ JSON 에도 싣는다 — 화면만 알면 스크립트가 못 센다
-          ...(orphans.dir ? { orphanQuotaSignals: orphans } : {}),
-        },
-        // ⛔ 임계는 «판정기가 실제로 쓴» 정규화 값이다 — raw config 가 아니다(리뷰 must-fix)
-        rotation: { reason: s.reason, to: s.to ?? null, explicit: s.explicit, enabled: s.enabled, thresholdPercent: s.thresholdPercent },
-        // ⭐ 신호 «나이»가 핵심 진단 항목이다 — JSON 에도 반드시 싣는다(리뷰 must-fix)
-        current: {
-          name: s.current.name, source: s.current.source, home: s.currentHome ?? null,
-          reached: s.currentReached ?? null, usedPercent: s.currentUsedPercent ?? null,
-          signalObservedAt: s.currentObservedAt ?? null, signalAgeMinutes: ageMinOf(s.currentHome),
-          // ⭐ 나이와 «유효성»은 다른 값이다 — 만료돼도 나이는 낸다
-          signalFresh: freshOf(s.currentHome),
-        },
-        candidates: shownCandidates.map((c) => ({
-          name: c.name, home: c.home, reached: c.reached ?? null, usedPercent: c.usedPercent ?? null,
-          signalObservedAt: s.observedAtByHome[c.home] ?? null, signalAgeMinutes: ageMinOf(c.home),
-          signalFresh: freshOf(c.home),
-        })),
-      }, null, 2) + '\n');
-      return;
-    }
-    console.log('━━ codex 멀티 계정 상태 ━━');
-    console.log(`우주      인스턴스  : ${instanceRoot}`);
-    // ⛔⭐⭐ **라벨이 «참»일 때만 그렇게 말한다**(2026-08-19 · `OBS-T114` 재현이 이 거짓말을 드러냈다).
-    //   종전엔 신호가 파생 우주를 가리켜도 ***"자격과 같은 공유 뿌리"*** 라고 찍었다 —
-    //   같은 화면 두 줄이 «서로 다른 말»을 했다(`F14` — 표면이 광고한 계약 ↔ 그 표면이 재는 것).
-    const authRoot = _dirname(authStorePath());
-    console.log(signalDir === _joinPath(authRoot, 'budget')
-      ? `          신호      : ${signalDir}  자격과 같은 공유 뿌리`
-      : `          신호      : ${signalDir}  ⛔ 자격 뿌리(${authRoot})와 «다르다** — 이 우주만의 값이다`);
-    // ⛔⭐ 「도구가 말하게」 — 파생 우주에 옛 신호가 남아 있으면 ***누가 그것을 현재 상태로 읽는다***.
-    //   (이 사건이 정확히 그렇게 났다: 19시간 낡은 파일을 보고 진단했다 · `OBS-T110`)
-    if (orphans.dir) {
-      console.log(`          ⚠️ 고아 신호 : ${orphans.dir}  ${orphans.count}개 · 가장 새 것 ${orphans.newestAgeMinutes ?? '?'}분 전`);
-      console.log('             ⛔ 이 파일들은 «아무도 안 읽는다». 열어서 「현재 상태」로 읽지 마라(OBS-T110)');
-    }
-    console.log(`          auth      : ${authStorePath()}  ⚠️ 자격은 «격리되지 않는다»(의도된 결정)`);
-    console.log(`회전      ${s.reason}${s.to ? ` → ${s.to}` : ''}   (enabled=${s.enabled} · explicit=${s.explicit} · 임계=${s.thresholdPercent}%)`);
-    console.log(`지금 계정 ${s.current.name}  (source=${s.current.source})`);
-    console.log(`          홈=${s.currentHome ?? '(모름)'}  사용=${s.currentUsedPercent ?? '?'}%  찼나=${s.currentReached ?? '모름'}  신호=${ageOf(s.currentHome)}`);
-    console.log('후보');
-    if (shownCandidates.length === 0) console.log('  (없음 — 홈을 아는 «다른» 계정이 없다 ⇒ 찼을 때 갈 곳이 없다)');
-    for (const c of shownCandidates) {
-      console.log(`  ${c.name.padEnd(10)} 사용=${String(c.usedPercent ?? '?').padStart(3)}%  찼나=${String(c.reached ?? '모름').padEnd(5)}  신호=${ageOf(c.home)}`);
-    }
-    if (s.reason === 'not-reached') {
-      // ⛔⭐ 「신선하다」와 「쓸 값이 있다」는 다른 말이다(리뷰 must-fix) — 신호가 신선해도
-      //   찼는지·몇 %인지가 «둘 다 없으면» 판정은 여전히 「모른다」다. 그때 「정상이다」라고
-      //   말하면 ***없는 안심을 준다.*** 셋으로 가른다.
-      const noUsable = s.currentReached === undefined && s.currentUsedPercent === undefined;
-      console.log(!freshOf(s.currentHome)
-        ? '💡 안 넘어가는 중 — 신호가 «없거나 만료»다. 그것이 원인이다 ⇒ 런이 돌면 자동 갱신되고, 급하면 `provider codex usage --account <이름>`.'
-        : noUsable
-          ? '⛔ 안 넘어가는 중 — 신호는 «신선한데 내용이 비었다»(찼는지도 사용률도 없다) ⇒ 판정은 「모른다」다.'
-            + '\n   🩹 `provider codex usage --account <이름> --json` 으로 provider 응답을 직접 보라 — 창이 안 실렸을 수 있다.'
-          : '💡 안 넘어가는 중 — 신호가 «신선»하고 지금 계정이 아직 임계 아래다. 정상이다.');
-    } else if (s.reason === 'no-candidate') {
-      // ⛔⭐ 「갈 곳이 없다」의 이유가 «셋»인데 한 문장으로 뭉개면 오진한다(리뷰 must-fix).
-      //   계정이 하나뿐인 것은 «정상 구성»이지 고장이 아니다 — 그때 필요한 것은 진단이 아니라 «다음 수»다.
-      if (shownCandidates.length === 0) {
-        // ⛔ 계정 수는 «스토어»에 묻는다 — `candidates` 는 홈 아는 것만 남은 목록이라
-        //   그것으로 세면 홈 없는 계정이 안 세어져 «거짓 원인»을 낸다(리뷰 must-fix).
-        const known = s.knownAccountCount;
-        console.log(known <= 1
-          ? '⛔ 찼는데 «갈 곳이 없다» — 정본이 아는 계정이 «이것 하나»다(고장이 아니라 구성이다).'
-            + '\n   🩹 둘째 계정을 들인다: 그 홈으로 `codex login` 한 뒤 `elanous provider codex account import <이름> --home <홈>`'
-          : '⛔ 찼는데 «갈 곳이 없다» — 다른 계정은 있는데 «홈을 몰라» 후보가 못 됐다.'
-            + '\n   🩹 `elanous provider codex account list` 로 홈을 확인하고, 없으면 그 계정을 다시 import 한다.');
-      } else {
-        console.log('⛔ 찼는데 «갈 곳이 없다» — 후보는 있는데 «그들도 찼다»(위 후보 목록의 사용률을 보라).');
-      }
-    }
-  });
-
-const accountCmd = codexCmd.command('account').description('Codex 계정 — 조회 · 정본 스토어로 들여오기 (⭐ 자동 회전은 «기본 ON» — llm.codexAccountRotation:false 로만 끈다)');
-
-const CODEX_ACCOUNT_CLI_SINK_SURFACE = 'codex-account-cli';
-type CodexAccountLogSinkModule = Pick<typeof import('./domains/standalone-log-sink.js'), 'registerStandaloneLogSink'>;
-let codexAccountLogSinkModuleForTesting: CodexAccountLogSinkModule | undefined;
-
-export function setCodexAccountLogSinkModuleForTesting(module: CodexAccountLogSinkModule | undefined): void {
-  codexAccountLogSinkModuleForTesting = module;
-}
-
-accountCmd.hook('preAction', async () => {
-  try {
-    const { registerStandaloneLogSink } = codexAccountLogSinkModuleForTesting
-      ?? await import('./domains/standalone-log-sink.js');
-    await registerStandaloneLogSink(CODEX_ACCOUNT_CLI_SINK_SURFACE);
-  } catch { /* fail-open — observation wiring must not block Codex account commands */ }
-});
-
-accountCmd
-  .command('list')
-  .description('elanous 정본 스토어가 아는 codex 계정을 보여준다 (READ-ONLY · ⛔ 토큰 값은 안 찍는다)')
-  .action(async () => {
-    const { listCodexAccountsInStore, activeCodexAccountView } = await import('./oauth/codex-account-store.js');
-    // ⛔⭐⭐ 「홈」은 «실효» 홈이어야 한다 — env 해석을 그대로 찍으면 정본 기록이 이기는 경우에
-    //   ***CLI 가 거짓 상태를 보고한다***(4R must-fix). 뷰가 런타임과 «같은 자»를 쓴다.
-    const active = activeCodexAccountView();
-    console.log(`활성  ${active.name}  (storeKey=${active.storeKey} · source=${active.source})`);
-    console.log(`홈    ${active.home ?? '(없음 — 정본이 이 계정의 홈을 모른다 · 어느 미러도 안 쓴다)'}  (source=${active.homeSource})`);
-    if (active.declaredHome) {
-      console.log(`⚠️ 선언된 홈은 ${active.declaredHome} 지만 «정본 기록»이 이긴다 — 실제로 쓰이는 것은 위의 홈이다`);
-    }
-    const rows = listCodexAccountsInStore();
-    if (rows.length === 0) { console.log('  (정본 스토어에 codex 계정 없음)'); return; }
-    for (const r of rows) console.log(`  ${r.name.padEnd(12)} storeKey=${r.storeKey}  authMode=${r.authMode ?? '-'}`);
-  });
-
-accountCmd
-  .command('import <name>')
-  .description('그 홈의 codex 로그인을 elanous 정본 스토어로 들여온다 — 그래야 elanous 가 그 계정으로 «실행»한다')
-  .requiredOption('--home <path>', '그 계정의 CODEX_HOME (예: ~/.codex-new)')
-  .action(async (name: string, opts: { home: string }) => {
-    const { importCodexAccountFromHome } = await import('./oauth/codex-account-store.js');
-    const r = await importCodexAccountFromHome(name, opts.home);
-    if (!r.ok) { console.error(`들여오기 실패(${r.kind}): ${r.message}`); process.exitCode = 1; return; }
-    console.log(`✅ ${name} 을 정본 스토어에 들였다 — storeKey=${r.storeKey} · accountId=${r.accountIdPrefix}`);
-    // Usage resolves its home from --account; one-run execution resolves it from per-run env.
-    // Keep these entrances separate so every printed command can be pasted and run as shown.
-    for (const guidance of buildCodexAccountImportGuidance(name, opts.home)) console.log(`  ${guidance}`);
-    // ⛔⭐ 2026-08-17 정정 — 옛 문면은 *"지속 설정과 자동 회전은 «아직 없다» — S4 다"* 였고 «거짓»이었다.
-    //   회전은 착지했고 기본 ON 이다(codex-account-rotation.ts: `llm.codexAccountRotation !== false`).
-    //   실측 근거: `account list` 가 `source=rotated` 를 찍고 있었다. ⇒ 기능이 늙은 문면을 앞질렀다.
-    console.log('⭐ 이 계정은 «자동 회전 후보»가 됐다 — 별도 설정 불필요. 현재 계정이 임계(기본 95%)에 닿으면 이름 사전순으로 넘어간다.');
-    console.log('   끄려면 config `llm.codexAccountRotation: false` · 임계는 `llm.codexAccountRotationThresholdPercent`.');
-    console.log('   확인:  bun bin/elanous.mjs provider codex account list   ·   bun bin/elanous.mjs usage');
-  });
-
-const resetCreditsCmd = codexCmd.command('reset-credits').description('리셋 크레딧 — 조회 · 관측 · 사용(⛔ 사용은 되돌릴 수 없다)');
-
-resetCreditsCmd
-  .command('list')
-  .description('사용 가능한 리셋 크레딧을 조회한다 (READ-ONLY)')
-  .option('--json', 'JSON 으로 출력')
-  .action(async (opts: { json?: boolean }) => {
-    const { listCodexResetCredits } = await import('./budget/codex-reset-credits.js');
-    const r = await listCodexResetCredits({});
-    if (opts.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); process.exitCode = r.ok ? 0 : 1; return; }
-    if (!r.ok) { console.error(`조회 실패(${r.kind}): ${r.message}`); process.exitCode = 1; return; }
-    console.log(`available=${r.value.availableCount} · totalEarned=${r.value.totalEarnedCount}`);
-    for (const c of r.value.credits) {
-      console.log(`  ${c.id}  status=${c.status}  title=${c.title ?? '-'}  expires=${c.expires_at ?? '-'}`);
-    }
-    if (r.value.credits.length === 0) console.log('  (없음)');
-  });
-
-resetCreditsCmd
-  .command('observe')
-  .description('가용 수의 «전이»를 한 번 관측해 기록한다 — 부여 주기의 표본을 모은다 (READ-ONLY)')
-  .action(async () => {
-    const { observeResetCreditAvailability } = await import('./budget/codex-reset-credits.js');
-    const { readAvailabilityState, writeAvailabilityState } = await import('./budget/codex-reset-credit-state.js');
-    const { resolveCodexAccount, effectiveCodexHome } = await import('./oauth/codex-account.js');
-    const { authStorePath, loadTokens } = await import('./oauth/store.js');
-    // ⛔ 관측하는 auth.json과 가용 수를 기록하는 홈은 정본이 아는 «같은 계정 홈»이어야 한다.
-    // 이름 계정은 env 해석만으로는 홈을 잃어 default로 떨어질 수 있으므로, resolver와 같은 storedHome 심을 준다.
-    const storePath = authStorePath();
-    const current = resolveCodexAccount(process.env, { storedHome: (key) => loadTokens(key, storePath)?.codexHome });
-    const currentHome = effectiveCodexHome(current, loadTokens(current.storeKey, storePath), process.env).home;
-    const r = await observeResetCreditAvailability({
-      ...(currentHome ? { authFilePath: _joinPath(currentHome, 'auth.json') } : {}),
-      readPrevious: () => readAvailabilityState(currentHome),
-      writeCurrent: (count) => writeAvailabilityState(count, currentHome),
-    });
-    if (!r.ok) { console.error(`관측 실패(${r.kind}): ${r.message}`); process.exitCode = 1; return; }
-    const { transition, from, to, isGrantSample } = r.change;
-    console.log(`transition=${transition}  from=${from ?? '(모름)'} → to=${to}  부여표본=${isGrantSample ? 'yes' : 'no'}`);
-    if (isGrantSample) console.log('⭐ 부여 전이를 «처음» 잡았다 — 매뉴얼 §2c 의 「모른다」를 이 표본으로 갱신할 수 있다.');
-  });
-
-resetCreditsCmd
-  .command('redeem')
-  .description('⛔ 리셋 크레딧을 «사용»한다 — 되돌릴 수 없다. --yes 없이는 실행하지 않는다')
-  .option('--yes', '되돌릴 수 없음을 확인했다')
-  .option('--request-id <id>', '멱등키를 직접 준다(재시도 시 같은 값을 주면 중복 소비를 막는다)')
-  .action(async (opts: { yes?: boolean; requestId?: string }) => {
-    if (!opts.yes) {
-      console.error('⛔ 이 명령은 크레딧을 «소비»하고 되돌릴 수 없다. 확인했으면 --yes 를 붙여라.');
-      process.exitCode = 2;
-      return;
-    }
-    const { consumeCodexResetCredits } = await import('./budget/codex-reset-credits.js');
-    const r = await consumeCodexResetCredits(opts.requestId ? { redeemRequestId: opts.requestId } : {});
-    if (!r.ok) { console.error(`사용 실패(${r.kind}): ${r.message}`); process.exitCode = 1; return; }
-    try {
-      const { activeCodexAccountView, notifyCodexResetCreditConsumed } = await import('./oauth/codex-account-store.js');
-      const { listCodexResetCredits } = await import('./budget/codex-reset-credits.js');
-      const account = activeCodexAccountView();
-      const remaining = await listCodexResetCredits();
-      notifyCodexResetCreditConsumed(account, remaining.ok ? remaining.value.availableCount : undefined);
-    } catch (error) {
-      debug.log('oauth.codex-account', 'outbound-prepare-failed', {
-        event: 'reset-credit-consumed',
-        message: error instanceof Error ? error.message : String(error),
-      }, { level: 'warn' });
-    }
-    await writeStdoutJson(JSON.stringify(r.value, null, 2) + '\n');
-    console.log('⭐ 효과 확인은 `elanous provider codex usage` 로 — usedPercent 가 떨어졌는지 본다.');
-  });
-
-
-
-/** Per-provider sensible-default model when --model is omitted. These
- *  are what a user running "elanous provider set <name>" expects to get
- *  without thinking — the flagship or recommended-for-agent model.
- *
- *  ⛔⭐⭐ 2026-09-23 — ***fallback 을 여기 «적지 않는다».*** `user-config.ts` 의
- *  `PROVIDER_DEFAULT_MODEL` 에서 «파생»한다.
- *  🩸 왜 — 이 표는 그 표의 ***사본***이었고 ***5주간 갈라져 있었다***. 2026-08-18 에 그쪽에서
- *  「기본값이 실물을 안 가리킨다」며 고친 셋이 ***여기엔 그대로 남아 있었다***:
- *    grok `grok-4-1-fast` — xAI 실호출 대조 결과 «200 OK 인데 실제로는 grok-4.3 이 돈다»
- *    gemini `gemini-2.0-flash` — 카탈로그의 «가장 낡은» 항목
- *    local `llama-3` — LM Studio 실물 목록에 «없다»
- *  ⛔ 그리고 이것은 `elanous provider:set <name>` 이라 ***사람이 직접 치는 명령***이다.
- *  ⇒ 사본을 지우고 «환경변수 이름»만 여기 남긴다(그건 이 축의 고유 정보다). */
-const PROVIDER_MODEL_ENV: Record<string, string> = {
-  anthropic:      'ANTHROPIC_MODEL',
-  openai:         'OPENAI_MODEL',
-  'openai-codex': 'OPENAI_MODEL',
-  grok:           'GROK_MODEL',
-  gemini:         'GEMINI_MODEL',
-  local:          'LOCAL_LLM_MODEL',
-};
-const PROVIDER_DEFAULT_MODEL: Record<string, { env: string; fallback: string }> =
-  Object.fromEntries(Object.entries(PROVIDER_MODEL_ENV).map(([provider, env]) => [
-    provider,
-    { env, fallback: USER_CONFIG_PROVIDER_DEFAULT_MODEL[provider as never] ?? '' },
-  ]));
-
-/** Env var holding the API key for each provider. When `elanous provider
- *  set` runs without --api-key, we pull from this env as a convenience
- *  (anthropic/openai users typically have ANTHROPIC_API_KEY /
- *  OPENAI_API_KEY exported already). */
-const PROVIDER_KEY_ENV: Record<string, string> = {
-  anthropic:      'ANTHROPIC_API_KEY',
-  openai:         'OPENAI_API_KEY',
-  'openai-codex': 'OPENAI_API_KEY',
-  grok:           'XAI_API_KEY',
-  gemini:         'GEMINI_API_KEY',
-};
-
-program
-  .command('provider:set <name>')
-  .description(
-    'Swap active LLM provider in config.json (auto-backs-up the previous config ' +
-    'to its `.bak` sibling — ⛔ the path is the ACTIVE config, not a fixed one: run `elanous where` to see it). ' +
-    'Useful for A/B testing model behaviour ' +
-    '— e.g. `elanous provider:set anthropic` to force-switch to Claude, then ' +
-    '`elanous provider:set restore` (or `elanous provider:restore`) to roll back.',
-  )
-  .option('-m, --model <model>', 'Model id. Default: $<PROVIDER>_MODEL env or a sensible fallback')
-  .option('-k, --api-key <key>', 'API key. Default: pulled from the provider-specific env (ANTHROPIC_API_KEY, etc.)')
-  .option('--base-url <url>', 'Custom base URL (OpenAI-compatible proxies, local).')
-  .option('--no-backup', "Don't write config.json.bak before overwriting.")
-  .action((name: string, opts: { model?: string; apiKey?: string; baseUrl?: string; backup?: boolean }) => {
-    const provider = name.toLowerCase();
-    const known = Object.keys(PROVIDER_DEFAULT_MODEL);
-    if (!known.includes(provider) && provider !== 'auto') {
-      ui.error(`unknown provider "${name}". Known: ${known.join(', ')}, auto`);
-      process.exit(1);
-    }
-
-    const path = userConfigPath();
-    const bakPath = backupConfigPath(path);
-
-    // Auto-backup unless --no-backup explicitly set.
-    let backedUp = false;
-    if (opts.backup !== false) {
-      try {
-        backedUp = backupUserConfig(path, bakPath);
-      } catch (err: any) {
-        ui.error(`backup failed: ${err?.message ?? err}`);
-        process.exit(1);
-      }
-    }
-
-    // Resolve model: --model > env > provider fallback.
-    const providerInfo = PROVIDER_DEFAULT_MODEL[provider];
-    const model = opts.model
-      ?? (providerInfo && process.env[providerInfo.env])
-      ?? providerInfo?.fallback;
-
-    // Resolve api key: --api-key > env (only for providers that have one).
-    const keyEnv = PROVIDER_KEY_ENV[provider];
-    const apiKey = opts.apiKey
-      ?? (keyEnv && process.env[keyEnv])
-      ?? undefined;
-
-    // Build the next config. Keep all non-llm sections untouched.
-    const cfg = getUserConfig();
-    cfg.llm = {
-      ...cfg.llm,
-      provider: provider as typeof cfg.llm.provider,
-      ...(model  ? { model }  : {}),
-      ...(apiKey ? { apiKey } : {}),
-      ...(opts.baseUrl ? { baseUrl: opts.baseUrl } : {}),
-    };
-
-    try {
-      saveUserConfig(cfg, path);
-    } catch (err: any) {
-      ui.error(`save failed: ${err?.message ?? err}`);
-      if (backedUp) ui.info(`backup remains at ${bakPath} — restore with \`elanous provider:restore\``);
-      process.exit(1);
-    }
-    reloadUserConfig();
-
-    ui.header(`Provider switched → ${provider}`);
-    console.log(`  model:  ${model ?? '(provider default)'}`);
-    if (apiKey) {
-      const mask = apiKey.length > 10 ? `${apiKey.slice(0, 4)}…${apiKey.slice(-4)}` : '****';
-      console.log(`  apiKey: ${mask} (from ${opts.apiKey ? '--api-key' : keyEnv + ' env'})`);
-    } else if (keyEnv) {
-      console.log(`  apiKey: (unset — set $${keyEnv} or pass --api-key)`);
-    }
-    if (opts.baseUrl) console.log(`  baseUrl: ${opts.baseUrl}`);
-    if (backedUp)     console.log(`\n  backup: ${bakPath}`);
-    console.log('');
-    console.log(renderProviderStatus());
-    process.exit(0);
-  });
-
-program
-  .command('provider:restore')
-  .description('Restore config.json from the automatic backup written by `elanous provider:set`.')
-  .action(() => {
-    const path = userConfigPath();
-    const bakPath = backupConfigPath(path);
-    const restored = restoreUserConfig(path, bakPath);
-    if (!restored) {
-      ui.error(`no backup found at ${bakPath}`);
-      process.exit(1);
-    }
-    reloadUserConfig();
-    ui.header(`Restored from ${bakPath}`);
-    console.log('');
-    console.log(renderProviderStatus());
-    process.exit(0);
-  });
-
-// ── provider:rotate — multi-provider cycling ──
-//
-// The user maintains an ordered list of (provider, model, label)
-// entries in `llm.rotation`. `rotate` advances one step, `rotate
-// reset` jumps back to the first, `rotate list` prints the list
-// with the current entry highlighted, and `rotate add/remove`
-// edit membership. A separate `use` verb jumps to a specific
-// entry by label / provider name / model substring. Works for
-// any N providers — 2, 3, 5, 10 — no hardcoded size.
-
-// RFC #2161 Phase 8 FU A5 (2026-05-11) — `provider:rotate add <name>`
-// now resolves both the supported-provider list AND the default model
-// straight from the registry catalog. New providers / models in
-// catalog/providers/*.yaml + catalog/models/<provider>/*.yaml
-// automatically thread through here without touching this file.
-
-import { getCatalog } from './registry/loader.js';
-import { defaultModelFor } from './registry/resolver.js';
-
-/** RFC #2161 Phase 8 FU A5 (2026-05-11) — supported provider names
- *  for `provider:rotate add` validation. Pulled from the registry
- *  catalog plus the legacy `'openai-codex'` adapter alias (the
- *  catalog stores it as an alias of `'openai'`; see
- *  `catalog/providers/openai.yaml`). Kept as a `Set<string>` for
- *  `O(1)` membership checks. */
-function supportedProviderNames(): Set<string> {
-  const catalogIds = [...getCatalog().providers.keys()];
-  return new Set([...catalogIds, 'openai-codex']);
-}
-
-/** Default model id for a provider name, sourced from the registry
- *  catalog. Returns `undefined` when the provider has no registered
- *  models (e.g. `local`) or when the name is unknown. The CLI falls
- *  back to a `<NAME>_MODEL` env var or omits the model field entirely
- *  in that case (the rotation entry stays useful — `provider` alone
- *  is enough; the LLM call later uses the provider's own default). */
-function defaultModelIdFor(providerName: string): string | undefined {
-  // 'openai-codex' shares OpenAI's catalog defaults (the codex adapter
-  // is just a different wire path; same model family).
-  const lookupName = providerName === 'openai-codex' ? 'openai' : providerName;
-  return defaultModelFor(lookupName)?.id;
-}
-
-/** API-key env var name for a provider, sourced from the registry
- *  catalog's `apiKeyEnv` field. `local` doesn't surface an env name
- *  here (LOCAL_LLM_API_KEY is rarely set; users wire local hosts via
- *  ELANOUS_LLM_HOSTS instead). */
-function apiKeyEnvFor(providerName: string): string | undefined {
-  const lookupName = providerName === 'openai-codex' ? 'openai' : providerName;
-  const provider = getCatalog().providers.get(lookupName);
-  if (!provider) return undefined;
-  if (provider.id === 'local') return undefined;
-  return provider.apiKeyEnv || undefined;
-}
-
-/** Format a rotation-list table for the CLI. Marks the current
- *  entry with a ▸ arrow so users can see which one is active. */
-function formatRotationList(cfg: ReturnType<typeof getUserConfig>, highlightIdx: number): string {
-  const rot = cfg.llm.rotation;
-  if (!rot || rot.length === 0) return '  (rotation list is empty — `elanous provider:rotate add <name>` to start)';
-  const lines: string[] = [];
-  const labelW = Math.max(...rot.map(e => rotationEntryLabel(e).length));
-  const provW = Math.max(...rot.map(e => e.provider.length));
-  for (let i = 0; i < rot.length; i++) {
-    const e = rot[i]!;
-    const marker = i === highlightIdx ? '▸' : ' ';
-    const label = rotationEntryLabel(e).padEnd(labelW);
-    const prov  = e.provider.padEnd(provW);
-    const model = e.model ?? '(provider default)';
-    lines.push(`  ${marker} ${label}  ${prov}  ${model}`);
-  }
-  return lines.join('\n');
-}
-
-/** Persist rotation mutation + reload in-memory cache. Shared tail
- *  of the add/remove/rotate CLI paths — keeps them one-liners. */
-function saveAndReload(path: string, cfg: ReturnType<typeof getUserConfig>): void {
-  saveUserConfig(cfg, path);
-  reloadUserConfig();
-}
-
-program
-  .command('provider:rotate [sub] [target]')
-  .description(
-    'Cycle through the rotation list. With no argument: advance one step. ' +
-    'Sub-commands: `list` (print list), `reset` (jump to first entry), ' +
-    '`add <provider> [-m model] [-l label]` (append), `remove <label>`, ' +
-    '`clear` (wipe rotation).',
-  )
-  .option('-m, --model <model>', 'Model id (used with `add`)')
-  .option('-l, --label <label>', 'Short name for `use` shortcut (used with `add`)')
-  .option('-k, --api-key <key>', 'API key override (used with `add`)')
-  .action((sub: string | undefined, target: string | undefined, opts: { model?: string; label?: string; apiKey?: string }) => {
-    const path = userConfigPath();
-    let cfg = getUserConfig();
-
-    // ── sub-command dispatch ─────────────────────────────────
-    const verb = (sub ?? '').toLowerCase();
-
-    if (verb === 'list' || verb === 'ls') {
-      const idx = currentRotationIndex(cfg);
-      ui.header('Provider rotation');
-      console.log('');
-      console.log(formatRotationList(cfg, idx));
-      console.log('');
-      console.log(renderProviderStatus());
-      process.exit(0);
-    }
-
-    if (verb === 'reset') {
-      const rot = cfg.llm.rotation;
-      if (!rot || rot.length === 0) {
-        ui.error('rotation is empty — nothing to reset to');
-        process.exit(1);
-      }
-      backupUserConfig(path).valueOf();  // silent best-effort
-      const { cfg: next, entry } = jumpToRotationEntry(cfg, rotationEntryLabel(rot[0]!));
-      if (!entry) { ui.error('reset failed'); process.exit(1); }
-      saveAndReload(path, next);
-      ui.header(`Reset → ${rotationEntryLabel(entry)}`);
-      console.log('');
-      console.log(renderProviderStatus());
-      process.exit(0);
-    }
-
-    if (verb === 'add') {
-      // `target` is the second positional — the provider name.
-      const providerName = (target ?? '').toLowerCase();
-      const known = supportedProviderNames();
-      if (!providerName || !known.has(providerName)) {
-        const sortedKnown = [...known].sort().join(', ');
-        ui.error(
-          `usage: elanous provider:rotate add <provider> [-m model] [-l label]\n`
-          + `Known providers: ${sortedKnown}`,
-        );
-        process.exit(1);
-      }
-      const model = opts.model
-        ?? process.env[`${providerName.toUpperCase().replace('-', '_')}_MODEL`]
-        ?? defaultModelIdFor(providerName);
-      const keyEnv = apiKeyEnvFor(providerName);
-      const apiKey = opts.apiKey ?? (keyEnv && process.env[keyEnv]) ?? undefined;
-      const label = opts.label ?? undefined;
-      const entry: RotationEntry = {
-        provider: providerName as RotationEntry['provider'],
-        ...(model  ? { model }  : {}),
-        ...(apiKey ? { apiKey } : {}),
-        ...(label  ? { label }  : {}),
-      };
-      backupUserConfig(path).valueOf();
-      const next = addRotationEntry(cfg, entry);
-      saveAndReload(path, next);
-      ui.header(`Added → ${rotationEntryLabel(entry)}`);
-      console.log('');
-      console.log(formatRotationList(getUserConfig(), currentRotationIndex(getUserConfig())));
-      process.exit(0);
-    }
-
-    if (verb === 'remove' || verb === 'rm' || verb === 'del') {
-      if (!target) {
-        ui.error('usage: elanous provider:rotate remove <label>');
-        process.exit(1);
-      }
-      backupUserConfig(path).valueOf();
-      const { cfg: next, removed } = removeRotationEntry(cfg, target);
-      if (!removed) {
-        ui.error(`no rotation entry matching "${target}"`);
-        process.exit(1);
-      }
-      saveAndReload(path, next);
-      ui.header(`Removed → ${rotationEntryLabel(removed)}`);
-      console.log('');
-      console.log(formatRotationList(getUserConfig(), currentRotationIndex(getUserConfig())));
-      process.exit(0);
-    }
-
-    if (verb === 'clear') {
-      backupUserConfig(path).valueOf();
-      cfg = { ...cfg, llm: { ...cfg.llm, rotation: undefined } };
-      saveAndReload(path, cfg);
-      ui.header('Rotation cleared');
-      process.exit(0);
-    }
-
-    // ── default: advance one step ────────────────────────────
-    const rot = cfg.llm.rotation;
-    if (!rot || rot.length === 0) {
-      ui.error(
-        'rotation is empty — add entries first:\n' +
-        '  elanous provider:rotate add anthropic    -m claude-opus-4-8    -l opus\n' +
-        '  elanous provider:rotate add openai-codex -m gpt-5.5            -l codex\n' +
-        '  elanous provider:rotate add grok         -m grok-4.20          -l grok\n' +
-        '  elanous provider:rotate          # advance\n' +
-        '  elanous provider:rotate list     # show list',
-      );
-      process.exit(1);
-    }
-    backupUserConfig(path).valueOf();
-    const { cfg: next, entry } = rotateNextProvider(cfg);
-    if (!entry) { ui.error('rotate failed'); process.exit(1); }
-    saveAndReload(path, next);
-    ui.header(`Rotated → ${rotationEntryLabel(entry)}`);
-    console.log('');
-    console.log(formatRotationList(getUserConfig(), currentRotationIndex(getUserConfig())));
-    console.log('');
-    console.log(renderProviderStatus());
-    process.exit(0);
-  });
-
-program
-  .command('provider:use <needle>')
-  .description(
-    'Jump to a specific rotation entry by label / provider name / model substring. ' +
-    'Auto-backs-up config.json before the switch (restore with `elanous provider:restore`). ' +
-    'Example: `elanous provider:use opus`, `elanous provider:use grok`, `elanous provider:use gpt-5`.',
-  )
-  .action((needle: string) => {
-    const path = userConfigPath();
-    const cfg = getUserConfig();
-    const rot = cfg.llm.rotation;
-    if (!rot || rot.length === 0) {
-      ui.error(
-        'rotation is empty — add entries first with `elanous provider:rotate add <provider>`',
-      );
-      process.exit(1);
-    }
-    backupUserConfig(path).valueOf();
-    const { cfg: next, entry } = jumpToRotationEntry(cfg, needle);
-    if (!entry) {
-      ui.error(
-        `no rotation entry matching "${needle}". Known entries:\n${formatRotationList(cfg, -1)}`,
-      );
-      process.exit(1);
-    }
-    saveAndReload(path, next);
-    ui.header(`Switched → ${rotationEntryLabel(entry)}`);
-    console.log('');
-    console.log(renderProviderStatus());
-    process.exit(0);
-  });
+registerProviderCommands(program);
 
 // ── status-bar (one-shot Claude-Code-style status line) ──
 program
@@ -5920,182 +5154,7 @@ program
     }
   });
 
-// ── cron (스케줄/크론 CRUD — claude code/codex 외부 접근용) ──
-// dispatchScheduleManage(전 표면 공유 구현) 재사용 → schedule_registry·crontab·surface_events
-// 메모리 루프까지 텔레그램/PWA와 동일 정합. schedules.db 직접 조작 금지(정합 깨짐).
-const scheduleCmd = program.command('schedule')
-  .description('스케줄/크론 CRUD (registry·crontab·기억 정합). --json 으로 프로그래매틱 소비.');
-
-interface ScheduleOpts { id?: string; category?: string; cron?: string; command?: string; apm?: string; json?: boolean; dryRun?: boolean; from?: string; to?: string; yes?: boolean; only?: string }
-
-export type ScheduleDispatch = (args: Record<string, unknown>) => Promise<unknown>;
-type ScheduleExit = (code: number) => void;
-type SchedulePlanValue<T> = { found: T } | { missing: string };
-type ScheduleCreatePlan = {
-  schedule: SchedulePlanValue<string>;
-  commands: SchedulePlanValue<string[]>;
-  resultPath: SchedulePlanValue<string>;
-  cron: SchedulePlanValue<string>;
-};
-type ParsedScheduleCreatePlan = { from: string; plan: ScheduleCreatePlan } | { error: string };
-
-async function parseScheduleCreatePlan(from?: string): Promise<ParsedScheduleCreatePlan> {
-  if (!from) return { error: '명세 문서 경로를 --from으로 지정해야 합니다.' };
-
-  let specification: string;
-  try {
-    specification = await readFile(from, 'utf8');
-  } catch {
-    return { error: `명세 문서를 읽을 수 없음: ${from}` };
-  }
-
-  const schedule = specification.match(/^\s*-\s*\*\*주기:\*\*\s*(.+?)(?:\.|$)/m)?.[1]?.trim();
-  const commands = [...specification.matchAll(/^\s*bun bin\/elanous\.mjs\s+(.+)$/gm)].map(match => match[1].trim());
-  const resultPath = specification.match(/^(reports\/[^\s`]+)$/m)?.[1];
-  const cron = specification.match(/^\s*(?:-\s*)?cron\s*:\s*`?([^`\n]+)`?\s*$/mi)?.[1]?.trim();
-  return {
-    from,
-    plan: {
-      schedule: schedule ? { found: schedule } : { missing: '주기' },
-      commands: commands.length > 0 ? { found: commands } : { missing: '실행 명령' },
-      resultPath: resultPath ? { found: resultPath } : { missing: '결과 경로' },
-      cron: cron ? { found: cron } : { missing: '명세에 cron 식이 없음' },
-    },
-  };
-}
-
-export async function scheduleCreatePlan(opts: Pick<ScheduleOpts, 'dryRun' | 'from'>): Promise<unknown> {
-  const parsed = await parseScheduleCreatePlan(opts.from);
-  if ('error' in parsed) {
-    return { error: opts.from ? parsed.error : 'dry-run에는 명세 문서 경로를 --from으로 지정해야 합니다.' };
-  }
-  const { from, plan } = parsed;
-  if ('missing' in plan.schedule || 'missing' in plan.commands) {
-    return { error: '명세에 등록 계획의 필수 주기 또는 실행 명령이 없음', from, plan };
-  }
-  return {
-    dryRun: true,
-    from,
-    plan,
-    note: '명세에서 등록 계획만 산출했습니다. 스케줄 저장소와 crontab은 변경하지 않았습니다.',
-  };
-}
-
-export async function runSchedule(action: string, opts: ScheduleOpts, dispatch?: ScheduleDispatch, exit: ScheduleExit = process.exit): Promise<void> {
-  let result: unknown;
-  if (action === 'retarget') {
-    const { retargetScheduleFolders } = await import('./domains/schedule-retarget-action.js');
-    result = retargetScheduleFolders({ from: opts.from, to: opts.to, yes: opts.yes === true, ...(opts.only ? { only: opts.only } : {}) });
-  } else if (action === 'create' && opts.dryRun) {
-    result = await scheduleCreatePlan(opts);
-  } else if (action === 'create' && opts.from) {
-    const parsed = await parseScheduleCreatePlan(opts.from);
-    if ('error' in parsed) {
-      result = parsed;
-    } else {
-      const requiredPlanFields = [
-        ['schedule', parsed.plan.schedule],
-        ['commands', parsed.plan.commands],
-        ['resultPath', parsed.plan.resultPath],
-        ['cron', parsed.plan.cron],
-      ] as const;
-      const missing = requiredPlanFields
-        .filter(([, value]) => 'missing' in value)
-        .map(([field]) => field);
-      if (missing.length > 0) {
-        result = { error: `명세 등록을 거부했습니다: ${missing.join(', ')}`, from: parsed.from, plan: parsed.plan };
-      } else if (
-        'found' in parsed.plan.schedule
-        && 'found' in parsed.plan.commands
-        && 'found' in parsed.plan.resultPath
-        && 'found' in parsed.plan.cron
-      ) {
-        result = await (dispatch ?? (await import('./domains/schedule-manage-tool.js')).dispatchScheduleManage)({
-          action,
-          id: opts.id,
-          category: opts.category,
-          cron: parsed.plan.cron.found,
-          command: parsed.plan.commands.found.map(command => `bun bin/elanous.mjs ${command}`).join(' && '),
-          schedule: parsed.plan.schedule.found,
-          resultPath: parsed.plan.resultPath.found,
-          yes: true,
-          ...(opts.apm ? { autopilotId: opts.apm } : {}),
-        });
-      } else {
-        result = { error: '명세 등록 계획을 읽을 수 없음', from: parsed.from, plan: parsed.plan };
-      }
-    }
-  } else {
-    result = await (dispatch ?? (await import('./domains/schedule-manage-tool.js')).dispatchScheduleManage)({
-      action, id: opts.id, category: opts.category, cron: opts.cron, command: opts.command,
-      // 오토파일럿 계보(AL2) — --apm 으로 미션에 fan-in 태깅(관측성). dispatch 가 setScheduleMission.
-      ...(opts.apm ? { autopilotId: opts.apm } : {}),
-      // wrap/unwrap(P3 관측성 래핑) — --yes 로 적용(기본 dry-run).
-      ...((opts as { yes?: boolean }).yes ? { yes: true } : {}),
-    });
-  }
-  const isErr = !!result && typeof result === 'object' && 'error' in (result as object);
-  if (opts.json) {
-    await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
-  } else if (isErr) {
-    ui.error(String((result as { error: string }).error));
-  } else if (action === 'list' && result && typeof result === 'object' && 'schedules' in result) {
-    const r = result as { schedules: Array<{ id: string; name: string; cron: string | null; interval_ms: number | null; category: string; enabled: boolean; run_via: string; last_run: string | null }>; count: number };
-    ui.header(`schedules (${r.count})`);
-    for (const s of r.schedules) {
-      const when = s.cron ?? (s.interval_ms ? `${Math.round(s.interval_ms / 1000)}s` : '?');
-      const flag = s.enabled ? '' : ' [disabled]';
-      console.log(`  ${s.id.padEnd(14)}  ${when.padEnd(18)}  [${s.category}·${s.run_via}]${flag}  ${s.name}`);
-      if (s.last_run) console.log(`              last_run ${s.last_run}`);
-    }
-  } else {
-    await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
-  }
-  exit(isErr ? 1 : 0);
-}
-
-scheduleCmd.command('list').description('전체 크론 조회(category 필터)')
-  .option('--category <cat>', 'ingest|monitor|report|alert|digest|maintenance')
-  .option('--json', 'JSON 출력(프로그래매틱)')
-  .action((o: ScheduleOpts) => runSchedule('list', o));
-scheduleCmd.command('inspect <id>').description('상세 + 최근발송(surface_events 회상·S3 폐루프)')
-  .option('--json').action((id: string, o: ScheduleOpts) => runSchedule('inspect', { ...o, id }));
-scheduleCmd.command('create').description('신규 크론(cron 식 + command). 자동 백업·cd/bun/로그 보강.')
-  .option('--cron <expr>', 'cron 식(예: "0 7 * * *")')
-  .option('--command <cmd>', 'command(예: "scripts/foo.ts --x")')
-  .option('--dry-run', '명세에서 등록 계획만 산출하고 등록하지 않음')
-  .option('--from <path>', '명세 문서에서 등록 계획을 읽음(--dry-run이면 계획만 산출)')
-  .option('--apm <id>', '오토파일럿 미션 fan-in 태깅(관측성·autopilot_id)')
-  .option('--json').action((o: ScheduleOpts) => {
-    if (!o.dryRun && !o.from && (!o.cron || !o.command)) throw new Error('create에는 --cron과 --command가 필요합니다.');
-    return runSchedule('create', o);
-  });
-scheduleCmd.command('update <id>').description('cron 시간 변경')
-  .requiredOption('--cron <expr>', '새 cron 식').option('--json')
-  .action((id: string, o: ScheduleOpts) => runSchedule('update', { ...o, id }));
-scheduleCmd.command('enable <id>').description('잡 켜기').option('--json')
-  .action((id: string, o: ScheduleOpts) => runSchedule('enable', { ...o, id }));
-scheduleCmd.command('disable <id>').description('잡 끄기(주석)').option('--json')
-  .action((id: string, o: ScheduleOpts) => runSchedule('disable', { ...o, id }));
-scheduleCmd.command('delete <id>').description('삭제(자동 백업·복구 가능)').option('--json')
-  .action((id: string, o: ScheduleOpts) => runSchedule('delete', { ...o, id }));
-scheduleCmd.command('wrap [id]').description('★관측성 래핑 — bun .ts 크론을 cron-run.ts 로 감싸 파이어 시 3계층(logs.db·레지스트리·자기기억) 기록. id 생략=전 .ts 크론. 기본 dry-run·--yes 적용(백업 자동·unwrap-aware id 승계·가역)').option('--yes', '적용(기본 dry-run)').option('--json')
-  .action((id: string | undefined, o: ScheduleOpts) => runSchedule('wrap', { ...o, ...(id ? { id } : {}) }));
-scheduleCmd.command('unwrap [id]').description('관측성 래퍼 제거(가역) — id 생략=전 래핑 크론. 기본 dry-run·--yes 적용').option('--yes', '적용(기본 dry-run)').option('--json')
-  .action((id: string | undefined, o: ScheduleOpts) => runSchedule('unwrap', { ...o, ...(id ? { id } : {}) }));
-scheduleCmd.command('migrate <id>').description('fabric Schedule Trigger 로 이관(elanous 데몬 발화·Mission Fabric B안)').option('--json')
-  .action((id: string, o: ScheduleOpts) => runSchedule('migrate', { ...o, id }));
-scheduleCmd.command('adopt <id>').description('=migrate 별칭(schedule-runner 은퇴로 통합)').option('--json')
-  .action((id: string, o: ScheduleOpts) => runSchedule('adopt', { ...o, id }));
-scheduleCmd.command('release <id>').description('crontab 실행으로 복원').option('--json')
-  .action((id: string, o: ScheduleOpts) => runSchedule('release', { ...o, id }));
-scheduleCmd.command('retarget').description('크론 cd <folder> 일괄 교체 — --from 폴더를 --to 폴더로. 기본 dry-run·--yes 적용(백업 자동). 대상 폴더가 없으면 에러.')
-  .option('--from <folder>', '바꿀 원본 폴더(cd 경로)')
-  .option('--to <folder>', '새 대상 폴더(존재해야 함)')
-  .option('--only <ids>', '이 잡들만(쉼표 구분 · schedule list 의 id 접두 또는 이름 · 각각 정확히 하나에 맞아야 함)')
-  .option('--yes', '적용(기본 dry-run)')
-  .option('--json')
-  .action((o: ScheduleOpts) => runSchedule('retarget', o));
+registerScheduleCommands(program);
 
 /** `elanous decide*` 공통 — 보낼 곳과 자격을 정한다(설정 decide.endpoint > ELANOUS_JEV_ENDPOINT > Typesafe). 없으면 안내하고 rc 2. */
 async function loadJevAccessOrExit(): Promise<import('./decide/jev.js').JevAccess> {
@@ -6121,468 +5180,9 @@ async function loadJevAccessOrExit(): Promise<import('./decide/jev.js').JevAcces
   return resolved.access;
 }
 
-// ── intake check — 바깥 사실을 elanous 현재와 대조 (태스크 등록 없음) ──
-const intakeCmd = program.command('intake').description('바깥 사실·문서를 elanous 현재와 대조하거나 태스크로 받는다');
-intakeCmd.hook('preAction', async () => {
-  try {
-    const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js');
-    await registerStandaloneLogSink('cli');
-  } catch { /* fail-open */ }
-});
-intakeCmd
-  .command('check')
-  .description('사실 목록·문서 경로·URL·표준입력을 elanous 현재와 대조한다. 구멍/낡음은 골 초안만 쓴다.')
-  .option('--file <path>', '문서 경로')
-  .option('--url <url>', 'URL')
-  .option('--fact <text>', '사실 한 줄 (반복 가능)', (value: string, prev: string[]) => [...prev, value], [] as string[])
-  .option('--json', '구조화 출력')
-  .option('--author', '「없음」마다 기존 골 중복을 확인하고 docs/goals/ 에 골을 저작·lint 한다(발사하지 않는다 · LLM 을 부른다)')
-  .option('--author-max <n>', '--author 로 한 번에 저작할 골 수 상한 (기본 3)')
-  .action(async (opts: { file?: string; url?: string; fact: string[]; json?: boolean; author?: boolean; authorMax?: string }) => {
-    const { readPipedStdin: readStdin } = await import('./cli/piped-stdin.js');
-    const {
-      defaultIntakeCheckDeps,
-      intakeCheckReportJson,
-      loadIntakeCheckInput,
-      renderIntakeCheckReport,
-      runIntakeCheck,
-      runIntakeCheckDocument,
-      documentTextForCheck,
-    } = await import('./intake-plane/check.js');
-    const { buildIntakeDocumentStageCallables } = await import('./intake-plane/runtime-callables.js');
-    const stdin = await readStdin();
-    const loaded = loadIntakeCheckInput({
-      ...(opts.file ? { file: opts.file } : {}),
-      ...(opts.url ? { url: opts.url } : {}),
-      ...(opts.fact.length > 0 ? { facts: opts.fact } : {}),
-      ...(stdin ? { stdin } : {}),
-      root: process.cwd(),
-      fetchText: (url) => {
-        const proc = Bun.spawnSync(['curl', '-fsSL', url], { timeout: 20_000 });
-        if (proc.exitCode !== 0) throw new Error(`url fetch failed: ${url}`);
-        return new TextDecoder().decode(proc.stdout);
-      },
-    });
-    const factMode = opts.fact.length > 0;
-    const documentText = documentTextForCheck(loaded, { factMode, ...(stdin ? { stdin } : {}) });
-    const stages = factMode ? undefined : buildIntakeDocumentStageCallables();
-    const deps = defaultIntakeCheckDeps(process.cwd(), stages
-      ? { preprocess: stages.preprocess, compare: stages.compare }
-      : {});
-    const report = documentText === undefined
-      ? runIntakeCheck(loaded.facts, deps)
-      : await runIntakeCheckDocument(loaded.facts, deps, {
-        document: documentText,
-        sourceBulletCount: loaded.facts.length,
-      });
-    // src/index.ts intake check --author → authorIntakeGoals → runGoalAuthorCli · lintGoalFile (발사 없음).
-    let authoring: Awaited<ReturnType<typeof import('./intake-plane/author-goals.js')['authorIntakeGoals']>> | undefined;
-    if (opts.author) {
-      const [{ authorIntakeGoals }, { runGoalAuthorCli }, { lintGoalFile }, { createRepositoryReferencedFileReader }, { relative: relativePath }] = await Promise.all([
-        import('./intake-plane/author-goals.js'),
-        import('./self-implement/goal-author-cli.js'),
-        import('./self-implement/goal-author.js'),
-        import('./self-implement/goal-file-reader.js'),
-        import('node:path'),
-      ]);
-      const root = process.cwd();
-      const branchResult = runGitCommand(root, ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' });
-      const branch = branchResult.status === 0 ? branchResult.stdout.trim() : '';
-      const readReferencedFile = createRepositoryReferencedFileReader(root);
-      const max = opts.authorMax !== undefined ? Number.parseInt(opts.authorMax, 10) : undefined;
-      if (max !== undefined && (!Number.isInteger(max) || max < 0)) throw new Error(`--author-max 는 0 이상의 정수여야 한다: ${opts.authorMax}`);
-      authoring = await authorIntakeGoals(report.items, {
-        root,
-        author: async (ask, rootIntent) => {
-          // Unattended authoring: let the author answer its own clarifications from repository evidence.
-          const result = await runGoalAuthorCli([ask], { cwd: root, rootIntent, goalType: 'implement', selfResolveClarifications: true });
-          return { path: relativePath(root, result.path), document: result.authored.document };
-        },
-        lintErrors: (document) => lintGoalFile(document, branch, { readReferencedFile })
-          .filter((finding) => finding.level === 'ERROR').length,
-      }, { ...(max !== undefined ? { max } : {}), source: opts.file ?? opts.url ?? (opts.fact.length > 0 ? '--fact' : 'stdin') });
-    }
-    if (opts.json) {
-      await writeStdoutJson(`${JSON.stringify({ ...intakeCheckReportJson(report), ...(authoring ? { authoring } : {}) }, null, 2)}\n`);
-    } else {
-      console.log(renderIntakeCheckReport(report));
-      if (authoring) {
-        const { renderIntakeAuthorOutcomes } = await import('./intake-plane/author-goals.js');
-        console.log(renderIntakeAuthorOutcomes(authoring));
-      }
-    }
-  });
+registerIntakeCommands(program);
 
-// 정기 외부 흡수 원장 — RFC-regular-external-intake-and-normalization-pipeline §3 (① 모양 · ② 중복).
-intakeCmd
-  .command('ingest')
-  .description('수집기 산출(JSONL · 한 줄 = {url,title,text,kind,signals,…})을 흡수 원장에 모양 맞춰 넣는다 — 같은 항목은 합친다')
-  .requiredOption('--source <source>', 'x | youtube | github | telegram-saved | telegram-bot | memo')
-  .option('--file <path>', 'JSONL 경로 (없으면 표준입력)')
-  .option('--json', '구조화 출력')
-  .action(async (opts: { source: string; file?: string; json?: boolean }) => {
-    const { INTAKE_SOURCES, ingestIntakeItems, parseRawIntakeJsonl } = await import('./intake-plane/items.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    if (!(INTAKE_SOURCES as readonly string[]).includes(opts.source)) {
-      console.error(`알 수 없는 입력원: ${opts.source} (${INTAKE_SOURCES.join(' · ')})`);
-      process.exitCode = 2;
-      return;
-    }
-    const { readFileSync } = await import('node:fs');
-    const { readPipedStdin } = await import('./cli/piped-stdin.js');
-    const text = opts.file ? readFileSync(opts.file, 'utf8') : (await readPipedStdin()) ?? '';
-    const { raws, bad } = parseRawIntakeJsonl(text);
-    const result = ingestIntakeItems(effectiveInstanceRoot(), opts.source as (typeof INTAKE_SOURCES)[number], raws);
-    const out = { source: opts.source, inputLines: raws.length + bad, badInputLines: bad, ...result };
-    if (opts.json) await writeStdoutFully(JSON.stringify(out, null, 2));
-    else console.log(`흡수 원장 · ${opts.source}: 새 ${result.added} · 합침 ${result.merged} · 이미 끝난 것 ${result.seen} · 버림 ${result.skipped}${bad ? ` · 깨진 입력 ${bad}` : ''}${result.badLines ? ` · 깨진 원장 줄 ${result.badLines}` : ''}`);
-  });
-
-intakeCmd
-  .command('items')
-  .description('흡수 원장 항목 보기 (최근 본 순)')
-  .option('--status <status>', 'new | queued | absorbed | checked | routed | discarded | deferred')
-  .option('--source <source>', '입력원으로 거르기')
-  .option('--limit <n>', '최대 줄 수 (기본 30)')
-  .option('--json', '구조화 출력')
-  .action(async (opts: { status?: string; source?: string; limit?: string; json?: boolean }) => {
-    const { listIntakeItems } = await import('./intake-plane/items.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    const all = listIntakeItems(effectiveInstanceRoot(), {
-      ...(opts.status ? { status: opts.status as never } : {}),
-      ...(opts.source ? { source: opts.source as never } : {}),
-    });
-    const limit = Math.max(1, Number(opts.limit ?? 30) || 30);
-    const shown = all.slice(0, limit);
-    if (opts.json) { await writeStdoutFully(JSON.stringify({ total: all.length, items: shown }, null, 2)); return; }
-    console.log(`흡수 원장 ${all.length}건${all.length > limit ? ` (앞 ${limit})` : ''}`);
-    // 개인 메모(user-private)는 본문을 찍지 않는다 — 제목·URL 만.
-    for (const i of shown) console.log(`${i.id}  ${i.status.padEnd(9)} ${i.sources.join('+').padEnd(16)} ${(i.title ?? i.url ?? (i.privacy === 'user-private' ? '(개인 메모)' : i.text ?? '')).slice(0, 90)}`);
-  });
-
-intakeCmd
-  .command('mark <id>')
-  .description('흡수 원장 항목의 상태·산출을 갱신한다 (예: 흡수 뒤 absorbed ⊕ 노트 경로)')
-  .requiredOption('--status <status>', 'new | queued | absorbed | checked | routed | discarded | deferred')
-  .option('--output <kind:ref>', '산출 (note|goal|manual|release|grounding):<경로·번호>')
-  .action(async (id: string, opts: { status: string; output?: string }) => {
-    const { INTAKE_STATUSES, markIntakeItem } = await import('./intake-plane/items.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    if (!(INTAKE_STATUSES as readonly string[]).includes(opts.status)) { console.error(`알 수 없는 상태: ${opts.status}`); process.exitCode = 2; return; }
-    const m = opts.output?.match(/^(note|goal|manual|release|grounding):(.+)$/);
-    if (opts.output && !m) { console.error('--output 은 <kind>:<ref> (kind = note|goal|manual|release|grounding)'); process.exitCode = 2; return; }
-    const ok = markIntakeItem(effectiveInstanceRoot(), id, {
-      status: opts.status as never,
-      ...(m ? { output: { kind: m[1] as 'note', ref: m[2] } } : {}),
-    });
-    if (!ok) { console.error(`원장에 없는 id: ${id}`); process.exitCode = 1; return; }
-    console.log(`${id} → ${opts.status}${m ? ` · ${m[1]}:${m[2]}` : ''}`);
-  });
-
-intakeCmd
-  .command('digest')
-  .description('흡수 하루 다이제스트 — 그날 흡수한 것을 축별로 · 노트의 한 줄 결론 · 골 후보. 노트 절(마크다운) 또는 텔레그램 보고 채널로')
-  .option('--day <YYYY-MM-DD>', 'KST 날짜 (기본 오늘)')
-  .option('--json', '구조화 출력')
-  .option('--telegram', '텔레그램 보고 채널(telegram.reportChannel)로 짧은 판을 보낸다')
-  .option('--vault <root>', '옵시디언 볼트 뿌리 — 텔레그램 판에 노트 열기 주소를 싣는다')
-  .option('--note <path>', '열기 주소가 가리킬 노트(그날 트렌드 노트)')
-  .action(async (opts: { day?: string; json?: boolean; telegram?: boolean; vault?: string; note?: string }) => {
-    const { buildIntakeDigest, renderDigestMarkdown, renderDigestTelegram } = await import('./intake-plane/digest.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    const day = opts.day ?? new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
-    const d = buildIntakeDigest(effectiveInstanceRoot(), day);
-    if (opts.telegram) {
-      if (!d.absorbed.length) { console.log(`텔레그램: ${day} 흡수 0 — 보내지 않음`); return; }
-      const { sendTelegramReport } = await import('./telegram-report.js');
-      const { getUserConfig } = await import('./user-config.js');
-      const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
-      const sent = await sendTelegramReport(getUserConfig(), text, { markdown: true });
-      debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length, sent });
-      console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');
-      if (!sent) process.exitCode = 3;
-      return;
-    }
-    if (opts.json) { await writeStdoutFully(JSON.stringify(d, null, 2)); return; }
-    await writeStdoutFully(renderDigestMarkdown(d));
-  });
-
-intakeCmd
-  .command('route <id>')
-  .description('흡수가 끝난 항목의 대조 결과(intake check --json)를 산출 큐로 나눈다 — 없음→goals · 문서뿐인 판단 필요→manual · 노트→grounding 후보')
-  .requiredOption('--check-json <path>', '`elanous intake check --file <노트> --json` 산출 파일')
-  .option('--dry-run', '큐·상태를 바꾸지 않고 건수만')
-  .option('--json', '구조화 출력')
-  .action(async (id: string, opts: { checkJson: string; dryRun?: boolean; json?: boolean }) => {
-    const { routeIntakeItem } = await import('./intake-plane/route.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    const { readFileSync } = await import('node:fs');
-    let check;
-    try { check = JSON.parse(readFileSync(opts.checkJson, 'utf8')); } catch (e) { console.error(`대조 산출을 못 읽었다: ${String((e as Error).message ?? e)}`); process.exitCode = 2; return; }
-    if (!check || !Array.isArray(check.items)) { console.error('대조 산출 모양이 아니다(items 칸 없음)'); process.exitCode = 2; return; }
-    const res = routeIntakeItem(effectiveInstanceRoot(), id, check, opts.dryRun ? { dryRun: true } : {});
-    if (opts.json) { await writeStdoutFully(JSON.stringify(res, null, 2)); return; }
-    if (res.skipped) { console.log(`${id}: 건너뜀 — ${res.skipped}`); if (res.skipped.startsWith('원장에 없는')) process.exitCode = 1; return; }
-    console.log(`${id} → 골 후보 ${res.goals} · 매뉴얼 후보 ${res.manual} · 판단 필요 ${res.review} · 그라운딩 후보 ${res.grounding}${res.dryRun ? ' (dry-run)' : ''}`);
-  });
-
-intakeCmd
-  .command('grounding-sync')
-  .description('흡수 그라운딩 후보 큐의 노트를 등록 가능한 단일 문서 폴더로 복사한다 (레지스트리는 읽기만)')
-  .option('--dry-run', '복사·삭제·폴더 생성을 하지 않고 건수만 계산한다')
-  .option('--json', '결과와 미등록 시 등록 명령을 JSON 한 줄로 출력한다')
-  .action(async (opts: { dryRun?: boolean; json?: boolean }) => {
-    const { syncIntakeGroundingDocs } = await import('./intake-plane/grounding-docs.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    const { listGroundingSources } = await import('./grounding/sources.js');
-    const result = syncIntakeGroundingDocs(effectiveInstanceRoot(), { dryRun: opts.dryRun });
-    const registered = listGroundingSources(getUserConfig()).some((source) => source.path === result.dir);
-    const registrationCommand = registered ? undefined : `elanous grounding sources add ${result.dir} --kind local-docs --tag intake --sync daily`;
-    if (opts.json) {
-      await writeStdoutFully(JSON.stringify({ ...result, ...(registrationCommand ? { registrationCommand } : {}) }) + '\n');
-      return;
-    }
-    console.log(`그라운딩 동기화: copied ${result.copied} · skipped ${result.skipped} · removed ${result.removed} · unchanged ${result.unchanged}${opts.dryRun ? ' (dry-run)' : ''}`);
-    if (registrationCommand) console.log(registrationCommand);
-  });
-
-intakeCmd
-  .command('queue')
-  .description('자동 흡수 대기열 — 원장의 new 항목에서 하루 상한까지 골라 queued 로 옮긴다 (사용자가 남긴 것 → 여러 입력원 → 점수 순)')
-  .option('--max <n>', '상한 (기본 10 — 대표 결정 2026-09-26)')
-  .option('--kind <kind>', 'video | repo | post | article | note')
-  .option('--dry-run', '고르기만 하고 상태를 안 바꾼다')
-  .option('--json', '구조화 출력 (한 줄 = {id,url,title,sources})')
-  .action(async (opts: { max?: string; kind?: string; dryRun?: boolean; json?: boolean }) => {
-    const { pickAbsorbQueue } = await import('./intake-plane/items.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    const picked = pickAbsorbQueue(effectiveInstanceRoot(), {
-      max: Math.max(0, Number(opts.max ?? 10) || 0),
-      ...(opts.kind ? { kind: opts.kind as never } : {}),
-      ...(opts.dryRun ? { dryRun: true } : {}),
-    });
-    if (opts.json) { await writeStdoutFully(picked.map((i) => JSON.stringify({ id: i.id, url: i.url, title: i.title, sources: i.sources })).join('\n')); return; }
-    console.log(`흡수 대기열 ${picked.length}건${opts.dryRun ? ' (dry-run)' : ''}`);
-    for (const i of picked) console.log(`${i.id}  ${i.sources.join('+').padEnd(16)} ${i.url}`);
-  });
-
-intakeCmd
-  .command('collect-telegram-saved')
-  .description('텔레그램 «저장된 메시지»를 읽기만 해 흡수 원장에 넣는다 (커서 이후만 · 호스트 전용 · 개인 메모는 user-private)')
-  .option('--max <n>', '한 번에 읽을 메시지 수 상한 (기본 300 — 쌓인 것은 판마다 따라잡는다)')
-  .option('--dry-run', '원장·커서를 바꾸지 않고 건수만')
-  .option('--json', '구조화 출력')
-  .action(async (opts: { max?: string; dryRun?: boolean; json?: boolean }) => {
-    const { collectTelegramSaved, gramjsFetchSaved } = await import('./intake-plane/collect-telegram-saved.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    let conn: Awaited<ReturnType<typeof gramjsFetchSaved>>;
-    try { conn = await gramjsFetchSaved(); } catch (e) { console.error(String((e as Error).message ?? e)); process.exitCode = 2; return; }
-    try {
-      const res = await collectTelegramSaved(effectiveInstanceRoot(), conn.fetch, { max: Math.max(1, Number(opts.max ?? 300) || 300), ...(opts.dryRun ? { dryRun: true } : {}) });
-      if (opts.json) await writeStdoutFully(JSON.stringify(res, null, 2));
-      else console.log(`텔레그램 저장된 메시지: 메시지 ${res.messages} · 원장 입력 ${res.raws} · 커서 ${res.cursorBefore} → ${res.cursorAfter}${res.dryRun ? ' (dry-run · 안 씀)' : res.ingest ? ` · 새 ${res.ingest.added} · 합침 ${res.ingest.merged} · 이미 끝난 것 ${res.ingest.seen}` : ''}`);
-    } finally {
-      await conn.close();
-    }
-  });
-
-intakeCmd
-  .command('collect-github')
-  .description('관심 주제의 GitHub 저장소를 별 순으로 모아 흡수 원장에 넣는다 (최근 생성·푸시만 · 별 스냅숏으로 증가량)')
-  .option('--days <n>', '최근 이 일수 안에 만들어졌거나 푸시된 저장소만 (기본 30)')
-  .option('--per-query <n>', '질의마다 별 순 상위 몇 개 (기본 20)')
-  .option('--dry-run', '스냅숏·원장을 바꾸지 않고 질의별 받은 수와 저장소 목록만')
-  .option('--json', '구조화 출력')
-  .action(async (opts: { days?: string; perQuery?: string; dryRun?: boolean; json?: boolean }) => {
-    const { collectGithubStars, ghApiSearchRepos, DEFAULT_GITHUB_STAR_DAYS, DEFAULT_GITHUB_STAR_PER_QUERY } = await import('./intake-plane/collect-github.js');
-    const { effectiveInstanceRoot } = await import('./instance/resolve.js');
-    const days = Math.max(1, Number(opts.days ?? DEFAULT_GITHUB_STAR_DAYS) || DEFAULT_GITHUB_STAR_DAYS);
-    const perQuery = Math.max(1, Number(opts.perQuery ?? DEFAULT_GITHUB_STAR_PER_QUERY) || DEFAULT_GITHUB_STAR_PER_QUERY);
-    const res = await collectGithubStars(effectiveInstanceRoot(), ghApiSearchRepos, {
-      days, perQuery, ...(opts.dryRun ? { dryRun: true } : {}),
-    });
-    if (opts.json) await writeStdoutFully(JSON.stringify(res, null, 2));
-    else console.log(`GitHub star: 저장소 ${res.repos.length} · 질의 ${res.queries.map((q) => `${q.query}=${q.received}`).join(' · ')}${res.dryRun ? ' (dry-run · 안 씀)' : res.ingest ? ` · 새 ${res.ingest.added} · 합침 ${res.ingest.merged} · 이미 끝난 것 ${res.ingest.seen}` : ''}`);
-  });
-
-// ── logs (통합 로그 패브릭 LF3 — adb logcat 동형 · 2026-07-13) ──
-// 조회/follow 는 logs.db 직독(데몬 다운 무관·토큰 불요), level 만 데몬 REST.
-const logsCmd = program.command('logs')
-  .description('전 서피스 로그 조회/실시간 tail (adb logcat 동형) — level/surface/category/grep 필터')
-  .option('-f, --follow', '실시간 follow (tail -f · Ctrl-C 종료)')
-  .option('--level <lvl>', '이 레벨 이상만 (trace|debug|info|warn|error|critical)')
-  .option('--surface <s>', 'surface 필터 CSV (nexus,pwa,telegram,discord,…)')
-  .option('--space <v>', '하니스 공간 필터 (self-implement|dev-harness|solve-mission = 종류별 · 그 외 = run id/branch slug 로 격리 조회)')
-  .option('--category <c>', 'category prefix 필터 CSV (voice,webterm.tabs,…)')
-  .option('--exact-category <c>', 'category 정확 일치 필터 CSV (자식 category 제외)')
-  // ⭐ 「무엇이 «실제로» 뜨나」 — 소스의 debug.log 목록과 «차집합»을 내면 미배선이 나온다(`OBS-T122`)
-  .option('--list-categories', '이 스토어들에 «실제로 뜬» 카테고리와 발화 수를 전수로 낸다(필터 무시)')
-  .option('--list-events', '이 스토어들에 «실제로 뜬» 이벤트와 발화 수를 낸다(카테고리 필터 존중)')
-  .option('--axis <name>', `축 이름을 정확 카테고리 묶음으로 조회 (${knownLogAxes().join('|')})`)   // ⛔ 목록을 손으로 적지 않는다 — 축이 늘면 도움말이 낡는다(A3)
-  .option('--explain', '축 미지정이면 축·카테고리를 발견, --axis와 함께면 매핑·미분류·최근 창 발화 0을 설명')
-  .option('--event <e>', 'event 정확 일치 필터 CSV')
-  .option('--grep <q>', 'event/data/category 부분 일치')
-  .option('--rework-recurrence-disagreement <true|false>', 'rework-budget data.recurrenceDisagreement 값 필터')
-  .option(...LOGS_SINCE_OPTION)
-  .option('--until <t>', '끝 시각 — --since 와 대칭 (30s|15m|2h|7d 상대 또는 ISO/epoch)')
-  .option('--before <cursor>', '⭐ 페이지 커서 — 행 id 또는 연합 --json 메타의 nextCursors JSON 객체')
-  .option('--session <id>', 'session_id 필터')
-  .option('--limit <n>', '최대 행 수 (기본 100 · 로컬 직독은 1000 에 갇히지 않는다 — 그 상한은 HTTP 경계로 옮겼다)')
-  .option('--json', 'JSON 출력')
-  .option('--json-data', '--json 출력에서 JSON data를 파싱된 값으로 출력')
-  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/) 로그를 본다 (LF7-b)')
-  .option('--instance <name>', '레지스트리 등록 인스턴스 타겟 (prod|test:<repo>|…)')
-  .option('--all', '전 인스턴스 연합 조회 — read-only 병합·⟨instance⟩ 태그')
-  .option('--include-test', '--all 연합에 격리 test 인스턴스도 포함(기본 제외)')
-  // ⛔ `-r` 은 값을 받지 않는다 — default 북마크만. 이름은 `--remote <name>` 으로만 준다.
-  .option('-r', 'query logs on the default remote bookmark (does not take a value)')
-  .option('--remote <name>', 'query logs on a named remote bookmark via GET /v1/logs')
-  .action(async (o: import('./cli/logs-cli.js').LogsCliOpts) => {
-    const { runLogsCli } = await import('./cli/logs-cli.js');
-    process.exitCode = await runLogsCli(o);
-  });
-// ★ 발견성 — 플래그 18개를 나열만 하면 **이미 있는 기능을 못 찾고 손으로 다시 만든다**.
-//   실측(2026-07-28): `--since 30m` 을 모른 채 `$(date -u -v-30M …)` 를 손으로 썼고(macOS 전용),
-//   `-f` 를 모른 채 폴 루프를 짰다. 그래서 예시를 **맨 앞**에 둔다(`before` = Usage 위).
-//   ⚠️ 자리표시자는 **대문자**다 — `<ref>` 로 쓰면 셸에서 입력 리다이렉션이라 복사해서 못 돌린다.
-logsCmd.addHelpText('before', `
-자주 쓰는 5가지 (복사해서 그대로 실행 · 자리표시자는 대문자)
-
-  elanous logs --category dev-pipeline --since 30m
-      최근 시간창. ⭐ --since 는 상대 표기를 받는다(30s|15m|2h|7d) — date 로 계산하지 마라.
-
-  elanous logs --category self-review -f
-      실시간 follow (tail -f 동형 · Ctrl-C 종료).
-
-  elanous logs --event headless.spawn --since 6h | grep -c .
-      그 이벤트가 몇 건인가. ⭐ --event 는 정확 일치 — --grep 은 data 본문도 매칭해 과다 계수한다.
-      ⚠️ 0건은 stderr 로 나가므로 이 파이프는 정직하게 0 을 낸다.
-
-  elanous logs --grep RUNID --since 3h --all --include-test
-      한 실행을 끝까지 따라간다. ⚠️ 런의 이벤트는 prod 와 격리 인스턴스에 **나뉘어** 있어
-      --all --include-test 가 없으면 일부만 보인다. (--space RUNID 는 harness 공간만 본다)
-
-  elanous logs --category self-review --event done --since 6h --json | jq '.data | fromjson | .verdict'
-      JSON 파이프. ⚠️ data 는 **문자열**이라 fromjson 을 거쳐야 필드를 뽑는다.
-
-  elanous logs --event frame-stall --since 7d --instance prod --limit 1000 --json | tail -1
-      ⭐ 과거로 가려면 페이지를 넘긴다. --since 를 넓히는 것으로는 못 간다 —
-      정렬이 최근순이라 어떤 창을 걸어도 **최근 상한만큼**만 온다(실측).
-      상한에 걸리면 다음 쪽 명령(--before ID)을 stderr 로 찍어 준다.
-
-더 보기: elanous logs timeline --help (자율빌드 드라이브를 내러티브로) · elanous logs instances
-`);
-logsCmd.command('instances')
-  .description('로그 인스턴스 레지스트리 조회 — 이름·state dir·liveness·store 유무 (LF7-b)')
-  .option('--json')
-  .action(async (o: { json?: boolean }) => {
-    const { runLogsInstances } = await import('./cli/logs-cli.js');
-    process.exit(runLogsInstances(o));
-  });
-logsCmd.command('level [lvl]')
-  .description('데몬 로그 레벨 조회/런타임 변경 (off|trail|diag|normal|verbose|detail|keytrace · 변경은 인스턴스 영속 — LF7-c). --render on|off = 렌더 로그 무음 스위치(레벨과 직교 · OH9)')
-  .option('--json')
-  .option('--render <on|off>', '렌더 카테고리(dashboard/key/mouse/…) 발화 on|off — 진단 레벨과 직교(OH9)')
-  .action(async (lvl: string | undefined, o: { json?: boolean; render?: string }) => {
-    const { runLogsLevel } = await import('./cli/logs-cli.js');
-    process.exit(await runLogsLevel(lvl, o));
-  });
-logsCmd.command('timeline')
-  .description('세션/드라이브를 휴먼 리더블 내러티브로 렌더 — 렌더 노이즈 제외·turn/tool-call/reasoning/edit 타임라인 (자율빌드 드라이브 진단용)')
-  .option('--session <id>', 'session_id 필터 (예: elanous-session-1)')
-  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO/epoch)')
-  .option('--until <t>', '종료 시각 (동일 문법)')
-  .option('--out <path>', '파일로 저장 (미지정 시 stdout)')
-  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
-  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
-  .action(async (o: import('./cli/logs-timeline.js').LogsTimelineOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
-    // Parent `logs` also declares --since/--session/--test/--instance; merge
-    // parent+child so those don't get swallowed by the parent scope.
-    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./cli/logs-timeline.js').LogsTimelineOpts;
-    const { runLogsTimeline } = await import('./cli/logs-timeline.js');
-    process.exit(runLogsTimeline(merged));
-  });
-
-logsCmd.command('durations')
-  .description('대화 표면과 헤드리스 core 경로를 분리해 툴별 소요 분포(count·median·p90·max)를 조회')
-  .option('--json', '구조화 JSON 출력')
-  .option('--limit <n>', '인스턴스별 최대 수집 행 수 (상한 도달 여부를 산출에 표시)')
-  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
-  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
-  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
-  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
-  .action(async (o: import('./cli/logs-tool-durations.js').LogsToolDurationsOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
-    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./cli/logs-tool-durations.js').LogsToolDurationsOpts;
-    const { runLogsToolDurations } = await import('./cli/logs-tool-durations.js');
-    process.exit(runLogsToolDurations(merged));
-  });
-
-logsCmd.command('degenerate')
-  .description('수치 로그 필드의 always-same/all-zero/표본 부족 퇴화를 NDJSON으로 판정 (기본 표본 50)')
-  .option('--category <prefix>', '카테고리 접두 필터 (복수는 쉼표)')
-  .option('--event <event>', '이벤트 정확 일치 필터 (복수는 쉼표)')
-  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO)')
-  .option('--min-samples <n>', '판정 최소 표본 수 (기본 50)')
-  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
-  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
-  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
-  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
-  .action(async (o: import('./cli/logs-degenerate.js').LogsDegenerateOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
-    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./cli/logs-degenerate.js').LogsDegenerateOpts;
-    const { runLogsDegenerate } = await import('./cli/logs-degenerate.js');
-    process.exit(runLogsDegenerate(merged));
-  });
-
-logsCmd.command('fields')
-  .description('모든 최상위 data 필드의 존재 행 수·이벤트 전체 행 수·관측 기간을 NDJSON으로 조회')
-  .option('--category <prefix>', '카테고리 접두 필터 (복수는 쉼표)')
-  .option('--exact-category <category>', '카테고리 정확 일치 필터 (복수는 쉼표)')
-  .option('--event <event>', '이벤트 정확 일치 필터 (복수는 쉼표)')
-  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO)')
-  .option('--limit <n>', '최대 수집 행 수 (상한 도달 시 firstSeen은 창 안에서 처음)')
-  .option('--values [n]', '필드별 최빈 primitive 값 분포 (기본 10개)')
-  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
-  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
-  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
-  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
-  .action(async (o: import('./cli/logs-fields.js').LogsFieldsOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
-    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./cli/logs-fields.js').LogsFieldsOpts;
-    const { runLogsFields } = await import('./cli/logs-fields.js');
-    process.exit(runLogsFields(merged));
-  });
-
-logsCmd.command('unclosed')
-  .description('시작만 있고 종료가 없는 작업을 나이순으로 — 행(hang) 후보. ⛔ 임계값을 정하지 않는다(자르는 선은 --older-than 으로 읽는 쪽이 고른다)')
-  .option('--since <t>', '스캔 창 (30s|15m|2h|7d · 기본 24h)')
-  .option('--older-than <t>', '이 나이 이상만 (동일 문법 · 미지정 시 전부)')
-  .option('--json', 'JSON Lines 출력')
-  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
-  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
-  .action(async (o: import('./cli/logs-unclosed.js').LogsUnclosedOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
-    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./cli/logs-unclosed.js').LogsUnclosedOpts;
-    const { runLogsUnclosed } = await import('./cli/logs-unclosed.js');
-    process.exit(runLogsUnclosed(merged));
-  });
-
-logsCmd.command('abandoned-draft-prs')
-  .description('중단 산출 draft PR 중 salvage 판정이 안 붙은 것을 세고 이름을 댄다 (읽기 전용 · 닫기/라벨/코멘트 없음)')
-  .option('--json', '구조화 JSON 출력')
-  .option('--store-names', '사람 산출에 본 스토어 이름을 전부 나열 (기본은 수·상한·못 읽은 수만)')
-  .option('--lookup-merged', '같은 골의 병합된 PR 을 GitHub 에서 조회해 superseded 를 이름으로 댄다 (기본은 오프라인)')
-  .option('--lookup-current-status', '각 draft PR의 현재 병합·닫힘·열림 상태를 GitHub 에서 조회한다 (기본은 오프라인 · 읽기 전용)')
-  .option('--count-domain-gap', '열린 draft PR 전체를 GitHub에서 조회해 이 보고서가 못 이은 수를 낸다 (기본은 오프라인 · 읽기 전용)')
-  .option('--run-lineage', '같은 런 원장에서 draft 뒤 병합된 PR 번호를 이름으로 댄다 (로컬 원장 읽기 전용)')
-  .option('--limit <n>', '전역 최대 수집 행 수 (스토어 합산, 상한 도달 여부를 산출에 표시)')
-  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO)')
-  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
-  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
-  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
-  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
-  .action(async (o: import('./cli/logs-abandoned-draft-prs.js').LogsAbandonedDraftPrsOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
-    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./cli/logs-abandoned-draft-prs.js').LogsAbandonedDraftPrsOpts;
-    const { runLogsAbandonedDraftPrs } = await import('./cli/logs-abandoned-draft-prs.js');
-    process.exit(runLogsAbandonedDraftPrs(merged));
-  });
+registerLogsCommands(program);
 
 // ── ad (marketing-ad pipeline entrance) ──
 /** ⛔ 「있다」와 「읽을 수 있는 파일이다」는 다른 값 — 디렉토리·권한 없는 파일을 실사로 읽지 않는다. */
@@ -6704,945 +5304,13 @@ program.command('ad [input...]')
     if (result.status === 'rejected' || result.status === 'blocked') process.exitCode = 1;
   });
 
-// ── docs (문서 지식 — DocOps P2 하이브리드 검색) ──
-const docsCmd = program.command('docs')
-  .description('문서 지식 검색/관리 — knowledge.db 벡터+BM25 하이브리드 (DocOps)');
-docsCmd.command('search <query>')
-  .description('하이브리드 검색(RRF) — 의미(임베딩)+키워드(FTS5) 융합. 임베딩 다운 시 키워드 단독')
-  .option('--limit <n>', '최대 결과 (기본 8·최대 20)')
-  .option('--domain <d>', '도메인 (기본 elanous — finance 신호와 격리)')
-  .option('--kind <k>', 'kind 필터 (docs|memory|signal|…)')
-  .option('--json')
-  .action(async (query: string, o: { limit?: string; domain?: string; kind?: string; json?: boolean }) => {
-    const { runDocsSearch } = await import('./cli/docs-cli.js');
-    process.exit(await runDocsSearch(query, o));
-  });
-docsCmd.command('revision <path>')
-  .description('문서가 선언한 현재 판과 해당 문서의 git 이력 판을 비교')
-  .option('--json', '구조화된 판정 출력')
-  .action(async (path: string, o: { json?: boolean }) => {
-    const { runDocsRevision } = await import('./cli/docs-cli.js');
-    process.exit(await runDocsRevision(path, o));
-  });
-docsCmd.command('stale [path]')
-  .description('과거 TypeScript 인벤토리와 대조해 실제로 늙은 문서를 판정')
-  .option('--json', '구조화된 판정 출력')
-  .option('--axis <axis>', '판정 축 — removed-identifiers(기본·고유 판별자)|all(기존 네 축 합집합)|broken-links|superseded|stale-score|source-paths(명시 선택 부가 신호)|line-anchors(「경로:줄 ⊕ 심볼」 인용이 ±5줄 안에서 맞는가)')
-  .option('--history', '사라진 식별자의 마지막 제거 커밋을 읽기 전용 이력으로 보강 (느릴 수 있음)')
-  .action(async (path: string | undefined, o: { json?: boolean; axis?: string; history?: boolean }) => {
-    // ⛔⭐ **sink 를 «먼저» 붙인다** — 붙이지 않으면 `debug.log('docs.stale', …)` 가 «불리는데»
-    //   logs.db 에 안 닿아 `elanous logs --exact-category docs.stale` 이 «0건»을 낸다.
-    //   📏 2026-08-12 실측: 이 줄이 없어서 라이브 판정 신호 ③(관측이 남는가)이 실패했다.
-    //   ⚠️ 「로그 0건」의 세 뜻(미배선 · 다른 경로 · ***sink 미등록***) 중 셋째다 — 계측은 있었다.
-    await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('cli');
-    const { runDocsStale } = await import('./cli/docs-cli.js');
-    process.exit(await runDocsStale(path, o));
-  });
+registerDocsCommands(program);
+registerFleetCommands(program);
 
 // ── ops (운영 관측 — 지금 뭐 도나·이상 없나·상태 전이) ──
-// ── fleet (멀티 인스턴스 통합 뷰 · §10 Control Plane/Fleet) ──
-const fleetCmd = program.command('fleet')
-  .description('멀티 elanous 인스턴스 통합 뷰(READ-ONLY 연합) — 등록 인스턴스·보유 스토어 매트릭스. `logs instances` 일반화(kubectl get nodes 등가). 연합 조회는 `session list --all-instances` 등.');
+registerOpsCommands(program);
 
-fleetCmd
-  .command('list', { isDefault: true })
-  .description('등록 인스턴스 나열 — name·alive·repo·state-dir·보유 스토어(logs/sessions/tasks/memory)')
-  .option('--json')
-  .action(async (opts: { json?: boolean }) => {
-    const { buildFleetView } = await import('./domains/fleet.js');
-    const view = buildFleetView();
-    if (opts.json) { await writeStdoutJson(JSON.stringify(view, null, 2) + '\n'); return; }
-    ui.header(`Fleet (${view.length} instances · ${view.filter((v) => v.alive).length} alive)`);
-    for (const i of view) {
-      const flag = i.alive ? '●' : '○';
-      const s = i.stores;
-      const stores = [s.logs ? 'logs' : '', s.sessions ? 'sessions' : '', s.tasks ? 'tasks' : '', s.memory ? 'memory' : '', s.opsEvents ? 'ops' : '', s.schedules ? 'sched' : '', s.mandate ? 'mandate' : '', s.frame ? 'frame' : ''].filter(Boolean).join(',');
-      const kindTag = i.kind === 'test' ? ui.dim(' [test]') : '';
-      console.log(`  ${flag} ${i.name.padEnd(24)}${kindTag} ${(i.liveness === 'remote' ? `remote@${i.hostname ?? 'unknown'}` : i.alive ? `pid=${i.pid}` : 'dead').padEnd(11)} [${stores}]`);
-      console.log(ui.dim(`      ${i.stateDir}${i.repoPath ? `  ← ${i.repoPath}` : ''}`));
-    }
-    ui.info(ui.dim('연합 조회: session list · ops status · self recall `--all-instances` · fleet screen `--all`(격리 test 기본 제외·--include-test 로 포함)'));
-  });
-
-fleetCmd
-  .command('screen')
-  .description('등록 elanous 인스턴스의 PTY 화면 프레임을 read-only로 조회한다')
-  .option('--all', '등록 인스턴스 전체를 연합 조회한다(격리 test 기본 제외)')
-  .option('--include-test', '--all 연합에 격리 test 인스턴스를 포함한다')
-  .option('--json', '구조화된 프레임 행을 출력한다')
-  .action(async (opts: { all?: boolean; includeTest?: boolean; json?: boolean }) => {
-    const { existsSync } = await import('node:fs');
-    const { homedir } = await import('node:os');
-    const { join } = await import('node:path');
-    const { instanceStorePaths, ptyManifestTargets } = await import('./domains/fleet.js');
-    const { listPtyManifestAt } = await import('./pty-shell/pty-manifest.js');
-    const { stripScreenAnsi } = await import('./harness/harness-screen.js');
-    const currentStateDir = process.env.ELANOUS_STATE_DIR?.trim() || join(homedir(), '.elanous');
-    const targets: Array<{ name: string; dbPath: string }> = [];
-    if (opts.all) {
-      // ⭐⭐ 열거는 `ptyManifestTargets`(SSOT) 한 곳이다 — `pty list --all` 과 **같은 함수**를 쓴다.
-      //    ⛔ 여기서 따로 조립하면 두 창구가 조용히 갈린다(2026-07-30 리뷰 must-fix).
-      targets.push(...ptyManifestTargets({ includeTest: opts.includeTest === true }));
-    } else {
-      targets.push({ name: process.env.ELANOUS_INSTANCE_NAME?.trim() || 'prod', dbPath: instanceStorePaths(currentStateDir).frame });
-    }
-    const rows = targets.flatMap((target) => existsSync(target.dbPath)
-      ? listPtyManifestAt(target.dbPath).map((row) => ({ ...row, instance: row.instance || target.name }))
-      : [])
-      .sort((a, b) => a.frameAt - b.frameAt || a.startedAt - b.startedAt || a.id.localeCompare(b.id));
-    if (opts.json) { await writeStdoutJson(JSON.stringify(rows, null, 2) + '\n'); return; }
-    if (rows.length === 0) { console.log('(화면 프레임 없음)'); return; }
-    for (const row of rows) {
-      console.log(`── ${row.instance} · ${row.id} · ${row.kind} · ${new Date(row.frameAt).toISOString()} ──`);
-      console.log(stripScreenAnsi(row.frame));
-    }
-  });
-
-const opsCmd = program.command('ops')
-  .description('운영 관측(READ-ONLY) — 미션·태스크·계약 루프·오케스트레이터 현재 상태·이상·전이. --json 프로그래매틱.');
-
-interface OpsOpts { id?: string; entityType?: string; event?: string; sinceHours?: string; limit?: string; json?: boolean }
-
-// ops 연합(fleet · --all-instances) — 각 인스턴스에 opsSnapshot 을 인스턴스별 스토어 경로로
-// 호출해 미션·태스크뿐 아니라 loops(계약루프)·스케줄·오케스트레이션까지 전체 종합한다.
-// 경로 주입이 opsSnapshot 의 부작용/편향을 자동 우회한다:
-//   · schedulesDbPath 주입 → crontab inventory skip(ops-status.ts `if(!opts.schedulesDbPath)`)
-//   · mandate 명시 주입 → loadMandate() 기본(prod) 미호출(ops-status.ts `opts.mandate!==undefined`)
-// loadMandate(path) 는 파일 부재 시 DEFAULT_MANDATE(DISARMED) fail-soft — test 인스턴스 안전.
-// prod 는 instanceStorePaths(~/.elanous)==기본 경로라 종전 loops/스케줄이 그대로 보인다(무회귀).
-async function runOpsFleet(json: boolean, includeTest = false): Promise<never> {
-  const { buildFleetView, instanceStorePaths } = await import('./domains/fleet.js');
-  const { TaskStore } = await import('./task-orchestrator/store.js');
-  const { opsSnapshot } = await import('./domains/ops-status.js');
-  const { loadMandate } = await import('./domains/trade-mandate.js');
-  // 격리 test 인스턴스는 기본 제외(데이터 오염 방지 · Phase A) — --include-test 로 opt-in.
-  const view = buildFleetView().filter((v) => v.stores.tasks && (includeTest || v.kind !== 'test'));
-  const rows: Array<{ name: string; kind: string; stateDir: string; snapshot: import('./domains/ops-status.js').OpsSnapshot }> = [];
-  for (const i of view) {
-    let store: InstanceType<typeof TaskStore> | null = null;
-    try {
-      const p = instanceStorePaths(i.stateDir, i.configDir);
-      store = new TaskStore({ path: p.tasks });
-      const snapshot = opsSnapshot({
-        opsDbPath: p.opsEvents,
-        schedulesDbPath: p.schedules,
-        mandate: loadMandate(p.mandate),   // 파일 부재 → DEFAULT(DISARMED) fail-soft
-        missionStore: store,
-      });
-      rows.push({ name: i.name, kind: i.kind, stateDir: i.stateDir, snapshot });
-    } catch { /* skip 손상/락 db */ } finally { store?.close?.(); }
-  }
-  if (json) { await writeStdoutJson(JSON.stringify(rows, null, 2) + '\n'); process.exit(0); }
-  ui.header(`ops · fleet (${rows.length} instances · read-only union · loops/스케줄/오케스트레이션 포함)`);
-  for (const { name, kind, snapshot: s } of rows) {
-    const kindTag = kind === 'test' ? ui.dim(' [test]') : '';
-    const sched = s.schedules ? `${s.schedules.elanousTotal}개(stale ${s.schedules.stale.length}·err ${s.schedules.errored.length})` : '—';
-    console.log(`  ${name.padEnd(22)}${kindTag} 미션 ${String(s.missions.total).padStart(3)} ${JSON.stringify(s.missions.byStatus)}`);
-    console.log(ui.dim(`  ${''.padEnd(22)} 태스크 ${String(s.tasks.total).padStart(3)} ${JSON.stringify(s.tasks.byStatus)} — 스케줄실행 ${s.tasks.scheduleBacked}(최근 ${s.tasks.recentlyActive}) · blocked ${s.tasks.blocked.length}`));
-    console.log(ui.dim(`  ${''.padEnd(22)} 루프 ${s.loops.loops.length}개 armed=${s.loops.armed}${s.loops.live ? '·LIVE' : ''} mode=${s.loops.executionMode} · 오케스트 ${s.orchestration.recent.length}건 · 스케줄 ${sched}`));
-  }
-  ui.info(ui.dim('연합=미션/태스크/loops/스케줄/오케스트레이션 전체 종합(스토어 경로 주입). 단일 인스턴스 상세=`elanous ops status`.'));
-  process.exit(0);
-}
-
-async function runOps(action: string, opts: OpsOpts): Promise<never> {
-  const { dispatchOpsStatus } = await import('./domains/ops-status-tool.js');
-  const result = await dispatchOpsStatus({
-    action,
-    ...(opts.id ? { id: opts.id } : {}),
-    ...(opts.entityType ? { entityType: opts.entityType } : {}),
-    ...(opts.event ? { event: opts.event } : {}),
-    ...(opts.sinceHours ? { sinceHours: Number(opts.sinceHours) } : {}),
-    ...(opts.limit ? { limit: Number(opts.limit) } : {}),
-  });
-  const isErr = !!result && typeof result === 'object' && 'error' in (result as object);
-  if (opts.json || isErr) {
-    await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
-  } else if (action === 'mission') {
-    const r = result as { mission: { goal: string; disposition: string; source: string; engine: string | null; rationale: string | null; createdAt: string } | null; derived: Array<{ kind: string; name: string; status: string; detail?: string }>; transitions: Array<{ ts: string; event: string; toState: string | null }>; phases: Array<{ index: number; title: string; status: string; failClass?: string; diagnosis?: { narrative: string; rootCause: string; heal: string; confidence: string }; prUrl?: string }>; runLogPath: string | null; planDraft: string | null; note: string };
-    if (!r.mission) { console.log(r.note); }
-    else {
-      ui.header(`미션 상세 · ${r.mission.disposition}`);
-      console.log(`  목표    ${r.mission.goal}`);
-      console.log(`  출처    ${r.mission.source}${r.mission.engine ? ` · engine=${r.mission.engine}` : ''}  · 생성 ${r.mission.createdAt.slice(0, 16)}`);
-      if (r.mission.rationale) console.log(`  근거    ${r.mission.rationale}`);
-      if (r.planDraft) { console.log(`\n  ── 멀티페이즈 플랜 (승인 전 검토) ──`); for (const line of r.planDraft.split('\n')) console.log(`  ${line}`); console.log(''); }
-      // ★ 페이즈 + 저장 진단(P1) — 실패 페이즈는 failClass·근본원인·권장 힐을 그대로(재계산 없음).
-      if (r.phases?.length) {
-        console.log(`  페이즈 ${r.phases.length}건:`);
-        for (const p of r.phases) {
-          const mark = p.status === 'done' ? '✅' : p.status === 'failed' ? '❌' : p.status === 'running' ? '🔧' : '·';
-          console.log(`    ${mark} ${p.index}. [${p.status}${p.failClass ? `·${p.failClass}` : ''}] ${p.title}${p.prUrl ? ` · PR ${p.prUrl}` : ''}`);
-          if (p.diagnosis) {
-            console.log(`       🧭 ${p.diagnosis.rootCause}`);
-            console.log(`       💡 권장: ${p.diagnosis.heal}(${p.diagnosis.confidence})`);
-          }
-        }
-      }
-      if (r.runLogPath) console.log(`  실행 로그  ${r.runLogPath}`);
-      console.log(`  관련 파생물 (태스크/스케줄/자율행동) ${r.derived.length}건:`);
-      for (const d of r.derived) console.log(`    [${d.kind}] ${d.name}  — ${d.status}${d.detail ? ` (${d.detail})` : ''}`);
-      if (r.transitions.length) {
-        console.log(`  상태 전이 ${r.transitions.length}건:`);
-        for (const t of r.transitions) console.log(`    ${t.ts.slice(0, 16)}  ${t.event} ${t.toState ?? ''}`);
-      }
-    }
-  } else if (action === 'health') {
-    const r = result as { healthy: boolean; anomalies: Array<{ kind: string; entity: string; detail: string }>; note: string };
-    ui.header(r.healthy ? '운영 상태: 정상 ✓' : `운영 상태: 이상 ${r.anomalies.length}건 ⚠`);
-    for (const a of r.anomalies) console.log(`  [${a.kind}] ${a.entity} — ${a.detail}`);
-    console.log(`  ${r.note}`);
-  } else if (action === 'timeline') {
-    const r = result as { count: number; timeline: Array<{ ts: string; entityType: string; entityId: string; event: string; toState: string | null }> };
-    ui.header(`운영 전이 타임라인 (${r.count})`);
-    for (const e of r.timeline) console.log(`  ${e.ts}  ${e.entityType.padEnd(13)} ${e.event.padEnd(14)} ${e.toState ?? ''}  ${e.entityId}`);
-  } else {
-    const r = result as {
-      missions: { total: number; byStatus: Record<string, number>; active: Array<{ status: string; disposition: string; goal: string }> };
-      tasks: { total: number; byStatus: Record<string, number>; scheduleBacked: number; recentlyActive: number; dispatchPending: number; blocked: unknown[]; dispatchable: Array<{ title: string }> };
-      loops: { loops: unknown[]; armed: boolean; executionMode: string }; health: { healthy: boolean; anomalyCount: number; anomalies: Array<{ kind: string; entity: string; detail: string }> };
-    };
-    ui.header('운영 상태 스냅샷');
-    console.log(`  미션    ${r.missions.total}건  ${JSON.stringify(r.missions.byStatus)}  (대부분 승인대기·HITL)`);
-    console.log(`  태스크  ${r.tasks.total}건 — 스케줄실행 ${r.tasks.scheduleBacked}(최근발화 ${r.tasks.recentlyActive}) · 디스패치대기 ${r.tasks.dispatchPending} · blocked ${r.tasks.blocked.length}`);
-    if (r.tasks.dispatchable.length) console.log(`          대기: ${r.tasks.dispatchable.map((t) => t.title).slice(0, 3).join(' · ')}`);
-    console.log(`  루프    ${r.loops.loops.length}개 활성  armed=${r.loops.armed}  mode=${r.loops.executionMode}`);
-    console.log(`  건강    ${r.health.healthy ? '정상 ✓' : `이상 ${r.health.anomalyCount}건 ⚠`}`);
-    // 이상 상세도 스냅샷에서 바로 — "무엇이" 이상인지 ops health 재조회 없이(관측 갭 해소).
-    if (!r.health.healthy) for (const a of r.health.anomalies) console.log(`          ⚠ [${a.kind}] ${a.entity} — ${a.detail}`);
-  }
-  process.exit(isErr ? 1 : 0);
-}
-
-// ── SE 격리 빌드 관측 CLI(PLAN B3) — list/스냅샷/--follow(tail -f 스트리밍) ──
-interface OpsBuildOpts { all?: boolean; follow?: boolean; stop?: boolean; tail?: string; json?: boolean }
-async function runOpsBuild(buildId: string | undefined, opts: OpsBuildOpts): Promise<never> {
-  const { dispatchSeBuild, buildSnapshot } = await import('./domains/se-build-tool.js');
-  const { buildLogPath } = await import('./autopilot/se-build-registry.js');
-  // --stop (빌드 컨트롤 — 실행중 빌드 중단)
-  if (buildId && opts.stop) {
-    const r = await dispatchSeBuild({ action: 'stop', buildId }) as { ok?: boolean; error?: string; killedPids?: number[]; missionId?: string; note?: string };
-    if (opts.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); process.exit(r.ok ? 0 : 1); }
-    if (r.ok) console.log(`⏹ 빌드 중단: ${buildId}${r.killedPids ? ` (SIGTERM pid ${r.killedPids.join(',')})` : ''}\n  미션 ${r.missionId} — 재개는 재구현/재실행으로.`);
-    else console.log(`중단 실패: ${r.error}`);
-    process.exit(r.ok ? 0 : 1);
-  }
-  // list (buildId 없음)
-  if (!buildId) {
-    const r = await dispatchSeBuild({ action: 'list', all: opts.all === true }) as { builds: Array<{ buildId: string; status: string; phase: string; backend: string; attempt: number }>; note: string };
-    if (opts.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); process.exit(0); }
-    ui.header('SE 격리 빌드');
-    if (!r.builds.length) console.log(`  ${r.note}`);
-    for (const b of r.builds) console.log(`  ${b.buildId}  [${b.status}]  ${b.backend}·시도${b.attempt}  ${b.phase.slice(0, 40)}`);
-    process.exit(0);
-  }
-  // --follow (tail -f 스트리밍·adb logcat 스타일)
-  if (opts.follow) {
-    const { readFileSync, existsSync, statSync } = await import('node:fs');
-    const snap = buildSnapshot(buildId, { tail: 1 });
-    const logPath = snap?.build.logPath ?? buildLogPath(buildId);
-    console.log(`── follow ${buildId} · ${logPath} (Ctrl-C 종료) ──`);
-    let offset = 0;
-    if (existsSync(logPath)) { const buf = readFileSync(logPath); process.stdout.write(buf); offset = buf.length; }
-    for (;;) {
-      await new Promise((res) => setTimeout(res, 1000));
-      try {
-        if (!existsSync(logPath)) continue;
-        const size = statSync(logPath).size;
-        if (size > offset) { const buf = readFileSync(logPath); process.stdout.write(buf.subarray(offset)); offset = buf.length; }
-        else if (size < offset) { offset = 0; } // 로그 회전 감지 → 처음부터
-      } catch { /* fail-soft·계속 폴링 */ }
-    }
-  }
-  // 스냅샷
-  const snap = buildSnapshot(buildId, { tail: opts.tail ? Number(opts.tail) : 40 });
-  if (opts.json) { await writeStdoutJson(JSON.stringify(snap, null, 2) + '\n'); process.exit(snap ? 0 : 1); }
-  if (!snap) { console.log(`빌드 없음: ${buildId}`); process.exit(1); }
-  ui.header(`SE 빌드 · ${snap.build.status}`);
-  console.log(`  ${snap.build.buildId}  ${snap.build.backend}·시도${snap.build.attemptSeq}·maxTurns${snap.build.maxTurns ?? '?'}`);
-  console.log(`  페이즈  ${snap.build.phaseTitle}`);
-  console.log(`  worktree  ${snap.worktree ?? '(없음)'}`);
-  if (snap.diffStat) { console.log(`  ── 변경(diff --stat) ──`); for (const l of snap.diffStat.split('\n')) console.log(`  ${l}`); }
-  console.log(`  ── 로그 tail ──`);
-  for (const l of snap.logTail) console.log(`  ${l}`);
-  process.exit(0);
-}
-
-opsCmd.command('status').description('현재 상태 종합(미션·태스크·루프·오케스트레이션·스케줄) · --all-instances 로 fleet 전체 종합(미션/태스크/loops/스케줄/오케스트레이션) · -r/--remote 로 원격 GET 조립')
-  .option('--json').option('--all-instances', '등록 인스턴스 전체 종합(미션/태스크/loops/스케줄/오케스트레이션 · fleet · read-only · §10)')
-  .option('--include-test', '연합에 격리 test 인스턴스도 포함(기본 제외)')
-  // ⛔ `-r` 은 값을 받지 않는다 — default 북마크만. 이름은 `--remote <name>` 으로만 준다.
-  .option('-r', 'query ops status on the default remote bookmark (does not take a value)')
-  .option('--remote <name>', 'query ops status on a named remote bookmark via GET /v1/missions · /v1/tasks · /v1/autopilot/arming')
-  .action(async (o: OpsOpts & { allInstances?: boolean; includeTest?: boolean; r?: boolean; remote?: string }) => {
-    if (o.remote !== undefined || o.r === true) {
-      const { runOpsStatusRemote } = await import('./cli/ops-status-remote.js');
-      const result = await runOpsStatusRemote({
-        args: process.argv.slice(2),
-        remote: o.remote !== undefined ? o.remote : true,
-        json: o.json === true,
-        allInstances: o.allInstances === true,
-      });
-      process.exitCode = result.classification === 'ok' ? 0 : 1;
-      return;
-    }
-    return o.allInstances ? runOpsFleet(o.json === true, o.includeTest === true) : runOps('snapshot', o);
-  });
-opsCmd.command('health').description('이상 판정만(blocked·errored·stale)').option('--json')
-  .action((o: OpsOpts) => runOps('health', o));
-opsCmd.command('timeline').description('상태 전이 최근순 통합')
-  .option('--entity-type <t>', 'mission|task|loop|orchestration')
-  .option('--event <e>', 'created|status_change|cycle_start|cycle_end|merge|alloc|blocked')
-  .option('--since-hours <n>', '조회 기간(기본 48)').option('--limit <n>', '건수(기본 40)').option('--json')
-  .action((o: OpsOpts) => runOps('timeline', o));
-opsCmd.command('mission <id>').description('미션 1건 상세 — 내용 + 페이즈별 진단(failClass·권장 힐) + 관련 태스크/스케줄/자율행동 fan-in + 전이')
-  .option('--json').action((id: string, o: OpsOpts) => runOps('mission', { ...o, id }));
-// P5 (2026-07-13) — 미션별 영속 run.log tail(O3 의 표면 완결·READ-ONLY). 빌드 단위 실시간
-// follow 는 `elanous ops build --follow`(B3) — 여긴 미션 레벨 스냅샷 tail.
-opsCmd.command('mission-log <id>').description('미션 실행 로그(run.log) tail — 진단 근거의 실체(재부팅에도 영속)')
-  .option('-n, --lines <n>', '마지막 N줄(기본 40·최대 200)').option('--json')
-  .action(async (id: string, o: { lines?: string; json?: boolean }) => {
-    const { dispatchAutopilotMissions } = await import('./autopilot/mission-tool.js');
-    const r = await dispatchAutopilotMissions({ action: 'log', id, ...(o.lines ? { tail: Number(o.lines) } : {}) }) as
-      { error?: string; exists?: boolean; lines?: string[]; runLogPath?: string; note?: string };
-    if (o.json || r.error) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); process.exit(r.error ? 1 : 0); }
-    if (!r.exists) { console.log(r.note ?? '로그 없음'); process.exit(0); }
-    for (const line of r.lines ?? []) console.log(line);
-    console.log(`\n· ${r.note ?? r.runLogPath ?? ''}`);
-    process.exit(0);
-  });
-opsCmd.command('build [buildId]').description('SE 격리 빌드 관측/컨트롤 — 없으면 list, buildId 지정 시 스냅샷. --follow=tail -f 스트리밍, --stop=실행중 빌드 중단')
-  .option('--stop', '실행중 빌드 중단(미션 프로세스 SIGTERM·재개는 재구현/재실행)')
-  .option('--all', '종결 포함 전체(list)').option('--follow', 'tail -f 스트리밍(adb logcat 스타일)')
-  .option('--tail <n>', '로그 tail 줄 수(기본 40)').option('--json')
-  .action((buildId: string | undefined, o: OpsBuildOpts) => runOpsBuild(buildId, o));
-
-// ── autopilot 미션 CRUD (기존 autopilotCmd 확장 — 관측(ops)과 분리·변경 전용) ──
-interface AutopilotOpts { id?: string; status?: string; source?: string; command?: string; cron?: string; prompt?: string; phase?: string; comment?: string; context?: string; title?: string; notify?: boolean; note?: string; pr?: string; reusables?: string; decisions?: string; sub?: string; toStage?: string; n?: string; model?: string; effort?: string; append?: string; kind?: string; full?: boolean; generation?: string; json?: boolean }
-
-async function runAutopilot(action: string, opts: AutopilotOpts): Promise<never> {
-  const { dispatchAutopilotMissions } = await import('./autopilot/mission-tool.js');
-  const result = await dispatchAutopilotMissions({
-    action,
-    ...(opts.id ? { id: opts.id } : {}),
-    ...(opts.status ? { status: opts.status } : {}),
-    ...(opts.source ? { source: opts.source } : {}),
-    ...(opts.command ? { command: opts.command } : {}),
-    ...(opts.cron ? { cron: opts.cron } : {}),
-    ...(opts.prompt ? { prompt: opts.prompt } : {}),
-    ...(opts.phase ? { phase: opts.phase } : {}),
-    ...(opts.comment ? { comment: opts.comment } : {}),
-    ...(opts.context ? { context: opts.context } : {}),
-    ...(opts.title ? { title: opts.title } : {}),
-    ...(opts.notify ? { notify: true } : {}),
-    ...(opts.note ? { note: opts.note } : {}),
-    ...(opts.pr ? { pr: opts.pr } : {}),
-    ...((opts as { arc?: string }).arc ? { arc: (opts as { arc?: string }).arc } : {}),
-    ...(opts.reusables ? { reusables: opts.reusables } : {}),
-    ...(opts.decisions ? { decisions: opts.decisions } : {}),
-    ...(opts.sub ? { sub: opts.sub } : {}),
-    ...(opts.toStage ? { stage: opts.toStage } : {}),
-    ...(opts.n !== undefined ? { n: opts.n } : {}),
-    ...(opts.generation !== undefined ? { generation: opts.generation } : {}),
-    // pipeline rerun(P4) 튜닝 인자 — 저장 프롬프트 재실행 시 모델·effort·추가지시·종류(critique|clarify).
-    ...(opts.model ? { model: opts.model } : {}),
-    ...(opts.effort ? { effort: opts.effort } : {}),
-    ...(opts.append ? { append: opts.append } : {}),
-    ...(opts.kind ? { kind: opts.kind } : {}),
-    ...(opts.full ? { full: true } : {}),
-    ...((opts as { tail?: number }).tail ? { tail: (opts as { tail?: number }).tail } : {}),
-    // briefing 용 — send(텔레그램 카드 발송)·grounded(현실 관측 on/off). send 는 boolean true 만 통과.
-    ...((opts as { send?: boolean }).send === true ? { send: true } : {}),
-    ...((opts as { grounded?: boolean }).grounded === false ? { grounded: false } : {}),
-  });
-  const isErr = !!result && typeof result === 'object' && 'error' in (result as object);
-  if (opts.json || isErr) {
-    await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
-  } else if (action === 'list' && result && typeof result === 'object' && 'missions' in result) {
-    const r = result as { missions: Array<{ id: string; goal: string; status: string; source: string; domain?: string | null; mode?: string | null }>; count?: number };
-    ui.header(`오토파일럿 미션 (${r.missions.length})`);
-    // 컬럼: status | domain(WHAT·골성격) | mode(HOW·에이전트유형·RFC 이후 채움) | source | id
-    for (const m of r.missions) console.log(`  ${m.status.padEnd(9)} ${(m.domain ?? '—').padEnd(11)} ${(m.mode ?? '—').padEnd(12)} ${m.source.padEnd(10)} ${m.id}\n            ${m.goal.slice(0, 70)}`);
-  } else if (action === 'phases' && result && typeof result === 'object' && 'phases' in result) {
-    const r = result as { missionId: string; phases: Array<{ index: number; title: string; status: string }>; note: string };
-    ui.header(`미션 페이즈 (${r.phases.length})`);
-    for (const p of r.phases) console.log(`  ${String(p.index).padStart(2)}. [${p.status}] ${p.title}`);
-    console.log(`  ${r.note}`);
-  } else if (action === 'history' && result && typeof result === 'object' && 'history' in result) {
-    const r = result as { missionId: string; currentGeneration: number; currentGoal?: string; history: Array<{ generation: number; reason: string; goal?: string; phases: Array<{ title: string; status: string; prUrl?: string }> }>; comprehensive?: Array<{ ts: string; kind: 'edit' | 'decision' | 'split' | 'drift' | 'revision' | 'external'; op: string; summary: string; provenance?: string }>; coldArchived?: boolean; lineageText?: string };
-    if (r.coldArchived) console.log('  ❄️  냉동보관 이력(행 purge 후 cold ledger 에서 복원 — self-recall 도달)');
-    ui.header(`미션 생애주기 — revision (현재 gen ${r.currentGeneration} · 보관 ${r.history.length}세대)`);
-    for (const s of r.history) {
-      console.log(`  ── gen ${s.generation} [${s.reason}]${s.goal ? ` · 골: ${s.goal.slice(0, 56)}` : ''}`);
-      s.phases.forEach((p, i) => console.log(`     ${i}. [${p.status}] ${p.title.slice(0, 48)}${p.prUrl ? ` · ${p.prUrl}` : ''}`));
-    }
-    console.log(`  ── 현재 gen ${r.currentGeneration}${r.currentGoal ? ` · 골: ${r.currentGoal.slice(0, 56)}` : ''}`);
-    // ★ 종합 히스토리(Track B·대표 2026-07-16 갭수정) — 편집/결정/분할/drift/외부(🔧 PR) 통합.
-    //   runAutopilot 가 이 뒤 process.exit 하므로 여기서 렌더(과거 history 커맨드의 post-call 블록은 dead code).
-    if (r.comprehensive && r.comprehensive.length) {
-      const { formatMissionHistory } = await import('./autopilot/mission-history.js');
-      process.stdout.write('\n' + formatMissionHistory(r.missionId, r.comprehensive) + '\n');
-    }
-    // ★ 5-way lineage(--full·H1) — Historian 통합 타임라인(시간축 교차 뷰). RFC §2a 관측 부족 수복.
-    if (r.lineageText) process.stdout.write('\n' + r.lineageText + '\n');
-  } else if (action === 'reconcile' && result && typeof result === 'object' && 'phases' in result) {
-    const r = result as { missionId: string; phaseCount: number; drifts: number; note: string; phases: Array<{ phase: string; recordedStatus: string; recordedPr: number | null; perceived: string; drift: boolean; note: string }> };
-    ui.header(`미션 self-perception — drift ${r.drifts}/${r.phaseCount} (기록 vs 현실)`);
-    for (const p of r.phases) {
-      console.log(`  ${p.drift ? '⚠️ DRIFT' : '  ✓ ok '} [${p.recordedStatus}→${p.perceived}]${p.recordedPr ? ` PR#${p.recordedPr}` : ''} ${p.phase.slice(0, 34)}`);
-      console.log(`           ${p.note.slice(0, 96)}`);
-    }
-    console.log(`  ${r.note}`);
-  } else if (action === 'revise-suggest' && result && typeof result === 'object' && 'reviseKind' in result) {
-    const r = result as { missionId: string; shouldRevise: boolean; reviseKind: string; reviseKindLabel: string; comment: string; confidence: string; rationale: string; source: string; observed: { generation: number; priorRevisions: number; driftCount: number; hasFailedPhases: boolean }; note: string };
-    ui.header(`미션 자율 revise 추천 — ${r.shouldRevise ? `${r.reviseKindLabel} (${r.confidence})` : '정정 불필요'}`);
-    console.log(`  관측: gen ${r.observed.generation} · 이전정정 ${r.observed.priorRevisions}회 · drift ${r.observed.driftCount} · 실패페이즈 ${r.observed.hasFailedPhases ? '있음' : '없음'} · source=${r.source}`);
-    if (r.shouldRevise) {
-      console.log(`\n  정정 지시(comment):\n    ${r.comment}`);
-      console.log(`\n  근거: ${r.rationale}`);
-      console.log(`\n  집행: elanous autopilot revise ${r.missionId} "${r.comment.slice(0, 40)}..."  (또는 텔레그램 원탭 승인)`);
-    } else {
-      console.log(`  ${r.rationale}`);
-    }
-  } else if ((action === 'prepare-log' || action === 'log') && result && typeof result === 'object' && 'lines' in result) {
-    const r = result as { missionId: string; lines: string[]; note: string };
-    ui.header(action === 'prepare-log' ? '재분해 진행 로그 (단계 전이)' : '미션 실행 로그');
-    for (const l of r.lines) console.log(l);
-    console.log(`  ${r.note}`);
-  } else if (action === 'pipeline' && result && typeof result === 'object' && 'exists' in result) {
-    const r = result as {
-      missionId: string; exists: boolean; note?: string; frameCount?: number;
-      current?: string | null; currentStatus?: string | null; statuses?: Record<string, string>;
-      stuck?: string[]; superseded?: string[]; incomplete?: string[]; healable?: boolean; recommendation?: string;
-      frames?: Array<{ seq: number; stage: string; status: string; op: string; at: string; supersededBy?: number; hasLlm: boolean }>;
-    };
-    const rr = result as { mode?: string; generation?: number; replayed?: string[]; skipped?: string[]; stoppedAt?: string; resultStages?: string[]; decisions?: Record<string, unknown>; note?: string };
-    if (!r.exists) { console.log(r.note ?? '파이프라인 프레임 없음'); }
-    else if (rr.mode === 'replay') {
-      // replay — 저장 출력 재생(결정론·집행 0)
-      ui.header(`파이프라인 리플레이 — ${rr.replayed?.length ?? 0}단계 재생(LLM 0)${rr.generation !== undefined ? ` · gen ${rr.generation}` : ''}`);
-      console.log(`  재생: ${(rr.replayed ?? []).join(' → ') || '-'}`);
-      if (rr.skipped?.length) console.log(`  skip: ${rr.skipped.join(',')} (superseded/failed)`);
-      console.log(`  재구성 결과: ${(rr.resultStages ?? []).join(',') || '-'}${rr.stoppedAt ? ` · ${rr.stoppedAt} 까지` : ''}`);
-      console.log(`  decisions: ${JSON.stringify(rr.decisions ?? {})}`);
-    }
-    else if (rr.mode === 'rewind' || rr.mode === 'goto') {
-      // rewind/goto — 되감기(셀프힐·이후 supersede)
-      const g = result as { targetStage?: string; targetSeq?: number; superseded?: number; note?: string };
-      ui.header(`파이프라인 ${rr.mode === 'rewind' ? '되감기' : 'goto'} — → ${g.targetStage ?? '(?)'}`);
-      console.log(`  타겟: ${g.targetStage} (seq ${g.targetSeq}) · 이후 ${g.superseded ?? 0}프레임 무효화(superseded·MESI I)`);
-      console.log(`  ${g.note ?? ''}`);
-      console.log(`  다음: pipeline status 로 재확인 · 재실행은 rerun(P4)`);
-    }
-    else if (rr.mode === 'rerun') {
-      // rerun(P4) — 저장 프롬프트 재실행(모델·effort·추가지시 튜닝) · old vs new 비교
-      const rp = result as unknown as { kind?: string; phase?: string; model?: string; effort?: string; appended?: boolean;
-        oldVerdict?: string; newVerdict?: string; changed?: boolean; oldSeverity?: string; newSeverity?: string;
-        newReason?: string; newConcerns?: string[]; newSuggestion?: string; oldResponse?: string; newResponse?: string; note?: string };
-      ui.header(`파이프라인 rerun(P4) — ${rp.kind} '${rp.phase ?? ''}' · ${rp.model} effort ${rp.effort}${rp.appended ? ' ·추가지시' : ''}`);
-      if (rp.kind === 'critique') {
-        console.log(`  verdict: ${rp.oldVerdict} → ${rp.newVerdict}${rp.changed ? '  ★변화' : '  (동일)'} · severity ${rp.oldSeverity}→${rp.newSeverity}`);
-        if (rp.newReason) console.log(`  새 근거: ${rp.newReason}`);
-        if (rp.newConcerns?.length) console.log(`  관심사: ${rp.newConcerns.join(' + ')}`);
-        if (rp.newSuggestion) console.log(`  제안: ${rp.newSuggestion}`);
-      }
-      console.log(`\n  ── old 응답(앞 800) ──\n${(rp.oldResponse ?? '').slice(0, 800)}`);
-      console.log(`\n  ── new 응답(앞 1500) ──\n${(rp.newResponse ?? '').slice(0, 1500)}`);
-      console.log(`\n  ${rp.note ?? ''}`);
-    }
-    else if (rr.mode === 'critique') {
-      // critique 트레이스 목록 — sol 입출력·오탐 진단
-      const ct = result as unknown as { count: number; round?: string; model?: string; traces: Array<{ phaseId: string; title: string; verdict: string; existsCount: number; total: number; dropped: number; groundConfidence: string; model: string; promptChars: number; responseChars: number }> };
-      ui.header(`critique 트레이스 — ${ct.count} 페이즈 · 모델 ${ct.model ?? '?'} (최신 라운드·오탐 진단)`);
-      for (const t of ct.traces) {
-        const flag = t.verdict === 'ungrounded' && t.existsCount > 0 ? '  ⚠️[실존인데ungrounded]' : '';
-        console.log(`  [${t.verdict.padEnd(15)}] 실존 ${t.existsCount}/${t.total}${t.dropped ? ` drop${t.dropped}` : ''} · gr ${t.groundConfidence} · ${t.model} ${t.promptChars}→${t.responseChars}자 · ${t.title.slice(0, 30)}${flag}`);
-      }
-      console.log(`\n  ⚠️ = LLM 이 [실존] 실측을 받고도 ungrounded(LLM 층 오탐). 원문: --sub critique --phase <제목일부>`);
-    }
-    else if (rr.mode === 'critique-detail') {
-      // critique 원문 — sol 이 받은 실존맵 + 프롬프트 + 응답(왜 무시했나)
-      const d = result as unknown as { phase?: { title?: string; verdict?: string; reuseMap?: string }; sidecar?: { prompt: string; response: string } };
-      ui.header(`critique 원문 — ${d.phase?.title ?? ''} [${d.phase?.verdict ?? ''}]`);
-      console.log(`\n  ── sol 이 받은 실존맵(실측) ──\n${(d.phase?.reuseMap || '(없음)').split('\n').map((l) => '    ' + l).join('\n')}`);
-      if (d.sidecar) {
-        console.log(`\n  ── sol 프롬프트(${d.sidecar.prompt.length}자·앞 3000) ──\n${d.sidecar.prompt.slice(0, 3000)}`);
-        console.log(`\n  ── sol 응답 원문(파싱 前) ──\n${d.sidecar.response.slice(0, 2000)}`);
-      } else console.log('\n  (원문 sidecar 없음)');
-    }
-    else if (rr.mode === 'clarify') {
-      // clarify 트레이스 목록 — sol 입출력·비결정성 진단(왜 범위 0개인가)
-      const cl = result as unknown as { count: number; traces: Array<{ phase: string; count: number; kinds: string[]; heavy: boolean; fallback: boolean; promptChars: number; responseChars: number }> };
-      ui.header(`clarify 트레이스 — ${cl.count} 판정 (sol 입출력·비결정성 진단)`);
-      for (const t of cl.traces) {
-        const flag = t.count === 0 ? '  (clear·범위 명확)' : t.fallback ? '  ⚠️[fallback 강제·A]' : '';
-        console.log(`  [${t.phase.padEnd(6)}] 질문 ${t.count} (${t.kinds.join(',') || '-'}) · heavy ${t.heavy} · sol ${t.promptChars}→${t.responseChars}자${flag}`);
-      }
-      console.log(`\n  원문(왜 이 판정): --sub clarify --phase scope|arc`);
-    }
-    else if (rr.mode === 'clarify-detail') {
-      // clarify 원문 — sol 이 범위/아크를 어떻게 판정했나(비결정성 진단)
-      const cd = result as unknown as { clarifyPhase?: { phase?: string; count?: number; kinds?: string[] }; sidecar?: { prompt: string; response: string } };
-      ui.header(`clarify 원문 — ${cd.clarifyPhase?.phase ?? ''} (질문 ${cd.clarifyPhase?.count ?? 0})`);
-      if (cd.sidecar) {
-        console.log(`\n  ── sol 프롬프트(${cd.sidecar.prompt.length}자·앞 3000) ──\n${cd.sidecar.prompt.slice(0, 3000)}`);
-        console.log(`\n  ── sol 응답 원문(파싱 前) ──\n${cd.sidecar.response.slice(0, 2000)}`);
-      } else console.log('\n  (원문 sidecar 없음)');
-    }
-    else if (rr.mode === 'exec-rewind') {
-      // exec-rewind/exec-goto — 실행 프레임 되감기(P5·셀프힐·이후 supersededBy)
-      const er = result as unknown as { sub?: string; targetPhase?: string; targetSeq?: number; superseded?: number; note?: string };
-      ui.header(`실행 되감기 — ${er.sub} → ${er.targetPhase ?? '(?)'}`);
-      console.log(`  타겟: ${er.targetPhase} (seq ${er.targetSeq}) · 이후 ${er.superseded ?? 0}프레임 무효화(supersededBy)`);
-      console.log(`  ${er.note ?? ''}`);
-      console.log(`  다음: pipeline --sub thread 로 재확인 · 재실행은 미션 재개(resume)`);
-    }
-    else if (rr.mode === 'coordinator') {
-      // coordinator — P0~P2 통합 단일 관측(thread 요약 + 채널 version + Progress Ledger)
-      const co = result as unknown as {
-        summary?: { buildFrames: number; execFrames: number; transitioned: boolean; orphanPendingWrites: number; current?: { layer: string; label: string; status: string } | null; channelVersions?: Record<string, number> };
-        ledger?: { satisfied: boolean; progressBeingMade: boolean; inLoop: boolean; stalled: boolean; stallCount: number; recommendation: string; rationale: string };
-      };
-      const s = co.summary; const lg = co.ledger;
-      ui.header(`조율자 단일 관측 — build ${s?.buildFrames ?? 0} · exec ${s?.execFrames ?? 0}${s?.transitioned ? ' · 실행✓' : ''}`);
-      if (s?.current) console.log(`  현재 위치: [${s.current.layer}] ${s.current.label} [${s.current.status}]`);
-      if (lg) {
-        const icon = lg.recommendation === 'done' ? '✅' : lg.recommendation === 'replan' ? '♻️' : lg.recommendation === 'escalate' ? '🚨' : '▶️';
-        console.log(`\n  ${icon} Progress Ledger → ${lg.recommendation.toUpperCase()}`);
-        console.log(`     satisfied=${lg.satisfied} · progress=${lg.progressBeingMade} · inLoop=${lg.inLoop} · stall=${lg.stallCount}`);
-        console.log(`     ${lg.rationale}`);
-      }
-      if (s?.orphanPendingWrites) console.log(`\n  ♻️  미종결 pending-write(고아 후보): ${s.orphanPendingWrites}건`);
-      const cv = s?.channelVersions ?? {};
-      if (Object.keys(cv).length) console.log(`  📊 채널 version: ${Object.entries(cv).map(([c, v]) => `${c}=${v}`).join(' · ')}`);
-      console.log(`\n  전과정 단일 관측(P0 thread+channel_versions · P2 ledger) — mission.coordinator.* 로그.`);
-    }
-    else if (rr.mode === 'thread') {
-      // thread — build+exec 통합 단일 thread(조율자 전컨텍스트·단일관측·P0 조각2)
-      const th = result as unknown as {
-        summary?: { buildFrames: number; execFrames: number; transitioned: boolean; orphanPendingWrites: number; current?: { layer: string; label: string; status: string } | null; channelVersions?: Record<string, number> };
-        thread?: Array<{ layer: string; seq: number; at: string; label: string; op: string; status: string; supersededBy?: number; artifacts?: string[]; arcName?: string; arcSeq?: string }>;
-      };
-      const s = th.summary;
-      ui.header(`미션 thread(통합) — build ${s?.buildFrames ?? 0} · exec ${s?.execFrames ?? 0} 프레임${s?.transitioned ? ' · 실행 전이✓' : ''}`);
-      if (s?.current) console.log(`  현재: [${s.current.layer}] ${s.current.label} [${s.current.status}]`);
-      if (s?.orphanPendingWrites) console.log(`  ♻️  미종결 pending-write(고아 후보): ${s.orphanPendingWrites}건`);
-      const cv = s?.channelVersions ?? {};
-      if (Object.keys(cv).length) console.log(`  📊 채널 version: ${Object.entries(cv).map(([c, v]) => `${c}=${v}`).join(' · ')}`);
-      console.log('');
-      for (const e of th.thread ?? []) {
-        const tag = e.layer === 'build' ? '🏗 build' : '⚙ exec ';
-        const arc = e.arcName ? ` 〔${e.arcSeq ?? ''} ${e.arcName}〕` : '';
-        const art = e.artifacts?.length ? ` 📎${e.artifacts.length}` : '';
-        const sup = e.supersededBy !== undefined ? ` ⟲→${e.supersededBy}` : '';
-        console.log(`  ${tag} #${String(e.seq).padStart(2)} [${e.status.padEnd(9)}] ${e.label.slice(0, 28).padEnd(28)} ${e.op}${arc}${art}${sup}`);
-      }
-      console.log(`\n  단일 thread(checkpoint_ns build·exec) — 조율자 전컨텍스트/단일관측(RFC ①②).`);
-    }
-    else if (r.frames) {
-      // stack — 프레임 목록(관측)
-      ui.header(`파이프라인 스택 — ${r.frameCount} 프레임`);
-      for (const f of r.frames) {
-        console.log(`  #${String(f.seq).padStart(2)} [${f.status.padEnd(10)}] ${f.stage.padEnd(11)} ${f.op}${f.supersededBy !== undefined ? ` ⟲superseded→${f.supersededBy}` : ''}${f.hasLlm ? ' 📎llm' : ''}`);
-      }
-    } else {
-      // status — 단계 ENUM 현재위치 + 자기인지 진단
-      ui.header(`파이프라인 STATUS — 현재: ${r.current ?? '(없음)'} [${r.currentStatus ?? '-'}]`);
-      for (const [stage, status] of Object.entries(r.statuses ?? {})) console.log(`  ${stage.padEnd(12)} ${status}`);
-      console.log(`\n  자기인지 — stuck=${(r.stuck ?? []).join(',') || '-'} · superseded=${(r.superseded ?? []).join(',') || '-'} · 미완=${(r.incomplete ?? []).join(',') || '-'}`);
-      console.log(`  ${r.healable ? '🔧 셀프힐 가능' : '✓ 정상'} — ${r.recommendation ?? ''}`);
-    }
-  } else {
-    await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
-  }
-  process.exit(isErr ? 1 : 0);
-}
-
-autopilotCmd.command('list').description('미션 목록(+헬스 롤업)').option('--status <s>', 'proposed|armed|running|done|failed|disarmed').option('--source <s>', 'human-intent|discovery|repo-watch|manual').option('--json')
-  .action((o: AutopilotOpts) => runAutopilot('list', o));
-autopilotCmd.command('threads').description('★조율자 상주 thread authority(UR4a) — 데몬이 인지하는 살아있는 미션 thread 뷰(disk-discovery·READ-ONLY). 활성도 + 중앙 State(progress/cursor) 요약. Option B 상주 조율자의 인지 관문.').option('--active', '활성(기본 60분 내 갱신) thread 만').option('--within <min>', '활성 판정 시간창(분·기본 60)').option('--json')
-  .action((o: AutopilotOpts) => runAutopilot('threads', o));
-autopilotCmd.command('trace <id>').description('미션 계보 트리(파생 크론/태스크/자율행동 live 상태)').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('trace', { ...o, id }));
-autopilotCmd.command('resources <id>').aliases(['res']).description('★미션 자원 원장 — 미션이 만든 살아있는 자원(태스크·크론)을 미션ID로 역추적·링크. PR은 부가정보(관리 아님). 삭제/수정은 elanous schedule/task CRUD로 라우팅.').option('--json')
-  .action(async (id: string, o: { json?: boolean }) => {
-    const { missionResources } = await import('./autopilot/mission-resources.js');
-    const led = missionResources(id);
-    if (o.json) { await writeStdoutJson(JSON.stringify(led, null, 2) + '\n'); return; }
-    ui.header(`미션 자원 원장 — ${id.slice(0, 52)}`);
-    console.log(`\n▸ 태스크 ${led.tasks.length}  (CRUD: elanous autopilot / task)`);
-    for (const t of led.tasks) console.log(`  [${t.status}] ${t.title.slice(0, 52)}${t.prUrl ? `  · ${t.prUrl.replace(/.*\/pull\//, 'PR#')}` : ''}`);
-    console.log(`\n▸ 크론 ${led.crons.length}  (CRUD: elanous schedule update/release <id>)`);
-    for (const c of led.crons) console.log(`  ${c.enabled ? '●' : '○'} ${c.id} · ${c.cron ?? '-'} · ${(c.command ?? '').replace(/^cd .*&& /, '').slice(0, 44)}`);
-    console.log(`\n▸ 루프 에이전트 ${led.loopAgents.length}  (반복 실행 주체 · CRUD: EnterAutoMode off · 크론 release)`);
-    for (const l of led.loopAgents) console.log(`  ◆ ${l.loopKind}/${l.lifecycle} · ${l.name.slice(0, 40)}${l.ttlMin ? ` (TTL ${l.ttlMin}m)` : ''}${l.scheduleIds.length ? ` · 크론 ${l.scheduleIds.join(',')}` : ''}`);
-    if (led.prRefs.length) { console.log(`\n▸ PR (부가정보·provenance)`); for (const p of led.prRefs) console.log(`  ${p}`); }
-    if (!led.tasks.length && !led.crons.length && !led.loopAgents.length) console.log('  (이 미션의 살아있는 자원 없음)');
-  });
-autopilotCmd.command('approve <id>').description('★HITL 승인·실행 — 텔레그램/PWA 승인 버튼의 CLI 파리티. task 미션=backlog 페이즈 스테이징+run-mission 실집행 · scheduler 미션=반복 예약 배선. 미션 running').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('approve', { ...o, id }));
-autopilotCmd.command('arm <id>').description('승인 — materialize spec 저장(실행 안 함·HITL)').option('--command <c>').option('--cron <expr>').option('--prompt <p>').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('arm', { ...o, id }));
-autopilotCmd.command('materialize <id>').description('구체화 — 실제 cron 생성(command 명시 필수·HITL)').option('--command <c>').option('--cron <expr>').option('--prompt <p>').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('materialize', { ...o, id }));
-autopilotCmd.command('cancel <id>').description('미션 종료(파생 잡 release)').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('cancel', { ...o, id }));
-autopilotCmd.command('history <id>').description('미션 생애주기 — revision 타임라인 + 종합 편집/결정/분할/외부(🔧 PR) 히스토리(Track B)').option('--full', '5-way lineage 통합 타임라인(세대아카이브·워킹메모리·빌드/실행프레임·캐시)').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('history', { ...o, id }));
-autopilotCmd.command('pipeline <id>').description('★파이프라인 프레임 상태머신·시간여행·critique관측 — 빌드 단계(ENUM) 관측/자기인지/되감기를 미션ID로. sub=status(기본)|stack|thread(build+exec 통합 단일 thread·조율자 전컨텍스트)|replay(재생·LLM0)|rewind(N단계 전·--n)|goto(그 단계로·--to-stage)|critique(sol 입출력·오탐 진단·--phase 로 원문)|rerun(P4·저장 프롬프트 재실행·--model/--effort/--append 튜닝). rewind/goto=셀프힐.').option('--sub <s>', 'status(기본)|stack|thread(build+exec 통합)|coordinator(전과정 단일관측+Progress Ledger)|state(중앙 MissionState read-through 조립·통합런타임 UR0)|replay|rewind|goto|build-rerun(P4·그 단계부터 LLM 재구동·--to-stage)|build-fresh(진짜 처음부터·캐시무효+clarify 재발동)|exec-rewind|exec-goto(실행 프레임 되감기·P5)|critique|clarify|rerun').option('--persist', 'state: 조립 snapshot 을 <id>.state.json 으로 저장(체크포인터 seed)').option('--to-stage <s>', 'replay/goto 대상 단계').option('--n <k>', 'rewind 되감을 단계 수(기본 1)').option('--generation <g>', 'replay/rewind/goto 대상 rerun 세대(기본=최신·H6 세대 인지)').option('--phase <p>', 'critique/rerun 페이즈(제목 일부) 또는 clarify 단계(scope|arc)').option('--kind <k>', 'rerun 종류 critique(기본)|clarify').option('--model <m>', 'rerun 재실행 모델(기본=저장 모델)').option('--effort <e>', 'rerun reasoning effort low|medium|high').option('--append <t>', 'rerun 프롬프트 끝에 덧붙일 추가 지시(튜닝)').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('pipeline', { ...o, id }));
-  // ★ 종합 히스토리(Track B)는 runAutopilot 의 history 렌더러에서 exit 전에 출력(과거 여기 post-call 블록은
-  //   runAutopilot 의 process.exit 로 dead code 였음 — 대표 2026-07-16 갭수정으로 렌더러 안으로 이동).
-autopilotCmd.command('briefing <id>').aliases(['brief']).description('★미션 최종 브리핑(실집행 전 종합 점검) — 골 진화(최초/중간/최종)+여정(편집·분할·결정)+산출물 grounded 점검(PR merge·main deliverable 실존)+정착 상태를 종합. --send 면 텔레그램 카드[승인/재조치/보류] 발송').option('--send', '텔레그램 브리핑 카드 발송(발신 origin)').option('--no-grounded', '현실 관측(reconcile·gh/git) 생략·title 휴리스틱만(빠름)').option('--json')
-  .action(async (id: string, o: { send?: boolean; grounded?: boolean; json?: boolean }) => {
-    if (o.send) { await runAutopilot('briefing', { id, send: true, ...(o.grounded === false ? { grounded: false } : {}) } as AutopilotOpts); return; }
-    const { buildLiveMissionBriefing } = await import('./autopilot/mission-briefing-live.js');
-    const { formatBriefingSummary, formatBriefingReport } = await import('./autopilot/mission-briefing.js');
-    const b = buildLiveMissionBriefing(id, { grounded: o.grounded !== false });
-    if (o.json) { await writeStdoutJson(JSON.stringify(b, null, 2) + '\n'); return; }
-    ui.header(`미션 최종 브리핑 — ${id.slice(0, 52)}`);
-    process.stdout.write('\n' + formatBriefingSummary(b) + '\n\n' + formatBriefingReport(b) + '\n');
-  });
-autopilotCmd.command('landing <id>').aliases(['land']).description('★랜딩 빠른 스캔 — 기록 PR merge 상태만 1회 gh 배치(git 고고학 없음·수초). 완주/arming 전 "미머지 있나?" 즉답. ⛔ open PR=확정 미머지(완주 차단) · ⚠️ closed=대체 랜딩 확인 권장(→ briefing grounded)').option('--json')
-  .action(async (id: string, o: { json?: boolean }) => {
-    const { scanMissionLanding, formatLandingScanReport } = await import('./autopilot/mission-landing-scan.js');
-    const scan = scanMissionLanding(id);
-    if (o.json) { await writeStdoutJson(JSON.stringify(scan, null, 2) + '\n'); return; }
-    ui.header(`미션 랜딩 스캔 — ${id.slice(0, 52)}`);
-    process.stdout.write('\n' + formatLandingScanReport(scan) + '\n');
-    if (scan.blocking > 0) process.exitCode = 2; // 미머지 있으면 non-zero(완주 게이트 스크립트용).
-  });
-autopilotCmd.command('reconcile <id>').description('★self-perception — 각 페이즈의 기록(상태·PR) vs 현실(git/PR/main)을 미션이 스스로 관측해 drift 감지·자기 형상 재인지(self-memory 에 provenance=reconcile self-write)').option('--notify', '재인지 결과를 텔레그램(발신 origin)으로 다시 통지').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('reconcile', { ...o, id }));
-autopilotCmd.command('inject <id>').description('★외부 가이드/수습 주입(방향 A) — 재사용맵·교정·페이즈 상태(done)·머지PR을 미션에 정식 주입(provenance=external·self-memory 안 해침)')
-  .option('--phase <p>', '대상 페이즈 index 또는 task id(선택)').option('--status <s>', '페이즈 새 상태(예: done)').option('--pr <n>', '외부 머지 PR 번호(링크)').option('--note <t>', '가이드/수습 내용').option('--reusables <csv>', '재사용 경계(; 구분)').option('--decisions <csv>', '결정(; 구분)').option('--json')
-  .option('--arc <name>', '★외부 아크 수습(대표 2026-07-16) — 외부가 아크 통합을 미션 밖(main 머지)에서 완성했을 때 그 아크(arcId·name·index)를 done+verified 로 정식 처리(provenance=external·후속 배리어 해제). --note 로 근거')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('inject', { ...o, id }));
-autopilotCmd.command('check <id> <phase>').description('★HITL 확인 패스 — 카나리 등 사람이 도착/결과를 눈으로 확인해야 하는 페이즈를 done 처리(에이전트 검증 불가 항목)').option('--json')
-  .action((id: string, phase: string, o: AutopilotOpts) => runAutopilot('check', { ...o, id, phase }));
-autopilotCmd.command('escalate <id> <phase>').description('★시스템 셀프힐링 — 진단이 escalate 권장한 실패 페이즈(R2 시스템 결함 의심)를 R3 Opus 룩백 후 system-repair 수리 미션으로 스폰(Opus 강제·분해→HITL). merge+데몬 재시작은 HITL').option('--json')
-  .action((id: string, phase: string, o: AutopilotOpts) => runAutopilot('escalate', { ...o, id, phase }));
-autopilotCmd.command('prepare-log <id>').description('★재분해 진행 관측 — se-mission-prepare 단계 전이(준비→조사→grounding→중복체크→분해)를 tail 로 본다("ING만" 해소)').option('--tail <n>', '마지막 N줄(기본 40)').option('--json')
-  .action((id: string, o: AutopilotOpts & { tail?: string }) => runAutopilot('prepare-log', { ...o, id, ...(o.tail ? { tail: Number(o.tail) } : {}) }));
-autopilotCmd.command('decompose-crash [id]').description('★분해 실패 근본조사 — decompose_crash.log(code·validationErrors·rawText 원문·컨텍스트) 조회. id 지정 시 해당 미션만. elanous logs(요약) 너머 전문 진단(스키마 위반 정확한 필드).').option('--limit <n>', '최근 N건(기본 3)').option('--json')
-  .action(async (id: string | undefined, o: { limit?: string; json?: boolean }) => {
-    const { readDecomposeCrashLog, formatCrashEntry } = await import('./autopilot/decompose-crash-log.js');
-    const entries = readDecomposeCrashLog({ ...(id ? { missionId: id } : {}), limit: o.limit ? Number(o.limit) : 3 });
-    if (o.json) { await writeStdoutJson(JSON.stringify(entries, null, 2) + '\n'); return; }
-    if (!entries.length) { console.log(`분해 크래시 기록 없음${id ? ` (미션 ${id})` : ''}`); return; }
-    console.log(entries.map(formatCrashEntry).join('\n\n'));
-  });
-autopilotCmd.command('decompose-stream <id>').description('★분해 스트리밍 실시간 관측 — decompose(sol 리즈닝) 출력을 미션별 임시 파일에서 조회. 분해 중에도 "지금 뭘 쓰는지"를 본다(블랙박스 해소). --follow 로 실시간 tail.').option('--tail <n>', '마지막 N자(기본 전체)').option('-f, --follow', '실시간 tail(2초 폴링·Ctrl-C 종료)')
-  .action(async (id: string, o: { tail?: string; follow?: boolean }) => {
-    const { readDecomposeStream, decomposeStreamPath } = await import('./autopilot/mission-decompose-stream.js');
-    const tailChars = o.tail ? Number(o.tail) : undefined;
-    const render = () => { const r = readDecomposeStream(id, tailChars ? { tailChars } : {}); return r.exists ? `${r.content}\n[${r.chars}자 · ${r.mtime}]` : `분해 스트림 없음 (${decomposeStreamPath(id)})`; };
-    if (!o.follow) { console.log(render()); return; }
-    let prev = ''; console.error('실시간 tail (Ctrl-C 종료)…');
-    for (;;) { const cur = render(); if (cur !== prev) { console.clear(); console.log(cur); prev = cur; } await new Promise((r) => setTimeout(r, 2000)); }
-  });
-autopilotCmd.command('promote <id>').description('★테스트→운영 캐스케이드(ISO 상향) — 격리 테스트에서 셋업/분해한 미션+플랜(+태스크)을 운영 스토어로 이관. proposed 로 착지(arm/materialize 는 운영 HITL). origin(notify)/이력/cron 스트립·config promote 동형. dry-run 기본')
-  .option('--from <dir>', '소스 테스트 state 루트(기본 <repo>/.elanous-test)').option('--repo <path>', '레포 루트 override').option('--with-tasks', '파생 태스크도 이관').option('--yes', '적용(기본 dry-run)')
-  .action(async (id: string, o: { from?: string; repo?: string; withTasks?: boolean; yes?: boolean }) => {
-    const { runMissionPromote } = await import('./cli/mission-promote-cli.js');
-    process.exit(runMissionPromote(id, o));
-  });
-autopilotCmd.command('freshness').description('★신선도 재게이트(2차 안전망) — 현 브랜치 base(또는 --base) 산출 파일이 origin/main 대비 stale 한지 재검증. 거리>0 자체는 stale 아님(파일 겹침 기준·sub8 교훈). fresh=통과·stale=rebase+rebuild 필요')
-  .option('--base <sha>', 'base SHA(미지정=merge-base HEAD origin/main)')
-  .option('--files <csv>', '검사할 파일(쉼표·미지정=base..HEAD 변경 파일)')
-  .option('--no-fetch', 'origin main fetch 생략(기본은 fetch 선행·stale ref 방지)')
-  .action(async (o: { base?: string; files?: string; fetch?: boolean }) => {
-    const { regateCurrentBranch } = await import('./autopilot/freshness-regate.js');
-    const files = typeof o.files === 'string' && o.files.trim() ? o.files.split(',').map((s) => s.trim()).filter(Boolean) : undefined;
-    const v = regateCurrentBranch({ ...(o.base ? { baseSha: o.base } : {}), ...(files ? { phaseFiles: files } : {}), fetchFirst: o.fetch !== false });
-    await writeStdoutJson(JSON.stringify({ fresh: v.fresh, baseSha: v.baseSha.slice(0, 10), mainSha: v.mainSha.slice(0, 10), distance: v.distance, staleFiles: v.staleFiles, reason: v.reason }, null, 2) + '\n');
-    if (!v.fresh) process.exitCode = 2; // 스크립트 게이트용(stale 이면 non-zero).
-  });
-autopilotCmd.command('restart-daemon').description('★시스템 셀프힐 — 수리 merge 후 환경별 데몬 재시작(reboot-adjacent). 기본 dry-run(계획만)·--execute 로 실제 실행(HITL·operator 승인)')
-  .option('--env <e>', 'production|test (미지정=자동 감지)')
-  .option('--execute', '실제 재시작(HITL·operator 가 직접 실행=승인). 미지정=dry-run 계획만')
-  .option('--force', '교차오염 가드 우회(요청 env != 감지 env 강제·명시적일 때만)')
-  .action(async (o: { env?: string; execute?: boolean; force?: boolean }) => {
-    const { restartDaemon } = await import('./autopilot/daemon-control.js');
-    const env = o.env === 'test' ? 'test' as const : o.env === 'production' ? 'production' as const : undefined;
-    // operator 가 --execute 를 직접 침 = HITL 승인(authorized). config 오염 사건 교훈: 자율 실행 아님.
-    const r = await restartDaemon({ ...(env ? { env } : {}), execute: !!o.execute, authorized: !!o.execute, forceEnvMismatch: !!o.force });
-    await writeStdoutJson(JSON.stringify({ env: r.plan.env, command: r.plan.command.join(' '), description: r.plan.description, executed: r.executed, ok: r.ok, detectedEnv: r.detectedEnv, ...(r.reason ? { reason: r.reason } : {}) }, null, 2) + '\n');
-  });
-autopilotCmd.command('add-phase <id> <title...>').description('안착 미션에 페이즈 추가(revision 스냅샷·backlog 스택)').option('--prompt <p>').option('--json')
-  .action((id: string, title: string[], o: AutopilotOpts) => runAutopilot('add-phase', { ...o, id, title: title.join(' ') }));
-autopilotCmd.command('pause <id>').description('미션 일시정지 — 다음 페이즈 전 중단(상태 보존·캐스케이드 컨트롤)').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('pause', { ...o, id }));
-autopilotCmd.command('resume <id>').description('미션 재개 — paused 해제 + 재실행(남은 페이즈 집행)').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('resume', { ...o, id }));
-// ★ 시스템 수리 미션 opt-in(대표 2026-07-13) — 대표가 명시 등재한 미션만 IMMUTABLE_CORE
-//   (매매/arming/safety/재부팅) 수정 예외(worktree·PR 까지 · merge 는 여전히 HITL). fail-closed.
-autopilotCmd.command('system-repair <action> [id]')
-  .description('시스템 수리 미션 예외 — IMMUTABLE_CORE 수정 허용 등재(merge HITL). authorize|revoke|list')
-  .action(async (action: string, id: string | undefined) => {
-    const sr = await import('./autopilot/system-repair.js');
-    if (action === 'list') { const l = sr.listSystemRepairAuthorized(); console.log(l.length ? l.join('\n') : '(등재 없음)'); return; }
-    if (!id) { console.error('id 필요: autopilot system-repair authorize|revoke <missionId>'); process.exit(1); }
-    if (action === 'authorize') { sr.authorizeSystemRepair(id); console.log(`✅ 시스템 수리 예외 등재: ${id}\n   IMMUTABLE_CORE 수정 허용(worktree·PR). merge 는 여전히 HITL(대표 확인).`); }
-    else if (action === 'revoke') { sr.revokeSystemRepair(id); console.log(`🔒 시스템 수리 예외 해제: ${id}`); }
-    else { console.error('action: authorize | revoke | list'); process.exit(1); }
-  });
-// ★ 페이즈 레벨 읽기/힐(P2 · 2026-07-13) — 텔레그램 버튼 전용이던 3층 탈출구를 CLI 에도 개방
-//   (외부 opus/codex 가 진단[ops mission] 후 권장 힐을 실행하는 경로). 동일 dispatch 단일 창구.
-autopilotCmd.command('phases <id>').description('멀티페이즈 플랜 목록(index·status — trim/defer/rebuild/split/skip 대상 확인)').option('--json')
-  .action((id: string, o: AutopilotOpts) => runAutopilot('phases', { ...o, id }));
-autopilotCmd.command('rebuild <id> <phase>').description('특정 페이즈부터 재구현(후속 리셋·앞 성공 보존)').option('--json')
-  .action((id: string, phase: string, o: AutopilotOpts) => runAutopilot('rebuild', { ...o, id, phase }));
-autopilotCmd.command('split <id> <phase>').description('실패 페이즈를 단일책임 서브페이즈로 국소 재분해(과대 페이즈 탈출구)').option('--json')
-  .action((id: string, phase: string, o: AutopilotOpts) => runAutopilot('split', { ...o, id, phase }));
-autopilotCmd.command('skip <id> <phase>').description('페이즈 건너뛰기(기능 제외·후속 언블록·부분 완주)').option('--json')
-  .action((id: string, phase: string, o: AutopilotOpts) => runAutopilot('skip', { ...o, id, phase }));
-autopilotCmd.command('revise <id> [comment...]').description('골 정정·재분해(실패 컨텍스트 자동 포함 — 예: "범위축소: X 제외"). --pr 로 PR 내용·연관 RFC 를 자동으로 읽어 재분해(comment 생략 가능)').option('--json')
-  .option('--pr <n>', 'PR 번호(들·쉼표구분·예 "4306,4307") — 시스템이 스스로 PR 제목·본문·변경파일·연관 RFC/PLAN 을 읽어 정정 맥락에 합류')
-  .action((id: string, comment: string[], o: AutopilotOpts) => runAutopilot('revise', { ...o, id, ...(comment.length ? { comment: comment.join(' ') } : {}) }));
-autopilotCmd.command('revise-suggest <id> [context...]').description('★미션 자율 revise 추천 — 관측+맥락으로 정정 comment 를 LLM 자동 생성(READ-ONLY·트리거 안 함). --pr 로 PR 자동 인지').option('--json')
-  .option('--pr <n>', 'PR 번호(들·쉼표구분) — PR 내용·연관 RFC 를 자동으로 읽어 정정 맥락에 합류(PR 던지면 알아서 분해 추천)')
-  .action((id: string, context: string[], o: AutopilotOpts) => runAutopilot('revise-suggest', { ...o, id, ...(context.length ? { context: context.join(' ') } : {}) }));
-
-// ── 아크 구조 편집(E2·E3 · PLAN-arc-phase-lifecycle-editing-2026-07-15) ──
-//   아크 사이즈 오판 비파괴 교정 — 중간 삽입(카빙)·순서 재배치. revise(전체 재분해) 회피.
-autopilotCmd.command('insert-arc <id> <name...>')
-  .description('★아크 중간 삽입 — --after 아크 뒤에 새 아크를 끼우고 --phases 를 카빙(배리어 재배선·예산 재산정)')
-  .requiredOption('--after <arc>', '앵커 아크(핸들 A1.. 또는 arcId)')
-  .requiredOption('--phases <refs>', '새 아크로 옮길 페이즈(쉼표구분·1-based 순번 또는 task hash4)')
-  .option('--intent <t>', '아크 의도(1~2문장)')
-  .option('--json')
-  .action(async (id: string, name: string[], o: { after: string; phases: string; intent?: string; json?: boolean }) => {
-    const { insertArcIntoMission } = await import('./autopilot/mission-lifecycle.js');
-    const r = insertArcIntoMission(id, { afterArc: o.after, name: name.join(' '), phaseHandles: o.phases.split(','), ...(o.intent ? { intent: o.intent } : {}) });
-    if (o.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); return; }
-    if (!r.ok) { process.stderr.write(`insert-arc 실패: ${r.error}\n`); process.exit(1); }
-    process.stdout.write(`⬡ 아크 삽입: "${r.arcName}" (${r.arcId})\n   페이즈 ${r.movedPhases}개 카빙 · 예산 델타 ${(r.budgetDelta ?? 0) >= 0 ? '+' : ''}$${(r.budgetDelta ?? 0).toFixed(2)} · 총 $${(r.totalBudget ?? 0).toFixed(2)}\n   → resume/rerun 으로 재편성된 아크 순회.\n`);
-  });
-autopilotCmd.command('reorder-arc <id> <arc> <newIdx>')
-  .description('★아크 순서 재배치 — 아크를 위치 newIdx(0-based) 로 이동(핸들 A<ord> 순번 갱신·의존 불변)')
-  .option('--json')
-  .action(async (id: string, arc: string, newIdx: string, o: { json?: boolean }) => {
-    const { reorderArcInMission } = await import('./autopilot/mission-lifecycle.js');
-    const r = reorderArcInMission(id, { arcRef: arc, newIdx: Number(newIdx) });
-    if (o.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); return; }
-    if (!r.ok) { process.stderr.write(`reorder-arc 실패: ${r.error}\n`); process.exit(1); }
-    process.stdout.write(`↕ 아크 재배치 완료 · 순서: ${r.order!.join(' → ')}\n`);
-  });
-autopilotCmd.command('insert-phase <id> <title...>')
-  .description('★페이즈 중간 삽입 — --after 페이즈 뒤에 새 backlog 페이즈를 끼운다(후속 의존 재배선·아크 편입)')
-  .requiredOption('--after <phase>', '앵커 페이즈(1-based 순번 또는 task hash4)')
-  .option('--prompt <p>', '페이즈 설명/프롬프트')
-  .option('--json')
-  .action(async (id: string, title: string[], o: { after: string; prompt?: string; json?: boolean }) => {
-    const { insertPhaseIntoMission } = await import('./autopilot/mission-lifecycle.js');
-    const r = insertPhaseIntoMission(id, { afterHandle: o.after, title: title.join(' '), ...(o.prompt ? { description: o.prompt } : {}) });
-    if (o.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); return; }
-    if (!r.ok) { process.stderr.write(`insert-phase 실패: ${r.error}\n`); process.exit(1); }
-    process.stdout.write(`＋ 페이즈 삽입: ${r.phaseId} (backlog·앵커 뒤)\n`);
-  });
-autopilotCmd.command('delete-phase <id> <phase>')
-  .description('★페이즈 진짜 삭제 — backlog/failed 만(의존 브리지·아크 제거). skip(제외 표기)과 구분')
-  .option('--json')
-  .action(async (id: string, phase: string, o: { json?: boolean }) => {
-    const { deletePhaseFromMission } = await import('./autopilot/mission-lifecycle.js');
-    const r = deletePhaseFromMission(id, phase);
-    if (o.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); return; }
-    if (!r.ok) { process.stderr.write(`delete-phase 실패: ${r.error}\n`); process.exit(1); }
-    process.stdout.write(`🗑 페이즈 삭제: ${r.deletedId}\n`);
-  });
-autopilotCmd.command('delete-arc <id> <arc>')
-  .description('★아크 삭제 — 전 페이즈 backlog 면 아크+페이즈 삭제(배리어 재배선). 진행분 있으면 descoped 승격을 쓰라')
-  .option('--json')
-  .action(async (id: string, arc: string, o: { json?: boolean }) => {
-    const { deleteArcFromMission } = await import('./autopilot/mission-lifecycle.js');
-    const r = deleteArcFromMission(id, arc);
-    if (o.json) { await writeStdoutJson(JSON.stringify(r, null, 2) + '\n'); return; }
-    if (!r.ok) { process.stderr.write(`delete-arc 실패: ${r.error}\n`); process.exit(1); }
-    process.stdout.write(`🗑 아크 삭제: ${r.deletedArcId} (페이즈 ${r.deletedPhases}개)\n`);
-  });
-// ── 미션 결정 기록(RFC-mission-decision-injection·2026-07-15) ──
-//   운영자 결정(re-ground·defer·check-pass·boundary…)을 관측·기억·자기인지·셀프힐 3박자로 미션에 새김.
-autopilotCmd.command('decide <id> <note...>')
-  .description('★미션 결정 기록 — 운영자 결정을 워킹메모리+관측관문(logs.db+기억+ops) 3박자로 주입')
-  .option('-k, --kind <kind>', 're-ground|defer|check-pass|scope-note|boundary|reuse|accept', 'scope-note')
-  .option('--applies-to <t>', '대상(아크 핸들·페이즈·criterion 등)')
-  .option('--rationale <r>', '왜(comprehension-debt 방지)')
-  .option('--actor <a>', '누가(기본 operator)')
-  .option('--arc <id>', '대상 아크 arcId(선택)')
-  .option('--json')
-  .action(async (id: string, note: string[], o: { kind?: string; appliesTo?: string; rationale?: string; actor?: string; arc?: string; json?: boolean }) => {
-    // ★ 결정을 logs.db 에 관측 — CLI 프로세스는 데몬 sink 미상속(negotiate 동형). mission.selfheal.decision
-    //   debug.log 가 logs.db 에 닿아 `elanous logs --category mission.selfheal.decision` 회상 가능.
-    try {
-      const [sMod, dMod, cMod] = await Promise.all([import('./mss/logging/log-store.js'), import('./debug/log.js'), import('./user-config.js')]);
-      const lc = cMod.getUserConfig().logs; sMod.setLogInstanceName(lc.instanceName);
-      const off = sMod.registerLogStoreSink((s) => dMod.debug.registerSink(s), 'autopilot', lc.retention); if (off) process.on('exit', off);
-    } catch { /* fail-soft */ }
-    const { TaskStore } = await import('./task-orchestrator/store.js');
-    const { recordMissionDecision } = await import('./autopilot/mission-decision.js');
-    const store = new TaskStore();
-    try {
-      if (!store.getMission(id)) { process.stderr.write(`decide 실패: 미션 없음 ${id}\n`); process.exit(1); }
-    } finally { store.close(); }
-    const kinds = ['re-ground', 'defer', 'check-pass', 'scope-note', 'boundary', 'reuse', 'accept'];
-    const kind = (kinds.includes(o.kind ?? '') ? o.kind : 'scope-note') as import('./autopilot/mission-decision.js').MissionDecisionKind;
-    const line = recordMissionDecision(id, {
-      kind, note: note.join(' '), actor: o.actor ?? 'operator',
-      ...(o.appliesTo ? { appliesTo: o.appliesTo } : {}),
-      ...(o.rationale ? { rationale: o.rationale } : {}),
-      ...(o.arc ? { arcId: o.arc } : {}),
-    });
-    if (o.json) { await writeStdoutJson(JSON.stringify({ ok: true, recorded: line }, null, 2) + '\n'); return; }
-    process.stdout.write(`🧭 결정 기록: ${line}\n   → 워킹메모리+logs.db(mission.selfheal.decision)+기억(회상)+ops. elanous logs --category mission.selfheal.decision\n`);
-  });
-
-// ── A6-c 연관 미션 fabric (동급 관계 CRUD·RFC §9) ──
-autopilotCmd.command('link <id> <targetId>')
-  .description('연관 미션 연결(양방향 동급) — friend(동일 골 계보 형제·재실행/변형) 또는 associate(자원·산출 공유·충돌 경보). parent/child 와 별개.')
-  .option('-r, --relation <kind>', 'friend | associate', 'associate')
-  .option('-n, --note <text>', '관계 메모(선택)')
-  .action(async (id: string, targetId: string, opts: { relation?: string; note?: string }) => {
-    const { TaskStore } = await import('./task-orchestrator/store.js');
-    const { attachAssociatedMission, detectAssociateConflicts } = await import('./autopilot/mission-associate.js');
-    const relation = opts.relation === 'friend' ? 'friend' : 'associate';
-    const store = new TaskStore();
-    try {
-      if (!store.getMission(id) || !store.getMission(targetId)) {
-        process.stderr.write(`autopilot link: 미션 없음(${id} 또는 ${targetId})\n`); process.exit(1);
-      }
-      attachAssociatedMission(store, id, targetId, relation, opts.note);
-      process.stdout.write(`🔗 연결: ${id} ⟷ ${targetId} (${relation}${opts.note ? ` · ${opts.note}` : ''})\n`);
-      if (relation === 'associate') {
-        const conflicts = detectAssociateConflicts(store, id, targetId);
-        if (conflicts.length) process.stdout.write(`⚠️ 자원 충돌 후보 ${conflicts.length}건(같은 grounding 파일·동시 개발 주의):\n${conflicts.map((f) => `  · ${f}`).join('\n')}\n`);
-      }
-    } finally { store.close(); }
-    process.exit(0);
-  });
-autopilotCmd.command('unlink <id> <targetId>')
-  .description('연관 미션 해제(양방향) — relation 미지정 시 그 대상과의 모든 동급 관계 제거.')
-  .option('-r, --relation <kind>', 'friend | associate (미지정=전부)')
-  .action(async (id: string, targetId: string, opts: { relation?: string }) => {
-    const { TaskStore } = await import('./task-orchestrator/store.js');
-    const { removeAssociatedMission } = await import('./autopilot/mission-associate.js');
-    const relation = opts.relation === 'friend' ? 'friend' : opts.relation === 'associate' ? 'associate' : undefined;
-    const store = new TaskStore();
-    try { removeAssociatedMission(store, id, targetId, relation); process.stdout.write(`🔗✗ 해제: ${id} ⟷ ${targetId}${relation ? ` (${relation})` : ' (전부)'}\n`); }
-    finally { store.close(); }
-    process.exit(0);
-  });
-
-// ── A6-b 성숙도 분리 — 과대 미션을 핵심(M1) + 후속(proposed) 으로 역제안(RFC §8b) ──
-autopilotCmd.command('maturity-split <id>')
-  .description('과대 미션 성숙도 분리 — 기본=제안 표시(READ-ONLY). --apply 시 후속 아크를 proposed 후속 미션으로 분리·parent-child 연결(M1 불변·자동 실행 없음).')
-  .option('--apply', '집행(후속 proposed 미션 생성). 미지정 시 제안만 표시.')
-  .action(async (id: string, opts: { apply?: boolean }) => {
-    const { TaskStore } = await import('./task-orchestrator/store.js');
-    const { buildMaturityProposal, formatMaturityProposal, applyMaturitySplit } = await import('./autopilot/mission-maturity.js');
-    const store = new TaskStore();
-    try {
-      const m = store.getMission(id);
-      if (!m) { process.stderr.write(`autopilot maturity-split: 미션 없음(${id})\n`); process.exit(1); }
-      const proposal = buildMaturityProposal(m.autopilot?.arcs, m.autopilot?.tier as 'light' | 'heavy');
-      if (!proposal.oversized) { process.stdout.write(`✅ 과대 아님 — 분리 불필요 (${proposal.reason})\n`); process.exit(0); }
-      process.stdout.write(`${formatMaturityProposal(proposal)}\n`);
-      if (!opts.apply) { process.stdout.write(`\n집행하려면: elanous autopilot maturity-split ${id} --apply\n`); process.exit(0); }
-      const r = applyMaturitySplit(store, id);
-      if (r.ok) process.stdout.write(`\n✂️ 성숙도 분리: 후속 ${r.created.length}개 proposed 생성(M1 종속·자동 실행 없음)\n${r.created.map((c) => `  · ${c}`).join('\n')}\n`);
-      else process.stderr.write(`분리 실패: ${r.reason}\n`);
-    } finally { store.close(); }
-    process.exit(0);
-  });
-
-// ── A6-a 골 리디자인 역제안 — 골 형태 grounded 판정(READ-ONLY·RFC §8) ──
-autopilotCmd.command('redesign <id>')
-  .description('골 형태 grounded 판정(READ-ONLY) — founded(진행)/mirage·bundle(리디자인 역제안)/over_scope(성숙도 분리). 자동 재구성 없음·HITL.')
-  .action(async (id: string) => {
-    const { TaskStore } = await import('./task-orchestrator/store.js');
-    const { assessGoalShape, formatRedesignProposal, findSimilarMissions } = await import('./autopilot/mission-redesign.js');
-    const store = new TaskStore();
-    try {
-      const m = store.getMission(id);
-      if (!m) { process.stderr.write(`autopilot redesign: 미션 없음(${id})\n`); process.exit(1); }
-      const goal = m.intent ?? m.title;
-      const shape = await assessGoalShape(goal);
-      if (shape.verdict === 'founded') { process.stdout.write(`✅ founded — 단일 응집 미션(그대로 진행). ${shape.reason}\n`); process.exit(0); }
-      const similar = findSimilarMissions(store, goal, id);
-      process.stdout.write(`${formatRedesignProposal(shape, similar)}\n`);
-    } finally { store.close(); }
-    process.exit(0);
-  });
-
-// ── D3 실현가능성 협상 — 교착 페이즈 스코프컷/replan 제안(READ-ONLY·RFC §3b) ──
-autopilotCmd.command('negotiate <id> <phase>')
-  .description('교착 페이즈 실현가능성 협상(READ-ONLY) — 근본원인 규명 → replan 또는 ★스코프컷(acceptance 축소·나머지 defer) 제안. 자동 집행 없음·항상 HITL.')
-  .action(async (id: string, phase: string) => {
-    // ★ D3 협상 결정을 logs.db 에 관측(2026-07-15) — CLI 프로세스는 데몬 sink 미상속. mission.negotiate
-    //   debug.log 가 logs.db 에 닿아 `elanous logs --category mission.negotiate` 로 회상 가능(자가진단 소스).
-    try {
-      const [sMod, dMod, cMod] = await Promise.all([import('./mss/logging/log-store.js'), import('./debug/log.js'), import('./user-config.js')]);
-      const lc = cMod.getUserConfig().logs; sMod.setLogInstanceName(lc.instanceName);
-      const off = sMod.registerLogStoreSink((s) => dMod.debug.registerSink(s), 'autopilot', lc.retention); if (off) process.on('exit', off);
-    } catch { /* fail-soft */ }
-    const { TaskStore } = await import('./task-orchestrator/store.js');
-    const { proposeScopeNegotiation, formatNegotiationCard } = await import('./autopilot/mission-feasibility-negotiate.js');
-    const store = new TaskStore();
-    try {
-      const tasks = store.listTasks({ goalSlug: id }).sort((a, b) => a.createdAt - b.createdAt);
-      const idx = parseInt(phase, 10);
-      const t = Number.isFinite(idx) ? tasks[idx] : tasks.find((x) => x.id === phase);
-      if (!t) { process.stderr.write(`autopilot negotiate: 페이즈 없음(${phase})\n`); process.exit(1); }
-      const notes = typeof t.notes === 'string' ? t.notes : JSON.stringify(t.notes ?? '');
-      const neg = await proposeScopeNegotiation({
-        phaseTitle: t.title,
-        phasePrompt: t.surface.kind === 'subagent' ? t.surface.prompt : t.title,
-        acceptance: t.acceptance?.criteria ? [...t.acceptance.criteria] : [],
-        diagnosis: notes.slice(-1500),
-      });
-      process.stdout.write(`${formatNegotiationCard(neg, t.title)}\n`);
-    } finally { store.close(); }
-    process.exit(0);
-  });
-
-// ── publish (external-markdown 게시 라이프사이클 GC) ──
-const publishCmd = program.command('publish').description('external-markdown 게시 라이프사이클 — 만료 게시물 GC(S3 콜드 백업·삭제 아님)');
-publishCmd
-  .command('gc')
-  .description('만료 게시물 GC — 1년 만료분을 S3 콜드(Glacier) 백업(삭제 아님)·permanent 자동보존. elanous schedule 크론용.')
-  .option('--root <dir>', '게시 저장 루트(기본 ~/.elanous/publishing·ELANOUS_PUBLISH_ROOT)')
-  .option('--json', '구조화 출력 {archived, kept, errors}')
-  .action(async (opts: { root?: string; json?: boolean }) => {
-    const { runPublishGc } = await import('./nexus/api/markdown-publish.js');
-    const r = await runPublishGc(opts.root ? { root: opts.root } : {});
-    if (opts.json) await writeStdoutJson(JSON.stringify(r) + '\n');
-    else console.log(`[publish gc] 콜드백업 ${r.archived.length}건 · 보존 ${r.kept}건 · 실패 ${r.errors.length}건${r.errors.length ? ' — ' + r.errors.map((e) => e.id).join(',') : ''}`);
-    process.exit(r.errors.length ? 1 : 0);
-  });
-publishCmd
-  .command('catalog')
-  .description('공개 콘텐츠 카탈로그(피드 보드 데이터) 빌드 — 전 게시물을 newest-first 공개 레코드로 프로젝션(만료·타깃없음 제외).')
-  .option('--root <dir>', '게시 저장 루트(기본 ~/.elanous/publishing·ELANOUS_PUBLISH_ROOT)')
-  .option('--json', '구조화 출력 — CatalogRecord[] JSON (피드/파이프라인용)')
-  .action(async (opts: { root?: string; json?: boolean }) => {
-    const { buildPublishCatalog } = await import('./nexus/api/markdown-publish.js');
-    const records = await buildPublishCatalog(opts.root ? { root: opts.root } : {});
-    if (opts.json) await writeStdoutJson(JSON.stringify(records) + '\n');
-    else console.log(`[publish catalog] ${records.length}건 · domain: ${[...new Set(records.map((r) => r.domain ?? 'other'))].join(', ')}`);
-    process.exit(0);
-  });
-publishCmd
-  .command('file <path>')
-  .description('마크다운 파일(Obsidian 등)을 외부 공개 게시하고 공개 URL 반환 — 공백·한글 경로 안전. skill/자동화용.')
-  .option('--json', '구조화 출력 {ok, url, path}')
-  .action(async (path: string, opts: { json?: boolean }) => {
-    const { publishObsidianFile } = await import('./skills/url-route-exec.js');
-    const url = publishObsidianFile(path);
-    if (opts.json) await writeStdoutJson(JSON.stringify({ ok: !!url, url, path }) + '\n');
-    else if (url) console.log(url);
-    else console.error('게시 실패 — 파일 없음·빈 파일·S3 미가용·게시 오류(elanous logs --category url-route.publish 확인)');
-    process.exit(url ? 0 : 1);
-  });
+registerPublishCommands(program);
 
 // ── agent-mission (외부 에이전트 backend 미션·리뷰·셋업) — `codex` 는 deprecated alias(하위호환) ──
 //   U2(명명 중립화): U1 이 backend 를 애그노스틱화했으므로 CLI 이름도 codex-특정 → 중립으로.
@@ -7690,6 +5358,8 @@ agentCmd.hook('preAction', async (_thisCommand, actionCommand) => {
     }
   } catch { /* fail-soft — 관측 실패가 명령 실행을 막지 않음 */ }
 });
+
+registerCapabilitiesCommand(agentCmd);
 
 // ★ elanous→codex PTY RFC 미션 (ROADMAP 3차 역전) — codex --yolo 를 PTY 로 열어
 // worktree 에서 미션을 자율 완주(구독 모드·브레인=elanous LLM·omni-crawl 폴백·증거 게이트).
@@ -9085,25 +6755,7 @@ missionCmd
     persistMissionOutcome(setMissionMode(cfg.llm.missionRouting, mode));
   });
 
-// ── task CLI · retired (scheduler retirement ROADMAP §R1) ──
-//
-// The legacy `elanous task` (scheduler task management) CLI was retired
-// in R1 of the scheduler-retirement ROADMAP. Use `elanous wf` (workflow-
-// runtime DAG runtime) instead. The `elanous workflow` retirement stub
-// was replaced in R4 by the real workflow-runtime alias on `wfCmd`
-// below (`.alias('workflow')`).
-function emitSchedulerRetirementNotice(family: 'task' | 'scheduler'): void {
-  ui.error(`[elanous ${family}] retired in scheduler-retirement ROADMAP §R1.`);
-  ui.info('Use `elanous wf` for workflow management (workflow-runtime DAG · supersedes scheduler v2).');
-  process.exit(1);
-}
-
-program
-  .command('task [args...]')
-  .alias('tasks')
-  .description('Retired — use `elanous wf` (workflow-runtime DAG · supersedes scheduler v2)')
-  .allowUnknownOption(true)
-  .action(() => emitSchedulerRetirementNotice('task'));
+registerTasksCommands(program);
 
 // ── ask alias (script-friendly one-shot query) ──
 program
@@ -9953,7 +7605,7 @@ program
       } catch { /* fail-open — 관측 배선 실패가 턴을 깨지 않는다 */ }
     }
     // ★ U4b 재라우팅 — chat 턴 실행을 runDevPipeline interactive dispatch 로 통일(seam=chat-cli). chat 엔진
-    //   (runChatTurnCli)은 index.ts 소유라 cfg-바인딩 클로저로 주입(순환 회피). opts→DevChatOpts 매핑은 seam.
+    //   단일 턴 엔진(runChatTurnCli)은 cfg-바인딩 클로저로 주입(순환 회피). opts→DevChatOpts 매핑은 seam.
     const { runChatCliCommand } = await import('./chat/chat-cli.js');
     await runChatCliCommand(parts.join(' '), opts, {
       runChatTurn: (text, chat) => runChatTurnCli({
@@ -10020,541 +7672,7 @@ program
     if (code !== 0) process.exit(code);
   });
 
-// ── agent (chat with tool loop on) ──
-// Declared as `.command('agent').argument('[text...]')` rather than
-// `.command('agent <text...>')` so the `dispatch` sub-command below can hang
-// off it. Commander 13 routes `agent dispatch …` to the sub-command and
-// everything else to this action (verified against commander 13.1 before the
-// change). The argument is optional at the parser level only — an empty
-// invocation is rejected explicitly in the action so the operator still gets
-// a named failure instead of an empty turn.
-type CliAgentDispatch = typeof import('./skills/tools/agent.js').dispatchAgent;
-let cliAgentDispatchForTesting: CliAgentDispatch | undefined;
-
-export function setCliAgentDispatchForTesting(dispatch: CliAgentDispatch | undefined): void {
-  cliAgentDispatchForTesting = dispatch;
-}
-
-const agentCommand = program
-  .command('agent')
-  .argument('[text...]', 'Prompt text for the single-turn agent.')
-  .description('Single-turn agent — same as `chat` but with the tool loop on by default (Read/Grep/Glob/ListDir/Edit/Write + Bash). Use this when the LLM needs to inspect files / run commands / debug itself.')
-  .option('--new', 'Force a new session instead of using the active one')
-  .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --new and active session.')
-  .option('--json', 'Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.')
-  .option('--no-tools', 'Disable the tool loop and fall back to text-only chat (for benchmarking / parity with `chat`).')
-  .action(async (parts: string[], opts: { new?: boolean; session?: string; json?: boolean; tools?: boolean }) => {
-    if (!parts || parts.length === 0) {
-      console.error("error: missing required argument 'text'");
-      process.exit(1);
-    }
-    // `elanous agent` is a standalone process that does not inherit the nexus
-    // StoreSink, so register the agent logs.db sink first — otherwise core-turn
-    // debug.log (e.g. capability.resolve) never reaches logs.db. Fail-open:
-    // logging must never block the agent turn. See src/chat/agent-cli-entry.ts.
-    try {
-      const { initializeAgentCliLogSink } = await import('./chat/agent-cli-entry.js');
-      await initializeAgentCliLogSink();
-    } catch (err) {
-      // Fail-open: logging must never block the agent turn. But do not go fully
-      // silent — surface the sink failure to the file trail (FileSink, independent
-      // of the StoreSink that just failed) so an observability outage is itself
-      // observable. Uses debug.log, not stdout, so the --json contract stays intact.
-      try {
-        const { debug } = await import('./debug/log.js');
-        debug.log('agent.log-sink', 'register-failed', { error: String(err) }, { level: 'warn' });
-      } catch { /* diagnostics are best-effort */ }
-    }
-    const cfg = getUserConfig();
-    if (needsOnboarding(cfg)) {
-      ui.info('No config yet — launching setup wizard first.');
-      await runOnboarding();
-    }
-    const refreshed = reloadUserConfig();
-    await runChatTurnCli({
-      cfg: refreshed,
-      userText: parts.join(' '),
-      explicitSessionId: opts.session,
-      reuseActive: opts.new !== true,
-      forceNew: opts.new === true,
-      json: opts.json === true,
-      // commander stores --no-tools as `tools: false`, plain absence as undefined → default true here.
-      enableTools: opts.tools !== false,
-    });
-  });
-
-// ── agent dispatch — RFC #7333 `A1` (트리거) ──
-//
-// The `Agent` sub-agent tool has existed and been fully instrumented
-// (`agent.spawn.dispatch` → `agent.done.finish`) for months, but it had NO
-// human entrance: measured 2026-08-23, all 15 recorded dispatches came from an
-// LLM deciding to call the tool mid-turn. That is exactly the gap the RFC
-// names — *"장치는 있고 관측도 끝까지 있다. 없는 것은 「쓴 적」이다."*
-//
-// A CLI sub-command (rather than a TUI slash) is deliberate: the point of A1
-// is to make SAMPLES, and only a scriptable entrance lets an operator fan out
-// repeat dispatches and diff them. It also keeps the result on stdout with a
-// real exit code, instead of the hidden-pane output path that slash commands
-// currently take.
-agentCommand
-  .command('dispatch <subagent_type> <prompt...>')
-  .description('Spawn one sub-agent from the terminal and print its final message. Observe with `elanous logs --category agent.spawn` / `--category agent.done` — the printed cid pairs the two.')
-  .option('--description <text>', 'Short label for the spawn (3–8 words). Defaults to the first 8 words of the prompt.')
-  .option('--max-turns <n>', 'Tool-loop budget for the sub-agent. Defaults to the Agent tool default.')
-  .option('--background', 'Return as soon as the child is spawned instead of waiting for its final message.')
-  .option('--isolation <mode>', 'Child isolation: "worktree" (fresh git worktree + branch) or "cwd".')
-  .option('--name <label>', 'UI label for this spawn (agent-roster / logs).')
-  .option('--quiet', 'Suppress the per-tool progress lines on stderr.')
-  .option('--json', 'Emit one JSON line {cid, agent, taskId, durationMs, background, isolation, cwd, output} instead of human text.')
-  .action(async (
-    subagentType: string,
-    promptParts: string[],
-    o: {
-      description?: string; maxTurns?: string; background?: boolean;
-      isolation?: string; name?: string; quiet?: boolean; json?: boolean;
-    },
-  ) => {
-    // Same rationale as `elanous agent`: a standalone CLI process does not
-    // inherit the nexus StoreSink, so without this the dispatch would run but
-    // `elanous logs --category agent.spawn` would show nothing — the exact
-    // "instrumented but invisible" failure this command exists to close.
-    try {
-      const { initializeAgentCliLogSink } = await import('./chat/agent-cli-entry.js');
-      await initializeAgentCliLogSink();
-    } catch (err) {
-      try {
-        const { debug } = await import('./debug/log.js');
-        debug.log('agent.log-sink', 'register-failed', { error: String(err) }, { level: 'warn' });
-      } catch { /* diagnostics are best-effort */ }
-    }
-
-    // Validate before spawning. Bad input must fail by NAME, not by silently
-    // falling through to a default that makes the run look successful.
-    let maxTurns: number | undefined;
-    if (o.maxTurns !== undefined) {
-      const n = Number(o.maxTurns);
-      if (!Number.isFinite(n) || n < 1) {
-        console.error(`Agent dispatch blocked: --max-turns must be a positive number — got ${JSON.stringify(o.maxTurns)}.`);
-        process.exit(2);
-      }
-      maxTurns = n;
-    }
-    if (o.isolation !== undefined && o.isolation !== 'worktree' && o.isolation !== 'cwd') {
-      console.error(`Agent dispatch blocked: --isolation must be "worktree" or "cwd" — got ${JSON.stringify(o.isolation)}.`);
-      process.exit(2);
-    }
-
-    const prompt = promptParts.join(' ').trim();
-    if (!prompt) {
-      console.error('Agent dispatch blocked: prompt is empty.');
-      process.exit(2);
-    }
-    const description = o.description?.trim()
-      ? o.description.trim()
-      : prompt.split(/\s+/).slice(0, 8).join(' ');
-
-    const cfg = reloadUserConfig();
-    // The child gets the CLI coding core (Read/Grep/Glob/ListDir/Edit/Write +
-    // Bash + shared app tools). Note this catalog does NOT contain `Agent`
-    // itself, so a dispatched child cannot recurse into another spawn.
-    const built = buildCliAgentTools(cfg);
-    const buildChildToolCatalog = (childCwd: string) => buildCliAgentTools(cfg, undefined, childCwd);
-    const controller = new AbortController();
-    const onSigint = (): void => controller.abort();
-    process.once('SIGINT', onSigint);
-
-    try {
-      const dispatchAgent = cliAgentDispatchForTesting
-        ?? (await import('./skills/tools/agent.js')).dispatchAgent;
-      const res = await dispatchAgent({
-        description,
-        prompt,
-        subagent_type: subagentType,
-        ...(maxTurns !== undefined ? { max_turns: maxTurns } : {}),
-        ...(o.background ? { run_in_background: true } : {}),
-        ...(o.isolation ? { isolation: o.isolation } : {}),
-        ...(o.name ? { name: o.name } : {}),
-      }, {
-        hostTools: built.specs,
-        dispatchTool: built.dispatch,
-        buildChildToolCatalog,
-        signal: controller.signal,
-        // Progress goes to stderr so `--json` (and plain stdout capture) stay
-        // machine-clean while a human watching the terminal still sees motion.
-        ...(o.quiet || o.json ? {} : {
-          onChildToolCall: (ev: { name: string; callIdx: number }) => {
-            process.stderr.write(`  ⎿ ${ev.name} (#${ev.callIdx})\n`);
-          },
-        }),
-      });
-
-      // `cid` is optional on the type for a gate reason documented at its
-      // declaration, but dispatchAgent sets it on every return path. If it is
-      // ever missing, say so by name rather than printing `cid=undefined` —
-      // a silent `undefined` would look like a working key that finds nothing.
-      const cid = res.cid ?? '(cid-missing)';
-      if (o.json) {
-        await writeStdoutJson(JSON.stringify({
-          cid,
-          agent: res.agent,
-          taskId: res.taskId,
-          durationMs: res.durationMs,
-          maxTurns: res.maxTurns,
-          ...(res.background ? { background: true } : {}),
-          ...(res.isolation ? { isolation: res.isolation } : {}),
-          ...(res.cwd ? { cwd: res.cwd } : {}),
-          output: res.output,
-        }) + '\n');
-      } else {
-        console.log(res.output);
-        // The cid trailer is the whole point of the entrance: it is the key
-        // that pairs this dispatch against agent.spawn / agent.done.
-        console.error(
-          `\n[agent dispatch] cid=${cid} agent=${res.agent} taskId=${res.taskId} `
-          + `durationMs=${res.durationMs}${res.background ? ' background=true' : ''}`
-          + `\n[agent dispatch] observe: elanous logs --category agent.done --json --json-data | rg ${cid}`,
-        );
-      }
-    } catch (err) {
-      console.error(`Agent dispatch failed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    } finally {
-      process.removeListener('SIGINT', onSigint);
-    }
-  });
-
-/** Single-turn CLI driver shared by `elanous ask` and `elanous chat`.
- *
- *  Resolution order for sessionId:
- *    1. opts.explicitSessionId (`--session`)  — wins, validates against
- *       resolveSessionId so a 6-char prefix works
- *    2. active session                         — when reuseActive
- *    3. fresh session                          — otherwise
- *
- *  When `json` is true, the function suppresses the streaming text +
- *  ui.info trailer and instead emits exactly ONE JSON line on stdout
- *  at end-of-turn:
- *    {sessionId, provider, model, reply, logPath, budget, durationMs,
- *     turnIndex, ts}
- *  Stable shape so LLMs can self-spawn `elanous chat` for follow-ups
- *  without parsing human-readable terminal output. */
-export async function runChatTurnCli(opts: {
-  cfg: ReturnType<typeof reloadUserConfig>;
-  userText: string;
-  explicitSessionId: string | undefined;
-  reuseActive: boolean;
-  forceNew: boolean;
-  json: boolean;
-  /** When true, build a CORE-native + Bash tool catalog and route
-   *  through streamLLMWithTools so the LLM can drive multi-turn
-   *  exploration (file reads, grep, shell). Default false — CLI
-   *  chat path stays text-only and matches telegram/discord etc.
-   *  for backward compatibility. `elanous agent` flips this on. */
-  enableTools?: boolean;
-  /** ⭐ substrate 통합 — goal-loop 아밍. true 면 tool-loop 을 runGoalLoop 으로 감싸
-   *  목표 완료(GOAL-COMPLETE 증거게이트)까지 across-turn 반복. config
-   *  llm.goalLoop.enabled 로도 아밍(ACP bridge 와 동일 SSOT). enableTools 필요. */
-  goalLoop?: boolean;
-  /** Test-only seam for observing the production CLI turn's final request without an LLM call. */
-  runTurn?: typeof runTurn;
-}): Promise<void> {
-  const startedAt = Date.now();
-  let resolvedSessionIdHint: string | undefined;
-  if (opts.explicitSessionId) {
-    const id = resolveSessionId(opts.explicitSessionId);
-    if (!id) {
-      const msg = `no session matching "${opts.explicitSessionId}"`;
-      if (opts.json) await writeStdoutJson(JSON.stringify({ error: msg, sessionRequested: opts.explicitSessionId }) + '\n');
-      else ui.error(msg);
-      process.exit(1);
-    }
-    resolvedSessionIdHint = id;
-  } else if (opts.reuseActive && !opts.forceNew) {
-    resolvedSessionIdHint = getActiveSessionId() ?? undefined;
-  }
-  const session = ensureCliSession(opts.cfg, resolvedSessionIdHint);
-  setActiveSessionId(session.id);
-  const harnessSpace = getHarnessSpace();
-  // Tag the debug log with this session id so every event in this
-  // process attributes correctly. enrichDebugRecord picks up the
-  // ambient value on the next event.
-  try {
-    const dbg = await import('./debug/log.js');
-    dbg.setAmbientSessionId?.(session.id);
-  } catch { /* debug module unavailable — fine */ }
-  const replyChunks: string[] = [];
-  // 어시스턴트 메시지 경계(도구 호출)로 자른 본문 조각 — 마지막 «비어 있지 않은» 조각이 finalReply.
-  let segmentChunks: string[] = [];
-  let lastSegment = '';
-  const closeSegment = (): void => {
-    const text = segmentChunks.join('').trim();
-    if (text) lastSegment = text;
-    segmentChunks = [];
-  };
-  if (!opts.json) {
-    console.log(`[elanous] ${oneLineProvider(inspectActiveProvider(opts.cfg))}`);
-    process.stdout.write('');  // flush
-  }
-  // Tool catalog + dispatcher — only built when enableTools is on
-  // (i.e. `elanous agent` or `elanous chat --tools`). The catalog mirrors
-  // the dashboard's CORE 6 native (Read/Grep/Glob/ListDir/Edit/Write)
-  // and adds Bash so the LLM can shell out for self-debugging.
-  // Scheduler/plugin/runtime tools are deliberately excluded — they
-  // depend on dashboard wiring that isn't available in the CLI.
-  let tools: ReturnType<typeof buildCliAgentTools> | undefined;
-  let dispatchTool: ((name: string, args: Record<string, unknown>) => Promise<unknown>) | undefined;
-  let enabledToolNames: string[] | undefined;
-  if (opts.enableTools) {
-    const built = buildCliAgentTools(opts.cfg, harnessSpace ? {
-      sessionId: session.id,
-      emitFeedback: emitHarnessFeedbackProgress,
-    } : undefined);   // ★ cfg 전달 → financeEnabled 시 finance 팩 노출(서피스 게이팅 정리)
-    tools = built;
-    dispatchTool = built.dispatch;
-    enabledToolNames = built.specs.map(s => s.name);
-  }
-  // Wire the universal preamble (project anchor + project tree +
-  // family addendum + session-specific guidance) into every CLI system
-  // prompt. Tool-enabled turns additionally pass their active tool names
-  // so session-specific guidance remains unchanged.
-  let agentSystemPrompt: string | undefined;
-  try {
-    const ulMod = require('./prompt-library/universal-preamble.js') as typeof import('./prompt-library/universal-preamble.js');
-    const modelsMod = require('./models/prompts.js') as typeof import('./models/prompts.js');
-    const modelId = opts.cfg.llm.model;
-    const modelFamily = modelId ? modelsMod.getModelFamily(modelId) : undefined;
-    const universal = ulMod.buildUniversalPreamble({
-      cwd: process.cwd(),
-      ...(modelFamily !== undefined ? { modelFamily } : {}),
-      ...(enabledToolNames !== undefined ? { enabledTools: enabledToolNames } : {}),
-    });
-    const joined = universal
-      .map(m => (typeof m.content === 'string' ? m.content : ''))
-      .filter(s => s.length > 0)
-      .join('\n\n');
-    if (joined.length > 0) {
-      agentSystemPrompt = joined;
-    }
-  } catch { /* universal-preamble unavailable — proceed without it */ }
-  agentSystemPrompt = applyHarnessPolicy(agentSystemPrompt, process.env[HARNESS_POLICY_ENV]);
-  agentSystemPrompt = applyDocumentReferences(agentSystemPrompt, process.env[DOCUMENT_REFERENCES_ENV]);
-  // Archon-port T1.2 (2026-05-08) — apply user-config `chat.toolDeny`
-  // to the CLI agent's tool roster. Prior to T1.2 this code path
-  // ignored toolDeny entirely (only `eval-prompt-cli.ts` honored it),
-  // so a global block list silently failed in `elanous ask`.
-  let cliToolSpecs = tools?.specs;
-  if (cliToolSpecs && opts.cfg.chat.toolDeny.length > 0) {
-    const { applyToolPolicy } = require('./tool-runtime/tool-policy.js') as typeof import('./tool-runtime/tool-policy.js');
-    cliToolSpecs = applyToolPolicy(cliToolSpecs, { deny: opts.cfg.chat.toolDeny }) ?? cliToolSpecs;
-  }
-  // ⭐ 도구 프로필(BACKLOG L1) — 하니스 구현 자식은 `ELANOUS_TOOL_PROFILE=coding` 으로 도메인·운영 도구를 뺀다.
-  {
-    const { activeToolProfile, applyToolProfile, omittedToolGroupsNote } = require('./agent/tool-profile.js') as typeof import('./agent/tool-profile.js');
-    const profile = activeToolProfile();
-    if (profile && cliToolSpecs) {
-      const before = cliToolSpecs.length;
-      const r = applyToolProfile(cliToolSpecs, profile);
-      cliToolSpecs = r.tools;
-      debug.log('chat.tools', 'profile-applied', { profile: profile.name, groups: [...profile.groups], before, after: cliToolSpecs?.length ?? 0, removed: r.removed });
-      // ⭐ 뺀 묶음을 «한 줄»로 알린다 — 자식이 상황을 보고 ToolSearch 로 불러 쓴다(ToolSearch 는 전체 목록에서 찾는다).
-      const note = omittedToolGroupsNote(r.removed);
-      if (note) agentSystemPrompt = agentSystemPrompt ? `${agentSystemPrompt}\n\n${note}` : note;
-    }
-  }
-  const result = await (opts.runTurn ?? runTurn)({
-    userConfig: opts.cfg,
-    sessionId: session.id,
-    userText: opts.userText,
-    systemPrompt: agentSystemPrompt,
-    onDelta: (d) => {
-      if (opts.json) { replyChunks.push(d); segmentChunks.push(d); }
-      else process.stdout.write(d);
-    },
-    tools: cliToolSpecs,
-    dispatchTool,
-    ...(opts.goalLoop ? { goalLoop: true } : {}),
-    onToolCall: (call) => {
-      // 도구 호출 뒤의 본문은 «새» 어시스턴트 메시지다 — 직전 조각을 마감한다(finalReply 용).
-      if (opts.json) closeSegment();
-      if (!opts.json) {
-        process.stdout.write(`\n  ⏺ ${call.name}(${truncateArgsForLog(call.args)})\n`);
-      }
-    },
-    onToolResult: (call) => {
-      if (!opts.json) {
-        const preview = truncateResultForLog(call.result);
-        process.stdout.write(`     ↳ ${preview}\n`);
-      }
-    },
-  });
-  if (opts.json) {
-    let logPath: string | null = null;
-    try {
-      const dbg = await import('./debug/log.js');
-      const status = dbg.debug?.status?.();
-      if (status?.path) logPath = status.path;
-    } catch { /* debug status unavailable — log path stays null */ }
-    const out = {
-      sessionId: session.id,
-      provider: result.provider,
-      model: result.model ?? null,
-      reply: replyChunks.join(''),
-      // ⭐ 2026-09-23 — `reply` 는 «모든 턴·모든 목표 루프 반복»의 본문을 이어 붙인다(뜻은 그대로 둔다 · 소비자 보호).
-      //   그래서 모델이 반복마다 최종 답을 다시 말하면 같은 문장이 여러 번 나온다(실측: kimi 3회·grok 2회).
-      //   `finalReply` = 마지막 어시스턴트 메시지 본문 — 「최종 답만」이 필요한 소비자용(뒤호환 추가 칸).
-      finalReply: (closeSegment(), lastSegment),
-      budget: sessionBudget(session.id),
-      durationMs: Date.now() - startedAt,
-      logPath,
-      ts: new Date().toISOString(),
-    };
-    await writeStdoutJson(JSON.stringify(out) + '\n');
-    return;
-  }
-  process.stdout.write('\n');
-  ui.info(`[session ${session.id.slice(0, 8)}  ${result.provider}${result.model ? '/' + result.model : ''}  ${sessionBudget(session.id)}]`);
-}
-
-/** Build the CLI agent's minimal tool catalog + dispatcher. Returns
- *  the spec list to pass into runTurn's `tools` field plus a single
- *  dispatch function. Native tools are sourced from
- *  SESSION_NATIVE_TOOL_RULES (the same module the dashboard uses);
- *  Bash is added explicitly because it lives outside that registry
- *  (in the dashboard-optional umbrella). All dispatch errors are
- *  caught and returned as `{error: '...'}` so the tool loop can
- *  continue rather than aborting. */
-export function buildCliAgentTools(
-  cfg?: import('./user-config.js').UserConfig,
-  harnessPlan?: {
-    sessionId: string;
-    emitFeedback: (env: import('./feedback/envelope.js').FeedbackEnvelope) => void;
-  },
-  trustedWorkingDirectory?: string,
-): {
-  specs: import('./llm.js').LLMToolSpec[];
-  dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
-  workingDirectory: string;
-} {
-  // An explicitly assigned child cwd is stable for its isolated lifetime. An
-  // omitted cwd deliberately remains late-bound at dispatch: the exposed
-  // snapshot is only for trusted-catalog mismatch observation.
-  const workingDirectory = trustedWorkingDirectory ?? process.cwd();
-  const dispatchWorkingDirectory = (): string => trustedWorkingDirectory ?? process.cwd();
-  const defaultSearchPath = trustedWorkingDirectory;
-  const specs: import('./llm.js').LLMToolSpec[] = [];
-  const dispatchByName = new Map<string, (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>>();
-  const resolveChildPath = (value: unknown): unknown =>
-    typeof value === 'string' && !value.startsWith('/') ? resolve(dispatchWorkingDirectory(), value) : value;
-  const bindWorkingDirectory = (name: string, args: Record<string, unknown>): Record<string, unknown> => {
-    switch (name) {
-      case 'Read':
-      case 'Edit':
-      case 'Write':
-        return { ...args, file_path: resolveChildPath(args.file_path) };
-      case 'Grep':
-      case 'Glob':
-      case 'ListDir':
-        return { ...args, path: resolveChildPath(args.path ?? defaultSearchPath) };
-      default:
-        return args;
-    }
-  };
-  // Native CORE — Read / Grep / Glob / ListDir / Edit / Write. Resolve through
-  // the same surface profile the dashboard uses so behavior matches.
-  // ★ turn 조립기 통일 Phase 2(2026-07-22) — native 코딩코어 조립을 buildCodingCoreNativeSpecs 단일
-  //   출처로(continuation-turn-runner 와 공유·"kept in sync deliberately" 수동 동기화 스멜 제거).
-  const sr = require('./session-runtime/index.js') as typeof import('./session-runtime/index.js');
-  const codingCore = require('./agent/coding-core-tools.js') as typeof import('./agent/coding-core-tools.js');
-  for (const spec of codingCore.buildCodingCoreNativeSpecs()) {
-    specs.push(spec);
-  }
-  // Bash — wired directly because it's a dashboard-optional tool,
-  // not in SESSION_NATIVE_TOOL_RULES. We always expose it in the
-  // CLI agent path because file-IO + shell is the minimum surface
-  // for self-debugging (per user's umbrella-survivor invariant).
-  const bashMod = require('./skills/tools/index.js') as typeof import('./skills/tools/index.js');
-  const bashSpec = bashMod.buildBashTool();
-  specs.push(bashSpec);
-  dispatchByName.set('Bash', async (args) => bashMod.dispatchBash(args, { cwd: dispatchWorkingDirectory() }));
-  // L2 코어 앱 도구(schedule_manage·memory_recall·… — 도메인 무관·전 서피스 공용). 단일
-  // 출처(core-tools.ts)에서 상속. CLI 채팅도 자기 예약·기억을 조회/관리.
-  // ★ turn 조립기 통일 Phase 0(2026-07-22) — L2 core + L3 finance(gated) 공통 조립을 buildSharedAppTools
-  //   단일 헬퍼로. 종전 core/finance 를 각자 조립하던 것 통일(specs 순서 보존·무회귀). finance=financeEnabled
-  //   게이트. [[project_skill_native_duplication_surface_gating]].
-  const shared = (require('./agent/shared-app-tools.js') as typeof import('./agent/shared-app-tools.js')).buildSharedAppTools(cfg);
-  for (const s of shared.specs) specs.push(s);
-  for (const name of shared.names) dispatchByName.set(name, async (args) => shared.dispatch(name, args));
-  if (harnessPlan) {
-    specs.push(buildPlanTool(), buildMarkStepDoneTool());
-    const planCtx = {
-      cwd: process.cwd(),
-      signal: new AbortController().signal,
-      sessionId: harnessPlan.sessionId,
-      emitFeedback: harnessPlan.emitFeedback,
-    };
-    dispatchByName.set('Plan', async (args) => dispatchPlan(
-      args as unknown as Parameters<typeof dispatchPlan>[0],
-      planCtx,
-    ));
-    dispatchByName.set('MarkStepDone', async (args) => dispatchMarkStepDone(
-      args as unknown as Parameters<typeof dispatchMarkStepDone>[0],
-      planCtx,
-    ));
-  }
-  // Native dispatch — route through dispatchSessionRuntimeTool so we
-  // pick up all the dashboard guards (broad-search-block, scoped-
-  // analysis, dedup planner). Scheduler/plugin/runtime stubs return
-  // not-available since the CLI doesn't wire those subsystems.
-  const dispatchSessionRuntimeTool = sr.dispatchSessionRuntimeTool;
-  const createPlanner = sr.createSearchPlannerState;
-  const plannerState = createPlanner({ maxAutoNarrowCandidates: 2 });
-  const dispatch = async (name: string, args: Record<string, unknown>): Promise<unknown> => {
-    try {
-      const direct = dispatchByName.get(name);
-      if (direct) return await direct(args);
-      // ⭐ BACKLOG L1b (2026-09-25) — ToolSearch 는 지연 도구가 있으면 «자동으로 광고»되는데 이 CLI 디스패처만
-      //   라우팅이 없어 `plugin tool unavailable in CLI: ToolSearch` 로 죽었다(daemon·monad-agent-turn 은 라우팅한다).
-      //   ⇒ 같은 공용 라우터로 이 CLI 의 도구 풀에서 찾는다.
-      const tsRoute = require('./skills/tools/tool-search-route.js') as typeof import('./skills/tools/tool-search-route.js');
-      if (tsRoute.isToolSearchCall(name)) return tsRoute.routeToolSearch(args, specs, { surface: 'cli' });
-      return await dispatchSessionRuntimeTool(name, bindWorkingDirectory(name, args), {
-        signal: undefined,
-        userText: '',
-        modelFamily: undefined,
-        agentHostTools: specs,
-        agentDispatchTool: dispatch,
-        buildChildToolCatalog: (childCwd: string) => buildCliAgentTools(cfg, undefined, childCwd),
-        searchPlannerState: plannerState,
-        turnIndex: undefined,
-        ptyDashboardOn: false,
-        getToolRuntime: () => undefined,
-        dispatchToolRuntime: async (n) => ({ error: `runtime tool unavailable in CLI: ${n}` }),
-        dispatchPluginTool: async (n) => ({ ok: false as const, error: `plugin tool unavailable in CLI: ${n}` }),
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      return { error: `dispatch failed: ${msg}` };
-    }
-  };
-  return { specs, dispatch, workingDirectory };
-}
-
-function truncateArgsForLog(args: Record<string, unknown>): string {
-  const json = JSON.stringify(args);
-  return json.length > 120 ? json.slice(0, 120) + '…' : json;
-}
-
-function truncateResultForLog(result: unknown): string {
-  let preview: string;
-  if (typeof result === 'string') preview = result;
-  else if (result && typeof result === 'object' && 'output' in result && typeof (result as { output?: unknown }).output === 'string') {
-    preview = String((result as { output: string }).output);
-  } else {
-    preview = JSON.stringify(result);
-  }
-  preview = preview.replace(/\s+/g, ' ').trim();
-  return preview.length > 200 ? preview.slice(0, 200) + '…' : preview;
-}
+registerAgentCommands(program);
 
 // ── Local LLM (OpenAI-compatible endpoint: LM Studio / llama.cpp / ollama) ──
 //
@@ -10563,132 +7681,6 @@ function truncateResultForLog(result: unknown): string {
 // run the full compatibility matrix, and shortcut to `set + test` as
 // a single setup command. Every subcommand reads the live endpoint
 // rather than the stored config so the user can diagnose before saving.
-// ── elanous registry — 모델 카탈로그 SSoT 관측(drift 자기감지·제1원칙) ──
-const registryCmd = program
-  .command('registry')
-  .description('모델 카탈로그(catalog/=SSoT) 관측 — 라우팅 맵 drift 감사');
-registryCmd.hook('preAction', async () => {
-  try {
-    const { registerStandaloneLogSink } = await import('./domains/standalone-log-sink.js');
-    await registerStandaloneLogSink('registry');
-  } catch { /* fail-open — observation wiring must not block registry */ }
-});
-registryCmd
-  .command('drift')
-  .description('라우팅 핀(alias·tier-map·mission-router)이 catalog active id 와 정합인지 감사 — HITL 역제안(자동 집행 없음)')
-  .option('--json', 'JSON 출력(미션/프로그래매틱 소비)')
-  .action(async (opts: { json?: boolean }) => {
-    const { detectRoutingDrift, buildRoutingDriftRecommendation } = await import('./registry/llm-routing-drift.js');
-    const drift = detectRoutingDrift();
-    try { const { debug } = await import('./debug/log.js'); debug.log('llm.drift', 'audit', { count: drift.length, models: drift.map((d) => d.model) }); } catch { /* fail-soft */ }
-    if (opts.json) { await writeStdoutJson(JSON.stringify(drift, null, 2) + '\n'); return; }
-    if (!drift.length) { ui.info('✅ 라우팅 맵 drift 없음 — 모든 핀이 catalog SSoT 와 정합'); return; }
-    ui.header(`LLM 라우팅 drift ${drift.length}건 (catalog SSoT 미정합 · HITL 역제안·자동 집행 없음)`);
-    for (const d of drift) console.log(`  [${d.status}] ${buildRoutingDriftRecommendation(d)}`);
-  });
-
-// 대표 2026-09-23 «카탈로그를 파생한다» — 고른 소스만 돌려 스냅숏에 «병합». ⛔ S3 푸시 없음(이 문엔 그 칸이 없다).
-//   기본은 드라이런(쓰지 않는다) — `--write` 일 때만 스냅숏 파일을 바꾼다.
-registryCmd
-  .command('discover')
-  .description('발견 소스를 골라 돌리고 기존 스냅숏에 병합 — 기본 드라이런 · --write 로 기록 · S3 푸시 없음')
-  .option('--source <id...>', '돌릴 소스 id (여러 개 가능 · 예: openrouter)')
-  .option('--write', '스냅숏 파일에 병합해 기록한다(없으면 드라이런)')
-  .option('--json', 'JSON 출력')
-  .action(async (opts: { source?: string[]; write?: boolean; json?: boolean }) => {
-    const { BUILTIN_SOURCES, runDiscovery } = await import('./registry/discovery/runner.js');
-    const { readDiscoveryCache, defaultDiscoveryCachePath } = await import('./registry/discovery/cache.js');
-    const { mergeDiscoverySnapshot } = await import('./registry/discovery/merge.js');
-    const known = BUILTIN_SOURCES.map((x) => x.id);
-    const wanted = opts.source ?? [];
-    const unknown = wanted.filter((id) => !known.includes(id as never));
-    if (!wanted.length || unknown.length) {
-      ui.error(`--source 를 주십시오${unknown.length ? ` (모르는 id: ${unknown.join(', ')})` : ''} — 가능: ${known.join(', ')}`);
-      process.exit(2);
-    }
-    const sources = BUILTIN_SOURCES.filter((x) => wanted.includes(x.id));
-    const { results } = await runDiscovery({ sources, skipCacheWrite: true, s3Push: false });
-    const path = defaultDiscoveryCachePath();
-    const prev = readDiscoveryCache({ cachePath: path });
-    const merged = mergeDiscoverySnapshot(prev, results);
-    const summary = {
-      path, write: !!opts.write, prevGeneratedAt: prev?.generatedAt ?? null,
-      prevModels: prev?.models.length ?? 0, mergedModels: merged.models.length,
-      sources: results.map((r) => ({ id: r.source, ok: r.ok, models: r.models.length, ...(r.error ? { error: r.error } : {}) })),
-    };
-    try { const { debug } = await import('./debug/log.js'); debug.log('registry.discovery', 'discover-cli', summary); } catch { /* fail-soft */ }
-    if (opts.write) {
-      const { mkdirSync, writeFileSync } = await import('node:fs');
-      const { dirname } = await import('node:path');
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, JSON.stringify(merged, null, 2), 'utf-8');
-    }
-    if (opts.json) { await writeStdoutJson(JSON.stringify(summary, null, 2) + '\n'); return; }
-    for (const r of summary.sources) console.log(`  ${r.ok ? '✅' : '⛔'} ${r.id}: ${r.models}개${r.error ? ` · ${r.error}` : ''}`);
-    console.log(`  스냅숏 ${summary.prevModels} → ${summary.mergedModels}개 (직전 ${summary.prevGeneratedAt ?? '없음'}) · ${path}`);
-    console.log(opts.write ? '  ✍️ 기록했다 — 카탈로그 폴드는 다음 로드(데몬 재시작·reloadCatalog)부터 보인다.' : '  🔎 드라이런 — 기록하려면 --write');
-    if (summary.sources.some((r) => !r.ok)) process.exitCode = 1;
-  });
-
-// ── tier SSOT — provider × tier → 모델 authoritative 조회(대표: "grok low tier" 헷갈림 종식) ──
-const tierCmd = program
-  .command('tier')
-  .description('LLM tier→모델 SSOT 조회 — provider별 budget/balanced/better/best/loaded 사다리(llm-tier-map). "grok low" 같은 별칭 흡수.');
-
-tierCmd
-  .command('resolve <provider> [tier]', { isDefault: true })
-  .description('provider(+tier) → 모델 해석. tier 생략 시 5단 전부. 별칭 low/mid/high/max 허용.')
-  .option('--json', 'JSON 출력')
-  .action(async (provider: string, tier: string | undefined, opts: { json?: boolean }) => {
-    const m = await import('./model-tier/llm-tier-map.js');
-    const t = await import('./model-tier/types.js');
-    const prov = provider.toLowerCase() as any;
-    const map = m.LLM_TIER_MAP_BY_PROVIDER[prov as keyof typeof m.LLM_TIER_MAP_BY_PROVIDER];
-    if (!map) { ui.error(`알 수 없는 provider: ${provider} (가능: ${m.TIER_PROVIDERS.join(', ')})`); process.exit(2); }
-    const rows = (tier ? [m.parseTierArg(tier)].filter(Boolean) as any[] : t.MODEL_TIERS) as readonly (typeof t.MODEL_TIERS)[number][];
-    if (tier && !rows.length) { ui.error(`알 수 없는 tier: ${tier} (canonical: ${t.MODEL_TIERS.join('/')} · 별칭: low/mid/high/max)`); process.exit(2); }
-    if (opts.json) {
-      await writeStdoutJson(JSON.stringify(rows.map((tk) => ({ provider: prov, tier: tk, ...map[tk] })), null, 2) + '\n');
-      return;
-    }
-    ui.header(`🎚️  ${prov} tier SSOT${tier ? ` · ${tier}→${m.parseTierArg(tier)}` : ''}`);
-    for (const tk of rows) {
-      const s = map[tk];
-      console.log(`  ${t.MODEL_TIER_LABELS[tk].padEnd(9)} → ${s.model.padEnd(30)} ${s.reasoningLevel ? `[reasoning:${s.reasoningLevel}]` : ''} · ${s.rationale}${s.status === 'wip' ? ' ⚠️wip' : ''}`);
-    }
-  });
-
-tierCmd
-  .command('list [provider]')
-  .alias('ls')
-  .description('전체 매트릭스(provider × 5 tier) 또는 한 provider. tier 헷갈림 방지용 한눈 표.')
-  .option('--json', 'JSON 출력')
-  .action(async (provider: string | undefined, opts: { json?: boolean }) => {
-    const m = await import('./model-tier/llm-tier-map.js');
-    const t = await import('./model-tier/types.js');
-    const provs = provider ? [provider.toLowerCase()] : m.TIER_PROVIDERS;
-    if (opts.json) {
-      const out: Record<string, unknown> = {};
-      for (const p of provs) { const map = (m.LLM_TIER_MAP_BY_PROVIDER as any)[p]; if (map) out[p] = Object.fromEntries(t.MODEL_TIERS.map((tk) => [tk, map[tk].model])); }
-      await writeStdoutJson(JSON.stringify(out, null, 2) + '\n'); return;
-    }
-    ui.header('🎚️  LLM tier→모델 SSOT 매트릭스 (llm-tier-map.ts · low=budget·mid=better·high=best·max=loaded)');
-    console.log(`  ${'provider'.padEnd(13)} ${t.MODEL_TIERS.map((tk) => tk.padEnd(13)).join(' ')}`);
-    console.log('  ' + '─'.repeat(13 + 14 * t.MODEL_TIERS.length));
-    for (const p of provs) {
-      const map = (m.LLM_TIER_MAP_BY_PROVIDER as any)[p];
-      if (!map) { ui.error(`알 수 없는 provider: ${p}`); continue; }
-      console.log(`  ${p.padEnd(13)} ${t.MODEL_TIERS.map((tk) => (map[tk].model.length > 13 ? map[tk].model.slice(0, 12) + '…' : map[tk].model).padEnd(13)).join(' ')}`);
-    }
-  });
-
-tierCmd
-  .command('providers')
-  .description('tier ladder 가 정의된 provider 목록.')
-  .action(async () => {
-    const m = await import('./model-tier/llm-tier-map.js');
-    console.log(m.TIER_PROVIDERS.join('\n'));
-  });
 
 const localCmd = program
   .command('local')
@@ -11186,6 +8178,12 @@ localCmd
     ui.info(`Next: \`elanous local ping\` to verify, then \`elanous local test\` for the full matrix.`);
   });
 
+function emitSchedulerRetirementNotice(family: 'scheduler'): void {
+  ui.error(`[elanous ${family}] retired in scheduler-retirement ROADMAP §R1.`);
+  ui.info('Use `elanous wf` for workflow management (workflow-runtime DAG · supersedes scheduler v2).');
+  process.exit(1);
+}
+
 // ── Scheduler CLI · retired (scheduler retirement ROADMAP §R1) ──
 //
 // `elanous scheduler` / `elanous sched` family retired. Scheduling becomes
@@ -11655,6 +8653,7 @@ wfCmd
   });
 
 const nexusCmd = program.command('nexus').description('NEXUS — unified TUI shell + supervisor + meta-api (Phase N-1, opt-in)');
+registerIngestTokenCommands(nexusCmd);
 
 // `elanous nexus run` — simplified surface (2026-05-11 refactor).
 //
@@ -12974,7 +9973,7 @@ voiceCmd
   });
 
 // ── Default: Dashboard (no subcommand) ──
-const DASHBOARD_FLAGS = new Set(['--debug', '--chat-only', '--chat', '--yolo', '--benchmark', '--rich']);
+const DASHBOARD_FLAGS = new Set(['--debug', '--chat-only', '--chat', '--yolo', '--benchmark']);
 
 export function filterDashboardArgs(rawArgs: readonly string[], resumeFlagIdx?: number): string[] {
   const rootResumeFlagIdx = resumeFlagIdx ?? rawArgs.findIndex((arg, index) =>
@@ -12987,7 +9986,7 @@ export function filterDashboardArgs(rawArgs: readonly string[], resumeFlagIdx?: 
   );
   const leadsWithSubcommand = rawArgs.length > 0 && !rawArgs[0]!.startsWith('-');
   return rawArgs.filter((a, i) => {
-    if (!leadsWithSubcommand && DASHBOARD_FLAGS.has(a)) return false;
+    if (!leadsWithSubcommand && (DASHBOARD_FLAGS.has(a) || a === '--rich')) return false;
     if (!leadsWithSubcommand && i === rootResumeFlagIdx) return false;
     if (!leadsWithSubcommand && rootResumeFlagIdx >= 0 && i === rootResumeFlagIdx + 1) return false;
     return true;
@@ -13034,6 +10033,14 @@ async function main(): Promise<void> {
 
   rawArgs = rewriteBareNexusToStatus({ rawArgs });
 
+  // A leading --rich was a dashboard launch flag. The dashboard no longer
+  // supports rich mode; reject it before remote resolution, help or TUI boot.
+  if (rawArgs[0]?.startsWith('-') && rawArgs.includes('--rich')) {
+    console.error('elanous: --rich is no longer supported by the dashboard');
+    process.exitCode = 1;
+    return;
+  }
+
   // MT5 — ACP server mode. When present, swap the whole startup path
   // for the ACP JSON-RPC server loop. The dashboard never draws in
   // this mode; parent program drives the agent through ACP.
@@ -13061,7 +10068,11 @@ async function main(): Promise<void> {
     // are opt-in without further CLI surface area. `hasSession`
     // mirrors `elanous serve` so loadSession can validate ids minted by
     // this same process across reconnect (M2.3).
-    const { runTurn, history, tools, toolCwd } = createDaemonRuntime({ killNonDetachedPty });
+    const { runTurn, history, tools, toolCwd } = createDaemonRuntime({
+      acpSessionCwd: true,
+      killNonDetachedPty,
+      ...(bootOpts.toolCwd !== undefined ? { toolCwd: bootOpts.toolCwd } : {}),
+    });
     const hasSession = (id: string): boolean => history.has(id);
     // MT5b polish — surface env-var resolution in the startup banner
     // (boot/acp-server.ts writeRuntimeBanner). Without this, stdio
@@ -13095,8 +10106,6 @@ async function main(): Promise<void> {
   //   --benchmark   benchmark-friendly chat boot: chat-only layout +
   //                 input focus from frame 1. Intended for scripted
   //                 Q&A benchmark loops (`bun run dev --benchmark`).
-  // --rich        TUI 부활 T0 — 이번 실행만 uiMode rich(기존 full
-  //               dashboard) 강제. essential 이 기본이 된 뒤의 탈출구.
   // T4.C — `elanous` no-arg default remote bookmark resolve. Order:
   //   --local > --remote <name> > ELANOUS_REMOTE > remotes.json default > local.
   // When a bookmark resolves, we synthesize ELANOUS_REMOTE / ELANOUS_TOKEN
@@ -13181,7 +10190,6 @@ async function main(): Promise<void> {
       rawArgs.includes('--debug') ||
       benchmark,
     yolo: rawArgs.includes('--yolo'),
-    rich: rawArgs.includes('--rich'),
     benchmark,
     ...(remote ? { remote } : {}),
     ...(resumeSessionId ? { resumeSessionId } : {}),

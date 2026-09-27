@@ -25,6 +25,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { join as joinPath } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 import {
   bridgeCoreTurnToAcp,
@@ -51,7 +52,7 @@ import {
 } from '../agent/terminal-surface.js';
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { elanousSelfAccessPrompt } from '../agent/self-ambient.js';
-import { createToolCwdResolver } from './tool-cwd.js';
+import { createToolCwdResolver, type ToolCwdResolver } from './tool-cwd.js';
 import { debug } from '../debug/log.js';
 
 /** C4 (2026-07-12) — arm the non-detached-PTY kill ONCE per turn signal.
@@ -108,9 +109,12 @@ export interface DaemonRuntimeOpts {
    *  to override per-invocation (CLI `--tools <kind>`). */
   tools?: import('./daemon-tools/index.js').DaemonToolSurfaceKind;
   /** M1.5 A.2 — working directory for fs-bound tools (Read · Grep).
-   *  Defaults to the daemon process's `cwd()` at boot. Honoured
-   *  only when `tools !== 'none'`. */
+   *  Non-ACP defaults to the daemon process's `cwd()` at boot; ACP uses
+   *  this only as a fallback when its session supplies no cwd.
+   *  Honoured only when `tools !== 'none'`. */
   toolCwd?: string;
+  /** ACP entry only: the client supplies cwd per session, not at daemon boot. */
+  acpSessionCwd?: boolean;
   /** C4 cancel seam — injected by the boot composition layer when a
    *  runtime exposes PtyShell. Keeps this headless module free of a
    *  direct pty-shell registry import while preserving cancel→PTY kill. */
@@ -519,6 +523,23 @@ export class DaemonSessionHistory {
   }
 }
 
+export function createDaemonBootToolCwdResolver(opts: DaemonRuntimeOpts, tools: string): ToolCwdResolver {
+  if (opts.acpSessionCwd && tools !== 'none') {
+    const defaultCwd = opts.toolCwd?.trim() || process.env.ELANOUS_TOOL_CWD?.trim();
+    if (!defaultCwd) {
+      return {
+        cwd: undefined,
+        resolveWriteCwd: () => { throw new Error('Tool surface has no working directory.'); },
+      };
+    }
+    return createToolCwdResolver({ tools, toolCwd: defaultCwd });
+  }
+  return createToolCwdResolver({
+    tools,
+    ...(opts.toolCwd !== undefined ? { toolCwd: opts.toolCwd } : {}),
+  });
+}
+
 /** Build a `runTurn` handler suitable for `bootAcpServer`'s
  *  `runTurn` option. Uses the supplied history store and the tool
  *  surface chosen via `opts.tools` (default 'none' = current
@@ -526,11 +547,9 @@ export class DaemonSessionHistory {
 export function createDaemonRunTurn(
   history: DaemonSessionHistory,
   opts: DaemonRuntimeOpts = {},
-  toolCwdResolver = createToolCwdResolver({
-    tools: opts.tools ?? 'none',
-    ...(opts.toolCwd !== undefined ? { toolCwd: opts.toolCwd } : {}),
-  }),
+  toolCwdResolver = createDaemonBootToolCwdResolver(opts, opts.tools ?? 'none'),
 ): NonNullable<AcpServerOptions['runTurn']> {
+  const turnToolCwd = new AsyncLocalStorage<ToolCwdResolver>();
   // Resolve tool surface synchronously so getTools is fast on the
   // hot path. M1.5 A.2 — when 'none', behavior matches pre-A.2
   // (`getTools` returns [], dispatchTool throws); when 'readonly',
@@ -605,9 +624,10 @@ export function createDaemonRunTurn(
       // current ACP scope when the LLM omits sessionId from args.
       const turnSignal = ctx?.signal;
       if (surfaceHasPtyShell && turnSignal) wirePtyKillOnAbort(turnSignal, killNonDetachedPty!);
+      const resolver = turnToolCwd.getStore() ?? toolCwdResolver;
       const dispatchCtx: import('./daemon-tools/types.js').DaemonToolDispatchCtx = {
-        cwd: toolCwdResolver.cwd!,
-        resolveWriteCwd: toolCwdResolver.resolveWriteCwd,
+        cwd: resolver.cwd!,
+        resolveWriteCwd: resolver.resolveWriteCwd,
         signal: turnSignal ?? new AbortController().signal,
         // Elanous's own LLM assembles tool arguments from natural language.
         entry: 'elanous-apparatus',
@@ -700,7 +720,12 @@ export function createDaemonRunTurn(
         });
         debugBridge.activate();
       }
-      await inner(turnCtx);
+      if (opts.acpSessionCwd) {
+        const resolver = createToolCwdResolver({ tools: opts.tools ?? 'none', toolCwd: turnCtx.cwd });
+        await turnToolCwd.run(resolver, () => inner(turnCtx));
+      } else {
+        await inner(turnCtx);
+      }
     } finally {
       debugBridge?.dispose();
     }
@@ -774,10 +799,7 @@ export function createDaemonRuntime(
           // permissive default — the sticky-webterm workflow stays
           // intact rather than silently disabling every tool.
           : 'webterm';
-  const toolCwdResolver = createToolCwdResolver({
-    tools: validTools,
-    ...(opts.toolCwd !== undefined ? { toolCwd: opts.toolCwd } : {}),
-  });
+  const toolCwdResolver = createDaemonBootToolCwdResolver(opts, validTools);
   // S4 (2026-07-12) — 크로스서피스 파리티: nexus 부트만 갖던 R5
   // read-through(on-disk SessionStore lazy 로드)를 standalone `elanous
   // serve` 런타임에도 기본 장착 — 어느 데몬으로 열든 텔레그램/디스코드/

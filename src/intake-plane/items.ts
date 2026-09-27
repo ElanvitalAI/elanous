@@ -221,24 +221,27 @@ export function parseRawIntakeJsonl(text: string): { raws: RawIntakeItem[]; bad:
 }
 
 /**
- * 자동 흡수 대기열 — 하루 상한(대표 결정 2026-09-26: 10편)까지 고른다. RFC §4 O1.
- * 순서: 사용자가 직접 남긴 것(텔레그램 저장된 메시지·메모) 먼저 → 입력원이 여럿인 것 → 점수(`*.score`) → 최근에 본 것.
+ * 자동 흡수 대기열 — 텔레그램 저장 링크는 별도 레인(기본 30), 일반 몫은 하루 상한(기본 10). RFC §4 O1.
+ * 레인이 먼저. 각 몫 안에서는 사용자가 직접 남긴 것(메모 포함) → 여러 입력원 → 점수(`*.score`) → 최근에 본 것.
  * 고른 항목은 `queued` 로 옮겨 다음 판에 다시 고르지 않는다(흡수 뒤 `absorbed`, 실패는 `deferred`).
  */
 const STALE_QUEUED_MS = 24 * 3600_000;
 
-export function pickAbsorbQueue(instanceRoot: string, opts: { max: number; kind?: IntakeKind; dryRun?: boolean }, now = new Date().toISOString()): IntakeItem[] {
+export function pickAbsorbQueue(instanceRoot: string, opts: { max: number; laneMax?: number; kind?: IntakeKind; dryRun?: boolean }, now = new Date().toISOString()): IntakeItem[] {
   const userLeft = (i: IntakeItem) => i.sources.some((s) => s === 'telegram-saved' || s === 'memo');
   const score = (i: IntakeItem) => Math.max(0, ...Object.entries(i.signals).filter(([k]) => k.endsWith('.score')).map(([, v]) => v));
-  const picked = [...loadIntakeLedger(instanceRoot).items.values()]
+  const eligible = [...loadIntakeLedger(instanceRoot).items.values()]
     // queued 로 옮긴 뒤 흡수·표시가 없이 하루가 지난 것(흡수 도중 죽은 판)은 다시 고른다.
     .filter((i) => (i.status === 'new' || (i.status === 'queued' && Date.parse(now) - Date.parse(i.lastSeenAt) > STALE_QUEUED_MS))
       && !!i.url && (!opts.kind || i.kind === opts.kind))
-    .sort((a, b) => Number(userLeft(b)) - Number(userLeft(a)) || b.sources.length - a.sources.length || score(b) - score(a) || b.lastSeenAt.localeCompare(a.lastSeenAt))
-    .slice(0, Math.max(0, opts.max));
+    .sort((a, b) => Number(userLeft(b)) - Number(userLeft(a)) || b.sources.length - a.sources.length || score(b) - score(a) || b.lastSeenAt.localeCompare(a.lastSeenAt));
+  const laneMax = opts.laneMax ?? 30;
+  const lane = eligible.filter((i) => i.sources.includes('telegram-saved')).slice(0, Math.max(0, laneMax));
+  const regular = eligible.filter((i) => !i.sources.includes('telegram-saved')).slice(0, Math.max(0, opts.max));
+  const picked = [...lane, ...regular];
   if (!opts.dryRun && picked.length) {
     appendItems(instanceRoot, picked.map((i) => ({ ...i, status: 'queued' as const, lastSeenAt: now })));
   }
-  debug.log('intake.normalize', 'absorb-queue', { picked: picked.length, max: opts.max, kind: opts.kind, dryRun: !!opts.dryRun });
+  debug.log('intake.normalize', 'absorb-queue', { picked: picked.length, max: opts.max, lane: lane.length, laneMax, kind: opts.kind, dryRun: !!opts.dryRun });
   return picked.map((i) => (opts.dryRun ? i : { ...i, status: 'queued' as const }));
 }

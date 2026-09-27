@@ -19,6 +19,7 @@ import { configuredWorktreeRoot } from '../user-config.js';
 import { worktreeHasChanges, commitWorktree, changedFiles } from '../self-implement/seams.js';
 import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { resolvePtyWebAddress } from '../cli/pty-web-address.js';
 import { reemitPtyUsage } from '../budget/pty-usage-reemit.js';
 import { classifyAuthError } from '../oauth/codex.js';
 import type { FallbackStep } from '../oauth/fallback-chain.js';
@@ -153,7 +154,19 @@ export const geminiBackend: AgentBackend = {
   cmd: 'agy',
   args: ['--dangerously-skip-permissions'],
   scrubEnv: ['GEMINI_API_KEY', 'GOOGLE_API_KEY', 'GOOGLE_GENAI_USE_VERTEXAI', 'GOOGLE_APPLICATION_CREDENTIALS'],
+  // 🩸 09-27(agy 1.2.12): 새 워크트리마다 «Do you trust the contents of this project?» 메뉴가 먼저 뜨고 첫 줄이
+  //    «> Yes, I trust this folder» 다. 처리가 없어 미션 문장이 이 메뉴로 들어가 사라졌고, 두뇌가 약 10분 뒤에야
+  //    다시 보냈다(탐침 run 06:03 → 06:13). 기본 선택(신뢰)을 Enter 로 고른다 — 워크트리는 elanous 가 만든 격리 트리다.
+  handleTrust: (screen, write) => {
+    if (agyNeedsTrust(screen)) { write('\r'); return true; }
+    return false;
+  },
 };
+
+/** agy 첫 화면의 폴더 신뢰 메뉴(기본 선택 = 신뢰). */
+export function agyNeedsTrust(screen: string): boolean {
+  return /Do you trust the contents of this project\?/.test(screen) && /Yes, I trust this folder/.test(screen);
+}
 
 /** xAI grok Build CLI 백엔드 — --always-approve(전툴 자동승인)·구독(grok login) 모드.
  *  scrub: XAI/GROK API 키 전부 → 남는 인증 = ~/.grok/auth.json(grok login oauth).
@@ -395,6 +408,8 @@ export interface AgentMissionResult {
   committed: boolean;
   usedOmniCrawl: boolean;
   detail: string;
+  ptyId?: string;
+  webUrl?: string | null;
 }
 /** @deprecated codex 특정 이름 — AgentMissionResult 을 쓰라. */
 export type CodexMissionResult = AgentMissionResult;
@@ -405,6 +420,7 @@ export interface AgentMissionDeps {
   createWorktree?: typeof createWorktree;
   recordWorktreeProvenance?: typeof recordHarnessWorktreeProvenance;
   runControlLoop?: typeof runPtyControlLoop;
+  resolvePtyWebAddress?: typeof resolvePtyWebAddress;
   resolveRunFallback?: (input: { currentStep: FallbackStep; currentCredentialRateLimited: true }) => { action: string; backend?: string };
   /** 재귀 재시도 사이에만 전달되는 런 로컬 폴백 진행 상태. */
   runtimeFallback?: RuntimeFallbackContext;
@@ -487,6 +503,8 @@ type EvidenceCheckDeps = {
   readonly executeTsc?: TscExecutor;
   readonly runTest?: (wt: string, testPath: string) => { ok: boolean; out: string };
   readonly hasChanges?: (wt: string) => boolean;
+  /** Worktree-relative paths this mission changed (uncommitted · untracked · committed since fork). */
+  readonly changedPaths?: (wt: string) => readonly string[];
 };
 
 export function checkEvidence(
@@ -501,8 +519,17 @@ export function checkEvidence(
   if (ev.kind === 'doc') {
     const dir = join(wt, ev.dirRel);
     if (!existsSync(dir)) return { ok: false, path: null, retry: `${ev.dirRel} 아래 문서가 아직 없다.` };
-    const hit = readdirSync(dir).find((f) => ev.glob.test(f));
-    return hit ? { ok: true, path: join(dir, hit) } : { ok: false, path: null, retry: `${ev.dirRel} 아래 대상 문서가 아직 없다.` };
+    // Only a document this mission wrote counts: a matching file that was already in the
+    // worktree (e.g. an old PLAN-*.md) passed round 0 without any work (🅞 09-27).
+    const changed = (deps.changedPaths ?? changedFiles)(wt);
+    const dirPrefix = `${ev.dirRel.replace(/\/+$/, '')}/`;
+    const isChanged = (f: string) => changed.some((c) => c === `${dirPrefix}${f}` || (c.endsWith('/') && `${dirPrefix}${f}`.startsWith(c)));
+    const matching = readdirSync(dir).filter((f) => ev.glob.test(f));
+    const hit = matching.find(isChanged);
+    if (hit) return { ok: true, path: join(dir, hit) };
+    return { ok: false, path: null, retry: matching.length
+      ? `${ev.dirRel} 아래 이름이 맞는 문서는 있지만 이번 미션이 쓴 것이 아니다 — 새로 작성하거나 고쳐라.`
+      : `${ev.dirRel} 아래 대상 문서가 아직 없다.` };
   }
   if (!hasChanges(wt)) return { ok: false, path: null, retry: '아직 변경사항이 없다. 실제 파일을 작성하라.' };
   if (ev.kind === 'tsc') {
@@ -868,6 +895,8 @@ export function recordMissionWorktreeProvenance(
 }
 
 // ══════════════════ 메인 ══════════════════
+export const AGENT_MISSION_TAKEOVER_WAIT_MS = 1_800_000;
+
 export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMissionDeps = {}): Promise<AgentMissionResult> {
   const backend = spec.agent ?? resolveDefaultBackend();
   const runtimeFallback = deps.runtimeFallback ?? {
@@ -980,6 +1009,9 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     instance: resolveInstanceName(),
   });
   debug.log('agent-mission', 'pty', { id: h.id, kind: h.kind, nickname: h.nickname, accessMode: h.accessMode, executorRef });
+  const webAddress = (deps.resolvePtyWebAddress ?? resolvePtyWebAddress)(h.id);
+  process.stderr.write(`[agent-mission] pty=${h.id} watch=${webAddress.webUrl ?? `(web unavailable: ${webAddress.pwaUnavailableReason ?? 'not-resolved'})`}\n`);
+  debug.log('agent-mission', 'pty-link', { id: h.id, webUrl: webAddress.webUrl, webUrlSource: webAddress.webUrlSource });
 
   // ⭐P2 arbiter: the child is accessMode='auto' (brain-owned), so the driver —
   // the autonomous brain — must write as 'agent' or the arbiter denies it. This
@@ -987,9 +1019,8 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   // inject unless they takeover (auto→write, needs 'open' policy). `h['write']`
   // form so the drive helper isn't caught by the h.write→drive rewrite.
   //
-  // ⭐takeover 조율/셀프힐(review): 사람이 takeover 하면(auto→write) agent write 가 arbiter 에
-  // 거부된다. 조용히 유실돼 미션이 헛도는 대신, drive 前 canWrite 로 감지해 미션을 깔끔히 중단
-  // (사람이 제어를 가져갔으니 자율 구동 멈춤 = HITL 로 넘어감). 관측 남김.
+  // 초기 미션 전송 중 소유권을 잃으면 write 를 시도하지 않는다. 제어 루프에 들어간 뒤의
+  // takeover 는 awaitOwnership 으로 기다리며, 사람이 release 하면 미션을 재개한다.
   const drive = (s: string): void => {
     // ⭐공용 seam(P2b P-a′) — 판정은 `pty-control-stance` 한 곳. 집행(throw)은 종전 그대로다(무회귀).
     const stance = probeControlStance(h, 'agent', (e) =>
@@ -1114,11 +1145,13 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   // ★ 동일 버스 인스턴스 보장(리뷰 should-fix) — observe 구독과 EMIT(makeMissionObserveStep)이 **같은** 버스를
   //   봐야 프레임이 흐른다. getChannelBus() 를 두 번 부르지 말고 지역 캐시로 구조적 보장.
   const bus = getChannelBus();
+  debug.log('agent-mission', 'takeover-wait', { id: h.id, maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS });
   const control = await runWithControlObserve(
     bus, execSurfaceId(h.id),
     (d) => debug.log('agent-mission.observe', 'progress', { surfaceId: d.surfaceId, state: d.state, summary: d.summary, unknownInput: d.unknownInput, frame: d.frameCount, runId: d.runId }),
     () => (deps.runControlLoop ?? runPtyControlLoop)(brain, {
       ...controlDepsForHandle(h),
+      awaitOwnership: { maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS },
       settle: async () => { await waitForQuiet(h, 6000, 360000); },
       // ★ U5 — 제어스텝 관측: 프레임 버스 발행(PTY 감독 계열 통일 합류·headless #5379 와 동일 seam) + 화면 전사.
       //   발행 먼저·내부 fail-soft(관측이 미션 안 깸)·capture 는 예외 전파(원 semantics). 배선=makeMissionObserveStep.
@@ -1176,7 +1209,6 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   debug.log('agent-mission', 'control-result', { termination: control.termination.kind, steps: control.steps });
   if (control.termination.kind === 'cancelled') {
     stopLive();
-    try { h.kill(); } catch { /* noop */ }
     throw new Error('AGENT_YIELDED: PTY 제어가 사람에게 이양됨(takeover) — 자율 미션 중단');
   }
 
@@ -1196,6 +1228,7 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   return {
     ok: finalEv.ok, worktree: wt.path, branch: wt.branch, rounds: round,
     evidencePath, committed, usedOmniCrawl: usedOmni,
+    ptyId: h.id, webUrl: webAddress.webUrl,
     detail: done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
   };
 }

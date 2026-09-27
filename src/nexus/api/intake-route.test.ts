@@ -18,6 +18,10 @@ afterEach(() => {
   logged.length = 0;
 });
 
+function routeLogs() {
+  return logged.filter((row) => row.category === 'intake.route');
+}
+
 function post(body: unknown): Request {
   return new Request('http://127.0.0.1/v1/intake/route', {
     method: 'POST',
@@ -33,6 +37,9 @@ test('200 응답은 판정 결과와 dryRun true · decidedBy 를 담는다', as
   expect(res.status).toBe(200);
   const body = await res.json() as Record<string, unknown>;
   expect(body.track).toBe('absorb');
+  expect(body.kind).toBe('link');
+  expect(body.urlRoute).toMatchObject({ kind: 'youtube', absorb: false });
+  expect(Object.keys(body.urlRoute as object).sort()).toEqual(['absorb', 'kind', 'skill']);
   expect(body.decidedBy).toBe('rule');
   expect(body.dryRun).toBe(true);
   expect(typeof body.reason).toBe('string');
@@ -55,8 +62,8 @@ test('로그 데이터에 원문 문자열이 없고 textLength 만 있다', asy
   const text = '이거 정리해줘 https://a.example';
   const res = await handleIntakeRoutePost(post({ text, consent: 'route' }));
   expect(res.status).toBe(200);
-  expect(logged).toHaveLength(1);
-  const row = logged[0]!;
+  expect(routeLogs()).toHaveLength(1);
+  const row = routeLogs()[0]!;
   expect(row.category).toBe('intake.route');
   expect(row.event).toBe('decided');
   const data = row.data as Record<string, unknown>;
@@ -79,10 +86,10 @@ test('규칙 밖 글은 요청하지 않으면 분류기를 부르지 않고 규
   };
   for (const classifyValue of [undefined, false, 'true']) {
     const res = await handleIntakeRoutePost(post({ text: '이 글 어떻게 할까요?', consent: 'route', classify: classifyValue }), { classify });
-    expect(await res.json()).toEqual({ track: 'ask-human', confidence: 0, reason: 'rule-unknown', decidedBy: 'rule', dryRun: true });
+    expect(await res.json()).toEqual({ track: 'ask-human', confidence: 0, reason: 'rule-unknown', decidedBy: 'rule', kind: 'question', urlRoute: null, dryRun: true });
   }
   expect(calls).toHaveLength(0);
-  expect(logged.map((row) => (row.data as { classifierCalled: boolean }).classifierCalled)).toEqual([false, false, false]);
+  expect(routeLogs().map((row) => (row.data as { classifierCalled: boolean }).classifierCalled)).toEqual([false, false, false]);
 });
 
 test('규칙 밖 글에 classify true 이면 한 번만 분류하고 길이만 기록한다', async () => {
@@ -93,8 +100,8 @@ test('규칙 밖 글에 classify true 이면 한 번만 분류하고 길이만 �
     classify: async (value) => { calls.push(value); return decision; },
   });
   expect(calls).toEqual([text]);
-  expect(await res.json()).toEqual({ ...decision, dryRun: true });
-  expect(logged[0]!.data).toEqual({ track: 'tasks', decidedBy: 'classifier', confidence: 0.83, textLength: new TextEncoder().encode(text).byteLength, classifierCalled: true });
+  expect(await res.json()).toEqual({ ...decision, kind: 'question', urlRoute: null, dryRun: true });
+  expect(routeLogs()[0]!.data).toEqual({ track: 'tasks', decidedBy: 'classifier', confidence: 0.83, textLength: new TextEncoder().encode(text).byteLength, classifierCalled: true });
   expect(JSON.stringify(logged)).not.toContain(text);
 });
 
@@ -117,6 +124,6 @@ test('끝나지 않는 분류기는 제한 시간을 넘으면 timeout 판정한
   const res = await handleIntakeRoutePost(post({ text: '어느 쪽일까요?', consent: 'route', classify: true }), {
     classify: async () => new Promise(() => {}), classifyTimeoutMs: 20,
   });
-  expect(await res.json()).toEqual({ track: 'ask-human', confidence: 0, reason: 'classifier-failed:timeout', decidedBy: 'classifier', dryRun: true });
-  expect(logged[0]!.data).toMatchObject({ classifierCalled: true, decidedBy: 'classifier' });
+  expect(await res.json()).toEqual({ track: 'ask-human', confidence: 0, reason: 'classifier-failed:timeout', decidedBy: 'classifier', kind: 'question', urlRoute: null, dryRun: true });
+  expect(routeLogs()[0]!.data).toMatchObject({ classifierCalled: true, decidedBy: 'classifier' });
 });

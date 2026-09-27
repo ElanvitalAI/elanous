@@ -389,6 +389,7 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
   });
   afterEach(() => { rmSync(box, { recursive: true, force: true }); });
 
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('직전 런이 커밋해 둔 산출 ⊕ 이번 런의 미커밋 변경을 한 diff 로 담는다', async () => {
     // ① 직전 런이 죽으며 preserveBlockedArtifacts 가 산출을 커밋해 둔 상태
     writeFileSync(join(work, 'wiring.ts'), 'export const wiring = 1;\n');
@@ -411,6 +412,7 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
   // ⛔ 위 테스트는 서로 다른 파일이라 "두 diff 를 이어 붙인" 구현으로도 통과한다. 같은 파일을 커밋 후
   //    다시 고쳐 **file patch 가 하나만** 나오는 것을 고정한다(이어붙이기면 헤더가 두 번 나온다 ⇒
   //    splitDiffByFile 예산 분할이 같은 파일을 두 조각으로 세게 된다).
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('같은 파일이 커밋·미커밋 양쪽에서 바뀌어도 file patch 는 하나다', async () => {
     writeFileSync(join(work, 'shared.ts'), 'export const a = 1;\n');
     git(work, 'add', 'shared.ts');
@@ -427,6 +429,7 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
 
   // ⭐ 수용기준 6 — 관측이 남는 것만이 아니라 **그 수가 참인가**. committedChars 를 뺄셈으로 구하면
   //    같은 파일이 양쪽에서 바뀔 때 거짓이 되므로(1R must-fix) 실제 diff 길이와 대조해 고정한다.
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('review.diff-scope 관측의 세 수가 실제 diff 길이와 일치한다', async () => {
     writeFileSync(join(work, 'shared.ts'), 'export const a = 1;\n');
     git(work, 'add', 'shared.ts');
@@ -458,6 +461,7 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
     expect(events[0]!.committedChars).not.toBe(scoped.length - uncommittedOnly.length);
   });
 
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('원격이 없어도 로컬 기본 브랜치에서 갈라진 커밋 변경을 리뷰 diff 에 담는다', async () => {
     git(noOrigin, 'checkout', '-b', 'dev/child');
     writeFileSync(join(noOrigin, 'committed.txt'), 'committed change\n');
@@ -481,6 +485,7 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
   });
 
   // 🩸 2026-09-23(#20027 직후 회귀): 기준이 없어도 «볼 변경»이 있으면 그것을 리뷰해야 한다 — 비었을 때만 «못 쟀다».
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('기준을 못 구해도 미커밋 변경이 있으면 그 diff 를 준다 — 측정 불가가 아니다', async () => {
     git(noOrigin, 'checkout', '--orphan', 'orphan-dirty');
     writeFileSync(join(noOrigin, 'root.txt'), 'root\n');
@@ -492,6 +497,7 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
     expect(scoped).toContain('edited');
   });
 
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('어느 기준으로도 merge-base 를 못 구하면 미커밋 diff 가 아니라 측정 불가를 낸다', async () => {
     writeFileSync(join(noOrigin, 'local-change.txt'), 'changed\n');
     git(noOrigin, 'checkout', '--orphan', 'orphan');
@@ -513,6 +519,7 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
     })]);
   });
 
+  // Fake bin: git; invoked command: git (execFile/spawnSync); the fake forwards all but the full diff to real git.
   test('full diff가 실패하면 실제 seam 관측에 전달된 baseOrigin과 함께 종전 동작으로 폴백한다', async () => {
     writeFileSync(join(work, 'committed.ts'), 'export const committed = true;\n');
     git(work, 'add', 'committed.ts');
@@ -521,8 +528,8 @@ describe('reviewScopeDiff — 이미 커밋된 산출도 리뷰 범위에 든다
     const bin = join(box, 'bin');
     mkdirSync(bin);
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
-    const counter = join(box, 'git-calls');
-    writeFileSync(join(bin, 'git'), `#!/bin/sh\ncount=0\n[ -f ${JSON.stringify(counter)} ] && count=$(cat ${JSON.stringify(counter)})\ncount=$((count + 1))\nprintf '%s' "$count" > ${JSON.stringify(counter)}\nif [ "$count" -eq 4 ]; then exit 1; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
+    // Fail the full diff by its argv, not by a call count that changes when Git observation runs first.
+    writeFileSync(join(bin, 'git'), `#!/bin/sh\nif [ "$1" = diff ] && [ "$2" = --no-color ] && [ "$#" -eq 3 ]; then exit 1; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(join(bin, 'git'), 0o755);
     const events: Record<string, unknown>[] = [];
     const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
@@ -2909,6 +2916,7 @@ describe('defaultSeams.reviewDiff — reviewer context와 diff 밖 이행 주장
 });
 
 describe('defaultSeams.reviewDiff — review.done 라운드 관측', () => {
+  // Fake bin: none; invoked command: git (only the unmocked noDiffResult uses real reviewScopeDiff).
   test('완료·변경 없음 결과에는 전달된 라운드를 싣고, 없는 라운드 키는 만들지 않는다', async () => {
     const changedRepo = mkdtempSync(join(tmpdir(), 'seams-review-round-changed-'));
     const noDiffRepo = mkdtempSync(join(tmpdir(), 'seams-review-round-no-diff-'));
@@ -2945,6 +2953,7 @@ describe('defaultSeams.reviewDiff — review.done 라운드 관측', () => {
 });
 
 describe('defaultSeams.reviewDiff — 측정 불가와 진짜 빈 diff', () => {
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('merge-base 를 구했는데 diff 가 비면 여전히 no-diff 다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'seams-review-true-empty-'));
     try {
@@ -2961,6 +2970,7 @@ describe('defaultSeams.reviewDiff — 측정 불가와 진짜 빈 diff', () => {
     }
   });
 
+  // Fake bin: none; invoked command: git (fixture via spawnSync, review via execFile/spawnSync).
   test('어느 기준으로도 범위를 못 재고 작업 트리가 깨끗하면 pass 도 no-diff 도 아니다', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'seams-review-unmeasurable-'));
     const events: Record<string, unknown>[] = [];

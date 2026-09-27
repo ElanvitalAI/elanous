@@ -4,7 +4,8 @@ import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Send, Paperclip, X, Mic, MicOff } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { isMetaCommand } from '@/lib/chat-runtime';
+import { isMetaCommand, META_COMMANDS } from '@/lib/chat-runtime';
+import { takeSharePrefill } from '@/lib/share-prefill';
 import { cn } from '@/lib/utils';
 import { CameraAttachButton } from '@/components/terminal/CameraAttachButton';
 import { FileAttachButton } from '@/components/terminal/FileAttachButton';
@@ -19,22 +20,12 @@ import {
   saveSnapshot,
   snapshotKey,
 } from '@/lib/snapshot';
-import {
-  BackendPickerChip,
-  type AgentCliBackend,
-  type CodexPlugin,
-} from '@/components/chat/BackendPickerChip';
 import { ElanousProviderChip } from '@/components/chat/ElanousProviderChip';
 import { useMissionRouter } from '@/lib/use-mission-router';
-import {
-  DEFAULT_CHAT_ROUTING,
-  getChatRouting,
-  subscribeChatRouting,
-  type ChatRoutingState,
-} from '@/lib/chat-routing-storage';
+import { DEFAULT_CHAT_ROUTING, getChatRouting, subscribeChatRouting } from '@/lib/chat-routing-storage';
 
-const SHARE_PREFILL_KEY = 'elanous.pwa.sharePrefill';
 const INPUT_PERSIST_DEBOUNCE_MS = 300;
+const EMPTY_ATTACHMENTS: AttachmentMeta[] = [];
 
 // PWA Phase 1·E+H (RESEARCH-ios-companion-tui-parity-2026-05-17 · Phase 1b)
 // — TUI src/chat/input-edit-key.ts:36-48 의 PWA 등가. localStorage 에
@@ -64,33 +55,24 @@ function savePromptHistory(history: readonly string[]): void {
   } catch { /* swallow — quota or disabled */ }
 }
 
-// PWA Phase 1·D (RESEARCH §1.1) — TUI src/chat/index.ts 의 SLASH_COMMANDS
-// 의 iOS-meaningful subset visual picker. iOS PR #2804 의 SlashCatalog 와
-// 1:1 mirror.
-interface SlashCommand {
-  name: string;
-  description: string;
-  /** true = client-local (parent's onSubmit handler with isMetaCommand
-   *  side-channel) · false = daemon prompt forward. */
-  clientLocal: boolean;
+function filterSlashCommands(query: string): readonly { name: string; description: string }[] {
+  const trimmed = query.trim().toLowerCase();
+  if (trimmed.length === 0) return META_COMMANDS;
+  return META_COMMANDS.filter((c) => c.name.toLowerCase().startsWith(trimmed));
 }
 
-const SLASH_COMMANDS: SlashCommand[] = [
-  { name: 'help',      description: '명령어 도움말',             clientLocal: true },
-  { name: 'clear',     description: '현재 chat 화면 비우기',      clientLocal: true },
-  { name: 'sessions',  description: '세션 목록 / 전환',           clientLocal: false },
-  { name: 'memory',    description: '저장된 memory 보기',         clientLocal: false },
-  { name: 'status',    description: 'daemon · autopilot 상태',    clientLocal: false },
-  { name: 'provider',  description: 'backend provider 변경',      clientLocal: false },
-  { name: 'reasoning', description: '추론 mode 설정',             clientLocal: false },
-  { name: 'plan',      description: '현재 plan 표시 (autopilot)', clientLocal: false },
-  { name: 'sync',      description: 'daemon force sync',          clientLocal: false },
-];
-
-function filterSlashCommands(query: string): SlashCommand[] {
-  const trimmed = query.trim().toLowerCase();
-  if (trimmed.length === 0) return SLASH_COMMANDS;
-  return SLASH_COMMANDS.filter((c) => c.name.toLowerCase().startsWith(trimmed));
+/** 슬래시 메뉴가 열린 채 Enter — 친 글이 명령 이름과 «정확히» 같으면 바로 실행(`:name` 전송),
+ *  아니면 지금처럼 고른 항목으로 완성(`:name ` 을 입력창에). 2026-09-27 시나리오 러너 C2b:
+ *  `/help` ⊕ Enter 가 입력창만 `:help ` 로 바꾸고 아무것도 안 보냈다. */
+export function slashEnterAction(
+  query: string,
+  filtered: readonly { name: string }[],
+  selectedIndex: number,
+): { kind: 'run'; line: string } | { kind: 'complete'; value: string } | null {
+  const exact = filtered.find((c) => c.name.toLowerCase() === query.trim().toLowerCase());
+  if (exact) return { kind: 'run', line: `:${exact.name}` };
+  const picked = filtered[Math.min(Math.max(selectedIndex, 0), filtered.length - 1)];
+  return picked ? { kind: 'complete', value: `:${picked.name} ` } : null;
 }
 
 /** Detect trailing `/<query>` for the slash menu. Returns the prefix or
@@ -170,12 +152,8 @@ interface Props {
   /** PWA Phase 2·B — `$` skill picker fetcher. parent (ChatLayout) 가
    *  AcpConnection.send('elanous/skills/list', ...) 으로 wire. */
   onListSkills?: (query: string) => Promise<{ entries: SkillPickerEntry[] }>;
-  /** PLAN-codex-app-server-hermes-parity §5 Phase H2·4 (2026-05-16) —
-   *  daemon fetcher for the codex CLI plugin list. ChatLayout wires
-   *  this with `acpForAsk.send('elanous/codex/plugins', {sessionId})`.
-   *  Forward into BackendPickerChip so its menu shows the sub-items
-   *  under the Codex entry. */
-  getCodexPlugins?: () => Promise<CodexPlugin[]>;
+  /** New shared text from the parent after mount. The id distinguishes repeat actions. */
+  prefill?: { text: string; id: number };
 }
 
 function fmtKB(bytes: number): string {
@@ -196,39 +174,17 @@ function attachmentSrc(downloadUrl: string, baseUrl?: string, token?: string): s
   return `${base}${downloadUrl}${auth}`;
 }
 
-const BACKEND_PERSIST_KEY = 'elanous.pwa.chat.backend';
-const STICKY_PERSIST_KEY = 'elanous.pwa.chat.backendSticky';
-const DEFAULT_BACKEND: AgentCliBackend = 'elanous-builtin';
-
-function readBackendPersist(): AgentCliBackend {
-  if (typeof window === 'undefined') return DEFAULT_BACKEND;
-  try {
-    const v = window.localStorage.getItem(BACKEND_PERSIST_KEY);
-    if (v === 'elanous-builtin' || v === 'codex-app-server' || v === 'claude' || v === 'gemini') {
-      return v;
-    }
-  } catch { /* swallow */ }
-  return DEFAULT_BACKEND;
-}
-
-function readStickyPersist(): boolean {
-  if (typeof window === 'undefined') return false;
-  try {
-    return window.localStorage.getItem(STICKY_PERSIST_KEY) === '1';
-  } catch { return false; }
-}
-
 export function ChatInput({
   onSubmit,
   disabled,
-  attachments = [],
+  attachments = EMPTY_ATTACHMENTS,
   onAttached,
   onRemoveAttachment,
   tabId,
   voice,
   onListFiles,
   onListSkills,
-  getCodexPlugins,
+  prefill,
 }: Props) {
   const { config } = useDaemon();
   const persistKey = snapshotKey('chatInput', tabId);
@@ -323,6 +279,25 @@ export function ChatInput({
   const skillQuery = onListSkills ? detectTrailingToken(value, '$') : null;
   const [skillEntries, setSkillEntries] = useState<SkillPickerEntry[]>([]);
   const [skillSelectedIndex, setSkillSelectedIndex] = useState<number>(0);
+  const [routing, setRouting] = useState(DEFAULT_CHAT_ROUTING);
+  useEffect(() => {
+    setRouting(getChatRouting());
+    return subscribeChatRouting(setRouting);
+  }, []);
+  const { prediction, predict, clear } = useMissionRouter({
+    baseUrl: config.baseUrl,
+    token: config.token,
+    enabled: routing.autoRouting,
+  });
+  useEffect(() => {
+    if (!routing.autoRouting) {
+      clear();
+      return;
+    }
+    const attachmentKinds = attachments.map((a): 'image' | 'document' =>
+      a.mediaType?.startsWith('image/') ? 'image' : 'document');
+    predict(value, attachmentKinds);
+  }, [value, routing.autoRouting, attachments, predict, clear]);
   useEffect(() => {
     if (skillQuery === null || !onListSkills) return;
     setSkillSelectedIndex(0);
@@ -339,44 +314,24 @@ export function ChatInput({
       setSkillSelectedIndex(0);
     }
   }, [skillQuery]);
-  // P2-1 (2026-05-14) — backend chip + mission router state. Mirrors
-  // iOS's @AppStorage("chatBackend") + @AppStorage("chatBackendSticky").
-  const [backend, setBackend] = useState<AgentCliBackend>(readBackendPersist);
-  const [sticky, setSticky] = useState<boolean>(readStickyPersist);
-  // dogfood polish (2026-05-14 EoD #8) — Settings 의 두 토글 mirror.
-  // SSR safety: 첫 render 는 default · mount 후 localStorage 로 sync ·
-  // cross-tab fan-out 도 구독.
-  const [routing, setRouting] = useState<ChatRoutingState>(DEFAULT_CHAT_ROUTING);
-  useEffect(() => {
-    setRouting(getChatRouting());
-    return subscribeChatRouting(setRouting);
-  }, []);
-  // ACP backends OFF 시 chip 자체 숨김 → 사용자가 send 직전 backend
-  // 선택 surface 없음. PWA /chat 의 실 send path 는 elanous-builtin 단일
-  // (BackendPickerChip 의 visual port deferred wire) 이라 추가 forcing
-  // 불필요. iOS 측은 chatBackend computed property 에서 동일 forcing.
-  const missionRouter = useMissionRouter({
-    baseUrl: config.baseUrl,
-    token: config.token,
-    enabled: !sticky && routing.autoRouting,
-  });
-
   // WT-N-6 — when the share-target page (/app/share/) stashed text in
   // sessionStorage we prefill the textarea on mount. One-shot: drain
   // the key so a manual reload doesn't re-prefill. Toast hint so the
   // user understands where the unexpected text came from. Share prefill
   // wins over snapshot (explicit user intent vs ambient persistence).
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try {
-      const stash = window.sessionStorage.getItem(SHARE_PREFILL_KEY);
-      if (stash && stash.length > 0) {
-        setValue(stash);
-        window.sessionStorage.removeItem(SHARE_PREFILL_KEY);
-        toast.success('📥 공유 받음 — 검토 후 보내세요');
-      }
-    } catch { /* swallow — sessionStorage may be disabled */ }
+    const stash = takeSharePrefill();
+    if (stash) {
+      setValue(stash);
+      toast.success('📥 공유 받음 — 검토 후 보내세요');
+    }
   }, []);
+
+  useEffect(() => {
+    if (!prefill) return;
+    setValue(prefill.text);
+    takeSharePrefill();
+  }, [prefill]);
 
   // BACKLOG #3 — debounce-persist textarea value so an LRU-frozen
   // unmount doesn't drop a half-typed prompt. Empty value clears the
@@ -393,42 +348,9 @@ export function ChatInput({
     };
   }, [value, persistKey]);
 
-  // P2-1 — persist backend + sticky to @localStorage so the chip
-  // remembers the user's choice across reloads (mirrors iOS @AppStorage).
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try { window.localStorage.setItem(BACKEND_PERSIST_KEY, backend); }
-    catch { /* swallow */ }
-  }, [backend]);
-  useEffect(() => {
-    if (typeof window === 'undefined') return;
-    try { window.localStorage.setItem(STICKY_PERSIST_KEY, sticky ? '1' : '0'); }
-    catch { /* swallow */ }
-  }, [sticky]);
-
-  // P2-1 — debounce-call POST /v1/llm/route/predict on every input
-  // change. Sticky / autoRouting=OFF short-circuit inside
-  // useMissionRouter (enabled flag) + here for chip clear.
-  useEffect(() => {
-    if (sticky || !routing.autoRouting) {
-      missionRouter.clear();
-      return;
-    }
-    const attachmentKinds = attachments
-      .map((a): 'image' | 'document' | undefined => {
-        if (typeof a.mediaType === 'string' && a.mediaType.startsWith('image/')) return 'image';
-        return 'document';
-      })
-      .filter((k): k is 'image' | 'document' => k !== undefined);
-    missionRouter.predict(value, attachmentKinds);
-    // missionRouter object is stable per render; depending on it directly
-    // would re-fire whenever React rebinds the closure. We intentionally
-    // key on input snapshot.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [value, sticky, routing.autoRouting, attachments.length]);
-
-  const submit = (): void => {
-    const trimmed = value.trim();
+  const submit = (): void => submitText(value);
+  const submitText = (text: string): void => {
+    const trimmed = text.trim();
     // Allow attachment-only sends (no body text) so the user can ship a
     // file with no caption — LLM still gets the path lines prepended.
     if (disabled) return;
@@ -531,34 +453,14 @@ export function ChatInput({
     }
     if (slashQuery !== null && slashFiltered.length > 0) {
       const idx = Math.min(Math.max(slashSelectedIndex, 0), slashFiltered.length - 1);
-      setValue(`/${slashFiltered[idx].name}`);
+      commitSlashSelection(slashFiltered[idx]);
       return true;
     }
     return false;
   };
 
-  // PWA Phase 1·D — slash menu commit. clientLocal 명령 (`/clear`, `/help`)
-  // 은 parent's isMetaCommand path 를 통해 처리되도록 input 에 set 후 즉시
-  // submit · 그 외는 input 에 `/cmd ` 으로 set (사용자 추가 args 가능).
-  const commitSlashSelection = (): void => {
-    if (slashFiltered.length === 0) return;
-    const idx = Math.min(Math.max(slashSelectedIndex, 0), slashFiltered.length - 1);
-    const cmd = slashFiltered[idx];
-    if (cmd.clientLocal) {
-      // `/help` · `/clear` — 즉시 submit (parent's isMetaCommand 가
-      // 처리). 사용자 추가 args 의도 없는 client-local.
-      const text = `/${cmd.name}`;
-      setValue(text);
-      // submit() 의 trim 후 onSubmit · parent 가 isMetaCommand 으로 분기.
-      requestAnimationFrame(() => {
-        onSubmit(text);
-        setValue('');
-        clearSnapshot(persistKey);
-      });
-    } else {
-      // daemon-forward — args 자리 확보 + 사용자 추가 typing.
-      setValue(`/${cmd.name} `);
-    }
+  const commitSlashSelection = (cmd = slashFiltered[Math.min(Math.max(slashSelectedIndex, 0), slashFiltered.length - 1)]): void => {
+    if (cmd) setValue(`:${cmd.name} `);
   };
 
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>): void => {
@@ -654,7 +556,9 @@ export function ChatInput({
     if (slashQuery !== null && slashFiltered.length > 0) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        commitSlashSelection();
+        const action = slashEnterAction(slashQuery, slashFiltered, slashSelectedIndex);
+        if (action?.kind === 'run') submitText(action.line);
+        else if (action) setValue(action.value);
         return;
       }
       if (e.key === 'ArrowUp') {
@@ -844,8 +748,7 @@ export function ChatInput({
           </ul>
         </div>
       )}
-      {/* PWA Phase 1·D — slash menu overlay (textarea 위). prefix filter +
-          ↑↓ Enter Esc keyboard nav · 9 commands. */}
+      {/* Local meta commands, filtered by the runtime's handler catalog. */}
       {slashQuery !== null && (
         <div className="mb-2 overflow-hidden rounded-md border border-border bg-card shadow-md">
           <div className="flex items-center justify-between px-3 py-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -868,9 +771,7 @@ export function ChatInput({
                       // slashQuery 를 derived = null 으로 만들기 전 commit).
                       e.preventDefault();
                       setSlashSelectedIndex(idx);
-                      // requestAnimationFrame 통해 setValue 의 next tick
-                      // 에서 commit 수행 (state batch 호환).
-                      requestAnimationFrame(() => commitSlashSelection());
+                      commitSlashSelection(cmd);
                     }}
                     className={cn(
                       'flex cursor-pointer items-center gap-2 px-3 py-1.5 text-sm',
@@ -881,12 +782,9 @@ export function ChatInput({
                       'font-mono',
                       selected ? 'font-semibold text-foreground' : 'text-foreground/86',
                     )}>
-                      /{cmd.name}
+                      :{cmd.name}
                     </span>
                     <span className="text-xs text-muted-foreground">{cmd.description}</span>
-                    {cmd.clientLocal && (
-                      <span className="ml-auto rounded border border-border px-1 py-px text-[10px] uppercase text-muted-foreground">local</span>
-                    )}
                   </li>
                 );
               })}
@@ -955,24 +853,12 @@ export function ChatInput({
               text-selection menu. */}
           <SaveAsNoteButton />
           <ShowroomVoiceIntake />
-          {/* P2-1 (2026-05-14) — backend chip + mission tag.
-              Visual parity with iOS BackendPickerChip.swift.
-              dogfood polish (EoD #8) — Settings 의 acpBackends OFF 시
-              chip 자체 숨김 + elanous-builtin 고정 (effectiveBackend).
-              autoRouting OFF 시 mission tag 만 클리어. */}
-          {routing.acpBackends && (
-            <BackendPickerChip
-              selection={backend}
-              onChange={setBackend}
-              mission={routing.autoRouting ? missionRouter.prediction?.mission : undefined}
-              sticky={sticky}
-              onStickyToggle={() => setSticky((s) => !s)}
-              disabled={disabled}
-              getCodexPlugins={getCodexPlugins}
-            />
+          <ElanousProviderChip />
+          {routing.autoRouting && prediction && (
+            <span className="text-xs text-muted-foreground" title="입력 의도 분류 · ACP 송신 경로는 변경하지 않습니다">
+              {prediction.mission}
+            </span>
           )}
-          {/* elanous backend 선택 시 LLM provider 스위처(claude/opus·grok 등). */}
-          {backend === 'elanous-builtin' && <ElanousProviderChip />}
         </div>
         <textarea
           value={value}

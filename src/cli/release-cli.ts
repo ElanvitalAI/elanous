@@ -317,7 +317,23 @@ export function stateRoundTrip(elanous: string, home: string, env: NodeJS.Proces
   return { memory, logs: /"registeredStores":0\b/.test(`${read.stdout}${read.stderr}`) ? 'no-store' : 'fail' };
 }
 
-export async function verifyRelease(opts: { version?: string; publicRepo?: string; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ ok: boolean; versionLine: string; installerUrl: string; steps?: { install: number | null; selfUpdate: number | null; uninstall: number | null }; state?: { memory: boolean; logs: LogRoundTrip } }> {
+/** 공개 판의 노트가 문서 사이트에 있나 — 🅕 제보(09-27): 0.2.2 노트가 GitHub 릴리스에만 있고 docs 에 없었다(#21137 이 뒤에 옮김).
+ *  `publish` 는 아무 경로의 본문 파일을 받으므로 원본(`release/public/내부 문서 `<판>``)·사이트 배포를 빼먹어도 모른다 ⇒ verify 가 사이트를 잰다.
+ *  정식 판만(`-rc.N` 같은 선행 판은 노트 페이지를 두지 않는다). */
+export const DOCS_SITE = 'https://docs.elanous.ai';
+export function releaseNotesPageUrl(version: string): string | null {
+  if (version.includes('-')) return null;
+  return `${DOCS_SITE}/releases/${version.replace(/\./g, '-')}/`;
+}
+export type NotesPage = 'ok' | 'missing' | 'not-required';
+export function checkReleaseNotesPage(version: string | undefined, run: Runner, cwd: string): { notesPage: NotesPage; url: string | null } {
+  const url = version ? releaseNotesPageUrl(version) : null;
+  if (!url) return { notesPage: 'not-required', url };
+  const r = run('curl', ['-sL', '-o', '/dev/null', '-w', '%{http_code}', url], cwd);
+  return { notesPage: r.status === 0 && r.stdout.trim() === '200' ? 'ok' : 'missing', url };
+}
+
+export async function verifyRelease(opts: { version?: string; publicRepo?: string; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ ok: boolean; versionLine: string; installerUrl: string; steps?: { install: number | null; selfUpdate: number | null; uninstall: number | null }; state?: { memory: boolean; logs: LogRoundTrip }; notesPage?: NotesPage }> {
   const log = opts.log ?? ((l: string) => console.log(l));
   if (opts.version !== undefined && !isReleaseVersion(opts.version)) throw new Error(`버전 모양이 아니다: ${opts.version}`);
   const repo = opts.publicRepo ?? DEFAULT_PUBLIC_REPO;
@@ -339,9 +355,10 @@ export async function verifyRelease(opts: { version?: string; publicRepo?: strin
     const uninstall = existsSync(join(prefix, 'current', 'node_modules', 'elanous', 'scripts', 'uninstall.sh'))
       ? run('bash', [join(prefix, 'current', 'node_modules', 'elanous', 'scripts', 'uninstall.sh')], home, { env })
       : { status: null, stdout: '', stderr: 'uninstall.sh 없음' };
-    const ok = install.status === 0 && (opts.version ? versionLine.startsWith(`${opts.version} `) : versionLine.length > 0) && update.status === 0 && state.memory && state.logs !== 'fail';
-    log(`${ok ? '✅' : '⛔'} ${installerUrl}\n  설치 rc=${install.status} · --version «${versionLine}» · 기억 왕복 ${state.memory ? 'ok' : 'FAIL'} · 로그 왕복 ${state.logs === 'ok' ? 'ok' : state.logs === 'fail' ? 'FAIL' : '안 잼(스토어 없음 — 데몬이 한 번 떠야 생긴다)'} · self-update rc=${update.status} · 제거 rc=${uninstall.status}`);
-    return { ok, versionLine, installerUrl, steps: { install: install.status, selfUpdate: update.status, uninstall: uninstall.status }, state };
+    const notes = checkReleaseNotesPage(opts.version, run, home);
+    const ok = install.status === 0 && (opts.version ? versionLine.startsWith(`${opts.version} `) : versionLine.length > 0) && update.status === 0 && state.memory && state.logs !== 'fail' && notes.notesPage !== 'missing';
+    log(`${ok ? '✅' : '⛔'} ${installerUrl}\n  설치 rc=${install.status} · --version «${versionLine}» · 기억 왕복 ${state.memory ? 'ok' : 'FAIL'} · 로그 왕복 ${state.logs === 'ok' ? 'ok' : state.logs === 'fail' ? 'FAIL' : '안 잼(스토어 없음 — 데몬이 한 번 떠야 생긴다)'} · self-update rc=${update.status} · 제거 rc=${uninstall.status} · 노트 페이지 ${notes.notesPage === 'ok' ? 'ok' : notes.notesPage === 'missing' ? `없음 — release/public/docs/releases/${opts.version}.md ⊕ website/pages.json ⊕ \`bun website/scripts/deploy-pages.ts\` (${notes.url})` : '해당 없음'}`);
+    return { ok, versionLine, installerUrl, steps: { install: install.status, selfUpdate: update.status, uninstall: uninstall.status }, state, notesPage: notes.notesPage };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

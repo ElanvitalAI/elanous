@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { registerControlCommands, runResourcesQuery } from '../cli/control-cli.js';
-import { readPrimaryJoin, resolvePrimary, writePrimaryJoin } from './primary.js';
+import { readPrimaryJoin, resolvePrimary, writePrimaryJoin, type PrimaryAddress, type PrimaryConfig, type ResolvePrimaryOptions } from './primary.js';
 
 const roots: string[] = [];
 const token = { admin: 'a'.repeat(64), member: 'b'.repeat(64), query: 'c'.repeat(64) };
@@ -15,6 +15,58 @@ function root(): string {
   return value;
 }
 afterEach(() => { for (const value of roots.splice(0)) rmSync(value, { force: true, recursive: true }); });
+
+test('candidate probes select the highest-generation self-reported holder and never leak a joined token to another URL', async () => {
+  const dir = root();
+  writePrimaryJoin({ url: 'https://mbp.example', tokens: { member: token.member } }, dir);
+  const calls: string[] = [];
+  const candidates = [{ machine: 'mbp', url: 'https://mbp.example' }, { machine: 'node-b', url: 'https://node-b.example' }];
+  const fakeFetch = async (input: string) => {
+    calls.push(input);
+    return Response.json(input.includes('node-b')
+      ? { holder: 'node-b', generation: 7, known: true }
+      : { holder: 'mbp', generation: 6, known: true });
+  };
+  const pending: Promise<PrimaryAddress> = resolvePrimary({ root: dir, role: 'member', config: { primaryCandidates: candidates }, fetch: fakeFetch });
+  const selected = await pending;
+  expect(selected).toEqual({ url: 'https://node-b.example', token: undefined, source: 'lease' });
+  expect(calls).toEqual(['https://mbp.example/v1/primary', 'https://node-b.example/v1/primary']);
+  const fallback = await resolvePrimary({ root: dir, role: 'member', config: { primaryCandidates: candidates },
+    fetch: async () => { throw new Error('offline'); } });
+  expect(fallback).toEqual({ url: 'https://mbp.example', token: token.member, source: 'lease' });
+  const forwarded = await resolvePrimary({ root: dir, role: 'member', config: { primaryCandidates: candidates },
+    fetch: async () => Response.json({ holder: 'node-b', generation: 999, known: true }) });
+  expect(forwarded.url).toBe('https://node-b.example');
+  const unknown = await resolvePrimary({ root: dir, role: 'member', config: { primaryCandidates: candidates },
+    fetch: async () => Response.json({ holder: 'outsider', generation: 999, known: true }) });
+  expect(unknown.url).toBe('https://mbp.example');
+  await expect(resolvePrimary({ root: dir, role: 'member', config: { primaryCandidates: [{ machine: 'mbp', url: 'https://mbp.example' }, { machine: 'mbp', url: 'https://node-b.example' }] } })).rejects.toThrow('duplicate primary candidate machine');
+  expect(resolvePrimary({ root: dir, role: 'member' })).toEqual({ url: 'https://mbp.example', token: token.member, source: 'join' });
+});
+
+test('candidate credentials are bound to the selected URL and a general config permits an asynchronous result', async () => {
+  const dir = root();
+  const config: PrimaryConfig = {
+    url: 'https://mbp.example', tokens: { member: token.member },
+    primaryCandidates: [
+      { machine: 'mbp', url: 'https://mbp.example' },
+      { machine: 'node-b', url: 'https://node-b.example', tokens: { member: token.query } },
+    ],
+  };
+  const options: ResolvePrimaryOptions = { root: dir, role: 'member', config,
+    fetch: async () => Response.json({ holder: 'node-b', generation: 7, known: true }) };
+  const pending: PrimaryAddress | Promise<PrimaryAddress> = resolvePrimary(options);
+  expect(pending).toBeInstanceOf(Promise);
+  expect(await pending).toEqual({ url: 'https://node-b.example', token: token.query, source: 'lease' });
+  config.primaryCandidates![1]!.tokens = undefined;
+  expect(await resolvePrimary(options)).toEqual({ url: 'https://node-b.example', token: undefined, source: 'lease' });
+  config.primaryCandidates![1]!.tokens = { query: token.query };
+  expect(await resolvePrimary(options)).toEqual({ url: 'https://node-b.example', token: undefined, source: 'lease' });
+  options.fetch = async () => { throw new Error('offline'); };
+  expect(await resolvePrimary(options)).toEqual({ url: 'https://mbp.example', token: token.member, source: 'lease' });
+  const staticAddress = resolvePrimary({ root: dir, role: 'member', config: { url: 'https://mbp.example' } });
+  expect(staticAddress).not.toBeInstanceOf(Promise);
+});
 
 test('join file is private, replaces atomically and reads only scoped credentials', () => {
   const dir = root();
@@ -60,6 +112,27 @@ test('missing or malformed join never creates credentials or supersedes local ad
   expect(existsSync(join(dir, 'control', 'tokens.json'))).toBe(false);
 });
 
+test('machine join resolves a scoped member credential and rejects damaged membership', () => {
+  const dir = root();
+  mkdirSync(join(dir, 'control'));
+  const path = join(dir, 'control', 'join.json');
+  writeFileSync(path, JSON.stringify({ url: 'https://joined.example/', machine: 'node-1', token: token.member }), { mode: 0o600 });
+  expect(readPrimaryJoin(dir)).toEqual({ url: 'https://joined.example', machine: 'node-1', tokens: { member: token.member } });
+  expect(resolvePrimary({ root: dir, role: 'member' })).toEqual({ url: 'https://joined.example', token: token.member, source: 'join', machine: 'node-1' });
+  expect(resolvePrimary({ root: dir, role: 'query' })).toEqual({ url: 'https://joined.example', token: token.member, source: 'join', machine: 'node-1' });
+  expect(resolvePrimary({ root: dir, role: 'member', config: { url: 'https://other.example', tokens: { member: token.query } } })).toEqual({
+    url: 'https://other.example', token: token.query, source: 'config',
+  });
+  expect(resolvePrimary({ root: dir, role: 'member', config: { url: 'https://joined.example', tokens: { member: token.query } } }).machine).toBeUndefined();
+  for (const invalid of [
+    { url: 'https://joined.example/', machine: '../escape', token: token.member },
+    { url: 'https://joined.example/', machine: 'node-1', token: 'short' },
+  ]) {
+    writeFileSync(path, JSON.stringify(invalid));
+    expect(readPrimaryJoin(dir)).toBeUndefined();
+  }
+});
+
 test('config URL outranks join; scoped token cannot leak across addresses or roles', () => {
   const dir = root();
   writePrimaryJoin({ url: 'https://joined.example', tokens: { member: token.member, query: token.query } }, dir);
@@ -87,7 +160,7 @@ test('joined local address never inherits a missing role from local tokens', () 
     url: 'http://127.0.0.1:31413', token: token.member, source: 'join',
   });
   expect(resolvePrimary({ root: dir, role: 'query' })).toEqual({
-    url: 'http://127.0.0.1:31413', token: undefined, source: 'join',
+    url: 'http://127.0.0.1:31413', token: token.member, source: 'join',
   });
 });
 
@@ -111,18 +184,32 @@ test('local-only port override selects local scoped token; remote ignores even i
   });
 });
 
-test('control join command writes a scoped join record into the isolated instance', async () => {
+test('control join command verifies a file token and writes private machine membership into the isolated instance', async () => {
   const dir = root();
+  const credential = join(dir, 'credential');
+  writeFileSync(credential, token.member);
   const before = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
+    expect(String(input)).toBe('https://primary.example/v1/resources?machine=node-b');
+    expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${token.member}`);
+    expect(existsSync(join(dir, 'control', 'join.json'))).toBe(false);
+    return Response.json({ resources: [] });
+  }) as typeof fetch);
+  const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
     const program = new Command();
     registerControlCommands(program);
-    await program.parseAsync(['control', 'join', '--url', 'https://primary.example', '--query-token', token.query], { from: 'user' });
-    expect(readPrimaryJoin(dir)).toEqual({ url: 'https://primary.example', tokens: { query: token.query } });
+    await program.parseAsync(['control', 'join', '--url', 'https://primary.example', '--machine', 'node-b', '--token-file', credential], { from: 'user' });
+    expect(process.exitCode).toBe(0);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(readPrimaryJoin(dir)).toEqual({ url: 'https://primary.example', machine: 'node-b', tokens: { member: token.member } });
     expect(statSync(join(dir, 'control', 'join.json')).mode & 0o077).toBe(0);
     expect(existsSync(join(dir, 'control', 'tokens.json'))).toBe(false);
   } finally {
+    process.exitCode = 0;
+    logSpy.mockRestore();
+    fetchSpy.mockRestore();
     if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = before;
   }
@@ -156,20 +243,24 @@ test('resources query preserves local scoped-token behavior and honors explicit 
   }
 });
 
-test('resources query refuses to send local credentials to a joined Primary lacking query scope', async () => {
+test('resources query uses joined member credential rather than local credentials when query scope is absent', async () => {
   const dir = root();
   mkdirSync(join(dir, 'control'));
   writeFileSync(join(dir, 'control', 'tokens.json'), JSON.stringify(token));
   writePrimaryJoin({ url: 'https://joined.example', tokens: { member: token.member } }, dir);
   const before = process.env.ELANOUS_STATE_DIR;
   process.env.ELANOUS_STATE_DIR = dir;
-  const fetchSpy = spyOn(globalThis, 'fetch');
-  const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+  const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
+    expect(String(input)).toBe('https://joined.example/v1/resources');
+    expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${token.member}`);
+    return Response.json({ resources: [] });
+  }) as typeof fetch);
+  const logSpy = spyOn(console, 'log').mockImplementation(() => {});
   try {
-    expect(await runResourcesQuery({})).toBe(2);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(await runResourcesQuery({})).toBe(0);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   } finally {
-    errorSpy.mockRestore();
+    logSpy.mockRestore();
     fetchSpy.mockRestore();
     if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = before;

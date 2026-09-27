@@ -34,6 +34,7 @@ import { useDaemon } from '@/components/providers/DaemonProvider';
 import type { AcpConnectionState, DaemonTerminalControlResult } from '@/lib/daemon-client';
 import { debugLog } from '@/lib/debug';
 import { terminalChipLabel } from './terminal-chip-label';
+import { originChipText, originTooltipText } from './terminal-origin-label';
 import { tabCloseAction, terminateConfirmation, type OwnerRunUsage } from './tab-close-intent';
 
 const STORAGE_KEY = 'elanous.webterm.tabs';
@@ -64,8 +65,9 @@ interface Props {
    *  guarantees a fresh value triggers the effect even when the user
    *  re-issues the same intent (e.g. `:tab next` twice). */
   tabIntent?: { intent: 'next' | 'prev' | number; nonce: number } | null;
-  ptyTabSelection?: { id: string; nonce: number } | null;
   onTabsChange?: (tabs: readonly string[]) => void;
+  /** A direct PTY link observes an existing owner; never mint a shell while it is open. */
+  suspendInitialSpawn?: boolean;
 }
 
 interface DaemonListEntry {
@@ -92,13 +94,6 @@ const STATUS_POLL_MS = 15_000;
 
 /** 신뢰할 수 없는 상태에서 쓰는 빈 지도 — 매 렌더 새 Map 을 만들면 memo 가 깨진다. */
 const EMPTY_DAEMON_INFO: ReadonlyMap<string, DaemonListEntry> = new Map();
-
-function terminalOriginLabel(info: DaemonListEntry | undefined): string {
-  if (info?.terminalOriginCategory === 'direct-human') return '사람';
-  if (info?.terminalOriginCategory === 'elanous') return 'elanous';
-  if (info?.terminalOriginCategory === 'external-tool') return info.externalToolName ? `외부 도구: ${info.externalToolName}` : '외부 도구';
-  return info?.terminalOriginReason ? `이 행에서는 알 수 없음: ${info.terminalOriginReason}` : '이 행에서는 알 수 없음';
-}
 
 function lastActivityLabel(ms?: number): string {
   if (!ms || !Number.isFinite(ms)) return '';
@@ -383,15 +378,14 @@ export function TerminalTabs({
   chatDockOpen = true,
   onToggleChatDock,
   tabIntent = null,
-  ptyTabSelection = null,
   onTabsChange,
+  suspendInitialSpawn = false,
 }: Props) {
   const { client, sessionId } = useDaemon();
   const [tabs, setTabs] = useState<string[]>(loadTabIds);
   const hiddenTabIdsRef = useRef(new Set(loadHiddenTabIds()));
   const tabsRef = useRef(tabs);
   tabsRef.current = tabs;
-  const handledPtySelectionNonceRef = useRef<number | null>(null);
   const activeIdRef = useRef(activeId);
   activeIdRef.current = activeId;
   const initialSpawnGenerationRef = useRef(0);
@@ -622,6 +616,7 @@ export function TerminalTabs({
   }, [onActiveChange, onInitialTerminalState, persist, sessionId]);
 
   useEffect(() => {
+    if (suspendInitialSpawn) return;
     if (tabs.length > 0) {
       const issuedThisMount = initialIssuedRef.current;
       initialSpawnPendingRef.current = false;
@@ -640,7 +635,7 @@ export function TerminalTabs({
     }
     void issueInitialTerminal(acp);
     return () => { initialSpawnGenerationRef.current += 1; };
-  }, [acpReadyGeneration, activeId, issueInitialTerminal, onActiveChange, onInitialTerminalState, tabs.length]);
+  }, [acpReadyGeneration, activeId, issueInitialTerminal, onActiveChange, onInitialTerminalState, suspendInitialSpawn, tabs.length]);
 
   /** WT-B4 — 새 탭의 이름을 «데몬이» 짓는다.
    *
@@ -780,23 +775,6 @@ export function TerminalTabs({
     setTabs((prev) => (prev.includes(activeId) ? prev : persist([...prev, activeId])));
   }, [activeId, persist]);
 
-  useEffect(() => {
-    if (!ptyTabSelection || handledPtySelectionNonceRef.current === ptyTabSelection.nonce) return;
-    handledPtySelectionNonceRef.current = ptyTabSelection.nonce;
-    const { id } = ptyTabSelection;
-    const previous = tabsRef.current;
-    if (previous.includes(id)) {
-      debugLog('webterm.tabs.pty-select.existing', { id, total: previous.length });
-      onActiveChange(id);
-      return;
-    }
-    const next = persist([...previous, id]);
-    setTabs(next);
-    onTabsChange?.(next);
-    debugLog('webterm.tabs.pty-select.add', { id, total: next.length });
-    onActiveChange(id);
-  }, [onActiveChange, onTabsChange, persist, ptyTabSelection?.nonce]);
-
   // Track 2 — apply :tab intent fired by sticky REPL. Effect deps on
   // nonce so re-issuing the same intent re-fires.
   useEffect(() => {
@@ -859,7 +837,8 @@ export function TerminalTabs({
             ? info.isAlive ? 'bg-emerald-500' : 'bg-rose-500'
             : 'bg-muted-foreground/40';
           const activityLabel = lastActivityLabel(info?.lastOutputAt);
-          const originLabel = terminalOriginLabel(info);
+          const originChip = originChipText(info);
+          const originTooltip = originTooltipText(info);
           // ⭐ 칩이 «이게 무엇인지» 말한다 (대표 2026-08-17). 원시 id 는 툴팁에 남는다.
           //   ⛔ preview-1 은 TUI 프리뷰 페인의 «약속된 이름»이라 개명하지 않는다 —
           //     src/dashboard/index.ts:7991 이 그 이름으로 못 박는다.
@@ -867,8 +846,8 @@ export function TerminalTabs({
           const terminalControl = terminalControls.get(id);
           const statusTitle = info
             // ⛔ pid 가 없는 판의 데몬도 있다 — 없으면 「pid 없음」이 아니라 그 칸을 «안 쓴다».
-            ? `${info.isAlive ? 'alive' : 'exited'}${typeof info.pid === 'number' ? ` · pid ${info.pid}` : ''}${activityLabel ? ` · 마지막 출력 ${activityLabel}` : ''} · 출처: ${originLabel}${info.controller ? ` · 통제: ${info.controller}` : ''}`
-            : `데몬 미기동 (선택 시 spawn) · 출처: ${originLabel}`;
+            ? `${info.isAlive ? 'alive' : 'exited'}${typeof info.pid === 'number' ? ` · pid ${info.pid}` : ''}${activityLabel ? ` · 마지막 출력 ${activityLabel}` : ''} · ${originTooltip}${info.controller ? ` · 통제: ${info.controller}` : ''}`
+            : `데몬 미기동 (선택 시 spawn) · ${originTooltip}`;
           return (
             <span
               key={id}
@@ -890,7 +869,7 @@ export function TerminalTabs({
                 title={`${chip.hint} — ${active ? '지금 보는 터미널' : '눌러서 전환'} · ${statusTitle}`}
                 aria-label={`switch to ${id}`}
               >
-                {chip.text} · {originLabel}{info?.controller ? ` · 통제: ${info.controller}` : ''}
+                {chip.text}{originChip ? ` · ${originChip}` : ''}{info?.controller ? ` · 통제: ${info.controller}` : ''}
               </button>
               <button
                 type="button"

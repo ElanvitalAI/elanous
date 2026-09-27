@@ -65,6 +65,7 @@ export interface DevMissionOpts {
  *  self-특정 미션 실행 파라미터(무손실 재라우팅용). self-mission dispatch 에만 유효(그 외 지정 시 planDevPipeline
  *  이 거부·수락 후 무시 금지). autoMerge 는 completion:'auto-merge'·autoReview 는 spec.autoReview 로 표현(중복 축 아님). */
 export interface DevSelfOpts {
+  mergeByHost?: boolean;
   /** PR draft 여부(기본 true·안전). PR 개설 시에만 의미. */
   draft?: boolean;
   /** 진입 클래스(enhance mode-gating). CLI self implement=external-verbatim. 미지정 시 orchestrator 기본. */
@@ -379,6 +380,9 @@ export function planDevPipeline(spec: DevPipelineSpec): ResolvedDevPlan {
   const entrance = spec.entrance;
 
   // ── 검증(불가 조합 hard-error) ──
+  if (spec.self?.mergeByHost === true && (process.env.ELANOUS_SUBSTRATE !== 'pod' || !process.env.ELANOUS_POD_NAME || !process.env.ELANOUS_POD_NAMESPACE)) {
+    throw new DevPipelineError('--merge-by-host 는 Pod 자식 전용입니다 (호스트 재게이트 인계가 없는 로컬 실행 거부)');
+  }
   if (context === 'interactive' && completion !== 'worktree-only') {
     throw new DevPipelineError('interactive(chat) 는 PR 산출이 없어 completion 은 worktree-only 만 유효');
   }
@@ -574,6 +578,7 @@ export function toSelfImplementOptions(text: string, plan: ResolvedDevPlan, seam
     ...(s.draft !== undefined ? { draft: s.draft } : {}),
     completion: plan.completion,
     ...(plan.completion === 'auto-merge' ? { autoMerge: true } : {}),
+    ...(s.mergeByHost === true ? { mergeByHost: true } : {}),
     ...(plan.autoReview ? { autoReview: true } : {}),
     ...(s.deliverableHint ? { deliverableHint: s.deliverableHint } : {}),
     ...(s.memory !== undefined ? { memory: s.memory } : {}),

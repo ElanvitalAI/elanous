@@ -11,6 +11,7 @@
 
 import { buildSelfImplementDevSpec, executeSelfImplementReroute } from '../self-dev/dev-pipeline.js';
 import type { SelfDevJobResult } from '../self-dev/orchestrate.js';
+import type { SupervisorJobResult } from '../self-dev/run-supervisor.js';
 import type { DevPipelineDeps } from '../self-dev/dev-pipeline.js';
 import { parsePositiveInt } from '../self-dev/dev-cli.js';
 import type { SelfImplementResult, SelfImplementSeams } from './orchestrator.js';
@@ -25,6 +26,7 @@ export interface SelfImplementCliOpts {
   draft?: boolean;
   openPr?: boolean;
   autoMerge?: boolean;
+  mergeByHost?: boolean;
   autoReview?: boolean;
   maxWait?: string;
   enhance?: boolean;
@@ -94,7 +96,7 @@ export interface SingleRunSuperviseOptions {
 type SelfImplementResultWithProposalMetadata = SelfImplementResult
   & Pick<SelfDevJobResult, 'decomposeProposal' | 'goalPlanRevision'>;
 
-export function singleRunAsJobResult(feature: string, r: SelfImplementResultWithProposalMetadata): SelfDevJobResult {
+export function singleRunAsJobResult(feature: string, r: SelfImplementResultWithProposalMetadata): SupervisorJobResult {
   return {
     taskId: r.runId,
     runId: r.runId,
@@ -112,13 +114,14 @@ export function singleRunAsJobResult(feature: string, r: SelfImplementResultWith
       ? { failureClassification: r.abandonedClassification.classification } : {}),
     ...(r.decomposeProposal ? { decomposeProposal: r.decomposeProposal } : {}),
     ...(r.goalPlanRevision ? { goalPlanRevision: r.goalPlanRevision } : {}),
+    ...(r.salvage !== undefined ? { salvage: r.salvage } : {}),
     ...(r.review?.reviewed !== undefined ? { reviewed: r.review.reviewed } : {}),
     ...(r.review?.failureReason !== undefined ? { reviewReason: r.review.failureReason } : {}),
     // ⭐ 대표 지시(2026-09-08) — 걸음을 슈퍼바이저까지 나른다.
     //   🩸 그 전까지 슈퍼바이저는 「시도의 요약 판정」만 봤고 「어떻게 걸었나」를 «못 봤다».
     //   ⛔ 비어 있으면 «안 싣는다» — 「안 걸었다」와 「관측을 안 붙였다」를 같은 값으로 두지 않는다.
     ...(r.walk && r.walk.length > 0 ? { walk: r.walk } : {}),
-  } as SelfDevJobResult;
+  } as SupervisorJobResult;
 }
 
 export type SelfImplementCliOutcome =
@@ -139,6 +142,9 @@ export async function runSelfImplementCliCommand(
   try {
     if (opts.plan) {
       return { ok: false, message: '--plan is retired for self implement and is rejected', exitCode: 1 };
+    }
+    if (opts.mergeByHost === true && (process.env.ELANOUS_SUBSTRATE !== 'pod' || !process.env.ELANOUS_POD_NAME || !process.env.ELANOUS_POD_NAMESPACE)) {
+      return { ok: false, message: '--merge-by-host 는 Pod 자식 전용입니다 (호스트 재게이트 인계가 없는 로컬 실행 거부)', exitCode: 1 };
     }
     const observeOnly = resolveObserveOnlyDecision(opts.observeOnly
       ? { ...process.env, ELANOUS_SELF_IMPLEMENT_OBSERVE_ONLY: '1' }
@@ -164,6 +170,7 @@ export async function runSelfImplementCliCommand(
       ...(opts.ground ? { ground: true } : {}),
       draft,
       ...(opts.autoMerge !== undefined ? { autoMerge: opts.autoMerge } : {}),
+      ...(opts.mergeByHost === true ? { mergeByHost: true, autoMerge: true } : {}),
       ...(opts.openPr !== undefined ? { openPr: opts.openPr } : {}),
       ...(opts.autoReview !== undefined
         ? { autoReview: opts.autoReview, autoReviewSource: 'request' as const }

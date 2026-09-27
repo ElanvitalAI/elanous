@@ -1654,7 +1654,7 @@ export function decideAskPreflight(
     preexistingFailures = { state: 'unreadable', reason: `gate preexisting 실패 기록 조회 실패: ${error instanceof Error ? error.message.split('\n')[0] : String(error)}` };
   }
 
-  const runningRunsConfidence = assessRunningRunsConfidence(deps.queryRunningRuns ?? ((options) => queryRunningRuns(options)), Date.now());
+  const runningRunsConfidence = assessRunningRunsConfidence(deps.queryRunningRuns ?? ((options) => queryRunningRuns({ ...options, caller: 'launch-preflight' })), Date.now());
   try {
     debug.log('harness.preflight', 'running-runs-confidence', runningRunsConfidence);
   } catch {

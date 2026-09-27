@@ -3,21 +3,25 @@ import { dirname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { CONTROL_HOSTNAME, DEFAULT_CONTROL_PORT, type ControlScope } from './server.js';
+import { debug } from '../debug/log.js';
 
 export interface PrimaryJoin {
   url: string;
   tokens: Partial<Record<ControlScope, string>>;
+  machine?: string;
 }
 
 export interface PrimaryConfig {
   url?: string;
   tokens?: Partial<Record<ControlScope, string>>;
+  primaryCandidates?: Array<{ machine: string; url: string; tokens?: Partial<Record<ControlScope, string>> }>;
 }
 
 export interface PrimaryAddress {
   url: string;
   token: string | undefined;
-  source: 'config' | 'join' | 'local';
+  source: 'config' | 'join' | 'local' | 'lease';
+  machine?: string;
 }
 
 const TOKEN_PATTERN = /^[a-f0-9]{64}$/;
@@ -63,7 +67,14 @@ export function readPrimaryJoin(root: string = effectiveInstanceRoot()): Primary
     if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
     const row = value as Record<string, unknown>;
     if (typeof row.url !== 'string') return undefined;
-    return { url: address(row.url), tokens: scopedTokens(row.tokens) };
+    const url = address(row.url);
+    if (row.machine !== undefined || row.token !== undefined) {
+      if (typeof row.machine !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(row.machine) ||
+          ['__proto__', 'constructor', 'prototype'].includes(row.machine) ||
+          typeof row.token !== 'string' || !TOKEN_PATTERN.test(row.token)) return undefined;
+      return { url, machine: row.machine, tokens: { member: row.token } };
+    }
+    return { url, tokens: scopedTokens(row.tokens) };
   } catch {
     return undefined;
   }
@@ -85,10 +96,60 @@ export interface ResolvePrimaryOptions {
   config?: PrimaryConfig;
   role: ControlScope;
   port?: number;
+  fetch?: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
 /** URL precedence is independent of credentials: never send a token to a different address. */
-export function resolvePrimary(opts: ResolvePrimaryOptions): PrimaryAddress {
+export function resolvePrimary(opts: ResolvePrimaryOptions & { config?: PrimaryConfig & { primaryCandidates?: never } }): PrimaryAddress;
+export function resolvePrimary(opts: ResolvePrimaryOptions & { config: PrimaryConfig & { primaryCandidates: NonNullable<PrimaryConfig['primaryCandidates']> } }): Promise<PrimaryAddress>;
+export function resolvePrimary(opts: ResolvePrimaryOptions): PrimaryAddress | Promise<PrimaryAddress>;
+export function resolvePrimary(opts: ResolvePrimaryOptions): PrimaryAddress | Promise<PrimaryAddress> {
+  const candidates = opts.config?.primaryCandidates;
+  if (candidates?.length) return resolveLeasePrimary(opts, candidates);
+  return resolveStaticPrimary(opts);
+}
+
+async function resolveLeasePrimary(opts: ResolvePrimaryOptions, candidates: NonNullable<PrimaryConfig['primaryCandidates']>): Promise<PrimaryAddress> {
+  const normalized = candidates.map(candidate => {
+    if (!/^[a-z0-9][a-z0-9-]{0,31}$/.test(candidate.machine)) throw new Error('invalid primary candidate machine');
+    return { machine: candidate.machine, url: address(candidate.url),
+      tokens: candidate.tokens === undefined ? undefined : scopedTokens(candidate.tokens) };
+  });
+  let winner: (typeof normalized)[number] & { generation: number } | undefined;
+  if (new Set(normalized.map(candidate => candidate.machine)).size !== normalized.length) throw new Error('duplicate primary candidate machine');
+  for (const candidate of normalized) {
+    try {
+      const response = await (opts.fetch ?? globalThis.fetch)(`${candidate.url}/v1/primary`, { signal: AbortSignal.timeout(5_000) });
+      if (!response.ok) continue;
+      const body: unknown = await response.json();
+      if (!body || typeof body !== 'object' || Array.isArray(body)) continue;
+      const value = body as Record<string, unknown>;
+      if (value.known !== true || typeof value.holder !== 'string' ||
+          !Number.isSafeInteger(value.generation) || (value.generation as number) < 1) continue;
+      const holder = normalized.find(item => item.machine === value.holder);
+      if (holder && (!winner || (value.generation as number) > winner.generation)) {
+        winner = { ...holder, generation: value.generation as number };
+      }
+    } catch { /* Unreachable candidate: try the next one. */ }
+  }
+  const selected = winner ?? normalized[0]!;
+  debug.log('control.primary', 'resolved', { source: 'lease', holder: winner?.machine ?? null, generation: winner?.generation ?? null });
+  const root = opts.root ?? effectiveInstanceRoot();
+  const joinFile = readPrimaryJoin(root);
+  const role = opts.role;
+  const configured = selected.tokens?.[role]
+    ?? (opts.config?.url && address(opts.config.url) === selected.url ? opts.config.tokens?.[role] : undefined);
+  if (configured !== undefined && !TOKEN_PATTERN.test(configured)) throw new Error('invalid primary token');
+  const joinToken = joinFile?.url === selected.url
+    ? (joinFile.tokens[role] ?? (role === 'query' ? joinFile.tokens.member : undefined)) : undefined;
+  const token = configured ?? joinToken
+    ?? (selected.url === `http://${CONTROL_HOSTNAME}:${opts.port ?? DEFAULT_CONTROL_PORT}` && joinFile?.url !== selected.url
+      ? localToken(root, role) : undefined);
+  return { url: selected.url, token, source: 'lease',
+    ...(joinFile?.url === selected.url && token !== undefined && token === joinToken && joinFile.machine ? { machine: joinFile.machine } : {}) };
+}
+
+function resolveStaticPrimary(opts: ResolvePrimaryOptions): PrimaryAddress {
   const root = opts.root ?? effectiveInstanceRoot();
   const joinFile = readPrimaryJoin(root);
   const configUrl = opts.config?.url ? address(opts.config.url) : undefined;
@@ -99,7 +160,10 @@ export function resolvePrimary(opts: ResolvePrimaryOptions): PrimaryAddress {
   if (source === 'local' && (!Number.isInteger(port) || port < 1 || port > 65535)) throw new Error('invalid control port');
   const configToken = opts.config?.tokens?.[opts.role];
   if (configToken !== undefined && !TOKEN_PATTERN.test(configToken)) throw new Error('invalid primary token');
-  const token = configToken ?? (joinFile?.url === url ? joinFile.tokens[opts.role] : undefined)
+  const joinToken = joinFile?.url === url
+    ? (joinFile.tokens[opts.role] ?? (opts.role === 'query' ? joinFile.tokens.member : undefined))
+    : undefined;
+  const token = configToken ?? joinToken
     ?? (url === localUrl && joinFile?.url !== url ? localToken(root, opts.role) : undefined);
-  return { url, token, source };
+  return { url, token, source, ...(joinFile?.url === url && token !== undefined && token === joinToken && joinFile.machine ? { machine: joinFile.machine } : {}) };
 }

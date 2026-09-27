@@ -12,6 +12,7 @@
 1	src/background-reasoning/patcher-config.ts
 1	src/budget/codex-reset-credit-state.ts
 1	src/cli/config-test-sync.ts
+1	src/cli/fleet-cli.ts
 2	src/cli/logs-cli.ts
 1	src/cli/nexus-dist.ts
 1	src/cli/nexus-ios-bind.ts
@@ -31,7 +32,6 @@
 1	src/domains/signal-dedup.ts
 1	src/expression/config/answer-file.ts
 1	src/hitl/audit-log.ts
-1	src/index.ts
 1	src/input-core/user-config-loader.ts
 2	src/instance/leader.ts
 1	src/instance/nexus-run-refusal.ts

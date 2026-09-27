@@ -27,6 +27,7 @@
 // crashed wizard cannot corrupt an existing file. Mode 0600 when the
 // telegram bot token is present.
 
+import { defaultObsidianVault } from './obsidian/default-vault.js';
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, chmodSync,
   statSync, accessSync, constants as fsConstants,
@@ -691,7 +692,7 @@ export interface ObsidianConfig {
 }
 
 function obsidianDefaults(): ObsidianConfig {
-  return { vault: process.env.OBSIDIAN_VAULT || join(REMOTE_HOME, 'Obsidian', 'ElanvitalAI') };
+  return { vault: defaultObsidianVault({ env: process.env, home: REMOTE_HOME }) };
 }
 
 // ── Telegram ─────────────────────────────────────────────────────────
@@ -1146,8 +1147,8 @@ export interface DebugConfig {
   /** OH9(2026-07-24) — 렌더 카테고리(dashboard·key·mouse·cursor 계열)
    *  발화 여부. 진단 강도 축(`level`)과 **직교**한 별도 스위치 —
    *  대표는 상시 diag+ 라 "진단은 켜두고 렌더만 끄는" 축이 필요하다.
-   *  기본 `false`(억제). `dashboard.uiMode === 'essential'` 이면 자동 OFF
-   *  (억제 시드). `true` 로 명시하면 essential 에서도 렌더 로그를 살린다
+   *  기본 `false`(억제). essential TUI 는 렌더 로그를 자동 억제한다.
+   *  `true` 로 명시하면 렌더 로그를 살린다
    *  (override). 런타임 영속은 config 가 아니라 `<stateRoot>/logs/level.json`
    *  의 `render` 필드(overlay 오염 방지) — 이 config 값은 부팅 시드일 뿐.
    *  선례: `exposeFullLlmTools`(계열 통째 죽이는 불린). */
@@ -1436,19 +1437,6 @@ export interface DashboardConfig {
    *  disabled so the bank can be populated and debugged before it
    *  affects real LLM turns. */
   promptBank: DashboardPromptBankConfig;
-  /** First-entry layout. 'chat' seeds chatOnlyMode=true on boot so
-   *  the app opens straight into the chat REPL; 'dashboard' (or
-   *  undefined) keeps the legacy 3-pane grid. CLI flags
-   *  (`--chat-only`, `--debug`) still force 'chat' regardless.
-   *  @deprecated TUI 부활 T0 — `uiMode` 로 흡수됨. uiMode 미설정 시에만
-   *  참조된다 ('chat'→essential · 'dashboard'→rich). */
-  defaultMode?: 'chat' | 'dashboard';
-  /** TUI 부활 T0 (PLAN-tui-revival-essentials-2026-07-12 §3a) —
-   *  단일 UI 모드 축. 'essential'(기본) = codex/claude-code 패리티
-   *  chat 전체화면 + 1줄 status line; 'rich' = 기존 전체 기능
-   *  (3-pane grid·VW·widget·마우스). CLI `--rich` 는 이번 실행만
-   *  rich 강제. 해석 우선순위는 views/ui-mode.ts 참조. */
-  uiMode?: 'essential' | 'rich';
   /** Chat-log fold strategy. Default `task-unit` collapses each tool
    *  body to its header; `line` keeps the unfolder line-budget body;
    *  `kind-unit` coalesces adjacent same-kind operations. Runtime
@@ -2913,6 +2901,7 @@ export interface IntakeSurfaceConfig {
 export interface IntakeConfig {
   telegram: IntakeSurfaceConfig;
   discord: IntakeSurfaceConfig;
+  approvals?: { repo?: string };
 }
 
 /** Hardcoded fallbacks used when neither user config nor env supplies
@@ -3287,7 +3276,7 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 export interface UserConfig {
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig };
+  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string };
   /** ☸️ Pod 실행 칸 — `pool` = 기본 풀(`컨텍스트[@ssh호스트][:상한]` 쉼표 · 앞이 우선). `harness say/ask --substrate pod` 가 인자·ELANOUS_POD_POOL 다음으로 읽는다. */
   pod?: { pool?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string };
   skillRouter: SkillRouterConfig;
@@ -4120,6 +4109,11 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const intakeTelegram = (intake.telegram ?? {}) as Record<string, unknown>;
   const intakeDiscord = (intake.discord ?? {}) as Record<string, unknown>;
   const dash = (rawObj.dashboard ?? {}) as Record<string, unknown>;
+  const retiredModeKeys = (['uiMode', 'defaultMode'] as const)
+    .filter((key) => Object.prototype.hasOwnProperty.call(dash, key));
+  if (retiredModeKeys.length > 0) {
+    debug.log('dashboard.ui-mode', 'retired-config-ignored', { key: retiredModeKeys.join(',') });
+  }
   const dashPromptBank = (dash.promptBank ?? {}) as Record<string, unknown>;
   const vw = (rawObj.vw ?? {}) as Record<string, unknown>;
   const acp = (rawObj.acp ?? {}) as Record<string, unknown>;
@@ -4141,6 +4135,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   return {
     harness: {
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
+      ...(typeof harness.defaultRepo === 'string' && isAbsolute(harness.defaultRepo)
+        ? { defaultRepo: harness.defaultRepo } : {}),
       budgetGate: parseHarnessBudgetGate(
         rawObj.harness && typeof rawObj.harness === 'object' && !Array.isArray(rawObj.harness)
           ? (rawObj.harness as Record<string, unknown>).budgetGate
@@ -4667,6 +4663,10 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
           ? { ambientCapture: normalizeIntakeAmbientCaptureMode(intakeDiscord.ambientCapture)! }
           : {}),
       },
+      ...(intake.approvals && typeof intake.approvals === 'object' && !Array.isArray(intake.approvals)
+        && typeof (intake.approvals as Record<string, unknown>).repo === 'string'
+        ? { approvals: { repo: (intake.approvals as { repo: string }).repo } }
+        : {}),
     },
     dashboard: {
       views: dash.views && typeof dash.views === 'object' && !Array.isArray(dash.views)
@@ -4674,12 +4674,6 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
         : undefined,
       theme: dash.theme && typeof dash.theme === 'object' && !Array.isArray(dash.theme)
         ? dash.theme as Record<string, unknown>
-        : undefined,
-      defaultMode: dash.defaultMode === 'chat' || dash.defaultMode === 'dashboard'
-        ? dash.defaultMode
-        : undefined,
-      uiMode: dash.uiMode === 'essential' || dash.uiMode === 'rich'
-        ? dash.uiMode
         : undefined,
       foldMode: dash.foldMode === 'line' || dash.foldMode === 'task-unit' || dash.foldMode === 'kind-unit'
         ? dash.foldMode
@@ -5515,10 +5509,6 @@ export function saveUserConfig(
       views: cfg.dashboard.views,
       theme: cfg.dashboard.theme,
       promptBank: cfg.dashboard.promptBank,
-      // TUI 부활 T2 — uiMode 런타임 persist(/ui). defaultMode·benchmark 는
-      // 종전 serializer 가 드롭하던 latent bug 동반 수리 (round-trip 보존).
-      defaultMode: cfg.dashboard.defaultMode,
-      uiMode: cfg.dashboard.uiMode,
       foldMode: cfg.dashboard.foldMode,
       benchmark: cfg.dashboard.benchmark,
       enableVirtualWindowSwitchKeys: cfg.dashboard.enableVirtualWindowSwitchKeys,

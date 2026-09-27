@@ -55,4 +55,20 @@ describe('renderDashboardAttachmentSummary', () => {
     expect(tracked).toEqual(['0:1', '1:1', '2:2']);
     expect(scratch).toEqual(['file:[PDF #1]', 'image:/tmp/b.png:b.png']);
   });
+
+  test('essential summary works without rich scratch preview handlers', () => {
+    const lines: string[] = [];
+    const tracked: string[] = [];
+    renderDashboardAttachmentSummary([
+      { attachment: pdfAttachment, isNew: true },
+      { attachment: imageAttachment, isNew: true },
+    ], {
+      formatNewLine: (attachment) => `new:${attachment.token}`,
+      formatExistingLine: (attachment) => `existing:${attachment.token}`,
+      pushLine: (line) => { lines.push(line); return lines.length - 1; },
+      trackRow: (row, id) => { tracked.push(`${row}:${id}`); },
+    });
+    expect(lines).toEqual(['new:[PDF #1]', 'new:[Image #2]']);
+    expect(tracked).toEqual(['0:1', '1:2']);
+  });
 });

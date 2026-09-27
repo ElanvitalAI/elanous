@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { ensureAdminToken, mintScopedToken, revokeScopedToken, clearTokenStore } from '../src/auth/token-store';
 import { handleMcpHttpPost } from '../src/nexus/api/mcp-http';
 import { registerToolRuntime, _resetToolRuntimeRegistryForTest } from '../src/tool-runtime/registry';
+import { registerAllDefaultToolRuntimes } from '../src/tool-runtime/index';
 import type { ToolRuntime } from '../src/tool-runtime/types';
 
 let tokenHome: string;
@@ -161,6 +162,73 @@ describe('handleMcpHttpPost — remote access control', () => {
     );
     expect(res.status).toBe(401);
     expect(executions).toBe(0);
+  });
+});
+
+describe('handleMcpHttpPost — mcp-public token tools', () => {
+  test('public token lists only allowed tools while admin and direct loopback still list all tools', async () => {
+    const paths = remoteContext().tokenStorePaths;
+    const admin = ensureAdminToken(paths);
+    const publicToken = mintScopedToken({ scope: 'mcp-public' }, paths);
+    registerAllDefaultToolRuntimes();
+    registerToolRuntime(makeProxyRuntime('xcode.build'));
+    const request = (token?: string) => jsonRpcReq({ jsonrpc: '2.0', id: 1, method: 'tools/list' }, token ? `Bearer ${token}` : undefined);
+    const names = async (res: Response) => ((await asJson(res)).result as { tools: Array<{ name: string }> }).tools.map(tool => tool.name);
+
+    const publicResponse = await handleMcpHttpPost(request(publicToken), remoteContext());
+    expect(publicResponse.status).toBe(200);
+    const publicNames = await names(publicResponse);
+    expect(publicNames).toContain('self_recall');
+    expect(publicNames).not.toContain('xcode.build');
+    expect(publicNames).not.toContain('AgentStop');
+    const adminNames = await names(await handleMcpHttpPost(request(admin), remoteContext()));
+    const loopbackNames = await names(await handleMcpHttpPost(request(), loopbackContext()));
+    expect(adminNames).toContain('xcode.build');
+    expect(loopbackNames).toContain('xcode.build');
+    const loopbackScopedNames = await names(await handleMcpHttpPost(request(publicToken), {
+      ...loopbackContext(), tokenStorePaths: paths,
+    }));
+    expect(loopbackScopedNames).not.toContain('xcode.build');
+  });
+
+  test('public token calls an allowed tool but cannot execute a disallowed tool in JSON or SSE', async () => {
+    const paths = remoteContext().tokenStorePaths;
+    const admin = ensureAdminToken(paths);
+    const publicToken = mintScopedToken({ scope: 'mcp-public' }, paths);
+    let deniedExecutions = 0;
+    registerAllDefaultToolRuntimes();
+    registerToolRuntime(makeProxyRuntime('xcode.build', 'private ok', () => { deniedExecutions += 1; }));
+    const call = (name: string, token: string, extraHeaders: Record<string, string> = {}, args: Record<string, unknown> = {}) =>
+      jsonRpcReq({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name, arguments: args } }, `Bearer ${token}`, extraHeaders);
+
+    const allowed = await handleMcpHttpPost(
+      call('self_recall', publicToken, {}, { query: 'mcp-public-test', sinceHours: 1, limit: 1 }),
+      remoteContext(),
+    );
+    expect(allowed.status).toBe(200);
+    const allowedBody = await asJson(allowed);
+    expect(allowedBody.error).toBeUndefined();
+    const allowedResult = allowedBody.result as { isError?: boolean; structuredContent?: { isError?: boolean }; content: Array<{ type: string; text: string }> };
+    expect(allowedResult.isError).not.toBe(true);
+    expect(allowedResult.structuredContent?.isError).not.toBe(true);
+    expect(allowedResult.content[0]?.type).toBe('text');
+    const recall = JSON.parse(allowedResult.content[0]!.text) as { events: unknown[]; count: number; note: string };
+    expect(Array.isArray(recall.events)).toBe(true);
+    expect(recall.count).toBe(recall.events.length);
+    expect(recall.note).toContain('자기 구현·자율행동 이력 회상');
+
+    const denied = await handleMcpHttpPost(call('xcode.build', publicToken), remoteContext());
+    expect(denied.status).toBe(200);
+    expect((await asJson(denied)).error).toEqual({ code: -32601, message: 'unknown tool: xcode.build' });
+    const streamed = await handleMcpHttpPost(call('xcode.build', publicToken, { 'MCP-Progress': 'stream' }), remoteContext());
+    expect(streamed.status).toBe(200);
+    expect(streamed.headers.get('content-type')).toBe('text/event-stream');
+    expect(await streamed.text()).toContain('"code":-32601');
+    expect(deniedExecutions).toBe(0);
+
+    const adminCall = await handleMcpHttpPost(call('xcode.build', admin), remoteContext());
+    expect(((await asJson(adminCall)).result as { content: Array<{ text: string }> }).content[0]!.text).toBe('private ok');
+    expect(deniedExecutions).toBe(1);
   });
 });
 

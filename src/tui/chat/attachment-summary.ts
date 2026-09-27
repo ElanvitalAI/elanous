@@ -23,8 +23,8 @@ export interface DashboardAttachmentSummaryDeps {
   formatExistingLine: (attachment: Attachment) => string;
   pushLine: (line: string) => number;
   trackRow: (row: number, attachmentId: number) => void;
-  setScratchImage: (sourcePath: string, filename: string) => Promise<void>;
-  setScratchFile: (attachment: Attachment) => void;
+  setScratchImage?: (sourcePath: string, filename: string) => Promise<void>;
+  setScratchFile?: (attachment: Attachment) => void;
 }
 
 export function renderDashboardAttachmentSummary(
@@ -44,9 +44,9 @@ export function renderDashboardAttachmentSummary(
     deps.trackRow(row, attachment.id);
     if (!item.isNew || duplicate) continue;
     if (attachment.kind === 'image') {
-      void deps.setScratchImage(attachment.sourcePath, attachment.filename);
+      void deps.setScratchImage?.(attachment.sourcePath, attachment.filename);
     } else {
-      deps.setScratchFile(attachment);
+      deps.setScratchFile?.(attachment);
     }
   }
 }

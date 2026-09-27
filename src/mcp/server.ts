@@ -25,6 +25,10 @@ import { dispatchToolByName, listToolRuntimes, getToolRuntime } from '../tool-ru
 import { findNativeTool } from '../native-tool-catalog.js';
 import { debug } from '../debug/log.js';
 import { userIntentLogger } from '../user-intent/index.js';
+import { buildCliAgentTools } from '../cli/agent-cli.js';
+import { getUserConfig } from '../user-config.js';
+import type { TokenScope } from '../auth/scope.js';
+import { filterToolsForScope, isToolAllowedForScope } from '../nexus/api/mcp-public-allowlist.js';
 
 // ─── JSON-RPC shapes ─────────────────────────────────────────────
 
@@ -91,6 +95,11 @@ export interface McpServerContext {
    *  Unset = emit is skipped (preserves backward-compat for any caller
    *  not yet origin-aware). */
   origin?: 'mcp-http' | 'mcp-stdio' | 'rest';
+  /** Filled from `initialize.params.clientInfo.name` on a stdio
+   *  connection; forwarded to tools as `ctx.mcpClient`. */
+  clientName?: string;
+  /** Authenticated HTTP token scope; absent on stdio and other trusted transports. */
+  tokenScope?: TokenScope;
 }
 
 /** Emit a `system.mcp.proxy_call` user-intent event for a single
@@ -130,7 +139,9 @@ export async function handleMcpRequest(
   const base = { jsonrpc: '2.0' as const, id };
   try {
     switch (req.method) {
-      case 'initialize':
+      case 'initialize': {
+        const clientInfo = req.params?.clientInfo as { name?: unknown } | undefined;
+        if (typeof clientInfo?.name === 'string' && clientInfo.name.trim()) ctx.clientName = clientInfo.name.trim().slice(0, 80);
         return {
           ...base,
           result: {
@@ -139,22 +150,30 @@ export async function handleMcpRequest(
             serverInfo: SERVER_INFO,
           },
         };
+      }
 
       case 'initialized':
       case 'notifications/initialized':
         return { ...base, result: {} };
 
       case 'tools/list': {
+        await preloadCoreTools();
         ensureDefaultMcpToolRuntimes();
         const surface = ctx.surface ?? 'mcp';
         const runtimes = listToolRuntimes(surface);
         logMcpToolsList(runtimes, surface, ctx.origin);
-        return { ...base, result: { tools: runtimes.map(runtimeToMcpTool) } };
+        const tools = runtimes.map(rt => runtimeToMcpTool(rt, surface));
+        return { ...base, result: { tools: ctx.tokenScope ? filterToolsForScope(tools, ctx.tokenScope) : tools } };
       }
 
       case 'tools/call': {
+        await preloadCoreTools();
         ensureDefaultMcpToolRuntimes();
         const name = typeof req.params?.name === 'string' ? req.params.name : '';
+        if (ctx.tokenScope && !isToolAllowedForScope(name, ctx.tokenScope)) {
+          emitProxyCallIntent(name, ctx.origin, false, 'unknown_tool');
+          return { ...base, error: { code: -32601, message: `unknown tool: ${name}` } };
+        }
         const args = (req.params?.arguments as Record<string, unknown>) ?? {};
         const surface = ctx.surface ?? 'mcp';
         const rt = getToolRuntime(name);
@@ -167,7 +186,32 @@ export async function handleMcpRequest(
           };
         }
         try {
-          const out = await dispatchToolByName(name, args, { surface });
+          const isMcpAgent = surface === 'mcp' && rt.id === 'agent';
+          const agentArgs = isMcpAgent
+            ? { ...args, run_in_background: args.run_in_background ?? true }
+            : args;
+          const agentConfig = isMcpAgent ? getUserConfig() : undefined;
+          const agentCwd = typeof args.cwd === 'string' ? args.cwd : process.cwd();
+          const agentTools = agentConfig
+            ? buildCliAgentTools(agentConfig, undefined, agentCwd)
+            : undefined;
+          const out = await dispatchToolByName(name, agentArgs, {
+            surface,
+            ...(ctx.clientName ? { mcpClient: ctx.clientName } : {}),
+            ...(agentTools ? {
+              agentHostTools: agentTools.specs,
+              agentCwd,
+              agentDispatchTool: agentTools.dispatch,
+              buildChildToolCatalog: (childCwd: string) => buildCliAgentTools(agentConfig, undefined, childCwd),
+            } : {}),
+          });
+          if (isMcpAgent && 'taskId' in out && typeof out.taskId === 'string') {
+            debug.log('mcp.agent', 'spawned', {
+              taskId: out.taskId,
+              client: ctx.clientName,
+              background: agentArgs.run_in_background === true,
+            });
+          }
           emitProxyCallIntent(name, ctx.origin, true);
           return { ...base, result: toMcpToolCallResult(out) };
         } catch (err) {
@@ -190,6 +234,13 @@ export async function handleMcpRequest(
     const msg = err instanceof Error ? err.message : String(err);
     return { ...base, error: { code: -32000, message: msg } };
   }
+}
+
+let preloaded: Promise<unknown> | null = null;
+
+async function preloadCoreTools(): Promise<void> {
+  preloaded ??= import('../domains/core-tools.js').catch(() => {});
+  await preloaded;
 }
 
 /** Ensure direct MCP transports expose elanous-owned runtimes even before
@@ -221,11 +272,28 @@ function logMcpToolsList(
   } catch { /* observability must not break JSON-RPC */ }
 }
 
-function runtimeToMcpTool(rt: ToolRuntime): Record<string, unknown> {
+function runtimeToMcpTool(rt: ToolRuntime, surface: ToolSurface) {
+  const inputSchema = surface === 'mcp' && rt.id === 'agent'
+    ? {
+        ...rt.spec.parameters,
+        properties: {
+          ...(rt.spec.parameters.properties as Record<string, unknown>),
+          cwd: {
+            type: 'string',
+            description: 'Optional MCP working directory for the child. Defaults to the MCP server process cwd.',
+          },
+        },
+      }
+    : rt.spec.parameters;
+  // Over MCP the agent tool runs in the background unless the caller says otherwise (client tool
+  // timeouts are short) — say so in the description the MCP client shows its model (#21088 review).
+  const description = surface === 'mcp' && rt.id === 'agent'
+    ? `${rt.spec.description} Over MCP this returns immediately with a taskId (run_in_background defaults to true); collect the result with AgentOutput(taskId, block: true) and cancel with AgentStop(taskId). Pass cwd to run the child in a specific project folder.`
+    : rt.spec.description;
   return {
     name: rt.spec.name,
-    description: rt.spec.description,
-    inputSchema: rt.spec.parameters,
+    description,
+    inputSchema,
   };
 }
 

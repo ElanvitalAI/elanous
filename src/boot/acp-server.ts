@@ -11,6 +11,7 @@
 //   --socket-path=<path>                       unix-socket only
 //   --port=<n>                                 websocket only
 //   --host=<host>                              websocket only
+//   --tool-cwd=<path>                          overrides ELANOUS_TOOL_CWD
 //   --no-auth                                  websocket: skip token
 //
 // The boot wraps `runAcpServer` with a SIGINT/SIGTERM-aware shutdown
@@ -50,6 +51,8 @@ export interface AcpBootOptions {
    *  other pre-auth'd private transports). Default `false` →
    *  token check ON. */
   noAuth?: boolean;
+  /** Optional ACP tool cwd fallback; overrides ELANOUS_TOOL_CWD when set. */
+  toolCwd?: string;
 }
 
 /** Default socket path — XDG-ish; `~/.elanous/elanous.sock`. */
@@ -101,6 +104,8 @@ export function parseAcpBootArgs(argv: readonly string[]): AcpBootOptions {
   const host = readFlagValue(argv, '--host');
   if (host) opts.host = host;
   if (argv.includes('--no-auth')) opts.noAuth = true;
+  const toolCwd = readFlagValue(argv, '--tool-cwd');
+  if (toolCwd !== undefined) opts.toolCwd = toolCwd;
   return opts;
 }
 
@@ -131,7 +136,7 @@ export interface BootRuntimeStatus {
   /** Active tool surface kind ('none' | 'readonly'). When omitted or
    *  'none', the banner says so + hints at ELANOUS_TOOLS=readonly. */
   tools?: string;
-  /** Resolved tool cwd when tools !== 'none'. */
+  /** Optional boot cwd fallback; session cwd takes precedence. */
   toolCwd?: string;
 }
 
@@ -226,6 +231,11 @@ export async function bootAcpServer(
   const runTurn = deps.runTurn;
   const hasSession = deps.hasSession;
   const runtimeStatus = deps.runtimeStatus;
+  const bootToolCwd = runtimeStatus?.toolCwd || opts.toolCwd?.trim() || process.env.ELANOUS_TOOL_CWD?.trim();
+  const cwdPolicy = {
+    requireSessionToolCwd: true,
+    ...(bootToolCwd ? { bootToolCwd } : {}),
+  };
   const declarationIdentity = {
     ...(deps.agentBrand !== undefined ? { agentBrand: deps.agentBrand } : {}),
     ...(deps.agentModel !== undefined ? { agentModel: deps.agentModel } : {}),
@@ -260,6 +270,7 @@ export async function bootAcpServer(
         shutdownSignal: ownSignal,
         ...(runTurn ? { runTurn } : {}),
         ...(hasSession ? { hasSession } : {}),
+        ...cwdPolicy,
         ...declarationIdentity,
       });
       return;
@@ -276,6 +287,7 @@ export async function bootAcpServer(
         shutdownSignal: ownSignal,
         ...(runTurn ? { runTurn } : {}),
         ...(hasSession ? { hasSession } : {}),
+        ...cwdPolicy,
         ...declarationIdentity,
       });
       return;
@@ -308,6 +320,7 @@ export async function bootAcpServer(
       shutdownSignal: ownSignal,
       ...(runTurn ? { runTurn } : {}),
       ...(hasSession ? { hasSession } : {}),
+      ...cwdPolicy,
       ...declarationIdentity,
     });
   } finally {

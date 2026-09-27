@@ -44,8 +44,7 @@ import { dirname, join as joinPath, resolve as resolvePath } from 'node:path';
 import { setTestStateRoot } from '../nexus/paths.js';
 import { PORT_BANDS } from '../control-plane/ports.js';
 import { PORT_LEASE_TTL_MS } from '../control-plane/port-lease-heartbeat.js';
-import { readMemberToken } from '../control-plane/member.js';
-import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { resolvePrimary, type PrimaryAddress, type PrimaryConfig } from '../control-plane/primary.js';
 import { runPwaStart, type PwaStartMode, type PwaStartOpts, type PwaStartResult } from './pwa-start.js';
 import { runPwaStop, type PwaStopOpts, type PwaStopResult } from './pwa-stop.js';
 import { isAliveNexusLock, type NexusLockMeta } from '../nexus/supervisor/lock.js';
@@ -129,6 +128,8 @@ export interface PwaTestOpts {
   productionLockAliveFn?: (meta: NexusLockMeta) => boolean;
   /** Replace the port collision probe. Defaults to a local bind probe. */
   portInUseFn?: (port: number) => boolean | Promise<boolean>;
+  /** Explicit primary address and scoped write token for coordinator leases. */
+  coordinatorPrimary?: PrimaryConfig;
   /** Coordinator request seam; null means coordinator unavailable. A lease must carry its id. */
   leasePortFn?: (excluded?: readonly number[]) => Promise<CoordinatorPortLease | null>;
   /** Release a failed central claim before retrying. */
@@ -233,14 +234,13 @@ function readProjectLock(lockPath: string): NexusLockMeta | null {
   }
 }
 
-const coordinatorUrl = `http://127.0.0.1:${PORT_BANDS.reserved[0]}`;
-
-async function coordinatorPortRequest(path: string, method: string, body?: unknown, token = readMemberToken(effectiveInstanceRoot())): Promise<Response | null> {
-  if (!token) return null;
+async function coordinatorPortRequest(path: string, method: string, body?: unknown, primary?: PrimaryAddress): Promise<Response | null> {
+  primary ??= await resolvePrimary({ role: 'member' });
+  if (!primary.token) return null;
   try {
-    return await fetch(`${coordinatorUrl}${path}`, {
+    return await fetch(`${primary.url}${path}`, {
       method,
-      headers: { Authorization: `Bearer ${token}`, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+      headers: { Authorization: `Bearer ${primary.token}`, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
       ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       signal: AbortSignal.timeout(1000),
     });
@@ -253,9 +253,15 @@ export async function requestCoordinatorPort(
   excluded: readonly number[] = [],
   send: typeof coordinatorPortRequest = coordinatorPortRequest,
 ): Promise<CoordinatorPortLease | null> {
+  return requestCoordinatorPortForPrimary(excluded, await resolvePrimary({ role: 'member' }), send);
+}
+
+async function requestCoordinatorPortForPrimary(
+  excluded: readonly number[], primary: PrimaryAddress, send: typeof coordinatorPortRequest = coordinatorPortRequest,
+): Promise<CoordinatorPortLease | null> {
   const response = await send('/v1/leases/port', 'POST', {
-    machine: process.env.HOSTNAME || 'local', purpose: 'nexus-test', ttlMs: PORT_LEASE_TTL_MS, excluded,
-  });
+    machine: primary.machine ?? (process.env.HOSTNAME || 'local'), purpose: 'nexus-test', ttlMs: PORT_LEASE_TTL_MS, excluded,
+  }, primary);
   if (!response) return null;
   if (response.status === 409) {
     const body: unknown = await response.json();
@@ -272,10 +278,11 @@ export async function requestCoordinatorPort(
   return { port, leaseId };
 }
 
-async function releaseCoordinatorPort(lease: CoordinatorPortLease, token = readMemberToken(effectiveInstanceRoot())): Promise<void> {
-  if (!token) return;
-  const response = await fetch(`${coordinatorUrl}/v1/leases/port/${lease.port}`, {
-    method: 'DELETE', headers: { Authorization: `Bearer ${token}`, 'x-port-lease-id': lease.leaseId },
+async function releaseCoordinatorPort(lease: CoordinatorPortLease, primary?: PrimaryAddress): Promise<void> {
+  primary ??= await resolvePrimary({ role: 'member' });
+  if (!primary.token) return;
+  const response = await fetch(`${primary.url}/v1/leases/port/${lease.port}`, {
+    method: 'DELETE', headers: { Authorization: `Bearer ${primary.token}`, 'x-port-lease-id': lease.leaseId },
     signal: AbortSignal.timeout(1000),
   }).catch(() => null);
   if (!response?.ok && response?.status !== 404 && response?.status !== 403) throw new Error(`coordinator port release ${response ? `HTTP ${response.status}` : 'unavailable'}`);
@@ -285,7 +292,7 @@ async function pickNexusPort(
   preferred: number | undefined,
   layout: RepoLayout,
   opts: PwaTestOpts,
-): Promise<{ port: number; reason: string; leaseId?: string } | { error: string }> {
+): Promise<{ port: number; reason: string; leaseId?: string; primary?: PrimaryAddress } | { error: string }> {
   const inUseFn = opts.portInUseFn ?? defaultPortInUse;
   // ⓐ 명시 `--port` 가 이긴다(불변).
   if (preferred !== undefined) {
@@ -305,17 +312,18 @@ async function pickNexusPort(
   return { port: claim.port, reason: `시험 대역에서 :${claim.port} 임대` };
 }
 
-async function releaseCentral(opts: PwaTestOpts, lease: CoordinatorPortLease): Promise<void> {
+async function releaseCentral(opts: PwaTestOpts, lease: CoordinatorPortLease, primary?: PrimaryAddress): Promise<void> {
   if (opts.releasePortFn) await opts.releasePortFn(lease.port);
-  else await releaseCoordinatorPort(lease);
+  else await releaseCoordinatorPort(lease, primary);
 }
 
 /** 관제부에서 시험 대역 포트를 받는다. 받지 못하면(관제부 부재·오류·잘못된 응답·대역 소진) null — 호출자가 로컬 임대로 넘어간다. */
 async function pickCoordinatorPort(
   opts: PwaTestOpts,
   inUseFn: (port: number) => boolean | Promise<boolean>,
-): Promise<{ port: number; reason: string; leaseId: string } | null> {
-  const request = opts.leasePortFn ?? requestCoordinatorPort;
+): Promise<{ port: number; reason: string; leaseId: string; primary?: PrimaryAddress } | null> {
+  const primary = opts.leasePortFn ? undefined : await resolvePrimary({ role: 'member', config: opts.coordinatorPrimary });
+  const request = opts.leasePortFn ?? ((excluded: readonly number[]) => requestCoordinatorPortForPrimary(excluded, primary!));
   const excluded: number[] = [];
   for (let attempt = PORT_BANDS.test.start; attempt <= PORT_BANDS.test.end; attempt++) {
     let claimed: CoordinatorPortLease | null;
@@ -338,11 +346,11 @@ async function pickCoordinatorPort(
     let occupied: boolean;
     try { occupied = await inUseFn(port); }
     catch (err) {
-      await releaseCentral(opts, claimed);
+      await releaseCentral(opts, claimed, primary);
       throw err;
     }
-    if (!occupied) return { port, reason: 'coordinator lease', leaseId };
-    await releaseCentral(opts, claimed);
+    if (!occupied) return { port, reason: 'coordinator lease', leaseId, ...(primary ? { primary } : {}) };
+    await releaseCentral(opts, claimed, primary);
     excluded.push(port);
   }
   debug.log('nexus.port-lease', 'coordinator-fallback', { reason: 'coordinator-band-exhausted' });
@@ -490,13 +498,12 @@ async function runStart(
     return { exitCode: 1 };
   }
   const nexusPort = nexusPick.port;
-  // Snapshot the credential before switching config to the project-local test root.
-  const coordinatorToken = nexusPick.reason === 'coordinator lease' && !opts.leasePortFn
-    ? readMemberToken(effectiveInstanceRoot()) : undefined;
+  const coordinatorPrimary = 'primary' in nexusPick ? nexusPick.primary : undefined;
+  const coordinatorToken = coordinatorPrimary?.token;
   const releasePickedLease = async (): Promise<void> => {
     if (nexusPick.reason === 'coordinator lease') {
       if (opts.releasePortFn) await opts.releasePortFn(nexusPort);
-      else if (nexusPick.leaseId) await releaseCoordinatorPort({ port: nexusPort, leaseId: nexusPick.leaseId }, coordinatorToken);
+      else if (nexusPick.leaseId) await releaseCoordinatorPort({ port: nexusPort, leaseId: nexusPick.leaseId }, coordinatorPrimary);
     }
   };
 

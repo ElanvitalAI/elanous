@@ -312,9 +312,8 @@ export interface DashboardMouseWiringDeps {
    *  with a fake timer to drive stable-hover deterministically; at
    *  runtime wiring creates its own via createHoverTracker(). */
   hoverTracker?: HoverTracker;
-  /** TUI 부활 T4 — hover 팝업(툴팁 자동 표시) 게이트. essential UI
-   *  모드가 `() => uiMode === 'rich'` 로 배선 — hover popup 스타일은
-   *  rich UI 전용. Omit = 항상 표시 (기존 동작 무변). */
+  /** Hover popup gate. The essential dashboard supplies `() => false`;
+   *  omitted gates continue to show tooltips for other hosts. */
   hoverPopupsEnabled?: () => boolean;
   /** IDX-5 — override the per-pill tooltip text map. Callers can
    *  hide a tooltip by returning null. Default map covers the

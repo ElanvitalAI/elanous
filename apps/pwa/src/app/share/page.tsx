@@ -28,6 +28,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { debugLog } from '@/lib/debug';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { takeSharedPayload } from '@/lib/share-target-store';
+import { writeSharePrefill } from '@/lib/share-prefill';
 import { uploadAttachment, type AttachmentMeta } from '@/lib/upload-attachment';
 
 function buildShareText(title: string | null, text: string | null, url: string | null): string {
@@ -38,7 +39,6 @@ function buildShareText(title: string | null, text: string | null, url: string |
   return parts.join('\n\n');
 }
 
-const SHARE_PREFILL_KEY = 'elanous.pwa.sharePrefill';
 const SHARE_ATTACHMENTS_KEY = 'elanous.pwa.shareAttachments';
 
 type Phase =
@@ -79,7 +79,7 @@ function ShareInner(): React.ReactElement {
           // somehow) or the cache was already drained. Fall back to
           // the L1 prefill path with whatever text we have.
           if (payload && payload.combinedText) {
-            try { window.sessionStorage.setItem(SHARE_PREFILL_KEY, payload.combinedText); } catch { /* swallow */ }
+            writeSharePrefill(payload.combinedText);
           }
           debugLog('pwa.share.l2.empty', { sharedId, hasPayload: !!payload });
           setState({ phase: 'level2-empty' });
@@ -118,10 +118,8 @@ function ShareInner(): React.ReactElement {
         // Stash the AttachmentMeta[] for ChatLayout to consume.
         try {
           window.sessionStorage.setItem(SHARE_ATTACHMENTS_KEY, JSON.stringify(metas));
-          if (payload.combinedText) {
-            window.sessionStorage.setItem(SHARE_PREFILL_KEY, payload.combinedText);
-          }
         } catch { /* swallow */ }
+        if (payload.combinedText) writeSharePrefill(payload.combinedText);
         setState({ phase: 'level2-handing-off', total: payload.files.length, done: payload.files.length });
         const t = setTimeout(() => router.replace('/chat?shared=1'), 400);
         return () => clearTimeout(t);
@@ -136,7 +134,7 @@ function ShareInner(): React.ReactElement {
     const c = buildShareText(title, text, url);
     debugLog('pwa.share.l1.received', { hasTitle: !!title, hasText: !!text, hasUrl: !!url, len: c.length });
     if (typeof window !== 'undefined' && c.length > 0) {
-      try { window.sessionStorage.setItem(SHARE_PREFILL_KEY, c); } catch { /* swallow */ }
+      writeSharePrefill(c);
     }
     setState({ phase: 'level1-handing-off', preview: c });
     const t = setTimeout(() => router.replace('/chat'), 400);

@@ -25,7 +25,6 @@ interface RouteSpy {
   preKeyFired: number;
   termModalFired: number;
   bellFired: number;
-  vwTerminalFired: number;
 }
 
 function makeDeps(opts: {
@@ -37,8 +36,6 @@ function makeDeps(opts: {
   const { voiceChatActive, onEsc, spy, onActiveKey } = opts;
   return {
     isForceQuitChord: () => false,
-    routePopupCloseChord: () => false,
-    routeVwSwitchChord: () => false,
     routeVoiceEnterChord: () => false,
     routeVoiceModeKey: () => false,
     routeVoiceChatRealtimeChord: () => false,
@@ -54,7 +51,6 @@ function makeDeps(opts: {
     routeBellKey: async () => { spy.bellFired++; return false; },
     dispatchPreKey: async () => { spy.preKeyFired++; return false; },
     routeExclusiveTerminalModalKey: () => { spy.termModalFired++; return false; },
-    routeVwTerminalKey: async () => { spy.vwTerminalFired++; return false; },
     routeArmedChordKey: async () => false,
     armPrefixChord: () => false,
     isHardQuitKey: () => false,
@@ -66,7 +62,7 @@ function makeDeps(opts: {
 
 describe('routeDashboardPriorityKey — voice-chat modal-A swallow', () => {
   it("swallows typing keys (a, space, enter) while voice-chat is active", async () => {
-    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0, vwTerminalFired: 0 };
+    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0 };
     const seen: string[] = [];
     const deps = makeDeps({
       voiceChatActive: true,
@@ -82,11 +78,10 @@ describe('routeDashboardPriorityKey — voice-chat modal-A swallow', () => {
     expect(spy.bellFired).toBe(0);
     expect(spy.preKeyFired).toBe(0);
     expect(spy.termModalFired).toBe(0);
-    expect(spy.vwTerminalFired).toBe(0);
   });
 
   it('forwards ESC into the controller exit hook + claims the key', async () => {
-    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0, vwTerminalFired: 0 };
+    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0 };
     let escFired = 0;
     const deps = makeDeps({
       voiceChatActive: true,
@@ -100,7 +95,7 @@ describe('routeDashboardPriorityKey — voice-chat modal-A swallow', () => {
   });
 
   it('passthrough when voice-chat controller is idle', async () => {
-    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0, vwTerminalFired: 0 };
+    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0 };
     const deps = makeDeps({
       voiceChatActive: false,
       spy,
@@ -111,11 +106,10 @@ describe('routeDashboardPriorityKey — voice-chat modal-A swallow', () => {
     expect(spy.bellFired).toBe(1);
     expect(spy.preKeyFired).toBe(1);
     expect(spy.termModalFired).toBe(1);
-    expect(spy.vwTerminalFired).toBe(1);
   });
 
   it('chord (alt+r) takes precedence over modal-A — handled at step 0r', async () => {
-    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0, vwTerminalFired: 0 };
+    const spy: RouteSpy = { preKeyFired: 0, termModalFired: 0, bellFired: 0 };
     let chordFired = 0;
     let activeKeyFired = 0;
     const deps: DashboardPriorityKeyRouteDeps<null> = {

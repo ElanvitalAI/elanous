@@ -1,9 +1,8 @@
 /**
  * BACKLOG #7 — collapsible code-block preview policy.
  *
- * AgentResponseSheet renders the daemon's `runAgentTurn` markdown as a
- * single ReactMarkdown tree. Long fenced code blocks (tool output,
- * multi-file diffs, JSON dumps) push the relevant text off-screen on
+ * ChatMessage renders agent markdown as a ReactMarkdown tree. Long fenced
+ * code blocks (tool output, multi-file diffs, JSON dumps) push text off-screen on
  * iPad 11" portrait — users keep scrolling instead of reading.
  *
  * This helper owns the threshold + raw-text extraction policy so the

@@ -10,6 +10,7 @@ import {
   CalendarClock,
   Compass,
   GitBranch,
+  GitPullRequest,
   KanbanSquare,
   Layers,
   LayoutGrid,
@@ -87,6 +88,7 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   { href: '/chat', label: 'Chat', hint: '채팅 (스트리밍 · multimodal · mic)', icon: MessageSquare, kind: 'chat' },
   // 2026-09-26 대표 결정으로 되살림 · RFC-pwa-intake-front-door
   { href: '/intake', label: 'Intake', hint: '넣으면 흡수 · 작업 · 그래프로 (URL · 미션 · 메모)', icon: Inbox, kind: null },
+  { href: '/approvals', label: 'Approvals', hint: '아이디어 PR 요약 · 승인하고 머지', icon: GitPullRequest, kind: null },
   { href: '/showroom', label: 'Showroom', hint: 'multi-agent 동시 비교 (broadcast · CV-3)', icon: LayoutGrid, kind: null },
   { href: '/bots', label: 'Bots', hint: '봇 신원 + 공통 명령 카탈로그 (읽기 전용)', icon: Bot, kind: null },
   { href: '/observatory', label: 'Observatory', hint: 'subject 관측 (talk · screen · agent)', icon: Telescope, kind: null },

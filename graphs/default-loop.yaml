@@ -174,7 +174,7 @@ nodes:
     #   ⛔ 수를 늘리는 것이 아니라 «관측에 맞추는» 것이다. 다시 좁히려면 «표본»을 대라.
     max_visits: 2
     progress: [merging, merged]
-    terminal_stages: [merged, pr-opened]
+    terminal_stages: [merged, pr-opened, merge-ready]  # merge-ready = Pod 런이 호스트 재게이트에 넘긴 자리(#20988)
     contract: { inputs: [pr_number, head_sha], tools: gh-pr-merge, outputs: [merged] }
 
   - node_id: stopped

@@ -13,6 +13,7 @@
 // 제거는 주입(테스트 가능·nexus 가 실핸들 배선).
 
 import type { Database } from 'bun:sqlite';
+import { debug } from '../debug/log.js';
 import type { WorkflowEntry } from '../workflow-runtime/types.js';
 import type { TaskStore } from '../task-orchestrator/store.js';
 import { taskToWorkflowEntry } from '../task-orchestrator/task-to-workflow.js';
@@ -30,12 +31,24 @@ import { scheduleJobToTask } from './schedule-to-task.js';
 export function registerScheduledToxTasks(
   store: TaskStore,
   registerWorkflow: (entry: WorkflowEntry) => void,
-): { registered: number; skipped: number } {
+  /** 레지스트리의 그 잡이 지금 무엇으로 도나(`run_via`). 주면 `trigger` 가 아닌 잡의 파생 task 는 등록하지 않는다.
+   *  🩸 2026-09-27: `schedule release` 뒤 남은 파생 task 가 재시작마다 트리거로 다시 등록돼 crontab ⊕ 트리거 두 번 돌 뻔했다. */
+  runViaOf?: (jobId: string) => string | null,
+): { registered: number; skipped: number; skippedNotTrigger: number } {
   let registered = 0;
   let skipped = 0;
+  let skippedNotTrigger = 0;
   for (const task of store.listTasks()) {
     if (!task.scheduleText) continue;
     if (isTerminalStatus(task.status)) { skipped++; continue; }
+    if (task.schedulerJobId && runViaOf) {
+      const runVia = runViaOf(task.schedulerJobId);
+      if (runVia !== 'trigger') {
+        skippedNotTrigger++;
+        debug.log('schedule.migrate', 'boot-register-skipped', { taskId: task.id, jobId: task.schedulerJobId, runVia });
+        continue;
+      }
+    }
     try {
       registerWorkflow(taskToWorkflowEntry(task, task.scheduleText));
       registered++;
@@ -43,7 +56,7 @@ export function registerScheduledToxTasks(
       skipped++;
     }
   }
-  return { registered, skipped };
+  return { registered, skipped, skippedNotTrigger };
 }
 
 export interface MigrateJobDeps {

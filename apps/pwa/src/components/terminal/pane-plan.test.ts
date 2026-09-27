@@ -18,19 +18,13 @@ const row = (
 });
 
 describe('panePlan', () => {
-  test('keeps rows without a run value as relationship-unavailable', () => {
+  test('two ordinary terminals without runId have no unknown placement', () => {
     const plan: PanePlan = panePlan([row('parent'), row('possible-child', { startedAt: 20 })]);
 
-    expect(plan).toEqual({
-      layouts: [],
-      unknown: [
-        { id: 'parent', reason: 'relationship-unavailable' },
-        { id: 'possible-child', reason: 'relationship-unavailable' },
-      ],
-    });
+    expect(plan).toEqual({ layouts: [], unknown: [] });
   });
 
-  test('preserves alive, dead, nested-looking, and separate rows without claiming a split', () => {
+  test('does not claim a split or unknown relationship for ordinary rows', () => {
     const plan = panePlan([
       row('root'),
       row('middle', { alive: false, startedAt: 10 }),
@@ -40,13 +34,7 @@ describe('panePlan', () => {
     ]);
 
     expect(plan.layouts).toEqual([]);
-    expect(plan.unknown).toEqual([
-      { id: 'root', reason: 'relationship-unavailable' },
-      { id: 'middle', reason: 'relationship-unavailable' },
-      { id: 'leaf', reason: 'relationship-unavailable' },
-      { id: 'other-root', reason: 'relationship-unavailable' },
-      { id: 'other-child', reason: 'relationship-unavailable' },
-    ]);
+    expect(plan.unknown).toEqual([]);
   });
 
   test('does not invent an input-order tie-breaker for equally recent run members', () => {
@@ -103,7 +91,7 @@ describe('panePlan', () => {
     ]);
   });
 
-  test('keeps blank run rows unknown and ignores parent metadata', () => {
+  test('treats blank run rows as ordinary and ignores parent metadata', () => {
     const plan = panePlan([
       row('first', { runId: 'run-a', startedAt: 10, parentPtyId: '' }),
       row('second', { runId: 'run-a', startedAt: 20, parentPtyId: '' }),
@@ -112,7 +100,7 @@ describe('panePlan', () => {
 
     expect(plan).toEqual({
       layouts: [{ runId: 'run-a', split: 'second', tabs: ['first'] }],
-      unknown: [{ id: 'blank-run', reason: 'relationship-unavailable' }],
+      unknown: [],
     });
     expect(plan.layouts[0]).not.toHaveProperty('parentId');
   });
@@ -147,12 +135,24 @@ describe('panePlan', () => {
       row('second', { parentPtyId: 'shared-parent', startedAt: 20 }),
     ]);
 
+    expect(plan).toEqual({ layouts: [], unknown: [] });
+  });
+
+  test('a run-bound terminal without a live child is unknown once', () => {
+    const plan = panePlan([row('dead', { runId: 'run-a', alive: false })]);
+    expect(plan.unknown).toEqual([{ id: 'dead', reason: 'relationship-unavailable' }]);
+  });
+
+  test('processes duplicate terminal IDs only once', () => {
+    const plan = panePlan([
+      row('dead', { runId: 'run-a', alive: false }),
+      row('dead', { runId: 'run-a', alive: false }),
+      row('live', { runId: 'run-b', startedAt: 10 }),
+      row('live', { runId: 'run-b', startedAt: 10 }),
+    ]);
     expect(plan).toEqual({
-      layouts: [],
-      unknown: [
-        { id: 'first', reason: 'relationship-unavailable' },
-        { id: 'second', reason: 'relationship-unavailable' },
-      ],
+      layouts: [{ runId: 'run-b', split: 'live', tabs: [] }],
+      unknown: [{ id: 'dead', reason: 'relationship-unavailable' }],
     });
   });
 });

@@ -80,12 +80,18 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
 
   usage
     .command('runs')
-    .description('저장된 llm-usage 로그를 런·모델·청구 경로별로 집계한다')
+    .description('저장된 llm-usage 로그를 런 또는 역할·호출 자리별로 집계한다')
     .option('--run <runId>', '런 ID 정확 일치')
+    .option('--by <axis>', '집계 축 (run | role)', 'run')
     .option(...LOGS_SINCE_OPTION)
     .option('--json', '집계 행 JSON 출력')
-    .action((opts: { run?: string; since?: string; json?: boolean }, command: Command) => {
+    .action((opts: { run?: string; by: string; since?: string; json?: boolean }, command: Command) => {
       const json = opts.json || command.optsWithGlobals<{ json?: boolean }>().json;
+      if (opts.by !== 'run' && opts.by !== 'role') {
+        out.log('⛔ --by 는 run | role');
+        exit(2);
+        return;
+      }
       const sinceMs = opts.since === undefined ? undefined : parseSince(opts.since);
       if (sinceMs === null) {
         out.log(`⛔ --since 파싱 불가: '${opts.since}' (30s/15m/2h/7d 또는 ISO)`);
@@ -98,14 +104,19 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
       });
       const inputs = rows.map(usageData).filter((data): data is RunUsageInput => data !== null)
         .filter((data) => opts.run === undefined || data.runId === opts.run);
-      const report = rollupRunUsage(inputs);
+      const report = rollupRunUsage(inputs, { by: opts.by });
+      if (opts.by === 'role') report.sort((a, b) => b.calls - a.calls);
       if (json) {
         out.log(JSON.stringify(report, null, 2));
         return;
       }
       if (report.length === 0) { out.log('(일치하는 런 사용량 없음)'); return; }
       for (const row of report) {
-        out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+        if (opts.by === 'role') {
+          out.log(`${row.role}  ${row.site}  ${row.model}  ${row.billingProvider}/${row.billing}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+        } else {
+          out.log(`${row.runId}  ${row.model}  ${row.billingProvider}/${row.billing}  hosts=${row.hostIds.join(',') || '(none)'}  calls=${row.calls}  input=${row.inputTokens}  output=${row.outputTokens}  cacheRead=${row.cacheReadInputTokens}  cacheCreation=${row.cacheCreationInputTokens}  reasoning=${row.reasoningOutputTokens}  usdKnown=${row.usdKnown}  unknownCostCalls=${row.unknownCostCalls}  includedCalls=${row.includedCalls}  apiEquivalentUsd=${row.apiEquivalentUsd}`);
+        }
       }
     });
 

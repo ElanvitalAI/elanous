@@ -63,18 +63,14 @@ export const dashboardStateRuntime: ToolRuntime<Record<string, unknown>, Dashboa
     const recentTerminalMouseIntents = (() => {
       try { return terminalMouseIntentsGetter?.() ?? []; } catch { return []; }
     })();
-    const includeVirtualWindows =
-      typeof req.includeVirtualWindows === 'boolean' ? req.includeVirtualWindows : undefined;
     const result = await dispatchGetDashboardState(req, {
       terminalSessions,
       dashboardToolNames,
       recentTerminalMouseIntents,
-      includeVirtualWindows,
     });
     const stableStateHash = createHash('sha1')
       .update(JSON.stringify({
         workspace: result.snapshot.workspace,
-        windows: result.snapshot.windows,
         ptys: result.snapshot.ptys,
         tools: result.snapshot.tools,
         terminalSessions: result.snapshot.terminalSessions,
@@ -91,7 +87,7 @@ export const dashboardStateRuntime: ToolRuntime<Record<string, unknown>, Dashboa
           `[DUPLICATE CALL — state unchanged]\n` +
           `GetDashboardState\n` +
           `Dashboard state is unchanged from ${secondsAgo}s ago. ` +
-          `Use the previous tool_result already in history unless an intervening action changed layout, sessions, cwd, or tool exposure.`,
+          `Use the previous tool_result already in history unless an intervening action changed sessions, cwd, or tool exposure.`,
       };
     }
 

@@ -24,6 +24,7 @@ import type {
   ScheduleTriggerNode,
   SetNode,
   ShowroomNode,
+  TaskNode,
   SkillNode,
   SwitchNode,
   TelegramTriggerNode,
@@ -38,7 +39,7 @@ import { buildWarnings, type ValidationWarning } from './validation-warnings.js'
 /** ⛔ 노드 변종의 SSOT — 도움말·문서가 이 배열에서 «파생»한다.
  *  손으로 목록을 옮겨 적으면 늙는다(2026-09-22 실측: `elanous wf --help` 가 13종만 말했고
  *  이 배열은 21종을 받고 있었다 — 여덟이 «안내 없이» 살아 있었다). */
-export const WORKFLOW_NODE_VARIANT_KEYS = ['prompt', 'bash', 'skill', 'cft', 'approval', 'if', 'switch', 'iteration', 'classify', 'extract', 'set', 'filter', 'template', 'http', 'showroom', 'scheduleTrigger', 'webhookTrigger', 'discordTrigger', 'telegramTrigger', 'manualTrigger', 'chatTrigger'] as const;
+export const WORKFLOW_NODE_VARIANT_KEYS = ['prompt', 'bash', 'skill', 'cft', 'approval', 'if', 'switch', 'iteration', 'classify', 'extract', 'set', 'filter', 'template', 'http', 'showroom', 'task', 'scheduleTrigger', 'webhookTrigger', 'discordTrigger', 'telegramTrigger', 'manualTrigger', 'chatTrigger'] as const;
 
 const KEBAB_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const TRIGGER_RULES: readonly TriggerRule[] = [
@@ -413,6 +414,43 @@ export function validateWorkflow(raw: unknown): ValidationResult {
           push(`${path}.extract.retryDelayMs`, "'extract.retryDelayMs' must be a non-negative number (ms)");
         }
       }
+    } else if (variant === 'task') {
+      // RFC external tasks §A8 (X5b) — TOX task with its external origin.
+      if (!isObject(variantValue)) {
+        push(`${path}.task`, "'task' must be an object with 'title' and 'external'");
+      } else {
+        if (typeof variantValue['title'] !== 'string' || !variantValue['title'].trim()) {
+          push(`${path}.task.title`, "'task.title' is required and must be a non-empty string");
+        }
+        for (const field of ['description', 'priority', 'eventId'] as const) {
+          if (variantValue[field] !== undefined && typeof variantValue[field] !== 'string') {
+            push(`${path}.task.${field}`, `'task.${field}' must be a string`);
+          }
+        }
+        const priority = variantValue['priority'];
+        if (typeof priority === 'string' && !priority.includes('$') && !['low', 'medium', 'high'].includes(priority)) {
+          push(`${path}.task.priority`, "'task.priority' must be low | medium | high (urgent needs acceptance checks)");
+        }
+        const ext = variantValue['external'];
+        if (!isObject(ext)) {
+          push(`${path}.task.external`, "'task.external' is required — { provider, ref } of where the task came from");
+        } else {
+          for (const field of ['provider', 'ref'] as const) {
+            if (typeof ext[field] !== 'string' || !ext[field].trim()) {
+              push(`${path}.task.external.${field}`, `'task.external.${field}' is required and must be a non-empty string`);
+            }
+          }
+          const provider = ext['provider'];
+          if (typeof provider === 'string' && !provider.includes('$') && !['asana', 'linear', 'telegram', 'github', 'other'].includes(provider)) {
+            push(`${path}.task.external.provider`, "'task.external.provider' must be asana | linear | telegram | github | other");
+          }
+          for (const field of ['url', 'project', 'team', 'assignee'] as const) {
+            if (ext[field] !== undefined && typeof ext[field] !== 'string') {
+              push(`${path}.task.external.${field}`, `'task.external.${field}' must be a string`);
+            }
+          }
+        }
+      }
     } else if (variant === 'set') {
       // Node-catalog N3.1 (2026-05-11) — Set / Variable Assigner.
       if (!isObject(variantValue)) {
@@ -501,8 +539,22 @@ export function validateWorkflow(raw: unknown): ValidationResult {
             if (typeof wtAuth['username'] !== 'string' || typeof wtAuth['password'] !== 'string') {
               push(`${path}.webhookTrigger.auth`, "'webhookTrigger.auth' (basic) requires 'username' + 'password' strings");
             }
+          } else if (wtAuth['type'] === 'hmac') {
+            if (typeof wtAuth['header'] !== 'string' || !wtAuth['header'].trim()
+              || typeof wtAuth['secretRef'] !== 'string' || !wtAuth['secretRef'].trim()) {
+              push(`${path}.webhookTrigger.auth`, "'webhookTrigger.auth' (hmac) requires 'header' + 'secretRef' strings");
+            }
+            if (wtAuth['algorithm'] !== undefined && wtAuth['algorithm'] !== 'sha256' && wtAuth['algorithm'] !== 'sha1') {
+              push(`${path}.webhookTrigger.auth.algorithm`, "'webhookTrigger.auth.algorithm' must be 'sha256' or 'sha1'");
+            }
+            if (wtAuth['encoding'] !== undefined && wtAuth['encoding'] !== 'hex' && wtAuth['encoding'] !== 'base64') {
+              push(`${path}.webhookTrigger.auth.encoding`, "'webhookTrigger.auth.encoding' must be 'hex' or 'base64'");
+            }
+            if (wtAuth['prefix'] !== undefined && typeof wtAuth['prefix'] !== 'string') {
+              push(`${path}.webhookTrigger.auth.prefix`, "'webhookTrigger.auth.prefix' must be a string");
+            }
           } else {
-            push(`${path}.webhookTrigger.auth.type`, "'webhookTrigger.auth.type' must be 'bearer' or 'basic'");
+            push(`${path}.webhookTrigger.auth.type`, "'webhookTrigger.auth.type' must be 'bearer', 'basic' or 'hmac'");
           }
         }
       }
@@ -935,6 +987,9 @@ export const isTemplateNode = (n: DagNode): n is TemplateNode =>
 export const isHttpRequestNode = (n: DagNode): n is HttpRequestNode =>
   typeof (n as HttpRequestNode).http === 'object' && (n as HttpRequestNode).http !== null
   && typeof ((n as HttpRequestNode).http as { url?: unknown }).url === 'string';
+export const isTaskNode = (n: DagNode): n is TaskNode =>
+  typeof (n as TaskNode).task === 'object' && (n as TaskNode).task !== null
+  && typeof ((n as TaskNode).task as { external?: unknown }).external === 'object';
 export const isShowroomNode = (n: DagNode): n is ShowroomNode =>
   typeof (n as ShowroomNode).showroom === 'object' && (n as ShowroomNode).showroom !== null
   && Array.isArray(((n as ShowroomNode).showroom as { lanes?: unknown }).lanes)

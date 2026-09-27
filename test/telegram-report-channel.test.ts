@@ -12,6 +12,7 @@ import { join } from 'node:path';
 import { buildUserConfig, saveUserConfig, type UserConfig } from '../src/user-config.js';
 import { resolveReportTarget, sendTelegramReport, sendReportPhoto, sendReportPhotoBuffer } from '../src/telegram-report.js';
 import { findSessionByTelegramChat, loadSession } from '../src/session/index.js';
+import { buildDashboardSlashRegistry, type DashboardSlashContext } from '../src/dashboard/slash-runtime/index.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'tg-report-')); });
@@ -187,22 +188,49 @@ describe('sendTelegramReport', () => {
   });
 });
 
-// Wire guard — the sender is dead unless a surface invokes it. Per
-// feedback_dep_inject_seam_must_be_wired + feedback_source_level_grep_
-// test_value: assert the `/telegram report` slash handler actually calls
-// sendTelegramReport. Behavioral tests above can't catch a dropped wire.
+// The report slash must reach the injected sender only for a configured target.
 describe('/telegram report wire', () => {
-  const src = readFileSync(
-    join(import.meta.dir, '..', 'src/dashboard/slash-runtime/dashboard-handlers.ts'),
-    'utf-8',
-  );
-  test('report subcommand imports + calls sendTelegramReport', () => {
-    expect(src).toMatch(/tgSub === 'report'/);
-    expect(src).toMatch(/import\(\s*['"][^'"]*telegram-report(\.js)?['"]\s*\)/);
-    expect(src).toContain('sendTelegramReport(cfg,');
+  function context(lines: string[], telegramReport: NonNullable<DashboardSlashContext['telegramReport']>): DashboardSlashContext {
+    const identity = (line: string) => line;
+    return {
+      chatLines: lines,
+      telegramReport,
+      warning: identity,
+      success: identity,
+      error: identity,
+      setChatScrollOffset: () => {},
+    } as unknown as DashboardSlashContext;
+  }
+
+  test('report subcommand dispatches the exact message once to the report sender', async () => {
+    const lines: string[] = [];
+    const cfg = cfgWith({ botToken: 'MAIN:tok', reportChannel: { chatId: 42, botToken: 'REPORT:tok' } });
+    const sends: Array<{ cfg: UserConfig; text: string }> = [];
+    const registry = buildDashboardSlashRegistry();
+    const report = {
+      getConfig: () => cfg,
+      send: async (sentCfg: UserConfig, text: string) => { sends.push({ cfg: sentCfg, text }); return true; },
+    };
+    expect(registry.names()).toContain('telegram');
+    expect(await registry.dispatch('telegram', ['report', 'daily', 'digest'], context(lines, report)))
+      .toEqual({ kind: 'continue' });
+    expect(sends).toHaveLength(1);
+    expect(sends).toEqual([{ cfg, text: 'daily digest' }]);
+    expect(lines).toContain('  ✓ report sent to chat 42');
   });
-  test('report subcommand gates on resolveReportTarget', () => {
-    expect(src).toContain('resolveReportTarget(cfg)');
+
+  test('report subcommand gates on a configured target', async () => {
+    const lines: string[] = [];
+    const sends: string[] = [];
+    const registry = buildDashboardSlashRegistry();
+    const report = {
+      getConfig: () => cfgWith({ botToken: 'MAIN:tok' }),
+      send: async (_cfg: UserConfig, text: string) => { sends.push(text); return true; },
+    };
+    expect(await registry.dispatch('telegram', ['report', 'daily digest'], context(lines, report)))
+      .toEqual({ kind: 'continue' });
+    expect(sends).toEqual([]);
+    expect(lines).toContain('  No report channel — set telegram.reportChannel.chatId (+ optional botToken) in config.');
   });
 });
 

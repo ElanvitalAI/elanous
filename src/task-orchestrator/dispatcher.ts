@@ -17,7 +17,7 @@
  *   - `store?` / `bus?` / `graph?` are injected → fully unit-testable.
  */
 import type { TaskSurfaceKind } from './types.js';
-import { newExecutionId, type Task, type TaskExecution } from './types.js';
+import { createExecution, newExecutionId, type Task, type TaskExecution } from './types.js';
 import type { TaskGraph } from './graph.js';
 import type { TaskEventBus } from './events.js';
 import type { TaskStore } from './store.js';
@@ -95,7 +95,7 @@ export interface DispatchTickResult {
   }>;
   /** Ready tasks we skipped this tick due to caps. Caller may `tick()`
    *  again after any adapter completes. */
-  deferred: Array<{ taskId: string; reason: 'cap' | 'no-adapter' }>;
+  deferred: Array<{ taskId: string; reason: 'cap' | 'no-adapter' | 'intake-sequential' }>;
 }
 
 export class TaskDispatcher {
@@ -115,14 +115,30 @@ export class TaskDispatcher {
    * dispatches tasks currently in `ready` status.
    */
   tick(): DispatchTickResult {
+    return this.dispatch(this.opts.graph.readySet());
+  }
+
+  /** Dispatch exactly one admitted task, without walking the rest of the ready queue. */
+  tickTask(taskId: string): DispatchTickResult {
+    const task = this.opts.graph.getTask(taskId);
+    return this.dispatch(task?.status === 'ready' ? [task] : []);
+  }
+
+  private dispatch(tasks: Task[]): DispatchTickResult {
     const dispatched: DispatchTickResult['dispatched'] = [];
     const deferred: DispatchTickResult['deferred'] = [];
 
-    for (const task of this.opts.graph.readySet()) {
+    for (const task of tasks) {
+      if (task.generatedBy?.kind === 'external' && task.approval?.state !== 'approved' && task.approval?.state !== 'auto') continue;
       const kind = task.surface.kind;
       const adapter = this.opts.registry.resolve(kind);
       if (!adapter) {
         deferred.push({ taskId: task.id, reason: 'no-adapter' });
+        continue;
+      }
+      const deferReason = adapter.deferReason?.(task);
+      if (deferReason) {
+        deferred.push({ taskId: task.id, reason: deferReason });
         continue;
       }
       const active = this.activeByKind.get(kind) ?? 0;
@@ -230,6 +246,7 @@ export class TaskDispatcher {
       status: 'running',
       lastExecutionId: executionId,
     }, { now: this.now() });
+    this.opts.store?.saveTask(this.opts.graph.getTask(task.id)!);
     this.recordOps(task, 'cycle_start', 'running', { executionId });
 
     this.opts.bus?.emit({
@@ -259,9 +276,13 @@ export class TaskDispatcher {
 
   private async monitor(task: Task, res: DispatchResult): Promise<void> {
     const kind = task.surface.kind;
+    let savedExecution = false;
     try {
-      const exec = await res.promise;
+      const exec = { ...await res.promise, id: res.executionId };
+      // Keep the task row and execution in the same store read by GET /v1/tasks/:id.
+      this.opts.store?.saveTask(this.opts.graph.getTask(task.id)!);
       this.opts.store?.saveExecution(exec);
+      savedExecution = true;
 
       // ── Acceptance gate (TOX-6 FU) ────────────────────────────
       // Only applies when the adapter finished cleanly AND the task
@@ -320,8 +341,20 @@ export class TaskDispatcher {
         }
       }
     } catch (err) {
-      // Adapter threw / rejected with a non-TaskExecution error.
-      // Mark the graph task as failed + emit event.
+      // An adapter rejection still represents one completed attempt.
+      if (!savedExecution) {
+        const startedAt = this.opts.graph.getTask(task.id)?.updatedAt ?? this.now();
+        const endedAt = this.now();
+        const message = err instanceof Error ? err.message : String(err);
+        try {
+          this.opts.store?.saveTask(this.opts.graph.getTask(task.id)!);
+          this.opts.store?.saveExecution({
+            ...createExecution(task, { id: res.executionId, now: startedAt }),
+            status: 'failed', endedAt, durationMs: endedAt - startedAt,
+            error: { code: 'ADAPTER_ERROR', message },
+          });
+        } catch { /* keep the original adapter error visible on the bus */ }
+      }
       try {
         this.opts.graph.updateTask(task.id, { status: 'failed' }, { now: this.now() });
         this.opts.store?.saveTask(this.opts.graph.getTask(task.id)!);

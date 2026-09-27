@@ -183,7 +183,7 @@ describe('명령 잡 자식 요청(requests) (2026-09-27)', () => {
     const m = manifest() as { spec: { template: { spec: { containers: Array<{ resources: { requests?: Record<string, string>; limits: Record<string, string> } }> } } } };
     const r = m.spec.template.spec.containers[0]!.resources;
     expect(r.requests).toEqual({ cpu: '1', memory: '4Gi' });
-    expect(r.limits).toEqual({ memory: '12Gi', cpu: '4' });
+    expect(r.limits).toEqual({ memory: '16Gi', cpu: '4' });
   });
 });
 

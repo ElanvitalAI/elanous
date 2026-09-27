@@ -1,0 +1,15 @@
+Usage: elanous tier [options] [command]
+
+LLM tier→모델 SSOT 조회 — provider별 budget/balanced/better/best/loaded
+사다리(llm-tier-map). "grok low" 같은 별칭 흡수.
+
+Options:
+  -h, --help                           display help for command
+
+Commands:
+  resolve [options] <provider> [tier]  provider(+tier) → 모델 해석. tier 생략 시 5단 전부.
+                                       별칭 low/mid/high/max 허용.
+  list|ls [options] [provider]         전체 매트릭스(provider × 5 tier) 또는 한 provider.
+                                       tier 헷갈림 방지용 한눈 표.
+  providers                            tier ladder 가 정의된 provider 목록.
+  help [command]                       display help for command

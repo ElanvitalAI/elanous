@@ -130,6 +130,34 @@ describe('scripts/install.ps1', () => {
     expect(source).toContain('[IO.File]::ReadAllText($Path)');
   });
 
+  test('marks the Windows shim and checks ownership before writing the short command', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain('rem elanous-wrapper');
+    expect(source).toContain("Join-Path $binDirectory 'eln.cmd'");
+    expect(source).toContain('Get-Command eln -ErrorAction SilentlyContinue');
+    expect(source).toContain('Set-Content -LiteralPath $elnShim -Value $shimContent');
+  });
+
+  windowsExecutionTest('Windows execution: eln.cmd calls the same entrypoint and leaves an existing foreign shim untouched', () => {
+    const home = fixture();
+    const prefix = join(home, 'prefix');
+    const first = run(['-NoModifyPath'], { home, prefix });
+    expect(first.result.status, first.result.stderr).toBe(0);
+    const bin = join(prefix, 'bin');
+    const eln = join(bin, 'eln.cmd');
+    const elanous = join(bin, 'elanous.cmd');
+    expect(readFileSync(eln, 'utf8')).toBe(readFileSync(elanous, 'utf8'));
+    const short = spawnSync(eln, ['--version'], { shell: true, encoding: 'utf8' });
+    const full = spawnSync(elanous, ['--version'], { shell: true, encoding: 'utf8' });
+    expect(short.status, short.stderr).toBe(0);
+    expect(short.stdout).toBe(full.stdout);
+    writeFileSync(eln, '@echo off\r\necho other\r\n');
+    const again = run(['-NoModifyPath'], { home, prefix });
+    expect(again.result.status, again.result.stderr).toBe(0);
+    expect(again.result.stdout).toContain('WARNING eln:');
+    expect(readFileSync(eln, 'utf8')).toBe('@echo off\r\necho other\r\n');
+  }, 120_000);
+
   executionTest('PowerShell execution (skipped when pwsh or powershell is unavailable): --Help exits successfully and names every supported argument', () => {
     const { result } = run(['--Help']);
     expect(result.status, result.stderr).toBe(0);

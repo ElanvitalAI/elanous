@@ -32,6 +32,7 @@ import {
   isPromptNode,
   isSetNode,
   isShowroomNode,
+  isTaskNode,
   isSkillNode,
   isSwitchNode,
   isTemplateNode,
@@ -54,6 +55,7 @@ import { executeIterationNode } from './nodes/iteration.js';
 import { executeClassifyNode } from './nodes/classify.js';
 import { executeExtractNode } from './nodes/extract.js';
 import { executeSetNode } from './nodes/set.js';
+import { executeTaskNode } from './nodes/task.js';
 import { executeFilterNode } from './nodes/filter.js';
 import { executeTemplateNode } from './nodes/template.js';
 import { executeHttpRequestNode } from './nodes/http.js';
@@ -475,6 +477,7 @@ async function dispatchNode(
   if (isTemplateNode(node)) return executeTemplateNode(node, ctx, deps);
   if (isHttpRequestNode(node)) return executeHttpRequestNode(node, ctx, deps);
   if (isShowroomNode(node)) return executeShowroomNode(node, ctx, deps);
+  if (isTaskNode(node)) return executeTaskNode(node, ctx, deps);
   if (isScheduleTriggerNode(node)) return executeScheduleTriggerNode(node, ctx, deps);
   if (isWebhookTriggerNode(node)) return executeWebhookTriggerNode(node, ctx, deps);
   if (isDiscordTriggerNode(node)) return executeDiscordTriggerNode(node, ctx, deps);
@@ -525,6 +528,7 @@ function variantOf(node: DagNode): string {
   if (isTemplateNode(node)) return 'template';
   if (isHttpRequestNode(node)) return 'http';
   if (isShowroomNode(node)) return 'showroom';
+  if (isTaskNode(node)) return 'task';
   if (isScheduleTriggerNode(node)) return 'scheduleTrigger';
   if (isWebhookTriggerNode(node)) return 'webhookTrigger';
   if (isDiscordTriggerNode(node)) return 'discordTrigger';

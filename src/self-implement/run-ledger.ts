@@ -11,6 +11,7 @@ import { loadSelfDevRun, selfDevRunsDir } from '../self-dev/run-store.js';
 import { extractHarnessReviewAcceptance } from '../harness/harness-seams.js';
 import { resolveGoalDocumentsDir } from './goal-documents-dir.js';
 import { debug } from '../debug/log.js';
+import { withRunLedgerLock, restoreArchivedRunLedger } from './run-ledger-compact.js';
 
 export interface RunLedgerEntry {
   timestamp?: string;
@@ -402,7 +403,11 @@ export function describeFederatedMissingRunLedger(runId: string, options: Federa
 /** Append one observer event. Callers own fail-soft handling. */
 export function appendRunLedgerEntry(entry: RunLedgerEntry, dir = runLedgerDir()): void {
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-  appendFileSync(runLedgerPath(entry.runId, dir), `${JSON.stringify(entry)}\n`, 'utf8');
+  const live = runLedgerPath(entry.runId, dir);
+  withRunLedgerLock(dir, entry.runId, () => {
+    const line = `${JSON.stringify(entry)}\n`;
+    if (!restoreArchivedRunLedger(dir, entry.runId, line)) appendFileSync(live, line, 'utf8');
+  });
 }
 
 export interface HumanStopRunLedgerOptions {
@@ -1209,6 +1214,8 @@ export interface UnfinishedRunLedgerQuery {
   ledgerDirectoryMissing: boolean;
   /** Ledgers the last-line rule would miss and the trailing-bookkeeping rule counts as terminal. */
   terminalByTrailingRunStatus?: number;
+  cacheHits?: number;
+  cacheMisses?: number;
   pathFilter?: string;
   matchingPathCount?: number;
   unknownPathCount?: number;
@@ -1222,6 +1229,7 @@ export interface UnfinishedRunLedgerQueryOptions {
   path?: string;
   read?: RunLedgerReader;
   list?: (path: string) => string[];
+  noCache?: boolean;
   /** ⛔ 「도는 중」으로 볼 마지막 활동 나이(ms). 호출자가 준다 — 이 모듈이 새 수를 정하지 않는다. */
   liveWindowMs?: number;
 }
@@ -1303,7 +1311,7 @@ function lastLineIsValidRunStatus(ledger: readonly RunLedgerEntry[]): boolean {
  * or when a `terminal` / `human-stop` event is present anywhere.
  * A later event outside the bookkeeping list keeps the run unfinished.
  */
-function hasTerminalRunStatus(ledger: readonly RunLedgerEntry[]): boolean {
+export function hasTerminalRunStatus(ledger: readonly RunLedgerEntry[]): boolean {
   const statusIndex = lastValidRunStatusIndex(ledger);
   const trailingOnly = statusIndex >= 0
     && ledger.slice(statusIndex + 1).every((entry) => TRAILING_BOOKKEEPING_EVENT_SET.has(entry.event));
@@ -1536,12 +1544,82 @@ function unknownDeclaredPaths(): Pick<UnfinishedRunLedgerEntry, 'declaredPaths' 
   return { declaredPaths: [], declaredPathStatus: 'unknown' };
 }
 
-function lastActivity(ledger: readonly RunLedgerEntry[]): Pick<UnfinishedRunLedgerEntry, 'lastActivityTimestamp' | 'lastActivityAgeMs' | 'lastActivityStatus'> {
-  const timestamp = ledger.at(-1)?.timestamp;
-  if (timestamp === undefined) return { lastActivityTimestamp: null, lastActivityAgeMs: null, lastActivityStatus: 'timestamp-missing' };
-  const time = Date.parse(timestamp);
-  if (!Number.isFinite(time)) return { lastActivityTimestamp: null, lastActivityAgeMs: null, lastActivityStatus: 'timestamp-invalid' };
-  return { lastActivityTimestamp: timestamp, lastActivityAgeMs: Date.now() - time, lastActivityStatus: 'available' };
+interface UnfinishedLedgerFacts {
+  terminal: boolean;
+  terminalByTrailingRunStatus: boolean;
+  branch: string | null;
+  lastActivityTimestamp: string | null;
+  lastActivityStatus: LastActivityStatus;
+  targetRoot: string | null;
+  goalFile: string | null;
+  fixedLifecycle: UnfinishedRunLifecycle;
+}
+
+const UNFINISHED_LEDGER_CACHE_LIMIT = 5_000;
+const unfinishedLedgerCache = new Map<string, { size: number; mtimeMs: number; facts: UnfinishedLedgerFacts }>();
+const unfinishedReaderIds = new WeakMap<RunLedgerReader, number>();
+let nextUnfinishedReaderId = 1;
+
+function unfinishedLedgerCacheKey(path: string, read?: RunLedgerReader): string {
+  if (!read) return `${path}\u0000default`;
+  let id = unfinishedReaderIds.get(read);
+  if (id === undefined) {
+    id = nextUnfinishedReaderId++;
+    unfinishedReaderIds.set(read, id);
+  }
+  return `${path}\u0000reader:${id}`;
+}
+
+function unfinishedLedgerFacts(ledger: readonly RunLedgerEntry[]): UnfinishedLedgerFacts {
+  const last = ledger.at(-1)?.timestamp;
+  const lastActivityTimestamp = last !== undefined && Number.isFinite(Date.parse(last)) ? last : null;
+  return {
+    terminal: hasTerminalRunStatus(ledger),
+    terminalByTrailingRunStatus: isTerminalOnlyByTrailingRunStatus(ledger),
+    branch: branchFromLedger(ledger),
+    lastActivityTimestamp,
+    lastActivityStatus: last === undefined ? 'timestamp-missing' : lastActivityTimestamp === null ? 'timestamp-invalid' : 'available',
+    targetRoot: ledgerTargetRoot(ledger),
+    goalFile: ledgerGoalDocument(ledger),
+    fixedLifecycle: classifyUnfinishedLifecycle(ledger, null, 0),
+  };
+}
+
+function readUnfinishedLedgerFacts(runId: string, dir: string, read?: RunLedgerReader, noCache?: boolean): { facts: UnfinishedLedgerFacts; hit: boolean } {
+  const path = runLedgerPath(runId, dir);
+  const key = noCache ? null : unfinishedLedgerCacheKey(path, read);
+  const stamp = noCache ? null : statSync(path);
+  const cached = key === null ? undefined : unfinishedLedgerCache.get(key);
+  if (cached && stamp && key !== null && cached.size === stamp.size && cached.mtimeMs === stamp.mtimeMs) {
+    unfinishedLedgerCache.delete(key);
+    unfinishedLedgerCache.set(key, cached);
+    return { facts: cached.facts, hit: true };
+  }
+  if (key !== null) unfinishedLedgerCache.delete(key);
+  try {
+    const ledger = loadRunLedger(runId, dir, read);
+    if (ledger === null && stamp !== null) throw new Error(`run ledger disappeared after stat: ${path}`);
+    const facts = unfinishedLedgerFacts(ledger ?? []);
+    if (stamp !== null && key !== null) {
+      const after = statSync(path);
+      if (after.size === stamp.size && after.mtimeMs === stamp.mtimeMs) {
+        unfinishedLedgerCache.set(key, { size: stamp.size, mtimeMs: stamp.mtimeMs, facts });
+        if (unfinishedLedgerCache.size > UNFINISHED_LEDGER_CACHE_LIMIT) unfinishedLedgerCache.delete(unfinishedLedgerCache.keys().next().value!);
+      }
+    }
+    return { facts, hit: false };
+  } catch (error) {
+    if (key !== null) unfinishedLedgerCache.delete(key);
+    throw error;
+  }
+}
+
+function unfinishedActivity(facts: UnfinishedLedgerFacts): Pick<UnfinishedRunLedgerEntry, 'lastActivityTimestamp' | 'lastActivityAgeMs' | 'lastActivityStatus'> {
+  return {
+    lastActivityTimestamp: facts.lastActivityTimestamp,
+    lastActivityStatus: facts.lastActivityStatus,
+    lastActivityAgeMs: facts.lastActivityTimestamp === null ? null : Date.now() - Date.parse(facts.lastActivityTimestamp),
+  };
 }
 
 /** Read non-terminal ledgers and their declared planned paths without changing any run, ledger, or goal document. */
@@ -1563,6 +1641,8 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
         unreadableLedgerCount: 0,
         ledgerDirectoryMissing: true,
         terminalByTrailingRunStatus: 0,
+        cacheHits: 0,
+        cacheMisses: 0,
         ...(options.path === undefined ? {} : { pathFilter: options.path, matchingPathCount: 0, unknownPathCount: 0 }),
         scope: 'self-implement-run-ledger',
         note: UNFINISHED_RUN_LEDGER_NOTE,
@@ -1573,6 +1653,8 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
         terminal: 0,
         unfinished: 0,
         terminalByTrailingRunStatus: 0,
+        cacheHits: 0,
+        cacheMisses: 0,
         ms: Date.now() - startedAt,
       });
       return missing;
@@ -1585,34 +1667,43 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
   let scanned = 0;
   let terminal = 0;
   let terminalByTrailingRunStatus = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
   let ledgerTargetCount = 0;
   let callerCwdCount = 0;
   for (const fileName of fileNames) {
     const runId = runIdFromCanonicalLedgerFile(fileName);
     if (!runId) continue;
     scanned += 1;
-    let ledger: RunLedgerEntry[];
+    let facts: UnfinishedLedgerFacts;
     try {
-      ledger = loadRunLedger(runId, dir, options.read) ?? [];
+      const observed = readUnfinishedLedgerFacts(runId, dir, options.read, options.noCache);
+      facts = observed.facts;
+      if (observed.hit) cacheHits += 1;
+      else cacheMisses += 1;
     } catch {
+      cacheMisses += 1;
       unreadableLedgerCount += 1;
       entries.push({ runId, branch: null, status: 'ledger-unreadable', plannedPaths: [], plannedPathStatus: 'unknown', ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis: 'caller-cwd', goalDocumentSearchDirectory: null, lastActivityTimestamp: null, lastActivityAgeMs: null, lastActivityStatus: 'ledger-unreadable', lifecycle: 'unjudgeable' });
       callerCwdCount += 1;
       continue;
     }
-    if (hasTerminalRunStatus(ledger)) {
+    if (facts.terminal) {
       terminal += 1;
-      if (isTerminalOnlyByTrailingRunStatus(ledger)) terminalByTrailingRunStatus += 1;
+      if (facts.terminalByTrailingRunStatus) terminalByTrailingRunStatus += 1;
       continue;
     }
 
-    const branch = branchFromLedger(ledger);
-    const activity = lastActivity(ledger);
-    const targetRoot = ledgerTargetRoot(ledger);
+    const branch = facts.branch;
+    const activity = unfinishedActivity(facts);
+    const lifecycle = facts.fixedLifecycle === 'unjudgeable' && activity.lastActivityAgeMs !== null
+      ? activity.lastActivityAgeMs <= liveWindowMs ? 'live' : 'orphaned'
+      : facts.fixedLifecycle;
+    const targetRoot = facts.targetRoot;
     const goalLookupBasis = targetRoot === null ? 'caller-cwd' : 'ledger-target';
     if (targetRoot === null) callerCwdCount += 1;
     else ledgerTargetCount += 1;
-    const ledgerGoalFile = ledgerGoalDocument(ledger);
+    const ledgerGoalFile = facts.goalFile;
     const searchDirectory = ledgerGoalFile ? null : targetRoot === null ? goalsDir : resolveGoalDocumentsDir(targetRoot).directory;
     const goalDocument = ledgerGoalFile
       ? { status: 'found' as const, path: targetRoot !== null && !isAbsolute(ledgerGoalFile) ? resolve(targetRoot, ledgerGoalFile) : ledgerGoalFile, source: 'ledger' as const }
@@ -1628,7 +1719,7 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
           : goalDocument.status === 'directory-unreadable'
             ? 'goal-directory-unreadable'
             : 'goal-document-not-found';
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus, ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle: classifyUnfinishedLifecycle(ledger, activity.lastActivityAgeMs, liveWindowMs) });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus, ...unknownDeclaredPaths(), pathMatchReasons: {}, goalDocumentPath: null, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle });
       continue;
     }
     try {
@@ -1636,9 +1727,9 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
       const text = typeof document === 'string' ? document : document.toString('utf8');
       const paths = [...new Set(tracedPathReferences(text).map((reference) => reference.path))];
       const declared = declaredPathsFromGoalDocument(text);
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: paths, plannedPathStatus: paths.length > 0 ? goalDocument.source === 'ledger' ? 'found-ledger-goal-file' : 'found-branch-fallback' : 'no-traced-paths', ...declared, pathMatchReasons: pathMatchReasons(declared.declaredPaths, paths), goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle: classifyUnfinishedLifecycle(ledger, activity.lastActivityAgeMs, liveWindowMs) });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: paths, plannedPathStatus: paths.length > 0 ? goalDocument.source === 'ledger' ? 'found-ledger-goal-file' : 'found-branch-fallback' : 'no-traced-paths', ...declared, pathMatchReasons: pathMatchReasons(declared.declaredPaths, paths), goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle });
     } catch {
-      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus: 'goal-document-unreadable', declaredPaths: [], declaredPathStatus: 'goal-document-unreadable', pathMatchReasons: {}, goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle: classifyUnfinishedLifecycle(ledger, activity.lastActivityAgeMs, liveWindowMs) });
+      entries.push({ runId, branch, status: 'terminal-status-missing', plannedPaths: [], plannedPathStatus: 'goal-document-unreadable', declaredPaths: [], declaredPathStatus: 'goal-document-unreadable', pathMatchReasons: {}, goalDocumentPath: goalDocument.path, goalLookupBasis, goalDocumentSearchDirectory: searchDirectory, ...activity, lifecycle });
     }
   }
   entries.sort((left, right) => left.runId.localeCompare(right.runId));
@@ -1648,10 +1739,12 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     terminal,
     unfinished: entries.length,
     terminalByTrailingRunStatus,
+    cacheHits,
+    cacheMisses,
     ms: Date.now() - startedAt,
   });
   if (options.path === undefined) {
-    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
+    return { entries, ledgerDirectory: dir, goalsDirectory: goalsDir, unreadableLedgerCount, ledgerDirectoryMissing: false, terminalByTrailingRunStatus, cacheHits, cacheMisses, scope: 'self-implement-run-ledger', note: UNFINISHED_RUN_LEDGER_NOTE };
   }
   const pathFilter = options.path;
   const unknownPathStatus = (entry: UnfinishedRunLedgerEntry): boolean => entry.plannedPathStatus !== 'found-ledger-goal-file'
@@ -1669,6 +1762,8 @@ export function queryUnfinishedRunLedgers(options: UnfinishedRunLedgerQueryOptio
     unreadableLedgerCount,
     ledgerDirectoryMissing: false,
     terminalByTrailingRunStatus,
+    cacheHits,
+    cacheMisses,
     pathFilter,
     matchingPathCount: matchingEntries.length,
     unknownPathCount: unknownEntries.length,
@@ -1704,6 +1799,8 @@ export interface FederatedUnfinishedRunLedgerQuery {
   /** ⭐ 가로 대조로 «미완에서 빠진» 런 수 — 다른 원장에 종결이 있어 제외된 것.
    *  ⛔ 「0 건」과 「대조를 안 했다」를 같은 값으로 두지 않으려고 «항상» 싣는다. */
   reconciledTerminatedElsewhereCount: number;
+  cacheHits?: number;
+  cacheMisses?: number;
   pathFilter?: string;
   matchingPathCount?: number;
   unknownPathCount?: number;
@@ -1719,6 +1816,7 @@ export interface FederatedUnfinishedRunLedgerQueryOptions {
   /** Pre-collected directories let callers separately observe target collection from ledger reads. */
   ledgerDirectories?: readonly string[];
   list?: (path: string) => string[];
+  noCache?: boolean;
   /**
    * When given, read only these run ledgers. Omitted means today's full scan of every
    * canonical *.jsonl plus the cross-directory unfinished-runId reconciliation.
@@ -1740,6 +1838,8 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
   let indeterminateLedgerDirectoryCount = 0;
   let matchingPathCount = 0;
   let unknownPathCount = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
   const recordDirectoryFailure = (kind: FederatedLedgerDirectoryFailureKind): void => {
     if (kind === 'missing') missingLedgerDirectoryCount += 1;
     else if (kind === 'unreadable') unreadableLedgerDirectoryAccessCount += 1;
@@ -1754,7 +1854,7 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
           const runId = runIdFromCanonicalLedgerFile(fileName);
           return runId !== null && requestedRunIds.has(runId);
         });
-      const result = queryUnfinishedRunLedgers({ dir: ledgerDirectory, goalsDir: goalsDirectory, ...(options.path === undefined ? {} : { path: options.path }), ...(list === undefined ? {} : { list }) });
+      const result = queryUnfinishedRunLedgers({ dir: ledgerDirectory, goalsDir: goalsDirectory, ...(options.path === undefined ? {} : { path: options.path }), ...(list === undefined ? {} : { list }), noCache: options.noCache });
       if (result.ledgerDirectoryMissing) {
         recordDirectoryFailure('missing');
         continue;
@@ -1763,6 +1863,8 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
       unreadableLedgerCount += result.unreadableLedgerCount;
       matchingPathCount += result.matchingPathCount ?? 0;
       unknownPathCount += result.unknownPathCount ?? 0;
+      cacheHits += result.cacheHits ?? 0;
+      cacheMisses += result.cacheMisses ?? 0;
       entries.push(...result.entries.map((entry) => ({ ...entry, ledgerDirectory })));
     } catch (error) {
       recordDirectoryFailure(classifyFederatedLedgerDirectoryReadFailure(error));
@@ -1779,9 +1881,9 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
   const unfinishedRunIds = requestedRunIds === undefined ? new Set(entries.map((entry) => entry.runId)) : new Set([...requestedRunIds].filter((runId) => entries.some((entry) => entry.runId === runId)));
   for (const runId of unfinishedRunIds) {
     for (const ledgerDirectory of ledgerDirectories) {
-      let ledger: RunLedgerEntry[] | null = null;
-      try { ledger = loadRunLedger(runId, ledgerDirectory); } catch { ledger = null; }
-      if (ledger && hasTerminalRunStatus(ledger)) { terminatedElsewhere.add(runId); break; }
+      try {
+        if (readUnfinishedLedgerFacts(runId, ledgerDirectory, undefined, options.noCache).facts.terminal) { terminatedElsewhere.add(runId); break; }
+      } catch { /* An absent or unreadable sibling cannot establish termination. */ }
     }
   }
   const reconciledEntries = entries.filter((entry) => !terminatedElsewhere.has(entry.runId));
@@ -1799,6 +1901,8 @@ export function queryFederatedUnfinishedRunLedgers(options: FederatedUnfinishedR
     unreadableLedgerDirectoryAccessCount,
     indeterminateLedgerDirectoryCount,
     reconciledTerminatedElsewhereCount,
+    cacheHits,
+    cacheMisses,
     ...(options.path === undefined ? {} : { pathFilter: options.path, matchingPathCount, unknownPathCount }),
     scope: 'self-implement-run-ledger-federated',
     note: FEDERATED_UNFINISHED_RUN_LEDGER_NOTE,

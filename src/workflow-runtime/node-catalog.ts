@@ -17,7 +17,7 @@ export type NodeCategory =
   | 'branch'       // if · switch
   | 'iteration'    // iteration
   | 'transform'    // classify · extract · set · filter · template
-  | 'integration'  // http
+  | 'integration'  // http · task
   | 'trigger';     // scheduleTrigger · webhookTrigger · discordTrigger · telegramTrigger · manualTrigger · chatTrigger
 
 export interface NodeSpec {
@@ -234,6 +234,25 @@ export const NODE_CATALOG: readonly NodeSpec[] = [
     method: GET
     url: https://api.example.com/health
     timeout: 5000`,
+  },
+  {
+    kind: 'task',
+    category: 'integration',
+    summary: 'Create a TOX task with its external origin · waits for approval unless autoRun matches',
+    yamlKey: 'task',
+    required: ['title', 'external'],
+    optional: ['description', 'priority', 'eventId'],
+    example: `- id: file
+  depends_on: [hook]
+  task:
+    title: $hook.output.body.data.title
+    priority: high
+    eventId: $hook.output.body.webhookId
+    external:
+      provider: linear
+      ref: $hook.output.body.data.identifier
+      url: $hook.output.body.data.url`,
+    related: ['http'],
   },
 
   // ── trigger ─────────────────────────────────────────────────────

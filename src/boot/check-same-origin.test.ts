@@ -28,10 +28,10 @@ describe('isSameOriginRequest peer gate', () => {
     expect(sameOrigin({ host: 'example.test', referer: 'http://example.test/app/' })).toBe(true);
   });
 
-  test('allows loopback and tailnet peers but rejects unfamiliar and unknown peers', () => {
+  test('allows only loopback peers — tailnet 100.64/10 now needs a bearer (RFC pwa-auth A′)', () => {
     const headers = { 'sec-fetch-site': 'same-origin' };
     expect(sameOrigin(headers, '::1')).toBe(true);
-    expect(sameOrigin(headers, '100.96.1.10')).toBe(true);
+    expect(sameOrigin(headers, '100.96.1.10')).toBe(false);
     expect(sameOrigin(headers, '192.168.1.20')).toBe(false);
     expect(isSameOriginRequest(request(headers))).toBe(false);
   });
@@ -40,6 +40,23 @@ describe('isSameOriginRequest peer gate', () => {
     expect(sameOrigin({ 'sec-fetch-site': 'cross-site', origin: 'http://example.test', host: 'example.test' })).toBe(false);
     expect(sameOrigin({ origin: 'http://evil.example', host: 'example.test' })).toBe(false);
     expect(sameOrigin({ host: 'example.test' })).toBe(false);
+  });
+});
+
+describe('proxy markers void the header bypass (tailscale serve reaches us over loopback)', () => {
+  test('a forged Host: localhost with same-origin via tailscale serve is rejected', () => {
+    expect(sameOrigin({
+      'sec-fetch-site': 'same-origin', host: 'localhost',
+      'x-forwarded-for': '100.83.1.69', 'tailscale-user-login': 'someone@example.com',
+    })).toBe(false);
+  });
+  test('any one proxy marker is enough to reject', () => {
+    for (const marker of ['x-forwarded-for', 'forwarded', 'x-real-ip', 'x-forwarded-host', 'tailscale-user-name']) {
+      expect(sameOrigin({ 'sec-fetch-site': 'same-origin', [marker]: 'x' })).toBe(false);
+    }
+  });
+  test('the Mac browser path (loopback, no proxy marker) still passes', () => {
+    expect(sameOrigin({ 'sec-fetch-site': 'same-origin', host: 'localhost:31415' })).toBe(true);
   });
 });
 
@@ -66,11 +83,14 @@ describe('peer-gated meta API auth', () => {
     expect(snapshot().at(-1)).toMatchObject({ reason: 'bearer-mismatch' });
   });
 
-  test('allows a tailnet peer without a bearer', () => {
+  test('a tailnet peer needs a bearer (RFC pwa-auth A′) and passes with one', () => {
     const tailnet = request({ 'sec-fetch-site': 'same-origin' });
     registerAuthPeerAddress(tailnet, '100.100.20.2');
-    expect(checkAuth(tailnet, { bearerToken: 'secret' })).toBe(true);
-    expect(snapshot().at(-1)).toMatchObject({ ok: true, reason: 'same-origin', peerAddress: '100.100.20.2' });
+    expect(checkAuth(tailnet, { bearerToken: 'secret' })).toBe(false);
+    expect(snapshot().at(-1)).toMatchObject({ ok: false, peerAddress: '100.100.20.2' });
+    const withBearer = request({ 'sec-fetch-site': 'same-origin', authorization: 'Bearer secret' });
+    registerAuthPeerAddress(withBearer, '100.100.20.2');
+    expect(checkAuth(withBearer, { bearerToken: 'secret' })).toBe(true);
   });
 });
 

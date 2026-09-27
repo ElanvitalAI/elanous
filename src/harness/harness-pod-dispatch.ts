@@ -6,7 +6,7 @@
  *    ⛔ 두 벌로 짓지 않고 그 경로로 넘긴다. Pod 안에서는 골 문서가 있으면 `harness ask`, 아니면 `self implement` 가 돌고,
  *    매니페스트가 실은 런 계약(`ELANOUS_RUN_CONTRACT`)으로 자기가 Pod 인 줄 안다(graph-run-contract.ts).
  */
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { findGitDir } from '../git-fs/locate.js';
@@ -19,6 +19,8 @@ export interface HarnessPodDispatchInput {
   /** say 의 문장, 또는 ask 의 골 문서 경로. */
   readonly input: string;
   readonly podPool?: string;
+  /** Pod 메모리 등급(standard|high) — 오케스트레이터 환경 `ELANOUS_POD_MEMORY_TIER` 로 Job 까지 간다. */
+  readonly podMemory?: string;
   readonly autoMerge?: boolean;
   readonly base?: string;
   readonly json?: boolean;
@@ -47,10 +49,11 @@ export function podOrchestrateArgs(input: HarnessPodDispatchInput, goal: string)
   ];
 }
 
-export function dispatchHarnessOnPod(
-  input: HarnessPodDispatchInput,
-  deps: { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => number | null; readFile?: (path: string) => string; cwd?: string } = {},
-): number {
+type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => number | null; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn };
+
+export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDispatchDeps & { run: NonNullable<PodDispatchDeps['run']> }): number;
+export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps?: PodDispatchDeps): number | Promise<number>;
+export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDispatchDeps = {}): number | Promise<number> {
   const cwd = deps.cwd ?? process.cwd();
   if (input.source !== undefined) {
     try {
@@ -65,6 +68,7 @@ export function dispatchHarnessOnPod(
   const args = podOrchestrateArgs(input, goal);
   const env = { ...process.env };
   delete env.ELANOUS_POD_GOAL_DOC;
+  if (input.podMemory) env.ELANOUS_POD_MEMORY_TIER = input.podMemory;
   if (input.entrance === 'cli-harness-ask') {
     const root = findGitDir(cwd)?.root;
     const path = resolve(cwd, input.input);
@@ -76,11 +80,31 @@ export function dispatchHarnessOnPod(
     }
   }
   debug.log('harness.substrate', 'dispatch-pod', {
-    entrance: input.entrance, podPool: input.podPool ?? null, autoMerge: input.autoMerge !== false,
+    entrance: input.entrance, podPool: input.podPool ?? null, podMemory: input.podMemory ?? null, autoMerge: input.autoMerge !== false,
     goalChars: goal.length, ...(input.entrance === 'cli-harness-ask' ? { goalPath: input.input } : {}),
   });
-  const run = deps.run ?? ((cmd, a, childEnv) => spawnSync(cmd, [...a], { stdio: 'inherit', env: childEnv }).status);
+  const run = deps.run ?? ((cmd: string, a: readonly string[], childEnv: NodeJS.ProcessEnv) => new Promise<number>((resolveStatus) => {
+    const child = (deps.spawnChild ?? spawn)(cmd, [...a], { stdio: 'inherit', env: childEnv });
+    let forwarded: NodeJS.Signals | undefined;
+    const forward = (signal: NodeJS.Signals) => {
+      forwarded = signal;
+      if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    };
+    const onTerm = () => forward('SIGTERM');
+    const onInt = () => forward('SIGINT');
+    process.on('SIGTERM', onTerm);
+    process.on('SIGINT', onInt);
+    const cleanup = () => { process.off('SIGTERM', onTerm); process.off('SIGINT', onInt); };
+    child.once('error', () => { cleanup(); resolveStatus(1); });
+    child.once('close', (code, signal) => { cleanup(); resolveStatus(code ?? ((signal ?? forwarded) === 'SIGINT' ? 130 : 143)); });
+  }));
   const status = run(process.execPath, args, env);
-  debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status });
-  return status ?? 1;
+  if (typeof status === 'number' || status === null) {
+    debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status });
+    return status ?? 1;
+  }
+  return status.then((code) => {
+    debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status: code });
+    return code;
+  });
 }

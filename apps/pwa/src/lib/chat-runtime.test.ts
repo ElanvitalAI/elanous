@@ -1,10 +1,4 @@
-/**
- * NEXUS T3 endpoint contract test for runChatTurn — POST `/v1/prompt`.
- *
- * DOGFOOD-nexus-t3 §S1 의 PWA-side counterpart. fetch mock 으로
- * (sessionId / userText / provider) body shape 검증 + 응답 → ChatMessage
- * 매핑 + sessionId 변동 시 newSessionId 노출.
- */
+/** PWA chat runtime — local meta dispatch and ACP/SSE turn contracts. */
 
 import { afterEach, beforeEach, describe, expect, it, spyOn, test } from 'bun:test';
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,12 +12,13 @@ import { FEEDBACK_KINDS } from './feedback-envelope';
 import * as feedbackBlockAccumulator from './feedback-block-accumulator';
 import {
   dispatchMeta,
+  META_COMMANDS,
+  META_HANDLERS,
   isMetaCommand,
   newMetaMessage,
   newUserMessage,
   parseMcpAppPayload,
   runAcpForeignTurnObserver,
-  runChatTurn,
   runChatTurnAcp,
   type ChatBlock,
   type ChatMessage,
@@ -85,90 +80,11 @@ function makeCtx(sessionId = 'session-1', provider = 'anthropic'): ChatRuntimeCo
     sessionId,
     provider,
     setSessionId: () => {},
-    setProvider: () => {},
   };
 }
 
 beforeEach(() => { calls = []; });
 afterEach(() => { globalThis.fetch = realFetch; });
-
-describe('runChatTurn — POST /v1/prompt', () => {
-  it('serializes the request body with sessionId / userText / provider', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: { sessionId: 'session-1', text: 'hello back', stopReason: 'end_turn' },
-    });
-    const ctx = makeCtx('session-1', 'anthropic');
-    const result = await runChatTurn('hello', ctx);
-    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/prompt');
-    expect(calls[0]!.init?.method).toBe('POST');
-    const body = JSON.parse(String(calls[0]!.init?.body));
-    expect(body).toEqual({
-      sessionId: 'session-1',
-      userText: 'hello',
-      provider: 'anthropic',
-    });
-    expect(result.message.role).toBe('assistant');
-    expect(result.message.text).toBe('hello back');
-    expect(result.message.meta?.stopReason).toBe('end_turn');
-  });
-
-  it('forwards bearer token via authorization header', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: { sessionId: 'session-1', text: 'reply', stopReason: 'end_turn' },
-    });
-    await runChatTurn('hi', makeCtx());
-    const headers = (calls[0]!.init?.headers ?? {}) as Record<string, string>;
-    expect(headers.authorization).toBe('Bearer tok');
-  });
-
-  it('omits sessionId / provider from the body when ctx values are empty', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: { sessionId: 'session-fresh', text: 'fresh', stopReason: 'end_turn' },
-    });
-    const ctx = makeCtx('', '');
-    await runChatTurn('hi', ctx);
-    const body = JSON.parse(String(calls[0]!.init?.body));
-    // Empty strings collapse to undefined which JSON.stringify drops entirely.
-    expect(body).toEqual({ userText: 'hi' });
-  });
-
-  it('returns newSessionId when daemon mints a fresh id', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: { sessionId: 'session-NEW', text: 'minted', stopReason: 'end_turn' },
-    });
-    const result = await runChatTurn('hi', makeCtx('session-old'));
-    expect(result.newSessionId).toBe('session-NEW');
-  });
-
-  it('omits newSessionId when daemon returns the same id', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: { sessionId: 'session-1', text: 'same', stopReason: 'end_turn' },
-    });
-    const result = await runChatTurn('hi', makeCtx('session-1'));
-    expect(result.newSessionId).toBeUndefined();
-  });
-
-  it('throws with the daemon detail body on non-200 (e.g. 503 not-wired)', async () => {
-    globalThis.fetch = mockResponse({
-      status: 503,
-      body: { error: 'meta-api-runtime-not-wired' },
-    });
-    await expect(runChatTurn('hi', makeCtx())).rejects.toThrow(/503/);
-  });
-
-  it('handles 409 turn_preempted (control-signal interception · §S1 FAIL mode)', async () => {
-    globalThis.fetch = mockResponse({
-      status: 409,
-      body: { error: 'turn_preempted' },
-    });
-    await expect(runChatTurn('hi', makeCtx())).rejects.toThrow(/409/);
-  });
-});
 
 // ── Phase B-2 (PWA chat streaming · 2026-05-06) ────────────────────
 //
@@ -612,7 +528,6 @@ function makeAcpCtx(sessionId = 'sess-acp', provider = 'anthropic'): ChatRuntime
     sessionId,
     provider,
     setSessionId: () => {},
-    setProvider: () => {},
   };
 }
 
@@ -1115,19 +1030,34 @@ describe(':budget · :history · :help', () => {
     expect(result?.text).toContain(':history');
     expect(result?.text).toContain(':session');
     expect(result?.text).toContain(':fork');
-    expect(result?.text).toContain(':provider');
+    expect(result?.text).not.toContain(':provider');
     expect(result?.text).toContain(':clear');
+    expect(result?.text).toContain(':name or /name');
   });
 
-  it(':session · :provider · :clear keep their previous replies', async () => {
+  it(':session · :clear preserve local replies and :provider is unknown', async () => {
     const ctx = ctxWith();
     expect((await dispatchMeta(':session', ctx))?.text).toBe('session = session-1');
-    expect((await dispatchMeta(':provider', ctx))?.text).toBe('current provider = anthropic');
-    expect((await dispatchMeta(':provider grok', ctx))?.newProvider).toBe('grok');
+    expect((await dispatchMeta(':provider x', ctx))?.text).toBe('unknown meta command: :provider');
     expect((await dispatchMeta(':clear', ctx))?.text).toBe('__CLEAR__');
     const forked = await dispatchMeta(':fork', ctx);
     expect(forked?.newSessionId).toBeTruthy();
     expect(forked?.text).toContain('forked → new session');
+  });
+
+  it('dispatches /help locally without consuming unknown slash prompts', async () => {
+    const ctx = ctxWith();
+    expect((await dispatchMeta('/help', ctx))?.text).toContain(':help');
+    expect((await dispatchMeta('/clear', ctx))?.text).toBe('__CLEAR__');
+    expect(await dispatchMeta('/run-skill test', ctx)).toBeNull();
+    expect(isMetaCommand('/help')).toBe(true);
+    expect(isMetaCommand('/run-skill test')).toBe(false);
+  });
+
+  it('offers exactly the same names in the menu as the meta handlers', () => {
+    expect(new Set(META_COMMANDS.map(({ name }) => name))).toEqual(
+      new Set(Object.keys(META_HANDLERS).map((key) => key.slice(1))),
+    );
   });
 });
 

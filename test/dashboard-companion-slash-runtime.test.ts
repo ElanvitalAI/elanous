@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 
-import { createDashboardCompanionSlashRuntime } from '../src/dashboard/companion-slash-runtime.js';
+import { createDashboardCompanionSlashRuntime } from '../src/dashboard/companion-messages-runtime.js';
 
 describe('createDashboardCompanionSlashRuntime', () => {
   test('renders companion popup feedback lines', () => {

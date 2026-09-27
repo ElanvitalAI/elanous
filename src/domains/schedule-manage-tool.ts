@@ -9,11 +9,12 @@
 // 상세 = 내부 문서 `PLAN-scheduler-registry-2026-07-07`.
 
 import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type { LLMToolSpec } from '../llm.js';
 import {
   openSchedulesDb, inventoryCrontab, inventoryInternalSchedules, listSchedules, readCrontab,
   buildCronLine, addLineToCrontab, removeLineFromCrontab, setLineEnabled, applyCrontab, setRunVia, setScheduleMission,
-  deleteScheduleRow, setNote, parseCronLine, scriptName, wrapCronLine, unwrapCronLine, sharesCrontabLine, reindexCrontabEntry,
+  deleteScheduleRow, setNote, parseCronLine, scriptName, wrapCronLine, wrapShellCronLine, unwrapCronLine, sharesCrontabLine, reindexCrontabEntry, repoRoot,
   type ScheduleRow,
 } from './schedule-registry.js';
 import { surfaceEventsDbPath, openSurfaceEventsDb, recallEvents } from './surface-events.js';
@@ -154,26 +155,36 @@ export async function dispatchScheduleManage(args: Record<string, unknown>): Pro
       const onlyName = idArg ? (listSchedules(sdb).find(r => r.id.startsWith(idArg) || r.name === idArg)?.name ?? null) : null;
       if (idArg && !onlyName) return { error: `잡 없음: ${idArg} (list로 id 확인).` };
       const changes: Array<{ name: string; after: string }> = [];
+      let skippedShell = 0;
       const newLines = current.split('\n').map((line) => {
         const parsed = parseCronLine(line);
         if (!parsed) return line;
         const nm = scriptName(parsed.command);
         if (onlyName && nm !== onlyName) return line;
-        // wrap 은 bun .ts 잡만(.sh 는 bun 미실행). unwrap 은 래핑된 라인만.
-        if (isWrap && !/\bbun\s+\S*scripts\/[\w.-]+\.ts/.test(parsed.command)) return line;
-        const after = isWrap ? wrapCronLine(line) : unwrapCronLine(line);
+        // 기존 bun .ts 래핑을 보존하고, 명시적 해석기가 있는 .sh만 셸 래퍼로 보낸다.
+        // 앞선 쪽이 발화 주체다 — `env bun scripts/x.ts` 는 bun, `zsh x.sh --runner bun scripts/y.ts` 는 셸.
+        const bunAt = parsed.command.search(/\bbun\s+\S*scripts\/[\w.-]+\.ts/);
+        const shellAt = parsed.command.search(/(?:^|\s)(?:\S*\/)?(?:bash|zsh|sh)\s+\S+\.sh(?=\s|$)/);
+        const bunJob = bunAt >= 0 && (shellAt < 0 || bunAt < shellAt);
+        const after = isWrap
+          ? bunJob ? wrapCronLine(line) : wrapShellCronLine(line, { bun: process.execPath, cronRun: join(repoRoot(), 'scripts', 'cron-run.ts') })
+          : unwrapCronLine(line);
+        if (isWrap && after === line && !bunJob && !/cron-run\.ts/.test(line)
+          && /^(?:cd\s+\S+\s*&&\s*)?(?:\.\/|\S*\/)?[\w.-]+\.sh(?=\s|$)/.test(parsed.command)) skippedShell++;
         if (after === line) return line;
         changes.push({ name: nm, after: after.trim() });
         return after;
       });
-      if (!changes.length) return { [isWrap ? 'wrapped' : 'unwrapped']: 0, note: isWrap ? '래핑할 .ts 크론 없음(이미 전부 래핑?).' : '언래핑할 래퍼 없음.' };
+      if (!changes.length) return { [isWrap ? 'wrapped' : 'unwrapped']: 0, ...(isWrap ? { skippedShell } : {}), note: isWrap ? '래핑할 .ts/.sh 크론 없음(이미 전부 래핑?).' : '언래핑할 래퍼 없음.' };
       if (args.yes !== true) {
         return { dryRun: true, action, count: changes.length, jobs: changes.map(c => c.name),
+          ...(isWrap ? { skippedShell } : {}),
           note: `${changes.length}건 ${isWrap ? '래핑' : '언래핑'} 예정 — 적용하려면 yes:true(백업 자동·crontab 재작성).` };
       }
       const backup = applyCrontab(newLines.join('\n'));
       inventoryCrontab(sdb); // unwrap-aware 파생 → id/계보 승계.
       return { [isWrap ? 'wrapped' : 'unwrapped']: changes.length, jobs: changes.map(c => c.name), backup,
+        ...(isWrap ? { skippedShell } : {}),
         note: `${changes.length}건 ${isWrap ? '래핑' : '언래핑'} 완료(백업 완료). ${isWrap ? '다음 발화부터 3계층(logs.db·레지스트리·자기기억) 관측' : '관측 래퍼 제거'}.` };
     }
     const target = byId(String(args.id ?? ''));
@@ -306,7 +317,16 @@ export async function dispatchScheduleManage(args: Record<string, unknown>): Pro
       const backup = applyCrontab(addLineToCrontab(current, line));
       setRunVia(sdb, target.id, 'crontab');
       inventoryCrontab(sdb);
-      return { released: target.name, id: target.id, backup, note: 'crontab 실행으로 복원. (trigger 이관잡은 데몬 재시작해야 trigger 발화 정지.)' };
+      // 파생 tox task 도 지운다 — delete 와 같은 규칙(안 지우면 부팅 sweep 이 다시 트리거로 등록한다).
+      // run_via 가 이미 crontab 이어도 지운다(앞선 release 가 남긴 고아를 이 명령으로 치울 수 있게).
+      const { deleteTriggerJob } = await import('./schedule-migrate.js');
+      const { TaskStore } = await import('../task-orchestrator/store.js');
+      const store = new TaskStore();
+      let taskDeleted = false;
+      try { taskDeleted = deleteTriggerJob(store, target.id).taskDeleted; } finally { store.close(); }
+      return { released: target.name, id: target.id, backup, taskDeleted, note: taskDeleted
+        ? 'crontab 실행으로 복원 · 파생 tox task 삭제(재시작 뒤 트리거 소멸).'
+        : 'crontab 실행으로 복원(파생 tox task 없음).' };
     }
     return { error: `알 수 없는 action: ${action}` };
   } catch (e) {

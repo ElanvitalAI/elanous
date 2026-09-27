@@ -1,0 +1,6 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "elanous",
+  "version": "0.1.0",
+  "description": "Hand work to elanous, the local agent orchestrator — approval-gated tasks through its MCP server and companion CLI."
+}

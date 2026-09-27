@@ -61,6 +61,17 @@ elanous keeps a small family of **standard templates** — reviewed graphs that 
 | Composite | work with execution or research in the middle: build, land, hand off, run, observe |
 | Heal (shared) | called by all of the above when a step fails |
 
+What ships today inside the development harness is one template per **goal type**, picked from the goal's `GoalType:` line or `--goal-type` (default `implement`):
+
+| Goal type | Template | Lands as |
+|---|---|---|
+| `implement` | author · plan · implement · gate · review · rework · main sync · pull request · merge | a code change |
+| `research` | investigate · (gate when code changed) · judge · landing | documents |
+| `document` | draft · review · rework · landing | documents |
+| `operate` | plan · verify · review · rework · landing | a registration or wiring change; the gate is never skipped |
+
+The general-development and composite templates in the first table are designed; composite work today is split into pieces with `elanous self orchestrate --decompose`, and each piece can carry its own goal type.
+
 A run's graph is shaped twice:
 
 1. **At launch** — from the template, the goal, the run contract (for example, where it runs) and past runs, elanous decides the graph for *this* run.
@@ -82,7 +93,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 
 - A **graph** is the flow: order, branches, retries, pauses for approval, reshaping, healing.
 - A **workflow** (`elanous wf`) is the body of a single node: a short DAG of prompts, HTTP calls, classification and templates.
-- **Intake** turns what you say into tasks; the **task manager** runs a task by starting a graph.
+- **Intake** turns what you say into tasks; the **task manager** runs a task. Today an approved task marked `[dev]` starts a harness run, and other tasks run as an agent with tools (🟡 on main). See [Tasks and intake](tasks-and-intake.md).
 
 ## What ships today, what is in progress
 
@@ -91,7 +102,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 | Harness runs (implement · research · document · operate templates) | ✅ ships — the orchestrator drives them; the graph declaration is checked against every step |
 | Graph runner with approval pauses and resume (`elanous graph run` · `graph approve` · `graph run --resume`) | ✅ ships |
 | Run contract: local or remote (pod) | ✅ declared and resolved at run start |
-| Node catalog | ✅ declared and checked (judge, execute and observe roles built from existing parts) · 🟡 heal roles execute through their recipes — other roles do not yet execute by role name |
+| Node catalog | ✅ declared and checked (judge, execute and observe roles built from existing parts) · 🟡 heal roles execute through their recipes — other roles do not yet execute by role name · 🔄 the harness templates still use their own node names; mapping them to catalog role names is in progress |
 | New node kinds (observe · hitl · subgraph) | ✅ accepted by the graph parser |
 | Node outputs flowing to the next node · multi-way branching | 🟡 on main — next release (each node reads the run context; a node's last-line JSON `outcome` picks the edge) |
 | Heal template with the resolution ladder | 🟡 on main — next release: the runner walks it; the first observation step marks deleted files by itself and a real failure class closes without a human (example below) · 🔄 the deeper observation and outside-grounding steps are still being filled in |
@@ -100,7 +111,9 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 | Budget decision before a launch (`elanous harness budget --json` → proceed · next provider · wait for reset · stop, with reasons) | 🟡 on main — next release |
 | Grounding sources registry (`elanous grounding sources list · add · discover · status`) | 🟡 on main — next release |
 | Supervisor adding nodes at launch and while running | 📋 designed |
-| Workflows as graph nodes (`wf:`) · graphs as workflow nodes · tasks that start graphs | 📋 designed |
+| Tasks that start harness runs (approved `[dev]` tasks → harness · other tasks → an agent with tools) | 🟡 on main — next release |
+| Task type → a combination of templates and workflows (run · implement · research · composite) | 📋 designed |
+| Workflows as graph nodes (`wf:`) · graphs as workflow nodes | 📋 designed |
 
 ### A real walk of the heal template
 

@@ -1,21 +1,6 @@
 // Dashboard slash command handlers · migrated cases from the inline
 // switch in dashboard/index.ts. Sub-phase tracking:
 //
-//   B-3.d         — /workspace /ws /window /win + /codex-vw /acp-vw
-//                   /claude-vw — closes Phase B-3 (last cluster).
-//                   `workspaceSlash` ctx bundle threads windowSlash
-//                   Runtime + virtualWindows.registry subset + 7
-//                   spawn helpers + openWindowPicker + 2 companion
-//                   ops. `acpVwSlash` ctx bundle covers cwd() +
-//                   vwRegistry for the spawn-coding-agent paths.
-//                   /codex-vw + /acp-vw + /claude-vw share a body but
-//                   discriminate on cmdLower; registered as 3 names
-//                   each closing over the brand label (matches the
-//                   B-2.m /claude /codex /gemini pattern).
-//                   spawnAcpLiveSessionInVW + parseWindowCompanion
-//                   Slash hoisted from dynamic to static imports.
-//                   /codex-vw reuses ctx.conv.openModal (B-2.w) for
-//                   openConversationModal. Behavior preserved verbatim.
 //   B-3.c.2       — /term /terminal — second half of the third B-3
 //                   cluster. The biggest single case (681 LOC inline ·
 //                   23 subcommands across 6 host-local subsystems —
@@ -170,14 +155,6 @@
 //                   layout / focus / open). Four host-local actions
 //                   (listLiveSessions, setLayoutMode, focusPopup,
 //                   openModal) threaded via `conv` ctx bundle.
-//   B-2.v         — /scratch · /sc — scratchpad open/close/popup/
-//                   memo/clear/dump/append/replace. Many host-local
-//                   refs (mutable scratchClosed flag, scratchLines /
-//                   scratchTitle state, working-dir focus transition,
-//                   companion popup actions keyed to 'scratch').
-//                   Threads `scratch` ctx bundle as a thin shell over
-//                   the host actions; slash handler stays close to the
-//                   original case body shape.
 //   B-2.u         — /git — read-only inspection (status / branch /
 //                   log / diff / remote). All deps are pure module-
 //                   level helpers (getSessionCwd · getGitStatusView ·
@@ -207,11 +184,6 @@
 //                   helpers + 5 host-local actions (spawnVirtualWindow,
 //                   openWebCockpit, listScenarios, runById, resolveAlias)
 //                   threaded via `sim` ctx bundle.
-//   B-2.p         — /view · /v — yazi-style view switcher + config
-//                   reload/save/restore/reset/export. viewSlashRuntime
-//                   line helpers + view-registry actions threaded via
-//                   a single `view` ctx bundle. Each subcommand
-//                   delegates to a thin ctx method.
 //   B-2.o         — /intake — intake-plane review picker / modal /
 //                   refresh fire-and-forget. Many host-local deps
 //                   (display coordinator, theme tokens, workspace
@@ -258,25 +230,11 @@
 //                   itself (`openSourceDeltaBrowserPopup`) is show
 //                   Dashboard-local; threaded as `delta.openBrowser
 //                   Popup`. Sets exitInputLoop on a successful open.
-//   B-2.h         — /pty-pane · /pty-view — open a VirtualWindow with
-//                   a pty-tail pane that live-renders an already-
-//                   spawned registry PTY. pty-shell/registry helpers
-//                   are dynamic-imported. Only host-local dep is
-//                   `virtualWindows.registry.spawn(...)`, wrapped
-//                   behind one ctx method. Threads new `ptyPane` ctx.
 //   B-2.g         — /undo — snapshot ring restore/list/clear/toggle.
 //                   undo-turn helpers loaded via dynamic import. The
 //                   only host-local dep is `refreshGitDirty` over the
 //                   session cwd, wrapped behind a single ctx method.
 //                   Threads new `undo` ctx bundle (1 method).
-//   B-2.f         — /fullscreen · /fs — toggle fullscreen on the
-//                   currently-foregrounded terminal modal. terminal
-//                   modal router is a module-level singleton (static
-//                   import in this module); display coordinator is
-//                   showDashboard-local, so it's wrapped behind a
-//                   single `showFullscreenToast` ctx method instead
-//                   of leaking the DisplayCoordinator type. Threads
-//                   new `terminal` ctx bundle.
 //   B-2.e         — /history · /hist · /inputs — input history viewer
 //                   (list / find / show / clear / path).
 //                   Threads new `inputHistory` ctx bundle.
@@ -325,15 +283,7 @@
 // `../index.ts`) instead of importing the type — keeps this module free
 // of circular dependency on dashboard/index.ts.
 
-import { perf } from '../../perf-counters.js';
-import {
-  runRebindCommand,
-  readAuditTail,
-  isInputAuditEntry,
-  formatAuditEntry,
-  parseDuration as parseAuditDuration,
-} from '../../input-core/index.js';
-import { resolveDashboardChatMainCacheCommand } from '../input/chat-main-cache-command.js';
+import { runRebindCommand } from '../../input-core/index.js';
 // B4 (TUI half) — /design reuses the CLI's own resolution so the three
 // surfaces (CLI, PWA panel, this) cannot answer differently.
 import { resolveRepositoryDesignCheck } from '../../cli/repo-cli.js';
@@ -364,14 +314,8 @@ import { lookupLlmTierSpec } from '../../model-tier/index.js';
 import { listProviders } from '../../llm.js';
 import { selfOrchestrateRuntime } from '../../self-dev/self-orchestrate-runtime.js';
 import type { ToolRuntime } from '../../tool-runtime/types.js';
-import {
-  getGitStatusView,
-  refreshDirty as refreshGitDirty,
-  listBranches as listGitBranches,
-} from '../../git-fs/index.js';
 import { getSessionCwd } from '../../session/working-dir.js';
 import { listSkillNames, describeSkill } from '../../skills/runner.js';
-import { getSkillIndex } from '../../skills/index.js';
 import {
   REASONING_CYCLE,
   effectiveReasoningLevel,
@@ -402,6 +346,8 @@ import {
 import { inputHistoryDbPath, inputHistoryJsonPath } from '../../input-history.js';
 import { terminalModalRouter } from '../input/terminal-modal-router.js';
 import { termSize, stripAnsi } from '../../tui.js';
+import { SLASH_COMMANDS } from '../../chat/index.js';
+import { buildEssentialHelpLines } from './help-from-registry.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveDashboardChatMainLogCommand } from '../input/chat-main-log-command.js';
 import {
@@ -449,8 +395,6 @@ import type { DashboardTermSlashRuntime } from '../term-slash-runtime.js';
 import { resolveTerminalMoveDestination } from '../../terminal-matrix/mobility.js';
 import { loadPersistedSessions } from '../../terminal/session-persistence.js';
 import { dispatchTerminalModalObserve } from '../../skills/tools/terminal-modal.js';
-import type { DashboardWindowSlashRuntime } from '../window-slash-runtime.js';
-import { parseWindowCompanionSlash } from '../windowing/companion-slash.js';
 // PLAN-tui-redundancy-cleanup T1 (2026-05-16) — vw-live-bridge trim.
 // `/codex-vw` slash 의 codex branch 가 의존했었지만 사용자 미사용 명시 ·
 // 본 trim 의 부차 path 정리. codex branch 는 error 메시지 출력으로 noop.
@@ -460,7 +404,6 @@ import {
   buildContextSlashCommand,
   buildCostSlashCommand,
   buildMemorySlashCommand,
-  buildUsageSlashCommand,
 } from '../../context-display/index.js';
 import {
   formatInspectOutput,
@@ -481,7 +424,6 @@ import type { LogTurnSeparatorMode } from '../log-turn-separator-mode.js';
 const CONTEXT_SLASH_DESCRIPTOR = buildContextSlashCommand();
 const COST_SLASH_DESCRIPTOR = buildCostSlashCommand();
 const MEMORY_SLASH_DESCRIPTOR = buildMemorySlashCommand();
-const USAGE_SLASH_DESCRIPTOR = buildUsageSlashCommand();
 
 export interface DashboardSlashContext {
   // Chat surface refs / mutators
@@ -521,6 +463,7 @@ export interface DashboardSlashContext {
   /** Exit-only lifecycle hook: dashboard uses this to leave a session-resume notice. */
   exitTui?(): void;
   showHelp(scope: string): Promise<void>;
+  showHelpModal?(options: { title: string; lines: readonly string[] }): void;
 
   // Log search / filter
   clearLogSearch(): void;
@@ -576,10 +519,8 @@ export interface DashboardSlashContext {
     providerId: Parameters<typeof handleAutoTtsSlash>[1];
   };
 
-  // B-1.g additions — three sub-runtime delegation cases (signals ·
-  // browser-cdp · widget). Each one routes sub-commands to a slash-
-  // runtime factory output. The runtimes are showDashboard-local so
-  // we thread them via ctx as opaque shapes.
+  // B-1.g additions — signals and widget delegation runtimes are
+  // showDashboard-local, so they are threaded via ctx as opaque shapes.
   controlSignalSlashRuntime: {
     usageLines(): readonly string[];
     statusLines(): readonly string[];
@@ -617,6 +558,8 @@ export interface DashboardSlashContext {
   widgetModalPopup?: {
     open(spec: { widgetInstanceId: string; modalType: string; title: string }): { dispose(): void } | null;
   };
+  /** Essential dashboard prints /bg rows into chat instead of opening a popup. */
+  backgroundTasksTextOnly?: boolean;
 
   // B-1.h additions
   // - /preview · /pv: previewSlashRuntime is showDashboard-local (built
@@ -643,7 +586,7 @@ export interface DashboardSlashContext {
     dockedSnapshotRef: { value: { sourceMode: unknown } & Record<string, unknown> };
   };
   contextSlash: {
-    renderContextList(): void;
+    renderContextList(): string[];
     contextRegistry: unknown;
   };
   pasteSlash: {
@@ -652,12 +595,6 @@ export interface DashboardSlashContext {
     };
     attachClipboardImage(): Promise<string | null>;
     setNextInitial(token: string): void;
-  };
-  /** TUI 부활 T2 — /ui 모드 전환. setMode 는 uiMode 재할당 + chat-only
-   *  동기 + config persist 를 수행 (dashboard 의 applyDashboardUiMode). */
-  uiModeSlash: {
-    getMode(): 'essential' | 'rich';
-    setMode(mode: 'essential' | 'rich'): void;
   };
   /** TUI 부활 S-a — /resume 세션 픽커. openPicker 는 dashboard 의
    *  openSessionResumePicker (createSearchModal 기반 · 선택 시
@@ -684,30 +621,12 @@ export interface DashboardSlashContext {
   // B-1.i additions
   refreshReasoningHudSegment(): void;
 
-  // B-2.f additions — /fullscreen toggle for the foregrounded terminal
-  // modal. `terminalModalRouter` is a module-level singleton (static-
-  // imported in this module). `display` is showDashboard-local, so the
-  // toast wiring is wrapped behind `showFullscreenToast` instead of
-  // leaking the DisplayCoordinator type through ctx.
-  terminal: {
-    fullscreenMissingLine(): string;
-    showFullscreenToast(opts: { title: string; lines?: string[] }): void;
-  };
-
   // B-2.g additions — /undo. The undo-turn helpers are dynamic-
   // imported in the handler body. Only `refreshGitDirty` over the
   // session cwd is host-local; wrapped behind a single ctx method.
   undo: {
     refreshGitDirty(): void;
     bold(text: string): string;
-  };
-
-  // B-2.h additions — /pty-pane · /pty-view. pty-shell/registry helpers
-  // are dynamic-imported in the handler body. Only host-local dep is
-  // `virtualWindows.registry.spawn(...)`, wrapped behind one ctx method
-  // that returns the new window's id (only field the case body reads).
-  ptyPane: {
-    spawnPtyTailWindow(opts: { title: string; ptyId: string }): { id: number };
   };
 
   // B-2.i additions — /delta · /diffs source-delta browser popup.
@@ -831,48 +750,6 @@ export interface DashboardSlashContext {
     openModal(sessionId: string): Promise<boolean>;
   };
 
-  // B-2.v additions — /scratch · /sc scratchpad. Many host-local
-  // refs (mutable scratchClosed flag, scratchLines / scratchTitle,
-  // working-dir focus transition, companion popup keyed to 'scratch').
-  scratch: {
-    slashRuntime: {
-      reopenedLine(): string;
-      alreadyOpenLine(): string;
-      popupLine(open: boolean): string;
-      popupPromotedLine(): string;
-      popupUsageLine(): string;
-      closedLine(): string;
-      clearedLine(): string;
-      emptyDumpLine(): string;
-      dumpHeaderLine(title: string): string;
-      memoOpenedLine(): string;
-      usageLine(): string;
-    };
-    isClosed(): boolean;
-    /** Reopen the scratchpad pane. */
-    open(): void;
-    /** Close the scratchpad pane (also handles focus transition). */
-    close(): void;
-    /** Empty the scratchpad. */
-    clear(): void;
-    /** Snapshot for /scratch dump. */
-    currentForCommand(): { title: string; lines: readonly string[] };
-    /** Snapshot for /scratch + (append). */
-    snapshotForAppend(): { title: string; lines: readonly string[] };
-    /** Replace scratch content. */
-    setText(title: string, lines: readonly string[]): void;
-    /** Helper to format dump lines (host-side). */
-    buildDumpLines(lines: readonly string[]): readonly string[];
-    popup: {
-      open(): void;
-      close(): void;
-      /** Returns whether the popup is open after toggle. */
-      toggle(): boolean;
-      promote(): void;
-    };
-    openMemo(): void;
-  };
-
   // B-2.t additions — /compact summarise + history reset. The host
   // owns chat.history; the slash-runtime layer needs to read it for
   // the compact algorithm and clear+repopulate it for reset. Returns
@@ -938,46 +815,6 @@ export interface DashboardSlashContext {
     runById(scenarioId: string): Promise<{ status: string; lines: readonly string[] }>;
     /** Normalize a raw user-provided alias to a registered scenario id, or null. */
     resolveScenarioId(raw: string): string | null;
-  };
-
-  // B-2.p additions — /view yazi-style view switcher + config mgmt.
-  view: {
-    slashRuntime: {
-      listLines(items: readonly {
-        active: boolean;
-        id: string;
-        label: string;
-        enabled: boolean;
-        shortcut?: string | null;
-        baseView?: string;
-      }[]): readonly string[];
-      closedPaneLines(labels: readonly string[]): readonly string[];
-      reloadedLine(): string;
-      savedLine(): string;
-      restoredLine(): string;
-      resetLine(): string;
-      exportedLine(): string;
-      usageLine(): string;
-    };
-    buildListItems(): readonly {
-      active: boolean;
-      id: string;
-      label: string;
-      enabled: boolean;
-      shortcut?: string;
-      baseView?: string;
-    }[];
-    closedPaneLabels(): readonly string[];
-    next(): void;
-    prev(): void;
-    reload(): void;
-    save(): void;
-    restoreAllClosed(): void;
-    reset(): void;
-    exportConfigJson(): string;
-    /** Open a view by id/label/shortcut. Returns false if not found. */
-    openByQuery(query: string): boolean;
-    openDetailViewer(title: string, lines: string[]): void;
   };
 
   // B-2.o additions — /intake review picker / modal / refresh.
@@ -1223,6 +1060,11 @@ export interface DashboardSlashContext {
   /** Telegram chat id paired with the attached session, when handed off. */
   getAttachedChatId(): number | null;
   setAttachedChatId(id: number | null): void;
+  /** Optional report delivery seam for slash dispatch tests; production uses the real config and sender. */
+  telegramReport?: {
+    getConfig(): ReturnType<typeof getUserConfig>;
+    send: (cfg: ReturnType<typeof getUserConfig>, text: string) => Promise<boolean>;
+  };
 
   sessionSlash: {
     /** opts.remote — when the dashboard is attached to a remote daemon. */
@@ -1376,50 +1218,6 @@ export interface DashboardSlashContext {
     run(args: readonly string[]): Promise<void>;
   };
 
-  // B-3.d additions — /workspace /ws /window /win + /codex-vw /acp-vw /claude-vw.
-  // Closes the last B-3 cluster. The two cases share the virtualWindows
-  // registry but differ in surface: /workspace owns lifecycle (spawn /
-  // list / switch / close / picker) while /codex-vw spawns coding-agent
-  // sessions inside VWs. `windowSlashRuntime` slashRuntime + the seven
-  // spawn*VirtualWindow + openWindowPicker + toggleVwCompanion +
-  // setVwCompanionOpen helpers all thread via `workspaceSlash`.
-  // `spawnAcpLiveSessionInVW` is static-imported. /codex-vw reuses
-  // ctx.conv.openModal (B-2.w) for openConversationModal · workingDir
-  // cwd via ctx.acpVwSlash.cwd().
-  workspaceSlash: {
-    /** Line-formatter helpers (host-built per-dashboard). */
-    slashRuntime: DashboardWindowSlashRuntime;
-    /** Virtual-window registry surface used by /workspace. */
-    registry: {
-      list(): readonly { id: number; title: string; listPanes(): readonly unknown[] }[];
-      current(): { id: number } | null;
-      switchTo(id: number): boolean;
-      close(id: number): boolean;
-      get(id: number): { id: number } | null;
-    };
-    /** Spawn helpers (each returns the new VW id). */
-    spawnScratchVirtualWindow(title: string): number;
-    spawnBrowserVirtualWindow(title: string): number;
-    spawnPreviewVirtualWindow(title: string): number;
-    spawnBrowserPreviewVirtualWindow(title: string): number;
-    spawnIulVirtualWindow(title: string): number;
-    spawnAcpVirtualWindow(title: string): number;
-    spawnSimVirtualWindow(title: string): number;
-    /** Open the cross-window picker modal. */
-    openWindowPicker(): void;
-    /** Toggle a VW companion popup; returns the resulting open state. */
-    toggleVwCompanion(windowId: number, key: string): boolean;
-    /** Set a VW companion popup's open state explicitly. */
-    setVwCompanionOpen(windowId: number, key: string, open: boolean): void;
-  };
-
-  acpVwSlash: {
-    /** Working-dir cwd for spawned coding-agent VWs. */
-    cwd(): string;
-    /** Virtual-windows registry handle (subset for spawnCodingAgentInVW). */
-    vwRegistry: unknown;
-  };
-
   // B-3.c.1 additions — /shell list/kill/attach/rollup. /local has no
   // bundle (all deps are static-imported helpers + existing ctx
   // chatLines / chatScrollOffset / color funcs / config helpers).
@@ -1560,17 +1358,17 @@ export function _setSelfOrchestrateSlashRuntimeForTesting(runtime: SelfOrchestra
 export const DASHBOARD_SLASH_CATALOG_BASELINE = {
   registeredOnly: [
     'ag', 'agent', 'agents', 'attach-clear', 'attach-pin', 'attach-unpin',
-    'bench', 'bg', 'branch', 'cb', 'ce', 'child', 'clip', 'clipboard',
-    'code-edit', 'compact', 'compress', 'cost', 'detail', 'dv', 'git',
-    'harness-llm', 'intake', 'me', 'mem-compact', 'memo',
-    'memorize', 'note', 'pause', 'plan-board', 'preview', 'pv', 'report',
-    'route', 'sh', 'shell', 'signal', 'signals', 'skill-reload',
-    'skill-triggers', 'skills-reload', 'spend', 'squeeze', 'stats',
-    'sweep-tool-results', 'tk', 'tokens', 'triggers', 'tslider',
-    'turn-slider', 'turnslider', 'undo', 'usage', 'w', 'wd',
+    'bench', 'bg', 'cb', 'ce', 'child', 'clip', 'clipboard',
+    'code-edit', 'compact', 'compress', 'cost', 'detail', 'dv',
+    'harness-llm', 'intake', 'me', 'memo',
+    'note', 'pause', 'plan-board', 'preview', 'pv', 'report',
+    'sh', 'shell', 'signal', 'signals', 'skill-reload',
+    'skills-reload', 'spend', 'squeeze',
+    'tk', 'tokens',
+    'undo', 'w', 'wd',
   ],
   listedOnly: [
-    'acp', 'hint', 'media', 'mv', 'pg', 'rsh', 'sr', 'surf',
+    'acp', 'rsh', 'sr',
   ],
 } as const;
 
@@ -1609,11 +1407,28 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.clearLogSearch();
     ctx.clearLogFilter();
     ctx.pushDebugLine(ctx.muted('Status cleared'));
+    ctx.chatLines.push(ctx.muted('Status cleared'));
     ctx.setChatScrollOffset(-1);
   });
 
-  registry.register(['help', '?'], async (_args, ctx) => {
-    await ctx.showHelp('dashboard');
+  registry.register(['help', '?'], (_args, ctx) => {
+    const { cols, rows } = termSize();
+    const lines = buildEssentialHelpLines({
+      names: registry.names(),
+      descriptions: SLASH_COMMANDS,
+      width: Math.max(1, Math.floor(cols * 0.7) - 2),
+    });
+    // The transient modal paints only height - 2 content rows and does not scroll.
+    // When the catalog outgrows it, use the scrollable chat log instead of hiding keys.
+    const minHeight = Math.min(6, Math.max(3, rows - 2));
+    const modalContentRows = Math.max(minHeight, Math.min(rows - 4, Math.floor(rows * 0.7))) - 2;
+    if (ctx.showHelpModal && lines.length <= modalContentRows) {
+      ctx.showHelpModal({ title: 'Dashboard help', lines });
+    } else {
+      if (ctx.showHelpModal) ctx.chatLines.push('Dashboard help — scroll the chat log with PgUp / PgDn');
+      ctx.chatLines.push(...lines);
+      ctx.setChatScrollOffset(-1);
+    }
   });
 
   // ── B-1.b ─────────────────────────────────────────────────────────
@@ -1715,14 +1530,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.setChatScrollOffset(-1);
   });
 
-  registry.register('ctoggle', (_args, ctx) => {
-    const next = ctx.toggleSessionControlMode(ctx.chatModeStateRef.value);
-    void ctx.inputCoreSetMode(ctx.resolveSessionInputModeFromChatMode({ chatModeState: ctx.chatModeStateRef.value }));
-    ctx.chatLines.push(next.posture === 'control'
-      ? ctx.error('-- CONTROL MODE (toggle) —') + ctx.text(' every message is a dashboard command. /ctoggle to exit.')
-      : ctx.muted('-- back to default chat mode --'));
-    ctx.setChatScrollOffset(-1);
-  });
 
   registry.register(['dashboard', 'dash'], (_args, ctx) => {
     // Explicit exit back to 3-pane layout — no-op if already there, so
@@ -1759,21 +1566,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
   });
 
   // ── B-1.c ─────────────────────────────────────────────────────────
-  registry.register('cache', async (args, ctx) => {
-    const cacheCommand = resolveDashboardChatMainCacheCommand(args);
-    const {
-      getSessionSummary, formatSessionSummary, resetSessionMetrics,
-    } = await import('../../prompt-cache/index.js');
-    if (cacheCommand.kind === 'reset') {
-      resetSessionMetrics();
-      ctx.pushDebugLine(ctx.muted('  cache metrics reset'));
-    } else {
-      const summary = formatSessionSummary(getSessionSummary());
-      for (const line of summary.split('\n')) ctx.pushDebugLine(ctx.muted(`  ${line}`));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
-
   registry.register('attach-pin', (args, ctx) => {
     // BL-E3 — bookmark a session's latest block so it survives ring rotation.
     const target = args[0]?.trim();
@@ -1854,60 +1646,8 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.setChatScrollOffset(-1);
   });
 
-  registry.register('perf', (args, ctx) => {
-    // Opt-in perf instrumentation. /perf on resets all buckets; report
-    // prints p50/p90/p99 + top categories; reset re-arms collection
-    // without toggling enabled.
-    const sub = (args[0] || 'status').toLowerCase();
-    if (sub === 'on') {
-      perf.enable();
-      emitReplyToChat(ctx, ctx.success('  perf counters ON — use /perf report to inspect'));
-    } else if (sub === 'off') {
-      perf.disable();
-      emitReplyToChat(ctx, ctx.muted('  perf counters OFF'));
-    } else if (sub === 'reset') {
-      if (perf.enabled) { perf.enable(); emitReplyToChat(ctx, ctx.muted('  perf reset (still ON)')); }
-      else               emitReplyToChat(ctx, ctx.muted('  perf is OFF — `/perf on` to start'));
-    } else if (sub === 'report') {
-      for (const l of perf.report().split('\n')) ctx.pushDebugLine(ctx.text(l));
-    } else { // status
-      emitReplyToChat(ctx, ctx.muted(`  perf: ${perf.enabled ? 'ON' : 'OFF'}`));
-      if (perf.enabled) {
-        for (const l of perf.report().split('\n')) ctx.pushDebugLine(ctx.muted('    ' + l));
-      }
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
-  registry.register(['pty-list', 'ptys'], async (_args, ctx) => {
-    // S3: visibility into PTYs the dashboard / skills spawned. Read-only;
-    // identical to PtyShellList native tool output.
-    const { dispatchPtyShellList } = await import('../../skills/tools/pty.js');
-    const { ptyAvailable } = await import('../../pty-shell/registry.js');
-    if (!ptyAvailable()) {
-      ctx.pushDebugLine(ctx.warning('  PtyShell unavailable — node-pty not installed'));
-    } else {
-      for (const line of dispatchPtyShellList().output.split('\n')) {
-        ctx.pushDebugLine(ctx.text(line));
-      }
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
-  registry.register('sweep-tool-results', async (_args, ctx) => {
-    try {
-      const { sweepToolResults, toolOutputStoreRoot } = await import('../../tool-runtime/truncation-store.js');
-      const removed = await sweepToolResults({
-        retentionDays: getUserConfig().chat.toolOutput.retentionDays,
-      });
-      ctx.pushDebugLine(ctx.success(
-        `[tool-results] sweep complete: removed ${removed.removedFiles} files, ${removed.removedDirs} dirs (${toolOutputStoreRoot()})`,
-      ));
-    } catch (err) {
-      ctx.pushDebugLine(ctx.warning(`[tool-results] sweep failed: ${err instanceof Error ? err.message : String(err)}`));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
   // ── B-1.d ─────────────────────────────────────────────────────────
   // 9 deferred skill-tool slashes. All share the fire-and-forget
@@ -1915,16 +1655,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
   // distinct module paths and exporter names are the only per-case
   // variation.
 
-  registry.register(['budget', 'b'], (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'budget',
-      async () => (await import('../../skills/tools/budget-slash.js')).executeBudgetSlash,
-      args,
-      ctx,
-    );
-  });
   // /remaining — 명령(`elanous usage`)이 내는 구조화 산출을 그대로 읽는다. 화면 계산 없음.
-  // 기존 /usage 는 세션 토큰 통계라 이름·동작을 그대로 둔다.
   registry.register('remaining', (args, ctx) => {
     runDeferredSkillToolSlash(
       'remaining',
@@ -1934,14 +1665,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     );
   });
 
-  registry.register('route', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'route',
-      async () => (await import('../../skills/tools/route-slash.js')).executeRouteSlash,
-      args,
-      ctx,
-    );
-  });
 
   // `agent-room` and `showroom` go to the same module but pass distinct
   // names through to the executor. Two registrations keep the alias
@@ -2010,14 +1733,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     );
   });
 
-  registry.register('llm', (args, ctx) => {
-    runDeferredSkillToolSlash(
-      'llm',
-      async () => (await import('../../skills/tools/llm-manager-slash.js')).executeLlmSlash,
-      args,
-      ctx,
-    );
-  });
 
   // ── B-1.e ─────────────────────────────────────────────────────────
   // 4 tiny standalone toggles / state-mutation cases. Each is small and
@@ -2025,18 +1740,23 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
   // share the "tiny" tier.
 
   registry.register('bg', async (_args, ctx) => {
-    // Wave P4b-1 — open the unified background-tasks widget as an
-    // interactive modal popup. Falls back to the previous chatLines
-    // snapshot dump when the host hasn't wired the popup helper
-    // (e.g. test harnesses) so the slash stays usable everywhere.
-    const handle = ctx.widgetModalPopup?.open?.({
-      widgetInstanceId: 'wd-background-tasks',
-      modalType: 'background-tasks-popup',
-      title: 'Background tasks',
-    });
-    if (handle) {
-      ctx.setChatScrollOffset(-1);
-      return;
+    if (!ctx.backgroundTasksTextOnly) {
+      let handle: { dispose(): void } | null | undefined;
+      try {
+        handle = ctx.widgetModalPopup?.open({
+          widgetInstanceId: 'wd-background-tasks', modalType: 'background-tasks-popup', title: 'Background tasks',
+        });
+      } catch (err) {
+        if (!(err instanceof Error) || !err.message.includes("no modal type registered as 'background-tasks-popup'")) throw err;
+        debug.log('dashboard.slash', 'modal-type-missing', { type: 'background-tasks-popup' });
+        ctx.pushChatLine(ctx.warning('  배경 작업 창을 열 수 없습니다'));
+        ctx.setChatScrollOffset(-1);
+        return;
+      }
+      if (handle) {
+        ctx.setChatScrollOffset(-1);
+        return;
+      }
     }
     type Row = {
       id: string; source: string; label: string; status: string;
@@ -2045,16 +1765,16 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     const inst = ctx.widgetHost.get('wd-background-tasks');
     const rows = (inst?.state as { rows?: Row[] } | undefined)?.rows ?? [];
     if (rows.length === 0) {
-      ctx.pushDebugLine(ctx.muted('  /bg: no active background tasks.'));
+      ctx.pushChatLine(ctx.muted('  /bg: no active background tasks.'));
     } else {
-      ctx.pushDebugLine(ctx.muted(`  /bg: ${rows.length} active background task${rows.length === 1 ? '' : 's'}`));
+      ctx.pushChatLine(ctx.muted(`  /bg: ${rows.length} active background task${rows.length === 1 ? '' : 's'}`));
       for (const r of rows) {
         const elapsed = typeof r.elapsedMs === 'number' && r.elapsedMs > 0
           ? `${Math.floor(r.elapsedMs / 1000)}s`
           : '';
         const tail = [r.detail, elapsed].filter(Boolean).join(' · ');
         const tailPart = tail ? `  ${tail}` : '';
-        ctx.pushDebugLine(`  ${r.source} · ${r.status} · ${r.label}${tailPart}`);
+        ctx.pushChatLine(`  ${r.source} · ${r.status} · ${r.label}${tailPart}`);
       }
     }
     ctx.setChatScrollOffset(-1);
@@ -2083,11 +1803,17 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     // `/resume`. The dynamic import keeps turn-checkpoint lazy-loaded.
     const { requestPause, isPauseRequested } = await import('../../turn-checkpoint/index.js');
     if (isPauseRequested()) {
-      ctx.pushDebugLine(ctx.muted('  /pause: already queued — the next decision-boundary tool call will halt the turn.'));
+      const line = ctx.muted('  /pause: already queued — the next decision-boundary tool call will halt the turn.');
+      ctx.pushDebugLine(line);
+      ctx.chatLines.push(line);
     } else {
       requestPause();
-      ctx.pushDebugLine(ctx.success('  /pause: queued. The next decision-boundary tool call (Edit/Write/Bash/Agent) will checkpoint and end the turn.'));
-      ctx.pushDebugLine(ctx.muted('  Resume the captured state with /resume-turn (most recent) or /resume-turn <turn-suffix>.'));
+      const line = ctx.success('  /pause: queued. The next decision-boundary tool call (Edit/Write/Bash/Agent) will checkpoint and end the turn.');
+      ctx.pushDebugLine(line);
+      ctx.chatLines.push(line);
+      const resumeHint = ctx.muted('  Resume the captured state with /resume-turn (most recent) or /resume-turn <turn-suffix>.');
+      ctx.pushDebugLine(resumeHint);
+      ctx.chatLines.push(resumeHint);
     }
     ctx.setChatScrollOffset(-1);
   });
@@ -2238,24 +1964,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.setChatScrollOffset(-1);
   });
 
-  registry.register(['browser-cdp', 'bcdp'], async (args, ctx) => {
-    const sub = (args[0] || 'status').toLowerCase();
-    const rt = ctx.browserCdpSlashRuntime;
-    ctx.chatLines.push('');
-    ctx.chatLines.push(ctx.accent(`❯ /browser-cdp ${args.join(' ').trim() || 'status'}`));
-    if (sub === 'help') {
-      for (const line of rt.usageLines()) ctx.chatLines.push(line);
-    } else if (sub === 'status') {
-      for (const line of rt.statusLines()) ctx.chatLines.push(line);
-    } else if (sub === 'smoke') {
-      for (const line of await rt.smokeLines()) ctx.chatLines.push(line);
-    } else if (sub === 'stop') {
-      for (const line of rt.stopLines()) ctx.chatLines.push(line);
-    } else {
-      for (const line of rt.usageLines()) ctx.chatLines.push(line);
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
   registry.register(['widget', 'widgets', 'w'], async (args, ctx) => {
     const sub = (args[0] || 'list').toLowerCase();
@@ -2302,7 +2010,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
   // hit before the alias-checking branches. Registry handlers don't
   // receive the matched name, so we register each alias separately and
   // hard-code the source name — fixes the typo by construction.
-  for (const sourceName of ['control', 'dm', 'default'] as const) {
+  for (const sourceName of ['control', 'default'] as const) {
     registry.register(sourceName, (args, ctx) => {
       const outcome = parseSessionControlSlash(
         sourceName,
@@ -2397,7 +2105,8 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     // helpers are statically imported.
     const subCmd = args[0]?.toLowerCase();
     if (!subCmd) {
-      ctx.contextSlash.renderContextList();
+      const lines = ctx.contextSlash.renderContextList();
+      ctx.chatLines.push(...(lines.length > 0 ? lines : [ctx.muted('  /context: (없음)')]));
       ctx.setChatScrollOffset(-1);
       return;
     }
@@ -2461,23 +2170,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
       ctx.chatLines.push(ctx.muted(`  ╰─ Reference it in your next question; the token is pre-filled.`));
       ctx.pasteSlash.setNextInitial(token);
     }
-    ctx.setChatScrollOffset(-1);
-  });
-
-  // /ui — TUI 부활 T2: essential(chat 전체화면) ↔ rich(full dashboard)
-  // 런타임 전환 + config persist. 인자 없으면 현재 모드 + 사용법.
-  registry.register('ui', async (args, ctx) => {
-    ctx.chatLines.push('');
-    const arg = (args[0] ?? '').trim().toLowerCase();
-    if (arg === 'essential' || arg === 'rich') {
-      ctx.chatLines.push(ctx.accent(`❯ /ui ${arg}`));
-      ctx.uiModeSlash.setMode(arg);
-      return;
-    }
-    ctx.chatLines.push(ctx.accent('❯ /ui'));
-    if (arg) ctx.chatLines.push(ctx.warning(`  unknown mode: ${arg}`));
-    ctx.chatLines.push(ctx.text(`  ui mode: ${ctx.uiModeSlash.getMode()}`));
-    ctx.chatLines.push(ctx.muted('  /ui essential — chat 전체화면 (기본) · /ui rich — full dashboard (VW·grid·dock)'));
     ctx.setChatScrollOffset(-1);
   });
 
@@ -2559,7 +2251,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     if (sub === 'runs') {
       if (args.length !== 1) return usage('/harness runs');
       const { queryRunningRuns, renderRunningRuns } = await import('../../self-implement/running-runs.js');
-      const result = queryRunningRuns({ includeTest: false });
+      const result = queryRunningRuns({ includeTest: false, caller: 'dashboard' });
       // Keep the TUI transcript readable while preserving the renderer's full summary.
       const visibleRunLimit = 8;
       const renderedLines = renderRunningRuns(result).split('\n');
@@ -3126,265 +2818,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     await ctx.ad.run(args);
     ctx.setChatScrollOffset(-1);
   });
-
-  registry.register(['workspace', 'ws', 'window', 'win'], (args, ctx) => {
-    // TUI 부활 T3 — essential 은 VW slash 표면 OFF (비가시 윈도우
-    // 생성/조작 방지). /ui rich 전환 즉시 복원.
-    if (ctx.uiModeSlash.getMode() !== 'rich') {
-      ctx.chatLines.push('');
-      ctx.chatLines.push(ctx.muted('  virtual workspace 는 rich 모드 전용 — /ui rich 로 전환하세요'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    // T2-P5 — virtual-window slash commands. Q2 (substrate Occam,
-    // 2026-05-03): primary name is now `/workspace`; `/window` `/win`
-    // `/ws` preserved as muscle-memory aliases. Internal terminology
-    // (VirtualWindow class, virtualWindows registry) will migrate in a
-    // follow-up — slash rename is the user-facing first step.
-    //
-    // Static-imported in this module: parseWindowCompanionSlash from
-    // ../windowing/companion-slash.js. The 7 spawn helpers + picker +
-    // companion toggle are showDashboard-local closures threaded via
-    // ctx.workspaceSlash.
-    const sub = (args[0] ?? '').toLowerCase();
-    const slashRuntime = ctx.workspaceSlash.slashRuntime;
-    const reg = ctx.workspaceSlash.registry;
-    if (!sub || sub === 'help') {
-      for (const line of slashRuntime.helpLines()) ctx.chatLines.push(line);
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'list') {
-      const current = reg.current();
-      ctx.chatLines.push(
-        ...slashRuntime.listLines(
-          reg.list().map((window) => ({
-            id: window.id,
-            title: window.title,
-            paneCount: window.listPanes().length,
-            isCurrent: window.id === current?.id,
-          })),
-        ),
-      );
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const spawnSubs: Record<string, (title: string) => number> = {
-      'new': ctx.workspaceSlash.spawnScratchVirtualWindow,
-      'browser': ctx.workspaceSlash.spawnBrowserVirtualWindow,
-      'preview': ctx.workspaceSlash.spawnPreviewVirtualWindow,
-      'browser-preview': ctx.workspaceSlash.spawnBrowserPreviewVirtualWindow,
-      'bp': ctx.workspaceSlash.spawnBrowserPreviewVirtualWindow,
-      'iul': ctx.workspaceSlash.spawnIulVirtualWindow,
-      'acp': ctx.workspaceSlash.spawnAcpVirtualWindow,
-      'sim': ctx.workspaceSlash.spawnSimVirtualWindow,
-    };
-    if (spawnSubs[sub]) {
-      type SpawnedFlavour = Parameters<DashboardWindowSlashRuntime['spawnedLine']>[0];
-      type FailedFlavour = Parameters<DashboardWindowSlashRuntime['spawnFailedLine']>[0];
-      const spawnedFlavour: SpawnedFlavour = sub === 'new' ? 'scratch'
-        : sub === 'bp' ? 'browser-preview'
-        : sub as SpawnedFlavour;
-      const failedFlavour: FailedFlavour = sub === 'bp' ? 'browser-preview' : sub as FailedFlavour;
-      const defaultTitlePrefix = sub === 'new' ? 'window'
-        : sub === 'bp' ? 'browser+preview'
-        : sub === 'iul' ? 'IUL UX Lab'
-        : sub === 'acp' ? 'ACP channels'
-        : sub === 'sim' ? 'Simulator'
-        : sub;
-      const title = args.slice(1).join(' ').trim() || `${defaultTitlePrefix} ${reg.list().length + 1}`;
-      try {
-        const id = spawnSubs[sub]!(title);
-        ctx.chatLines.push(slashRuntime.spawnedLine(spawnedFlavour, id, title));
-      } catch (err) {
-        ctx.chatLines.push(slashRuntime.spawnFailedLine(
-          failedFlavour,
-          err instanceof Error ? err.message : String(err),
-        ));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'switch') {
-      const id = parseInt(args[1] ?? '', 10);
-      if (!Number.isInteger(id)) {
-        ctx.chatLines.push(slashRuntime.switchInvalidIdLine());
-      } else if (!reg.switchTo(id)) {
-        ctx.chatLines.push(slashRuntime.switchMissingLine(id));
-      } else {
-        ctx.chatLines.push(slashRuntime.switchedLine(id));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'close') {
-      const raw = (args[1] ?? '').trim();
-      if (raw === 'all' || raw === '*') {
-        const ids = reg.list().map(w => w.id);
-        for (const id of ids) reg.close(id);
-        ctx.chatLines.push(slashRuntime.closeAllLine(ids.length));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const id = parseInt(raw, 10);
-      if (!Number.isInteger(id)) {
-        ctx.chatLines.push(slashRuntime.closeInvalidLine());
-      } else if (!reg.close(id)) {
-        ctx.chatLines.push(slashRuntime.closeMissingLine(id));
-      } else {
-        ctx.chatLines.push(slashRuntime.closedLine(id));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'closeall') {
-      const ids = reg.list().map(w => w.id);
-      for (const id of ids) reg.close(id);
-      ctx.chatLines.push(slashRuntime.closeAllLine(ids.length));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'picker') {
-      ctx.workspaceSlash.openWindowPicker();
-      return;
-    }
-    if (sub === 'companion' || sub === 'comp') {
-      const currentWindowId = reg.current()?.id ?? null;
-      const outcome = parseWindowCompanionSlash(args.slice(1), { currentWindowId });
-      if (!outcome.ok) {
-        ctx.chatLines.push(ctx.warning(`  ${outcome.message}`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      const { key, action, windowId } = outcome.value;
-      if (!reg.get(windowId)) {
-        ctx.chatLines.push(ctx.warning(`  no window with id ${windowId}`));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      if (action === 'toggle') {
-        const opened = ctx.workspaceSlash.toggleVwCompanion(windowId, key);
-        ctx.chatLines.push(slashRuntime.companionLine(action, opened, key, windowId));
-      } else {
-        ctx.workspaceSlash.setVwCompanionOpen(windowId, key, action === 'open');
-        ctx.chatLines.push(
-          slashRuntime.companionLine(action, action === 'open', key, windowId),
-        );
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    ctx.chatLines.push(slashRuntime.unknownSubcommandLine(sub));
-    ctx.setChatScrollOffset(-1);
-  });
-
-  // /codex-vw, /claude-vw, and /acp-vw have shared body but discriminate
-  // on cmdLower (passed via args[args.length] doesn't work — registry
-  // only delivers args. We register each name separately and pass the
-  // brand at registration time, matching the B-2.m /claude /codex /gemini
-  // pattern.). Each entry calls the same factory.
-  const buildAcpVwHandler = (cmdLower: 'acp-vw' | 'claude-vw' | 'codex-vw') =>
-    async (args: string[], ctx: DashboardSlashContext): Promise<void> => {
-      const subArg0 = (args[0] ?? '').toLowerCase();
-      const cwd = ctx.acpVwSlash.cwd();
-      const vwRegistry = ctx.acpVwSlash.vwRegistry;
-
-      // H5 P3 — claude-pty / gemini-pty adapters via embodied-agent bus.
-      if (cmdLower === 'acp-vw' && (subArg0 === 'clc' || subArg0 === 'claude-pty' || subArg0 === 'claude-code')) {
-        (async () => {
-          try {
-            const { spawnEmbodiedAgentInVW } = await import('../../agent/spawn-embodied-agent-in-vw.js');
-            const r = await spawnEmbodiedAgentInVW({ brand: 'claude-code', mode: 'hybrid', cwd });
-            ctx.chatLines.push(ctx.success(`  ✓ claude-code (pty) in win:${r.windowId} (pane:${r.paneId})`));
-            ctx.chatLines.push(ctx.muted(`    • H5 Embodied Agent Bus · session:${r.session.id} · pty:${r.ptyId}`));
-            ctx.chatLines.push(ctx.muted(`    • @pane:${r.paneId} inlines output in next LLM turn`));
-            void ctx.conv.openModal(r.session.id);
-          } catch (err) {
-            ctx.chatLines.push(ctx.error(`  /acp-vw clc failed: ${err instanceof Error ? err.message : String(err)}`));
-          }
-          ctx.setChatScrollOffset(-1);
-          ctx.draw();
-        })().catch(() => {});
-        return;
-      }
-      if (cmdLower === 'acp-vw' && (subArg0 === 'gem' || subArg0 === 'gemini' || subArg0 === 'gemini-cli')) {
-        (async () => {
-          try {
-            const { spawnEmbodiedAgentInVW } = await import('../../agent/spawn-embodied-agent-in-vw.js');
-            const r = await spawnEmbodiedAgentInVW({ brand: 'gemini', mode: 'hybrid', cwd });
-            ctx.chatLines.push(ctx.success(`  ✓ gemini (pty) in win:${r.windowId} (pane:${r.paneId})`));
-            ctx.chatLines.push(ctx.muted(`    • H5 Embodied Agent Bus · session:${r.session.id} · pty:${r.ptyId}`));
-            ctx.chatLines.push(ctx.muted(`    • @pane:${r.paneId} inlines output in next LLM turn`));
-            void ctx.conv.openModal(r.session.id);
-          } catch (err) {
-            ctx.chatLines.push(ctx.error(`  /acp-vw gem failed: ${err instanceof Error ? err.message : String(err)}`));
-          }
-          ctx.setChatScrollOffset(-1);
-          ctx.draw();
-        })().catch(() => {});
-        return;
-      }
-      // H6 P2 Bundle 2 A — local-llm embodied session via `lms chat <model>`.
-      if (cmdLower === 'acp-vw' && (subArg0 === 'lll' || subArg0 === 'local-llm' || subArg0 === 'lmstudio')) {
-        (async () => {
-          try {
-            const rawSpec = args.slice(1).join(' ').trim();
-            if (!rawSpec) {
-              ctx.chatLines.push(ctx.error(`  /acp-vw lll <model> · example: /acp-vw lll local:qwen3.5-35b-a3b`));
-              ctx.chatLines.push(ctx.muted(`    • run /llm models to list available models`));
-              ctx.setChatScrollOffset(-1);
-              ctx.draw();
-              return;
-            }
-            ctx.chatLines.push(ctx.muted(`  … launching local-llm '${rawSpec}'`));
-            ctx.setChatScrollOffset(-1);
-            ctx.draw();
-            const { spawnLocalLlmInVW } = await import('../../agent/spawn-local-llm-in-vw.js');
-            const r = await spawnLocalLlmInVW({ rawSpec, cwd });
-            ctx.chatLines.push(ctx.success(`  ✓ local-llm (pty) in win:${r.windowId} (pane:${r.paneId})`));
-            ctx.chatLines.push(ctx.muted(`    • H5 Embodied Agent Bus · session:${r.session.id} · pty:${r.ptyId}`));
-            ctx.chatLines.push(ctx.muted(`    • @pane:${r.paneId} inlines output in next LLM turn`));
-            void ctx.conv.openModal(r.session.id);
-          } catch (err) {
-            ctx.chatLines.push(ctx.error(`  /acp-vw lll failed: ${err instanceof Error ? err.message : String(err)}`));
-          }
-          ctx.setChatScrollOffset(-1);
-          ctx.draw();
-        })().catch(() => {});
-        return;
-      }
-      // Default: spawn coding-agent (codex via ACP live · claude via dispatchSpawnCodingAgentInVW).
-      const brand: 'claude-code' | 'codex' =
-        cmdLower === 'codex-vw' ? 'codex'
-        : cmdLower === 'claude-vw' ? 'claude-code'
-        : (subArg0 === 'codex' ? 'codex' : 'claude-code');
-      (async () => {
-        try {
-          if (brand === 'codex') {
-            // PLAN-tui-redundancy-cleanup T1 (2026-05-16) — `codex-vw`
-            // (vw-live-bridge spawn) 트림. backend chip 의 codex 선택 +
-            // chat panel 의 main ACP wire 가 동일 capability 제공.
-            ctx.chatLines.push(ctx.muted(`  /${cmdLower} codex: deprecated — use chat panel with backend = codex-app-server.`));
-          } else {
-            const { dispatchSpawnCodingAgentInVW } = await import('../../skills/tools/spawn-coding-agent-vw.js');
-            const r = await dispatchSpawnCodingAgentInVW(
-              { brand, cwd },
-              { registry: vwRegistry as Parameters<typeof dispatchSpawnCodingAgentInVW>[1] extends { registry?: infer R } | undefined ? R : never },
-            );
-            ctx.chatLines.push(ctx.success(`  ✓ ${brand} running in win:${r.windowId} (pane:${r.paneId})`));
-            ctx.chatLines.push(ctx.muted(`    • @pane:${r.paneId} inlines recent output in the next LLM turn`));
-            ctx.chatLines.push(ctx.muted('    • PaneInject queues input (approval-gated)'));
-          }
-        } catch (err) {
-          ctx.chatLines.push(ctx.error(`  /${cmdLower} failed: ${err instanceof Error ? err.message : String(err)}`));
-        }
-        ctx.setChatScrollOffset(-1);
-        ctx.draw();
-      })().catch(() => {});
-    };
-  registry.register('acp-vw', buildAcpVwHandler('acp-vw'));
-  registry.register('claude-vw', buildAcpVwHandler('claude-vw'));
-  registry.register('codex-vw', buildAcpVwHandler('codex-vw'));
 
   // ── B-3.c.2 ───────────────────────────────────────────────────────
 
@@ -4852,7 +4285,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
         ctx.setChatScrollOffset(-1);
         return;
       }
-      const cfg = getUserConfig();
+      const cfg = ctx.telegramReport?.getConfig() ?? getUserConfig();
       const { resolveReportTarget, sendTelegramReport } = await import('../../telegram-report.js');
       const target = resolveReportTarget(cfg);
       if (!target) {
@@ -4861,7 +4294,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
         return;
       }
       try {
-        await sendTelegramReport(cfg, msg);
+        await (ctx.telegramReport?.send ?? sendTelegramReport)(cfg, msg);
         ctx.chatLines.push(ctx.success(`  ✓ report sent to chat ${target.chatId}`));
       } catch (e: unknown) {
         const m = e instanceof Error ? e.message : String(e);
@@ -5315,19 +4748,20 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     } else if (sub === 'path') {
       ctx.pushDebugLine(ctx.muted(`  debug log path: ${debug.path()}`));
     } else {
-      ctx.pushDebugLine(ctx.undo.bold(
+      const output = (line: string): void => { ctx.pushDebugLine(line); ctx.chatLines.push(line); };
+      output(ctx.undo.bold(
         `  debug:  file=${debug.isFileEnabled() ? ctx.success('ON') : ctx.muted('OFF')}  ` +
         `mirror=${debug.isMirrorEnabled() ? ctx.success('ON') : ctx.muted('OFF')}  ` +
         `diag=${debug.isDiagEnabled() ? ctx.warning('ON') : ctx.muted('OFF')}  ` +
         `verbose=${debug.isVerboseEnabled() ? ctx.warning('ON') : ctx.muted('OFF')}  ` +
         `level=${debug.level()}`,
       ));
-      ctx.pushDebugLine(ctx.muted(`  log: ${debug.path()}`));
-      ctx.pushDebugLine(ctx.muted('  quick: /debug on (mirror+file)  /debug off  /debug file (quiet trail)  /debug diag (loud trail)'));
-      ctx.pushDebugLine(ctx.muted('  fine:  /debug mirror on|off  /debug file on|off  /debug diag on|off  /debug verbose on|off  /debug level off|trail|diag|normal|detail'));
-      ctx.pushDebugLine(ctx.muted('  log view: /debug filter [query|clear]  /debug tail [N]  /debug clear  /debug trace [<turn-suffix>]'));
-      ctx.pushDebugLine(ctx.muted('  surfaces: /debug window [open|close|toggle]  /debug popup [events|detail|stack|prompts|all] [open|close|toggle]  /debug workbench [open|close|toggle]'));
-      ctx.pushDebugLine(ctx.muted('  misc:  /debug toggle | tail [N] | clear | path | view | status'));
+      output(ctx.muted(`  log: ${debug.path()}`));
+      output(ctx.muted('  quick: /debug on (mirror+file)  /debug off  /debug file (quiet trail)  /debug diag (loud trail)'));
+      output(ctx.muted('  fine:  /debug mirror on|off  /debug file on|off  /debug diag on|off  /debug verbose on|off  /debug level off|trail|diag|normal|detail'));
+      output(ctx.muted('  log view: /debug filter [query|clear]  /debug tail [N]  /debug clear  /debug trace [<turn-suffix>]'));
+      output(ctx.muted('  surfaces: /debug window [open|close|toggle]  /debug popup [events|detail|stack|prompts|all] [open|close|toggle]  /debug workbench [open|close|toggle]'));
+      output(ctx.muted('  misc:  /debug toggle | tail [N] | clear | path | view | status'));
     }
     ctx.setChatScrollOffset(-1);
   });
@@ -5715,46 +5149,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
 
   // ── B-2.x ─────────────────────────────────────────────────────────
 
-  registry.register(['skill-triggers', 'triggers'], (args, ctx) => {
-    // Phase 3 debug — show the triggers the router sees for a given
-    // skill, split by provenance (explicit vs auto-extracted from
-    // description). Useful when tuning a SKILL.md description so
-    // routing fires right.
-    const target = args[0];
-    const idx = getSkillIndex();
-    ctx.chatLines.push('');
-    if (!target) {
-      ctx.chatLines.push(...ctx.skill.triggersSlashRuntime.usageLines());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (target === '*') {
-      ctx.chatLines.push(...ctx.skill.triggersSlashRuntime.summaryLines(
-        idx.map((entry) => ({
-          name: entry.name,
-          explicitCount: entry.triggers.length,
-          extractedCount: entry.extractedTriggers.length,
-          triggerSource: entry.triggerSource,
-        })),
-      ));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const entry = idx.find(e => e.name === target);
-    if (!entry) {
-      ctx.chatLines.push(ctx.skill.triggersSlashRuntime.missingSkillLine(target));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    ctx.chatLines.push(...ctx.skill.triggersSlashRuntime.detailLines({
-      name: target,
-      triggerSource: entry.triggerSource,
-      triggers: entry.triggers,
-      extractedTriggers: entry.extractedTriggers,
-      autoTrigger: entry.autoTrigger,
-    }));
-    ctx.setChatScrollOffset(-1);
-  });
 
   registry.register(['run-skill', 'rs', 'run'], async (args, ctx) => {
     const skillArg = args[0];
@@ -5865,278 +5259,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.draw();
   });
 
-  // ── B-2.v ─────────────────────────────────────────────────────────
-
-  registry.register(['scratch', 'sc'], (args, ctx) => {
-    // `/scratch <text>`        — replace scratchpad with text.
-    // `/scratch + <text>`      — append (current + blank + text).
-    // `/scratch clear`         — empty scratchpad.
-    // `/scratch dump`          — copy scratchpad lines into the log.
-    // `/scratch memo`          — interactive multi-line memo capture
-    //                            (Ctrl+S save / Esc cancel).
-    const sub = (args[0] ?? '').toLowerCase();
-    if (sub === 'open' || sub === 'show') {
-      if (ctx.scratch.isClosed()) {
-        ctx.scratch.open();
-        ctx.chatLines.push(ctx.scratch.slashRuntime.reopenedLine());
-      } else {
-        ctx.chatLines.push(ctx.scratch.slashRuntime.alreadyOpenLine());
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'popup' || sub === 'companion') {
-      const mode = (args[1] ?? 'toggle').toLowerCase();
-      if (mode === 'open' || mode === 'show') {
-        ctx.scratch.popup.open();
-        ctx.chatLines.push(ctx.scratch.slashRuntime.popupLine(true));
-      } else if (mode === 'close' || mode === 'hide') {
-        ctx.scratch.popup.close();
-        ctx.chatLines.push(ctx.scratch.slashRuntime.popupLine(false));
-      } else if (mode === 'toggle' || mode === 't') {
-        const opened = ctx.scratch.popup.toggle();
-        ctx.chatLines.push(ctx.scratch.slashRuntime.popupLine(opened));
-      } else if (mode === 'promote' || mode === 'foreground') {
-        ctx.scratch.popup.promote();
-        ctx.chatLines.push(ctx.scratch.slashRuntime.popupPromotedLine());
-      } else {
-        ctx.chatLines.push(ctx.scratch.slashRuntime.popupUsageLine());
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'close' || sub === 'hide') {
-      if (!ctx.scratch.isClosed()) {
-        ctx.scratch.close();
-        ctx.chatLines.push(ctx.scratch.slashRuntime.closedLine());
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'clear' || sub === 'cls') {
-      ctx.scratch.clear();
-      ctx.chatLines.push(ctx.scratch.slashRuntime.clearedLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'dump' || sub === 'log') {
-      const currentScratch = ctx.scratch.currentForCommand();
-      if (currentScratch.lines.length === 0) {
-        ctx.chatLines.push(ctx.scratch.slashRuntime.emptyDumpLine());
-      } else {
-        ctx.chatLines.push(ctx.scratch.slashRuntime.dumpHeaderLine(currentScratch.title));
-        for (const ln of ctx.scratch.buildDumpLines(currentScratch.lines)) ctx.chatLines.push(ln);
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'memo' || sub === 'm') {
-      ctx.scratch.openMemo();
-      ctx.chatLines.push(ctx.scratch.slashRuntime.memoOpenedLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (args.length === 0) {
-      ctx.chatLines.push(ctx.scratch.slashRuntime.usageLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    // Append vs replace based on a leading `+` token.
-    if (args[0] === '+') {
-      const body = args.slice(1).join(' ');
-      const snapshot = ctx.scratch.snapshotForAppend();
-      const next = snapshot.lines.length
-        ? [...snapshot.lines, '', ...body.split('\n')]
-        : body.split('\n');
-      ctx.scratch.setText(snapshot.title || 'Note', next);
-    } else {
-      ctx.scratch.setText('Note', args.join(' ').split('\n'));
-    }
-  });
-
-  // ── B-2.u ─────────────────────────────────────────────────────────
-
-  registry.register('git', async (args, ctx) => {
-    // GT3 — read-only git inspection.
-    //   /git / /git status     → porcelain summary
-    //   /git branch [list]     → list all branches
-    //   /git log [N]           → last N commits (default 5)
-    //   /git diff              → git diff HEAD (unified)
-    //   /git remote            → git remote -v
-    const swd = getSessionCwd();
-    const gitView = getGitStatusView(swd);
-    if (!gitView.head) {
-      ctx.pushDebugLine(ctx.warning('  /git: not inside a git repo (session cwd has no .git)'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const sub = (args[0] || 'status').toLowerCase();
-    const { runGitCommand } = await import('../../git-fs/runner.js');
-    const runGitCmd = (a: string[]): { out: string; status: number } => {
-      const r = runGitCommand(swd, a, {
-        encoding: 'utf8', timeout: 10_000,
-        maxBuffer: 4 * 1024 * 1024,
-      });
-      return { out: r.stdout + r.stderr, status: r.status ?? -1 };
-    };
-    if (sub === 'status' || sub === '') {
-      refreshGitDirty(swd, { force: true });
-      const v = getGitStatusView(swd);
-      ctx.pushDebugLine(ctx.undo.bold(`  git — ${v.head!.branch ?? `HEAD@${v.head!.sha?.slice(0, 7)}`}  ${v.head!.isWorktree ? '(worktree)' : ''}`));
-      if (v.dirty) {
-        ctx.pushDebugLine(ctx.muted(`  staged=${v.dirty.staged}  modified=${v.dirty.modified}  untracked=${v.dirty.untracked}  total=${v.dirty.total}`));
-      }
-      if (v.aheadBehind) {
-        ctx.pushDebugLine(ctx.muted(`  upstream: ahead ${v.aheadBehind.ahead}  behind ${v.aheadBehind.behind}`));
-      }
-      const { out } = runGitCmd(['status', '--short']);
-      for (const line of out.split('\n').filter(Boolean).slice(0, 40)) {
-        ctx.pushDebugLine(ctx.muted(`  ${line}`));
-      }
-    } else if (sub === 'branch') {
-      const sub2 = (args[1] || 'list').toLowerCase();
-      if (sub2 === 'list' || sub2 === 'ls') {
-        const branches = listGitBranches(swd, gitView.head);
-        const locals = branches.filter(b => !b.isRemote);
-        const remotes = branches.filter(b => b.isRemote);
-        ctx.pushDebugLine(ctx.undo.bold(`  branches — ${locals.length} local, ${remotes.length} remote`));
-        for (const b of locals) {
-          const mark = b.isHead ? ctx.success('▸ ') : '  ';
-          ctx.pushDebugLine(ctx.muted(`  ${mark}${b.name}  ${b.sha.slice(0, 7)}`));
-        }
-        if (remotes.length) {
-          ctx.pushDebugLine(ctx.muted('  — remotes —'));
-          for (const b of remotes.slice(0, 20)) {
-            ctx.pushDebugLine(ctx.muted(`    ${b.name}  ${b.sha.slice(0, 7)}`));
-          }
-        }
-      } else {
-        ctx.pushDebugLine(ctx.warning('  /git branch [list]'));
-      }
-    } else if (sub === 'log') {
-      const n = Math.max(1, Math.min(50, Number.parseInt(args[1] ?? '5', 10) || 5));
-      const { out, status } = runGitCmd([
-        'log', `-n${n}`, '--pretty=format:%h %ad  %s', '--date=short',
-      ]);
-      if (status !== 0) {
-        ctx.pushDebugLine(ctx.warning(`  /git log failed: ${out.trim()}`));
-      } else {
-        ctx.pushDebugLine(ctx.undo.bold(`  last ${n} commits`));
-        for (const line of out.split('\n').filter(Boolean)) {
-          ctx.pushDebugLine(ctx.muted(`  ${line}`));
-        }
-      }
-    } else if (sub === 'diff') {
-      const { out } = runGitCmd(['diff', 'HEAD', '--stat']);
-      if (!out.trim()) {
-        ctx.pushDebugLine(ctx.muted('  no diff against HEAD — clean working tree'));
-      } else {
-        ctx.pushDebugLine(ctx.undo.bold('  diff --stat vs HEAD'));
-        for (const line of out.split('\n').filter(Boolean).slice(0, 60)) {
-          ctx.pushDebugLine(ctx.muted(`  ${line}`));
-        }
-      }
-    } else if (sub === 'remote') {
-      const { out } = runGitCmd(['remote', '-v']);
-      if (!out.trim()) {
-        ctx.pushDebugLine(ctx.muted('  (no remotes)'));
-      } else {
-        for (const line of out.split('\n').filter(Boolean)) {
-          ctx.pushDebugLine(ctx.muted(`  ${line}`));
-        }
-      }
-    } else {
-      ctx.pushDebugLine(ctx.warning('  usage: /git [status | branch [list] | log [N] | diff | remote]'));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
-
-  // ── B-2.t ─────────────────────────────────────────────────────────
-
-  // F1 (2026-05-04) — Renamed from `/compact` to `/memorize`
-  // (alias `mem-compact`) to resolve the duplicate registration with
-  // the Wave 5 PR #1481 4-layer pipeline `/compact` (line ~3126
-  // below). Both registered the same `compact` name, causing
-  // `SlashCommandRegistry: duplicate registration for 'compact'`
-  // and blocking baseline scenario boot.
-  //
-  // Naming rationale: this handler's unique feature is
-  // `appendCompactToMemory` — writing the summary to MEMORY.md's
-  // "Recent work" section + resetting history. The Wave 5 pipeline
-  // (`/compact`) does in-context 4-layer reduction without MEMORY.md
-  // touch. So:
-  //   - `/compact` → 4-layer pipeline (in-context reduction)
-  //   - `/memorize` → summarize-and-archive to MEMORY.md + reset
-  //
-  // The `mem-compact` alias preserves the legacy semantic for users
-  // who muscle-memory `/compact` for the MEMORY.md flow.
-  registry.register(['memorize', 'mem-compact'], async (args, ctx) => {
-    // WF6 — summarise the current conversation, append to MEMORY.md's
-    // "Recent work", and reset chat.history (keeping the system
-    // message). Optional --preserve N keeps the last N turns in
-    // context.
-    const {
-      compactConversation,
-      compactConversationPartial,
-      appendCompactToMemory,
-    } = await import('../../compact/index.js');
-    const { renderCompactBoundary } = await import('../../chat/compact-boundary.js');
-    const preserveArg = args.find((a) => a.startsWith('--preserve'));
-    const partial = args.includes('--partial');
-    const preserveLastN = preserveArg
-      ? Math.max(0, Number.parseInt(preserveArg.split('=')[1] ?? args[args.indexOf(preserveArg) + 1] ?? '0', 10) || 0)
-      : partial ? 2 : 0;
-    const history = ctx.compact.getHistory();
-    ctx.pushDebugLine(ctx.muted(`[compact] summarising ${history.filter(m => m.role !== 'system').length} turns${partial ? ` (partial, keeping last ${preserveLastN})` : ''}…`));
-    ctx.setChatScrollOffset(-1);
-    try { ctx.draw(); } catch { /* noop */ }
-    try {
-      // The compact helpers expect LLMMessage[]; the host owns the
-      // typed array. Cast through unknown — same pattern the inline
-      // case used.
-      const compactHistory = history as unknown as Parameters<typeof compactConversation>[0];
-      let upToIndex = compactHistory.length - 1;
-      if (partial) {
-        let trailing = preserveLastN;
-        upToIndex = -1;
-        for (let i = compactHistory.length - 1; i >= 0; i--) {
-          if (compactHistory[i]!.role === 'system') continue;
-          if (trailing > 0) {
-            trailing--;
-            continue;
-          }
-          upToIndex = i;
-          break;
-        }
-      }
-      const { summary } = partial
-        ? await compactConversationPartial(compactHistory, { preserveLastN, upToIndex })
-        : await compactConversation(compactHistory, { preserveLastN });
-      if (summary) {
-        const { path } = await appendCompactToMemory(summary);
-        ctx.pushDebugLine(ctx.success(`[compact] summary appended to ${path}`));
-        const sections = ['Goal', 'Instructions', 'Discoveries', 'Accomplished', 'Relevant files / directories']
-          .filter((name) => summary.includes(`## ${name}`));
-        ctx.pushDebugLine(ctx.muted(`[compact] sections: ${sections.join(', ') || '(none)'}`));
-      } else {
-        ctx.pushDebugLine(ctx.muted('[compact] nothing to summarise'));
-      }
-      // Reset history, keep the system message, keep preserveLastN trailing turns.
-      const sys = history.find((m) => m.role === 'system');
-      const tail = history.filter((m) => m.role !== 'system').slice(-preserveLastN);
-      history.length = 0;
-      if (sys) history.push(sys);
-      for (const t of tail) history.push(t);
-      ctx.pushChatLine(renderCompactBoundary(
-        partial ? 'partial' : 'manual',
-        partial && preserveLastN > 0 ? `last ${preserveLastN}` : undefined,
-      ));
-      ctx.pushDebugLine(ctx.muted(`[compact] history reset${preserveLastN ? ` (kept last ${preserveLastN} turns)` : ''}`));
-    } catch (err) {
-      ctx.pushDebugLine(ctx.warning(`[compact] failed: ${err instanceof Error ? err.message : String(err)}`));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
   // ── B-2.s ─────────────────────────────────────────────────────────
 
@@ -6339,92 +5461,8 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
 
   // ── B-2.q ─────────────────────────────────────────────────────────
 
-  registry.register(['sim', 'simulator'], async (args, ctx) => {
-    const sub = (args[0] || 'open').toLowerCase();
-    ctx.chatLines.push('');
-    ctx.chatLines.push(ctx.accent(`❯ /sim ${args.join(' ').trim() || 'open'}`));
-    if (sub === 'help') {
-      for (const line of ctx.sim.slashRuntime.usageLines()) ctx.chatLines.push(line);
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'open') {
-      const id = ctx.sim.spawnVirtualWindow();
-      ctx.chatLines.push(ctx.sim.slashRuntime.openedLine(id));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'web') {
-      const result = await ctx.sim.openWebCockpit();
-      ctx.chatLines.push(ctx.sim.slashRuntime.openedWebLine(result.path));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'list' || sub === 'ls') {
-      for (const line of ctx.sim.slashRuntime.listLines(ctx.sim.listScenarios())) ctx.chatLines.push(line);
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (sub === 'run') {
-      const scenarioId = ctx.sim.resolveScenarioId(args[1] || '');
-      if (!scenarioId) {
-        ctx.chatLines.push(ctx.sim.slashRuntime.unknownScenarioLine(args[1] || ''));
-        ctx.setChatScrollOffset(-1);
-        return;
-      }
-      ctx.chatLines.push(ctx.sim.slashRuntime.runHeading(scenarioId));
-      const result = await ctx.sim.runById(scenarioId);
-      for (const line of result.lines) {
-        ctx.chatLines.push(result.status === 'error' ? ctx.warning(`  ${line}`) : ctx.muted(`  ${line}`));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    for (const line of ctx.sim.slashRuntime.usageLines()) ctx.chatLines.push(line);
-    ctx.setChatScrollOffset(-1);
-  });
 
   // ── B-2.p ─────────────────────────────────────────────────────────
-
-  registry.register(['view', 'v'], (args, ctx) => {
-    // `/view <id|label|shortcut>` switches configured views.
-    // `/view list`, `/view next`, `/view prev`, `/view reload`
-    // expose the yazi-style user-config registry.
-    const sub = (args[0] ?? '').trim();
-    if (sub === 'list' || sub === 'ls') {
-      ctx.chatLines.push(...ctx.view.slashRuntime.listLines(ctx.view.buildListItems()));
-      const closed = ctx.view.closedPaneLabels();
-      if (closed.length > 0) {
-        ctx.chatLines.push(...ctx.view.slashRuntime.closedPaneLines(closed));
-      }
-    } else if (sub === 'next' || sub === '+') {
-      ctx.view.next();
-    } else if (sub === 'prev' || sub === '-') {
-      ctx.view.prev();
-    } else if (sub === 'reload') {
-      ctx.view.reload();
-      ctx.chatLines.push(ctx.view.slashRuntime.reloadedLine());
-    } else if (sub === 'save') {
-      ctx.view.save();
-      ctx.chatLines.push(ctx.view.slashRuntime.savedLine());
-    } else if (sub === 'restore') {
-      ctx.view.restoreAllClosed();
-      ctx.chatLines.push(ctx.view.slashRuntime.restoredLine());
-    } else if (sub === 'reset') {
-      ctx.view.reset();
-      ctx.chatLines.push(ctx.view.slashRuntime.resetLine());
-    } else if (sub === 'export') {
-      const json = ctx.view.exportConfigJson();
-      ctx.view.openDetailViewer('Dashboard Views JSON', json.split('\n'));
-      ctx.chatLines.push(ctx.view.slashRuntime.exportedLine());
-    } else {
-      const opened = ctx.view.openByQuery(sub);
-      if (!opened) {
-        ctx.chatLines.push(ctx.view.slashRuntime.usageLine());
-      }
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
   // ── B-2.o ─────────────────────────────────────────────────────────
 
@@ -6437,65 +5475,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
 
   // ── B-2.n ─────────────────────────────────────────────────────────
 
-  registry.register(['turn-slider', 'turnslider', 'tslider'], async (args, ctx) => {
-    // Arc 2.3 (PLAN §4.7) — render the UndoTurn time-travel slider as
-    // text. Reads the existing snapshot ring; pure read-only display
-    // + an explicit `restore` sub-command that delegates to the same
-    // backend /undo uses.
-    //   /turn-slider             → bar + detail
-    //   /turn-slider <id>        → move cursor to <id>
-    //   /turn-slider restore     → restore to current cursor
-    //   /turn-slider restore <id>→ restore to specified id
-    const {
-      buildSliderState, setSliderCursor, renderSliderDetail,
-      restoreToCursor,
-    } = await import('../../undo-turn/index.js');
-    const sub = (args[0] || '').trim();
-
-    if (sub === 'restore') {
-      let state = buildSliderState();
-      const targetId = (args[1] || '').trim();
-      if (targetId) {
-        const idx = state.entries.findIndex((e) => e.id === targetId || e.shaShort === targetId);
-        if (idx === -1) {
-          ctx.pushDebugLine(ctx.warning(`  /turn-slider: no snapshot matches "${targetId}"`));
-          ctx.setChatScrollOffset(-1);
-          return;
-        }
-        state = setSliderCursor(state, idx);
-      }
-      const result = restoreToCursor(state);
-      if (result.ok) {
-        ctx.pushDebugLine(ctx.success(`  ✓ /turn-slider: restored — ${result.summary}`));
-        try { ctx.undo.refreshGitDirty(); } catch { /* noop */ }
-      } else {
-        ctx.pushDebugLine(ctx.error(`  /turn-slider: ${result.error ?? result.summary}`));
-      }
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-
-    // Default: render bar + detail. Optional positional arg moves the
-    // cursor to a specific id before rendering so the user can scrub
-    // by typing.
-    let state = buildSliderState();
-    if (sub) {
-      const idx = state.entries.findIndex((e) => e.id === sub || e.shaShort === sub);
-      if (idx >= 0) state = setSliderCursor(state, idx);
-    }
-    const lines = renderSliderDetail(state);
-    ctx.pushDebugLine(ctx.undo.bold('  /turn-slider'));
-    for (const line of lines) {
-      if (/^\(no/.test(line)) ctx.pushDebugLine(ctx.muted('  ' + line));
-      else if (/^turn /.test(line)) ctx.pushDebugLine(ctx.accent('  ' + line));
-      else if (/description:/.test(line)) ctx.pushDebugLine(ctx.muted('  ' + line));
-      else ctx.pushDebugLine('  ' + line);
-    }
-    if (state.entries.length > 0) {
-      ctx.pushDebugLine(ctx.muted('  → /turn-slider <id|sha7> to scrub · /turn-slider restore [id] to restore'));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
   // ── B-2.m ─────────────────────────────────────────────────────────
 
@@ -6605,17 +5584,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
 
   // ── B-2.j ─────────────────────────────────────────────────────────
 
-  registry.register('playground', async (args, ctx) => {
-    // F-B2 — declarative scenario harness. Usage:
-    //   /playground [list]           → enumerate registered scenarios
-    //   /playground run <id> [-v]    → execute + print result
-    // Default scenarios (dialog/picker/theme) are registered once per
-    // process at init; follow-up arcs can append via
-    // `getDefaultScenarioRegistry().register(...)`.
-    const lines = await ctx.playground.runCommand(args);
-    for (const l of lines) ctx.chatLines.push(ctx.text(l));
-    ctx.setChatScrollOffset(-1);
-  });
 
   // ── B-2.i ─────────────────────────────────────────────────────────
 
@@ -6656,48 +5624,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
 
   // ── B-2.h ─────────────────────────────────────────────────────────
 
-  registry.register(['pty-pane', 'pty-view'], async (args, ctx) => {
-    // V3 (DESIGN-background-terminal-port.md §5 V3): open a
-    // VirtualWindow containing a pty-tail pane that live-renders an
-    // already-spawned registry PTY. Usage:
-    //   /pty-pane              — auto-pick when exactly 1 alive
-    //   /pty-pane <pty_id>     — pick by id (partial ok)
-    const { listPty: lp, ptyAvailable: pa } = await import('../../pty-shell/registry.js');
-    if (!pa()) {
-      ctx.chatLines.push(ctx.warning('  PtyShell unavailable — node-pty not installed'));
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const live = lp().filter(h => h.isAlive());
-    const target = (() => {
-      const wanted = (args[0] ?? '').trim();
-      if (!wanted) {
-        if (live.length === 0) return { err: 'no live PTY shells — spawn one via PtyShellStart first' };
-        if (live.length > 1) return { err: `${live.length} PTYs alive; pass an id (see /pty-list)` };
-        return { handle: live[0]! };
-      }
-      const match = live.find(h => h.id === wanted)
-        ?? live.find(h => h.id.startsWith(wanted))
-        ?? lp().find(h => h.id === wanted);
-      if (!match) return { err: `no PTY matches "${wanted}"` };
-      return { handle: match };
-    })();
-    if ('err' in target) {
-      ctx.pushDebugLine(ctx.warning(`  ${target.err}`));
-    } else {
-      try {
-        const w = ctx.ptyPane.spawnPtyTailWindow({
-          title: `pty:${target.handle.id}`,
-          ptyId: target.handle.id,
-        });
-        ctx.pushDebugLine(ctx.success(`  opened win:${w.id} tailing ${target.handle.id}`));
-      } catch (e) {
-        ctx.pushDebugLine(ctx.warning(`  could not open pane: ${e instanceof Error ? e.message : String(e)}`));
-      }
-    }
-    ctx.setChatScrollOffset(-1);
-  });
-
   // ── B-2.g ─────────────────────────────────────────────────────────
 
   registry.register('undo', async (args, ctx) => {
@@ -6716,14 +5642,15 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     const sub = (args[0] || '').toLowerCase();
     if (sub === 'list' || sub === 'ls') {
       const snaps = listSnapshots();
+      const output = (line: string): void => { ctx.pushDebugLine(line); ctx.chatLines.push(line); };
       if (snaps.length === 0) {
-        ctx.pushDebugLine(ctx.muted('  /undo: no snapshots yet'));
+        output(ctx.muted('  /undo: no snapshots yet'));
       } else {
-        ctx.pushDebugLine(ctx.undo.bold(`  undo history — ${snaps.length} snapshot${snaps.length === 1 ? '' : 's'} (newest last)`));
+        output(ctx.undo.bold(`  undo history — ${snaps.length} snapshot${snaps.length === 1 ? '' : 's'} (newest last)`));
         for (const s of snaps) {
           const ageSec = Math.round((Date.now() - s.capturedAt) / 1000);
           const desc = s.description ? ` · ${s.description.slice(0, 60)}` : '';
-          ctx.pushDebugLine(ctx.muted(`  ${s.id}  ${s.sha.slice(0, 7)}  ${ageSec}s ago${desc}`));
+          output(ctx.muted(`  ${s.id}  ${s.sha.slice(0, 7)}  ${ageSec}s ago${desc}`));
         }
       }
     } else if (sub === 'clear') {
@@ -6760,24 +5687,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
   });
 
   // ── B-2.f ─────────────────────────────────────────────────────────
-
-  registry.register(['fullscreen', 'fs'], (_args, ctx) => {
-    const current = terminalModalRouter.current();
-    if (!current) {
-      ctx.chatLines.push(ctx.terminal.fullscreenMissingLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const { cols: tc, rows: tr } = termSize();
-    if (current.isFullscreen(tc, tr)) {
-      current.exitFullscreen(tc, tr);
-      ctx.terminal.showFullscreenToast({ title: 'Fullscreen off' });
-    } else {
-      current.enterFullscreen(tc, tr);
-      ctx.terminal.showFullscreenToast({ title: 'Fullscreen on', lines: ['Esc to detach'] });
-    }
-    ctx.draw();
-  });
 
   // ── B-2.e ─────────────────────────────────────────────────────────
 
@@ -6887,17 +5796,18 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
       }
     } else if (sub === 'list') {
       const entries = listAllowed();
+      const output = (line: string): void => { ctx.pushDebugLine(line); ctx.chatLines.push(line); };
       if (entries.length === 0) {
-        ctx.pushDebugLine(ctx.muted('  api-allow: empty (api_call will refuse every URL)'));
-        ctx.pushDebugLine(ctx.muted('  add a host with /api-allow add <host>'));
+        output(ctx.muted('  api-allow: empty (api_call will refuse every URL)'));
+        output(ctx.muted('  add a host with /api-allow add <host>'));
       } else {
-        ctx.pushDebugLine(ctx.muted(`  api-allow: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`));
+        output(ctx.muted(`  api-allow: ${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}`));
         for (const e of entries) {
           const reason = e.reason ? ` — ${e.reason}` : '';
           const ageMin = Math.round((Date.now() - e.addedAt) / 60_000);
-          ctx.pushDebugLine(ctx.muted(`    ${e.host.padEnd(28)} added ${ageMin}m ago${reason}`));
+          output(ctx.muted(`    ${e.host.padEnd(28)} added ${ageMin}m ago${reason}`));
           const status = rateLimitStatus(`https://${e.host}/`);
-          ctx.pushDebugLine(ctx.muted(`      rate budget — host:${status.hostRemaining} global:${status.globalRemaining}`));
+          output(ctx.muted(`      rate budget — host:${status.hostRemaining} global:${status.globalRemaining}`));
         }
       }
     } else if (sub === 'clear') {
@@ -6923,15 +5833,16 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     const sub = (args[0] || '').trim();
     if (sub === 'list' || sub === 'ls') {
       const turns = listCheckpointTurns();
+      const output = (line: string): void => { ctx.pushDebugLine(line); ctx.chatLines.push(line); };
       if (turns.length === 0) {
-        ctx.pushDebugLine(ctx.muted('  /resume: no checkpoints on disk yet — invoke /pause mid-turn or run a decision-boundary tool first.'));
+        output(ctx.muted('  /resume: no checkpoints on disk yet — invoke /pause mid-turn or run a decision-boundary tool first.'));
       } else {
-        ctx.pushDebugLine(ctx.accent(`  resume — ${turns.length} checkpointed turn${turns.length === 1 ? '' : 's'} (newest first)`));
+        output(ctx.accent(`  resume — ${turns.length} checkpointed turn${turns.length === 1 ? '' : 's'} (newest first)`));
         for (const turn of turns.slice(0, 10)) {
-          ctx.pushDebugLine(ctx.muted(`  ${turn}`));
+          output(ctx.muted(`  ${turn}`));
         }
         if (turns.length > 10) {
-          ctx.pushDebugLine(ctx.muted(`  …${turns.length - 10} more`));
+          output(ctx.muted(`  …${turns.length - 10} more`));
         }
       }
       ctx.setChatScrollOffset(-1);
@@ -7000,67 +5911,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.setChatScrollOffset(-1);
   });
 
-  registry.register('branch', async (args, ctx) => {
-    // GT4 — git worktree mgmt mirrored at slash surface.
-    const { enterWorktreeRuntime, exitWorktreeRuntime, currentWorktreeSummary } =
-      await import('../../tool-runtime/git-worktree-runtimes.js');
-    const { getSessionCwd } = await import('../../session/working-dir.js');
-    const sub = (args[0] || 'list').toLowerCase();
-    const swd = getSessionCwd();
-    if (sub === 'list' || sub === 'ls') {
-      const summary = currentWorktreeSummary(swd);
-      if (!summary.repoRoot) {
-        ctx.pushDebugLine(ctx.warning('  /branch: not inside a git repo'));
-      } else {
-        ctx.pushDebugLine(ctx.accent(`  worktrees — ${summary.entries.length} total${summary.isWorktree ? ' (you are IN a secondary worktree)' : ''}`));
-        for (const e of summary.entries) {
-          const mark = e.isMain ? '★' : (e.path === swd ? '▸' : ' ');
-          const label = e.isDetached ? `(detached ${e.sha.slice(0, 7)})` : (e.branch ?? '');
-          ctx.pushDebugLine(ctx.muted(`  ${mark} ${e.path}  ${label}${e.isLocked ? ' [locked]' : ''}`));
-        }
-      }
-    } else if (sub === 'new') {
-      const name = args.slice(1).join(' ').trim();
-      if (!name) {
-        ctx.pushDebugLine(ctx.warning('  usage: /branch new <branch-name>'));
-      } else {
-        try {
-          const r = await enterWorktreeRuntime.run({ name }, { surface: 'tui' });
-          ctx.pushDebugLine(ctx.success(`  ${r.output}`));
-        } catch (err) {
-          ctx.pushDebugLine(ctx.error(`  /branch new: ${err instanceof Error ? err.message : String(err)}`));
-        }
-      }
-    } else if (sub === 'exit') {
-      const prune = args.slice(1).includes('prune');
-      const force = args.slice(1).includes('force');
-      try {
-        const r = await exitWorktreeRuntime.run({ prune, force }, { surface: 'tui' });
-        ctx.pushDebugLine(ctx.success(`  ${r.output}`));
-      } catch (err) {
-        ctx.pushDebugLine(ctx.error(`  /branch exit: ${err instanceof Error ? err.message : String(err)}`));
-      }
-    } else if (sub === 'switch' || sub === 'checkout') {
-      const target = args.slice(1).join(' ').trim();
-      if (!target) {
-        ctx.pushDebugLine(ctx.warning('  usage: /branch switch <branch>'));
-      } else {
-        const { runGitCommand } = await import('../../git-fs/runner.js');
-        const r = runGitCommand(swd, ['switch', target], {
-          encoding: 'utf8', timeout: 10_000,
-        });
-        if (r.status === 0) {
-          ctx.pushDebugLine(ctx.success(`  ✓ switched to ${target}`));
-        } else {
-          const msg = (r.stderr || r.stdout || '').trim();
-          ctx.pushDebugLine(ctx.error(`  /branch switch failed: ${msg}`));
-        }
-      }
-    } else {
-      ctx.pushDebugLine(ctx.warning('  usage: /branch [list | new <name> | exit [prune] [force] | switch <name>]'));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
   // ── B-2.b ─────────────────────────────────────────────────────────
 
@@ -7069,11 +5919,12 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     const sub = (args[0] || 'status').toLowerCase();
     if (sub === 'status' || sub === '') {
       const s = getPlanModeState();
+      const output = (line: string): void => { ctx.pushDebugLine(line); ctx.chatLines.push(line); };
       if (s.active) {
-        ctx.pushDebugLine(ctx.accent(`  plan mode: ${ctx.success('ACTIVE')}  (session ${s.sessionId}, phase ${s.phase})`));
-        ctx.pushDebugLine(ctx.muted(`  plan file: ${s.planFilePath}`));
+        output(ctx.accent(`  plan mode: ${ctx.success('ACTIVE')}  (session ${s.sessionId}, phase ${s.phase})`));
+        output(ctx.muted(`  plan file: ${s.planFilePath}`));
       } else {
-        ctx.pushDebugLine(ctx.muted('  plan mode: inactive — /plan start [title] to enter'));
+        output(ctx.muted('  plan mode: inactive — /plan start [title] to enter'));
       }
     } else if (sub === 'start') {
       const title = args.slice(1).join(' ').trim();
@@ -7128,83 +5979,16 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
       ctx.pushDebugLine(ctx.muted('  code-edit policy reset to default (ask-edit)'));
     } else {
       const p = getPolicy();
-      ctx.pushDebugLine(ctx.muted(`  code-edit policy: ${p.mode}${p.mode === 'trusted-dirs' && p.trustedDirs ? ` (${p.trustedDirs.length} dirs)` : ''}`));
+      const line = ctx.muted(`  code-edit policy: ${p.mode}${p.mode === 'trusted-dirs' && p.trustedDirs ? ` (${p.trustedDirs.length} dirs)` : ''}`);
+      ctx.pushDebugLine(line);
+      ctx.chatLines.push(line);
     }
     ctx.setChatScrollOffset(-1);
   });
 
   // ── B-2.a (medium-tier first round) ──────────────────────────────
 
-  registry.register('audit', (args, ctx) => {
-    // R4 — tail the control audit log. Default scope: input policy
-    // changes; `/audit all` shows every category. Optional --tail N /
-    // --since DUR.
-    const scope = (args[0] || 'input').toLowerCase();
-    let tailN = 20;
-    let sinceMs: number | undefined;
-    for (let i = 1; i < args.length; i++) {
-      const a = args[i]!;
-      if (a === '--tail' && i + 1 < args.length) {
-        const n = Number.parseInt(args[++i]!, 10);
-        if (Number.isFinite(n) && n > 0) tailN = n;
-      } else if (a === '--since' && i + 1 < args.length) {
-        const d = parseAuditDuration(args[++i]!);
-        if (d !== null) sinceMs = d;
-      }
-    }
-    const predicate = scope === 'all' ? undefined : isInputAuditEntry;
-    const result = readAuditTail({
-      ...(predicate ? { match: predicate } : {}),
-      tail: tailN,
-      ...(sinceMs !== undefined ? { sinceMs } : {}),
-    });
-    if (result.filesScanned.length === 0) {
-      ctx.pushDebugLine(ctx.muted('  [audit] no audit files found (today + yesterday checked)'));
-    } else if (result.entries.length === 0) {
-      const scopeLabel = scope === 'all' ? 'all' : 'input';
-      const sinceLabel = sinceMs !== undefined ? ` (within ${sinceMs}ms window)` : '';
-      ctx.pushDebugLine(ctx.muted(`  [audit] no ${scopeLabel} entries${sinceLabel}`));
-    } else {
-      const truncLabel = result.truncated ? ` (showing last ${tailN})` : '';
-      ctx.pushDebugLine(ctx.muted(`  [audit] ${scope}${truncLabel} — ${result.entries.length} entries`));
-      for (const e of result.entries) {
-        const line = formatAuditEntry(e);
-        ctx.pushDebugLine(e.ok ? ctx.text('    ' + line) : ctx.warning('    ' + line));
-      }
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
-  registry.register(['substrate-stats', 'sst'], (_args, ctx) => {
-    // Phase 5 — operator-on-demand observability for the 3-layer
-    // paint pipeline cache + L5 mount churn + F8 generation bumps.
-    const s = ctx.substrateStats;
-    const paintStats = s.paintCacheStats();
-    const overlayStats = s.overlayWriteStats();
-    const genStats = s.generationStats();
-    const f8Shadow = s.f8ShadowStats();
-    ctx.pushDebugLine(ctx.accent('  substrate stats'));
-    ctx.pushDebugLine(ctx.muted(
-      `    paint-cache  hits=${paintStats.hits}  misses=${paintStats.misses}  size=${paintStats.size}`,
-    ));
-    ctx.pushDebugLine(ctx.muted(
-      `    overlay      skipped=${overlayStats.skipped}  written=${overlayStats.written}`,
-    ));
-    ctx.pushDebugLine(ctx.muted(
-      `    f8 shadow    mode=${f8Shadow.mode ? 'ON' : 'off'}  divergences=${f8Shadow.divergences}`,
-    ));
-    if (genStats.length > 0) {
-      ctx.pushDebugLine(ctx.muted(`    bumps (top ${Math.min(5, genStats.length)})`));
-      const now = Date.now();
-      for (const e of genStats.slice(0, 5)) {
-        const ageS = Math.max(0, Math.round((now - e.lastBumpAt) / 1000));
-        ctx.pushDebugLine(ctx.muted(`      ${e.id}  bumps=${e.bumps}  age=${ageS}s`));
-      }
-    } else {
-      ctx.pushDebugLine(ctx.muted('    bumps        (none recorded)'));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
 
   registry.register('wd', async (args, ctx) => {
     // WD8 — session working directory control.
@@ -7215,8 +5999,11 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     if (args.length === 0 || sub === 'show' || sub === 'status') {
       const s = getSessionWorkingDir();
       const ageSec = Math.round((Date.now() - s.setAt) / 1000);
-      ctx.pushDebugLine(ctx.accent(`  session working dir: ${s.cwd}`));
-      ctx.pushDebugLine(ctx.muted(`  origin: ${s.origin}  ·  set ${ageSec}s ago`));
+      const location = ctx.accent(`  session working dir: ${s.cwd}`);
+      const origin = ctx.muted(`  origin: ${s.origin}  ·  set ${ageSec}s ago`);
+      ctx.pushDebugLine(location);
+      ctx.pushDebugLine(origin);
+      ctx.chatLines.push(location, origin);
     } else if (sub === 'reset') {
       const restored = initSessionWorkingDir(process.cwd());
       ctx.pushDebugLine(ctx.success(`  ✓ working dir reset to boot cwd → ${restored.cwd}`));
@@ -7524,15 +6311,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     }
   }, { immediateDuringStream: true });
 
-  registry.register(['usage', 'stats'], (_args, ctx) => {
-    const text = USAGE_SLASH_DESCRIPTOR.render();
-    for (const line of text.split('\n')) ctx.chatLines.push(line);
-    ctx.setChatScrollOffset(-1);
-  });
 
-  // /cost alias note: 'budget' is already taken by the B-1.d
-  // skill-tool budget slash (registered above), so we use only
-  // ['cost', 'spend'].
   // ── B4 (TUI half) — /design shows the craft-rulebook verdict ─────────
   // The same verdict `elanous repo design-check` prints and the PWA
   // `/design-check` panel renders, resolved through the SAME
@@ -7611,13 +6390,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
       return;
     }
     for (const line of result.logLines ?? []) ctx.chatLines.push(line);
-    ctx.setChatScrollOffset(-1);
-  });
-
-  // Interactive OAuth cannot finish inside this screen — name the CLI to type.
-  registry.register(['codex-setup', 'codex-init'], (_args, ctx) => {
-    ctx.chatLines.push('  Interactive OAuth cannot finish inside this screen.');
-    ctx.chatLines.push('  Type `elanous codex setup` in a terminal to continue.');
     ctx.setChatScrollOffset(-1);
   });
 

@@ -94,11 +94,13 @@ export class TaskGraph {
     // We only check for cycles.
     this.tasks.set(task.id, task);
     this.indexEdgesForAdd(task);
+    this.indexGoal(task);
     const cycle = this.detectCycleStartingAt(task.id);
     if (cycle) {
       // rollback
       this.tasks.delete(task.id);
       this.unindexEdgesForRemove(task);
+      this.unindexGoal(task);
       throw new TaskGraphError(
         'CYCLE_DETECTED',
         `Adding ${task.id} creates cycle: ${cycle.join(' → ')}`,
@@ -186,6 +188,21 @@ export class TaskGraph {
     return this.tasks.has(id);
   }
 
+  /** Restore a task after a persistence transaction fails, including a new insertion. */
+  restoreTask(id: string, previous?: Task): void {
+    const current = this.tasks.get(id);
+    if (current) {
+      this.tasks.delete(id);
+      this.unindexEdgesForRemove(current);
+      this.unindexGoal(current);
+    }
+    if (previous) {
+      this.tasks.set(id, previous);
+      this.indexEdgesForAdd(previous);
+      this.indexGoal(previous);
+    }
+  }
+
   size(): number {
     return this.tasks.size;
   }
@@ -265,6 +282,7 @@ export class TaskGraph {
     const promoted: Task[] = [];
     for (const t of this.tasks.values()) {
       if (t.status !== 'backlog' && t.status !== 'blocked') continue;
+      if (t.generatedBy?.kind === 'external' && t.approval?.state !== 'auto') continue;
       if (this.depsAllDone(t)) {
         const next = this.updateTask(t.id, { status: 'ready' }, opts);
         promoted.push(next);
@@ -412,7 +430,6 @@ export class TaskGraph {
       }
       set.add(task.id);
     }
-    this.indexGoal(task);
   }
 
   private unindexEdgesForRemove(task: Task): void {

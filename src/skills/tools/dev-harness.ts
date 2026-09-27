@@ -29,7 +29,8 @@ import { resolveMainRepoRoot } from '../../git-fs/worktree.js';
 import { describeEntranceCommand, lookupEntrance } from '../../self-dev/entrance-registry.js';
 
 const AUTO_DRIVES = ['off', 'safe', 'on'] as const;
-const RUN_DEV_HARNESS_ENTRANCE = lookupEntrance('nl-run-dev-harness');
+// ⛔ 모듈 평가 시점에 조회하지 않는다 — entrance-registry → native-tool-catalog → 이 파일의 순환에서
+//    registry 가 아직 초기화 중이면 `byId` TDZ 로 적재가 죽는다(🅞 2026-09-27 · test/intake-plane-draft.test.ts).
 const RUN_DEV_HARNESS_REPLACEMENT = 'SelfImplement 또는 SolveMission';
 const RUN_DEV_HARNESS_DESCRIPTION =
   'Use this tool when the user mentions the harness: forms such as "하니스로 개발", "하니스:", "하니스로 구현해줘", "하니스 구현", English "harness", or "self dev" mean the same even with Korean particles or punctuation. ' +
@@ -66,7 +67,7 @@ export function buildRunDevHarnessTool(): LLMToolSpec {
   return {
     name: 'RunDevHarness',
     description: describeEntranceCommand(
-      RUN_DEV_HARNESS_ENTRANCE,
+      lookupEntrance('nl-run-dev-harness'),
       RUN_DEV_HARNESS_REPLACEMENT,
       RUN_DEV_HARNESS_DESCRIPTION,
     ),

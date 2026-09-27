@@ -20,7 +20,8 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 | Menu | What it does |
 |---|---|
 | **Chat** | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](pwa-chat.md). |
-| **Terminal** | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, and a mirror of the terminal UI. See [Terminal](pwa-terminal.md). |
+| **Terminal** | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and (next release) a live view of an agent's terminal from a link. See [Terminal](pwa-terminal.md). |
+| **Intake** | *On main — next release.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](tasks-and-intake.md). |
 | **Vault** | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](pwa-vault.md). |
 | **Settings** | Models and tiers, voice and text-to-speech, persona, notifications, theme and daemon health. |
 | **Setup** (`/setup`) | First-time setup in the browser. Today it covers the LLM provider; the other wizard steps still run in the terminal with `elanous onboarding`. |
@@ -38,6 +39,24 @@ Other devices on the same tailnet can then open the link that
 `elanous nexus show` prints. Every device on your tailnet can reach it, so
 only share on a tailnet you trust. Turn it off with
 `elanous nexus pwa share disable`.
+
+### Connect each device once
+
+:::info On main — next release
+From the release after 0.2.2, a device that opens the web app through the
+tailnet link needs a token once. The browser on the daemon's own machine
+(`localhost`) does not.
+:::
+
+A device that is not connected yet shows a banner saying it is not
+connected to the daemon (인증 필요 — authentication needed). To connect it:
+
+1. On a device that already works, open **Settings › Connect token (other
+   devices)** and press **Generate connect token**, then copy it.
+2. On the new device, open **Settings › Daemon** and paste it into
+   **Bearer token**.
+
+The token is kept in that browser, so you do this once per browser.
 
 If the link stops working from another device, check
 `elanous nexus pwa share status` and run `elanous nexus pwa share enable`

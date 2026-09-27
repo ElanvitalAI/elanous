@@ -53,6 +53,9 @@ export interface SelfUpdateResult {
   /** 체크아웃에서 PWA 빌드가 성공한 HEAD 커밋(12자)과 빌드 시각. */
   pwaBuiltCommit?: string;
   pwaBuiltAt?: string;
+  /** 릴리스 갱신에 사용한 기준 URL 및 결정 출처. */
+  releaseBase?: string;
+  releaseBaseSource?: 'option' | 'env' | 'install-source' | 'default';
   /** 설치 뒤 옛 판 정리 결과. 정리를 건너뛰었으면 `skipped` 에 이유. */
   prune?: VersionPruneOutcome;
   /** 재시작 뒤 건강 — ok · rolled-back(직전 판으로 되돌려 회복) · rollback-failed · no-rollback-target. */
@@ -295,7 +298,7 @@ export interface ReleaseUpdateDeps {
   out?: { log: (text: string) => void; error: (text: string) => void };
   alert?: (text: string) => void;
   pruneVersions?: (plan: { current: string; previous: string; keep: number; prefix: string }) => VersionPruneOutcome;
-  /** 릴리스 기준 URL 주입(시험) — 없으면 `ELANOUS_RELEASE_BASE` → 공개 저장소. */
+  /** 릴리스 기준 URL 주입 — 환경변수와 설치 출처보다 우선한다. */
   releaseBase?: string;
 }
 
@@ -319,7 +322,9 @@ function pruneReleaseVersions(plan: { current: string; previous: string; keep: n
 /** A release update never packs the checkout: the downloaded installer verifies its own release tarball. */
 export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps: ReleaseUpdateDeps = {}): Promise<SelfUpdateResult> {
   const out = deps.out ?? console;
+  let selection: Pick<SelfUpdateResult, 'releaseBase' | 'releaseBaseSource'> = {};
   const finish = (result: SelfUpdateResult): SelfUpdateResult => {
+    result = { ...result, ...selection };
     if (options.alert && result.exitCode !== 0) (deps.alert ?? defaultAlert)(`⛔ elanous self-update 실패(exit ${result.exitCode}): ${result.reason}`);
     if (options.json) out.log(JSON.stringify(result));
     else out.log(`release-update: installed=${result.installedVersion ?? 'none'} restarted=${result.restarted} reason=${result.reason}`);
@@ -339,8 +344,15 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
   if (options.version !== undefined && (!version || !/^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(version))) {
     return fail(2, `잘못된 릴리스 버전: ${options.version}`);
   }
-  // ⭐ 설치기와 같은 기준(`ELANOUS_RELEASE_BASE` · 없으면 공개 저장소 릴리스) — 사설 미러·시험 픽스처(file://)도 같은 길로 간다.
-  const base = (deps.releaseBase ?? process.env.ELANOUS_RELEASE_BASE ?? 'https://github.com/ElanvitalAI/elanous/releases').replace(/\/+$/, '');
+  const source = readInstallSource(packageRoot, exists);
+  const inferred = source?.match(/^(https?:\/\/[^?#]+|file:\/\/[^?#]+)\/(?:latest\/download|download\/v[^/]+)\/elanous\.tgz$/)?.[1];
+  const base = (deps.releaseBase ?? process.env.ELANOUS_RELEASE_BASE ?? inferred ?? 'https://github.com/ElanvitalAI/elanous/releases').replace(/\/+$/, '');
+  selection = { releaseBase: base, releaseBaseSource: deps.releaseBase !== undefined ? 'option' : process.env.ELANOUS_RELEASE_BASE !== undefined ? 'env' : inferred ? 'install-source' : 'default' };
+  const isTailnet = (value: string | null): boolean => {
+    try { return value !== null && new URL(value).hostname.toLowerCase().endsWith('.ts.net'); }
+    catch { return false; }
+  };
+  if (isTailnet(source) && !isTailnet(base)) return fail(2, '내부 설치본을 공개 기준으로 바꾸지 않는다');
   const url = `${base}/${version ? `download/v${version}` : 'latest/download'}/install.sh`;
   let installer: string;
   try {
@@ -366,13 +378,16 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     return { status: result.status, stderr: result.error?.message ?? result.stderr ?? '' };
   });
   try {
-    const install = run('bash', ['-s', '--', '--no-modify-path', '--prefix', prefix], prefix, installer, { ELANOUS_VERSION: version ?? '', ELANOUS_INSTALL_SOURCE: '' });
+    const install = run('bash', ['-s', '--', '--no-modify-path', '--prefix', prefix], prefix, installer, { ELANOUS_VERSION: version ?? '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: base });
     if (install.status !== 0) return fail(1, `설치 실패: ${install.stderr.trim() || install.status}`);
     const metadata: unknown = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8'));
     const installedVersion = typeof metadata === 'object' && metadata !== null && 'version' in metadata && typeof metadata.version === 'string'
       ? metadata.version : null;
     if (!installedVersion) return fail(1, '설치판 확인 실패: install.json version 없음');
-    if (version && installedVersion !== version) return fail(1, `설치판 버전 불일치: 요청 ${version}, 설치 ${installedVersion}`);
+    const internalRevision = isTailnet(source) && version?.match(/^(.*)-([0-9a-f]{12})$/);
+    if (version && installedVersion !== version && (!internalRevision || installedVersion !== internalRevision[1])) {
+      return fail(1, `설치판 버전 불일치: 요청 ${version}, 설치 ${installedVersion}`);
+    }
     let prune: VersionPruneOutcome;
     try {
       const current = typeof metadata === 'object' && metadata !== null && 'versionDir' in metadata && typeof metadata.versionDir === 'string'

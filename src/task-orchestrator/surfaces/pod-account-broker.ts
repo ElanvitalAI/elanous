@@ -12,9 +12,9 @@ export const POD_ACCOUNT_EXCLUDE_AT_PERCENT = 95;
 export interface PodAccountPlan { usable: string[]; excluded: Array<{ name: string; why: string }> }
 
 export type PodProviderPlan =
-  | { provider: 'openai-codex'; accounts: string[]; excluded: PodAccountPlan['excluded'] }
-  | { provider: 'grok'; excluded: PodAccountPlan['excluded'] }
-  | { provider: null; reasons: string[] };
+  | { provider: 'openai-codex'; accounts: string[]; excluded: PodAccountPlan['excluded']; grokSubscriptionEligible: boolean }
+  | { provider: 'grok'; excluded: PodAccountPlan['excluded']; grokSubscriptionEligible: boolean }
+  | { provider: null; reasons: string[]; grokSubscriptionEligible: boolean };
 
 /** Pod 의 codex → grok 선택. 자격 종류는 과금 동의와 별도로 판단한다. */
 export function planPodProvider(input: {
@@ -29,10 +29,11 @@ export function planPodProvider(input: {
     excludeAt: input.excludeAt,
     thresholdPercentByAccount: input.thresholdPercentByAccount,
   });
-  if (accounts.usable.length) return { provider: 'openai-codex', accounts: accounts.usable, excluded: accounts.excluded };
-  if (input.grokSubscription || (input.grokApiKey && input.grokApiKeyOptIn)) return { provider: 'grok', excluded: accounts.excluded };
+  if (accounts.usable.length) return { provider: 'openai-codex', accounts: accounts.usable, excluded: accounts.excluded, grokSubscriptionEligible: input.grokSubscription };
+  if (input.grokSubscription || (input.grokApiKey && input.grokApiKeyOptIn)) return { provider: 'grok', excluded: accounts.excluded, grokSubscriptionEligible: input.grokSubscription };
   return {
     provider: null,
+    grokSubscriptionEligible: false,
     reasons: [
       `codex: ${accounts.excluded.map((e) => `${e.name}(${e.why})`).join(' · ') || '계정 0개'}`,
       `grok: 구독 자격 없음 · ${input.grokApiKey ? 'API 키 opt-in 꺼짐' : 'API 키 없음'}`,

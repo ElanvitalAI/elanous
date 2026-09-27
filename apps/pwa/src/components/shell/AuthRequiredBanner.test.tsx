@@ -86,3 +86,12 @@ test('a 401 before mounting shows the one-time notice', async () => {
   await mount();
   expect(host.querySelector('[role="alert"]')?.textContent).toContain('붙여넣으세요');
 });
+
+test('banner names settings labels that exist on the settings page', async () => {
+  const { readFileSync } = await import('node:fs');
+  const read = (name: string) => readFileSync(new URL(`../settings/${name}`, import.meta.url), 'utf8');
+  const banner = readFileSync(new URL('./AuthRequiredBanner.tsx', import.meta.url), 'utf8');
+  for (const label of ['Connect token (other devices)', 'Bearer token']) expect(banner).toContain(label);
+  expect(read('ConnectTokenCard.tsx')).toContain('Connect token (other devices)');
+  expect(read('SettingsPanel.tsx')).toContain('Bearer token');
+});

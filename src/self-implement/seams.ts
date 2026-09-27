@@ -1328,7 +1328,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
               const provider = getProviderForConfig(
                 { ...config, llm: { ...config.llm, provider: resolved.provider, model: resolved.model } },
               );
-              return streamLLM([{ role: 'user', content: prompt }], () => {}, { model: resolved.model, provider, reasoningEffort: 'low', signal });
+              return streamLLM([{ role: 'user', content: prompt }], () => {}, { model: resolved.model, provider, reasoningEffort: 'low', signal, usageRole: 'classify' });
             })(), o.goalSummaryTimeoutMs ?? DEFAULT_GOAL_SUMMARY_TIMEOUT_MS);
         const goalDescription = boundedGoalDescription(summary);
         if (goalDescription) return { goalTitle: title, goalDescription, goalDescriptionSource: 'generated' as const };

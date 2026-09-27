@@ -21,6 +21,7 @@ import {
   resolveChildLivenessHeartbeatPath,
 } from '../core-turn/child-liveness-heartbeat.js';
 import { resolveNexusPwa, type NexusPwaResolution } from '../cli/nexus-show.js';
+import { ptyWebAddress } from '../cli/pty-web-address.js';
 import { startPty, mintPtyId, ptyAvailable } from '../pty-shell/registry.js';
 import { probeControlStance, stanceBlocksWrite } from '../pty-shell/pty-control-stance.js';
 import { externalWriteProvenance } from '../pty-shell/pty-write-provenance.js';
@@ -61,6 +62,8 @@ import { childPtyIdentityEnv } from '../agent/pty-identity.js';
 import { elanousTuiSpawnOptions } from './elanous-tui-spawn.js';
 import { describeGrokCredentialFreshness, readGrokTokenFreshness, type GrokCredentialFreshnessSnapshot } from '../acp/grok-auth.js';
 import { debug } from '../debug/log.js';
+import { sendOutbound } from '../domains/outbound-alert.js';
+import { formatPtyLinkMessage, readReportOrigin } from './report-origin.js';
 import { DETACHED_PROGRESS_FRAME_PREFIX, decodeDetachedProgressFrame } from '../harness/dispatch-detached.js';
 import { setEventLoopActivity } from '../debug/event-loop-watchdog.js';
 import { resolveEscalateTarget, resolveExplicitChildEscalateTarget } from './rework-policy.js';
@@ -151,17 +154,14 @@ export function formatWaitSupervisionBatchReason(waitCount: number, latestJudgme
   return `waitCount=${waitCount} latestJudgment=${singleLineBoundarySurfaceValue(latestJudgment ?? 'wait')}`;
 }
 
-/** Renders the spawned child's PWA terminal link or the typed reason it is unavailable. */
 /** The child's terminal URL, or `null` when no PWA base is resolvable.
  *  ⛔⭐ Reads `url` (what the resolver ALREADY chose), never `loopback` — the resolver may have
  *  picked a tailnet base, and reading `loopback` silently discarded that choice (`GOAL-T80`).
  *  ⛔ Exists so the structured observation is built from the SAME value the human line shows,
  *  instead of string-slicing that line (which glued ` source=…` into the URL). */
 export function surfaceLinkUrlFor(ptyId: string, pwa: NexusPwaResolution): string | null {
-  if (!('url' in pwa)) return null;
-  const url = new URL('term', pwa.url);
-  url.search = new URLSearchParams({ pty: ptyId }).toString();
-  return url.toString();
+  // 링크 모양은 한 곳(`src/cli/pty-web-address.ts`)에서만 만든다 — agent-mission `watch=` 줄·`pty list` 와 같은 값.
+  return ptyWebAddress(ptyId, pwa).webUrl;
 }
 
 /** Renders the spawned child's PWA terminal link or the typed reason it is unavailable. */
@@ -948,6 +948,8 @@ export interface HeadlessGoalLoopPtyOptions {
   onSurfaceProgress?: (line: string) => void;
   /** Current worktree's PWA resolver seam; it is resolved once after the child is spawned. */
   resolveNexusPwa?: (opts: { cwd: string }) => NexusPwaResolution;
+  /** Outbound seam; the default retains quiet hours and origin routing. */
+  sendOutbound?: typeof sendOutbound;
   /** Queues an argv child supervisor input for the orchestrator's next-round prompt; never writes stdin. */
   onSupervisorInput?: (text: string, updateDelivery: (delivery: SupervisorDeliveryState, reason?: string) => void) => void;
   /** ★ 턴 abort 신호(#21) — /cancel 이 이 신호를 abort 하면 호스팅 PTY 를 즉시 kill + 폴 루프 조기 종료
@@ -1377,6 +1379,15 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
   // ⛔ 사람이 읽는 줄을 «잘라서» 구조화 값을 만들지 않는다 — 줄 형식이 바뀌면 값이 조용히 오염된다
   //   (실제로 `source=` 를 더하자 그 슬라이스가 URL 에 그것을 붙였다). 같은 순수 함수에서 «둘 다» 뽑는다.
   const surfaceLinkUrl = surfaceLinkUrlFor(ptyId, pwa);
+  const reportOrigin = readReportOrigin(process.env);
+  if (surfaceLinkUrl !== null && reportOrigin?.channel === 'telegram') {
+    try {
+      const accepted = (opts.sendOutbound ?? sendOutbound)(formatPtyLinkMessage({ webUrl: surfaceLinkUrl, ptyId }), 'report', reportOrigin);
+      debug.log('self-implement.surface-link', accepted ? 'reported' : 'report-failed', { ptyId, chatId: reportOrigin.chatId });
+    } catch (error) {
+      try { debug.log('self-implement.surface-link', 'report-failed', { ptyId, error: errorMessage(error) }, { level: 'warn' }); } catch { /* fail-soft */ }
+    }
+  }
   const surfaceLinkObservation: Record<string, string> = surfaceLinkUrl !== null && 'source' in pwa
     ? { surfaceLinkUrl, surfaceLinkSource: pwa.source }
     : { surfaceLinkUnavailableReason: 'reason' in pwa ? pwa.reason : 'pwa-url-unknown' };

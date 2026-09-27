@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 
 import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
 import type { NexusClient, PutSwitchResult, SwitchWire } from '@/nexus/client';
 
@@ -25,6 +26,12 @@ function themeSwitch(value: string): SwitchWire {
 function hotSwitchWrite(switchId = 'dashboard.theme.active'): PutSwitchResult {
   return { outcome: 'hot', switchId };
 }
+
+// R-TST23 — 아래 mock.module 은 프로세스 전역이다. 원본을 잡아 두고 파일 끝에 되돌린다(`@/lib/testing/restore-module-mocks`).
+await restoreModuleMocksAfterAll([
+  '@/nexus/hooks/use-nexus-context',
+  '@/lib/debug',
+], (specifier) => import(specifier));
 
 mock.module('@/nexus/hooks/use-nexus-context', () => ({
   useOptionalNexusClient: () => client,

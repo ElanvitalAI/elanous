@@ -1,4 +1,5 @@
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, spyOn } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -45,6 +46,53 @@ describe('런 슈퍼바이저 — 「끝까지 돌린다」의 판정', () => {
     expect(d.decomposable).toEqual([]);
     expect(d.repairable).toEqual([]);
     expect(d.needsHuman).toEqual([]);
+  });
+
+  test('수확 자식에게 넘긴 실패만 남으면 재시작하지 않고 인계 사유와 jobId를 기록한다', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const handedOff = { taskId: 'salvaged', feature: 'salvaged', status: 'failed' as const, stage: 'review-blocked', salvage: 'launched' as const };
+    let reruns = 0;
+    try {
+      const decision = decideNextRun({ results: [handedOff] });
+      expect(decision).toMatchObject({ action: 'stop', stopReason: 'handed-off-to-salvage' });
+      expect(decision.why).toContain('수확 자식에게 넘겼다');
+      expect(decision.rerunnable).toEqual([]);
+      expect(decision.reworkable).toEqual([]);
+      expect(decision.decomposable).toEqual([]);
+      expect(decision.repairable).toEqual([]);
+      expect(SUPERVISOR_STOP_REASONS).toContain('handed-off-to-salvage');
+      expect(log).toHaveBeenCalledWith('self-dev.supervisor', 'handed-off-to-salvage', { jobId: 'salvaged' });
+      const decisions: string[] = [];
+      await superviseRun({
+        initial: [handedOff],
+        rerun: async (previous) => { reruns++; return previous; },
+        onDecision: (next) => decisions.push(next.stopReason ?? 'none'),
+      });
+      expect(reruns).toBe(0);
+      expect(decisions).toEqual(['handed-off-to-salvage']);
+    } finally { log.mockRestore(); }
+  });
+
+  test('인계된 재실행·재작업·분해·수리 후보를 제외하고 남은 실패만 다시 건다', () => {
+    const results = [
+      { taskId: 'retry-handed', feature: 'retry-handed', status: 'failed' as const, stage: 'review-blocked', salvage: 'launched' as const },
+      { taskId: 'rework-handed', feature: 'rework-handed', status: 'done' as const, stage: 'pr-opened', salvage: 'launched' as const },
+      { taskId: 'split-handed', feature: 'split-handed', status: 'done' as const, stage: 'pr-opened', decomposeProposal: { pieces: [{ id: 'a', feature: 'a', dependsOn: [] }, { id: 'b', feature: 'b', dependsOn: [] }] }, salvage: 'launched' as const },
+      { taskId: 'repair-handed', feature: 'repair-handed', status: 'done' as const, stage: 'pr-opened', goalCauseObserved: true as const, salvage: 'launched' as const },
+      lockRace('retry-active'),
+    ];
+    const decision = decideNextRun({ results });
+    expect(decision.action).toBe('relaunch');
+    expect(decision.rerunnable).toEqual(['retry-active']);
+    expect(decision.reworkable).toEqual([]);
+    expect(decision.decomposable).toEqual([]);
+    expect(decision.repairable).toEqual([]);
+    expect(appendRound([], results)[0]?.actionable).toBe(1);
+    for (const salvage of [undefined, 'parked'] as const) {
+      const retry = decideNextRun({ results: [{ taskId: 'ordinary', feature: 'ordinary', status: 'failed' as const, stage: 'error', error: { code: 'SELF_IMPL_FAILED', message: "error: cannot lock ref 'refs/remotes/origin/main': is at abc123" }, ...(salvage ? { salvage } : {}) }] });
+      expect(retry.action).toBe('relaunch');
+      expect(retry.rerunnable).toEqual(['ordinary']);
+    }
   });
 
   test('전부 착지하면 converged 로 «선다»', () => {

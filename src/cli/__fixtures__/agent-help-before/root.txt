@@ -1,0 +1,95 @@
+Usage: elanous [options] [command]
+
+TUI skill runner — Yazi-style 3-pane + multi-LLM, with remote sync, smart diff,
+and SQLite logging
+
+Options:
+  -V, --version                                output the version number
+  --config-dir <dir>                           Override the elanous config / daemon root directory (default ~/.elanous). Pass at any position — works at the global or subcommand level. Replaces the legacy ELANOUS_DAEMON_DIR env var.
+  -r, --remote [name]                          원격 북마크로 붙는다. `-r` 만 쓰면 default 북마크(값을 받지 않는다), 이름을 대려면 `--remote <name>`. 처음 1회 `elanous nexus connect <host> --default`.
+  --test                                       격리 테스트 인스턴스로 실행 — cwd 의 git 트리(worktree 포함)에서 `<트리>/.elanous-test` 를 루트로 잡고 state·config 두 축을 함께 격리한다. config 사본이 없으면 자동 물질화. `--test=<dir>` 로 루트 직접 지정 가능(값 문법은 `=` 형태 하나 — 모호함 없음). ELANOUS_STATE_DIR/--config-dir 을 손으로 줄 필요가 없다.
+  -h, --help                                   display help for command
+
+Commands:
+  pty                                          PTY control — <ref> is an id, nickname, or unique prefix (see 'pty list')
+  pr                                           PR landing commands
+  repo                                         명시적 로컬 저장소 GitHub 비공개 발행
+  role                                         관제부 Primary 임대 조회 및 수동 넘김
+  where [options]                              지금 이 프로세스가 어느 인스턴스(prod/test)에 속하는지와 그 이유를 보여준다 (READ-ONLY)
+  leader                                       은퇴한 리더 트리 명령
+  pod                                          Pod 명령 Job — 하니스 없이 명령 하나를 돌리고 산출을 돌려받는다
+  browser                                      🎨 봇이 모는 브라우저 페이지 «안»에 그린다 — 도형 · 캔들 차트 · 지우기
+  questions                                    AskUserQuestion 대기를 조회하고 파일 답을 기록한다
+  usage [options]                              계정마다 행으로 「지금 쓸 수 있는 것이 얼마나 남았나」를 본다 (크레딧 축 ≠ 구독 축)
+  release                                      공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)
+  model-watch [options]                        제공자 문서에서 카탈로그 변경 제안을 만든다; 자동 적용하지 않는다
+  doctor [options]                             Reports whether credentials resolve and where each resolution comes from
+  control                                      독립 관제부
+  resources                                    관제부 자원 조회
+  setup [options]                              Check OpenAI Codex setup and guide each missing credential step
+  grounding                                    그라운딩 출처 레지스트리
+  graph                                        Run a declared command graph or inspect its latest run
+  launch-head                                  발사 앞 머리 — 골이 Pod 로 가도 되는지 판정
+  python                                       elanous 가 쓰는 파이썬(해석 · 점검 · elanous venv 셋업) — RFC-doctor-fix-build-toolchain-and-python-by-distro
+  self-update|update [options]                 설치본은 릴리스로, 체크아웃은 깨끗한 체크아웃으로 갱신하고 승인 시 넥서스 재시작 · `elanous update` 와 같다 · `--auto on` 이면 매일 자동
+  measure-fabric-arc-ab                        Fabric 분해 아크의 축소/전체 그라운딩 A/B를 관측하고 표와 JSON 결과를 낸다
+  mcp                                          MCP (Model Context Protocol) server / client integration
+  telegram-test [options]                      Standalone TEST telegram bot (separate token) — full Q&A/HITL/delegate path with ISOLATED state, WITHOUT touching the production daemon. Restart THIS process to test code changes; the live daemon stays up.
+  telegram                                     텔레그램 봇 — 넥서스 밖에서 도는 정식 Q&A 폴러
+  discord-test [options]                       Standalone TEST discord session (SAME app/token, scoped to discord.testChannel.channelId) with ISOLATED state, WITHOUT touching the production daemon. Restart THIS process to test code changes; the live daemon stays up.
+  sync [options]                               Sync skills to local or remote machines
+  status                                       Show current sync status and detect changes since last sync
+  git <args...>                                Run git through the git-fs gateway and append a pipe-visible exit status
+  gh <args...>                                 Run gh with retry-safe reads and append a pipe-visible outcome
+  theme                                        Inspect and configure dashboard themes
+  history [options]                            Show sync history
+  inspect [options]                            Inspect remote targets without syncing
+  autopilot                                    Mission-driven autopilot — runs an ACP agent against a single mission with safety + budget guards
+  memory                                       Persistent memories injected into every chat turn (user / feedback / project / reference)
+  decide [options] <question>                  Jev(System One)에게 «확률이 붙은» 판정 하나를 묻는다 — 기본 예/아니오. 📚 docs/manual/MANUAL-typesafe-jev-system-one-2026-09-20.md
+  ax-screen [options] <tasks.json>             업무 목록을 Jev 로 스크리닝해 자동화 후보 순위를 낸다. 📚 docs/manual/MANUAL-ax-task-screening-2026-09-20.md
+  decide-recipe [options] <name> <state.json>  이름 붙은 레시피로 판정한다. 질문은 recipes/<name>.json 에 «고정»되어 있다 — 매번 짓지 않는다.
+  signals [options]                            신호 파이프라인 퍼널(READ-ONLY) — 유입→분류→critical→2차→확정→집행 각 단계 수·통과율·갭. 게이트 튜닝 판단 근거.
+  loops [options]                              루프 에이전트 자산 원장(READ-ONLY) — 목표까지 반복하는 실행 주체(계약/자율/코디네이터)를 미션연관·독립·라이프사이클별로. 좀비(TTL 초과) 감지.
+  buzz [options]                               커뮤니티 버즈 온디맨드 브리핑 — 수집분 조회 + stale(밤/주말)이면 실시간 그랩 폴백. 매매 아님(정성 신호).
+  harness                                      dev-harness worktree 수명 — 워크트리 생성(worktree add)·조회(worktrees)·정리(clean)·프로세스 관찰(processes)
+  self                                         Self-awareness memory — 외부 도구(Claude Code/Codex)가 구현/변경 이력을 elanous 기억에 주입·회상
+  factcheck [options] <query...>               팩트체크 — 내부(발송 리포트/대화) 먼저 검색 → 없으면 외부(X/레딧/웹) 에스컬레이션
+  provider|providers                           Show the currently active LLM provider + model + auth status
+  provider:set [options] <name>                Swap active LLM provider in config.json (auto-backs-up the previous config to its `.bak` sibling — ⛔ the path is the ACTIVE config, not a fixed one: run `elanous where` to see it). Useful for A/B testing model behaviour — e.g. `elanous provider:set anthropic` to force-switch to Claude, then `elanous provider:set restore` (or `elanous provider:restore`) to roll back.
+  provider:restore                             Restore config.json from the automatic backup written by `elanous provider:set`.
+  provider:rotate [options] [sub] [target]     Cycle through the rotation list. With no argument: advance one step. Sub-commands: `list` (print list), `reset` (jump to first entry), `add <provider> [-m model] [-l label]` (append), `remove <label>`, `clear` (wipe rotation).
+  provider:use <needle>                        Jump to a specific rotation entry by label / provider name / model substring. Auto-backs-up config.json before the switch (restore with `elanous provider:restore`). Example: `elanous provider:use opus`, `elanous provider:use grok`, `elanous provider:use gpt-5`.
+  status-bar [options]                         Print the status pills (working dir + git + model) — pipe into shell prompt or preview
+  schedule                                     스케줄/크론 CRUD (registry·crontab·기억 정합). --json 으로 프로그래매틱 소비.
+  intake                                       바깥 사실·문서를 elanous 현재와 대조하거나 태스크로 받는다
+  logs [options]                               전 서피스 로그 조회/실시간 tail (adb logcat 동형) — level/surface/category/grep 필터
+  ad [options] [input...]                      판매 URL, 텍스트 브리프 또는 실사 이미지로 광고 제작 파이프라인을 시작
+  docs                                         문서 지식 검색/관리 — knowledge.db 벡터+BM25 하이브리드 (DocOps)
+  fleet                                        멀티 elanous 인스턴스 통합 뷰(READ-ONLY 연합) — 등록 인스턴스·보유 스토어 매트릭스. `logs instances` 일반화(kubectl get nodes 등가). 연합 조회는 `session list --all-instances` 등.
+  ops                                          운영 관측(READ-ONLY) — 미션·태스크·계약 루프·오케스트레이터 현재 상태·이상·전이. --json 프로그래매틱.
+  publish                                      external-markdown 게시 라이프사이클 — 만료 게시물 GC(S3 콜드 백업·삭제 아님)
+  agent-mission|codex                          Agent-mission CLI — 외부 에이전트 backend(codex[디폴트]·claude·gemini·grok·aside) 미션·리뷰 워치·셋업. `codex` 는 deprecated alias(하위호환).
+  dev|drive [options] [text...]                ⛔ `drive` 별칭으로 부르면 옵션은 여덟뿐 (--goal · --attach · --max-steps · --poll-ms · --model · --cwd · --worktree · --json) — `--attach <ref>` 는 이미 있는 PTY 를 몬다(생략하면 셸 명령을 새로 띄운다). 나머지는 전부 `dev` 전용이고 `drive` 에서는 거부된다. dev 와 drive 는 한 명령이라 이 도움말을 공유하므로, 아래 목록은 `dev` 기준이다. ⚠️ 실험 — 통합 self-dev 파이프라인 runDevPipeline. --backend self(디폴트·elanous-chat 자체구현)|codex/claude/gemini/grok(외부). --transport pty(디폴트·worktree·--branch 필수)|acp(cwd 세션·U6·capability 미검증). 미배선 조합은 NotYetUnified 명시 거부. ★self 는 무인 완결이 기본(PR 개설→auto-review 라벨→리뷰 clean 시 병합) — 끄려면 --no-open-pr/--no-auto-review/--no-auto-merge. 관측=elanous logs --category dev-pipeline · 상세=docs/manual/MANUAL-frontdoor-selfdev-dogfood-mechanism-2026-07-25.md
+  keys [options] [context]                     Print all keybindings + slash commands. Optional context filter.
+  finance                                      Native finance/investment logic (SSOT) — skill thin-client 진입점
+  config                                       Inspect and edit ~/.config/elanous/config.json
+  task|tasks [args...]                         Retired — use `elanous wf` (workflow-runtime DAG · supersedes scheduler v2)
+  ask [options] <text...>                      Alias for `elanous chat --new`: send one query and print the reply
+  onboarding [options] [step]                  Run the first-run wizard. Pass a step name (llm|skills|obsidian|telegram|discord|voice-ai) to run only that step.
+  login                                        Authenticate to an LLM provider via OAuth
+  session                                      Manage conversation sessions
+  chat [options] <text...>                     Send one message in the active session (or a new one) and print the reply
+  repl [options]                               Sticky multi-turn REPL — same session across turns, no per-turn process boot. Drives chat / agent / scenario from one shell. Uses --new for a fresh session, --session <id> to resume, --scenario <yaml> for a scripted run, JSONL on stdin for piped automation.
+  agent [options] [text...]                    Single-turn agent — same as `chat` but with the tool loop on by default (Read/Grep/Glob/ListDir/Edit/Write + Bash). Use this when the LLM needs to inspect files / run commands / debug itself.
+  registry                                     모델 카탈로그(catalog/=SSoT) 관측 — 라우팅 맵 drift 감사
+  tier                                         LLM tier→모델 SSOT 조회 — provider별 budget/balanced/better/best/loaded 사다리(llm-tier-map). "grok low" 같은 별칭 흡수.
+  local                                        Local OpenAI-compatible LLM — ping, list, test, setup
+  scheduler|sched [args...]                    Retired — scheduling is now a workflow-runtime Schedule Trigger node (`elanous wf`)
+  attach [options]                             ACP client for the running elanous daemon. Three modes: handshake-only (default), one-shot (--message), interactive REPL (--interactive). Local (unix socket) or remote (--host / --url) over Tailscale.
+  wf|workflows                                 Run YAML DAG workflows (workflow-runtime · prompt|bash|skill|cft|approval|if|switch|iteration|classify|extract|set|filter|template|http|showroom|task|scheduleTrigger|webhookTrigger|discordTrigger|telegramTrigger|manualTrigger|chatTrigger nodes). Aliases: `workflows` (plural) · `workflow` (singular).
+  nexus                                        NEXUS — unified TUI shell + supervisor + meta-api (Phase N-1, opt-in)
+  token                                        Manage the ACP admin token
+  acp                                          Agent Client Protocol — spawn ACP agents (claude-code, codex, gemini)
+  voice                                        Voice tier + identity helpers (STT slider · TTS voice id · cost preview)
+  help [command]                               display help for command

@@ -28,10 +28,11 @@
 // kept passing on tier 1 — the regression was Tailscale-only.
 
 /**
- * Trust only local clients and the Tailscale CGNAT allocation for the
- * header-based bypass. We deliberately do not invoke `tailscale whois` per
- * request: authentication must remain available without the CLI/runtime and
- * must not turn an external process into the hot-path availability boundary.
+ * Trust only a connection made on this machine itself (loopback) for the
+ * header-based bypass. 2026-09-27 (RFC `내부 문서 `RFC-pwa-auth-without-header-trust-2026-09-27``
+ * · 대표 A · 🅢 A′): the Tailscale CGNAT range (100.64/10) is no longer trusted —
+ * `Sec-Fetch-Site`/`Origin`/`Referer`/`Host` are freely set by any non-browser
+ * client, and the tailnet includes the bot VM that takes public webhooks.
  * An absent peer is untrusted, so unknown connections must present a bearer.
  */
 export function isTrustedSameOriginPeer(peerAddress: string | undefined): boolean {
@@ -42,11 +43,24 @@ export function isTrustedSameOriginPeer(peerAddress: string | undefined): boolea
   if (octets.length !== 4 || octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)) {
     return false;
   }
-  return octets[0] === 127 || (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127);
+  return octets[0] === 127;
+}
+
+/** Headers a reverse proxy adds. `tailscale serve` reaches NEXUS over loopback but
+ *  always attaches `X-Forwarded-For` and `Tailscale-*`; a client cannot make them
+ *  disappear (it passes `Host` through untouched, so `Host` proves nothing — 🅢 실측 2026-09-27). */
+export function hasProxyMarker(req: Request): boolean {
+  for (const name of ['x-forwarded-for', 'forwarded', 'x-real-ip', 'x-forwarded-host']) {
+    if (req.headers.has(name)) return true;
+  }
+  for (const [name] of req.headers) if (name.toLowerCase().startsWith('tailscale-')) return true;
+  return false;
 }
 
 export function isSameOriginRequest(req: Request, peerAddress?: string): boolean {
   if (!isTrustedSameOriginPeer(peerAddress)) return false;
+  // Loopback via a proxy (tailscale serve · local relay) is someone else's request.
+  if (hasProxyMarker(req)) return false;
   const sfs = req.headers.get('sec-fetch-site');
   if (sfs === 'same-origin') return true;
   if (sfs && sfs !== 'none') return false;

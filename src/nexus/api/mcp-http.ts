@@ -14,7 +14,8 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { resolveToken, type TokenStorePaths } from '../../auth/token-store.js';
-import { tokenScopeAllows } from '../../auth/scope.js';
+import { tokenScopeAllows, type TokenScope } from '../../auth/scope.js';
+import { hasProxyMarker } from '../../boot/check-same-origin.js';
 import { debug } from '../../debug/log.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
 import { handleMcpRequest } from '../../mcp/server.js';
@@ -48,10 +49,9 @@ interface McpHttpRequestContext {
   mcpToolCatalog?: readonly NativeToolCatalogEntry[];
 }
 
-interface McpHttpAccessDecision {
-  allowed: boolean;
-  reason?: 'browser_origin' | 'missing_peer' | 'missing_bearer' | 'invalid_token' | 'insufficient_scope';
-}
+type McpHttpAccessDecision =
+  | { allowed: true; scope: TokenScope }
+  | { allowed: false; reason: 'browser_origin' | 'missing_peer' | 'missing_bearer' | 'invalid_token' | 'insufficient_scope' };
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -82,7 +82,11 @@ function authorizeMcpHttpRequest(
   // MCP clients do not send Origin. Reject browser-originated posts before
   // the loopback exception so another website cannot invoke local tools.
   if (req.headers.has('origin')) return { allowed: false, reason: 'browser_origin' };
-  if (isLoopbackPeer(context.peerAddress)) return { allowed: true };
+  // ⛔ 루프백 «이고» 프록시 표식이 없을 때만 믿는다(RFC 공개 MCP 인증 M0 · #21073 A′ 와 같은 규칙).
+  //    `tailscale serve`·Caddy 뒤에선 상대가 늘 루프백으로 보인다 — 표식 없이 믿으면 프록시 너머 누구나 전 도구를 쓴다.
+  if (isLoopbackPeer(context.peerAddress) && !hasProxyMarker(req) && !req.headers.has('authorization')) {
+    return { allowed: true, scope: 'admin' };
+  }
 
   const credential = extractBearerCredential(req.headers.get('authorization'));
   if (!credential) {
@@ -91,7 +95,7 @@ function authorizeMcpHttpRequest(
   const token = resolveToken(credential, context.tokenStorePaths);
   if (!token) return { allowed: false, reason: 'invalid_token' };
   const scope = tokenScopeAllows(token, { method: 'POST', pathname: '/v1/mcp' });
-  return scope.ok ? { allowed: true } : { allowed: false, reason: 'insufficient_scope' };
+  return scope.ok ? { allowed: true, scope: token.scope } : { allowed: false, reason: 'insufficient_scope' };
 }
 
 function unauthorizedMcpResponse(): Response {
@@ -281,20 +285,21 @@ export async function handleMcpHttpPost(
   };
 
   const progress = isProgressStreamOptIn(req, rpc, context);
+  const mcpContext = { surface: 'mcp' as const, origin: 'mcp-http' as const, tokenScope: access.scope };
   if (!isNotification && progress.stream) {
     logMcpResponseMode('sse', progress);
     return sseProgressResponse(async (send) => {
       const resp = await withMcpProgressSink(
         (env) => send('progress', env),
         rpc,
-        () => handleMcpRequest(mcpRequest, { surface: 'mcp', origin: 'mcp-http' }),
+        () => handleMcpRequest(mcpRequest, mcpContext),
       );
       if (resp.error) send('error', resp);
       else send('result', resp);
     });
   }
 
-  const resp = await handleMcpRequest(mcpRequest, { surface: 'mcp', origin: 'mcp-http' });
+  const resp = await handleMcpRequest(mcpRequest, mcpContext);
   if (isNotification) return new Response(null, { status: 202 });
   logMcpResponseMode('json');
   return jsonResponse(resp, 200);

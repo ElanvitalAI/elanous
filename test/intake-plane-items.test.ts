@@ -2,8 +2,10 @@ import { afterEach, expect, test } from 'bun:test';
 import { appendFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
+import { registerIntakeCommands } from '../src/cli/intake-cli.js';
 import {
-  canonicalUrl, ingestIntakeItems, intakeItemId, intakeLedgerDir, listIntakeItems, loadIntakeLedger, markIntakeItem, shapeIntakeItem,
+  canonicalUrl, ingestIntakeItems, intakeItemId, intakeLedgerDir, listIntakeItems, loadIntakeLedger, markIntakeItem, pickAbsorbQueue, shapeIntakeItem,
 } from '../src/intake-plane/items.js';
 
 const roots: string[] = [];
@@ -79,8 +81,7 @@ test('깨진 원장 줄은 건너뛰고 센다', () => {
   expect(badLines).toBe(1);
 });
 
-test('자동 흡수 대기열: 사용자가 남긴 것 먼저 · 점수 순 · 상한 · 고른 것은 queued 로 다시 안 고른다', async () => {
-  const { pickAbsorbQueue } = await import('../src/intake-plane/items.js');
+test('자동 흡수 대기열: 사용자가 남긴 것 먼저 · 점수 순 · 상한 · 고른 것은 queued 로 다시 안 고른다', () => {
   const r = root();
   ingestIntakeItems(r, 'youtube', [
     { url: 'https://youtu.be/aaaaaaaaaaa', signals: { score: 5 } },
@@ -89,17 +90,62 @@ test('자동 흡수 대기열: 사용자가 남긴 것 먼저 · 점수 순 · �
   ], undefined, quiet);
   ingestIntakeItems(r, 'telegram-saved', [{ url: 'https://youtu.be/ddddddddddd' }, { text: '메모만' }], undefined, quiet);
   ingestIntakeItems(r, 'github', [{ url: 'https://github.com/a/b', signals: { score: 100 } }], undefined, quiet);
-  const dry = pickAbsorbQueue(r, { max: 3, kind: 'video', dryRun: true });
+  const dry = pickAbsorbQueue(r, { max: 2, kind: 'video', dryRun: true });
   expect(dry.map((i) => i.url)).toEqual(['https://www.youtube.com/watch?v=ddddddddddd', 'https://www.youtube.com/watch?v=bbbbbbbbbbb', 'https://www.youtube.com/watch?v=aaaaaaaaaaa']);
   expect(listIntakeItems(r, { status: 'queued' })).toHaveLength(0);
-  const first = pickAbsorbQueue(r, { max: 3, kind: 'video' });
+  const first = pickAbsorbQueue(r, { max: 2, kind: 'video' });
   expect(first).toHaveLength(3);
   expect(listIntakeItems(r, { status: 'queued' })).toHaveLength(3);
   expect(pickAbsorbQueue(r, { max: 3, kind: 'video' }).map((i) => i.url)).toEqual(['https://www.youtube.com/watch?v=ccccccccccc']);
 });
 
-test('queued 로 하루 넘게 묶인 항목(흡수 도중 죽은 판)은 다시 고른다', async () => {
-  const { pickAbsorbQueue } = await import('../src/intake-plane/items.js');
+test('텔레그램 저장 레인은 일반 상한 밖 · 레인 상한 별도 · 저장이 없으면 일반 상한 그대로', () => {
+  const r = root();
+  const saved = Array.from({ length: 12 }, (_, n) => ({ url: `https://example.com/saved/${n}` }));
+  const x = Array.from({ length: 12 }, (_, n) => ({ url: `https://x.com/example/status/${n + 100}` }));
+  ingestIntakeItems(r, 'telegram-saved', saved, '2026-09-27T00:00:00.000Z', quiet);
+  ingestIntakeItems(r, 'x', x, '2026-09-27T00:00:00.000Z', quiet);
+
+  const defaultLane = pickAbsorbQueue(r, { max: 10, dryRun: true });
+  expect(defaultLane).toHaveLength(22);
+  expect(defaultLane.slice(0, 12).every((i) => i.sources.includes('telegram-saved'))).toBe(true);
+  expect(defaultLane.slice(12).every((i) => i.source === 'x')).toBe(true);
+
+  const limitedLane = pickAbsorbQueue(r, { max: 10, laneMax: 5, dryRun: true });
+  expect(limitedLane).toHaveLength(15);
+  expect(limitedLane.slice(0, 5).every((i) => i.sources.includes('telegram-saved'))).toBe(true);
+  expect(limitedLane.slice(5).every((i) => i.source === 'x')).toBe(true);
+
+  const xOnly = root();
+  ingestIntakeItems(xOnly, 'x', x, '2026-09-27T00:00:00.000Z', quiet);
+  expect(pickAbsorbQueue(xOnly, { max: 10 })).toHaveLength(10);
+
+  const manySaved = root();
+  ingestIntakeItems(manySaved, 'telegram-saved', Array.from({ length: 32 }, (_, n) => ({ url: `https://example.com/more-saved/${n}` })), '2026-09-27T00:00:00.000Z', quiet);
+  expect(pickAbsorbQueue(manySaved, { max: 10, dryRun: true })).toHaveLength(30);
+});
+
+test('memo 는 일반 몫 앞자리이고, 저장 링크가 뒤늦게 합쳐져도 레인이다', () => {
+  const r = root();
+  ingestIntakeItems(r, 'x', [
+    { url: 'https://x.com/example/status/200' },
+    { url: 'https://x.com/example/status/201' },
+  ], '2026-09-27T00:00:00.000Z', quiet);
+  ingestIntakeItems(r, 'telegram-saved', [{ url: 'https://x.com/example/status/200' }], '2026-09-27T00:00:01.000Z', quiet);
+  ingestIntakeItems(r, 'memo', [{ url: 'https://example.com/memo' }], '2026-09-27T00:00:00.000Z', quiet);
+  const picked = pickAbsorbQueue(r, { max: 1, dryRun: true });
+  expect(picked.map((i) => i.url)).toEqual(['https://x.com/i/status/200', 'https://example.com/memo']);
+});
+
+test('intake queue CLI 는 일반 상한과 별도로 --lane-max 를 받는다', () => {
+  const program = new Command();
+  registerIntakeCommands(program);
+  const queue = program.commands.find((c) => c.name() === 'intake')?.commands.find((c) => c.name() === 'queue');
+  expect(queue?.options.map((o) => o.long)).toContain('--max');
+  expect(queue?.options.map((o) => o.long)).toContain('--lane-max');
+});
+
+test('queued 로 하루 넘게 묶인 항목(흡수 도중 죽은 판)은 다시 고른다', () => {
   const r = root();
   ingestIntakeItems(r, 'youtube', [{ url: 'https://youtu.be/eeeeeeeeeee' }], '2026-09-20T00:00:00.000Z', quiet);
   expect(pickAbsorbQueue(r, { max: 5 }, '2026-09-20T01:00:00.000Z')).toHaveLength(1);

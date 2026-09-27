@@ -2,15 +2,13 @@ import { describe, test, expect, beforeEach } from 'bun:test';
 import {
   buildContextTools,
   dispatchContextWorkspace,
-  dispatchContextWindowsList,
-  dispatchContextWindowDetail,
-  dispatchContextPaneDetail,
   dispatchContextPtysList,
   dispatchContextSessionsList,
   dispatchContextToolsList,
   dispatchContextEventsTail,
   dispatchContextBootstrap,
 } from '../src/skills/tools/context.js';
+import { ALL_CONTEXT_RUNTIMES } from '../src/tool-runtime/context-runtime.js';
 import {
   getGlobalElementEventBus,
   _resetGlobalElementEventBusForTesting,
@@ -30,8 +28,9 @@ beforeEach(() => {
 describe('skill-tool-context / buildContextTools', () => {
   test('returns expected number of specs', () => {
     const specs = buildContextTools();
-    expect(specs).toHaveLength(12);
-    expect(new Set(specs.map(s => s.name)).size).toBe(12);
+    expect(specs).toHaveLength(9);
+    expect(new Set(specs.map(s => s.name)).size).toBe(9);
+    expect(ALL_CONTEXT_RUNTIMES.map(rt => rt.spec.name)).toEqual(specs.map(s => s.name));
     expect(specs.some(s => s.name === 'ContextWorkspace')).toBe(true);
     expect(specs.some(s => s.name === 'ContextBootstrap')).toBe(true);
   });
@@ -43,41 +42,6 @@ describe('skill-tool-context / dispatchers', () => {
     expect(r.workspace.cwd).toBe('/tmp/x');
     expect(r.workspace.platform).toBe(process.platform);
     expect(r.output).toContain('cwd=/tmp/x');
-  });
-
-  test('windows.list returns empty when no registry wired', async () => {
-    const r = await dispatchContextWindowsList({});
-    expect(r.windows).toEqual([]);
-    expect(r.output).toContain('no virtual windows');
-  });
-
-  test('windows.list + window.detail + pane.detail with a stub registry', async () => {
-    const deps = {
-      getWindowRegistry: () => ({
-        list: () => [{
-          id: 3,
-          title: 'main',
-          focused: 'aa1234',
-          listPanes: () => [
-            { id: 'aa1234', content: { kind: 'terminal', title: 'shell' } },
-            { id: 'bb5678', content: { kind: 'markdown', title: 'notes' } },
-          ],
-        }],
-        current: () => ({ id: 3 }),
-      }),
-    };
-    const list = await dispatchContextWindowsList({}, deps);
-    expect(list.windows).toHaveLength(1);
-    expect(list.windows[0]!.foreground).toBe(true);
-    expect(list.windows[0]!.paneCount).toBe(2);
-
-    const detail = await dispatchContextWindowDetail({ addr: 'win:3' }, deps);
-    expect(detail.output).toContain('win:3');
-    expect(detail.output).toContain('pane:aa1234(terminal,focus)');
-
-    const pane = await dispatchContextPaneDetail({ addr: 'pane:bb5678' }, deps);
-    expect(pane.output).toContain('pane:bb5678');
-    expect(pane.output).toContain('markdown');
   });
 
   test('ptys.list reads from PTY registry (empty in test env)', async () => {
@@ -122,7 +86,8 @@ describe('skill-tool-context / dispatchers', () => {
     });
     expect(r.output).toContain('cwd=/tmp/y');
     expect(r.workspace).toBeDefined();
-    expect(Array.isArray(r.windows)).toBe(true);
+    expect(r).not.toHaveProperty('windows');
+    expect(r.output).not.toContain('windows:');
     expect(Array.isArray(r.tools)).toBe(true);
   });
 });

@@ -59,7 +59,7 @@ export interface DashboardTurnPreambleContext {
   modelFamily?: ModelFamily;
   /** Current request session ID. It is injected only while this preamble is built for the turn. */
   sessionId?: string;
-  /** TUI --rich mode. Kept aligned with the tool catalog selected for this turn. */
+  /** Catalog richness for non-dashboard callers; the essential dashboard passes false. */
   rich?: boolean;
   /** Active tool names for session-specific guidance (Wave 3,
    *  2026-05-04). When provided, the universal preamble emits per-tool

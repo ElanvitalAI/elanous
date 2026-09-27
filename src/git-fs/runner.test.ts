@@ -100,6 +100,7 @@ describe('runGitCommand', () => {
       const expectedStdout = git(fixture.repo, ['rev-parse', '--show-toplevel']);
       const result = runGitCommand(fixture.repo, ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
       expect(result).toEqual({ status: 0, stdout: expectedStdout, stderr: '' });
+      expect(result).not.toHaveProperty('signal');
     } finally {
       fixture.dispose();
     }

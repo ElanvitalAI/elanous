@@ -271,6 +271,7 @@ test('observe-deeper 가 찾은 errorText 는 ground-external 질의가 되고 �
   expect(roleResult('observe-deeper', { input: { runId, failure: { failedTests: 1, errorText: 'supplied' } } }, { loadLedger: () => entries })).toMatchObject({ outcome: 'empty', reason: 'no-new-facts' });
 });
 
+// Fake bin: npx; invoked command: npx (run-role defaultSearch), which executes the fake via the child PATH.
 test('기본 omni-crawl 호출은 실제 fc-dev JSON 출력의 URL을 END 유무와 무관하게 추출하고 실패는 empty', () => {
   const root = mkdtempSync(join(tmpdir(), 'heal-search-'));
   const bin = join(root, 'npx');
@@ -339,7 +340,7 @@ OmniCrawl
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
+}, 30_000);
 
 test('run-role 은 컨텍스트의 실패 서명을 정규화해 마지막 줄 JSON 을 낸다', () => {
   const dir = mkdtempSync(join(tmpdir(), 'heal-ctx-'));

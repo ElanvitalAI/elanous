@@ -3,6 +3,7 @@
 //
 // crontab 이 실제 스크립트를 이 래퍼로 감싸 실행하면, 그 파이어를 3계층(logs.db·레지스트리·자기기억)에
 // 기록한다. 사용:  bun scripts/cron-run.ts <target-script> [target-args...]
+//                 bun scripts/cron-run.ts --shell <interpreter> <target> [args...]
 //   예) cd <repo> && bun scripts/cron-run.ts scripts/community-buzz-cycle.ts --collect-only >> /tmp/x.log 2>&1
 //
 // ★ fail-open 불변식: 관측(sink 등록·레지스트리·기억) 무엇이 실패해도 자식은 반드시 실행하고 자식의
@@ -16,9 +17,11 @@ ensureCronNodePath();
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const target = argv[0];
-  if (!target) { process.stderr.write('cron-run: target script 인자 필수\n'); process.exit(2); }
-  const targetArgs = argv.slice(1);
+  const shell = argv[0] === '--shell';
+  const interpreter = shell ? argv[1] : process.execPath;
+  const target = argv[shell ? 2 : 0];
+  if (!interpreter || !target) { process.stderr.write('cron-run: target script 인자 필수\n'); process.exit(2); }
+  const targetArgs = argv.slice(shell ? 3 : 1);
 
   // 관측 준비(fail-open) — logs.db sink 등록 + 레지스트리 행 해석.
   let name = target;
@@ -40,7 +43,8 @@ async function main(): Promise<void> {
     sMod.setLogInstanceName(lc.instanceName);
     const off = sMod.registerLogStoreSink((s) => dMod.debug.registerSink(s), 'scheduler', lc.retention);
     if (off) process.on('exit', off);
-    name = rMod.scriptName(target);
+    // 셸 대상은 해석기와 함께 넘겨 레지스트리 파생 이름(`bash /x/backup.sh` → backup)과 맞춘다.
+    name = rMod.scriptName(shell ? `${interpreter} ${target}` : target);
     db = rMod.openSchedulesDb();
     // 최신 crontab 인벤토리 반영(래핑된 라인도 unwrap-aware 로 동일 id 승계).
     try { rMod.inventoryCrontab(db); } catch { /* fail-soft */ }
@@ -58,15 +62,15 @@ async function main(): Promise<void> {
   }
 
   const start = Date.now();
-  // 자식은 이 래퍼와 같은 bun 으로 실행(cron PATH 무관·process.execPath). stdout 은 흘리고(2>&1 보존),
-  // stderr 는 tee(흘리며 tail 캡처).
+  // 기본 자식은 이 래퍼와 같은 bun 으로 실행(cron PATH 무관·process.execPath).
+  // --shell 자식은 지정한 interpreter 로 실행한다. stdout 은 흘리고(2>&1 보존), stderr 는 tee(흘리며 tail 캡처).
   // ⛔⭐ env 를 «명시»한다 — bun 은 자식에게 「기동 시 스냅샷」을 주므로 ensureCronNodePath() 가
   //   런타임에 세운 PATH 가 «안 간다»(node 와 갈리고, 실패가 조용하다).
   //   📏 2026-08-31 실측(알려진 양성 /ZZZ_SENTINEL): env 미지정 ⇒ ⛔ 안 흐름 · env 명시 ⇒ ✅ 흐름.
   //   🔑 크론은 PATH= 선언이 «없어» cron 기본 PATH(pyenv·bun «없음»)로 도는데, 그것을 메우려고
   //     ensureCronNodePath() 가 있다 — 그 수리가 자식에게 안 가면 python 스킬 shell-out 이
   //     `exit 1` 로 «조용히» 죽는다(cron-path.ts 주석의 그 사고).
-  const child = spawn(process.execPath, [target, ...targetArgs], {
+  const child = spawn(interpreter, [target, ...targetArgs], {
     stdio: ['ignore', 'inherit', 'pipe'],
     env: { ...process.env },
   });

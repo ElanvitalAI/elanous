@@ -1,8 +1,26 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { ptyAvailable } from './pty-shell/registry.js';
-import { nativeToolCatalog } from './native-tool-catalog.js';
+import { nativeToolCatalog, listNativeToolsForHost } from './native-tool-catalog.js';
 
+test('virtual-window control and context tools are absent while essential tools remain', () => {
+  const names = new Set(nativeToolCatalog.flatMap(tool => [tool.id, tool.displayName, ...tool.aliases]));
+  for (const name of [
+    'ControlWindowResize', 'ControlPaneResize', 'ControlPaneLayout',
+    'ContextWindowsList', 'ContextWindowDetail', 'ContextPaneDetail',
+    'control_window_resize', 'control_pane_resize', 'control_pane_layout',
+    'context_windows_list', 'context_window_detail', 'context_pane_detail',
+  ]) expect(names.has(name)).toBe(false);
+  for (const name of ['ControlToolToggle', 'ControlPromptAppend', 'ControlPromptClear', 'GetDashboardState', 'ContextBootstrap']) {
+    expect(names.has(name)).toBe(true);
+  }
+  const mcpNames = new Set(listNativeToolsForHost('mcp').flatMap(tool => [tool.id, tool.displayName, ...tool.aliases]));
+  for (const name of ['ContextWindowsList', 'ContextWindowDetail', 'ContextPaneDetail']) {
+    expect(mcpNames.has(name)).toBe(false);
+  }
+  expect(mcpNames.has('GetDashboardState')).toBe(true);
+  expect(mcpNames.has('ContextBootstrap')).toBe(true);
+});
 
 describe('solve_mission native catalog entry', () => {
   test('names self-implement as the default and staged as explicit option', () => {

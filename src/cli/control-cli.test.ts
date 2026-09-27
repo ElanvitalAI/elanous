@@ -1,5 +1,6 @@
-import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { afterEach, expect, spyOn, test } from 'bun:test';
+import { runControlServe } from './control-cli.js';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONTROL_PORT, ensureControlTokens } from '../control-plane/server.js';
@@ -16,7 +17,7 @@ function root() {
 }
 function launch(dir: string, ...args: string[]) {
   const child = Bun.spawn(['bun', entry, `--test=${dir}`, ...args], {
-    cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: '' }, stdout: 'pipe', stderr: 'pipe',
+    cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' }, stdout: 'pipe', stderr: 'pipe',
   });
   children.push(child);
   return child;
@@ -58,6 +59,75 @@ afterEach(async () => {
   for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+test('control member without a machine join gives the join instruction and rc=2', async () => {
+  const result = await command(root(), 'control', 'member', '--once');
+  expect(result).toEqual({ code: 2, stdout: '', stderr: '먼저 `elanous control join` 을 치세요\n' });
+});
+
+test('control member --once registers a failed probe and resources where reports its loopback bind', async () => {
+  const dir = root();
+  const { port } = await serve(dir);
+  const tokenFile = join(dir, 'member-credential');
+  const issued = await command(dir, 'control', 'token', 'issue', 'node-b');
+  expect(issued.code).toBe(0);
+  writeFileSync(tokenFile, issued.stdout.trim());
+  const joined = await command(dir, 'control', 'join', '--url', `http://127.0.0.1:${port}`, '--machine', 'node-b', '--token-file', tokenFile);
+  expect(joined.code).toBe(0);
+  const result = await command(dir, 'control', 'member', '--once', '--resource', 'image:registry=http://127.0.0.1:1',
+    '--resource', 'image:mirror=http://127.0.0.1:2', '--resource', 'image:tail6=http://[fd7a:115c:a1e0::42]:1', '--json');
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({ machine: 'node-b', resources: [
+    { kind: 'image', name: 'registry', reachable: false, bind: 'loopback' },
+    { kind: 'image', name: 'mirror', reachable: false, bind: 'loopback' },
+    { kind: 'image', name: 'tail6', reachable: false, bind: 'tailnet' },
+  ] });
+  const onceTable = await command(dir, 'control', 'member', '--once', '--resource', 'image:registry=http://127.0.0.1:1');
+  expect(onceTable.code).toBe(0);
+  expect(onceTable.stdout).toContain('image · registry · http://127.0.0.1:1/ · loopback · false');
+  const found = await command(dir, 'resources', 'where', 'registry', '--json');
+  expect(found.code).toBe(0);
+  expect(JSON.parse(found.stdout).resources).toMatchObject([{ machine: 'node-b', kind: 'image', name: 'registry', attrs: { reachable: false, bind: 'loopback' } }]);
+  const table = await command(dir, 'resources', 'where', 'registry');
+  expect(table.stdout).toContain('image · registry · node-b · http://127.0.0.1:1/');
+  expect(table.stdout).toContain(' · loopback');
+  const tail6 = await command(dir, 'resources', 'where', 'tail6', '--json');
+  expect(tail6.code).toBe(0);
+  expect(JSON.parse(tail6.stdout).resources).toMatchObject([{ machine: 'node-b', kind: 'image', name: 'tail6', attrs: { reachable: false, bind: 'tailnet' } }]);
+  expect(result.stdout + result.stderr + onceTable.stdout + onceTable.stderr + found.stdout + found.stderr + table.stdout + table.stderr).not.toContain(issued.stdout.trim());
+}, 20_000);
+
+test('control member stays foreground and heartbeats until SIGTERM', async () => {
+  const dir = root();
+  const { port } = await serve(dir);
+  const issued = await command(dir, 'control', 'token', 'issue', 'node-b');
+  const tokenFile = join(dir, 'credential');
+  writeFileSync(tokenFile, issued.stdout.trim());
+  expect((await command(dir, 'control', 'join', '--url', `http://127.0.0.1:${port}`, '--machine', 'node-b', '--token-file', tokenFile)).code).toBe(0);
+  const child = launch(dir, 'control', 'member', '--interval', '0.05', '--resource', 'image:registry=http://127.0.0.1:1');
+  try {
+    let found = false;
+    for (let n = 0; n < 100; n++) {
+      const rows = await fetch(`http://127.0.0.1:${port}/v1/resources`, { headers: { authorization: `Bearer ${issued.stdout.trim()}` } });
+      const data = await rows.json() as { resources: Array<{ kind: string; name: string }> };
+      if (data.resources.some(row => row.kind === 'image' && row.name === 'registry')) { found = true; break; }
+      await Bun.sleep(50);
+    }
+    expect(found).toBe(true);
+    const resourceUrl = `http://127.0.0.1:${port}/v1/resources?machine=node-b&name=registry`;
+    const headers = { authorization: `Bearer ${issued.stdout.trim()}` };
+    const initial = await (await fetch(resourceUrl, { headers })).json() as { resources: Array<{ observedAt: number }> };
+    const firstObservedAt = initial.resources[0]!.observedAt;
+    let heartbeat = false;
+    for (let n = 0; n < 100; n++) {
+      await Bun.sleep(50);
+      const next = await (await fetch(resourceUrl, { headers })).json() as { resources: Array<{ observedAt: number }> };
+      if (next.resources[0]!.observedAt > firstObservedAt) { heartbeat = true; break; }
+    }
+    expect(heartbeat).toBe(true);
+    expect(child.exitCode).toBeNull();
+  } finally { child.kill('SIGTERM'); expect(await child.exited).toBe(0); }
+}, 20_000);
+
 test('empty control port environment falls back to the default (not ephemeral)', async () => {
   const result = await command(root(), 'resources', 'list', '--json');
   expect(result.code).toBe(2);
@@ -71,9 +141,17 @@ test('real CLI help reaches both registered command groups', async () => {
   const resources = await command(dir, 'resources', '--help');
   expect(control.code).toBe(0);
   expect(control.stdout).toContain('serve');
+  expect(control.stdout).toContain('join');
   expect(control.stdout).toContain('token');
   const serveHelp = await command(dir, 'control', 'serve', '--help');
   expect(serveHelp.stdout).toContain('--host <addr>');
+  expect(serveHelp.stdout).toContain('--follow-lease');
+  expect(serveHelp.stdout).toContain('--bucket <bucket>');
+  const joinHelp = await command(dir, 'control', 'join', '--help');
+  expect(joinHelp.stdout).toContain('--machine <name>');
+  expect(joinHelp.stdout).toContain('--token-file <path>');
+  expect(joinHelp.stdout).toContain('--token-stdin');
+  expect(joinHelp.stdout).not.toMatch(/--(?:admin|member|query)-token/);
   expect(resources.code).toBe(0);
   expect(resources.stdout).toContain('where');
   expect(resources.stdout).toContain('list');
@@ -130,6 +208,92 @@ test('real CLI serves in foreground, stops on SIGTERM, and query token is requir
   await expect(fetch(url)).rejects.toThrow();
 });
 
+test('real CLI --follow-lease reports its bucket and keeps serving when GCS cannot be read', async () => {
+  const dir = root();
+  const child = Bun.spawn([process.execPath, entry, `--test=${dir}`, 'control', 'serve', '--port', '0', '--follow-lease', '--bucket', 'gs://example-bucket'], {
+    cwd, env: { ...process.env, PATH: '/usr/bin:/bin', HOME: dir, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+    stdout: 'pipe', stderr: 'pipe',
+  });
+  children.push(child);
+  const reader = child.stdout.getReader();
+  try {
+    const line = await Promise.race([
+      reader.read().then(result => new TextDecoder().decode(result.value)),
+      Bun.sleep(15_000).then(() => { throw new Error('follow-lease startup timeout'); }),
+    ]);
+    expect(line).toContain('임대 따름 · gs://example-bucket · 나=');
+    const port = /관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!;
+    const primary = await fetch(`http://127.0.0.1:${port}/v1/primary`, { signal: AbortSignal.timeout(30_000) });
+    expect(primary.status).toBe(200);
+    expect(await primary.json()).toEqual({ holder: null, generation: null, known: false });
+    const denied = await fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ id: 'unmeasured', kind: 'instance', machine: 'mbp', name: 'unmeasured', attrs: {}, ttlMs: 30_000 }),
+    });
+    expect(denied.status).toBe(409);
+    expect(await denied.json()).toEqual({ error: 'not-primary', holder: null, generation: null });
+    expect(child.exitCode).toBeNull();
+  } finally { reader.releaseLock(); child.kill('SIGTERM'); await child.exited; }
+}, 45_000);
+
+test('control serve follows the lease only when opted in', async () => {
+  const dir = root();
+  const previous = process.env.ELANOUS_STATE_DIR;
+  process.env.ELANOUS_STATE_DIR = dir;
+  const logs: string[] = [];
+  const log = spyOn(console, 'log').mockImplementation(line => { logs.push(String(line)); });
+  let readCount = 0;
+  let holder = 'node-b';
+  const read = async () => { readCount++; return { kind: 'present' as const, doc: { holder, generation: holder === 'mbp' ? 8 : 7, state: 'held' as const, renewedAt: 123 } }; };
+  const register = (port: string) => fetch(`http://127.0.0.1:${port}/v1/resources/register`, {
+    method: 'POST', headers: { Authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ id: 'i1', kind: 'instance', machine: 'mbp', name: 'demo', attrs: {}, ttlMs: 30000 }),
+  });
+  const launchInProcess = async (followLease: boolean) => {
+    const active = runControlServe({ port: '0', followLease, bucket: followLease ? 'gs://example-bucket' : 'ignored-without-follow-lease', read, machine: 'mbp' });
+    try {
+      for (let n = 0; n < 100 && logs.length === 0; n++) await Bun.sleep(10);
+      const line = logs.shift()!;
+      expect(line).toContain('관제부 127.0.0.1:');
+      return { active, port: /관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!, line };
+    } catch (error) { process.emit('SIGTERM'); await active; throw error; }
+  };
+  try {
+    const followed = await launchInProcess(true);
+    try {
+      expect(followed.line).toContain('임대 따름 · gs://example-bucket · 나=mbp');
+      const primary = await fetch(`http://127.0.0.1:${followed.port}/v1/primary`);
+      expect(await primary.json()).toEqual({ holder: 'node-b', generation: 7, known: true });
+      expect(primary.headers.get('x-primary-generation')).toBe('7');
+      const denied = await register(followed.port);
+      expect(denied.status).toBe(409);
+      expect(denied.headers.get('x-primary-generation')).toBe('7');
+      expect(await denied.json()).toEqual({ error: 'not-primary', holder: 'node-b', generation: 7 });
+      expect(readCount).toBeGreaterThan(0);
+      holder = 'mbp';
+      await Bun.sleep(10_050);
+      const accepted = await register(followed.port);
+      expect(accepted.status).toBe(200);
+      expect(accepted.headers.get('x-primary-generation')).toBe('8');
+      expect((await accepted.json() as { name: string }).name).toBe('demo');
+    } finally { process.emit('SIGTERM'); await followed.active; }
+    const legacy = await launchInProcess(false);
+    try {
+      expect(legacy.line).not.toContain('임대 따름');
+      const allowed = await register(legacy.port);
+      expect(allowed.status).toBe(200);
+      expect(allowed.headers.get('x-primary-generation')).toBeNull();
+      expect((await allowed.json() as { name: string }).name).toBe('demo');
+      expect(readCount).toBe(2);
+    } finally { process.emit('SIGTERM'); await legacy.active; }
+  } finally {
+    log.mockRestore();
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+  }
+}, 15_000);
+
 test('real CLI also stops on SIGINT', async () => {
   const { child, port } = await serve(root());
   child.kill('SIGINT');
@@ -167,6 +331,111 @@ test('member registration is visible through where and list; JSON final line inc
     expect(found.stdout + found.stderr + list.stdout + list.stderr).not.toContain(token);
   }
 }, 20_000);
+
+test('joined Primary CLI queries use its member token without creating local credentials', async () => {
+  const dir = root();
+  const credential = 'c'.repeat(64);
+  const tokenFile = join(dir, 'credential');
+  writeFileSync(tokenFile, `${credential}\n`);
+  const peer = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    fetch(req) {
+      if (req.headers.get('authorization') !== `Bearer ${credential}`) return new Response(null, { status: 401 });
+      return Response.json({ resources: [{ kind: 'instance', name: 'remote-demo', machine: 'peer', ageMs: 4, expired: false }] });
+    },
+  });
+  try {
+    for (const flag of ['--admin-token', '--member-token', '--query-token']) {
+      const rejected = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', flag, credential);
+      expect(rejected).toEqual({ code: 2, stdout: '', stderr: '토큰은 인자로 받지 않습니다 — `--token-file` 또는 `--token-stdin`\n' });
+      expect(rejected.stderr).not.toContain(credential);
+      expect(existsSync(join(dir, 'control', 'join.json'))).toBe(false);
+    }
+    const joined = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', '--token-file', tokenFile);
+    expect(joined.code).toBe(0);
+    expect(joined.stdout).toBe(`Joined ${peer.url.origin} as node-b\n`);
+    expect(joined.stdout + joined.stderr).not.toContain(credential);
+    expect(JSON.parse(readFileSync(join(dir, 'control', 'join.json'), 'utf8'))).toEqual({ url: peer.url.href, machine: 'node-b', token: credential });
+    expect(statSync(join(dir, 'control', 'join.json')).mode & 0o777).toBe(0o600);
+    const found = await command(dir, 'resources', 'where', 'remote-demo', '--json');
+    expect(found.code).toBe(0);
+    expect(JSON.parse(found.stdout).resources).toMatchObject([{ name: 'remote-demo', machine: 'peer' }]);
+    const list = await command(dir, 'resources', 'list', '--json');
+    expect(list.code).toBe(0);
+    expect(JSON.parse(list.stdout).resources).toHaveLength(1);
+    expect(existsSync(join(dir, 'control', 'tokens.json'))).toBe(false);
+    expect(found.stdout + found.stderr + list.stdout + list.stderr).not.toContain(credential);
+  } finally { peer.stop(true); }
+}, 20_000);
+
+test('explicit Primary URL does not send a joined token to another address', async () => {
+  const dir = root();
+  const joinedPeer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => Response.json({ resources: [] }) });
+  const requests: Array<string | null> = [];
+  const targetPeer = Bun.serve({
+    hostname: '127.0.0.1', port: 0,
+    fetch(req) {
+      requests.push(req.headers.get('authorization'));
+      return Response.json({ resources: [] });
+    },
+  });
+  try {
+    const credential = join(dir, 'credential');
+    writeFileSync(credential, 'c'.repeat(64));
+    expect((await command(dir, 'control', 'join', '--url', joinedPeer.url.href, '--machine', 'node-b', '--token-file', credential)).code).toBe(0);
+    const denied = await command(dir, 'resources', 'list', '--primary-url', targetPeer.url.href, '--json');
+    expect(denied.code).toBe(2);
+    expect(denied.stderr).toContain('관제부 query 토큰 없음');
+    expect(denied.stdout).toBe('');
+    expect(requests).toEqual([]);
+    expect(existsSync(join(dir, 'control', 'tokens.json'))).toBe(false);
+    const allowed = await command(dir, 'resources', 'list', '--primary-url', targetPeer.url.href, '--query-token', 'd'.repeat(64), '--json');
+    expect(allowed.code).toBe(0);
+    expect(JSON.parse(allowed.stdout)).toEqual({ resources: [] });
+    expect(requests).toEqual([`Bearer ${'d'.repeat(64)}`]);
+    expect(allowed.stdout + allowed.stderr).not.toContain('d'.repeat(64));
+  } finally { joinedPeer.stop(true); targetPeer.stop(true); }
+});
+
+test('real join accepts a member token on stdin', async () => {
+  const dir = root();
+  const credential = 'f'.repeat(64);
+  const peer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch(req) {
+    expect(req.url).toBe(`${peer.url.href}v1/resources?machine=node-b`);
+    expect(req.headers.get('authorization')).toBe(`Bearer ${credential}`);
+    return Response.json({ resources: [] });
+  } });
+  try {
+    const child = Bun.spawn(['bun', entry, `--test=${dir}`, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', '--token-stdin'], {
+      cwd, env: { ...process.env, ELANOUS_CONTROL_PORT: '', ELANOUS_SUPPRESS_XDG_WARNING: '1' }, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
+    });
+    children.push(child);
+    child.stdin.write(`${credential}\n`);
+    child.stdin.end();
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(code).toBe(0);
+    expect(stdout).toBe(`Joined ${peer.url.origin} as node-b\n`);
+    expect(stdout + stderr).not.toContain(credential);
+    expect(JSON.parse(readFileSync(join(dir, 'control', 'join.json'), 'utf8'))).toEqual({ url: peer.url.href, machine: 'node-b', token: credential });
+  } finally { peer.stop(true); }
+});
+
+test('real join refuses argv tokens and failed validation writes no file or stack trace', async () => {
+  const dir = root();
+  const credential = 'e'.repeat(64);
+  const tokenFile = join(dir, 'credential');
+  writeFileSync(tokenFile, credential);
+  const peer = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response(credential, { status: 401, statusText: credential }) });
+  try {
+    const failed = await command(dir, 'control', 'join', '--url', peer.url.href, '--machine', 'node-b', '--token-file', tokenFile);
+    expect(failed.code).toBe(1);
+    expect(failed.stdout).toBe('');
+    expect(failed.stderr).toMatch(/^합류 실패: [^\n]+\n$/);
+    expect(failed.stderr).not.toMatch(/at |Bun v/);
+    expect(failed.stderr).not.toContain(credential);
+    expect(existsSync(join(dir, 'control', 'join.json'))).toBe(false);
+  } finally { peer.stop(true); }
+});
 
 test('a peer cannot reflect the query token through resource output', async () => {
   const dir = root();

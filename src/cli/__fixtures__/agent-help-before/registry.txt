@@ -1,0 +1,13 @@
+Usage: elanous registry [options] [command]
+
+모델 카탈로그(catalog/=SSoT) 관측 — 라우팅 맵 drift 감사
+
+Options:
+  -h, --help          display help for command
+
+Commands:
+  drift [options]     라우팅 핀(alias·tier-map·mission-router)이 catalog active id 와
+                      정합인지 감사 — HITL 역제안(자동 집행 없음)
+  discover [options]  발견 소스를 골라 돌리고 기존 스냅숏에 병합 — 기본 드라이런 · --write 로 기록 · S3 푸시
+                      없음
+  help [command]      display help for command

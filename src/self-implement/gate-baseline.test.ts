@@ -165,6 +165,60 @@ describe('gate baseline case attribution', () => {
       .toEqual(['unknown', 'unknown']);
   });
 
+  test('다른 파일의 동일 시험 이름과 소스 위치·진단이 확인될 때만 preexisting으로 귀속한다', () => {
+    const path = 'harness orchestrate canonical entrance capability > primary help exposes only the promoted harness orchestrate options from the self-only gap';
+    const original = 'src/index.test.ts';
+    const added = 'src/cli/new-thing.test.ts';
+    const baseline = `${original}:\n    at ${original}:12:3\n(fail) ${path}`;
+    const candidate = `${added}:\n    at ${original}:12:3\n(fail) ${path}`;
+    expect(classifyGateTestFailures(candidate, baseline, [added])).toMatchObject([{
+      file: added, attribution: 'preexisting', attributedBy: 'name-across-files', baselinePresence: 'missing',
+    }]);
+    expect(buildGateBaselineReport(candidate, { status: 'test-fail', output: baseline, log: 'base red', missingAtBase: [added] }))
+      .toMatchObject({ introduced: 0, preexisting: 1, missingAtBase: 1 });
+    expect(classifyGateTestFailures(candidate, `${original}:\n(pass) ${path}`, [added]))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(classifyGateTestFailures(candidate, failLog(original, 'different path'), [added]))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(classifyGateTestFailures(candidate, baseline))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'present' }]);
+    expect(classifyGateTestFailures(failLog(added, path), failLog(original, path), [added]))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(buildGateBaselineReport(failLog(added, path), { status: 'test-fail', output: failLog(original, path), log: 'base red', missingAtBase: [added] }))
+      .toMatchObject({ introduced: 1, preexisting: 0, missingAtBase: 1 });
+    expect(classifyGateTestFailures(`${added}:\n    at ${added}:12:3\n(fail) ${path}`, baseline, [added]))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(classifyGateTestFailures(`${added}:\n    at ${original}:99:3\n(fail) ${path}`, baseline, [added]))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(classifyGateTestFailures(`${added}:\n    at ${original}:12:3\nerror: different failure\n(fail) ${path}`, baseline, [added]))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(classifyGateTestFailures(candidate, `${baseline}\nsrc/other.test.ts:\n    at src/other.test.ts:4:2\n(fail) ${path}`, [added]))
+      .toMatchObject([{ attribution: 'introduced', baselinePresence: 'missing' }]);
+    expect(classifyGateTestFailures(`${candidate}\n${candidate}`, baseline, [added]))
+      .toMatchObject([{ attribution: 'introduced' }, { attribution: 'introduced' }]);
+  });
+
+  test('파일 간 동일 시험 증거가 있을 때만 귀속 로그에 기준선 파일을 기록한다', () => {
+    const original = debug.log;
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      const base = 'src/index.test.ts:\n    at src/index.test.ts:12:3\n(fail) suite > case';
+      const child = 'src/cli/new-thing.test.ts:\n    at src/index.test.ts:12:3\n(fail) suite > case';
+      classifyGateTestFailures(child, base, ['src/cli/new-thing.test.ts']);
+      expect(events).toContainEqual({ category: 'self-implement.gate', event: 'attributed-across-files', data: {
+        name: 'suite > case', file: 'src/cli/new-thing.test.ts', baselineFile: 'src/index.test.ts',
+      } });
+      events.length = 0;
+      classifyGateTestFailures(failLog('src/cli/new-thing.test.ts', 'suite > case'), base, ['src/cli/new-thing.test.ts']);
+      expect(events).toEqual([]);
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
   test('같은 파일의 base 실패와 child 신규 실패를 케이스별로 갈라 신규 실패를 숨기지 않는다', () => {
     const child = failLog('test/mixed.test.ts', 'base red', 'child regression');
     const baseline = { status: 'test-fail' as const, output: failLog('test/mixed.test.ts', 'base red'), log: 'base failed' };

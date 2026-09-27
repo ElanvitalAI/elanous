@@ -209,6 +209,9 @@ export interface AcpServerOptions {
    *  receives the user message text and a push() for streaming back
    *  assistant chunks. When omitted, the server echoes the prompt. */
   runTurn?: (ctx: AcpTurnContext) => Promise<void>;
+  /** ACP standalone entry: require session cwd or an explicit boot default. */
+  requireSessionToolCwd?: boolean;
+  bootToolCwd?: string;
   /** Session MCP path runner. Defaults to the canonical Codex ACP turn runner;
    *  tests inject it to observe the exact per-session child arguments. */
   runCodexTurn?: (opts: Parameters<typeof runAcpTurn>[0]) => Promise<unknown>;
@@ -1371,7 +1374,13 @@ function wireAcpConnection(
     },
 
     async newSession(req: NewSessionRequest): Promise<NewSessionResponse> {
-      const cwd = req.cwd ?? process.cwd();
+      const sessionCwd = typeof req.cwd === 'string' && req.cwd.trim() ? req.cwd : undefined;
+      const cwd = opts.requireSessionToolCwd
+        ? sessionCwd ?? opts.bootToolCwd
+        : req.cwd ?? process.cwd();
+      if (!cwd) {
+        throw RequestError.invalidParams(undefined, 'cwd required: pass session/new cwd or start with --tool-cwd');
+      }
       const mcpServers = req.mcpServers ?? [];
       const codexArgs = buildAcpSessionCodexArgs(mcpServers);
       const forwardedServerCount = codexArgs.length === 0
@@ -1400,6 +1409,9 @@ function wireAcpConnection(
       //   ⚠️ `if (debug.enabled)` 로 감싸지 않는다 — 그건 핫패스 게이트라 운영에서 꺼져 있고,
       //      기존 `acp.peer-id` 가 그 뒤에 있어 안 보였다. 세션 lifecycle 은 저빈도라 항상 남긴다.
       debug.log('acp.session', 'new', { sessionId: record.id, cwd });
+      if (opts.requireSessionToolCwd) {
+        debug.log('acp.session', 'tool-cwd', { sessionId: record.id, cwd, source: sessionCwd ? 'session' : 'boot' });
+      }
       const models = deriveAcpSessionModelState();
       advertisedSessionModels.set(record.id, models);
       return { sessionId: record.id, models };
@@ -1446,15 +1458,28 @@ function wireAcpConnection(
       // `opts.hasSession` check below queries history, not the live
       // sessions map). Idempotency: a re-load by the same connection
       // simply re-adds itself to the same set — no double-init.
+      const sessionCwd = typeof req.cwd === 'string' && req.cwd.trim() ? req.cwd : undefined;
+      const cwd = opts.requireSessionToolCwd
+        ? sessionCwd ?? opts.bootToolCwd
+        : req.cwd ?? process.cwd();
       if (sessions.has(sessionId)) {
+        if (opts.requireSessionToolCwd && sessionCwd) {
+          sessions.get(sessionId)!.cwd = sessionCwd;
+          debug.log('acp.session', 'tool-cwd', { sessionId, cwd: sessionCwd, source: 'session' });
+        }
         registerPeer(sessionId);
         return {};
       }
       if (!opts.hasSession || !opts.hasSession(sessionId)) {
         throw new Error(`unknown session: ${sessionId}`);
       }
-      const cwd = req.cwd ?? process.cwd();
+      if (!cwd) {
+        throw RequestError.invalidParams(undefined, 'cwd required: pass session/load cwd or start with --tool-cwd');
+      }
       acpServerLoadSession(sessions, dualRole, sessionId, cwd);
+      if (opts.requireSessionToolCwd) {
+        debug.log('acp.session', 'tool-cwd', { sessionId, cwd, source: sessionCwd ? 'session' : 'boot' });
+      }
       // BACKLOG #2.5 — broadcast peer registration.
       registerPeer(sessionId);
       return {};
@@ -2028,8 +2053,8 @@ function wireAcpConnection(
      *  convention.
      *
      *  `terminal/spawn`  · params: { sessionId, terminalId?, cwd?, cols?, rows?, shell? }
-     *      → spawns a fresh PreviewTerminal + registers in the
-     *        web-terminal tap registry · returns terminalId
+     *      → attaches a live shell with the same ID across sessions, or
+     *        spawns and registers a new PreviewTerminal · returns terminalId
      *  `terminal/input`  · params: { sessionId, terminalId, data }
      *      → forwards UTF-8 bytes to PreviewTerminal.write()
      *  `terminal/resize` · params: { sessionId, terminalId, cols, rows }
@@ -2070,14 +2095,26 @@ function wireAcpConnection(
         const cols = typeof p.cols === 'number' && p.cols > 0 ? p.cols : 80;
         const rows = typeof p.rows === 'number' && p.rows > 0 ? p.rows : 24;
 
-        const { lookupPreviewTerminal, registerPreviewTerminalForWebTap } =
+        const { lookupPreviewTerminal, findPreviewTerminalsById,
+          registerPreviewTerminalForWebTap, unregisterPreviewTerminalForWebTap } =
           await import('../web-terminal/preview-tap-registry.js');
 
-        // Idempotent — returning the existing terminal lets the PWA
-        // re-mount cycle attach to a single live PTY instead of
-        // spawning duplicates per Strict Mode mount-cleanup-mount.
-        const existing = lookupPreviewTerminal(p.sessionId, tid);
+        // Preserve same-session idempotency; remove dead registrations before
+        // adopting a live shell or creating a replacement.
+        const sameSession = lookupPreviewTerminal(p.sessionId, tid);
+        const matches = findPreviewTerminalsById(tid);
+        for (const match of matches) {
+          if (!match.pt.isAlive) unregisterPreviewTerminalForWebTap(match.pt);
+        }
+        const adopted = matches.find((match) => match.pt.isAlive);
+        const existing = sameSession?.isAlive ? sameSession : adopted?.pt;
         if (existing) {
+          if (existing !== sameSession && adopted) {
+            registerPreviewTerminalForWebTap(existing, p.sessionId, tid, handle);
+            debug.log('webterm.acp', 'spawn.adopt', {
+              terminalId: tid, fromSessions: adopted.sessionIds, toSession: p.sessionId,
+            });
+          }
           // P4 — replay opt-in: xterm-headless 가 상주 보유한 현재 화면을
           // render()(뷰포트·SGR 보존)로 동봉. 스냅샷 실패는 attach 를 막지
           // 않는다(fail-soft).

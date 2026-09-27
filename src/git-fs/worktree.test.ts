@@ -166,6 +166,15 @@ describe('createWorktree — elanous dev 기본 브랜치 분기', () => {
     expect(child.resolvedBase).toBe(mainSha);
   });
 
+  test('참조 거울 origin 의 비기본 base 로 발사하면 fetch 를 지나 원격 tip 에서 시작한다', () => {
+    git(repo, 'push', '-q', 'origin', 'feature/caller');
+    const child = createWorktree({ repoRoot: repo, worktreeRoot: dirname(repo), branch: 'child/from-feature', base: 'origin/feature/caller', resetExisting: true });
+    expect(child.base).toBe('origin/feature/caller');
+    expect(child.baseFreshness).toBe('remote-synced');
+    expect(child.resolvedBase).toBe(callerSha);
+    expect(spawnSync('git', ['rev-parse', 'HEAD'], { cwd: child.path, encoding: 'utf8' }).stdout.trim()).toBe(callerSha);
+  });
+
   test('기본 브랜치 교정은 선택한 base를 실행 관측으로 남긴다', () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
@@ -697,8 +706,8 @@ describe('syncBaseWithRemote — 실패 분기 (seam)', () => {
   const REMOTE = 'f'.repeat(40);
   const AHEAD = 'a'.repeat(40);
   const LOCAL = '9'.repeat(40);
-  const ok = (stdout = '') => ({ status: 0, stdout, stderr: '' });
-  const fail = (stderr = 'boom') => ({ status: 1, stdout: '', stderr });
+  const ok = (stdout = ''): ReturnType<GitRunner> => ({ status: 0, stdout, stderr: '' });
+  const fail = (stderr = 'boom'): ReturnType<GitRunner> => ({ status: 1, stdout: '', stderr });
 
   /** 기본 응답을 주고 필요한 것만 덮는다 — 대역이 "요청한 것만" 답하게 유지한다. */
   function runner(over: Partial<Record<'showRef' | 'lsRemote' | 'fetch' | 'fetchHead' | 'localRev', ReturnType<typeof ok>>> = {}): GitRunner {
@@ -715,6 +724,15 @@ describe('syncBaseWithRemote — 실패 분기 (seam)', () => {
   test('⛔ origin 에 있는데 fetch 가 실패하면 던진다 (fail-closed · 낡은 채로 진행 금지)', () => {
     expect(() => syncBaseWithRemote('/r', 'feat', false, runner({ fetch: fail('network down') })))
       .toThrow(/base sync failed.*fetch failed/s);
+  });
+
+  test('fetch 실패에 status·signal·stdout·stderr 가 남고 stderr 가 비어도 사유가 비지 않는다', () => {
+    expect(() => syncBaseWithRemote('/r', 'feat', false, runner({
+      fetch: { status: null, signal: 'SIGTERM', stdout: 'fetch interrupted\n', stderr: '' },
+    }))).toThrow('fetch failed: status=null, signal=SIGTERM, stdout="fetch interrupted", stderr=""');
+    expect(() => syncBaseWithRemote('/r', 'feat', false, runner({
+      fetch: { status: 128, stdout: '', stderr: '' },
+    }))).toThrow('fetch failed: status=128, signal=none, stdout="", stderr=""');
   });
 
   function remoteRepo(): { repo: string; dispose: () => void } {

@@ -3,6 +3,7 @@ import { TaskDispatcher, DEFAULT_CONCURRENCY_CAPS } from './dispatcher.js';
 import { TaskGraph } from './graph.js';
 import { SurfaceRegistry, type SurfaceAdapter } from './surface-registry.js';
 import { createTask, type Task } from './types.js';
+import { TaskStore } from './store.js';
 import type { OpsEventInput } from '../domains/ops-log.js';
 
 function selfImplementTask(id: string): Task {
@@ -36,6 +37,32 @@ function dispatcherFor(
   registry.register('self-implement', pendingAdapter());
   return new TaskDispatcher({ graph, registry, recordOpsEvent, concurrencyCaps });
 }
+
+describe('TaskDispatcher persistence and rejection', () => {
+  test('adapter rejection records a failed execution and final task in the API store', async () => {
+    const store = new TaskStore({ path: ':memory:' });
+    try {
+      const graph = new TaskGraph();
+      const registry = new SurfaceRegistry();
+      const item = createTask({ title: 'reject', surface: { kind: 'subagent', definitionName: 'missing', prompt: 'go' }, status: 'ready' });
+      store.saveTask(item);
+      graph.addTask(item);
+      registry.register('subagent', async () => { throw new Error('definition not found'); });
+      const dispatcher = new TaskDispatcher({ graph, registry, store, recordOpsEvent: () => {} });
+      const result = dispatcher.tickTask(item.id);
+      expect(result.dispatched).toHaveLength(1);
+      expect(store.getTask(item.id)?.status).toBe('running');
+      await result.dispatched[0]!.promise;
+      expect(store.getTask(item.id)).toMatchObject({ status: 'failed', lastExecutionId: result.dispatched[0]!.executionId });
+      expect(store.listExecutions(item.id)).toMatchObject([{
+        id: result.dispatched[0]!.executionId, surface: item.surface, status: 'failed',
+        error: { code: 'ADAPTER_ERROR', message: 'definition not found' },
+      }]);
+    } finally {
+      store.close();
+    }
+  });
+});
 
 describe('TaskDispatcher self-implement concurrency observation', () => {
   test('defaults to three admissions and records one cap wait event for surplus work', () => {

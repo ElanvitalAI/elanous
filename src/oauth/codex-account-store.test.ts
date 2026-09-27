@@ -286,3 +286,27 @@ describe('회전 핀 — 소진되면 «풀린다»', () => {
     } finally { delete process.env.ELANOUS_RUN_ID; }
   });
 });
+
+describe('기본 계정은 정본에 홈을 안 적어도 회전 후보다 (🅢 2026-09-27)', () => {
+  test('`openai-codex` 에 codexHome 이 없으면 기본 위치(CODEX_HOME)로 풀어 후보에 넣는다 — 이름 계정은 여전히 홈이 있어야 한다', () => {
+    const root = isolatedRoot('codex-default-candidate-');
+    const defaultHome = join(root, 'default-home');
+    const teamHome = join(root, 'team-home');
+    for (const home of [defaultHome, teamHome]) mkdirSync(home, { recursive: true });
+    const store = join(root, 'auth.json');
+    // 운영 모양: 기본 계정은 codexHome 없이 저장된다.
+    saveTokens('openai-codex', tokens(), { mirrorCodex: false, codexHome: defaultHome }, store);
+    stripStoredHome(store, 'openai-codex');
+    saveTokens('openai-codex:team', tokens(), { mirrorCodex: false, codexHome: teamHome }, store);
+    saveTokens('openai-codex:ghost', tokens(), { mirrorCodex: false, codexHome: join(root, 'ghost') }, store);
+    stripStoredHome(store, 'openai-codex:ghost');
+    writeQuotaSignal(undefined, 1, defaultHome);
+    writeQuotaSignal(undefined, 98, teamHome);
+    const inspected = inspectCodexRotation({ CODEX_HOME: defaultHome }, { storePath: store });
+    const byName = Object.fromEntries(inspected.candidates.map((c) => [c.name, c]));
+    expect(byName.default?.home).toBe(defaultHome);
+    expect(byName.default?.usedPercent).toBe(1);
+    expect(byName.team?.home).toBe(teamHome);
+    expect(byName.ghost).toBeUndefined();
+  });
+});

@@ -1,10 +1,8 @@
 // ── Context pull tools — Phase C of PLAN-llm-active-context-and-control ──
 //
 // A family of read-only LLM tools that replace the dropped auto-inject
-// snapshot. Each tool answers ONE question ("what windows are open?",
-// "what did pty:xyz last output?"), so the LLM can chain them: a
-// broad listing first, then drill into the single element it cares
-// about. Token cost scales with interest instead of turn count.
+// snapshot. Each tool answers one question so the LLM can request
+// only the context it needs.
 //
 // All outputs intentionally return JSON-friendly shapes + a short
 // `output` string for the LLM's preview pane.
@@ -45,24 +43,11 @@ function workspaceBlob(deps?: ContextDeps): {
   };
 }
 
-/** Optional DI so dashboard can inject cwd, remoteHost, VW hooks,
- *  terminal-session list, scheduler store. Defaults pull from the
- *  ambient singletons so a skill-only LLM still gets useful output. */
+/** Optional DI for dashboard workspace and terminal-session state. */
 export interface ContextDeps {
   cwd?: string;
   remoteHost?: string;
-  getWindowRegistry?: () => {
-    list(): Array<{
-      id: number;
-      title: string;
-      listPanes(): Array<{ id: string; content: { kind: string; title?: string } }>;
-      focused: string | null;
-    }>;
-    current?: () => { id: number } | null;
-  } | null;
   getTerminalSessions?: () => Array<{ id: string; title: string; state: string }>;
-  /** Capture pane text for `context.pane.detail`. Empty when absent. */
-  capturePane?: (paneId: string, maxBytes?: number) => string | undefined;
 }
 
 // ── Tool specs ─────────────────────────────────────────────────────
@@ -74,38 +59,6 @@ export function buildContextTools(): LLMToolSpec[] {
       description:
         'Return workspace basics: cwd, platform, optional remote host, and whether a sandbox is available. Cheap — call once at turn start.',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
-    },
-    {
-      name: 'ContextWindowsList',
-      description:
-        'List virtual windows: id, title, foreground flag, pane count. Use for broad layout survey; follow up with ContextWindowDetail for one window.',
-      parameters: { type: 'object', properties: {}, additionalProperties: false },
-    },
-    {
-      name: 'ContextWindowDetail',
-      description:
-        'Detail for one virtual window: pane ids + kinds + rects + focused flag. Input `addr` accepts either "win:3" or "3".',
-      parameters: {
-        type: 'object',
-        properties: { addr: { type: 'string' } },
-        required: ['addr'],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: 'ContextPaneDetail',
-      description:
-        'Detail for one pane: kind, title, which window, optional tail of its rendered text (set `captureTail:true`).',
-      parameters: {
-        type: 'object',
-        properties: {
-          addr: { type: 'string' },
-          captureTail: { type: 'boolean' },
-          maxBytes: { type: 'number' },
-        },
-        required: ['addr'],
-        additionalProperties: false,
-      },
     },
     {
       name: 'ContextPtysList',
@@ -133,10 +86,6 @@ export function buildContextTools(): LLMToolSpec[] {
         'List terminal-modal sessions (coding agents + shells): id, title, state (foreground|background|exited).',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
     },
-    // Surface-unification v2.2 V2.2-5 (2026-05-11) — `ContextJobsList` retired
-    // (scheduler view폐기). Workflows take that role under `/workflows`; LLMs
-    // call workflow-runtime listings directly when they need a scheduled-work
-    // snapshot.
     {
       name: 'ContextWidgetsList',
       description: 'List currently-mounted widgets by id (tied to the active plugin, if any).',
@@ -181,7 +130,7 @@ export function buildContextTools(): LLMToolSpec[] {
     {
       name: 'ContextBootstrap',
       description:
-        'One-shot context warmup: returns workspace + windows.list + ptys.list + sessions.list + tools.list together. Call once at turn start if you need a broad picture, then drill in with the specialized tools as needed.',
+        'One-shot context warmup: returns workspace + ptys.list + sessions.list + tools.list together. Call once at turn start if you need a broad picture, then drill in with the specialized tools as needed.',
       parameters: {
         type: 'object',
         properties: {
@@ -204,81 +153,6 @@ export async function dispatchContextWorkspace(
     output: `cwd=${w.cwd} platform=${w.platform}${w.remoteHost ? ` remote=${w.remoteHost}` : ''} sandbox=${w.sandboxAvailable ? 'yes' : 'no'}`,
     workspace: w,
   };
-}
-
-export async function dispatchContextWindowsList(
-  _args: Record<string, unknown>,
-  deps: ContextDeps = {},
-): Promise<{ output: string; windows: Array<{ addr: string; id: number; title: string; foreground: boolean; paneCount: number }> }> {
-  const wr = deps.getWindowRegistry?.();
-  const windows: Array<{ addr: string; id: number; title: string; foreground: boolean; paneCount: number }> = [];
-  if (wr) {
-    const foreId = wr.current?.()?.id;
-    for (const w of wr.list()) {
-      windows.push({
-        addr: `win:${w.id}`,
-        id: w.id,
-        title: w.title,
-        foreground: foreId === w.id,
-        paneCount: w.listPanes().length,
-      });
-    }
-  }
-  const output = windows.length
-    ? windows.map(w => `${w.addr}${w.foreground ? '*' : ''} "${w.title}" panes=${w.paneCount}`).join(', ')
-    : '(no virtual windows)';
-  return { output, windows };
-}
-
-export async function dispatchContextWindowDetail(
-  args: Record<string, unknown>,
-  deps: ContextDeps = {},
-): Promise<{ output: string; window?: unknown }> {
-  const addr = String(args.addr ?? '');
-  const m = /^(?:win:)?(\d+)$/.exec(addr.trim());
-  if (!m) return { output: `invalid window addr: ${addr}` };
-  const id = parseInt(m[1]!, 10);
-  const wr = deps.getWindowRegistry?.();
-  if (!wr) return { output: 'window registry unavailable' };
-  const w = wr.list().find(x => x.id === id);
-  if (!w) return { output: `unknown window win:${id}` };
-  const panes = w.listPanes().map(p => ({
-    addr: `pane:${p.id}`,
-    id: p.id,
-    kind: p.content.kind,
-    title: p.content.title,
-    focused: w.focused === p.id,
-  }));
-  return {
-    output: `win:${id} "${w.title}" panes=${panes.length}: ${panes.map(p => `${p.addr}(${p.kind}${p.focused ? ',focus' : ''})`).join(', ')}`,
-    window: { addr: `win:${id}`, id, title: w.title, panes },
-  };
-}
-
-export async function dispatchContextPaneDetail(
-  args: Record<string, unknown>,
-  deps: ContextDeps = {},
-): Promise<{ output: string; pane?: unknown }> {
-  const addr = String(args.addr ?? '').replace(/^pane:/, '');
-  if (!addr) return { output: 'missing pane addr' };
-  const wr = deps.getWindowRegistry?.();
-  if (!wr) return { output: 'window registry unavailable' };
-  for (const w of wr.list()) {
-    const p = w.listPanes().find(x => x.id === addr);
-    if (!p) continue;
-    const body = args.captureTail === true
-      ? deps.capturePane?.(addr, typeof args.maxBytes === 'number' ? args.maxBytes : undefined)
-      : undefined;
-    return {
-      output: `pane:${addr} (${p.content.kind}) in win:${w.id}${body ? ` tail=${body.length}B` : ''}`,
-      pane: {
-        addr: `pane:${addr}`, windowId: w.id, kind: p.content.kind,
-        title: p.content.title, focused: w.focused === p.id,
-        tail: body,
-      },
-    };
-  }
-  return { output: `unknown pane:${addr}` };
 }
 
 export async function dispatchContextPtysList(): Promise<{
@@ -332,12 +206,6 @@ export async function dispatchContextSessionsList(
     sessions,
   };
 }
-
-// Surface-unification v2.2 V2.2-5 (2026-05-11) — `context.jobs.list`
-// tool retired together with the dashboard scheduler view. Scheduled
-// work is now first-class workflow surface (`scheduleTrigger` nodes ·
-// `/workflows` listing · `~/.elanous/workflows-runs/`). LLMs that need a
-// "what's scheduled" view consult the workflows path directly.
 
 export async function dispatchContextWidgetsList(): Promise<{
   output: string;
@@ -404,9 +272,8 @@ export async function dispatchContextBootstrap(
   args: Record<string, unknown>,
   deps: ContextDeps = {},
 ): Promise<{ output: string; [k: string]: unknown }> {
-  const [workspace, windows, ptys, sessions, tools] = await Promise.all([
+  const [workspace, ptys, sessions, tools] = await Promise.all([
     dispatchContextWorkspace({}, deps),
-    dispatchContextWindowsList({}, deps),
     dispatchContextPtysList(),
     dispatchContextSessionsList({}, deps),
     dispatchContextToolsList({}),
@@ -418,14 +285,12 @@ export async function dispatchContextBootstrap(
   return {
     output: [
       workspace.output,
-      `windows: ${windows.output}`,
       `ptys: ${ptys.output}`,
       `sessions: ${sessions.output}`,
       tools.output,
       `state-store entries: ${storeSize}`,
     ].join(' | '),
     workspace: workspace.workspace,
-    windows: windows.windows,
     ptys: ptys.ptys,
     sessions: sessions.sessions,
     tools: tools.tools,

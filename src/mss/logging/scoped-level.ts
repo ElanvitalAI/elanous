@@ -26,8 +26,8 @@ export function scopedLevelPath(): string {
 interface ScopedLevelFile {
   level?: unknown;
   /** OH9(2026-07-24) — 렌더 로그 발화 여부(축은 level 과 직교). true = 렌더 로그
-   *  ON(비억제) · false = 억제(무음). 부재(undefined) = 명시 없음 → config/uiMode
-   *  시드로 폴백. `elanous logs level --render on|off` 가 이 한 필드를 관리한다. */
+   *  ON(비억제) · false = 억제(무음). 부재(undefined) = 부팅 시드로 폴백.
+   *  `elanous logs level --render on|off` 가 이 한 필드를 관리한다. */
   render?: unknown;
   updatedAt?: unknown;
   pid?: unknown;
@@ -133,17 +133,13 @@ export function readScopedRenderLogs(path: string = scopedLevelPath()): boolean 
   }
 }
 
-/** 렌더 무음 시드 해석(부팅·`/ui` 전환 공용). 우선순위:
- *   1. level.json.render(명시) — true=비억제 · false=억제
- *   2. config.debug.renderLogs === true — 명시 override → 비억제(절대 안 끔)
- *   3. uiMode essential → 억제 · rich → 비억제(기본)
- *  반환값 = `_renderSuppressed` 로 넣을 boolean(true=억제). */
+/** Render suppression: explicit scoped setting wins, then config override; dashboard opts into essential suppression. */
 export function resolveRenderSuppressed(input: {
   scopedRender: boolean | null;
   configRenderLogs?: boolean | undefined;
-  uiModeEssential: boolean;
+  defaultSuppressed?: boolean | undefined;
 }): boolean {
   if (input.scopedRender !== null) return !input.scopedRender;
   if (input.configRenderLogs === true) return false;
-  return input.uiModeEssential;
+  return input.defaultSuppressed ?? false;
 }

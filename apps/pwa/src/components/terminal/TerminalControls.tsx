@@ -294,11 +294,12 @@ export function TerminalControls({ terminalId, onClear, onRecordingChange, onAtt
           ×
         </button>
       )}
-      <span className="ml-auto text-[11px] text-muted-foreground">
-        {active && '● recording'}
-        {done && !active && `✓ ${done.recorderId}`}
-        {!active && !done && 'screenshot — WT-C-2'}
-      </span>
+      {(active || done) && (
+        <span className="ml-auto text-[11px] text-muted-foreground">
+          {active && '● recording'}
+          {done && !active && `✓ ${done.recorderId}`}
+        </span>
+      )}
       {error && (
         <span className="ml-2 max-w-[40%] truncate text-[11px] text-rose-500" title={error}>
           {error}

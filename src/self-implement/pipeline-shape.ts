@@ -20,7 +20,7 @@ export const TERMINAL_STAGES_BY_NODE = {
   'main-sync': ['merge-conflict'],
   regate: ['gate-failed'],
   'open-pr': ['pr-declined', 'pr-opened', 'worktree-completed'],
-  merge: ['merged', 'pr-opened'],
+  merge: ['merged', 'pr-opened', 'merge-ready'],
 } as const satisfies Record<PipelineNodeId, readonly SelfImplementStage[]>;
 
 type DeclaredTerminalStage = (typeof TERMINAL_STAGES_BY_NODE)[PipelineNodeId][number];

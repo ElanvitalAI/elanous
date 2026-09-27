@@ -9,13 +9,12 @@ import {
   useRef,
   useState,
 } from 'react';
-import { Loader2, MessagesSquare, Mic, MicOff, Sparkles, Square, TerminalSquare, Volume2, VolumeX } from 'lucide-react';
+import { Loader2, MessagesSquare, Mic, MicOff, Sparkles, Square, Volume2, VolumeX } from 'lucide-react';
 import { toast } from 'sonner';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { ChatHistory } from '@/components/chat/ChatHistory';
 import { ChatInput } from '@/components/chat/ChatInput';
 import { BudgetPill } from '@/components/chat/BudgetPill';
-import { ProviderPicker } from '@/components/chat/ProviderPicker';
 import { SessionPill } from '@/components/chat/SessionPill';
 import { VoiceCostPill } from '@/components/chat/VoiceCostPill';
 import { Button } from '@/components/ui/button';
@@ -26,16 +25,13 @@ import type { VoicePhase } from '@/voice/use-voice-controller';
 import { useVoiceTts } from '@/voice/use-voice-tts';
 import {
   dispatchMeta,
+  isMetaCommand,
   newMetaMessage,
   newUserMessage,
   type ChatMessage,
   type MetaResult,
 } from '@/lib/chat-runtime';
-import {
-  buildMirroredMessage,
-  countDroppedAttachments,
-  type ReplMirrorKind,
-} from '@/lib/dock-history-mirror';
+import { countDroppedAttachments } from '@/lib/dock-attachment-count';
 import { fetchDockHistory } from '@/lib/dock-history-hydrate';
 
 const QUICK_TERMINAL_COMMANDS = [
@@ -48,9 +44,6 @@ const QUICK_TERMINAL_COMMANDS = [
 const HISTORY_LIMIT = 200;
 
 export interface TerminalChatDockHandle {
-  /** BACKLOG #15 — append a mirrored REPL event into the dock's
-   *  history. TerminalPanel forwards `TerminalRepl.onMirror` here. */
-  appendMirrored: (event: ReplMirrorKind) => void;
   /** Phase 2 (webterm voice control) — TerminalPanel-owned voice
    *  controller routes STT `final` transcripts here when activeMicSource
    *  === 'dock'. Skips the call when a turn is already in flight (B2
@@ -76,8 +69,7 @@ export interface TerminalChatDockVoiceProps {
 interface Props {
   terminalId: string;
   open: boolean;
-  replOpen: boolean;
-  onToggleRepl: () => void;
+  onTabIntent?: (intent: 'next' | 'prev' | number) => void;
   /** Parent-measured vertical allocation; absent or invalid values keep the legacy CSS budget. */
   height?: number;
   voice?: TerminalChatDockVoiceProps;
@@ -93,13 +85,13 @@ function normalizeMetaOutput(raw: string | undefined): string {
 }
 
 export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(function TerminalChatDock(
-  { terminalId, open, replOpen, onToggleRepl, height, voice },
+  { terminalId, open, onTabIntent, height, voice },
   ref,
 ) {
   const externalHeight = typeof height === 'number' && Number.isFinite(height) && height > 0
     ? height
     : undefined;
-  const { client, config, setConfig, sessionId, setSessionId } = useDaemon();
+  const { client, config, sessionId, setSessionId } = useDaemon();
   const latestSessionIdRef = useRef(sessionId);
   const acpRef = useRef<ReturnType<typeof client.connectAcp> | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -212,22 +204,12 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
     setMessages((prev) => [...prev, msg].slice(-HISTORY_LIMIT));
   }, []);
 
-  // BACKLOG #15 — imperative handle so TerminalPanel can forward
-  // TerminalRepl events into the dock's unified history without lifting
-  // messages state to a parent.
-  // Phase 2 (webterm voice) — adds submitVoiceTranscript so the panel-
-  // owned useVoiceController can route final STT transcripts here when
+  // Phase 2 (webterm voice) — submitVoiceTranscript lets the panel-owned
+  // useVoiceController route final STT transcripts here when
   // activeMicSource === 'dock'. ref-based dispatch keeps the handle
   // identity stable across renders (no re-create on handleSubmit
   // identity change).
   useImperativeHandle(ref, () => ({
-    appendMirrored: (event: ReplMirrorKind): void => {
-      append(buildMirroredMessage(event));
-      debugLog('webterm.terminal-chat.mirror', {
-        terminalId,
-        kind: event.kind,
-      });
-    },
     submitVoiceTranscript: (text: string): void => {
       const trimmed = text.trim();
       if (!trimmed) return;
@@ -238,7 +220,7 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
       debugLog('webterm.terminal-chat.voice.auto-send', { len: trimmed.length });
       void latestSubmitRef.current(trimmed);
     },
-  }), [append, terminalId]);
+  }), []);
 
   const ensureAcp = useCallback(() => {
     const sid = latestSessionIdRef.current;
@@ -253,10 +235,9 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
     sessionId,
     provider: config.provider,
     setSessionId,
-    setProvider: (p: string) => setConfig({ provider: p }),
     daemon: { baseUrl: config.baseUrl, ...(config.token ? { token: config.token } : {}) },
     messages,
-  }), [client, config.baseUrl, config.provider, config.token, messages, sessionId, setConfig, setSessionId]);
+  }), [client, config.baseUrl, config.provider, config.token, messages, sessionId, setSessionId]);
 
   const handleAttached = useCallback((entries: AttachmentMeta[]): void => {
     setPendingAttachments((prev) => [...prev, ...entries]);
@@ -272,7 +253,7 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
   }, []);
 
   const executeMeta = useCallback(async (line: string): Promise<void> => {
-    const meta: MetaResult | null = await dispatchMeta(line, ctx);
+    const meta: MetaResult | null = line.startsWith(':') ? null : await dispatchMeta(line, ctx);
     if (meta) {
       if (meta.text === '__CLEAR__') {
         setMessages([]);
@@ -280,7 +261,6 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
         append(newMetaMessage(meta.text, terminalId));
       }
       if (meta.newSessionId) setSessionId(meta.newSessionId);
-      if (meta.newProvider !== undefined) setConfig({ provider: meta.newProvider });
       return;
     }
 
@@ -307,6 +287,7 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
     append(newMetaMessage(normalizeMetaOutput(res?.output), terminalId));
     if (res?.sessionIdChange) setSessionId(res.sessionIdChange);
     if (res?.tabIntent !== undefined) {
+      onTabIntent?.(res.tabIntent);
       append(newMetaMessage(`tab intent → ${String(res.tabIntent)}`, terminalId));
     }
     if (res?.injectPath) {
@@ -315,7 +296,7 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
     if (res?.agentChatModeEnter) {
       append(newMetaMessage('agent chat mode hint — terminal dock already runs plain text as agent turns', terminalId));
     }
-  }, [append, ctx, ensureAcp, sessionId, setConfig, setSessionId, terminalId]);
+  }, [append, ctx, ensureAcp, onTabIntent, sessionId, setSessionId, terminalId]);
 
   const triggerAbort = useCallback(async (): Promise<void> => {
     const sid = latestSessionIdRef.current;
@@ -373,7 +354,7 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
 
     setPending(true);
     try {
-      if (trimmed.startsWith(':')) {
+      if (isMetaCommand(trimmed)) {
         await executeMeta(trimmed);
         return;
       }
@@ -409,11 +390,16 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
         attachCount: attached.length,
         placeholderId,
       });
+      const attachmentPaths = attached
+        .filter((entry) => entry.path)
+        .map((entry) => `[attached] ${entry.path}`);
+      const agentText = attachmentPaths.length > 0
+        ? `${attachmentPaths.join('\n')}\n\n${trimmed}`.trimEnd()
+        : trimmed;
       const res = (await acp.send('terminal/repl/exec', {
         sessionId,
         terminalId,
-        line: `:agent ${trimmed}`,
-        attachments: attached,
+        line: `:agent ${agentText}`,
       })) as {
         output?: string;
         agent?: {
@@ -557,7 +543,6 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
               STT/TTS USD pill mirror of /chat header. PR #1891 컴포넌트 재사용 ·
               daemon URL 미설정 시 자동 hidden. */}
           <VoiceCostPill />
-          <ProviderPicker />
           {pendingPrompt && (
             <Button
               variant="destructive"
@@ -597,15 +582,6 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
               </div>
             )}
           </div>
-          <Button
-            variant={replOpen ? 'secondary' : 'outline'}
-            size="sm"
-            onClick={onToggleRepl}
-            title={replOpen ? 'hide command strip' : 'show command strip'}
-          >
-            <TerminalSquare className="h-3.5 w-3.5" />
-            {replOpen ? 'REPL on' : 'REPL off'}
-          </Button>
         </div>
       </div>
       {pendingPrompt && (

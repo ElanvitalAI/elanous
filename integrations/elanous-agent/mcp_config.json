@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "elanous": {
+      "command": "elanous",
+      "args": ["mcp", "serve"]
+    }
+  }
+}

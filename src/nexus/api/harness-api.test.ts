@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import type { GoalRunRecord } from '../../self-implement/goal-run-store.js';
+import { readReportOrigin } from '../../self-implement/report-origin.js';
 import { LogStore } from '../../mss/logging/log-store.js';
 import {
   handleHarnessAskPost,
@@ -83,6 +87,26 @@ describe('harness API handlers', () => {
     expect((await nullBody.json() as { error: string }).error).toContain('usage: POST /v1/harness/ask');
   });
 
+  test('ask forwards a valid origin only in the detached launch environment; ignores unknown shapes', async () => {
+    const origin = { channel: 'telegram' as const, chatId: -100123, botId: 'bot-1', threadId: 7 };
+    const launches: Array<{ env?: Record<string, string> }> = [];
+    const logs: string[] = [];
+    for (const supplied of [origin, undefined, { channel: 'telegram', chatId: 'not-a-number' }]) {
+      const body = supplied === undefined ? { text: 'ask' } : { text: 'ask', origin: supplied };
+      const response = await handleHarnessAskPost(request('/v1/harness/ask', body), {}, {
+        log: (event) => { logs.push(event); },
+        runAskLaunchFlow: async () => ({ kind: 'launch', goalFile: '/tmp/GOAL.md' }) as never,
+        launchDevGoalFileDetached: async (input) => { launches.push(input); },
+      });
+      expect(response.status).toBe(202);
+      await Bun.sleep(0);
+    }
+    expect(readReportOrigin(launches[0]!.env ?? {})).toEqual(origin);
+    expect(launches[1]).not.toHaveProperty('env');
+    expect(launches[2]).not.toHaveProperty('env');
+    expect(logs.filter((event) => event === 'ask-origin-ignored')).toHaveLength(1);
+  });
+
   test('ask emits an empty sessionId without changing the accepted response when omitted', async () => {
     const feedback: unknown[] = [];
     const response = await handleHarnessAskPost(request('/v1/harness/ask', { text: 'ask' }), {}, {
@@ -135,14 +159,20 @@ describe('harness API handlers', () => {
       expect(launchCalls).toBe(0);
     }
 
-    const launchCalls: unknown[] = [];
-    const response = await handleHarnessAskPost(request('/v1/harness/ask', { text: 'ask', target: process.cwd() }), {}, {
-      runAskLaunchFlow: async () => ({ kind: 'launch', goalFile: '/tmp/GOAL.md' }) as never,
-      launchDevGoalFileDetached: async (input) => { launchCalls.push(input); },
-    });
-    expect(response.status).toBe(202);
-    await Bun.sleep(0);
-    expect(launchCalls).toEqual([{ goalFile: '/tmp/GOAL.md', correlation: expect.any(String), target: process.cwd() }]);
+    // The allowed target is «inside home». process.cwd() is outside home when the suite runs
+    // from a worktree under /tmp or /private/tmp (harness worktrees, CI) — use a directory
+    // that is inside home wherever the suite runs.
+    const allowed = mkdtempSync(join(homedir(), '.elanous-harness-target-'));
+    try {
+      const launchCalls: unknown[] = [];
+      const response = await handleHarnessAskPost(request('/v1/harness/ask', { text: 'ask', target: allowed }), {}, {
+        runAskLaunchFlow: async () => ({ kind: 'launch', goalFile: '/tmp/GOAL.md' }) as never,
+        launchDevGoalFileDetached: async (input) => { launchCalls.push(input); },
+      });
+      expect(response.status).toBe(202);
+      await Bun.sleep(0);
+      expect(launchCalls).toEqual([{ goalFile: '/tmp/GOAL.md', correlation: expect.any(String), target: allowed }]);
+    } finally { rmSync(allowed, { recursive: true, force: true }); }
   });
 
   test('ask logs background failures without changing accepted response', async () => {

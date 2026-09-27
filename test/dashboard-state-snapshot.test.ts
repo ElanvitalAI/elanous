@@ -5,26 +5,9 @@ import {
   captureDashboardState, renderDashboardStateForSystemPrompt,
 } from '../src/dashboard/runtime/state-snapshot';
 import { resolveTerminalInteractionPolicy } from '../src/dashboard/terminal-exposure';
-import { DisplayCoordinator } from '../src/display/coordinator.js';
-import {
-  initDashboardVirtualWindows,
-  _resetDashboardVirtualWindowsForTesting,
-} from '../src/dashboard/windowing/virtual-windows.js';
 import {
   setPtyAdapterForTesting, resetForTesting, startPty,
 } from '../src/pty-shell/registry';
-
-function spawnProbeWindow(): void {
-  const coord = new DisplayCoordinator({ frameMs: 0 });
-  const vw = initDashboardVirtualWindows({
-    coordinator: coord,
-    defaultBounds: () => ({ row: 1, col: 1, width: 80, height: 24 }),
-  });
-  vw.registry.spawn({
-    title: 'probe',
-    initialContent: { kind: 'markdown', text: 'hello' },
-  });
-}
 
 type FakePty = {
   pid: number;
@@ -55,17 +38,15 @@ describe('captureDashboardState', () => {
   beforeEach(() => {
     resetForTesting();
     installFakeAdapter();
-    _resetDashboardVirtualWindowsForTesting();
   });
   afterEach(() => {
     resetForTesting();
     setPtyAdapterForTesting(null);
-    _resetDashboardVirtualWindowsForTesting();
   });
 
   test('returns empty-lists snapshot when nothing is running', () => {
     const s = captureDashboardState({ cwd: '/tmp/foo' });
-    expect(s.windows).toEqual([]);
+    expect(s).not.toHaveProperty('windows');
     expect(s.ptys).toEqual([]);
     expect(s.terminalSessions).toEqual([]);
     expect(s.recentTerminalMouseIntents).toEqual([]);
@@ -131,42 +112,16 @@ describe('captureDashboardState', () => {
     expect(s.workspace.remoteHost).toBe('bastion');
   });
 
-  test('includes virtual windows by default when they exist', () => {
-    spawnProbeWindow();
-    const s = captureDashboardState({ cwd: '/tmp' });
-    expect(s.windows).toHaveLength(1);
-    expect(s.windows[0]?.title).toBe('probe');
-    expect(s.windows[0]?.panes.length).toBeGreaterThan(0);
-    expect(s.workspace.cwd).toBe('/tmp');
-    expect(s.workspace.platform).toBe(process.platform);
-  });
-
-  test('emits windows: [] when includeVirtualWindows is false', () => {
-    spawnProbeWindow();
-    const s = captureDashboardState({ cwd: '/tmp', includeVirtualWindows: false });
-    expect(s.windows).toEqual([]);
-    expect(s.workspace.cwd).toBe('/tmp');
-    expect(s.workspace.platform).toBe(process.platform);
-  });
-
-  test('includeVirtualWindows true still captures windows', () => {
-    spawnProbeWindow();
-    const s = captureDashboardState({ cwd: '/tmp', includeVirtualWindows: true });
-    expect(s.windows).toHaveLength(1);
-    expect(s.windows[0]?.title).toBe('probe');
-  });
 });
 
 describe('renderDashboardStateForSystemPrompt', () => {
   beforeEach(() => {
     resetForTesting();
     installFakeAdapter();
-    _resetDashboardVirtualWindowsForTesting();
   });
   afterEach(() => {
     resetForTesting();
     setPtyAdapterForTesting(null);
-    _resetDashboardVirtualWindowsForTesting();
   });
 
   test('header + workspace + empty sections when nothing active', () => {
@@ -174,7 +129,7 @@ describe('renderDashboardStateForSystemPrompt', () => {
     const text = renderDashboardStateForSystemPrompt(s);
     expect(text).toContain('# monad-agent state');
     expect(text).toContain('workspace: cwd=/tmp');
-    expect(text).toContain('virtual windows: none');
+    expect(text).not.toContain('virtual windows:');
     expect(text).not.toContain('pty shells:');
     expect(text).not.toContain('terminal sessions:');
   });

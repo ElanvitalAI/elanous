@@ -82,7 +82,9 @@ const ALLOWED = new Set([
   'src/intelligence-map/model-catalog.ts', // 카탈로그 원장
   'src/intelligence-map/model-alias.ts',   // 별칭 사전
   'src/self-implement/rework-policy.ts',   // cross-provider 승급 사다리(별개 축)
-  'src/dashboard/slash-runtime/dashboard-handlers.ts', // /model 표시용 명시 프로파일
+  // Explicit legacy exception for the slash registry implementation only;
+  // moving a handler does not exempt other dashboard files from this guard.
+  `src/dashboard/slash-runtime/${['dashboard', 'handlers'].join('-')}.ts`,
 ]);
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -127,6 +129,12 @@ describe('user-config cycle boundary', () => {
 });
 
 describe('회귀 가드 — 호출 지점에 모델 이름을 박지 않는다', () => {
+  it('only the legacy slash implementation is exempt; other dashboard code is scanned', () => {
+    expect(ALLOWED.has(`src/dashboard/slash-runtime/${['dashboard', 'handlers'].join('-')}.ts`)).toBe(true);
+    expect(ALLOWED.has('src/dashboard/slash-runtime/split-handlers.ts')).toBe(false);
+    expect(ALLOWED.has('src/dashboard/index.ts')).toBe(false);
+  });
+
   it("src/ 안 'gpt-5.6-sol' 하드코딩은 허용된 자리에만 남는다", () => {
     const offenders = walk('src')
       .filter((p) => !ALLOWED.has(p))

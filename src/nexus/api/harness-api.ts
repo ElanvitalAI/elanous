@@ -8,6 +8,7 @@ import * as askIo from '../../self-dev/ask-launch-io.js';
 import { DAEMON_HARNESS_ASK_ENTRANCE } from '../../self-dev/entrance-registry.js';
 import { prepareAskLaunch } from '../../self-dev/launch-preflight.js';
 import { launchDevGoalFileDetached } from '../../self-implement/seams.js';
+import { encodeReportOriginEnv, readReportOrigin, REPORT_ORIGIN_ENV } from '../../self-implement/report-origin.js';
 import { loadGoalRunQuery, type GoalRunRecord } from '../../self-implement/goal-run-store.js';
 import { resolveHarnessTarget } from '../../self-implement/harness-target-options.js';
 import { queryRunningRuns, type RunningRunsResult } from '../../self-implement/running-runs.js';
@@ -237,6 +238,10 @@ export async function handleHarnessAskPost(req: Request, _metaApi: HarnessMetaAp
 
   const acceptanceId = deps.createAcceptanceId?.() ?? crypto.randomUUID();
   const log = deps.log ?? ((event, data) => debug.log('harness-http', event, data));
+  const suppliedOrigin = (body as { origin?: unknown }).origin;
+  const origin = suppliedOrigin === undefined ? null
+    : readReportOrigin({ [REPORT_ORIGIN_ENV]: JSON.stringify(suppliedOrigin) });
+  if (suppliedOrigin !== undefined && !origin) log('ask-origin-ignored', { acceptanceId, reason: 'invalid-origin' });
   const ask = deps.runAskLaunchFlow ?? runAskLaunchFlow;
   const launch = deps.launchDevGoalFileDetached ?? launchDevGoalFileDetached;
   const emitFeedback = deps.createFeedbackEmitter?.(acceptanceId);
@@ -276,7 +281,7 @@ export async function handleHarnessAskPost(req: Request, _metaApi: HarnessMetaAp
       log('ask-flow-settled', { acceptanceId, kind: result.kind });
       if (result.kind === 'launch') {
         log('ask-launch-started', { acceptanceId, goalFile: result.goalFile });
-        await launch({ goalFile: result.goalFile, correlation: acceptanceId, ...(typeof target === 'string' ? { target } : {}) });
+        await launch({ goalFile: result.goalFile, correlation: acceptanceId, ...(typeof target === 'string' ? { target } : {}), ...(origin ? { env: encodeReportOriginEnv(origin) } : {}) });
         log('ask-launch-settled', { acceptanceId, goalFile: result.goalFile });
         emitCompletion(`Harness ask launched: ${result.goalFile}`);
       } else {

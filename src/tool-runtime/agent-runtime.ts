@@ -10,6 +10,7 @@ export const agentRuntime: ToolRuntime<Record<string, unknown>, AgentToolResult>
   spec: buildAgentTool(),
   async run(req, ctx) {
     return await dispatchAgent(req, {
+      ...(ctx.agentCwd ? { cwd: ctx.agentCwd } : {}),
       hostTools: ctx.agentHostTools,
       dispatchTool: ctx.agentDispatchTool,
       buildChildToolCatalog: ctx.buildChildToolCatalog,

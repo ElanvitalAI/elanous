@@ -112,7 +112,9 @@ describe('SessionsService.forceRefresh — GET /v1/sessions/store', () => {
       status: 200,
       body: { ok: true, sessions: SAMPLE_CARDS, total: 2, ts: '2026-05-06T12:00:01Z' },
     });
-    const service = new SessionsService(makeClient());
+    const client = makeClient();
+    expect('prompt' in client).toBe(false);
+    const service = new SessionsService(client);
     expect(service.list()).toEqual([]);
     await service.forceRefresh();
     expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/sessions/store');
@@ -272,18 +274,30 @@ describe('SessionsService subscriptions — current store-card updates', () => {
 });
 
 describe('SessionsService polling — browser cadence', () => {
-  // ⛔ 값이 아니라 «속성 서술자»를 통째로 붙잡았다 되돌린다.
-  //   값만 다시 심으면 원래가 접근자였거나 «아예 없었을» 때 그 상태를 못 되돌리고,
-  //   globalThis 에 데이터 속성이 «남아» 같은 프로세스의 다른 시험(window.localStorage 를 쓰는 것들)이 죽는다.
-  //   📏 2026-08-28 실측: 값만 되돌리던 판에서 apps/pwa/src/lib 축이 1324p/0f → 1308p/***23f*** 였다
-  //      (daemon-session · ocr-prefs · surface-preference — 전부 localStorage 계열).
   const originalWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  const intervals = new Map<number, { tick: () => void; ms: number }>();
+  let nextTimerId = 0;
 
   beforeEach(() => {
+    intervals.clear();
+    nextTimerId = 0;
     Object.defineProperty(globalThis, 'window', { configurable: true, value: {} });
+    globalThis.setInterval = ((tick: () => void, ms: number) => {
+      const id = ++nextTimerId;
+      intervals.set(id, { tick, ms });
+      return id;
+    }) as typeof setInterval;
+    globalThis.clearInterval = ((id: number) => {
+      intervals.delete(id);
+    }) as typeof clearInterval;
   });
 
   afterEach(() => {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    intervals.clear();
     if (originalWindowDescriptor) Object.defineProperty(globalThis, 'window', originalWindowDescriptor);
     else delete (globalThis as { window?: unknown }).window;
   });
@@ -291,31 +305,48 @@ describe('SessionsService polling — browser cadence', () => {
   it('starts an immediate idle refresh and polls again at the idle cadence', async () => {
     globalThis.fetch = mockResponse({ status: 200, body: { ok: true, sessions: [] } });
     const service = new SessionsService(makeClient(), { activeIntervalMs: 10, idleIntervalMs: 20 });
-    service.start();
-    await new Promise((resolve) => setTimeout(resolve, 45));
-    expect(calls.length).toBeGreaterThanOrEqual(3);
-    service.dispose();
+    try {
+      service.start();
+      expect(calls.length).toBe(1);
+      expect([...intervals.values()].map((timer) => timer.ms)).toEqual([20]);
+      await service.forceRefresh();
+      intervals.values().next().value!.tick();
+      expect(calls.length).toBe(2);
+    } finally {
+      service.dispose();
+    }
+    expect(intervals.size).toBe(0);
   });
 
   it('switches to active cadence and an idempotent release restores idle cadence', async () => {
     globalThis.fetch = mockResponse({ status: 200, body: { ok: true, sessions: [] } });
     const service = new SessionsService(makeClient(), { activeIntervalMs: 10, idleIntervalMs: 50 });
-    service.start();
-    const release = service.enterActive();
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(calls.length).toBeGreaterThanOrEqual(3);
-    release();
-    release();
-    const settledCalls = calls.length;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    expect(calls.length).toBe(settledCalls);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(calls.length).toBeGreaterThan(settledCalls);
-    const nextRelease = service.enterActive();
-    await new Promise((resolve) => setTimeout(resolve, 15));
-    expect(calls.length).toBeGreaterThan(settledCalls + 1);
-    nextRelease();
-    service.dispose();
+    try {
+      service.start();
+      await service.forceRefresh();
+      const idleId = nextTimerId;
+      const release = service.enterActive();
+      expect(intervals.has(idleId)).toBe(false);
+      expect([...intervals.values()].map((timer) => timer.ms)).toEqual([10]);
+      intervals.values().next().value!.tick();
+      expect(calls.length).toBe(2);
+      await service.forceRefresh();
+      const activeId = nextTimerId;
+      release();
+      release();
+      expect(intervals.has(activeId)).toBe(false);
+      expect([...intervals.values()].map((timer) => timer.ms)).toEqual([50]);
+      intervals.values().next().value!.tick();
+      expect(calls.length).toBe(3);
+      await service.forceRefresh();
+      const nextRelease = service.enterActive();
+      expect([...intervals.values()].map((timer) => timer.ms)).toEqual([10]);
+      nextRelease();
+      expect([...intervals.values()].map((timer) => timer.ms)).toEqual([50]);
+    } finally {
+      service.dispose();
+    }
+    expect(intervals.size).toBe(0);
   });
 });
 

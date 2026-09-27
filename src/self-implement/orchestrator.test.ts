@@ -7601,6 +7601,29 @@ describe('runSelfImplement — docs Markdown 대량 삭제 auto-merge guard', ()
     expect(result).toMatchObject({ stage: 'pr-opened', merged: false, mergeReason: 'merge-attempt-failed' });
   });
 
+  test('mergeByHost: clean review and merge guards leave a ready PR with the checked head, never merge in Pod', async () => {
+    let mergeCalls = 0;
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.mergePr = async () => { mergeCalls++; return { merged: true }; };
+    s.readPrCommitShas = async () => ({ baseCommit: 'b'.repeat(40), headCommit: 'a'.repeat(40) });
+    openPrCalls = [];
+    const result = await runSelfImplement({ feature: 'host owns merge', mergeByHost: true, seams: s });
+    expect(mergeCalls).toBe(0);
+    expect(result.stage).toBe('merge-ready');
+    expect(result.prNumber).toBeDefined();
+    expect(result.prUrl).toBeDefined();
+    expect(result.checkedHeadCommit).toBe('a'.repeat(40));
+    expect(openPrCalls.at(-1)?.draft).toBe(false);
+  });
+
+  test('mergeByHost: blocked guard must not yield merge-ready', async () => {
+    const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
+    s.readPrDiff = async () => docsDiff(500);
+    const result = await runSelfImplement({ feature: 'host guard blocked', mergeByHost: true, seams: s });
+    expect(result.stage).toBe('pr-opened');
+    expect(result.checkedHeadCommit).toBeUndefined();
+  });
+
   test('docs 마크다운에서 499줄 삭제하는 diff는 자동머지된다', async () => {
     let mergeCalls = 0;
     const s = revSeams({ reviews: [{ verdict: 'pass', reviewed: true }] });
@@ -10142,6 +10165,66 @@ describe('runSelfImplement — rework budget judgment', () => {
     expect(evidence.observations.outcome.state).toBe('empty');
     expect(evidence.modelReasoning).toBe(reasoning);
     expect(evidence.observations.goal.value).not.toEqual({ _compact_depth_exceeded: true });
+  });
+
+  test('hard cap에서 baseline-only 실패는 새 시도를 막고 introduced 실패는 기존 인수 발사를 유지한다', async () => {
+    const original = debug.log;
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data: data as Record<string, unknown> });
+    }) as typeof debug.log;
+    try {
+      for (const [attribution, expectedLaunches] of [['preexisting', 0], ['introduced', 1]] as const) {
+        let launches = 0;
+        const s = seams({ gateResults: [false, false, false, false, false, false] });
+        s.diagnose = async () => 'BUDGET: EXTEND\nREASON: one more round';
+        s.readReworkSalvageEvidence = async () => ({ clean: true, aheadCommits: 2 });
+        s.launchReworkSalvage = async () => { launches++; };
+        s.gate = async () => ({
+          passed: false, log: 'gate failed',
+          baselineFailures: [{ name: 'src/cli/new-thing.test.ts > baseline red', file: 'src/cli/new-thing.test.ts', baselinePresence: 'missing', attribution }],
+          reflectGateFacts: { introduced: attribution === 'introduced' ? 1 : 0, preexisting: attribution === 'preexisting' ? 1 : 0, unknown: 0 },
+        });
+        const result = await runSelfImplement({ feature: 'baseline retry', goalFile: budgetGoalFile(), writeGoalExecutionRecord: () => {}, maxReworkRounds: 2, seams: s });
+        expect(launches).toBe(expectedLaunches);
+        expect(result).toMatchObject({ stage: 'gate-failed', salvage: expectedLaunches ? 'launched' : 'parked' });
+        expect(result.terminationReason).toBe(expectedLaunches ? undefined : 'blocked-by-baseline');
+        if (!expectedLaunches) expect(result.detail).toBe('blocked-by-baseline');
+      }
+      expect(events).toContainEqual(expect.objectContaining({ category: 'self-implement.supervisor', event: 'no-retry-baseline', data: expect.objectContaining({ preexisting: 1, flaky: 0 }) }));
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
+  test('flaky·precondition만 남아도 멈추고 unknown 또는 도입 실패가 섞이면 baseline 차단을 선언하지 않는다', async () => {
+    for (const [attributions, facts, blocked] of [
+      [['flaky-rerun', 'precondition-unmet'], { introduced: 0, preexisting: 0, unknown: 0, flakyRerun: 1 }, true],
+      [['preexisting', 'unknown'], { introduced: 0, preexisting: 1, unknown: 1 }, false],
+      [['preexisting', 'introduced'], { introduced: 1, preexisting: 1, unknown: 0 }, false],
+    ] as const) {
+      const s = seams({ gateResults: [false] });
+      s.gate = async () => ({
+        passed: false, log: 'gate red',
+        baselineFailures: attributions.map((attribution, index) => ({ name: `src/index.test.ts > case ${index}`, file: 'src/index.test.ts', baselinePresence: 'present' as const, attribution })),
+        reflectGateFacts: facts,
+      });
+      const result = await runSelfImplement({ feature: 'baseline guard', maxReworkRounds: 0, seams: s });
+      expect(result.terminationReason).toBe(blocked ? 'blocked-by-baseline' : undefined);
+    }
+  });
+
+  test('UNCONVERGEABLE gate 종료도 baseline-only면 blocked-by-baseline을 기록한다', async () => {
+    const s = seams({ gateResults: [false] });
+    s.gate = async () => ({
+      passed: false, log: 'base red',
+      baselineFailures: [{ name: 'src/index.test.ts > base red', file: 'src/index.test.ts', baselinePresence: 'present', attribution: 'preexisting' }],
+      reflectGateFacts: { introduced: 0, preexisting: 1, unknown: 0 },
+    });
+    let diagnoses = 0;
+    s.diagnose = async () => ++diagnoses === 1 ? 'BUDGET: EXTEND\nREASON: inspect first' : 'BUDGET: UNCONVERGEABLE\nREASON: base red';
+    const result = await runSelfImplement({ feature: 'baseline stop', maxReworkRounds: 5, reworkBudgetShadowStop: false, seams: s });
+    expect(result).toMatchObject({ stage: 'gate-failed', outcome: 'abandoned', terminationReason: 'blocked-by-baseline', detail: 'blocked-by-baseline' });
   });
 
   test('hard cap이 마지막 EXTEND를 무효화하면 budget-exhausted·계속 의사·경고를 남긴다', async () => {

@@ -5,6 +5,7 @@
 // knowledge.db(벡터+FTS5) 하이브리드 검색(RRF) — 의미(임베딩)와 키워드(BM25)
 // 양쪽에서 잡는다. 임베딩 다운 시 키워드 단독으로 강등(fail-soft).
 
+import type { Command } from 'commander';
 import { existsSync, readFileSync } from 'node:fs';
 import { relative, resolve } from 'node:path';
 import { knowledgeDbPath, openKnowledgeDb, hybridQueryKnowledge } from '../domains/knowledge.js';
@@ -273,4 +274,41 @@ export async function runDocsStale(
     deps.printError(`elanous docs stale: ${error instanceof Error ? error.message : String(error)}`);
     return 1;
   }
+}
+
+// ── docs (문서 지식 — DocOps P2 하이브리드 검색) ──
+export function registerDocsCommands(program: Command): void {
+  const docsCmd = program.command('docs')
+    .description('문서 지식 검색/관리 — knowledge.db 벡터+BM25 하이브리드 (DocOps)');
+  docsCmd.command('search <query>')
+    .description('하이브리드 검색(RRF) — 의미(임베딩)+키워드(FTS5) 융합. 임베딩 다운 시 키워드 단독')
+    .option('--limit <n>', '최대 결과 (기본 8·최대 20)')
+    .option('--domain <d>', '도메인 (기본 elanous — finance 신호와 격리)')
+    .option('--kind <k>', 'kind 필터 (docs|memory|signal|…)')
+    .option('--json')
+    .action(async (query: string, o: { limit?: string; domain?: string; kind?: string; json?: boolean }) => {
+      const { runDocsSearch } = await import('./docs-cli.js');
+      process.exit(await runDocsSearch(query, o));
+    });
+  docsCmd.command('revision <path>')
+    .description('문서가 선언한 현재 판과 해당 문서의 git 이력 판을 비교')
+    .option('--json', '구조화된 판정 출력')
+    .action(async (path: string, o: { json?: boolean }) => {
+      const { runDocsRevision } = await import('./docs-cli.js');
+      process.exit(await runDocsRevision(path, o));
+    });
+  docsCmd.command('stale [path]')
+    .description('과거 TypeScript 인벤토리와 대조해 실제로 늙은 문서를 판정')
+    .option('--json', '구조화된 판정 출력')
+    .option('--axis <axis>', '판정 축 — removed-identifiers(기본·고유 판별자)|all(기존 네 축 합집합)|broken-links|superseded|stale-score|source-paths(명시 선택 부가 신호)|line-anchors(「경로:줄 ⊕ 심볼」 인용이 ±5줄 안에서 맞는가)')
+    .option('--history', '사라진 식별자의 마지막 제거 커밋을 읽기 전용 이력으로 보강 (느릴 수 있음)')
+    .action(async (path: string | undefined, o: { json?: boolean; axis?: string; history?: boolean }) => {
+      // ⛔⭐ **sink 를 «먼저» 붙인다** — 붙이지 않으면 `debug.log('docs.stale', …)` 가 «불리는데»
+      //   logs.db 에 안 닿아 `elanous logs --exact-category docs.stale` 이 «0건»을 낸다.
+      //   📏 2026-08-12 실측: 이 줄이 없어서 라이브 판정 신호 ③(관측이 남는가)이 실패했다.
+      //   ⚠️ 「로그 0건」의 세 뜻(미배선 · 다른 경로 · ***sink 미등록***) 중 셋째다 — 계측은 있었다.
+      await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('cli');
+      const { runDocsStale } = await import('./docs-cli.js');
+      process.exit(await runDocsStale(path, o));
+    });
 }

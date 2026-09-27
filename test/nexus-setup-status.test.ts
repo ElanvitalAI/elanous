@@ -10,6 +10,7 @@ import {
   type SetupCheckResult,
 } from '../src/nexus/setup-status.js';
 import type { UserConfig as NexusUserConfig } from '../src/nexus/config/types.js';
+import { resolveGrokCredential } from '../src/grok/credential.js';
 
 function makeMainCfg(): MainUserConfig {
   const root = mkdtempSync(joinPath(tmpdir(), 'elanous-setup-status-'));
@@ -86,13 +87,13 @@ describe('Q.1 · checkSetupStatus', () => {
       cfg,
       nexusCfg: makeNexusCfg(),
       pwaBuilt: true,
-      resolveGrokCredential: () => ({ kind: 'subscription', baseUrl: '', token: '', headers: {}, source: 'test' }),
+      resolveGrokCredential: (() => ({ kind: 'subscription', baseUrl: '', token: '', headers: {}, source: 'test' })) as typeof resolveGrokCredential,
     });
     const apiKey = checkSetupStatus({
       cfg,
       nexusCfg: makeNexusCfg(),
       pwaBuilt: true,
-      resolveGrokCredential: () => ({ kind: 'api_key', baseUrl: '', token: '', headers: {}, source: 'test' }),
+      resolveGrokCredential: (() => ({ kind: 'api_key', baseUrl: '', token: '', headers: {}, source: 'test' })) as typeof resolveGrokCredential,
     });
     expect(subscription.required.find((item) => item.id === 'llm')).toMatchObject({
       passed: true,
@@ -111,7 +112,7 @@ describe('Q.1 · checkSetupStatus', () => {
       decideProviderForConfig: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
     });
     const noneCfg = makeMainCfg();
-    noneCfg.llm.provider = 'none';
+    (noneCfg.llm as { provider: string }).provider = 'none';
     const none = checkSetupStatus({ cfg: noneCfg, nexusCfg: makeNexusCfg(), pwaBuilt: true });
     expect(auto.required.find((item) => item.id === 'llm')?.passed).toBe(false);
     expect(none.required.find((item) => item.id === 'llm')?.passed).toBe(false);

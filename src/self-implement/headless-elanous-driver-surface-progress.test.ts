@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { EventEmitter } from 'node:events';
@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { classifyFrameState, GOAL_LOOP_STATE_RULES, UNKNOWN_INPUT_MAX_LINE_LENGTH, UNKNOWN_INPUT_MAX_LINES } from '../capture/frame-state-detect.js';
 import { decideBoundaryApproval } from './auto-intervene.js';
+import { encodeReportOriginEnv } from './report-origin.js';
 import {
   countSurfaceProgressOutcome,
   deliverSurfaceProgress,
@@ -19,11 +20,16 @@ import {
 } from './headless-elanous-driver.js';
 
 const previousStateDir = process.env.ELANOUS_STATE_DIR;
+const previousReportOrigin = process.env.ELANOUS_REPORT_ORIGIN;
 const stateDirs: string[] = [];
+
+beforeEach(() => { delete process.env.ELANOUS_REPORT_ORIGIN; });
 
 afterEach(() => {
   if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = previousStateDir;
+  if (previousReportOrigin === undefined) delete process.env.ELANOUS_REPORT_ORIGIN;
+  else process.env.ELANOUS_REPORT_ORIGIN = previousReportOrigin;
   for (const stateDir of stateDirs.splice(0)) rmSync(stateDir, { recursive: true, force: true });
 });
 
@@ -444,6 +450,65 @@ describe('headless parent-surface progress lines', () => {
       onSurfaceProgress: (line) => failureLines.push(line),
     });
     expect(failureLines).toContain('[surface-link] unavailable=pwa-query-failed\n');
+  });
+
+  test('reports one link only for an originating telegram conversation and a resolved URL; send failure is fail-soft', async () => {
+    const origin = { channel: 'telegram' as const, chatId: -100123, botId: 'bot-1', threadId: 7 };
+    const sends: Array<{ text: string; kind: string; origin: unknown }> = [];
+    const reported: Record<string, unknown>[] = [];
+    const off = debug.registerSink({
+      name: 'headless-link-reported-capture',
+      emit: (record) => {
+        if (record.category === 'self-implement.surface-link' && record.event === 'reported') reported.push(record.data as Record<string, unknown>);
+      },
+    });
+    const wasEnabled = debug.enabled;
+    debug.enable();
+    const run = async (hasOrigin: boolean, hasLink: boolean, failSend = false) => {
+      configureBoundaryMailboxState();
+      if (hasOrigin) Object.assign(process.env, encodeReportOriginEnv(origin));
+      else delete process.env.ELANOUS_REPORT_ORIGIN;
+      let aliveChecks = 0;
+      const lines: string[] = [];
+      const result = await runHeadlessGoalLoopPty({
+        binRoot: '/tmp/repo', cwd: '/tmp/worktree', featurePrompt: 'x', runId: 'report-link-run', maxWaitSec: 1, pollMs: 1,
+        ptyAvailable: () => true,
+        resolveNexusPwa: () => hasLink
+          ? { status: 'registered', loopback: 'http://127.0.0.1:4312/', url: 'https://host.ts.net/', source: 'tailnet' }
+          : { status: 'absent', reason: 'daemon-absent' },
+        spawn: (() => ({
+          id: 'self_12345678', write: () => {}, renderScreen: async () => 'working', renderScreenPng: async () => null,
+          snapshot: () => 'working', drainDelta: () => '', isAlive: () => aliveChecks++ < 2, exitCode: 0, kill: () => {},
+        })) as never,
+        onSurfaceProgress: (line) => lines.push(line),
+        sendOutbound: (text, kind, destination) => {
+          sends.push({ text, kind: kind ?? 'alert', origin: destination });
+          if (failSend) throw new Error('telegram unavailable');
+          return true;
+        },
+      });
+      expect(result.ok).toBe(true);
+      expect(lines.filter((line) => line.startsWith('[surface-link]'))).toHaveLength(1);
+    };
+    try {
+      await run(true, true);
+      expect(sends).toHaveLength(1);
+      expect(typeof sends[0]!.text).toBe('string');
+      expect(sends[0]!.text).toContain('https://host.ts.net/term?pty=self_12345678');
+      expect(sends[0]!.text).toContain('takeover');
+      expect(sends[0]).toMatchObject({ kind: 'report', origin });
+      expect(reported).toHaveLength(1);
+      expect(reported[0]).toMatchObject({ ptyId: 'self_12345678', chatId: -100123 });
+      await run(false, true);
+      await run(true, false);
+      expect(sends).toHaveLength(1);
+      await run(true, true, true);
+      expect(sends).toHaveLength(2);
+      expect(reported).toHaveLength(1);
+    } finally {
+      off();
+      if (!wasEnabled) debug.disable();
+    }
   });
 
   test('actual driver run includes callback-handoff and unwired parent-surface totals in headless.done', async () => {

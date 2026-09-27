@@ -42,6 +42,20 @@ describe('runSelfImplementCliCommand — 재라우팅 글루 seam(무손실 등�
     });
   });
 
+  it('Pod 밖 --merge-by-host 는 PR 실행 전에 거부한다', async () => {
+    const cap = capture();
+    const previous = process.env.ELANOUS_SUBSTRATE;
+    delete process.env.ELANOUS_SUBSTRATE;
+    try {
+      expect(await runSelfImplementCliCommand('F', opts({ mergeByHost: true }), { executeReroute: cap.executeReroute }))
+        .toMatchObject({ ok: false, exitCode: 1, message: expect.stringContaining('Pod 자식 전용') });
+      expect(cap.calls).toHaveLength(0);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_SUBSTRATE;
+      else process.env.ELANOUS_SUBSTRATE = previous;
+    }
+  });
+
   it('--ground → self.ground true로 무손실 전달', async () => {
     const cap = capture();
     await runSelfImplementCliCommand('F', opts({ ground: true }), { resolveWantAutoReview: () => false, executeReroute: cap.executeReroute });
@@ -301,6 +315,12 @@ describe('단일 실행의 런 슈퍼바이저 (E2)', () => {
     const goalPlanRevision = { status: 'read' as const, attempted: 0, applied: 0, failureReasons: [] };
     const result = singleRunAsJobResult('f', { ...RESULT({ runId: 'run-single' }), decomposeProposal, goalPlanRevision });
     expect(result).toMatchObject({ taskId: 'run-single', runId: 'run-single', decomposeProposal, goalPlanRevision });
+  });
+
+  it('실행 결과의 수확 상태를 감독 잡 결과로 옮기고 미지정 상태는 싣지 않는다', () => {
+    expect(singleRunAsJobResult('f', RESULT({ salvage: 'launched' })).salvage).toBe('launched');
+    expect(singleRunAsJobResult('f', RESULT({ salvage: 'parked' })).salvage).toBe('parked');
+    expect(singleRunAsJobResult('f', RESULT())).not.toHaveProperty('salvage');
   });
 
   it('리뷰 실행 여부와 미실행 사유를 감독용 결과에 보존하고, 사유 생략은 유지한다', () => {

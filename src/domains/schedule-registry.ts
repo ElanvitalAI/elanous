@@ -272,6 +272,8 @@ export function cronEntryId(cron: string, effectiveCommand: string): string {
  *  `scripts/cron-run.ts ` 토큰만 제거 → 래핑 전 원본과 동일 문자열 → id(sha1) 불변·마이그레이션 0.
  *  순수·멱등(비래핑 라인은 그대로 반환). */
 export function unwrapCronCommand(command: string): string {
+  const shell = command.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+--shell\s+/, '');
+  if (shell !== command) return shell;
   return command.replace(/(?:[^\s]*\/)?cron-run\.ts\s+/, '');
 }
 
@@ -283,8 +285,17 @@ export function wrapCronLine(line: string): string {
   return line.replace(/(\bbun\s+)(\S*scripts\/(?!cron-run\b)[\w.-]+\.ts)/, '$1scripts/cron-run.ts $2');
 }
 
-/** wrapCronLine 역 — 래퍼 제거(가역). 비래핑 라인은 그대로. */
+/** 셸 해석기가 명시된 .sh 발화만 래핑한다. 원래 해석기 토큰과 인자를 그대로 보존한다. */
+export function wrapShellCronLine(line: string, opts: { bun: string; cronRun: string }): string {
+  if (/cron-run\.ts/.test(line) || !parseCronLine(line)) return line;
+  return line.replace(/^(\s*\S+(?:\s+\S+){4}\s+(?:cd\s+\S+\s+&&\s+)?)((?:\S*\/)?(?:bash|zsh|sh))(?=\s+\S+\.sh(?:\s|$))/, (_match, prefix: string, interpreter: string) =>
+    `${prefix}${opts.bun} ${opts.cronRun} --shell ${interpreter}`);
+}
+
+/** wrapCronLine / wrapShellCronLine 역 — 래퍼 제거(가역). 비래핑 라인은 그대로. */
 export function unwrapCronLine(line: string): string {
+  const shell = line.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+--shell\s+/, '');
+  if (shell !== line) return shell;
   return line.replace(/(\bbun\s+)(?:\S*\/)?cron-run\.ts\s+/, '$1');
 }
 
@@ -298,9 +309,11 @@ export function sharesCrontabLine(rows: readonly { id: string; raw?: string | nu
 /** 스크립트 basename 추출 (scripts/foo.ts|sh → foo). 없으면 커맨드 첫 토큰. 래퍼는 unwrap 후 파생. */
 export function scriptName(command: string): string {
   const c = unwrapCronCommand(command);
+  const noCd = c.replace(/^cd\s+\S+\s*&&\s*/, '');
+  const shellTarget = noCd.match(/^(?:\S*\/)?(?:bash|zsh|sh)\s+(\S+\.sh)(?=\s|$)/);
+  if (shellTarget) return shellTarget[1]!.split('/').pop()!.replace(/\.sh$/, '');
   const m = c.match(/scripts\/([\w.-]+?)\.(?:ts|sh|mjs|js)\b/);
   if (m) return m[1]!;
-  const noCd = c.replace(/^cd\s+\S+\s*&&\s*/, '');
   const tokens = noCd.split(/\s+/);
   // bun/node 런처면 다음 토큰(실 스크립트)을 이름 원천으로 — `bun bin/elanous.mjs` → elanous.mjs(bun 아님).
   let head = tokens[0] ?? c;
@@ -325,7 +338,8 @@ export function inferCategory(command: string): ScheduleCategory {
 export function readCrontab(): string {
   // ⛔ stderr 를 물려받지 않는다 — 크론이 없는 기계에서 「no crontab for <user>」가 TUI 화면 한가운데 찍혔다
   //   (2026-09-26 베어 Ubuntu 26.04 실측 · UX 17). 크론 없음은 정상이라 빈 문자열이다.
-  try { return execFileSync('crontab', ['-l'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+  // env 명시 — bun 은 env 없이 부르면 «기동 시» PATH 로 찾는다(시험이 PATH 앞에 둔 가짜 crontab 을 지나쳐 실물을 연다).
+  try { return execFileSync('crontab', ['-l'], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: process.env }); }
   catch { return ''; } // no crontab for user
 }
 
@@ -644,6 +658,6 @@ export function applyCrontab(text: string, opts: { backupDir?: string; now?: str
   const stamp = (opts.now ?? new Date().toISOString()).replace(/[:.]/g, '-');
   const backup = join(dir, `crontab-cronmanage-${stamp}.bak`);
   try { writeFileSync(backup, readCrontab()); } catch { /* 최초엔 빈 crontab */ }
-  execFileSync('crontab', ['-'], { input: text.replace(/\n*$/, '\n'), encoding: 'utf-8' });
+  execFileSync('crontab', ['-'], { input: text.replace(/\n*$/, '\n'), encoding: 'utf-8', env: process.env });
   return backup;
 }

@@ -55,7 +55,8 @@ import type {
 // v2 (Phase 1 I6 · 2026-05-12) — tox_missions table + tox_tasks.mission_id column
 // v3 (Mission Fabric 통합 U1 · 2026-07-09) — tox_missions.autopilot_json
 //    (PFC Layer2 자율 메타 흡수 · apm Mission 병렬 table 제거 준비)
-export const TOX_SCHEMA_VERSION = 3;
+// v4 — external task identity and approval
+export const TOX_SCHEMA_VERSION = 4;
 
 // ─────────────────────── Row shapes ────────────────────────────────
 
@@ -89,6 +90,9 @@ interface TaskRow {
   review_verdicts_json: string | null;
   notes_json: string; // JSON array
   generated_by_json: string | null;
+  approval_json: string | null;
+  external_provider: string | null;
+  external_ref: string | null;
   trigger_chain_json: string;
 }
 
@@ -298,6 +302,10 @@ export class TaskStore {
     this.addColumnIfMissing('tox_executions', 'host_id', 'TEXT');
     this.addColumnIfMissing('tox_executions', 'hostname', 'TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tox_executions_host ON tox_executions(host_id, started_at)');
+    this.addColumnIfMissing('tox_tasks', 'approval_json', 'TEXT');
+    this.addColumnIfMissing('tox_tasks', 'external_provider', 'TEXT');
+    this.addColumnIfMissing('tox_tasks', 'external_ref', 'TEXT');
+    this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_tox_tasks_external_ref ON tox_tasks(external_provider, external_ref) WHERE external_provider IS NOT NULL AND external_ref IS NOT NULL');
     this.db.exec(`PRAGMA user_version = ${TOX_SCHEMA_VERSION}`);
   }
 
@@ -316,17 +324,36 @@ export class TaskStore {
 
   // ──────────────── Task CRUD ───────────────────────────────────
 
+  transaction<T>(work: () => T): T {
+    return this.db.transaction(work)();
+  }
+
   saveTask(task: Task): void {
     this.db
       .prepare(
-        `INSERT OR REPLACE INTO tox_tasks (
+        `INSERT INTO tox_tasks (
           id, created_at, updated_at, version, title, description, surface_json,
           parent_id, goal_slug, mission_id, depends_on_json, triggers_json, priority,
           estimate_ms, estimate_tokens, estimate_usd, feature_name, isolation,
           max_retries, attempt, timeout_ms, status, schedule_text, scheduler_job_id, last_execution_id,
           acceptance_json, review_verdicts_json, notes_json, generated_by_json,
-          trigger_chain_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          trigger_chain_json, approval_json, external_provider, external_ref
+        ) VALUES (${Array(33).fill('?').join(', ')})
+        ON CONFLICT(id) DO UPDATE SET
+          updated_at=excluded.updated_at, version=excluded.version, title=excluded.title,
+          description=excluded.description, surface_json=excluded.surface_json,
+          parent_id=excluded.parent_id, goal_slug=excluded.goal_slug, mission_id=excluded.mission_id,
+          depends_on_json=excluded.depends_on_json, triggers_json=excluded.triggers_json,
+          priority=excluded.priority, estimate_ms=excluded.estimate_ms,
+          estimate_tokens=excluded.estimate_tokens, estimate_usd=excluded.estimate_usd,
+          feature_name=excluded.feature_name, isolation=excluded.isolation,
+          max_retries=excluded.max_retries, attempt=excluded.attempt, timeout_ms=excluded.timeout_ms,
+          status=excluded.status, schedule_text=excluded.schedule_text,
+          scheduler_job_id=excluded.scheduler_job_id, last_execution_id=excluded.last_execution_id,
+          acceptance_json=excluded.acceptance_json, review_verdicts_json=excluded.review_verdicts_json,
+          notes_json=excluded.notes_json, generated_by_json=excluded.generated_by_json,
+          trigger_chain_json=excluded.trigger_chain_json, approval_json=excluded.approval_json,
+          external_provider=excluded.external_provider, external_ref=excluded.external_ref`
       )
       .run(
         task.id,
@@ -358,8 +385,17 @@ export class TaskStore {
         task.reviewVerdicts ? JSON.stringify(task.reviewVerdicts) : null,
         JSON.stringify(task.notes),
         task.generatedBy ? JSON.stringify(task.generatedBy) : null,
-        JSON.stringify([...task.triggerChain])
+        JSON.stringify([...task.triggerChain]),
+        task.approval ? JSON.stringify(task.approval) : null,
+        task.generatedBy?.kind === 'external' ? task.generatedBy.provider : null,
+        task.generatedBy?.kind === 'external' ? task.generatedBy.ref : null,
       );
+  }
+
+  findTaskByExternalRef(provider: string, ref: string): Task | null {
+    const row = this.db.prepare('SELECT * FROM tox_tasks WHERE external_provider = ? AND external_ref = ?')
+      .get(provider, ref) as TaskRow | undefined;
+    return row ? this.rowToTask(row) : null;
   }
 
   getTask(id: string): Task | null {
@@ -650,6 +686,9 @@ export class TaskStore {
       notes: JSON.parse(row.notes_json) as string[],
       generatedBy: row.generated_by_json
         ? (JSON.parse(row.generated_by_json) as TaskGeneratedBy)
+        : undefined,
+      approval: row.approval_json
+        ? (JSON.parse(row.approval_json) as Task['approval'])
         : undefined,
       triggerChain: Object.freeze(JSON.parse(row.trigger_chain_json) as string[]),
     };

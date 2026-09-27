@@ -14,27 +14,15 @@ import { paintCursor } from '../src/display/cursor-state.js';
 //    ⇒ 게이트가 "0 files ran" 을 내고 rework 가 그 자리에서 네 라운드를 태웠다.
 //    그래서 배선 보증을 둘로 나눈다 — 헬퍼의 런타임 계약 ⊕ 호출부의 형태 가드.
 describe('dashboard frame cursor wiring', () => {
-  test('헬퍼가 조율자 커서를 RenderOptions.cursor 로 넘긴다', () => {
+  test('essential frame keeps overlay and force while resolving its cursor', () => {
     const seen: RenderOptions[] = [];
-    const state = { row: 7, col: 13, visible: true };
-
-    renderDashboardFrame(
-      ['row'],
-      {
-        overlay: 'OVERLAY',
-        force: true,
-        essential: false,                       // rich — 종전(#6528) 값을 그대로 쓴다
-        cursorOwner: 'coordinator',
-        claimedCursor: null,
-        coordinatorCursor: { ...state },
-        promptCaret: null,
-        suppressPromptArea: false,
-      },
-      (_lines, options) => { seen.push(options); },
-    );
-
+    const caret = { row: 7, col: 13, visible: true };
+    renderDashboardFrame(['row'], {
+      overlay: 'OVERLAY', force: true, cursorOwner: 'none', claimedCursor: null,
+      promptCaret: caret, suppressPromptArea: false,
+    }, (_lines, options) => { seen.push(options); });
     expect(seen).toHaveLength(1);
-    expect(seen[0]!.cursor).toBe(paintCursor({ ...state }));
+    expect(seen[0]!.cursor).toBe(paintCursor(caret));
     expect(seen[0]!.overlay).toBe('OVERLAY');
     expect(seen[0]!.force).toBe(true);
   });
@@ -44,7 +32,7 @@ describe('dashboard frame cursor wiring', () => {
 
     renderDashboardFrame(
       [],
-      { overlay: '', force: false, essential: false, cursorOwner: 'none', claimedCursor: null, coordinatorCursor: null, promptCaret: null, suppressPromptArea: false },
+      { overlay: '', force: false, cursorOwner: 'none', claimedCursor: null, promptCaret: null, suppressPromptArea: false },
       (_lines, options) => { seen.push(options); },
     );
 
@@ -58,7 +46,7 @@ describe('dashboard frame cursor wiring', () => {
 
     renderDashboardFrame(
       ['row'],
-      { overlay: '', force: false, essential: true, cursorOwner: 'none', claimedCursor: null, coordinatorCursor: null, promptCaret: { ...caret }, suppressPromptArea: false },
+      { overlay: '', force: false, cursorOwner: 'none', claimedCursor: null, promptCaret: { ...caret }, suppressPromptArea: false },
       (_lines, options) => { seen.push(options); },
     );
 
@@ -71,14 +59,14 @@ describe('dashboard frame cursor wiring', () => {
 
     renderDashboardFrame(
       ['row'],
-      { overlay: '', force: false, essential: true, cursorOwner: 'none', claimedCursor: null, coordinatorCursor: null, promptCaret: { row: 26, col: 2, visible: true }, suppressPromptArea: true },
+      { overlay: '', force: false, cursorOwner: 'none', claimedCursor: null, promptCaret: { row: 26, col: 2, visible: true }, suppressPromptArea: true },
       (_lines, options) => { seen.push(options); },
     );
 
     expect(seen[0]!.cursor).toBe(ansi.hideCursor);
   });
 
-  test('essential 은 coordinator가 결정한 입력 cursor를 프롬프트 caret보다 우선한다', () => {
+  test('프롬프트 caret은 coordinator fallback보다 우선한다', () => {
     const seen: RenderOptions[] = [];
     const promptCaret = { row: 26, col: 2, visible: true };
     const inputCaret = { row: 26, col: 9, visible: true };
@@ -86,10 +74,8 @@ describe('dashboard frame cursor wiring', () => {
     renderDashboardFrame(
       ['row'],
       {
-        overlay: '', force: false, essential: true,
-        cursorOwner: 'coordinator',
+        overlay: '', force: false, cursorOwner: 'coordinator',
         claimedCursor: { ...inputCaret },
-        coordinatorCursor: { ...inputCaret },
         promptCaret: { ...promptCaret },
         suppressPromptArea: false,
       },
@@ -107,10 +93,8 @@ describe('dashboard frame cursor wiring', () => {
     renderDashboardFrame(
       ['row'],
       {
-        overlay: '', force: false, essential: true,
-        cursorOwner: 'modal',
+        overlay: '', force: false, cursorOwner: 'modal',
         claimedCursor: { ...claim },
-        coordinatorCursor: null,
         promptCaret: { row: 26, col: 2, visible: true },
         suppressPromptArea: false,
       },
@@ -129,10 +113,8 @@ describe('dashboard frame cursor wiring', () => {
     renderDashboardFrame(
       ['row'],
       {
-        overlay: '', force: false, essential: true,
-        cursorOwner: 'terminal',
+        overlay: '', force: false, cursorOwner: 'terminal',
         claimedCursor: { ...ptyCaret },
-        coordinatorCursor: null,
         promptCaret: { row: 26, col: 2, visible: true },
         suppressPromptArea: false,
       },
@@ -145,10 +127,8 @@ describe('dashboard frame cursor wiring', () => {
   test('essential 최종 결정은 프레임 적용 뒤 정확한 payload로 observer에 전달한다', () => {
     const observations: unknown[] = [];
     renderDashboardFrame(['row'], {
-      overlay: '', force: false, essential: true,
-      cursorOwner: 'terminal',
+      overlay: '', force: false, cursorOwner: 'terminal',
       claimedCursor: null,
-      coordinatorCursor: null,
       promptCaret: { row: 26, col: 2, visible: true },
       suppressPromptArea: false,
       onEssentialFrameCursorDecision: observation => { observations.push(observation); },
@@ -198,6 +178,17 @@ describe('dashboard frame cursor wiring', () => {
 
   // 배선 회귀 가드 — 헬퍼를 지나지 않고 render 로 직접 그리면 커서 슬롯이 사라진다.
   // 런타임 가드가 아니라 형태 가드다(위 주석의 이유). 되돌리기를 실패시키는 것이 목적이다.
+  test('dashboard index keeps chatOnlyMode and has no UI mode axis', () => {
+    const src = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
+    expect(src).toContain('let chatOnlyMode = true;');
+    expect(src).toContain('setChatOnlyLayout(next, opts)');
+    // D1a — /ui 모드 축 자체가 없다(uiModeSlash 슬롯도 없다).
+    expect(src).not.toContain('uiModeSlash');
+    expect(src).not.toMatch(/\bdashboardUiMode\b|\bisDashboardHeavyFeatureEnabled\b|\bcreateRichScratchViewers\b/);
+    expect(src).toContain('rich: false,');
+    expect(src).toContain("slot: 'bottom'");
+  });
+
   test('showDashboard 의 프레임 flush 가 헬퍼를 지난다', () => {
     const src = readFileSync(new URL('../src/dashboard/index.ts', import.meta.url), 'utf8');
     const showDashboardAt = src.indexOf('export async function showDashboard(');
@@ -212,5 +203,18 @@ describe('dashboard frame cursor wiring', () => {
     expect(occurrences).toBe(2);              // 정의 1 · 호출 1
     expect(callAt).toBeGreaterThan(showDashboardAt);
     expect(bareRenderCall).toBeNull();
+  });
+});
+
+describe('essential 결정이 커서를 안 낼 때 조율자 커서로 폴백 (D1a 리뷰 must-fix · 종전 동작 보존)', () => {
+  test('claim·prompt caret 이 없고 조율자 커서가 있으면 그것을 그린다 · 없으면 숨긴다', () => {
+    const seen: RenderOptions[] = [];
+    const coord = { row: 3, col: 4, visible: true };
+    renderDashboardFrame([], { overlay: '', force: false, cursorOwner: 'none', claimedCursor: null, coordinatorCursor: coord, promptCaret: null, suppressPromptArea: false },
+      (_lines, options) => { seen.push(options); });
+    renderDashboardFrame([], { overlay: '', force: false, cursorOwner: 'none', claimedCursor: null, coordinatorCursor: null, promptCaret: null, suppressPromptArea: false },
+      (_lines, options) => { seen.push(options); });
+    expect(seen[0]!.cursor).toBe(paintCursor(coord));
+    expect(seen[1]!.cursor).toBe(ansi.hideCursor);
   });
 });

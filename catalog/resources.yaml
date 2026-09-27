@@ -267,10 +267,10 @@ resources:
       Two credential-free TTS providers ship in-tree and both are implemented:
       `edge-tts` (no API key, multilingual incl. Korean, cross-platform) and
       `macos-say` (tier: 'free' in the registry, macOS only).
-      MEASURED 2026-09-22: the fallback is NOT automatic — resolveProviderId()
-      in src/voice/voice-tts-singleton.ts:25 defaults to 'openai-tts' (paid);
-      reaching a free provider needs config `voice.tts.provider` or env TTS_PROVIDER.
-      So TTS degrades to free only when the operator says so, never on its own.
+      With no TTS key or explicit config or TTS_PROVIDER selection, the daemon
+      automatically picks an installed free provider (`edge-tts` with `sox`, then
+      macOS `say`) if available. Otherwise it retains the original choice;
+      explicit provider choices remain respected.
 
   # ⭐ 무자격 TTS — 자원 맵이 «빠뜨리고 있던» 칸이다(실측 2026-09-22).
   #   오픈코어 경계 규칙상 `auth: none` 은 코어이고, 이 둘이 voice 축의 «무료 바닥»이다.
@@ -306,13 +306,10 @@ resources:
       ***whisper-cpp-local*** (was openai-realtime-stt). Explicit
       STREAMING_STT_PROVIDER / voice.stt.provider is still respected.
     free_fallback: >-
-      MEASURED 2026-09-22. A credential-free STT provider ships in-tree and is
-      implemented: `whisper-cpp-local` (streaming-stt-provider.ts declares
-      tier 'free', implemented true). But the degradation is NOT automatic —
-      resolveProviderId() in src/voice/voice-streaming-stt-singleton.ts:34 defaults to
-      'openai-realtime-stt' (paid); reaching whisper needs config `voice.stt.provider`
-      or env. Same shape as the TTS axis (see elevenlabs) — the free floor exists,
-      the default does not walk to it.
+      Without a streaming STT key or explicit config or STREAMING_STT_PROVIDER
+      selection, the daemon automatically selects the credential-free
+      `whisper-cpp-local` provider. The TTS axis (see elevenlabs) selects an
+      installed free TTS provider when available; explicit selections stay intact.
     note: "Throws when absent (does not degrade)"
 
   - id: supadata

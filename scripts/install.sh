@@ -4,7 +4,7 @@
 # 🆕 2026-09-24 (결정 「sh 를 실행하면 알아서 설치되는 구조」) — claude·grok 의 네이티브 설치기와 같은 모양:
 #   $PREFIX/versions/<version>[-<커밋12>]/ 판별 본체(각자 node_modules) ← 옛 판은 남는다(롤백 · 체크아웃 설치는 커밋이 이름)
 #   $PREFIX/current  → versions/<version>                                ← 전환은 심링크 하나
-#   $PREFIX/bin/elanous → ../current/node_modules/.bin/elanous               ← PATH 에 넣는 «고정» 경로
+#   $PREFIX/bin/elanous → current 판을 절대 경로 bun 으로 실행하는 sh 래퍼     ← PATH 에 넣는 «고정» 경로
 #   ⛔ 기본 PREFIX 는 상태 폴더(~/.elanous)가 «아니다» — 설치물과 상태(auth·logs·worktrees)를 가른다.
 #   bun 이 없으면 공식 설치기로 먼저 깐다(--no-bootstrap-bun 으로 끈다).
 set -euo pipefail
@@ -159,8 +159,13 @@ done
 #    $PREFIX/bin/bun 링크 «자신»을 가리켰고, `ln -sfn` 이 그것을 자기 자신으로 덮어 고리를 만들었다
 #    (`bun: Too many levels of symbolic links` · 설치 rc 127 · 이후 `elanous` 가 전부 죽음). 업데이트·재설치 경로 전부가 여기를 지난다.
 BUN_EXEC="$(bun -e 'process.stdout.write(process.execPath)' 2>/dev/null || true)"
-# bun 이 경로를 못 대면(비정상 bun) 예전처럼 PATH 의 이름으로 물러선다 — 그 이름이 우리 링크 자신이면 아래에서 다시 잇지 않는다.
-{ [ -n "$BUN_EXEC" ] && [ -x "$BUN_EXEC" ]; } || BUN_EXEC="$(command -v bun)"
+# 래퍼에는 PATH 에 의존하지 않는 절대 실행 경로만 박는다. bun 이 경로를 못 대면(비정상 bun) PATH 에서 찾은 절대 경로로 물러서고,
+# 그래도 절대 경로가 없으면 설치를 중단한다.
+{ [ -n "$BUN_EXEC" ] && [ -x "$BUN_EXEC" ]; } || BUN_EXEC="$(command -v bun 2>/dev/null || true)"
+case "$BUN_EXEC" in
+  /*) [ -x "$BUN_EXEC" ] || { echo "⛔ bun executable is not available: $BUN_EXEC" >&2; exit 127; } ;;
+  *) echo '⛔ bun executable absolute path is unavailable' >&2; exit 127 ;;
+esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd -P)"
@@ -305,11 +310,25 @@ fi
 rm -rf "$NATIVE_SHIM"
 ln -sfn "versions/$VERSION_NAME" "$PREFIX/current"
 mkdir -p "$PREFIX/bin"
-ln -sfn ../current/node_modules/.bin/elanous "$PREFIX/bin/elanous"
-chmod +x "$PREFIX/bin/elanous"
-# elanous 엔트리는 `#!/usr/bin/env bun` 이다 — bun 도 같은 bin 에 둬서 PATH 한 줄로 둘 다 잡히게 한다.
-# 🩸 2026-09-25 빈 debian:12 컨테이너: bun 설치기는 ~/.bun/bin 을 ~/.bashrc 에만 써서(비대화형이면 안 읽힌다)
-#    로그인 셸에서 elanous 는 찾았는데 `/usr/bin/env: 'bun': No such file or directory` 로 죽었다.
+# 절대 bun 경로를 설치 때 박고 엔트리는 current 를 거친다 — cron/systemd 의 짧은 PATH 와 판 전환 모두 지원.
+WRAPPER="$PREFIX/bin/.elanous-$$"
+printf '#!/bin/sh\n# elanous-wrapper\nif [ ! -x %s ]; then\n  printf '\''bun 을 찾을 수 없습니다: %%s — 설치기를 다시 실행하세요\\n'\'' %s >&2\n  exit 127\nfi\nexec %s %s "$@"\n' \
+  "$(shell_quote "$BUN_EXEC")" "$(shell_quote "$BUN_EXEC")" "$(shell_quote "$BUN_EXEC")" \
+  "$(shell_quote "$PREFIX/current/node_modules/elanous/bin/elanous.mjs")" > "$WRAPPER"
+chmod +x "$WRAPPER"
+mv -f "$WRAPPER" "$PREFIX/bin/elanous"
+ELN="$PREFIX/bin/eln"
+ELN_ON_PATH="$(command -v eln 2>/dev/null || true)"
+if { [ -n "$ELN_ON_PATH" ] && [ "$ELN_ON_PATH" != "$ELN" ]; } ||
+   { { [ -e "$ELN" ] || [ -L "$ELN" ]; } &&
+     { [ -L "$ELN" ] || [ ! -f "$ELN" ] || [ "$(sed -n '2p' "$ELN")" != '# elanous-wrapper' ]; }; }; then
+  echo '⚠ eln: 이미 다른 명령이 있어 만들지 않았다 — elanous 로 쓰십시오'
+  ELN_AVAILABLE=0
+else
+  cp "$PREFIX/bin/elanous" "$ELN"
+  ELN_AVAILABLE=1
+fi
+# 대화형 셸은 bun 도 같은 bin 에서 찾는다(래퍼 자체는 이 링크나 PATH 에 의존하지 않는다).
 case "$BUN_EXEC" in
   "$PREFIX/bin/bun"|"$PREFIX/bin/bun/") ;;   # 자기 자신에게 잇지 않는다(고리)
   *) ln -sfn "$BUN_EXEC" "$PREFIX/bin/bun" ;;
@@ -371,5 +390,9 @@ if ! command -v gh >/dev/null 2>&1; then
 elif ! gh auth status >/dev/null 2>&1; then
   echo "  $STEP) gh auth login                     # the harness opens pull requests with it"; STEP=$((STEP + 1))
 fi
-echo "  $STEP) elanous harness say \"<one line of what you want>\""
+if [ "$ELN_AVAILABLE" -eq 1 ]; then
+  echo "  $STEP) eln harness say \"<one line of what you want>\" (or: elanous harness say)"
+else
+  echo "  $STEP) elanous harness say \"<one line of what you want>\""
+fi
 echo "  check anytime: elanous setup --non-interactive"

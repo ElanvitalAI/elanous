@@ -77,6 +77,7 @@ export interface HarnessAskSayOptions {
   target?: string;
   forcePreflight?: boolean;
   autoMerge?: boolean;
+  mergeByHost?: boolean;
   observeOnly?: boolean;
   supervise?: boolean;
   supervisorSource?: HarnessSupervisorSource;
@@ -143,6 +144,7 @@ function registerHarnessCommonOptions(command: Command): Command {
     .option('--json', '구조화 출력')
     .option('--base <branch>', '분기 base')
     .addOption(new Option('--no-auto-merge', 'self: PR 생성 후 자동 병합을 끔'))
+    .option('--merge-by-host', 'Pod: merge-ready 까지 실행하고 병합은 발사 호스트가 재게이트')
     .option('--observe-only', 'elanous: child boot부터 SelfImplement 호출을 기록만 한다')
     .addOption(new Option('--no-supervise', 'self: supervisor 재개를 끔').hideHelp())
     .option('--dry-run', '변경 없이 발사 계획만 출력');
@@ -230,6 +232,7 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .option('--child-llm-effort <level>', 'self: 구현 자식 추론 노력 minimal|low|medium|high|xhigh|max — 모델 상한을 넘으면 «거부»한다(--child-llm-provider와 함께)')
     .addOption(new Option('--substrate <kind>', '실행 칸 — local(기본 · 이 기계) | pod(k8s Pod · 같은 그래프가 원격에서 돈다 · 풀·이미지 판·계정은 자동)').choices(['local', 'pod']))
     .option('--pod-pool <spec>', 'pod: 풀 — 컨텍스트[@ssh호스트][:상한] 쉼표로(앞이 우선) · 없으면 ELANOUS_POD_POOL · 그것도 없으면 현재 컨텍스트')
+    .addOption(new Option('--pod-memory <tier>', 'pod: 메모리 등급 — standard(16Gi) | high(32Gi) · 없으면 골 문면 `Pod 메모리: high` 줄 · 그것도 없으면 골이 apps/pwa/ 를 담을 때 high').choices(['standard', 'high']))
     .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께');
 }
 
@@ -254,6 +257,7 @@ function normalizeHarnessCommonOptions(opts: HarnessAskSayOptions): HarnessAskSa
     ...(opts.base !== undefined ? { base: opts.base } : {}),
     ...(opts.target !== undefined ? { target: opts.target } : {}),
     ...(opts.autoMerge === false ? { autoMerge: false } : {}),
+    ...(opts.mergeByHost === true ? { mergeByHost: true } : {}),
     ...(opts.observeOnly ? { observeOnly: true } : {}),
     ...(opts.goalType !== undefined ? { goalType: opts.goalType } : {}),
     ...resolveHarnessSupervisor(opts),
@@ -293,7 +297,7 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 }
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
-type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string };
+type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string };
 function podSubstrate(opts: unknown): boolean {
   return (opts as HarnessSubstrateOpts).substrate === 'pod';
 }
@@ -308,7 +312,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
     return;
   }
   const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
-  const status = dispatchHarnessOnPod({ entrance, input, ...(o.podPool ? { podPool: o.podPool } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) });
+  const status = await dispatchHarnessOnPod({ entrance, input, ...(o.podPool ? { podPool: o.podPool } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) });
   if (status !== 0) process.exitCode = status;
 }
 

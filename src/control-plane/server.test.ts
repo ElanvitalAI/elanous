@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { allowedControlHostname, DEFAULT_CONTROL_PORT, ensureControlTokens, startControlServer } from './server.js';
 import { issueMemberToken } from './member-tokens.js';
+import { createLeaseHolderView } from './lease-holder.js';
+import type { RoleLeaseRead } from '../roles/role-lease.js';
 import { createHash } from 'node:crypto';
 import { runNexus } from '../nexus/index.js';
 import { setTestStateRoot } from '../nexus/paths.js';
@@ -340,6 +342,62 @@ test('machine-scoped port leases reject other machines on allocation and target 
   const next = issueMemberToken('node-b', root);
   expect((await call(`${url}/heartbeat`, next, 'POST', undefined, lease.attrs.leaseId)).status).toBe(200);
   expect((await call(url, next, 'DELETE', undefined, lease.attrs.leaseId)).status).toBe(204);
+});
+
+test('lease holder gates every write, keeps queries and scopes, and stamps every response with generation', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-control-holder-'));
+  roots.push(root);
+  let reading: RoleLeaseRead = { kind: 'present', doc: { holder: 'node-b', generation: 7, state: 'held', renewedAt: 1 } };
+  let time = 0;
+  const leaseView = createLeaseHolderView({ machine: 'mbp', read: () => reading, ttlMs: 10, now: () => time });
+  const server = startControlServer({ root, port: 0, leaseView });
+  servers.push(server);
+  const tokens = ensureControlTokens(root);
+  const call = (path: string, method = 'GET', credential?: string, body?: unknown) => fetch(`${server.url}${path}`, {
+    method, headers: { ...(credential ? { authorization: `Bearer ${credential}` } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const noLease = setup();
+  const noLeasePrimary = await noLease.call('/v1/primary');
+  expect(noLeasePrimary.status).toBe(200);
+  expect(await noLeasePrimary.json()).toEqual({ holder: null, generation: null, known: false });
+  expect(noLeasePrimary.headers.get('x-primary-generation')).toBeNull();
+  const noLeaseWrite = await noLease.call('/v1/resources/register', noLease.tokens.member, 'POST', record);
+  expect(noLeaseWrite.status).toBe(200);
+  expect(noLeaseWrite.headers.get('x-primary-generation')).toBeNull();
+  const primary = await call('/v1/primary');
+  expect(primary.status).toBe(200);
+  expect(await primary.json()).toEqual({ holder: 'node-b', generation: 7, known: true });
+  expect(primary.headers.get('x-primary-generation')).toBe('7');
+  const rejected = await call('/v1/resources/register', 'POST', tokens.member, record);
+  expect(rejected.status).toBe(409);
+  expect(await rejected.json()).toEqual({ error: 'not-primary', holder: 'node-b', generation: 7 });
+  expect(rejected.headers.get('x-primary-generation')).toBe('7');
+  const query = await call('/v1/resources', 'GET', tokens.query);
+  expect(query.status).toBe(200);
+  expect(query.headers.get('x-primary-generation')).toBe('7');
+  expect((await query.json()).resources).toEqual([]);
+  expect((await call('/v1/resources/register', 'POST', tokens.query, record)).status).toBe(403);
+  const unauthorized = await call('/v1/resources/register', 'POST', undefined, record);
+  expect(unauthorized.status).toBe(401);
+  expect(unauthorized.headers.get('x-primary-generation')).toBe('7');
+  expect((await call('/v1/resources/i1/heartbeat', 'POST', tokens.member, {})).status).toBe(409);
+  expect((await call('/v1/resources/i1', 'DELETE', tokens.member)).status).toBe(409);
+  expect((await call('/v1/leases/port', 'POST', tokens.member, { machine: 'local', purpose: 'test', ttlMs: 1000 })).status).toBe(409);
+  expect((await call('/v1/leases/port/31450/heartbeat', 'POST', tokens.member)).status).toBe(409);
+  expect((await call('/v1/leases/port/31450', 'DELETE', tokens.member)).status).toBe(409);
+  expect((await call('/missing')).headers.get('x-primary-generation')).toBe('7');
+  time = 10;
+  reading = { kind: 'present', doc: { holder: 'mbp', generation: 8, state: 'held', renewedAt: 2 } };
+  const accepted = await call('/v1/resources/register', 'POST', tokens.member, record);
+  expect(accepted.status).toBe(200);
+  expect(accepted.headers.get('x-primary-generation')).toBe('8');
+  time = 20;
+  reading = { kind: 'unmeasured', why: 'offline' };
+  const unknown = await call('/v1/resources/register', 'POST', tokens.member, { ...record, id: 'i2' });
+  expect(unknown.status).toBe(200);
+  expect(unknown.headers.get('x-primary-generation')).toBeNull();
+  expect(await (await call('/v1/primary')).json()).toEqual({ holder: null, generation: null, known: false });
 });
 
 test('the server clips an oversized port-lease ttl to the 24-hour cap', async () => {

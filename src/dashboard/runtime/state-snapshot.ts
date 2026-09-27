@@ -3,9 +3,6 @@
 // One place that assembles the CURRENT static state the LLM needs to
 // reason about "what's on screen and what can I control right now":
 //
-//   • virtual windows (count, titles, foreground flag, pane layout +
-//     sizes per window)
-//   • panes per window (id, kind, title, focused, dimensions)
 //   • PTY shells (id, cmd, status, age, detach flag)
 //   • terminal-modal sessions (id, title, state, kind)
 //   • active workspace (cwd, remote host if any)
@@ -25,10 +22,8 @@
 // flows naturally through chat-log activity entries (V2); this module
 // guarantees the LLM sees the RIGHT-NOW shape of the world.
 
-import { getDashboardVirtualWindows } from '../windowing/virtual-windows.js';
 import { listPty } from '../../pty-shell/registry.js';
 import { getSessionCwd } from '../../session/working-dir.js';
-import type { PaneRect } from '../../virtual-windows/layout-tree.js';
 import type {
   TerminalExposureSnapshot,
   TerminalInteractionPolicy,
@@ -40,25 +35,6 @@ export interface SnapshotWorkspace {
   cwd: string;
   remoteHost?: string;
   platform: NodeJS.Platform;
-}
-
-export interface SnapshotPane {
-  /** Opaque pane id (elanous uses string ids via mintPaneId). */
-  id: string;
-  kind: string;
-  title: string;
-  focused: boolean;
-  /** Pane rect in TERMINAL cells (cols/rows). When the window hasn't
-   *  been sized yet (pre-first-render) dimensions are 0. */
-  rect: { row: number; col: number; width: number; height: number };
-}
-
-export interface SnapshotWindow {
-  id: number;
-  title: string;
-  foreground: boolean;
-  paneCount: number;
-  panes: SnapshotPane[];
 }
 
 export interface SnapshotPty {
@@ -92,7 +68,6 @@ export interface SnapshotTerminalMouseIntent {
 export interface DashboardStateSnapshot {
   capturedAt: string;                     // ISO-8601
   workspace: SnapshotWorkspace;
-  windows: SnapshotWindow[];
   ptys: SnapshotPty[];
   tools: SnapshotToolFlags;
   /** Terminal-modal sessions (coding agents, misc PTY shells). Shape
@@ -131,11 +106,6 @@ export interface CaptureOpts {
   /** Recent host-side terminal mouse intent history. Caller owns
    *  retention policy; snapshot just projects the current buffer. */
   recentTerminalMouseIntents?: SnapshotTerminalMouseIntent[];
-  /** Include virtual-window manager state (`windows` / panes).
-   *  Default true preserves today's always-include behavior. When
-   *  false, skip collection and emit `windows: []` — the field stays
-   *  on the snapshot type as a parked backup, not a deletion. */
-  includeVirtualWindows?: boolean;
 }
 
 // ─── Capture ──────────────────────────────────────────────────────
@@ -147,47 +117,6 @@ export function captureDashboardState(opts: CaptureOpts = {}): DashboardStateSna
     remoteHost: opts.remoteHost,
     platform: opts.platform ?? process.platform,
   };
-
-  const includeVirtualWindows = opts.includeVirtualWindows !== false;
-  let windows: SnapshotWindow[] = [];
-  if (includeVirtualWindows) {
-    try {
-      const vw = getDashboardVirtualWindows();
-      const registry = vw?.registry;
-      const current = registry?.current();
-      for (const w of registry?.list() ?? []) {
-        const rects = safePaneRects(w);
-        const rectBy = new Map<string, PaneRect>();
-        for (const r of rects) rectBy.set(r.paneId, r);
-        const panes: SnapshotPane[] = [];
-        for (const { id, content } of w.listPanes()) {
-          const r = rectBy.get(id);
-          panes.push({
-            id,
-            kind: content.kind,
-            title: content.title,
-            focused: w.focused === id,
-            rect: {
-              row: r?.rect.row ?? 0,
-              col: r?.rect.col ?? 0,
-              width: r?.rect.width ?? 0,
-              height: r?.rect.height ?? 0,
-            },
-          });
-        }
-        windows.push({
-          id: w.id,
-          title: w.title,
-          foreground: current === w,
-          paneCount: panes.length,
-          panes,
-        });
-      }
-    } catch {
-      // Virtual windows not initialized yet — empty list is valid state.
-      windows = [];
-    }
-  }
 
   const now = Date.now();
   const ptys: SnapshotPty[] = [];
@@ -209,16 +138,11 @@ export function captureDashboardState(opts: CaptureOpts = {}): DashboardStateSna
   return {
     capturedAt,
     workspace,
-    windows,
     ptys,
     tools: { dashboardTools: opts.dashboardToolNames ?? [] },
     terminalSessions: opts.terminalSessions ?? [],
     recentTerminalMouseIntents: opts.recentTerminalMouseIntents ?? [],
   };
-}
-
-function safePaneRects(w: { paneRects?: () => PaneRect[] }): PaneRect[] {
-  try { return w.paneRects?.() ?? []; } catch { return []; }
 }
 
 // ─── Renderers ────────────────────────────────────────────────────
@@ -233,20 +157,6 @@ export function renderDashboardStateForSystemPrompt(s: DashboardStateSnapshot): 
 
   if (s.tools.dashboardTools.length > 0) {
     out.push(`tools exposed this turn: ${s.tools.dashboardTools.join(', ')}`);
-  }
-
-  if (s.windows.length === 0) {
-    out.push('virtual windows: none');
-  } else {
-    out.push(`virtual windows: ${s.windows.length}`);
-    for (const w of s.windows) {
-      const fg = w.foreground ? 'fg' : 'bg';
-      out.push(`  win:${w.id} [${fg}] "${w.title}" panes=${w.paneCount}`);
-      for (const p of w.panes) {
-        const fc = p.focused ? ' focused' : '';
-        out.push(`    pane:${p.id} ${p.kind} "${p.title}" ${p.rect.width}x${p.rect.height}${fc}`);
-      }
-    }
   }
 
   if (s.ptys.length > 0) {

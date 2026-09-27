@@ -1,0 +1,32 @@
+flowchart TD
+  classDef pass fill:#d7f5df,stroke:#198754,color:#102a16
+  classDef gate fill:#fff3cd,stroke:#b7791f,color:#3b2f00
+  classDef fail fill:#fde2e2,stroke:#b42318,color:#3b0a0a
+  classDef data fill:#e7f0ff,stroke:#2563eb,color:#102a43
+
+  A[Domain executor returns dr<br/>ok · changes · outcome · ref · evidence]:::data
+  B{Execute conditions?<br/>ok AND changes = 0<br/>AND verifiedNonCodeOutcome(dr)}:::gate
+  C[No nonCodeOutcome<br/>ordinary no-changes result]:::fail
+  D[Create in-memory nonCodeOutcome<br/>outcome · ref · nonCodeEvidence]:::pass
+  E[deploy: files = changedFiles(cwd)]:::data
+  F{Code changes exist?}:::gate
+  G[Code deploy path]:::data
+  H{nonCodeOutcome exists?}:::gate
+  I[observe deploy-no-changes<br/>return { ok:false, kind:none }]:::fail
+  J{Evidence is artifact-created?}:::gate
+  K{PR #8731 · 2026-08-13<br/>existsSync(resolve(cwd, ref))?}:::gate
+  L[observe deploy-noncode-blocked<br/>reason: artifact-created-ref-missing<br/>then deploy-no-changes]:::fail
+  M[Do not treat ref as a file<br/>published-url / execution-completed]:::data
+  N[observe deploy-noncode<br/>return terminal:<br/>published or executed]:::pass
+
+  A --> B
+  B -- no --> C
+  B -- yes --> D --> E --> F
+  F -- yes --> G
+  F -- no --> H
+  H -- no --> I
+  H -- yes --> J
+  J -- yes --> K
+  K -- no --> L
+  K -- yes --> N
+  J -- no --> M --> N

@@ -1,0 +1,23 @@
+{
+  "name": "elanous",
+  "owner": {
+    "name": "Elanvital AI",
+    "url": "https://elanous.ai"
+  },
+  "metadata": {
+    "description": "Official elanous plugins — hand work from Claude Code, Codex, Grok or Antigravity to your local elanous agent."
+  },
+  "plugins": [
+    {
+      "name": "elanous",
+      "source": "./integrations/elanous-agent",
+      "description": "Hand work to elanous from your coding agent — ask, check status, fetch results and approve tasks in the local elanous daemon.",
+      "author": { "name": "Elanvital AI" },
+      "homepage": "https://docs.elanous.ai",
+      "repository": "https://github.com/ElanvitalAI/elanous",
+      "license": "Apache-2.0",
+      "keywords": ["elanous", "agent", "tasks", "mcp", "handoff"],
+      "category": "productivity"
+    }
+  ]
+}

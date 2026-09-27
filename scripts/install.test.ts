@@ -1,13 +1,13 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
 
 const repoRoot = resolve(import.meta.dir, '..');
 const installer = resolve(import.meta.dir, 'install.sh');
-const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { version: string };
+const packageJson = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { version: string; bin: Record<string, string> };
 const fixtures: string[] = [];
 
 afterEach(() => { for (const fixture of fixtures.splice(0)) rmSync(fixture, { recursive: true, force: true }); }, 120_000);
@@ -77,6 +77,10 @@ function pack(destination: string): string {
 }
 
 describe('scripts/install.sh', () => {
+  test('package bin exposes elanous and eln through the same entrypoint, without mda', () => {
+    expect(packageJson.bin).toEqual({ elanous: './bin/elanous.mjs', eln: './bin/elanous.mjs' });
+  });
+
   test('--help names every supported argument', () => {
     const { result } = run(['--help']);
     expect(result.status).toBe(0);
@@ -92,11 +96,48 @@ describe('scripts/install.sh', () => {
     const version = spawnSync(elanous, ['--version'], { encoding: 'utf8', env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache') } });
     expect(version.status).toBe(0);
     expect(version.stdout).toContain(packageJson.version);
+    const eln = join(prefix, 'bin', 'eln');
+    expect(readFileSync(eln, 'utf8')).toBe(readFileSync(elanous, 'utf8'));
+    const shortVersion = spawnSync(eln, ['--version'], { encoding: 'utf8', env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache') } });
+    expect(shortVersion.status, shortVersion.stderr).toBe(0);
+    expect(shortVersion.stdout).toBe(version.stdout);
+    expect(result.stdout).toContain('eln harness say');
     const metadata = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8')) as Record<string, string>;
     expect(metadata.version).toBe(packageJson.version);
     expect(metadata.source).toBe(realpathSync(repoRoot));
     expect(metadata.installedAt).toBeTruthy();
     expect(metadata.commit).toMatch(/^[0-9a-f]{40}$/);
+  }, 120_000);
+
+  test('does not replace a foreign eln in the prefix, and warns once', () => {
+    const env = setup();
+    mkdirSync(join(env.prefix, 'bin'), { recursive: true });
+    const eln = join(env.prefix, 'bin', 'eln');
+    writeFileSync(eln, '#!/bin/sh\necho other\n');
+    chmodSync(eln, 0o755);
+    const installed = run(['--no-modify-path'], env);
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    expect(installed.result.stdout.match(/⚠ eln:/g)).toHaveLength(1);
+    expect(installed.result.stdout).toContain('elanous harness say');
+    expect(installed.result.stdout).not.toContain('eln harness say');
+    expect(readFileSync(eln, 'utf8')).toBe('#!/bin/sh\necho other\n');
+    expect(spawnSync(eln, [], { encoding: 'utf8' }).stdout).toBe('other\n');
+  }, 120_000);
+
+  test('does not shadow a foreign eln earlier on PATH', () => {
+    const env = setup();
+    const pathDir = join(env.dir, 'foreign-path');
+    mkdirSync(pathDir);
+    const foreign = join(pathDir, 'eln');
+    writeFileSync(foreign, '#!/bin/sh\necho other\n');
+    chmodSync(foreign, 0o755);
+    const installed = run(['--no-modify-path'], env, `${pathDir}:${process.env.PATH ?? ''}`);
+    expect(installed.result.status, installed.result.stderr).toBe(0);
+    expect(installed.result.stdout.match(/⚠ eln:/g)).toHaveLength(1);
+    expect(installed.result.stdout).toContain('elanous harness say');
+    expect(installed.result.stdout).not.toContain('eln harness say');
+    expect(existsSync(join(env.prefix, 'bin', 'eln'))).toBe(false);
+    expect(spawnSync(foreign, [], { encoding: 'utf8' }).stdout).toBe('other\n');
   }, 120_000);
 
   // 🩸 2026-09-25 빈 debian:12: ~/.bashrc 는 비대화형이면 맨 앞에서 return 한다 ⇒ `bash -lc elanous`(ssh 원격 명령)가 못 찾았다.
@@ -107,14 +148,74 @@ describe('scripts/install.sh', () => {
     expect(readFileSync(join(home, '.profile'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
   }, 120_000);
 
-  // 🩸 2026-09-25 빈 debian:12: elanous 는 PATH 에 있었지만 `#!/usr/bin/env bun` 의 bun 이 로그인 셸 PATH 에 없었다.
-  test('the PATH directory also carries bun, so the elanous shebang resolves with that one entry', () => {
-    const { prefix, result } = run(['--no-modify-path']);
+  test('the installed sh wrapper uses the resolved bun without PATH and follows current for version and installed universe', () => {
+    const env = setup();
+    const { prefix, result } = run(['--no-modify-path'], env);
     expect(result.status, result.stderr).toBe(0);
-    const bun = join(prefix, 'bin', 'bun');
-    expect(existsSync(bun)).toBe(true);
-    const version = spawnSync(join(prefix, 'bin', 'elanous'), ['--version'], { encoding: 'utf8', env: { HOME: process.env.HOME ?? '', PATH: `${join(prefix, 'bin')}:/usr/bin:/bin` } });
+    const elanous = join(prefix, 'bin', 'elanous');
+    const bunLink = join(prefix, 'bin', 'bun');
+    const bunExec = realpathSync(bunLink);
+    expect(lstatSync(elanous).isFile()).toBe(true);
+    expect(readFileSync(elanous, 'utf8')).toStartWith('#!/bin/sh\n');
+    expect(readFileSync(elanous, 'utf8')).toContain(bunExec);
+    expect(readlinkSync(bunLink)).toBe(bunExec);
+    const restricted = { HOME: env.home, PATH: '/usr/bin:/bin', XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache') };
+    const control = spawnSync('/usr/bin/env', ['bun', '--version'], { encoding: 'utf8', env: restricted });
+    expect(control.status).not.toBe(0);
+    expect(control.stderr).toContain('bun');
+    const version = spawnSync(elanous, ['--version'], { encoding: 'utf8', env: restricted });
     expect(version.status, version.stderr).toBe(0);
+    expect(version.stdout).toContain(packageJson.version);
+    const where = spawnSync(elanous, ['where', '--json'], { encoding: 'utf8', env: restricted });
+    expect(where.status, where.stderr).toBe(0);
+    const universe = JSON.parse(where.stdout) as { kind: string; layer: string };
+    expect(universe.kind).toBe('prod');
+    expect(universe.layer).toBe('installed');
+    const entry = join(prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs');
+    expect(realpathSync(entry)).toContain('/node_modules/elanous/bin/elanous.mjs');
+    expect(readFileSync(elanous, 'utf8')).toContain(entry);
+    // The installer writes bin/elanous; executing that wrapper must pass the installed entry to Bun, not the checkout entry.
+    writeFileSync(entry, 'console.log(JSON.stringify({ entry: process.argv[1], args: process.argv.slice(2) }))\n');
+    const forwarded = spawnSync(elanous, ['argv-probe', 'argument with spaces'], { encoding: 'utf8', env: restricted });
+    expect(forwarded.status, forwarded.stderr).toBe(0);
+    expect(JSON.parse(forwarded.stdout)).toEqual({ entry: realpathSync(entry), args: ['argv-probe', 'argument with spaces'] });
+  }, 120_000);
+
+  test('a bun that cannot print its execPath is pinned by its absolute PATH location — never by a bare name', () => {
+    const env = setup();
+    const path = join(env.dir, 'path');
+    mkdirSync(path);
+    const git = join(path, 'git');
+    writeFileSync(git, '#!/bin/sh\nexit 0\n');
+    chmodSync(git, 0o755);
+    const bun = join(path, 'bun');
+    writeFileSync(bun, '#!/bin/sh\nprintf relative-bun\n');
+    chmodSync(bun, 0o755);
+    const { result } = run(['--no-modify-path', '--no-bootstrap-bun'], env, `${path}:/usr/bin:/bin`);
+    // 폴백(`command -v bun`)이 절대 경로를 준다 ⇒ «절대 경로 없음»으로 거부하지 않는다(옛 동작 · BUN_INSTALL 재사용 시험과 같은 축).
+    expect(result.stderr).not.toContain('bun executable absolute path is unavailable');
+    const wrapper = join(env.prefix, 'bin', 'elanous');
+    if (existsSync(wrapper)) {
+      const text = readFileSync(wrapper, 'utf8');
+      expect(text).toContain(bun);
+      expect(text).not.toContain('relative-bun');
+    }
+  });
+
+  test('the installed wrapper reports one line when its pinned bun is missing', () => {
+    const packed = pack(fixture());
+    const env = setup();
+    const { result } = run(['--source', packed, '--no-modify-path'], env);
+    expect(result.status, result.stderr).toBe(0);
+    const elanous = join(env.prefix, 'bin', 'elanous');
+    const bun = realpathSync(join(env.prefix, 'bin', 'bun'));
+    const wrapper = readFileSync(elanous, 'utf8');
+    const unavailable = join(env.dir, 'bun-not-found');
+    writeFileSync(elanous, wrapper.replaceAll(bun, unavailable));
+    const missing = spawnSync(elanous, ['--version'], { encoding: 'utf8', env: { HOME: env.home, PATH: '/usr/bin:/bin' } });
+    expect(missing.status).toBe(127);
+    expect(missing.stdout).toBe('');
+    expect(missing.stderr).toBe(`bun 을 찾을 수 없습니다: ${unavailable} — 설치기를 다시 실행하세요\n`);
   }, 120_000);
 
   test('preserves the first installation startup file across a real reinstallation', () => {
@@ -318,7 +419,7 @@ describe('scripts/install.sh', () => {
   test('install.sh handles spawn-helper and a real isolated install leaves it executable', () => {
     const source = readFileSync(installer, 'utf8');
     expect(source).toContain('spawn-helper');
-    expect(source.indexOf('ln -sfn ../current/node_modules/.bin/elanous')).toBeLessThan(source.indexOf('spawn-helper'));
+    expect(source.indexOf('mv -f "$WRAPPER" "$PREFIX/bin/elanous"')).toBeLessThan(source.indexOf('spawn-helper'));
     expect(source.indexOf('> "$PREFIX/install.json"')).toBeLessThan(source.indexOf('spawn-helper'));
     const env = setup();
     const installed = run(['--no-modify-path'], env);
@@ -338,6 +439,7 @@ describe('scripts/install.sh', () => {
     expect(fresh.result.status, fresh.result.stderr).toBe(0);
     const next = fresh.result.stdout.slice(fresh.result.stdout.indexOf('Next:'));
     expect(next).toContain('elanous login openai-codex');
+    expect(next).toContain('eln harness say');
     expect(next).toContain('elanous harness say');
     expect(next).not.toContain('llm.provider');   // auto 는 로그인만 있으면 런타임이 codex 로 고른다(#19950)
     mkdirSync(join(env.home, '.elanous'), { recursive: true });
@@ -434,7 +536,9 @@ describe('scripts/install.sh', () => {
     const prefix = realpathSync(env.prefix);
     const firstDir = checkoutVersionName();
     expect(readlinkSync(join(prefix, 'current'))).toBe(`versions/${firstDir}`);
-    expect(readlinkSync(join(prefix, 'bin', 'elanous'))).toBe('../current/node_modules/.bin/elanous');
+    const elanous = join(prefix, 'bin', 'elanous');
+    expect(lstatSync(elanous).isFile()).toBe(true);
+    expect(readFileSync(elanous, 'utf8')).toContain(join(prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs'));
     expect(existsSync(join(prefix, 'versions', firstDir, 'node_modules', 'elanous', 'package.json'))).toBe(true);
     // 둘째 버전: 같은 소스를 다른 버전 번호로 다시 싸서 깐다
     const work = fixture();
@@ -451,6 +555,9 @@ describe('scripts/install.sh', () => {
     const upgraded = run(['--no-modify-path', '--source', second], env);
     expect(upgraded.result.status, upgraded.result.stderr).toBe(0);
     expect(readlinkSync(join(prefix, 'current'))).toBe(`versions/${packageJson.version}-rollbacktest`);
+    const switched = spawnSync(elanous, ['--version'], { encoding: 'utf8', env: { HOME: env.home, PATH: '/usr/bin:/bin' } });
+    expect(switched.status, switched.stderr).toBe(0);
+    expect(switched.stdout).toContain(`${packageJson.version}-rollbacktest`);
     expect(existsSync(join(prefix, 'versions', firstDir, 'node_modules', 'elanous'))).toBe(true);   // 옛 버전은 남는다
   }, 240_000);
 

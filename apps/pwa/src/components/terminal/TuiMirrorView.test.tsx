@@ -7,10 +7,16 @@
 // tui-observe.test.ts.
 
 import { describe, expect, test, mock } from 'bun:test';
+import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 // Mock the DaemonProvider hook so the SSR pass doesn't reach a real client.
 // Effects don't fire under SSR, so connectAcp is never called here.
+// R-TST23 — 아래 mock.module 은 프로세스 전역이다. 원본을 잡아 두고 파일 끝에 되돌린다(`@/lib/testing/restore-module-mocks`).
+await restoreModuleMocksAfterAll([
+  '@/components/providers/DaemonProvider',
+], (specifier) => import(specifier));
+
 mock.module('@/components/providers/DaemonProvider', () => ({
   useDaemon: () => ({ client: {}, setSessionId: () => {} }),
 }));

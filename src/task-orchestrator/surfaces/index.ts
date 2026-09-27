@@ -6,7 +6,7 @@
  * Missing callables → the adapter is simply not registered (dispatcher
  * will emit `deferred: [{reason: 'no-adapter'}]` for those kinds).
  */
-import type { SurfaceRegistry } from '../surface-registry.js';
+import type { SurfaceRegistry, SurfaceAdapter } from '../surface-registry.js';
 import type { TaskSurfaceKind } from '../types.js';
 import { TASK_SURFACE_KINDS } from '../types.js';
 
@@ -25,6 +25,7 @@ import { createShowroomAdapter, type ShowroomLaneCallable } from './showroom-sur
 
 export interface SurfaceAdapterDeps {
   llmDirect?: LlmDirectCallable;
+  externalExec?: SurfaceAdapter;
   skill?: SkillCallable;
   chatPrompt?: ChatPromptCallable;
   terminalPane?: TerminalPaneCallable;
@@ -65,8 +66,8 @@ export function registerSurfaceAdapters(
   for (const kind of TASK_SURFACE_KINDS) {
     switch (kind) {
       case 'llm-direct':
-        if (deps.llmDirect) {
-          commit(kind, createLlmDirectAdapter({ callable: deps.llmDirect, now: deps.now }));
+        if (deps.externalExec ?? deps.llmDirect) {
+          commit(kind, deps.externalExec ?? createLlmDirectAdapter({ callable: deps.llmDirect!, now: deps.now }));
           registered.push(kind);
         }
         break;

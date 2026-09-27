@@ -1,18 +1,12 @@
 /**
- * Chat turn runtime — REST `/v1/prompt` POST + meta-command dispatch.
- *
- * Mirrors PR #1555 src/repl/index.ts META_COMMANDS so the PWA chat surface
- * exposes the same sticky-REPL semantics.
- *
- * Streaming via WS will land in a follow-up; U-3 ships request/response
- * over /v1/prompt for the simplest possible round-trip.
+ * Chat turn runtime — ACP `session/prompt` by default, SSE `/v1/prompt/stream`
+ * when ACP is unavailable, plus local meta-command dispatch.
  */
 
 import type {
   AcpConnection,
   AcpFrame,
   DaemonClient,
-  DaemonToolSurfaceKind,
   PromptUserContentBlock,
 } from './daemon-client';
 import {
@@ -375,7 +369,6 @@ export interface ChatMessage {
 export interface MetaResult {
   text: string; // rendered as a `meta` message
   newSessionId?: string; // if :fork or :session changes id
-  newProvider?: string; // if :provider changes provider
 }
 
 export interface ChatRuntimeContext {
@@ -383,7 +376,6 @@ export interface ChatRuntimeContext {
   sessionId: string;
   provider: string;
   setSessionId: (id: string) => void;
-  setProvider: (p: string) => void;
   /** Daemon HTTP settings for `:budget`. Injected when the caller has them
    *  outside this context (tests, or a surface that does not hold DaemonConfig). */
   daemon?: DaemonHttpConfig;
@@ -413,18 +405,21 @@ export function formatHistoryLines(
     .join('\n');
 }
 
+export const META_COMMANDS: readonly { name: string; description: string }[] = [
+  { name: 'help', description: 'Show this help' },
+  { name: 'session', description: 'Show current session id' },
+  { name: 'fork', description: 'Allocate a fresh session id' },
+  { name: 'budget', description: 'Show this month spend and the notify threshold' },
+  { name: 'history', description: 'Summarize the last N local turns (default 10) as role: first 80 chars' },
+  { name: 'clear', description: 'Clear local message buffer' },
+];
+
 const HELP_TEXT = [
-  'Meta commands (text starting with `:`):',
-  '  :help            Show this help',
-  '  :session         Show current session id',
-  '  :fork            Allocate a fresh session id',
-  '  :provider <name> Set default provider for this session',
-  '  :budget          Show this month spend and the notify threshold',
-  '  :history [N]     Summarize the last N local turns (default 10) as role: first 80 chars',
-  '  :clear           Clear local message buffer',
+  'Meta commands (enter :name or /name):',
+  ...META_COMMANDS.map(({ name, description }) => `  :${name.padEnd(16)}${description}`),
 ].join('\n');
 
-const META_HANDLERS: Record<
+export const META_HANDLERS: Record<
   string,
   (args: string[], ctx: ChatRuntimeContext) => Promise<MetaResult>
 > = {
@@ -433,11 +428,6 @@ const META_HANDLERS: Record<
   ':fork': async () => {
     const id = forkSession();
     return { text: `forked → new session ${id}`, newSessionId: id };
-  },
-  ':provider': async (args, ctx) => {
-    const p = args[0]?.trim() ?? '';
-    if (!p) return { text: `current provider = ${ctx.provider || '(server default)'}` };
-    return { text: `provider → ${p}`, newProvider: p };
   },
   ':budget': async (_args, ctx) => {
     const cfg = ctx.daemon;
@@ -455,7 +445,11 @@ const META_HANDLERS: Record<
 };
 
 export function isMetaCommand(line: string): boolean {
-  return line.trimStart().startsWith(':');
+  const trimmed = line.trimStart();
+  if (trimmed.startsWith(':')) return true;
+  if (!trimmed.startsWith('/')) return false;
+  const [cmd] = trimmed.split(/\s+/);
+  return Object.hasOwn(META_HANDLERS, `:${cmd.slice(1)}`);
 }
 
 export async function dispatchMeta(
@@ -463,11 +457,13 @@ export async function dispatchMeta(
   ctx: ChatRuntimeContext,
 ): Promise<MetaResult | null> {
   const trimmed = line.trim();
-  if (!trimmed.startsWith(':')) return null;
-  const [cmd, ...args] = trimmed.split(/\s+/);
+  if (!trimmed.startsWith(':') && !trimmed.startsWith('/')) return null;
+  const [entered, ...args] = trimmed.split(/\s+/);
+  const cmd = entered.startsWith('/') ? `:${entered.slice(1)}` : entered;
+  if (entered.startsWith('/') && !Object.hasOwn(META_HANDLERS, cmd)) return null;
   debugLog('webterm.chat.meta-command', { cmd });
-  const handler = META_HANDLERS[cmd];
-  if (!handler) return { text: `unknown meta command: ${cmd}` };
+  const handler = Object.hasOwn(META_HANDLERS, cmd) ? META_HANDLERS[cmd] : undefined;
+  if (!handler) return { text: `unknown meta command: ${entered}` };
   return handler(args, ctx);
 }
 
@@ -476,43 +472,9 @@ export interface RunTurnResult {
   newSessionId?: string;
 }
 
-export async function runChatTurn(
-  userText: string,
-  ctx: ChatRuntimeContext,
-): Promise<RunTurnResult> {
-  debugLog('webterm.chat.runturn.start', {
-    sessionId: ctx.sessionId,
-    provider: ctx.provider,
-    len: userText.length,
-  });
-  const res = await ctx.client.prompt({
-    sessionId: ctx.sessionId || undefined,
-    userText,
-    provider: ctx.provider || undefined,
-  });
-  debugLog('webterm.chat.runturn.end', {
-    stopReason: res.stopReason,
-    sessionId: res.sessionId,
-  });
-  const message: ChatMessage = {
-    id: `m-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    role: 'assistant',
-    text: res.text ?? '',
-    timestamp: Date.now(),
-    // 실제 답한 LLM(백엔드 반환 provider+model) 우선, 없으면 요청 provider.
-    meta: { provider: res.provider ?? ctx.provider, model: res.model, stopReason: res.stopReason },
-  };
-  return {
-    message,
-    newSessionId: res.sessionId !== ctx.sessionId ? res.sessionId : undefined,
-  };
-}
-
-/** Phase B-1 / B-2 / B-3 (PWA chat streaming · 2026-05-06) — streaming
- *  variant of `runChatTurn`. Routes to `/v1/prompt/stream` and
- *  forwards events to caller hooks; the returned `RunTurnResult`
- *  matches the non-streaming version so callers swap with no UI
- *  diff.
+/** Phase B-1 / B-2 / B-3 (PWA chat streaming · 2026-05-06) — SSE fallback
+ *  via `/v1/prompt/stream`; forwards events to caller hooks and returns
+ *  the final `RunTurnResult`.
  *
  *  Phase B-3 — also collects `tool-call` / `tool-result` events.
  *  `tool-call` pushes a tool_use block with status:'running'; the
@@ -551,11 +513,6 @@ export interface RunChatTurnStreamingHandlers {
    *  opt-in debug-tap. Propagates to `promptStream` so the request
    *  URL gains `?debug-tap=on` and daemon's debug-bridge activates. */
   debugTap?: boolean;
-  /** PR-D (PWA surface picker · 2026-05-13) — per-request tool-surface
-   *  override. Forwarded into the `/v1/prompt/stream` body as `tools`
-   *  so the daemon swaps surfaces for this turn only. ChatLayout reads
-   *  the active SurfacePicker selection and inject here. */
-  tools?: DaemonToolSurfaceKind;
 }
 
 export async function runChatTurnStreaming(
@@ -617,7 +574,6 @@ export async function runChatTurnStreaming(
         ? { userContent: handlers.userContent }
         : {}),
       provider: ctx.provider || undefined,
-      ...(handlers.tools ? { tools: handlers.tools } : {}),
     },
     {
       onError: handlers.onError,

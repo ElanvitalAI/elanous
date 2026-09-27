@@ -7,6 +7,7 @@ import { buildSharedAppTools } from './shared-app-tools.js';
 import { findNativeTool } from '../native-tool-catalog.js';
 import { buildSkillExecTool } from '../tool-runtime/skill-exec-runtime.js';
 import { resetUserConfig } from '../user-config.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import type { UserConfig } from '../user-config.js';
 
 const cfg = (financeOn: boolean): UserConfig => ({ finance: { enabled: financeOn } } as unknown as UserConfig);
@@ -55,13 +56,17 @@ describe('buildSharedAppTools — core + finance(gated) + skill execution 단일
       mkdirSync(join(workdir, 'elanous'));
       writeFileSync(join(workdir, 'elanous', 'config.json'), JSON.stringify({ skills: { activeSet: 'custom', dirs: [skillsDir] } }));
       process.env.XDG_CONFIG_HOME = workdir;
+      // 설정 로더는 XDG 가 아니라 elanous 설정 폴더를 읽는다 — XDG 만 바꾸면 실제 ~/.claude/skills 가 섞였다(🅣·🅢 2026-09-27).
+      setElanousConfigDir(join(workdir, 'elanous'));
       resetUserConfig();
 
       const result = await buildSharedAppTools().dispatch('elanous_skills_list', {});
-      expect(result).toMatchObject({ entries: [{ name: 'fixture-skill', description: 'fixture description' }] });
+      // 설정 폴더 뒤에 배포판 동봉 스킬 폴더(`appendBundledSkillsDir`)가 늘 붙는다 — fixture 가 «들어 있는지»만 본다.
+      expect(result).toMatchObject({ entries: expect.arrayContaining([expect.objectContaining({ name: 'fixture-skill', description: 'fixture description' })]) });
     } finally {
       if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = savedXdg;
+      resetElanousConfigDir();
       resetUserConfig();
       rmSync(workdir, { recursive: true, force: true });
     }

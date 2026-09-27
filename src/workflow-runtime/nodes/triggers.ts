@@ -36,11 +36,33 @@ export async function executeScheduleTriggerNode(
   };
 }
 
+function parseObject(text: unknown): Record<string, unknown> | undefined {
+  if (typeof text !== 'string') return undefined;
+  try {
+    const value: unknown = JSON.parse(text);
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  } catch { return undefined; }
+}
+
+function webhookBodyObject(args: string): Record<string, unknown> | undefined {
+  const outer = parseObject(args);
+  const trigger = outer?.['trigger'];
+  if (trigger !== null && typeof trigger === 'object' && (trigger as { kind?: unknown }).kind === 'webhook') {
+    return parseObject((trigger as { body?: unknown }).body);
+  }
+  return outer;
+}
+
 export async function executeWebhookTriggerNode(
   node: WebhookTriggerNode,
-  _ctx: NodeExecContext,
+  ctx: NodeExecContext,
   _deps: WorkflowDeps,
 ): Promise<NodeOutput> {
+  // A JSON object body is exposed as `$<id>.output.body.<field>` so a
+  // downstream node (e.g. `task`) can read provider fields. The daemon
+  // passes `{ trigger: { kind: 'webhook', body: <raw> }, nodeId }` as
+  // `$ARGUMENTS`; `wf run <name> '<json>'` passes the body itself.
+  const body = webhookBodyObject(ctx.arguments);
   return {
     ok: true,
     output: {
@@ -50,6 +72,7 @@ export async function executeWebhookTriggerNode(
       // Auth descriptor surfaces type only; secret values stay in YAML
       // (the executor doesn't need to echo them downstream).
       ...(node.webhookTrigger.auth ? { authType: node.webhookTrigger.auth.type } : {}),
+      ...(body ? { body } : {}),
     },
     durationMs: 0,
   };

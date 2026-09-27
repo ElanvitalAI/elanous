@@ -14,7 +14,6 @@ import type { RenderOptions } from '../src/tui.js';
 const frameInput: DashboardFrameInput = {
   overlay: '',
   force: false,
-  essential: false,
   cursorOwner: 'none',
   claimedCursor: null,
   coordinatorCursor: null,

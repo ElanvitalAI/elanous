@@ -1119,7 +1119,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
       let runningRunObservationComplete: boolean;
       let conflictStatuses: Array<{ path: string; runIds: Array<{ runId: string; status: string }> }>;
       try {
-        const running = (deps.queryRunningRuns ?? (() => queryRunningRuns({ includeTest: true })))();
+        const running = (deps.queryRunningRuns ?? (() => queryRunningRuns({ includeTest: true, caller: 'pr-land' })))();
         const summary = runningRunObservation(running, query.entries.length);
         const statusFor = summary.statusFor as (runId: string) => string;
         observation = { ...summary };

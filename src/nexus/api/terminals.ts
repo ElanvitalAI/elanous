@@ -606,7 +606,7 @@ export interface CachedRunningRuns {
 
 export interface RunningRunsCacheDeps {
   now(): number;
-  queryRunningRuns(options: { includeTest?: boolean }): RunningRunsResult;
+  queryRunningRuns(options: { includeTest?: boolean; caller?: string }): RunningRunsResult;
 }
 
 /**
@@ -641,7 +641,7 @@ export function createRunningRunsCache(
     }
     flights.add(includeTest);
     try {
-      const computed = deps.queryRunningRuns({ includeTest });
+      const computed = deps.queryRunningRuns({ includeTest, caller: 'nexus.terminals' });
       const slot = slots.get(includeTest);
       const result = slot?.result ?? computed;
       if (slot) Object.assign(slot.result, computed);
@@ -895,20 +895,14 @@ function terminalKey(terminal: Pick<TerminalSummary, 'id' | 'sourceRoot'>): stri
   return `${terminal.sourceRoot?.dbPath ?? ptyManifestDbPath()}\u0000${terminal.id}`;
 }
 
-function webTerminalKey(sessionId: string, terminalId: string): string {
-  return `${sessionId}\u0000${terminalId}`;
-}
-
 function mergeWebPreviewTerminals(ptyTerminals: TerminalSummary[]): TerminalSummary[] {
+  // Registry enumeration is shell-unique even when multiple ACP sessions
+  // have output taps on the same PreviewTerminal.
   const webTerminals = listAllPreviewTerminals();
   const liveWebTerminals = webTerminals.filter((terminal) => terminal.isAlive);
-  const seenWebTerminals = new Set<string>();
   const merged = [...ptyTerminals];
   let added = 0;
   for (const terminal of liveWebTerminals) {
-    const key = webTerminalKey(terminal.sessionId, terminal.terminalId);
-    if (seenWebTerminals.has(key)) continue;
-    seenWebTerminals.add(key);
     merged.push({
       id: terminal.terminalId,
       cmd: 'web-terminal',

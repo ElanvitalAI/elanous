@@ -10,6 +10,7 @@
 // Provider resolution order (MEMORY pattern — user-config wins over env):
 //   user-config voice.tts.provider > env TTS_PROVIDER > default 'openai-tts'
 
+import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
 import {
@@ -29,21 +30,50 @@ function credentialResolves(name: string): boolean {
   return (process.env[name] ?? '').trim().length > 0;
 }
 
-/** Pure availability for a TTS id. Paid ids need their credential class;
- *  free ids never do. A thrown measurement is not "absent". */
-export function isTtsProviderUsableNow(id: TTSProviderId): boolean {
+interface TtsAvailabilityDeps {
+  which(name: string): string | null;
+  exists(path: string): boolean;
+  executable(path: string): boolean;
+  platform: NodeJS.Platform;
+}
+
+function isExecutableFile(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const defaultTtsAvailabilityDeps: TtsAvailabilityDeps = {
+  which: (name) => Bun.which(name),
+  exists: existsSync,
+  executable: isExecutableFile,
+  platform: process.platform,
+};
+
+/** Paid ids need credentials; free ids need their local executables. */
+export function isTtsProviderUsableNow(
+  ...[id, deps = defaultTtsAvailabilityDeps]: [TTSProviderId, TtsAvailabilityDeps?]
+): boolean {
   switch (id) {
     case 'openai-tts':
       return credentialResolves('OPENAI_API_KEY');
     case 'elevenlabs-tts':
       return credentialResolves('ELEVENLABS_API_KEY');
-    case 'edge-tts':
+    case 'edge-tts': {
+      const binary = process.env.EDGE_TTS_BIN?.trim();
+      return (binary ? deps.exists(binary) && deps.executable(binary) : deps.which('edge-tts') !== null)
+        && deps.which('sox') !== null;
+    }
     case 'macos-say':
-      return true;
+      return deps.platform === 'darwin' && deps.which('say') !== null;
   }
 }
 
-function resolveProviderId(): TTSProviderId {
+function resolveProviderId(deps: TtsAvailabilityDeps = defaultTtsAvailabilityDeps): TTSProviderId {
   let configOverride: TTSProviderId | undefined;
   try {
     const cfg = getUserConfig();
@@ -68,12 +98,15 @@ function resolveProviderId(): TTSProviderId {
   if (!unpaidDefault) return chosen;
   let usable = true;
   try {
-    usable = isTtsProviderUsableNow(chosen);
+    usable = isTtsProviderUsableNow(chosen, deps);
   } catch {
     return chosen;
   }
   if (usable) return chosen;
-  return TTS_FREE_FALLBACK.find((id) => isTtsProviderUsableNow(id)) ?? chosen;
+  const free = TTS_FREE_FALLBACK.find((id) => isTtsProviderUsableNow(id, deps));
+  if (free) return free;
+  debug.log('voice.tts', 'no-usable-provider', { tried: [chosen, ...TTS_FREE_FALLBACK] });
+  return chosen;
 }
 
 /** config화 (2026-07-12) — `voice.tts.voiceId` 를 provider 생성자에
@@ -117,6 +150,11 @@ async function instantiateForId(
 /** Test seam — the id `initDaemonTtsProvider` will instantiate. */
 export function resolveDaemonTtsProviderIdForTesting(): TTSProviderId {
   return resolveProviderId();
+}
+
+/** Resolve with a fake local executable probe without touching the host PATH. */
+export function resolveDaemonTtsProviderIdWithDepsForTesting(deps: TtsAvailabilityDeps): TTSProviderId {
+  return resolveProviderId(deps);
 }
 
 export async function initDaemonTtsProvider(): Promise<TTSProvider | null> {

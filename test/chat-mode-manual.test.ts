@@ -108,11 +108,16 @@ describe('buildDashboardControlManual', () => {
     expect(m).not.toContain('## Active intent');
   });
 
-  test('conventions + response shape sections land verbatim', () => {
+  test('conventions + response shape sections omit virtual-window advice', () => {
     const m = buildDashboardControlManual({ catalog: FAKE_CATALOG, slashes: FAKE_SLASHES });
     expect(m).toContain('## Conventions');
     expect(m).toContain('Approval');
     expect(m).toContain('## Your response shape');
+    expect(m).not.toContain('WindowCreate');
+    expect(m).not.toContain('PaneSplit');
+    expect(m).not.toContain('SpawnCodingAgentInVW');
+    expect(m).not.toContain('@win:');
+    expect(m).toContain('@term:<id>');
   });
 
   test('exit-mode guidance is present', () => {

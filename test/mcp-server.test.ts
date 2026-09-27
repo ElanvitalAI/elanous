@@ -123,6 +123,52 @@ describe('MCP initialize', () => {
 });
 
 describe('MCP tools/list', () => {
+  test('fresh process lists self-cognition tools without preloading core-tools', async () => {
+    const script = `
+      import { createRequire } from 'node:module';
+      const { handleMcpRequest } = await import('./src/mcp/server.ts');
+      const { registerToolRuntime } = await import('./src/tool-runtime/registry.ts');
+      const require = createRequire(import.meta.url);
+      const coreToolsPath = require.resolve('./src/domains/core-tools.js');
+      const startedUnloaded = !require.cache[coreToolsPath];
+      registerToolRuntime({
+        id: 'preload_probe', surfaces: ['mcp'],
+        get spec() {
+          if (!require.cache[coreToolsPath]) throw new Error('core-tools not preloaded before tools/list');
+          return { name: 'preload_probe', description: 'preload probe', parameters: { type: 'object' } };
+        },
+        run: async () => ({ output: 'ok' }),
+      });
+      const response = await handleMcpRequest({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+      const tools = (response.result as { tools?: Array<{ name: string }> } | undefined)?.tools;
+      console.log(JSON.stringify({
+        startedUnloaded,
+        error: response.error ?? null,
+        toolCount: tools?.length ?? 0,
+        hasSelfRecall: tools?.some(tool => tool.name === 'self_recall') ?? false,
+      }));
+    `;
+    const child = Bun.spawn([process.execPath, '-e', script], {
+      cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    expect(exitCode, stderr).toBe(0);
+    const result = JSON.parse(stdout.trim()) as {
+      startedUnloaded: boolean;
+      error: { code: number; message: string } | null;
+      toolCount: number;
+      hasSelfRecall: boolean;
+    };
+    expect(result.startedUnloaded).toBe(true);
+    expect(result.error).toBeNull();
+    expect(result.toolCount).toBeGreaterThan(0);
+    expect(result.hasSelfRecall).toBe(true);
+  });
+
   beforeEach(() => {
     _resetToolRuntimeRegistryForTest();
     resetForTesting();

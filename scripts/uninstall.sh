@@ -55,7 +55,14 @@ echo "remove: $PREFIX/{versions,current,bin,install.json}"
 if [ "$KEEP_PATH" -eq 0 ]; then for f in "${STARTUPS[@]+"${STARTUPS[@]}"}"; do echo "remove PATH block: $f"; done; fi
 if [ "$DRY" -eq 1 ]; then echo "(dry run — nothing changed)"; exit 0; fi
 
-for item in versions current bin install.json; do rm -rf -- "${PREFIX:?}/$item"; done
+rm -rf -- "${PREFIX:?}/versions" "$PREFIX/current" "$PREFIX/install.json"
+# bin may contain a different eln (or other user commands); remove only our marked alias.
+ELN="$PREFIX/bin/eln"
+if [ -f "$ELN" ] && [ ! -L "$ELN" ] && [ "$(sed -n '2p' "$ELN")" = '# elanous-wrapper' ]; then
+  rm -f -- "$ELN"
+fi
+rm -f -- "$PREFIX/bin/elanous" "$PREFIX/bin/bun"
+rmdir -- "$PREFIX/bin" 2>/dev/null || true
 KEPT=""
 if ! rmdir -- "$PREFIX" 2>/dev/null; then KEPT="$(ls -A -- "$PREFIX" 2>/dev/null | tr '\n' ' ')"; fi
 if [ "$KEEP_PATH" -eq 0 ]; then

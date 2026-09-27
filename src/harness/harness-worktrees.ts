@@ -389,7 +389,7 @@ export function execHarnessWorktrees(deps: {
   const queryOwnerRuns = deps.queryRunningRuns ?? queryRunningRuns;
   let ownerRunStatuses: Map<string, RunningRunStatus> | undefined;
   try {
-    ownerRunStatuses = ownerRunStatusesFromQuery(queryOwnerRuns());
+    ownerRunStatuses = ownerRunStatusesFromQuery(queryOwnerRuns({ caller: 'harness-worktrees' }));
   } catch {
     ownerRunStatuses = undefined;
   }

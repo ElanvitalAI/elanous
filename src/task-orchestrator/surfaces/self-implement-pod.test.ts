@@ -10,9 +10,13 @@ import { parsePodArtifactChunks } from './pod-artifact-return.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
-import { POD_JOB_DEADLINE_SECONDS, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSelfImplementSpawn, recordPodSalvage, type Kubectl } from './self-implement-pod.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSelfImplementSpawn, recordPodSalvage, type Kubectl } from './self-implement-pod.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
+import { loadTokens } from '../../oauth/store.js';
+import { resolveCodexAccount } from '../../oauth/codex-account.js';
+import { statSync } from 'node:fs';
+import { orchestrateSelfDev } from '../../self-dev/orchestrate.js';
 
 const CREDS = () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' });
 
@@ -62,6 +66,239 @@ describe('pod source delivery', () => {
     const { k, calls } = sourceKubectl('Running');
     await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS })({ feature: 'x', spaceId: 'src-default' }).done;
     expect(calls.filter((c) => c.includes(' cp '))).toHaveLength(0);
+  });
+});
+
+describe('pod codex rotation credentials', () => {
+  test('brokered allocation packages every usable account separately, reconstructs the account store and keeps explicit account single', async () => {
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    const selected: string[] = [];
+    const creds = (account: string) => {
+      selected.push(account);
+      return {
+        elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: `access-${account}`, refreshToken: '' } } } }),
+        codexAuth: JSON.stringify({ tokens: { access_token: `access-${account}`, refresh_token: '' } }), ghToken: 'gh',
+      };
+    };
+    await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, accountBroker: () => 'third', rotationAccounts: ['default', 'team', 'third'], credentials: creds, env: {} })({ feature: 'x', spaceId: 'rotation-pack' }).done;
+    const [secret, job] = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+    expect(selected).toEqual(['third', 'default', 'team']);
+    expect(Object.keys(secret.stringData).filter((key) => key.startsWith('codex-')).sort()).toEqual(['codex-0.json', 'codex-1.json', 'codex-2.json']);
+    expect(secret.stringData['codex-auth.json']).toBeUndefined();
+    expect(job.spec.template.spec.volumes[0].secret.defaultMode).toBe(0o400);
+    const script: string = job.spec.template.spec.containers[0].args[0];
+    expect(script).toContain("export ELANOUS_CODEX_ACCOUNT='third'");
+    const home = mkdtempSync(join(tmpdir(), 'pod-rotation-home-'));
+    try {
+      const mount = join(home, 'creds'); mkdirSync(mount);
+      for (const [key, value] of Object.entries(secret.stringData) as Array<[string, string]>) writeFileSync(join(mount, key), value);
+      const block = script.slice(script.indexOf('mkdir -p "$HOME/.elanous"'), script.indexOf('\nexport GH_TOKEN='));
+      const run = Bun.spawnSync(['bash', '-c', block.replaceAll('/creds/', `${mount}/`)], { env: { ...process.env, HOME: home } });
+      expect(run.exitCode).toBe(0);
+      const store = JSON.parse(readFileSync(join(home, '.elanous', 'auth.json'), 'utf8'));
+      expect(Object.keys(store.providers)).toEqual(['openai-codex:third', 'openai-codex', 'openai-codex:team']);
+      expect(statSync(join(home, '.elanous', 'auth.json')).mode & 0o777).toBe(0o600);
+      for (const [i, name] of ['third', 'default', 'team'].entries()) {
+        const key = name === 'default' ? 'openai-codex' : `openai-codex:${name}`;
+        expect(store.providers[key].codexHome).toBe(join(home, '.elanous', 'codex-accounts', String(i)));
+        expect(loadTokens(key, join(home, '.elanous', 'auth.json'))?.tokens.accessToken).toBe(`access-${name}`);
+        const resolved = resolveCodexAccount({ ELANOUS_CODEX_ACCOUNT: name } as NodeJS.ProcessEnv, { storedHome: (storeKey) => loadTokens(storeKey, join(home, '.elanous', 'auth.json'))?.codexHome });
+        expect(resolved.name).toBe(name);
+        if (name !== 'default') expect(resolved.home).toBe(store.providers[key].codexHome);
+        const authFile = join(store.providers[key].codexHome, 'auth.json');
+        expect(JSON.parse(readFileSync(authFile, 'utf8')).tokens.access_token).toBe(`access-${name}`);
+        expect(statSync(authFile).mode & 0o777).toBe(0o600);
+      }
+      expect(JSON.parse(readFileSync(join(home, '.codex', 'auth.json'), 'utf8')).tokens.access_token).toBe('access-third');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+    const single = fakeKubectl(['Complete'], '');
+    await podSelfImplementSpawn({ kubectl: single.k, account: 'team', credentials: creds, env: {} })({ feature: 'x', spaceId: 'rotation-explicit' }).done;
+    const [singleSecret, singleJob] = single.calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+    expect(singleSecret.stringData['codex-auth.json']).toBeDefined();
+    expect(singleSecret.stringData['codex-1-auth.json']).toBeUndefined();
+    expect(singleJob.spec.template.spec.containers[0].args[0]).toContain('cp /creds/codex-auth.json ~/.codex/auth.json');
+    const second = fakeKubectl(['Complete'], '');
+    await podSelfImplementSpawn({ kubectl: second.k, accountBroker: () => 'team', rotationAccounts: ['default', 'team', 'third'], credentials: creds, env: {} })({ feature: 'x', spaceId: 'rotation-second-allocation' }).done;
+    const secondSecret = second.calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!))[0];
+    expect(JSON.parse(secondSecret.stringData['codex-0.json']).codexAuth).toContain('access-team');
+    expect(JSON.parse(secondSecret.stringData['codex-1.json']).codexAuth).toContain('access-default');
+    expect(JSON.parse(secondSecret.stringData['codex-2.json']).codexAuth).toContain('access-third');
+    const invalid = fakeKubectl(['Complete'], '');
+    const bad = await podSelfImplementSpawn({ kubectl: invalid.k, accountBroker: () => 'third', rotationAccounts: ['third', 'third'], credentials: creds, env: {} })({ feature: 'x', spaceId: 'rotation-duplicate' }).done;
+    expect(bad.error?.message).toContain('서로 다른 codex 계정');
+    expect(invalid.calls.filter((c) => c.args.endsWith('apply -f -'))).toHaveLength(0);
+  });
+
+  test('every account is checked on the host and no account refresh token enters the Secret', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-rotation-host-'));
+    try {
+      const providers: Record<string, unknown> = {};
+      const token = (exp: number) => `h.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.s`;
+      for (const [i, name] of ['team', 'third'].entries()) {
+        const codexHome = join(root, `home-${i}`);
+        mkdirSync(codexHome);
+        writeFileSync(join(codexHome, 'auth.json'), JSON.stringify({ tokens: { access_token: token(Math.floor(Date.now() / 1000) + 200 * 3600), refresh_token: `cli-refresh-${name}`, account_id: `id-${name}` } }));
+        providers[`openai-codex:${name}`] = { codexHome, tokens: { accessToken: 'stale', refreshToken: `store-refresh-${name}`, expiresAt: 1 } };
+      }
+      const store = join(root, 'auth.json');
+      writeFileSync(store, JSON.stringify({ version: 1, providers }));
+      const credentials = (name: string) => hostCredentials(name, store, () => 'gh');
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const result = await podSelfImplementSpawn({ kubectl: k, accountBroker: () => 'third', rotationAccounts: ['team', 'third'], credentials, env: {} })({ feature: 'x', spaceId: 'rotation-redaction' }).done;
+      expect(result.exitCode).toBe(0);
+      const secret = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!))[0];
+      expect(JSON.stringify(secret)).not.toMatch(/cli-refresh-|store-refresh-/);
+      for (const i of [0, 1]) {
+        const account = JSON.parse(secret.stringData[`codex-${i}.json`]);
+        expect(JSON.parse(account.codexAuth).tokens.refresh_token).toBe('');
+        expect(JSON.parse(account.elanousAuth).providers['openai-codex'].tokens.refreshToken).toBe('');
+      }
+      const unredacted = fakeKubectl(['Complete'], '');
+      const bad = await podSelfImplementSpawn({ kubectl: unredacted.k, accountBroker: () => 'third', rotationAccounts: ['team', 'third'], credentials: (name) => name === 'team' ? { ...credentials(name), codexAuth: JSON.stringify({ tokens: { refresh_token: 'unsafe' } }) } : credentials(name), env: {} })({ feature: 'x', spaceId: 'rotation-unredacted' }).done;
+      expect(bad.error?.message).toContain('refresh');
+      expect(unredacted.calls.filter((c) => c.args.endsWith('apply -f -'))).toHaveLength(0);
+      const expired = join(root, 'home-0', 'auth.json');
+      writeFileSync(expired, JSON.stringify({ tokens: { access_token: token(Math.floor(Date.now() / 1000) + 60), refresh_token: 'cli-refresh-team' } }));
+      const rejected = fakeKubectl(['Complete'], '');
+      const failure = await podSelfImplementSpawn({ kubectl: rejected.k, accountBroker: () => 'third', rotationAccounts: ['team', 'third'], credentials, env: {} })({ feature: 'x', spaceId: 'rotation-expired' }).done;
+      expect(failure.error?.message).toContain('3시간 안에 만료');
+      expect(rejected.calls.filter((c) => c.args.endsWith('apply -f -'))).toHaveLength(0);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+describe('pod terminal usage-limit retry', () => {
+  const quota = JSON.stringify({ stage: 'abandoned', ok: false, error: '429 usage_limit_reached' });
+  const success = JSON.stringify({ stage: 'pr-opened', ok: true, worktreePath: '/pod/only' });
+  const credentials = (name: string) => ({
+    elanousAuth: JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: name, refreshToken: '' } } } }),
+    codexAuth: JSON.stringify({ tokens: { access_token: name, refresh_token: '' } }), ghToken: 'gh',
+  });
+  function simulation(results: string[]) {
+    const applied: Array<Record<string, any>> = [];
+    const calls: string[] = [];
+    let attempt = -1;
+    const kubectl: Kubectl = (args, input) => {
+      const cmd = args.join(' ');
+      calls.push(cmd);
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (cmd.includes('jsonpath={.metadata.uid} ')) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (cmd.endsWith('apply -f -')) {
+        const manifest = JSON.parse(input!);
+        applied.push(manifest);
+        if (manifest.kind === 'Job') attempt++;
+      }
+      if (args.includes('logs')) return { status: 0, stdout: results[attempt] ?? '', stderr: '' };
+      if (cmd.includes('get job') && cmd.includes('status.conditions[*].type')) return { status: 0, stdout: 'Complete', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    return { kubectl, applied, calls };
+  }
+  test('terminal 429 retries one chunk once on next remaining account; failed account is absent from retry Secret', async () => {
+    const { kubectl, applied, calls } = simulation([quota, success]);
+    const events: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-usage-limit-retry', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'usage-limit-retry') events.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl, credentials, accountBroker: () => 'team', rotationAccounts: ['default', 'team', 'third'], env: {} })({ feature: 'same chunk', spaceId: 'quota-retry' }).done;
+      expect(result.exitCode).toBe(0);
+      expect(result.disposition).toMatchObject({ stage: 'pr-opened', worktreePath: undefined });
+      const jobs = applied.filter((m) => m.kind === 'Job');
+      const secrets = applied.filter((m) => m.kind === 'Secret');
+      expect(jobs).toHaveLength(2);
+      expect(secrets[0].stringData.feature).toBe(secrets[1].stringData.feature);
+      expect(JSON.parse(secrets[1].stringData['codex-0.json']).codexAuth).toContain('default');
+      expect(Object.keys(secrets[1].stringData).filter((key) => key.startsWith('codex-')).map((key) => JSON.parse(secrets[1].stringData[key]).codexAuth)).not.toContainEqual(expect.stringContaining('"access_token":"team"'));
+      expect(Object.keys(secrets[1].stringData).filter((key) => key.startsWith('codex-'))).toHaveLength(2);
+      expect(jobs[1].spec.template.spec.containers[0].args[0]).toContain("export ELANOUS_CODEX_ACCOUNT='default'");
+      expect(jobs[0].spec.template.spec.containers[0].env.find((e: { name: string }) => e.name === 'ELANOUS_RUN_ID').value)
+        .not.toBe(jobs[1].spec.template.spec.containers[0].env.find((e: { name: string }) => e.name === 'ELANOUS_RUN_ID').value);
+      expect(calls.some((c) => c.includes('delete job') && c.includes('--wait=true'))).toBe(true);
+      expect(events).toEqual([expect.objectContaining({ from: 'team', to: 'default' })]);
+    } finally { off(); }
+  });
+  test('executed Pod child command: terminal 429 with a Complete Job still retries once without the failed account', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-quota-child-'));
+    const bin = join(home, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'elanous'), `#!/bin/sh
+[ "$1" = self ] && [ "$2" = implement ] && [ "$3" = 'same chunk' ] || exit 8
+case "$ELANOUS_CODEX_ACCOUNT" in
+  team) printf '%s\\n' '${quota}'; exit 0 ;;
+  default) printf '%s\\n' '${success}'; exit 0 ;;
+  *) exit 9 ;;
+esac
+`);
+    chmodSync(join(bin, 'elanous'), 0o755);
+    const applied: Array<Record<string, any>> = [];
+    const executions: Array<{ account: string; feature: string; exitCode: number; state: string; terminal: Record<string, unknown> }> = [];
+    const calls: string[] = [];
+    let active: { state: string; log: string } | undefined;
+    const kubectl: Kubectl = (args, input) => {
+      const cmd = args.join(' ');
+      calls.push(cmd);
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (cmd.includes('jsonpath={.metadata.uid} ')) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (cmd.endsWith('apply -f -')) {
+        const manifest = JSON.parse(input!);
+        applied.push(manifest);
+        if (manifest.kind === 'Job') {
+          const secret = applied.filter((item) => item.kind === 'Secret').at(-1)!;
+          const featureFile = join(home, 'feature');
+          const outputFile = join(home, 'si.out');
+          writeFileSync(featureFile, secret.stringData.feature);
+          const script: string = manifest.spec.template.spec.containers[0].args[0];
+          const accountLine = script.split('\n').find((line) => line.startsWith('export ELANOUS_CODEX_ACCOUNT='))!;
+          const command = script.split('\n').find((line) => line.startsWith('elanous self implement '))!;
+          const child = Bun.spawnSync(['bash', '-c', `${accountLine}\n${command.replace('/creds/feature', featureFile).replaceAll('/tmp/si.out', outputFile)}\ncat ${outputFile}\ntail -n 1 ${outputFile}\nexit $rc`], {
+            cwd: home, env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
+          });
+          const log = child.stdout.toString();
+          const terminal = JSON.parse(log.trimEnd().split('\n').at(-1)!) as Record<string, unknown>;
+          const state = child.exitCode === 0 ? 'Complete' : 'Failed';
+          active = { state, log };
+          executions.push({ account: /'([^']+)'/.exec(accountLine)![1]!, feature: secret.stringData.feature, exitCode: child.exitCode, state, terminal });
+        }
+      }
+      if (cmd.includes('get job') && cmd.includes('status.conditions[*].type')) return { status: 0, stdout: active?.state ?? '', stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: active?.log ?? '', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      const result = await podSelfImplementSpawn({ kubectl, credentials, accountBroker: () => 'team', rotationAccounts: ['team', 'default'], env: {} })({ feature: 'same chunk', spaceId: 'quota-executed-child' }).done;
+      expect(executions.map(({ account, feature, exitCode, state, terminal }) => ({ account, feature, exitCode, state, terminal }))).toEqual([
+        { account: 'team', feature: 'same chunk', exitCode: 0, state: 'Complete', terminal: JSON.parse(quota) },
+        { account: 'default', feature: 'same chunk', exitCode: 0, state: 'Complete', terminal: JSON.parse(success) },
+      ]);
+      expect(result.exitCode).toBe(0);
+      expect(result.disposition?.stage).toBe('pr-opened');
+      expect(applied.filter((item) => item.kind === 'Job')).toHaveLength(2);
+      const retrySecret = applied.filter((item) => item.kind === 'Secret')[1]!;
+      expect(Object.keys(retrySecret.stringData).filter((key) => key.startsWith('codex-'))).toEqual(['codex-0.json']);
+      expect(JSON.parse(JSON.parse(retrySecret.stringData['codex-0.json']).codexAuth).tokens.access_token).toBe('default');
+      expect(calls.filter((cmd) => cmd.includes('delete job') && cmd.includes('--wait=true'))).toHaveLength(1);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('second 429 is returned without another launch; non-terminal and explicit-account failures do not rotate', async () => {
+    const twice = simulation([quota, quota]);
+    const failed = await podSelfImplementSpawn({ kubectl: twice.kubectl, credentials, accountBroker: () => 'team', rotationAccounts: ['team', 'third'], env: {} })({ feature: 'chunk', spaceId: 'quota-twice' }).done;
+    expect(failed.exitCode).toBe(1);
+    expect(failed.disposition?.error).toBe('429 usage_limit_reached');
+    expect(twice.applied.filter((m) => m.kind === 'Job')).toHaveLength(2);
+    const noSpare = simulation([quota]);
+    await podSelfImplementSpawn({ kubectl: noSpare.kubectl, credentials, accountBroker: () => 'team', rotationAccounts: ['team'], env: {} })({ feature: 'chunk', spaceId: 'quota-no-spare' }).done;
+    expect(noSpare.applied.filter((m) => m.kind === 'Job')).toHaveLength(1);
+    const other = simulation([JSON.stringify({ stage: 'abandoned', ok: false, error: '429 different_error' })]);
+    await podSelfImplementSpawn({ kubectl: other.kubectl, credentials, accountBroker: () => 'team', rotationAccounts: ['team', 'third'], env: {} })({ feature: 'chunk', spaceId: 'quota-other' }).done;
+    expect(other.applied.filter((m) => m.kind === 'Job')).toHaveLength(1);
+    const explicit = simulation([quota]);
+    await podSelfImplementSpawn({ kubectl: explicit.kubectl, credentials, account: 'team', env: {} })({ feature: 'chunk', spaceId: 'quota-explicit' }).done;
+    expect(explicit.applied.filter((m) => m.kind === 'Job')).toHaveLength(1);
+    const nonTerminal = simulation([`${quota}\n{"stage":"abandoned","ok":false,"error":"different_error"}`]);
+    await podSelfImplementSpawn({ kubectl: nonTerminal.kubectl, credentials, accountBroker: () => 'team', rotationAccounts: ['team', 'third'], env: {} })({ feature: 'chunk', spaceId: 'quota-not-terminal' }).done;
+    expect(nonTerminal.applied.filter((m) => m.kind === 'Job')).toHaveLength(1);
   });
 });
 
@@ -125,6 +362,34 @@ describe('pod grok credentials', () => {
 });
 
 describe('podSelfImplementSpawn', () => {
+  test('self orchestrate CLI passes its actual supervise option into the Pod launch', () => {
+    const source = readFileSync(new URL('../../index.ts', import.meta.url), 'utf8');
+    const action = source.slice(source.indexOf(".command('orchestrate [goals...]')"), source.indexOf("selfOrchestrateCmd.on('option:help-all'"));
+    expect(action).toContain('const podBase = { hostSupervised: opts.supervise === true,');
+    expect(action).toContain('rotationAccounts = plan.accounts');
+    expect(action).toContain('{ accountBroker, rotationAccounts }');
+    expect(action).toContain('podSpawn = podSelfImplementSpawn(podBase)');
+    expect(action).toContain('podSpawn = benchPodSpawn(benchArms, podBase)');
+    expect(action).toContain('...(opts.supervise\n          ? {');
+  });
+
+  test('host supervision default and explicit values control self implement child flag and debug log', async () => {
+    for (const hostSupervised of [undefined, true, false]) {
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const events: Array<Record<string, unknown>> = [];
+      const off = debug.registerSink({ name: `child-supervise-${hostSupervised}`, emit: (record) => {
+        if (record.category === 'pod.self-implement' && record.event === 'child-supervise') events.push(record.data as Record<string, unknown>);
+      } });
+      try {
+        await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {}, ...(hostSupervised === undefined ? {} : { hostSupervised }) })({ feature: 'x', spaceId: `supervise-${hostSupervised}` }).done;
+        const job = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
+        const script: string = job.spec.template.spec.containers[0].args[0];
+        expect(script.split('\n').find((line) => line.startsWith('elanous self implement'))!.includes("'--no-supervise'")).toBe(hostSupervised !== false);
+        expect(events).toEqual([expect.objectContaining({ hostSupervised: hostSupervised !== false, childSupervise: hostSupervised === false })]);
+      } finally { off(); }
+    }
+  });
+
   test('job names are per-run (parallel-safe) and k8s-valid', () => {
     const a = podJobName('orch-1234/goal A');
     const b = podJobName('orch-1234/goal B');
@@ -151,6 +416,77 @@ describe('podSelfImplementSpawn', () => {
     expect(env).toContainEqual({ name: 'ELANOUS_SUBSTRATE', value: 'pod' });
     expect(applied[1].spec.template.spec.containers[0].args[0]).toContain("'--open-pr'");
     expect(calls.some((c) => c.args.includes('delete secret'))).toBe(true);
+  });
+
+  test('autoMerge Pod child requests merge-by-host, then invokes host regate once for merge-ready', async () => {
+    const headCommit = 'a'.repeat(40);
+    const json = JSON.stringify({ stage: 'merge-ready', ok: true, prUrl: 'https://github.com/o/r/pull/9', prNumber: 9, checkedHeadCommit: headCommit });
+    const { k, calls } = fakeKubectl(['Complete'], `${json}\n`);
+    const received: Array<{ prNumber: number; headCommit: string; repoRoot: string }> = [];
+    const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, hostRegate: async (request) => {
+      received.push(request);
+      return { passed: true, failures: [], os: process.platform };
+    } })({ feature: 'host regate', spaceId: 'pod-merge-host', autoMerge: true }).done;
+    const job = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!))[1];
+    const script = job.spec.template.spec.containers[0].args[0] as string;
+    expect(script).toContain("'--merge-by-host'");
+    expect(script).not.toContain('--auto-merge');
+    expect(received).toEqual([{ prNumber: 9, headCommit, repoRoot: expect.any(String) }]);
+    expect(r.disposition).toMatchObject({ stage: 'merged', merged: true, hostRegate: { passed: true } });
+  });
+
+  test('real runHostRegate path: Pod merge-ready becomes merged only through the host gh merge and MERGED confirmation', async () => {
+    const { runHostRegate } = await import('../../self-implement/host-regate.js');
+    const head = 'a'.repeat(40); const base = 'c'.repeat(40); const squash = 'd'.repeat(40);
+    const json = JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 9, checkedHeadCommit: head });
+    const ghCalls: string[] = [];
+    const deps = {
+      command: (bin: string, args: readonly string[]) => {
+        const call = `${bin} ${args.join(' ')}`; ghCalls.push(call);
+        if (call === 'gh pr view 9 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: JSON.stringify({ headRefOid: head, baseRefName: 'main', baseRefOid: base, state: 'OPEN', isDraft: false }), stderr: '' };
+        if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: ghCalls.at(-2) === 'git fetch origin refs/heads/main' ? base : head, stderr: '' };
+        if (call === 'git rev-parse HEAD' || call === 'git rev-parse HEAD^1') return { status: 0, stdout: base, stderr: '' };
+        if (call === 'git rev-parse HEAD^2') return { status: 0, stdout: head, stderr: '' };
+        if (call.startsWith('git merge-base')) return { status: 0, stdout: 'b'.repeat(40), stderr: '' };
+        if (call.startsWith('git diff --name-only')) return { status: 0, stdout: 'src/x.ts\n', stderr: '' };
+        if (call === 'gh pr view 9 --json state,mergeCommit') return { status: 0, stdout: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: squash } }), stderr: '' };
+        if (call === `git rev-parse ${squash}^1`) return { status: 0, stdout: base, stderr: '' };
+        return { status: 0, stdout: '', stderr: '' };
+      },
+      makeTemp: () => mkdtempSync(join(tmpdir(), 'pod-real-regate-')), removeTemp: (path: string) => rmSync(path, { recursive: true, force: true }), acquire: async () => () => {}, interference: async () => ({ passed: true }), log: () => {},
+    };
+    const { k } = fakeKubectl(['Complete'], `${json}\n`);
+    const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS, hostRegate: (request) => runHostRegate(request, deps) })({ feature: 'real regate', spaceId: 'pod-real-regate', autoMerge: true }).done;
+    expect(ghCalls).toContain(`gh pr merge 9 --squash --match-head-commit ${head}`);
+    expect(r.disposition).toMatchObject({ stage: 'merged', merged: true, hostRegate: { passed: true } });
+  });
+
+  test('host regate failure stays unmerged in disposition', async () => {
+    const headCommit = 'b'.repeat(40);
+    const { k } = fakeKubectl(['Complete'], JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 8, checkedHeadCommit: headCommit }));
+    const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, hostRegate: async () => ({ passed: false, failures: [{ step: 'test-interference', detail: 'combined fail' }], os: process.platform }) })({ feature: 'fail', spaceId: 'pod-regate-fail', autoMerge: true }).done;
+    expect(r.disposition).toMatchObject({ stage: 'host-regate-failed', merged: false, ok: false });
+    expect(r.exitCode).toBe(1);
+  });
+
+  test('merge-ready without a checked head: no regate, no merge, one failure comment on the PR', async () => {
+    const { k } = fakeKubectl(['Complete'], JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 7 }));
+    const comments: Array<[number, string]> = [];
+    let regated = 0;
+    const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, ghComment: (n, body) => comments.push([n, body]), hostRegate: async () => { regated++; return { passed: true, failures: [], os: process.platform }; } })({ feature: 'no head', spaceId: 'pod-regate-nohead', autoMerge: true }).done;
+    expect(regated).toBe(0);
+    expect(r.disposition).toMatchObject({ stage: 'host-regate-failed', merged: false });
+    expect(comments).toHaveLength(1);
+    expect(comments[0]![0]).toBe(7);
+    expect(comments[0]![1]).toContain('호스트 재게이트 실패');
+  });
+
+  test('hostRegate throws: one failure comment on the PR', async () => {
+    const { k } = fakeKubectl(['Complete'], JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 6, checkedHeadCommit: 'c'.repeat(40) }));
+    const comments: Array<[number, string]> = [];
+    const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, ghComment: (n, body) => comments.push([n, body]), hostRegate: async () => { throw new Error('boom'); } })({ feature: 'throws', spaceId: 'pod-regate-throws', autoMerge: true }).done;
+    expect(r.disposition).toMatchObject({ stage: 'host-regate-failed', merged: false });
+    expect(comments).toEqual([[6, expect.stringContaining('host-regate — boom')]]);
   });
 
   test('goal document travels only by Secret and the cloned Job invokes harness ask with supported flags', async () => {
@@ -181,11 +517,23 @@ describe('podSelfImplementSpawn', () => {
         expect(restored.exitCode).toBe(0);
         expect(readFileSync(join(clone, goal), 'utf8')).toBe(document);
       } finally { rmSync(clone, { recursive: true, force: true }); }
-      expect(script).toContain(`elanous harness ask '${goal}' --json '--base' 'main' --no-auto-merge`);
+      expect(script).toContain(`elanous harness ask '${goal}' --json '--base' 'main' --no-auto-merge --no-supervise`);
       expect(script).not.toContain('--open-pr');
       expect(script).not.toContain('--auto-review');
       expect(script).not.toContain('--no-draft');
       expect(result.exitCode).toBe(0);
+      const stamped = `${document}\n\n## Shard identity\n${JSON.stringify({ orchestrationId: 'a5096ecf-cb0b-4dd9-84eb-bfdffa07a280', shardId: 'task:abcdef', totalShards: 1, position: 1, summary: document, siblings: [] })}`;
+      const { k: stampedKubectl, calls: stampedCalls } = fakeKubectl(['Complete'], '');
+      await podSelfImplementSpawn({ kubectl: stampedKubectl, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal } })({ feature: stamped, spaceId: 'pod-stamped-top' }).done;
+      const stampedJob = stampedCalls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
+      expect(stampedJob.spec.template.spec.containers[0].args[0]).not.toContain('harness ask');
+      expect(stampedJob.spec.template.spec.containers[0].args[0]).toContain('elanous self implement "$(cat /creds/feature)" --json');
+      const withHandoff = `${stamped}\n\n## Working-memory handoff\nPass along findings`;
+      const { k: handoffKubectl, calls: handoffCalls } = fakeKubectl(['Complete'], '');
+      await podSelfImplementSpawn({ kubectl: handoffKubectl, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal } })({ feature: withHandoff, spaceId: 'pod-stamped-top-handoff' }).done;
+      const handoffJob = handoffCalls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
+      expect(handoffJob.spec.template.spec.containers[0].args[0]).not.toContain('harness ask');
+      expect(handoffJob.spec.template.spec.containers[0].args[0]).toContain('elanous self implement "$(cat /creds/feature)" --json');
       const command = script.split('\n').find((line) => line.startsWith('elanous harness ask '))!;
       const out = mkdtempSync(join(tmpdir(), 'pod-ask-output-'));
       const outputFile = join(out, 'si.out');
@@ -234,6 +582,349 @@ describe('podSelfImplementSpawn', () => {
     } finally { process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
   });
 
+  test('harness ask follows hostSupervised default and false', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-child-supervise-'));
+    const previous = process.cwd();
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      writeFileSync(join(root, 'GOAL.md'), '# goal');
+      process.chdir(root);
+      for (const hostSupervised of [undefined, false]) {
+        const { k, calls } = fakeKubectl(['Complete'], '');
+        await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: 'GOAL.md' }, ...(hostSupervised === undefined ? {} : { hostSupervised }) })({ feature: 'goal', spaceId: `pod-child-supervise-${hostSupervised}` }).done;
+        const job = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!)).find((m) => m.kind === 'Job');
+        const command = (job.spec.template.spec.containers[0].args[0] as string).split('\n').find((line) => line.startsWith('elanous harness ask '))!;
+        expect(command.includes('--no-supervise')).toBe(hostSupervised !== false);
+      }
+    } finally { process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('goal-doc spawn preserves the top-level ask but runs distinct shards by their feature', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-goal-shards-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const stamp = (position: number, shardId: string, summary: string) => JSON.stringify({ orchestrationId: 'a5096ecf-cb0b-4dd9-84eb-bfdffa07a280', shardId, totalShards: 2, position, summary, siblings: [{ shardId: position === 1 ? 'task:bbbbbb' : 'task:aaaaaa', summary: position === 1 ? 'implement B' : 'implement A' }] });
+    const featureA = `implement A\n\n## Shard identity\n${stamp(1, 'task:aaaaaa', 'implement A')}\n\n## Dependency handoff\n- upstream: ready`;
+    const featureB = `implement B\n\n## Shard identity\n${stamp(2, 'task:bbbbbb', 'implement B')}`;
+    const exampleGoal = `# original goal\n\n## Shard identity\n${stamp(1, 'task:aaaaaa', '# original goal')}`;
+    const topFeature = exampleGoal;
+    const exampleStamped = `${exampleGoal}\n\n## Shard identity\n${JSON.stringify({ orchestrationId: 'a5096ecf-cb0b-4dd9-84eb-bfdffa07a280', shardId: 'task:abcdef', totalShards: 1, position: 1, summary: exampleGoal.replace(/\s+/g, ' '), siblings: [] })}`;
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-goal-shard-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), exampleGoal);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const spawn = podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } });
+      for (const [spaceId, feature] of [['top', topFeature], ['piece-a', featureA], ['piece-b', featureB], ['example-stamped', exampleStamped]] as const) {
+        expect((await spawn({ feature, spaceId }).done).exitCode).toBe(0);
+      }
+      const applied = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+      const secrets = applied.filter((m) => m.kind === 'Secret');
+      const scripts = applied.filter((m) => m.kind === 'Job').map((m) => m.spec.template.spec.containers[0].args[0] as string);
+      expect(scripts).toHaveLength(4);
+      expect(scripts[0]).toContain(`elanous harness ask '${goal}' --json`);
+      expect(scripts[0]).not.toContain('elanous self implement');
+      for (const script of scripts.slice(1, 3)) {
+        expect(script).not.toContain('harness ask');
+        expect(script).not.toContain('/creds/goal-doc');
+        expect(script).toContain('elanous self implement "$(cat /creds/feature)" --json');
+      }
+      expect(secrets.slice(1, 3).every((m) => m.stringData['goal-doc'] === undefined)).toBe(true);
+      expect(scripts[3]).not.toContain('harness ask');
+      expect(scripts[3]).toContain('elanous self implement "$(cat /creds/feature)" --json');
+      expect(secrets[3].stringData['goal-doc']).toBeUndefined();
+      expect(secrets.map((m) => m.stringData.feature)).toEqual([topFeature, featureA, featureB, exampleStamped]);
+      expect(secrets[1].stringData.feature).not.toBe(secrets[2].stringData.feature);
+      expect(modes).toEqual([
+        expect.objectContaining({ spaceId: 'top', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ spaceId: 'piece-a', mode: 'shard-feature', reason: 'shard-identity' }),
+        expect.objectContaining({ spaceId: 'piece-b', mode: 'shard-feature', reason: 'shard-identity' }),
+        expect.objectContaining({ spaceId: 'example-stamped', mode: 'shard-feature', reason: 'shard-identity' }),
+      ]);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a single real shard with the exact goal body uses its own feature, while an identical unstamped top-level ask stays an ask', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-single-shard-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const document = '# original goal';
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-single-shard-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), document);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const spawn = podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } });
+      expect((await spawn({ feature: document, spaceId: 'single-top' }).done).exitCode).toBe(0);
+      const results = await orchestrateSelfDev({
+        goals: [{ feature: document }], parentRequest: document,
+        concurrency: 1, spawn, readScreenTranscript: () => null, readScreenTail: () => null,
+      });
+      expect(results).toHaveLength(1);
+      expect(results[0]?.status).toBe('done');
+      const applied = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+      const [top, shard] = applied.filter((manifest) => manifest.kind === 'Secret');
+      const [topJob, shardJob] = applied.filter((manifest) => manifest.kind === 'Job');
+      const topScript = topJob.spec.template.spec.containers[0].args[0] as string;
+      const shardScript = shardJob.spec.template.spec.containers[0].args[0] as string;
+      expect(topScript).toContain(`elanous harness ask '${goal}' --json`);
+      expect(top.stringData['goal-doc']).toBe(document);
+      expect(shard.stringData.feature).toStartWith(`${document}\n\n## Shard identity\n`);
+      expect(JSON.parse(shard.stringData.feature.split('## Shard identity\n')[1])).toMatchObject({ totalShards: 1, position: 1, summary: document });
+      expect(shard.stringData['goal-doc']).toBeUndefined();
+      expect(shardScript).not.toContain('harness ask');
+      expect(shardScript).toContain('elanous self implement "$(cat /creds/feature)" --json');
+      expect(modes).toEqual([
+        expect.objectContaining({ spaceId: 'single-top', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ mode: 'shard-feature', reason: 'shard-identity' }),
+      ]);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('real decomposition stamps launch distinct shard Jobs while an example in the original goal stays an ask', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-real-shards-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const example = '# original goal\n\nExample of a proposed shard:\n## Shard identity\n{"pieceIndex":1,"totalShards":2}';
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-real-shards-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), example);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const spawn = podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } });
+      expect((await spawn({ feature: example, spaceId: 'original-example' }).done).exitCode).toBe(0);
+      const results = await orchestrateSelfDev({
+        goals: [{ feature: 'implement A' }, { feature: 'implement B' }], parentRequest: example,
+        concurrency: 2, spawn, readScreenTranscript: () => null, readScreenTail: () => null,
+      });
+      expect(results).toHaveLength(2);
+      expect(results.every((result) => result.status === 'done')).toBe(true);
+      const applied = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+      const jobs = applied.filter((manifest) => manifest.kind === 'Job');
+      const secrets = applied.filter((manifest) => manifest.kind === 'Secret');
+      expect(new Set(jobs.map((job) => job.metadata.name)).size).toBe(3);
+      const scripts = jobs.map((job) => job.spec.template.spec.containers[0].args[0] as string);
+      expect(scripts[0]).toContain(`elanous harness ask '${goal}' --json`);
+      expect(secrets[0].stringData['goal-doc']).toBe(example);
+      for (const script of scripts.slice(1)) {
+        expect(script).not.toContain('harness ask');
+        expect(script).toContain('elanous self implement "$(cat /creds/feature)" --json');
+      }
+      expect(secrets.slice(1).map((secret) => secret.stringData.feature.split('\n')[0]).sort()).toEqual(['implement A', 'implement B']);
+      expect(secrets[1].stringData.feature).not.toBe(secrets[2].stringData.feature);
+      expect(secrets.slice(1).every((secret) => secret.stringData['goal-doc'] === undefined)).toBe(true);
+      expect(modes).toEqual([
+        expect.objectContaining({ spaceId: 'original-example', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ mode: 'shard-feature', reason: 'shard-identity' }),
+        expect.objectContaining({ mode: 'shard-feature', reason: 'shard-identity' }),
+      ]);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a shard whose own body quotes handoff headings is still recognised by its identity (real orchestrateSelfDev)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-shard-quoted-handoff-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const document = '# original goal';
+    const quoted = 'implement A\n\n## Working-memory handoff\nquoted in the body\n\n## Dependency handoff\nalso quoted';
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-shard-quoted-handoff-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), document);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const spawn = podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } });
+      const results = await orchestrateSelfDev({
+        goals: [{ id: 'a', feature: quoted }, { id: 'b', feature: 'implement B', dependsOn: ['a'] }], parentRequest: document,
+        concurrency: 1, spawn, readScreenTranscript: () => null, readScreenTail: () => null,
+      });
+      expect(results.every((result) => result.status === 'done')).toBe(true);
+      const applied = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+      const jobs = applied.filter((manifest) => manifest.kind === 'Job');
+      const secrets = applied.filter((manifest) => manifest.kind === 'Secret');
+      expect(jobs).toHaveLength(2);
+      for (const job of jobs) {
+        const script = job.spec.template.spec.containers[0].args[0] as string;
+        expect(script).not.toContain('harness ask');
+        expect(script).toContain('elanous self implement "$(cat /creds/feature)" --json');
+      }
+      expect(secrets.every((secret) => secret.stringData['goal-doc'] === undefined)).toBe(true);
+      expect(secrets[0].stringData.feature).toStartWith(quoted);
+      expect(modes).toEqual([
+        expect.objectContaining({ mode: 'shard-feature', reason: 'shard-identity' }),
+        expect.objectContaining({ mode: 'shard-feature', reason: 'shard-identity' }),
+      ]);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a shard identity heading without valid shard data keeps the top-level goal document', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-shard-heading-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-shard-heading-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), '# original goal');
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const spawn = podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } });
+      const invalidFeatures = [
+        'implement A\n\n## Shard identity\n',
+        'implement A\n\n## Shard identity\n{not json}',
+        'implement A\n\n## Shard identity\n{"totalShards":2,"position":1}',
+        'implement A\n\n## Shard identity\n{"pieceIndex":3,"totalShards":2}',
+      ];
+      expect((await spawn({ feature: '# original goal', spaceId: 'heading-top' }).done).exitCode).toBe(0);
+      for (const [index, feature] of invalidFeatures.entries()) {
+        expect((await spawn({ feature, spaceId: `heading-${index}` }).done).exitCode).toBe(0);
+      }
+      const applied = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+      for (const job of applied.filter((m) => m.kind === 'Job')) {
+        const script: string = job.spec.template.spec.containers[0].args[0];
+        expect(script).toContain(`elanous harness ask '${goal}' --json`);
+        expect(script).not.toContain('elanous self implement');
+      }
+      expect(applied.filter((m) => m.kind === 'Secret').map((m) => m.stringData.feature)).toEqual(['# original goal', ...invalidFeatures]);
+      expect(modes).toEqual(['heading-top', ...invalidFeatures.map((_, index) => `heading-${index}`)].map((spaceId) =>
+        expect.objectContaining({ spaceId, mode: 'goal-doc', reason: 'goal-doc-env' })));
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('pieceIndex examples alone keep goal-document mode even when appended after the goal', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-piece-shards-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-piece-shard-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      const exampleGoal = '# original goal\n\n## Shard identity\n{"pieceIndex":1,"totalShards":2}';
+      writeFileSync(join(root, goal), exampleGoal);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const spawn = podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } });
+      const features = [exampleGoal,
+        'implement A\n\n## Shard identity\n{"pieceIndex":1,"totalShards":2}\n\n## Working-memory handoff\nExample:\n## Shard identity\n{"pieceIndex":2,"totalShards":2}',
+        'implement B\n\n## Shard identity\n{"pieceIndex":2,"totalShards":2}',
+        '# original goal\n\n## Shard identity\n{"pieceIndex":1,"totalShards":1}',
+        '# original goal\n\n## Working-memory handoff\nExample of an earlier shard:\n## Shard identity\n{"pieceIndex":1,"totalShards":2}',
+        `${exampleGoal}\n\n## Shard identity\n{"pieceIndex":1,"totalShards":2}`];
+      for (const [index, feature] of features.entries()) {
+        expect((await spawn({ feature, spaceId: `piece-${index}` }).done).exitCode).toBe(0);
+      }
+      const applied = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+      const secrets = applied.filter((m) => m.kind === 'Secret');
+      const scripts = applied.filter((m) => m.kind === 'Job').map((m) => m.spec.template.spec.containers[0].args[0] as string);
+      expect(scripts).toHaveLength(6);
+      expect(scripts[0]).toContain(`elanous harness ask '${goal}' --json`);
+      expect(scripts[0]).not.toContain('elanous self implement');
+      for (const script of scripts) {
+        expect(script).toContain(`elanous harness ask '${goal}' --json`);
+        expect(script).not.toContain('elanous self implement');
+      }
+      expect(secrets.map((m) => m.stringData.feature)).toEqual(features);
+      expect(secrets[1].stringData.feature).not.toBe(secrets[2].stringData.feature);
+      expect(secrets[5].stringData['goal-doc']).toContain(exampleGoal);
+      expect(modes).toEqual([
+        expect.objectContaining({ spaceId: 'piece-0', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ spaceId: 'piece-1', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ spaceId: 'piece-2', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ spaceId: 'piece-3', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ spaceId: 'piece-4', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ spaceId: 'piece-5', mode: 'goal-doc', reason: 'goal-doc-env' }),
+      ]);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('a goal containing ;; and a valid shard example remains top-level for both raw and escaped feature sources', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-semicolon-goal-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const document = '# goal ;; example\n\n## Shard identity\n{"pieceIndex":1,"totalShards":2}\n';
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-semicolon-goal-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), document);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const spawn = podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } });
+      for (const [spaceId, feature] of [['raw', document], ['escaped', document.replaceAll(';;', '; ;')]] as const) {
+        expect((await spawn({ spaceId, feature }).done).exitCode).toBe(0);
+      }
+      const applied = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+      const secrets = applied.filter((m) => m.kind === 'Secret');
+      const scripts = applied.filter((m) => m.kind === 'Job').map((m) => m.spec.template.spec.containers[0].args[0] as string);
+      expect(secrets[0].stringData['goal-doc']).toBe(document);
+      expect(secrets[1].stringData['goal-doc']).toStartWith(document);
+      for (const script of scripts) {
+        expect(script).toContain(`elanous harness ask '${goal}' --json`);
+        expect(script).not.toContain('elanous self implement');
+      }
+      expect(modes).toEqual([
+        expect.objectContaining({ spaceId: 'raw', mode: 'goal-doc', reason: 'goal-doc-env' }),
+        expect.objectContaining({ spaceId: 'escaped', mode: 'goal-doc', reason: 'goal-doc-env' }),
+      ]);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('CRLF goal examples with valid multi-shard identities and a handoff still launch the top-level ask', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-crlf-goal-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/x.md';
+    const stamp = (position: number) => JSON.stringify({ orchestrationId: 'a5096ecf-cb0b-4dd9-84eb-bfdffa07a280', shardId: `task:example-${position}`, totalShards: 2, position, summary: `example ${position}`, siblings: [] });
+    const document = `# goal\r\n\r\n## Shard identity\r\n${stamp(1)}\r\n\r\n## Shard identity\r\n${stamp(2)}\r\n`;
+    const feature = `${document.trim()}\n\n## Working-memory handoff\nPass along findings`;
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-crlf-goal-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      writeFileSync(join(root, goal), document);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: goal, ELANOUS_STATE_DIR: root } })({ feature, spaceId: 'crlf-top' }).done;
+      expect(result.exitCode).toBe(0);
+      const [secret, job] = calls.filter((c) => c.args.endsWith('apply -f -')).map((c) => JSON.parse(c.input!));
+      const script = job.spec.template.spec.containers[0].args[0] as string;
+      expect(secret.stringData['goal-doc']).toBe(document);
+      expect(script).toContain(`elanous harness ask '${goal}' --json`);
+      expect(script).not.toContain('elanous self implement');
+      expect(modes).toEqual([expect.objectContaining({ spaceId: 'crlf-top', mode: 'goal-doc', reason: 'goal-doc-env' })]);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('a root goal filename beginning with a dash is passed as a safe operand', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-dash-goal-'));
     const previous = process.cwd();
@@ -276,6 +967,18 @@ describe('podSelfImplementSpawn', () => {
       expect(result.error?.message).toContain('outside repository');
       expect(calls.some((c) => c.args.endsWith('apply -f -'))).toBe(false);
     } finally { process.chdir(previous); rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); }
+  });
+
+  test('without a goal document a spawn records feature mode', async () => {
+    const { k } = fakeKubectl(['Complete'], '');
+    const modes: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-feature-mode', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'goal-doc-mode') modes.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'normal', spaceId: 'feature-only' }).done;
+      expect(modes).toEqual([expect.objectContaining({ spaceId: 'feature-only', mode: 'feature', reason: 'no-goal-doc' })]);
+    } finally { off(); }
   });
 
   test('without goal document the original self implement Job script remains unchanged', () => {
@@ -474,7 +1177,9 @@ describe('podSelfImplementSpawn', () => {
       writeFileSync(stub, '#!/bin/sh\nhead -c 5242881 /dev/zero\n');
       const overLimit = Bun.spawnSync(['bash', '-c', `rc=7\n${extract}`], { env });
       expect(overLimit.exitCode).toBe(7);
-      expect(overLimit.stdout.toString().split('\n')).toContain('ELANOUS_POD_ARTIFACT_SKIPPED pod-logs/logs.jsonl 5242881');
+      // Over the 5MB limit the export is cut to its newest lines (not skipped whole) and says so.
+      expect(overLimit.stdout.toString().split('\n')).not.toContain('ELANOUS_POD_ARTIFACT_SKIPPED pod-logs/logs.jsonl 5242881');
+      expect(overLimit.stdout.toString()).toMatch(/^ELANOUS_POD_LOGS_TRUNCATED 5242881 \d+$/m);
       writeFileSync(stub, '#!/bin/sh\nprintf "partial"\nexit 4\n');
       const failed = Bun.spawnSync(['bash', '-c', `rc=7\n${extract}`], { env });
       expect(failed.exitCode).toBe(7);
@@ -1014,15 +1719,14 @@ describe('pod run-origin env (RFC run-origin §A3)', () => {
     expect(out[0]).toMatchObject({ podName: 'si-x-abc', nodeName: 'k3d-node-0', podHostId: 'host-abc' });
   });
 
-  test('memory limit defaults to 12Gi (6Gi OOMKilled a real child) and follows ELANOUS_POD_MEMORY', () => {
+  test('memory limit defaults to 16Gi (6Gi then 12Gi OOMKilled real children) and follows ELANOUS_POD_MEMORY', () => {
     const base = { name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 };
-    expect(JSON.stringify(podJobManifest(base))).toContain('"memory":"12Gi"');
+    expect(JSON.stringify(podJobManifest(base))).toContain('"memory":"16Gi"');
     expect(JSON.stringify(podJobManifest({ ...base, memoryLimit: '24Gi' }))).toContain('"memory":"24Gi"');
   });
 });
 
 // P2·P3·P4 (2026-09-26 Pod 실물 미션에서 나온 셋).
-import { hostCredentials } from './self-implement-pod.js';
 import { join as pjoin } from 'node:path';
 describe('pod remote continuity', () => {
   const jwt = (expSec: number) => `h.${Buffer.from(JSON.stringify({ exp: expSec })).toString('base64url')}.s`;
@@ -1041,6 +1745,24 @@ describe('pod remote continuity', () => {
     expect(JSON.parse(c.codexAuth).tokens.refresh_token).toBe('');
     expect(c.elanousAuth + c.codexAuth).not.toContain('r-codex');
     expect(c.elanousAuth + c.codexAuth).not.toContain('r-elanous');
+  });
+
+  test('default account: store key `openai-codex` without codexHome resolves to CODEX_HOME (the rotation candidate the pod broker now hands out)', () => {
+    const dir = mkdtempSync(pjoin(tmpdir(), 'pod-cred-default-'));
+    const codexHome = pjoin(dir, 'codex'); mkdirSync(codexHome);
+    const fresh = jwt(Math.floor(Date.now() / 1000) + 200 * 3600);
+    writeFileSync(pjoin(codexHome, 'auth.json'), JSON.stringify({ tokens: { access_token: fresh, refresh_token: 'r', account_id: 'acc' } }));
+    const store = pjoin(dir, 'auth.json');
+    writeFileSync(store, JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: fresh, expiresAt: 1, refreshToken: 'r2' } } } }));
+    const previous = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexHome;
+    try {
+      const c = hostCredentials('default', store, () => 'gh');
+      expect(JSON.parse(c.elanousAuth).providers['openai-codex'].tokens.accessToken).toBe(fresh);
+      expect(() => hostCredentials('ghost', store, () => 'gh')).toThrow('openai-codex:ghost');
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous;
+    }
   });
 
   const run = (existing: string) => {
@@ -1488,11 +2210,62 @@ describe('pod salvage', () => {
 });
 
 describe('Pod 자식 요청(requests) — 예약은 실사용에, 상한은 그대로 (2026-09-27)', () => {
-  test('podJobManifest 는 cpu 1 · 메모리 4Gi 를 요청하고 상한 cpu 4 · 12Gi 를 유지한다', () => {
+  test('podJobManifest 는 cpu 1 · 메모리 4Gi 를 요청하고 상한 cpu 4 · 16Gi 를 유지한다', () => {
     const m = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ resources: { requests?: Record<string, string>; limits: Record<string, string> } }> } } } };
     const r = m.spec.template.spec.containers[0]!.resources;
     expect(r.requests).toEqual({ cpu: '1', memory: '4Gi' });
-    expect(r.limits).toEqual({ memory: '12Gi', cpu: '4' });
+    expect(r.limits).toEqual({ memory: '16Gi', cpu: '4' });
   });
 });
 
+
+describe('pod log export stays under the artifact limit instead of being skipped', () => {
+  test('an oversized export keeps the newest whole lines under POD_LOGS_KEEP_BYTES and says it was truncated', () => {
+    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
+    const start = script.indexOf('if mkdir -p "$HOME/outbox/pod-logs"');
+    const end = script.indexOf('\nfi', start) + 3;
+    expect(start).toBeGreaterThan(-1);
+    const block = script.slice(start, end);
+    const home = mkdtempSync(join(tmpdir(), 'pod-logs-trunc-'));
+    try {
+      mkdirSync(join(home, 'bin'));
+      // Fake exporter: ~5.5MB of numbered JSON lines (newest last).
+      writeFileSync(join(home, 'bin', 'elanous'), '#!/bin/sh\ni=0; while [ $i -lt 55000 ]; do printf \'{"n":%d,"pad":"%0100d"}\\n\' $i 0; i=$((i+1)); done\n');
+      chmodSync(join(home, 'bin', 'elanous'), 0o755);
+      const out = execFileSync('bash', ['-c', block], { env: { ...process.env, HOME: home, PATH: `${join(home, 'bin')}:${process.env.PATH}` }, encoding: 'utf8' });
+      const file = readFileSync(join(home, 'outbox', 'pod-logs', 'logs.jsonl'), 'utf8');
+      expect(Buffer.byteLength(file)).toBeLessThanOrEqual(POD_LOGS_KEEP_BYTES);
+      const lines = file.trimEnd().split('\n');
+      expect(() => JSON.parse(lines[0]!)).not.toThrow();
+      expect(JSON.parse(lines.at(-1)!).n).toBe(54999);
+      expect(out).toMatch(/^ELANOUS_POD_LOGS_TRUNCATED \d+ \d+$/m);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('the host records pod-logs-truncated from the marker line', async () => {
+    const { collectPodArtifacts } = await import('./pod-artifact-return.js');
+    const events: Array<[string, Record<string, unknown>]> = [];
+    const dir = mkdtempSync(join(tmpdir(), 'pod-art-'));
+    try {
+      collectPodArtifacts('ELANOUS_POD_LOGS_TRUNCATED 5500000 4499000\n', { dir, job: 'j1', log: (_c, e, d) => events.push([e, d]) });
+      expect(events.find(([e]) => e === 'pod-logs-truncated')?.[1]).toMatchObject({ job: 'j1', originalBytes: 5500000, keptBytes: 4499000 });
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('Pod run label — harness stop ⊕ 오케스트레이터 신호 정리가 고르는 라벨', () => {
+  test('elanous.run = 오케스트레이터 런(parentRunId) · 자식은 elanous.child-run · Job 과 Pod 템플릿 둘 다', () => {
+    expect(podRunLabels({ runId: 'run-child', parentRunId: 'run-parent' })).toEqual({ 'elanous.run': 'run-parent', 'elanous.child-run': 'run-child' });
+    expect(podRunLabels({ runId: 'run-solo' })).toEqual({ 'elanous.run': 'run-solo' });
+    const job = podJobManifest({ name: 'si-x', namespace: 'elanous-test', image: 'img', repoUrl: 'https://example.invalid/r', args: [], passEnv: [], deadlineSeconds: 60, runId: 'run-abc', parentRunId: 'run-p' }) as {
+      metadata: { labels: Record<string, string> }; spec: { template: { metadata: { labels: Record<string, string> } } };
+    };
+    expect(job.metadata.labels).toMatchObject({ 'elanous.job': 'si-x', 'elanous.run': 'run-p', 'elanous.child-run': 'run-abc' });
+    expect(job.spec.template.metadata.labels).toMatchObject({ 'elanous.run': 'run-p' });
+  });
+  test('k8s 라벨 값 규칙 — 63자 · 영숫자 양끝 · 허용 문자 밖은 정리', () => {
+    expect(k8sLabelValue('run-' + 'a'.repeat(80))!.length).toBeLessThanOrEqual(63);
+    expect(k8sLabelValue('--run/x y--')).toBe('run-x-y');
+    expect(k8sLabelValue('')).toBeUndefined();
+  });
+});

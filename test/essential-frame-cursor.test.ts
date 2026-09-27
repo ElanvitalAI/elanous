@@ -28,7 +28,6 @@ function renderEssentialFrame(input: EssentialFrameInput): string {
     renderDashboardFrame(['base'], {
       overlay: '\x1b[8;2Hoverlay',
       force: true,
-      essential: true,
       cursorOwner: input.owner ?? 'none',
       claimedCursor: input.claimedCursor,
       coordinatorCursor: null,

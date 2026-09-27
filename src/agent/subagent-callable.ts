@@ -27,8 +27,10 @@
 // fail loud with status='failed' + an error message in `output`.
 
 import { resolveAgentLayered } from './definition-registry.js';
+import { resolveAgent } from './loader.js';
 import { globalAgentRegistry } from './registry.js';
 import type { AgentRegistry } from './registry.js';
+import type { LLMProvider, LLMToolSpec } from '../llm.js';
 import type { SubagentCallable } from '../task-orchestrator/surfaces/subagent.js';
 
 export interface CreateSubagentCallableOpts {
@@ -39,6 +41,11 @@ export interface CreateSubagentCallableOpts {
    *  inject a synchronous lookup table so they don't touch the
    *  filesystem. */
   resolveDefinition?: (name: string) => ReturnType<typeof resolveAgentLayered>;
+  /** Same catalog and dispatcher supplied to the host's interactive agent tools. */
+  hostTools?: LLMToolSpec[];
+  dispatchTool?: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
+  provider?: LLMProvider;
+  cwd?: string;
 }
 
 /** Surface-agnostic factory — returns a `SubagentCallable` ready to
@@ -47,7 +54,11 @@ export function createGlobalSubagentCallable(
   opts: CreateSubagentCallableOpts = {},
 ): SubagentCallable {
   const registry = opts.registry ?? globalAgentRegistry;
-  const resolveDefinition = opts.resolveDefinition ?? resolveAgentLayered;
+  // The 4-layer map loads the builtin layer only when a builtin dir is passed, so the
+  // builtins (`general-purpose` …) were missing here while chat's Agent tool had them
+  // (2026-09-27 dogfood: every TOX `run` task failed «'general-purpose' not found»).
+  // Fall back to the builtin loader — the same order `dispatchAgent` uses.
+  const resolveDefinition = opts.resolveDefinition ?? ((name: string) => resolveAgentLayered(name) ?? resolveAgent(name));
 
   return async ({ definitionName, prompt, model, signal }) => {
     const startedAt = Date.now();
@@ -75,10 +86,37 @@ export function createGlobalSubagentCallable(
       ? { ...definition, model }
       : definition;
 
+    const allowed = new Set(effectiveDefinition.tools ?? []);
+    const denied = new Set(effectiveDefinition.disallowedTools ?? []);
+    const tools = (opts.hostTools ?? []).filter(tool =>
+      tool.name !== 'Agent' && allowed.has(tool.name) && !denied.has(tool.name));
+    const permittedNames = new Set(tools.map(tool => tool.name));
+    if (allowed.size > 0 && (tools.length === 0 || !opts.dispatchTool)) {
+      return {
+        address: `subagent:no-tools:${definitionName}`,
+        done: Promise.resolve({
+          status: 'failed' as const,
+          output: `no-tools: definition '${definitionName}' requires [${[...allowed].join(', ')}]; host tool count=${opts.hostTools === undefined ? 'unknown' : opts.hostTools.length}; usable=${tools.length}; dispatchTool=${Boolean(opts.dispatchTool)}`,
+          durationMs: Date.now() - startedAt,
+        }),
+      };
+    }
+
+    let childSignal: AbortSignal | undefined;
     const handle = registry.spawn({
       definition: effectiveDefinition,
       prompt,
+      tools,
+      dispatchTool: opts.dispatchTool
+        ? async (name, args) => {
+          if (!permittedNames.has(name)) throw new Error(`subagent tool '${name}' is not allowed`);
+          return opts.dispatchTool!(name, args, childSignal);
+        }
+        : undefined,
+      provider: opts.provider,
+      ...(opts.cwd ? { cwd: opts.cwd } : {}),
     });
+    childSignal = handle.task.controller?.signal;
 
     // External cancellation: chain caller signal into the registry's
     // own AbortController. Idempotent — registry.abort is a no-op on

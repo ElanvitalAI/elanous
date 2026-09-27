@@ -406,7 +406,20 @@ export type TaskGeneratedBy =
   | { kind: 'llm'; modelId?: string; turn?: number }
   | { kind: 'cron'; jobRef: string }
   | { kind: 'followUp'; parentTaskId: string }
-  | { kind: 'regenerate'; parentTaskId?: string; depth: number };
+  | { kind: 'regenerate'; parentTaskId?: string; depth: number }
+  | { kind: 'external'; provider: 'asana' | 'linear' | 'telegram' | 'github' | 'agent-plugin' | 'intake' | 'other'; ref: string; url?: string };
+
+export type ExternalTaskSource = Extract<TaskGeneratedBy, { kind: 'external' }>;
+export interface TaskApproval {
+  /** pending = waits for a person · auto = matched a `tox.external.autoRun` rule ·
+   *  approved = a person approved it (`POST /v1/tasks/:id/approve`). */
+  state: 'pending' | 'auto' | 'approved';
+  /** The autoRun rule that matched (state `auto` only). */
+  rule?: string;
+  /** Who approved it (state `approved` only). */
+  approvedBy?: 'manual';
+  approvedAt?: number;
+}
 
 // ──────────────────── Task ───────────────────────────────────────────
 
@@ -464,6 +477,7 @@ export interface Task {
 
   // provenance
   generatedBy?: TaskGeneratedBy;
+  approval?: TaskApproval;
   triggerChain: readonly string[]; // parent taskIds (hop ≤ 5)
 
   /** Cascade-zyu Z0 (2026-05-12) — optional anchor to an existing
@@ -495,6 +509,7 @@ export interface TaskInit {
   timeoutMs?: number;
   acceptance?: TaskAcceptance;
   generatedBy?: TaskGeneratedBy;
+  approval?: TaskApproval;
   triggerChain?: readonly string[];
   /** Optional override — default is `'backlog'`. */
   status?: TaskStatus;
@@ -647,6 +662,7 @@ export function createTask(
     acceptance: init.acceptance,
     notes: initialNotes,
     generatedBy: init.generatedBy,
+    approval: init.approval,
     triggerChain: Object.freeze([...triggerChain]),
     showroomSessionId: init.showroomSessionId,
   };
@@ -737,6 +753,7 @@ export function serializeTask(t: Task): Record<string, unknown> {
     reviewVerdicts: t.reviewVerdicts,
     notes: [...t.notes],
     generatedBy: t.generatedBy,
+    approval: t.approval,
     triggerChain: [...t.triggerChain],
     showroomSessionId: t.showroomSessionId,
   };

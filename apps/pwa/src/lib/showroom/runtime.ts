@@ -111,7 +111,7 @@ export function newShowroomId(): string {
   return `sr-${Date.now().toString(36)}-${nextCounter()}`;
 }
 
-/** PWA ProviderPicker 와 동일 5 풀.
+/** Showroom offline fallback provider pool.
  *
  *  RFC #2161 Phase 3 (2026-05-11) — the authoritative provider list
  *  now comes from `useResolvedView()` (registry catalog). This array

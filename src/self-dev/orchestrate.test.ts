@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
+import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 import { test, expect, describe } from 'bun:test';
-import { classifyFailure, classifyFailures, classifyResumeDisposition, hasDelivered, hasLanded, failureFromDeployFindings, formatShardHandoffInput, goalCauseObservedFromFailureClassification, orchestrateSelfDev, queryPreflightWarning, resolveOrchestrateConcurrency, resumeKey, summarizeFailureKinds, summarizeResults, triageRun, triageActionFor } from './orchestrate.js';
+import { classifyFailure, classifyFailures, classifyResumeDisposition, hasDelivered, hasLanded, failureFromDeployFindings, formatShardHandoffInput, goalCauseObservedFromFailureClassification, withOrchestrateGoalKey, orchestrateSelfDev, queryPreflightWarning, resolveOrchestrateConcurrency, resumeKey, summarizeFailureKinds, summarizeResults, triageRun, triageActionFor } from './orchestrate.js';
 import type { SelfDevJobResult } from './orchestrate.js';
 import { parseRunShardIdentity } from '../self-implement/run-ledger.js';
 import type { WorkingMemoryEntry } from '../agent-substrate/working-memory-format.js';
@@ -255,6 +256,220 @@ describe('orchestrateSelfDev (S1 · parallel self-dev driver)', () => {
     expect(maxLive()).toBeLessThanOrEqual(2);
     // And it actually parallelised (not serialised to 1).
     expect(maxLive()).toBe(2);
+  });
+
+  test('same plan branch waits while a different branch overlaps at concurrency 3', async () => {
+    const active = new Set<string>();
+    const launches: string[] = [];
+    const releases = new Map<string, () => void>();
+    const events: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'same-key-in-flight-test', emit: (record) => {
+      if (record.category === 'self-dev.orchestrate' && record.event === 'same-key-in-flight') events.push(record.data as Record<string, unknown>);
+    } });
+    const spawn: SelfImplementJobSpawn = (input) => {
+      const feature = input.feature.split('\n')[0]!;
+      launches.push(feature);
+      active.add(feature);
+      return { address: `self-impl:${input.spaceId}`, done: new Promise((resolve) => {
+        releases.set(feature, () => { active.delete(feature); resolve({ exitCode: 0, output: '' }); });
+      }) };
+    };
+    try {
+      const run = orchestrateSelfDev({
+        goals: [
+          { feature: 'first', planBranch: 'plan/shared', goalId: 'goal-a' },
+          { feature: 'second', planBranch: 'plan/shared', goalId: 'goal-b' },
+          { feature: 'different', planBranch: 'plan/other', goalId: 'goal-a' },
+        ], concurrency: 3, spawn,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const firstShared = active.has('first') ? 'first' : 'second';
+      const nextShared = firstShared === 'first' ? 'second' : 'first';
+      expect(active).toEqual(new Set([firstShared, 'different']));
+      expect(launches).not.toContain(nextShared);
+      expect(events).toEqual([expect.objectContaining({ key: 'plan/shared', waited: true })]);
+      releases.get(firstShared)!();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(active).toEqual(new Set([nextShared, 'different']));
+      releases.get(nextShared)!();
+      releases.get('different')!();
+      expect((await run).map((r) => r.status)).toEqual(['done', 'done', 'done']);
+    } finally { off(); for (const release of releases.values()) release(); }
+  });
+
+  test('waiting for a shared key launches the next child before returning its actual address to the adapter', async () => {
+    const source = readFileSync(new URL('./orchestrate.ts', import.meta.url).pathname, 'utf8');
+    const wait = source.slice(source.indexOf('const keyedDevAdapter: SurfaceAdapter ='), source.indexOf('const devDefinition: JobKindDefinition ='));
+    expect(wait.indexOf('await previous;')).toBeLessThan(wait.indexOf('const result = await devAdapter(task, ctx);'));
+    expect(wait).toContain('return { ...result, promise: result.promise.finally(releaseKey) };');
+    const capture = source.slice(source.indexOf('const capturingSpawn: SelfImplementJobSpawn ='), source.indexOf('const devAdapter ='));
+    expect(capture).toContain('address: started.address,');
+    expect(capture).not.toContain('started?.address ??');
+
+    const releases = new Map<string, () => void>();
+    const addresses: string[] = [];
+    const active = new Set<string>();
+    const spawn: SelfImplementJobSpawn = (input) => {
+      const name = input.feature.split('\n')[0]!;
+      active.add(name);
+      const address = `pod://${name}`;
+      addresses.push(address);
+      return { address, done: new Promise((resolve) => {
+        releases.set(name, () => { active.delete(name); resolve({ exitCode: 0, output: '' }); });
+      }) };
+    };
+    const run = orchestrateSelfDev({ goals: [
+      { feature: 'first', planBranch: 'same' }, { feature: 'second', planBranch: 'same' },
+      { feature: 'other', planBranch: 'other' },
+    ], concurrency: 3, spawn });
+    try {
+      await Bun.sleep(10);
+      const firstShared = active.has('first') ? 'first' : 'second';
+      const nextShared = firstShared === 'first' ? 'second' : 'first';
+      expect(new Set(addresses)).toEqual(new Set([`pod://${firstShared}`, 'pod://other']));
+      expect(active.has(nextShared)).toBe(false);
+      releases.get(firstShared)!();
+      for (let i = 0; i < 30 && !releases.has(nextShared); i++) await Bun.sleep(10);
+      expect(addresses).toContain(`pod://${nextShared}`);
+      expect(active).toEqual(new Set([nextShared, 'other']));
+      releases.get(nextShared)!();
+      releases.get('other')!();
+      expect((await run).map((result) => result.status)).toEqual(['done', 'done', 'done']);
+    } finally { for (const release of releases.values()) release(); }
+  });
+
+  test('same key remains reserved across three queued jobs and releases after failure', async () => {
+    const active = new Set<string>();
+    const releases = new Map<string, (exitCode: number) => void>();
+    const spawn: SelfImplementJobSpawn = (input) => {
+      const feature = input.feature.split('\n')[0]!;
+      active.add(feature);
+      return { address: `self-impl:${input.spaceId}`, done: new Promise((resolve) => {
+        releases.set(feature, (exitCode) => { active.delete(feature); resolve({ exitCode, output: '' }); });
+      }) };
+    };
+    const run = orchestrateSelfDev({ goals: [
+      { feature: 'a', goalId: 'same' }, { feature: 'b', goalId: 'same' }, { feature: 'c', goalId: 'same' },
+    ], concurrency: 3, spawn });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(active.size).toBe(1);
+      for (let index = 0; index < 3; index++) {
+        const current = [...active][0]!;
+        releases.get(current)!(index === 0 ? 1 : 0);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(active.size).toBe(index === 2 ? 0 : 1);
+      }
+      const results = await run;
+      expect(results.filter((r) => r.status === 'failed')).toHaveLength(1);
+      expect(results.filter((r) => r.status === 'done')).toHaveLength(2);
+    } finally { for (const release of releases.values()) release(0); }
+  });
+
+  test('separate self orchestrate calls reserve the same supplied plan branch', async () => {
+    const active = new Set<string>();
+    const releases: Array<() => void> = [];
+    const keys: string[] = [];
+    const off = debug.registerSink({ name: 'generated-branch-in-flight', emit: (record) => {
+      if (record.category === 'self-dev.orchestrate' && record.event === 'same-key-in-flight') keys.push(String((record.data as { key: string }).key));
+    } });
+    const spawn: SelfImplementJobSpawn = (input) => {
+      active.add(input.spaceId);
+      return { address: `self-impl:${input.spaceId}`, done: new Promise((resolve) => {
+        releases.push(() => { active.delete(input.spaceId); resolve({ exitCode: 0, output: '' }); });
+      }) };
+    };
+    try {
+      const first = orchestrateSelfDev({ goals: [{ feature: 'same CLI goal', planBranch: 'plan/shared-across-calls' }], concurrency: 3, spawn });
+      const second = orchestrateSelfDev({ goals: [{ feature: 'same CLI goal', planBranch: 'plan/shared-across-calls' }], concurrency: 3, spawn });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(active.size).toBe(1);
+      expect(releases).toHaveLength(1);
+      expect(keys).toHaveLength(1);
+      expect(keys[0]).toBe('plan/shared-across-calls');
+      releases[0]!();
+      for (let i = 0; i < 30 && releases.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(active.size).toBe(1);
+      expect(releases).toHaveLength(2);
+      releases[1]!();
+      expect((await Promise.all([first, second])).flat().map((r) => r.status)).toEqual(['done', 'done']);
+    } finally { off(); for (const release of releases) release(); }
+  });
+
+  test('authored CLI goal identity is parsed from the actual goal text before spawn', async () => {
+    const goalText = '# Goal\n- GoalId: 4b852b3a0f863ad2\n- RootIntent: same work\n\n## PROBLEM\nFix it';
+    const created = withOrchestrateGoalKey({ feature: goalText });
+    expect(created.goalId).toBe('4b852b3a0f863ad2');
+    expect(created.planBranch).toStartWith('self-impl/');
+    expect(withOrchestrateGoalKey({ feature: 'untagged CLI goal' }).planBranch).toStartWith('self-impl/');
+    expect(created.planBranch).toBe(plannedSelfImplBranch(goalText, created.goalId));
+    let release!: () => void;
+    const held = new Promise<SelfImplementJobDone>((resolve) => { release = () => resolve({ exitCode: 0, output: '' }); });
+    const launches: string[] = [];
+    const events: string[] = [];
+    const otherText = 'a different branch from the CLI';
+    const other = withOrchestrateGoalKey({ feature: otherText });
+    expect(other.planBranch).not.toBe(created.planBranch);
+    const off = debug.registerSink({ name: 'authored-goal-key', emit: (record) => {
+      if (record.category === 'self-dev.orchestrate' && record.event === 'same-key-in-flight') events.push(String((record.data as { key: string }).key));
+    } });
+    const spawn: SelfImplementJobSpawn = (input) => { launches.push(input.feature); return { address: input.spaceId, done: held }; };
+    try {
+      const run = orchestrateSelfDev({ goals: [created, withOrchestrateGoalKey({ feature: goalText }), other], concurrency: 3, spawn });
+      expect(launches).toHaveLength(2);
+      expect(launches.some((feature) => feature.startsWith(otherText))).toBe(true);
+      expect(events).toEqual([created.planBranch!]);
+      release();
+      expect((await run).map((r) => r.status)).toEqual(['done', 'done', 'done']);
+      expect(launches).toHaveLength(3);
+    } finally { release(); off(); }
+  });
+
+  test('self orchestrate CLI constructs unkeyed goals and serializes their branch while another branch runs', async () => {
+    const { program, setSelfOrchestrateSpawnForTesting } = await import('../index.js');
+    const releases = new Map<string, () => void>();
+    const active = new Set<string>();
+    const features = new Map<string, string>();
+    const keys: string[] = [];
+    const off = debug.registerSink({ name: 'actual-cli-key', emit: (record) => {
+      if (record.category === 'self-dev.orchestrate' && record.event === 'same-key-in-flight') keys.push(String((record.data as { key: string }).key));
+    } });
+    const text = '# Goal\n- GoalId: 4b852b3a0f863ad2\n- RootIntent: CLI actual path';
+    const otherText = '# Goal\n- GoalId: 55aabbccddeeff00\n- RootIntent: different CLI branch';
+    const spawn: SelfImplementJobSpawn = (input) => {
+      active.add(input.spaceId);
+      features.set(input.spaceId, input.feature);
+      return { address: input.spaceId, done: new Promise((resolve) => {
+        releases.set(input.spaceId, () => { active.delete(input.spaceId); resolve({ exitCode: 0, output: '' }); });
+      }) };
+    };
+    setSelfOrchestrateSpawnForTesting(spawn);
+    try {
+      const run = program.parseAsync(['node', 'elanous', 'self', 'orchestrate', text, text, otherText, '--concurrency', '3', '--no-supervise', '--json']);
+      for (let i = 0; i < 100 && releases.size < 2; i++) await Bun.sleep(10);
+      expect(active.size).toBe(2);
+      expect(releases.size).toBe(2);
+      expect(keys).toEqual([plannedSelfImplBranch(text, '4b852b3a0f863ad2')]);
+      const firstSpace = [...active].find((space) => features.get(space)?.startsWith(text))!;
+      expect(firstSpace).toBeDefined();
+      releases.get(firstSpace)!();
+      for (let i = 0; i < 100 && releases.size < 3; i++) await Bun.sleep(10);
+      expect(releases.size).toBe(3);
+      expect(active.size).toBe(2);
+      expect(active.has(firstSpace)).toBe(false);
+      for (const space of active) releases.get(space)!();
+      await run;
+    } finally { for (const release of releases.values()) release(); setSelfOrchestrateSpawnForTesting(undefined); off(); }
+  });
+
+  test('goalId fallback serializes matching jobs without a plan branch', async () => {
+    const { spawn, maxLive } = makeTrackingSpawn({ delayMs: 8 });
+    const result = await orchestrateSelfDev({
+      goals: [{ feature: 'one', goalId: 'goal-1' }, { feature: 'two', goalId: 'goal-1' }],
+      concurrency: 3, spawn,
+    });
+    expect(result.map((r) => r.status)).toEqual(['done', 'done']);
+    expect(maxLive()).toBe(1);
   });
 
   test('applies runtime-derived concurrency through the orchestration boundary', async () => {

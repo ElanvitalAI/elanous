@@ -7,6 +7,8 @@ type Ledger = { runId: string; jsonl: string };
 type Incomplete = { runId: string; reason: string };
 type ParseResult = Ledger[] | { error: Incomplete[]; ledgers: Ledger[] };
 
+const NON_PROGRESS_EVENTS = new Set(['progress-delivery-outcome']);
+
 /** Reassemble only complete, unambiguous transfers; retain good runs when another run is incomplete. */
 export function parsePodLedgerChunks(logs: string): ParseResult {
   const groups = new Map<string, { total: number; chunks: Map<number, string>; reason?: string }>();
@@ -106,14 +108,34 @@ export function createPodLedgerFollower(opts: {
   exec: (script: string) => { status: number | null; stdout: string; stderr: string };
   dir?: string;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  stallMinutes?: number;
+  now?: () => number;
+  onStall?: (message: string) => void;
 }): { poll(): void; readonly owned: boolean } {
   const dir = opts.dir ?? runLedgerDir();
   const log = opts.log ?? ((c, e, d) => debug.log(c, e, d));
+  const now = opts.now ?? Date.now;
+  const stallMinutes = opts.stallMinutes ?? 30;
+  if (!Number.isFinite(stallMinutes) || stallMinutes <= 0) throw new RangeError('stallMinutes must be positive');
+  const onStall = opts.onStall ?? ((message: string) => console.error(message));
   const path = runLedgerPath(opts.runId, dir);   // runId 검증(경로·셸에 안전한 문자만)도 여기서 된다
   let offset = 0;
   let pending = '';
   let owned = false;
   let disabled = false;
+  let lastProgressAt = now();
+  let lastProgressEvent: string | null = null;
+  let nextStallMinute = stallMinutes;
+  let stalled = false;
+  function checkStall() {
+    const idleMinutes = Math.max(0, (now() - lastProgressAt) / 60_000);
+    if (idleMinutes >= nextStallMinute) {
+      log('self-implement.pod', 'stalled', { runId: opts.runId, lastProgressEvent, idleMinutes });
+      onStall(`[pod] 진행 없음 ${Math.floor(idleMinutes)}분 — 마지막 진행 ${lastProgressEvent ?? '없음'}`);
+      stalled = true;
+      nextStallMinute = (Math.floor(idleMinutes / stallMinutes) + 1) * stallMinutes;
+    }
+  }
   return {
     get owned() { return owned; },
     poll() {
@@ -124,18 +146,32 @@ export function createPodLedgerFollower(opts: {
         return;
       }
       const r = opts.exec(`f="\${ELANOUS_STATE_DIR:-$HOME/.elanous}/run-ledger/${opts.runId}.jsonl"; [ -f "$f" ] || exit 0; tail -c +${offset + 1} "$f"`);
-      if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); return; }
-      if (!r.stdout) return;
+      if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); checkStall(); return; }
+      if (!r.stdout) { checkStall(); return; }
       offset += Buffer.byteLength(r.stdout);
       const text = pending + r.stdout;
       const cut = text.lastIndexOf('\n');
-      if (cut < 0) { pending = text; return; }
+      if (cut < 0) { pending = text; checkStall(); return; }
       const complete = text.slice(0, cut + 1);
       pending = text.slice(cut + 1);
       mkdirSync(dir, { recursive: true });
       appendFileSync(path, complete);
       owned = true;
       log('self-implement.pod', 'ledger-live-appended', { runId: opts.runId, lines: complete.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(complete), offset });
+      for (const line of complete.split('\n')) {
+        if (!line) continue;
+        let entry: unknown;
+        try { entry = JSON.parse(line); } catch { continue; }
+        const event = (entry && typeof entry === 'object' && 'event' in entry) ? entry.event : undefined;
+        if (typeof event !== 'string' || !event || NON_PROGRESS_EVENTS.has(event)) continue;
+        const idleMinutes = Math.max(0, (now() - lastProgressAt) / 60_000);
+        if (stalled) log('self-implement.pod', 'stall-cleared', { runId: opts.runId, idleMinutes });
+        stalled = false;
+        lastProgressAt = now();
+        lastProgressEvent = event;
+        nextStallMinute = stallMinutes;
+      }
+      checkStall();
     },
   };
 }

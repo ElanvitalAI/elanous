@@ -5,6 +5,7 @@
 // of the NEXUS HTTP server (see `src/nexus/api/http-server.ts`); this
 // module just adapts subscriptions → router + collision reporting.
 
+import { debug } from '../../debug/log.js';
 import { isWebhookTriggerNode } from '../schema.js';
 import type { WebhookTriggerNode, WorkflowEntry } from '../types.js';
 import { findWebhookCollisions } from './registry.js';
@@ -36,7 +37,17 @@ export interface WebhookSource extends TriggerSource {
   subscriptions(): TriggerSubscription[];
 }
 
-export function createWebhookSource(): WebhookSource {
+export interface WebhookSourceOpts {
+  /** Secret lookup for `hmac` routes. Default = the NEXUS secret store. */
+  resolveSecret?: (ref: string) => string | undefined | Promise<string | undefined>;
+}
+
+async function secretStoreLookup(ref: string): Promise<string | undefined> {
+  const { getSecretAsync } = await import('../../nexus/config/secrets/index.js');
+  return await getSecretAsync(ref);
+}
+
+export function createWebhookSource(sourceOpts: WebhookSourceOpts = {}): WebhookSource {
   const bindings: Binding[] = [];
   let router: WebhookRouter | null = null;
   let collisionList: Array<{ method: string; path: string }> = [];
@@ -72,6 +83,13 @@ export function createWebhookSource(): WebhookSource {
       collisionList = collisions.map(c => ({ method: c.method, path: c.path }));
       router = buildWebhookRouter({
         registry: bindings.map(b => b.webhookEntry),
+        resolveSecret: sourceOpts.resolveSecret ?? secretStoreLookup,
+        onAuthRejected: (webhookEntry, res) => debug.log('workflow.webhook', 'auth-rejected', {
+          method: webhookEntry.trigger.method,
+          path: webhookEntry.trigger.path,
+          status: res.status,
+          authType: webhookEntry.trigger.auth?.type,
+        }),
         runWorkflow: async (webhookEntry, body) => {
           const binding = bindings.find(b =>
             b.webhookEntry.workflowName === webhookEntry.workflowName

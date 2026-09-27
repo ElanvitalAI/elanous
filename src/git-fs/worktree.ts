@@ -338,7 +338,7 @@ export interface CreateWorktreeResult {
 /** git 실행 seam — 기본은 실 `spawnSync`. 테스트가 실패 분기(ls-remote 실패·fetch 실패·경합)를
  *  **결정론적으로** 재도록 주입 가능하게 뺐다(사후 리뷰 should-fix: 그 분기들이 회귀 무방비였다).
  *  ⛔ 결과 타입을 따로 export 하지 않는다 — 외부 소비자가 없다(dead surface 금지·리뷰 should-fix). */
-export type GitRunner = (args: string[]) => { status: number | null; stdout: string; stderr: string };
+export type GitRunner = (args: string[]) => { status: number | null; signal?: NodeJS.Signals | null; stdout: string; stderr: string };
 
 export function resolveDefaultBranchBase(repoRoot: string): string | null {
   const run = (...args: string[]) => spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
@@ -372,16 +372,17 @@ export function syncBaseWithRemote(
     ? (...args: string[]) => runner(args)
     : (...args: string[]) => {
       const r = spawnSync('git', args, { cwd: repoRoot, encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
-      return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+      return { status: r.status, signal: r.signal, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
     };
 
-  const wanted = `refs/heads/${base}`;
+  const remoteBranch = base.startsWith('origin/') ? base.slice('origin/'.length) : base;
+  const wanted = `refs/heads/${remoteBranch}`;
   // ⛔ **이름이 hex 라고 SHA 가 아니다**(리뷰 must-fix ④) — `abc1234` 라는 **브랜치**가 있을 수 있다.
   //    로컬 heads 뿐 아니라 **remote-tracking ref** 까지 본다(둘 다 로컬 조회·네트워크 0).
   //    그래도 남는 모호함(원격에만 있는 hex 이름 브랜치)은 아래에서 ls-remote 결과로 최종 판정한다.
   const looksHex = /^[0-9a-f]{7,40}$/i.test(base);
   const isKnownLocalRef = git('show-ref', '--verify', '--quiet', wanted).status === 0
-    || git('show-ref', '--verify', '--quiet', `refs/remotes/origin/${base}`).status === 0;
+    || git('show-ref', '--verify', '--quiet', `refs/remotes/origin/${remoteBranch}`).status === 0;
   const isFullOid = /^[0-9a-f]{40}$/i.test(base);
   /** ref 로 알려진 바 없고 커밋으로 풀리면 그때만 SHA 다.
    *  `requireUnambiguous` = 원격을 못 물어본 상황(skip) — 그때는 **완전한 40자 oid** 만 SHA 로 친다.
@@ -420,7 +421,7 @@ export function syncBaseWithRemote(
     : runGitCommand(repoRoot, ['fetch', 'origin', wanted], { encoding: 'utf8', timeout: GIT_TIMEOUT_MS });
   if (fetched.status !== 0) {
     // origin 에 있는 것을 확인했는데 못 가져왔다 ⇒ 낡은 로컬로 진행하면 조용히 틀린다.
-    throw new Error(`git worktree base sync failed — origin/${base} exists but fetch failed: ${(fetched.stderr || '').trim().slice(0, 200)}`);
+    throw new Error(`git worktree base sync failed — origin/${remoteBranch} exists but fetch failed: status=${fetched.status}, signal=${fetched.signal ?? 'none'}, stdout=${JSON.stringify((fetched.stdout || '').trim().slice(0, 200))}, stderr=${JSON.stringify((fetched.stderr || '').trim().slice(0, 200))}`);
   }
   // ⭐ **가져온 것**에서 갈린다(리뷰 must-fix ②) — ls-remote 로 먼저 읽은 SHA 를 쓰면 그 사이 원격이
   //    전진했을 때 "원격 tip" 계약이 깨진다. FETCH_HEAD 가 방금 받은 tip 이다.

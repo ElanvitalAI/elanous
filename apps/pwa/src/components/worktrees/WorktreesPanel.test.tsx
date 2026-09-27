@@ -11,6 +11,7 @@
 // mock.module, then render the public panel.
 
 import { describe, expect, mock, test } from 'bun:test';
+import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import type { WorktreesResponse, WorktreeView } from '@/nexus/client';
@@ -40,6 +41,12 @@ function setQuery(next: {
   query.error = next.error === undefined ? null : next.error;
   query.isFetching = next.isFetching ?? false;
 }
+
+// R-TST23 — 아래 mock.module 은 프로세스 전역이다. 원본을 잡아 두고 파일 끝에 되돌린다(`@/lib/testing/restore-module-mocks`).
+await restoreModuleMocksAfterAll([
+  '@/nexus/hooks/use-worktrees',
+  '@/nexus/hooks/use-nexus-context',
+], (specifier) => import(specifier));
 
 mock.module('@/nexus/hooks/use-worktrees', () => ({
   useWorktrees: () => query,

@@ -431,72 +431,42 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'mission',   aliases: [],             description: 'Autopilot 미션 — list(+헬스) · trace <id> 계보 · arm <id> 승인 (구체화/종료는 CLI)', subcommands: ['list', 'trace', 'arm'] },
   { name: 'resume-turn', aliases: [],           description: 'Resume a paused turn checkpoint (/pause 짝 · 구 /resume)', subcommands: ['list'] },
   { name: 'context',   aliases: ['ctx'],        description: 'Show / clear / drop attached files', subcommands: ['clear', 'drop'] },
-  { name: 'paste', aliases: ['v'],          description: 'Attach clipboard image (macOS)' },
+  { name: 'paste', aliases: [],             description: 'Attach clipboard image (macOS)' },
   { name: 'sync',  aliases: ['s'],         description: 'Enter sync mode' },
   { name: 'plugin', aliases: ['plugins'], description: 'Manage plugins', subcommands: ['list', 'activate', 'deactivate', 'reload'] },
   { name: 'widget', aliases: ['widgets'], description: 'Manage widgets', subcommands: ['list', 'reload', 'instances'] },
   { name: 'clear', aliases: ['cls'],       description: 'Clear chat log' },
   { name: 'log',   aliases: [],             description: 'Chat Log controls — size / clear / filter / search / freeze / solo / turn / fold / help', subcommands: ['size', 'clear', 'filter', 'search', 'freeze', 'solo', 'turn', 'fold', 'help'] },
-  { name: 'media', aliases: ['mv'],         description: 'Last assistant media preview — status / open / sample / clear', subcommands: ['status', 'open', 'sample', 'clear', 'help'] },
-  { name: 'browser-cdp', aliases: ['bcdp'], description: 'Browser CDP status / smoke / stop', subcommands: ['status', 'smoke', 'stop', 'help'] },
   { name: 'help',  aliases: ['?'],         description: 'Show help overlay' },
-  { name: 'codex-setup', aliases: ['codex-init'], description: 'Codex 1-point setup — OAuth login + model pick + save config' },
   { name: 'setup', aliases: [], description: 'Onboarding wizard guide — /setup (anchor) · /setup reset (re-run wizard on next boot)', subcommands: ['help', 'reset'] },
   { name: 'memory', aliases: ['mem'], description: 'Memory ops — list / show / search / add / delete (see `elanous memory --help`)', subcommands: ['list', 'show', 'search', 'add', 'delete', 'index'] },
   { name: 'status', aliases: ['st'], description: 'Print the claude-code-style status pills (working dir + git + model)' },
   { name: 'export', aliases: [], description: 'Export this conversation transcript to a markdown file — /export [path] (default ~/temp/elanous-transcript-<stamp>.md)' },
-  { name: 'cache', aliases: [], description: 'Prompt-cache metrics — show session totals / reset', subcommands: ['show', 'reset'] },
   { name: 'delta', aliases: ['diffs'], description: 'Source delta browser — open the latest turn-scoped file diff popup', subcommands: ['open', 'help'] },
   { name: 'theme', aliases: [], description: 'Theme controls — list / switch / use / reset / preview / export', subcommands: ['list', 'switch', 'use', 'reset', 'preview', 'export'] },
   { name: 'debug', aliases: [], description: 'Runtime tracer + surfaces — /debug on (mirror+file) · off · file (quiet trail) · diag (loud trail) · render on|off (렌더 무음, 레벨과 직교); surfaces: window / popup / workbench / promote', subcommands: ['on', 'off', 'file', 'diag', 'mirror', 'verbose', 'render', 'level', 'toggle', 'tail', 'clear', 'path', 'view', 'status', 'window', 'popup', 'workbench'] },
-  { name: 'audit', aliases: [], description: 'Tail control-audit log (default: input policy changes; last 20 entries)', subcommands: ['input', 'all'] },
   { name: 'rebind', aliases: [], description: 'Manage runtime input bindings — list / show / add / reset / export / import', subcommands: ['actions', 'reset', 'export', 'import', 'help'] },
-  { name: 'perf',  aliases: [], description: 'Perf counters: draw latency + debug.log calls + stdout writes', subcommands: ['on', 'off', 'report', 'reset', 'status'] },
-  { name: 'substrate-stats', aliases: ['sst'], description: 'Substrate observability — paint cache hits/misses · overlay skip/write · mount churn · F8 generation bumps' },
-  { name: 'playground', aliases: ['pg'], description: 'IUL playground lab — list / run <id> [-v] / parse <path> / edit <id> / save <id> <path>.', subcommands: ['list', 'run', 'parse', 'edit', 'save'] },
-  { name: 'hint',  aliases: [], description: 'Tool hints — prefer/avoid/enable/disable/list/reset/show', subcommands: ['prefer', 'avoid', 'enable', 'disable', 'list', 'reset', 'show'] },
   { name: 'api-allow', aliases: ['api'], description: 'api_call allowlist — add/remove/list hosts the model may call', subcommands: ['add', 'remove', 'list', 'clear'] },
   { name: 'prompt', aliases: ['prompts'], description: 'Prompt Bank — list / show / search / select / inject / explain / enable / disable / config', subcommands: ['list', 'show', 'search', 'select', 'inject', 'explain', 'enable', 'disable', 'config'] },
   { name: 'history', aliases: ['hist', 'inputs'], description: 'Input history — list / find / show / clear', subcommands: ['list', 'find', 'show', 'clear'] },
   { name: 'research', aliases: ['rsh'],    description: 'Autonomous research loop — start / status / stop / tail / replan (PFC-S4)', subcommands: ['start', 'status', 'stop', 'tail', 'replan'] },
   // /harness is the dashboard's sole harness-launching entry. Its first
-  // positional token selects plan, ask, implement, goal, runs, stop, or memo;
+  // positional token selects plan, ask, dev, goal, runs, stop, or memo;
   // otherwise the complete sentence follows the former /dev dispatch.
-  { name: 'harness', aliases: [], description: 'Harness — /harness <goal> (self-dev) · plan <goal> · ask <sentence> · implement <feature> · goal <goal-file> · runs · stop <space-id> · memo <space-id> <note>', subcommands: ['plan', 'ask', 'implement', 'goal', 'runs', 'stop', 'memo'] },
+  { name: 'harness', aliases: [], description: 'Harness — /harness <goal> (self-dev) · plan <goal> · ask <sentence> · dev <goal> · goal <goal-file> · runs · stop <space-id> · memo <space-id> <note>', subcommands: ['plan', 'ask', 'dev', 'goal', 'runs', 'stop', 'memo'] },
   { name: 'plan',  aliases: [],            description: 'Toggle plan mode — read-only planning posture (slash alias for EnterPlanMode tool)', subcommands: ['enter', 'exit', 'status'] },
   { name: 'chat',  aliases: [],            description: 'Toggle LLM-only layout (hide 3-pane grid)' },
   { name: 'dashboard', aliases: ['dash'],  description: 'Return to 3-pane dashboard layout' },
-  // TUI 부활 T2 (2026-07-12): 단일 UI 모드 축 — essential(chat 전체화면 ·
-  // 기본) ↔ rich(full dashboard). config persist 포함.
-  { name: 'ui',    aliases: [],            description: 'UI mode — essential (chat 전체화면 · 기본) ↔ rich (full dashboard) · config 저장', subcommands: ['essential', 'rich'] },
-  // Q2 (substrate Occam, 2026-05-03): the legacy `/workspace`
-  // (working-dir | skill view switch) entry was vestigial — declared
-  // in the catalog but never wired to a handler. Removed so the new
-  // `/workspace` (virtual window management) below can take the name.
-  // Use `/view` for view switching instead.
   { name: 'telegram',  aliases: ['tg'],    description: 'Telegram bot — status / pair / send / pause / stop / attach / detach / sessions', subcommands: ['status', 'pair', 'setup', 'send', 'pause', 'stop', 'attach', 'detach', 'sessions'] },
-  { name: 'view',      aliases: [],        description: 'Switch or manage dashboard views', subcommands: ['list', 'next', 'prev', 'reload', 'save', 'restore', 'reset', 'export', '1', '2', '3', '4', '5', '6'] },
-  // Q2 (substrate Occam, 2026-05-03): renamed `/window` → `/workspace`
-  // per PLAN §4. `/window` `/win` `/ws` preserved as muscle-memory
-  // aliases. Implementation directory rename + symbol rename
-  // (`VirtualWindow` → `Workspace`, etc.) deferred to a follow-up PR
-  // — slash-command rename is the user-facing first step.
-  { name: 'workspace', aliases: ['ws', 'window', 'win'], description: 'Workspaces (formerly virtual windows) — list / new / browser / preview / browser-preview / iul / acp / sim / switch / close / picker / companion', subcommands: ['list', 'new', 'browser', 'preview', 'browser-preview', 'iul', 'acp', 'sim', 'switch', 'close', 'closeall', 'picker', 'companion'] },
-  { name: 'sim',       aliases: ['simulator'], description: 'Simulator shell — open / list / run <scenario>', subcommands: ['open', 'list', 'run'] },
-  { name: 'tablet',    aliases: [],        description: 'Tablet mode — collapse layout to log + input (Ctrl+M <pane> for others)', subcommands: ['on', 'off', 'toggle', 'auto', 'status', 'browser-preview', 'bp'] },
-  { name: 'surface',   aliases: ['surf'],  description: 'Surface control — open a pane/catalog launcher (/surface catalog · browser · preview · log · scratch · obsidian · skill) OR set a preferred LLM surface (/surface coding-agent · research-agent · control-agent · ops-agent · … · clear · status)', subcommands: ['catalog', 'browser', 'preview', 'browser-preview', 'log', 'scratch', 'obsidian', 'skill', 'skill-file', 'agents', 'coding-agent', 'coding-chat', 'research-agent', 'research-chat', 'control-agent', 'ops-ui-agent', 'ops-fleet-agent', 'ops-agent', 'clear', 'status'] },
-  { name: 'scratch',   aliases: ['sc'],    description: 'Scratchpad ops (text body / memo / clear / dump-log / popup)', subcommands: ['memo', 'clear', 'dump', 'popup'] },
+  { name: 'tablet',    aliases: [],        description: 'Tablet mode — collapse layout to log + input', subcommands: ['on', 'off', 'toggle', 'auto', 'status', 'browser-preview', 'bp'] },
+  { name: 'surface',   aliases: [], description: 'Surface control — open a pane/catalog launcher (/surface catalog · browser · preview · log · scratch · obsidian · skill) OR set a preferred LLM surface (/surface coding-agent · research-agent · control-agent · ops-agent · … · clear · status)', subcommands: ['catalog', 'browser', 'preview', 'browser-preview', 'log', 'scratch', 'obsidian', 'skill', 'skill-file', 'agents', 'coding-agent', 'coding-chat', 'research-agent', 'research-chat', 'control-agent', 'ops-ui-agent', 'ops-fleet-agent', 'ops-agent', 'clear', 'status'] },
   { name: 'term',  aliases: ['terminal'], description: 'Interactive terminal modal — spawn / list / attach / detach / switch / kill / snapshot / resume', subcommands: ['spawn', 'list', 'attach', 'detach', 'switch', 'kill', 'snapshot', 'resume'] },
-  { name: 'pty-list', aliases: ['ptys'], description: 'List PTY shell processes started from this dashboard session' },
-  { name: 'pty-pane', aliases: ['pty-view'], description: 'Open a virtual-window pane tailing a PTY shell (auto-picks the only live one, else specify id)' },
   { name: 'claude', aliases: [], description: 'Spawn claude-code CLI in a terminal modal' },
   { name: 'codex',  aliases: [], description: 'Spawn codex CLI in a terminal modal' },
   { name: 'gemini', aliases: [], description: 'Spawn gemini CLI in a terminal modal' },
   { name: 'acp',    aliases: [], description: 'ACP chat — stream claude-code / codex / gemini replies into the chat pane (not a VW spawn). /acp codex points at the canonical codex app-server path; /acp cas is a synonym.', subcommands: ['claude', 'codex', 'gemini', 'cas', 'cancel', 'status', 'drop'] },
-  { name: 'acp-vw', aliases: [], description: 'Spawn claude-code/codex/gemini/local-llm inside a new virtual window pane. /acp-vw clc (claude-code) · /acp-vw gem (gemini) · /acp-vw lll <node>:<model> (local-llm via lms chat · local node only) route through the H5 Embodied Agent Bus.', subcommands: ['claude', 'codex', 'clc', 'gem', 'lll'] },
   { name: 'conv', aliases: [], description: 'Conversation widget/popup host — /conv list · /conv open <session-id> · /conv layout <cascade|tile|stack> · /conv focus <next|prev>.', subcommands: ['list', 'ls', 'open', 'layout', 'focus'] },
   { name: 'handoff', aliases: [], description: 'H5 P3 cross-agent context handoff: /handoff <from_session_id> <to_brand> [--channels r,p,m] [--prompt "prefix"]. Takes source session snapshot (filtered by channels if observer present) and launches target via adapter registry. Brands: codex · claude · claude-code · gemini · elanous.' },
-  { name: 'budget',  aliases: ['b'], description: 'H6 P1 budget tracker — /budget [brand] · /budget remaining · /budget set <b> <w> <q> · /budget refresh · /budget forecast · /budget help', subcommands: ['set', 'refresh', 'forecast', 'status', 'remaining', 'help'] },
   { name: 'remaining', aliases: [], description: '계정마다 행으로 「지금 쓸 수 있는 것이 얼마나 남았나」를 본다 — 크레딧 축과 구독 축을 갈라 낸다. 화면은 명령 산출을 그대로 읽는다.' },
   { name: 'agent-room', aliases: [], description: 'H6 P4 VW agent-room — /agent-room <N> <brands...> · /agent-room list · /agent-room close <id> · N ∈ {2,3,4} · brands: codex/claude/gemini/elanous/auto/lll:<m>', subcommands: ['list', 'close', 'preset', 'help'] },
   { name: 'showroom', aliases: ['sr'], description: 'Showroom v2 multi-LLM lane composer — /showroom (default 2-pane) · /showroom <lane1> <lane2> [<lane3> [<lane4>]] · lane = role:provider[:transport] · roles plan/build/exec/review/reflect · pair with /lane and /relay for cross-lane handoffs.', subcommands: ['help'] },
@@ -505,18 +475,13 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'inject',    aliases: [], description: 'H6 P7 InjectCaptureToContext — /inject <sourceId> <targetId> · inject capture snapshot into target session · --as user-message|system-note|attached-block · HITL approver gated · non-revocable v1', subcommands: ['help'] },
   { name: 'relay',     aliases: [], description: 'Showroom v2 multi-lane handoff macros — /relay plan-build-review · /relay broadcast [--from <lane>] · /relay <from> -> <toA>,<toB> · HITL approver gates each step · failed steps non-aborting', subcommands: ['plan-build-review', 'broadcast', 'help'] },
   { name: 'lane',      aliases: [], description: 'Showroom v2 cross-lane context inject — /lane <from> <to> · address by pane index | role (plan/build/exec/review/reflect) | brand · --as user-message|system-note|attached-block · HITL approver gated · /lane list · /lane help', subcommands: ['list', 'help'] },
-  { name: 'llm',       aliases: [], description: 'H6 P2 Bundle 1 local LLM fleet — /llm nodes · /llm models [--node <id>] · /llm refresh · enumerate Tailscale hosts + LM Studio inventory · model spec = local-llm:<node>:<model>', subcommands: ['nodes', 'models', 'refresh', 'help'] },
-  { name: 'claude-vw', aliases: [], description: 'Spawn claude-code CLI in a new virtual window (fullscreen-by-default, single pane).' },
-  { name: 'codex-vw',  aliases: [], description: 'Spawn codex CLI in a new virtual window (fullscreen-by-default, single pane).' },
-  { name: 'control', aliases: ['dm'],      description: 'Enter control mode — the LLM treats every message as a dashboard command. /control off to exit.' },
+  { name: 'control', aliases: [],      description: 'Enter control mode — the LLM treats every message as a dashboard command. /control off to exit.' },
   { name: 'default', aliases: [],          description: 'Exit control mode back to default chat.' },
   // NOTE: the preferred-LLM-surface command (/surface coding-agent · … · clear · status)
   // shares the '/surface' name with the pane/catalog launcher above — both handlers
   // dispatch by argument (immediate slash-executor for panes, registry for LLM surfaces).
   // They are documented in the single merged '/surface' entry to keep names unique.
   { name: 'qc',      aliases: [],          description: 'Quick-control — arm one-shot control mode; next message runs as control, then auto-return to chat.' },
-  { name: 'ctoggle', aliases: [],          description: 'Toggle persistent control mode (alternative to /control ↔ /default).' },
-  { name: 'fullscreen', aliases: ['fs'], description: 'Toggle fullscreen mode for the current terminal modal' },
   { name: 'voice-chat', aliases: ['vc'], description: 'Continuous voice chat mode — speak, elanous replies in voice (Phase 4-5). Subcommands: start / stop / cancel / status. Chord: Alt+R toggles enter/exit anywhere.', subcommands: ['start', 'stop', 'cancel', 'status'] },
   { name: 'auto-tts', aliases: ['tts', 'autotts'], description: 'Auto-TTS for chat responses (Phase 2) — speaks LLM replies sentence-by-sentence. Subcommands: on / off / toggle / status.', subcommands: ['on', 'off', 'toggle', 'status'] },
   { name: 'quit',  aliases: ['q', 'exit'], description: 'Exit application' },
@@ -1771,10 +1736,20 @@ export async function textInput(opts: {
     }
     // ── Arrow keys (non-slash mode) ──
     else if (editAction.kind === 'move-left') {
-      applyMultilineEditorState(multilineEditorMoveLeft(multilineEditorState()));
+      if (key.ctrl) {
+        const action = resolveTextInputTextAction(currentLineEditorState(), key);
+        if (action.kind === 'insert') applyCurrentLineEditorState(action.next);
+      } else {
+        applyMultilineEditorState(multilineEditorMoveLeft(multilineEditorState()));
+      }
     }
     else if (editAction.kind === 'move-right') {
-      applyMultilineEditorState(multilineEditorMoveRight(multilineEditorState()));
+      if (key.ctrl) {
+        const action = resolveTextInputTextAction(currentLineEditorState(), key);
+        if (action.kind === 'insert') applyCurrentLineEditorState(action.next);
+      } else {
+        applyMultilineEditorState(multilineEditorMoveRight(multilineEditorState()));
+      }
     }
     else if (editAction.kind === 'history-older') {
       applyHistoryState(navigateSingleLineHistory(historyState(), history, 'older'));

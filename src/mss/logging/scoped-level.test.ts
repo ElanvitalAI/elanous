@@ -67,16 +67,20 @@ describe('scoped-level — 인스턴스 로컬 레벨 영속', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it('OH9 — resolveRenderSuppressed 우선순위: level.json.render > config.renderLogs > uiMode essential', () => {
-    // 1. level.json.render 명시가 최상위 (config/uiMode 무시)
-    expect(resolveRenderSuppressed({ scopedRender: true, configRenderLogs: false, uiModeEssential: true })).toBe(false);
-    expect(resolveRenderSuppressed({ scopedRender: false, configRenderLogs: true, uiModeEssential: false })).toBe(true);
-    // 2. scoped 없음 + config.renderLogs === true → 절대 억제 안 함(override)
-    expect(resolveRenderSuppressed({ scopedRender: null, configRenderLogs: true, uiModeEssential: true })).toBe(false);
-    // 3. scoped 없음 + config 미설정 → essential 이면 억제 · rich 면 비억제
-    expect(resolveRenderSuppressed({ scopedRender: null, configRenderLogs: false, uiModeEssential: true })).toBe(true);
-    expect(resolveRenderSuppressed({ scopedRender: null, configRenderLogs: false, uiModeEssential: false })).toBe(false);
-    expect(resolveRenderSuppressed({ scopedRender: null, uiModeEssential: false })).toBe(false);
+  it('OH9 — dashboard essential suppresses by default, explicit settings still win', () => {
+    expect(resolveRenderSuppressed({ scopedRender: true, configRenderLogs: false, defaultSuppressed: true })).toBe(false);
+    expect(resolveRenderSuppressed({ scopedRender: false, configRenderLogs: true, defaultSuppressed: true })).toBe(true);
+    expect(resolveRenderSuppressed({ scopedRender: null, configRenderLogs: true, defaultSuppressed: true })).toBe(false);
+    expect(resolveRenderSuppressed({ scopedRender: null, configRenderLogs: false, defaultSuppressed: true })).toBe(true);
+    expect(resolveRenderSuppressed({ scopedRender: null, defaultSuppressed: true })).toBe(true);
+  });
+
+  it('OH9 — Nexus retains unsuppressed default without changing scoped/config precedence', () => {
+    expect(resolveRenderSuppressed({ scopedRender: null })).toBe(false);
+    expect(resolveRenderSuppressed({ scopedRender: null, configRenderLogs: false })).toBe(false);
+    expect(resolveRenderSuppressed({ scopedRender: null, configRenderLogs: true })).toBe(false);
+    expect(resolveRenderSuppressed({ scopedRender: false })).toBe(true);
+    expect(resolveRenderSuppressed({ scopedRender: true })).toBe(false);
   });
 
   it('경로는 ELANOUS_STATE_DIR 존중 — logs.db 와 같은 루트(격리 동형)', () => {

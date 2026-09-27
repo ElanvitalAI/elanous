@@ -423,6 +423,29 @@ describe('runtime llm model/provider compatibility', () => {
   });
 });
 
+describe('retired dashboard mode config', () => {
+  test('reads both former mode fields without applying or serializing them', () => {
+    writeConfig({ dashboard: { uiMode: 'rich', defaultMode: 'dashboard', foldMode: 'line' } });
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => { events.push({ category, event, data }); }) as typeof debug.log;
+    let cfg: ReturnType<typeof buildUserConfig>;
+    try { cfg = buildUserConfig(configPath); }
+    finally { (debug as { log: typeof debug.log }).log = originalLog; }
+    expect(events.filter(({ category, event }) => category === 'dashboard.ui-mode' && event === 'retired-config-ignored'))
+      .toEqual([
+        { category: 'dashboard.ui-mode', event: 'retired-config-ignored', data: { key: 'uiMode,defaultMode' } },
+      ]);
+    expect(cfg.dashboard.foldMode).toBe('line');
+    expect(cfg.dashboard).not.toHaveProperty('uiMode');
+    expect(cfg.dashboard).not.toHaveProperty('defaultMode');
+    saveUserConfig(cfg, configPath);
+    const saved = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(saved.dashboard).not.toHaveProperty('uiMode');
+    expect(saved.dashboard).not.toHaveProperty('defaultMode');
+  });
+});
+
 describe('dashboard foldMode', () => {
   test('defaults dashboard.foldMode to task-unit when the key is absent', () => {
     writeConfig({});

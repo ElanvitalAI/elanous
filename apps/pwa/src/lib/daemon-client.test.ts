@@ -235,40 +235,6 @@ describe('DaemonClient.fetchJson — generic wrapper', () => {
   });
 });
 
-describe('DaemonClient.prompt — POST /v1/prompt', () => {
-  it('serializes the JSON body + content-type + bearer header', async () => {
-    globalThis.fetch = mockResponse({
-      status: 200,
-      body: { sessionId: 's-1', text: 'hi', stopReason: 'end_turn' },
-    });
-    const client = makeClient({ token: 'tok' });
-    await client.prompt({ sessionId: 's-1', userText: 'hello', provider: 'anthropic' });
-    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/prompt');
-    expect(calls[0]!.init?.method).toBe('POST');
-    const body = JSON.parse(String(calls[0]!.init?.body));
-    expect(body).toEqual({
-      sessionId: 's-1',
-      userText: 'hello',
-      provider: 'anthropic',
-    });
-    const headers = (calls[0]!.init?.headers ?? {}) as Record<string, string>;
-    expect(headers['content-type']).toBe('application/json');
-    expect(headers.authorization).toBe('Bearer tok');
-  });
-
-  it('throws with the response text body on non-200', async () => {
-    globalThis.fetch = mockResponse({
-      status: 503,
-      body: 'meta-api-runtime-not-wired',
-      contentType: 'text/plain',
-    });
-    const client = makeClient();
-    await expect(
-      client.prompt({ userText: 'hi' }),
-    ).rejects.toThrow(/503.*meta-api-runtime-not-wired/);
-  });
-});
-
 // ── Phase B-1 (PWA chat streaming · 2026-05-06) — promptStream ─────
 
 function mockSseResponse(opts: {
@@ -295,6 +261,10 @@ function mockSseResponse(opts: {
 }
 
 describe('DaemonClient.promptStream — POST /v1/prompt/stream (SSE)', () => {
+  it('has no non-streaming prompt entry point', () => {
+    expect('prompt' in DaemonClient.prototype).toBe(false);
+  });
+
   it('hits /v1/prompt/stream with content-type + accept + bearer header', async () => {
     globalThis.fetch = mockSseResponse({
       status: 200,
@@ -317,7 +287,7 @@ describe('DaemonClient.promptStream — POST /v1/prompt/stream (SSE)', () => {
     expect(headers.authorization).toBe('Bearer tok-stream');
   });
 
-  it('serializes the same body shape as `prompt`', async () => {
+  it('serializes the SSE request without a tool-surface override', async () => {
     globalThis.fetch = mockSseResponse({
       status: 200,
       chunks: [
@@ -336,6 +306,11 @@ describe('DaemonClient.promptStream — POST /v1/prompt/stream (SSE)', () => {
       userText: 'hello world',
       provider: 'codex',
     });
+    await client.promptStream({
+      userText: 'no override',
+      tools: 'readonly',
+    } as Parameters<DaemonClient['promptStream']>[0]);
+    expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({ userText: 'no override' });
   });
 
   it('dispatches deltas to onTextDelta and resolves with the turn-end payload', async () => {
@@ -595,6 +570,51 @@ describe('DaemonClient.controlTerminal — POST /v1/terminals/:id/control', () =
   });
 });
 
+describe('DaemonClient live PTY control', () => {
+  it('posts an ANSI snapshot and retains its screen', async () => {
+    globalThis.fetch = mockResponse({ status: 200, body: { status: 'success', screen: '\x1b[32mlive' } });
+    const result = await makeClient({ token: 'tok' }).snapshotTerminal('codex / 1', { ansi: true });
+    expect(String(calls[0]!.url)).toBe('http://localhost:31415/v1/terminals/codex%20%2F%201/control');
+    expect(new Headers(calls[0]!.init?.headers).get('authorization')).toBe('Bearer tok');
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ action: 'snapshot', ansi: true });
+    expect(result.screen).toBe('\x1b[32mlive');
+  });
+
+  it('sends text and key via chars and preserves distinct failure statuses and reason', async () => {
+    globalThis.fetch = mockResponse({ status: 409, body: { status: 'denied', reason: 'agent controls this PTY' } });
+    expect(await makeClient().sendTerminalText('pty', 'hello')).toEqual({ status: 'denied', reason: 'agent controls this PTY' });
+    expect(JSON.parse(String(calls[0]!.init?.body))).toEqual({ action: 'input-text', chars: 'hello' });
+    globalThis.fetch = mockResponse({ status: 504, body: { status: 'owner-unreachable' } });
+    expect(await makeClient().sendTerminalKey('pty', '\r')).toEqual({ status: 'owner-unreachable' });
+    expect(JSON.parse(String(calls[1]!.init?.body))).toEqual({ action: 'input-key', chars: '\r' });
+    globalThis.fetch = mockResponse({ status: 404, body: { status: 'unknown-pty' } });
+    expect((await makeClient().snapshotTerminal('pty', { ansi: true })).status).toBe('unknown-pty');
+    globalThis.fetch = mockResponse({ status: 502, body: { status: 'write-failed' } });
+    expect((await makeClient().sendTerminalText('pty', 'x')).status).toBe('failed');
+  });
+});
+
+describe('DaemonClient federated live PTY request', () => {
+  it('sends the selected source root in snapshot, takeover, text, key and release URLs', async () => {
+    const sourceRoot = '/roots/test/pty/manifest.db';
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: url instanceof Request ? url.url : url, init });
+      const action = (JSON.parse(String(init?.body)) as { action: string }).action;
+      return new Response(JSON.stringify({ status: 'success', ...(action === 'snapshot' ? { screen: 'screen' } : {}) }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const client = makeClient();
+    await client.snapshotTerminal('pty / one', { ansi: true, sourceRoot });
+    await client.controlTerminal('pty / one', 'takeover', { sourceRoot });
+    await client.sendTerminalText('pty / one', 'a', { sourceRoot });
+    await client.sendTerminalKey('pty / one', '\r', { sourceRoot });
+    await client.controlTerminal('pty / one', 'release', { sourceRoot });
+    expect(calls.map((call) => String(call.url))).toEqual(Array(5).fill(`http://localhost:31415/v1/terminals/pty%20%2F%20one/control?sourceRoot=${encodeURIComponent(sourceRoot)}`));
+    expect(calls.map((call) => (JSON.parse(String(call.init?.body)) as { action: string }).action)).toEqual(['snapshot', 'takeover', 'input-text', 'input-key', 'release']);
+  });
+});
+
 describe('DaemonClient.renameTerminal — POST /v1/terminals/:id/rename', () => {
   it('sends encoded name JSON with the authenticated POST convention', async () => {
     globalThis.fetch = mockResponse({ status: 200, body: { status: 'success', id: 'pty / one', name: 'build terminal' } });
@@ -794,6 +814,60 @@ describe('DaemonClient.{getLlmHosts,setLlmHosts,clearLlmHosts} — §3.6 (FU.A3 
 });
 
 describe('DaemonClient.connectAcp lifecycle leases', () => {
+  it('defers the last lease release until an in-flight prompt replies, then closes', async () => {
+    const client = makeClient();
+    const acp = client.connectAcp({ sessionId: 'stale' });
+    const socket = MockWebSocket.instances[0]!;
+    socket.open();
+    await Promise.resolve();
+    await Promise.resolve();
+    socket.respond(1, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    socket.respondError(2, 'unknown session');
+    await Promise.resolve();
+    await Promise.resolve();
+    socket.respond(3, { sessionId: 'issued' });
+    expect(await acp.ready).toBe('issued');
+
+    const reply = acp.send('session/prompt', { sessionId: 'issued', prompt: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(JSON.parse(socket.sent.at(-1)!)).toMatchObject({ id: 4, method: 'session/prompt' });
+    acp.close();
+    expect(socket.closeCalls).toBe(0);
+    expect(acp.state).not.toBe('CLOSED');
+    socket.respond(4, { stopReason: 'end_turn' });
+    expect(await reply).toEqual({ stopReason: 'end_turn' });
+    await Promise.resolve();
+    expect(socket.closeCalls).toBe(1);
+  });
+
+  it('closes immediately with no pending requests and keeps a deferred core if reacquired', async () => {
+    const client = makeClient();
+    const first = client.connectAcp({ sessionId: 'shared' });
+    const socket = MockWebSocket.instances[0]!;
+    socket.open();
+    await Promise.resolve();
+    await Promise.resolve();
+    socket.respond(1, {});
+    await Promise.resolve();
+    await Promise.resolve();
+    socket.respond(2, {});
+    await first.ready;
+    const reply = first.send('session/prompt', {});
+    await Promise.resolve();
+    await Promise.resolve();
+    first.close();
+    const second = client.connectAcp({ sessionId: 'shared' });
+    expect(MockWebSocket.instances).toHaveLength(1);
+    socket.respond(3, { stopReason: 'end_turn' });
+    await reply;
+    await Promise.resolve();
+    expect(socket.closeCalls).toBe(0);
+    second.close();
+    expect(socket.closeCalls).toBe(1);
+  });
   it('shares one connecting WebSocket, retains it after a pre-open release, and closes after the final open lease releases', () => {
     const client = makeClient();
     const first = client.connectAcp({ sessionId: 'shared-session' });

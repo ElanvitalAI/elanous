@@ -3,6 +3,9 @@ import { cpus, freemem, loadavg, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { readPrimaryJoin } from './primary.js';
+import { resolveMachineName } from '../roles/machine-name.js';
+import { readMachineProfile } from '../roles/machine-profile.js';
 
 const DEFAULT_INTERVAL_MS = 30_000;
 const MAX_RETRY_MS = 300_000;
@@ -21,6 +24,8 @@ export function measureLoad(now: () => number = Date.now): {
 
 /** Read only the member credential. A missing or malformed file never creates credentials. */
 export function readMemberToken(root: string = effectiveInstanceRoot()): string | undefined {
+  const joined = readPrimaryJoin(root)?.tokens.member;
+  if (joined) return joined;
   try {
     const parsed: unknown = JSON.parse(readFileSync(join(root, 'control', 'tokens.json'), 'utf8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
@@ -47,6 +52,18 @@ export interface MemberHeartbeatOptions {
   now?: () => number;
 }
 
+/** 넥서스 멤버의 기계 신원 — OS hostname 이 아니라 임대·관제가 쓰는 기계 식별자(`resolveMachineName`)를 쓴다.
+ *  🅢 09-27: mbp 넥서스가 `machine:MacBookProM5` 로 올라가 프로필 id `mbp` 와 어긋날 뻔했다(가벼운 멤버는 이미 id 를 쓴다).
+ *  프로필이 있으면 맡은 일·자리 순위를 속성에 싣는다(가벼운 멤버와 같은 칸). */
+export function nexusMemberMachine(root: string = effectiveInstanceRoot(), host?: string): MemberResource {
+  const { machine } = resolveMachineName({ root, ...(host ? { host } : {}) });
+  const profile = readMachineProfile(root);
+  return {
+    id: `machine:${machine}`, name: machine,
+    ...(profile && profile.id === machine ? { attrs: { duties: profile.duties, seats: profile.seats } } : {}),
+  };
+}
+
 /** Best-effort registration; no network work is awaited by the caller. */
 export function startMemberHeartbeat(opts: MemberHeartbeatOptions): () => void {
   const interval = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
@@ -64,6 +81,8 @@ export function startMemberHeartbeat(opts: MemberHeartbeatOptions): () => void {
   let failures = 0;
   let lastFailure: string | undefined;
   const machineId = opts.machine.id;
+  // 자원의 `machine` 칸 = 기계 «이름»(가벼운 멤버·임대와 같은 값). 기계 범위 토큰은 이 칸을 토큰의 기계와 대조한다(server.ts requireMachine).
+  const machineName = opts.machine.name;
 
   const post = async (path: string, body: unknown): Promise<void> => {
     const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -86,11 +105,11 @@ export function startMemberHeartbeat(opts: MemberHeartbeatOptions): () => void {
   };
   const register = async (): Promise<void> => {
     await post('/v1/resources/register', {
-      ...opts.machine, kind: 'machine', machine: machineId, owner: '',
+      ...opts.machine, kind: 'machine', machine: machineName, owner: '',
       attrs: { ...opts.machine.attrs, load: measureLoad(now) }, observedAt: now(), ttlMs: MAX_RETRY_MS * 2,
     });
     await post('/v1/resources/register', {
-      ...opts.instance, kind: 'instance', machine: machineId, owner: '',
+      ...opts.instance, kind: 'instance', machine: machineName, owner: '',
       attrs: opts.instance.attrs ?? {}, observedAt: now(), ttlMs: MAX_RETRY_MS * 2,
     });
     registered = true;

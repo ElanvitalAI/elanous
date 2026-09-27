@@ -5,6 +5,7 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { RESOURCE_KINDS, ResourceLedger, ResourceLedgerError, type ResourceRecord } from './ledger.js';
 import { leasePort, PORT_BANDS } from './ports.js';
 import { machineForToken } from './member-tokens.js';
+import type { LeaseHolderView } from './lease-holder.js';
 
 export const DEFAULT_CONTROL_PORT = PORT_BANDS.reserved[0];
 export const CONTROL_HOSTNAME = '127.0.0.1';
@@ -72,6 +73,8 @@ export interface ControlServerOptions {
   root?: string;
   port?: number;
   hostname?: string;
+  leaseView?: LeaseHolderView;
+  requireKnownLeaseForWrites?: boolean;
 }
 
 export function startControlServer(opts: ControlServerOptions = {}): {
@@ -90,107 +93,119 @@ export function startControlServer(opts: ControlServerOptions = {}): {
     hostname,
     port,
     async fetch(req) {
-      const url = new URL(req.url);
-      const path = url.pathname;
-      const method = req.method;
-      const resourcePath = path === '/v1/resources' && method === 'GET';
-      const registerPath = path === '/v1/resources/register' && method === 'POST';
-      const heartbeat = /^\/v1\/resources\/([^/]+)\/heartbeat$/.exec(path);
-      const deletion = /^\/v1\/resources\/([^/]+)$/.exec(path);
-      const leaseRequest = path === '/v1/leases/port' && method === 'POST';
-      const leaseDeletion = /^\/v1\/leases\/port\/([^/]+)$/.exec(path);
-      const leaseRenewal = /^\/v1\/leases\/port\/([^/]+)\/heartbeat$/.exec(path);
-      if (!resourcePath && !registerPath && !leaseRequest && !(leaseDeletion && method === 'DELETE') && !(leaseRenewal && method === 'POST') && !(heartbeat && method === 'POST') && !(deletion && method === 'DELETE')) {
-        return json({ error: 'not-found' }, 404);
-      }
-      const authorization = req.headers.get('authorization');
-      const presented = authorization?.startsWith('Bearer ') ? authorization.slice(7) : null;
-      const scope: ControlScope | undefined = presented
-        ? (Object.keys(tokens) as ControlScope[]).find(key => tokens[key] === presented)
-        : undefined;
-      const machine = !scope && presented ? machineForToken(presented, root) : undefined;
-      if (!scope && !machine) return json({ error: 'unauthorized' }, 401);
-      if (!resourcePath && (scope === 'query' || ((leaseRequest || leaseDeletion || leaseRenewal) && scope !== 'member' && !machine))) return json({ error: 'forbidden' }, 403);
-      const owner = createHash('sha256').update(machine ? `machine:${machine}` : presented!).digest('hex');
-      const requireMachine = (target: string) => {
-        if (machine && target !== machine) throw new ResourceLedgerError(403, 'machine-scope');
-      };
-      const requireTarget = (id: string) => {
-        if (machine) {
-          const target = ledger.list().find(row => row.id === id);
-          if (target) requireMachine(target.machine);
+      const lease = await opts.leaseView?.get();
+      const respond = async (): Promise<Response> => {
+        const url = new URL(req.url);
+        const path = url.pathname;
+        const method = req.method;
+        if (path === '/v1/primary' && method === 'GET') return json({
+          holder: lease?.holder ?? null, generation: lease?.generation ?? null, known: lease?.known ?? false,
+        });
+        const resourcePath = path === '/v1/resources' && method === 'GET';
+        const registerPath = path === '/v1/resources/register' && method === 'POST';
+        const heartbeat = /^\/v1\/resources\/([^/]+)\/heartbeat$/.exec(path);
+        const deletion = /^\/v1\/resources\/([^/]+)$/.exec(path);
+        const leaseRequest = path === '/v1/leases/port' && method === 'POST';
+        const leaseDeletion = /^\/v1\/leases\/port\/([^/]+)$/.exec(path);
+        const leaseRenewal = /^\/v1\/leases\/port\/([^/]+)\/heartbeat$/.exec(path);
+        if (!resourcePath && !registerPath && !leaseRequest && !(leaseDeletion && method === 'DELETE') && !(leaseRenewal && method === 'POST') && !(heartbeat && method === 'POST') && !(deletion && method === 'DELETE')) {
+          return json({ error: 'not-found' }, 404);
         }
-      };
-      try {
-        if (leaseRequest) {
-          const body: unknown = await req.json();
-          if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ResourceLedgerError(400, 'invalid-port-lease');
-          const { machine, purpose, ttlMs, excluded } = body as Record<string, unknown>;
-          if (typeof machine !== 'string' || !machine.trim() || typeof purpose !== 'string' || !purpose.trim() ||
-              typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs <= 0 ||
-              (excluded !== undefined && (!Array.isArray(excluded) || !excluded.every(port =>
-                Number.isInteger(port) && port >= PORT_BANDS.test.start && port <= PORT_BANDS.test.end)))) {
-            throw new ResourceLedgerError(400, 'invalid-port-lease');
+        const authorization = req.headers.get('authorization');
+        const presented = authorization?.startsWith('Bearer ') ? authorization.slice(7) : null;
+        const scope: ControlScope | undefined = presented
+          ? (Object.keys(tokens) as ControlScope[]).find(key => tokens[key] === presented)
+          : undefined;
+        const machine = !scope && presented ? machineForToken(presented, root) : undefined;
+        if (!scope && !machine) return json({ error: 'unauthorized' }, 401);
+        if (!resourcePath && (scope === 'query' || ((leaseRequest || leaseDeletion || leaseRenewal) && scope !== 'member' && !machine))) return json({ error: 'forbidden' }, 403);
+        if (!resourcePath && (lease?.known ? !lease.iAmHolder : opts.requireKnownLeaseForWrites)) {
+          return json({ error: 'not-primary', holder: lease?.holder ?? null, generation: lease?.generation ?? null }, 409);
+        }
+        const owner = createHash('sha256').update(machine ? `machine:${machine}` : presented!).digest('hex');
+        const requireMachine = (target: string) => {
+          if (machine && target !== machine) throw new ResourceLedgerError(403, 'machine-scope');
+        };
+        const requireTarget = (id: string) => {
+          if (machine) {
+            const target = ledger.list().find(row => row.id === id);
+            if (target) requireMachine(target.machine);
           }
-          requireMachine(machine);
-          const lease = leasePort({ machine, purpose, ttlMs, owner, excluded: excluded as number[] | undefined }, ledger);
-          return json({ port: lease.attrs.port, lease });
-        }
-        if (leaseRenewal || leaseDeletion) {
-          const match = leaseRenewal ?? leaseDeletion!;
-          const port = Number(match[1]);
-          if (!Number.isInteger(port) || port < PORT_BANDS.test.start || port > PORT_BANDS.test.end ||
-              match[1] !== String(port)) throw new ResourceLedgerError(400, 'invalid-port');
-          requireTarget(`port-lease:${port}`);
-          const leaseId = req.headers.get('x-port-lease-id');
-          if (!leaseId) throw new ResourceLedgerError(400, 'missing-lease-id');
-          if (leaseRenewal) {
-            const renewed = ledger.renewTestPort(port, owner, leaseId);
-            return json({ ...renewed, attrs: { ...renewed.attrs, leaseId: undefined } });
+        };
+        try {
+          if (leaseRequest) {
+            const body: unknown = await req.json();
+            if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ResourceLedgerError(400, 'invalid-port-lease');
+            const { machine, purpose, ttlMs, excluded } = body as Record<string, unknown>;
+            if (typeof machine !== 'string' || !machine.trim() || typeof purpose !== 'string' || !purpose.trim() ||
+                typeof ttlMs !== 'number' || !Number.isFinite(ttlMs) || ttlMs <= 0 ||
+                (excluded !== undefined && (!Array.isArray(excluded) || !excluded.every(port =>
+                  Number.isInteger(port) && port >= PORT_BANDS.test.start && port <= PORT_BANDS.test.end)))) {
+              throw new ResourceLedgerError(400, 'invalid-port-lease');
+            }
+            requireMachine(machine);
+            const lease = leasePort({ machine, purpose, ttlMs, owner, excluded: excluded as number[] | undefined }, ledger);
+            return json({ port: lease.attrs.port, lease });
           }
-          ledger.deleteTestPort(port, owner, leaseId);
-          return new Response(null, { status: 204 });
-        }
-        if (resourcePath) {
-          const rows = ledger.list({
-            kind: url.searchParams.get('kind') || undefined,
-            machine: url.searchParams.get('machine') || undefined,
-            name: url.searchParams.get('name') || undefined,
-          });
-          return json({ resources: rows.map(row => row.kind === 'port-lease'
-            ? { ...row, attrs: { ...row.attrs, leaseId: undefined } }
-            : row) });
-        }
-        if (registerPath) {
-          const row = recordFromBody(await req.json(), owner);
-          if (row.kind === 'port-lease' || row.id.startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
-          requireMachine(row.machine);
-          requireTarget(row.id);
-          return json(ledger.register(row, owner));
-        }
-        if (heartbeat && method === 'POST') {
-          if (decodeURIComponent(heartbeat[1]!).startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
-          const body: unknown = await req.json();
-          if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ResourceLedgerError(400, 'invalid-heartbeat');
-          if (machine && 'machine' in body) requireMachine((body as Record<string, unknown>).machine as string);
-          const attrs = (body as Record<string, unknown>).attrs;
-          if (attrs !== undefined && (!attrs || typeof attrs !== 'object' || Array.isArray(attrs))) {
-            throw new ResourceLedgerError(400, 'invalid-heartbeat');
+          if (leaseRenewal || leaseDeletion) {
+            const match = leaseRenewal ?? leaseDeletion!;
+            const port = Number(match[1]);
+            if (!Number.isInteger(port) || port < PORT_BANDS.test.start || port > PORT_BANDS.test.end ||
+                match[1] !== String(port)) throw new ResourceLedgerError(400, 'invalid-port');
+            requireTarget(`port-lease:${port}`);
+            const leaseId = req.headers.get('x-port-lease-id');
+            if (!leaseId) throw new ResourceLedgerError(400, 'missing-lease-id');
+            if (leaseRenewal) {
+              const renewed = ledger.renewTestPort(port, owner, leaseId);
+              return json({ ...renewed, attrs: { ...renewed.attrs, leaseId: undefined } });
+            }
+            ledger.deleteTestPort(port, owner, leaseId);
+            return new Response(null, { status: 204 });
           }
-          const id = decodeURIComponent(heartbeat[1]!);
+          if (resourcePath) {
+            const rows = ledger.list({
+              kind: url.searchParams.get('kind') || undefined,
+              machine: url.searchParams.get('machine') || undefined,
+              name: url.searchParams.get('name') || undefined,
+            });
+            return json({ resources: rows.map(row => row.kind === 'port-lease'
+              ? { ...row, attrs: { ...row.attrs, leaseId: undefined } }
+              : row) });
+          }
+          if (registerPath) {
+            const row = recordFromBody(await req.json(), owner);
+            if (row.kind === 'port-lease' || row.id.startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
+            requireMachine(row.machine);
+            requireTarget(row.id);
+            return json(ledger.register(row, owner));
+          }
+          if (heartbeat && method === 'POST') {
+            if (decodeURIComponent(heartbeat[1]!).startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
+            const body: unknown = await req.json();
+            if (!body || typeof body !== 'object' || Array.isArray(body)) throw new ResourceLedgerError(400, 'invalid-heartbeat');
+            if (machine && 'machine' in body) requireMachine((body as Record<string, unknown>).machine as string);
+            const attrs = (body as Record<string, unknown>).attrs;
+            if (attrs !== undefined && (!attrs || typeof attrs !== 'object' || Array.isArray(attrs))) {
+              throw new ResourceLedgerError(400, 'invalid-heartbeat');
+            }
+            const id = decodeURIComponent(heartbeat[1]!);
+            requireTarget(id);
+            return json(ledger.heartbeat(id, owner, attrs as Record<string, unknown> | undefined));
+          }
+          if (decodeURIComponent(deletion![1]!).startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
+          const id = decodeURIComponent(deletion![1]!);
           requireTarget(id);
-          return json(ledger.heartbeat(id, owner, attrs as Record<string, unknown> | undefined));
+          ledger.delete(id, owner);
+          return new Response(null, { status: 204 });
+        } catch (err) {
+          if (err instanceof ResourceLedgerError) return json({ error: err.message }, err.status);
+          if (err instanceof SyntaxError) return json({ error: 'invalid-json' }, 400);
+          throw err;
         }
-        if (decodeURIComponent(deletion![1]!).startsWith('port-lease:')) throw new ResourceLedgerError(403, 'port-lease-requires-allocator');
-        const id = decodeURIComponent(deletion![1]!);
-        requireTarget(id);
-        ledger.delete(id, owner);
-        return new Response(null, { status: 204 });
-      } catch (err) {
-        if (err instanceof ResourceLedgerError) return json({ error: err.message }, err.status);
-        if (err instanceof SyntaxError) return json({ error: 'invalid-json' }, 400);
-        throw err;
-      }
+      };
+      const response = await respond();
+      if (lease?.known && lease.generation !== null) response.headers.set('x-primary-generation', String(lease.generation));
+      return response;
     },
   });
   return {

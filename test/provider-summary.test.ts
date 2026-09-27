@@ -48,9 +48,9 @@ beforeEach(() => {
   process.env.HOME = root;
   process.env.XDG_CONFIG_HOME = root;
   process.env.CODEX_HOME = join(root, 'codex-home');
-  spyOn(grokCredential, 'resolveGrokCredential').mockImplementation((opts = {}) => (
+  spyOn(grokCredential, 'resolveGrokCredential').mockImplementation(((opts = {}) => (
     resolveGrokCredential({ ...opts, home: root })
-  ));
+  )) as typeof resolveGrokCredential);
   spyOn(config, 'getGrokApiKey').mockImplementation(() => (
     process.env.XAI_API_KEY || process.env.GROK_API_KEY
   ));

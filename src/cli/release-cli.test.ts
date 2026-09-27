@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isPrerelease, isReleaseVersion, planPublish, publishRelease, verifyChecksums, verifyRelease, type ReleaseManifest, type Runner } from './release-cli.js';
+import { isPrerelease, isReleaseVersion, planPublish, publishRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 
 function fixture() {
   const out = mkdtempSync(join(tmpdir(), 'release-cli-'));
@@ -99,18 +99,21 @@ function stateOk(a: readonly string[]): { status: number; stdout: string; stderr
   return { status: 0, stdout: '', stderr: '' };
 }
 
+// 노트 페이지 확인 curl(-w %{http_code}) 가짜 — 기본 200.
+const notesCurl = (a: readonly string[], code = '200') => (a.includes('-w') ? { status: 0, stdout: code, stderr: '' } : null);
+
 describe('release verify — 공개 주소로 끝까지', () => {
   test('고정 버전이면 download/v<버전> 설치기를 받고, --version 이 그 버전으로 시작해야 ok', async () => {
     const urls: string[] = [];
     const run: Runner = (c, a) => {
-      if (c === 'curl') { urls.push(String(a[1])); return { status: 0, stdout: 'echo installer', stderr: '' }; }
+      if (c === 'curl') { const n = notesCurl(a); if (n) return n; urls.push(String(a[1])); return { status: 0, stdout: 'echo installer', stderr: '' }; }
       if (a[0] === '--version') return { status: 0, stdout: '0.1.1 cafe\n', stderr: '' };
       return stateOk(a);
     };
     const r = await verifyRelease({ version: '0.1.1', log: () => {} }, run);
     expect(urls).toEqual(['https://github.com/ElanvitalAI/elanous/releases/download/v0.1.1/install.sh']);
     expect(r.ok).toBe(true);
-    const wrong: Runner = (c, a) => (a[0] === '--version' ? { status: 0, stdout: '0.1.0 cafe', stderr: '' } : stateOk(a));
+    const wrong: Runner = (c, a) => (c === 'curl' && notesCurl(a) ? notesCurl(a)! : a[0] === '--version' ? { status: 0, stdout: '0.1.0 cafe', stderr: '' } : stateOk(a));
     expect((await verifyRelease({ version: '0.1.1', log: () => {} }, wrong)).ok).toBe(false);
   });
 
@@ -119,7 +122,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
     const saved = { s: process.env.ELANOUS_STATE_DIR, x: process.env.XDG_DATA_HOME };
     process.env.ELANOUS_STATE_DIR = '/real/state'; process.env.XDG_DATA_HOME = '/real/xdg';
     try {
-      const run: Runner = (c, a, cwd, o) => { if (o?.env) seen.push(o.env); return c === 'curl' ? { status: 0, stdout: 'x', stderr: '' } : a[0] === '--version' ? { status: 0, stdout: '0.1.1 c', stderr: '' } : stateOk(a); };
+      const run: Runner = (c, a, cwd, o) => { if (o?.env) seen.push(o.env); return c === 'curl' ? (notesCurl(a) ?? { status: 0, stdout: 'x', stderr: '' }) : a[0] === '--version' ? { status: 0, stdout: '0.1.1 c', stderr: '' } : stateOk(a); };
       await verifyRelease({ version: '0.1.1', log: () => {} }, run);
     } finally {
       if (saved.s === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = saved.s;
@@ -130,7 +133,7 @@ describe('release verify — 공개 주소로 끝까지', () => {
   });
 
   test('--version 이 맞아도 상태 왕복(기억 · 로그)이 안 되면 ok 가 아니다', async () => {
-    const base: Runner = (c, a) => (c === 'curl' ? { status: 0, stdout: 'echo installer', stderr: '' } : a[0] === '--version' ? { status: 0, stdout: '0.1.1 cafe\n', stderr: '' } : stateOk(a));
+    const base: Runner = (c, a) => (c === 'curl' ? (notesCurl(a) ?? { status: 0, stdout: 'echo installer', stderr: '' }) : a[0] === '--version' ? { status: 0, stdout: '0.1.1 cafe\n', stderr: '' } : stateOk(a));
     const noMemory: Runner = (c, a, cwd, o) => (a[0] === 'memory' && a[1] === 'search' ? { status: 0, stdout: 'no matches', stderr: '' } : base(c, a, cwd, o));
     const oldLogs: Runner = (c, a, cwd, o) => (a[0] === 'logs' ? { status: 0, stdout: '{"id":1,"ts_ms":1}\n', stderr: '' } : base(c, a, cwd, o));
     expect((await verifyRelease({ version: '0.1.1', log: () => {} }, base)).ok).toBe(true);
@@ -218,4 +221,25 @@ describe('release --json — stdout 은 결과 한 줄(T-R 그래프 간선용)'
     expect(typeof d.error).toBe('string');
     expect(r.exitCode).toBe(1);
   }, 60_000);
+});
+
+describe('release verify — 노트 페이지가 문서 사이트에 있나(🅕 09-27 · 0.2.2 노트 누락)', () => {
+  test('정식 판은 docs 노트 페이지가 200 이어야 ok · 없으면 경로를 말한다 · 선행 판은 안 잰다', async () => {
+    const pages: string[] = [];
+    const mk = (code: string): Runner => (c, a) => {
+      if (c === 'curl' && a.includes('-w')) { pages.push(String(a[a.length - 1])); return { status: 0, stdout: code, stderr: '' }; }
+      if (c === 'curl') return { status: 0, stdout: 'echo installer', stderr: '' };
+      return a[0] === '--version' ? { status: 0, stdout: '0.2.2 cafe\n', stderr: '' } : stateOk(a);
+    };
+    const ok = await verifyRelease({ version: '0.2.2', log: () => {} }, mk('200'));
+    expect(ok.ok).toBe(true);
+    expect(ok.notesPage).toBe('ok');
+    expect(pages).toEqual(['https://docs.elanous.ai/releases/0-2-2/']);
+    const lines: string[] = [];
+    const missing = await verifyRelease({ version: '0.2.2', log: (l) => lines.push(l) }, mk('404'));
+    expect(missing.ok).toBe(false);
+    expect(missing.notesPage).toBe('missing');
+    expect(lines.join('\n')).toContain('release/public/docs/releases/0.2.2.md');
+    expect(releaseNotesPageUrl('0.3.0-rc.1')).toBeNull();
+  });
 });

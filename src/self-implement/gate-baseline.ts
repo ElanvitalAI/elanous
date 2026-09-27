@@ -25,6 +25,7 @@ export interface GateTestFailure {
   attribution: GateFailureAttribution;
   /** 기준선 실행 산출과 기존 missingAtBase 입력에서 독립적으로 도출한 파일 존재 상태. */
   baselinePresence: GateBaselinePresence;
+  attributedBy?: 'name-across-files';
   precondition?: GateFailurePrecondition;
   /** 같은 gate 실행 안에서 같은 시험의 통과 기록이 있으면 `may-vary`로 보존한다. 타임아웃은 재실행 결과 변동성도 함께 표현한다. */
   timeoutVariability?: TimeoutVariability;
@@ -474,6 +475,24 @@ export function classifyGateTestFailures(
   };
   const worktreeFailures = extractGateTestFailures(worktreeLog);
   const baselineFailures = baselineLog === undefined ? [] : extractGateTestFailures(baselineLog);
+  const testPath = ({ file, name }: GateTestIdentitySource): string | undefined =>
+    file && name.startsWith(`${file} > `) ? name.slice(file.length + 3) : undefined;
+  // A Bun failure header can point at a newly added file even when the stack still points at the original test.
+  // Names alone are not identities: independent files may declare identically named suites and cases.
+  const testSource = (diagnostic: string | undefined, file: string): string | undefined => {
+    const escaped = escapeRegexSegment(file);
+    const locations = [...(diagnostic ?? '').matchAll(new RegExp(`(?:^|[\\s(])(${escaped}:\\d+:\\d+)(?=[\\s)]|$)`, 'gm'))];
+    return locations.length === 1 ? locations[0]![1] : undefined;
+  };
+  const failuresAcrossFiles = new Map<string, Array<{ file: string; source: string | undefined; diagnostic: string | undefined }>>();
+  for (const failure of baselineFailures) {
+    const path = testPath(failure);
+    if (path && failure.file && !isTimeoutDiagnostic(failure.diagnostic)) {
+      const matches = failuresAcrossFiles.get(path) ?? [];
+      matches.push({ file: failure.file, source: testSource(failure.diagnostic, failure.file), diagnostic: failure.diagnostic });
+      failuresAcrossFiles.set(path, matches);
+    }
+  }
   const baselinePassed = baselinePassedEvidence?.status === 'available'
     ? passedIdentities(baselinePassedEvidence.tests ?? [])
     : baselinePassedEvidence?.status === 'unavailable' || baselineLog === undefined
@@ -534,7 +553,19 @@ export function classifyGateTestFailures(
       ? 'may-vary'
       : undefined;
     if (timeoutVariability) return { ...failure, attribution: 'unknown' as const, baselinePresence, timeoutVariability };
-    if (failure.file && missing.has(failure.file)) return { ...failure, attribution: 'introduced' as const, baselinePresence };
+    if (failure.file && missing.has(failure.file)) {
+      const path = testPath(failure);
+      const matches = path ? failuresAcrossFiles.get(path) : undefined;
+      const baseline = matches?.length === 1 ? matches[0] : undefined;
+      const source = baseline ? testSource(failure.diagnostic, baseline.file) : undefined;
+      if (baseline && path && worktreeFailures.filter((entry) => testPath(entry) === path).length === 1
+        && baseline.file !== failure.file && baseline.source && baseline.source === source
+        && baseline.diagnostic === failure.diagnostic) {
+        debug.log('self-implement.gate', 'attributed-across-files', { name: path, file: failure.file, baselineFile: baseline.file });
+        return { ...failure, attribution: 'preexisting' as const, attributedBy: 'name-across-files' as const, baselinePresence };
+      }
+      return { ...failure, attribution: 'introduced' as const, baselinePresence };
+    }
     if (baselineLog === undefined || !failure.file) return { ...failure, attribution: 'unknown' as const, baselinePresence };
     const attribution = preexisting.has(failure) ? 'preexisting' as const : 'introduced' as const;
     // 재실행 관측이 `pass`일 때만 흔들림으로 강등한다. 관측이 없거나 실패면 원래 귀속을 유지한다.

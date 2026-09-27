@@ -16,7 +16,7 @@
 // makes "leak in shell history" recovery a one-line revoke instead
 // of a key-rotation flow.
 
-export type TokenScope = 'admin' | 'session' | 'read-only';
+export type TokenScope = 'admin' | 'session' | 'read-only' | 'mcp-public';
 
 const READONLY_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
@@ -36,9 +36,8 @@ export interface ScopedToken {
 
 export interface ScopeCheckRequest {
   method: string;
-  /** Path AFTER the `/v1/` prefix — e.g. `registry/daemons/x` or
-   *  `bindings/telegram/123`. The server.ts dispatcher passes the
-   *  url.pathname; we strip `/v1/` here for clarity. */
+  /** Request path (e.g. `/v1/mcp`). Callers must provide the full
+   *  pathname when checking the `mcp-public` scope. */
   pathname: string;
   /** Optional — the session id this request is targeting. Routes
    *  that touch a single session (e.g. `active-session` or future
@@ -72,6 +71,11 @@ export function tokenScopeAllows(
   switch (token.scope) {
     case 'admin':
       return { ok: true };
+
+    case 'mcp-public':
+      return req.method.toUpperCase() === 'POST' && req.pathname === '/v1/mcp'
+        ? { ok: true }
+        : { ok: false, reason: 'mcp_public_scope' };
 
     case 'read-only': {
       const m = req.method.toUpperCase();

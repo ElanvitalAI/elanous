@@ -39,7 +39,7 @@ not use it.
 
 | Button | What it does |
 |---|---|
-| **clear** | Clears the screen. |
+| **clear** | Clears the screen in this browser. The shell itself keeps running as it was. |
 | Camera | Takes a photo (or picks one) and puts its file path into the terminal. |
 | File | Attaches one or more files and puts their paths into the terminal. You can also drag files onto the terminal. |
 | **Live** | Shares your camera with the agent while it is on. |
@@ -53,7 +53,7 @@ Under the terminal is a chat box tied to the current terminal:
 - Plain text asks an agent about the terminal — it can see what is on screen.
 - Lines that start with `:` stay local. Type `:help` to list them; for example
   `:tab next`, `:tab prev`, `:cwd` and `:capture`.
-- You can pick the agent provider and see the session and cost for the month.
+- It shows the session and what the agent has cost this month.
 
 ## Use it from several devices
 
@@ -61,6 +61,39 @@ Open the same terminal on another device (see
 [The web app (PWA)](pwa.md#use-it-from-another-device)) and both see the same
 screen. A badge shows how many devices are attached, and a short "typing"
 flash appears when someone else types.
+
+Reopening a terminal tab — after a browser restart, or from another browser —
+returns you to the same shell that is still running; it does not start a new
+one.
+
+## Watch an agent's terminal from a link
+
+:::info On main — next release
+This section describes behaviour on `main` that ships in the release after 0.2.2.
+:::
+
+When elanous drives a coding CLI (codex, Claude Code, grok) in a terminal of
+its own, it prints a link to that terminal as soon as the terminal starts:
+
+- `elanous agent-mission` prints `[agent-mission] pty=<id> watch=<link>` on
+  its first lines, and the finished result carries the same link.
+- A harness run prints a `[surface-link] url=<link>` progress line.
+- A harness run started from Telegram also sends the link to that chat once.
+
+The link has the form `https://<your-tailnet-name>/app/term/?pty=<id>` and
+works on your tailnet only. Opening it shows that terminal's screen live,
+refreshed about once a second, with the terminal id at the top:
+
+- It starts **읽기 전용** (read-only) — you watch; your keys go nowhere.
+- **takeover** lets you type into it (the label changes to **입력 가능** —
+  typing enabled). **release** gives control back.
+- **닫기** (close) returns to your own terminals.
+
+Picking a row in **PTY 목록** (PTY list) opens the same live view.
+
+When the terminal ends the view stops with «PTY 가 끝났습니다» (the PTY has
+ended). «소유 프로세스에 닿지 않습니다» (the owning process cannot be
+reached) means the process that runs it stopped answering.
 
 ## Troubleshooting
 

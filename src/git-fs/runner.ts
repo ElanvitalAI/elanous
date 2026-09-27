@@ -29,6 +29,7 @@ export function runGitCommand(
     const result = spawnSync('git', gitArgs, { ...options, cwd });
     return {
       status: result.status,
+      ...(result.signal ? { signal: result.signal } : {}),
       stdout: outputText(result.stdout),
       stderr: outputText(result.stderr),
     };

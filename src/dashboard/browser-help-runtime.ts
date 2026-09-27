@@ -1,8 +1,7 @@
 // Browser-pane help overlay — yazi-style `~` action.
 //
-// Mirrors the shape of `virtual-window-help-runtime.ts` (the existing
-// `Ctrl+B ?` chord help). Builds the lines, hands them to the
-// dashboard's `showHelpModal` dep — which is itself a thin wrapper
+// Builds the lines and hands them to the dashboard's `showHelpModal`
+// dep — which is itself a thin wrapper
 // over `showTransientTerminalModal` (group: 'browser-help', auto-
 // dismiss after ttlMs).
 //

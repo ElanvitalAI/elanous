@@ -1,9 +1,9 @@
 import { test, expect, describe } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SCHEDULE_MANAGE_SPEC, compactSchedule, dispatchScheduleManage } from './schedule-manage-tool.js';
-import { openSchedulesDb, schedulesDbPath } from './schedule-registry.js';
+import { cronEntryId, openSchedulesDb, parseCronLine, repoRoot, schedulesDbPath, unwrapCronCommand } from './schedule-registry.js';
 
 const schedule = (command: string, extra: Record<string, unknown> = {}) => ({
   id: 'weekly-alpha', name: 'weekly-alpha', cron: '0 7 * * 1', interval_ms: null,
@@ -12,6 +12,73 @@ const schedule = (command: string, extra: Record<string, unknown> = {}) => ({
   last_status: null, last_exit: null, last_duration_ms: null, last_error: null,
   ...extra,
 }) as any;
+
+describe('dispatchScheduleManage wrap — explicit shell jobs', () => {
+  test('dry-run lists shell and Bun jobs, counts interpreter-free .sh, and --yes backs up and preserves ids', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'schedule-wrap-shell-'));
+    const bin = join(root, 'crontab');
+    const state = join(root, 'crontab.txt');
+    const lines = [
+      '0 7 * * * zsh $HOME/s/intake-cron.sh',
+      '20 4 * * * bash /x/backup.sh --source cron >> /tmp/b.log 2>&1',
+      '0 6 * * 1 cd /r && /bin/bash scripts/verify.sh',
+      '0 */6 * * * cd /r && scripts/m.sh gcpvm',
+      '15 8 * * * ./scripts/x.sh',
+      '10 8 * * * cd /r && bun scripts/report.ts --runner bash /x/backup.sh',
+      '0 11 * * * zsh /x/intake.sh --runner bun scripts/report.ts',
+      '0 12 * * * FOO=bar bun scripts/report.ts',
+      '0 13 * * * env bun scripts/report.ts',
+    ];
+    writeFileSync(state, `${lines.join('\n')}\n`);
+    writeFileSync(bin, `#!/bin/sh\nif [ "$1" = "-l" ]; then cat "${state}"; else cat > "${state}"; fi\n`);
+    chmodSync(bin, 0o755);
+    const previous = { state: process.env.ELANOUS_STATE_DIR, config: process.env.ELANOUS_CONFIG_DIR, path: process.env.PATH };
+    process.env.ELANOUS_STATE_DIR = root;
+    process.env.ELANOUS_CONFIG_DIR = root;
+    process.env.PATH = `${root}:${previous.path ?? ''}`;
+    try {
+      const dry = await dispatchScheduleManage({ action: 'wrap' }) as { dryRun: boolean; count: number; jobs: string[]; skippedShell: number };
+      expect(dry).toMatchObject({ dryRun: true, count: 7, skippedShell: 2 });
+      expect(dry.jobs).toEqual(['intake-cron', 'backup', 'verify', 'report', 'intake', 'report', 'report']);
+      expect(readFileSync(state, 'utf8')).toBe(`${lines.join('\n')}\n`);
+      const result = await dispatchScheduleManage({ action: 'wrap', yes: true }) as { wrapped: number; backup: string; jobs: string[]; skippedShell: number };
+      expect(result.wrapped).toBe(7);
+      expect(result.skippedShell).toBe(2);
+      expect(result.jobs).toEqual(dry.jobs);
+      expect(readFileSync(result.backup, 'utf8')).toBe(`${lines.join('\n')}\n`);
+      const applied = readFileSync(state, 'utf8').trimEnd().split('\n');
+      expect(applied[0]).toContain(`${process.execPath} ${join(repoRoot(), 'scripts', 'cron-run.ts')} --shell zsh `);
+      expect(applied[1]).toContain('cron-run.ts --shell bash /x/backup.sh --source cron >> /tmp/b.log 2>&1');
+      expect(applied[2]).toContain('cron-run.ts --shell /bin/bash scripts/verify.sh');
+      expect(applied.slice(3, 5)).toEqual(lines.slice(3, 5));
+      expect(applied[5]).toContain('bun scripts/cron-run.ts scripts/report.ts');
+      expect(applied[6]).toContain('cron-run.ts --shell zsh /x/intake.sh --runner bun scripts/report.ts');
+      expect(applied[7]).toContain('FOO=bar bun scripts/cron-run.ts scripts/report.ts');
+      expect(applied[8]).toContain('env bun scripts/cron-run.ts scripts/report.ts');
+      for (const i of [0, 1, 2, 5, 6, 7, 8]) {
+        const original = parseCronLine(lines[i]!)!;
+        const wrapped = parseCronLine(applied[i]!)!;
+        expect(cronEntryId(wrapped.cron, unwrapCronCommand(wrapped.command)))
+          .toBe(cronEntryId(original.cron, unwrapCronCommand(original.command)));
+      }
+      const again = await dispatchScheduleManage({ action: 'wrap' }) as { wrapped: number; skippedShell: number };
+      expect(again).toMatchObject({ wrapped: 0, skippedShell: 2 });
+      const undo = await dispatchScheduleManage({ action: 'unwrap', yes: true }) as { unwrapped: number; backup: string };
+      expect(undo.unwrapped).toBe(7);
+      expect(readFileSync(undo.backup, 'utf8')).toBe(`${applied.join('\n')}\n`);
+      expect(readFileSync(state, 'utf8')).toBe(`${lines.join('\n')}\n`);
+      writeFileSync(state, `${lines[0]}\n${lines[3]}\n`);
+      const oneSkipped = await dispatchScheduleManage({ action: 'wrap' }) as { dryRun: boolean; jobs: string[]; skippedShell: number };
+      expect(oneSkipped).toMatchObject({ dryRun: true, jobs: ['intake-cron'], skippedShell: 1 });
+      expect(readFileSync(state, 'utf8')).toBe(`${lines[0]}\n${lines[3]}\n`);
+    } finally {
+      for (const [key, value] of Object.entries({ ELANOUS_STATE_DIR: previous.state, ELANOUS_CONFIG_DIR: previous.config, PATH: previous.path })) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('compactSchedule — command truncation observability', () => {
   test('marks commands longer than 120 characters while retaining the 120-character command prefix', () => {

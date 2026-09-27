@@ -8,7 +8,7 @@
 // `<pre>` with the same styling so the markdown stays readable.
 //
 // We don't replace `<code>` — it still renders with the prose styles
-// the parent surface set up (ChatMessage / AgentResponseSheet).
+// the parent surface set up (ChatMessage).
 // SSR-safe: clipboard interactions degrade to a no-op when the API is
 // unavailable. The component is reusable across surfaces.
 

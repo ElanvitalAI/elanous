@@ -5,7 +5,7 @@
 // PTY lives on the same host as the saved file, so no SCP hop is needed:
 //
 //   ctr.sh:  Mac clipboard → SCP → remote /tmp → host clipboard → Cmd+V
-//   PWA:     PWA picker    → POST /v1/attachments → daemon fs → ACP terminal/input (auto)
+//   PWA:     PWA picker    → POST /v1/attachments → daemon fs → terminal input sender (auto)
 //
 // (b) — also writes the same string to the PWA-side clipboard via
 // navigator.clipboard.writeText so an SSH client / external editor can
@@ -17,16 +17,10 @@
 // in single quotes and escape inner `'` as `'\''` (POSIX-safe). zsh,
 // bash, and dash all accept this exact form.
 
-import { getPeerId } from './peer-id';
+import { sendToTerminal } from '@/components/terminal/terminal-input-registry';
 import { debugLog } from './debug';
 
-interface AcpLike {
-  send(method: string, params: Record<string, unknown>): Promise<unknown>;
-}
-
 export interface InjectOpts {
-  acp: AcpLike;
-  sessionId: string;
   terminalId: string;
   paths: readonly string[];
   /** When true (default), also writes the same quoted string to the
@@ -45,7 +39,7 @@ export function quotePathsForShell(paths: readonly string[]): string {
 export async function injectAttachmentPathsToTerminal(
   opts: InjectOpts,
 ): Promise<{ injected: boolean; copied: boolean }> {
-  const { acp, sessionId, terminalId, paths } = opts;
+  const { terminalId, paths } = opts;
   const alsoCopy = opts.alsoCopyToClipboard ?? true;
   const quoted = quotePathsForShell(paths);
   if (!quoted) return { injected: false, copied: false };
@@ -58,18 +52,16 @@ export async function injectAttachmentPathsToTerminal(
 
   let injected = false;
   try {
-    await acp.send('terminal/input', {
-      sessionId,
-      terminalId,
-      data,
-      peerId: getPeerId(),
-    });
-    injected = true;
-    debugLog('webterm.attach.inject.ok', {
-      terminalId,
-      pathCount: paths.length,
-      bytes: data.length,
-    });
+    injected = sendToTerminal(terminalId, data);
+    if (injected) {
+      debugLog('webterm.attach.inject.ok', {
+        terminalId,
+        pathCount: paths.length,
+        bytes: data.length,
+      });
+    } else {
+      debugLog('webterm.attach.inject.error', { terminalId, reason: 'no-sender' });
+    }
   } catch (e) {
     debugLog('webterm.attach.inject.error', { terminalId, reason: String(e) });
   }
@@ -81,8 +73,8 @@ export async function injectAttachmentPathsToTerminal(
       copied = true;
       debugLog('webterm.attach.clipboard.ok', { pathCount: paths.length });
     } catch (e) {
-      // Insecure-context Safari, permission denied, etc. Inject already
-      // delivered the value to the PTY — clipboard is a bonus.
+      // Insecure-context Safari, permission denied, etc. Clipboard is
+      // best-effort regardless of whether a terminal sender was available.
       debugLog('webterm.attach.clipboard.skip', { reason: String(e) });
     }
   }

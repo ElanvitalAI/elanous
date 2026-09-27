@@ -51,11 +51,20 @@ export interface LlmMergeOutcome {
   sizeChange?: LlmMergeSizeChange;
   testDeclarationLoss?: Array<{ file: string; ours: number; theirs: number; merged: number }>;
   testDeclarationUnmeasured?: string[];
+  /** 해결기 응답이 LLM 공급자 오류 문구였다 — 파일 내용이 아니다(🅢 2026-09-27 #21086: 세 파일이 통째로 그 문구가 됐다). */
+  providerFailure?: string[];
+  /** 병합 결과가 양쪽 판 중 작은 쪽의 절반 아래로 줄었다 — 통째로 날린 것으로 보고 해결 실패로 친다. */
+  sizeCollapse?: Array<{ file: string; ours: number; theirs: number; merged: number }>;
   /** `status: 'error'` 일 때 어느 단계인지. 선택 — 옛 호출자는 이 칸 없이 돌아도 된다. */
   errorStep?: LlmMergeErrorStep;
   /** 그 단계의 git stderr 첫 줄. seam 이 안 주면 칸 자체를 만들지 않는다. */
   errorDetail?: string;
 }
+
+/** `src/session-runtime/retry-policy.ts` `formatProviderFallbackOutput` 의 머리 — 라우터는 공급자가 전부 막히면 이 문구를 «응답 텍스트»로 돌려준다. */
+export const PROVIDER_FAILURE_TEXT = /^\s*\[LLM PROVIDER (?:BLOCKED|STOPPED)\]/;
+/** 이 줄 수 미만 파일은 크기 붕괴 판정에서 뺀다(작은 파일은 정당하게 크게 줄 수 있다). */
+export const SIZE_COLLAPSE_MIN_LINES = 50;
 
 function lineCount(s: string): number {
   if (s.length === 0) return 0;
@@ -189,6 +198,10 @@ export async function mergeMainWithLlmResolve(
       git.abort(worktreePath); // LLM 예외 → base 유지
       return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles });
     }
+    if (PROVIDER_FAILURE_TEXT.test(merged)) {
+      git.abort(worktreePath); // 해결기가 공급자 오류 문구를 «내용»으로 돌려줬다 → base 유지
+      return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles, providerFailure: [f] });
+    }
     if (hasConflictMarkers(merged)) {
       git.abort(worktreePath); // LLM 이 종합 못 함(마커 잔존) → base 유지
       return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles });
@@ -204,6 +217,18 @@ export async function mergeMainWithLlmResolve(
       }
     } catch {
       testDeclarationUnmeasured.push(f);
+    }
+    try {
+      const ours = lineCount(git.readIndexStage(worktreePath, 2, f));
+      const theirs = lineCount(git.readIndexStage(worktreePath, 3, f));
+      const mergedLines = lineCount(merged);
+      const smaller = Math.min(ours, theirs);
+      if (smaller >= SIZE_COLLAPSE_MIN_LINES && mergedLines * 2 < smaller) {
+        git.abort(worktreePath); // 양쪽 판 모두보다 절반 넘게 작다 → 통째로 날렸다 → base 유지
+        return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles, sizeCollapse: [{ file: f, ours, theirs, merged: mergedLines }] });
+      }
+    } catch {
+      /* 한쪽 판이 없는 충돌(삭제·추가) — 크기 비교 대상이 아니다 */
     }
     addSizeChange(sizeChange, f, conflicted, merged);
     git.writeFile(abs, merged);
@@ -293,6 +318,8 @@ export function defaultGitMergeSeam(): MergeGitSeam {
 export async function defaultLlmResolve(filePath: string, conflicted: string, mergeTarget: string): Promise<string> {
   const { streamLLM } = await import('../../llm.js');
   const out = await streamLLM([{ role: 'user', content: conflictResolvePrompt(filePath, conflicted, mergeTarget) }], () => {}, { model: process.env.ELANOUS_CONFLICT_MODEL || tierModel('better'), reasoningEffort: 'medium' });
+  // ⛔ 라우터는 공급자가 전부 막히면 던지지 않고 오류 문구를 돌려준다 — 그것은 파일 내용이 아니다. 던져서 «LLM 예외 → base 유지» 로 보낸다.
+  if (PROVIDER_FAILURE_TEXT.test(out)) throw new Error(`conflict resolve: LLM provider failure for ${filePath}`);
   return `${out.replace(/^```[\w.-]*\n?/, '').replace(/\n?```\s*$/, '').trimEnd()}\n`;
 }
 

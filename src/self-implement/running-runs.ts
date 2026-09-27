@@ -92,7 +92,7 @@ export interface RunningRunsResult {
   readonly observation: RunningRunsObservation;
   /** Terminated-ledger runs whose persisted launch parent is still alive, distinct from running-run status. Query results always provide it. */
   readonly lingeringLaunchParents?: LingeringLaunchParentAssessment;
-  readonly ledger: Pick<FederatedUnfinishedRunLedgerQuery, 'ledgerDirectories' | 'unreadableLedgerCount' | 'unreadableLedgerDirectoryCount' | 'missingLedgerDirectoryCount' | 'unreadableLedgerDirectoryAccessCount' | 'indeterminateLedgerDirectoryCount'>;
+  readonly ledger: Pick<FederatedUnfinishedRunLedgerQuery, 'ledgerDirectories' | 'unreadableLedgerCount' | 'unreadableLedgerDirectoryCount' | 'missingLedgerDirectoryCount' | 'unreadableLedgerDirectoryAccessCount' | 'indeterminateLedgerDirectoryCount'> & { readonly cacheHits?: number; readonly cacheMisses?: number };
   readonly pty: Pick<FederatedPtyListing, 'unreadable'> & {
     readonly observedRefCount: number;
     readonly withoutRunIdCount: number;
@@ -212,6 +212,8 @@ function phaseStoreObservation(phases: ObservedRunPhases): RunningRunsPhaseStore
 
 export interface RunningRunsLedgerObservation {
   readonly entries: readonly FederatedUnfinishedRunLedgerEntry[];
+  readonly cacheHits?: number;
+  readonly cacheMisses?: number;
   readonly ledgerDirectories: readonly string[];
   readonly unreadableLedgerCount: number;
   readonly unreadableLedgerDirectoryCount: number;
@@ -221,6 +223,9 @@ export interface RunningRunsLedgerObservation {
 }
 
 export interface RunningRunsQueryObservation {
+  readonly caller?: string | null;
+  readonly cacheHits?: number;
+  readonly cacheMisses?: number;
   readonly elapsedMs: number;
   readonly ledgerDirectoryCollectionElapsedMs: number;
   readonly ledgerReadElapsedMs: number;
@@ -234,7 +239,7 @@ export interface RunningRunsQueryObservation {
 }
 
 export interface RunningRunsQueryDeps {
-  readonly queryLedgers?: (options: { includeTest?: boolean; ledgerDirectories?: readonly string[]; runIds?: readonly string[] }) => FederatedUnfinishedRunLedgerQuery;
+  readonly queryLedgers?: (options: { includeTest?: boolean; ledgerDirectories?: readonly string[]; runIds?: readonly string[]; noCache?: boolean }) => FederatedUnfinishedRunLedgerQuery;
   readonly ledgerDirectories?: (options: { includeTest?: boolean }) => readonly string[];
   readonly ptyTargets?: (options: { includeTest?: boolean }) => readonly { name: string; dbPath: string }[];
   readonly readPtyRows?: typeof listPtyManifestRowsAt;
@@ -385,7 +390,7 @@ export function assessRunningRuns(
   return { entries, counts, total, countedStatuses, quantities: quantitySummary({ entries, counts, total, countedStatuses, observation }), observation, lingeringLaunchParents: { observation: 'indeterminate' }, ledger: { ledgerDirectories: [], unreadableLedgerCount: ledgerObservation.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledgerObservation.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledgerObservation.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledgerObservation.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledgerObservation.indeterminateLedgerDirectoryCount }, pty: { unreadable: [...pty.unreadable], observedRefCount: pty.refs.length, withoutRunIdCount, notCountedRefCount }, phases: { targetCount: 0, readableTargetCount: 0, unreadableTargetCount: 0, unreadableTargets: [], discardedNonStageEventCount: 0 } };
 }
 
-export function queryRunningRuns(options: { includeTest?: boolean; runIds?: readonly string[] } = {}, deps: RunningRunsQueryDeps = {}): RunningRunsResult {
+export function queryRunningRuns(options: { includeTest?: boolean; runIds?: readonly string[]; caller?: string; noCache?: boolean } = {}, deps: RunningRunsQueryDeps = {}): RunningRunsResult {
   const queryLedgers = deps.queryLedgers ?? queryFederatedUnfinishedRunLedgers;
   const ledgerDirectories = deps.ledgerDirectories ?? resolveFederatedRunLedgerDirectories;
   const collectLedgerDirectories = deps.ledgerDirectories !== undefined || deps.queryLedgers === undefined;
@@ -406,6 +411,8 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
   let collectedLedgerDirectories: readonly string[] = [];
   let ledgerDirectoryCount = 0;
   let ledgerEntryCount = 0;
+  let cacheHits = 0;
+  let cacheMisses = 0;
   let stageStoreCount = 0;
   let discardedNonStageEventCount = 0;
   try {
@@ -421,11 +428,14 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     let ledger: FederatedUnfinishedRunLedgerQuery;
     try {
       const requestedRunIds = options.runIds === undefined ? {} : { runIds: options.runIds };
+      const cacheOption = options.noCache === undefined ? {} : { noCache: options.noCache };
       ledger = collectLedgerDirectories
-        ? queryLedgers({ includeTest: options.includeTest, ledgerDirectories: collectedLedgerDirectories, ...requestedRunIds })
-        : queryLedgers({ includeTest: options.includeTest, ...requestedRunIds });
+        ? queryLedgers({ includeTest: options.includeTest, ledgerDirectories: collectedLedgerDirectories, ...requestedRunIds, ...cacheOption })
+        : queryLedgers({ includeTest: options.includeTest, ...requestedRunIds, ...cacheOption });
       ledgerDirectoryCount = ledger.ledgerDirectories.length;
       ledgerEntryCount = ledger.entries.length;
+      cacheHits = ledger.cacheHits ?? 0;
+      cacheMisses = ledger.cacheMisses ?? 0;
     } finally {
       ledgerReadElapsedMs = Date.now() - ledgerReadStartedAt;
     }
@@ -460,10 +470,13 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     } finally {
       launchParentClassificationElapsedMs = Date.now() - launchParentClassificationStartedAt;
     }
-    return { ...result, observation, quantities: quantitySummary({ ...result, observation }), lingeringLaunchParents: lingeringLaunchParents!, ledger: { ledgerDirectories: ledger.ledgerDirectories, unreadableLedgerCount: ledger.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledger.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledger.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledger.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledger.indeterminateLedgerDirectoryCount }, phases: phaseStoreObservation(observedPhases) };
+    return { ...result, observation, quantities: quantitySummary({ ...result, observation }), lingeringLaunchParents: lingeringLaunchParents!, ledger: { ledgerDirectories: ledger.ledgerDirectories, unreadableLedgerCount: ledger.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledger.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledger.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledger.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledger.indeterminateLedgerDirectoryCount, cacheHits, cacheMisses }, phases: phaseStoreObservation(observedPhases) };
   } finally {
     try {
       observeQuery({
+        caller: options.caller ?? null,
+        cacheHits,
+        cacheMisses,
         elapsedMs: Date.now() - startedAt,
         ledgerDirectoryCollectionElapsedMs,
         ledgerReadElapsedMs,

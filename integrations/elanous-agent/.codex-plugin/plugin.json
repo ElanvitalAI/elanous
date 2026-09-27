@@ -1,0 +1,24 @@
+{
+  "name": "elanous",
+  "version": "0.1.0",
+  "description": "Hand work to elanous from Codex — queues an approval-gated task in the local elanous daemon through its MCP server.",
+  "author": {
+    "name": "ElanvitalAI"
+  },
+  "homepage": "https://github.com/ElanvitalAI/elanous",
+  "license": "Apache-2.0",
+  "keywords": [
+    "elanous",
+    "tasks",
+    "mcp",
+    "handoff"
+  ],
+  "mcpServers": "./.mcp.json",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "elanous",
+    "shortDescription": "Hand a task to your local elanous agent",
+    "developerName": "ElanvitalAI",
+    "category": "Productivity"
+  }
+}

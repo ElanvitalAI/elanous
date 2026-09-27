@@ -37,22 +37,6 @@ export interface DashboardPriorityKeyRouteDeps<Action> {
    *  fires; the route then short-circuits to `{type:'quit'}`
    *  regardless of any other state. */
   isForceQuitChord: (key: Key) => boolean;
-  /** Step 0a — popup terminal close chord (Alt+W). Fires from anywhere
-   *  the user might want to dismiss a popup-terminal-like surface:
-   *  - popup terminal modal (claude / codex / shell)
-   *  - VW with a terminal pane focused
-   *  Returns true if it claimed the key. The handler is responsible
-   *  for actually disposing the modal / pane and for deciding what
-   *  "close" means in each context. Compensates for removing
-   *  Ctrl+Shift+T (which colided with shell-level Ctrl+T finders). */
-  routePopupCloseChord: (key: Key) => boolean;
-  /** Step 0b — VW navigation chord (Alt+1..Alt+9, Alt+0). Fires from
-   *  anywhere — popup terminal, VW with terminal pane, dashboard.
-   *  Compensates for the broad ^B-forward-to-PTY policy: when a VW
-   *  has a terminal-priority pane, the ^B 0..9 chord doesn't fire,
-   *  so single-keystroke Alt+digit becomes the only way to switch
-   *  windows without leaving the popup. */
-  routeVwSwitchChord: (key: Key) => boolean;
   /** PR-S1V.4-wiring · Step 0x — Voice mode entry chord
    *  (Ctrl+Shift+V). Fires from ANYWHERE (popup terminal · VW
    *  terminal · bell modal · dashboard) so the user always has a
@@ -67,7 +51,7 @@ export interface DashboardPriorityKeyRouteDeps<Action> {
    *  host swallows everything that isn't an explicit voice action so
    *  bell · terminal · editor primitives never see release/repeat
    *  artefacts of the kitty `>3u` protocol). Escape hatches (Force
-   *  quit · Alt+W · Alt+digit) are above this step so the user can
+   *  quit) are above this step so the user can
    *  always escape. */
   routeVoiceModeKey: (key: Key) => boolean;
   /** experiment/voice-chat-realtime-rebind (2026-04-30) — Step 0r:
@@ -89,14 +73,6 @@ export interface DashboardPriorityKeyRouteDeps<Action> {
   inputOwner?: InputOwner;
   dispatchPreKey: (key: Key, targetHandlerName?: string) => boolean | Promise<boolean>;
   routeExclusiveTerminalModalKey: (key: Key) => boolean | Promise<boolean>;
-  /** Step 2b — VW (Virtual Window) whose focused pane is a terminal
-   *  ('terminal' | 'terminal-slot' kind). When true, the VW is treated
-   *  the same as the popup terminal modal: forward the key directly to
-   *  the pane's PTY before any input-core / chord / global-action fires.
-   *  Per user feedback: "Virtual Window 전체도 터미널이 붙을 경우에는
-   *  터미널 우선 모드를 일단 적용해주세요. 나중에 너무 불편할 경우 미세
-   *  조정 들어가겠습니다." */
-  routeVwTerminalKey: (key: Key) => boolean | Promise<boolean>;
   routeArmedChordKey: (key: Key) => boolean | Promise<boolean>;
   armPrefixChord: (key: Key) => boolean;
   isHardQuitKey: (key: Key) => boolean;
@@ -128,18 +104,6 @@ export async function routeDashboardPriorityKey<Action>(
   if (deps.isForceQuitChord(key)) {
     if (tracing) trace('isForceQuitChord', key, 'quit');
     return { type: 'quit' };
-  }
-
-  // Step 0a: Alt+W popup-close.
-  if (deps.routePopupCloseChord(key)) {
-    if (tracing) trace('routePopupCloseChord', key, true);
-    return { type: 'handled' };
-  }
-
-  // Step 0b: Alt+digit VW switch.
-  if (deps.routeVwSwitchChord(key)) {
-    if (tracing) trace('routeVwSwitchChord', key, true);
-    return { type: 'handled' };
   }
 
   // Step 0x: Voice mode entry chord (Ctrl+Shift+V).
@@ -188,12 +152,6 @@ export async function routeDashboardPriorityKey<Action>(
   // 많이 보이므로."
   if (await deps.routeExclusiveTerminalModalKey(key)) {
     if (tracing) trace('routeExclusiveTerminalModalKey', key, true);
-    return { type: 'handled' };
-  }
-
-  // Step 2b: Virtual Window with terminal-kind focused pane.
-  if (await deps.routeVwTerminalKey(key)) {
-    if (tracing) trace('routeVwTerminalKey', key, true);
     return { type: 'handled' };
   }
 

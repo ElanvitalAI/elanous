@@ -17,24 +17,6 @@ import {
   setPtyAdapterForTesting, resetForTesting,
 } from '../src/pty-shell/registry';
 import { resolveTerminalInteractionPolicy } from '../src/dashboard/terminal-exposure';
-import { DisplayCoordinator } from '../src/display/coordinator.js';
-import {
-  initDashboardVirtualWindows,
-  _resetDashboardVirtualWindowsForTesting,
-} from '../src/dashboard/windowing/virtual-windows.js';
-
-function spawnProbeWindow(): void {
-  const coord = new DisplayCoordinator({ frameMs: 0 });
-  const vw = initDashboardVirtualWindows({
-    coordinator: coord,
-    defaultBounds: () => ({ row: 1, col: 1, width: 80, height: 24 }),
-  });
-  vw.registry.spawn({
-    title: 'probe',
-    initialContent: { kind: 'markdown', text: 'hello' },
-  });
-}
-
 describe('buildGetDashboardStateTool', () => {
   test('shape', () => {
     const spec = buildGetDashboardStateTool();
@@ -61,6 +43,8 @@ describe('dispatchGetDashboardState', () => {
   test('returns snapshot + summary output', async () => {
     const res = await dispatchGetDashboardState({}, { cwd: '/tmp/test' });
     expect(res.snapshot.workspace.cwd).toBe('/tmp/test');
+    expect(res.snapshot).not.toHaveProperty('windows');
+    expect(res.output).not.toContain('virtual windows:');
     expect(res.output).toContain('monad-agent state');
     expect(res.output).toContain('cwd=/tmp/test');
   });
@@ -88,14 +72,12 @@ describe('dashboardStateRuntime registry', () => {
     setTerminalMouseIntentsGetter(null);
     setTerminalSessionsGetter(null);
     _resetDashboardStateDedupForTest();
-    _resetDashboardVirtualWindowsForTesting();
   });
   afterEach(() => {
     _resetToolRuntimeRegistryForTest();
     setTerminalMouseIntentsGetter(null);
     setTerminalSessionsGetter(null);
     _resetDashboardStateDedupForTest();
-    _resetDashboardVirtualWindowsForTesting();
   });
 
   test('registers + aliases resolve', () => {
@@ -154,7 +136,12 @@ describe('dashboardStateRuntime registry', () => {
           surfaceId: string;
           mouseType: string;
           hostInterpretation: string;
+          paneKind: string;
+          row: number;
+          col: number;
+          transport: string;
           exposure: { userExposure: string; agentInteractive: boolean };
+          interactionPolicy: ReturnType<typeof resolveTerminalInteractionPolicy>;
         }>;
       };
     };
@@ -198,37 +185,14 @@ describe('dashboardStateRuntime registry', () => {
     expect(second.output).toContain('state unchanged');
   });
 
-  test('runtime includes virtual windows by default', async () => {
+  test('runtime omits windows and retains workspace', async () => {
     registerAllDefaultToolRuntimes();
-    spawnProbeWindow();
     const res = await dispatchToolByName(
       'GetDashboardState', {}, { surface: 'dashboard' },
-    ) as { snapshot: { windows: Array<{ title: string }>; workspace: { cwd: string } } };
-    expect(res.snapshot.windows.map(w => w.title)).toEqual(['probe']);
-    expect(res.snapshot.workspace.cwd).toBeTruthy();
-  });
-
-  test('runtime emits windows: [] when includeVirtualWindows is false', async () => {
-    registerAllDefaultToolRuntimes();
-    spawnProbeWindow();
-    const res = await dispatchToolByName(
-      'GetDashboardState',
-      { includeVirtualWindows: false },
-      { surface: 'dashboard' },
-    ) as { snapshot: { windows: unknown[]; workspace: { cwd: string; platform: string } } };
-    expect(res.snapshot.windows).toEqual([]);
+    ) as { snapshot: { workspace: { cwd: string; platform: string } }; output: string };
+    expect(res.snapshot).not.toHaveProperty('windows');
+    expect(res.output).not.toContain('virtual windows:');
     expect(res.snapshot.workspace.cwd).toBeTruthy();
     expect(res.snapshot.workspace.platform).toBe(process.platform);
-  });
-
-  test('runtime includes virtual windows when includeVirtualWindows is true', async () => {
-    registerAllDefaultToolRuntimes();
-    spawnProbeWindow();
-    const res = await dispatchToolByName(
-      'GetDashboardState',
-      { includeVirtualWindows: true },
-      { surface: 'dashboard' },
-    ) as { snapshot: { windows: Array<{ title: string }> } };
-    expect(res.snapshot.windows.map(w => w.title)).toEqual(['probe']);
   });
 });

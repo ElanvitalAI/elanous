@@ -28,7 +28,7 @@ export interface ShowroomPanel {
   /** client-side 식별자 — `@name` mention 의 base 가 됨 (D12) */
   id: string;
   kind: ShowroomPanelKind;
-  /** chat panel: provider 식별자. PWA ProviderPicker 와 동일 5 풀
+  /** chat panel: provider 식별자. Showroom 의 default + named provider pool
    *  (`claude` `gemini` `grok` `codex` 또는 빈 문자열 = daemon default).
    *  agent panel: brand 와 lock (P5 D2) — agentBrandToProvider 로 채움. */
   provider: string;

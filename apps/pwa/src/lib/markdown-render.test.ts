@@ -1,8 +1,7 @@
 /**
  * Markdown render config contract — `MARKDOWN_REMARK_PLUGINS` export
- * shape lock. ChatMessage / AgentResponseSheet / CollapsibleCodeBlock
- * 모두 본 상수로 ReactMarkdown 을 wire 하므로 plugin set 변동 시 즉시
- * surface.
+ * shape lock. ChatMessage uses this plugin set for ReactMarkdown, so plugin
+ * changes surface here.
  */
 
 import { describe, expect, it } from 'bun:test';

@@ -64,6 +64,9 @@ import { selfToolArgHint } from './telegram-exec-footer.js';
 import { detectUrlRoute, type UrlRouteDecision } from './skills/url-router.js';
 import { observeDevRequestRouteFailSoft } from './skills/dev-request-router.js';
 import { runUrlRoute } from './skills/url-route-exec.js';
+import { recordRoutedLinkAbsorbed } from './intake-plane/link-ledger.js';
+import { classifyFrontInput } from './intake-plane/front-classifier.js';
+import { effectiveInstanceRoot } from './instance/resolve.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -1251,10 +1254,19 @@ export class TelegramBot {
     const typingTimer = setInterval(typing, 4000);
 
     let posted = 0;
+    let recorded = false;
     let result: Awaited<ReturnType<typeof runUrlRoute>>;
     try {
       result = await runUrlRoute(dec, {
-        onStageDone: async (_kind, text) => {
+        onStageDone: async (kind, text, meta) => {
+          if (!recorded && (kind === 'detailed' || kind === 'absorb') && meta.obsidianPath) {
+            recorded = true;
+            try {
+              recordRoutedLinkAbsorbed(effectiveInstanceRoot(), {
+                source: 'telegram-bot', url: dec.url, notePath: meta.obsidianPath,
+              });
+            } catch { /* instance root lookup is best-effort too */ }
+          }
           const t = (text ?? '').trim();
           if (!t) return;
           // ★ 공개 URL → 클릭 가능한 링크. legacy markdown 은 URL 내 `_` 를 이탤릭으로 파싱해 raw URL 이
@@ -1633,6 +1645,9 @@ export class TelegramBot {
         ? getActiveDelegation(delegationChatKey(this.botId, ctx.chatId, ctx.threadId))
         : null;
       if (!activeDeleg) {
+        try {
+          classifyFrontInput({ text: ctx.text, surface: 'telegram' }, { urlRouting: getUserConfig().skills.urlRouting });
+        } catch { /* observation must not interrupt URL routing */ }
         const urlDec = detectUrlRoute(ctx.text, getUserConfig().skills.urlRouting);
         if (urlDec) {
           const handled = await this.runUrlRouteReply(ctx, urlDec);

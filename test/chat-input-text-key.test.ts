@@ -41,8 +41,11 @@ describe('chat input text-key resolver', () => {
     expect(resolveTextInputTextAction({ text: 'ab', cursor: 1 }, { name: 'u', ctrl: true, shift: false })).toEqual({
       kind: 'none',
     });
+  });
+
+  test('Ctrl+Left is now an editor word-navigation key rather than an ignored control', () => {
     expect(resolveTextInputTextAction({ text: 'ab', cursor: 1 }, { name: 'left', ctrl: true, shift: false })).toEqual({
-      kind: 'none',
+      kind: 'insert', next: { text: 'ab', cursor: 0 },
     });
   });
 });

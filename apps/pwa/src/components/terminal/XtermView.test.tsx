@@ -1,7 +1,9 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, test } from 'bun:test';
+import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import { createRequire } from 'node:module';
 
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
+import { sendToTerminal } from './terminal-input-registry';
 
 type StateListener = (state: 'CONNECTING' | 'OPEN' | 'FAILED' | 'CLOSED', error?: Error) => void;
 type IntervalCallback = () => void;
@@ -24,6 +26,25 @@ let capabilityResponse = '';
 const terminals: Terminal[] = [];
 const logs: Array<{ event: string; details: unknown }> = [];
 let sends: string[] = [];
+
+// R-TST23 — 이 파일은 전역 `window`·`Date.now` 와 모듈 여럿(React JSX 런타임 포함)을 바꾼다. mock.module 은
+// 프로세스 전역이라, 안 되돌리면 뒤에 도는 파일이 가짜를 받는다(2026-09-27 전 스위트: `IntakeFrontDoor.test.tsx`
+// 6건이 `instanceof window.HTMLElement` 로 깨졌다 · 이 파일과 짝으로 돌리면 재현). 원본을 잡아 두고 끝에 되돌린다.
+const originalWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+const originalDateNow = Date.now;
+const MOCKED_MODULES = [
+  'react/jsx-dev-runtime', 'react/jsx-runtime',
+  '@xterm/xterm', '@xterm/addon-fit', '@xterm/addon-web-links', '@xterm/addon-unicode11', '@xterm/addon-serialize',
+  '@/lib/debug', '@/lib/elanous-term-envelope', '@/lib/peer-id', '@/lib/snapshot',
+  '@/lib/xterm-resize-controller', '@/lib/xterm-capability-filter',
+] as const;
+await restoreModuleMocksAfterAll(MOCKED_MODULES, (specifier) => import(specifier));
+afterAll(() => {
+  if (originalWindowDescriptor) Object.defineProperty(globalThis, 'window', originalWindowDescriptor);
+  else delete (globalThis as { window?: unknown }).window;
+  Date.now = originalDateNow;
+  mock.module('@/components/providers/DaemonProvider', () => actualDaemonProvider);
+});
 
 Object.defineProperty(globalThis, 'window', {
   value: {
@@ -135,8 +156,8 @@ function liveTextOf(value: unknown): string {
   return children.map(liveTextOf).find(Boolean) ?? '';
 }
 
-function render(terminalId = 't1', clearRequest = 0): unknown {
-  harness.render(() => XtermView({ sessionId: 's1', terminalId, clearRequest }));
+function render(terminalId = 't1', clearRequest = 0, readOnly = false): unknown {
+  harness.render(() => XtermView({ sessionId: 's1', terminalId, clearRequest, readOnly }));
   return harness.find((element) => element.type === 'div' && element.props.className === 'relative h-full w-full bg-[#0d0c08]');
 }
 
@@ -153,11 +174,73 @@ function resetState(): void {
   onTerminalData = undefined;
   onAcpSession = undefined;
   sendInput = async () => ({});
+  acp.ready = Promise.resolve('s1');
   capabilityResponse = '';
   terminals.length = 0;
   logs.length = 0;
   sends = [];
 }
+
+describe('XtermView terminal input routing', () => {
+  test('routes external and keyboard input through the same sender for its terminalId', async () => {
+    resetState();
+    const sent: Array<{ data: string; sessionId: string }> = [];
+    sendInput = async (data, sessionId) => { sent.push({ data, sessionId }); return {}; };
+    render('terminal-a');
+    await harness.settle();
+    expect(sendToTerminal('terminal-b', 'wrong')).toBe(false);
+    expect(sendToTerminal('terminal-a', 'external')).toBe(true);
+    onTerminalData?.('keyboard');
+    await harness.settle();
+    expect(sent).toEqual([
+      { data: 'external', sessionId: 's1' },
+      { data: 'keyboard', sessionId: 's1' },
+    ]);
+    harness.unmount();
+  });
+
+  test('queues routed input before ACP connects and drains it in order', async () => {
+    resetState();
+    let connect!: (sessionId: string) => void;
+    acp.ready = new Promise<string>((resolve) => { connect = resolve; });
+    const sent: Array<{ data: string; sessionId: string }> = [];
+    sendInput = async (data, sessionId) => { sent.push({ data, sessionId }); return {}; };
+    render('terminal-a');
+    expect(sendToTerminal('terminal-a', 'first')).toBe(true);
+    onTerminalData?.('second');
+    expect(sendToTerminal('terminal-a', 'third')).toBe(true);
+    expect(sent).toEqual([]);
+    connect('connected-session');
+    await harness.settle();
+    expect(sent).toEqual([
+      { data: 'first', sessionId: 'connected-session' },
+      { data: 'second', sessionId: 'connected-session' },
+      { data: 'third', sessionId: 'connected-session' },
+    ]);
+    harness.unmount();
+  });
+
+  test('does not register readOnly and removes routed input on readOnly toggle and unmount', async () => {
+    resetState();
+    const sent: string[] = [];
+    sendInput = async (data) => { sent.push(data); return {}; };
+    render('terminal-a', 0, true);
+    expect(sendToTerminal('terminal-a', 'readonly')).toBe(false);
+    expect(onTerminalData).toBeUndefined();
+    render('terminal-a', 0, false);
+    await harness.settle();
+    expect(sendToTerminal('terminal-a', 'writable')).toBe(true);
+    await harness.settle();
+    render('terminal-a', 0, true);
+    expect(sendToTerminal('terminal-a', 'readonly-again')).toBe(false);
+    render('terminal-a', 0, false);
+    expect(sendToTerminal('terminal-a', 'pending-unmount')).toBe(true);
+    harness.unmount();
+    expect(sendToTerminal('terminal-a', 'after-unmount')).toBe(false);
+    await Promise.resolve();
+    expect(sent).toEqual(['writable']);
+  });
+});
 
 describe('XtermView local clear', () => {
   test('clears only its xterm once per changed request and never sends shell input', async () => {

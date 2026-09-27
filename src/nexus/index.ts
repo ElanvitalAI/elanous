@@ -108,7 +108,8 @@ import { discoverWorkflows as discoverWorkflowsForDaemon } from '../workflow-run
 import { buildDefaultWorkflowDeps as buildWorkflowDaemonDeps } from './api/workflows.js';
 import { startNexusHttpServer, type NexusHttpServer, type NexusWsBridgeInit } from './api/http-server.js';
 import { startControlServer } from '../control-plane/server.js';
-import { readMemberToken, startMemberHeartbeat } from '../control-plane/member.js';
+import { nexusMemberMachine, startMemberHeartbeat } from '../control-plane/member.js';
+import { resolvePrimary } from '../control-plane/primary.js';
 import { cleanGhostTailscaleServe } from '../cli/tailscale-serve.js';
 import { buildNextFluentRouteOpts } from './api/next-fluent-wiring.js';
 import { bootDefaultOcrProviders, type OcrRegistry } from '../ocr/index.js';
@@ -254,6 +255,9 @@ import { runFirstBootWizard } from './onboarding/first-boot-wizard.js';
 // Phase 2 of RESEARCH-tox-surface-agnostic-boot-2026-05-13 — surface-
 // agnostic TOX bootstrap + subagent surface bridge to globalAgentRegistry.
 import { wireTox, type ToxBootHandle } from '../task-orchestrator/boot.js';
+import { createExternalExecAdapter } from '../task-orchestrator/surfaces/external-exec.js';
+import { dispatchSelfImplement } from '../boot/daemon-tools/self-implement.js';
+import { TaskStore, hydrateGraph } from '../task-orchestrator/store.js';
 import { createGlobalSubagentCallable } from '../agent/subagent-callable.js';
 import { setAgentHopCap } from '../agent/registry.js';
 import type { SidebarTabSurface } from '../ui/widgets/sidebar-tab-surface.js';
@@ -960,13 +964,11 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       gateOpen: scopedMod.hotPathGateOpen(startLevel), surface: 'nexus',
     });
     dbgMod.debug.setFileEnabled(dbgCfg.file);
-    // OH9 — 렌더 무음 시드(레벨 직교). 데몬은 uiMode 가 없으므로
-    // essential=false(기본 비억제) — level.json.render 명시 또는
+    // OH9 — 렌더 무음 시드(레벨 직교). 데몬은 기본 비억제 — level.json.render 명시 또는
     // config.debug.renderLogs 만 억제/override 를 결정한다.
     dbgMod.debug.setRenderSuppressed(scopedMod.resolveRenderSuppressed({
       scopedRender: scopedMod.readScopedRenderLogs(),
       configRenderLogs: dbgCfg.renderLogs,
-      uiModeEssential: false,
     }));
     if (dbgCfg.file) {
       console.log(`debug: level=${dbgMod.debug.level()} file: ${dbgMod.debug.path()}`);
@@ -1214,6 +1216,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   // (PWA Intake, iPhone, ACP, MCP, future). Disposed in the shutdown
   // hook below.
   let toxHandle: ToxBootHandle | undefined;
+  let toxStore: TaskStore | undefined;
   // §5-③ — autonomous idle-continuation scheduler. Only constructed when
   // `dispatch.enabled` is set (default off); stopped in the shutdown hook.
   let continuationScheduler: import('../dispatch/continuation-scheduler.js').ContinuationScheduler | undefined;
@@ -2161,10 +2164,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     // schedule-trigger nodes that register a TOX task on fire have a
     // live graph + dispatcher to land in. The `subagent` surface bridges
     // to `globalAgentRegistry` so `Agent`-tool spawns and TOX-driven
-    // subagent tasks share a single live registry. Other surface
-    // callables (skill / chatPrompt / vwSlot / acxSession / cron /
-    // terminalPane / llmDirect) stay unwired here — they land in
-    // follow-up PRs as each becomes load-bearing for production work.
+    // subagent tasks share a single live registry. External llm-direct
+    // tasks are triaged to current self-implement or the same subagent callable.
+    // Other surface callables stay unwired here.
     try {
       // Wave 5 E3 — pick up `tools.agentSpawn.hopCap` from user-config
       // before any spawn can fire (the global registry reads the cap
@@ -2177,11 +2179,29 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
           setAgentHopCap(cap);
         }
       } catch { /* keep default cap */ }
+      const agentToolSurface = toolSurface(resolveToolsKind(opts));
+      const agentToolCwd = runtimeToolCwd ?? resolveToolCwd({ tools: 'chat', toolCwd: opts.toolCwd });
+      const subagent = createGlobalSubagentCallable({
+        hostTools: agentToolSurface.specs,
+        ...(agentToolCwd ? {
+          dispatchTool: (name: string, args: Record<string, unknown>, signal?: AbortSignal) => agentToolSurface.dispatch(name, args, {
+            cwd: agentToolCwd, signal: signal ?? new AbortController().signal, entry: 'elanous-apparatus',
+          }),
+          cwd: agentToolCwd,
+        } : {}),
+      });
+      toxStore = new TaskStore();
       toxHandle = wireTox({
-        surfaces: { subagent: createGlobalSubagentCallable() },
+        graph: hydrateGraph(toxStore), store: toxStore,
+        surfaces: {
+          subagent,
+          externalExec: createExternalExecAdapter({ dispatch: dispatchSelfImplement, cwd: runtimeToolCwd ?? resolveToolCwd({ tools: 'chat', toolCwd: opts.toolCwd })!, subagent }),
+        },
         log: (line) => console.debug('[nexus]', line),
       });
     } catch (err) {
+      toxStore?.close();
+      toxStore = undefined;
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(`[nexus] wireTox failed: ${msg}`);
     }
@@ -2392,7 +2412,10 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         // 로 등록해, 이관잡이 데몬 재시작 후에도 발화하게 한다. best-effort.
         try {
           const { registerScheduledToxTasks } = await import('../domains/schedule-migrate.js');
-          const rr = registerScheduledToxTasks(bridgeTaskStore, (e) => workflowDaemon!.registerWorkflow(e));
+          const { listSchedules } = await import('../domains/schedule-registry.js');
+          // 레지스트리가 «trigger» 라고 말하는 잡의 파생 task 만 등록한다(release 뒤 고아 task 의 이중 발화 방지).
+          const runViaById = new Map(listSchedules(bridgeScheduleDb).map((row) => [row.id, row.run_via] as const));
+          const rr = registerScheduledToxTasks(bridgeTaskStore, (e) => workflowDaemon!.registerWorkflow(e), (jobId) => runViaById.get(jobId) ?? null);
           if (rr.registered > 0) {
             console.log(`[nexus] re-registered ${rr.registered} scheduled TOX task(s) as Schedule Triggers`);
           }
@@ -2999,22 +3022,25 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     runtime.httpAuth = 'off';
     // The actual bound port (not the requested port or registry entry) is the member endpoint.
     try {
-      const token = readMemberToken();
       const configured = (getUserConfig().raw?.nexus as { primary?: unknown } | undefined)?.primary;
-      const coordinatorUrl = configured === undefined || configured === '' ? 'http://127.0.0.1:31413' : configured;
-      if (!token || typeof coordinatorUrl !== 'string' || !coordinatorUrl.trim()) {
-        try { debug.log('control.member', 'start-skipped', { reason: !token ? 'member-token-missing' : 'coordinator-url-missing' }); } catch { /* fail-soft */ }
+      const { url: coordinatorUrl, token } = resolvePrimary({
+        role: 'member',
+        ...(configured === undefined || configured === '' ? {} : { config: { url: configured as string } }),
+      });
+      if (!token) {
+        try { debug.log('control.member', 'start-skipped', { reason: 'member-token-missing' }); } catch { /* fail-soft */ }
       } else {
-        const machineId = `machine:${hostname()}`;
+        const machine = nexusMemberMachine();
         stopMemberHeartbeat = startMemberHeartbeat({
           coordinatorUrl, token,
-          machine: { id: machineId, name: hostname() },
+          machine,
           instance: {
-            id: `instance:${hostname()}:${effectiveInstanceRoot()}`, name: 'nexus',
+            id: `instance:${machine.name}:${effectiveInstanceRoot()}`, name: 'nexus',
             endpoint: httpServer.url,
             attrs: { port: httpServer.port, pid: process.pid },
           },
         });
+        try { debug.log('control.member', 'started', { machine: machine.id, coordinatorUrl }); } catch { /* fail-soft */ }
       }
     } catch {
       try { debug.log('control.member', 'start-skipped', { reason: 'member-configuration-invalid' }); } catch { /* fail-soft */ }
@@ -3258,6 +3284,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         console.warn(`[nexus] tox dispose failed: ${msg}`);
       }
     }
+    if (toxStore) { try { toxStore.close(); } catch { /* shutdown best effort */ } toxStore = undefined; }
     // V2.2-3 (2026-05-12) — stop the workflow Discord trigger bot.
     if (workflowDiscordBot) {
       void workflowDiscordBot.stop().catch(() => { /* swallow */ });

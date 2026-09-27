@@ -15,6 +15,7 @@
 // 경유 필수). 설계: 내부 문서 `PLAN-unified-log-fabric-2026-07-13` §LF3.
 
 import { existsSync, readFileSync } from 'node:fs';
+import type { Command } from 'commander';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -1837,4 +1838,187 @@ export async function runLogsLevel(level: string | undefined, opts: { json?: boo
     console.error(`  (인스턴스별 영속은 <stateDir>/logs/level.json — 데몬이 있을 때 이 명령이 관리)`);
     return 1;
   }
+}
+
+export function registerLogsCommands(program: Command): void {
+// ── logs (통합 로그 패브릭 LF3 — adb logcat 동형 · 2026-07-13) ──
+// 조회/follow 는 logs.db 직독(데몬 다운 무관·토큰 불요), level 만 데몬 REST.
+const logsCmd = program.command('logs')
+  .description('전 서피스 로그 조회/실시간 tail (adb logcat 동형) — level/surface/category/grep 필터')
+  .option('-f, --follow', '실시간 follow (tail -f · Ctrl-C 종료)')
+  .option('--level <lvl>', '이 레벨 이상만 (trace|debug|info|warn|error|critical)')
+  .option('--surface <s>', 'surface 필터 CSV (nexus,pwa,telegram,discord,…)')
+  .option('--space <v>', '하니스 공간 필터 (self-implement|dev-harness|solve-mission = 종류별 · 그 외 = run id/branch slug 로 격리 조회)')
+  .option('--category <c>', 'category prefix 필터 CSV (voice,webterm.tabs,…)')
+  .option('--exact-category <c>', 'category 정확 일치 필터 CSV (자식 category 제외)')
+  // ⭐ 「무엇이 «실제로» 뜨나」 — 소스의 debug.log 목록과 «차집합»을 내면 미배선이 나온다(`OBS-T122`)
+  .option('--list-categories', '이 스토어들에 «실제로 뜬» 카테고리와 발화 수를 전수로 낸다(필터 무시)')
+  .option('--list-events', '이 스토어들에 «실제로 뜬» 이벤트와 발화 수를 낸다(카테고리 필터 존중)')
+  .option('--axis <name>', `축 이름을 정확 카테고리 묶음으로 조회 (${knownLogAxes().join('|')})`)   // ⛔ 목록을 손으로 적지 않는다 — 축이 늘면 도움말이 낡는다(A3)
+  .option('--explain', '축 미지정이면 축·카테고리를 발견, --axis와 함께면 매핑·미분류·최근 창 발화 0을 설명')
+  .option('--event <e>', 'event 정확 일치 필터 CSV')
+  .option('--grep <q>', 'event/data/category 부분 일치')
+  .option('--rework-recurrence-disagreement <true|false>', 'rework-budget data.recurrenceDisagreement 값 필터')
+  .option(...LOGS_SINCE_OPTION)
+  .option('--until <t>', '끝 시각 — --since 와 대칭 (30s|15m|2h|7d 상대 또는 ISO/epoch)')
+  .option('--before <cursor>', '⭐ 페이지 커서 — 행 id 또는 연합 --json 메타의 nextCursors JSON 객체')
+  .option('--session <id>', 'session_id 필터')
+  .option('--limit <n>', '최대 행 수 (기본 100 · 로컬 직독은 1000 에 갇히지 않는다 — 그 상한은 HTTP 경계로 옮겼다)')
+  .option('--json', 'JSON 출력')
+  .option('--json-data', '--json 출력에서 JSON data를 파싱된 값으로 출력')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/) 로그를 본다 (LF7-b)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스 타겟 (prod|test:<repo>|…)')
+  .option('--all', '전 인스턴스 연합 조회 — read-only 병합·⟨instance⟩ 태그')
+  .option('--include-test', '--all 연합에 격리 test 인스턴스도 포함(기본 제외)')
+  // ⛔ `-r` 은 값을 받지 않는다 — default 북마크만. 이름은 `--remote <name>` 으로만 준다.
+  .option('-r', 'query logs on the default remote bookmark (does not take a value)')
+  .option('--remote <name>', 'query logs on a named remote bookmark via GET /v1/logs')
+  .action(async (o: import('./logs-cli.js').LogsCliOpts) => {
+    const { runLogsCli } = await import('./logs-cli.js');
+    process.exitCode = await runLogsCli(o);
+  });
+// ★ 발견성 — 플래그 18개를 나열만 하면 **이미 있는 기능을 못 찾고 손으로 다시 만든다**.
+//   실측(2026-07-28): `--since 30m` 을 모른 채 `$(date -u -v-30M …)` 를 손으로 썼고(macOS 전용),
+//   `-f` 를 모른 채 폴 루프를 짰다. 그래서 예시를 **맨 앞**에 둔다(`before` = Usage 위).
+//   ⚠️ 자리표시자는 **대문자**다 — `<ref>` 로 쓰면 셸에서 입력 리다이렉션이라 복사해서 못 돌린다.
+logsCmd.addHelpText('before', `
+자주 쓰는 5가지 (복사해서 그대로 실행 · 자리표시자는 대문자)
+
+  elanous logs --category dev-pipeline --since 30m
+      최근 시간창. ⭐ --since 는 상대 표기를 받는다(30s|15m|2h|7d) — date 로 계산하지 마라.
+
+  elanous logs --category self-review -f
+      실시간 follow (tail -f 동형 · Ctrl-C 종료).
+
+  elanous logs --event headless.spawn --since 6h | grep -c .
+      그 이벤트가 몇 건인가. ⭐ --event 는 정확 일치 — --grep 은 data 본문도 매칭해 과다 계수한다.
+      ⚠️ 0건은 stderr 로 나가므로 이 파이프는 정직하게 0 을 낸다.
+
+  elanous logs --grep RUNID --since 3h --all --include-test
+      한 실행을 끝까지 따라간다. ⚠️ 런의 이벤트는 prod 와 격리 인스턴스에 **나뉘어** 있어
+      --all --include-test 가 없으면 일부만 보인다. (--space RUNID 는 harness 공간만 본다)
+
+  elanous logs --category self-review --event done --since 6h --json | jq '.data | fromjson | .verdict'
+      JSON 파이프. ⚠️ data 는 **문자열**이라 fromjson 을 거쳐야 필드를 뽑는다.
+
+  elanous logs --event frame-stall --since 7d --instance prod --limit 1000 --json | tail -1
+      ⭐ 과거로 가려면 페이지를 넘긴다. --since 를 넓히는 것으로는 못 간다 —
+      정렬이 최근순이라 어떤 창을 걸어도 **최근 상한만큼**만 온다(실측).
+      상한에 걸리면 다음 쪽 명령(--before ID)을 stderr 로 찍어 준다.
+
+더 보기: elanous logs timeline --help (자율빌드 드라이브를 내러티브로) · elanous logs instances
+`);
+logsCmd.command('instances')
+  .description('로그 인스턴스 레지스트리 조회 — 이름·state dir·liveness·store 유무 (LF7-b)')
+  .option('--json')
+  .action(async (o: { json?: boolean }) => {
+    const { runLogsInstances } = await import('./logs-cli.js');
+    process.exit(runLogsInstances(o));
+  });
+logsCmd.command('level [lvl]')
+  .description('데몬 로그 레벨 조회/런타임 변경 (off|trail|diag|normal|verbose|detail|keytrace · 변경은 인스턴스 영속 — LF7-c). --render on|off = 렌더 로그 무음 스위치(레벨과 직교 · OH9)')
+  .option('--json')
+  .option('--render <on|off>', '렌더 카테고리(dashboard/key/mouse/…) 발화 on|off — 진단 레벨과 직교(OH9)')
+  .action(async (lvl: string | undefined, o: { json?: boolean; render?: string }) => {
+    const { runLogsLevel } = await import('./logs-cli.js');
+    process.exit(await runLogsLevel(lvl, o));
+  });
+logsCmd.command('timeline')
+  .description('세션/드라이브를 휴먼 리더블 내러티브로 렌더 — 렌더 노이즈 제외·turn/tool-call/reasoning/edit 타임라인 (자율빌드 드라이브 진단용)')
+  .option('--session <id>', 'session_id 필터 (예: elanous-session-1)')
+  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO/epoch)')
+  .option('--until <t>', '종료 시각 (동일 문법)')
+  .option('--out <path>', '파일로 저장 (미지정 시 stdout)')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
+  .action(async (o: import('./logs-timeline.js').LogsTimelineOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
+    // Parent `logs` also declares --since/--session/--test/--instance; merge
+    // parent+child so those don't get swallowed by the parent scope.
+    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-timeline.js').LogsTimelineOpts;
+    const { runLogsTimeline } = await import('./logs-timeline.js');
+    process.exit(runLogsTimeline(merged));
+  });
+
+logsCmd.command('durations')
+  .description('대화 표면과 헤드리스 core 경로를 분리해 툴별 소요 분포(count·median·p90·max)를 조회')
+  .option('--json', '구조화 JSON 출력')
+  .option('--limit <n>', '인스턴스별 최대 수집 행 수 (상한 도달 여부를 산출에 표시)')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
+  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
+  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
+  .action(async (o: import('./logs-tool-durations.js').LogsToolDurationsOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
+    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-tool-durations.js').LogsToolDurationsOpts;
+    const { runLogsToolDurations } = await import('./logs-tool-durations.js');
+    process.exit(runLogsToolDurations(merged));
+  });
+
+logsCmd.command('degenerate')
+  .description('수치 로그 필드의 always-same/all-zero/표본 부족 퇴화를 NDJSON으로 판정 (기본 표본 50)')
+  .option('--category <prefix>', '카테고리 접두 필터 (복수는 쉼표)')
+  .option('--event <event>', '이벤트 정확 일치 필터 (복수는 쉼표)')
+  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO)')
+  .option('--min-samples <n>', '판정 최소 표본 수 (기본 50)')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
+  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
+  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
+  .action(async (o: import('./logs-degenerate.js').LogsDegenerateOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
+    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-degenerate.js').LogsDegenerateOpts;
+    const { runLogsDegenerate } = await import('./logs-degenerate.js');
+    process.exit(runLogsDegenerate(merged));
+  });
+
+logsCmd.command('fields')
+  .description('모든 최상위 data 필드의 존재 행 수·이벤트 전체 행 수·관측 기간을 NDJSON으로 조회')
+  .option('--category <prefix>', '카테고리 접두 필터 (복수는 쉼표)')
+  .option('--exact-category <category>', '카테고리 정확 일치 필터 (복수는 쉼표)')
+  .option('--event <event>', '이벤트 정확 일치 필터 (복수는 쉼표)')
+  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO)')
+  .option('--limit <n>', '최대 수집 행 수 (상한 도달 시 firstSeen은 창 안에서 처음)')
+  .option('--values [n]', '필드별 최빈 primitive 값 분포 (기본 10개)')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
+  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
+  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
+  .action(async (o: import('./logs-fields.js').LogsFieldsOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
+    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-fields.js').LogsFieldsOpts;
+    const { runLogsFields } = await import('./logs-fields.js');
+    process.exit(runLogsFields(merged));
+  });
+
+logsCmd.command('unclosed')
+  .description('시작만 있고 종료가 없는 작업을 나이순으로 — 행(hang) 후보. ⛔ 임계값을 정하지 않는다(자르는 선은 --older-than 으로 읽는 쪽이 고른다)')
+  .option('--since <t>', '스캔 창 (30s|15m|2h|7d · 기본 24h)')
+  .option('--older-than <t>', '이 나이 이상만 (동일 문법 · 미지정 시 전부)')
+  .option('--json', 'JSON Lines 출력')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
+  .action(async (o: import('./logs-unclosed.js').LogsUnclosedOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
+    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-unclosed.js').LogsUnclosedOpts;
+    const { runLogsUnclosed } = await import('./logs-unclosed.js');
+    process.exit(runLogsUnclosed(merged));
+  });
+
+logsCmd.command('abandoned-draft-prs')
+  .description('중단 산출 draft PR 중 salvage 판정이 안 붙은 것을 세고 이름을 댄다 (읽기 전용 · 닫기/라벨/코멘트 없음)')
+  .option('--json', '구조화 JSON 출력')
+  .option('--store-names', '사람 산출에 본 스토어 이름을 전부 나열 (기본은 수·상한·못 읽은 수만)')
+  .option('--lookup-merged', '같은 골의 병합된 PR 을 GitHub 에서 조회해 superseded 를 이름으로 댄다 (기본은 오프라인)')
+  .option('--lookup-current-status', '각 draft PR의 현재 병합·닫힘·열림 상태를 GitHub 에서 조회한다 (기본은 오프라인 · 읽기 전용)')
+  .option('--count-domain-gap', '열린 draft PR 전체를 GitHub에서 조회해 이 보고서가 못 이은 수를 낸다 (기본은 오프라인 · 읽기 전용)')
+  .option('--run-lineage', '같은 런 원장에서 draft 뒤 병합된 PR 번호를 이름으로 댄다 (로컬 원장 읽기 전용)')
+  .option('--limit <n>', '전역 최대 수집 행 수 (스토어 합산, 상한 도달 여부를 산출에 표시)')
+  .option('--since <t>', '시작 시각 (30s|15m|2h|7d 상대 또는 ISO)')
+  .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/)')
+  .option('--instance <name>', '레지스트리 등록 인스턴스 (prod|test:<repo>|…)')
+  .option('--all', '등록된 모든 로그 인스턴스를 연합 조회')
+  .option('--include-test', '--all 연합에 격리 test 인스턴스 포함')
+  .action(async (o: import('./logs-abandoned-draft-prs.js').LogsAbandonedDraftPrsOpts, cmd: { optsWithGlobals(): Record<string, unknown> }) => {
+    const merged = { ...cmd.optsWithGlobals(), ...o } as import('./logs-abandoned-draft-prs.js').LogsAbandonedDraftPrsOpts;
+    const { runLogsAbandonedDraftPrs } = await import('./logs-abandoned-draft-prs.js');
+    process.exit(runLogsAbandonedDraftPrs(merged));
+  });
+
+
 }

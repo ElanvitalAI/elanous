@@ -763,6 +763,14 @@ export function defaultTelegramCommands(): TgSlashCommand[] {
       },
     },
     {
+      name: 'work',
+      description: '글을 알맞은 곳(흡수·태스크·하니스)에 넣고 결과를 여기로 답합니다 — /work [absorb|tasks|graph] <글>',
+      handler: async (args, ctx) => {
+        const { handleTelegramWork } = await import('./intake-plane/telegram-work.js');
+        return handleTelegramWork(args, { chatId: ctx.chatId, messageId: ctx.messageId });
+      },
+    },
+    {
       name: 'harness',
       description: 'Capture a task and launch its harness implementation',
       handler: async (args, ctx, opts) => {

@@ -10,9 +10,14 @@ import {
   type TaskSurface,
   type TaskPriority,
   type TaskIsolation,
+  TASK_DEFAULTS,
 } from '../types.js';
 import { getToxRuntimeDeps } from '../runtime-deps.js';
+import type { TaskGraph } from '../graph.js';
+import { debug } from '../../debug/log.js';
 import { taskToWorkflowEntry } from '../task-to-workflow.js';
+import { TaskStore } from '../store.js';
+import { decideExternalApproval, externalTaskPrompt, isExternalProvider, type ExternalTaskContext } from '../external-policy.js';
 import type { WorkflowRuntimeDaemon } from '../../workflow-runtime/daemon.js';
 
 export interface TaskCreateInput {
@@ -27,12 +32,18 @@ export interface TaskCreateInput {
   estimateTokens?: number;
   estimateUsd?: number;
   scheduleText?: string;
+  external?: ExternalTaskContext;
+  /** The HTTP default prompt repeats title/description; it is not caller-provided content. */
+  externalSurfaceDefaulted?: boolean;
+  eventId?: string;
+  traceId?: string;
 }
 
 export interface TaskCreateResult {
   output: string;
   taskId?: string;
   task?: Task;
+  deduplicated?: boolean;
 }
 
 export async function dispatchTaskCreate(
@@ -45,6 +56,17 @@ export async function dispatchTaskCreate(
   }
   if (!isTaskSurface(input.surface)) {
     return { output: 'TaskCreate: surface must be a valid TaskSurface tagged union' };
+  }
+  if (input.external) {
+    if (!isExternalProvider(input.external.provider)) return { output: 'TaskCreate: external.provider is invalid' };
+    if (!input.external.ref?.trim()) return { output: 'TaskCreate: external.ref is required' };
+    if (input.surface.kind !== 'llm-direct') {
+      return { output: 'TaskCreate: external tasks require llm-direct surface' };
+    }
+    if (input.surface.model !== undefined || input.surface.systemPrompt !== undefined) {
+      return { output: 'TaskCreate: external tasks cannot set model or systemPrompt' };
+    }
+    return createExternalTask(input, graph);
   }
 
   const task = createTask({
@@ -111,6 +133,112 @@ export async function dispatchTaskCreate(
     taskId: task.id,
     task: graph.getTask(task.id),
   };
+}
+
+const externalCreateLocks = new Map<string, Promise<void>>();
+
+async function createExternalTask(input: TaskCreateInput, graph: TaskGraph): Promise<TaskCreateResult> {
+  const external = input.external!;
+  const key = JSON.stringify([external.provider, external.ref]);
+  const previous = externalCreateLocks.get(key);
+  let release!: () => void;
+  const finished = new Promise<void>((resolve) => { release = resolve; });
+  externalCreateLocks.set(key, finished);
+  if (previous) await previous;
+  try {
+    return createExternalTaskLocked(input, graph);
+  } finally {
+    if (externalCreateLocks.get(key) === finished) externalCreateLocks.delete(key);
+    release();
+  }
+}
+
+function createExternalTaskLocked(input: TaskCreateInput, graph: TaskGraph): TaskCreateResult {
+  const external = input.external!;
+  if (input.title.length > TASK_DEFAULTS.titleMaxLen || (input.description?.length ?? 0) > TASK_DEFAULTS.descriptionMaxLen || input.priority === 'urgent') {
+    return { output: 'TaskCreate: invalid external task title, description or unchecked urgent priority' };
+  }
+  const store = getToxRuntimeDeps().getStore?.() as TaskStore | null | undefined;
+  let ownedStore: TaskStore | null = null;
+  try {
+    ownedStore = store ? null : new TaskStore();
+    const db = (store ?? ownedStore)!;
+    const surface: TaskSurface = {
+      kind: 'llm-direct',
+      prompt: externalTaskPrompt(external, input.title, input.description ?? '',
+        input.externalSurfaceDefaulted ? undefined : (input.surface as Extract<TaskSurface, { kind: 'llm-direct' }>).prompt),
+    };
+    // Keep lookup and persistence in one transaction; restore the graph if
+    // commit fails, without deleting another request's external identity.
+    let graphBefore: Task | undefined;
+    let changedId: string | undefined;
+    let changedTask: Task | undefined;
+    let result: TaskCreateResult;
+    try {
+      result = db.transaction((): TaskCreateResult => {
+        const existing = db.findTaskByExternalRef(external.provider, external.ref)
+          ?? graph.listAll().find((task) => task.generatedBy?.kind === 'external'
+            && task.generatedBy.provider === external.provider && task.generatedBy.ref === external.ref);
+        if (existing) {
+          const graphPrevious = graph.getTask(existing.id);
+          const current = graphPrevious ?? existing;
+          const content = { title: input.title, description: input.description ?? '', priority: input.priority ?? current.priority, surface };
+          const contentChanged = content.title !== current.title || content.description !== (current.description ?? '')
+            || content.priority !== current.priority || JSON.stringify(content.surface) !== JSON.stringify(current.surface);
+          // Approval covers the content and the rule match at that moment. For work that has not
+          // started, re-decide: an autoRun match now → ready · a person's approval of unchanged
+          // content stands · anything else waits for a person again (🅢 M1).
+          let approvalPatch: Partial<Task> = {};
+          if (current.status === 'backlog' || current.status === 'ready') {
+            const redecided = decideExternalApproval(external);
+            const approval = redecided.state === 'auto' ? redecided
+              : current.approval?.state === 'approved' && !contentChanged ? current.approval
+              : { state: 'pending' as const };
+            approvalPatch = { approval, status: approval.state === 'pending' ? 'backlog' : 'ready' };
+          }
+          // The source link travels with the item: a moved/renamed issue keeps its ref but not its URL.
+          const generatedBy = current.generatedBy?.kind === 'external' && external.url !== undefined && external.url !== current.generatedBy.url
+            ? { ...current.generatedBy, url: external.url } : undefined;
+          const patch: Partial<Task> = { ...content, ...approvalPatch, ...(generatedBy ? { generatedBy } : {}) };
+          const updated = { ...current, ...patch, updatedAt: Date.now() };
+          db.saveTask(updated);
+          graphBefore = graphPrevious;
+          changedId = existing.id;
+          if (graphPrevious) changedTask = graph.updateTask(existing.id, patch);
+          else { graph.addTask(updated); changedTask = updated; }
+          return { output: `TaskCreate: ${updated.id} deduplicated`, taskId: updated.id, task: updated, deduplicated: true };
+        }
+        const approval = decideExternalApproval(external);
+        const task = createTask({
+          title: input.title,
+          description: input.description,
+          surface,
+          priority: input.priority,
+          generatedBy: { kind: 'external', provider: external.provider, ref: external.ref, url: external.url },
+          approval,
+          status: approval.state === 'auto' ? 'ready' : 'backlog',
+        });
+        db.saveTask(task);
+        changedId = task.id;
+        graph.addTask(task);
+        changedTask = task;
+        return { output: `TaskCreate: ${task.id} created`, taskId: task.id, task, deduplicated: false };
+      });
+    } catch (err) {
+      if (changedId && graph.getTask(changedId) !== graphBefore
+        && (!changedTask || graph.getTask(changedId) === changedTask)) graph.restoreTask(changedId, graphBefore);
+      throw err;
+    }
+    debug.log('tox.external', result.deduplicated ? 'deduplicated' : 'created', {
+      provider: external.provider, ref: external.ref, taskId: result.taskId, approval: result.task?.approval,
+      eventId: input.eventId, traceId: input.traceId,
+    });
+    return result;
+  } catch (err) {
+    return { output: `TaskCreate failed: ${err instanceof Error ? err.message : String(err)}` };
+  } finally {
+    ownedStore?.close();
+  }
 }
 
 export function buildTaskCreateTool(): LLMToolSpec {

@@ -68,9 +68,9 @@ beforeEach(() => {
   process.env.HOME = tmpXdg;
   process.env.XDG_CONFIG_HOME = tmpXdg;
   process.env.CODEX_HOME = join(tmpXdg, 'codex-home');
-  spyOn(grokCredential, 'resolveGrokCredential').mockImplementation((opts = {}) => (
+  spyOn(grokCredential, 'resolveGrokCredential').mockImplementation(((opts = {}) => (
     resolveGrokCredential({ ...opts, home: tmpXdg ?? undefined })
-  ));
+  )) as typeof resolveGrokCredential);
   spyOn(grokCredential, 'resolveFreshGrokCredential').mockImplementation((opts = {}) => (
     resolveGrokCredential({ ...opts, home: tmpXdg ?? undefined })
   ));

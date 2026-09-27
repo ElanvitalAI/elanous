@@ -189,6 +189,7 @@ export async function dispatchSelfImplement(
   const ground = typeof args.ground === 'boolean' ? args.ground : undefined;
   const adversarialReview = typeof args.adversarialReview === 'boolean' ? args.adversarialReview : undefined;
   const autoMerge = ctx.autoMerge;
+  const autoReview = autoMerge === true ? true : undefined;
 
   // 막 — ctx 의 서피스 필드(surfaceHitlChannels/surfaceFileSink/emitFeedback)를 SurfaceUx 로.
   const ux = surfaceUxFromDispatchCtx(ctx);
@@ -204,6 +205,7 @@ export async function dispatchSelfImplement(
     entry,
     ground,
     adversarialReview,
+    autoReview,
   });
   const originalUserText = ctx.userText;
   const goalSourceText = originalUserText;
@@ -268,6 +270,7 @@ export async function dispatchSelfImplement(
     progress: ux.progress,
     ...(goalFile ? { goalFile } : {}),
     ...(autoMerge !== undefined ? { autoMerge } : {}),
+    ...(autoReview ? { autoReview } : {}),
   };
   // 승인 통로는 surface seams.approvePr 하나다. opts/pipelineDeps.approver를 보강하면
   // 중앙 심이 seams를 다시 조립해 fail-closed 승인 게이트를 우회할 수 있다.
@@ -283,6 +286,7 @@ export async function dispatchSelfImplement(
       ...(goalFile ? { goalFile } : {}),
       ...(ground !== undefined ? { ground } : {}),
       ...(autoMerge !== undefined ? { autoMerge } : {}),
+      ...(autoReview ? { autoReview } : {}),
       seams,
     })
     : await runSelfImplementViaCli(runCli, feature, cliOpts, { pipelineDeps });

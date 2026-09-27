@@ -172,7 +172,8 @@ import type { RunOutcome, ReworkBudgetVerdict } from './run-outcome.js';
 import type { EscalateTier } from './rework-policy.js';
 import type { ClassifyShadowCallLLM } from './classify-shadow.js';
 import { hasModuleLoadFailure, type GateTestFailure } from './gate-baseline.js';
-import { defaultBranchRef } from './seams.js';
+import { commitWorktree, defaultBranchRef } from './seams.js';
+import { blockedDraftDisposition } from './blocked-draft-policy.js';
 import { formatLlmMergeOutcome } from '../autopilot/build/llm-conflict-merge.js';
 import { FOUND_CITED_PATH_REFUTATION_QUOTE, MISSING_CITED_PATH_REFUTATION_QUOTE, MUST_FIX_REFUTATION_ACKNOWLEDGEMENT_WITH_REASON, REFUTATION_QUOTE_GRAMMAR, observeMustFixCitedPaths, parseMustFixRefutationAcknowledgement, parseMustFixRefutations, renderMustFixCitedPathFacts, snapshotMustFixFindings, stableMustFixId, type ReflectEvidenceFacts, type ReflectGateFacts, type MustFixCitedPathFact, type MustFixFinding, type MustFixRecurrenceHistory, type MustFixRefutation, type MustFixRefutationKind } from './reflect-mustfix.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
@@ -981,6 +982,8 @@ export interface SelfImplementSeams {
   /** PR을 열기 전에 보존할 산출물이 있는지 판별한다. `base` 대비 branch 고유 변경과 미커밋 변경을 함께 본다.
    *  생략 시 기존 주입 seam 호환을 위해 산출물이 있다고 본다. */
   preservationHasChanges?: (ctx: { cwd: string; base?: string }) => boolean | Promise<boolean>;
+  /** Test seam for blocked environment branch persistence; return whether the branch was pushed. */
+  preserveBlockedBranch?: (ctx: { cwd: string; branch: string; title: string }) => boolean | Promise<boolean>;
   /** Hard-cap salvage evidence: a clean worktree and commits ahead of origin/main. */
   readReworkSalvageEvidence?: (cwd: string) => Promise<ReworkSalvageEvidence>;
   /** Starts exactly one detached `elanous dev --file <goal> --base <branch>` follow-up. */
@@ -1999,6 +2002,8 @@ export interface SelfImplementOptions {
    *  outward-facing(main 병합)이라 명시 opt-in 만. mergePr seam 이 있어야 실제 병합(없으면 non-draft PR 까지).
    *  completion이 없던 기존 호출자의 호환 입력으로 유지한다. */
   autoMerge?: boolean;
+  /** Pod-only: stop after passing the same merge guards, leaving the ready PR for host regate. */
+  mergeByHost?: boolean;
   /** ★ G8 자기판단(2026-07-23·[[ROADMAP-elanous-is-all-pty-unified-autonomy-2026-07-21]] §2b) — PR 을 열 때
    *  `auto-review` opt-in 라벨을 붙일지. **2단 게이트**: 이 플래그(사람 옵트인) AND assessAutonomyEligibility
    *  (작업 위험도 자기판단·fail-safe) 통과여야 부착. 부적합(외부배포·실주문·설계분기·파괴·보안·리뷰 must-fix)이면
@@ -2110,6 +2115,8 @@ export interface SelfImplementResult {
   supervisorWantedContinue?: true;
   /** Additive hard-cap disposition; outcome remains the stable public terminal contract. */
   salvage?: 'launched' | 'parked';
+  /** Rework stopped on exclusively baseline/flaky/precondition failures; do not retry this goal against the same base. */
+  terminationReason?: 'blocked-by-baseline';
   sessionId?: string;
   worktreePath?: string;
   branch?: string;
@@ -2148,6 +2155,7 @@ export interface SelfImplementResult {
   mergeReason?: string;
   prUrl?: string;
   prNumber?: number;
+  checkedHeadCommit?: string;
   detail?: string;
 }
 
@@ -3011,11 +3019,11 @@ export function federationObservation(shardIdentity: RunShardIdentity): Record<s
  *   🚨 그것을 `pr-only` 라 부르면 ***「PR 을 연다」로 읽히는데 worktree-only 도 여기 들어온다*** — 이름이 거짓이 된다.
  *   ⇒ 📌 세 번째 값이 필요하면 `completion` 자체를 seam 으로 내려보내야 한다(계약 변경).
  */
-export function completionIntentOf(opts: Pick<SelfImplementOptions, 'completion' | 'autoMerge'>): SelfImplementOptions['completion'] | 'not-auto-merge' {
-  return opts.completion ?? (opts.autoMerge === true ? 'auto-merge' : 'not-auto-merge');
+export function completionIntentOf(opts: Pick<SelfImplementOptions, 'completion' | 'autoMerge' | 'mergeByHost'>): SelfImplementOptions['completion'] | 'not-auto-merge' {
+  return opts.completion ?? (opts.autoMerge === true || opts.mergeByHost === true ? 'auto-merge' : 'not-auto-merge');
 }
 
-function autoMergeEnabled(opts: Pick<SelfImplementOptions, 'completion' | 'autoMerge'>): boolean {
+function autoMergeEnabled(opts: Pick<SelfImplementOptions, 'completion' | 'autoMerge' | 'mergeByHost'>): boolean {
   return completionIntentOf(opts) === 'auto-merge';
 }
 
@@ -5228,30 +5236,76 @@ async function runSelfImplementInner(
       opts.goalFile,
       s.persistPrBodyArtifact,
     );
-    // worktree-only 는 원격이 없어 draft PR 을 열 수 없다. 시도 실패로 사유를 전하지 않고
-    // 같은 본문을 아티팩트로 남긴 뒤 워크트리·브랜치를 보존한다. no-changes 가 먼저다.
-    if (opts.completion === 'worktree-only') {
+    // no-changes wins; worktree-only remains local even for environment stops.
+    const environmentStop = blockedDraftDisposition(classificationRecord.classification) === 'preserve-branch';
+    const worktreeOnly = opts.completion === 'worktree-only';
+    if (worktreeOnly || environmentStop) {
       let artifactPath: string | undefined;
       let artifactError: string | undefined;
       try {
         artifactPath = persistFullPrBody(s.persistPrBodyArtifact, {
-          origin: 'self-implement-blocked-draft-pr-worktree-only',
+          origin: worktreeOnly ? 'self-implement-blocked-draft-pr-worktree-only' : 'self-implement-blocked-draft-pr-environment-stop',
           body: assembled.body,
           originalChars: assembled.originalChars,
         });
       } catch (persistenceError) {
         artifactError = persistenceError instanceof Error ? persistenceError.message : String(persistenceError);
       }
+      let pushed = false;
+      let committed = false;
+      let pushError: Error | undefined;
+      let preservationErrorStep: 'worktree' | 'commit' | 'push' | undefined;
+      if (environmentStop && !worktreeOnly) {
+        try {
+          if (!s.preserveBlockedBranch && !existsSync(wt.path)) {
+            preservationErrorStep = 'worktree';
+            throw new Error(`worktree not found: ${wt.path}`);
+          }
+          if (s.preserveBlockedBranch) {
+            pushed = await s.preserveBlockedBranch({ cwd: wt.path, branch: wt.branch, title: prTitle(opts.feature) });
+            if (!pushed) throw new Error('브랜치 push가 성공하지 않았음');
+          } else {
+            preservationErrorStep = 'commit';
+            const commit = commitWorktree(wt.path, prTitle(opts.feature));
+            if (!commit.ok && !/nothing to commit/.test(commit.out)) throw new Error(commit.out);
+            committed = commit.ok;
+            if (runGitCommand(wt.path, ['remote', 'get-url', 'origin']).status === 0) {
+              preservationErrorStep = 'push';
+              const push = runGitCommand(wt.path, ['push', '-u', 'origin', `HEAD:refs/heads/${wt.branch}`]);
+              if (push.status !== 0) throw new Error(push.stderr || push.stdout);
+              pushed = true;
+            }
+          }
+        } catch (error) {
+          pushError = error instanceof Error ? error : new Error(String(error));
+        }
+      }
       observe('rework-blocked-draft-pr', {
         ...observation,
-        skipped: 'worktree-only',
+        skipped: worktreeOnly ? 'worktree-only' : 'environment-stop',
+        ...(!worktreeOnly && environmentStop ? { pushed, committed } : {}),
         worktreePath: wt.path,
+        ...(pushError ? { pushError: pushError.message, preservationErrorStep: preservationErrorStep ?? 'push' } : {}),
         ...(artifactPath ? { prBodyArtifactPath: artifactPath } : {}),
         ...(artifactError ? { prBodyArtifactError: artifactError } : {}),
-      });
-      progress(stage, artifactPath
-        ? `worktree-only 완료: draft PR을 열지 않음(worktree·branch 보존 · 중단 사유 보존: ${artifactPath} · worktree: ${wt.path} · branch: ${wt.branch})`
-        : `worktree-only 완료: draft PR을 열지 않음(worktree·branch 보존 · 중단 사유 보존 실패: ${artifactError ?? 'unknown error'} · worktree: ${wt.path} · branch: ${wt.branch})`);
+      }, pushError ? { level: 'warn' } : undefined);
+      if (pushError) {
+        const failure = preservationErrorStep === 'worktree' ? '워크트리 부재로 보존 실패' : preservationErrorStep === 'commit' ? '로컬 브랜치 커밋 실패' : '원격 브랜치 보존 실패';
+        progress('aborted', `환경 탓 중단 — ${failure}: ${wt.branch} (${pushError.message}; worktree: ${wt.path})`);
+        if (preservationErrorStep === 'worktree') return undefined;
+        throw new Error(`환경 탓 중단 — ${failure}: ${wt.branch} (worktree: ${wt.path})`, { cause: pushError });
+      }
+      if (worktreeOnly) {
+        progress(stage, artifactPath
+          ? `worktree-only 완료: draft PR을 열지 않음(worktree·branch 보존 · 중단 사유 보존: ${artifactPath} · worktree: ${wt.path} · branch: ${wt.branch})`
+          : `worktree-only 완료: draft PR을 열지 않음(worktree·branch 보존 · 중단 사유 보존 실패: ${artifactError ?? 'unknown error'} · worktree: ${wt.path} · branch: ${wt.branch})`);
+      } else {
+        // No draft PR on this path, so the stop reason must be findable from the progress line itself.
+        const reasonNote = artifactPath ? `중단 사유 보존: ${artifactPath}` : `중단 사유 보존 실패: ${artifactError ?? 'unknown error'}`;
+        progress(stage, pushed
+          ? `환경 탓 중단 — draft PR 없이 브랜치만 보존: ${wt.branch} · ${reasonNote}`
+          : `환경 탓 중단 — draft PR 없이 로컬 브랜치만 보존(원격 origin 없음): ${wt.branch} · worktree: ${wt.path} · ${reasonNote}`);
+      }
       return undefined;
     }
     progress('pr-opening', '중단 산출물을 draft PR로 보존…');
@@ -5397,6 +5451,23 @@ async function runSelfImplementInner(
     });
     await flushPrComments(pr);
     return { decision, pr };
+  };
+  const baselineOnlyGate = (): boolean => {
+    const failures = gate?.baselineFailures;
+    return gate?.passed === false && !!failures?.length && gate.reflectGateFacts?.introduced === 0
+      && gate.reflectGateFacts.unknown === 0
+      && failures.every(({ attribution }) => attribution === 'preexisting' || attribution === 'flaky-timeout'
+        || attribution === 'flaky-rerun' || attribution === 'precondition-unmet');
+  };
+  const noRetryBaseline = (): { terminationReason?: 'blocked-by-baseline' } => {
+    if (!baselineOnlyGate()) return {};
+    const failures = gate!.baselineFailures!;
+    debug.log('self-implement.supervisor', 'no-retry-baseline', {
+      runId,
+      preexisting: failures.filter(({ attribution }) => attribution === 'preexisting').length,
+      flaky: failures.filter(({ attribution }) => attribution === 'flaky-timeout' || attribution === 'flaky-rerun').length,
+    });
+    return { terminationReason: 'blocked-by-baseline' };
   };
   const salvageHardCap = async (hardCapBlockedExtend: boolean, pr?: { number: number }): Promise<'launched' | 'parked'> => {
     let evidence: ReworkSalvageEvidence | undefined;
@@ -5783,9 +5854,11 @@ async function runSelfImplementInner(
               const quotaExhaustionAssessment = quotaExhaustionAssessmentForRun();
               return { ok: false, stage: 'review-blocked', node: 'rework', ...terminal, ...supervisorOutcome, sessionId, worktreePath: wt.path, branch: wt.branch, gate, review, quotaExhaustionAssessment, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: `rework judged unconvergeable after ${round} rework round(s): ${parsedDecision.reason}` };
             }
-            const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', verdict: parsedDecision.verdict, reason: parsedDecision.reason, gate, decomposition: terminalDecomposition, salvageStatusExpected: false });
+            const baselineStop = noRetryBaseline();
+            const reason = baselineStop.terminationReason ?? parsedDecision.reason;
+            const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', verdict: parsedDecision.verdict, reason, gate, decomposition: terminalDecomposition, salvageStatusExpected: false });
             const quotaExhaustionAssessment = quotaExhaustionAssessmentForRun();
-            return { ok: false, stage: 'gate-failed', node: 'rework', ...terminal, ...supervisorOutcome, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: `rework judged unconvergeable after ${round} rework round(s): ${parsedDecision.reason}` };
+            return { ok: false, stage: 'gate-failed', node: 'rework', ...terminal, ...supervisorOutcome, ...baselineStop, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment, ...(lastSupervisorReason ? { supervisorReason: lastSupervisorReason } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: baselineStop.terminationReason ?? `rework judged unconvergeable after ${round} rework round(s): ${parsedDecision.reason}` };
           }
         } else {
           const repeatedBlockingIds = repeatedBlockingFindingIds(currentBlockingFindings, previousBlockingFindings);
@@ -5809,8 +5882,9 @@ async function runSelfImplementInner(
           const pr = await preserveBlockedArtifacts({ stage: 'review-blocked', verdict: lastReworkVerdict, reason, gate, salvageStatusExpected: false });
           return { ok: false, stage: 'review-blocked', node: 'rework', ...terminal, sessionId, worktreePath: wt.path, branch: wt.branch, gate, review, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(lastSupervisorVerdict === 'CONTRACT-CONFLICT' ? { supervisorVerdict: lastSupervisorVerdict } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
         }
-        const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', verdict: lastReworkVerdict, reason, gate, salvageStatusExpected: false });
-        return { ok: false, stage: 'gate-failed', node: 'rework', ...terminal, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(lastSupervisorVerdict === 'CONTRACT-CONFLICT' ? { supervisorVerdict: lastSupervisorVerdict } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
+        const baselineStop = noRetryBaseline();
+        const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', verdict: lastReworkVerdict, reason: baselineStop.terminationReason ?? reason, gate, salvageStatusExpected: false });
+        return { ok: false, stage: 'gate-failed', node: 'rework', ...terminal, ...baselineStop, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(lastSupervisorVerdict === 'CONTRACT-CONFLICT' ? { supervisorVerdict: lastSupervisorVerdict } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: baselineStop.terminationReason ?? reason };
       }
       const terminal = resolveRunOutcome({ termination: 'budget-exhausted', ...(lastReworkVerdict ? { lastVerdict: lastReworkVerdict } : {}) });
       // ⛔⭐ **보존(=커밋·push) 뒤에 발사한다.** 종전엔 발사가 먼저라, 인수 자식이 `--base <그 브랜치>`
@@ -5849,10 +5923,11 @@ async function runSelfImplementInner(
         const disposition = { ...terminal, ...(salvage ? { salvage } : {}) };
         return { ok: false, stage: 'review-blocked', node: 'rework', ...disposition, sessionId, worktreePath: wt.path, branch: wt.branch, gate, review, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(lastSupervisorVerdict === 'CONTRACT-CONFLICT' ? { supervisorVerdict: lastSupervisorVerdict } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
       }
-      const reason = `gate failed after ${round - 1} rework round(s)`;
-      const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate, salvageStatusExpected: true });
-      const salvage = await salvageHardCap(canSalvage, pr);
-      const disposition = { ...terminal, ...(salvage ? { salvage } : {}) };
+      const baselineStop = noRetryBaseline();
+      const reason = baselineStop.terminationReason ?? `gate failed after ${round - 1} rework round(s)`;
+      const pr = await preserveBlockedArtifacts({ stage: 'gate-failed', reason, gate, salvageStatusExpected: !baselineStop.terminationReason });
+      const salvage = baselineStop.terminationReason ? 'parked' : await salvageHardCap(canSalvage, pr);
+      const disposition = { ...terminal, ...(salvage ? { salvage } : {}), ...baselineStop };
       return { ok: false, stage: 'gate-failed', node: 'rework', ...disposition, sessionId, worktreePath: wt.path, branch: wt.branch, gate, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(lastSupervisorVerdict === 'CONTRACT-CONFLICT' ? { supervisorVerdict: lastSupervisorVerdict } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: reason };
     }
 
@@ -6897,7 +6972,7 @@ async function runSelfImplementInner(
   });
   await flushPrComments(pr);
 
-  if (canAuto && s.mergePr) {
+  if (canAuto && (s.mergePr || opts.mergeByHost)) {
     let docsMarkdownDeletions: number | undefined;
     let nonDocsMarkdownDeletions: number | undefined;
     let checkedHeadCommit: string | undefined;
@@ -6927,6 +7002,7 @@ async function runSelfImplementInner(
         guardFailure = `${checkedHeadCommit === undefined ? 'readPrCommitShas' : 'readPrDiff'} failed: ${error instanceof Error ? error.message : String(error)}`;
       }
     }
+    if (opts.mergeByHost && checkedHeadCommit && !/^[0-9a-f]{40}$/i.test(checkedHeadCommit)) guardFailure = 'checked head SHA is not a full commit hash';
     const blocked = guardFailure !== undefined || docsMarkdownDeletions! >= DOCS_MARKDOWN_AUTO_MERGE_DELETION_THRESHOLD;
     observe('auto-merge-docs-deletion-guard', {
       number: pr.number, threshold: DOCS_MARKDOWN_AUTO_MERGE_DELETION_THRESHOLD, blocked,
@@ -6945,9 +7021,14 @@ async function runSelfImplementInner(
       const guardSkipReason = mergeSkipReason ?? (guardFailure ? 'merge-guard-unevaluated' : 'docs-deletion-threshold');
       return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason: guardSkipReason, prUrl: pr.url, prNumber: pr.number, detail };
     }
+    if (opts.mergeByHost) {
+      observe('merge-ready', { number: pr.number, checkedHeadCommit });
+      progress('pr-opened', `호스트 재게이트 대기 (#${pr.number})`);
+      return { ok: true, stage: 'merge-ready', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), checkedHeadCommit: checkedHeadCommit!, prUrl: pr.url, prNumber: pr.number };
+    }
     onNodeEntry('merge', round);
     progress('merging', '자동 병합 (리뷰 clean·squash)…');
-    const m = await withStepTimeout(s.mergePr({ number: pr.number, cwd: wt.path, matchHeadCommit: checkedHeadCommit! }), T.pr, 'pr');
+    const m = await withStepTimeout(s.mergePr!({ number: pr.number, cwd: wt.path, matchHeadCommit: checkedHeadCommit! }), T.pr, 'pr');
     observe('merged', { number: pr.number, merged: m.merged, detail: m.detail ?? null });
     if (m.merged) {
       const directory = releaseNotesDir(elanousStateRoot());

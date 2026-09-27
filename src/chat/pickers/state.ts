@@ -629,10 +629,12 @@ export function createPickerState(deps: PickerDeps): PickerState {
 
     if (key.name === 'up' || (key.ctrl && key.name === 'p')) {
       cmdPickerIdx = (cmdPickerIdx - 1 + currentArgItems.length) % currentArgItems.length;
+      pickerNavigated = true;
       return { consumed: true, action: null };
     }
     if (key.name === 'down' || (key.ctrl && key.name === 'n')) {
       cmdPickerIdx = (cmdPickerIdx + 1) % currentArgItems.length;
+      pickerNavigated = true;
       return { consumed: true, action: null };
     }
     if (key.name === 'tab') {
@@ -660,7 +662,7 @@ export function createPickerState(deps: PickerDeps): PickerState {
       const ctx = parseArgContext(buf, deps.commands);
       const selected = currentArgItems[cmdPickerIdx];
       let submitText = buf.lines[0] ?? '';
-      if (ctx && ctx.currentArg === '' && selected) {
+      if (ctx && ctx.currentArg === '' && selected && pickerNavigated) {
         submitText = submitText.slice(0, ctx.currentArgStart) + selected.value;
       }
       return {
@@ -707,32 +709,13 @@ export function createPickerState(deps: PickerDeps): PickerState {
     }
     if (key.name === 'enter' && !key.shift) {
       const selected = filtered[cmdPickerIdx];
-      const typed = (buf.lines[0] ?? '').slice(1).toLowerCase();
-      const exactMatch = selected
-        ? typed === selected.name || (selected.aliases?.includes(typed) ?? false)
-        : false;
-      if (selected && (pickerNavigated || exactMatch)) {
-        return {
-          consumed: true,
-          action: { kind: 'submit', text: '/' + selected.name },
-        };
-      }
-      // Autofill-only: rewrite the line to the full name, stay open.
-      if (selected) {
-        const newLine0 = '/' + selected.name;
-        return {
-          consumed: true,
-          action: {
-            kind: 'splice',
-            lineIdx: 0,
-            start: 0,
-            end: (buf.lines[0] ?? '').length,
-            text: newLine0,
-            newColIdx: newLine0.length,
-          },
-        };
-      }
-      return { consumed: true, action: null };
+      return {
+        consumed: true,
+        action: {
+          kind: 'submit',
+          text: pickerNavigated && selected ? '/' + selected.name : (buf.lines[0] ?? ''),
+        },
+      };
     }
     return { consumed: false };
   };

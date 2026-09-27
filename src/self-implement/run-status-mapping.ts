@@ -12,6 +12,7 @@ export interface MappedRunOutcome {
 export type SelfImplementStage =
   | 'merged'
   | 'pr-opened'
+  | 'merge-ready'
   | 'worktree-completed'
   | 'gate-failed'
   | 'review-blocked'
@@ -24,6 +25,7 @@ export type SelfImplementStage =
 const STAGE_OUTCOMES = {
   merged: { runStatus: 'completed' },
   'pr-opened': { runStatus: 'completed' },
+  'merge-ready': { runStatus: 'completed' },
   'worktree-completed': { runStatus: 'completed' },
   'gate-failed': { runStatus: 'failed', failureKind: 'gate' },
   'review-blocked': { runStatus: 'failed', failureKind: 'review' },

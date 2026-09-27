@@ -39,6 +39,7 @@ import {
 import { createXtermResizeController } from '@/lib/xterm-resize-controller';
 import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
 import { createTerminalInputSender } from './terminal-input-sender';
+import { registerTerminalInput } from './terminal-input-registry';
 import { shouldClear } from './terminal-clear';
 
 interface Props {
@@ -281,6 +282,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       },
     });
     confirmInputSession = inputSender.confirmSession;
+    const unregisterInput = readOnly ? null : registerTerminalInput(terminalId, inputSender.push);
 
     // WT-A-2a — keyboard input writeback. xterm.js `onData` emits the
     // standard terminal byte sequence for every key (modifyOtherKeys
@@ -362,6 +364,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
         debugLog('webterm.xterm.snapshot.error', { reason: String(e) });
       }
       try { resizeController.dispose(); } catch { /* swallow */ }
+      unregisterInput?.();
       inputSender.dispose();
       offUpdate();
       offState();

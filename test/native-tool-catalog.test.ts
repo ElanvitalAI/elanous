@@ -293,7 +293,7 @@ describe('nativeToolCatalog — metadata invariants', () => {
     );
   });
 
-  test('keeps the 200-entry catalog on the five-host vocabulary', () => {
+  test('keeps the 200-entry catalog on the five-host vocabulary after six virtual-window tools retire', () => {
     const distribution = new Map<string, number>();
     for (const { host } of nativeToolCatalog) {
       const key = host.join(',');
@@ -303,13 +303,13 @@ describe('nativeToolCatalog — metadata invariants', () => {
 
     expect(nativeToolCatalog).toHaveLength(200);
     expect([...distribution.entries()].sort()).toEqual([
-      ['mcp', 10],
+      ['mcp', 16],
       ['skill', 48],
-      ['skill,tui', 94],
+      ['skill,tui', 90],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).
       //   ⛔ #16003 이 SelfImplement 만 열고 이 짝을 안 열어서 챗 자식은 물을 도구가 없었다.
       ['skill,tui,chat', 1],
-      ['skill,tui,mcp', 40],
+      ['skill,tui,mcp', 38],
       // 🆕 SelfImplement — 챗에서도 부를 수 있다(2026-09-07 · 대표).
       //   ⭐ 이 툴은 «헤드리스 자식»을 띄우므로 ***부르는 쪽에 PTY 가 필요 없다.***
       ['skill,tui,mcp,chat', 1],

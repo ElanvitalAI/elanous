@@ -1,0 +1,16 @@
+{
+  "name": "elanous",
+  "version": "0.1.0",
+  "description": "Hand work to elanous from Claude Code, Codex or Grok — queues an approval-gated task in the local elanous daemon through its MCP server.",
+  "author": {
+    "name": "ElanvitalAI"
+  },
+  "homepage": "https://github.com/ElanvitalAI/elanous",
+  "license": "Apache-2.0",
+  "keywords": [
+    "elanous",
+    "tasks",
+    "mcp",
+    "handoff"
+  ]
+}

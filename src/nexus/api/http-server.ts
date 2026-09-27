@@ -189,7 +189,8 @@ import { handleTemplatesList, handleTemplateGet, handleTemplateSave } from './te
 import { handleMcpHttpPost } from './mcp-http.js';
 import { handleMcpResourceGet, MCP_RESOURCE_ROUTE_PATH } from './mcp-resource-route.js';
 // ⛔ 라우트 상수를 «디스패처»가 안 쓰고 문자열로 베끼고 있었다(16차 실측) — 잎에서 읽는다.
-import { IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
+import { APPROVALS_MERGES_PATH, IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
+import { handleMergeApprovals } from './merge-approvals.js';
 import { handleMcpWidgetCall, MCP_WIDGET_CALL_ROUTE_PATH, persistWidgetTurnToSessionStore } from './mcp-widget-call-route.js';
 import type { McpClientsHandle } from '../boot/register-mcp-clients.js';
 import { handleTabLogs } from './logs.js';
@@ -301,6 +302,8 @@ import {
   handleTasksList,
   handleTaskDetail,
 } from './tasks-scheduler.js';
+import { handleTaskCreatePost, handleTaskApprovePost } from './tasks-create.js';
+import { matchIngestAuthorization } from './ingest-token.js';
 import {
   handleWorkflowApprovalApprove,
   handleWorkflowApprovalReject,
@@ -813,8 +816,14 @@ async function routeRequest(
     && !isPublicRoute(method, pathname, { setupMode: false })
   ) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) {
-      debug.log('nexus.auth', 'default-deny', { method, pathname });
-      return jsonResponse({ error: 'unauthorized' }, 401);
+      const name = method === 'POST' && pathname === '/v1/tasks' && opts.metaApi
+        ? matchIngestAuthorization(req)?.name
+        : undefined;
+      if (name === undefined) {
+        debug.log('nexus.auth', 'default-deny', { method, pathname });
+        return jsonResponse({ error: 'unauthorized' }, 401);
+      }
+      debug.log('nexus.auth', 'ingest-token', { name, pathname });
     }
   }
 
@@ -860,6 +869,12 @@ async function routeRequest(
       const { handleDistIpa } = await import('./dist.js');
       return handleDistIpa(req, filename);
     }
+  }
+
+  if (pathname === APPROVALS_MERGES_PATH || pathname.startsWith(`${APPROVALS_MERGES_PATH}/`)) {
+    return handleMergeApprovals(req, {
+      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+    });
   }
 
   if (pathname === MCP_RESOURCE_ROUTE_PATH && method === 'GET') {
@@ -1111,6 +1126,20 @@ async function routeRequest(
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
   if (method !== 'GET') {
+    if (method === 'POST' && pathname === '/v1/tasks') {
+      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+      return handleTaskCreatePost(req, opts.metaApi);
+    }
+    if (method === 'POST' && pathname.startsWith('/v1/tasks/') && pathname.endsWith('/approve')) {
+      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+      let taskId: string;
+      try { taskId = decodeURIComponent(pathname.slice('/v1/tasks/'.length, -'/approve'.length)); }
+      catch { return jsonResponse({ error: 'bad_request', reason: 'invalid taskId' }, 400); }
+      if (!taskId || taskId.includes('/') || taskId.includes('\\') || taskId.includes('..')) {
+        return jsonResponse({ error: 'bad_request', reason: 'invalid taskId' }, 400);
+      }
+      return handleTaskApprovePost(req, taskId, opts.metaApi);
+    }
     // Pod grok access 재발급. 넥서스 bearer 가 아니라 llm-credential 토큰을 본문 파싱 전에 검증한다.
     if (pathname === POD_CREDENTIAL_GROK_PATH && method === 'POST') {
       const gate = await authenticatePodCredential(req);

@@ -74,6 +74,8 @@ export interface LauncherDeps {
   launch: (task: LaunchCandidate, slot: ResolvedSlot) => Promise<void> | void;
   /** Surface concurrency check — return false to skip the task. */
   concurrencyOK?: (surface: string | undefined) => boolean;
+  /** Admission check before taking a resource reservation or launching. */
+  admit?: (task: LaunchCandidate) => Promise<string | undefined> | string | undefined;
   /** D8.2 (FU8 PR #1) — observer hook fired once per evaluated task.
    *  Production wiring (NEXUS daemon) injects
    *  `createDispatchOutcomeRecorder()` so each decision flows into the
@@ -88,6 +90,8 @@ export interface LauncherDeps {
   perTickCap?: number;
   /** Tick interval (ms). Default 1000. */
   intervalMs?: number;
+  /** Optional caller-owned interval observer; defaults to tick(). */
+  onTick?: () => Promise<unknown>;
 }
 
 export interface OpportunisticLauncherOptions extends LauncherDeps {}
@@ -107,7 +111,7 @@ export class OpportunisticLauncher {
     if (this.timer) return;
     const interval = this.deps.intervalMs ?? 1000;
     this.timer = setInterval(() => {
-      void this.tick();
+      void (this.deps.onTick ? this.deps.onTick() : this.tick());
     }, interval);
   }
 
@@ -162,6 +166,25 @@ export class OpportunisticLauncher {
       const outcome: LaunchOutcome = { ok: false, taskId: task.id, reason: 'concurrency-cap' };
       this.recordOutcome(task, slot, outcome, 'rejected');
       return outcome;
+    }
+
+    // Admission (budget and other caller-owned gates).
+    if (this.deps.admit) {
+      try {
+        const reason = await this.deps.admit(task);
+        if (reason) {
+          const outcome: LaunchOutcome = { ok: false, taskId: task.id, reason };
+          this.recordOutcome(task, slot, outcome, 'rejected');
+          return outcome;
+        }
+      } catch (err) {
+        const outcome: LaunchOutcome = {
+          ok: false, taskId: task.id,
+          reason: `admission-error:${err instanceof Error ? err.message : String(err)}`,
+        };
+        this.recordOutcome(task, slot, outcome, 'errored');
+        return outcome;
+      }
     }
 
     // Resource

@@ -4,12 +4,15 @@
 // runPwaStop, mountTailscaleServe). These tests inject those as
 // seam fns so we don't actually spawn daemons or shell out.
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
 import { requestCoordinatorPort, runPwaTest, type PwaTestOpts } from '../src/cli/pwa-test';
+import { resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir';
+import { setTestStateRoot } from '../src/nexus/paths';
+import { PORT_LEASE_TTL_MS } from '../src/control-plane/port-lease-heartbeat';
 import type { PwaStartOpts } from '../src/cli/pwa-start';
 
 interface CapturedOut {
@@ -53,6 +56,8 @@ afterEach(() => {
   if (baseSeams.leaseDir) try { rmSync(baseSeams.leaseDir, { recursive: true, force: true }); } catch { /* swallow */ }
   // Restore env we may have polluted.
   delete process.env.ELANOUS_NEXUS_DIR;
+  setTestStateRoot(null);
+  resetElanousConfigDir();
 });
 
 // 🔐 임대 파일은 시험마다 새 폴더에 — 실제 OS 임시 폴더(진짜 격리 데몬의 임대)와 섞이지 않고, 시험끼리 대역을 나눠 먹지 않게.
@@ -125,6 +130,159 @@ describe('runPwaTest — tool cwd forwarding', () => {
 
 const inTestBand = (port: number | undefined): boolean => port !== undefined && port >= 31450 && port <= 31499;
 const PRODUCTION_PORTS = [31413, 31415, 31420, 31421, 31422, 31423, 31424];
+
+describe('coordinator lease primary wiring', () => {
+  const member = 'a'.repeat(64);
+  const localMember = 'b'.repeat(64);
+  const joinFile = (value: unknown) => {
+    mkdirSync(joinPath(repoRoot, 'control'), { recursive: true });
+    writeFileSync(joinPath(repoRoot, 'control', 'join.json'), JSON.stringify(value), { mode: 0o600 });
+  };
+  const localTokens = () => {
+    mkdirSync(joinPath(repoRoot, 'control'), { recursive: true });
+    writeFileSync(joinPath(repoRoot, 'control', 'tokens.json'), JSON.stringify({ member: localMember }));
+  };
+  const useRoot = () => setElanousConfigDir(repoRoot);
+  const capture = () => {
+    const calls: { url: string; method: string; headers: Headers; body?: unknown }[] = [];
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (input: URL | RequestInfo, init?: RequestInit) => {
+      calls.push({ url: String(input), method: init?.method ?? 'GET', headers: new Headers(init?.headers),
+        ...(init?.body ? { body: JSON.parse(String(init.body)) as unknown } : {}) });
+      return init?.method === 'POST'
+        ? Response.json({ port: 31450, lease: { attrs: { leaseId: 'joined-lease' } } })
+        : new Response(null, { status: 204 });
+    }) as typeof fetch);
+    return { calls, fetchSpy };
+  };
+
+  test('joined member credential and machine route request and startup-failure release to the joined primary', async () => {
+    joinFile({ url: 'https://primary.example:31413/', machine: 'joined-machine', token: member });
+    localTokens();
+    useRoot();
+    const { calls, fetchSpy } = capture();
+    let started: PwaStartOpts | undefined;
+    try {
+      const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+        leasePortFn: undefined,
+        pwaStartFn: async opts => { started = opts; return { exitCode: 1 }; },
+      });
+      expect(r.exitCode).toBe(1);
+      expect(started?.coordinatorLeaseToken).toBe(member);
+      expect(started?.coordinatorLeaseId).toBe('joined-lease');
+      expect(calls.map(({ url, method, headers }) => [url, method, headers.get('authorization')])).toEqual([
+        ['https://primary.example:31413/v1/leases/port', 'POST', `Bearer ${member}`],
+        ['https://primary.example:31413/v1/leases/port/31450', 'DELETE', `Bearer ${member}`],
+      ]);
+      expect(calls[0]?.body).toEqual({ machine: 'joined-machine', purpose: 'nexus-test', ttlMs: PORT_LEASE_TTL_MS, excluded: [] });
+      expect(calls[1]?.headers.get('x-port-lease-id')).toBe('joined-lease');
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  test('configured primary overrides a different join URL without sending its machine or token', async () => {
+    joinFile({ url: 'https://joined.example/', machine: 'joined-machine', token: member });
+    useRoot();
+    const configuredToken = 'c'.repeat(64);
+    const { calls, fetchSpy } = capture();
+    try {
+      const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+        leasePortFn: undefined,
+        coordinatorPrimary: { url: 'https://configured.example/', tokens: { member: configuredToken } },
+        pwaStartFn: async opts => {
+          expect(opts.coordinatorLeaseToken).toBe(configuredToken);
+          return { exitCode: 1 };
+        },
+      });
+      expect(r.exitCode).toBe(1);
+      expect(calls.map(call => [call.url, call.method, call.headers.get('authorization')])).toEqual([
+        ['https://configured.example/v1/leases/port', 'POST', `Bearer ${configuredToken}`],
+        ['https://configured.example/v1/leases/port/31450', 'DELETE', `Bearer ${configuredToken}`],
+      ]);
+      expect(calls[0]?.body).toEqual({ machine: process.env.HOSTNAME || 'local', purpose: 'nexus-test', ttlMs: PORT_LEASE_TTL_MS, excluded: [] });
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  test('lease release keeps the selected primary even if the join changes after the request', async () => {
+    joinFile({ url: 'https://joined.example/', machine: 'joined-machine', token: member });
+    useRoot();
+    const { calls, fetchSpy } = capture();
+    try {
+      const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+        leasePortFn: undefined,
+        pwaStartFn: async () => {
+          joinFile({ url: 'https://other.example/', machine: 'other-machine', token: 'd'.repeat(64) });
+          return { exitCode: 1 };
+        },
+      });
+      expect(r.exitCode).toBe(1);
+      expect(calls.map(call => [call.url, call.headers.get('authorization')])).toEqual([
+        ['https://joined.example/v1/leases/port', `Bearer ${member}`],
+        ['https://joined.example/v1/leases/port/31450', `Bearer ${member}`],
+      ]);
+      expect(calls[0]?.body).toMatchObject({ machine: 'joined-machine' });
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  test('configured URL without member credential does not send the joined token', async () => {
+    joinFile({ url: 'https://joined.example/', machine: 'joined-machine', token: member });
+    useRoot();
+    const { calls, fetchSpy } = capture();
+    try {
+      const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+        leasePortFn: undefined, coordinatorPrimary: { url: 'https://configured.example/' },
+      });
+      expect(r.exitCode).toBe(0);
+      expect(calls).toEqual([]);
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  test('occupied central lease is released to joined primary before retrying with exclusion', async () => {
+    joinFile({ url: 'https://primary.example/', machine: 'joined-machine', token: member });
+    useRoot();
+    const { calls, fetchSpy } = capture();
+    try {
+      const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+        leasePortFn: undefined, portInUseFn: port => port === 31450,
+      });
+      expect(r.exitCode).toBe(0);
+      expect(calls.map(call => `${call.method} ${call.url}`)).toEqual([
+        'POST https://primary.example/v1/leases/port',
+        'DELETE https://primary.example/v1/leases/port/31450',
+        'POST https://primary.example/v1/leases/port',
+      ]);
+      expect(calls[2]?.body).toMatchObject({ machine: 'joined-machine', excluded: [31450] });
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  test('join without member scope does not send local member credentials to the joined address', async () => {
+    joinFile({ url: 'https://primary.example/', tokens: { query: member } });
+    localTokens();
+    useRoot();
+    const { calls, fetchSpy } = capture();
+    try {
+      const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams, leasePortFn: undefined });
+      expect(r.exitCode).toBe(0);
+      expect(r.picked?.nexusPort).toBe(31450);
+      expect(calls).toEqual([]);
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  test('without join or config uses the local primary and existing hostname fallback for request and release', async () => {
+    localTokens();
+    useRoot();
+    const { calls, fetchSpy } = capture();
+    try {
+      const r = await runPwaTest({ repoRoot, out: makeOut(), ...baseSeams,
+        leasePortFn: undefined, pwaStartFn: async () => ({ exitCode: 1 }),
+      });
+      expect(r.exitCode).toBe(1);
+      expect(calls.map(call => `${call.method} ${call.url} ${call.headers.get('authorization')}`)).toEqual([
+        `POST http://127.0.0.1:31413/v1/leases/port Bearer ${localMember}`,
+        `DELETE http://127.0.0.1:31413/v1/leases/port/31450 Bearer ${localMember}`,
+      ]);
+      expect(calls[0]?.body).toMatchObject({ machine: process.env.HOSTNAME || 'local' });
+    } finally { fetchSpy.mockRestore(); }
+  });
+});
 
 describe('coordinator lease response', () => {
   test('409 no-port falls through to the local test-band lease', async () => {

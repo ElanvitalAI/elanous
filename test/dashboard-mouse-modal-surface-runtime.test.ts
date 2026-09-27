@@ -3,21 +3,6 @@ import { describe, expect, mock, test } from 'bun:test';
 import { createMouseModalSurfaceRuntime } from '../src/dashboard/input/mouse-modal-surface-runtime.js';
 
 describe('createMouseModalSurfaceRuntime', () => {
-  test('delegates window pill clicks to the picker opener', () => {
-    const openWindowPicker = mock(() => {});
-    const runtime = createMouseModalSurfaceRuntime({
-      openWindowPicker,
-      getFocusStack: () => [],
-      surfaceAt: () => null,
-      getTopBlockingModalSurface: () => null,
-      routeModalMouse: () => false,
-    });
-
-    runtime.onWindowPillClick?.();
-
-    expect(openWindowPicker).toHaveBeenCalled();
-  });
-
   test('resolves top modal from focus stack and forwards modal mouse routing', () => {
     const modal = {
       id: 'm1',
@@ -28,7 +13,6 @@ describe('createMouseModalSurfaceRuntime', () => {
     } as never;
     const routeModalMouse = mock((_surface: unknown, _ev: unknown) => true);
     const runtime = createMouseModalSurfaceRuntime({
-      openWindowPicker: () => {},
       getFocusStack: () => ['pane-1', 'm1'],
       surfaceAt: (id) => (id === 'm1' ? modal : null),
       getTopBlockingModalSurface: () => modal,

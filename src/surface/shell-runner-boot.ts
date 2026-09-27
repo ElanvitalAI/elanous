@@ -1,20 +1,5 @@
 import type { PaneContent } from '../virtual-windows/pane-content.js';
 import type { ExternalTerminalPaneOpts } from '../shell-runner/external-terminal-pane.js';
-import { getUserConfig } from '../user-config.js';
-import { resolveDashboardUiMode } from '../views/ui-mode.js';
-
-/** essential UI 모드 = 헤드리스: RunShell 이 VW 페인을 안 그리고 PtyCaptureEngine
- *  캡처로만 LLM 에 출력 반환(RFC §5 · P1). per-spawn 판정이라 /ui 런타임 토글도
- *  반영. --rich CLI override 는 config-level read 라 안 보이지만, 그 경우에도
- *  캡처는 동작(페인만 없음·graceful degrade). */
-function isHeadlessSurface(): boolean {
-  const uc = getUserConfig();
-  return resolveDashboardUiMode({
-    configUiMode: uc.dashboard?.uiMode,
-    legacyDefaultMode: uc.dashboard?.defaultMode,
-  }) === 'essential';
-}
-
 interface ShellRegistryLike<Handle> {}
 
 interface BackgroundSurfaceLike<Handle> {
@@ -64,7 +49,6 @@ export interface DashboardShellRunnerBootDeps<Request, Handle, Host> {
   termSize: () => { cols: number; rows: number };
   setLatestShellRollup: (rollup: { running: number; backgrounded: number }) => void;
   onSpawnError: (label: string, err: unknown) => void;
-  spawnVirtualWindowTerminal: (label: string, host: Host) => void;
   subscribeVirtualWindowClose: (cb: (ev: { type: string; spawnTitle?: string | null }) => void) => void;
 }
 
@@ -104,18 +88,7 @@ export function bootDashboardShellRunner<Request, Handle, Host>(
     getSessionCwd: deps.getSessionCwd,
     initialSize: deps.termSize,
     onSpawnError: deps.onSpawnError,
-    onSpawn: (label, host) => {
-      // P1 (RFC §5) — essential 서피스는 헤드리스: VW 페인 planting 을 아예
-      // 건너뛴다. PtyCaptureEngine 이 host 로 명령을 돌려 출력을 캡처하므로
-      // RunShell 은 페인 없이도 LLM 에 결과를 반환한다(codex unified_exec 패리티).
-      if (isHeadlessSurface()) return;
-      try {
-        deps.spawnVirtualWindowTerminal(label, host);
-      } catch {
-        // VW subsystem may not be ready yet. Keep PTY host alive and
-        // let the caller fall back to non-visible capture mode.
-      }
-    },
+    onSpawn: () => {},
   });
   deps.setShellRunnerDeps({
     registry,

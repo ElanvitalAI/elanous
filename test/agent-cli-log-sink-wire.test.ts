@@ -66,7 +66,7 @@ describe('agent CLI log sink initializer', () => {
 // process + an LLM call, which does not belong in the unit suite.
 describe('elanous agent action wires the log sink initializer', () => {
   const HERE = dirname(fileURLToPath(import.meta.url));
-  const SOURCE = readFileSync(resolve(HERE, '..', 'src', 'index.ts'), 'utf8');
+  const SOURCE = readFileSync(resolve(HERE, '..', 'src', 'cli', 'agent-cli.ts'), 'utf8');
 
   test('the `agent <text...>` action calls initializeAgentCliLogSink before runChatTurnCli', () => {
     const agentAction = SOURCE.match(

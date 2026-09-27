@@ -144,6 +144,7 @@ describe('dispatchSelfImplement — result addressability', () => {
       undefined,
       async (_feature, opts) => {
         expect(opts.autoMerge).toBeUndefined();
+        expect(opts.autoReview).toBeUndefined();
         return { ok: true, kind: 'self', exitCode: 0, result: expected };
       },
     );
@@ -154,6 +155,30 @@ describe('dispatchSelfImplement — result addressability', () => {
       async (opts) => { runOpts = opts; return expected; },
     );
     expect(runOpts?.autoMerge).toBe(true);
+    expect(runOpts?.autoReview).toBe(true);
+    expect(runOpts).toHaveProperty('autoReview', true);
+    await dispatchSelfImplement(
+      { feature: 'caller auto merge' },
+      { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus' },
+      async (opts) => {
+        expect(opts.autoMerge).toBeUndefined();
+        expect(opts.autoReview).toBeUndefined();
+        expect(Object.hasOwn(opts, 'autoReview')).toBe(false);
+        return expected;
+      },
+    );
+    await dispatchSelfImplement(
+      { feature: 'caller auto merge' },
+      { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus', autoMerge: true },
+      undefined,
+      undefined,
+      async (_feature, opts) => {
+        expect(opts.autoMerge).toBe(true);
+        expect(opts.autoReview).toBe(true);
+        expect(opts).toHaveProperty('autoReview', true);
+        return { ok: true, kind: 'self', exitCode: 0, result: expected };
+      },
+    );
     await dispatchSelfImplement(
       { feature: 'caller auto merge' },
       { cwd: '/tmp', signal: new AbortController().signal, entry: 'elanous-apparatus', autoMerge: false },
@@ -161,9 +186,31 @@ describe('dispatchSelfImplement — result addressability', () => {
       undefined,
       async (_feature, opts) => {
         expect(opts.autoMerge).toBe(false);
+        expect(opts.autoReview).toBeUndefined();
         return { ok: true, kind: 'self', exitCode: 0, result: expected };
       },
     );
+  });
+
+  test('dispatch log reports autoReview only for a caller-requested autoMerge', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const expected: SelfImplementResult = {
+      runId: 'run-review-observation', ok: true, stage: 'pr-opened', node: 'open-pr', outcome: 'completed',
+    };
+    try {
+      for (const autoMerge of [true, undefined] as const) {
+        await dispatchSelfImplement(
+          { feature: 'review observation' },
+          { cwd: '/tmp', signal: new AbortController().signal, ...(autoMerge ? { autoMerge } : {}) },
+          async () => expected,
+        );
+      }
+      const dispatches = log.mock.calls
+        .filter(([category, event]) => category === 'daemon-tools.self-implement' && event === 'dispatch');
+      expect(dispatches.map(([, , data]) => (data as { autoReview?: boolean }).autoReview)).toEqual([true, undefined]);
+    } finally {
+      log.mockRestore();
+    }
   });
 
   test('default runner retains isolated config and state seams through the central pipeline', async () => {
@@ -299,7 +346,7 @@ describe('dispatchSelfImplement — result addressability', () => {
         }),
       );
       expect(received).toEqual(expect.objectContaining({ feature: 'natural language provenance', naturalLanguageDispatch: true }));
-      expect(received?.goalFile).toStartWith(join(cwd, 'docs', 'goals', 'GOAL-dispatch-'));
+      expect(received?.goalFile).toStartWith(join(cwd, '.elanous', 'goals', 'GOAL-dispatch-'));
       const document = readFileSync(received!.goalFile!, 'utf8');
       expect(document.split('\n', 1)[0]).toBe('natural language provenance');
       expect(document).toContain(`Original ask (verbatim, unmodified):\n\`\`\`\n${original}\n\`\`\``);

@@ -188,4 +188,24 @@ describe('registerScheduledToxTasks — 부팅 재등록 sweep', () => {
       expect(registered[0]!.definition.name).toBe('tox-task-task:aa');
     } finally { store.close(); }
   });
+
+  it('레지스트리가 trigger 가 아니라고 하면 파생 task 를 등록하지 않는다(release 뒤 고아 · 이중 발화 방지)', () => {
+    const store = new TaskStore({ path: ':memory:', noWal: true });
+    const registered: WorkflowEntry[] = [];
+    try {
+      store.saveTask(createTask({
+        title: 'released', surface: { kind: 'terminal-pane', spec: { command: 'bun x' } },
+        scheduleText: '0 7 * * *', schedulerJobId: 'jRel',
+      }, { id: 'task:rel', now: 1 }));
+      store.saveTask(createTask({
+        title: 'live', surface: { kind: 'terminal-pane', spec: { command: 'bun y' } },
+        scheduleText: '0 8 * * *', schedulerJobId: 'jTrig',
+      }, { id: 'task:trig', now: 1 }));
+      const runVia: Record<string, string> = { jRel: 'crontab', jTrig: 'trigger' };
+      const res = registerScheduledToxTasks(store, (e) => registered.push(e), (id) => runVia[id] ?? null);
+      expect(res.registered).toBe(1);
+      expect(res.skippedNotTrigger).toBe(1);
+      expect(registered.map((e) => e.definition.name)).toEqual(['tox-task-task:trig']);
+    } finally { store.close(); }
+  });
 });

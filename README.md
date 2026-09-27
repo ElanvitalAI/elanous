@@ -1,8 +1,7 @@
 # ElanousAgent
 
-> Named after Leibniz's elanous — a self-contained individual that mirrors
-> the whole. The agent observes itself, reasons about what it sees, and
-> repairs itself; a person is called only when it cannot (一約之觀).
+> The name joins *élan* (the drive to act) and *nous* (mind). The agent
+> observes itself, reasons about what it sees, and repairs itself; a person is called only when it cannot (一約之觀).
 
 **A self-healing coding harness where eyes, hands, and memory all turn on
 one sentence — an agent that develops agents.**

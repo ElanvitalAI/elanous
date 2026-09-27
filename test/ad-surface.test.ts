@@ -5,6 +5,7 @@ import { defaultTelegramCommands, dispatchTelegramSlash, type TgCommandContext }
 import { classifyIntake } from '../src/ad-pipeline/intake.js';
 import { createAdPipelineDeps, runAdPipeline, type AdPipelinePlan } from '../src/ad-pipeline/run.js';
 import { formatAdProductionWarnings } from '../src/index.js';
+import { buildDashboardSlashRegistry } from '../src/dashboard/slash-runtime/index.js';
 
 const incoming = (text: string) => ({ text, chatId: 1, userId: 2, botId: 'bot' }) as any;
 const gates = ['BRIEF_OK', 'MASTER_PICK', 'PACK_OK', 'VIDEO_OK'];
@@ -53,8 +54,8 @@ describe('/ad surface wiring', () => {
 
   test('TUI catalog exposes ad and the dashboard dispatcher consumes the same catalog name', () => {
     expect(displayedSlashCommandNames()).toContain('ad');
-    const dashboard = readFileSync(new URL('../src/dashboard/slash-runtime/dashboard-handlers.ts', import.meta.url), 'utf8');
-    expect(dashboard).toContain('buildDashboardSlashRegistry');
+    const registry = buildDashboardSlashRegistry();
+    expect(registry.names()).toContain('ad');
   });
 
   test('Telegram dispatcher forwards the exact text brief to the shared intake boundary', async () => {

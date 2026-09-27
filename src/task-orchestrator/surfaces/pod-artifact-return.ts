@@ -91,6 +91,11 @@ export function collectPodArtifacts(logs: string, { dir, job, log = (c, e, d) =>
   let podLogsMissingReason = logs.split(/\r?\n/).find((line) => line.startsWith(`ELANOUS_POD_ARTIFACT_SKIPPED ${podLogsPath} `))
     ? 'artifact skipped (size limit or encoding failure)'
     : logs.split(/\r?\n/).find((line) => line.startsWith('ELANOUS_POD_LOGS_UNAVAILABLE '))?.slice('ELANOUS_POD_LOGS_UNAVAILABLE '.length) || 'absent';
+  const truncated = logs.split(/\r?\n/).find((line) => line.startsWith('ELANOUS_POD_LOGS_TRUNCATED '));
+  if (truncated) {
+    const [, originalBytes, keptBytes] = truncated.split(' ');
+    log('self-implement.pod', 'pod-logs-truncated', { job, originalBytes: Number(originalBytes), keptBytes: Number(keptBytes) });
+  }
   for (const { path, reason } of Array.isArray(parsed) ? [] : parsed.error) {
     log('self-implement.pod', 'artifact-collect-incomplete', { job, path, reason });
     if (path === podLogsPath) podLogsMissingReason = reason;

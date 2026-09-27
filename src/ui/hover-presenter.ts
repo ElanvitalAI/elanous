@@ -62,10 +62,8 @@ export interface HoverPresenterDeps {
    *  hover tooltips into the YAML/IUL chrome vocabulary while tests
    *  can keep legacy behaviour by omitting it. */
   getChromeSpec?: () => WidgetChromeSpec | null | undefined;
-  /** TUI 부활 T4 — hover 팝업/툴팁 자동 표시 게이트. false 를 돌려주면
-   *  hover-stable 이 와도 툴팁을 mount 하지 않는다 (기존 활성 툴팁은
-   *  정상 해제). essential UI 모드가 `() => uiMode === 'rich'` 로
-   *  배선 — hover popup 스타일은 rich UI 전용. Omit = 항상 표시. */
+  /** Optional host visibility gate. False prevents stable-hover from mounting
+   *  a tooltip; other hosts may omit the gate. */
   enabled?: () => boolean;
 }
 
@@ -171,9 +169,7 @@ export function createHoverPresenter(
       return;
     }
     if (ev.kind === 'hover-stable') {
-      // TUI 부활 T4 — hover 팝업 게이트 (rich UI 전용). 게이트 off 면
-      // 새 툴팁 mount 를 건너뛴다. 기존 활성 툴팁은 위 leave/이동
-      // 경로가 정상 해제하므로 여기서는 표시만 억제.
+      // Host-disabled tooltips are cleared rather than mounted.
       if (deps.enabled && !deps.enabled()) {
         clearActive();
         return;

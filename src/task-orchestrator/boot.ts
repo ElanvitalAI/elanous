@@ -52,6 +52,8 @@ import {
 import { setToxRuntimeDeps, resetToxRuntimeDepsForTest } from './runtime-deps.js';
 import type { TaskSurfaceKind } from './types.js';
 import type { TaskStore } from './store.js';
+import { startToxLoop } from './tox-loop.js';
+import { getUserConfig } from '../user-config.js';
 
 export type AndonSubscribeSeam = (
   fn: (signal: AndonSignalLike, kind: AndonSubscriberKind) => void,
@@ -67,6 +69,7 @@ export interface ToxBootOptions {
 
   startFeedbackLoop?: boolean;
   startRetryPolicy?: boolean;
+  tox?: { loop?: { enabled?: boolean; maxConcurrent?: number; intervalMs?: number } };
 
   andon?: {
     subscribe: AndonSubscribeSeam;
@@ -97,6 +100,7 @@ export interface ToxBootHandle {
   dispatcher: TaskDispatcher;
   generator: TaskGenerator | null;
   loop: TaskFeedbackLoop;
+  toxLoop?: ReturnType<typeof startToxLoop> | null;
   retry: RetryPolicy;
   disposeAndon: () => void;
   registeredSurfaceKinds: TaskSurfaceKind[];
@@ -111,11 +115,22 @@ export function wireTox(opts: ToxBootOptions = {}): ToxBootHandle {
   const bus = opts.bus ?? new TaskEventBus();
   const registry = opts.registry ?? new SurfaceRegistry();
 
+  const rawTox = getUserConfig().raw.tox;
+  const rawLoop = rawTox && typeof rawTox === 'object' && !Array.isArray(rawTox)
+    ? (rawTox as { loop?: unknown }).loop : undefined;
+  const configuredLoop = rawLoop && typeof rawLoop === 'object' && !Array.isArray(rawLoop)
+    ? rawLoop as { enabled?: unknown; maxConcurrent?: unknown } : {};
+  const loopEnabled = opts.tox?.loop?.enabled ?? (configuredLoop.enabled !== false);
+  const loopMaxConcurrent = opts.tox?.loop?.maxConcurrent ?? (
+    typeof configuredLoop.maxConcurrent === 'number' && Number.isInteger(configuredLoop.maxConcurrent)
+      && configuredLoop.maxConcurrent > 0 ? configuredLoop.maxConcurrent : 2);
+
   const registeredSurfaceKinds = opts.surfaces
     ? registerSurfaceAdapters(registry, { ...opts.surfaces, now, overwrite: true })
     : [];
 
-  const dispatcher = new TaskDispatcher({ graph, registry, bus, now });
+  const dispatcher = new TaskDispatcher({ graph, registry, bus, store: opts.store, now });
+  let toxLoop: ReturnType<typeof startToxLoop> | null = null;
 
   const generator = opts.decompose
     ? new TaskGenerator({ callable: opts.decompose })
@@ -124,6 +139,7 @@ export function wireTox(opts: ToxBootOptions = {}): ToxBootHandle {
   const loop = new TaskFeedbackLoop({
     graph,
     dispatcher,
+    dispatchReady: !loopEnabled ? undefined : () => toxLoop?.tick() ?? { dispatched: [], deferred: [] },
     bus,
     generator: generator ?? undefined,
     terminationCheck: opts.terminationCheck,
@@ -148,6 +164,11 @@ export function wireTox(opts: ToxBootOptions = {}): ToxBootHandle {
 
   if (opts.startFeedbackLoop !== false) loop.start();
   if (opts.startRetryPolicy !== false) retry.start();
+  toxLoop = !loopEnabled ? null : startToxLoop({
+    graph, dispatcher, bus, budgetCheck: opts.budgetCheck,
+    maxConcurrent: loopMaxConcurrent,
+    intervalMs: opts.tox?.loop?.intervalMs ?? 1000,
+  });
 
   let disposeAndon: () => void = () => {};
   if (opts.andon) {
@@ -180,10 +201,12 @@ export function wireTox(opts: ToxBootOptions = {}): ToxBootHandle {
     dispatcher,
     generator,
     loop,
+    toxLoop,
     retry,
     disposeAndon,
     registeredSurfaceKinds,
     dispose() {
+      toxLoop?.stop();
       try {
         loop.stop();
       } catch {

@@ -60,6 +60,7 @@ export interface StreamLlmFn {
       model?: string;
       provider?: { name: string } & Record<string, unknown>;
       signal?: AbortSignal;
+      usageRole?: ModelRole;
     },
   ): Promise<string>;
 }

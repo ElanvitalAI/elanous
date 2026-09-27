@@ -65,6 +65,8 @@ export interface BudgetGate {
 export interface FeedbackLoopOptions {
   graph: TaskGraph;
   dispatcher: TaskDispatcher;
+  /** Boot can route follow-up dispatch through the admitted TOX queue. */
+  dispatchReady?: () => ReturnType<TaskDispatcher['tick']> | Promise<ReturnType<TaskDispatcher['tick']>>;
   bus?: TaskEventBus;
   generator?: TaskGenerator;
 
@@ -390,7 +392,7 @@ export class TaskFeedbackLoop {
   ): Promise<FeedbackOutcome> {
     // promote first so newly-unblocked deps flip to ready
     this.opts.graph.promoteReady({ now: this.now() });
-    const result = this.opts.dispatcher.tick();
+    const result = await (this.opts.dispatchReady ?? (() => this.opts.dispatcher.tick()))();
     const dispatched = result.dispatched.length;
     const deferred = result.deferred.length;
 
@@ -401,7 +403,7 @@ export class TaskFeedbackLoop {
         regenerated = { goalSlug, taskIds: rg.taskIds };
         // After regenerate applied, run another dispatch pass so the
         // new ready tasks start immediately.
-        const second = this.opts.dispatcher.tick();
+        const second = await (this.opts.dispatchReady ?? (() => this.opts.dispatcher.tick()))();
         return {
           kind: 'continue',
           dispatched: second.dispatched.length,

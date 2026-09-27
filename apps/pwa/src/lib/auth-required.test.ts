@@ -71,14 +71,14 @@ test('daemon fetchResponse signals on 401 and preserves its Response and fetchJs
   off();
 });
 
-test('daemon direct prompt and streaming paths also signal on 401 without changing errors', async () => {
+test('daemon streaming fallback signals on 401 without changing errors', async () => {
   const client = new DaemonClient({ baseUrl: 'http://localhost:31415', token: '', provider: 'anthropic' });
+  expect('prompt' in client).toBe(false);
   globalThis.fetch = (async () => new Response('unauthorized', { status: 401 })) as unknown as typeof fetch;
   const seen: { path: string }[] = [];
   const off = onAuthRequired((detail) => seen.push(detail));
-  await expect(client.prompt({ userText: 'hello' })).rejects.toThrow('prompt 401: unauthorized');
   await expect(client.promptStream({ userText: 'hello' })).rejects.toThrow('prompt/stream 401: unauthorized');
-  expect(seen).toEqual([{ path: '/v1/prompt' }]);
+  expect(seen).toEqual([{ path: '/v1/prompt/stream' }]);
   off();
 });
 

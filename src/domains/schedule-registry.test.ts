@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { Database } from 'bun:sqlite';
 import {
-  openSchedulesDb, parseCronLine, scriptName, inferCategory, unwrapCronCommand, wrapCronLine, unwrapCronLine, sharesCrontabLine,
+  openSchedulesDb, parseCronLine, scriptName, inferCategory, unwrapCronCommand, wrapCronLine, wrapShellCronLine, unwrapCronLine, sharesCrontabLine,
   inventoryCrontab, inventoryInternalSchedules, listSchedules, driftedSchedules,
   buildCronLine, addLineToCrontab, removeLineFromCrontab, setLineEnabled,
   deleteScheduleRow, setRunVia, markResult, scheduleHealth, setScheduleMission,
@@ -156,6 +156,20 @@ describe('scriptName', () => {
     expect(scriptName('/r/scripts/collect-market-backbone.sh')).toBe('collect-market-backbone');
     expect(scriptName('cd /r && bun scripts/samsung-koru-watch.ts >> /tmp/x')).toBe('samsung-koru-watch');
   });
+  test('a wrapped shell target outside scripts/ keeps the registry name (cron-run passes interpreter and target)', () => {
+    expect(scriptName('/opt/homebrew/bin/bash /x/backup.sh')).toBe('backup');
+    expect(scriptName('bash /x/backup.sh --source cron')).toBe('backup');
+  });
+
+  test('shell interpreter in Bun arguments is not mistaken for the executable', () => {
+    const command = 'bun scripts/report.ts --runner bash /x/backup.sh';
+    expect(scriptName(command)).toBe('report');
+    const d = db();
+    try {
+      inventoryCrontab(d, { crontab: `0 7 * * * ${command}` });
+      expect(listSchedules(d)[0]!.name).toBe('report');
+    } finally { d.close(); }
+  });
 });
 
 describe('unwrapCronCommand + 래퍼 id 안정성 (RFC-scheduler-execution-observability·2026-07-15)', () => {
@@ -215,6 +229,50 @@ describe('unwrapCronCommand + 래퍼 id 안정성 (RFC-scheduler-execution-obser
     expect(rows.length).toBe(1);          // 새 행 안 생김(같은 id UPSERT)
     expect(rows[0]!.id).toBe(id);
     expect(rows[0]!.last_status).toBe('ok'); // 계보 보존
+  });
+});
+
+describe('explicit shell cron wrapping', () => {
+  const opts = { bun: '/b/bun', cronRun: '/r/scripts/cron-run.ts' };
+  const lines = [
+    ['0 7 * * * zsh $HOME/s/intake-cron.sh', 'zsh', 'intake-cron'],
+    ['20 4 * * * bash /x/backup.sh --source cron >> /tmp/b.log 2>&1', 'bash', 'backup'],
+    ['0 6 * * 1 cd /r && /bin/bash scripts/verify.sh', '/bin/bash', 'verify'],
+    ['0 9 * * * /usr/bin/sh /x/daily.sh', '/usr/bin/sh', 'daily'],
+    ['0 10 * * * zsh $HOME/.claude/skills/yt-vault/scripts/intake-cron.sh', 'zsh', 'intake-cron'],
+    ['0 8 * * * /opt/homebrew/bin/bash /x/backup.sh --source cron', '/opt/homebrew/bin/bash', 'backup'],
+  ] as const;
+
+  test.each(lines)('preserves shell line, interpreter, id and execution history: %s', (plain, interpreter, name) => {
+    const wrapped = wrapShellCronLine(plain, opts);
+    expect(wrapped).toContain(`${opts.bun} ${opts.cronRun} --shell ${interpreter} `);
+    expect(wrapShellCronLine(wrapped, opts)).toBe(wrapped);
+    expect(unwrapCronLine(wrapped)).toBe(plain);
+    const before = parseCronLine(plain)!;
+    const after = parseCronLine(wrapped)!;
+    expect(unwrapCronCommand(after.command)).toBe(before.command);
+    expect(cronEntryId(after.cron, unwrapCronCommand(after.command)))
+      .toBe(cronEntryId(before.cron, unwrapCronCommand(before.command)));
+    const d = db();
+    try {
+      inventoryCrontab(d, { crontab: plain });
+      const id = listSchedules(d)[0]!.id;
+      expect(listSchedules(d)[0]!.name).toBe(name);
+      markResult(d, id, { status: 'ok', exit: 0, via: 'crontab' });
+      inventoryCrontab(d, { crontab: wrapped });
+      expect(listSchedules(d)).toHaveLength(1);
+      expect(listSchedules(d)[0]).toMatchObject({ id, name, last_status: 'ok', last_exit: 0 });
+    } finally { d.close(); }
+  });
+
+  test('interpreter-free shell and already wrapped jobs remain unchanged', () => {
+    const plain = '0 */6 * * * cd /r && scripts/m.sh gcpvm';
+    expect(wrapShellCronLine(plain, opts)).toBe(plain);
+    expect(unwrapCronLine(plain)).toBe(plain);
+    const wrapped = wrapShellCronLine(lines[0][0], opts);
+    expect(wrapShellCronLine(wrapped, opts)).toBe(wrapped);
+    const argument = '0 7 * * * echo "zsh /x/intake-cron.sh"';
+    expect(wrapShellCronLine(argument, opts)).toBe(argument);
   });
 });
 

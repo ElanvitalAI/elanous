@@ -236,6 +236,8 @@ export interface DispatchAgentOpts {
    *  parent skill is using, MINUS the Agent tool itself (no recursion).
    *  When omitted, the sub-agent runs with no tools (text-only). */
   hostTools?: LLMToolSpec[];
+  /** Host-selected cwd when there is no parent session (e.g. MCP). */
+  cwd?: string;
   /** Dispatcher the parent uses for tool calls. The sub-agent reuses
    *  this so all I/O hits the same Bash/Read/etc. implementations. */
   dispatchTool?: (name: string, args: Record<string, unknown>) => Promise<unknown>;
@@ -477,7 +479,7 @@ export async function dispatchAgent(
   let childCwd: string | undefined;
   let appliedIsolation: AgentToolResult['isolation'];
   if (isolation === 'cwd') {
-    childCwd = getSessionCwd();
+    childCwd = opts.cwd ?? getSessionCwd();
     appliedIsolation = 'cwd';
     debug.log('agent.spawn', 'cwd', { agent: definition.name, cwd: childCwd });
   } else if (isolation === 'worktree') {
@@ -496,7 +498,7 @@ export async function dispatchAgent(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!message.includes('is not inside a git repo')) throw error;
-      childCwd = getSessionCwd();
+      childCwd = opts.cwd ?? getSessionCwd();
       appliedIsolation = 'cwd';
       debug.log('agent.spawn', 'worktree-fallback-cwd', {
         agent: definition.name,
@@ -506,7 +508,7 @@ export async function dispatchAgent(
       }, { level: 'warn' });
     }
   } else {
-    childCwd = getSessionCwd();
+    childCwd = opts.cwd ?? getSessionCwd();
     debug.log('agent.spawn', 'inherited-cwd', { agent: definition.name, cwd: childCwd });
   }
 

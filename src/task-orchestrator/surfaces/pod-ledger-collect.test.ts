@@ -142,6 +142,175 @@ describe('pod ledger live follower', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test('heartbeat lines do not reset the 30-minute stall; progress clears it and starts the next window', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-stall-'));
+    try {
+      let minute = 0;
+      const chunks: string[] = [];
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({
+        runId, dir, now: () => minute * 60_000,
+        log: (_c, event, data) => events.push({ event, data }),
+        onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: chunks.shift() ?? '', stderr: '' }),
+      });
+      chunks.push('{"event":"pipeline-node-entry"}\n');
+      f.poll();
+      for (minute = 1; minute <= 40; minute++) {
+        chunks.push('{"event":"progress-delivery-outcome"}\n');
+        f.poll();
+      }
+      expect(events.filter(({ event }) => event === 'stalled')).toEqual([{
+        event: 'stalled', data: { runId, lastProgressEvent: 'pipeline-node-entry', idleMinutes: 30 },
+      }]);
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 마지막 진행 pipeline-node-entry']);
+      expect(events.filter(({ event }) => event === 'ledger-live-appended')).toHaveLength(41);
+      expect(events[0]).toEqual({ event: 'ledger-live-appended', data: {
+        runId, lines: 1, bytes: Buffer.byteLength('{"event":"pipeline-node-entry"}\n'),
+        offset: Buffer.byteLength('{"event":"pipeline-node-entry"}\n'),
+      } });
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(
+        '{"event":"pipeline-node-entry"}\n' + '{"event":"progress-delivery-outcome"}\n'.repeat(40),
+      );
+
+      minute = 45;
+      chunks.push('{"event":"gated"}\n');
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stall-cleared')).toEqual([{
+        event: 'stall-cleared', data: { runId, idleMinutes: 45 },
+      }]);
+      minute = 74;
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toHaveLength(1);
+      minute = 75;
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toEqual([
+        { event: 'stalled', data: { runId, lastProgressEvent: 'pipeline-node-entry', idleMinutes: 30 } },
+        { event: 'stalled', data: { runId, lastProgressEvent: 'gated', idleMinutes: 30 } },
+      ]);
+      expect(messages).toEqual([
+        '[pod] 진행 없음 30분 — 마지막 진행 pipeline-node-entry',
+        '[pod] 진행 없음 30분 — 마지막 진행 gated',
+      ]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('malformed lines never count as progress, and reminders fire once at each threshold', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-stall-malformed-'));
+    try {
+      let minute = 0;
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({
+        runId, dir, now: () => minute * 60_000, stallMinutes: 30,
+        log: (_c, event, data) => events.push({ event, data }),
+        onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: 'not json\n', stderr: '' }),
+      });
+      f.poll();
+      minute = 35;
+      f.poll(); f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toEqual([{
+        event: 'stalled', data: { runId, lastProgressEvent: null, idleMinutes: 35 },
+      }]);
+      minute = 60;
+      f.poll(); f.poll();
+      minute = 90;
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stalled').map(({ data }) => data.idleMinutes)).toEqual([35, 60, 90]);
+      expect(messages).toEqual([
+        '[pod] 진행 없음 35분 — 마지막 진행 없음',
+        '[pod] 진행 없음 60분 — 마지막 진행 없음',
+        '[pod] 진행 없음 90분 — 마지막 진행 없음',
+      ]);
+      expect(events.some(({ event }) => event === 'stall-cleared')).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('one poll after a 180-minute jump emits one reminder, then waits for the next threshold', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-stall-jump-'));
+    try {
+      let minute = 0;
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({
+        runId, dir, now: () => minute * 60_000,
+        log: (_c, event, data) => events.push({ event, data }),
+        onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: '', stderr: '' }),
+      });
+      f.poll();
+      minute = 180;
+      f.poll(); f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toEqual([
+        { event: 'stalled', data: { runId, lastProgressEvent: null, idleMinutes: 180 } },
+      ]);
+      expect(messages).toEqual(['[pod] 진행 없음 180분 — 마지막 진행 없음']);
+      minute = 209;
+      f.poll();
+      expect(messages).toHaveLength(1);
+      minute = 210;
+      f.poll(); f.poll();
+      expect(events.filter(({ event }) => event === 'stalled').map(({ data }) => data.idleMinutes)).toEqual([180, 210]);
+      expect(messages).toEqual([
+        '[pod] 진행 없음 180분 — 마지막 진행 없음',
+        '[pod] 진행 없음 210분 — 마지막 진행 없음',
+      ]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('regular polls emit one reminder at each of 30, 60 and 90 minutes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-stall-regular-'));
+    try {
+      let minute = 0;
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({
+        runId, dir, now: () => minute * 60_000,
+        log: (_c, event, data) => events.push({ event, data }),
+        onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: '', stderr: '' }),
+      });
+      f.poll();
+      for (minute of [30, 60, 90]) { f.poll(); f.poll(); }
+      expect(events.filter(({ event }) => event === 'stalled').map(({ data }) => data.idleMinutes)).toEqual([30, 60, 90]);
+      expect(messages).toEqual([30, 60, 90].map((n) => `[pod] 진행 없음 ${n}분 — 마지막 진행 없음`));
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a custom stall threshold ignores incomplete lines until a complete progress event arrives', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-stall-split-'));
+    try {
+      let minute = 0;
+      const chunks = ['{"event":"gated"', '', '}\n'];
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const f = createPodLedgerFollower({
+        runId, dir, now: () => minute * 60_000, stallMinutes: 5,
+        log: (_c, event, data) => events.push({ event, data }), onStall: () => {},
+        exec: () => ({ status: 0, stdout: chunks.shift() ?? '', stderr: '' }),
+      });
+      f.poll();
+      minute = 5;
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toEqual([{
+        event: 'stalled', data: { runId, lastProgressEvent: null, idleMinutes: 5 },
+      }]);
+      expect(f.owned).toBe(false);
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stall-cleared')).toEqual([{
+        event: 'stall-cleared', data: { runId, idleMinutes: 5 },
+      }]);
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('{"event":"gated"}\n');
+      minute = 9;
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toHaveLength(1);
+      minute = 10;
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toHaveLength(2);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('the final collection replaces the partial live copy (and only that one)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ledger-live-'));
     const full = '{"a":1}\n{"b":2}\n{"done":true}\n';

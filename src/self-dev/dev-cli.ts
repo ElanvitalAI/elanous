@@ -101,6 +101,7 @@ export interface DevCliOpts {
   worktree?: boolean;
   openPr?: boolean;
   autoMerge?: boolean;
+  mergeByHost?: boolean;
   autoReview?: boolean;
   branch?: string;
   draft?: boolean;
@@ -902,7 +903,7 @@ export async function executeDevSelfRun(
     if (!supervise) return { result };
 
     const asSupervisorJobResult = (currentFeature: string, current: SelfImplementResult) => singleRunAsJobResult(currentFeature, current);
-    const initialJob = asSupervisorJobResult(feature, result);
+    const initialJob = singleRunAsJobResult(feature, result);
     const wiring = supervise.deliverableDocument === undefined
       ? undefined
       : buildDeliverableTargets(supervise.deliverableDocument, ['single'], 'all', '127.0.0.1');
@@ -1574,7 +1575,7 @@ const DEV_PATH_ALLOWED: Record<DevPath, readonly string[]> = {
   'interactive': ['implement', 'roleLlm'],
   'elanous-tui': ['hold', 'readyTimeoutMs', 'goal', 'maxSteps', 'pollMs', 'model', 'observeOnly', 'isolatedRoot', 'cwd', 'worktree', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
   'shell-drive': ['goal', 'maxSteps', 'pollMs', 'model', 'cwd', 'worktree', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
-  'self-mission': ['openPr', 'autoMerge', 'autoReview', 'draft', 'maxWait', 'activityGrace', 'supervise', 'superviseRounds', 'childLlmProvider', 'childLlmModel', 'childLlmEffort', 'correlation', 'graph', 'ground', 'target', 'context', 'contextText', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
+  'self-mission': ['openPr', 'autoMerge', 'mergeByHost', 'autoReview', 'draft', 'maxWait', 'activityGrace', 'supervise', 'superviseRounds', 'childLlmProvider', 'childLlmModel', 'childLlmEffort', 'correlation', 'graph', 'ground', 'target', 'context', 'contextText', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
   'agent-mission-pty': ['branch', 'evidence', 'docDir', 'docGlob', 'testPath', 'maxRounds', 'commit', 'deliverable', 'screens', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
   'acp': ['context', 'contextText', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
 };
@@ -1763,14 +1764,17 @@ export function buildDevCliSpec(
       chat: { forceNew: true, enableTools: true, goalLoop: true },
     };
   }
-  if (opts.openPr === false && opts.autoMerge === true) {
+  if (opts.mergeByHost === true && (process.env.ELANOUS_SUBSTRATE !== 'pod' || !process.env.ELANOUS_POD_NAME || !process.env.ELANOUS_POD_NAMESPACE)) {
+    throw new DevPipelineError('--merge-by-host 는 Pod 자식 전용입니다 (호스트 재게이트 인계가 없는 로컬 실행 거부)');
+  }
+  if (opts.openPr === false && (opts.autoMerge === true || opts.mergeByHost === true)) {
     throw new DevPipelineError('--no-open-pr 와 --auto-merge 는 동시 사용 불가 — PR 없이 병합할 수 없음');
   }
 
   const supportsCompletion = path === 'self-mission' || path === 'plan-staged';
   const completion: DevCompletion | undefined = opts.openPr === false
     ? 'worktree-only'
-    : opts.autoMerge === true
+    : opts.autoMerge === true || opts.mergeByHost === true
       ? 'auto-merge'
       : opts.autoMerge === false
         ? 'pr'
@@ -1860,6 +1864,7 @@ export function buildDevCliSpec(
     warnParentLlmQuota(parentProvider, readGrokQuotaOnce);
     const self = {
       ...(opts.draft === false ? { draft: false } : {}),
+      ...(opts.mergeByHost === true ? { mergeByHost: true } : {}),
       ...(childLlm ? { childLlm } : {}),
       ...(opts.correlation !== undefined ? { correlationId: opts.correlation } : {}),
       ...(opts.maxWait !== undefined ? { maxWaitSec: parsePositiveInt(opts.maxWait, '--max-wait') } : {}),

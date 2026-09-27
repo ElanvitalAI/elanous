@@ -5,11 +5,12 @@
  */
 import { debug } from '../../debug/log.js';
 import {
-  decideIntakeFrontRoute,
   INTAKE_FRONT_ROUTE_RULES,
   type IntakeFrontRouteDecision,
 } from '../../intake-plane/front-route-rules.js';
+import { classifyFrontInput, type FrontClassifierDecision } from '../../intake-plane/front-classifier.js';
 import { classifyIntakeFrontRoute } from '../../intake-plane/front-route-classifier.js';
+import { getUserConfig } from '../../user-config.js';
 import { jsonResponse } from './json-response.js';
 
 /** 8KB. 초과·빈 text 는 400. */
@@ -25,10 +26,14 @@ export interface IntakeRouteBody {
   classify?: boolean;
 }
 
-export interface IntakeRouteResponse extends IntakeFrontRouteDecision {
+type ClassifiedRoutePayload = Pick<FrontClassifierDecision, 'kind'> & {
+  urlRoute: Pick<NonNullable<FrontClassifierDecision['urlRoute']>, 'kind' | 'skill' | 'absorb'> | null;
+};
+
+export type IntakeRouteResponse = IntakeFrontRouteDecision & ClassifiedRoutePayload & {
   /** I1 은 언제나 판정만이라 항상 true. */
   dryRun: true;
-}
+};
 
 function badRequest(reason: string): Response {
   return jsonResponse({ error: 'bad_request', reason }, 400);
@@ -58,13 +63,14 @@ export const handleIntakeRoutePost: (req: Request, deps?: IntakeRouteDeps) => Pr
   const textLength = textByteLength(text);
   if (textLength > INTAKE_ROUTE_MAX_TEXT_BYTES) return badRequest('text exceeds 8KB');
 
-  const ruleDecision = decideIntakeFrontRoute({
+  const frontDecision = classifyFrontInput({
     text,
+    surface: 'pwa',
     ...(typeof body.hint === 'string' ? { hint: body.hint } : {}),
     ...(typeof body.consent === 'string' ? { consent: body.consent } : {}),
-  });
-  const classifierCalled = ruleDecision.reason === INTAKE_FRONT_ROUTE_RULES.unknownReason && body.classify === true;
-  let decision = ruleDecision;
+  }, { urlRouting: getUserConfig().skills.urlRouting });
+  const classifierCalled = frontDecision.reason === INTAKE_FRONT_ROUTE_RULES.unknownReason && body.classify === true;
+  let decision: IntakeFrontRouteDecision = frontDecision;
   if (classifierCalled) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -91,6 +97,15 @@ export const handleIntakeRoutePost: (req: Request, deps?: IntakeRouteDeps) => Pr
     classifierCalled,
   });
 
-  const response: IntakeRouteResponse = { ...decision, dryRun: true };
+  const response: IntakeRouteResponse = {
+    ...decision,
+    kind: frontDecision.kind,
+    urlRoute: frontDecision.urlRoute === null ? null : {
+      kind: frontDecision.urlRoute.kind,
+      skill: frontDecision.urlRoute.skill,
+      absorb: frontDecision.urlRoute.absorb,
+    },
+    dryRun: true,
+  };
   return jsonResponse(response, 200);
 };

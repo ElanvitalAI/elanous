@@ -14,8 +14,6 @@ function createDeps(overrides: Partial<DashboardPriorityKeyRouteDeps<string>> = 
   const calls: string[] = [];
   const deps: DashboardPriorityKeyRouteDeps<string> = {
     isForceQuitChord: () => { calls.push('force-quit-check'); return false; },
-    routePopupCloseChord: () => { calls.push('popup-close'); return false; },
-    routeVwSwitchChord: () => { calls.push('vw-switch'); return false; },
     // PR-S1V.4-wiring · Step 0x voice entry chord (idle → fire) and
     // Step 0c voice active dispatch (active → host.maybeHandleKey).
     // Default mocks return false so existing tests are unaffected.
@@ -26,7 +24,6 @@ function createDeps(overrides: Partial<DashboardPriorityKeyRouteDeps<string>> = 
     routeBellKey: () => { calls.push('bell'); return false; },
     dispatchPreKey: () => { calls.push('pre'); return false; },
     routeExclusiveTerminalModalKey: () => { calls.push('terminal'); return false; },
-    routeVwTerminalKey: () => { calls.push('vw-terminal'); return false; },
     routeArmedChordKey: () => { calls.push('chord'); return false; },
     armPrefixChord: () => { calls.push('arm'); return false; },
     isHardQuitKey: () => { calls.push('quit-check'); return false; },
@@ -47,7 +44,7 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('x'), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);
+    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);
   });
 
   test('returns quit before global action or layout routing', async () => {
@@ -59,7 +56,7 @@ describe('routeDashboardPriorityKey', () => {
 
     expect(result).toEqual({ type: 'quit' });
     expect(calls).toEqual([
-      'force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal', 'vw-terminal', 'pre', 'chord', 'arm', 'quit-check',
+      'force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal', 'pre', 'chord', 'arm', 'quit-check',
     ]);
   });
 
@@ -73,15 +70,12 @@ describe('routeDashboardPriorityKey', () => {
     expect(result).toEqual({ type: 'handled' });
     expect(calls).toEqual([
       'force-quit-check',
-      'popup-close',
-      'vw-switch',
       'voice-enter',
       'voice-active',
       'voice-chat-chord',
       'voice-chat-active',
       'bell',
       'terminal',
-      'vw-terminal',
       'pre',
       'chord',
       'arm',
@@ -99,15 +93,12 @@ describe('routeDashboardPriorityKey', () => {
     expect(result).toEqual({ type: 'passthrough' });
     expect(calls).toEqual([
       'force-quit-check',
-      'popup-close',
-      'vw-switch',
       'voice-enter',
       'voice-active',
       'voice-chat-chord',
       'voice-chat-active',
       'bell',
       'terminal',
-      'vw-terminal',
       'pre',
       'chord',
       'arm',
@@ -141,7 +132,7 @@ describe('routeDashboardPriorityKey', () => {
     expect(result).toEqual({ type: 'handled' });
     expect(dispatched).toEqual(['question-view']);
     expect(calls).toEqual([
-      'force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal', 'vw-terminal', 'pre',
+      'force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal', 'pre',
     ]);
   });
 
@@ -170,7 +161,7 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('x'), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);
+    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);
   });
 
   test('terminal modal claim wins over input-core dispatchPreKey (regression)', async () => {
@@ -182,39 +173,7 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('b', { ctrl: true }), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);  // 'pre' never runs
-  });
-
-  // Regression: when a Virtual Window's focused pane is a terminal,
-  // the same "terminal-priority" applies as the popup terminal modal.
-  // input-core / chord / global-action all skip. User: "Virtual Window
-  // 전체도 터미널이 붙을 경우에는 터미널 우선 모드를 일단 적용해주세요."
-  test('VW with terminal pane claims before input-core (regression)', async () => {
-    const { calls, deps } = createDeps({
-      routeVwTerminalKey: () => { calls.push('vw-terminal'); return true; },
-      dispatchPreKey: () => { calls.push('pre'); return true; },        // would have claimed
-      armPrefixChord: () => { calls.push('arm'); return true; },        // would have claimed
-    });
-
-    const result = await routeDashboardPriorityKey(key('b', { ctrl: true }), deps);
-
-    expect(result).toEqual({ type: 'handled' });
-    // vw-terminal claims after popup-terminal step (which returns false
-    // when popup is closed). pre / arm / chord never run.
-    expect(calls).toEqual(['force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal', 'vw-terminal']);
-  });
-
-  // Defensive: when popup terminal AND VW with terminal are both
-  // theoretically claiming, popup wins (it's the foreground modal,
-  // pushed on top of the VW). VW step never runs in that case.
-  test('popup terminal claim wins over VW terminal claim', async () => {
-    const { calls, deps } = createDeps({
-      routeExclusiveTerminalModalKey: () => { calls.push('terminal'); return true; },
-      routeVwTerminalKey: () => { calls.push('vw-terminal'); return true; },
-    });
-
-    await routeDashboardPriorityKey(key('a'), deps);
-    expect(calls).toEqual(['force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);  // vw-terminal never runs
+    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell', 'terminal']);  // 'pre' never runs
   });
 
   // The bell-then-terminal order matters: a notification bell modal
@@ -230,37 +189,18 @@ describe('routeDashboardPriorityKey', () => {
     const result = await routeDashboardPriorityKey(key('1'), deps);
 
     expect(result).toEqual({ type: 'handled' });
-    expect(calls).toEqual(['force-quit-check', 'popup-close', 'vw-switch', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell']);  // 'terminal' never runs
+    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell']);  // 'terminal' never runs
   });
 
-  // Regression: Alt+W popup-close chord claims at step 0a, BEFORE
-  // routeBellKey + routeExclusiveTerminalModalKey + routeVwTerminalKey
-  // would otherwise forward Alt+W to the child PTY. Without this
-  // priority position, the popup terminal's terminalModalRouter
-  // would consume Alt+W as ordinary input.
-  test('Alt+W popup-close chord claims before bell + terminal forwards', async () => {
+  test('Alt+W no longer closes a popup before bell routing', async () => {
     const { calls, deps } = createDeps({
-      routePopupCloseChord: () => { calls.push('popup-close'); return true; },
-      routeBellKey: () => { calls.push('bell'); return true; },                         // would have claimed
-      routeExclusiveTerminalModalKey: () => { calls.push('terminal'); return true; },   // would have claimed
-    });
-
-    await routeDashboardPriorityKey(key('w', { alt: true }), deps);
-    // popup-close fires; bell + terminal never run.
-    expect(calls).toEqual(['force-quit-check', 'popup-close']);
-  });
-
-  // Regression: Alt+digit VW switch chord lives at step 0b. Same
-  // priority rationale — must beat the popup terminal forwarding so
-  // the user can switch windows from inside a child PTY.
-  test('Alt+digit VW switch chord claims before terminal forwards', async () => {
-    const { calls, deps } = createDeps({
-      routeVwSwitchChord: () => { calls.push('vw-switch'); return true; },
+      routeBellKey: () => { calls.push('bell'); return true; },
       routeExclusiveTerminalModalKey: () => { calls.push('terminal'); return true; },
     });
 
-    await routeDashboardPriorityKey(key('2', { alt: true }), deps);
-    expect(calls).toEqual(['force-quit-check', 'popup-close', 'vw-switch']);
+    const result = await routeDashboardPriorityKey(key('w', { alt: true }), deps);
+    expect(result).toEqual({ type: 'handled' });
+    expect(calls).toEqual(['force-quit-check', 'voice-enter', 'voice-active', 'voice-chat-chord', 'voice-chat-active', 'bell']);
   });
 
   // Regression: Ctrl+Shift+Q (force-quit chord) wins over EVERYTHING,

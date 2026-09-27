@@ -104,7 +104,7 @@ describe('dispatchDashboardSlashExecute', () => {
 
   test('allow-list includes common commands', () => {
     expect(ALLOWED_SLASHES).toContain('term');
-    expect(ALLOWED_SLASHES).toContain('window');
+    expect(ALLOWED_SLASHES).not.toContain('window'); // D1a: VW `/window` 는 essential 에서 지워졌다
     expect(ALLOWED_SLASHES).toContain('claude');
     expect(ALLOWED_SLASHES).not.toContain('quit');
     expect(ALLOWED_SLASHES).not.toContain('debug');

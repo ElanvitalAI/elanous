@@ -571,9 +571,7 @@ export function SettingsPanel() {
           and exposes a Test notification button via /v1/hitl/test-pushcut. */}
       <PushcutSettingsCard />
 
-      {/* dogfood polish (2026-05-14 EoD #8) — chat input chip stack
-          toggles. autoRouting (default OFF) + acpBackends (default ON).
-          OFF, OFF = NEXUS rotation only ("베이직 모드"). */}
+      {/* Chat input automatic-routing preference (default OFF). */}
       <ChatRoutingCard />
 
       {/* CV-3 dogfood follow-up (2026-05-09) — IntentPanel display

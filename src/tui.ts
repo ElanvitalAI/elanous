@@ -260,11 +260,13 @@ function parseKey(data: string | Buffer): Key {
     return K('', ctrl, shift, alt);
   }
 
-  // Legacy shift combos (terminals that don't support Kitty/modifyOtherKeys)
-  if (s === '\x1b[1;2A') return K('up', false, true);
-  if (s === '\x1b[1;2B') return K('down', false, true);
-  if (s === '\x1b[1;2C') return K('right', false, true);
-  if (s === '\x1b[1;2D') return K('left', false, true);
+  // xterm modified arrows (including legacy Shift+arrow)
+  const arrowMod = s.match(/^\x1b\[1;(\d+)([ABCD])$/);
+  if (arrowMod) {
+    const { shift, alt, ctrl } = decodeModifier(parseInt(arrowMod[1]!, 10));
+    const name = { A: 'up', B: 'down', C: 'right', D: 'left' }[arrowMod[2]! as 'A' | 'B' | 'C' | 'D'];
+    return K(name, ctrl, shift, alt);
+  }
   if (s === '\x1bOM')     return K('enter', false, true); // legacy Shift+Enter (SS3)
   if (s === '\x1b\r' || s === '\x1b\n') return K('enter', false, true); // ESC+CR = Shift/Alt+Enter
   if (s === '\x1b[Z')     return K('tab', false, true);   // Shift+Tab (backtab)
@@ -321,6 +323,7 @@ function parseKey(data: string | Buffer): Key {
   if (s === '\x1b[F' || s === '\x1b[4~') return K('end');
   if (s === '\x1b[5~') return K('pageup');
   if (s === '\x1b[6~') return K('pagedown');
+  if (s === '\x1b[3~') return K('delete');
 
   // Special keys
   if (s === '\r' || s === '\n')   return K('enter');

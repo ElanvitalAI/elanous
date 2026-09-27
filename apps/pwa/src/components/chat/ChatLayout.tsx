@@ -5,12 +5,11 @@ import { Mic, MicOff } from 'lucide-react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
-import { ProviderPicker } from './ProviderPicker';
 import { SessionPill } from './SessionPill';
-import { SurfacePicker, surfacePreferenceToWire, useSurfacePreference } from './SurfacePicker';
 import { ChatHud } from './blocks/ChatHud';
 import { dispatchHudSegmentEnvelope } from '@/lib/chat-runtime';
 import { restorableChatMessages } from '@/lib/session-restore';
+import { writeSharePrefill } from '@/lib/share-prefill';
 import { BudgetPill } from './BudgetPill';
 import { VoiceCostPill } from './VoiceCostPill';
 import { VoiceOverlay } from './VoiceOverlay';
@@ -51,14 +50,17 @@ export interface ChatLayoutProps {
    *  안 보임 (single-tab `/chat` 동작 보존). */
   onAttachRequest?: () => void;
   onForgetRequest?: () => void;
+  /** The daemon corrected this conversation's id; keep its mounted transcript. */
+  onSessionAdopt?: (id: string) => void;
   /** BACKLOG #3 — workspace tab id forwarded to ChatInput / ChatHistory
    *  for surface snapshot persistence. */
   tabId?: string;
 }
 
 export function ChatLayout(props: ChatLayoutProps = {}) {
-  const { client, config, setConfig, sessionId, setSessionId } = useDaemon();
+  const { client, config, sessionId, setSessionId } = useDaemon();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [composerPrefill, setComposerPrefill] = useState<{ text: string; id: number }>();
   const [pending, setPending] = useState(false);
   const [turnBusyBanner, setTurnBusyBanner] = useState<TurnBusyBanner | null>(null);
   // Phase B-3 (PWA chat streaming · 2026-05-06) — Stop button + Esc
@@ -89,7 +91,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   const remoteSseTurnPlaceholderRef = useRef<string | null>(null);
   // CV-1b (2026-05-07) — long-lived ACP connection ref. The CV-1a
   // useEffect mounts the WebSocket on sessionId/baseUrl change; the ref
-  // exposes the live instance to handleSubmit so chat's self-turn POST
+  // exposes the live instance to handleSubmit so chat's self-turn
   // routes via `runChatTurnAcp` (ACP `session/prompt` RPC + chunks
   // listener) instead of REST `/v1/prompt/stream`. cleanup nulls it.
   const acpRef = useRef<ReturnType<typeof client.connectAcp> | null>(null);
@@ -322,7 +324,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     sessionId,
     provider: config.provider,
     setSessionId,
-    setProvider: (p) => setConfig({ provider: p }),
     daemon: { baseUrl: config.baseUrl, ...(config.token ? { token: config.token } : {}) },
     messages,
   };
@@ -330,11 +331,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   const append = (msg: ChatMessage): void => {
     setMessages((prev) => [...prev, msg]);
   };
-
-  // PR-D (PWA surface picker · 2026-05-13) — per-turn tool surface
-  // sourced from localStorage via the picker. `null` (default) means
-  // "send no `tools` field" so the daemon's configured surface wins.
-  const [surfacePreference] = useSurfacePreference();
 
   const handleSubmit = async (text: string): Promise<void> => {
     setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-begin' }));
@@ -419,7 +415,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         append(newMetaMessage(meta.text));
       }
       if (meta.newSessionId) setSessionId(meta.newSessionId);
-      if (meta.newProvider !== undefined) setConfig({ provider: meta.newProvider });
       return;
     }
 
@@ -457,7 +452,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     // delta 만 보내야 sentence boundary 가 중복 계산되지 않는다.
     let lastTtsLen = 0;
     // CV-1b (PLAN v1.2 §5 · 2026-05-07) — chat self-turn path selection.
-    //   • ACP path (preferred · runChatTurnAcp): chat 의 자기 POST 가 ACP
+    //   • ACP path (preferred · runChatTurnAcp): chat 의 자기 turn 이 ACP
     //     `session/prompt` RPC + chunks listener. webterm dock 과 같은
     //     architecture, daemon-side 의 단일 broadcast pipeline 활용.
     //   • SSE fallback (legacy · runChatTurnStreaming): sessionId 미발급
@@ -466,6 +461,9 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     //     에서 SSE handler 자체 제거 시 fallback 도 함께 제거.
     const acpInst = acpRef.current;
     const useAcpPath = Boolean(acpInst && sessionId && config.baseUrl);
+    // Keep the turn's own lease across the session-adoption effect cleanup.
+    // The handshake may replace a stale stored id before session/prompt starts.
+    let turnAcp: AcpConnection | null = null;
     debugLog('webterm.chat.runturn.path', { useAcpPath, hasAcp: !!acpInst, hasSession: !!sessionId });
     const onPartial = (full: string): void => {
       setMessages((prev) =>
@@ -488,8 +486,12 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       );
     };
     try {
+      if (useAcpPath) turnAcp = client.connectAcp({ sessionId });
       const { message, newSessionId } = useAcpPath
-        ? await runChatTurnAcp(acpInst!, composedText, ctx, {
+        ? await runChatTurnAcp(turnAcp!, composedText, {
+            ...ctx,
+            sessionId: (await turnAcp!.ready) || sessionId,
+          }, {
             signal: ac.signal,
             ...(userContentBlocks ? { userContent: userContentBlocks } : {}),
             onPartial,
@@ -499,13 +501,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             signal: ac.signal,
             ...(userContentBlocks ? { userContent: userContentBlocks } : {}),
             ...(drawerOpen ? { debugTap: true } : {}),
-            // PR-D — forward the picker's choice as `tools`. Undefined
-            // when the picker is at "default", which omits the field so
-            // the daemon's configured surface (CLI `--tools` or
-            // `global.tools`) stays authoritative.
-            ...(surfacePreferenceToWire(surfacePreference) !== undefined
-              ? { tools: surfacePreferenceToWire(surfacePreference)! }
-              : {}),
             onPartial,
             onPartialBlocks,
             onError: (info) => setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, {
@@ -555,6 +550,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         debugLog('webterm.chat.runturn.error', { reason: msg, useAcpPath });
       }
     } finally {
+      turnAcp?.close();
       setPending(false);
       setAbortController(null);
       localTurnInFlightRef.current = false;
@@ -744,6 +740,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
               previous: sessionId,
               issued,
             });
+            props.onSessionAdopt?.(issued);
             setSessionId(issued);
           }
         },
@@ -818,34 +815,16 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     };
   }, [client, sessionId, config.baseUrl, config.provider]);
 
-  // M4 of PLAN-ask-user-question-cross-surface-2026-05-13 — wire the
-  // inbound AskUserQuestion handler. When the daemon's bridge pushes a
-  // `elanous/ask/request` extMethod, this hook stashes it as
-  // `askPending`; AskQuestionSheet below renders the modal. "Chat about
-  // this" calls onComposerPrefill — TODO PR: pipe the prefill text into
-  // ChatInput (composer 측 prop · 별 PR 로 분리).
+  // An inbound AskUserQuestion's "Chat about this" action fills the
+  // mounted composer as well as the shared one-shot handoff.
   const askQuestion = useAskQuestion({
     acp: acpForAsk,
     onComposerPrefill: (req) => {
       const first = req.questions[0];
       if (!first) return;
       const prefill = `[ Q: ${first.question.trim()} ]\n\n`;
-      // SHARE_PREFILL_KEY 패턴 재활용 — ChatInput 의 mount-time prefill
-      // hook (`/app/share/` 와 동일 메커니즘) 이 sessionStorage 값을 읽음.
-      // 단점: ChatInput 가 이미 mount 됐으면 다시 trigger 하려면 force
-      // remount 또는 별도 effect 가 필요. 후속 PR 에서 controlled prop
-      // 으로 교체. v1 은 toast 만 띄워 사용자 알림 (실제 prefill 동작은
-      // ChatInput follow-up).
-      try {
-        if (typeof window !== 'undefined') {
-          window.sessionStorage.setItem('elanous.chat.share-prefill', prefill);
-          // ChatInput 의 useEffect 가 mount 시점에만 sessionStorage 를 보므로,
-          // 새로 띄울 때 효과. 본 release 는 사용자에게 안내 + 후속 PR 에서
-          // ChatInput controlled-value prop 으로 즉시 적용.
-        }
-      } catch {
-        /* swallow — sessionStorage may be disabled */
-      }
+      writeSharePrefill(prefill);
+      setComposerPrefill((previous) => ({ text: prefill, id: (previous?.id ?? 0) + 1 }));
       toast.info('💬 입력 영역에 질문 prefill 됨 (Chat about this)');
     },
   });
@@ -866,12 +845,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           <VoiceCostPill />
         </div>
         <div className="flex items-center gap-2">
-          <ProviderPicker />
-          {/* PR-D (2026-05-13) — per-turn daemon tool surface override.
-              Clusters with ProviderPicker so "this-turn settings" stay
-              together; null (default) preserves daemon's configured
-              surface, named kinds inject as body.tools. */}
-          <SurfacePicker />
           {/* Phase 1 (voice 일원화) — header mic toggle (large).
               Mirrors the small mic in ChatInput; pressing either drives
               the same voice controller. Daemon URL not configured →
@@ -975,6 +948,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       )}
       <ChatInput
         onSubmit={handleSubmit}
+        prefill={composerPrefill}
         disabled={pending}
         attachments={pendingAttachments}
         onAttached={handleAttached}
@@ -1014,23 +988,6 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
                   typeof e?.name === 'string' && typeof e?.description === 'string')
                 .map((e) => ({ name: e.name, description: e.description }));
               return { entries };
-            }
-          : undefined}
-        getCodexPlugins={acpForAsk && sessionId
-          ? async () => {
-              // PLAN-codex-app-server-hermes-parity §5 Phase H2·4
-              // (2026-05-16) — codex CLI plugin list. Daemon caches 5
-              // min so calling on every BackendPickerChip mount /
-              // backend-change is fine.
-              const result = await acpForAsk.send('elanous/codex/plugins', {
-                sessionId,
-              }) as { plugins?: Array<{ name?: string; marketplace?: string; enabled?: boolean }> };
-              return (result.plugins ?? [])
-                .filter((p): p is { name: string; marketplace: string; enabled: boolean } =>
-                  typeof p?.name === 'string'
-                  && typeof p?.marketplace === 'string'
-                  && typeof p?.enabled === 'boolean')
-                .map((p) => ({ name: p.name, marketplace: p.marketplace, enabled: p.enabled }));
             }
           : undefined}
       />

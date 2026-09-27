@@ -6,7 +6,7 @@ import {
   type ApmMissionSnapshot,
 } from './mission-autopilot.js';
 import { createMission } from './mission.js';
-import { TaskStore } from './store.js';
+import { TaskStore, TOX_SCHEMA_VERSION } from './store.js';
 
 describe('apmStatusToMissionStatus', () => {
   it('실행/종료 상태를 TOX 5-state 로 매핑', () => {
@@ -131,10 +131,11 @@ describe('store round-trip — autopilot_json 영속화 (U1)', () => {
     }
   });
 
-  it('schema version 이 v3 (autopilot_json 흡수)', () => {
+  it('schema version 이 현재판이고 v3(autopilot_json 흡수) 이상 — v4 = 외부 태스크 신원·승인', () => {
     const store = new TaskStore({ path: ':memory:', noWal: true });
     try {
-      expect(store.schemaVersion()).toBe(3);
+      expect(store.schemaVersion()).toBe(TOX_SCHEMA_VERSION);
+      expect(store.schemaVersion()).toBeGreaterThanOrEqual(3);
     } finally {
       store.close();
     }

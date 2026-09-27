@@ -483,6 +483,26 @@ describe('handleMcpHttpPost — access and malformed preservation', () => {
     expect(executions).toBe(0);
   });
 
+  test('loopback peer behind a proxy (X-Forwarded-For · Tailscale-*) is not trusted without a token — RFC 공개 MCP M0', async () => {
+    let executions = 0;
+    registerToolRuntime(makeProgressRuntime('xcode.build', { onRun() { executions += 1; } }));
+    const proxiedHeaders: Record<string, string>[] = [{ 'x-forwarded-for': '100.83.1.69' }, { 'tailscale-user-login': 'someone@example.com' }, { forwarded: 'for=203.0.113.9' }];
+    for (const proxied of proxiedHeaders) {
+      const res = await handleMcpHttpPost(
+        jsonRpcReq({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'xcode.build', arguments: {} } }, proxied),
+        loopbackContext(),
+      );
+      expect(res.status).toBe(401);
+    }
+    expect(executions).toBe(0);
+    // 대조군: 같은 요청이 프록시 표식 없이 루프백에서 직접 오면 종전대로 통과한다(이 기계의 로컬 클라이언트).
+    const direct = await handleMcpHttpPost(
+      jsonRpcReq({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }),
+      loopbackContext(),
+    );
+    expect(direct.status).toBe(200);
+  });
+
   test('non-JSON body → 400 parse error with frozen envelope bytes', async () => {
     const req = new Request('http://test.local/v1/mcp', {
       method: 'POST',

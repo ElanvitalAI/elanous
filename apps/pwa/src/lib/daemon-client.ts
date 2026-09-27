@@ -1,14 +1,14 @@
 /**
  * Unified daemon client — REST + WS multiplex.
  *
- * REST  : POST /v1/prompt · GET /v1/health
+ * REST  : POST /v1/prompt/stream (SSE fallback) · GET /v1/health
  * WS    : /v1/acp (ACP multiplex) · /v1/voice/ws (voice frame protocol)
  *
  * The WS surfaces are wrapped behind connectAcp() / connectVoice() so callers
  * never touch raw WebSocket lifecycle. Reconnect / backoff is the connection's
  * job, not the consumer's.
  *
- * Slice U-2 contract — REST.prompt + connectAcp skeleton with frame typing.
+ * Chat turns prefer ACP session/prompt; REST streaming is the fallback.
  * Voice connection is a thin wrapper around the existing voice-websocket.ts
  * frame protocol so the / page keeps working unchanged.
  */
@@ -34,21 +34,6 @@ import {
  *  the SDK on the client. The daemon validates that each block has a
  *  `type` string before dispatching. */
 export type PromptUserContentBlock = { type: string; [key: string]: unknown };
-
-/** PR-D (PWA surface picker · 2026-05-13) — daemon tool-surface kind
- *  literal union. Mirrors `DaemonToolSurfaceKind` in
- *  `src/boot/daemon-tools/types.ts`; kept as a PWA-local copy so the
- *  client bundle has no transitive import from the daemon source tree.
- *  Validation lives daemon-side (`parseDaemonPromptBody`) — wire any
- *  string here and the daemon rejects unknown kinds with 400. */
-export type DaemonToolSurfaceKind = 'none' | 'readonly' | 'chat' | 'webterm';
-
-export const DAEMON_TOOL_SURFACE_KINDS: readonly DaemonToolSurfaceKind[] = [
-  'none',
-  'readonly',
-  'chat',
-  'webterm',
-];
 
 /** §3.6 (2026-05-10) — multi-host LLM resolver shape (FU.A1 / FU.A3).
  *  Mirrors `LlmHostConfig` in `src/nexus/api/llm-hosts.ts` so the PWA
@@ -88,12 +73,6 @@ export interface PromptRequest {
   /** P-3 §6.9 (2026-05-07) — see {@link PromptUserContentBlock}. */
   userContent?: PromptUserContentBlock[];
   provider?: string;
-  /** PR-D (PWA surface picker · 2026-05-13) — per-request tool-surface
-   *  override. When present, the daemon swaps its boot-time surface for
-   *  this kind on the turn only. ChatLayout reads the user's preference
-   *  via `useSurfacePreference()` and injects here so the SurfacePicker
-   *  segmented control is the single source of truth for surface choice. */
-  tools?: DaemonToolSurfaceKind;
 }
 
 export interface PromptResponse {
@@ -215,8 +194,7 @@ export interface DaemonLogsResponse {
 
 /** Phase B-1 (PWA chat streaming · 2026-05-06) — handler set passed to
  *  `DaemonClient.promptStream`. All callbacks are optional; the
- *  returned `PromptResponse` mirrors the non-streaming `prompt()` so
- *  callers can ignore deltas and still get a final result. */
+ *  returned `PromptResponse` includes the final result even when callers ignore deltas. */
 export interface PromptStreamErrorPayload {
   error: string;
   message?: string;
@@ -335,7 +313,10 @@ export interface AcpConnection {
 
 export type DaemonTerminalControlResult = {
   status: 'success' | 'unknown-pty' | 'denied' | 'failed' | 'owner-unreachable';
+  reason?: string;
 };
+
+export type DaemonTerminalSnapshotResult = DaemonTerminalControlResult & { screen?: string };
 
 export type DaemonTerminalRenameResult =
   | { status: 'success'; id: string; name: string }
@@ -396,18 +377,6 @@ export class DaemonClient {
 
   async health(): Promise<{ ok: boolean }> {
     return this.fetchJson<{ ok: boolean }>('/v1/health');
-  }
-
-  async prompt(req: PromptRequest): Promise<PromptResponse> {
-    debugLog('webterm.rest.prompt', { sessionId: req.sessionId, len: req.userText.length });
-    const res = await fetch(this.url('/v1/prompt'), {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...this.authHeaders() },
-      body: JSON.stringify(req),
-    });
-    if (res.status === 401) reportAuthRequired('/v1/prompt');
-    if (!res.ok) throw new Error(`prompt ${res.status}: ${await res.text()}`);
-    return res.json() as Promise<PromptResponse>;
   }
 
   /** Phase B-4 follow-up (2026-05-06) — long-lived observer SSE for a
@@ -645,8 +614,7 @@ export class DaemonClient {
     };
   }
 
-  /** Phase B-1 (PWA chat streaming) — SSE variant of `prompt`. Same
-   *  request body; consumes `text/event-stream` from
+  /** Phase B-1 (PWA chat streaming) — SSE fallback consumes `text/event-stream` from
    *  `/v1/prompt/stream` and dispatches per-event into `handlers`.
    *  Resolves with the final `turn-end` payload or rejects on `error`
    *  event / non-200 status. */
@@ -665,7 +633,12 @@ export class DaemonClient {
         accept: 'text/event-stream',
         ...this.authHeaders(),
       },
-      body: JSON.stringify(req),
+      body: JSON.stringify({
+        ...(req.sessionId !== undefined ? { sessionId: req.sessionId } : {}),
+        userText: req.userText,
+        ...(req.userContent !== undefined ? { userContent: req.userContent } : {}),
+        ...(req.provider !== undefined ? { provider: req.provider } : {}),
+      }),
     };
     if (handlers.signal) init.signal = handlers.signal;
     const path = handlers.debugTap === true
@@ -764,12 +737,33 @@ export class DaemonClient {
     return this.fetchJson(`/v1/terminals/${safe}/scrollback?${query}`);
   }
 
+  async snapshotTerminal(id: string, options: { ansi: boolean; sourceRoot?: string }): Promise<DaemonTerminalSnapshotResult> {
+    return this.requestTerminalControl(id, { action: 'snapshot', ansi: options.ansi }, options);
+  }
+
+  async sendTerminalText(id: string, text: string, options: DaemonTerminalDetailOptions = {}): Promise<DaemonTerminalControlResult> {
+    return this.requestTerminalControl(id, { action: 'input-text', chars: text }, options);
+  }
+
+  async sendTerminalKey(id: string, key: string, options: DaemonTerminalDetailOptions = {}): Promise<DaemonTerminalControlResult> {
+    return this.requestTerminalControl(id, { action: 'input-key', chars: key }, options);
+  }
+
   /** Request ownership control for a PTY. The daemon's five outcomes remain
    * distinct so callers can choose a different recovery path for each one. */
   async controlTerminal(
     id: string,
     action: 'takeover' | 'release',
+    options: DaemonTerminalDetailOptions = {},
   ): Promise<DaemonTerminalControlResult> {
+    return this.requestTerminalControl(id, { action }, options);
+  }
+
+  private async requestTerminalControl(
+    id: string,
+    request: { action: 'takeover' | 'release' | 'snapshot' | 'input-text' | 'input-key'; ansi?: boolean; chars?: string },
+    options: DaemonTerminalDetailOptions = {},
+  ): Promise<DaemonTerminalSnapshotResult> {
     const expectedStatus: Record<DaemonTerminalControlResult['status'], number> = {
       success: 200,
       'unknown-pty': 404,
@@ -778,10 +772,11 @@ export class DaemonClient {
       'owner-unreachable': 504,
     };
     const safe = encodeURIComponent(id);
-    const res = await fetch(this.url(`/v1/terminals/${safe}/control`), {
+    const query = options.sourceRoot ? `?sourceRoot=${encodeURIComponent(options.sourceRoot)}` : '';
+    const res = await fetch(this.url(`/v1/terminals/${safe}/control${query}`), {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...this.authHeaders() },
-      body: JSON.stringify({ action }),
+      body: JSON.stringify(request),
     });
     if (res.status === 401) reportAuthRequired(`/v1/terminals/${safe}/control`);
     let body: unknown;
@@ -804,7 +799,15 @@ export class DaemonClient {
         : undefined;
       throw new Error(`terminal control ${res.status}: ${String(detail ?? 'unexpected response')}`);
     }
-    return { status: normalized };
+    const payload = body as { screen?: unknown; reason?: unknown };
+    if (request.action === 'snapshot' && normalized === 'success' && typeof payload.screen !== 'string') {
+      throw new Error(`terminal control ${res.status}: missing screen`);
+    }
+    return {
+      status: normalized,
+      ...(typeof payload.reason === 'string' ? { reason: payload.reason } : {}),
+      ...(request.action === 'snapshot' && typeof payload.screen === 'string' ? { screen: payload.screen } : {}),
+    };
   }
 
   /** Rename a PTY while preserving the daemon's caller-visible outcome distinctions. */
@@ -1592,7 +1595,11 @@ class AcpConnectionImpl implements AcpConnection {
       // ndjson framing — daemon-side ndJsonStream parses by '\n'.
       // Without the terminator, the server-side parser holds the frame
       // in its buffer indefinitely (no handler dispatch, no response).
-      try { this.ws.send(JSON.stringify(frame) + '\n'); } catch (e) { reject(e); }
+      try { this.ws.send(JSON.stringify(frame) + '\n'); } catch (e) {
+        this.pending.delete(id);
+        reject(e);
+        this.closeIfUnused();
+      }
     });
   }
 
@@ -1621,7 +1628,17 @@ class AcpConnectionImpl implements AcpConnection {
   release(): void {
     this.leases = Math.max(0, this.leases - 1);
     if (this.leases !== 0) return;
-    this.dispose(new Error('ACP transport released'));
+    if (this.pending.size > 0) {
+      debugLog('webterm.acp.release-deferred', { pending: this.pending.size });
+      return;
+    }
+    this.closeIfUnused();
+  }
+
+  private closeIfUnused(): void {
+    if (this.leases === 0 && this.pending.size === 0 && !this.isTerminal) {
+      this.dispose(new Error('ACP transport released'));
+    }
   }
 
   dispose(error: Error = new Error('ACP transport disposed')): void {
@@ -1851,6 +1868,9 @@ class AcpConnectionImpl implements AcpConnection {
       this.pending.delete(frame.id);
       if (frame.error) p.reject(new Error(frame.error.message));
       else p.resolve(frame.result);
+      // A reply may itself trigger another send in the caller's microtask.
+      // Defer retirement until that continuation has had a chance to run.
+      queueMicrotask(() => this.closeIfUnused());
     } else if (
       // M4 of PLAN-ask-user-question-cross-surface-2026-05-13 — inbound
       // JSON-RPC request from the server (id present + method present +

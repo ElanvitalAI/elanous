@@ -15,12 +15,12 @@ import {
 } from '../src/workflow-runtime/node-catalog';
 
 describe('NODE_CATALOG · invariants', () => {
-  it('covers all 20 expected node kinds (v1)', () => {
+  it('covers all 21 expected node kinds (v1 ⊕ task)', () => {
     const expectedKinds = [
       'prompt', 'bash', 'skill', 'cft', 'approval',
       'if', 'switch', 'iteration',
       'classify', 'extract', 'set', 'filter', 'template',
-      'http',
+      'http', 'task',
       'scheduleTrigger', 'webhookTrigger', 'discordTrigger', 'telegramTrigger', 'manualTrigger', 'chatTrigger',
     ];
     const actualKinds = NODE_CATALOG.map(s => s.kind).sort();

@@ -15,8 +15,6 @@ export interface DashboardTurnMessageRuntimeDeps {
   contextText: string;
   contextRegistry: ContextRegistry;
   terminalRegistry: unknown;
-  addressBook: unknown;
-  windowRegistry: unknown;
   blockAttach: DashboardTurnBlockAttachLike;
   pushChatLine: (line: string) => void;
 }
@@ -34,8 +32,6 @@ export function buildDashboardTurnMessage(
 ): DashboardTurnMessageRuntimeResult {
   const expandedQuestion = expandPromptReferences(deps.userText, {
     terminalRegistry: deps.terminalRegistry as never,
-    addressBook: deps.addressBook as never,
-    windowRegistry: deps.windowRegistry as never,
   });
   const attachedBanner = deps.blockAttach.banner();
   if (attachedBanner) deps.pushChatLine(C.muted(`  ${attachedBanner}`));

@@ -181,7 +181,10 @@ describe('intake plane observability', () => {
     } finally {
       restore();
     }
-    const lifecycle = events.filter((event) => event.category === 'intake-plane.slash');
+    const slash = events.filter((event) => event.category === 'intake-plane.slash');
+    // 발사 전 점검(#20962 대상 저장소 가드)은 수명 사건이 아니다 — 먼저 ok 로 와야 하고, 본문 메타데이터는 싣지 않는다.
+    expect(slash[0]).toMatchObject({ event: 'harness-target', data: { ok: true } });
+    const lifecycle = slash.filter((event) => event.event !== 'harness-target');
     expect(lifecycle.map((event) => event.event)).toEqual(['harness-launching', 'harness-launched']);
     for (const event of lifecycle) assertSafeTextMetadata(event, body);
   });

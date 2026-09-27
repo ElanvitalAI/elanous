@@ -52,7 +52,7 @@ Much of elanous's view of the world depends on external services. `catalog/resou
 
 Two caveats:
 
-- Many credentialed resources still have an empty `free_fallback`, meaning "not measured", not "nothing breaks".
+- An empty `free_fallback` means "not measured", not "nothing breaks". As of 2026-09-27 every resource that needs a credential has one written; in a source checkout, `bun scripts/resource-map-check.ts` lists any that do not (`emptyFreeFallbackIds`).
 - The catalog only counts API keys. Dependencies that are installed binaries or browsers (the crawl skill, browser automation, Chrome/CDP) are not listed yet.
 
 Treat only capabilities with a written free fallback as dependable without payment. `elanous doctor` shows what is unlocked on your machine.

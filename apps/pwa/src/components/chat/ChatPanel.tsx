@@ -7,7 +7,7 @@
 // "다른 세션 attach" / "이 세션 잊기" dropdown 이 SessionPicker 를
 // 연다 (props.tabId 가 attachToTab mode 의 target).
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { ChatLayout } from './ChatLayout';
 import { useWorkspaceOptional } from '@/components/workspace/WorkspaceProvider';
 import { getSessionsService } from '@/lib/sessions-service';
@@ -26,6 +26,16 @@ export interface ChatPanelProps {
 export function ChatPanel(props: ChatPanelProps = {}) {
   const ws = useWorkspaceOptional();
   const { client, sessionId, setSessionId } = useDaemon();
+  const [conversationKey, setConversationKey] = useState(sessionId || 'default');
+  const adoptedSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (adoptedSessionRef.current === sessionId) {
+      adoptedSessionRef.current = null;
+      return;
+    }
+    adoptedSessionRef.current = null;
+    setConversationKey(sessionId || 'default');
+  }, [sessionId]);
 
   // 탭 ↔ 전역 세션 동기화 (2026-07-13) — attach(updateChatTab)·탭 활성
   // 전환이 실제 화면 세션(전역)으로 반영되고, ChatLayout 내부 전환(fork
@@ -65,9 +75,9 @@ export function ChatPanel(props: ChatPanelProps = {}) {
 
   return (
     <ChatLayout
-      // key=전역 세션 — 세션 전환 시 remount 로 이전 세션 버블/복원 레이스
-      // 제거 (R4 restore 가 fresh mount 에서 새 세션을 깨끗이 seed).
-      key={sessionId || 'default'}
+      // Only a selected session remounts; daemon adoption keeps the live turn.
+      key={conversationKey}
+      onSessionAdopt={(issued) => { adoptedSessionRef.current = issued; }}
       {...(onAttachRequest ? { onAttachRequest } : {})}
       {...(onForgetRequest ? { onForgetRequest } : {})}
       {...(props.tabId ? { tabId: props.tabId } : {})}

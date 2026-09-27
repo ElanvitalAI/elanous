@@ -54,8 +54,18 @@ describe('pod account broker — 병렬 Pod 가 한 계정에 몰리지 않게',
 describe('pod provider selection', () => {
   const candidates = (third: number) => [c('default', 100), c('team', 95), c('third', third)];
   const available = { grokSubscription: true, grokApiKey: false, grokApiKeyOptIn: false };
+  test('every usable codex account is exposed in remaining-usage order, including unknown usage last', () => {
+    const plan = planPodProvider({ codexCandidates: [c('unknown'), c('team', 74), c('default', 100, true), c('third', 47)], ...available });
+    expect(plan).toEqual({ provider: 'openai-codex', accounts: ['third', 'team', 'unknown'], excluded: [{ name: 'default', why: 'quota reached' }], grokSubscriptionEligible: true });
+    if (plan.provider !== 'openai-codex') throw new Error('expected codex provider');
+    const next = makePodAccountBroker({ usable: plan.accounts, excluded: plan.excluded });
+    const allocated = next();
+    expect([allocated, ...plan.accounts.filter((name) => name !== allocated)]).toEqual(['third', 'team', 'unknown']);
+    const secondAllocated = next();
+    expect([secondAllocated, ...plan.accounts.filter((name) => name !== secondAllocated)]).toEqual(['team', 'third', 'unknown']);
+  });
   test('100 · 95 · 85 → codex third, original account order', () => {
-    expect(planPodProvider({ codexCandidates: candidates(85), ...available })).toMatchObject({ provider: 'openai-codex', accounts: ['third'] });
+    expect(planPodProvider({ codexCandidates: candidates(85), ...available })).toMatchObject({ provider: 'openai-codex', accounts: ['third'], grokSubscriptionEligible: true });
   });
   test('provider selection forwards account overrides and reports each effective exclusion threshold', () => {
     const plan = planPodProvider({
@@ -65,6 +75,7 @@ describe('pod provider selection', () => {
     });
     expect(plan).toEqual({
       provider: null,
+      grokSubscriptionEligible: false,
       reasons: [
         'codex: default(used 70% ≥ 60%) · team(used 75% ≥ 70%) · third(used 85% ≥ 80%)',
         'grok: 구독 자격 없음 · API 키 없음',
@@ -73,10 +84,10 @@ describe('pod provider selection', () => {
     expect(planPodProvider({
       codexCandidates: [c('default', 70), c('team', 75)], ...available,
       excludeAt: 90, thresholdPercentByAccount: { default: 80 },
-    })).toEqual({ provider: 'openai-codex', accounts: ['default', 'team'], excluded: [] });
+    })).toEqual({ provider: 'openai-codex', accounts: ['default', 'team'], excluded: [], grokSubscriptionEligible: true });
     expect(planPodProvider({
       codexCandidates: [c('default', 70)], ...available, excludeAt: 90,
-    })).toEqual({ provider: 'grok', excluded: [{ name: 'default', why: 'used 70% ≥ 60%' }] });
+    })).toEqual({ provider: 'grok', excluded: [{ name: 'default', why: 'used 70% ≥ 60%' }], grokSubscriptionEligible: true });
   });
   test('100 · 95 · 96 → grok subscription', () => {
     expect(planPodProvider({ codexCandidates: candidates(96), ...available }).provider).toBe('grok');
@@ -87,7 +98,13 @@ describe('pod provider selection', () => {
     if (plan.provider !== null) throw new Error('expected no provider');
     expect(plan.reasons.join(' · ')).toMatch(/default.*100%.*team.*95%.*third.*96%.*grok.*opt-in 꺼짐/);
   });
-  test('all codex excluded, API key with opt-in → grok', () => {
-    expect(planPodProvider({ codexCandidates: candidates(96), grokSubscription: false, grokApiKey: true, grokApiKeyOptIn: true }).provider).toBe('grok');
+  test('all codex excluded, API key with opt-in → grok, without subscription eligibility', () => {
+    expect(planPodProvider({ codexCandidates: candidates(96), grokSubscription: false, grokApiKey: true, grokApiKeyOptIn: true })).toMatchObject({ provider: 'grok', grokSubscriptionEligible: false });
+  });
+  test('subscription eligibility is independent of API-key opt-in even when codex is usable', () => {
+    const plan = planPodProvider({ codexCandidates: [c('third', 47)], grokSubscription: true, grokApiKey: true, grokApiKeyOptIn: false });
+    expect(plan).toMatchObject({ provider: 'openai-codex', accounts: ['third'], grokSubscriptionEligible: true });
+    const withoutSubscription = planPodProvider({ codexCandidates: [c('third', 47)], grokSubscription: false, grokApiKey: true, grokApiKeyOptIn: true });
+    expect(withoutSubscription).toMatchObject({ provider: 'openai-codex', accounts: ['third'], grokSubscriptionEligible: false });
   });
 });

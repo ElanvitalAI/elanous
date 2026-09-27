@@ -5,6 +5,7 @@ import { join, resolve } from 'path';
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
 import { listSshHosts } from './ssh/ssh-hosts.js';
 import { isInstalledPackagePath } from './instance/installed-package.js';
+import { defaultObsidianVault } from './obsidian/default-vault.js';
 
 // ── User config ──
 export const REMOTE_HOME = homedir();
@@ -50,8 +51,7 @@ export const DB_PATH = join(DATA_DIR, 'sync.db');
 // Root directory of the user's Obsidian vault. The working-dir V1
 // layout pairs a Working browser and an Obsidian browser side by side
 // so results saved to Obsidian are one pane-focus away.
-export const OBSIDIAN_VAULT =
-  process.env.OBSIDIAN_VAULT || join(REMOTE_HOME, 'Obsidian', 'ElanvitalAI');
+export const OBSIDIAN_VAULT = defaultObsidianVault({ env: process.env, home: REMOTE_HOME });
 
 // ── Servers (SSH host aliases) ──
 // `local` is a first-class target for syncing between local agent runtimes

@@ -2,6 +2,7 @@ import { afterAll, describe, expect, mock, test } from 'bun:test';
 import { createRequire } from 'node:module';
 
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
+import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 
 import { initialTerminalNotice } from './initial-terminal-notice';
 
@@ -81,7 +82,11 @@ const client = {
     return { status: controlMode };
   },
 };
+// R-TST23 — process-global module mocks: snapshot and restore after this file.
+await restoreModuleMocksAfterAll(['@/components/providers/DaemonProvider', '@/lib/debug'], (specifier) => import(specifier));
+const actualDaemonProvider = { ...(await import('@/components/providers/DaemonProvider')) };
 mock.module('@/components/providers/DaemonProvider', () => ({
+  ...actualDaemonProvider,
   useDaemon: () => ({ client, sessionId: 'session-test' }),
 }));
 /** ⛔ no-op stub 이면 「관측에 남는다」를 원리상 못 잰다(무인 리뷰 must-fix · #10105). 잡아 둔다. */
@@ -175,47 +180,36 @@ async function renderTabs(
   await harness.settle();
 }
 
-describe('TerminalTabs PTY-list selection interaction', () => {
-  test('adds a selected PTY once, then activates the existing tab without duplication', async () => {
+describe('TerminalTabs initial daemon issuance interaction', () => {
+  test('direct PTY links defer shell issuance until the live view is closed', async () => {
     const { TerminalTabs } = await import('./TerminalTabs');
     const active: string[] = [];
-    const tabSnapshots: string[][] = [];
-    let selection: { id: string; nonce: number } | null = { id: 'pty-new', nonce: 1 };
-    const PanelTabs = () => {
-      const [activeId, setActiveId] = react.useState<string | null>('existing');
-      const onActiveChange = react.useCallback((id: string) => { active.push(id); setActiveId(id); }, []);
-      const onTabsChange = react.useCallback((tabs: readonly string[]) => { tabSnapshots.push([...tabs]); }, []);
-      return TerminalTabs({ activeId, onActiveChange, ptyTabSelection: selection, onTabsChange });
-    };
+    let suspended = true;
+    const PanelTabs = () => TerminalTabs({
+      activeId: active.at(-1) ?? null,
+      onActiveChange: (id) => active.push(id),
+      suspendInitialSpawn: suspended,
+    });
     harness.unmount();
     storage.clear();
-    storage.set('elanous.webterm.tabs', JSON.stringify(['existing']));
     connection.state = 'CONNECTING';
-    debugCalls.length = 0;
+    spawnCalls = 0;
+    issued = 0;
     harness.render(PanelTabs as never);
     await harness.settle();
-
-    expect(active).toEqual(['pty-new']);
-    expect(storage.get('elanous.webterm.tabs')).toBe('["existing","pty-new"]');
-    expect(tabSnapshots.at(-1)).toEqual(['existing', 'pty-new']);
-    expect(debugCalls.filter((call) => call.event === 'webterm.tabs.pty-select.add')).toEqual([
-      { event: 'webterm.tabs.pty-select.add', data: { id: 'pty-new', total: 2 } },
-    ]);
-
-    selection = { id: 'pty-new', nonce: 2 };
+    connection.state = 'OPEN';
+    harness.act(() => stateListener?.('OPEN'));
+    await harness.settle();
+    expect(spawnCalls).toBe(0);
+    expect(active).toEqual([]);
+    suspended = false;
     harness.render(PanelTabs as never);
     await harness.settle();
-
-    expect(active).toEqual(['pty-new', 'pty-new']);
-    expect(storage.get('elanous.webterm.tabs')).toBe('["existing","pty-new"]');
-    expect(debugCalls.filter((call) => call.event === 'webterm.tabs.pty-select.existing')).toEqual([
-      { event: 'webterm.tabs.pty-select.existing', data: { id: 'pty-new', total: 2 } },
-    ]);
-    expect(debugCalls.filter((call) => call.event.startsWith('webterm.tabs.pty-select'))).toHaveLength(2);
+    expect(spawnCalls).toBe(1);
+    expect(active).toContain('daemon-1');
+    expect(storage.get('elanous.webterm.tabs')).toBe('["daemon-1"]');
   });
-});
 
-describe('TerminalTabs initial daemon issuance interaction', () => {
   test('does not fall back before ACP opens, then adopts the daemon response and reports its provenance', async () => {
     const active: string[] = [];
     const states: unknown[] = [];
@@ -577,7 +571,9 @@ describe('TerminalTabs terminal provenance rendering', () => {
     expect(labels[0]).toContain('통제: operator');
     expect(labels[1]).toContain('외부 도구: codex');
     expect(labels[1]).not.toContain('통제:');
-    expect(labels[2]).toContain('이 행에서는 알 수 없음: legacy daemon');
+    // #20967 — 출처를 모르면 탭 «글자»에는 안 붙이고 툴팁(title)에만 둔다.
+    expect(labels[2]).not.toContain('이 행에서는 알 수 없음');
+    expect(String(switchButton('unknown').props.title)).toContain('이 행에서는 알 수 없음: legacy daemon');
     expect(labels[2]).not.toContain('사람');
     expect(new Set(labels)).toHaveLength(3);
   });

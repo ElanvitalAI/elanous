@@ -10,7 +10,8 @@ import { readPtyEventsAfter, readPtyEventsAfterAt, type PtyEventLogReadResult, t
 import { resolvePtyRef, type PtyRefItem } from '../pty-shell/pty-ref.js';
 import { parsePtyWriteActor, resolveRemoteControlActor, resolveTakeover, type PtyWriteActor } from '../pty-shell/pty-write-arbiter.js';
 import { registerPtyAttachDriveCommand } from './pty-drive-cli.js';
-import { resolveNexusPwa, type NexusPwaLinkSource, type NexusPwaResolution, type NexusPwaUnavailableReason } from './nexus-show.js';
+import { resolveNexusPwa, type NexusPwaResolution } from './nexus-show.js';
+import { formatPtyWebAddress, ptyWebAddress, type PtyWebAddress } from './pty-web-address.js';
 import { getHarnessRunId, normalizeRunIdSource, type RunIdSource } from '../harness/harness-space.js';
 import { inspectControlInbox, type ControlInboxSnapshot } from '../harness/control-inbox.js';
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../pty-shell/pty-control-ipc.js';
@@ -1177,24 +1178,6 @@ export function ptyListRunTermination(
   return runStoreResolution(runId, ledgerDirectories, readRunStore, alive, processStartedAt);
 }
 
-/** ⛔⭐⭐ **세 칸이 «언제나» 나온다 — 값이 없으면 `null` 이다.**
- *
- *  🩸 한때 이 셋을 «선택 키»로 뒀고, 그래서 로컬(등록됨)과 원격의 `Object.keys()` 가 갈렸다.
- *     나는 그것을 *"원격이 저쪽 PWA 주소를 지어내야 하니 원리상 불가"* 라고 적었는데 ***틀렸다*** —
- *     ***`webUrl: null` 이면 지어내지 않고도 키가 보존된다***(리뷰가 그 길을 줬다).
- *  ⇒ 이제 출처·상태와 무관하게 키 집합이 «하나»이고, 소비자는 분기하지 않는다.
- *  ⛔ `null` 과 「값 있음」을 구별하는 것은 소비자의 몫이고, 그 구별은 «값»으로 남는다. */
-interface PtyWebAddress {
-  /** ⭐ `'remote-not-queried'` 는 ***원격 행 전용***이다 — 저쪽 PWA 를 «묻지 않았다».
-   *  ⛔ `'pwa-url-unknown'`(데몬은 있는데 PWA 미등록)과 «다른 사실»이라 재사용하지 않는다.
-   *  ⛔ 공용 유니온(`NexusPwaUnavailableReason`)은 «안 넓힌다» — 이 파일의 계약만 넓힌다. */
-  readonly pwaUnavailableReason: NexusPwaUnavailableReason | 'remote-not-queried' | null;
-  readonly webUrl: string | null;
-  /** ⭐ 이 링크가 이 기계 «밖»에서 열리나 — `tailnet` 이면 다른 기기에서 열린다.
-   *  ⛔ 이 칸이 없으면 사람이 링크만 보고 그것을 «알 수 없다». */
-  readonly webUrlSource: NexusPwaLinkSource | null;
-}
-
 /** 원격 행의 웹 주소 — 우리는 저쪽 PWA 를 «묻지 않았다». 지어내지 않고 «모른다»를 값으로 낸다. */
 const REMOTE_WEB_ADDRESS: PtyWebAddress = {
   webUrl: null,
@@ -1208,25 +1191,6 @@ const UNRESOLVED_WEB_ADDRESS: PtyWebAddress = {
   webUrlSource: null,
   pwaUnavailableReason: null,
 };
-
-function ptyWebAddress(ptyId: string, pwa: NexusPwaResolution): PtyWebAddress {
-  if ('url' in pwa) {
-    // ⛔⭐ `loopback` 이 아니라 `url` 을 읽는다 — 해석기가 「밖에서 여는 주소」를 이미 «골랐다».
-    //   종전엔 `loopback` 을 읽어, 해석기가 사설망 주소를 골라도 링크는 되돌이로 나왔다(`GOAL-T80`).
-    const url = new URL('term', pwa.url);
-    url.search = new URLSearchParams({ pty: ptyId }).toString();
-    return { webUrl: url.toString(), webUrlSource: pwa.source, pwaUnavailableReason: null };
-  }
-  return { webUrl: null, webUrlSource: null, pwaUnavailableReason: pwa.reason };
-}
-
-function formatPtyWebAddress(address: PtyWebAddress): string {
-  if (address.webUrl) {
-    return address.webUrlSource === 'tailnet' ? `${address.webUrl} (tailnet)` : address.webUrl;
-  }
-  // ⛔ `null` 사유(=해석 안 함)와 「사유가 있다」를 구별해 낸다 — 둘을 한 문면으로 접지 않는다.
-  return `web-unavailable=${address.pwaUnavailableReason ?? 'not-resolved'}`;
-}
 
 interface PtyManifestSourceRoot {
   readonly name: string;

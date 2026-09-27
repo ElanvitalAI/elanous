@@ -165,6 +165,23 @@ function createContext(
   } as unknown as DashboardSlashContext;
 }
 
+test('/dashboard followed by /chat restores the chat layout (no /ui mode axis)', async () => {
+  const lines: string[] = [];
+  let chatOnlyMode = true;
+  const transitions: boolean[] = [];
+  const ctx = createContext(lines);
+  ctx.getChatOnlyMode = () => chatOnlyMode;
+  ctx.setChatOnlyLayout = (next) => { chatOnlyMode = next; transitions.push(next); };
+  const registry = buildDashboardSlashRegistry();
+  expect(registry.has('ui')).toBe(false);
+  expect(registry.has('workspace')).toBe(false);
+  await registry.dispatch('dashboard', [], ctx);
+  expect(chatOnlyMode).toBe(false);
+  await registry.dispatch('chat', [], ctx);
+  expect(chatOnlyMode).toBe(true);
+  expect(transitions).toEqual([false, true]);
+});
+
 test('/theme mirrors list output to ChatLog while preserving debug output', async () => {
   const preset = listThemes()[0];
   expect(preset).toBeDefined();
@@ -559,7 +576,7 @@ test('harness runs shows renderer summary before a capped run list and discloses
     ...runLines.slice(0, 8).map((line) => `  ${line}`),
     '  runs truncated: showing 8 of 10 total assessments',
   ]);
-  expect(queryRunningRuns).toHaveBeenCalledWith({ includeTest: false });
+  expect(queryRunningRuns).toHaveBeenCalledWith({ includeTest: false, caller: 'dashboard' });
   expect(renderRunningRuns).toHaveBeenCalledWith(expect.anything());
 });
 
@@ -581,7 +598,7 @@ test('harness runs uses the established running predicate and validates stop and
   const registry = buildDashboardSlashRegistry();
 
   await registry.dispatch('harness', ['runs'], createContext([]));
-  expect(queryRunningRuns).toHaveBeenCalledWith({ includeTest: false });
+  expect(queryRunningRuns).toHaveBeenCalledWith({ includeTest: false, caller: 'dashboard' });
   expect(renderRunningRuns).toHaveBeenCalledWith(expect.anything());
 
   await registry.dispatch('harness', ['stop', 'space-123'], createContext([]));
@@ -777,39 +794,6 @@ test('/debug keytrace on replies on chat and leaves debug empty', async () => {
   expect(debugLines).toEqual([]);
 });
 
-test('/perf on then off replies on chat and leaves debug empty', async () => {
-  const registry = buildDashboardSlashRegistry();
-  const chatLines: string[] = [];
-  const debugLines: string[] = [];
-  const context = createContext(chatLines, undefined, debugLines);
-
-  try {
-    await expect(registry.dispatch('perf', ['on'], context))
-      .resolves.toEqual({ kind: 'continue' });
-    await expect(registry.dispatch('perf', ['off'], context))
-      .resolves.toEqual({ kind: 'continue' });
-    expect(chatLines.some((line) => line.includes('perf counters ON'))).toBe(true);
-    expect(chatLines.some((line) => line.includes('perf counters OFF'))).toBe(true);
-    expect(debugLines).toEqual([]);
-  } finally {
-    const { perf } = await import('../../perf-counters.js');
-    perf.disable();
-  }
-});
-
-test('/perf report keeps the dump on debug and leaves chat empty', async () => {
-  const registry = buildDashboardSlashRegistry();
-  const chatLines: string[] = [];
-  const debugLines: string[] = [];
-  const context = createContext(chatLines, undefined, debugLines);
-
-  await expect(registry.dispatch('perf', ['report'], context))
-    .resolves.toEqual({ kind: 'continue' });
-  expect(chatLines).toEqual([]);
-  expect(debugLines.length).toBeGreaterThan(0);
-  expect(debugLines.some((line) => line.includes('perf'))).toBe(true);
-});
-
 test('/log twelve subcommands emit no debug lines', async () => {
   const registry = buildDashboardSlashRegistry();
   const subcommands: string[][] = [
@@ -876,18 +860,18 @@ test('dashboard catalog exposes only the unified harness entry for every harness
   const harness = SLASH_COMMANDS.find((command) => command.name === 'harness');
   expect(harness).toMatchObject({
     aliases: [],
-    subcommands: ['plan', 'ask', 'implement', 'goal', 'runs', 'stop', 'memo'],
+    subcommands: ['plan', 'ask', 'dev', 'goal', 'runs', 'stop', 'memo'],
   });
   for (const retiredName of ['ask', 'say', 'dev', 'goal', 'g', 'implement']) {
     expect(displayedSlashCommandNames()).not.toContain(retiredName);
   }
 });
 
-test('remaining slash is registered next to budget and does not steal /usage', () => {
+test('remaining slash stays registered and listed after retiring budget and usage', () => {
   const registry = buildDashboardSlashRegistry();
   expect(registry.has('remaining')).toBe(true);
-  expect(registry.has('budget')).toBe(true);
-  expect(registry.has('usage')).toBe(true);
+  expect(registry.has('budget')).toBe(false);
+  expect(registry.has('usage')).toBe(false);
   const remaining = SLASH_COMMANDS.find((command) => command.name === 'remaining');
   expect(remaining?.name).toBe('remaining');
 });
@@ -904,7 +888,7 @@ test('dashboard catalog and registry stay synchronized except for the recorded d
   for (const name of registered) {
     if (!registeredOnly.has(name)) expect(listed).toContain(name);
   }
-  for (const name of ['harness', 'status', 'st', 'codex-setup', 'codex-init']) {
+  for (const name of ['harness', 'status', 'st']) {
     expect(listed).toContain(name);
     expect(registered).toContain(name);
   }
@@ -931,18 +915,6 @@ test('status and st on the human surface reuse the immediate executor lines', as
   expect(agent).not.toBeNull();
   expect(agent!.logLines).toEqual(statusLines);
   expect(humanLines).toEqual(statusLines);
-});
-
-test('codex-setup on the human surface names the next command to type', async () => {
-  const lines: string[] = [];
-  await expect(buildDashboardSlashRegistry().dispatch('codex-setup', [], createContext(lines)))
-    .resolves.toEqual({ kind: 'continue' });
-  expect(lines.some((line) => line.includes('elanous codex setup'))).toBe(true);
-
-  const initLines: string[] = [];
-  await expect(buildDashboardSlashRegistry().dispatch('codex-init', [], createContext(initLines)))
-    .resolves.toEqual({ kind: 'continue' });
-  expect(initLines.some((line) => line.includes('elanous codex setup'))).toBe(true);
 });
 
 test('restoring a removed listed-only name fails the catalog baseline by that name', () => {

@@ -60,10 +60,12 @@ import { elanousSkillsListRuntime } from './elanous-skills-list-runtime.js';
 import { skillExecRuntime } from './skill-exec-runtime.js';
 import { elanousObsidianSearchRuntime } from './elanous-obsidian-search-runtime.js';
 import { elanousObsidianInfoRuntime } from './elanous-obsidian-info-runtime.js';
+import { ELANOUS_ASANA_RUNTIMES } from './elanous-asana-runtimes.js';
 import { elanousFsListRuntime } from './elanous-fs-list-runtime.js';
 import { elanousFsReadRuntime } from './elanous-fs-read-runtime.js';
 import { elanousShowroomBroadcastRuntime } from './elanous-showroom-broadcast-runtime.js';
 import { elanousAutopilotLaunchRuntime } from './elanous-autopilot-launch-runtime.js';
+import { elanousTaskSubmitRuntime } from './elanous-task-submit-runtime.js';
 import { persistentGroundingRuntime } from './persistent-grounding-runtime.js';
 import { goalAuthorRuntime } from './goal-author-runtime.js';
 import { bootstrapMcpProxyRuntimes } from './mcp-proxy-bootstrap.js';
@@ -153,10 +155,12 @@ export function registerAllDefaultToolRuntimes(): void {
   registerToolRuntime(skillExecRuntime);
   registerToolRuntime(elanousObsidianSearchRuntime);
   registerToolRuntime(elanousObsidianInfoRuntime);
+  for (const rt of ELANOUS_ASANA_RUNTIMES) registerToolRuntime(rt);
   registerToolRuntime(elanousFsListRuntime);
   registerToolRuntime(elanousFsReadRuntime);
   registerToolRuntime(elanousShowroomBroadcastRuntime);
   registerToolRuntime(elanousAutopilotLaunchRuntime);
+  registerToolRuntime(elanousTaskSubmitRuntime);
   for (const rt of SELF_COGNITION_RUNTIMES) registerToolRuntime(rt);
   for (const rt of ELANOUS_CONTROL_RUNTIMES) registerToolRuntime(rt);
   // External MCP proxies already declare surfaces `['mcp','tui']`, but the
@@ -180,7 +184,6 @@ export {
   setDashboardToolsGetter,
 } from './dashboard-state-runtime.js';
 export { setContextRuntimeDeps } from './context-runtime.js';
-export { setControlRuntimeDeps } from '../skills/tools/control.js';
 export { setTerminalModalRuntimeDeps } from './terminal-modal-runtimes.js';
 
 export {

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { resolve, join } from 'node:path';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { childPath, planVersionPrune, relayImportClosure, rollbackTarget, runReleaseUpdate, runSelfUpdate, runUpdateForInstallation, updateRelay, versionCommit, type SelfUpdateDeps, type ReleaseUpdateDeps } from './self-update.js';
 import type { RestartNeededResult } from './nexus-restart-needed.js';
@@ -65,7 +65,7 @@ describe('runReleaseUpdate — release installer', () => {
     try {
       const result = await runReleaseUpdate({}, f.deps);
       expect(f.urls).toEqual(['https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh']);
-      expect(f.calls).toEqual([{ command: 'bash', args: ['-s', '--', '--no-modify-path', '--prefix', f.prefix], cwd: f.prefix, input: 'echo verified installer', env: { ELANOUS_VERSION: '', ELANOUS_INSTALL_SOURCE: '' } }]);
+      expect(f.calls).toEqual([{ command: 'bash', args: ['-s', '--', '--no-modify-path', '--prefix', f.prefix], cwd: f.prefix, input: 'echo verified installer', env: { ELANOUS_VERSION: '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases' } }]);
       expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0', restarted: false });
     } finally { f.cleanup(); }
   });
@@ -76,7 +76,7 @@ describe('runReleaseUpdate — release installer', () => {
     try {
       const result = await runReleaseUpdate({ version: '0.2.0-rc.1', restart: true, json: true }, f.deps);
       expect(f.urls).toEqual(['https://github.com/ElanvitalAI/elanous/releases/download/v0.2.0-rc.1/install.sh']);
-      expect(f.calls[0]?.env).toEqual({ ELANOUS_VERSION: '0.2.0-rc.1', ELANOUS_INSTALL_SOURCE: '' });
+      expect(f.calls[0]?.env).toEqual({ ELANOUS_VERSION: '0.2.0-rc.1', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: 'https://github.com/ElanvitalAI/elanous/releases' });
       expect(f.calls[1]).toEqual({ command: 'launchctl', args: ['kickstart', '-k', 'gui/501/com.elanous.nexus'], cwd: f.prefix, input: undefined, env: undefined });
       expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0-rc.1', restarted: true });
       expect(JSON.parse(f.lines[0]!)).toEqual(result);
@@ -111,6 +111,8 @@ describe('runReleaseUpdate — release installer', () => {
     mkdirSync(join(versions, 'a'));
     mkdirSync(join(versions, 'b'));
     mkdirSync(join(versions, 'c'));
+    for (const name of ['a', 'b', 'old']) utimesSync(join(versions, name), new Date('2020-01-01'), new Date('2020-01-01'));
+    utimesSync(join(versions, 'c'), new Date('2021-01-01'), new Date('2021-01-01'));
     writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.1.0', versionDir: 'versions/old' }));
     f.deps.run = (command) => {
       if (command === 'bash') writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.2.0', versionDir: 'versions/c' }));
@@ -120,6 +122,19 @@ describe('runReleaseUpdate — release installer', () => {
       const result = await runReleaseUpdate({ keep: 1 }, f.deps);
       expect(result.prune).toMatchObject({ kept: expect.arrayContaining(['old', 'c']), removed: expect.arrayContaining(['a', 'b']) });
       expect(result.prune?.skipped).toBeUndefined();
+    } finally { f.cleanup(); }
+  });
+
+  test('internal revision tag accepts package.json version only on a tailnet install source', async () => {
+    const f = setup();
+    const internal = 'https://mbp.tailnet-example.ts.net/elanous-internal';
+    writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.1.0', source: `${internal}/latest/download/elanous.tgz` }));
+    f.setInstalledVersion('0.2.0');
+    try {
+      const result = await runReleaseUpdate({ version: '0.2.0-abcdef123456' }, f.deps);
+      expect(f.urls).toEqual([`${internal}/download/v0.2.0-abcdef123456/install.sh`]);
+      expect(f.calls[0]?.env?.ELANOUS_RELEASE_BASE).toBe(internal);
+      expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0', releaseBaseSource: 'install-source' });
     } finally { f.cleanup(); }
   });
 
@@ -247,6 +262,49 @@ describe('self-update routing by install source (2026-09-25 🅣)', () => {
       expect(result.reason).toContain('--from');
       expect(f.calls).toEqual([]);
     } finally { rmSync(inst.prefix, { recursive: true, force: true }); }
+  });
+
+  test('release base follows install source, preserves public source and refuses tailnet to public env', async () => {
+    const tailBase = 'https://mbp.tailnet-example.ts.net/elanous-internal';
+    const publicBase = 'https://github.com/ElanvitalAI/elanous/releases';
+    const inst = installed(`${tailBase}/latest/download/elanous.tgz`);
+    const lines: string[] = [];
+    const urls: string[] = [];
+    const old = process.env.ELANOUS_RELEASE_BASE;
+    delete process.env.ELANOUS_RELEASE_BASE;
+    try {
+      const deps: ReleaseUpdateDeps = {
+        packageRoot: inst.packageRoot,
+        out: { log: (line) => lines.push(line), error: () => {} },
+        fetchInstaller: async (url) => { urls.push(url); throw new Error('injected download stop'); },
+      };
+      const tail = await runUpdateForInstallation({ json: true }, { cliRoot: inst.packageRoot, release: deps });
+      expect(urls).toEqual([`${tailBase}/latest/download/install.sh`]);
+      expect(tail).toMatchObject({ exitCode: 1, releaseBase: tailBase, releaseBaseSource: 'install-source' });
+      expect(JSON.parse(lines.at(-1)!)).toEqual(tail);
+      writeFileSync(join(inst.prefix, 'install.json'), JSON.stringify({ source: `${tailBase}/download/v0.2.3-abcdef123456/elanous.tgz` }));
+      await runReleaseUpdate({ version: '0.2.3-abcdef123456' }, deps);
+      expect(urls.at(-1)).toBe(`${tailBase}/download/v0.2.3-abcdef123456/install.sh`);
+      writeFileSync(join(inst.prefix, 'install.json'), JSON.stringify({ source: `${publicBase}/latest/download/elanous.tgz` }));
+      const publicResult = await runReleaseUpdate({ json: true }, deps);
+      expect(urls.at(-1)).toBe(`${publicBase}/latest/download/install.sh`);
+      expect(publicResult).toMatchObject({ releaseBase: publicBase, releaseBaseSource: 'install-source' });
+      expect(JSON.parse(lines.at(-1)!)).toEqual(publicResult);
+      writeFileSync(join(inst.prefix, 'install.json'), JSON.stringify({ source: `${tailBase}/latest/download/elanous.tgz` }));
+      process.env.ELANOUS_RELEASE_BASE = publicBase;
+      const refused = await runUpdateForInstallation({ json: true }, { cliRoot: inst.packageRoot, release: deps });
+      expect(refused).toMatchObject({ exitCode: 2, releaseBase: publicBase, releaseBaseSource: 'env' });
+      expect(refused.reason).toContain('내부 설치본');
+      expect(JSON.parse(lines.at(-1)!)).toEqual(refused);
+      expect(urls).toHaveLength(3);
+      const option = await runReleaseUpdate({ json: true }, { ...deps, releaseBase: publicBase });
+      expect(option).toMatchObject({ exitCode: 2, releaseBase: publicBase, releaseBaseSource: 'option' });
+      expect(urls).toHaveLength(3);
+    } finally {
+      if (old === undefined) delete process.env.ELANOUS_RELEASE_BASE;
+      else process.env.ELANOUS_RELEASE_BASE = old;
+      rmSync(inst.prefix, { recursive: true, force: true });
+    }
   });
 
   test('the release installer URL follows ELANOUS_RELEASE_BASE (mirror or file:// fixture)', async () => {

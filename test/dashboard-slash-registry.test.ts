@@ -20,7 +20,10 @@ import {
   type CompactProvider,
 } from '../src/compact/index.js';
 import { computeAnchorCount } from '../src/compact/pipeline.js';
-import type { ChatMessage } from '../src/chat/index.js';
+import { displayedSlashCommandNames, SLASH_COMMANDS, type ChatMessage } from '../src/chat/index.js';
+import { buildEssentialHelpLines } from '../src/dashboard/slash-runtime/help-from-registry.js';
+import { showTransientTerminalModal } from '../src/dashboard/modals/transient.js';
+import { DisplayCoordinator } from '../src/display/coordinator.js';
 import { clearTelemetryForTest } from '../src/context-display/index.js';
 import { censusRegisteredSlashOutputs } from '../src/command-registry.js';
 import { setGoalAuthorRuntimeDeps } from '../src/tool-runtime/goal-author-runtime.js';
@@ -30,6 +33,19 @@ const {
   buildDashboardSlashRegistry,
   runDeferredSkillToolSlash,
 } = await import('../src/dashboard/slash-runtime/index.js');
+
+test('essential slashes remain registered while VW slashes are absent', () => {
+  const names = buildDashboardSlashRegistry().names();
+  for (const command of ['help', 'session', 'model', 'mission', 'quit']) {
+    expect(names).toContain(command);
+  }
+  for (const command of ['acp-vw', 'claude-vw', 'pty-pane', 'pty-view', 'fullscreen', 'fs', 'view', 'window']) {
+    expect(names).not.toContain(command);
+    expect(displayedSlashCommandNames()).not.toContain(command);
+  }
+  expect(names).toContain('paste');
+  expect(displayedSlashCommandNames()).toContain('paste');
+});
 
 /**
  * Phase B-1.a — slash command registry pilot. Verifies:
@@ -49,6 +65,7 @@ interface FakeCtxState {
   debugLines: string[];
   chatOutputLines: string[];
   helpCalls: string[];
+  helpModalCalls: Array<{ title: string; lines: readonly string[] }>;
 
   // B-1.b
   forkCalls: number;
@@ -96,9 +113,6 @@ interface FakeCtxState {
   pasteThinkingStops: Array<{ status: 'completed' | 'failed'; errorText?: string }>;
   pasteNextInitial: string | null;
 
-  // TUI 부활 T2 — /ui
-  uiMode: 'essential' | 'rich';
-  uiModeSetCalls: Array<'essential' | 'rich'>;
   resumePickerOpens: number;
   forkPickerOpens: number;
   forkTimetravelCalls: number[];
@@ -125,6 +139,7 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
     debugLines: [],
     chatOutputLines: [],
     helpCalls: [],
+    helpModalCalls: [],
     forkCalls: 0,
     toggleCalls: [],
     toggleResult: { posture: 'control' },
@@ -155,9 +170,6 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
     pasteAttachThrow: null,
     pasteThinkingStops: [],
     pasteNextInitial: null,
-    // TUI 부활 T2 — /ui
-    uiMode: 'essential' as 'essential' | 'rich',
-    uiModeSetCalls: [] as Array<'essential' | 'rich'>,
     // TUI 부활 S-a — /resume
     resumePickerOpens: 0,
     // TUI 부활 S-b — /fork
@@ -211,6 +223,7 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
     iconsSync: '↻',
     closeTui: () => { state.closed++; },
     showHelp: async (scope) => { state.helpCalls.push(scope); },
+    showHelpModal: (options) => { state.helpModalCalls.push(options); },
     clearLogSearch: () => { state.searchClears++; },
     clearLogFilter: () => { state.filterClears++; },
     forkAttachedSessionFromChatHistory: async () => { state.forkCalls++; },
@@ -318,7 +331,7 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
       dockedSnapshotRef: { value: { sourceMode: 'src-mode-fake' } },
     },
     contextSlash: {
-      renderContextList: () => { state.contextRenderCalls++; },
+      renderContextList: () => { state.contextRenderCalls++; return ['  /context', '  (empty)']; },
       contextRegistry: { _fake: true },
     },
     pasteSlash: {
@@ -330,13 +343,6 @@ function makeFakeCtx(): { ctx: DashboardSlashContext; state: FakeCtxState } {
         return state.pasteAttachResult;
       },
       setNextInitial: (token: string) => { state.pasteNextInitial = token; },
-    },
-    uiModeSlash: {
-      getMode: () => state.uiMode,
-      setMode: (mode: 'essential' | 'rich') => {
-        state.uiModeSetCalls.push(mode);
-        state.uiMode = mode;
-      },
     },
     sessionResume: {
       openPicker: () => { state.resumePickerOpens++; },
@@ -646,7 +652,7 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
       ctx.chatLines.push('a', 'b', 'c');
       const r = await reg.dispatch(name, [], ctx);
       expect(r.kind).toBe('continue');
-      expect(ctx.chatLines.length).toBe(0);
+      expect(ctx.chatLines).toEqual(['[muted]Status cleared']);
       expect(state.attachmentClears).toBe(1);
       expect(state.searchClears).toBe(1);
       expect(state.filterClears).toBe(1);
@@ -655,14 +661,116 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     }
   });
 
-  test('help / ? → showHelp("dashboard") then continue', async () => {
-    const reg = buildDashboardSlashRegistry();
-    for (const name of ['help', '?'] as const) {
-      const { ctx, state } = makeFakeCtx();
-      const r = await reg.dispatch(name, [], ctx);
-      expect(r.kind).toBe('continue');
-      expect(state.helpCalls).toEqual(['dashboard']);
+  test('help / ? → showHelpModal without waiting for a key', async () => {
+    const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
+    const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+    try {
+      Object.defineProperty(process.stdout, 'rows', { configurable: true, value: 50 });
+      Object.defineProperty(process.stdout, 'columns', { configurable: true, value: 160 });
+      const reg = buildDashboardSlashRegistry();
+      for (const name of ['help', '?'] as const) {
+        const { ctx, state } = makeFakeCtx();
+        const r = await reg.dispatch(name, [], ctx);
+        expect(r.kind).toBe('continue');
+        expect(state.helpCalls).toEqual([]);
+        expect(state.helpModalCalls).toHaveLength(1);
+        const lines = state.helpModalCalls[0]!.lines;
+        expect(lines.length).toBeGreaterThan(0);
+        expect(lines.join('\n')).not.toContain('Focus left pane');
+        expect(lines.join('\n')).not.toContain('Focus right pane');
+        expect(lines.join('\n')).toContain('/session  ');
+        expect(lines.join('\n')).toContain('Ctrl+W');
+        expect(lines.join('\n')).not.toMatch(/[│╭╰┌┐└┘─]/);
+      }
+    } finally {
+      if (priorRows) Object.defineProperty(process.stdout, 'rows', priorRows);
+      else Reflect.deleteProperty(process.stdout, 'rows');
+      if (priorColumns) Object.defineProperty(process.stdout, 'columns', priorColumns);
+      else Reflect.deleteProperty(process.stdout, 'columns');
     }
+  });
+
+  test('real registry /help paint shows last registered described command and last key', async () => {
+    const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+    const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
+    try {
+      for (const [cols, rows] of [[160, 50], [220, 60]] as const) {
+        Object.defineProperty(process.stdout, 'columns', { configurable: true, value: cols });
+        Object.defineProperty(process.stdout, 'rows', { configurable: true, value: rows });
+        const registry = buildDashboardSlashRegistry();
+        const { ctx, state } = makeFakeCtx();
+        await registry.dispatch('help', [], ctx);
+        expect(state.helpModalCalls).toHaveLength(1);
+        const allLines = state.helpModalCalls[0]!.lines;
+        const expectedNames = registry.names().filter((name) => SLASH_COMMANDS.some(
+          (command) => command.name === name || command.aliases?.includes(name),
+        ));
+        const lastName = [...expectedNames].sort().at(-1)!;
+        const commandText = allLines.slice(1, allLines.indexOf('')).join('\n');
+        expect(commandText).toContain(`/${lastName}  `);
+        expect(allLines.join('\n')).not.toContain('Focus left pane');
+        expect(allLines.join('\n')).not.toContain('Focus right pane');
+        expect(allLines.join('\n')).toContain('/session  ');
+        expect(allLines.join('\n')).toContain('Ctrl+W');
+        expect(allLines.join('\n')).not.toMatch(/[│╭╰┌┐└┘─]/);
+        const coordinator = new DisplayCoordinator({ frameMs: 0 });
+        const modal = showTransientTerminalModal({
+          title: 'Dashboard help', lines: [...allLines],
+          coordinator, termCols: cols, termRows: rows, ttlMs: 0, group: 'dashboard-help-test',
+        });
+        try {
+          expect(allLines.length).toBeLessThanOrEqual(modal.bounds.height - 2);
+          const paint = (coordinator.surface(modal.id) as unknown as { paint: () => string }).paint();
+          expect(paint.match(/┌/g)).toHaveLength(1);
+          expect(paint).toContain('┘');
+          expect(paint).toContain(`/${lastName}  `);
+          expect(paint).toContain('Ctrl+↑  ');
+        } finally {
+          modal.dispose();
+        }
+      }
+    } finally {
+      if (priorColumns) Object.defineProperty(process.stdout, 'columns', priorColumns);
+      else Reflect.deleteProperty(process.stdout, 'columns');
+      if (priorRows) Object.defineProperty(process.stdout, 'rows', priorRows);
+      else Reflect.deleteProperty(process.stdout, 'rows');
+    }
+  });
+
+  test('when the terminal is too small, /help preserves all entries in scrollable chat', async () => {
+    const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
+    const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+    try {
+      const registry = buildDashboardSlashRegistry();
+      for (const [cols, rows] of [[80, 24]] as const) {
+        Object.defineProperty(process.stdout, 'rows', { configurable: true, value: rows });
+        Object.defineProperty(process.stdout, 'columns', { configurable: true, value: cols });
+        const { ctx, state } = makeFakeCtx();
+        await registry.dispatch('help', [], ctx);
+        expect(state.helpModalCalls).toHaveLength(0);
+        expect(ctx.chatLines.join('\n')).toContain('/session  ');
+        expect(ctx.chatLines.at(-1)).toContain('Ctrl+↑  ');
+        expect(state.scrollOffset).toBe(-1);
+      }
+    } finally {
+      if (priorRows) Object.defineProperty(process.stdout, 'rows', priorRows);
+      else Reflect.deleteProperty(process.stdout, 'rows');
+      if (priorColumns) Object.defineProperty(process.stdout, 'columns', priorColumns);
+      else Reflect.deleteProperty(process.stdout, 'columns');
+    }
+  });
+
+  test('help command section equals the described registrations', () => {
+    const registry = buildDashboardSlashRegistry();
+    const names = registry.names();
+    const described = new Set(displayedSlashCommandNames());
+    const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width: 220 });
+    const commandLines = lines.slice(1, lines.indexOf(''));
+    const orderedNames = commandLines.join('\n').match(/\/[\w?-]+  /g)?.map((entry) => entry.slice(1, -2));
+    expect(orderedNames).toEqual(
+      [...new Set(names)].filter((name) => described.has(name)).sort(),
+    );
+    expect(commandLines.length).toBeGreaterThan(0);
   });
 
   test('unknown command → unregistered (falls through to legacy switch)', async () => {
@@ -719,31 +827,6 @@ describe('B-1.b · 6 tiny standalone case migrations', () => {
     expect(state.forkPickerOpens).toBe(0);
     expect(state.forkTimetravelCalls).toEqual([]);
     expect(ctx.chatLines.join('\n')).toContain('usage: /rewind');
-  });
-
-  test('ctoggle (control posture) → push CONTROL MODE banner + reset scroll', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    state.toggleResult = { posture: 'control' };
-    const r = await reg.dispatch('ctoggle', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.toggleCalls.length).toBe(1);
-    expect(state.toggleCalls[0]?.state).toBe(state.chatModeStateValue);
-    expect(state.inputCoreSetModeCalls).toEqual(['mode-out']);
-    expect(state.resolveModeCalls).toEqual([{ chatModeState: state.chatModeStateValue }]);
-    expect(ctx.chatLines.length).toBe(1);
-    expect(ctx.chatLines[0]).toContain('[error]');
-    expect(ctx.chatLines[0]).toContain('CONTROL MODE');
-    expect(state.scrollOffset).toBe(-1);
-  });
-
-  test('ctoggle (default posture) → push back-to-default banner', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    state.toggleResult = { posture: 'default' };
-    const r = await reg.dispatch('ctoggle', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines[0]).toBe('[muted]-- back to default chat mode --');
   });
 
   test('dashboard / dash → exits chatOnly when active (idempotent when already off)', async () => {
@@ -924,43 +1007,6 @@ describe('B-1.c · 8 small standalone case migrations', () => {
     expect(ctx.chatLines.length).toBeGreaterThan(0);
   });
 
-  test('perf status dispatch (no-throw smoke + chat-line)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('perf', ['status'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.debugLines.length).toBeGreaterThan(0);
-    expect(state.debugLines[0]).toContain('perf:');
-  });
-
-  test('cache (default subcommand) dispatch (no-throw smoke)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('cache', [], ctx);
-    expect(r.kind).toBe('continue');
-    // formatSessionSummary returns at least one line; pushed as muted.
-    expect(state.debugLines.length).toBeGreaterThan(0);
-  });
-
-  test('pty-list / ptys dispatch (no-throw smoke)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    for (const name of ['pty-list', 'ptys'] as const) {
-      const { ctx, state } = makeFakeCtx();
-      const r = await reg.dispatch(name, [], ctx);
-      expect(r.kind).toBe('continue');
-      expect(state.debugLines.length).toBeGreaterThan(0);
-    }
-  });
-
-  test('sweep-tool-results dispatch (no-throw smoke; success or warning)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('sweep-tool-results', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.debugLines.length).toBe(1);
-    // outcome is success or warning (filesystem-dependent)
-    expect(state.debugLines[0]).toMatch(/^\[(success|warning)\]/);
-  });
 });
 
 // Wait for fire-and-forget IIFE inside `runDeferredSkillToolSlash` to flush.
@@ -1032,7 +1078,7 @@ describe('B-1.d · runDeferredSkillToolSlash helper', () => {
   });
 });
 
-describe('B-1.d · 9 deferred skill-tool slash registrations', () => {
+describe('B-1.d · remaining deferred skill-tool slash registrations', () => {
   // Each registration is verified for two things only — that's the
   // load-bearing per-case check at this tier:
   //   1. The name/alias is registered (dispatch returns 'continue', not 'unregistered').
@@ -1041,8 +1087,6 @@ describe('B-1.d · 9 deferred skill-tool slash registrations', () => {
   // The actual skill-tool execution is exercised in those modules' own
   // test files; the helper's behavior is covered by the previous block.
   const registeredNames = [
-    'budget', 'b',
-    'route',
     'agent-room',
     'showroom',
     'lane',
@@ -1050,7 +1094,6 @@ describe('B-1.d · 9 deferred skill-tool slash registrations', () => {
     'reply',
     'capture',
     'inject',
-    'llm',
   ] as const;
 
   for (const name of registeredNames) {
@@ -1062,13 +1105,7 @@ describe('B-1.d · 9 deferred skill-tool slash registrations', () => {
     });
   }
 
-  test('budget alias `b` is registered to the same handler shape as budget', () => {
-    const reg = buildDashboardSlashRegistry();
-    expect(reg.has('budget')).toBe(true);
-    expect(reg.has('b')).toBe(true);
-  });
-
-  test('all 9 unique handlers are present in registry.names()', () => {
+  test('remaining deferred handlers are present in registry.names()', () => {
     const reg = buildDashboardSlashRegistry();
     const names = new Set(reg.names());
     for (const n of registeredNames) {
@@ -1366,30 +1403,6 @@ describe('B-1.g · 3 sub-runtime delegation cases', () => {
     expect(ctx.chatLines[2]).toBe('[cs:usage]');
   });
 
-  test('browser-cdp status (default) → statusLines', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx } = makeFakeCtx();
-    const r = await reg.dispatch('browser-cdp', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines[2]).toBe('[bcdp:status]');
-  });
-
-  test('browser-cdp smoke → smokeLines (async)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx } = makeFakeCtx();
-    const r = await reg.dispatch('bcdp', ['smoke'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines[2]).toBe('[bcdp:smoke]');
-  });
-
-  test('browser-cdp stop → stopLines', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx } = makeFakeCtx();
-    const r = await reg.dispatch('bcdp', ['stop'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines[2]).toBe('[bcdp:stop]');
-  });
-
   test('widget list → renders available widgets', async () => {
     const reg = buildDashboardSlashRegistry();
     const { ctx } = makeFakeCtx();
@@ -1429,12 +1442,12 @@ describe('B-1.g · 3 sub-runtime delegation cases', () => {
 });
 
 describe('B-1.h · session/context cluster', () => {
-  // /control / /dm / /default — registered as 3 separate names so the
+  // /control / /default — registered separately so the
   // matched name flows through (fixing the original `cmd` typo by
-  // construction). Smoke-test all 3 → continue.
-  test('control / dm / default registered separately', async () => {
+  // construction). Smoke-test both → continue.
+  test('control / default registered separately', async () => {
     const reg = buildDashboardSlashRegistry();
-    for (const name of ['control', 'dm', 'default'] as const) {
+    for (const name of ['control', 'default'] as const) {
       const { ctx } = makeFakeCtx();
       const r = await reg.dispatch(name, [], ctx);
       expect(r.kind).toBe('continue');
@@ -1505,40 +1518,42 @@ describe('B-1.h · session/context cluster', () => {
     expect(ctx.chatLines.length).toBeGreaterThanOrEqual(1);
   });
 
-  test('ui: 인자 없음 → 현재 모드 + 사용법 (setMode 미호출)', async () => {
+  test('retired rich commands including /scratch are absent; /help, /session and /mission remain', async () => {
     const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('ui', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.uiModeSetCalls).toEqual([]);
-    expect(ctx.chatLines.join('\n')).toContain('ui mode: essential');
-    expect(ctx.chatLines.join('\n')).toContain('/ui rich');
+    const { ctx } = makeFakeCtx();
+    const names = new Set(reg.names());
+    for (const command of ['ui', 'workspace', 'ws', 'window', 'win', 'scratch', 'sc']) {
+      expect(names.has(command)).toBe(false);
+      expect((await reg.dispatch(command, [], ctx)).kind).toBe('unregistered');
+    }
+    expect(displayedSlashCommandNames()).not.toContain('scratch');
+    expect(displayedSlashCommandNames()).not.toContain('sc');
+    for (const command of ['help', 'session', 'mission']) expect(names.has(command)).toBe(true);
+    expect((await reg.dispatch('help', [], ctx)).kind).toBe('continue');
   });
 
-  test('ui rich → setMode(rich) 위임', async () => {
+  test('D1e retired slashes and aliases are absent from registry and picker', async () => {
     const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('ui', ['rich'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.uiModeSetCalls).toEqual(['rich']);
-    expect(ctx.chatLines.join('\n')).toContain('/ui rich');
-  });
-
-  test('ui bogus → warning + 사용법 (setMode 미호출)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    await reg.dispatch('ui', ['bogus'], ctx);
-    expect(state.uiModeSetCalls).toEqual([]);
-    expect(ctx.chatLines.join('\n')).toContain('unknown mode: bogus');
-  });
-
-  test('workspace: essential 에서 rich 전용 안내 (T3 VW slash 게이트)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    state.uiMode = 'essential';
-    const r = await reg.dispatch('workspace', ['list'], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines.join('\n')).toContain('rich 모드 전용');
+    const { ctx } = makeFakeCtx();
+    const names = new Set(reg.names());
+    const displayed = new Set(displayedSlashCommandNames());
+    for (const command of [
+      'ctoggle', 'cache', 'perf', 'pty-list', 'ptys', 'sweep-tool-results',
+      'budget', 'b', 'route', 'llm', 'browser-cdp', 'bcdp', 'dm', 'surf',
+      'codex-vw', 'skill-triggers', 'triggers', 'git', 'memorize', 'mem-compact',
+      'sim', 'simulator', 'turn-slider', 'turnslider', 'tslider', 'playground',
+      'pg', 'branch', 'audit', 'substrate-stats', 'sst', 'usage', 'stats',
+      'codex-setup', 'codex-init', 'hint', 'media', 'mv',
+      'ask', 'say', 'dev', 'implement',
+    ]) {
+      expect(names.has(command), command).toBe(false);
+      expect(displayed.has(command), command).toBe(false);
+      expect((await reg.dispatch(command, [], ctx)).kind, command).toBe('unregistered');
+    }
+    for (const command of ['help', 'session', 'model', 'theme', 'mission', 'quit']) {
+      expect(names.has(command), command).toBe(true);
+    }
+    expect(names.has('scratch')).toBe(false);
   });
 
   test('mission 알 수 없는 서브커맨드 → usage (DB 무접촉 경로)', async () => {
@@ -1657,36 +1672,6 @@ describe('B-1.i · /handoff + /reasoning', () => {
 });
 
 describe('B-2.a · medium-tier first round (audit · sst · wd)', () => {
-  test('audit dispatches without throw (smoke)', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('audit', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(state.scrollOffset).toBe(-1);
-  });
-
-  test('sst (default sub) renders 4 pushDebugLine groups + bumps', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('sst', [], ctx);
-    expect(r.kind).toBe('continue');
-    // header + 3 stat lines + 1 "bumps (top N)" + N=2 entries = 6 lines minimum
-    expect(state.debugLines.length).toBeGreaterThanOrEqual(5);
-    expect(state.debugLines[0]).toContain('substrate stats');
-    expect(state.debugLines[1]).toContain('paint-cache');
-    expect(state.debugLines[1]).toContain('hits=7');
-    expect(state.debugLines[2]).toContain('overlay');
-    expect(state.debugLines[2]).toContain('skipped=4');
-    expect(state.debugLines[3]).toContain('f8 shadow');
-  });
-
-  test('substrate-stats alias → same handler', async () => {
-    const reg = buildDashboardSlashRegistry();
-    const { ctx } = makeFakeCtx();
-    const r = await reg.dispatch('substrate-stats', [], ctx);
-    expect(r.kind).toBe('continue');
-  });
-
   test('wd (default sub = show) dispatches without throw', async () => {
     const reg = buildDashboardSlashRegistry();
     const { ctx, state } = makeFakeCtx();
@@ -1801,7 +1786,7 @@ describe('B-2.e · /history /hist /inputs', () => {
 
 // ── Slash wire-up · context-display + compact (PR1) ──────────────────
 //
-// HANDOFF (2026-05-04) §5.1 — verifies that /tokens, /compact, /usage,
+// HANDOFF (2026-05-04) §5.1 — verifies that /tokens, /compact,
 // /cost, and /memory dispatch correctly off the registry, mutate
 // chatHistory only when the pipeline reduced something, and route
 // through the ctx-injected fake provider so no real LLM call escapes.
@@ -1941,27 +1926,8 @@ describe('buildDashboardSlashRegistry — output census', () => {
   });
 });
 
-describe('slash wire-up · /usage', () => {
-  test('register usage + stats aliases', () => {
-    const reg = buildDashboardSlashRegistry();
-    expect(reg.has('usage')).toBe(true);
-    expect(reg.has('stats')).toBe(true);
-  });
-
-  test('dispatch /usage with empty telemetry → renders no-call message', async () => {
-    clearTelemetryForTest();
-    const reg = buildDashboardSlashRegistry();
-    const { ctx, state } = makeFakeCtx();
-    const r = await reg.dispatch('usage', [], ctx);
-    expect(r.kind).toBe('continue');
-    expect(ctx.chatLines.join('\n')).toContain('/usage');
-    expect(ctx.chatLines.join('\n')).toContain('no LLM calls');
-    expect(state.scrollOffset).toBe(-1);
-  });
-});
-
 describe('slash wire-up · /cost', () => {
-  test('register cost + spend aliases (budget already taken)', () => {
+  test('register cost + spend aliases', () => {
     const reg = buildDashboardSlashRegistry();
     expect(reg.has('cost')).toBe(true);
     expect(reg.has('spend')).toBe(true);

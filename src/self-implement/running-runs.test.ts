@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
+import { debug } from '../debug/log.js';
 import { assessLingeringLaunchParents, assessRunningRuns, collectObservedRunPhases, queryRunningRuns, renderRunningRuns } from './running-runs.js';
 import { queryFederatedUnfinishedRunLedgers, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery } from './run-ledger.js';
 
@@ -574,6 +575,9 @@ test('emits one query observation with exact timing and existing scale fields', 
 
   expect(result.total).toBe(2);
   expect(observations).toEqual([{
+    caller: null,
+    cacheHits: 0,
+    cacheMisses: 0,
     elapsedMs: 95,
     ledgerDirectoryCollectionElapsedMs: 11,
     ledgerReadElapsedMs: 13,
@@ -585,6 +589,56 @@ test('emits one query observation with exact timing and existing scale fields', 
     stageStoreCount: 3,
     discardedNonStageEventCount: 4,
   }]);
+});
+
+test('attributes running-run query logs to the caller and forwards cache diagnostics without changing assessments', () => {
+  const observations: unknown[] = [];
+  const received: unknown[] = [];
+  const deps = {
+    queryLedgers: (options: { noCache?: boolean }) => {
+      received.push(options);
+      return { entries: [ledger('run-live', 'live')], ledgerDirectories: [], goalsDirectory: '/goals', unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0, reconciledTerminatedElsewhereCount: 0, scope: 'self-implement-run-ledger-federated' as const, note: 'fixture', missingLedgerDirectoryCount: 0, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0, cacheHits: 52, cacheMisses: 0 };
+    },
+    ptyTargets: () => [],
+    listPtyRefs: () => ({ refs: [], unreadable: [] }),
+    readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+    observeQuery: (observation: unknown) => observations.push(observation),
+  };
+  const named = queryRunningRuns({ caller: 'nexus.terminals', noCache: true }, deps);
+  const unnamed = queryRunningRuns({}, deps);
+  expect(named.entries).toEqual(unnamed.entries);
+  expect(named.counts).toEqual(unnamed.counts);
+  expect(named.ledger).toMatchObject({ cacheHits: 52, cacheMisses: 0 });
+  expect(received[0]).toMatchObject({ noCache: true });
+  expect(received[1]).not.toHaveProperty('noCache');
+  expect(observations).toEqual([
+    expect.objectContaining({ caller: 'nexus.terminals', cacheHits: 52, cacheMisses: 0 }),
+    expect.objectContaining({ caller: null, cacheHits: 52, cacheMisses: 0 }),
+  ]);
+});
+
+test('writes caller and null to running-runs query log', () => {
+  const originalLog = debug.log;
+  const logged: unknown[] = [];
+  try {
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category === 'self-implement.running-runs' && event === 'query') logged.push(data);
+    }) as typeof debug.log;
+    const deps = {
+      queryLedgers: () => ({ entries: [], ledgerDirectories: [], goalsDirectory: '/goals', unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 0, reconciledTerminatedElsewhereCount: 0, scope: 'self-implement-run-ledger-federated' as const, note: 'fixture', missingLedgerDirectoryCount: 0, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0, cacheHits: 52, cacheMisses: 0 }),
+      ptyTargets: () => [],
+      listPtyRefs: () => ({ refs: [], unreadable: [] }),
+      readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+    };
+    queryRunningRuns({ caller: 'nexus.terminals' }, deps);
+    queryRunningRuns({}, deps);
+    expect(logged).toEqual([
+      expect.objectContaining({ caller: 'nexus.terminals', cacheHits: 52, cacheMisses: 0 }),
+      expect.objectContaining({ caller: null, cacheHits: 52, cacheMisses: 0 }),
+    ]);
+  } finally {
+    (debug as { log: typeof debug.log }).log = originalLog;
+  }
 });
 
 test('emits exact timing through a failing query stage while preserving the original exception', () => {
@@ -606,6 +660,9 @@ test('emits exact timing through a failing query stage while preserving the orig
 
   expect(received).toBe(queryError);
   expect(observations).toEqual([{
+    caller: null,
+    cacheHits: 0,
+    cacheMisses: 0,
     elapsedMs: 41,
     ledgerDirectoryCollectionElapsedMs: 11,
     ledgerReadElapsedMs: 13,

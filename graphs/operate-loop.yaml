@@ -123,7 +123,7 @@ nodes:
     recipe: seams-gh-merge-squash
     max_visits: 2
     progress: [merging, merged]
-    terminal_stages: [merged, pr-opened]
+    terminal_stages: [merged, pr-opened, merge-ready]  # merge-ready = Pod 런이 호스트 재게이트에 넘긴 자리(#20988)
     contract:
       inputs: [pr-number, head-sha]
       tools: gh-pr-merge

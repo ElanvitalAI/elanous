@@ -13,6 +13,7 @@ import { createRequire } from 'node:module';
 
 import { afterAll, describe, expect, mock, test } from 'bun:test';
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
+import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import type { DaemonTerminalRenameResult, DaemonTerminalSummary } from '@/lib/daemon-client';
 
 const require = createRequire(import.meta.url);
@@ -26,15 +27,28 @@ const harness = createReactHookHarness(require('react'));
 // an unrendered element and its module never executes browser code. Stubbing them
 // would replace those modules process-wide and turn their own suites red.
 // Only the hooks TerminalPanel calls directly need standing in for.
+// R-TST23 — the mock.module lines below are process-global. Snapshot the originals and put
+// them back after this file (`@/lib/testing/restore-module-mocks`) — without this the fake
+// DaemonProvider reached IntakeFrontDoor.test.tsx in the same process (6 red · 09-27).
+await restoreModuleMocksAfterAll([
+  'sonner', '@/lib/debug', '@/lib/use-pointer-capability', '@/lib/secure-context-guard',
+  '@/voice/use-voice-controller', '@/components/providers/DaemonProvider',
+], (specifier) => import(specifier));
+const actualDaemonProvider = { ...(await import('@/components/providers/DaemonProvider')) };
 mock.module('sonner', () => ({ toast: {
   error: (message: string) => { toastMessages.push({ level: 'error', message }); },
   success: (message: string) => { toastMessages.push({ level: 'success', message }); },
 } }));
-mock.module('@/lib/debug', () => ({ debugLog: () => {} }));
+const debugEvents: string[] = [];
+mock.module('@/lib/debug', () => ({ debugLog: (event: string) => { debugEvents.push(event); } }));
 mock.module('@/lib/use-pointer-capability', () => ({ usePointerCapability: () => ({ isCoarsePointer: false }) }));
 mock.module('@/lib/secure-context-guard', () => ({ checkSecureContext: () => ({ isSecure: true }) }));
+let onVoiceTranscript: ((text: string) => void) | undefined;
 mock.module('@/voice/use-voice-controller', () => ({
-  useVoiceController: () => ({ active: false, phase: 'idle', toggle: async () => {} }),
+  useVoiceController: ({ onTranscript }: { onTranscript: (text: string) => void }) => {
+    onVoiceTranscript = onTranscript;
+    return { active: false, phase: 'idle', toggle: async () => {} };
+  },
 }));
 
 /** The PTY the daemon reports from ANOTHER manifest root — the case the whole
@@ -47,7 +61,9 @@ const FOREIGN = {
 const LOCAL = { ...FOREIGN, id: 'tui:100', instance: 'local', sourceRoot: undefined } as DaemonTerminalSummary;
 
 const calls: Array<{ endpoint: string; id: string; options: unknown }> = [];
+const listOptions: unknown[] = [];
 const renameCalls: Array<{ id: string; name: string }> = [];
+let acpConnections = 0;
 const toastMessages: Array<{ level: 'success' | 'error'; message: string }> = [];
 let renameResult: { status: 'success'; id: string; name: string } | { status: 'invalid-name' | 'unknown-pty' | 'denied' | 'failed' | 'owner-unreachable' } = { status: 'success', id: FOREIGN.id, name: 'renamed' };
 let promptResult: string | null = null;
@@ -61,8 +77,8 @@ let listFails = false;
 // not of the panel, and it must not be papered over with a render cap.
 const client = {
   voiceWsUrl: () => '',
-  connectAcp: () => ({ close: () => {}, on: () => () => {}, onState: () => () => {}, send: async () => ({}) }),
-  listTerminals: async () => { if (listFails) throw new Error('list boom'); return { terminals: listed, scope: undefined }; },
+  connectAcp: () => { acpConnections += 1; throw new Error('voice must use the registered terminal input sender'); },
+  listTerminals: async (options: unknown) => { listOptions.push(options); if (listFails) throw new Error('list boom'); return { terminals: listed, scope: undefined }; },
   listProgressFrames: async () => ({ logs: [] }),
   fetchTerminalLineage: async (id: string) => ({ key: id, rows: [] }),
   fetchTerminalScrollback: async (id: string, lines: number, options: unknown) => {
@@ -79,15 +95,14 @@ const client = {
   },
 };
 const daemon = { client, config: { baseUrl: '', token: '' }, sessionId: 'session-test' };
-mock.module('@/components/providers/DaemonProvider', () => ({ useDaemon: () => daemon }));
+// Keep the real exports (DaemonContext …): TerminalPanel's own tree imports them.
+mock.module('@/components/providers/DaemonProvider', () => ({ ...actualDaemonProvider, useDaemon: () => daemon }));
 
 // TerminalPanel reads window in effects, and the harness runs effects.
 // ⛔ Restored in afterAll: `globalThis` outlives this file, and a leftover fake
 // window would make a later suite believe it is in a browser.
-// ⚠️ The `mock.module` replacements above CANNOT be undone — `mock.restore()` does
-// not revert module mocks in this Bun build (measured). They are kept to modules
-// whose own suites do not import them, which is why the child components are not
-// stubbed at all (see above).
+// ⚠️ `mock.restore()` does not revert module mocks in this Bun build (measured) —
+// the module mocks are put back by restoreModuleMocksAfterAll above instead.
 const storage = new Map<string, string>();
 const priorWindow = (globalThis as { window?: unknown }).window;
 (globalThis as { window?: unknown }).window = {
@@ -118,8 +133,10 @@ function click(element: { props: Record<string, unknown> }): void {
 async function renderPanel(props: Record<string, unknown> = {}): Promise<void> {
   const { TerminalPanel } = await import('./TerminalPanel');
   calls.length = 0;
+  listOptions.length = 0;
   renameCalls.length = 0;
   toastMessages.length = 0;
+  debugEvents.length = 0;
   harness.unmount();
   harness.render(() => TerminalPanel(props as never));
   await harness.settle();
@@ -145,12 +162,85 @@ async function selectTheOnlyRow(): Promise<string> {
   return text;
 }
 
+describe('TerminalPanel · voice controls input', () => {
+  test('sends trimmed dictation plus a space through the selected terminal\'s registered input sender', async () => {
+    const { registerTerminalInput } = await import('./terminal-input-registry');
+    listed = [LOCAL];
+    storage.clear();
+    await renderPanel();
+    const tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)('voice-terminal'));
+    await harness.settle();
+    const pushed: string[] = [];
+    const unregister = registerTerminalInput('voice-terminal', (data) => { pushed.push(data); });
+    try {
+      acpConnections = 0;
+      const controls = harness.find((element) => element.props.onClear !== undefined && element.props.voice !== undefined);
+      harness.act(() => ((controls.props.voice as { onToggle: () => void }).onToggle)());
+      onVoiceTranscript!('  hello world \n');
+      expect(pushed).toEqual(['hello world ']);
+      expect(debugEvents).toContain('webterm.voice.stdin-inject');
+      expect(acpConnections).toBe(0);
+    } finally {
+      unregister();
+    }
+  });
+
+  test('reports an unmounted selected terminal rather than claiming its dictation was injected', async () => {
+    listed = [LOCAL];
+    storage.clear();
+    await renderPanel();
+    const tabs = harness.find((element) => typeof element.props.onActiveChange === 'function');
+    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)('unmounted-terminal'));
+    await harness.settle();
+    acpConnections = 0;
+    const controls = harness.find((element) => element.props.onClear !== undefined && element.props.voice !== undefined);
+    harness.act(() => ((controls.props.voice as { onToggle: () => void }).onToggle)());
+    expect(onVoiceTranscript).toBeFunction();
+    onVoiceTranscript!('  hello world \n');
+    expect(debugEvents).toContain('webterm.voice.stdin-inject-failed');
+    expect(debugEvents).not.toContain('webterm.voice.stdin-inject');
+    expect(toastMessages).toEqual([{ level: 'error', message: '터미널 입력 전송 실패 — 터미널 연결을 확인하고 다시 말해 주세요.' }]);
+    expect(acpConnections).toBe(0);
+  });
+});
+
+describe('TerminalPanel · live PTY selection without a shell tab', () => {
+  test('clicking the actual federated PTY row opens the live component without changing shell tabs or stored tabs', async () => {
+    listed = [FOREIGN];
+    storage.clear();
+    storage.set('elanous.webterm.tabs', '["existing-shell"]');
+    await renderPanel();
+    click(button('PTY 목록'));
+    await harness.settle();
+    const tabsBefore = storage.get('elanous.webterm.tabs');
+    const tabPropsBefore = harness.find((element) => typeof element.props.onTabsChange === 'function').props;
+    click(harness.find((element) => element.props.className === 'w-full text-left'));
+    await harness.settle();
+    const { PtyLiveView } = await import('./PtyLiveView');
+    const live = harness.findAll((element) => element.type === PtyLiveView);
+    expect(live).toHaveLength(1);
+    expect(live[0]!.props.terminal).toEqual(FOREIGN);
+    const tabPropsAfter = harness.find((element) => typeof element.props.onTabsChange === 'function').props;
+    expect(tabPropsAfter.activeId).toBe(tabPropsBefore.activeId);
+    expect(tabPropsAfter.ptyTabSelection).toBeUndefined();
+    expect(storage.get('elanous.webterm.tabs')).toBe(tabsBefore);
+    harness.act(() => (live[0]!.props.onClose as () => void)());
+    await harness.settle();
+    expect(harness.findAll((element) => element.type === PtyLiveView)).toHaveLength(0);
+    expect(harness.find((element) => typeof element.props.onTabsChange === 'function').props.activeId).toBe(tabPropsBefore.activeId);
+  });
+});
+
 describe('TerminalPanel · URL PTY selection', () => {
   test('initializes a unique URL id after the list resolves without reporting a direct selection', async () => {
     listed = [FOREIGN];
     const selected: string[] = [];
     await renderPanel({ initialPtyId: FOREIGN.id, onPtySelection: (terminal: DaemonTerminalSummary) => selected.push(terminal.id) });
 
+    expect(listOptions).toContainEqual({ all: true, includeTest: true });
+    const { PtyLiveView } = await import('./PtyLiveView');
+    expect(harness.find((element) => element.type === PtyLiveView).props.terminal).toEqual(FOREIGN);
     expect(calls).toEqual([{ endpoint: 'scrollback', id: FOREIGN.id, options: { sourceRoot: '/roots/prod/pty/manifest.db' } }]);
     expect(selected).toEqual([]);
   });
@@ -205,44 +295,30 @@ describe('TerminalPanel · URL PTY selection', () => {
     await harness.settle();
     click(harness.find((element) => element.props.className === 'w-full text-left'));
     await harness.settle();
-    expect(selected).toEqual([]);
-
-    const tabs = harness.find((element) => typeof element.props.onActiveChange === 'function' && element.props.ptyTabSelection !== null);
-    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)(FOREIGN.id));
-    await harness.settle();
     expect(selected).toEqual([FOREIGN]);
+    const { PtyLiveView } = await import('./PtyLiveView');
+    expect(harness.findAll((element) => element.type === PtyLiveView)).toHaveLength(1);
   });
 });
 
-describe('TerminalPanel · PTY-list to tab wiring', () => {
-  test('a row click forwards one tab-selection nonce, then URL selection follows the tab activation exactly once', async () => {
+describe('TerminalPanel · PTY-list and shell tabs', () => {
+  test('a row click opens the live view and reports that row without activating a shell tab', async () => {
     const newest = { ...LOCAL, startedAt: 2 } as DaemonTerminalSummary;
     listed = [{ ...FOREIGN, startedAt: 1 }, newest];
     const selected: DaemonTerminalSummary[] = [];
     await renderPanel({ onPtySelection: (terminal: DaemonTerminalSummary) => selected.push(terminal) });
     click(button('PTY 목록'));
     await harness.settle();
-
+    const tabsBefore = harness.find((element) => typeof element.props.onTabsChange === 'function').props.activeId;
     const rows = harness.findAll((element) => element.props.className === 'w-full text-left');
     expect(harness.textOf(rows[0]!)).toContain(LOCAL.id);
     click(rows[0]!);
     await harness.settle();
-
-    const tabs = harness.find((element) => (
-      typeof element.props.ptyTabSelection === 'object'
-      && (element.props.ptyTabSelection as { id: string }).id === LOCAL.id
-    ));
-    expect(tabs.props.ptyTabSelection).toEqual({ id: LOCAL.id, nonce: 1 });
-    expect(selected).toEqual([]);
-
-    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)(LOCAL.id));
-    await harness.settle();
+    const { PtyLiveView } = await import('./PtyLiveView');
+    expect(harness.find((element) => element.type === PtyLiveView).props.terminal).toEqual(newest);
     expect(selected).toEqual([newest]);
-    expect(storage.get('elanous.webterm.activeId')).toBe(LOCAL.id);
-
-    harness.act(() => (tabs.props.onActiveChange as (id: string) => void)(LOCAL.id));
-    await harness.settle();
-    expect(selected).toEqual([newest]);
+    expect(harness.find((element) => typeof element.props.onTabsChange === 'function').props.activeId).toBe(tabsBefore);
+    expect(storage.get('elanous.webterm.activeId')).not.toBe(LOCAL.id);
   });
 
   test('keeps both mounted panel ids while switching to another tab and back', async () => {
@@ -344,6 +420,8 @@ describe('TerminalPanel · a selected row reaches the daemon carrying its own so
 
     // The mode buttons only exist once a row is selected, so reaching them is
     // itself evidence that the selection landed in state.
+    click(button('PTY 목록'));
+    await harness.settle();
     click(button('렌더 화면'));
     await harness.settle();
     // Whole array, not calls[1]: an extra or misfired request would otherwise pass.
@@ -372,6 +450,8 @@ describe('TerminalPanel · a selected row reaches the daemon carrying its own so
 
     click(listRows()[0]!);
     await harness.settle();
+    click(button('PTY 목록'));
+    await harness.settle();
     // ⛔ Re-query. An element captured before the first click carries that render's
     // closure, so clicking it would test the guard against stale state — which is
     // how this test first passed even with the id-only guard restored.
@@ -383,6 +463,8 @@ describe('TerminalPanel · a selected row reaches the daemon carrying its own so
     ]);
 
     // And the mode change follows the row that is actually selected, not the id.
+    click(button('PTY 목록'));
+    await harness.settle();
     click(button('렌더 화면'));
     await harness.settle();
     expect(calls[2]).toEqual({

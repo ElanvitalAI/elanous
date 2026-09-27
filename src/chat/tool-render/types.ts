@@ -30,7 +30,7 @@ export interface ToolRenderConfig {
   foldMode?: FoldMode;
   /** When true, collapsed foldHint keeps the rich-mode "press f to expand"
    *  suffix. Omitted/false = count-only (essential/unknown). Expanded
-   *  rendering ignores this. Producers that know DashboardUiMode pass
+   *  rendering ignores this. Dashboard producers pass
    *  `mode === 'rich'`. */
   expandHint?: boolean;
 }

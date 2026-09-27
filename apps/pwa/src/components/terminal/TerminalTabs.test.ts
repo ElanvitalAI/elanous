@@ -4,6 +4,7 @@ import {
   loadTabIds, nextDefaultId, resolveNewTabId, saveTabIds, shouldReacquireAcp,
   spawnNewTerminal, summarizeTabs, tabCountLabel, tabsCleanableAsUnknown, parseTerminalListResponse,
 } from './TerminalTabs';
+import { originChipText, originTooltipText, terminalOriginLabel } from './terminal-origin-label';
 
 interface FakeWindowEnv {
   store: Map<string, string>;
@@ -313,5 +314,18 @@ describe('TerminalTabs terminal provenance parsing', () => {
   test('drops malformed optional provenance metadata and keeps legacy entries parseable', () => {
     expect(parseTerminalListResponse({ terminals: [{ terminalId: 'legacy', isAlive: true, terminalOriginCategory: 'human', terminalOriginReason: 4, externalToolName: false, controller: null }] }))
       .toEqual({ ok: true, entries: [{ terminalId: 'legacy', isAlive: true }] });
+  });
+
+  test('uses moved origin labels for parsed daemon entries', () => {
+    const result = parseTerminalListResponse({ terminals: [
+      { terminalId: 'human', isAlive: true, terminalOriginCategory: 'direct-human' },
+      { terminalId: 'legacy', isAlive: true },
+    ] });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(originChipText(result.entries[0])).toBe('사람');
+    expect(terminalOriginLabel(result.entries[0])).toBe('사람');
+    expect(originChipText(result.entries[1])).toBe('');
+    expect(originTooltipText(result.entries[1])).toBe('출처: 이 행에서는 알 수 없음');
   });
 });

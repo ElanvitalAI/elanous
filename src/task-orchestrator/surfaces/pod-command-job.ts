@@ -125,7 +125,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
           initContainers: [{ name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] }],
           containers: [{
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
-            resources: { requests: { ...POD_CHILD_REQUESTS }, limits: { memory: '12Gi', cpu: '4' } },
+            resources: { requests: { ...POD_CHILD_REQUESTS }, limits: { memory: '16Gi', cpu: '4' } },
             command: ['bash', '-c'], args: [script],
             env: [
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),

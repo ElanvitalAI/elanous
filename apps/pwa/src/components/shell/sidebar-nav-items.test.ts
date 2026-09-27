@@ -30,6 +30,7 @@ const DYNAMIC_SEGMENT_PATTERN = /^\[.+\]$/;
 const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/',
   '/404',
+  '/approvals',
   '/autopilot',
   '/botlab',
   '/bots',
@@ -151,9 +152,18 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
     expect(NON_MENU_SIDEBAR_ROUTES.some((route) => route.href === '/intake')).toBe(false);
   });
 
-  it('Showroom 은 Intake 다음 슬롯 · kind=null · href=/showroom (CV-3 P1)', () => {
+  it('Approvals 는 Intake 바로 다음이고 직접 페이지로 진입한다', () => {
+    const item = SIDEBAR_NAV_ITEMS[3]!;
+    expect(item.href).toBe('/approvals');
+    expect(item.label).toBe('Approvals');
+    expect(item.hint).toBe('아이디어 PR 요약 · 승인하고 머지');
+    expect(item.kind).toBeNull();
+    expect(item.icon).toBeDefined();
+  });
+
+  it('Showroom 은 Approvals 다음 슬롯 · kind=null · href=/showroom (CV-3 P1)', () => {
     const showroomIdx = SIDEBAR_NAV_ITEMS.findIndex((i) => i.label === 'Showroom');
-    expect(showroomIdx).toBe(3);
+    expect(showroomIdx).toBe(4);
     const sr = SIDEBAR_NAV_ITEMS[showroomIdx]!;
     expect(sr.href).toBe('/showroom');
     expect(sr.kind).toBeNull();
@@ -178,7 +188,7 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
     expect(worktrees.kind).toBeNull();
     expect(worktrees.hint).toContain('작업 트리');
     expect(worktrees.icon).toBeDefined();
-    expect(SIDEBAR_NAV_ITEMS).toHaveLength(18);
+    expect(SIDEBAR_NAV_ITEMS).toHaveLength(19);
   });
 
   it('Bots 항목 · href=/bots · kind=null · 읽기 전용 카탈로그 안내', () => {

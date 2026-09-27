@@ -8,6 +8,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, mock, test } from 'bun:test';
+import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 
 const require = createRequire(import.meta.url);
 const react = require('react') as { createElement: (type: unknown, props?: unknown, ...children: unknown[]) => unknown };
@@ -17,6 +18,24 @@ const jsxDEV = jsx;
 const stub = (testId: string) => () => react.createElement('div', { 'data-testid': testId });
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = readFileSync(join(HERE, 'TerminalPanel.tsx'), 'utf8');
+
+// R-TST23 — 아래 mock.module 은 프로세스 전역이다. 원본을 잡아 두고 파일 끝에 되돌린다(`@/lib/testing/restore-module-mocks`).
+await restoreModuleMocksAfterAll([
+  'react/jsx-dev-runtime',
+  'sonner',
+  '@/components/providers/DaemonProvider',
+  '@/lib/use-pointer-capability',
+  '@/lib/secure-context-guard',
+  '@/voice/use-voice-controller',
+  '@/voice/voice-phase-styles',
+  '@/components/terminal/XtermView',
+  '@/components/terminal/TuiMirrorView',
+  '@/components/terminal/TerminalControls',
+  '@/components/terminal/ModifierBar',
+  '@/components/terminal/TerminalDropZone',
+  '@/components/terminal/MultiDeviceIndicator',
+  '@/components/terminal/TerminalChatDock',
+], (specifier) => import(specifier));
 
 mock.module('react/jsx-dev-runtime', () => ({
   Fragment: Symbol.for('react.fragment'),
@@ -45,14 +64,13 @@ mock.module('@/voice/use-voice-controller', () => ({
 }));
 mock.module('@/voice/voice-phase-styles', () => ({ VOICE_DOT_COLOR: { idle: '' }, VOICE_PHASE_LABEL: { idle: '' } }));
 
-mock.module('./XtermView', () => ({ XtermView: stub('xterm-view') }));
-mock.module('./TuiMirrorView', () => ({ TuiMirrorView: stub('tui-mirror-view') }));
-mock.module('./TerminalControls', () => ({ TerminalControls: stub('terminal-controls') }));
-mock.module('./TerminalRepl', () => ({ TerminalRepl: stub('terminal-repl') }));
-mock.module('./ModifierBar', () => ({ ModifierBar: stub('modifier-bar') }));
-mock.module('./TerminalDropZone', () => ({ TerminalDropZone: stub('terminal-drop-zone') }));
-mock.module('./MultiDeviceIndicator', () => ({ MultiDeviceIndicator: stub('multi-device-indicator') }));
-mock.module('./TerminalChatDock', () => ({ TerminalChatDock: stub('terminal-chat-dock') }));
+mock.module('@/components/terminal/XtermView', () => ({ XtermView: stub('xterm-view') }));
+mock.module('@/components/terminal/TuiMirrorView', () => ({ TuiMirrorView: stub('tui-mirror-view') }));
+mock.module('@/components/terminal/TerminalControls', () => ({ TerminalControls: stub('terminal-controls') }));
+mock.module('@/components/terminal/ModifierBar', () => ({ ModifierBar: stub('modifier-bar') }));
+mock.module('@/components/terminal/TerminalDropZone', () => ({ TerminalDropZone: stub('terminal-drop-zone') }));
+mock.module('@/components/terminal/MultiDeviceIndicator', () => ({ MultiDeviceIndicator: stub('multi-device-indicator') }));
+mock.module('@/components/terminal/TerminalChatDock', () => ({ TerminalChatDock: stub('terminal-chat-dock') }));
 
 describe('TerminalPanel · initial SSR render contract', () => {
   test('renders three mode buttons with terminal as the only active initial view', async () => {

@@ -578,6 +578,24 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(() => buildDevCliSpec(IN, SELF, { superviseRounds: '2' })).not.toThrow();
   });
 
+  it('review-blocked 수확 자식이 시작되면 감독기는 재발사 없이 인계하고, 수확 신호가 없으면 재발사한다', async () => {
+    for (const salvage of ['launched', undefined] as const) {
+      const calls: Array<boolean | undefined> = [];
+      const executed = await devCli.executeDevSelfRun('same goal', async (relaunch) => {
+        calls.push(relaunch);
+        return selfResult({ ok: false, stage: 'review-blocked', ...(salvage ? { salvage } : {}) });
+      }, { rounds: 1, printDecision: () => {} });
+      if (salvage === 'launched') {
+        expect(calls).toEqual([undefined]);
+        expect(executed.supervisorStopReason).toBe('handed-off-to-salvage');
+      } else {
+        expect(calls).toContain(true);
+        expect(calls.length).toBeGreaterThan(1);
+        expect(executed.supervisorStopReason).not.toBe('handed-off-to-salvage');
+      }
+    }
+  });
+
   it('감독이 꺼지면 주입 실행 심을 정확히 한 번 호출한다', async () => {
     let calls = 0;
     const executed = await devCli.executeDevSelfRun('same goal', async () => {

@@ -1,11 +1,5 @@
-/**
- * Contract test for inject-attachment-paths — Raycast `ctr.sh` flow의
- * PWA-side. ACP `terminal/input` 호출 + clipboard fallback + POSIX-safe
- * quoting 검증.
- */
-
 import { afterEach, describe, expect, it } from 'bun:test';
-
+import { registerTerminalInput } from '@/components/terminal/terminal-input-registry';
 import {
   injectAttachmentPathsToTerminal,
   quotePathsForShell,
@@ -42,26 +36,6 @@ describe('quotePathsForShell — POSIX-safe single-quote escape', () => {
   });
 });
 
-interface AcpCall {
-  method: string;
-  params: Record<string, unknown>;
-}
-
-function makeAcpStub(opts: { fail?: boolean } = {}): {
-  calls: AcpCall[];
-  send: (m: string, p: Record<string, unknown>) => Promise<unknown>;
-} {
-  const calls: AcpCall[] = [];
-  return {
-    calls,
-    send: async (method, params) => {
-      calls.push({ method, params });
-      if (opts.fail) throw new Error('terminal/input failed');
-      return { delivered: true, bytes: 0 };
-    },
-  };
-}
-
 const realNavigator = (globalThis as { navigator?: unknown }).navigator;
 let clipboardWrites: string[] = [];
 
@@ -88,84 +62,95 @@ function uninstallClipboardStub(): void {
 describe('injectAttachmentPathsToTerminal', () => {
   afterEach(() => uninstallClipboardStub());
 
-  it('sends `terminal/input` with quoted paths + trailing space + peerId', async () => {
-    const acp = makeAcpStub();
-    installClipboardStub();
-    const result = await injectAttachmentPathsToTerminal({
-      acp,
-      sessionId: 's-1',
-      terminalId: 'term-1',
-      paths: ['/tmp/a.png', '/tmp/b.png'],
-    });
-    expect(result.injected).toBe(true);
-    expect(acp.calls.length).toBe(1);
-    expect(acp.calls[0]!.method).toBe('terminal/input');
-    expect(acp.calls[0]!.params.sessionId).toBe('s-1');
-    expect(acp.calls[0]!.params.terminalId).toBe('term-1');
-    expect(acp.calls[0]!.params.data).toBe("'/tmp/a.png' '/tmp/b.png' ");
-    expect(typeof acp.calls[0]!.params.peerId).toBe('string');
+  it('sends quoted paths and a trailing space through the terminal input sender', async () => {
+    const received: string[] = [];
+    const unregister = registerTerminalInput('attachment-term', (data) => { received.push(data); });
+    try {
+      installClipboardStub();
+      const result = await injectAttachmentPathsToTerminal({
+        terminalId: 'attachment-term',
+        paths: ['/tmp/a.png', '/tmp/b.png'],
+      });
+      expect(result).toEqual({ injected: true, copied: true });
+      expect(received).toEqual(["'/tmp/a.png' '/tmp/b.png' "]);
+    } finally {
+      unregister();
+    }
   });
 
   it('skips entirely when there are no valid paths', async () => {
-    const acp = makeAcpStub();
-    const result = await injectAttachmentPathsToTerminal({
-      acp,
-      sessionId: 's-1',
-      terminalId: 'term-1',
-      paths: [],
-    });
-    expect(result).toEqual({ injected: false, copied: false });
-    expect(acp.calls.length).toBe(0);
+    const received: string[] = [];
+    const unregister = registerTerminalInput('attachment-empty', (data) => { received.push(data); });
+    try {
+      installClipboardStub();
+      const result = await injectAttachmentPathsToTerminal({
+        terminalId: 'attachment-empty',
+        paths: [],
+      });
+      expect(result).toEqual({ injected: false, copied: false });
+      expect(received).toEqual([]);
+      expect(clipboardWrites).toEqual([]);
+    } finally {
+      unregister();
+    }
   });
 
-  it('returns injected=false on ACP send failure (silent debug.log)', async () => {
-    const acp = makeAcpStub({ fail: true });
+  it('returns injected=false when no terminal sender is registered, but still copies the paths', async () => {
     installClipboardStub();
     const result = await injectAttachmentPathsToTerminal({
-      acp,
-      sessionId: 's-1',
-      terminalId: 'term-1',
+      terminalId: 'attachment-missing',
       paths: ['/tmp/a.png'],
     });
-    expect(result.injected).toBe(false);
+    expect(result).toEqual({ injected: false, copied: true });
+    expect(clipboardWrites).toEqual(["'/tmp/a.png'"]);
   });
 
-  it('writes the same string to navigator.clipboard when alsoCopy=true', async () => {
-    const acp = makeAcpStub();
+  it('returns injected=false on sender failure and retains clipboard fallback', async () => {
+    const unregister = registerTerminalInput('attachment-throw', () => { throw new Error('input failed'); });
+    try {
+      installClipboardStub();
+      const result = await injectAttachmentPathsToTerminal({
+        terminalId: 'attachment-throw',
+        paths: ['/tmp/a.png'],
+      });
+      expect(result).toEqual({ injected: false, copied: true });
+      expect(clipboardWrites).toEqual(["'/tmp/a.png'"]);
+    } finally {
+      unregister();
+    }
+  });
+
+  it('writes the quoted string without the trailing input space to the clipboard', async () => {
     installClipboardStub();
     await injectAttachmentPathsToTerminal({
-      acp,
-      sessionId: 's-1',
-      terminalId: 'term-1',
+      terminalId: 'attachment-missing',
       paths: ['/tmp/a.png'],
     });
     expect(clipboardWrites).toEqual(["'/tmp/a.png'"]);
   });
 
   it('skips clipboard when alsoCopyToClipboard=false (caller drove its own write)', async () => {
-    const acp = makeAcpStub();
     installClipboardStub();
     const result = await injectAttachmentPathsToTerminal({
-      acp,
-      sessionId: 's-1',
-      terminalId: 'term-1',
+      terminalId: 'attachment-missing',
       paths: ['/tmp/a.png'],
       alsoCopyToClipboard: false,
     });
-    expect(result.copied).toBe(false);
-    expect(clipboardWrites.length).toBe(0);
+    expect(result).toEqual({ injected: false, copied: false });
+    expect(clipboardWrites).toEqual([]);
   });
 
   it('treats clipboard.writeText failure as a silent skip (insecure-context Safari)', async () => {
-    const acp = makeAcpStub();
-    installClipboardStub({ fail: true });
-    const result = await injectAttachmentPathsToTerminal({
-      acp,
-      sessionId: 's-1',
-      terminalId: 'term-1',
-      paths: ['/tmp/a.png'],
-    });
-    expect(result.injected).toBe(true);
-    expect(result.copied).toBe(false);
+    const unregister = registerTerminalInput('attachment-clipboard-fail', () => {});
+    try {
+      installClipboardStub({ fail: true });
+      const result = await injectAttachmentPathsToTerminal({
+        terminalId: 'attachment-clipboard-fail',
+        paths: ['/tmp/a.png'],
+      });
+      expect(result).toEqual({ injected: true, copied: false });
+    } finally {
+      unregister();
+    }
   });
 });

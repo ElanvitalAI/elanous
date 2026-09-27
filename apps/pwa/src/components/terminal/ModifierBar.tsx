@@ -21,14 +21,12 @@
 //     auto-deactivates after one letter.
 //
 // Wire path: each press builds a byte sequence via key-sequences.ts
-// and ships it to the daemon's PTY through the same ACP `terminal/
-// input` channel xterm.js uses. From bash/vim/tmux's perspective the
-// keystroke is indistinguishable from a physical keyboard press.
+// and routes it through the terminal's registered input sender.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { debugLog } from '@/lib/debug';
-import { getPeerId } from '@/lib/peer-id';
+import { sendToTerminal } from './terminal-input-registry';
 import {
   buildKeySequence,
   type ModifierKey,
@@ -59,7 +57,7 @@ const NAV_BUTTONS: ButtonSpec[] = [
 const MODIFIER_AUTO_RELEASE_MS = 5000;
 
 export function ModifierBar({ terminalId }: Props) {
-  const { client, sessionId } = useDaemon();
+  const { sessionId } = useDaemon();
   const [ctrl, setCtrl] = useState(false);
   const [alt, setAlt] = useState(false);
   // Refs let callbacks stay stable while reading current modifier state.
@@ -68,17 +66,7 @@ export function ModifierBar({ terminalId }: Props) {
   ctrlRef.current = ctrl;
   altRef.current = alt;
 
-  const acpRef = useRef<ReturnType<typeof client.connectAcp> | null>(null);
   const releaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    if (!sessionId) return undefined;
-    if (!acpRef.current) acpRef.current = client.connectAcp({ sessionId });
-    return () => {
-      try { acpRef.current?.close(); } catch { /* ignore */ }
-      acpRef.current = null;
-    };
-  }, [client, sessionId]);
 
   // Reset auto-release timer whenever a modifier is freshly engaged.
   // Toggling off mid-flight clears the timer outright.
@@ -103,23 +91,16 @@ export function ModifierBar({ terminalId }: Props) {
     }
   }, []);
 
-  const sendKey = useCallback(async (key: ModifierKey): Promise<void> => {
+  const sendKey = useCallback((key: ModifierKey): void => {
     if (!sessionId) {
       debugLog('webterm.modbar.no-session', { key });
       return;
     }
-    if (!acpRef.current) acpRef.current = client.connectAcp({ sessionId });
-    const acp = acpRef.current;
     const mods: ModifierState = { ctrl: ctrlRef.current, alt: altRef.current };
     const data = buildKeySequence(key, mods);
     debugLog('webterm.modbar.send', { key, ctrl: mods.ctrl, alt: mods.alt, bytes: data.length });
     try {
-      await acp.send('terminal/input', {
-        sessionId,
-        terminalId,
-        data,
-        peerId: getPeerId(),
-      });
+      sendToTerminal(terminalId, data);
     } catch (e) {
       debugLog('webterm.modbar.send-error', { reason: String(e) });
     }
@@ -131,7 +112,7 @@ export function ModifierBar({ terminalId }: Props) {
       setAlt(false);
       armAutoRelease(false, false);
     }
-  }, [client, sessionId, terminalId, armAutoRelease]);
+  }, [sessionId, terminalId, armAutoRelease]);
 
   const toggleCtrl = useCallback((): void => {
     const next = !ctrlRef.current;
@@ -176,7 +157,7 @@ export function ModifierBar({ terminalId }: Props) {
           key={btn.key}
           type="button"
           className={navButtonClass(btn.width)}
-          onClick={() => { void sendKey(btn.key); }}
+          onClick={() => { sendKey(btn.key); }}
           disabled={!sessionId}
           aria-label={btn.title}
           title={btn.title}

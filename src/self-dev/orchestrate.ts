@@ -17,7 +17,14 @@
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21.
  */
 import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { mkdirSync, openSync, writeFileSync, closeSync, renameSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
 import { availableParallelism, cpus } from 'node:os';
+import { selfDevRunsDir } from './run-store.js';
+import { HARNESS_RUN_ID_ENV, normalizeRunId } from '../harness/harness-space.js';
+import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
+import { parseGoalId } from '../self-implement/goal-author.js';
 import { isTransientExecutionFailure } from './execution-transient.js';
 import type { AbandonedClassification } from '../self-implement/abandoned-classification.js';
 import type { DeployVerifyFinding, DeployVerifyResult } from '../harness/browser-verify.js';
@@ -201,6 +208,10 @@ export interface SelfDevGoal {
   draft?: boolean;
   /** Optional short title (≤ 80 chars). Default = feature head. */
   title?: string;
+  /** 계획 브랜치가 알려지면 같은 워크트리의 실행을 직렬화한다. */
+  planBranch?: string;
+  /** 계획 브랜치가 없는 저작 골의 안정 식별자. */
+  goalId?: string;
   /** S2 — goal-local id for dependency wiring (default = array index). */
   id?: string;
   /** S2 — goal-local ids this goal depends on (must complete first).
@@ -823,6 +834,19 @@ export interface OrchestrateSelfDevOptions {
   verifyDeliverable?: (target: string) => Promise<DeployVerifyResult>;
   /** Launch seam — default spawns real subprocesses. Tests inject a fake. */
   spawn?: SelfImplementJobSpawn;
+  /** Run identity for the per-run PID and labelled Pod cleanup. */
+  runId?: string;
+  /** Override the run directory root for isolated tests. */
+  runsDir?: string;
+  /** Signal source and kubectl seams for isolated lifecycle tests. */
+  signalSource?: Pick<NodeJS.Process, 'on' | 'off'>;
+  /** Pod context/namespace pairs chosen by the caller that launched the Jobs. */
+  podTargets?: readonly { context: string; namespace: string }[];
+  /** Return the number of labelled jobs removed. */
+  deleteJobs?: (runId: string) => number | Promise<number>;
+  /** Injectable kubectl process seam. */
+  spawnKubectl?: typeof spawn;
+  onSecondSignal?: (signal: NodeJS.Signals) => void;
   /** F1 additions for non-dev jobs. `dev` always uses the legacy mapping. */
   jobKinds?: Omit<JobKindRegistry, 'dev'>;
   now?: () => number;
@@ -873,12 +897,53 @@ function goalTitle(g: SelfDevGoal): string {
   return raw.length <= TASK_DEFAULTS.titleMaxLen ? raw : raw.slice(0, TASK_DEFAULTS.titleMaxLen - 1) + '…';
 }
 
+export function withOrchestrateGoalKey(goal: SelfDevGoal): SelfDevGoal {
+  const goalId = goal.goalId ?? parseGoalId(goal.feature);
+  return {
+    ...goal,
+    ...(goalId ? { goalId } : {}),
+    planBranch: goal.planBranch ?? plannedSelfImplBranch(goal.feature, goalId ?? undefined),
+  };
+}
+
+function goalInFlightKey(goal: SelfDevGoal): string {
+  return goal.planBranch?.trim() || goal.goalId?.trim() || parseGoalId(goal.feature) || plannedSelfImplBranch(goal.feature);
+}
+
+/** All orchestrations in this process share reservations; the Pod Job name is the remote execution's identity. */
+const inFlightByKey = new Map<string, Promise<void>>();
+
+async function deleteLabelledJobs(runId: string, selectedTargets: readonly { context: string; namespace: string }[], spawnKubectl: typeof spawn = spawn): Promise<number> {
+  const targets = new Map(selectedTargets.map(({ context, namespace }) => [`${context}/${namespace}`, { context, namespace }]));
+  const counts = await Promise.all([...targets.values()].map(({ context, namespace }) => new Promise<number>((resolveCount) => {
+    const env = { ...process.env };
+    for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[key];
+    const child = spawnKubectl('kubectl', ['--context', context, '-n', namespace, 'delete', 'job', '-l', `elanous.run=${runId}`, '--wait=false'], { stdio: ['ignore', 'pipe', 'pipe'], env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (data: Buffer) => { stdout += data.toString(); });
+    child.stderr?.on('data', (data: Buffer) => { stderr += data.toString(); });
+    const timeout = setTimeout(() => { child.kill('SIGKILL'); }, 5_000);
+    let spawnError: Error | undefined;
+    child.once('error', (error) => { spawnError = error; });
+    child.once('close', (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) debug.log('self-dev.orchestrate', 'job-delete-failed', { runId, context, namespace, error: String(spawnError ?? (stderr || `kubectl exit ${code}`)) }, { level: 'warn' });
+      resolveCount(code === 0 ? stdout.split('\n').filter((line) => line.startsWith('job.batch/')).length : 0);
+    });
+  })));
+  return counts.reduce((sum, count) => sum + count, 0);
+}
+
 /**
  * Run N self-dev jobs in parallel under the TOX dispatcher and resolve
  * once every job reaches a terminal status.
  */
 export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<SelfDevJobResult[]> {
   const now = opts.now ?? Date.now;
+  const runId = opts.runId ?? process.env[HARNESS_RUN_ID_ENV];
+  if (runId && runId !== normalizeRunId(runId)) throw new Error(`invalid self-dev run ID: ${runId}`);
+  const pidPath = runId ? join(opts.runsDir ?? selfDevRunsDir(), runId, 'pid.json') : undefined;
   const graph = new TaskGraph();
   const bus = new TaskEventBus();
   const registry = new SurfaceRegistry();
@@ -887,6 +952,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
   // (keyed by its harness-space id) as the child exits. The dispatcher
   // only surfaces status via bus events, so this side-channel carries
   // the rich `{stage, prUrl, merged, worktreePath}` back to `finish()`.
+  let cancelling = false;
   const baseSpawn = opts.spawn ?? defaultSelfImplementSpawn();
   const doneBySpace = new Map<string, SelfImplementJobDone>();
   const taskByGoal = new Map<string, SelfDevGoal>();      // taskId → goal
@@ -990,14 +1056,14 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     return handoffs.length ? `${dependencyFeature}\n\n## Dependency handoff\n${handoffs.join('\n')}` : dependencyFeature;
   };
   const capturingSpawn: SelfImplementJobSpawn = (input) => {
-    const feature = dependencyOutputFeature(input.spaceId, input.feature);
-    const r = baseSpawn({ ...input, feature });
+    const taskId = [...spaceIdByTask.entries()].find(([, id]) => id === input.spaceId)?.[0];
+    const goal = taskId ? taskByGoal.get(taskId) : undefined;
+    if (cancelling) throw new Error('orchestration cancelled by signal');
+    const started = baseSpawn({ ...input, feature: dependencyOutputFeature(input.spaceId, input.feature) });
     return {
-      address: r.address,
-      done: r.done.then((d) => {
+      address: started.address,
+      done: started.done.then((d) => {
         doneBySpace.set(input.spaceId, d);
-        const taskId = [...spaceIdByTask.entries()].find(([, id]) => id === input.spaceId)?.[0];
-        const goal = taskId ? taskByGoal.get(taskId) : undefined;
         // ⛔ 종전엔 exitCode 0 일 때만 붙잡아 «막힌 상류의 맥락»이 사라졌다 ⇒ 하류가 같은 벽에 다시 부딪혔다.
         //   이제 막혀도 붙잡되, 결말을 «다른 값»으로 실어 하류가 「이미 된 것」으로 오독하지 않게 한다.
         if (goal) {
@@ -1018,6 +1084,34 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       }),
     };
   };
+  const devAdapter = createSelfImplementAdapter({ spawn: capturingSpawn, now });
+  const keyedDevAdapter: SurfaceAdapter = async (task, ctx) => {
+    const goal = taskByGoal.get(task.id);
+    const key = goalInFlightKey(goal ?? { feature: task.surface.kind === 'self-implement' ? task.surface.feature : task.title });
+    const previous = inFlightByKey.get(key);
+    let releaseQueue!: () => void;
+    const reserved = new Promise<void>((resolve) => { releaseQueue = resolve; });
+    inFlightByKey.set(key, reserved);
+    const releaseKey = () => {
+      if (inFlightByKey.get(key) === reserved) inFlightByKey.delete(key);
+      releaseQueue();
+    };
+    try {
+      if (previous) {
+        debug.log('self-dev.orchestrate', 'same-key-in-flight', { key, waited: true });
+        await previous;
+      }
+      if (ctx.signal?.aborted) {
+        throw new Error('aborted while waiting for same key');
+      }
+      if (cancelling) throw new Error('orchestration cancelled by signal');
+      const result = await devAdapter(task, ctx);
+      return { ...result, promise: result.promise.finally(releaseKey) };
+    } catch (error) {
+      releaseKey();
+      throw error;
+    }
+  };
   const devDefinition: JobKindDefinition = {
     surfaceKind: 'self-implement',
     surface: (goal) => ({
@@ -1029,7 +1123,8 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       ...(goal.openPr !== undefined ? { openPr: goal.openPr } : {}),
       ...(goal.draft !== undefined ? { draft: goal.draft } : {}),
     }),
-    adapter: createSelfImplementAdapter({ spawn: capturingSpawn, now }),
+    // TaskDispatcher.tick → TaskDispatcher.spawn → keyedDevAdapter → dispatchSelfImplement (self-implement.ts) → capturingSpawn.
+    adapter: keyedDevAdapter,
     isolation: 'worktree',
   };
   if (opts.jobKinds && Object.prototype.hasOwnProperty.call(opts.jobKinds, 'dev')) {
@@ -1216,6 +1311,63 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
   return new Promise<SelfDevJobResult[]>((resolve, reject) => {
     const results = new Map<string, SelfDevJobResult>();
     let settled = false;
+    let interrupted: NodeJS.Signals | undefined;
+    const signals = opts.signalSource ?? process;
+    const cleanup = (): void => {
+      signals.off('SIGTERM', onTerm);
+      signals.off('SIGINT', onInt);
+      if (pidPath) {
+        try { unlinkSync(pidPath); }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') debug.log('self-dev.orchestrate', 'pid-cleanup-failed', { pidPath, error: String(error) }, { level: 'warn' });
+        }
+      }
+    };
+    const cancel = (signal: NodeJS.Signals): void => {
+      if (cancelling) {
+        cleanup();
+        (opts.onSecondSignal ?? ((s) => process.exit(s === 'SIGINT' ? 130 : 143)))(signal);
+        return;
+      }
+      if (settled) return;
+      cancelling = true;
+      interrupted = signal;
+      let pending = 0;
+      for (const { task } of created) {
+        const current = graph.getTask(task.id);
+        if (!current || isTerminalStatus(current.status)) continue;
+        if (current.status === 'running') dispatcher.kill(task.id);
+        else {
+          graph.updateTask(task.id, { status: 'cancelled' }, { now: now() });
+          pending++;
+        }
+        results.set(task.id, { taskId: task.id, feature: taskByGoal.get(task.id)?.feature ?? '', status: 'cancelled', stopReason: 'signal', error: { code: 'SIGNAL', message: 'signal' } });
+      }
+      void (async () => {
+        let jobsDeleted = 0;
+        try { if (runId && (opts.podTargets || opts.deleteJobs)) jobsDeleted = await (opts.deleteJobs ?? ((id) => deleteLabelledJobs(id, opts.podTargets!, opts.spawnKubectl)))(runId); }
+        catch (error) { debug.log('self-dev.orchestrate', 'job-delete-failed', { runId, error: String(error) }, { level: 'warn' }); }
+        debug.log('self-dev.orchestrate', 'signal', { signal, pending, jobsDeleted });
+        finishOrReject();
+      })();
+    };
+    const onTerm = () => cancel('SIGTERM');
+    const onInt = () => cancel('SIGINT');
+    signals.on('SIGTERM', onTerm);
+    signals.on('SIGINT', onInt);
+    try {
+      if (pidPath) {
+        mkdirSync(join(opts.runsDir ?? selfDevRunsDir(), runId!), { recursive: true });
+        const temporary = `${pidPath}.${process.pid}.${randomUUID()}.tmp`;
+        const fd = openSync(temporary, 'wx', 0o600);
+        try {
+          try {
+            writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() - Math.floor(process.uptime() * 1000), argv0: process.argv0 }));
+          } finally { closeSync(fd); }
+          renameSync(temporary, pidPath);
+        } catch (error) { unlinkSync(temporary); throw error; }
+      }
+    } catch (error) { cleanup(); reject(error); return; }
 
     // Current full result set: resumed-done goals + each running task's
     // state (with disposition merged when the job has settled). Reused by
@@ -1243,7 +1395,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(disp?.merged !== undefined ? { merged: disp.merged } : {}),
           // ⭐ `A1` — 판정 3종을 «끝까지» 옮긴다. 여기서 빠지면 트리아지가 눈을 잃는다.
           ...(disp?.mergeReason ? { mergeReason: disp.mergeReason } : {}),
-          ...(disp?.stopReason ? { stopReason: disp.stopReason } : {}),
+          ...(!cancelling && disp?.stopReason ? { stopReason: disp.stopReason } : {}),
           ...(disp?.completionDisposition ? { completionDisposition: disp.completionDisposition } : {}),
           ...(disp?.failureClassification ? { failureClassification: disp.failureClassification } : {}),
           ...(disp?.providerErrors ? { providerErrors: disp.providerErrors } : {}),
@@ -1267,7 +1419,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       const out = buildResults();
       // S3 — teardown (opt-in): remove each job's worktree (fail-soft),
       // preserving any job that opened a PR (branch/worktree still needed).
-      if (opts.teardown === true) {
+      if (opts.teardown === true && !cancelling) {
         const rm = opts.removeWorktree ?? defaultRemoveWorktree;
         let removed = 0;
         for (const r of out) {
@@ -1279,7 +1431,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       const summary = summarizeResults(out);
       const failureKinds = summarizeFailureKinds(out);
       // ⛔⭐ 「검증 안 함」이 «산출에 보여야» 한다 — 안 그러면 「결함 0」으로 읽힌다(리뷰 #10393).
-      const observedDeliverables = opts.deliverableTargets
+      const observedDeliverables = !cancelling && opts.deliverableTargets
         ? await observeDeliverables(opts.deliverableTargets, opts.verifyDeliverable ? { verify: opts.verifyDeliverable } : {})
         : undefined;
       const deployFindings = observedDeliverables?.deployFindings ?? opts.deployFindings;
@@ -1332,11 +1484,13 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
         outcomes,
       });
       doCheckpoint();
+      cleanup();
+      if (interrupted && signals === process) process.exit(interrupted === 'SIGINT' ? 130 : 143);
       resolve(out);
     };
 
     const finishOrReject = (): void => {
-      void finish().catch(reject);
+      void finish().catch((error) => { cleanup(); reject(error); });
     };
 
     const openCount = (): number => {
@@ -1349,7 +1503,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     // else the re-tick sees a stale active count and defers on cap.
     const scheduleTick = (): void => {
       queueMicrotask(() => {
-        if (settled) return;
+        if (settled || cancelling) return;
         graph.promoteReady({ now: now() });
         const { dispatched } = dispatcher.tick();
         doCheckpoint();   // S3 — persist progress each cycle (crash-resumable)
@@ -1383,6 +1537,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
 
     bus.subscribe((ev) => {
       try { opts.onEvent?.(ev); } catch { /* isolate */ }
+      if (cancelling) return;
       switch (ev.kind) {
         case 'task-started':
           debug.log('self-dev.orchestrate', 'job.start', {
@@ -1509,8 +1664,8 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     });
 
     // Kickoff.
-    graph.promoteReady({ now: now() });
-    dispatcher.tick();
-    if (openCount() === 0) finishOrReject();
+    if (!cancelling) graph.promoteReady({ now: now() });
+    if (!cancelling) dispatcher.tick();
+    if (!cancelling && openCount() === 0) finishOrReject();
   });
 }

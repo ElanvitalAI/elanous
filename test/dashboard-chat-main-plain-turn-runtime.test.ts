@@ -44,8 +44,6 @@ function buildDeps(overrides: Partial<DashboardChatMainPlainTurnRuntimeDeps> = {
     contextRegistry: {},
     loadAttachments: async (_reg) => { calls.push('load-attachments'); },
     sessionRegistry: {},
-    virtualWindowBook: {},
-    virtualWindowRegistry: {},
     sync: { some: 'sync' },
     chatFooterLine: { current: null },
     acpTurnRef: {},
@@ -268,6 +266,26 @@ describe('runDashboardChatMainPlainTurn', () => {
     expect(ctx.finalizeCalls).toEqual([{ status: 'completed', error: undefined }]);
     expect(ctx.errorLines).toEqual([]);
     expect(ctx.assistantState).toHaveLength(1);
+  });
+
+  it('passes only terminal session reference deps into the chat turn message', async () => {
+    const registry = {};
+    let args: Record<string, unknown> | undefined;
+    const ctx = buildDeps({
+      userText: '@pane:p1 안녕 [Text #1]',
+      sessionRegistry: registry,
+      buildTurnMessage: (input) => {
+        args = input;
+        return { userMsg: { content: input.userText } };
+      },
+    });
+    await runDashboardChatMainPlainTurn(ctx.deps);
+    expect(args).toBeDefined();
+    expect(args?.userText).toBe('@pane:p1 안녕 [Text #1]');
+    expect(args?.terminalRegistry).toBe(registry);
+    expect(args).not.toHaveProperty('addressBook');
+    expect(args).not.toHaveProperty('windowRegistry');
+    expect(ctx.finalizeCalls).toEqual([{ status: 'completed', error: undefined }]);
   });
 
   it('attaches ESC handling before building the turn message', async () => {

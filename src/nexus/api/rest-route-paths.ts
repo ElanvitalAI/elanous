@@ -35,6 +35,9 @@
 /** `GET /v1/devices` — 디바이스 함대 스냅샷. */
 export const DEVICES_PATH = '/v1/devices';
 
+/** Owner-only idea PR review and merge. */
+export const APPROVALS_MERGES_PATH = '/v1/approvals/merges';
+
 /** `POST /v1/templates/capability-preview` — 템플릿 능력 미리보기.
  *  📏 이 여섯째는 앞 다섯을 접자 «자가 곧바로 다음 후보로 올려 준 것»이다 — 같은 부류라 같이 접었다. */
 export const TEMPLATE_CAPABILITY_PREVIEW_PATH = '/v1/templates/capability-preview';

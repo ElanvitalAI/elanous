@@ -1,9 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { asideBackend, buildMissionWorktreeProvenance, buildScreenLogPayload, checkEvidence, claudeBackend, codexBackend, collectTscDiagnostics, createMissionControlBrain, createMissionSearch, createMissionVerifyDone, grokBackend, recordMissionWorktreeProvenance, runAgentMission, runTsc, SCREEN_LOG_TAIL_MAX_LINE_LENGTH, SCREEN_LOG_TAIL_MAX_LINES, type EvidenceMode } from './driver.js';
+import { asideBackend, geminiBackend, buildMissionWorktreeProvenance, buildScreenLogPayload, checkEvidence, claudeBackend, codexBackend, collectTscDiagnostics, createMissionControlBrain, createMissionSearch, createMissionVerifyDone, grokBackend, recordMissionWorktreeProvenance, runAgentMission, runTsc, SCREEN_LOG_TAIL_MAX_LINE_LENGTH, SCREEN_LOG_TAIL_MAX_LINES, type EvidenceMode } from './driver.js';
 import { emitPtyEvent } from '../pty-shell/registry.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 import { createWorktree, gateWorktreeReuse } from '../git-fs/worktree.js';
@@ -498,5 +498,62 @@ describe('createMissionVerifyDone', () => {
       verifyCoverage: async () => complete,
     });
     expect(await verifyDone()).toEqual({ ok: true });
+  });
+});
+
+describe('checkEvidence doc — only a document this mission wrote counts', () => {
+  const mkRepo = () => {
+    const d = mkdtempSync(join(tmpdir(), 'doc-evidence-'));
+    execFileSync('git', ['init', '-q', d]);
+    mkdirSync(join(d, 'docs', 'plans'), { recursive: true });
+    writeFileSync(join(d, 'docs', 'plans', 'PLAN-old-2026-01-01.md'), 'old\n');
+    execFileSync('git', ['-C', d, 'add', '-A']);
+    execFileSync('git', ['-C', d, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base']);
+    return d;
+  };
+  const ev = { kind: 'doc' as const, dirRel: 'docs/plans', glob: /^PLAN-.*\.md$/ };
+
+  test('a matching document that was already committed does not pass round 0', () => {
+    const d = mkRepo();
+    try {
+      const r = checkEvidence(d, ev);
+      expect(r.ok).toBe(false);
+      expect(r.retry).toContain('이번 미션이 쓴 것이 아니다');
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test('a new document passes · an edited old one passes', () => {
+    const d = mkRepo();
+    try {
+      writeFileSync(join(d, 'docs', 'plans', 'PLAN-new-2026-09-27.md'), 'new\n');
+      expect(checkEvidence(d, ev)).toMatchObject({ ok: true, path: join(d, 'docs', 'plans', 'PLAN-new-2026-09-27.md') });
+      rmSync(join(d, 'docs', 'plans', 'PLAN-new-2026-09-27.md'));
+      writeFileSync(join(d, 'docs', 'plans', 'PLAN-old-2026-01-01.md'), 'old\nedited\n');
+      expect(checkEvidence(d, ev)).toMatchObject({ ok: true, path: join(d, 'docs', 'plans', 'PLAN-old-2026-01-01.md') });
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+
+  test('a document inside a wholly untracked directory passes (porcelain collapses it to the directory)', () => {
+    const d = mkRepo();
+    try {
+      const e2 = { kind: 'doc' as const, dirRel: 'docs/fresh', glob: /^RFC-.*\.md$/ };
+      mkdirSync(join(d, 'docs', 'fresh'), { recursive: true });
+      writeFileSync(join(d, 'docs', 'fresh', 'RFC-x.md'), 'x\n');
+      expect(checkEvidence(d, e2)).toMatchObject({ ok: true });
+    } finally { rmSync(d, { recursive: true, force: true }); }
+  });
+});
+
+describe('gemini(agy) backend answers the folder-trust menu', () => {
+  const trustScreen = 'Accessing workspace:\n/tmp/wt\nDo you trust the contents of this project?\nAntigravity CLI requires permission to read, edit, and execute files here.\n> Yes, I trust this folder\n  No, exit\n  ↑/↓ Navigate · enter Confirm';
+  test('the trust menu is confirmed with Enter (default = trust) and reported as handled', () => {
+    const writes: string[] = [];
+    expect(geminiBackend.handleTrust?.(trustScreen, (s) => writes.push(s))).toBe(true);
+    expect(writes).toEqual(['\r']);
+  });
+  test('a normal prompt screen is left alone', () => {
+    const writes: string[] = [];
+    expect(geminiBackend.handleTrust?.('Antigravity CLI 1.2.12\n> \n? for shortcuts', (s) => writes.push(s))).toBe(false);
+    expect(writes).toEqual([]);
   });
 });

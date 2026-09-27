@@ -9,32 +9,39 @@ const CRON_RUN = new URL('./cron-run.ts', import.meta.url).pathname;
 
 async function runCron(
   observabilityBody: string | null,
-  options: { targetBody?: string; preloadBody?: string; registryMock?: string } = {},
-): Promise<{ exitCode: number; stderr: string; durationMs: number; home: string }> {
+  options: { targetBody?: string; preloadBody?: string; registryMock?: string; shell?: boolean; targetArgs?: string[]; env?: Record<string, string> } = {},
+): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number; home: string }> {
   const directory = await mkdtemp(join(tmpdir(), 'cron-run-test-'));
   const home = await mkdtemp(join(tmpdir(), 'cron-run-home-'));
-  const target = join(directory, 'target.ts');
+  const target = join(directory, options.shell ? 'target.sh' : 'target.ts');
   const module = join(directory, 'observability.ts');
   const preload = join(directory, 'preload.ts');
-  await writeFile(target, options.targetBody ?? 'process.exit(7);\n');
+  await writeFile(target, options.targetBody ?? (options.shell ? 'exit 7\n' : 'process.exit(7);\n'));
   if (observabilityBody !== null) await writeFile(module, observabilityBody);
   if (options.preloadBody || options.registryMock) await writeFile(preload, `${options.preloadBody ?? ''}${options.registryMock ?? ''}`);
   try {
     const startedAt = Date.now();
     const child = Bun.spawn({
-      cmd: [process.execPath, ...(options.preloadBody || options.registryMock ? ['--preload', preload] : []), WRAPPER, target],
+      cmd: [process.execPath, ...(options.preloadBody || options.registryMock ? ['--preload', preload] : []), WRAPPER, ...(options.shell ? ['--shell', '/bin/sh'] : []), target, ...(options.targetArgs ?? [])],
       cwd: REPOSITORY_ROOT,
       env: {
         ...process.env,
         HOME: home,
         CRON_RUN_OBSERVABILITY_MODULE: observabilityBody === null ? join(directory, 'missing.ts') : module,
+        ...options.env,
       },
       stdout: 'pipe',
       stderr: 'pipe',
     });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
     return {
-      exitCode: await child.exited,
-      stderr: await new Response(child.stderr).text(),
+      exitCode,
+      stdout,
+      stderr,
       durationMs: Date.now() - startedAt,
       home,
     };
@@ -157,6 +164,42 @@ describe('cron-run observation diagnostics', () => {
 });
 
 describe('cron-run observation wrapper', () => {
+  test('--shell invokes the interpreter with target and arguments while recording the target, stderr tail, and exit code', async () => {
+    const result = await runCron(
+      'export function recordScheduledExecution(name: string, record: unknown): void { process.stderr.write(`record=${JSON.stringify({ name, record })}\\n`); }\n',
+      {
+        shell: true,
+        targetBody: 'printf "out=%s|%s|%s\\n" "$1" "$2" "$CRON_RUN_TEST_VALUE"\nprintf "first\\nsecond\\n" >&2\nexit 23\n',
+        targetArgs: ['one two', '--literal=$HOME'],
+        env: { CRON_RUN_TEST_VALUE: 'inherited' },
+      },
+    );
+    expect(result.exitCode).toBe(23);
+    expect(result.stdout).toBe('out=one two|--literal=$HOME|inherited\n');
+    expect(result.stderr).toContain('first\nsecond\n');
+    const recorded = result.stderr.match(/^record=(.*)$/m);
+    expect(recorded).not.toBeNull();
+    const { name, record } = JSON.parse(recorded![1]!) as {
+      name: string;
+      record: { status: string; exit: number; via: string; error: string };
+    };
+    // 레지스트리가 `<해석기> <경로>.sh` 줄에 붙이는 이름과 같아야 행을 찾는다.
+    expect(name).toBe('target');
+    expect(record).toMatchObject({ status: 'error', exit: 23, via: 'crontab', error: 'first\nsecond' });
+  });
+
+  test.each(['missing interpreter', 'missing target'])('rejects an incomplete --shell invocation: %s', async (caseName) => {
+    const args = caseName === 'missing interpreter' ? ['--shell'] : ['--shell', '/bin/sh'];
+    const proc = Bun.spawn([process.execPath, CRON_RUN, ...args], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env },
+    });
+    const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+    expect(exitCode).toBe(2);
+    expect(stderr).toContain('cron-run: target script 인자 필수');
+  });
+
   test('target 없이 실행하면 자식을 띄우지 않고 사용 오류로 종료한다', async () => {
     const proc = Bun.spawn([process.execPath, CRON_RUN], {
       stdout: 'pipe',

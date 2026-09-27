@@ -4,6 +4,7 @@ import { hasDelivered, triageRun, type FailureClassification } from './orchestra
 import type { DeployVerifyFinding } from '../harness/browser-verify.js';
 import type { SelfDevJobResult } from './orchestrate.js';
 import { recordSelfDevRunSupervisorStop, selfDevRunsDir } from './run-store.js';
+import { debug } from '../debug/log.js';
 
 export interface SupervisorRound {
   round: number;
@@ -20,6 +21,7 @@ export type SupervisorStopReason =
   | 'parent-signals-red'
   | 'needs-human'
   | 'no-actionable-work'
+  | 'handed-off-to-salvage'
   | 'max-rounds'
   | 'no-progress'
   | 'provider-exhausted'
@@ -36,6 +38,7 @@ export const SUPERVISOR_STOP_REASONS = [
   'parent-signals-red',
   'needs-human',
   'no-actionable-work',
+  'handed-off-to-salvage',
   'max-rounds',
   'no-progress',
   'provider-exhausted',
@@ -146,6 +149,7 @@ function formatGoalPlanRevisionObservation(results: readonly SelfDevJobResult[])
 
 export type SupervisorJobResult = SelfDevJobResult & {
   reviewReason?: string;
+  salvage?: 'launched' | 'parked';
 };
 
 export function decideNextRun(input: {
@@ -169,7 +173,12 @@ export function decideNextRun(input: {
     ? 'unmeasured'
     : input.deliverableMerge.merged >= input.deliverableMerge.expected ? 'complete' : 'incomplete';
   const reviewMustFixTrend: SupervisorDecision['reviewMustFixTrend'] = input.reviewMustFixTrend ?? 'unmeasured';
-  const t = triageRun(results, input.deployFindings, observation === 'failed');
+  const handedOff = results.filter((result) => result.salvage === 'launched');
+  const activeResults = results.filter((result) => result.salvage !== 'launched');
+  const handedOffIds = new Set(handedOff.map((result) => result.taskId));
+  const deployFindings = input.deployFindings === undefined ? undefined
+    : new Map([...input.deployFindings].filter(([taskId]) => !handedOffIds.has(taskId)));
+  const t = triageRun(activeResults, deployFindings, observation === 'failed');
   const round = history.length;
   const landed = countLanded(results);
   const actionable = countActionable(t);
@@ -203,6 +212,18 @@ export function decideNextRun(input: {
       action: 'stop',
       stopReason: 'deliverable-merged',
       why: withGoalPlanRevisionObservation(`산출물 전체가 이미 병합됐다 — 기대 ${input.deliverableMerge!.expected} · 병합 ${input.deliverableMerge!.merged}`),
+    };
+  }
+
+  if (handedOff.length > 0 && t.classifications.length === 0) {
+    for (const { taskId: jobId } of handedOff) {
+      try { debug.log('self-dev.supervisor', 'handed-off-to-salvage', { jobId }); } catch { /* fail-open */ }
+    }
+    return {
+      ...base,
+      action: 'stop',
+      stopReason: 'handed-off-to-salvage',
+      why: withGoalPlanRevisionObservation(`수확 자식에게 넘겼다 — ${handedOff.map((result) => result.taskId).join(' · ')}`),
     };
   }
 
@@ -345,10 +366,10 @@ export function decideNextRun(input: {
 
 export function appendRound(
   history: readonly SupervisorRound[],
-  results: readonly SelfDevJobResult[],
+  results: readonly SupervisorJobResult[],
   reviewMustFixTrend?: SupervisorDecision['reviewMustFixTrend'],
 ): SupervisorRound[] {
-  const t = triageRun([...results]);
+  const t = triageRun(results.filter((result) => result.salvage !== 'launched'));
   return [...history, {
     round: history.length,
     landed: countLanded(results),

@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { Command } from 'commander';
+import { registerOpsCommands } from './cli/ops-cli.js';
+import { registerPublishCommands } from './cli/publish-cli.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -2414,7 +2417,7 @@ describe('filterDashboardArgs', () => {
 });
 
 describe('buildCliAgentTools — harnessPlan child tool wiring', () => {
-  const source = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
+  const source = readFileSync(new URL('./cli/agent-cli.ts', import.meta.url), 'utf8');
 
   function harnessPlanBlock(text: string): string {
     const start = text.indexOf('if (harnessPlan) {');
@@ -3556,6 +3559,8 @@ describe('harness orchestrate canonical entrance capability', () => {
   const excludedHarnessOptions = ['--fabric-decompose', '--max-tasks'] as const;
   const expectedHarnessRootEntrances = [
     'ask',
+    // 💰 예산 입구 — `harness budget`(뿌리 입구에 새로 섰다 · 기대 목록이 따라오지 않아 main 이 결정적으로 빨갛던 자리 · 🅞 09-27 분석).
+    'budget',
     'browser-act',
     // ⌨️ 타이핑 «판정» 입구 — 판정기 decideTypeAction 의 CLI 표면(키를 보내지 않는다).
     'browser-type',
@@ -3923,6 +3928,54 @@ describe('self orchestrate CLI deliverable wiring', () => {
     const outputTypeOptions = [...source.matchAll(/\.option\('--deliverable(?:\s|<)/g)];
     expect(outputTypeOptions).toHaveLength(2);
     expect(orchestrateCommandInput(source)).not.toContain(".option('--deliverable");
+  });
+});
+
+describe('schedule migrate/adopt/release/delete default dry-run', () => {
+  for (const action of ['migrate', 'adopt', 'release', 'delete']) {
+    test(`${action} does not dispatch without --yes and dispatches once with --yes`, async () => {
+      const dispatched: Record<string, unknown>[] = [];
+      const exits: number[] = [];
+      const output: string[] = [];
+      const originalWrite = process.stdout.write;
+      process.stdout.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+        output.push(typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk));
+        callback?.();
+        return true;
+      }) as typeof process.stdout.write;
+      try {
+        const dispatch: ScheduleDispatch = async args => {
+          dispatched.push(args);
+          return { applied: true };
+        };
+        await runSchedule(action, { id: 'x', json: true }, dispatch, code => exits.push(code));
+        expect(dispatched).toHaveLength(0);
+        expect(JSON.parse(output[0])).toEqual({
+          dryRun: true, action, id: 'x', note: '적용하려면 --yes 를 붙인다',
+        });
+        expect(exits).toEqual([0]);
+
+        await runSchedule(action, { id: 'x', json: true, yes: true }, dispatch, code => exits.push(code));
+        expect(dispatched).toHaveLength(1);
+        expect(dispatched[0]).toMatchObject({ action, id: 'x', yes: true });
+        expect(JSON.parse(output[1])).toEqual({ applied: true });
+        expect(exits).toEqual([0, 0]);
+      } finally {
+        process.stdout.write = originalWrite;
+      }
+    });
+  }
+
+  test('list still dispatches without --yes', async () => {
+    const dispatched: Record<string, unknown>[] = [];
+    const exits: number[] = [];
+    await runSchedule('list', { json: true }, async args => {
+      dispatched.push(args);
+      return { schedules: [] };
+    }, code => exits.push(code));
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toMatchObject({ action: 'list' });
+    expect(exits).toEqual([0]);
   });
 });
 
@@ -4411,7 +4464,18 @@ describe('decide / ax-screen / decide-recipe JSON stdout completion', () => {
     const source = indexSource();
     expect(source).not.toMatch(/console\.log\(JSON\.stringify/);
     expect(source).toContain('import { writeStdoutJson } from \'./cli/stdout-json.js\';');
-    expect((source.match(/writeStdoutJson/g) ?? []).length).toBeGreaterThan(102);
+    // agent / ops / publish / autopilot call sites now live in their registration modules; count them together.
+    const jsonSources = source
+      + readFileSync(new URL('./cli/agent-cli.ts', import.meta.url), 'utf8')
+      + readFileSync(new URL('./cli/ops-cli.ts', import.meta.url), 'utf8')
+      + readFileSync(new URL('./cli/publish-cli.ts', import.meta.url), 'utf8')
+      + readFileSync(new URL('./cli/autopilot-cli.ts', import.meta.url), 'utf8');
+    expect((jsonSources.match(/writeStdoutJson/g) ?? []).length).toBeGreaterThan(102);
+
+    const extracted = new Command();
+    registerOpsCommands(extracted);
+    registerPublishCommands(extracted);
+    expect(extracted.commands.map((command) => command.name())).toEqual(['ops', 'publish']);
 
     const decide = commandSlice(source, ".command('decide <question>')", ".command('ax-screen <tasks.json>')");
     expect(decide).toContain('.action(async (question: string, opts:');

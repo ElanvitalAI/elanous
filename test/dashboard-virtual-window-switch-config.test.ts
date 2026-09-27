@@ -22,7 +22,6 @@ function registeredGlobalKeys(enableSupplementalGlobalKeys: boolean): string[] {
     enableSupplementalGlobalKeys,
     register: (binding) => { bindings.push(binding); },
     openSurfaceCatalog: () => {},
-    dispatchVirtualWindowChord: () => {},
   });
   return bindings.map((binding) => binding.id);
 }
@@ -58,32 +57,12 @@ describe('dashboard global key config', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test('showDashboard registration helper gates only supplemental global keys', () => {
-    const supplementalBindings = [
-      'dashboard:open-surface-catalog',
-      'dashboard:vw-chord:picker',
-      'dashboard:vw-chord:close-window',
-      'dashboard:vw-chord:last-pane',
-    ];
-    const coreBindings = [
-      'dashboard:vw-chord:new-window',
-      'dashboard:vw-chord:close-pane',
-      'dashboard:vw-chord:zoom-toggle',
-    ];
-
+  test('registration leaves retired VW chords unbound with either config setting', () => {
     const disabled = registeredGlobalKeys(false);
     const enabled = registeredGlobalKeys(true);
 
-    expect(disabled).toEqual(coreBindings);
-    expect(enabled).toEqual([...supplementalBindings, ...coreBindings]);
-    for (const binding of supplementalBindings) {
-      expect(disabled).not.toContain(binding);
-      expect(enabled).toContain(binding);
-    }
-    for (const binding of coreBindings) {
-      expect(disabled).toContain(binding);
-      expect(enabled).toContain(binding);
-    }
+    expect(disabled).toEqual([]);
+    expect(enabled).toEqual(['dashboard:open-surface-catalog']);
   });
 
   test('keeps virtual-window switch configuration independent from supplemental keys', () => {

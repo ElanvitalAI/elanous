@@ -3,6 +3,7 @@ const MAX_GIT_RETRY_ATTEMPTS = 6;
 
 export type GitRunResult = {
   status: number | null;
+  signal?: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
 };

@@ -2,6 +2,7 @@
  *  Mirrors `chat-runtime.test.ts` style. */
 
 import { describe, expect, test } from 'bun:test';
+import { DaemonClient } from '../daemon-client';
 import {
   addChainEdge,
   broadcastToPanels,
@@ -180,8 +181,9 @@ describe('Showroom runtime · createDefaultPanels', () => {
 });
 
 describe('Showroom runtime · SHOWROOM_PROVIDERS', () => {
-  test('matches PWA ProviderPicker pool (5 entries · default + 4 named)', () => {
+  test('keeps the showroom fallback provider pool (default + 4 named)', () => {
     expect(SHOWROOM_PROVIDERS).toEqual(['', 'claude', 'gemini', 'grok', 'codex']);
+    expect('prompt' in DaemonClient.prototype).toBe(false);
   });
 });
 

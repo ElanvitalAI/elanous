@@ -25,12 +25,14 @@
 //
 // See: 내부 문서 `PLAN-cv-3-daemon-multi-llm-2026-05-08` (RFC v2 · 13 D)
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { notifyDaemonActivity } from '../dispatch/idle-detector.js';
 import {
   composeDaemonSystemPrompt,
   createDaemonRunTurn,
+  createDaemonBootToolCwdResolver,
   type DaemonRuntimeOpts,
   type DaemonSessionHistory,
 } from './daemon-runtime.js';
@@ -41,7 +43,7 @@ import {
   type MultiLlmTarget,
 } from '../acp/multi-llm-bridge.js';
 import { toolSurface } from './daemon-tools/index.js';
-import { createToolCwdResolver } from './tool-cwd.js';
+import { createToolCwdResolver, type ToolCwdResolver } from './tool-cwd.js';
 import type { AcpServerOptions, AcpTurnContext } from '../acp/server.js';
 import { getGlobalPersonaRegistry } from '../persona/global-registry.js';
 import { assemblePersonaPrompt } from '../persona/prompt-assembler.js';
@@ -57,10 +59,7 @@ import { assemblePersonaPrompt } from '../persona/prompt-assembler.js';
 export function createDaemonMultiLlmRunTurn(
   history: DaemonSessionHistory,
   opts: DaemonRuntimeOpts = {},
-  toolCwdResolver = createToolCwdResolver({
-    tools: opts.tools ?? 'none',
-    ...(opts.toolCwd !== undefined ? { toolCwd: opts.toolCwd } : {}),
-  }),
+  toolCwdResolver = createDaemonBootToolCwdResolver(opts, opts.tools ?? 'none'),
 ): NonNullable<AcpServerOptions['runTurn']> {
   // Legacy single-LLM bridge (used when no multiLlm hint). Both paths share
   // one resolver so cwd validation runs once while write worktrees stay lazy.
@@ -70,6 +69,7 @@ export function createDaemonMultiLlmRunTurn(
   // sharing means each target sees the same surface but invokes its
   // own dispatchTool calls; nothing is shared across targets).
   const surface = toolSurface(opts.tools ?? 'none');
+  const turnToolCwd = new AsyncLocalStorage<ToolCwdResolver>();
 
   // Multi-LLM bridge — fans out N runCoreTurn per target.
   const multiBridge = bridgeMultiLlmCoreTurnsToAcp({
@@ -84,9 +84,10 @@ export function createDaemonMultiLlmRunTurn(
     getTools: () => surface.specs,
     dispatchTool: async (name, args, ctx) => {
       const ctrl = new AbortController();
+      const resolver = turnToolCwd.getStore() ?? toolCwdResolver;
       const dispatchCtx: import('./daemon-tools/types.js').DaemonToolDispatchCtx = {
-        cwd: toolCwdResolver.cwd!,
-        resolveWriteCwd: toolCwdResolver.resolveWriteCwd,
+        cwd: resolver.cwd!,
+        resolveWriteCwd: resolver.resolveWriteCwd,
         signal: ctrl.signal,
         // Elanous's own LLM assembles tool arguments from natural language.
         entry: 'elanous-apparatus',
@@ -120,7 +121,12 @@ export function createDaemonMultiLlmRunTurn(
       await legacyRunTurn(turnCtx);
       return;
     }
-    await multiBridge(turnCtx);
+    if (opts.acpSessionCwd) {
+      const resolver = createToolCwdResolver({ tools: opts.tools ?? 'none', toolCwd: turnCtx.cwd });
+      await turnToolCwd.run(resolver, () => multiBridge(turnCtx));
+    } else {
+      await multiBridge(turnCtx);
+    }
   };
 }
 

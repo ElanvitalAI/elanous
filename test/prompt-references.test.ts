@@ -67,4 +67,13 @@ describe('expandPromptReferences', () => {
     const r = expandPromptReferences('@term:abc', {});
     expect(r).toBe('@term:abc');
   });
+
+  test('passes pane and window tokens through while expanding terminal references', () => {
+    const registry = makeFakeRegistry([{ id: 'term-session:1', title: 'probe', render: 'TERMINAL_CAPTURE' }]);
+    const input = '@pane:p1 안녕 @win:2/pane:p1 @win:2#all @term:term-session:1';
+    const result = expandPromptReferences(input, { terminalRegistry: registry });
+    expect(result).toContain('@pane:p1 안녕 @win:2/pane:p1 @win:2#all');
+    expect(result).toContain('TERMINAL_CAPTURE');
+    expect(result).toContain('<terminal-session id="term-session:1"');
+  });
 });

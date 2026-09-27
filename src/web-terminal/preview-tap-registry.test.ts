@@ -13,24 +13,26 @@ import {
   unregisterPreviewTerminalForWebTap,
   listAllPreviewTerminals,
   listPreviewTerminals,
+  lookupPreviewTerminal,
+  getRegisteredPreviewTerminalCount,
   __resetPreviewTapRegistry,
 } from './preview-tap-registry.js';
 import type { PreviewTerminal } from '../preview/terminal.js';
 import type { AcpServerHandle } from '../acp/server.js';
 
 function makeFakePt(): { pt: PreviewTerminal; emit: (chunk: string) => void } {
-  let tap: ((chunk: string) => void) | null = null;
+  const taps = new Set<(chunk: string) => void>();
   const pt = {
     pid: 12345,
     cols: 80,
     rows: 24,
     isAlive: true,
     addRawOutputTap(cb: (chunk: string) => void) {
-      tap = cb;
-      return () => { tap = null; };
+      taps.add(cb);
+      return () => { taps.delete(cb); };
     },
   } as unknown as PreviewTerminal;
-  return { pt, emit: (chunk) => tap?.(chunk) };
+  return { pt, emit: (chunk) => { for (const tap of taps) tap(chunk); } };
 }
 
 const fakeHandle = {
@@ -112,6 +114,49 @@ describe('listPreviewTerminals — lastOutputAt (P4)', () => {
         lastOutputAt: firstRegisteredAt,
       }),
     ]);
+  });
+
+  it('one shell can serve two sessions; detaching one retains the other tap and lookup', () => {
+    const { pt, emit } = makeFakePt();
+    const sent: Array<[string, string, string]> = [];
+    const handle = {
+      terminalOutput: async (sid: string, tid: string, chunk: string) => {
+        sent.push([sid, tid, chunk]);
+        return true;
+      },
+    } as unknown as AcpServerHandle;
+    const detachA = registerPreviewTerminalForWebTap(pt, 'sid-a', 'term-x', handle);
+    const detachB = registerPreviewTerminalForWebTap(pt, 'sid-b', 'term-x', handle);
+    expect(getRegisteredPreviewTerminalCount()).toBe(1);
+    expect(listAllPreviewTerminals()).toHaveLength(1);
+    expect(listPreviewTerminals('sid-a')).toEqual([expect.objectContaining({ sessionId: 'sid-a', terminalId: 'term-x' })]);
+    expect(listPreviewTerminals('sid-b')).toEqual([expect.objectContaining({ sessionId: 'sid-b', terminalId: 'term-x' })]);
+    expect(lookupPreviewTerminal('sid-b', 'term-x')).toBe(pt);
+    emit('before');
+    expect(sent).toEqual([['sid-a', 'term-x', 'before'], ['sid-b', 'term-x', 'before']]);
+
+    detachA();
+    expect(lookupPreviewTerminal('sid-a', 'term-x')).toBeNull();
+    expect(lookupPreviewTerminal('sid-b', 'term-x')).toBe(pt);
+    expect(listPreviewTerminals('sid-a')).toEqual([]);
+    expect(listAllPreviewTerminals()).toHaveLength(1);
+    emit('after');
+    expect(sent.at(-1)).toEqual(['sid-b', 'term-x', 'after']);
+    detachB();
+    expect(listAllPreviewTerminals()).toEqual([]);
+  });
+
+  it('replacing a session tap leaves the other session attached and does not duplicate output', () => {
+    const { pt, emit } = makeFakePt();
+    const sent: string[] = [];
+    const handle = { terminalOutput: async (sid: string) => { sent.push(sid); return true; } } as unknown as AcpServerHandle;
+    const staleDetach = registerPreviewTerminalForWebTap(pt, 'sid-a', 'term-x', handle);
+    registerPreviewTerminalForWebTap(pt, 'sid-b', 'term-x', handle);
+    registerPreviewTerminalForWebTap(pt, 'sid-a', 'term-x', handle);
+    staleDetach();
+    emit('once');
+    expect(sent.sort()).toEqual(['sid-a', 'sid-b']);
+    expect(listAllPreviewTerminals()).toHaveLength(1);
   });
 
   it('해제한 터미널은 전역 열거에서 제거된다', () => {

@@ -50,6 +50,9 @@ export interface SelfImplementDisposition {
   branch?: string;
   prUrl?: string;
   prNumber?: number;
+  /** Head SHA checked by the Pod before host regate. */
+  checkedHeadCommit?: string;
+  hostRegate?: { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string };
   merged?: boolean;
   detail?: string;
   /** Terminal error emitted by a failed child `--json` result. */
@@ -447,6 +450,8 @@ export function parseSelfImplementJson(stdout: string): SelfImplementDisposition
         ...(typeof o.branch === 'string' ? { branch: o.branch } : {}),
         ...(typeof o.prUrl === 'string' ? { prUrl: o.prUrl } : {}),
         ...(typeof o.prNumber === 'number' ? { prNumber: o.prNumber } : {}),
+        ...(typeof o.checkedHeadCommit === 'string' ? { checkedHeadCommit: o.checkedHeadCommit } : {}),
+        ...(typeof o.hostRegate === 'object' && o.hostRegate !== null ? { hostRegate: o.hostRegate as SelfImplementDisposition['hostRegate'] } : {}),
         ...(typeof o.merged === 'boolean' ? { merged: o.merged } : {}),
         ...(typeof o.detail === 'string' ? { detail: o.detail } : {}),
         ...(typeof o.error === 'string' && o.error.trim() ? { error: o.error } : {}),

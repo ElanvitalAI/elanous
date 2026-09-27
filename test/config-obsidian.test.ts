@@ -1,23 +1,22 @@
-// ── OBSIDIAN_VAULT config tests ──
-// `OBSIDIAN_VAULT` is read once at module load, so these tests
-// exercise the default-value shape (env + fallback) rather than
-// mutating process.env mid-run.
+// ── Default Obsidian vault ──
+// The inputs (env, home) are injected, so the result is the same on every machine.
+// (The old test recomputed `process.env`/`homedir()` inside the test — it mirrored the
+// code, passed whatever the default was, and could differ between machines.)
 
 import { describe, test, expect } from 'bun:test';
-import { homedir } from 'os';
-import { join } from 'path';
-import { OBSIDIAN_VAULT } from '../src/config.js';
+import { defaultObsidianVault, fallbackObsidianVault } from '../src/obsidian/default-vault.js';
 
-describe('OBSIDIAN_VAULT', () => {
-  test('is a non-empty absolute path', () => {
-    expect(typeof OBSIDIAN_VAULT).toBe('string');
-    expect(OBSIDIAN_VAULT.length).toBeGreaterThan(0);
-    expect(OBSIDIAN_VAULT.startsWith('/')).toBe(true);
+describe('defaultObsidianVault', () => {
+  test('without OBSIDIAN_VAULT it is <home>/Documents/Obsidian', () => {
+    expect(defaultObsidianVault({ env: {}, home: '/h' })).toBe('/h/Documents/Obsidian');
+    expect(fallbackObsidianVault('/h')).toBe('/h/Documents/Obsidian');
   });
 
-  test('either honors $OBSIDIAN_VAULT or falls back to ~/Obsidian/ElanvitalAI', () => {
-    const fromEnv = process.env.OBSIDIAN_VAULT;
-    const fallback = join(homedir(), 'Obsidian', 'ElanvitalAI');
-    expect(OBSIDIAN_VAULT).toBe(fromEnv || fallback);
+  test('OBSIDIAN_VAULT wins, trimmed', () => {
+    expect(defaultObsidianVault({ env: { OBSIDIAN_VAULT: '  /v/Notes ' }, home: '/h' })).toBe('/v/Notes');
+  });
+
+  test('a blank OBSIDIAN_VAULT is treated as unset', () => {
+    expect(defaultObsidianVault({ env: { OBSIDIAN_VAULT: '   ' }, home: '/h' })).toBe('/h/Documents/Obsidian');
   });
 });

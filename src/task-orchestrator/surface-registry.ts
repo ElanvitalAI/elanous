@@ -52,10 +52,13 @@ export interface DispatchContext {
 }
 
 /** An adapter is a pure-ish function bound to one surface kind. */
-export type SurfaceAdapter = (
+export type SurfaceAdapter = ((
   task: Task,
   ctx: DispatchContext
-) => Promise<DispatchResult>;
+) => Promise<DispatchResult>) & {
+  /** Admission check before the dispatcher changes ready → running. */
+  deferReason?: (task: Task) => 'intake-sequential' | undefined;
+};
 
 /**
  * In-memory registry with a singleton escape for dashboard boot.

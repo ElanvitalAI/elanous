@@ -56,7 +56,7 @@ export async function classifyIntakeFrontRoute(
         'Return only one JSON object: {"track":"...","confidence":0.0,"reason":"..."}. Confidence must be between 0 and 1.',
       ].join('\n') },
       { role: 'user', content: text },
-    ], () => {}, { provider: rolePick.provider, ...(rolePick.model ? { model: rolePick.model } : {}) });
+    ], () => {}, { provider: rolePick.provider, ...(rolePick.model ? { model: rolePick.model } : {}), usageRole: 'classify' });
 
     // 실제 모델은 JSON 을 ```json 펜스로 감싸거나 앞뒤에 말을 붙이곤 한다 — 같은 디렉토리의 다른 호출자와 같은 관대한 추출을 쓴다.
     const parsed: unknown = extractJsonBlock(response);
