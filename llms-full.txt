@@ -420,6 +420,132 @@ See also: [Commands you will use](/using-elanous/commands) · [Troubleshooting](
 
 ---
 
+# Tasks and intake
+
+Source: https://docs.elanous.ai/using-elanous/tasks-and-intake/
+
+**In one sentence:** whatever you throw at elanous — a sentence in Telegram, a note in the web app, a link, a YouTube video, an issue in Linear — lands in one place, becomes one or more **tasks**, and each task is run by the part of elanous that fits it (the harness for code changes, an agent with tools for jobs that only need running).
+
+This page separates what ships today from what is in progress. Status marks: ✅ in the latest release · 🟡 on main, in the next release · 🔄 in progress · 📋 designed.
+
+## The shape
+
+```mermaid
+flowchart LR
+  IN["Input<br/>Telegram · web app · TUI · links · YouTube · Linear"] --> FD["Front door<br/>memo · instruction · link · question"]
+  FD --> L["Intake ledger"]
+  L --> I["Interpretation<br/>one input → N tasks"]
+  I --> T[("Tasks<br/>the source of truth")]
+  EXT["Linear (optional)"] <--> T
+  T --> R["Run<br/>harness · agent with tools · workflow"]
+  R --> T
+```
+
+- **Tasks are the source of truth.** An outside tracker such as Linear keeps a copy; elanous keeps the original.
+- **Outside trackers are optional.** Without any, elanous still takes work in, triages it, runs it and reports back. Connecting Linear adds a second place to see and file the same tasks.
+
+## Getting work in
+
+| Where | What happens | Status |
+|---|---|---|
+| Telegram `/work <text>` | The front door classifies the text: a link to absorb, a list of tasks, or something to implement. Tasks wait for your approval; implementation goes to the harness. The reply comes back in the same chat. | 🟡 on main |
+| Telegram, a plain link | The matching skill summarizes it (YouTube, X, GitHub, web) and saves a note. | ✅ · 🔄 recording it in the intake ledger |
+| Telegram, a plain sentence | A normal chat answer. | ✅ · 🔄 recording it in the intake ledger |
+| Web app intake page | A live preview of how the front door reads your text, then absorb or send to the harness. | 🟡 on main |
+| Web app chat | A normal chat turn. | ✅ · 🔄 front door for chat |
+| TUI | Links are summarized by the matching skill; «하니스로 구현 …» offers the harness to the model. | ✅ |
+| Daily collection | Trending videos, saved Telegram messages and GitHub activity are collected every morning, absorbed, checked against elanous, and summarized in a daily digest. | ✅ |
+| Linear | Issues become tasks, by sync or by webhook (below). | 🟡 on main |
+
+The intake ledger is the list of everything that came in:
+
+```bash
+elanous intake items --status new      # what has not been processed yet
+elanous intake digest                  # today's summary: what was absorbed, one-line conclusions, goal candidates
+```
+
+⬜ Known limits today: the automatic queue only picks items that carry a link, so text-only notes wait; and the improvement candidates found by absorbing a video are shown in the digest but are not yet turned into tasks automatically.
+
+## From an item to tasks
+
+**Interpretation** reads an intake item and writes the task: a short title, why it matters, an acceptance criterion, a priority, and whether it is a code change or a job to run.
+
+| | Status |
+|---|---|
+| One item → one task, marked as a code change (`[dev]`) or a job to run (`[run]`) | 🔄 in progress (a `to-tasks` intake command) |
+| One item → several tasks, each typed as **run**, **implement**, **research** or **composite** | 📋 designed |
+| Duplicate detection against existing tasks and past runs | 📋 designed |
+
+An item without an acceptance criterion is sent back as a question instead of becoming a task.
+
+## Approval and priority
+
+- Tasks that come from outside (Linear, Telegram `/work`, intake) start as **backlog** and wait for approval.
+- See what is waiting with `elanous tasks list --status backlog` and approve with `elanous tasks approve <id>`.
+- Approved tasks run in **priority order** — urgent, high, medium, low — then oldest first, a few at a time.
+- Auto-run rules can approve tasks from a given source, team, project or assignee automatically (configuration key `tox.external.autoRun`).
+
+| | Status |
+|---|---|
+| Priority-ordered task loop | ✅ |
+| Outside tasks waiting for approval · auto-run rules | 🟡 on main |
+| Running approved outside tasks: `[dev]` → the harness, everything else → an agent with tools; intake tasks one at a time | 🟡 on main |
+| `elanous tasks list · show · approve` — tasks in priority order, details, approval (needs the daemon running) | 🟡 on main |
+
+## Linear
+
+elanous works with Linear's **Basic** plan: issues and the API are all it needs.
+
+**1. Store your API key** (read from stdin, never printed):
+
+```bash
+elanous connector linear set-key < linear-api-key.txt
+```
+
+**2. Pull issues in:**
+
+```bash
+elanous connector linear sync --team ENG --prefix "[elanous]" --dry-run
+elanous connector linear sync --team ENG --prefix "[elanous]"
+```
+
+- `--team` is the team key; `--prefix` limits the sync to issues whose title starts with that text (or carry that label).
+- Each issue becomes one task, identified by its Linear id — syncing twice does not create duplicates, and an issue that changed is updated.
+- Linear priority maps to task priority: Urgent → high (the note "original priority: Urgent" is kept), High → high, Medium → medium, Low → low, none → medium.
+- Done, canceled and duplicate issues are skipped. One failing issue does not stop the rest; it is retried on the next sync.
+- Put `[dev]` in an issue title to send it to the harness once approved; otherwise it runs as a job.
+
+**3. Or receive webhooks** instead of syncing: store the signing secret with `elanous connector linear set-webhook-secret` (stdin) and run the receiver with `elanous hooks serve`. Signatures are checked and replayed deliveries are refused. The receiver needs a public HTTPS address in front of it.
+
+| | Status |
+|---|---|
+| Issues → tasks (sync and webhook) | 🟡 on main |
+| Task results written back to Linear (state, comments) | 📋 designed |
+| Asana | Use the Asana connector of your coding agent (Claude Code); an elanous adapter is optional and designed |
+| Jira | 📋 designed — not available |
+
+## Without any outside tracker
+
+Everything above works with no tracker connected. What a tracker gives you and where elanous has it:
+
+| A tracker gives you | In elanous | Status |
+|---|---|---|
+| Issues, states, priority, sub-issues, projects | Tasks (with dependencies, parent task, mission, acceptance criteria) | ✅ |
+| A board | TUI board, the web app task panel | ✅ · 🔄 one shared list and approval view |
+| Filing by message or email | Telegram `/work`, the web app intake page | 🟡 · 📋 email |
+| Triage suggestions and rules | Interpretation and auto-run rules | 🔄 · 📋 condition → action rules |
+| Cycle time and lead time | Task timestamps and the run ledger | 📋 `tasks stats` |
+| Scheduled and event-driven agents | The harness, the task loop and `elanous schedule` | ✅ |
+
+## What this page deliberately does not claim
+
+- That the 🔄 and 📋 rows work today. They do not yet.
+- How often interpretation picks the right type or priority. It is not measured yet.
+
+See also: [The harness](/using-elanous/harness) · [Graph engineering](/concepts/graph-engineering) · [Telegram](/surfaces/telegram).
+
+---
+
 # Sessions
 
 Source: https://docs.elanous.ai/using-elanous/sessions/
@@ -739,6 +865,17 @@ elanous keeps a small family of **standard templates** — reviewed graphs that 
 | Composite | work with execution or research in the middle: build, land, hand off, run, observe |
 | Heal (shared) | called by all of the above when a step fails |
 
+What ships today inside the development harness is one template per **goal type**, picked from the goal's `GoalType:` line or `--goal-type` (default `implement`):
+
+| Goal type | Template | Lands as |
+|---|---|---|
+| `implement` | author · plan · implement · gate · review · rework · main sync · pull request · merge | a code change |
+| `research` | investigate · (gate when code changed) · judge · landing | documents |
+| `document` | draft · review · rework · landing | documents |
+| `operate` | plan · verify · review · rework · landing | a registration or wiring change; the gate is never skipped |
+
+The general-development and composite templates in the first table are designed; composite work today is split into pieces with `elanous self orchestrate --decompose`, and each piece can carry its own goal type.
+
 A run's graph is shaped twice:
 
 1. **At launch** — from the template, the goal, the run contract (for example, where it runs) and past runs, elanous decides the graph for *this* run.
@@ -760,7 +897,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 
 - A **graph** is the flow: order, branches, retries, pauses for approval, reshaping, healing.
 - A **workflow** (`elanous wf`) is the body of a single node: a short DAG of prompts, HTTP calls, classification and templates.
-- **Intake** turns what you say into tasks; the **task manager** runs a task by starting a graph.
+- **Intake** turns what you say into tasks; the **task manager** runs a task. Today an approved task marked `[dev]` starts a harness run, and other tasks run as an agent with tools (🟡 on main). See [Tasks and intake](/using-elanous/tasks-and-intake).
 
 ## What ships today, what is in progress
 
@@ -769,7 +906,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 | Harness runs (implement · research · document · operate templates) | ✅ ships — the orchestrator drives them; the graph declaration is checked against every step |
 | Graph runner with approval pauses and resume (`elanous graph run` · `graph approve` · `graph run --resume`) | ✅ ships |
 | Run contract: local or remote (pod) | ✅ declared and resolved at run start |
-| Node catalog | ✅ declared and checked (judge, execute and observe roles built from existing parts) · 🟡 heal roles execute through their recipes — other roles do not yet execute by role name |
+| Node catalog | ✅ declared and checked (judge, execute and observe roles built from existing parts) · 🟡 heal roles execute through their recipes — other roles do not yet execute by role name · 🔄 the harness templates still use their own node names; mapping them to catalog role names is in progress |
 | New node kinds (observe · hitl · subgraph) | ✅ accepted by the graph parser |
 | Node outputs flowing to the next node · multi-way branching | 🟡 on main — next release (each node reads the run context; a node's last-line JSON `outcome` picks the edge) |
 | Heal template with the resolution ladder | 🟡 on main — next release: the runner walks it; the first observation step marks deleted files by itself and a real failure class closes without a human (example below) · 🔄 the deeper observation and outside-grounding steps are still being filled in |
@@ -778,7 +915,9 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 | Budget decision before a launch (`elanous harness budget --json` → proceed · next provider · wait for reset · stop, with reasons) | 🟡 on main — next release |
 | Grounding sources registry (`elanous grounding sources list · add · discover · status`) | 🟡 on main — next release |
 | Supervisor adding nodes at launch and while running | 📋 designed |
-| Workflows as graph nodes (`wf:`) · graphs as workflow nodes · tasks that start graphs | 📋 designed |
+| Tasks that start harness runs (approved `[dev]` tasks → harness · other tasks → an agent with tools) | 🟡 on main — next release |
+| Task type → a combination of templates and workflows (run · implement · research · composite) | 📋 designed |
+| Workflows as graph nodes (`wf:`) · graphs as workflow nodes | 📋 designed |
 
 ### A real walk of the heal template
 
@@ -1239,7 +1378,7 @@ not use it.
 
 | Button | What it does |
 |---|---|
-| **clear** | Clears the screen. |
+| **clear** | Clears the screen in this browser. The shell itself keeps running as it was. |
 | Camera | Takes a photo (or picks one) and puts its file path into the terminal. |
 | File | Attaches one or more files and puts their paths into the terminal. You can also drag files onto the terminal. |
 | **Live** | Shares your camera with the agent while it is on. |
@@ -1253,7 +1392,7 @@ Under the terminal is a chat box tied to the current terminal:
 - Plain text asks an agent about the terminal — it can see what is on screen.
 - Lines that start with `:` stay local. Type `:help` to list them; for example
   `:tab next`, `:tab prev`, `:cwd` and `:capture`.
-- You can pick the agent provider and see the session and cost for the month.
+- It shows the session and what the agent has cost this month.
 
 ## Use it from several devices
 
@@ -1261,6 +1400,10 @@ Open the same terminal on another device (see
 [The web app (PWA)](/surfaces/pwa#use-it-from-another-device)) and both see the same
 screen. A badge shows how many devices are attached, and a short "typing"
 flash appears when someone else types.
+
+Reopening a terminal tab — after a browser restart, or from another browser —
+returns you to the same shell that is still running; it does not start a new
+one.
 
 ## Troubleshooting
 
@@ -1290,8 +1433,6 @@ as it appears on screen, with the meaning in brackets.
 | **sess:** | The current session. Click the id to copy it. Double-click the new-chat button to start an empty session; the old one stays in the session list. The menu next to it (**세션 메뉴** — session menu) starts a new chat or shows the session id and message count. |
 | **이번 달 $…** (this month) | What elanous has spent this month, and the share of your budget when a budget is set. It turns to a warning colour when you pass your notify threshold. It reads **budget —** when the daemon cannot report it. |
 | Microphone cost | What voice input and read-aloud have cost this month. |
-| **provider** | The LLM provider for this session — keep **(default)** to use your configured one, or pick claude, gemini, grok or codex. |
-| Tool surface (**default**) | Click to switch between the daemon's normal tools and **readonly** (the agent can look but not change anything). |
 | **음성 대기** (voice waiting) | Voice status. The voice controls turn listening, spoken replies and the voice panel on or off. |
 
 ## Write a message
@@ -1301,22 +1442,23 @@ as it appears on screen, with the meaning in brackets.
 - Buttons next to the box: attach a photo (camera or file), attach files,
   **save a photo as a note** (it becomes a Markdown note), and a
   **voice memo** — hold it down to record; the memo goes to intake.
-- The pill on the left (**elanous** by default) picks the backend that
-  answers: elanous's own LLM rotation, or the Codex, Claude Code or Gemini
-  command-line tools.
+- The chip next to the box (for example **OpenAI Codex**) shows which LLM
+  provider elanous answers with. Click it to cycle through the providers you
+  have set up. This changes elanous's own setting, so every conversation —
+  not just this one — uses the new provider.
 
 ## Meta commands
 
 Lines that start with `:` are handled in the browser, not sent to the model.
-Type `:help` to list them:
+Type `:help` (or `/help`) to list them. Typing `/` at the start of the box
+opens the same list as a menu:
 
 | Command | What it does |
 |---|---|
 | `:session` | Show the current session id. |
 | `:fork` | Start a fresh session id. |
-| `:provider <name>` | Set the provider for this session. |
 | `:budget` | Show this month's spend and the notify threshold. |
-| `:history [N]` | Summarise the last N turns on screen (default 10). |
+| `:history [N]` | Summarise the last N messages on screen (default 10). |
 | `:clear` | Clear the messages on screen. |
 
 ## Troubleshooting

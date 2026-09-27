@@ -18,6 +18,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 - [Commands you will use](https://docs.elanous.ai/using-elanous/commands/): The handful of commands that cover daily use.
 - [The harness](https://docs.elanous.ai/using-elanous/harness/): say, ask and goal documents.
+- [Tasks and intake](https://docs.elanous.ai/using-elanous/tasks-and-intake/): Anything you send becomes tasks — Telegram, the web app, links, YouTube, Linear — run by the harness or an agent.
 - [Sessions](https://docs.elanous.ai/using-elanous/sessions/): Conversation history, resume, and one-shot chat.
 - [The TUI](https://docs.elanous.ai/using-elanous/tui/): The 3-pane dashboard: attachments, slash commands, clipboard, terminals.
 
