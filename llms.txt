@@ -61,6 +61,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 ## Releases
 
+- [0.2.3](https://docs.elanous.ai/releases/0-2-3/): A shorter command, an Approvals tab that merges, tasks from Linear and other tools, several machines as one, a lighter terminal UI.
 - [0.2.2](https://docs.elanous.ai/releases/0-2-2/): Daemon security hardening, one rule for which environment a command runs in, web setup for chat bots, a lighter install.
 - [0.2.1](https://docs.elanous.ai/releases/0-2-1/): S3: no default bucket, private/public buckets; options that are now always on.
 - [0.2.0](https://docs.elanous.ai/releases/0-2-0/): monad is now Elanous — new command, package, paths and repository; npm as elanous.
