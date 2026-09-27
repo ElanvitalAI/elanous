@@ -46,6 +46,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Operations
 
 - [Doctor](https://docs.elanous.ai/operations/doctor/): Find out what this machine still needs.
+- [Running on several machines](https://docs.elanous.ai/operations/multi-machine/): Join machines into one fleet — seats move by rank, duties describe what each machine is for.
 
 ## Reference
 
