@@ -13,6 +13,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 - [Install](https://docs.elanous.ai/getting-started/install/): One-line install for macOS, Linux and Windows; bare Linux; background service.
 - [Quickstart](https://docs.elanous.ai/getting-started/quickstart/): From a fresh install to your first harness run.
 - [Update and uninstall](https://docs.elanous.ai/getting-started/update-and-uninstall/): Update with self-update; uninstall with one line. Your state folder is kept.
+- [Recommended programs and services](https://docs.elanous.ai/getting-started/recommended-programs/): What to install next — model subscriptions, gh, Grok, Firecrawl, Chrome, Aside, Tailscale, Obsidian, voice — what each unlocks and how to set it up per OS.
 
 ## Using elanous
 
