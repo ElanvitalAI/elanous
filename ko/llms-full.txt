@@ -1214,7 +1214,8 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 | Menu | What it does |
 |---|---|
 | **Chat** | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](/surfaces/pwa-chat). |
-| **Terminal** | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, and a mirror of the terminal UI. See [Terminal](/surfaces/pwa-terminal). |
+| **Terminal** | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and (next release) a live view of an agent's terminal from a link. See [Terminal](/surfaces/pwa-terminal). |
+| **Intake** | *On main — next release.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](/using-elanous/tasks-and-intake). |
 | **Vault** | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](/surfaces/pwa-vault). |
 | **Settings** | Models and tiers, voice and text-to-speech, persona, notifications, theme and daemon health. |
 | **Setup** (`/setup`) | First-time setup in the browser. Today it covers the LLM provider; the other wizard steps still run in the terminal with `elanous onboarding`. |
@@ -1232,6 +1233,24 @@ Other devices on the same tailnet can then open the link that
 `elanous nexus show` prints. Every device on your tailnet can reach it, so
 only share on a tailnet you trust. Turn it off with
 `elanous nexus pwa share disable`.
+
+### Connect each device once
+
+:::info On main — next release
+From the release after 0.2.2, a device that opens the web app through the
+tailnet link needs a token once. The browser on the daemon's own machine
+(`localhost`) does not.
+:::
+
+A device that is not connected yet shows a banner saying it is not
+connected to the daemon (인증 필요 — authentication needed). To connect it:
+
+1. On a device that already works, open **Settings › Connect token (other
+   devices)** and press **Generate connect token**, then copy it.
+2. On the new device, open **Settings › Daemon** and paste it into
+   **Bearer token**.
+
+The token is kept in that browser, so you do this once per browser.
 
 If the link stops working from another device, check
 `elanous nexus pwa share status` and run `elanous nexus pwa share enable`
@@ -1404,6 +1423,35 @@ flash appears when someone else types.
 Reopening a terminal tab — after a browser restart, or from another browser —
 returns you to the same shell that is still running; it does not start a new
 one.
+
+## Watch an agent's terminal from a link
+
+:::info On main — next release
+This section describes behaviour on `main` that ships in the release after 0.2.2.
+:::
+
+When elanous drives a coding CLI (codex, Claude Code, grok) in a terminal of
+its own, it prints a link to that terminal as soon as the terminal starts:
+
+- `elanous agent-mission` prints `[agent-mission] pty=<id> watch=<link>` on
+  its first lines, and the finished result carries the same link.
+- A harness run prints a `[surface-link] url=<link>` progress line.
+- A harness run started from Telegram also sends the link to that chat once.
+
+The link has the form `https://<your-tailnet-name>/app/term/?pty=<id>` and
+works on your tailnet only. Opening it shows that terminal's screen live,
+refreshed about once a second, with the terminal id at the top:
+
+- It starts **읽기 전용** (read-only) — you watch; your keys go nowhere.
+- **takeover** lets you type into it (the label changes to **입력 가능** —
+  typing enabled). **release** gives control back.
+- **닫기** (close) returns to your own terminals.
+
+Picking a row in **PTY 목록** (PTY list) opens the same live view.
+
+When the terminal ends the view stops with «PTY 가 끝났습니다» (the PTY has
+ended). «소유 프로세스에 닿지 않습니다» (the owning process cannot be
+reached) means the process that runs it stopped answering.
 
 ## Troubleshooting
 
