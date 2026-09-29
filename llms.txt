@@ -19,8 +19,14 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 - [Commands you will use](https://docs.elanous.ai/using-elanous/commands/): The handful of commands that cover daily use.
 - [The harness](https://docs.elanous.ai/using-elanous/harness/): say, ask and goal documents.
+- [PTY intelligence](https://docs.elanous.ai/using-elanous/pty-intelligence/): elanous drives terminals and coding agents from inside their own screens.
 - [Tasks and intake](https://docs.elanous.ai/using-elanous/tasks-and-intake/): Anything you send becomes tasks — Telegram, the web app, links, YouTube, Linear — run by the harness or an agent.
+- [Loop agents](https://docs.elanous.ai/using-elanous/loop-agents/): Work that repeats runs as loop agents you can list, start and stop.
+- [Build a loop agent](https://docs.elanous.ai/using-elanous/build-a-loop-agent/): Write your own loop agent as a graph.
+- [Plugins](https://docs.elanous.ai/using-elanous/plugins/): Skills and graphs install as plugins from a signed marketplace.
+- [Build a plugin](https://docs.elanous.ai/using-elanous/build-a-plugin/): Package and publish your own plugin.
 - [Sessions](https://docs.elanous.ai/using-elanous/sessions/): Conversation history, resume, and one-shot chat.
+- [Design systems](https://docs.elanous.ai/using-elanous/design/): Choose one of 52 bundled design systems for a web project, check pages against it with design-lint and design-gate, and optionally draw full previews with OpenDesign.
 - [The TUI](https://docs.elanous.ai/using-elanous/tui/): The 3-pane dashboard: attachments, slash commands, clipboard, terminals.
 
 ## Concepts
@@ -42,6 +48,8 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 - [Vault (Obsidian notes)](https://docs.elanous.ai/surfaces/pwa-vault/): Browse, search, edit and create Obsidian notes in the web app, and handle edits made elsewhere.
 - [Terminal (web shells)](https://docs.elanous.ai/surfaces/pwa-terminal/): Open live shells on the daemon's machine from a browser, phone or tablet, attach files and ask an agent about the screen.
 - [Chat (in the browser)](https://docs.elanous.ai/surfaces/pwa-chat/): Talk to elanous in the web app: sessions, spend, provider and backend, attachments, voice and meta commands.
+- [Live (harness runs as they happen)](https://docs.elanous.ai/surfaces/pwa-live/): Watch harness runs stage by stage, read each decision with its reason and destination, and turn on Full show for demos and debugging.
+- [Trace (follow a run to the log line)](https://docs.elanous.ai/surfaces/pwa-trace/): Narrow from every run on every machine to one decision and the exact log line behind it, with a command to find it again.
 
 ## Operations
 
