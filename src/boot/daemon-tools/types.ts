@@ -9,6 +9,7 @@ import type { LLMToolSpec } from '../../llm.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
 import type { IngestionEntry } from '../../agent-substrate/execution/ingestion-policy.js';
 import type { SurfaceKind } from '../../agent/surface-ux/types.js';
+import type { RequestOrigin } from '../../policy/claude-subscription-guard.js';
 
 /** Activation level requested by the operator.
  *
@@ -58,6 +59,8 @@ export interface DaemonToolDispatchCtx {
    *  the args. Optional for backward compat with tests / surfaces that
    *  build the ctx by hand without a session in scope. */
   sessionId?: string;
+  /** Trusted server-side classification of the current turn, never supplied as a tool argument. */
+  requestOrigin?: RequestOrigin;
   /** Ingestion entry class. Omit for conservative external-verbatim fallback. */
   entry?: IngestionEntry;
   /** M5 PR 2 (PLAN-rich-dev-feedback-multi-surface · 2026-05-13) —

@@ -1,25 +1,14 @@
 import type { SurfaceAddress } from '../surface/address.js';
 import type { DeclarativeWidgetNode } from '../ui/declarative/index.js';
-import {
-  mountScenarioIntoPane,
-  mountScenarioIntoWindow,
-  type ScenarioWindowMountDeps,
-} from './scenario-window-mount.js';
-import {
-  mountScenarioIntoModal,
-  type ScenarioModalMountDeps,
-} from './scenario-modal-mount.js';
+import { mountScenarioIntoModal } from './scenario-modal-mount.js';
 import {
   mountScenarioIntoWidget,
   type ScenarioWidgetMountDeps,
 } from './scenario-widget-mount.js';
 
-export interface ScenarioTargetMountDeps
-  extends ScenarioWindowMountDeps, ScenarioWidgetMountDeps {}
+export type ScenarioTargetMountDeps = ScenarioWidgetMountDeps;
 
 export const RUN_SCENARIO_MOUNT_TARGET_KINDS = [
-  'window',
-  'pane',
   'modal',
   'widget',
 ] as const;
@@ -30,10 +19,7 @@ export type RunScenarioMountTargetKind =
 export function isRunScenarioMountTargetKind(
   kind: SurfaceAddress['kind'],
 ): kind is RunScenarioMountTargetKind {
-  return kind === 'window'
-    || kind === 'pane'
-    || kind === 'modal'
-    || kind === 'widget';
+  return kind === 'modal' || kind === 'widget';
 }
 
 export function unsupportedRunScenarioTargetError(target: SurfaceAddress): string {
@@ -49,6 +35,7 @@ export function unsupportedRunScenarioTargetError(target: SurfaceAddress): strin
       return `RunScenario: target kind "${target.kind}" is a background/session surface and not a scenario mount destination`;
     case 'window':
     case 'pane':
+      return `RunScenario: target kind "${target.kind}" is not a scenario mount destination`;
     case 'modal':
     case 'widget':
       return `RunScenario: target kind "${target.kind}" requires a mount helper, not unsupportedRunScenarioTargetError()`;
@@ -61,21 +48,6 @@ export function mountScenarioIntoTarget(
   deps: ScenarioTargetMountDeps,
 ): { mounted: boolean; error?: string } {
   switch (target.kind) {
-    case 'window':
-      return mountScenarioIntoWindow(widgets, target.windowId, deps);
-    case 'pane': {
-      const windowId = Number(target.ref.windowId);
-      if (!Number.isInteger(windowId) || windowId <= 0) {
-        return {
-          mounted: false,
-          error: `RunScenario: target pane windowId "${target.ref.windowId}" is not a valid VW id`,
-        };
-      }
-      return mountScenarioIntoPane(widgets, {
-        windowId,
-        paneId: target.ref.paneId,
-      }, deps);
-    }
     case 'modal':
       return mountScenarioIntoModal(widgets, target.modalId, deps);
     case 'widget':
@@ -84,6 +56,8 @@ export function mountScenarioIntoTarget(
     case 'popover':
     case 'inline':
     case 'bg':
+    case 'window':
+    case 'pane':
       return {
         mounted: false,
         error: unsupportedRunScenarioTargetError(target),

@@ -791,7 +791,7 @@ export function formatOutsideChangedWarning(outsideChanged: readonly { file: str
   return `[tsc-gate] ⚠ 변경 파일 밖 진단 ${total}건이 파일 ${fileCount}개에서 버려짐: ${nameText}`;
 }
 
-function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: ReadonlyMap<string, number>, error: (message: string) => void, warn: (message: string) => void, wholeRepository = false, excludedPrefixes: readonly string[] = [], includedPrefixes: readonly string[] = [], promotionBaseline?: BaselineDiagnostics): boolean {
+function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: ReadonlyMap<string, number>, error: (message: string) => void, warn: (message: string) => void, wholeRepository = false, excludedPrefixes: readonly string[] = [], includedPrefixes: readonly string[] = [], promotionBaseline?: BaselineDiagnostics, excludeTests = false): boolean {
   if (!tsc.ran) {
     error(`[tsc-gate] ⛔ 실행 판정 실패 — ${tsc.why}`);
     if (tsc.out.trim()) error(tsc.out.trim().slice(0, 2000));
@@ -800,11 +800,13 @@ function inspectTscResult(tsc: TscRun, changed: ReadonlySet<string>, baseline: R
   }
   const diagnostics = parseTypecheckErrors(tsc.out).filter((diagnostic) =>
     !excludedPrefixes.some((prefix) => diagnostic.file.startsWith(prefix))
+      && (!excludeTests || (!isTestTypeScriptFile(diagnostic.file)))
       && (includedPrefixes.length === 0 || includedPrefixes.some((prefix) => diagnostic.file.startsWith(prefix))),
   );
   const baselineDiagnostics = promotionBaseline && 'diagnostics' in promotionBaseline
     ? promotionBaseline.diagnostics.filter((diagnostic) =>
       !excludedPrefixes.some((prefix) => diagnostic.file.startsWith(prefix))
+        && (!excludeTests || (!isTestTypeScriptFile(diagnostic.file)))
         && (includedPrefixes.length === 0 || includedPrefixes.some((prefix) => diagnostic.file.startsWith(prefix))),
     )
     : undefined;
@@ -904,6 +906,9 @@ export function runGate(io: Partial<GateIo> = {}): void {
   // PWA 설정은 언제나 자기 소유 범위만 판정해 진단이 중복 귀속되지 않게 한다.
   const rootScope = wholeRepository ? new Set(['**']) : rootChanged;
   const pwaScope = wholeRepository ? new Set(['apps/pwa/**']) : pwaChanged;
+  const nonTestRootChanged = new Set([...rootChanged].filter((file) => !isTestTypeScriptFile(file)));
+  const pwaEnvScope = wholeRepository ? new Set(['**']) : nonTestRootChanged;
+  const runsPwaEnv = nonTestRootChanged.size > 0;
   if (requiredFields.length > 0) log(`[tsc-gate] 필수 export 필드 추가 감지 — 저장소 전체 검사로 승격: ${requiredFields.map(({ typeName, fieldName }) => `${typeName}.${fieldName}`).join(', ')}.`);
   if (removedSymbols.length > 0) log(`[tsc-gate] exported 심볼 사라짐 감지 — 저장소 전체 검사로 승격: ${removedSymbols.map(({ name }) => name).join(', ')}.`);
   if (parameterIncreases.length > 0) log(`[tsc-gate] exported 함수 매개변수 증가 감지 — 저장소 전체 검사로 승격: ${parameterIncreases.map(({ name, from, to }) => `${name}(${from}→${to})`).join(', ')}.`);
@@ -912,6 +917,7 @@ export function runGate(io: Partial<GateIo> = {}): void {
   const observedScopes = [
     { config: TYPECHECK_GATE_CONFIG, checkedFiles: [...rootScope], excludes: ['apps/pwa/**'] },
     ...(runsPwa ? [{ config: 'apps/pwa/tsconfig.json', checkedFiles: [...pwaScope], excludes: [] as string[] }] : []),
+    ...(runsPwaEnv ? [{ config: 'tsconfig.pwa-env.json', checkedFiles: [...pwaEnvScope], excludes: ['apps/pwa/**', 'docs/**', '**/*.test.ts', 'test/**'] }] : []),
   ];
   const promotionTriggers = [
     ...(requiredFields.length > 0 ? ['required-export-field'] : []),
@@ -932,8 +938,10 @@ export function runGate(io: Partial<GateIo> = {}): void {
   const baseline = readTestTypecheckBaseline(process.cwd());
   const rootCommand = `${tscBin} --noEmit -p ${TYPECHECK_GATE_CONFIG}`;
   const pwaCommand = `${tscBin} --noEmit -p apps/pwa/tsconfig.json`;
+  const pwaEnvCommand = `${tscBin} --noEmit -p tsconfig.pwa-env.json`;
   const rootPromotionBaseline = wholeRepository ? readBaselineDiagnostics(base, rootCommand) : undefined;
   const pwaPromotionBaseline = wholeRepository && runsPwa ? readBaselineDiagnostics(base, pwaCommand) : undefined;
+  const pwaEnvPromotionBaseline = wholeRepository && runsPwaEnv ? readBaselineDiagnostics(base, pwaEnvCommand) : undefined;
   const rootTsc = runTscCmd(rootCommand);
   let unmeasured = !rootTsc.ran;
   let passed = inspectTscResult(rootTsc, rootScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], rootPromotionBaseline);
@@ -942,6 +950,12 @@ export function runGate(io: Partial<GateIo> = {}): void {
     const pwaTsc = runTscCmd(pwaCommand);
     unmeasured = unmeasured || !pwaTsc.ran;
     passed = inspectTscResult(pwaTsc, pwaScope, baseline, error, warn, wholeRepository, [], ['apps/pwa/'], pwaPromotionBaseline) && passed;
+  }
+  if (runsPwaEnv) {
+    log(`[tsc-gate] PWA env 패스 — 루트 비시험 ${nonTestRootChanged.size}개 (Next ProcessEnv 선언 포함).`);
+    const pwaEnvTsc = runTscCmd(pwaEnvCommand);
+    unmeasured = unmeasured || !pwaEnvTsc.ran;
+    passed = inspectTscResult(pwaEnvTsc, pwaEnvScope, baseline, error, warn, wholeRepository, ['apps/pwa/'], [], pwaEnvPromotionBaseline, true) && passed;
   }
   if (passed) { log('[tsc-gate] PASS — 변경 파일에 신규 타입 에러 없음.'); return; }
   // ⛔⭐⭐ T67 — ***마지막 줄은 언제나 「판정」이어야 한다.*** 사람도 도구도 마지막 줄을 읽는다.

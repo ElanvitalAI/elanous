@@ -387,6 +387,28 @@ describe('연합 조회 (LF7-d) — ?store= 리졸버 + /v1/logs/instances', () 
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('store=@active → 이 인스턴스 ⊕ 최근 24시간에 쓰인 우주만(최신순) · 응답에 본 목록', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-active-'));
+    const fresh = join(dir, 'fresh', 'logs', 'logs.db');
+    const stale = join(dir, 'stale', 'logs', 'logs.db');
+    const a = new LogStore(fresh, { instance: 'test:fresh' });
+    a.insertBatch([{ rec: rec({ event: 'fresh.ok' }), surface: 'nexus' }]);
+    a.close();
+    const self = seededStore();
+    const now = Date.now();
+    const res = handleLogsQuery(get('/v1/logs?store=@active&limit=50'), OPTS, {
+      store: () => self,
+      instances: () => [mkView('test:fresh', fresh), mkView('test:stale', stale), mkView('test:nodb', '/nope/logs.db', false)],
+      dbMtimeMs: (path) => (path === fresh ? now - 60_000 : path === stale ? now - 3 * 86_400_000 : null),
+    });
+    expect(res.status).toBe(200);
+    const j = await res.json() as { logs: Array<{ event: string; instance?: string }>; stores: string[] };
+    expect(j.stores.slice(1)).toEqual(['test:fresh']);
+    expect(j.logs.some((l) => l.event === 'fresh.ok' && l.instance === 'test:fresh')).toBe(true);
+    self.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('스토어 없는 인스턴스(store 미생성) → 404', async () => {
     const self = seededStore();
     const { handleLogsQuery } = await import('./log-fabric.js');

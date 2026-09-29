@@ -194,9 +194,16 @@ if [ "$MODIFY_PATH" -eq 1 ]; then
   fi
   # bash 는 로그인 셸이 ~/.profile 을 읽고, ~/.bashrc 는 «비대화형이면 맨 앞에서 return» 한다(Debian 기본).
   # 🩸 2026-09-25 빈 debian:12 컨테이너: `bash -lc elanous`(= ssh 원격 명령·스크립트) → command not found. 그래서 ~/.profile 에도 쓴다.
+  # zsh 도 같다: ~/.zshrc 는 «대화형» 만 읽고 `ssh host cmd`(비대화형)는 ~/.zshenv 만 읽는다.
+  # 🩸 2026-09-28 node-b: ssh 원격 명령이 설치본을 못 찾아 🅣 의 원격 실행 태스크가 not-done 이 됐다. 그래서 ~/.zshenv 에도 쓴다.
   LOGIN_STARTUP=""
+  if [ -z "${ELANOUS_SHELL_STARTUP:-}" ] && [ "$STARTUP" = "$HOME/.zshrc" ]; then
+    LOGIN_STARTUP="$HOME/.zshenv"
+  fi
   if [ -z "${ELANOUS_SHELL_STARTUP:-}" ] && [ "$STARTUP" = "$HOME/.bashrc" ]; then
     LOGIN_STARTUP="$HOME/.profile"
+  fi
+  if [ -n "$LOGIN_STARTUP" ]; then
     touch "$LOGIN_STARTUP"
     if grep -Fqx "$MARKER_START" "$LOGIN_STARTUP" && ! grep -Fqx "$PATH_LINE" "$LOGIN_STARTUP"; then
       echo "⛔ PATH block in $LOGIN_STARTUP already points to a different installation prefix" >&2
@@ -379,6 +386,48 @@ if ! grep -q '"openai-codex"' "$HOME/.elanous/auth.json" 2>/dev/null; then
 fi
 # 🆕 2026-09-24 빈 VM 실측: 하니스(codex 백엔드)는 Codex CLI 를 자식으로 띄우는데 빈 기계엔 codex·node 가 «둘 다» 없었다.
 #    ⚠️ 아래 설치 줄은 빈 기계에서 아직 «안 쟀다» — `elanous doctor` 의 codex 줄이 판정한다.
+# C++20 toolchain must precede node-pty's rebuild; only suggest missing prerequisites.
+if ! command -v make >/dev/null 2>&1 || ! command -v c++ >/dev/null 2>&1; then
+  case "$(uname -s)" in
+    Darwin) BUILD_HINT='xcode-select --install' ;;
+    Linux)
+      OS_ID='' OS_LIKE=''
+      if [ -r "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}" ]; then
+        while IFS='=' read -r key value; do
+          value="${value#\"}"; value="${value%\"}"
+          case "$key" in ID) OS_ID="$value" ;; ID_LIKE) OS_LIKE="$value" ;; esac
+        done < "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}"
+      fi
+      BUILD_HINT=''
+      case " $OS_ID $OS_LIKE " in
+        *' debian '*|*' ubuntu '*) BUILD_HINT='sudo apt-get install -y build-essential' ;;
+        *' fedora '*) BUILD_HINT='sudo dnf groupinstall -y "Development Tools"' ;;
+      esac ;;
+    *) BUILD_HINT='' ;;
+  esac
+  if [ -n "$BUILD_HINT" ]; then
+    echo "  $STEP) $BUILD_HINT"; STEP=$((STEP + 1))
+  fi
+  echo "  $STEP) elanous doctor --fix --yes       # rebuild node-pty after installing build tools"; STEP=$((STEP + 1))
+fi
+if ! command -v rg >/dev/null 2>&1; then
+  if [ -z "${OS_ID:-}" ] && [ -r "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}" ]; then
+    while IFS='=' read -r key value; do
+      value="${value#\"}"; value="${value%\"}"
+      case "$key" in ID) OS_ID="$value" ;; ID_LIKE) OS_LIKE="$value" ;; esac
+    done < "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}"
+  fi
+  case "$(uname -s)" in
+    Darwin) RG_HINT='brew install ripgrep' ;;
+    Linux) case " ${OS_ID:-} ${OS_LIKE:-} " in
+      *' debian '*|*' ubuntu '*) RG_HINT='sudo apt-get install -y ripgrep' ;;
+      *' fedora '*) RG_HINT='sudo dnf install -y ripgrep' ;;
+      *) RG_HINT='install ripgrep (rg) with your package manager' ;;
+    esac ;;
+    *) RG_HINT='install ripgrep (rg) with your package manager' ;;
+  esac
+  echo "  $STEP) $RG_HINT"; STEP=$((STEP + 1))
+fi
 if ! command -v codex >/dev/null 2>&1; then
   if ! command -v node >/dev/null 2>&1; then
     echo "  $STEP) install Node.js 20+ (the Codex CLI runs on node)   # e.g. your package manager or https://nodejs.org"; STEP=$((STEP + 1))

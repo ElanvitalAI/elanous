@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { changedFileTypecheck } from '../src/self-implement/seams.js';
 import { regenerateTestTypecheckBaseline } from '../scripts/regenerate-test-typecheck-baseline.js';
-import { TEST_TYPECHECK_BASELINE, TYPECHECK_COMPLETION_RULERS, TYPECHECK_GATE_CONFIG, TYPECHECK_PROJECT_CONFIG, assessTypecheckCompletionRuler, classifyFieldWiring, classifyTypecheckErrors, collectTypecheckCompletion, diffTypecheckDiagnostics, isBaselineExemptTestFile, judgeTypecheckCompletion, missingTypecheckGateConfig, parseTypecheckErrors, readTestTypecheckBaseline, resolveTypecheckConfig } from '../src/typecheck-ratchet.js';
+import { TEST_TYPECHECK_BASELINE, TYPECHECK_COMPLETION_RULERS, TYPECHECK_GATE_CONFIG, TYPECHECK_PROJECT_CONFIG, assessTypecheckCompletionRuler, classifyFieldWiring, classifyTypecheckErrors, collectTypecheckCompletion, diffTypecheckDiagnostics, isBaselineExemptTestFile, judgeTypecheckCompletion, missingTypecheckGateConfig, parseTypecheckErrors, promotedConsumersFromDiff, readTestTypecheckBaseline, resolveTypecheckConfig } from '../src/typecheck-ratchet.js';
 
 const diagnostic = (file: string, number: number) => ({ file, line: `${file}(${number},1): error TS2322: broken`, code: 'TS2322' });
 const tscError = (file: string, number = 1) => `${file}(${number},1): error TS2322: broken\n`;
@@ -14,6 +14,9 @@ function withTemporaryBaseline(content: string, run: (cwd: string, baseline: str
   const cwd = mkdtempSync(join(tmpdir(), 'typecheck-ratchet-'));
   const baseline = join(cwd, TEST_TYPECHECK_BASELINE);
   writeFileSync(join(cwd, TYPECHECK_GATE_CONFIG), '{}');
+  // The PWA gate fails closed if the fixture has no workspace config.
+  mkdirSync(join(cwd, 'apps/pwa'), { recursive: true });
+  writeFileSync(join(cwd, 'apps/pwa/tsconfig.json'), '{}');
   writeFileSync(baseline, content);
   try {
     run(cwd, baseline);
@@ -251,6 +254,36 @@ describe('diagnostic multiset diff', () => {
     expect(result.added).toEqual([introduced]);
     expect(result.removed).toEqual([]);
   });
+
+  it('promotes only added diagnostics outside changed files within the included project', () => {
+    const current = [
+      diagnostic('src/inherited.ts', 8),
+      diagnostic('src/changed.ts', 2),
+      diagnostic('./src/new.ts', 4),
+      diagnostic('src/new.ts', 5),
+      diagnostic('apps/pwa/src/outside.tsx', 3),
+    ];
+    const diff = diffTypecheckDiagnostics(current, [diagnostic('src/inherited.ts', 1)]);
+    const changed = new Set(['src/changed.ts']);
+    const include = (file: string) => file.startsWith('src/');
+    expect(promotedConsumersFromDiff(diff, changed, include)).toEqual(new Set(['src/new.ts']));
+    expect(changed).toEqual(new Set(['src/changed.ts']));
+    expect(diff.added).toEqual(current.slice(1));
+    expect(promotedConsumersFromDiff(diff, changed, (file) => file.startsWith('apps/pwa/')))
+      .toEqual(new Set(['apps/pwa/src/outside.tsx']));
+    expect(promotedConsumersFromDiff(diff, changed, () => false)).toEqual(new Set());
+  });
+
+  it('does not promote a changed file when both diagnostic and changed paths start with ./', () => {
+    const diff = diffTypecheckDiagnostics(
+      [diagnostic('./src/new.ts', 1), diagnostic('./src/consumer.ts', 2)],
+      [],
+    );
+    const changed = new Set(['./src/new.ts']);
+    expect(promotedConsumersFromDiff(diff, changed, (file) => file.startsWith('src/')))
+      .toEqual(new Set(['src/consumer.ts']));
+    expect(changed).toEqual(new Set(['./src/new.ts']));
+  });
 });
 
 describe('test typecheck ratchet', () => {
@@ -321,6 +354,20 @@ describe('test typecheck ratchet', () => {
       expect(result.errors).toBe(1);
       expect(result.exempted).toBe(0);
       expect(readFileSync(baseline, 'utf8')).toBe(before);
+    });
+  });
+
+  it('fails closed on a changed PWA file when the workspace config is absent', () => {
+    withTemporaryBaseline('', (cwd) => {
+      rmSync(join(cwd, 'apps/pwa/tsconfig.json'));
+      const calls: string[][] = [];
+      const result = changedFileTypecheck(cwd, ['apps/pwa/src/product.ts'], (_cmd, args) => {
+        calls.push(args);
+        return completed('');
+      });
+      expect(result.passed).toBeFalse();
+      expect(result.log).toContain('PWA 타입 검사 설정이 없어');
+      expect(calls).toEqual([['tsc', '--noEmit', '-p', 'tsconfig.gate.json']]);
     });
   });
 

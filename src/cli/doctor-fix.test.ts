@@ -4,7 +4,8 @@ import { lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { applyDoctorFixes, applySudoFixes, planDoctorFixes, sudoFixCommands, type DoctorFixDeps } from './doctor-fix.js';
+import { applyDoctorFixes, applyGitInstall, applySudoFixes, planDoctorFixes, sudoFixCommands, type DoctorFixDeps } from './doctor-fix.js';
+import { gitInstallPlan } from './git-install-plan.js';
 import { registerDoctorCommand } from './doctor-cli.js';
 
 function fixture(text = 'existing startup\n') {
@@ -44,7 +45,174 @@ function fixture(text = 'existing startup\n') {
 
 const block = '# >>> elanous installer PATH >>>\nexport PATH=\'/install/elanous/bin\':"$PATH"\n# <<< elanous installer PATH <<<';
 
+describe('doctor git installation consent', () => {
+  test('registered --fix without a TTY never installs; --yes installs and re-probes git', async () => {
+    const calls: string[][] = [];
+    let installed = false;
+    const outputs: string[] = [];
+    const codes: number[] = [];
+    const register = async (args: string[]) => {
+      const program = new Command();
+      registerDoctorCommand(program, {
+        repositoryRoot: '/repo', platform: 'linux', readiness: { distro: 'debian' },
+        readFile: (path) => path === '/repo/.env.example' ? 'ONE_KEY=\n' : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
+        commandExists: (name) => name === 'sudo' || name === 'apt-get' || (name === 'git' && installed),
+        userConfig: { registry: { discovery: { firecrawl: {} } } } as never,
+        env: {}, gitInteractive: false,
+        runGitInstallCommand: (command, commandArgs) => {
+          calls.push([command, ...commandArgs]);
+          if (command === 'sudo') installed = true;
+          return { status: 0 };
+        },
+        out: { log: (line) => outputs.push(line) }, setExitCode: (code) => codes.push(code),
+      });
+      await program.parseAsync(['doctor', ...args], { from: 'user' });
+    };
+    await register(['--fix', '--json']);
+    expect(calls).toEqual([]);
+    expect(JSON.parse(outputs.at(-1)!).gitPlan.command).toEqual(['sudo', 'apt-get', 'install', '-y', 'git']);
+    expect(codes.at(-1)).toBe(1);
+    await register(['--fix', '--yes', '--json']);
+    expect(calls.slice(0, 2)).toEqual([['sudo', 'apt-get', 'update'], ['sudo', 'apt-get', 'install', '-y', 'git']]);
+    expect(calls[2]?.[0]).toBe('git');
+    expect(calls[2]?.[1]).toBe('init');
+    expect(calls[2]?.[2]).toStartWith(join(tmpdir(), 'elanous-doctor-git-'));
+    expect(calls).toHaveLength(3);
+    expect(() => lstatSync(calls[2]![2]!)).toThrow();
+    expect(JSON.parse(outputs.at(-1)!).gitInstall).toMatchObject({ ran: true, ok: true });
+    expect(JSON.parse(outputs.at(-1)!).report.requiredMissing).toEqual([]);
+    expect(codes.at(-1)).toBe(0);
+  }, 30_000);
+
+  const plan = gitInstallPlan({ platform: 'linux', distro: 'ubuntu', has: () => true });
+  test('non-TTY --fix does not execute; --yes executes exactly once and verifies git init', async () => {
+    const calls: string[][] = [];
+    const run = (command: string, args: readonly string[]) => { calls.push([command, ...args]); return { status: 0 }; };
+    expect(await applyGitInstall(plan, { interactive: false, run })).toMatchObject({ ran: false, ok: false });
+    expect(calls).toEqual([]);
+    expect(await applyGitInstall(plan, { yes: true, interactive: false, run })).toMatchObject({ ran: true, ok: true, detail: 'git init 재확인 성공' });
+    expect(calls.slice(0, 2)).toEqual([['sudo', 'apt-get', 'update'], ['sudo', 'apt-get', 'install', '-y', 'git']]);
+    expect(calls[2]?.[0]).toBe('git');
+    expect(calls[2]?.[1]).toBe('init');
+    expect(calls[2]?.[2]).toStartWith(join(tmpdir(), 'elanous-doctor-git-'));
+    expect(calls).toHaveLength(3);
+    expect(() => lstatSync(calls[2]![2]!)).toThrow();
+  });
+  test('git version alone does not count as a usable installation', async () => {
+    const result = await applyGitInstall({ command: ['installer'], display: 'installer', needsSudo: false }, {
+      yes: true,
+      run: (command, args) => ({ status: command === 'git' && args[0] === 'init' ? 1 : 0 }),
+    });
+    expect(result).toMatchObject({ ran: true, ok: false, detail: 'git 설치 또는 git init 재확인 실패' });
+  });
+  test('post-install git smoke initializes a disposable repository and removes it', async () => {
+    let work = '';
+    const result = await applyGitInstall({ command: ['installer'], display: 'installer', needsSudo: false }, {
+      yes: true,
+      run: (command, args) => {
+        if (command === 'installer') return { status: 0 };
+        expect([command, args[0]]).toEqual(['git', 'init']);
+        work = args[1]!;
+        expect(work).toStartWith(join(tmpdir(), 'elanous-doctor-git-'));
+        const check = spawnSync(command, [...args], { stdio: 'ignore' });
+        expect(lstatSync(join(work, '.git')).isDirectory()).toBe(true);
+        return { status: check.status };
+      },
+    });
+    expect(result).toMatchObject({ ran: true, ok: true, detail: 'git init 재확인 성공' });
+    expect(() => lstatSync(work)).toThrow();
+  });
+
+  test('TTY refusal or unknown platform cannot install; affirmative answer and failed recheck are reported', async () => {
+    const calls: string[][] = [];
+    const run = (command: string, args: readonly string[]) => { calls.push([command, ...args]); return { status: command === 'git' ? 1 : 0 }; };
+    expect((await applyGitInstall(plan, { interactive: true, confirm: async () => false, run })).ran).toBe(false);
+    expect(calls).toEqual([]);
+    expect(await applyGitInstall(plan, { interactive: true, confirm: async () => true, run })).toMatchObject({ ran: true, ok: false });
+    expect(calls).toHaveLength(3); // apt-get update · install · git init
+    expect((await applyGitInstall({ command: null, display: 'manual', needsSudo: false }, { yes: true, run })).ran).toBe(false);
+    expect(calls).toHaveLength(3); // unchanged — the manual plan runs nothing
+  });
+});
+
+test('static install reports failure if the installed binary fails its smoke check', () => {
+  const calls: string[] = [];
+  const result = applyDoctorFixes({
+    readiness: { platform: 'linux', distro: 'amzn2', rgOnPath: false }, keyNames: [], arch: 'x64',
+    installStaticTool: (tool) => { calls.push(`install ${tool}`); return { ok: true, detail: 'installed' }; },
+    smokeCheck: (tool) => { calls.push(`smoke ${tool}`); return false; },
+  }, true, new Set(['static-tools']));
+  expect(calls).toEqual(['install rg', 'smoke rg']);
+  expect(result.items.find((item) => item.id === 'static-tools')).toMatchObject({ result: 'failed', reason: 'installed, but smoke check failed' });
+  expect(result.exitCode).toBe(1);
+});
+
+test('when a pinned static download fails, no smoke check can turn it into a success', () => {
+  let checked = 0;
+  const result = applyDoctorFixes({
+    readiness: { platform: 'linux', distro: 'amzn2', rgOnPath: false }, keyNames: [], arch: 'x64',
+    installStaticTool: () => ({ ok: false, detail: 'sha256 mismatch' }),
+    smokeCheck: () => { checked++; return true; },
+  }, true, new Set(['static-tools']));
+  expect(checked).toBe(0);
+  expect(result.items.find((item) => item.id === 'static-tools')).toMatchObject({ result: 'failed', reason: 'sha256 mismatch' });
+});
+
+test('static install verifies each tool only after its complete pinned set is installed', () => {
+  const calls: string[] = [];
+  const result = applyDoctorFixes({
+    readiness: { platform: 'linux', distro: 'amzn2', codexOnPath: false, nodeOnPath: false }, keyNames: [], arch: 'x64',
+    installStaticTool: (name) => { calls.push(`install ${name}`); return { ok: true, detail: name }; },
+    smokeCheck: (name) => { calls.push(`smoke ${name}`); return true; },
+  }, true, new Set(['static-tools']));
+  expect(calls).toEqual(['install codex', 'install codex-code-mode-host', 'smoke codex', 'smoke codex-code-mode-host']);
+  expect(result.items.find((item) => item.id === 'static-tools')?.result).toBe('fixed');
+});
+
+test('a codex whose host cannot execute is not reported as fixed even when codex --help succeeds', () => {
+  const calls: string[] = [];
+  const result = applyDoctorFixes({
+    readiness: { platform: 'linux', distro: 'amzn2', codexOnPath: false, nodeOnPath: false }, keyNames: [], arch: 'x64',
+    installStaticTool: (name) => { calls.push(`install ${name}`); return { ok: true, detail: name }; },
+    smokeCheck: (name, dest) => {
+      calls.push(`smoke ${name}`);
+      expect(dest).toEndWith(`/${name}`);
+      return name !== 'codex-code-mode-host';
+    },
+  }, true, new Set(['static-tools']));
+  expect(calls).toEqual(['install codex', 'install codex-code-mode-host', 'smoke codex', 'smoke codex-code-mode-host']);
+  expect(result.items.find((item) => item.id === 'static-tools')).toMatchObject({ result: 'failed', reason: 'installed, but smoke check failed' });
+  expect(result.exitCode).toBe(1);
+});
+
 describe('doctor --fix', () => {
+  test('only executes selected catalog id and marks all other planned repairs not selected', () => {
+    const f = fixture();
+    f.deps.readiness = { installPrefix: null, platform: 'linux', tmpdirSameFsAsBunCache: false, distro: 'amzn2', rgOnPath: false };
+    const chmod = f.deps.chmod!;
+    f.deps.chmod = (path, mode) => { f.writes.push(`chmod:${path}`); chmod(path, mode); };
+    f.deps.installStaticTool = () => ({ ok: true, detail: 'installed' });
+    f.deps.smokeCheck = () => true;
+    f.deps.configDir = '/home/test/.elanous';
+    const exists = f.deps.exists!;
+    const lstat = f.deps.lstat!;
+    f.deps.exists = (path) => path === f.deps.configDir || exists(path);
+    f.deps.lstat = (path) => path === f.deps.configDir
+      ? { mode: 0o755, isFile: () => false, isSymbolicLink: () => false }
+      : lstat(path);
+    const readdir = f.deps.readdir!;
+    f.deps.readdir = (path) => path === f.deps.configDir ? [] : readdir(path);
+    const selected = new Set(['static-tools'] as const);
+    const preview = applyDoctorFixes(f.deps, false, selected);
+    expect(preview.items.find((item) => item.id === 'bun-tmpdir')).toMatchObject({ result: 'skipped', reason: 'not selected' });
+    expect(f.writes).toEqual([]);
+    const result = applyDoctorFixes(f.deps, true, selected);
+    expect(result.items.find((item) => item.id === 'static-tools')?.result).toBe('fixed');
+    expect(result.items.find((item) => item.id === 'bun-tmpdir')).toMatchObject({ result: 'skipped', reason: 'not selected' });
+    expect(result.items.find((item) => item.id === 'private-files')).toMatchObject({ result: 'skipped', reason: 'not selected' });
+    expect(result.items.find((item) => item.id === 'key-cache-permissions')).toMatchObject({ result: 'skipped', reason: 'not selected' });
+    expect(f.writes).toEqual([]);
+  });
   test('dry run lists exact installer block, file and permissions without writes or cache contents', () => {
     const f = fixture();
     const plan = planDoctorFixes(f.deps);
@@ -364,7 +532,7 @@ describe('doctor --fix', () => {
         ...fileDeps,
         env: { ...fileDeps.env, PATH: '/usr/bin' },
         repositoryRoot: '/repo',
-        readFile: (path) => path === '/repo/.env.example' ? 'ONE_KEY=\nOTHER_KEY=\n' : f.deps.readFile!(path),
+        readFile: (path) => path === '/repo/.env.example' ? 'ONE_KEY=\nOTHER_KEY=\n' : path === '/repo/catalog/external-commands.yaml' ? 'commands: []\n' : f.deps.readFile!(path),
         rename: f.deps.rename,
         remove: f.deps.remove,
         temporaryPath: f.deps.temporaryPath,
@@ -391,22 +559,22 @@ describe('doctor --fix', () => {
     expect(probes).toEqual(['install-prefix', 'install-prefix', 'install-prefix']);
     expect(JSON.parse(logs.at(-1)!).report.readiness.items.find((item: { id: string }) => item.id === 'install-path').status).toBe('fixable');
     expect(JSON.parse(logs.at(-1)!).plan.items[0]).toMatchObject({ id: 'install-path', path: '/home/test/.zshrc', action: block });
-    expect(JSON.parse(logs.at(-1)!).plan.items[1].path).toBe('one_key');
+    expect(JSON.parse(logs.at(-1)!).plan.items.find((item: { id: string }) => item.id === 'key-cache-permissions').path).toBe('one_key');
     expect(logs.at(-1)).not.toContain('/cache/');
     expect(f.writes).toEqual([]);
     await register(['doctor', '--fix', '--yes', '--json']);
     expect(JSON.parse(logs.at(-1)!).results.items[0].result).toBe('fixed');
     expect(JSON.parse(logs.at(-1)!).results.items[0].reason).toContain('readiness is fixable');
     expect(JSON.parse(logs.at(-1)!).report.readiness.items.find((item: { id: string }) => item.id === 'install-path').status).toBe('fixable');
-    expect(JSON.parse(logs.at(-1)!).results.items[1].path).toBe('one_key');
+    expect(JSON.parse(logs.at(-1)!).results.items.find((item: { id: string }) => item.id === 'key-cache-permissions').path).toBe('one_key');
     expect(logs.at(-1)).not.toContain('/cache/');
     f.files.get('/cache/one_key')!.mode = 0o644;
     await register(['doctor', '--fix']);
     expect(logs.at(-1)).toContain('key-cache-permissions:');
     expect(logs.at(-1)).toContain('one_key');
     expect(logs.at(-1)).not.toContain('/cache/');
-    expect(codes).toEqual([0]);
-  });
+    expect(codes).toEqual([1]);
+  }, 30_000);
 });
 
 describe('doctor --fix — service file (T2 · 2026-09-24)', () => {
@@ -740,5 +908,32 @@ describe('node-pty rebuild uses the native build shim', () => {
     expect(result.items.find((i) => i.id === 'node-pty-rebuild')).toMatchObject({ result: 'fixed' });
     expect(removed).toEqual(['/opt/elanous/versions/1.0.0/node_modules/node-pty']);
     expect(seenPath.startsWith('/tmp/shim-x')).toBe(true);
+  });
+});
+
+describe('applyGitInstall — pre-commands and waiting for the macOS installer', () => {
+  test('runs apt-get update before install, and stops if the update fails', async () => {
+    const { applyGitInstall } = await import('./doctor-fix.js');
+    const calls: string[] = [];
+    const ok = await applyGitInstall({ command: ['apt-get', 'install', '-y', 'git'], preCommands: [['apt-get', 'update']], display: 'x', needsSudo: false },
+      { yes: true, run: (c, a) => { calls.push([c, ...a].join(' ')); return { status: 0 }; } });
+    expect(calls.slice(0, 2)).toEqual(['apt-get update', 'apt-get install -y git']);
+    expect(calls[2]).toStartWith(`git init ${join(tmpdir(), 'elanous-doctor-git-')}`);
+    expect(ok.ok).toBe(true);
+    expect(() => lstatSync(calls[2]!.slice('git init '.length))).toThrow();
+    const calls2: string[] = [];
+    const bad = await applyGitInstall({ command: ['apt-get', 'install', '-y', 'git'], preCommands: [['apt-get', 'update']], display: 'x', needsSudo: false },
+      { yes: true, run: (c, a) => { calls2.push([c, ...a].join(' ')); return { status: c === 'apt-get' && a[0] === 'update' ? 100 : 0 }; } });
+    expect(calls2).toEqual(['apt-get update']);
+    expect(bad.ok).toBe(false);
+  });
+  test('xcode-select waits until git answers, then reports success', async () => {
+    const { applyGitInstall } = await import('./doctor-fix.js');
+    let gitCalls = 0; let t = 0;
+    const result = await applyGitInstall({ command: ['xcode-select', '--install'], display: 'x', needsSudo: false, waitForGit: true },
+      { yes: true, now: () => t, sleep: async (ms) => { t += ms; }, pollMs: 10_000, waitForGitMs: 60_000,
+        run: (c) => { if (c === 'git') { gitCalls += 1; return { status: gitCalls >= 3 ? 0 : 1 }; } return { status: 0 }; } });
+    expect(result.ok).toBe(true);
+    expect(gitCalls).toBe(3);
   });
 });

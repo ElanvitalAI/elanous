@@ -11,6 +11,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
 import { XtermView } from './XtermView';
 import { PtyLiveView } from './PtyLiveView';
+import { PtyWall } from './PtyWall';
+import { wallFromSearch } from './pty-wall';
 import { TerminalTabs, type InitialTerminalState } from './TerminalTabs';
 import { initialTerminalNotice } from './initial-terminal-notice';
 import { TuiMirrorView } from './TuiMirrorView';
@@ -168,6 +170,16 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   const [tabIds, setTabIds] = useState<readonly string[]>([]);
   const [liveDismissed, setLiveDismissed] = useState(false);
   const [livePty, setLivePty] = useState<DaemonTerminalSummary | null>(null);
+  // 터미널 나란히(드라이브 RFC ⑥ 2단계) — 주소 `?wall=a,b` 로도 연다(마운트 뒤에 읽는다 · #418).
+  const [wall, setWall] = useState<string[] | null>(null);
+  // «무대» 보기(`&stage=1` · 🅢 12:4x 녹화용) — 채팅 독·툴바를 덮고 터미널이 화면 높이 전부 · 의도 띠 글자 한 단계 크게.
+  const [wallStage, setWallStage] = useState(false);
+  useEffect(() => {
+    const search = window.location?.search ?? '';
+    const w = wallFromSearch(search);
+    if (w.length) setWall(w);
+    if (new URLSearchParams(search).get('stage') === '1') setWallStage(true);
+  }, []);
   const [initialTerminalState, setInitialTerminalState] = useState<InitialTerminalState>({ status: 'pending' });
   // ⛔ 렌더당 «한 번»만 계산한다 — 두 번 부르면 화면 분기와 배너가 서로 다른 결과를 쓸 수 있다
   //    (무인 리뷰 should-fix · 2026-08-18 `#10105`).
@@ -674,6 +686,15 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         >
           PTY 목록
         </button>
+        <button
+          type="button"
+          aria-pressed={wall !== null}
+          onClick={() => setWall((w) => (w === null ? [] : null))}
+          className={`rounded px-2 py-1 text-xs ${wall !== null ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
+          data-elanous-action="pty-wall"
+        >
+          ▦ 나란히
+        </button>
       </div>
       {terminalId ? <div className={panelsMinimized || panelView !== 'terminal' || livePty !== null || (initialPtyId && !liveDismissed) ? 'hidden' : 'contents'}>
         <MultiDeviceIndicator
@@ -690,7 +711,12 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         {isCoarsePointer && <ModifierBar terminalId={terminalId} />}
         <TerminalDropZone onAttached={handleAttached} />
       </div> : null}
-      <div className="flex-1 min-h-0">
+      <div className="relative flex-1 min-h-0">
+        {wall !== null && (
+          <div className={wallStage ? 'fixed inset-0 z-50' : 'absolute inset-0 z-20'} data-pty-wall-stage={wallStage ? '1' : undefined}>
+            <PtyWall rows={ptyRows} client={client} initial={wall} stage={wallStage} onClose={() => { setWall(null); const p = new URLSearchParams(window.location.search); p.delete('wall'); window.history.replaceState(null, '', `${window.location.pathname}${p.toString() ? `?${p}` : ''}`); }} />
+          </div>
+        )}
         <TerminalPaneLayout
           layout={terminalPaneLayout}
           sessionId={sessionId}

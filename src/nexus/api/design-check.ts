@@ -1,4 +1,4 @@
-// NEXUS · GET /v1/design-check — the craft-rulebook verdict, over the wire
+// NEXUS · GET /v1/design-check and POST /v1/design-direction
 //
 // `elanous repo design-check` already answers "which craft rulebooks does this
 // repository's DESIGN.md declare, and which of them cannot be found?" — but
@@ -6,48 +6,28 @@
 // `resolveDesignCheck`, not re-derived here) to the PWA, so the browser panel
 // and the CLI can never drift apart.
 //
-// ⭐ Two roots, deliberately different — this is the whole subtlety:
-//
-//   DESIGN.md       ← the ACTIVE REPOSITORY, found the way `/v1/worktrees`
-//                     finds it (`git rev-parse --show-toplevel` from the
-//                     daemon's cwd). The daemon watches one checkout; that
-//                     checkout's design document is the subject.
-//   craft/          ← ELANOUS'S INSTALLATION directory. `#11793` established
-//                     that the rulebooks travel with elanous, not with the
-//                     project under inspection, so a project outside the
-//                     elanous tree still resolves them.
-//
-// Reading either root from the other would reintroduce exactly the
-// `process.cwd()` coupling `#11793` removed.
-//
-// Wire shape:
-//   { repoRoot: string | null,
-//     ok: true,  documentPath, craftDirectory,
-//                availableRulebooks[], declaredRulebooks[], unavailableRulebooks[],
-//                exitCode: 0 | 1 }
-//   { repoRoot: string | null,
-//     ok: false, blockedOn: 'no-repository' | 'craft-directory' | 'design-document',
-//                path: string | null, exitCode: 1 }
-//
-// ⛔ `blockedOn` is carried through rather than flattened to an error string:
-//    a renderer must be able to tell "nothing is missing" from "I could not
-//    read the directory", and prose cannot be switched on reliably.
-//
-// Read-only · no auth (mirrors `/v1/worktrees` under the same same-origin
-// enforcement layer).
+// DESIGN.md comes from the configured harness.defaultRepo when present (no
+// fallback if it is invalid), otherwise the daemon's checkout. The craft and
+// bundled system directories always come from the elanous installation.
+// A blocked verdict is still a GET result, not an HTTP error. POST writes are
+// authenticated at http-server's /v1 owner-auth gate before this handler runs.
 
 import { readFileSync, readdirSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
+import { debug } from '../../debug/log.js';
+import { applyDesignDirection, type ApplyDesignDirectionResult } from '../../design/apply-direction.js';
 import { designCheckExitCode, resolveDesignCheck, type DesignCheckDeps } from '../../design/design-check.js';
-import { directionFromDesignMd, listDesignDirections, parseDeclaredDirection } from '../../design/design-directions.js';
-import { jsonResponse } from './http-server.js';
+import { directionFromDesignMd, listAllDesignDirections, parseDeclaredDirection } from '../../design/design-directions.js';
+import { defaultDesignSystemsDir, listDesignSystems } from '../../design/design-systems.js';
+import { getUserConfig } from '../../user-config.js';
+import { jsonResponse } from './json-response.js';
 import { detectRepoRoot } from './worktrees.js';
 
 export interface DesignCheckRouteDeps extends DesignCheckDeps {
-  /** Active repository root, or null outside a checkout. Injected so the
-   *  route can be tested without spawning git. */
-  repoRoot: () => string | null;
+  /** Detect a checkout from the configured path, or from the daemon cwd. */
+  repoRoot: (cwd?: string) => string | null;
+  defaultRepo?: () => string | undefined;
   /** Absolute path of elanous's vendored craft rulebook directory. */
   craftDirectory: () => string;
 }
@@ -59,23 +39,44 @@ function installedCraftDirectory(): string {
   return resolve(import.meta.dir, '..', '..', '..', 'docs', 'design', 'craft');
 }
 
-const liveDeps: DesignCheckRouteDeps = {
+export const designCheckLiveDeps: DesignCheckRouteDeps = {
   readFile: (path, encoding) => readFileSync(path, encoding),
   readdir: (path) => readdirSync(path),
-  repoRoot: () => detectRepoRoot(),
+  repoRoot: (cwd) => detectRepoRoot(cwd === undefined ? {} : { cwd }),
+  defaultRepo: () => getUserConfig().harness?.defaultRepo,
   craftDirectory: installedCraftDirectory,
 };
 
-/** Pure — builds the wire body from injected reads. Exported for tests so the
- *  route's shape is pinned without booting an HTTP server. */
+const liveDeps: DesignCheckRouteDeps = designCheckLiveDeps;
+
+export interface DesignDirectionRouteDeps extends DesignCheckRouteDeps {
+  applyDirection: typeof applyDesignDirection;
+  logSelection: (repoRoot: string, direction: string) => void;
+}
+
+const directionDeps: Pick<DesignDirectionRouteDeps, 'applyDirection' | 'logSelection'> = {
+  applyDirection: applyDesignDirection,
+  logSelection: (repoRoot, direction) => debug.log('nexus.design-direction', 'selected', { repoRoot, direction }),
+};
+
+export type DesignRepository = { repoRoot: string | null; repoSource: 'config' | 'cwd' | null };
+
+/** Same repository the design-check verdict reads: harness.defaultRepo, else daemon cwd. */
+export function resolveDesignRepository(deps: DesignCheckRouteDeps): DesignRepository {
+  const configured = (deps.defaultRepo ?? (() => getUserConfig().harness?.defaultRepo))();
+  if (configured !== undefined) {
+    return { repoRoot: isAbsolute(configured) ? deps.repoRoot(configured) : null, repoSource: 'config' };
+  }
+  const repoRoot = deps.repoRoot();
+  return { repoRoot, repoSource: repoRoot ? 'cwd' : null };
+}
+
+/** Builds the wire body from injected reads. Exported for tests without booting HTTP. */
 export function buildDesignCheckView(overrides: Partial<DesignCheckRouteDeps> = {}): Record<string, unknown> {
   const deps = { ...liveDeps, ...overrides };
-  const repoRoot = deps.repoRoot();
+  const { repoRoot, repoSource } = resolveDesignRepository(deps);
   if (!repoRoot) {
-    // ⛔ Distinct from a read failure. "The daemon is not inside a checkout"
-    // is a deployment fact the operator can act on; collapsing it into
-    // `design-document` would send them hunting for a missing file instead.
-    return { repoRoot: null, ok: false, blockedOn: 'no-repository', path: null, exitCode: 1 };
+    return { repoRoot: null, repoSource, ok: false, blockedOn: 'no-repository', path: null, exitCode: 1 };
   }
   const outcome = resolveDesignCheck(
     join(repoRoot, 'DESIGN.md'),
@@ -84,7 +85,7 @@ export function buildDesignCheckView(overrides: Partial<DesignCheckRouteDeps> = 
   );
   const exitCode = designCheckExitCode(outcome);
   if (!outcome.ok) {
-    return { repoRoot, ok: false, blockedOn: outcome.blockedOn, path: outcome.path, exitCode };
+    return { repoRoot, repoSource, ok: false, blockedOn: outcome.blockedOn, path: outcome.path, exitCode };
   }
   // B5 — 방향은 «같은 문서»에서 나온다. 두 번째 라우트를 만들면 두 번째
   // 「어느 저장소의 DESIGN.md 인가」 답이 생긴다. 여기서 같이 실어 보낸다.
@@ -95,23 +96,23 @@ export function buildDesignCheckView(overrides: Partial<DesignCheckRouteDeps> = 
   try {
     document = deps.readFile(outcome.documentPath, 'utf8');
   } catch { /* 방금 읽힌 문서다. 사라졌으면 「선언 없음」과 같은 화면이 맞다. */ }
-  // ⭐ 방향은 «둘»에서 온다: 테마 레지스트리(여섯) ⊕ ***이 문서 자신***.
-  //    🩸 2026-09-08 실측: 여섯은 전부 «터미널 색 스킴»이라 웹 레퍼런스에서 뽑은 팔레트·서체는
-  //       ***어느 이름으로도 선언할 수 없었다*** — 선언하면 늘 `unavailable` 로 떨어졌다.
-  //    ⛔ 문서 방향을 «항상» 만들지 않는다. 선언이 테마에 없을 때만 «그 이름으로» 시도한다 —
-  //       그래야 오타가 조용히 「스스로 선언한 방향」으로 둔갑하지 않는다(팔레트를 못 읽으면 null).
-  const themeDirections = listDesignDirections();
-  const declaredAmongThemes = parseDeclaredDirection(document, themeDirections);
-  const documentDirection = declaredAmongThemes.unavailable === null
+  // Bundled terminal themes and web systems are selectable; a document-defined
+  // direction is added only when its declared ID is not already bundled and
+  // its palette supplies a usable swatch (never turn a typo into a direction).
+  const bundledDirections = listAllDesignDirections();
+  const declaredAmongBundled = parseDeclaredDirection(document, bundledDirections);
+  const documentDirection = declaredAmongBundled.unavailable === null
     ? null
-    : directionFromDesignMd(document, declaredAmongThemes.unavailable);
+    : directionFromDesignMd(document, declaredAmongBundled.unavailable);
   const availableDirections = documentDirection === null
-    ? themeDirections
-    : [...themeDirections, documentDirection];
+    ? bundledDirections
+    : [...bundledDirections, documentDirection];
+  const systemCategories = new Map(listDesignSystems(defaultDesignSystemsDir()).map((system) => [system.id, system.category]));
   const direction = parseDeclaredDirection(document, availableDirections);
 
   return {
     repoRoot,
+    repoSource,
     ok: true,
     documentPath: outcome.documentPath,
     craftDirectory: outcome.craftDirectory,
@@ -123,9 +124,9 @@ export function buildDesignCheckView(overrides: Partial<DesignCheckRouteDeps> = 
       declared: direction.declared,
       unavailable: direction.unavailable,
       available: availableDirections.map((d) => ({
-        id: d.id, mood: d.mood, isDark: d.isDark, isPastel: d.isPastel, swatch: d.swatch,
-        // ⛔ 「테마에서 왔다」와 「이 문서가 스스로 정했다」를 화면이 가를 수 있어야 한다.
+        id: d.id, label: d.label, mood: d.mood, isDark: d.isDark, isPastel: d.isPastel, swatch: d.swatch,
         source: d.source ?? 'theme', typography: d.typography ?? null,
+        category: systemCategories.get(d.id) ?? null,
       })),
     },
   };
@@ -137,4 +138,34 @@ export function buildDesignCheckView(overrides: Partial<DesignCheckRouteDeps> = 
  *  like the daemon is broken. */
 export function handleDesignCheck(): Response {
   return jsonResponse(buildDesignCheckView(), 200);
+}
+
+/** The HTTP dispatcher must run owner checkAuth before invoking this write handler. */
+export async function handleDesignDirectionPost(
+  req: Request,
+  overrides: Partial<DesignDirectionRouteDeps> = {},
+): Promise<Response> {
+  let body: unknown;
+  try { body = await req.json(); }
+  catch { return jsonResponse({ ok: false, reason: 'invalid-json' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || typeof (body as { id?: unknown }).id !== 'string'
+    || !(body as { id: string }).id.trim()) {
+    return jsonResponse({ ok: false, reason: 'id-required' }, 400);
+  }
+  const id = (body as { id: string }).id;
+  const deps = { ...liveDeps, ...directionDeps, ...overrides };
+  const { repoRoot, repoSource } = resolveDesignRepository(deps);
+  if (!repoRoot) return jsonResponse({ ok: false, reason: 'no-repository', repoRoot, repoSource }, 409);
+  let result: ApplyDesignDirectionResult;
+  try { result = deps.applyDirection(join(repoRoot, 'DESIGN.md'), id); }
+  catch (error) {
+    debug.log('nexus.design-direction', 'failed', { repoRoot, direction: id, error: String(error) }, { level: 'error' });
+    return jsonResponse({ ok: false, reason: 'cannot-write' }, 500);
+  }
+  if (!result.ok) {
+    return jsonResponse(result, result.reason === 'unknown-direction' ? 400 : result.reason === 'conflicting-system-file' ? 409 : 500);
+  }
+  deps.logSelection(repoRoot, id);
+  return jsonResponse({ ...result, repoRoot, repoSource }, 200);
 }

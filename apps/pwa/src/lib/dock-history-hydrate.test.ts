@@ -159,7 +159,7 @@ describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
     const result = await fetchDockHistory(makeClient(), 's-1');
     expect(result).not.toBeNull();
     expect(result!.length).toBe(1);
-    expect(String(httpCalls[0]!.url)).toBe('http://localhost:31415/v1/sessions/store/s-1');
+    expect(String(httpCalls[0]!.url)).toBe('http://localhost:31415/v1/sessions/store/s-1?ifExists=1');
   });
 
   it('folds store tool rows into a compact 🛠️ meta line (P4)', async () => {
@@ -221,6 +221,6 @@ describe('fetchDockHistory — NEXUS T3 endpoint contract', () => {
   it('encodes path segments with /', async () => {
     globalThis.fetch = mockResponse({ status: 200, body: { messages: [] } });
     await fetchDockHistory(makeClient(), 'a/b');
-    expect(String(httpCalls[0]!.url)).toBe('http://localhost:31415/v1/sessions/store/a%2Fb');
+    expect(String(httpCalls[0]!.url)).toBe('http://localhost:31415/v1/sessions/store/a%2Fb?ifExists=1');
   });
 });

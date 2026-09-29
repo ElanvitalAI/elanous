@@ -9,6 +9,7 @@
 
 import { describe, expect, test } from 'bun:test';
 import { buildManualReviewIntent, buildReviewIntent, capIntent, extractIntentBlocks, intentFromPr, prIntentSectionCoverage, reviewIntentTruncationObservation, stripExtractedSections, MAX_INTENT_ITEMS, MAX_INTENT_ITEM_CHARS, MAX_REVIEW_INTENT_CHARS, type ExtractedIntentBlocks } from './review-intent.js';
+import { toReviewIntentInput } from '../self-implement/seams.js';
 
 describe('buildManualReviewIntent', () => {
   test('상한 이하는 종전 수동 조립 문자열과 문자 동등하다', () => {
@@ -126,7 +127,56 @@ describe('buildManualReviewIntent', () => {
   });
 });
 
+describe('buildReviewIntent design gate', () => {
+  const base = { direction: 'paper', tokensSource: null, advisoryTotal: 0, truncated: false, omitted: 0, checkedAt: '2026-01-01T00:00:00Z' } as const;
+  test('P0 findings become review must-fix candidates without changing the absent output', () => {
+    const input = { goal: 'Design an index' };
+    const previous = buildReviewIntent(input);
+    const designGate = {
+      ...base, verdict: 'fail' as const, p0Total: 2,
+      files: [{ path: 'index.html', p0: 2, advisory: 0, skipped: [], findings: [
+        { rule: 'display-font-mismatch', severity: 'p0' as const, line: 12 },
+        { rule: 'raw-color', severity: 'p0' as const, line: 30 },
+      ] }],
+    };
+    const out = buildReviewIntent({ ...input, designGate });
+    expect(out).toContain('디자인 게이트 — must-fix 후보(P0 2)');
+    expect(out).toContain('index.html:12 display-font-mismatch');
+    expect(out).toContain('index.html:30 raw-color');
+    expect(buildReviewIntent(input)).toBe(previous);
+    expect(buildReviewIntent({ ...input, designGate: { ...designGate, verdict: 'not-applicable', reason: 'no-direction' } })).toBe(previous);
+  });
+
+  test('pass and unmeasured are visible; P0 list is capped at twenty', () => {
+    const input = { goal: 'Design an index' };
+    const pass = { ...base, verdict: 'pass' as const, p0Total: 0, files: [] };
+    expect(buildReviewIntent({ ...input, designGate: pass })).toContain('디자인 게이트 통과(방향 paper)');
+    expect(buildReviewIntent({ ...input, designGate: { unmeasured: 'git unavailable' } })).toContain('측정 불가: git unavailable');
+    const findings = Array.from({ length: 23 }, (_, index) => ({ rule: `rule-${index}`, severity: 'p0' as const, line: index + 1 }));
+    const out = buildReviewIntent({ ...input, designGate: { ...base, verdict: 'fail', p0Total: 23, files: [{ path: 'index.html', p0: 23, advisory: 0, skipped: [], findings }] } });
+    expect(out).toContain('index.html:20 rule-19');
+    expect(out).not.toContain('index.html:21 rule-20');
+    expect(out).toContain('…3개 생략');
+  });
+});
+
 describe('buildReviewIntent', () => {
+  test('prior-run findings require a decision but an absent or empty list leaves the intent byte-identical', () => {
+    const baseline = buildReviewIntent({ goal: 'G' });
+    const finding = { pr: 21457, runId: 'run-old', round: 1, items: ['프록시가 압축 응답 헤더를 그대로 넘긴다'] };
+    const intent = buildReviewIntent({ goal: 'G', priorRunFindings: [finding] });
+    expect(intent).toContain('앞 런이 남긴 지적(같은 골 · 다른 런)');
+    expect(intent).toContain('#21457 · 라운드 1 · 프록시가 압축 응답 헤더를 그대로 넘긴다');
+    expect(intent).toContain('닫혔는지 판정하라');
+    expect(intent).toContain('닫히지 않았고 이 PR 범위에 해당하면 must-fix 로 올린다 · 해당 없으면 이유 한 줄');
+    expect(baseline).not.toContain('앞 런이 남긴 지적');
+    expect(buildReviewIntent({ goal: 'G', priorRunFindings: [] })).toBe(baseline);
+    // Exercise the actual reviewDiff adapter input, not only the intent builder.
+    const forwarded = toReviewIntentInput({ goal: 'G', priorRunFindings: [finding] });
+    expect(forwarded?.priorRunFindings).toEqual([finding]);
+    expect(buildReviewIntent(forwarded!)).toContain('#21457 · 라운드 1');
+  });
+
   test('절이 없는 골은 implement 종류와 기존 성공 조건을 알린다', () => {
     const out = buildReviewIntent({ goal: '  게이트 스코프를 고친다  ' });
     expect(out).toBe('골 종류와 성공 조건\n종류: implement\n성공: 게이트 통과와 PR 머지다.\n\n목표\n게이트 스코프를 고친다');

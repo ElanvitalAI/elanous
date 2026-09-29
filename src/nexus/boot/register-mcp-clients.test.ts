@@ -1,5 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
 
+import { debug } from '../../debug/log.js';
+import { failureReason } from '../../domains/repeated-failure.js';
+import { McpConnectionError } from '../../mcp/client.js';
 import { registerMcpClients } from './register-mcp-clients.js';
 
 const stdioServer = (id: string, handshakeTimeoutMs?: number) => ({
@@ -68,6 +71,61 @@ describe('registerMcpClients handshake timeout configuration', () => {
     expect(handle.perServer.healthy).toEqual({ status: 'ready', toolCount: 0 });
     expect(warnings).toContainEqual(expect.stringContaining('slow was excluded after its 1ms handshake timeout'));
     expect(warnings).toContainEqual(expect.stringContaining('raise mcp.handshakeTimeoutMs or mcp.servers[].handshakeTimeoutMs, then run elanous mcp reload'));
+    await handle.shutdown();
+  });
+});
+
+describe('registerMcpClients connect-failed trace', () => {
+  const captured: { category: string; event: string; data?: Record<string, unknown> }[] = [];
+  const originalLog = debug.log.bind(debug) as typeof debug.log;
+
+  afterEach(() => {
+    (debug as { log: typeof debug.log }).log = originalLog;
+    captured.length = 0;
+  });
+
+  const failingClient = (err: Error) => ({
+    start: async () => { throw err; },
+    listTools: async () => [],
+    callTool: async () => ({ content: [] }),
+    dispose: async () => {},
+  });
+
+  test('logs auth-required and invalid-token, leaves the ready peer ready, and is countable by failureReason', async () => {
+    (debug as { log: typeof debug.log }).log = ((category: string, event: string, data?: Record<string, unknown>) => {
+      captured.push({ category, event, data });
+    }) as typeof debug.log;
+
+    const secret = 'sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789';
+    const handle = await registerMcpClients({
+      servers: [stdioServer('higgsfield'), stdioServer('bridge'), stdioServer('krea')],
+      handshakeTimeoutMs: 0,
+      createClient: (spec) => {
+        if (spec.id === 'higgsfield') {
+          return failingClient(new McpConnectionError('auth-required', `authentication required token=${secret}`));
+        }
+        if (spec.id === 'bridge') return failingClient(new Error('invalid_token'));
+        return successfulClient();
+      },
+      logger: { info: () => {}, warn: () => {} },
+    });
+
+    const rows = captured.filter((row) => row.category === 'mcp.client.boot' && row.event === 'connect-failed');
+    const byId = Object.fromEntries(rows.map((row) => [row.data?.id, row.data?.reason]));
+    expect(byId).toEqual({ higgsfield: 'auth-required', bridge: 'invalid-token' });
+    expect(JSON.stringify(rows)).not.toContain(secret);
+    expect(handle.perServer.higgsfield).toMatchObject({ status: 'failed', reasonClass: 'auth-required' });
+    expect(handle.perServer.bridge).toMatchObject({ status: 'failed', reasonClass: 'invalid-token' });
+    expect(handle.perServer.krea).toEqual({ status: 'ready', toolCount: 0 });
+
+    for (const row of rows) {
+      const reason = failureReason({
+        event: row.event,
+        category: row.category,
+        data: JSON.stringify(row.data ?? {}),
+      });
+      expect(reason).not.toBeNull();
+    }
     await handle.shutdown();
   });
 });

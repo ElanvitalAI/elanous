@@ -419,6 +419,7 @@ export interface TaskApproval {
   /** Who approved it (state `approved` only). */
   approvedBy?: 'manual';
   approvedAt?: number;
+  fingerprint?: string;
 }
 
 // ──────────────────── Task ───────────────────────────────────────────
@@ -542,6 +543,8 @@ export interface TaskExecution {
    */
   surfaceAddress?: string;
   output?: string;                 // ≤ 4 KB tail; larger goes to outputPath
+  /** The agent ran, but its reported outcome needs human review rather than automatic completion. */
+  reviewRequired?: boolean;
   outputPath?: string;
   error?: { code: string; message: string; stack?: string };
   tokenUsage?: { input: number; output: number };

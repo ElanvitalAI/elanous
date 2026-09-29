@@ -4,7 +4,7 @@
 //   - validateAgentRoomSpec enum check on member.transportPref
 //   - checkTransportCompat compat-table cells (drop · warning · pass-through)
 //   - composeFromLanes pipes lane.transportPref into member.transportPref
-//   - room-builder surfaces compat warnings via BuildRoomResult.warnings
+//   - room-builder rejects room launches for every transport preference
 
 import { describe, test, expect, mock } from 'bun:test';
 import { validateAgentRoomSpec } from '../src/agent-room/types.js';
@@ -17,6 +17,7 @@ import {
 import { executeAgentRoomSlash } from '../src/skills/tools/agent-room-slash.js';
 import { AgentRoomRegistry } from '../src/agent-room/registry.js';
 import type { AgentRoomSpec } from '../src/agent-room/types.js';
+import { buildAgentRoom } from '../src/agent-room/room-builder.js';
 
 // ─── validateAgentRoomSpec · enum ─────────────────────────────────
 
@@ -133,148 +134,20 @@ describe('checkTransportCompat · unknown brand', () => {
   });
 });
 
-// ─── room-builder integration · warnings surface ─────────────────
+// ─── buildAgentRoom refuses all transport combinations ──────────────
 
-describe('buildAgentRoom · transportPref warnings', () => {
-  function makeStubs() {
-    let seq = 0;
-    return {
-      spawnInitial: async () => ({
-        session: {
-          id: `s-${seq}`,
-          launchSpec: { brand: 'stub' },
-          transports: [{ kind: 'pty' as const, id: `pty-${seq}` }],
-          state: () => ({ status: 'running' as const }),
-          send: async () => {},
-          interrupt: async () => {},
-          snapshot: async () => '',
-          dispose: async () => {},
-        },
-        windowId: 100,
-        paneId: 'pane-0',
-        ptyId: `pty-${seq++}`,
-      }),
-      spawnIntoPane: async () => ({
-        session: {
-          id: `s-${seq}`,
-          launchSpec: { brand: 'stub' },
-          transports: [{ kind: 'pty' as const, id: `pty-${seq}` }],
-          state: () => ({ status: 'running' as const }),
-          send: async () => {},
-          interrupt: async () => {},
-          snapshot: async () => '',
-          dispose: async () => {},
-        },
-        windowId: 100,
-        paneId: `pane-${seq}`,
-        ptyId: `pty-${seq++}`,
-      }),
-      // PR-CL7 (C.3 · 2026-04-29) — ACP-lane stubs. After CL6 every
-      // brand has a `laneKind`; brands that default to ACP (codex /
-      // elanous) route here unless `transportPref: 'pty'` narrows them
-      // back. The transport-pref warning tests cover both branches.
-      spawnAcpInitial: async (o: { backendId: string }) => {
-        const sid = `acp-${seq++}`;
-        return {
-          sessionId: sid,
-          backendId: o.backendId,
-          windowId: 100,
-          paneId: 'pane-0',
-          dispose: async () => {},
-        };
-      },
-      spawnAcpIntoPane: async (o: { backendId: string; targetWindowId: number }) => {
-        const sid = `acp-${seq++}`;
-        return {
-          sessionId: sid,
-          backendId: o.backendId,
-          windowId: o.targetWindowId,
-          paneId: `pane-${seq}`,
-          dispose: async () => {},
-        };
-      },
-      closeWindow: () => {},
-      renameWindow: async () => true,
-      renamePane: async () => true,
-      focusPane: async () => true,
-    };
+describe('buildAgentRoom · unsupported transport preferences', () => {
+  for (const transportPref of ['pty', 'acp', 'auto'] as const) {
+    test(`refuses ${transportPref} without launching a room`, async () => {
+      const registry = new AgentRoomRegistry();
+      await expect(buildAgentRoom({
+        preset: 'two-split',
+        members: [{ brandRef: 'codex', transportPref }, { brandRef: 'claude' }],
+        layoutMode: 'single-vw',
+      }, { registry })).rejects.toThrow('agent rooms need the removed rich TUI (virtual windows)');
+      expect(registry.list()).toEqual([]);
+    });
   }
-
-  test('elanous + pty → warning surfaced', async () => {
-    const reg = new AgentRoomRegistry();
-    const stubs = makeStubs();
-    // dynamic import inside to avoid circular module init
-    const { buildAgentRoom } = await import('../src/agent-room/room-builder.js');
-    const result = await buildAgentRoom(
-      {
-        preset: 'two-split',
-        members: [
-          { brandRef: 'elanous', transportPref: 'pty' },
-          { brandRef: 'codex' },
-        ],
-      },
-      { registry: reg, ...stubs },
-    );
-    const warningText = result.warnings.join('\n');
-    expect(warningText).toMatch(/transportPref 'pty' dropped/);
-    expect(warningText).toMatch(/no PTY adapter/);
-    expect(result.room.members.length).toBe(2);
-  });
-
-  test('lll:llama3 + acp → warning surfaced', async () => {
-    const reg = new AgentRoomRegistry();
-    const stubs = makeStubs();
-    const { buildAgentRoom } = await import('../src/agent-room/room-builder.js');
-    const result = await buildAgentRoom(
-      {
-        preset: 'two-split',
-        members: [
-          { brandRef: 'lll:llama3', transportPref: 'acp' },
-          { brandRef: 'codex' },
-        ],
-      },
-      { registry: reg, ...stubs },
-    );
-    const warningText = result.warnings.join('\n');
-    expect(warningText).toMatch(/transportPref 'acp' dropped/);
-    expect(warningText).toMatch(/local LLM is PTY only/);
-  });
-
-  test('codex + acp → warning surfaced', async () => {
-    const reg = new AgentRoomRegistry();
-    const stubs = makeStubs();
-    const { buildAgentRoom } = await import('../src/agent-room/room-builder.js');
-    const result = await buildAgentRoom(
-      {
-        preset: 'two-split',
-        members: [
-          { brandRef: 'codex', transportPref: 'acp' },
-          { brandRef: 'claude' },
-        ],
-      },
-      { registry: reg, ...stubs },
-    );
-    const warningText = result.warnings.join('\n');
-    expect(warningText).toMatch(/no ACP-embodied adapter yet/);
-  });
-
-  test('compatible combo → no transport warning', async () => {
-    const reg = new AgentRoomRegistry();
-    const stubs = makeStubs();
-    const { buildAgentRoom } = await import('../src/agent-room/room-builder.js');
-    const result = await buildAgentRoom(
-      {
-        preset: 'two-split',
-        members: [
-          { brandRef: 'codex', transportPref: 'pty' },
-          { brandRef: 'elanous', transportPref: 'acp' },
-        ],
-      },
-      { registry: reg, ...stubs },
-    );
-    const warningText = result.warnings.join('\n');
-    expect(warningText).not.toMatch(/transportPref/);
-  });
 });
 
 // ─── composeFromLanes · transportPref pipe ────────────────────────

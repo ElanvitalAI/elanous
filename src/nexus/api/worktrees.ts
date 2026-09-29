@@ -28,6 +28,8 @@
 // Read-only · no auth (mirrors `/v1/platforms` / `/v1/providers`
 // per existing same-origin enforcement layer).
 
+import { isAbsolute } from 'node:path';
+import { getUserConfig } from '../../user-config.js';
 import { type GitRunner } from '../../git-fs/retry.js';
 import { runGitCommand } from '../../git-fs/runner.js';
 import { jsonResponse } from './http-server.js';
@@ -97,6 +99,19 @@ export function detectRepoRoot(opts: DetectRepoRootOpts = {}): string | null {
   if (res.status !== 0) return null;
   const out = res.stdout.trim();
   return out.length > 0 ? out : null;
+}
+
+/** 워크트리 탭이 보는 저장소 — Design 탭과 같은 해석(🅕 09-28 트리아지 P2):
+ *  `harness.defaultRepo`(절대 경로)가 있으면 그 저장소, 없으면 데몬 cwd.
+ *  ⛔ 데몬은 launchd 로 뜨면 cwd 가 저장소 밖이라 «git 밖»으로 오판했다. 상대 경로 설정은 모호하니 null. */
+export function resolveWorktreesRepoRoot(deps: {
+  defaultRepo?: () => string | undefined;
+  detect?: (cwd?: string) => string | null;
+} = {}): string | null {
+  const detect = deps.detect ?? ((cwd?: string) => detectRepoRoot(cwd === undefined ? {} : { cwd }));
+  const configured = (deps.defaultRepo ?? (() => getUserConfig().harness?.defaultRepo))();
+  if (configured !== undefined) return isAbsolute(configured) ? detect(configured) : null;
+  return detect();
 }
 
 /** Pure aggregation — combine listWorktrees + listWorktreeSessions
@@ -172,7 +187,7 @@ export function buildWorktreesView(
  *  not in a git checkout, returns `{repoRoot: null, worktrees: [],
  *  orphanedSessions: []}`. */
 export function handleWorktrees(): Response {
-  const repoRoot = detectRepoRoot();
+  const repoRoot = resolveWorktreesRepoRoot();
   const worktrees = repoRoot ? listWorktrees(repoRoot) : [];
   const sessions = listWorktreeSessions();
   const body = buildWorktreesView(worktrees, sessions, repoRoot);
@@ -243,7 +258,8 @@ export function disposeWorktree(
   req: DisposeWorktreeRequest,
   deps: DisposeWorktreeDeps = {},
 ): DisposeWorktreeResponse {
-  const detect = deps.detectRepoRoot ?? detectRepoRoot;
+  // 목록과 «같은» 저장소로 검증한다 — 다르면 목록에 보인 경로를 지울 수 없거나, 안 보인 경로를 검증에 쓴다.
+  const detect = deps.detectRepoRoot ?? (() => resolveWorktreesRepoRoot());
   const lstWt = deps.listWorktrees ?? listWorktrees;
   const lstSe = deps.listWorktreeSessions ?? listWorktreeSessions;
   const rmWt = deps.removeWorktree ?? removeWorktree;

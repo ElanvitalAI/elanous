@@ -15,6 +15,7 @@ import {
   type SelfDevDecomposition,
 } from './decompose.js';
 import { gradePhaseCompletability } from '../autopilot/mission-phase-granularity.js';
+import { emitDecision } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
 import {
   groundGoalAuthoringContext,
@@ -211,6 +212,15 @@ function observeFinalFabricDecomposition(goals: readonly SelfDevGoal[]): void {
     tooLargeSubtaskCount,
     tooSmallSubtaskCount: grades.filter(({ verdict }) => verdict === 'too_small').length,
     hasMultipleTooLargeSubtasks: tooLargeSubtaskCount >= 2,
+  });
+  emitDecision({
+    kind: 'PLAN',
+    what: `골을 조각 ${goals.length}개로 분해`,
+    reason: tooLargeSubtaskCount > 0 ? `큰 조각 ${tooLargeSubtaskCount}개 남음 — 더 쪼갤 여지` : '조각 크기 적정(한 런에 끝날 크기)',
+    purpose: '조각마다 독립 런으로 병렬 구현 · 실패를 작게 가둔다',
+    phase: 'decompose',
+    target: goals.map((goal) => goal.id ?? goal.feature?.slice(0, 40) ?? '?').slice(0, 8).join(' · ') || '없음',
+    paths: goals.length,
   });
 }
 

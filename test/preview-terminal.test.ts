@@ -113,6 +113,36 @@ describe('PreviewTerminal', () => {
     session.stop();
   });
 
+  // 위 시험은 «에뮬레이터» 격자만 본다 — 그래서 Bun 에서 node-pty `resize` 가 EBADF 로 삼켜져 커널 PTY 가
+  // 80×24 에 머무는 것을 못 잡았다(2026-09-28 · 웹 터미널 셸이 80칸에서 접혔다). 여기선 «셸이 보는» 크기를 잰다.
+  test('resize reaches the kernel PTY — the shell sees the new size (stty size)', async () => {
+    const session = new PreviewTerminal({
+      cols: 80,
+      rows: 10,
+      cwd: process.cwd(),
+      shell: '/bin/bash',
+      env: { ...process.env, PS1: '$ ', BASH_ENV: '', ENV: '' } as Record<string, string>,
+    });
+    session.start();
+    // node-pty 의 fd 는 «뜬 직후»엔 아직 살아 있다 — 셸이 한 줄 낸 뒤(실사용과 같은 때)에 바꾼다.
+    session.write('echo READY\r');
+    for (const until = Date.now() + 2000; Date.now() < until && !session.render().includes('READY'); ) {
+      await new Promise(r => setTimeout(r, 50));
+    }
+    await new Promise(r => setTimeout(r, 300));
+    session.resize(117, 21);
+    session.write('echo SZ=$(stty size)\r');
+    const deadline = Date.now() + 3000;
+    let snapshot = '';
+    while (Date.now() < deadline) {
+      snapshot = session.render();
+      if (/SZ=\d+ \d+/.test(snapshot)) break;
+      await new Promise(r => setTimeout(r, 50));
+    }
+    session.stop();
+    expect(snapshot).toContain('SZ=21 117');
+  }, 6000);
+
   test('stop is idempotent', () => {
     const session = new PreviewTerminal({
       cols: 80,

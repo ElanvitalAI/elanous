@@ -1,9 +1,4 @@
-import { dirname } from 'path';
-
 import type { DisplayCoordinator } from '../display/coordinator.js';
-import { PaneContent, type PaneBroadcast, type PaneUnsubscribe } from '../virtual-windows/pane-content.js';
-import { mintPaneId } from '../virtual-windows/addressing.js';
-import type { Action, DisplayMouseEvent, KeyEvent } from '../display/types.js';
 import {
   showLivePaneMultiModal,
   showPaneMultiModal,
@@ -20,31 +15,12 @@ import {
 import type { ThemeTokens } from '../theme/tokens.js';
 import type { WidgetHost } from '../widgets/host.js';
 import type { BrowserPaneRegistry } from './registry.js';
-import {
-  focusedBrowserEntry,
-  refreshBrowserPane,
-  toggleBrowserSelection,
-  type FsEntry,
-  type BrowserPaneModel,
-} from './model.js';
-import { C, pad, truncate, visibleWidth } from '../tui.js';
-import { dirColor, fileColor, fileIcon, sizeStr } from '../panes/file-icons.js';
+import type { FsEntry } from './model.js';
 import {
   navigateBrowserPreviewModalDirectory,
   projectBrowserPreviewModalBrowserState,
   syncBrowserPreviewModalCursorFromWidgetState,
 } from '../dashboard/modals/browser-preview-modal-seams.js';
-
-export interface BrowserPaneContentSpec {
-  kind: 'vw-browser';
-  browserId: string;
-  title?: string;
-}
-
-export interface BrowserPaneMountDeps {
-  browserPaneRegistry: BrowserPaneRegistry;
-  refreshRemoteBrowserPane?: (state: BrowserPaneModel) => Promise<void>;
-}
 
 export interface OpenBrowserPaneModalDeps {
   browserWidgetInstanceId: string;
@@ -61,110 +37,6 @@ export interface OpenBrowserPaneModalDeps {
   onSubmit?(text: string): void;
   onDispose?(): void;
   onCancel?(): void;
-}
-
-function createObserver(): {
-  emit: () => void;
-  on: (event: 'update' | 'output' | 'exit', cb: () => void) => PaneUnsubscribe;
-} {
-  const subs = new Map<'update' | 'output' | 'exit', Set<() => void>>();
-  return {
-    emit() {
-      for (const cb of subs.get('update') ?? []) {
-        try { cb(); } catch { /* ignore */ }
-      }
-    },
-    on(event, cb) {
-      const set = subs.get(event) ?? new Set<() => void>();
-      set.add(cb);
-      subs.set(event, set);
-      return () => { set.delete(cb); };
-    },
-  };
-}
-
-function clampBrowserOffset(state: BrowserPaneModel, rows: number): void {
-  const bodyRows = Math.max(1, rows);
-  if (state.cursor < state.offset) {
-    state.offset = state.cursor;
-    return;
-  }
-  if (state.cursor >= state.offset + bodyRows) {
-    state.offset = Math.max(0, state.cursor - bodyRows + 1);
-  }
-}
-
-function formatBrowserLine(
-  state: BrowserPaneModel,
-  entry: BrowserPaneModel['entries'][number],
-  focused: boolean,
-  width: number,
-): string {
-  const cursor = focused ? C.bold('›') : ' ';
-  const selected = !entry.isDir && state.selected.has(entry.absPath) ? C.success('●') : ' ';
-  if (entry.name === '..') {
-    const raw = `${cursor} ${selected} ${C.muted('↩')} ${C.muted('..')}`;
-    return visibleWidth(raw) > width ? truncate(raw, width) : pad(raw, width);
-  }
-  if (entry.isDir) {
-    const raw = `${cursor} ${selected} ${C.accent('')} ${dirColor(entry.name)}`;
-    return visibleWidth(raw) > width ? truncate(raw, width) : pad(raw, width);
-  }
-  const icon = fileColor(entry.name)(fileIcon(entry.name));
-  const name = fileColor(entry.name)(entry.name);
-  const size = C.muted(sizeStr(entry.size));
-  const raw = `${cursor} ${selected} ${icon} ${name} ${size}`;
-  return visibleWidth(raw) > width ? truncate(raw, width) : pad(raw, width);
-}
-
-async function refreshBrowserContentState(
-  state: BrowserPaneModel,
-  deps: BrowserPaneMountDeps,
-): Promise<void> {
-  if (!state.remote) {
-    refreshBrowserPane(state);
-    return;
-  }
-  await deps.refreshRemoteBrowserPane?.(state);
-}
-
-async function navigateBrowserContent(
-  state: BrowserPaneModel,
-  deps: BrowserPaneMountDeps,
-  direction: 'parent' | 'into',
-): Promise<boolean> {
-  if (!state.remote) {
-    if (direction === 'parent') {
-      const parent = dirname(state.cwd);
-      if (parent === state.cwd) return false;
-      state.cwd = parent;
-    } else {
-      const entry = focusedBrowserEntry(state);
-      if (!entry || !entry.isDir || entry.name === '..') return false;
-      state.cwd = entry.absPath;
-    }
-    state.cursor = 0;
-    state.offset = 0;
-    state.selected.clear();
-    refreshBrowserPane(state);
-    return true;
-  }
-
-  const nextCwd = direction === 'parent'
-    ? dirname(state.remote.cwd)
-    : (() => {
-        const entry = focusedBrowserEntry(state);
-        if (!entry || !entry.isDir || entry.name === '..') return null;
-        return entry.absPath;
-      })();
-  if (!nextCwd || nextCwd === state.remote.cwd) return false;
-  state.remote = { host: state.remote.host, cwd: nextCwd };
-  state.cwd = nextCwd;
-  state.cursor = 0;
-  state.offset = 0;
-  state.selected.clear();
-  await refreshBrowserContentState(state, deps);
-  return true;
 }
 
 export function createBrowserPaneModalChrome(
@@ -367,121 +239,4 @@ export function openBrowserPaneModal(
   };
   handle = showPaneMultiModal(params);
   return handle;
-}
-
-export function createBrowserPaneContent(
-  spec: BrowserPaneContentSpec,
-  deps: BrowserPaneMountDeps,
-): PaneContent {
-  const state = deps.browserPaneRegistry.get(spec.browserId);
-  if (!state) {
-    throw new Error(`createBrowserPaneContent: unknown browser id "${spec.browserId}"`);
-  }
-  const obs = createObserver();
-  let lastRows = 12;
-
-  return {
-    id: mintPaneId(),
-    kind: spec.kind,
-    title: spec.title ?? 'browser',
-    focusPolicy: 'interactive',
-    start() {},
-    stop() {},
-    render(ctx) {
-      lastRows = Math.max(1, ctx.rows);
-      clampBrowserOffset(state, ctx.rows);
-      const bodyRows = Math.max(1, ctx.rows);
-      const lines: string[] = [];
-      for (let i = 0; i < bodyRows; i++) {
-        const entry = state.entries[state.offset + i];
-        if (!entry) {
-          lines.push(' '.repeat(Math.max(0, ctx.cols)));
-          continue;
-        }
-        lines.push(formatBrowserLine(state, entry, state.offset + i === state.cursor, ctx.cols));
-      }
-      return lines.join('\n');
-    },
-    onKey(ev) {
-      const rows = lastRows;
-      if (ev.name === 'up' || ev.name === 'k') {
-        state.cursor = Math.max(0, state.cursor - 1);
-        clampBrowserOffset(state, rows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'down' || ev.name === 'j') {
-        state.cursor = Math.min(Math.max(0, state.entries.length - 1), state.cursor + 1);
-        clampBrowserOffset(state, rows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'pageup') {
-        state.cursor = Math.max(0, state.cursor - rows);
-        clampBrowserOffset(state, rows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'pagedown') {
-        state.cursor = Math.min(Math.max(0, state.entries.length - 1), state.cursor + rows);
-        clampBrowserOffset(state, rows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'home' || ev.name === 'g') {
-        state.cursor = 0;
-        state.offset = 0;
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'end' || (ev.name === 'G' && ev.shift)) {
-        state.cursor = Math.max(0, state.entries.length - 1);
-        clampBrowserOffset(state, rows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === ' ') {
-        toggleBrowserSelection(state);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'left' || ev.name === 'h') {
-        void navigateBrowserContent(state, deps, 'parent').then(() => obs.emit());
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'right' || ev.name === 'l' || ev.name === 'enter') {
-        const entry = focusedBrowserEntry(state);
-        if (!entry?.isDir) return { type: 'none' };
-        void navigateBrowserContent(state, deps, 'into').then(() => obs.emit());
-        return { type: 'refresh' };
-      }
-      return { type: 'none' };
-    },
-    onMouse(ev: DisplayMouseEvent): Action {
-      const delta = Math.max(1, Math.floor(lastRows / 3));
-      if (ev.type === 'scroll-up') {
-        state.cursor = Math.max(0, state.cursor - delta);
-        clampBrowserOffset(state, lastRows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.type === 'scroll-down') {
-        state.cursor = Math.min(Math.max(0, state.entries.length - 1), state.cursor + delta);
-        clampBrowserOffset(state, lastRows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      return { type: 'none' };
-    },
-    write(_bytes: string) {},
-    acceptBroadcast(_input: PaneBroadcast) {},
-    capture() {
-      return state.entries.map((entry, index) =>
-        formatBrowserLine(state, entry, index === state.cursor, 120),
-      ).join('\n');
-    },
-    get isAlive() { return true; },
-    on: obs.on,
-    dispose() {},
-  };
 }

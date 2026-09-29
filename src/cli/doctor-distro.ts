@@ -58,6 +58,10 @@ export interface DistroRemedies {
   node?: string;
   /** node 가 준비된 뒤 codex CLI 설치 한 줄. */
   codex?: string;
+  /** jq 설치 한 줄(없는 계열에는 추측하지 않는다). */
+  jq?: string;
+  /** ffmpeg 설치 한 줄(기본 저장소에 없는 계열에는 두지 않는다). */
+  ffmpeg?: string;
   /** 계열별 주의 한 줄(없으면 생략). */
   note?: string;
 }
@@ -68,6 +72,8 @@ export const DISTRO_REMEDIES: Readonly<Record<Exclude<DistroFamily, 'unknown'>, 
     buildToolchain: 'xcode-select --install',
     pythonBuildDeps: 'brew install openssl readline sqlite3 xz zlib tcl-tk',
     gh: 'brew install gh',
+    jq: 'brew install jq',
+    ffmpeg: 'brew install ffmpeg',
     rg: 'brew install ripgrep',
     node: 'brew install node',
     codex: 'npm install -g @openai/codex',
@@ -77,8 +83,10 @@ export const DISTRO_REMEDIES: Readonly<Record<Exclude<DistroFamily, 'unknown'>, 
     pythonBuildDeps: 'sudo apt-get install -y build-essential libssl-dev zlib1g-dev libbz2-dev libreadline-dev libsqlite3-dev curl git libncurses-dev xz-utils tk-dev libffi-dev liblzma-dev',
     // 🩸 09-24 빈 GCP Ubuntu 24.04 실측: 목록 갱신 없이 `apt-get install -y gh` → «Unable to locate package gh».
     gh: 'sudo apt-get update && sudo apt-get install -y gh',
+    jq: 'sudo apt-get update && sudo apt-get install -y jq',
+    ffmpeg: 'sudo apt-get update && sudo apt-get install -y ffmpeg',
     rg: 'sudo apt-get update && sudo apt-get install -y ripgrep',
-    node: 'sudo apt-get update && sudo apt-get install -y nodejs npm',
+    node: 'Install Node.js 20+ using the official distribution instructions at https://nodejs.org/en/download',
     codex: 'sudo npm install -g @openai/codex',
     pythonVenv: 'sudo apt-get install -y python3-venv',
     pythonBase: 'sudo apt-get update && sudo apt-get install -y python3 python3-venv',
@@ -89,6 +97,7 @@ export const DISTRO_REMEDIES: Readonly<Record<Exclude<DistroFamily, 'unknown'>, 
     pythonBuildDeps: 'sudo dnf install -y gcc make patch zlib-devel bzip2 bzip2-devel readline-devel sqlite sqlite-devel openssl-devel tk-devel libffi-devel xz-devel',
     // 🩸 2026-09-25 fedora:latest 컨테이너: dnf5 는 `config-manager --add-repo` 를 모른다. gh 는 Fedora 공식 저장소에 있다.
     gh: 'sudo dnf install -y gh',
+    jq: 'sudo dnf install -y jq',
     rg: 'sudo dnf install -y ripgrep',
     node: 'sudo dnf install -y nodejs npm',
     codex: 'sudo npm install -g @openai/codex',
@@ -99,6 +108,7 @@ export const DISTRO_REMEDIES: Readonly<Record<Exclude<DistroFamily, 'unknown'>, 
     buildToolchain: 'sudo dnf install -y gcc-c++ make',
     pythonBuildDeps: 'sudo dnf install -y gcc make patch zlib-devel bzip2 bzip2-devel readline-devel sqlite sqlite-devel openssl-devel tk-devel libffi-devel xz-devel',
     gh: "sudo dnf install -y 'dnf-command(config-manager)' && sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo && sudo dnf install -y gh",
+    jq: 'sudo dnf install -y jq',
     node: 'sudo dnf install -y nodejs npm',
     codex: 'sudo npm install -g @openai/codex',
     note: 'ripgrep is not in the AL2023 base repos — install it manually; the system python3 is 3.9 (older than the declared 3.12)',
@@ -108,6 +118,7 @@ export const DISTRO_REMEDIES: Readonly<Record<Exclude<DistroFamily, 'unknown'>, 
     pythonBuildDeps: 'sudo yum install -y gcc make patch zlib-devel bzip2 bzip2-devel readline-devel sqlite sqlite-devel openssl11-devel tk-devel libffi-devel xz-devel',
     // 🩸 2026-09-25 amazonlinux:2 컨테이너: yum-config-manager 는 yum-utils 에 있고 기본 이미지엔 없다.
     gh: 'sudo yum install -y yum-utils && sudo yum-config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo && sudo yum install -y gh',
+    jq: 'sudo yum install -y jq',
     // ⛔ rg·node 줄을 두지 않는다(🅢 수확 2026-09-24): AL2 기본 저장소에 ripgrep·nodejs 가 없고, 제3자 저장소(COPR 등)를
     //    `--sudo` 가 자동으로 붙이는 것은 위험하며 aarch64 에서는 실행도 안 된다(리뷰 must-fix). 이름만 대고 사람이 고른다.
     codex: 'sudo npm install -g @openai/codex',
@@ -118,4 +129,9 @@ export const DISTRO_REMEDIES: Readonly<Record<Exclude<DistroFamily, 'unknown'>, 
 /** 계열의 처방 — 모르는 계열은 undefined(명령을 추측하지 않는다). */
 export function remediesFor(family: DistroFamily): DistroRemedies | undefined {
   return family === 'unknown' ? undefined : DISTRO_REMEDIES[family];
+}
+
+/** 표에 명시된 도구 설치 줄만 돌려준다 — 모르는 계열·빈 칸은 undefined. */
+export function toolInstallLine(tool: 'gh' | 'rg' | 'node' | 'codex' | 'jq' | 'ffmpeg', family: DistroFamily): string | undefined {
+  return remediesFor(family)?.[tool];
 }

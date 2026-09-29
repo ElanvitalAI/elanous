@@ -1,6 +1,6 @@
 // Picker family a11y integration — Pick A PR-S2.
 //
-// Each picker host (session / window / ssh / transfer / finder) now
+// Each picker host (session / ssh / transfer / finder) now
 // exports a pure `buildXxxPickerSpec(...)` helper that wraps the
 // existing SearchItem build logic with `searchItemsToPickerSpec`.
 // Tests exercise:
@@ -12,12 +12,11 @@
 //
 // The pickers' own UX (createSearchModal wiring, query filter, accept)
 // stays out of scope here — those are covered in their dedicated tests
-// (session-picker-modal.test.ts, window-picker-modal.test.ts, etc.).
+// (session-picker-modal.test.ts, etc.).
 
 import { describe, expect, test, beforeEach } from 'bun:test';
 
 import { buildSessionPickerSpec } from '../src/session/picker-modal.js';
-import { buildWindowPickerSpec } from '../src/window-picker-modal.js';
 import { buildSshPickerSpec } from '../src/ssh/ssh-picker-modal.js';
 import { buildTransferPickerSpec } from '../src/transfer/transfer-picker-modal.js';
 import { buildFinderPickerSpec } from '../src/finder/finder-modal.js';
@@ -26,8 +25,6 @@ import {
   type PickerSpec,
 } from '../src/expression/index.js';
 import type { TerminalSession, TerminalSessionRegistry } from '../src/terminal/session-registry.js';
-import type { WindowRegistry } from '../src/virtual-windows/window-registry.js';
-import type { VirtualWindow } from '../src/virtual-windows/virtual-window.js';
 import {
   _resetSshHostsForTesting,
   setSshHostsPathForTesting,
@@ -110,50 +107,7 @@ describe('buildSessionPickerSpec (PR-S2)', () => {
   });
 });
 
-// ── 2. window-picker ─────────────────────────────────────────────────
-
-describe('buildWindowPickerSpec (PR-S2)', () => {
-  function fakeWindow(id: number, title: string, paneCount = 1): VirtualWindow {
-    return {
-      id,
-      title,
-      listPanes: () => Array(paneCount).fill({}),
-    } as unknown as VirtualWindow;
-  }
-
-  function fakeRegistry(wins: VirtualWindow[], current: VirtualWindow | null): WindowRegistry {
-    return {
-      list: () => wins,
-      current: () => current,
-    } as unknown as WindowRegistry;
-  }
-
-  test('empty registry → empty spec', () => {
-    const spec = buildWindowPickerSpec(fakeRegistry([], null));
-    expectCleanSpec(spec, 'Virtual windows');
-    expect(spec.items).toEqual([]);
-  });
-
-  test('foreground vs background described in plain text', () => {
-    const w1 = fakeWindow(1, 'alpha', 2);
-    const w2 = fakeWindow(2, 'beta', 1);
-    const spec = buildWindowPickerSpec(fakeRegistry([w1, w2], w2));
-    const a = spec.items.find((i) => i.id === '1')!;
-    const b = spec.items.find((i) => i.id === '2')!;
-    expect(a.description).toContain('background');
-    expect(a.description).toContain('2 panes');
-    expect(b.description).toContain('foreground');
-    expect(b.description).toContain('1 pane');
-  });
-
-  test('payload uses string id (matches elanous SearchItem pattern)', () => {
-    const w = fakeWindow(42, 'forty-two');
-    const spec = buildWindowPickerSpec(fakeRegistry([w], w));
-    expect(spec.items[0]!.id).toBe('42');
-  });
-});
-
-// ── 3. ssh-picker ────────────────────────────────────────────────────
+// ── 2. ssh-picker ────────────────────────────────────────────────────
 
 describe('buildSshPickerSpec (PR-S2)', () => {
   beforeEach(() => {
@@ -196,7 +150,7 @@ describe('buildSshPickerSpec (PR-S2)', () => {
   });
 });
 
-// ── 4. transfer-picker ───────────────────────────────────────────────
+// ── 3. transfer-picker ───────────────────────────────────────────────
 
 describe('buildTransferPickerSpec (PR-S2)', () => {
   const sshTarget: TransferTarget = {
@@ -243,7 +197,7 @@ describe('buildTransferPickerSpec (PR-S2)', () => {
   });
 });
 
-// ── 5. finder-picker ─────────────────────────────────────────────────
+// ── 4. finder-picker ─────────────────────────────────────────────────
 
 describe('buildFinderPickerSpec (PR-S2)', () => {
   const sample: FinderItem[] = [
@@ -294,10 +248,9 @@ describe('buildFinderPickerSpec (PR-S2)', () => {
 // ── Cross-host invariants ────────────────────────────────────────────
 
 describe('PR-S2 cross-host invariants', () => {
-  test('all 5 specs share kind="picker"', () => {
+  test('all 4 specs share kind="picker"', () => {
     const specs: PickerSpec[] = [
       buildSessionPickerSpec({ list: () => [] } as unknown as TerminalSessionRegistry),
-      buildWindowPickerSpec({ list: () => [], current: () => null } as unknown as WindowRegistry),
       buildSshPickerSpec(null, 0),
       buildTransferPickerSpec([]),
       buildFinderPickerSpec([]),

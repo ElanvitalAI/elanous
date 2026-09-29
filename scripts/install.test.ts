@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, symlinkSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
@@ -146,6 +146,14 @@ describe('scripts/install.sh', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(readFileSync(join(home, '.bashrc'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
     expect(readFileSync(join(home, '.profile'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
+  }, 120_000);
+
+  // 🩸 2026-09-28 node-b: zsh 도 ~/.zshrc 는 대화형만 읽는다 ⇒ `ssh host elanous`(비대화형)가 못 찾았다.
+  test('a zsh user without an override gets the PATH block in ~/.zshenv too (non-interactive ssh)', () => {
+    const { home, result } = run([], setup(), process.env.PATH ?? '', repoRoot, { ELANOUS_SHELL_STARTUP: '', SHELL: '/bin/zsh' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(join(home, '.zshrc'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
+    expect(readFileSync(join(home, '.zshenv'), 'utf8')).toContain('# >>> elanous installer PATH >>>');
   }, 120_000);
 
   test('the installed sh wrapper uses the resolved bun without PATH and follows current for version and installed universe', () => {
@@ -448,6 +456,61 @@ describe('scripts/install.sh', () => {
     expect(again.result.status, again.result.stderr).toBe(0);
     expect(again.result.stdout.slice(again.result.stdout.indexOf('Next:'))).not.toContain('elanous login');
   }, 180_000);
+
+  test('Next suggests build tools then node-pty rebuild and ripgrep only when missing on Debian PATH', () => {
+    const packed = pack(fixture());
+    const env = setup();
+    const pathDir = join(env.dir, 'path');
+    mkdirSync(pathDir);
+    const release = join(env.dir, 'os-release');
+    writeFileSync(release, 'ID=debian\nVERSION_ID="12"\n');
+    for (const name of ['git', 'bun', 'make', 'c++', 'rg']) {
+      const real = spawnSync('/bin/bash', ['-c', `command -v ${name}`], { encoding: 'utf8' }).stdout.trim();
+      if (real) writeFileSync(join(pathDir, name), `#!/bin/sh\nexec ${real} "$@"\n`, { mode: 0o755 });
+    }
+    const extra = { ELANOUS_INSTALL_OS_RELEASE_FILE: release };
+    const install = (path: string) => run(['--source', packed, '--no-modify-path'], env, path, repoRoot, extra);
+    // Keep system utilities but hide only the three commands under test.
+    const missingDir = join(env.dir, 'missing');
+    mkdirSync(missingDir);
+    for (const name of ['git', 'bun']) copyFileSync(join(pathDir, name), join(missingDir, name));
+    // The Debian branch is chosen by `uname -s`; report Linux so this also runs on a Mac.
+    writeFileSync(join(missingDir, 'uname'), '#!/bin/sh\nif [ "$1" = "-s" ]; then echo Linux; else exec /usr/bin/uname "$@"; fi\n', { mode: 0o755 });
+    const hidden = join(env.dir, 'hidden');
+    mkdirSync(hidden);
+    const systemPath = process.env.PATH ?? '';
+    for (const dir of systemPath.split(':')) {
+      if (!dir || !existsSync(dir)) continue;
+      for (const name of readdirSync(dir)) {
+        if (['make', 'c++', 'rg'].includes(name)) continue;
+        // The first directory on PATH wins; a dangling link already made for an earlier directory reads as absent to existsSync.
+        try { symlinkSync(join(dir, name), join(hidden, name)); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+      }
+    }
+    const missing = install(`${missingDir}:${hidden}`);
+    expect(missing.result.status, missing.result.stderr).toBe(0);
+    const next = missing.result.stdout.slice(missing.result.stdout.indexOf('Next:'));
+    expect(next).toContain('sudo apt-get install -y build-essential');
+    expect(next).toContain('elanous doctor --fix --yes');
+    expect(next.indexOf('build-essential')).toBeLessThan(next.indexOf('doctor --fix --yes'));
+    expect(next).toContain('sudo apt-get install -y ripgrep');
+    for (const name of ['make', 'c++', 'rg']) writeFileSync(join(missingDir, name), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const present = install(`${missingDir}:${hidden}`);
+    expect(present.result.status, present.result.stderr).toBe(0);
+    const already = present.result.stdout.slice(present.result.stdout.indexOf('Next:'));
+    expect(already).not.toContain('build-essential');
+    expect(already).not.toContain('doctor --fix --yes');
+    expect(already).not.toContain('install -y ripgrep');
+  }, 240_000);
+
+  test('nexus boot banner has no internal phase or PR markers and keeps exit and service help', () => {
+    const source = readFileSync(join(repoRoot, 'src/nexus/index.ts'), 'utf8');
+    const banner = source.slice(source.indexOf('function printBootBanner('), source.indexOf('const NEXUS_STATUS_HEALTH_TIMEOUT_MS'));
+    expect(banner).toContain('Ctrl-C to release lock and exit.');
+    expect(banner).toContain('elanous nexus install --launchd');
+    expect(banner).toContain('--systemd-user');
+    expect(banner).not.toMatch(/Phase N-|PR χ|PR ψ|runtime\.phase/);
+  });
 
   test('non-Darwin skips the spawn-helper step', () => {
     const source = readFileSync(installer, 'utf8');

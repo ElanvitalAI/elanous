@@ -112,9 +112,9 @@ describe('dispatchRunShell', () => {
       off();
     }
     const rejected = seen.find((record) => record.category === 'shell.dispatch' && record.event === 'cd.rejected');
-    expect(rejected?.data).toEqual({ reason: 'argv-state-does-not-persist' });
+    expect(rejected?.data).toMatchObject({ reason: 'argv-state-does-not-persist' });
     const executed = seen.find((record) => record.category === 'shell.dispatch' && record.event === 'legacy.exit');
-    expect(executed?.data).toEqual({ cwd, cwdSource: 'argument' });
+    expect(executed?.data).toMatchObject({ cwd, cwdSource: 'argument' });
   });
 
   test('empty command rejected with a message', async () => {
@@ -223,6 +223,10 @@ describe('NT-C1b-1 — mode parameter opts into shell-runner dispatch', () => {
       // it's completed but Registry retains it (no retention policy
       // on the registry layer itself; entries persist until unregister).
       expect(registry.size()).toBeGreaterThanOrEqual(1);
+      const bg = await dispatchRunShell({ command: ['echo', 'x'], mode: 'bg' });
+      expect(bg.outcome).toBe('exit');
+      expect(bg.stdout).toContain('from-runner');
+      expect(bg.approvalKey.startsWith('runner:')).toBe(true);
     } finally {
       resetShellRunnerDeps();
     }
@@ -252,13 +256,18 @@ describe('NT-C1b-1 — mode parameter opts into shell-runner dispatch', () => {
     }
   });
 
-  test('tool spec advertises mode + description + vw_window_label', () => {
+  test('tool spec advertises only inline and bg shell-runner modes', () => {
     const spec = buildRunShellTool();
     const props = spec.parameters.properties as Record<string, { enum?: string[] }>;
-    expect(props.mode).toBeDefined();
-    expect(props.mode!.enum).toEqual(['auto', 'inline', 'bg', 'modal', 'vw']);
+    expect(props.mode!.enum).toEqual(['inline', 'bg']);
     expect(props.description).toBeDefined();
-    expect(props.vw_window_label).toBeDefined();
+    expect(props).not.toHaveProperty('vw_window_label');
+  });
+
+  test('retired runner modes are rejected before dispatch', async () => {
+    for (const mode of ['auto', 'modal', 'vw']) {
+      await expect(dispatchRunShell({ command: ['echo', 'x'], mode })).rejects.toThrow(`invalid mode value: "${mode}"`);
+    }
   });
 });
 

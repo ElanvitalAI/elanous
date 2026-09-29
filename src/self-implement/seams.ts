@@ -25,7 +25,7 @@ import { promisify } from 'node:util';
 import { forkSessionById, HARNESS_SESSION_ORIGIN, isHarnessSessionOrigin } from '../session/index.js';
 import { configuredWorktreeRoot, getUserConfig, resolveRoleLlm } from '../user-config.js';
 import { getProviderForConfig } from '../llm.js';
-import { createWorktree, DEFAULT_BRANCH_WORKTREE_BASE, removeWorktree, resolveDefaultBranchBase, resolveMainRepoRoot } from '../git-fs/worktree.js';
+import { createWorktree, DEFAULT_BRANCH_WORKTREE_BASE, linkWorktreeDependencies, removeWorktree, resolveDefaultBranchBase, resolveMainRepoRoot } from '../git-fs/worktree.js';
 import { isWorktreeInUse, listActiveTerminalDirectories } from '../harness/harness-clean.js';
 import { readWorktreePorcelain } from './abandoned-classification.js';
 import { recordHarnessWorktreeGoalMetadata, recordHarnessWorktreeProvenance, type HarnessWorktreeGoalMetadata } from '../harness/harness-worktree-add.js';
@@ -35,6 +35,7 @@ import { DEFAULT_GATE_STEPS, runIntegrityGate, type GateResult, type GateStepNam
 import { androidFilesIn, runAndroidUnitTestGate } from '../../scripts/ci-android-unit-tests.js';
 import { iosFilesIn, runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
 import { detectGateCommand } from './detect-gate.js';
+import { writeScopedTypecheckConfig } from './scoped-typecheck-config.js';
 // ⭐ 게이트 스코프 근본 수리(2026-07-26) — 풀 `bun test` 폴백 제거 + 연관 테스트 유도(순수).
 import { resolveGateScope } from './gate-scope.js';
 import { buildImporterTestIndex, isTestPath } from './importer-test-index.js';
@@ -53,6 +54,9 @@ import {
   formatVerifyByBreakingScopeSkipNote,
   type BaselineProcessResult, gateBaselineLogLevel, formatGateBaselineNote } from './gate-baseline.js';
 import { runConfigSyntaxGate } from './config-gate.js';
+import { runHarnessPolicyGates } from './harness-policy-gates.js';
+import { runDependencyChangeGate } from './dependency-change-gate.js';
+import { pwaReachableSrcFiles } from './pwa-import-graph.js';
 import { stageNonGitDir, stageFile, applyShadowToTarget, applyFileToTarget } from './shadow-stage.js';
 import type { TargetKind } from './target-kind.js';
 import { basename } from 'node:path';
@@ -67,10 +71,12 @@ import { fetchAppliedReviewItemsForBranch } from '../agent-mission/review-loop.j
 import { GoalRunStore, type GoalPriorRuns } from './goal-run-store.js';
 import { CLEAN_BUILD_ANCHOR } from './build-discipline.js';
 import { addedExportedFunctionParameters, removedExportedSymbols, requiredExportFieldsAdded } from '../../scripts/ci-typecheck-changed.js';
-import { tscEnv, assessTypecheckExecution, classifyTypecheckErrors, readTestTypecheckBaseline, resolveTypecheckConfig, type MissingTypecheckGateConfig, type ResolvedTypecheckConfig, type TypecheckExecutionResult, type TypecheckNoInspectionReason } from '../typecheck-ratchet.js';
+import { tscEnv, assessTypecheckExecution, classifyTypecheckErrors, diffTypecheckDiagnostics, promotedConsumersFromDiff, readTestTypecheckBaseline, resolveTypecheckConfig, type MissingTypecheckGateConfig, type ResolvedTypecheckConfig, type TypecheckError, type TypecheckExecutionResult, type TypecheckNoInspectionReason } from '../typecheck-ratchet.js';
 import { nestCapReached, childNestEnv, nestInfo } from '../agent/nest-depth.js';
 import { harnessBoundaryEnv, harnessBoundaryRequestsEnv, harnessBoundaryResponsesEnv, harnessSpaceEnv, getHarnessSpace, normalizeSpaceId, getHarnessRunId, resolveRunIdentity } from '../harness/harness-space.js';
 import { debug } from '../debug/log.js';
+import { emitDecision } from '../live/detail-switch.js';
+import { gateDecision, reviewDecision, mergeDecision } from './decision-events.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { instanceNameForStateDir } from '../instance-identity.js';
 import { queryStructuredChildProviderErrors } from './orchestrator.js';
@@ -536,6 +542,44 @@ export function gitChangedFiles(cwd: string): string[] {
 }
 
 type ChangedFileTypecheckRunner = (cmd: string, args: string[]) => TypecheckExecutionResult;
+type BaseDiagnostics = (cwd: string, config: string, files?: readonly string[]) => TypecheckError[] | null;
+
+/** Run the same project against the fork point in an isolated, dependency-linked worktree. */
+export function mergeBaseDiagnostics(cwd: string, config: string, files: readonly string[] = []): TypecheckError[] | null {
+  const base = defaultBranchRef(cwd);
+  if (!base) return null;
+  const fork = git(cwd, ['merge-base', 'HEAD', base]);
+  const ref = fork.ok ? fork.stdout.trim() : '';
+  if (!/^[0-9a-f]{7,64}$/.test(ref)) return null;
+  let dir = '';
+  let attached = false;
+  let scopedConfig: ReturnType<typeof writeScopedTypecheckConfig> = null;
+  try {
+    dir = mkdtempSync(join(tmpdir(), 'elanous-typecheck-base-'));
+    const added = runGitCommand(cwd, ['worktree', 'add', '--detach', dir, ref], { encoding: 'utf8', timeout: 60_000 });
+    if (added.status !== 0) return null;
+    attached = true;
+    linkWorktreeDependencies(cwd, dir);
+    if (!existsSync(join(dir, config))) return null;
+    scopedConfig = writeScopedTypecheckConfig(dir, config, files);
+    debug.log('typecheck.gate', 'base-diagnostics', { config, scopedConfigUsed: scopedConfig !== null });
+    const startedAt = Date.now();
+    const result = spawnSync('bunx', ['tsc', '--noEmit', '-p', scopedConfig?.config ?? config], {
+      cwd: dir, encoding: 'utf8', timeout: 180_000, maxBuffer: 32 * 1024 * 1024, env: tscEnv(),
+    });
+    const assessment = assessTypecheckExecution({
+      out: `${result.stdout ?? ''}${result.stderr ?? ''}`, status: result.status,
+      signal: result.signal, error: result.error, durationMs: Date.now() - startedAt,
+    });
+    return assessment.executed ? assessment.diagnostics : null;
+  } catch {
+    return null;
+  } finally {
+    scopedConfig?.cleanup();
+    if (attached) runGitCommand(cwd, ['worktree', 'remove', '--force', dir], { encoding: 'utf8', timeout: 60_000 });
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 /** ★ #2 변경파일 스코프 tsc 게이트(2026-07-21) — 스코프 bun test 가 놓칠 수 있는 tsc-깨짐(F1: 변경 소스에
  *  대응 테스트가 안 바뀌면 그 파일이 컴파일 안 됨·"0 tests" 거짓 green)을 결정론 차단한다. `bunx tsc --noEmit`
@@ -549,6 +593,7 @@ export function changedFileTypecheck(
     return { out: `${r.stdout ?? ''}${r.stderr ?? ''}`, status: r.status, signal: r.signal, error: r.error, durationMs: Date.now() - startedAt };
   }),
   gateConfig: ResolvedTypecheckConfig | MissingTypecheckGateConfig | null = resolveTypecheckConfig(cwd),
+  baseDiagnostics: BaseDiagnostics = mergeBaseDiagnostics,
 ): { passed: boolean; executed: boolean; checked: number; errors: number; exempted: number; noInspectionReason: TypecheckNoInspectionReason | null; log: string } {
   const norm = (f: string): string => f.replace(/^\.\//, '').trim();
   const changed = new Set(changedTsFiles.map(norm).filter((f) => /\.[cm]?tsx?$/.test(f) && !/\.d\.ts$/.test(f)));
@@ -613,53 +658,111 @@ export function changedFileTypecheck(
     .filter((promotion) => !promotion.file.startsWith('apps/pwa/'));
   const pwaPromotions = [...requiredExportFieldPromotions, ...removedExportedSymbolPromotions, ...addedFunctionParameterPromotions]
     .filter((promotion) => promotion.file.startsWith('apps/pwa/'));
-  const execution = assessTypecheckExecution(run('bunx', ['tsc', '--noEmit', '-p', selectedConfig]));
-  const pwaExecution = pwaChanged.size > 0 || rootPromotions.length > 0
-    ? assessTypecheckExecution(run('bunx', ['tsc', '--noEmit', '-p', 'apps/pwa/tsconfig.json']))
+  const promotionRequested = rootPromotions.length > 0 || pwaPromotions.length > 0;
+  const pwaConfig = 'apps/pwa/tsconfig.json';
+  const pwaEnvConfig = 'tsconfig.pwa-env.json';
+  const isPwaEnvTest = (file: string) => isTestPath(file) || /(^|\/)(test|tests|__tests__|spec|__specs__)(\/|$)/.test(file);
+  const nonTestRootChanged = new Set([...rootChanged].filter((file) => !isPwaEnvTest(file)));
+  const pwaEnvAvailable = existsSync(join(cwd, pwaEnvConfig));
+  const scopedConfigs: Array<NonNullable<ReturnType<typeof writeScopedTypecheckConfig>>> = [];
+  const scopedUsed = new Map<string, boolean>();
+  const scopedFor = (config: string, files: readonly string[]): string => {
+    const scoped = writeScopedTypecheckConfig(cwd, config, files);
+    if (scoped) scopedConfigs.push(scoped);
+    scopedUsed.set(config, scoped !== null);
+    return scoped?.config ?? config;
+  };
+  try {
+  // A promotion needs a project-wide discovery pass: reverse consumers are not reachable
+  // through the changed file's forward imports. Only the final attribution pass is scoped.
+  let execution = assessTypecheckExecution(run('bunx', ['tsc', '--noEmit', '-p', promotionRequested ? selectedConfig : scopedFor(selectedConfig, [...rootChanged])]));
+  const pwaRequested = pwaChanged.size > 0 || rootPromotions.length > 0;
+  const pwaAvailable = existsSync(join(cwd, pwaConfig));
+  // PWA 의존성이 없는 트리(Pod 작업 트리 등)에서 PWA tsc 를 돌리면 모듈 해석이 무너져 수천 건이 «변경 파일 에러»로 보인다
+  // (2026-09-27 실측: 의존성 없음 8,474 ↔ 있음 46). 이 저장소의 PWA 의존성은 apps/pwa/node_modules 에 있다 — 루트로 끌어올려진
+  // 경우(next 가 루트에 있음)도 «있음»으로 본다. 없으면 PWA 검사는 호스트 재게이트 몫이다.
+  const pwaDependenciesPresent = existsSync(join(cwd, 'apps/pwa/node_modules')) || existsSync(join(cwd, 'node_modules', 'next'));
+  // 건너뛰기는 «PWA 파일은 안 바뀌었는데 루트 export 변경으로 PWA 검사가 불려 온» 경우에만 — 그 경우가 사고였다.
+  //   PWA 파일을 직접 고친 경우는 컴파일러를 그대로 돌린다(PWA 골은 --merge-by-host 로 호스트가 재게이트한다).
+  const pwaSkippedDepsMissing = pwaRequested && pwaChanged.size === 0 && pwaAvailable && !pwaDependenciesPresent;
+  let pwaExecution = pwaRequested && pwaAvailable && !pwaSkippedDepsMissing
+    ? assessTypecheckExecution(run('bunx', ['tsc', '--noEmit', '-p', promotionRequested ? pwaConfig : scopedFor(pwaConfig, [...pwaChanged])]))
     : undefined;
-  if (rootPromotions.length > 0) {
-    for (const diagnostic of execution.diagnostics) {
-      if (!changed.has(diagnostic.file) && !diagnostic.file.startsWith('apps/pwa/')) promotedRootConsumers.add(diagnostic.file);
+  const baseFor = (config: string, files: readonly string[]): TypecheckError[] | null => {
+    try { return baseDiagnostics(cwd, config, files); }
+    catch { return null; }
+  };
+  let baseUnavailable = false;
+  if (promotionRequested) {
+    // base 진단은 임시 트리에서 tsc 를 한 번 더 도는 비싼 일이다 — 소비자 후보(바뀌지 않은 파일의 진단)가 있을 때만 잰다.
+    const rootCandidates = execution.executed && execution.diagnostics.some((error) => !changed.has(error.file) && !error.file.startsWith('apps/pwa/'));
+    const pwaCandidates = pwaExecution?.executed === true && pwaExecution.diagnostics.some((error) => !changed.has(error.file) && error.file.startsWith('apps/pwa/'));
+    const rootCandidateFiles = execution.executed ? execution.diagnostics.filter((error) => !changed.has(error.file) && !error.file.startsWith('apps/pwa/')).map((error) => error.file) : [];
+    const pwaCandidateFiles = pwaExecution?.executed ? pwaExecution.diagnostics.filter((error) => !changed.has(error.file) && error.file.startsWith('apps/pwa/')).map((error) => error.file) : [];
+    const rootBase = rootPromotions.length > 0 && rootCandidates ? baseFor(selectedConfig, [...rootChanged, ...rootCandidateFiles]) : [];
+    const pwaBase = pwaCandidates ? baseFor(pwaConfig, [...pwaChanged, ...pwaCandidateFiles]) : [];
+    baseUnavailable = (rootBase === null && execution.executed && execution.diagnostics.some((error) =>
+      !changed.has(error.file) && !error.file.startsWith('apps/pwa/')))
+      || (pwaBase === null && pwaExecution?.executed === true && pwaExecution.diagnostics.some((error) =>
+        !changed.has(error.file) && error.file.startsWith('apps/pwa/')));
+    if (rootPromotions.length > 0 && rootBase !== null && execution.executed) {
+      for (const file of promotedConsumersFromDiff(diffTypecheckDiagnostics(execution.diagnostics, rootBase), changed, (file) => !file.startsWith('apps/pwa/'))) promotedRootConsumers.add(file);
     }
-    if (pwaExecution) {
-      for (const diagnostic of pwaExecution.diagnostics) {
-        if (!changed.has(diagnostic.file) && diagnostic.file.startsWith('apps/pwa/')) promotedPwaConsumers.add(diagnostic.file);
-      }
-    }
-  }
-  if (pwaPromotions.length > 0 && pwaExecution) {
-    for (const diagnostic of pwaExecution.diagnostics) {
-      if (!changed.has(diagnostic.file) && diagnostic.file.startsWith('apps/pwa/')) promotedPwaConsumers.add(diagnostic.file);
+    if (pwaExecution && pwaBase !== null && pwaExecution.executed) {
+      for (const file of promotedConsumersFromDiff(diffTypecheckDiagnostics(pwaExecution.diagnostics, pwaBase), changed, (file) => file.startsWith('apps/pwa/'))) promotedPwaConsumers.add(file);
     }
   }
   const rootScope = new Set([...rootChanged, ...promotedRootConsumers]);
   const pwaScope = new Set([...pwaChanged, ...promotedPwaConsumers]);
+  const pwaEnvScope = new Set([...nonTestRootChanged, ...[...promotedRootConsumers].filter((file) => !isPwaEnvTest(file))]);
+  if (promotionRequested) {
+    if (execution.executed) execution = assessTypecheckExecution(run('bunx', ['tsc', '--noEmit', '-p', scopedFor(selectedConfig, [...rootScope])]));
+    if (pwaExecution?.executed) pwaExecution = assessTypecheckExecution(run('bunx', ['tsc', '--noEmit', '-p', scopedFor(pwaConfig, [...pwaScope])]));
+  }
+  const pwaEnvExecution = nonTestRootChanged.size > 0 && pwaEnvAvailable
+    ? assessTypecheckExecution(run('bunx', ['tsc', '--noEmit', '-p', scopedFor(pwaEnvConfig, [...pwaEnvScope])]))
+    : undefined;
   const baseline = readTestTypecheckBaseline(cwd);
   const result = classifyTypecheckErrors(execution.diagnostics, rootScope, baseline);
   const pwaResult = pwaExecution
     ? classifyTypecheckErrors(pwaExecution.diagnostics, pwaScope, baseline)
     : { failing: [], exempted: [], outsideChanged: [] };
-  const executions = pwaExecution ? [execution, pwaExecution] : [execution];
-  const failing = [...result.failing, ...pwaResult.failing];
-  const exemptedErrors = [...result.exempted, ...pwaResult.exempted];
-  const outsideChanged = [...result.outsideChanged, ...pwaResult.outsideChanged];
-  const passed = executions.every((candidate) => candidate.executed) && failing.length === 0;
+  const pwaEnvResult = pwaEnvExecution
+    ? classifyTypecheckErrors(pwaEnvExecution.diagnostics.filter((diagnostic) => !diagnostic.file.startsWith('apps/pwa/') && !isPwaEnvTest(diagnostic.file)), pwaEnvScope, baseline)
+    : { failing: [], exempted: [], outsideChanged: [] };
+  const executions = [execution, ...(pwaExecution ? [pwaExecution] : []), ...(pwaEnvExecution ? [pwaEnvExecution] : [])];
+  const failing = [...result.failing, ...pwaResult.failing, ...pwaEnvResult.failing.filter((entry) => !result.failing.some((root) => root.line === entry.line))];
+  const exemptedErrors = [...result.exempted, ...pwaResult.exempted, ...pwaEnvResult.exempted];
+  const outsideChanged = [...result.outsideChanged, ...pwaResult.outsideChanged, ...pwaEnvResult.outsideChanged];
+  // base 를 못 얻으면 승격 소비자를 «실패»로 세지 않는다 — 자식이 고칠 수 없는 이유로 런이 막힌다(2026-09-27 8,480건 사고). 경고로만 남긴다.
+  const promotionWarnings = [
+    ...(baseUnavailable ? ['[tsc: 승격 소비자 base 진단 비교 불가 — 바뀌지 않은 파일의 진단은 경고로만 남긴다]'] : []),
+    ...(pwaSkippedDepsMissing ? ['[tsc: PWA 의존성 없음 — PWA 검사는 호스트 재게이트가 잰다]'] : []),
+  ];
+  const passed = executions.every((candidate) => candidate.executed) && (!pwaChanged.size || pwaExecution?.executed === true)
+    && failing.length === 0;
   // ⛔ baseline 전량(수백 항목)을 매 게이트마다 싣지 않는다 — 로그 부피가 크고, `elanous logs` 기본
   //    출력이 페이로드를 200자에서 자르므로 **자기 페이로드가 절단돼** 정작 failing/exempted 를
   //    못 읽게 된다(실측 2026-07-30).
   //    ⚠️ **이 자리는 `scripts/ci-typecheck-changed.ts` 와 같은 판정의 두 번째 호출부**다 —
   //       그쪽만 고치고 여기를 빼먹으면 게이트 경로에 따라 로그가 갈린다.
-  const checkedFiles = new Set([...rootScope, ...pwaScope]);
+  const checkedFiles = new Set([...rootScope, ...pwaScope, ...(pwaEnvExecution ? pwaEnvScope : [])]);
   const touchedBaseline = Object.fromEntries(
     [...checkedFiles].filter((file) => baseline.has(file)).map((file) => [file, baseline.get(file)]),
   );
   debug.log('typecheck.gate', 'ratchet', {
     changedFiles: [...changed],
     executions: [
-      { config: selectedConfig, checkedFiles: [...rootScope], executed: execution.executed },
-      ...(pwaExecution ? [{ config: 'apps/pwa/tsconfig.json', checkedFiles: [...pwaScope], executed: pwaExecution.executed }] : []),
+      { config: selectedConfig, checkedFiles: [...rootScope], executed: execution.executed, scopedConfigUsed: scopedUsed.get(selectedConfig) ?? false },
+      ...(pwaExecution ? [{ config: 'apps/pwa/tsconfig.json', checkedFiles: [...pwaScope], executed: pwaExecution.executed, scopedConfigUsed: scopedUsed.get(pwaConfig) ?? false }] : []),
+      ...(pwaEnvExecution ? [{ config: pwaEnvConfig, checkedFiles: [...pwaEnvScope], executed: pwaEnvExecution.executed, scopedConfigUsed: scopedUsed.get(pwaEnvConfig) ?? false }] : []),
     ],
+    pwaEnv: nonTestRootChanged.size > 0 && !pwaEnvAvailable ? 'config-missing' : null,
     promotionTriggers,
+    baseDiagnosticsUnavailable: baseUnavailable,
+    promotionWarnings,
+    pwaSkippedMissingConfig: pwaRequested && !pwaAvailable,
+    pwaSkipped: pwaSkippedDepsMissing ? 'deps-missing' : null,
     requiredExportFieldPromotions,
     removedExportedSymbolPromotions,
     addedFunctionParameterPromotions,
@@ -669,7 +772,7 @@ export function changedFileTypecheck(
     touchedBaseline,
     baselineFileCount: baseline.size,
     baselineErrorTotal: [...baseline.values()].reduce((sum, count) => sum + count, 0),
-    executed: executions.every((candidate) => candidate.executed),
+    executed: executions.every((candidate) => candidate.executed) && (!pwaChanged.size || pwaExecution?.executed === true),
     status: execution.status,
     signal: execution.signal,
     error: execution.error === undefined ? null : String((execution.error as { message?: string })?.message ?? execution.error),
@@ -680,17 +783,22 @@ export function changedFileTypecheck(
     pwaError: pwaExecution?.error === undefined ? null : String((pwaExecution.error as { message?: string })?.message ?? pwaExecution.error),
     pwaDurationMs: pwaExecution?.durationMs ?? null,
     noInspectionReason: null,
-  }, { level: passed ? 'info' : 'warn' });
+  }, { level: passed && promotionWarnings.length === 0 ? 'info' : 'warn' });
   const exempted = exemptedErrors.length;
-  const executed = executions.every((candidate) => candidate.executed);
+  const executed = executions.every((candidate) => candidate.executed) && (!pwaChanged.size || pwaExecution?.executed === true);
   return {
     passed, executed, checked: checkedFiles.size, errors: failing.length, exempted, noInspectionReason: null,
     log: [
-      ...executions.map((candidate) => candidate.failureLog),
+      ...new Set(executions.map((candidate) => candidate.failureLog).filter(Boolean)),
       exempted > 0 ? `[tsc: 기존 test 타입 부채 ${exempted}건 baseline 면제 — 부채를 고치면 목록 재생성으로 제거하라]` : '',
+      ...promotionWarnings,
+      pwaRequested && !pwaAvailable ? '[tsc: PWA 타입 검사 설정이 없어 PWA 컴파일러를 실행하지 못했다.]' : '',
       executed && failing.length > 0 ? `[tsc: 변경 파일 컴파일 에러 ${failing.length}건 — 참조 심볼/필드 미정의 등, 통과까지 고쳐라]\n${failing.slice(0, 20).map((error) => error.line).join('\n')}` : '',
     ].filter(Boolean).join('\n'),
   };
+  } finally {
+    for (const scoped of scopedConfigs) scoped.cleanup();
+  }
 }
 
 /** 헤드리스 elanous 가 이 feature 를 구현하도록 주입하는 프롬프트. goal-loop 계약 + 검증된 클린-빌드
@@ -734,6 +842,7 @@ export function featurePrompt(feature: string, cwd?: string, reviewerContext?: r
     //   그 타임아웃이 `stage=aborted` 로 런 전체를 버렸다. ⇒ 걸리는 시간을 **안내문에 수로** 적는다.
     //   ⚠️ 바로 위 `bun test` 줄은 같은 실패 모드를 이미 경고하는데 **여기엔 대칭이 없었다.**
     '- 완료 前 타입 검사(중요): `bun bin/elanous.mjs self typecheck` 를 돌려라 — **네가 바꾼 파일의 타입에러만** 보여준다(레포 baseline 노이즈 0·gate 와 동일 로직). **0건이 될 때까지 고쳐라.** 참조한 심볼/필드는 정의·선언까지 완성하라(소비만 하고 미정의 금지). (이 명령이 없는 레포면 프로젝트 타입체크로.) ⛔ **이 명령은 이 레포에서 약 150초 걸린다**(실측 146,518ms · 변경 5파일) — 셸 툴로 부를 때 **`timeoutMs` 를 240000 이상** 주어라. 기본값이나 120000 으로는 **검증이 통과해도 시간초과로 런이 버려진다**(실측 2026-07-30).',
+    '- ⛔ **저장소 전체 타입검사(`tsc --noEmit -p tsconfig.gate.json`·`bunx tsc`·그것을 부르는 scratch 스크립트)를 직접 돌리지 마라** — Pod 에서 약 10GB 를 먹어 **OOMKilled** 로 런이 죽는다(실측 2026-09-28 · 한도 16Gi). 타입 검사는 위 `self typecheck` 하나로 끝낸다 — 그 관문은 바뀐 파일 ⊕ 승격 소비자만 진입점으로 둔 **범위 컴파일**이라 약 1~2GB 다(#21577 · 전에는 안에서 전체 tsc 를 두 번 돌렸다). 전체 검사가 필요하면 호스트 재게이트가 한다.',
     '- ⚠️ `bun test` 가 "Ran 0 tests" 또는 "0 pass 0 fail" 이면 **통과가 아니다** — 파일 경로가 틀린 것이니 올바른 테스트 경로로 다시 실행해 실제 테스트가 돌게 하라.',
     // ⛔⛔ #4 가드가 막는데 나아갈 길이 없었다(실측 2026-07-30): 깊은 위임 **2/2** 가 여기서 죽었다.
     //   자식이 `elanous <cmd>` 를 중첩으로 띄우면 `instance-root-coherence.ts:107` 이 stderr 로
@@ -861,6 +970,10 @@ export interface DefaultSeamsOptions {
   /** Existing platform gate runners; injected only by focused seam tests. */
   runAndroidUnitTestGate?: (io: { args: readonly string[]; cwd: string }) => number;
   runIosUnitTestGate?: (io: { args: readonly string[]; cwd: string }) => number;
+  /** Source-policy gate adapter for focused seam tests. */
+  runHarnessPolicyGates?: typeof runHarnessPolicyGates;
+  /** Dependency-wide validation adapter for focused seam tests. */
+  runDependencyChangeGate?: typeof runDependencyChangeGate;
   /** 워크트리 시험 묶음(없으면 실패 파일)을 base에서 재실행하는 seam. 실패 경로에서만 호출된다. */
   runGateBaseline?: (cwd: string, failedFiles: readonly string[], baseRef?: string) => BaselineProcessResult;
   /** Timeout failure별로 검증된 단일-test 재실행 관측을 수집하는 seam. */
@@ -975,9 +1088,9 @@ export function removeMatchingGoalCopy(repoRoot: string, goalFile: string, remot
  * (결정론·LLM 0). 그래서 여기서 따로 나르지 않는다 — 두 경로로 나르면 갈라진다.
  */
 const REVIEW_DIFF_CONTEXT_KEYS = [
-  'runId', 'commits', 'changedFiles', 'goal', 'goalFile', 'goalDocumentPath', 'round', 'appliedLastRound',
+  'runId', 'commits', 'changedFiles', 'goal', 'goalFile', 'goalDocumentPath', 'round', 'appliedLastRound', 'priorRunFindings',
   'shardSiblings', 'diffOutsideClaims', 'gateEvidenceNote', 'preexistingTestFailures', 'importerTestsNotRun',
-  'evidenceCoverage', 'designCheck',
+  'evidenceCoverage', 'designCheck', 'designGate',
 ] as const satisfies readonly (keyof ReviewDiffContext)[];
 
 type UnmappedReviewDiffContextKey = Exclude<keyof ReviewDiffContext, typeof REVIEW_DIFF_CONTEXT_KEYS[number]>;
@@ -1003,6 +1116,7 @@ export function toReviewIntentInput(ctx?: ReviewDiffContext): ReviewIntentInput 
     ...(ctx.goalFile?.trim() ? { goalFile: ctx.goalFile } : {}),
     ...(ctx.round !== undefined ? { round: ctx.round } : {}),
     ...(ctx.appliedLastRound?.length ? { appliedLastRound: ctx.appliedLastRound } : {}),
+    ...(ctx.priorRunFindings?.length ? { priorRunFindings: ctx.priorRunFindings } : {}),
     ...(ctx.shardSiblings?.items.length ? { shardSiblings: ctx.shardSiblings } : {}),
     ...(ctx.diffOutsideClaims?.length ? { diffOutsideClaims: ctx.diffOutsideClaims } : {}),
     ...(ctx.gateEvidenceNote?.trim() ? { gateEvidenceNote: ctx.gateEvidenceNote } : {}),
@@ -1010,6 +1124,7 @@ export function toReviewIntentInput(ctx?: ReviewDiffContext): ReviewIntentInput 
     ...(ctx.importerTestsNotRun !== undefined ? { importerTestsNotRun: ctx.importerTestsNotRun } : {}),
     ...(ctx.evidenceCoverage ? { evidenceCoverage: ctx.evidenceCoverage } : {}),
     ...(ctx.designCheck ? { designCheck: ctx.designCheck } : {}),
+    ...(ctx.designGate ? { designGate: ctx.designGate } : {}),
   };
 }
 
@@ -1757,6 +1872,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         unresolvedRelativeImportSpecifiers: scope.importerTestsNotRun?.unresolvedRelativeSpecifiers ?? null,
       // ⚠️ 커버 안 된 변경이 있으면 **테스트가 돌았어도** warn — debug 는 운영 로그에서 필터링된다(리뷰 should-fix).
       }, { level: scope.reason === 'no-related-tests' || scope.missingTestFiles > 0 || scope.unverified.length > 0 ? 'warn' : 'debug' });
+      try { emitDecision(gateDecision({ runId: ctx?.runId, reason: scopeReason, testStepSkipped })); } catch { /* observation must not change the gate result */ }
       // `defaultSeams.gate` owns the changed-file list and runs before the test-step skip,
       // so platform-only changes remain measured even when gate-scope has no Bun filters.
       const androidChanged = androidFilesIn(changedAll);
@@ -1898,11 +2014,27 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       //   tsc-깨짐(F1 refFacts 미정의)을 결정론 차단. 변경 전체(.ts·테스트 포함)를 tsc 로 검사(변경 경로만 카운트).
       const tc = changedFileTypecheck(cwd, changedAll);
       debug.log('self-implement', 'gate.tsc', { checked: tc.checked, passed: tc.passed, errors: tc.errors, exempted: tc.exempted, noInspectionReason: tc.noInspectionReason }, { level: tc.passed ? 'info' : 'warn' });
+      const policy = (o.runHarnessPolicyGates ?? runHarnessPolicyGates)({ cwd, changedFiles: changedAll });
+      debug.log('self-implement', 'gate.policy', {
+        passed: policy.passed, failures: policy.failures.map((failure) => failure.gate), skipped: policy.skipped,
+      });
+      const dependencyChanged = changedAll.some((file) => ['package.json', 'bun.lock', 'apps/pwa/package.json'].includes(file.replace(/^\.\//, '')));
+      const candidateSrcFiles = changedAll.map((file) => file.replace(/^\.\//, '')).filter((file) => file.startsWith('src/'));
+      const reachable = !dependencyChanged && candidateSrcFiles.length > 0 ? pwaReachableSrcFiles(cwd) : new Set<string>();
+      const pwaReachableChanged = candidateSrcFiles.some((file) => reachable.has(file));
+      const dependencyGate = dependencyChanged || pwaReachableChanged
+        ? (o.runDependencyChangeGate ?? runDependencyChangeGate)({ cwd, changedFiles: changedAll })
+        : undefined;
+      if (dependencyGate) debug.log('self-implement', 'gate.dependency-change', {
+        ran: dependencyGate.ran, passed: dependencyGate.passed,
+        failures: dependencyGate.failures.map((failure) => failure.step), skipped: dependencyGate.skipped,
+        trigger: dependencyGate.trigger, pwaReachableChanged: dependencyGate.pwaReachableChanged, measured: dependencyGate.measured,
+      });
       // ⛔⭐⭐ **최종 게이트가 통과할 때만** 돈다(리뷰 2R) — 종전엔 `r.passed`(스텝 결과)만 보고
       //   `tc`(변경파일 tsc) **전에** 실행해서, tsc 가 깨져 **최종 게이트가 실패한 런에도**
       //   base 를 다시 돌리고 `gate.log` 를 바꿨다 ⇒ *"게이트 실패 경로 무변경"* 경계 위반.
-      //   ⇒ 조건을 **최종 판정과 같은 식**(`integrityPassed && tc.passed`)으로 묶는다.
-      const gatePassed = !comparisonFailureReason && !unmeasuredPostsync && integrityPassed && tc.passed;
+      //   ⇒ 조건을 최종 판정과 같은 식으로 묶는다.
+      const gatePassed = !comparisonFailureReason && !unmeasuredPostsync && integrityPassed && tc.passed && policy.passed && (dependencyGate?.passed ?? true);
       const verifyIdentity = gateVerifyIdentity(ctx?.runId);
       if (gatePassed && scope.skipTestStep) {
         verifyByBreaking = { ran: false, distinguishes: 0, 'does-not-distinguish': 0, unknown: 0, skippedReason: scope.reason };
@@ -2061,9 +2193,18 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
               : '문서만 변경돼 동작 테스트 대상이 없다(정상).')
         : '';
       const baseLog = tc.passed ? r.log : `${r.log}\n\n${tc.log}`;
+      const policyFailureLog = policy.failures.length
+        ? `\n\n${policy.failures.flatMap((failure) => failure.lines).join('\n')}`
+        : '';
+      const dependencyFailureLog = dependencyGate?.failures.length
+        ? `\n\n${dependencyGate.failures.flatMap((failure) => [`[dependency-change: ${failure.step}] FAIL`, ...failure.lines]).join('\n')}`
+        : '';
+      const dependencyUnmeasuredNote = dependencyGate?.measured === false
+        ? `\n\n[dependency-change: pwa-build] 못 쟀다 — ${dependencyGate.skipped}; passed=true 는 PWA 빌드 검증을 뜻하지 않는다.`
+        : '';
       return {
         passed: gatePassed,
-        log: `${baseLog}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}`,
+        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}`,
         testStepExecuted: !testStepSkipped && testStep !== undefined && !testStep.skipped,
         scopeReason,
         comparisonBaseStatus: observationChanges.comparisonBaseStatus,
@@ -2227,6 +2368,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             verdict: 'fail', reviewed: false, reason: 'unmeasurable-scope',
             ...(ctx?.round !== undefined ? { round: ctx.round } : {}),
           });
+          try { emitDecision(reviewDecision({ runId: ctx?.runId, verdict: 'fail', reviewed: false, reason: 'unmeasurable-scope' })); } catch { /* observation must not change the review result */ }
           return {
             verdict: 'fail' as const, mustFix: [], shouldFix: [], summary: '(리뷰 범위를 못 쟀다)', reviewed: false,
             failureReason: 'unmeasurable-scope',
@@ -2238,6 +2380,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
             verdict: 'pass', reviewed: false, reason: 'no-diff',
             ...(ctx?.round !== undefined ? { round: ctx.round } : {}),
           });
+          try { emitDecision(reviewDecision({ runId: ctx?.runId, verdict: 'pass', reviewed: false, reason: 'no-diff' })); } catch { /* observation must not change the review result */ }
           return {
             verdict: 'pass' as const, mustFix: [], shouldFix: [], summary: '(변경 없음)', reviewed: false,
             failureReason: 'no-diff',
@@ -2282,6 +2425,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           ...(rr.failureReason !== undefined ? { failureReason: rr.failureReason } : {}),
           ...reviewDiffBudgetObservation(rr),
         });
+        try { emitDecision(reviewDecision({ runId: ctx?.runId, verdict: rr.verdict, reviewed: rr.reviewed ?? false, mustFix: rr.mustFix.length, shouldFix: rr.shouldFix.length, topFinding: rr.mustFix[0], reason: rr.failureReason })); } catch { /* observation must not change the review result */ }
         return {
           verdict: rr.verdict,
           mustFix: rr.mustFix,
@@ -2603,6 +2747,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const mergeOutput = `${m.stdout ?? ''}${m.stderr ?? ''}`;
       if (m.status !== 0 && matchHeadCommit) {
         debug.log('self-implement', 'merge.gh', { number, mergeExit: m.status, stateExit: null, prState: null, merged: false });
+        try { emitDecision(mergeDecision({ number, merged: false, reason: mergeOutput.slice(-240), runId: getHarnessRunId() })); } catch { /* observation must not change the merge result */ }
         return { merged: false, detail: mergeOutput.slice(-240) };
       }
       const state = runSpawnSync('gh', ['pr', 'view', String(number), '--json', 'state,baseRefName'], { cwd, encoding: 'utf8', timeout: 30_000 });
@@ -2615,6 +2760,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       const baseRefName = typeof parsed.baseRefName === 'string' && parsed.baseRefName.trim() ? parsed.baseRefName.trim() : undefined;
       const merged = prState === 'MERGED';
       debug.log('self-implement', 'merge.gh', { number, mergeExit: m.status, stateExit: state.status, prState: prState || null, merged, ...(baseRefName ? { baseRefName } : {}) });
+      try { emitDecision(mergeDecision({ number, merged, reason: merged ? 'confirmed-merged' : `PR state is ${prState || 'unknown'} after merge command`, runId: getHarnessRunId() })); } catch { /* observation must not change the merge result */ }
       if (merged) {
         let mergeCommit: string | undefined;
         try {

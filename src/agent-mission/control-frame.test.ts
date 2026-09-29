@@ -161,7 +161,9 @@ describe('제어루프 경유 발행(behavior) — 실 runPtyControlLoop 이 onS
   // 별개 링크 → source 가드로 production wiring 회귀를 잡는다(둘이 합쳐 전 경로 커버).
   it('배선 가드 — runAgentMission 이 onStep: makeMissionObserveStep 을 배선(production wiring)', async () => {
     const src = await Bun.file(new URL('./driver.ts', import.meta.url)).text();
-    expect(src).toContain('onStep: makeMissionObserveStep(');
+    // The step is built once (`const observeStep = makeMissionObserveStep(`) and awaited first inside onStep.
+    expect(src).toContain('const observeStep = makeMissionObserveStep(');
+    expect(src).toMatch(/onStep: async \(obs, decision\) => \{\n\s+await observeStep\(obs, decision\);/);
   });
 });
 

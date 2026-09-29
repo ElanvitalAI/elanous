@@ -198,4 +198,13 @@ describe('handleSessionsStoreList — harness origin default hide', () => {
     expect(body.ok).toBe(true);
     expect(body.messages.some((m) => m.content === 'keep going')).toBe(true);
   });
+
+  it('없는 세션: 기본은 404 · `?ifExists=1` 이면 200 에 exists:false(새 세션 복원이 오류를 남기지 않게)', async () => {
+    const missing = 'no-such-session-id';
+    const plain = handleSessionsStoreGet(new Request(`http://localhost:31415/v1/sessions/store/${missing}`), missing, OPTS);
+    expect(plain.status).toBe(404);
+    const soft = handleSessionsStoreGet(new Request(`http://localhost:31415/v1/sessions/store/${missing}?ifExists=1`), missing, OPTS);
+    expect(soft.status).toBe(200);
+    expect(await soft.json()).toEqual({ ok: true, exists: false, messages: [] });
+  });
 });

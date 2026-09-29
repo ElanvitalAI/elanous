@@ -1,8 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, spyOn } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
-import { registerSetupCommand } from './setup-cli.js';
+import { registerSetupCommand, type SetupCliDeps } from './setup-cli.js';
+import { planClaudePluginSetup, type ClaudePluginSetupPlan } from './claude-plugin-setup.js';
+import { debug } from '../debug/log.js';
 import type { UserConfig } from '../user-config.js';
 
 const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: 'access', refreshToken: 'refresh' } } } });
@@ -57,9 +60,150 @@ function section(text: string, heading: string, nextHeading?: string): string {
   return text.slice(start, end < 0 ? text.length : end);
 }
 
+const marketplaceCommand = ['claude', 'plugin', 'marketplace', 'add', 'ElanvitalAI/elanous'];
+const pluginCommand = ['claude', 'plugin', 'install', 'elanous@elanous'];
+const pluginPlan: ClaudePluginSetupPlan = {
+  source: 'ElanvitalAI/elanous', claudeCode: true, node: true, elanous: true,
+  marketplaceInstalled: false, pluginInstalled: false,
+  steps: [{ command: marketplaceCommand, needed: true }, { command: pluginCommand, needed: true }], ready: false,
+};
+
+async function runClaudeSetup(args: string[], overrides: Partial<SetupCliDeps> = {}) {
+  const output: string[] = [];
+  const errors: string[] = [];
+  const exitCodes: number[] = [];
+  const plans: Array<{ source?: string }> = [];
+  const applies: ClaudePluginSetupPlan[] = [];
+  const program = new Command();
+  registerSetupCommand(program, {
+    planClaudePluginSetup: async (options = {}) => { plans.push(options); return pluginPlan; },
+    applyClaudePluginSetup: async (plan) => {
+      applies.push(plan);
+      return { verification: { ...plan, marketplaceInstalled: true, pluginInstalled: true, ready: true }, mcpVerified: true, executed: [marketplaceCommand, pluginCommand], ok: true };
+    },
+    runDoctor: () => { throw new Error('legacy doctor must not run'); },
+    getUserConfig: () => { throw new Error('credentials must not be read'); },
+    saveUserConfig: () => { throw new Error('config must not be written'); },
+    out: { log: (line) => output.push(line), error: (line) => errors.push(line) },
+    setExitCode: (code) => exitCodes.push(code),
+    ...overrides,
+  });
+  await program.parseAsync(['node', 'elanous', 'setup', 'claude-code', ...args]);
+  return { output, errors, exitCodes, plans, applies };
+}
+
+describe('setup Claude Code CLI', () => {
+  test('planning shows both missing steps, checks prerequisites and stays read-only', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await runClaudeSetup([]);
+      expect(result.plans).toEqual([{ source: undefined }]);
+      expect(result.applies).toEqual([]);
+      expect(result.output.filter((line) => line.includes('할 일'))).toEqual([
+        `→ 할 일: ${marketplaceCommand.join(' ')}`, `→ 할 일: ${pluginCommand.join(' ')}`,
+      ]);
+      expect(result.output.at(-1)).toBe('--apply 로 실행');
+      expect(result.exitCodes).toEqual([0]);
+      expect(log).toHaveBeenCalledWith('setup.claude-code', 'planned', { ready: false, needed: 2, executed: undefined, mcpVerified: undefined });
+    } finally { log.mockRestore(); }
+  });
+
+  test('prints the real planner command with the original source as one shell argument', async () => {
+    const source = "/tmp/local marketplace's files";
+    const plan = await planClaudePluginSetup({ source }, {
+      has: () => true,
+      run: async () => ({ exitCode: 0, stdout: '[]' }),
+    });
+    expect(plan.steps.map((step) => step.needed)).toEqual([true, true]);
+    const result = await runClaudeSetup(['--source', source], {
+      planClaudePluginSetup: async (options) => {
+        expect(options).toEqual({ source });
+        return plan;
+      },
+    });
+    const tasks = result.output.filter((line) => line.startsWith('→ 할 일: '));
+    expect(tasks).toHaveLength(2);
+    for (const [index, line] of tasks.entries()) {
+      const displayed = line.slice('→ 할 일: '.length);
+      const parsed = spawnSync('bash', ['-c', `claude() { printf '%s\\n' "$@"; }; ${displayed}`], { encoding: 'utf8' });
+      expect(parsed.status).toBe(0);
+      expect(parsed.stdout.trimEnd().split('\n')).toEqual(plan.steps[index]!.command.slice(1));
+    }
+    expect(result.applies).toEqual([]);
+    expect(result.exitCodes).toEqual([0]);
+  });
+
+  test('apply prints both executed commands and MCP verification, returning success', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await runClaudeSetup(['--apply']);
+      expect(result.applies).toEqual([pluginPlan]);
+      expect(result.output).toEqual([`✓ 실행: ${marketplaceCommand.join(' ')}`, `✓ 실행: ${pluginCommand.join(' ')}`, 'MCP 확인: ✓ 완료']);
+      expect(result.exitCodes).toEqual([0]);
+      expect(log).toHaveBeenCalledWith('setup.claude-code', 'applied', { ready: true, needed: 2, executed: 2, mcpVerified: true });
+    } finally { log.mockRestore(); }
+  });
+
+  test('apply errors have one line without a stack and return failure', async () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    let applyCalls = 0;
+    try {
+      const result = await runClaudeSetup(['--apply'], {
+        applyClaudePluginSetup: async () => { applyCalls++; throw new Error('Claude Code is not installed'); },
+      });
+      expect(applyCalls).toBe(1);
+      expect(result.output).toEqual([]);
+      expect(result.errors).toEqual(['Claude Code is not installed']);
+      expect(result.errors.join('\n')).not.toContain('at ');
+      expect(result.exitCodes).toEqual([1]);
+      expect(log).toHaveBeenCalledWith('setup.claude-code', 'failed', { ready: false, needed: 2, executed: undefined, mcpVerified: undefined });
+    } finally { log.mockRestore(); }
+  });
+
+  test('JSON emits the unmodified plan or application result in a single line; non-ok apply exits 1', async () => {
+    const planned = await runClaudeSetup(['--json']);
+    expect(planned.output).toEqual([JSON.stringify(pluginPlan)]);
+    expect(planned.applies).toEqual([]);
+    const verification = { ...pluginPlan, marketplaceInstalled: true, pluginInstalled: true, ready: true };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const applied = await runClaudeSetup(['--json', '--apply'], {
+        applyClaudePluginSetup: async () => ({ verification, mcpVerified: false, executed: [marketplaceCommand], ok: false }),
+      });
+      expect(applied.output).toEqual([JSON.stringify({ verification, mcpVerified: false, executed: [marketplaceCommand], ok: false })]);
+      expect(applied.exitCodes).toEqual([1]);
+      expect(log).toHaveBeenCalledWith('setup.claude-code', 'failed', { ready: true, needed: 2, executed: 1, mcpVerified: false });
+    } finally { log.mockRestore(); }
+  });
+
+  test('ready plan and absent prerequisites display the matching status lines', async () => {
+    const ready = await runClaudeSetup([], { planClaudePluginSetup: async () => ({ ...pluginPlan, steps: pluginPlan.steps.map((step) => ({ ...step, needed: false })), ready: true }) });
+    expect(ready.output).toContain('✓ 완료: claude');
+    expect(ready.output.at(-1)).toBe('준비됨');
+    const blocked = await runClaudeSetup([], { planClaudePluginSetup: async () => ({ ...pluginPlan, claudeCode: false, node: false, elanous: false }) });
+    expect(blocked.output.filter((line) => line.startsWith('✗ 막힘:'))).toHaveLength(3);
+    expect(blocked.applies).toEqual([]);
+  });
+
+  test('planning errors are one line and never apply', async () => {
+    const result = await runClaudeSetup([], { planClaudePluginSetup: async () => { throw new Error('bad source\nsecond line'); } });
+    expect(result.errors).toEqual(['bad source second line']);
+    expect(result.applies).toEqual([]);
+    expect(result.exitCodes).toEqual([1]);
+  });
+});
+
 describe('setup CLI', () => {
   test('non-interactive calls doctor, shows its detailed command report and all guidance, never prompts or writes, and succeeds', async () => {
     const result = await runSetup({ externalReady: false });
+    const originalReport = [
+      'Setup: external command check',
+      'Setup: LLM credential steps',
+      'Non-interactive: no questions were asked and no configuration was written.',
+      'Available now:',
+      'Unavailable until setup is complete:',
+    ];
+    for (const line of originalReport) expect(result.text).toContain(line);
     expect(result.doctorCalls).toBe(1);
     expect(result.exitCodes).toEqual([0]);
     expect(result.prompts).toEqual([]);

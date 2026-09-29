@@ -1,4 +1,9 @@
 graph_id: docs-publish
+loop:
+  title: 문서 게시
+  description: 공개 문서를 빌드하고 게시 전 검증한다
+  trigger:
+    events: [manual]
 version: 1
 entry_node: build
 terminal_nodes: [done, failed]

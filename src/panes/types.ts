@@ -11,7 +11,7 @@
 // This file defines the types and interfaces; concrete implementations
 // land in `terminal-pane.ts`, `external-terminal-pane.ts`, `widget-pane.ts`,
 // `placeholder-pane.ts`. Dashboard-side polymorphic dispatch (replacing
-// the case-kind switch in `dashboard-virtual-windows.ts`) arrives in a
+// the dashboard case-kind switch) arrives in a
 // later commit — this module is additive, behavior-preserving, and
 // compiles alone.
 //

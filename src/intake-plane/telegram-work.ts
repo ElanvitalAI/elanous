@@ -14,6 +14,8 @@ import {
 export interface TelegramWorkMessage {
   chatId: number;
   messageId: number;
+  botId?: string;
+  threadId?: number;
 }
 
 export interface TelegramWorkDeps extends SubmitIntakeWorkDeps {
@@ -26,7 +28,10 @@ export const TELEGRAM_WORK_USAGE = 'Usage: /work <글> — 알맞은 곳(흡수�
 const TRACK_LABEL: Record<IntakeWorkTrack, string> = { absorb: '흡수', tasks: '태스크', graph: '하니스' };
 
 function origin(msg: TelegramWorkMessage): IntakeWorkOrigin {
-  return { kind: 'external', ledgerSource: 'telegram-bot', provider: 'telegram', ref: `${msg.chatId}:${msg.messageId}` };
+  return {
+    kind: 'external', ledgerSource: 'telegram-bot', provider: 'telegram', ref: `${msg.chatId}:${msg.messageId}`,
+    reportTo: { channel: 'telegram', chatId: msg.chatId, ...(msg.botId ? { botId: msg.botId } : {}), ...(msg.threadId ? { threadId: msg.threadId } : {}) },
+  };
 }
 
 export function formatSubmitted(result: SubmitIntakeWorkResult): string {

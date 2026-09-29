@@ -5,6 +5,7 @@
 // and family exposure — no external binary required (whichBinary seam).
 
 import { describe, test, expect, afterEach } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import {
   dispatchSpawnCodingAgentHeadless,
   buildSpawnCodingAgentHeadlessTool,
@@ -14,10 +15,21 @@ import {
 import { CodingAgentBinaryMissing } from '../src/terminal/coding-agent';
 import { buildPtyShellSpecs, PTY_SHELL_TOOL_NAMES } from '../src/boot/daemon-tools/pty-shell';
 import { resetForTesting, listPty } from '../src/pty-shell/registry';
+import type { CodingAgentBrand } from '../src/skills/tools/spawn-coding-agent-headless';
+
+const supportedBrands: CodingAgentBrand[] = ['claude-code', 'codex'];
 
 afterEach(() => resetForTesting());
 
 describe('SpawnCodingAgentHeadless', () => {
+  test('owns CodingAgentBrand without importing the VW tool', () => {
+    const source = readFileSync(new URL('../src/skills/tools/spawn-coding-agent-headless.ts', import.meta.url), 'utf8');
+    expect(source).toMatch(/export type CodingAgentBrand = 'claude-code' \| 'codex';/);
+    expect(source).not.toMatch(/from\s+['"]\.\/spawn-coding-agent-vw(?:\.js)?['"]/);
+    const properties = buildSpawnCodingAgentHeadlessTool().parameters.properties as { brand: { enum: string[] } };
+    expect(properties.brand.enum).toEqual(supportedBrands);
+  });
+
   test('rejects an unknown brand', () => {
     expect(() => dispatchSpawnCodingAgentHeadless({ brand: 'aider' })).toThrow(/must be 'claude-code' or 'codex'/);
   });

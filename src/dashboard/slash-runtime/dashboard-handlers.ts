@@ -115,17 +115,6 @@
 //                   factory output (controlSignal · browserCdp ·
 //                   widgetHost). The runtimes are showDashboard-local,
 //                   so they're threaded via ctx as opaque shapes.
-//   B-2.AA        — /bench — LLM benchmark window spawner. The
-//                   `MAX_BENCHMARK_PANES` constant is static-imported.
-//                   `spawnLLMBenchmark` requires host-local
-//                   virtualWindows refs; threaded behind `bench.spawn`
-//                   ctx method that returns just the new window id +
-//                   pane count (only fields the case body reads).
-//                   The original case parsed `cmdText.slice('/bench'
-//                   .length)` to get the raw tail (because the
-//                   prompt may contain spaces + ::); the registry
-//                   passes args[], so we rebuild via args.join(' ').
-//                   Closes B-2 — B-2 medium tier fully migrated.
 //   B-2.z         — /setup — onboarding wizard launcher (inline /
 //                   popup / reset / help). resolveDashboardChatMain
 //                   SetupCommand + dashboardSetupHelpLines +
@@ -181,8 +170,8 @@
 //                   requestDashboardRender threaded via `theme` ctx.
 //   B-2.q         — /sim · /simulator — declarative simulation cockpit
 //                   (open / web / list / run). simSlashRuntime line
-//                   helpers + 5 host-local actions (spawnVirtualWindow,
-//                   openWebCockpit, listScenarios, runById, resolveAlias)
+//                   helpers + host-local actions (openWebCockpit,
+//                   listScenarios, runById, resolveAlias)
 //                   threaded via `sim` ctx bundle.
 //   B-2.o         — /intake — intake-plane review picker / modal /
 //                   refresh fire-and-forget. Many host-local deps
@@ -288,6 +277,7 @@ import { runRebindCommand } from '../../input-core/index.js';
 // surfaces (CLI, PWA panel, this) cannot answer differently.
 import { resolveRepositoryDesignCheck } from '../../cli/repo-cli.js';
 import { renderDesignCheckLines, type DesignCheckTone } from '../../design/design-check-render.js';
+import { handleDesignPick } from './design-pick.js';
 import { listDesignDirections, parseDeclaredDirection } from '../../design/design-directions.js';
 import {
   dashboardDeltaHelpLines,
@@ -300,7 +290,6 @@ import {
   resolveDashboardChatMainSetupCommand,
 } from '../input/chat-main-setup-command.js';
 import { resetOnboardingMarker } from '../../onboarding.js';
-import { MAX_BENCHMARK_PANES } from '../../virtual-windows/benchmark-preset.js';
 import { DEFAULT_THEME_TOKENS } from '../../theme/tokens.js';
 import { setActivePresetInConfig } from '../render/theme-resolver.js';
 import { getTheme, listThemes } from '../../themes/index.js';
@@ -395,9 +384,6 @@ import type { DashboardTermSlashRuntime } from '../term-slash-runtime.js';
 import { resolveTerminalMoveDestination } from '../../terminal-matrix/mobility.js';
 import { loadPersistedSessions } from '../../terminal/session-persistence.js';
 import { dispatchTerminalModalObserve } from '../../skills/tools/terminal-modal.js';
-// PLAN-tui-redundancy-cleanup T1 (2026-05-16) — vw-live-bridge trim.
-// `/codex-vw` slash 의 codex branch 가 의존했었지만 사용자 미사용 명시 ·
-// 본 trim 의 부차 path 정리. codex branch 는 error 메시지 출력으로 noop.
 import { SlashCommandRegistry } from './registry.js';
 import { executeImmediateDashboardSlash } from '../input/slash-executor.js';
 import {
@@ -645,27 +631,6 @@ export interface DashboardSlashContext {
     runCommand(args: readonly string[]): Promise<readonly string[]>;
   };
 
-  // B-2.AA additions — /bench LLM benchmark window spawner.
-  // `MAX_BENCHMARK_PANES` static-imported. `spawnLLMBenchmark`
-  // wrapped behind `bench.spawn` ctx method (needs host-local
-  // virtualWindows refs).
-  bench: {
-    slashRuntime: {
-      helpLines(): readonly string[];
-      missingSeparatorLine(): string;
-      emptyPromptLine(): string;
-      noProvidersLine(): string;
-      tooManyProvidersLine(): string;
-      spawnedLine(windowId: number, paneCount: number, providers: readonly string[]): string;
-      failedLine(message: string): string;
-    };
-    /** Spawn a 2-4 pane LLM benchmark window. */
-    spawn(spec: {
-      prompt: string;
-      providers: readonly { name: string; provider: string; model?: string }[];
-    }): { window: { id: number }; paneIds: readonly string[] };
-  };
-
   // B-2.z additions — /setup wizard launcher. The popup-launch and
   // inline-flow paths are wrapped behind two ctx methods that
   // encapsulate the host-local TerminalPopup + display + theme deps.
@@ -809,7 +774,6 @@ export interface DashboardSlashContext {
       unknownScenarioLine(input: string): string;
       runHeading(scenarioId: string): string;
     };
-    spawnVirtualWindow(): string | number;
     openWebCockpit(): Promise<{ path: string }>;
     listScenarios(): readonly unknown[];
     runById(scenarioId: string): Promise<{ status: string; lines: readonly string[] }>;
@@ -1358,7 +1322,7 @@ export function _setSelfOrchestrateSlashRuntimeForTesting(runtime: SelfOrchestra
 export const DASHBOARD_SLASH_CATALOG_BASELINE = {
   registeredOnly: [
     'ag', 'agent', 'agents', 'attach-clear', 'attach-pin', 'attach-unpin',
-    'bench', 'bg', 'cb', 'ce', 'child', 'clip', 'clipboard',
+    'bg', 'cb', 'ce', 'child', 'clip', 'clipboard',
     'code-edit', 'compact', 'compress', 'cost', 'detail', 'dv',
     'harness-llm', 'intake', 'me', 'memo',
     'note', 'pause', 'plan-board', 'preview', 'pv', 'report',
@@ -1428,6 +1392,16 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
       if (ctx.showHelpModal) ctx.chatLines.push('Dashboard help — scroll the chat log with PgUp / PgDn');
       ctx.chatLines.push(...lines);
       ctx.setChatScrollOffset(-1);
+    }
+  });
+
+  registry.register('directive', async (args, ctx) => {
+    try {
+      const { addDirective } = await import('../../steward/directive.js');
+      const result = await addDirective(args.join(' '), { source: 'tui' });
+      ctx.pushChatLine(`${result.issue}: ${result.status}`);
+    } catch {
+      ctx.pushChatLine('지시 등록 실패 — Linear 연결과 자격을 확인하세요.');
     }
   });
 
@@ -4970,64 +4944,6 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.setChatScrollOffset(-1);
   });
 
-  // ── B-2.AA ────────────────────────────────────────────────────────
-
-  registry.register('bench', (args, ctx) => {
-    // T2-P5 — spawn a 2-4 pane LLM benchmark window.
-    //   /bench <prompt> :: <provider[:model]>,<provider[:model]>[,...]
-    // The original case parsed cmdText.slice('/bench'.length); the
-    // registry passes args[], so we rebuild via args.join(' ') to
-    // preserve the prompt's spaces + :: separator.
-    const tail = args.join(' ').trim();
-    if (!tail || tail === 'help' || tail === '-h' || tail === '--help') {
-      ctx.chatLines.push(...ctx.bench.slashRuntime.helpLines());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const sepIdx = tail.indexOf('::');
-    if (sepIdx < 0) {
-      ctx.chatLines.push(ctx.bench.slashRuntime.missingSeparatorLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const prompt = tail.slice(0, sepIdx).trim();
-    const providerList = tail.slice(sepIdx + 2).trim();
-    if (!prompt) {
-      ctx.chatLines.push(ctx.bench.slashRuntime.emptyPromptLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    const providers = providerList.split(',').map(p => p.trim()).filter(Boolean).map(raw => {
-      const [name, model] = raw.split(':');
-      return { name: name!, provider: name!, model };
-    });
-    if (providers.length === 0) {
-      ctx.chatLines.push(ctx.bench.slashRuntime.noProvidersLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    if (providers.length > MAX_BENCHMARK_PANES) {
-      ctx.chatLines.push(ctx.bench.slashRuntime.tooManyProvidersLine());
-      ctx.setChatScrollOffset(-1);
-      return;
-    }
-    try {
-      const handle = ctx.bench.spawn({ prompt, providers });
-      ctx.chatLines.push(
-        ctx.bench.slashRuntime.spawnedLine(
-          handle.window.id,
-          handle.paneIds.length,
-          providers.map((p) => p.name),
-        ),
-      );
-    } catch (err) {
-      ctx.chatLines.push(ctx.bench.slashRuntime.failedLine(
-        err instanceof Error ? err.message : String(err),
-      ));
-    }
-    ctx.setChatScrollOffset(-1);
-  });
-
   // ── B-2.z ─────────────────────────────────────────────────────────
 
   registry.register('setup', (args, ctx) => {
@@ -6322,6 +6238,10 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
   //    pane is the "slash output only reaches a hidden pane" problem this
   //    track has on its backlog, and there is no reason to inherit it here.
   registry.register(['design', 'design-check'], (args, ctx) => {
+    if (args[0] === 'pick') {
+      handleDesignPick(args.slice(1), ctx);
+      return;
+    }
     const tone: Record<DesignCheckTone, (t: string) => string> = {
       heading: ctx.highlight,
       ok: ctx.success,

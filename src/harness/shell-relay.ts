@@ -21,6 +21,9 @@ import type { SurfaceUx } from '../agent/surface-ux/types.js';
 import type { AutoDrive } from './staged-harness.js';
 import { dispatchPtyShellSend } from '../skills/tools/pty.js';
 import { debug } from '../debug/log.js';
+import { getHarnessRunId } from './harness-space.js';
+import { emitDecision } from '../live/detail-switch.js';
+import { escalateDecision } from '../self-implement/decision-events.js';
 
 /** relay 게이트 결정 — auto(자율 답·operator 안 부름) vs escalate(막으로 외부 전파). */
 export type RelayMode = 'auto' | 'escalate';
@@ -176,12 +179,14 @@ export async function relayShellPrompt(input: RelayShellPromptInput): Promise<Re
       answer = typeof picked === 'string' ? picked : Array.isArray(picked) ? (picked[0] ?? null) : null;
       if (answer === null) reason = res == null ? 'non-interactive-menu-fail-closed' : 'cancelled';
       debug.log('harness.relay', 'escalate-question', { shellId, answer: answer ? digest(answer) : null, interactive: ux.interactive });
+      try { emitDecision(escalateDecision({ runId: getHarnessRunId() || undefined, shellId, answer, interactive: ux.interactive, mode: 'question' })); } catch { /* observation must not change the relay outcome */ }
     } else {
       // y/N → ux.confirm. 채널 없으면 fail-closed false → 안전측 decline(noBytes) 주입.
       const ok = await ux.confirm({ prompt, detail: `셸 ${shellId}`, yesLabel: '예', noLabel: '아니오' });
       answer = ok ? yesBytes : noBytes;
       if (!ok && !ux.interactive) reason = 'non-interactive-fail-closed-decline';
       debug.log('harness.relay', 'escalate-confirm', { shellId, ok, answer: digest(answer), interactive: ux.interactive });
+      try { emitDecision(escalateDecision({ runId: getHarnessRunId() || undefined, shellId, answer: reason === 'non-interactive-fail-closed-decline' ? null : answer, interactive: ux.interactive, mode: 'confirm', safeDecline: reason === 'non-interactive-fail-closed-decline' })); } catch { /* observation must not change the relay outcome */ }
     }
   }
 

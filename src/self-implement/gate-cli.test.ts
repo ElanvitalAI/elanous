@@ -569,6 +569,7 @@ describe('runSelfGateCli', () => {
       exists: () => true, runCommand: () => ok(), runTests: () => ok(),
       runIsolationGate: (out) => { gateArgs.push(out.args ?? []); return runIsolationHardcodeGate({ ...out, scan: () => isolationScan, loadBaseline: () => new Map() }); },
       runMockModuleRestoreGate: (out) => { gateArgs.push(out.args ?? []); return runMockModuleRestoreGate({ ...out, scan: () => mockScan, loadBaseline: () => new Map([['test/changed.test.ts', 0]]) }); },
+      runDaemonPortGate: () => 0,
     });
     const changed = run(['src/changed.ts', 'test/changed.test.ts']);
     const outside = run(['src/a.ts']);
@@ -614,12 +615,12 @@ describe('runSelfGateCli', () => {
     const clean = runSelfGateCli('/repo', {}, {
       changedFiles: () => ({ files: ['src/a.ts'], baseRef: 'HEAD' }),
       exists: (path) => path === 'src/a.test.ts', runCommand: () => ok(), runTests: () => ok(),
-      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0, runDaemonPortGate: () => 0,
     });
     const unmeasured = runSelfGateCli('/repo', {}, {
       changedFiles: () => ({ files: ['src/a.ts'], baseRef: 'HEAD' }),
       exists: (path) => path === 'src/a.test.ts', runCommand: () => ok(), runTests: () => ok(),
-      runIsolationGate: () => { throw new Error('script unavailable'); }, runMockModuleRestoreGate: () => 0,
+      runIsolationGate: () => { throw new Error('script unavailable'); }, runMockModuleRestoreGate: () => 0, runDaemonPortGate: () => 0,
     });
     expect(clean.exitCode).toBe(0);
     expect(clean.lines).toContain('tests: pass (1 files)');
@@ -802,6 +803,35 @@ describe('runSelfGateCli', () => {
     });
   });
 
+  describe('policy gates on the skipTestStep path', () => {
+    const noRelatedTests = {
+      changedFiles: () => ({ files: ['src/zz-probe.ts'], baseRef: 'HEAD' }),
+      exists: () => false,
+      runTests: () => { throw new Error('bun tests must not run when no related test is selected'); },
+    };
+    test('⭐ 시험이 하나도 선택되지 않아도 실패하는 daemon-port-gate 는 exit 1 이고 줄에 이름이 남는다', () => {
+      const result = runSelfGateCli('/repo', {}, {
+        ...noRelatedTests,
+        runDaemonPortGate: (out) => { out.error('[daemon-port-gate] FAIL src/zz-probe.ts:1'); return 1; },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.lines.join('\n')).toContain('daemon-port-gate');
+      expect(result.lines).toContain('scope: (test step skipped)');
+      expect(result.testFiles).toEqual([]);
+    });
+    test('⭐ 같은 경로에서 daemon-port-gate 가 통과하면 exit 0', () => {
+      const result = runSelfGateCli('/repo', {}, {
+        ...noRelatedTests,
+        runIsolationGate: () => 0,
+        runMockModuleRestoreGate: () => 0,
+        runModelHardcodeGate: () => 0,
+        runDaemonPortGate: (out) => { out.log('[daemon-port-gate] PASS'); return 0; },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.lines.join('\n')).toContain('daemon-port-gate');
+      expect(result.lines).toContain('scope: (test step skipped)');
+    });
+  });
   describe('android gate on the skipTestStep path', () => {
     test('⭐ Kotlin 만 바뀌어 테스트 단계를 건너뛸 때에도 «안드로이드 게이트는 돈다»', () => {
       const seen: string[][] = [];

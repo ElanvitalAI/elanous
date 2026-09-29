@@ -70,6 +70,18 @@ describe('⛔ 위양성이 «없는가» — 잡아선 안 되는 것', () => {
     expect(rules(lintArtifact({ ...clean, css: '.q{border-left:3px solid #07513b}' }))).not.toContain('rounded-card-left-accent');
   });
 
+  test('타원 «그림»(50% · `/` 반경)의 한쪽 선은 카드가 아니다 — E0·E1 커피콩 실물', () => {
+    const e0 = '.bean::after{width:31px;height:116px;border-left:4px solid #e7ddd0;border-radius:50%;transform:rotate(18deg)}';
+    const e1 = ".bean::before { content: ''; position: absolute; inset: 4% 44%; border-radius: 50%; border-left: 2px solid var(--fg); }";
+    const ellipse = '.seed{border-radius:40px / 60px;border-left:2px solid #333}';
+    for (const css of [e0, e1, ellipse]) expect(rules(lintArtifact({ ...clean, css }))).not.toContain('rounded-card-left-accent');
+  });
+
+  test('작은 퍼센트 모서리의 카드는 여전히 잡는다', () => {
+    const css = '.card{border-radius:6%;border-left:4px solid #07513b}';
+    expect(rules(lintArtifact({ ...clean, css }))).toContain('rounded-card-left-accent');
+  });
+
   test('⛔ «다른 블록»의 라운드와 보더를 합쳐서 잡지 않는다', () => {
     const css = '.a{border-radius:8px}\n.b{border-left:3px solid #07513b}';
     expect(rules(lintArtifact({ ...clean, css }))).not.toContain('rounded-card-left-accent');

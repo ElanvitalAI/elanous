@@ -62,7 +62,7 @@ const baseLookupRun = (cmd: string, args: readonly string[]) =>
             : { ok: false, out: '' };
 const baseDeps = {
   currentBranch: () => 'feat/land', resolveBase: () => 'origin/main', run: baseLookupRun, listUnfinishedRuns: () => [] as const,
-  queryRunningRuns: () => runningRuns([]), runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true,
+  queryRunningRuns: () => runningRuns([]), runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true, runDaemonPortGate: () => true,
   runPublicLeakGate: () => 0,
   isInteractive: () => false,
 };
@@ -274,6 +274,8 @@ describe('elanous pr land', () => {
         '✓ typecheck: scripts/ci-typecheck-changed.ts PASS — changed files have no new type errors.',
         '✓ isolation-gate: scripts/ci-isolation-hardcode-gate.ts PASS — no new homedir+.elanous hardcoding.',
         '✓ mock-module-restore-gate: scripts/ci-mock-module-restore-gate.ts PASS — no new un-restored mock.module.',
+        '✓ model-hardcode-gate: scripts/ci-model-hardcode-gate.ts PASS — no new hardcoded model id.',
+        '✓ daemon-port-gate: scripts/ci-daemon-port-gate.ts PASS — no new daemon port literals.',
         '[test-interference-gate] 해당 없음 — 변경 시험 파일 0개 (간섭 검사는 2개 이상 필요).',
         // ⭐ 안드로이드를 안 만진 착지라 게이트가 «깨어나지 않았다»고 «말한다».
         //    ⛔ 그 자리에 「PASS — 실제로 돌았다」가 오면 안 된다 — 안 돌았기 때문이다.

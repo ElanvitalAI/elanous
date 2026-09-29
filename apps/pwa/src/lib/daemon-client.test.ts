@@ -1177,3 +1177,12 @@ describe('DaemonClient.connectAcp lifecycle leases', () => {
     expect(secondSocket!.sent).toHaveLength(0);
   });
 });
+
+describe('describeSocketError — «[object Event]» 대신 언제·어디', () => {
+  it('열기 전이면 «못 닿음·거절» · 연 뒤면 «도중 끊김» · 호스트만(토큰 없음)', async () => {
+    const { describeSocketError } = await import('./daemon-client');
+    expect(describeSocketError(0, 'ws://mbp.tailnet-example.ts.net:31415/v1/acp?session=abc')).toBe('socket error before open — daemon unreachable or refused (mbp.tailnet-example.ts.net:31415)');
+    expect(describeSocketError(1, 'ws://127.0.0.1:31415/v1/acp')).toBe('socket error while open — connection dropped (127.0.0.1:31415)');
+    expect(describeSocketError(0, 'not a url')).toContain('unknown-host');
+  });
+});

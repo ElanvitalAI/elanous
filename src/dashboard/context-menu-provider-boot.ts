@@ -10,9 +10,6 @@ import {
 import {
   registerDashboardPaneTitleContextMenus,
 } from '../dashboard-pane-context-menu.js';
-import {
-  registerVirtualWindowContextMenus,
-} from '../virtual-window-context-menu.js';
 import { registerDebugContextMenus } from '../debug-context-menu.js';
 
 export interface DashboardContextMenuProviderBootDeps {
@@ -23,8 +20,6 @@ export interface DashboardContextMenuProviderBootDeps {
   getScratchTotalBytes: () => number;
   isCompanionOpen: (key: string) => boolean;
   hasClosedPanes: () => boolean;
-  resolveVirtualWindowPaneKind: (ref: { windowId: string; paneId: string }) => string | null;
-  isVirtualWindowCompanionOpen: (ref: { windowId: string }, key: string) => boolean;
   getDebugPath: () => string;
   getDebugLevel: () => string;
   createRegistry?: typeof createMenuProviderRegistry;
@@ -52,10 +47,6 @@ export function bootDashboardContextMenuProviders(
   registerDashboardPaneTitleContextMenus(providers, {
     isCompanionOpen: (key) => deps.isCompanionOpen(key),
     hasClosedPanes: deps.hasClosedPanes,
-  });
-  registerVirtualWindowContextMenus(providers, {
-    resolvePaneKind: (ref) => deps.resolveVirtualWindowPaneKind(ref),
-    isCompanionOpen: (ref, key) => deps.isVirtualWindowCompanionOpen(ref, key),
   });
   registerDebugContextMenus(providers, {
     getPath: deps.getDebugPath,

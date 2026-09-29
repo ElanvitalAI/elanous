@@ -324,6 +324,17 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(devCli.explicitDevOptionNames(command)).toEqual(['roleLlm', 'childLlmProvider']);
   });
 
+  it('CLI --no-auto-merge remains an explicit remote-dependent completion', () => {
+    const command = {
+      options: [{ attributeName: () => 'autoMerge' }],
+      getOptionValueSource: () => 'cli',
+      getOptionValue: () => false,
+    };
+    const explicit = devCli.explicitDevOptionNames(command);
+    expect(explicit).toEqual(['autoMerge']);
+    expect(buildDevCliSpec(IN, SELF, { autoMerge: false }, explicit).completionSource).toBe('request');
+  });
+
   it('self-mission의 명시 --role-llm은 자식에 전달되지 않음을 이름과 child LLM 대안으로 거부한다', () => {
     expect(() => buildDevCliSpec(IN, SELF, { roleLlm: ['implement=grok/best'] }, ['roleLlm']))
       .toThrow(/--role-llm.*--child-llm-provider.*--child-llm-model/);
@@ -786,6 +797,64 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(devCli.rotateDraftTriageRuns(candidates, undefined)).toEqual(candidates);
   });
 
+  it('12개 초안의 완료·중지·실행 런을 각각 판정하고 브랜치를 보존한다', async () => {
+    const now = 40 * 3_600_000;
+    const closed: number[] = [];
+    const drafts = Array.from({ length: 12 }, (_, i) => ({
+      runId: ['completed', 'stopped', 'running'][Math.floor(i / 4)],
+      number: i + 1, url: pr(i + 1), openedAtMs: now - 30 * 3_600_000,
+      branch: `self-impl/run-${i}`, title: `draft-${i}`,
+    }));
+    const events = await observeRunExit('triage-12-decisions', async () => {
+      devCli.startDraftTriage('current', {
+        nowMs: () => now,
+        queryAbandonedDraftPrs: () => drafts as never,
+        queryDraftPrInventory: () => ({ open: drafts as never, merged: [], complete: true }),
+        queryRunningRuns: () => ({ entries: ['completed', 'stopped', 'running'].map((runId) => ({ runId, status: runId })) }) as never,
+        queryTerminalRunStatuses: () => ({ completed: 'completed', stopped: 'stopped' }),
+        viewDraftPr: openDraft,
+        closeDraftPr: (url) => { closed.push(Number(url.split('/').at(-1))); return true; },
+      });
+    });
+    expect(closed.sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(devCli.draftPrCommandArgs(pr(1), 'close', 'stale-ended-run')).not.toContain('--delete-branch');
+    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ decisions: expect.objectContaining({ live: 4, staleEndedRun: 8 }) }) }));
+    const event = events.find(({ event }) => event === 'draft-triage-start')!;
+    expect(Object.values((event.data as { decisions: Record<string, number> }).decisions).reduce((sum, value) => sum + value, 0)).toBe(12);
+  });
+
+  it('병합 제목·골 계보는 1시간 된 초안도 닫고 승인 라벨과 실제 live branch는 보존한다', async () => {
+    const now = 40 * 3_600_000;
+    const closed: Array<{ url: string; reason: string }> = [];
+    const drafts = [
+      { runId: 'finished', number: 21, url: pr(21), branch: 'self-impl/a-goalid-aabc1234-old', title: 'a', openedAtMs: now - 3_600_000 },
+      { runId: 'finished', number: 22, url: pr(22), branch: 'self-impl/b-goalid-bbcd1234-old', title: 'b', openedAtMs: now - 3_600_000 },
+      { runId: 'finished', number: 23, url: pr(23), branch: 'self-impl/c-goalid-ccde1234-old', title: 'c', openedAtMs: now - 40 * 3_600_000, labels: ['elanous:idea-approval'] },
+      { runId: 'running', number: 24, url: pr(24), branch: 'self-impl/live', title: 'd', openedAtMs: 0 },
+      { runId: 'finished', number: 25, url: pr(25), branch: 'self-impl/live', title: 'e', openedAtMs: 0 },
+    ];
+    const events = await observeRunExit('triage-merged-twins', async () => devCli.startDraftTriage('current', {
+      nowMs: () => now,
+      queryAbandonedDraftPrs: () => drafts as never,
+      queryDraftPrInventory: () => ({ open: drafts, merged: [
+        { number: 50, title: 'a', branch: 'self-impl/other-goalid-1234' },
+        { number: 51, title: 'different', branch: 'self-impl/new-goalid-bbcd1234-next' },
+      ], complete: true }),
+      queryRunningRuns: () => ({ entries: [{ runId: 'finished', status: 'unknown' }, { runId: 'running', status: 'running' }] }) as never,
+      queryTerminalRunStatuses: () => ({ finished: 'completed' }),
+      viewDraftPr: openDraft,
+      closeDraftPr: (url, reason) => { closed.push({ url, reason }); return true; },
+    }));
+    expect(closed).toEqual([
+      { url: pr(21), reason: '하니스 시작 트리아지: superseded-by #50' },
+      { url: pr(22), reason: '하니스 시작 트리아지: superseded-by #51' },
+    ]);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({
+      decisions: { live: 2, superseded: 2, staleEndedRun: 0, recent: 0, humanApproval: 1 },
+      statusesObserved: expect.objectContaining({ completed: 4, running: 1 }),
+    }) }));
+  });
+
   it('시작 트리아지는 launch runId로 회전한 후보 순서를 배치 조회와 처리에 사용한다', async () => {
     const launchRunId = 'run-alpha';
     const runIds = ['one', 'two', 'three', 'four'];
@@ -809,7 +878,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     }));
   });
 
-  it('시작 트리아지는 execute 전에 ended-unclosed 런의 이전 draft만 닫고 최신 하나에 한 번 코멘트한다', async () => {
+  it('시작 트리아지는 execute 전에 끝난 런의 24시간 지난 draft를 모두 닫고 live draft는 보존한다', async () => {
     const calls: string[] = [];
     const closed: Array<{ url: string; comment: string }> = [];
     const comments: Array<{ url: string; comment: string }> = [];
@@ -836,9 +905,9 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       });
     });
     expect(calls.indexOf('execute')).toBeGreaterThan(calls.indexOf(`close:${pr(1)}`));
-    expect(closed).toEqual([{ url: pr(1), comment: '하니스 시작 트리아지: 종결 기록 없이 끝난 런 ended — 최신 산출 #2 로 대체됨' }]);
-    expect(comments).toEqual([{ url: pr(2), comment: '하니스 시작 트리아지: 이 런은 종결 트리아지 없이 끝났다 · 이 draft 가 이 런의 유일한 사람 판단 대상' }]);
-    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ runId: 'current', considered: ['ended'], closed: [1], kept: [2], closeFailed: [], skipped: { running: 1, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 1 } }) }));
+    expect(closed).toEqual([{ url: pr(1), comment: '하니스 시작 트리아지: stale-ended-run' }, { url: pr(2), comment: '하니스 시작 트리아지: stale-ended-run' }]);
+    expect(comments).toEqual([]);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ runId: 'current', considered: ['ended'], closed: [1, 2], kept: [], closeFailed: [], decisions: expect.objectContaining({ live: 1, staleEndedRun: 2 }) }) }));
   });
 
   it('startDraftTriage를 독립 launch-start operation으로 export하며 주입 seam·현재 런 제외·event fields를 보존한다', async () => {
@@ -859,13 +928,12 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       });
     });
 
-    expect(closed).toEqual([pr(2)]);
-    expect(comments).toEqual([pr(3)]);
+    expect(closed).toEqual([pr(2), pr(3)]);
+    expect(comments).toEqual([]);
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
       data: expect.objectContaining({
-        runId: 'current', considered: ['ended'], closed: [2], kept: [3], closeFailed: [],
-        skipped: { running: 0, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 0 },
+        runId: 'current', considered: ['ended'], closed: [2, 3], kept: [], closeFailed: [],
         runningRunsQueried: true,
       }),
     }));
@@ -893,7 +961,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
 
     expect(queried).toEqual(['drafts', 'running']);
     expect(events.filter(({ event }) => event === 'draft-triage-start')).toEqual([
-      expect.objectContaining({ data: expect.objectContaining({ runId: 'run-current', considered: ['run-ended'], closed: [], kept: [2] }) }),
+      expect.objectContaining({ data: expect.objectContaining({ runId: 'run-current', considered: ['run-ended'], closed: [], kept: [], closeFailed: [2] }) }),
     ]);
   });
 
@@ -933,15 +1001,14 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
       data: expect.objectContaining({
-        considered: ['ended'], closed: [1], kept: [2], closeFailed: [],
-        skipped: { running: 0, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 0 },
+        considered: ['ended'], closed: [], kept: [1, 2], closeFailed: [],
         budgetUnprocessed: 0, budgetExhausted: false, runningRunsQueried: true,
-        elapsedMs: 102,
+        elapsedMs: 79,
         draftListDurationMs: 11,
         terminalTriageDurationMs: 13,
         runningRunsDurationMs: 17,
         draftViewDurationMs: 38,
-        unaccountedDurationMs: 23,
+        unaccountedDurationMs: 0,
       }),
     }));
   });
@@ -995,7 +1062,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
         runningRunsUnqueriedUniverseCount: unqueriedUniverseCount,
         runningRunsDurationMs: 10,
         elapsedMs: 10,
-        skipped: expect.objectContaining({ running: 1, probableRunning: 1 }),
+        decisions: expect.objectContaining({ live: 2 }),
       }) }));
       expect(runningRunsQueries).toBe(1);
       observations.push((event!.data as { runningRunsUnqueriedUniverseCount: number | null }).runningRunsUnqueriedUniverseCount);
@@ -1098,7 +1165,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
       data: expect.objectContaining({
-        skipped: expect.objectContaining({ alreadyTriaged: 1 }),
+        decisions: expect.any(Object),
         runningRunsQueried: true,
         draftListDurationMs: 11,
         terminalTriageDurationMs: 13,
@@ -1139,7 +1206,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(viewed.length).toBeGreaterThan(0);
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
-      data: expect.objectContaining({ skipped: expect.objectContaining({ alreadyTriaged: 6 }), runningRunsQueried: true }),
+      data: expect.objectContaining({ decisions: expect.objectContaining({ recent: 20 }), runningRunsQueried: true }),
     }));
   });
 
@@ -1181,14 +1248,13 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       });
     });
 
-    expect(viewed).toEqual([pr(3)]);
+    expect(viewed).toEqual([pr(3), pr(4)]);
     expect(closed).toEqual([]);
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
       data: expect.objectContaining({
-        considered: ['ended'], kept: [3], closed: [], budgetUnprocessed: 0, budgetExhausted: false,
-        skipped: { running: 1, probableRunning: 1, unknown: 1, alreadyTriaged: 0, noRunId: 0 },
-        elapsedMs: 70, runningRunsDurationMs: 20, draftViewDurationMs: 40,
+        considered: ['ended', 'outside-query-scope'], kept: [3], closed: [], budgetUnprocessed: 1, budgetExhausted: true,
+        elapsedMs: 110, runningRunsDurationMs: 20, draftViewDurationMs: 80,
       }),
     }));
   });
@@ -1221,7 +1287,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     }));
   });
 
-  it('시작 트리아지는 좁힌 조회에 없는 r2를 닫지 않고 skipped.unknown으로 남긴다', async () => {
+  it('시작 트리아지는 좁힌 조회에 없는 r2를 닫지 않고 unobserved 상태로 남긴다', async () => {
     const closed: string[] = [];
     const events = await observeRunExit('start-draft-triage-absent-run-stays-unknown', async () => {
       devCli.startDraftTriage('current', {
@@ -1239,7 +1305,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(closed).not.toContain(pr(2));
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
-      data: expect.objectContaining({ skipped: expect.objectContaining({ unknown: 1 }) }),
+      data: expect.objectContaining({ statusesObserved: expect.objectContaining({ unobserved: 1 }) }),
     }));
   });
 
@@ -1311,7 +1377,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       queryRunningRuns: () => ({ entries: [{ runId: 'candidate-run', status: 'ended-unclosed' }] }) as never,
       viewDraftPr: openDraft,
     });
-    expect(batchCalls).toEqual([['candidate-run']]);
+    expect(batchCalls).toEqual([['terminal-run', 'candidate-run']]);
     expect(singleCalls).toEqual([]);
   });
 
@@ -1350,7 +1416,6 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       event: 'draft-triage-start',
       data: expect.objectContaining({
         considered: ['first'], budgetUnprocessed: 3, elapsedMs: expect.any(Number),
-        skipped: { running: 0, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 0 },
       }),
     }));
   });
@@ -1420,7 +1485,6 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       event: 'draft-triage-start',
       data: expect.objectContaining({
         considered: [], closed: [], kept: [], runningRunsQueried: false,
-        skipped: { running: 0, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 0 },
         budgetUnprocessed: 2, unobservedRuns: 2,
       }),
     }));
@@ -1452,8 +1516,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
       data: expect.objectContaining({
-        considered: ['first'], closed: [1], closeFailed: [2], kept: [3], budgetUnprocessed: 1,
-        skipped: { running: 0, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 0 },
+        considered: ['first', 'second'], closed: [], closeFailed: [], kept: [1, 2, 3, 4], budgetUnprocessed: 0,
       }),
     }));
   });
@@ -1477,7 +1540,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
 
     expect(events).toContainEqual(expect.objectContaining({
       event: 'draft-triage-start',
-      data: expect.objectContaining({ considered: ['ended'], closed: [1], kept: [2], closeFailed: [], budgetUnprocessed: 0, elapsedMs: 0 }),
+      data: expect.objectContaining({ considered: ['ended'], closed: [], kept: [1, 2], closeFailed: [], budgetUnprocessed: 0, elapsedMs: 0 }),
     }));
   });
 
@@ -1503,8 +1566,8 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     const seen: unknown[] = [];
     const rows = devCli.defaultQueryAbandonedDraftPrs((options) => { seen.push(options); return []; }, false);
     expect(rows).toEqual([]);
-    expect(seen).toEqual([{ all: true, includeTest: true, since: '7d' }]);
-    expect(devCli.START_DRAFT_TRIAGE_LEDGER_QUERY).toEqual({ all: true, includeTest: true, since: '7d' });
+    expect(seen).toEqual([{ all: true, includeTest: true }]);
+    expect(devCli.START_DRAFT_TRIAGE_LEDGER_QUERY).toEqual({ all: true, includeTest: true });
   });
 
   it('시작 트리아지 기본 원장 조회는 시험 프로세스에서 조회를 부르지 않는다', () => {
@@ -1575,15 +1638,15 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
         commentDraftPr: (url) => { comments.push(url); return true; },
       });
     });
-    expect(closed).toEqual([pr(1), pr(3)]);
-    expect(comments).toEqual([pr(2), pr(4)]);
-    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ considered: ['first', 'second'], kept: [2, 4] }) }));
+    expect(closed).toEqual([pr(1), pr(2), pr(3), pr(4)]);
+    expect(comments).toEqual([]);
+    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ considered: ['first', 'second'], kept: [], decisions: expect.objectContaining({ staleEndedRun: 4 }) }) }));
   });
 
   it('시작 트리아지는 다음 발사에서 이미 닫힌 이전 draft를 다시 닫거나 코멘트하지 않는다', async () => {
     const closed: string[] = [];
     const comments: string[] = [];
-    let firstClosed = false;
+    const alreadyClosed = new Set<string>();
     const seams = {
       runId: 'current',
       queryAbandonedDraftPrs: () => [
@@ -1592,14 +1655,14 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       ] as never,
       queryRunningRuns: () => ({ entries: [{ runId: 'ended', status: 'ended-unclosed' }] }) as never,
       queryTerminalDraftTriages: () => new Set<string>(),
-      viewDraftPr: (url: string) => url === pr(1) && firstClosed ? { isDraft: true, state: 'CLOSED' } : openDraft(),
-      closeDraftPr: (url: string) => { closed.push(url); firstClosed = true; return true; },
+      viewDraftPr: (url: string) => alreadyClosed.has(url) ? { isDraft: true, state: 'CLOSED' } : openDraft(),
+      closeDraftPr: (url: string) => { closed.push(url); alreadyClosed.add(url); return true; },
       commentDraftPr: (url: string) => { comments.push(url); return true; },
     };
     await executeAfterStartDraftTriage('start triage repeat', async () => selfResult({ stage: 'merged', merged: true }), seams);
     await executeAfterStartDraftTriage('start triage repeat', async () => selfResult({ stage: 'merged', merged: true }), seams);
-    expect(closed).toEqual([pr(1)]);
-    expect(comments).toEqual([pr(2)]);
+    expect(closed).toEqual([pr(1), pr(2)]);
+    expect(comments).toEqual([]);
   });
 
   it('시작 트리아지는 실행과 반환을 보존하며 상태·종결기록·단일 draft를 건너뛴다', async () => {
@@ -1632,9 +1695,9 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     });
     expect(executions).toBe(1);
     expect(result.result.stage).toBe('merged');
-    expect(closed).toEqual([]);
+    expect(closed).toEqual([pr(2), pr(3), pr(4)]);
     expect(comments).toEqual([]);
-    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ runId: null, closed: [], skipped: { running: 0, probableRunning: 1, unknown: 1, alreadyTriaged: 1, noRunId: 0 } }) }));
+    expect(events).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ runId: null, closed: [2, 3, 4], decisions: expect.objectContaining({ live: 1, staleEndedRun: 3 }) }) }));
   });
 
   it('종결 트리아지 조회 실패는 PR 변경 없이 execute를 보존하고 error 사건을 남긴다', async () => {
@@ -1676,7 +1739,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       });
     });
     expect(comments).toEqual([]);
-    expect(failures).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ closeFailed: [1] }) }));
+    expect(failures).toContainEqual(expect.objectContaining({ event: 'draft-triage-start', data: expect.objectContaining({ closeFailed: [1, 2] }) }));
 
     await executeAfterStartDraftTriage('start triage already closed', async () => selfResult({ stage: 'merged', merged: true }), {
       queryAbandonedDraftPrs: () => [
@@ -1756,15 +1819,15 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
           closeDraftPr: (url: string) => { closed.push(url); return true; },
         });
       });
-      expect(closed).toEqual([pr(2)]);
+      expect(closed).toEqual([pr(1), pr(2), pr(3)]);
       expect(events).toContainEqual(expect.objectContaining({
         event: 'draft-triage-start',
         data: expect.objectContaining({
-          skipped: expect.objectContaining({ alreadyTriaged: 1 }),
+          decisions: expect.any(Object),
           budgetUnprocessed: 0,
         }),
       }));
-      expect(restoreTargets).toHaveBeenCalledTimes(1);
+      expect(restoreTargets).toHaveBeenCalledTimes(0);
     } finally {
       restoreTargets.mockRestore();
       rmSync(dir, { recursive: true, force: true });
@@ -1808,10 +1871,10 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
         });
       });
       expect(executions).toBe(1);
-      expect(closed).toEqual([]);
+      expect(closed).toEqual([pr(1), pr(2)]);
       expect(events).toContainEqual(expect.objectContaining({
         event: 'draft-triage-start',
-        data: expect.objectContaining({ considered: [], error: expect.stringMatching(/Unexpected token|JSON Parse error|malformed/) }),
+        data: expect.objectContaining({ considered: ['ended'], decisions: expect.objectContaining({ staleEndedRun: 2 }) }),
       }));
     } finally {
       restoreTargets.mockRestore();
@@ -1826,7 +1889,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       });
     });
     expect(events.filter(({ event }) => event === 'draft-triage-start')).toEqual([
-      expect.objectContaining({ data: expect.objectContaining({ considered: [], closed: [], kept: [], closeFailed: [], skipped: { running: 0, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 0 }, runningRunsQueried: false }) }),
+      expect.objectContaining({ data: expect.objectContaining({ considered: [], closed: [], kept: [], closeFailed: [], decisions: expect.any(Object), runningRunsQueried: false }) }),
     ]);
   });
 

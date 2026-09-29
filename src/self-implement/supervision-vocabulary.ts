@@ -43,8 +43,15 @@ export function mapBrainAction(
 ): SupervisionVerdict {
   switch (action) {
     case 'wait':
+    case 'handoff':
       return CONTINUE;
+    case 'ask-human':
+      return { verdict: 'escalate' };
     case 'input':
+    case 'key':
+    case 'mouse':
+    case 'resize':
+      // 두뇌가 PTY 에 직접 행동(키·마우스·크기)을 낸 것도 «입력을 넣어 돕는다» 와 같은 판정이다.
       return assist('context');
     case 'done':
       return stallConfirmed ? ABANDON : COMPLETE;

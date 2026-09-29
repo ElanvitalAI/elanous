@@ -1,6 +1,8 @@
 import { loadScenarioCatalog, type ScenarioCatalog } from '../scenarios/index.js';
 import { registerScenarioRuntimes } from '../tool-runtime/scenario-runtimes.js';
-import { mountScenarioIntoTarget, type ScenarioTargetMountDeps } from '../tool-runtime/scenario-target-mount.js';
+import { mountScenarioIntoModal } from '../tool-runtime/scenario-modal-mount.js';
+import { mountScenarioIntoWidget } from '../tool-runtime/scenario-widget-mount.js';
+import { unsupportedRunScenarioTargetError } from '../tool-runtime/scenario-target-mount.js';
 import type { ModalPlacement, Layout } from '../layout/types.js';
 import type { SurfaceAddress } from '../surface/address.js';
 import {
@@ -31,11 +33,7 @@ export const DASHBOARD_SCENARIO_MANAGED_WIDGET_IDS = [
   'wd-notification-bell',
 ] as const;
 
-export interface DashboardScenarioRuntimeBootDeps
-  // getDashboardManagedWidgetIds is supplied internally by
-  // handleScenarioMount (from DASHBOARD_SCENARIO_MANAGED_WIDGET_IDS), so
-  // it is NOT part of the caller-facing contract.
-  extends Omit<ScenarioTargetMountDeps, 'getDashboardManagedWidgetIds'> {
+export interface DashboardScenarioRuntimeBootDeps {
   scenarioCatalog: ScenarioCatalog | undefined;
   spawnWidget: (spec: {
     type: string;
@@ -45,13 +43,13 @@ export interface DashboardScenarioRuntimeBootDeps
     meta?: Record<string, unknown>;
   }) => { id: string };
   disposeWidget: (id: string) => void;
-  // 부모 ScenarioTargetMountDeps 의 구체 타입과 정합(unknown 은 extends 를 깨뜨림).
   getDashboardModals: () => readonly ModalPlacement[];
   setDashboardModals: (modals: readonly ModalPlacement[]) => void;
   getPluginLayout: () => Layout | null;
   setPluginLayout: (layout: Layout) => void;
   registerScenario?: typeof registerScenarioRuntimes;
-  mountIntoTarget?: typeof mountScenarioIntoTarget;
+  mountIntoModal?: typeof mountScenarioIntoModal;
+  mountIntoWidget?: typeof mountScenarioIntoWidget;
 }
 
 export async function loadDashboardScenarioCatalog(
@@ -80,19 +78,21 @@ function handleScenarioMount(
   deps: DashboardScenarioRuntimeBootDeps,
 ): { mounted: boolean; error?: string } {
   if (target) {
-    return (deps.mountIntoTarget ?? mountScenarioIntoTarget)(widgets, target, {
-      registry: deps.registry,
-      createPaneContent: deps.createPaneContent,
-      spawnWidget: (spec) => deps.spawnWidget(spec),
-      disposeWidget: (id) => {
-        try { deps.disposeWidget(id); } catch { /* ignore absent */ }
-      },
+    if (target.kind !== 'modal' && target.kind !== 'widget') {
+      return { mounted: false, error: unsupportedRunScenarioTargetError(target) };
+    }
+    const mountDeps = {
+      spawnWidget: deps.spawnWidget,
+      disposeWidget: deps.disposeWidget,
       getDashboardModals: deps.getDashboardModals,
       setDashboardModals: deps.setDashboardModals,
       getPluginLayout: deps.getPluginLayout,
       setPluginLayout: deps.setPluginLayout,
       getDashboardManagedWidgetIds: () => [...DASHBOARD_SCENARIO_MANAGED_WIDGET_IDS],
-    });
+    };
+    return target.kind === 'modal'
+      ? (deps.mountIntoModal ?? mountScenarioIntoModal)(widgets, target.modalId, mountDeps)
+      : (deps.mountIntoWidget ?? mountScenarioIntoWidget)(widgets, target.widgetId, mountDeps);
   }
   for (const widget of widgets) {
     try {

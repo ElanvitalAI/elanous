@@ -1,42 +1,26 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, mock, test } from 'bun:test';
 
 import { createLayout } from '../src/layout/host.js';
-import { DisplayCoordinator } from '../src/display/coordinator.js';
+import type { ModalPlacement } from '../src/layout/types.js';
 import {
   isRunScenarioMountTargetKind,
   mountScenarioIntoTarget,
   RUN_SCENARIO_MOUNT_TARGET_KINDS,
   unsupportedRunScenarioTargetError,
 } from '../src/tool-runtime/scenario-target-mount.js';
-import { logWidget } from '../src/ui/declarative/index.js';
-import { createAddressBook } from '../src/virtual-windows/addressing.js';
-import { createPaneContent } from '../src/virtual-windows/pane-content.js';
-import { WindowRegistry } from '../src/virtual-windows/window-registry.js';
 
 function makeDeps() {
-  const registry = new WindowRegistry({
-    addressBook: createAddressBook(),
-    coordinator: new DisplayCoordinator({ frameMs: 0 }),
-    defaultBounds: () => ({ row: 1, col: 1, width: 80, height: 24 }),
-  });
-  registry.spawn({
-    title: 'target',
-    initialContent: { kind: 'markdown', text: 'seed' },
-  });
-
-  let dashboardModals = [{ id: 'picker', widgetInstanceId: 'old-widget', position: 'center' as const }];
+  let dashboardModals: ModalPlacement[] = [{ id: 'picker', widgetInstanceId: 'old-widget', position: 'center' }];
   let pluginLayout = createLayout(
     [{ height: 'flex', cells: [{ widgetInstanceId: 'plugin-widget', width: 'flex' }] }],
     [],
   );
 
   return {
-    registry,
-    createPaneContent,
     spawnWidget: () => ({ id: 'new-widget' }),
     disposeWidget: () => {},
     getDashboardModals: () => dashboardModals,
-    setDashboardModals: (modals: readonly typeof dashboardModals[number][]) => { dashboardModals = [...modals]; },
+    setDashboardModals: (modals: readonly ModalPlacement[]) => { dashboardModals = [...modals]; },
     getPluginLayout: () => pluginLayout,
     setPluginLayout: (layout: typeof pluginLayout) => { pluginLayout = layout; },
     getDashboardManagedWidgetIds: () => ['wd-log'],
@@ -46,12 +30,12 @@ function makeDeps() {
 describe('scenario-target-mount', () => {
   test('mount target kind roster is explicit and closed', () => {
     expect(RUN_SCENARIO_MOUNT_TARGET_KINDS).toEqual([
-      'window',
-      'pane',
       'modal',
       'widget',
     ]);
-    expect(isRunScenarioMountTargetKind('window')).toBe(true);
+    expect(isRunScenarioMountTargetKind('window')).toBe(false);
+    expect(isRunScenarioMountTargetKind('pane')).toBe(false);
+    expect(isRunScenarioMountTargetKind('modal')).toBe(true);
     expect(isRunScenarioMountTargetKind('widget')).toBe(true);
     expect(isRunScenarioMountTargetKind('input')).toBe(false);
     expect(isRunScenarioMountTargetKind('popover')).toBe(false);
@@ -64,15 +48,20 @@ describe('scenario-target-mount', () => {
     expect(unsupportedRunScenarioTargetError({ kind: 'bg', bgId: 'job-1' })).toMatch(/background\/session surface/);
   });
 
-  test('pane target validates windowId before dispatch', () => {
+  test('window and pane targets do not mount or spawn widgets', () => {
     const deps = makeDeps();
-    const result = mountScenarioIntoTarget(
-      [{ type: 'markdown', config: { text: 'hello' } }],
-      { kind: 'pane', ref: { windowId: 'NaN', paneId: 'pane-1' } },
-      deps,
-    );
-    expect(result.mounted).toBe(false);
-    expect(result.error).toMatch(/not a valid VW id/);
+    const spawnWidget = mock(deps.spawnWidget);
+    deps.spawnWidget = spawnWidget;
+    for (const target of [
+      { kind: 'window' as const, windowId: 1 },
+      { kind: 'pane' as const, ref: { windowId: '1', paneId: 'pane-1' } },
+    ]) {
+      expect(mountScenarioIntoTarget([{ type: 'markdown', config: { text: 'hello' } }], target, deps)).toEqual({
+        mounted: false,
+        error: `RunScenario: target kind "${target.kind}" is not a scenario mount destination`,
+      });
+    }
+    expect(spawnWidget).not.toHaveBeenCalled();
   });
 
   test('non-mount target kind returns shared unsupported error from the dispatcher', () => {
@@ -88,14 +77,17 @@ describe('scenario-target-mount', () => {
     });
   });
 
-  test('window target accepts a builder-authored scenario', () => {
+  test('modal and widget targets still dispatch through their mount helpers', () => {
     const deps = makeDeps();
-    const windowId = deps.registry.list()[0]!.id;
-    const result = mountScenarioIntoTarget(
-      [logWidget('Telemetry').setLines(['> ready'])],
-      { kind: 'window', windowId },
+    expect(mountScenarioIntoTarget(
+      [{ type: 'log', config: { lines: ['> ready'] } }],
+      { kind: 'modal', modalId: 'picker' },
       deps,
-    );
-    expect(result).toEqual({ mounted: true });
+    )).toEqual({ mounted: true });
+    expect(mountScenarioIntoTarget(
+      [{ type: 'log', config: { lines: ['> next'] } }],
+      { kind: 'widget', widgetId: 'new-widget' },
+      deps,
+    )).toEqual({ mounted: true });
   });
 });

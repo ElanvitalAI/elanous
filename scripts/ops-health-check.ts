@@ -24,9 +24,16 @@ import { opsHealth, type OpsAnomaly } from '../src/domains/ops-status.js';
 import { recordAutonomousActionSafe } from '../src/domains/autonomy-log.js';
 import { sendOutbound } from '../src/domains/outbound-alert.js';
 import { getUserConfig } from '../src/user-config.js';
+import { elanousStateRoot } from '../src/autopilot/state-paths.js';
 
 const LOG = join(homedir(), '.elanous/conatus/ops_health.log');
-const STATE = join(homedir(), '.elanous/ops_health_state.json');
+// `--only <kind,...>` narrows what is judged and alerted (🅢 2026-09-28: only repeated_failure — the other kinds are noise today).
+// A narrowed run keeps its own dedup signature so it never overwrites the full run's memory, and both follow the
+// same state root as the log store (ELANOUS_STATE_DIR) — a test universe must not touch the operator's signature.
+const onlyArg = (() => { const i = process.argv.indexOf('--only'); return i >= 0 ? process.argv[i + 1] : undefined; })();
+if (process.argv.includes('--only') && (!onlyArg || onlyArg.startsWith('--'))) { console.error('ops-health-check: --only needs <kind,...>'); process.exit(2); }
+const ONLY_KINDS: ReadonlySet<string> | null = onlyArg ? new Set(onlyArg.split(',').map((k) => k.trim()).filter(Boolean)) : null;
+const STATE = join(elanousStateRoot(), ONLY_KINDS ? `ops_health_state.only-${[...ONLY_KINDS].sort().join('+')}.json` : 'ops_health_state.json');
 
 function logLine(s: string): void {
   const line = `${new Date().toISOString()} ${s}`;
@@ -61,7 +68,9 @@ function attemptSelfHeal(anomalies: OpsAnomaly[]): void {
 const asJson = process.argv.includes('--json');
 const force = process.argv.includes('--force');
 
-const report = opsHealth();
+const full = opsHealth();
+const anomalies = ONLY_KINDS ? full.anomalies.filter((a) => ONLY_KINDS.has(a.kind)) : full.anomalies;
+const report = { ...full, anomalies, healthy: anomalies.length === 0 };
 
 if (asJson) {
   console.log(JSON.stringify(report, null, 2));
@@ -98,7 +107,10 @@ if (changed) {
   const msg = `⚠️ 운영 상태 경보 — 자율 시스템 이상 ${report.anomalies.length}건\n\n${lines.join('\n')}${more}\n\n관측+알림만 자동(개입=대표 결정). 상세: elanous ops health`;
   const ok = sendOutbound(msg, 'ops-health');
   logLine(`[ops-health] 대표 알림 ${ok ? '발송' : '실패'}.`);
-  saveSignature(sig);
+  // Remember the signature only once it was delivered — a failed send must retry next run, not go silent forever
+  // (measured 2026-09-28: a failed first send saved the signature and the second run went «동일 이상 지속 — 무음»).
+  if (ok) saveSignature(sig);
+  else logLine('[ops-health] 발송 실패 — 시그니처를 저장하지 않는다(다음 실행이 다시 보낸다).');
 } else {
   logLine('[ops-health] 동일 이상 지속 — 중복 알림 무음(시그니처 변화 없음).');
 }

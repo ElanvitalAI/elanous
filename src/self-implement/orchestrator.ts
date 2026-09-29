@@ -60,11 +60,15 @@ export function formatAutoMergeSuccessMessage(input: {
 }
 
 import { GoalRunStore, insertGoalRunRecord, type GoalPriorRuns } from './goal-run-store.js';
+import { writeGoalRunRecordFragment } from './goal-execution-records.js';
+import { getUserConfig } from '../user-config.js';
 import { appendRunLedgerEntry, loadRunLedger, parseRunShardIdentity, queryRunChain, type RunChainShardSibling, type RunLedgerEntry, type RunLedgerWriter, type RunOriginData, type RunShardIdentity } from './run-ledger.js';
 import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSupersedeOpenDraft } from './lineage-supersede.js';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
 import { debug } from '../debug/log.js';
+import { emitDecision } from '../live/detail-switch.js';
+import { reworkDecision } from './decision-events.js';
 import type { LogSink } from '../mss/logging/sink.js';
 import type { LogQuery, LogStoreRow } from '../mss/logging/log-store.js';
 import { refreshCodexQuotaSignals } from '../budget/codex-quota-refresh.js';
@@ -178,7 +182,9 @@ import { formatLlmMergeOutcome } from '../autopilot/build/llm-conflict-merge.js'
 import { FOUND_CITED_PATH_REFUTATION_QUOTE, MISSING_CITED_PATH_REFUTATION_QUOTE, MUST_FIX_REFUTATION_ACKNOWLEDGEMENT_WITH_REASON, REFUTATION_QUOTE_GRAMMAR, observeMustFixCitedPaths, parseMustFixRefutationAcknowledgement, parseMustFixRefutations, renderMustFixCitedPathFacts, snapshotMustFixFindings, stableMustFixId, type ReflectEvidenceFacts, type ReflectGateFacts, type MustFixCitedPathFact, type MustFixFinding, type MustFixRecurrenceHistory, type MustFixRefutation, type MustFixRefutationKind } from './reflect-mustfix.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
 import { buildReviewIntent } from '../agent-substrate/review-intent.js';
+import { collectPriorDraftFindings, goalTitleFromTargetGoalFile } from './prior-draft-findings.js';
 import { resolveDesignCheck, type DesignCheckOutcome } from '../design/design-check.js';
+import { runDesignGate, type DesignGateResult } from '../design/design-gate.js';
 import type { ReviewerContextBudget } from '../agent-substrate/pr-reviewer.js';
 import { persistReviewArtifact, type ReviewArtifactWriter } from '../agent-substrate/review-artifact.js';
 import { createArtifactStore } from '../artifact/index.js';
@@ -603,6 +609,7 @@ export interface ReviewDiffContext {
   goalDocumentPath?: string;
   round?: number;
   appliedLastRound?: readonly string[];
+  priorRunFindings?: import('./prior-draft-findings.js').PriorDraftFinding[];
   /** Existing run-chain projection of sibling shards; absent means no sibling runs were observed. */
   shardSiblings?: {
     items: readonly RunChainShardSibling[];
@@ -635,6 +642,8 @@ export interface ReviewDiffContext {
   };
   /** Read-only comparison of the worktree DESIGN.md declaration and installed craft rulebooks. */
   designCheck?: DesignCheckOutcome;
+  /** Deterministic design-token result supplied to review, never the implementation gate. */
+  designGate?: DesignGateResult | { unmeasured: string };
 }
 
 /** 런 사실(커밋 제목·변경 파일)을 fail-soft 로 걷어 온다. seam(git) 이 실패하면 그 종류를 생략하고,
@@ -966,10 +975,14 @@ export interface SelfImplementSeams {
    *  `buildReviewIntent` 가 `goal` 하나로 직접 추출한다(`extractIntentBlocks` · 결정론 · LLM 0).
    *  ⇒ 같은 값을 두 경로로 나르면 갈라진다. 골을 SSOT 로 둔다. */
   reviewDiff?: (cwd: string, ctx?: ReviewDiffContext) => Promise<SelfImplementReview>;
+  /** Read-only prior-draft reviewer findings; tests inject the lookup to avoid network access. */
+  collectPriorDraftFindings?: typeof collectPriorDraftFindings;
   /** Existing run-chain query projection. The orchestrator only selects the current entry's producer-computed siblings. */
   queryRunChain?: () => { entries: readonly { runId: string; prNumber?: number | null; merged?: boolean; shardSiblings: readonly RunChainShardSibling[] }[] };
   /** Computes the worktree's design declaration verdict for review context; informational only. */
   resolveDesignCheck?: (worktreePath: string) => DesignCheckOutcome;
+  /** Read-only design-token check for HTML/CSS changes; exceptions remain review-visible. */
+  runDesignGate?: typeof runDesignGate;
   /** 실행 원장 우선, 기존 base 브랜치 PR 코멘트 폴백으로 자동 반영 항목을 읽는다. 실패·부재는 빈 목록으로 수렴한다. */
   findAppliedReviewItems?: (branch: string, goalId?: string) => Promise<{ basePrLocated: boolean; items: readonly string[]; headlineComments?: number; source?: 'ledger' | 'pr-comment' | 'unavailable' }>;
   /** ★ 반사-기각 seam(RFC-selfdev-judgment-context-substrate Facet C) — must-fix 재주입 前 각 항목을
@@ -1845,7 +1858,6 @@ export type GoalRunRecordWriter = (goalFile: string, record: GoalExecutionRecord
 
 export function appendGoalExecutionRecord(goalFile: string, record: GoalExecutionRecord): void {
   const existing = readFileSync(goalFile, 'utf8');
-  if (existing.includes(`- runId: ${record.runId}\n`)) return;
   const entry = [
     '## 실행 기록',
     `- runId: ${record.runId}`,
@@ -1914,6 +1926,14 @@ export function appendGoalExecutionRecord(goalFile: string, record: GoalExecutio
       : []),
     '',
   ].join('\n');
+  const goalId = existing.match(/^- GoalId: ([0-9a-f]{16})$/m)?.[1];
+  if (goalId) {
+    const path = writeGoalRunRecordFragment(goalId, record.runId, entry);
+    logRunAwareFailSoft(record.runId, 'goal-record-fragment-written', { goalId, path });
+  }
+  // Legacy documents without GoalId have no fragment key; retain the append so the run is not lost.
+  if (goalId && getUserConfig().tools.selfImplement.goalRecordInDoc === false) return;
+  if (existing.includes(`- runId: ${record.runId}\n`)) return;
   appendFileSync(goalFile, `${existing.endsWith('\n') ? '' : '\n'}${entry}`);
 }
 
@@ -3366,9 +3386,25 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   let lastParsedSupervisorReason: string | undefined;
   let providerErrorCount = 0;
   let credentialFailureCount = 0;
+  let failureSequence = 0;
+  let lastProviderErrorSeq = 0;
+  let lastCredentialFailureSeq = 0;
+  let lastFailedGateSeq = 0;
+  let lastMustFixReviewSeq = 0;
+  const recordFailureVerdict = async (kind: 'gate' | 'review'): Promise<void> => {
+    // Capture child errors at the verdict boundary, not when terminal reporting eventually reads them.
+    await mergeChildProviderErrors();
+    if (kind === 'gate') lastFailedGateSeq = ++failureSequence;
+    else lastMustFixReviewSeq = ++failureSequence;
+  };
+  const latestVerdictSeq = (): number => Math.max(lastFailedGateSeq, lastMustFixReviewSeq);
+  const hasCurrentProviderError = (): boolean => providerErrorCount > 0 && lastProviderErrorSeq > latestVerdictSeq();
+  const hasCurrentCredentialFailure = (): boolean => credentialFailureCount > 0 && lastCredentialFailureSeq > latestVerdictSeq();
   let lastProviderError: { provider?: string; message?: string } | undefined;
   let lastCredentialFailure: { provider?: string; message?: string } | undefined;
   let childProviderErrorQueryStatus: 'found' | 'none' | 'unavailable' | 'not-configured' = 'not-configured';
+  let queriedProviderErrorCount = 0;
+  let queriedCredentialFailureCount = 0;
   const providerErrorsForResult = (): Pick<SelfImplementResult, 'providerErrors'> => {
     if (providerErrorCount === 0) return {};
     const message = lastProviderError?.message ?? '';
@@ -3388,8 +3424,14 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       const result = await query({ runId, sinceMs: startedAtMs, untilMs: Date.now() });
       childProviderErrorQueryStatus = result.status;
       if (result.status !== 'found') return;
-      providerErrorCount += result.providerErrorCount;
-      credentialFailureCount += result.credentialFailureCount;
+      const newProviderErrors = Math.max(0, result.providerErrorCount - queriedProviderErrorCount);
+      const newCredentialFailures = Math.max(0, result.credentialFailureCount - queriedCredentialFailureCount);
+      providerErrorCount += newProviderErrors;
+      credentialFailureCount += newCredentialFailures;
+      if (newProviderErrors > 0) lastProviderErrorSeq = ++failureSequence;
+      if (newCredentialFailures > 0) lastCredentialFailureSeq = newProviderErrors > 0 ? lastProviderErrorSeq : ++failureSequence;
+      queriedProviderErrorCount = Math.max(queriedProviderErrorCount, result.providerErrorCount);
+      queriedCredentialFailureCount = Math.max(queriedCredentialFailureCount, result.credentialFailureCount);
       lastProviderError = result.lastProviderError ?? lastProviderError;
       lastCredentialFailure = result.lastCredentialFailure ?? lastCredentialFailure;
     } catch {
@@ -3404,6 +3446,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       if (!data || typeof data !== 'object') return;
       const { provider, message } = data as Record<string, unknown>;
       providerErrorCount++;
+      lastProviderErrorSeq = ++failureSequence;
       lastProviderError = {
         ...(typeof provider === 'string' ? { provider } : {}),
         ...(typeof message === 'string' ? { message } : {}),
@@ -3419,6 +3462,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       //   여기서 문면 정규식으로 다시 재면 소비자마다 다른 답이 나온다.
       if ((data as Record<string, unknown>).authRejected === true) {
         credentialFailureCount++;
+        lastCredentialFailureSeq = lastProviderErrorSeq;
         lastCredentialFailure = { ...lastProviderError };
       }
     },
@@ -3430,9 +3474,11 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   const defaultProviderName = opts.seams.currentProviderName?.() ?? currentProviderName();
   const runProviderName = opts.childLlm?.provider ?? defaultProviderName;
   const logQuotaProvider = (assessment: QuotaExhaustionAssessment | undefined): void => {
-    debug.log('self-implement.abandoned', 'quota-provider', {
-      runProvider: runProviderName, defaultProvider: defaultProviderName, used: assessment?.exhausted !== undefined,
-    });
+    try {
+      debug.log('self-implement.abandoned', 'quota-provider', {
+        runProvider: runProviderName, defaultProvider: defaultProviderName, used: assessment?.exhausted !== undefined,
+      });
+    } catch { /* observation must not change the terminal result */ }
   };
   const instrumentedOpts: SelfImplementOptions = {
     ...opts,
@@ -3802,22 +3848,27 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       (base) => { resolvedBase = base ?? undefined; },
       (basis) => { observationMeasurementBasis = basis; },
       (timeout) => { clarificationTimeout = timeout; },
-      () => providerErrorCount > 0,
-      () => credentialFailureCount > 0,
-      () => providerErrorsForResult().providerErrors?.category,
+      hasCurrentProviderError,
+      hasCurrentCredentialFailure,
+      () => hasCurrentProviderError() ? providerErrorsForResult().providerErrors?.category : undefined,
       (rejectedCount) => { reviewReflectRejectedCount = (reviewReflectRejectedCount ?? 0) + rejectedCount; },
       observeOuter,
       (active) => { runActiveProvider = active; },
       (sessionId) => { terminalSessionId = sessionId; },
       (contract) => { runContract = contract; },
+      recordFailureVerdict,
+      () => providerErrorCount > 0,
+      () => credentialFailureCount > 0,
+      hasCurrentProviderError,
+      hasCurrentCredentialFailure,
     );
     terminalNode = result.node;
     await mergeChildProviderErrors();
     const addressedResult = attachAbandonedClassification(
       attachReviewReflectionOutcome({ ...result, ...providerErrorsForResult(), runId, ...(lastParsedSupervisorReason ? { supervisorReason: lastParsedSupervisorReason } : {}), ...(mergeApprovalReceived ? { mergeApprovalReceived: true } : {}) }),
       opts.goalFile,
-      providerErrorCount > 0,
-      credentialFailureCount > 0,
+      hasCurrentProviderError(),
+      hasCurrentCredentialFailure(),
       opts.seams.inspectCodexRotation,
       runProviderName,
     );
@@ -3898,7 +3949,7 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
       };
       terminalNode = result.node;
       await mergeChildProviderErrors();
-      const addressedResult = attachAbandonedClassification(attachReviewReflectionOutcome({ ...result, ...providerErrorsForResult() }), opts.goalFile, providerErrorCount > 0, credentialFailureCount > 0, opts.seams.inspectCodexRotation, runProviderName);
+      const addressedResult = attachAbandonedClassification(attachReviewReflectionOutcome({ ...result, ...providerErrorsForResult() }), opts.goalFile, hasCurrentProviderError(), hasCurrentCredentialFailure(), opts.seams.inspectCodexRotation, runProviderName);
       logQuotaProvider(addressedResult.quotaExhaustionAssessment);
       observeOuter('child-provider-error-query', { status: childProviderErrorQueryStatus });
       if (lastProviderError) {
@@ -4166,7 +4217,7 @@ export function attachAbandonedClassification(
       ...(quotaExhaustionAssessment.accountAvailability ? { quotaAccountAvailability: quotaExhaustionAssessment.accountAvailability } : {}),
       ...(credentialFailure ? { credentialFailure: true } : {}),
       ...(providerError ? { providerError: true } : {}),
-      ...(result.providerErrors?.category ? { providerErrorCategory: result.providerErrors.category } : {}),
+      ...(providerError && result.providerErrors?.category ? { providerErrorCategory: result.providerErrors.category } : {}),
       worktreePorcelain: worktree.worktreePorcelain,
       ...(worktree.gitResidue ? { gitResidue: worktree.gitResidue } : {}),
       ...(result.completionDisposition ? { completionDisposition: result.completionDisposition } : {}),
@@ -4365,6 +4416,11 @@ async function runSelfImplementInner(
   onActiveProvider: (active: { provider?: string; model?: string; auth?: string }) => void = () => {},
   onSessionCreated: (sessionId: string) => void = () => {},
   onRunContractResolved: (contract: RunContract) => void = () => {},
+  onFailureVerdict: (kind: 'gate' | 'review') => Promise<void> = async () => {},
+  hasObservedProviderError: () => boolean = hasProviderError,
+  hasObservedCredentialFailure: () => boolean = hasCredentialFailure,
+  hasCurrentProviderError: () => boolean = hasProviderError,
+  hasCurrentCredentialFailure: () => boolean = hasCredentialFailure,
 ): Promise<Omit<SelfImplementResult, 'runId'>> {
   const s = opts.seams;
   const pipelineStartedAtMs = Date.now();
@@ -4908,8 +4964,23 @@ async function runSelfImplementInner(
       observe('review-context-carried', { base: opts.base, basePrLocated: false, carriedItems: 0, headlineComments: 0, source: 'unavailable', error: true, reason: 'lookup-failed' }, { level: 'warn' });
     }
   }
+  const goalTitle = opts.goalFile ? goalTitleFromTargetGoalFile(opts.goalFile, wt.path) : undefined;
+  let priorRunFindings: Awaited<ReturnType<typeof collectPriorDraftFindings>> = [];
+  if (goalTitle) {
+    try {
+      priorRunFindings = await (s.collectPriorDraftFindings ?? collectPriorDraftFindings)({ goalTitle, currentRunId: runId, repoPath: wt.path });
+    } catch (error) {
+      observe('prior-findings.unreadable', { error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (priorRunFindings.length) {
+    observe('prior-findings.loaded', {
+      prs: priorRunFindings.length,
+      items: priorRunFindings.reduce((sum, finding) => sum + finding.items.length, 0),
+    });
+  }
   let appliedLastRound: string[] | undefined;
-  let reviewIntent = buildReviewIntent({ goal: opts.feature, goalFile: opts.goalFile });
+  let reviewIntent = buildReviewIntent({ goal: opts.feature, goalFile: opts.goalFile, ...(priorRunFindings.length ? { priorRunFindings } : {}) });
   // ⛔⭐ 리뷰 루프가 만든 마지막 컨텍스트를 잡아 둔다 — PR 본문 조립 직전에 **최종 커밋**의
   //   런 사실로 갱신하기 위해서다(3R must-fix). 루프 안 수집은 `openPr` 단계가 만드는 커밋을
   //   못 본다: 자식은 파일만 남기고 실제 커밋은 `commitWork` 가 루프 뒤에서 만든다.
@@ -5099,9 +5170,9 @@ async function runSelfImplementInner(
       ...(opts.goalFile ? { goalType: goalTypeFields(opts.goalFile).goalType } : {}),
       ...(quotaExhaustionAssessment.exhausted ? { quotaExhausted: true } : {}),
       ...(quotaExhaustionAssessment.accountAvailability ? { quotaAccountAvailability: quotaExhaustionAssessment.accountAvailability } : {}),
-      ...(hasCredentialFailure() ? { credentialFailure: true } : {}),
-      ...(hasProviderError() ? { providerError: true } : {}),
-      ...(providerErrorCategory() ? { providerErrorCategory: providerErrorCategory() } : {}),
+      ...(hasCurrentCredentialFailure() ? { credentialFailure: true } : {}),
+      ...(hasCurrentProviderError() ? { providerError: true } : {}),
+      ...(hasCurrentProviderError() && providerErrorCategory() ? { providerErrorCategory: providerErrorCategory() } : {}),
       worktreePorcelain: worktree.worktreePorcelain,
       ...(worktree.gitResidue ? { gitResidue: worktree.gitResidue } : {}),
       ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}),
@@ -5487,21 +5558,27 @@ async function runSelfImplementInner(
       ...(opts.goalFile ? { goalType: goalTypeFields(opts.goalFile).goalType } : {}),
       ...(quotaExhaustionAssessment.exhausted ? { quotaExhausted: true } : {}),
       ...(quotaExhaustionAssessment.accountAvailability ? { quotaAccountAvailability: quotaExhaustionAssessment.accountAvailability } : {}),
-      ...(hasCredentialFailure() ? { credentialFailure: true } : {}),
-      ...(hasProviderError() ? { providerError: true } : {}),
-      ...(providerErrorCategory() ? { providerErrorCategory: providerErrorCategory() } : {}),
+      ...(hasCurrentCredentialFailure() ? { credentialFailure: true } : {}),
+      ...(hasCurrentProviderError() ? { providerError: true } : {}),
+      ...(hasCurrentProviderError() && providerErrorCategory() ? { providerErrorCategory: providerErrorCategory() } : {}),
       worktreePorcelain: worktree.worktreePorcelain,
       ...(worktree.gitResidue ? { gitResidue: worktree.gitResidue } : {}),
       stage: isReviewRework(reworkKind) ? 'review-blocked' : 'gate-failed',
       reviewResultObserved: review !== undefined,
       mustFixReported: (review?.mustFix.length ?? 0) > 0,
     });
+    observe('rework-salvage-classification', { ...abandonedClassification, branch: wt.branch });
+    // Salvage may resume an observed environment interruption even when a later
+    // gate/review verdict is the terminal classification. Keep its cause distinct.
+    const salvageClassification = abandonedClassification.classification === 'implementation-deficit' && hasObservedProviderError()
+      ? hasObservedCredentialFailure() ? 'credential-failure' : 'provider-error'
+      : abandonedClassification.classification;
     const decision = decideReworkSalvage({
       hardCapBlockedExtend,
       goalFile: opts.goalFile,
       salvageAttempt: opts.salvageAttempt,
       evidence,
-      abandonedClassification: abandonedClassification.classification,
+      abandonedClassification: salvageClassification,
     });
     if (decision.action !== 'launch') {
       const reason = decision.reason;
@@ -5514,7 +5591,7 @@ async function runSelfImplementInner(
     const launchObservation = {
       branch: wt.branch,
       goalFile: opts.goalFile,
-      ...(environmentReason ? { reason: environmentReason, abandonedClassification: abandonedClassification.classification } : {}),
+      ...(environmentReason ? { reason: environmentReason, abandonedClassification: salvageClassification } : {}),
       ...(salvageEvidence ? { clean: salvageEvidence.clean, aheadCommits: salvageEvidence.aheadCommits } : {}),
     };
     observe('rework-salvage', { action: 'launching', ...launchObservation });
@@ -5960,6 +6037,9 @@ async function runSelfImplementInner(
     progress('implementing', round === 0
       ? '구현 중 (헤드리스 goal-loop·수분 소요)…'
       : formatReworkProgressLine(round, effectiveMax, escalateTier, attemptOrdinal));
+    if (round > 0) {
+      try { emitDecision(reworkDecision({ runId, round, effectiveMax, escalateTier, kind: reworkKind })); } catch { /* observation must not interrupt rework */ }
+    }
     let reworkArtifactPath: string | undefined;
     if (round > 0) {
       try {
@@ -6286,6 +6366,7 @@ async function runSelfImplementInner(
       : gate.passed ? 'gate 통과' : `gate 실패(라운드 ${round})`);
     if (gate.passed) lastGateUnverifiedKey = undefined;
     if (!gate.passed) {
+      await onFailureVerdict('gate');
       const facts = gate.reflectGateFacts;
       const failureDisposition = decideGateFailureDisposition(facts);
       // 타임아웃«뿐» — 도입 0 · 미분류 0 · 자식 책임 없음. 재작업으로 보내지 않고 리뷰로 진행한다.
@@ -6416,6 +6497,26 @@ async function runSelfImplementInner(
         path: designCheck.path,
       });
     }
+    const runFacts = collectRunFacts(wt.path);
+    let designGate: ReviewDiffContext['designGate'];
+    // Git porcelain collapses untracked directories to `site/`; inspect their files too.
+    let untrackedFiles: string[] = [];
+    if (runFacts.changedFiles?.some((file) => file.endsWith('/'))) {
+      try {
+        const untracked = runGitCommand(wt.path, ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8' });
+        if (untracked.status === 0) untrackedFiles = untracked.stdout.split(/\r?\n/).filter(Boolean);
+      } catch { /* change discovery must not stop review */ }
+    }
+    if ([...(runFacts.changedFiles ?? []), ...(gateRouteFiles ?? []), ...untrackedFiles].some((file) => /\.(?:html|css)$/i.test(file))) {
+      try {
+        designGate = (s.runDesignGate ?? runDesignGate)({ projectDir: wt.path, base: wt.resolvedBase });
+      } catch (error) {
+        designGate = { unmeasured: safeErrorDescription(error) };
+      }
+      observe('design-gate', 'unmeasured' in designGate
+        ? { verdict: null, reason: null, p0Total: null, advisoryTotal: null, files: null, unmeasured: designGate.unmeasured }
+        : { verdict: designGate.verdict, reason: designGate.reason ?? null, p0Total: designGate.p0Total, advisoryTotal: designGate.advisoryTotal, files: designGate.files.length });
+    }
     let goalDocumentPath: string | undefined;
     try {
       goalDocumentPath = opts.goalId ? s.goalDocumentPathByGoalId?.(opts.goalId) : undefined;
@@ -6424,9 +6525,10 @@ async function runSelfImplementInner(
     }
     const reviewContext = {
       runId,
-      ...collectRunFacts(wt.path),
+      ...runFacts,
       goal: opts.feature,
       goalFile: opts.goalFile,
+      ...(priorRunFindings.length ? { priorRunFindings } : {}),
       ...(goalDocumentPath ? { goalDocumentPath } : {}),
       round,
       ...((round === 0 ? carriedAppliedItems : appliedLastRound)?.length
@@ -6439,6 +6541,7 @@ async function runSelfImplementInner(
       // ⛔⭐ 하니스가 이미 센 것을 판정자에게 준다(원장 `JDG-S4`·`JDG-S5` — 로그에만 있으면 못 본다).
       ...(evidenceCoverage ? { evidenceCoverage } : {}),
       ...(designCheck ? { designCheck } : {}),
+      ...(designGate ? { designGate } : {}),
       ...(gateEvidence ? { gateEvidenceNote: gateEvidence } : {}),
       ...(gate.baselineFailures?.some((failure) => failure.attribution === 'preexisting')
         ? { preexistingTestFailures: gate.baselineFailures
@@ -6465,6 +6568,7 @@ async function runSelfImplementInner(
         throw error;
       }
       onReviewFindings(round, review.mustFix);
+      if (review.mustFix.length > 0) await onFailureVerdict('review');
       const reviewFindings = snapshotMustFixFindings([...review.mustFix, ...review.shouldFix]);
       const reviewMustFixFindings = reviewFindings.slice(0, review.mustFix.length);
       observeReviewFindingRecurrence(round, review.mustFix);
@@ -6807,6 +6911,7 @@ async function runSelfImplementInner(
         : `${mergeTarget} 정합됨 — 통합 결과 full 재-gate…`);
       onNodeEntry('regate', round);
       const regate = await withStepTimeout(s.gate(wt.path, { runId, mode: 'postsync' }), T.gate, 'gate');
+      if (!regate.passed) await onFailureVerdict('gate');
       // `mode` name/meaning stay: `full` = existing gate including tests. Both
       // conflict-resolved and clean-merge reuse this same `s.gate` invocation.
       const timeoutOnlyPostSync = !regate.passed && postSyncTimeoutOnly(regate.reflectGateFacts);

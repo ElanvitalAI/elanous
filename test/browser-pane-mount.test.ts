@@ -7,7 +7,6 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { DisplayCoordinator } from '../src/display/coordinator.js';
 import { createBrowserPaneModel, refreshBrowserPane } from '../src/browser-pane/model.js';
 import {
-  createBrowserPaneContent,
   createBrowserPaneModalChrome,
   openBrowserPaneModal,
 } from '../src/browser-pane/mount.js';
@@ -28,60 +27,6 @@ afterAll(() => {
 });
 
 describe('browser pane mount', () => {
-  test('renders registry-backed browser content and moves cursor', () => {
-    const registry = new BrowserPaneRegistry();
-    const state = createBrowserPaneModel(ROOT);
-    refreshBrowserPane(state);
-    registry.register('vw-browser:test', state);
-    const pane = createBrowserPaneContent(
-      { kind: 'vw-browser', browserId: 'vw-browser:test', title: 'browser' },
-      { browserPaneRegistry: registry },
-    );
-
-    const first = pane.render({ cols: 60, rows: 6, focused: true });
-    expect(first).toContain('child');
-
-    pane.onKey({ name: 'down' } as never);
-    expect(state.cursor).toBe(1);
-  });
-
-  test('enter on a directory refreshes the cloned browser model', () => {
-    const registry = new BrowserPaneRegistry();
-    const state = createBrowserPaneModel(ROOT);
-    refreshBrowserPane(state);
-    registry.register('vw-browser:test', state);
-    const pane = createBrowserPaneContent(
-      { kind: 'vw-browser', browserId: 'vw-browser:test', title: 'browser' },
-      { browserPaneRegistry: registry },
-    );
-
-    const childIndex = state.entries.findIndex((entry) => entry.absPath === CHILD);
-    expect(childIndex).toBeGreaterThan(0);
-    for (let i = 0; i < childIndex; i++) pane.onKey({ name: 'down' } as never);
-    pane.onKey({ name: 'enter' } as never);
-
-    expect(state.cwd).toBe(CHILD);
-    expect(state.cursor).toBe(0);
-  });
-
-  test('space toggles file selection on the cloned browser model', () => {
-    const registry = new BrowserPaneRegistry();
-    const state = createBrowserPaneModel(ROOT);
-    refreshBrowserPane(state);
-    registry.register('vw-browser:test', state);
-    const pane = createBrowserPaneContent(
-      { kind: 'vw-browser', browserId: 'vw-browser:test', title: 'browser' },
-      { browserPaneRegistry: registry },
-    );
-
-    const fileIndex = state.entries.findIndex((entry) => entry.absPath === FILE_A);
-    expect(fileIndex).toBeGreaterThan(0);
-    for (let i = 0; i < fileIndex; i++) pane.onKey({ name: 'down' } as never);
-    pane.onKey({ name: ' ' } as never);
-
-    expect([...state.selected]).toEqual([FILE_A]);
-  });
-
   test('snapshot browser modal opens as a single-column popup', () => {
     const coordinator = new DisplayCoordinator({ frameMs: 0 });
     const registry = new BrowserPaneRegistry();

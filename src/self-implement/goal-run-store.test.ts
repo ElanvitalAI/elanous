@@ -202,6 +202,55 @@ describe('federated unfinished run ledgers', () => {
   }, 20_000);
 });
 
+describe('GoalRunStore concurrent writers', () => {
+  test('two actual Bun processes persist 200 rows each without busy-lost', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'goal-run-parallel-'));
+    directories.push(dir);
+    const path = join(dir, 'goal-runs.db');
+    const modulePath = new URL('./goal-run-store.ts', import.meta.url).href;
+    const script = `import { GoalRunStore } from ${JSON.stringify(modulePath)};
+      import { debug } from ${JSON.stringify(new URL('../debug/log.ts', import.meta.url).href)};
+      debug.registerSink({ name: 'busy-observer', emit(rec) {
+        if (rec.category === 'store.sqlite' && rec.event === 'busy-lost') console.error('BUSY_LOST', JSON.stringify(rec.data));
+      } });
+      const store = new GoalRunStore(process.argv[1]);
+      const hold = process.argv[2] === 'a';
+      const timeout = store['db'].query('PRAGMA busy_timeout').get().timeout;
+      if (timeout !== 5000) throw new Error('writer busy_timeout must be 5000, got ' + timeout);
+      if (hold) { store['db'].run('BEGIN IMMEDIATE'); console.log('locked'); }
+      try {
+        for (let i = 0; i < 200; i++) store.insert('parallel-goal', {
+          runId: process.argv[2] + '-' + i, stage: 'pr-opened', outcome: 'completed', ok: true,
+          startedAt: '2026-09-29T00:00:00.000Z', rounds: 1, model: 'test-model'
+        }, 'parallel-goal');
+      } finally {
+        if (hold) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+          store['db'].run('COMMIT');
+        }
+        store.close();
+      }`;
+    const launch = (id: string) => Bun.spawn({
+      cmd: [process.execPath, '-e', script, path, id], stdout: 'pipe', stderr: 'pipe',
+      env: { ...process.env, NODE_ENV: 'test' },
+    });
+    const first = launch('a');
+    const reader = first.stdout.getReader();
+    const ready = await reader.read();
+    reader.releaseLock();
+    expect(new TextDecoder().decode(ready.value)).toContain('locked');
+    const workers = [first, launch('b')];
+    const results = await Promise.all(workers.map(async (worker) => ({
+      code: await worker.exited, stderr: await new Response(worker.stderr).text(),
+    })));
+    expect(results.map((result) => result.code)).toEqual([0, 0]);
+    expect(results.flatMap((result) => result.stderr.split('\n').filter((line) => line.startsWith('BUSY_LOST')))).toHaveLength(0);
+    const stored = new GoalRunStore(path, true);
+    try { expect(stored.recordCount()).toBe(400); }
+    finally { stored.close(); }
+  }, 20_000);
+});
+
 describe('GoalRunStore', () => {
   test('keeps both records when the same run ID is recorded twice', () => {
     const { store: goalRunStore, goalFile } = store();

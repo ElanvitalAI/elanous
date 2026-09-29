@@ -61,10 +61,6 @@ import {
   dispatchDashboardViewSwitch,
   dispatchDashboardWidgetInvoke,
 } from './tools/dashboard-view.js';
-import {
-  buildSpawnCodingAgentInVWTool,
-  dispatchSpawnCodingAgentInVW,
-} from './tools/spawn-coding-agent-vw.js';
 import { buildApiCallTool, dispatchApiCall } from './tools/api-call.js';
 import { buildOmniSearchTool, dispatchOmniSearch } from './tools/omni-search.js';
 import { buildMarketQuoteTool, dispatchMarketQuote } from './tools/market-quote.js';
@@ -213,36 +209,6 @@ export const browserSessionDispatchers = {
   BrowserClose: (args: Record<string, unknown>) => dispatchBrowserClose(args),
 };
 
-import {
-  buildWindowListTool,
-  buildWindowCreateTool,
-  buildWindowSwitchTool,
-  buildWindowCloseTool,
-  buildPaneListTool,
-  buildPaneSplitTool,
-  buildPaneFocusTool,
-  buildPaneCloseTool,
-  buildPaneCaptureTool,
-  buildPaneInjectTool,
-  buildBroadcastTool,
-  buildSubscribeTool,
-  buildVWCollectTool,
-  buildVWUnsubscribeTool,
-  dispatchWindowList,
-  dispatchWindowCreate,
-  dispatchWindowSwitch,
-  dispatchWindowClose,
-  dispatchPaneList,
-  dispatchPaneSplit,
-  dispatchPaneFocus,
-  dispatchPaneClose,
-  dispatchPaneCapture,
-  dispatchPaneInject,
-  dispatchBroadcast,
-  dispatchSubscribe,
-  dispatchVWCollect,
-  dispatchVWUnsubscribe,
-} from './tools/virtual-windows.js';
 import { buildAgentTool, dispatchAgent } from './tools/agent.js';
 import { buildSkillToolDisciplinePrompt } from './tool-discipline-prompt.js';
 import {
@@ -1235,8 +1201,6 @@ export async function executeSkill(
     // HT1/HT2: view switch + widget key-event injection.
     buildDashboardViewSwitchTool(),
     buildDashboardWidgetInvokeTool(),
-    // T6-K6: one-call claude-code/codex in a fresh VW.
-    buildSpawnCodingAgentInVWTool(),
     // P9: generic HTTP JSON tool — allowlist + rate-limit gated.
     buildApiCallTool(),
     // P10: parallel multi-provider search (skill-essence extraction
@@ -1316,21 +1280,6 @@ export async function executeSkill(
     buildLlmListNodesTool(),
     buildLlmListAvailableModelsTool(),
     buildLlmRequestInstallTool(),
-    // VW-P9: virtual windows + pane tree + broadcast.
-    buildWindowListTool(),
-    buildWindowCreateTool(),
-    buildWindowSwitchTool(),
-    buildWindowCloseTool(),
-    buildPaneListTool(),
-    buildPaneSplitTool(),
-    buildPaneFocusTool(),
-    buildPaneCloseTool(),
-    buildPaneCaptureTool(),
-    buildPaneInjectTool(),
-    buildBroadcastTool(),
-    buildSubscribeTool(),
-    buildVWCollectTool(),
-    buildVWUnsubscribeTool(),
     // BI-P5: browser + iPhone + HITL confirm
     ...buildBrowserSessionTools(),
     buildIPhoneNotifyTool(),
@@ -1481,10 +1430,6 @@ export async function executeSkill(
       const r = await dispatchDashboardWidgetInvoke(a);
       return { output: r.output };
     },
-    SpawnCodingAgentInVW: async (a) => {
-      const r = await dispatchSpawnCodingAgentInVW(a);
-      return { output: r.output };
-    },
     ApiCall: async (a) => {
       const r = await dispatchApiCall(a);
       return { output: r.output };
@@ -1598,20 +1543,6 @@ export async function executeSkill(
       const r = await dispatchLlmRequestInstall(a);
       return { output: r.output };
     },
-    WindowList:    (a) => dispatchWindowList(a),
-    WindowCreate:  (a) => dispatchWindowCreate(a),
-    WindowSwitch:  (a) => dispatchWindowSwitch(a),
-    WindowClose:   (a) => dispatchWindowClose(a),
-    PaneList:      (a) => dispatchPaneList(a),
-    PaneSplit:     (a) => dispatchPaneSplit(a),
-    PaneFocus:     (a) => dispatchPaneFocus(a),
-    PaneClose:     (a) => dispatchPaneClose(a),
-    PaneCapture:   (a) => dispatchPaneCapture(a),
-    PaneInject:    (a) => dispatchPaneInject(a),
-    BroadcastPanes: (a) => dispatchBroadcast(a),
-    VWSubscribe:   (a) => dispatchSubscribe(a),
-    VWCollect:     (a) => dispatchVWCollect(a),
-    VWUnsubscribe: (a) => dispatchVWUnsubscribe(a),
     ...browserSessionDispatchers,
     IPhoneNotify:        (a) => dispatchIPhoneNotify(a),
     IPhoneOpenUrl:       (a) => dispatchIPhoneOpenUrl(a),

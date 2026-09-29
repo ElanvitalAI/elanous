@@ -59,9 +59,66 @@ describe('host regate: never merge without a measured host pass', () => {
     expect(calls).toContain(`git merge --no-ff --no-commit ${HEAD}`);
     expect(calls.indexOf(`git merge --no-ff --no-commit ${HEAD}`)).toBeLessThan(calls.indexOf('bun scripts/ci-typecheck-changed.ts'));
     expect(calls).toContain('bun scripts/ci-typecheck-changed.ts');
+    expect(calls.indexOf('bun scripts/ci-isolation-hardcode-gate.ts --changed-files src/feature.test.ts')).toBeLessThan(calls.indexOf(`gh pr merge 42 --squash --match-head-commit ${HEAD}`));
     expect(calls).not.toContain('bun bin/elanous.mjs --test nexus build');
     expect(calls).toContain('git worktree remove --force /temp/regate');
     expect(events).toContain('cleanup');
+  });
+
+  test('verifyOnly runs host gates without merging; landing path still merges', async () => {
+    const { deps, calls } = mock();
+    const result = await runHostRegate({ ...input, verifyOnly: true }, deps);
+    expect(result).toMatchObject({ passed: true, status: 'passed' });
+    expect(calls).toContain('bun scripts/ci-isolation-hardcode-gate.ts --changed-files src/feature.test.ts');
+    expect(calls.some((call) => call.startsWith('gh pr merge'))).toBe(false);
+    expect(calls.filter((call) => call === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft')).toHaveLength(2);
+  });
+
+  test('verifyOnly measures on the current base tip even when the PR records an older base, and reports that tip', async () => {
+    const OLD = 'e'.repeat(40);
+    const staleView = JSON.stringify({ headRefOid: HEAD, baseRefName: 'main', baseRefOid: OLD, state: 'OPEN', isDraft: false });
+    const envs: Array<NodeJS.ProcessEnv | undefined> = [];
+    const base = mock().deps.command!;
+    const calls: string[] = [];
+    const { deps } = mock({ command: (bin, args, cwd, env) => {
+      calls.push(`${bin} ${args.join(' ')}`);
+      if (`${bin} ${args.join(' ')}` === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft') return { status: 0, stdout: staleView, stderr: '' };
+      if (bin === 'bun' && args[0] === 'scripts/ci-typecheck-changed.ts') envs.push(env);
+      return base(bin, args, cwd, env);
+    } });
+    const verified = await runHostRegate({ ...input, verifyOnly: true }, deps);
+    expect(verified).toMatchObject({ passed: true, status: 'passed', baseCommit: BASE });
+    expect(calls).toContain(`git worktree add --detach /temp/regate ${BASE}`);
+    expect(envs.at(-1)?.TSC_BASE_REF).toBe(BASE);
+    expect(calls.filter((call) => call.startsWith('gh pr merge'))).toHaveLength(0);
+
+    const landing = await runHostRegate(input, mock({ command: (bin, args, cwd, env) => (`${bin} ${args.join(' ')}` === 'gh pr view 42 --json headRefOid,baseRefName,baseRefOid,state,isDraft'
+      ? { status: 0, stdout: staleView, stderr: '' } : base(bin, args, cwd, env)) }).deps);
+    expect(landing.passed).toBe(false);
+    expect(landing.failures[0]!.detail).toContain('fetched PR base differs from checked SHA');
+  });
+
+  test('verifyOnly keeps unmeasured distinct from a failed gate and cannot merge', async () => {
+    const { deps, calls } = mock({ makeTemp: () => { throw new Error('no temporary worktree'); } });
+    const result = await runHostRegate({ ...input, verifyOnly: true }, deps);
+    expect(result).toMatchObject({ passed: false, status: 'unmeasured', failures: [{ step: 'worktree' }] });
+    expect(calls.some((call) => call.startsWith('gh pr merge'))).toBe(false);
+  });
+
+  test('a new ~/.elanous hardcoding fails the host regate before merge (isolation gate on the changed files)', async () => {
+    const base = mock();
+    const { deps, calls } = mock({ command: (bin, args, cwd, env) => {
+      if (bin === 'bun' && args[0] === 'scripts/ci-isolation-hardcode-gate.ts') {
+        calls.push(`${bin} ${args.join(' ')}`);
+        return { status: 1, stdout: '', stderr: '[isolation-gate] FAIL — src/feature.test.ts: 0 → 1' };
+      }
+      return base.deps.command!(bin, args, cwd, env);
+    } });
+    const result = await runHostRegate(input, deps);
+    expect(result.passed).toBe(false);
+    expect(JSON.stringify(result.failures)).toContain('isolation-gate');
+    expect(calls).toContain('bun scripts/ci-isolation-hardcode-gate.ts --changed-files src/feature.test.ts');
+    expect([...calls, ...base.calls].some((call) => call.startsWith('gh pr merge'))).toBe(false);
   });
 
   test('base moved between the re-read and the merge: merged, but the race is recorded', async () => {
@@ -94,8 +151,10 @@ describe('host regate: never merge without a measured host pass', () => {
     const root = mkdtempSync(join(tmpdir(), 'host-regate-pwa-'));
     const workspace = join(root, 'repo');
     const tree = join(root, 'candidate');
-    mkdirSync(join(workspace, 'apps/pwa/node_modules'), { recursive: true });
-    mkdirSync(join(workspace, 'node_modules'), { recursive: true });
+    mkdirSync(join(workspace, 'apps/pwa/node_modules/next'), { recursive: true });
+    writeFileSync(join(workspace, 'apps/pwa/node_modules/next/package.json'), '{}');
+    mkdirSync(join(workspace, 'node_modules/typescript'), { recursive: true });
+    writeFileSync(join(workspace, 'node_modules/typescript/package.json'), '{}');
     mkdirSync(join(tree, 'apps/pwa'), { recursive: true });
     const { deps, calls } = mock();
     const command = deps.command!;
@@ -115,6 +174,35 @@ describe('host regate: never merge without a measured host pass', () => {
     try {
       expect(await runHostRegate({ ...input, repoRoot: workspace }, deps)).toMatchObject({ passed: true });
       expect(calls).toContain('bun bin/elanous.mjs --test nexus build');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('an install source without installed dependencies gets a fresh install in the candidate, not an empty link', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'host-regate-empty-'));
+    const workspace = join(root, 'repo');
+    const tree = join(root, 'candidate');
+    mkdirSync(join(workspace, 'node_modules'), { recursive: true });
+    mkdirSync(join(workspace, 'apps/pwa/node_modules'), { recursive: true });
+    mkdirSync(join(tree, 'apps/pwa'), { recursive: true });
+    const { deps, calls } = mock();
+    const command = deps.command!;
+    deps.makeTemp = () => tree;
+    deps.removeTemp = () => {};
+    const installs: string[] = [];
+    deps.command = (bin, args, cwd, env) => {
+      if (bin === 'git' && args[0] === 'diff' && args[1] === '--name-only') {
+        calls.push(`${bin} ${args.join(' ')}`);
+        return { status: 0, stdout: 'apps/pwa/src/page.test.ts\n', stderr: '' };
+      }
+      if (bin === 'bun' && args.join(' ') === 'install --frozen-lockfile') installs.push(cwd);
+      return command(bin, args, cwd, env);
+    };
+    try {
+      expect(await runHostRegate({ ...input, repoRoot: workspace }, deps)).toMatchObject({ passed: true });
+      expect(installs).toEqual([tree, join(tree, 'apps/pwa')]);
+      expect(existsSync(join(tree, 'node_modules'))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

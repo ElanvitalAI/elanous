@@ -68,8 +68,7 @@ one.
 
 ## Watch an agent's terminal from a link
 
-:::info On main — next release
-This section describes behaviour on `main` that ships in the release after 0.2.2.
+:::info Since 0.2.3
 :::
 
 When elanous drives a coding CLI (codex, Claude Code, grok) in a terminal of

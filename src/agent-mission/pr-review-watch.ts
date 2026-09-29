@@ -100,6 +100,35 @@ export function pickLatestSignal(raw: RawReviews): ReviewSignal | null {
 // ──────────────────── IO (gh 폴링·상태 db) ──────────────────────────────
 
 export type RunGh = (args: string[]) => string;
+
+export type ReviewWatchGhErrorKind = 'auth' | 'not-found' | 'missing-binary' | 'other';
+
+export class ReviewWatchGhError extends Error {
+  readonly name = 'ReviewWatchGhError';
+
+  constructor(readonly kind: ReviewWatchGhErrorKind, message: string, cause?: unknown) {
+    super(message, { cause });
+  }
+}
+
+/** gh CLI 실패의 stderr와 spawn 오류를 구분한다. 분류 이외의 호출/재시도 정책은 호출부가 결정한다. */
+export function classifyReviewWatchGhError(error: unknown): ReviewWatchGhError {
+  if (error instanceof ReviewWatchGhError) return error;
+  const details = error && typeof error === 'object' ? error as { message?: unknown; stderr?: unknown; code?: unknown } : {};
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : String(error);
+  const stderr = details.stderr == null ? '' : String(details.stderr);
+  const text = `${stderr}\n${message}`;
+  let kind: ReviewWatchGhErrorKind = 'other';
+  if (details.code === 'ENOENT' || /\b(?:gh:\s*)?command not found\b|\bgh:\s*not found\b|\bspawn gh ENOENT\b|\bexecutable file not found\b/i.test(text)) {
+    kind = 'missing-binary';
+  } else if (/\b401\b|\bunauthorized\b|\bbad credentials\b|\bnot logged in\b|\bgh auth login\b|\bauthenticat(?:e|ion)\b/i.test(text)) {
+    kind = 'auth';
+  } else if (/\b404\b|\bnot found\b/i.test(text)) {
+    kind = 'not-found';
+  }
+  return new ReviewWatchGhError(kind, stderr.trim() || message, error);
+}
+
 // env: process.env — cron/launchd 최소 PATH 에서도 ensure-bin-path 가 보강한 PATH 로 gh(/opt/homebrew/bin)를
 // 찾도록 명시 전달(Bun 은 env 미전달 시 startup 스냅샷 PATH 로 해석 → 무음실패).
 const defaultRunGh: RunGh = (args) => execFileSync('gh', args, { encoding: 'utf-8', timeout: 60_000, maxBuffer: 20 * 1024 * 1024, env: process.env });
@@ -124,7 +153,7 @@ export function setLastReviewKey(db: Database, pr: string, key: string, now: str
     [pr, key, now]);
 }
 
-/** opt-in 라벨이 붙은 열린 PR 번호 목록(READ-ONLY 배치). 실패=[]. */
+/** opt-in 라벨이 붙은 열린 PR 번호 목록(READ-ONLY 배치). 조회 실패는 분류해 전달한다. */
 export function fetchLabeledOpenPrs(label: string, deps: { runGh?: RunGh } = {}): string[] {
   const runGh = deps.runGh ?? defaultRunGh;
   try {
@@ -134,8 +163,9 @@ export function fetchLabeledOpenPrs(label: string, deps: { runGh?: RunGh } = {})
   } catch (e) {
     // ⚠️ gh 실패를 무음으로 []로 삼키면 (gh not-in-PATH·auth·network) 라벨 PR 이 항상 0 으로 보여 파이프라인이
     //   조용히 사문화된다(이 버그의 근본). 반드시 관측을 남긴다 — 조회 0 이 '진짜 0' 인지 'gh 실패' 인지 구분.
-    debug.log('review-watch', 'list-prs-error', { label, error: (e as Error).message }, { level: 'error' });
-    return [];
+    const error = classifyReviewWatchGhError(e);
+    debug.log('review-watch', 'list-prs-error', { label, error: error.message, kind: error.kind }, { level: 'error' });
+    throw error;
   }
 }
 
@@ -176,13 +206,13 @@ export function analyzeSignals(raw: RawReviews): SignalAnalysis {
   return { latest: pickLatestSignal(raw), latestHuman: pickLatestHumanSignal(raw) };
 }
 
-/** PR 신호 분석 조회(READ-ONLY). 실패=신호 없음·사람 리뷰 없음. */
+/** PR 신호 분석 조회(READ-ONLY). 조회 실패는 분류해 전달한다. */
 export function fetchSignalAnalysis(pr: string, deps: { runGh?: RunGh } = {}): SignalAnalysis {
   const runGh = deps.runGh ?? defaultRunGh;
   try {
     return analyzeSignals(JSON.parse(runGh(['pr', 'view', pr, '--json', 'reviews,comments'])) as RawReviews);
-  } catch {
-    return { latest: null, latestHuman: null };
+  } catch (e) {
+    throw classifyReviewWatchGhError(e);
   }
 }
 
@@ -208,8 +238,9 @@ export interface PrReviewWatchDeps {
 
 export interface PrReviewWatchOutcome {
   pr: string;
-  /** triggered=발동함 · initial-review-failed=초기리뷰 시도 후 null 반환 · initial-review-error=초기리뷰 예외 · dedup=이미 처리한 리뷰 · bot=자동신호 skip · none=신호없음 · capped=발동한도 초과 대기. */
-  status: 'triggered' | 'initial-review-failed' | 'initial-review-error' | 'dedup' | 'bot' | 'none' | 'capped';
+  /** triggered=발동함 · signal-error=해당 PR 신호 조회 실패 · initial-review-failed=초기리뷰 시도 후 null 반환 · initial-review-error=초기리뷰 예외 · dedup=이미 처리한 리뷰 · bot=자동신호 skip · none=신호없음 · capped=발동한도 초과 대기. */
+  status: 'triggered' | 'signal-error' | 'initial-review-failed' | 'initial-review-error' | 'dedup' | 'bot' | 'none' | 'capped';
+  error?: ReviewWatchGhErrorKind;
   reviewKey?: string;
   result?: ReviewLoopResult | null;
 }
@@ -217,7 +248,7 @@ export interface PrReviewWatchOutcome {
 const defaultTrigger = (pr: string, opts: ReviewLoopOpts) => runReviewLoop(pr, opts);
 
 /** 감시 1사이클 — 라벨 PR 폴링 → 새 사람 리뷰 감지 → runReviewLoop 발동(사이클당 maxTriggers 건). */
-export async function runPrReviewWatchCycle(deps: PrReviewWatchDeps = {}): Promise<PrReviewWatchOutcome[]> {
+export async function runPrReviewWatchCycle(deps: PrReviewWatchDeps = {}): Promise<PrReviewWatchOutcome[] & { authErrors: number }> {
   const db = deps.db ?? openPrReviewWatchDb();
   const ownDb = !deps.db;
   const now = deps.now?.() ?? new Date().toISOString();
@@ -229,8 +260,16 @@ export async function runPrReviewWatchCycle(deps: PrReviewWatchDeps = {}): Promi
 
   const outcomes: PrReviewWatchOutcome[] = [];
   let triggered = 0;
+  let authErrors = 0;
   try {
-    const prs = fetchLabeledOpenPrs(label, ghDep);
+    let prs: string[];
+    try {
+      prs = fetchLabeledOpenPrs(label, ghDep);
+    } catch (e) {
+      const error = classifyReviewWatchGhError(e);
+      debug.log('review-watch', 'cycle-failed', { label, error: error.kind }, { level: 'error' });
+      throw error;
+    }
     const rework = resolveReworkBackendChoice(reviewLoopOpts);
     debug.log('review-watch', 'cycle-start', {
       label, prs: prs.length, maxTriggers,
@@ -239,7 +278,17 @@ export async function runPrReviewWatchCycle(deps: PrReviewWatchDeps = {}): Promi
     });
 
     for (const pr of prs) {
-      const { latest, latestHuman } = fetchSignalAnalysis(pr, ghDep);
+      let analysis: SignalAnalysis;
+      try {
+        analysis = fetchSignalAnalysis(pr, ghDep);
+      } catch (e) {
+        const error = classifyReviewWatchGhError(e);
+        if (error.kind === 'auth') authErrors++;
+        debug.log('review-watch', 'signal-error', { pr, kind: error.kind, error: error.message }, { level: 'error' });
+        outcomes.push({ pr, status: 'signal-error', error: error.kind });
+        continue;
+      }
+      const { latest, latestHuman } = analysis;
       // ★ 트리거 판정은 '최신 미처리 사람 신호(latestHuman)' 기준 — 봇/자기 자동 신호는 무시한다.
       //   ⚠️ self-dev PR 은 내부 리뷰노드/자동 코멘트를 gh 인증 계정(사람 계정)으로 남겨 봇 신호(마커)를
       //   갖는다. '최신 절대 신호'로 판정하면 (a) 봇 신호가 최신이라 skip-bot dead-end(triggered=0 상시의
@@ -308,8 +357,8 @@ export async function runPrReviewWatchCycle(deps: PrReviewWatchDeps = {}): Promi
       debug.log('review-watch', 'triggered', { pr, reviewKey: latestHuman.key, action: result?.action ?? 'error' });
       outcomes.push({ pr, status: 'triggered', reviewKey: latestHuman.key, result });
     }
-    debug.log('review-watch', 'cycle-done', { label, scanned: prs.length, triggered });
-    return outcomes;
+    debug.log('review-watch', 'cycle-done', { label, scanned: prs.length, triggered, authErrors });
+    return Object.assign(outcomes, { authErrors });
   } finally {
     if (ownDb) db.close();
   }

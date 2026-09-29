@@ -5,9 +5,13 @@
 // 「세 번째 사본」을 지킴이에 넣어 막은 그 문제가 다시 열린다.
 
 import { describe, expect, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   DIRECTION_HEADING,
   listDesignDirections,
+  listAllDesignDirections,
   parseDeclaredDirection,
   writeDeclaredDirection,
   attemptDirectionFromDesignMd,
@@ -66,6 +70,59 @@ describe('listDesignDirections — 정본에서 «도출»한다', () => {
     const [plain] = listDesignDirections([fakeTheme('plain')]);
     expect(plain!.isDark).toBe(false);
     expect(plain!.isPastel).toBe(false);
+  });
+});
+
+describe('listAllDesignDirections', () => {
+  test('keeps six themes, adds system tokens and fonts, and lets a theme win an id collision', () => {
+    const root = mkdtempSync(join(tmpdir(), 'all-directions-'));
+    try {
+      writeFileSync(join(root, 'SOURCE.json'), JSON.stringify({ commit: 'abcdef123456' }));
+      for (const [id, bg] of [['web-probe', '#111111'], [THEME_REGISTRY[0]!.name, '#ffffff']]) {
+        const dir = join(root, id);
+        mkdirSync(dir);
+        writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ id, name: 'Web Style', category: 'Modern' }));
+        writeFileSync(join(dir, 'DESIGN.md'), '# Web Style\n> Category: Modern\n> Web-first direction.\n');
+        writeFileSync(join(dir, 'tokens.css'), `:root {\n--bg: ${bg};\n--fg: #eeeeee;\n--accent: #ffcc00;\n--font-display: Display;\n--font-body: Body;\n}`);
+      }
+      const directions = listAllDesignDirections({ systemsDir: root });
+      expect(directions).toHaveLength(THEME_REGISTRY.length + 1);
+      expect(directions.slice(0, THEME_REGISTRY.length)).toEqual(listDesignDirections());
+      expect(directions.filter((direction) => direction.id === THEME_REGISTRY[0]!.name)).toHaveLength(1);
+      expect(directions.find((direction) => direction.id === 'web-probe')).toMatchObject({
+        label: 'Web Style', mood: 'Web-first direction.', isDark: true, source: 'design-system',
+        swatch: { bg: '#111111', fg: '#eeeeee', accent: '#ffcc00' },
+        typography: { display: 'Display', body: 'Body' },
+      });
+      expect(directions.find((direction) => direction.id === 'web-probe')?.category).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('라이브러리 시스템은 후보에 Custom 으로 붙고 겹치는 id 는 번들이 이긴다', () => {
+    const bundled = mkdtempSync(join(tmpdir(), 'all-directions-bundle-'));
+    const library = mkdtempSync(join(tmpdir(), 'all-directions-library-'));
+    try {
+      for (const [root, id, category] of [
+        [bundled, 'web-probe', 'Modern'],
+        [library, 'my-ink', 'Custom'],
+        [library, 'web-probe', 'Custom'],
+      ] as const) {
+        writeFileSync(join(root, 'SOURCE.json'), JSON.stringify({ commit: category === 'Custom' ? 'custom' : 'abc' }));
+        const dir = join(root, id);
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ id, name: id, category }));
+        writeFileSync(join(dir, 'DESIGN.md'), `# ${id}\n> Category: ${category}\n> ${id} summary.\n`);
+        writeFileSync(join(dir, 'tokens.css'), ':root {\n--bg: #ffffff;\n--fg: #111111;\n--accent: #cc3344;\n--font-display: Display;\n--font-body: Body;\n}');
+      }
+      const directions = listAllDesignDirections({ systemsDir: bundled, librarySystemsDir: library });
+      const custom = directions.find((direction) => direction.id === 'my-ink');
+      expect(custom).toMatchObject({ source: 'design-system', category: 'Custom', mood: 'my-ink summary.' });
+      expect(directions.filter((direction) => direction.id === 'web-probe')).toHaveLength(1);
+      expect(directions.find((direction) => direction.id === 'web-probe')?.category).toBeUndefined();
+    } finally {
+      rmSync(bundled, { recursive: true, force: true });
+      rmSync(library, { recursive: true, force: true });
+    }
   });
 });
 

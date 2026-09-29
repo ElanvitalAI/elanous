@@ -3,7 +3,7 @@
 #   bash scripts/uninstall.sh [--prefix PATH] [--keep-path] [--dry-run]
 #   curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/uninstall.sh | bash
 #
-# 지우는 것: 설치 폴더($PREFIX — versions/·current·bin/·install.json) ⊕ 설치기가 쓴 PATH 블록(마커 사이 · ~/.zshrc·~/.bashrc·~/.profile).
+# 지우는 것: 설치 폴더($PREFIX — versions/·current·bin/·install.json) ⊕ 설치기가 쓴 PATH 블록(마커 사이 · ~/.zshrc·~/.zshenv·~/.bashrc·~/.profile).
 # ⛔ 설치 폴더를 «통째로» 지우지 않는다 — 설치물 넷만 지우고, 그 밖의 것이 남으면 폴더를 지킨다.
 #    🩸 09-25: 기억 저장소 기본 위치가 ${XDG_DATA_HOME:-~/.local/share}/elanous/memory — 설치 폴더 «안»이라 `rm -rf $PREFIX` 가 사용자 기억을 지웠다.
 # ⛔ 지우지 «않는» 것: 상태 폴더 ~/.elanous(로그인·로그·원장·설정) — 되돌릴 수 없으니 사람이 직접 지운다(경로만 알려 준다).
@@ -47,7 +47,7 @@ fi
 MARKER_START='# >>> elanous installer PATH >>>'
 MARKER_END='# <<< elanous installer PATH <<<'
 STARTUPS=()
-for f in "${ELANOUS_SHELL_STARTUP:-}" "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+for f in "${ELANOUS_SHELL_STARTUP:-}" "$HOME/.zshrc" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.profile"; do
   [ -n "$f" ] && [ -f "$f" ] && grep -Fqx "$MARKER_START" "$f" && STARTUPS+=("$f")
 done
 

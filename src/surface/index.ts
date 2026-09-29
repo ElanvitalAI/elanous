@@ -119,12 +119,6 @@ export {
 } from './adapters/shell-runner-wiring.js';
 
 export {
-  wireWindowSurfaces,
-  type WireWindowSurfacesOpts,
-  type WireWindowSurfacesHandle,
-} from './adapters/window-surface-adapter.js';
-
-export {
   buildGetUIStateTool,
   buildDescribeSurfaceTool,
   buildObserveSurfaceTool,

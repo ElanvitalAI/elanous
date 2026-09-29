@@ -311,7 +311,7 @@ describe('XtermView ACP status surface', () => {
 
     listeners.forEach((listener) => listener('CLOSED'));
     const closed = render('   ');
-    expect(textOf(closed)).toContain('ACP: 연결 종료');
+    expect(textOf(closed)).toContain('ACP: 연결 끊김 · 곧 다시 붙습니다');
     expect(statusClassOf(closed)).toContain('text-red-300');
 
     cleanup();

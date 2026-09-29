@@ -40,6 +40,7 @@ import { getHarnessSpace, getHarnessBoundaryPath, HARNESS_BOUNDARY_REQUESTS_ENV,
 import { getSessionCwd, getSessionWorkingDir, setSessionCwd } from '../session/working-dir.js';
 import { findGitDir } from '../git-fs/locate.js';
 import { debug } from '../debug/log.js';
+import { emitDecision } from '../live/detail-switch.js';
 import { observeRawShellMetacharacters } from '../self-implement/auto-intervene.js';
 
 export { HARNESS_BOUNDARY_REQUESTS_ENV } from './harness-space.js';
@@ -319,6 +320,7 @@ export function harnessMainTreeReject(
   try {
     // ⭐ 이쪽은 `target` 이 «실제» 쓰기 대상이다 — 위 미지-셸 분기와 «다른 사실»이므로 값으로 가른다.
     debug.log('harness.boundary', 'main-tree-reject', request);
+    emitDecision({ kind: 'VERIFY', what: `격리 경계 밖 쓰기 거절 · ${basename(absPath)}`, reason: `정본 트리(${space.kind}) 보호 — 격리 worktree 밖`, purpose: '사람 트리를 자식이 오염하지 않게', target: '자식에게 되돌림(격리 안 경로로)', phase: 'implement' });
   } catch { /* fail-soft */ }
   const requestRecorded = appendHarnessBoundaryRequest(env, request);
   observeHarnessBoundaryResponseMailbox(env);

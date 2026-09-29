@@ -10301,6 +10301,7 @@ describe('runSelfImplement — rework budget judgment', () => {
       const result = await runSelfImplement({ feature: 'provider salvage', goalFile: budgetGoalFile(), writeGoalExecutionRecord: () => {}, maxReworkRounds: 2, seams: s });
 
       expect(result).toMatchObject({ ok: false, stage: 'gate-failed', outcome: 'budget-exhausted', salvage: 'launched' });
+      expect(result.abandonedClassification?.classification).toBe('implementation-deficit');
       expect(launches).toEqual([{ goalFile: budgetGoalFile(), base: expect.stringMatching(/^self-impl\//), salvageAttempt: 1 }]);
       expect(events).toContainEqual(expect.objectContaining({
         event: 'rework-salvage',
@@ -13460,6 +13461,99 @@ describe('parseBehindCount — 부분 파싱 금지(미지 불변식)', () => {
     expect(parseBehindCount('')).toBeUndefined();
     expect(parseBehindCount('-1')).toBeUndefined();
     expect(parseBehindCount('1e3')).toBeUndefined();
+  });
+});
+
+describe('design-gate review-only wiring', () => {
+  test('a thrown design check is reported as unmeasured without stopping review', async () => {
+    const contexts: ReviewDiffContext[] = [];
+    const observations: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const result = await runSelfImplement({
+      feature: 'measure design', completion: 'worktree-only', memory: false,
+      seams: seams({
+        changedFilesForGateRoute: () => ['site/index.html'],
+        runDesignGate: () => { throw new Error('diff unavailable'); },
+        writeRunLedger: (entry) => { observations.push({ event: entry.event, data: entry.data }); },
+        reviewDiff: async (_cwd, context) => {
+          contexts.push(context!);
+          return { verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review', reviewed: true };
+        },
+      }),
+    });
+    expect(result.stage).not.toBe('gate-failed');
+    expect(contexts[0]?.designGate).toEqual({ unmeasured: 'diff unavailable' });
+    expect(buildReviewIntent(toReviewIntentInput(contexts[0])!)).toContain('측정 불가: diff unavailable');
+    expect(observations.filter(({ event }) => event === 'design-gate').map(({ data }) => data)).toEqual([
+      expect.objectContaining({ unmeasured: 'diff unavailable' }),
+    ]);
+  });
+
+  test('TS-only skips the seam; HTML invokes it once with resolved base and a failed result only informs review', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-design-gate-review-'));
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', ['-C', root, ...args], { encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      return result.stdout.trim();
+    };
+    try {
+      git('init');
+      writeFileSync(join(root, 'baseline.txt'), 'base');
+      git('add', 'baseline.txt');
+      git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-m', 'base');
+      const base = git('rev-parse', 'HEAD');
+      const calls: Array<{ projectDir: string; base?: string }> = [];
+      let gateCalls = 0;
+      let implementCalls = 0;
+      const contexts: ReviewDiffContext[] = [];
+      const intents: string[] = [];
+      const observations: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const fakeResult = {
+        verdict: 'fail' as const, direction: 'paper', tokensSource: null, p0Total: 1, advisoryTotal: 0,
+        files: [{ path: 'site/index.html', p0: 1, advisory: 0, skipped: [], findings: [{ rule: 'display-font-mismatch', severity: 'p0' as const, line: 12 }] }],
+        truncated: false, omitted: 0, checkedAt: '2026-01-01T00:00:00Z',
+      };
+      const run = async () => runSelfImplement({
+        feature: 'design token review', completion: 'worktree-only', memory: false,
+        seams: seams({
+          createWorktree: async ({ branch }) => ({ path: root, branch, resolvedBase: base }),
+          implement: async () => { implementCalls++; return { ok: true, summary: 'implemented' }; },
+          gate: async () => { gateCalls++; return { passed: true, log: 'gate passed' }; },
+          resolveDesignCheck: () => ({ ok: false, blockedOn: 'craft-directory', path: '/craft' }),
+          runDesignGate: (input) => { calls.push(input); return fakeResult; },
+          writeRunLedger: (entry) => { observations.push({ event: entry.event, data: entry.data }); },
+          reviewDiff: async (_cwd, context) => {
+            contexts.push(context!);
+            intents.push(buildReviewIntent(toReviewIntentInput(context)!));
+            return { verdict: 'pass', mustFix: [], shouldFix: [], summary: 'review passed', reviewed: true };
+          },
+        }),
+      });
+      mkdirSync(join(root, 'src'));
+      writeFileSync(join(root, 'src/a.ts'), 'export const a = 1;');
+      git('add', '-N', 'src/a.ts');
+      expect(collectRunFacts(root).changedFiles).toEqual(['src/a.ts']);
+      const tsRun = await run();
+      expect(tsRun.stage).not.toBe('gate-failed');
+      expect(calls).toHaveLength(0);
+      expect(contexts[0]?.designGate).toBeUndefined();
+      expect(intents[0]).not.toContain('디자인 게이트');
+      mkdirSync(join(root, 'site'));
+      writeFileSync(join(root, 'site/index.html'), '<h1>Title</h1>');
+      expect(collectRunFacts(root).changedFiles).toContain('site/');
+      const htmlRun = await run();
+      expect(htmlRun.stage).not.toBe('gate-failed');
+      expect(gateCalls).toBe(2);
+      expect(implementCalls).toBe(2);
+      expect(calls).toEqual([{ projectDir: root, base }]);
+      expect(contexts[1]?.designGate).toEqual(fakeResult);
+      expect(intents[1]).toContain('디자인 게이트 — must-fix 후보(P0 1)');
+      expect(intents[1]).toContain('site/index.html:12 display-font-mismatch');
+      expect(observations.filter(({ event }) => event === 'design-gate').map(({ data }) => data)).toEqual([
+        expect.objectContaining({ verdict: 'fail', p0Total: 1, advisoryTotal: 0, files: 1 }),
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

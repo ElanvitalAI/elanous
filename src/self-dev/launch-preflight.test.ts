@@ -982,7 +982,8 @@ describe('gate preexisting 실패 관측 — 경고만 남긴다', () => {
       const decision = decideAskPreflight({
         goalFile: '',
         pathsOverride: ['src/self-dev/launch-preflight.ts'],
-        askText: '대상 경로: src/self-dev/launch-preflight.ts\n판정 신호: 조건 = 경로; 관측 = bun test src/oauth/codex-account-rotation.test.ts; 기대 = 경고',
+        // 파일 이름은 존재하지만 선언한 경로는 틀려야 경고 요약과 실제 경로 세부가 함께 나온다.
+        askText: '대상 경로: src/self-dev/launch-preflight.ts\n판정 신호: 조건 = 경로; 관측 = bun test missing/oauth/codex-account-rotation.test.ts; 기대 = 경고',
         liveRunWindowMinutes: 30,
         recentChangeWindowDays: 7,
       }, {
@@ -995,7 +996,9 @@ describe('gate preexisting 실패 관측 — 경고만 남긴다', () => {
       }, false);
       const lines = renderLaunchPreflight(decision.result).split('\n');
       const summaryIndex = lines.findIndex((line) => line.includes('⚠️ ask 마커 — ⚠️ 판정 신호 시험 경로 — 1개 경로가'));
-      const detailIndex = lines.findIndex((line) => line.includes('⚠️ ask 마커 — ⚠️ 판정 신호 시험 경로 —') && line.includes('같은 파일 이름의 실제 경로: test/oauth/codex-account-rotation.test.ts'));
+      // #21466 added src/oauth/codex-account-rotation.test.ts next to test/oauth/…, so the «same file name» list now
+      // holds both paths (sorted). Check membership, not which one comes right after the colon.
+      const detailIndex = lines.findIndex((line) => line.includes('⚠️ ask 마커 — ⚠️ 판정 신호 시험 경로 —') && line.includes('같은 파일 이름의 실제 경로:') && line.includes('test/oauth/codex-account-rotation.test.ts'));
 
       expect(detailIndex).toBe(summaryIndex + 1);
       expect(lines.some((line) => line.includes('ask 마커 — ℹ️'))).toBe(false);
@@ -2070,7 +2073,7 @@ describe('decideAskPreflight — CLI 배선', () => {
   test('[unpressed-decision-signals-warn-without-blocking] 안 눌릴 신호는 inspectionRoot 유무와 무관하게 경고로 남고 발사를 막지 않으며 기존 ask-marker 경고를 잃지 않는다', () => {
     const askText = [
       '대상 경로: src/self-dev/launch-preflight.ts',
-      '판정 신호: 조건 = 경로; 관측 = bun test src/oauth/codex-account-rotation.test.ts; 기대 = 경고',
+      '판정 신호: 조건 = 경로; 관측 = bun test missing/oauth/codex-account-rotation.test.ts; 기대 = 경고',
       '판정 신호: 조건 = 기판; 관측 = 그 기판으로 자식을 하나 돌려 main-tree-reject 0 을 보여라; 기대 = 0',
     ].join('\n');
     const options = { goalFile: 'g.md', askText, liveRunWindowMinutes: 30, recentChangeWindowDays: 7 };

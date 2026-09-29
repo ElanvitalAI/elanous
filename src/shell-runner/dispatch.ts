@@ -81,6 +81,9 @@ export function runShell(
   opts: RunShellOpts = {},
 ): ShellHandle {
   const effectiveMode = resolveMode(req.mode, deps);
+  if ((req.mode === 'vw' || req.mode === 'modal') && !deps.ptyHostFactory) {
+    throw new Error(`RunShell(mode:"${req.mode}") requires an attachable PTY surface`);
+  }
   const engine = pickEngine(effectiveMode, req, deps);
   const ctx: RunCtx = opts.ctx ?? {
     getCwd: () => req.cwd ?? process.cwd(),

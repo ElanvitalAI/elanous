@@ -6,6 +6,7 @@ import type { GoalRunRecord } from '../../self-implement/goal-run-store.js';
 import { readReportOrigin } from '../../self-implement/report-origin.js';
 import { LogStore } from '../../mss/logging/log-store.js';
 import {
+  handleHarnessRunScreenGet,
   handleHarnessAskPost,
   handleHarnessAskStatusGet,
   rememberAcceptedAsk,
@@ -628,5 +629,36 @@ describe('harness API handlers', () => {
     const nullBody = await handleHarnessStopPost(request('/v1/harness/stop', null), {}, {});
     expect(nullBody.status).toBe(400);
     expect((await nullBody.json() as { error: string }).error).toContain('usage: POST /v1/harness/stop');
+  });
+
+  test('run-screen: runId → screen key → redacted tail · reasons as values · stoppable only for a live screen', async () => {
+    const screens = [{ spaceId: 'space-a', path: '/tmp/a.screen', mtimeMs: 1, bytes: 1 }];
+    const secret = 'sk-or-v1-this-is-a-secret-value-with-long-random-chars';
+    const res = handleHarnessRunScreenGet(new Request('http://nexus.test/v1/harness/run-screen?runId=run-1&lines=10'), {}, {
+      queryRunScreenKey: () => ({ screenKey: 'space-a', logStoreStatus: 'read', lastEvent: null }),
+      readHarnessScreenTail: (key, lines) => ({ text: `${key} ${lines} OPENROUTER_API_KEY=${secret}`, outcome: null, path: '/tmp/a.screen' }),
+      listHarnessScreens: () => screens,
+    });
+    const body = await res.json() as { text: string; stoppable: boolean; screenKey: string };
+    expect(res.status).toBe(200);
+    expect(body.screenKey).toBe('space-a');
+    expect(body.stoppable).toBe(true);
+    expect(body.text).toContain('space-a 10');
+    expect(body.text).not.toContain(secret);
+
+    const noKey = await handleHarnessRunScreenGet(new Request('http://nexus.test/v1/harness/run-screen?runId=run-2'), {}, {
+      queryRunScreenKey: () => ({ screenKey: null, logStoreStatus: 'read', lastEvent: { category: 'self-implement', event: 'x', timestamp: 't' } }),
+    }).json() as { reason: string; stoppable: boolean };
+    expect(noKey).toMatchObject({ reason: 'no-screen-key', stoppable: false });
+
+    const gone = await handleHarnessRunScreenGet(new Request('http://nexus.test/v1/harness/run-screen?runId=run-3'), {}, {
+      queryRunScreenKey: () => ({ screenKey: 'space-z', logStoreStatus: 'read', lastEvent: null }),
+      readHarnessScreenTail: () => null,
+      listHarnessScreens: () => screens,
+    }).json() as { reason: string; stoppable: boolean };
+    expect(gone).toMatchObject({ reason: 'screen-missing', stoppable: false });
+
+    expect(handleHarnessRunScreenGet(new Request('http://nexus.test/v1/harness/run-screen?runId=../x'), {}, {}).status).toBe(400);
+    expect(handleHarnessRunScreenGet(new Request('http://nexus.test/v1/harness/run-screen'), {}, {}).status).toBe(400);
   });
 });

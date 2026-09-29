@@ -288,7 +288,15 @@ export class TaskDispatcher {
       // Only applies when the adapter finished cleanly AND the task
       // declares deterministic checks. Other exec statuses follow the
       // direct mapping below.
-      if (
+      if (exec.status === 'completed' && exec.reviewRequired) {
+        this.opts.graph.updateTask(task.id, {
+          status: 'review',
+          notes: [...task.notes, `[EXECUTION ${exec.id}] Final-line done outcome absent; reconcile in review`],
+        }, { now: this.now() });
+        this.opts.store?.saveTask(this.opts.graph.getTask(task.id)!);
+        this.opts.bus?.emit({ kind: 'task-status-changed', taskId: task.id, from: 'running', to: 'review' });
+        this.recordOps(task, 'cycle_end', 'review', { executionId: exec.id, reason: 'execution-reconciliation' });
+      } else if (
         exec.status === 'completed' &&
         task.acceptance?.checks &&
         task.acceptance.checks.length > 0
@@ -395,6 +403,7 @@ export class TaskDispatcher {
       });
       return;
     }
+    this.opts.bus?.emit({ kind: 'task-status-changed', taskId: task.id, from: 'running', to: 'review' });
 
     let report: AcceptanceReport;
     let threw: unknown = null;

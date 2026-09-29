@@ -4,7 +4,7 @@ import { bootDashboardContextMenuProviders } from '../src/dashboard/context-menu
 import { createWorkingDirState } from '../src/working-dir/index.js';
 
 describe('bootDashboardContextMenuProviders', () => {
-  test('registers browser, scratch, pane-title, virtual-window, and debug providers into one registry', () => {
+  test('registers browser, scratch, pane-title, and debug providers without virtual-window menus', () => {
     const workingDirState = createWorkingDirState('/tmp');
     workingDirState.entries = [{
       name: 'notes.md',
@@ -20,8 +20,6 @@ describe('bootDashboardContextMenuProviders', () => {
       getScratchTotalBytes: () => 42,
       isCompanionOpen: () => false,
       hasClosedPanes: () => true,
-      resolveVirtualWindowPaneKind: () => 'markdown',
-      isVirtualWindowCompanionOpen: () => false,
       getDebugPath: () => '/tmp/debug.log',
       getDebugLevel: () => 2,
     });
@@ -62,7 +60,7 @@ describe('bootDashboardContextMenuProviders', () => {
       paneId: 'editor',
       row: 1,
       col: 1,
-    } as never)).not.toBeNull();
+    } as never)).toBeNull();
 
     expect(providers.resolve({
       kind: 'modal-body',

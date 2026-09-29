@@ -15,6 +15,7 @@ import { androidFilesIn, runAndroidUnitTestGate } from '../../scripts/ci-android
 import { iosFilesIn, runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
 import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
+import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
 import { runPublicLeakGate } from '../../scripts/ci-public-leak-gate.js';
 import { checkCommands, extractElanousCommands, type Finding as DocsCliFinding } from '../../scripts/docs-cli-check.js';
 import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
@@ -97,6 +98,7 @@ export interface PrLandDeps {
   runIsolationGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   runMockModuleRestoreGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   runModelHardcodeGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
+  runDaemonPortGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   /** 공개 유출 래칫(경고 전용) — 반환 0 통과 · 1 늘었다 · 2 못 쟀다. */
   runPublicLeakGate?: (changedFiles: readonly string[], out: { log: (message: string) => void; error: (message: string) => void }) => number;
   /** 공개 문서의 `elanous …` 호출 ↔ 실제 `--help` 대조(경고 전용) — 바뀐 공개 문서 경로를 받아 어긋남 목록을 돌려준다. */
@@ -1271,6 +1273,15 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
   if (modelHardcode.measured) {
     out.log('✓ model-hardcode-gate: scripts/ci-model-hardcode-gate.ts PASS — no new hardcoded model id.');
+  }
+  const daemonPort = gateVerdict('daemon-port-gate', deps.runDaemonPortGate ?? ((o) => runDaemonPortGate({ log: o.log, error: o.error, cwd, args: [] }) === 0), out);
+  record('daemon-port-gate', daemonPort.ok, { measured: daemonPort.measured });
+  if (!daemonPort.ok) {
+    out.error('✗ daemon-port-gate: scripts/ci-daemon-port-gate.ts blocked pr land because source hardcodes the daemon port — resolve it with resolveDaemonEndpoint (src/nexus/daemon-endpoint.ts).');
+    return 1;
+  }
+  if (daemonPort.measured) {
+    out.log('✓ daemon-port-gate: scripts/ci-daemon-port-gate.ts PASS — no new daemon port literals.');
   }
 
   const changedPaths = currentChangePaths(run, cwd, staged, base, out);

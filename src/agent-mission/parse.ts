@@ -50,8 +50,8 @@ export function parseTscErrors(out: string): string[] {
 // ★ P4 — 'provision' 추가(감독이 자식 역량을 자율 설치·[[provision.ts]]). spec/layer 필드 동반.
 //   layer 는 **raw 문자열 그대로** 보존한다 — 검증/기본화는 provision 정책이 단일점에서(무효/non-pkg 전부 defer).
 //   파서가 무효 layer 를 drop 하면 undefined→pkg 오분류 우회가 생긴다(리뷰 must-fix).
-export type BrainAction = 'wait' | 'send' | 'search' | 'verify' | 'done' | 'provision';
-export interface BrainDecision { action: BrainAction; text?: string; query?: string; spec?: string; layer?: string; reason: string; }
+export type BrainAction = 'wait' | 'send' | 'search' | 'verify' | 'done' | 'provision' | 'handoff' | 'ask-human';
+export interface BrainDecision { action: BrainAction; text?: string; query?: string; spec?: string; layer?: string; reason: string; to?: 'codex' | 'claude' | 'elanous'; mission?: string; carry?: 'diff' | 'summary'; url?: string; code?: string; }
 
 /** 브레인 LLM 의 원문에서 JSON 결정을 관대하게 파싱. 실패 시 wait 폴백. */
 export function parseBrainDecision(raw: string): BrainDecision {
@@ -59,8 +59,10 @@ export function parseBrainDecision(raw: string): BrainDecision {
   if (!jm) return { action: 'wait', reason: `no-json: ${raw.slice(0, 80)}` };
   try {
     const d = JSON.parse(jm[0]) as Record<string, unknown>;
-    const action = (['wait', 'send', 'search', 'verify', 'done', 'provision'] as const).includes(d.action as BrainAction)
+    const action = (['wait', 'send', 'search', 'verify', 'done', 'provision', 'handoff', 'ask-human'] as const).includes(d.action as BrainAction)
       ? (d.action as BrainAction) : 'wait';
+    if (action === 'handoff' && (!['codex', 'claude', 'elanous'].includes(d.to as string) || typeof d.mission !== 'string' || !d.mission.trim() || (d.carry !== undefined && d.carry !== 'diff' && d.carry !== 'summary'))) return { action: 'wait', reason: 'invalid handoff' };
+    if (action === 'ask-human' && (typeof d.reason !== 'string' || !d.reason.trim())) return { action: 'wait', reason: 'invalid ask-human' };
     return {
       action,
       text: typeof d.text === 'string' ? d.text : undefined,
@@ -68,6 +70,8 @@ export function parseBrainDecision(raw: string): BrainDecision {
       spec: typeof d.spec === 'string' ? d.spec : undefined,
       layer: typeof d.layer === 'string' ? d.layer : undefined,
       reason: typeof d.reason === 'string' ? d.reason : '',
+      ...(action === 'handoff' ? { to: d.to as 'codex' | 'claude' | 'elanous', mission: d.mission as string, ...(d.carry ? { carry: d.carry as 'diff' | 'summary' } : {}) } : {}),
+      ...(action === 'ask-human' ? { ...(typeof d.url === 'string' ? { url: d.url } : {}), ...(typeof d.code === 'string' ? { code: d.code } : {}) } : {}),
     };
   } catch { return { action: 'wait', reason: 'json-parse-fail' }; }
 }
@@ -79,5 +83,6 @@ export function screenSignalsComplete(screen: string): boolean {
 
 /** codex TUI 화면에서 trust 프롬프트를 감지. */
 export function screenNeedsTrust(screen: string): boolean {
-  return /trust the contents|Do you trust/i.test(screen);
+  // codex ≥0.157: «Trust this folder? … 1. Trust and continue» (older: «Do you trust the contents …»).
+  return /trust the contents|Do you trust|Trust this folder\?/i.test(screen);
 }

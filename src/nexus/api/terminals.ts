@@ -21,7 +21,7 @@
 
 import { jsonResponse } from './http-server.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
-import { getPty, listPty, type PtyHandle } from '../../pty-shell/registry.js';
+import { getPty, listPty, onPtyEvent, type PtyEvent, type PtyHandle } from '../../pty-shell/registry.js';
 import { listAllPreviewTerminals } from '../../web-terminal/preview-tap-registry.js';
 import { debug } from '../../debug/log.js';
 export { terminalTreeLabel, terminalTreeNames } from '../../pty-shell/terminal-tree.js';
@@ -33,6 +33,7 @@ import { readPtyEventsAfter } from '../../pty-shell/pty-event-log.js';
 import { classifyPtyOwnerRunUsage, joinPtyLineage, resolveRunTermination, type PtyOwnerRunUsage, type RunTermination } from '../../cli/pty-takeover-cli.js';
 import { loadRunLedger, resolveFederatedRunLedgerDirectories, runLedgerDir } from '../../self-implement/run-ledger.js';
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../../pty-shell/pty-control-ipc.js';
+import { encodeSgrMouse, type PtyMouseInput } from '../../pty-shell/pty-mouse.js';
 import { queryRunningRuns, type RunningRunAssessment, type RunningRunPresence, type RunningRunStatus, type RunningRunsResult } from '../../self-implement/running-runs.js';
 // ⭐P4 §4-1 — 표시 폭(wide-char/CJK/emoji 인지) SSOT. PNG 캔버스 cols 파생용.
 import { cellWidth } from '../../ui/printer.js';
@@ -1301,6 +1302,85 @@ export function parseTerminalRenamePath(pathname: string): string | null {
   return m && m[1] ? safeDecodeSegment(m[1]) : null;
 }
 
+/** Path matcher: `/v1/terminals/:id/stream`. */
+export function parseTerminalStreamPath(pathname: string): string | null {
+  const m = /^\/v1\/terminals\/([^/]+)\/stream$/.exec(pathname);
+  return m && m[1] ? safeDecodeSegment(m[1]) : null;
+}
+
+export interface TerminalStreamDeps {
+  getPty?: (id: string) => Pick<PtyHandle, 'renderScreen'> | undefined;
+  onPtyEvent?: (cb: (ev: PtyEvent) => void) => () => void;
+  requestRemotePtyControl?: TerminalControlDeps['requestRemotePtyControl'];
+  isAllowedSourceRoot?: (dbPath: string) => boolean;
+  /** 남의 PTY 화면을 다시 묻는 간격(ms). */
+  pollMs?: number;
+  /** 바이트 묶음 간격(ms). */
+  flushMs?: number;
+}
+
+/** GET /v1/terminals/:id/stream — PWA 웹 터미널 실시간(드라이브 RFC ⑥ · 800ms 폴링 대체 · SSE).
+ *  - 이 데몬이 가진 PTY: 처음 `reset`(현재 화면) → `onPtyEvent` 출력 바이트를 `data` 로 흘린다(flushMs 로 묶음) · 끝나면 `end`.
+ *  - 남의 PTY(다른 프로세스·연합 뿌리): 서버 쪽에서 pollMs 마다 스냅숏 → 화면이 «바뀐 때만» `screen`.
+ *    ⛔ 교차 프로세스 바이트 버스는 아직 없다 — owner 의 제어 처리기가 직렬이라 pollMs 는 150ms 아래로 내리지 않는다.
+ *  - 입력은 그대로 `POST /control`. 연결이 끊기면 구독·루프를 멈춘다(평소 부하 0). */
+export function handleTerminalStream(req: Request, opts: MetaApiOpts, id: string, deps: TerminalStreamDeps = {}): Response {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (!id) return jsonResponse({ error: 'missing-id' }, 400);
+  const sourceRoot = new URL(req.url).searchParams.get('sourceRoot');
+  if (sourceRoot !== null && !(deps.isAllowedSourceRoot ?? isAllowedSourceRoot)(sourceRoot)) return jsonResponse({ error: 'not-found', sourceRoot }, 404);
+  const local = sourceRoot === null ? (deps.getPty ?? getPty)(id) : undefined;
+  const pollMs = Math.max(150, deps.pollMs ?? 200);
+  const flushMs = deps.flushMs ?? 25;
+  const encoder = new TextEncoder();
+  let stop: () => void = () => {};
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let closed = false;
+      const send = (event: string, data: unknown) => {
+        if (closed) return;
+        try { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)); } catch { closed = true; }
+      };
+      const close = () => { if (closed) return; closed = true; try { controller.close(); } catch { /* already closed */ } };
+      const heartbeat = setInterval(() => { if (!closed) { try { controller.enqueue(encoder.encode(': hb\n\n')); } catch { closed = true; } } }, 15_000);
+      if (local) {
+        send('mode', { mode: 'bytes' });
+        let pending = '';
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const flush = () => { timer = null; if (pending) { send('data', pending); pending = ''; } };
+        void local.renderScreen({ ansi: true }).then((screen) => send('reset', { screen })).catch(() => send('reset', { screen: '' }));
+        const off = (deps.onPtyEvent ?? onPtyEvent)((ev) => {
+          if (ev.id !== id) return;
+          if (ev.type === 'output') { pending += ev.chunk; if (!timer) timer = setTimeout(flush, flushMs); }
+          else if (ev.type === 'exit' || ev.type === 'unregistered') { flush(); send('end', { reason: ev.type }); cleanup(); }
+        });
+        const cleanup = () => { off(); if (timer) clearTimeout(timer); clearInterval(heartbeat); close(); };
+        stop = cleanup;
+        return;
+      }
+      send('mode', { mode: 'screen', pollMs });
+      let last = '';
+      let loop: ReturnType<typeof setTimeout> | null = null;
+      const control = deps.requestRemotePtyControl ?? requestRemotePtyControl;
+      const tick = async () => {
+        if (closed) return;
+        try {
+          const r = await control(id, 'snapshot', { ansi: true }, { timeoutMs: TERMINAL_CONTROL_TIMEOUT_MS, ...(sourceRoot ? { manifestDbPath: sourceRoot } : {}) });
+          if (r.status === 'unknown-pty') { send('end', { reason: 'unknown-pty' }); cleanup(); return; }
+          if (r.status === 'success' && typeof r.screen === 'string' && r.screen !== last) { last = r.screen; send('screen', { screen: r.screen }); }
+          else if (r.status !== 'success') send('status', { status: r.status });
+        } catch { send('status', { status: 'control-failed' }); }
+        if (!closed) loop = setTimeout(() => { void tick(); }, pollMs);
+      };
+      const cleanup = () => { if (loop) clearTimeout(loop); clearInterval(heartbeat); close(); };
+      stop = cleanup;
+      void tick();
+    },
+    cancel() { stop(); },
+  });
+  return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive', 'x-accel-buffering': 'no' } });
+}
+
 /** Path matcher: `/v1/terminals/:id/terminate`. */
 export function parseTerminalTerminatePath(pathname: string): string | null {
   const m = /^\/v1\/terminals\/([^/]+)\/terminate$/.exec(pathname);
@@ -1309,6 +1389,7 @@ export function parseTerminalTerminatePath(pathname: string): string | null {
 
 interface TerminalControlDeps {
   requestRemotePtyControl(id: string, action: PtyControlAction, payload?: PtyControlPayload, options?: PtyControlRequestOptions): Promise<PtyControlResult>;
+  isAllowedSourceRoot?: (dbPath: string) => boolean;
 }
 
 const liveTerminalControlDeps: TerminalControlDeps = { requestRemotePtyControl };
@@ -1327,20 +1408,31 @@ export async function handleTerminalControl(
   if (!id) return jsonResponse({ error: 'missing-id' }, 400);
   let body: unknown;
   try { body = await req.json(); } catch { return jsonResponse({ error: 'invalid-json', reason: 'JSON body required' }, 400); }
-  const request = body !== null && typeof body === 'object' ? body as { action?: unknown; chars?: unknown; ansi?: unknown } : {};
+  const request = body !== null && typeof body === 'object' && !Array.isArray(body) ? body as { action?: unknown; chars?: unknown; ansi?: unknown; x?: unknown; y?: unknown; kind?: unknown; button?: unknown } : {};
   const action = request.action;
-  if (action !== 'takeover' && action !== 'release' && action !== 'input-text' && action !== 'input-key' && action !== 'snapshot') {
-    return jsonResponse({ error: 'invalid-action', reason: 'action must be takeover, release, input-text, input-key, or snapshot' }, 400);
+  if (action !== 'takeover' && action !== 'release' && action !== 'input-text' && action !== 'input-key' && action !== 'input-mouse' && action !== 'snapshot') {
+    return jsonResponse({ error: 'invalid-action', reason: 'action must be takeover, release, input-text, input-key, input-mouse, or snapshot' }, 400);
   }
   const isInput = action === 'input-text' || action === 'input-key';
   if (isInput && (typeof request.chars !== 'string' || request.chars.length === 0)) {
     return jsonResponse({ error: 'invalid-payload', reason: 'chars must be a non-empty string' }, 400);
   }
+  let mouse: PtyMouseInput | undefined;
+  if (action === 'input-mouse') {
+    if (typeof request.x !== 'number' || typeof request.y !== 'number' || (request.kind !== 'click' && request.kind !== 'scroll-up' && request.kind !== 'scroll-down') || (request.button !== undefined && request.button !== 'left' && request.button !== 'middle' && request.button !== 'right')) {
+      return jsonResponse({ error: 'invalid-payload', reason: 'mouse requires 1-based x,y, kind and optional button' }, 400);
+    }
+    mouse = { x: request.x, y: request.y, kind: request.kind, ...(request.button ? { button: request.button } : {}) };
+    try { encodeSgrMouse(mouse); } catch (error) { return jsonResponse({ error: 'invalid-payload', reason: (error as Error).message }, 400); }
+  }
   const payload = isInput ? { chars: request.chars as string }
-    : action === 'snapshot' && request.ansi === true ? { ansi: true }
-      : undefined;
+    : mouse ?? (action === 'snapshot' && request.ansi === true ? { ansi: true } : undefined);
+  // 연합 PTY(다른 매니페스트 뿌리)는 그 DB 에 요청을 남겨야 그 행의 owner 가 처리한다 — PWA 가 `?sourceRoot=` 를 보내는데
+  // 이 자리가 무시해 연합 PTY 제어·스냅숏이 `unknown-pty` 로 떨어졌다(09-28 탐색). frame 핸들러와 같은 규칙으로 받는다.
+  const sourceRoot = new URL(req.url).searchParams.get('sourceRoot');
+  if (sourceRoot !== null && !(deps.isAllowedSourceRoot ?? isAllowedSourceRoot)(sourceRoot)) return jsonResponse({ error: 'not-found', sourceRoot }, 404);
   try {
-    const result = await deps.requestRemotePtyControl(id, action, payload, { timeoutMs: TERMINAL_CONTROL_TIMEOUT_MS });
+    const result = await deps.requestRemotePtyControl(id, action, payload, { timeoutMs: TERMINAL_CONTROL_TIMEOUT_MS, ...(sourceRoot ? { manifestDbPath: sourceRoot } : {}) });
     const status = result.status === 'unknown-pty' ? 404
       : result.status === 'owner-unreachable' ? 504
       : result.status === 'failed' || result.status === 'write-failed' ? 502

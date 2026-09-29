@@ -24,14 +24,14 @@ flowchart LR
 
 | Where | What happens | Status |
 |---|---|---|
-| Telegram `/work <text>` | The front door classifies the text: a link to absorb, a list of tasks, or something to implement. Tasks wait for your approval; implementation goes to the harness. The reply comes back in the same chat. | 🟡 on main |
+| Telegram `/work <text>` | The front door classifies the text: a link to absorb, a list of tasks, or something to implement. Tasks wait for your approval; implementation goes to the harness. The reply comes back in the same chat. | ✅ 0.2.3 |
 | Telegram, a plain link | The matching skill summarizes it (YouTube, X, GitHub, web) and saves a note. | ✅ · 🔄 recording it in the intake ledger |
 | Telegram, a plain sentence | A normal chat answer. | ✅ · 🔄 recording it in the intake ledger |
-| Web app intake page | A live preview of how the front door reads your text, then absorb or send to the harness. | 🟡 on main |
+| Web app intake page | A live preview of how the front door reads your text, then absorb or send to the harness. | ✅ 0.2.3 |
 | Web app chat | A normal chat turn. | ✅ · 🔄 front door for chat |
 | TUI | Links are summarized by the matching skill; «하니스로 구현 …» offers the harness to the model. | ✅ |
 | Daily collection | Trending videos, saved Telegram messages and GitHub activity are collected every morning, absorbed, checked against elanous, and summarized in a daily digest. | ✅ |
-| Linear | Issues become tasks, by sync or by webhook (below). | 🟡 on main |
+| Linear | Issues become tasks, by sync or by webhook (below). | ✅ 0.2.3 |
 
 The intake ledger is the list of everything that came in:
 
@@ -64,9 +64,9 @@ An item without an acceptance criterion is sent back as a question instead of be
 | | Status |
 |---|---|
 | Priority-ordered task loop | ✅ |
-| Outside tasks waiting for approval · auto-run rules | 🟡 on main |
-| Running approved outside tasks: `[dev]` → the harness, everything else → an agent with tools; intake tasks one at a time | 🟡 on main |
-| `elanous tasks list · show · approve` — tasks in priority order, details, approval (needs the daemon running) | 🟡 on main |
+| Outside tasks waiting for approval · auto-run rules | ✅ 0.2.3 |
+| Running approved outside tasks: `[dev]` → the harness, everything else → an agent with tools; intake tasks one at a time | ✅ 0.2.3 |
+| `elanous tasks list · show · approve` — tasks in priority order, details, approval (needs the daemon running) | ✅ 0.2.3 |
 
 ## Linear
 
@@ -87,7 +87,7 @@ elanous connector linear sync --team ENG --prefix "[elanous]"
 
 - `--team` is the team key; `--prefix` limits the sync to issues whose title starts with that text (or carry that label).
 - Each issue becomes one task, identified by its Linear id — syncing twice does not create duplicates, and an issue that changed is updated.
-- Linear priority maps to task priority: Urgent → high (the note "original priority: Urgent" is kept), High → high, Medium → medium, Low → low, none → medium.
+- Linear priority maps to task priority: Urgent → high (the note "original priority: Urgent" is kept), High → high, Medium → medium, Low → low, none → medium. Within one sync, Urgent issues are created first, so they run ahead of High ones.
 - Done, canceled and duplicate issues are skipped. One failing issue does not stop the rest; it is retried on the next sync.
 - Put `[dev]` in an issue title to send it to the harness once approved; otherwise it runs as a job.
 
@@ -95,7 +95,7 @@ elanous connector linear sync --team ENG --prefix "[elanous]"
 
 | | Status |
 |---|---|
-| Issues → tasks (sync and webhook) | 🟡 on main |
+| Issues → tasks (sync and webhook) | ✅ 0.2.3 |
 | Task results written back to Linear (state, comments) | 📋 designed |
 | Asana | Use the Asana connector of your coding agent (Claude Code); an elanous adapter is optional and designed |
 | Jira | 📋 designed — not available |
@@ -108,7 +108,7 @@ Everything above works with no tracker connected. What a tracker gives you and w
 |---|---|---|
 | Issues, states, priority, sub-issues, projects | Tasks (with dependencies, parent task, mission, acceptance criteria) | ✅ |
 | A board | TUI board, the web app task panel | ✅ · 🔄 one shared list and approval view |
-| Filing by message or email | Telegram `/work`, the web app intake page | 🟡 · 📋 email |
+| Filing by message or email | Telegram `/work`, the web app intake page | ✅ 0.2.3 · 📋 email |
 | Triage suggestions and rules | Interpretation and auto-run rules | 🔄 · 📋 condition → action rules |
 | Cycle time and lead time | Task timestamps and the run ledger | 📋 `tasks stats` |
 | Scheduled and event-driven agents | The harness, the task loop and `elanous schedule` | ✅ |

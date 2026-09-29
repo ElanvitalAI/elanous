@@ -29,12 +29,21 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { ensureCronNodePath } from '../src/domains/cron-path.js';
 import { registerStandaloneLogSink } from '../src/domains/standalone-log-sink.js';
+import { getUserConfig } from '../src/user-config.js';
+import { creditsSummary, formatCreditsSummary } from './codex-quota-alert-format.js';
+import {
+  CODEX_QUOTA_POLICY_LABEL, codexPolicyAllowsCredits, codexPolicyAllowsFallback, resolveCodexQuotaPolicy,
+} from '../src/oauth/codex-quota-policy.js';
 
 const STATE = join(homedir(), '.elanous/conatus/codex_quota_alert_state.json');
 /** 잔여가 이 % 이하로 내려간 계정을 «임박»으로 본다. */
 const LOW_REMAINING_PERCENT = 10;
 /** 리셋권 만료가 이 일수 안이면 알린다. */
 const RESET_CREDIT_EXPIRY_DAYS = 7;
+/** 정책 `credits`(크레딧 사용이 «허가된» 상태)에서 잔액 보고의 발송 단위 — 이만큼 줄 때마다 한 번.
+ *  ⛔ 허가된 지출을 매시 경보로 보내면 진짜 경보(리셋 전 고갈 · 정책 위반)가 묻힌다(대표 2026-09-28 «정책과 안 맞는다»).
+ *  허가 «밖»(within-quota·fallback)에서는 종전대로 줄 때마다 보낸다 — 그때는 줄어드는 것 자체가 사고다. */
+const CREDITS_REPORT_STEP = 5000;
 
 interface AccountRow {
   provider: string; accountName: string;
@@ -104,6 +113,12 @@ if ('error' in usage) {
   }
   process.exit(0);
 }
+
+// 대표 2026-09-28 한도 정책(`llm.codexQuotaPolicy`) — 알림 문구·발송 기준이 «설정된 정책»을 따른다.
+let quota = resolveCodexQuotaPolicy(undefined);
+try { quota = resolveCodexQuotaPolicy(getUserConfig().llm); } catch { /* 못 읽으면 기본(fallback) */ }
+const creditsAllowed = codexPolicyAllowsCredits(quota.policy);
+const fallbackAllowed = codexPolicyAllowsFallback(quota.policy);
 
 const codex = usage.rows.filter((r) => r.provider === 'codex');
 const others = usage.rows.filter((r) => r.provider !== 'codex');
@@ -178,7 +193,20 @@ function drainOf(r: AccountRow): { state: 'draining' | 'flat' | 'unknown'; delta
     ...(hours > 0 ? { perHour: delta / hours, windowMin: Math.round(hours * 60) } : {}),
   };
 }
-const drain = new Map(burning.map((r) => [r.accountName, drainOf(r)] as const));
+const drain = new Map((quota.policy === 'credits' ? codex : burning)
+  .map((r) => [r.accountName, drainOf(r)] as const));
+// 🩸 2026-09-28: 머리줄이 «찬 ⊕ 크레딧 있음» 계정 수(3)를 «나가는 중» 으로 셌다 — 실제로 줄던 것은 default 하나.
+//   ⇒ «줄고 있다»(draining)와 «크레딧은 있지만 안 쓰는 중»을 가른다.
+const draining = burning.filter((r) => drain.get(r.accountName)?.state === 'draining');
+const creditHolders = quota.policy === 'credits'
+  ? codex.filter((r) => r.credits?.hasCredits === true)
+  : [];
+const combinedCredits = creditHolders.length >= 2 ? creditsSummary(creditHolders.map((r) => ({
+  name: r.accountName,
+  balance: r.credits?.balance,
+  perHour: drain.get(r.accountName)?.state === 'flat' ? 0 : drain.get(r.accountName)?.perHour,
+  resetInHours: hoursUntil(r.subscription?.resetsAt) ?? undefined,
+}))) : null;
 
 // ⭐ 상태를 «문자열 하나»로 접어 두고, 바뀔 때만 보낸다(같은 경고 반복 금지).
 const signature = JSON.stringify({
@@ -187,12 +215,20 @@ const signature = JSON.stringify({
   exp: expiring.map((r) => r.accountName).sort(),
   // ⛔ 「못 읽음」이 서명에 없으면, 자가 눈먼 상태가 「상태 동일」로 조용해진다.
   unread: unreadable.map((r) => r.accountName).sort(),
+  policy: quota.policy,
+  ...(combinedCredits ? { beforeReset: combinedCredits.beforeReset } : {}),
   // ⛔ 「줄고 있는 중」은 «매 틱» 서명이 달라야 한다 — 돈이 계속 나가는데 한 번만 알리면
   //   두 번째 시간부터는 「상태 동일」로 조용해진다. 그래서 draining 이면 원값을 넣는다.
   //   ⛔ 반대로 멎었으면(flat) 원값을 넣지 «않는다» — 그래야 반복 발송이 멎는다.
   burn: burning.map((r) => {
     const d = drain.get(r.accountName);
-    return `${r.accountName}:${d?.state === 'draining' ? String(r.credits?.balance) : (d?.state ?? 'unknown')}`;
+    if (d?.state !== 'draining') return `${r.accountName}:${d?.state ?? 'unknown'}`;
+    const b = r.credits?.balance;
+    // 허가된 크레딧 지출은 «단위»로 접는다 — 단 «리셋 전에 바닥난다»로 바뀌면 단위와 무관하게 서명이 바뀐다.
+    const resetH = hoursUntil(r.subscription?.resetsAt);
+    const etaH = d.perHour && d.perHour < 0 && typeof b === 'number' ? b / -d.perHour : null;
+    const risk = !combinedCredits && etaH !== null && (resetH === null || etaH < resetH) ? ':before-reset' : '';
+    return `${r.accountName}:${creditsAllowed ? b === undefined ? 'balance-unknown' : `step${Math.floor(b / CREDITS_REPORT_STEP)}${risk}` : String(b ?? 0)}`;
   }).sort(),
 });
 const prev = prevState;
@@ -214,13 +250,15 @@ if (prev.signature === signature) {
 }
 
 if (exhausted.length === 0 && low.length === 0 && expiring.length === 0 && burning.length === 0
-    && unreadable.length === 0) {
+    && unreadable.length === 0 && !combinedCredits) {
   console.log('[codex-quota-alert] 경고 조건 없음');
   saveState({ ...prev, ...balances, signature });
   process.exit(0);
 }
 
 const lines: string[] = [];
+lines.push(`🧭 정책: **${CODEX_QUOTA_POLICY_LABEL[quota.policy]}** (\`llm.codexQuotaPolicy=${quota.policy}\`${quota.source === 'legacy-credits' ? ' · 옛 codexCreditsAllowed 에서' : quota.source === 'default' ? ' · 기본값' : quota.source === 'invalid' ? ' · ⚠️ 모르는 값이라 기본값' : ''})`);
+lines.push('');
 // ⛔ 「못 읽음」을 맨 위에 둔다 — 아래 판정들이 «그만큼 눈이 먼» 상태임을 먼저 말해야 한다.
 if (unreadable.length > 0) {
   lines.push(`⚠️ **계정 ${unreadable.length}개를 «못 읽었습니다»** — 아래 판정은 그만큼 눈이 멉니다.`);
@@ -229,16 +267,26 @@ if (unreadable.length > 0) {
   lines.push('');
 }
 // 🔥 돈이 나가는 축을 «맨 위»에 둔다 — 소진은 멈춘 것이고 이것은 안 멈춘 것이다.
-if (burning.length > 0) {
-  lines.push(`🔥 **한도를 넘겼는데 요청이 «안 죽고» 있습니다 (${burning.length}개 계정)**`);
-  lines.push('레이트리밋 오류가 안 나므로 ⛔ **회전도 폴백도 안 열립니다** — 잔액에서 그대로 나갑니다.');
+if (burning.length > 0 || combinedCredits) {
+  if (creditsAllowed) {
+    lines.push(burning.length > 0
+      ? `💳 **크레딧으로 진행 중 — 줄고 있는 계정 ${draining.length}개** (크레딧 보유 ${burning.length}개 · 정책상 허가된 지출)`
+      : '💳 **크레딧 보유 계정**');
+    if (combinedCredits) lines.push(formatCreditsSummary(combinedCredits));
+    if (burning.length > 0) lines.push(combinedCredits
+      ? `잔액이 ${CREDITS_REPORT_STEP} 단위로 줄 때마다 한 번 알립니다. 리셋 전 고갈은 합계로 판정합니다.`
+      : `잔액이 ${CREDITS_REPORT_STEP} 단위로 줄 때마다 한 번 알립니다. 🚨 표시가 있으면 리셋 전에 바닥납니다.`);
+  } else {
+    lines.push(`🚨 **정책 밖 지출 — 한도를 넘겼는데 크레딧에서 나가고 있습니다 (줄고 있는 계정 ${draining.length}개 · 크레딧 보유 ${burning.length}개)**`);
+    lines.push(`정책이 «${CODEX_QUOTA_POLICY_LABEL[quota.policy]}» 인데 레이트리밋 오류가 안 나 회전·폴백이 안 열립니다. 크레딧을 허가하려면 \`elanous config set llm.codexQuotaPolicy credits\`.`);
+  }
   for (const r of burning) {
     const now = r.credits?.balance;
     const nowText = typeof now === 'number' ? now.toFixed(2) : '미상';
     const d = drain.get(r.accountName);
     let tail: string;
     if (!d || d.state === 'unknown') tail = ' (직전 관측 없음 — 이번이 첫 표본입니다)';
-    else if (d.state === 'flat') tail = ' · 직전 관측 이후 «안 줄었습니다»';
+    else if (d.state === 'flat') tail = ' · 크레딧 보유 · 직전 관측 이후 «안 썼습니다»';
     else {
       // ⛔ 남은 시간은 «속도를 실제로 쟀을 때만» 말한다 — 지어내면 사람이 그 수로 계획을 세운다.
       const rate = d.perHour;
@@ -249,7 +297,7 @@ if (burning.length > 0) {
       const etaH = rate && rate < 0 && typeof now === 'number' ? now / -rate : null;
       const resetH = hoursUntil(r.subscription?.resetsAt);
       let eta = '';
-      if (etaH !== null) {
+      if (etaH !== null && !combinedCredits) {
         const h = Math.max(0, Math.round(etaH));
         if (resetH !== null && resetH > 0 && resetH < etaH) {
           // 리셋이 먼저 온다 — 이 창에서 탈 양까지 «수»로 말한다.
@@ -271,10 +319,12 @@ if (burning.length > 0) {
   lines.push('');
 }
 if (exhausted.length === codex.length && codex.length > 0) {
-  lines.push(`🚨 **codex 계정이 «전부» 소진됐습니다 (${codex.length}/${codex.length})**`);
-  lines.push('폴백이 grok 으로 갑니다. grok 도 한도가 있으니 같이 보십시오.');
+  lines.push(`${creditsAllowed ? '💳' : '🚨'} **codex 구독 한도가 «전부» 찼습니다 (${codex.length}/${codex.length})**`);
+  if (creditsAllowed) lines.push('정책 «크레딧까지» — codex 를 크레딧으로 계속 씁니다. 크레딧까지 떨어지면 폴백 체인으로 갑니다.');
+  else if (fallbackAllowed) lines.push(`정책 «자동 폴백» — 폴백 체인(\`llm.fallbackChain\`)으로 갑니다. 폴백 대상의 한도도 같이 보십시오.`);
+  else lines.push('정책 «한도 안에서만» — codex 작업은 리셋까지 «멈춥니다»(폴백·크레딧 없음).');
 } else if (exhausted.length > 0) {
-  lines.push(`⚠️ **codex 계정 ${exhausted.length}/${codex.length} 소진**`);
+  lines.push(`⚠️ **codex 계정 ${exhausted.length}/${codex.length} 한도 참** — 남은 계정으로 회전합니다`);
 }
 for (const r of exhausted) {
   const h = hoursUntil(r.subscription?.resetsAt);
@@ -289,9 +339,9 @@ if (expiring.length > 0) {
   lines.push(`💳 **리셋권 만료 임박 (${RESET_CREDIT_EXPIRY_DAYS}일 이내)**`);
   for (const r of expiring) lines.push(`  • \`${r.accountName}\` — ${daysUntil(r.resetCredits?.expiresAt)}일 뒤`);
 }
-if (others.length > 0) {
+if (others.length > 0 && fallbackAllowed) {
   lines.push('');
-  lines.push('폴백 대상:');
+  lines.push(creditsAllowed ? '폴백 대상(크레딧까지 떨어진 뒤):' : '폴백 대상:');
   for (const r of others) {
     const rem = r.subscription?.remainingPercent;
     const used = r.credits?.usedPercent;

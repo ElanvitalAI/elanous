@@ -36,6 +36,74 @@ export interface ScheduleJob {
   stale?: boolean;
   command: string;
   note: string | null;
+  /** «켜짐»의 근거(🅣 S1 `GET /v1/schedules`) — 레지스트리 enabled 가 아니라 실제 발화 경로(crontab·launchd·trigger)로 잰 상태. */
+  state?: ScheduleState;
+  /** 다음 발화 시각(ISO · 최대 5). */
+  next?: string[];
+  /** stale · no-history · duplicate · pilot-path. */
+  flags?: string[];
+}
+
+export type ScheduleState = 'live' | 'firing' | 'stale' | 'off';
+
+/** `GET /v1/schedules` 카드(🅣 #21472 · 레지스트리 메타는 🅕 09-28 추가). */
+export interface ScheduleCard {
+  id: string;
+  name: string;
+  source: string;
+  cron: string | null;
+  intervalMs: number | null;
+  command: string | null;
+  runVia?: string | null;
+  category?: string | null;
+  domain?: string | null;
+  note?: string | null;
+  state: ScheduleState;
+  registryEnabled: boolean;
+  next: string[];
+  lastRun: { at: string; status: string | null; exit: number | null; durationMs: number | null; via: string | null } | null;
+  flags: string[];
+  pid?: number | null;
+  lastExit?: number | null;
+}
+
+/** 새 카드 → 화면 행. 켜짐 = 실제 발화 근거가 있다(state ≠ off). */
+export function cardToJob(card: ScheduleCard): ScheduleJob {
+  return {
+    id: card.id,
+    name: card.name,
+    cron: card.cron,
+    intervalMs: card.intervalMs,
+    category: card.category ?? card.source,
+    domain: card.domain ?? null,
+    source: card.source,
+    enabled: card.state !== 'off',
+    runVia: card.runVia ?? card.source,
+    lastRun: card.lastRun?.at ?? null,
+    lastStatus: card.lastRun?.status ?? null,
+    lastExit: card.lastRun?.exit ?? card.lastExit ?? null,
+    lastDurationMs: card.lastRun?.durationMs ?? null,
+    lastVia: card.lastRun?.via ?? null,
+    stale: card.state === 'stale',
+    command: card.command ?? '',
+    note: card.note ?? null,
+    state: card.state,
+    next: card.next,
+    flags: card.flags,
+  };
+}
+
+export function cardsToPayload(cards: ScheduleCard[], generatedAt = new Date().toISOString()): SchedulesPayload {
+  const jobs = cards.map(cardToJob);
+  const byCategory: Record<string, number> = {};
+  const bySource: Record<string, number> = {};
+  const byState: Record<string, number> = {};
+  for (const j of jobs) {
+    byCategory[j.category] = (byCategory[j.category] ?? 0) + 1;
+    bySource[j.source] = (bySource[j.source] ?? 0) + 1;
+    if (j.state) byState[j.state] = (byState[j.state] ?? 0) + 1;
+  }
+  return { total: jobs.length, adopted: jobs.filter((j) => j.runVia === 'elanous').length, byCategory, bySource, byState, jobs, generatedAt };
 }
 
 export interface SchedulesPayload {
@@ -43,6 +111,8 @@ export interface SchedulesPayload {
   adopted: number;
   byCategory: Record<string, number>;
   bySource: Record<string, number>;
+  /** 새 API 에서만 — 상태별 수. */
+  byState?: Record<string, number>;
   jobs: ScheduleJob[];
   generatedAt: string;
 }
@@ -58,15 +128,58 @@ function errorReason(err: unknown): string {
   return 'Unknown error';
 }
 
+/** 새 읽기 API(`/v1/schedules`)가 정본 — 판올림 전 데몬(그 경로가 없다)에서만 옛 대시보드 경로로 한 번 더. 모양으로 가른다. */
+export const SCHEDULES_PATH = '/v1/schedules?includeOff=1';
+export const LEGACY_SCHEDULES_PATH = '/v1/dashboard/schedules';
+
+function toPayload(res: unknown): SchedulesPayload | null {
+  const body = res as { schedules?: unknown } | null;
+  if (!body || typeof body !== 'object') return null;
+  if (Array.isArray(body.schedules)) return cardsToPayload(body.schedules as ScheduleCard[]);
+  const legacy = body.schedules as SchedulesPayload | undefined;
+  return legacy && Array.isArray(legacy.jobs) ? legacy : null;
+}
+
 export async function fetchScheduleLoad(
-  fetchJson: (path: string) => Promise<{ ok: boolean; schedules: SchedulesPayload }>,
+  fetchJson: (path: string) => Promise<unknown>,
 ): Promise<ScheduleLoadState> {
-  try {
-    const res = await fetchJson('/v1/dashboard/schedules');
-    return { kind: 'ready', data: res.schedules };
-  } catch (err) {
-    return { kind: 'error', reason: errorReason(err) };
+  let reason = 'Unknown error';
+  for (const path of [SCHEDULES_PATH, LEGACY_SCHEDULES_PATH]) {
+    try {
+      const data = toPayload(await fetchJson(path));
+      if (data) return { kind: 'ready', data };
+      reason = `unexpected response from ${path}`;
+    } catch (err) {
+      reason = errorReason(err);
+    }
   }
+  return { kind: 'error', reason };
+}
+
+const STATE_BADGE: Record<ScheduleState, { label: string; tone: string; tip: string }> = {
+  live: { label: '켜짐', tone: 'bg-emerald-500/15 text-emerald-300 ring-emerald-500/30', tip: '실제 발화 경로(crontab·launchd·trigger)에 올라 있다' },
+  firing: { label: '발화 중', tone: 'bg-sky-500/15 text-sky-200 ring-sky-500/30', tip: '발화 경로에 올라 있고 최근 실행 기록이 있다' },
+  stale: { label: '유실 의심', tone: 'bg-amber-500/15 text-amber-300 ring-amber-500/30', tip: '예정 시각이 지났는데 실행 기록이 없다' },
+  off: { label: '꺼짐', tone: 'bg-muted text-muted-foreground ring-border', tip: '어느 발화 경로에도 없다(레지스트리에만 있다)' },
+};
+
+/** `?ids=a,b` — Missions 의 «이 미션을 부르는 스케줄» 링크가 넘기는 정확한 id 목록(부분 일치 아님). */
+export function parseIdsFilter(search: string): string[] | null {
+  const raw = new URLSearchParams(search).get('ids');
+  if (!raw) return null;
+  const ids = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  return ids.length ? ids : null;
+}
+
+function fmtNext(iso: string | undefined): string | null {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return null;
+  const min = Math.round((ts - Date.now()) / 60000);
+  if (min < 1) return 'next <1m';
+  if (min < 60) return `next ${min}m`;
+  const hr = Math.floor(min / 60);
+  return hr < 24 ? `next ${hr}h` : `next ${Math.floor(hr / 24)}d`;
 }
 
 export function isCurrentScheduleRequest<T>(
@@ -173,8 +286,10 @@ function JobRow({
   onAction: (action: string, job: ScheduleJob, note?: string) => void;
   acting: boolean;
 }) {
-  // daemon(데몬 내부 스케줄)은 crontab/registry 조작 대상이 아님 — 액션 숨김.
-  const isDaemon = job.runVia === 'daemon';
+  // daemon(데몬 내부 스케줄)·launchd·trigger 미러는 crontab/registry 조작 대상이 아님 — 액션 숨김.
+  const isDaemon = job.runVia === 'daemon' || job.id.includes(':');
+  const badge = job.state ? STATE_BADGE[job.state] : null;
+  const next = fmtNext(job.next?.[0]);
   // 하단 레이블: 수동 설명(note)이 있으면 우선, 없으면 command 자동 요약.
   const label = job.note || describeCommand(job.command);
   // 호버 툴팁: 설명(있으면) + 항상 풀 command.
@@ -190,8 +305,13 @@ function JobRow({
       <div className="min-w-0">
         <div className="flex items-center gap-2">
           <span className="truncate text-sm font-medium">{job.name}</span>
-          {!job.enabled && (
+          {badge ? (
+            <span className={`shrink-0 whitespace-nowrap rounded-full px-1.5 py-0.5 text-[10px] ring-1 ${badge.tone}`} title={badge.tip} data-schedule-state={job.state}>{badge.label}</span>
+          ) : !job.enabled && (
             <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">disabled</span>
+          )}
+          {job.flags?.includes('duplicate') && (
+            <span className="rounded-full bg-red-500/15 px-1.5 py-0.5 text-[10px] text-red-300 ring-1 ring-red-500/30" title="같은 명령이 두 번 발화한다">duplicate</span>
           )}
         </div>
         <div
@@ -202,6 +322,9 @@ function JobRow({
       </div>
       <div className="flex shrink-0 flex-wrap items-center gap-1.5 text-[11px]">
         <span className="rounded-full bg-muted px-2 py-0.5 font-mono text-muted-foreground">{whenLabel(job)}</span>
+        {next && job.enabled && (
+          <span className="text-muted-foreground" title={job.next?.join('\n')}>{next}</span>
+        )}
         <span className="rounded-full bg-muted px-2 py-0.5 text-muted-foreground">{job.category}</span>
         <span className={`rounded-full px-2 py-0.5 ring-1 ${RUN_VIA_TONE[job.runVia] ?? RUN_VIA_TONE.crontab}`}>
           {job.runVia}
@@ -221,7 +344,7 @@ function JobRow({
             {job.lastVia && job.lastVia !== 'crontab' ? ` ${job.lastVia}` : ''}
           </span>
         )}
-        {job.stale && (
+        {job.stale && !badge && (
           <span
             className="rounded-full bg-amber-500/15 px-2 py-0.5 text-amber-300 ring-1 ring-amber-500/30"
             title="예정 시각이 지났는데 미실행(유실 의심)"
@@ -309,6 +432,9 @@ export function SchedulerPanel() {
   const requestId = useRef(0);
   const inFlightClient = useRef<typeof client | null>(null);
   const data = load.kind === 'ready' ? load.data : null;
+  // ⛔ 렌더 중에 location 을 읽지 않는다(정적 export 하이드레이션 · #418) — 마운트 뒤에.
+  const [idsFilter, setIdsFilter] = useState<string[] | null>(null);
+  useEffect(() => { setIdsFilter(parseIdsFilter(window.location.search)); }, []);
 
   const refresh = useCallback(async (): Promise<void> => {
     if (inFlightClient.current === client) return;
@@ -317,7 +443,7 @@ export function SchedulerPanel() {
     setBusy(true);
     setLoad({ kind: 'loading' });
     try {
-      const nextLoad = await fetchScheduleLoad((path) => client.fetchJson<{ ok: boolean; schedules: SchedulesPayload }>(path));
+      const nextLoad = await fetchScheduleLoad((path) => client.fetchJson<unknown>(path));
       if (isCurrentScheduleRequest(currentRequest, client, requestId.current, inFlightClient.current)) {
         setLoad(nextLoad);
         if (nextLoad.kind === 'error') reportScheduleLoadFailure(nextLoad.reason, toast.error);
@@ -365,6 +491,7 @@ export function SchedulerPanel() {
     if (!data) return [];
     const byDomain = new Map<string, ScheduleJob[]>();
     for (const job of data.jobs) {
+      if (idsFilter && !idsFilter.includes(job.id)) continue;
       const key = domainKey(job.domain);
       const list = byDomain.get(key) ?? [];
       list.push(job);
@@ -382,16 +509,16 @@ export function SchedulerPanel() {
         domain,
         jobs: jobs.sort((x, y) => (Date.parse(y.lastRun ?? '0') || 0) - (Date.parse(x.lastRun ?? '0') || 0)),
       }));
-  }, [data]);
+  }, [data, idsFilter]);
 
   return (
     <div className="mx-auto max-w-[1200px] space-y-4 p-4">
       <FabricStageHeader active="scheduler" />
       <header className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
         <div>
-          <h1 className="text-xl font-semibold tracking-tight">Scheduler</h1>
+          <h1 className="text-xl font-semibold tracking-tight">Schedules</h1>
           <p className="text-sm text-muted-foreground">
-            예약된 모든 잡의 단일 인지 지점 (crontab · 데몬 내부 · workflow trigger 미러). run_via = 실행 주체.
+            예약된 모든 잡 한 곳 (crontab · launchd · 데몬 내부 · workflow trigger). «켜짐» = 실제 발화 경로에 올라 있다.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -401,10 +528,19 @@ export function SchedulerPanel() {
                 <div className="text-muted-foreground">total</div>
                 <div className="text-sm font-semibold">{data.total}</div>
               </div>
-              <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs">
-                <div className="text-muted-foreground">adopted (elanous)</div>
-                <div className="text-sm font-semibold">{data.adopted}</div>
-              </div>
+              {data.byState ? (
+                (['live', 'firing', 'stale', 'off'] as const).map((st) => (
+                  <div key={st} className="rounded-lg border border-border bg-card px-3 py-2 text-xs" data-schedule-count={st}>
+                    <div className="text-muted-foreground">{STATE_BADGE[st].label}</div>
+                    <div className={`text-sm font-semibold ${st === 'stale' && data.byState?.[st] ? 'text-amber-300' : ''}`}>{data.byState?.[st] ?? 0}</div>
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-lg border border-border bg-card px-3 py-2 text-xs">
+                  <div className="text-muted-foreground">adopted (elanous)</div>
+                  <div className="text-sm font-semibold">{data.adopted}</div>
+                </div>
+              )}
             </>
           )}
           <Button size="sm" variant="outline" onClick={() => void refresh()} disabled={busy}>
@@ -413,6 +549,15 @@ export function SchedulerPanel() {
         </div>
       </header>
 
+      {idsFilter && (
+        <div className="flex items-center gap-2 rounded-lg border border-primary/40 bg-primary/10 px-3 py-2 text-xs" data-schedule-ids-filter>
+          <span>미션이 부르는 스케줄만 · {idsFilter.length}</span>
+          {data && groups.reduce((n, g) => n + g.jobs.length, 0) < idsFilter.length && (
+            <span className="text-amber-300">— {idsFilter.length - groups.reduce((n, g) => n + g.jobs.length, 0)}개는 지금 목록에 없다(지워졌거나 다른 우주)</span>
+          )}
+          <button type="button" className="ml-auto underline" onClick={() => { setIdsFilter(null); window.history.replaceState(null, '', window.location.pathname); }}>모두 보기</button>
+        </div>
+      )}
       <ScheduleLoadContent
         load={load}
         groups={groups}

@@ -1,5 +1,5 @@
-// ACP client — spawns an ACP-speaking subprocess (claude-code-acp,
-// codex-acp, etc.) and exposes a small surface for prompts +
+// ACP client — spawns an ACP-speaking subprocess (claude-agent-acp,
+// grok, etc.) and exposes a small surface for prompts +
 // streaming session updates.
 //
 // Architecture (matches zed/crates/agent_servers/src/acp.rs:193-280):
@@ -25,6 +25,7 @@ import {
   ClientSideConnection,
   ndJsonStream,
   PROTOCOL_VERSION,
+  RequestError,
   type Agent,
   type Client,
   type ContentBlock,
@@ -34,6 +35,7 @@ import {
   type SessionNotification,
   type SessionUpdate,
   type SessionId,
+  type SessionConfigOption,
   type StopReason,
 } from '@agentclientprotocol/sdk';
 import { getAcpBackend, type AcpBackendSpec } from './backend-registry.js';
@@ -57,9 +59,31 @@ import type {
   LoadSessionResponse,
   McpServer,
   ResumeSessionResponse,
-  SessionModelState,
-  ModelInfo,
 } from '@agentclientprotocol/sdk';
+
+// Keep the legacy wire shape for consumers and peers that still advertise session models.
+interface ModelInfo { modelId: string; name: string }
+interface SessionModelState { currentModelId: string; availableModels: ModelInfo[] }
+
+function claudeModelState(options: SessionConfigOption[] | null | undefined): SessionModelState | undefined {
+  // claude-agent-acp 0.81.2 publishes its model selector as a config option.
+  const model = options?.find(option => option.id === 'model' && option.type === 'select');
+  if (!model || model.type !== 'select') return undefined;
+  return {
+    currentModelId: model.currentValue,
+    availableModels: model.options.flatMap(option => 'options' in option ? option.options : [option])
+      .map(option => ({ modelId: option.value, name: option.name })),
+  };
+}
+
+export class AcpAuthRequiredError extends Error {
+  readonly backendId: string;
+  constructor(backendId: string) {
+    super('Claude Code 구독 로그인이 필요합니다 — 터미널에서 `claude /login`');
+    this.name = 'AcpAuthRequiredError';
+    this.backendId = backendId;
+  }
+}
 
 export const ACP_UNKNOWN_EXTERNAL_PERFORMER = 'acp-external:unknown';
 
@@ -111,10 +135,11 @@ function truncateAcpFrameBody(body: string): { body: string; bodyTruncated: bool
 function observeAcpFrame(direction: AcpFrameDirection, frame: Uint8Array): void {
   try {
     const rawBody = new TextDecoder().decode(frame);
-    const body = redactSecretText(rawBody);
     const parsed = JSON.parse(rawBody) as { id?: unknown; method?: unknown };
     const method = typeof parsed.method === 'string' ? parsed.method : null;
-    const truncated = truncateAcpFrameBody(body);
+    // Authentication notifications may contain an email: never log their raw frame.
+    if (direction === 'incoming' && method === '_auth/status_update') return;
+    const truncated = truncateAcpFrameBody(redactSecretText(rawBody));
     debug.log('acp.client', 'frame', {
       direction,
       id: parsed.id ?? null,
@@ -400,10 +425,9 @@ export class AcpAgent {
   private proc: ChildProcessByStdio<Writable, Readable, Readable> | null = null;
   private connection: ClientSideConnection | null = null;
   private readonly pendingBySession = new Map<SessionId, PendingSession>();
-  /** Per-session model catalog captured from the `session/new` response
-   *  (UNSTABLE model-selection extension). Lets callers pick a model tier
-   *  (opus/sonnet/haiku) via `selectSessionModel` instead of inheriting the
-   *  backend CLI default. Empty when the backend doesn't advertise models. */
+  /** Per-session model catalog captured from `session/new` (Claude configOptions
+   *  or the legacy model extension). Lets callers pick a model tier via
+   *  `selectSessionModel`. Empty when the backend doesn't advertise models. */
   private readonly sessionModels = new Map<SessionId, SessionModelState>();
   private initialized = false;
   private permissionApprover: AcpPermissionApprover | null;
@@ -413,6 +437,7 @@ export class AcpAgent {
    *  `getCapabilities()` to feature-gate without plumbing the raw
    *  AgentCapabilities blob through every layer. */
   private peerCapabilities: ElanousCapabilities | null = null;
+  private authMethods: string[] = [];
 
   constructor(opts: AcpAgentOpts) {
     this.spec = getAcpBackend(opts.backendId);
@@ -421,8 +446,8 @@ export class AcpAgent {
     this.cwd = opts.cwd ?? getSessionCwd();
     // Inherit env, then strip any flags that would confuse a child
     // ACP agent. CLAUDECODE / CLAUDE_CODE_* indicate the parent
-    // process is already a Claude Code session; claude-code-acp
-    // refuses to start nested ("nested sessions share runtime
+    // process is already a Claude Code session; the child may
+    // refuse to start nested ("nested sessions share runtime
     // resources and will crash all active sessions"). Same problem
     // hits anyone running elanous inside a `claude` terminal — strip
     // proactively. Mirrors zed's env-strip pattern for provider
@@ -538,8 +563,9 @@ export class AcpAgent {
       stream,
     );
 
-    // Initialize handshake. We advertise NO fs / terminal / auth
-    // capabilities for now — keeps the surface minimal. The agent
+    // Initialize handshake. We advertise no fs or terminal RPC capability.
+    // Claude receives terminal auth support so it can advertise login methods;
+    // elanous only provides a CLI hint and never executes the login. The agent
     // will refuse to use filesystem tools, which is fine for P1
     // smoke tests. P3 will add fs callbacks for real coding tasks.
     // ACP backends such as Codex require clientInfo, so identify this
@@ -549,12 +575,18 @@ export class AcpAgent {
     const response = await this.connection.initialize({
       protocolVersion: PROTOCOL_VERSION,
       clientInfo,
-      clientCapabilities: buildClientDeclaration(),
+      clientCapabilities: this.spec.id === 'claude'
+        ? { ...buildClientDeclaration(), auth: { terminal: true } }
+        : buildClientDeclaration(),
     });
     // H2 #4 — fail loudly on protocol-version mismatch instead of
     // silently proceeding. Message points at the upgrade path.
     const versionErr = checkProtocolVersion(PROTOCOL_VERSION, response.protocolVersion);
     if (versionErr) throw versionErr;
+    this.authMethods = this.spec.id === 'claude'
+      ? (response.authMethods?.map(({ id }) => id) ?? [])
+        .filter((id) => id === 'claude-login' || id === 'claude-ai-login')
+      : [];
     this.recordCapabilities(response.agentCapabilities, response.protocolVersion);
     this.initialized = true;
   }
@@ -668,7 +700,7 @@ export class AcpAgent {
       throw new AcpResumeSessionUnsupportedError(this.spec.id);
     }
     debug.log('acp.client', 'session-resume', { sessionId: req.sessionId });
-    return this.connection.unstable_resumeSession({
+    return this.connection.resumeSession({
       sessionId: req.sessionId,
       cwd: req.cwd ?? this.cwd,
       mcpServers: req.mcpServers ?? [],
@@ -702,7 +734,7 @@ export class AcpAgent {
     if (!this.peerCapabilities?.session.list) {
       throw new AcpListSessionsUnsupportedError(this.spec.id);
     }
-    const response = await this.connection.unstable_listSessions({
+    const response = await this.connection.listSessions({
       cursor: req.cursor,
       cwd: req.cwd ?? this.cwd,
     });
@@ -717,40 +749,60 @@ export class AcpAgent {
    *  assigned sessionId — caller stores this for follow-up turns. */
   async newSession(): Promise<SessionId> {
     if (!this.connection) throw new Error('AcpAgent not started');
-    const response = await this.connection.newSession({
-      cwd: this.cwd,
-      mcpServers: [],
-    });
-    // Capture the model catalog (UNSTABLE ext) so selectSessionModel can
-    // resolve a tier alias → concrete modelId without another round-trip.
-    if (response.models) this.sessionModels.set(response.sessionId, response.models);
+    let response;
+    try {
+      response = await this.connection.newSession({
+        cwd: this.cwd,
+        mcpServers: [],
+      });
+    } catch (error) {
+      if (this.spec.id === 'claude'
+        && (this.authMethods.includes('claude-login') || this.authMethods.includes('claude-ai-login'))
+        && error instanceof RequestError
+        && error.code === RequestError.authRequired().code) {
+        debug.log('acp.client', 'auth-required', { backendId: this.spec.id, methods: this.authMethods });
+        throw new AcpAuthRequiredError(this.spec.id);
+      }
+      throw error;
+    }
+    // Claude's model selector is a config option; other peers may still use
+    // the legacy models extension. Keep their behavior unchanged.
+    const models = this.spec.id === 'claude'
+      ? claudeModelState(response.configOptions)
+      : (response as typeof response & { models?: SessionModelState }).models;
+    if (models) this.sessionModels.set(response.sessionId, models);
     this.log(`new session ${response.sessionId}`);
     debug.log('acp.client', 'session-new', { sessionId: response.sessionId });
     return response.sessionId;
   }
 
   /** Model catalog for a session (available models + current), or undefined
-   *  when the backend didn't advertise the UNSTABLE model-selection ext. */
+   *  when the backend didn't advertise model selection. */
   getSessionModels(sessionId: SessionId): SessionModelState | undefined {
     return this.sessionModels.get(sessionId);
   }
 
   /** Set the active model for a session by concrete modelId (raw primitive).
-   *  Wraps the UNSTABLE `session/set_model` request — throws if the backend
-   *  doesn't implement it. Prefer `selectSessionModel` for alias resolution. */
+   *  Claude uses `session/set_config_option`; other peers retain their
+   *  existing UNSTABLE `session/set_model` extension. */
   async setSessionModel(sessionId: SessionId, modelId: string): Promise<void> {
     if (!this.connection) throw new Error('AcpAgent not started');
-    await this.connection.unstable_setSessionModel({ sessionId, modelId });
-    const state = this.sessionModels.get(sessionId);
-    if (state) this.sessionModels.set(sessionId, { ...state, currentModelId: modelId });
+    if (this.spec.id === 'claude') {
+      const response = await this.connection.setSessionConfigOption({ sessionId, configId: 'model', value: modelId });
+      const models = claudeModelState(response.configOptions);
+      if (models) this.sessionModels.set(sessionId, models);
+    } else {
+      await this.connection.extMethod('session/set_model', { sessionId, modelId });
+      const state = this.sessionModels.get(sessionId);
+      if (state) this.sessionModels.set(sessionId, { ...state, currentModelId: modelId });
+    }
   }
 
   /** Select a session model by a tier alias (e.g. "opus"/"sonnet"/"haiku").
    *  Resolves against the session's advertised models with a lenient
-   *  includes-match (mirrors claude-code-acp's own settings.model matching),
-   *  then applies it. Returns the picked model, or null when no model matched
-   *  or the backend advertises none / rejects set_model — callers stay on the
-   *  backend default in that case rather than failing hard. */
+   *  includes-match, then applies it. Returns the picked model, or null when
+   *  no model matched or the backend advertises none / rejects the change —
+   *  callers stay on the backend default in that case rather than failing hard. */
   async selectSessionModel(sessionId: SessionId, alias: string): Promise<ModelInfo | null> {
     const state = this.sessionModels.get(sessionId);
     if (!state || state.availableModels.length === 0) return null;
@@ -764,7 +816,7 @@ export class AcpAgent {
     if (!pick) return null;
     if (pick.modelId === state.currentModelId) return pick; // already active
     try { await this.setSessionModel(sessionId, pick.modelId); }
-    catch (e) { this.log(`set_model failed (${(e as Error).message}) — staying on default`); return null; }
+    catch (e) { this.log(`${this.spec.id === 'claude' ? 'model selection' : 'set_model'} failed (${(e as Error).message}) — staying on default`); return null; }
     return pick;
   }
 
@@ -824,6 +876,15 @@ export class AcpAgent {
         const original = error instanceof Error ? error.message : String(error);
         throw new Error(`${original} · ${grokAuthHint()}`, { cause: error });
       }
+      // claude-agent-acp may create a session before Claude Code checks the
+      // saved login. The same authRequired rejection can arrive on prompt.
+      if (this.spec.id === 'claude'
+        && (this.authMethods.includes('claude-login') || this.authMethods.includes('claude-ai-login'))
+        && error instanceof RequestError
+        && error.code === RequestError.authRequired().code) {
+        debug.log('acp.client', 'auth-required', { backendId: this.spec.id, methods: this.authMethods });
+        throw new AcpAuthRequiredError(this.spec.id);
+      }
       throw error;
     } finally {
       this.pendingBySession.delete(sessionId);
@@ -868,6 +929,7 @@ export class AcpAgent {
     }
     this.connection = null;
     this.initialized = false;
+    this.authMethods = [];
     this.pendingBySession.clear();
   }
 
@@ -892,6 +954,14 @@ export class AcpAgent {
 
       extNotification: async (method, params): Promise<void> => {
         try {
+          if (this.spec.id === 'claude' && method === '_auth/status_update') {
+            const status = params.authStatus;
+            if (status && typeof status === 'object' && 'kind' in status
+              && ['account', 'api_key', 'gateway', 'external', 'none'].includes(String(status.kind))) {
+              debug.log('acp.client', 'auth-status', { backendId: this.spec.id, kind: status.kind });
+            }
+            return;
+          }
           debug.log('acp.client', 'ext-notification', {
             backendId: this.spec.id,
             method,
@@ -999,7 +1069,7 @@ export class AcpAgent {
       } catch { /* keep searching */ }
     }
     // Last resort: rely on PATH. Lets the user globally install the
-    // backend (`bun add -g @zed-industries/claude-code-acp`).
+    // backend (`bun add -g @agentclientprotocol/claude-agent-acp`).
     return { path: this.spec.command, reason: 'default' };
   }
 }

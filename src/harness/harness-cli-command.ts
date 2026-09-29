@@ -5,14 +5,19 @@ import { Command, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, parseGoalType, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
-import { loadFederatedRunLedger, loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { listRunLedgers, loadFederatedRunLedger, loadRunLedger, runLedgerDir, type RunLedgerMatch } from '../self-implement/run-ledger.js';
 import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
+import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
+import { runDraftSweep, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr } from '../self-dev/draft-sweep.js';
 import { debug } from '../debug/log.js';
+import { PR_LABELS } from '../github/pr-labels.js';
 import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
+import { getUserConfig } from '../user-config.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
+import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
 import type { MissionSolveOutcome } from './mission-solve-loop.js';
 import { formatAxis, formatAxisObservations, inspectAskMarkers, inspectUnpressedDecisionSignals } from '../../scripts/ask-marker-check.js';
@@ -75,6 +80,7 @@ export interface HarnessAskSayOptions {
   json?: boolean;
   base?: string;
   target?: string;
+  yes?: boolean;
   forcePreflight?: boolean;
   autoMerge?: boolean;
   mergeByHost?: boolean;
@@ -135,7 +141,7 @@ async function runInjectedHarnessHandler(run: () => Promise<void>): Promise<void
     await run();
   } catch (error) {
     console.error(humanErrorLine(error));
-    process.exitCode = 1;
+    process.exitCode = error instanceof DevPipelineError ? error.exitCode : 1;
   }
 }
 
@@ -224,14 +230,15 @@ function printHarnessLaunchDryRun(preview: {
 function registerHarnessAskSayOptions(command: Command): Command {
   return registerHarnessCommonOptions(command)
     .option('--target <path>', 'self: harness가 작업할 레포 또는 디렉터리(self-mission 전용)')
+    .option('--yes', 'git 아닌 프로젝트에 git init 및 첫 커밋을 만들도록 동의')
     .option('--correlation <id>', '요청과 런을 잇는 불투명 correlation 값')
     .addOption(new Option('--goal-type <type>', `골 종류 (${GOAL_TYPES.join('|')})`).choices([...GOAL_TYPES]))
     .option('--force-preflight', '전제 검사 막힘을 명시 요청으로 우회(관측에 남음)')
     .option('--child-llm-provider <id>', 'self: 구현 자식 LLM provider(--child-llm-model과 함께)')
     .option('--child-llm-model <id>', 'self: 구현 자식 LLM model(--child-llm-provider와 함께)')
     .option('--child-llm-effort <level>', 'self: 구현 자식 추론 노력 minimal|low|medium|high|xhigh|max — 모델 상한을 넘으면 «거부»한다(--child-llm-provider와 함께)')
-    .addOption(new Option('--substrate <kind>', '실행 칸 — local(기본 · 이 기계) | pod(k8s Pod · 같은 그래프가 원격에서 돈다 · 풀·이미지 판·계정은 자동)').choices(['local', 'pod']))
-    .option('--pod-pool <spec>', 'pod: 풀 — 컨텍스트[@ssh호스트][:상한] 쉼표로(앞이 우선) · 없으면 ELANOUS_POD_POOL · 그것도 없으면 현재 컨텍스트')
+    .addOption(new Option('--substrate <kind>', '실행 칸 — local(설정 없을 때 기본 · 이 기계) | pod(k8s Pod · 같은 그래프가 원격에서 돈다)').choices(['local', 'pod']))
+    .option('--pod-pool <spec>', 'pod: 풀 — 인자 > ELANOUS_POD_POOL > harness.podPool > 기존 pod.pool > 현재 컨텍스트')
     .addOption(new Option('--pod-memory <tier>', 'pod: 메모리 등급 — standard(16Gi) | high(32Gi) · 없으면 골 문면 `Pod 메모리: high` 줄 · 그것도 없으면 골이 apps/pwa/ 를 담을 때 high').choices(['standard', 'high']))
     .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께');
 }
@@ -256,6 +263,7 @@ function normalizeHarnessCommonOptions(opts: HarnessAskSayOptions): HarnessAskSa
     ...(opts.json ? { json: true } : {}),
     ...(opts.base !== undefined ? { base: opts.base } : {}),
     ...(opts.target !== undefined ? { target: opts.target } : {}),
+    ...(opts.yes === true ? { yes: true } : {}),
     ...(opts.autoMerge === false ? { autoMerge: false } : {}),
     ...(opts.mergeByHost === true ? { mergeByHost: true } : {}),
     ...(opts.observeOnly ? { observeOnly: true } : {}),
@@ -298,11 +306,16 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
 type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string };
-function podSubstrate(opts: unknown): boolean {
-  return (opts as HarnessSubstrateOpts).substrate === 'pod';
+function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubstrate {
+  const resolved = resolveHarnessSubstrate({ flag: opts, config: getUserConfig(), env: process.env });
+  debug.log('harness.substrate', 'resolved', resolved);
+  const head = `[harness] substrate=${resolved.substrate}${resolved.substrate === 'pod' ? ` pool=${resolved.pool}` : ''} (${resolved.source})`;
+  if (opts.json) console.error(head);
+  else console.log(head);
+  return resolved;
 }
 /** ⭐ 런 계약의 실행 칸 = pod — 호스트는 그래프를 안 돌리고 Pod 로 보낸다(harness-pod-dispatch.ts). */
-async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-say', input: string): Promise<void> {
+async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-say', input: string, pool: string): Promise<void> {
   const o = opts as HarnessSubstrateOpts;
   if (o.target !== undefined) {
     debug.log('harness.pod', 'target-refused', { target: o.target });
@@ -312,8 +325,11 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
     return;
   }
   const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
-  const status = await dispatchHarnessOnPod({ entrance, input, ...(o.podPool ? { podPool: o.podPool } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) });
-  if (status !== 0) process.exitCode = status;
+  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) });
+  if (status !== 0) {
+    console.error('Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라');
+    process.exitCode = status;
+  }
 }
 
 async function dispatchHarnessAskSay(
@@ -324,15 +340,16 @@ async function dispatchHarnessAskSay(
     readonly wouldStart: string;
     readonly goalPath?: string;
   },
-  dispatch: () => Promise<void>,
+  dispatch: (resolved: ResolvedHarnessSubstrate) => Promise<void>,
 ): Promise<void> {
   await runInjectedHarnessHandler(async () => {
     assertHarnessChildLlmModel(opts);
+    const resolved = resolveLaunchSubstrate(opts);
     if (isHarnessDryRun(opts)) {
       printHarnessLaunchDryRun(dryRunPreview);
       return;
     }
-    await dispatch();
+    await dispatch(resolved);
   });
 }
 
@@ -1214,6 +1231,234 @@ export async function runHarnessBudget(opts: { json?: boolean } = {}, io: {
   return decision;
 }
 
+const DRAFT_SWEEP_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+type GithubPull = {
+  number: number;
+  title: string;
+  draft: boolean;
+  state: 'open' | 'closed';
+  head: { ref: string };
+  labels: Array<{ name: string }>;
+  created_at: string;
+  updated_at?: string;
+  merged_at: string | null;
+};
+
+type GhExecute = (args: string[]) => string;
+
+// ⛔ `env: process.env` is required: Bun resolves the executable against the PATH it started with, not the one
+//    ensure-bin-path augments. Under cron's minimal PATH the hourly sweep died with «Executable not found: gh» (2026-09-28).
+const executeGh: GhExecute = (args) => execFileSync('gh', args, {
+  encoding: 'utf8', timeout: 30_000, maxBuffer: 16 * 1024 * 1024,
+  stdio: ['ignore', 'pipe', 'pipe'], env: process.env,
+});
+
+function ghJson<T>(args: string[], execute: GhExecute): T {
+  return JSON.parse(execute(args)) as T;
+}
+
+function githubPullsPage(repository: string, state: 'open' | 'closed', page: number, execute: GhExecute): GithubPull[] {
+  // Closed PRs newest-updated first: a merged twin that matters was merged after the oldest open draft, so paging can stop there.
+  const order = state === 'closed' ? '&sort=updated&direction=desc' : '';
+  return ghJson<GithubPull[]>(['api', `repos/${repository}/pulls?state=${state}${order}&per_page=100&page=${page}`], execute);
+}
+
+function ledgerPrRepository(data: Record<string, unknown>, number: number): string | undefined {
+  const value = data.repository ?? data.repo ?? data.nameWithOwner;
+  const named = typeof value === 'string' ? value : value && typeof value === 'object'
+    ? (value as Record<string, unknown>).nameWithOwner ?? (value as Record<string, unknown>).full_name : undefined;
+  const url = data.url ?? data.html_url;
+  const match = typeof url === 'string'
+    ? /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)(?:[/?#].*)?$/.exec(url)
+    : null;
+  if (typeof url === 'string' && (!match || Number(match[2]) !== number)) return undefined;
+  const fromUrl = match?.[1];
+  if (typeof named === 'string' && fromUrl && named !== fromUrl) return undefined;
+  const repository = typeof named === 'string' ? named : fromUrl;
+  return repository && DRAFT_SWEEP_REPOSITORY.test(repository) ? repository : undefined;
+}
+
+/** A PR number alone is not run identity; ledgers without verifiable repository ownership stay unknown. */
+export function draftSweepRunStatus(ledgerMatches: readonly RunLedgerMatch[], running: ReadonlyMap<string, string>,
+  repository: string, number: number): string | undefined {
+  const statuses = new Set<string>();
+  for (const match of ledgerMatches) {
+    const prEvents = match.entries.filter((entry) => entry.event === 'pr-opened' && entry.data.number === number);
+    if (prEvents.length === 0 || prEvents.some((entry) => ledgerPrRepository(entry.data, number) !== repository)) continue;
+    const terminal = [...match.entries].reverse().find((item) => item.event === 'run-status')?.data.runStatus;
+    const status = running.get(match.runId) ?? (typeof terminal === 'string' &&
+      ['completed', 'failed', 'cancelled', 'abandoned'].includes(terminal) ? terminal : undefined);
+    if (status && status !== 'unknown') statuses.add(status);
+  }
+  return statuses.size === 1 ? [...statuses][0] : undefined;
+}
+
+type DraftSweepGitExecute = (cwd: string, args: string[]) => Pick<ReturnType<typeof runGitCommand>, 'status' | 'stdout' | 'stderr'>;
+
+function githubRemoteRepository(url: string): string | undefined {
+  const remote = url.trim();
+  const match = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(remote);
+  return match?.[1];
+}
+
+export function githubDraftSweepAdapters(execute: GhExecute = executeGh, git: DraftSweepGitExecute = runGitCommand): DraftSweepAdapters {
+  const inventory = async (repository: string, state: 'open' | 'closed'): Promise<GithubPull[]> => {
+    // ⛔ A large repository has tens of thousands of closed PRs (2026-09-28: 21k → «exceeded pagination limit», no sweep at all).
+    //    Merged twins only matter after the oldest open draft was opened, so the closed listing stops at that time.
+    let cutoff: number | undefined;
+    if (state === 'closed') {
+      const drafts = (await listed(open, repository, 'open')).filter((pr) => pr.draft);
+      if (drafts.length === 0) return [];
+      cutoff = Math.min(...drafts.map((pr) => Date.parse(pr.created_at)));
+      if (!Number.isFinite(cutoff)) throw new Error('Incomplete GitHub PR inventory');
+    }
+    const all: GithubPull[] = [];
+    for (let page = 1; page <= 100; page++) {
+      const batch = githubPullsPage(repository, state, page, execute);
+      if (!Array.isArray(batch) || batch.length > 100) throw new Error('Incomplete GitHub PR inventory');
+      all.push(...batch);
+      if (batch.length < 100) return all;
+      // An unknown update time cannot prove the rest is older — keep paging.
+      const oldest = Date.parse(batch[batch.length - 1]!.updated_at ?? '');
+      if (cutoff !== undefined && Number.isFinite(oldest) && oldest < cutoff) return all;
+    }
+    throw new Error('GitHub PR inventory exceeded pagination limit');
+  };
+  const open = new Map<string, Promise<GithubPull[]>>();
+  const closed = new Map<string, Promise<GithubPull[]>>();
+  const listed = (cache: Map<string, Promise<GithubPull[]>>, repository: string, state: 'open' | 'closed') => {
+    if (!cache.has(repository)) cache.set(repository, inventory(repository, state));
+    return cache.get(repository)!;
+  };
+  let ledgerMatches: readonly RunLedgerMatch[] | undefined;
+  let running: ReadonlyMap<string, string> | undefined;
+  const runStatusFor = (repository: string, number: number): string | undefined => {
+    ledgerMatches ??= listRunLedgers().matches;
+    running ??= new Map(queryRunningRuns().entries.map((entry) => [entry.runId, entry.status]));
+    return draftSweepRunStatus(ledgerMatches, running, repository, number);
+  };
+  return {
+    listDrafts: async (page, perPage, repository): Promise<SweepDraft[]> =>
+      (await listed(open, repository, 'open')).filter((pr) => pr.draft)
+        .slice((page - 1) * perPage, page * perPage)
+        .map((pr) => ({ number: pr.number, title: pr.title, branch: pr.head.ref,
+          labels: pr.labels.map((item) => item.name), createdAt: pr.created_at, ...(pr.updated_at ? { updatedAt: pr.updated_at } : {}) })),
+    listMerged: async (page, perPage, repository): Promise<SweepMergedPr[]> =>
+      (await listed(closed, repository, 'closed')).filter((pr) => pr.merged_at !== null)
+        .slice((page - 1) * perPage, page * perPage)
+        .map((pr) => ({ number: pr.number, title: pr.title, branch: pr.head.ref })),
+    getRunStatus: async (draft, repository) => runStatusFor(repository, draft.number),
+    listLiveBranches: async (repository) => {
+      const cwd = process.cwd();
+      const remote = git(cwd, ['config', '--get', 'remote.origin.url']);
+      if (remote.status !== 0 || githubRemoteRepository(remote.stdout)?.toLowerCase() !== repository.toLowerCase()) {
+        return undefined;
+      }
+      const result = git(cwd, ['worktree', 'list', '--porcelain']);
+      if (result.status !== 0) return undefined;
+      return new Set(result.stdout.split('\n').filter((line) => line.startsWith('branch refs/heads/'))
+        .map((line) => line.slice('branch refs/heads/'.length).trim()));
+    },
+    setLabels: async (repository, number, change) => {
+      execute(['pr', 'edit', String(number), '--repo', repository, '--add-label', change.add,
+        ...change.remove.flatMap((name) => ['--remove-label', name])]);
+    },
+    closeDraft: async (repository, number, comment) => {
+      execute(['pr', 'close', String(number), '--repo', repository, '--comment', comment]);
+    },
+    getClaimOwner: async (repository, number) => claimCommentOwner(repository, number, execute),
+  };
+}
+
+export interface HarnessDraftSweepDeps {
+  readonly adapters?: DraftSweepAdapters;
+  readonly repository?: () => string;
+  readonly write?: (line: string) => void;
+  readonly execute?: GhExecute;
+  readonly now?: () => Date;
+}
+
+function draftClaimOwner(body: string): string | undefined {
+  return /^🔧 처리 중 — owner ([^\n·]+?) · /m.exec(body)?.[1]?.trim();
+}
+
+async function claimCommentOwner(repository: string, number: number, execute: GhExecute): Promise<string | undefined> {
+  const pages = ghJson<Array<Array<{ body: string }>>>(['api', '--paginate', '--slurp',
+    `repos/${repository}/issues/${number}/comments?per_page=100`], execute);
+  if (!Array.isArray(pages) || pages.some((page) => !Array.isArray(page) || page.some((comment) => typeof comment.body !== 'string'))) {
+    throw new Error('Incomplete claim comments');
+  }
+  return pages.flat().reverse().map((comment) => draftClaimOwner(comment.body)).find((owner) => owner !== undefined);
+}
+
+function installHarnessDraftSweepCommand(harnessCmd: Command, deps: HarnessDraftSweepDeps = {}): Command {
+  const drafts = harnessCmd.command('drafts').description('하니스 draft PR 정리');
+  drafts.command('claim <number>').description('세션이 처리 중인 draft 를 표식하거나 해제한다')
+    .option('--owner <name>', '처리 주인 (S|T|F|O|이름)')
+    .option('--note <text>', '한 줄 메모')
+    .option('--release', '처리 중 표식을 해제하고 stalled 상태로 전환')
+    .option('--repo <owner/name>', '조회할 GitHub 저장소')
+    .action(async (number: string, opts: { owner?: string; note?: string; release?: boolean; repo?: string }) => {
+      try {
+        const execute = deps.execute ?? executeGh;
+        const repository = opts.repo ?? deps.repository?.() ?? execute(['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner']).trim();
+        if (!DRAFT_SWEEP_REPOSITORY.test(repository) || repository.includes('..')) throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
+        if (!/^[1-9]\d*$/.test(number) || !Number.isSafeInteger(Number(number))) throw new HarnessCliInputError(`invalid PR number: ${number}`);
+        const owner = opts.owner?.trim();
+        if (!opts.release && (!owner || /[\r\n·]/.test(owner))) throw new HarnessCliInputError('--owner 필요 (한 줄)');
+        if (opts.note !== undefined && /[\r\n]/.test(opts.note)) throw new HarnessCliInputError('--note 는 한 줄이어야 합니다');
+        const pr = ghJson<GithubPull>(['api', `repos/${repository}/pulls/${number}`], execute);
+        const approval = PR_LABELS.find((label) => label.axis === 'state' && label.sweep.action === 'none')!.name;
+        if (pr.state !== 'open' || pr.draft !== true || !Array.isArray(pr.labels) || pr.labels.some((item) => item.name === approval)) throw new HarnessCliInputError('열린 draft 이고 idea-approval 이 아닌 PR 만 claim 할 수 있음');
+        const running = PR_LABELS.find((label) => label.axis === 'state' && label.sweep.action === 'mark-stalled')!.name;
+        const otherStates = PR_LABELS.filter((label) => label.axis === 'state' && label.name !== running && pr.labels.some((item) => item.name === label.name));
+        if (opts.release) {
+          if (!pr.labels.some((item) => item.name === running) || otherStates.length > 0) {
+            throw new HarnessCliInputError('--release 는 running 이 유일한 상태인 draft 에만 사용 가능');
+          }
+          const stalled = PR_LABELS.find((label) => label.axis === 'state' && label.sweep.action === 'close' && label.name.endsWith(':stalled'))!.name;
+          execute(['pr', 'edit', number, '--repo', repository, '--add-label', stalled, '--remove-label', running]);
+          execute(['pr', 'comment', number, '--repo', repository, '--body', `🔧 처리 끝 — ${(deps.now?.() ?? new Date()).toISOString()}`]);
+        } else {
+          execute(['pr', 'edit', number, '--repo', repository, '--add-label', running,
+            ...otherStates.flatMap((item) => ['--remove-label', item.name])]);
+          execute(['pr', 'comment', number, '--repo', repository, '--body',
+            `🔧 처리 중 — owner ${owner} · ${(deps.now?.() ?? new Date()).toISOString()}${opts.note?.trim() ? ` · ${opts.note.trim()}` : ''}`]);
+        }
+        (deps.write ?? console.log)(`#${number} ${opts.release ? 'release' : 'claim'}: ${repository}`);
+      } catch (error) {
+        console.error(humanErrorLine(error));
+        process.exitCode = 1;
+      }
+    });
+  return drafts.command('sweep').description('draft PR 을 조사한다 (기본: 변경 없음)')
+    .option('--apply', '판정한 라벨 변경과 종료를 적용')
+    .option('--json', '판정 결과를 JSON 으로 출력')
+    .option('--repo <owner/name>', '조회할 GitHub 저장소')
+    .action(async (opts: { apply?: boolean; json?: boolean; repo?: string }) => {
+      try {
+        const write = deps.write ?? console.log;
+        const repository = opts.repo ?? deps.repository?.() ?? execFileSync('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'],
+          { encoding: 'utf8', timeout: 30_000, stdio: ['ignore', 'pipe', 'pipe'], env: process.env }).trim();
+        if (!DRAFT_SWEEP_REPOSITORY.test(repository) || repository.includes('..')) {
+          throw new HarnessCliInputError(`invalid --repo (expected owner/name): ${repository}`);
+        }
+        const result: DraftSweepResult = await runDraftSweep({ repository, apply: opts.apply === true, adapters: deps.adapters ?? githubDraftSweepAdapters(deps.execute) });
+        if (opts.json) write(JSON.stringify(result));
+        else {
+          write(`draft sweep ${result.repository}: ${result.complete ? 'complete' : `incomplete (${result.error})`} · ${result.apply ? 'apply' : 'dry-run'}`);
+          for (const entry of result.entries) write(`#${entry.number} ${entry.action}: ${entry.reason}${entry.statusLabel ? ` → ${entry.statusLabel}` : ''}${entry.error ? ` ERROR: ${entry.error}` : ''}`);
+          if (result.complete) write(`못 본 초안 ${result.unobserved ?? 0} · 이번에 닫음 ${result.closed ?? 0}${result.apply ? '' : '(dry-run)'} · 처리 중 ${result.claimed ?? 0} · 표식 만료 ${result.claimExpired ?? 0}`);
+        }
+        if (!result.complete || result.entries.some((entry) => entry.error)) process.exitCode = 1;
+      } catch (error) {
+        console.error(humanErrorLine(error));
+        process.exitCode = 1;
+      }
+    });
+}
+
 function installHarnessBudgetCommand(harnessCmd: Command): Command {
   return harnessCmd
     .command('budget')
@@ -1254,6 +1499,7 @@ export interface HarnessCliCommandDeps {
   resolveSurface: () => Promise<string>;
   deliverableVerify?: InstallDeliverableVerifyCliDeps;
   processObservation?: HarnessProcessObservationDeps;
+  draftSweep?: HarnessDraftSweepDeps;
   ask?: HarnessAskHandler;
   say?: HarnessSayHandler;
   plan?: HarnessPlanHandler;
@@ -1272,6 +1518,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
   installDeliverableVerifyCliCommand(harnessCmd, deps.deliverableVerify);
   installHarnessProcessObservationCommand(harnessCmd, deps.processObservation);
   installHarnessBudgetCommand(harnessCmd);
+  installHarnessDraftSweepCommand(harnessCmd, deps.draftSweep);
 
   const ask = deps.ask;
   if (ask) {
@@ -1287,13 +1534,13 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             ...(opts.goalType !== undefined ? { goalType: opts.goalType } : {}),
             ...(opts.target !== undefined ? { target: opts.target } : {}),
           },
-          () => {
-            if (!podSubstrate(opts) && (opts as { source?: string }).source !== undefined) {
+          (resolved) => {
+            if (resolved.substrate !== 'pod' && (opts as { source?: string }).source !== undefined) {
               console.error('`--source` 는 `--substrate pod` 와 함께');
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return podSubstrate(opts) ? onPod(opts, 'cli-harness-ask', goalPath) : ask(goalPath, normalizeHarnessAskSayOptions(opts));
+            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-ask', goalPath, resolved.pool!) : ask(goalPath, normalizeHarnessAskSayOptions(opts));
           },
         );
       });
@@ -1311,13 +1558,13 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             wouldStart: '골 문서 · 워크트리 · 브랜치 · 자식 · 파이프라인',
             ...(opts.target !== undefined ? { target: opts.target } : {}),
           },
-          () => {
-            if (!podSubstrate(opts) && (opts as { source?: string }).source !== undefined) {
+          (resolved) => {
+            if (resolved.substrate !== 'pod' && (opts as { source?: string }).source !== undefined) {
               console.error('`--source` 는 `--substrate pod` 와 함께');
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return podSubstrate(opts) ? onPod(opts, 'cli-harness-say', sentence.join(' ')) : say(sentence, normalizeHarnessAskSayOptions(opts));
+            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-say', sentence.join(' '), resolved.pool!) : say(sentence, normalizeHarnessAskSayOptions(opts));
           },
         );
       });

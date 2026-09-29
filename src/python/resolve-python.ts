@@ -202,7 +202,7 @@ export function evaluatePythonEnv(input: {
   if (!versionAtLeast(probe.version, floor)) {
     const remedy = windows
       ? windowsPythonRemedy(resolution.source)
-      : `pyenv install ${pin} (build deps per distro: RFC-doctor-fix-build-toolchain-and-python-by-distro A2) · then: elanous python setup --yes`;
+      : `pyenv install ${pin} (install your distribution's Python build dependencies first) · then: elanous python setup --yes`;
     return { status: 'manual', evidence: `${resolution.source} python ${v} is older than the minimum ${floor}`, remedy, resolution };
   }
   if (!venvExists) return { status: 'fixable', evidence: `python ${v} (${resolution.source}) · elanous venv missing`, remedy: 'elanous python setup --yes', resolution };

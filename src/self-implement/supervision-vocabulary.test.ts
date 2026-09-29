@@ -25,6 +25,8 @@ describe('supervision vocabulary brain mappings', () => {
 
     expect(mapBrainAction(wait, false)).toEqual({ verdict: 'continue' });
     expect(mapBrainAction(input, false)).toEqual({ verdict: 'assist', kind: 'context' });
+    expect(mapBrainAction('handoff', false)).toEqual({ verdict: 'continue' });
+    expect(mapBrainAction('ask-human', false)).toEqual({ verdict: 'escalate' });
   });
 
   test('splits done completion from the exact stall-confirmed auto-stop condition', () => {

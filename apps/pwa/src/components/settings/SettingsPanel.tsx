@@ -52,6 +52,7 @@ import { BudgetGuardWatcher } from './BudgetGuardWatcher';
 import { EmbeddingVisionTierCard } from './EmbeddingVisionTierCard';
 import { PersonaCard } from './PersonaCard';
 import { BuildInfoCard } from './BuildInfoCard';
+import { MenuVisibilityCard } from './MenuVisibilityCard';
 
 const PROVIDER_OPTIONS = ['', 'claude', 'gemini', 'grok', 'codex'];
 
@@ -120,6 +121,16 @@ interface PushcutState {
 
 export function SettingsPanel() {
   const { config, setConfig, client, sessionId } = useDaemon();
+  // `#bearer-token` 으로 들어오면(웹 터미널 «토큰 없음» 안내의 링크) 그 칸으로 바로 가서 포커스한다.
+  useEffect(() => {
+    if (typeof window === 'undefined' || window.location.hash !== '#bearer-token') return;
+    const t = window.setTimeout(() => {
+      const el = document.getElementById('bearer-token');
+      el?.scrollIntoView({ block: 'center' });
+      (el as HTMLInputElement | null)?.focus();
+    }, 50);
+    return () => window.clearTimeout(t);
+  }, []);
   const { theme, setTheme } = useTheme();
   const [health, setHealth] = useState<HealthState>({ status: 'idle' });
   const [tools, setTools] = useState<ToolsState>({ status: 'idle' });
@@ -648,6 +659,7 @@ export function SettingsPanel() {
         <label className="block space-y-1">
           <span className="text-xs text-muted-foreground">Bearer token</span>
           <Input
+            id="bearer-token"
             type="password"
             value={config.token}
             placeholder="(optional)"
@@ -1150,6 +1162,7 @@ export function SettingsPanel() {
       <ConnectTokenCard />
 
       {/* 빌드 정보 (2026-07-08) — 우하단 fixed 배너를 정식 카드로 이관. */}
+      <MenuVisibilityCard />
       <BuildInfoCard />
 
       <Button onClick={() => toast.success('Settings saved')}>Saved</Button>

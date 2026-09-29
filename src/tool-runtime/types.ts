@@ -23,6 +23,7 @@ import type { LLMToolSpec } from '../llm.js';
 import type { FeedbackEnvelope } from '../feedback/envelope.js';
 
 import type { ToolHost } from '../tool-surface.js';
+import type { RequestOrigin } from '../policy/claude-subscription-guard.js';
 
 export type ToolSurface = ToolHost;
 
@@ -90,6 +91,8 @@ export interface ToolRuntimeContext {
   sessionId?: string;
   /** Session that originated this execution when it was delegated through another runtime session. */
   originSessionId?: string;
+  /** Server-assigned provenance; omitted on existing owner tool paths. */
+  requestOrigin?: RequestOrigin;
 }
 
 /** Output shape the LLM layer expects back. Most tools produce

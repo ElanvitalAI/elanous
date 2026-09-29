@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { asideBackend, geminiBackend, buildMissionWorktreeProvenance, buildScreenLogPayload, checkEvidence, claudeBackend, codexBackend, collectTscDiagnostics, createMissionControlBrain, createMissionSearch, createMissionVerifyDone, grokBackend, recordMissionWorktreeProvenance, runAgentMission, runTsc, SCREEN_LOG_TAIL_MAX_LINE_LENGTH, SCREEN_LOG_TAIL_MAX_LINES, type EvidenceMode } from './driver.js';
+import { asideBackend, claudeTrustChoice, submitSeparately, geminiBackend, buildMissionWorktreeProvenance, buildScreenLogPayload, checkEvidence, claudeBackend, codexBackend, collectTscDiagnostics, createMissionControlBrain, createMissionSearch, createMissionVerifyDone, grokBackend, recordMissionWorktreeProvenance, runAgentMission, runTsc, SCREEN_LOG_TAIL_MAX_LINE_LENGTH, SCREEN_LOG_TAIL_MAX_LINES, type EvidenceMode } from './driver.js';
 import { emitPtyEvent } from '../pty-shell/registry.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 import { createWorktree, gateWorktreeReuse } from '../git-fs/worktree.js';
@@ -14,6 +14,7 @@ import type { StreamLLMFn } from '../autopilot/llm-control-brain.js';
 import type { LLMMessage } from '../llm.js';
 import type { TypecheckError } from '../typecheck-ratchet.js';
 import { decideInterventionStep } from '../self-implement/intervention-step.js';
+import type { PtyControlDeps, RunSupervisor } from '../autopilot/pty-control-loop.js';
 
 const observation = {
   screen: 'agent screen',
@@ -86,6 +87,142 @@ test('runAgentMission re-emits exactly once on its Codex child exit with the spa
     else process.env.CODEX_HOME = oldHome;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('runAgentMission hands a brain-selected review to the existing launcher in the same worktree and routes the gate', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mission-driver-handoff-'));
+  const events: string[] = [];
+  let launches = 0;
+  let created = 0;
+  try {
+    const result = await runAgentMission({ mission: 'Build feature', repo: dir, branch: 'fixture', agent: codexBackend,
+      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, commit: false,
+      screensDir: join(dir, 'screens'),
+    }, {
+      createWorktree: (() => { created++; return { path: dir, branch: 'fixture', base: 'HEAD' }; }) as never,
+      recordWorktreeProvenance: () => {},
+      checkClaudeSubscription: () => ({ ok: true, authMethod: 'claude.ai', apiProvider: 'firstParty', reason: 'subscription' }),
+      startPty: ((opts) => {
+        launches++;
+        expect(opts.workdir).toBe(dir);
+        events.push(`pty:${opts.kind}`);
+        return { id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
+          isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => 'Review finding: missing test',
+          renderScreenPng: async () => null, write: () => {}, kill: () => {},
+        } as unknown as PtyHandle;
+      }),
+      handoffOperations: {
+        diff: () => 'diff --git a/file b/file\n+new',
+        gateAndPr: async (worktree) => { expect(worktree).toBe(dir); events.push('gate/PR'); },
+      },
+      runControlLoop: (async (_brain: RunSupervisor, controlDeps: PtyControlDeps) => {
+        if (launches === 1) {
+          await controlDeps.handoff!({ action: 'handoff', to: 'claude', mission: 'Review', carry: 'diff' }, observation);
+          return { termination: { kind: 'success' }, steps: 1, handoff: { action: 'handoff', to: 'claude', mission: 'Review', carry: 'diff' } } as never;
+        }
+        expect(readFileSync(join(dir, '.mission-handoff.diff'), 'utf8')).toContain('+new');
+        await controlDeps.handoff!({ action: 'handoff', to: 'elanous', mission: 'Gate' }, observation);
+        return { termination: { kind: 'success' }, steps: 1, handoff: { action: 'handoff', to: 'elanous', mission: 'Gate' } } as never;
+      }) as never,
+    });
+    expect(result.ok).toBe(true);
+    expect(created).toBe(1);
+    expect(events).toEqual(['pty:codex', 'pty:claude', 'gate/PR']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('Claude handoff login escalation failure cannot fall through to a successful single-backend result', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mission-login-fail-'));
+  let killed = false;
+  try {
+    await expect(runAgentMission({ mission: 'Build', repo: dir, branch: 'fixture', agent: codexBackend,
+      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, commit: false,
+      screensDir: join(dir, 'screens'),
+    }, {
+      createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
+      recordWorktreeProvenance: () => {},
+      startPty: ((opts) => ({ id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
+        isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => opts.args?.includes('login') ? 'Sign in at https://claude.ai/login' : 'Codex done',
+        renderScreenPng: async () => null, write: () => {}, kill: () => { killed = true; },
+      } as unknown as PtyHandle)),
+      checkClaudeSubscription: () => ({ ok: false, authMethod: null, apiProvider: null, reason: 'logged-out' }),
+      handoffOperations: { notify: () => { throw new Error('login card delivery failed'); } },
+      runControlLoop: (async (_brain: RunSupervisor, controlDeps: PtyControlDeps) => {
+        try {
+          await controlDeps.handoff!({ action: 'handoff', to: 'claude', mission: 'Review' }, observation);
+        } catch (error) {
+          return { termination: { kind: 'error', message: String(error) }, steps: 1 } as never;
+        }
+        throw new Error('handoff must reject');
+      }) as never,
+    })).rejects.toThrow('login card delivery failed');
+    expect(killed).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('brain gate failure is surfaced instead of falling through to a success result', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mission-gate-fail-'));
+  let killed = false;
+  try {
+    await expect(runAgentMission({ mission: 'Build', repo: dir, branch: 'fixture', agent: codexBackend,
+      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, commit: true,
+      screensDir: join(dir, 'screens'),
+    }, {
+      createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
+      recordWorktreeProvenance: () => {},
+      startPty: ((opts) => ({ id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
+        isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => 'done',
+        renderScreenPng: async () => null, write: () => {}, kill: () => { killed = true; },
+      } as unknown as PtyHandle)),
+      handoffOperations: { gateAndPr: async () => { throw new Error('handoff evidence gate failed: missing test'); } },
+      runControlLoop: (async (_brain: RunSupervisor, controlDeps: PtyControlDeps) => {
+        try {
+          await controlDeps.handoff!({ action: 'handoff', to: 'elanous', mission: 'Gate' }, observation);
+        } catch (error) {
+          return { termination: { kind: 'error', message: String(error) }, steps: 1 } as never;
+        }
+        throw new Error('gate must reject');
+      }) as never,
+    })).rejects.toThrow('handoff evidence gate failed: missing test');
+    expect(killed).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('explicit chain uses the same handoff coordinator and launch path: codex → claude → elanous', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mission-driver-chain-'));
+  const events: string[] = [];
+  let created = 0;
+  try {
+    const result = await runAgentMission({ mission: 'Build feature', repo: dir, branch: 'fixture', agent: codexBackend,
+      chain: ['codex', 'claude', 'elanous'], evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ },
+      memory: false, commit: true, screensDir: join(dir, 'screens'),
+    }, {
+      createWorktree: (() => { created++; return { path: dir, branch: 'fixture', base: 'HEAD' }; }) as never,
+      recordWorktreeProvenance: () => {},
+      checkClaudeSubscription: () => ({ ok: true, authMethod: 'claude.ai', apiProvider: 'firstParty', reason: 'subscription' }),
+      startPty: ((opts) => {
+        expect(opts.workdir).toBe(dir);
+        events.push(`pty:${opts.kind}`);
+        return { id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
+          isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => 'Review finding: missing test',
+          renderScreenPng: async () => null, write: () => {}, kill: () => {},
+        } as unknown as PtyHandle;
+      }),
+      handoffOperations: {
+        diff: () => 'diff --git a/file b/file\n+new',
+        gateAndPr: async (worktree) => { expect(worktree).toBe(dir); events.push('gate/PR'); },
+      },
+      runControlLoop: (async (_brain: RunSupervisor, controlDeps: PtyControlDeps) => {
+        if (events.at(-1) === 'pty:claude') {
+          expect(readFileSync(join(dir, '.mission-handoff.diff'), 'utf8')).toContain('+new');
+        }
+        return { termination: { kind: 'success', reason: 'done' }, steps: 1 } as never;
+      }) as never,
+    });
+    expect(result.ok).toBe(true);
+    expect(created).toBe(1);
+    expect(events).toEqual(['pty:codex', 'pty:claude', 'gate/PR']);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 describe('agent-mission worktree provenance', () => {
@@ -184,6 +321,26 @@ describe('buildScreenLogPayload', () => {
 });
 
 describe('createMissionControlBrain', () => {
+  test('does not carry a login decision reason into the next backend summary', async () => {
+    const summaries: string[] = [];
+    const brain = createMissionControlBrain({ mission: 'Review', evidenceReady: () => true, search: () => {},
+      onSummary: (text) => { summaries.push(text); },
+      stream: scriptedStream('{"action":"ask-human","reason":"code: SECRET-1234"}'),
+    });
+    expect(await brain.decide({ ...observation, screen: 'Sign in at https://example.org/device' })).toEqual({ action: 'ask-human', reason: 'code: SECRET-1234' });
+    expect(summaries).toEqual([]);
+  });
+
+  test('forwards the preceding brain summary, not a screen transcript, to the next stage', async () => {
+    const summaries: string[] = [];
+    const brain = createMissionControlBrain({ mission: 'Review', evidenceReady: () => true, search: () => {},
+      onSummary: (text) => { summaries.push(text); },
+      stream: scriptedStream('{"action":"handoff","to":"codex","mission":"Fix review","carry":"summary","reason":"Missing assertion in test"}'),
+    });
+    expect(await brain.decide({ ...observation, screen: 'token=SCREEN_SECRET' })).toEqual({ action: 'handoff', to: 'codex', mission: 'Fix review', carry: 'summary' });
+    expect(summaries).toEqual(['Missing assertion in test']);
+  });
+
   test('wait/send/verify/done 5-action 판단을 canonical 3-action으로 매핑하고 carriage return을 붙인다', async () => {
     const make = (raw: string) => createMissionControlBrain({ mission: 'goal', evidenceReady: () => false, search: () => {}, stream: scriptedStream(raw) });
     expect(await make('{"action":"wait"}').decide(observation)).toEqual({ action: 'wait' });
@@ -389,6 +546,7 @@ describe('test evidence tsc preservation', () => {
       executeTsc: () => ({ ran: true, diagnostics: [{ file: 'src/broken.ts', line: 'src/broken.ts(1,1): error TS2322: broken' }] }),
       runTest: () => { testsRun += 1; return { ok: true, out: '1 pass' }; },
       hasChanges: () => true,
+      hasTsconfig: true,
     });
     expect(result).toEqual({ ok: false, path: null, retry: 'tsc 실패. 다음 에러를 고쳐라:\nsrc/broken.ts(1,1): error TS2322: broken' });
     expect(testsRun).toBe(0);
@@ -402,6 +560,7 @@ describe('test evidence tsc preservation', () => {
       executeTsc: () => collected,
       runTest: () => { testsRun += 1; return { ok: true, out: '1 pass' }; },
       hasChanges: () => true,
+      hasTsconfig: true,
     });
     expect(result).toEqual({ ok: false, path: null, retry: 'tsc 실패. 다음 에러를 고쳐라:\nerror TS5058: The specified path does not exist.' });
     expect(testsRun).toBe(0);
@@ -413,6 +572,7 @@ describe('test evidence tsc preservation', () => {
       executeTsc: () => ({ ran: true, diagnostics: [] }),
       runTest: () => { testsRun += 1; return { ok: false, out: '0 pass / 1 fail' }; },
       hasChanges: () => true,
+      hasTsconfig: true,
     });
     expect(result).toEqual({ ok: false, path: null, retry: '테스트 실패/부재:\n0 pass / 1 fail' });
     expect(testsRun).toBe(1);
@@ -430,6 +590,7 @@ describe('test evidence tsc preservation', () => {
       executeTsc: () => ({ ran: true, diagnostics }),
       runTest: () => { testsRun += 1; return { ok: true, out: '1 pass' }; },
       hasChanges: () => true,
+      hasTsconfig: true,
     });
     expect(result).toEqual({ ok: false, path: null, retry: `tsc 실패. 다음 에러를 고쳐라:\n${former}` });
     // 26번째 진단은 문구에 없어야 한다(25개 상한).
@@ -450,12 +611,25 @@ describe('test evidence tsc preservation', () => {
       executeTsc: () => ({ ran: false, diagnostics: [], output: rawOutput, failure: 'tsc 실행 실패' }),
       runTest: () => { testsRun += 1; return { ok: true, out: '1 pass' }; },
       hasChanges: () => true,
+      hasTsconfig: true,
     });
     expect(result).toEqual({ ok: false, path: null, retry: `tsc 실패. 다음 에러를 고쳐라:\n${former}` });
     // 끝부분(꼬리)은 실리고 머리는 잘려나가야 한다(앞 1500자를 쓰면 회귀).
     expect((result.retry ?? '')).toContain(tail);
     expect((result.retry ?? '')).not.toContain(head);
     expect(testsRun).toBe(0);
+  });
+
+  test('tsconfig 가 없는 저장소는 tsc 를 건너뛰고 시험으로 판정한다(09-29 S6: 시험 2/2 인데 tsc 도움말이 «실패»였다)', () => {
+    let tscRun = 0;
+    const result = checkEvidence(worktree, evidence, {
+      executeTsc: () => { tscRun += 1; return { ran: false, diagnostics: [], output: 'Version 5.9 … tsc: The TypeScript Compiler', failure: 'exit 1' }; },
+      runTest: () => ({ ok: true, out: '2 pass' }),
+      hasChanges: () => true,
+      hasTsconfig: false,
+    });
+    expect(result).toEqual({ ok: true, path: worktree });
+    expect(tscRun).toBe(0);
   });
 });
 
@@ -555,5 +729,58 @@ describe('gemini(agy) backend answers the folder-trust menu', () => {
     const writes: string[] = [];
     expect(geminiBackend.handleTrust?.('Antigravity CLI 1.2.12\n> \n? for shortcuts', (s) => writes.push(s))).toBe(false);
     expect(writes).toEqual([]);
+  });
+});
+
+describe('claude backend answers the folder-trust menu (09-29 S6 실물 화면)', () => {
+  const screen = (sel: 'no' | 'yes') => [
+    'Accessing workspace:',
+    '/Users/user/.elanous/worktrees/demo-a2a1e533/retry-demo.worktrees/s6-retry-0929c',
+    'Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open',
+    "Claude Code'll be able to read, edit, and execute files here.",
+    'Security guide',
+    sel === 'no' ? '❯ No, exit' : '  No, exit',
+    sel === 'yes' ? '❯ Yes, I trust this folder' : '  Yes, I trust this folder',
+    'Enter to confirm · Esc to cancel',
+  ].join('\n');
+  test('default «No» selected → move down, never Enter on «No»', () => {
+    const writes: string[] = [];
+    expect(claudeBackend.handleTrust?.(screen('no'), (s) => writes.push(s))).toBe(true);
+    expect(writes).toEqual(['\x1b[B']);
+  });
+  test('«Yes» selected → Enter', () => {
+    const writes: string[] = [];
+    expect(claudeBackend.handleTrust?.(screen('yes'), (s) => writes.push(s))).toBe(true);
+    expect(writes).toEqual(['\r']);
+  });
+  test('a normal claude prompt is left alone', () => {
+    const writes: string[] = [];
+    expect(claudeTrustChoice('Claude Code\n❯ \n? for shortcuts')).toBeNull();
+    expect(claudeBackend.handleTrust?.('Claude Code\n❯ \n? for shortcuts', (s) => writes.push(s))).toBe(false);
+    expect(writes).toEqual([]);
+  });
+});
+
+describe('claude input: text and Enter go as separate writes (09-29 실물: Enter inside one chunk became a newline)', () => {
+  test('a trailing Enter is split off and sent after a delay', () => {
+    const writes: string[] = [];
+    const later: Array<() => void> = [];
+    const inject = submitSeparately((t) => { writes.push(t); return true; }, (fn) => { later.push(fn); });
+    expect(inject('Address the review findings.\r')).toBe(true);
+    expect(writes).toEqual(['Address the review findings.']);
+    later.forEach((fn) => fn());
+    expect(writes).toEqual(['Address the review findings.', '\r']);
+  });
+  test('a bare Enter or text without Enter is written as is', () => {
+    const writes: string[] = [];
+    const inject = submitSeparately((t) => { writes.push(t); return true; }, (fn) => fn());
+    inject('\r'); inject('y');
+    expect(writes).toEqual(['\r', 'y']);
+  });
+  test('a refused write does not schedule the Enter', () => {
+    const later: Array<() => void> = [];
+    const inject = submitSeparately(() => false, (fn) => { later.push(fn); });
+    expect(inject('text\r')).toBe(false);
+    expect(later).toEqual([]);
   });
 });

@@ -1,0 +1,54 @@
+# Word-aligned narration → density-aware B-roll → composited video → measured QC.
+graph_id: broll-line
+version: 1
+entry_node: align
+terminal_nodes: [delivered, skipped, blocked, unobserved]
+nodes:
+  - node_id: align
+    kind: agent
+    recipe: broll-align-words
+    max_visits: 2
+    contract: { inputs: [audio_path], tools: network-write, outputs: [aligned_words, narration_seconds] }
+  - node_id: plan
+    kind: agent
+    recipe: broll-density-plan
+    max_visits: 2
+    contract: { inputs: [aligned_words, density_target], tools: read-only, outputs: [broll_slots, target_clips] }
+  - node_id: clips
+    kind: agent
+    recipe: broll-select-clips
+    max_visits: 2
+    contract: { inputs: [broll_slots, clips_dir], tools: network-write, outputs: [broll_clips, skipped_clips] }
+  - node_id: assemble
+    kind: agent
+    recipe: broll-render
+    max_visits: 2
+    contract: { inputs: [base_video, broll_clips, clips_dir], tools: workspace-write, outputs: [rendered_path, rendered_clips] }
+  - node_id: qc
+    kind: gate
+    recipe: broll-qc
+    max_visits: 2
+    contract: { inputs: [rendered_path, rendered_clips, density_target], tools: read-and-run, outputs: [qc_pass, qc_seconds, density_actual] }
+  - node_id: delivered
+    kind: judge
+    recipe: terminal-delivered
+    max_visits: 1
+  - node_id: skipped
+    kind: judge
+    recipe: terminal-skipped
+    max_visits: 1
+  - node_id: blocked
+    kind: judge
+    recipe: terminal-blocked
+    max_visits: 1
+  - node_id: unobserved
+    kind: judge
+    recipe: terminal-unobserved
+    max_visits: 1
+edges:
+  - { from: align, on: outcome, map: { ok: plan, error: blocked, unmeasurable: unobserved } }
+  - { from: plan, on: outcome, map: { ok: clips, unmeasurable: unobserved } }
+  # A timed-out clip is skipped inside the recipe; any selected clip still renders.
+  - { from: clips, on: outcome, map: { ok: assemble, empty: skipped, unmeasurable: unobserved } }
+  - { from: assemble, on: outcome, map: { ok: qc, empty: skipped, error: assemble, unmeasurable: unobserved } }
+  - { from: qc, on: outcome, map: { pass: delivered, fail: assemble, unmeasurable: unobserved } }

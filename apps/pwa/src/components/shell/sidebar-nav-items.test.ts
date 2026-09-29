@@ -19,6 +19,7 @@ import {
   type SidebarRouteHref,
 } from './sidebar-nav-items';
 import { ROUTE_GUIDANCE_ITEMS } from '../welcome/WelcomeHome';
+import { PRIVATE_SIDEBAR_NAV_ITEMS } from './sidebar-nav-private';
 
 const APP_DIRECTORY = resolve(dirname(import.meta.path), '../../app');
 const PAGE_FILE_PATTERN = /^page\.(?:ts|tsx|js|jsx)$/;
@@ -27,18 +28,23 @@ const DYNAMIC_SEGMENT_PATTERN = /^\[.+\]$/;
 
 /** Current App Router address inventory: static pages use their complete href;
  * the `/missions/[id]` dynamic page is represented by its `/missions` parent. */
+// 비공개 전용 화면(개인 투자 대시보드)은 공개본에 없다 — 그 주소는 비공개 모듈에서 가져와 더한다.
 const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
+  ...PRIVATE_SIDEBAR_NAV_ITEMS.map((item) => item.href as SidebarRouteHref),
   '/',
   '/404',
   '/approvals',
   '/autopilot',
+  '/board',
   '/botlab',
   '/bots',
   '/chat',
   '/control',
-  '/dashboard',
   '/design-check',
+  '/editor',
   '/intake',
+  '/live',
+  '/market',
   '/missions',
   '/morning',
   '/observatory',
@@ -53,6 +59,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/showroom',
   '/tasks',
   '/term',
+  '/trace',
   '/vault',
   '/workflows',
   '/workflows/chat-ui',
@@ -170,14 +177,13 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
     expect(sr.hint).toContain('multi-agent');
   });
 
-  // Archon-port T2A (2026-05-08).
-  it('Workflows 항목 · kind=workflows · href=/workflows', () => {
-    const wfIdx = SIDEBAR_NAV_ITEMS.findIndex((i) => i.label === 'Workflows');
-    expect(wfIdx).toBeGreaterThan(0);
-    const wf = SIDEBAR_NAV_ITEMS[wfIdx]!;
-    expect(wf.href).toBe('/workflows');
-    expect(wf.kind).toBe('workflows');
-    expect(wf.hint).toContain('YAML');
+  it('편집기 하나가 두 모드에 진입하고 옛 워크플로 주소는 메뉴 밖으로 보존된다', () => {
+    const editor = SIDEBAR_NAV_ITEMS.find((item) => item.label === '편집기');
+    expect(editor?.href).toBe('/editor');
+    expect(editor?.kind).toBeNull();
+    expect(editor?.hint).toContain('실행 그래프');
+    expect(SIDEBAR_NAV_ITEMS.some((item) => item.href === '/workflows')).toBe(false);
+    expect(NON_MENU_SIDEBAR_ROUTES.find((route) => route.href === '/workflows')?.category).toBe('workflow-legacy-redirect');
   });
 
   it('Worktrees 항목 · href=/worktrees · kind=null · GitBranch 아이콘', () => {
@@ -188,7 +194,15 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
     expect(worktrees.kind).toBeNull();
     expect(worktrees.hint).toContain('작업 트리');
     expect(worktrees.icon).toBeDefined();
-    expect(SIDEBAR_NAV_ITEMS).toHaveLength(19);
+    // 2026-09-28 탭 다이어트 — Design 이 메뉴로 올라와 20(공개 10 · Labs 3 · 숨김 7).
+    expect(SIDEBAR_NAV_ITEMS).toHaveLength(23 + PRIVATE_SIDEBAR_NAV_ITEMS.length);
+  });
+
+  it('마켓은 읽기 화면으로 직접 진입한다', () => {
+    const market = SIDEBAR_NAV_ITEMS.find(item => item.href === '/market');
+    expect(market?.label).toBe('마켓');
+    expect(market?.kind).toBeNull();
+    expect(market?.hint).toContain('설치됨');
   });
 
   it('Bots 항목 · href=/bots · kind=null · 읽기 전용 카탈로그 안내', () => {
@@ -202,8 +216,9 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
   // 2026-07-08 — Scheduler 부활(registry 기반 · 은퇴한 workflow-trigger 통합
   // 모델이 투자 크론을 못 담아 공백이 생겼던 것을 되살림). kind=null(페이지
   // 직접 진입 · workspace 탭 안 만듦).
-  it('Scheduler 항목 부활 · href=/scheduler · kind=null', () => {
-    const idx = SIDEBAR_NAV_ITEMS.findIndex((i) => i.label === 'Scheduler');
+  // 2026-09-28 — 이름만 «Schedules»(대표 «스케줄러 종합 현황» 탭 · 🅣 계약 #21428) · 주소는 호환 그대로.
+  it('Schedules 항목 · href=/scheduler · kind=null', () => {
+    const idx = SIDEBAR_NAV_ITEMS.findIndex((i) => i.label === 'Schedules');
     expect(idx).toBeGreaterThan(0);
     const s = SIDEBAR_NAV_ITEMS[idx]!;
     expect(s.href).toBe('/scheduler');
@@ -277,6 +292,42 @@ describe('SIDEBAR_NAV_ITEMS — order + tooltip table (2026-05-07 dogfood)', () 
     expect(categoryByHref.get('/setup')).toBe('provider-onboarding');
     expect(categoryByHref.get('/404')).toBe('error-page');
     expect(categoryByHref.get('/morning')).toBe('unwired-screen');
-    expect(categoryByHref.get('/design-check')).toBe('diagnostic-readonly');
+    // /design-check 는 2026-09-28 메뉴 «Design» 으로 올라갔다(비메뉴 목록에 없다).
+    expect(categoryByHref.get('/design-check')).toBeUndefined();
+    expect(categoryByHref.get('/botlab')).toBe('diagnostic-readonly');
+  });
+});
+
+// 2026-09-28 탭 다이어트 — 🅢 리딩 판단(채널 07:4x) · 내부 문서 `ROADMAP-pwa-tab-triage-and-launch-2026-09-28`
+import { visibleNavGroups } from './sidebar-nav-items';
+
+describe('탭 다이어트 — 메뉴 노출 등급', () => {
+  const label = (level: 'public' | 'labs' | 'hidden') =>
+    SIDEBAR_NAV_ITEMS.filter((item) => (item.visibility ?? 'public') === level).map((item) => item.label);
+
+  it('공개 메뉴는 핵심 탭만 — Missions = Autopilot ⊕ Tasks 한 메뉴(09-28 합침 · Tasks 는 주소로 열리고 Missions 가 켜진다)', () => {
+    expect(label('public')).toEqual(['Terminal', 'Chat', 'Intake', 'Approvals', 'Live', 'Trace', 'Missions', 'Design', 'Vault', '마켓', 'Schedules', 'Settings']);
+    const missions = SIDEBAR_NAV_ITEMS.find((i) => i.label === 'Missions')!;
+    expect(missions.href).toBe('/autopilot');
+    expect(missions.activeAlso).toEqual(['/tasks', '/missions']);
+  });
+
+  it('Labs = 편집기 · Workspace · Showroom · 숨김 = 일곱', () => {
+    expect(label('labs').sort()).toEqual(['Showroom', 'Workspace', '편집기', '보드'].sort());
+    const privateHidden = PRIVATE_SIDEBAR_NAV_ITEMS.map((item) => item.label);
+    expect(label('hidden').sort()).toEqual(['Bots', 'Control', 'Observatory', 'Reflection', 'Sessions', 'Tasks', 'Worktrees', ...privateHidden].sort());
+  });
+
+  it('기본은 공개만 · 설정을 켜면 Labs·숨김 묶음이 따로 붙는다', () => {
+    const off = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: false, showHidden: false });
+    expect(off.labs).toEqual([]);
+    expect(off.hidden).toEqual([]);
+    const on = visibleNavGroups(SIDEBAR_NAV_ITEMS, { showLabs: true, showHidden: true });
+    expect(on.main.length + on.labs.length + on.hidden.length).toBe(SIDEBAR_NAV_ITEMS.length);
+  });
+
+  it('Design 은 메뉴 밖 목록에서 빠지고 메뉴로 올라왔다', () => {
+    expect(NON_MENU_SIDEBAR_ROUTES.some((route) => route.href === '/design-check')).toBe(false);
+    expect(SIDEBAR_NAV_ITEMS.some((item) => item.href === '/design-check' && item.label === 'Design')).toBe(true);
   });
 });

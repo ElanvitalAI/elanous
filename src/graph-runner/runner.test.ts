@@ -94,6 +94,67 @@ second:
   });
 });
 
+test('failed run restarts at saved node, keeps preceding output, and reports node progress', async () => {
+  const { graph, root } = fixture('printf original');
+  const calls: string[] = [];
+  const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
+  const deps = { root, log: (event: string, data: Record<string, unknown>) => logs.push({ event, data }),
+    runBash: async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+      calls.push(body);
+      if (calls.length > 1) {
+        expect(JSON.parse(readFileSync(opts.env!.ELANOUS_GRAPH_CONTEXT!, 'utf8')).outputs.first).toBe('original');
+        return { stdout: 'broken', stderr: '', exitCode: calls.length === 2 ? 1 : 0 };
+      }
+      return { stdout: 'original', stderr: '', exitCode: 0 };
+    } };
+  const first = await runGraph(graph, { runId: 'restart', deps });
+  expect(first.status).toBe('failed');
+  expect(first.path).toEqual(['first', 'second', 'failed']);
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'second', deps });
+  expect(resumed.status).toBe('done');
+  expect(resumed.path).toEqual(['first', 'second', 'done']);
+  expect(resumed.executed).toBe(2);
+  expect(calls).toHaveLength(3);
+  expect(resumed.nodes[0]).toEqual(first.nodes[0]);
+  expect(resumed.resume).toMatchObject({ from: 'second', previousStatus: 'failed', at: expect.any(String) });
+  expect(JSON.parse(readFileSync(first.statePath, 'utf8')).resume).toEqual(resumed.resume);
+  expect(logs.filter((entry) => entry.event === 'node-start' && entry.data.nodeId === 'first')).toHaveLength(1);
+});
+
+test('restart refuses nodes outside the failed path or changed graph and leaves state intact', async () => {
+  const { graph, root } = fixture('exit 1');
+  const first = await runGraph(graph, { deps: { root } });
+  const before = readFileSync(first.statePath, 'utf8');
+  for (const fromNodeId of ['second', 'failed', 'absent']) {
+    await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId, deps: { root } })).rejects.toThrow('--from node');
+    expect(readFileSync(first.statePath, 'utf8')).toBe(before);
+  }
+  await expect(runGraph(graph, { fromNodeId: 'first', deps: { root } })).rejects.toThrow('--from requires --resume');
+  writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(root, 'recipes.yaml'), 'utf8').replace('exit 1', 'exit 0'));
+  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', deps: { root } })).rejects.toThrow('graph or recipes changed');
+  expect(readFileSync(first.statePath, 'utf8')).toBe(before);
+});
+
+test('failed publication cannot skip or replay approval with --from', async () => {
+  const { graph, root } = approvalFixture();
+  writeFileSync(graph, readFileSync(graph, 'utf8').replace('- { from: b, to: done }', '- { from: b, on: outcome, map: { ok: done, fail: failed } }'));
+  let calls = 0;
+  const deps = { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: ++calls === 2 ? 1 : 0 }) };
+  const pending = await runGraph(graph, { deps });
+  await expect(runGraph(graph, { resumeRunId: pending.runId, fromNodeId: 'b', deps })).rejects.toThrow('failed, non-dry run');
+  decideGraphApproval(pending.graphId, pending.runId, 'approved', 'reviewer', root);
+  const failed = await runGraph(graph, { resumeRunId: pending.runId, deps });
+  expect(failed.status).toBe('failed');
+  const original = readFileSync(failed.statePath, 'utf8');
+  await expect(runGraph(graph, { resumeRunId: failed.runId, fromNodeId: 'a', deps })).rejects.toThrow('across an approval');
+  await expect(runGraph(graph, { resumeRunId: failed.runId, fromNodeId: 'gate', deps })).rejects.toThrow('across an approval');
+  expect(readFileSync(failed.statePath, 'utf8')).toBe(original);
+  const resumed = await runGraph(graph, { resumeRunId: failed.runId, fromNodeId: 'b', deps });
+  expect(resumed.status).toBe('done');
+  expect(resumed.nodes[1]).toMatchObject({ nodeId: 'gate', ok: true, decidedBy: 'reviewer' });
+  expect(calls).toBe(3);
+});
+
 test('failed first command branches to failed without executing second', async () => {
   const { graph, root } = fixture('exit 1');
   const result = await runGraph(graph, { deps: { root } });
@@ -197,7 +258,7 @@ test('resume keeps persisted input and exposes pre-approval outputs to the next 
   expect(resumed.input).toEqual({ original: true });
   expect(contexts).toEqual([
     { graphId: first.graphId, runId: first.runId, nodeId: 'a', input: { original: true }, outputs: {} },
-    { graphId: first.graphId, runId: first.runId, nodeId: 'b', input: { original: true }, outputs: { a: 'output-1', gate: null } },
+    { graphId: first.graphId, runId: first.runId, nodeId: 'b', input: { original: true }, outputs: { a: 'output-1', gate: expect.objectContaining({ outcome: 'approved', decidedBy: 'reviewer' }) } },
   ]);
   expect(JSON.parse(readFileSync(resumed.statePath, 'utf8')).input).toEqual({ original: true });
 });

@@ -32,6 +32,18 @@
  *  bun test test/rest-route-paths-single-home.test.ts
  *  ``` */
 
+/** `POST /v1/design-direction` — owner-authenticated repository design direction selection. */
+export const DESIGN_DIRECTION_PATH = '/v1/design-direction';
+
+/** `POST /v1/design-system` — owner-authenticated custom system from a URL or a palette. */
+export const DESIGN_SYSTEM_PATH = '/v1/design-system';
+
+/** `GET /v1/design-previews` — HTML previews under the resolved repository. */
+export const DESIGN_PREVIEWS_PATH = '/v1/design-previews';
+
+/** `GET /v1/design-previews/<system>` — one preview document. */
+export const DESIGN_PREVIEW_PATH_PREFIX = '/v1/design-previews/';
+
 /** `GET /v1/devices` — 디바이스 함대 스냅샷. */
 export const DEVICES_PATH = '/v1/devices';
 

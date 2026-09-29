@@ -1,8 +1,6 @@
 // Bundle B-7-α — skipWindowWhenStorePredicate unit tests.
 //
-// Direct predicate behaviour with fake VirtualWindow stubs; the full
-// cycling integration with WindowRegistry lives in
-// test/virtual-windows-skip-store-alt.test.ts.
+// Direct predicate behaviour with window-shaped stubs.
 
 import { describe, expect, test } from 'bun:test';
 
@@ -12,14 +10,13 @@ import {
   PANE_FOCUS_POLICY,
   PANE_VISIBILITY,
 } from '../src/panes/visual-state.js';
-import type { VirtualWindow } from '../src/virtual-windows/virtual-window.js';
 
 type PaneStub = { id: string };
-function fakeWindow(id: number, panes: PaneStub[]): VirtualWindow {
+function fakeWindow(id: number, panes: PaneStub[]) {
   return {
     id,
-    listPanes: () => panes.map(p => ({ id: p.id, content: {} as never })),
-  } as unknown as VirtualWindow;
+    listPanes: () => panes.map(p => ({ id: p.id })),
+  };
 }
 
 describe('B-7-α · skipWindowWhenStorePredicate', () => {

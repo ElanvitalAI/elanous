@@ -1,5 +1,6 @@
 // P2b P-a′ — 소유권 상실 판정 seam. 종전 boolean 이 {상실}∪{확인 불가} 를 뭉치던 것을 3-값으로 가른다.
 import { describe, expect, test } from 'bun:test';
+import ts from 'typescript';
 import { classifyControlStance, probeControlStance, reportProbeError, stanceBlocksWrite } from './pty-control-stance.js';
 
 describe('classifyControlStance (순수 매핑)', () => {
@@ -89,22 +90,22 @@ describe('세 소비자가 소유권을 직접 판정하지 않는다 (구조 �
   });
 
   test.each(CONSUMERS)('%s — probe 에 **관측 훅을 넘긴다**(원인 유실 방지)', async (path) => {
-    // ⚠️ A·C 는 드라이버 전체를 띄워야 행위 검증이 되므로 여기서는 **구조**로 고정한다.
-    //   훅 자체의 행위(unknown 보존·non-Error·훅 예외 격리)는 위 `probeControlStance` 단위 테스트가 덮는다.
-    const code = executableCode(await Bun.file(path).text());
-    // `probeControlStance(x)` 처럼 인자 하나로 부르면 오류 원인이 조용히 사라진다 — 3-인자 형태를 요구한다.
-    const calls = [...code.matchAll(/probeControlStance\s*\(([\s\S]*?)\)\s*[;,)]/g)];
-    expect(calls.length).toBeGreaterThan(0);
-    for (const c of calls) {
-      // ⚠️ 쉼표 1개면 `probeControlStance(h, 'agent')` 도 통과한다(훅 누락 회귀를 못 잡는 Goodhart).
-      //   **최상위 인자 3개**를 요구한다 — 중첩 괄호 안의 쉼표는 세지 않는다.
-      let depth = 0, top = 1;
-      for (const ch of c[1]!) {
-        if ('([{'.includes(ch)) depth += 1;
-        else if (')]}'.includes(ch)) depth -= 1;
-        else if (ch === ',' && depth === 0) top += 1;
+    // #21723 added ownership checks in the mission/PTY consumers. Inspect real calls rather than
+    // splitting source at the first nested `)` (e.g. canWrite() inside the first argument).
+    const source = ts.createSourceFile(path, await Bun.file(path).text(), ts.ScriptTarget.Latest, true);
+    const calls: ts.CallExpression[] = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'probeControlStance') {
+        calls.push(node);
       }
-      expect(top).toBeGreaterThanOrEqual(3);   // target, actor, hook
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) {
+      expect(call.arguments).toHaveLength(3); // target, actor, observation hook
+      const hook = call.arguments[2];
+      expect(hook && (ts.isArrowFunction(hook) || (ts.isIdentifier(hook) && hook.text === 'onProbeError'))).toBe(true);
     }
   });
 
@@ -115,6 +116,21 @@ describe('세 소비자가 소유권을 직접 판정하지 않는다 (구조 �
     expect(imports).toContain('pty-control-stance');
     // import 줄을 제외한 본문에서 **호출 형태**로 나타나야 한다(이름만 스치는 것으로는 통과 못 한다).
     expect(body).toMatch(/probeControlStance\s*\(/);
+  });
+
+  test('⚠️ 3-인자 가드는 중첩 괄호를 통과하고 훅 없는 호출은 잡는다', () => {
+    const calls = (code: string): ts.CallExpression[] => {
+      const source = ts.createSourceFile('probe.ts', code, ts.ScriptTarget.Latest, true);
+      const found: ts.CallExpression[] = [];
+      const visit = (node: ts.Node): void => {
+        if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'probeControlStance') found.push(node);
+        ts.forEachChild(node, visit);
+      };
+      visit(source);
+      return found;
+    };
+    expect(calls("probeControlStance({ canWrite: () => hasControl() }, 'agent', onProbeError)")[0]?.arguments).toHaveLength(3);
+    expect(calls("probeControlStance(handle, 'agent')")[0]?.arguments).toHaveLength(2);
   });
 
   test('⚠️ 가드 자신이 도는지 — 위반 코드를 넣으면 실제로 잡힌다', () => {
@@ -254,6 +270,26 @@ describe('watcher·inject 경로에서도 unknown 이 보존된다', () => {
     expect(rows.some((r) => r.event === 'hascontrol-error' && r.at === 'inject')).toBe(true);
     const blocked = rows.find((r) => r.event === 'inject-blocked');
     expect(blocked?.stance).toBe('unknown');   // ⚠️ 접혔다면 여기서 lost 이거나 로그 자체가 없다
+  });
+
+  test('키·마우스·크기 조절 조회 오류도 쓰기 차단과 관측을 함께 유지한다', async () => {
+    const { controlDepsForHandle } = await import('../autopilot/pty-control-loop.js');
+    const writes: string[] = [];
+    const deps = controlDepsForHandle({
+      id: 'pty_error', renderScreen: () => 'x', isAlive: () => true,
+      write: (text: string) => writes.push(text), resize: () => writes.push('resize'),
+      canWrite: () => { throw new Error('registry gone'); },
+    } as never);
+    const rows = await capture(async () => {
+      expect(deps.injectKey!('Enter')).toBe(false);
+      expect(deps.injectMouse!({ button: 0, col: 1, row: 1, kind: 'press' } as never)).toBe(false);
+      expect(deps.resize!(80, 24)).toBe(false);
+    });
+    expect(writes).toEqual([]);
+    expect(rows.filter((r) => r.event === 'hascontrol-error').map((r) => r.at)).toEqual([
+      'inject-key', 'inject-mouse', 'resize',
+    ]);
+    expect(rows.filter((r) => r.event === 'hascontrol-error').every((r) => r.error === 'registry gone' && r.ptyId === 'pty_error')).toBe(true);
   });
 
   test('inject 가 확인된 상실이면 lost 로 남고 write 는 안 불린다', async () => {

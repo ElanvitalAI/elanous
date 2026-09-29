@@ -4,6 +4,7 @@ import { dispatchTaskCreate } from '../../task-orchestrator/runtimes/create.js';
 import { getToxRuntimeDeps } from '../../task-orchestrator/runtime-deps.js';
 import { TaskStore } from '../../task-orchestrator/store.js';
 import { isExternalProvider } from '../../task-orchestrator/external-policy.js';
+import { externalTaskFingerprint } from '../../task-orchestrator/external-fingerprint.js';
 import { isTaskSurface, TASK_DEFAULTS, type TaskPriority } from '../../task-orchestrator/types.js';
 import { jsonResponse } from './http-server.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
@@ -109,7 +110,8 @@ export function handleTaskApprovePost(req: Request, taskId: string, opts: MetaAp
     }
     const now = Date.now();
     const updated = { ...task, status: 'ready' as const,
-      approval: { state: 'approved' as const, approvedBy: 'manual' as const, approvedAt: now }, updatedAt: now };
+      approval: { state: 'approved' as const, approvedBy: 'manual' as const, approvedAt: now,
+        fingerprint: externalTaskFingerprint(task) }, updatedAt: now };
     const graphPrevious = graph.getTask(taskId);
     let changedTask: typeof task | undefined;
     try {

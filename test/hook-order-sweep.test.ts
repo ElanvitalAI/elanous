@@ -88,6 +88,22 @@ describe('hook order sweep', () => {
       .toEqual([['useEffect', 'conditional'], ['useMemo', 'nested-function']]);
   }, 60_000);
 
+  it('allows a shared query-options factory when each hook is called at the top level', async () => {
+    const report = await sweepHookOrder(fixture({
+      'apps/pwa/src/use-logs.ts': [
+        'import { useQuery } from "@tanstack/react-query";',
+        'export function useLogs() {',
+        '  const options = (category: string) => ({ queryKey: [category], queryFn: () => category });',
+        '  const runs = useQuery(options("runs"));',
+        '  const usage = useQuery(options("usage"));',
+        '  return { runs, usage };',
+        '}',
+      ].join('\n'),
+    }));
+    expect(report.violations).toEqual([]);
+    expect(report.hookCallsScanned).toBe(2);
+  }, 60_000);
+
   it('counts a namespaced hook call, so a gate reading zero is not blind to React.useState', async () => {
     // ⛔📏 무인 리뷰(2026-08-21 · PR #10852)가 낸 지적이다: 식별자 호출만 보면 이 형태가 분모와
     //    위반 검사에서 «둘 다» 빠져 「0 위반」이 거짓이 된다. 이 저장소의 shadcn 컴포넌트가 이 형태를 쓴다.

@@ -2,6 +2,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { runPtyControlLoop, controlDepsForHandle, type RunSupervisor, type ControlObservation, type ControlDecision } from './pty-control-loop.js';
+import { encodeSgrMouse, MAX_PTY_KEY_REPEAT } from '../pty-shell/pty-mouse.js';
 
 // 결정론 brain — 스크립트된 결정 시퀀스.
 function scriptedBrain(script: ControlDecision[]): RunSupervisor {
@@ -24,6 +25,97 @@ function harness(screens: string[]) {
 }
 
 describe('runPtyControlLoop', () => {
+  test('key dispatch and absent injectMouse are separate from text and reported to brain', async () => {
+    const { deps, injected } = harness(['ready']);
+    const keys: Array<[string, number | undefined]> = [];
+    const seen: Array<string | undefined> = [];
+    const brain: RunSupervisor = { decide: (obs) => {
+      seen.push(obs.unavailableAction);
+      return obs.step === 0 ? { action: 'key', name: 'down', repeat: 2 } : obs.step === 1 ? { action: 'mouse', x: 10, y: 5, kind: 'click' } : { action: 'done', reason: 'ok' };
+    } };
+    await runPtyControlLoop(brain, { ...deps, injectKey: (name, repeat) => { keys.push([name, repeat]); return true; } }, { maxSteps: 3, pollMs: 0 });
+    expect(keys).toEqual([['down', 2]]);
+    expect(injected).toEqual([]);
+    expect(seen[2]).toContain('injectMouse unavailable');
+  });
+
+  test('mouse on emits SGR press/release; off refuses next click with reason', async () => {
+    const { deps, injected } = harness([]);
+    const obsChunks = ['\x1b[?1000;1006h', '\x1b[?1000l'];
+    const seen: Array<string | undefined> = [];
+    await runPtyControlLoop({ decide: (obs) => { seen.push(obs.unavailableAction); return { action: 'mouse', kind: 'click', x: 10, y: 5 }; } }, {
+      ...deps, observe: () => obsChunks.shift() ?? '',
+      injectMouse: (input) => { injected.push(encodeSgrMouse(input)); return true; },
+    }, { maxSteps: 3, pollMs: 0 });
+    expect(injected).toEqual(['\x1b[<0;10;5M\x1b[<0;10;5m']);
+    expect(seen[2]).toContain('mouse mode is off');
+  });
+
+  test('real handle routes key/resize through agent ownership and rejects mouse after mode-off', async () => {
+    const { startPty, setPtyAdapterForTesting, unregisterPty } = await import('../pty-shell/registry.js');
+    const writes: string[] = [];
+    const sizes: Array<[number, number]> = [];
+    setPtyAdapterForTesting(() => ({
+      pid: 9, write: (chars: string) => { writes.push(chars); }, resize: (cols: number, rows: number) => { sizes.push([cols, rows]); }, kill: () => {},
+      onData: () => ({ dispose() {} }), onExit: () => ({ dispose() {} }),
+    }));
+    let id: string | undefined;
+    try {
+      const handle = startPty({ cmd: 'x', accessMode: 'auto', detach: true });
+      id = handle.id;
+      const wired = controlDepsForHandle(handle);
+      handle.appendOutput('\x1b[?1000;1006h');
+      expect(wired.injectKey!('down', 2)).toBe(true);
+      expect(() => wired.injectKey!('down', MAX_PTY_KEY_REPEAT + 1)).toThrow(`key repeat must be between 1 and ${MAX_PTY_KEY_REPEAT}`);
+      expect(() => wired.injectKey!('down', Number.MAX_SAFE_INTEGER)).toThrow(`key repeat must be between 1 and ${MAX_PTY_KEY_REPEAT}`);
+      expect(wired.injectMouse!({ kind: 'click', x: 10, y: 5 })).toBe(true);
+      expect(wired.resize!(100, 30)).toBe(true);
+      expect(writes).toEqual(['\x1b[B\x1b[B', '\x1b[<0;10;5M\x1b[<0;10;5m']);
+      expect(sizes).toEqual([[100, 30]]);
+      handle.appendOutput('\x1b[?1000l');
+      expect(wired.mouseModeEnabled!()).toBe(false);
+      expect(() => wired.injectMouse!({ kind: 'click', x: 10, y: 5 })).toThrow('PTY mouse mode is off');
+      handle.appendOutput('\x1b[?1000h');
+      handle.setAccessMode('write');
+      expect(wired.injectMouse!({ kind: 'click', x: 10, y: 5 })).toBe(false);
+      expect(wired.injectKey!('enter')).toBe(false);
+      expect(wired.resize!(80, 24)).toBe(false);
+      handle.appendOutput('\x1b[?1000l');
+      expect(wired.injectMouse!({ kind: 'click', x: 10, y: 5 })).toBe(false);
+      expect(writes).toHaveLength(2);
+      expect(sizes).toHaveLength(1);
+    } finally {
+      if (id) unregisterPty(id);
+      setPtyAdapterForTesting(null);
+    }
+  }, 20_000);
+
+  test('resize without dependency returns unavailable to the brain', async () => {
+    const { deps, injected } = harness(['ready']);
+    const seen: Array<string | undefined> = [];
+    await runPtyControlLoop({ decide: (obs) => {
+      seen.push(obs.unavailableAction);
+      return obs.step === 0 ? { action: 'resize', cols: 100, rows: 30 } : { action: 'done', reason: 'ok' };
+    } }, deps, { maxSteps: 2, pollMs: 0 });
+    expect(seen[1]).toContain('resize unavailable');
+    expect(injected).toEqual([]);
+  });
+
+  test('takeover prevents key/mouse/resize writes before and after decide', async () => {
+    for (const action of [{ action: 'key', name: 'enter' }, { action: 'mouse', kind: 'click', x: 1, y: 1 }, { action: 'resize', cols: 80, rows: 24 }] as const) {
+      const writes: string[] = [];
+      let owned = true;
+      const { deps } = harness(['\x1b[?1000;1006h']);
+      const result = await runPtyControlLoop({ decide: () => { owned = false; return action; } }, {
+        ...deps, controlStance: () => owned ? 'owned' : 'lost',
+        injectKey: () => { writes.push('key'); return true; },
+        injectMouse: () => { writes.push('mouse'); return true; },
+        resize: () => { writes.push('resize'); return true; },
+      }, { maxSteps: 1, pollMs: 0 });
+      expect(result.termination.kind).toBe('cancelled');
+      expect(writes).toEqual([]);
+    }
+  });
   test('success — brain 이 done 반환', async () => {
     const { deps } = harness(['❯ ready', 'work', 'done']);
     const brain = scriptedBrain([{ action: 'input', text: 'go\r' }, { action: 'wait' }, { action: 'done', reason: '골 완료' }]);

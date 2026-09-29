@@ -3,7 +3,7 @@
 // is exercised by `git-worktree-runtimes.test.ts` already.
 
 import { describe, expect, it, test } from 'bun:test';
-import {
+import { resolveWorktreesRepoRoot,
   detectRepoRoot,
   buildWorktreesView,
   disposeWorktree,
@@ -408,5 +408,18 @@ describe('detectRepoRoot — 관문 결과 처리 (리뷰 must-fix · 2026-08-03
   test('성공인데 stdout 이 공백뿐이면 null 이다 (빈 문자열을 경로로 쓰지 않는다)', () => {
     const root = detectRepoRoot({ cwd: '/x', runner: () => ({ status: 0, stdout: '   \n', stderr: '' }) });
     expect(root).toBeNull();
+  });
+});
+
+describe('resolveWorktreesRepoRoot — Design 탭과 같은 해석(트리아지 P2 «git 밖» 오판)', () => {
+  test('configured absolute harness.defaultRepo wins over the daemon cwd', () => {
+    const seen: Array<string | undefined> = [];
+    const root = resolveWorktreesRepoRoot({ defaultRepo: () => '/repo', detect: (cwd) => { seen.push(cwd); return cwd ? '/repo' : null; } });
+    expect(root).toBe('/repo');
+    expect(seen).toEqual(['/repo']);
+  });
+  test('no config falls back to the daemon cwd; relative config is ambiguous → null', () => {
+    expect(resolveWorktreesRepoRoot({ defaultRepo: () => undefined, detect: (cwd) => (cwd ? null : '/cwd-repo') })).toBe('/cwd-repo');
+    expect(resolveWorktreesRepoRoot({ defaultRepo: () => './repo', detect: () => '/anything' })).toBeNull();
   });
 });

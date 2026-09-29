@@ -144,6 +144,98 @@ describe('plugin manifest parser', () => {
     }
   });
 
+  test('normalizes Agent Plugins extension metadata without dropping legacy contributions', () => {
+    const manifest = parsePluginManifest({
+      $schema: 'https://agentplugins.dev/schemas/v1/plugin.json', name: 'job-coach', version: '0.1.0',
+      capabilities: [{ kind: 'fs:read', roots: ['./reports'] }],
+      contributes: { tools: [{ name: 'existing' }], graphs: ['./graphs/legacy.yaml'] },
+      extensions: { 'ai.elanous': {
+        graphs: ['./graphs/report.yaml'], vocab: ['./vocab/lookup.yaml'],
+        capabilities: ['network:fetch'],
+        connectors: [{ id: 'ncs', fields: [{ name: 'serviceKey', secret: true }] }],
+      } },
+    });
+    expect(manifest).toMatchObject({ id: 'job-coach', name: 'job-coach', version: '0.1.0', main: './plugin.ts' });
+    expect(manifest.contributes.graphs).toEqual(['./graphs/legacy.yaml']);
+    expect(manifest.contributes.vocab).toEqual(['./vocab/lookup.yaml']);
+    expect(manifest.contributes.connectors).toEqual([{ id: 'ncs', fields: [{ name: 'serviceKey', secret: true }] }]);
+    expect(manifest.contributes.tools).toEqual([{ name: 'existing' }]);
+    expect(manifest.capabilities).toEqual([{ kind: 'fs:read', roots: ['./reports'] }, { kind: 'network:fetch' }]);
+  });
+
+  test('normalizes extension node paths without dropping other contributions', () => {
+    const manifest = parsePluginManifest({
+      id: 'demo',
+      contributes: { tools: [{ name: 'existing' }] },
+      extensions: { 'ai.elanous': {
+        nodes: ['./nodes/word-count.yaml', './nodes/nested/counter.yaml'],
+        graphs: ['./graphs/report.yaml'],
+      } },
+    });
+    expect(manifest.contributes.nodes).toEqual(['./nodes/word-count.yaml', './nodes/nested/counter.yaml']);
+    expect(manifest.contributes.graphs).toEqual(['./graphs/report.yaml']);
+    expect(manifest.contributes.tools).toEqual([{ name: 'existing' }]);
+    expect(parsePluginManifest({
+      id: 'demo',
+      contributes: { nodes: ['./nodes/direct.yaml'] },
+      extensions: { 'ai.elanous': { nodes: ['./nodes/extension.yaml'] } },
+    }).contributes.nodes).toEqual(['./nodes/direct.yaml']);
+  });
+
+  test('rejects extension node paths that escape or are not ./-relative', () => {
+    for (const path of ['./nodes/../../escape.yaml', './../escape.yaml', './nodes/..\\..\\escape.yaml',
+      '/tmp/escape.yaml', 'nodes/missing-dot.yaml', './']) {
+      expect(() => parsePluginManifest({ id: 'bad', extensions: { 'ai.elanous': { nodes: [path] } } }))
+        .toThrow(/contributes\.nodes\[0\]/);
+    }
+    expect(() => parsePluginManifest({ id: 'bad', extensions: { 'ai.elanous': { nodes: './nodes/a.yaml' } } }))
+      .toThrow(/contributes\.nodes must be an array/);
+    expect(() => parsePluginManifest({ id: 'bad', extensions: { 'ai.elanous': { nodes: ['./nodes/a.yaml', 42] } } }))
+      .toThrow(/contributes\.nodes\[1\]/);
+  });
+
+  test('preserves fallback identity for legacy manifests with a display name', () => {
+    expect(parsePluginManifest({ name: 'Display Name' }, { fallbackId: 'stable-id' })).toMatchObject({
+      id: 'stable-id', name: 'Display Name',
+    });
+    expect(parsePluginManifest({ id: 'explicit-id', name: 'Display Name' }, { fallbackId: 'stable-id' }).id).toBe('explicit-id');
+    const root = mkdtempSync(join(tmpdir(), 'elanous-legacy-name-'));
+    try {
+      writeFileSync(join(root, 'plugin.json'), JSON.stringify({ name: 'Display Name' }));
+      expect(loadPluginManifestFromDir(root, { id: 'stable-id' }).manifest.id).toBe('stable-id');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('loads Codex manifest when no root or elanous manifest is present', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-codex-manifest-'));
+    try {
+      mkdirSync(join(root, '.codex-plugin'));
+      mkdirSync(join(root, '.elanous-plugin'));
+      writeFileSync(join(root, '.codex-plugin/plugin.json'), JSON.stringify({ name: 'codex-plugin', version: '2.0.0' }));
+      expect(loadPluginManifestFromDir(root, { id: 'fallback' }).manifest.id).toBe('codex-plugin');
+      writeFileSync(join(root, '.elanous-plugin/plugin.json'), JSON.stringify({ id: 'legacy' }));
+      expect(loadPluginManifestFromDir(root, { id: 'fallback' }).manifest.id).toBe('legacy');
+      writeFileSync(join(root, 'plugin.json'), JSON.stringify({
+        $schema: 'https://agentplugins.dev/schemas/v1/plugin.json', name: 'root-plugin',
+      }));
+      const loaded = loadPluginManifestFromDir(root, { id: 'fallback' });
+      expect(loaded.path).toBe(join(root, 'plugin.json'));
+      expect(loaded.manifest.id).toBe('root-plugin');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects unsafe extension assets and malformed connector fields', () => {
+    expect(() => parsePluginManifest({ name: 'bad', extensions: { 'ai.elanous': { graphs: ['../escape.yaml'] } } })).toThrow(/must not contain/);
+    expect(() => parsePluginManifest({ name: 'bad', extensions: { 'ai.elanous': { vocab: ['/etc/passwd'] } } })).toThrow(/must be relative/);
+    expect(() => parsePluginManifest({ name: 'bad', extensions: { 'ai.elanous': { connectors: [{ id: 'ncs', fields: [{ name: 'key', secret: 'yes' }] }] } } })).toThrow(/secret must be a boolean/);
+    expect(() => parsePluginManifest({ name: 'bad', extensions: { 'ai.elanous': { connectors: [{ id: 'ncs', userConfig: [{ key: 'region', label: 42 }] }] } } })).toThrow(/userConfig\[0\]\.label must be a string/);
+    expect(parsePluginManifest({ name: 'good', extensions: { 'ai.elanous': { connectors: [{ id: 'ncs', userConfig: [{ key: 'region', label: 'Region' }] }] } } }).contributes.connectors?.[0]?.userConfig).toEqual([{ key: 'region', label: 'Region' }]);
+  });
+
   test('rejects unsafe main paths and invalid ids', () => {
     expect(() => parsePluginManifest({ id: '../bad', main: './plugin.ts' })).toThrow(/invalid id/);
     expect(() => parsePluginManifest({ id: 'ok', main: '../plugin.ts' })).toThrow(/unsafe path/);

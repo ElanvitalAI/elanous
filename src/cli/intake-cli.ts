@@ -1,12 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { readNexusRuntime } from '../nexus/runtime.js';
 import { resolveRoleLlm } from '../user-config.js';
-import type { IntakeItem } from '../intake-plane/items.js';
-import { runIntakeToTasks, type IntakeTaskRequest, type IntakeToTasksResult } from '../intake-plane/intake-to-tasks.js';
+import { runIntakeToTasks, type IntakeTaskInput, type IntakeTaskRequest, type IntakeToTasksResult } from '../intake-plane/intake-to-tasks.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { writeStdoutFully } from './stdout-flush.js';
 import { runGitCommand } from '../git-fs/runner.js';
@@ -18,22 +17,39 @@ export interface IntakeToTasksCliDeps {
   runtime?: typeof readNexusRuntime;
   token?: () => string | undefined;
   fetch?: typeof fetch;
-  llm?: (item: IntakeItem) => Promise<string>;
+  llm?: (input: IntakeTaskInput) => Promise<string>;
+}
+
+export function intakeToTasksMessages(content: string) {
+  return [
+    { role: 'system' as const, content: 'Interpret the supplied goal line or idea note into up to three actionable tasks. Respond only with JSON: {"tasks":[{"type":"implement|research|document|operate","title":"...","description":"...","priority":"low|medium|high","acceptanceCriteria":["..."]}],"questions":["..."]}. Each task needs a verifiable acceptance criterion; put unresolved requests in questions instead. Do not invent facts. Limit each title to 80 characters and description to 4000 characters.' },
+    { role: 'user' as const, content },
+  ];
+}
+
+export function renderIntakeToTasksResult(result: IntakeToTasksResult, dryRun = false): string {
+  return [
+    `흡수 → 태스크: 처리 ${result.processed} · 등록 ${result.created} · 건너뜀 ${result.skipped} · 실패 ${result.failed}${dryRun ? ' (dry-run)' : ''}`,
+    ...result.items.map((row) => {
+      const typed = row as { type?: unknown; types?: unknown };
+      const type = typeof typed.type === 'string' ? typed.type : Array.isArray(typed.types) && typed.types.length ? typed.types.join(',') : undefined;
+      return `${row.id}\t${row.status}${type ? `\t${type}` : ''}${row.taskId ? `\t${row.taskId}` : ''}${row.reason ? `\t${row.reason}` : ''}`;
+    }),
+  ].join('\n');
 }
 
 export async function runIntakeToTasksCli(
   opts: { limit?: number; dryRun?: boolean },
   deps: IntakeToTasksCliDeps,
 ): Promise<IntakeToTasksResult> {
-  const llm = deps.llm ?? (async (item: IntakeItem) => {
+  const llm = deps.llm ?? (async (input: IntakeTaskInput) => {
     const { streamLLM, PROVIDERS } = await import('../llm.js');
     const selected = resolveRoleLlm('classify');
     const provider = PROVIDERS[selected.provider];
     if (!provider) throw new Error(`Unknown LLM provider: ${selected.provider}`);
-    return streamLLM([
-      { role: 'system', content: 'Interpret this queued intake item as exactly one actionable task. Respond only with JSON: {"title":"...","description":"...","priority":"low|medium|high"}. Do not invent facts. Limit title to 80 characters and description to 4000 characters.' },
-      { role: 'user', content: JSON.stringify({ title: item.title, text: item.text, url: item.url, kind: item.kind }) },
-    ], () => {}, { provider, model: selected.model });
+    // 원장 칸(text·signals·url)은 싣지 않는다 — 골 줄은 fact·current, 아이디어 노트는 공개 노트 본문만.
+    const content = input.kind === 'goal-line' ? `${input.fact}\n현재: ${input.current}` : input.content;
+    return streamLLM(intakeToTasksMessages(content), () => {}, { provider, model: selected.model });
   });
   const post = async (request: IntakeTaskRequest) => {
     const runtime = (deps.runtime ?? readNexusRuntime)();
@@ -57,6 +73,19 @@ export async function runIntakeToTasksCli(
     return { taskId: result.taskId, deduplicated: result.deduplicated === true };
   };
   return runIntakeToTasks(deps.root, opts, { llm, post });
+}
+
+export function resolveIntakeCheckRoot(
+  cwd: string,
+  git: typeof runGitCommand = runGitCommand,
+): string {
+  try {
+    const result = git(cwd, ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+    const root = result.stdout.trim();
+    return result.status === 0 && isAbsolute(root) ? root : cwd;
+  } catch {
+    return cwd;
+  }
 }
 
 export function registerIntakeCommands(program: Command): void {
@@ -90,12 +119,14 @@ export function registerIntakeCommands(program: Command): void {
       } = await import('../intake-plane/check.js');
       const { buildIntakeDocumentStageCallables } = await import('../intake-plane/runtime-callables.js');
       const stdin = await readStdin();
+      const cwd = process.cwd();
+      const root = resolveIntakeCheckRoot(cwd);
       const loaded = loadIntakeCheckInput({
-        ...(opts.file ? { file: opts.file } : {}),
+        ...(opts.file ? { file: resolve(cwd, opts.file) } : {}),
         ...(opts.url ? { url: opts.url } : {}),
         ...(opts.fact.length > 0 ? { facts: opts.fact } : {}),
         ...(stdin ? { stdin } : {}),
-        root: process.cwd(),
+        root,
         fetchText: (url) => {
           const proc = Bun.spawnSync(['curl', '-fsSL', url], { timeout: 20_000 });
           if (proc.exitCode !== 0) throw new Error(`url fetch failed: ${url}`);
@@ -105,7 +136,7 @@ export function registerIntakeCommands(program: Command): void {
       const factMode = opts.fact.length > 0;
       const documentText = documentTextForCheck(loaded, { factMode, ...(stdin ? { stdin } : {}) });
       const stages = factMode ? undefined : buildIntakeDocumentStageCallables();
-      const deps = defaultIntakeCheckDeps(process.cwd(), stages
+      const deps = defaultIntakeCheckDeps(root, stages
         ? { preprocess: stages.preprocess, compare: stages.compare }
         : {});
       const report = documentText === undefined
@@ -124,7 +155,6 @@ export function registerIntakeCommands(program: Command): void {
           import('../self-implement/goal-file-reader.js'),
           import('node:path'),
         ]);
-        const root = process.cwd();
         const branchResult = runGitCommand(root, ['rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf8' });
         const branch = branchResult.status === 0 ? branchResult.stdout.trim() : '';
         const readReferencedFile = createRepositoryReferencedFileReader(root);
@@ -276,9 +306,10 @@ export function registerIntakeCommands(program: Command): void {
       try { check = JSON.parse(readFileSync(opts.checkJson, 'utf8')); } catch (e) { console.error(`대조 산출을 못 읽었다: ${String((e as Error).message ?? e)}`); process.exitCode = 2; return; }
       if (!check || !Array.isArray(check.items)) { console.error('대조 산출 모양이 아니다(items 칸 없음)'); process.exitCode = 2; return; }
       const res = routeIntakeItem(effectiveInstanceRoot(), id, check, opts.dryRun ? { dryRun: true } : {});
+      if (res.skipped === '모든 주장을 못 쟀다 — 대조를 다시 돌려라' || res.skipped?.startsWith('원장에 없는')) process.exitCode = 1;
       if (opts.json) { await writeStdoutFully(JSON.stringify(res, null, 2)); return; }
-      if (res.skipped) { console.log(`${id}: 건너뜀 — ${res.skipped}`); if (res.skipped.startsWith('원장에 없는')) process.exitCode = 1; return; }
-      console.log(`${id} → 골 후보 ${res.goals} · 매뉴얼 후보 ${res.manual} · 판단 필요 ${res.review} · 그라운딩 후보 ${res.grounding}${res.dryRun ? ' (dry-run)' : ''}`);
+      if (res.skipped) { console.log(`${id}: 건너뜀 — ${res.skipped}`); return; }
+      console.log(`${id} → 골 후보 ${res.goals} · 매뉴얼 후보 ${res.manual} · 판단 필요 ${res.review} · 그라운딩 후보 ${res.grounding}${res.unmeasured > 0 ? ` · 못 쟀다 ${res.unmeasured}` : ''}${res.dryRun ? ' (dry-run)' : ''}`);
     });
 
   intakeCmd
@@ -325,8 +356,8 @@ export function registerIntakeCommands(program: Command): void {
 
   intakeCmd
     .command('to-tasks')
-    .description('queued 흡수 항목을 해석해 Nexus 태스크로 등록한다 (기본 최대 5건)')
-    .option('--limit <n>', '처리할 queued 항목 상한 (기본 5)')
+    .description('소비하지 않은 골 줄과 공개 아이디어 노트를 해석해 Nexus 태스크로 등록한다 (기본 최대 5건)')
+    .option('--limit <n>', '처리할 골 줄·아이디어 노트 상한 (기본 5)')
     .option('--dry-run', 'LLM 해석만 하고 POST·원장 갱신은 하지 않는다')
     .option('--json', '구조화 출력')
     .action(async (opts: { limit?: string; dryRun?: boolean; json?: boolean }) => {
@@ -339,10 +370,7 @@ export function registerIntakeCommands(program: Command): void {
       const { effectiveInstanceRoot } = await import('../instance/resolve.js');
       const result = await runIntakeToTasksCli({ limit, dryRun: opts.dryRun }, { root: effectiveInstanceRoot() });
       if (opts.json) await writeStdoutFully(JSON.stringify(result) + '\n');
-      else {
-        console.log(`흡수 → 태스크: 처리 ${result.processed} · 등록 ${result.created} · 건너뜀 ${result.skipped} · 실패 ${result.failed}${opts.dryRun ? ' (dry-run)' : ''}`);
-        for (const row of result.items) console.log(`${row.id}\t${row.status}${row.taskId ? `\t${row.taskId}` : ''}${row.reason ? `\t${row.reason}` : ''}`);
-      }
+      else console.log(renderIntakeToTasksResult(result, opts.dryRun));
       if (result.failed > 0) process.exitCode = 1;
     });
 

@@ -300,7 +300,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     void (async () => {
       try {
         const r = await client.fetchJson<{ ok?: boolean; messages?: { role: string; content: string }[] }>(
-          `/v1/sessions/store/${encodeURIComponent(sessionId)}`,
+          `/v1/sessions/store/${encodeURIComponent(sessionId)}?ifExists=1`,
         );
         if (!alive || !r?.messages || r.messages.length === 0) return;
         setMessages((prev) => {

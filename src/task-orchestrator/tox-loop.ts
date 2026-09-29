@@ -10,6 +10,9 @@ import { PRIORITY_RANK } from './priority.js';
 import type { Task } from './types.js';
 import { decideBudget, readBudgetInputsLive, type ReadBudgetInputsDeps } from '../self-implement/budget-gate.js';
 import { getUserConfig } from '../user-config.js';
+import { getSecretAsync } from '../nexus/config/secrets/index.js';
+import { projectLinearTask } from '../connectors/linear-projector.js';
+import type { TaskStore } from './store.js';
 
 async function defaultBudgetCheck(readBudget?: ReadBudgetInputsDeps & { readLiveGrok?: () => Promise<number | undefined> }): Promise<{ canAfford: boolean; tripped: readonly string[] }> {
   const inputs = await readBudgetInputsLive({ config: getUserConfig(), ...readBudget });
@@ -32,6 +35,12 @@ export interface ToxLoopOptions {
   graph: TaskGraph;
   dispatcher: Pick<TaskDispatcher, 'tickTask'>;
   bus?: TaskEventBus;
+  store?: TaskStore;
+  /** Optional projection IO seams for isolated TOX tests. */
+  linearProjection?: {
+    getApiKey: () => Promise<string | undefined>;
+    project: typeof projectLinearTask;
+  };
   maxConcurrent?: number;
   intervalMs?: number;
   budgetCheck?: BudgetGate;
@@ -45,7 +54,7 @@ export interface ToxLoopOptions {
   }) => void;
 }
 
-export function startToxLoop({ graph, dispatcher, bus, maxConcurrent = 2, intervalMs = 1000,
+export function startToxLoop({ graph, dispatcher, bus, store, linearProjection, maxConcurrent = 2, intervalMs = 1000,
   budgetCheck, readBudget, launch, log }: ToxLoopOptions): { tick: () => Promise<DispatchTickResult>; stop: () => void } {
   if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1) throw new RangeError('maxConcurrent must be a positive integer');
   if (!Number.isFinite(intervalMs) || intervalMs < 1) throw new RangeError('intervalMs must be positive');
@@ -54,6 +63,7 @@ export function startToxLoop({ graph, dispatcher, bus, maxConcurrent = 2, interv
   const inflight = new Set<string>();
   const gate = budgetCheck ?? (() => defaultBudgetCheck(readBudget));
   let stopped = false;
+  const projections = new Map<string, Promise<void>>();
   let pending = false;
   let tickPromise: Promise<DispatchTickResult> | undefined;
   let currentResult: DispatchTickResult | undefined;
@@ -150,7 +160,36 @@ export function startToxLoop({ graph, dispatcher, bus, maxConcurrent = 2, interv
   const subscription = bus?.subscribe((event) => {
     if (event.kind === 'task-created' || (event.kind === 'task-status-changed' && event.to === 'ready')) wake();
     if (event.kind === 'task-completed' || event.kind === 'task-failed' || event.kind === 'task-cancelled') wake();
-  }, { kinds: ['task-created', 'task-status-changed', 'task-completed', 'task-failed', 'task-cancelled'] });
+
+    const status = event.kind === 'task-status-changed' ? event.to
+      : event.kind === 'task-started' ? 'running'
+      : event.kind === 'task-completed' ? 'done'
+      : event.kind === 'task-failed' ? 'failed' : undefined;
+    if (status !== 'running' && status !== 'review' && status !== 'done' && status !== 'failed') return;
+    if (event.kind === 'task-status-changed' && (event.from === event.to || event.to !== 'review')) return;
+    if (!event.taskId) return;
+    const task = graph.getTask(event.taskId);
+    if (task?.generatedBy?.kind !== 'external' || task.generatedBy.provider !== 'linear') return;
+    const projectionTask = { ...task, status };
+    const executionId = event.kind === 'task-started' || event.kind === 'task-completed' || event.kind === 'task-failed'
+      ? event.executionId : task.lastExecutionId;
+    if (executionId) projectionTask.lastExecutionId = executionId;
+    const previous = projections.get(task.id);
+    const current = (async () => {
+      if (previous) await previous;
+      if (stopped) return;
+      try {
+        const apiKey = await (linearProjection?.getApiKey ?? (() => getSecretAsync('connector.linear.apiKey')))();
+        if (!apiKey || stopped) return;
+        const execution = executionId ? store?.getExecution(executionId) ?? undefined : undefined;
+        await (linearProjection?.project ?? projectLinearTask)({ task: projectionTask, apiKey, execution });
+      } catch (error) {
+        emit('skipped', { taskId: task.id, ...snapshot(), reason: `linear-projection:${String(error)}` });
+      }
+    })();
+    projections.set(task.id, current);
+    void current.finally(() => { if (projections.get(task.id) === current) projections.delete(task.id); });
+  }, { kinds: ['task-created', 'task-status-changed', 'task-started', 'task-completed', 'task-failed', 'task-cancelled'] });
   launcher.start();
   wake();
   return {

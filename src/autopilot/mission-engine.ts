@@ -27,6 +27,8 @@ import {
   type DecompBaseline, type BaselineArcView, type BaselinePhaseView,
 } from './mission-decompose-baseline.js';
 import { executeApprovedMission } from './mission-executor.js';
+import { deliverMissionPhases, type CourierDeps } from './track-courier.js';
+import { getUserConfig } from '../user-config.js';
 import type { DecomposeCallable } from '../task-orchestrator/generator.js';
 import type { ProposedTask } from '../task-orchestrator/generator-schema.js';
 import { spawn } from 'node:child_process';
@@ -863,11 +865,21 @@ export type SpawnRunFn = (missionId: string) => void;
 
 export async function approveMission(
   missionId: string,
-  deps: { store?: TaskStore; now?: number; createSchedule?: CreateScheduleFn; spawnRun?: SpawnRunFn } = {},
+  deps: { store?: TaskStore; now?: number; createSchedule?: CreateScheduleFn; spawnRun?: SpawnRunFn; courier?: Omit<CourierDeps, 'store' | 'now'> } = {},
 ): Promise<ApproveMissionResult> {
   const store = deps.store ?? new TaskStore();
   const owns = !deps.store;
   const now = deps.now ?? Date.now();
+  const notifyCourier = () => {
+    try {
+      const config = deps.courier?.config ?? getUserConfig().autopilot?.trackCourier;
+      if (config?.enabled === true) {
+        void deliverMissionPhases(missionId, { ...deps.courier, config, store, now });
+      }
+    } catch (e) {
+      try { debug.log('autopilot.track-courier', 'post-failed', { missionId, error: e instanceof Error ? e.message : String(e) }); } catch { /* fail-soft */ }
+    }
+  };
   try {
     const m = getMission(store, missionId);
     if (!m) return { ok: false, activated: 0, error: `미션 없음: ${missionId}` };
@@ -916,6 +928,7 @@ export async function approveMission(
       //   승인 후 막히던 문제. 이제 모든 도메인 승인=실행. 실제 매매 집행은 하위 trade-mandate
       //   (armed/live)가 게이트하므로 미션 실행해도 실매매 오집행 불가(도메인 통째 dry 는 과잉 이중).
       try { (deps.spawnRun ?? defaultSpawnRunMission)(m.id); } catch { /* fail-soft — 스테이징 유지 */ }
+      if (r.ok) notifyCourier();
       return { ok: r.ok, activated: r.activated, ...(r.note ? { note: r.note } : {}) };
     }
     // ── 단일 페이즈 → 기존 동작 유지(ready + run-mission one-shot) ──
@@ -928,6 +941,7 @@ export async function approveMission(
     // ★ 실집행 — ready 만으론 안 돎(활성 디스패처 부재·대표 지적 2026-07-10). run-mission.ts 를
     //   detached one-shot 실행해 골을 에이전트 턴으로 즉시 수행·발송(scheduler 의 1회판).
     try { (deps.spawnRun ?? defaultSpawnRunMission)(m.id); } catch { /* fail-soft — ready 로 남음 */ }
+    notifyCourier();
     return { ok: true, activated };
   } catch (e) {
     return { ok: false, activated: 0, error: e instanceof Error ? e.message.slice(0, 150) : String(e) };

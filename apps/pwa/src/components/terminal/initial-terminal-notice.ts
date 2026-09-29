@@ -36,7 +36,7 @@ export function initialTerminalNotice(
     placeholder: hasTerminalId
       ? null
       : state.status === 'pending'
-        ? '터미널 이름을 준비하는 중…'
+        ? (state.slow ? '데몬이 느립니다 — 터미널을 만드는 중… (기다리는 중)' : '터미널 이름을 준비하는 중…')
         : `터미널 이름을 로컬에서 정했습니다 (${reason}).`,
     fallbackBanner: localFallback
       ? `터미널 이름을 로컬에서 정했습니다 (${reason}). 데몬 발급을 확인하지 못했습니다.`

@@ -1,0 +1,12 @@
+steward-sync:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" sync'
+  timeout_ms: 120000
+steward-triage:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" triage'
+  timeout_ms: 600000
+steward-schedule:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" schedule'
+  timeout_ms: 120000
+steward-report:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/steward/triage.ts" report'
+  timeout_ms: 120000

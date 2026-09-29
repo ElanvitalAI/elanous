@@ -23,8 +23,8 @@ interface IgnoreSnapshot {
 }
 
 export type RepoProvisionResult =
-  | { status: 'provisioned'; target: string; resolution: HarnessTargetResolution; ignoreFile: { added: number; preserved: number } }
-  | { status: 'already-git'; target: string; resolution: HarnessTargetResolution; ignoreFile: { added: number; preserved: number } }
+  | { status: 'provisioned'; target: string; resolution: HarnessTargetResolution; ignoreFile: { added: number; preserved: number; created: boolean } }
+  | { status: 'already-git'; target: string; resolution: HarnessTargetResolution; ignoreFile: { added: number; preserved: number; created: boolean } }
   | { status: 'not-applicable'; target: string; reason: string };
 
 interface RepoProvisionDeps {
@@ -440,6 +440,10 @@ function prepareIgnoreSnapshot(target: string): IgnoreSnapshot {
 function managedIgnoreEntries(): string[] {
   return [
     ...SENSITIVE_GLOBS,
+    'node_modules/',
+    '.env*',
+    'dist/',
+    '.DS_Store',
     ELANOUS_WORK_GLOB,
     ELANOUS_TEST_GLOB,
     ...ELANOUS_RUNTIME_ARTIFACT_DIRS,
@@ -468,32 +472,22 @@ export function ensureInfoExclude(repoRoot: string): { added: number; path: stri
   return { added: additions.length, path };
 }
 
-function ensureIgnoreFile(snapshot: IgnoreSnapshot): { added: number; preserved: number } {
+function ensureIgnoreFile(snapshot: IgnoreSnapshot): { added: number; preserved: number; created: boolean } {
   const current = snapshot.backupPath ? readFileSync(snapshot.backupPath, 'utf8') : '';
   const lines = current.split(/\r?\n/).filter(Boolean);
-  // ⛔ elanous 런타임 산출물 목록을 여기 «다시» 나열하지 않는다 — 하나의 출처를 임포트한다.
-  //    📏 2026-09-21: 종전엔 `.elanous/` · `.elanous-test/` 둘만 썼고, 판별 함수가 아는 나머지 셋
-  //       (`.elanous-child-liveness.hb` · `.elanous-se/` · `.elanous-goal-grounding-build/` · `.elanous-session/`)은 untracked 로 남아
-  //       그중 하나가 빈 저장소 PR 에 들어가 런을 UNCONVERGEABLE 로 만들었다(`#19300`·`#19302`).
-  const managedEntries = [
-    ...SENSITIVE_GLOBS,
-    ELANOUS_WORK_GLOB,
-    ELANOUS_TEST_GLOB,
-    ...ELANOUS_RUNTIME_ARTIFACT_DIRS,
-    ...ELANOUS_RUNTIME_ARTIFACT_PATHS,
-  ].filter((entry, index, all) => all.indexOf(entry) === index);
+  const managedEntries = managedIgnoreEntries();
   const additions = managedEntries.filter((glob) => !lines.includes(glob));
   const preserved = lines.filter((line) => !managedEntries.includes(line)).length;
   if (additions.length === 0) {
     snapshot.restore();
-    return { added: 0, preserved };
+    return { added: 0, preserved, created: false };
   }
   replaceFileAtomically(
     snapshot.path,
     `${current}${current && !current.endsWith('\n') ? '\n' : ''}${additions.join('\n')}\n`,
     snapshot.backupPath ? lstatSync(snapshot.backupPath).mode : undefined,
   );
-  return { added: additions.length, preserved };
+  return { added: additions.length, preserved, created: !snapshot.backupPath };
 }
 
 interface GitSnapshot {
@@ -551,10 +545,10 @@ export function provisionRepository(
   if (target.status === 'git-repo') {
     const cwd = target.repoRoot ?? target.canonicalTarget ?? target.target;
     const ignoreSnapshot = prepareIgnoreSnapshot(cwd);
-    let ignoreFile: { added: number; preserved: number };
+    let ignoreFile: { added: number; preserved: number; created: boolean };
     try {
       ignoreFile = ensureIgnoreFile(ignoreSnapshot);
-      debug.log('repo-provision', 'step', { target: cwd, step: 'ignore', ok: true, added: ignoreFile.added, preserved: ignoreFile.preserved });
+      debug.log('repo-provision', 'step', { target: cwd, step: 'ignore', ok: true, ...ignoreFile });
       try {
         const excl = ensureInfoExclude(cwd);
         debug.log('repo-provision', 'step', { target: cwd, step: 'info-exclude', ok: excl !== null, ...(excl ?? {}) });
@@ -597,7 +591,7 @@ export function provisionRepository(
   //   「승격을 시도조차 안 했다」와 「준비에서 멎었다」가 같은 모양이 된다(회귀가 실측으로 잡았다).
   let gitSnapshot: GitSnapshot | undefined;
   let ignoreSnapshot: IgnoreSnapshot | undefined;
-  let ignoreFile: { added: number; preserved: number } | undefined;
+  let ignoreFile: { added: number; preserved: number; created: boolean } | undefined;
   try {
     gitSnapshot = snapshotGitDirectory(cwd);
     ignoreSnapshot = prepareIgnoreSnapshot(cwd);
@@ -620,12 +614,15 @@ export function provisionRepository(
     //   (무인 리뷰 must-fix · 2026-08-18 `#10120` 3R). 침묵이 정상과 구별 안 되면 그 자는 거짓을 생산한다.
     try {
       ignoreFile = ensureIgnoreFile(ignoreSnapshot!);
-      debug.log('repo-provision', 'step', { target: cwd, step: 'ignore', ok: true, added: ignoreFile.added, preserved: ignoreFile.preserved });
+      debug.log('repo-provision', 'step', { target: cwd, step: 'ignore', ok: true, ...ignoreFile });
     } catch (error) {
       debug.log('repo-provision', 'step', { target: cwd, step: 'ignore', ok: false, reason: String(error) }, { level: 'error' });
       throw error;
     }
-    runGit(cwd, ['add', '-A'], deps, 'add');
+    // Keep the rollback snapshot until commit succeeds without staging it.
+    runGit(cwd, ignoreSnapshot!.backupPath
+      ? ['add', '-A', '--', '.', `:(exclude)${basename(ignoreSnapshot!.backupPath)}`]
+      : ['add', '-A'], deps, 'add');
     runGit(cwd, ['commit', '--allow-empty', '-m', 'Initial repository baseline'], deps, 'commit');
   } catch (error) {
     // ⛔ 롤백 «자신»이 실패해도 원래 오류를 잃지 않는다 — 복구 실패가 원인을 덮으면

@@ -28,7 +28,7 @@ import { LOG_LEVEL_ORDER, type LogLevel } from '../../mss/logging/record.js';
 import { debug, type DebugLevel } from '../../debug/log.js';
 import { persistScopedDebugLevel, persistScopedRenderLogs } from '../../mss/logging/scoped-level.js';
 import { userConfigPath } from '../../user-config.js';
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
@@ -55,6 +55,8 @@ export interface LogFabricDeps {
   instances?: () => LogInstanceView[];
   /** 연합 스토어 open 주입 — 리졸버의 선택 결과를 테스트에서 관측한다. */
   openRemoteStore?: (view: LogInstanceView) => LogStore | null;
+  /** `store=@active` 가 «최근에 쓰인» 우주를 고를 때 보는 logs.db 수정 시각(테스트 주입). */
+  dbMtimeMs?: (dbPath: string) => number | null;
   /** 다중 과거 조회가 연 원격 스토어의 정리를 테스트에서 관측한다. */
   closeRemoteStore?: (store: LogStore) => void;
   /**
@@ -278,10 +280,38 @@ function toWire(row: LogStoreRow): Record<string, unknown> {
 
 // ── GET /v1/logs ──────────────────────────────────────────────────────
 
+/** `store=@active` 가 가리키는 연합 — 이 인스턴스 ⊕ 최근 `ACTIVE_WINDOW_MS` 안에 logs.db 가 쓰인 우주(최신순 · 상한 `HTTP_LOG_STORE_MAX`).
+ *  🅢 09-28 10:1x: 워크트리 발사 = 시험 우주 · 자식 = Pod 라 «이 인스턴스»만 보면 오늘 병합 150+ 가 0 으로 보였다.
+ *  ⛔ 등록된 우주 전부(수백)를 한 GET 에서 열지 않는다 — 최근에 쓰인 것만. 고른 목록은 응답 `stores` 로 돌려준다(무엇을 봤나). */
+export const ACTIVE_STORE_TOKEN = '@active';
+const ACTIVE_WINDOW_MS = 24 * 60 * 60_000;
+export function activeStoreNames(deps: LogFabricDeps, nowMs = Date.now()): string[] {
+  const selfName = resolveLogInstanceName();
+  const mtime = deps.dbMtimeMs ?? ((path: string) => { try { return statSync(path).mtimeMs; } catch { return null; } });
+  const recent = (deps.instances ?? readLogInstances)()
+    .filter((view) => view.dbExists && view.name !== selfName)
+    .map((view) => ({ name: view.name, at: mtime(view.dbPath) }))
+    .filter((view): view is { name: string; at: number } => view.at !== null && nowMs - view.at <= ACTIVE_WINDOW_MS)
+    .sort((a, b) => b.at - a.at);
+  const names = [selfName];
+  for (const view of recent) {
+    if (names.length >= HTTP_LOG_STORE_MAX) break;
+    if (!names.includes(view.name)) names.push(view.name);
+  }
+  return names;
+}
+
 export function handleLogsQuery(req: Request, opts: MetaApiOpts, deps: LogFabricDeps = {}): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
   const url = new URL(req.url);
-  const requestedNames = [...new Set(url.searchParams.getAll('store').flatMap((value) => value.split(',')).map((value) => value.trim()).filter(Boolean))];
+  let requestedNames = [...new Set(url.searchParams.getAll('store').flatMap((value) => value.split(',')).map((value) => value.trim()).filter(Boolean))];
+  let activeStores: string[] | null = null;
+  if (requestedNames.includes(ACTIVE_STORE_TOKEN)) {
+    activeStores = activeStoreNames(deps);
+    requestedNames = activeStores.length > 1 ? activeStores : [...activeStores, activeStores[0]!].slice(0, 1);
+    url.searchParams.delete('store');
+    for (const name of requestedNames) url.searchParams.append('store', name);
+  }
   // Preserve every legacy response shape and error path unless this is explicitly a multi-store request.
   if (requestedNames.length <= 1) {
     const resolved = resolveStoreParam(url, deps, requestedNames[0]);
@@ -344,6 +374,7 @@ export function handleLogsQuery(req: Request, opts: MetaApiOpts, deps: LogFabric
     ts: new Date().toISOString(),
     ...(failedStores.length ? { failedStores } : {}),
     ...(selection.storeLimitReached ? { storeLimitReached: true } : {}),
+    ...(activeStores ? { stores: activeStores } : {}),
   }, 200);
 }
 

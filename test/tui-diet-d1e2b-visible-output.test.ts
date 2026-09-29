@@ -63,13 +63,13 @@ describe('essential slash output', () => {
     expect(chatLines).toHaveLength(0);
     expect(debugLines).toEqual(['  usage: /plan [status | start [title] | done | show]']);
   });
-  test('/help opens a modal and does not call blocking showHelp', async () => {
-    const { ctx, helpModals, helpCalls } = makeCtx();
+  test('/help uses the scrollable log when the catalog outgrows the modal', async () => {
+    const { ctx, chatLines, helpModals, helpCalls } = makeCtx();
     expect((await registry.dispatch('help', [], ctx)).kind).toBe('continue');
-    expect(helpModals).toHaveLength(1);
-    expect(helpModals[0]!.lines.length).toBeGreaterThan(0);
-    expect(helpModals[0]!.lines.some(line => line.includes('/help'))).toBe(true);
-    expect(helpModals[0]!.lines.some(line => line.includes('Press any key to close'))).toBe(false);
+    expect(helpModals).toHaveLength(0);
+    expect(chatLines).toContain('Dashboard help — scroll the chat log with PgUp / PgDn');
+    expect(chatLines.some(line => line.includes('/help'))).toBe(true);
+    expect(chatLines.some(line => line.includes('Press any key to close'))).toBe(false);
     expect(helpCalls).toHaveLength(0);
   });
   test('/help without a modal host remains visible without waiting for a key', async () => {

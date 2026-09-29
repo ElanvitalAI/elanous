@@ -22,11 +22,12 @@ test('isolated CLI ACP stdio answers initialize and session/new without boot too
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let results: string;
   try {
-    results = await Promise.race([
-      new Response(proc.stdout).text(),
+    const [stdout, exitCode] = await Promise.race([
+      Promise.all([new Response(proc.stdout).text(), proc.exited]),
       new Promise<never>((_, reject) => { timeout = setTimeout(() => { proc.kill(); reject(new Error('ACP stdio timeout')); }, 20_000); }),
     ]);
-    await proc.exited;
+    results = stdout;
+    expect(exitCode).toBe(0);
   } finally {
     if (timeout) clearTimeout(timeout);
   }

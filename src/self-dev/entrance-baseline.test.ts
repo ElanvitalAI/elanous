@@ -43,10 +43,15 @@ describe('compareCommandEntranceBaseline', () => {
     expect(result.added).toEqual(['self new-command']);
   });
 
-  test('fails only when a declared CLI entrance is missing from the assembled program', () => {
-    const result = compareCommandEntranceBaseline(CLI_ENTRANCE_BASELINE, collectCommandEntrances(program));
+  test('matches the current assembled CLI including the TOX tasks command', () => {
+    const entrances = collectCommandEntrances(program);
+    const result = compareCommandEntranceBaseline(CLI_ENTRANCE_BASELINE, entrances);
 
+    // 판정은 «선언한 입구가 사라졌나»(missing → exit 1)다. 새로 늘어난 명령(added)까지 0 을 요구하면 명령을 더할 때마다 깨진다(오늘의 목록을 박은 자).
     expect(result.missing).toEqual([]);
+    expect(entrances.find(entrance => entrance.path.join(' ') === 'tasks')?.aliases).toContain('task');
+    expect(CLI_ENTRANCE_BASELINE).toContain('tasks list');
+    expect(CLI_ENTRANCE_BASELINE).not.toContain('task');
   });
 
   test('derives nonzero exit status from missing paths rather than a fixed result', () => {

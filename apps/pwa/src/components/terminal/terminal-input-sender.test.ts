@@ -154,3 +154,28 @@ describe('createTerminalInputSender', () => {
     expect(sent).toEqual([]);
   });
 });
+
+describe('shellReady 관문 — 셸이 뜨기 전 입력은 모아 뒀다가 순서대로', () => {
+  test('관문이 열리기 전엔 한 바이트도 안 보내고, 열리면 친 순서대로 보낸다', async () => {
+    const sent: string[] = [];
+    let open!: () => void;
+    const shellReady = new Promise<void>((r) => { open = r; });
+    const sender = createTerminalInputSender({
+      send: async (_m, p) => { sent.push(p.data); return {}; },
+      ready: Promise.resolve('sess-1'),
+      getSessionId: () => 'sess-1',
+      terminalId: 't1',
+      getPeerId: () => 'peer',
+      log: () => {},
+      shellReady,
+    });
+    sender.push('cd /tmp');
+    sender.push('\r');
+    sender.push('\x1b[A');
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sent).toEqual([]);
+    open();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sent).toEqual(['cd /tmp', '\r', '\x1b[A']);
+  });
+});

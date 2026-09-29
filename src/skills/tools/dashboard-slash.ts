@@ -49,8 +49,6 @@ export function _resetDashboardSlashExecutorForTesting(): void {
  *  additional command proves safe + useful in control mode. */
 export const ALLOWED_SLASHES: readonly string[] = Object.freeze([
   'term', 'terminal',
-  'bench',
-  'view',
   'provider', 'p',
   'context', 'ctx',
   'plugin', 'plugins',
@@ -63,15 +61,10 @@ export const ALLOWED_SLASHES: readonly string[] = Object.freeze([
   'api-allow', 'api',
   'prompt', 'prompts',
   'history', 'hist',
-  'scratch', 'sc',
-  'fullscreen', 'fs',
   'log',
   'claude',
   'codex',
-  'claude-vw',
-  'codex-vw',
-  'acp-vw',
-  'control', 'dm', 'default',
+  'control', 'default',
   'help', '?',
   'run-skill', 'rs',
 ]);
@@ -95,7 +88,7 @@ export function buildDashboardSlashExecuteTool(): LLMToolSpec {
   return {
     name: 'DashboardSlashExecute',
     description:
-      'Run a slash command programmatically from control mode. Only a curated allow-list is callable (term, view, provider, context, plugin, widget, memory, status, hint, api-allow, prompt, history, scratch, fullscreen, claude, codex, control, help, run-skill). Interactive/destructive commands (quit, clear, debug, perf, codex-setup, telegram) are blocked — ask the user to type those. Returns ok=false + reason when the command is blocked or unrecognized.',
+      'Run a slash command programmatically from control mode. Only a curated allow-list is callable (term, provider, context, plugin, widget, memory, status, hint, api-allow, prompt, history, claude, codex, control, help, run-skill). Interactive/destructive commands (quit, clear, debug, perf, codex-setup, telegram) are blocked — ask the user to type those. Returns ok=false + reason when the command is blocked or unrecognized.',
     parameters: {
       type: 'object',
       properties: {

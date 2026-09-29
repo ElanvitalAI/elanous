@@ -15,9 +15,10 @@ import {
   type PtyControlResult,
 } from '../pty-shell/pty-control-ipc.js';
 import { resolvePtySpecialKey } from '../pty-shell/pty-special-keys.js';
+import { encodeSgrMouse, type PtyMouseInput } from '../pty-shell/pty-mouse.js';
 import type { ToolRuntime } from './types.js';
 
-const PTY_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'resize', 'snapshot', 'rename', 'terminate', 'capabilities'] as const;
+const PTY_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'input-mouse', 'resize', 'snapshot', 'rename', 'terminate', 'capabilities'] as const;
 const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_HOLD_TIMEOUT_MS = 90_000;
 const HOLD_OWNER_REGISTRATION_BUDGET_MS = 8_700;
@@ -76,13 +77,17 @@ export function buildElanousHoldTool(): LLMToolSpec {
 export function buildPtyControlTool(): LLMToolSpec {
   return {
     name: 'PtyControl',
-    description: 'Control a registered PTY through its owning process: inspect, take/release ownership, send input, resize, rename, or terminate.',
+    description: 'Control a registered PTY through its owning process: inspect, take/release ownership, send text/key/mouse input, resize, rename, or terminate. Mouse requires enabled SGR tracking on the owning PTY.',
     parameters: {
       type: 'object',
       properties: {
         ptyId: { type: 'string', description: 'Registered PTY id.' },
         action: { type: 'string', enum: [...PTY_ACTIONS] },
         text: { type: 'string', description: 'Required for input-text as literal text, or input-key as a key name (enter, esc, tab, up, down, left, right, backspace, ctrl+c, etc.).' },
+        x: { type: 'integer', description: 'Required for input-mouse; 1-based column.' },
+        y: { type: 'integer', description: 'Required for input-mouse; 1-based row.' },
+        kind: { type: 'string', enum: ['click', 'scroll-up', 'scroll-down'] },
+        button: { type: 'string', enum: ['left', 'middle', 'right'] },
         cols: { type: 'integer', description: 'Required for resize; positive integer.' },
         rows: { type: 'integer', description: 'Required for resize; positive integer.' },
         ansi: { type: 'boolean', description: 'Optional ANSI reconstruction for snapshot.' },
@@ -278,6 +283,15 @@ function parseActor(value: unknown): 'human' | 'agent' {
 function payloadFor(action: PtyControlAction, raw: Args): PtyControlPayload | undefined {
   if (action === 'input-text') return { chars: requiredInput(raw.text, 'text') };
   if (action === 'input-key') return { chars: resolvePtySpecialKey(requiredInput(raw.text, 'text')) };
+  if (action === 'input-mouse') {
+    const kind = raw.kind;
+    const button = raw.button ?? 'left';
+    if (kind !== 'click' && kind !== 'scroll-up' && kind !== 'scroll-down') throw new Error("'kind' must be click, scroll-up or scroll-down");
+    if (button !== 'left' && button !== 'middle' && button !== 'right') throw new Error("'button' must be left, middle or right");
+    const input: PtyMouseInput = { x: positiveInteger(raw.x, 'x'), y: positiveInteger(raw.y, 'y'), kind, button };
+    encodeSgrMouse(input);
+    return input;
+  }
   if (action === 'resize') return { cols: positiveInteger(raw.cols, 'cols'), rows: positiveInteger(raw.rows, 'rows') };
   if (action === 'snapshot') {
     if (raw.ansi !== undefined && typeof raw.ansi !== 'boolean') throw new Error("'ansi' must be a boolean");

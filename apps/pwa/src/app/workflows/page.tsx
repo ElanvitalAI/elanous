@@ -1,7 +1,10 @@
 'use client';
 
-import { WorkflowsPanel } from '@/components/workflows/WorkflowsPanel';
+import { useEffect } from 'react';
 
 export default function WorkflowsPage() {
-  return <WorkflowsPanel />;
+  useEffect(() => {
+    window.location.replace('/app/editor/?mode=workflow');
+  }, []);
+  return <a href="/app/editor/?mode=workflow">편집기로 이동</a>;
 }

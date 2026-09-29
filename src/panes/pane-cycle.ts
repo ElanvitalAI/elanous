@@ -13,7 +13,7 @@
 //
 // PLAN: 내부 문서 `PLAN-vw-term-bundle-b7-delta-alt-o-pane-cycle`
 
-import type { PaneId } from '../virtual-windows/addressing.js';
+type PaneId = string;
 
 export type PaneCycleDirection = 'forward' | 'backward';
 

@@ -14,8 +14,8 @@ import {
 describe('backend registry', () => {
   it('exposes the claude backend by id', () => {
     const b = getAcpBackend('claude');
-    expect(b.command).toBe('claude-code-acp');
-    expect(b.npmPackage).toBe('@zed-industries/claude-code-acp');
+    expect(b.command).toBe('claude-agent-acp');
+    expect(b.npmPackage).toBe('@agentclientprotocol/claude-agent-acp');
   });
 
   it('throws on unknown backend with the known list in the message', () => {

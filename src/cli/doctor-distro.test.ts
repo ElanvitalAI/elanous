@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { detectDistroFamily, parseOsRelease, remediesFor } from './doctor-distro.js';
+import { detectDistroFamily, parseOsRelease, remediesFor, toolInstallLine } from './doctor-distro.js';
 import { checkReadiness } from './doctor-readiness.js';
 
 // os-release 픽스처 — 각 배포판이 실제로 싣는 형식(따옴표·ID_LIKE 공백 목록)을 따른다(RFC 표의 네 기계 · 2026-09-24).
@@ -54,7 +54,12 @@ describe('doctor-distro', () => {
   });
 
   test('harness remedies use the measured family and leave unknown families without guessed commands', () => {
-    expect(remediesFor('debian')).toMatchObject({ rg: 'sudo apt-get update && sudo apt-get install -y ripgrep', node: 'sudo apt-get update && sudo apt-get install -y nodejs npm', codex: 'sudo npm install -g @openai/codex' });
+    expect(remediesFor('debian')).toMatchObject({ rg: 'sudo apt-get update && sudo apt-get install -y ripgrep', node: 'Install Node.js 20+ using the official distribution instructions at https://nodejs.org/en/download', codex: 'sudo npm install -g @openai/codex' });
+    const debian = checkReadiness({ distro: detectDistroFamily('linux', 'ID=debian\nVERSION_ID="12"'), rgOnPath: false, codexOnPath: false, nodeOnPath: false }).items.find((entry) => entry.id === 'harness-tools')!;
+    expect(debian.remedy?.match(/apt-get update/g)).toHaveLength(1);
+    expect(debian.remedy).not.toContain('apt-get install -y nodejs');
+    expect(`${debian.remedy} ${debian.evidence}`).toContain('https://nodejs.org');
+    expect(`${debian.remedy} ${debian.evidence}`).not.toContain('RFC-');
     expect(remediesFor('fedora')).toMatchObject({ rg: 'sudo dnf install -y ripgrep', node: 'sudo dnf install -y nodejs npm', codex: 'sudo npm install -g @openai/codex' });
     // AL2: 기본 저장소에 ripgrep·nodejs 가 없다 — 제3자 저장소를 자동으로 붙이지 않는다(이름만).
     expect(remediesFor('amzn2')?.rg).toBeUndefined();
@@ -63,6 +68,25 @@ describe('doctor-distro', () => {
     expect(remediesFor('amzn2')?.note).toContain('install them manually');
     expect(remediesFor('darwin')).toMatchObject({ rg: 'brew install ripgrep', node: 'brew install node', codex: 'npm install -g @openai/codex' });
     expect(remediesFor('unknown')).toBeUndefined();
+  });
+
+  test('toolInstallLine looks up the specified jq and ffmpeg lines without inventing unsupported remedies', () => {
+    expect(toolInstallLine('jq', 'darwin')).toBe('brew install jq');
+    expect(toolInstallLine('ffmpeg', 'darwin')).toBe('brew install ffmpeg');
+    expect(toolInstallLine('jq', 'debian')).toBe('sudo apt-get update && sudo apt-get install -y jq');
+    expect(toolInstallLine('ffmpeg', 'debian')).toBe('sudo apt-get update && sudo apt-get install -y ffmpeg');
+    expect(toolInstallLine('jq', 'fedora')).toBe('sudo dnf install -y jq');
+    expect(toolInstallLine('jq', 'amzn2023')).toBe('sudo dnf install -y jq');
+    expect(toolInstallLine('jq', 'amzn2')).toBe('sudo yum install -y jq');
+    expect(toolInstallLine('ffmpeg', 'fedora')).toBeUndefined();
+    expect(toolInstallLine('ffmpeg', 'amzn2023')).toBeUndefined();
+    expect(toolInstallLine('ffmpeg', 'amzn2')).toBeUndefined();
+    expect(toolInstallLine('rg', 'amzn2')).toBeUndefined();
+    expect(toolInstallLine('gh', 'darwin')).toBe('brew install gh');
+    expect(toolInstallLine('codex', 'debian')).toBe('sudo npm install -g @openai/codex');
+    for (const tool of ['gh', 'rg', 'node', 'codex', 'jq', 'ffmpeg'] as const) {
+      expect(toolInstallLine(tool, 'unknown')).toBeUndefined();
+    }
   });
 
   test('gh readiness follows the distro family when it was measured, and keeps the old default when it was not', () => {

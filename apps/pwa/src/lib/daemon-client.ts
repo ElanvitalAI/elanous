@@ -100,6 +100,8 @@ export interface DaemonTerminalSummary {
   status?: string;
   /** PTY metadata already serialized by GET /v1/terminals. */
   kind?: string;
+  /** 실행 명령. 데몬이 보유한 웹 셸은 `'web-terminal'` — 터미널 탭(XtermView)이 «붙을 수 있는» 유일한 종류다. */
+  cmd?: string;
   nickname?: string;
   /** Terminal creation requester serialized by current daemons; absent from legacy responses. */
   origin?: 'human' | 'system' | 'unknown';
@@ -737,6 +739,42 @@ export class DaemonClient {
     return this.fetchJson(`/v1/terminals/${safe}/scrollback?${query}`);
   }
 
+  /** 웹 터미널 실시간(`GET /v1/terminals/:id/stream` · SSE). 데몬이 가진 PTY 는 바이트, 남의 PTY 는 바뀐 화면만 온다.
+   *  연결이 안 되면(옛 데몬 404 · 네트워크) `onFail` — 호출자는 800ms 폴링으로 돌아간다. 반환값 = 끊기. */
+  streamTerminal(
+    id: string,
+    options: { sourceRoot?: string },
+    onEvent: (ev: import('./terminal-stream').TerminalStreamEvent) => void,
+    onFail: (reason: string) => void,
+  ): () => void {
+    const ac = new AbortController();
+    const q = options.sourceRoot ? `?sourceRoot=${encodeURIComponent(options.sourceRoot)}` : '';
+    const url = this.url(`/v1/terminals/${encodeURIComponent(id)}/stream${q}`);
+    void (async () => {
+      try {
+        const res = await fetch(url, { method: 'GET', headers: { accept: 'text/event-stream', ...this.authHeaders() }, signal: ac.signal });
+        if (res.status === 401) reportAuthRequired('/v1/terminals/stream');
+        if (!res.ok || !res.body) { onFail(`stream ${res.status}`); return; }
+        const { parseTerminalSse } = await import('./terminal-stream');
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const r = await reader.read();
+          if (r.done) break;
+          buf += dec.decode(r.value, { stream: true });
+          const parsed = parseTerminalSse(buf);
+          buf = parsed.rest;
+          for (const ev of parsed.events) onEvent(ev);
+        }
+      } catch (err) {
+        if (ac.signal.aborted) return;
+        onFail(err instanceof Error ? err.message : String(err));
+      }
+    })();
+    return () => { try { ac.abort(); } catch { /* swallow */ } };
+  }
+
   async snapshotTerminal(id: string, options: { ansi: boolean; sourceRoot?: string }): Promise<DaemonTerminalSnapshotResult> {
     return this.requestTerminalControl(id, { action: 'snapshot', ansi: options.ansi }, options);
   }
@@ -747,6 +785,11 @@ export class DaemonClient {
 
   async sendTerminalKey(id: string, key: string, options: DaemonTerminalDetailOptions = {}): Promise<DaemonTerminalControlResult> {
     return this.requestTerminalControl(id, { action: 'input-key', chars: key }, options);
+  }
+
+  /** 사람이 takeover 한 PTY 에 마우스(1 기반 셀 · 서버가 SGR 로 인코딩 · 앱이 마우스 모드가 아니면 거절 — 🅢 #21609). */
+  async sendTerminalMouse(id: string, mouse: { x: number; y: number; kind: 'click' | 'scroll-up' | 'scroll-down'; button?: 'left' | 'middle' | 'right' }, options: DaemonTerminalDetailOptions = {}): Promise<DaemonTerminalControlResult> {
+    return this.requestTerminalControl(id, { action: 'input-mouse', ...mouse }, options);
   }
 
   /** Request ownership control for a PTY. The daemon's five outcomes remain
@@ -761,7 +804,7 @@ export class DaemonClient {
 
   private async requestTerminalControl(
     id: string,
-    request: { action: 'takeover' | 'release' | 'snapshot' | 'input-text' | 'input-key'; ansi?: boolean; chars?: string },
+    request: { action: 'takeover' | 'release' | 'snapshot' | 'input-text' | 'input-key' | 'input-mouse'; ansi?: boolean; chars?: string; x?: number; y?: number; kind?: string; button?: string },
     options: DaemonTerminalDetailOptions = {},
   ): Promise<DaemonTerminalSnapshotResult> {
     const expectedStatus: Record<DaemonTerminalControlResult['status'], number> = {
@@ -1458,6 +1501,15 @@ export class DaemonClient {
   }
 }
 
+/** WebSocket error 의 사람 말 — 사유가 없는 이벤트에서 «언제·어디»만 적는다(토큰은 서브프로토콜이라 URL 에 없다). */
+export function describeSocketError(readyState: number, url: string): string {
+  let host = 'unknown-host';
+  try { host = new URL(url).host; } catch { /* 모르면 모른다 */ }
+  return readyState === 0
+    ? `socket error before open — daemon unreachable or refused (${host})`
+    : `socket error while open — connection dropped (${host})`;
+}
+
 class AcpConnectionImpl implements AcpConnection {
   private ws: WebSocket;
   private nextId = 1;
@@ -1496,15 +1548,17 @@ class AcpConnectionImpl implements AcpConnection {
     // is async-only and would silently drop synchronous JSON.parse).
     this.ws.binaryType = 'arraybuffer';
     this.ws.addEventListener('message', (ev) => this.onMessage(ev));
-    this.ws.addEventListener('error', (ev) => {
-      const error = new Error(`socket error: ${String(ev)}`);
+    this.ws.addEventListener('error', () => {
+      // 브라우저 WebSocket 의 error 이벤트는 사유를 싣지 않는다 — `String(ev)` 는 늘 «[object Event]» 였다(09-28 · 3시간 36줄).
+      // ⇒ 무엇을 가를 수 있는지만 적는다: «열기 전»(데몬에 못 닿음·거절) ↔ «연 뒤»(도중 끊김) ⊕ 어느 호스트.
+      const error = new Error(describeSocketError(this.ws.readyState, wsUrl));
       this.fail(error);
       // An error need not be followed promptly by close. Request transport
       // shutdown after rejecting readiness and all in-flight RPCs now.
       if (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN) {
         this.ws.close();
       }
-      debugLog('webterm.acp.error', { ev: String(ev) });
+      debugLog('webterm.acp.error', { reason: error.message });
     });
     this.ws.addEventListener('close', (ev) => {
       const closeDetail = ev.reason ? `: ${ev.reason}` : '';

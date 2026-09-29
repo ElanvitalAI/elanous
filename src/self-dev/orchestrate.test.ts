@@ -1,11 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 import { test, expect, describe } from 'bun:test';
-import { classifyFailure, classifyFailures, classifyResumeDisposition, hasDelivered, hasLanded, failureFromDeployFindings, formatShardHandoffInput, goalCauseObservedFromFailureClassification, withOrchestrateGoalKey, orchestrateSelfDev, queryPreflightWarning, resolveOrchestrateConcurrency, resumeKey, summarizeFailureKinds, summarizeResults, triageRun, triageActionFor } from './orchestrate.js';
+import { classifyFailure, classifyFailures, classifyResumeDisposition, dependencyOnMain, hasDelivered, hasLanded, failureFromDeployFindings, formatShardHandoffInput, goalCauseObservedFromFailureClassification, withOrchestrateGoalKey, orchestrateSelfDev, prMergedOnMain, queryPreflightWarning, resolveOrchestrateConcurrency, resumeKey, summarizeFailureKinds, summarizeResults, triageRun, triageActionFor } from './orchestrate.js';
 import type { SelfDevJobResult } from './orchestrate.js';
 import { parseRunShardIdentity } from '../self-implement/run-ledger.js';
 import type { WorkingMemoryEntry } from '../agent-substrate/working-memory-format.js';
 import { debug } from '../debug/log.js';
+import { decideNextRun } from './run-supervisor.js';
 import type { SelfImplementJobSpawn, SelfImplementJobDone } from '../task-orchestrator/surfaces/self-implement.js';
 import type { LogRecord } from '../mss/logging/record.js';
 
@@ -983,6 +984,298 @@ function makeOrderTrackingSpawn(delayMs = 5) {
   };
   return { spawn, completedAtSpawn, maxLive: () => maxLive };
 }
+
+describe('PR-completion dependency landing', () => {
+  test('default PR probe rejects merges into a non-main base, and only accepts merges into main', () => {
+    const pr = (state: string, baseRefName: string) => (number: number) => {
+      expect(number).toBe(1);
+      return JSON.stringify({ state, baseRefName });
+    };
+    expect(prMergedOnMain(1, pr('MERGED', 'feature/stack'))).toBe(false);
+    expect(prMergedOnMain(1, pr('OPEN', 'main'))).toBe(false);
+    expect(prMergedOnMain(1, pr('MERGED', 'main'))).toBe(true);
+    expect(dependencyOnMain({ stage: 'pr-opened', merged: false, prNumber: 1 }, {
+      prMerged: (number) => prMergedOnMain(number, pr('MERGED', 'feature/stack')),
+      commitOnMain: () => false,
+    })).toBe(false);
+  });
+
+  test('a parent PR merged into another branch does not launch its dependent', async () => {
+    const launches: string[] = [];
+    const results = await orchestrateSelfDev({
+      goals: [{ id: 'a', feature: 'A', openPr: true, autoMerge: false }, { id: 'b', feature: 'B', dependsOn: ['a'] }],
+      spawn: (input) => {
+        launches.push(input.feature.split('\n')[0]!);
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+          stage: 'pr-opened', merged: false, prNumber: 1,
+        } }) };
+      },
+      landingProbe: {
+        prMerged: (number) => prMergedOnMain(number, () => JSON.stringify({ state: 'MERGED', baseRefName: 'feature/stack' })),
+        commitOnMain: () => false,
+      },
+      emitDispatchDecision: () => true,
+    });
+    expect(launches).toEqual(['A']);
+    expect(results.find((result) => result.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 });
+  });
+
+  test('goals sharing only hotPaths are serialized but not blocked on an unlanded PR', async () => {
+    const launches: string[] = [];
+    const results = await orchestrateSelfDev({
+      goals: [
+        { id: 'a', feature: 'A', openPr: true, autoMerge: false, hotPaths: ['src/shared.ts'] },
+        { id: 'b', feature: 'B', hotPaths: ['src/shared.ts'] },
+      ],
+      spawn: (input) => {
+        launches.push(input.feature.split('\n')[0]!);
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+          stage: 'pr-opened', merged: false, prNumber: 1,
+        } }) };
+      },
+      landingProbe: { prMerged: () => false, commitOnMain: () => false },
+      emitDispatchDecision: () => true,
+    });
+    expect(launches).toEqual(['A', 'B']);
+    expect(results.find((result) => result.feature === 'B')?.blockReason).toBeUndefined();
+  });
+
+  test('merged disposition alone is not main landing evidence for a PR-completion parent', async () => {
+    const launches: string[] = [];
+    const results = await orchestrateSelfDev({
+      goals: [{ id: 'a', feature: 'A', openPr: true, autoMerge: false }, { id: 'b', feature: 'B', dependsOn: ['a'] }],
+      spawn: (input) => {
+        launches.push(input.feature.split('\n')[0]!);
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+          stage: 'merged', merged: true, prNumber: 1,
+        } }) };
+      },
+      landingProbe: { prMerged: (number) => prMergedOnMain(number, () => JSON.stringify({ state: 'MERGED', baseRefName: 'feature/stack' })), commitOnMain: () => false },
+      emitDispatchDecision: () => true,
+    });
+    expect(launches).toEqual(['A']);
+    expect(results.find((result) => result.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 });
+  });
+
+  test('PR merge or commit ancestry proves landing; an open PR alone does not', () => {
+    let merged = false;
+    const probe = { prMerged: () => merged, commitOnMain: (commit: string) => commit === 'ancestor' };
+    const parent = { prNumber: 1, stage: 'pr-opened', merged: false };
+    expect(dependencyOnMain(parent, probe)).toBe(false);
+    merged = true;
+    expect(dependencyOnMain(parent, probe)).toBe(true);
+    merged = false;
+    expect(dependencyOnMain({ ...parent, checkedHeadCommit: 'ancestor' }, probe)).toBe(true);
+    expect(dependencyOnMain({ ...parent, checkedHeadCommit: 'not-an-ancestor' }, probe)).toBe(false);
+    expect(dependencyOnMain({ ...parent, checkedHeadCommit: undefined }, probe)).toBe(false);
+    expect(dependencyOnMain({ ...parent, stage: 'merged', merged: true, checkedHeadCommit: undefined }, probe)).toBe(false);
+  });
+
+  test('fake graph blocks unmerged PR, checkpoints and reports it, then resumes after merge without re-opening parent', async () => {
+    const launches: string[] = [];
+    const checkpoints: SelfDevJobResult[][] = [];
+    const records: LogRecord[] = [];
+    let merged = false;
+    const off = debug.registerSink({ name: 'parent-landing-test', emit: (record) => {
+      if (record.category === 'self-dev.orchestrate' && (record.event === 'parent-unlanded' || record.event === 'done')) records.push(record);
+    } });
+    const goals = [
+      { id: 'a', feature: 'A', openPr: true, autoMerge: false },
+      { id: 'b', feature: 'B', dependsOn: ['a'], openPr: true, autoMerge: false },
+    ];
+    const spawn: SelfImplementJobSpawn = (input) => {
+      const feature = input.feature.split('\n')[0]!;
+      launches.push(feature);
+      return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+        stage: 'pr-opened', prNumber: 1, merged: false,
+      } }) };
+    };
+    const landingProbe = { prMerged: () => merged, commitOnMain: () => false };
+    const decisions: unknown[] = [];
+    try {
+      const first = await orchestrateSelfDev({ goals, spawn, landingProbe, checkpoint: (r) => checkpoints.push(r),
+        emitDispatchDecision: (event) => { decisions.push(event); return true; } });
+      expect(launches).toEqual(['A']);
+      expect(decisions).toEqual([expect.objectContaining({ kind: 'ESCALATE', what: '조각 B 대기', reason: '앞 조각 PR #1 이 main 에 없다', purpose: '없는 토대 위에 짓지 않는다', target: '사람(부모 승인·병합)', phase: 'dispatch', refs: { pr: 1 } })]);
+      expect(first.find((r) => r.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 });
+      expect(checkpoints.at(-1)!.find((r) => r.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 });
+      expect(records.find((r) => r.event === 'parent-unlanded')?.data).toMatchObject({ blockReason: 'parent-unlanded', parentPrNumber: 1, progress: '[supervisor] ⏸ 조각 B 대기 — 앞 조각 PR #1 미병합' });
+      expect(decideNextRun({ results: first })).toMatchObject({ action: 'stop', stopReason: 'needs-human', why: '[supervisor] ⏸ 조각 B 대기 — 앞 조각 PR #1 미병합' });
+      expect(summarizeFailureKinds(first).unclassified).toBe(summarizeFailureKinds(first.filter((r) => r.feature === 'A')).unclassified);
+      expect(triageRun(first).classifications).toContainEqual(expect.objectContaining({ kind: 'parent-unlanded', action: 'needs-human', errorCode: 'PARENT_UNLANDED' }));
+      expect((records.find((r) => r.event === 'done')!.data as { outcomes: unknown[] }).outcomes).toContainEqual(expect.objectContaining({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 }));
+      const waiting = await orchestrateSelfDev({ goals, spawn, landingProbe, resumeFrom: first,
+        emitDispatchDecision: () => true });
+      expect(launches).toEqual(['A']);
+      expect(waiting.find((r) => r.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 });
+      merged = true;
+      const second = await orchestrateSelfDev({ goals, spawn, landingProbe, resumeFrom: waiting });
+      expect(launches).toEqual(['A', 'B']);
+      expect(second.find((r) => r.feature === 'B')?.status).toBe('done');
+    } finally { off(); }
+  });
+
+  test('mixed settings: an unmerged parent blocks children that auto-merge or do not open a PR, then resumes after landing', async () => {
+    for (const childOptions of [{ autoMerge: true, openPr: true }, { autoMerge: false, openPr: false }]) {
+      const goals = [
+        { id: 'a', feature: 'A', openPr: true, autoMerge: false },
+        { id: 'b', feature: 'B', dependsOn: ['a'], ...childOptions },
+      ];
+      let merged = false;
+      const launches: string[] = [];
+      const decisions: unknown[] = [];
+      const spawn: SelfImplementJobSpawn = (input) => {
+        const feature = input.feature.split('\n')[0]!;
+        launches.push(feature);
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: feature === 'A'
+          ? { stage: 'pr-opened', prNumber: 1, merged: false }
+          : { stage: 'merged', merged: true } }) };
+      };
+      const landingProbe = { prMerged: () => merged, commitOnMain: () => false };
+      const first = await orchestrateSelfDev({ goals, spawn, landingProbe,
+        emitDispatchDecision: (event) => { decisions.push(event); return true; } });
+      expect(launches).toEqual(['A']);
+      expect(first.find((r) => r.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 });
+      expect(decisions).toEqual([expect.objectContaining({ kind: 'ESCALATE', refs: { pr: 1 }, phase: 'dispatch' })]);
+      merged = true;
+      const second = await orchestrateSelfDev({ goals, spawn, landingProbe, resumeFrom: first });
+      expect(launches).toEqual(['A', 'B']);
+      expect(second.find((r) => r.feature === 'B')?.status).toBe('done');
+    }
+  });
+
+  test('worktree-only parent without PR blocks a PR child; ancestry unlocks it on resume', async () => {
+    const launches: string[] = [];
+    const decisions: Array<{ reason: string; refs?: Readonly<Record<string, string | number>> }> = [];
+    const records: LogRecord[] = [];
+    const off = debug.registerSink({ name: 'worktree-parent-landing-test', emit: (record) => {
+      if (record.category === 'self-dev.orchestrate' && record.event === 'parent-unlanded') records.push(record);
+    } });
+    let onMain = false;
+    const goals = [
+      { id: 'a', feature: 'A', openPr: false },
+      { id: 'b', feature: 'B', dependsOn: ['a'], openPr: true, autoMerge: false },
+    ];
+    const spawn: SelfImplementJobSpawn = (input) => {
+      const feature = input.feature.split('\n')[0]!;
+      launches.push(feature);
+      return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: feature === 'A'
+        ? { stage: 'worktree-completed', checkedHeadCommit: 'ancestor' }
+        : { stage: 'merged', merged: true } }) };
+    };
+    const landingProbe = { prMerged: () => false, commitOnMain: (commit: string) => onMain && commit === 'ancestor' };
+    try {
+      const first = await orchestrateSelfDev({ goals, spawn, landingProbe,
+        emitDispatchDecision: (event) => { decisions.push(event); return true; } });
+      expect(launches).toEqual(['A']);
+      expect(first.find((r) => r.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded' });
+      expect(first.find((r) => r.feature === 'B')?.parentPrNumber).toBeUndefined();
+      expect(first.find((r) => r.feature === 'B')?.parentNoPr).toBe(true);
+      expect(records[0]?.data).toMatchObject({ progress: '[supervisor] ⏸ 조각 B 대기 — 앞 조각 커밋 main 미착지', parentPrNumber: null, parentNoPr: true });
+      expect(decisions).toEqual([expect.objectContaining({ reason: '앞 조각 커밋이 main 에 없다' })]);
+      expect(decisions[0]?.refs).toBeUndefined();
+      expect(decideNextRun({ results: first }).why).toBe('[supervisor] ⏸ 조각 B 대기 — 앞 조각 커밋 main 미착지');
+      onMain = true;
+      const second = await orchestrateSelfDev({ goals, spawn, landingProbe, resumeFrom: first });
+      expect(launches).toEqual(['A', 'B']);
+      expect(second.find((r) => r.feature === 'B')?.status).toBe('done');
+    } finally { off(); }
+  });
+
+  test('an auto-merge parent that actually leaves an unmerged PR still blocks a non-PR child', async () => {
+    const launches: string[] = [];
+    const results = await orchestrateSelfDev({
+      goals: [
+        { id: 'a', feature: 'A', openPr: true, autoMerge: true },
+        { id: 'b', feature: 'B', dependsOn: ['a'], openPr: false },
+      ],
+      spawn: (input) => {
+        const feature = input.feature.split('\n')[0]!;
+        launches.push(feature);
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+          stage: 'pr-opened', prNumber: 1, merged: false,
+        } }) };
+      },
+      landingProbe: { prMerged: () => false, commitOnMain: () => false },
+      emitDispatchDecision: () => true,
+    });
+    expect(launches).toEqual(['A']);
+    expect(results.find((r) => r.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 1 });
+  });
+
+  test('missing PR number remains unknown and is never invented in an escalation ref', async () => {
+    const decisions: Array<{ refs?: Readonly<Record<string, string | number>> }> = [];
+    const result = await orchestrateSelfDev({
+      goals: [
+        { id: 'a', feature: 'A', openPr: true },
+        { id: 'b', feature: 'B', dependsOn: ['a'], openPr: true },
+      ],
+      spawn: (input) => ({ address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: { stage: 'pr-opened', merged: false } }) }),
+      landingProbe: { prMerged: () => false, commitOnMain: () => false },
+      emitDispatchDecision: (event) => { decisions.push(event); return true; },
+    });
+    expect(result.find((entry) => entry.feature === 'B')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded' });
+    expect(result.find((entry) => entry.feature === 'B')?.parentPrNumber).toBeUndefined();
+    expect(decisions[0]?.refs).toBeUndefined();
+    expect(decisions[0]).toMatchObject({ reason: '앞 조각 PR 번호를 알 수 없고 main 착지가 확인되지 않았다' });
+  });
+
+  test('two upstream PRs must both be merged before the dependent starts', async () => {
+    const launches: string[] = [];
+    const goals = [
+      { id: 'a', feature: 'A', openPr: true, autoMerge: false },
+      { id: 'b', feature: 'B', openPr: true, autoMerge: false },
+      { id: 'c', feature: 'C', dependsOn: ['a', 'b'], openPr: true, autoMerge: false },
+    ];
+    const spawn: SelfImplementJobSpawn = (input) => {
+      const feature = input.feature.split('\n')[0]!;
+      launches.push(feature);
+      return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+        stage: 'pr-opened', merged: false, prNumber: feature === 'A' ? 1 : 2,
+      } }) };
+    };
+    const first = await orchestrateSelfDev({ goals, spawn, landingProbe: { prMerged: (n) => n === 1, commitOnMain: () => false },
+      emitDispatchDecision: () => true });
+    expect(new Set(launches)).toEqual(new Set(['A', 'B']));
+    expect(first.find((r) => r.feature === 'C')).toMatchObject({ status: 'blocked', blockReason: 'parent-unlanded', parentPrNumber: 2 });
+    const second = await orchestrateSelfDev({ goals, spawn, resumeFrom: first, landingProbe: { prMerged: () => true, commitOnMain: () => false } });
+    expect(launches).toHaveLength(3);
+    expect(launches[2]).toBe('C');
+    expect(second.find((r) => r.feature === 'C')?.status).toBe('done');
+  });
+
+  test('a child starts when its parent commit is on origin/main even if the PR remains open', async () => {
+    const launches: string[] = [];
+    const results = await orchestrateSelfDev({
+      goals: [
+        { id: 'a', feature: 'A', openPr: true, autoMerge: false },
+        { id: 'b', feature: 'B', dependsOn: ['a'], openPr: true, autoMerge: false },
+      ],
+      spawn: (input) => {
+        const name = input.feature.split('\n')[0]!;
+        launches.push(name);
+        return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '', disposition: {
+          stage: 'pr-opened', merged: false, prNumber: 1, checkedHeadCommit: 'ancestor',
+        } }) };
+      },
+      landingProbe: { prMerged: () => false, commitOnMain: (commit) => commit === 'ancestor' },
+    });
+    expect(launches).toEqual(['A', 'B']);
+    expect(results.find((result) => result.feature === 'A')?.checkedHeadCommit).toBe('ancestor');
+    expect(results.find((result) => result.feature === 'B')?.status).toBe('done');
+  });
+
+  test('default auto-merge schedule remains A then B without consulting the PR probe', async () => {
+    const { spawn, completedAtSpawn } = makeOrderTrackingSpawn();
+    const results = await orchestrateSelfDev({
+      goals: [{ id: 'a', feature: 'A', autoMerge: true, openPr: true }, { id: 'b', feature: 'B', dependsOn: ['a'], autoMerge: true, openPr: true }],
+      spawn,
+      landingProbe: { prMerged: () => { throw new Error('default schedule queried PR'); }, commitOnMain: () => { throw new Error('default schedule queried ancestry'); } },
+    });
+    expect(results.map((result) => result.status)).toEqual(['done', 'done']);
+    expect(completedAtSpawn.get('B')).toContain('A');
+  });
+});
 
 describe('orchestrateSelfDev — S2 dependency DAG + hot-file serialization', () => {
   test('dependent goal starts only after its dependency completes', async () => {

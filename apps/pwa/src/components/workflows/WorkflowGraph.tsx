@@ -45,6 +45,7 @@ import {
   clearLayout as defClearLayout,
   definitionToYaml,
   deleteNode as defDeleteNode,
+  nextFreeNodeId,
   duplicateNode as defDuplicateNode,
   removeEdge as defRemoveEdge,
   safeParseWorkflowYaml,
@@ -58,6 +59,7 @@ import {
 } from './run-status-helpers';
 import { nodeStatusClass } from './node-status-class';
 import type { ValidationIssue } from './validation-helpers';
+import type { GraphKindEntry } from '@/nexus/client';
 
 // Lazy parse: yaml has its own bundle cost so we only import on first
 // use. Returns the parsed definition or null on failure.
@@ -75,6 +77,8 @@ async function safeParseYaml(yaml: string): Promise<WorkflowDefinitionLike | nul
 }
 
 interface WorkflowGraphProps {
+  /** Server vocabulary, shared with the editor header. */
+  palette?: GraphKindEntry[];
   /** Raw YAML text. Re-parsed on change. */
   yaml: string;
   /** Optional pre-parsed definition. When set, takes precedence over
@@ -146,6 +150,7 @@ const VARIANT_COLOR: Record<NodeVariant, string> = {
 };
 
 export function WorkflowGraph({
+  palette,
   yaml,
   definition,
   editable,
@@ -356,6 +361,11 @@ export function WorkflowGraph({
     },
     [mutate],
   );
+  const onAddPaletteNode = useCallback((entry: GraphKindEntry) => {
+    mutate((def) => entry.core
+      ? defAddNode(def, entry.kind as NodeVariant)
+      : { ...def, nodes: [...def.nodes, { id: nextFreeNodeId(def, 'unknown'), kind: entry.kind, inputs: {} }] });
+  }, [mutate]);
 
   // Tier E3.2 (2026-05-11) — keyboard shortcuts. Skipped entirely
   // when not editable so a read-only viewer doesn't accidentally
@@ -436,7 +446,7 @@ export function WorkflowGraph({
     // they have to fork the YAML.
     return (
       <div className="relative flex h-full items-center justify-center text-[11px] text-text-tertiary">
-        {editable && <NodePalette onAdd={(v) => mutate((def) => defAddNode(def, v))} />}
+        {editable && <NodePalette palette={palette} onAdd={onAddPaletteNode} />}
         {editable
           ? 'No nodes yet — pick a variant from the palette.'
           : 'No nodes yet — switch to YAML view to add one.'}
@@ -446,7 +456,7 @@ export function WorkflowGraph({
 
   return (
     <div className="relative h-full w-full">
-      {editable && <NodePalette onAdd={(v) => mutate((def) => defAddNode(def, v))} />}
+      {editable && <NodePalette palette={palette} onAdd={onAddPaletteNode} />}
       {editable && (
         <TidyUpButton
           onTidy={() => mutate((def) => defClearLayout(def))}
@@ -494,7 +504,7 @@ export function WorkflowGraph({
 
 /** Floating palette of variant buttons. Click → add a new node of
  *  that variant via the consumer's mutate callback. */
-function NodePalette({ onAdd }: { onAdd: (variant: NodeVariant) => void }) {
+function NodePalette({ palette, onAdd }: { palette?: GraphKindEntry[]; onAdd: (entry: GraphKindEntry) => void }) {
   const variants: { v: NodeVariant; label: string }[] = [
     { v: 'prompt', label: '+ prompt' },
     { v: 'bash', label: '+ bash' },
@@ -517,15 +527,17 @@ function NodePalette({ onAdd }: { onAdd: (variant: NodeVariant) => void }) {
     <div
       className="absolute left-3 top-3 z-10 flex flex-col gap-1 rounded-md border border-border bg-surface-elevated p-1 shadow-md"
     >
-      {variants.map(({ v, label }) => (
+      {(palette ?? variants.map(({ v }) => ({ graph: 'workflow' as const, kind: v, core: true, plugin: null, description: '' })))
+        .map((entry) => (
         <button
-          key={v}
+          key={entry.kind}
           type="button"
-          onClick={() => onAdd(v)}
+          onClick={() => onAdd(entry)}
           className="rounded px-2 py-0.5 text-left text-[10px] text-text-tertiary transition-colors hover:bg-surface hover:text-text-primary"
           style={{ minWidth: 80 }}
         >
-          {label}
+          {variants.find(({ v }) => v === entry.kind)?.label ?? `+ ${entry.kind}`}
+          {entry.plugin && <span className="ml-1 rounded bg-accent/15 px-1 text-accent">{entry.plugin}</span>}
         </button>
       ))}
     </div>

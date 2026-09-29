@@ -37,6 +37,19 @@ describe('llmDecomposeSteps', () => {
     }
   });
 
+  test('passes the generator rationale to the optional observer without changing titles or failure behavior', async () => {
+    const callable: DecomposeCallable = async () => ({ text: validProposal });
+    const rationales: string[] = [];
+    expect(await llmDecomposeSteps('로그인 기능 추가', callable, { onRationale: (reason) => rationales.push(reason) }))
+      .toEqual(['스키마 정의', '핸들러 구현', '테스트 추가']);
+    expect(rationales).toEqual(['세 단계로 나눠 스키마→구현→테스트 순으로 진행.']);
+    expect(await llmDecomposeSteps('로그인 기능 추가', callable, { onRationale: () => { throw new Error('observer down'); } }))
+      .toEqual(['스키마 정의', '핸들러 구현', '테스트 추가']);
+    expect(await llmDecomposeSteps('로그인 기능 추가', async () => ({ text: 'invalid' }), { onRationale: (reason) => rationales.push(reason) }))
+      .toEqual([]);
+    expect(rationales).toHaveLength(1);
+  });
+
   test('garbage(파싱 실패·2라운드) → [] (fail-soft)', async () => {
     const callable: DecomposeCallable = async () => ({ text: '이건 JSON 이 아님' });
     const steps = await llmDecomposeSteps('뭔가 해줘', callable);

@@ -65,7 +65,7 @@ export function AutopilotPanel() {
         <FabricStageHeader active="autopilot" />
       </div>
       <div className="mb-3 space-y-2">
-        <h1 className="text-lg font-semibold">Autopilot <span className="text-sm font-normal text-muted-foreground">미션 지휘 센터</span></h1>
+        <h1 className="text-lg font-semibold">Missions <span className="text-sm font-normal text-muted-foreground">미션 지휘 센터 · Autopilot</span></h1>
         <p className="text-sm text-muted-foreground">미션(사람 + 자율)의 계보·상태·자율행동. 아래 &ldquo;골 던지기&rdquo; 또는 텔레그램 &ldquo;미션:&rdquo; 마커로 소망을 던지면 미션이 됩니다.</p>
         <ArmingBanner arming={arming} />
       </div>

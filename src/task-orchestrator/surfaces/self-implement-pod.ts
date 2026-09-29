@@ -51,8 +51,10 @@ import { authStorePath } from '../../oauth/store.js';
 import { grokAuthFilePath, resolveGrokCredential } from '../../grok/credential.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { resolveHostId } from '../../platform/host-id.js';
+import { envLiteral } from '../../platform/env-literal.js';
 import { LLM_TIER_MAP_BY_PROVIDER, lookupLlmTierSpec, type LlmTierProvider } from '../../model-tier/llm-tier-map.js';
 import { parseSelfImplementJson, type SelfImplementJobDone, type SelfImplementJobSpawn } from './self-implement.js';
+import { codexQuotaPolicyFromConfig } from '../../oauth/codex-account-store.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
 
@@ -132,7 +134,7 @@ export function hostCredentials(account: string, storePath: string = authStorePa
   // ⭐ 기본 계정은 정본 키가 `openai-codex`(이름 없음)이고 홈을 안 적는다 — 기본 위치로 푼다(회전 후보와 같은 해석).
   const storeKey = account === 'default' ? 'openai-codex' : `openai-codex:${account}`;
   const entry = store.providers[storeKey] as { tokens: Record<string, unknown>; lastRefresh?: string; authMode?: string; codexHome?: string } | undefined;
-  const codexHome = entry?.codexHome ?? (entry && account === 'default' ? resolveCodexAccount({ CODEX_HOME: process.env.CODEX_HOME }).home : undefined);
+  const codexHome = entry?.codexHome ?? (entry && account === 'default' ? resolveCodexAccount(envLiteral({ CODEX_HOME: process.env.CODEX_HOME })).home : undefined);
   if (!entry || !codexHome) throw new Error(`${storeKey} 계정이 없거나 codexHome 을 모른다`);
   const codex = JSON.parse(readFileSync(join(codexHome, 'auth.json'), 'utf8')) as { tokens: Record<string, unknown> };
   const access = String(codex.tokens.access_token ?? '');
@@ -261,14 +263,20 @@ done
 echo "[gate] ISOLATION NOT ENFORCED within 30s"; exit 1`;
 
 /** Only the allocated account is active; each candidate has its own read-only Secret files and writable Codex home. */
+/** The host's codex quota policy, exported into the Pod so the child rotates onto credits like the host does. */
+function podQuotaPolicyExport(policy: string = codexQuotaPolicyFromConfig()): string {
+  return `export ELANOUS_CODEX_QUOTA_POLICY='${policy.replace(/[^a-z-]/g, '')}'`;
+}
+
 function podCodexAccountScript(accounts: readonly string[]): string {
   if (!accounts.length || new Set(accounts).size !== accounts.length || accounts.some((name) => !isValidAccountName(name))) throw new Error('pod: 유효하고 서로 다른 codex 계정이 필요하다');
   return [
     'mkdir -p "$HOME/.elanous" "$HOME/.codex"',
     // Names travel as JSON data, never as shell syntax. Reconstruct the account-store keys that elanous resolves at runtime.
-    `POD_CODEX_ACCOUNTS='${JSON.stringify(accounts)}' bun -e 'const fs=require("node:fs"),path=require("node:path");const names=JSON.parse(process.env.POD_CODEX_ACCOUNTS),home=process.env.HOME;const providers={};let version;for(let i=0;i<names.length;i++){const payload=JSON.parse(fs.readFileSync("/creds/codex-"+i+".json","utf8"));const row=JSON.parse(payload.elanousAuth);if(i===0)version=row.version;const entry=row.providers["openai-codex"];if(!entry)throw Error("missing codex account credential "+i);const codexHome=path.join(home,".elanous/codex-accounts",String(i));fs.mkdirSync(codexHome,{recursive:true});fs.writeFileSync(path.join(codexHome,"auth.json"),payload.codexAuth,{mode:0o600});fs.chmodSync(path.join(codexHome,"auth.json"),0o600);providers[names[i]==="default"?"openai-codex":"openai-codex:"+names[i]]={...entry,codexHome}}fs.writeFileSync(path.join(home,".elanous/auth.json"),JSON.stringify({version,providers}),{mode:0o600});fs.chmodSync(path.join(home,".elanous/auth.json"),0o600);fs.copyFileSync(path.join(home,".elanous/codex-accounts/0/auth.json"),path.join(home,".codex/auth.json"));fs.chmodSync(path.join(home,".codex/auth.json"),0o600)' || exit 5`,
+    `POD_CODEX_ACCOUNTS='${JSON.stringify(accounts)}' bun -e 'const fs=require("node:fs"),path=require("node:path");const names=JSON.parse(process.env.POD_CODEX_ACCOUNTS),home=process.env.HOME;const providers={};let version;for(let i=0;i<names.length;i++){const payload=JSON.parse(fs.readFileSync("/creds/codex-"+i+".json","utf8"));const row=JSON.parse(payload.elanousAuth);if(i===0)version=row.version;const entry=row.providers["openai-codex"];if(!entry)throw Error("missing codex account credential "+i);const codexHome=path.join(home,".elanous/codex-accounts",String(i));fs.mkdirSync(codexHome,{recursive:true});fs.writeFileSync(path.join(codexHome,"auth.json"),payload.codexAuth,{mode:0o600});fs.chmodSync(path.join(codexHome,"auth.json"),0o600);providers[names[i]==="default"?"openai-codex":"openai-codex:"+names[i]]={...entry,codexHome}}if(!providers["openai-codex"])providers["openai-codex"]=providers["openai-codex:"+names[0]];fs.writeFileSync(path.join(home,".elanous/auth.json"),JSON.stringify({version,providers}),{mode:0o600});fs.chmodSync(path.join(home,".elanous/auth.json"),0o600);fs.copyFileSync(path.join(home,".elanous/codex-accounts/0/auth.json"),path.join(home,".codex/auth.json"));fs.chmodSync(path.join(home,".codex/auth.json"),0o600)' || exit 5`,
     `export ELANOUS_CODEX_ACCOUNT='${accounts[0]!.replace(/'/g, `'\\''`)}'`,
     'export ELANOUS_CODEX_ACCOUNT_HOME="$HOME/.elanous/codex-accounts/0" CODEX_HOME="$HOME/.elanous/codex-accounts/0"',
+    podQuotaPolicyExport(),
   ].join('\n');
 }
 
@@ -342,7 +350,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
       ? 'mkdir -p ~/.grok && install -m 600 /creds/grok-auth.json ~/.grok/auth.json && export ELANOUS_LLM_PROVIDER=grok'
       : o.grokCredential === 'api_key'
         ? 'mkdir -p ~/.grok && install -m 600 /creds/grok-api-key ~/.grok/api-key && export XAI_API_KEY="$(cat ~/.grok/api-key)" && export ELANOUS_LLM_PROVIDER=grok'
-        : o.codexAccounts ? podCodexAccountScript(o.codexAccounts) : 'mkdir -p ~/.elanous ~/.codex && cp /creds/elanous-auth.json ~/.elanous/auth.json && cp /creds/codex-auth.json ~/.codex/auth.json && chmod 600 ~/.elanous/auth.json ~/.codex/auth.json',
+        : o.codexAccounts ? podCodexAccountScript(o.codexAccounts) : `mkdir -p ~/.elanous ~/.codex && cp /creds/elanous-auth.json ~/.elanous/auth.json && cp /creds/codex-auth.json ~/.codex/auth.json && chmod 600 ~/.elanous/auth.json ~/.codex/auth.json\n${podQuotaPolicyExport()}`,
     'export GH_TOKEN="$(cat /creds/gh-token)"',
     // 🔑 스킬 키(.env) — 이미지엔 없다. 이 런의 Secret 에서 각 스킬 폴더로 0600 복사(값은 로그에 안 나온다).
     ...(o.skillEnvs?.length ? [`for n in ${o.skillEnvs.join(' ')}; do [ -d ~/.claude/skills/$n ] && install -m 600 /creds/skillenv-$n ~/.claude/skills/$n/.env; done; echo "[pod] skill env: ${o.skillEnvs.join(',')}"`] : []),
@@ -352,6 +360,8 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     ...(goalPath ? [
       `mkdir -p -- "$(dirname -- ${goalPath})" && cp -- /creds/goal-doc ${goalPath} || exit 6`,
     ] : []),
+    // Only fixed command shapes leave the Pod; arbitrary argv (including shell -c text) is never emitted.
+    `(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, "%25", s); gsub(/:/, "%3A", s); gsub(/ /, "%20", s); gsub(/\\t/, "%09", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, ""); n=split($0, a, /[[:space:]]+/); cmd="<redacted>"; if (name=="sleep" && a[2]=="30") cmd="sleep 30" (n>2 ? " <redacted>" : ""); else if (name=="bun") { cmd="bun <redacted>"; if (a[2]=="test") cmd="bun test <redacted>"; else if (a[2]=="run") cmd="bun run <redacted>"; else if ((a[2]=="x" || a[2]=="exec") && a[3]=="tsc") cmd="bun x tsc <redacted>" } else if (name=="tsc") cmd="tsc <redacted>"; else if (name=="elanous") { cmd="elanous <redacted>"; if (a[2]=="self") cmd="elanous self <redacted>"; else if (a[2]=="harness") cmd="elanous harness <redacted>" } else if (name=="node") cmd="node <redacted>"; if (name=="sleep" && cmd=="<redacted>") cmd="sleep <redacted>"; else if (cmd=="<redacted>" && name!="bash" && name!="sh") name="other"; printf " %s:%s:%s", rss, encode(name), encode(substr(cmd,1,120)) }'); printf "ELANOUS_MEM %s %s%s\\n" "$(date +%s)" "$mem" "$top"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!`,
     // 마지막 줄 JSON 이 «맨 끝»이어야 한다(parseSelfImplementJson) — rollup 은 그 앞에.
     goalPath
       ? `elanous harness ask ${goalPath} --json${quotedAsk} > /tmp/si.out 2>&1; rc=$?; bun -e 'const fs=require("fs");const p="/tmp/si.out";const s=fs.readFileSync(p,"utf8");const line=s.trimEnd().split("\\n").at(-1);try{const o=JSON.parse(line);if(o.kind==="self"&&o.result&&typeof o.result==="object")fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n")}catch{}'`
@@ -411,6 +421,8 @@ for ledger in "\${ELANOUS_STATE_DIR:-$HOME/.elanous}"/run-ledger/*.jsonl; do
   fi
 done
 if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
+    'kill "$mem_sampler_pid" 2>/dev/null || true',
+    'wait "$mem_sampler_pid" 2>/dev/null || true',
     'tail -n 1 /tmp/si.out',
     podSalvageScript(),
     'exit $rc',
@@ -526,7 +538,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
       try {
       if (!context) return { exitCode: 1, output: '', error: { code: 'pod-context', message: 'Pod Job context를 확인할 수 없다' } };
       const cleanupSecret = () => { kubectl(['-n', namespace, 'delete', 'secret', `${name}-creds`, '--ignore-not-found']); };
-      const collectFullLogs = (unavailableEvent: string, replace?: ReadonlySet<string>, onEvent?: (event: string, data: Record<string, unknown>) => void, childId?: string): { status: 'ok' | 'unavailable' | 'incomplete'; childLedgerIncomplete: boolean } => {
+      const collectFullLogs = (unavailableEvent: string, replace?: ReadonlySet<string>, onEvent?: (event: string, data: Record<string, unknown>) => void, childId?: string): { status: 'ok' | 'unavailable' | 'incomplete'; childLedgerIncomplete: boolean; samples: ReturnType<typeof parseMemSamples> } => {
         let full: ReturnType<Kubectl>;
         try {
           full = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child']);
@@ -534,7 +546,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           if (!full.stdout && unavailableEvent === 'failed-job-logs-unavailable') throw new Error('empty child logs');
         } catch (error) {
           debug.log('self-implement.pod', unavailableEvent, { job: name, reason: error instanceof Error ? error.message : String(error) });
-          return { status: 'unavailable', childLedgerIncomplete: false };
+          return { status: 'unavailable', childLedgerIncomplete: false, samples: [] };
         }
         let ledgerIncomplete = false;
         let childLedgerIncomplete = false;
@@ -554,7 +566,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           collectPodArtifacts(full.stdout, { dir: join(effectiveInstanceRoot(), 'pod-artifacts'), job: name, log: record });
         }
         catch (error) { record('self-implement.pod', 'artifact-collect-incomplete', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
-        return { status: ledgerIncomplete || artifactIncomplete ? 'incomplete' : 'ok', childLedgerIncomplete };
+        return { status: ledgerIncomplete || artifactIncomplete ? 'incomplete' : 'ok', childLedgerIncomplete, samples: parseMemSamples(full.stdout) };
       };
       let retryAccount: string | undefined;
       let failedAccount: string | undefined;
@@ -820,13 +832,29 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           try { follower?.poll(); } catch (e) { debug.log('self-implement.pod', 'ledger-live-unavailable', { job: name, reason: e instanceof Error ? e.message : String(e) }); }
           await sleep(options.pollMs ?? 15_000);
         }
-        const logs = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child', '--tail=400']).stdout;
+        let logs = '';
+        let logTailReason: string | undefined;
+        try {
+          const fetched = kubectl(['-n', namespace, 'logs', `job/${name}`, '-c', 'child', '--tail=400']);
+          if (fetched.status !== 0) logTailReason = fetched.stderr.trim() || `kubectl logs exited ${fetched.status}`;
+          else if (!fetched.stdout) logTailReason = 'empty child logs';
+          else logs = fetched.stdout;
+        } catch (error) { logTailReason = error instanceof Error ? error.message : String(error); }
         let ledgerReason = '';
         let ledgerCollected = false;
         const collection = collectFullLogs('ledger-collect-incomplete', follower.owned ? new Set([liveChildRunId]) : undefined, (event, data) => {
           if ((event === 'ledger-collect-incomplete' || event === 'ledger-collect-skipped') && (data.runId === liveChildRunId || !data.runId)) ledgerReason = String(data.reason);
           if ((event === 'ledger-collected' || event === 'ledger-collect-already-complete') && data.runId === liveChildRunId) ledgerCollected = true;
         }, liveChildRunId);
+        const samples = collection.status === 'unavailable' ? parseMemSamples(logs) : collection.samples;
+        if (state === 'failed' && containerReason === 'OOMKilled') {
+          // 자식 stdout 원문은 싣지 않는다 — 임의 출력에 든 비밀이 진단 경로로 새지 않도록 «모양»(줄·바이트)만 남긴다.
+          const childLines = logs ? logs.replace(/\n$/, '').split('\n').filter((line) => !line.startsWith('ELANOUS_MEM ')) : [];
+          const logShape = logs ? { lines: childLines.length, bytes: Buffer.byteLength(childLines.join('\n')) } : null;
+          debug.log('self-implement.pod', 'oom-evidence', { job: name, memoryLimit, samples: samples.slice(-3), logShape, ...(logShape === null ? { logTailReason: logTailReason ?? 'empty child logs' } : {}) }, { compact: { maxDepth: 6 } });
+        } else if (state === 'complete') {
+          debug.log('self-implement.pod', 'memory-last', { job: name, sample: samples.at(-1) ?? null }, { compact: { maxDepth: 6 } });
+        }
         const ledgerExists = existsSync(runLedgerPath(liveChildRunId, ledgerDir));
         const ledgerCompleteness = collection.childLedgerIncomplete || (follower.owned && !ledgerCollected) ? 'incomplete' : ledgerCollected ? 'complete' : 'missing';
         if (ledgerCompleteness === 'incomplete' || (state !== 'complete' && !ledgerExists)) {
@@ -892,7 +920,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           catch (error) { debug.log('self-implement.pod', 'goal-record-unavailable', { job: name, childRunId: liveChildRunId, reason: error instanceof Error ? error.message : String(error) }); }
         }
         debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, ledgerCompleteness });
-        const tail = podRunResultLine(logs.slice(-4000), salvage);
+        const tail = podRunResultLine(logs, salvage);
         if (state === 'aborted') return { exitCode: null, output: tail, error: { code: 'aborted', message: 'aborted — Job deleted' }, ...(disposition ? { disposition } : {}) };
         const deadlineExceeded = state === 'failed' && failedReason === 'DeadlineExceeded';
         const deadlineSeconds = options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS;
@@ -915,7 +943,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             ? { error: { code: 'pod-deadline-exceeded', message: `Job ${name} 이 수명 상한 ${deadlineSeconds}초에 닿았다` } }
             : state === 'failed'
               ? containerReason === 'OOMKilled'
-                ? { error: { code: 'pod-oom-killed', message: `Job ${name} failed (OOMKilled/${containerExitCode ?? 'unknown'}, memoryLimit=${memoryLimit})` } }
+                ? { error: { code: 'pod-oom-killed', message: `Job ${name} failed (OOMKilled/${containerExitCode ?? 'unknown'}, memoryLimit=${memoryLimit})\n${formatLastMemSample(samples.at(-1))}` } }
                 : { error: { code: 'pod-job-failed', message: `Job ${name} failed${failedReason || containerReason ? ` (${[failedReason, containerReason ? `container=${containerReason}/${containerExitCode ?? 'unknown'}` : ''].filter(Boolean).join(', ')})` : ''}` } }
               : {}),
           ...(finishedDisposition ? { disposition: finishedDisposition } : {}),
@@ -979,10 +1007,41 @@ export function recordPodSalvage(logs: string, job: string, log: (category: stri
 }
 
 /** 사람용 런 결과 한 줄 — 수확 브랜치가 있으면 «수확할 브랜치: …» 를 붙인다. */
-export function podRunResultLine(tail: string, branches: readonly string[]): string {
-  if (!branches.length) return tail;
+export function podRunResultLine(logs: string, branches: readonly string[]): string {
+  const result = logs.split('\n').filter((line) => !line.startsWith('ELANOUS_MEM ')).join('\n').slice(-4000);
+  if (!branches.length) return result;
   const note = branches.map((branch) => `수확할 브랜치: ${branch}`).join('\n');
-  return tail ? `${tail}\n${note}` : note;
+  return result ? `${result}\n${note}` : note;
+}
+
+export function parseMemSamples(logs: string): Array<{ at: number; cgroupBytes: number | null; top: Array<{ rssKb: number; name: string; cmd?: string }> }> {
+  const samples: Array<{ at: number; cgroupBytes: number | null; top: Array<{ rssKb: number; name: string; cmd?: string }> }> = [];
+  for (const line of logs.split('\n')) {
+    const match = /^ELANOUS_MEM (\d+) (\d+|-)(?: (.*))?\r?$/.exec(line);
+    if (!match) continue;
+    const at = Number(match[1]);
+    const cgroupBytes = match[2] === '-' ? null : Number(match[2]);
+    if (!Number.isSafeInteger(at) || (cgroupBytes !== null && !Number.isSafeInteger(cgroupBytes))) continue;
+    const top: Array<{ rssKb: number; name: string; cmd?: string }> = [];
+    let valid = true;
+    for (const token of (match[3] ?? '').split(' ').filter(Boolean)) {
+      const entry = /^(\d+):([^\s:]+)(?::([^\s:]+))?$/.exec(token);
+      if (!entry || !Number.isSafeInteger(Number(entry[1])) || top.length >= 5) { valid = false; break; }
+      let name: string;
+      let cmd: string | undefined;
+      try { name = decodeURIComponent(entry[2]!); if (entry[3] !== undefined) cmd = decodeURIComponent(entry[3]); }
+      catch { valid = false; break; }
+      top.push({ rssKb: Number(entry[1]), name, ...(cmd !== undefined ? { cmd } : {}) });
+    }
+    if (valid) samples.push({ at, cgroupBytes, top });
+  }
+  return samples;
+}
+
+function formatLastMemSample(sample: ReturnType<typeof parseMemSamples>[number] | undefined): string {
+  if (!sample) return '마지막 샘플: 샘플 없음';
+  const gib = (bytes: number) => `${(bytes / 1024 ** 3).toFixed(2)}GiB`;
+  return `마지막 샘플: cgroup ${sample.cgroupBytes === null ? '-' : gib(sample.cgroupBytes)} · 상위 ${sample.top.length ? sample.top.map((p) => `${p.name} ${gib(p.rssKb * 1024)}`).join(' · ') : '없음'}`;
 }
 
 export function reemitPodUsage(logs: string, job: string, log: (category: string, event: string, data: Record<string, unknown>) => void = (c, e, d) => debug.log(c, e, d), reprice?: PodRowReprice): number {
@@ -1008,7 +1067,7 @@ export function reemitPodUsage(logs: string, job: string, log: (category: string
 /** 이 기계가 Pod 칸을 쓸 수 있나(클러스터 · 이미지) — 발사 전 한 번. */
 export function podSubstrateReady(kubectl: Kubectl = defaultKubectl, image = 'elanous-harness:local'): { ok: boolean; reason: string } {
   const ctx = kubectl(['config', 'current-context']);
-  if (ctx.status !== 0) return { ok: false, reason: 'kubectl context 없음 — k3d cluster create elanous-h1 --no-lb' };
+  if (ctx.status !== 0) return { ok: false, reason: 'kubectl context 없음 — k3d cluster create elanous-h1 --no-lb (이미 있는 k3d 클러스터면 kubectl config use-context k3d-<이름>)' };
   const ns = kubectl(['get', 'ns', 'elanous-test']);
   if (ns.status !== 0) return { ok: false, reason: 'elanous-test 네임스페이스 없음 — kubectl apply -f docker/h1/base.yaml -f docker/h1/policy-internet.yaml' };
   void image;

@@ -17,6 +17,7 @@ import { existsSync } from 'node:fs';
 import { requirePosixShell } from '../platform/default-shell.js';
 import { randomBytes } from 'node:crypto';
 import { Terminal as XtermHeadless } from '@xterm/headless';
+import { trackPtyMouseOutput, forgetPtyMouseMode } from './pty-mouse.js';
 import { getGlobalElementRegistry, publishElementEvent } from '../element-registry/index.js';
 import { getSessionCwd } from '../session/working-dir.js';
 import { buildPtyEnv } from '../agent/identity-env.js';
@@ -26,6 +27,7 @@ import { resolvePtyRef, canTransitionAccessMode, ptyIdSeparatorIndex, type PtyAc
 import { resolveWriteDecision, resolveTakeover, type PtyWriteActor } from './pty-write-arbiter.js';
 import { addPtyManifestOutputBytes, upsertPtyManifest, updatePtyManifestSnapshot, updatePtyManifestNickname, markPtyManifestClosed, removePtyManifest, touchLivePtyManifest } from './pty-manifest.js';
 import { processPtyControlRequests } from './pty-control-ipc.js';
+import { tapPtyOutput, autoStopPtyRecording } from './pty-recording.js';
 import { forgetExternalWriteProvenance, noteExternalWrite } from './pty-write-provenance.js';
 import { resolveRunIdentity } from '../harness/harness-space.js';
 import { addSelfDevRunParticipant, selfDevRunsDir } from '../self-dev/run-store.js';
@@ -168,6 +170,8 @@ function renderAnsiLine(line: { length: number; getCell(x: number): XtermCell | 
 
 export interface PtyControlTarget {
   readonly id: string;
+  readonly cols?: number;
+  readonly rows?: number;
   accessMode: PtyAccessMode;
   transitionPolicy: PtyTransitionPolicy;
   setAccessMode(mode: PtyAccessMode): boolean;
@@ -211,6 +215,8 @@ export interface PtyHandle extends PtyControlTarget {
   readonly pid: number;
   readonly workdir: string | undefined;
   readonly startedAt: number;
+  readonly cols: number;
+  readonly rows: number;
   /** Last time the PTY produced output OR was driven (write/drain). Used
    *  for LRU eviction when the concurrency cap is hit — recently-driven
    *  PTYs (a session the user may still resume) are protected; only the
@@ -329,6 +335,7 @@ export function emitPtyEvent(ev: PtyEvent): void {
       publishElementEvent('pty', ev.id, 'output', { bytes: ev.chunk.length });
       break;
     case 'exit':
+      forgetPtyMouseMode(ev.id);
       publishElementEvent('pty', ev.id, 'exit', { exitCode: ev.exitCode, signal: ev.signal });
       break;
     case 'stalled':
@@ -337,6 +344,7 @@ export function emitPtyEvent(ev: PtyEvent): void {
     case 'write-denied':
       break;
     case 'unregistered':
+      forgetPtyMouseMode(ev.id);
       publishElementEvent('pty', ev.id, 'delete');
       break;
   }
@@ -469,6 +477,8 @@ export function startPty(opts: StartOpts): PtyHandle {
    *  the alternative was a dead PTY reporting itself alive forever. Splitting
    *  the two lets `exitCode: null` honestly mean "죽었지만 모름". */
   let exited = false;
+  let currentCols = opts.cols ?? 80;
+  let currentRows = opts.rows ?? 24;
   let lastActivityAt = Date.now();
 
   // Screen emulator (@xterm/headless) — parses the same byte stream the
@@ -514,6 +524,8 @@ export function startPty(opts: StartOpts): PtyHandle {
     pid: adapter.pid,
     workdir: opts.workdir,
     startedAt: Date.now(),
+    get cols() { return currentCols; },
+    get rows() { return currentRows; },
     get lastActivityAt() { return lastActivityAt; },
     detach: opts.detach ?? false,
     get exitCode() { return exitCode; },
@@ -526,6 +538,7 @@ export function startPty(opts: StartOpts): PtyHandle {
     appendOutput(chunk: string): void {
       lastActivityAt = Date.now();
       delta += chunk;
+      trackPtyMouseOutput(id, chunk);
       // Feed the screen emulator so renderScreen() reflects live state.
       if (term) { try { term.write(chunk); } catch { /* parser hiccup — buffer still ok */ } }
       // Head: fill until cap.
@@ -634,7 +647,10 @@ export function startPty(opts: StartOpts): PtyHandle {
     resize(cols: number, rows: number): void {
       const c = Math.max(2, Math.floor(cols));
       const r = Math.max(2, Math.floor(rows));
-      try { adapter.resize?.(c, r); } catch { /* ignore */ }
+      // The reported size (recording headers) follows the PTY only once the adapter took it.
+      try {
+        if (adapter.resize) { adapter.resize(c, r); currentCols = c; currentRows = r; }
+      } catch { /* ignore */ }
       if (term) { try { term.resize(c, r); } catch { /* ignore */ } }
     },
   };
@@ -692,6 +708,8 @@ export function startPty(opts: StartOpts): PtyHandle {
 
   adapter.onData(chunk => {
     handle.appendOutput(chunk);
+    try { tapPtyOutput(id, chunk); }
+    catch (error) { debug.log('pty.record', 'tap-error', { ptyId: id, error: String(error) }); }
     emitPtyEvent({ type: 'output', id, chunk });
     // ★ 크로스-프로세스 관측(2026-07-23) — throttled 스냅샷을 공유 매니페스트에(데몬 PWA 유니온). getter 라 throttle 통과 시에만 snapshot().
     if (PTY_MANIFEST_ENABLED) {
@@ -714,6 +732,8 @@ export function startPty(opts: StartOpts): PtyHandle {
     killEscalationTimer = null;
     exitCode = code;
     exitSignal = signal;
+    try { autoStopPtyRecording(id); }
+    catch (error) { debug.log('pty.record', 'auto-stop-error', { ptyId: id, error: String(error) }); }
     emitPtyEvent({ type: 'exit', id, exitCode: code, signal });
     if (PTY_MANIFEST_ENABLED) {
       const now = Date.now();
@@ -802,7 +822,31 @@ function ensurePtyManifestHeartbeat(): void {
  * deliberately separate from spawned PTYs: it has no child lifecycle. */
 export function registerPtyControlTarget(handle: PtyControlTarget): () => void {
   controlTargets.set(handle.id, handle);
-  return () => { if (controlTargets.get(handle.id) === handle) controlTargets.delete(handle.id); };
+  // The self-reporting foreground TUI owns its stdout. The mirror installed later
+  // delegates through this tap, preserving its existing output and overlay path.
+  const stream = process.stdout;
+  const previousWrite = stream.write;
+  let tappedWrite: typeof stream.write | undefined;
+  if (handle.id.startsWith('tui:')) {
+    // Streaming decode: a multibyte character split across two Buffer writes stays intact.
+    const decoder = new TextDecoder('utf-8');
+    tappedWrite = function (this: typeof stream, ...args: Parameters<typeof stream.write>) {
+      const chunk = args[0];
+      if (chunk !== undefined) {
+        try { tapPtyOutput(handle.id, typeof chunk === 'string' ? chunk : decoder.decode(chunk as Uint8Array, { stream: true })); }
+        catch (error) { debug.log('pty.record', 'tap-error', { ptyId: handle.id, error: String(error) }); }
+      }
+      return previousWrite.apply(this, args);
+    } as typeof stream.write;
+    stream.write = tappedWrite;
+  }
+  return () => {
+    if (controlTargets.get(handle.id) !== handle) return;
+    try { autoStopPtyRecording(handle.id); }
+    catch (error) { debug.log('pty.record', 'auto-stop-error', { ptyId: handle.id, error: String(error) }); }
+    controlTargets.delete(handle.id);
+    if (tappedWrite && stream.write === tappedWrite) stream.write = previousWrite;
+  };
 }
 
 /** Run the existing cross-process control protocol for live targets. This
@@ -896,6 +940,8 @@ export function requestPtyTakeover(id: string, actor: PtyWriteActor): boolean {
 export function unregisterPty(id: string): boolean {
   const existed = processes.delete(id);
   if (existed) {
+    try { autoStopPtyRecording(id); }
+    catch (error) { debug.log('pty.record', 'auto-stop-error', { ptyId: id, error: String(error) }); }
     const outputFlush = pendingManifestOutputFlushers.get(id);
     outputFlush?.flush(Date.now());
     outputFlush?.cancel();
@@ -939,7 +985,8 @@ export function killNonDetached(): number {
     if (handle.isAlive()) {
       try { handle.kill('SIGTERM'); killed++; } catch { /* ignore */ }
     }
-    // The adapter's later onExit owns closure. Keep a failed trailing-output flush retryable until then.
+    // The adapter's later onExit owns recording closure (including trailing bytes).
+    // Keep a failed trailing-output flush retryable until then.
     pendingManifestOutputFlushers.get(id)?.flush(Date.now());
     processes.delete(id);
     getGlobalElementRegistry().unregister('pty', id);
@@ -1111,6 +1158,9 @@ export function resetForTesting(): void {
   const registry = getGlobalElementRegistry();
   for (const handle of processes.values()) {
     if (handle.isAlive()) try { handle.kill('SIGKILL'); } catch { /* ignore */ }
+    try { autoStopPtyRecording(handle.id); }
+    catch (error) { debug.log('pty.record', 'auto-stop-error', { ptyId: handle.id, error: String(error) }); }
+    forgetPtyMouseMode(handle.id);
     const outputFlush = pendingManifestOutputFlushers.get(handle.id);
     outputFlush?.flush(Date.now());
     outputFlush?.cancel();

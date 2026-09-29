@@ -1,10 +1,8 @@
 // Dashboard ACP chat bridge — T7-N.
 //
 // Wires the dashboard `/acp` slash straight into the real ACP client
-// (src/acp/*). Replaces the T6-K7 VW+terminal alias with a streaming
-// chat surface that routes agent_message_chunk + tool_call updates
-// into the dashboard chat pane. The VW+terminal path is preserved
-// under `/acp-vw` for users who want the old behavior.
+// (src/acp/*). Streams agent_message_chunk + tool_call updates
+// into the dashboard chat pane.
 //
 // Design:
 //
@@ -618,7 +616,6 @@ export function parseAcpSlash(sub: string, args: string[], chat: DashboardAcpCha
       '  /acp cancel            cancel in-flight turn',
       '  /acp status            list sessions',
       '  /acp drop <backend>    reset a session',
-      '  /acp-vw [backend]      legacy VW+terminal spawn (T6-K7)',
     ];
     if (last) lines.push(`  last backend: ${last}`);
     if (sticky) lines.push(`  sticky: ${sticky}`);

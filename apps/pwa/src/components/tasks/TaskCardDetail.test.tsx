@@ -1,0 +1,57 @@
+import { describe, expect, test } from 'bun:test';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { foldCard, type TaskCardEntry } from '@/lib/task-card-model';
+import { TaskCardDetail } from './TaskCardDetail';
+
+const entry = (section: TaskCardEntry['section'], key: string, ts: number, owner: string, data: Record<string, unknown>): TaskCardEntry =>
+  ({ taskId: 'task-1', section, key, ts, owner, data });
+
+function render(entries: TaskCardEntry[]) {
+  const card = foldCard(entries);
+  if (!card) throw new Error('expected a card');
+  return renderToStaticMarkup(<TaskCardDetail card={card} />);
+}
+
+describe('TaskCardDetail', () => {
+  test('renders the latest entry for each section with its owner, time, and collapsed JSON', () => {
+    const html = render([
+      entry('intake', 'intake-1', 1700000000000, 'steward', { title: 'First title' }),
+      entry('gates', 'old-gate', 1700000001000, 'old-owner', { budget: 'wait' }),
+      entry('gates', 'new-gate', 1700000002000, 'gate-owner', { budget: 'proceed', location: 'pod' }),
+      entry('run', 'run-1', 1700000003000, 'runner', { status: 'active' }),
+    ]);
+    expect(html).toContain('First title');
+    expect(html).toContain('aria-label="intake section"');
+    expect(html).toContain('aria-label="run section"');
+    expect(html).toContain('Owner: steward');
+    expect(html).toContain('Owner: gate-owner');
+    expect(html).toContain('Owner: runner');
+    expect(html).toContain('dateTime="2023-11-14T22:13:22.000Z"');
+    expect(html).toContain('&quot;status&quot;: &quot;active&quot;');
+    expect(html).not.toContain('old-owner');
+    expect((html.match(/<details class=/g) ?? []).length).toBe(3);
+    expect(html).not.toContain('<details open');
+  });
+
+  test('summarizes gate decisions together in one line and lists every incident with its metadata', () => {
+    const html = render([
+      entry('gates', 'gate-1', 1700000000000, 'gatekeeper', { budget: 'wait-reset', location: 'host' }),
+      entry('incidents', 'incident-1', 1700000001000, 'operator', { kind: 'quota' }),
+      entry('incidents', 'incident-2', 1700000002000, 'runner', { kind: 'pod-oom' }),
+    ]);
+    expect(html).toMatch(/<p[^>]*aria-label="Gate decisions"[^>]*>Gate · budget: wait-reset · location: host<\/p>/);
+    expect(html).toContain('Incidents (2)');
+    expect(html).toContain('<ol');
+    expect(html).toContain('Owner: operator');
+    expect(html).toContain('Owner: runner');
+    expect(html).toContain('&quot;kind&quot;: &quot;quota&quot;');
+    expect(html).toContain('&quot;kind&quot;: &quot;pod-oom&quot;');
+    expect((html.match(/<details class=/g) ?? []).length).toBe(3);
+  });
+
+  test('does not invent a gate decision or incident when neither exists', () => {
+    const html = render([entry('triage', 'triage-1', 1700000000000, 'steward', { title: 'Ready' })]);
+    expect(html).not.toContain('Gate decisions');
+    expect(html).toContain('No incidents.');
+  });
+});

@@ -80,6 +80,8 @@ export interface ToxBootOptions {
   bus?: TaskEventBus;
   registry?: SurfaceRegistry;
   store?: TaskStore;
+  /** Late-bound: NEXUS creates the workflow daemon after TOX boot. */
+  getWorkflowDaemon?: () => unknown | null;
 
   reprioritizeEvery?: number;
   maxRegenerateDepth?: number;
@@ -165,7 +167,7 @@ export function wireTox(opts: ToxBootOptions = {}): ToxBootHandle {
   if (opts.startFeedbackLoop !== false) loop.start();
   if (opts.startRetryPolicy !== false) retry.start();
   toxLoop = !loopEnabled ? null : startToxLoop({
-    graph, dispatcher, bus, budgetCheck: opts.budgetCheck,
+    graph, dispatcher, bus, store: opts.store, budgetCheck: opts.budgetCheck,
     maxConcurrent: loopMaxConcurrent,
     intervalMs: opts.tox?.loop?.intervalMs ?? 1000,
   });
@@ -188,6 +190,7 @@ export function wireTox(opts: ToxBootOptions = {}): ToxBootHandle {
     getGenerator: () => generator,
     getStore: () => opts.store ?? null,
     getFeedbackLoop: () => loop,
+    getWorkflowDaemon: opts.getWorkflowDaemon ?? (() => null),
   });
 
   log?.(

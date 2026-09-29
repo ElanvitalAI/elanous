@@ -140,11 +140,19 @@ function versionedInstallerMetadataPath(versionDir: string, packageEntry: string
   const root = resolve(versionsDir, '..');
   try {
     const shim = _joinPath(root, 'bin', 'elanous');
-    if (!lstatSync(shim).isSymbolicLink()) return undefined;
-    if (readlinkSync(shim, 'utf8').replace(/\\/g, '/') !== '../current/node_modules/.bin/elanous') return undefined;
-    const bunBinShim = _joinPath(versionDir, 'node_modules', '.bin', 'elanous');
-    if (!sameResolvedPath(bunBinShim, packageEntry)
-      && !(isFile(bunBinShim) && PACKAGE_ENTRY_PATTERN.test(readFileSync(bunBinShim, 'utf8')))) return undefined;
+    const shimStat = lstatSync(shim);
+    if (shimStat.isSymbolicLink()) {
+      if (readlinkSync(shim, 'utf8').replace(/\\/g, '/') !== '../current/node_modules/.bin/elanous') return undefined;
+      const bunBinShim = _joinPath(versionDir, 'node_modules', '.bin', 'elanous');
+      if (!sameResolvedPath(bunBinShim, packageEntry)
+        && !(isFile(bunBinShim) && PACKAGE_ENTRY_PATTERN.test(readFileSync(bunBinShim, 'utf8')))) return undefined;
+    } else if (shimStat.isFile()) {
+      // #21004 뒤 설치기는 bin/elanous 를 «bun 절대 경로 래퍼»(2번째 줄 `# elanous-wrapper`)로 쓴다 — 링크가 아니다.
+      //   래퍼가 이 설치 뿌리의 current 엔트리를 부를 때만 설치기 소유로 본다.
+      const text = readFileSync(shim, 'utf8');
+      if (text.split('\n')[1] !== '# elanous-wrapper') return undefined;
+      if (!text.includes(_joinPath(root, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs'))) return undefined;
+    } else return undefined;
   } catch {
     return undefined;
   }
@@ -168,15 +176,32 @@ function installerOwnedMetadataPath(packageRoot: string): string | undefined {
   return _joinPath(prefix, 'install.json');
 }
 
-/** git 이 실패했을 때만 install.json 의 commit 을 본다. caller cwd 는 쓰지 않는다. */
-function installMetadataCommit(root: string): string | undefined {
+function installMetadataCandidates(root: string): string[] {
   const metadataRoot = testInstallMetadataRoot ?? root;
   const candidates = [_joinPath(metadataRoot, 'install.json')];
   const owned = installerOwnedMetadataPath(metadataRoot);
   if (owned && owned !== candidates[0]) candidates.push(owned);
-  for (const metadataPath of candidates) {
+  return candidates;
+}
+
+/** git 이 실패했을 때만 install.json 의 commit 을 본다. caller cwd 는 쓰지 않는다. */
+function installMetadataCommit(root: string): string | undefined {
+  for (const metadataPath of installMetadataCandidates(root)) {
     const commit = readInstallMetadataCommit(metadataPath);
     if (commit) return commit;
+  }
+  return undefined;
+}
+
+/** Return the install.json source only when it names an existing directory. */
+export function installMetadataSource(root: string = REPOSITORY_ROOT): string | undefined {
+  for (const metadataPath of installMetadataCandidates(root)) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      const source = (parsed as { readonly source?: unknown }).source;
+      if (typeof source === 'string' && statSync(source).isDirectory()) return source;
+    } catch { /* Try the next candidate. */ }
   }
   return undefined;
 }

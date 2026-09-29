@@ -11,9 +11,7 @@
 //   tool:Bash               → { kind:'tool',    id:'Bash' }
 //
 // Permissive: accepts optional leading '@'. Unknown prefixes return null
-// so callers can fall back to kind-specific legacy parsers (e.g.
-// virtual-windows/addressing.ts still handles bare `pane:hex` +
-// combined `win:N/pane:hex` forms).
+// so callers can fall back to kind-specific parsers.
 
 import { ADDR_PREFIX_TO_KIND, KIND_PREFIX, type ElementKind, type ParsedElementAddress } from './types.js';
 

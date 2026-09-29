@@ -31,7 +31,6 @@ import {
   runShell as runnerDispatch,
   getShellRunnerDeps,
 } from '../../shell-runner/dispatch.js';
-import type { ShellMode } from '../../shell-runner/types.js';
 import type { ShellResult as RunnerResult } from '../../shell-runner/types.js';
 import { debug } from '../../debug/log.js';
 import { getSessionCwd } from '../../session/working-dir.js';
@@ -81,23 +80,14 @@ export function buildRunShellTool(): LLMToolSpec {
           enum: ['inherit', 'off'],
           description: "Network policy. Only enforced when sandbox != 'off'. Default 'inherit'.",
         },
-        // NT-C1b (session nt): shell-runner routing opt-in. When these
-        // fields are present the call is dispatched through the unified
-        // 4-mode runner; otherwise the legacy shell-primitive argv path
-        // is used as before (zero behavior change).
         mode: {
           type: 'string',
-          enum: ['auto', 'inline', 'bg', 'modal', 'vw'],
-          description:
-            "shell-runner mode. Omit for the legacy argv-only path. 'vw' (default when shell-runner deps are wired) hosts the command in a user-visible runner VW pane and returns only the new output slice. 'bg' registers as background for later ShellPoll. 'inline' is a chat-log one-liner. 'modal' is the legacy centered modal surface.",
+          enum: ['inline', 'bg'],
+          description: "Shell-runner mode. Omit for the legacy argv-only path. 'inline' captures command output; 'bg' registers it for later ShellPoll.",
         },
         description: {
           type: 'string',
-          description: 'Free-form label shown in surfaces (chat log, status-bar pill, runner pane title).',
-        },
-        vw_window_label: {
-          type: 'string',
-          description: "Only for mode='vw'. Label of the VW to reuse / create. Default 'runner'.",
+          description: 'Free-form label shown in shell logs and status.',
         },
       },
       required: ['command'],
@@ -113,9 +103,8 @@ export interface RunShellDispatchArgs {
   approval?: ShellRequest['approval'];
   sandbox?: ShellRequest['sandbox'];
   network?: ShellRequest['network'];
-  mode?: ShellMode;
+  mode?: 'inline' | 'bg';
   description?: string;
-  vw_window_label?: string;
 }
 
 export interface RunShellDispatchResult extends Record<string, unknown> {
@@ -164,11 +153,9 @@ function asNetwork(raw: unknown): ShellRequest['network'] {
   throw new Error(`invalid network value: ${JSON.stringify(raw)}`);
 }
 
-function asMode(raw: unknown): ShellMode | undefined {
+function asMode(raw: unknown): 'inline' | 'bg' | undefined {
   if (raw === undefined) return undefined;
-  if (raw === 'auto' || raw === 'inline' || raw === 'bg' || raw === 'modal' || raw === 'vw') {
-    return raw;
-  }
+  if (raw === 'inline' || raw === 'bg') return raw;
   throw new Error(`invalid mode value: ${JSON.stringify(raw)}`);
 }
 
@@ -204,7 +191,6 @@ export async function dispatchRunShell(
   const network = asNetwork(rawArgs.network);
   const mode = asMode(rawArgs.mode);
   const description = typeof rawArgs.description === 'string' ? rawArgs.description : undefined;
-  const vwLabel = typeof rawArgs.vw_window_label === 'string' ? rawArgs.vw_window_label : undefined;
   if (command[0] === 'cd') {
     logShellDispatch('cd.rejected', { reason: 'argv-state-does-not-persist' });
     return rejectedCdResult();
@@ -214,14 +200,12 @@ export async function dispatchRunShell(
   const boundaryReject = harnessCommandWriteReject(command, effectiveCwd, 'run-shell');
   if (boundaryReject) throw new Error(boundaryReject);
 
-  // NT-C1b-1: when mode is explicitly provided AND shell-runner deps
-  // are installed, route through the 4-mode dispatcher. Otherwise
-  // keep the legacy argv-only shell-primitive path (zero behavior
-  // change for callers not opting in).
+  // Explicit inline/bg uses the file-backed runner when its deps are installed;
+  // omitted mode and uninitialized hosts keep the legacy argv path.
   const deps = mode ? getShellRunnerDeps() : null;
   if (mode && deps) {
     const result = await dispatchViaRunner({
-      command, cwd, timeoutMs, mode, description, vwLabel,
+      command, cwd, timeoutMs, mode, description,
       signal: opts.signal,
       deps,
     });
@@ -255,16 +239,15 @@ export async function dispatchRunShell(
   };
 }
 
-/** Route a request through the 4-mode shell-runner and project its
+/** Route a request through the file-backed shell-runner and project its
  *  ShellResult back into the legacy RunShell response shape so
  *  callers keep the same output fields (exitCode/stdout/stderr/…). */
 async function dispatchViaRunner(args: {
   command: string[];
   cwd?: string;
   timeoutMs?: number;
-  mode: ShellMode;
+  mode: 'inline' | 'bg';
   description?: string;
-  vwLabel?: string;
   signal?: AbortSignal;
   deps: NonNullable<ReturnType<typeof getShellRunnerDeps>>;
 }): Promise<RunShellDispatchResult> {
@@ -275,7 +258,6 @@ async function dispatchViaRunner(args: {
     ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
     ...(args.description !== undefined ? { description: args.description } : {}),
     ...(args.signal !== undefined ? { signal: args.signal } : {}),
-    ...(args.vwLabel !== undefined ? { vw: { windowLabel: args.vwLabel } } : {}),
   };
   const handle = runnerDispatch(req, args.deps);
   const result = await handle.result;

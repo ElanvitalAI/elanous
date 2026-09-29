@@ -24,6 +24,7 @@ import { notifyMissionOrigin, notifyMissionHitl, notifyMissionDocument, resolveT
 import { proposalDraftPath } from '../src/autopilot/build/build-target.js';
 import { applyConfigDirFlagFromArgv } from '../src/cli/config-dir-flag.js';
 import { debug } from '../src/debug/log.js';
+import { inferPhaseTrack, loadTrackRegistry } from '../src/autopilot/mission-phase-track.js';
 import { reportDecomposeFailureHitl } from './se-mission-prepare-cause.js';
 
 // ★ 인스턴스 스코프 상속(ISO·2026-07-14) — 부모 데몬(mission-prepare-spawn)이 argv 로 넘긴
@@ -232,7 +233,13 @@ function collectDecompPhases(mid: string): { decompPhases: DecompPhase[]; phaseL
   const phases = new TaskStore();
   try {
     const t = phases.listTasks({ goalSlug: mid }).sort((a, b) => a.createdAt - b.createdAt);
-    const phaseLines = t.slice(0, 10).map((x, i) => `  ${i}. ${x.title}`).join('\n');
+    const registry = loadTrackRegistry();
+    const phaseLines = t.map((x, i) => {
+      const result = inferPhaseTrack(`${x.title}\n${x.surface.kind === 'subagent' ? x.surface.prompt : ''}`, registry);
+      try { debug.log('mission.prepare', 'phase-track', { missionId: mid, taskId: x.id, track: result.track, reason: result.reason, hits: result.hits }); } catch { /* fail-soft */ }
+      if (!registry.length) return `  ${i}. ${x.title}`;
+      return result.track ? `  ${i}. ${result.mark} ${x.title}` : `  ${i}. ❔ ${x.title} (트랙 미정 → 🅢)`;
+    }).slice(0, 10).join('\n');
     const decompPhases: DecompPhase[] = t.filter((x) => x.surface.kind === 'subagent').map((x) => ({
       id: x.id, title: x.title,
       prompt: x.surface.kind === 'subagent' ? x.surface.prompt : x.title,
@@ -423,20 +430,7 @@ const buildImpls: import('../src/autopilot/mission-build-orchestrate.js').StageI
     //   Opus 재분해). 실측: universal-content 분해가 sol 스키마 위반으로 실패했으나 Opus 면 성공 가능.
     const errStr = r.error ?? '';
     const transientFailed = !r.ok && !decomposeModelOverride && (isTransientLlmError(errStr) || /VALIDATION_FAILED|PARSE_FAILED|schema violation/i.test(errStr));
-    let phaseLines = '';
-    let decompPhases: { id: string; title: string; prompt: string; acceptance: string[]; dependsOn: string[] }[] = [];
-    const phases = new TaskStore();
-    try {
-      const t = phases.listTasks({ goalSlug: missionId }).sort((a, b) => a.createdAt - b.createdAt);
-      phaseLines = t.slice(0, 10).map((x, i) => `  ${i}. ${x.title}`).join('\n');
-      decompPhases = t.filter((x) => x.surface.kind === 'subagent').map((x) => ({
-        id: x.id, title: x.title,
-        prompt: x.surface.kind === 'subagent' ? x.surface.prompt : x.title,
-        acceptance: x.acceptance?.criteria ? [...x.acceptance.criteria] : [],
-        // ★ 사전정보(축③) — 비평기가 상류 계약 출처(dependsOn)를 알고 고립 판정 방지.
-        dependsOn: [...x.dependsOn],
-      }));
-    } finally { phases.close(); }
+    const { phaseLines, decompPhases } = collectDecompPhases(missionId);
     return { ok: r.ok, phaseCount, error: r.error ?? '', transientFailed, decompPhases, phaseLines };
   },
   // critique — D1 적대적 비평(heavy·decompPhases).

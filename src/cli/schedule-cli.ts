@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import type { Database } from 'bun:sqlite';
 import type { Command } from 'commander';
 import * as ui from '../ui.js';
 import { writeStdoutJson } from './stdout-json.js';
@@ -7,6 +8,16 @@ import { writeStdoutJson } from './stdout-json.js';
 // dispatchScheduleManage(전 표면 공유 구현) 재사용 → schedule_registry·crontab·surface_events
 // 메모리 루프까지 텔레그램/PWA와 동일 정합. schedules.db 직접 조작 금지(정합 깨짐).
 interface ScheduleOpts { id?: string; category?: string; cron?: string; command?: string; apm?: string; json?: boolean; dryRun?: boolean; from?: string; to?: string; yes?: boolean; only?: string }
+interface ScheduleRunsOpts { limit?: string; before?: string; json?: boolean }
+interface ScheduleRunRow {
+  run_id: string | null;
+  fired_at: string;
+  status: string;
+  exit: number | null;
+  duration_ms: number | null;
+  via: string;
+}
+export type ScheduleRunsReader = (id: string, opts: { limit: number; before?: string }) => ScheduleRunRow[];
 
 export type ScheduleDispatch = (args: Record<string, unknown>) => Promise<unknown>;
 type ScheduleExit = (code: number) => void;
@@ -136,6 +147,51 @@ export async function runSchedule(action: string, opts: ScheduleOpts, dispatch?:
   exit(isErr ? 1 : 0);
 }
 
+export async function runScheduleRuns(
+  id: string,
+  opts: ScheduleRunsOpts,
+  read?: ScheduleRunsReader,
+): Promise<void> {
+  const limit = opts.limit === undefined ? 20 : Number(opts.limit);
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('--limit에는 양의 정수가 필요합니다.');
+  if (opts.before !== undefined) {
+    const match = /^(\d{4})-(\d\d)-(\d\d)T\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)$/.exec(opts.before);
+    const year = Number(match?.[1]);
+    const month = Number(match?.[2]);
+    const day = Number(match?.[3]);
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if (!match || month < 1 || month > 12 || day < 1 || day > days[month - 1]! || !Number.isFinite(Date.parse(opts.before))) {
+      throw new Error('--before에는 유효한 ISO 시각이 필요합니다.');
+    }
+  }
+  let rows: ScheduleRunRow[];
+  if (read) {
+    rows = read(id, { limit, ...(opts.before !== undefined ? { before: opts.before } : {}) });
+  } else {
+    const { openSchedulesDb } = await import('../domains/schedule-registry.js');
+    const { listScheduleRuns } = await import('../domains/schedule-runs.js');
+    const db: Database = openSchedulesDb();
+    try {
+      rows = listScheduleRuns(db, id, { limit, ...(opts.before !== undefined ? { before: opts.before } : {}) });
+    } finally {
+      db.close();
+    }
+  }
+  if (opts.json) {
+    await writeStdoutJson(JSON.stringify(rows, null, 2) + '\n');
+    return;
+  }
+  ui.header(`schedule runs ${id} (${rows.length})`);
+  console.log('  KST                  상태    exit  소요      via       runId');
+  for (const row of rows) {
+    const kst = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).format(new Date(row.fired_at));
+    const exit = row.exit === null ? '-' : String(row.exit);
+    const duration = row.duration_ms === null ? '-' : `${row.duration_ms}ms`;
+    console.log(`  ${kst}  ${row.status.padEnd(6)}  ${exit.padEnd(4)}  ${duration.padEnd(8)}  ${row.via.padEnd(8)}  ${row.run_id ?? '-'}`);
+  }
+}
+
 export function registerScheduleCommands(program: Command): void {
   const scheduleCmd = program.command('schedule')
     .description('스케줄/크론 CRUD (registry·crontab·기억 정합). --json 으로 프로그래매틱 소비.');
@@ -146,6 +202,11 @@ scheduleCmd.command('list').description('전체 크론 조회(category 필터)')
   .action((o: ScheduleOpts) => runSchedule('list', o));
 scheduleCmd.command('inspect <id>').description('상세 + 최근발송(surface_events 회상·S3 폐루프)')
   .option('--json').action((id: string, o: ScheduleOpts) => runSchedule('inspect', { ...o, id }));
+scheduleCmd.command('runs <id>').description('스케줄 실행 이력(최신순)')
+  .option('--limit <N>', '최대 조회 수(기본 20)')
+  .option('--before <ISO>', '이 시각 이전 실행만 조회')
+  .option('--json', 'JSON 출력')
+  .action((id: string, o: ScheduleRunsOpts) => runScheduleRuns(id, o));
 scheduleCmd.command('create').description('신규 크론(cron 식 + command). 자동 백업·cd/bun/로그 보강.')
   .option('--cron <expr>', 'cron 식(예: "0 7 * * *")')
   .option('--command <cmd>', 'command(예: "scripts/foo.ts --x")')

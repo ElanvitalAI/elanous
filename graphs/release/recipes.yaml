@@ -1,0 +1,38 @@
+version-release:
+  command: 'bun scripts/release-loop/version-node.ts release --json'
+  timeout_ms: 1800000
+cutoff:
+  command: 'bun scripts/release-loop/node-verdict.ts cutoff'
+  timeout_ms: 600000
+gate:
+  command: 'bun scripts/release-loop/gate-node.ts --json'
+  timeout_ms: 7200000
+pwa:
+  command: 'bun scripts/release-loop/node-verdict.ts pwa'
+  timeout_ms: 1800000
+prepare:
+  command: 'bun scripts/release-loop/prepare-node.ts'
+  timeout_ms: 1800000
+upgrade:
+  command: 'bun scripts/release-loop/upgrade-node.ts'
+  timeout_ms: 1800000
+tui:
+  command: 'bun scripts/release-loop/node-verdict.ts tui'
+  timeout_ms: 600000
+docs:
+  command: 'bun scripts/release-loop/docs-node.ts --json'
+  timeout_ms: 1800000
+publish:
+  approval: 'v{{input.version}} 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?'
+publish-command:
+  command: 'bun scripts/release-loop/publish-node.ts'
+  timeout_ms: 1800000
+docs-land:
+  command: 'bun scripts/release-loop/docs-land-node.ts'
+  timeout_ms: 1800000
+verify:
+  command: 'bun scripts/release-loop/verify-node.ts'
+  timeout_ms: 1800000
+version-dev-bump:
+  command: 'bun scripts/release-loop/version-node.ts dev-bump --json'
+  timeout_ms: 1800000

@@ -93,6 +93,14 @@ export const STORE_SAFETY_MAX = 100_000;
  */
 /** Read-only federation waits briefly for a concurrent writer before surfacing an unreadable store. */
 export const LOG_STORE_READONLY_BUSY_TIMEOUT_MS = 2_000;
+const LOG_STORE_WRITE_BUSY_TIMEOUT_MS = 5_000;
+const LOG_STORE_OPEN_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600] as const;
+const sqliteOpenWait = new Int32Array(new SharedArrayBuffer(4));
+let pendingBusyOpenLosses: Array<{ path: string; loss: { store: 'logs'; op: 'open'; waitedMs: number } }> = [];
+
+function sqliteBusy(error: unknown): boolean {
+  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|database is busy/i.test(String(error));
+}
 
 export class LogCursorNotFoundError extends Error {
   constructor(public readonly beforeId: number) {
@@ -199,7 +207,37 @@ export class LogStore {
       return;
     }
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
-    this.db = new Database(path);
+    const openedAt = Date.now();
+    for (let attempt = 0; ; attempt++) {
+      let db: Database | undefined;
+      try {
+        db = new Database(path);
+        db.run(`PRAGMA busy_timeout = ${LOG_STORE_WRITE_BUSY_TIMEOUT_MS}`);
+        this.db = db;
+        this.initializeWriter();
+        break;
+      } catch (error) {
+        db?.close();
+        if (!sqliteBusy(error)) throw error;
+        if (attempt >= LOG_STORE_OPEN_RETRY_DELAYS_MS.length) {
+          const loss = { store: 'logs' as const, op: 'open' as const, waitedMs: Date.now() - openedAt };
+          pendingBusyOpenLosses.push({ path, loss });
+          try { process.stderr.write(`[store.sqlite] busy-lost ${JSON.stringify(loss)}\n`); } catch { /* diagnostics must not block callers */ }
+          throw error;
+        }
+        Atomics.wait(sqliteOpenWait, 0, 0, LOG_STORE_OPEN_RETRY_DELAYS_MS[attempt]);
+      }
+    }
+    for (const item of pendingBusyOpenLosses.filter((entry) => entry.path === path)) {
+      try {
+        this.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'store.sqlite', event: 'busy-lost', data: item.loss }, surface: 'nexus' }]);
+        debug.log('store.sqlite', 'busy-lost', item.loss);
+        pendingBusyOpenLosses.splice(pendingBusyOpenLosses.indexOf(item), 1);
+      } catch { /* retain the observation for the next writable connection */ }
+    }
+  }
+
+  private initializeWriter(): void {
     this.db.run('PRAGMA journal_mode = WAL');
     this.db.run(`CREATE TABLE IF NOT EXISTS logs(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -260,7 +298,17 @@ export class LogStore {
         );
       }
     });
-    insertAll(rows);
+    const startedAt = Date.now();
+    try {
+      insertAll(rows);
+    } catch (error) {
+      if (sqliteBusy(error)) {
+        const loss = { store: 'logs', op: 'insertBatch', waitedMs: Date.now() - startedAt };
+        try { process.stderr.write(`[store.sqlite] busy-lost ${JSON.stringify(loss)}\n`); } catch { /* diagnostics must not block callers */ }
+        debug.log('store.sqlite', 'busy-lost', loss);
+      }
+      throw error;
+    }
   }
 
   /** 보존정책 집행 — age 초과 삭제 + 크기 상한(오래된 행부터). 부팅 시 1회 +
@@ -511,6 +559,46 @@ export class LogStore {
       .all(...(params as never[])) as Array<{ bucket: number; count: number; errors: number }>;
   }
 
+  /** Aggregate all measured runs in the query window before applying a run-count bound. Read-only. */
+  aggregateRuns(q: LogQuery, runLimit: number): Array<{ runId: string; parentRunId: string | null; firstTs: string; lastTs: string; rows: number }> {
+    const { clause, params } = this.buildWhere(q);
+    const valid = clause ? `${clause} AND json_valid(data)` : 'WHERE json_valid(data)';
+    return this.db.query(`
+      WITH measured AS (
+        SELECT id, ts, ts_ms,
+          COALESCE(NULLIF(json_extract(data, '$.runId'), ''), NULLIF(json_extract(data, '$.run_id'), '')) AS runId,
+          NULLIF(json_extract(data, '$.parentRunId'), '') AS parentRunId
+        FROM logs ${valid}
+      ), ranked AS (
+        SELECT runId, parentRunId, ts, ts_ms,
+          ROW_NUMBER() OVER (PARTITION BY runId ORDER BY ts_ms ASC, id ASC) AS firstRow,
+          ROW_NUMBER() OVER (PARTITION BY runId ORDER BY ts_ms DESC, id DESC) AS lastRow
+        FROM measured WHERE typeof(runId) = 'text' AND runId <> ''
+      )
+      SELECT runId, MAX(parentRunId) AS parentRunId,
+        MAX(CASE WHEN firstRow = 1 THEN ts END) AS firstTs,
+        MAX(CASE WHEN lastRow = 1 THEN ts END) AS lastTs, COUNT(*) AS rows
+      FROM ranked GROUP BY runId ORDER BY MAX(ts_ms) DESC LIMIT ?
+    `).all(...(params as never[]), Math.min(Math.max(1, runLimit), STORE_SAFETY_MAX)) as Array<{
+      runId: string; parentRunId: string | null; firstTs: string; lastTs: string; rows: number;
+    }>;
+  }
+
+  /** Trace run lens filters before the bounded page, so old runs are not hidden by newer unrelated logs. */
+  queryTraceRun(runId: string, q: LogQuery): LogStoreRow[] {
+    const { clause, params } = this.buildWhere(q);
+    const predicate = `CASE WHEN json_valid(data) THEN
+      (json_extract(data, '$.runId') = ? OR json_extract(data, '$.run_id') = ?) ELSE 0 END`;
+    const where = clause ? `${clause} AND (${predicate})` : `WHERE (${predicate})`;
+    return this.db.query(`SELECT * FROM logs ${where} ORDER BY ts_ms DESC, id DESC LIMIT ?`)
+      .all(...(params as never[]), runId, runId, Math.min(Math.max(1, q.limit ?? 100), STORE_SAFETY_MAX)) as LogStoreRow[];
+  }
+
+  /** Trace evidence resolves one local row ID without scanning a bounded recent page. */
+  getById(id: number): LogStoreRow | null {
+    return this.db.query('SELECT * FROM logs WHERE id = ?').get(id) as LogStoreRow | null;
+  }
+
   /** 현재 최대 id — SSE 스트림의 시작 커서. 빈 스토어 = 0. */
   maxId(): number {
     const r = this.db.query('SELECT MAX(id) AS m FROM logs').get() as { m: number | null };
@@ -567,6 +655,7 @@ export function _resetDefaultLogStoreForTest(): void {
   try { defaultStore?.close(); } catch { /* noop */ }
   defaultStore = null;
   defaultStoreUnavailableReported = false;
+  pendingBusyOpenLosses = [];
 }
 
 // ── StoreSink — debug.registerSink() 로 꽂히는 배치 싱크 ─────────────────

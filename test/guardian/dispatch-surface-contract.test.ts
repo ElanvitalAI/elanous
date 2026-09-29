@@ -57,9 +57,14 @@ function createFixtureTree(): { rootDir: string; guardianTypes: string; verifier
   const guardianTypes = copy('src/guardian/types.ts', rootDir);
   const verifierTypes = copy('src/verifier/types.ts', rootDir);
   copy('src/tool-surface.ts', rootDir);
+  const requestOrigin = readFileSync(join(root, 'src', 'policy', 'claude-subscription-guard.ts'), 'utf8')
+    .match(/^export type RequestOrigin = [^;]+;/m)?.[0];
+  if (!requestOrigin) throw new Error('Missing RequestOrigin declaration in claude-subscription-guard.ts');
   mkdirSync(join(rootDir, 'src', 'feedback'), { recursive: true });
   writeFileSync(join(rootDir, 'src', 'feedback', 'envelope.ts'), 'export interface FeedbackEnvelope {}\n');
   writeFileSync(join(rootDir, 'src', 'llm.ts'), 'export interface LLMToolSpec {}\n');
+  mkdirSync(join(rootDir, 'src', 'policy'), { recursive: true });
+  writeFileSync(join(rootDir, 'src', 'policy', 'claude-subscription-guard.ts'), `${requestOrigin}\n`);
   mkdirSync(join(rootDir, 'src', 'plugins', 'core'), { recursive: true });
   writeFileSync(join(rootDir, 'src', 'plugins', 'core', 'manifest.ts'), "export type PluginCapability = string;\nexport type PluginSource = string;\n");
   copy('test/guardian/dispatch-surface-contract.fixture.ts', rootDir);

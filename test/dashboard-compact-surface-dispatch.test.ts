@@ -17,15 +17,6 @@ function mkDeps() {
       openBrowserPreviewModal: () => { events.push('browser-preview'); },
       openDashboardPaneModal: (pane: string) => { events.push(`pane:${pane}`); },
       openCompanionPopup: (key: 'clipboard' | 'memo' | 'detail') => { events.push(`companion:${key}`); },
-      spawnBrowserVirtualWindow: () => { events.push('vw:browser'); },
-      spawnPreviewVirtualWindow: () => { events.push('vw:preview'); },
-      spawnBrowserPreviewVirtualWindow: () => { events.push('vw:browser-preview'); },
-      spawnScratchVirtualWindow: () => { events.push('vw:scratch'); },
-      spawnSimVirtualWindow: () => { events.push('vw:sim'); },
-      currentVirtualWindowId: () => 7,
-      openVwCompanion: (windowId: number, key: 'clipboard' | 'memo' | 'detail') => {
-        events.push(`vw-companion:${windowId}:${key}`);
-      },
       onWarning: (message: string) => { warnings.push(message); },
     },
   };
@@ -57,13 +48,17 @@ describe('dispatchDashboardSurfaceCatalogAction', () => {
     dispatchDashboardSurfaceCatalogAction('vw:preview', h.deps);
     dispatchDashboardSurfaceCatalogAction('vw:sim', h.deps);
     dispatchDashboardSurfaceCatalogAction('vw-companion:detail', h.deps);
-    expect(h.events).toEqual(['vw:preview', 'vw:sim', 'vw-companion:7:detail']);
+    expect(h.events).toEqual([]);
+    expect(h.warnings).toEqual([
+      'unsupported dashboard surface: vw:preview',
+      'unsupported dashboard surface: vw:sim',
+      'unsupported dashboard surface: vw-companion:detail',
+    ]);
   });
 
   test('warns when vw companion has no foreground window', () => {
     const h = mkDeps();
-    h.deps.currentVirtualWindowId = () => null;
     dispatchDashboardSurfaceCatalogAction('vw-companion:clipboard', h.deps);
-    expect(h.warnings).toEqual(['no foreground virtual window for VW companion']);
+    expect(h.warnings).toEqual(['unsupported dashboard surface: vw-companion:clipboard']);
   });
 });

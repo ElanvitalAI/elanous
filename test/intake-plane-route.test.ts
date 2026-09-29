@@ -1,7 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { ingestIntakeItems, listIntakeItems, markIntakeItem } from '../src/intake-plane/items.js';
 import { intakeOutboxDir, routeIntakeItem, type IntakeCheckJson } from '../src/intake-plane/route.js';
 
@@ -32,7 +34,7 @@ function absorbed(r: string, source: 'youtube' | 'telegram-saved', text?: string
 test('「없음」은 goals · 문서뿐인 「판단 필요」는 manual · 그 밖의 「판단 필요」는 review · 노트는 grounding 후보 · 항목은 routed', () => {
   const r = root();
   const id = absorbed(r, 'youtube');
-  expect(routeIntakeItem(r, id, check, {}, NOW)).toEqual({ id, goals: 1, manual: 1, review: 1, grounding: 1, release: 0, dryRun: false });
+  expect(routeIntakeItem(r, id, check, {}, NOW)).toEqual({ id, goals: 1, manual: 1, review: 1, grounding: 1, release: 0, unmeasured: 0, measured: 4, dryRun: false });
   const out = intakeOutboxDir(r);
   expect(lines(join(out, 'goals', '2026-09-26.jsonl'))[0]).toMatchObject({ id, fact: 'elanous 에 `foo bar` 가 있다', patterns: ['foo bar'], commit: 'abc' });
   expect(lines(join(out, 'manual', '2026-09-26.jsonl'))[0]).toMatchObject({ id, evidence: ['docs/x.md:1'] });
@@ -40,6 +42,61 @@ test('「없음」은 goals · 문서뿐인 「판단 필요」는 manual · 그
   expect(lines(join(out, 'grounding.jsonl'))).toEqual([{ path: '/vault/note.md', kind: 'local-docs', tag: 'intake:youtube', at: NOW, id }]);
   expect(listIntakeItems(r)[0].status).toBe('routed');
 });
+
+test('모든 주장을 못 쟀으면 건너뛰고 재대조할 수 있게 상태·큐를 그대로 둔다; 일부만 못 쟀으면 나머지는 나눈다', () => {
+  const r = root();
+  ingestIntakeItems(r, 'youtube', [
+    { url: 'https://youtu.be/aaaaaaaaaaa' },
+    { url: 'https://youtu.be/bbbbbbbbbbb' },
+  ], NOW, quiet);
+  const [a, b] = listIntakeItems(r).map((item) => item.id);
+  expect(a).toBeDefined();
+  expect(b).toBeDefined();
+  markIntakeItem(r, a!, { status: 'absorbed', output: { kind: 'note', ref: '/vault/a.md' } }, NOW);
+  markIntakeItem(r, b!, { status: 'absorbed', output: { kind: 'note', ref: '/vault/b.md' } }, NOW);
+  const missing = (n: number): IntakeCheckJson['items'][number] => ({ fact: `주장 ${n}`, current: '대조 실패', verdict: '못 쟀다' });
+  const resultA = routeIntakeItem(r, a!, { items: [1, 2, 3, 4].map(missing) }, {}, NOW);
+  expect(resultA).toMatchObject({ skipped: '모든 주장을 못 쟀다 — 대조를 다시 돌려라', measured: 0, unmeasured: 4, goals: 0, grounding: 0 });
+  expect(listIntakeItems(r).find((item) => item.id === a)?.status).toBe('absorbed');
+  expect(existsSync(intakeOutboxDir(r))).toBe(false);
+  const resultB = routeIntakeItem(r, b!, { items: [
+    { fact: '새 기능', current: '전수 0건', verdict: '없음' }, missing(1), missing(2),
+  ] }, {}, NOW);
+  expect(resultB).toMatchObject({ goals: 1, unmeasured: 2, measured: 1, grounding: 1 });
+  expect(resultB.skipped).toBeUndefined();
+  expect(listIntakeItems(r).find((item) => item.id === b)?.status).toBe('routed');
+  expect(lines(join(intakeOutboxDir(r), 'goals', '2026-09-26.jsonl'))).toHaveLength(1);
+  expect(lines(join(intakeOutboxDir(r), 'grounding.jsonl'))).toHaveLength(1);
+});
+
+test('CLI route 는 전부 미측정 시 JSON·텍스트 모두 실패 종료하고 항목을 다시 대조할 수 있게 둔다', () => {
+  const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+  const r = root();
+  ingestIntakeItems(r, 'youtube', [{ url: 'https://youtu.be/aaaaaaaaaaa' }], NOW, quiet);
+  const id = listIntakeItems(r)[0]!.id;
+  markIntakeItem(r, id, { status: 'absorbed' }, NOW);
+  const checkFile = join(r, 'check.json');
+  writeFileSync(checkFile, JSON.stringify({ items: [{ fact: '주장', current: '대조 실패', verdict: '못 쟀다' }] }));
+  for (const json of [false, true]) {
+    const args = [join(repo, 'bin/elanous.mjs'), `--test=${r}`, 'intake', 'route', id, '--check-json', checkFile, ...(json ? ['--json'] : [])];
+    const result = spawnSync(process.execPath, args, { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+    expect(result.status, result.stderr).toBe(1);
+    if (json) expect(JSON.parse(result.stdout)).toMatchObject({ skipped: '모든 주장을 못 쟀다 — 대조를 다시 돌려라', unmeasured: 1, measured: 0 });
+    else expect(result.stdout).toContain(`${id}: 건너뜀 — 모든 주장을 못 쟀다 — 대조를 다시 돌려라`);
+    expect(listIntakeItems(r)[0]?.status).toBe('absorbed');
+  }
+  ingestIntakeItems(r, 'youtube', [{ url: 'https://youtu.be/bbbbbbbbbbb' }], NOW, quiet);
+  const nextId = listIntakeItems(r).find((item) => item.id !== id)!.id;
+  markIntakeItem(r, nextId, { status: 'absorbed' }, NOW);
+  writeFileSync(checkFile, JSON.stringify({ items: [
+    { fact: '새 기능', current: '전수 0건', verdict: '없음' },
+    { fact: '주장', current: '대조 실패', verdict: '못 쟀다' },
+  ] }));
+  const partial = spawnSync(process.execPath, [join(repo, 'bin/elanous.mjs'), `--test=${r}`, 'intake', 'route', nextId, '--check-json', checkFile], { cwd: repo, encoding: 'utf8', timeout: 60_000 });
+  expect(partial.status, partial.stderr).toBe(0);
+  expect(partial.stdout).toContain(`${nextId} → 골 후보 1 · 매뉴얼 후보 0 · 판단 필요 0 · 그라운딩 후보 0 · 못 쟀다 1`);
+  expect(listIntakeItems(r).find((item) => item.id === nextId)?.status).toBe('routed');
+}, 30_000); // CLI 를 두 번 띄운다 — mbp 에서 약 9초(2026-09-27 실측 · 기본 5초 초과)
 
 test('이미 routed 면 다시 나누지 않는다 · 같은 노트는 grounding 에 한 번만', () => {
   const r = root();

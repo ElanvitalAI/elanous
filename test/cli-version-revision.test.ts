@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { setGitCommandRunnerForTesting } from '../src/git-fs/runner.js';
 import { cliVersion, setInstallMetadataRootForTesting } from '../src/index.js';
-import { packageVersion } from '../src/version/code-revision.js';
+import { installMetadataSource, packageVersion } from '../src/version/code-revision.js';
 
 const INSTALL_REVISION = 'a'.repeat(40);
 const CALLER_REVISION = 'b'.repeat(40);
@@ -51,6 +51,71 @@ function failGitAtInstallRoot(calls: string[]) {
       : { status: 0, stdout: `${CALLER_REVISION}\n`, stderr: '' };
   });
 }
+
+describe('install metadata source', () => {
+  test('returns the exact source only when it is a string naming an existing directory', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-source-'));
+    try {
+      const source = join(root, 'repository');
+      mkdirSync(source);
+      writeFileSync(join(root, 'file'), 'not a directory');
+      for (const invalid of [undefined, null, 42, {}, '', 'local', join(root, 'file')]) {
+        writeFileSync(join(root, 'install.json'), JSON.stringify({ source: invalid }));
+        expect(installMetadataSource(root)).toBeUndefined();
+      }
+      writeFileSync(join(root, 'install.json'), '{not-json');
+      expect(installMetadataSource(root)).toBeUndefined();
+      writeFileSync(join(root, 'install.json'), JSON.stringify({ source }));
+      withUnrelatedCaller(() => expect(installMetadataSource(root)).toBe(source));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('reads the installer prefix metadata only with the package installer shim', () => {
+    const prefix = mkdtempSync(join(tmpdir(), 'elanous-source-prefix-'));
+    try {
+      const packageRoot = join(prefix, 'node_modules', 'elanous');
+      const source = join(prefix, 'repository');
+      mkdirSync(join(prefix, 'bin'), { recursive: true });
+      mkdirSync(join(prefix, 'node_modules', '.bin'), { recursive: true });
+      mkdirSync(join(packageRoot, 'bin'), { recursive: true });
+      mkdirSync(source);
+      writeFileSync(join(packageRoot, 'bin', 'elanous.mjs'), '');
+      symlinkSync(join('..', 'elanous', 'bin', 'elanous.mjs'), join(prefix, 'node_modules', '.bin', 'elanous'));
+      writeFileSync(join(prefix, 'install.json'), JSON.stringify({ source }));
+      expect(installMetadataSource(packageRoot)).toBeUndefined();
+      symlinkSync(join('..', 'node_modules', '.bin', 'elanous'), join(prefix, 'bin', 'elanous'));
+      expect(installMetadataSource(packageRoot)).toBe(source);
+      writeFileSync(join(packageRoot, 'install.json'), JSON.stringify({ source: 'local' }));
+      expect(installMetadataSource(packageRoot)).toBe(source);
+    } finally {
+      rmSync(prefix, { recursive: true, force: true });
+    }
+  });
+
+  test('reads versioned metadata rather than the last installed root metadata', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-source-versioned-'));
+    try {
+      const versionDir = join(root, 'versions', '1.0.0-cccccccccccc');
+      const packageRoot = join(versionDir, 'node_modules', 'elanous');
+      const source = join(root, 'repository');
+      mkdirSync(join(root, 'bin'), { recursive: true });
+      mkdirSync(join(versionDir, 'node_modules', '.bin'), { recursive: true });
+      mkdirSync(join(packageRoot, 'bin'), { recursive: true });
+      mkdirSync(source);
+      writeFileSync(join(packageRoot, 'bin', 'elanous.mjs'), '');
+      symlinkSync(join('..', 'elanous', 'bin', 'elanous.mjs'), join(versionDir, 'node_modules', '.bin', 'elanous'));
+      symlinkSync(join('versions', '1.0.0-cccccccccccc'), join(root, 'current'));
+      symlinkSync(join('..', 'current', 'node_modules', '.bin', 'elanous'), join(root, 'bin', 'elanous'));
+      writeFileSync(join(versionDir, 'install.json'), JSON.stringify({ source }));
+      writeFileSync(join(root, 'install.json'), JSON.stringify({ source: root }));
+      expect(installMetadataSource(packageRoot)).toBe(source);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('CLI version revision', () => {
   test('uses the installed tool repository revision instead of a different caller repository revision', () => {

@@ -1345,6 +1345,43 @@ describe('headless goal-loop child file heartbeat — 갈림 ① ㉢ · ② ㉠'
   });
 });
 
+describe('boundary Jev shadow watcher wiring', () => {
+  test('starts only the rejected enabled shadow after response and callback without awaiting it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'boundary-jev-watcher-'));
+    const requests = join(dir, 'requests');
+    const responses = join(dir, 'responses');
+    const calls: string[] = [];
+    let finish!: (value: { model: string; answers: {} }) => void;
+    try {
+      writeFileSync(requests, [
+        JSON.stringify({ requestId: 'started', requestType: 'command-start', commandFirstToken: 'git' }),
+        JSON.stringify({ requestId: 'rejected-1', boundary: '/tmp/worktree', cwd: '/tmp/worktree', targetKnown: false }),
+      ].join('\n').concat('\n'));
+      const stop = watchHarnessBoundaryRequests(requests, { ptyId: 'pty', runId: 'run' }, {
+        responsePath: responses, pollMs: 1_000_000,
+        boundaryShadow: { enabled: true, endpoint: 'http://localhost:1234/v1/systemone' },
+        boundaryShadowDeps: {
+          callJev: async (req) => {
+            calls.push((req.state as { request: { requestId: string } }).request.requestId);
+            return new Promise((resolve) => { finish = resolve; });
+          },
+          log: (_category, event) => { if (event === 'judged') calls.push(event); },
+          logUsage: () => {},
+        },
+        onVerdict: () => { expect(readFileSync(responses, 'utf8')).toContain('"requestId":"rejected-1"'); calls.push('callback'); },
+      });
+      try {
+        expect(calls).toEqual(['callback']);
+        await Promise.resolve();
+        expect(calls).toEqual(['callback', 'rejected-1']);
+        finish({ model: 'local', answers: { irreversible: { type: 'noul', noul: 0.9 } } });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(calls).toEqual(['callback', 'rejected-1', 'judged']);
+      } finally { stop(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('boundary behavior-axis shadow', () => {
   const dirs: string[] = [];
   const previousKey = process.env.TYPESAFE_API_KEY;

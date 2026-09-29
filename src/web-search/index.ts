@@ -88,12 +88,12 @@ export async function searchWeb(
   throw new WebSearchUnavailableError(tried, reasons);
 }
 
-/** Test-only reset — clears every registered provider and re-runs
- *  the built-in registration. Kept separate from the public API so
- *  production code can't accidentally wipe the registry. */
-export function _resetWebSearchProvidersForTests(): void {
+/** Test-only reset — clears every registered provider and normally re-runs
+ *  built-in registration. Pass false to isolate tests from credential-backed
+ *  providers. Kept separate from the public API. */
+export function _resetWebSearchProvidersForTests(includeBuiltins = true): void {
   providers.length = 0;
-  registerBuiltins();
+  if (includeBuiltins) registerBuiltins();
 }
 
 /** Snapshot of currently-available providers, in preference order.

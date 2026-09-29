@@ -93,7 +93,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 
 - A **graph** is the flow: order, branches, retries, pauses for approval, reshaping, healing.
 - A **workflow** (`elanous wf`) is the body of a single node: a short DAG of prompts, HTTP calls, classification and templates.
-- **Intake** turns what you say into tasks; the **task manager** runs a task. Today an approved task marked `[dev]` starts a harness run, and other tasks run as an agent with tools (🟡 on main). See [Tasks and intake](tasks-and-intake.md).
+- **Intake** turns what you say into tasks; the **task manager** runs a task. Today an approved task marked `[dev]` starts a harness run, and other tasks run as an agent with tools (✅ 0.2.3). See [Tasks and intake](tasks-and-intake.md).
 
 ## What ships today, what is in progress
 
@@ -102,16 +102,16 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 | Harness runs (implement · research · document · operate templates) | ✅ ships — the orchestrator drives them; the graph declaration is checked against every step |
 | Graph runner with approval pauses and resume (`elanous graph run` · `graph approve` · `graph run --resume`) | ✅ ships |
 | Run contract: local or remote (pod) | ✅ declared and resolved at run start |
-| Node catalog | ✅ declared and checked (judge, execute and observe roles built from existing parts) · 🟡 heal roles execute through their recipes — other roles do not yet execute by role name · 🔄 the harness templates still use their own node names; mapping them to catalog role names is in progress |
+| Node catalog | ✅ declared and checked (judge, execute and observe roles built from existing parts) · ✅ 0.2.3 heal roles execute through their recipes — other roles do not yet execute by role name · 🔄 the harness templates still use their own node names; mapping them to catalog role names is in progress |
 | New node kinds (observe · hitl · subgraph) | ✅ accepted by the graph parser |
-| Node outputs flowing to the next node · multi-way branching | 🟡 on main — next release (each node reads the run context; a node's last-line JSON `outcome` picks the edge) |
-| Heal template with the resolution ladder | 🟡 on main — next release: the runner walks it; the first observation step marks deleted files by itself and a real failure class closes without a human (example below) · 🔄 the deeper observation and outside-grounding steps are still being filled in |
+| Node outputs flowing to the next node · multi-way branching | ✅ 0.2.3 (each node reads the run context; a node's last-line JSON `outcome` picks the edge) |
+| Heal template with the resolution ladder | ✅ 0.2.3: the runner walks it; the first observation step marks deleted files by itself and a real failure class closes without a human (example below) · 🔄 the deeper observation and outside-grounding steps are still being filled in |
 | Posture level and alert priority for market watching | ✅ in the code — the level is computed from regime inputs and tripwires, alert priority reads it, and each computation and change is logged |
 | Posture setting cadence, resolution floor/ceiling, loop budget and grounding breadth | 📋 designed — most of the response profile is not consumed yet |
-| Budget decision before a launch (`elanous harness budget --json` → proceed · next provider · wait for reset · stop, with reasons) | 🟡 on main — next release |
-| Grounding sources registry (`elanous grounding sources list · add · discover · status`) | 🟡 on main — next release |
+| Budget decision before a launch (`elanous harness budget --json` → proceed · next provider · wait for reset · stop, with reasons) | ✅ 0.2.3 |
+| Grounding sources registry (`elanous grounding sources list · add · discover · status`) | ✅ 0.2.3 |
 | Supervisor adding nodes at launch and while running | 📋 designed |
-| Tasks that start harness runs (approved `[dev]` tasks → harness · other tasks → an agent with tools) | 🟡 on main — next release |
+| Tasks that start harness runs (approved `[dev]` tasks → harness · other tasks → an agent with tools) | ✅ 0.2.3 |
 | Task type → a combination of templates and workflows (run · implement · research · composite) | 📋 designed |
 | Workflows as graph nodes (`wf:`) · graphs as workflow nodes | 📋 designed |
 

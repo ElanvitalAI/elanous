@@ -90,6 +90,30 @@ describe('nativeToolCatalog', () => {
     expect(idsFor('mcp')).toEqual([]);
   });
 
+  test('retired VW and layout tools are absent while headless and shared tools remain available', () => {
+    for (const id of [
+      'window_list', 'window_create', 'window_switch', 'window_close',
+      'pane_list', 'pane_split', 'pane_focus', 'pane_close', 'pane_capture', 'pane_inject',
+      'vw_broadcast', 'vw_subscribe', 'vw_collect', 'vw_unsubscribe',
+      'spawn_coding_agent_in_vw', 'layout_save', 'layout_load', 'layout_apply_preset',
+    ]) {
+      expect(findNativeTool(id)).toBeUndefined();
+    }
+    expect(findNativeTool('SpawnCodingAgentInVW')).toBeUndefined();
+    expect(findNativeTool('SpawnCodingAgentHeadless')).toBeDefined();
+    expect(findNativeTool('RunScenario')).toBeDefined();
+  });
+
+  test('skill runner no longer imports or registers retired VW tools', () => {
+    const source = readFileSync(new URL('../src/skills/runner.ts', import.meta.url), 'utf8');
+    expect(source).not.toContain("from './tools/virtual-windows.js'");
+    expect(source).not.toContain("from './tools/spawn-coding-agent-vw.js'");
+    expect(source).not.toMatch(/build(?:WindowList|PaneCapture|VWCollect|SpawnCodingAgentInVW)Tool\(/);
+    expect(source).not.toMatch(/(?:WindowList|PaneCapture|VWCollect|SpawnCodingAgentInVW):\s*(?:async\s*)?\(/);
+    expect(source).toContain('buildAgentTool()');
+    expect(source).toContain('...browserSessionDispatchers');
+  });
+
   test('keeps RunDevHarness out of the default tui catalog while retaining SelfImplement', () => {
     const tuiTools = listNativeToolsForHost('tui').map(tool => tool.id);
 
@@ -293,7 +317,7 @@ describe('nativeToolCatalog — metadata invariants', () => {
     );
   });
 
-  test('keeps the 200-entry catalog on the five-host vocabulary after six virtual-window tools retire', () => {
+  test('keeps the catalog on the five-host vocabulary after VW and layout tools retire', () => {
     const distribution = new Map<string, number>();
     for (const { host } of nativeToolCatalog) {
       const key = host.join(',');
@@ -301,15 +325,15 @@ describe('nativeToolCatalog — metadata invariants', () => {
       expect(host).not.toContain('plugin');
     }
 
-    expect(nativeToolCatalog).toHaveLength(200);
+    expect(nativeToolCatalog).toHaveLength(182);
     expect([...distribution.entries()].sort()).toEqual([
       ['mcp', 16],
-      ['skill', 48],
+      ['skill', 33],
       ['skill,tui', 90],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).
       //   ⛔ #16003 이 SelfImplement 만 열고 이 짝을 안 열어서 챗 자식은 물을 도구가 없었다.
       ['skill,tui,chat', 1],
-      ['skill,tui,mcp', 38],
+      ['skill,tui,mcp', 35],
       // 🆕 SelfImplement — 챗에서도 부를 수 있다(2026-09-07 · 대표).
       //   ⭐ 이 툴은 «헤드리스 자식»을 띄우므로 ***부르는 쪽에 PTY 가 필요 없다.***
       ['skill,tui,mcp,chat', 1],

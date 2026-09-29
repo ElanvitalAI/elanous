@@ -24,13 +24,14 @@ import { ContinuationScheduler } from '../src/dispatch/continuation-scheduler.js
 import type { ContinuationStepResult } from '../src/dispatch/continuation-driver.js';
 import { makeContinuationRunTurn } from '../src/dispatch/continuation-turn-runner.js';
 import { getUserConfig } from '../src/user-config.js';
+import { envLiteral } from '../src/platform/env-literal.js';
 
 const SLUG = 'continuation-demo';
 const MAX_TICKS = 5;
 
 resetAutoModeForTest();
 const home = mkdtempSync(join(tmpdir(), 'cont-dogfood-'));
-const vault = discoverObsidianVault({ env: { ELANOUS_OBSIDIAN_VAULT: join(home, 'vault') }, cwd: home });
+const vault = discoverObsidianVault({ env: envLiteral({ ELANOUS_OBSIDIAN_VAULT: join(home, 'vault') }), cwd: home });
 const paths = resolveGoalPaths(vault, SLUG);
 const summaryPath = join(paths.goalRoot, 'executive-summary.md');
 

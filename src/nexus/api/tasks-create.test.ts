@@ -17,6 +17,7 @@ import { tasksDbPath } from '../../task-orchestrator/paths.js';
 import { isPublicRoute } from './public-routes.js';
 import { issueIngestToken, revokeIngestToken } from './ingest-token.js';
 import { handleTaskCreatePost } from './tasks-create.js';
+import { externalTaskFingerprint } from '../../task-orchestrator/external-fingerprint.js';
 import { setTestStateRoot } from '../paths.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'nexus-external-task-'));
@@ -76,15 +77,27 @@ test('authenticated route creates, deduplicates and approves external tasks with
   expect((await post('/v1/tasks', { title: 'Bad', priority: 'urgent' })).status).toBe(400);
   expect((await post('/v1/tasks', { title: 'Bad', external: { provider: 'linear', ref: 'LIN-3' }, surface: { kind: 'terminal-pane', spec: { command: 'echo unsafe' } } })).status).toBe(400);
   expect(graph.size()).toBe(1);
+  const ingestToken = issueIngestToken('approval-scope').token;
+  try {
+    expect((await fetch(`${server.url}/v1/tasks/${encodeURIComponent(taskId)}/approve`, {
+      method: 'POST', headers: { authorization: `Bearer ${ingestToken}`, 'sec-fetch-site': 'cross-site' },
+      body: '{}',
+    })).status).toBe(401);
+    expect(graph.getTask(taskId)?.approval?.state).toBe('pending');
+  } finally { revokeIngestToken('approval-scope'); }
   const approved = await post(`/v1/tasks/${encodeURIComponent(taskId)}/approve`, {});
   expect(approved.status).toBe(200);
-  const approvedBody = await approved.json() as { approval: { state: string; approvedBy?: string; rule?: string } };
+  const approvedBody = await approved.json() as { approval: { state: string; approvedBy?: string; rule?: string; fingerprint?: string } };
   // A person approved it: never recorded as an autoRun match.
   expect(approvedBody.approval).toMatchObject({ state: 'approved', approvedBy: 'manual' });
   expect(approvedBody.approval.rule).toBeUndefined();
-  expect(graph.getTask(taskId)?.status).toBe('ready');
+  expect(approvedBody.approval.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  const approvedTask = graph.getTask(taskId)!;
+  expect(approvedBody.approval.fingerprint).toBe(externalTaskFingerprint(approvedTask));
+  expect(approvedTask.status).toBe('ready');
+  expect(approvedTask.approval?.fingerprint).toBe(approvedBody.approval.fingerprint);
   expect(store.getTask(taskId)?.status).toBe('ready');
-  expect(store.getTask(taskId)?.approval).toMatchObject({ state: 'approved', approvedBy: 'manual' });
+  expect(store.getTask(taskId)?.approval).toEqual(approvedTask.approval);
   expect((await post(`/v1/tasks/${encodeURIComponent(taskId)}/approve`, {})).status).toBe(409);
   graph.updateTask(taskId, { status: 'running' });
   expect((await post(`/v1/tasks/${encodeURIComponent(taskId)}/approve`, {})).status).toBe(409);

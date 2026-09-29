@@ -13,9 +13,9 @@ import Link from 'next/link';
 
 /** 파이프라인 단계 표(순서 = 데이터 흐름). 테스트가 이 표 shape 를 검증(Next 훅 의존 0). */
 export const FABRIC_STAGES = [
-  { key: 'autopilot', href: '/autopilot', num: '①', label: 'Autopilot', sub: '미션·포착' },
-  { key: 'tasks', href: '/tasks', num: '②', label: 'Tasks', sub: '실행' },
-  { key: 'scheduler', href: '/scheduler', num: '③', label: 'Scheduler', sub: '트리거' },
+  { key: 'autopilot', href: '/autopilot', num: '①', label: '미션', sub: 'Autopilot' },
+  { key: 'tasks', href: '/tasks', num: '②', label: '작업', sub: 'Tasks' },
+  { key: 'scheduler', href: '/scheduler', num: '③', label: '스케줄', sub: 'Schedules' },
 ] as const;
 const STAGES = FABRIC_STAGES;
 
@@ -29,7 +29,7 @@ export function FabricStageHeader({ active }: { active: FabricStage }) {
       data-testid="fabric-stage-header"
       className="flex flex-wrap items-center gap-1 text-xs"
     >
-      <span className="mr-1 text-muted-foreground">Mission Fabric</span>
+      <span className="mr-1 text-muted-foreground">Missions</span>
       {STAGES.map((s, i) => (
         <span key={s.key} className="flex items-center gap-1">
           <Link

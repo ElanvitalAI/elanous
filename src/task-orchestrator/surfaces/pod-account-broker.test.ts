@@ -51,6 +51,28 @@ describe('pod account broker — 병렬 Pod 가 한 계정에 몰리지 않게',
   });
 });
 
+describe('💳 크레딧 허가(09-28 · 9·10월 출시 특별 기간)', () => {
+  test('구독 잔량 계정이 하나도 없으면 찬 계정을 사용률 낮은 순으로 크레딧으로 쓴다', () => {
+    const plan = planPodAccounts([c('default', 98), c('team', 100, true), c('third', 100)], { thresholdPercentByAccount: { default: 97 }, creditsAllowed: true });
+    expect(plan.usable).toEqual(['default', 'team', 'third']);
+    expect(plan.creditAccounts).toEqual(['default', 'team', 'third']);
+    expect(plan.excluded).toEqual([]);
+  });
+
+  test('잔량 계정이 있으면 크레딧 계정은 쓰지 않는다 · 허가가 꺼지면 종전대로 제외', () => {
+    const some = planPodAccounts([c('default', 40), c('team', 100, true)], { creditsAllowed: true });
+    expect(some.usable).toEqual(['default']);
+    expect(some.creditAccounts).toBeUndefined();
+    const off = planPodAccounts([c('default', 98), c('team', 100, true)], { thresholdPercentByAccount: { default: 97 } });
+    expect(off.usable).toEqual([]);
+  });
+
+  test('planPodProvider 는 크레딧 허가면 grok 으로 가지 않고 codex 에 머문다', () => {
+    const plan = planPodProvider({ codexCandidates: [c('default', 99), c('third', 100, true)], thresholdPercentByAccount: { default: 97 }, creditsAllowed: true, grokSubscription: true, grokApiKey: false, grokApiKeyOptIn: false });
+    expect(plan.provider).toBe('openai-codex');
+  });
+});
+
 describe('pod provider selection', () => {
   const candidates = (third: number) => [c('default', 100), c('team', 95), c('third', third)];
   const available = { grokSubscription: true, grokApiKey: false, grokApiKeyOptIn: false };

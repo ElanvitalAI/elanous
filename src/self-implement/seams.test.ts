@@ -3,10 +3,10 @@ import { test, expect, describe, beforeEach, afterEach, spyOn } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, rmdirSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, rmdirSync, symlinkSync, writeFileSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { worktreeHasChanges, preservationHasChanges, changedFiles, commitTitles, commitWorktree, unstageElanousRuntimeArtifacts, featurePrompt, defaultSeams, changedFileTypecheck, gateChangedFiles, gateWorktreeBehindMain, resolveBootFailureReason, toReviewIntentInput, worktreeDiff, reviewScopeDiff, REVIEW_SCOPE_UNMEASURABLE, type DefaultSeamsOptions } from './seams.js';
+import { worktreeHasChanges, preservationHasChanges, changedFiles, commitTitles, commitWorktree, unstageElanousRuntimeArtifacts, featurePrompt, defaultSeams, changedFileTypecheck, mergeBaseDiagnostics, gateChangedFiles, gateWorktreeBehindMain, resolveBootFailureReason, toReviewIntentInput, worktreeDiff, reviewScopeDiff, REVIEW_SCOPE_UNMEASURABLE, type DefaultSeamsOptions } from './seams.js';
 import type { PrManager } from '../autopilot/pr-manager.js';
 import type { SelfImplementSeams } from './orchestrator.js';
 import { runSelfImplement } from './orchestrator.js';
@@ -1112,6 +1112,122 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
     expect(r.log).toContain('refFacts');
   });
 
+  test('Next env 설정 없는 구 브랜치는 셋째 패스만 건너뛰고 로그에 config-missing을 남긴다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'no-pwa-env-config-'));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      mkdirSync(join(cwd, 'src'));
+      writeFileSync(join(cwd, 'src/a.ts'), 'export const a = 1;');
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), '{"include":["src/**/*.ts"]}');
+      const calls: string[][] = [];
+      const result = changedFileTypecheck(cwd, ['src/a.ts'], (_cmd, args) => { calls.push(args); return completed(''); });
+      expect(calls).toHaveLength(1);
+      expect(result).toMatchObject({ passed: true, noInspectionReason: null });
+      expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({ pwaEnv: 'config-missing' }), expect.anything());
+    } finally { log.mockRestore(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test('test 디렉터리의 파일만 바뀌면 Next env 패스를 실행하지 않는다', () => {
+    const calls: string[][] = [];
+    const result = changedFileTypecheck(gateConfigCwd, ['test/helper.ts'], (_cmd, args) => {
+      calls.push(args);
+      return completed('');
+    });
+    expect(result).toMatchObject({ passed: true, errors: 0 });
+    expect(calls).toHaveLength(1);
+  });
+
+  test('Next env 패스만 실행 실패하면 못 잰 것으로 막고 시험 파일만 바뀌면 건너뛴다', () => {
+    const calls: string[][] = [];
+    const run = (_cmd: string, args: string[]) => {
+      calls.push(args);
+      return calls.length === 2
+        ? { out: '', status: null, signal: 'SIGKILL' as const, durationMs: 1 }
+        : completed('');
+    };
+    const failed = changedFileTypecheck(gateConfigCwd, [F], run);
+    expect(failed).toMatchObject({ passed: false, executed: false, errors: 0, noInspectionReason: null });
+    expect(failed.log).toContain('SIGKILL');
+    calls.length = 0;
+    expect(changedFileTypecheck(gateConfigCwd, ['src/foo.test.ts'], run)).toMatchObject({ passed: true, executed: true, errors: 0 });
+    expect(calls).toHaveLength(1);
+  });
+
+  test('루트 ProcessEnv 실물 범위 컴파일은 비시험 파일만 Next env 오류로 막고 단언 뒤 통과한다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pwa-env-seams-'));
+    const sourceRoot = resolve(import.meta.dir, '../..');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(git(cwd, 'init', '-q').status).toBe(0);
+      mkdirSync(join(cwd, 'src'));
+      mkdirSync(join(cwd, 'types'));
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [], skipLibCheck: true }, include: ['src/**/*.ts', 'types/node.d.ts'] }));
+      writeFileSync(join(cwd, 'tsconfig.pwa-env.json'), readFileSync(join(sourceRoot, 'tsconfig.pwa-env.json'), 'utf8').replace('"types/next-process-env-mirror.d.ts"', '"types/next-process-env-mirror.d.ts", "types/node.d.ts"'));
+      writeFileSync(join(cwd, 'types/next-process-env-mirror.d.ts'), readFileSync(join(sourceRoot, 'types/next-process-env-mirror.d.ts'), 'utf8'));
+      writeFileSync(join(cwd, 'types/node.d.ts'), 'declare namespace NodeJS { interface ProcessEnv { PATH?: string } }');
+      writeFileSync(join(cwd, 'src/a.test.ts'), "export const e: NodeJS.ProcessEnv = { PATH: '/bin' };\n");
+      const check = (literal: boolean) => {
+        writeFileSync(join(cwd, 'src/a.ts'), `const e: NodeJS.ProcessEnv = ${literal ? "{ PATH: '/bin' } as NodeJS.ProcessEnv" : "{ PATH: '/bin' }"};\n`);
+        const configs: string[] = [];
+        const result = changedFileTypecheck(cwd, ['src/a.ts', 'src/a.test.ts'], (_cmd, args) => {
+          const config = args.at(-1)!;
+          configs.push(config);
+          const run = spawnSync(process.execPath, [join(sourceRoot, 'node_modules/typescript/bin/tsc'), '--noEmit', '-p', config], { cwd, encoding: 'utf8' });
+          return { out: `${run.stdout ?? ''}${run.stderr ?? ''}`, status: run.status, signal: run.signal, durationMs: 1 };
+        });
+        return { result, configs };
+      };
+      const broken = check(false);
+      expect(broken.result).toMatchObject({ passed: false, errors: 1 });
+      expect(broken.result.log).toContain('src/a.ts');
+      expect(broken.result.log).toContain("Property 'NODE_ENV' is missing");
+      expect(broken.result.log).not.toContain('src/a.test.ts');
+      expect(broken.configs).toHaveLength(2);
+      expect(log.mock.calls.find((call) => call[0] === 'typecheck.gate' && call[1] === 'ratchet')?.[2]).toMatchObject({
+        executions: [expect.objectContaining({ checkedFiles: ['src/a.ts', 'src/a.test.ts'] }), expect.objectContaining({ checkedFiles: ['src/a.ts'], scopedConfigUsed: true })],
+      });
+      expect(check(true).result).toMatchObject({ passed: true, errors: 0 });
+    } finally { log.mockRestore(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test('독립적인 root .tsx는 범위 컴파일 Next env 오류에 귀속되고 test는 제외된다', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pwa-env-tsx-seams-'));
+    const sourceRoot = resolve(import.meta.dir, '../..');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      git(cwd, 'init', '-q');
+      mkdirSync(join(cwd, 'src'));
+      mkdirSync(join(cwd, 'types'));
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, types: [], skipLibCheck: true }, include: ['src/**/*.ts', 'types/node.d.ts'] }));
+      writeFileSync(join(cwd, 'tsconfig.pwa-env.json'), readFileSync(join(sourceRoot, 'tsconfig.pwa-env.json'), 'utf8').replace('"types/next-process-env-mirror.d.ts"', '"types/next-process-env-mirror.d.ts", "types/node.d.ts"'));
+      writeFileSync(join(cwd, 'types/next-process-env-mirror.d.ts'), readFileSync(join(sourceRoot, 'types/next-process-env-mirror.d.ts'), 'utf8'));
+      writeFileSync(join(cwd, 'types/node.d.ts'), 'declare namespace NodeJS { interface ProcessEnv { PATH?: string } }');
+      writeFileSync(join(cwd, 'src/Widget.tsx'), "const e: NodeJS.ProcessEnv = { PATH: '/bin' };\n");
+      writeFileSync(join(cwd, 'src/Widget.test.ts'), "export const e: NodeJS.ProcessEnv = { PATH: '/bin' };\n");
+      const outputs: string[] = [];
+      const result = changedFileTypecheck(cwd, ['src/Widget.tsx', 'src/Widget.test.ts'], (_cmd, args) => {
+        const output = spawnSync(process.execPath, [join(sourceRoot, 'node_modules/typescript/bin/tsc'), '--noEmit', '-p', args.at(-1)!], { cwd, encoding: 'utf8' });
+        outputs.push(`${output.stdout ?? ''}${output.stderr ?? ''}`);
+        return { out: outputs.at(-1)!, status: output.status, signal: output.signal, durationMs: 1 };
+      });
+      expect(outputs).toHaveLength(2);
+      expect(outputs[1]).toContain('src/Widget.tsx(1,7): error TS2741');
+      expect(outputs[1]).not.toContain('src/Widget.test.ts');
+      expect(result).toMatchObject({ passed: false, errors: 1 });
+      expect(result.log).toContain('src/Widget.tsx(1,7): error TS2741');
+      expect(result.log).not.toContain('src/Widget.test.ts');
+      expect(log.mock.calls.find((call) => call[0] === 'typecheck.gate' && call[1] === 'ratchet')?.[2]).toMatchObject({
+        executions: [expect.anything(), { config: 'tsconfig.pwa-env.json', checkedFiles: ['src/Widget.tsx'], executed: true, scopedConfigUsed: true }],
+      });
+      writeFileSync(join(cwd, 'src/Widget.tsx'), "const e: NodeJS.ProcessEnv = { PATH: '/bin' } as NodeJS.ProcessEnv;\n");
+      const repaired = changedFileTypecheck(cwd, ['src/Widget.tsx', 'src/Widget.test.ts'], (_cmd, args) => {
+        const output = spawnSync(process.execPath, [join(sourceRoot, 'node_modules/typescript/bin/tsc'), '--noEmit', '-p', args.at(-1)!], { cwd, encoding: 'utf8' });
+        return { out: `${output.stdout ?? ''}${output.stderr ?? ''}`, status: output.status, signal: output.signal, durationMs: 1 };
+      });
+      expect(repaired).toMatchObject({ passed: true, errors: 0 });
+    } finally { log.mockRestore(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   test('TypeScript 설정이 전혀 없는 작업 트리에서 .ts 하나를 바꾸면 해당 없음으로 통과하고 컴파일러를 돌리지 않는다', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'no-typescript-config-'));
     const log = spyOn(debug, 'log').mockImplementation(() => {});
@@ -1432,12 +1548,242 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
     expect(r.log).toContain("Type 'string' is not assignable");
   });
 
+  test('PWA entry uses its own scoped config while zero root entries fall back to the full project', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-pwa-scoped-'));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      mkdirSync(join(cwd, 'apps/pwa/src'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      writeFileSync(join(cwd, 'apps/pwa/tsconfig.json'), '{}\n');
+      writeFileSync(join(cwd, 'apps/pwa/src/view.tsx'), 'export const view = 1;\n');
+      const configs: string[] = [];
+      const result = changedFileTypecheck(cwd, ['apps/pwa/src/view.tsx'], (_cmd, args) => {
+        configs.push(args.at(-1)!);
+        if (configs.length === 2) {
+          expect(JSON.parse(readFileSync(args.at(-1)!, 'utf8'))).toMatchObject({ files: ['src/view.tsx'], include: [], exclude: [] });
+        }
+        return completed('');
+      });
+      expect(result).toMatchObject({ passed: true, checked: 1, errors: 0 });
+      expect(configs[0]).toBe('tsconfig.gate.json');
+      expect(configs[1]).toContain('/apps/pwa/.elanous-typecheck-scope-');
+      expect(readdirSync(join(cwd, 'apps/pwa')).filter((file) => file.startsWith('.elanous-typecheck-scope-'))).toEqual([]);
+      expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({
+        executions: [
+          { config: 'tsconfig.gate.json', checkedFiles: [], executed: true, scopedConfigUsed: false },
+          { config: 'apps/pwa/tsconfig.json', checkedFiles: ['apps/pwa/src/view.tsx'], executed: true, scopedConfigUsed: true },
+        ],
+      }), { level: 'info' });
+    } finally {
+      log.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('current scoped config contains changed and promoted consumer roots and is removed after inspection', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-current-scoped-'));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; }\n');
+      writeFileSync(join(cwd, 'src/consumer.ts'), "import type { Model } from './model';\nexport const value: Model = { stable: 'ok' };\n");
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; required: boolean; }\n');
+      const seen: string[][] = [];
+      const diagnostic = 'src/consumer.ts(2,14): error TS2741: missing required.';
+      const result = changedFileTypecheck(cwd, ['src/model.ts'], (_cmd, args) => {
+        if (args.at(-1)?.includes('.elanous-typecheck-scope-')) {
+          const config = JSON.parse(readFileSync(args.at(-1)!, 'utf8')) as { files: string[]; extends: string };
+          expect(config.extends).toBe(join(realpathSync(cwd), 'tsconfig.gate.json')); // the writer resolves the tree (macOS /var → /private/var)
+          seen.push(config.files);
+        }
+        return completed(diagnostic);
+      }, undefined, () => []);
+      expect(result).toMatchObject({ passed: false, checked: 2, errors: 1 });
+      expect(seen).toEqual([['src/model.ts', 'src/consumer.ts']]);
+      expect(readdirSync(cwd).filter((file) => file.startsWith('.elanous-typecheck-scope-'))).toEqual([]);
+      expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({
+        executions: [{ config: 'tsconfig.gate.json', checkedFiles: ['src/model.ts', 'src/consumer.ts'], executed: true, scopedConfigUsed: true }],
+      }), expect.anything());
+    } finally {
+      log.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('promotion compares base diagnostics: existing consumer stays outside, added consumer fails', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-diff-consumer-'));
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; }\n');
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; required: boolean; }\n');
+      const oldLine = 'src/old.ts(2,1): error TS2322: existing debt.';
+      const newLine = 'src/new.ts(2,1): error TS2741: Property required is missing.';
+      const baseDiagnostics = (_cwd: string, config: string, files?: readonly string[]) => {
+        expect(config).toBe('tsconfig.gate.json');
+        expect(files).toEqual(['src/model.ts', 'src/old.ts', 'src/new.ts']);
+        return [{ file: 'src/old.ts', line: oldLine, code: 'TS2322' }];
+      };
+      const run = () => completed(`${oldLine}\n${newLine}`);
+      const result = changedFileTypecheck(cwd, ['src/model.ts'], run, undefined, baseDiagnostics);
+      expect(result).toMatchObject({ passed: false, checked: 2, errors: 1 });
+      expect(result.log).toContain(newLine);
+      expect(result.log).not.toContain(oldLine);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('unavailable base diagnostics with current consumer errors warns instead of failing', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-unavailable-base-'));
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; }\n');
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; required: boolean; }\n');
+      const result = changedFileTypecheck(cwd, ['src/model.ts'], () => completed(
+        'src/consumer.ts(2,1): error TS2741: new consumer.',
+      ), undefined, () => null);
+      // 골: base 를 못 얻으면 승격 소비자는 «실패»가 아니라 경고로만 — 자식이 고칠 수 없는 이유로 런을 막지 않는다.
+      expect(result).toMatchObject({ passed: true, checked: 1, errors: 0 });
+      expect(result.log).toContain('base 진단 비교 불가');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('PWA promotion compares PWA baseline independently of root baseline', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-pwa-diff-'));
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      mkdirSync(join(cwd, 'apps/pwa/node_modules'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      writeFileSync(join(cwd, 'apps/pwa/tsconfig.json'), '{}\n');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; }\n');
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; required: boolean; }\n');
+      const oldLine = 'apps/pwa/src/a.tsx(2,1): error TS2322: old debt.';
+      const newLine = 'apps/pwa/src/b.tsx(2,1): error TS2741: new consumer.';
+      const configs: string[] = [];
+      const result = changedFileTypecheck(cwd, ['src/model.ts'], (_cmd, args) => completed(
+        args.includes('apps/pwa/tsconfig.json') ? `${oldLine}\n${newLine}` : '',
+      ), undefined, (_dir, config) => {
+        configs.push(config);
+        return config === 'apps/pwa/tsconfig.json' ? [{ file: 'apps/pwa/src/a.tsx', line: oldLine, code: 'TS2322' }] : [];
+      });
+      // 루트 진단이 비었으니 루트 base 는 재지 않는다(소비자 후보가 있을 때만 base 를 잰다).
+      expect(configs).toEqual(['apps/pwa/tsconfig.json']);
+      expect(result).toMatchObject({ passed: false, checked: 2, errors: 1 });
+      expect(result.log).toContain(newLine);
+      expect(result.log).not.toContain(oldLine);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('missing PWA workspace dependencies still runs compiler with root resolution', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-pwa-unavailable-'));
+    try {
+      mkdirSync(join(cwd, 'apps/pwa'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      writeFileSync(join(cwd, 'apps/pwa/tsconfig.json'), '{}\n');
+      const configs: string[] = [];
+      const result = changedFileTypecheck(cwd, ['apps/pwa/src/view.tsx'], (_cmd, args) => {
+        configs.push(args.at(-1)!);
+        return completed('');
+      });
+      expect(configs).toEqual(['tsconfig.gate.json', 'apps/pwa/tsconfig.json']);
+      expect(result).toMatchObject({ passed: true, executed: true, checked: 1 });
+      expect(result.log).toBe('');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('base scopes only paths present at the fork, falls back for exclusively new paths, and keeps ambient declarations', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-base-new-file-'));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), JSON.stringify({ compilerOptions: { noEmit: true, types: [] }, include: ['src/**/*.ts'] }));
+      writeFileSync(join(cwd, 'src/globals.d.ts'), 'declare const PROJECT_GLOBAL: number;\n');
+      writeFileSync(join(cwd, 'src/existing.ts'), 'export const existing: number = PROJECT_GLOBAL;\n');
+      symlinkSync(join(gateConfigCwd, 'node_modules'), join(cwd, 'node_modules'), 'dir');
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      git(cwd, 'add', 'tsconfig.gate.json', 'src');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/new.ts'), 'export const added: number = PROJECT_GLOBAL;\n');
+
+      expect(mergeBaseDiagnostics(cwd, 'tsconfig.gate.json', ['src/existing.ts', 'src/new.ts'])).toEqual([]);
+      expect(log).toHaveBeenCalledWith('typecheck.gate', 'base-diagnostics', { config: 'tsconfig.gate.json', scopedConfigUsed: true });
+      expect(mergeBaseDiagnostics(cwd, 'tsconfig.gate.json', ['src/new.ts'])).toEqual([]);
+      expect(log).toHaveBeenCalledWith('typecheck.gate', 'base-diagnostics', { config: 'tsconfig.gate.json', scopedConfigUsed: false });
+      expect(git(cwd, 'worktree', 'list', '--porcelain').stdout.match(/^worktree /gm)).toHaveLength(1);
+    } finally {
+      log.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('default base diagnostics uses a dependency-linked merge-base worktree and cleans it up', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'typecheck-base-worktree-'));
+    try {
+      mkdirSync(join(cwd, 'src'), { recursive: true });
+      writeFileSync(join(cwd, 'tsconfig.gate.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true }, include: ['src/*.ts'] }));
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; }\n');
+      writeFileSync(join(cwd, 'src/consumer.ts'), "import type { Model } from './model';\nexport const value: Model = { stable: 'ok' };\n");
+      symlinkSync(join(gateConfigCwd, 'node_modules'), join(cwd, 'node_modules'), 'dir');
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/model.ts'), 'export interface Model { stable: string; required: boolean; }\n');
+      const line = "src/consumer.ts(2,14): error TS2741: Property 'required' is missing in type '{ stable: string; }' but required in type 'Model'.";
+      const baseLog = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        const result = changedFileTypecheck(cwd, ['src/model.ts'], () => completed(line));
+        expect(result).toMatchObject({ passed: false, checked: 2, errors: 1 });
+        expect(baseLog).toHaveBeenCalledWith('typecheck.gate', 'base-diagnostics', { config: 'tsconfig.gate.json', scopedConfigUsed: true });
+      } finally {
+        baseLog.mockRestore();
+      }
+      expect(git(cwd, 'worktree', 'list', '--porcelain').stdout.match(/^worktree /gm)).toHaveLength(1);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   test('export 타입에 필수 필드가 추가되면 그 타입을 쓰는 미변경 consumer도 검사 대상에 포함한다', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'required-export-consumer-'));
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       mkdirSync(join(cwd, 'src'), { recursive: true });
       writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      mkdirSync(join(cwd, 'apps/pwa/node_modules'), { recursive: true });
+      writeFileSync(join(cwd, 'apps/pwa/tsconfig.json'), '{}\n');
       writeFileSync(join(cwd, 'src', 'model.ts'), 'export interface Model { stable: string; }\n');
       writeFileSync(join(cwd, 'src', 'consumer.ts'), "import type { Model } from './model';\nexport const value: Model = { stable: 'ok' };\n");
       git(cwd, 'init', '-b', 'main');
@@ -1449,14 +1795,14 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
 
       const r = changedFileTypecheck(cwd, ['src/model.ts'], () => completed(
         "src/consumer.ts(2,14): error TS2741: Property 'required' is missing in type '{ stable: string; }' but required in type 'Model'.",
-      ));
+      ), undefined, () => []);
 
       expect(r).toMatchObject({ passed: false, checked: 2, errors: 1 });
       expect(r.log).toContain('src/consumer.ts');
       expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({
         executions: [
-          { config: 'tsconfig.gate.json', checkedFiles: ['src/model.ts', 'src/consumer.ts'], executed: true },
-          { config: 'apps/pwa/tsconfig.json', checkedFiles: [], executed: true },
+          { config: 'tsconfig.gate.json', checkedFiles: ['src/model.ts', 'src/consumer.ts'], executed: true, scopedConfigUsed: true },
+          { config: 'apps/pwa/tsconfig.json', checkedFiles: [], executed: true, scopedConfigUsed: false },
         ],
         requiredExportFieldPromotions: [{ file: 'src/model.ts', typeName: 'Model', fieldName: 'required' }],
       }), { level: 'warn' });
@@ -1471,6 +1817,7 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       mkdirSync(join(cwd, 'src'), { recursive: true });
+      mkdirSync(join(cwd, 'apps/pwa/node_modules'), { recursive: true });
       mkdirSync(join(cwd, 'apps', 'pwa', 'src'), { recursive: true });
       mkdirSync(join(cwd, 'apps', 'pwa'), { recursive: true });
       writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
@@ -1487,21 +1834,24 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
       const calls: string[][] = [];
       const r = changedFileTypecheck(cwd, ['src/model.ts'], (_cmd, args) => {
         calls.push(args);
-        return completed(args.includes('apps/pwa/tsconfig.json')
+        return completed(args.at(-1)?.includes('/apps/pwa/') || args.includes('apps/pwa/tsconfig.json')
           ? "apps/pwa/src/consumer.tsx(2,14): error TS2741: Property 'required' is missing in type '{ stable: string; }' but required in type 'Model'."
           : '');
-      });
+      }, undefined, () => []);
 
-      expect(calls).toEqual([
+      expect(calls.slice(0, 2)).toEqual([
         ['tsc', '--noEmit', '-p', 'tsconfig.gate.json'],
         ['tsc', '--noEmit', '-p', 'apps/pwa/tsconfig.json'],
       ]);
+      expect(calls).toHaveLength(4);
+      expect(calls[2]?.at(-1)).toContain('.elanous-typecheck-scope-');
+      expect(calls[3]?.at(-1)).toContain('.elanous-typecheck-scope-');
       expect(r).toMatchObject({ passed: false, checked: 2, errors: 1 });
       expect(r.log).toContain('apps/pwa/src/consumer.tsx');
       expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({
         executions: [
-          { config: 'tsconfig.gate.json', checkedFiles: ['src/model.ts'], executed: true },
-          { config: 'apps/pwa/tsconfig.json', checkedFiles: ['apps/pwa/src/consumer.tsx'], executed: true },
+          { config: 'tsconfig.gate.json', checkedFiles: ['src/model.ts'], executed: true, scopedConfigUsed: true },
+          { config: 'apps/pwa/tsconfig.json', checkedFiles: ['apps/pwa/src/consumer.tsx'], executed: true, scopedConfigUsed: true },
         ],
         requiredExportFieldPromotions: [{ file: 'src/model.ts', typeName: 'Model', fieldName: 'required' }],
       }), { level: 'warn' });
@@ -1516,6 +1866,7 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       mkdirSync(join(cwd, 'src'), { recursive: true });
+      mkdirSync(join(cwd, 'apps/pwa/node_modules'), { recursive: true });
       mkdirSync(join(cwd, 'apps', 'pwa', 'src'), { recursive: true });
       writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
       writeFileSync(join(cwd, 'apps', 'pwa', 'tsconfig.json'), '{}\n');
@@ -1531,22 +1882,25 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
       const calls: string[][] = [];
       const r = changedFileTypecheck(cwd, ['src/api.ts'], (_cmd, args) => {
         calls.push(args);
-        return completed(args.includes('apps/pwa/tsconfig.json')
+        return completed(args.at(-1)?.includes('/apps/pwa/') || args.includes('apps/pwa/tsconfig.json')
           ? "apps/pwa/src/consumer.tsx(1,10): error TS2305: Module '../../../src/api' has no exported member 'removed'."
           : '');
-      });
+      }, undefined, () => []);
 
-      expect(calls).toEqual([
+      expect(calls.slice(0, 2)).toEqual([
         ['tsc', '--noEmit', '-p', 'tsconfig.gate.json'],
         ['tsc', '--noEmit', '-p', 'apps/pwa/tsconfig.json'],
       ]);
+      expect(calls).toHaveLength(4);
+      expect(calls[2]?.at(-1)).toContain('.elanous-typecheck-scope-');
+      expect(calls[3]?.at(-1)).toContain('.elanous-typecheck-scope-');
       expect(r).toMatchObject({ passed: false, checked: 2, errors: 1 });
       expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({
         promotionTriggers: ['removed-exported-symbol'],
         removedExportedSymbolPromotions: [{ file: 'src/api.ts', name: 'removed' }],
         executions: [
-          { config: 'tsconfig.gate.json', checkedFiles: ['src/api.ts'], executed: true },
-          { config: 'apps/pwa/tsconfig.json', checkedFiles: ['apps/pwa/src/consumer.tsx'], executed: true },
+          { config: 'tsconfig.gate.json', checkedFiles: ['src/api.ts'], executed: true, scopedConfigUsed: true },
+          { config: 'apps/pwa/tsconfig.json', checkedFiles: ['apps/pwa/src/consumer.tsx'], executed: true, scopedConfigUsed: true },
         ],
       }), { level: 'warn' });
     } finally {
@@ -1561,6 +1915,8 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
     try {
       mkdirSync(join(cwd, 'src'), { recursive: true });
       writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
+      mkdirSync(join(cwd, 'apps/pwa/node_modules'), { recursive: true });
+      writeFileSync(join(cwd, 'apps/pwa/tsconfig.json'), '{}\n');
       writeFileSync(join(cwd, 'src', 'api.ts'), 'export function format(value: string) { return value; }\n');
       writeFileSync(join(cwd, 'src', 'consumer.ts'), "import { format } from './api';\nexport const value = format('ok');\n");
       git(cwd, 'init', '-b', 'main');
@@ -1572,7 +1928,7 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
 
       const r = changedFileTypecheck(cwd, ['src/api.ts'], () => completed(
         'src/consumer.ts(2,22): error TS2554: Expected 2 arguments, but got 1.',
-      ));
+      ), undefined, () => []);
 
       expect(r).toMatchObject({ passed: false, checked: 2, errors: 1 });
       expect(r.log).toContain('src/consumer.ts');
@@ -1580,8 +1936,8 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
         promotionTriggers: ['added-function-parameter'],
         addedFunctionParameterPromotions: [{ file: 'src/api.ts', name: 'format', from: 1, to: 2 }],
         executions: [
-          { config: 'tsconfig.gate.json', checkedFiles: ['src/api.ts', 'src/consumer.ts'], executed: true },
-          { config: 'apps/pwa/tsconfig.json', checkedFiles: [], executed: true },
+          { config: 'tsconfig.gate.json', checkedFiles: ['src/api.ts', 'src/consumer.ts'], executed: true, scopedConfigUsed: true },
+          { config: 'apps/pwa/tsconfig.json', checkedFiles: [], executed: true, scopedConfigUsed: false },
         ],
       }), { level: 'warn' });
     } finally {
@@ -1595,6 +1951,7 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       mkdirSync(join(cwd, 'src'), { recursive: true });
+      mkdirSync(join(cwd, 'apps/pwa/node_modules'), { recursive: true });
       mkdirSync(join(cwd, 'apps', 'pwa', 'src'), { recursive: true });
       mkdirSync(join(cwd, 'apps', 'pwa'), { recursive: true });
       writeFileSync(join(cwd, 'tsconfig.gate.json'), '{}\n');
@@ -1618,8 +1975,8 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
       expect(r.log).not.toContain('src/unrelated.ts');
       expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({
         executions: [
-          { config: 'tsconfig.gate.json', checkedFiles: [], executed: true },
-          { config: 'apps/pwa/tsconfig.json', checkedFiles: ['apps/pwa/src/model.tsx'], executed: true },
+          { config: 'tsconfig.gate.json', checkedFiles: [], executed: true, scopedConfigUsed: false },
+          { config: 'apps/pwa/tsconfig.json', checkedFiles: ['apps/pwa/src/model.tsx'], executed: true, scopedConfigUsed: true },
         ],
         requiredExportFieldPromotions: [{ file: 'apps/pwa/src/model.tsx', typeName: 'PwaModel', fieldName: 'required' }],
       }), { level: 'info' });
@@ -1660,7 +2017,10 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
       calls.push(args);
       return completed(`${F}(1,1): error TS2304: Cannot find name 'rootOnly'.`);
     });
-    expect(calls).toEqual([['tsc', '--noEmit', '-p', 'tsconfig.gate.json']]);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.slice(0, 3)).toEqual(['tsc', '--noEmit', '-p']);
+    expect(calls[0]?.at(-1)).toContain('.elanous-typecheck-scope-');
+    expect(calls[1]?.at(-1)).toContain('.elanous-typecheck-scope-');
     expect(r).toMatchObject({ passed: false, errors: 1 });
   });
 
@@ -1669,14 +2029,15 @@ describe('changedFileTypecheck — #2 변경파일 스코프 tsc 게이트', () 
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       changedFileTypecheck(gateConfigCwd, [F, pwa], (_cmd, args) => completed(
-        args.includes('apps/pwa/tsconfig.json')
+        args.at(-1)?.includes('/apps/pwa/') || args.includes('apps/pwa/tsconfig.json')
           ? `${pwa}(2,3): error TS2322: PWA error.`
           : `${F}(1,1): error TS2304: root error.`,
       ));
       expect(log).toHaveBeenCalledWith('typecheck.gate', 'ratchet', expect.objectContaining({
         executions: [
-          { config: 'tsconfig.gate.json', checkedFiles: [F], executed: true },
-          { config: 'apps/pwa/tsconfig.json', checkedFiles: [pwa], executed: true },
+          { config: 'tsconfig.gate.json', checkedFiles: [F], executed: true, scopedConfigUsed: true },
+          { config: 'apps/pwa/tsconfig.json', checkedFiles: [pwa], executed: true, scopedConfigUsed: false },
+          { config: 'tsconfig.pwa-env.json', checkedFiles: [F], executed: true, scopedConfigUsed: true },
         ],
       }), { level: 'warn' });
     } finally {
@@ -1805,6 +2166,176 @@ describe('defaultSeams — worktree integration ancestry', () => {
     const feature = await seams.createWorktree({ branch: 'self-impl/feature-base' });
     worktrees.push(feature.path);
     expect(feature.baseIsIntegration).toBe(false);
+  });
+});
+
+describe('defaultSeams.gate — source policy feedback', () => {
+  test('passing tests and typecheck cannot hide an injected isolation policy failure; the log reaches rework', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-policy-gate-'));
+    const policyEvents: unknown[] = [];
+    const observation = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+      if (category === 'self-implement' && event === 'gate.policy') policyEvents.push(data);
+    }) as never);
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      writeFileSync(join(cwd, 'README.md'), 'base\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      mkdirSync(join(cwd, 'src'));
+      writeFileSync(join(cwd, 'src/x.ts'), 'export const x = 1;\n');
+      const changed: string[][] = [];
+      const result = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+        runHarnessPolicyGates: ({ cwd: target, changedFiles }) => {
+          expect(target).toBe(cwd);
+          changed.push([...changedFiles]);
+          return { passed: false, failures: [{ gate: 'isolation-gate', lines: ['[isolation-gate] FAIL src/x.ts'] }] };
+        },
+      }).gate(cwd);
+      expect(changed).toEqual([['src/x.ts']]);
+      expect(result.passed).toBe(false);
+      expect(result.log).toContain('[isolation-gate] FAIL src/x.ts');
+      expect(policyEvents).toEqual([{ passed: false, failures: ['isolation-gate'], skipped: undefined }]);
+    } finally {
+      observation.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('a passing policy leaves the previous gate.log byte-for-byte intact', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-policy-clean-'));
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      writeFileSync(join(cwd, 'README.md'), 'base\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      const result = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+        runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
+      }).gate(cwd);
+      expect(result.passed).toBe(true);
+      expect(result.log).toBe('[test] PASS\n\nVerify-by-breaking: skipped; reason=no-changes; evaluated-changes=[]; test-step=scope-skipped\n\n[gate-scope] no-changes — test 스텝을 건너뛰었다(변경파일 tsc 만 검증). 이 스코프가 관측한 변경이 없어 동작 테스트 대상이 없다.');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('defaultSeams.gate — dependency-wide validation feedback', () => {
+  test('PWA reachable source invokes the dependency gate seam even without a manifest change', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-pwa-reachable-'));
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      mkdirSync(join(cwd, 'apps/pwa/src'), { recursive: true });
+      mkdirSync(join(cwd, 'src/llm'), { recursive: true });
+      writeFileSync(join(cwd, 'apps/pwa/src/entry.tsx'), "import '../../../src/llm/x.js';\n");
+      writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 1;\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 2;\n');
+      const calls: string[][] = [];
+      const gate = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+        runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
+        runDependencyChangeGate: ({ changedFiles }) => {
+          calls.push([...changedFiles]);
+          return { ran: true, passed: false, failures: [{ step: 'pwa-build', lines: ['PWA build failed'] }] };
+        },
+      }).gate(cwd);
+      expect(calls).toEqual([['src/llm/x.ts']]);
+      expect(gate.passed).toBe(false);
+      expect(gate.log).toContain('[dependency-change: pwa-build] FAIL\nPWA build failed');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+  test('missing PWA dependencies remain visible in the seam gate log even while passing', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-pwa-unmeasured-'));
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      mkdirSync(join(cwd, 'apps/pwa/src'), { recursive: true });
+      mkdirSync(join(cwd, 'src/llm'), { recursive: true });
+      writeFileSync(join(cwd, 'apps/pwa/src/entry.tsx'), "import '../../../src/llm/x.js';\n");
+      writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 1;\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'src/llm/x.ts'), 'export const x = 2;\n');
+      const result = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+        runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
+        runDependencyChangeGate: () => ({ ran: false, passed: true, failures: [], measured: false, skipped: 'pwa-deps-missing', trigger: 'pwa-reachable', pwaReachableChanged: ['src/llm/x.ts'] }),
+      }).gate(cwd);
+      expect(result.passed).toBe(true);
+      expect(result.log).toContain('[dependency-change: pwa-build] 못 쟀다 — pwa-deps-missing');
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  test('passing tests, changed-file tsc and policy cannot hide an unchanged consumer broken by a dependency update', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-dependency-gate-'));
+    const events: unknown[] = [];
+    const observation = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: unknown) => {
+      if (category === 'self-implement' && event === 'gate.dependency-change') events.push(data);
+    }) as never);
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      writeFileSync(join(cwd, 'README.md'), 'base\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      writeFileSync(join(cwd, 'bun.lock'), 'updated lock');
+      const calls: string[][] = [];
+      const gate = await defaultSeams({
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+        runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
+        runDependencyChangeGate: ({ cwd: target, changedFiles }) => {
+          expect(target).toBe(cwd);
+          calls.push([...changedFiles]);
+          return { ran: true, passed: false, failures: [{ step: 'root-tsc', lines: ['src/acp/server.ts(36,3): error TS2724: session API removed'] }] };
+        },
+      }).gate(cwd);
+      expect(calls).toEqual([['bun.lock']]);
+      expect(gate.passed).toBe(false);
+      expect(gate.log).toContain('[dependency-change: root-tsc] FAIL');
+      expect(gate.log).toContain('src/acp/server.ts(36,3): error TS2724');
+      expect(events).toEqual([{ ran: true, passed: false, failures: ['root-tsc'], skipped: undefined, trigger: undefined, pwaReachableChanged: undefined, measured: undefined }]);
+    } finally {
+      observation.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test('non-dependency changes do not call the injected gate or change the existing gate log', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'seam-dependency-unchanged-'));
+    try {
+      git(cwd, 'init', '-b', 'main');
+      git(cwd, 'config', 'user.email', 't@t.co');
+      git(cwd, 'config', 'user.name', 'T');
+      writeFileSync(join(cwd, 'README.md'), 'base\n');
+      git(cwd, 'add', '-A');
+      git(cwd, 'commit', '-m', 'base');
+      mkdirSync(join(cwd, 'src'));
+      writeFileSync(join(cwd, 'src/a.ts'), 'export const a = true;\n');
+      const options: DefaultSeamsOptions = {
+        runIntegrityGate: () => ({ passed: true, steps: [], log: '[test] PASS' }),
+        runHarnessPolicyGates: () => ({ passed: true, failures: [] }),
+      };
+      const baseline = await defaultSeams(options).gate(cwd);
+      const result = await defaultSeams({
+        ...options,
+        runDependencyChangeGate: () => { throw new Error('must not call dependency gate'); },
+      }).gate(cwd);
+      expect(result.passed).toBe(true);
+      expect(result.log).toBe(baseline.log);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -2502,10 +3033,15 @@ describe('createSelfImplementControlBrain — 완료 보고 프롬프트 격리'
 목표: 테스트 목표
 화면을 보고 **다음 행동 하나**를 JSON 으로 결정하라:
 - "input": 자식이 입력을 기다리면(프롬프트/선택/blocked) 다음 입력 text(개행 필요 시 \\r 포함).
+- "key": 특수키 name(enter/esc/tab/up/down/left/right 등), 선택 repeat(1~100).
+- "mouse": 마우스가 켜진 TUI 에 1부터 세는 x,y 와 kind(click/scroll-up/scroll-down), 선택 button(left/middle/right). 모드가 꺼져 있으면 거절되며 다음 관측의 직전 행동 불가 이유를 보고 다른 행동을 택하라.
+- "resize": 양의 정수 cols, rows 로 화면 크기 변경.
 - "wait": 자식이 아직 작업 중(working)이면 대기.
 - "done": 목표를 달성했으면 reason.
+- "handoff": 같은 미션의 다른 담당자에게 넘길 때 to(codex/claude/elanous), mission(다음 작업), carry(diff/summary 선택). elanous 는 증거 게이트와 PR.
+- "ask-human": 화면에 로그인 URL/장치 코드가 보일 때 reason, url/code(화면에 보이는 것만). 자격 파일/토큰은 읽지 마라.
 화면 분류(참고 신호): working.
-JSON 만 출력: {"action":"input|wait|done","text":"...","reason":"..."}`);
+JSON 만 출력. 행동을 고른 화면 근거 한 줄을 reason 으로 반드시 담아라. 예: {"action":"key","name":"enter","reason":"메뉴 선택"} / {"action":"mouse","x":10,"y":5,"kind":"click","button":"left","reason":"버튼 누름"} / {"action":"resize","cols":80,"rows":24,"reason":"화면 맞춤"}. input 은 text, done 는 reason 을 싣는다.`);
   });
 });
 

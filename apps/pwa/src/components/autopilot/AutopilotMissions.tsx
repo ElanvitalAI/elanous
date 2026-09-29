@@ -8,9 +8,10 @@
 // 실행모델 뱃지·파생 계보(/v1/autopilot/trace?id=apm_…), 사람 미션은 Task 진행 표시.
 
 import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import {
-  AutopilotApi, EXECUTION_MODEL_META,
+  AutopilotApi, EXECUTION_MODEL_META, missionSchedulesHref,
   type MissionSummary, type MissionTrace, type DerivedStatus, type DerivedJob, type TriageResult,
 } from '@/lib/autopilot-api';
 
@@ -169,7 +170,7 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
             사람이 Intake 로 만든 미션입니다. 실행은 Task 보드에서 진행됩니다.
           </p>
           <TaskProgressChips counts={m.taskCounts} total={m.taskCount} />
-          <a href="/tasks" className="inline-block text-xs text-primary hover:underline">Tasks 보드에서 보기 →</a>
+          <Link href="/tasks" className="inline-block text-xs text-primary hover:underline">② 작업 보드에서 보기 →</Link>
         </div>
       )}
       {open && !isHuman && (
@@ -196,6 +197,11 @@ function MissionCard({ api, m }: { api: AutopilotApi; m: MissionSummary }) {
           {busy && <p className="text-xs text-muted-foreground">계보 조회 중…</p>}
           {trace && trace.derived.length === 0 && (
             <p className="text-xs text-muted-foreground">{trace.note}</p>
+          )}
+          {trace && missionSchedulesHref(trace.derived) && (
+            <Link href={missionSchedulesHref(trace.derived) as never} className="mb-2 inline-block text-xs text-primary hover:underline" data-mission-schedules>
+              이 미션을 부르는 스케줄 {trace.derived.filter((d) => d.kind === 'cron' && d.id).length} →
+            </Link>
           )}
           {trace && trace.derived.length > 0 && (
             <ul className="space-y-1.5">

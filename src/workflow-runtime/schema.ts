@@ -30,16 +30,18 @@ import type {
   TelegramTriggerNode,
   TemplateNode,
   WebhookTriggerNode,
+  PluginKindNode,
   TriggerRule,
   WorkflowDefinition,
 } from './types.js';
 import { normalizeProviderId } from '../registry/normalize.js';
 import { buildWarnings, type ValidationWarning } from './validation-warnings.js';
+import { getNodeKind, WORKFLOW_CORE_KINDS } from '../graph-kinds/registry.js';
 
 /** ⛔ 노드 변종의 SSOT — 도움말·문서가 이 배열에서 «파생»한다.
  *  손으로 목록을 옮겨 적으면 늙는다(2026-09-22 실측: `elanous wf --help` 가 13종만 말했고
  *  이 배열은 21종을 받고 있었다 — 여덟이 «안내 없이» 살아 있었다). */
-export const WORKFLOW_NODE_VARIANT_KEYS = ['prompt', 'bash', 'skill', 'cft', 'approval', 'if', 'switch', 'iteration', 'classify', 'extract', 'set', 'filter', 'template', 'http', 'showroom', 'task', 'scheduleTrigger', 'webhookTrigger', 'discordTrigger', 'telegramTrigger', 'manualTrigger', 'chatTrigger'] as const;
+export const WORKFLOW_NODE_VARIANT_KEYS = WORKFLOW_CORE_KINDS;
 
 const KEBAB_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const TRIGGER_RULES: readonly TriggerRule[] = [
@@ -299,6 +301,43 @@ export function validateWorkflow(raw: unknown): ValidationResult {
           }
         }
       }
+    }
+
+    // Plugin kind — `{ id, kind: '<plugin>:<kind>', inputs, depends_on? }`.
+    // Checked before the core variant keys so a registered kind is not
+    // reported as "must declare exactly one of" the 22 core shapes.
+    if (node['kind'] !== undefined) {
+      const kind = node['kind'];
+      if (typeof kind !== 'string' || !kind.trim()) {
+        push(`${path}.kind`, "'kind' must be a non-empty string");
+        continue;
+      }
+      const alsoCore = WORKFLOW_NODE_VARIANT_KEYS.filter(k => node[k] !== undefined);
+      if (alsoCore.length > 0) {
+        push(path, `node declares kind '${kind}' and a core variant (${alsoCore.join(', ')}) — pick one`);
+        continue;
+      }
+      const entry = getNodeKind('workflow', kind);
+      if (!entry || entry.core || !entry.run) {
+        push(path, `unknown node kind '${kind}'`);
+        continue;
+      }
+      const inputs = node['inputs'];
+      if (inputs !== undefined && !isObject(inputs)) {
+        push(`${path}.inputs`, "'inputs' must be an object");
+        continue;
+      }
+      const provided = isObject(inputs) ? inputs : {};
+      const required = Array.isArray(entry.schema?.['required']) ? entry.schema['required'] : [];
+      for (const name of required) {
+        if (typeof name === 'string' && (provided[name] === undefined || provided[name] === null)) {
+          push(`${path}.inputs.${name}`, `missing required input '${name}'`);
+        }
+      }
+      if (issues.every(iss => !iss.path.startsWith(path))) {
+        nodes.push({ ...(node as unknown as PluginKindNode), inputs: { ...provided } });
+      }
+      continue;
     }
 
     // Variant detection — exactly one of the variant keys must be
@@ -1017,3 +1056,5 @@ export const isChatTriggerNode = (n: DagNode): n is ChatTriggerNode =>
   typeof (n as ChatTriggerNode).chatTrigger === 'object'
   && (n as ChatTriggerNode).chatTrigger !== null
   && typeof ((n as ChatTriggerNode).chatTrigger as { path?: unknown }).path === 'string';
+export const isPluginKindNode = (n: DagNode): n is PluginKindNode =>
+  typeof (n as PluginKindNode).kind === 'string';

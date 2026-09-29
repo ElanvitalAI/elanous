@@ -21,6 +21,8 @@ const { upsertPtyManifest, ptyManifestDbPath, getPtyManifest } = await import('.
 const { resetPtyEventLogForTesting } = await import('./pty-event-log.js');
 const { getPtyControlTarget, registerPtyControlTarget, resetForTesting, setPtyAdapterForTesting, startPty } = await import('./registry.js');
 const { createTuiControlTarget, startTuiSelfReport } = await import('../capture/tui-self-report.js');
+const { stopPtyRecording } = await import('./pty-recording.js');
+const { readFileSync } = await import('node:fs');
 const registryIds: string[] = [];
 
 interface FakeHandle {
@@ -97,6 +99,134 @@ function registryHandle(accessMode: 'auto' | 'write', write: (chars: string) => 
 }
 
 describe('pty-control-ipc round-trip', () => {
+  test('record-start and record-stop cross the owner queue and save timed PTY output', async () => {
+    let onData: ((chunk: string) => void) | undefined;
+    setPtyAdapterForTesting(() => ({ pid: 7, write() {}, kill() {},
+      onData(callback) { onData = callback; return { dispose() {} }; },
+      onExit() { return { dispose() {} }; },
+    }));
+    const handle = startPty({ cmd: 'fake', cols: 100, rows: 27 });
+    register(handle.id);
+    const owner = () => processPtyControlRequests(getPtyControlTarget, () => false);
+    const start = requestRemotePtyControl(handle.id, 'record-start', undefined, { timeoutMs: 2000 });
+    await Bun.sleep(60); await owner();
+    const started = await start;
+    expect(started).toEqual({ status: 'success', path: expect.any(String), recordingId: expect.any(String) });
+    if (!started.path) throw new Error(`record-start did not return a path: ${JSON.stringify(started)}`);
+    const duplicate = requestRemotePtyControl(handle.id, 'record-start', undefined, { timeoutMs: 2000 });
+    await Bun.sleep(60); await owner();
+    expect(await duplicate).toEqual({ status: 'denied', reason: 'already-recording' });
+    const invalid = requestRemotePtyControl(handle.id, 'record-start', { cols: -1, rows: 27 }, { timeoutMs: 2000 });
+    await Bun.sleep(60); await owner();
+    expect(await invalid).toEqual({ status: 'denied', reason: 'invalid-record-payload' });
+    onData?.('hello');
+    await Bun.sleep(20);
+    onData?.('hello');
+    const stop = requestRemotePtyControl(handle.id, 'record-stop', undefined, { timeoutMs: 2000 });
+    await Bun.sleep(60); await owner();
+    const stopped = await stop;
+    expect(stopped).toMatchObject({ status: 'success', path: started.path, bytes: expect.any(Number), durationMs: expect.any(Number) });
+    const lines = readFileSync(started.path!, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(lines[0]).toMatchObject({ version: 2, width: 100, height: 27 });
+    expect(lines.slice(1).map((frame) => frame.slice(1))).toEqual([['o', 'hello'], ['o', 'hello']]);
+    expect(lines[2][0]).toBeGreaterThan(lines[1][0]);
+    expect(stopped.bytes).toEqual(Buffer.byteLength(readFileSync(started.path!, 'utf8'), 'utf8'));
+    expect(stopPtyRecording(handle.id)).toEqual({ ok: false, reason: 'not-recording' });
+  });
+
+  test('record-start refuses a target whose size is unknown instead of writing a guessed 80x24 header', async () => {
+    const id = `tui:${process.pid}`;
+    const target = createTuiControlTarget(id, { dims: () => undefined });
+    const original = process.stdout.write;
+    const unregister = registerPtyControlTarget(target);
+    try {
+      register(id);
+      const start = requestRemotePtyControl(id, 'record-start', undefined, { timeoutMs: 2000 });
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await start).toEqual({ status: 'denied', reason: 'dimensions-unknown' });
+      // A caller-supplied size does not stand in for the owner's unknown one.
+      const claimed = requestRemotePtyControl(id, 'record-start', { cols: 200, rows: 50 }, { timeoutMs: 2000 });
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      expect(await claimed).toEqual({ status: 'denied', reason: 'dimensions-unknown' });
+      expect(stopPtyRecording(id)).toEqual({ ok: false, reason: 'not-recording' });
+    } finally {
+      unregister();
+      process.stdout.write = original;
+    }
+  });
+
+  test('foreground TUI owner starts remotely, records stdout and auto-stops on unregister', async () => {
+    const id = `tui:${process.pid}`;
+    const target = createTuiControlTarget(id, { dims: () => ({ cols: 120, rows: 40 }) });
+    const original = process.stdout.write;
+    const unregister = registerPtyControlTarget(target);
+    try {
+      register(id);
+      const start = requestRemotePtyControl(id, 'record-start', undefined, { timeoutMs: 2000 });
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => false);
+      const started = await start;
+      if (typeof started.path !== 'string') throw new Error(`invalid cast path: ${JSON.stringify(started)}`);
+      const castPath = started.path;
+      expect(started).toMatchObject({ status: 'success', path: expect.any(String) });
+      const writer = process.stdout.write;
+      try {
+        process.stdout.write = (() => true) as typeof process.stdout.write;
+        writer.call(process.stdout, 'hello');
+        // One multibyte character split across two Buffer writes must survive intact.
+        const han = Buffer.from('한', 'utf8');
+        writer.call(process.stdout, han.subarray(0, 1));
+        writer.call(process.stdout, han.subarray(1));
+      } finally {
+        process.stdout.write = writer;
+      }
+      unregister();
+      expect(process.stdout.write).toBe(original);
+      expect(readFileSync(castPath, 'utf8')).toContain('"o","hello"');
+      expect(readFileSync(castPath, 'utf8')).toContain('한');
+      expect(readFileSync(castPath, 'utf8')).not.toContain('\ufffd');
+      expect(JSON.parse(readFileSync(castPath, 'utf8').split('\n')[0]!)).toMatchObject({ width: 120, height: 40 });
+      expect(stopPtyRecording(id)).toEqual({ ok: false, reason: 'not-recording' });
+    } finally {
+      unregister();
+      process.stdout.write = original;
+    }
+  });
+
+  test('input-mouse owner round-trip: adapter output enables click, disables it, and takeover denies it', async () => {
+    const written: string[] = [];
+    let onData: ((chunk: string) => void) | undefined;
+    setPtyAdapterForTesting(() => ({
+      pid: 7, write: (chars) => { written.push(chars); }, kill() {},
+      onData: (callback) => { onData = callback; return { dispose() {} }; },
+      onExit: () => ({ dispose() {} }),
+    }));
+    const h = startPty({ cmd: 'test', accessMode: 'write', detach: true });
+    register(h.id);
+    registryIds.push(h.id);
+    const click = { x: 10, y: 5, kind: 'click' as const };
+    const dispatch = async (payload = click) => {
+      const pending = requestRemotePtyControl(h.id, 'input-mouse', payload, { actor: 'human', timeoutMs: 2000 });
+      await Bun.sleep(60);
+      await processPtyControlRequests(getPtyControlTarget, () => true);
+      return pending;
+    };
+    expect((await dispatch()).reason).toContain('mouse mode is off');
+    onData?.('\x1b[?1000;1006h');
+    expect(await dispatch()).toEqual({ status: 'success' });
+    expect(written).toEqual(['\x1b[<0;10;5M\x1b[<0;10;5m']);
+    onData?.('\x1b[?1000l');
+    expect((await dispatch()).reason).toContain('mouse mode is off');
+    const bad = await dispatch({ x: 0, y: 5, kind: 'click' });
+    expect(bad).toEqual({ status: 'denied', reason: 'invalid-mouse-payload' });
+    onData?.('\x1b[?1000h');
+    h.setAccessMode('auto');
+    expect(await dispatch()).toEqual({ status: 'denied', reason: 'write-arbiter' });
+    expect(written).toHaveLength(1);
+  }, 30_000);
+
   test('unknown-pty — manifest 미등록 id 는 즉시 unknown-pty', async () => {
     const r = await requestRemotePtyControl(freshId(), 'takeover', 300);
     expect(r.status).toBe('unknown-pty');

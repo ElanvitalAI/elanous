@@ -44,13 +44,6 @@ export {
 export type { ShellRunnerDeps, RunShellOpts } from './dispatch.js';
 export { decideAttach } from './attach-routing.js';
 export type { AttachOutcome, AttachRoutingDeps } from './attach-routing.js';
-export { createRunnerHostFactory } from './runner-host-factory.js';
-export type {
-  RunnerHostFactory,
-  RunnerHostFactoryOpts,
-} from './runner-host-factory.js';
-export { createExternalTerminalPaneContent } from './external-terminal-pane.js';
-export type { ExternalTerminalPaneOpts } from './external-terminal-pane.js';
 export {
   detectShellKind,
   makeOsc133RcFile,

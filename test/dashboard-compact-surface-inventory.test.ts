@@ -23,10 +23,6 @@ describe('buildDashboardSurfaceCatalogTargets', () => {
       'companion:clipboard',
       'companion:memo',
       'companion:detail',
-      'vw:browser-preview',
-      'vw:sim',
-      'vw:browser',
-      'vw:preview',
     ]);
   });
 });

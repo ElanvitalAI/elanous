@@ -47,14 +47,22 @@ describe('dispatchScheduleManage wrap — explicit shell jobs', () => {
       expect(result.jobs).toEqual(dry.jobs);
       expect(readFileSync(result.backup, 'utf8')).toBe(`${lines.join('\n')}\n`);
       const applied = readFileSync(state, 'utf8').trimEnd().split('\n');
-      expect(applied[0]).toContain(`${process.execPath} ${join(repoRoot(), 'scripts', 'cron-run.ts')} --shell zsh `);
-      expect(applied[1]).toContain('cron-run.ts --shell bash /x/backup.sh --source cron >> /tmp/b.log 2>&1');
-      expect(applied[2]).toContain('cron-run.ts --shell /bin/bash scripts/verify.sh');
+      // #21723 stamps each wrapper with the original cron entry id for execution attribution.
+      for (const i of [0, 1, 2, 5, 6, 7, 8]) {
+        const original = parseCronLine(lines[i]!)!;
+        expect(applied[i]).toContain(`--schedule-id ${cronEntryId(original.cron, original.command)} `);
+      }
+      expect(applied[0]).toContain(`${process.execPath} ${join(repoRoot(), 'scripts', 'cron-run.ts')} --schedule-id ${cronEntryId('0 7 * * *', 'zsh $HOME/s/intake-cron.sh')} --shell zsh `);
+      expect(applied[1]).toContain(' --shell bash /x/backup.sh --source cron >> /tmp/b.log 2>&1');
+      expect(applied[2]).toContain(' --shell /bin/bash scripts/verify.sh');
       expect(applied.slice(3, 5)).toEqual(lines.slice(3, 5));
-      expect(applied[5]).toContain('bun scripts/cron-run.ts scripts/report.ts');
-      expect(applied[6]).toContain('cron-run.ts --shell zsh /x/intake.sh --runner bun scripts/report.ts');
-      expect(applied[7]).toContain('FOO=bar bun scripts/cron-run.ts scripts/report.ts');
-      expect(applied[8]).toContain('env bun scripts/cron-run.ts scripts/report.ts');
+      expect(applied[5]).toContain('bun scripts/cron-run.ts --schedule-id ');
+      expect(applied[5]).toContain(' scripts/report.ts --runner bash /x/backup.sh');
+      expect(applied[6]).toContain(' --shell zsh /x/intake.sh --runner bun scripts/report.ts');
+      expect(applied[7]).toContain('FOO=bar bun scripts/cron-run.ts --schedule-id ');
+      expect(applied[7]).toContain(' scripts/report.ts');
+      expect(applied[8]).toContain('env bun scripts/cron-run.ts --schedule-id ');
+      expect(applied[8]).toContain(' scripts/report.ts');
       for (const i of [0, 1, 2, 5, 6, 7, 8]) {
         const original = parseCronLine(lines[i]!)!;
         const wrapped = parseCronLine(applied[i]!)!;
@@ -443,7 +451,7 @@ describe('전 표면 배선 가드 (L2 코어 도구 — 단일 출처 상속)',
     expect(src).toContain('shared.names.has(name)');
   });
   test('CLI buildCliAgentTools: buildSharedAppTools 상속', () => {
-    const src = read('../index.ts');
+    const src = read('../cli/agent-cli.ts');   // moved out of src/index.ts in the D4c split
     expect(src).toContain('buildSharedAppTools(cfg)');
   });
   test('continuation(telegram·자율루프): buildCoreTools 조립', () => {

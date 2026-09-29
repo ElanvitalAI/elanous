@@ -1,9 +1,10 @@
 {
   "_comment": "조율 채널 트랙 신원의 정본. 트랙을 더하려면 여기 한 줄만 더한다 — scripts/coord-post.sh 와 scripts/build-docs-site.ts 가 이 파일을 읽는다.",
   "tracks": [
-    { "id": "S", "mark": "🅢" },
-    { "id": "T", "mark": "🅣" },
-    { "id": "F", "mark": "🅕" },
-    { "id": "O", "mark": "🅞" }
+    { "id": "S", "mark": "🅢", "owns": ["기획", "총괄", "전략", "소구점", "로드맵", "plan", "strategy"] },
+    { "id": "T", "mark": "🅣", "owns": ["영상", "비디오", "티저", "하이퍼프레임", "HyperFrames", "렌더", "video", "teaser", "render", "B-roll"] },
+    { "id": "F", "mark": "🅕", "owns": ["PWA", "웹", "웹사이트", "elanous.ai", "탭", "화면", "UI", "프론트엔드", "frontend", "web", "tab"] },
+    { "id": "O", "mark": "🅞", "owns": ["블로그", "매뉴얼", "문서", "흡수", "Obsidian", "승인", "blog", "manual", "docs"] },
+    { "id": "E", "mark": "🅔", "owns": [] }
   ]
 }

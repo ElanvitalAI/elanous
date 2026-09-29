@@ -102,8 +102,14 @@ export function handleSessionsStoreList(req: Request, opts: MetaApiOpts): Respon
 export function handleSessionsStoreGet(req: Request, id: string, opts: MetaApiOpts): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
   const loaded = loadSession(id);
-  if (!loaded) return jsonResponse({ ok: false, error: 'not_found' }, 404);
-  return jsonResponse({ ok: true, meta: loaded.meta, messages: loaded.messages }, 200);
+  if (!loaded) {
+    // `?ifExists=1` — «있으면 복원»하는 호출자(PWA 챗·터미널 독: 새 세션은 아직 저장소에 없다)용.
+    // 없음을 오류가 아니라 값으로 돌려준다 — 404 가 매 새 세션마다 콘솔에 빨간 줄을 남겼다(탭 트리아지 P0).
+    // ⛔ 기본은 404 그대로(다른 호출자 계약 불변).
+    if (new URL(req.url).searchParams.get('ifExists') === '1') return jsonResponse({ ok: true, exists: false, messages: [] }, 200);
+    return jsonResponse({ ok: false, error: 'not_found' }, 404);
+  }
+  return jsonResponse({ ok: true, exists: true, meta: loaded.meta, messages: loaded.messages }, 200);
 }
 
 /** POST /v1/sessions/store/:id/fork — 히스토리 복사 새 세션(원본 불변·forkedFromId 링크).

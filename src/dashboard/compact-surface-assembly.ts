@@ -37,13 +37,6 @@ export interface CreateDashboardCompactSurfaceAssemblyDeps {
   openBrowserPreviewModal: () => void;
   openDashboardPaneModal: (pane: PaneFocus) => void;
   openCompanionPopup: (key: DashboardCompanionSurfaceKey) => void;
-  spawnBrowserVirtualWindow: () => void;
-  spawnPreviewVirtualWindow: () => void;
-  spawnBrowserPreviewVirtualWindow: () => void;
-  spawnScratchVirtualWindow: () => void;
-  spawnSimVirtualWindow: () => void;
-  currentVirtualWindowId: () => number | null;
-  openVwCompanion: (windowId: number, key: DashboardCompanionSurfaceKey) => void;
   onWarning: (message: string) => void;
   setChatOnlyMode: (next: boolean) => void;
   getChatOnlyMode: () => boolean;
@@ -75,13 +68,6 @@ export function createDashboardCompactSurfaceAssembly(
     openBrowserPreviewModal: deps.openBrowserPreviewModal,
     openDashboardPaneModal: deps.openDashboardPaneModal,
     openCompanionPopup: deps.openCompanionPopup,
-    spawnBrowserVirtualWindow: deps.spawnBrowserVirtualWindow,
-    spawnPreviewVirtualWindow: deps.spawnPreviewVirtualWindow,
-    spawnBrowserPreviewVirtualWindow: deps.spawnBrowserPreviewVirtualWindow,
-    spawnScratchVirtualWindow: deps.spawnScratchVirtualWindow,
-    spawnSimVirtualWindow: deps.spawnSimVirtualWindow,
-    currentVirtualWindowId: deps.currentVirtualWindowId,
-    openVwCompanion: deps.openVwCompanion,
     onWarning: deps.onWarning,
   });
   const host = createCompactSurfaceHost({

@@ -13,7 +13,7 @@
 // When a match is found, surface:
 //   - alive flag (pid still live?)
 //   - all ports (nexus + dev for HMR)
-//   - loopback URL (always — local fallback)
+//   - loopback URL (when the daemon's HTTP port is known)
 //   - tailnet URL (only when `shareMounted=true` — picks up share
 //     enable / `--https` ad-hoc)
 //
@@ -26,6 +26,8 @@ import { join } from 'node:path';
 
 import { listPwaInstances, type PwaInstanceListing } from './pwa-registry.js';
 import { probeTailscale, type TailscaleProbe } from '../nexus/onboarding/tailscale-probe.js';
+import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
+import { debug } from '../debug/log.js';
 
 export interface PwaShowOpts {
   /** Format. Default 'human'. */
@@ -75,9 +77,23 @@ export async function runPwaShow(opts: PwaShowOpts = {}): Promise<PwaShowResult>
     return { exitCode: 0 };
   }
 
-  // Compute URLs. Loopback always. Tailnet requires share mounted +
-  // tailscale alive + magic-DNS hostname.
-  const httpPort = match.ports[0] ?? 31415; // first port = nexus
+  // Prefer the registry's nexus port; only consult the watch endpoint when it is absent.
+  const registryPort = match.ports[0];
+  let endpointPort: number | undefined;
+  if (registryPort === undefined) {
+    try {
+      const endpoint = resolveDaemonEndpoint({ purpose: 'watch' });
+      endpointPort = endpoint ? Number(new URL(endpoint.baseUrl).port) : undefined;
+    } catch { /* No usable daemon address. */ }
+  }
+  const httpPort = registryPort ?? endpointPort;
+  if (httpPort === undefined || !Number.isInteger(httpPort) || httpPort < 1 || httpPort > 65_535) {
+    const message = '데몬 주소를 모른다 — `elanous nexus run` 먼저';
+    if (format === 'json') out.log(JSON.stringify({ instance: match, urls: null, reason: message }, null, 2));
+    else out.log(message);
+    return { exitCode: 1, instance: match };
+  }
+  debug.log('nexus.pwa-share', 'port-resolved', { port: httpPort, source: registryPort === undefined ? 'endpoint' : 'bound' });
   const loopback = `http://127.0.0.1:${httpPort}/app/`;
   let tailnet: string | undefined;
   if (match.shareMounted) {

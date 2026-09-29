@@ -24,6 +24,7 @@ import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 
+import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
 import { resolvePwaCwd } from './pwa-build.js';
 import {
   isAliveNexusLock,
@@ -32,7 +33,6 @@ import {
 } from '../nexus/supervisor/lock.js';
 
 const ADMIN_DEV_PROXY_PATH = '/v1/nexus/admin/pwa-dev-proxy';
-const DEFAULT_NEXUS_BASE = 'http://127.0.0.1:31415';
 /** Bind interface for the next-dev child. Mirrors the nexus
  *  PWA_DEFAULT_HTTP_HOST in pwa-start.ts — both surfaces need to be
  *  reachable from Tailscale / LAN / container without extra flags. */
@@ -57,9 +57,12 @@ export interface PwaDevOpts {
   host?: string;
   /** When false, skip POST/DELETE to the admin endpoint. Default true. */
   autoConfig?: boolean;
-  /** Override the nexus base URL probed for hot-swap (default
-   *  `http://127.0.0.1:31415`). */
+  /** Override the nexus base URL probed for hot-swap. When omitted the
+   *  address comes from the daemon endpoint resolver; a missing daemon
+   *  is reported, not guessed. */
   nexusBaseUrl?: string;
+  /** Test seam — daemon address. `null` means this universe has no daemon. */
+  resolveEndpoint?: (opts?: ResolveDaemonEndpointOpts) => { baseUrl: string } | null;
   spawnFn?: (cmd: string, args: string[], cwd: string, env: NodeJS.ProcessEnv) => Promise<number>;
   out?: { log: (s: string) => void; error: (s: string) => void };
   skipNodeModulesCheck?: boolean;
@@ -167,7 +170,7 @@ export async function runPwaDev(opts: PwaDevOpts = {}): Promise<PwaDevResult> {
   const fetchFn = opts.fetchFn ?? fetch;
   const readLockFn = opts.readNexusLockFn ?? readNexusLock;
   const isAliveFn = opts.isAliveNexusLockFn ?? isAliveNexusLock;
-  const baseUrl = opts.nexusBaseUrl ?? DEFAULT_NEXUS_BASE;
+  const baseUrl = opts.nexusBaseUrl ?? (opts.resolveEndpoint ?? resolveDaemonEndpoint)()?.baseUrl ?? null;
 
   out.log(`elanous nexus pwa dev: ${cwd}`);
   const hostShown = opts.host ?? DEFAULT_DEV_HOST;
@@ -182,7 +185,9 @@ export async function runPwaDev(opts: PwaDevOpts = {}): Promise<PwaDevResult> {
   let lastSeenPid: number | null = null;
   let lastSeenStartedAt: string | null = null;
 
-  if (autoConfig) {
+  if (autoConfig && !baseUrl) {
+    out.error('  nexus: daemon address unknown — a port is not guessed. Pass --nexus-url or start the daemon.');
+  } else if (autoConfig && baseUrl) {
     const lock = readLockFn();
     if (lock && isAliveFn(lock)) {
       out.log(`  nexus: live lock detected (pid ${lock.pid}) — POST ${ADMIN_DEV_PROXY_PATH}`);
@@ -202,7 +207,7 @@ export async function runPwaDev(opts: PwaDevOpts = {}): Promise<PwaDevResult> {
     out.log('  --no-auto-config — admin endpoint untouched.');
   }
 
-  out.log(`  → single-origin (when nexus is up): ${baseUrl}/app/`);
+  out.log(`  → single-origin (when nexus is up): ${baseUrl ? `${baseUrl}/app/` : '(daemon address unknown)'}`);
   out.log(`  → cross-origin (always):           http://localhost:${port}/app/`);
   out.log('  Ctrl-C to stop.');
 
@@ -220,7 +225,7 @@ export async function runPwaDev(opts: PwaDevOpts = {}): Promise<PwaDevResult> {
   // race a poll cleanly. autoConfig=false skips the watcher (caller
   // opted out of admin-endpoint mutation entirely).
   const pollIntervalMs = opts.reregisterPollIntervalMs ?? DEFAULT_REREGISTER_POLL_INTERVAL_MS;
-  const watcherEnabled = autoConfig && pollIntervalMs > 0;
+  const watcherEnabled = autoConfig && baseUrl !== null && pollIntervalMs > 0;
   let reregisterCount = 0;
   let watcherTimer: ReturnType<typeof setInterval> | null = null;
   if (watcherEnabled) {
@@ -259,7 +264,7 @@ export async function runPwaDev(opts: PwaDevOpts = {}): Promise<PwaDevResult> {
     exitCode = await spawnFn('bun', ['run', 'dev'], cwd, env);
   } finally {
     if (watcherTimer) clearInterval(watcherTimer);
-    if (autoConfig && hotSwappedOnStart) {
+    if (autoConfig && baseUrl && hotSwappedOnStart) {
       const ok = await deleteDevProxy(baseUrl, fetchFn);
       if (ok) {
         clearedOnExit = true;

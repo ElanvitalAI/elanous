@@ -69,6 +69,10 @@ export async function runResourcesQuery(options: { where?: string; kind?: string
 
 export async function runControlServe(options: { port?: string; host?: string; followLease?: boolean; bucket?: string;
   read?: (bucket: string) => RoleLeaseRead | Promise<RoleLeaseRead>; machine?: string;
+  /** 시험 seam — 이 신호로 멈춘다. ⛔ 시험이 `process.emit('SIGTERM')` 로 멈추면 같은 프로세스의 다른 SIGTERM 처리기
+   *  (로그 저장소가 «남은 처리기가 없으면 자기에게 진짜 SIGTERM 을 다시 보낸다»)가 깨어 **시험 러너가 죽었다**
+   *  (📏 09-27 0.2.3 게이트: 전체 한 프로세스면 이 시험 자리에서 rc 143 · 조각으로 나누면 완주). */
+  signal?: AbortSignal;
 }): Promise<void> {
   let port: number;
   let bucket: string | undefined;
@@ -92,6 +96,10 @@ export async function runControlServe(options: { port?: string; host?: string; f
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
+    if (options.signal) {
+      if (options.signal.aborted) { stop(); return; }
+      options.signal.addEventListener('abort', stop, { once: true });
+    }
     console.log(`관제부 ${new URL(server.url).host} · 토큰 ${join(effectiveInstanceRoot(), 'control', 'tokens.json')}${bucket === undefined ? '' : ` · 임대 따름 · ${bucket} · 나=${machine}`}`);
   });
 }

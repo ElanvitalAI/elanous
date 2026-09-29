@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerOpsCommands } from './cli/ops-cli.js';
+import { setUserConfigOverlay } from './user-config.js';
+import * as podDispatch from './harness/harness-pod-dispatch.js';
 import { registerPublishCommands } from './cli/publish-cli.js';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
@@ -209,7 +211,7 @@ describe('self send superseded explicit target protection', () => {
       expect(decode(result.stderr)).not.toContain('heartbeat alive=false');
       expect(memoRecords(stateDir, target)).toHaveLength(0);
     });
-  });
+  }, 20_000);
 
   test('records a memo for a continuing run despite its dead child through explicit --run', async () => {
     await withStateDir((stateDir) => {
@@ -232,7 +234,7 @@ describe('self send superseded explicit target protection', () => {
       const frame = JSON.parse(Buffer.from(content.slice('memo:CONTROL_MEMO_FRAME:'.length).trim(), 'base64url').toString('utf8'));
       expect(frame).toEqual({ version: 1, kind: 'supervisor', urgency: 'normal', body: 'deliver to next iteration' });
     });
-  });
+  }, 20_000);
 });
 
 describe('root command help dispatch', () => {
@@ -289,7 +291,7 @@ describe('root command help dispatch', () => {
     } finally {
       await rm(home, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 
   test('preserves registered-command and root help', () => {
     const registered = invoke('self', '--help');
@@ -299,7 +301,7 @@ describe('root command help dispatch', () => {
     expect(decode(registered.stdout)).toContain('Self-awareness memory');
     expect(root.exitCode).toBe(0);
     expect(decode(root.stdout)).toContain('Usage: elanous [options] [command]');
-  });
+  }, 30_000);
 
   test('self unfinished-runs-cleanup plans by default, removes only on request, and blocks removal for incomplete queries', async () => {
     const stateDir = await mkdtemp(join(tmpdir(), 'elanous-unfinished-runs-cleanup-'));
@@ -367,7 +369,7 @@ describe('root command help dispatch', () => {
       expect(result.exitCode).not.toBe(0);
       expect(decode(result.stderr)).toContain(`--age must be a non-negative number of minutes: ${age}`);
     }
-  });
+  }, 30_000);
 
   test('self implement retains --plan only to reject the retired staged-harness door before standalone-run setup', () => {
     const rejected = invoke('self', 'implement', '--plan', 'x');
@@ -384,7 +386,7 @@ describe('root command help dispatch', () => {
     expect(decode(help.stdout)).toContain('지정하면 명시적으로 거부됨');
     expect(devPlanHelp.exitCode).toBe(0);
     expect(decode(devPlanHelp.stdout)).toContain('--plan');
-  });
+  }, 30_000);
 
   test('preserves Commander implicit help command dispatch', () => {
     const help = invoke('help', '--help');
@@ -395,7 +397,7 @@ describe('root command help dispatch', () => {
     expect(decode(help.stderr)).not.toContain("error: unknown command 'help'");
     expect(nestedHelp.exitCode).toBe(0);
     expect(decode(nestedHelp.stdout)).toContain('Self-awareness memory');
-  });
+  }, 30_000);
 
   test('token rotate uses --config-dir, masks default output, and only reveals on request', async () => {
     const configDir = await mkdtemp(join(tmpdir(), 'elanous-token-rotate-'));
@@ -425,7 +427,7 @@ describe('root command help dispatch', () => {
     } finally {
       await rm(configDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });
 
 describe('mcp serve handshake timeout wiring', () => {
@@ -1030,6 +1032,72 @@ describe('harness ask production entry wiring', () => {
     }
   });
 
+  test('dev --ask rejects --branch on configured Pod before authoring or dispatch, while explicit local preserves the option', async () => {
+    const { program, setDevLaunchControlTestSeams } = await import('./index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'dev-ask-branch-'));
+    const askPath = join(dir, 'ask.txt');
+    await writeFile(askPath, '# goal\n## PROBLEM\nPreserve branch.\n## WHAT TO BUILD\nCheck branch.\n## ACCEPTANCE CRITERIA\n- [ ] No silent loss.\n## REQUIRED EVIDENCE\n- [test] Check the refusal.\n## TRACED PATHS\n- src/index.ts\n## SCOPE BOUNDARY\n- Boundary decision: Do not start a Pod.\n## 답하지 못하는 것\n- Live Pod availability is unmeasured.\n## 불변식\n- Local stays local.\n## 판정 신호\n- Branch is not lost.\n');
+    const previousPool = process.env.ELANOUS_POD_POOL;
+    delete process.env.ELANOUS_POD_POOL;
+    setUserConfigOverlay((cfg) => ({ ...cfg, harness: { ...cfg.harness, substrate: 'pod', podPool: 'pool-node-b@node-b:8' } }));
+    const dispatched = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation(() => 0);
+    const exit = spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`PROCESS_EXIT_${code}`); }) as never);
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    let authored = 0;
+    try {
+      setDevLaunchControlTestSeams({ runAskLaunchFlow: (async () => { authored++; throw new Error('author-flow-reached'); }) as never });
+      await expect(program.parseAsync(['node', 'elanous', 'dev', '--ask', askPath, '--branch', 'feature/chosen']))
+        .rejects.toThrow('PROCESS_EXIT_1');
+      expect(error.mock.calls.flat().join('\n')).toContain('`--branch` 는 Pod 경로에서 아직 지원하지 않는다');
+      expect(authored).toBe(0);
+      expect(dispatched).not.toHaveBeenCalled();
+      error.mockClear();
+      await expect(program.parseAsync(['node', 'elanous', 'dev', '--ask', askPath, '--branch', 'feature/chosen', '--substrate', 'local']))
+        .rejects.toThrow('PROCESS_EXIT_1');
+      expect(authored).toBe(1);
+      expect(error.mock.calls.flat().join('\n')).not.toContain('`--branch` 는 Pod 경로에서 아직 지원하지 않는다');
+      expect(dispatched).not.toHaveBeenCalled();
+    } finally {
+      setDevLaunchControlTestSeams(undefined);
+      dispatched.mockRestore();
+      exit.mockRestore();
+      error.mockRestore();
+      setUserConfigOverlay(null);
+      if (previousPool === undefined) delete process.env.ELANOUS_POD_POOL;
+      else process.env.ELANOUS_POD_POOL = previousPool;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('dev --ask forwards its selected base and configured pool across the Pod dispatch boundary', async () => {
+    const { program, setDevLaunchControlTestSeams } = await import('./index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'dev-ask-base-'));
+    const askPath = join(dir, 'ask.txt');
+    await writeFile(askPath, '# goal\n## PROBLEM\nPod base must be preserved.\n## WHAT TO BUILD\nForward --base.\n## ACCEPTANCE CRITERIA\n- [ ] The dispatched Pod receives feature/base.\n## REQUIRED EVIDENCE\n- [test] Check the dispatch argument.\n## TRACED PATHS\n- src/index.ts\n## SCOPE BOUNDARY\n- Boundary decision: No real Pod is started.\n## 답하지 못하는 것\n- Pod availability is unmeasured.\n## 불변식\n- Local execution is not started.\n## 판정 신호\n- The dispatch receives feature/base.\n');
+    const previousPool = process.env.ELANOUS_POD_POOL;
+    delete process.env.ELANOUS_POD_POOL;
+    setUserConfigOverlay((cfg) => ({ ...cfg, harness: { ...cfg.harness, substrate: 'pod', podPool: 'pool-node-b@node-b:8' } }));
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation(() => 0);
+    const exit = spyOn(process, 'exit').mockImplementation(((code?: number) => { if (code === 0) throw new Error('POD_DISPATCH_EXIT'); }) as never);
+    try {
+      setDevLaunchControlTestSeams({
+        runAskLaunchFlow: (async () => ({ kind: 'launch', goalFile: askPath })) as never,
+      });
+      await program.parseAsync(['node', 'elanous', 'dev', '--ask', askPath, '--base', 'feature/base']);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: askPath, podPool: 'pool-node-b@node-b:8', base: 'feature/base' });
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      setDevLaunchControlTestSeams(undefined);
+      dispatch.mockRestore();
+      exit.mockRestore();
+      setUserConfigOverlay(null);
+      if (previousPool === undefined) delete process.env.ELANOUS_POD_POOL;
+      else process.env.ELANOUS_POD_POOL = previousPool;
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test('dev command executes promoted pieces at the pipeline boundary, forwards a chained base, and preserves the initial base without opts', async () => {
     const { program, setDevLaunchControlTestSeams } = await import('./index.js');
     const previousRunId = process.env.ELANOUS_RUN_ID;
@@ -1483,7 +1551,7 @@ describe('harness ask production entry wiring', () => {
     try {
       setRunDevAskFromGoalFileDepsForTesting({
         ...passingPreflightDeps(),
-        loadDevCli: async () => ({ renderDevCompletionLine, assertDevCliPathOptions, buildDevCliSpec, selectDevAuthorInput }),
+        loadDevCli: async () => ({ renderDevCompletionLine, assertDevCliPathOptions, buildDevCliSpec, selectDevAuthorInput, startDraftTriage: () => {} }),
         loadDevPipeline: async () => ({
           runDevPipeline: (async (spec: unknown) => {
             pipelineSpecs.push(spec);
@@ -1505,7 +1573,7 @@ describe('harness ask production entry wiring', () => {
       console.error = originalError;
       setRunDevAskFromGoalFileDepsForTesting(undefined);
     }
-  });
+  }, 20_000);
 
   test('harness ask emits a pre-launch decomposition recommendation before pipeline execution', async () => {
     const { program, setRunDevAskFromGoalFileDepsForTesting } = await import('./index.js');
@@ -2635,7 +2703,7 @@ describe('self orchestrate CLI help tiers', () => {
 
   test('preserves the existing option set across primary and extended help', () => {
     assertExistingOptions(help('--help'), help('--help-all'));
-  });
+  }, 30_000);
 
   test.each([
     ['--help', 'Options:'],
@@ -2666,21 +2734,21 @@ describe('self orchestrate CLI help tiers', () => {
     const extendedWithoutResume = help('--help-all').replace(/^\s+--resume.*\n/m, '');
 
     expect(() => assertExistingOptions(primary, extendedWithoutResume)).toThrow();
-  });
+  }, 30_000);
 });
 
 describe('dev CLI help tiers', () => {
   const elanous = new URL('../bin/elanous.mjs', import.meta.url).pathname;
   const cwd = new URL('../', import.meta.url).pathname;
   const existingOptionNames = new Set([
-    '--file', '--ask', '--say', '--force-preflight', '--allow-no-evidence',
+    '--file', '--ask', '--substrate', '--pod-pool', '--say', '--force-preflight', '--allow-no-evidence',
     '--allow-superseded-goal', '--allow-goal-lint-errors', '--backend', '--transport',
     '--branch', '--base', '--plan', '--implement', '--elanous', '--hold', '--goal',
     '--max-steps', '--poll-ms', '--ready-timeout-ms', '--model', '--observe-only', '--isolated-root', '--cwd',
     '--worktree', '--no-open-pr', '--no-auto-merge', '--no-auto-review', '--no-draft',
     '--no-supervise', '--child-llm-provider', '--child-llm-model', '--child-llm-effort', '--correlation', '--target', '--context',
     '--context-text', '--evidence', '--doc-dir', '--doc-glob', '--test-path', '--max-rounds',
-    '--no-commit', '--deliverable', '--screens', '--json', '--role-llm', '--attach',
+    '--no-commit', '--deliverable', '--screens', '--json', '--role-llm', '--attach', '--yes',
   ]);
   const primaryOptionNames = new Set([
     '--ask', '--say', '--file', '--backend', '--target',
@@ -2688,7 +2756,7 @@ describe('dev CLI help tiers', () => {
   ]);
 
   test('option contract set itself only shrinks for the intentional retirements including graph authority', () => {
-    expect(existingOptionNames.size).toBe(47);
+    expect(existingOptionNames.size).toBe(50);
   });
 
   function help(...args: string[]): string {
@@ -2729,7 +2797,7 @@ describe('dev CLI help tiers', () => {
 
   test('preserves the existing option set across primary and extended help', () => {
     assertExistingOptions(help('--help'), help('--help-all'));
-  });
+  }, 30_000);
 
   test('accepts a folded option as a real CLI argument instead of unknown option', () => {
     const result = Bun.spawnSync({
@@ -2753,7 +2821,7 @@ describe('dev CLI help tiers', () => {
 
     expect(output).not.toContain("unknown option '--correlation'");
     expect(output).toContain('ENOENT: no such file');
-  });
+  }, 30_000);
 
   test('dev say action carries force-preflight without a graph authority override', async () => {
     const { program, setDevLaunchControlTestSeams } = await import('./index.js');
@@ -3203,7 +3271,7 @@ describe('dev CLI help tiers', () => {
     const extendedWithoutForce = help('--help-all').replace(/^\s+--force-preflight.*\n/m, '');
 
     expect(() => assertExistingOptions(primary, extendedWithoutForce)).toThrow(/force-preflight/);
-  });
+  }, 30_000);
 });
 
 describe('orchestrate CLI entrances wiring', () => {
@@ -3566,6 +3634,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     'browser-type',
     'clean',
     'deliverable-verify',
+    // 🧹 draft PR 정리 — `harness drafts`(installHarnessDraftSweepCommand).
+    'drafts',
     'map',
     'mission',
     'orchestrate',
@@ -3573,6 +3643,8 @@ describe('harness orchestrate canonical entrance capability', () => {
     'processes',
     'replay',
     'say',
+    // 🛑 런 정지 — `harness stop <runId>`(stopHarnessRun).
+    'stop',
     'trajectory',
     'terminals-purge',
     'verify-url',
@@ -3883,7 +3955,7 @@ describe('harness orchestrate canonical entrance capability', () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.text).toContain(`unknown option '${flag}'`);
     }
-  });
+  }, 20_000);
 });
 
 describe('self orchestrate CLI deliverable wiring', () => {

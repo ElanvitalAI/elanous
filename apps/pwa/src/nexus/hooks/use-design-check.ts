@@ -9,10 +9,18 @@
 
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNexusClient } from './use-nexus-context';
 import { nexusKeys } from './query-keys';
-import type { DesignCheckResponse } from '../client';
+import {
+  NexusApiError,
+  type CreateDesignSystemBody,
+  type CreateDesignSystemResponse,
+  type DesignCheckResponse,
+  type DesignDirectionView,
+  type DesignPreviewDocument,
+  type DesignPreviewsResponse,
+} from '../client';
 
 export function useDesignCheck(opts: { enabled?: boolean } = {}) {
   const client = useNexusClient();
@@ -22,6 +30,104 @@ export function useDesignCheck(opts: { enabled?: boolean } = {}) {
     enabled: opts.enabled ?? true,
     refetchInterval: 30_000,
   });
+}
+
+/** RFC design loop §B — pick a direction. Writes through the daemon (same
+ *  function as `elanous repo design-direction --set`), then refetches the check
+ *  so the card that is now declared shows it. */
+/** RFC design loop §A2 — which systems have an HTML preview. Same cadence as the check. */
+export function useDesignPreviews(opts: { enabled?: boolean } = {}) {
+  const client = useNexusClient();
+  return useQuery<DesignPreviewsResponse>({
+    queryKey: nexusKeys.designPreviews(),
+    queryFn: () => client.listDesignPreviews(),
+    enabled: opts.enabled ?? true,
+    refetchInterval: 30_000,
+  });
+}
+
+/** One preview document. `null` means the frame is closed — do not fetch. */
+export function useDesignPreview(system: string | null) {
+  const client = useNexusClient();
+  return useQuery<DesignPreviewDocument>({
+    queryKey: nexusKeys.designPreview(system ?? ''),
+    queryFn: () => client.getDesignPreview(system as string),
+    enabled: system !== null && system !== '',
+  });
+}
+
+/** System ids that currently have a preview file. */
+export function previewSystemSet(previews: readonly { system: string }[] | undefined): ReadonlySet<string> {
+  return new Set((previews ?? []).map((p) => p.system));
+}
+
+export function useSetDesignDirection() {
+  const client = useNexusClient();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => client.setDesignDirection(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: nexusKeys.designCheck() }),
+  });
+}
+
+/** URL 또는 팔레트로 라이브러리에 시스템을 만들고, 성공하면 카드 목록을 다시 읽는다. */
+export function useCreateDesignSystem() {
+  const client = useNexusClient();
+  const qc = useQueryClient();
+  return useMutation<CreateDesignSystemResponse, Error, CreateDesignSystemBody>({
+    mutationFn: (body) => client.createDesignSystem(body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: nexusKeys.designCheck() }),
+  });
+}
+
+/** One sentence for a refused create — keyed off the daemon's `reason`. */
+export function describeCreateFailure(error: unknown): string {
+  const reason = error instanceof NexusApiError
+    && error.body && typeof error.body === 'object'
+    ? (error.body as { reason?: unknown }).reason
+    : undefined;
+  switch (reason) {
+    case 'bad-url': return 'That address is not an http or https URL.';
+    case 'bad-id': return 'The id may only use lowercase letters, digits, and hyphens.';
+    case 'id-taken': return 'That id is already taken.';
+    case 'extract-failed': return 'The page could not be measured.';
+    case 'no-colors': return 'Give between 2 and 6 colors.';
+    case 'busy': return 'Another system is being made — wait for it to finish.';
+    default:
+      if (error instanceof NexusApiError && error.status === 401) return 'Only the owner can make a system — sign in first.';
+      return `Could not make the system: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+/** Cards in two groups: design systems (web · tokens) first, terminal themes
+ *  after. A system carries real values into the project; a theme is one line.
+ *  Order within a group is the daemon's. */
+export function groupDirections(available: readonly DesignDirectionView[]): {
+  systems: DesignDirectionView[];
+  themes: DesignDirectionView[];
+} {
+  const systems: DesignDirectionView[] = [];
+  const themes: DesignDirectionView[] = [];
+  for (const d of available) (d.source === 'design-system' ? systems : themes).push(d);
+  return { systems, themes };
+}
+
+/** One sentence for a refused pick — keyed off the daemon's `reason`. */
+export function describePickFailure(error: unknown): string {
+  const reason = error instanceof NexusApiError
+    && error.body && typeof error.body === 'object'
+    ? (error.body as { reason?: unknown }).reason
+    : undefined;
+  switch (reason) {
+    case 'unknown-direction': return 'The daemon does not know this direction.';
+    case 'no-repository': return 'The daemon has no repository to write to (set harness.defaultRepo).';
+    case 'conflicting-system-file': return 'design/system/ already holds a file the daemon will not overwrite.';
+    case 'cannot-read': return 'The DESIGN.md could not be read.';
+    case 'cannot-write': return 'The DESIGN.md could not be written.';
+    default:
+      if (error instanceof NexusApiError && error.status === 401) return 'Only the owner can pick a direction — sign in first.';
+      return `Could not set the direction: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 /** One rulebook row as the panel renders it.

@@ -8,13 +8,6 @@ export interface DispatchDashboardSurfaceCatalogActionDeps {
   openBrowserPreviewModal: () => void;
   openDashboardPaneModal: (pane: PaneFocus) => void;
   openCompanionPopup: (key: DashboardCompanionSurfaceKey) => void;
-  spawnBrowserVirtualWindow: () => void;
-  spawnPreviewVirtualWindow: () => void;
-  spawnBrowserPreviewVirtualWindow: () => void;
-  spawnScratchVirtualWindow: () => void;
-  spawnSimVirtualWindow: () => void;
-  currentVirtualWindowId: () => number | null;
-  openVwCompanion: (windowId: number, key: DashboardCompanionSurfaceKey) => void;
   onWarning?: (message: string) => void;
 }
 
@@ -46,35 +39,5 @@ export function dispatchDashboardSurfaceCatalogAction(
     }
     return;
   }
-  if (surfaceId === 'vw:browser') {
-    deps.spawnBrowserVirtualWindow();
-    return;
-  }
-  if (surfaceId === 'vw:preview') {
-    deps.spawnPreviewVirtualWindow();
-    return;
-  }
-  if (surfaceId === 'vw:browser-preview') {
-    deps.spawnBrowserPreviewVirtualWindow();
-    return;
-  }
-  if (surfaceId === 'vw:scratch') {
-    deps.spawnScratchVirtualWindow();
-    return;
-  }
-  if (surfaceId === 'vw:sim') {
-    deps.spawnSimVirtualWindow();
-    return;
-  }
-  if (surfaceId.startsWith('vw-companion:')) {
-    const key = surfaceId.slice('vw-companion:'.length);
-    const windowId = deps.currentVirtualWindowId();
-    if (!Number.isInteger(windowId)) {
-      deps.onWarning?.('no foreground virtual window for VW companion');
-      return;
-    }
-    if (key === 'clipboard' || key === 'memo' || key === 'detail') {
-      deps.openVwCompanion(windowId as number, key);
-    }
-  }
+  deps.onWarning?.(`unsupported dashboard surface: ${surfaceId}`);
 }

@@ -24,7 +24,10 @@ the web app or in the terminal:
   ```
 
 Give the absolute path of the folder that contains your notes (the one with
-the `.obsidian` folder inside).
+the `.obsidian` folder inside). A folder set from the terminal is picked up by
+the running daemon on the next Vault request as well — no restart.
+If the new path is missing or empty, elanous keeps using the vault it already
+had, so a mistyped path never leaves the Vault menu without notes.
 
 ## Browse and search
 

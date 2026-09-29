@@ -51,10 +51,18 @@ const DEFAULT_CANDIDATES = [
   'tailscale',
 ];
 
+/** macOS 앱 번들의 `Tailscale` 바이너리는 환경이 비어 있으면(launchd 로 뜬 넥서스 — `TERM` 없음) CLI 가 아니라
+ *  GUI 로 뜨려다 «The Tailscale GUI failed to start» 를 rc 0 으로 낸다 ⇒ JSON 파싱 실패 ⇒ `alive:false` ⇒
+ *  공유 자동 마운트가 1분마다 «tailscale-down» 으로 건너뛰었다(📏 2026-09-27 운영 · 재시작 뒤 tailnet PWA 가 빠짐).
+ *  `TAILSCALE_BE_CLI=1` 이 CLI 로 고정한다(다른 플랫폼·래퍼에는 무해). tailscale 을 부르는 모든 자리가 이 환경을 쓴다. */
+export function tailscaleExecEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...base, TAILSCALE_BE_CLI: '1' };
+}
+
 function defaultExec(timeoutMs: number) {
   return (binary: string, args: string[]): Promise<{ stdout: string; code: number }> =>
     new Promise((resolve) => {
-      execFile(binary, args, { timeout: timeoutMs, encoding: 'utf-8' }, (err, stdout) => {
+      execFile(binary, args, { timeout: timeoutMs, encoding: 'utf-8', env: tailscaleExecEnv() }, (err, stdout) => {
         // An execFile error with code !== 0 still surfaces stdout; capture both.
         if (err && typeof err === 'object' && 'code' in err && typeof err.code === 'number') {
           resolve({ stdout: stdout ?? '', code: err.code });

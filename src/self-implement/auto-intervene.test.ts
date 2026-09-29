@@ -12,7 +12,7 @@ type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends (<T>() => T extends B 
   ? (<T>() => T extends B ? 1 : 2) extends (<T>() => T extends A ? 1 : 2) ? true : false
   : false;
 type Assert<T extends true> = T;
-type ExpectedBrainActions = 'input' | 'wait' | 'done' | 'no-progress';
+type ExpectedBrainActions = 'input' | 'wait' | 'done' | 'no-progress' | 'key' | 'mouse' | 'resize' | 'handoff' | 'ask-human';
 type ControlDecisionActionParity = Assert<Equal<ControlDecision['action'], ExpectedBrainActions>>;
 type BrainSuggestionActionParity = Assert<Equal<BrainSuggestionAction, ControlDecision['action']>>;
 void (0 as unknown as ControlDecisionActionParity);

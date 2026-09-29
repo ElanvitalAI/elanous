@@ -421,12 +421,13 @@ describe('ask marker check — CLI 종료 경로', () => {
     expect(r.stdout).toContain('ℹ️ 판정 신호 시험 경로 — bun test 경로가 없다');
   });
 
+  // #21723 added the old src/oauth/codex-account-rotation.test.ts fixture path; keep an absent path with a real same-name test to verify suggestions.
   it('exports warning-grade axis observations without changing their CLI wording', () => {
-    const testPathAxis = inspectAskMarkers('대상 경로: scripts/ask-marker-check.ts\n판정 신호: 조건 = 경로; 관측 = bun test src/oauth/codex-account-rotation.test.ts; 기대 = 경고')
+    const testPathAxis = inspectAskMarkers('대상 경로: scripts/ask-marker-check.ts\n판정 신호: 조건 = 경로; 관측 = bun test src/oauth/codex-account-mirror.test.ts; 기대 = 경고')
       .find((axis) => axis.label === '판정 신호 시험 경로')!;
 
     expect(formatAxisObservations(testPathAxis)).toEqual([
-      `⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-rotation.test.ts; 같은 파일 이름의 실제 경로: test/oauth/codex-account-rotation.test.ts`,
+      `⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-mirror.test.ts; 같은 파일 이름의 실제 경로: test/oauth/codex-account-mirror.test.ts`,
     ]);
   });
 
@@ -576,13 +577,13 @@ describe('ask marker check — CLI 종료 경로', () => {
 
 불변식: scripts/ask-marker-check.ts 를 계속 쓴다.
 경계: 다른 스크립트는 대상이 아니다.
-판정 신호: 조건 = 경로를 본다; 관측 = bun test src/oauth/codex-account-rotation.test.ts; 기대 = 경고를 낸다.
+판정 신호: 조건 = 경로를 본다; 관측 = bun test src/oauth/codex-account-mirror.test.ts; 기대 = 경고를 낸다.
 `);
 
     expect(r.status).toBe(0);
     expectLinesInOrder(r.stdout, [
       `   ⚠️ 판정 신호 시험 경로 — 1개 경로가 «${shortRoot(repositoryRoot)}»의 파일을 못 문다 (0/1개 경로가 파일 0개를 문다)`,
-      `   ⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-rotation.test.ts; 같은 파일 이름의 실제 경로: test/oauth/codex-account-rotation.test.ts`,
+      `   ⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-mirror.test.ts; 같은 파일 이름의 실제 경로: test/oauth/codex-account-mirror.test.ts`,
       '   ⚠️ 판정 신호 종류 — 1개가 «전부» 단위 시험이다 (실물 관측 0) — 값이 «실행 경로»로 흘렀다는 것을 무엇이 증명하나',
       '✅ 1개 파일이 마커를 온전히 갖고 있다 — 발사해도 된다.',
     ]);
@@ -1225,21 +1226,21 @@ describe('판정 신호 시험 경로 — CLI 배선', () => {
   const ask = (observation: string) => [...HEAD, `판정 신호: 조건 = 경로를 본다; 관측 = ${observation}; 기대 = 출력한다`].join('\n');
 
   it('전부 못 무는 경로는 경고 요약과 기존 개별 진단을 내면서 exit 0을 유지한다', () => {
-    const r = runCli(ask('bun test src/oauth/codex-account-rotation.test.ts'));
+    const r = runCli(ask('bun test src/oauth/codex-account-mirror.test.ts'));
 
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(`⚠️ 판정 신호 시험 경로 — 1개 경로가 «${shortRoot(repositoryRoot)}»의 파일을 못 문다 (0/1개 경로가 파일 0개를 문다)`);
-    expect(r.stdout).toContain(`⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-rotation.test.ts`);
-    expect(r.stdout).toContain('test/oauth/codex-account-rotation.test.ts');
+    expect(r.stdout).toContain(`⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-mirror.test.ts`);
+    expect(r.stdout).toContain('test/oauth/codex-account-mirror.test.ts');
   });
 
   it('일부만 못 무는 경로는 그 수를 경고 요약으로 낸다', () => {
-    const r = runCli(ask('bun test scripts/ask-marker-check.test.ts src/oauth/codex-account-rotation.test.ts'));
+    const r = runCli(ask('bun test scripts/ask-marker-check.test.ts src/oauth/codex-account-mirror.test.ts'));
 
     expect(r.status).toBe(0);
     expect(r.stdout).toContain(`⚠️ 판정 신호 시험 경로 — 1개 경로가 «${shortRoot(repositoryRoot)}»의 파일을 못 문다 (1/2개 경로가 파일 1개를 문다)`);
     expect(r.stdout).toContain(`ℹ️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 scripts/ask-marker-check.test.ts: 1개 파일 매치`);
-    expect(r.stdout).toContain(`⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-rotation.test.ts; 같은 파일 이름의 실제 경로: test/oauth/codex-account-rotation.test.ts`);
+    expect(r.stdout).toContain(`⚠️ 판정 신호 시험 경로 — «${shortRoot(repositoryRoot)}»에서 0개 매치: src/oauth/codex-account-mirror.test.ts; 같은 파일 이름의 실제 경로: test/oauth/codex-account-mirror.test.ts`);
   });
 
   it('어디에도 없는 파일은 경고가 아닌 만들 파일 정보로 내되 요약은 못 무는 수를 경고한다', () => {

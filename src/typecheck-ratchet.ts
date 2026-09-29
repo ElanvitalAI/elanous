@@ -304,6 +304,21 @@ export function diffTypecheckDiagnostics(current: readonly TypecheckError[], bas
   return { added, existing, removed };
 }
 
+/** Selects newly diagnosed consumers outside the changed-file set for a project scope. */
+export function promotedConsumersFromDiff(
+  diff: TypecheckDiagnosticDiff,
+  changed: ReadonlySet<string>,
+  include: (file: string) => boolean,
+): Set<string> {
+  const promoted = new Set<string>();
+  const normalizedChanged = new Set([...changed].map(normalizeTypecheckPath));
+  for (const error of diff.added) {
+    const file = normalizeTypecheckPath(error.file);
+    if (!normalizedChanged.has(file) && include(file)) promoted.add(file);
+  }
+  return promoted;
+}
+
 export function classifyTypecheckErrors(
   errors: readonly TypecheckError[],
   changedFiles: ReadonlySet<string>,

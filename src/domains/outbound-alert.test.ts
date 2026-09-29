@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import {
   classifyDaemonResponse,
   deliver,
@@ -158,7 +159,7 @@ describe('flushDeferred 관측 — 경로 · 밀림 경고 등급', () => {
 type LogFn = typeof debug.log;
 type Logged = { category: string; event: string; data: unknown };
 
-const ENV_KEYS = ['SEND_VIA_ELANOUS', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'] as const;
+const ENV_KEYS = ['SEND_VIA_ELANOUS', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'ELANOUS_NEXUS_URL'] as const;
 
 const savedEnv: Record<string, string | undefined> = {};
 const logged: Logged[] = [];
@@ -196,6 +197,10 @@ function classifications(): DaemonPathClass[] {
 beforeEach(() => {
   for (const key of ENV_KEYS) savedEnv[key] = process.env[key];
   delete process.env.SEND_VIA_ELANOUS;
+  delete process.env.ELANOUS_NEXUS_URL;
+  setResolveDaemonEndpointForTest(() => ({
+    baseUrl: 'http://127.0.0.1:45678', healthUrl: 'http://127.0.0.1:45678/v1/health', pwaUrl: 'http://127.0.0.1:45678/app/', source: 'registry',
+  }));
   process.env.TELEGRAM_BOT_TOKEN = 'test-bot-token:dummy';
   process.env.TELEGRAM_CHAT_ID = '12345';
   logged.length = 0;
@@ -226,6 +231,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setResolveDaemonEndpointForTest(null);
   curlSpy?.mockRestore();
   curlSpy = undefined;
   (debug as { log: LogFn }).log = originalLog;
@@ -462,5 +468,26 @@ describe('deliver()', () => {
     expect(unauthorizedLine).not.toBe(rejectedLine);
     expect(rejectedLine).not.toBe(unreachableLine);
     expect(unauthorizedLine).not.toBe(unreachableLine);
+  });
+
+  test('데몬 주소는 해석기가 낸 주소다 — 31415 로 짐작하지 않는다', () => {
+    daemonBody = JSON.stringify({ delivered: true });
+    expect(deliver('t', 'alert')).toBe('daemon');
+    expect(outboundUrls).toEqual(['http://127.0.0.1:45678/v1/outbound']);
+  });
+
+  test('ELANOUS_NEXUS_URL 이 있으면 해석기보다 먼저다', () => {
+    process.env.ELANOUS_NEXUS_URL = 'http://127.0.0.1:31999';
+    daemonBody = JSON.stringify({ delivered: true });
+    expect(deliver('t', 'alert')).toBe('daemon');
+    expect(outboundUrls).toEqual(['http://127.0.0.1:31999/v1/outbound']);
+  });
+
+  test('해석기가 null 이면 데몬에 쓰지 않고 직접 발송으로 간다', () => {
+    setResolveDaemonEndpointForTest(() => null);
+    daemonBody = JSON.stringify({ delivered: true });
+    expect(deliver('t', 'alert')).toBe('direct');
+    expect(outboundUrls).toEqual([]);
+    expect(telegramUrls.length).toBe(1);
   });
 });

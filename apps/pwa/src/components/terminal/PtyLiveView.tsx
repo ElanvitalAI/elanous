@@ -7,13 +7,15 @@ import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import type { DaemonClient, DaemonTerminalSummary } from '@/lib/daemon-client';
 import {
-  initialPtyLivePollState, nextPtyLivePollState, PTY_LIVE_POLL_MS, shouldPollPty,
+  initialPtyLivePollState, nextPtyLivePollState, PTY_LIVE_POLL_MS, ptySnapshotReplacement, shouldPollPty,
   type PtyLivePollState,
 } from './pty-live-poll';
+import { debugLog } from '@/lib/debug';
+import { cellFromPoint, isMouseModeOff, mouseButtonName } from './pty-mouse-forward';
 
 interface Props {
   terminal: DaemonTerminalSummary;
-  client: Pick<DaemonClient, 'snapshotTerminal' | 'controlTerminal' | 'sendTerminalText' | 'sendTerminalKey'>;
+  client: Pick<DaemonClient, 'snapshotTerminal' | 'controlTerminal' | 'sendTerminalText' | 'sendTerminalKey'> & Partial<Pick<DaemonClient, 'streamTerminal' | 'sendTerminalMouse'>>;
   onClose: () => void;
 }
 
@@ -35,6 +37,8 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [message, setMessage] = useState<string | null>(null);
+  /** 화면을 받는 방식 — 스트림(바이트·화면 차이) 또는 800ms 폴링(옛 데몬·실패 시). */
+  const [feed, setFeed] = useState<'stream-bytes' | 'stream-screen' | 'poll' | 'connecting'>('connecting');
 
   useEffect(() => {
     if (!container.current) return;
@@ -91,6 +95,50 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
       });
     });
 
+    // takeover 중 마우스 → PTY(🅢 #21609 `input-mouse`). xterm 이 이미 마우스를 추적하면(원 바이트 스트림으로
+    // 앱의 ?1000h 를 받은 경우) xterm 이 onData 로 보내므로 여기서는 비킨다 — 두 번 보내지 않는다.
+    const host = container.current;
+    let mouseOffNoted = false;
+    const sendMouse = (mouse: { x: number; y: number; kind: 'click' | 'scroll-up' | 'scroll-down'; button?: 'left' | 'middle' | 'right' }) => {
+      session.queue = session.queue.then(async () => {
+        try {
+          if (!client.sendTerminalMouse) return;
+          const result = await client.sendTerminalMouse(terminal.id, mouse, source);
+          if (session.closed || result.status === 'success') return;
+          if (isMouseModeOff(result.reason)) {
+            if (mouse.kind === 'click' && !mouseOffNoted) { mouseOffNoted = true; setMessage('이 앱은 마우스를 받지 않는다(마우스 모드 꺼짐) — 키보드로 조작하세요.'); }
+            return;
+          }
+          setMessage(result.reason || `마우스 전송 실패: ${result.status}`);
+        } catch (error) {
+          if (!session.closed) setMessage(`마우스 전송 실패: ${String(error)}`);
+        }
+      });
+    };
+    const cellOf = (e: MouseEvent) => {
+      const screenEl = term.element?.querySelector('.xterm-screen');
+      return screenEl ? cellFromPoint(e.clientX, e.clientY, screenEl.getBoundingClientRect(), term.cols, term.rows) : null;
+    };
+    const forwarding = () => session.accepting && !session.closed && term.modes.mouseTrackingMode === 'none';
+    const onMouseDown = (e: MouseEvent) => {
+      if (!forwarding()) return;
+      const button = mouseButtonName(e.button);
+      const cell = cellOf(e);
+      if (!button || !cell) return;
+      sendMouse({ ...cell, kind: 'click', button });
+    };
+    const onWheel = (e: WheelEvent) => {
+      if (!forwarding() || e.deltaY === 0) return;
+      const cell = cellOf(e);
+      if (!cell) return;
+      // xterm 은 마우스 추적이 없을 때 휠을 ↑↓ 화살표로 바꿔 보낸다(실측: 앱이 `ESC[A` 를 받았다) — 캡처 단계에서 가로채 막는다.
+      e.preventDefault();
+      e.stopPropagation();
+      sendMouse({ ...cell, kind: e.deltaY < 0 ? 'scroll-up' : 'scroll-down' });
+    };
+    host.addEventListener?.('mousedown', onMouseDown, { capture: true });
+    host.addEventListener?.('wheel', onWheel, { passive: false, capture: true });
+
     let timer: ReturnType<typeof setTimeout> | undefined;
     const schedule = () => {
       if (!session.closed && shouldPollPty(!document.hidden, stateRef.current)) timer = setTimeout(() => { void poll(); }, PTY_LIVE_POLL_MS);
@@ -112,19 +160,48 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
       }
       schedule();
     };
+    // 실시간 스트림을 먼저 쓴다(드라이브 RFC ⑥) — 안 되면 폴링으로. 창을 숨기면 끊고, 보이면 다시 잇는다(평소 부하 0).
+    let polling = !client.streamTerminal;
+    let disposeStream: (() => void) | null = null;
+    const startStream = () => {
+      if (!client.streamTerminal || session.closed || polling) return;
+      setFeed('connecting');
+      disposeStream = client.streamTerminal(terminal.id, { sourceRoot: source.sourceRoot }, (ev) => {
+        if (session.closed) return;
+        if (ev.type === 'mode') setFeed(ev.mode === 'bytes' ? 'stream-bytes' : 'stream-screen');
+        else if (ev.type === 'reset' || ev.type === 'screen') { term.write(ptySnapshotReplacement(ev.screen) + '\x1b[?25l'); setMessage(null); }
+        else if (ev.type === 'data') term.write(ev.chunk);
+        else if (ev.type === 'end') { setMessage('PTY 가 끝났습니다'); stateRef.current = { ...stateRef.current, stopped: true }; }
+        else if (ev.type === 'status') setMessage(`화면 조회: ${ev.status}`);
+      }, (reason) => {
+        if (session.closed) return;
+        debugLog('pwa.terminal.stream-fallback', { id: terminal.id, reason });
+        polling = true;
+        setFeed('poll');
+        void poll();
+      });
+    };
     const onVisibility = () => {
       if (timer) clearTimeout(timer);
       timer = undefined;
+      if (!polling) {
+        if (document.hidden) { disposeStream?.(); disposeStream = null; }
+        else if (!disposeStream && !stateRef.current.stopped) startStream();
+        return;
+      }
       if (!document.hidden && !session.closed && !stateRef.current.stopped) void poll();
     };
     document.addEventListener('visibilitychange', onVisibility);
-    void poll();
+    if (polling) { setFeed('poll'); void poll(); } else startStream();
     return () => {
       session.closed = true;
       session.accepting = false;
       if (timer) clearTimeout(timer);
+      disposeStream?.();
       document.removeEventListener('visibilitychange', onVisibility);
       input.dispose();
+      host.removeEventListener?.('mousedown', onMouseDown, { capture: true });
+      host.removeEventListener?.('wheel', onWheel, { capture: true });
       // A takeover may still be in flight when the view is removed. Its promise
       // records ownership before this cleanup attempts the release.
       void (async () => {
@@ -197,6 +274,9 @@ export function PtyLiveView({ terminal, client, onClose }: Props) {
         <span className="font-mono">{terminal.id}</span>
         <span>{terminal.kind ?? 'PTY'}</span>
         <span>{writable ? '입력 가능' : '읽기 전용'}</span>
+        <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300" data-pty-feed={feed} title="화면을 받는 방식">
+          {feed === 'stream-bytes' ? '● 실시간' : feed === 'stream-screen' ? '● 실시간(화면)' : feed === 'poll' ? '폴링 0.8s' : '연결 중'}
+        </span>
         <button type="button" disabled={busy} onClick={() => { changeControl(writable ? 'release' : 'takeover'); }}>
           {writable ? 'release' : 'takeover'}
         </button>

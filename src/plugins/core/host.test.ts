@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 import { PluginHost, USER_DIR, type HostHooks } from './host.js';
+import { installPlugin, removePlugin } from '../install/plugin-install.js';
 
 const tempDirs: string[] = [];
 
@@ -62,7 +63,7 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     expect(header).toMatch(/currently finds no Claude-managed/);
   });
 
-  test('discover() finds seven repository built-ins including botlab', async () => {
+  test('discover() finds repository built-ins including botlab', async () => {
     const userDir = createDir('elanous-host-user-empty-');
     const host = new PluginHost(hooks, null, { userDir });
     await host.discover();
@@ -102,5 +103,57 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     const userPlugins = host.list().filter((entry) => entry.source === 'user');
     expect(userPlugins.map((entry) => entry.manifest.id)).toEqual(['mine']);
     expect(host.list().filter((entry) => entry.source === 'builtin')).toHaveLength(7);
+  });
+
+  test('ledger entries alone are discovered; removal and corrupt ledger preserve built-ins and user plugins', async () => {
+    const original = process.env.ELANOUS_STATE_DIR;
+    const root = createDir('elanous-host-ledger-');
+    const userDir = createDir('elanous-host-user-ledger-');
+    const source = createDir('elanous-host-source-ledger-');
+    writeMinePlugin(userDir);
+    writeFileSync(join(source, 'plugin.json'), JSON.stringify({ id: 'installed-test', name: 'installed-test', version: '1.0.0', main: './plugin.ts' }));
+    writeFileSync(join(source, 'plugin.ts'), `export default { name: 'installed-test', version: '1.0.0', initialState: () => ({}), panes: {} };`);
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const installed = await installPlugin(source, { root, yes: true });
+      const override = join(root, 'plugins', 'local', 'mine', '1.0.0');
+      mkdirSync(override, { recursive: true });
+      writeFileSync(join(override, 'plugin.json'), JSON.stringify({ id: 'mine', version: '1.0.0', main: './plugin.ts' }));
+      writeFileSync(join(override, 'plugin.ts'), MINIMAL_PLUGIN);
+      const ledgerFile = join(root, 'plugins', 'installed.json');
+      const ledger = JSON.parse(readFileSync(ledgerFile, 'utf8')) as object[];
+      writeFileSync(ledgerFile, JSON.stringify([...ledger, { name: 'mine', version: '1.0.0', market: 'local', sha256: null }]));
+      const stray = join(root, 'plugins', 'local', 'stray-test', '1.0.0');
+      const fakeVersion = join(root, 'plugins', 'local', 'installed-test', '9.0.0');
+      mkdirSync(fakeVersion, { recursive: true });
+      writeFileSync(join(fakeVersion, 'plugin.json'), JSON.stringify({ id: 'installed-test', version: '9.0.0', main: './plugin.ts' }));
+      writeFileSync(join(fakeVersion, 'plugin.ts'), MINIMAL_PLUGIN);
+      mkdirSync(stray, { recursive: true });
+      writeFileSync(join(stray, 'plugin.json'), JSON.stringify({ id: 'stray-test', version: '1.0.0', main: './plugin.ts' }));
+      writeFileSync(join(stray, 'plugin.ts'), MINIMAL_PLUGIN);
+      const warnings: string[] = [];
+      const host = new PluginHost({ ...hooks, log: message => warnings.push(message) }, null, { userDir });
+      await host.discover();
+      expect(host.list().find(entry => entry.manifest.id === 'installed-test')).toMatchObject({ path: installed.path, source: 'installed' });
+      expect(host.list().some(entry => entry.manifest.id === 'stray-test')).toBe(false);
+      expect(host.list().find(entry => entry.manifest.id === 'installed-test')?.manifest.version).toBe('1.0.0');
+      expect(host.list().filter(entry => entry.source === 'builtin')).toHaveLength(7);
+      expect(host.list().filter(entry => entry.source === 'user').map(entry => entry.manifest.id)).toEqual(['mine']);
+      expect(host.list().find(entry => entry.manifest.id === 'mine')?.path).toBe(join(userDir, 'mine'));
+      rmSync(fakeVersion, { recursive: true });
+      rmSync(stray, { recursive: true });
+      expect(removePlugin('installed-test', root)).toBe(1);
+      await host.discover();
+      expect(host.list().some(entry => entry.manifest.id === 'installed-test')).toBe(false);
+      expect(host.list().some(entry => entry.manifest.id === 'stray-test')).toBe(false);
+      writeFileSync(join(root, 'plugins', 'installed.json'), '{bad');
+      await host.discover();
+      expect(warnings.some(message => message.includes('installed.json'))).toBe(true);
+      expect(host.list().filter(entry => entry.source === 'builtin')).toHaveLength(7);
+      expect(host.list().filter(entry => entry.source === 'user').map(entry => entry.manifest.id)).toEqual(['mine']);
+    } finally {
+      if (original === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = original;
+    }
   });
 });

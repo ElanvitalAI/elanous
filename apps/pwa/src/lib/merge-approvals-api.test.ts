@@ -62,3 +62,33 @@ describe('merge approvals PWA client', () => {
     }
   });
 });
+
+describe('approval error text says the cause and the next step', () => {
+  test('401 → missing owner token, with a link to settings', async () => {
+    const { approvalErrorText, MergeApprovalsApiError } = await import('./merge-approvals-api');
+    const out = approvalErrorText(new MergeApprovalsApiError(401, 'unauthorized'), 'x');
+    expect(out.text).toContain('소유자 토큰');
+    // Where to get it, not just that it is missing (대표 16:1x — the terminal banner said «붙이면» but not «어디서»).
+    expect(out.text).toContain('Connect token');
+    expect(out.text).toContain('Bearer token');
+    // Plain full-page link to the Bearer token field (the settings panel focuses it on this hash).
+    expect(out.href).toBe('/app/settings/#bearer-token');
+  });
+  test('gh-failed names the daemon side and keeps the first reason line', async () => {
+    const { approvalErrorText, MergeApprovalsApiError } = await import('./merge-approvals-api');
+    const out = approvalErrorText(new MergeApprovalsApiError(502, 'gh-failed', 'HTTP 502: bad gateway\nmore'), 'x');
+    expect(out.text).toContain('GitHub');
+    expect(out.text).toContain('HTTP 502: bad gateway');
+    expect(out.text).not.toContain('more');
+  });
+  test('unknown repo points at the config key; network errors say the daemon was unreachable', async () => {
+    const { approvalErrorText, MergeApprovalsApiError } = await import('./merge-approvals-api');
+    expect(approvalErrorText(new MergeApprovalsApiError(503, 'approvals-repo-unknown'), 'x').text).toContain('intake.approvals.repo');
+    expect(approvalErrorText(new TypeError('Failed to fetch'), 'x').text).toContain('데몬에 닿지 못했습니다');
+  });
+  test('a server reason is shown as is; an unknown code keeps status and code', async () => {
+    const { approvalErrorText, MergeApprovalsApiError } = await import('./merge-approvals-api');
+    expect(approvalErrorText(new MergeApprovalsApiError(403, 'label-missing', '아이디어 승인 라벨이 없습니다.'), 'x').text).toBe('아이디어 승인 라벨이 없습니다.');
+    expect(approvalErrorText(new MergeApprovalsApiError(500, 'boom'), '목록 실패').text).toBe('목록 실패 (500 boom)');
+  });
+});

@@ -1,0 +1,45 @@
+graph_id: steward
+loop:
+  title: 스튜어드
+  trigger:
+    cron: '*/15 8-23 * * *'
+    events: [directive, linear-webhook]
+version: 1
+entry_node: sync
+terminal_nodes: [done, failed]
+nodes:
+  - node_id: sync
+    kind: agent
+    recipe: cmd:steward-sync
+    max_visits: 1
+  - node_id: triage
+    kind: agent
+    recipe: cmd:steward-triage
+    max_visits: 1
+  - node_id: schedule
+    kind: agent
+    recipe: cmd:steward-schedule
+    max_visits: 1
+  - node_id: report
+    kind: agent
+    recipe: cmd:steward-report
+    max_visits: 1
+  - node_id: done
+    kind: gate
+    max_visits: 1
+  - node_id: failed
+    kind: gate
+    max_visits: 1
+edges:
+  - from: sync
+    on: outcome
+    map: { ok: triage, fail: failed }
+  - from: triage
+    on: outcome
+    map: { ok: schedule, fail: failed }
+  - from: schedule
+    on: outcome
+    map: { ok: report, fail: failed }
+  - from: report
+    on: outcome
+    map: { ok: done, fail: failed }

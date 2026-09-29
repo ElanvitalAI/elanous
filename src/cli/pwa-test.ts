@@ -37,11 +37,14 @@
 
 import { leaseTestPort } from './port-lease-local.js';
 import { debug } from '../debug/log.js';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { dirname, join as joinPath, resolve as resolvePath } from 'node:path';
 
 import { setTestStateRoot } from '../nexus/paths.js';
+import { readNexusRuntimeAt } from '../nexus/runtime.js';
+import { isPidAlive } from '../process/pid-liveness.js';
+import { lastMeaningfulLogLine } from './bg-launch.js';
 import { PORT_BANDS } from '../control-plane/ports.js';
 import { PORT_LEASE_TTL_MS } from '../control-plane/port-lease-heartbeat.js';
 import { resolvePrimary, type PrimaryAddress, type PrimaryConfig } from '../control-plane/primary.js';
@@ -754,11 +757,33 @@ function runStatus(
     if (parsed.url) out.log(`  url       ${parsed.url}`);
     out.log(`  started   ${parsed.startedAt ?? '(unknown)'}`);
 
+    // The daemon writes under nexus/ after setTestStateRoot(stateDir); also read
+    // the project-root sidecar when that daemon path does not exist.
+    const daemonRuntimePath = joinPath(layout.stateDir, 'nexus', 'runtime.json');
+    const runtime = readNexusRuntimeAt(existsSync(daemonRuntimePath) ? daemonRuntimePath : layout.runtimePath);
+    const pid = runtime?.pid;
+    const alive = pid !== undefined && isPidAlive(pid);
+    debug.log('nexus.test-status', 'liveness', { pid, alive });
+    out.log(pid === undefined ? '  alive     unknown — runtime.json 에 pid 없음'
+      : alive ? `  alive     yes (pid ${pid})` : `  alive     NO — pid ${pid} 없음`);
+
     const tsState = readMountedState(layout.tailscaleStatePath);
     if (tsState && tsState.mode.kind === 'tls-tcp') {
       out.log(`  tailscale port=${tsState.mode.port} hostname=${tsState.hostname ?? '?'}`);
     }
-    return { exitCode: 0 };
+    if (!alive) {
+      // bg-launch names its detached logs nexus-<Date.now()>.log in this test root.
+      const logsDir = joinPath(layout.stateDir, 'nexus', 'logs');
+      try {
+        const logName = readdirSync(logsDir).filter(name => /^nexus-\d+\.log$/.test(name)).sort().at(-1);
+        if (logName) {
+          const lastLine = lastMeaningfulLogLine(joinPath(logsDir, logName));
+          if (lastLine) out.log(`  last log  ${lastLine}`);
+        }
+      } catch { /* log is optional when the daemon died before creating it */ }
+      out.log('  fix       elanous nexus run --test --stop 으로 기록을 치운 뒤 다시 띄운다');
+    }
+    return { exitCode: alive ? 0 : 1 };
   } catch (err) {
     out.error(`elanous nexus run --test --status: state file unreadable — ${(err as Error).message}`);
     return { exitCode: 1 };

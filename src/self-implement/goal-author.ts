@@ -82,7 +82,7 @@ export interface GoalAuthorDeps {
   /** Optional externally decomposed plan steps rendered verbatim into the authored goal; the author never generates them. */
   steps?: readonly string[];
   /** Optional injected decomposition seam; omitted means authoring never invokes an LLM or decomposition. */
-  decomposeSteps?: (objective: string, opts?: { context?: string }) => Promise<readonly string[]>;
+  decomposeSteps?: (objective: string, opts?: { context?: string; runId?: string }) => Promise<readonly string[]>;
   /** Optional launch preflight result supplied by the caller; authoring never reads the ledger or logs itself. */
   launchPreflight?: LaunchPreflightResult;
   /** Optional in-process notification for each authored-goal phase transition. */
@@ -5066,7 +5066,7 @@ async function authorGoalWithSupersededRootIntent(
     const startedAt = Date.now();
     let failed = false;
     try {
-      const decomposed = await deps.decomposeSteps(ask, { context: facts?.context || undefined });
+      const decomposed = await deps.decomposeSteps(ask, { context: facts?.context || undefined, runId: process.env.ELANOUS_RUN_ID?.trim() || authorRunId });
       if (decomposed.length > 0) resolvedSteps = decomposed;
     } catch {
       failed = true;

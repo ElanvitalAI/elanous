@@ -11,7 +11,7 @@
 //   3. VW pane intent (`paneId`) travels with the handle so the
 //      slash-command caller (Step E) knows where to mount.
 //
-// This file deliberately does NOT touch `src/virtual-windows/**` —
+// This file deliberately stays independent of the display layer —
 // mounting a PTY into a VW pane is a display concern and belongs to
 // the consumer of the returned BoundAgent (slash wiring, VW tool,
 // etc.). Keeping the boundary clean lets AXON and IDX evolve

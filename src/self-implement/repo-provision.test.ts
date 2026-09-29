@@ -13,10 +13,12 @@ import { ELANOUS_RUNTIME_ARTIFACT_DIRS, ELANOUS_RUNTIME_ARTIFACT_PATHS } from '.
 //       그 박힌 수가 「판별 함수가 아는 다섯 중 둘만 쓴다」는 사실을 «계약으로» 굳히고 있었다.
 const MANAGED_ELANOUS_ENTRIES = ['.elanous/', '.elanous-test/', ...ELANOUS_RUNTIME_ARTIFACT_DIRS, ...ELANOUS_RUNTIME_ARTIFACT_PATHS]
   .filter((entry, index, all) => all.indexOf(entry) === index);
-const MANAGED_ENTRY_COUNT = SENSITIVE_GLOBS.length + MANAGED_ELANOUS_ENTRIES.length;
+const DEFAULT_PROJECT_ENTRIES = ['node_modules/', '.env*', 'dist/', '.DS_Store'];
+const MANAGED_ENTRY_COUNT = new Set([...SENSITIVE_GLOBS, ...DEFAULT_PROJECT_ENTRIES, ...MANAGED_ELANOUS_ENTRIES]).size;
 import { resolveHarnessTarget, type HarnessTargetResolution } from './harness-target-options.js';
 import { makeRepositoryPublic, preflightRepositoryPublish, preflightRepositoryVisibility, provisionRepository, publishRepository } from './repo-provision.js';
 import { runDevPipeline, type DevPipelineSpec } from '../self-dev/dev-pipeline.js';
+import { buildDevCliSpec } from '../self-dev/dev-cli.js';
 import type { SelfImplementSeams } from './orchestrator.js';
 import { runRepositoryPublic, runRepositoryPublish } from '../cli/repo-cli.js';
 
@@ -80,6 +82,48 @@ afterEach(() => {
 });
 
 describe('provisionRepository', () => {
+  test('creates .gitignore before the initial commit and excludes default project artifacts', async () => {
+    const { debug } = await import('../debug/log.js');
+    const ignoreSteps: Record<string, unknown>[] = [];
+    const off = debug.registerSink({
+      name: 'repo-provision-new-ignore-capture',
+      emit: (record) => {
+        const data = record.data as Record<string, unknown> | undefined;
+        if (record.category === 'repo-provision' && record.event === 'step' && data?.step === 'ignore') ignoreSteps.push(data);
+      },
+    });
+    try {
+      const directory = createDirectory();
+      writeFileSync(join(directory, 'a.ts'), 'export const a = 1;\n');
+      writeFileSync(join(directory, '.env.local'), 'secret\n');
+      writeFileSync(join(directory, '.DS_Store'), 'metadata');
+      mkdirSync(join(directory, 'node_modules'));
+      writeFileSync(join(directory, 'node_modules', 'dependency.js'), 'dependency');
+      mkdirSync(join(directory, 'dist'));
+      writeFileSync(join(directory, 'dist', 'a.js'), 'compiled');
+
+      const result = provisionRepository(resolution(directory));
+      expect(result).toMatchObject({ status: 'provisioned', ignoreFile: { created: true, preserved: 0 } });
+      expect(readFileSync(join(directory, '.gitignore'), 'utf8').split(/\r?\n/)).toEqual(expect.arrayContaining(DEFAULT_PROJECT_ENTRIES));
+      expect(git(directory, ['ls-tree', '-r', '--name-only', 'HEAD']).split('\n')).toEqual(['.gitignore', 'a.ts']);
+      expect(Number(git(directory, ['rev-list', '--count', 'HEAD']))).toBe(1);
+      expect(ignoreSteps).toEqual([expect.objectContaining({ ok: true, created: true })]);
+    } finally {
+      off();
+    }
+  });
+
+  test('preserves an existing .gitignore and reports it was not created', () => {
+    const directory = createDirectory();
+    writeFileSync(join(directory, 'a.ts'), 'export const a = 1;\n');
+    writeFileSync(join(directory, '.gitignore'), 'custom/\n');
+    expect(provisionRepository(resolution(directory))).toMatchObject({
+      status: 'provisioned', ignoreFile: { created: false, preserved: 1 },
+    });
+    expect(readFileSync(join(directory, '.gitignore'), 'utf8')).toContain('custom/\n');
+    expect(git(directory, ['ls-tree', '-r', '--name-only', 'HEAD']).split('\n')).toEqual(['.gitignore', 'a.ts']);
+  });
+
   test('promotes a non-git directory with an initial commit and ignores sensitive plus elanous work and test files', () => {
     const directory = createDirectory();
     writeFileSync(join(directory, 'app.ts'), 'export const app = true;\n');
@@ -295,12 +339,153 @@ describe('provisionRepository', () => {
 describe('runDevPipeline repository provision wiring', () => {
   const spec = (target: string): DevPipelineSpec => ({ input: { text: 'implement feature' }, target, humanReadableOutput: false });
 
+  test('interactive consent initializes and commits only non-ignored files', async () => {
+    const directory = mkdtempSync(join(homedir(), 'dev-repo-consent-'));
+    directories.push(directory);
+    writeFileSync(join(directory, '.env'), 'secret');
+    writeFileSync(join(directory, 'a.ts'), 'export {};');
+    const prompts: string[] = [];
+    await runDevPipeline(spec(directory), {
+      nonGitInteractive: true,
+      askNonGitInit: async (prompt) => { prompts.push(prompt); return 'y'; },
+      buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+      runSelfImplement: async () => ({ ok: true } as never),
+    });
+    expect(prompts).toHaveLength(1);
+    expect(readFileSync(join(directory, '.gitignore'), 'utf8')).toContain('.env*');
+    expect(git(directory, ['ls-tree', '-r', '--name-only', 'HEAD']).split('\n')).toEqual(['.gitignore', 'a.ts']);
+  });
+
+  test.each([
+    { answer: 'y\n', initialized: true },
+    { answer: 'n\n', initialized: false },
+  ])('real CLI asks on TTY stdin with piped JSON stdout ($answer)', ({ answer, initialized }) => {
+    const directory = mkdtempSync(join(homedir(), 'dev-repo-json-consent-'));
+    directories.push(directory);
+    writeFileSync(join(directory, '.env'), 'secret');
+    writeFileSync(join(directory, 'a.ts'), 'export {};');
+    // The CLI exits after the repository gate: an explicit remote-dependent completion needs a remote.
+    // This keeps the real entry point under test without launching an implementation child.
+    const ptyCli = `
+import json, os, pty, select, subprocess, sys, time, tty
+master, slave = pty.openpty()
+tty.setraw(slave)
+child = subprocess.Popen(['bun', 'bin/elanous.mjs', '--test', 'dev', 'implement feature', '--target', sys.argv[1], '--no-auto-merge', '--json'], stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=os.getcwd(), env={**os.environ, 'NODE_ENV': 'test'})
+os.close(slave)
+seen = b''
+try:
+    deadline = time.monotonic() + 30
+    while b'[y/N]' not in seen and child.poll() is None and time.monotonic() < deadline:
+        if select.select([child.stderr], [], [], 0.1)[0]:
+            seen += os.read(child.stderr.fileno(), 4096)
+    if b'[y/N]' in seen:
+        os.write(master, sys.argv[2].encode())
+    out, err = child.communicate(timeout=30)
+    print(json.dumps({'exitCode': child.returncode, 'stdout': out.decode(), 'stderr': (seen + err).decode()}))
+finally:
+    if child.poll() is None:
+        child.kill()
+        child.communicate()
+    os.close(master)
+`;
+    const child = spawnSync('python3', ['-c', ptyCli, directory, answer], { cwd: process.cwd(), encoding: 'utf8', timeout: 100_000 });
+    expect(child.status, `${child.stderr}\n${child.stdout}`).toBe(0);
+    const observed = JSON.parse(child.stdout) as { exitCode: number; stdout: string; stderr: string };
+    expect(observed.stderr).toContain(`${directory} 는 git 저장소가 아닙니다.`);
+    const output = JSON.parse(observed.stdout) as { error?: string };
+    expect(output.error).toContain(initialized ? 'target has no git remote' : 'git 저장소가 필요합니다');
+    expect(observed.exitCode).toBe(initialized ? 1 : 2);
+    expect(existsSync(join(directory, '.git'))).toBe(initialized);
+    if (initialized) {
+      expect(git(directory, ['ls-tree', '-r', '--name-only', 'HEAD']).split('\n')).toEqual(['.gitignore', 'a.ts']);
+    }
+  }, 120_000);
+
+  test('passes the revalidated non-git resolution to provision after consent', async () => {
+    const directory = mkdtempSync(join(homedir(), 'dev-repo-revalidated-'));
+    directories.push(directory);
+    let given: HarnessTargetResolution | undefined;
+    await runDevPipeline({ ...spec(directory), assumeYes: true }, {
+      provisionRepository: (target) => { given = target; return provisionRepository(target); },
+      buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+      runSelfImplement: async () => ({ ok: true } as never),
+    });
+    expect(given?.status).toBe('non-git-dir');
+    expect(given?.canonicalTarget).toBe(directory);
+    expect(existsSync(join(directory, '.git'))).toBe(true);
+  });
+
+  test('declined and non-interactive launches do not create .git or call provision', async () => {
+    for (const interactive of [true, false]) {
+      const directory = mkdtempSync(join(homedir(), 'dev-repo-refusal-'));
+      directories.push(directory);
+      let asked = 0;
+      let provisioned = false;
+      await expect(runDevPipeline(spec(directory), {
+        nonGitInteractive: interactive,
+        askNonGitInit: async () => { asked++; return 'n'; },
+        provisionRepository: () => { provisioned = true; throw new Error('must not provision'); },
+      })).rejects.toMatchObject({ exitCode: 2, message: expect.stringContaining('git 저장소가 필요합니다') });
+      expect(asked).toBe(interactive ? 1 : 0);
+      expect(provisioned).toBe(false);
+      expect(existsSync(join(directory, '.git'))).toBe(false);
+    }
+  });
+
+  test('an existing git target does not ask or change its HEAD', async () => {
+    const directory = mkdtempSync(join(homedir(), 'dev-repo-existing-'));
+    directories.push(directory);
+    git(directory, ['init']);
+    git(directory, ['config', 'user.email', 'test@example.invalid']);
+    git(directory, ['config', 'user.name', 'test']);
+    writeFileSync(join(directory, 'a.ts'), 'export {};');
+    git(directory, ['add', 'a.ts']);
+    git(directory, ['commit', '-m', 'existing']);
+    const before = git(directory, ['rev-parse', 'HEAD']);
+    await runDevPipeline(spec(directory), {
+      nonGitInteractive: true,
+      askNonGitInit: async () => { throw new Error('must not ask an existing repository'); },
+      buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+      runSelfImplement: async () => ({ ok: true } as never),
+    });
+    expect(git(directory, ['rev-parse', 'HEAD'])).toBe(before);
+  });
+
+  test('--yes flows through the CLI spec into a non-interactive target launch', async () => {
+    const directory = mkdtempSync(join(homedir(), 'dev-repo-yes-'));
+    directories.push(directory);
+    const cliSpec = buildDevCliSpec({ text: 'implement feature' }, { kind: 'self' }, { target: directory, yes: true });
+    expect(cliSpec.assumeYes).toBe(true);
+    await runDevPipeline({ ...cliSpec, humanReadableOutput: false }, {
+      nonGitInteractive: false,
+      askNonGitInit: async () => { throw new Error('must not ask'); },
+      buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+      runSelfImplement: async () => ({ ok: true } as never),
+    });
+    expect(existsSync(join(directory, '.git'))).toBe(true);
+  });
+
+  test('without --target, non-git working directory uses the same consent gate', async () => {
+    const directory = mkdtempSync(join(homedir(), 'dev-repo-cwd-'));
+    directories.push(directory);
+    await expect(runDevPipeline({ input: { text: 'implement feature' }, humanReadableOutput: false }, {
+      cwd: directory, nonGitInteractive: false,
+    })).rejects.toMatchObject({ exitCode: 2 });
+    expect(existsSync(join(directory, '.git'))).toBe(false);
+    await runDevPipeline({ input: { text: 'implement feature' }, humanReadableOutput: false, assumeYes: true }, {
+      cwd: directory,
+      buildSelfImplementSeams: () => ({} as SelfImplementSeams),
+      runSelfImplement: async () => ({ ok: true } as never),
+    });
+    expect(existsSync(join(directory, '.git'))).toBe(true);
+  });
+
   test('provisions before building seams and child execution while preserving the resolved target contract', async () => {
     const directory = mkdtempSync(join(homedir(), 'dev-repo-provision-'));
     directories.push(directory);
     const order: string[] = [];
     let seamTarget: string | undefined;
-    await runDevPipeline(spec(directory), {
+    await runDevPipeline({ ...spec(directory), assumeYes: true }, {
       provisionRepository: (target) => {
         order.push('provision');
         const result = provisionRepository(target);
@@ -324,7 +509,7 @@ describe('runDevPipeline repository provision wiring', () => {
     const directory = mkdtempSync(join(homedir(), 'dev-repo-provision-'));
     directories.push(directory);
     let downstream = false;
-    await expect(runDevPipeline(spec(directory), {
+    await expect(runDevPipeline({ ...spec(directory), assumeYes: true }, {
       provisionRepository: () => { throw new Error('provision failed'); },
       buildSelfImplementSeams: () => { downstream = true; return {} as SelfImplementSeams; },
       runSelfImplement: async () => { downstream = true; return { ok: true } as never; },
@@ -342,7 +527,7 @@ describe('runDevPipeline repository provision wiring', () => {
     console.log = ((line: unknown) => { output.push(String(line)); }) as typeof console.log;
     try {
       for (const directory of [promoted, existing]) {
-        await runDevPipeline({ ...spec(directory), humanReadableOutput: true }, {
+        await runDevPipeline({ ...spec(directory), humanReadableOutput: true, assumeYes: true }, {
           buildSelfImplementSeams: () => ({} as SelfImplementSeams),
           runSelfImplement: async () => ({ ok: true } as never),
         });
@@ -352,6 +537,7 @@ describe('runDevPipeline repository provision wiring', () => {
     }
     expect(output.filter((line) => line.startsWith('[repo-provision]'))).toEqual([
       `[repo-provision] promoted ${promoted}`,
+      `[repo-provision] .gitignore created ${promoted}`,
       `[repo-provision] already-git ${existing}`,
     ]);
   });

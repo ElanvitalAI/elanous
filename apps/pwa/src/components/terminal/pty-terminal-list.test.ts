@@ -581,8 +581,9 @@ describe('ptyProgressByTerminal — the markers the daemon actually emits', () =
 describe('initialTerminalSelection — 첫 화면은 실재 PTY 를 먼저 본다', () => {
   const rows = [
     { id: 'agent:dead1', alive: false },
-    { id: 'self_5837456a', alive: true },
-    { id: 'pty_2696c00d', alive: true },
+    { id: 'term-dead', alive: false, cmd: 'web-terminal' },
+    { id: 'self_5837456a', alive: true, cmd: 'bash' },
+    { id: 'term-mukshd4l', alive: true, cmd: 'web-terminal' },
   ];
 
   test('사람이 마지막에 고른 것을 «도구가 뒤엎지 않는다»', () => {
@@ -592,7 +593,16 @@ describe('initialTerminalSelection — 첫 화면은 실재 PTY 를 먼저 본�
 
   test('저장된 선택이 없으면 «살아 있는» 실재 PTY 를 고르고 이유를 말한다', () => {
     expect(initialTerminalSelection({ storedId: null, fallbackId: 'preview-1', terminals: rows }))
-      .toEqual({ terminalId: 'self_5837456a', reason: 'live-pty' });
+      .toEqual({ terminalId: 'term-mukshd4l', reason: 'live-pty' });
+  });
+
+  // 대표 2026-09-28 — 에이전트 PTY 를 터미널 탭으로 고르면 같은 id 의 «그림자 셸»이 생긴다.
+  test('살아 있는 에이전트 PTY 만 있으면 고르지 않는다 — 터미널 탭은 웹 셸에만 붙는다', () => {
+    expect(initialTerminalSelection({
+      storedId: null,
+      fallbackId: 'preview-1',
+      terminals: [{ id: 'codex_801fe2e2', alive: true, cmd: 'bash' }, { id: 'pty_2696c00d', alive: true }],
+    })).toEqual({ terminalId: 'preview-1', reason: 'fallback' });
   });
 
   test('죽은 것만 있으면 폴백으로 떨어진다 — 죽은 PTY 를 고르지 않는다', () => {
@@ -625,7 +635,7 @@ describe('initialTerminalSelection — 첫 화면은 실재 PTY 를 먼저 본�
   test('실재 목록의 고정 이름은 폴백 없이도 선택한다', () => {
     expect(initialTerminalSelection({
       storedId: null,
-      terminals: [{ id: 'preview-1', alive: true }],
+      terminals: [{ id: 'preview-1', alive: true, cmd: 'web-terminal' }],
     })).toEqual({ terminalId: 'preview-1', reason: 'live-pty' });
   });
 

@@ -32,7 +32,7 @@ import type {
   ValidationError,
 } from '../ui/declarative/index.js';
 import { registerToolRuntime } from './registry.js';
-import { RUN_SCENARIO_MOUNT_TARGET_KINDS } from './scenario-target-mount.js';
+import { RUN_SCENARIO_MOUNT_TARGET_KINDS, unsupportedRunScenarioTargetError } from './scenario-target-mount.js';
 import type { ToolRuntime } from './types.js';
 
 // ── deps ────────────────────────────────────────────────────────────
@@ -167,19 +167,19 @@ function parseSurfaceAddress(raw: unknown): SurfaceAddress | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const obj = raw as Record<string, unknown>;
   switch (obj.kind) {
+    case 'window':
+      return typeof obj.windowId === 'number' && Number.isInteger(obj.windowId) && obj.windowId > 0
+        ? { kind: 'window', windowId: obj.windowId } : undefined;
     case 'pane': {
-      const ref = obj.ref;
-      if (!ref || typeof ref !== 'object') return undefined;
-      const r = ref as Record<string, unknown>;
-      if (typeof r.windowId !== 'string' || typeof r.paneId !== 'string') return undefined;
-      return {
-        kind: 'pane',
-        ref: {
-          windowId: r.windowId,
-          paneId: r.paneId,
-          ...(typeof r.runnerLabel === 'string' ? { runnerLabel: r.runnerLabel } : {}),
-        },
-      };
+      if (!obj.ref || typeof obj.ref !== 'object' || Array.isArray(obj.ref)) return undefined;
+      const ref = obj.ref as Record<string, unknown>;
+      return typeof ref.windowId === 'string' && typeof ref.paneId === 'string'
+        && (ref.runnerLabel === undefined || typeof ref.runnerLabel === 'string')
+        ? { kind: 'pane', ref: {
+          windowId: ref.windowId,
+          paneId: ref.paneId,
+          ...(ref.runnerLabel !== undefined ? { runnerLabel: ref.runnerLabel as string } : {}),
+        } } : undefined;
     }
     case 'modal':
       return typeof obj.modalId === 'string' ? { kind: 'modal', modalId: obj.modalId } : undefined;
@@ -191,13 +191,6 @@ function parseSurfaceAddress(raw: unknown): SurfaceAddress | undefined {
       return typeof obj.inlineId === 'string' ? { kind: 'inline', inlineId: obj.inlineId } : undefined;
     case 'bg':
       return typeof obj.bgId === 'string' ? { kind: 'bg', bgId: obj.bgId } : undefined;
-    case 'window': {
-      const rawWindowId = obj.windowId;
-      const n = typeof rawWindowId === 'number' ? rawWindowId
-        : typeof rawWindowId === 'string' ? Number(rawWindowId) : NaN;
-      if (!Number.isInteger(n) || n <= 0) return undefined;
-      return { kind: 'window', windowId: n };
-    }
     case 'input':
       return typeof obj.inputId === 'string' ? { kind: 'input', inputId: obj.inputId } : undefined;
     default:
@@ -227,7 +220,7 @@ export function createRunScenarioRuntime(
             description:
               'Optional SurfaceAddress mount target. Supported mount destinations are '
               + `${RUN_SCENARIO_MOUNT_TARGET_KINDS.join(', ')}. `
-              + 'Non-mount surface kinds such as input/popover/inline/bg return explicit unsupported-target errors.',
+              + 'Window/pane targets are not supported. Non-mount surface kinds such as input/popover/inline/bg return explicit unsupported-target errors.',
           },
         },
         required: ['id'],
@@ -258,6 +251,14 @@ export function createRunScenarioRuntime(
         return stringifyOutput({
           ok: false,
           error: 'RunScenario: malformed `target` SurfaceAddress',
+        });
+      }
+      if (target?.kind === 'window' || target?.kind === 'pane') {
+        return stringifyOutput({
+          ok: false,
+          mounted: false,
+          target,
+          error: unsupportedRunScenarioTargetError(target),
         });
       }
       const decode = materializeScenario(def, { lax });

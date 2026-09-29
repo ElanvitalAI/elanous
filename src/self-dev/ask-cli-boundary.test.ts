@@ -21,7 +21,7 @@ const REPO = resolve(import.meta.dir, '..', '..');
 const BIN = resolve(REPO, 'bin', 'elanous.mjs');
 
 function runDev(args: readonly string[]): { code: number | null; stderr: string } {
-  const r = spawnSync('bun', [BIN, 'dev', ...args], {
+  const r = spawnSync('bun', [BIN, '--test', 'dev', ...args], {
     cwd: REPO,
     encoding: 'utf8',
     timeout: 60_000,
@@ -31,10 +31,23 @@ function runDev(args: readonly string[]): { code: number | null; stderr: string 
 }
 
 describe('dev --ask — 실물 진입점(spawn)에서 인자 계약이 서는가', () => {
+  test('[substrate-selection] dev --ask exposes the substrate options and rejects an unsupported Pod target before authoring', () => {
+    const help = spawnSync('bun', [BIN, '--test', 'dev', '--help-all'], { cwd: REPO, encoding: 'utf8', timeout: 60_000 });
+    expect(help.stdout).toContain('--substrate <kind>');
+    expect(help.stdout).toContain('--pod-pool <spec>');
+    const local = runDev(['--ask', '/tmp/elanous-ask-does-not-exist.txt', '--substrate', 'local']);
+    expect(local.stderr).toContain('ENOENT');
+    const invalid = runDev(['--ask', '/tmp/elanous-ask-does-not-exist.txt', '--substrate', 'invalid']);
+    expect(invalid.stderr).toContain('Allowed choices are local, pod');
+    const target = runDev(['--ask', '/tmp/elanous-ask-does-not-exist.txt', '--substrate', 'pod', '--pod-pool', 'pool-test:1', '--target', '/tmp/target']);
+    expect(target.stderr).toContain('`--target` 은 Pod 경로에서 아직 지원하지 않는다');
+    expect(target.stderr).not.toContain('ENOENT');
+  });
+
   test('[option-exists] `--ask` 가 도움말에 실제로 노출된다', () => {
-    const r = spawnSync('bun', [BIN, 'dev', '--help'], { cwd: REPO, encoding: 'utf8', timeout: 60_000 });
+    const r = spawnSync('bun', [BIN, '--test', 'dev', '--help'], { cwd: REPO, encoding: 'utf8', timeout: 60_000 });
     expect(r.stdout).toContain('--ask <path>');
-    const all = spawnSync('bun', [BIN, 'dev', '--help-all'], { cwd: REPO, encoding: 'utf8', timeout: 60_000 });
+    const all = spawnSync('bun', [BIN, '--test', 'dev', '--help-all'], { cwd: REPO, encoding: 'utf8', timeout: 60_000 });
     expect(all.stdout).toContain('--force-preflight');
     // ⛔ 2026-09-02: `--live-run-window` 는 «은퇴»했다(대표 지시 · #15264). 도움말에 «없는 것»이 맞다.
     //   이 단언이 지키던 것은 「그 축이 실물 진입점에 닿는가」이고, 그 자리는 이제 «은퇴 안내»다.

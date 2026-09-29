@@ -1,6 +1,6 @@
 {
   "name": "elanous",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Self-healing coding harness where eyes, hands, and memory all turn on one sentence — it authors its own goals, implements them in isolated worktrees, and reviews its own work.",
   "license": "Apache-2.0",
   "repository": {
@@ -36,6 +36,7 @@
     ".rules/",
     "docs/goal-context/",
     "docs/design/craft/",
+    "docs/design/systems/",
     "docs/mission-requests/",
     "docs/ad-presets/",
     "!**/*.test.ts",
@@ -81,7 +82,9 @@
     "test:cdp": "bun run scripts/test-cdp.ts"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "0.14.1",
+    "@a2a-js/sdk": "^0.3.0",
+    "@agentclientprotocol/claude-agent-acp": "0.81.2",
+    "@agentclientprotocol/sdk": "1.5.0",
     "@antv/infographic": "^0.2.20",
     "@aws-sdk/client-secrets-manager": "^3.1043.0",
     "@discordjs/voice": "^0.19.2",
@@ -89,7 +92,6 @@
     "@google/gemini-cli": "0.38.0",
     "@google/genai": "^1.51.0",
     "@xterm/headless": "^6.0.0",
-    "@zed-industries/claude-code-acp": "0.16.2",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",
     "diff": "^9.0.0",

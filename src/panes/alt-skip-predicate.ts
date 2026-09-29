@@ -5,7 +5,7 @@
 // the PaneVisualStateStore (Bundle A · A3).
 //
 // Compose (don't replace) with the existing
-// `!w.hasInteractableFocus()` default in dashboard-virtual-windows.ts:
+// `!w.hasInteractableFocus()` dashboard default:
 // a window is skipped if EITHER predicate says so. Explicit selection
 // (`^B <digit>`, Alt+<digit>, picker, switchTo(id)) bypasses both.
 //
@@ -15,12 +15,13 @@
 // cycle so the user can still reach a usable pane inside.
 
 import { isAltSkipEligible, type PaneVisualStateStore } from './visual-state.js';
-import type { VirtualWindow } from '../virtual-windows/virtual-window.js';
 import { debug } from '../debug/log.js';
+
+type WindowWithPanes = { readonly id: number; listPanes(): Array<{ id: string }> };
 
 export function skipWindowWhenStorePredicate(
   store: PaneVisualStateStore,
-): (w: VirtualWindow) => boolean {
+): (w: WindowWithPanes) => boolean {
   return (window) => {
     const panes = window.listPanes();
     if (panes.length === 0) return false;

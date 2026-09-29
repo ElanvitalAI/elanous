@@ -76,7 +76,7 @@ describe('회전 판정 — 결정 넷', () => {
     const rotation = decideCodexRotation({ ...base, resetCreditAvailability: 'unknown', candidates: [cand('team', undefined)] });
     expect(rotation.reason).toBe('reset-credit-unknown');
     const fallback = decideFallback({
-      rotation: { reason: rotation.reason, to: rotation.to! },
+      rotation: { reason: rotation.reason as 'reset-credit-unknown', to: rotation.to! },
       chain: ['codex-rotate'],
       grokAvailable: false,
     });
@@ -177,6 +177,17 @@ describe('회전 판정 — 결정 넷', () => {
   test('⛔ 후보도 «찼으면» 그리로 안 넘긴다', () => {
     const d = decideCodexRotation({ ...base, candidates: [cand('team', true)] });
     expect(d.reason).toBe('no-candidate');
+  });
+
+  test('💳 크레딧 허가(09-28)면 갈 곳이 없어도 «no-candidate» 가 아니라 머문다(credits-allowed) · 잔량 계정이 있으면 그쪽이 먼저', () => {
+    const stay = decideCodexRotation({ ...base, creditsAllowed: true, candidates: [cand('team', true)] });
+    expect(stay.reason).toBe('credits-allowed');
+    expect(stay.to).toBeUndefined();
+    const rotated = decideCodexRotation({ ...base, creditsAllowed: true, candidates: [cand('team', true), cand('third', undefined)] });
+    expect(rotated.reason).toBe('rotated');
+    expect(rotated.to?.name).toBe('third');
+    const off = decideCodexRotation({ ...base, creditsAllowed: false, candidates: [cand('team', true)] });
+    expect(off.reason).toBe('no-candidate');
   });
 
   test('⭐ 96%는 기본 95% 임계를 넘어 team으로 미리 회전한다', () => {

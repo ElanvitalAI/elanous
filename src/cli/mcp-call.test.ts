@@ -7,6 +7,7 @@ import { program } from '../index.js';
 import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { RemotesStore, type RemoteEntry } from './remotes.js';
 import { runMcpCall, runMcpList } from './mcp-call.js';
+import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const BIN = resolve(REPO_ROOT, 'bin/elanous.mjs');
@@ -667,4 +668,41 @@ describe('bin/elanous.mjs mcp call', () => {
     expect(typeof sent.name).toBe('string');
     expect(`${stdout}${stderr}`).toContain('"limit": 5');
   }, SPAWN_TIMEOUT_MS);
+
+  test('with no localUrl the call goes to the injected daemon, not a guessed port', async () => {
+    const { requests, url } = startMock(() => jsonRpc({ structuredContent: { ok: true } }));
+    const base = url.replace(/\/v1\/mcp$/, '');
+    setResolveDaemonEndpointForTest(() => ({
+      baseUrl: base, healthUrl: `${base}/v1/health`, pwaUrl: `${base}/app/`, source: 'registry',
+    }));
+    try {
+      const io = sink();
+      const result = await runMcpCall({ tool: 'demo.tool', out: io.out });
+      expect(result.exitCode).toBe(0);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]!.url.startsWith(base)).toBe(true);
+      expect(requests[0]!.url).not.toContain('31415');
+    } finally {
+      setResolveDaemonEndpointForTest(null);
+    }
+  });
+
+  test('a null daemon endpoint is an error and never calls a guessed port', async () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const fetched: string[] = [];
+    try {
+      const io = sink();
+      const result = await runMcpCall({
+        tool: 'demo.tool',
+        out: io.out,
+        fetchFn: async (input) => { fetched.push(String(input)); return jsonRpc({}); },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(result.classification).toBe('mcp-remote-error');
+      expect(fetched).toEqual([]);
+      expect(io.errors.join(' ')).not.toContain('31415');
+    } finally {
+      setResolveDaemonEndpointForTest(null);
+    }
+  });
 });

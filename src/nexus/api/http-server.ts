@@ -18,6 +18,8 @@
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
 import type { NexusState } from '../state/state.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
+export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 import type { TabRegistry } from '../state/tab-registry.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
 import type { Supervisor } from '../supervisor/index.js';
@@ -147,7 +149,7 @@ import {
   parseVaultPath,
 } from './vault-api.js';
 import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
-import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
+import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
 import { dispatchPersonaRoute } from './personas.js';
 import { handleRoleJudge } from './role-judge.js';
 import { handleAudioStt } from './audio-stt.js';
@@ -180,7 +182,9 @@ import {
 } from './registry-discovery.js';
 import { handleWorktrees, handleWorktreeDispose } from './worktrees.js';
 import { handleBotCommands } from './bot-commands.js';
-import { handleDesignCheck } from './design-check.js';
+import { handleDesignCheck, handleDesignDirectionPost } from './design-check.js';
+import { handleDesignPreviews } from './design-previews-route.js';
+import { handleDesignSystemCreate } from './design-system-create-route.js';
 import { handleHitlAuditRecent, handleHitlTestPushcut } from './hitl-pushcut-settings.js';
 import { handleWorkflowRoute } from './workflow-router.js';
 import { handleSkillRoute } from './skill-router.js';
@@ -189,10 +193,13 @@ import { handleTemplatesList, handleTemplateGet, handleTemplateSave } from './te
 import { handleMcpHttpPost } from './mcp-http.js';
 import { handleMcpResourceGet, MCP_RESOURCE_ROUTE_PATH } from './mcp-resource-route.js';
 // ⛔ 라우트 상수를 «디스패처»가 안 쓰고 문자열로 베끼고 있었다(16차 실측) — 잎에서 읽는다.
-import { APPROVALS_MERGES_PATH, IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
+import { APPROVALS_MERGES_PATH, DESIGN_DIRECTION_PATH, DESIGN_PREVIEW_PATH_PREFIX, DESIGN_PREVIEWS_PATH, DESIGN_SYSTEM_PATH, IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
 import { handleMergeApprovals } from './merge-approvals.js';
+import { handleLiveDetail, LIVE_DETAIL_PATH } from './live-detail.js';
+import { handleLiveShipped, LIVE_SHIPPED_PATH } from './live-shipped.js';
 import { handleMcpWidgetCall, MCP_WIDGET_CALL_ROUTE_PATH, persistWidgetTurnToSessionStore } from './mcp-widget-call-route.js';
 import type { McpClientsHandle } from '../boot/register-mcp-clients.js';
+import { mcpUnauthorizedResponse, oauthRegistrationRejected } from './mcp-oauth-hint.js';
 import { handleTabLogs } from './logs.js';
 import {
   handleConfigGet,
@@ -254,10 +261,12 @@ import { handleIntakeRoutePost } from './intake-route.js';
 import { corsPreflight, jsonResponse } from './json-response.js';
 import { isPublicRoute } from './public-routes.js';
 import { handleSchedulesActionPost } from './schedules-action.js';
+import { handleSchedulesList, handleScheduleDetail, handleScheduleRuns } from './schedules-read.js';
 import { handleIntakeRunsList } from './intake-runs.js';
 import { handleMissionsList, handleMissionDetail } from './missions.js';
 import { handleSessionsStoreList, handleSessionsStoreGet, handleSessionsStoreFork, handleSessionsStoreDelete } from './sessions-store.js';
 import { handleLogsQuery, handleLogsStream, handleLogsLevelGet, handleLogsLevelPost, handleLogsFacets, handleLogsHistogram, handleLogsInstances } from './log-fabric.js';
+import { handleTrace, handleTraceEvidence } from './trace.js';
 import { handleDispatchRunsList } from './dispatch-runs.js';
 import {
   handleWorkflowLifecycleGet,
@@ -302,6 +311,7 @@ import {
   handleTasksList,
   handleTaskDetail,
 } from './tasks-scheduler.js';
+import { handleTaskCardsGet } from './task-cards-api.js';
 import { handleTaskCreatePost, handleTaskApprovePost } from './tasks-create.js';
 import { matchIngestAuthorization } from './ingest-token.js';
 import {
@@ -320,6 +330,9 @@ import {
 } from './workflows.js';
 import { handleTriggersSnapshot } from './triggers.js';
 import { handleWorkflowTemplatesList } from './workflow-templates.js';
+import { handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
+import { handleGraphKindsGet, handleGraphsValidatePost } from './graph-kinds.js';
+import { handlePluginsIndexGet, handlePluginsGet } from './plugins-market.js';
 import {
   handleWorkflowsList,
 } from './workflows.js';
@@ -344,7 +357,7 @@ import {
   parseTerminalRenamePath,
   parseTerminalsPrunePath,
   parseTerminalTerminatePath,
-  parseScrollbackPath,
+  parseScrollbackPath, parseTerminalStreamPath, handleTerminalStream,
   parseFramePath,
   parsePngPath,
 } from './terminals.js';
@@ -371,7 +384,6 @@ import {
   parseShowroomLayoutPath,
 } from './showroom-layouts.js';
 
-export const DEFAULT_NEXUS_HTTP_PORT = 31415;
 export const NEXUS_HTTP_PORT_RANGE = 16;     // try 31415..31430
 /** Short timeout for the pre-bind localhost occupancy probe. */
 export const NEXUS_PORT_PROBE_TIMEOUT_MS = 400;
@@ -762,7 +774,7 @@ function isPortBusy(err: unknown): boolean {
   return /EADDRINUSE|address already in use/i.test(msg);
 }
 
-async function routeRequest(
+export async function routeRequest(
   req: Request,
   opts: NexusHttpServerOpts,
   server: BunServerLike,
@@ -821,10 +833,17 @@ async function routeRequest(
         : undefined;
       if (name === undefined) {
         debug.log('nexus.auth', 'default-deny', { method, pathname });
+        // MCP 클라이언트(Claude Code)에게는 «할 일»을 말한다 — 안 그러면 OAuth 로 가서 /register 405 를 만난다.
+        if (pathname === '/v1/mcp') return mcpUnauthorizedResponse();
         return jsonResponse({ error: 'unauthorized' }, 401);
       }
       debug.log('nexus.auth', 'ingest-token', { name, pathname });
     }
+  }
+  // OAuth 동적 클라이언트 등록(RFC 7591) — Elanous 는 OAuth 를 쓰지 않는다. 405 대신 «이렇게 등록하라»를 돌려준다.
+  if (method === 'POST' && pathname === '/register') {
+    debug.log('nexus.auth', 'oauth-register-rejected', { pathname });
+    return oauthRegistrationRejected();
   }
 
   // FU2 (2026-05-12) — root-level browser conveniences. The PWA serves
@@ -869,6 +888,15 @@ async function routeRequest(
       const { handleDistIpa } = await import('./dist.js');
       return handleDistIpa(req, filename);
     }
+  }
+
+  if (pathname === LIVE_SHIPPED_PATH) {
+    return handleLiveShipped(req, { authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi) });
+  }
+  if (pathname === LIVE_DETAIL_PATH) {
+    return handleLiveDetail(req, {
+      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+    });
   }
 
   if (pathname === APPROVALS_MERGES_PATH || pathname.startsWith(`${APPROVALS_MERGES_PATH}/`)) {
@@ -1116,16 +1144,57 @@ async function routeRequest(
     return handleHarnessAskStatusGet(req, opts.metaApi);
   }
 
+  if (pathname === '/v1/harness/run-screen' && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleHarnessRunScreenGet(req, opts.metaApi);
+  }
+
   if (pathname === '/v1/harness/run-events' && method === 'GET') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
     if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleHarnessRunEventsGet(req, opts.metaApi);
   }
 
+  // Design direction is a write: check owner auth before the handler reads the body.
+  // Keep this POST ahead of the mutation fallback, and never make it a public route.
+  if (method === 'POST' && pathname === DESIGN_DIRECTION_PATH) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleDesignDirectionPost(req);
+  }
+  // Custom system create is a write that launches an extract. Auth before the body.
+  // The default-deny gate above already refuses anonymous /v1 writes; this check
+  // stays so a future gate change cannot reach the extractor without an owner.
+  if (method === 'POST' && pathname === DESIGN_SYSTEM_PATH) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    // Same-origin exemption is enough for a direction pick. An extract writes a
+    // library and launches Chrome, so it also requires the owner bearer.
+    const owner = opts.metaApi.bearerToken;
+    const offered = (req.headers.get('authorization') ?? '').startsWith('Bearer ')
+      ? (req.headers.get('authorization') ?? '').slice('Bearer '.length).trim()
+      : '';
+    if (!owner || offered.length !== owner.length) return jsonResponse({ error: 'unauthorized' }, 401);
+    let bearerDiff = 0;
+    for (let i = 0; i < offered.length; i += 1) bearerDiff |= offered.charCodeAt(i) ^ owner.charCodeAt(i);
+    if (bearerDiff !== 0) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleDesignSystemCreate(req);
+  }
+
+  if (method === 'POST' && pathname === '/v1/graphs/validate') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleGraphsValidatePost(req, opts.metaApi);
+  }
+
   // Mutation routes (PR ι) — POST/PATCH/DELETE on /v1/nexus/tabs[/:id[/action]].
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
   if (method !== 'GET') {
+    if ((method === 'PUT' || method === 'POST') && pathname.startsWith('/v1/graphs/')) {
+      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+      if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      const mutated = await handleGraphsMutation(pathname, req);
+      if (mutated) return mutated;
+    }
     if (method === 'POST' && pathname === '/v1/tasks') {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
       return handleTaskCreatePost(req, opts.metaApi);
@@ -1234,7 +1303,8 @@ async function routeRequest(
     }
     // B 트랙 closure piece (RFC #2474) — MCP Streamable HTTP transport.
     // External MCP clients (Claude Code · Cursor · Codex) register elanous
-    // via `claude mcp add --transport http elanous http://localhost:31415/v1/mcp`
+    // via `claude mcp add --transport http elanous http://localhost:31415/v1/mcp --header "Authorization: Bearer <acp-token>"`
+    // (토큰 없이 붙이면 401 → Claude Code 가 OAuth 를 시도한다 — mcp-oauth-hint.ts)
     // and reach the NEXUS daemon's ToolRuntime registry directly — no
     // child process spawn (cf. `elanous mcp serve` stdio · #2485), every
     // call flows through the PFC capture seam. Placed inside the
@@ -2043,6 +2113,13 @@ async function routeRequest(
     }
   }
   {
+    const streamId = parseTerminalStreamPath(pathname);
+    if (streamId !== null) {
+      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+      return handleTerminalStream(req, opts.metaApi, streamId);
+    }
+  }
+  {
     const scrollbackId = parseScrollbackPath(pathname);
     if (scrollbackId !== null) {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
@@ -2097,6 +2174,15 @@ async function routeRequest(
   if (pathname === '/v1/logs' && method === 'GET') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
     return handleLogsQuery(req, opts.metaApi);
+  }
+  // Trace (v6 T1 · 2026-09-28) — 판단 사슬 L0–L3 ⊕ 증거 한 줄. 읽기만 한다.
+  if (pathname === '/v1/trace' && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    return handleTrace(req, opts.metaApi);
+  }
+  if (pathname.startsWith('/v1/trace/evidence/') && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
+    return handleTraceEvidence(req, opts.metaApi, pathname.slice('/v1/trace/evidence/'.length));
   }
   if (pathname === '/v1/logs/stream' && method === 'GET') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
@@ -2306,6 +2392,28 @@ async function routeRequest(
   // 접근. 둘 다 process-singleton store (TaskStore · getSchedulerStore)
   // 라 zero-migration. metaApi 미wired 환경에서는 503 — daemon-public
   // grace-window 가 닫힌 후에도 PWA 가 stable error 만 보도록.
+  if (pathname === '/v1/schedules' && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleSchedulesList(req, opts.metaApi);
+  }
+  const scheduleRunsMatch = /^\/v1\/schedules\/([^/]+)\/runs$/.exec(pathname);
+  if (scheduleRunsMatch && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+    let id: string;
+    try { id = decodeURIComponent(scheduleRunsMatch[1]!); }
+    catch { return jsonResponse({ error: 'bad_request' }, 400); }
+    return handleScheduleRuns(req, id, opts.metaApi);
+  }
+  if (pathname.startsWith('/v1/schedules/') && method === 'GET') {
+    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+    let id: string;
+    try { id = decodeURIComponent(pathname.slice('/v1/schedules/'.length)); }
+    catch { return jsonResponse({ error: 'bad_request' }, 400); }
+    return handleScheduleDetail(req, id, opts.metaApi);
+  }
+  if (pathname === '/v1/task-cards' || /^\/v1\/task-cards\/[^/]+$/.test(pathname)) {
+    return handleTaskCardsGet(pathname);
+  }
   if (pathname === '/v1/tasks') {
     if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
     return handleTasksList(req, opts.metaApi);
@@ -2323,6 +2431,18 @@ async function routeRequest(
   // surface (`/v1/workflows` · `~/.elanous/workflows-runs/`) covers the same
   // user need.
 
+  if (method === 'GET' && (pathname === '/v1/plugins/index' || pathname === '/v1/plugins')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return pathname === '/v1/plugins/index' ? handlePluginsIndexGet(req, opts.metaApi) : handlePluginsGet(req, opts.metaApi);
+  }
+  if (method === 'GET' && pathname === '/v1/graph/kinds') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleGraphKindsGet(req, opts.metaApi);
+  }
+  // F-M1 read + P-F1 raw YAML. Writes live in the mutation block and never touch core graphs/.
+  if (method === 'GET' && (pathname === '/v1/graphs' || /^\/v1\/graphs\/[^/]+$/.test(pathname) || /^\/v1\/graphs\/[^/]+\/yaml$/.test(pathname))) {
+    return handleGraphsGet(pathname);
+  }
   // Archon-port T2.3 (2026-05-08) — workflow GET surface.
   // (POST /validate · POST /:name/run · PUT/DELETE /:name landed
   // inside the mutation block above.)
@@ -2508,6 +2628,10 @@ async function routeRequest(
   // B4 — the `elanous repo design-check` verdict over the wire, so the PWA
   // renders the SAME resolution the CLI prints instead of re-deriving it.
   if (pathname === '/v1/design-check') return handleDesignCheck();
+  // RFC design loop §A2 — HTML previews under the same repository as design-check.
+  if (pathname === DESIGN_PREVIEWS_PATH || pathname.startsWith(DESIGN_PREVIEW_PATH_PREFIX)) {
+    return handleDesignPreviews(pathname);
+  }
   // RFC #2161 Phase 3 — Layer A static catalog snapshot. Read-only ·
   // refreshed on demand by the PWA Showroom dropdown + future
   // LlmCatalogCard. Phase 5 adds /v1/registry/resolved for live

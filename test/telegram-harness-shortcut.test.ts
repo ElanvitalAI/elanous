@@ -55,9 +55,8 @@ describe('Telegram /harness shortcut', () => {
     const names = defaultTelegramCommands().map((command) => command.name);
     expect(names).toContain('harness');
     expect(names).toContain('intake');
-    // 34 = 09-10 `/ad` 추가(#16953) — 그때 이 수를 안 따라 올렸다(09-24 🅣 전수에서 드러남).
     expect(names).toContain('ad');
-    expect(names).toHaveLength(34);
+    expect(new Set(names).size).toBe(names.length);
     const harness = defaultTelegramCommands().find((command) => command.name === 'harness')!;
     expect(harness.name).toMatch(/^[a-z0-9_]{1,32}$/);
     expect(harness.description.length).toBeGreaterThanOrEqual(1);

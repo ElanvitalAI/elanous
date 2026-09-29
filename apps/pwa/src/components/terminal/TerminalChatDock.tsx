@@ -469,7 +469,7 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
   if (!open) return null;
 
   return (
-    <div className="shrink-0 border-t border-border bg-background/95">
+    <div className="shrink-0 border-t border-border bg-background/95" data-terminal-chat-dock>
       <div className="flex items-center gap-2 border-b border-border/80 px-3 py-2">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <span className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-primary/30 bg-primary/10 text-primary">

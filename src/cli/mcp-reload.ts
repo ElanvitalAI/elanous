@@ -14,8 +14,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 
-const DEFAULT_NEXUS_BASE = 'http://127.0.0.1:31415';
 const ADMIN_MCP_RELOAD_PATH = '/v1/nexus/admin/mcp-reload';
 
 interface ServerRow {
@@ -23,6 +23,8 @@ interface ServerRow {
   toolCount?: unknown;
   /** `McpServerBootResult.reason` 과 같은 이름 — 실패 사유. */
   reason?: unknown;
+  /** `McpServerBootResult.reasonClass` — 실패 분류. */
+  reasonClass?: unknown;
 }
 
 /** Fail-soft read of the loopback ACP token the rest of the CLI already uses. */
@@ -61,7 +63,11 @@ export async function runMcpReload(opts: McpReloadCliOpts = {}): Promise<McpRelo
     log: (s: string) => process.stdout.write(`${s}\n`),
     error: (s: string) => process.stderr.write(`${s}\n`),
   };
-  const base = opts.nexusBaseUrl ?? DEFAULT_NEXUS_BASE;
+  const base = opts.nexusBaseUrl ?? resolveDaemonEndpoint()?.baseUrl;
+  if (base === undefined) {
+    rawOut.error('✗ 데몬 주소를 모른다 — `elanous nexus show`');
+    return { exitCode: 1 };
+  }
   const fetchFn = opts.fetchFn ?? fetch;
   const url = `${base}${ADMIN_MCP_RELOAD_PATH}`;
   const token = readAcpToken();
@@ -126,7 +132,18 @@ export async function runMcpReload(opts: McpReloadCliOpts = {}): Promise<McpRelo
   const registered = typeof rec.registered === 'number' ? rec.registered : 0;
   const perServer = (rec.perServer ?? {}) as Record<string, ServerRow>;
   const ids = Object.keys(perServer).sort();
-  out.log(`✓ MCP 재장전 완료 — 서버 ${ids.length}개 · 도구 ${registered}개 등록`);
+  const failedIds = ids.filter((id) => String(perServer[id]?.status ?? '') === 'failed');
+  if (failedIds.length > 0) {
+    const named = failedIds
+      .map((id) => {
+        const cls = perServer[id]?.reasonClass;
+        return typeof cls === 'string' && cls.length > 0 ? `${id}(${cls})` : id;
+      })
+      .join(' · ');
+    out.log(`⚠ 끊긴 서버 ${failedIds.length}개 — ${named}`);
+  } else {
+    out.log(`✓ MCP 재장전 완료 — 서버 ${ids.length}개 · 도구 ${registered}개 등록`);
+  }
   let failed = 0;
   for (const id of ids) {
     const row = perServer[id] ?? {};

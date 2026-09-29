@@ -1,0 +1,9 @@
+# Daemon port literal baseline: non-comment lines in non-test src/**/*.ts, per file.
+# New files and increases fail. Migrate callers to the daemon endpoint resolver, then --update.
+# total=13 files=6
+1	src/autopilot/proposal/draft-plan.ts
+6	src/index.ts
+1	src/nexus/api/mcp-oauth-hint.ts
+1	src/nexus/default-port.ts
+2	src/task-orchestrator/surfaces/pod-command-job.ts
+2	src/task-orchestrator/surfaces/self-implement-pod.ts

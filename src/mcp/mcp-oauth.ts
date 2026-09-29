@@ -79,6 +79,8 @@ export interface AuthorizationServerMetadata {
 export interface ClientRegistration {
   clientId: string;
   clientSecret?: string;
+  /** 동적 등록 때 쓴 redirect_uri. 옛 등록에는 없다. */
+  redirectUri?: string;
 }
 
 export interface AuthorizationRequest {
@@ -131,6 +133,8 @@ export interface McpOAuthAuthorization {
 export interface PrepareMcpOAuthAuthorizationOpts extends McpOAuthRuntimeOpts {
   resourceMetadataUrl: string;
   scope?: string;
+  /** 저장된 등록의 포트를 못 열었을 때 새 client_id 로 다시 등록한다. */
+  forceReregister?: boolean;
 }
 
 /** ⛔⭐⭐ MCP 자격은 «우주를 따라가지 않는다» — 격리 매뉴얼 §6 의 전역 사용자 자산이다.
@@ -172,6 +176,7 @@ function loadIssuerState(
       authMode: AUTH_MODE,
       ...(stranded.accountUuid ? { accountUuid: stranded.accountUuid } : {}),
       ...(stranded.organizationUuid ? { organizationUuid: stranded.organizationUuid } : {}),
+      ...(stranded.redirectUri ? { redirectUri: stranded.redirectUri } : {}),
       mirrorCodex: false,
     },
     path,
@@ -402,9 +407,11 @@ function registrationFromState(state: ProviderAuthState | null): ClientRegistrat
   const clientId = state?.accountUuid?.trim();
   if (!state || !clientId) return null;
   const clientSecret = state.organizationUuid?.trim();
+  const redirectUri = state.redirectUri?.trim();
   return {
     clientId,
     ...(clientSecret ? { clientSecret } : {}),
+    ...(redirectUri ? { redirectUri } : {}),
   };
 }
 
@@ -426,10 +433,30 @@ function persistRegistration(
         : existing?.organizationUuid
           ? { organizationUuid: existing.organizationUuid }
           : {}),
+      ...(registration.redirectUri ? { redirectUri: registration.redirectUri } : {}),
       mirrorCodex: false,
     },
     path,
   );
+}
+
+/** 루프백 redirect_uri 의 TCP 포트. 없거나 기본 포트(생략)면 null. */
+export function loopbackRedirectPort(redirectUri: string | undefined): number | null {
+  if (!redirectUri?.trim()) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUri);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  if (parsed.hostname !== '127.0.0.1' && parsed.hostname !== 'localhost' && parsed.hostname !== '[::1]') {
+    return null;
+  }
+  if (!parsed.port) return null;
+  const port = Number(parsed.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  return port;
 }
 
 export function loadStoredRegistration(
@@ -441,11 +468,14 @@ export function loadStoredRegistration(
 
 export async function ensureClientRegistration(
   metadata: AuthorizationServerMetadata,
-  opts: McpOAuthRuntimeOpts = {},
+  opts: McpOAuthRuntimeOpts & { forceReregister?: boolean } = {},
 ): Promise<ClientRegistration> {
   const path = storePath(opts);
-  const stored = loadStoredRegistration(metadata.issuer, { storePath: path });
-  if (stored) return stored;
+  if (!opts.forceReregister) {
+    const stored = loadStoredRegistration(metadata.issuer, { storePath: path });
+    // 옛 등록은 redirect_uri 기록이 없다 — 재사용하면 포트 불일치로 영원히 막힌다.
+    if (stored?.redirectUri) return stored;
+  }
   if (!metadata.registrationEndpoint) {
     throw new McpOAuthError(
       'registration',
@@ -489,6 +519,7 @@ export async function ensureClientRegistration(
   const registration: ClientRegistration = {
     clientId,
     ...(clientSecret ? { clientSecret } : {}),
+    redirectUri,
   };
   persistRegistration(metadata.issuer, registration, path);
   return registration;
@@ -642,6 +673,7 @@ function persistTokens(
       authMode: AUTH_MODE,
       ...(clientId ? { accountUuid: clientId } : {}),
       ...(clientSecret ? { organizationUuid: clientSecret } : {}),
+      ...(existing?.redirectUri ? { redirectUri: existing.redirectUri } : {}),
       mirrorCodex: false,
     },
     path,
@@ -769,7 +801,10 @@ export async function prepareMcpOAuthAuthorization(
   opts: PrepareMcpOAuthAuthorizationOpts,
 ): Promise<McpOAuthAuthorization> {
   const { resource, metadata } = await discoverMcpOAuth(opts.resourceMetadataUrl, opts);
-  const registration = await ensureClientRegistration(metadata, opts);
+  const registration = await ensureClientRegistration(metadata, {
+    ...opts,
+    ...(opts.forceReregister ? { forceReregister: true } : {}),
+  });
   const request = buildAuthorizationRequest(metadata, registration, {
     scope: opts.scope,
     resource: resource.resource,

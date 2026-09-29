@@ -7,10 +7,11 @@
 //   - 막히면 omni-crawl 자율 검색 → worktree 파일로 떨궈 codex 에 read 지시(TUI 멀티라인 회피)
 //   - 증거 게이트(doc 존재 / tsc 0 / test pass)로 완료 판정 후 commit
 // 재사용: startPty(Bun 네이티브 PTY)·createWorktree·streamLLM·worktreeHasChanges·commitWorktree.
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawnSync, spawn as spawnChild } from 'node:child_process';
 import { homedir } from 'node:os';
-import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, statSync, readlinkSync, realpathSync, lstatSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join, relative, resolve, isAbsolute, sep } from 'node:path';
 import { startPty, mintPtyId, onPtyEvent, type PtyHandle, type StartOpts } from '../pty-shell/registry.js';
 import { withChildPtyIdentity } from '../agent/pty-identity.js';
 import { NESTED_AGENT_ENV_BLOCKLIST } from '../agent/nested-agent-env.js';
@@ -19,6 +20,7 @@ import { configuredWorktreeRoot } from '../user-config.js';
 import { worktreeHasChanges, commitWorktree, changedFiles } from '../self-implement/seams.js';
 import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { emitDecision } from '../live/detail-switch.js';
 import { resolvePtyWebAddress } from '../cli/pty-web-address.js';
 import { reemitPtyUsage } from '../budget/pty-usage-reemit.js';
 import { classifyAuthError } from '../oauth/codex.js';
@@ -30,10 +32,15 @@ import { createLlmControlBrain, type StreamLLMFn } from '../autopilot/llm-contro
 import { buildExecutorPtyRef, execSurfaceId } from '../self-implement/executor-contract.js';
 import { runWithControlObserve } from '../capture/control-observe-adapter.js';
 import { buildMissionProvision, sanitizeForPtyInput, type ProvisionRequest, type ProvisionResult } from './provision.js';
+import { checkClaudeSubscription } from './claude-subscription.js';
+import { handoffMission, waitForHumanLogin, type HandoffOperations } from './handoff.js';
+import { runClaudeHeadless } from './claude-headless.js';
+import { installPluginInsideAgent, type PluginRequest, type PluginDeps } from './in-agent-plugin.js';
 import { ensureRunId } from '../harness/harness-space.js';
 import { recordHarnessWorktreeProvenance } from '../harness/harness-worktree-add.js';
 import { resolveInstanceName } from '../instance-identity.js';
 import { getChannelBus } from '../terminal-matrix/index.js';
+import { envLiteral } from '../platform/env-literal.js';
 import { publishSelfReportFrame } from '../capture/self-report-frame.js';
 import { buildExecutorSelfReportFrame } from '../self-implement/executor-frame.js';
 import { classifierFrameLines, classifyFrameState, type FrameState } from '../capture/frame-state-detect.js';
@@ -47,6 +54,52 @@ import { classifyAgainstBaseline } from '../self-implement/gate-baseline.js';
 import type { IngestionEntry } from '../agent-substrate/execution/ingestion-policy.js';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Terminate the PTY process and every descendant found before signalling it. */
+export async function terminateMissionProcessTree(rootPid: number, deps: {
+  processTable?: () => string;
+  signal?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  wait?: (ms: number) => Promise<void>;
+} = {}): Promise<number[]> {
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 0) return [];
+  const signal = deps.signal ?? ((pid, sig) => process.kill(pid, sig));
+  const processTable = deps.processTable ?? (() => execFileSync('ps', ['-eo', 'pid=,ppid='], { encoding: 'utf8' }));
+  const children = new Map<number, number[]>();
+  try {
+    for (const line of processTable().split('\n')) {
+      const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+      if (!match) continue;
+      const pid = Number(match[1]);
+      const ppid = Number(match[2]);
+      if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid)) continue;
+      const siblings = children.get(ppid) ?? [];
+      siblings.push(pid);
+      children.set(ppid, siblings);
+    }
+  } catch (error) {
+    debug.log('agent-mission', 'process-tree-snapshot-failed', { rootPid, error: String(error) }, { level: 'warn' });
+  }
+  const visited = new Set<number>();
+  const order: number[] = [];
+  const collect = (pid: number): void => {
+    if (visited.has(pid)) return;
+    visited.add(pid);
+    for (const child of children.get(pid) ?? []) collect(child);
+    order.push(pid);
+  };
+  collect(rootPid);
+  for (const pid of order) {
+    try { signal(pid, 'SIGTERM'); } catch { /* The process may already have exited. */ }
+  }
+  await (deps.wait ?? sleep)(2000);
+  for (const pid of order) {
+    try {
+      signal(pid, 0);
+      signal(pid, 'SIGKILL');
+    } catch { /* The process has exited or is no longer accessible. */ }
+  }
+  return order;
+}
 
 /** Bounded classifier-compatible screen tail retained with each screen observation. */
 export const SCREEN_LOG_TAIL_MAX_LINES = 10;
@@ -120,14 +173,44 @@ export const codexBackend: AgentBackend = {
 //   ⚠️ "알려진 경로"까지의 보장 — CLI 가 새 과금 env 를 추가하면 추적 필요(flag/scrub drift 는 테스트로 감시).
 
 /** claude Code 백엔드 — --dangerously-skip-permissions(권한 자동)·구독(oauth) 모드.
- *  scrub: API 키 + 대체 인증 토큰(ANTHROPIC_AUTH_TOKEN) + 프로바이더 스위치(Bedrock/Vertex) → oauth 로 좁힘.
- *  CLAUDE_CODE_USE_BEDROCK/VERTEX 가 unset 이면 AWS/GCP creds 가 있어도 그 경로로 라우팅되지 않는다. */
+ *  scrub: API 키 + 대체 인증 토큰(ANTHROPIC_AUTH_TOKEN) + 프로바이더 스위치(Bedrock/Vertex/Foundry) → oauth 로 좁힘.
+ *  CLAUDE_CODE_USE_BEDROCK/VERTEX/FOUNDRY 가 unset 이면 다른 provider 의 creds 가 있어도 그 경로로 라우팅되지 않는다. */
 export const claudeBackend: AgentBackend = {
   name: 'claude',
   cmd: 'claude',
   args: ['--dangerously-skip-permissions'],
-  scrubEnv: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX'],
+  // CLAUDE_CODE_OAUTH_TOKEN: a launching Claude Code session exports its own token; the child must use the
+  //   machine's stored login, never the parent session's (09-29 🅞: status read `oauth_token` → «api-key» · 대표 R2).
+  scrubEnv: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'],
+  // 🩸 09-29 S6: new worktree → «Accessing workspace … ❯ No, exit / Yes, I trust this folder». The default is «No», so
+  //    the brain spent all 16 steps on this screen. Move to «Yes» (↓) then confirm (Enter) on the next observation —
+  //    the worktree is an isolated tree elanous created (same reasoning as agy).
+  handleTrust: (screen, write) => {
+    const choice = claudeTrustChoice(screen);
+    if (choice === 'no-selected') { write('\x1b[B'); return true; }
+    if (choice === 'yes-selected') { write('\r'); return true; }
+    return false;
+  },
 };
+
+/** claude reads «text + Enter» arriving in one chunk as a paste, so the Enter becomes a newline and nothing is sent
+ *  (09-29 실물: three brain inputs piled up in the input box). Send the text, then Enter on its own a moment later. */
+export function submitSeparately(inject: (text: string) => boolean, delay: (fn: () => void) => void = (fn) => { setTimeout(fn, 250); }): (text: string) => boolean {
+  return (text) => {
+    if (text.length < 2 || !/\r$/.test(text)) return inject(text);
+    if (!inject(text.slice(0, -1))) return false;
+    delay(() => { inject('\r'); });
+    return true;
+  };
+}
+
+/** claude 첫 화면의 폴더 신뢰 메뉴 — 어느 줄이 선택돼 있나(기본 선택 = «No, exit»). */
+export function claudeTrustChoice(screen: string): 'no-selected' | 'yes-selected' | null {
+  if (!/Yes, I trust this folder/.test(screen) || !/(?:Accessing workspace|Quick safety check)/.test(screen)) return null;
+  if (/^\s*[❯>]\s*(?:\d+\.\s*)?Yes, I trust this folder/m.test(screen)) return 'yes-selected';
+  if (/^\s*[❯>]\s*(?:\d+\.\s*)?No, exit/m.test(screen)) return 'no-selected';
+  return null;
+}
 
 /** gemini 백엔드 — ⭐ 실행체는 **Antigravity CLI(`agy`)** 다(대표 2026-08-18 결정).
  *
@@ -352,8 +435,12 @@ export interface AgentMissionSpec {
   mission: string;
   /** repo 루트(기본: CWD 에서 resolveMainRepoRoot). */
   repo?: string;
-  /** 새 worktree 브랜치명. */
-  branch: string;
+  /** 새 worktree 브랜치명. workdir 모드에서는 관측 라벨(선택). */
+  branch?: string;
+  /** 저장소 worktree 대신 직접 실행할 비-git 작업 폴더. */
+  workdir?: string;
+  /** 호출자의 벽시계 마감/취소 신호. */
+  signal?: AbortSignal;
   /** 분기 base(기본 HEAD). 이전 미션 산출 위에 쌓으려면 그 브랜치명. */
   base?: string;
   /** 완료 증거 판정. */
@@ -368,6 +455,12 @@ export interface AgentMissionSpec {
   omniCrawlPath?: string;
   /** 구동할 에이전트 backend(기본 codexBackend). claude/gemini/grok 확장점. */
   agent?: AgentBackend;
+  /** Claude CLI 비대화형 stream-json 실행. 다른 backend 에서는 거부. */
+  headless?: boolean;
+  /** Install in the agent's own UI before sending the mission. */
+  plugin?: Pick<PluginRequest, 'plugin' | 'marketplace'>;
+  /** Explicit backend sequence; transitions use the same handoff coordinator as brain decisions. */
+  chain?: readonly ('codex' | 'claude' | 'elanous')[];
   /**
    * ★ elanous 내부 프롬프트 인핸싱(가산·anti-drift) — 원문 verbatim 보존 + 커버리지 체크리스트 부착.
    * 명시 override(undefined 면 entry 정책이 결정: elanous-apparatus→ON·external-verbatim→OFF·§6e capability 구동).
@@ -402,7 +495,9 @@ export type CodexMissionSpec = AgentMissionSpec;
 export interface AgentMissionResult {
   ok: boolean;
   worktree: string;
-  branch: string;
+  branch: string | null;
+  reason?: 'aborted' | 'outside-write';
+  paths?: string[];
   rounds: number;
   evidencePath: string | null;
   committed: boolean;
@@ -420,11 +515,37 @@ export interface AgentMissionDeps {
   createWorktree?: typeof createWorktree;
   recordWorktreeProvenance?: typeof recordHarnessWorktreeProvenance;
   runControlLoop?: typeof runPtyControlLoop;
+  /** Inject controller responses while keeping the production control loop. */
+  controlStream?: StreamLLMFn;
   resolvePtyWebAddress?: typeof resolvePtyWebAddress;
   resolveRunFallback?: (input: { currentStep: FallbackStep; currentCredentialRateLimited: true }) => { action: string; backend?: string };
   /** 재귀 재시도 사이에만 전달되는 런 로컬 폴백 진행 상태. */
   runtimeFallback?: RuntimeFallbackContext;
   reemitPtyUsage?: typeof reemitPtyUsage;
+  checkClaudeSubscription?: typeof checkClaudeSubscription;
+  runClaudeHeadless?: typeof runClaudeHeadless;
+  checkEvidence?: typeof checkEvidence;
+  commitWorktree?: typeof commitWorktree;
+  terminateProcessTree?: typeof terminateMissionProcessTree;
+  repoStatus?: (repo: string) => string | Promise<string>;
+  emitDecision?: typeof emitDecision;
+  onPtyStarted?: (handle: PtyHandle, stop: () => void) => void;
+  onHeadlessStarted?: (pid: number, kill: () => void) => void;
+  isMissionAborted?: () => boolean;
+  awaitMission?: <T>(pending: Promise<T>) => Promise<T>;
+  onControlPending?: (pending: Promise<unknown>) => void;
+  onControlActive?: (pending: Promise<unknown>) => void;
+  /** Upper bound for waiting on control stages after cancel (default 10s). */
+  cancelDrainMs?: number;
+  handoffOperations?: Partial<HandoffOperations>;
+  /** Internal continuation: retain this exact worktree rather than calling createWorktree again. */
+  handoffWorktree?: { path: string; branch: string; base: string };
+  originalMission?: string;
+  /** The last controller reason from the previous backend (not a PTY transcript). */
+  previousSummary?: string;
+  initialTsc?: ReturnType<typeof collectTscDiagnostics> | null;
+  installPlugin?: typeof installPluginInsideAgent;
+  pluginDeps?: PluginDeps;
 }
 
 const DEFAULT_OMNI = `${process.env.HOME}/.claude/skills/omni-crawl/scripts/main.ts`;
@@ -505,6 +626,11 @@ type EvidenceCheckDeps = {
   readonly hasChanges?: (wt: string) => boolean;
   /** Worktree-relative paths this mission changed (uncommitted · untracked · committed since fork). */
   readonly changedPaths?: (wt: string) => readonly string[];
+  /** Non-git mission: compare against the files present before execution, not only mtime. */
+  readonly startedAt?: number;
+  readonly initialFiles?: ReadonlyMap<string, string>;
+  /** test mode: whether the worktree is a TypeScript project (default: tsconfig.json exists). */
+  readonly hasTsconfig?: boolean;
 };
 
 export function checkEvidence(
@@ -521,9 +647,18 @@ export function checkEvidence(
     if (!existsSync(dir)) return { ok: false, path: null, retry: `${ev.dirRel} 아래 문서가 아직 없다.` };
     // Only a document this mission wrote counts: a matching file that was already in the
     // worktree (e.g. an old PLAN-*.md) passed round 0 without any work (🅞 09-27).
-    const changed = (deps.changedPaths ?? changedFiles)(wt);
+    const changed = deps.startedAt === undefined ? (deps.changedPaths ?? changedFiles)(wt) : [];
     const dirPrefix = `${ev.dirRel.replace(/\/+$/, '')}/`;
-    const isChanged = (f: string) => changed.some((c) => c === `${dirPrefix}${f}` || (c.endsWith('/') && `${dirPrefix}${f}`.startsWith(c)));
+    const isChanged = (f: string) => {
+      if (deps.startedAt !== undefined) {
+        try {
+          const stat = statSync(join(dir, f));
+          return stat.isFile() && stat.mtimeMs >= deps.startedAt
+            && (!deps.initialFiles || deps.initialFiles.get(f) !== fileFingerprint(join(dir, f)));
+        } catch { return false; }
+      }
+      return changed.some((c) => c === `${dirPrefix}${f}` || (c.endsWith('/') && `${dirPrefix}${f}`.startsWith(c)));
+    };
     const matching = readdirSync(dir).filter((f) => ev.glob.test(f));
     const hit = matching.find(isChanged);
     if (hit) return { ok: true, path: join(dir, hit) };
@@ -543,7 +678,10 @@ export function checkEvidence(
   //   없으면 비파싱 원시 출력의 **끝** 1500자(out.slice(-1500))를 쓴다. output.slice(0,1500)(앞부분)로
   //   바꾸면 종전 문구와 어긋나 수용기준을 위반한다.
   if (ev.fileRel && !existsSync(join(wt, ev.fileRel))) return { ok: false, path: null, retry: `${ev.fileRel} 가 아직 없다.` };
-  const tsc = executeTsc(wt);
+  // 🩸 09-29 S6(retry-demo): without a tsconfig.json tsc prints its help and exits 1, so a mission whose tests passed
+  //    2/2 was sent «tsc 실패» with the help text as the error. The test is the evidence the caller asked for — the
+  //    tsc pre-check only applies to a TypeScript project.
+  const tsc: ReturnType<TscExecutor> = deps.hasTsconfig ?? existsSync(join(wt, 'tsconfig.json')) ? executeTsc(wt) : { ran: true, diagnostics: [] };
   if (!tsc.ran || tsc.diagnostics.length > 0) {
     const parsed = tsc.diagnostics.map((diagnostic) => diagnostic.line);
     const errors = parsed.slice(0, 25).join('\n') || (tsc.output ?? tsc.failure ?? '').slice(-1500);
@@ -679,6 +817,9 @@ export interface MissionControlBrainOpts {
    *  행동은 no-op(wait)로 폴백 = 무회귀. 반환 detail 을 자식에 input 으로 전달(설치됨/거부 안내). */
   readonly provision?: (req: ProvisionRequest) => Promise<ProvisionResult>;
   readonly stream?: StreamLLMFn;
+  readonly handoffEnabled?: boolean;
+  /** Screen-grounded brain summary for the next backend, never the raw PTY screen. */
+  readonly onSummary?: (summary: string) => void;
 }
 
 /** 기존 5-action mission 판단을 canonical PTY control-loop 결정으로 축소한다. search는 이 경계에서만
@@ -705,7 +846,9 @@ export function createMissionControlBrain(opts: MissionControlBrainOpts): RunSup
  - "wait": ${backendName} 가 아직 작업 중(도구 실행/생성)이면 대기.
  - "verify": ${backendName} 가 MISSION-COMPLETE/완료를 주장하면 증거 게이트(내가 실행)로 검증. 완료주장 시 이걸 우선.
  - "send": ${backendName} 가 멈추거나 계속 진행이 필요하면 짧고 명확한 지시(text).
- - "search": ${backendName} 가 정보/라이브러리/문법/외부자원에 막혔으면 omni-crawl 로 조사(query). ⭐외부 힌트 없이 스스로 판단.${opts.provision ? `
+ - "search": ${backendName} 가 정보/라이브러리/문법/외부자원에 막혔으면 omni-crawl 로 조사(query). ⭐외부 힌트 없이 스스로 판단.
+${opts.handoffEnabled ? ` - "handoff": 다른 담당자로 넘길 때 to(codex/claude/elanous), mission(다음 지시), carry(diff/summary 선택). carry=summary 면 reason 에 화면에서 확인한 리뷰 지적을 구체적으로 요약하라(다음 backend 에 전달된다). claude 리뷰 뒤 지적은 codex 에 summary 로 되돌려라. elanous 는 증거 게이트와 PR.
+ - "ask-human": 화면에 로그인 URL/장치 코드가 보이면 reason, url/code(보이는 것만). 토큰·자격파일을 열지 마라.` : ''}${opts.provision ? `
  - "provision": ${backendName} 가 **없는 Node 패키지**에 막혔으면(예: "Cannot find module 'X'"·"Module not found: X") 격리 worktree 에 자율 설치(spec=**npm 패키지명**, layer="pkg"). ⚠️Node 패키지만 — 파이썬/시스템 도구(pip·apt·brew)는 아직 미지원이니 provision 하지 말고 다른 방법(search·send)으로. 내가 설치 후 재시도를 지시한다.` : ''}
  증거상태: ${opts.evidenceReady() ? '충족(완료 가능)' : '아직'}.
  JSON 만: {"action":"...","text":"...","query":"...","spec":"...","layer":"pkg","reason":"..."}`;
@@ -718,7 +861,11 @@ export function createMissionControlBrain(opts: MissionControlBrainOpts): RunSup
     decisionFromRaw: async (raw, obs): Promise<ControlDecision> => {
       const decision = parseBrainDecision(raw);
       history.push(`s${obs.step}:${decision.action}`);
-      debug.log('agent-mission', 'brain', { step: obs.step, action: decision.action, reason: decision.reason.slice(0, 120) });
+      debug.log('agent-mission', 'brain', { step: obs.step, action: decision.action,
+        ...(decision.action === 'ask-human' ? {} : { reason: decision.reason.slice(0, 120) }) });
+      if (decision.reason && decision.action !== 'ask-human') opts.onSummary?.(decision.reason.slice(0, 2000));
+      if (decision.action === 'handoff' && decision.to && decision.mission) return { action: 'handoff', to: decision.to, mission: decision.mission, ...(decision.carry ? { carry: decision.carry } : {}) };
+      if (decision.action === 'ask-human') return { action: 'ask-human', reason: decision.reason, ...(decision.url ? { url: decision.url } : {}), ...(decision.code ? { code: decision.code } : {}) };
       if (decision.action === 'send') return { action: 'input', text: `${decision.text || 'continue'}\r` };
       if (decision.action === 'verify' || decision.action === 'done') return { action: 'done', reason: decision.reason || 'agent completed' };
       if (decision.action === 'search') {
@@ -865,7 +1012,7 @@ export function buildMissionWorktreeRequest(
   ctx: { repoRoot: string; worktreeRoot: string },
 ): CreateWorktreeOpts {
   return {
-    repoRoot: ctx.repoRoot, branch: spec.branch, worktreeRoot: ctx.worktreeRoot, resetExisting: true,
+    repoRoot: ctx.repoRoot, branch: spec.branch!, worktreeRoot: ctx.worktreeRoot, resetExisting: true,
     ...(spec.base ? { base: spec.base } : {}),
     ...(spec.reuseOwnedWorktree === true ? { reuseOwnedWorktree: true } : {}),
   };
@@ -897,10 +1044,332 @@ export function recordMissionWorktreeProvenance(
 // ══════════════════ 메인 ══════════════════
 export const AGENT_MISSION_TAKEOVER_WAIT_MS = 1_800_000;
 
+function containingGitRepo(dir: string): string | null {
+  const probe = spawnSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+  return probe.status === 0 && probe.stdout.trim() ? probe.stdout.trim() : null;
+}
+
+function missionRepoStatus(repo: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawnChild('git', ['status', '--porcelain', '-z', '--untracked-files=all'], { cwd: repo });
+    let out = '', err = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => { out += chunk; });
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => { err += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => code === 0 ? resolve(out) : reject(new Error(`git status failed (${code}): ${err}`)));
+  });
+}
+
+function statusEntries(status: string): Map<string, string> {
+  const nulDelimited = status.includes('\0');
+  const entries = nulDelimited ? status.split('\0') : status.split('\n');
+  const paths = new Map<string, string>();
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (!entry) continue;
+    // Porcelain -z lists the source of a rename in the following entry; its path is literal.
+    if (nulDelimited && /[RC]/.test(entry.slice(0, 2))) i++;
+    const raw = nulDelimited ? entry.slice(3) : entry.slice(3).replace(/^.* -> /, '');
+    if (raw) paths.set(raw, entry.slice(0, 2));
+  }
+  return paths;
+}
+
+function insideWorkdir(repo: string, workdir: string, path: string): boolean {
+  const root = realpathSync(repo);
+  const folder = realpathSync(workdir);
+  const candidate = resolve(root, path);
+  const rel = relative(folder, candidate);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+function initialEvidenceFiles(workdir: string, evidence: Extract<EvidenceMode, { kind: 'doc' }>): Map<string, string> {
+  const dir = join(workdir, evidence.dirRel);
+  const files = new Map<string, string>();
+  if (existsSync(dir)) for (const name of readdirSync(dir)) {
+    if (!evidence.glob.test(name)) continue;
+    const fingerprint = fileFingerprint(join(dir, name));
+    if (fingerprint !== null) files.set(name, fingerprint);
+  }
+  return files;
+}
+
+function fileFingerprint(path: string): string | null {
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile()) return null;
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch { return null; }
+}
+
+function linkedTargetFingerprint(path: string, seen: Set<string> = new Set()): string | null {
+  try {
+    const real = realpathSync(path);
+    // A link cycle is hashed as a marker; the content was already hashed on the first visit.
+    if (seen.has(real)) return 'cycle';
+    const stat = statSync(real);
+    if (stat.isFile()) return fileFingerprint(real);
+    if (!stat.isDirectory()) return null;
+    seen.add(real);
+    const hash = createHash('sha256');
+    for (const entry of readdirSync(real, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const child = join(real, entry.name);
+      // Follow nested links too: writing through `link/nested` changes the nested target, not the link text.
+      const content = linkedTargetFingerprint(child, seen) ?? 'missing';
+      hash.update(entry.name).update(entry.isSymbolicLink() ? `link:${readlinkSync(child)}:${content}` : content);
+    }
+    return hash.digest('hex');
+  } catch { return null; }
+}
+
+// Git control files change what git and its hooks execute. Objects, the index and refs churn during
+// ordinary reads and sibling worktrees, so they are not compared.
+const GIT_CONTROL_ENTRIES = ['config', 'config.worktree', 'hooks', 'info'];
+
+function gitControlFingerprints(root: string, add: (label: string, hash: string | null) => void): void {
+  const dotGit = join(root, '.git');
+  const dirs: Array<{ dir: string; label: string }> = [];
+  try {
+    const stat = lstatSync(dotGit);
+    if (stat.isDirectory()) dirs.push({ dir: dotGit, label: '.git' });
+    else if (stat.isFile()) {
+      add('.git', fileFingerprint(dotGit));
+      const gitdir = /^gitdir:\s*(.+)$/m.exec(readFileSync(dotGit, 'utf8'))?.[1]?.trim();
+      if (gitdir) {
+        const dir = resolve(root, gitdir);
+        dirs.push({ dir, label: '.git:gitdir' });
+        const common = existsSync(join(dir, 'commondir')) ? readFileSync(join(dir, 'commondir'), 'utf8').trim() : '';
+        if (common) dirs.push({ dir: resolve(dir, common), label: '.git:common' });
+      }
+    }
+  } catch { return; }
+  const walk = (absolute: string, label: string): void => {
+    try {
+      const stat = lstatSync(absolute);
+      if (stat.isDirectory()) {
+        for (const name of readdirSync(absolute).sort()) walk(join(absolute, name), `${label}/${name}`);
+      } else add(label, stat.isSymbolicLink() ? `link:${readlinkSync(absolute)}:${linkedTargetFingerprint(absolute)}` : fileFingerprint(absolute));
+    } catch { /* Absent control files are compared as absent. */ }
+  };
+  for (const { dir, label } of dirs) for (const name of GIT_CONTROL_ENTRIES) walk(join(dir, name), `${label}/${name}`);
+}
+
+function externalLinks(dir: string, workdir: string, label: (path: string) => string): Map<string, string | null> {
+  const links = new Map<string, string | null>();
+  const folder = realpathSync(workdir);
+  const visit = (current: string): void => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (entry.name === '.git' && entry.isDirectory()) continue;
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isSymbolicLink()) {
+        try {
+          const target = realpathSync(path);
+          const rel = relative(folder, target);
+          if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+            links.set(label(path), linkedTargetFingerprint(target));
+          }
+        } catch { /* A broken link cannot be used to write an existing target. */ }
+      }
+    }
+  };
+  visit(dir);
+  return links;
+}
+
+function repoFingerprints(repo: string, workdir: string, paths: readonly string[]): Map<string, string | null> {
+  const fingerprints = new Map<string, string | null>();
+  const root = realpathSync(repo);
+  const folder = realpathSync(workdir);
+  const inside = (absolute: string): boolean => {
+    const rel = relative(folder, absolute);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  const visit = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (dir === root && entry.name === '.git') continue;
+      const absolute = join(dir, entry.name);
+      if (inside(absolute)) continue;
+      const path = relative(root, absolute);
+      if (entry.isDirectory()) visit(absolute);
+      else if (entry.isSymbolicLink()) {
+        fingerprints.set(path, `link:${readlinkSync(absolute)}`);
+        try {
+          const target = realpathSync(absolute);
+          if (!target.startsWith(`${root}${sep}`) && target !== root) {
+            fingerprints.set(path, `link:${readlinkSync(absolute)}:${linkedTargetFingerprint(target)}`);
+          }
+        } catch { /* Broken link. */ }
+      }
+      else fingerprints.set(path, fileFingerprint(absolute));
+    }
+  };
+  // Include ignored files as well as tracked/untracked paths: git status alone cannot see them.
+  visit(root);
+  gitControlFingerprints(root, (label, hash) => fingerprints.set(label, hash));
+  for (const path of paths) {
+    if (insideWorkdir(repo, workdir, path) || fingerprints.has(path)) continue;
+    fingerprints.set(path, fileFingerprint(resolve(root, path)));
+  }
+  return fingerprints;
+}
+
+/** Abort owns the PTY tree even while the control brain or an external tool is awaiting. */
 export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMissionDeps = {}): Promise<AgentMissionResult> {
-  const backend = spec.agent ?? resolveDefaultBackend();
+  if (spec.signal?.aborted) {
+    debug.log('agent-mission', 'aborted', { workdir: spec.workdir, pids: [], reason: 'aborted' });
+    return { ok: false, reason: 'aborted', worktree: spec.workdir ?? '', branch: spec.workdir ? null : spec.branch ?? null,
+      rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
+  }
+  if (spec.workdir && spec.evidence.kind !== 'doc') throw new Error('workdir 모드는 doc 증거만');
+  const workdir = spec.workdir;
+  const status = deps.repoStatus ?? missionRepoStatus;
+  // Compare the repository that contains the workdir, not the launcher's cwd: a workdir outside any repository
+  // (e.g. a media folder) must not be failed by unrelated writes in the launcher's tree, such as its own logs.
+  const repo = workdir ? (spec.repo ?? containingGitRepo(workdir)) : null;
+  if (workdir && !repo) debug.log('agent-mission', 'workdir-outside-repo', { workdir, pids: [], reason: 'links-only' });
+  const signal = spec.signal;
+  let before = '';
+  let beforeFingerprints = new Map<string, string | null>();
+  let beforeLinks = new Map<string, string | null>();
+  if (workdir) {
+    let stopWaiting!: () => void;
+    const interrupted = new Promise<never>((_resolve, reject) => { stopWaiting = () => reject(new Error('MISSION_ABORTED')); });
+    signal?.addEventListener('abort', stopWaiting, { once: true });
+    try {
+      if (repo) {
+        before = await Promise.race([status(repo), interrupted]);
+        beforeFingerprints = repoFingerprints(repo, workdir, [...statusEntries(before).keys()]);
+      }
+      beforeLinks = externalLinks(workdir, workdir, (path) => path);
+    } catch (error) {
+      if (!signal?.aborted) throw error;
+      debug.log('agent-mission', 'aborted', { workdir, pids: [], reason: 'aborted' });
+      return { ok: false, reason: 'aborted', worktree: workdir, branch: null,
+        rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
+    } finally { signal?.removeEventListener('abort', stopWaiting); }
+  }
+  const startedAt = Date.now();
+  const initialFiles = workdir && spec.evidence.kind === 'doc' ? initialEvidenceFiles(workdir, spec.evidence) : undefined;
+  let handle: PtyHandle | undefined;
+  let childPid: number | undefined;
+  let killChild: (() => void) | undefined;
+  let stopPty: (() => void) | undefined;
+  let abort!: () => void;
+  let cancelled = false;
+  let controlPending: Promise<unknown> | undefined;
+  let controlSettled = false;
+  let activeControl: Promise<unknown> | undefined;
+  let activeSettled = false;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    abort = () => {
+      if (cancelled) return;
+      cancelled = true;
+      debug.log('agent-mission', 'aborted', { workdir, pids: childPid ? [childPid] : handle?.pid ? [handle.pid] : [], reason: 'aborted' });
+      void (async () => {
+        stopPty?.();
+        const pid = childPid ?? handle?.pid;
+        try {
+          if (pid) {
+            const pids = await (deps.terminateProcessTree ?? terminateMissionProcessTree)(pid);
+            debug.log('agent-mission', 'tree-killed', { workdir, pids, reason: 'aborted' });
+          }
+        } finally {
+          if (handle) try { handle.kill(); } catch { /* Already exited. */ }
+          killChild?.();
+        }
+      })().then(() => reject(new Error('MISSION_ABORTED')), reject);
+    };
+  });
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
+  let result: AgentMissionResult;
+  try {
+    if (cancelled) await aborted;
+    const body = runAgentMissionBody(spec, { ...deps, onControlActive: (pending) => {
+      activeSettled = false;
+      activeControl = pending.then(() => { activeSettled = true; }, () => { activeSettled = true; });
+    }, onControlPending: (pending) => {
+      controlSettled = false;
+      controlPending = pending.then(() => { controlSettled = true; }, () => { controlSettled = true; });
+    }, awaitMission: (pending) => Promise.race([pending, aborted]), isMissionAborted: () => cancelled, onPtyStarted: (h, stop) => { handle = h; stopPty = stop; deps.onPtyStarted?.(h, stop); if (signal?.aborted) abort(); }, onHeadlessStarted: (pid, kill) => { childPid = pid; killChild = kill; deps.onHeadlessStarted?.(pid, kill); if (signal?.aborted) abort(); } }, startedAt, initialFiles);
+    if (signal) {
+      try { result = await Promise.race([body, aborted]); }
+      catch (error) {
+        if (cancelled) {
+          // The tree is already terminated by abort; a stage not tied to cancellation (e.g. ownership wait)
+          // must not hold the return forever, so the drain is bounded.
+          const drain = (async () => {
+            await body.catch(() => {});
+            if (activeControl && !activeSettled) await activeControl;
+            if (controlPending && !controlSettled) await controlPending;
+          })();
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const drained = await Promise.race([drain.then(() => true), new Promise<false>((done) => { timer = setTimeout(() => done(false), deps.cancelDrainMs ?? 10_000); })]);
+          clearTimeout(timer);
+          if (!drained) debug.log('agent-mission', 'cancel-drain-timeout', { workdir, pids: childPid ? [childPid] : handle?.pid ? [handle.pid] : [], reason: 'aborted' });
+        }
+        throw error;
+      }
+    } else result = await body;
+    if (cancelled) await aborted;
+  } catch (error) {
+    if (!cancelled) throw error;
+    result = { ok: false, reason: 'aborted', worktree: workdir ?? '', branch: workdir ? null : spec.branch ?? null,
+      rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
+  } finally {
+    signal?.removeEventListener('abort', abort);
+  }
+  if (workdir) {
+    let after = '';
+    if (repo) {
+      let stopWaiting!: () => void;
+      const interrupted = new Promise<never>((_resolve, reject) => { stopWaiting = () => reject(new Error('MISSION_ABORTED')); });
+      signal?.addEventListener('abort', stopWaiting, { once: true });
+      try { after = await Promise.race([status(repo), interrupted]); }
+      catch (error) {
+        if (!signal?.aborted) throw error;
+        after = await status(repo);
+      } finally { signal?.removeEventListener('abort', stopWaiting); }
+    }
+    // A cancel that lands during the final inspection still cancels the mission; it never reports success.
+    if (signal?.aborted && result.reason !== 'aborted') {
+      debug.log('agent-mission', 'aborted', { workdir, pids: [], reason: 'aborted-during-final-inspection' });
+      result = { ...result, ok: false, reason: 'aborted', committed: false, detail: 'aborted' };
+    }
+    const afterEntries = statusEntries(after);
+    const beforeEntries = statusEntries(before);
+    const afterFingerprints = repo
+      ? repoFingerprints(repo, workdir, [...new Set([...beforeFingerprints.keys(), ...afterEntries.keys()])])
+      : new Map<string, string | null>();
+    const paths = [...afterFingerprints].filter(([path, hash]) =>
+      (beforeFingerprints.has(path) && beforeFingerprints.get(path) !== hash)
+      || (!beforeFingerprints.has(path) && hash !== null)
+      || (afterEntries.has(path) && beforeEntries.get(path) !== afterEntries.get(path)))
+      .map(([path]) => path);
+    for (const [link, hash] of externalLinks(workdir, workdir, (path) => path)) {
+      if (beforeLinks.get(link) !== hash && !paths.includes(link)) paths.push(link);
+    }
+    paths.sort();
+    if (paths.length) {
+      debug.log('agent-mission', 'outside-write', { workdir, pids: [], reason: paths.join(', ') });
+      (deps.emitDecision ?? emitDecision)({ kind: 'ESCALATE', what: '작업 폴더 밖 쓰기', reason: paths.join(', '), purpose: '사람이 확인한다', target: 'human' });
+      return { ...result, ok: false, reason: 'outside-write', paths, committed: false };
+    }
+  }
+  return result;
+}
+
+async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDeps, startedAt: number, initialFiles?: ReadonlyMap<string, string>): Promise<AgentMissionResult> {
+  const backend = spec.agent ?? (spec.chain?.[0] && spec.chain[0] !== 'elanous' ? resolveBackend(spec.chain[0]) : resolveDefaultBackend());
+  if (spec.chain && (spec.chain[0] !== backend.name || !['codex,claude,elanous', 'codex,claude,codex,elanous'].some((allowed) => allowed === spec.chain!.join(',') || (deps.handoffWorktree && allowed.endsWith(`,${spec.chain!.join(',')}`))))) throw new Error('invalid agent mission chain');
+  if (spec.chain && spec.commit === false && spec.chain.includes('elanous')) throw new Error('elanous PR handoff requires commit authorization');
+  if (spec.headless && spec.chain) throw new Error('--headless cannot run a PTY handoff chain');
+  if (spec.headless && backend.name !== 'claude') throw new Error('--headless 는 --backend claude 전용입니다');
+  if (spec.plugin && (spec.headless || (backend.name !== 'codex' && backend.name !== 'claude'))) throw new Error('--plugin 은 codex/claude PTY 전용입니다');
+  if (spec.workdir && spec.chain) throw new Error('workdir 모드는 넘기기 사슬을 쓰지 않는다');
   const runtimeFallback = deps.runtimeFallback ?? {
-    fallbackEligible: spec.agent === undefined,
+    fallbackEligible: spec.agent === undefined && !spec.chain,
     attemptedSteps: new Set<FallbackStep>([backend.name === 'grok' ? 'grok' : 'codex-rotate']),
     descents: 0,
     maxDescents: backend.name === 'codex' ? 1 : 0,
@@ -909,6 +1378,7 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   const createMissionWorktree = deps.createWorktree ?? createWorktree;
   const recordWorktreeProvenance = deps.recordWorktreeProvenance ?? recordHarnessWorktreeProvenance;
   const repoRoot = spec.repo ?? resolveMainRepoRoot(process.cwd()) ?? process.cwd();
+  if (!spec.workdir && !spec.branch) throw new Error('branch is required without workdir');
   const maxRounds = spec.maxRounds ?? 16;
   const omniPath = spec.omniCrawlPath ?? DEFAULT_OMNI;
   const screensDir = spec.screensDir ?? join(process.env.TMPDIR || '/tmp', `agent-mission-${backend.name}-${spec.branch}`);
@@ -932,32 +1402,124 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     role: 'controller', executor: describeRole({ role: 'executor', executorKind: 'agent', agentBackend: backend.name }),
     entry: missionEntry, capabilities: [...caps.active], enhanceActive,
   });
-  // ⭐ 이 자리는 «별칭»(createMissionWorktree)이라 소스 스캔이 못 찾았고 타입 검사가 찾았다
-  //    — 리뷰 3R must-fix ② 가 경고한 그 형태다(별칭·래퍼는 정규식으로 못 센다).
-  const wt = createMissionWorktree(buildMissionWorktreeRequest(spec, { repoRoot, worktreeRoot: configuredWorktreeRoot() }));
-  recordMissionWorktreeProvenance(wt.path, buildMissionWorktreeProvenance(spec.branch), recordWorktreeProvenance);
-  debug.log('agent-mission', 'worktree', { path: wt.path, branch: wt.branch, base: wt.base });
-  const baselineTsc = spec.evidence.kind === 'tsc' ? collectTscDiagnostics(wt.path) : null;
-  const evidenceCheck: typeof checkEvidence = (worktree, evidence) => evidence.kind === 'tsc' && baselineTsc
-    ? checkEvidence(worktree, evidence, { baseline: baselineTsc.diagnostics, executeTsc: baselineTsc.ran ? collectTscDiagnostics : () => baselineTsc })
-    : checkEvidence(worktree, evidence);
-
   // 구독 모드 — backend 지정 env 키 스크럽 후 강제 env까지 적용해 cmd·args·env를 순수 seam으로 구성한다.
   // forcedEnv 이름의 후속 로깅은 이 착지의 의도적 경계이며, spawn에는 같은 seam의 env가 그대로 흐른다.
   const spawnParams = resolveBackendSpawn(backend, process.env);
   const env = spawnParams.env;
-  env.TERM = 'xterm-256color';
-  // ⭐run-identity — runId 를 spawn 前 확정해 child env(ELANOUS_RUN_ID 상속)와 executorRef 에 동일 배선한다.
-  //   spawn 後 mint 하면 child 는 자기 runId 를 모르고 ref 와도 상관이 끊긴다(K join 정합·review).
+  if (backend.name === 'claude') {
+    const status = (deps.checkClaudeSubscription ?? checkClaudeSubscription)({ env });
+    debug.log('agent-mission.claude-subscription', 'status', {
+      ok: status.ok, authMethod: status.authMethod, apiProvider: status.apiProvider, reason: status.reason,
+    });
+    if (!status.ok) {
+      const action = status.reason === 'logged-out'
+        ? 'Run `claude login` to authenticate a Claude subscription, then retry.'
+        : status.reason === 'api-key'
+          ? 'Claude is using API-key/provider authentication rather than a Claude subscription. Run `claude login` with a subscription account, then retry.'
+          : 'Run `claude auth status --json` and check the Claude CLI/login, then retry.';
+      return {
+        ok: false, worktree: spec.workdir ?? '', branch: spec.branch ?? null, rounds: 0,
+        evidencePath: null, committed: false, usedOmniCrawl: false,
+        detail: `Claude subscription check failed (${status.reason}). ${action}`,
+      };
+    }
+  }
+  // ⭐ 이 자리는 «별칭»(createMissionWorktree)이라 소스 스캔이 못 찾았고 타입 검사가 찾았다
+  //    — 리뷰 3R must-fix ② 가 경고한 그 형태다(별칭·래퍼는 정규식으로 못 센다).
+  if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
+  const wt = spec.workdir
+    ? { path: spec.workdir, branch: spec.branch ?? null, base: null }
+    : deps.handoffWorktree ?? createMissionWorktree(buildMissionWorktreeRequest(spec, { repoRoot, worktreeRoot: configuredWorktreeRoot() }));
+  if (spec.workdir) debug.log('agent-mission', 'workdir-mode', { workdir: wt.path, pids: [], reason: 'non-git' });
+  else {
+    if (!deps.handoffWorktree) recordMissionWorktreeProvenance(wt.path, buildMissionWorktreeProvenance(spec.branch!), recordWorktreeProvenance);
+    debug.log('agent-mission', 'worktree', { path: wt.path, branch: wt.branch, base: wt.base });
+  }
+  const baselineTsc = spec.evidence.kind === 'tsc' ? (deps.initialTsc ?? collectTscDiagnostics(wt.path)) : null;
+  const evidenceCheck: typeof checkEvidence = (worktree, evidence) => evidence.kind === 'tsc' && baselineTsc
+    ? checkEvidence(worktree, evidence, { baseline: baselineTsc.diagnostics, executeTsc: baselineTsc.ran ? collectTscDiagnostics : () => baselineTsc })
+    : checkEvidence(worktree, evidence, spec.workdir ? { startedAt, initialFiles } : {});
+  const verifyEvidence: typeof checkEvidence = spec.workdir ? evidenceCheck : deps.checkEvidence ?? evidenceCheck;
+  // Resolve identity before either child path; both receive the same run ID through env.
+  if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
   const runId = ensureRunId();
   env.ELANOUS_RUN_ID = runId;
+  if (spec.headless === true) {
+    // The non-interactive child receives the mission on stdin, never via a PTY or argv.
+    // Keep the same enhancement and additive memory policy as the interactive mission.
+    let prompt = spec.mission;
+    let checklist: string[] = [];
+    if (enhanceActive) {
+      const { enhancePrompt } = await import('../prompt-enhance/enhance.js');
+      const enhanced = await enhancePrompt(spec.mission, {
+        ...(spec.deliverableHint ? { deliverableHint: spec.deliverableHint } : {}),
+      });
+      prompt = enhanced.enhanced;
+      checklist = enhanced.checklist;
+      debug.log('agent-mission', 'enhance', {
+        checklist: checklist.length, enhancedBy: enhanced.enhancedBy,
+        origChars: enhanced.original.length, enhancedChars: prompt.length, verbatimPreserved: enhanced.verbatimPreserved,
+      });
+    }
+    if (spec.memory !== false) {
+      const { recallMemoryContext } = await import('../agent-substrate/execution/memory-context.js');
+      const mem = await recallMemoryContext(spec.mission.slice(0, 300), { limit: 5 });
+      if (mem) { prompt = `${prompt}\n\n${mem}`; debug.log('agent-mission', 'memory', { injected: true, chars: mem.length }); }
+      else debug.log('agent-mission', 'memory', { injected: false });
+    }
+    if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
+    const headlessRun = (deps.runClaudeHeadless ?? runClaudeHeadless)({ cwd: wt.path, prompt, env: envLiteral(env), maxTurns: maxRounds, onSpawn: deps.onHeadlessStarted });
+    const result = await (deps.awaitMission ? deps.awaitMission(headlessRun) : headlessRun);
+    debug.log('agent-mission', 'headless-result', {
+      ok: result.ok, reason: result.reason, exitCode: result.exitCode,
+      sessionId: result.sessionId, numTurns: result.numTurns, toolEvents: result.toolEvents,
+      malformedLines: result.malformedLines, durationMs: result.durationMs,
+    });
+    if (!result.ok) return {
+      ok: false, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
+      evidencePath: null, committed: false, usedOmniCrawl: false,
+      detail: `Claude headless failed (${result.reason}; exit ${result.exitCode ?? 'unknown'}). Check the Claude CLI and retry.`,
+    };
+    if (deps.isMissionAborted?.()) return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
+      rounds: result.numTurns ?? 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
+    const finalEv = verifyEvidence(wt.path, spec.evidence);
+    if (!finalEv.ok) return {
+      ok: false, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
+      evidencePath: null, committed: false, usedOmniCrawl: false,
+      detail: `미완(증거 부족): ${finalEv.retry ?? '증거가 아직 부족하다.'}`,
+    };
+    if (checklist.length) {
+      const { verifyCoverage } = await import('../prompt-enhance/coverage.js');
+      const coverage = await verifyCoverage(gatherArtifactText(wt.path, finalEv.path), checklist, {});
+      debug.log('agent-mission', 'coverage', { covered: coverage.covered.length, missing: coverage.missing.length,
+        ratio: Number(coverage.ratio.toFixed(2)), method: coverage.method, coverageRetries: 0 });
+      if (coverage.missing.length) debug.log('agent-mission', 'coverage-exhausted', { missing: coverage.missing.length });
+    }
+    let committed = false;
+    if (!deps.isMissionAborted?.() && !spec.workdir && (spec.commit ?? true)) {
+      const c = (deps.commitWorktree ?? commitWorktree)(wt.path, `chore(agent-mission): ${spec.branch} — claude-in-elanous headless 산출`);
+      committed = c.ok;
+      debug.log('agent-mission', 'commit', { ok: c.ok, out: c.out.slice(0, 120) });
+      if (!c.ok) {
+        debug.log('agent-mission', 'result', { ok: false, rounds: result.numTurns ?? 0, evidencePath: finalEv.path, committed: false, usedOmni: false });
+        return { ok: false, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
+          evidencePath: finalEv.path, committed: false, usedOmniCrawl: false,
+          detail: `미완(자동 커밋 실패): ${c.out.slice(0, 120)}` };
+      }
+    }
+    debug.log('agent-mission', 'result', { ok: true, rounds: result.numTurns ?? 0, evidencePath: finalEv.path, committed, usedOmni: false });
+    return { ok: true, worktree: wt.path, branch: wt.branch, rounds: result.numTurns ?? 0,
+      evidencePath: finalEv.path, committed, usedOmniCrawl: false, detail: '완료(증거 충족)' };
+  }
+  env.TERM = 'xterm-256color';
+  // ⭐run-identity — runId was resolved before either headless or PTY spawn.
   debug.log('agent-mission', 'spawn', { agent: backend.name, cmd: `${spawnParams.cmd} ${spawnParams.args.join(' ')}`, scrubbed: backend.scrubEnv ?? [], nestedEnvRemovedCount: spawnParams.nestedEnvRemovedCount, runId });
   // PTY 정체성 — kind(=backend)·nickname(goto 로 나중 접근)·accessMode='auto'(헤드리스 자율·brain 이 write 소유).
   const ptyOpts = buildAgentMissionPtySpawnOptions({
     backend,
     spawn: { cmd: spawnParams.cmd, args: spawnParams.args, env, unsetEnv: spawnParams.unsetEnv },
     workdir: wt.path,
-    nickname: spec.nickname ?? spec.branch,
+    nickname: spec.nickname ?? spec.branch ?? backend.name,
   });
   const childStartedAt = Date.now();
   let liveDirty = false, liveChunks = 0;
@@ -999,8 +1561,12 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     }
   });
   let h: PtyHandle;
+  if (deps.isMissionAborted?.()) { offLive(); throw new Error('MISSION_ABORTED'); }
   try { h = spawnPty(ptyOpts); }
   catch (error) { offLive(); throw error; }
+  deps.onPtyStarted?.(h, () => { if (liveTimer) clearInterval(liveTimer); offLive(); });
+  if (deps.isMissionAborted?.()) return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
+    rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
   const executorRef = buildExecutorPtyRef({
     ptyId: h.id,
     backend: backend.name,
@@ -1022,6 +1588,7 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   // 초기 미션 전송 중 소유권을 잃으면 write 를 시도하지 않는다. 제어 루프에 들어간 뒤의
   // takeover 는 awaitOwnership 으로 기다리며, 사람이 release 하면 미션을 재개한다.
   const drive = (s: string): void => {
+    if (deps.isMissionAborted?.()) return;
     // ⭐공용 seam(P2b P-a′) — 판정은 `pty-control-stance` 한 곳. 집행(throw)은 종전 그대로다(무회귀).
     const stance = probeControlStance(h, 'agent', (e) =>
       debug.log('agent-mission', 'hascontrol-error', { id: h.id, error: (e as Error)?.message ?? String(e) }));
@@ -1064,11 +1631,30 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   const stopLive = (): void => { if (liveTimer) clearInterval(liveTimer); offLive(); };
 
   // ready + trust — backend 별 신뢰/권한 프롬프트 처리(codex=1, 이후 백엔드는 자체 handler).
-  await waitForQuiet(h, 1500, 20000);
-  let screen = await capture('ready');
-  if (backend.handleTrust?.(screen, (s) => drive(s))) {
-    debug.log('agent-mission', 'trust', { agent: backend.name, action: 'handled' });
-    await waitForQuiet(h, 1500, 15000); screen = await capture('trusted');
+  await (deps.awaitMission ? deps.awaitMission(waitForQuiet(h, 1500, 20000)) : waitForQuiet(h, 1500, 20000));
+  if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
+  let screen = await (deps.awaitMission ? deps.awaitMission(capture('ready')) : capture('ready'));
+  if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
+  // A trust menu can need more than one key (claude: ↓ to «Yes», then Enter) — answer until it is gone, at most 3 times.
+  //   🩸 09-29: one pass sent only ↓, the mission text went into the menu and its Enter confirmed «Yes» instead of
+  //   submitting the mission, which then sat unsent in the input box.
+  for (let pass = 0; pass < 3 && backend.handleTrust?.(screen, (s) => drive(s)); pass++) {
+    debug.log('agent-mission', 'trust', { agent: backend.name, action: 'handled', pass });
+    const trusted = (async () => { await waitForQuiet(h, 1500, 15000); return capture('trusted'); })();
+    screen = await (deps.awaitMission ? deps.awaitMission(trusted) : trusted);
+  }
+
+  if (spec.plugin) {
+    const plugin = await (deps.installPlugin ?? installPluginInsideAgent)(
+      { agent: backend.name as 'codex' | 'claude', ...spec.plugin }, h,
+      { ...(backend.handleTrust ? { handleTrust: backend.handleTrust } : {}), ...deps.pluginDeps, write: drive },
+    );
+    if (plugin.outcome !== 'installed') {
+      stopLive();
+      try { h.kill(); } catch { /* already exited */ }
+      return { ok: false, worktree: wt.path, branch: wt.branch, rounds: 0, evidencePath: null,
+        committed: false, usedOmniCrawl: false, detail: `플러그인 설치 ESCALATE (${plugin.reason}) — 미션은 전송하지 않았다` };
+    }
   }
 
   // ★ elanous 내부 인핸싱(opt-in) — 원문 verbatim 보존 + 커버리지 체크리스트 부착(anti-drift).
@@ -1097,6 +1683,8 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     else debug.log('agent-mission', 'memory', { injected: false });
   }
 
+  if (spec.plugin) missionText = `${missionText}\n\n설치된 ${spec.plugin.plugin} 플러그인에서 실제 스킬을 확인하고 ${spec.plugin.plugin}:<skill> 형식으로 해당 스킬을 사용하라.`;
+  if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
   // 미션 전송 — 인핸싱/기억으로 가공됐으면(멀티라인) 파일로 떨궈 read 지시(TUI 멀티라인 위험·verbatim 보존).
   //   원문 그대로면(단문) 타이핑.
   if (missionText !== spec.mission) {
@@ -1113,12 +1701,17 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   }
 
   let usedOmni = false;
+  let controllerSummary = deps.previousSummary ?? '';
+  let reviewSummary = '';
   let coverageRetries = enhanceActive && checklist.length ? 2 : 0;
   const search = createMissionSearch({ worktree: wt.path, omniPath });
   const brain = createMissionControlBrain({
     mission: spec.mission,
     backend,
-    evidenceReady: () => evidenceCheck(wt.path, spec.evidence).ok,
+    stream: deps.controlStream,
+    handoffEnabled: true,
+    onSummary: (summary) => { controllerSummary = summary; },
+    evidenceReady: () => spec.chain && spec.chain.length > 1 ? true : verifyEvidence(wt.path, spec.evidence).ok,
     search: async (query, step) => {
       usedOmni = true;
       await search(query, step);
@@ -1129,12 +1722,64 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     //   buildMissionProvision 팩토리로 배선(wt.path→cwd 를 DI 로 행동검증 가능·소스 tripwire 불요).
     provision: buildMissionProvision(wt.path),
   });
+  // A trust/permission prompt can appear after the first screen (09-29 S6: codex 0.157 showed «Folder access»
+  // 70 s after launch, after the one-shot check). Answer it at every step with the backend's own bytes
+  // before asking the LLM — otherwise the mission text is typed into the prompt and the run stalls.
+  const trustAwareBrain: RunSupervisor = {
+    decide: (obs, signal) => {
+      let answer: string | undefined;
+      if (backend.handleTrust?.(obs.screen, (bytes) => { answer = bytes; }) && answer !== undefined) {
+        debug.log('agent-mission', 'trust', { agent: backend.name, action: 'handled-in-loop', step: obs.step });
+        emitDecision({ kind: 'ROUTE', what: `${backend.name} 폴더 신뢰 화면 → 계속`, reason: '시작 뒤 늦게 뜬 신뢰 확인', purpose: '미션을 이어 간다', target: backend.name, phase: 'implement' });
+        return { action: 'input', text: answer };
+      }
+      return brain.decide(obs, signal);
+    },
+  };
+  let pendingHandoff: { to: 'codex' | 'claude'; mission: string; summary: string } | undefined;
+  let gatedHandoff = false;
+  let transitionFailure: string | undefined;
+  const handoffOps: HandoffOperations = {
+    start: async (to, mission) => { pendingHandoff = { to, mission, summary: controllerSummary }; },
+    claudeLoggedIn: () => (deps.checkClaudeSubscription ?? checkClaudeSubscription)({ env: resolveBackendSpawn(claudeBackend, process.env).env }).ok,
+    screen: () => h.renderScreen(),
+    alive: () => h.isAlive(),
+    login: async (worktree) => {
+      const loginSpawn = resolveBackendSpawn(claudeBackend, process.env);
+      const handle = spawnPty(buildAgentMissionPtySpawnOptions({
+        backend: claudeBackend,
+        spawn: { cmd: loginSpawn.cmd, args: ['login'], env: { ...loginSpawn.env, TERM: 'xterm-256color' }, unsetEnv: loginSpawn.unsetEnv },
+        workdir: worktree,
+        nickname: `${spec.branch}-login`,
+      }));
+      return { screen: () => handle.renderScreen(), alive: () => handle.isAlive(), close: () => handle.kill() };
+    },
+    sleep: async (ms) => { await sleep(ms); },
+    notify: async (card) => {
+      const { sendOutbound } = await import('../domains/outbound-alert.js');
+      if (!sendOutbound([card.text, card.url, card.code].filter(Boolean).join('\n'), 'agent-mission')) {
+        throw new Error('agent mission login card delivery failed');
+      }
+    },
+    gateAndPr: async (worktree) => {
+      if (spec.commit === false) throw new Error('elanous PR handoff requires commit authorization');
+      const ev = (deps.checkEvidence ?? evidenceCheck)(worktree, spec.evidence);
+      if (!ev.ok) throw new Error(`handoff evidence gate failed: ${ev.retry ?? 'missing evidence'}`);
+      const commit = (deps.commitWorktree ?? commitWorktree)(worktree, `chore(agent-mission): ${spec.branch} handoff`);
+      if (!commit.ok) throw new Error(`handoff commit failed: ${commit.out}`);
+      execFileSync('git', ['push', '-u', 'origin', `HEAD:${spec.branch}`], { cwd: worktree, encoding: 'utf8', timeout: 120_000 });
+      const { dispatchOpenPullRequest } = await import('../tool-runtime/git-pr-runtime.js');
+      dispatchOpenPullRequest({ title: `agent-mission: ${spec.branch}`, body: deps.originalMission ?? spec.mission, head: spec.branch, base: spec.base ?? 'main' }, { cwd: worktree });
+      gatedHandoff = true;
+    },
+    ...deps.handoffOperations,
+  };
   const verifyDone = createMissionVerifyDone({
     worktree: wt.path,
     evidence: spec.evidence,
     checklist,
     coverageRetries,
-    checkEvidence: evidenceCheck,
+    checkEvidence: verifyEvidence,
   });
   // ★ P3b-2 observe 어댑터(2026-07-25) — EMIT-side(makeMissionObserveStep)가 프레임 버스에 흘리는 executor
   //   화면을 **구조화 진행 다이제스트**(state+요약·throttle)로 압축해 observe 서피스(로그 패브릭)에 노출한다.
@@ -1145,26 +1790,97 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
   // ★ 동일 버스 인스턴스 보장(리뷰 should-fix) — observe 구독과 EMIT(makeMissionObserveStep)이 **같은** 버스를
   //   봐야 프레임이 흐른다. getChannelBus() 를 두 번 부르지 말고 지역 캐시로 구조적 보장.
   const bus = getChannelBus();
+  const observeStep = makeMissionObserveStep({
+    capture,
+    renderPng: () => h.renderScreenPng(),
+    bus,
+    ident: { ptyId: h.id, instance: resolveInstanceName(), runId },
+  });
   debug.log('agent-mission', 'takeover-wait', { id: h.id, maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS });
-  const control = await runWithControlObserve(
+  const controlRun = runWithControlObserve(
     bus, execSurfaceId(h.id),
     (d) => debug.log('agent-mission.observe', 'progress', { surfaceId: d.surfaceId, state: d.state, summary: d.summary, unknownInput: d.unknownInput, frame: d.frameCount, runId: d.runId }),
-    () => (deps.runControlLoop ?? runPtyControlLoop)(brain, {
-      ...controlDepsForHandle(h),
-      awaitOwnership: { maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS },
-      settle: async () => { await waitForQuiet(h, 6000, 360000); },
+    () => {
+      const handleDeps = controlDepsForHandle(h);
+      const pending = (deps.runControlLoop ?? runPtyControlLoop)(trustAwareBrain, {
+        ...handleDeps,
+        ...(backend.name === 'claude' ? { inject: submitSeparately(handleDeps.inject) } : {}),
+        ...(deps.isMissionAborted ? {
+          controlStance: () => deps.isMissionAborted!() ? 'unknown' as const : probeControlStance(h, 'agent', (e) =>
+            debug.log('agent-mission', 'hascontrol-error', { id: h.id, error: (e as Error)?.message ?? String(e) })),
+        } : {}),
+        awaitOwnership: { maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS },
+        settle: async () => {
+          const quiet = waitForQuiet(h, 6000, 360000);
+          await (deps.awaitMission ? deps.awaitMission(quiet) : quiet);
+        },
       // ★ U5 — 제어스텝 관측: 프레임 버스 발행(PTY 감독 계열 통일 합류·headless #5379 와 동일 seam) + 화면 전사.
       //   발행 먼저·내부 fail-soft(관측이 미션 안 깸)·capture 는 예외 전파(원 semantics). 배선=makeMissionObserveStep.
-      onStep: makeMissionObserveStep({
-        capture,
-        renderPng: () => h.renderScreenPng(),
-        bus,
-        ident: { ptyId: h.id, instance: resolveInstanceName(), runId },
-      }),
-      verifyDone,
-    }, { maxSteps: maxRounds }),
+      onStep: async (obs, decision) => {
+        await observeStep(obs, decision);
+        if (backend.name === 'claude') {
+          // Keep only review findings, not authentication screens or a raw PTY transcript.
+          const finding = obs.screen.match(/(?:review findings?|finding|issues?|지적|문제)\s*[:：]\s*([^\r\n]+)/i)?.[1]?.trim();
+          if (finding && !/login|log in|sign in|https?:\/\/|token|cookie|password|장치 코드|로그인/i.test(finding)) {
+            reviewSummary = `${reviewSummary}\n${finding}`.trim().slice(-3500);
+          }
+        }
+      },
+      verifyDone: spec.chain && spec.chain.length > 1 ? async () => ({ ok: true as const }) : verifyDone,
+      handoff: async (decision, obs) => {
+        try {
+          if (spec.chain && decision.to !== spec.chain[1]) throw new Error(`chain order violation: expected ${spec.chain[1] ?? 'completion'}, got ${decision.to}`);
+          if (await handoffMission(decision, wt.path, handoffOps, reviewSummary || controllerSummary) === 'gated') gatedHandoff = true;
+        } catch (error) {
+          transitionFailure = error instanceof Error ? error.message : String(error);
+          throw error;
+        }
+      },
+      askHuman: async (decision) => {
+        try {
+          await waitForHumanLogin(decision, handoffOps);
+        } catch (error) {
+          transitionFailure = error instanceof Error ? error.message : String(error);
+          throw error;
+        }
+      },
+      }, { maxSteps: maxRounds });
+      deps.onControlActive?.(pending);
+      return pending;
+    },
     { onSettled: (digestCount) => debug.log('agent-mission.observe', 'summary', { digestCount }), observeOpts: { expectRunId: runId } },
   );
+  deps.onControlPending?.(controlRun);
+  const control = await (deps.awaitMission ? deps.awaitMission(controlRun) : controlRun);
+  if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
+  if (control.termination.kind === 'success' && !control.handoff && spec.chain && spec.chain.length > 1) {
+    const to = spec.chain[1]!;
+    try {
+      if (await handoffMission({ action: 'handoff', to, mission: to === 'claude' ? 'Review changes and report findings; do not rewrite the original mission.' : to === 'codex' ? `Address the review findings and finish the original mission.\nOriginal mission:\n${deps.originalMission ?? spec.mission}` : deps.originalMission ?? spec.mission, carry: to === 'claude' ? 'diff' : 'summary' }, wt.path, handoffOps, reviewSummary || controllerSummary) === 'gated') gatedHandoff = true;
+    } catch (error) {
+      stopLive();
+      try { h.kill(); } catch { /* noop */ }
+      throw error;
+    }
+  }
+  const nextChain = spec.chain?.slice(1);
+  if (transitionFailure || (control.termination.kind !== 'success' && pendingHandoff)) {
+    stopLive();
+    try { h.kill(); } catch { /* noop */ }
+    throw new Error(transitionFailure ?? 'handoff was requested but the PTY control loop did not finish successfully');
+  }
+  if (pendingHandoff) {
+    stopLive();
+    try { h.kill(); } catch { /* noop */ }
+    const next = pendingHandoff;
+    return runAgentMission({ ...spec, plugin: undefined, agent: resolveBackend(next.to), mission: next.mission, chain: nextChain && nextChain.length > 1 ? nextChain : undefined, enhance: false, memory: false }, { ...deps, handoffWorktree: { path: wt.path, branch: wt.branch!, base: wt.base! }, originalMission: deps.originalMission ?? spec.mission, previousSummary: next.summary, initialTsc: baselineTsc, runtimeFallback: { ...runtimeFallback, fallbackEligible: false } });
+  }
+  // A gate/PR handoff only counts as success when the control loop itself did not end in error.
+  if (gatedHandoff && control.termination.kind !== 'error') {
+    stopLive();
+    try { h.kill(); } catch { /* noop */ }
+    return { ok: true, worktree: wt.path, branch: wt.branch, rounds: control.steps, evidencePath: wt.path, committed: true, usedOmniCrawl: usedOmni, detail: '완료(증거 게이트·PR)' };
+  }
   const done = control.termination.kind === 'success';
   const round = control.steps;
   if (control.termination.kind === 'error') {
@@ -1189,21 +1905,22 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
       descents: runtimeFallback.descents,
       maxFallbackDescents: runtimeFallback.maxDescents,
     });
-    if (nextBackend) {
+    if (nextBackend && !deps.isMissionAborted?.()) {
       const nextStep: FallbackStep = nextBackend.name === 'grok' ? 'grok' : 'codex-rotate';
       stopLive();
+      if (h.pid) await (deps.terminateProcessTree ?? terminateMissionProcessTree)(h.pid);
       try { h.kill(); } catch { /* noop */ }
-      return runAgentMission(
-        { ...spec, agent: nextBackend, reuseOwnedWorktree: true },
-        {
-          ...deps,
-          runtimeFallback: {
-            ...runtimeFallback,
-            attemptedSteps: new Set([...runtimeFallback.attemptedSteps, nextStep]),
-            descents: runtimeFallback.descents + 1,
-          },
+      const nextSpec = { ...spec, agent: nextBackend, reuseOwnedWorktree: true };
+      const nextDeps = {
+        ...deps,
+        runtimeFallback: {
+          ...runtimeFallback,
+          attemptedSteps: new Set([...runtimeFallback.attemptedSteps, nextStep]),
+          descents: runtimeFallback.descents + 1,
         },
-      );
+      };
+      // Keep the original signal owner and outside-write baseline across a replacement PTY.
+      return spec.signal || spec.workdir ? runAgentMissionBody(nextSpec, nextDeps, startedAt, initialFiles) : runAgentMission(nextSpec, nextDeps);
     }
   }
   debug.log('agent-mission', 'control-result', { termination: control.termination.kind, steps: control.steps });
@@ -1212,18 +1929,20 @@ export async function runAgentMission(spec: AgentMissionSpec, deps: AgentMission
     throw new Error('AGENT_YIELDED: PTY 제어가 사람에게 이양됨(takeover) — 자율 미션 중단');
   }
 
-  const finalEv = evidenceCheck(wt.path, spec.evidence);
+  if (deps.isMissionAborted?.()) return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
+    rounds: round, evidencePath: null, committed: false, usedOmniCrawl: usedOmni, detail: 'aborted' };
+  const finalEv = verifyEvidence(wt.path, spec.evidence);
   const evidencePath = finalEv.ok ? finalEv.path : null;
   let committed = false;
-  if (finalEv.ok && (spec.commit ?? true)) {
-    const c = commitWorktree(wt.path, `chore(agent-mission): ${spec.branch} — ${backend.name}-in-elanous PTY RFC 산출`);
+  if (!deps.isMissionAborted?.() && !spec.workdir && finalEv.ok && (spec.commit ?? true)) {
+    const c = (deps.commitWorktree ?? commitWorktree)(wt.path, `chore(agent-mission): ${spec.branch} — ${backend.name}-in-elanous PTY RFC 산출`);
     committed = c.ok;
     debug.log('agent-mission', 'commit', { ok: c.ok, out: c.out.slice(0, 120) });
   }
   debug.log('agent-mission', 'result', { ok: finalEv.ok, rounds: round, evidencePath, committed, usedOmni });
   stopLive();
+  if (h.pid) await terminateMissionProcessTree(h.pid);
   try { h.kill(); } catch { /* noop */ }
-  await sleep(400);
 
   return {
     ok: finalEv.ok, worktree: wt.path, branch: wt.branch, rounds: round,

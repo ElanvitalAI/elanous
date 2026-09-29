@@ -4,6 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { Database } from 'bun:sqlite';
+import { TaskStore } from '../task-orchestrator/store.js';
+import { createTask } from '../task-orchestrator/types.js';
+import { migrateJobToTrigger, registerScheduledToxTasks, scheduledRunViaById } from './schedule-migrate.js';
+import { debug } from '../debug/log.js';
 import {
   openSchedulesDb, parseCronLine, scriptName, inferCategory, unwrapCronCommand, wrapCronLine, wrapShellCronLine, unwrapCronLine, sharesCrontabLine,
   inventoryCrontab, inventoryInternalSchedules, listSchedules, driftedSchedules,
@@ -52,6 +56,39 @@ describe('openSchedulesDb schema initialization', () => {
       inventoryCrontab(d, { crontab: '0 8 * * * cd /r && bun scripts/file-backed.ts', now: '2026-09-04T08:05:00Z' });
       expect(listSchedules(d).map(({ name }) => name)).toEqual(['file-backed']);
       d.close();
+    });
+  });
+
+  test('legacy manually disabled trigger without provenance stays off after opening and inventory', () => {
+    withTempDb(path => {
+      const legacy = new Database(path);
+      legacy.run(`CREATE TABLE schedule_registry (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL, cron TEXT,
+        command TEXT, category TEXT NOT NULL, domain TEXT, enabled INT, last_seen TEXT,
+        managed_by TEXT, raw TEXT, run_via TEXT, last_via TEXT
+      )`);
+      legacy.run(`INSERT INTO schedule_registry (id, name, source, category, enabled, run_via, last_via)
+        VALUES ('old', 'old', 'crontab', 'maintenance', 0, 'trigger', 'trigger')`);
+      expect((legacy.query(`PRAGMA table_info(schedule_registry)`).all() as Array<{ name: string }>).some(c => c.name === 'disabled_reason')).toBe(false);
+      legacy.close();
+      const d = openSchedulesDb(path);
+      try {
+        expect(d.query(`SELECT disabled_reason FROM schedule_registry WHERE id = 'old'`).get()).toEqual({ disabled_reason: null });
+        inventoryCrontab(d, { crontab: '0 10 * * * echo keep' });
+        expect(d.query(`SELECT source, enabled FROM schedule_registry WHERE id = 'old'`).get()).toEqual({ source: 'crontab', enabled: 0 });
+        const store = new TaskStore({ path: ':memory:', noWal: true });
+        try {
+          store.saveTask(createTask({
+            title: 'old', surface: { kind: 'terminal-pane', spec: { command: 'echo old' } },
+            scheduleText: '0 8 * * *', schedulerJobId: 'old',
+          }, { id: 'task:old', now: 1 }));
+          const byId = scheduledRunViaById(listSchedules(d));
+          const registered: string[] = [];
+          const result = registerScheduledToxTasks(store, entry => registered.push(entry.definition.name), id => byId.get(id) ?? null);
+          expect(result).toMatchObject({ registered: 0, skippedNotTrigger: 1 });
+          expect(registered).toEqual([]);
+        } finally { store.close(); }
+      } finally { d.close(); }
     });
   });
 
@@ -180,12 +217,20 @@ describe('unwrapCronCommand + 래퍼 id 안정성 (RFC-scheduler-execution-obser
   test('scriptName — 래핑돼도 안쪽 target 명', () => {
     expect(scriptName('cd /r && bun scripts/cron-run.ts scripts/community-buzz-cycle.ts --collect-only')).toBe('community-buzz-cycle');
   });
-  test('wrapCronLine — bun .ts 잡만 감싸고 멱등·round-trip', () => {
+  test('wrapCronLine — bun .ts 잡만 감싸고 원래 id 전달·멱등·round-trip', () => {
     const plain = '*/10 8-20 * * 1-5 cd /r && /Users/j/.bun/bin/bun scripts/community-buzz-cycle.ts --collect-only >> /tmp/x.log 2>&1';
+    const before = parseCronLine(plain)!;
+    const id = cronEntryId(before.cron, before.command);
     const wrapped = wrapCronLine(plain);
-    expect(wrapped).toContain('bun scripts/cron-run.ts scripts/community-buzz-cycle.ts --collect-only');
+    expect(wrapped).toContain(`bun scripts/cron-run.ts --schedule-id ${id} scripts/community-buzz-cycle.ts --collect-only`);
     expect(wrapCronLine(wrapped)).toBe(wrapped);          // 멱등(이미 래핑)
     expect(unwrapCronLine(wrapped)).toBe(plain);          // round-trip
+    const after = parseCronLine(wrapped)!;
+    expect(unwrapCronCommand(after.command)).toBe(before.command);
+    expect(cronEntryId(after.cron, unwrapCronCommand(after.command))).toBe(id);
+    const other = wrapCronLine(plain.replace('*/10', '*/15'));
+    expect(other).toContain(`--schedule-id ${cronEntryId('*/15 8-20 * * 1-5', before.command)}`);
+    expect(other).not.toContain(`--schedule-id ${id}`);
   });
   test('wrapCronLine — .sh 잡·비대상은 그대로', () => {
     const sh = '50 4 * * * /r/scripts/collect-market-backbone.sh';
@@ -244,15 +289,15 @@ describe('explicit shell cron wrapping', () => {
   ] as const;
 
   test.each(lines)('preserves shell line, interpreter, id and execution history: %s', (plain, interpreter, name) => {
+    const before = parseCronLine(plain)!;
+    const id = cronEntryId(before.cron, before.command);
     const wrapped = wrapShellCronLine(plain, opts);
-    expect(wrapped).toContain(`${opts.bun} ${opts.cronRun} --shell ${interpreter} `);
+    expect(wrapped).toContain(`${opts.bun} ${opts.cronRun} --schedule-id ${id} --shell ${interpreter} `);
     expect(wrapShellCronLine(wrapped, opts)).toBe(wrapped);
     expect(unwrapCronLine(wrapped)).toBe(plain);
-    const before = parseCronLine(plain)!;
     const after = parseCronLine(wrapped)!;
     expect(unwrapCronCommand(after.command)).toBe(before.command);
-    expect(cronEntryId(after.cron, unwrapCronCommand(after.command)))
-      .toBe(cronEntryId(before.cron, unwrapCronCommand(before.command)));
+    expect(cronEntryId(after.cron, unwrapCronCommand(after.command))).toBe(id);
     const d = db();
     try {
       inventoryCrontab(d, { crontab: plain });
@@ -896,6 +941,127 @@ describe('지워진 crontab 줄 — enabled 를 내리는 경로', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe('trigger migration inventory reconciliation', () => {
+  const migrated = '0 8 * * * cd /r && bun scripts/migrate-watch.ts';
+  const unchanged = '0 9 * * * cd /r && bun scripts/ordinary.ts';
+
+  test('live migration keeps trigger enabled after its crontab line disappears; ordinary vanished row is disabled', () => {
+    const d = db();
+    const store = new TaskStore({ path: ':memory:' });
+    try {
+      inventoryCrontab(d, { crontab: `${migrated}\n${unchanged}` });
+      const id = listSchedules(d).find(r => r.name === 'migrate-watch')!.id;
+      const entries: unknown[] = [];
+      const result = migrateJobToTrigger({
+        scheduleDb: d, store, registerWorkflow: entry => { entries.push(entry); },
+        removeCrontabLine: raw => { expect(raw).toBe(migrated); },
+      }, id);
+      expect(result.registered).toBe(true);
+      expect(result.crontabRemoved).toBe(true);
+      expect(entries).toHaveLength(1);
+      expect(inventoryCrontab(d, { crontab: '0 10 * * * echo keep' }).vanished).toBe(1);
+      const migratedRow = listSchedules(d).find(r => r.id === id)!;
+      expect(migratedRow).toMatchObject({ source: 'trigger', enabled: 1, run_via: 'trigger' });
+      expect(scheduleHealth([migratedRow]).elanousTotal).toBe(1);
+      expect(listSchedules(d).find(r => r.name === 'ordinary')).toMatchObject({ source: 'crontab', enabled: 0 });
+    } finally { store.close(); d.close(); }
+  });
+
+  test('a remaining active crontab line cannot re-enable a disabled trigger without provenance', () => {
+    const d = db();
+    try {
+      inventoryCrontab(d, { crontab: `${migrated}\n${unchanged}` });
+      const id = listSchedules(d).find(r => r.name === 'migrate-watch')!.id;
+      d.run(`UPDATE schedule_registry SET run_via = 'trigger', enabled = 0, last_via = 'trigger' WHERE id = ?`, [id]);
+      inventoryCrontab(d, { crontab: `${migrated}\n${unchanged}` });
+      expect(listSchedules(d).find(r => r.id === id)).toMatchObject({ run_via: 'trigger', enabled: 0, disabled_reason: null });
+    } finally { d.close(); }
+  });
+
+  test('a commented former crontab line does not mark a live migrated trigger as disabled', () => {
+    const d = db();
+    const store = new TaskStore({ path: ':memory:' });
+    try {
+      inventoryCrontab(d, { crontab: `${migrated}\n${unchanged}` });
+      const id = listSchedules(d).find(r => r.name === 'migrate-watch')!.id;
+      migrateJobToTrigger({ scheduleDb: d, store, registerWorkflow: () => {} }, id);
+      inventoryCrontab(d, { crontab: `# ${migrated}\n${unchanged}` });
+      expect(listSchedules(d).find(r => r.id === id)).toMatchObject({ source: 'trigger', enabled: 1, run_via: 'trigger' });
+    } finally { store.close(); d.close(); }
+  });
+
+  test('legacy crontab-origin trigger that has not fired stays enabled when its line vanishes', () => {
+    const d = db();
+    try {
+      inventoryCrontab(d, { crontab: `${migrated}\n${unchanged}` });
+      const first = listSchedules(d).find(r => r.name === 'migrate-watch')!.id;
+      setRunVia(d, first, 'trigger');
+      const result = inventoryCrontab(d, { crontab: unchanged });
+      expect(result.vanished).toBe(0);
+      expect(listSchedules(d).find(r => r.id === first)).toMatchObject({ source: 'crontab', run_via: 'trigger', enabled: 1 });
+    } finally { d.close(); }
+  });
+
+  test('legacy crontab-origin trigger stays enabled when its old line is commented; ordinary commented row turns off', () => {
+    const d = db();
+    try {
+      inventoryCrontab(d, { crontab: `${migrated}\n${unchanged}` });
+      const id = listSchedules(d).find(r => r.name === 'migrate-watch')!.id;
+      setRunVia(d, id, 'trigger');
+      const result = inventoryCrontab(d, { crontab: `# ${migrated}\n# ${unchanged}` });
+      expect(result).toMatchObject({ disabled: 1, vanished: 0 });
+      expect(listSchedules(d).find(r => r.id === id)).toMatchObject({ source: 'crontab', run_via: 'trigger', enabled: 1, disabled_reason: null });
+      expect(listSchedules(d).find(r => r.name === 'ordinary')).toMatchObject({ source: 'crontab', run_via: 'crontab', enabled: 0 });
+    } finally { d.close(); }
+  });
+
+  test('unknown disable provenance cannot repair a previously fired trigger', () => {
+    const d = db();
+    try {
+      inventoryCrontab(d, { crontab: migrated });
+      const id = listSchedules(d)[0]!.id;
+      d.run(`UPDATE schedule_registry SET source = 'crontab', run_via = 'trigger', enabled = 0,
+        last_via = 'trigger', disabled_reason = NULL WHERE id = ?`, [id]);
+      inventoryCrontab(d, { crontab: '0 10 * * * echo keep' });
+      expect(listSchedules(d).find(row => row.id === id)).toMatchObject({
+        source: 'crontab', enabled: 0, run_via: 'trigger', last_via: 'trigger', disabled_reason: null,
+      });
+    } finally { d.close(); }
+  });
+
+  test('inventory-vanished fired triggers are repaired; manual and unproven disabled rows stay off', () => {
+    const d = db();
+    const originalLog = debug.log;
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const manual = '0 11 * * * cd /r && bun scripts/manual.ts';
+    debug.log = ((category: string, event: string, data?: unknown) => {
+      if (event === 'trigger-row-repaired') events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      inventoryCrontab(d, { crontab: `${migrated}\n${unchanged}\n${manual}` });
+      const first = listSchedules(d).find(r => r.name === 'migrate-watch')!.id;
+      const second = listSchedules(d).find(r => r.name === 'ordinary')!.id;
+      const third = listSchedules(d).find(r => r.name === 'manual')!.id;
+      inventoryCrontab(d, { crontab: `${unchanged}\n${manual}` });
+      expect(listSchedules(d).find(r => r.id === first)).toMatchObject({ enabled: 0, disabled_reason: 'vanished' });
+      d.run(`UPDATE schedule_registry SET run_via = 'trigger', last_via = 'trigger' WHERE id = ?`, [first]);
+      // A disabled row that has never fired through the trigger stays off.
+      d.run(`UPDATE schedule_registry SET run_via = 'trigger', enabled = 0, last_via = NULL WHERE id = ?`, [second]);
+      d.run(`UPDATE schedule_registry SET run_via = 'trigger', last_via = 'trigger', enabled = 0, disabled_reason = 'manual' WHERE id = ?`, [third]);
+      inventoryCrontab(d, { crontab: `${unchanged}\n# ${manual}` });
+      expect(listSchedules(d).find(r => r.id === third)).toMatchObject({ enabled: 0, disabled_reason: 'manual' });
+      d.run(`UPDATE schedule_registry SET enabled = 0, disabled_reason = NULL WHERE id = ?`, [second]);
+      inventoryCrontab(d, { crontab: '0 10 * * * echo keep' });
+      expect(listSchedules(d).find(r => r.id === first)).toMatchObject({ source: 'trigger', enabled: 1, disabled_reason: null, run_via: 'trigger' });
+      expect(listSchedules(d).find(r => r.id === second)).toMatchObject({ source: 'crontab', enabled: 0, disabled_reason: null });
+      expect(listSchedules(d).find(r => r.id === third)).toMatchObject({ source: 'crontab', enabled: 0, disabled_reason: 'manual' });
+      expect(events).toEqual([{ category: 'schedule.registry', event: 'trigger-row-repaired', data: { id: first } }]);
+      inventoryCrontab(d, { crontab: '0 10 * * * echo keep' });
+      expect(events).toHaveLength(1);
+    } finally { debug.log = originalLog; d.close(); }
   });
 });
 

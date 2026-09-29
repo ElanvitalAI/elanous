@@ -250,14 +250,17 @@ test('control serve follows the lease only when opted in', async () => {
     method: 'POST', headers: { Authorization: `Bearer ${ensureControlTokens(dir).member}`, 'content-type': 'application/json' },
     body: JSON.stringify({ id: 'i1', kind: 'instance', machine: 'mbp', name: 'demo', attrs: {}, ttlMs: 30000 }),
   });
+  // ⛔ process.emit('SIGTERM') 를 쓰지 않는다 — 같은 러너의 로그 저장소 처리기가 진짜 SIGTERM 을 자기에게 다시 보내 러너가 죽는다.
   const launchInProcess = async (followLease: boolean) => {
-    const active = runControlServe({ port: '0', followLease, bucket: followLease ? 'gs://example-bucket' : 'ignored-without-follow-lease', read, machine: 'mbp' });
+    const controller = new AbortController();
+    const active = runControlServe({ port: '0', followLease, bucket: followLease ? 'gs://example-bucket' : 'ignored-without-follow-lease', read, machine: 'mbp', signal: controller.signal });
+    const stop = async () => { controller.abort(); await active; };
     try {
       for (let n = 0; n < 100 && logs.length === 0; n++) await Bun.sleep(10);
       const line = logs.shift()!;
       expect(line).toContain('관제부 127.0.0.1:');
-      return { active, port: /관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!, line };
-    } catch (error) { process.emit('SIGTERM'); await active; throw error; }
+      return { active, stop, port: /관제부 127\.0\.0\.1:(\d+)/.exec(line)![1]!, line };
+    } catch (error) { await stop(); throw error; }
   };
   try {
     const followed = await launchInProcess(true);
@@ -277,7 +280,7 @@ test('control serve follows the lease only when opted in', async () => {
       expect(accepted.status).toBe(200);
       expect(accepted.headers.get('x-primary-generation')).toBe('8');
       expect((await accepted.json() as { name: string }).name).toBe('demo');
-    } finally { process.emit('SIGTERM'); await followed.active; }
+    } finally { await followed.stop(); }
     const legacy = await launchInProcess(false);
     try {
       expect(legacy.line).not.toContain('임대 따름');
@@ -286,7 +289,7 @@ test('control serve follows the lease only when opted in', async () => {
       expect(allowed.headers.get('x-primary-generation')).toBeNull();
       expect((await allowed.json() as { name: string }).name).toBe('demo');
       expect(readCount).toBe(2);
-    } finally { process.emit('SIGTERM'); await legacy.active; }
+    } finally { await legacy.stop(); }
   } finally {
     log.mockRestore();
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;

@@ -340,3 +340,12 @@ html, body {
     @apply font-sans;
   }
 }
+
+/* 폰에서 가상 키보드가 올라와 화면이 낮아지면 챗 도크(min-h 200)가 자리를 지키고 터미널 칸이 15px 로 접혀,
+   xterm 이 도크 «밑으로» 겹쳐 그려졌다(2026-09-28 · 390×464 실측). ⇒ 낮은 화면에서 «터미널에 입력 중»일 때만
+   도크를 비킨다. 도크 입력칸에 치는 중이면 그대로 둔다(포커스가 xterm 에 있을 때만 걸린다). */
+@media (max-height: 600px) {
+  body:has(.xterm-helper-textarea:focus) [data-terminal-chat-dock] {
+    display: none;
+  }
+}

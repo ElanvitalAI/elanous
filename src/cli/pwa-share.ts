@@ -32,9 +32,10 @@ import {
 } from '../nexus/config/user-config.js';
 import { resolveNexusPwa, type NexusPwaResolution } from './nexus-show.js';
 import { debug } from '../debug/log.js';
+import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 
 export type ShareTailnetValue = 'ask' | 'enabled' | 'disabled';
-type SharePortSource = 'default' | 'explicit' | 'nexus' | 'unknown';
+type SharePortSource = 'endpoint' | 'explicit' | 'nexus' | 'unknown';
 
 interface SharePortResolution {
   port?: number;
@@ -122,9 +123,7 @@ async function defaultReset(binary: string, port: number): Promise<{ exitCode: n
     }),
   });
   if (r.ok) return { exitCode: 0 };
-  // Best-effort exit-code recovery: serve-cmd-failed often means
-  // "nothing to unmount" which we surface as 0 (idempotent contract).
-  if (r.reason === 'serve-cmd-failed' || r.reason === 'no-state') return { exitCode: 0 };
+  // A failed command or unreadable state cannot confirm the mount is gone.
   return { exitCode: 1 };
 }
 
@@ -143,7 +142,7 @@ function defaultMountStatus(binary: string, port: number): Promise<TailscaleServ
   return inspectTailscaleServeMount({ binary, port, useSudo: true });
 }
 
-function resolveDeps(deps: PwaShareDeps): Required<PwaShareDeps> & { portExplicit: boolean } {
+function resolveDeps(deps: PwaShareDeps): Omit<Required<PwaShareDeps>, 'port'> & { port?: number; portExplicit: boolean } {
   return {
     readSwitch: deps.readSwitch ?? defaultReadSwitch,
     saveSwitch: deps.saveSwitch ?? defaultSaveSwitch,
@@ -153,10 +152,24 @@ function resolveDeps(deps: PwaShareDeps): Required<PwaShareDeps> & { portExplici
     nexusAliveFn: deps.nexusAliveFn ?? defaultNexusAlive,
     mountStatusFn: deps.mountStatusFn ?? defaultMountStatus,
     resolveNexusPwaFn: deps.resolveNexusPwaFn ?? resolveNexusPwa,
-    port: deps.port ?? 31415,
+    port: deps.port,
     portExplicit: deps.port !== undefined,
     out: deps.out ?? console,
   };
+}
+
+function resolveWritePort(r: ReturnType<typeof resolveDeps>): SharePortResolution {
+  if (r.portExplicit) return { port: r.port, source: 'explicit' };
+  try {
+    const endpoint = resolveDaemonEndpoint();
+    if (!endpoint) return { source: 'unknown', reason: 'daemon-absent' };
+    const port = Number(new URL(endpoint.baseUrl).port);
+    return Number.isInteger(port) && port >= 1 && port <= 65_535
+      ? { port, source: 'endpoint' }
+      : { source: 'unknown', reason: 'daemon-port-unknown' };
+  } catch {
+    return { source: 'unknown', reason: 'daemon-query-failed' };
+  }
 }
 
 function resolveStatusPort(r: ReturnType<typeof resolveDeps>): SharePortResolution {
@@ -216,26 +229,32 @@ export async function pwaShareEnable(deps: PwaShareDeps = {}): Promise<PwaShareR
     r.out.error('  Start Tailscale + retry.');
     return { exitCode: 1 };
   }
+  const portResolution = resolveWritePort(r);
+  const port = portResolution.port;
+  if (port === undefined) {
+    r.out.error('elanous nexus pwa share enable: 데몬 주소를 모른다 — `elanous nexus run` 먼저.');
+    return { exitCode: 1 };
+  }
+  debug.log('nexus.pwa-share', 'port-resolved', { port, source: r.portExplicit ? 'flag' : 'endpoint' });
   // Persist the user's intent to UserConfig BEFORE attempting serve.
   // The switch is the source of truth read by `pwa start` — saving it
   // first means a transient `tailscale serve` failure doesn't lose the
   // user's "I want share enabled" decision: the next `pwa start` (or
   // `pwa share enable` retry) auto-brings the forward up.
   r.saveSwitch('enabled');
-  const serveResult = await r.serveFn(probe.binary ?? 'tailscale', r.port);
+  const serveResult = await r.serveFn(probe.binary ?? 'tailscale', port);
   if (serveResult.exitCode !== 0) {
     r.out.error(`elanous nexus pwa share enable: tailscale serve failed (exit ${serveResult.exitCode}).`);
     r.out.error('  Switch saved (shareTailnet=enabled) — next `pwa start` will retry the forward.');
     return { exitCode: serveResult.exitCode };
   }
   const host = probe.magicDnsHost ?? probe.hostname ?? probe.ips?.[0] ?? '<host>';
-  r.out.log(`✓ tailnet share enabled. URL: https://${host}:${r.port}/app/`);
-  // Quick nexus health probe — if nothing is listening on r.port, the
-  // forward is registered but has no upstream yet. Tell the user how to
-  // bring nexus up so they don't think the share is broken.
-  const nexusUp = await r.nexusAliveFn(r.port);
+  r.out.log(`✓ tailnet share enabled. URL: https://${host}:${port}/app/`);
+  // Quick nexus health probe — if nothing is listening on this port, the
+  // forward is registered but has no upstream yet.
+  const nexusUp = await r.nexusAliveFn(port);
   if (!nexusUp) {
-    r.out.log(`⚠ nexus is not currently running on :${r.port} — \`elanous nexus run\` to bring it up.`);
+    r.out.log(`⚠ nexus is not currently running on :${port} — \`elanous nexus run\` to bring it up.`);
   }
   return {
     exitCode: 0,
@@ -243,7 +262,7 @@ export async function pwaShareEnable(deps: PwaShareDeps = {}): Promise<PwaShareR
       switchValue: 'enabled',
       mountStatus: 'mounted',
       probe,
-      portResolution: { port: r.port, source: r.portExplicit ? 'explicit' : 'default' },
+      portResolution,
     }),
   };
 }
@@ -251,23 +270,47 @@ export async function pwaShareEnable(deps: PwaShareDeps = {}): Promise<PwaShareR
 export async function pwaShareDisable(deps: PwaShareDeps = {}): Promise<PwaShareResult> {
   const r = resolveDeps(deps);
   const probe = await r.probeFn();
+  const portResolution = resolveWritePort(r);
+  const port = portResolution.port;
+  if (port === undefined) {
+    r.saveSwitch('disabled');
+    r.out.error('elanous nexus pwa share disable: switch disabled, but 데몬 주소를 모른다 — Tailscale unmount is unconfirmed; existing share may still be active. `elanous nexus run` 먼저.');
+    return {
+      exitCode: 1,
+      report: buildReport({
+        switchValue: 'disabled',
+        mountStatus: 'unknown',
+        probe,
+        portResolution,
+      }),
+    };
+  }
+  let mountStatus: TailscaleServeMountStatus = 'unknown';
   if (probe.installed && probe.alive) {
-    const resetResult = await r.resetFn(probe.binary ?? 'tailscale', r.port);
+    debug.log('nexus.pwa-share', 'port-resolved', { port, source: r.portExplicit ? 'flag' : 'endpoint' });
+    const resetResult = await r.resetFn(probe.binary ?? 'tailscale', port);
     if (resetResult.exitCode !== 0) {
-      // unmount is idempotent — non-zero usually means "nothing to
-      // unmount on this port", which is a non-fatal warning.
-      r.out.error(`(warn) tailscale serve unmount exit ${resetResult.exitCode} — assuming port :${r.port} already off.`);
+      r.out.error(`(warn) tailscale serve unmount exit ${resetResult.exitCode} — port :${port} may still be shared.`);
+      // 해제 명령이 실패해도 «원래 안 걸려 있었을» 수 있다 — 실제 마운트를 다시 재서 가른다.
+      try { mountStatus = await r.mountStatusFn(probe.binary ?? 'tailscale', port); } catch { mountStatus = 'unknown'; }
+    } else {
+      mountStatus = 'unmounted';
     }
+  } else if (!probe.installed) {
+    // Tailscale 이 없으면 tailnet 공유는 존재할 수 없다.
+    mountStatus = 'unmounted';
   }
   r.saveSwitch('disabled');
-  r.out.log('✓ local-only. Re-enable: `elanous nexus pwa share enable`.');
+  if (mountStatus === 'unmounted') r.out.log('✓ local-only. Re-enable: `elanous nexus pwa share enable`.');
+  else r.out.error('elanous nexus pwa share disable: switch disabled, but Tailscale unmount is unconfirmed; existing share may still be active.');
   return {
-    exitCode: 0,
+    // 해제를 «확인했을 때만» 성공 — 미확인 해제를 0 으로 알리지 않는다(리뷰 R3).
+    exitCode: mountStatus === 'unmounted' ? 0 : 1,
     report: buildReport({
       switchValue: 'disabled',
-      mountStatus: 'unmounted',
+      mountStatus,
       probe,
-      portResolution: { port: r.port, source: r.portExplicit ? 'explicit' : 'default' },
+      portResolution,
     }),
   };
 }

@@ -212,6 +212,7 @@ export function registerProviderCommands(program: Command): void {
 
   // ⛔⭐⭐⭐⭐ **한 화면** — 이 축의 진단 시간 대부분이 「어느 우주에서 무엇을 보고 있나」를
   //   손으로 맞추는 데 갔다(2026-08-07). 그 셋(우주·신호 나이·회전 dry-run)이 여기 같이 뜬다.
+  // 릴리스 노트: `elanous provider codex status` 가 한도 정책과 계정별 크레딧 잔액을 보여 준다 — 회전이 왜 그 계정으로 갔는지 화면에서 읽힌다.
   // ⛔ READ-ONLY 이고 «네트워크를 안 친다» — 디스크 신호만 읽는다. 사용량을 «새로 재려면»
   //   `provider codex usage --account <이름>` 를 따로 부른다(그건 자식을 띄운다).
   codexCmd
@@ -220,6 +221,7 @@ export function registerProviderCommands(program: Command): void {
     .option('--json', 'JSON 으로 출력')
     .action(async (opts: { json?: boolean }) => {
       const { inspectCodexRotation } = await import('../oauth/codex-account-store.js');
+      const { CODEX_QUOTA_POLICY_LABEL } = await import('../oauth/codex-quota-policy.js');
       const { authStorePath } = await import('../oauth/store.js');
       // ⛔⭐⭐⭐ 우주는 «정식 resolver»로 잡는다(리뷰 must-fix) — env 로 재구성하면 `--test`·
       //   `--test-state-dir`(setTestStateRoot 경유) 격리를 «놓친다». 표면이 런타임과 다른 자를
@@ -251,8 +253,11 @@ export function registerProviderCommands(program: Command): void {
         if (m === null) return '⛔ 없음 (신호 파일이 아예 없다 ⇒ 판정은 「모른다」)';
         return freshOf(home) ? `${m}분 전` : `⛔ ${m}분 전 — «만료»(⇒ 판정은 「모른다」 ⇒ 회전 안 섬)`;
       };
+      const creditText = (balance: number | undefined, hasCredits: boolean | undefined): string =>
+        hasCredits === false ? '없음' : balance === undefined ? '?' : String(Math.round(balance));
       if (opts.json) {
         await writeStdoutJson(JSON.stringify({
+          policy: { value: s.policy.policy, source: s.policy.source },
           universe: {
             instanceRoot, signalDir, authStore: authStorePath(),
             // ⭐ JSON 에도 싣는다 — 화면만 알면 스크립트가 못 센다
@@ -264,12 +269,14 @@ export function registerProviderCommands(program: Command): void {
           current: {
             name: s.current.name, source: s.current.source, home: s.currentHome ?? null,
             reached: s.currentReached ?? null, usedPercent: s.currentUsedPercent ?? null,
+            creditBalance: s.currentCreditBalance ?? null, hasCredits: s.currentHasCredits ?? null,
             signalObservedAt: s.currentObservedAt ?? null, signalAgeMinutes: ageMinOf(s.currentHome),
             // ⭐ 나이와 «유효성»은 다른 값이다 — 만료돼도 나이는 낸다
             signalFresh: freshOf(s.currentHome),
           },
           candidates: shownCandidates.map((c) => ({
             name: c.name, home: c.home, reached: c.reached ?? null, usedPercent: c.usedPercent ?? null,
+            creditBalance: c.creditBalance ?? null, hasCredits: c.hasCredits ?? null,
             signalObservedAt: s.observedAtByHome[c.home] ?? null, signalAgeMinutes: ageMinOf(c.home),
             signalFresh: freshOf(c.home),
           })),
@@ -293,12 +300,15 @@ export function registerProviderCommands(program: Command): void {
       }
       console.log(`          auth      : ${authStorePath()}  ⚠️ 자격은 «격리되지 않는다»(의도된 결정)`);
       console.log(`회전      ${s.reason}${s.to ? ` → ${s.to}` : ''}   (enabled=${s.enabled} · explicit=${s.explicit} · 임계=${s.thresholdPercent}%)`);
+      const policySource = s.policy.source === 'legacy-credits' ? ' · 옛 codexCreditsAllowed 에서'
+        : s.policy.source === 'default' ? ' · 기본값' : '';
+      console.log(`정책      ${s.policy.policy} (${CODEX_QUOTA_POLICY_LABEL[s.policy.policy]} · llm.codexQuotaPolicy)${policySource}`);
       console.log(`지금 계정 ${s.current.name}  (source=${s.current.source})`);
-      console.log(`          홈=${s.currentHome ?? '(모름)'}  사용=${s.currentUsedPercent ?? '?'}%  찼나=${s.currentReached ?? '모름'}  신호=${ageOf(s.currentHome)}`);
+      console.log(`          홈=${s.currentHome ?? '(모름)'}  사용=${s.currentUsedPercent ?? '?'}%  찼나=${s.currentReached ?? '모름'}  신호=${ageOf(s.currentHome)}  크레딧=${creditText(s.currentCreditBalance, s.currentHasCredits)}`);
       console.log('후보');
       if (shownCandidates.length === 0) console.log('  (없음 — 홈을 아는 «다른» 계정이 없다 ⇒ 찼을 때 갈 곳이 없다)');
       for (const c of shownCandidates) {
-        console.log(`  ${c.name.padEnd(10)} 사용=${String(c.usedPercent ?? '?').padStart(3)}%  찼나=${String(c.reached ?? '모름').padEnd(5)}  신호=${ageOf(c.home)}`);
+        console.log(`  ${c.name.padEnd(10)} 사용=${String(c.usedPercent ?? '?').padStart(3)}%  찼나=${String(c.reached ?? '모름').padEnd(5)}  신호=${ageOf(c.home)}  크레딧=${creditText(c.creditBalance, c.hasCredits)}`);
       }
       if (s.reason === 'not-reached') {
         // ⛔⭐ 「신선하다」와 「쓸 값이 있다」는 다른 말이다(리뷰 must-fix) — 신호가 신선해도

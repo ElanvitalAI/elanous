@@ -224,6 +224,7 @@ const DEFAULT_ERROR_BACKOFF = 5000;
 const DEFAULT_PER_CHAT_GAP_MS = 900;
 const DEFAULT_GLOBAL_MAX_PER_SEC = 28;
 const DEFAULT_STREAM_EDIT_GAP_MS = 1100;
+const EMPTY_ALLOWLIST_NOTICE_GAP_MS = 10 * 60 * 1000;
 // A turn slower than this delivers its result as FRESH messages (which
 // push-notify) instead of a silent placeholder edit — so a long /cc job
 // or HITL-approved task the user walked away from actually pings them.
@@ -284,6 +285,7 @@ export class TelegramBot {
    *  means no recent send. Telegram's documented limit is 1 msg/sec
    *  per chat — we enforce 900ms to leave jitter slack. */
   private readonly chatLastSentAt = new Map<number, number>();
+  private readonly emptyAllowlistNoticeAt = new Map<number, number>();
   /** T2-P6 — callback_query subscribers. When any is registered the
    *  getUpdates poller also asks for callback_query updates so
    *  inline-keyboard taps reach a handler. */
@@ -343,6 +345,33 @@ export class TelegramBot {
       // the tap is set once at construction and never reassigned.
       (this as unknown as { onTriggerTap: TelegramBotOpts['onTriggerTap'] }).onTriggerTap = opts.onTriggerTap;
     }
+  }
+
+  private isOwnerAllowed(userId: number): boolean {
+    return this.allowedUsers.size > 0 && this.allowedUsers.has(userId);
+  }
+
+  private async refuseMessage(ctx: TgIncoming): Promise<void> {
+    const empty = this.allowedUsers.size === 0;
+    debug.log('telegram.owner-gate', 'refused', {
+      kind: 'message', reason: empty ? 'empty-allowlist' : 'not-allowed', userId: ctx.userId,
+    });
+    if (!empty) this.log(`telegram: refusing unknown user ${ctx.userId}`);
+    if (empty) {
+      const now = this.nowImpl();
+      const previous = this.emptyAllowlistNoticeAt.get(ctx.chatId);
+      if (previous !== undefined && now - previous < EMPTY_ALLOWLIST_NOTICE_GAP_MS) return;
+      this.emptyAllowlistNoticeAt.set(ctx.chatId, now);
+    }
+    try {
+      await this.sendMessage(
+        ctx.chatId,
+        empty
+          ? `이 봇은 아직 소유자가 정해지지 않았습니다. 당신의 사용자 ID 는 ${ctx.userId} 입니다 — 기계에서 \`elanous config set telegram.allowedUsers '[${ctx.userId}]'\` 로 등록하면 쓸 수 있습니다.`
+          : 'This bot is private. Your user ID is not on the allowlist.',
+        { replyTo: ctx.messageId, threadId: ctx.threadId },
+      );
+    } catch { /* swallow — refusal must not enter the turn */ }
   }
 
   private apiUrl(method: string): string {
@@ -923,7 +952,7 @@ export class TelegramBot {
    *  slash command resolves the capture with `null` (cancel). */
   private tryConsumeTextCapture(ctx: TgIncoming): boolean {
     if (!ctx.text || ctx.attachments.length > 0) return false;
-    if (this.allowedUsers.size > 0 && !this.allowedUsers.has(ctx.userId)) return false;
+    if (!this.isOwnerAllowed(ctx.userId)) return false;
     const key = `${ctx.chatId}:${ctx.threadId ?? ''}`;
     const capture = this.pendingTextCaptures.get(key);
     if (!capture) return false;
@@ -1038,6 +1067,7 @@ export class TelegramBot {
   async start(): Promise<void> {
     this.running = true;
     this.log(`telegram bot starting (allowlist size ${this.allowedUsers.size})`);
+    if (this.allowedUsers.size === 0) this.log('telegram.owner-gate empty-allowlist');
 
     // Publish the slash-command menu to Telegram. Clients pick up the
     // update automatically next time they open the chat — no user-side
@@ -1095,6 +1125,13 @@ export class TelegramBot {
           // parser.
           if (u.callback_query) {
             const cq = u.callback_query;
+            if (!this.isOwnerAllowed(cq.from.id)) {
+              debug.log('telegram.owner-gate', 'refused', {
+                kind: 'callback', reason: this.allowedUsers.size === 0 ? 'empty-allowlist' : 'not-allowed', userId: cq.from.id,
+              });
+              await this.answerCallbackQuery(cq.id, { text: '권한이 없습니다' });
+              continue;
+            }
             const payload: TgCallbackQuery = {
               id: cq.id,
               userId: cq.from.id,
@@ -1114,6 +1151,13 @@ export class TelegramBot {
           // (UX 에이전트 NORMALIZE). No `message`/`text`, so handle before the parser.
           if (u.message_reaction) {
             const mr = u.message_reaction;
+            // 리액션도 미션 카드 흐름을 앞으로 민다(ux-reaction-router) — 소유자 것만 받는다. 익명(user 없음)은 거절.
+            if (!mr.user || !this.isOwnerAllowed(mr.user.id)) {
+              debug.log('telegram.owner-gate', 'refused', {
+                kind: 'reaction', reason: this.allowedUsers.size === 0 ? 'empty-allowlist' : mr.user ? 'not-allowed' : 'anonymous', userId: mr.user?.id,
+              });
+              continue;
+            }
             const payload: TgMessageReaction = {
               chatId: mr.chat.id,
               messageId: mr.message_id,
@@ -1133,6 +1177,10 @@ export class TelegramBot {
           // scoped per channel — a private chat's chatId is the same user
           // id across every bot, so without this two bots' DMs merge.
           incoming.botId = this.botId;
+          if (!this.isOwnerAllowed(incoming.userId)) {
+            await this.refuseMessage(incoming);
+            continue;
+          }
           // HITL "Other" free-text: consume inline (before the turn
           // chain) so it isn't queued behind the turn awaiting it.
           if (this.tryConsumeTextCapture(incoming)) continue;
@@ -1300,6 +1348,10 @@ export class TelegramBot {
   }
 
   private async handleIncoming(ctx: TgIncoming): Promise<void> {
+    if (!this.isOwnerAllowed(ctx.userId)) {
+      await this.refuseMessage(ctx);
+      return;
+    }
     // Cascade-zyu U2 — capture utterance intent at update ingress.
     try {
       const { userIntentLogger } = await import('./user-intent/index.js');
@@ -1314,18 +1366,6 @@ export class TelegramBot {
       });
     } catch { /* logging must never break the chat path */ }
 
-    if (this.allowedUsers.size > 0 && !this.allowedUsers.has(ctx.userId)) {
-      this.log(`telegram: refusing unknown user ${ctx.userId}`);
-      try {
-        await this.sendMessage(
-          ctx.chatId,
-          'This bot is private. Your user ID is not on the allowlist.',
-          { replyTo: ctx.messageId, threadId: ctx.threadId },
-        );
-      } catch { /* swallow — we already logged */ }
-      return;
-    }
-
     // ★ 미션 언급 추적(맥락-인지 revise·대표 2026-07-14) — 이 메시지가 apm_id 를 언급하면 이 방의
     //   "최근 논의 미션"으로 기록. 이후 id 없는 "개정해줘"가 이 미션을 recency 보다 우선 채택하도록.
     if (ctx.text && ctx.text.includes('apm_')) {
@@ -1333,6 +1373,19 @@ export class TelegramBot {
         const { recordChatMissionMentionsFromText } = await import('./autopilot/mission-chat-context.js');
         recordChatMissionMentionsFromText(ctx.chatId, ctx.text);
       } catch { /* fail-soft */ }
+    }
+
+    // Explicit directive ingress precedes mission/HITL text interceptors.
+    if (ctx.text.startsWith('지시:') || ctx.text.startsWith('/directive ')) {
+      try {
+        const { addDirective } = await import('./steward/directive.js');
+        const text = ctx.text.startsWith('지시:') ? ctx.text.slice('지시:'.length) : ctx.text.slice('/directive '.length);
+        const result = await addDirective(text, { source: 'telegram' });
+        await this.sendMessage(ctx.chatId, `${result.issue}: ${result.status}`, { replyTo: ctx.messageId, threadId: ctx.threadId });
+      } catch {
+        await this.sendMessage(ctx.chatId, '지시 등록 실패 — Linear 연결과 자격을 확인하세요.', { replyTo: ctx.messageId, threadId: ctx.threadId });
+      }
+      return;
     }
 
     // ★ 미션 정정 답장 가로채기(force_reply·대표 2026-07-12) — reply_to 가 정정요청이면

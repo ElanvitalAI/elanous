@@ -22,11 +22,7 @@ export type { PlaceholderReason } from './placeholder-pane.js';
 export { TerminalPane } from './terminal-pane.js';
 export { WidgetPane } from './widget-pane.js';
 
-// W1 — factory + content adapter
-export {
-  PaneContentAdapter,
-  inferKindFromContent,
-} from './content-adapter.js';
+// W1 — factory
 export {
   PaneFactory,
   getDefaultPaneFactory,

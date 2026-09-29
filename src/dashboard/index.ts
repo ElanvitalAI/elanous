@@ -488,11 +488,9 @@ import {
 } from '../primitives/damage-region/index.js';
 import {
   createArtifactStore,
-  createLegacyLayoutProvider,
   createLegacyTimelineProvider,
 } from '../artifact/index.js';
 import { defaultTimelineBaseDir } from '../tool-runtime/recording-runtimes-paths.js';
-import { layoutsDir } from '../virtual-windows/layout/persistence.js';
 import { createVisualStateStore } from '../panes/visual-state.js';
 import { composeIdentityHooks } from '../display/modal-identity-wiring.js';
 import { composeWorkspaceHostHooks } from '../display/workspace-host-wiring.js';
@@ -971,7 +969,6 @@ import { createDashboardContextMenuFeedbackRuntime } from './context-menu-feedba
 import { createDashboardStatusFeedbackRuntime } from './status-feedback-runtime.js';
 import { createDashboardTransferFeedbackRuntime } from './transfer-feedback-runtime.js';
 import { createDashboardFinderFeedbackRuntime } from './finder-feedback-runtime.js';
-import { createDashboardBenchSlashRuntime } from './bench-slash-runtime.js';
 import { createDashboardTermSlashRuntime } from './term-slash-runtime.js';
 import { createDashboardShellSlashRuntime } from './shell-slash-runtime.js';
 import { createDashboardRunSkillSlashRuntime } from './run-skill-slash-runtime.js';
@@ -1049,7 +1046,6 @@ import {
 import { createDashboardTerminalPopupRuntime } from './terminal-popup-runtime.js';
 import { toggleDashboardAssistantRenderState } from './assistant-render-state-runtime.js';
 import { bootDashboardAcpBgSweep } from './acp-bg-sweep-boot.js';
-import { bootDashboardAgentSpawnTools } from './agent-spawn-tools-boot.js';
 import { bootDashboardConfigTools } from './config-tools-boot.js';
 import { bootDashboardConversationPopupRuntime } from './conversation-popup-boot.js';
 import { bootDashboardTerminalRuntime } from './terminal-runtime-boot.js';
@@ -1114,9 +1110,6 @@ import {
 import {
   type DashboardPaneTitleMenuPayload,
 } from '../dashboard-pane-context-menu.js';
-import {
-  type VirtualWindowTitleMenuPayload,
-} from '../virtual-window-context-menu.js';
 // writeClipboard imported below with other clipboard helpers (line ~185).
 import {
   renderPaneNav, paneAtColumn, paneNavLabel,
@@ -1189,24 +1182,10 @@ import {
   TerminalRegistry,
   BroadcastBus,
   PreviewSlotAdapter,
-  VwPlacementAdapter,
   getChannelBus,
   type TerminalPlacement,
 } from '../terminal-matrix/index.js';
-import {
-  resolveTerminalMoveDestination,
-  resolveVwTerminalInstanceForPane,
-} from '../terminal-matrix/mobility.js';
-import {
-  createVwExitPaneCloser,
-  installVwLifecycleHandlers,
-} from './windowing/lifecycle.js';
-import { createPaneContent } from '../virtual-windows/pane-content.js';
-import type { PaneId } from '../virtual-windows/addressing.js';
-import {
-  initDashboardVirtualWindows,
-  type DashboardVirtualWindows,
-} from './windowing/virtual-windows.js';
+import { resolveTerminalMoveDestination } from '../terminal-matrix/mobility.js';
 import { initElementObservability } from '../element-registry/index.js';
 import {
   armSessionQuickControl,
@@ -1231,8 +1210,6 @@ import {
 import {
   initDashboardApprovers,
   createInjectApprover,
-  createPaneInjectApprover,
-  createBroadcastApprover,
   createConfigSetApprover,
   createAcpPermissionApprover,
   openGenericApproval,
@@ -1256,7 +1233,6 @@ import { createDashboardCompactSurfaceAssembly } from './compact-surface-assembl
 import { openCompactSurfaceCatalogPopup } from './compact-surface-popup.js';
 import { approvalModalRouter, type ApprovalModalRouter } from '../approval-modal.js';
 import { routeApprovalModalKey } from './input/approval-key-router.js';
-import { createWindowPickerModal } from '../window-picker-modal.js';
 
 export function routeStreamingApprovalModalKey(
   key: Parameters<typeof routeApprovalModalKey>[0],
@@ -1273,12 +1249,8 @@ export function routeStreamingApprovalModalKey(
 import {
   attachSurfaceToWorkspace,
   DASHBOARD_MAIN_WORKSPACE_ID,
-  workspaceOwnerIdForVirtualWindow,
 } from '../display/workspace-affinity.js';
-import { spawnLLMBenchmark, MAX_BENCHMARK_PANES } from '../virtual-windows/benchmark-preset.js';
-import { PROVIDERS as LLM_PROVIDERS } from '../llm.js';
 import { initDashboardHitl, stopDashboardHitl } from './runtime/hitl.js';
-import { createIulSidebarShellPaneContent } from '../iul/sidebar-shell.js';
 import { openDashboardShellRollupPopup } from './shell-rollup-popup.js';
 import { expandPromptReferences } from '../prompt/references.js';
 import { spawnCodingAgent, CodingAgentBinaryMissing } from '../terminal/coding-agent.js';
@@ -1374,11 +1346,9 @@ import { initWidgetInspectorTools } from '../skills/tools/widget-inspector.js';
 import {
   initDashboardViewTools,
 } from '../skills/tools/dashboard-view.js';
-import { initSpawnCodingAgentInVW } from '../skills/tools/spawn-coding-agent-vw.js';
 import {
   findLiveSessionById,
   findLiveSessionByPaneId,
-  initSpawnEmbodiedAgentInVW,
   listLiveEmbodiedSessions,
 } from '../agent/spawn-embodied-agent-in-vw.js';
 import { findSessionObserver } from '../agent/observer-registry.js';
@@ -1470,9 +1440,8 @@ import {
   resolveBrowserActionContextFromHit,
 } from '../browser-pane/actions.js';
 import { resolveBrowserTransferCapability } from '../browser-pane/capabilities.js';
-import { createBrowserPaneContent, openBrowserPaneModal } from '../browser-pane/mount.js';
+import { openBrowserPaneModal } from '../browser-pane/mount.js';
 import { openPreviewPaneModal } from '../preview-pane/mount.js';
-import { createPreviewPaneContent } from '../preview-pane/mount.js';
 import {
   cyclePreviewSourceForView,
   formatPreviewSourceLabel,
@@ -1602,29 +1571,11 @@ import {
   TERMINAL_BACKGROUND_STATES,
   withBgApprovalSignals,
 } from '../acp/background-manager.js';
-import { dispatchAcpSessionJoin, dispatchAcpSessionResume } from '../skills/tools/acp-session.js';
-// PLAN-tui-redundancy-cleanup T1 (2026-05-16) — ACP resident window
-// 자산은 사용자 미사용 명시로 trim. `acp-shell` pane kind 자체는
-// resident-shell.ts (ACP Browser · ACP History) 가 의존하므로 보존 ·
-// vw-join-bridge / vw-live-bridge / resident-vw 의 boot init + resident
-// auto-mount 만 제거.
-import { createAcpResidentShellPaneContent } from '../acp/resident-shell.js';
-import { createSimShellPaneContent } from './sim-shell.js';
+import { dispatchAcpSessionJoin } from '../skills/tools/acp-session.js';
 import {
   listDashboardSimulationScenarios,
   runDashboardSimulationScenario,
 } from './sim-shell-runtime.js';
-import {
-  bootSimResidentWindow,
-  focusOrSpawnSimResidentWindow,
-  isSimResidentEnabled,
-} from '../sim/resident-vw.js';
-import {
-  bootIulResidentWindow,
-  focusOrSpawnIulResidentWindow,
-  isIulForegroundStartupEnabled,
-  isIulResidentEnabled,
-} from '../iul/resident-vw.js';
 import { preservesHostChromeInput } from '../display/host-chrome-profile.js';
 // H3 #6 follow-up #1 — auto-persist on turn-end. Subscribes DRM +
 // BG managers to the H2 #5 persistence primitive so
@@ -2164,7 +2115,6 @@ export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<Da
       forceQuit: true,
     });
   });
-  let virtualWindows!: DashboardVirtualWindows;
   // E3 (§7.4 TS baseline reduction · 2026-05-17) — forward declarations
   // for handler functions that get assigned later via destructure from
   // createDashboardCopyRuntime / createDashboardMediaRuntime (lines
@@ -3855,25 +3805,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           }
         : {};
       const liveShells = listPty().filter(h => h.isAlive()).length;
-      // VW-U1 — foreground VW summary for the 🪟 pill. vwSegment hides
-      // itself when there's only one single-pane window (nothing worth
-      // showing). When there's no foreground at all we pass null.
-      let vwSummary: Parameters<typeof mouseWiring.buildStatusLine>[0]['vw'] = null;
-      try {
-        const current = virtualWindows.registry.current();
-        const list = virtualWindows.registry.list();
-        if (current) {
-          const panes = current.listPanes();
-          const focusedIdx = panes.findIndex(p => p.id === current.focused);
-          vwSummary = {
-            windowId: current.id,
-            paneIdx: focusedIdx >= 0 ? focusedIdx + 1 : 1,
-            paneTotal: panes.length,
-            windowTotal: list.length,
-            zoomed: current.isZoomed(),
-          };
-        }
-      } catch { /* vw not yet initialised */ }
       pruneConversationPopupHost();
       const conversationSnapshot = conversationPopupHost.snapshot();
       const metrics = getSessionMetrics();
@@ -3890,7 +3821,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         controller: process.env.ELANOUS_CONTROLLER?.trim() || undefined,
         shellCount: liveShells,
         shellRollup: latestShellRollup ?? undefined,
-        vw: vwSummary,
+        vw: null,
         conversationPopups: {
           liveCount: conversationSnapshot.live.length,
           minimizedCount: conversationSnapshot.minimized.length,
@@ -4319,13 +4250,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // tools) has one place to fan keys + clipboard across groups.
   // Phase T5 — terminal IPC channel bus. Fetched via getChannelBus()
   // here so the /term channel slashes can publish / list.
-  // Phase T3b-b — VW slot bookkeeping. `<windowId>/<slotId>` → PaneId
-  // so the adapter's removeSlot can find the right pane to close.
-  // Populated by installSlot, drained by removeSlot. Slot id equals
-  // the PaneId on the split-chord path (paneId is already globally
-  // unique); externally-chosen slotIds from /term move are free-form.
-  const vwSlotBindings = new Map<string, PaneId>();
-  const suppressedVwPaneKills = new Set<PaneId>();
   // P16 — mirror session metadata to
   // ~/.config/monad-agent/terminal-sessions.json on each lifecycle
   // change (debounced 250ms). /term resume later re-spawns from this.
@@ -4356,22 +4280,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // dispatch so browser Ctrl+W / /wd retargets Bash immediately.
     setBashRuntimeDeps({});
 
-    // NT-C1b-2/3 — wire the 4-mode ShellRunner.
-    //   • registry       → auto-bg (15s) + TTL (5m) + ShellList/Poll/Kill backend.
-    //   • fileEngine     → inline/bg mode (spawn+pipe).
-    //   • ptyHostFactory → NT-C1b-3 (session nt): per-label persistent
-    //                       PreviewTerminal for mode='vw' / 'modal'.
-    //                       Sequential commands in the same label
-    //                       share PTY + scrollback. VW pane binding
-    //                       itself lives in NT-C1b-4.
+    // ShellRunner registry tracks handles; file capture runs inline/bg commands.
     {
       const { initShellRegistry } = await import('../shell-runner/registry.js');
       const { createFileCaptureEngine } = await import('../shell-runner/file-engine.js');
       const { setShellRunnerDeps } = await import('../shell-runner/dispatch.js');
-      const { createRunnerHostFactory } = await import('../shell-runner/runner-host-factory.js');
-      const { createExternalTerminalPaneContent } = await import('../shell-runner/external-terminal-pane.js');
       const { createBackgroundSurface } = await import('../shell-runner/background-surface.js');
-      const { registerPaneContentKind } = await import('../virtual-windows/pane-content.js');
       // The boot seam types the registry as the opaque `ShellRegistryLike`
       // stub (decoupling), while the real `wireShellRunnerSurface` takes a
       // concrete `ShellRegistry`. At runtime `initShellRegistry` returns the
@@ -4386,132 +4300,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           deps: { shellRegistry: unknown },
         ) => void;
       } catch { /* never break boot */ }
-      registerPaneContentKind('vw-browser', (spec: any, deps: any) =>
-        createBrowserPaneContent(spec, {
-          browserPaneRegistry: deps.browserPaneRegistry,
-          refreshRemoteBrowserPane: deps.refreshRemoteBrowserPane,
-        }),
-      );
-      registerPaneContentKind('vw-preview', (spec: any, deps: any) =>
-        createPreviewPaneContent(spec, {
-          previewPaneRegistry: deps.previewPaneRegistry,
-        }),
-      );
-      registerPaneContentKind('iul-shell', (spec: any) =>
-        createIulSidebarShellPaneContent(spec, {
-          iulThemePreviewControl: {
-            getActiveThemeName: () => currentThemeTokens().name,
-            previewTheme: (name: string) => {
-              iulThemePreviewOverride = name;
-              requestDashboardRender();
-            },
-            revertPreview: () => {
-              iulThemePreviewOverride = null;
-              requestDashboardRender();
-            },
-            commitTheme: (name: string) => {
-              iulThemePreviewOverride = null;
-              const cfg = getUserConfig();
-              cfg.dashboard.theme = { ...(cfg.dashboard.theme as object ?? {}), active: name } as never;
-              saveUserConfig(cfg);
-              requestDashboardRender();
-            },
-          },
-        }),
-      );
-      registerPaneContentKind('acp-shell', (spec: any) =>
-        createAcpResidentShellPaneContent(spec, {
-          runPrimaryAction: async (action, stub) => {
-            switch (action.id) {
-              case 'open-live-client-room':
-              case 'open-live-server-room': {
-                const opened = await openConversationModal(stub.id);
-                return opened
-                  ? `Opened live ACP room for ${stub.id}`
-                  : `Live ACP room not mounted for ${stub.id}`;
-              }
-              case 'promote-background-vw': {
-                const result = await dispatchAcpSessionJoin({ backgroundId: stub.id, promoteToVW: true });
-                return result.promoted && result.windowId
-                  ? `Promoted to VW ${result.windowId}`
-                  : 'Joined background lane';
-              }
-              case 'join-background-transcript': {
-                await dispatchAcpSessionJoin({ backgroundId: stub.id, promoteToVW: false });
-                return 'Loaded background transcript';
-              }
-              case 'resume-persisted-session': {
-                await dispatchAcpSessionResume({ sessionId: stub.id });
-                return 'Resumed persisted ACP session';
-              }
-              default:
-                return 'No ACP action wired for this lane';
-            }
-          },
-        }),
-      );
-      registerPaneContentKind('sim-shell', (spec: any) =>
-        createSimShellPaneContent(spec, {
-          seedAssistantSample: (text) => {
-            ({ lastAssistantRaw, lastAssistantRange, lastAssistantMode } = appendDashboardAssistantSampleOutput({
-              chatLines,
-              text,
-              termCols: termSize().cols,
-              wrapEnabled: getUserConfig().chat.rendering.wrap,
-              formatResponse,
-              renderTextLine: C.text,
-            }));
-            chatScrollOffset = -1;
-            draw();
-          },
-          clearAssistantSample: () => {
-            lastAssistantRaw = null;
-            lastAssistantRange = null;
-            lastAssistantMode = 'rendered';
-            chatScrollOffset = -1;
-            draw();
-          },
-          openLastAssistantMediaPreview: async () => {
-            await openLastAssistantMediaPreview();
-          },
-          getBrowserStatusLines: () => browserCdpSlashRuntime.statusLines(),
-          getBrowserSmokeLines: async () => browserCdpSlashRuntime.smokeLines(),
-          getBrowserStopLines: () => browserCdpSlashRuntime.stopLines(),
-          signalBus: dashboardControlSignals,
-          signalScope: { surface: 'dashboard-chat-main', channel: 'dashboard' },
-          source: { kind: 'keyboard', surface: 'dashboard-chat-main' },
-        }),
-      );
       bootDashboardShellRunner({
         createBackgroundSurface,
         initShellRegistry,
         wireShellRunnerSurface,
-        registerPaneContentKind,
-        createExternalTerminalPaneContent,
-        createRunnerHostFactory,
         createFileCaptureEngine,
         setShellRunnerDeps,
-        getSessionCwd: () => getSessionCwd(),
-        termSize: () => termSize(),
         setLatestShellRollup: (rollup) => { latestShellRollup = rollup; },
-        onSpawnError: (label, err) => {
-          // SP-E — visible failure mode. Factory already degrades to
-          // file engine + null return; without this the user only
-          // sees "no VW appeared" with no hint as to why.
-          const msg = err instanceof Error ? err.message : String(err);
-          pushDebugLine(C.warning(`  [shell] spawn failed for label=${label}: ${msg}`));
-          pushDebugLine(C.muted('  (file engine fallback — output still captured; no VW pane)'));
-          chatScrollOffset = -1;
-          try { draw(); } catch { /* TUI torn down */ }
-        },
-        subscribeVirtualWindowClose: (cb) => {
-          virtualWindows.registry.subscribe((ev) => {
-            cb({
-              type: ev.type,
-              spawnTitle: 'spawnTitle' in ev ? ev.spawnTitle : undefined,
-            });
-          });
-        },
       });
     }
     const { setShellApprover } = await import('../shell-primitive/index.js');
@@ -4638,9 +4433,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       } catch { return []; }
     });
     setTerminalMouseIntentsGetter(() => [...recentTerminalMouseIntents]);
-    // Phase C — wire context.* tools. Window-registry getter is set
-    // later once virtualWindows is built (a few lines down); until
-    // then ContextWindowsList returns (no windows).
+    // Phase C — wire context.* tools without virtual-window state.
     const { setContextRuntimeDeps } = await import('../tool-runtime/index.js');
     // Surface-unification v2.2 V2.2-5 (2026-05-11) — scheduler store
     // wire retired together with `context.jobs.list` LLM tool.
@@ -4743,13 +4536,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       debug.log(scope, area, details);
     },
   });
-  // VW-term-infra Bundle B-1 — Phase 5 symmetry foundation.
-  // PaneVisualStateStore singleton + SetFocusPolicy/DescribePane LLM
-  // tools. Store is dashboard-local so consumers (Alt+N skip migration
-  // landed in B-7-α, `^B !` toggle migration, visibility pill) subscribe
-  // via the same instance. Constructed ahead of initDashboardVirtualWindows
-  // so the VW init can plumb the store-driven skip predicate (B-7-α).
-  // Chord hints `^B p` / `^B d` reserved for Bundle B-2 symmetry registry wire.
+  // PaneVisualStateStore serves dashboard pane tools.
   const paneVisualStateStore = createVisualStateStore();
   let browserPaneRegistry!: BrowserPaneRegistry;
   let previewPaneRegistry!: PreviewPaneRegistry;
@@ -4771,148 +4558,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         group,
       });
     },
-  });
-  // TUI 부활 T3 (2026-07-12) — VW 는 essential 에서 "실질 OFF" 게이트.
-  // 설계 노트: init 자체는 유지한다 (빈 레지스트리 + 이벤트버스 뿐 —
-  // 부팅 시 무조건적 윈도우 스폰이 없어 타이머/렌더 비용 0 확인).
-  // 완전 스킵(no-op registry)을 택하지 않은 이유: WindowRegistry 는
-  // private 필드를 가진 concrete class 라 구조적 타입 위조가 불가하고,
-  // Keep the virtual-window registry for programmatic consumers; the essential
-  // dashboard does not paint its frame or expose workspace slash/chord controls.
-  virtualWindows = initDashboardVirtualWindows({
-    coordinator: display,
-    injectApprover: createPaneInjectApprover(),
-    broadcastApprover: createBroadcastApprover(),
-    // T2-P5 — wire llm-chat panes to the same provider set the
-    // rest of the app uses. spawnLLMBenchmark now routes to a real
-    // backend; unknown providers surface as an error line inside
-    // the pane rather than a silent hang.
-    paneDeps: {
-      onTerminalMouseIntent: (ev, meta) => {
-        emitTerminalMouseIntent({
-          surfaceId: meta.paneId,
-          paneKind: meta.paneKind,
-          mouseType: ev.type,
-          row: ev.row,
-          col: ev.col,
-          exposure: meta.exposure,
-          interactionPolicy: meta.interactionPolicy,
-        });
-      },
-      llmChatBackend: async function* (req) {
-        const provider = LLM_PROVIDERS[req.provider];
-        if (!provider) {
-          yield `[unknown provider: ${req.provider}]`;
-          return;
-        }
-        if (!provider.chat) {
-          yield `[provider ${req.provider} missing chat()]`;
-          return;
-        }
-        try {
-          for await (const chunk of provider.chat(req.messages, { model: req.model })) {
-            yield chunk;
-          }
-        } catch (err) {
-          yield `\n[error: ${err instanceof Error ? err.message : String(err)}]`;
-        }
-      },
-      get browserPaneRegistry() { return browserPaneRegistry; },
-      get previewPaneRegistry() { return previewPaneRegistry; },
-      refreshRemoteBrowserPane: async (state: BrowserPaneModel) => {
-        await refreshRemoteWorkingDir(
-          state as WorkingDirState,
-          {},
-          { previewPath: null, previewLines: [], previewOffset: 0 },
-        );
-      },
-    },
-  });
-  // Phase T3b-b1 — install the VW placement adapter. matrix.move()
-  // with kind='vw' now routes through the VW registry's splitFocused
-  // / closePaneAt. Uses the vwSlotBindings map so the slot id (which
-  // the matrix caller chose) resolves back to the real PaneId.
-  const vwPlacementAdapter = new VwPlacementAdapter({
-    matrix: terminalMatrix,
-    sessionRegistry,
-    termSize,
-    installSlot: (windowId, slotId, terminalId) => {
-      // WindowId is a number in the VW registry but the matrix
-      // placement carries it as a string. Convert + guard Naan.
-      const winNum = Number(windowId);
-      const w = Number.isFinite(winNum) ? virtualWindows.registry.get(winNum) : null;
-      if (!w) throw new Error(`window not found: ${windowId}`);
-      const content = createPaneContent({
-        kind: 'terminal-slot',
-        terminalId,
-        title: `term:${terminalId}`,
-      });
-      // Adapter-driven terminal slots default to horizontal splits.
-      const newPaneId = w.splitFocused('h', content);
-      vwSlotBindings.set(`${windowId}/${slotId}`, newPaneId);
-    },
-    removeSlot: (windowId, slotId) => {
-      const winNum = Number(windowId);
-      const w = Number.isFinite(winNum) ? virtualWindows.registry.get(winNum) : null;
-      if (!w) return;
-      const key = `${windowId}/${slotId}`;
-      const paneId = vwSlotBindings.get(key) ?? slotId; // fallback: slotId == paneId on chord path
-      suppressedVwPaneKills.add(paneId);
-      try { w.closePaneAt(paneId); } catch { /* already gone */ }
-      vwSlotBindings.delete(key);
-    },
-  });
-  vwPlacementAdapter.install();
-  // Phase T3b-b1 — drop stale bindings when a pane closes externally
-  // (user pressed `x` in the VW, window was destroyed, pane exited).
-  // Matrix placement stays as `vw:<w>/<slot>` until the user moves it
-  // explicitly; drift is annoying but not dangerous. Future phase:
-  // auto-move to background on pane:close.
-  installVwLifecycleHandlers({
-    bus: virtualWindows.bus,
-    terminalMatrix,
-    bindings: vwSlotBindings,
-    suppressedKills: suppressedVwPaneKills,
-  });
-  // Symmetric counterpart — when a VW-placed PTY exits or is killed
-  // (shell `exit`, external kill), auto-close the hosting VW pane so
-  // the user isn't left with a dead shell frame on screen. closePaneAt
-  // emits pane:close → the handler above drops the binding; kill is a
-  // no-op because the terminal already has exitCode !== null.
-  const closeVwPaneForExit = createVwExitPaneCloser({
-    getVirtualWindow: (id) => virtualWindows.registry.get(id),
-    bindings: vwSlotBindings,
-  });
-  // Phase T3b-b3 — auto-tag terminals with `_vw:<windowId>` broadcast
-  // group as they enter / leave a VW placement. This is the per-VW
-  // implicit group that `/term group send _vw:<id> <text>` broadcasts
-  // to — a tmux synchronize-panes at the VW level without the user
-  // having to manually joinGroup each split terminal.
-  terminalMatrix.subscribe((ev) => {
-    if (ev.type !== 'placement') return;
-    const { instance, prev } = ev;
-    if (prev.kind === 'vw') {
-      terminalMatrix.leaveGroup(instance.id, `_vw:${prev.windowId}`);
-    }
-    if (instance.placement.kind === 'vw') {
-      terminalMatrix.joinGroup(instance.id, `_vw:${instance.placement.windowId}`);
-    }
-  });
-  virtualWindows.bus.subscribe({ types: ['window:close'] }, (ev) => {
-    if (ev.type !== 'window:close') return;
-    const ownerId = vwCompanionOwnerId(ev.windowId);
-    const host = companionSurfaceHosts.get(ownerId);
-    if (!host) return;
-    suppressCompanionPopupDispose = true;
-    try {
-      host.disposeHandles();
-    } finally {
-      suppressCompanionPopupDispose = false;
-    }
-    for (const key of ['clipboard', 'memo', 'detail'] as const) {
-      host.close(key);
-      display.workspaceHostAPI().removeMember(ownerId, companionSurfaceId(ownerId, key));
-    }
   });
   // Refresh context runtime deps after the dashboard session registry is ready.
   try {
@@ -5107,7 +4752,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     wireDashboardSurfaceRegistry({
       surfaceRegistry,
       widgetHost,
-      windowRegistry: virtualWindows.registry,
     });
   } catch { /* never break boot */ }
 
@@ -5139,8 +4783,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   try {
     registerDashboardScenarioRuntimes({
       scenarioCatalog,
-      registry: virtualWindows.registry,
-      createPaneContent,
       spawnWidget: (spec) => widgetHost.spawn(spec),
       disposeWidget: (id) => { widgetHost.dispose(id); },
       getDashboardModals: () => dashboardModals,
@@ -5167,7 +4809,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const artifactStore = createArtifactStore({
     legacyProviders: [
       createLegacyTimelineProvider({ dir: defaultTimelineBaseDir() }),
-      createLegacyLayoutProvider({ dir: layoutsDir() }),
     ],
   });
   try {
@@ -5604,19 +5245,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     afterThemeActiveSaved: draw,
   });
 
-  // T6-K6 — wire the SpawnCodingAgentInVW tool. Registry is the
-  // virtual-windows WindowRegistry shared across VW-P1..VW-P11.
-  // paneDeps already flow into VW tool dispatchers via
-  // initVirtualWindowTools so the terminal factory + spawn seam
-  // use the same defaults.
-  bootDashboardAgentSpawnTools({
-    registry: virtualWindows.registry,
-    initSpawnCodingAgentInVW,
-    initSpawnEmbodiedAgentInVW,
-  });
-  // H5 P1 Step E — wire the Embodied Agent Bus spawner + register the
-  // default codex-pty adapter into `defaultAdapterRegistry`. Legacy
-  // `/acp-vw codex` flows through `dispatchSpawnCodingAgentInVW`.
   // H5 P2 bootstrap — register the default channel router patterns
   // + codex-pty adapter hook, then bind the TTY snapshot LLM tools
   // to the live embodied-session registry. Without this wiring:
@@ -5771,15 +5399,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     findLiveSessionById,
     findLiveSessionByPaneId,
     getFocusedConversationSessionId: () => conversationPopupHost.snapshot().focusedSessionId,
-    getFocusedVirtualWindowPane: () => {
-      const vw = virtualWindows?.registry.current();
-      const pane = vw?.getFocusedPane();
-      return {
-        vwId: vw?.id ?? null,
-        paneId: pane?.id ?? null,
-        paneKind: pane?.kind ?? null,
-      };
-    },
+    getFocusedVirtualWindowPane: () => ({ vwId: null, paneId: null, paneKind: null }),
     noteUserSubmit: (sessionId, text) => globalAcpEventRouter().noteUserSubmit(sessionId, text),
     clientSessionSend: (opts) => globalDualRoleManager().clientSessionSend(opts),
     getWorkingFocus: () => workingDir.focus,
@@ -5844,25 +5464,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       '../capture/capture-tools.js'
     );
     pfcScreenshotAttacherRef.current = createPfcScreenshotAttacher({
-      // The dashboard tracks shell handle ↔ surface mapping in
-      // `previewPaneRegistry` and `virtualWindows.registry`. For now
-      // resolve via the registered VW runner label (most common case);
-      // bg / inline shells return null and skip capture.
-      resolveScreenshotTarget: (shellId) => {
-        try {
-          const reg = pfcGetShellRegistry();
-          const label = reg.getVwLabel(shellId);
-          if (!label) return null;
-          const win = virtualWindows.registry.list().find(
-            (w) => virtualWindows.registry.spawnTitleOf(w.id) === label,
-          );
-          if (!win) return null;
-          return {
-            surfaceId: `vw:${win.id}/${label}`,
-            args: { windowId: String(win.id), runnerLabel: label },
-          };
-        } catch { return null; }
-      },
+      resolveScreenshotTarget: () => null,
       dispatchScreenshot: async (args) => {
         const out = await pfcDispatchScreenshot(args);
         return {
@@ -6326,7 +5928,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     }
     return policy.suppressPromptArea || policy.suppressStatusArea;
   };
-  const vwCompanionOwnerId = (windowId: string | number): string => `virtual-window:${windowId}`;
   const companionPopupSpec = (
     key: CompanionPopupKey,
   ): {
@@ -6569,189 +6170,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     syncCompanionPopups();
     return next;
   };
-  const computeVirtualWindowCompanionBounds = (
-    windowId: number,
-    slotIndex = 0,
-    totalCount = 1,
-  ) => {
-    const bounds = virtualWindows.registry.get(windowId)?.getBounds();
-    if (!bounds) return null;
-    const innerCols = Math.max(24, bounds.width - 2);
-    const innerRows = Math.max(10, bounds.height - 2);
-    const local = computeCompanionPopupBounds({
-      termCols: innerCols,
-      termRows: innerRows,
-      slotIndex,
-      totalCount,
-      hasBlockingForeground: false,
-    });
-    return {
-      row: bounds.row + Math.max(0, local.row - 1),
-      col: bounds.col + Math.max(0, local.col - 1),
-      width: Math.min(local.width, innerCols),
-      height: Math.min(local.height, innerRows),
-    };
-  };
-  const syncVwCompanions = (windowId: number): void => {
-    const ownerId = vwCompanionOwnerId(windowId);
-    const host = companionSurfaceHosts.ensure(ownerId, ['clipboard', 'memo', 'detail']);
-    const workspaceHost = display.workspaceHostAPI();
-    suppressCompanionPopupDispose = true;
-    try {
-      host.disposeHandles();
-    } finally {
-      suppressCompanionPopupDispose = false;
-    }
-    const window = virtualWindows.registry.get(windowId);
-    if (!window) {
-      for (const key of ['clipboard', 'memo', 'detail'] as const) {
-        workspaceHost.removeMember(ownerId, companionSurfaceId(ownerId, key));
-      }
-      return;
-    }
-    workspaceHost.setLayoutMode(ownerId, 'desktop');
-    (['clipboard', 'memo', 'detail'] as const).forEach((key, index) => {
-      const surfaceId = companionSurfaceId(ownerId, key);
-      if (!host.isActive(key)) {
-        workspaceHost.removeMember(ownerId, surfaceId);
-        return;
-      }
-      workspaceHost.upsertMember(ownerId, {
-        surfaceId,
-        kind: 'popup',
-        label: companionPopupSpec(key).title,
-        order: 280 + index,
-      });
-      if (host.isDocked(key)) {
-        workspaceHost.minimizeMember(ownerId, surfaceId, { docked: true });
-        return;
-      }
-      workspaceHost.restoreMember(ownerId, surfaceId);
-      const bounds = computeVirtualWindowCompanionBounds(windowId, index, 3);
-      if (!bounds) return;
-      const spec = companionPopupSpec(key);
-      const columns = spec.columns.map((column) => ({ ...column }));
-      if (key === 'clipboard' && columns[0]) {
-        columns[0].onAfterKey = (action, ev) => {
-          syncClipboardCursorFromWidget();
-          if (action?.type === 'submit' || ev.name === 'enter' || ev.name === 'y' || ev.name === 'ㅛ') {
-            void copyClipboardHistoryEntryAt(clipCursor).then(() => draw());
-            return;
-          }
-          if (ev.name === 'c') {
-            clipHistory.clear();
-            clipCursor = 0;
-            statusFeedbackRuntime.onClipboardHistoryCleared();
-            draw();
-            return;
-          }
-          if (ev.name === 'escape' || ev.name === 'l' || ev.name === 'right') {
-            host.close('clipboard');
-            syncVwCompanions(windowId);
-            draw();
-          }
-        };
-      }
-      if (key === 'memo' && columns[0]) {
-        columns[0].onAfterKey = (_action, ev) => {
-          if (ev.name === 'escape') {
-            closeVwMemoCompanion(windowId);
-            syncVwCompanions(windowId);
-            draw();
-            return;
-          }
-          if ((ev as { ctrl?: boolean }).ctrl && (ev.name === 's' || ev.name === 'ㄴ')) {
-            commitVwMemoCompanion(windowId);
-            syncVwCompanions(windowId);
-            draw();
-            return;
-          }
-          if ((ev as { ctrl?: boolean }).ctrl && ev.name === 'a') {
-            const memo = widgetHost.get('wd-memo') as any;
-            if (memo?.state) memo.state.memoColIdx = 0;
-            requestDashboardRender('memo');
-            return;
-          }
-          if ((ev as { ctrl?: boolean }).ctrl && ev.name === 'e') {
-            const memo = widgetHost.get('wd-memo') as any;
-            if (memo?.state) {
-              const lineIdx = memo.state.memoLineIdx ?? 0;
-              const line = memo.state.memoLines?.[lineIdx] ?? '';
-              memo.state.memoColIdx = line.length;
-            }
-            requestDashboardRender('memo');
-          }
-        };
-      }
-      const handle = showLivePaneMultiModal({
-        id: surfaceId,
-        title: spec.title,
-        columns,
-        widgetHost,
-        coordinator: display,
-        termCols: termSize().cols,
-        termRows: termSize().rows,
-        bounds,
-        ttlMs: 0,
-        group: surfaceId,
-        interactionClass: 'embedded-overlay',
-        windowRole: 'companion',
-        chrome: resolveWindowScopedCompanionPopupChrome({
-          theme: currentThemeTokens(),
-          titleControls: spec.titleControls,
-          bottomStatus: spec.status,
-          windowId,
-        }),
-        onChromeAction: (action) => {
-          if (action.controlId === 'minimize') {
-            host.markDocked(key);
-            workspaceHost.minimizeMember(ownerId, surfaceId, { docked: true });
-            syncVwCompanions(windowId);
-            draw();
-            return;
-          }
-          if (action.controlId === 'close') {
-            host.close(key);
-            workspaceHost.removeMember(ownerId, surfaceId);
-            syncVwCompanions(windowId);
-            draw();
-          }
-        },
-        onDispose: () => {
-          if (suppressCompanionPopupDispose) return;
-          if (host.isDocked(key)) {
-            workspaceHost.minimizeMember(ownerId, surfaceId, { docked: true });
-            draw();
-            return;
-          }
-          host.close(key);
-          workspaceHost.removeMember(ownerId, surfaceId);
-          draw();
-        },
-      });
-      host.setHandle(key, handle);
-    });
-  };
-  const toggleVwCompanion = (
-    windowId: number,
-    key: 'clipboard' | 'memo' | 'detail',
-  ): boolean => {
-    const host = companionSurfaceHosts.ensure(vwCompanionOwnerId(windowId), ['clipboard', 'memo', 'detail']);
-    if (key === 'memo' && !host.isActive('memo')) seedMemoWidget(['']);
-    const next = host.toggleOpen(key);
-    syncVwCompanions(windowId);
-    return next;
-  };
-  const setVwCompanionOpen = (
-    windowId: number,
-    key: 'clipboard' | 'memo' | 'detail',
-    next: boolean,
-  ): void => {
-    const host = companionSurfaceHosts.ensure(vwCompanionOwnerId(windowId), ['clipboard', 'memo', 'detail']);
-    if (key === 'memo' && next && !host.isActive('memo')) seedMemoWidget(['']);
-    host.setOpen(key, next);
-    syncVwCompanions(windowId);
-  };
   const {
     syncConversationPopupModals,
     setConversationPopupLayoutMode,
@@ -6782,7 +6200,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       createAgentSessionProvider,
       createBrowserCdpProvider,
       registerProvider: (registry, provider) => { registry.registerProvider(provider); },
-      getWindows: () => virtualWindows.registry.list(),
+      getWindows: () => [],
       listSessions: () => listLiveEmbodiedSessions(),
       // H6 P5 observer-registry landed · threading through enables
       // the channel-aware snapshot path (falls back to raw snapshot
@@ -6822,10 +6240,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     enabled: true,
     backgroundManager: globalBackgroundManager(),
   });
-
-  // Phase 3a wiring — register SaveLayout/LoadLayout/ApplyLayoutPreset
-  // LLM tools against the shared WindowRegistry. Plan-only today; actual
-  // restore-to-live-VW lands in a follow-up commit.
 
   // T6-K5 — wire widget + pane control tools. Widgets are reported
   // from widgetHost; pane focus piggybacks on workingDir.focus. The
@@ -6906,32 +6320,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         openSurfaceCatalogPopup();
         return true;
       },
-      openSurfaceInVw: (surface) => {
-        if (surface === 'scratch') {
-          spawnScratchVirtualWindow();
-          return true;
-        }
-        if (surface === 'browser') {
-          spawnBrowserVirtualWindow();
-          return true;
-        }
-        if (surface === 'preview') {
-          spawnPreviewVirtualWindow();
-          return true;
-        }
-        if (surface === 'browser-preview') {
-          spawnBrowserPreviewVirtualWindow();
-          return true;
-        }
-        return false;
-      },
+      openSurfaceInVw: () => false,
       openCompanionSurface: (surface, target) => {
-        if (target === 'vw') {
-          const windowId = virtualWindows.registry.current()?.id ?? null;
-          if (!Number.isInteger(windowId)) return false;
-          setVwCompanionOpen(windowId as number, surface, true);
-          return true;
-        }
+        if (target === 'vw') return false;
         setCompanionPopupOpen(surface, true);
         return true;
       },
@@ -7734,131 +7125,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   const activeBrowserState = (): BrowserPaneModel => (
     resolveBrowserStateById(activeBrowserWidgetId()) ?? (workingDir as BrowserPaneModel)
   );
-  let vwPaneMountSeq = 0;
-  const nextVwBrowserPaneId = (): string => `vw-browser:${++vwPaneMountSeq}`;
-  const nextVwPreviewPaneId = (): string => `vw-preview:${++vwPaneMountSeq}`;
-  const cloneActiveBrowserIntoVw = (): { browserId: string; state: BrowserPaneModel } => {
-    const browserId = nextVwBrowserPaneId();
-    const state = browserPaneRegistry.cloneInto(activeBrowserWidgetId(), browserId);
-    return { browserId, state };
-  };
-  const cloneDockedPreviewIntoVw = (): { previewId: string } => {
-    const previewId = nextVwPreviewPaneId();
-    previewPaneRegistry.cloneInto('wd-preview', previewId);
-    return { previewId };
-  };
-  const nextTerminalVwSlotId = (terminalId: string): string => `term-slot:${terminalId}`;
-  const spawnScratchVirtualWindow = (title?: string): number => {
-    const reg = virtualWindows.registry;
-    const nextTitle = title?.trim() || `window ${reg.list().length + 1}`;
-    const w = reg.spawn({
-      title: nextTitle,
-      initialContent: { kind: 'scratch', title: nextTitle },
-    });
-    return w.id;
-  };
-  const spawnBrowserVirtualWindow = (title?: string): number => {
-    const reg = virtualWindows.registry;
-    const nextTitle = title?.trim() || `browser ${reg.list().length + 1}`;
-    const { browserId } = cloneActiveBrowserIntoVw();
-    const w = reg.spawn({
-      title: nextTitle,
-      initialContent: { kind: 'vw-browser', browserId, title: 'browser' } as any,
-    });
-    return w.id;
-  };
-  const spawnPreviewVirtualWindow = (title?: string): number => {
-    const reg = virtualWindows.registry;
-    const nextTitle = title?.trim() || `preview ${reg.list().length + 1}`;
-    const { previewId } = cloneDockedPreviewIntoVw();
-    const w = reg.spawn({
-      title: nextTitle,
-      initialContent: { kind: 'vw-preview', previewId, title: 'preview' } as any,
-    });
-    return w.id;
-  };
-  const spawnBrowserPreviewVirtualWindow = (title?: string): number => {
-    const reg = virtualWindows.registry;
-    const nextTitle = title?.trim() || `browser+preview ${reg.list().length + 1}`;
-    const { browserId } = cloneActiveBrowserIntoVw();
-    const { previewId } = cloneDockedPreviewIntoVw();
-    const w = reg.spawn({
-      title: nextTitle,
-      initialContent: { kind: 'vw-browser', browserId, title: 'browser' } as any,
-    });
-    const previewContent = createPaneContent({
-      kind: 'vw-preview',
-      previewId,
-      title: 'preview',
-    } as any, {
-      browserPaneRegistry,
-      previewPaneRegistry,
-      refreshRemoteBrowserPane: async (state: BrowserPaneModel) => {
-        await refreshRemoteWorkingDir(
-          state as WorkingDirState,
-          {},
-          { previewPath: null, previewLines: [], previewOffset: 0 },
-        );
-      },
-    });
-    w.splitFocused('h', previewContent);
-    return w.id;
-  };
-  const spawnIulVirtualWindow = (title?: string): number => {
-    const reg = virtualWindows.registry;
-    const trimmed = title?.trim() ?? '';
-    if (!trimmed && isIulResidentEnabled(getUserConfig().vw)) {
-      return focusOrSpawnIulResidentWindow(reg);
-    }
-    const nextTitle = trimmed || `IUL UX Lab ${reg.list().length + 1}`;
-    const w = reg.spawn({
-      title: nextTitle,
-      initialContent: { kind: 'iul-shell', title: nextTitle } as any,
-    });
-    return w.id;
-  };
-  const spawnAcpVirtualWindow = (title?: string): number => {
-    const reg = virtualWindows.registry;
-    const trimmed = title?.trim() ?? '';
-    // PLAN-tui-redundancy-cleanup T1 (2026-05-16) — resident-vw 의
-    // focusOrSpawnAcpResidentWindow + isAcpResidentEnabled 의존 제거.
-    // 사용자 slash command 통한 manual spawn 만 유지.
-    const nextTitle = trimmed || `ACP channels ${reg.list().length + 1}`;
-    const w = reg.spawn({
-      title: nextTitle,
-      initialContent: { kind: 'acp-shell', title: 'ACP Channels' } as any,
-    });
-    return w.id;
-  };
-  const spawnSimVirtualWindow = (title?: string): number => {
-    const reg = virtualWindows.registry;
-    const trimmed = title?.trim() ?? '';
-    if (!trimmed && isSimResidentEnabled(getUserConfig().vw)) {
-      return focusOrSpawnSimResidentWindow(reg);
-    }
-    const nextTitle = trimmed || `Simulator ${reg.list().length + 1}`;
-    const w = reg.spawn({
-      title: nextTitle,
-      initialContent: { kind: 'sim-shell', title: 'Test Simulator' } as any,
-    });
-    return w.id;
-  };
-  for (const residentKind of getUserConfig().vw.order) {
-    if (residentKind === 'iul' && isIulResidentEnabled(getUserConfig().vw)) {
-      bootIulResidentWindow(virtualWindows.registry, {
-        foreground: isIulForegroundStartupEnabled(getUserConfig().vw),
-      });
-      continue;
-    }
-    // PLAN-tui-redundancy-cleanup T1 (2026-05-16) — ACP resident window
-    // boot auto-mount 제거. `vw.order` 에 'acp' 가 남아 있어도 noop ·
-    // 사용자 manual slash command (/acp-vw) 통한 spawn 만 유지.
-    if (residentKind === 'acp') continue;
-    if (residentKind === 'sim' && isSimResidentEnabled(getUserConfig().vw)) {
-      bootSimResidentWindow(virtualWindows.registry);
-    }
-  }
-
   // T7-N1 — ACP chat bridge. Speaks JSON-RPC to claude-code-acp /
   // codex-acp / gemini via the real client in src/acp/*. Subprocess
   // spawn is lazy — no cost until the user runs /acp.
@@ -7960,7 +7226,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       // chrome rows (input/status/dock), but that does not mean the
       // main workspace's chat composer remains an active input owner.
       const chatMainAvailable = foregroundWorkspace === null;
-      const vwLocalComposerActive = !!virtualWindows.registry.current()?.isLocalComposerActive();
+      const vwLocalComposerActive = false;
       const overlayInputActive = hasOverlayInputOwner({
         focusStack: display.modalStack(),
         surfaceAt: (id) => display.surface(id),
@@ -9217,13 +8483,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       agentStatusStore.clear(ev.instance.id);
       claudeStatusParser.reset(ev.instance.id);
       codexStatusParser.reset(ev.instance.id);
-      closeVwPaneForExit(ev.instance.placement, 'exited');
     } else if (ev.type === 'killed') {
       notificationStore.push(exitToNotification(ev.instance.id, null));
       agentStatusStore.clear(ev.instance.id);
       claudeStatusParser.reset(ev.instance.id);
       codexStatusParser.reset(ev.instance.id);
-      closeVwPaneForExit(ev.instance.placement, 'killed');
     } else if (ev.type === 'attention') {
       notificationStore.push(attentionToNotification(ev.instance.id, ev.level));
     }
@@ -11325,18 +10589,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getScratchTotalBytes: () => scratchLines.reduce((n, l) => n + l.length, 0),
     isCompanionOpen: (key) => companionPopupHost.isActive(key as CompanionPopupKey),
     hasClosedPanes: () => paneStateSnapshot().panes.some((pane) => pane.closed),
-    resolveVirtualWindowPaneKind: ({ windowId, paneId }) => {
-      const id = Number.parseInt(windowId, 10);
-      if (!Number.isFinite(id)) return null;
-      return virtualWindows.registry.get(id)?.getPane(paneId)?.kind ?? null;
-    },
-    isVirtualWindowCompanionOpen: ({ windowId }, key) => {
-      const id = Number.parseInt(windowId, 10);
-      if (!Number.isFinite(id)) return false;
-      return companionSurfaceHosts
-        .ensure(vwCompanionOwnerId(id), ['clipboard', 'memo', 'detail'])
-        .isActive(key as 'clipboard' | 'memo' | 'detail');
-    },
     getDebugPath: () => debug.path(),
     getDebugLevel: () => debug.level(),
   });
@@ -11514,93 +10766,10 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           });
           return;
         }
-        case 'vw.clipboard-companion': {
-          const payload = result.payload as VirtualWindowTitleMenuPayload | undefined;
-          if (!payload) return;
-          const windowId = Number.parseInt(payload.windowId, 10);
-          if (!Number.isFinite(windowId)) return;
-          const opened = toggleVwCompanion(windowId, 'clipboard');
-          contextMenuFeedbackRuntime.onVwCompanionToggled(windowId, 'clipboard', opened);
-          return;
-        }
-        case 'vw.memo-companion': {
-          const payload = result.payload as VirtualWindowTitleMenuPayload | undefined;
-          if (!payload) return;
-          const windowId = Number.parseInt(payload.windowId, 10);
-          if (!Number.isFinite(windowId)) return;
-          const opened = toggleVwCompanion(windowId, 'memo');
-          contextMenuFeedbackRuntime.onVwCompanionToggled(windowId, 'memo', opened);
-          return;
-        }
-        case 'vw.detail-companion': {
-          const payload = result.payload as VirtualWindowTitleMenuPayload | undefined;
-          if (!payload) return;
-          const windowId = Number.parseInt(payload.windowId, 10);
-          if (!Number.isFinite(windowId)) return;
-          const opened = toggleVwCompanion(windowId, 'detail');
-          contextMenuFeedbackRuntime.onVwCompanionToggled(windowId, 'detail', opened);
-          return;
-        }
-        case 'vw.return-popup': {
-          const payload = result.payload as VirtualWindowTitleMenuPayload | undefined;
-          if (!payload) return;
-          const windowId = Number.parseInt(payload.windowId, 10);
-          if (!Number.isFinite(windowId)) return;
-          const window = virtualWindows.registry.get(windowId);
-          const pane = window?.getPane(payload.paneId);
-          if (!window || !pane) return;
-          if (pane.kind === 'terminal-slot') {
-            const inst = resolveVwTerminalInstanceForPane(
-              terminalMatrix.list({ includeExited: true }),
-              vwSlotBindings,
-              payload.windowId,
-              payload.paneId,
-            );
-            if (!inst) return;
-            terminalMatrix.move(inst.id, { kind: 'modal', modalId: inst.id });
-            if (inst.legacySessionId) {
-              const session = sessionRegistry.get(inst.legacySessionId);
-              if (session?.modal) {
-                terminalModalRouter.set(session.modal, {
-                  onClose: () => { sessionRegistry.detach(session.id); draw(); },
-                });
-              }
-            }
-            draw();
-            return;
-          }
-          if (pane.kind === 'vw-browser') {
-            openBrowserOnlyModal();
-          } else if (pane.kind === 'vw-preview') {
-            openPreviewOnlyModal();
-          } else if (pane.kind === 'scratch') {
-            openDashboardPaneModal('scratch');
-          } else {
-            return;
-          }
-          try { window.closePaneAt(payload.paneId); } catch { /* already gone */ }
-          return;
-        }
         case 'dashboard-pane.open-popup': {
           const payload = result.payload as DashboardPaneTitleMenuPayload | undefined;
           if (!payload) return;
           openDashboardPaneModal(payload.pane);
-          return;
-        }
-        case 'dashboard-pane.open-vw': {
-          const payload = result.payload as DashboardPaneTitleMenuPayload | undefined;
-          if (!payload) return;
-          if (payload.pane === 'browser') {
-            spawnBrowserVirtualWindow();
-            return;
-          }
-          if (payload.pane === 'preview') {
-            spawnPreviewVirtualWindow();
-            return;
-          }
-          if (payload.pane === 'scratch') {
-            spawnScratchVirtualWindow();
-          }
           return;
         }
         case 'dashboard-pane.clipboard-companion': {
@@ -11662,13 +10831,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     openBrowserPreviewModal: () => openBrowserPreviewModal(),
     openDashboardPaneModal: (pane) => openDashboardPaneModal(pane),
     openCompanionPopup: (key) => setCompanionPopupOpen(key as DashboardCompanionSurfaceKey, true),
-    spawnBrowserVirtualWindow: () => spawnBrowserVirtualWindow(),
-    spawnPreviewVirtualWindow: () => spawnPreviewVirtualWindow(),
-    spawnBrowserPreviewVirtualWindow: () => spawnBrowserPreviewVirtualWindow(),
-    spawnScratchVirtualWindow: () => spawnScratchVirtualWindow(),
-    spawnSimVirtualWindow: () => spawnSimVirtualWindow(),
-    currentVirtualWindowId: () => virtualWindows.registry.current()?.id ?? null,
-    openVwCompanion: (windowId, key) => setVwCompanionOpen(windowId, key as DashboardCompanionSurfaceKey, true),
     onWarning: (message) => {
       pushDebugLine(C.warning(`  ${message}`));
       chatScrollOffset = -1;
@@ -11721,13 +10883,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     // sibling runtime two blocks above.
     pushChatLine: (line) => { chatLines.push(line); },
     setChatScrollBottom: () => { chatScrollOffset = -1; },
-  });
-  const benchSlashRuntime = createDashboardBenchSlashRuntime({
-    accent: C.accent,
-    muted: C.muted,
-    warning: C.warning,
-    error: C.error,
-    maxPanes: MAX_BENCHMARK_PANES,
   });
   const termSlashRuntime = createDashboardTermSlashRuntime({
     accent: C.accent,
@@ -11857,14 +11012,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     },
   });
   const mouseShellRollupRuntime = createMouseShellRollupRuntime({
-    resolveVwIdByLabel: (label) => {
-      const all = virtualWindows.registry.list();
-      const hit = all.find((window) => virtualWindows.registry.spawnTitleOf(window.id) === label);
-      return hit ? hit.id : null;
-    },
-    switchToVirtualWindow: (windowId) => {
-      virtualWindows.registry.switchTo(windowId);
-    },
+    resolveVwIdByLabel: () => null,
+    switchToVirtualWindow: () => { throw new Error('Virtual windows are unavailable in the essential dashboard'); },
     onWarning: (message) => {
       chatLines.push(C.warning(`  ${message}`));
       chatScrollOffset = -1;
@@ -12025,14 +11174,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     getTheme: () => currentThemeTokens(),
   });
 
-  // Phase 3a + F6 / S1.D — layout + display-control runtime
-  // registration. Both need late boot state now available here:
-  // artifactStore/windowRegistry for Layout* and mouse/context-menu
-  // deps for display-control. Registration is idempotent.
+  // F6 / S1.D — display-control runtime registration needs late-boot mouse/context-menu state.
   try {
     registerDashboardLayoutDisplayRuntimes({
-      windowRegistry: virtualWindows.registry,
-      artifactStore,
       coordinator: display,
       mouseDispatch: (ev) => mouseWiring.handleMouse(ev),
       menuProviderRegistry: ctxMenuProviders,
@@ -13678,20 +12822,14 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   });
 
   function currentWorkspaceOwnerId(): string {
-    const currentWindow = virtualWindows.registry.current();
-    return currentWindow
-      ? workspaceOwnerIdForVirtualWindow(currentWindow.id)
-      : DASHBOARD_MAIN_WORKSPACE_ID;
+    return DASHBOARD_MAIN_WORKSPACE_ID;
   }
 
   function openSurfaceCatalogPopup(): void {
-    const currentWindow = virtualWindows.registry.current();
     void openCompactSurfaceCatalogPopup({
       getTargets: () => compactSurfaceRuntime.buildTargets(),
       openTarget: (surfaceId) => compactSurfaceRuntime.openTarget(surfaceId),
-      ownerWorkspaceId: currentWindow
-        ? workspaceOwnerIdForVirtualWindow(currentWindow.id)
-        : DASHBOARD_MAIN_WORKSPACE_ID,
+      ownerWorkspaceId: DASHBOARD_MAIN_WORKSPACE_ID,
       termSize,
       getTheme: () => currentThemeTokens(),
       pushModalSurface: (surface) => display.pushModal(surface),
@@ -13712,24 +12850,15 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   let shellRollupDispose: (() => void) | null = null;
   async function openShellRollupPopup(): Promise<void> {
     const { getShellRegistry } = await import('../shell-runner/registry.js');
-    const currentWindow = virtualWindows.registry.current();
     await openDashboardShellRollupPopup({
       getShellRegistry,
       getCurrentDispose: () => shellRollupDispose,
       setCurrentDispose: (dispose) => {
         shellRollupDispose = dispose;
       },
-      resolveVwIdByLabel: (label) => {
-        const all = virtualWindows.registry.list();
-        const hit = all.find(w => virtualWindows.registry.spawnTitleOf(w.id) === label);
-        return hit ? hit.id : null;
-      },
-      switchVirtualWindow: (windowId) => {
-        virtualWindows.registry.switchTo(windowId);
-      },
-      ownerWorkspaceId: currentWindow
-        ? workspaceOwnerIdForVirtualWindow(currentWindow.id)
-        : DASHBOARD_MAIN_WORKSPACE_ID,
+      resolveVwIdByLabel: () => null,
+      switchVirtualWindow: () => { throw new Error('Virtual windows are unavailable in the essential dashboard'); },
+      ownerWorkspaceId: DASHBOARD_MAIN_WORKSPACE_ID,
       termSize,
       getTheme: () => currentThemeTokens(),
       pushModalSurface: (surface) => display.pushModal(surface),
@@ -13900,26 +13029,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     memoCompanionRuntime.cancel();
     chatScrollOffset = -1;
   };
-  const closeVwMemoCompanion = (windowId: number): void => {
-    seedMemoWidget(['']);
-    const host = companionSurfaceHosts.ensure(vwCompanionOwnerId(windowId), ['clipboard', 'memo', 'detail']);
-    host.close('memo');
-  };
-  const commitVwMemoCompanion = (windowId: number): void => {
-    const host = companionSurfaceHosts.ensure(vwCompanionOwnerId(windowId), ['clipboard', 'memo', 'detail']);
-    const runtime = createDashboardMemoCompanionRuntime({
-      readLines: readMemoWidgetLines,
-      resetEditor: () => { seedMemoWidget(['']); },
-      close: () => { host.close('memo'); },
-      publishSaved: publishMemoLines,
-      pushSavedLine: (lineCount) => { chatLines.push(companionFeedbackRuntime.memoSavedLine(lineCount)); },
-      pushDiscardedLine: () => { chatLines.push(companionFeedbackRuntime.memoDiscardedLine()); },
-      pushCancelledLine: () => { chatLines.push(companionFeedbackRuntime.memoCancelledLine()); },
-    });
-    runtime.commit();
-    chatScrollOffset = -1;
-  };
-
   // Repaint hook the active textInput populates so external draws
   // (scratchpad refresh, async chafa render finishing) can ask the
   // prompt to re-paint itself afterwards. While input is idle this
@@ -16641,13 +15750,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         && voiceHostFlow.getState().kind === 'idle'
         && workingDir.focus !== 'input'
       ) {
-        const focusedTerminalPane = (() => {
-          try {
-            const vw = virtualWindows?.registry.current();
-            const pane = vw?.getFocusedPane();
-            return pane?.kind === 'terminal' || pane?.kind === 'terminal-slot';
-          } catch { return false; }
-        })();
+        const focusedTerminalPane = false;
 
         // Branch 1 — Ctrl+Shift+D trial chord. TEMP DEBUG (2026-04-29):
         // toggle pattern instead of long-press detector. First press
@@ -17557,8 +16660,8 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           initialText: inputEntry?.initialText ?? null,
           visibility: chatMainInputVisibilityState(),
           topBlockingForegroundModal: topBlockingForegroundModal()?.id ?? null,
-          currentVwId: virtualWindows.registry.current()?.id ?? null,
-          currentVwHostChromeProfile: virtualWindows.registry.current()?.getHostChromeProfile?.() ?? null,
+          currentVwId: null,
+          currentVwHostChromeProfile: null,
         });
       }
       if (inputEntry) {
@@ -18533,17 +17636,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 runSlashRuntime: runSkillSlashRuntime,
                 runByName: (name, skillArgs) => runSkillByName(name, skillArgs),
               },
-              bench: {
-                slashRuntime: benchSlashRuntime,
-                spawn: (spec) => spawnLLMBenchmark(
-                  { prompt: spec.prompt, providers: [...spec.providers] },
-                  {
-                    registry: virtualWindows.registry,
-                    eventBus: virtualWindows.bus,
-                    addressBook: virtualWindows.book,
-                  },
-                ),
-              },
               setup: {
                 launchPopup: (cmd) => {
                   const session = TerminalPopup.shell()
@@ -18630,7 +17722,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               },
               sim: {
                 slashRuntime: simSlashRuntime,
-                spawnVirtualWindow: () => spawnSimVirtualWindow(),
                 openWebCockpit: () => openDashboardSimulationWebCockpit(),
                 listScenarios: () => listDashboardSimulationScenarios(),
                 runById: (scenarioId) => runDashboardSimulationById(scenarioId as Parameters<typeof runDashboardSimulationById>[0]),
@@ -18935,18 +18026,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               shellSlash: {
                 slashRuntime: shellSlashRuntime,
                 openRollupPopup: () => openShellRollupPopup(),
-                virtualWindowsSwitchTo: (windowId) => { virtualWindows.registry.switchTo(windowId); },
-                resolveVwIdByLabel: (label) => {
-                  const all = virtualWindows.registry.list();
-                  const hit = all.find(w => virtualWindows.registry.spawnTitleOf(w.id) === label);
-                  return hit ? hit.id : null;
-                },
+                virtualWindowsSwitchTo: () => { throw new Error('Virtual windows are unavailable in the essential dashboard'); },
+                resolveVwIdByLabel: () => null,
               },
               termSlash: {
                 slashRuntime: termSlashRuntime,
                 sessionRegistry: sessionRegistry as unknown as DashboardSlashContext['termSlash']['sessionRegistry'],
                 terminalMatrix: terminalMatrix as unknown as DashboardSlashContext['termSlash']['terminalMatrix'],
-                vwRegistry: virtualWindows.registry as unknown as DashboardSlashContext['termSlash']['vwRegistry'],
+                vwRegistry: {
+                  current: () => null,
+                  get: () => null,
+                },
                 broadcastBus: broadcastBus as unknown as DashboardSlashContext['termSlash']['broadcastBus'],
                 channelBus: channelBus as unknown as DashboardSlashContext['termSlash']['channelBus'],
                 openSessionPicker: () => {
@@ -19209,15 +18299,6 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                 }
                 continue;
               }
-              // T7-N2 — spawn coding-agent CLI in a new VW pane.
-              //   /acp-vw [claude|codex]   — legacy, brand via sub-arg
-              //   /claude-vw               — direct alias (default brand claude-code)
-              //   /codex-vw                — direct alias (brand codex)
-              //
-              // Sprint 5B (2026-04-28) removed the `/acp-vw cxn` path
-              // (codex-native via Embodied Agent Bus) — codex-native
-              // source is gone, codex-app-server is canonical.
-              // B-3.d migrated: /codex-vw /acp-vw /claude-vw → registry handlers.
               // B-2.w migrated: /conv → registry handler.
               // H5 P3 · /handoff <fromId> <toBrand> [--channels reasoning,plan]
               //         Cross-agent snapshot-based context transfer.

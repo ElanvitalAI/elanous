@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { readdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { resolveLogTargets } from '../cli/logs-cli.js';
 import { debug } from '../debug/log.js';
@@ -8,7 +9,7 @@ import { isPidAlive } from '../git-fs/worktree.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { loadSelfDevRun, selfDevRunsDir, type SelfDevRunState } from '../self-dev/run-store.js';
 import { listPtyManifestRowsAt } from '../pty-shell/pty-manifest.js';
-import { isTerminatedUnfinishedLifecycle, queryFederatedUnfinishedRunLedgers, resolveFederatedRunLedgerDirectories, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery, type UnfinishedRunLifecycle } from './run-ledger.js';
+import { classifyFederatedLedgerDirectoryReadFailure, isTerminatedUnfinishedLifecycle, queryFederatedUnfinishedRunLedgers, resolveFederatedRunLedgerDirectories, type FederatedUnfinishedRunLedgerEntry, type FederatedUnfinishedRunLedgerQuery, type UnfinishedRunLifecycle } from './run-ledger.js';
 import { SELF_IMPLEMENT_PROGRESS_STAGES } from './orchestrator.js';
 
 export type RunningRunStatus = 'running' | 'probable-running' | 'ended-unclosed' | 'unknown';
@@ -77,8 +78,21 @@ export type LingeringLaunchParentAssessment =
   }
   | { readonly observation: 'indeterminate' };
 
+export interface UnreadableRunningRunsLedger {
+  readonly dir: string;
+  readonly reason: 'unreadable-ledger' | 'unreadable-directory' | 'indeterminate-directory';
+}
+
+export type RunningRunsCount = number | { readonly count: null; readonly lowerBound: number; readonly unreadable: readonly UnreadableRunningRunsLedger[] };
+
 export interface RunningRunsResult {
+  /** Query results supply these fields; direct assessments and existing fixtures remain observational lower-level values. */
+  readonly completeness?: 'complete' | 'partial';
+  readonly unreadable?: readonly UnreadableRunningRunsLedger[];
+  /** Exact on complete observations; otherwise only the observed running-run lower bound is known. */
+  readonly count?: RunningRunsCount;
   readonly entries: readonly RunningRunAssessment[];
+  /** Counts over observed assessments; use count for the federation-wide running quantity. */
   readonly counts: Record<RunningRunStatus, number>;
   readonly total: number;
   readonly countedStatuses: readonly RunningRunStatus[];
@@ -100,6 +114,12 @@ export interface RunningRunsResult {
   };
   /** Additive phase-store observability; queryRunningRuns always supplies this value. */
   readonly phases?: RunningRunsPhaseStoreObservation;
+}
+
+export interface QueriedRunningRunsResult extends RunningRunsResult {
+  readonly completeness: 'complete' | 'partial';
+  readonly unreadable: readonly UnreadableRunningRunsLedger[];
+  readonly count: RunningRunsCount;
 }
 
 function quantityScope<T>(value: T, population: RunningRunsQuantity<T>['population'], observation: RunningRunsObservation): RunningRunsQuantity<T> {
@@ -365,7 +385,7 @@ export function assessRunningRuns(
     if (matchingLedgers.length > 0 && lifecycle === 'live' && pty.unreadable.length === 0 && refs.length === 0) {
       return { runId, status: 'probable-running' as const, presence: 'ledger-live-pty-not-observed' as const, reason: 'ledger-without-live-pty', lifecycle, lastActivityTimestamp, ...phase, ptyUpdatedAt, ledgerDirectories, ptyRefs };
     }
-    const ledgerUnreadable = ledgerObservation.unreadableLedgerCount > 0;
+    const ledgerUnreadable = hasUnreadableLedgerObservation(ledgerObservation);
     const reason = matchingLedgers.length === 0
       ? ledgerUnreadable ? 'ledger-query-unreadable-pty-observed' : 'pty-without-unfinished-ledger'
       : pty.unreadable.length > 0 ? 'pty-query-unreadable'
@@ -387,11 +407,34 @@ export function assessRunningRuns(
     if (!ref.runId) return false;
     return !countedStatuses.includes(entries.find((entry) => entry.runId === ref.runId)?.status ?? 'unknown');
   }).length;
-  return { entries, counts, total, countedStatuses, quantities: quantitySummary({ entries, counts, total, countedStatuses, observation }), observation, lingeringLaunchParents: { observation: 'indeterminate' }, ledger: { ledgerDirectories: [], unreadableLedgerCount: ledgerObservation.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledgerObservation.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledgerObservation.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledgerObservation.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledgerObservation.indeterminateLedgerDirectoryCount }, pty: { unreadable: [...pty.unreadable], observedRefCount: pty.refs.length, withoutRunIdCount, notCountedRefCount }, phases: { targetCount: 0, readableTargetCount: 0, unreadableTargetCount: 0, unreadableTargets: [], discardedNonStageEventCount: 0 } };
+  const partial = hasUnreadableLedgerObservation(ledgerObservation);
+  const unreadable: UnreadableRunningRunsLedger[] = partial
+    ? ledgers.filter((entry) => entry.status === 'ledger-unreadable')
+      .map((entry) => ({ dir: entry.ledgerDirectory, reason: 'unreadable-ledger' }))
+    : [];
+  if (partial) {
+    for (let i = unreadable.length; i < ledgerObservation.unreadableLedgerCount; i += 1) unreadable.push({ dir: '<unlocated-ledger>', reason: 'unreadable-ledger' });
+    for (let i = 0; i < ledgerObservation.unreadableLedgerDirectoryAccessCount; i += 1) unreadable.push({ dir: '<unlocated-ledger-directory>', reason: 'unreadable-directory' });
+    for (let i = 0; i < ledgerObservation.indeterminateLedgerDirectoryCount; i += 1) unreadable.push({ dir: '<unlocated-ledger-directory>', reason: 'indeterminate-directory' });
+  }
+  return { ...(partial ? { completeness: 'partial' as const, unreadable, count: { count: null, lowerBound: counts.running + counts['probable-running'], unreadable } } : {}), entries, counts, total, countedStatuses, quantities: quantitySummary({ entries, counts, total, countedStatuses, observation }), observation, lingeringLaunchParents: { observation: 'indeterminate' }, ledger: { ledgerDirectories: [], unreadableLedgerCount: ledgerObservation.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledgerObservation.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledgerObservation.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledgerObservation.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledgerObservation.indeterminateLedgerDirectoryCount }, pty: { unreadable: [...pty.unreadable], observedRefCount: pty.refs.length, withoutRunIdCount, notCountedRefCount }, phases: { targetCount: 0, readableTargetCount: 0, unreadableTargetCount: 0, unreadableTargets: [], discardedNonStageEventCount: 0 } };
 }
 
-export function queryRunningRuns(options: { includeTest?: boolean; runIds?: readonly string[]; caller?: string; noCache?: boolean } = {}, deps: RunningRunsQueryDeps = {}): RunningRunsResult {
-  const queryLedgers = deps.queryLedgers ?? queryFederatedUnfinishedRunLedgers;
+export function queryRunningRuns(options: { includeTest?: boolean; runIds?: readonly string[]; caller?: string; noCache?: boolean } = {}, deps: RunningRunsQueryDeps = {}): QueriedRunningRunsResult {
+  const directoryFailures = new Map<string, ReturnType<typeof classifyFederatedLedgerDirectoryReadFailure>>();
+  const queryLedgers = deps.queryLedgers ?? ((queryOptions: Parameters<typeof queryFederatedUnfinishedRunLedgers>[0]) => queryFederatedUnfinishedRunLedgers({
+    ...queryOptions,
+    list: (dir) => {
+      try {
+        // A privileged process can enumerate mode 000 directories; still report the denied universe.
+        if ((statSync(dir).mode & 0o555) === 0) throw Object.assign(new Error(`Permission denied: ${dir}`), { code: 'EACCES' });
+        return readdirSync(dir);
+      } catch (error) {
+        directoryFailures.set(dir, classifyFederatedLedgerDirectoryReadFailure(error));
+        throw error;
+      }
+    },
+  }));
   const ledgerDirectories = deps.ledgerDirectories ?? resolveFederatedRunLedgerDirectories;
   const collectLedgerDirectories = deps.ledgerDirectories !== undefined || deps.queryLedgers === undefined;
   const targets = deps.ptyTargets ?? ptyManifestTargets;
@@ -460,6 +503,37 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     }
     const phaseObservation = phaseObservationFor(observedPhases);
     const result = assessRunningRuns(ledger.entries, pty, ledger, observedPhases.events, phaseObservation);
+    const unreadable: UnreadableRunningRunsLedger[] = [...(result.unreadable ?? [])].filter((entry) => entry.reason === 'unreadable-ledger');
+    const failedDirectories = hasUnreadableLedgerObservation(ledger)
+      ? collectedLedgerDirectories.filter((dir) => !ledger.ledgerDirectories.includes(dir))
+      : [];
+    for (const dir of failedDirectories) {
+      let kind = directoryFailures.get(dir);
+      if (kind === undefined) {
+        try {
+          // Injected readers do not expose failure details; probe the candidate once for a reason.
+          if ((statSync(dir).mode & 0o555) === 0) throw Object.assign(new Error(`Permission denied: ${dir}`), { code: 'EACCES' });
+          readdirSync(dir);
+          kind = 'indeterminate';
+        } catch (error) {
+          kind = classifyFederatedLedgerDirectoryReadFailure(error);
+        }
+      }
+      if (kind !== 'missing') unreadable.push({ dir, reason: kind === 'unreadable' ? 'unreadable-directory' : 'indeterminate-directory' });
+    }
+    const unlocatedLedgers = Math.max(0, ledger.unreadableLedgerCount - unreadable.filter((entry) => entry.reason === 'unreadable-ledger').length);
+    for (let i = 0; i < unlocatedLedgers; i += 1) unreadable.push({ dir: '<unlocated-ledger>', reason: 'unreadable-ledger' });
+    const unlocatedAccess = Math.max(0, ledger.unreadableLedgerDirectoryAccessCount - unreadable.filter((entry) => entry.reason === 'unreadable-directory').length);
+    const unlocatedIndeterminate = Math.max(0, ledger.indeterminateLedgerDirectoryCount - unreadable.filter((entry) => entry.reason === 'indeterminate-directory').length);
+    for (let i = 0; i < unlocatedAccess; i += 1) unreadable.push({ dir: '<unlocated-ledger-directory>', reason: 'unreadable-directory' });
+    for (let i = 0; i < unlocatedIndeterminate; i += 1) unreadable.push({ dir: '<unlocated-ledger-directory>', reason: 'indeterminate-directory' });
+    const completeness = hasUnreadableLedgerObservation(ledger) ? 'partial' : 'complete';
+    if (completeness === 'partial') {
+      try { debug.log('self-implement.running-runs', 'partial', { checked: ledger.ledgerDirectories.length + ledger.unreadableLedgerDirectoryCount, unreadable }); } catch {}
+    }
+    const count: RunningRunsCount = completeness === 'partial'
+      ? { count: null, lowerBound: result.counts.running + result.counts['probable-running'], unreadable }
+      : result.counts.running + result.counts['probable-running'];
     const observation = { ...result.observation, includesTest: options.includeTest ?? false };
     const launchParentClassificationStartedAt = Date.now();
     let lingeringLaunchParents: LingeringLaunchParentAssessment;
@@ -470,7 +544,7 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
     } finally {
       launchParentClassificationElapsedMs = Date.now() - launchParentClassificationStartedAt;
     }
-    return { ...result, observation, quantities: quantitySummary({ ...result, observation }), lingeringLaunchParents: lingeringLaunchParents!, ledger: { ledgerDirectories: ledger.ledgerDirectories, unreadableLedgerCount: ledger.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledger.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledger.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledger.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledger.indeterminateLedgerDirectoryCount, cacheHits, cacheMisses }, phases: phaseStoreObservation(observedPhases) };
+    return { ...result, completeness, unreadable, count, observation, quantities: quantitySummary({ ...result, observation }), lingeringLaunchParents: lingeringLaunchParents!, ledger: { ledgerDirectories: ledger.ledgerDirectories, unreadableLedgerCount: ledger.unreadableLedgerCount, unreadableLedgerDirectoryCount: ledger.unreadableLedgerDirectoryCount, missingLedgerDirectoryCount: ledger.missingLedgerDirectoryCount, unreadableLedgerDirectoryAccessCount: ledger.unreadableLedgerDirectoryAccessCount, indeterminateLedgerDirectoryCount: ledger.indeterminateLedgerDirectoryCount, cacheHits, cacheMisses }, phases: phaseStoreObservation(observedPhases) };
   } finally {
     try {
       observeQuery({
@@ -494,18 +568,29 @@ export function queryRunningRuns(options: { includeTest?: boolean; runIds?: read
 
 export function renderRunningRuns(result: RunningRunsResult): string {
   const lingeringLaunchParents = result.lingeringLaunchParents ?? { observation: 'indeterminate' } as const;
+  const partial = (result.count !== undefined && typeof result.count !== 'number' && result.count.count === null)
+    || result.completeness === 'partial' || hasUnreadableLedgerObservation(result.ledger) || (result.unreadable?.length ?? 0) > 0;
+  const lowerBound = result.count !== undefined && typeof result.count !== 'number'
+    ? result.count.lowerBound : result.counts.running + result.counts['probable-running'];
+  const unreadable = result.unreadable ?? (result.count !== undefined && typeof result.count !== 'number' ? result.count.unreadable : []);
   return [
-    `running runs: ${result.counts.running + result.counts['probable-running']} confirmed: ${result.counts.running} probable: ${result.counts['probable-running']} countedStatuses=${result.countedStatuses.join(',')}`,
-    `total assessments: ${result.total} ended-unclosed: ${result.counts['ended-unclosed']} unknown: ${result.counts.unknown}`,
+    partial
+      ? `running runs: unknown (at least ${lowerBound}) unreadable: ${unreadable.map((item) => `${item.dir}:${item.reason}`).join(',')}`
+      : `running runs: ${result.counts.running + result.counts['probable-running']} confirmed: ${result.counts.running} probable: ${result.counts['probable-running']} countedStatuses=${result.countedStatuses.join(',')}`,
+    partial
+      ? `total assessments: unknown (at least ${result.entries.length})`
+      : `total assessments: ${result.total} ended-unclosed: ${result.counts['ended-unclosed']} unknown: ${result.counts.unknown}`,
     'observation limit: runs still in the post-launch authoring window and not yet recorded in the run ledger are not counted',
-    `lingering launch parents: ${lingeringLaunchParents.observation === 'observed' ? `${lingeringLaunchParents.count} without pid: ${lingeringLaunchParents.withoutPidCount} uncounted: ${lingeringLaunchParents.uncountedCount} reused pid: ${lingeringLaunchParents.reusedPidCount}` : 'indeterminate'}`,
+    `lingering launch parents: ${!partial && lingeringLaunchParents.observation === 'observed' ? `${lingeringLaunchParents.count} without pid: ${lingeringLaunchParents.withoutPidCount} uncounted: ${lingeringLaunchParents.uncountedCount} reused pid: ${lingeringLaunchParents.reusedPidCount}` : 'indeterminate'}`,
     `observation scope: ${observationScopeText(result.observation)}`,
     `ledger directories: ${result.ledger.ledgerDirectories.length} unreadable ledgers: ${result.ledger.unreadableLedgerCount} unreadable ledger directories: ${result.ledger.unreadableLedgerDirectoryCount} missing ledger directories: ${result.ledger.missingLedgerDirectoryCount} unreadable ledger directory accesses: ${result.ledger.unreadableLedgerDirectoryAccessCount} indeterminate ledger directories: ${result.ledger.indeterminateLedgerDirectoryCount}`,
     `observed live ptys: ${result.pty.observedRefCount} without runId: ${result.pty.withoutRunIdCount} not counted as running: ${result.pty.notCountedRefCount}`,
     `unreadable pty roots: ${result.pty.unreadable.join(',') || 'none'}`,
     `phase stores: ${result.phases?.targetCount ?? 0} readable: ${result.phases?.readableTargetCount ?? 0} unreadable: ${result.phases?.unreadableTargetCount ?? 0} unreadable targets: ${result.phases?.unreadableTargets.join(',') || 'none'} non-stage events discarded: ${result.phases?.discardedNonStageEventCount ?? 0}`,
     ...result.entries.map((entry) => `runId=${entry.runId} status=${entry.status} presence=${entry.presence} reason=${entry.reason} lifecycle=${entry.lifecycle ?? 'none'} lastActivity=${entry.lastActivityTimestamp ?? 'null'} phaseObservation=${entry.phaseObservation ?? 'not-observed'} lastPhase=${entry.lastPhase ?? 'none'} lastPhaseObservedAt=${entry.lastPhaseObservedAt ?? 'none'} ledgerDirectories=${entry.ledgerDirectories.join(',') || 'none'} ptyRefs=${entry.ptyRefs.map((ref) => `${ref.instance}:${ref.id}`).join(',') || 'none'}`),
-    `quantity scope: running=${result.quantities.running.value} population=${result.quantities.running.population}; total=${result.quantities.total.value} entries=${result.quantities.entries.value} population=${result.quantities.total.population}; ${observationScopeText(result.observation)}`,
+    partial
+      ? `quantity scope: running=unknown lowerBound=${lowerBound} population=${result.quantities.running.population}; total=unknown entries=unknown population=${result.quantities.total.population}; ${observationScopeText(result.observation)}`
+      : `quantity scope: running=${result.quantities.running.value} population=${result.quantities.running.population}; total=${result.quantities.total.value} entries=${result.quantities.entries.value} population=${result.quantities.total.population}; ${observationScopeText(result.observation)}`,
     'quantity limit: runs still in the post-launch authoring window and not yet recorded in the run ledger are not counted',
   ].join('\n');
 }

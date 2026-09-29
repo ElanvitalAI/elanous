@@ -1,6 +1,9 @@
 // P5 (2026-05-10) — `pwa show` (current project view) unit coverage.
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { setResolveDaemonEndpointForTest } from '../src/nexus/daemon-endpoint.js';
+
+afterEach(() => setResolveDaemonEndpointForTest(null));
 
 import { runPwaShow } from '../src/cli/pwa-show.js';
 import type { PwaInstanceListing } from '../src/cli/pwa-registry.js';
@@ -164,6 +167,26 @@ describe('runPwaShow', () => {
     const parsed = JSON.parse(out.logs[0]!);
     expect(parsed.instance).toBeNull();
     expect(parsed.cwd).toBe('/tmp/Z');
+  });
+
+  test('missing registry port uses watch endpoint port for both links', async () => {
+    const out = makeOut();
+    let purpose: string | undefined;
+    setResolveDaemonEndpointForTest((opts) => {
+      purpose = opts.purpose;
+      return { baseUrl: 'http://127.0.0.1:31420', healthUrl: 'http://127.0.0.1:31420/v1/health', pwaUrl: 'http://127.0.0.1:31420/app/', source: 'lifecycle' };
+    });
+    const result = await runPwaShow({ out, cwd: '/tmp/A', listFn: () => [fixture({ ports: [], shareMounted: true })], probeFn: async () => TS_ALIVE });
+    expect(purpose).toBe('watch');
+    expect(result.urls).toEqual({ loopback: 'http://127.0.0.1:31420/app/', tailnet: 'https://mbp.tail-abc.ts.net:31420/app/' });
+  });
+
+  test('missing registry port and endpoint emits only unknown-address line, without links', async () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const out = makeOut();
+    const result = await runPwaShow({ out, cwd: '/tmp/A', listFn: () => [fixture({ ports: [], shareMounted: true })], probeFn: async () => TS_ALIVE });
+    expect(result.urls).toBeUndefined();
+    expect(out.logs).toEqual(['데몬 주소를 모른다 — `elanous nexus run` 먼저']);
   });
 
   test('HMR mode (2 ports) → loopback uses first port (nexus)', async () => {

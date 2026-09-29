@@ -2,7 +2,7 @@
  * elanous logs CLI — 파서/포맷 계약 (통합 로그 패브릭 LF3 · 2026-07-13).
  * DB/네트워크 미접촉 — 순수 함수만.
  */
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -13,13 +13,106 @@ import {
   aggregateListEvents, buildQuery, collectObservedEventNames, effectiveLogLimit, eventCategoryWarning, eventNameDistance, eventNameHint, eventNameVerdict, EVENT_NAME_HINT_SHOWN, EVENT_NAME_HINT_WINDOW_MS, formatLogInstance, formatLogLine, formatRemoteLogLine, grepPhraseWarning, isNameLikeEvent, limitReachedHint, limitReachedJsonMeta, limitReachedStderrSignal, matchesReworkRecurrenceDisagreement, multiSurfaceDuplicateJsonMeta, otherInstanceHint, rankNearbyEventNames, renderLogJsonLine, renderRemoteLogJsonLine,
   probeOtherInstanceMatches, quoteShellArg, resolveLogTargets, resolveLogsRemoteFlag, renderAxisExplanation, renderLogAxisDiscovery, runCoverageHint, UNCLASSIFIED_PREVIEW, renderGatedHint, runLogsCli, nonCurrentScopeNames, zeroResultFilterRelaxationWarning, type LogTarget,
   liveFetchRemoteLogs,
+  runLogsLevel,
 } from './logs-cli.js';
 import { LogStore, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import type { LogInstanceView } from '../mss/logging/instance-registry.js';
 import { RemotesStore } from './remotes.js';
 import { setElanousConfigDir, getElanousConfigDirOverride, resetElanousConfigDir } from '../elanous-config-dir.js';
+import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import { program } from '../index.js';
 import { HARNESS_SPACE_KINDS } from '../harness/harness-space.js';
+
+describe('logs --top-failures', () => {
+  it('uses the selected store and time window; default mode still renders individual lines', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logs-top-failures-'));
+    const dbPath = join(dir, 'logs.db');
+    const store = new LogStore(dbPath, { instance: 'test:top' });
+    const now = Date.now();
+    try {
+      store.insertBatch([
+        ...Array.from({ length: 25 }, (_, i) => ({
+          surface: 'pwa', rec: { ts: new Date(now - 60_000 + i * 100).toISOString(), category: 'webterm.acp.close',
+            event: 'close', data: { reason: 'socket closed: 1008: auth_failed', sessionId: `session-${i}` } },
+        })),
+        { surface: 'pwa', rec: { ts: new Date(now - 7200_000).toISOString(), category: 'webterm.acp.close',
+          event: 'close', data: { reason: 'socket closed: 1008: auth_failed' } } },
+      ]);
+      const targets = () => ({ targets: [{ name: 'test:top', dbPath }] });
+      const lines: string[] = [];
+      const output: string[] = [];
+      const spy = spyOn(console, 'log').mockImplementation((...args) => { lines.push(args.join(' ')); });
+      const stdoutWrite = process.stdout.write;
+      try {
+        process.stdout.write = ((chunk: string | Uint8Array, callback?: (error?: Error | null) => void) => {
+          output.push(String(chunk));
+          callback?.();
+          return true;
+        }) as typeof process.stdout.write;
+        expect(await runLogsCli({ topFailures: true, since: '10m', threshold: '20', json: true }, { resolveTargets: targets })).toBe(0);
+        const groups = JSON.parse(lines.join('\n')).groups;
+        expect(groups).toHaveLength(1);
+        expect(groups[0]).toMatchObject({ area: 'webterm.acp', count: 25 });
+        expect(groups[0].explanation).toContain('소유자 토큰');
+        lines.length = 0;
+        expect(await runLogsCli({ topFailures: true, since: '10m', threshold: '20' }, { resolveTargets: targets })).toBe(0);
+        expect(lines.join('\n')).toContain('25  webterm.acp  socket closed: #: auth_failed');
+        expect(lines.join('\n')).toContain('소유자 토큰');
+        lines.length = 0;
+        expect(await runLogsCli({ topFailures: true, since: '10m', category: 'unrelated', threshold: '20', json: true }, { resolveTargets: targets })).toBe(0);
+        expect(JSON.parse(lines.join('\n')).groups).toEqual([]);
+        lines.length = 0;
+        expect(await runLogsCli({ since: '10m', limit: '1' }, { resolveTargets: targets })).toBe(0);
+        expect(lines.join('\n')).toContain('--before 25');
+        expect(output.join('')).toContain('webterm.acp.close close');
+        expect(output.join('')).not.toContain('개수  영역  사유');
+      } finally { process.stdout.write = stdoutWrite; spy.mockRestore(); }
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('aggregates a large window without treating a healthy store as unreadable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logs-top-failures-large-'));
+    const dbPath = join(dir, 'logs.db');
+    const store = new LogStore(dbPath, { instance: 'test:large' });
+    const now = Date.now();
+    try {
+      for (let batch = 0; batch < 7; batch++) {
+        store.insertBatch(Array.from({ length: 20_000 }, (_, i) => ({
+          surface: 'pwa', rec: { ts: new Date(now - 30_000 + batch * 100 + i % 100).toISOString(),
+            category: 'webterm.acp.close', event: 'close', data: { reason: 'socket closed: 1008: auth_failed' } },
+        })));
+      }
+      const lines: string[] = [];
+      const spy = spyOn(console, 'log').mockImplementation((...args) => { lines.push(args.join(' ')); });
+      try {
+        expect(await runLogsCli({ topFailures: true, since: '10m', json: true },
+          { resolveTargets: () => ({ targets: [{ name: 'test:large', dbPath }] }) })).toBe(0);
+        const result = JSON.parse(lines.join('\n'));
+        expect(result.unreadable).toEqual([]);
+        expect(result.groups).toHaveLength(1);
+        expect(result.groups[0].count).toBe(140_000);
+      } finally { spy.mockRestore(); }
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('rejects invalid thresholds and follow without opening a store', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logs-top-failures-invalid-'));
+    const dbPath = join(dir, 'logs.db');
+    try {
+      new LogStore(dbPath).close();
+      const targets = () => ({ targets: [{ name: 'fixture', dbPath }] });
+      const errors: string[] = [];
+      const spy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+      try {
+        expect(await runLogsCli({ topFailures: true, threshold: '0' }, { resolveTargets: targets })).toBe(1);
+        expect(errors.join('\n')).toContain('--threshold');
+        errors.length = 0;
+        expect(await runLogsCli({ topFailures: true, follow: true }, { resolveTargets: targets })).toBe(1);
+        expect(errors.join('\n')).toContain('--follow');
+      } finally { spy.mockRestore(); }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('0건 이벤트 이름 안내 — 이미 찍힌 기록에서만', () => {
   it('이름 모양 규칙은 토큰은 남기고 주소·식별자·문장은 버린다', () => {
@@ -855,30 +948,21 @@ describe('runLogsCli — 사람용 출력 wiring', () => {
         expect.objectContaining({ category: 'run-coverage', event: 'second', data: '{"runId":"run-a"}' }),
         expect.objectContaining({ category: 'run-coverage', event: 'third', data: '{"runId":"run-b"}' }),
       ]);
-      const expressions = [
-        { args: ['-s', '[.[]|select(._meta==null)]|length'] },
-        { args: ['-s', 'map(select(._meta==null))'] },
-        { args: ['-r', 'select(._meta==null)'] },
-      ];
-      const filtered = (args: string[], stdout: string) => spawnSync('jq', args, {
-        input: stdout, encoding: 'utf8', timeout: 5_000,
-      });
-      for (const { args } of expressions) {
-        const result = filtered(args, json.stdout);
-        expect(result.status).toBe(0);
-        expect(result.stdout).not.toContain('log-query-limit');
-      }
-      expect(filtered(expressions[0]!.args, json.stdout).stdout.trim()).toBe('2');
+      const payloadRows = (stdout: string) => stdout.split('\n').filter(Boolean)
+        .map((line) => JSON.parse(line) as { _meta?: { type: string }; category?: string; event?: string })
+        .filter((entry) => entry._meta == null);
+      const cappedPayload = payloadRows(json.stdout);
+      expect(cappedPayload).toHaveLength(2);
+      expect(cappedPayload.map((entry) => entry.event)).toEqual(['second', 'third']);
+      expect(cappedPayload.every((entry) => entry.category === 'run-coverage')).toBe(true);
 
       const uncapped = runLogs(['--instance', 'prod', '--json', '--category', 'run-coverage', '--limit', '4'], home);
       expect(uncapped.status).toBe(0);
       expect(uncapped.stderr).not.toContain('elanous logs: result may be truncated');
-      expect(filtered(expressions[0]!.args, uncapped.stdout).stdout.trim()).toBe('3');
-      for (const { args } of expressions.slice(1)) {
-        const result = filtered(args, uncapped.stdout);
-        expect(result.status).toBe(0);
-        expect(result.stdout).not.toContain('log-query-limit');
-      }
+      const uncappedPayload = payloadRows(uncapped.stdout);
+      expect(uncappedPayload).toHaveLength(3);
+      expect(uncappedPayload.map((entry) => entry.event)).toEqual(['first', 'second', 'third']);
+      expect(uncappedPayload.every((entry) => entry._meta == null)).toBe(true);
 
       const empty = runLogs(['--instance', 'prod', '--category', 'absent-run-coverage'], home);
       expect(empty.status).toBe(0);
@@ -3215,5 +3299,51 @@ describe('runLogsCli — remote /v1/logs', () => {
     expect(resolveLogsRemoteFlag({ r: true })).toBe(true);
     expect(resolveLogsRemoteFlag({ remote: 'iso' })).toBe('iso');
     expect(resolveLogsRemoteFlag({})).toBeUndefined();
+  });
+
+  it('logs level asks the injected daemon and does not guess 31415', async () => {
+    const fetched: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      fetched.push(String(input));
+      return new Response(JSON.stringify({ ok: true, level: 'info', gates: {} }), { status: 200 });
+    }) as typeof fetch;
+    const errors: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    setResolveDaemonEndpointForTest(() => ({
+      baseUrl: 'http://127.0.0.1:45678', healthUrl: 'http://127.0.0.1:45678/v1/health', pwaUrl: 'http://127.0.0.1:45678/app/', source: 'registry',
+    }));
+    try {
+      expect(await runLogsLevel(undefined, {})).toBe(0);
+      expect(fetched).toEqual(['http://127.0.0.1:45678/v1/logs/level']);
+      expect(fetched.join(' ')).not.toContain('31415');
+    } finally {
+      setResolveDaemonEndpointForTest(null);
+      globalThis.fetch = original;
+      spy.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it('logs level with no daemon does not call 31415', async () => {
+    const fetched: string[] = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      fetched.push(String(input));
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    const errors: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args) => { errors.push(args.join(' ')); });
+    setResolveDaemonEndpointForTest(() => null);
+    try {
+      expect(await runLogsLevel(undefined, {})).toBe(1);
+      expect(fetched).toEqual([]);
+      expect(errors.join(' ')).not.toContain('31415');
+    } finally {
+      setResolveDaemonEndpointForTest(null);
+      globalThis.fetch = original;
+      spy.mockRestore();
+    }
   });
 });

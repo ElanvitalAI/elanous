@@ -164,7 +164,11 @@ export function lintArtifact(input: LintInput): LintResult {
   // ⑤ 라운드 카드 + 색깔 좌측 보더 — ⛔ «같은 규칙 블록» 안에서만 본다
   for (const m of css.matchAll(/\{[^}]*\}/g)) {
     const b = m[0];
-    if (/border-radius\s*:\s*(?!0)/.test(b) && /border-left\s*:\s*[^;]*(#|rgb|var\()/.test(b)) {
+    // 🩸 2026-09-28 E0·E1: 두 판 모두 «커피콩 그림»(`border-radius: 50%` 타원 ⊕ 한쪽 선)에 걸렸다.
+    //    카드 타일은 둥근 «모서리»지 타원이 아니다 — 30% 이상 퍼센트·`/` 타원 반경은 그림으로 보고 뺀다.
+    const radius = /border-radius\s*:\s*([^;}]*)/.exec(b)?.[1] ?? '';
+    const shape = radius.includes('/') || [...radius.matchAll(/(\d+(?:\.\d+)?)%/g)].some((p) => Number(p[1]) >= 30);
+    if (/border-radius\s*:\s*(?!0)/.test(b) && !shape && /border-left\s*:\s*[^;]*(#|rgb|var\()/.test(b)) {
       push('rounded-card-left-accent', 'p0', { line: lineOf(css, m.index ?? 0), evidence: b.replace(/\s+/g, ' ').slice(0, 90) },
         '라운드 + 색 좌측 보더는 전형적 「AI 대시보드 타일」이다 — 둘 중 하나를 뺀다');
     }

@@ -17,7 +17,9 @@
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21.
  */
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
+import { emitDecision } from '../live/detail-switch.js';
+import { parentUnlandedProgressLine } from './run-supervisor.js';
 import { mkdirSync, openSync, writeFileSync, closeSync, renameSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { availableParallelism, cpus } from 'node:os';
@@ -237,12 +239,15 @@ interface SelfDevTerminalOutcome {
   stage: string | null;
   merged: boolean | null;
   prUrl: string | null;
+  blockReason?: 'parent-unlanded';
+  parentPrNumber?: number | null;
+  parentNoPr?: true;
 }
 
 export interface SelfDevJobResult {
   taskId: string;
   feature: string;
-  /** Terminal status — done | failed | cancelled. */
+  /** Run outcome — done | failed | cancelled | blocked (awaiting parent landing). */
   status: TaskStatus;
   error?: { code: string; message: string };
   durationMs?: number;
@@ -254,6 +259,13 @@ export interface SelfDevJobResult {
   prUrl?: string;
   prNumber?: number;
   merged?: boolean;
+  /** Child commit SHA, when observed by the Pod/host. */
+  checkedHeadCommit?: string;
+  /** A dependency is done but its result is not on main; no child was launched. */
+  blockReason?: 'parent-unlanded';
+  parentPrNumber?: number;
+  /** The upstream completed in a worktree without opening a PR. */
+  parentNoPr?: true;
   // ⭐⭐⭐ `A1`(2026-08-19 · 대표 *"R3 가 서브 프로세스여도 잘 도는 안"*) — ***판정 3종***.
   //   🚨 이 셋이 트리아지의 입력 전부인데 종전엔 자식 → 부모 경계에서 «전부» 사라졌다.
   //     값은 전선에 «실려 있었고»(자식이 `r.result` 를 통째로 낸다) 파서가 버렸다.
@@ -329,6 +341,37 @@ export interface SelfDevResultSummary {
   /** Terminal shards that did not confirm a landing. */
   unlanded: number;
 }
+
+/** Read-only landing probe. An unobservable PR/commit is not evidence of landing. */
+export function dependencyOnMain(
+  result: Pick<SelfDevJobResult, 'prNumber' | 'stage' | 'merged' | 'checkedHeadCommit'>,
+  probe: { prMerged: (number: number) => boolean; commitOnMain: (commit: string) => boolean },
+): boolean {
+  if (result.prNumber !== undefined) {
+    try { if (probe.prMerged(result.prNumber)) return true; } catch { /* unknown is not landed */ }
+  }
+  if (result.checkedHeadCommit) {
+    try { if (probe.commitOnMain(result.checkedHeadCommit)) return true; } catch { /* unknown is not landed */ }
+  }
+  return false;
+}
+
+/** A merged PR lands a dependency only when its base is main. */
+export function prMergedOnMain(number: number, readPr: (number: number) => string = (pr) =>
+  execFileSync('gh', ['pr', 'view', String(pr), '--json', 'state,baseRefName'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000 })): boolean {
+  const pr = JSON.parse(readPr(number)) as { state?: unknown; baseRefName?: unknown };
+  return pr.state === 'MERGED' && pr.baseRefName === 'main';
+}
+
+const defaultLandingProbe = {
+  prMerged: prMergedOnMain,
+  commitOnMain: (commit: string): boolean => {
+    if (!/^[0-9a-f]{40}$/i.test(commit)) return false;
+    // git-spawn-allow: read-only ancestry check against the cached remote main ref.
+    try { execFileSync('git', ['merge-base', '--is-ancestor', commit, 'refs/remotes/origin/main'], { stdio: 'ignore' }); return true; }
+    catch { return false; }
+  },
+};
 
 export function hasLanded(result: SelfDevJobResult): boolean {
   return result.stage === 'merged' && result.merged === true;
@@ -409,6 +452,7 @@ export type FailureKind =
    * 가리킬 PR(prUrl 또는 prNumber)이 있을 때만. 없으면 기존 수렴 실패로 남긴다.
    */
   | 'awaiting-human'
+  | 'parent-unlanded'
   /**
    * 구현·리뷰가 끝난 결과가 main 정합(`stage: merge-conflict`)에서 멈췄다.
    * 구현 결함이 아니므로 재구현하지 않고 사람에게 넘긴다 — 결과는 보존 워크트리·브랜치에 있다.
@@ -467,6 +511,7 @@ export function triageActionFor(kind: FailureKind): TriageAction {
     case 'oversized-goal': return 'add-repair-task';
     case 'false-failure': return 'no-action';
     case 'awaiting-human':
+    case 'parent-unlanded':
     case 'main-sync-blocked':
     case 'provider-rejected': return 'needs-human';
     default: return 'needs-human';
@@ -542,6 +587,7 @@ export function classifyFailure(
   result: SelfDevJobResult,
   preflightWarning: PreflightWarningObservation = 'unknown',
 ): FailureKind | null {
+  if (result.blockReason === 'parent-unlanded') return 'parent-unlanded';
   const ledgerKind = result.failureClassification === undefined
     ? undefined
     : result.failureClassification === 'run-deadline-exceeded'
@@ -663,7 +709,9 @@ export function classifyFailures(
     const error = result.error;
     const awaitingHuman = kind === 'awaiting-human'
       ? failureObservationFields('AWAITING_HUMAN', openPrAwaitingHumanMessage(result))
-      : undefined;
+      : kind === 'parent-unlanded'
+        ? failureObservationFields('PARENT_UNLANDED', parentUnlandedProgressLine(result.feature.split('\n')[0]!, result.parentPrNumber, result.parentNoPr === true))
+        : undefined;
     return [{
       taskId: result.taskId,
       stage: result.stage ?? null,
@@ -690,7 +738,7 @@ export function summarizeFailureKinds(results: SelfDevJobResult[]): {
       else if (failure.kind === 'transient') summary.transient++;
       else if (failure.kind === 'blocked-upstream') summary.blockedUpstream++;
       else if (failure.kind === 'main-sync-blocked') summary.mainSyncBlocked++;
-      else summary.unclassified++;
+      else if (failure.kind !== 'parent-unlanded') summary.unclassified++;
       return summary;
     },
     { falseFailure: 0, unconverged: 0, unclassified: 0, transient: 0, blockedUpstream: 0, unconvergedDecomposable: 0, mainSyncBlocked: 0 },
@@ -834,6 +882,10 @@ export interface OrchestrateSelfDevOptions {
   verifyDeliverable?: (target: string) => Promise<DeployVerifyResult>;
   /** Launch seam — default spawns real subprocesses. Tests inject a fake. */
   spawn?: SelfImplementJobSpawn;
+  /** Read-only landing seam; production queries PR state and cached origin/main. */
+  landingProbe?: { prMerged: (number: number) => boolean; commitOnMain: (commit: string) => boolean };
+  /** Dispatch decision observation seam; production uses the live-detail switch. */
+  emitDispatchDecision?: typeof emitDecision;
   /** Run identity for the per-run PID and labelled Pod cleanup. */
   runId?: string;
   /** Override the run directory root for isolated tests. */
@@ -1173,10 +1225,19 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
   const resumeDispositionByGoal = new Map<SelfDevGoal, Exclude<ResumeDisposition, 'skip'>>();
   const goalsToRun: SelfDevGoal[] = [];
   const held = new Set(opts.resumeHold ?? []);
+  const localGoals = new Map(opts.goals.map((goal, index) => [goal.id ?? String(index), goal]));
+  // Landing is required only for declared dependencies. Shared hotPaths serialize execution
+  // order (TOX edges below) but do not make an independent goal wait for another goal's PR.
+  const dependencyGoals = (goal: SelfDevGoal): SelfDevGoal[] => [...new Set(
+    (goal.dependsOn ?? []).map((id) => localGoals.get(id)).filter((parent): parent is SelfDevGoal => parent !== undefined && parent !== goal),
+  )];
+  const parents = new Set(opts.goals.flatMap(dependencyGoals));
+  const landingProbe = opts.landingProbe ?? defaultLandingProbe;
   for (const g of opts.goals) {
     const prior = priorByResumeKey.get(resumeKey(g.feature));
     if (prior) {
-      const disposition = held.has(prior.taskId) ? 'skip' : classifyResumeDisposition(prior);
+      const disposition = held.has(prior.taskId) || (parents.has(g) && prior.status === 'done' && prior.stage === 'pr-opened')
+        ? 'skip' : classifyResumeDisposition(prior);
       if (held.has(prior.taskId)) {
         debug.log('self-dev.orchestrate', 'resume.held', { taskId: prior.taskId, stage: prior.stage ?? null, wouldHaveBeen: classifyResumeDisposition(prior) });
       }
@@ -1310,6 +1371,8 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
 
   return new Promise<SelfDevJobResult[]>((resolve, reject) => {
     const results = new Map<string, SelfDevJobResult>();
+    const blockedByParent = new Set<string>();
+    const resumedByTaskId = new Map(resumedResults.map((result) => [result.taskId, result]));
     let settled = false;
     let interrupted: NodeJS.Signals | undefined;
     const signals = opts.signalSource ?? process;
@@ -1393,6 +1456,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           ...(disp?.prUrl ? { prUrl: disp.prUrl } : {}),
           ...(disp?.prNumber !== undefined ? { prNumber: disp.prNumber } : {}),
           ...(disp?.merged !== undefined ? { merged: disp.merged } : {}),
+          ...(disp?.checkedHeadCommit ? { checkedHeadCommit: disp.checkedHeadCommit } : {}),
           // ⭐ `A1` — 판정 3종을 «끝까지» 옮긴다. 여기서 빠지면 트리아지가 눈을 잃는다.
           ...(disp?.mergeReason ? { mergeReason: disp.mergeReason } : {}),
           ...(!cancelling && disp?.stopReason ? { stopReason: disp.stopReason } : {}),
@@ -1462,7 +1526,9 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
         unconverged: failureKinds.unconverged,
         unclassified: failureKinds.unclassified,
         mainSyncBlocked: failureKinds.mainSyncBlocked,
+        parentUnlanded: out.filter((r) => r.blockReason === 'parent-unlanded').length,
         failures,
+        blockedParents: out.filter((r) => r.blockReason === 'parent-unlanded').map((r) => ({ taskId: r.taskId, blockReason: r.blockReason, parentPrNumber: r.parentPrNumber ?? null, ...(r.parentNoPr ? { parentNoPr: true } : {}) })),
         ...(unionDiff ? { unionDiff } : {}),
       });
       const outcomes: SelfDevTerminalOutcome[] = out.map((result) => ({
@@ -1471,6 +1537,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
         stage: result.stage ?? null,
         merged: result.merged ?? null,
         prUrl: result.prUrl ?? null,
+        ...(result.blockReason ? { blockReason: result.blockReason, parentPrNumber: result.parentPrNumber ?? null, ...(result.parentNoPr ? { parentNoPr: true } : {}) } : {}),
       }));
       debug.log('self-dev.orchestrate', 'done', {
         total: out.length,
@@ -1498,6 +1565,52 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       return (OPEN_TASK_STATUSES as readonly TaskStatus[]).reduce((n, s) => n + c[s], 0);
     };
 
+    // Guard the TOX ready set (including dependencies carried from a prior checkpoint)
+    // before tick can turn ready into running. The parent's completion, not the child's
+    // merge/PR settings, determines whether a landing check is required.
+    const guardUnlandedParents = (): void => {
+      for (const { task, goal } of created) {
+        const current = graph.getTask(task.id);
+        if (!current || (current.status !== 'ready' && current.status !== 'blocked')) continue;
+        const parentGoals = dependencyGoals(goal);
+        if (!parentGoals.length) continue;
+        const missing = parentGoals.flatMap((parent) => {
+          const parentId = taskIdByGoal.get(parent);
+          if (!parentId) return [];
+          const prior = resumedByTaskId.get(parentId);
+          const live = results.get(parentId);
+          const disp = doneBySpace.get(spaceIdByTask.get(parentId) ?? '')?.disposition;
+          const result = prior ?? (live && { ...live, stage: disp?.stage, merged: disp?.merged, prUrl: disp?.prUrl, prNumber: disp?.prNumber, checkedHeadCommit: disp?.checkedHeadCommit });
+          if (!result || result.status !== 'done') return [];
+          // Default auto-merge scheduling and legacy no-disposition results stay unchanged.
+          // A PR completion or explicitly unlanded parent must be checked, regardless of the child's settings.
+          if (result.stage !== 'pr-opened' && result.stage !== 'worktree-completed'
+            && result.merged !== false && !(parent.openPr === true && parent.autoMerge === false)) return [];
+          return dependencyOnMain(result, landingProbe) ? [] : [result];
+        })[0];
+        if (!missing) continue;
+        // TOX permits ready → backlog → blocked, but not ready → blocked directly.
+        if (current.status === 'ready') graph.updateTask(task.id, { status: 'backlog' }, { now: now() });
+        if (graph.getTask(task.id)?.status === 'backlog') graph.updateTask(task.id, { status: 'blocked' }, { now: now() });
+        const parentNoPr = missing.stage === 'worktree-completed' && missing.prNumber === undefined && !missing.prUrl;
+        const blocked: SelfDevJobResult = {
+          taskId: task.id, feature: goal.feature, status: 'blocked', blockReason: 'parent-unlanded',
+          ...(missing.prNumber === undefined ? {} : { parentPrNumber: missing.prNumber }),
+          ...(parentNoPr ? { parentNoPr: true } : {}),
+        };
+        results.set(task.id, blocked);
+        if (blockedByParent.has(task.id)) continue;
+        blockedByParent.add(task.id);
+        const line = parentUnlandedProgressLine(goal.feature.split('\n')[0]!, missing.prNumber, parentNoPr);
+        console.error(line);
+        debug.log('self-dev.orchestrate', 'parent-unlanded', { taskId: task.id, blockReason: 'parent-unlanded', parentPrNumber: missing.prNumber ?? null, ...(parentNoPr ? { parentNoPr: true } : {}), progress: line });
+        const reason = parentNoPr ? '앞 조각 커밋이 main 에 없다'
+          : missing.prNumber === undefined ? '앞 조각 PR 번호를 알 수 없고 main 착지가 확인되지 않았다'
+            : `앞 조각 PR #${missing.prNumber} 이 main 에 없다`;
+        (opts.emitDispatchDecision ?? emitDecision)({ kind: 'ESCALATE', what: `조각 ${goal.feature.split('\n')[0]} 대기`, reason, purpose: '없는 토대 위에 짓지 않는다', target: '사람(부모 승인·병합)', phase: 'dispatch', ...(missing.prNumber === undefined ? {} : { refs: { pr: missing.prNumber } }), ...(runId ? { runId } : {}) });
+      }
+    };
+
     // Re-tick deferred past the current microtask so the dispatcher's
     // `monitor().finally` (which frees the concurrency slot) runs first —
     // else the re-tick sees a stale active count and defers on cap.
@@ -1505,6 +1618,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       queueMicrotask(() => {
         if (settled || cancelling) return;
         graph.promoteReady({ now: now() });
+        guardUnlandedParents();
         const { dispatched } = dispatcher.tick();
         doCheckpoint();   // S3 — persist progress each cycle (crash-resumable)
         if (openCount() === 0) { finishOrReject(); return; }
@@ -1665,7 +1779,10 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
 
     // Kickoff.
     if (!cancelling) graph.promoteReady({ now: now() });
-    if (!cancelling) dispatcher.tick();
-    if (!cancelling && openCount() === 0) finishOrReject();
+    if (!cancelling) guardUnlandedParents();
+    if (!cancelling) {
+      const { dispatched } = dispatcher.tick();
+      if (openCount() === 0 || (blockedByParent.size > 0 && dispatched.length === 0 && graph.listRunning().length === 0)) finishOrReject();
+    }
   });
 }

@@ -4,9 +4,8 @@
 // command + args. Adding a new backend is one entry here plus an npm
 // install — no per-backend code path required.
 //
-// The packages we depend on are vendored ACP wrappers from zed and
-// the OpenAI org. They wrap the underlying CLI / SDK and expose ACP
-// over stdio so we can stay on the client side.
+// The packages we depend on wrap the underlying CLI / SDK and expose
+// ACP over stdio so we can stay on the client side.
 
 import { isGrokAvailable } from './grok-auth-probe.js';
 
@@ -59,14 +58,11 @@ export const ACP_BACKENDS: Record<string, AcpBackendSpec> = {
   claude: {
     id: 'claude',
     label: 'Claude Code (Anthropic)',
-    command: 'claude-code-acp',
+    command: 'claude-agent-acp',
     args: [],
-    npmPackage: '@zed-industries/claude-code-acp',
-    // Pin to the version we tested with. claude-code-acp itself
-    // pins @agentclientprotocol/sdk@0.14.1, so we match that on
-    // our SDK side too — protocol versions agree without a
-    // negotiation surprise.
-    npmVersion: '0.16.2',
+    npmPackage: '@agentclientprotocol/claude-agent-acp',
+    // This adapter pins @agentclientprotocol/sdk@1.5.0; match our SDK pin.
+    npmVersion: '0.81.2',
   },
   gemini: {
     id: 'gemini',

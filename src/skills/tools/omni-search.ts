@@ -35,6 +35,16 @@ export interface OmniSearchResult {
   };
 }
 
+export type OmniSearchEngineEvent =
+  | { engine: string; phase: 'start' }
+  | { engine: string; phase: 'complete'; hits: number; durationMs: number; error?: string };
+
+export interface OmniSearchDispatchOpts {
+  /** Observational only: callback failures must not interrupt a provider search. */
+  onEngine?: (event: OmniSearchEngineEvent) => void;
+  onSource?: (source: WebSearchHit & { engine: string }) => void;
+}
+
 const DEFAULT_LIMIT = 5;
 const MAX_LIMIT = 20;
 
@@ -63,7 +73,10 @@ export function buildOmniSearchTool(): LLMToolSpec {
   };
 }
 
-export async function dispatchOmniSearch(rawArgs: Record<string, unknown>): Promise<OmniSearchResult> {
+export async function dispatchOmniSearch(
+  rawArgs: Record<string, unknown>,
+  opts: OmniSearchDispatchOpts = {},
+): Promise<OmniSearchResult> {
   const args = validate(rawArgs);
   const merge = args.merge ?? 'interleave';
   const limit = Math.max(1, Math.min(args.limit ?? DEFAULT_LIMIT, MAX_LIMIT));
@@ -82,8 +95,15 @@ export async function dispatchOmniSearch(rawArgs: Record<string, unknown>): Prom
 
   // Parallel fan-out. Per-provider failures don't fail the whole call.
   const perEngine: Record<string, { hits: WebSearchHit[]; durationMs: number; error?: string }> = {};
+  const emit = (event: OmniSearchEngineEvent): void => {
+    if (!opts.onEngine) return;
+    try {
+      void Promise.resolve(opts.onEngine(event)).catch(() => {});
+    } catch { /* Observers cannot change search results. */ }
+  };
   await Promise.all(providers.map(async (p) => {
     const start = Date.now();
+    emit({ engine: p.id, phase: 'start' });
     try {
       const result = await p.search({
         query: args.query,
@@ -93,6 +113,11 @@ export async function dispatchOmniSearch(rawArgs: Record<string, unknown>): Prom
         recencyDays: args.recency_days,
       });
       perEngine[p.id] = { hits: result.hits, durationMs: Date.now() - start };
+      for (const hit of result.hits) {
+        try {
+          if (opts.onSource) void Promise.resolve(opts.onSource({ ...hit, engine: p.id })).catch(() => {});
+        } catch { /* Observers cannot change search results. */ }
+      }
     } catch (err) {
       perEngine[p.id] = {
         hits: [],
@@ -100,6 +125,9 @@ export async function dispatchOmniSearch(rawArgs: Record<string, unknown>): Prom
         error: err instanceof Error ? err.message : String(err),
       };
     }
+    const info = perEngine[p.id]!;
+    emit({ engine: p.id, phase: 'complete', hits: info.hits.length, durationMs: info.durationMs,
+      ...(info.error !== undefined ? { error: info.error } : {}) });
   }));
 
   // Merge.

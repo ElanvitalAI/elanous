@@ -1,30 +1,18 @@
-// ── B5 — 「다섯 방향으로 대화 시작」 ──
-//
-// 요구사항은 표 한 행이다: *"다섯 방향으로 대화 시작"* — 브랜드가 아직 없을 때
-// 대화 첫머리에 시각적 출발점을 «고르게» 한다.
-//
-// ⭐ 결정(2026-08-24): 남의 값을 수입하지 않고 «형식»만 가져온다.
-//    upstream(OpenDesign)은 `DesignDirection` 에 팔레트·폰트를 담아 다섯을 큐레이션한다.
-//    ⛔ 그것을 수입하면 B1 라이선스 절차(체크섬 ⊕ NOTICE ⊕ 3자 드리프트 지킴이)를
-//    전부 짊어지고 upstream 을 계속 추적해야 한다.
-//    ✅ 그런데 우리에겐 `THEME_REGISTRY` 가 «이미» 있고, 21차가 그 대비까지 게이트로 지켰다.
-//    ⇒ 방향은 그 레지스트리에서 «도출»한다. 새 목록을 손으로 적지 않는다.
-//
-// ⛔ 그래서 이 파일에 색값이 «하나도» 없다. 하나라도 적는 순간 그것이
-//    테마 목록의 다음 사본이 되고, `B4-1`(#11498 계열)이 지운 그 문제가 돌아온다.
-//
-// B2 와의 관계: 규칙집은 *"하지 마라"*, 방향은 *"이렇게 생겨라"* — 다른 축이다.
-// 고른 방향의 «착지점»은 `DESIGN.md` 다. B2 가 이미 「DESIGN.md 가 선언한다」 축을 세웠다.
+// 방향은 테마 레지스트리 또는 번들 디자인 시스템의 토큰에서 도출한다.
+// 테마의 기존 목록과 선언 형식은 유지하고, 시스템 토큰 값은 이 파일에 복제하지 않는다.
+// B2 규칙집은 제약을, DESIGN.md 의 방향 선언은 선택을 담는다.
 
 import type { ThemeTokens } from '../theme/tokens.js';
 import { THEME_REGISTRY } from '../themes/index.js';
 import { readSectionItems } from './design-doc.js';
+import { libraryDir } from './design-library.js';
+import { defaultDesignSystemsDir, listDesignSystems, type DesignSystem } from './design-systems.js';
 
 /** `DESIGN.md` 안에서 방향을 선언하는 절. */
 export const DIRECTION_HEADING = '## Design direction';
 
 export interface DesignDirection {
-  /** 테마 이름 그대로 — 별도 id 를 만들면 그것이 사상 하나를 더 만든다. */
+  /** 테마 이름 또는 디자인 시스템 id 그대로. */
   id: string;
   /** 사람이 고를 때 보는 한 줄. */
   label: string;
@@ -34,14 +22,13 @@ export interface DesignDirection {
   isDark: boolean;
   /** 파스텔(채도를 낮춘) 계열인가. */
   isPastel: boolean;
-  /** 미리보기에 쓸 대표 색 — 테마 토큰에서 «그대로» 가져온다(사본 아님). */
-  swatch: { text: string; accent: string; muted: string };
-  /** 이 방향이 «어디서» 왔나. 없으면 테마 레지스트리다(기존 여섯).
-   *  ⛔ 「테마에서 왔다」와 「문서에서 왔다」를 한 값으로 접지 않는다 —
-   *  전자는 이 저장소가 대비까지 게이트로 지키고, 후자는 «남의 웹»에서 왔다. */
-  source?: 'theme' | 'document';
-  /** 이 방향이 묶는 서체. ⛔ 테마 방향엔 «없다» — 터미널 테마는 서체를 안 정한다.
-   *  그것이 이 필드가 선택인 이유다(억지로 채우면 「모른다」가 사라진다). */
+  /** 미리보기에 쓸 대표 색 — 테마 또는 시스템 토큰에서 가져온다. */
+  swatch: { text: string; accent: string; muted: string; bg?: string; fg?: string };
+  /** 방향의 출처. 없으면 테마 레지스트리다(기존 여섯). */
+  source?: 'theme' | 'document' | 'design-system';
+  /** 라이브러리 커스텀 시스템만 `Custom`. 번들·테마는 비운다. */
+  category?: 'Custom';
+  /** 시스템/문서 방향의 서체. 터미널 테마는 서체를 정하지 않는다. */
   typography?: { display: string | null; body: string | null };
 }
 
@@ -75,6 +62,36 @@ export function listDesignDirections(
   }));
 }
 
+export function listAllDesignDirections({
+  systemsDir = defaultDesignSystemsDir(),
+  librarySystemsDir,
+}: { systemsDir?: string; librarySystemsDir?: string } = {}): DesignDirection[] {
+  const themes = listDesignDirections();
+  const themeIds = new Set(themes.map((theme) => theme.id));
+  const bundled = listDesignSystems(systemsDir).filter((system) => !themeIds.has(system.id));
+  const bundledIds = new Set(bundled.map((system) => system.id));
+  const library = listDesignSystems(librarySystemsDir ?? libraryDir())
+    .filter((system) => !themeIds.has(system.id) && !bundledIds.has(system.id));
+  return [
+    ...themes,
+    ...[...bundled, ...library].map(directionFromSystem),
+  ];
+}
+
+function directionFromSystem(system: DesignSystem): DesignDirection {
+  return {
+    id: system.id,
+    label: system.name,
+    mood: system.summary,
+    isDark: (luminance(system.swatch.bg) ?? 255) < 128,
+    isPastel: false,
+    swatch: { bg: system.swatch.bg, fg: system.swatch.fg, text: system.swatch.fg, accent: system.swatch.accent, muted: system.swatch.fg },
+    typography: { display: system.fonts.display, body: system.fonts.body },
+    source: 'design-system',
+    ...(system.category === 'Custom' ? { category: 'Custom' as const } : {}),
+  };
+}
+
 export interface DirectionDeclaration {
   /** `DESIGN.md` 가 선언한 방향. 절이 없거나 비면 null. */
   declared: string | null;
@@ -105,13 +122,27 @@ export function parseDeclaredDirection(
  *  DESIGN.md 인가)을 소유한다. 그 규칙은 `#11793`·`#11930` 이 이미 정했고
  *  여기서 다시 정하면 세 번째 답이 생긴다. */
 export function writeDeclaredDirection(document: string, directionId: string): string {
+  return writeDirectionEntries(document, directionId, []);
+}
+
+export function writeDeclaredSystemDirection(document: string, directionId: string, sourceCommit: string): string {
+  return writeDirectionEntries(document, directionId, [
+    'tokens: design/system/tokens.css',
+    sourceCommit === 'custom'
+      ? `source: custom@${directionId}`
+      : `source: open-design@${sourceCommit.slice(0, 10)}`,
+  ]);
+}
+
+function writeDirectionEntries(document: string, directionId: string, details: readonly string[]): string {
+  const entries = [`- ${directionId}`, ...details.map((detail) => `- ${detail}`)];
   const lines = document.split(/\r?\n/);
   const start = lines.indexOf(DIRECTION_HEADING);
 
   if (start === -1) {
     // 절이 없다 — 문서 끝에 붙인다. 앞 문서의 마지막 빈 줄은 보존한다.
     const trimmed = document.replace(/\s*$/, '');
-    return `${trimmed}\n\n${DIRECTION_HEADING}\n\n- ${directionId}\n`;
+    return `${trimmed}\n\n${DIRECTION_HEADING}\n\n${entries.join('\n')}\n`;
   }
 
   // 절이 있다 — 그 절만 갈아 끼운다(다른 절은 손대지 않는다).
@@ -119,7 +150,7 @@ export function writeDeclaredDirection(document: string, directionId: string): s
   while (end < lines.length && !lines[end]!.startsWith('#')) end += 1;
   const rest = lines.slice(end);
   const head = lines.slice(0, start + 1);
-  return [...head, '', `- ${directionId}`, '', ...rest].join('\n').replace(/\n{3,}/g, '\n\n');
+  return [...head, '', ...entries, '', ...rest].join('\n').replace(/\n{3,}/g, '\n\n');
 }
 
 // ── 웹 레퍼런스를 «방향»으로 ────────────────────────────────────────────────
@@ -131,19 +162,8 @@ export function writeDeclaredDirection(document: string, directionId: string): s
 //
 // ⛔ 이 함수도 색값을 «적지 않는다» — 문서가 말한 값만 옮긴다(이 파일의 머리말 규율).
 
-// ── 🛑 «안 짓기로» 한 것 — 간격·모션 (2026-09-08 결정) ─────────────────────
-//
-// 인계 §19d 가 *"DesignDirection 에 간격·모션이 없다 — 추출은 내는데 타입이 안 담는다"*를
-// 열린 칸으로 적어 뒀다. ⛔ 짓기 전에 **누가 쓰나**를 쟀다:
-//
-//   direction.typography  (같은 날 추가)   →  소비자 ***0***
-//   PWA `DesignCheckPanel` 이 그리는 것    →  `id` · `mood` · `swatch` 뿐
-//
-// ⇒ 간격·모션을 더해도 «그리는 자리»가 없다. 그것은 사다리 ①(호출부 0)을 하나 더 짓는 일이다.
-// 🔑 그래서 **안 짓는다.** 필요해지는 조건을 대신 적어 둔다:
-//   ***「방향을 골라 페이지를 «저작»하는 소비자」가 생기면*** 그때 간격·모션이 값을 갖는다.
-//   (지금 소비자는 「고르는 화면」이지 「짓는 코드」가 아니다)
-// ⛔ 이 주석을 지우고 필드를 더하려면, 먼저 그 소비자를 대라.
+// 시스템의 간격·모션 값은 선택 시 복사하는 DESIGN.md 와 tokens.css 에 보존된다.
+// 웹 추출 방향은 해당 값을 사용하는 소비자가 생길 때 별도 필드로 확장한다.
 
 /** 왜 방향을 «못» 만들었나. ⛔ 「null」 하나로 접으면 「팔레트가 없다」와 「역할을 못 봤다」가 같아진다. */
 export type DirectionRefusal =

@@ -17,6 +17,8 @@ describe('redactSecretText — gitleaks 규칙 이식(탐지)', () => {
     ['slack-token', 'xoxb-1234567890-1234567890-abcdefghij', 'xoxb-'],
     ['gcp-api-key', `AIza${'B'.repeat(35)}`, 'AIza'],
     ['jwt', 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghij', 'ey'],
+    ['openrouter-api-key', `sk-or-v1-${'d'.repeat(64)} 설정됨`, 'sk-or-v1-'],
+    ['xai-api-key', `xai-${'E'.repeat(80)} 설정됨`, 'xai-'],
   ];
 
   for (const [id, input, keepPrefix] of cases) {
@@ -42,6 +44,12 @@ describe('redactSecretText — gitleaks 규칙 이식(탐지)', () => {
     expect(redactSecretText('token=abcd1234efgh')).toContain('token=***');
   });
 
+  test('환경변수 형태 — 접두 없는 값도 이름으로 가린다', () => {
+    expect(redactSecretText('OPENROUTER_API_KEY=abcdef0123456789zz')).toBe('OPENROUTER_API_KEY=***');
+    expect(redactSecretText('export GROK_CODE_XAI_API_KEY="q1w2e3r4t5y6"')).toBe('export GROK_CODE_XAI_API_KEY=***"');
+    expect(redactSecretText('GH_TOKEN: abcd1234efgh5678')).toBe('GH_TOKEN: ***');
+  });
+
   test('Authorization 헤더', () => {
     const out = redactSecretText('Authorization: Bearer abcdefghijklmnop');
     expect(out).not.toContain('abcdefghijklmnop');
@@ -56,6 +64,8 @@ describe('redactSecretText — 오탐 가드(로그가 못 쓰게 되면 안 된
     'https://github.com/ElanvitalAI/elanous/pull/5502',
     'bun test test/self-implement-seams.test.ts',
     'runId=run-8f7ba351-cb40-4745-a5c3-34c18ca978f8',
+    'MAX_TOKEN=4096',
+    'OPENROUTER_API_KEY 가 없다',
   ];
   for (const n of normals) {
     test(`훼손하지 않는다: ${n.slice(0, 40)}`, () => {

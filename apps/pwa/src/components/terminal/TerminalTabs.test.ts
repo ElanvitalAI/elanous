@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
 import {
   loadTabIds, nextDefaultId, resolveNewTabId, saveTabIds, shouldReacquireAcp,
-  spawnNewTerminal, summarizeTabs, tabCountLabel, tabsCleanableAsUnknown, parseTerminalListResponse,
+  orphanedInitialSpawn, spawnNewTerminal, summarizeTabs, tabCountLabel, tabsCleanableAsUnknown, parseTerminalListResponse,
 } from './TerminalTabs';
 import { originChipText, originTooltipText, terminalOriginLabel } from './terminal-origin-label';
 
@@ -218,6 +218,28 @@ describe('new-terminal spawn observability', () => {
     await expect(request).resolves.toEqual({ terminalId: 'webterm-m7k2x1' });
   });
 
+  // 대표 2026-09-28 — 데몬이 spawn 에 답하지 않으면 «터미널 이름을 준비하는 중…» 이 영원히 남았다.
+  test('gives up on a daemon that never answers — spawn-timeout, so the tab falls back to a local name', async () => {
+    const logs: Array<[string, unknown]> = [];
+    const acp = { send: () => new Promise<unknown>(() => {}) };
+    const result = await spawnNewTerminal(acp, 's1', (category, snapshot) => logs.push([category, snapshot]), 20);
+    expect(result).toEqual({ spawnFailure: 'spawn-timeout' });
+    expect(resolveNewTabId(result, [])).toMatchObject({ issuedBy: 'local', fallbackReason: 'spawn-timeout' });
+    expect(logs.at(-1)).toEqual(['webterm.tabs.add.spawn-timeout', { sessionId: 's1', timeoutMs: 20 }]);
+  });
+
+  // 2026-09-28 운영(부하 300 대): 8초에 «버리고» 로컬 이름으로 가자 늦게 온 데몬 셸과 합쳐 셸이 둘이 됐다.
+  test('slow daemon — signals «slow» but still returns the late daemon response (no local fallback, no duplicate)', async () => {
+    const logs: Array<[string, unknown]> = [];
+    let slow = 0;
+    const acp = { send: () => new Promise<unknown>((resolve) => setTimeout(() => resolve({ terminalId: 'term-late', status: 'spawned' }), 60)) };
+    const result = await spawnNewTerminal(acp, 's1', (c, d) => logs.push([c, d]), 1000, () => { slow += 1; }, 20);
+    expect(slow).toBe(1);
+    expect(result).toEqual({ terminalId: 'term-late', status: 'spawned' });
+    expect(logs.some(([c]) => c === 'webterm.tabs.add.spawn-slow')).toBe(true);
+    expect(logs.some(([c]) => c === 'webterm.tabs.add.spawn-timeout')).toBe(false);
+  });
+
   test('preserves the established spawn-error observation after a rejected request', async () => {
     const logs: Array<[string, unknown]> = [];
     const acp = { send: () => Promise.reject(new Error('offline')) };
@@ -327,5 +349,17 @@ describe('TerminalTabs terminal provenance parsing', () => {
     expect(terminalOriginLabel(result.entries[0])).toBe('사람');
     expect(originChipText(result.entries[1])).toBe('');
     expect(originTooltipText(result.entries[1])).toBe('출처: 이 행에서는 알 수 없음');
+  });
+});
+
+describe('orphanedInitialSpawn — 버린 첫 발급이 남긴 셸만 치운다', () => {
+  test('데몬이 «새로 만든» 셸이면 치울 열쇠를 준다', () => {
+    expect(orphanedInitialSpawn({ status: 'spawned', sessionId: 'uuid-1', terminalId: 'term-a' })).toEqual({ sessionId: 'uuid-1', terminalId: 'term-a' });
+  });
+  test('이미 있던 셸에 붙은 것·실패·모름은 치우지 않는다 — 남의 셸을 지우면 안 된다', () => {
+    expect(orphanedInitialSpawn({ status: 'attached', sessionId: 's', terminalId: 'term-a' })).toBeNull();
+    expect(orphanedInitialSpawn({ spawnFailure: 'spawn-timeout' })).toBeNull();
+    expect(orphanedInitialSpawn(undefined)).toBeNull();
+    expect(orphanedInitialSpawn({ status: 'spawned', sessionId: ' ', terminalId: 'term-a' })).toBeNull();
   });
 });

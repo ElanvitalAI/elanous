@@ -27,6 +27,7 @@
 // crashed wizard cannot corrupt an existing file. Mode 0600 when the
 // telegram bot token is present.
 
+import { isCodexQuotaPolicy } from './oauth/codex-quota-policy.js';
 import { defaultObsidianVault } from './obsidian/default-vault.js';
 import {
   existsSync, readFileSync, writeFileSync, mkdirSync, renameSync, chmodSync,
@@ -203,6 +204,14 @@ export interface LLMConfig {
    *  🩸 2026-09-24(대표): 「third 부터 소진하고 그다음 team」 — 이름순(default<new<third)으론 못 만든다.
    *  ⛔ 여기 없는 계정은 버리지 않는다 — 뒤로 가서 이름순으로 붙는다. */
   codexAccountOrder?: string[];
+  /** 대표 2026-09-28 «크레딧 사용 허가» — 주간 한도가 찬 codex 계정도 «선불 크레딧으로 계속» 쓴다(서버가 한도 소진 시 크레딧으로 넘긴다).
+   *  켜면 회전이 «후보 없음»(→ grok 폴백) 대신 지금 계정에 머물고, Pod 배분도 찬 계정을 사용률 낮은 순으로 쓴다.
+   *  순서는 여전히 «구독 잔량이 남은 계정 먼저». 기본 꺼짐(크레딧은 돈이다). */
+  codexCreditsAllowed?: boolean;
+  /** 대표 2026-09-28 codex «한도 정책» — 한도가 차면 무엇을 하나(`src/oauth/codex-quota-policy.ts` 가 canonical):
+   *  `within-quota`(한도 안에서만 · 전부 차면 멈춤) · `fallback`(한도 안 ⊕ 폴백 체인 · 기본) · `credits`(크레딧까지).
+   *  회전·Pod 배분·폴백·매시 한도 알림이 «이 한 값»을 같이 읽는다. 없으면 옛 `codexCreditsAllowed` 를 읽는다. */
+  codexQuotaPolicy?: 'within-quota' | 'fallback' | 'credits';
   /** ⭐⭐ codex 가 «소진된 뒤» 갈 곳을 «순서»로 정한다 (대표 2026-08-13).
    *
    *  값: `['codex-rotate', 'grok']` — 아는 칸은 그 둘뿐이고, 모르는 이름은 버린다(관측에 남는다).
@@ -1013,6 +1022,8 @@ export interface SelfImplementToolConfig {
   prApprovalDelivery: 'terminal' | 'all';
   /** Records SelfImplement dispatches without starting an implementation run. */
   observeOnly: boolean;
+  /** Also append terminal execution records to the authored goal document (default true). */
+  goalRecordInDoc: boolean;
   /** Controls the persistent grounding loop used while authoring goals; absent preserves it. */
   goalAuthorPersistentGrounding?: boolean;
   /** Uses the Fabric decomposer for SelfOrchestrate requests that omit `fabric_decompose`. */
@@ -1112,7 +1123,7 @@ const TOOLS_DEFAULTS: ToolsConfig = {
   selfOrchestrate: {},
   nativeStructure: { enabled: false },
   // 대표 결정(2026-07-26): 오토 선호 — 기본 ON.
-  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
+  selfImplement: { worktreeRoot: join(homedir(), '.elanous', 'worktrees'), childInstanceMode: 'isolated', prApprovalDelivery: 'terminal' as const, observeOnly: false, goalRecordInDoc: true, fabricDecompose: false, fabricDecomposeAutoPathThreshold: 5, autoOpenPr: true, autoStop: { enabled: true, minRung: 2 }, autoAssist: { enabled: true, minRung: 2 }, screenStallTermination: { enabled: true, minRung: 2 }, reworkBudget: { shadowStop: false, maxRounds: 3 }, decompositionShadow: { enabled: false }, clarificationEscalation: { enabled: false } },
 };
 
 // ── Debug ────────────────────────────────────────────────────────────
@@ -1759,6 +1770,32 @@ function parseTasteConfig(raw: unknown): TasteConfig | undefined {
 export interface WebSearchConfig {
   tavily?: { enabled?: boolean };
 }
+
+/** OpenDesign 데몬 접속. url 이 없으면 시안 생성은 꺼진 것이다. tokenFile 은 토큰 «경로»만 담는다. */
+export interface OpenDesignConfig {
+  url?: string;
+  tokenFile?: string;
+}
+
+export interface DesignConfig {
+  openDesign?: OpenDesignConfig;
+}
+
+function parseOpenDesignConfig(raw: unknown): OpenDesignConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: OpenDesignConfig = {};
+  if (typeof r.url === 'string' && r.url.trim()) out.url = r.url.trim();
+  if (typeof r.tokenFile === 'string' && r.tokenFile.trim()) out.tokenFile = r.tokenFile.trim();
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function parseDesignConfig(raw: unknown): DesignConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const openDesign = parseOpenDesignConfig(r.openDesign);
+  return openDesign ? { openDesign } : undefined;
+}
 function parseWebSearchConfig(raw: unknown): WebSearchConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
@@ -2366,6 +2403,9 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
   const observeOnly = typeof selfImplRaw.observeOnly === 'boolean'
     ? selfImplRaw.observeOnly
     : TOOLS_DEFAULTS.selfImplement.observeOnly;
+  const goalRecordInDoc = typeof selfImplRaw.goalRecordInDoc === 'boolean'
+    ? selfImplRaw.goalRecordInDoc
+    : TOOLS_DEFAULTS.selfImplement.goalRecordInDoc;
   const goalAuthorPersistentGrounding = typeof selfImplRaw.goalAuthorPersistentGrounding === 'boolean'
     ? selfImplRaw.goalAuthorPersistentGrounding
     : undefined;
@@ -2486,7 +2526,7 @@ function parseToolsConfig(raw: unknown): ToolsConfig {
     runDevHarness,
     selfOrchestrate,
     nativeStructure,
-    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}) },
+    selfImplement: { worktreeRoot, childInstanceMode, prApprovalDelivery, observeOnly, goalRecordInDoc, goalAuthorPersistentGrounding, fabricDecompose, fabricDecomposeAutoPathThreshold, autoOpenPr, autoStop, autoAssist, screenStallTermination, reworkBudget, decompositionShadow, clarificationEscalation, ...(childLlm ? { childLlm } : {}) },
   };
 }
 
@@ -3274,10 +3314,12 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 
 
 export interface UserConfig {
+  /** Steward loop: observe-only until an independently approved act implementation exists. */
+  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number } };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string };
-  /** ☸️ Pod 실행 칸 — `pool` = 기본 풀(`컨텍스트[@ssh호스트][:상한]` 쉼표 · 앞이 우선). `harness say/ask --substrate pod` 가 인자·ELANOUS_POD_POOL 다음으로 읽는다. */
+  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string };
+  /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
   pod?: { pool?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
@@ -3326,6 +3368,8 @@ export interface UserConfig {
   taste?: TasteConfig;
   /** 웹 검색 프로바이더 게이트(기본 OFF — `isTavilySearchEnabled()` 로만 읽는다). */
   webSearch?: WebSearchConfig;
+  /** OpenDesign 시안 생성. 기본 없음 = 꺼짐. url 이 없으면 클라이언트가 호출하지 않는다. */
+  design?: DesignConfig;
   /** G8 무인 리뷰루프 auto-review 라벨 자동부착 모드(sparse·기본 opt-in). §2b ROADMAP-elanous-is-all. */
   autoReview?: AutoReviewConfig;
   /** 표시·집계 시간대 (IANA 이름 · 예 `Asia/Seoul`). 2026-07-24 신설.
@@ -3372,6 +3416,11 @@ export interface UserConfig {
    *  자동 개입(재큐/재시작)까지 할지. 기본 disarmed(관측+알림만·HITL). 매매/재부팅은
    *  이 게이트가 armed 여도 항상 제외. 대표 결정 전까지 undefined=false. */
   ops?: { selfHeal?: { armed?: boolean }; cronRepoRoot?: string };
+  /** 승인 뒤 조율 채널 페이즈 배달(기본 OFF) 및 트랙 에이전트(기본 OFF, 최대 동시 2개). */
+  autopilot?: {
+    trackCourier?: { enabled?: boolean; channelPr?: number; handoffMinutes?: number };
+    trackAgent?: { enabled: boolean; maxConcurrent: number };
+  };
   /** 하니스 예산 게이트 설정. 판정은 P15 — 여기선 칸만 싣는다. 파서는 항상 기본을 채운다.
    *  선택이다 — 기존 UserConfig 리터럴이 이 칸 없이 컴파일되게 한다. 해석기는 없으면 기본을 쓴다.
    *  타입 칸은 위 `harness.budgetGate` 한 곳이다(중복 선언 금지). */
@@ -3536,6 +3585,31 @@ function parseOpsConfig(raw: unknown): UserConfig['ops'] | undefined {
     else warnUserConfigDrop('ops.cronRepoRoot', `비어 있거나 문자열이 아니다(${JSON.stringify(v.cronRepoRoot)}) — 버림`);
   }
   return Object.keys(parsed).length ? parsed : undefined;
+}
+
+function parseAutopilotConfig(raw: unknown): UserConfig['autopilot'] | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const values = raw as Record<string, unknown>;
+  const parsed: NonNullable<UserConfig['autopilot']> = {};
+  const courier = values.trackCourier;
+  if (courier && typeof courier === 'object' && !Array.isArray(courier)) {
+    const v = courier as Record<string, unknown>;
+    parsed.trackCourier = {
+      enabled: v.enabled === true,
+      ...(typeof v.channelPr === 'number' && Number.isSafeInteger(v.channelPr) && v.channelPr > 0 ? { channelPr: v.channelPr } : {}),
+      handoffMinutes: typeof v.handoffMinutes === 'number' && Number.isFinite(v.handoffMinutes) && v.handoffMinutes > 0 ? v.handoffMinutes : 60,
+    };
+  }
+  const agent = values.trackAgent;
+  if (agent && typeof agent === 'object' && !Array.isArray(agent)) {
+    const v = agent as Record<string, unknown>;
+    parsed.trackAgent = {
+      enabled: v.enabled === true,
+      maxConcurrent: typeof v.maxConcurrent === 'number' && Number.isSafeInteger(v.maxConcurrent) && v.maxConcurrent > 0
+        ? Math.min(v.maxConcurrent, 2) : 2,
+    };
+  }
+  return Object.keys(parsed).length > 0 ? parsed : undefined;
 }
 
 function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
@@ -4032,6 +4106,27 @@ function observeRetiredConfigKeysOnce(raw: Record<string, unknown>): void {
   } catch { /* observation must never break config loading */ }
 }
 
+function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const value = (input as Record<string, unknown>).steward;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const s = value as Record<string, unknown>;
+  const roles: NonNullable<NonNullable<UserConfig['loops']>['steward']>['roles'] = {};
+  if (s.roles && typeof s.roles === 'object' && !Array.isArray(s.roles)) {
+    for (const [role, entry] of Object.entries(s.roles)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const max = (entry as Record<string, unknown>).maxConcurrent;
+      if (typeof max === 'number' && Number.isInteger(max) && max >= 0) roles[role] = { maxConcurrent: max };
+    }
+  }
+  return { steward: {
+    mode: s.mode === 'act' ? 'act' : 'observe',
+    ...(typeof s.linearTeam === 'string' && s.linearTeam.trim() ? { linearTeam: s.linearTeam.trim() } : {}),
+    ...(Object.keys(roles).length ? { roles } : {}),
+    ...(typeof s.budget === 'number' && Number.isFinite(s.budget) && s.budget >= 0 ? { budget: s.budget } : {}),
+  } };
+}
+
 export function buildUserConfig(path: string = defaultPath()): UserConfig {
   if (!existsSync(path)) return defaultConfigWithRuntimeProvider();
   let raw: unknown;
@@ -4045,6 +4140,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   observeRetiredConfigKeysOnce(rawObj);
   const harness = rawObj.harness && typeof rawObj.harness === 'object' && !Array.isArray(rawObj.harness) ? rawObj.harness as Record<string, unknown> : {};
   const harnessPod = harness.pod && typeof harness.pod === 'object' && !Array.isArray(harness.pod) ? harness.pod as Record<string, unknown> : {};
+  const legacyPod = rawObj.pod && typeof rawObj.pod === 'object' && !Array.isArray(rawObj.pod) ? rawObj.pod as Record<string, unknown> : {};
 
   const sr = (rawObj.skillRouter ?? {}) as Record<string, unknown>;
   let llm = (rawObj.llm ?? {}) as Record<string, unknown>;
@@ -4131,10 +4227,18 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ? (rawObj.global as Record<string, unknown>)
       : undefined;
   const rawNotifications = rawGlobalObj?.notifications ?? rawObj.notifications;
+  const autopilotConfig = parseAutopilotConfig(rawObj.autopilot);
+  const stewardLoops = parseStewardLoopsConfig(rawObj.loops);
 
   return {
+    pod: {
+      ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
+      ...(typeof legacyPod.groundingUrl === 'string' ? { groundingUrl: legacyPod.groundingUrl } : {}),
+    },
     harness: {
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
+      ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
+      ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
       ...(typeof harness.defaultRepo === 'string' && isAbsolute(harness.defaultRepo)
         ? { defaultRepo: harness.defaultRepo } : {}),
       budgetGate: parseHarnessBudgetGate(
@@ -4221,6 +4325,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
           .filter(([, value]) => typeof value === 'number'))
         : undefined,
       // ⛔ 같은 모양(문자열 배열)이라 아래 fallbackChain 과 «같은 자»를 쓴다.
+      codexCreditsAllowed: llm.codexCreditsAllowed === true ? true : undefined,
+      codexQuotaPolicy: isCodexQuotaPolicy(llm.codexQuotaPolicy) ? llm.codexQuotaPolicy : undefined,
       codexAccountOrder: Array.isArray(llm.codexAccountOrder)
         ? llm.codexAccountOrder.filter((v: unknown): v is string => typeof v === 'string' && v.length > 0)
         : undefined,
@@ -4746,6 +4852,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     goals: parseGoalsConfig(rawObj.goals),
     registry: parseRegistryConfig(rawObj.registry),
     tools: parseToolsConfig(rawObj.tools),
+    ...(stewardLoops ? { loops: stewardLoops } : {}),
     // M1-1: sparse — undefined when the user hasn't set anything, so
     // resolvers fall through to zero-config defaults.
     ...spreadIfDefined('modelTier', parseModelTierConfig(rawObj.modelTier)),
@@ -4753,6 +4860,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     ...spreadIfDefined('nextFluent', parseNextFluentConfig(rawObj.nextFluent)),
     ...spreadIfDefined('taste', parseTasteConfig(rawObj.taste)),
     ...spreadIfDefined('webSearch', parseWebSearchConfig(rawObj.webSearch)),
+    ...spreadIfDefined('design', parseDesignConfig(rawObj.design)),
     ...spreadIfDefined('budget', parseBudgetConfig(rawObj.budget)),
     ...spreadIfDefined('smartDefaults', parseSmartDefaultsConfig(rawObj.smartDefaults)),
     ...spreadIfDefined('roleModels', parseRoleModelConfig(rawObj.roleModels)),
@@ -4760,6 +4868,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     ...spreadIfDefined('roleLlm', parseRoleLlmConfig(rawObj.roleLlm)),
     ...spreadIfDefined('autoReview', parseAutoReviewConfig(rawObj.autoReview)),
     ...spreadIfDefined('ops', parseOpsConfig(rawObj.ops)),
+    ...(autopilotConfig ? { autopilot: autopilotConfig } : {}),
     grounding: parseGroundingSources(rawObj.grounding),
     ...spreadIfDefined('notifications', parseNotificationsConfig(rawNotifications)),
     ...spreadIfDefined('mcp', parseMcpConfig(rawObj.mcp)),
@@ -5314,8 +5423,19 @@ export function saveUserConfig(
   delete rawRest.budget;
   delete rawRest.smartDefaults;
   delete rawRest.grounding;
+  const rawHarness = rawRest.harness && typeof rawRest.harness === 'object' && !Array.isArray(rawRest.harness)
+    ? rawRest.harness as Record<string, unknown> : {};
+  delete rawRest.harness;
 
   const out: Record<string, unknown> = {
+    harness: stripUndef({
+      ...rawHarness,
+      pod: cfg.harness?.pod ?? rawHarness.pod,
+      budgetGate: cfg.harness?.budgetGate ?? rawHarness.budgetGate,
+      defaultRepo: cfg.harness?.defaultRepo ?? rawHarness.defaultRepo,
+      substrate: cfg.harness?.substrate,
+      podPool: cfg.harness?.podPool,
+    }),
     ...rawRest,
     skillRouter: cfg.skillRouter,
     llm: stripUndef({
@@ -5353,6 +5473,9 @@ export function saveUserConfig(
       codexAccountRotationThresholdPercent: cfg.llm.codexAccountRotationThresholdPercent,
       codexAccountRotationThresholdPercentByAccount: cfg.llm.codexAccountRotationThresholdPercentByAccount,
       codexAccountOrder: cfg.llm.codexAccountOrder,
+      // ★ 2026-09-28: 타입·파서에만 넣고 이 whitelist 를 빠뜨려 `config set llm.codexCreditsAllowed true` 가 «직렬화 드롭» 됐다(#21375 직후 운영 실측).
+      codexCreditsAllowed: cfg.llm.codexCreditsAllowed,
+      codexQuotaPolicy: cfg.llm.codexQuotaPolicy,
       fallbackChain: cfg.llm.fallbackChain,
       reviewFallbackModels: cfg.llm.reviewFallbackModels,
       codexStore: cfg.llm.codexStore,
@@ -5611,6 +5734,7 @@ export function saveUserConfig(
     ...(cfg.nextFluent ? { nextFluent: cfg.nextFluent } : {}),
     ...(cfg.taste ? { taste: cfg.taste } : {}),
     ...(cfg.webSearch ? { webSearch: cfg.webSearch } : {}),
+    ...(cfg.design ? { design: cfg.design } : {}),
     ...(cfg.budget ? { budget: cfg.budget } : {}),
     ...(cfg.smartDefaults ? { smartDefaults: cfg.smartDefaults } : {}),
     ...(cfg.grounding && cfg.grounding.sources.length > 0

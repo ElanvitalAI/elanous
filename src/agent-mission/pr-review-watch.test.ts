@@ -5,7 +5,7 @@ import { describe, test, expect, spyOn } from 'bun:test';
 import { debug } from '../debug/log.js';
 import {
   isBotSignal, pickLatestHumanSignal, pickLatestSignal, analyzeSignals, openPrReviewWatchDb, getLastReviewKey, setLastReviewKey,
-  runPrReviewWatchCycle, mapReviewToInjected, type RunGh,
+  runPrReviewWatchCycle, fetchLabeledOpenPrs, fetchLatestSignal, fetchSignalAnalysis, ReviewWatchGhError, mapReviewToInjected, type RunGh,
 } from './pr-review-watch.js';
 import type { ReviewLoopOpts, ReviewLoopResult } from './review-loop.js';
 import { runAutoInitialReview, type AutoInitialReviewerDeps } from '../index.js';
@@ -102,6 +102,99 @@ function mkTrigger(calls: string[]): (pr: string, opts: ReviewLoopOpts) => Promi
 }
 
 describe('runPrReviewWatchCycle', () => {
+  test('목록 조회 인증 실패는 kind를 관측하고 분류된 오류를 던지며 사이클 실패로 기록한다', async () => {
+    const db = openPrReviewWatchDb(':memory:');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const calls: string[] = [];
+    const gh: RunGh = () => { throw new Error('HTTP 401: Bad credentials'); };
+    try {
+      expect(() => fetchLabeledOpenPrs('auto-review', { runGh: gh })).toThrow(ReviewWatchGhError);
+      await expect(runPrReviewWatchCycle({ db, runGh: gh, trigger: mkTrigger(calls) })).rejects.toMatchObject({ kind: 'auth' });
+      expect(calls).toEqual([]);
+      expect(log.mock.calls.find(([, event]) => event === 'list-prs-error')?.[2]).toMatchObject({ label: 'auto-review', kind: 'auth' });
+      const failed = log.mock.calls.find(([, event]) => event === 'cycle-failed')?.[2];
+      expect(failed).toMatchObject({ label: 'auto-review', error: 'auth' });
+      expect(failed).not.toHaveProperty('scanned');
+      expect(log.mock.calls.some(([, event]) => event === 'cycle-done')).toBe(false);
+    } finally {
+      log.mockRestore();
+      db.close();
+    }
+  });
+
+  test('정상적인 빈 목록은 실패가 아니며 기존 cycle-done scanned=0을 남긴다', async () => {
+    const db = openPrReviewWatchDb(':memory:');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(fetchLabeledOpenPrs('auto-review', { runGh: mkGh([], {}) })).toEqual([]);
+      const out = await runPrReviewWatchCycle({ db, runGh: mkGh([], {}) });
+      expect(out).toHaveLength(0);
+      expect(out.authErrors).toBe(0);
+      expect(log.mock.calls.find(([, event]) => event === 'cycle-done')?.[2]).toMatchObject({ scanned: 0, triggered: 0 });
+      expect(log.mock.calls.some(([, event]) => event === 'cycle-failed')).toBe(false);
+    } finally {
+      log.mockRestore();
+      db.close();
+    }
+  });
+
+  test('한 PR의 신호 조회만 401이면 signal-error로 격리하고 다른 PR은 계속 처리한다', async () => {
+    const db = openPrReviewWatchDb(':memory:');
+    const calls: string[] = [];
+    const initialCalls: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const healthy = mkGh([100, 101], { '101': { body: '보강 요청', author: 'reviewer', key: 't1', kind: 'review' } });
+    const gh: RunGh = (args) => {
+      if (args[0] === 'pr' && args[1] === 'view' && args[2] === '100') throw new Error('HTTP 401: Bad credentials');
+      return healthy(args);
+    };
+    try {
+      expect(fetchLatestSignal('100', { runGh: gh })).toBeNull();
+      expect(() => fetchSignalAnalysis('100', { runGh: gh })).toThrow(ReviewWatchGhError);
+      expect(fetchLatestSignal('101', { runGh: gh })?.key).toBe('t1');
+      expect(fetchSignalAnalysis('101', { runGh: gh }).latestHuman?.key).toBe('t1');
+      const out = await runPrReviewWatchCycle({
+        db, runGh: gh, trigger: mkTrigger(calls), now: () => 'now',
+        autoInitialReview: true,
+        initialReviewer: async (pr) => { initialCalls.push(pr); return { verdict: 'ok', asks: [] }; },
+      });
+      expect(out.map(o => ({ pr: o.pr, status: o.status }))).toEqual([
+        { pr: '100', status: 'signal-error' }, { pr: '101', status: 'triggered' },
+      ]);
+      expect(out[0]!.error).toBe('auth');
+      expect(out.authErrors).toBe(1);
+      expect(calls).toEqual(['101']);
+      expect(initialCalls).toEqual([]);
+      expect(getLastReviewKey(db, '100')).toBeNull();
+      expect(getLastReviewKey(db, '101')).toBe('t1');
+      expect(log.mock.calls.find(([, event]) => event === 'signal-error')?.[2]).toMatchObject({ pr: '100', kind: 'auth' });
+      expect(log.mock.calls.find(([, event]) => event === 'cycle-done')?.[2]).toMatchObject({ scanned: 2, triggered: 1, authErrors: 1 });
+    } finally {
+      log.mockRestore();
+      db.close();
+    }
+  });
+
+  test('인증 이외의 PR 신호 조회 실패는 authErrors에 더하지 않고 나머지 PR을 계속 처리한다', async () => {
+    const db = openPrReviewWatchDb(':memory:');
+    const calls: string[] = [];
+    const healthy = mkGh([100, 101], { '101': { body: '보강 요청', author: 'reviewer', key: 't1', kind: 'review' } });
+    const gh: RunGh = (args) => {
+      if (args[0] === 'pr' && args[1] === 'view' && args[2] === '100') throw new Error('HTTP 404: Not Found');
+      return healthy(args);
+    };
+    try {
+      const out = await runPrReviewWatchCycle({ db, runGh: gh, trigger: mkTrigger(calls) });
+      expect(out[0]).toEqual({ pr: '100', status: 'signal-error', error: 'not-found' });
+      expect(out[1]!.status).toBe('triggered');
+      expect(out.authErrors).toBe(0);
+      expect(calls).toEqual(['101']);
+      expect(getLastReviewKey(db, '100')).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
   test('새 사람 리뷰 → 발동 + 커서 갱신', async () => {
     const db = openPrReviewWatchDb(':memory:');
     const calls: string[] = [];

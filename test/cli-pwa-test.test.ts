@@ -698,7 +698,7 @@ describe('runPwaTest --status', () => {
       ...baseSeams,
     });
     expect(r.exitCode).toBe(0);
-    expect(out.logs.some((l) => l.includes('no active test instance'))).toBe(true);
+    expect(out.logs).toEqual(['elanous nexus run --test: no active test instance.']);
   });
 
   test('reads + prints active instance state', async () => {
@@ -715,16 +715,77 @@ describe('runPwaTest --status', () => {
         startedAt: '2026-05-09T22:00:00Z',
       }),
     );
+    writeFileSync(joinPath(stateDir, 'runtime.json'), JSON.stringify({
+      pid: process.pid, startedAt: '2026-05-09T22:00:00Z', nexusVersion: '0.1', phase: 'ready',
+    }));
+    const before = readFileSync(joinPath(stateDir, 'test-state.json'), 'utf8');
+    const runtimeBefore = readFileSync(joinPath(stateDir, 'runtime.json'), 'utf8');
     const out = makeOut();
-    const r = await runPwaTest({
-      repoRoot, out, status: true,
-      ...baseSeams,
-    });
+    const r = await runPwaTest({ status: true, repoRoot, out });
     expect(r.exitCode).toBe(0);
-    expect(out.logs.some((l) => l.includes('hmr'))).toBe(true);
-    expect(out.logs.some((l) => l.includes(':31420'))).toBe(true);
-    expect(out.logs.some((l) => l.includes(':3211'))).toBe(true);
-    expect(out.logs.some((l) => l.includes('mbp.tailnet.ts.net'))).toBe(true);
+    expect(out.logs).toContain('  mode      hmr');
+    expect(out.logs).toContain('  nexus     :31420');
+    expect(out.logs).toContain('  next-dev  :3211');
+    expect(out.logs).toContain('  started   2026-05-09T22:00:00Z');
+    expect(out.logs).toContain('  url       https://mbp.tailnet.ts.net:31420/app/showroom/');
+    expect(out.logs).toContain(`  alive     yes (pid ${process.pid})`);
+    expect(out.logs.some(line => line.startsWith('  fix       '))).toBe(false);
+    expect(readFileSync(joinPath(stateDir, 'test-state.json'), 'utf8')).toBe(before);
+    expect(readFileSync(joinPath(stateDir, 'runtime.json'), 'utf8')).toBe(runtimeBefore);
+  });
+
+  test('prefers the isolated daemon runtime over a stale root sidecar', async () => {
+    const stateDir = joinPath(repoRoot, '.elanous-test');
+    const nexusDir = joinPath(stateDir, 'nexus');
+    mkdirSync(nexusDir, { recursive: true });
+    writeFileSync(joinPath(stateDir, 'test-state.json'), JSON.stringify({ mode: 'static', nexusPort: 31450 }));
+    writeFileSync(joinPath(stateDir, 'runtime.json'), JSON.stringify({ pid: 2147483647, startedAt: 'old', nexusVersion: '0.1', phase: 'ready' }));
+    writeFileSync(joinPath(nexusDir, 'runtime.json'), JSON.stringify({ pid: process.pid, startedAt: 'now', nexusVersion: '0.1', phase: 'ready' }));
+    const out = makeOut();
+    const r = await runPwaTest({ status: true, repoRoot, out });
+    expect(r.exitCode).toBe(0);
+    expect(out.logs).toContain(`  alive     yes (pid ${process.pid})`);
+  });
+
+  test('dead pid reports NO, last meaningful log line and fix without clearing records', async () => {
+    const stateDir = joinPath(repoRoot, '.elanous-test');
+    const stateFile = joinPath(stateDir, 'test-state.json');
+    const runtimeFile = joinPath(stateDir, 'runtime.json');
+    const deadPid = 2147483647;
+    writeFileSync(stateFile, JSON.stringify({ mode: 'static', nexusPort: 31450, startedAt: '2026-09-28T00:00:00Z' }));
+    writeFileSync(runtimeFile, JSON.stringify({ pid: deadPid, startedAt: '2026-09-28T00:00:00Z', nexusVersion: '0.1', phase: 'ready' }));
+    const logsDir = joinPath(stateDir, 'nexus', 'logs');
+    mkdirSync(logsDir, { recursive: true });
+    writeFileSync(joinPath(logsDir, 'nexus-123.log'), 'error: Isolated instance requires an explicit tool cwd\n    at resolveToolCwd (tool-cwd.ts:74:15)\n');
+    const stateBefore = readFileSync(stateFile, 'utf8');
+    const runtimeBefore = readFileSync(runtimeFile, 'utf8');
+    const out = makeOut();
+    const r = await runPwaTest({ status: true, repoRoot, out });
+    expect(r.exitCode).toBe(1);
+    expect(out.logs).toContain('  mode      static');
+    expect(out.logs).toContain('  nexus     :31450');
+    expect(out.logs).toContain('  started   2026-09-28T00:00:00Z');
+    expect(out.logs).toContain(`  alive     NO — pid ${deadPid} 없음`);
+    expect(out.logs).toContain('  last log  error: Isolated instance requires an explicit tool cwd');
+    expect(out.logs).toContain('  fix       elanous nexus run --test --stop 으로 기록을 치운 뒤 다시 띄운다');
+    expect(readFileSync(stateFile, 'utf8')).toBe(stateBefore);
+    expect(readFileSync(runtimeFile, 'utf8')).toBe(runtimeBefore);
+    expect(readFileSync(joinPath(logsDir, 'nexus-123.log'), 'utf8')).toContain('error: Isolated');
+  });
+
+  test('missing runtime pid reports unknown and fix without a log line', async () => {
+    const stateDir = joinPath(repoRoot, '.elanous-test');
+    const stateFile = joinPath(stateDir, 'test-state.json');
+    writeFileSync(stateFile, JSON.stringify({ mode: 'static', nexusPort: 31450, startedAt: '2026-09-28T00:00:00Z' }));
+    const before = readFileSync(stateFile, 'utf8');
+    const out = makeOut();
+    const r = await runPwaTest({ status: true, repoRoot, out });
+    expect(r.exitCode).toBe(1);
+    expect(out.logs).toContain('  alive     unknown — runtime.json 에 pid 없음');
+    expect(out.logs).toContain('  fix       elanous nexus run --test --stop 으로 기록을 치운 뒤 다시 띄운다');
+    expect(out.logs.some(line => line.startsWith('  last log  '))).toBe(false);
+    expect(readFileSync(stateFile, 'utf8')).toBe(before);
+    expect(existsSync(joinPath(stateDir, 'runtime.json'))).toBe(false);
   });
 });
 

@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { Database } from 'bun:sqlite';
+import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
 import { RemotesStore } from './remotes.js';
-import { federatedPtyRefs, findPtyManifestRows, joinPtyLineage, ptyGitDiscoveryEnv, registerPtyTakeoverCommands, resolvePtyWorktreeProvenance, runPtyFind, runPtyLineage, runPtyList, runPtyReap, runPtyRelease, runPtyRetire, runPtySnapshot, runPtyText, type PtyTakeoverCommandDeps } from './pty-takeover-cli.js';
+import { federatedPtyRefs, findPtyManifestRows, joinPtyLineage, ptyGitDiscoveryEnv, registerPtyTakeoverCommands, resolvePtyWorktreeProvenance, runPtyFind, runPtyLineage, runPtyList, runPtyReap, runPtyRelease, runPtyRetire, runPtySnapshot, runPtyText, runPtyMouse, type PtyTakeoverCommandDeps } from './pty-takeover-cli.js';
 import { PTY_MANIFEST_CLOSED_TTL_MS, reapDeadPtyManifestAt, setPtyManifestDbPathForTesting, upsertPtyManifest, type PtyManifestRow } from '../pty-shell/pty-manifest.js';
 import { enqueueControlMemo } from '../harness/control-inbox.js';
 import type { PtyEventRow } from '../pty-shell/pty-event-log.js';
@@ -35,6 +36,67 @@ function lineageDeps(manifestRows: readonly PtyManifestRow[], lifecycleRows: rea
     log: () => {},
   };
 }
+
+describe('pty install-tool wiring', () => {
+  test('real CLI entrypoint rejects an absent PTY ref instead of reporting already', () => {
+    const ref = `missing-pty-install-${process.pid}-${Date.now()}`;
+    const result = spawnSync(process.execPath, ['bin/elanous.mjs', '--test', 'pty', 'install-tool', ref, 'jq'], {
+      cwd: join(import.meta.dir, '../..'),
+      env: { ...process.env, NODE_ENV: 'test' },
+      encoding: 'utf8', timeout: 30_000,
+    });
+    const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
+    expect(result.status).toBe(1);
+    expect(output).toContain(ref);
+    expect(output).toContain('PTY probe unavailable');
+    expect(output).not.toContain('pty install-tool: already');
+  });
+  test('Commander invokes smoke-first installer in the supplied PTY and reports its outcome', async () => {
+    const stdout: string[] = [];
+    const originalOut = process.stdout.write;
+    const originalErr = process.stderr.write;
+    const typed: string[] = [];
+    let checks = 0;
+    process.stdout.write = ((chunk: string) => { stdout.push(chunk); return true; }) as typeof process.stdout.write;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    try {
+      const program = new Command();
+      registerPtyTakeoverCommands(program, lineageDeps([], []), {
+        exec: () => ({ status: 0, stdout: `${++checks}` }),
+        typeLine: (ref, line) => { expect(ref).toBe('pty-from-cli'); typed.push(line); },
+        waitIdle: () => '$', decision: () => {}, log: () => {},
+      });
+      await program.parseAsync(['node', 'elanous', 'pty', 'install-tool', 'pty-from-cli', 'jq']);
+      expect(checks).toBe(1);
+      expect(typed).toEqual([]);
+      expect(stdout.join('')).toContain('already');
+    } finally {
+      process.stdout.write = originalOut;
+      process.stderr.write = originalErr;
+      process.exitCode = 0;
+    }
+  });
+
+  test('codex help does not claim authenticated readiness without login notice', async () => {
+    const stdout: string[] = [];
+    const originalOut = process.stdout.write;
+    const originalErr = process.stderr.write;
+    process.stdout.write = ((chunk: string) => { stdout.push(chunk); return true; }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string) => { stdout.push(chunk); return true; }) as typeof process.stderr.write;
+    try {
+      const program = new Command();
+      registerPtyTakeoverCommands(program, lineageDeps([], []), {
+        exec: (cmd) => cmd[1] === '--help' ? { status: 0, stdout: 'codex help' } : { status: 1, stdout: 'Not logged in' }, decision: () => {}, log: () => {},
+      });
+      await program.parseAsync(['node', 'elanous', 'pty', 'install-tool', 'pty-from-cli', 'codex']);
+      expect(stdout.join('')).toContain('codex authentication not verified; run codex login');
+    } finally {
+      process.stdout.write = originalOut;
+      process.stderr.write = originalErr;
+      process.exitCode = 0;
+    }
+  });
+});
 
 describe('federatedPtyRefs', () => {
   test('carries supplied updatedAt values and omits the key when a live row does not supply one', () => {
@@ -840,6 +902,40 @@ describe('PTY-less agent references', () => {
     log: () => {},
   };
   const agentMessage = 'pty: agent:subagent-1 is a participant without a PTY and cannot be controlled by this command; inspect it via the observatory list or elanous logs';
+
+  test('mouse command validates mode, preserves ownership and dispatches structured remote input', async () => {
+    const written: string[] = [];
+    const { startPty, setPtyAdapterForTesting, unregisterPty } = await import('../pty-shell/registry.js');
+    let onData: ((chunk: string) => void) | undefined;
+    setPtyAdapterForTesting(() => ({
+      pid: 7, write: (chars: string) => { written.push(chars); }, kill() {},
+      onData: (callback) => { onData = callback; return { dispose() {} }; },
+      onExit: () => ({ dispose() {} }),
+    }));
+    let id: string | undefined;
+    try {
+      const handle = startPty({ cmd: 'test', accessMode: 'auto', detach: true });
+      id = handle.id;
+      const calls: unknown[][] = [];
+      const mouseDeps = { ...deps, listRefs: () => [{ id: handle.id, kind: 'test', source: 'local' as const, alive: true }, { id: 'foreign-pty', kind: 'test', source: 'remote' as const, alive: true }], readAddressBook: undefined, getPty: (ref: string) => ref === handle.id ? handle : undefined, requestRemote: async (...args: Parameters<PtyTakeoverCommandDeps['requestRemote']>) => { calls.push(args); return { status: 'success' as const }; }, runIdentity: () => ({ requester: 'run-1', target: 'run-1' }) };
+      expect((await runPtyMouse(handle.id, { x: 10, y: 5, kind: 'click' }, mouseDeps, 'agent')).message).toContain('mouse mode is off');
+      onData?.('\x1b[?1000;1006h');
+      expect((await runPtyMouse(handle.id, { x: 10, y: 5, kind: 'click' }, mouseDeps, 'agent')).exitCode).toBe(0);
+      expect(written).toEqual(['\x1b[<0;10;5M\x1b[<0;10;5m']);
+      handle.setAccessMode('write');
+      expect((await runPtyMouse(handle.id, { x: 10, y: 5, kind: 'click' }, mouseDeps, 'agent')).exitCode).toBe(1);
+      expect((await runPtyMouse(handle.id, { x: 10, y: 5, kind: 'click' }, mouseDeps, 'human')).exitCode).toBe(0);
+      expect(written).toHaveLength(2);
+      onData?.('\x1b[?1000l');
+      expect((await runPtyMouse(handle.id, { x: 10, y: 5, kind: 'click' }, mouseDeps, 'human')).message).toContain('mouse mode is off');
+      expect(written).toHaveLength(2);
+      await runPtyMouse('foreign-pty', { x: 1, y: 1, kind: 'scroll-up' }, mouseDeps);
+      expect(calls.at(-1)?.[1]).toBe('input-mouse');
+    } finally {
+      if (id) unregisterPty(id);
+      setPtyAdapterForTesting(null);
+    }
+  }, 20_000);
 
   test('distinguishes a PTY-less agent from a missing snapshot or text target', async () => {
     await expect(runPtySnapshot('agent:subagent-1', deps)).resolves.toEqual({ exitCode: 1, message: agentMessage });
@@ -1988,6 +2084,43 @@ describe('runPtyList remote bookmark', () => {
       expect(result.message).not.toContain('pty_ok');
     } finally {
       server.stop(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('pty mouse CLI remote bookmark', () => {
+  test('mouse --remote forwards structured click; agent HTTP path refuses without same-run proof', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pty-mouse-remote-'));
+    const tokens = join(dir, 'remotes');
+    mkdirSync(tokens, { recursive: true });
+    const store = new RemotesStore({ remotesFilePath: join(dir, 'remotes.json'), tokensDir: tokens });
+    const tokenFile = store.saveToken('good', 'test-token');
+    store.addRemote('good', { host: 'good', acp_url: 'ws://127.0.0.1:31416/v1/acp', token_file: tokenFile, addedAt: '2026-09-01T00:00:00Z' }, { setDefault: true });
+    const posted: unknown[] = [];
+    const output: string[] = [];
+    const previousOut = process.stdout.write;
+    const previousErr = process.stderr.write;
+    process.stdout.write = ((chunk: string) => { output.push(chunk); return true; }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string) => { output.push(chunk); return true; }) as typeof process.stderr.write;
+    try {
+      const command = new Command();
+      registerPtyTakeoverCommands(command, { ...lineageDeps([], []), remotesStore: () => store,
+        postRemoteTerminalControl: async (_url, _token, body) => { posted.push(body); return { ok: true, status: 200, json: { status: 'success' } }; },
+      });
+      await command.parseAsync(['node', 'elanous', 'pty', 'mouse', 'pty_one', '10', '5', '--remote', 'good']);
+      expect(posted).toEqual([{ action: 'input-mouse', x: 10, y: 5, kind: 'click', button: 'left' }]);
+      expect(process.exitCode).toBe(0);
+      await command.parseAsync(['node', 'elanous', 'pty', 'mouse', 'pty_one', '3', '4', '--remote', 'good', '--scroll', 'down', '--button', 'right']);
+      expect(posted[1]).toEqual({ action: 'input-mouse', x: 3, y: 4, kind: 'scroll-down', button: 'right' });
+      await command.parseAsync(['node', 'elanous', 'pty', 'mouse', 'pty_one', '10', '5', '--remote', 'good', '--actor', 'agent']);
+      expect(posted).toHaveLength(2);
+      expect(process.exitCode).toBe(1);
+      expect(output.join('')).toContain('cannot verify same-run agent ownership');
+    } finally {
+      process.stdout.write = previousOut;
+      process.stderr.write = previousErr;
+      process.exitCode = 0;
       rmSync(dir, { recursive: true, force: true });
     }
   });

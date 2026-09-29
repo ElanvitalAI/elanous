@@ -2,6 +2,7 @@
 //
 //   elanous release prepare --version <x.y.z[-rc.N]> [--source <ref>] [--out <dir>] [--notes-from <ref>] [--skip-e2e]
 //   elanous release publish --dir <prepare 산출> --notes-file <본문> [--yes]
+//   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
 //
@@ -12,11 +13,13 @@
 // ⛔ 공개본은 «원본 매니페스트»(`release/public-export.yaml`)대로만 만든다 — 매매 실행 코드는 그 매니페스트가 이미 뺀다(🅢 #20529).
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { debug } from '../debug/log.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { envLiteral } from '../platform/env-literal.js';
 
 export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
 const SEMVER = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -207,7 +210,54 @@ export function readManifest(dir: string): ReleaseManifest {
   return JSON.parse(readFileSync(join(resolve(dir), 'release.json'), 'utf8')) as ReleaseManifest;
 }
 
-export async function publishRelease(opts: { dir: string; notesFile: string; yes?: boolean; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ published: boolean; steps: PublishStep[] }> {
+const COMMIT_SHA = /^[0-9a-f]{40}$/i;
+
+export interface TagOptions { version: string; source: string; yes?: boolean; repoRoot?: string; log?: (line: string) => void }
+
+/** 로컬과 origin 의 태그를 모두 대조한다. 주석 태그는 반드시 peel 해서 원본 커밋을 비교한다. */
+function checkSourceTag(version: string, source: string, repoRoot: string, run: Runner): { tag: string; commit: string; local: boolean; remote: boolean } {
+  if (!isReleaseVersion(version)) throw new Error(`버전 모양이 아니다: ${version}`);
+  if (!COMMIT_SHA.test(source)) throw new Error(`원본 커밋 SHA가 아니다: ${source}`);
+  const tag = `v${version}`;
+  const commit = must(run('git', ['rev-parse', '--verify', `${source}^{commit}`], repoRoot), '원본 커밋 확인');
+  if (commit !== source.toLowerCase()) throw new Error(`원본 커밋 불일치: ${source} ≠ ${commit}`);
+  const localRef = `refs/tags/${tag}`;
+  // `--quiet` 없이 없는 ref 를 물으면 git 은 1 이 아니라 128 을 낸다(📏 2026-09-27 · 0.2.2 소급 태깅이 여기서 멈췄다).
+  const local = run('git', ['show-ref', '--verify', '--quiet', localRef], repoRoot);
+  if (local.status !== 0 && local.status !== 1) must(local, `로컬 태그 ${tag} 조회`);
+  if (local.status === 0) {
+    const target = must(run('git', ['rev-parse', '--verify', `${localRef}^{commit}`], repoRoot), `로컬 태그 ${tag} 확인`);
+    if (target !== commit) throw new Error(`태그 충돌: ${tag} 로컬 ${target} ≠ 원본 ${commit} — 덮지 않는다`);
+  }
+  const remote = must(run('git', ['ls-remote', '--tags', 'origin', localRef, `${localRef}^{}`], repoRoot), `origin 태그 ${tag} 조회`);
+  const refs = new Map(remote.split('\n').filter(Boolean).map((line) => {
+    const [hash, ref] = line.split(/\s+/);
+    return [ref, hash];
+  }));
+  const target = refs.get(`${localRef}^{}`) ?? refs.get(localRef);
+  if (target && target !== commit) throw new Error(`태그 충돌: ${tag} origin ${target} ≠ 원본 ${commit} — 덮지 않는다`);
+  return { tag, commit, local: local.status === 0, remote: Boolean(target) };
+}
+
+function applySourceTag(version: string, source: string, repoRoot: string, run: Runner): void {
+  const state = checkSourceTag(version, source, repoRoot, run);
+  if (!state.local) must(run('git', ['tag', '-a', state.tag, state.commit, '-m', `elanous ${state.tag}`], repoRoot), `내부 태그 ${state.tag} 생성`);
+  if (!state.remote) must(run('git', ['push', 'origin', `refs/tags/${state.tag}:refs/tags/${state.tag}`], repoRoot), `내부 태그 ${state.tag} push`);
+  debug.log('release.publish', 'tagged', { version, commit: state.commit });
+}
+
+/** 이미 발행한 판의 내부 기준점을 소급 태깅한다. --yes 없으면 저장소를 읽거나 쓰지 않는다. */
+export async function tagRelease(opts: TagOptions, run: Runner = defaultRunner): Promise<{ tagged: boolean }> {
+  const log = opts.log ?? ((line: string) => console.log(line));
+  if (!isReleaseVersion(opts.version)) throw new Error(`버전 모양이 아니다: ${opts.version}`);
+  if (!COMMIT_SHA.test(opts.source)) throw new Error(`원본 커밋 SHA가 아니다: ${opts.source}`);
+  log(`${opts.yes ? '▶' : '·'} 내부 태그 v${opts.version} → ${opts.source} (origin push${opts.yes ? '' : ' 예정'})`);
+  if (!opts.yes) return { tagged: false };
+  applySourceTag(opts.version, opts.source, resolve(opts.repoRoot ?? join(import.meta.dir, '..', '..')), run);
+  return { tagged: true };
+}
+
+export async function publishRelease(opts: { dir: string; notesFile: string; yes?: boolean; repoRoot?: string; instanceRoot?: string; log?: (l: string) => void }, run: Runner = defaultRunner): Promise<{ published: boolean; steps: PublishStep[] }> {
   const log = opts.log ?? ((l: string) => console.log(l));
   const m = readManifest(opts.dir);
   if (!existsSync(opts.notesFile)) throw new Error(`릴리스 본문 파일이 없다: ${opts.notesFile} (초안: ${m.notesDraft ?? 'release notes --from <ref>'})`);
@@ -219,7 +269,15 @@ export async function publishRelease(opts: { dir: string; notesFile: string; yes
   const steps = planPublish(m, resolve(opts.notesFile));
   for (const s of steps) log(`${opts.yes ? '▶' : '·'} ${s.what}\n    ${s.command} ${s.args.join(' ')}`);
   if (!opts.yes) { log('⛔ 보기만 했다 — 공개는 되돌릴 수 없다. 실행하려면 --yes'); return { published: false, steps }; }
+  const repoRoot = resolve(opts.repoRoot ?? join(import.meta.dir, '..', '..'));
+  checkSourceTag(m.version, m.sourceCommit, repoRoot, run);
   for (const s of steps) must(run(s.command, s.args, s.cwd), s.what);
+  applySourceTag(m.version, m.sourceCommit, repoRoot, run);
+  const recordDir = join(opts.instanceRoot ?? effectiveInstanceRoot(), 'release', m.version);
+  mkdirSync(recordDir, { recursive: true });
+  const record = join(recordDir, 'release.json');
+  writeFileSync(record, `${JSON.stringify({ ...m, publishedAt: new Date().toISOString() }, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(record, 0o600);
   log(`✅ 공개: https://github.com/${m.publicRepo}/releases/tag/${m.tag} — 이어서 \`elanous release verify --version ${m.version}\``);
   return { published: true, steps };
 }
@@ -346,7 +404,7 @@ export async function verifyRelease(opts: { version?: string; publicRepo?: strin
     mkdirSync(home);
     // 검증은 «빈 HOME» 에서만 쓴다 — 물려받은 ELANOUS_*(STATE_DIR 등)·XDG_* 가 있으면 상태 왕복이 운영 저장소에 쓴다.
     const inherited = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('ELANOUS_') && !key.startsWith('XDG_')));
-    const env: NodeJS.ProcessEnv = { ...inherited, HOME: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: opts.version ?? '', SHELL: '/bin/zsh' };
+    const env = envLiteral({ ...inherited, HOME: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_INSTALL_SOURCE: '', ELANOUS_VERSION: opts.version ?? '', SHELL: '/bin/zsh' });
     const script = must(run('curl', ['-fsSL', installerUrl], home), `설치기 받기 ${installerUrl}`);
     const install = run('bash', ['-s', '--', '--no-modify-path'], home, { env, input: script });
     const versionLine = run(join(prefix, 'bin', 'elanous'), ['--version'], home, { env }).stdout.trim();
@@ -414,6 +472,14 @@ export function registerReleaseCommands(program: Command): void {
         const m = readManifest(o.dir);
         return { ...r, tag: m.tag, publicRepo: m.publicRepo, publicCommit: m.publicCommit, assets: [...new Set([...m.files.map((f) => f.name), 'SHA256SUMS'])].map((name) => join(m.distDir, name)) };
       }, () => true);
+    });
+  release.command('tag')
+    .description('이미 발행된 판의 내부 원본 커밋에 주석 태그를 달고 origin 에 push. --yes 없으면 계획만')
+    .requiredOption('--version <x.y.z>', '이미 발행된 판')
+    .requiredOption('--source <commit>', '내부 원본 커밋 SHA')
+    .option('--yes', '태그를 실제로 만든다')
+    .action(async (o: { version: string; source: string; yes?: boolean }) => {
+      await jsonAction(undefined, (log) => tagRelease({ ...o, log }), () => true);
     });
   release.command('verify')
     .description('공개 주소로 끝까지 — 깨끗한 임시 홈에서 설치 → --version → self-update → 제거')

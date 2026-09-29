@@ -18,6 +18,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync, chmodSync, unlinkSync } from 'node:fs';
 import { join as joinPath, dirname } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 
 export const REMOTES_FILE_VERSION = 1;
 
@@ -212,7 +213,7 @@ export function deriveNameFromHost(host: string): string {
 
 /** Parse a host/URL spec the user passed: `mbp.tailnet`, `mbp.tailnet:31415`,
  *  or `http://mbp.tailnet:31415`. Returns base URL (no trailing slash). */
-export function normalizeHost(spec: string, defaultPort = 31415): { url: string; host: string; port: number } {
+export function normalizeHost(spec: string, defaultPort = DEFAULT_NEXUS_HTTP_PORT): { url: string; host: string; port: number } {
   let raw = spec.trim();
   if (raw.length === 0) throw new Error('host required');
   if (!/^https?:\/\//.test(raw)) raw = `http://${raw}`;

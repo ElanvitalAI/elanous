@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { installStaticTool, linuxArch, STATIC_TOOLS } from './doctor-static-tools.js';
-import { managedPythonNeeded, planDoctorFixes, staticToolsNeeded } from './doctor-fix.js';
+import { managedPythonNeeded, planDoctorFixes, smokeCheck, staticToolsNeeded } from './doctor-fix.js';
 import { managedPythonCandidate } from '../python/resolve-python.js';
 
 // 2026-09-25 amazonlinux:2·2023 컨테이너 실측의 판정 규칙을 고정한다.
@@ -113,11 +114,56 @@ describe('codex needs its code-mode host', () => {
   test('installing codex installs the host too (one set)', () => {
     const installed: string[] = [];
     const home = mkdtempSync(join(tmpdir(), 'st-'));
-    applyDoctorFixes({ arch: 'arm64', home, env: { HOME: home }, readiness: { platform: 'linux', distro: 'amzn2', rgOnPath: true, codexOnPath: false, nodeOnPath: false }, installStaticTool: (name) => { installed.push(name); return { ok: true, detail: name }; } }, true);
+    applyDoctorFixes({ arch: 'arm64', home, env: { HOME: home }, readiness: { platform: 'linux', distro: 'amzn2', rgOnPath: true, codexOnPath: false, nodeOnPath: false }, installStaticTool: (name) => { installed.push(name); return { ok: true, detail: name }; }, smokeCheck: () => true }, true);
     expect(installed).toEqual(['codex', 'codex-code-mode-host']);
   });
   test('a codex binary missing its host is re-installed as a set', () => {
     expect(staticToolsNeeded({ platform: 'linux', distro: 'debian', rgOnPath: true, codexOnPath: true, codexCodeModeHost: false })).toEqual(['codex']);
+  });
+  test('smokeCheck runs the injected host probe rather than assuming it works', () => {
+    const calls: string[][] = [];
+    const ok = smokeCheck('codex-code-mode-host', '/tmp/test-host', (command, args) => {
+      calls.push([command, ...args]);
+      return { status: 0 };
+    });
+    expect(ok).toBe(true);
+    expect(calls).toEqual([['/tmp/test-host', '--help']]);
+    expect(smokeCheck('codex-code-mode-host', '/tmp/test-host', () => ({ status: null }))).toBe(false);
+  });
+  test('host handshake requires a framed ready response, not just successful process exit', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'doctor-host-protocol-'));
+    try {
+      const dest = join(dir, 'codex-code-mode-host');
+      writeFileSync(dest, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      expect(smokeCheck('codex-code-mode-host', dest)).toBe(false);
+      const payload = Buffer.from(JSON.stringify({ type: 'connection/ready', selectedVersion: 1, capabilities: [] }));
+      const frame = Buffer.alloc(payload.length + 4);
+      frame.writeUInt32LE(payload.length, 0);
+      payload.copy(frame, 4);
+      writeFileSync(dest, `#!/bin/sh\nprintf '${[...frame].map((byte) => `\\${byte.toString(8).padStart(3, '0')}`).join('')}'\n`, { mode: 0o755 });
+      expect(smokeCheck('codex-code-mode-host', dest)).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test('a host that exists but cannot execute prevents static-tools from reporting fixed', () => {
+    const home = mkdtempSync(join(tmpdir(), 'doctor-host-'));
+    try {
+      const bin = join(home, 'bin');
+      mkdirSync(bin);
+      writeFileSync(join(bin, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      writeFileSync(join(bin, 'codex-code-mode-host'), '#!/bin/sh\nexit 23\n', { mode: 0o755 });
+      const result = applyDoctorFixes({
+        home, env: { HOME: home, ELANOUS_INSTALL_PREFIX: home }, keyNames: [], arch: 'x64',
+        readiness: { platform: 'linux', distro: 'amzn2', codexOnPath: false, nodeOnPath: false },
+        installStaticTool: (name) => ({ ok: true, detail: name }),
+      }, true, new Set(['static-tools']));
+      expect(spawnSync(join(bin, 'codex'), ['--help'], { stdio: 'ignore' }).status).toBe(0);
+      expect(result.items.find((item) => item.id === 'static-tools')).toMatchObject({ result: 'failed', reason: 'installed, but smoke check failed' });
+      expect(result.exitCode).toBe(1);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

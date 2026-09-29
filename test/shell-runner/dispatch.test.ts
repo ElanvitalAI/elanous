@@ -87,6 +87,14 @@ describe('runShell', () => {
     await h.result;
   });
 
+  test('explicit VW and modal requests without a PTY host fail rather than reporting a headless success', () => {
+    const deps = makeDeps({ spawnFn: fakeSpawn() });
+    for (const mode of ['vw', 'modal'] as const) {
+      expect(() => runShell({ command: 'echo unsafe', mode }, deps)).toThrow(`RunShell(mode:"${mode}") requires an attachable PTY surface`);
+    }
+    expect(deps.registry.list()).toEqual([]);
+  });
+
   test('mode=vw routes to pty engine when a factory is provided', () => {
     const host = fakeHost();
     const deps = makeDeps({

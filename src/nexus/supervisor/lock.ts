@@ -48,6 +48,14 @@ export function isAliveNexusLock(meta: NexusLockMeta): boolean {
   return isAliveLock(meta);
 }
 
+/** Read the live daemon lifecycle at an explicit nexus root (e.g. the production
+ *  universe's `~/.elanous/nexus`), independent of this process's own universe. */
+export function findNexusLifecycleStateAt(root: string): NexusLifecycleState | null {
+  const lock = safeReadLock(joinPath(root, '.lock'));
+  if (!lock || !isAliveNexusLock(lock)) return null;
+  return { root, lock, runtime: readNexusRuntimeAt(joinPath(root, 'runtime.json')) };
+}
+
 export interface NexusLifecycleState {
   root: string;
   lock: NexusLockMeta;

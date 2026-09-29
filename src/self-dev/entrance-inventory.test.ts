@@ -1,9 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { Command, Option } from 'commander';
 import { collectCommandEntrances, renderCommandEntrances } from './entrance-inventory.js';
 import { program } from '../index.js';
@@ -49,24 +47,19 @@ describe('collectCommandEntrances', () => {
   });
 
   test('the CLI consumer reports the registered root-command count and the same inventory', () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'elanous-entrances-'));
-    try {
-      const result = spawnSync('bun', [bin, 'self', 'entrances', '--json'], {
-        cwd: repositoryRoot,
-        encoding: 'utf8',
-        timeout: 60_000,
-        env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
-      });
-      if (result.error) throw result.error;
-      expect(result.signal).toBeNull();
-      expect(result.status).toBe(0);
+    const result = spawnSync('bun', [bin, '--test', 'self', 'entrances', '--json'], {
+      cwd: repositoryRoot,
+      encoding: 'utf8',
+      timeout: 60_000,
+      env: { ...process.env, NODE_ENV: 'test', ELANOUS_DEBUG_LEVEL: 'off' },
+    });
+    if (result.error) throw result.error;
+    expect(result.signal).toBeNull();
+    expect(result.status, result.stderr).toBe(0);
 
-      const output = JSON.parse(result.stdout) as { rootCommandCount: number; entrances: ReturnType<typeof collectCommandEntrances> };
-      expect(output.rootCommandCount).toBe(program.commands.length);
-      expect(output.entrances).toEqual(collectCommandEntrances(program));
-      expect(renderCommandEntrances(output.entrances, output.rootCommandCount)).toContain(`root commands: ${program.commands.length}`);
-    } finally {
-      rmSync(stateDir, { recursive: true, force: true });
-    }
+    const output = JSON.parse(result.stdout) as { rootCommandCount: number; entrances: ReturnType<typeof collectCommandEntrances> };
+    expect(output.rootCommandCount).toBe(program.commands.length);
+    expect(output.entrances).toEqual(collectCommandEntrances(program));
+    expect(renderCommandEntrances(output.entrances, output.rootCommandCount)).toContain(`root commands: ${program.commands.length}`);
   }, 60_000);
 });

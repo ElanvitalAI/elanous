@@ -1,6 +1,7 @@
 // P.3 — First-boot PWA share wizard unit coverage.
 
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 
 import {
   runPwaSharePrompt,
@@ -20,6 +21,7 @@ interface DepsState {
   saveCalls: ShareTailnetValue[];
   buildCalls: number;
   serveCalls: number;
+  servedPorts: number[];
   chooseCalls: number;
   logs: string[];
   errors: string[];
@@ -43,6 +45,7 @@ function mkDeps(state: Partial<DepsState> = {}): { deps: PwaSharePromptDeps; sta
     saveCalls: [],
     buildCalls: 0,
     serveCalls: 0,
+    servedPorts: [],
     chooseCalls: 0,
     logs: [],
     errors: [],
@@ -66,8 +69,9 @@ function mkDeps(state: Partial<DepsState> = {}): { deps: PwaSharePromptDeps; sta
       s.buildCalls += 1;
       return { exitCode: s.buildExitCode };
     },
-    serveFn: async () => {
+    serveFn: async (_binary, port) => {
       s.serveCalls += 1;
+      s.servedPorts.push(port);
       return { exitCode: s.serveExitCode };
     },
     readSwitch: () => s.switchValue,
@@ -77,6 +81,7 @@ function mkDeps(state: Partial<DepsState> = {}): { deps: PwaSharePromptDeps; sta
     },
     io,
     pwaBuilt: s.pwaBuilt,
+    port: 31420,
     forceTty: true,
     out: {
       log: (l) => s.logs.push(l),
@@ -87,6 +92,15 @@ function mkDeps(state: Partial<DepsState> = {}): { deps: PwaSharePromptDeps; sta
 }
 
 describe('P.3 · runPwaSharePrompt', () => {
+  test('Nexus boot skips PWA onboarding when no HTTP listener was bound', () => {
+    const source = readFileSync(new URL('../src/nexus/index.ts', import.meta.url), 'utf8');
+    const boot = source.slice(source.indexOf('  // P.3 — first-boot PWA share wizard.'), source.indexOf('  // PWA share auto-mount'));
+    expect(boot).toContain('shouldRunTailscale: httpPort !== undefined && shouldAskPwaShareSwitch()');
+    expect(boot).toContain('if (httpPort === undefined) return;');
+    expect(boot).not.toContain("throw new Error('NEXUS HTTP port unavailable for PWA onboarding')");
+    expect(boot).toContain('port: httpPort,');
+  });
+
   test('switch already enabled → skipped (no probe / no prompt)', async () => {
     const { deps, state } = mkDeps({ switchValue: 'enabled' });
     const result = await runPwaSharePrompt(deps);
@@ -129,6 +143,23 @@ describe('P.3 · runPwaSharePrompt', () => {
     }
     expect(state.buildCalls).toBe(0);
     expect(state.serveCalls).toBe(1);
+    expect(state.servedPorts).toEqual([31420]);
+    expect(state.logs.some((line) => line.includes('https://mbp.tail-abc.ts.net:31420/app/'))).toBe(true);
+    expect(state.saveCalls).toEqual(['enabled']);
+  });
+
+  test('bound-port input drives both the picker and serve after a missing build', async () => {
+    const { deps, state } = mkDeps({ chooseAnswer: true, pwaBuilt: false });
+    deps.port = 31421;
+    const choose = deps.io.choose!;
+    deps.io.choose = async (prompt, options, opts) => {
+      expect(options[0]?.label).toContain('https://mbp.tail-abc.ts.net:31421/app/');
+      return choose(prompt, options, opts);
+    };
+    const result = await runPwaSharePrompt(deps);
+    expect(result).toMatchObject({ action: 'enabled', built: true });
+    expect(state.buildCalls).toBe(1);
+    expect(state.servedPorts).toEqual([31421]);
     expect(state.saveCalls).toEqual(['enabled']);
   });
 
@@ -141,6 +172,8 @@ describe('P.3 · runPwaSharePrompt', () => {
     }
     expect(state.buildCalls).toBe(1);
     expect(state.serveCalls).toBe(1);
+    expect(state.servedPorts).toEqual([31420]);
+    expect(state.logs.some((line) => line.includes('https://mbp.tail-abc.ts.net:31420/app/'))).toBe(true);
     expect(state.saveCalls).toEqual(['enabled']);
   });
 

@@ -15,7 +15,7 @@ import type {
 } from '../../plugin-workflows/types.js';
 import { WORKFLOW_DEFAULTS } from '../../plugin-workflows/types.js';
 
-export type PluginSource = 'builtin' | 'user' | 'workspace';
+export type PluginSource = 'builtin' | 'user' | 'workspace' | 'installed';
 
 export type PluginCapability =
   | { kind: 'process:spawn'; commands?: string[] }
@@ -74,6 +74,19 @@ export interface PluginManifestContributes {
   mcpServers?: PluginNamedContribution[];
   /** Portable provider contributions (classifier bucket). */
   providers?: PluginNamedContribution[];
+  /** Declarative node definitions, relative to the plugin root. */
+  nodes?: string[];
+  /** Agent Plugins extension assets; paths remain relative to the plugin root. */
+  graphs?: string[];
+  vocab?: string[];
+  connectors?: PluginConnectorContribution[];
+}
+
+export interface PluginConnectorContribution {
+  id: string;
+  fields?: Array<{ name: string; secret?: boolean; [key: string]: unknown }>;
+  userConfig?: Array<{ key: string; label?: string; secret?: boolean; [key: string]: unknown }>;
+  [key: string]: unknown;
 }
 
 /** Generic named contribution used by portable classifier buckets. */
@@ -247,7 +260,7 @@ export interface PluginManifestLoadResult {
   inferred: boolean;
 }
 
-const MANIFEST_FILES = ['plugin.json', join('.elanous-plugin', 'plugin.json')];
+const MANIFEST_FILES = ['plugin.json', join('.elanous-plugin', 'plugin.json'), join('.codex-plugin', 'plugin.json')];
 
 export function loadPluginManifestFromDir(
   pluginDir: string,
@@ -264,7 +277,11 @@ export function loadPluginManifestFromDir(
       throw new Error(`${rel}: invalid JSON: ${err?.message || err}`);
     }
     return {
-      manifest: parsePluginManifest(json, { fallbackId: fallback.id, fallbackMain: fallback.main ?? './plugin.ts' }),
+      manifest: parsePluginManifest(json, {
+        fallbackId: fallback.id,
+        fallbackMain: fallback.main ?? './plugin.ts',
+        agentPlugin: rel === join('.codex-plugin', 'plugin.json'),
+      }),
       path,
       inferred: false,
     };
@@ -289,19 +306,27 @@ export function loadPluginManifestFromDir(
 
 export function parsePluginManifest(
   value: unknown,
-  opts: { fallbackId?: string; fallbackMain?: string } = {},
+  opts: { fallbackId?: string; fallbackMain?: string; agentPlugin?: boolean } = {},
 ): PluginManifest {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('plugin manifest must be an object');
   }
   const raw = value as Record<string, unknown>;
-  const id = normalizeId(stringOr(raw.id, opts.fallbackId), 'id');
+  const agentPlugin = opts.agentPlugin === true
+    || (typeof raw.$schema === 'string' && raw.$schema.startsWith('https://agentplugins.dev/'));
+  const id = normalizeId(stringOr(raw.id, (agentPlugin || opts.fallbackId === undefined)
+    && typeof raw.name === 'string' && raw.name.trim() ? raw.name : opts.fallbackId), 'id');
   const name = stringOr(raw.name, id);
   const version = stringOr(raw.version, '0.0.0');
   const main = normalizeMain(stringOr(raw.main, opts.fallbackMain ?? './plugin.ts'));
   const activationEvents = stringArrayOr(raw.activationEvents, ['onCommand']);
-  const contributes = parseContributes(raw.contributes);
-  const capabilities = parseCapabilities(raw.capabilities);
+  const extension = parseElanousExtension(raw.extensions);
+  const contributes = parseContributes({ ...extension.contributes, ...objectOrEmpty(raw.contributes, 'contributes') });
+  const capabilities = parseCapabilities(raw.capabilities === undefined
+    ? extension.capabilities
+    : extension.capabilities === undefined
+      ? raw.capabilities
+      : [...parseCapabilities(raw.capabilities), ...parseCapabilities(extension.capabilities)]);
   const dependencies = parseDependencies(raw.dependencies);
   const description = typeof raw.description === 'string' ? raw.description : undefined;
   const allowMultiActive = typeof raw.allowMultiActive === 'boolean' ? raw.allowMultiActive : undefined;
@@ -320,6 +345,26 @@ export function parsePluginManifest(
     ...(allowMultiActive !== undefined ? { allowMultiActive } : {}),
     ...(activePeerCompat ? { activePeerCompat } : {}),
     ...(resourceQuota ? { resourceQuota } : {}),
+  };
+}
+
+function objectOrEmpty(value: unknown, label: string): Record<string, unknown> {
+  if (value === undefined) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} must be an object`);
+  return value as Record<string, unknown>;
+}
+
+function parseElanousExtension(value: unknown): { contributes: Record<string, unknown>; capabilities?: unknown } {
+  const extensions = objectOrEmpty(value, 'extensions');
+  const extension = objectOrEmpty(extensions['ai.elanous'], 'extensions["ai.elanous"]');
+  const contributes = objectOrEmpty(extension.contributes, 'extensions["ai.elanous"].contributes');
+  return {
+    contributes: {
+      ...contributes,
+      ...Object.fromEntries(['nodes', 'graphs', 'vocab', 'connectors'].filter(key => extension[key] !== undefined)
+        .map(key => [key, extension[key]])),
+    },
+    capabilities: extension.capabilities,
   };
 }
 
@@ -390,6 +435,10 @@ function parseContributes(value: unknown): PluginManifestContributes {
     ...(raw.tools !== undefined ? { tools: parseNamedContributions(raw.tools, 'contributes.tools') } : {}),
     ...(raw.mcpServers !== undefined ? { mcpServers: parseNamedContributions(raw.mcpServers, 'contributes.mcpServers') } : {}),
     ...(raw.providers !== undefined ? { providers: parseNamedContributions(raw.providers, 'contributes.providers') } : {}),
+    ...(raw.nodes !== undefined ? { nodes: parseNodePaths(raw.nodes) } : {}),
+    ...(raw.graphs !== undefined ? { graphs: parseAssetPaths(raw.graphs, 'contributes.graphs') } : {}),
+    ...(raw.vocab !== undefined ? { vocab: parseAssetPaths(raw.vocab, 'contributes.vocab') } : {}),
+    ...(raw.connectors !== undefined ? { connectors: parseConnectors(raw.connectors) } : {}),
   };
 }
 
@@ -910,6 +959,54 @@ function parseThemes(value: unknown): NonNullable<PluginManifestContributes['the
       path: stringOr(raw.path),
       ...(typeof raw.label === 'string' ? { label: raw.label } : {}),
     };
+  });
+}
+
+function parseNodePaths(value: unknown): string[] {
+  const label = 'contributes.nodes';
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value.map((item, idx) => {
+    const field = `${label}[${idx}]`;
+    if (typeof item !== 'string' || !item.startsWith('./') || item.length <= 2 || item.includes('\0')) {
+      throw new Error(`${field} must be a path starting with ./ inside the plugin dir`);
+    }
+    return validatePluginRelativePath(item, field);
+  });
+}
+
+function parseAssetPaths(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value.map((item, idx) => {
+    if (typeof item !== 'string') throw new Error(`${label}[${idx}] must be a path`);
+    return validatePluginRelativePath(item, `${label}[${idx}]`);
+  });
+}
+
+function parseConnectors(value: unknown): PluginConnectorContribution[] {
+  if (!Array.isArray(value)) throw new Error('contributes.connectors must be an array');
+  const seen = new Set<string>();
+  return value.map((item, idx) => {
+    const label = `contributes.connectors[${idx}]`;
+    const raw = objectOrEmpty(item, label);
+    const id = normalizeId(stringOr(raw.id), `${label}.id`);
+    if (seen.has(id)) throw new Error(`${label}.id '${id}' is duplicated`);
+    seen.add(id);
+    const fields = raw.fields === undefined ? undefined : parseConnectorFields(raw.fields, `${label}.fields`, 'name');
+    const userConfig = raw.userConfig === undefined ? undefined : parseConnectorFields(raw.userConfig, `${label}.userConfig`, 'key');
+    return { ...raw, id, ...(fields ? { fields } : {}), ...(userConfig ? { userConfig } : {}) } as PluginConnectorContribution;
+  });
+}
+
+function parseConnectorFields(value: unknown, label: string, key: 'name' | 'key') {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  return value.map((item, idx) => {
+    const raw = objectOrEmpty(item, `${label}[${idx}]`);
+    const field = stringOr(raw[key]);
+    if (raw.secret !== undefined && typeof raw.secret !== 'boolean') throw new Error(`${label}[${idx}].secret must be a boolean`);
+    if (key === 'key' && raw.label !== undefined && typeof raw.label !== 'string') {
+      throw new Error(`${label}[${idx}].label must be a string`);
+    }
+    return { ...raw, [key]: field };
   });
 }
 

@@ -19,7 +19,8 @@ export type { GraphNodeKind } from './graph-yaml.js';
 
 export interface GraphTemplateNode {
   readonly nodeId: string;
-  readonly kind: GraphNodeKind;
+  // 플러그인 kind(`<plugin>:<kind>`)가 들어오므로 스펙과 같은 넓은 형(P-T1 #21684) — 좁은 union 이면 PWA(Next) 타입 검사가 빌드를 막는다.
+  readonly kind: GraphNodeSpec['kind'];
   /** 그 노드의 재방문 상한. ⛔ 지금의 rework 상한이 «여기로 올라올» 자리다(RFC §4.1). */
   readonly maxVisits: number;
   /** YAML recipe identifier; existing orchestrator does not execute it. */

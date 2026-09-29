@@ -40,6 +40,7 @@ import {
 } from './schema.js';
 import { evaluateWhen } from './variables.js';
 import { readWorkflowPin } from './pin-data.js';
+import { WORKFLOW_CORE_KINDS } from '../graph-kinds/registry.js';
 import { checkModelRequires } from '../registry/resolver.js';
 import { validateJudgmentContract, validateJudgmentVerdict } from './judgment-contract.js';
 import { signalBus } from '../signal-bus/index.js';
@@ -61,6 +62,7 @@ import { executeTemplateNode } from './nodes/template.js';
 import { executeHttpRequestNode } from './nodes/http.js';
 import { executeShowroomNode } from './nodes/showroom.js';
 import { executeScheduleTriggerNode, executeWebhookTriggerNode, executeDiscordTriggerNode, executeTelegramTriggerNode, executeManualTriggerNode, executeChatTriggerNode } from './nodes/triggers.js';
+import { executePluginKindNode, isPluginKindNode } from './plugin-kind-node.js';
 import type {
   DagNode,
   NodeExecContext,
@@ -462,6 +464,9 @@ async function dispatchNode(
     } catch { /* best-effort */ }
     return { ok: true, output, durationMs: 0 };
   }
+  // Plugin kinds are dispatched before the core 22. A node without `kind`
+  // never enters this branch, so the core chain below is unchanged.
+  if (isPluginKindNode(node)) return executePluginKindNode(node, ctx, deps);
   if (isPromptNode(node)) return executePromptNode(node, ctx, deps);
   if (isBashNode(node)) return executeBashNode(node, ctx, deps);
   if (isSkillNode(node)) return executeSkillNode(node, ctx, deps);
@@ -513,29 +518,16 @@ function isTriggerVariant(node: DagNode): boolean {
 }
 
 function variantOf(node: DagNode): string {
-  if (isPromptNode(node)) return 'prompt';
-  if (isBashNode(node)) return 'bash';
-  if (isSkillNode(node)) return 'skill';
-  if (isCftNode(node)) return 'cft';
-  if (isApprovalNode(node)) return 'approval';
-  if (isIfNode(node)) return 'if';
-  if (isSwitchNode(node)) return 'switch';
-  if (isIterationNode(node)) return 'iteration';
-  if (isClassifyNode(node)) return 'classify';
-  if (isExtractNode(node)) return 'extract';
-  if (isSetNode(node)) return 'set';
-  if (isFilterNode(node)) return 'filter';
-  if (isTemplateNode(node)) return 'template';
-  if (isHttpRequestNode(node)) return 'http';
-  if (isShowroomNode(node)) return 'showroom';
-  if (isTaskNode(node)) return 'task';
-  if (isScheduleTriggerNode(node)) return 'scheduleTrigger';
-  if (isWebhookTriggerNode(node)) return 'webhookTrigger';
-  if (isDiscordTriggerNode(node)) return 'discordTrigger';
-  if (isTelegramTriggerNode(node)) return 'telegramTrigger';
-  if (isManualTriggerNode(node)) return 'manualTrigger';
-  if (isChatTriggerNode(node)) return 'chatTrigger';
-  return 'unknown';
+  if (isPluginKindNode(node)) return node.kind;
+  const guards: ReadonlyArray<(node: DagNode) => boolean> = [
+    isPromptNode, isBashNode, isSkillNode, isCftNode, isApprovalNode, isIfNode,
+    isSwitchNode, isIterationNode, isClassifyNode, isExtractNode, isSetNode,
+    isFilterNode, isTemplateNode, isHttpRequestNode, isShowroomNode, isTaskNode,
+    isScheduleTriggerNode, isWebhookTriggerNode, isDiscordTriggerNode,
+    isTelegramTriggerNode, isManualTriggerNode, isChatTriggerNode,
+  ];
+  const index = guards.findIndex((guard) => guard(node));
+  return index < 0 ? 'unknown' : WORKFLOW_CORE_KINDS[index]!;
 }
 
 function generateRunId(): string {

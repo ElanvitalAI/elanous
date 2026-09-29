@@ -18,12 +18,6 @@ export interface DashboardPaneTitleMenuDeps {
   hasClosedPanes?: () => boolean;
 }
 
-const VW_CAPABLE_PANES = new Set<PaneFocus>([
-  'browser',
-  'preview',
-  'scratch',
-]);
-
 function createDashboardPaneTitleMenuProvider(
   pane: PaneFocus,
   deps: DashboardPaneTitleMenuDeps = {},
@@ -43,14 +37,6 @@ function createDashboardPaneTitleMenuProvider(
         payload,
       },
     ];
-    if (VW_CAPABLE_PANES.has(pane)) {
-      items.push({
-        kind: 'command',
-        id: 'dashboard-pane.open-vw',
-        label: 'Open in virtual window',
-        payload,
-      });
-    }
     if (hasClosedPanes) {
       items.push(
         { kind: 'separator' },

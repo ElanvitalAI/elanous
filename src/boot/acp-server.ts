@@ -36,6 +36,7 @@ import {
 } from '../acp/transport/index.js';
 import { runAcpServer, type AcpServerOptions } from '../acp/server.js';
 import type { LlmBrand } from '../llm-vision-capability.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 
 export type AcpBootTransport = 'stdio' | 'unix-socket' | 'websocket';
 
@@ -61,7 +62,7 @@ export function defaultUnixSocketPath(): string {
 }
 
 /** Default websocket bind port. Mnemonic: π × 10⁴. */
-export const DEFAULT_WEBSOCKET_PORT = 31415;
+export const DEFAULT_WEBSOCKET_PORT = DEFAULT_NEXUS_HTTP_PORT;
 
 /** Parse --flag / --flag=value / --flag value out of argv. Returns
  *  the value string or undefined. Exported for tests; the boot

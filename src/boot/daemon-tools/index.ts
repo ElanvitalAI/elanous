@@ -17,6 +17,8 @@ import {
 } from '../../tool-runtime/browser-runtime.js';
 import { askUserQuestionRuntime } from '../../tool-runtime/ask-user-question-runtime.js';
 import { dispatchToolByName, listToolRuntimes } from '../../tool-runtime/registry.js';
+import { ACP_SESSION_RUNTIMES } from '../../tool-runtime/acp-session-runtime.js';
+import { ClaudeSubscriptionNotAllowedError } from '../../policy/claude-subscription-guard.js';
 import { toWireToolName } from '../../tool-runtime/mcp-wire-name.js';
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 
@@ -230,6 +232,7 @@ function dispatchDaemonMcpRuntime(
   return dispatchToolByName(name, args, {
     surface: 'tui',
     signal: ctx.signal,
+    ...(ctx.requestOrigin ? { requestOrigin: ctx.requestOrigin } : {}),
     ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
     ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),
     ...(ctx.emitFeedback ? { emitFeedback: ctx.emitFeedback } : {}),
@@ -335,6 +338,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     //   ⭐ 재발명하지 않는다: `askUserQuestionRuntime` 이 spec ⊕ dispatch 를 한 묶음으로 «이미» 갖고 있고,
     //      ACP 브릿지 → SSE 채널 순의 사다리도 그 안에서 이미 돈다(`#16031`).
     askUserQuestionRuntime.spec,
+    ...ACP_SESSION_RUNTIMES.map((runtime) => runtime.spec),
     ...shared.specs, // L2 core + L3 finance(gated) — buildSharedAppTools 단일 출처(전 서피스 공용)
   ];
 
@@ -371,6 +375,18 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
         return { error: `nest-cap: 재귀 상한(${nestInfo().max}중) 도달 — delegate_code_agent 비활성(액자 폭주 방지)` };
       }
       return dispatchDelegateAgent(args, ctx);
+    }
+    const acpRuntime = ACP_SESSION_RUNTIMES.find((runtime) => runtime.spec.name === name);
+    if (acpRuntime) {
+      try {
+        return await acpRuntime.run(args, {
+          surface: 'tui',
+          ...(ctx.requestOrigin ? { requestOrigin: ctx.requestOrigin } : {}),
+        });
+      } catch (error) {
+        if (error instanceof ClaudeSubscriptionNotAllowedError) return { error: error.message };
+        throw error;
+      }
     }
     if (shared.names.has(name)) {
       return shared.dispatch(name, args); // L2 core + L3 finance(gated) — buildSharedAppTools 단일 dispatch

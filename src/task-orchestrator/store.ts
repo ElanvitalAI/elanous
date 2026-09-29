@@ -174,9 +174,19 @@ export class TaskStore {
       ensureDir(dirname(path));
     }
     this.db = new Database(path);
-    if (!opts.noWal && this.fileBacked) this.db.exec('PRAGMA journal_mode=WAL');
-    this.db.exec('PRAGMA foreign_keys=ON');
-    this.migrate();
+    this.db.exec('PRAGMA busy_timeout = 5000');
+    const openedAt = Date.now();
+    try {
+      if (!opts.noWal && this.fileBacked) this.db.exec('PRAGMA journal_mode=WAL');
+      this.db.exec('PRAGMA foreign_keys=ON');
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      if (/SQLITE_BUSY|SQLITE_LOCKED|database is locked|database is busy/i.test(String(error))) {
+        debug.log('store.sqlite', 'busy-lost', { store: 'tasks', op: 'open', waitedMs: Date.now() - openedAt });
+      }
+      throw error;
+    }
 
     if (this.fileBacked) {
       __tsFileOpenCount++;
@@ -324,12 +334,23 @@ export class TaskStore {
 
   // ──────────────── Task CRUD ───────────────────────────────────
 
+  private observeBusyLoss<T>(op: string, work: () => T): T {
+    const startedAt = Date.now();
+    try { return work(); }
+    catch (error) {
+      if (/SQLITE_BUSY|SQLITE_LOCKED|database is locked|database is busy/i.test(String(error))) {
+        debug.log('store.sqlite', 'busy-lost', { store: 'tasks', op, waitedMs: Date.now() - startedAt });
+      }
+      throw error;
+    }
+  }
+
   transaction<T>(work: () => T): T {
-    return this.db.transaction(work)();
+    return this.observeBusyLoss('transaction', () => this.db.transaction(work)());
   }
 
   saveTask(task: Task): void {
-    this.db
+    this.observeBusyLoss('saveTask', () => this.db
       .prepare(
         `INSERT INTO tox_tasks (
           id, created_at, updated_at, version, title, description, surface_json,
@@ -340,7 +361,7 @@ export class TaskStore {
           trigger_chain_json, approval_json, external_provider, external_ref
         ) VALUES (${Array(33).fill('?').join(', ')})
         ON CONFLICT(id) DO UPDATE SET
-          updated_at=excluded.updated_at, version=excluded.version, title=excluded.title,
+          created_at=excluded.created_at, updated_at=excluded.updated_at, version=excluded.version, title=excluded.title,
           description=excluded.description, surface_json=excluded.surface_json,
           parent_id=excluded.parent_id, goal_slug=excluded.goal_slug, mission_id=excluded.mission_id,
           depends_on_json=excluded.depends_on_json, triggers_json=excluded.triggers_json,
@@ -389,7 +410,7 @@ export class TaskStore {
         task.approval ? JSON.stringify(task.approval) : null,
         task.generatedBy?.kind === 'external' ? task.generatedBy.provider : null,
         task.generatedBy?.kind === 'external' ? task.generatedBy.ref : null,
-      );
+      ));
   }
 
   findTaskByExternalRef(provider: string, ref: string): Task | null {
@@ -426,7 +447,7 @@ export class TaskStore {
   }
 
   deleteTask(id: string): boolean {
-    const res = this.db.prepare('DELETE FROM tox_tasks WHERE id = ?').run(id);
+    const res = this.observeBusyLoss('deleteTask', () => this.db.prepare('DELETE FROM tox_tasks WHERE id = ?').run(id));
     return res.changes > 0;
   }
 
@@ -448,7 +469,7 @@ export class TaskStore {
     if (hostname === undefined) {
       try { hostname = osHostname(); } catch { /* Origin resolution must not block persistence. */ }
     }
-    this.db
+    this.observeBusyLoss('saveExecution', () => this.db
       .prepare(
         `INSERT OR REPLACE INTO tox_executions (
           id, task_id, started_at, ended_at, duration_ms, status, surface_json,
@@ -474,7 +495,7 @@ export class TaskStore {
         exec.modelId ?? null,
         hostId ?? null,
         hostname ?? null
-      );
+      ));
   }
 
   getExecution(id: string): TaskExecution | null {
@@ -499,7 +520,7 @@ export class TaskStore {
   appendEvent(event: TaskEvent): number {
     const goalSlug =
       (event as { goalSlug?: string | null }).goalSlug ?? null;
-    const res = this.db
+    const res = this.observeBusyLoss('appendEvent', () => this.db
       .prepare(
         `INSERT INTO tox_events (kind, timestamp, task_id, goal_slug, payload_json)
          VALUES (?, ?, ?, ?, ?)`
@@ -510,7 +531,7 @@ export class TaskStore {
         event.taskId ?? null,
         goalSlug,
         JSON.stringify(event)
-      );
+      ));
     return Number(res.lastInsertRowid);
   }
 
@@ -561,7 +582,7 @@ export class TaskStore {
   // ──────────────── Mission CRUD (Phase 1 I6 · v2) ──────────────
 
   saveMission(mission: Mission): void {
-    this.db
+    this.observeBusyLoss('saveMission', () => this.db
       .prepare(
         `INSERT OR REPLACE INTO tox_missions (
           id, created_at, updated_at, closed_at, title, description, intent,
@@ -584,7 +605,7 @@ export class TaskStore {
         mission.goalSlug ?? null,
         JSON.stringify([...mission.notes]),
         mission.autopilot ? JSON.stringify(mission.autopilot) : null,
-      );
+      ));
   }
 
   getMission(id: string): Mission | null {
@@ -615,7 +636,7 @@ export class TaskStore {
   }
 
   deleteMission(id: string): boolean {
-    const res = this.db.prepare('DELETE FROM tox_missions WHERE id = ?').run(id);
+    const res = this.observeBusyLoss('deleteMission', () => this.db.prepare('DELETE FROM tox_missions WHERE id = ?').run(id));
     return res.changes > 0;
   }
 

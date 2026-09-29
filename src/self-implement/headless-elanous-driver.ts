@@ -50,6 +50,7 @@ import { brainTrigger } from './brain-consultation.js';
 import { decideAutoAssist, decideAutoStop, decideBoundaryApproval, decideScreenStallSilenceTermination, hasNovelCompletionSignal, NO_STALL, parseBoundaryApprovalRequest, UNKNOWN_OBSERVED_RAW_SHELL_METACHARACTERS, type AutoAssistInput, type AutoStopInput, type AutoStopVerdict, type BoundaryApprovalRequestKind, type DeterministicCompletionState, type ScreenStallSilenceInput } from './auto-intervene.js';
 import { decideByRecipe, missingStateKeys, parseRecipe, type Recipe, type RecipeDecision } from '../decide/recipe.js';
 import { callJev, gateAnswer, probeKey, type JevAnswer } from '../decide/jev.js';
+import { shadowBoundaryDecision, type BoundaryShadowConfig, type BoundaryShadowDeps } from '../decide/boundary-shadow.js';
 import { decideOutputArtifactWatchdog, type OutputArtifactSnapshot, type OutputWatchdogPolicy } from './output-artifact-watchdog.js';
 import { mapBrainAction, mapControlStance, supervisionObservationFields } from './supervision-vocabulary.js';
 import { decideInterventionStep, type InterventionStep } from './intervention-step.js';
@@ -271,6 +272,9 @@ export interface BoundaryRequestWatchOptions {
   onCommandStart?: (commandFirstToken: string) => void;
   /** Test seam for the behavior-axis shadow. Default reads recipes/tool-guard.json and calls Jev. */
   behaviorAxis?: BoundaryBehaviorAxis;
+  /** Test seam for the Jev boundary shadow; production reads raw.decide.boundaryShadow. */
+  boundaryShadow?: BoundaryShadowConfig;
+  boundaryShadowDeps?: BoundaryShadowDeps;
 }
 
 const BEHAVIOR_AXIS_QUESTIONS = ['irreversible', 'outside_workdir', 'reaches_network'] as const;
@@ -518,6 +522,13 @@ export function watchHarnessBoundaryRequests(
                 queueMicrotask(() => {
                   try {
                     observeBoundaryBehaviorAxis(request, verdict, context, options.behaviorAxis);
+                  } catch (error) { observeFailure(error); }
+                  try {
+                    const rawDecide = getUserConfig().raw.decide;
+                    const config = options.boundaryShadow ?? (rawDecide && typeof rawDecide === 'object'
+                      ? (rawDecide as { boundaryShadow?: BoundaryShadowConfig }).boundaryShadow
+                      : undefined);
+                    void shadowBoundaryDecision(request, verdict, config, options.boundaryShadowDeps).catch(observeFailure);
                   } catch (error) { observeFailure(error); }
                 });
               }
@@ -1764,7 +1775,9 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
                     const deliveryReason = input && !opts.onSupervisorInput ? 'next-round-callback-unwired' : undefined;
                     emitSurfaceProgress(formatSupervisionProgressLine({
                       action: decision.action,
-                      reason: decision.action === 'input' ? decision.text : decision.reason,
+                      reason: decision.action === 'input' ? decision.text
+                        : 'reason' in decision ? decision.reason
+                        : `${decision.action} ${JSON.stringify({ ...decision, action: undefined })}`,
                       ...(delivery ? { delivery } : {}),
                       ...(deliveryReason ? { deliveryReason } : {}),
                       ...(inputInstructionOccurrence ? { inputInstructionOccurrence } : {}),

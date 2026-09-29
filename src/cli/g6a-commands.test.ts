@@ -3,13 +3,14 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 
 // Captured from the pre-move src/index.ts Commander tree (flags preserve declaration order).
+// #21723 added logs --top-failures/--threshold after the extraction snapshot; keep the exact flag-order guard.
 const beforeMove = [
   {
     name: 'logs', flags: [
       '-f, --follow', '--level <lvl>', '--surface <s>', '--space <v>', '--category <c>', '--exact-category <c>',
       '--list-categories', '--list-events', '--axis <name>', '--explain', '--event <e>', '--grep <q>',
       '--rework-recurrence-disagreement <true|false>', '--since <t>', '--until <t>', '--before <cursor>',
-      '--session <id>', '--limit <n>', '--json', '--json-data', '--test', '--instance <name>', '--all',
+      '--session <id>', '--limit <n>', '--top-failures', '--threshold <n>', '--json', '--json-data', '--test', '--instance <name>', '--all',
       '--include-test', '-r', '--remote <name>',
     ],
     children: [

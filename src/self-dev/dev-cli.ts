@@ -45,10 +45,12 @@ import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChildLlmPreference, type ChildLlmPreferenceInput, type ResolvedChildLlmPreference } from '../self-implement/child-llm-preference.js';
 import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
 import { queryAbandonedDraftPrs, type AbandonedDraftPr } from '../cli/logs-abandoned-draft-prs.js';
+import { decideDraft, type DraftTriagePr } from './draft-triage-rules.js';
 import { resolveLogTargets } from '../cli/logs-cli.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import { collectObservedRunPhases, queryRunningRuns, type RunningRunAssessment, type RunningRunStatus, type RunningRunsResult } from '../self-implement/running-runs.js';
 import { queryFederatedUnfinishedRunLedgers, resolveFederatedRunLedgerDirectories } from '../self-implement/run-ledger.js';
+import { loadSelfDevRun, selfDevRunsDir } from './run-store.js';
 import { instanceStorePaths } from '../domains/fleet.js';
 import { dirname } from 'node:path';
 import { lookupEntrance, RECOMMENDED_ENTRANCE_ID_BY_SURFACE, recommendedEntranceNotice, type EntranceId } from './entrance-registry.js';
@@ -82,6 +84,7 @@ export interface DevCliOpts {
   allowGoalLintErrors?: boolean;
   ground?: boolean;
   target?: string;
+  yes?: boolean;
   plan?: boolean;
   implement?: boolean;
   elanous?: boolean;
@@ -179,6 +182,8 @@ export interface DevSelfRunSuperviseOptions {
   hasTerminalDraftTriage?: (runId: string, timeoutMs?: number) => boolean;
   queryTerminalDraftTriages?: (runIds: readonly string[], timeoutMs?: number) => Set<string>;
   startDraftTriageBudgetMs?: number;
+  queryDraftPrInventory?: (repository: string, timeoutMs: number) => DraftPrInventory | undefined;
+  queryTerminalRunStatuses?: (runIds: readonly string[], timeoutMs: number) => Readonly<Record<string, string>> | undefined;
   nowMs?: () => number;
   printDecision?: (line: string) => void;
 }
@@ -197,6 +202,50 @@ interface DraftTriage {
 }
 
 export type DraftPrViewState = { isDraft: boolean; state: string } | null;
+
+export interface DraftPrInventory {
+  readonly open: readonly (DraftTriagePr & { url: string; openedAtMs: number; runId?: string | null })[];
+  readonly merged: readonly DraftTriagePr[];
+  readonly complete: boolean;
+}
+
+/** A paginated GitHub snapshot. A partial page or failed response must never authorize a close. */
+export function queryDraftPrInventory(repository: string, timeoutMs: number): DraftPrInventory | undefined {
+  if (IN_TEST_PROCESS() || timeoutMs <= 0 || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) return undefined;
+  const deadline = Date.now() + timeoutMs;
+  const fetch = (state: 'open' | 'closed'): unknown[] | undefined => {
+    const rows: unknown[] = [];
+    for (let page = 1; ; page += 1) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return undefined;
+      const response = spawnSync('gh', ['api', `repos/${repository}/pulls?state=${state}&per_page=100&page=${page}`, '-H', 'Accept: application/vnd.github+json'], { encoding: 'utf8', timeout: remaining, maxBuffer: 16 * 1024 * 1024 });
+      if (response.status !== 0) return undefined;
+      const parsed: unknown = JSON.parse(response.stdout);
+      if (!Array.isArray(parsed)) return undefined;
+      rows.push(...parsed);
+      if (parsed.length < 100) return rows;
+    }
+  };
+  try {
+    const open = fetch('open');
+    const closed = fetch('closed');
+    if (!open || !closed) return undefined;
+    const parse = (row: unknown): (DraftTriagePr & { url: string; openedAtMs: number; runId?: string | null }) | undefined => {
+      if (!row || typeof row !== 'object') return undefined;
+      const pr = row as { number?: unknown; title?: unknown; html_url?: unknown; created_at?: unknown; head?: { ref?: unknown }; labels?: Array<{ name?: unknown }> };
+      const openedAtMs = Date.parse(String(pr.created_at));
+      const url = typeof pr.html_url === 'string' ? draftPrTargetFromUrl(pr.html_url) : null;
+      if (!Number.isInteger(pr.number) || typeof pr.title !== 'string' || !url || url.repository !== repository || url.number !== pr.number || typeof pr.head?.ref !== 'string' || !Number.isFinite(openedAtMs) || !Array.isArray(pr.labels) || pr.labels.some((label) => typeof label?.name !== 'string')) return undefined;
+      return { number: pr.number as number, title: pr.title, url: pr.html_url as string, branch: pr.head.ref, openedAtMs, labels: pr.labels.map((label) => label.name as string) };
+    };
+    if ([...open, ...closed].some((row) => !parse(row) || (typeof (row as { draft?: unknown }).draft !== 'boolean') || (typeof (row as { merged_at?: unknown }).merged_at !== 'string' && (row as { merged_at?: unknown }).merged_at !== null))) return undefined;
+    return {
+      open: open.filter((row) => (row as { draft?: boolean }).draft === true).map((row) => parse(row)!),
+      merged: closed.filter((row) => (row as { merged_at?: string | null }).merged_at != null).map((row) => parse(row)!),
+      complete: true,
+    };
+  } catch { return undefined; }
+}
 
 interface DraftPrTarget {
   repository: string;
@@ -254,8 +303,6 @@ function defaultViewDraftPr(prUrl: string, timeoutMs?: number): DraftPrViewState
     return null;
   }
 }
-
-const START_DRAFT_TRIAGE_HANDOFF = '하니스 시작 트리아지: 이 런은 종결 트리아지 없이 끝났다 · 이 draft 가 이 런의 유일한 사람 판단 대상';
 
 export function collectRunDraftPrUrls(observed: readonly Pick<SelfImplementResult, 'prUrl' | 'merged'>[]): string[] {
   const latest = new Map<string, { index: number; merged: boolean }>();
@@ -394,7 +441,7 @@ export function renderSupervisorDecisionLine(decision: Pick<SupervisorDecision, 
   return `[supervisor] ${verb}${reason} — ${decision.why}`;
 }
 
-export const START_DRAFT_TRIAGE_LEDGER_QUERY = { all: true, includeTest: true, since: '7d' } as const;
+export const START_DRAFT_TRIAGE_LEDGER_QUERY = { all: true, includeTest: true } as const;
 export const DEFAULT_START_DRAFT_TRIAGE_BUDGET_MS = 10_000;
 
 export type ProductionQueryResult<T> =
@@ -594,6 +641,26 @@ export function queryTerminalDraftTriageRunIds(runIds: Iterable<string>): string
   return [...queryTerminalDraftTriages(runIds)];
 }
 
+export function queryTerminalRunStatuses(runIds: readonly string[]): Record<string, string> {
+  const requested = new Set(runIds);
+  const statuses: Record<string, string> = Object.create(null) as Record<string, string>;
+  const { targets, error } = resolveLogTargets({ all: true, includeTest: true });
+  if (error) throw new Error(error);
+  for (const target of targets) {
+    const store = LogStore.openReadOnly(target.dbPath);
+    try {
+      for (const row of store.queryAll({ exactCategories: ['self-implement'], events: ['run-terminal'] })) {
+        const data = row.data ? JSON.parse(row.data) as { runId?: unknown; runStatus?: unknown } : null;
+        if (typeof data?.runId === 'string' && requested.has(data.runId)) {
+          // The terminal event itself proves the run ended, including older records without runStatus.
+          statuses[data.runId] = typeof data.runStatus === 'string' ? data.runStatus : 'completed';
+        }
+      }
+    } finally { store.close(); }
+  }
+  return statuses;
+}
+
 /** Rotates candidates deterministically so repeated launches share no fixed first candidate. */
 export function rotateDraftTriageRuns<T>(candidates: readonly T[], runId: string | undefined): T[] {
   if (!runId || candidates.length < 2) return [...candidates];
@@ -606,29 +673,18 @@ export function rotateDraftTriageRuns<T>(candidates: readonly T[], runId: string
   return [...candidates.slice(offset), ...candidates.slice(0, offset)];
 }
 
-function queryTerminalDraftTriagesWithinBudget(runIds: readonly string[], timeoutMs: number): Set<string> | undefined {
-  if (IN_TEST_PROCESS()) return queryTerminalDraftTriages(runIds);
-  const result = unwrapProductionQuery(runProductionQuery<string[]>(import.meta.url, 'queryTerminalDraftTriageRunIds', [runIds], timeoutMs));
-  return result === undefined ? undefined : new Set(result);
-}
-
-function defaultHasTerminalDraftTriage(runId: string, timeoutMs: number): boolean | undefined {
-  if (IN_TEST_PROCESS()) return queryTerminalDraftTriage(runId);
-  return unwrapProductionQuery(runProductionQuery<boolean>(import.meta.url, 'queryTerminalDraftTriage', [runId], timeoutMs));
-}
-
 export function startDraftTriage(
   currentRunId: string | undefined,
   supervise?: DevSelfRunSuperviseOptions,
 ): void {
-  const skipped: Record<'running' | 'probableRunning' | 'unknown' | 'alreadyTriaged' | 'noRunId', number> = {
-    running: 0, probableRunning: 0, unknown: 0, alreadyTriaged: 0, noRunId: 0,
-  };
+  const decisions = { live: 0, superseded: 0, staleEndedRun: 0, recent: 0, humanApproval: 0 };
+  const statusesObserved: Record<string, number> = {};
   const considered: string[] = [];
   const closed: number[] = [];
   const closeFailed: number[] = [];
   const kept: number[] = [];
   const errors: string[] = [];
+  const unobservedDrafts: number[] = [];
   const nowMs = supervise?.nowMs ?? Date.now;
   const startedAtMs = nowMs();
   const budgetMs = supervise?.startDraftTriageBudgetMs ?? DEFAULT_START_DRAFT_TRIAGE_BUDGET_MS;
@@ -683,13 +739,61 @@ export function startDraftTriage(
     }
     if (draftResult.kind === 'error') throw new Error(draftResult.error);
     const drafts = draftResult.value;
+    const repositories = new Set(drafts.flatMap((draft) => draft.url ? [draftPrTargetFromUrl(draft.url)?.repository].filter((repo): repo is string => !!repo) : []));
+    if (!IN_TEST_PROCESS() && remainingMs() > 0) {
+      const repo = spawnSync('gh', ['repo', 'view', '--json', 'nameWithOwner', '--jq', '.nameWithOwner'], { encoding: 'utf8', timeout: remainingMs() });
+      if (repo.status === 0 && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo.stdout.trim())) repositories.add(repo.stdout.trim());
+      else if (repositories.size === 0) { budgetUnprocessedUnknown = true; unobservedRuns = null; return; }
+    }
+    if (repositories.size === 0 && supervise?.queryDraftPrInventory) repositories.add('{owner}/{repo}');
+    const inventories: Array<{ repository: string; snapshot: DraftPrInventory }> = [];
+    if (!IN_TEST_PROCESS() && repositories.size === 0) {
+      budgetUnprocessedUnknown = true;
+      unobservedRuns = null;
+      return;
+    }
+    for (const repository of repositories) {
+      if (budgetExhausted()) {
+        const pendingRuns = new Set(drafts.flatMap((draft) => draft.runId ? [draft.runId] : []));
+        noteUnprocessed(pendingRuns);
+        unobservedRuns = pendingRuns.size;
+        return;
+      }
+      const snapshot = measureStage('draftList', () => (supervise?.queryDraftPrInventory ?? queryDraftPrInventory)(repository, remainingMs()));
+      if (snapshot?.complete && snapshot.open.every((draft) => draftPrTargetFromUrl(draft.url)?.repository === repository) && snapshot.merged.every((pr) => Number.isInteger(pr.number))) inventories.push({ repository, snapshot });
+      else if (!IN_TEST_PROCESS()) {
+        const pendingRuns = new Set(drafts.flatMap((draft) => draft.runId ? [draft.runId] : []));
+        noteUnprocessed(pendingRuns);
+        unobservedRuns = pendingRuns.size || null;
+        budgetUnprocessedUnknown = pendingRuns.size === 0;
+        return;
+      }
+    }
+    const inventoryDrafts = inventories.flatMap(({ snapshot }) => snapshot.open);
+    const ledgerRunByUrl = new Map(drafts.filter((draft) => draft.url && draft.runId).map((draft) => [draft.url!, draft.runId!]));
+    const inventoryByUrl = new Map(inventoryDrafts.map((draft) => [draft.url, draft]));
     const byRun = new Map<string, AbandonedDraftPr[]>();
-    for (const draft of drafts) {
-      if (!draft.runId) { skipped.noRunId += 1; continue; }
-      if (draft.runId === currentRunId) continue;
-      const group = byRun.get(draft.runId) ?? [];
-      if (!group.some((candidate) => candidate.number === draft.number)) group.push(draft);
-      byRun.set(draft.runId, group);
+    for (const draft of [...drafts, ...inventoryDrafts]) {
+      const runId = draft.runId ?? (draft.url ? ledgerRunByUrl.get(draft.url) : undefined);
+      if (!runId || runId === currentRunId || (inventoryByUrl.has(draft.url ?? '') && !inventoryByUrl.get(draft.url ?? '')?.branch.startsWith('self-impl/'))) continue;
+      const group = byRun.get(runId) ?? [];
+      if (!group.some((candidate) => candidate.url === draft.url)) group.push({ ...draft, ...inventoryByUrl.get(draft.url ?? '') } as AbandonedDraftPr);
+      byRun.set(runId, group);
+    }
+    for (const draft of inventoryDrafts) {
+      if (!draft.branch.startsWith('self-impl/') || draft.runId || ledgerRunByUrl.has(draft.url)) continue;
+      if (budgetExhausted()) { budgetUnprocessedUnknown = true; unobservedRuns = null; return; }
+      const candidate = /(?:^|[-/])(run-[0-9a-f-]{16,})(?:-|$)/i.exec(draft.branch)?.[1];
+      const goalRun = candidate ? loadSelfDevRun(candidate, selfDevRunsDir()) : null;
+      if (!goalRun || !goalRun.supervisorStopReason || !goalRun.results.some((result) => result.prNumber === draft.number || result.prUrl === draft.url)) {
+        decisions.recent += 1;
+        unobservedDrafts.push(draft.number);
+        statusesObserved.unobserved = (statusesObserved.unobserved ?? 0) + 1;
+        continue;
+      }
+      const group = byRun.get(candidate!) ?? [];
+      if (!group.some((entry) => entry.url === draft.url)) group.push({ ...draft, runId: candidate } as AbandonedDraftPr);
+      byRun.set(candidate!, group);
     }
     const byRunEntries = rotateDraftTriageRuns([...byRun.entries()], currentRunId);
     if (byRunEntries.length === 0) return;
@@ -708,64 +812,56 @@ export function startDraftTriage(
     }
     // ⭐ seam 이 «범위 메타데이터 없는» 예전 모양을 줘도 받는다 — 그때는 「모른다」(null)이지 0이 아니다.
     const runningRuns = 'result' in runningRunsQuery ? runningRunsQuery.result : runningRunsQuery;
+    if (runningRuns.pty?.unreadable?.length || runningRuns.ledger?.unreadableLedgerCount || runningRuns.ledger?.indeterminateLedgerDirectoryCount) {
+      noteUnprocessed(byRun.keys());
+      unobservedRuns = byRun.size;
+      return;
+    }
     runningRunsUnqueriedUniverseCount = 'unqueriedUniverseCount' in runningRunsQuery
       ? runningRunsQuery.unqueriedUniverseCount
       : null;
     runningRunsQueried = true;
     const statuses = new Map(runningRuns.entries.map(({ runId, status }) => [runId, status]));
-    const protectedCandidates = new Map<string, AbandonedDraftPr[]>();
-    for (const [runId, runDrafts] of byRunEntries) {
-      const status: RunningRunStatus | undefined = statuses.get(runId);
-      if (status === 'running') { skipped.running += 1; continue; }
-      if (status === 'probable-running') { skipped.probableRunning += 1; continue; }
-      if (status !== 'ended-unclosed') { skipped.unknown += 1; continue; }
-      protectedCandidates.set(runId, runDrafts);
+    const liveBranches = new Set(byRunEntries.flatMap(([id, drafts]) => {
+      const status = statuses.get(id);
+      return status === 'running' || status === 'probable-running' ? drafts.map((draft) => draft.branch).filter((branch) => typeof branch === 'string' && branch.length > 0) : [];
+    }));
+    for (const [id, drafts] of byRunEntries) {
+      const status = statuses.get(id);
+      if (status === 'running' || status === 'probable-running') {
+        decisions.live += drafts.length;
+        statusesObserved[status] = (statusesObserved[status] ?? 0) + drafts.length;
+      }
+    }
+    const protectedCandidates = new Map(byRunEntries.filter(([id]) => statuses.get(id) !== 'running' && statuses.get(id) !== 'probable-running'));
+    let terminalStatuses: Readonly<Record<string, string>> = {};
+    if (protectedCandidates.size > 0 && remainingMs() > 0) {
+      const ids = [...protectedCandidates.keys()];
+      // The old terminal-triage seam remains observable, but its result no longer exempts
+      // already-triaged drafts from later supersession and staleness checks.
+      if (supervise?.queryTerminalDraftTriages || supervise?.hasTerminalDraftTriage) {
+        measureStage('terminalTriage', () => supervise.queryTerminalDraftTriages
+          ? supervise.queryTerminalDraftTriages(ids, remainingMs())
+          : ids.forEach((id) => supervise.hasTerminalDraftTriage!(id, remainingMs())));
+      }
+      if (budgetExhausted()) { noteUnprocessed(protectedCandidates.keys()); return; }
+      const lookup = supervise?.queryTerminalRunStatuses ?? ((runIds: readonly string[], timeout: number) => IN_TEST_PROCESS()
+        ? {} : unwrapProductionQuery(runProductionQuery<Record<string, string>>(import.meta.url, 'queryTerminalRunStatuses', [runIds], timeout)));
+      const resolved = measureStage('terminalTriage', () => lookup(ids, remainingMs()));
+      if (resolved === undefined && !IN_TEST_PROCESS()) { noteUnprocessed(protectedCandidates.keys()); return; }
+      terminalStatuses = resolved ?? {};
     }
     if (protectedCandidates.size === 0) return;
     if (budgetExhausted()) {
       noteUnprocessed(protectedCandidates.keys());
       return;
     }
-    const terminalTriageByRun = new Map<string, boolean>();
-    const hasTerminalTriage = (runId: string): boolean | undefined => {
-      const cached = terminalTriageByRun.get(runId);
-      if (cached !== undefined) return cached;
-      const terminalTriage = measureStage('terminalTriage', () => invokeWithinBudget((timeoutMs) => supervise?.hasTerminalDraftTriage?.(runId, timeoutMs) ?? defaultHasTerminalDraftTriage(runId, timeoutMs)));
-      if (terminalTriage !== undefined) terminalTriageByRun.set(runId, terminalTriage);
-      return terminalTriage;
-    };
-    const useBatchTerminalTriage = supervise?.queryTerminalDraftTriages !== undefined || supervise?.hasTerminalDraftTriage === undefined;
-    if (useBatchTerminalTriage) {
-      const runIds = [...protectedCandidates.keys()];
-      const triagedRunIds = measureStage('terminalTriage', () => invokeWithinBudget((timeoutMs) => supervise?.queryTerminalDraftTriages?.(runIds, timeoutMs)
-        ?? queryTerminalDraftTriagesWithinBudget(runIds, timeoutMs)));
-      if (triagedRunIds === undefined) {
-        noteUnprocessed(runIds);
-        return;
-      }
-      for (const runId of runIds) terminalTriageByRun.set(runId, triagedRunIds.has(runId));
-    }
-    const candidates = new Map<string, AbandonedDraftPr[]>();
-    const protectedEntries = [...protectedCandidates.entries()];
-    for (const [index, [runId, runDrafts]] of protectedEntries.entries()) {
-      if (budgetExhausted()) {
-        noteUnprocessed(protectedEntries.slice(index).map(([id]) => id));
-        break;
-      }
-      const terminalTriage = hasTerminalTriage(runId);
-      if (terminalTriage === undefined) { noteUnprocessed(protectedEntries.slice(index).map(([id]) => id)); break; }
-      if (terminalTriage) { skipped.alreadyTriaged += 1; continue; }
-      candidates.set(runId, runDrafts);
-    }
-    const candidateEntries = [...candidates.entries()];
+    const candidateEntries = [...protectedCandidates.entries()];
     for (const [index, [runId, runDrafts]] of candidateEntries.entries()) {
       if (budgetExhausted()) {
         noteUnprocessed(candidateEntries.slice(index).map(([id]) => id));
         break;
       }
-      const terminalTriage = hasTerminalTriage(runId);
-      if (terminalTriage === undefined) { noteUnprocessed(candidateEntries.slice(index).map(([id]) => id)); break; }
-      if (terminalTriage) { skipped.alreadyTriaged += 1; continue; }
       considered.push(runId);
       const view = supervise?.viewDraftPr ?? defaultViewDraftPr;
       const openDrafts: AbandonedDraftPr[] = [];
@@ -780,37 +876,28 @@ export function startDraftTriage(
         }
       }
       if (budgetExhausted()) { noteUnprocessed(candidateEntries.slice(index).map(([id]) => id)); break; }
-      const retained = openDrafts.at(-1);
-      if (!retained?.url) continue;
-      kept.push(retained.number);
-      const closeDraft = supervise?.closeDraftPr ?? defaultCloseDraftPr;
-      let closedForRun = 0;
-      for (const draft of openDrafts.slice(0, -1)) {
+      const status = statuses.get(runId);
+      const resolvedStatus = (status === undefined || status === 'unknown') ? terminalStatuses[runId] ?? (runId.startsWith('run-') && runDrafts.every((draft) => draft.runId === runId) && loadSelfDevRun(runId, selfDevRunsDir())?.supervisorStopReason ? 'stopped' : status) : status;
+      statusesObserved[resolvedStatus ?? 'unobserved'] = (statusesObserved[resolvedStatus ?? 'unobserved'] ?? 0) + runDrafts.length;
+      for (const draft of openDrafts) {
         if (budgetExhausted()) { noteUnprocessed([runId]); break; }
+        const repository = draftPrTargetFromUrl(draft.url!)?.repository;
+        const inventory = inventories.find((entry) => entry.repository === repository)?.snapshot;
+        const enriched = { ...draft, branch: draft.branch ?? '', ...inventoryByUrl.get(draft.url!) };
+        if ((!inventory || !inventoryByUrl.has(draft.url!)) && !IN_TEST_PROCESS()) { unobservedDrafts.push(draft.number); continue; }
+        const decision = decideDraft({ draft: enriched, runStatus: resolvedStatus, mergedTwins: inventory?.merged ?? [], ageHours: (nowMs() - draft.openedAtMs) / 3_600_000, liveBranches });
+        if (decision.reason.startsWith('superseded-by')) decisions.superseded += 1;
+        else if (decision.reason === 'stale-ended-run') decisions.staleEndedRun += 1;
+        else if (decision.reason.startsWith('label:')) decisions.humanApproval += 1;   // approval-waiting or human «keep»
+        else if (decision.reason === 'live') decisions.live += 1;
+        else decisions.recent += 1;
+        if (decision.action === 'keep') { kept.push(draft.number); continue; }
         try {
-          const didClose = invokeWithinBudget((timeoutMs) => closeDraft(draft.url!, `하니스 시작 트리아지: 종결 기록 없이 끝난 런 ${runId} — 최신 산출 #${retained.number} 로 대체됨`, timeoutMs));
+          const didClose = invokeWithinBudget((timeoutMs) => (supervise?.closeDraftPr ?? defaultCloseDraftPr)(draft.url!, `하니스 시작 트리아지: ${decision.reason}`, timeoutMs));
           if (didClose === undefined) { noteUnprocessed([runId]); break; }
-          if (didClose) {
-            closed.push(draft.number);
-            closedForRun += 1;
-          } else {
-            closeFailed.push(draft.number);
-            noteError(`close draft #${draft.number} failed`);
-          }
-        } catch (caught) {
-          closeFailed.push(draft.number);
-          noteError(caught);
-        }
-      }
-      if (budgetExhausted()) { noteUnprocessed(candidateEntries.slice(index).map(([id]) => id)); break; }
-      if (closedForRun > 0) {
-        try {
-          const didComment = invokeWithinBudget((timeoutMs) => (supervise?.commentDraftPr ?? defaultCommentDraftPr)(retained.url!, START_DRAFT_TRIAGE_HANDOFF, timeoutMs));
-          if (didComment === undefined) { noteUnprocessed(candidateEntries.slice(index).map(([id]) => id)); break; }
-          if (!didComment) noteError(`comment retained draft #${retained.number} failed`);
-        } catch (caught) {
-          noteError(caught);
-        }
+          if (didClose) closed.push(draft.number);
+          else { closeFailed.push(draft.number); noteError(`close draft #${draft.number} failed`); }
+        } catch (caught) { closeFailed.push(draft.number); noteError(caught); }
       }
     }
   } catch (caught) {
@@ -822,7 +909,7 @@ export function startDraftTriage(
         + stageDurationsMs.terminalTriage
         + stageDurationsMs.runningRuns
         + stageDurationsMs.draftView;
-      debug.log('self-implement', 'draft-triage-start', { runId: currentRunId ?? null, considered, closed, kept, closeFailed, skipped, budgetUnprocessed: budgetUnprocessedUnknown ? null : budgetUnprocessedRunIds.size, unobservedRuns, budgetExhausted: budgetUnprocessedUnknown || budgetExhausted(), elapsedMs, runningRunsQueried, runningRunsQueriedRunIds, runningRunsUnqueriedUniverseCount, draftListDurationMs: stageDurationsMs.draftList, terminalTriageDurationMs: stageDurationsMs.terminalTriage, runningRunsDurationMs: stageDurationsMs.runningRuns, draftViewDurationMs: stageDurationsMs.draftView, unaccountedDurationMs: elapsedMs - stageDurationMs, ...(errors.length === 0 ? {} : { error: errors.join('; ') }) });
+      debug.log('self-implement', 'draft-triage-start', { runId: currentRunId ?? null, considered, closed, kept, closeFailed, decisions, statusesObserved, unobservedDrafts, budgetUnprocessed: budgetUnprocessedUnknown ? null : budgetUnprocessedRunIds.size, unobservedRuns, budgetExhausted: budgetUnprocessedUnknown || budgetExhausted(), elapsedMs, runningRunsQueried, runningRunsQueriedRunIds, runningRunsUnqueriedUniverseCount, draftListDurationMs: stageDurationsMs.draftList, terminalTriageDurationMs: stageDurationsMs.terminalTriage, runningRunsDurationMs: stageDurationsMs.runningRuns, draftViewDurationMs: stageDurationsMs.draftView, unaccountedDurationMs: elapsedMs - stageDurationMs, ...(errors.length === 0 ? {} : { error: errors.join('; ') }) });
     } catch { /* fail-open */ }
   }
 }
@@ -1116,6 +1203,7 @@ export async function executeDevSelfRun(
       };
       debug.log('self-implement', 'run-terminal', {
         ...terminalData,
+        runId: supervise?.runId ?? result?.runId ?? null,
         supervised: supervise !== undefined,
         ...(supervisorStopReason === undefined ? {} : { supervisorStopReason }),
         ...(draftTriage === undefined ? {} : { draftTriage }),
@@ -1575,7 +1663,7 @@ const DEV_PATH_ALLOWED: Record<DevPath, readonly string[]> = {
   'interactive': ['implement', 'roleLlm'],
   'elanous-tui': ['hold', 'readyTimeoutMs', 'goal', 'maxSteps', 'pollMs', 'model', 'observeOnly', 'isolatedRoot', 'cwd', 'worktree', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
   'shell-drive': ['goal', 'maxSteps', 'pollMs', 'model', 'cwd', 'worktree', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
-  'self-mission': ['openPr', 'autoMerge', 'mergeByHost', 'autoReview', 'draft', 'maxWait', 'activityGrace', 'supervise', 'superviseRounds', 'childLlmProvider', 'childLlmModel', 'childLlmEffort', 'correlation', 'graph', 'ground', 'target', 'context', 'contextText', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
+  'self-mission': ['openPr', 'autoMerge', 'mergeByHost', 'autoReview', 'draft', 'maxWait', 'activityGrace', 'supervise', 'superviseRounds', 'childLlmProvider', 'childLlmModel', 'childLlmEffort', 'correlation', 'graph', 'ground', 'target', 'yes', 'context', 'contextText', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
   'agent-mission-pty': ['branch', 'evidence', 'docDir', 'docGlob', 'testPath', 'maxRounds', 'commit', 'deliverable', 'screens', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
   'acp': ['context', 'contextText', 'roleLlm', 'allowNoEvidence', 'allowSupersededGoal', 'allowGoalLintErrors'],
 };
@@ -1605,7 +1693,8 @@ export function explicitDevOptionNames(command: {
     if (seen.has(name)) continue;
     if (command.getOptionValueSource(name) !== 'cli') continue;
     if (command.getOptionValue !== undefined
-      && !isProgrammaticOptionProvided(name, command.getOptionValue(name))) continue;
+      && !isProgrammaticOptionProvided(name, command.getOptionValue(name))
+      && !(name === 'autoMerge' && command.getOptionValue(name) === false)) continue;
     seen.add(name);
     names.push(name);
   }
@@ -1792,6 +1881,7 @@ export function buildDevCliSpec(
     ...(opts.allowGoalLintErrors === true ? { allowGoalLintErrors: true } : {}),
     ...(opts.branch ? { branch: opts.branch } : {}),
     ...(opts.target !== undefined ? { target: opts.target } : {}),
+    ...(opts.yes === true ? { assumeYes: true } : {}),
     ...((path === 'self-mission' || path === 'plan-staged' || path === 'agent-mission-pty')
       ? { base: opts.base ?? DEFAULT_BRANCH_WORKTREE_BASE }
       : (opts.base ? { base: opts.base } : {})),

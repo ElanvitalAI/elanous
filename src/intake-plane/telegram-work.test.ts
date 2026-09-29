@@ -16,9 +16,38 @@ describe('telegram /work (X6)', () => {
       route: async () => { throw new Error('판정을 부르면 안 된다'); },
       submit: async (input) => { seen.push(input); return { ok: true, track: 'tasks', taskId: 'task:abc', deduplicated: false }; },
     });
-    expect(seen).toEqual([{ text: '보고서 초안', track: 'tasks', origin: { kind: 'external', ledgerSource: 'telegram-bot', provider: 'telegram', ref: '42:7' } }]);
+    expect(seen).toEqual([{ text: '보고서 초안', track: 'tasks', origin: { kind: 'external', ledgerSource: 'telegram-bot', provider: 'telegram', ref: '42:7', reportTo: { channel: 'telegram', chatId: 42 } } }]);
     expect(reply).toContain('task:abc');
     expect(reply).toContain('승인 대기');
+  });
+
+  test('graph 는 발신 대화로 reportTo 를 askHarness 까지 전한다', async () => {
+    const seen: unknown[] = [];
+    const reply = await handleTelegramWork(['graph', '만들어줘'], MSG, {
+      askHarness: async (text, reportTo) => { seen.push({ text, reportTo }); return { acceptanceId: 'h-1' }; },
+      log: () => {},
+    });
+    expect(reply).toBe('🛠 하니스 접수 h-1');
+    expect(seen).toEqual([{ text: '만들어줘', reportTo: { channel: 'telegram', chatId: 42 } }]);
+  });
+
+  test('자동 판정 갈래에서도 원점은 그대로 전달된다', async () => {
+    const seen: unknown[] = [];
+    await handleTelegramWork(['구현해줘'], MSG, {
+      route: async (input) => {
+        seen.push(input.origin);
+        return { decision: { track: 'graph' } as never, submitted: { ok: true, track: 'graph', acceptanceId: 'h-3' } };
+      },
+    });
+    expect(seen).toEqual([{ kind: 'external', ledgerSource: 'telegram-bot', provider: 'telegram', ref: '42:7', reportTo: { channel: 'telegram', chatId: 42 } }]);
+  });
+
+  test('봇과 스레드가 주어지면 원점에만 붙이고 ref 는 유지한다', async () => {
+    const seen: unknown[] = [];
+    await handleTelegramWork(['graph', 'x'], { ...MSG, botId: 'bot-1', threadId: 3 }, {
+      submit: async (input) => { seen.push(input.origin); return { ok: true, track: 'graph', acceptanceId: 'h-2' }; },
+    });
+    expect(seen).toEqual([{ kind: 'external', ledgerSource: 'telegram-bot', provider: 'telegram', ref: '42:7', reportTo: { channel: 'telegram', chatId: 42, botId: 'bot-1', threadId: 3 } }]);
   });
 
   test('판정이 못 고르면 실행 0 · 갈래 셋을 묻는다', async () => {

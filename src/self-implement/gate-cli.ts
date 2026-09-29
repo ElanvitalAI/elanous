@@ -4,6 +4,7 @@ import { join } from 'node:path/posix';
 import { prepareDeterministicChildEnvironment } from '../../scripts/lib/deterministic-env.js';
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
 import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
+import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
 import { runAndroidUnitTestGate } from '../../scripts/ci-android-unit-tests.js';
 import { runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
@@ -76,6 +77,8 @@ interface SelfGateCliDeps {
   runMockModuleRestoreGate?: (out: GateOutput) => number;
   /** 모델 이름 하드코딩 래칫(🅕 #20521) — `pr land` 만 물고 하니스 무인 병합은 안 물면 위반이 main 에 들어가 남의 착지를 막는다(🅣 2026-09-25). */
   runModelHardcodeGate?: (out: GateOutput) => number;
+  /** 데몬 포트 리터럴 래칫 — 공용 `runDaemonPortGate` 를 부른다(새 스캐너 금지). */
+  runDaemonPortGate?: (out: GateOutput) => number;
   /** 안드로이드 단위 시험 게이트 심(시험 주입용). */
   runAndroidGate?: (out: GateOutput) => number;
   /** iOS 순수-로직 시험 게이트 심(시험 주입용). */
@@ -99,6 +102,26 @@ interface SelfGateCliResult {
   unverified: readonly string[];
   documentPaths: readonly string[];
   documentsWithoutDerivedTests: readonly string[];
+}
+
+/** 시험 단계와 독립인 정책 관문 넷. skipTestStep 이든 시험 통과든 같은 함수를 부른다. */
+function runPolicyGates(
+  files: readonly string[],
+  cwd: string,
+  lines: string[],
+  deps: SelfGateCliDeps,
+): boolean {
+  const shouldRunAdditionalGates = deps.runIsolationGate !== undefined
+    || deps.runMockModuleRestoreGate !== undefined
+    || deps.runModelHardcodeGate !== undefined
+    || deps.runDaemonPortGate !== undefined
+    || existsSync(join(cwd, 'scripts'));
+  if (!shouldRunAdditionalGates) return true;
+  const isolationPassed = runAdditionalGate('isolation-gate', deps.runIsolationGate ?? runIsolationHardcodeGate, files, cwd, lines);
+  const mockModuleRestorePassed = runAdditionalGate('mock-module-restore-gate', deps.runMockModuleRestoreGate ?? runMockModuleRestoreGate, files, cwd, lines);
+  const modelHardcodePassed = runAdditionalGate('model-hardcode-gate', deps.runModelHardcodeGate ?? runModelHardcodeGate, files, cwd, lines);
+  const daemonPortPassed = runAdditionalGate('daemon-port-gate', deps.runDaemonPortGate ?? ((out) => runDaemonPortGate({ log: out.log, error: out.error, cwd: out.cwd, args: [] })), files, cwd, lines);
+  return isolationPassed && mockModuleRestorePassed && modelHardcodePassed && daemonPortPassed;
 }
 
 function runAdditionalGate(
@@ -598,20 +621,18 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   const iosPassed = runAdditionalGate('ios-gate', deps.runIosGate ?? runIosUnitTestGate, selection.files, cwd, lines);
 
   if (scope.skipTestStep) {
+    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: androidPassed && iosPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: androidPassed && iosPassed && policyPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
   }
 
   const test = (deps.runTests ?? ((dir, files) => (deps.runCommand ?? defaultRunCommand)('bun', ['test', ...files], dir)))(cwd, testFiles);
   const worktreeLog = formatProcessOutput(test);
   if (test.status === 0 && !test.error) {
     lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
-    const shouldRunAdditionalGates = deps.runIsolationGate !== undefined || deps.runMockModuleRestoreGate !== undefined || existsSync(join(cwd, 'scripts'));
-    const isolationPassed = !shouldRunAdditionalGates || runAdditionalGate('isolation-gate', deps.runIsolationGate ?? runIsolationHardcodeGate, selection.files, cwd, lines);
-    const mockModuleRestorePassed = !shouldRunAdditionalGates || runAdditionalGate('mock-module-restore-gate', deps.runMockModuleRestoreGate ?? runMockModuleRestoreGate, selection.files, cwd, lines);
-    const modelHardcodePassed = !shouldRunAdditionalGates || runAdditionalGate('model-hardcode-gate', deps.runModelHardcodeGate ?? runModelHardcodeGate, selection.files, cwd, lines);
+    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: isolationPassed && mockModuleRestorePassed && modelHardcodePassed && androidPassed && iosPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: policyPassed && androidPassed && iosPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
   }
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
@@ -631,6 +652,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     lookupFailed: importerLookupFailed,
   });
   lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
-  const exitCode = !androidPassed || !iosPassed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
+  const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+  const exitCode = !androidPassed || !iosPassed || !policyPassed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
   return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
 }

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { chmod, exists, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { openSchedulesDb } from '../src/domains/schedule-registry.js';
 
 const REPOSITORY_ROOT = join(import.meta.dir, '..');
 const WRAPPER = join(REPOSITORY_ROOT, 'scripts', 'cron-run.ts');
@@ -9,7 +10,7 @@ const CRON_RUN = new URL('./cron-run.ts', import.meta.url).pathname;
 
 async function runCron(
   observabilityBody: string | null,
-  options: { targetBody?: string; preloadBody?: string; registryMock?: string; shell?: boolean; targetArgs?: string[]; env?: Record<string, string> } = {},
+  options: { targetBody?: string; preloadBody?: string; registryMock?: string; shell?: boolean; scheduleId?: string; targetArgs?: string[]; env?: Record<string, string> } = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string; durationMs: number; home: string }> {
   const directory = await mkdtemp(join(tmpdir(), 'cron-run-test-'));
   const home = await mkdtemp(join(tmpdir(), 'cron-run-home-'));
@@ -22,7 +23,7 @@ async function runCron(
   try {
     const startedAt = Date.now();
     const child = Bun.spawn({
-      cmd: [process.execPath, ...(options.preloadBody || options.registryMock ? ['--preload', preload] : []), WRAPPER, ...(options.shell ? ['--shell', '/bin/sh'] : []), target, ...(options.targetArgs ?? [])],
+      cmd: [process.execPath, ...(options.preloadBody || options.registryMock ? ['--preload', preload] : []), WRAPPER, ...(options.scheduleId ? ['--schedule-id', options.scheduleId] : []), ...(options.shell ? ['--shell', '/bin/sh'] : []), target, ...(options.targetArgs ?? [])],
       cwd: REPOSITORY_ROOT,
       env: {
         ...process.env,
@@ -68,7 +69,7 @@ describe('cron-run observation diagnostics', () => {
         stderr: 'pipe',
       });
       expect(await child.exited).toBe(0);
-      expect(await readFile(crontabState, 'utf8')).toContain('bun scripts/cron-run.ts scripts/example.ts');
+      expect(await readFile(crontabState, 'utf8')).toMatch(/bun scripts\/cron-run\.ts --schedule-id [0-9a-f]+ scripts\/example\.ts/);
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -126,6 +127,51 @@ describe('cron-run observation diagnostics', () => {
     expect(result.exitCode).toBe(7);
     expect(result.stderr.split('\n').filter((line) => line.startsWith('cron-run observation registry record skipped: schedule row not found for '))).toHaveLength(1);
     expect(result.stderr).not.toContain('cron-run observation prerequisite failed:');
+  });
+
+  test('records only the explicit schedule id when another enabled row has the same name', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'cron-run-schedule-id-'));
+    const crontab = join(directory, 'crontab');
+    await writeFile(crontab, '#!/bin/sh\nexit 1\n');
+    await chmod(crontab, 0o755);
+    const db = openSchedulesDb(join(directory, 'schedules.db'));
+    try {
+      for (const [id, lastStatus] of [['first-id', 'ok'], ['selected-id', 'error']] as const) {
+        db.run(`INSERT INTO schedule_registry (id, name, source, category, enabled, last_status, last_exit)
+          VALUES (?, 'target', 'crontab', 'maintenance', 1, ?, 99)`, [id, lastStatus]);
+      }
+      const result = await runCron(`export { recordScheduledExecution } from ${JSON.stringify(join(REPOSITORY_ROOT, 'src', 'domains', 'schedule-observability.ts'))};\n`, {
+        scheduleId: 'selected-id',
+        shell: true,
+        targetBody: 'printf "arg=%s\\n" "$1"\nexit 7\n',
+        targetArgs: ['--payload'],
+        env: { ELANOUS_STATE_DIR: directory, ELANOUS_CONFIG_DIR: directory, PATH: `${directory}:${process.env.PATH}` },
+      });
+      expect(result.exitCode).toBe(7);
+      expect(result.stdout).toBe('arg=--payload\n');
+      expect(result.stderr).not.toContain('registry selection ambiguous');
+      const rows = db.query(`SELECT id, last_status, last_exit, last_run, last_via FROM schedule_registry ORDER BY id`).all() as Array<{
+        id: string; last_status: string | null; last_exit: number | null; last_run: string | null; last_via: string | null;
+      }>;
+      expect(rows[0]).toEqual({ id: 'first-id', last_status: 'ok', last_exit: 99, last_run: null, last_via: null });
+      expect(rows[1]).toMatchObject({ id: 'selected-id', last_status: 'error', last_exit: 7, last_via: 'crontab' });
+      expect(rows[1]?.last_run).not.toBeNull();
+    } finally {
+      db.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test('does not fall back to name matching when the explicit id is absent', async () => {
+    const registry = join(REPOSITORY_ROOT, 'src', 'domains', 'schedule-registry.js');
+    const result = await runCron("export function recordScheduledExecution(_name: string, _record: unknown, options: { id?: string }): void { process.stderr.write(`selected=${options.id ?? 'none'}\\n`); }\n", {
+      scheduleId: 'missing-id',
+      registryMock: `import { mock } from 'bun:test';\nmock.module(${JSON.stringify(registry)}, () => ({ scriptName: () => 'target', openSchedulesDb: () => ({ close() {}, query: () => ({ get: () => undefined }) }), inventoryCrontab() {}, listSchedules: () => { throw new Error('name matching must not run'); } }));\n`,
+    });
+    expect(result.exitCode).toBe(7);
+    expect(result.stderr).toContain('selected=none');
+    expect(result.stderr).toContain('cron-run observation registry record skipped:');
+    expect(result.stderr).not.toContain('name matching must not run');
   });
 
   test('records the first enabled duplicate instead of an earlier disabled row', async () => {
@@ -186,6 +232,15 @@ describe('cron-run observation wrapper', () => {
     // 레지스트리가 `<해석기> <경로>.sh` 줄에 붙이는 이름과 같아야 행을 찾는다.
     expect(name).toBe('target');
     expect(record).toMatchObject({ status: 'error', exit: 23, via: 'crontab', error: 'first\nsecond' });
+  });
+
+  test('rejects --schedule-id without an id before starting a child', async () => {
+    const proc = Bun.spawn([process.execPath, CRON_RUN, '--schedule-id', '--shell', '/bin/sh'], {
+      stdout: 'pipe', stderr: 'pipe', env: { ...process.env },
+    });
+    const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+    expect(exitCode).toBe(2);
+    expect(stderr).toContain('cron-run: --schedule-id 인자 필수');
   });
 
   test.each(['missing interpreter', 'missing target'])('rejects an incomplete --shell invocation: %s', async (caseName) => {

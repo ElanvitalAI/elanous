@@ -38,6 +38,7 @@ import { join } from 'node:path';
 // behind `import.meta.main` / `runDeterministicTests()`, but the filter stays
 // in the helper so an untested credential check cannot rot silently.
 import { isCredentialKey } from './lib/deterministic-env.js';
+import { envLiteral } from '../src/platform/env-literal.js';
 
 export const TEMP_ROOT_PREFIX = 'elanous-deterministic-test-';
 export const CHILD_EXIT_GRACE_MS = 2_000;
@@ -274,7 +275,7 @@ export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: s
   // while guaranteeing nothing — a later test could branch on it believing it
   // means something. The tier work in PLAN-test-suite-diet introduces the
   // signal together with the code that honours it.
-  return env;
+  return envLiteral(env);
 }
 
 const defaultSpawn: SpawnDirectChild = (opts) => Bun.spawn({

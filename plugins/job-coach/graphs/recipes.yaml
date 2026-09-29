@@ -1,0 +1,18 @@
+profile:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" profile'
+  timeout_ms: 30000
+ncs-match:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" ncs-match'
+  timeout_ms: 30000
+research:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" research'
+  timeout_ms: 120000
+gap:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" gap'
+  timeout_ms: 30000
+report:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" report'
+  timeout_ms: 30000
+judge:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" judge'
+  timeout_ms: 30000

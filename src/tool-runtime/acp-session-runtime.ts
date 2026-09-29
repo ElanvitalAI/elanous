@@ -38,7 +38,17 @@ import {
   type AcpPlanThenExecuteArgs,
   type AcpSessionStatusArgs,
 } from '../skills/tools/acp-session.js';
-import type { ToolRuntime } from './types.js';
+import type { ToolRuntime, ToolRuntimeContext } from './types.js';
+import { assertClaudeSubscriptionAllowed } from '../policy/claude-subscription-guard.js';
+
+function assertBackendAllowed(backendId: string, ctx: ToolRuntimeContext): void {
+  assertClaudeSubscriptionAllowed({ origin: ctx.requestOrigin ?? 'owner', backendId, surface: ctx.surface });
+}
+
+function assertSessionAllowed(sessionId: string, ctx: ToolRuntimeContext): void {
+  const backendId = /^acp-cli:([^:]+):/.exec(sessionId)?.[1];
+  if (backendId) assertBackendAllowed(backendId, ctx);
+}
 
 // Output types are widened to `any` the way other multi-field runtimes
 // (context-runtime, control-runtime, ...) do — ToolRunResult's union
@@ -49,7 +59,9 @@ import type { ToolRuntime } from './types.js';
 export const acpSessionCreateRuntime: ToolRuntime<AcpSessionCreateArgs, any> = {
   id: 'acp_session_create',
   spec: buildAcpSessionCreateTool(),
-  async run(req) {
+  async run(req, ctx) {
+    assertBackendAllowed(req.brand, ctx);
+    if (req.parentSessionId) assertSessionAllowed(req.parentSessionId, ctx);
     return dispatchAcpSessionCreate(req);
   },
 };
@@ -57,7 +69,8 @@ export const acpSessionCreateRuntime: ToolRuntime<AcpSessionCreateArgs, any> = {
 export const acpSessionSendRuntime: ToolRuntime<AcpSessionSendArgs, any> = {
   id: 'acp_session_send',
   spec: buildAcpSessionSendTool(),
-  async run(req) {
+  async run(req, ctx) {
+    assertSessionAllowed(req.sessionId, ctx);
     return dispatchAcpSessionSend(req);
   },
 };
@@ -82,7 +95,8 @@ export const acpSessionListRuntime: ToolRuntime<AcpSessionListArgs, any> = {
 export const acpSessionResumeRuntime: ToolRuntime<AcpSessionResumeArgs, any> = {
   id: 'acp_session_resume',
   spec: buildAcpSessionResumeTool(),
-  async run(req) {
+  async run(req, ctx) {
+    assertSessionAllowed(req.sessionId, ctx);
     return dispatchAcpSessionResume(req);
   },
 };
@@ -91,7 +105,9 @@ export const acpSessionResumeRuntime: ToolRuntime<AcpSessionResumeArgs, any> = {
 export const acpSessionSpawnSubRuntime: ToolRuntime<AcpSessionSpawnSubArgs, any> = {
   id: 'acp_session_spawn_sub',
   spec: buildAcpSessionSpawnSubTool(),
-  async run(req) {
+  async run(req, ctx) {
+    assertBackendAllowed(req.brand, ctx);
+    assertSessionAllowed(req.parentSessionId, ctx);
     return dispatchAcpSessionSpawnSub(req);
   },
 };
@@ -100,7 +116,10 @@ export const acpSessionSpawnSubRuntime: ToolRuntime<AcpSessionSpawnSubArgs, any>
 export const acpPlanThenExecuteRuntime: ToolRuntime<AcpPlanThenExecuteArgs, any> = {
   id: 'acp_plan_then_execute',
   spec: buildAcpPlanThenExecuteTool(),
-  async run(req) {
+  async run(req, ctx) {
+    assertBackendAllowed(req.brand, ctx);
+    assertBackendAllowed(req.executeBrand ?? req.brand, ctx);
+    assertSessionAllowed(req.parentSessionId, ctx);
     return dispatchAcpPlanThenExecute(req);
   },
 };
@@ -109,7 +128,9 @@ export const acpPlanThenExecuteRuntime: ToolRuntime<AcpPlanThenExecuteArgs, any>
 export const acpSessionStartBackgroundRuntime: ToolRuntime<AcpSessionStartBackgroundArgs, any> = {
   id: 'acp_session_start_background',
   spec: buildAcpSessionStartBackgroundTool(),
-  async run(req) {
+  async run(req, ctx) {
+    assertBackendAllowed(req.brand, ctx);
+    if (req.parentSessionId) assertSessionAllowed(req.parentSessionId, ctx);
     return dispatchAcpSessionStartBackground(req);
   },
 };

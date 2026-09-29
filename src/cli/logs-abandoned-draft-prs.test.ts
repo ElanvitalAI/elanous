@@ -561,9 +561,10 @@ describe('runLogsAbandonedDraftPrs — read-only storage path', () => {
 
   test('사람 출력에도 건수·스토어·상한이 있고 GitHub 쓰기 심볼이 모듈에 없다', () => {
     const source = readFileSync(new URL('./logs-abandoned-draft-prs.ts', import.meta.url), 'utf8');
-    const indexSource = readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
+    // The `logs` subcommands moved from src/index.ts to src/cli/logs-cli.ts in the D4c split.
+    const indexSource = readFileSync(new URL('./logs-cli.ts', import.meta.url), 'utf8');
     expect(indexSource).toContain("logsCmd.command('abandoned-draft-prs')");
-    expect(indexSource).toContain("const { runLogsAbandonedDraftPrs } = await import('./cli/logs-abandoned-draft-prs.js');");
+    expect(indexSource).toContain("const { runLogsAbandonedDraftPrs } = await import('./logs-abandoned-draft-prs.js');");
     expect(indexSource).toContain('process.exit(runLogsAbandonedDraftPrs(merged));');
     expect(indexSource).toContain(".option('--store-names'");
     expect(indexSource).toContain(".option('--lookup-merged'");

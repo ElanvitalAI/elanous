@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
-import { detectTestInterference, runBunTest } from '../../scripts/detect-test-interference.js';
+import { detectTestInterference, parseFailureCount, runBunTest } from '../../scripts/detect-test-interference.js';
 import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 
 /**
@@ -16,8 +16,8 @@ export function needsPwaBuild(files: readonly string[]): boolean {
   return files.some((file) => file.startsWith('apps/pwa/') || (file.startsWith('src/') && !/\.test\.tsx?$/.test(file)));
 }
 
-export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string }
-export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string }
+export interface HostRegateInput { prNumber: number; headCommit: string; repoRoot: string; verifyOnly?: boolean }
+export interface HostRegateResult { passed: boolean; failures: Array<{ step: string; detail: string }>; os: string; status?: 'passed' | 'failed' | 'unmeasured'; /** verifyOnly: 실제로 얹어 잰 base 끝 */ baseCommit?: string }
 export type HostRegateDeps = {
   command?: (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv) => { status: number | null; stdout: string; stderr: string };
   interference?: (files: readonly string[], cwd: string) => Promise<{ passed: boolean; detail?: string; unmeasured?: boolean }>;
@@ -33,16 +33,25 @@ const defaultCommand: NonNullable<HostRegateDeps['command']> = (bin, args, cwd, 
 };
 
 /** The informational pr-land gate always returns zero; enforce its measured report and the combined test result instead. */
-async function defaultInterference(files: readonly string[], cwd: string): Promise<{ passed: boolean; detail?: string; unmeasured?: boolean }> {
+async function defaultInterference(files: readonly string[], cwd: string, opts: { neighbors?: boolean } = {}): Promise<{ passed: boolean; detail?: string; unmeasured?: boolean }> {
   const tests = files.filter((file) => /\.test\.tsx?$/.test(file));
   const neighbors = new Set<string>(tests);
-  for (const file of tests) {
+  // verifyOnly(승인 탭)는 «이 PR 이 바꾼 시험»만 잰다 — 이웃 시험을 넣으면 간섭 관문의 상한(8)에 잘려 영영 «측정 불가»가 되고,
+  //   이웃의 기존 실패가 이 PR 을 막는다(2026-09-28 #21239 실측: scripts/lib 이웃 9 → 상한 8 · nl-routing-measurement 기존 1 fail).
+  if (opts.neighbors !== false) for (const file of tests) {
     for (const sibling of readdirSync(join(cwd, dirname(file)))) {
       if (/\.test\.tsx?$/.test(sibling)) neighbors.add(join(dirname(file), sibling));
     }
   }
   const selected = [...neighbors].sort();
   if (!selected.length) return { passed: true };
+  // 간섭 관문은 시험 파일이 둘 이상일 때만 잰다 — 하나면 간섭이라는 말이 없으니 그 파일을 한 번 돌려 실패 수로 본다.
+  if (selected.length === 1) {
+    const run = await runBunTest(selected, undefined, cwd);
+    const fail = run.signal || run.exitCode === null ? null : parseFailureCount(`${run.stdout}${run.stderr}`);
+    if (fail === null) return { passed: false, unmeasured: true, detail: `single test run unmeasured: ${selected[0]}` };
+    return fail === 0 ? { passed: true } : { passed: false, detail: `${selected[0]} — ${fail} fail` };
+  }
   // The informational pr-land gate always returns zero; its measured report is the verdict.
   let report: Awaited<ReturnType<typeof detectTestInterference>> | undefined;
   await runTestInterferenceGate({
@@ -108,10 +117,11 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
   let worktree: string | undefined;
   let attached = false;
   let release: (() => void) | undefined;
+  let verifiedBase: string | undefined;
   const result = (event: 'passed' | 'failed' | 'unmeasured', step?: string, detail?: string): HostRegateResult => {
     if (step) failures.push({ step, detail: detail ?? 'unknown' });
     log(event, { pr: input.prNumber, files, os: process.platform, ...(step ? { failedStep: step } : {}) });
-    return { passed: event === 'passed', failures, os: process.platform };
+    return { passed: event === 'passed', failures, os: process.platform, ...(input.verifyOnly ? { status: event, ...(verifiedBase ? { baseCommit: verifiedBase } : {}) } : {}) };
   };
   const run = (bin: string, args: readonly string[], cwd: string, env?: NodeJS.ProcessEnv): string => {
     const r = command(bin, args, cwd, env);
@@ -128,10 +138,13 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     catch (e) { return result('unmeasured', 'pr-view', String(e)); }
     if (view.headRefOid !== input.headCommit || view.state !== 'OPEN' || view.isDraft !== false || !view.baseRefName || !/^[0-9a-f]{40}$/i.test(view.baseRefOid ?? '')) return result('unmeasured', 'pr-head', 'PR head, base commit, ready state or open state unavailable or changed');
     const baseRefName = view.baseRefName;
-    const baseCommit = view.baseRefOid;
+    // verifyOnly(승인 탭): PR 에 기록된 base(baseRefOid)는 main 의 «지금 끝»보다 늙을 수 있다 — 지금 끝에 얹어 잰다.
+    let baseCommit = view.baseRefOid!;
     try {
       run('git', ['fetch', 'origin', `refs/heads/${baseRefName}`], input.repoRoot);
-      if (run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot) !== baseCommit) throw new Error('fetched PR base differs from checked SHA');
+      const fetchedBase = run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot);
+      if (input.verifyOnly) { baseCommit = fetchedBase; verifiedBase = fetchedBase; }
+      else if (fetchedBase !== baseCommit) throw new Error('fetched PR base differs from checked SHA');
       run('git', ['fetch', 'origin', `refs/pull/${input.prNumber}/head`], input.repoRoot);
       if (run('git', ['rev-parse', 'FETCH_HEAD'], input.repoRoot) !== input.headCommit) throw new Error('fetched PR head differs from checked SHA');
       worktree = (deps.makeTemp ?? (() => mkdtempSync(join(tmpdir(), 'elanous-host-regate-'))))();
@@ -148,17 +161,33 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       run('git', ['-c', 'user.name=elanous host regate', '-c', 'user.email=regate@localhost', 'commit', '-m', 'host regate integration candidate'], worktree);
       if (run('git', ['rev-parse', 'HEAD^1'], worktree) !== baseCommit || run('git', ['rev-parse', 'HEAD^2'], worktree) !== input.headCommit) throw new Error('integration parents do not match PR base and checked head');
       if (!deps.command && !existsSync(join(worktree, 'scripts/ci-typecheck-changed.ts'))) throw new Error('typecheck gate unavailable in checked worktree');
-      if (existsSync(join(input.repoRoot, 'node_modules')) && !existsSync(join(worktree, 'node_modules'))) symlinkSync(join(input.repoRoot, 'node_modules'), join(worktree, 'node_modules'), 'dir');
-      if (needsPwaBuild(files) && existsSync(join(input.repoRoot, 'apps/pwa/node_modules')) && existsSync(join(worktree, 'apps/pwa')) && !existsSync(join(worktree, 'apps/pwa/node_modules'))) {
-        symlinkSync(join(input.repoRoot, 'apps/pwa/node_modules'), join(worktree, 'apps/pwa/node_modules'), 'dir');
-      }
+      // Borrow the source checkout's dependencies only when they are really installed. The daemon's install source can be
+      // a temporary checkout whose node_modules is empty or purged; linking it turned every gate into
+      // «Cannot find package 'typescript'» (unmeasured · 2026-09-29 #21239). Install into the candidate instead.
+      const candidate = worktree;
+      const provide = (dir: string, marker: string): void => {
+        if (existsSync(join(candidate, dir, 'node_modules'))) return;
+        if (existsSync(join(input.repoRoot, dir, 'node_modules', marker, 'package.json'))) {
+          symlinkSync(join(input.repoRoot, dir, 'node_modules'), join(candidate, dir, 'node_modules'), 'dir');
+        } else run('bun', ['install', '--frozen-lockfile'], join(candidate, dir));
+      };
+      provide('', 'typescript');
+      if (needsPwaBuild(files) && existsSync(join(worktree, 'apps/pwa'))) provide('apps/pwa', 'next');
     } catch (e) { return result('unmeasured', 'worktree', String(e)); }
     try {
-      const interference = await (deps.interference ?? defaultInterference)(files, worktree);
+      const interference = await (deps.interference ?? ((f: readonly string[], c: string) => defaultInterference(f, c, { neighbors: !input.verifyOnly })))(files, worktree);
       if (!interference.passed) return result(interference.unmeasured ? 'unmeasured' : 'failed', 'test-interference', interference.detail);
     } catch (e) { return result('unmeasured', 'test-interference', String(e)); }
-    try { run('bun', ['scripts/ci-typecheck-changed.ts'], worktree, { ...process.env, TSC_BASE_REF: base }); }
+    // verifyOnly: 통합 후보는 «지금 main 끝»(baseCommit)에 얹은 것이다 — 옛 merge-base 로 비교하면 그사이 main 착지분
+    //   수백 파일이 «이 PR 의 변경»으로 잡혀 저장소 전체 검사로 승격된다(2026-09-28 #21239 실측: 456파일 · PWA 636건).
+    try { run('bun', ['scripts/ci-typecheck-changed.ts'], worktree, { ...process.env, TSC_BASE_REF: input.verifyOnly ? baseCommit : base }); }
     catch (e) { return result(String(e).includes('error TS') ? 'failed' : 'unmeasured', 'typecheck', String(e)); }
+    // ⛔ 2026-09-28: a Pod landing brought `join(home, '.elanous', …)` into main without this gate, and every human
+    //    `pr land` after it failed the isolation gate regardless of its own files (#21336 → #21343).
+    if (deps.command || existsSync(join(worktree, 'scripts/ci-isolation-hardcode-gate.ts'))) {
+      try { run('bun', ['scripts/ci-isolation-hardcode-gate.ts', '--changed-files', ...files], worktree); }
+      catch (e) { return result(/\[isolation-gate\] FAIL/.test(String(e)) ? 'failed' : 'unmeasured', 'isolation-gate', String(e)); }
+    }
     if (needsPwaBuild(files)) {
       try { run('bun', ['bin/elanous.mjs', '--test', 'nexus', 'build'], worktree); }
       catch (e) { return result(String(e).includes('command unavailable') ? 'unmeasured' : 'failed', 'nexus-build', String(e)); }
@@ -166,11 +195,12 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     let current: PrView;
     try { current = readPr(); }
     catch (e) { return result('unmeasured', 'pr-view', String(e)); }
-    if (current.headRefOid !== input.headCommit || current.baseRefName !== baseRefName || current.baseRefOid !== baseCommit || current.state !== 'OPEN' || current.isDraft !== false) {
+    if (current.headRefOid !== input.headCommit || current.baseRefName !== baseRefName || (!input.verifyOnly && current.baseRefOid !== baseCommit) || current.state !== 'OPEN' || current.isDraft !== false) {
       return result('unmeasured', 'pr-base-changed', 'PR head or base changed during host regate; rerun against the new base');
     }
     // --match-head-commit pins the head. gh has no base pin, so the base was re-read just
     // above; the seconds between that read and the merge are checked after the fact below.
+    if (input.verifyOnly) return result('passed');
     try { run('gh', ['pr', 'merge', String(input.prNumber), '--squash', '--match-head-commit', input.headCommit], input.repoRoot); }
     catch (e) { return result('failed', 'merge', String(e)); }
     type MergedView = { state?: string; mergeCommit?: { oid?: string } | null };

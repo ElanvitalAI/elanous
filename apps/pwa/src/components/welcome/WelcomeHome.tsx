@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { AppRouterContext } from 'next/dist/shared/lib/app-router-context.shared-runtime';
 import { cn } from '@/lib/utils';
+import { splitWelcomeRoutes } from './welcome-core-routes';
 import { useNexusHealthIfMounted } from '@/nexus/hooks/use-nexus-state';
 import { setupModeRedirect } from '@/lib/setup-mode';
 import {
@@ -13,11 +14,7 @@ import {
   type SidebarRouteHref,
 } from '@/components/shell/sidebar-nav-items';
 
-/**
- * The sidebar table is the sole route classification source. Menu entries are
- * safe static destinations; every non-menu entry remains visible as reference
- * only because its recorded category says it is not a general destination.
- */
+/** Menu destinations and non-menu references share the not-found address inventory. */
 type RouteGuidanceItem = {
   href: SidebarRouteHref;
   label: string;
@@ -41,8 +38,8 @@ function toSidebarRouteHref(href: string): SidebarRouteHref {
 }
 
 /**
- * Shared application address accounting for the home, missing-route screen,
- * and their route-inventory tests. Non-menu paths intentionally have no href:
+ * Shared application address accounting for the missing-route screen
+ * and route-inventory tests. Non-menu paths intentionally have no links:
  * their sidebar-table reason means they are reference material, not a general
  * destination users should be sent to.
  */
@@ -60,14 +57,19 @@ export const ROUTE_GUIDANCE_ITEMS: readonly RouteGuidanceItem[] = [
   })),
 ];
 
+const WELCOME_MENU_ITEMS: readonly RouteGuidanceItem[] = [
+  ...ROUTE_GUIDANCE_ITEMS.filter((item) => item.navigable),
+  { href: '/setup', label: 'Setup', navigable: true },
+];
+
 function routeGuidanceTestId(href: SidebarRouteHref): string {
   return `route-guidance-${href === '/' ? 'root' : href.slice(1).replaceAll('/', '-')}`;
 }
 
-export function RouteGuidanceList({ ariaLabel }: { ariaLabel: string }) {
+export function RouteGuidanceList({ ariaLabel, items = ROUTE_GUIDANCE_ITEMS }: { ariaLabel: string; items?: readonly RouteGuidanceItem[] }) {
   return (
     <section aria-label={ariaLabel} className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-      {ROUTE_GUIDANCE_ITEMS.map((item) => (
+      {items.map((item) => (
         <article
           key={item.href}
           data-testid={routeGuidanceTestId(item.href)}
@@ -115,6 +117,7 @@ function WelcomeHomeRedirect() {
 }
 
 function WelcomeHomeView() {
+  const { core, more } = splitWelcomeRoutes(WELCOME_MENU_ITEMS);
   return (
     <main data-testid="welcome-home" className="min-h-screen bg-gradient-to-b from-background via-background to-muted/40 px-6 py-12 sm:px-10">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-10">
@@ -122,15 +125,20 @@ function WelcomeHomeView() {
           <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">elanous PWA</p>
           <h1 className="text-3xl font-bold leading-tight sm:text-4xl">웰컴 — 어디부터 시작할까요?</h1>
           <p className="max-w-2xl text-sm text-muted-foreground sm:text-base">
-            지금 갈 수 있는 곳과 참고 주소를 모두 안내합니다. 참고 주소는 기록된 사유 때문에 일반 목적지 링크로 만들지 않습니다.
+            처음이라면 아래 핵심 화면에서 시작하세요. 다른 화면은 필요할 때 펼쳐 볼 수 있습니다.
           </p>
         </header>
 
-        <RouteGuidanceList ariaLabel="전체 주소 안내" />
+        <RouteGuidanceList ariaLabel="핵심 화면" items={core} />
+        <details className="rounded-2xl border border-border/60 bg-card/60 p-5">
+          <summary className="cursor-pointer font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            모든 화면 ({more.length})
+          </summary>
+          <div className="mt-4">
+            <RouteGuidanceList ariaLabel="나머지 화면" items={more} />
+          </div>
+        </details>
 
-        <footer className="text-xs text-muted-foreground">
-          이전 자동 포워딩(<code className="rounded bg-muted px-1 py-0.5 text-[11px]">/app → /chat</code>) 은 제거되었습니다. 기본 진입은 본 페이지로 유지됩니다.
-        </footer>
       </div>
     </main>
   );

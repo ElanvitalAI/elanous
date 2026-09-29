@@ -28,13 +28,13 @@
 //     daemon exit.
 
 import type { McpServerSpec } from '../../user-config.js';
-import { McpClient } from '../../mcp/client.js';
+import { McpClient, McpConnectionError } from '../../mcp/client.js';
 import {
   createMcpProxyRuntime,
   createMcpToolAuthorizer,
 } from '../../mcp/proxy-runtime.js';
 import { registerToolRuntime, unregisterToolRuntime } from '../../tool-runtime/registry.js';
-import { debug } from '../../debug/log.js';
+import { debug, redactSecretText } from '../../debug/log.js';
 
 export interface McpClientsHandle {
   /** Live clients (one per successfully started server). */
@@ -60,6 +60,35 @@ export interface McpServerBootResult {
   /** When status=='failed', the error message captured (string only —
    *  callers should not depend on Error identity). */
   reason?: string;
+  /** When status=='failed', the classified cause. Same vocabulary as the
+   *  `mcp.client.boot` / `connect-failed` log row's `reason`. */
+  reasonClass?: McpConnectFailureClass;
+}
+
+/** Classified cause of a boot-time MCP attach failure.
+ *  `McpConnectionError.reason` plus the message shapes the boot catch sees. */
+export type McpConnectFailureClass =
+  | 'auth-required'
+  | 'invalid-token'
+  | 'unreachable'
+  | 'not-mcp'
+  | 'handshake-timeout'
+  | 'spawn-failed'
+  | 'other';
+
+const SPAWN_FAILURE = /\b(?:ENOENT|EACCES|EPERM|ENOTDIR)\b|spawn \S+ ENOENT/i;
+
+/** Map a thrown attach error onto the boot failure vocabulary.
+ *  `invalid_token` wins over `McpConnectionError.reason` — a 401 whose
+ *  body says the token itself was rejected is a different next action
+ *  from "authentication required". */
+export function classifyMcpConnectFailure(err: unknown): McpConnectFailureClass {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes('invalid_token')) return 'invalid-token';
+  if (err instanceof McpConnectionError) return err.reason;
+  if (msg.includes('-timeout after ')) return 'handshake-timeout';
+  if (SPAWN_FAILURE.test(msg)) return 'spawn-failed';
+  return 'other';
 }
 
 export interface RegisterMcpClientsOpts {
@@ -257,8 +286,13 @@ export async function registerMcpClients(
         registeredIds.splice(i, 1);
       }
       const msg = err instanceof Error ? err.message : String(err);
-      perServer[spec.id] = { status: 'failed', toolCount: 0, reason: msg };
-      logger.warn(`[nexus] mcp-client failed to start: ${spec.id} (${msg})`);
+      const reasonClass = classifyMcpConnectFailure(err);
+      const detail = redactSecretText(msg);
+      perServer[spec.id] = { status: 'failed', toolCount: 0, reason: detail, reasonClass };
+      try {
+        debug.log('mcp.client.boot', 'connect-failed', { id: spec.id, reason: reasonClass, detail });
+      } catch { /* logger must never throw the boot */ }
+      logger.warn(`[nexus] mcp-client failed to start: ${spec.id} (${detail})`);
       if (msg.includes('-timeout after ')) {
         logger.warn(
           `[nexus] mcp-client ${spec.id} was excluded after its ${serverHandshakeTimeoutMs}ms handshake timeout; raise mcp.handshakeTimeoutMs or mcp.servers[].handshakeTimeoutMs, then run elanous mcp reload.`,

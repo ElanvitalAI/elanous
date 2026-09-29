@@ -1,0 +1,558 @@
+import { expect, test } from 'bun:test';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { parse as yaml } from 'yaml';
+import { decideGraphApproval, runGraph } from '../../src/graph-runner/runner.js';
+import { runPrLand } from '../../src/cli/pr-cli.js';
+import { makePrManager, type CmdRunner } from '../../src/autopilot/pr-manager.js';
+import { publicNotes, runPublish } from './publish-node.js';
+import { runPrepare } from './prepare-node.js';
+import { runUpgrade } from './upgrade-node.js';
+import { runDocsLand } from './docs-land-node.js';
+import { runVerify } from './verify-node.js';
+
+test('release graph CLI dry-run stops at approval without executing commands', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-cli-dry-run-'));
+  try {
+    const run = spawnSync('bun', ['bin/elanous.mjs', '--test', 'graph', 'run', 'graphs/release/release-loop.yaml', '--dry-run', '--json', '--input', '{"version":"9.9.9","previousVersion":"0.2.3"}'], {
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', ELANOUS_STATE_DIR: root },
+    });
+    expect(run.status).toBe(0);
+    const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; executed: number; pending?: { nodeId: string; message: string } };
+    expect(output.status).toBe('awaiting-approval');
+    expect(output.path).toEqual(['version-release', 'cutoff', 'gate', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'approve-publish']);
+    expect(output.pending?.nodeId).toBe('approve-publish');
+    expect(output.pending?.message).toContain('v9.9.9 공개 발행');
+    expect(output.executed).toBe(0);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('graph dry-run reaches approval in declared order, without executing commands', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-graph-'));
+  try {
+    const state = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), {
+      input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
+    });
+    expect(state.status).toBe('awaiting-approval');
+    expect(state.path).toEqual(['version-release', 'cutoff', 'gate', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'approve-publish']);
+    expect(state.pending?.nodeId).toBe('approve-publish');
+    expect(state.pending?.message).toContain('v9.9.9 공개 발행');
+    expect(state.pending?.notifiedAt).toBeUndefined();
+    expect(state.executed).toBe(0);
+    expect(state.nodes.every((node) => !node.executed)).toBe(true);
+    const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { edges: Array<{ from: string; map: Record<string, string> }> };
+    expect(graph.edges.filter((e) => Object.values(e.map).includes('publish')).map((e) => e.from)).toEqual(['approve-publish']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('graph recipes carry start notices and measured long-node timeouts', () => {
+  const graph = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), 'utf8')) as { nodes: Array<{ node_id: string; notify?: string; max_visits: number }> };
+  const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { timeout_ms?: number; command?: string; approval?: string }>;
+  for (const node of graph.nodes) expect(node.max_visits).toBe(1);
+  expect(graph.nodes.filter((node) => node.notify === 'start').map((node) => node.node_id)).toEqual(['gate', 'pwa', 'prepare']);
+  expect(recipes.gate?.timeout_ms).toBe(7_200_000);
+  expect(recipes.pwa?.timeout_ms).toBe(1_800_000);
+  expect(recipes.prepare?.timeout_ms).toBe(1_800_000);
+  expect(recipes.publish?.approval).toContain('되돌릴 수 없다');
+  expect(recipes['publish-command']?.command).toContain('publish-node.ts');
+});
+
+test('real graph commands stop at approval before publish', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-approval-'));
+  try {
+    const state = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), {
+      input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => ({ exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' }) },
+    });
+    expect(state.status).toBe('awaiting-approval');
+    expect(state.path).toEqual(['version-release', 'cutoff', 'gate', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'approve-publish']);
+    expect(state.pending?.nodeId).toBe('approve-publish');
+    expect(state.executed).toBe(8);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('gate regression routes to failed before preparing or publishing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-regression-'));
+  const commands: string[] = [];
+  try {
+    const state = await runGraph(join(import.meta.dir, '../../graphs/release/release-loop.yaml'), {
+      input: { version: '9.9.9', previousVersion: '0.2.3' },
+      deps: { root, runBash: async (body) => {
+        commands.push(body);
+        return body.includes('gate-node.ts')
+          ? { exitCode: 1, stdout: '{"outcome":"fail","verdict":"fail","summary":"new regression"}\n', stderr: '' }
+          : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' };
+      } },
+    });
+    expect(state.status).toBe('failed');
+    expect(state.path).toEqual(['version-release', 'cutoff', 'gate', 'failed']);
+    expect(commands).toHaveLength(3);
+    expect(commands.some((command) => command.includes('publish-node.ts'))).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('approval resumes through publish, docs land, verify and dev bump with fake runner', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-resume-'));
+  const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const commands: string[] = [];
+  const fake = async (body: string) => {
+    commands.push(body);
+    const node = body.includes('version-node.ts release') ? 'version-release' : body.includes('prepare-node.ts') ? 'prepare'
+      : body.includes('docs-node.ts') ? 'docs' : body.includes('publish-node.ts') ? 'publish' : 'other';
+    const fields = node === 'version-release' ? { commit: 'a'.repeat(40) } : node === 'prepare'
+      ? { commit: 'a'.repeat(40), candidate: join(root, 'elanous.tgz'), out: join(root, 'prepared') }
+      : node === 'docs' ? { branch: 'release-docs/9.9.9', worktree: join(root, 'docs-tree') }
+      : node === 'publish' ? { tag: 'v9.9.9' } : {};
+    return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: node, ...fields }) + '\n', stderr: '' };
+  };
+  try {
+    const first = await runGraph(graph, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: fake } });
+    expect(first.status).toBe('awaiting-approval');
+    expect(commands).toHaveLength(8);
+    decideGraphApproval(first.graphId, first.runId, 'approved', 'fake-approver', root);
+    const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: fake } });
+    expect(resumed.status).toBe('done');
+    expect(resumed.path.slice(-6)).toEqual(['approve-publish', 'publish', 'docs-land', 'verify', 'version-dev-bump', 'done']);
+    expect(commands).toHaveLength(12);
+    expect(commands.at(-4)).toContain('publish-node.ts');
+    expect(commands.at(-1)).toContain('version-node.ts dev-bump');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('real node entrypoints pass commit, candidate and worktree through graph contexts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-real-wiring-'));
+  const bin = join(root, 'bin');
+  const sha = 'a'.repeat(40);
+  const graph = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const calls = join(root, 'calls');
+  const originalState = process.env.ELANOUS_STATE_DIR;
+  try {
+    mkdirSync(bin);
+    writeFileSync(calls, '');
+    const fixture = `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.env.RELEASE_WIRING_ROOT;
+const args = process.argv.slice(2);
+const tool = path.basename(process.argv[1]);
+fs.appendFileSync(path.join(root, 'calls'), tool + ' ' + args.join(' ') + '\\n');
+const sha = 'a'.repeat(40);
+if (tool === 'git') {
+  if (args[0] === 'rev-parse') console.log(args.includes('v0.2.3^{commit}') ? 'b'.repeat(40) : fs.existsSync(path.join(root,'dev-bump.done')) ? 'd'.repeat(40) : fs.existsSync(path.join(root,'release.done')) ? sha : 'c'.repeat(40));
+  else if (args[0] === 'show') {
+    if (args[1] === 'origin/main:package.json') console.log(JSON.stringify({version:fs.existsSync(path.join(root,'dev-bump.done')) ? '0.2.5-dev.0' : fs.existsSync(path.join(root,'release.done')) ? '0.2.4' : '0.2.4-dev.0'}));
+    else if (args[1].endsWith(':website/pages.json')) console.log(JSON.stringify({pages:[{id:'using-elanous/tasks-and-intake', source:'release/public/docs/tasks-and-intake.md'}]}));
+    else console.log('# 0.2.4\\n\\n[Tasks and intake](tasks-and-intake.md)');
+  } else if (args[0] === 'worktree' && args[1] === 'add') {
+    const tree = args.includes('--detach') ? args[3] : args[4];
+    fs.mkdirSync(path.join(tree,'release/public/docs/releases'),{recursive:true});
+    fs.mkdirSync(path.join(tree,'website'),{recursive:true});
+    fs.writeFileSync(path.join(tree,'website/pages.json'),JSON.stringify({pages:[]}));
+    if (fs.existsSync(path.join(tree,'release/public/docs/releases/0.2.4.md'))) process.exit(1);
+    fs.writeFileSync(path.join(tree,'package.json'),JSON.stringify({name:'fixture',version:fs.existsSync(path.join(root,'release.done')) ? '0.2.4' : '0.2.4-dev.0'},null,2)+'\\n');
+    fs.writeFileSync(path.join(tree,'bun.lock'),JSON.stringify({workspaces:{'':{name:'fixture',version:fs.existsSync(path.join(root,'release.done')) ? '0.2.4' : '0.2.4-dev.0',dependencies:{}}}}));
+  } else if (args[0] === 'worktree' && args[1] === 'remove') fs.rmSync(args.at(-1),{recursive:true,force:true});
+  else if (!['fetch','add','commit','push'].includes(args[0])) process.exit(1);
+} else if (tool === 'bun') {
+  if (args.includes('prepare')) {
+    const out = args[args.indexOf('--out')+1];
+    if (args[args.indexOf('--source')+1] !== sha || args[args.indexOf('--notes-from')+1] !== 'b'.repeat(40)) process.exit(1);
+    fs.mkdirSync(path.join(out,'dist'),{recursive:true});
+    fs.writeFileSync(path.join(out,'dist/elanous.tgz'),'candidate');
+    fs.writeFileSync(path.join(root,'release/0.2.4/manifest.json'),JSON.stringify({version:'0.2.4',in:[{sha:'a',title:'Release change',kind:'feat'}]}));
+    console.log(JSON.stringify({manifest:{version:'0.2.4',sourceCommit:sha,distDir:path.join(out,'dist')}}));
+  } else if (args.includes('publish')) {
+    if (!fs.existsSync(path.join(args[args.indexOf('--dir')+1],'dist/elanous.tgz'))) process.exit(1);
+    if (!fs.readFileSync(args[args.indexOf('--notes-file')+1],'utf8').includes('https://docs.elanous.ai/using-elanous/tasks-and-intake')) process.exit(1);
+    console.log(JSON.stringify({ok:true,published:true,tag:'v0.2.4'}));
+  } else if (args.includes('verify')) console.log(JSON.stringify({ok:true,notesPage:'ok'}));
+  else if (args.includes('land')) {
+    if (args.includes('--commit-message')) fs.writeFileSync(path.join(root,args[args.indexOf('--commit-message')+1] === 'release: 0.2.4' ? 'release.done' : 'dev-bump.done'),'yes');
+    console.log('✓ find: NONE\\n✓ upsert-ready: https://github.com/example/repo/pull/42 (새 PR)\\n✓ merge: squash https://github.com/example/repo/pull/42');
+  }
+  else if (args[0] !== 'install' && !args.some((arg) => arg.endsWith('deploy-pages.ts'))) process.exit(1);
+} else if (tool === 'bash') console.log('ubuntu:24.04 [upgrade] verdict ok\\ndebian:12 [upgrade] verdict ok');
+`;
+    for (const tool of ['git', 'bun', 'bash']) {
+      writeFileSync(join(bin, tool), fixture);
+      chmodSync(join(bin, tool), 0o755);
+    }
+    process.env.ELANOUS_STATE_DIR = root;
+    const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RELEASE_WIRING_ROOT: root, ELANOUS_STATE_DIR: root };
+    const real = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
+      if (body.includes('node-verdict.ts') || body.includes('gate-node.ts')) {
+        return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'isolated costly check' }) + '\n', stderr: '' };
+      }
+      const run = spawnSync(process.execPath, [join(import.meta.dir, '../..', body.slice(4).split(' ')[0]!), ...body.slice(4).split(' ').slice(1)], {
+        cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...env, ELANOUS_GRAPH_CONTEXT: opts.env?.ELANOUS_GRAPH_CONTEXT },
+      });
+      return { exitCode: run.status ?? 2, stdout: run.stdout, stderr: run.stderr };
+    };
+    const first = await runGraph(graph, { input: { version: '0.2.4', previousVersion: '0.2.3' }, deps: { root, runBash: real } });
+    expect(first.status).toBe('awaiting-approval');
+    expect(first.pending?.message).toContain('v0.2.4');
+    const outputs = Object.fromEntries(first.nodes.map((node) => [node.nodeId, JSON.parse(String(node.output).trim().split('\n').at(-1)!)]));
+    expect(outputs['version-release'].commit).toBe(sha);
+    expect(outputs.prepare.commit).toBe(sha);
+    expect(outputs.prepare.candidate).toEndWith('dist/elanous.tgz');
+    expect(outputs.docs.worktree).toEndWith('/tree');
+    expect(readFileSync(join(outputs.docs.worktree, 'release/public/docs/releases/0.2.4.md'), 'utf8')).toContain('## ');
+    expect(JSON.parse(readFileSync(join(outputs.docs.worktree, 'website/pages.json'), 'utf8')).pages).toContainEqual(expect.objectContaining({ id: 'releases/0.2.4' }));
+    decideGraphApproval(first.graphId, first.runId, 'approved', 'fixture-approver', root);
+    const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: real } });
+    expect(resumed.status).toBe('done');
+    const transcript = readFileSync(calls, 'utf8');
+    expect(transcript).toContain('pr land --commit-message release: 0.2.4');
+    expect(transcript).toContain('pr land --commit-message version: 0.2.5-dev.0');
+    expect(transcript).toContain(`--candidate ${outputs.prepare.candidate}`);
+    expect(transcript).toContain(`--cwd ${outputs.docs.worktree}`);
+    expect(transcript).toContain('pr land --cwd');
+    expect(transcript).toContain('release publish');
+    const published = JSON.parse(String(resumed.nodes.find((node) => node.nodeId === 'publish')?.output).trim().split('\n').at(-1)!);
+    expect(published.tag).toBe('v0.2.4');
+    expect(transcript).toContain('release verify --version 0.2.4');
+    expect(resumed.nodes.find((node) => node.nodeId === 'prepare')?.executed).toBe(true);
+    const missing = { input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: sha }, prepare: { outcome: 'ok', commit: sha } } };
+    const badContext = join(root, 'missing-context.json');
+    writeFileSync(badContext, JSON.stringify(missing));
+    const rejected = spawnSync(process.execPath, [join(import.meta.dir, 'upgrade-node.ts')], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...env, ELANOUS_GRAPH_CONTEXT: badContext } });
+    expect(rejected.status).toBe(2);
+    expect(JSON.parse(rejected.stdout.trim().split('\n').at(-1)!).summary).toContain('prepare.candidate required');
+    writeFileSync(badContext, JSON.stringify({ ...missing, outputs: { ...missing.outputs, prepare: { outcome: 'ok', candidate: outputs.prepare.candidate } } }));
+    const rejectedCommit = spawnSync(process.execPath, [join(import.meta.dir, 'upgrade-node.ts')], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...env, ELANOUS_GRAPH_CONTEXT: badContext } });
+    expect(rejectedCommit.status).toBe(2);
+    expect(JSON.parse(rejectedCommit.stdout.trim().split('\n').at(-1)!).summary).toContain('prepare.commit required');
+    writeFileSync(badContext, JSON.stringify({ ...missing, outputs: { ...missing.outputs, prepare: { outcome: 'ok', commit: sha, candidate: join(root, 'absent.tgz') } } }));
+    const rejectedCandidate = spawnSync(process.execPath, [join(import.meta.dir, 'upgrade-node.ts')], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...env, ELANOUS_GRAPH_CONTEXT: badContext } });
+    expect(rejectedCandidate.status).toBe(2);
+    expect(JSON.parse(rejectedCandidate.stdout.trim().split('\n').at(-1)!).summary).toContain('candidate missing');
+    writeFileSync(badContext, JSON.stringify({ ...missing, outputs: { ...missing.outputs, prepare: { outcome: 'ok', commit: 'c'.repeat(40), candidate: outputs.prepare.candidate } } }));
+    const rejectedMismatch = spawnSync(process.execPath, [join(import.meta.dir, 'upgrade-node.ts')], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...env, ELANOUS_GRAPH_CONTEXT: badContext } });
+    expect(rejectedMismatch.status).toBe(2);
+    expect(JSON.parse(rejectedMismatch.stdout.trim().split('\n').at(-1)!).summary).toContain('prepare commit differs from release commit');
+    const beforeMissingTree = readFileSync(calls, 'utf8');
+    writeFileSync(badContext, JSON.stringify({ input: missing.input, outputs: { publish: { outcome: 'ok', tag: 'v0.2.4' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' } } }));
+    const rejectedTree = spawnSync(process.execPath, [join(import.meta.dir, 'docs-land-node.ts')], { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...env, ELANOUS_GRAPH_CONTEXT: badContext } });
+    expect(rejectedTree.status).toBe(2);
+    expect(JSON.parse(rejectedTree.stdout.trim().split('\n').at(-1)!).summary).toContain('docs.worktree required');
+    expect(readFileSync(calls, 'utf8')).toBe(beforeMissingTree);
+  } finally {
+    if (originalState === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = originalState;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('publish uses docs branch notes and page slugs when prerequisites pass', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-publish-success-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  const calls: Array<[string, string[]]> = [];
+  try {
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+      'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok', out: root, commit: 'a'.repeat(40) }, upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
+    } });
+    const result = runPublish((cmd, args) => {
+      calls.push([cmd, args]);
+      if (cmd === 'git') return { status: 0, stderr: '', stdout: args[1]?.endsWith('pages.json') ? JSON.stringify({ pages: [{ id: 'using-elanous/tasks-and-intake', source: 'release/public/docs/tasks-and-intake.md' }] }) : '# 0.2.4\n\n[Tasks and intake](tasks-and-intake.md)\n' };
+      const notes = readFileSync(args[args.indexOf('--notes-file') + 1]!, 'utf8');
+      expect(notes).toContain('https://docs.elanous.ai/using-elanous/tasks-and-intake');
+      expect(notes).not.toContain('.md)');
+      return { status: 0, stderr: '', stdout: JSON.stringify({ ok: true, published: true, tag: 'v0.2.4' }) };
+    });
+    expect(result.outcome).toBe('ok');
+    expect(result.tag).toBe('v0.2.4');
+    expect(calls.map(([cmd]) => cmd)).toEqual(['git', 'git', 'bun']);
+    expect(calls.at(-1)?.[1]).toContain('--yes');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('any failed prerequisite refuses publish without calling the release command', () => {
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    for (const failed of ['gate', 'prepare', 'upgrade']) {
+      const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'prepare', 'upgrade', 'pwa', 'tui', 'docs'].map((node) => [node, { outcome: node === failed ? 'fail' : 'ok' }]));
+      outputs['approve-publish'] = { outcome: 'approved' };
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+      const result = runPublish(() => { throw new Error('release publish was called'); });
+      expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail' });
+      expect(result.summary).toContain(failed);
+    }
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; }
+});
+
+test('publish cannot report a tag that differs from the release CLI result', () => {
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+      'version-release': { outcome: 'ok', commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' },
+      prepare: { outcome: 'ok', commit: 'a'.repeat(40), out: '/tmp/prepared' }, upgrade: { outcome: 'ok' },
+      tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
+    } });
+    const run = (cmd: string, args: string[]) => ({ status: 0, stderr: '', stdout: cmd === 'git'
+      ? args[1]?.endsWith('pages.json') ? JSON.stringify({ pages: [] }) : '# 0.2.4\n\nBody\n'
+      : JSON.stringify({ ok: true, published: true, tag: 'v0.2.5' }) });
+    expect(() => runPublish(run)).toThrow('tag mismatch');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; }
+});
+
+test('publish refuses mismatched prepared commit without reading notes or calling release publish', () => {
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+      'version-release': { outcome: 'ok', commit: 'a'.repeat(40) },
+      gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok', commit: 'b'.repeat(40), out: '/tmp/prepared' },
+      upgrade: { outcome: 'ok' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
+    } });
+    expect(() => runPublish(() => { throw new Error('release publish was called'); })).toThrow('prepare commit differs from release commit');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; }
+});
+
+test('wrapper exit conventions distinguish failed command from incomplete run', () => {
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    const context = { input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: 'a'.repeat(40) }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' } } };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    const failed = runPrepare((command) => command === 'git' ? { status: 0, stdout: `${'b'.repeat(40)}\n`, stderr: '' } : { status: 1, stdout: '{"ok":false,"error":"build failed"}', stderr: '' });
+    expect(failed).toMatchObject({ outcome: 'fail', verdict: 'fail' });
+    expect(() => runPrepare((command) => command === 'git' ? { status: 0, stdout: `${'b'.repeat(40)}\n`, stderr: '' } : { status: 2, stdout: '', stderr: '' })).toThrow('prepare incomplete');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; }
+});
+
+test('publish refuses failed upgrade before running any release command', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-publish-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  let calls = 0;
+  try {
+    const file = join(root, 'context.json');
+    writeFileSync(file, JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+      gate: { outcome: 'ok' }, pwa: { outcome: 'ok' }, prepare: { outcome: 'ok' }, upgrade: { outcome: 'fail' }, tui: { outcome: 'ok' }, docs: { outcome: 'ok', branch: 'release-docs/0.2.4' },
+    } }));
+    process.env.ELANOUS_GRAPH_CONTEXT = file;
+    const result = runPublish(() => { calls++; return { status: 0, stdout: '', stderr: '' }; });
+    expect(result).toMatchObject({ outcome: 'fail', verdict: 'fail' });
+    expect(result.summary).toContain('upgrade');
+    expect(calls).toBe(0);
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('prepare uses prior tag commit and release commit from graph context', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-prepare-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  const calls: string[] = [];
+  try {
+    const sha = 'a'.repeat(40);
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { outcome: 'ok', commit: sha }, gate: { outcome: 'ok' }, pwa: { outcome: 'ok' } } });
+    const result = runPrepare((cmd, args) => {
+      calls.push(`${cmd} ${args.join(' ')}`);
+      return cmd === 'git' ? { status: 0, stdout: `${'b'.repeat(40)}\n`, stderr: '' }
+        : { status: 0, stdout: JSON.stringify({ manifest: { version: '0.2.4', sourceCommit: sha, distDir: join(args[args.indexOf('--out') + 1]!, 'dist') } }), stderr: '' };
+    });
+    expect(result.outcome).toBe('ok');
+    expect(result.commit).toBe(sha);
+    expect(calls[0]).toBe('git rev-parse --verify v0.2.3^{commit}');
+    expect(calls[1]).toContain(`--source ${sha} --notes-from ${'b'.repeat(40)}`);
+    expect(calls[1]).toContain('--out ');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('graph docs refuses a missing upgrade output without generating documentation', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-docs-missing-upgrade-'));
+  const notes = join(root, 'release/public/docs/releases/9.9.9.md');
+  try {
+    mkdirSync(join(root, 'release/9.9.9'), { recursive: true });
+    mkdirSync(join(root, 'release/public/docs/releases'), { recursive: true });
+    mkdirSync(join(root, 'website'), { recursive: true });
+    writeFileSync(join(root, 'release/9.9.9/manifest.json'), JSON.stringify({ version: '9.9.9', in: [] }));
+    writeFileSync(join(root, 'website/pages.json'), JSON.stringify({ pages: [] }));
+    const graphContext = JSON.stringify({ input: { version: '9.9.9', previousVersion: '0.2.3', base: root }, outputs: { 'approve-publish': { outcome: 'approved' },
+      gate: { outcome: 'ok' }, prepare: { outcome: 'ok' }, tui: { outcome: 'ok' },
+    } });
+    const run = spawnSync(process.execPath, [join(import.meta.dir, 'docs-node.ts'), '--json'], {
+      cwd: root, encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: graphContext, ELANOUS_STATE_DIR: root },
+    });
+    expect(run.status).toBe(1);
+    const result = JSON.parse(run.stdout.trim().split('\n').at(-1)!);
+    expect(result).toMatchObject({ outcome: 'error', verdict: 'fail' });
+    expect(result.summary).toContain('upgrade did not pass');
+    expect(readFileSync(join(root, 'website/pages.json'), 'utf8')).toBe('{"pages":[]}');
+    expect(() => readFileSync(notes, 'utf8')).toThrow();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('upgrade reports stderr-only failure reason', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-upgrade-stderr-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    const candidate = join(root, 'elanous.tgz');
+    writeFileSync(candidate, 'fake');
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+      prepare: { outcome: 'ok', candidate, commit: 'a'.repeat(40) }, 'version-release': { outcome: 'ok', commit: 'a'.repeat(40) },
+    } });
+    const result = runUpgrade(() => ({ status: 2, stdout: '', stderr: 'candidate archive cannot be opened\n' }));
+    expect(result).toMatchObject({ outcome: 'error', verdict: 'fail' });
+    expect(result.summary).toBe('upgrade failed (rc=2): candidate archive cannot be opened');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('upgrade rejects incomplete verdict even on successful shell exit', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-upgrade-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    const candidate = join(root, 'elanous.tgz');
+    writeFileSync(candidate, 'fake');
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { prepare: { outcome: 'ok', candidate, commit: 'a'.repeat(40) }, 'version-release': { outcome: 'ok', commit: 'a'.repeat(40) } } });
+    const result = runUpgrade(() => ({ status: 0, stdout: 'ubuntu:24.04 [upgrade] verdict ok\n', stderr: '' }));
+    expect(result.outcome).toBe('fail');
+    expect(result.summary).toContain('upgrade failed');
+    const complete = runUpgrade(() => ({ status: 0, stdout: 'ubuntu:24.04  [upgrade] verdict ok\ndebian:12  [upgrade] verdict ok\n', stderr: '' }));
+    expect(complete.outcome).toBe('ok');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('docs land requires publish; after merge deploy precedes cleanup', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-docs-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  const calls: string[] = [];
+  try {
+    const context = { input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { publish: { outcome: 'fail', tag: 'v0.2.4' }, docs: { branch: 'release-docs/0.2.4', worktree: join(root, 'tree') } } };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(() => runDocsLand(() => { throw new Error('called before publish'); })).toThrow('publish must succeed');
+    context.outputs.publish.outcome = 'ok';
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    mkdirSync(join(root, 'tree'));
+    const result = runDocsLand((cmd, args, cwd) => {
+      calls.push(`${cmd} ${args.join(' ')} @ ${cwd ?? '.'}`);
+      if (cmd === 'git' && args[0] === 'cat-file') return { status: 1, stdout: '', stderr: '' };   // 노트가 아직 main 에 없다
+      return { status: 0, stdout: cmd === 'git' && args[0] === 'rev-parse' ? 'a'.repeat(40) : cmd === 'bun' && args.includes('land') ? '✓ find: NONE\n✓ upsert-ready: https://github.com/example/pull/1 (새 PR)\n✓ merge: squash https://github.com/example/pull/1' : '', stderr: '' };
+    });
+    expect(result.outcome).toBe('ok');
+    context.outputs.publish.tag = 'v0.2.5';
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(() => runDocsLand(() => { throw new Error('land called for wrong tag'); })).toThrow('published tag/version mismatch');
+    expect(calls.slice(0, 8).map((s) => s.split(' ')[0])).toEqual(['git', 'git', 'bun', 'git', 'git', 'git', 'bun', 'bun']);
+    expect(calls[0]).toContain('fetch origin main');
+    expect(calls[1]).toContain('cat-file -e origin/main:release/public/docs/releases/0.2.4.md');
+    expect(calls[2]).toContain(`--cwd ${join(root, 'tree')}`);
+    expect(calls[3]).toContain('fetch origin main');
+    expect(calls[5]).toContain(`worktree add --detach`);
+    expect(calls[5]).toContain('a'.repeat(40));
+    expect(calls[6]).toContain('install --frozen-lockfile');
+    expect(calls[7]).toContain('deploy-pages.ts --remote node-b --yes @ ');
+    expect(calls[7]).toContain('/release-docs-deploy-');
+    expect(calls.at(-1)).toContain('worktree remove --force');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('pr land creates a missing docs PR before merging it', async () => {
+  const calls: string[] = [];
+  const lines: string[] = [];
+  const url = 'https://github.com/example/repo/pull/42';
+  const cwd = '/tmp/release-docs-fixture/tree';
+  const run: CmdRunner = (command, args) => {
+    if (command === 'gh' && args[0] === 'pr') {
+      calls.push(`gh ${args.slice(0, 2).join(' ')}`);
+      if (args[1] === 'list') return { ok: true, out: '' };
+      if (args[1] === 'create') {
+        expect(args).toContain('--head');
+        expect(args).toContain('release-docs/0.2.4');
+        expect(args).toContain('--base');
+        expect(args).toContain('main');
+        return { ok: true, out: url };
+      }
+      if (args[1] === 'merge') return { ok: true, out: '' };
+      if (args[1] === 'view') return { ok: false, out: '' };
+    }
+    if (command === 'git' && args.includes('push')) calls.push('git push');
+    return { ok: true, out: command === 'git' && args.includes('rev-list') ? '1' : '' };
+  };
+  const code = await runPrLand({ cwd }, {
+    manager: makePrManager(run), currentBranch: () => 'release-docs/0.2.4', resolveBase: () => 'origin/main',
+    run,
+    listUnfinishedRuns: () => [], listOpenPrs: () => [], isInteractive: () => false,
+    runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true,
+    runModelHardcodeGate: () => true, runPublicLeakGate: () => 0,
+    runTestInterferenceGate: async () => 0, runAndroidGate: () => true, runIosGate: () => true,
+    out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
+  });
+  expect(code).toBe(0);
+  expect(calls).toEqual(['gh pr list', 'git push', 'gh pr list', 'gh pr create', 'gh pr merge', 'gh pr view']);
+  expect(lines.some((line) => line.includes('✓ upsert-ready:') && line.includes('(새 PR)'))).toBe(true);
+  expect(lines.some((line) => line.includes('✓ merge: squash'))).toBe(true);
+});
+
+test('docs land refuses an upsert-only response without merge and never deploys', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-docs-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  const calls: string[] = [];
+  try {
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'approve-publish': { outcome: 'approved' },
+      publish: { outcome: 'ok', tag: 'v0.2.4' }, docs: { branch: 'release-docs/0.2.4', worktree: join(root, 'tree') },
+    } });
+    mkdirSync(join(root, 'tree'));
+    expect(() => runDocsLand((cmd, args) => {
+      calls.push(`${cmd} ${args.join(' ')}`);
+      if (cmd === 'git' && args[0] === 'cat-file') return { status: 1, stdout: '', stderr: '' };
+      return { status: 0, stdout: '✓ upsert-ready: https://github.com/example/pull/1 (새 PR)', stderr: '' };
+    })).toThrow('docs land incomplete');
+    expect(calls.filter((c) => c.startsWith('bun '))).toEqual([`bun bin/elanous.mjs pr land --cwd ${join(root, 'tree')}`]);
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});
+
+test('verify requires deployed docs and a live release notes page', () => {
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    const context = { input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'docs-land': { outcome: 'fail' }, publish: { outcome: 'ok', tag: 'v0.2.4' } } };
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(() => runVerify(() => { throw new Error('called before deploy'); })).toThrow('docs must land');
+    context.outputs['docs-land'].outcome = 'ok';
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(runVerify(() => ({ status: 0, stdout: JSON.stringify({ ok: true, notesPage: 'missing' }), stderr: '' })).outcome).toBe('fail');
+    expect(runVerify(() => ({ status: 0, stdout: JSON.stringify({ ok: true, notesPage: 'ok' }), stderr: '' })).outcome).toBe('ok');
+    context.outputs.publish.tag = 'v0.2.5';
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify(context);
+    expect(() => runVerify(() => { throw new Error('verify called for wrong tag'); })).toThrow('published tag/version mismatch');
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; }
+});
+
+test('publish body resolves flat markdown links through pages slug', () => {
+  const pages = { pages: [{ id: 'using-elanous/tasks-and-intake', source: 'release/public/docs/tasks-and-intake.md' }] };
+  const body = publicNotes('# 0.2.4\n\n[Tasks and intake](tasks-and-intake.md)\n', pages);
+  expect(body).toContain('[Tasks and intake](https://docs.elanous.ai/using-elanous/tasks-and-intake)');
+  expect(body).not.toContain('.md)');
+  expect(body).not.toContain('# 0.2.4');
+});
+
+
+test('publish refuses when approve-publish did not approve, without calling any command', () => {
+  const calls: string[] = [];
+  const previous = process.env.ELANOUS_GRAPH_CONTEXT;
+  try {
+    for (const approval of [undefined, { outcome: 'rejected' }, null]) {
+      const outputs: Record<string, unknown> = Object.fromEntries(['gate', 'prepare', 'upgrade', 'pwa', 'tui', 'docs'].map((node) => [node, { outcome: 'ok' }]));
+      if (approval !== undefined) outputs['approve-publish'] = approval;
+      process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs });
+      const result = runPublish((cmd, args) => { calls.push(`${cmd} ${args.join(' ')}`); return { status: 0, stdout: '', stderr: '' }; });
+      expect(result.outcome).toBe('fail');
+      expect(result.summary).toContain('approve-publish');
+    }
+    expect(calls).toEqual([]);
+  } finally { if (previous === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = previous; }
+});
+
+
+test('docs land retry: notes already on main → skip pr land and resume at deploy', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-docs-'));
+  const prior = process.env.ELANOUS_GRAPH_CONTEXT;
+  const calls: string[] = [];
+  try {
+    process.env.ELANOUS_GRAPH_CONTEXT = JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: {
+      publish: { outcome: 'ok', tag: 'v0.2.4' }, docs: { branch: 'release-docs/0.2.4', worktree: join(root, 'tree') } } });
+    const result = runDocsLand((cmd, args) => {
+      calls.push(`${cmd} ${args.join(' ')}`);
+      return { status: 0, stdout: cmd === 'git' && args[0] === 'rev-parse' ? 'b'.repeat(40) : '', stderr: '' };   // cat-file 0 = 이미 main 에 있다 · 워크트리는 앞 판이 지웠다
+    });
+    expect(result.outcome).toBe('ok');
+    expect(calls.some((c) => c.includes('pr land'))).toBe(false);
+    expect(calls.some((c) => c.includes('deploy-pages.ts --remote node-b --yes'))).toBe(true);
+  } finally { if (prior === undefined) delete process.env.ELANOUS_GRAPH_CONTEXT; else process.env.ELANOUS_GRAPH_CONTEXT = prior; rmSync(root, { recursive: true, force: true }); }
+});

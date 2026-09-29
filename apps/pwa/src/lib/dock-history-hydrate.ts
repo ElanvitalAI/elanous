@@ -126,7 +126,7 @@ export async function fetchDockHistory(
   if (!sessionId || sessionId.length === 0) return null;
   try {
     const data = await client.fetchJson<SessionHistoryResponse>(
-      `/v1/sessions/store/${encodeURIComponent(sessionId)}`,
+      `/v1/sessions/store/${encodeURIComponent(sessionId)}?ifExists=1`,
     );
     if (!data || !Array.isArray(data.messages)) return null;
     const mapped = mapServerHistoryToChat(data.messages);

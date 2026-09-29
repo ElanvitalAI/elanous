@@ -6,6 +6,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { Command } from 'commander';
+import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import {
   DEFAULT_HARNESS_PROCESS_THRESHOLDS,
   HARNESS_PROCESS_LONG_RUNNING_ELAPSED_SECONDS,
@@ -16,6 +17,8 @@ import {
   defaultLookupHarnessProcessLedger,
   formatHarnessProcessElapsed,
   installHarnessCliCommand,
+  githubDraftSweepAdapters,
+  draftSweepRunStatus,
   observeHarnessLaunchdPids,
   parseHarnessProcessPsOutput,
   parseLaunchctlListOutput,
@@ -77,6 +80,7 @@ describe('harness CLI command', () => {
     processObservation?: Parameters<typeof installHarnessCliCommand>[1]['processObservation'],
     mission?: Parameters<typeof installHarnessCliCommand>[1]['mission'],
     missionLoop?: Parameters<typeof installHarnessCliCommand>[1]['missionLoop'],
+    draftSweep?: Parameters<typeof installHarnessCliCommand>[1]['draftSweep'],
   ) {
     const program = new Command().exitOverride();
     const harness = installHarnessCliCommand(program, {
@@ -88,6 +92,7 @@ describe('harness CLI command', () => {
       processObservation,
       mission,
       missionLoop,
+      draftSweep,
     });
     return { program, harness };
   }
@@ -149,6 +154,372 @@ describe('harness CLI command', () => {
     return captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'processes']));
   }
 
+  test('draft sweep is installed by default; dry-run and apply pass repository and actions through the CLI', async () => {
+    const labels: unknown[] = [];
+    const closed: unknown[] = [];
+    const pages: unknown[] = [];
+    const statuses: unknown[] = [];
+    const lines: string[] = [];
+    const draft = { number: 43, title: 'old goal', branch: 'self-impl/old',
+      labels: ['elanous:stalled'], createdAt: '2026-09-01T00:00:00Z' };
+    const adapters = {
+      listDrafts: async (page: number, size: number, repository: string) => {
+        pages.push(['drafts', page, size, repository]);
+        return page === 1 ? [draft] : [];
+      },
+      listMerged: async (page: number, size: number, repository: string) => {
+        pages.push(['merged', page, size, repository]);
+        return [];
+      },
+      getRunStatus: async (...args: unknown[]) => { statuses.push(args); return 'failed'; },
+      listLiveBranches: async () => new Set<string>(),
+      setLabels: async (...args: unknown[]) => { labels.push(args); },
+      closeDraft: async (...args: unknown[]) => { closed.push(args); },
+    };
+    const { program, harness } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, repository: () => 'default/repo', write: (line) => lines.push(line) });
+    const drafts = harness.commands.find((command) => command.name() === 'drafts')!;
+    expect(drafts.commands.find((command) => command.name() === 'sweep')?.options.map((option) => option.long))
+      .toEqual(['--apply', '--json', '--repo']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', '--repo', 'my/repo']);
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ repository: 'my/repo', apply: false, complete: true,
+      entries: [{ number: 43, action: 'close', applied: false }] });
+    expect(pages).toContainEqual(['drafts', 1, 100, 'my/repo']);
+    expect(statuses).toEqual([[draft, 'my/repo']]);
+    expect(closed).toEqual([]);
+    expect(labels).toEqual([]);
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--apply']);
+    expect(statuses).toEqual([[draft, 'my/repo'], [draft, 'default/repo']]);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toEqual(['default/repo', 43, expect.stringContaining('Branch preserved')]);
+    expect(labels).toEqual([]);
+    expect(lines.at(-2)).toContain('#43 close:');
+    expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1 · 처리 중 0 · 표식 만료 0');
+  });
+
+  test('draft sweep reports fresh claims and expired claims in JSON and the human summary', async () => {
+    const lines: string[] = [];
+    const now = Date.now();
+    const draft = (number: number, hours: number) => ({ number, title: 'goal', branch: `self-impl/${number}`,
+      labels: ['elanous:running'], createdAt: new Date(now - 72 * 3_600_000).toISOString(),
+      updatedAt: new Date(now - hours * 3_600_000).toISOString() });
+    const adapters = {
+      listDrafts: async () => [draft(1, 2), draft(2, 7)], listMerged: async () => [],
+      getRunStatus: async () => undefined, listLiveBranches: async () => new Set<string>(),
+      setLabels: async () => {}, closeDraft: async () => {},
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, repository: () => 'my/repo', write: (line) => lines.push(line) });
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ claimed: 1, claimExpired: 1, closed: 1 });
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep']);
+    expect(lines.at(-1)).toBe('못 본 초안 0 · 이번에 닫음 1(dry-run) · 처리 중 1 · 표식 만료 1');
+  });
+
+  test('draft sweep apply transitions stale running label before close and dry-run leaves both untouched', async () => {
+    const labels: unknown[] = [];
+    const closed: unknown[] = [];
+    const lines: string[] = [];
+    const adapters = {
+      listDrafts: async () => [{ number: 44, title: 'pending goal', branch: 'self-impl/old',
+        labels: ['elanous:running'], createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z' }],
+      listMerged: async () => [],
+      getRunStatus: async () => 'failed',
+      listLiveBranches: async () => new Set<string>(),
+      setLabels: async (...args: unknown[]) => { labels.push(args); },
+      closeDraft: async (...args: unknown[]) => { closed.push(args); },
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, repository: () => 'my/repo', write: (line) => lines.push(line) });
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json']);
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ apply: false,
+      entries: [{ statusLabel: 'elanous:stalled', applied: false }] });
+    expect(labels).toEqual([]);
+    expect(closed).toEqual([]);
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', '--apply']);
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ apply: true,
+      entries: [{ statusLabel: 'elanous:stalled', applied: true }] });
+    expect(labels).toEqual([['my/repo', 44, { add: 'elanous:stalled', remove: ['elanous:running'] }]]);
+    expect(closed).toHaveLength(1);
+  });
+
+  test('drafts claim labels a draft, removes other states, records owner/note, and release transitions running to stalled', async () => {
+    const requests: string[][] = [];
+    let labels = [{ name: 'elanous:stalled' }, { name: 'elanous:from-harness' }];
+    const lines: string[] = [];
+    const { program, harness } = install(undefined, undefined, undefined, undefined, undefined, undefined, {
+      repository: () => 'my/repo', write: (line) => lines.push(line), now: () => new Date('2026-09-30T00:00:00Z'),
+      execute: (args) => {
+        requests.push(args);
+        if (args[0] === 'api') return JSON.stringify({ number: 123, state: 'open', draft: true, labels });
+        return '';
+      },
+    });
+    expect(harness.commands.find((command) => command.name() === 'drafts')?.commands.map((command) => command.name()))
+      .toEqual(['claim', 'sweep']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'claim', '123', '--owner', 'T', '--note', '재작업 중']);
+    expect(requests).toEqual([
+      ['api', 'repos/my/repo/pulls/123'],
+      ['pr', 'edit', '123', '--repo', 'my/repo', '--add-label', 'elanous:running', '--remove-label', 'elanous:stalled'],
+      ['pr', 'comment', '123', '--repo', 'my/repo', '--body', '🔧 처리 중 — owner T · 2026-09-30T00:00:00.000Z · 재작업 중'],
+    ]);
+    expect(lines).toEqual(['#123 claim: my/repo']);
+    requests.length = 0;
+    labels = [{ name: 'elanous:running' }];
+    await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'claim', '123', '--release', '--repo', 'my/repo']);
+    expect(requests).toEqual([
+      ['api', 'repos/my/repo/pulls/123'],
+      ['pr', 'edit', '123', '--repo', 'my/repo', '--add-label', 'elanous:stalled', '--remove-label', 'elanous:running'],
+      ['pr', 'comment', '123', '--repo', 'my/repo', '--body', '🔧 처리 끝 — 2026-09-30T00:00:00.000Z'],
+    ]);
+  });
+
+  test('drafts claim release rejects a missing or conflicting running state without gh writes', async () => {
+    const writes: string[][] = [];
+    let labels = [{ name: 'elanous:stalled' }];
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined, {
+      repository: () => 'my/repo', execute: (args) => {
+        if (args[0] !== 'api') writes.push(args);
+        return JSON.stringify({ number: 123, state: 'open', draft: true, labels });
+      },
+    });
+    const previousExit = process.exitCode;
+    try {
+      for (const state of [[{ name: 'elanous:stalled' }],
+        [{ name: 'elanous:running' }, { name: 'elanous:stalled' }]]) {
+        labels = state;
+        process.exitCode = 0;
+        const errors = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'claim', '123', '--release']));
+        expect(errors).toEqual(['❌ --release 는 running 이 유일한 상태인 draft 에만 사용 가능']);
+        expect(writes).toEqual([]);
+        expect(process.exitCode).toBe(1);
+      }
+    } finally { process.exitCode = previousExit; }
+  });
+
+  test('drafts claim refuses idea-approval or ready PR without any gh writes', async () => {
+    const writes: string[][] = [];
+    let labels = [{ name: 'elanous:idea-approval' }];
+    let draft = true;
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined, {
+      repository: () => 'my/repo', execute: (args) => {
+        if (args[0] !== 'api') writes.push(args);
+        return JSON.stringify({ number: 123, state: 'open', draft, labels });
+      },
+    });
+    const previousExit = process.exitCode;
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        process.exitCode = 0;
+        const errors = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'claim', '123', '--owner', 'T']));
+        expect(errors).toEqual(['❌ 열린 draft 이고 idea-approval 이 아닌 PR 만 claim 할 수 있음']);
+        expect(writes).toEqual([]);
+        expect(process.exitCode).toBe(1);
+        labels = [];
+        draft = false;
+      }
+    } finally { process.exitCode = previousExit; }
+  });
+
+  test('drafts claim and release refuse closed or merged drafts without gh writes', async () => {
+    const requests: string[][] = [];
+    let mergedAt: string | null = null;
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined, {
+      repository: () => 'my/repo', execute: (args) => {
+        requests.push(args);
+        return JSON.stringify({ number: 123, state: 'closed', draft: true,
+          merged_at: mergedAt, labels: [{ name: 'elanous:running' }] });
+      },
+    });
+    const previousExit = process.exitCode;
+    try {
+      for (const mergeTime of [null, '2026-09-29T00:00:00Z']) {
+        mergedAt = mergeTime;
+        for (const options of [['--owner', 'T'], ['--release']]) {
+          process.exitCode = 0;
+          const errors = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'claim', '123', ...options]));
+          expect(errors).toEqual(['❌ 열린 draft 이고 idea-approval 이 아닌 PR 만 claim 할 수 있음']);
+          expect(process.exitCode).toBe(1);
+        }
+      }
+      expect(requests).toEqual(Array.from({ length: 4 }, () => ['api', 'repos/my/repo/pulls/123']));
+    } finally { process.exitCode = previousExit; }
+  });
+
+  test('GitHub adapters page the full draft and merged inventory and pass label/close arguments without deleting branches', async () => {
+    const requests: string[][] = [];
+    const pr = (number: number, draft: boolean, merged = false) => ({
+      number, draft, title: `goal ${number}`, head: { ref: `self-impl/${number}` },
+      labels: [{ name: 'elanous:running' }], created_at: '2026-09-01T00:00:00Z',
+      merged_at: merged ? '2026-09-02T00:00:00Z' : null,
+    });
+    const adapters = githubDraftSweepAdapters((args) => {
+      requests.push(args);
+      if (args[0] !== 'api') return '';
+      const endpoint = args[1]!;
+      if (endpoint.includes('state=open')) return JSON.stringify(endpoint.endsWith('&page=1')
+        ? Array.from({ length: 100 }, (_, i) => pr(i + 1, true)) : [pr(101, true), pr(102, false)]);
+      return JSON.stringify(endpoint.endsWith('&page=1')
+        ? Array.from({ length: 100 }, (_, i) => pr(i + 201, false, true)) : [pr(301, false, true), pr(302, false, false)]);
+    });
+    expect((await adapters.listDrafts(1, 100, 'my/repo'))).toHaveLength(100);
+    expect((await adapters.listDrafts(2, 100, 'my/repo')).map((entry) => entry.number)).toEqual([101]);
+    expect((await adapters.listMerged(1, 100, 'my/repo'))).toHaveLength(100);
+    expect((await adapters.listMerged(2, 100, 'my/repo')).map((entry) => entry.number)).toEqual([301]);
+    expect(requests.filter((args) => args[0] === 'api')).toEqual([
+      ['api', 'repos/my/repo/pulls?state=open&per_page=100&page=1'],
+      ['api', 'repos/my/repo/pulls?state=open&per_page=100&page=2'],
+      ['api', 'repos/my/repo/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=1'],
+      ['api', 'repos/my/repo/pulls?state=closed&sort=updated&direction=desc&per_page=100&page=2'],
+    ]);
+    await adapters.setLabels('my/repo', 3, { add: 'elanous:stalled', remove: ['elanous:running'] });
+    await adapters.closeDraft('my/repo', 3, 'Branch preserved.');
+    expect(requests.slice(-2)).toEqual([
+      ['pr', 'edit', '3', '--repo', 'my/repo', '--add-label', 'elanous:stalled', '--remove-label', 'elanous:running'],
+      ['pr', 'close', '3', '--repo', 'my/repo', '--comment', 'Branch preserved.'],
+    ]);
+  });
+
+  test('GitHub sweep adapter reads the latest claim owner for the expired-claim comment', async () => {
+    const requests: string[][] = [];
+    const adapters = githubDraftSweepAdapters((args) => {
+      requests.push(args);
+      return JSON.stringify([
+        [{ body: '🔧 처리 중 — owner S · 2026-09-28T17:00:00.000Z' }],
+        [{ body: '🔧 처리 중 — owner T · 2026-09-29T17:00:00.000Z · 재작업 중' }, { body: 'unrelated' }],
+      ]);
+    });
+    expect(await adapters.getClaimOwner?.('my/repo', 123)).toBe('T');
+    expect(requests).toEqual([['api', '--paginate', '--slurp', 'repos/my/repo/issues/123/comments?per_page=100']]);
+  });
+
+  test('draft sweep reads closed PRs only back to the oldest open draft — a large repository does not exhaust pagination', async () => {
+    const requests: string[] = [];
+    const closedPage = (page: number) => Array.from({ length: 100 }, (_, i) => ({
+      number: 10_000 - page * 100 - i, draft: false, title: `old ${page}-${i}`, head: { ref: `b-${page}-${i}` }, labels: [],
+      created_at: '2026-01-01T00:00:00Z', merged_at: '2026-01-02T00:00:00Z',
+      // page 1 is newer than the oldest draft; page 2 ends before it
+      updated_at: page === 1 ? '2026-09-20T00:00:00Z' : '2026-09-05T00:00:00Z',
+    }));
+    const adapters = githubDraftSweepAdapters((args) => {
+      requests.push(args[1]!);
+      if (args[1]!.includes('state=open')) return JSON.stringify([{ number: 1, draft: true, title: 'd', head: { ref: 'self-impl/d' },
+        labels: [], created_at: '2026-09-10T00:00:00Z', merged_at: null }]);
+      const page = Number(/&page=(\d+)/.exec(args[1]!)![1]);
+      if (page > 2) throw new Error('paged past the oldest draft');
+      return JSON.stringify(closedPage(page));
+    });
+    expect(await adapters.listMerged(1, 100, 'my/repo')).toHaveLength(100);
+    expect(requests.filter((r) => r.includes('state=closed'))).toHaveLength(2);
+
+    const none = githubDraftSweepAdapters((args) => {
+      if (args[1]!.includes('state=closed')) throw new Error('no drafts — closed listing is not needed');
+      return '[]';
+    });
+    expect(await none.listMerged(1, 100, 'my/repo')).toEqual([]);
+  });
+
+  test('draft sweep never treats a different or unverified cwd repository as an absent branch', async () => {
+    const pr = { number: 9, draft: true, title: 'goal', head: { ref: 'self-impl/live' },
+      labels: [{ name: 'elanous:stalled' }], created_at: '2026-09-01T00:00:00Z', merged_at: null };
+    const gitCalls: string[][] = [];
+    const gitCwds: string[] = [];
+    let origin = 'git@github.com:other/repo.git';
+    let worktreeStatus = 0;
+    let worktreeBranch = 'self-impl/unrelated';
+    const adapters = githubDraftSweepAdapters(
+      (args) => args[0] === 'api' && args[1]?.includes('state=open') ? JSON.stringify([pr]) : '[]',
+      (cwd, args) => {
+        gitCwds.push(cwd);
+        gitCalls.push(args);
+        if (args[0] === 'config') return { status: 0, stdout: `${origin}\n`, stderr: '' };
+        return { status: worktreeStatus, stdout: `worktree /tmp/other\nbranch refs/heads/${worktreeBranch}\n`, stderr: '' };
+      },
+    );
+    const closed: number[] = [];
+    const sweep = async (repository: string) => {
+      const { runDraftSweep } = await import('../self-dev/draft-sweep.js');
+      return runDraftSweep({ repository, apply: true, now: new Date('2026-10-01T00:00:00Z'), adapters: {
+        ...adapters,
+        getRunStatus: async () => 'failed',
+        setLabels: async () => {},
+        closeDraft: async (_repository, number) => { closed.push(number); },
+      } });
+    };
+    expect(await adapters.listLiveBranches('my/repo')).toBeUndefined();
+    expect(gitCalls).toEqual([['config', '--get', 'remote.origin.url']]);
+    expect(gitCwds).toEqual([process.cwd()]);
+    expect(await sweep('my/repo')).toMatchObject({ complete: false, entries: [] });
+    expect(closed).toEqual([]);
+
+    origin = 'https://github.com/my/repo.git';
+    worktreeBranch = 'self-impl/live';
+    expect(await adapters.listLiveBranches('my/repo')).toEqual(new Set(['self-impl/live']));
+    expect(await sweep('my/repo')).toMatchObject({ complete: true, entries: [{ number: 9, action: 'keep' }] });
+    expect(closed).toEqual([]);
+
+    worktreeStatus = 1;
+    expect(await adapters.listLiveBranches('my/repo')).toBeUndefined();
+    expect(await sweep('my/repo')).toMatchObject({ complete: false, entries: [] });
+    expect(closed).toEqual([]);
+    origin = 'file:///tmp/unverified';
+    expect(await adapters.listLiveBranches('my/repo')).toBeUndefined();
+  });
+
+  test('run-status attribution requires repository as well as PR number, and leaves unowned ledgers unknown', () => {
+    const ledger = (runId: string, data: Record<string, unknown>, status: string) => ({
+      runId, ledgerDirectory: '/tmp/ledger', ledgerPath: `/tmp/ledger/${runId}.jsonl`, targetName: null,
+      entries: [
+        { runId, event: 'pr-opened', data },
+        { runId, event: 'run-status', data: { runStatus: status } },
+      ],
+    });
+    const foreign = ledger('run-foreign', { number: 43, repository: 'other/repo' }, 'failed');
+    const unowned = ledger('run-unowned', { number: 43 }, 'failed');
+    const owned = ledger('run-owned', { number: 43, url: 'https://github.com/my/repo/pull/43' }, 'completed');
+    const live = new Map([['run-foreign', 'failed'], ['run-owned', 'running']]);
+    expect(draftSweepRunStatus([foreign, unowned], live, 'my/repo', 43)).toBeUndefined();
+    expect(draftSweepRunStatus([foreign, unowned, owned], live, 'my/repo', 43)).toBe('running');
+    expect(draftSweepRunStatus([foreign, unowned, owned], live, 'other/repo', 43)).toBe('failed');
+    expect(draftSweepRunStatus([foreign, unowned, owned], live, 'my/repo', 44)).toBeUndefined();
+    expect(draftSweepRunStatus([ledger('run-disputed', {
+      number: 43, repo: 'my/repo', url: 'https://github.com/other/repo/pull/43',
+    }, 'failed')], live, 'my/repo', 43)).toBeUndefined();
+    expect(draftSweepRunStatus([owned, ledger('run-conflict', { number: 43, repo: 'my/repo' }, 'failed')],
+      live, 'my/repo', 43)).toBeUndefined();
+    expect(draftSweepRunStatus([{
+      ...owned, entries: [...owned.entries, { runId: owned.runId, event: 'pr-opened', data: { number: 43 } }],
+    }], live, 'my/repo', 43)).toBeUndefined();
+  });
+
+  test('draft sweep refuses malformed repository before adapters run and reports incomplete inventory in JSON', async () => {
+    let calls = 0;
+    const lines: string[] = [];
+    const adapters = {
+      listDrafts: async () => { calls++; throw new Error('GitHub listing failed'); },
+      listMerged: async () => [],
+      getRunStatus: async () => undefined,
+      listLiveBranches: async () => new Set<string>(),
+      setLabels: async () => { throw new Error('unexpected label'); },
+      closeDraft: async () => { throw new Error('unexpected close'); },
+    };
+    const { program } = install(undefined, undefined, undefined, undefined, undefined, undefined,
+      { adapters, repository: () => 'default/repo', write: (line) => lines.push(line) });
+    const prior = process.exitCode;
+    try {
+      process.exitCode = 0;
+      const errors = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--apply', '--repo', '../other']));
+      expect(errors).toEqual(['❌ invalid --repo (expected owner/name): ../other']);
+      expect(calls).toBe(0);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'drafts', 'sweep', '--json', '--apply']);
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ repository: 'default/repo', apply: true,
+        complete: false, entries: [], error: expect.stringContaining('GitHub listing failed') });
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = prior; }
+  });
+
   test('ask keeps its default options without graph authority forwarding', async () => {
     const received: unknown[] = [];
     const { program } = install(async (_goalPath, options) => { received.push(options); });
@@ -185,26 +556,41 @@ describe('harness CLI command', () => {
     ]);
   });
 
-  test('ask and say expose and forward --target without exposing it to plan', async () => {
+  test('ask and say expose and forward --target and --yes without exposing them to plan', async () => {
     const received: unknown[] = [];
     const { program, harness } = install(
       async (goalPath, options) => { received.push(['ask', goalPath, options]); },
       async (words, options) => { received.push(['say', words, options]); },
     );
     for (const name of ['ask', 'say'] as const) {
-      expect(harness.commands.find((command) => command.name() === name)!.options.map((option) => option.long)).toContain('--target');
+      expect(harness.commands.find((command) => command.name() === name)!.options.map((option) => option.long)).toEqual(expect.arrayContaining(['--target', '--yes']));
     }
     expect(harness.commands.find((command) => command.name() === 'plan')!.options.map((option) => option.long)).not.toContain('--target');
+    expect(harness.commands.find((command) => command.name() === 'plan')!.options.map((option) => option.long)).not.toContain('--yes');
 
-    await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--target', '/tmp/repo']);
-    await program.parseAsync(['node', 'elanous', 'harness', 'say', 'write', 'goal', '--target', '/tmp/dir']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--target', '/tmp/repo', '--yes']);
+    await program.parseAsync(['node', 'elanous', 'harness', 'say', 'write', 'goal', '--target', '/tmp/dir', '--yes']);
     await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/no-target.md']);
 
     expect(received).toEqual([
-      ['ask', '/tmp/goal.md', { target: '/tmp/repo', supervise: true, supervisorSource: 'default' }],
-      ['say', ['write', 'goal'], { target: '/tmp/dir', supervise: true, supervisorSource: 'default' }],
+      ['ask', '/tmp/goal.md', { target: '/tmp/repo', yes: true, supervise: true, supervisorSource: 'default' }],
+      ['say', ['write', 'goal'], { target: '/tmp/dir', yes: true, supervise: true, supervisorSource: 'default' }],
       ['ask', '/tmp/no-target.md', { supervise: true, supervisorSource: 'default' }],
     ]);
+  });
+
+  test('a refused non-git launch returns exit 2 with one actionable error line', async () => {
+    const prior = process.exitCode;
+    const { program } = install(async () => {
+      throw new DevPipelineError('git 저장소가 필요합니다 — `git init` 하거나 `--yes` 로 다시 · (다음 판: 그림자 저장소 — RFC P19)', 2);
+    });
+    try {
+      const errors = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md']));
+      expect(process.exitCode).toBe(2);
+      expect(errors).toEqual(['❌ git 저장소가 필요합니다 — `git init` 하거나 `--yes` 로 다시 · (다음 판: 그림자 저장소 — RFC P19)']);
+    } finally {
+      process.exitCode = prior;
+    }
   });
 
   test('pod ask/say refuse --target with code 2 before dispatch; target-free ask still dispatches', async () => {
@@ -226,7 +612,7 @@ describe('harness CLI command', () => {
       ] as const) {
         process.exitCode = 0;
         const errors = await captureError(() => program.parseAsync([
-          'node', 'elanous', 'harness', entrance, ...args, '--substrate', 'pod', '--target', target,
+          'node', 'elanous', 'harness', entrance, ...args, '--substrate', 'pod', '--pod-pool', 'pool-test:1', '--target', target,
         ]));
         expect(errors).toEqual([
           '`--target` 은 Pod 경로에서 아직 지원하지 않는다 — 로컬로 돌리거나 `--target` 을 빼라',
@@ -242,9 +628,9 @@ describe('harness CLI command', () => {
           { category: 'harness.pod', event: 'target-refused', data: { target: '/tmp/other' } },
         ]);
       process.exitCode = 0;
-      await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
       expect(dispatch).toHaveBeenCalledTimes(1);
-      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: '/tmp/goal.md' });
+      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: '/tmp/goal.md', podPool: 'pool-test:1' });
       expect(process.exitCode).toBe(0);
     } finally {
       dispatch.mockRestore();
@@ -921,6 +1307,7 @@ describe('harness CLI command', () => {
 
       expect(calls).toEqual([]);
       expect(lines).toEqual([
+        '[harness] substrate=local (default)',
         `[dry-run] 입력: ${goalPath}`,
         '[dry-run] 입구: cli-harness-ask',
         '[dry-run] 시작 예정: 워크트리 · 브랜치 · 자식 · 파이프라인',
@@ -1520,4 +1907,11 @@ describe('harness process classification/report helpers', () => {
     expect(report.parentUnknown).toEqual([]);
     expect(renderHarnessProcessReport(report)).toContain('관찰 대상 없음');
   });
+});
+
+test('draft sweep gh calls pass env: process.env (cron minimal PATH — Bun resolves against the startup PATH otherwise)', () => {
+  const source = require('node:fs').readFileSync(require('node:path').join(import.meta.dir, 'harness-cli-command.ts'), 'utf8') as string;
+  const calls = [...source.matchAll(/execFileSync\('gh',[\s\S]*?\)\s*[;.)]/g)].map((m) => m[0]);
+  expect(calls.length).toBeGreaterThan(0);
+  expect(calls.filter((call) => !call.includes('env: process.env'))).toEqual([]);
 });

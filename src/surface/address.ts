@@ -46,11 +46,9 @@ export type SurfaceAddress =
   | { readonly kind: 'popover';  readonly popoverId: string }
   | { readonly kind: 'inline';   readonly inlineId: string }
   | { readonly kind: 'bg';       readonly bgId: string }
-  // B-13-α (Phase P7-B closure) — addresses a Virtual Window as a whole
-  // (layout container). Window surfaces are registered/unregistered by
-  // `window-surface-adapter` on VW spawn/close; LLM tools
-  // (SaveLayout / LoadLayout / ApplyLayoutPreset · GetUIState /
-  // DescribeSurface / ObserveSurface) accept this address.
+  // Addresses a Virtual Window as a whole (layout container).
+  // The address remains accepted by surface tools, but dashboard wiring
+  // no longer registers Virtual Windows as surfaces.
   //
   // Widget-team ack for shared-union extension: SYNC #245
   // (내부 문서 `SYNC-widget-to-term-b13-surface-address-coord`).

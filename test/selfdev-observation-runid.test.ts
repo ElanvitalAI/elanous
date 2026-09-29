@@ -54,6 +54,8 @@ describe('ratchet — self-implement 관측은 전부 runId 를 싣는다', () =
     // 완전 차단은 AST 가 필요하며, 그 형태를 도입한다면 이 가드를 함께 올릴 것.
     const src = readFileSync(ORCH, 'utf-8');
     expect(scanRawEmits(src)).toEqual([]);
+    expect(src).toMatch(/observe\('prior-findings\.unreadable',\s*\{ error:/);
+    expect(src).toMatch(/observe\('prior-findings\.loaded',\s*\{/);
     for (const event of ['goal-execution-record', 'goal-execution-record-failed', 'goal-run-store-failed']) {
       expect(src).toMatch(new RegExp(`logRunAwareFailSoft\\(\\s*runId\\s*,\\s*['\"]${event}['\"]`));
     }

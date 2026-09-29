@@ -209,6 +209,8 @@ export async function runDaemonPromptTurn(opts: {
             resolveWriteCwd: toolCwdResolver.resolveWriteCwd,
             signal: dispatchCtrl.signal,
             sessionId: request.sessionId,
+            ...(request.source?.kind === 'daemon-api' && request.source.route === '/a2a'
+              ? { requestOrigin: 'external-agent' as const } : {}),
             ...(request.userText ? { userText: request.userText } : {}),
             ...(opts.surface !== undefined || sourceResolution.surface !== 'unknown' ? { surface } : {}),
             ...(opts.surfaceHitlChannels ? { surfaceHitlChannels: opts.surfaceHitlChannels } : {}),

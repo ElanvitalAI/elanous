@@ -1,0 +1,20 @@
+graph_id: job-coach-report
+version: 1
+entry_node: profile
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: profile, kind: agent, recipe: 'cmd:profile', max_visits: 1 }
+  - { node_id: ncs-match, kind: agent, recipe: 'cmd:ncs-match', max_visits: 1 }
+  - { node_id: research, kind: agent, recipe: 'cmd:research', max_visits: 2 }
+  - { node_id: gap, kind: agent, recipe: 'cmd:gap', max_visits: 2 }
+  - { node_id: report, kind: agent, recipe: 'cmd:report', max_visits: 2 }
+  - { node_id: judge, kind: judge, recipe: 'cmd:judge', max_visits: 2 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: profile, on: outcome, map: { ok: ncs-match, fail: failed } }
+  - { from: ncs-match, on: outcome, map: { ok: research, fail: failed } }
+  - { from: research, on: outcome, map: { ok: gap, fail: failed } }
+  - { from: gap, on: outcome, map: { ok: report, fail: failed } }
+  - { from: report, on: outcome, map: { ok: judge, fail: failed } }
+  - { from: judge, on: outcome, map: { ok: done, retry: research, fail: failed } }

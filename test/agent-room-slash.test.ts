@@ -1,10 +1,8 @@
 // H6 P4 · /agent-room slash handler tests.
 //
-// Scope: argument parsing + error paths + list/close against a
-// synthetic registry. Happy-path compose is covered end-to-end in
-// `agent-room-room-builder.test.ts` (stubbed spawn). The slash tests
-// exercise the parser shim around `composeAction` so `/agent-room 3`
-// without real adapters still surfaces a useful error.
+// Scope: argument parsing, unsupported composition, and list/close
+// against a synthetic registry. Room construction cannot spawn without
+// the removed rich TUI; the slash returns that error to callers.
 
 import { describe, test, expect, mock } from 'bun:test';
 import {
@@ -75,6 +73,16 @@ describe('/agent-room help + unknown subcommand', () => {
     expect(text).toMatch(/Lane token grammar/);
     expect(text).toMatch(/role:provider\[:transport\]/);
     expect(text).toMatch(/lll:<model>/);
+  });
+
+  test('valid /agent-room compose reports the removed rich TUI error', async () => {
+    const registry = new AgentRoomRegistry();
+    const r = await executeAgentRoomSlash({
+      name: 'agent-room', args: ['2', 'codex', 'claude'],
+    }, registry);
+    expect(r?.ok).toBe(false);
+    expect(r?.message).toBe('agent rooms need the removed rich TUI (virtual windows)');
+    expect(registry.list()).toEqual([]);
   });
 
   test('/showroom with no args opens the default 2-pane showroom', async () => {

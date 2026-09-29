@@ -33,11 +33,10 @@ import type {
   NewSessionRequest, NewSessionResponse,
   LoadSessionRequest, LoadSessionResponse,
   PromptRequest, PromptResponse,
-  SetSessionModelRequest, SetSessionModelResponse,
+  SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+  SessionConfigOption,
   CancelNotification,
   ContentBlock,
-  ModelInfo,
-  SessionModelState,
 } from '@agentclientprotocol/sdk';
 import { randomBytes } from 'node:crypto';
 import type { NormalizedAttachment } from './content-blocks.js';
@@ -112,6 +111,29 @@ import type { ModelTier } from '../model-tier/types.js';
 import { setSessionTierOverride } from '../model-tier/session-override.js';
 
 export const ACP_SERVER_SELF_PERFORMER = 'elanous:self';
+
+// ACP SDK 1.x removed the session «model» API (`ModelInfo`·`SessionModelState`·`session/set_model`) in favour of
+// session config options — the model list is now a `select` option with category `model` (#21407 bumped the SDK).
+// These local shapes keep the tier catalog projection; `modelConfigOption` turns it into the 1.x wire shape.
+export interface ModelInfo { modelId: string; name: string; description?: string }
+export interface SessionModelState { availableModels: ModelInfo[]; currentModelId: string }
+export const ACP_MODEL_CONFIG_ID = 'model';
+
+/** Session model state as the ACP 1.x `configOptions` entry (a `select` in the `model` category). */
+export function modelConfigOption(state: SessionModelState): SessionConfigOption {
+  return {
+    id: ACP_MODEL_CONFIG_ID,
+    name: 'Model',
+    category: 'model',
+    type: 'select',
+    currentValue: state.currentModelId,
+    options: state.availableModels.map((model) => ({
+      value: model.modelId,
+      name: model.name,
+      ...(model.description ? { _meta: { description: model.description } } : {}),
+    })),
+  };
+}
 
 type AcpSessionModelCatalog = Readonly<Partial<Record<LlmTierProvider, Readonly<Partial<Record<ModelTier, LlmTierSpec>>>>>>;
 
@@ -212,6 +234,13 @@ export interface AcpServerOptions {
   /** ACP standalone entry: require session cwd or an explicit boot default. */
   requireSessionToolCwd?: boolean;
   bootToolCwd?: string;
+  /** Test seam for exercising stdio EOF with controlled byte streams. */
+  stdioInput?: ReadableStream<Uint8Array>;
+  stdioOutput?: WritableStream<Uint8Array>;
+  /** Test seam for a slow session/new handler. */
+  beforeNewSession?: () => Promise<void>;
+  /** Stdio EOF drain deadline; defaults to 30 seconds. */
+  stdioDrainTimeoutMs?: number;
   /** Session MCP path runner. Defaults to the canonical Codex ACP turn runner;
    *  tests inject it to observe the exact per-session child arguments. */
   runCodexTurn?: (opts: Parameters<typeof runAcpTurn>[0]) => Promise<unknown>;
@@ -318,7 +347,7 @@ export interface AcpServerOptions {
    *  already accept an `onConnection` callback. The factory wraps
    *  that call so the server hands in its own handler.
    *
-   *  When omitted, stdio behavior is unchanged. */
+   *  When omitted, stdio is used (with EOF response draining). */
   transportFactory?: (onConnection: AcpConnectionHandler) => Promise<AcpTransportServer>;
   /** U4b — shutdown seam for transport mode. When the server is
    *  running over `transportFactory`, the serve loop waits on this
@@ -1374,6 +1403,7 @@ function wireAcpConnection(
     },
 
     async newSession(req: NewSessionRequest): Promise<NewSessionResponse> {
+      if (opts.beforeNewSession) await opts.beforeNewSession();
       const sessionCwd = typeof req.cwd === 'string' && req.cwd.trim() ? req.cwd : undefined;
       const cwd = opts.requireSessionToolCwd
         ? sessionCwd ?? opts.bootToolCwd
@@ -1414,28 +1444,34 @@ function wireAcpConnection(
       }
       const models = deriveAcpSessionModelState();
       advertisedSessionModels.set(record.id, models);
-      return { sessionId: record.id, models };
+      return { sessionId: record.id, configOptions: [modelConfigOption(models)] };
     },
 
-    async unstable_setSessionModel(req: SetSessionModelRequest): Promise<SetSessionModelResponse> {
+    async setSessionConfigOption(req: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
       const advertisedModels = advertisedSessionModels.get(req.sessionId);
       if (!ownedSessionIds.has(req.sessionId) || !advertisedModels) {
         throw RequestError.invalidParams(undefined, 'unknown or unadvertised session');
       }
-      const selected = advertisedModels.availableModels.find((model) => model.modelId === req.modelId);
-      if (!selected) {
+      if (req.configId !== ACP_MODEL_CONFIG_ID) {
+        throw RequestError.invalidParams(undefined, 'unknown config option');
+      }
+      const modelId = typeof req.value === 'string' ? req.value : undefined;
+      const selected = modelId ? advertisedModels.availableModels.find((model) => model.modelId === modelId) : undefined;
+      if (!modelId || !selected) {
         throw RequestError.invalidParams(undefined, 'unadvertised session model');
       }
-      const [, tier] = req.modelId.split(':', 3);
+      const [, tier] = modelId.split(':', 3);
       if (!tier) {
         throw RequestError.invalidParams(undefined, 'invalid session model');
       }
       setSessionTierOverride(req.sessionId, {
         llm: tier as ModelTier,
-        rationale: `ACP client selected ${selected.name} (${req.modelId})`,
+        rationale: `ACP client selected ${selected.name} (${modelId})`,
       });
-      debug.log('acp.session', 'model-selected', { sessionId: req.sessionId, modelId: req.modelId, tier });
-      return {};
+      const next: SessionModelState = { ...advertisedModels, currentModelId: modelId };
+      advertisedSessionModels.set(req.sessionId, next);
+      debug.log('acp.session', 'model-selected', { sessionId: req.sessionId, modelId, tier });
+      return { configOptions: [modelConfigOption(next)] };
     },
 
     /** M2.3 — adopt an EXISTING session id from a long-lived ledger
@@ -2210,10 +2246,15 @@ function wireAcpConnection(
         }
         const { lookupPreviewTerminal } = await import('../web-terminal/preview-tap-registry.js');
         const pt = lookupPreviewTerminal(p.sessionId, p.terminalId);
-        if (!pt) return { delivered: false, reason: 'unknown_terminal' };
+        if (!pt) {
+          debug.log('webterm.acp', 'resize.miss', { sessionId: p.sessionId, terminalId: p.terminalId, cols: p.cols, rows: p.rows });
+          return { delivered: false, reason: 'unknown_terminal' };
+        }
         try { pt.resize(p.cols, p.rows); } catch (e) {
+          debug.log('webterm.acp', 'resize.error', { terminalId: p.terminalId, reason: String(e) });
           return { delivered: false, reason: String(e) };
         }
+        if (debug.enabled) debug.log('webterm.acp', 'resize.ok', { sessionId: p.sessionId, terminalId: p.terminalId, cols: p.cols, rows: p.rows });
         return { delivered: true, cols: p.cols, rows: p.rows };
       }
       if (method === 'terminal/list') {
@@ -3307,15 +3348,84 @@ function streamFromTransportConnection(
   return ndJsonStream(connection.writable, connection.readable);
 }
 
-/** Build an ndJsonStream wrapping Node's stdio. Exported as a helper
- *  only so tests can substitute a pair of Web streams. */
-async function createStdioStream(): Promise<ReturnType<typeof ndJsonStream>> {
+/** Adapt Node's stdio into Web byte streams for the stdio ACP path. */
+async function createStdioBytes(): Promise<{
+  input: ReadableStream<Uint8Array>;
+  output: WritableStream<Uint8Array>;
+}> {
   const { Readable, Writable } = await import('node:stream');
-  const stdinWeb = (Readable as unknown as { toWeb: (s: unknown) => ReadableStream<Uint8Array> })
+  const input = (Readable as unknown as { toWeb: (s: unknown) => ReadableStream<Uint8Array> })
     .toWeb(process.stdin);
-  const stdoutWeb = (Writable as unknown as { toWeb: (s: unknown) => WritableStream<Uint8Array> })
+  const output = (Writable as unknown as { toWeb: (s: unknown) => WritableStream<Uint8Array> })
     .toWeb(process.stdout);
-  return ndJsonStream(stdoutWeb, stdinWeb);
+  return { input, output };
+}
+
+/** Keep the SDK's input stream open after EOF until responses already received
+ *  have been written. Closing it earlier makes the SDK abort its handlers. */
+function drainStdioResponses(
+  stream: ReturnType<typeof ndJsonStream>,
+  timeoutMs: number,
+): ReturnType<typeof ndJsonStream> {
+  const pending = new Map<string, number>();
+  let releaseDrain: (() => void) | undefined;
+  let inputEnded = false;
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  const input = stream.readable.getReader();
+  const output = stream.writable.getWriter();
+  const readable = new ReadableStream<NonNullable<Awaited<ReturnType<typeof input.read>>['value']>>({
+    async pull(controller) {
+      const { done, value } = inputEnded
+        ? { done: true as const, value: undefined }
+        : await input.read();
+      if (!done) {
+        if (value && !Array.isArray(value) && 'method' in value && 'id' in value) {
+          const key = JSON.stringify(value.id);
+          pending.set(key, (pending.get(key) ?? 0) + 1);
+        }
+        controller.enqueue(value!);
+        return;
+      }
+      if (!inputEnded) {
+        inputEnded = true;
+        if (pending.size > 0) {
+          drainTimer = setTimeout(() => {
+            drainTimer = undefined;
+            releaseDrain?.();
+          }, timeoutMs);
+        }
+      }
+      while (pending.size > 0 && drainTimer) {
+        await new Promise<void>((resolve) => { releaseDrain = resolve; });
+        releaseDrain = undefined;
+      }
+      if (drainTimer) clearTimeout(drainTimer);
+      drainTimer = undefined;
+      controller.close();
+    },
+    async cancel(reason) {
+      if (drainTimer) clearTimeout(drainTimer);
+      drainTimer = undefined;
+      await input.cancel(reason);
+    },
+  });
+  const writable = new WritableStream<Parameters<typeof output.write>[0]>({
+    async write(message) {
+      await output.write(message);
+      if (message && !Array.isArray(message) && !('method' in message) && 'id' in message) {
+        const key = JSON.stringify(message.id);
+        const count = pending.get(key);
+        if (count !== undefined) {
+          if (count === 1) pending.delete(key);
+          else pending.set(key, count - 1);
+          if (pending.size === 0) releaseDrain?.();
+        }
+      }
+    },
+    async close() { await output.close(); },
+    async abort(reason) { await output.abort(reason); },
+  });
+  return { readable, writable };
 }
 
 /** Construct the server state + register method handlers. Returns a
@@ -3493,11 +3603,21 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
     return;
   }
 
-  // Stdio path — single connection, runs until stdin closes.
-  const stream = await createStdioStream();
+  // Stdio path — EOF stops intake, but already received replies drain first.
+  const bytes = opts.stdioInput && opts.stdioOutput
+    ? { input: opts.stdioInput, output: opts.stdioOutput }
+    : await createStdioBytes();
+  const stream = drainStdioResponses(
+    ndJsonStream(bytes.output, bytes.input),
+    opts.stdioDrainTimeoutMs ?? 30_000,
+  );
   const conn = wireAcpConnection(stream, ctx);
   try {
     await conn.closed;
+    // The SDK closes its message stream on EOF but does not close the
+    // underlying byte sink. Flush and end stdout only after the replies.
+    const writer = bytes.output.getWriter();
+    try { await writer.close(); } finally { writer.releaseLock(); }
   } finally {
     acpServerDisposeSessions(sessions, dualRole);
     activeAcpBroadcaster = null;

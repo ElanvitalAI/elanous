@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import { runMcpReload } from './mcp-reload.js';
 
 const recorder = () => {
@@ -26,9 +27,16 @@ let isolatedDir: string | undefined;
 beforeEach(() => {
   isolatedDir = mkdtempSync(join(tmpdir(), 'mcp-reload-iso-'));
   setElanousConfigDir(isolatedDir);
+  setResolveDaemonEndpointForTest(() => ({
+    baseUrl: 'http://127.0.0.1:31420',
+    healthUrl: 'http://127.0.0.1:31420/v1/health',
+    pwaUrl: 'http://127.0.0.1:31420/',
+    source: 'registry',
+  }));
 });
 
 afterEach(() => {
+  setResolveDaemonEndpointForTest(null);
   resetElanousConfigDir();
   if (isolatedDir) {
     rmSync(isolatedDir, { recursive: true, force: true });
@@ -37,6 +45,74 @@ afterEach(() => {
 });
 
 describe('elanous mcp reload', () => {
+  test('현재 우주의 데몬 주소로 실제 HTTP 재장전 요청을 보낸다', async () => {
+    const requests: Array<{ path: string; method: string }> = [];
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch(req) {
+        requests.push({ path: new URL(req.url).pathname, method: req.method });
+        return Response.json({ reloaded: true, registered: 1, perServer: { krea: { status: 'ready', toolCount: 1 } } });
+      },
+    });
+    const baseUrl = `http://127.0.0.1:${server.port}`;
+    try {
+      setResolveDaemonEndpointForTest(() => ({
+        baseUrl,
+        healthUrl: `${baseUrl}/v1/health`,
+        pwaUrl: `${baseUrl}/`,
+        source: 'registry',
+      }));
+      const r = recorder();
+      const res = await runMcpReload({ out: r.out });
+      expect(requests).toEqual([{ path: '/v1/nexus/admin/mcp-reload', method: 'POST' }]);
+      expect(res).toEqual({ exitCode: 0, registered: 1 });
+      expect(r.lines[0]).toBe('✓ MCP 재장전 완료 — 서버 1개 · 도구 1개 등록');
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('해석기가 null 이면 요청 없이 nexus show 안내와 exit 1 을 낸다', async () => {
+    const requests: string[] = [];
+    const server = Bun.serve({
+      hostname: '127.0.0.1',
+      port: 0,
+      fetch(req) {
+        requests.push(new URL(req.url).pathname);
+        return Response.json({ reloaded: true, registered: 0, perServer: {} });
+      },
+    });
+    try {
+      setResolveDaemonEndpointForTest(() => null);
+      const r = recorder();
+      const res = await runMcpReload({
+        out: r.out,
+        fetchFn: (async (_url: string | URL | Request, init?: RequestInit) => fetch(`http://127.0.0.1:${server.port}/v1/nexus/admin/mcp-reload`, init)) as typeof fetch,
+      });
+      expect(requests).toEqual([]);
+      expect(res.exitCode).toBe(1);
+      expect(r.errs).toHaveLength(1);
+      expect(r.errs[0]).toContain('elanous nexus show');
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('--nexus-url 이 주어지면 해석기가 null 이어도 명시 주소를 먼저 쓴다', async () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const r = recorder();
+    const res = await runMcpReload({
+      nexusBaseUrl: 'http://127.0.0.1:31420',
+      out: r.out,
+      fetchFn: (async (url: string | URL | Request) => {
+        expect(String(url)).toBe('http://127.0.0.1:31420/v1/nexus/admin/mcp-reload');
+        return jsonRes({ reloaded: true, registered: 0, perServer: {} });
+      }) as unknown as typeof fetch,
+    });
+    expect(res.exitCode).toBe(0);
+  });
+
   test('데몬 admin 경로로 POST 한다', async () => {
     const seen: { url?: string; method?: string } = {};
     const r = recorder();
@@ -48,7 +124,7 @@ describe('elanous mcp reload', () => {
         return jsonRes({ reloaded: true, registered: 1, perServer: { krea: { status: 'ready', toolCount: 1 } } });
       }) as unknown as typeof fetch,
     });
-    expect(seen.url).toBe('http://127.0.0.1:31415/v1/nexus/admin/mcp-reload');
+    expect(seen.url).toBe('http://127.0.0.1:31420/v1/nexus/admin/mcp-reload');
     expect(seen.method).toBe('POST');
   });
 
@@ -72,6 +148,42 @@ describe('elanous mcp reload', () => {
     const screen = r.lines.join('\n');
     expect(screen).toContain('krea');
     expect(screen).toContain('oauth token missing');
+  });
+
+  test('실패가 하나라도 있으면 첫 줄이 끊긴 서버와 분류를 말한다', async () => {
+    const r = recorder();
+    await runMcpReload({
+      out: r.out,
+      fetchFn: (async () => jsonRes({
+        reloaded: true,
+        registered: 2,
+        perServer: {
+          higgsfield: { status: 'failed', toolCount: 0, reason: 'authentication required', reasonClass: 'auth-required' },
+          krea: { status: 'ready', toolCount: 1 },
+          bridge: { status: 'ready', toolCount: 1 },
+        },
+      })) as unknown as typeof fetch,
+    });
+    const first = r.lines[0] ?? '';
+    expect(first.startsWith('⚠ 끊긴 서버 1개')).toBe(true);
+    expect(first).toContain('higgsfield');
+    expect(first).toContain('auth-required');
+  });
+
+  test('전부 붙었으면 첫 줄은 완료 문면 그대로다', async () => {
+    const r = recorder();
+    await runMcpReload({
+      out: r.out,
+      fetchFn: (async () => jsonRes({
+        reloaded: true,
+        registered: 2,
+        perServer: {
+          krea: { status: 'ready', toolCount: 1 },
+          bridge: { status: 'ready', toolCount: 1 },
+        },
+      })) as unknown as typeof fetch,
+    });
+    expect(r.lines[0]).toBe('✓ MCP 재장전 완료 — 서버 2개 · 도구 2개 등록');
   });
 
   test('전부 ready 면 exit 0', async () => {

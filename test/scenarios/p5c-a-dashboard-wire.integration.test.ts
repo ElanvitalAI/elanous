@@ -28,10 +28,6 @@ import {
   dispatchToolByName,
   _resetToolRuntimeRegistryForTest,
 } from '../../src/tool-runtime/registry.js';
-import { createAddressBook } from '../../src/virtual-windows/addressing.js';
-import { DisplayCoordinator } from '../../src/display/coordinator.js';
-import { createPaneContent } from '../../src/virtual-windows/pane-content.js';
-import { WindowRegistry } from '../../src/virtual-windows/window-registry.js';
 
 const SCENARIOS_DIR = join(__dirname, '..', '..', 'scenarios');
 const CTX = { surface: 'dashboard' as const };
@@ -65,16 +61,7 @@ function createWidgetHostStub(): {
 function wireDashboardBoot(
   catalog: ScenarioCatalog | undefined,
   host: ReturnType<typeof createWidgetHostStub>,
-): { rootPaneId: string } {
-  const registry = new WindowRegistry({
-    addressBook: createAddressBook(),
-    coordinator: new DisplayCoordinator({ frameMs: 0 }),
-    defaultBounds: () => ({ row: 1, col: 1, width: 80, height: 24 }),
-  });
-  const targetWindow = registry.spawn({
-    title: 'target',
-    initialContent: { kind: 'markdown', text: 'seed' },
-  });
+): void {
   let dashboardModals = [{ id: 'dashboard-pane-modal', widgetInstanceId: 'old-modal-widget', position: 'center' as const }];
   let pluginLayout = createLayout(
     [{ height: 'flex', cells: [{ widgetInstanceId: null, width: 'flex' }] }],
@@ -85,8 +72,6 @@ function wireDashboardBoot(
     onMount: (widgets: readonly DeclarativeWidgetNode[], target) => {
       if (target) {
         return mountScenarioIntoTarget(widgets, target, {
-          registry,
-          createPaneContent,
           spawnWidget: (spec) => {
             const id = spec.id ?? `target-mounted:${host.calls.length + 1}`;
             host.spawn({ type: spec.type, ...(spec.config ? { config: spec.config } : {}), id });
@@ -114,7 +99,6 @@ function wireDashboardBoot(
       return { mounted: true };
     },
   });
-  return { rootPaneId: targetWindow.focused };
 }
 
 beforeEach(() => {
@@ -176,37 +160,31 @@ describe('P5c-a · dashboard wire', () => {
     expect(spawnedTypes).toEqual(['list', 'log']);
   });
 
-  test('RunScenario with target window mounts pane-mappable widgets into the VW path', async () => {
+  test('RunScenario refuses window and pane targets without mounting widgets', async () => {
     const catalog = await loadScenarioCatalog(SCENARIOS_DIR);
     const host = createWidgetHostStub();
     wireDashboardBoot(catalog, host);
 
-    const res = await dispatchToolByName(
-      'ui_run_scenario',
-      { id: 'dashboard-default', target: { kind: 'window', windowId: 1 } },
-      CTX,
-    );
-    const payload = JSON.parse((res as { output: string }).output);
-    expect(payload.ok).toBe(true);
-    expect(payload.mounted).toBe(true);
-    expect(payload.target).toEqual({ kind: 'window', windowId: 1 });
-    expect(host.calls).toHaveLength(0);
-  });
-
-  test('RunScenario with target pane mounts pane-mappable widgets into the addressed pane', async () => {
-    const catalog = await loadScenarioCatalog(SCENARIOS_DIR);
-    const host = createWidgetHostStub();
-    const { rootPaneId } = wireDashboardBoot(catalog, host);
-
-    const res = await dispatchToolByName(
-      'ui_run_scenario',
-      { id: 'heap-graph', target: { kind: 'pane', ref: { windowId: '1', paneId: rootPaneId } } },
-      CTX,
-    );
-    const payload = JSON.parse((res as { output: string }).output);
-    expect(payload.ok).toBe(true);
-    expect(payload.mounted).toBe(true);
-    expect(payload.target).toEqual({ kind: 'pane', ref: { windowId: '1', paneId: rootPaneId } });
+    for (const target of [
+      { kind: 'window', windowId: 1 },
+      { kind: 'pane', ref: { windowId: '1', paneId: 'pane-1' } },
+    ]) {
+      const res = await dispatchToolByName('ui_run_scenario', { id: 'dashboard-default', target }, CTX);
+      const payload = JSON.parse((res as { output: string }).output);
+      expect(payload.ok).toBe(false);
+      expect(payload.mounted).toBe(false);
+      expect(payload.target).toEqual(target);
+      expect(payload.error).toBe(`RunScenario: target kind "${target.kind}" is not a scenario mount destination`);
+    }
+    for (const target of [
+      { kind: 'window', windowId: '1' },
+      { kind: 'pane', ref: { windowId: 1, paneId: 'pane-1' } },
+    ]) {
+      const res = await dispatchToolByName('ui_run_scenario', { id: 'dashboard-default', target }, CTX);
+      const payload = JSON.parse((res as { output: string }).output);
+      expect(payload.ok).toBe(false);
+      expect(payload.error).toBe('RunScenario: malformed `target` SurfaceAddress');
+    }
     expect(host.calls).toHaveLength(0);
   });
 

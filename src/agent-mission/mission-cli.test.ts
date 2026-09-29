@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'bun:test';
 import { runAgentMissionCliCommand, type MissionCliOpts, type MissionCliDeps } from './mission-cli.js';
 import type { AgentBackend, AgentMissionResult } from './driver.js';
-import type { DevPipelineSpec, DevPipelineDeps, ResolvedDevPlan } from '../self-dev/dev-pipeline.js';
+import { planDevPipeline, toAgentMissionSpec, type DevPipelineSpec, type DevPipelineDeps, type ResolvedDevPlan } from '../self-dev/dev-pipeline.js';
 
 const BACKEND: AgentBackend = { name: 'codex', cmd: 'codex', args: ['--yolo'] };
 const RESULT: AgentMissionResult = { ok: true, worktree: '/wt', branch: 'b', rounds: 2, evidencePath: '/e', committed: true, usedOmniCrawl: false, detail: 'ok' };
@@ -117,7 +117,65 @@ describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => 
   });
 });
 
+describe('explicit mission chain', () => {
+  it('passes the sequence into the same driver spec after reroute', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['Build then review'], baseOpts({ chain: 'codex,claude,elanous' }), {
+      resolveBackend: () => BACKEND, runDevPipeline: cap.fn,
+    });
+    expect(out.ok).toBe(true);
+    expect(cap.last().spec!.mission!.chain).toEqual(['codex', 'claude', 'elanous']);
+    const plan = planDevPipeline(cap.last().spec!);
+    expect(toAgentMissionSpec('Build then review', plan, () => BACKEND).chain).toEqual(['codex', 'claude', 'elanous']);
+  });
+  it('accepts the optional codex repair return and rejects a mismatched explicit backend', async () => {
+    const cap = captureRun();
+    expect((await runAgentMissionCliCommand(['M'], baseOpts({ chain: 'codex,claude,codex,elanous' }), { resolveBackend: () => BACKEND, runDevPipeline: cap.fn })).ok).toBe(true);
+    expect(cap.last().spec!.mission!.chain).toEqual(['codex', 'claude', 'codex', 'elanous']);
+    expect((await runAgentMissionCliCommand(['M'], baseOpts({ chain: 'codex,claude,elanous', backend: 'claude' }), { resolveBackend: () => BACKEND })).ok).toBe(false);
+  });
+  it('rejects --no-commit with a PR chain', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ chain: 'codex,claude,elanous', commit: false }), { resolveBackend: () => BACKEND, runDevPipeline: cap.fn });
+    expect(out.ok).toBe(false);
+    expect(cap.last().spec).toBeUndefined();
+  });
+  it.each(['codex', 'claude,elanous', 'codex,elanous', 'codex,claude,claude,elanous', 'codex,elanous,claude', 'codex,gemini', 'elanous,codex', 'codex,,claude'])('rejects invalid chain %s', async (chain) => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ chain }), { resolveBackend: () => BACKEND, runDevPipeline: cap.fn });
+    expect(out.ok).toBe(false);
+    expect(cap.last().spec).toBeUndefined();
+  });
+});
+
 describe('runAgentMissionCliCommand — 에러경로', () => {
+  it.each(['codex', 'gemini', 'grok', 'aside'])('--headless rejects %s before pipeline execution', async (name) => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: name, headless: true }), {
+      resolveBackend: () => ({ ...BACKEND, name: name as AgentBackend['name'] }), runDevPipeline: cap.fn,
+    });
+    expect(out).toEqual({ ok: false, message: '--headless 는 --backend claude 전용입니다', exitCode: 1 });
+    expect(cap.last().spec).toBeUndefined();
+  });
+
+  it('--headless with Claude reaches the mission execution spec', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: 'claude', headless: true }), {
+      resolveBackend: () => ({ ...BACKEND, name: 'claude' }), runDevPipeline: cap.fn,
+    });
+    expect(out.ok).toBe(true);
+    expect(cap.last().spec!.mission!.headless).toBe(true);
+    expect(cap.last().spec!.executor).toEqual({ kind: 'external', backend: 'claude' });
+    const plan = planDevPipeline(cap.last().spec!);
+    expect(toAgentMissionSpec('M', plan, () => ({ ...BACKEND, name: 'claude' })).headless).toBe(true);
+  });
+
+  it.each(['codex', 'gemini', 'grok', 'aside'])('pipeline also rejects --headless on %s', (name) => {
+    expect(() => planDevPipeline({ input: { text: 'M' }, executor: { kind: 'external', backend: name as AgentBackend['name'] },
+      branch: 'b', mission: { headless: true },
+    })).toThrow('--headless');
+  });
+
   it('bad backend → exit 1(재라우팅 전)', async () => {
     const out = await runAgentMissionCliCommand(['M'], baseOpts({ backend: 'bogus' }), {
       resolveBackend: () => { throw new Error("알 수 없는 agent backend 'bogus'"); },

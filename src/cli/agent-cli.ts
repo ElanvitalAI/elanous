@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { getUserConfig, reloadUserConfig } from '../user-config.js';
 import { needsOnboarding, runOnboarding } from '../onboarding.js';
 import { runTurn, ensureCliSession, sessionBudget } from '../session/chat.js';
+import { NoLlmProviderAvailableError, noProviderAvailableMessage } from '../llm.js';
 import { resolveSessionId, getActiveSessionId, setActiveSessionId } from '../session/index.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
 import { encodeDetachedProgressFrame } from '../harness/dispatch-detached.js';
@@ -514,32 +515,41 @@ export async function runChatTurnCli(opts: {
       if (note) agentSystemPrompt = agentSystemPrompt ? `${agentSystemPrompt}\n\n${note}` : note;
     }
   }
-  const result = await (opts.runTurn ?? runTurn)({
-    userConfig: opts.cfg,
-    sessionId: session.id,
-    userText: opts.userText,
-    systemPrompt: agentSystemPrompt,
-    onDelta: (d) => {
-      if (opts.json) { replyChunks.push(d); segmentChunks.push(d); }
-      else process.stdout.write(d);
-    },
-    tools: cliToolSpecs,
-    dispatchTool,
-    ...(opts.goalLoop ? { goalLoop: true } : {}),
-    onToolCall: (call) => {
-      // 도구 호출 뒤의 본문은 «새» 어시스턴트 메시지다 — 직전 조각을 마감한다(finalReply 용).
-      if (opts.json) closeSegment();
-      if (!opts.json) {
-        process.stdout.write(`\n  ⏺ ${call.name}(${truncateArgsForLog(call.args)})\n`);
-      }
-    },
-    onToolResult: (call) => {
-      if (!opts.json) {
-        const preview = truncateResultForLog(call.result);
-        process.stdout.write(`     ↳ ${preview}\n`);
-      }
-    },
-  });
+  let result: Awaited<ReturnType<typeof runTurn>>;
+  try {
+    result = await (opts.runTurn ?? runTurn)({
+      userConfig: opts.cfg,
+      sessionId: session.id,
+      userText: opts.userText,
+      systemPrompt: agentSystemPrompt,
+      onDelta: (d) => {
+        if (opts.json) { replyChunks.push(d); segmentChunks.push(d); }
+        else process.stdout.write(d);
+      },
+      tools: cliToolSpecs,
+      dispatchTool,
+      ...(opts.goalLoop ? { goalLoop: true } : {}),
+      onToolCall: (call) => {
+        // 도구 호출 뒤의 본문은 «새» 어시스턴트 메시지다 — 직전 조각을 마감한다(finalReply 용).
+        if (opts.json) closeSegment();
+        if (!opts.json) {
+          process.stdout.write(`\n  ⏺ ${call.name}(${truncateArgsForLog(call.args)})\n`);
+        }
+      },
+      onToolResult: (call) => {
+        if (!opts.json) {
+          const preview = truncateResultForLog(call.result);
+          process.stdout.write(`     ↳ ${preview}\n`);
+        }
+      },
+    });
+  } catch (err) {
+    if (err instanceof NoLlmProviderAvailableError) {
+      console.error(noProviderAvailableMessage());
+      process.exit(2);
+    }
+    throw err;
+  }
   if (opts.json) {
     let logPath: string | null = null;
     try {

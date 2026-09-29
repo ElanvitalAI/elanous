@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LogStore, LogStoreRow } from '../mss/logging/log-store.js';
@@ -110,6 +110,14 @@ test('keeps missing ledger directories distinct from unreadable ledger observati
   const indeterminatePresent = queryWithDirectoryObservation({ missingLedgerDirectoryCount: 0, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 1 });
 
   expect(missingOnly.lingeringLaunchParents).toEqual({ observation: 'observed', count: 1, withoutPidCount: 0, uncountedCount: 0, reusedPidCount: 0 });
+  expect(missingOnly.completeness).toBe('complete');
+  expect(missingOnly.count).toBe(0);
+  expect(unreadablePresent.completeness).toBe('partial');
+  expect(unreadablePresent.count).toMatchObject({ count: null, lowerBound: 0 });
+  expect(renderRunningRuns(unreadablePresent)).toContain('running runs: unknown (at least 0)');
+  expect(renderRunningRuns(unreadablePresent)).not.toContain('running runs: 0 confirmed:');
+  expect(indeterminatePresent.completeness).toBe('partial');
+  expect(indeterminatePresent.count).toMatchObject({ count: null, lowerBound: 0 });
   expect(unreadablePresent.lingeringLaunchParents).toEqual({ observation: 'indeterminate' });
   expect(indeterminatePresent.lingeringLaunchParents).toEqual({ observation: 'indeterminate' });
   expect(assessLingeringLaunchParents(terminated, () => ({ runId: 'run-terminated', pid: 42, createdAt: 2_000 }) as never, () => false, () => null)).toEqual({ observation: 'indeterminate' });
@@ -165,6 +173,7 @@ test('uses unreadable ledger files, not absent candidate directories, for PTY-on
   };
   const missingDirectoryResult = assessRunningRuns([], pty, { unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 3, missingLedgerDirectoryCount: 3, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0 });
   const unreadableLedgerResult = assessRunningRuns([], pty, { unreadableLedgerCount: 1, unreadableLedgerDirectoryCount: 3, missingLedgerDirectoryCount: 3, unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0 });
+  const unreadableDirectoryResult = assessRunningRuns([], pty, { unreadableLedgerCount: 0, unreadableLedgerDirectoryCount: 1, missingLedgerDirectoryCount: 0, unreadableLedgerDirectoryAccessCount: 1, indeterminateLedgerDirectoryCount: 0 });
 
   expect(missingDirectoryResult.entries).toEqual([expect.objectContaining({
     runId: 'run-ledger-unreadable', status: 'unknown', reason: 'pty-without-unfinished-ledger',
@@ -178,6 +187,38 @@ test('uses unreadable ledger files, not absent candidate directories, for PTY-on
     runId: 'run-ledger-unreadable', status: 'unknown', reason: 'ledger-query-unreadable-pty-observed',
   })]);
   expect(unreadableLedgerResult.counts).toEqual({ running: 0, 'probable-running': 0, 'ended-unclosed': 0, unknown: 1 });
+  expect(unreadableLedgerResult.count).toMatchObject({ count: null, lowerBound: 0 });
+  expect(unreadableDirectoryResult.count).toMatchObject({ count: null, lowerBound: 0 });
+  expect(unreadableDirectoryResult.entries).toEqual([expect.objectContaining({ runId: 'run-ledger-unreadable', status: 'unknown', reason: 'ledger-query-unreadable-pty-observed' })]);
+});
+
+test('render derives partial observation from unreadable ledgers even without completeness or count', () => {
+  const observed = assessRunningRuns([ledger('run-live', 'live')], { refs: [], unreadable: [] }, {
+    unreadableLedgerCount: 1, unreadableLedgerDirectoryCount: 0, missingLedgerDirectoryCount: 0,
+    unreadableLedgerDirectoryAccessCount: 0, indeterminateLedgerDirectoryCount: 0,
+  });
+  const { completeness: _completeness, count: _count, ...withoutOptionalFields } = observed;
+  const rendered = renderRunningRuns(withoutOptionalFields);
+  expect(rendered).toContain('running runs: unknown (at least 1)');
+  expect(rendered).toContain('quantity scope: running=unknown lowerBound=1');
+  expect(rendered).not.toContain('running runs: 1 confirmed:');
+});
+
+test('render treats a null count as unknown even when completeness is omitted and ledger counters are zero', () => {
+  const observed = assessRunningRuns([ledger('run-live', 'live')], { refs: [], unreadable: [] });
+  const result = { ...observed, count: { count: null, lowerBound: 1, unreadable: [] } };
+  const rendered = renderRunningRuns(result);
+  expect(rendered).toContain('running runs: unknown (at least 1)');
+  expect(rendered).toContain('total assessments: unknown (at least 1)');
+  expect(rendered).toContain('quantity scope: running=unknown lowerBound=1');
+  expect(rendered).not.toContain('running runs: 1 confirmed:');
+});
+
+test('render accepts a valid partial result without an optional count', () => {
+  const observed = assessRunningRuns([ledger('run-live', 'live')], { refs: [], unreadable: [] });
+  const result = { ...observed, completeness: 'partial' as const, unreadable: [{ dir: '/denied', reason: 'unreadable-directory' as const }] };
+  expect(renderRunningRuns(result)).toContain('running runs: unknown (at least 1) unreadable: /denied:unreadable-directory');
+  expect(renderRunningRuns(result)).toContain('quantity scope: running=unknown lowerBound=1');
 });
 
 test('passes includeTest consistently to the injected ledger and PTY target readers', () => {
@@ -222,6 +263,50 @@ test('passes includeTest consistently to the injected ledger and PTY target read
   expect(renderRunningRuns(withTest)).toContain('observation scope: isolated test universes included');
   expect(renderRunningRuns(withoutTest).split('\n').slice(-5).join('\n')).toContain('quantity scope: running=0 population=assessed runs whose status is in countedStatuses; total=1 entries=1 population=all assessed runs; isolated test universes excluded');
   expect(renderRunningRuns(withoutTest).split('\n').slice(-5).join('\n')).toContain('quantity limit: runs still in the post-launch authoring window and not yet recorded in the run ledger are not counted');
+});
+
+test('a chmod-unreadable federated ledger gives a partial count with the observed live run as lower bound', () => {
+  const root = mkdtempSync(join(tmpdir(), 'running-runs-partial-'));
+  const readable = join(root, 'readable', 'run-ledger');
+  const inaccessible = join(root, 'inaccessible', 'run-ledger');
+  const runId = 'run-00000000-0000-4000-8000-00000000f014';
+  mkdirSync(readable, { recursive: true });
+  mkdirSync(inaccessible, { recursive: true });
+  writeFileSync(join(readable, `${runId}.jsonl`), JSON.stringify({ timestamp: new Date().toISOString(), runId, event: 'start', data: {} }) + '\n');
+  const deps = {
+    ledgerDirectories: () => [readable, inaccessible],
+    ptyTargets: () => [],
+    listPtyRefs: () => ({ refs: [{ instance: 'fixture', id: 'pty-live', kind: 'shell' as const, alive: true, runId }], unreadable: [] }),
+    readRunPhases: () => ({ events: [], targetCount: 0, unreadableTargets: [] }),
+  };
+  const originalLog = debug.log;
+  const partialLogs: unknown[] = [];
+  try {
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category === 'self-implement.running-runs' && event === 'partial') partialLogs.push(data);
+    }) as typeof debug.log;
+    chmodSync(inaccessible, 0o000);
+    const partial = queryRunningRuns({}, deps);
+    expect(partial.completeness).toBe('partial');
+    expect(partial.count).toEqual({ count: null, lowerBound: 1, unreadable: [{ dir: inaccessible, reason: 'unreadable-directory' }] });
+    expect(partial.unreadable).toEqual([{ dir: inaccessible, reason: 'unreadable-directory' }]);
+    expect(partial.ledger.unreadableLedgerDirectoryAccessCount).toBe(1);
+    expect(partialLogs).toEqual([{ checked: 2, unreadable: [{ dir: inaccessible, reason: 'unreadable-directory' }] }]);
+    expect(renderRunningRuns(partial)).toContain('running runs: unknown (at least 1)');
+    expect(renderRunningRuns(partial)).toContain('quantity scope: running=unknown lowerBound=1');
+    chmodSync(inaccessible, 0o700);
+    const complete = queryRunningRuns({}, deps);
+    expect(complete.completeness).toBe('complete');
+    expect(complete.count).toBe(1);
+    expect(complete.unreadable).toEqual([]);
+    expect(complete.ledger.unreadableLedgerDirectoryAccessCount).toBe(0);
+    expect(partialLogs).toHaveLength(1);
+    expect(renderRunningRuns(complete)).toContain('running runs: 1 confirmed: 1 probable: 0');
+  } finally {
+    (debug as { log: typeof debug.log }).log = originalLog;
+    chmodSync(inaccessible, 0o700);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('query reaches terminal evidence through the federated post-terminal activity ledger path', () => {

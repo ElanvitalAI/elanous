@@ -1,6 +1,9 @@
 // P.4 — `elanous nexus pwa share enable|disable|status` CLI unit coverage.
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { setResolveDaemonEndpointForTest } from '../src/nexus/daemon-endpoint.js';
+
+afterEach(() => setResolveDaemonEndpointForTest(null));
 
 import {
   pwaShareEnable,
@@ -151,13 +154,32 @@ describe('P.4 · pwaShareEnable', () => {
     expect(state.errors.some((e) => e.includes('Switch saved') && e.includes('next `pwa start`'))).toBe(true);
   });
 
-  test('omitted port reports the 31415 fallback as default, while an injected port remains explicit', async () => {
+  test('omitted port serves on current daemon endpoint; explicit port overrides it', async () => {
     const { deps } = mkDeps();
-    const defaultResult = await pwaShareEnable({ ...deps, port: undefined });
-    expect(defaultResult.report).toMatchObject({ port: 31415, portSource: 'default' });
+    const served: number[] = [];
+    let purpose: string | undefined;
+    setResolveDaemonEndpointForTest((opts) => {
+      purpose = opts.purpose;
+      return { baseUrl: 'http://127.0.0.1:31420', healthUrl: 'http://127.0.0.1:31420/v1/health', pwaUrl: 'http://127.0.0.1:31420/app/', source: 'registry' };
+    });
+    const defaultResult = await pwaShareEnable({ ...deps, port: undefined, serveFn: async (_binary, port) => { served.push(port); return { exitCode: 0 }; } });
+    expect(purpose).toBeUndefined(); // default is write, never watch production
+    expect(defaultResult.report).toMatchObject({ port: 31420, portSource: 'endpoint' });
+    expect(defaultResult.report?.urls.tailnet).toBe('https://mbp.tail-abc.ts.net:31420/app/');
 
-    const explicitResult = await pwaShareEnable({ ...deps, port: 31416 });
+    const explicitResult = await pwaShareEnable({ ...deps, port: 31416, serveFn: async (_binary, port) => { served.push(port); return { exitCode: 0 }; } });
     expect(explicitResult.report).toMatchObject({ port: 31416, portSource: 'explicit' });
+    expect(served).toEqual([31420, 31416]);
+  });
+
+  test('no endpoint without port fails closed before serve or switch persistence', async () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const { deps, state } = mkDeps();
+    const result = await pwaShareEnable({ ...deps, port: undefined });
+    expect(result.exitCode).toBe(1);
+    expect(state.serveCalls).toBe(0);
+    expect(state.saveCalls).toEqual([]);
+    expect(state.errors).toEqual(['elanous nexus pwa share enable: 데몬 주소를 모른다 — `elanous nexus run` 먼저.']);
   });
 });
 
@@ -179,25 +201,77 @@ describe('P.4 · pwaShareDisable', () => {
     expect(result.exitCode).toBe(0);
     expect(state.resetCalls).toBe(0);
     expect(state.saveCalls).toEqual(['disabled']);
+    // Tailscale 이 없으면 공유가 있을 수 없다 → 해제 확인.
+    expect(result.report?.mountStatus).toBe('unmounted');
   });
 
-  test('reset exit !=0 → warn + still flip switch (idempotent)', async () => {
-    const { deps, state } = mkDeps({ switchValue: 'enabled', resetExitCode: 1 });
+  test('Tailscale installed but daemon down → unmount unconfirmed → exit 1', async () => {
+    const { deps, state } = mkDeps({ switchValue: 'enabled', probe: { installed: true, alive: false } });
     const result = await pwaShareDisable(deps);
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode).toBe(1);
+    expect(state.saveCalls).toEqual(['disabled']);
+    expect(state.errors.some((e) => e.includes('unmount is unconfirmed'))).toBe(true);
+  });
+
+  test('reset exit !=0 and mount still unknown → warn + flip switch + exit 1', async () => {
+    const { deps, state } = mkDeps({ switchValue: 'enabled', resetExitCode: 1 });
+    const result = await pwaShareDisable({ ...deps, mountStatusFn: async () => 'unknown' });
+    expect(result.exitCode).toBe(1);
     expect(state.saveCalls).toEqual(['disabled']);
     // P1 unification (2026-05-10): per-port unmount replaces global
     // `serve reset` — warn message now reads "unmount exit N".
     expect(state.errors.some((e) => e.includes('unmount exit 1'))).toBe(true);
+    expect(result.report?.mountStatus).toBe('unknown');
+    expect(state.logs.some((l) => l.includes('local-only'))).toBe(false);
+    expect(state.errors.some((e) => e.includes('existing share may still be active'))).toBe(true);
   });
 
-  test('omitted port reports the 31415 fallback as default, while an injected port remains explicit', async () => {
-    const { deps } = mkDeps({ switchValue: 'enabled' });
-    const defaultResult = await pwaShareDisable({ ...deps, port: undefined });
-    expect(defaultResult.report).toMatchObject({ port: 31415, portSource: 'default' });
+  test('reset exit !=0 but mount re-check says unmounted → exit 0 (was never on)', async () => {
+    const { deps } = mkDeps({ switchValue: 'enabled', resetExitCode: 1 });
+    const result = await pwaShareDisable({ ...deps, mountStatusFn: async () => 'unmounted' });
+    expect(result.exitCode).toBe(0);
+    expect(result.report?.mountStatus).toBe('unmounted');
+  });
 
-    const explicitResult = await pwaShareDisable({ ...deps, port: 31416 });
-    expect(explicitResult.report).toMatchObject({ port: 31416, portSource: 'explicit' });
+  test('reset exit !=0 and mount still mounted → exit 1', async () => {
+    const { deps } = mkDeps({ switchValue: 'enabled', resetExitCode: 1 });
+    const result = await pwaShareDisable({ ...deps, mountStatusFn: async () => 'mounted' });
+    expect(result.exitCode).toBe(1);
+  });
+
+  test('omitted port unmounts current endpoint, or skips unmount when unknown', async () => {
+    const { deps, state } = mkDeps({ switchValue: 'enabled' });
+    const unmounted: number[] = [];
+    setResolveDaemonEndpointForTest(() => ({ baseUrl: 'http://127.0.0.1:31420', healthUrl: 'http://127.0.0.1:31420/v1/health', pwaUrl: 'http://127.0.0.1:31420/app/', source: 'registry' }));
+    const result = await pwaShareDisable({ ...deps, port: undefined, resetFn: async (_binary, port) => { unmounted.push(port); return { exitCode: 0 }; } });
+    expect(result.report).toMatchObject({ port: 31420, portSource: 'endpoint' });
+    expect(unmounted).toEqual([31420]);
+    const explicit = await pwaShareDisable({ ...deps, port: 31416, resetFn: async (_binary, port) => { unmounted.push(port); return { exitCode: 0 }; } });
+    expect(explicit.report).toMatchObject({ port: 31416, portSource: 'explicit' });
+    expect(unmounted).toEqual([31420, 31416]);
+    setResolveDaemonEndpointForTest(() => null);
+    const unknown = await pwaShareDisable({ ...deps, port: undefined, resetFn: async (_binary, port) => { unmounted.push(port); return { exitCode: 0 }; } });
+    expect(unknown.exitCode).toBe(1);
+    expect(unknown.report).toMatchObject({ portSource: 'unknown', mountStatus: 'unknown', switchValue: 'disabled' });
+    expect(unmounted).toEqual([31420, 31416]);
+    expect(state.saveCalls).toEqual(['disabled', 'disabled', 'disabled']);
+    expect(state.errors).toHaveLength(1);
+    expect(state.errors[0]).toContain('unmount is unconfirmed');
+  });
+
+  test('unknown port persists disabled intent even with a possibly live mount, but does not claim unmount', async () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const { deps, state } = mkDeps({ switchValue: 'enabled', mountStatus: 'mounted' });
+    const result = await pwaShareDisable({ ...deps, port: undefined });
+    expect(result).toMatchObject({ exitCode: 1, report: { switchValue: 'disabled', mountStatus: 'unknown', portSource: 'unknown' } });
+    expect(result.report?.port).toBeUndefined();
+    expect(state.switchValue).toBe('disabled');
+    expect(state.resetCalls).toBe(0);
+    expect(state.saveCalls).toEqual(['disabled']);
+    expect(state.logs).toEqual([]);
+    expect(state.errors).toHaveLength(1);
+    expect(state.errors[0]).toContain('unmount is unconfirmed');
+    expect(state.errors[0]).toContain('existing share may still be active');
   });
 });
 

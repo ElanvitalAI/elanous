@@ -1,5 +1,10 @@
 // 셸 relay 라운드트립(P1) — autoDrive 게이트·auto 답·escalate·fail-soft 검증.
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, beforeAll, afterAll, spyOn } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { debug } from '../debug/log.js';
+import { resetLiveDetailCacheForTesting, writeLiveDetail } from '../live/detail-switch.js';
 import { decideRelayMode, relayShellPrompt, selectionBytes, type ShellInjector, type RelayShellPromptInput } from './shell-relay.js';
 import type { SurfaceUx } from '../agent/surface-ux/types.js';
 import type { AskUserQuestionResult } from '../ask-user-question/types.js';
@@ -153,6 +158,139 @@ describe('relayShellPrompt — escalate question(N-way 메뉴)', () => {
     const out = await relayShellPrompt(base({ autoDrive: 'off', ux, options: ['A', 'B'] }));
     expect(out.answer).toBe(null);
     expect(out.reason).toBe('cancelled');
+  });
+});
+
+describe('relayShellPrompt — escalate decision observations', () => {
+  const previousStateDir = process.env.ELANOUS_STATE_DIR;
+  const previousRunId = process.env.ELANOUS_RUN_ID;
+  const stateRoot = mkdtempSync(join(tmpdir(), 'shell-relay-decision-'));
+  beforeAll(() => {
+    process.env.ELANOUS_STATE_DIR = stateRoot;
+    process.env.ELANOUS_RUN_ID = 'run-shell-relay';
+    writeLiveDetail({ scope: 'all', ttlMin: 30 });
+    resetLiveDetailCacheForTesting();
+  });
+  afterAll(() => {
+    if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previousStateDir;
+    if (previousRunId === undefined) delete process.env.ELANOUS_RUN_ID;
+    else process.env.ELANOUS_RUN_ID = previousRunId;
+    resetLiveDetailCacheForTesting();
+    rmSync(stateRoot, { recursive: true, force: true });
+  });
+
+  test('question emits immediately after the original log even when no answer is available', async () => {
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      events.push({ category, event, data: data ?? {} });
+    }) as never);
+    try {
+      const out = await relayShellPrompt(base({ autoDrive: 'off', ux: fakeUx({ interactive: false }), options: ['A', 'B'] }));
+      expect(out).toMatchObject({ mode: 'escalate', answer: null, injected: false, reason: 'non-interactive-menu-fail-closed' });
+      const index = events.findIndex(({ category, event }) => category === 'harness.relay' && event === 'escalate-question');
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(events[index]?.data).toEqual({ shellId: 's1', answer: null, interactive: false });
+      expect(events[index + 1]).toMatchObject({ category: 'harness.decision', event: 'decision', data: { kind: 'ESCALATE', runId: 'run-shell-relay', reason: 'question · 비대화형 · 응답 없음' } });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('confirm emits immediately after the unchanged log and preserves injection', async () => {
+    resetLiveDetailCacheForTesting();
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      events.push({ category, event, data: data ?? {} });
+    }) as never);
+    try {
+      const { inject, sent } = captureInject();
+      const out = await relayShellPrompt(base({ autoDrive: 'off', ux: fakeUx({ confirmAnswer: false }), inject }));
+      expect(out).toMatchObject({ mode: 'escalate', answer: 'n', injected: true });
+      expect(sent).toEqual(['n\n']);
+      const index = events.findIndex(({ category, event }) => category === 'harness.relay' && event === 'escalate-confirm');
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(events[index]?.data).toEqual({ shellId: 's1', ok: false, answer: 'n', interactive: true });
+      expect(events[index + 1]).toMatchObject({ category: 'harness.decision', event: 'decision', data: { kind: 'ESCALATE', runId: 'run-shell-relay', reason: 'confirm · 대화형 · 응답 수신' } });
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('non-interactive confirm records no operator response separately from the safe decline selection', async () => {
+    resetLiveDetailCacheForTesting();
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      events.push({ category, event, data: data ?? {} });
+    }) as never);
+    try {
+      const { inject, sent } = captureInject();
+      const out = await relayShellPrompt(base({ autoDrive: 'off', ux: fakeUx({ interactive: false, confirmAnswer: false }), noBytes: 'decline', inject }));
+      expect(out).toMatchObject({ mode: 'escalate', answer: 'decline', injected: true, reason: 'non-interactive-fail-closed-decline' });
+      expect(sent).toEqual(['decline\n']);
+      const index = events.findIndex(({ category, event }) => category === 'harness.relay' && event === 'escalate-confirm');
+      expect(index).toBeGreaterThanOrEqual(0);
+      expect(events[index]?.data).toEqual({ shellId: 's1', ok: false, answer: 'decline', interactive: false });
+      expect(events[index + 1]).toMatchObject({ category: 'harness.decision', event: 'decision', data: {
+        kind: 'ESCALATE', runId: 'run-shell-relay', reason: 'confirm · 비대화형 · 응답 없음 · 안전 거절 선택',
+      } });
+      expect(JSON.stringify(events[index + 1]?.data)).not.toContain('decline');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('escalation decision never records raw prompt or answer in either branch', async () => {
+    resetLiveDetailCacheForTesting();
+    const secret = 'token-EXAMPLE-secret-value';
+    const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
+      events.push({ category, event, data: data ?? {} });
+    }) as never);
+    try {
+      const prompt = `Enter password ${secret}`;
+      const question = await relayShellPrompt(base({ autoDrive: 'off', prompt, ux: fakeUx({ questionAnswer: { answers: { shell_relay: secret } } }), options: [secret] }));
+      resetLiveDetailCacheForTesting();
+      const confirm = await relayShellPrompt(base({ autoDrive: 'off', prompt, ux: fakeUx({ confirmAnswer: true }), yesBytes: secret }));
+      expect(question.answer).toBe(secret);
+      expect(confirm.answer).toBe(secret);
+      const decisions = events.filter(({ category, event }) => category === 'harness.decision' && event === 'decision').map(({ data }) => data);
+      expect(decisions).toHaveLength(2);
+      for (const decision of decisions) {
+        expect(decision).toMatchObject({ kind: 'ESCALATE', runId: 'run-shell-relay', what: '셸 응답 요청' });
+        expect(JSON.stringify(decision)).not.toContain(secret);
+        expect(JSON.stringify(decision)).not.toContain(prompt);
+      }
+      expect(decisions[0]?.reason).toBe('question · 대화형 · 응답 수신');
+      expect(decisions[1]?.reason).toBe('confirm · 대화형 · 응답 수신');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('emission failure preserves question and confirm outcomes and original logs', async () => {
+    resetLiveDetailCacheForTesting();
+    const events: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string) => {
+      events.push(`${category}:${event}`);
+      if (category === 'harness.decision') throw new Error('decision sink unavailable');
+    }) as never);
+    try {
+      const question = await relayShellPrompt(base({ autoDrive: 'off', ux: fakeUx({ interactive: false }), options: ['A', 'B'] }));
+      expect(question).toMatchObject({ answer: null, injected: false, reason: 'non-interactive-menu-fail-closed' });
+      const { inject, sent } = captureInject();
+      resetLiveDetailCacheForTesting();
+      const confirm = await relayShellPrompt(base({ autoDrive: 'off', ux: fakeUx({ confirmAnswer: true }), inject }));
+      expect(confirm).toMatchObject({ answer: 'y', injected: true });
+      expect(sent).toEqual(['y\n']);
+      for (const event of ['escalate-question', 'escalate-confirm']) {
+        const index = events.indexOf(`harness.relay:${event}`);
+        expect(index).toBeGreaterThanOrEqual(0);
+        expect(events[index + 1]).toBe('harness.decision:decision');
+      }
+    } finally {
+      log.mockRestore();
+    }
   });
 });
 

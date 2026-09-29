@@ -34,7 +34,7 @@ import { execFile } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { probeTailscale, type TailscaleProbe } from '../nexus/onboarding/tailscale-probe.js';
+import { probeTailscale, tailscaleExecEnv, type TailscaleProbe } from '../nexus/onboarding/tailscale-probe.js';
 
 export type TailscaleServeMode =
   | { kind: 'https-443' }
@@ -214,9 +214,10 @@ function buildDefaultServeCmd(useSudo: boolean): (
   args: readonly string[],
 ) => Promise<{ exitCode: number; stdout: string; stderr: string }> {
   return (binary, args) => new Promise((resolve) => {
+    // sudo 는 환경을 지우므로 `env TAILSCALE_BE_CLI=1` 로 넘긴다(tailscaleExecEnv 설명 참조).
     const cmd = useSudo ? 'sudo' : binary;
-    const argv = useSudo ? ['-n', binary, ...args] : [...args];
-    execFile(cmd, argv, { timeout: 15000 }, (err, stdout, stderr) => {
+    const argv = useSudo ? ['-n', 'env', 'TAILSCALE_BE_CLI=1', binary, ...args] : [...args];
+    execFile(cmd, argv, { timeout: 15000, env: tailscaleExecEnv() }, (err, stdout, stderr) => {
       if (!err) {
         resolve({ exitCode: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') });
         return;

@@ -3,6 +3,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Command } from 'commander';
 import { formatDoctorReport, runDoctor, type DoctorOptions, type DoctorReport } from './doctor-cli.js';
+import { applyClaudePluginSetup, planClaudePluginSetup } from './claude-plugin-setup.js';
+import { debug } from '../debug/log.js';
 import { getUserConfig, saveUserConfig, type UserConfig } from '../user-config.js';
 
 const ELANOUS_LOGIN_COMMAND = 'elanous login openai-codex';
@@ -23,7 +25,9 @@ export interface SetupCliDeps extends DoctorOptions {
   homeDir?: () => string;
   getUserConfig?: () => UserConfig;
   saveUserConfig?: (config: UserConfig) => void;
-	  prompt?: (message: string) => Promise<string | undefined>;
+  planClaudePluginSetup?: typeof planClaudePluginSetup;
+  applyClaudePluginSetup?: typeof applyClaudePluginSetup;
+  prompt?: (message: string) => Promise<string | undefined>;
   isStdinTty?: () => boolean;
   out?: { log: (value: string) => void; error?: (value: string) => void };
   setExitCode?: (code: number) => void;
@@ -104,6 +108,12 @@ function missingRequiredCommands(doctor: DoctorReport): boolean {
   return doctor.externalCommands.some((command) => command.status === 'missing' && command.tier === 'required');
 }
 
+function displayCommand(command: string[]): string {
+  return command.map((arg) => /^[A-Za-z0-9_@%+=:,./-]+$/.test(arg)
+    ? arg
+    : `'${arg.replace(/'/g, "'\\''")}'`).join(' ');
+}
+
 export function formatSetupReport(doctor: DoctorReport, steps: SetupStep[], nonInteractive: boolean): string {
   const elanousLogin = steps[0]!.complete;
   const provider = steps[1]!.complete;
@@ -141,7 +151,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
     try { return await rl.question(message); } finally { rl.close(); }
   });
 
-  program.command('setup')
+  const setup = program.command('setup')
     .description('Check OpenAI Codex setup and guide each missing credential step')
     .option('--non-interactive', 'Report setup state without prompts or writes')
     .action(async (opts: { nonInteractive?: boolean }) => {
@@ -170,5 +180,57 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       }
       out.log(formatSetupReport(doctor, steps, false));
       setExitCode(0);
+    });
+
+  setup.command('claude-code')
+    .description('Plan or install the elanous Claude Code plugin')
+    .option('--apply', 'Install missing steps and verify the MCP connection')
+    .option('--source <URL|경로|owner/repo>', 'Claude plugin marketplace source')
+    .option('--json', 'Print the plan or result as one JSON line')
+    .action(async (opts: { apply?: boolean; source?: string; json?: boolean }) => {
+      let ready: boolean | undefined;
+      let needed: number | undefined;
+      let executed: number | undefined;
+      let mcpVerified: boolean | undefined;
+      try {
+        const plan = await (deps.planClaudePluginSetup ?? planClaudePluginSetup)({ source: opts.source });
+        ready = plan.ready;
+        needed = plan.steps.filter((step) => step.needed).length;
+        debug.log('setup.claude-code', 'planned', { ready, needed, executed, mcpVerified });
+        if (opts.apply) {
+          const result = await (deps.applyClaudePluginSetup ?? applyClaudePluginSetup)(plan);
+          executed = result.executed.length;
+          mcpVerified = result.mcpVerified;
+          ready = result.verification.ready;
+          if (opts.json) out.log(JSON.stringify(result));
+          else {
+            for (const command of result.executed) out.log(`✓ 실행: ${displayCommand(command)}`);
+            out.log(`MCP 확인: ${mcpVerified ? '✓ 완료' : '✗ 실패'}`);
+          }
+          debug.log('setup.claude-code', result.ok ? 'applied' : 'failed', { ready, needed, executed, mcpVerified });
+          setExitCode(result.ok ? 0 : 1);
+          return;
+        }
+        if (opts.json) out.log(JSON.stringify(plan));
+        else {
+          for (const binary of [
+            { available: plan.claudeCode, name: 'claude', reason: 'Claude Code is not installed' },
+            { available: plan.node, name: 'node', reason: 'node is not on PATH' },
+            { available: plan.elanous, name: 'elanous', reason: 'elanous is not on PATH' },
+          ]) {
+            out.log(binary.available ? `✓ 완료: ${binary.name}` : `✗ 막힘: ${binary.reason}`);
+          }
+          for (const step of plan.steps) {
+            out.log(step.needed ? `→ 할 일: ${displayCommand(step.command)}` : `✓ 완료: ${displayCommand(step.command)}`);
+          }
+          out.log(plan.ready ? '준비됨' : '--apply 로 실행');
+        }
+        setExitCode(0);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        debug.log('setup.claude-code', 'failed', { ready, needed, executed, mcpVerified });
+        (out.error ?? out.log)(message.replace(/\r?\n/g, ' '));
+        setExitCode(1);
+      }
     });
 }

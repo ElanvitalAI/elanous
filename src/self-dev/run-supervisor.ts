@@ -91,6 +91,15 @@ export interface SupervisorLimits {
 const DEFAULT_MAX_ROUNDS = 3;
 const DEFAULT_STALL_ROUNDS = 2;
 
+export function parentUnlandedProgressLine(feature: string, parentPrNumber?: number, parentNoPr = false): string {
+  const detail = parentNoPr
+    ? '앞 조각 커밋 main 미착지'
+    : parentPrNumber === undefined
+      ? '앞 조각 PR 번호 미확인 · main 착지 미확인'
+      : `앞 조각 PR #${parentPrNumber} 미병합`;
+  return `[supervisor] ⏸ 조각 ${feature} 대기 — ${detail}`;
+}
+
 export function countLanded(results: readonly SelfDevJobResult[]): number {
   return results.filter(hasDelivered).length;
 }
@@ -205,6 +214,16 @@ export function decideNextRun(input: {
     needsHuman: t.needsHuman,
     classifications: t.classifications,
   };
+
+  const unlandedParents = results.filter((result) => result.blockReason === 'parent-unlanded');
+  if (unlandedParents.length > 0) {
+    return {
+      ...base,
+      action: 'stop',
+      stopReason: 'needs-human',
+      why: unlandedParents.map((result) => parentUnlandedProgressLine(result.feature.split('\n')[0]!, result.parentPrNumber, result.parentNoPr === true)).join(' · '),
+    };
+  }
 
   if (deliverableMergeCompleteness === 'complete') {
     return {

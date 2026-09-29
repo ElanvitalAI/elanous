@@ -13,6 +13,7 @@
 // describes. Full Puppeteer feature parity is explicitly out of
 // scope.
 
+import { CHROME_NO_KEYCHAIN_FLAGS } from './chrome-flags.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -382,6 +383,7 @@ export async function createCdpClient(
     `--user-data-dir=${profileDir}`,
     '--no-first-run',
     '--no-default-browser-check',
+    ...CHROME_NO_KEYCHAIN_FLAGS,
     '--disable-gpu-vsync',
     // Security: lock the remote-debugging endpoint to loopback only.
     '--remote-debugging-address=127.0.0.1',

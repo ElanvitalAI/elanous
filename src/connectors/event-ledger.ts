@@ -17,6 +17,12 @@ export class EventLedger {
     return this.rows().some(row => row.provider === provider && row.ref === ref && row.occurredAt === occurredAt);
   }
 
+  seenOutgoingChange(provider: string, ref: string, occurredAt: string, now = Date.now()): boolean {
+    const age = now - Date.parse(occurredAt);
+    if (!Number.isFinite(age) || age < 0 || age > 24 * 60 * 60 * 1000) return false;
+    return this.rows().some(row => row.provider === provider && row.eventId.startsWith('outgoing:') && row.ref === ref && row.occurredAt === occurredAt);
+  }
+
   private rows(): Array<{ provider: string; eventId: string; ref?: string; occurredAt?: string }> {
     try {
       return readFileSync(this.path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line));

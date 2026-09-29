@@ -291,16 +291,17 @@ function harnessTools(deps: ReadinessDeps): ReadinessItem {
   const remedies = remediesFor(deps.distro ?? 'unknown');
   const commands = [
     rgOnPath === false ? remedies?.rg : undefined,
-    nodeMissing ? remedies?.node : undefined,
-    // node 를 깔 줄이 없으면 codex(npm) 줄도 내지 않는다 — 🩸 2026-09-25 amazonlinux:2: `sudo: npm: command not found`.
-    codexOnPath === false && nodeOnPath != null && (!nodeMissing || remedies?.node) ? remedies?.codex : undefined,
+    nodeMissing && deps.distro !== 'debian' ? remedies?.node : undefined,
+    // On Debian, Node installation is an instruction, not a shell command: npm cannot run until Node is installed.
+    codexOnPath === false && nodeOnPath != null && (!nodeMissing || (deps.distro !== 'debian' && remedies?.node)) ? remedies?.codex : undefined,
   ].filter((command): command is string => command !== undefined);
+  const nodeInstruction = nodeMissing && deps.distro === 'debian' ? remedies?.node : undefined;
   const nodeEvidence = nodeMissing ? ' (node missing)' : codexOnPath === false && nodeOnPath == null ? ' (node not measured)' : '';
   // 계열에 설치 줄이 없는 도구는 «추측하지 않고» 이름을 댄다(예: Amazon Linux 2 의 rg·node).
   const noLine = [rgOnPath === false && !remedies?.rg ? 'rg' : '', nodeMissing && !remedies?.node ? 'node' : ''].filter(Boolean);
   const manualNote = noLine.length ? ` — no install line for this distro: install ${noLine.join(', ')} manually` : '';
   const unmeasured = rgOnPath == null || codexOnPath == null ? ' (other harness tool not measured)' : '';
-  return item('harness-tools', 'manual', `${missing.length ? `${missing.join(' and ')} missing from harness tools` : 'codex requires node'}${nodeEvidence}${unmeasured}${manualNote}`, commands.join(' && ') || undefined);
+  return item('harness-tools', 'manual', `${missing.length ? `${missing.join(' and ')} missing from harness tools` : 'codex requires node'}${nodeEvidence}${unmeasured}${manualNote}${nodeInstruction && commands.length ? ` — ${nodeInstruction}` : ''}`, commands.join(' && ') || nodeInstruction);
 }
 
 function normalizeDir(value: string): string {
@@ -384,7 +385,9 @@ function serviceVersion(deps: ReadinessDeps): ReadinessItem {
     return item('service-version', 'unknown', 'health was not measured');
   }
   if (deps.health === null) {
-    return item('service-version', 'unknown', 'health did not respond; not measured');
+    return deps.serviceFile === null
+      ? item('service-version', 'ok', 'no service installed; nothing to compare')
+      : item('service-version', 'unknown', 'health did not respond; not measured');
   }
   const daemonSha = typeof deps.health.daemonSha === 'string' ? deps.health.daemonSha.trim() : '';
   const revision = (deps.codeRevision ?? '').trim();

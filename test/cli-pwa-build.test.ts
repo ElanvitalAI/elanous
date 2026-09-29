@@ -5,7 +5,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
-import { resolvePwaCwd, runPwaBuild } from '../src/cli/pwa-build.js';
+import { checkPwaBuildDeps, resolvePwaCwd, runPwaBuild } from '../src/cli/pwa-build.js';
 
 function mkRepoLike(): { argvBin: string; pwaDir: string; cleanup: () => void } {
   const root = mkdtempSync(joinPath(tmpdir(), 'elanous-pwa-build-'));
@@ -56,6 +56,35 @@ describe('P.2 · resolvePwaCwd', () => {
 
   test('argvBin 빈 문자열 → undefined', () => {
     expect(resolvePwaCwd('')).toBeUndefined();
+  });
+});
+
+describe('PWA type package precheck', () => {
+  test.each([
+    { field: 'types', declaration: 'dist/main.d.ts' },
+    { field: 'typings', declaration: 'lib/main.d.ts' },
+    { field: undefined, declaration: 'index.d.ts' },
+  ])('rejects package.json-only @types dependency, then accepts $field declaration', async ({ field, declaration }) => {
+    const { pwaDir, cleanup } = mkRepoLike();
+    try {
+      writeFileSync(joinPath(pwaDir, 'package.json'), JSON.stringify({ devDependencies: { '@types/d3-force': '^3.0.10' } }));
+      const typeDir = joinPath(pwaDir, 'node_modules/@types/d3-force');
+      mkdirSync(typeDir, { recursive: true });
+      writeFileSync(joinPath(typeDir, 'package.json'), JSON.stringify({ name: '@types/d3-force', ...(field ? { [field]: declaration } : {}) }));
+      expect(checkPwaBuildDeps(pwaDir)).toEqual({ ok: false, missing: ['@types/d3-force'] });
+      const sink = silentSink();
+      let spawned = false;
+      const result = await runPwaBuild({ cwd: pwaDir, out: sink, spawnFn: async () => { spawned = true; return 0; } });
+      expect(result.exitCode).toBe(1);
+      expect(spawned).toBe(false);
+      expect(sink.errors).toEqual([
+        `✗ elanous nexus build: missing or incomplete node_modules in ${pwaDir}: @types/d3-force`,
+        `  fix:  cd "${pwaDir}" && bun install --force`,
+      ]);
+      mkdirSync(joinPath(typeDir, declaration, '..'), { recursive: true });
+      writeFileSync(joinPath(typeDir, declaration), 'export {};');
+      expect(checkPwaBuildDeps(pwaDir)).toEqual({ ok: true, missing: [] });
+    } finally { cleanup(); }
   });
 });
 

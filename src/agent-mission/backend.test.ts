@@ -106,12 +106,13 @@ describe('resolveBackendSpawn — 선택→PTY spawn 파라미터 실행경로(U
     // claude: API 키 + 대체 인증 토큰 + 프로바이더 스위치(Bedrock/Vertex)
     const claudeEnv = resolveBackendSpawn(claudeBackend, {
       ...base, ANTHROPIC_API_KEY: 'sk', ANTHROPIC_AUTH_TOKEN: 'tok',
-      CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_USE_VERTEX: '1',
+      CLAUDE_CODE_USE_BEDROCK: '1', CLAUDE_CODE_USE_VERTEX: '1', CLAUDE_CODE_OAUTH_TOKEN: 'parent',
     }).env;
     expect(claudeEnv.ANTHROPIC_API_KEY).toBeUndefined();
     expect(claudeEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
     expect(claudeEnv.CLAUDE_CODE_USE_BEDROCK).toBeUndefined();
     expect(claudeEnv.CLAUDE_CODE_USE_VERTEX).toBeUndefined();
+    expect(claudeEnv.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined(); // 부모 Claude Code 세션 토큰은 자식에 안 간다
     expect(claudeEnv.FOO).toBe('keep');
 
     // gemini: API 키 + Vertex/ADC 트리거

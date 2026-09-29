@@ -1,7 +1,6 @@
+import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
 import { RemotesStore } from './remotes.js';
 import { bookmarkAttachDefaults } from './remote-resolve.js';
-
-const DEFAULT_LOCAL_MCP_URL = 'http://127.0.0.1:31415/v1/mcp';
 
 export type McpCliClassification =
   | 'ok'
@@ -33,6 +32,8 @@ export interface McpCallOpts {
   remotesStore?: () => RemotesStore;
   localUrl?: string;
   localToken?: string;
+  /** Test seam — daemon address. `null` means this universe has no daemon (do not guess a port). */
+  resolveEndpoint?: (opts?: ResolveDaemonEndpointOpts) => { baseUrl: string } | null;
 }
 
 export type McpListOpts = Omit<McpCallOpts, 'tool' | 'args' | 'argJson' | 'argsJson'>;
@@ -70,12 +71,27 @@ export async function runMcpCall(opts: McpCallOpts): Promise<McpCliResult> {
   const out = opts.out ?? defaultOut();
   const parsed = parseCallArguments(opts.args, opts.argsJson, opts.argJson);
   if (!parsed.ok) return fail(out, 'mcp-usage-error', parsed.message);
-  return runMcpRpc(opts, out, {
-    jsonrpc: '2.0',
-    id: nextRpcId(),
-    method: 'tools/call',
-    params: { name: opts.tool, arguments: parsed.arguments },
-  }, opts.tool);
+  return runMcpRpc(opts, out, { tool: opts.tool, arguments: parsed.arguments }, opts.tool);
+}
+
+function mcpToolRequest(tool: string, args: Record<string, unknown>): JsonRpcRequest {
+  return { jsonrpc: '2.0', id: nextRpcId(), method: 'tools/call', params: { name: tool, arguments: args } };
+}
+
+/** Invoke one tool through the daemon's JSON-RPC MCP gateway. Returns the raw tools/call result. */
+export async function callDaemonMcpTool(opts: {
+  tool: string;
+  arguments: Record<string, unknown>;
+  endpoint?: string | ResolvedEndpoint;
+  fetchFn?: McpCallOpts['fetchFn'];
+}): Promise<unknown> {
+  const endpoint = typeof opts.endpoint === 'string' ? { url: opts.endpoint } : opts.endpoint;
+  const resolved = endpoint ? { ok: true as const, value: endpoint } : resolveMcpEndpoint({});
+  if (!resolved.ok) throw new McpCliFailure(resolved.classification, resolved.message);
+  const payload = await dispatchMcpRpc(
+    { fetchFn: opts.fetchFn }, mcpToolRequest(opts.tool, opts.arguments), opts.tool, resolved.value,
+  );
+  return payload.result;
 }
 
 export async function runMcpList(opts: McpListOpts = {}): Promise<McpCliResult> {
@@ -90,17 +106,19 @@ export async function runMcpList(opts: McpListOpts = {}): Promise<McpCliResult> 
 async function runMcpRpc(
   opts: McpListOpts,
   out: NonNullable<McpCallOpts['out']>,
-  request: JsonRpcRequest,
+  request: JsonRpcRequest | { tool: string; arguments: Record<string, unknown> },
   tool?: string,
 ): Promise<McpCliResult> {
   const endpoint = resolveMcpEndpoint(opts);
   if (!endpoint.ok) return fail(out, endpoint.classification, endpoint.message);
 
   try {
-    const payload = await dispatchMcpRpc(opts, request, tool, endpoint.value);
+    const result = 'tool' in request
+      ? await callDaemonMcpTool({ tool: request.tool, arguments: request.arguments, endpoint: endpoint.value, fetchFn: opts.fetchFn })
+      : (await dispatchMcpRpc(opts, request, tool, endpoint.value)).result;
     const message = opts.json === true
-      ? JSON.stringify(payload.result, null, 2)
-      : formatPayload(payload.result, false);
+      ? JSON.stringify(result, null, 2)
+      : formatPayload(result, false);
     out.log(message);
     return { exitCode: 0, classification: 'ok', message };
   } catch (err) {
@@ -237,7 +255,14 @@ function resolveMcpEndpoint(opts: McpListOpts):
   | { ok: true; value: ResolvedEndpoint }
   | { ok: false; classification: 'mcp-remote-error'; message: string } {
   if (opts.remote === undefined) {
-    const url = opts.localUrl ?? DEFAULT_LOCAL_MCP_URL;
+    const url = opts.localUrl ?? localMcpUrl(opts);
+    if (!url) {
+      return {
+        ok: false,
+        classification: 'mcp-remote-error',
+        message: 'mcp: no local daemon. Start one with `elanous nexus run` (a port is not guessed).',
+      };
+    }
     return {
       ok: true,
       value: {
@@ -293,6 +318,11 @@ function resolveMcpEndpoint(opts: McpListOpts):
     };
   }
   return { ok: true, value: { url: `${origin}/v1/mcp`, token, remoteLabel: label } };
+}
+
+function localMcpUrl(opts: McpListOpts): string | null {
+  const endpoint = (opts.resolveEndpoint ?? resolveDaemonEndpoint)();
+  return endpoint ? `${endpoint.baseUrl}/v1/mcp` : null;
 }
 
 function mcpRemoteHttpOrigin(host: string): string {

@@ -7,9 +7,8 @@
 //   2. Step 0c — `routeVoiceModeKey` delegates every key to
 //      `host.maybeHandleKey` while voice mode is active and that path
 //      swallows non-voice keys (modal A invariant).
-//   3. priority-route ordering — Force quit (Step 0) and Alt+W (Step 0a)
-//      stay reachable even when voice mode is active so the user has an
-//      escape hatch.
+//   3. priority-route ordering — Force quit (Step 0) stays reachable
+//      even when voice mode is active so the user has an escape hatch.
 //   4. Indicator subscription — host emits transition labels
 //      (`🎙 Voice mode` / `🔴 Recording` / `✨ Transcribing`) and a
 //      separate `✖ send failed` flash when bridge.onSendError fires.
@@ -90,8 +89,6 @@ function fakeSTT(text = ''): STTProvider {
 
 interface PriorityRouteHandles {
   forceQuitFired: number;
-  altWFired: number;
-  altDigitFired: number;
   bellFired: number;
   preKeyFired: number;
   termModalFired: number;
@@ -100,8 +97,6 @@ interface PriorityRouteHandles {
 function mkPriorityDeps(host: VoiceInputHost | null) {
   const handles: PriorityRouteHandles = {
     forceQuitFired: 0,
-    altWFired: 0,
-    altDigitFired: 0,
     bellFired: 0,
     preKeyFired: 0,
     termModalFired: 0,
@@ -113,16 +108,6 @@ function mkPriorityDeps(host: VoiceInputHost | null) {
       const fired = (k.ctrl === true && k.shift === true && k.name === 'q')
         || (k.ctrl === true && (k.name === '\\' || k.name === 'backslash'));
       if (fired) handles.forceQuitFired++;
-      return fired;
-    },
-    routePopupCloseChord: (k: Key) => {
-      const fired = k.alt === true && k.name === 'w';
-      if (fired) handles.altWFired++;
-      return fired;
-    },
-    routeVwSwitchChord: (k: Key) => {
-      const fired = k.alt === true && k.name === '1';
-      if (fired) handles.altDigitFired++;
       return fired;
     },
     routeVoiceEnterChord: (k: Key) => {
@@ -142,7 +127,6 @@ function mkPriorityDeps(host: VoiceInputHost | null) {
     routeBellKey: async (_k: Key) => { handles.bellFired++; return false; },
     dispatchPreKey: async (_k: Key) => { handles.preKeyFired++; return false; },
     routeExclusiveTerminalModalKey: (_k: Key) => { handles.termModalFired++; return false; },
-    routeVwTerminalKey: async (_k: Key) => false,
     routeArmedChordKey: async (_k: Key) => false,
     armPrefixChord: (_k: Key) => false,
     isHardQuitKey: (_k: Key) => false,
@@ -245,6 +229,8 @@ describe('PR-S1V.4-wiring · priority-route Step 0c (modal A)', () => {
     for (const k of [
       mkKey({ name: 'a' }),
       mkKey({ name: 'b', ctrl: true }),
+      mkKey({ name: 'w', alt: true }),
+      mkKey({ name: '1', alt: true }),
       mkKey({ name: 'enter', kind: 'release' }),
     ]) {
       const r = await routeDashboardPriorityKey(k, deps);
@@ -299,28 +285,6 @@ describe('PR-S1V.4-wiring · priority-route Step 0c (modal A)', () => {
     );
     expect(result.type).toBe('quit');
     expect(handles.forceQuitFired).toBe(1);
-    host.dispose();
-  });
-
-  test('Alt+W (close) and Alt+1 (VW switch) survive voice mode (escape hatches)', async () => {
-    const sched = mkScheduler();
-    const host = createVoiceInputHost({
-      sttProvider: fakeSTT(),
-      resolveSession: () => null,
-      submitToSession: async () => {},
-      writeStdout: () => {},
-      setTimer: sched.setTimer,
-      clearTimer: sched.clearTimer,
-    });
-    host.requestEnter();
-
-    const { deps, handles } = mkPriorityDeps(host);
-    const r1 = await routeDashboardPriorityKey(mkKey({ name: 'w', alt: true }), deps);
-    const r2 = await routeDashboardPriorityKey(mkKey({ name: '1', alt: true }), deps);
-    expect(r1.type).toBe('handled');
-    expect(r2.type).toBe('handled');
-    expect(handles.altWFired).toBe(1);
-    expect(handles.altDigitFired).toBe(1);
     host.dispose();
   });
 });

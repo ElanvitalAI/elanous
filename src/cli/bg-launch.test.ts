@@ -55,7 +55,9 @@ describe('runBgLaunch setup mode', () => {
     expect(result.exitCode).not.toBe(1);
     expect(env?.ELANOUS_NEXUS_SETUP_MODE).toBe('1');
     expect(env?.ELANOUS_TEST_COORDINATOR_LEASE_PORT).toBeUndefined();
-    expect(out.logs.join('\n')).toContain('/setup');
+    // The PWA is exported under basePath /app — a bare /setup is a 404 on a fresh machine (measured 2026-09-28 bare VM).
+    expect(out.logs.join('\n')).toContain('/app/setup/ (빠진 것');
+    expect(out.logs.join('\n')).not.toMatch(/\d\/setup /);
   });
 
   test('passes only an explicitly requested central lease to the detached child', async () => {

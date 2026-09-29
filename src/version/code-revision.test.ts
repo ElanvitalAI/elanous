@@ -349,3 +349,23 @@ test('bun pm pack and bash install.sh --source preserve commit for installed ver
   ]);
   setCodeRevisionRootForTesting(undefined);
 }, 180_000);
+
+test('versioned install with the bun-path wrapper shim (#21004) exposes install.json source and commit', async () => {
+  const { installMetadataSource } = await import('./code-revision.js');
+  const prefix = mkdtempSync(join(tmpdir(), 'elanous-wrapper-install-'));
+  folders.push(prefix);
+  const versionDir = join(prefix, 'versions', '0.0.0-test');
+  const root = join(versionDir, 'node_modules', 'elanous');
+  const source = mkdtempSync(join(tmpdir(), 'elanous-wrapper-source-'));
+  folders.push(source);
+  mkdirSync(join(root, 'bin'), { recursive: true });
+  mkdirSync(join(prefix, 'bin'));
+  writeFileSync(join(root, 'bin', 'elanous.mjs'), '#!/usr/bin/env bun\n');
+  writeFileSync(join(versionDir, 'install.json'), JSON.stringify({ commit: INSTALLED_COMMIT, source }));
+  const wrapper = (marker: string) => `#!/bin/sh\n${marker}\nexec '/bin/bun' '${join(prefix, 'current', 'node_modules', 'elanous', 'bin', 'elanous.mjs')}' "$@"\n`;
+  writeFileSync(join(prefix, 'bin', 'elanous'), wrapper('# elanous-wrapper'));
+  expect(installMetadataSource(root)).toBe(source);
+  // 표지가 없는 스크립트는 설치기 소유로 보지 않는다.
+  writeFileSync(join(prefix, 'bin', 'elanous'), wrapper('# something-else'));
+  expect(installMetadataSource(root)).toBeUndefined();
+});

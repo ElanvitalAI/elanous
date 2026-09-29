@@ -1,0 +1,22 @@
+# Example loop agent — «open draft PRs older than N days, every morning».
+# A loop agent = a graph (this file) + a trigger (the `loop:` header / a schedule) + a lifecycle
+# (each run is a resumable walk saved under <state>/graph-runs/stale-draft-digest/).
+# Run once:   elanous graph run graphs/examples/stale-draft-digest/stale-draft-digest.yaml --input '{"days":3}'
+# Dry run:    elanous graph run graphs/examples/stale-draft-digest/stale-draft-digest.yaml --dry-run
+# Schedule:   elanous schedule create --cron "0 9 * * *" --command "elanous graph run graphs/examples/stale-draft-digest/stale-draft-digest.yaml"
+graph_id: stale-draft-digest
+version: 1
+loop:
+  title: Stale draft PR digest
+  trigger: { cron: "0 9 * * *" }
+  description: Every morning, list open draft pull requests older than N days (default 3).
+entry_node: collect
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: collect, kind: agent, recipe: 'cmd:collect', max_visits: 1 }
+  - { node_id: report, kind: agent, recipe: 'cmd:report', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: collect, on: outcome, map: { ok: report, none: done, fail: failed, error: failed } }
+  - { from: report, on: outcome, map: { ok: done, fail: failed, error: failed } }

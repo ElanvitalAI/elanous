@@ -1,0 +1,6 @@
+{
+  "name": "job-coach",
+  "version": "0.1.0",
+  "description": "Interview-to-NCS competency gap and cited course report.",
+  "skills": "./skills/"
+}

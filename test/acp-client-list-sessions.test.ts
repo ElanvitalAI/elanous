@@ -4,7 +4,7 @@ import { AcpListSessionsUnsupportedError } from '../src/acp/capabilities.js';
 import { debug } from '../src/debug/log.js';
 
 type ListConnection = {
-  unstable_listSessions: (request: { cursor?: string; cwd: string }) => Promise<unknown>;
+  listSessions: (request: { cursor?: string; cwd: string }) => Promise<unknown>;
 };
 
 function setConnection(agent: AcpAgent, connection: ListConnection): void {
@@ -30,8 +30,8 @@ describe('AcpAgent.listSessions', () => {
       sessions: [{ sessionId: 'private-session-id', cwd: '/workspace' }],
       nextCursor: 'next-page',
     };
-    const connection = { unstable_listSessions: async () => response };
-    const listSessions = spyOn(connection, 'unstable_listSessions');
+    const connection = { listSessions: async () => response };
+    const listSessions = spyOn(connection, 'listSessions');
     const events: Array<{ category: string; event: string; data: unknown }> = [];
     const logSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
       events.push({ category, event, data });
@@ -53,8 +53,8 @@ describe('AcpAgent.listSessions', () => {
 
   test('uses an explicit request cwd instead of the agent cwd', async () => {
     const agent = new AcpAgent({ backendId: 'claude', cwd: '/agent-cwd' });
-    const connection = { unstable_listSessions: async () => ({ sessions: [] }) };
-    const listSessions = spyOn(connection, 'unstable_listSessions');
+    const connection = { listSessions: async () => ({ sessions: [] }) };
+    const listSessions = spyOn(connection, 'listSessions');
     setConnection(agent, connection);
     recordCapabilities(agent, true);
 
@@ -65,8 +65,8 @@ describe('AcpAgent.listSessions', () => {
 
   test('uses the agent cwd when the request omits cwd', async () => {
     const agent = new AcpAgent({ backendId: 'claude', cwd: '/agent-cwd' });
-    const connection = { unstable_listSessions: async () => ({ sessions: [] }) };
-    const listSessions = spyOn(connection, 'unstable_listSessions');
+    const connection = { listSessions: async () => ({ sessions: [] }) };
+    const listSessions = spyOn(connection, 'listSessions');
     setConnection(agent, connection);
     recordCapabilities(agent, true);
 
@@ -77,8 +77,8 @@ describe('AcpAgent.listSessions', () => {
 
   test('rejects an unadvertised list capability with its dedicated error without calling the SDK', async () => {
     const agent = new AcpAgent({ backendId: 'claude', cwd: '/workspace' });
-    const connection = { unstable_listSessions: async () => ({ sessions: [] }) };
-    const listSessions = spyOn(connection, 'unstable_listSessions');
+    const connection = { listSessions: async () => ({ sessions: [] }) };
+    const listSessions = spyOn(connection, 'listSessions');
     setConnection(agent, connection);
     recordCapabilities(agent, false);
 

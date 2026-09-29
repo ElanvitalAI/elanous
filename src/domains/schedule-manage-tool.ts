@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import type { LLMToolSpec } from '../llm.js';
 import {
   openSchedulesDb, inventoryCrontab, inventoryInternalSchedules, listSchedules, readCrontab,
-  buildCronLine, addLineToCrontab, removeLineFromCrontab, setLineEnabled, applyCrontab, setRunVia, setScheduleMission,
+  buildCronLine, addLineToCrontab, removeLineFromCrontab, setLineEnabled, applyCrontab, setScheduleMission,
   deleteScheduleRow, setNote, parseCronLine, scriptName, wrapCronLine, wrapShellCronLine, unwrapCronLine, sharesCrontabLine, reindexCrontabEntry, repoRoot,
   type ScheduleRow,
 } from './schedule-registry.js';
@@ -315,7 +315,7 @@ export async function dispatchScheduleManage(args: Record<string, unknown>): Pro
       const line = target.raw ?? (target.cron && target.command ? buildCronLine(target.cron, target.command) : '');
       if (!line) return { error: 'release: 복원할 라인 없음(raw/cron 부재).' };
       const backup = applyCrontab(addLineToCrontab(current, line));
-      setRunVia(sdb, target.id, 'crontab');
+      sdb.run(`UPDATE schedule_registry SET run_via = 'crontab', source = 'crontab', enabled = 1, disabled_reason = NULL WHERE id = ?`, [target.id]);
       inventoryCrontab(sdb);
       // 파생 tox task 도 지운다 — delete 와 같은 규칙(안 지우면 부팅 sweep 이 다시 트리거로 등록한다).
       // run_via 가 이미 crontab 이어도 지운다(앞선 release 가 남긴 고아를 이 명령으로 치울 수 있게).

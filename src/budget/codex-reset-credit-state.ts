@@ -124,6 +124,9 @@ interface QuotaSignalState {
   observedAt?: string;
   /** ⭐ 이 관측이 «어느 홈»을 잰 것인가. 파일 이름은 해시라 사람이 못 읽는다. */
   measuredHome?: string;
+  /** 선불 크레딧 잔액·보유(대표 09-28 크레딧 정책 — 한도가 찬 뒤 «어느 계정 크레딧으로» 갈지 고르는 재료). */
+  creditsBalance?: number;
+  hasCredits?: boolean;
 }
 
 /**
@@ -212,6 +215,7 @@ export function writeQuotaSignal(
   usedPercentOrHome?: number | string,
   homePath?: string,
   storage?: QuotaSignalStorageOpts,
+  credits?: { readonly balance?: number; readonly hasCredits?: boolean },
 ): void {
   try {
     const usedPercent = typeof usedPercentOrHome === 'number' && Number.isFinite(usedPercentOrHome)
@@ -225,6 +229,8 @@ export function writeQuotaSignal(
       ...(usedPercent === undefined ? {} : { usedPercent }),
       observedAt: new Date().toISOString(),
       measuredHome: normalizeHome(home?.trim() || process.env.CODEX_HOME?.trim() || join(homedir(), '.codex')),
+      ...(typeof credits?.balance === 'number' && Number.isFinite(credits.balance) ? { creditsBalance: credits.balance } : {}),
+      ...(typeof credits?.hasCredits === 'boolean' ? { hasCredits: credits.hasCredits } : {}),
     };
     writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
   } catch { /* fail-soft */ }
@@ -282,6 +288,15 @@ export function readQuotaSignalObservedAt(nowMs: number = Date.now(), homePath?:
   const observedAt = readFreshQuotaSignal(nowMs, homePath, storage)?.observedAt;
   const parsed = observedAt ? Date.parse(observedAt) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/** 최근의 크레딧 잔액·보유. 옛 파일·낡은 신호·다른 홈은 모두 모른다(빈 객체). */
+export function readQuotaSignalCredits(nowMs: number = Date.now(), homePath?: string, storage?: QuotaSignalStorageOpts): { balance?: number; hasCredits?: boolean } {
+  const s = readFreshQuotaSignal(nowMs, homePath, storage);
+  return {
+    ...(typeof s?.creditsBalance === 'number' && Number.isFinite(s.creditsBalance) ? { balance: s.creditsBalance } : {}),
+    ...(typeof s?.hasCredits === 'boolean' ? { hasCredits: s.hasCredits } : {}),
+  };
 }
 
 /** 최근의 브랜드 총량 사용률. 옛 파일·낡은 신호·다른 홈은 모두 모른다. */

@@ -1,9 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isPrerelease, isReleaseVersion, planPublish, publishRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
+import { debug } from '../debug/log.js';
+import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 
 function fixture() {
   const out = mkdtempSync(join(tmpdir(), 'release-cli-'));
@@ -46,6 +48,21 @@ describe('release — 버전·자산', () => {
   });
 });
 
+function tagRunner(calls: string[], opts: { releaseFails?: boolean; tagPushFails?: boolean; local?: string; remote?: string } = {}): Runner {
+  return (command, args) => {
+    calls.push(`${command} ${args.join(' ')}`);
+    const success = (stdout = '') => ({ status: 0, stdout, stderr: '' });
+    if (command === 'gh' && args[1] === 'view') return { status: 1, stdout: '', stderr: '' };
+    if (command === 'gh' && args[1] === 'create' && opts.releaseFails) return { status: 1, stdout: '', stderr: 'release failed' };
+    if (command === 'git' && args[0] === 'push' && args[2]?.startsWith('refs/tags/') && opts.tagPushFails) return { status: 1, stdout: '', stderr: 'tag push failed' };
+    // 실제 git 처럼: 없는 ref 는 `--quiet` 이면 1, 아니면 128
+    if (command === 'git' && args[0] === 'show-ref') return opts.local ? success(opts.local) : { status: args.includes('--quiet') ? 1 : 128, stdout: '', stderr: args.includes('--quiet') ? '' : `fatal: '${args[args.length - 1]}' - not a valid ref` };
+    if (command === 'git' && args[0] === 'ls-remote') return success(opts.remote ? `${opts.remote}\trefs/tags/v0.1.1^{}\n` : '');
+    if (command === 'git' && args[0] === 'rev-parse') return success(args[2]?.startsWith('refs/tags/') ? opts.local : 'a'.repeat(40));
+    return success();
+  };
+}
+
 describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', () => {
   test('계획: 공개 커밋 푸시 → 태그 릴리스(자산 전부 · 공개 커밋을 target · prerelease 면 표시)', () => {
     const f = fixture();
@@ -78,15 +95,93 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
     } finally { rmSync(f.out, { recursive: true, force: true }); }
   });
 
-  test('--yes 면 푸시 → 릴리스 순서로 실행한다', async () => {
+  test('--yes 면 공개 성공 뒤 원본 주석 태그를 push 하고 인스턴스에 0600 판 기록을 남긴다', async () => {
     const f = fixture();
     const calls: string[] = [];
-    const run: Runner = (c, a) => { calls.push(`${c} ${a[0]} ${a[1]}`); return { status: c === 'gh' && a[1] === 'view' ? 1 : 0, stdout: '', stderr: '' }; };
+    const observations: Array<{ category: string; event: string; data: unknown }> = [];
+    const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { observations.push({ category, event, data }); });
     try {
-      const r = await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, log: () => {} }, run);
+      const r = await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls));
       expect(r.published).toBe(true);
-      expect(calls).toEqual(['gh release view', 'git push origin', 'gh release create']);
+      const published = calls.findIndex((c) => c.startsWith('gh release create'));
+      const tagged = calls.findIndex((c) => c.startsWith('git tag -a v0.1.1 '));
+      expect(published).toBeGreaterThan(calls.findIndex((c) => c === 'git push origin HEAD:main'));
+      expect(tagged).toBeGreaterThan(published);
+      expect(calls[tagged]).toBe(`git tag -a v0.1.1 ${'a'.repeat(40)} -m elanous v0.1.1`);
+      expect(calls).toContain('git push origin refs/tags/v0.1.1:refs/tags/v0.1.1');
+      const path = join(f.out, 'release', '0.1.1', 'release.json');
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ ...f.manifest, publishedAt: expect.any(String) });
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      expect(observations).toContainEqual({ category: 'release.publish', event: 'tagged', data: { version: '0.1.1', commit: 'a'.repeat(40) } });
+    } finally { observation.mockRestore(); rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+  test('공개 릴리스 실패면 내부 태그와 판 기록은 없다', async () => {
+    const f = fixture();
+    const calls: string[] = [];
+    try {
+      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls, { releaseFails: true }))).rejects.toThrow('release failed');
+      expect(calls.filter((c) => c.startsWith('git tag ') || c.startsWith('git push origin refs/tags/'))).toHaveLength(0);
+      expect(() => readFileSync(join(f.out, 'release', '0.1.1', 'release.json'))).toThrow();
     } finally { rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+  test('내부 태그 push 실패면 판 기록을 남기지 않는다', async () => {
+    const f = fixture();
+    const calls: string[] = [];
+    try {
+      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls, { tagPushFails: true }))).rejects.toThrow('tag push failed');
+      expect(calls.some((c) => c.startsWith('git tag -a v0.1.1 '))).toBe(true);
+      expect(() => readFileSync(join(f.out, 'release', '0.1.1', 'release.json'))).toThrow();
+    } finally { rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+  test('로컬 또는 origin 태그가 다른 원본이면 공개·태그 변경 전에 거부한다', async () => {
+    const f = fixture();
+    try {
+      for (const conflict of [{ local: 'b'.repeat(40) }, { remote: 'b'.repeat(40) }]) {
+        const calls: string[] = [];
+        await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls, conflict))).rejects.toThrow('태그 충돌');
+        expect(calls.filter((c) => c.startsWith('git tag ') || c.startsWith('git push ') || c.startsWith('gh release create'))).toHaveLength(0);
+      }
+    } finally { rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+  test('같은 원본이면 태그 생성·push 는 각각 멱등이다', async () => {
+    const f = fixture();
+    try {
+      const calls: string[] = [];
+      await tagRelease({ version: '0.1.1', source: 'a'.repeat(40), repoRoot: f.out, yes: true, log: () => {} }, tagRunner(calls, { local: 'a'.repeat(40), remote: 'a'.repeat(40) }));
+      expect(calls.filter((c) => c.startsWith('git tag ') || c.startsWith('git push '))).toHaveLength(0);
+      const missingRemote: string[] = [];
+      await tagRelease({ version: '0.1.1', source: 'a'.repeat(40), repoRoot: f.out, yes: true, log: () => {} }, tagRunner(missingRemote, { local: 'a'.repeat(40) }));
+      expect(missingRemote.filter((c) => c.startsWith('git tag '))).toHaveLength(0);
+      expect(missingRemote).toContain('git push origin refs/tags/v0.1.1:refs/tags/v0.1.1');
+    } finally { rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+  test('release tag CLI: --yes 없는 소급 판은 한 줄 계획 · exit 0 · 태그 미생성', async () => {
+    const cli = new Command();
+    registerReleaseCommands(cli);
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    try {
+      await cli.parseAsync(['release', 'tag', '--version', '0.2.2', '--source', '0a3902fb104f8d0501811a5402d1455b7d0e1a77'], { from: 'user' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('v0.2.2 → 0a3902fb104f8d0501811a5402d1455b7d0e1a77');
+      expect(process.exitCode ?? 0).toBe(0);
+    } finally { output.mockRestore(); }
+  });
+
+  test('release tag --yes 없으면 계획만 · 버전/커밋 유효성 검사', async () => {
+    const calls: string[] = [];
+    const lines: string[] = [];
+    expect(await tagRelease({ version: '0.2.2', source: '0a3902fb104f8d0501811a5402d1455b7d0e1a77', log: (line) => lines.push(line) }, tagRunner(calls))).toEqual({ tagged: false });
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('v0.2.2 → 0a3902fb104f8d0501811a5402d1455b7d0e1a77');
+    expect(calls).toHaveLength(0);
+    await expect(tagRelease({ version: 'v0.2.2', source: 'a'.repeat(40) }, tagRunner(calls))).rejects.toThrow('버전 모양');
+    await expect(tagRelease({ version: '0.2.2', source: 'HEAD' }, tagRunner(calls))).rejects.toThrow('커밋 SHA');
   });
 });
 
@@ -207,7 +302,7 @@ describe('release yank — 설치기 리다이렉트 반영을 기다린다(📏
     expect(r.propagated).toBe(false);
     expect(lines.join('\n')).toContain('아직 v0.1.1 을 준다');
     expect(process.exitCode).toBe(2);
-    process.exitCode = before;
+    process.exitCode = before ?? 0;
   });
 });
 

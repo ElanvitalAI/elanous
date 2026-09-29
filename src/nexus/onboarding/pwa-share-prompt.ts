@@ -18,6 +18,7 @@
 
 import type { TailscaleProbe } from './tailscale-probe.js';
 import type { WizardIO } from '../../onboarding.js';
+import { debug } from '../../debug/log.js';
 import {
   chooseFrom,
   showStepOr,
@@ -42,8 +43,8 @@ export interface PwaSharePromptDeps {
   io: WizardIO;
   /** Whether `apps/pwa/out` exists (skip build when true). */
   pwaBuilt: boolean;
-  /** HTTP port for the tailscale serve forward. Default 31415. */
-  port?: number;
+  /** Actual bound HTTP port for the tailscale serve forward. */
+  port: number;
   /** Force the prompt path even when stdin is non-TTY (tests). */
   forceTty?: boolean;
   /** Output sink (default = console). */
@@ -66,7 +67,7 @@ export async function runPwaSharePrompt(
   deps: PwaSharePromptDeps,
 ): Promise<PwaSharePromptResult> {
   const out = deps.out ?? console;
-  const port = deps.port ?? 31415;
+  const port = deps.port;
   const io = deps.io;
 
   const current = deps.readSwitch();
@@ -124,6 +125,7 @@ export async function runPwaSharePrompt(
   }
 
   out.log(`  → tailscale serve --bg --tls-terminated-tcp ${port} tcp://localhost:${port}`);
+  debug.log('nexus.pwa-share', 'port-resolved', { port, source: 'bound' });
   const serveResult = await deps.serveFn(probe.binary ?? 'tailscale', port);
   if (serveResult.exitCode !== 0) {
     out.error(`  ✗ tailscale serve failed (exit ${serveResult.exitCode}); switch left at 'ask'.`);
@@ -147,7 +149,7 @@ export async function runPwaSharePrompt(
  *  which strips WebSocket Upgrade — voice + Showroom multi-LLM WS
  *  bridge both 502 in production. Mode unification (single tls-tcp
  *  mode for both `pwa share enable` and `pwa test --https`) makes
- *  voice/WS work in daily-driver mode at the cost of `:31415` in the
+ *  voice/WS work in daily-driver mode at the cost of a port in the
  *  surfaced URL. The trade was decided 2026-05-10 (P1-P6 redesign).
  *
  *  `useSudo: true` because tls-tcp on macOS requires a privileged

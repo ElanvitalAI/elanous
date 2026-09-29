@@ -362,34 +362,52 @@ export class GoalRunStore {
     }
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new Database(path);
-    this.db.run('PRAGMA journal_mode = WAL');
-    this.db.run(`CREATE TABLE IF NOT EXISTS goal_run (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      run_id TEXT NOT NULL,
-      goal_id TEXT NOT NULL,
-      goal_file TEXT NOT NULL,
-      doc TEXT NOT NULL,
-      started_at TEXT GENERATED ALWAYS AS (json_extract(doc, '$.startedAt')) VIRTUAL,
-      outcome TEXT GENERATED ALWAYS AS (json_extract(doc, '$.outcome')) VIRTUAL,
-      rounds INTEGER GENERATED ALWAYS AS (json_extract(doc, '$.rounds')) VIRTUAL,
-      executor TEXT GENERATED ALWAYS AS (json_extract(doc, '$.model')) VIRTUAL
-    )`);
-    // RFC 런 출처 O5 — 기계별 집계를 인덱스로. 옛 DB 는 VIRTUAL 생성 열이라 ALTER 로 더할 수 있다(옛 행은 NULL).
-    const columns = this.db.query('PRAGMA table_xinfo(goal_run)').all() as Array<{ name: string }>;
-    if (!columns.some((c) => c.name === 'host_id')) {
-      this.db.run("ALTER TABLE goal_run ADD COLUMN host_id TEXT GENERATED ALWAYS AS (json_extract(doc, '$.hostId')) VIRTUAL");
+    this.db.run('PRAGMA busy_timeout = 5000');
+    const openedAt = Date.now();
+    try {
+      this.db.run('PRAGMA journal_mode = WAL');
+      this.db.run(`CREATE TABLE IF NOT EXISTS goal_run (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL,
+        goal_id TEXT NOT NULL,
+        goal_file TEXT NOT NULL,
+        doc TEXT NOT NULL,
+        started_at TEXT GENERATED ALWAYS AS (json_extract(doc, '$.startedAt')) VIRTUAL,
+        outcome TEXT GENERATED ALWAYS AS (json_extract(doc, '$.outcome')) VIRTUAL,
+        rounds INTEGER GENERATED ALWAYS AS (json_extract(doc, '$.rounds')) VIRTUAL,
+        executor TEXT GENERATED ALWAYS AS (json_extract(doc, '$.model')) VIRTUAL
+      )`);
+      // RFC 런 출처 O5 — 기계별 집계를 인덱스로. 옛 DB 는 VIRTUAL 생성 열이라 ALTER 로 더할 수 있다(옛 행은 NULL).
+      const columns = this.db.query('PRAGMA table_xinfo(goal_run)').all() as Array<{ name: string }>;
+      if (!columns.some((c) => c.name === 'host_id')) {
+        this.db.run("ALTER TABLE goal_run ADD COLUMN host_id TEXT GENERATED ALWAYS AS (json_extract(doc, '$.hostId')) VIRTUAL");
+      }
+      this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_host ON goal_run(host_id, started_at)');
+      this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_goal ON goal_run(goal_id, started_at)');
+      this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_run ON goal_run(run_id)');
+      this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_file ON goal_run(goal_file)');
+    } catch (error) {
+      this.db.close();
+      if (/SQLITE_BUSY|SQLITE_LOCKED|database is locked|database is busy/i.test(String(error))) {
+        debug.log('store.sqlite', 'busy-lost', { store: 'goal_run', op: 'open', waitedMs: Date.now() - openedAt });
+      }
+      throw error;
     }
-    this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_host ON goal_run(host_id, started_at)');
-    this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_goal ON goal_run(goal_id, started_at)');
-    this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_run ON goal_run(run_id)');
-    this.db.run('CREATE INDEX IF NOT EXISTS goal_run_by_file ON goal_run(goal_file)');
   }
 
   insert(goalFile: string, record: GoalExecutionRecord, goalId?: string): void {
-    this.db.run(
-      'INSERT INTO goal_run (run_id, goal_id, goal_file, doc) VALUES (?, ?, ?, ?)',
-      [record.runId, goalId ?? goalIdFromDocument(goalFile), normalizeGoalFile(goalFile), serializeGoalExecutionRecord(withRecordOrigin(record))],
-    );
+    const startedAt = Date.now();
+    try {
+      this.db.run(
+        'INSERT INTO goal_run (run_id, goal_id, goal_file, doc) VALUES (?, ?, ?, ?)',
+        [record.runId, goalId ?? goalIdFromDocument(goalFile), normalizeGoalFile(goalFile), serializeGoalExecutionRecord(withRecordOrigin(record))],
+      );
+    } catch (error) {
+      if (/SQLITE_BUSY|SQLITE_LOCKED|database is locked|database is busy/i.test(String(error))) {
+        debug.log('store.sqlite', 'busy-lost', { store: 'goal_run', op: 'insert', waitedMs: Date.now() - startedAt });
+      }
+      throw error;
+    }
   }
 
   byRunId(runId: string): GoalRunRecord[] {

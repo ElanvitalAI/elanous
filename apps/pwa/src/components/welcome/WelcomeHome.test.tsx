@@ -1,7 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { ROUTE_GUIDANCE_ITEMS, isSidebarRouteHref, WelcomeHome } from './WelcomeHome';
+import { ROUTE_GUIDANCE_ITEMS, RouteGuidanceList, isSidebarRouteHref, WelcomeHome } from './WelcomeHome';
+import { SIDEBAR_NAV_ITEMS } from '@/components/shell/sidebar-nav-items';
+import { splitWelcomeRoutes } from './welcome-core-routes';
 
 function decodedHtml(html: string): string {
   return html.replaceAll('&quot;', '"');
@@ -11,32 +13,40 @@ function routeGuidanceTestId(href: string): string {
   return `route-guidance-${href === '/' ? 'root' : href.slice(1).replaceAll('/', '-')}`;
 }
 
-
-describe('WelcomeHome — complete route guidance contract', () => {
+describe('WelcomeHome — core routes and not-found guidance', () => {
   test('renders a welcome-home root with the headline', () => {
     const html = renderToStaticMarkup(<WelcomeHome />);
     expect(html).toContain('data-testid="welcome-home"');
     expect(html).toContain('웰컴 — 어디부터 시작할까요?');
   });
 
-  test('renders every shared route-accounting entry exactly once', () => {
-    const html = renderToStaticMarkup(<WelcomeHome />);
-    expect(ROUTE_GUIDANCE_ITEMS.length).toBeGreaterThan(0);
-    for (const route of ROUTE_GUIDANCE_ITEMS) {
-      expect(html.match(new RegExp(`data-testid="${routeGuidanceTestId(route.href)}"`, 'g'))?.length).toBe(1);
+  test('shows core tiles first and nests every other menu tile in the closed all-screens disclosure', () => {
+    const html = decodedHtml(renderToStaticMarkup(<WelcomeHome />));
+    const { core, more } = splitWelcomeRoutes([...SIDEBAR_NAV_ITEMS, { href: '/setup' }]);
+    expect(html).toContain('aria-label="핵심 화면"');
+    expect(html).toContain('<details');
+    expect(html).not.toContain('<details open=""');
+    expect(html).toContain(`모든 화면 (${more.length})`);
+    const disclosure = html.indexOf('<details');
+    for (const item of core) {
+      expect(html.indexOf(`data-testid="${routeGuidanceTestId(item.href)}"`)).toBeLessThan(disclosure);
     }
+    for (const item of more) {
+      expect(html.indexOf(`data-testid="${routeGuidanceTestId(item.href)}"`)).toBeGreaterThan(disclosure);
+    }
+    expect(html).not.toContain('참고 주소');
+    expect(html).not.toContain('data-route-kind="reference"');
   });
 
-  test('links only menu destinations and preserves each non-menu reason as reference text', () => {
-    const html = decodedHtml(renderToStaticMarkup(<WelcomeHome />));
-    for (const item of ROUTE_GUIDANCE_ITEMS.filter((route) => route.navigable)) {
-      expect(html).toContain(`href="${item.href}"`);
-      expect(html).toContain('data-route-kind="destination"');
-    }
-    for (const route of ROUTE_GUIDANCE_ITEMS.filter((item) => !item.navigable)) {
-      expect(html).toContain(route.reason!);
-      expect(html).toContain('data-route-kind="reference"');
-      expect(html).not.toContain(`href="${route.href}"`);
+  test('keeps full menu and non-menu references on the not-found guidance list', () => {
+    const html = decodedHtml(renderToStaticMarkup(<RouteGuidanceList ariaLabel="이동 가능한 주소와 참고 주소" />));
+    for (const item of ROUTE_GUIDANCE_ITEMS) {
+      expect(html.match(new RegExp(`data-testid="${routeGuidanceTestId(item.href)}"`, 'g'))?.length).toBe(1);
+      if (item.navigable) expect(html).toContain(`href="${item.href}"`);
+      else {
+        expect(html).toContain(item.reason!);
+        expect(html).not.toContain(`href="${item.href}"`);
+      }
     }
   });
 

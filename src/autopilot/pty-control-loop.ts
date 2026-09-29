@@ -18,6 +18,8 @@ import { decideInterventionStep, type InterventionStep } from '../self-implement
 import type { AutopilotTermination } from './agent-loop.js';
 import type { PtyHandle } from '../pty-shell/registry.js';
 import { requestRemotePtyControl } from '../pty-shell/pty-control-ipc.js';
+import { encodeSgrMouse, detectMouseMode, mouseModeOffReason, MOUSE_MODE_OFF_REASON, MAX_PTY_KEY_REPEAT, type PtyMouseInput } from '../pty-shell/pty-mouse.js';
+import { resolvePtySpecialKey } from '../pty-shell/pty-special-keys.js';
 import type { PtyWriteActor } from '../pty-shell/pty-write-arbiter.js';
 import { debug } from '../debug/log.js';
 import { probeControlStance, reportProbeError, stanceBlocksWrite, type ControlStance } from '../pty-shell/pty-control-stance.js';
@@ -71,13 +73,20 @@ export interface ControlObservation {
   readonly subjectPtyId?: string;
   /** 이 판단이 속한 harness run. harness 밖 감독자는 생략한다. */
   readonly runId?: string;
+  /** Last structured action that could not be performed; brain sees the reason next round. */
+  readonly unavailableAction?: string;
 }
 
 /** brain 의 결정 — 입력 주입 | 완료 | 대기 | 무진행 보고. */
 export type ControlDecision =
   | { readonly action: 'input'; readonly text: string }
+  | { readonly action: 'key'; readonly name: string; readonly repeat?: number }
+  | ({ readonly action: 'mouse' } & PtyMouseInput)
+  | { readonly action: 'resize'; readonly cols: number; readonly rows: number }
   | { readonly action: 'done'; readonly reason: string }
   | { readonly action: 'wait' }
+  | { readonly action: 'handoff'; readonly to: 'codex' | 'claude' | 'elanous'; readonly mission: string; readonly carry?: 'diff' | 'summary' }
+  | { readonly action: 'ask-human'; readonly reason: string; readonly url?: string; readonly code?: string }
   /** `no-progress` reports observed lack of progress without claiming completion. */
   | { readonly action: 'no-progress'; readonly reason: string };
 
@@ -97,6 +106,10 @@ export interface PtyControlDeps {
   readonly observe: () => Promise<string> | string;
   /** 입력 주입 — arbiter-gated write('agent'). 반환 false = 거부(사람 takeover)→루프 cancelled. */
   readonly inject: (text: string) => boolean;
+  readonly injectKey?: (name: string, repeat?: number) => boolean;
+  readonly injectMouse?: (input: PtyMouseInput) => boolean;
+  readonly resize?: (cols: number, rows: number) => boolean;
+  readonly mouseModeEnabled?: () => boolean;
   /** 이 child가 PTY 입력을 실제로 소비한다는 호출자 선언. 추론 금지. */
   readonly canReceiveInput?: boolean;
   /** 이 supervisor가 제어하는 child PTY id. 호출자가 선언하며 추론하지 않는다. */
@@ -107,6 +120,10 @@ export interface PtyControlDeps {
   readonly autoAssist?: { readonly enabled: boolean; readonly minRung: number };
   /** brain의 done 선언을 ground truth로 확정한다. false면 retry를 주입하고 루프를 계속한다. */
   readonly verifyDone?: (obs: ControlObservation) => VerifyDoneResult | Promise<VerifyDoneResult>;
+  /** Mission-only handoff; absent in generic PTY callers. A successful handoff ends this child loop. */
+  readonly handoff?: (decision: Extract<ControlDecision, { action: 'handoff' }>, obs: ControlObservation) => Promise<void>;
+  /** Notify and wait without killing the child PTY. */
+  readonly askHuman?: (decision: Extract<ControlDecision, { action: 'ask-human' }>, obs: ControlObservation) => Promise<void>;
   /** ⭐매 스텝 소유권 확인 — false = agent 가 write 제어 상실(사람 takeover). `wait` 중에도 감지해
    *  즉시 yield(review: takeover 를 input 시에만 보면 wait 중 놓침). 기본 항상 true.
    *  ⚠️ **boolean 은 {상실}∪{확인 불가} 를 뭉친다** — 실 PTY 배선은 아래 `controlStance` 를 쓴다.
@@ -151,6 +168,7 @@ export interface PtyControlOpts {
 export interface PtyControlResult {
   readonly termination: AutopilotTermination;
   readonly steps: number;
+  readonly handoff?: Extract<ControlDecision, { action: 'handoff' }>;
 }
 
 // eslint-disable-next-line no-control-regex
@@ -354,6 +372,8 @@ export async function runPtyControlLoop(
   let previousIntervention: InterventionStep | null = null;
   let frameObs: FrameObservationState = INITIAL_FRAME_OBSERVATION;
   let step = 0;
+  let unavailableAction: string | undefined;
+  const mouseMode = detectMouseMode('');
   // ⚠️ 재개는 `continue` 로 같은 스텝을 다시 하므로 **스텝 예산을 소비하지 않는다**(그게
   //   *"재개한 스텝은 재관측·재결정한다"* 의 뜻이다). 그러면 소유권이 `lost ↔ owned` 로
   //   플래핑할 때 루프가 `maxSteps` 를 영구 우회해 **무한**이 된다 — 대기 자체는 유한한데
@@ -401,6 +421,7 @@ export async function runPtyControlLoop(
       // 전 스텝 try 가 잡아 error termination 으로 수렴(observe 실패와 동일 정책).
       if (deps.settle) await deps.settle();
       const screen = await deps.observe();
+      mouseMode.feed(screen);
       const norm = normalizeScreen(screen);
       const changed = prevNorm !== null && norm !== prevNorm;
       const state = classify(screen);
@@ -427,6 +448,7 @@ export async function runPtyControlLoop(
         stallRung: frameObs.stallRung,
         ...(deps.subjectPtyId ? { subjectPtyId: deps.subjectPtyId } : {}),
         ...(runId ? { runId } : {}),
+        ...(unavailableAction ? { unavailableAction } : {}),
       };
 
       // ⭐안전계약(review): decide()(LLM 호출)가 오래 걸려도 그동안 사람이 takeover 하면 **≤250ms 내** 감지
@@ -501,6 +523,7 @@ export async function runPtyControlLoop(
         return finish({ kind: 'cancelled' }, step);
       }
       const decision = outcome.decision;
+      unavailableAction = undefined;
       // ⭐결정 직후 소유권 재검사(review) — decide 가 250ms watcher 틱 前에 완료되면 그 사이 takeover 를
       // 놓쳐 done 을 success 로 확정할 수 있다. 여기서 재검사해 상실이면 결정 무시하고 cancelled.
       const postStance = controlStance();
@@ -561,7 +584,30 @@ export async function runPtyControlLoop(
       });
       await deps.onStep?.(obs, decision);
 
-      if (decision.action === 'done') {
+      if (decision.action === 'handoff') {
+        if (!deps.handoff) {
+          unavailableAction = 'handoff: unavailable';
+          debug.log('autopilot.control', 'action-unavailable', { step, action: decision.action });
+        } else {
+          await deps.handoff(decision, obs);
+          debug.log('autopilot.control', 'handoff', { step, to: decision.to });
+          return { ...finish({ kind: 'success', reason: `handoff:${decision.to}` }, step), handoff: decision };
+        }
+      } else if (decision.action === 'ask-human') {
+        if (!deps.askHuman) {
+          unavailableAction = 'ask-human: unavailable';
+          debug.log('autopilot.control', 'action-unavailable', { step, action: decision.action });
+        } else {
+          await deps.askHuman(decision, obs);
+          if (deps.isAlive?.() === false) return finish({ kind: 'stuck', iteration: step, reason: 'login PTY exited' }, step);
+          prevNorm = null;
+          previousIntervention = null;
+          frameObs = INITIAL_FRAME_OBSERVATION;
+          await sleep(pollMs);
+          step += 1;
+          continue;
+        }
+      } else if (decision.action === 'done') {
         const verification = deps.verifyDone ? await deps.verifyDone(obs) : { ok: true as const };
         debug.log('autopilot.control', 'verify-done', { ok: verification.ok });
         if (verification.ok) {
@@ -596,6 +642,23 @@ export async function runPtyControlLoop(
           }
           if (!injected) {
             debug.log('autopilot.control', 'yield', { step, reason: 'arbiter denied inject — 사람 takeover' });
+            return finish({ kind: 'cancelled' }, step);
+          }
+          previousIntervention = { ...intervention, sameScreenCount: 1 };
+        }
+      } else if (decision.action === 'key' || decision.action === 'mouse' || decision.action === 'resize') {
+        const refusal = decision.action === 'key' ? !deps.injectKey ? 'injectKey unavailable' : undefined
+          : decision.action === 'mouse' ? !deps.injectMouse ? 'injectMouse unavailable' : !(deps.mouseModeEnabled?.() ?? mouseMode.enabled) ? MOUSE_MODE_OFF_REASON : undefined
+          : !deps.resize ? 'resize unavailable' : undefined;
+        if (refusal) {
+          unavailableAction = `${decision.action}: ${refusal}`;
+          debug.log('autopilot.control', 'action-unavailable', { step, action: decision.action, reason: refusal });
+        } else {
+          const applied = decision.action === 'key' ? deps.injectKey!(decision.name, decision.repeat)
+            : decision.action === 'mouse' ? deps.injectMouse!(decision)
+            : deps.resize!(decision.cols, decision.rows);
+          if (!applied) {
+            debug.log('autopilot.control', 'yield', { step, reason: `arbiter denied ${decision.action} — 사람 takeover` });
             return finish({ kind: 'cancelled' }, step);
           }
           previousIntervention = { ...intervention, sameScreenCount: 1 };
@@ -664,8 +727,37 @@ export function controlDepsForRemoteRef(id: string, opts: {
   };
 }
 
-export function controlDepsForHandle(handle: PtyHandle): Pick<PtyControlDeps, 'observe' | 'inject' | 'controlStance' | 'isAlive'> {
+export function controlDepsForHandle(handle: PtyHandle): Pick<PtyControlDeps, 'observe' | 'inject' | 'injectKey' | 'injectMouse' | 'resize' | 'mouseModeEnabled' | 'controlStance' | 'isAlive' | 'subjectPtyId'> {
+  const injectAgent = (chars: string): boolean => {
+    const stance = probeControlStance(handle, 'agent', (e) =>
+      debug.log('autopilot.control', 'hascontrol-error', { ptyId: handle.id, at: 'inject-key', error: (e as Error)?.message ?? String(e) }));
+    if (stanceBlocksWrite(stance)) return false;
+    handle.write(chars, 'agent');
+    return true;
+  };
   return {
+    subjectPtyId: handle.id,
+    mouseModeEnabled: () => !mouseModeOffReason(handle),
+    injectKey: (name, repeat = 1) => {
+      if (!Number.isSafeInteger(repeat) || repeat < 1 || repeat > MAX_PTY_KEY_REPEAT) throw new Error(`key repeat must be between 1 and ${MAX_PTY_KEY_REPEAT}`);
+      return injectAgent(resolvePtySpecialKey(name).repeat(repeat));
+    },
+    injectMouse: (input) => {
+      // Check ownership before reporting mode: a human takeover must never be
+      // mistaken for a recoverable "mouse unavailable" decision.
+      if (stanceBlocksWrite(probeControlStance(handle, 'agent', (e) =>
+        debug.log('autopilot.control', 'hascontrol-error', { ptyId: handle.id, at: 'inject-mouse', error: (e as Error)?.message ?? String(e) })))) return false;
+      const off = mouseModeOffReason(handle);
+      if (off) throw new Error(off);
+      return injectAgent(encodeSgrMouse(input));
+    },
+    resize: (cols, rows) => {
+      if (!Number.isSafeInteger(cols) || cols < 1 || !Number.isSafeInteger(rows) || rows < 1) throw new Error('invalid PTY size');
+      if (stanceBlocksWrite(probeControlStance(handle, 'agent', (e) =>
+        debug.log('autopilot.control', 'hascontrol-error', { ptyId: handle.id, at: 'resize', error: (e as Error)?.message ?? String(e) })))) return false;
+      handle.resize(cols, rows);
+      return true;
+    },
     observe: () => handle.renderScreen(),
     // ⭐공용 seam 경유(P2b P-a′) — `canWrite` 직접 호출 금지. 여기와 driver·headless 가 같은 판정을 본다.
     //   ⚠️boolean 으로 접지 않는다 — 루프가 `unknown` 을 그대로 봐야 상실과 갈린다.

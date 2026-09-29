@@ -1,5 +1,5 @@
 import type { DisplayCoordinator } from '../display/coordinator.js';
-import type { Action, DisplayMouseEvent, KeyEvent } from '../display/types.js';
+import type { DisplayMouseEvent } from '../display/types.js';
 import {
   showLivePaneMultiModal,
   showPaneMultiModal,
@@ -14,12 +14,8 @@ import {
   resolvePaneMultiLiveSnapshotChrome,
 } from '../dashboard/modals/pane-multi-chrome.js';
 import type { ThemeTokens } from '../theme/tokens.js';
-import { mintPaneId } from '../virtual-windows/addressing.js';
-import type { PaneBroadcast, PaneContent, PaneUnsubscribe } from '../virtual-windows/pane-content.js';
 import type { WidgetHost } from '../widgets/host.js';
 import type { PreviewPaneModel } from './model.js';
-import type { PreviewPaneRegistry } from './registry.js';
-import { pad, truncate, visibleWidth } from '../tui.js';
 
 export interface OpenPreviewPaneModalDeps {
   preview: PreviewPaneModel;
@@ -35,16 +31,6 @@ export interface OpenPreviewPaneModalDeps {
   theme: ThemeTokens;
   onDispose?(): void;
   onCancel?(): void;
-}
-
-export interface PreviewPaneContentSpec {
-  kind: 'vw-preview';
-  previewId: string;
-  title?: string;
-}
-
-export interface PreviewPaneMountDeps {
-  previewPaneRegistry: PreviewPaneRegistry;
 }
 
 export function createPreviewPaneModalWidgetId(
@@ -124,133 +110,6 @@ export function resolvePreviewPaneModalChromeAction(
   if (action.controlId !== 'close') return false;
   callbacks.onClose();
   return true;
-}
-
-function createObserver(): {
-  emit: () => void;
-  on: (event: 'update' | 'output' | 'exit', cb: () => void) => PaneUnsubscribe;
-} {
-  const subs = new Map<'update' | 'output' | 'exit', Set<() => void>>();
-  return {
-    emit() {
-      for (const cb of subs.get('update') ?? []) {
-        try { cb(); } catch { /* ignore */ }
-      }
-    },
-    on(event, cb) {
-      const set = subs.get(event) ?? new Set<() => void>();
-      set.add(cb);
-      subs.set(event, set);
-      return () => { set.delete(cb); };
-    },
-  };
-}
-
-function clampPreviewOffset(preview: PreviewPaneModel, rows: number): void {
-  const maxOffset = Math.max(0, preview.previewLines.length - Math.max(1, rows));
-  preview.previewOffset = Math.max(0, Math.min(preview.previewOffset, maxOffset));
-}
-
-function formatPreviewLine(line: string, width: number): string {
-  return visibleWidth(line) > width ? truncate(line, width) : pad(line, width);
-}
-
-export function createPreviewPaneContent(
-  spec: PreviewPaneContentSpec,
-  deps: PreviewPaneMountDeps,
-): PaneContent {
-  const preview = deps.previewPaneRegistry.get(spec.previewId);
-  if (!preview) {
-    throw new Error(`createPreviewPaneContent: unknown preview id "${spec.previewId}"`);
-  }
-  const obs = createObserver();
-  let lastRows = 8;
-
-  return {
-    id: mintPaneId(),
-    kind: spec.kind,
-    title: spec.title ?? 'preview',
-    focusPolicy: 'interactive',
-    start() {},
-    stop() {},
-    render(ctx) {
-      lastRows = Math.max(1, ctx.rows);
-      clampPreviewOffset(preview, ctx.rows);
-      const lines: string[] = [];
-      for (let i = 0; i < Math.max(1, ctx.rows); i++) {
-        const line = preview.previewLines[preview.previewOffset + i] ?? '';
-        lines.push(formatPreviewLine(line, ctx.cols));
-      }
-      return lines.join('\n');
-    },
-    onKey(ev: KeyEvent): Action {
-      const step = Math.max(1, lastRows);
-      if (ev.name === 'up' || ev.name === 'k') {
-        preview.previewOffset = Math.max(0, preview.previewOffset - 1);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'down' || ev.name === 'j') {
-        preview.previewOffset += 1;
-        clampPreviewOffset(preview, step);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'pageup') {
-        preview.previewOffset = Math.max(0, preview.previewOffset - step);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'pagedown') {
-        preview.previewOffset += step;
-        clampPreviewOffset(preview, step);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'home' || ev.name === 'g') {
-        preview.previewOffset = 0;
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.name === 'end' || (ev.name === 'G' && ev.shift)) {
-        preview.previewOffset = Math.max(0, preview.previewLines.length - step);
-        clampPreviewOffset(preview, step);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      return { type: 'none' };
-    },
-    onMouse(ev: DisplayMouseEvent): Action {
-      if (ev.type === 'scroll-up') {
-        preview.previewOffset = Math.max(0, preview.previewOffset - 3);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      if (ev.type === 'scroll-down') {
-        preview.previewOffset += 3;
-        clampPreviewOffset(preview, lastRows);
-        obs.emit();
-        return { type: 'refresh' };
-      }
-      return { type: 'none' };
-    },
-    write(bytes: string) {
-      preview.previewLines = bytes.split('\n');
-      preview.previewOffset = 0;
-      obs.emit();
-    },
-    acceptBroadcast(input: PaneBroadcast) {
-      preview.previewLines = input.text.split('\n');
-      preview.previewOffset = 0;
-      obs.emit();
-    },
-    capture() {
-      return preview.previewLines.join('\n');
-    },
-    get isAlive() { return true; },
-    on: obs.on,
-    dispose() {},
-  };
 }
 
 export function openPreviewPaneModal(

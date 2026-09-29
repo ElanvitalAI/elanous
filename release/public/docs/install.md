@@ -58,6 +58,15 @@ source ~/.bashrc
 elanous --version && elanous doctor
 ```
 
+Then add what the terminal and harness features need (measured on a fresh Debian 12):
+
+```bash
+sudo apt-get install -y build-essential ripgrep   # C++ build tools for the terminal (node-pty) · ripgrep
+elanous doctor --fix --yes                        # builds node-pty
+```
+
+The Codex CLI needs **Node.js 20 or newer** — Debian 12's own `nodejs` package is 18, so install Node from [nodejs.org](https://nodejs.org/en/download) (or your distribution's Node 20+ source) before `npm install -g @openai/codex`.
+
 That is enough to boot. To run the daemon and the harness, let `doctor` install what they need — build tools and the node-pty rebuild, a pinned static `gh`, `rg`, Node and the Codex CLI (about 80 seconds on a bare Debian 12 VM):
 
 ```bash
@@ -100,7 +109,7 @@ Your settings, logins and logs live in `~/.elanous`; your memory lives in `~/.lo
 
 ```bash
 elanous self-update                              # latest release; the previous version stays for rollback
-elanous self-update --version 0.1.1              # a specific release
+elanous self-update --version 0.2.3              # a specific release
 ln -sfn versions/<previous> ~/.local/share/elanous/current      # roll back
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/uninstall.sh | bash
 ```

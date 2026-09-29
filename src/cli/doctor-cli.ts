@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { createInterface } from 'node:readline/promises';
 import { closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir, tmpdir } from 'node:os';
@@ -8,6 +9,7 @@ import type { Command } from 'commander';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { discoverChromeBinary } from '../browser-cdp/client.js';
 import { listProviders } from '../oauth/store.js';
+import { detectLocale } from '../expression/locale.js';
 import { findRetiredConfigKeysInFile, getUserConfig, type RetiredConfigKey, type UserConfig } from '../user-config.js';
 import { codeRevision } from '../version/code-revision.js';
 import {
@@ -26,8 +28,11 @@ import {
   type SubstrateSignals,
 } from './doctor-readiness.js';
 import { debug } from '../debug/log.js';
-import { applyDoctorFixes, applyServiceRestart, applySudoFixes, planDoctorFixes, type DoctorFixDeps } from './doctor-fix.js';
-import { detectDistroFamily } from './doctor-distro.js';
+import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
+import { applyDoctorFixes, applyGitInstall, applyServiceRestart, applySudoFixes, planDoctorFixes, type DoctorFixDeps, type DoctorFixItem } from './doctor-fix.js';
+import { ADVISABLE_DOCTOR_FIX_IDS, adviseDoctorFixes, type DoctorAdvice } from './doctor-llm-assist.js';
+import { gitInstallPlan } from './git-install-plan.js';
+import { detectDistroFamily, parseOsRelease } from './doctor-distro.js';
 import { checkPythonEnv } from './python-cli.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
@@ -92,6 +97,7 @@ export interface DoctorReport {
   ok: boolean;
   credentials: DoctorCredential[];
   externalCommands: DoctorExternalCommand[];
+  requiredMissing?: string[];
   capabilitySummary?: DoctorCapabilitySummary;
   /** F1 readiness. Present on a successful report. Absent when the report itself failed. */
   readiness?: ReadinessReport;
@@ -121,6 +127,8 @@ export interface DoctorOptions {
   readFile?: (path: string) => string;
   exists?: (path: string) => boolean;
   commandExists?: (name: string) => boolean;
+  /** Whether this process runs as root (uid 0) — git install then skips sudo. Test seam. */
+  isRoot?: boolean;
   discoverChromeBinary?: () => string | null;
   loadNativeModule?: (name: string) => boolean;
   resolveNativeModuleDir?: (name: string) => string | null;
@@ -140,6 +148,8 @@ export interface DoctorOptions {
   codeRevision?: () => string | undefined;
   /** Read-only `GET /v1/health`. `null` means no response. */
   fetchHealth?: () => { daemonSha?: string } | null;
+  /** Test seam — daemon address. `null` means this universe has no daemon (do not guess a port). */
+  resolveDaemonEndpoint?: (opts?: ResolveDaemonEndpointOpts) => { healthUrl: string } | null;
   /**
    * Read-only install prefix. `null` means a checkout was confirmed.
    * Throw when the lookup itself fails — that is not a checkout.
@@ -155,7 +165,11 @@ export interface DoctorOptions {
   ghVersion?: () => string | null;
 }
 
-export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home' | 'readdir' | 'appendFile' | 'writeFile' | 'mkdir' | 'lstat' | 'chmod' | 'rename' | 'remove' | 'temporaryPath'> {
+export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home' | 'readdir' | 'appendFile' | 'writeFile' | 'mkdir' | 'lstat' | 'chmod' | 'rename' | 'remove' | 'temporaryPath' | 'installStaticTool' | 'smokeCheck' | 'pythonSetup' | 'recheckPythonEnv'> {
+  /** Git install-only seams; all other doctor repairs retain their existing consent rules. */
+  gitInteractive?: boolean;
+  confirmGitInstall?: (display: string) => Promise<boolean>;
+  runGitInstallCommand?: (command: string, args: readonly string[]) => { status: number | null };
   out?: { log: (value: string) => void };
   err?: { error: (value: string) => void };
   setExitCode?: (code: number) => void;
@@ -163,11 +177,15 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   applySudoFixes?: typeof applySudoFixes;
   /** D5 시험 seam — `--restart` 실행기. */
   applyServiceRestart?: typeof applyServiceRestart;
+  /** Read-only advice call; injection avoids any real LLM access in tests. */
+  adviseLlm?: (prompt: string, provider: string, model: string) => Promise<string>;
+  resolveAdviceProvider?: (config: UserConfig) => { provider: string; model: string; auth: string };
+  confirmAdvice?: (message: string) => Promise<boolean>;
+  adviceInteractive?: boolean;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const tavilyNames = new Set(['TAVILY_API_KEY', 'TAVILY_KEY']);
-const HEALTH_URL = 'http://127.0.0.1:31415/v1/health';
 
 function codexLoginPresent(providers: readonly string[]): boolean {
   return providers.some((name) => name === 'openai-codex' || name.startsWith('openai-codex:'));
@@ -186,8 +204,17 @@ function defaultCodeRevision(): string | undefined {
   }
 }
 
-function defaultFetchHealth(): { daemonSha?: string } | null {
-  const probe = spawnSync('curl', ['-fsS', '--max-time', '2', HEALTH_URL], {
+/** Test seam — records the curl argv `defaultFetchHealth` actually runs. */
+let fetchHealthSpawn: typeof spawnSync = spawnSync;
+
+export function setFetchHealthSpawnForTest(spawn: typeof spawnSync | null): void {
+  fetchHealthSpawn = spawn ?? spawnSync;
+}
+
+function defaultFetchHealth(resolveEndpoint: (opts?: ResolveDaemonEndpointOpts) => { healthUrl: string } | null = resolveDaemonEndpoint): { daemonSha?: string } | null {
+  const healthUrl = resolveEndpoint()?.healthUrl;
+  if (!healthUrl) return null;
+  const probe = fetchHealthSpawn('curl', ['-fsS', '--max-time', '2', healthUrl], {
     encoding: 'utf8',
     timeout: 3000,
     stdio: ['ignore', 'pipe', 'ignore'],
@@ -925,6 +952,28 @@ export function summarizeDoctorCapabilities(credentials: readonly DoctorCredenti
   return { available, unavailable, unknownCredentials };
 }
 
+function gitPlanFor(options: DoctorOptions) {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const exists = options.exists ?? existsSync;
+  const has = options.commandExists ?? ((name: string) => {
+    const extensions = platform === 'win32'
+      ? (env.PATHEXT?.split(';').filter(Boolean).map((extension) => extension.toLowerCase()) ?? ['.com', '.exe', '.bat', '.cmd'])
+      : [''];
+    return (env.PATH ?? '').split(options.pathDelimiter ?? delimiter).some((dir) =>
+      dir.length > 0 && extensions.some((extension) => exists(join(dir, `${name}${extension}`))));
+  });
+  let distro: string | undefined = options.readiness?.distro;
+  if (platform === 'linux' && (!distro || distro === 'unknown')) {
+    try {
+      const fields = parseOsRelease((options.readFile ?? ((path) => readFileSync(path, 'utf8')))('/etc/os-release'));
+      distro = fields.ID?.toLowerCase();
+      if (!distro || distro === 'unknown') distro = detectDistroFamily(platform, `ID_LIKE=${fields.ID_LIKE ?? ''}`);
+    } catch { distro = undefined; }
+  }
+  return gitInstallPlan({ platform, distro, has, isRoot: options.isRoot ?? (typeof process.getuid === 'function' && process.getuid() === 0) });
+}
+
 export function runDoctor(options: DoctorOptions = {}): DoctorReport {
   const root = options.repositoryRoot ?? repositoryRoot;
   const env = options.env ?? process.env;
@@ -983,6 +1032,11 @@ export function runDoctor(options: DoctorOptions = {}): DoctorReport {
         .find((candidate): candidate is { name: string; source: Exclude<CredentialSource, 'unresolved'> } => candidate.source !== 'unresolved');
       if (sibling) credential.satisfiedBy = sibling;
     }
+    const requiredMissing = externalCommands.commands
+      .filter((command) => command.tier === 'required' && (command.status === 'missing' || command.status === 'broken'))
+      .map((command) => command.name);
+    const missingGit = externalCommands.commands.find((command) => command.name === 'git' && command.status === 'missing');
+    if (missingGit) missingGit.fix = gitPlanFor(options).display;
     const evaluateReadiness = options.checkReadiness ?? checkReadiness;
     const readiness = options.readiness !== undefined
       ? options.readiness
@@ -994,7 +1048,7 @@ export function runDoctor(options: DoctorOptions = {}): DoctorReport {
         getConfig,
         listAuthProviders: options.listAuthProviders ?? defaultListAuthProviders,
         codeRevision: options.codeRevision ?? defaultCodeRevision,
-        fetchHealth: options.fetchHealth ?? defaultFetchHealth,
+        fetchHealth: options.fetchHealth ?? (() => defaultFetchHealth(options.resolveDaemonEndpoint ?? resolveDaemonEndpoint)),
         readInstallPrefix: options.readInstallPrefix ?? (() => defaultReadInstallPrefix(root, exists)),
         bunPin: options.bunPin ?? (() => readBunPin(root)),
         ghAuthStatus: options.ghAuthStatus ?? (() => defaultGhAuthStatus(commandExists)),
@@ -1010,6 +1064,7 @@ export function runDoctor(options: DoctorOptions = {}): DoctorReport {
       ok: true,
       credentials,
       externalCommands: externalCommands.commands,
+      requiredMissing,
       capabilitySummary: summarizeDoctorCapabilities(credentials),
       readiness: evaluateReadiness(readiness),
       retiredConfigKeys: findRetiredConfigKeysInFile(options.configPath, readFile),
@@ -1040,9 +1095,19 @@ function formatReadiness(readiness: ReadinessReport | undefined): string[] {
   ];
 }
 
+function humanFreeFallback(value: string): string {
+  return value.replace(/\s+/g, ' ')
+    .split(/\b(?:MEASURED|CHANGED)\s*(?::|\d{4}-\d{2}-\d{2})/i, 1)[0]!
+    .replace(/\(📏[^)]*\)/g, '')
+    .replace(/\s*[—–·]\s*(?:src|skills|scripts|catalog|test)\/.*$/g, '')
+    .replace(/\([^)]*\b(?:src|skills|scripts|catalog|test)\/[\w./:-]+[^)]*\)/g, '')
+    .replace(/\b(?:src|skills|scripts|catalog|test)\/[\w./:-]+|\b[\w-]+\.ts(?::\d+)?/g, '')
+    .replace(/\s{2,}/g, ' ').trim().replace(/[—–·;,\s]+$/, '');
+}
+
 function formatCapabilitySummary(summary: DoctorCapabilitySummary): string[] {
   const unavailable = summary.unavailable.map((capability) =>
-    `  ${capability.name} — unlock with ${capability.credential}${capability.freeFallback !== undefined ? `; free alternative: ${capability.freeFallback}` : ''}`,
+    `  ${capability.name} — unlock with ${capability.credential}${capability.freeFallback !== undefined && humanFreeFallback(capability.freeFallback) ? `; free alternative: ${humanFreeFallback(capability.freeFallback)}` : ''}`,
   );
   return [
     '할 수 있는 일:',
@@ -1054,16 +1119,24 @@ function formatCapabilitySummary(summary: DoctorCapabilitySummary): string[] {
   ];
 }
 
-export function formatDoctorReport(report: DoctorReport): string {
+export function formatDoctorReport(report: DoctorReport, options: { credentials?: boolean } = {}): string {
   if (!report.ok) return `Doctor failed: ${report.reason ?? 'unknown error'}`;
   const capabilitySummary = report.capabilitySummary ?? summarizeDoctorCapabilities(report.credentials);
+  const requiredMissing = report.requiredMissing ?? report.externalCommands
+    .filter((command) => command.tier === 'required' && (command.status === 'missing' || command.status === 'broken'))
+    .map((command) => command.name);
+  const resolved = report.credentials.filter((credential) => credential.resolved).length;
+  const satisfied = report.credentials.filter((credential) => !credential.resolved && credential.satisfiedBy !== undefined).length;
   return [
-    ...report.credentials.map((credential) => [
+    ...formatReadiness(report.readiness),
+    ...(requiredMissing.length ? [`⛔ 필수 명령 없음: ${requiredMissing.join(', ')}`] : []),
+    `자격증명: ${resolved}/${report.credentials.length} resolved${satisfied ? ` · ${satisfied} satisfied by alternative names` : ''} · details: elanous doctor --credentials`,
+    ...(options.credentials ? report.credentials.map((credential) => [
       `${credential.name}: ${credential.resolved ? 'resolved' : 'unresolved'} (${credential.source}) — ${credential.note}`,
       ...(credential.satisfiedBy !== undefined ? [`  Satisfied by: ${credential.satisfiedBy.name} (${credential.satisfiedBy.source})`] : []),
       ...(credential.requiredFor !== undefined ? [`  Required for: ${credential.requiredFor.join(', ')}`] : []),
-      ...(credential.freeFallback !== undefined ? [`  Free fallback${credential.freeFallbackMode === 'auto' || credential.freeFallbackMode === 'manual' || credential.freeFallbackMode === 'none' ? ` [${credential.freeFallbackMode}]` : ''}: ${credential.freeFallback}`] : []),
-    ].join('\n')),
+      ...(credential.freeFallback !== undefined ? [`  Free fallback${credential.freeFallbackMode === 'auto' || credential.freeFallbackMode === 'manual' || credential.freeFallbackMode === 'none' ? ` [${credential.freeFallbackMode}]` : ''}: ${humanFreeFallback(credential.freeFallback)}`] : []),
+    ].join('\n')) : []),
     ...(report.catalogMetadataUnavailable ? ['Catalog metadata unavailable: could not read catalog/resources.yaml.'] : []),
     ...(report.retiredConfigKeys ?? []).map(({ path, reason }) => `더는 안 쓰는 설정 키: ${path} — ${reason}`),
     'External commands:',
@@ -1078,10 +1151,63 @@ export function formatDoctorReport(report: DoctorReport): string {
     }),
     ...(report.externalCommandsCatalogUnavailable ? [`External commands catalog unavailable: ${report.externalCommandsCatalogReason ?? 'catalog/external-commands.yaml is unavailable.'}`] : []),
     ...formatCapabilitySummary(capabilitySummary),
-    // 준비 상태는 «맨 끝» — 터미널에서 보이는 것은 끝이다. 09-25 베어 ubuntu:24.04: 224줄 중 준비 상태가
-    // 「못 하는 일」 40여 줄 위에 묻혀 스크롤 밖이었다.
-    ...formatReadiness(report.readiness),
   ].join('\n');
+}
+
+async function requestDoctorAdvice(report: DoctorReport, plan: ReturnType<typeof planDoctorFixes>, deps: DoctorCliDeps): Promise<DoctorAdvice & { provider: string; model: string; ms: number }> {
+  const started = Date.now();
+  const locale = detectLocale(process.env);
+  let provider = 'auto';
+  let model = '(none)';
+  const failure = (reason: string) => ({ ok: false, reason, summary: '', order: [], manual: [], dropped: 0, provider, model, ms: Date.now() - started });
+  const log = (event: 'requested' | 'advised' | 'failed', orderCount = 0, dropped = 0) =>
+    debug.log('doctor.advise', event, { provider, model, locale, ms: Date.now() - started, orderCount, dropped, applied: 0 });
+  log('requested');
+  try {
+    const config = deps.userConfig ?? (deps.getUserConfig ?? getUserConfig)();
+    const llm = await import('../llm.js');
+    const selected = (deps.resolveAdviceProvider ?? llm.decideProviderForConfig)(config);
+    provider = selected.provider.replace(/^auto:/, '');
+    model = selected.model;
+    if (selected.auth === 'none' || provider === 'auto' || !llm.PROVIDERS[provider]) {
+      log('failed');
+      const remedy = report.readiness?.items.find((item) => item.id === 'provider-decision')?.remedy ?? 'elanous login openai-codex';
+      return failure(`LLM 없음 — 구독이 있으면 \`elanous llm detect --probe --apply\`, 없으면 \`${remedy}\`(기기 코드) 뒤 다시 \`elanous doctor --advise\``);
+    }
+    const advice = await adviseDoctorFixes({
+      locale,
+      report: report.readiness ?? { items: [] },
+      plan: { ...plan, items: plan.items.filter((item) => item.status === 'fixable' && ADVISABLE_DOCTOR_FIX_IDS.has(item.id)) },
+      llm: (prompt) =>
+      deps.adviseLlm ? deps.adviseLlm(prompt, provider, model) : llm.streamLLM([
+        { role: 'system', content: 'Read-only diagnosis. Return JSON only. Never execute commands.' },
+        { role: 'user', content: prompt },
+      ], () => {}, { provider: llm.PROVIDERS[provider], model }),
+    });
+    log(advice.ok ? 'advised' : 'failed', advice.order.length, advice.dropped);
+    return { ...advice, provider, model, ms: Date.now() - started };
+  } catch {
+    log('failed');
+    return failure('LLM failed or timed out');
+  }
+}
+
+function formatDoctorAdvice(advice: DoctorAdvice): string {
+  if (!advice.ok) return advice.reason ?? 'LLM failed or timed out';
+  return [
+    `LLM 조언: ${advice.summary}`,
+    '순서  항목  수리 id  이유',
+    ...advice.order.map((entry, index) => `${index + 1}.  ${entry.readinessId}  ${entry.fixId ?? '사람 할 일'}  ${entry.why}`),
+    ...advice.manual.map((entry) => `사람 할 일: ${entry}`),
+    `버린 제안 ${advice.dropped}개`,
+  ].join('\n');
+}
+
+async function confirmDoctorAdvice(message: string, json: boolean): Promise<boolean> {
+  const prompt = createInterface({ input: process.stdin, output: json ? process.stderr : process.stdout });
+  try { return /^(y|yes)$/i.test((await prompt.question(message)).trim()); }
+  catch { return false; }
+  finally { prompt.close(); }
 }
 
 export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}): void {
@@ -1091,13 +1217,20 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
   program.command('doctor')
     .description('Reports whether credentials resolve and where each resolution comes from')
     .option('--json', 'structured output')
-    .option('--fix', 'show reversible repairs (read-only unless --yes)')
+    .option('--credentials', 'show per-credential details in human-readable output')
+    .option('--fix', 'show repairs; git installation asks on a TTY (other repairs require --yes)')
+    .option('--advise', 'ask the configured LLM to rank catalog repairs (read-only advice)')
     .option('--yes', 'apply planned doctor repairs (requires --fix)')
     .option('--sudo', 'also run the planned sudo install lines — only where `sudo -n true` works (requires --fix --yes)')
     .option('--restart', 'restart the nexus service when it runs a different version than this installed copy, then verify it (requires --fix --yes · interrupts bots, terminals and running turns)')
-    .action(async (opts: { json?: boolean; fix?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
+    .action(async (opts: { json?: boolean; credentials?: boolean; fix?: boolean; advise?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
       if (opts.yes && !opts.fix) {
         err.error('--yes requires --fix');
+        setExitCode(1);
+        return;
+      }
+      if (opts.advise && (opts.sudo || opts.restart)) {
+        err.error('--advise does not run --sudo or --restart; use the deterministic --fix path for those actions');
         setExitCode(1);
         return;
       }
@@ -1117,8 +1250,9 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         setExitCode(1);
         return;
       }
-      if (!opts.fix) {
-        out.log(opts.json ? JSON.stringify(report, null, 2) : formatDoctorReport(report));
+      if (!opts.fix && !opts.advise) {
+        out.log(opts.json ? JSON.stringify(report, null, 2) : formatDoctorReport(report, { credentials: opts.credentials }));
+        if (report.requiredMissing?.length) setExitCode(1);
         return;
       }
       const makeFixes = (source: DoctorReport): DoctorFixDeps => ({
@@ -1134,7 +1268,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           getConfig: deps.getUserConfig ?? getUserConfig,
           listAuthProviders: deps.listAuthProviders ?? defaultListAuthProviders,
           codeRevision: deps.codeRevision ?? defaultCodeRevision,
-          fetchHealth: deps.fetchHealth ?? defaultFetchHealth,
+          fetchHealth: deps.fetchHealth ?? (() => defaultFetchHealth(deps.resolveDaemonEndpoint ?? resolveDaemonEndpoint)),
           readInstallPrefix: deps.readInstallPrefix ?? (() => defaultReadInstallPrefix(deps.repositoryRoot ?? repositoryRoot, deps.exists ?? existsSync)),
           ghAuthStatus: deps.ghAuthStatus ?? (() => null),
           // gh 판은 수리 계획에 쓰인다(낡은 gh → 정적 gh) — 🩸 09-25: 여기서 안 재서 계획은 보고서에만 뜨고 적용이 안 됐다.
@@ -1157,36 +1291,101 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         rename: deps.rename,
         remove: deps.remove,
         temporaryPath: deps.temporaryPath,
+        installStaticTool: deps.installStaticTool,
+        smokeCheck: deps.smokeCheck,
+        pythonSetup: deps.pythonSetup,
+        recheckPythonEnv: deps.recheckPythonEnv,
         // 키 캐시에서 다룰 이름 = doctor 가 보고하는 자격 이름(같은 `.env.example` · 소문자) — 다른 프로그램 캐시는 안 건드린다.
         keyNames: fixKeyNames(deps),
       });
       const fixes = makeFixes(report);
-      // registerDoctorCommand is the CLI caller: planning never writes; only --fix --yes reaches application.
+      // Planning never writes; existing repairs require --yes, while git alone can use affirmative TTY consent.
       const plan = planDoctorFixes(fixes);
+      const advice = opts.advise ? await requestDoctorAdvice(report, plan, deps) : undefined;
+      if (!opts.fix) {
+        out.log(opts.json
+          ? JSON.stringify({ ...report, advise: advice }, null, 2)
+          : [formatDoctorReport(report, { credentials: opts.credentials }), formatDoctorAdvice(advice!)].join('\n'));
+        if (report.requiredMissing?.length) setExitCode(1);
+        return;
+      }
+      const selected = advice?.ok
+        ? new Set<DoctorFixItem['id']>(advice.order.flatMap((entry): DoctorFixItem['id'][] => entry.fixId && entry.fixId !== 'git-install' && ADVISABLE_DOCTOR_FIX_IDS.has(entry.fixId) ? [entry.fixId] : []))
+        : undefined;
+      const selectedGit = advice?.ok ? advice.order.some((entry) => entry.fixId === 'git-install') : true;
+      const selectedCount = plan.items.filter((item) => item.status === 'fixable' && selected?.has(item.id)).length
+        + (selectedGit && advice?.ok && report.externalCommands.some((command) => command.name === 'git' && command.status === 'missing') ? 1 : 0);
+      const interactive = deps.adviceInteractive ?? (process.stdin.isTTY === true && (opts.json ? process.stderr.isTTY === true : process.stdout.isTTY === true));
+      if (advice?.ok && !opts.yes && interactive && selectedCount > 0) {
+        const preview = formatDoctorAdvice(advice);
+        if (opts.json) err.error(preview);
+        else out.log(preview);
+      }
+      const agreed = advice?.ok && !opts.yes && interactive && selectedCount > 0
+        ? await (deps.confirmAdvice ?? ((message) => confirmDoctorAdvice(message, opts.json === true)))(`위 ${selectedCount}개를 실행할까요? [y/N] `)
+        : false;
+      const applySelected = opts.yes || agreed;
+      const gitPlan = report.externalCommands.some((command) => command.name === 'git' && command.status === 'missing') ? gitPlanFor(deps) : undefined;
+      const installGit = () => applyGitInstall(gitPlan!, {
+        yes: advice?.ok ? applySelected : opts.yes,
+        interactive: advice?.ok ? false : deps.gitInteractive ?? (process.stdin.isTTY === true && (opts.json ? process.stderr.isTTY === true : process.stdout.isTTY === true)),
+        confirm: deps.confirmGitInstall,
+        run: deps.runGitInstallCommand,
+        platform: deps.platform ?? process.platform,
+        json: opts.json,
+      });
       // P5: sudo 설치 줄을 «먼저» 친다 — 빌드 도구가 서야 뒤의 node-pty 재빌드가 된다.
       const sudoResult = opts.sudo ? (deps.applySudoFixes ?? applySudoFixes)(plan.manual) : undefined;
       // sudo 로 뭔가 깔았으면 보고서·준비 상태를 «다시 잰다» — 빌드 도구가 선 뒤에야 node-pty 재빌드가 계획에 오른다.
       const afterSudo = sudoResult?.runs.some((entry) => entry.result === 'ran') ? makeFixes(runDoctor(deps)) : fixes;
-      const results = opts.yes ? applyDoctorFixes(afterSudo, true) : undefined;
+      let gitInstall: Awaited<ReturnType<typeof applyGitInstall>> | undefined;
+      let results: ReturnType<typeof applyDoctorFixes> | undefined;
+      if (advice?.ok && applySelected) {
+        // Invoke only known catalog operations, in the vetted order (including git).
+        const appliedItems: NonNullable<typeof results>['items'] = [];
+        for (const entry of advice.order) {
+          if (entry.fixId === 'git-install') {
+            if (gitPlan) gitInstall = await installGit();
+          } else if (entry.fixId && selected?.has(entry.fixId)) {
+            const single = applyDoctorFixes(afterSudo, true, new Set([entry.fixId]));
+            appliedItems.push(...single.items.filter((item) => item.id === entry.fixId));
+          }
+        }
+        const remaining = applyDoctorFixes(afterSudo, false, new Set<DoctorFixItem['id']>());
+        results = { items: [...appliedItems, ...remaining.items.filter((item) => !selected?.has(item.id))], exitCode: appliedItems.some((item) => item.result === 'failed') ? 1 : 0 };
+      } else {
+        gitInstall = gitPlan && selectedGit ? await installGit() : undefined;
+        results = applySelected ? applyDoctorFixes(afterSudo, true, selected) : undefined;
+      }
+      if (advice?.ok && (results || gitInstall?.ran)) debug.log('doctor.advise', 'applied', {
+        provider: advice.provider, model: advice.model, locale: detectLocale(process.env), ms: advice.ms, orderCount: advice.order.length,
+        dropped: advice.dropped, applied: (results?.items.filter((item) => item.result === 'fixed').length ?? 0) + (gitInstall?.ran && gitInstall.ok ? 1 : 0),
+      });
       // D5: 다른 수리가 다 끝난 «뒤» 재시작 — 서비스 파일을 고쳤으면 그 판으로 뜬다.
       const restartResult = opts.restart && afterSudo.readiness
         ? await (deps.applyServiceRestart ?? applyServiceRestart)({ readiness: afterSudo.readiness })
         : undefined;
       // PATH cannot change in this process; re-probe readiness rather than treating a saved block as PATH=ok.
-      const currentReport = results ? runDoctor(deps) : report;
-      if (opts.json) out.log(JSON.stringify({ report: currentReport, plan, manualCommands: manualCommandFixes(currentReport), ...(sudoResult ? { sudo: sudoResult } : {}), ...(results ? { results } : {}), ...(restartResult ? { restart: restartResult } : {}) }, null, 2));
+      const currentReport = results || gitInstall?.ran ? runDoctor(deps) : report;
+      if (gitInstall?.ran && gitInstall.ok && currentReport.requiredMissing?.includes('git')) {
+        gitInstall.detail = 'git init 성공 · 현재 doctor PATH 에서 git 을 찾지 못했습니다. 새 셸에서 다시 확인하세요.';
+      }
+      if (opts.json) out.log(JSON.stringify({ report: currentReport, plan, manualCommands: manualCommandFixes(currentReport), ...(gitPlan ? { gitPlan, gitInstall } : {}), ...(sudoResult ? { sudo: sudoResult } : {}), ...(results ? { results } : {}), ...(restartResult ? { restart: restartResult } : {}), ...(advice ? { advise: advice } : {}) }, null, 2));
       else out.log([
-        formatDoctorReport(currentReport),
+        formatDoctorReport(currentReport, { credentials: opts.credentials }),
+        ...(advice ? [formatDoctorAdvice(advice)] : []),
         '수정 계획:',
         ...plan.items.map((item) => `  ${item.id}: ${item.status} — ${item.path} — ${item.action}${item.reason ? ` — ${item.reason}` : ''}`),
         ...plan.manual.map((item) => `  ${item.id}: manual${item.remedy ? ` — ${item.remedy}` : ''}`),
         ...manualCommandFixes(currentReport).map((line) => `  ${line}`),
+        ...(gitInstall ? [`git 설치: ${gitInstall.detail}${gitPlan?.note ? ` — ${gitPlan.note}` : ''}`] : []),
         ...(sudoResult ? [sudoResult.sudoAvailable
           ? `sudo 설치: ${sudoResult.runs.length ? sudoResult.runs.map((entry) => `${entry.result} — ${entry.command}${entry.detail ? ` — ${entry.detail}` : ''}`).join(' · ') : '칠 줄 없음'}`
           : 'sudo 설치: 건너뜀 — 이 기계는 sudo 에 암호가 필요하다(sudo -n true 실패). 위 «manual» 줄을 직접 치세요.'] : []),
         ...(results ? ['적용 결과:', ...results.items.map((item) => `  ${item.id}: ${item.result} — ${item.path}${item.reason ? ` — ${item.reason}` : ''}`)] : ['적용하려면 --fix --yes']),
         ...(restartResult ? [`서비스 재시작: ${restartResult.result} — ${restartResult.reason}`] : []),
       ].join('\n'));
-      if (results) setExitCode(Math.max(results.exitCode, sudoResult?.exitCode ?? 0, restartResult?.result === 'failed' ? 1 : 0));
+      const exitCode = Math.max(results?.exitCode ?? 0, sudoResult?.exitCode ?? 0, restartResult?.result === 'failed' ? 1 : 0, currentReport.requiredMissing?.length ? 1 : 0, gitInstall?.ran && !gitInstall.ok ? 1 : 0);
+      if (results || exitCode) setExitCode(exitCode);
     });
 }

@@ -9,8 +9,10 @@ import { resetExternalWriteProvenanceForTesting } from './pty-write-provenance.j
 import { parsePtyWriteActor, resolveRemoteControlActor, type PtyWriteActor } from './pty-write-arbiter.js';
 import { isPtyAccessMode } from './pty-ref.js';
 import { debug } from '../debug/log.js';
+import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from './pty-mouse.js';
+import { startPtyRecording, stopPtyRecording } from './pty-recording.js';
 
-const OWNER_PTY_CONTROL_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'resize', 'snapshot', 'rename', 'terminate', 'capabilities'] as const;
+const OWNER_PTY_CONTROL_ACTIONS = ['takeover', 'release', 'input-text', 'input-key', 'input-mouse', 'resize', 'snapshot', 'rename', 'terminate', 'capabilities', 'record-start', 'record-stop'] as const;
 export type PtyControlAction = typeof OWNER_PTY_CONTROL_ACTIONS[number];
 type PtyControlStatus = 'success' | 'unknown-pty' | 'denied' | 'failed' | 'write-failed' | 'owner-unreachable';
 
@@ -33,9 +35,11 @@ function isStringList(value: unknown): value is readonly string[] {
 
 export type PtyControlPayload =
   | { readonly chars: string }
+  | PtyMouseInput
   | { readonly cols: number; readonly rows: number }
   | { readonly ansi: boolean }
-  | { readonly nickname: string };
+  | { readonly nickname: string }
+  | { readonly cols: number; readonly rows: number; readonly title?: string };
 
 export interface PtyControlRequestOptions {
   /** 요청자가 주장하는 쓰기 주체. `'agent'` 는 run-identity 일치를 요구한다(`resolveRemoteControlActor`). */
@@ -57,6 +61,10 @@ export interface PtyControlResult {
   readonly diagnostic?: 'owner-unavailable' | 'render-unavailable';
   readonly frameUnavailable?: boolean;
   readonly actions?: readonly string[];
+  readonly path?: string;
+  readonly recordingId?: string;
+  readonly bytes?: number;
+  readonly durationMs?: number;
 }
 
 interface ControlRow {
@@ -294,7 +302,41 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
       else if (!isOwnerPtyControlAction(row.action)) result = { status: 'denied', reason: 'unsupported-action' };
       else if (row.action === 'capabilities') result = { status: 'success', actions: OWNER_PTY_CONTROL_ACTIONS };
       else if (row.action === 'terminate') result = await terminatePty(handle);
-      else if (row.action === 'snapshot') {
+      else if (row.action === 'record-start' || row.action === 'record-stop') {
+        if (requested === null) result = { status: 'denied', reason: 'invalid-actor' };
+        else if (row.action === 'record-stop') {
+          const stopped = stopPtyRecording(row.pty_id);
+          result = stopped.ok
+            ? { status: 'success', path: stopped.path, bytes: stopped.bytes, durationMs: stopped.durationMs }
+            : { status: 'denied', reason: stopped.reason };
+        } else {
+          const payload = parsePayload(row);
+          if (payload !== null && (typeof payload !== 'object' || Array.isArray(payload)
+            || !('cols' in payload) || !('rows' in payload)
+            || !Number.isSafeInteger(payload.cols) || payload.cols < 1
+            || !Number.isSafeInteger(payload.rows) || payload.rows < 1
+            || ('title' in payload && payload.title !== undefined && typeof payload.title !== 'string'))) {
+            result = { status: 'denied', reason: 'invalid-record-payload' };
+          } else {
+            // The cast header must carry the PTY's real size, and only the owner knows it:
+            // a caller's cols/rows are never trusted, and an unknown size is refused, never guessed.
+            const cols = handle.cols;
+            const rows = handle.rows;
+            if (cols === undefined || rows === undefined) {
+              result = { status: 'denied', reason: 'dimensions-unknown' };
+            } else {
+              const started = startPtyRecording(row.pty_id, {
+                cols,
+                rows,
+                ...(payload && 'title' in payload && typeof payload.title === 'string' ? { title: payload.title } : {}),
+              });
+              result = started.ok
+                ? { status: 'success', recordingId: started.recordingId, path: started.path }
+                : { status: 'denied', reason: started.reason };
+            }
+          }
+        }
+      } else if (row.action === 'snapshot') {
         if (!handle.renderScreen) {
           result = { status: 'failed', reason: 'screen-unavailable' };
         }
@@ -355,6 +397,18 @@ async function processPtyControlRequestsOnce(getHandle: (id: string) => PtyContr
             : outcome === 'denied'
               ? { status: 'denied', reason: 'write-arbiter' }
               : { status: 'failed', reason: 'resize-error' };
+        } else if (row.action === 'input-mouse' && 'kind' in payload && 'x' in payload && 'y' in payload) {
+          let chars: string | undefined;
+          try { chars = encodeSgrMouse(payload); }
+          catch { result = { status: 'denied', reason: 'invalid-mouse-payload' }; }
+          if (chars !== undefined) {
+            const off = mouseModeOffReason(handle);
+            if (off) result = { status: 'denied', reason: off };
+            else {
+              const outcome = writePtyWithOutcome(handle, chars, authorized.actor);
+              result = outcome === 'success' ? { status: 'success' } : outcome === 'denied' ? { status: 'denied', reason: 'write-arbiter' } : { status: 'write-failed', reason: 'adapter-write' };
+            }
+          }
         } else if ((row.action === 'input-text' || row.action === 'input-key') && 'chars' in payload) {
           // ⛔⭐ 여기서 세지 «않는다» — 계기는 `registry.write`(진짜 초크포인트)에 있다.
           //   여기서도 세면 크로스-프로세스 쓰기가 **두 번** 세어진다(`[S]` 리뷰 후 이동).

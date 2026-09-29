@@ -74,7 +74,8 @@ function bootHarness(opts: HarnessOpts = {}): ToxBootHandle {
     surfaces: { llmDirect: opts.llmCallable ?? defaultLlm },
     decompose: opts.decompose,
     terminationCheck: opts.terminationCheck,
-    budgetCheck: opts.budgetCheck,
+    // The TOX loop's default gate reads live provider usage (~2s, and `stop` with no LLM chain) — tests admit by default.
+    budgetCheck: opts.budgetCheck ?? (async () => ({ canAfford: true, tripped: [] })),
     hasPendingCritical: opts.hasPendingCritical,
     regenerateObjective: opts.regenerateObjective,
     andon: opts.andon,

@@ -5,17 +5,22 @@
 // ⛔ 이 파일은 화면에 «찍지 않는다» — 호출자가 표현을 소유한다.
 
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 
 import { debug } from '../debug/log.js';
-import { reportDesignTokens } from './design-tokens.js';
+import { readCssRootTokens } from './css-root-tokens.js';
+import { reportDesignTokens, type DeclaredToken } from './design-tokens.js';
 import { lintArtifact, type LintResult } from './lint-artifact.js';
 
 export interface LintDesignInput {
   readonly htmlPath: string;
   readonly cssPath?: string;
   readonly designPath?: string;
+  /** 고른 디자인 시스템의 `tokens.css` — 안 주면 씨앗의 `## Design direction` 절 `- tokens:` 줄에서 찾는다. */
+  readonly tokensPath?: string;
 }
+
+export type TokensSource = 'flag' | 'design-direction' | 'none';
 
 export interface LintDesignRun extends LintResult {
   readonly htmlPath: string;
@@ -24,8 +29,29 @@ export interface LintDesignRun extends LintResult {
   readonly cssFound: boolean;
   readonly designPath: string;
   readonly designFound: boolean;
+  readonly tokensPath: string | null;
+  readonly tokensFound: boolean;
+  readonly tokensSource: TokensSource;
+  /** 씨앗 절 토큰 ⊕ `tokens.css` `:root` 토큰(같은 이름이면 씨앗이 이긴다). */
   readonly paletteCount: number;
   readonly typographyCount: number;
+}
+
+/** 씨앗 `## Design direction` 절의 `- tokens: <상대 경로>` — 씨앗 폴더 기준. 없으면 null. */
+export function tokensPathFromDesignDirection(designMarkdown: string, designPath: string): string | null {
+  let inSection = false;
+  for (const line of designMarkdown.split(/\r?\n/)) {
+    if (/^##\s/.test(line)) { inSection = /^##\s+Design direction\s*$/i.test(line); continue; }
+    if (!inSection) continue;
+    const match = /^\s*-\s*tokens:\s*(\S.*?)\s*$/.exec(line);
+    if (match) return resolve(dirname(designPath), match[1]);
+  }
+  return null;
+}
+
+function mergeTokens(primary: readonly DeclaredToken[], secondary: readonly DeclaredToken[]): DeclaredToken[] {
+  const names = new Set(primary.map((t) => t.name));
+  return [...primary, ...secondary.filter((t) => !names.has(t.name))];
 }
 
 /** @throws HTML 을 못 읽으면 던진다 — 호출자가 표현한다. */
@@ -41,23 +67,36 @@ export function runLintDesign(input: LintDesignInput): LintDesignRun {
 
     const designPath = input.designPath ?? join(dirname(input.htmlPath), 'DESIGN.md');
     const designFound = existsSync(designPath);
-    const tokens = designFound ? reportDesignTokens(readFileSync(designPath, 'utf8')) : null;
+    const designMarkdown = designFound ? readFileSync(designPath, 'utf8') : '';
+    const tokens = designFound ? reportDesignTokens(designMarkdown) : null;
+
+    // ⛔ 토큰 파일이 없으면 지금과 «같은» 결과 — 씨앗 절 토큰만 쓴다.
+    const directionTokensPath = designFound ? tokensPathFromDesignDirection(designMarkdown, designPath) : null;
+    const tokensPath = input.tokensPath ?? directionTokensPath;
+    const tokensSource: TokensSource = input.tokensPath !== undefined ? 'flag' : directionTokensPath ? 'design-direction' : 'none';
+    const tokensFound = tokensPath !== null && existsSync(tokensPath);
+    const rootTokens = tokensFound ? readCssRootTokens(readFileSync(tokensPath, 'utf8')) : null;
+    const palette = mergeTokens(tokens?.palette.tokens ?? [], rootTokens?.palette ?? []);
+    const typography = mergeTokens(tokens?.typography.tokens ?? [], rootTokens?.typography ?? []);
 
     const result = lintArtifact({
       html, css,
-      declaredTokens: tokens ? [...tokens.palette.tokens, ...tokens.typography.tokens] : undefined,
+      declaredTokens: tokens || rootTokens ? [...palette, ...typography] : undefined,
     });
 
     const run = {
       ...result,
       htmlPath: input.htmlPath, cssPath, cssFound, designPath, designFound,
-      paletteCount: tokens?.palette.tokens.length ?? 0,
-      typographyCount: tokens?.typography.tokens.length ?? 0,
+      tokensPath, tokensFound, tokensSource,
+      paletteCount: palette.length,
+      typographyCount: typography.length,
     };
     debug.log('design.lint', 'done', {
       htmlPath: run.htmlPath,
       cssPath: run.cssPath,
       designPath: run.designPath,
+      tokensSource: run.tokensSource,
+      tokensFound: run.tokensFound,
       p0Count: run.p0Count,
       advisoryCount: run.advisoryCount,
       uncheckedRuleCount: run.skipped.length,
@@ -75,6 +114,7 @@ export function formatLintDesignRun(r: LintDesignRun): string[] {
     `◆ design-lint — ${r.htmlPath}`,
     `  CSS     ${r.cssFound ? r.cssPath : '🔴 못 찾았다 — CSS 규칙은 «검사 안 됨»이다'}`,
     `  씨앗    ${r.designFound ? `${r.designPath} (토큰 ${r.paletteCount}색 · ${r.typographyCount}타이포)` : '🔴 없다 — 씨앗 의존 규칙은 «검사 안 됨»'}`,
+    `  토큰    ${r.tokensPath === null ? '없음 (방향 절에 tokens 줄이 없다)' : `${r.tokensFound ? r.tokensPath : `🔴 못 찾았다 — ${r.tokensPath}`} (출처 ${r.tokensSource})`}`,
     `  ── 결과 ──`,
     `  ⛔ P0 위반   ${r.p0Count}`,
     `  ⚠️ advisory  ${r.advisoryCount}`,

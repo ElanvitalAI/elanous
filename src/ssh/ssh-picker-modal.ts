@@ -1,6 +1,6 @@
 // SSH host picker modal — T4-E4.
 //
-// Sibling of session-picker-modal + window-picker-modal. Wraps
+// Sibling of session-picker-modal. Wraps
 // createSearchModal with the registered SSH hosts so Ctrl+K pops
 // a fuzz-matchable list; Enter switches the browser pane into
 // remote mode against the selected host, Esc cancels.

@@ -59,6 +59,14 @@ describe('dispatchDashboardSlashExecute', () => {
     expect(called).toBe(false);
   });
 
+  test('retired unreachable slash refuses before calling handler', async () => {
+    let called = false;
+    const handler = async () => { called = true; return { ok: true, name: 'bench', args: [] }; };
+    const r = await dispatchDashboardSlashExecute({ name: 'bench' }, { handler });
+    expect(r.output).toContain('not on the LLM allow-list');
+    expect(called).toBe(false);
+  });
+
   test('allow-listed slash dispatches + captures log lines', async () => {
     const handler = async ({ name, args }: { name: string; args: string[] }) => ({
       ok: true,
@@ -104,7 +112,9 @@ describe('dispatchDashboardSlashExecute', () => {
 
   test('allow-list includes common commands', () => {
     expect(ALLOWED_SLASHES).toContain('term');
-    expect(ALLOWED_SLASHES).not.toContain('window'); // D1a: VW `/window` 는 essential 에서 지워졌다
+    for (const retired of ['window', 'view', 'bench', 'scratch', 'sc', 'fullscreen', 'fs', 'claude-vw', 'codex-vw', 'acp-vw', 'dm']) {
+      expect(ALLOWED_SLASHES).not.toContain(retired);
+    }
     expect(ALLOWED_SLASHES).toContain('claude');
     expect(ALLOWED_SLASHES).not.toContain('quit');
     expect(ALLOWED_SLASHES).not.toContain('debug');

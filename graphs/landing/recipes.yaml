@@ -1,0 +1,8 @@
+collect:
+  command: 'bun scripts/landing-heal/run-mission.ts collect'
+must-fix-match:
+  command: 'bun scripts/landing-heal/run-mission.ts must-fix-match'
+verify-needed:
+  command: 'bun scripts/landing-heal/run-mission.ts verify-needed'
+report:
+  command: 'bun scripts/landing-heal/run-mission.ts report'

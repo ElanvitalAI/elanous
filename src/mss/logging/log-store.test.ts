@@ -27,7 +27,7 @@ import {
 import { debug } from '../../debug/log.js';
 import { resetNestBootObservationForTest } from '../../agent/nest-depth.js';
 import * as nestDepth from '../../agent/nest-depth.js';
-import { resetEffectiveInstanceRoot, setTreeDerivedTestForTesting } from '../../instance/resolve.js';
+import { prodInstanceRoot, resetEffectiveInstanceRoot, setTreeDerivedTestForTesting } from '../../instance/resolve.js';
 
 function rec(over: Partial<LogRecord> = {}): LogRecord {
   return {
@@ -57,6 +57,87 @@ describe('deriveLogLevel — 명시 level only · 기본 debug (OH10 PR-b2)', ()
     expect(deriveLogLevel(rec({ event: 'boot' }))).toBe('debug');
     expect(deriveLogLevel(rec({ event: 'phase' }))).toBe('debug');
   });
+});
+
+describe('LogStore writer contention', () => {
+  it('exposes a 5000ms writer timeout without changing the read-only timeout', () => {
+    const store = new LogStore(':memory:');
+    try {
+      expect(((store as unknown as { db: Database }).db.query('PRAGMA busy_timeout').get() as { timeout: number }).timeout).toBe(5000);
+    } finally { store.close(); }
+  });
+
+  it('carries a failed open observation to the next writable connection', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-log-loss-'));
+    const path = join(dir, 'logs.db');
+    const db = new Database(path);
+    db.run(`CREATE TABLE logs (id INTEGER PRIMARY KEY, ts TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+      level TEXT NOT NULL, instance TEXT NOT NULL DEFAULT '', surface TEXT NOT NULL,
+      category TEXT NOT NULL, event TEXT NOT NULL, session_id TEXT, trace_id TEXT, data TEXT)`);
+    db.run('PRAGMA journal_mode = WAL');
+    db.run('BEGIN EXCLUSIVE');
+    const observed: LogRecord[] = [];
+    const off = debug.registerSink({ name: 'busy-loss-test', emit: (row) => observed.push(row) });
+    const stderr = spyOn(process.stderr, 'write').mockImplementation(() => true);
+    try {
+      expect(() => new LogStore(path)).toThrow();
+      expect(stderr.mock.calls.some(([line]) => String(line).includes('[store.sqlite] busy-lost'))).toBe(true);
+      db.run('COMMIT');
+      const store = new LogStore(path);
+      try {
+        expect(observed.some((row) => row.category === 'store.sqlite' && row.event === 'busy-lost'
+          && (row.data as { store: string; op: string; waitedMs: number }).store === 'logs'
+          && (row.data as { op: string }).op === 'open')).toBe(true);
+        expect(store.query({ exactCategories: ['store.sqlite'], events: ['busy-lost'] })).toHaveLength(1);
+      } finally { store.close(); }
+    } finally {
+      try { db.run('ROLLBACK'); } catch { /* already committed */ }
+      db.close();
+      off();
+      stderr.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  it('opens and persists a row while a second connection holds BEGIN IMMEDIATE for 1.5 seconds', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-log-busy-'));
+    const path = join(dir, 'logs.db');
+    const seed = new Database(path);
+    seed.run(`CREATE TABLE logs (id INTEGER PRIMARY KEY, ts TEXT NOT NULL, ts_ms INTEGER NOT NULL,
+      level TEXT NOT NULL, instance TEXT NOT NULL DEFAULT '', surface TEXT NOT NULL,
+      category TEXT NOT NULL, event TEXT NOT NULL, session_id TEXT, trace_id TEXT, data TEXT)`);
+    seed.close();
+    const holder = Bun.spawn({
+      cmd: [process.execPath, '-e', `import { Database } from 'bun:sqlite';
+        const db = new Database(process.argv[1]);
+        db.run('BEGIN IMMEDIATE');
+        console.log('locked');
+        setTimeout(() => { db.run('COMMIT'); db.close(); }, 1500);`, path],
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    try {
+      const reader = holder.stdout.getReader();
+      const ready = await reader.read();
+      reader.releaseLock();
+      expect(new TextDecoder().decode(ready.value)).toContain('locked');
+      const openedAt = Date.now();
+      const writer = new LogStore(path);
+      try {
+        expect(((writer as unknown as { db: Database }).db.query('PRAGMA busy_timeout').get() as { timeout: number }).timeout).toBe(5000);
+        expect(Date.now() - openedAt).toBeGreaterThanOrEqual(1000);
+        writer.insertBatch([{ rec: rec({ event: 'after-lock' }), surface: 'nexus' }]);
+        expect(writer.count()).toBe(1);
+        const check = new Database(path, { readonly: true });
+        try { expect((check.query('SELECT COUNT(*) AS count FROM logs').get() as { count: number }).count).toBe(1); }
+        finally { check.close(); }
+      } finally { writer.close(); }
+      expect(await holder.exited).toBe(0);
+    } finally {
+      if (holder.exitCode === null) holder.kill();
+      await holder.exited;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 describe('LogStore host identity', () => {
@@ -120,6 +201,46 @@ describe('LogStore — 적재/조회/보존', () => {
     expect(rows[1]!.level).toBe('debug');
     expect(JSON.parse(rows[1]!.data!)).toEqual({ elapsedMs: 12 });
     store.close();
+  });
+
+  it('aggregateRuns groups valid JSON by run, filters before grouping and bounds only the run count', () => {
+    const store = new LogStore(':memory:');
+    const base = Date.parse('2026-09-28T00:00:00.000Z');
+    try {
+      store.insertBatch([
+        { rec: rec({ ts: new Date(base).toISOString(), data: { run_id: 'old', parentRunId: 'parent' } }), surface: 'nexus' },
+        { rec: rec({ ts: new Date(base + 1000).toISOString(), data: { runId: 'old', parentRunId: '' } }), surface: 'nexus' },
+        { rec: rec({ ts: new Date(base + 2000).toISOString(), data: { runId: 'new' } }), surface: 'pwa' },
+        { rec: rec({ ts: new Date(base + 3000).toISOString(), data: { runId: '' } }), surface: 'nexus' },
+        { rec: rec({ ts: new Date(base + 4000).toISOString() }), surface: 'nexus' },
+      ]);
+      const db = (store as unknown as { db: Database }).db;
+      db.run("INSERT INTO logs (ts, ts_ms, level, instance, surface, category, event, data) VALUES (?, ?, 'info', 'prod', 'nexus', 'test', 'bad', '{bad')", [new Date(base + 5000).toISOString(), base + 5000]);
+      expect(store.aggregateRuns({ sinceMs: base, untilMs: base + 2500 }, 10)).toEqual([
+        { runId: 'new', parentRunId: null, firstTs: new Date(base + 2000).toISOString(), lastTs: new Date(base + 2000).toISOString(), rows: 1 },
+        { runId: 'old', parentRunId: 'parent', firstTs: new Date(base).toISOString(), lastTs: new Date(base + 1000).toISOString(), rows: 2 },
+      ]);
+      expect(store.aggregateRuns({ surfaces: ['nexus'], sinceMs: base, untilMs: base + 2500 }, 1).map((run) => run.runId)).toEqual(['old']);
+      expect(store.count()).toBe(6);
+    } finally { store.close(); }
+  });
+
+  it('aggregateRuns chooses first and last timestamps by ts_ms across different timezone offsets', () => {
+    const store = new LogStore(':memory:');
+    const firstTs = '2026-09-28T10:00:00+09:00'; // 01:00Z, lexically later than the last timestamp
+    const lastTs = '2026-09-28T03:00:00+00:00';
+    try {
+      store.insertBatch([
+        { rec: rec({ ts: lastTs, data: { runId: 'offset-run' } }), surface: 'nexus' },
+        { rec: rec({ ts: firstTs, data: { run_id: 'offset-run', parentRunId: 'parent' } }), surface: 'nexus' },
+      ]);
+      expect(store.aggregateRuns({}, 10)).toEqual([
+        { runId: 'offset-run', parentRunId: 'parent', firstTs, lastTs, rows: 2 },
+      ]);
+      expect(store.aggregateRuns({ sinceMs: Date.parse(lastTs) }, 10)).toEqual([
+        { runId: 'offset-run', parentRunId: null, firstTs: lastTs, lastTs, rows: 1 },
+      ]);
+    } finally { store.close(); }
   });
 
   it('countMatching 은 조회 상한 없이 같은 필터의 전체 일치 수를 센다', () => {
@@ -984,8 +1105,8 @@ describe('인스턴스 identity (LF7-a) — 멀티 엘라누스 출처 스탬프
     }
   }
 
-  it('ELANOUS_STATE_DIR 미설정 → prod', () => {
-    withStateDir(undefined, () => {
+  it('운영 루트를 명시했을 때만 prod 이름을 쓴다', () => {
+    withStateDir(prodInstanceRoot(), () => {
       expect(resolveLogInstanceName()).toBe('prod');
     });
   });
@@ -1003,7 +1124,7 @@ describe('인스턴스 identity (LF7-a) — 멀티 엘라누스 출처 스탬프
   });
 
   it('setLogInstanceName 오버라이드가 유도보다 이긴다 · 빈 문자열은 무시', () => {
-    withStateDir(undefined, () => {
+    withStateDir(prodInstanceRoot(), () => {
       expect(resolveLogInstanceName()).toBe('prod');
       setLogInstanceName('pilot-2');
       try {

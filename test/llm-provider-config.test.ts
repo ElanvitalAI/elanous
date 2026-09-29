@@ -5,15 +5,14 @@
 //   - Honors explicit provider + apiKey + model + baseUrl overrides.
 //   - Exposes the new 'openai-codex' provider.
 //
-// Does NOT make real HTTP calls — we only inspect .name, .defaultModel,
-// and .available(). Streaming behavior is covered by the integration
-// tests that run against stubbed fetch.
+// Exercises provider selection and the Codex streaming wire against an
+// isolated local HTTP server; never calls a live provider endpoint.
 
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getProviderForConfig, noProviderAvailableMessage, CODEX_DEFAULT_MODEL, PROVIDERS, isLoopbackBaseUrl, decideProviderForConfig, finalizeProviderModelCompatibility, resolveDefaultProvider, streamLLM, type ProviderDecision } from '../src/llm';
+import { getProvider, getProviderForConfig, noProviderAvailableMessage, CODEX_DEFAULT_MODEL, PROVIDERS, isLoopbackBaseUrl, decideProviderForConfig, finalizeProviderModelCompatibility, resolveDefaultProvider, streamLLM, type ProviderDecision } from '../src/llm';
 import { inspectActiveProvider } from '../src/provider-summary';
 import { resolveActiveProvider, setUserConfigOverlay, type UserConfig } from '../src/user-config';
 import { saveTokens, loadTokens } from '../src/oauth/store';
@@ -55,7 +54,7 @@ function writeGrokSubscriptionCredential(): void {
 }
 
 beforeEach(() => {
-  for (const k of ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL']) {
+  for (const k of ['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY', 'LOCAL_LLM_URL']) {
     savedEnv[k] = process.env[k];
     delete process.env[k];
   }
@@ -78,6 +77,7 @@ beforeEach(() => {
   spyOn(config, 'getAnthropicApiKey').mockImplementation(() => process.env.ANTHROPIC_API_KEY);
   spyOn(config, 'getGeminiApiKey').mockImplementation(() => process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
   spyOn(config, 'getLocalLLMUrl').mockImplementation(() => process.env.LOCAL_LLM_URL);
+  spyOn(config, 'getOpenRouterApiKey').mockImplementation(() => process.env.OPENROUTER_API_KEY);
 });
 afterEach(() => {
   globalThis.fetch = originalFetch;
@@ -86,6 +86,7 @@ afterEach(() => {
   spyOn(config, 'getAnthropicApiKey').mockRestore();
   spyOn(config, 'getGeminiApiKey').mockRestore();
   spyOn(config, 'getLocalLLMUrl').mockRestore();
+  spyOn(config, 'getOpenRouterApiKey').mockRestore();
   spyOn(grokCredential, 'resolveGrokCredential').mockRestore();
   spyOn(grokCredential, 'resolveFreshGrokCredential').mockRestore();
   for (const [k, v] of Object.entries(savedEnv)) {
@@ -261,6 +262,74 @@ describe('openai-codex OAuth-aware provider', () => {
     expect(p.name).toBe('openai-codex');
     expect(p.available()).toBe(true);
     expect(loadTokens('openai-codex')?.tokens.accessToken).toBe('oauth-wins');
+  });
+});
+
+describe('auto provider selection from isolated credentials', () => {
+  test('CODEX_HOME mirror is read-only during selection and its token reaches the Codex streaming HTTP request', async () => {
+    const codexHome = process.env.CODEX_HOME!;
+    mkdirSync(codexHome, { recursive: true });
+    const jwt = `header.${Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
+    const mirror = JSON.stringify({ tokens: { access_token: jwt, refresh_token: 'mirror-refresh' } });
+    writeFileSync(join(codexHome, 'auth.json'), mirror);
+    const cfg = baseUserConfig();
+    expect(decideProviderForConfig(cfg)).toEqual({ provider: 'auto:openai-codex', model: CODEX_DEFAULT_MODEL, auth: 'oauth' });
+    expect(getProviderForConfig(cfg).available()).toBe(true);
+    expect(getProvider().name).toBe('openai-codex');
+    expect(loadTokens('openai-codex')).toBeNull();
+    expect(readFileSync(join(codexHome, 'auth.json'), 'utf8')).toBe(mirror);
+
+    const received: Array<{ authorization: string | null; path: string }> = [];
+    const server = Bun.serve({
+      port: 0,
+      fetch(request) {
+        received.push({ authorization: request.headers.get('Authorization'), path: new URL(request.url).pathname });
+        return new Response('data: {"type":"response.output_text.delta","delta":"from mirror"}\n\ndata: [DONE]\n\n', {
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      },
+    });
+    const destinations: string[] = [];
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      destinations.push(String(input));
+      return originalFetch(`http://127.0.0.1:${server.port}/responses`, init);
+    }) as typeof fetch;
+    try {
+      const chunks: string[] = [];
+      const result = await streamLLM([{ role: 'user', content: 'hello' }], (delta) => chunks.push(delta));
+      expect(result).toBe('from mirror');
+      expect(chunks).toEqual(['from mirror']);
+      expect(destinations).toEqual(['https://chatgpt.com/backend-api/codex/responses']);
+      expect(received).toEqual([{ authorization: `Bearer ${jwt}`, path: '/responses' }]);
+      expect(loadTokens('openai-codex')?.tokens.accessToken).toBe(jwt);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('unreadable or incomplete CODEX_HOME mirror is not treated as OAuth', () => {
+    const codexHome = process.env.CODEX_HOME!;
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(join(codexHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'not-a-jwt' } }));
+    expect(decideProviderForConfig(baseUserConfig())).toEqual({ provider: 'auto', model: '(none)', auth: 'none' });
+    expect(() => getProviderForConfig(baseUserConfig())).toThrow(/No LLM provider available/);
+  });
+
+  test('OpenRouter-only key selects its registered default without changing explicit selection', () => {
+    process.env.OPENROUTER_API_KEY = 'or-test';
+    const cfg = baseUserConfig();
+    expect(decideProviderForConfig(cfg)).toEqual({ provider: 'auto:openrouter', model: PROVIDERS.openrouter!.defaultModel, auth: 'apikey' });
+    expect(getProviderForConfig(cfg)).toBe(PROVIDERS.openrouter);
+    expect(getProvider()).toBe(PROVIDERS.openrouter);
+    process.env.GEMINI_API_KEY = 'gemini-test';
+    expect(decideProviderForConfig(cfg).provider).toBe('auto:gemini');
+    cfg.llm = { provider: 'openrouter', model: 'openrouter/qwen/qwen3.8-max-0902' };
+    expect(getProviderForConfig(cfg).name).toBe('openrouter');
+  });
+
+  test('model routing consults the registry for Codex and OpenRouter', () => {
+    expect(getProvider('codex-mini-latest').name).toBe('openai-codex');
+    expect(getProvider('openrouter/qwen/qwen3.8-max-0902').name).toBe('openrouter');
   });
 });
 

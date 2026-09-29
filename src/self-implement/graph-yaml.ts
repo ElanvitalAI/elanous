@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { HARNESS_CORE_KINDS, hasNodeKind } from '../graph-kinds/registry.js';
 
 /** ⭐ RFC-graph-templates-as-yaml §5 «0단계» — YAML 저작본을 읽어 실행·해시·원장용 정규형으로.
  *
@@ -10,7 +11,7 @@ import { parse as parseYaml } from 'yaml';
  *    (`playground-scenario/yaml-parser.ts` 의 계약을 따른다 · 재발명 0).
  *  ⛔⭐ **뿌리를 «인자»로 받는다** — `import.meta.url` 로 코드 트리에 묶지 않는다.
  *    🩸 §4.6 이 지목한 병: `mission-capabilities/registry.ts` 가 그 방식이라 `--root` 격리가 불가능하다. */
-export type GraphNodeKind = 'agent' | 'gate' | 'git' | 'judge' | 'observe' | 'hitl' | 'subgraph';
+export type GraphNodeKind = typeof HARNESS_CORE_KINDS[number];
 
 export interface GraphNodeContract {
   readonly inputs: readonly string[];
@@ -20,7 +21,7 @@ export interface GraphNodeContract {
 
 export interface GraphNodeSpec {
   readonly nodeId: string;
-  readonly kind: GraphNodeKind;
+  readonly kind: GraphNodeKind | (string & {});
   readonly recipe: string;
   readonly maxVisits: number;
   readonly progress?: readonly string[];
@@ -44,6 +45,7 @@ export interface GraphEdgeSpec {
 }
 
 export interface GraphTemplateSpec {
+  readonly loop?: { readonly title?: string; readonly description?: string; readonly trigger?: { readonly cron?: string; readonly events?: readonly string[] } };
   readonly graphId: string;
   readonly version: number;
   readonly entryNode: string;
@@ -68,7 +70,6 @@ export interface GraphParseResult {
   readonly warnings: readonly GraphParseIssue[];
 }
 
-const KINDS = new Set<GraphNodeKind>(['agent', 'gate', 'git', 'judge', 'observe', 'hitl', 'subgraph']);
 /** ⚠️ YAML 함정 — `no`/`off`/`yes`/`on` 이 boolean 으로 파싱된다(Norway 문제). 노드 이름에 쓰면 조용히 깨진다. */
 const YAML_TRAP_WORDS = new Set(['true', 'false', 'yes', 'no', 'on', 'off', 'null', '~']);
 
@@ -114,8 +115,8 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     }
     if (YAML_TRAP_WORDS.has(nodeId.toLowerCase())) warnings.push({ path: `${at}/node_id`, message: `'${nodeId}' 는 YAML 이 다른 값으로 읽을 수 있는 낱말이다` });
     const kind = n.kind;
-    if (typeof kind !== 'string' || !KINDS.has(kind as GraphNodeKind)) {
-      errors.push({ path: `${at}/kind`, message: `kind 는 ${[...KINDS].join('|')} 중 하나여야 한다 (받은 값: ${JSON.stringify(kind)})` });
+    if (typeof kind !== 'string' || !hasNodeKind('harness', kind)) {
+      errors.push({ path: `${at}/kind`, message: `kind 는 ${HARNESS_CORE_KINDS.join('|')} 또는 등록된 플러그인 종류여야 한다 (받은 값: ${JSON.stringify(kind)})` });
       continue;
     }
     const recipe = n.recipe;
@@ -138,7 +139,7 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
     else if (contract.tools === '') warnings.push({ path: `${at}/contract/tools`, message: 'tools 가 비었다' });
 
     nodes.push({
-      nodeId, kind: kind as GraphNodeKind, recipe, maxVisits,
+      nodeId, kind, recipe, maxVisits,
       ...(Array.isArray(n.progress) ? { progress: n.progress.filter((v): v is string => typeof v === 'string') } : {}),
       ...(Array.isArray(n.phases) ? { phases: n.phases.filter((v): v is string => typeof v === 'string') } : {}),
       ...(Array.isArray(n.terminal_stages) ? { terminalStages: n.terminal_stages.filter((v): v is string => typeof v === 'string') } : {}),
@@ -199,10 +200,32 @@ export function parseGraphTemplateYaml(source: string, label = '<inline>'): Grap
 
   const runContract = parseGraphRunContract(doc.run_contract);
   if (runContract.error) errors.push({ path: `${label}/run_contract`, message: runContract.error });
+  let loop: GraphTemplateSpec['loop'];
+  if (doc.loop !== undefined) {
+    const l = doc.loop;
+    if (!l || typeof l !== 'object' || Array.isArray(l)) errors.push({ path: `${label}/loop`, message: 'loop 는 맵이어야 한다' });
+    else {
+      const obj = l as Record<string, unknown>;
+      const t = obj.trigger;
+      if (obj.title !== undefined && typeof obj.title !== 'string') errors.push({ path: `${label}/loop/title`, message: 'title 은 문자열이어야 한다' });
+      if (obj.description !== undefined && typeof obj.description !== 'string') errors.push({ path: `${label}/loop/description`, message: 'description 은 문자열이어야 한다' });
+      if (t !== undefined && (!t || typeof t !== 'object' || Array.isArray(t))) errors.push({ path: `${label}/loop/trigger`, message: 'trigger 는 맵이어야 한다' });
+      const trigger = t && typeof t === 'object' && !Array.isArray(t) ? t as Record<string, unknown> : null;
+      if (trigger?.cron !== undefined && typeof trigger.cron !== 'string') errors.push({ path: `${label}/loop/trigger/cron`, message: 'cron 은 문자열이어야 한다' });
+      if (trigger?.events !== undefined && (!Array.isArray(trigger.events) || !trigger.events.every(e => typeof e === 'string'))) errors.push({ path: `${label}/loop/trigger/events`, message: 'events 는 문자열 배열이어야 한다' });
+      loop = {
+        ...(typeof obj.title === 'string' ? { title: obj.title } : {}),
+        ...(typeof obj.description === 'string' ? { description: obj.description } : {}),
+        ...(trigger ? { trigger: { ...(typeof trigger.cron === 'string' ? { cron: trigger.cron } : {}),
+          ...(Array.isArray(trigger.events) ? { events: trigger.events as string[] } : {}) } } : {}),
+      };
+    }
+  }
   if (errors.length > 0) return { errors, warnings };
   return {
     template: {
       graphId: graphId!, version: version!, entryNode: entryNode!, terminalNodes, nodes, edges,
+      ...(loop ? { loop } : {}),
       ...(typeof doc.docs_only_gate_skip === 'boolean' ? { docsOnlyGateSkip: doc.docs_only_gate_skip } : {}),
       ...(Array.isArray(doc.state) ? { state: doc.state.filter((v): v is string => typeof v === 'string') } : {}),
       ...(runContract.spec ? { runContract: runContract.spec } : {}),

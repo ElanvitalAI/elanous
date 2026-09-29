@@ -892,7 +892,9 @@ const SECRET_TEXT_RULES: readonly { readonly id: string; readonly re: RegExp; re
   { id: 'private-key', re: /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----[\s\S]*?-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----/gi, to: '<private-key redacted>' },
   { id: 'anthropic-api-key', re: /\b(sk-ant-(?:api|admin)[0-9]{0,2}-)[A-Za-z0-9_-]{8,}/g, to: '$1***' },
   { id: 'openai-api-key-scoped', re: /\b(sk-(?:proj|svcacct|admin)-)[A-Za-z0-9_-]{8,}/g, to: '$1***' },
+  { id: 'openrouter-api-key', re: /\b(sk-or-v1-)[A-Za-z0-9]{16,}/g, to: '$1***' },
   { id: 'openai-api-key', re: /\b(sk-)[A-Za-z0-9]{16,}/g, to: '$1***' },
+  { id: 'xai-api-key', re: /\b(xai-)[A-Za-z0-9]{20,}/g, to: '$1***' },
   { id: 'github-fine-grained-pat', re: /\b(github_pat_)\w{20,}/g, to: '$1***' },
   { id: 'github-token', re: /\b((?:ghp|gho|ghu|ghs|ghr)_)[0-9a-zA-Z]{20,}/g, to: '$1***' },
   { id: 'aws-access-token', re: /\b((?:A3T[A-Z0-9]|AKIA|ASIA|ABIA|ACCA))[A-Z2-7]{16}\b/g, to: '$1***' },
@@ -901,6 +903,8 @@ const SECRET_TEXT_RULES: readonly { readonly id: string; readonly re: RegExp; re
   { id: 'jwt', re: /\b(ey)[A-Za-z0-9_-]{10,}\.ey[A-Za-z0-9._\\/-]{10,}/g, to: '$1***' },
   // gitleaks: generic-api-key 축소판 — `key = value` 형태.
   { id: 'generic-api-key', re: /\b(api[_-]?key|secret|password|passwd|token|credential)\b(\s*[:=]\s*)["']?[^\s"',;)]{4,}/gi, to: '$1$2***' },
+  // 환경변수 형태 `OPENROUTER_API_KEY=…` — 위 규칙은 `_API_KEY` 앞에 단어 경계가 없어 못 잡는다. 값에 글자가 있어야 한다(`MAX_TOKEN=4096` 은 그대로).
+  { id: 'env-secret', re: /\b([A-Z][A-Z0-9]*_(?:[A-Z0-9]+_)*(?:API_KEY|TOKEN|SECRET|PASSWORD|ACCESS_KEY))(\s*[:=]\s*)["']?(?=[^\s"',;)]*[A-Za-z])[^\s"',;)]{8,}/g, to: '$1$2***' },
   // Authorization 헤더(로그에서 흔하다).
   { id: 'authorization-header', re: /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]{8,}={0,2}/gi, to: '$1 ***' },
 ];

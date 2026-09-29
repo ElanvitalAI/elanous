@@ -36,6 +36,8 @@ import {
   saveSnapshot,
   snapshotKey,
 } from '@/lib/snapshot';
+import { ACP_AUTH_HOWTO, ACP_AUTH_MESSAGE, classifyAcpFailure, reconnectDelayMs } from './acp-failure';
+import { touchScrollLines } from './touch-scroll';
 import { createXtermResizeController } from '@/lib/xterm-resize-controller';
 import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
 import { createTerminalInputSender } from './terminal-input-sender';
@@ -85,7 +87,12 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     state: 'CONNECTING' | 'OPEN' | 'FAILED' | 'CLOSED';
     terminalId: string;
     connectingSince: number;
+    /** 닫힘·실패 사유(서버 close reason 포함). */
+    reason?: string;
   }>(() => ({ state: 'CONNECTING', terminalId, connectingSince: Date.now() }));
+  // 끊기면 다시 붙는다 — 데몬 재시작 뒤 FAILED/CLOSED 에 멈춰 있던 것(대표 2026-09-28). 값이 바뀌면 연결을 새로 연다.
+  const [reconnectNonce, setReconnectNonce] = useState(0);
+  const reconnectAttemptRef = useRef(0);
   const [now, setNow] = useState(() => Date.now());
   const [inputError, setInputError] = useState<{ terminalId: string; dropped: number } | null>(null);
   const visibleInputError = inputError?.terminalId === terminalId ? inputError : null;
@@ -198,7 +205,9 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
         state,
         terminalId,
         connectingSince: state === 'CONNECTING' ? observedAt : current.connectingSince,
+        ...(error?.message ? { reason: error.message } : {}),
       }));
+      if (state === 'OPEN') reconnectAttemptRef.current = 0;
       if (state === 'CONNECTING') setNow(observedAt);
       debugLog('webterm.xterm.acp-state', { terminalId, state, reason: error?.message });
     });
@@ -207,8 +216,18 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // dogfood (no dashboard TUI in the daemon process) has no
     // PreviewTerminal instance to attach to and the screen stays blank.
     // Idempotent on the daemon side: re-mount returns `status:'attached'`.
+    // 셸 준비 관문 — 입력은 이게 열릴 때까지 모인다(terminal-input-sender `shellReady`).
+    //   붙은(attached) 셸은 바로 · 새로 뜬(spawned) 셸은 첫 출력(프롬프트)에서 · 그래도 20초면 연다 · 실패면 연다(오류 표시는 기존대로).
+    let openShell: (via: string) => void = () => {};
+    let waitingFirstOutput = false;
+    const shellWaitStart = Date.now();
+    const shellReady = new Promise<void>((resolve) => {
+      let opened = false;
+      openShell = (via) => { if (opened) return; opened = true; debugLog('webterm.shell.ready', { terminalId, via, ms: Date.now() - shellWaitStart }); resolve(); };
+    });
+    const shellCap = setTimeout(() => openShell('cap-20s'), 20_000);
     void acp.ready.then((daemonSid) => {
-      if (!daemonSid) return; // handshake failed — silent
+      if (!daemonSid) { openShell('no-session'); return; } // handshake failed — silent
       return acp.send('terminal/spawn', {
         sessionId: daemonSid,
         terminalId,
@@ -222,13 +241,29 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       if (res === undefined) return;
       debugLog('webterm.spawn.result', res);
       const r = res as { status?: string; snapshot?: string };
+      // 새 탭은 TerminalTabs 가 먼저 만들고 여기서는 «붙는다»(attached) — 그래서 attached 라도 화면이 아직 비어 있으면
+      // (프롬프트 전) 새 셸과 같이 첫 출력을 기다린다(09-28 격리 실측: 새 탭이 attached 로 84ms 에 관문을 열었다).
+      const blank = typeof r.snapshot !== 'string' || r.snapshot.trim().length === 0;
+      if (r.status === 'spawned' || (r.status === 'attached' && blank)) waitingFirstOutput = true;
+      else openShell(r.status === 'attached' ? 'attached' : `status:${String(r.status)}`);
+      // 크기 동기 — 데몬의 attach 경로는 spawn 의 cols/rows 를 무시하고, fit() 은 onResize 구독 «전»에
+      // 돌았으므로 그 뒤 그리드가 안 바뀌면 resize 가 한 번도 안 간다. 그러면 PTY 는 80×24 로 남고
+      // 셸이 80칸에서 접어 넓은 xterm 위 프롬프트·긴 명령이 깨진다(2026-09-28 실측 stty 24 80 ↔ 139칸).
+      // ⇒ 붙은 직후 지금 격자를 명시로 한 번 보낸다(읽기 전용은 크기 주인이 아니다).
+      if (!readOnly && sessionIdRef.current) {
+        try { fit.fit(); } catch { /* dimensions not ready yet */ }
+        debugLog('webterm.xterm.size-sync', { terminalId, cols: term.cols, rows: term.rows, status: r.status });
+        void acp
+          .send('terminal/resize', { sessionId: sessionIdRef.current, terminalId, cols: term.cols, rows: term.rows })
+          .catch((e) => debugLog('webterm.resize.send-error', { reason: String(e) }));
+      }
       if (r.status === 'attached' && typeof r.snapshot === 'string' && r.snapshot.length > 0) {
         // 화면만 지우고(ESC[2J — scrollback 보존) 데몬이 상주 보유한 현재
         // 뷰포트로 동기화. 로컬 복원 snapshot 보다 항상 최신이므로 우선.
         debugLog('webterm.attach.replay', { terminalId, bytes: r.snapshot.length });
         term.write('\x1b[2J\x1b[H' + r.snapshot.split('\n').join('\r\n') + '\r\n');
       }
-    }).catch((e) => debugLog('webterm.spawn.error', { reason: String(e) }));
+    }).catch((e) => { debugLog('webterm.spawn.error', { reason: String(e) }); openShell('spawn-error'); });
 
     const offUpdate = acp.on('sessionUpdate', (frame) => {
       const params = (frame.params ?? {}) as { sessionId?: string; update?: unknown };
@@ -249,6 +284,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
           bytes: env.payload.data.length,
         });
         term.write(env.payload.data);
+        if (waitingFirstOutput) { waitingFirstOutput = false; openShell('first-output'); }
       } else if (env.method === 'terminalExit' && env.payload.terminalId === terminalId) {
         debugLog('webterm.pty.exit', { terminalId, code: env.payload.code });
         term.write(`\r\n\x1b[2m[exit ${env.payload.code}]\x1b[0m\r\n`);
@@ -273,6 +309,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     const inputSender = createTerminalInputSender({
       send: (method, params) => acp.send(method, params),
       ready: acp.ready,
+      shellReady,
       getSessionId: () => sessionIdRef.current,
       terminalId,
       getPeerId,
@@ -340,6 +377,30 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // up with the final container box. Mirrors ghostty's pattern of
     // mailing the resize to the IO thread regardless of whether the
     // grid actually changed (Surface.zig:2466-2481).
+    // 폰 터치 스크롤백 — xterm 6 은 터치 끌기로 스크롤하지 않는다(touch-scroll.ts 머리말).
+    const touchHost = ref.current;
+    let touchStart: { y: number; viewportY: number } | null = null;
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length !== 1) { touchStart = null; return; }
+      touchStart = { y: e.touches[0].clientY, viewportY: term.buffer.active.viewportY };
+    };
+    const onTouchMove = (e: TouchEvent) => {
+      if (!touchStart || e.touches.length !== 1) return;
+      const cellHeight = term.rows > 0 ? (term.element?.querySelector('.xterm-screen')?.getBoundingClientRect().height ?? 0) / term.rows : 0;
+      const lines = touchScrollLines({
+        startY: touchStart.y,
+        currentY: e.touches[0].clientY,
+        cellHeight,
+        startViewportY: touchStart.viewportY,
+        currentViewportY: term.buffer.active.viewportY,
+      });
+      if (lines !== 0) term.scrollLines(lines);
+    };
+    const onTouchEnd = () => { touchStart = null; };
+    touchHost.addEventListener?.('touchstart', onTouchStart, { passive: true });
+    touchHost.addEventListener?.('touchmove', onTouchMove, { passive: true });
+    touchHost.addEventListener?.('touchend', onTouchEnd, { passive: true });
+
     const resizeController = createXtermResizeController({
       target: ref.current,
       onImmediate: () => {
@@ -364,8 +425,12 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
         debugLog('webterm.xterm.snapshot.error', { reason: String(e) });
       }
       try { resizeController.dispose(); } catch { /* swallow */ }
+      touchHost.removeEventListener?.('touchstart', onTouchStart);
+      touchHost.removeEventListener?.('touchmove', onTouchMove);
+      touchHost.removeEventListener?.('touchend', onTouchEnd);
       unregisterInput?.();
       inputSender.dispose();
+      clearTimeout(shellCap);
       offUpdate();
       offState();
       try { dataDisposable?.dispose(); } catch { /* swallow */ }
@@ -379,7 +444,47 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // sessionIdRef above. Reconnect is driven only by terminalId /
     // readOnly toggles.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminalId, readOnly, client]);
+  }, [terminalId, readOnly, client, reconnectNonce]);
+
+  const failureKind = (acpState === 'FAILED' || acpState === 'CLOSED') ? classifyAcpFailure(acpStatus.reason) : null;
+
+  // 토큰이 바뀌면(이 탭 설정 · 다른 탭 설정 모두 · DaemonProvider 가 config 를 갈아 끼운다) «토큰 없음» 상태면 바로 다시 붙는다.
+  const tokenSeenRef = useRef(config.token);
+  useEffect(() => {
+    if (tokenSeenRef.current === config.token) return;
+    tokenSeenRef.current = config.token;
+    if (failureKind === 'auth' && config.token) {
+      debugLog('webterm.acp.reconnect', { terminalId, why: 'token-changed' });
+      setReconnectNonce((n) => n + 1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.token]);
+
+  // 잠깐의 실패(데몬 재시작 · 네트워크)면 1s→30s 간격으로 다시 붙는다. 토큰 거절은 두드리지 않는다 —
+  // 대신 탭으로 돌아오거나(설정에서 토큰을 붙이고 온 경우) 네트워크가 돌아오면 한 번 다시 붙는다.
+  useEffect(() => {
+    if (failureKind === null) return;
+    const retry = (why: string) => {
+      reconnectAttemptRef.current += 1;
+      debugLog('webterm.acp.reconnect', { terminalId, why, attempt: reconnectAttemptRef.current, reason: acpStatus.reason });
+      setReconnectNonce((n) => n + 1);
+    };
+    const doc = typeof document === 'undefined' ? null : document;
+    const win = typeof window === 'undefined' ? null : window;
+    const onVisible = () => { if (doc?.visibilityState === 'visible') retry('visible'); };
+    const onOnline = () => retry('online');
+    doc?.addEventListener?.('visibilitychange', onVisible);
+    win?.addEventListener?.('online', onOnline);
+    const timer = failureKind === 'transient'
+      ? setTimeout(() => retry('backoff'), reconnectDelayMs(reconnectAttemptRef.current))
+      : undefined;
+    return () => {
+      doc?.removeEventListener?.('visibilitychange', onVisible);
+      win?.removeEventListener?.('online', onOnline);
+      if (timer !== undefined) clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [failureKind, terminalId]);
 
   useEffect(() => {
     if (shouldClear(previousClearRequestRef.current, clearRequest) && termRef.current) {
@@ -389,7 +494,11 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     previousClearRequestRef.current = clearRequest;
   }, [clearRequest, terminalId]);
 
-  const statusLabel = acpState === 'CONNECTING' ? '연결 중' : acpState === 'OPEN' ? '연결됨' : acpState === 'FAILED' ? '연결 실패' : '연결 종료';
+  const statusLabel = acpState === 'CONNECTING'
+    ? (reconnectAttemptRef.current > 0 ? `다시 연결 중(${reconnectAttemptRef.current}회)` : '연결 중')
+    : acpState === 'OPEN' ? '연결됨'
+      : failureKind === 'auth' ? '토큰 없음'
+        : acpState === 'FAILED' ? '연결 실패 · 곧 다시 붙습니다' : '연결 끊김 · 곧 다시 붙습니다';
   const statusTone = acpState === 'OPEN' ? 'text-emerald-300' : acpState === 'CONNECTING' ? 'text-amber-300' : 'text-red-300';
   const connectionTarget = terminalId.trim() || '대상 미지정';
   const connectingDurationSeconds = Math.max(0, Math.floor((now - connectingSince) / 1_000));
@@ -400,6 +509,15 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       {visibleInputError && (
         <div role="alert" className="pointer-events-none absolute bottom-2 left-2 right-2 rounded bg-red-950/95 px-3 py-2 text-sm text-red-100">
           터미널 입력 전송 실패: {visibleInputError.dropped}바이트가 버려졌습니다. 명령이 일부만 실행됐을 수 있습니다. 입력을 확인하고 다시 입력하세요.
+        </div>
+      )}
+      {failureKind === 'auth' && (
+        // ⛔ z-index 필수 — xterm 층이 z-index 최대 11 이라 없으면 캔버스가 클릭을 먹는다(대표 2026-09-28 «링크가 안 눌린다»).
+        <div role="alert" className="absolute left-2 right-2 top-10 z-30 space-y-1 rounded bg-amber-950/95 px-3 py-2 text-sm text-amber-100" data-webterm-auth-missing>
+          <p>{ACP_AUTH_MESSAGE}</p>
+          <p className="text-xs text-amber-200/90">{ACP_AUTH_HOWTO}</p>
+          {/* ⛔ 평범한 <a> — Next Link 의 클라이언트 이동이 이 화면에서 끝나지 않았다(클릭은 먹고 경로가 안 바뀜 · 2026-09-28 실측). 설정은 새로 읽어도 된다. */}
+          <a href="/app/settings/#bearer-token" className="inline-block font-medium underline" data-webterm-auth-settings>설정 열기 →</a>
         </div>
       )}
       <span aria-live="polite" className="sr-only">ACP: {statusLabel}</span>

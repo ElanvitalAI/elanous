@@ -31,6 +31,7 @@ import { InstallBanner } from '@/components/install-banner';
 import { WorkspaceProvider } from '@/components/workspace/WorkspaceProvider';
 import { SetupModeBanner } from './SetupModeBanner';
 import { AuthRequiredBanner } from './AuthRequiredBanner';
+import { useNavVisitLog } from './use-nav-visit-log';
 
 const SIDEBAR_KEY = 'elanous.pwa.sidebarOpen';
 
@@ -44,6 +45,8 @@ export function AppShell({
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const polled = useShellActivity();
   const activity = activityOverride ?? polled;
+  // 탭 방문 계측 — `elanous logs --category pwa.nav.visit`(트리아지 P1 · 탭의 «의미»를 수로).
+  useNavVisitLog();
 
   useEffect(() => {
     if (typeof window === 'undefined') return;

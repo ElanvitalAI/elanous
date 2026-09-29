@@ -16,6 +16,7 @@ const routeDetails = {
   handleHarnessAskPost: { path: '/v1/harness/ask', method: 'POST', body: { text: 'target: src/x.ts' } },
   handleHarnessAskStatusGet: { path: '/v1/harness/ask-status?acceptanceId=accept-1', method: 'GET' },
   handleHarnessRunEventsGet: { path: '/v1/harness/run-events?runId=run-1', method: 'GET' },
+  handleHarnessRunScreenGet: { path: '/v1/harness/run-screen?runId=run-1', method: 'GET' },
   handleHarnessRunsGet: { path: '/v1/harness/runs', method: 'GET' },
   handleHarnessStopPost: { path: '/v1/harness/stop', method: 'POST', body: { spaceId: 'space-1' } },
 } as const satisfies Record<HarnessHandlerName, Omit<HarnessRoute, 'handler'>>;

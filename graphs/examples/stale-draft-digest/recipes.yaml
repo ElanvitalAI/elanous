@@ -1,0 +1,8 @@
+# Each recipe is a shell command. Its last stdout line, if it is a JSON object, becomes the node's output;
+# its `outcome` field picks the outgoing edge (ok / none / fail …), otherwise exit 0 = ok.
+collect:
+  command: "bun graphs/examples/stale-draft-digest/digest.ts collect"
+  timeout_ms: 60000
+report:
+  command: "bun graphs/examples/stale-draft-digest/digest.ts report"
+  timeout_ms: 30000

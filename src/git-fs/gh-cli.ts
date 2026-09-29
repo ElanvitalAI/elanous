@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 
 const LF = 0x0a;
@@ -123,22 +123,7 @@ export type GhCliResult = {
   limit?: number;
 };
 
-/** Executes gh through the retry gateway and returns its raw stdout with outcome metadata. */
-export function runGhCliWithResult(args: string[]): GhCliResult {
-  let stdout: Buffer = Buffer.alloc(0);
-  let stderr: Buffer = Buffer.alloc(0);
-  let status: number | null = null;
-  const retryable = isReadOnlyGhCall(args);
-
-  for (let attempt = 1; attempt <= MAX_GH_RETRY_ATTEMPTS; attempt++) {
-    const result = spawnSync('gh', args, { maxBuffer: Infinity });
-    stdout = asBuffer(result.stdout);
-    stderr = asBuffer(result.stderr);
-    status = result.status;
-    const exitCode = status ?? 1;
-    if (exitCode === 0 || !retryable || attempt === MAX_GH_RETRY_ATTEMPTS || !isTransientGhError(Buffer.concat([stderr, stdout]))) break;
-  }
-
+function ghResult(args: string[], stdout: Buffer, stderr: Buffer, status: number | null): GhCliResult {
   const exitCode = status ?? 1;
   const count = itemCount(stdout);
   const limit = limitValue(args);
@@ -151,6 +136,51 @@ export function runGhCliWithResult(args: string[]): GhCliResult {
     ...(count === undefined ? {} : { itemCount: count }),
     ...(limit === undefined ? {} : { limit }),
   };
+}
+
+/** One retry decision for both the blocking and the async gateway. */
+function shouldRetry(args: string[], attempt: number, stdout: Buffer, stderr: Buffer, status: number | null): boolean {
+  const exitCode = status ?? 1;
+  return !(exitCode === 0 || !isReadOnlyGhCall(args) || attempt === MAX_GH_RETRY_ATTEMPTS || !isTransientGhError(Buffer.concat([stderr, stdout])));
+}
+
+/** Executes gh through the retry gateway and returns its raw stdout with outcome metadata. */
+export function runGhCliWithResult(args: string[]): GhCliResult {
+  let stdout: Buffer = Buffer.alloc(0);
+  let stderr: Buffer = Buffer.alloc(0);
+  let status: number | null = null;
+  for (let attempt = 1; attempt <= MAX_GH_RETRY_ATTEMPTS; attempt++) {
+    const result = spawnSync('gh', args, { maxBuffer: Infinity });
+    stdout = asBuffer(result.stdout);
+    stderr = asBuffer(result.stderr);
+    status = result.status;
+    if (!shouldRetry(args, attempt, stdout, stderr, status)) break;
+  }
+  return ghResult(args, stdout, stderr, status);
+}
+
+function spawnGh(args: string[]): Promise<{ stdout: Buffer; stderr: Buffer; status: number | null }> {
+  return new Promise((resolve) => {
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let child: ReturnType<typeof spawn>;
+    try { child = spawn('gh', args, { stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (e) { resolve({ stdout: Buffer.alloc(0), stderr: Buffer.from(String(e)), status: null }); return; }
+    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
+    child.once('error', (e) => resolve({ stdout: Buffer.concat(out), stderr: Buffer.concat([...err, Buffer.from(String(e))]), status: null }));
+    child.once('close', (code) => resolve({ stdout: Buffer.concat(out), stderr: Buffer.concat(err), status: code }));
+  });
+}
+
+/** Same gateway without blocking the event loop — for daemon request handlers. */
+export async function runGhCliWithResultAsync(args: string[]): Promise<GhCliResult> {
+  let last: { stdout: Buffer; stderr: Buffer; status: number | null } = { stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), status: null };
+  for (let attempt = 1; attempt <= MAX_GH_RETRY_ATTEMPTS; attempt++) {
+    last = await spawnGh(args);
+    if (!shouldRetry(args, attempt, last.stdout, last.stderr, last.status)) break;
+  }
+  return ghResult(args, last.stdout, last.stderr, last.status);
 }
 
 /** Executes gh while preserving its byte streams and appending a pipe-visible outcome.

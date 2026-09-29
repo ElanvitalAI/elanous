@@ -2,7 +2,10 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { relative } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { enqueueSoftStop } from '../../harness/control-inbox.js';
-import { listHarnessScreens } from '../../harness/harness-screen.js';
+import { listHarnessScreens, readHarnessScreenTail } from '../../harness/harness-screen.js';
+import { queryRunScreenKey } from '../../self-implement/run-ledger.js';
+import { logsDbPath } from '../../mss/logging/log-store.js';
+import { redactSecretText } from '../../debug/log.js';
 import { runAskLaunchFlow, type AskLaunchFlowResult } from '../../self-dev/ask-launch-flow.js';
 import * as askIo from '../../self-dev/ask-launch-io.js';
 import { DAEMON_HARNESS_ASK_ENTRANCE } from '../../self-dev/entrance-registry.js';
@@ -95,6 +98,8 @@ export interface HarnessApiDeps {
   readonly askStatusRunLogStore?: Pick<LogStore, 'queryByDataKeys'>;
   readonly listHarnessScreens?: typeof listHarnessScreens;
   readonly enqueueSoftStop?: typeof enqueueSoftStop;
+  readonly queryRunScreenKey?: (runId: string) => Pick<ReturnType<typeof queryRunScreenKey>, 'screenKey' | 'logStoreStatus' | 'lastEvent'>;
+  readonly readHarnessScreenTail?: typeof readHarnessScreenTail;
   readonly createAcceptanceId?: () => string;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
   readonly createFeedbackEmitter?: (acceptanceId: string) => (env: FeedbackEnvelope) => void | Promise<void>;
@@ -367,6 +372,25 @@ export function handleHarnessRunEventsGet(req: Request, _metaApi: HarnessMetaApi
       return { ts: row.ts, event: row.event, runId, ...(payload === undefined ? {} : { payload }) };
     });
   return json(events);
+}
+
+/** GET /v1/harness/run-screen?runId=&lines= — 런의 «화면»(Live 탭 런 서랍 · 🅢 09-28 «런 클릭 → 화면·로그·멈춤»).
+ *  runId → 화면 키는 `self screen --run` 과 같은 해석(`headless.spawn` 로그). ⛔ 이 인스턴스 로그만 본다 —
+ *  전 우주 스캔은 GET 한 번에 수백 저장소를 연다. 못 찾으면 «이유»를 값으로 돌려준다(오류 아님).
+ *  화면 글은 비밀처럼 보이는 조각을 가린다. `stoppable` = 그 화면이 살아 있어 `POST /v1/harness/stop` 이 받는다. */
+export function handleHarnessRunScreenGet(req: Request, _metaApi: HarnessMetaApi, deps: HarnessApiDeps = {}): Response {
+  const url = new URL(req.url);
+  const runId = url.searchParams.get('runId')?.trim() ?? '';
+  if (!runId || /[\\/]|\.\./.test(runId)) return json({ error: 'usage: GET /v1/harness/run-screen?runId=<runId>[&lines=60]' }, 400);
+  const lines = Math.min(200, Math.max(5, Number(url.searchParams.get('lines')) || 60));
+  const q = (deps.queryRunScreenKey ?? ((id: string) => queryRunScreenKey(id, { logStorePath: logsDbPath() })))(runId);
+  if (!q.screenKey) {
+    return json({ runId, screenKey: null, text: null, stoppable: false, reason: q.logStoreStatus === 'read' ? 'no-screen-key' : `log-store-${q.logStoreStatus}`, lastEvent: q.lastEvent });
+  }
+  const tail = (deps.readHarnessScreenTail ?? readHarnessScreenTail)(q.screenKey, lines);
+  const stoppable = (deps.listHarnessScreens ?? listHarnessScreens)().some((screen) => screen.spaceId === q.screenKey);
+  if (!tail) return json({ runId, screenKey: q.screenKey, text: null, stoppable, reason: 'screen-missing', lastEvent: q.lastEvent });
+  return json({ runId, screenKey: q.screenKey, text: redactSecretText(tail.text), outcome: tail.outcome, stoppable, lastEvent: q.lastEvent });
 }
 
 /** Queue a soft stop for an existing harness screen. */

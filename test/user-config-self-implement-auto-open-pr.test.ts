@@ -68,6 +68,15 @@ describe('tools.selfImplement.autoOpenPr', () => {
       .toContain('tools.selfImplement.autoStop.enabled');
   });
 
+  test('goalRecordInDoc defaults on, accepts explicit false, and ignores non-boolean values', () => {
+    expect(loadWith(undefined).tools.selfImplement.goalRecordInDoc).toBe(true);
+    expect(loadWith({ selfImplement: { goalRecordInDoc: true } }).tools.selfImplement.goalRecordInDoc).toBe(true);
+    expect(loadWith({ selfImplement: { goalRecordInDoc: false } }).tools.selfImplement.goalRecordInDoc).toBe(false);
+    for (const bad of ['false', 0, null, [], {}]) {
+      expect(loadWith({ selfImplement: { goalRecordInDoc: bad } }).tools.selfImplement.goalRecordInDoc).toBe(true);
+    }
+  });
+
   test('observeOnly는 명시 boolean만 존중하고 기본은 OFF', () => {
     expect(loadWith({ selfImplement: { observeOnly: true } }).tools.selfImplement.observeOnly).toBe(true);
     expect(loadWith({ selfImplement: { observeOnly: false } }).tools.selfImplement.observeOnly).toBe(false);

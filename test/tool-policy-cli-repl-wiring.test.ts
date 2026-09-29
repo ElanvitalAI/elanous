@@ -29,11 +29,12 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 
 const repoRoot = join(import.meta.dir, '..');
-const cliPath = join(repoRoot, 'src', 'index.ts');
+// The CLI agent turn moved out of src/index.ts in the D4c split.
+const cliPath = join(repoRoot, 'src', 'cli', 'agent-cli.ts');
 const replPath = join(repoRoot, 'src', 'repl', 'index.ts');
 
 describe('Archon-port T1.2 — CLI + REPL apply chat.toolDeny', () => {
-  it('main CLI (src/index.ts) calls applyToolPolicy on cfg.chat.toolDeny', () => {
+  it('main CLI (src/cli/agent-cli.ts) calls applyToolPolicy on cfg.chat.toolDeny', () => {
     const src = readFileSync(cliPath, 'utf-8');
     expect(src).toContain('applyToolPolicy');
     expect(src).toContain('opts.cfg.chat.toolDeny');

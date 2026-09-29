@@ -2,7 +2,6 @@ import { describe, expect, test } from 'bun:test';
 
 import { DisplayCoordinator } from '../src/display/coordinator.js';
 import {
-  createPreviewPaneContent,
   createPreviewPaneModalChrome,
   createPreviewPaneModalWidgetId,
   disposePreviewPaneModalWidgetInstance,
@@ -11,7 +10,6 @@ import {
   resolvePreviewPaneModalChromeAction,
   syncPreviewPaneWidgetFromModel,
 } from '../src/preview-pane/mount.js';
-import { PreviewPaneRegistry } from '../src/preview-pane/registry.js';
 import { DEFAULT_THEME_TOKENS } from '../src/theme/tokens.js';
 
 describe('preview pane mount', () => {
@@ -118,28 +116,4 @@ describe('preview pane mount', () => {
     handle.dispose();
   });
 
-  test('creates registry-backed VW preview content with scroll controls', () => {
-    const registry = new PreviewPaneRegistry();
-    registry.register('vw-preview:test', {
-      id: 'vw-preview:test',
-      mode: 'vw',
-      followCursor: true,
-      pinned: false,
-      sourceMode: 'smart',
-      lastBrowserFocus: 'browser',
-      previewPath: '/tmp/a.md',
-      previewLines: ['one', 'two', 'three', 'four'],
-      previewOffset: 0,
-    });
-    const pane = createPreviewPaneContent(
-      { kind: 'vw-preview', previewId: 'vw-preview:test', title: 'preview' },
-      { previewPaneRegistry: registry },
-    );
-
-    expect(pane.render({ cols: 20, rows: 2, focused: true })).toContain('one');
-    pane.onKey({ name: 'down' } as never);
-
-    const preview = registry.get('vw-preview:test');
-    expect(preview?.previewOffset).toBe(1);
-  });
 });

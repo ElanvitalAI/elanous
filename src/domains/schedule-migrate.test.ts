@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { openSchedulesDb, listSchedules, type ScheduleRow } from './schedule-registry.js';
-import { migrateJobToTrigger, registerScheduledToxTasks, catchUpTriggerJobs, findScheduledTaskId, deleteTriggerJob } from './schedule-migrate.js';
+import { migrateJobToTrigger, registerScheduledToxTasks, scheduledRunViaById, catchUpTriggerJobs, findScheduledTaskId, deleteTriggerJob } from './schedule-migrate.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 import { createTask } from '../task-orchestrator/types.js';
 import type { WorkflowEntry } from '../workflow-runtime/types.js';
@@ -187,6 +187,24 @@ describe('registerScheduledToxTasks — 부팅 재등록 sweep', () => {
       expect(registered).toHaveLength(1);
       expect(registered[0]!.definition.name).toBe('tox-task-task:aa');
     } finally { store.close(); }
+  });
+
+  it('disabled trigger row is excluded when boot registration receives enabled-aware run via', () => {
+    const db = openSchedulesDb(':memory:');
+    const store = new TaskStore({ path: ':memory:', noWal: true });
+    const registered: WorkflowEntry[] = [];
+    try {
+      const jobId = seedJob(db, { run_via: 'trigger', enabled: 0 });
+      store.saveTask(createTask({
+        title: 'disabled schedule', surface: { kind: 'terminal-pane', spec: { command: 'bun x' } },
+        scheduleText: '0 8 * * *', schedulerJobId: jobId,
+      }, { id: 'task:disabled', now: 1 }));
+      const byId = scheduledRunViaById(listSchedules(db));
+      expect(byId.get(jobId)).toBeNull();
+      const result = registerScheduledToxTasks(store, entry => registered.push(entry), id => byId.get(id) ?? null);
+      expect(result).toMatchObject({ registered: 0, skippedNotTrigger: 1 });
+      expect(registered).toEqual([]);
+    } finally { store.close(); db.close(); }
   });
 
   it('레지스트리가 trigger 가 아니라고 하면 파생 task 를 등록하지 않는다(release 뒤 고아 · 이중 발화 방지)', () => {

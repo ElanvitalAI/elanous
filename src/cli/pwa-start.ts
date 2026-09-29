@@ -23,6 +23,7 @@ import { resolveCurrentInstance } from '../instance/current.js';
 import { leaseTestPort, releaseTestPort, transferTestPort } from './port-lease-local.js';
 import { isPidAlive } from '../process/pid-liveness.js';
 import type { InstanceResolution } from '../instance/resolve.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 
 type ShareTailnetValue = 'ask' | 'enabled' | 'disabled';
 
@@ -243,7 +244,7 @@ function collectForwardArgs(opts: PwaStartOpts, httpPort: number): string[] {
  *    CLI flag (opts.httpPort/opts.devPort) > UserConfig > hard default. */
 function resolvePorts(opts: PwaStartOpts): { httpPort: number; devPort: number } {
   const readConfigPort = opts.readConfigPortFn ?? defaultReadConfigPort;
-  const httpPort = opts.httpPort ?? readConfigPort('global.nexus.pwa.port') ?? 31415;
+  const httpPort = opts.httpPort ?? readConfigPort('global.nexus.pwa.port') ?? DEFAULT_NEXUS_HTTP_PORT;
   const devPort = opts.devPort ?? readConfigPort('global.nexus.pwa.devPort') ?? 3210;
   return { httpPort, devPort };
 }

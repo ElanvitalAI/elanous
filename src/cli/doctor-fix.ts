@@ -1,16 +1,84 @@
 import { nativeBuildEnv, nativeBuildShimDir } from '../native/native-build-env.js';
+import { debug } from '../debug/log.js';
+import type { GitInstallPlan } from './git-install-plan.js';
+import { createInterface } from 'node:readline/promises';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { fixPrivateFiles, scanPrivateFiles } from './doctor-private-files.js';
 import { checkPythonEnv, runPythonSetup } from './python-cli.js';
-import { remediesFor } from './doctor-distro.js';
+import { remediesFor, toolInstallLine } from './doctor-distro.js';
 import { installManagedPython, installStaticTool, linuxArch, staticToolBinDir, STATIC_TOOLS, type StaticToolName } from './doctor-static-tools.js';
 import { declaredPythonVersion, PYTHON_MIN_SUPPORTED } from '../python/resolve-python.js';
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { appendFileSync, chmodSync, closeSync, constants, existsSync, fchmodSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve, win32 } from 'node:path';
 import { checkReadiness, ghVersionAtLeast, serviceSecretEntries, SERVICE_VERSION_FOLDER, type ReadinessDeps, type ReadinessItem } from './doctor-readiness.js';
+
+export interface GitInstallResult {
+  ran: boolean;
+  ok: boolean;
+  detail: string;
+}
+
+/** Installation is never attempted without an explicit yes or an affirmative TTY answer. */
+export async function applyGitInstall(plan: GitInstallPlan, deps: {
+  yes?: boolean;
+  interactive?: boolean;
+  confirm?: (display: string) => Promise<boolean>;
+  run?: (command: string, args: readonly string[]) => { status: number | null };
+  platform?: NodeJS.Platform;
+  json?: boolean;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+  waitForGitMs?: number;
+  pollMs?: number;
+} = {}): Promise<GitInstallResult> {
+  const run = deps.run ?? ((command: string, args: readonly string[]) => {
+    const result = spawnSync(command, [...args], { stdio: ['inherit', deps.json ? process.stderr : process.stdout, process.stderr], timeout: 1_800_000 });
+    return { status: result.status };
+  });
+  const confirm = deps.confirm ?? (async (display: string) => {
+    const prompt = createInterface({ input: process.stdin, output: deps.json ? process.stderr : process.stdout });
+    try { return /^(y|yes)$/i.test((await prompt.question(`${display} 실행할까요? [y/N] `)).trim()); }
+    catch { return false; }
+    finally { prompt.close(); }
+  });
+  let agreed = deps.yes === true;
+  if (!agreed && deps.interactive === true && plan.command !== null) {
+    try { agreed = await confirm(plan.display); } catch { agreed = false; }
+  }
+  let ran = false;
+  let ok = false;
+  let detail = plan.command === null ? plan.display : '설치하지 않음 — --fix --yes 또는 대화형 동의가 필요합니다.';
+  if (agreed && plan.command) {
+    ran = true;
+    try {
+      let preOk = true;
+      for (const pre of plan.preCommands ?? []) {
+        if (run(pre[0]!, pre.slice(1)).status !== 0) { preOk = false; break; }
+      }
+      const installed = preOk ? run(plan.command[0]!, plan.command.slice(1)) : { status: 1 };
+      if (installed.status === 0) {
+        ok = smokeCheck('git', 'git', run);
+        // xcode-select returns as soon as Apple's installer window opens — wait for git to appear.
+        if (!ok && plan.waitForGit) {
+          const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+          const deadline = (deps.now ?? Date.now)() + (deps.waitForGitMs ?? 15 * 60_000);
+          while (!ok && (deps.now ?? Date.now)() < deadline) {
+            await sleep(deps.pollMs ?? 10_000);
+            ok = smokeCheck('git', 'git', run);
+          }
+        }
+      }
+      detail = ok ? 'git init 재확인 성공' : 'git 설치 또는 git init 재확인 실패';
+    } catch {
+      detail = 'git 설치 또는 git init 재확인 실패';
+    }
+  }
+  debug.log('doctor.fix', 'git-install', { platform: deps.platform ?? process.platform, command: plan.command, ran, ok });
+  return { ran, ok, detail };
+}
 
 export interface DoctorFixDeps {
   env?: NodeJS.ProcessEnv;
@@ -51,6 +119,8 @@ export interface DoctorFixDeps {
   arch?: string;
   /** 정적 도구 설치(시험 주입 · 기본 = doctor-static-tools). */
   installStaticTool?: (name: StaticToolName, dest: string) => { ok: boolean; detail: string };
+  /** 설치 뒤 실제 도구 동작 확인(시험 주입). */
+  smokeCheck?: (name: StaticToolName, dest: string) => boolean;
   /** 관리형 파이썬 설치(시험 주입). */
   installManagedPython?: (minor: string) => { python: string | null; detail: string };
 }
@@ -69,7 +139,7 @@ export interface DoctorFixResult {
   exitCode: number;
 }
 
-type IO = Required<Omit<DoctorFixDeps, 'configDir' | 'readiness' | 'keyNames' | 'realpath' | 'runCommand' | 'verifyNodePty' | 'pythonSetup' | 'recheckPythonEnv' | 'shimDir' | 'removeTree' | 'arch' | 'installStaticTool' | 'installManagedPython'>> & { readiness: ReadinessDeps; keyNames: readonly string[] | undefined };
+type IO = Required<Omit<DoctorFixDeps, 'configDir' | 'readiness' | 'keyNames' | 'realpath' | 'runCommand' | 'verifyNodePty' | 'pythonSetup' | 'recheckPythonEnv' | 'shimDir' | 'removeTree' | 'arch' | 'installStaticTool' | 'smokeCheck' | 'installManagedPython'>> & { readiness: ReadinessDeps; keyNames: readonly string[] | undefined };
 const cachePath = Symbol('cachePath');
 type InternalFixItem = DoctorFixItem & { [cachePath]?: string };
 const START = '# >>> elanous installer PATH >>>';
@@ -394,11 +464,11 @@ function pythonEnvItem(deps: DoctorFixDeps): InternalFixItem | undefined {
  *  📏 2026-09-25 amazonlinux:2·2023 컨테이너에서 실측(`doctor-static-tools.ts` 머리말). sudo 불필요. */
 export function staticToolsNeeded(readiness: ReadinessDeps): StaticToolName[] {
   if (readiness.platform !== 'linux') return [];
-  const remedies = remediesFor(readiness.distro ?? 'unknown');
+  const family = readiness.distro ?? 'unknown';
   const tools: StaticToolName[] = [];
-  if (readiness.rgOnPath === false && !remedies?.rg) tools.push('rg');
+  if (readiness.rgOnPath === false && !toolInstallLine('rg', family)) tools.push('rg');
   // node 를 깔 줄이 있으면 codex 는 npm 길(sudo)로 — 없을 때만 정적 바이너리(node 불필요).
-  if (readiness.codexOnPath === false && readiness.nodeOnPath === false && !remedies?.node) tools.push('codex');
+  if (readiness.codexOnPath === false && readiness.nodeOnPath === false && !toolInstallLine('node', family)) tools.push('codex');
   // codex 바이너리는 있는데 짝이 없다 — 한 벌로 다시 깐다(elanous bin 이 PATH 앞이라 그쪽이 쓰인다).
   else if (readiness.codexOnPath === true && readiness.codexCodeModeHost === false) tools.push('codex');
   // gh 가 없거나 낡았다(배포판 gh 가 GH_MIN_VERSION 미만) — 고정 판 정적 gh(elanous bin 이 PATH 앞이라 그쪽이 쓰인다).
@@ -476,15 +546,48 @@ function defaultVerifyNodePty(packageDir: string): boolean {
   return r.status === 0;
 }
 
-export function applyDoctorFixes(deps: DoctorFixDeps = {}, yes = false): DoctorFixResult {
+export function smokeCheck(name: StaticToolName | 'git', dest: string, run?: (command: string, args: readonly string[]) => { status: number | null }): boolean {
+  if (name === 'uv') return true;
+  if (name === 'codex-code-mode-host') {
+    if (run) return run(dest, ['--help']).status === 0;
+    const hello = Buffer.from(JSON.stringify({ type: 'connection/hello', supportedVersions: [1], requiredCapabilities: [], optionalCapabilities: [] }));
+    const frame = Buffer.alloc(4 + hello.length);
+    frame.writeUInt32LE(hello.length, 0);
+    hello.copy(frame, 4);
+    const reply = spawnSync(dest, [], { input: frame, timeout: 15_000, maxBuffer: 1024 * 1024 });
+    if (reply.status !== 0 || reply.stdout.length < 5) return false;
+    const length = reply.stdout.readUInt32LE(0);
+    if (length !== reply.stdout.length - 4) return false;
+    try {
+      const ready = JSON.parse(reply.stdout.subarray(4).toString('utf8')) as { type?: string; selectedVersion?: number };
+      return ready.type === 'connection/ready' && ready.selectedVersion === 1;
+    } catch { return false; }
+  }
+  const work = mkdtempSync(join(tmpdir(), name === 'git' ? 'elanous-doctor-git-' : 'elanous-doctor-tool-'));
+  try {
+    const args = name === 'git' ? ['init', work] : name === 'rg' ? ['doctor smoke', 'smoke.txt'] : name === 'gh' ? ['help'] : ['--help'];
+    if (name === 'rg') writeFileSync(join(work, 'smoke.txt'), 'doctor smoke\n');
+    return (run ? run(dest, args) : spawnSync(dest, args, { cwd: work, stdio: 'ignore', timeout: 15_000 })).status === 0;
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
+}
+
+export function applyDoctorFixes(deps: DoctorFixDeps = {}, yes = false, only?: ReadonlySet<DoctorFixItem['id']>): DoctorFixResult {
   const fs = io(deps);
   const plan = planDoctorFixes(deps);
   if (!yes) return {
-    items: plan.items.map((item) => ({ ...item, result: item.status === 'failed' ? 'failed' : 'skipped', reason: item.reason ?? 'requires --yes' })),
-    exitCode: plan.items.some((item) => item.status === 'failed') ? 1 : 0,
+    items: plan.items.map((item) => only && !only.has(item.id)
+      ? { ...item, result: 'skipped' as const, reason: 'not selected' }
+      : { ...item, result: item.status === 'failed' ? 'failed' as const : 'skipped' as const, reason: item.reason ?? 'requires --yes' }),
+    exitCode: plan.items.some((item) => item.status === 'failed' && (!only || only.has(item.id))) ? 1 : 0,
   };
   const items: DoctorFixResult['items'] = [];
   for (const item of plan.items) {
+    if (only && !only.has(item.id)) {
+      items.push({ ...item, result: 'skipped', reason: 'not selected' });
+      continue;
+    }
     if (item.status !== 'fixable') {
       items.push({ ...item, result: item.status === 'failed' ? 'failed' : 'skipped' });
       continue;
@@ -557,11 +660,14 @@ export function applyDoctorFixes(deps: DoctorFixDeps = {}, yes = false): DoctorF
       } else if (item.id === 'static-tools') {
         const arch = linuxArch(deps.arch)!;
         // codex 는 짝(`codex-code-mode-host`)과 «한 벌»이다 — 없으면 셸 도구가 못 뜬다(2026-09-25 L2 실측).
-        const outcomes = staticToolsNeeded(deps.readiness ?? {})
+        const tools = staticToolsNeeded(deps.readiness ?? {});
+        const outcomes = tools
           .flatMap((tool): StaticToolName[] => (tool === 'codex' ? ['codex', 'codex-code-mode-host'] : [tool]))
           .map((tool) => (deps.installStaticTool ?? ((name, to) => installStaticTool(name, arch, to)))(tool, join(item.path, tool)));
-        const ok = outcomes.length > 0 && outcomes.every((o) => o.ok);
-        items.push({ ...item, result: ok ? 'fixed' : 'failed', reason: outcomes.map((o) => o.detail).join(' · ') || 'nothing to install' });
+        const installed = outcomes.length > 0 && outcomes.every((o) => o.ok);
+        const verified = installed && tools.every((tool) => (deps.smokeCheck ?? smokeCheck)(tool, join(item.path, tool)) &&
+          (tool !== 'codex' || (deps.smokeCheck ?? smokeCheck)('codex-code-mode-host', join(item.path, 'codex-code-mode-host'))));
+        items.push({ ...item, result: verified ? 'fixed' : 'failed', reason: installed && !verified ? 'installed, but smoke check failed' : outcomes.map((o) => o.detail).join(' · ') || 'nothing to install' });
       } else if (item.id === 'python-managed') {
         const got = (deps.installManagedPython ?? ((minor) => installManagedPython(minor, { env: fs.env, home: fs.home })))(managedPythonMinor());
         if (!got.python) { items.push({ ...item, result: 'failed', reason: got.detail }); continue; }

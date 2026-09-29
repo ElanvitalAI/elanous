@@ -10,13 +10,32 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import {
-  opsSnapshot,
+  opsSnapshot, opsHealth,
   OPS_STATUS_LOG_CATEGORY,
   OPS_SCHEDULES_LOOKUP_FAILED_EVENT,
+  readRecentFailureLogs,
 } from './ops-status.js';
 import { buildCronLine, openSchedulesDb, repoRoot, scheduleHealth, type ScheduleRow } from './schedule-registry.js';
 import type { TradeMandate } from './trade-mandate.js';
 import { TaskStore } from '../task-orchestrator/store.js';
+
+describe('opsHealth — repeated failure is isolated from existing health checks', () => {
+  test('unreadable logs skip only this check and leave existing anomaly wording untouched', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const store = new TaskStore({ path: ':memory:', noWal: true });
+    const opts = { missionStore: store, opsDbPath: '/nonexistent/ops_events.db', mandate: null,
+      listScheduleRows: () => [schedRow({ id: 'failed', name: 'failed', last_status: 'error', last_run: '2026-09-28T06:00:00Z' })],
+      now: new Date('2026-09-28T06:02:00Z') };
+    try {
+      const baseline = opsHealth({ ...opts, recentLogs: () => [] });
+      const failed = opsHealth({ ...opts, recentLogs: () => { throw new Error('log DB unavailable'); } });
+      expect(failed.anomalies).toEqual(baseline.anomalies);
+      expect(failed.anomalies).toContainEqual({ kind: 'schedule_error', entity: 'failed', detail: '마지막 실행 error', since: '2026-09-28T06:00:00Z' });
+      expect(log).toHaveBeenCalledWith('ops.health', 'repeated-failure-skipped', { reason: 'log DB unavailable' });
+      expect(log).toHaveBeenCalledWith('ops.health', 'repeated-failure', { groups: 0, topCount: 0 });
+    } finally { store.close(); log.mockRestore(); }
+  });
+});
 
 describe('opsSnapshot — 부재 스토어 skip(read-only · 빈 db 미생성)', () => {
   test('주입된 ops_events/schedules 경로가 부재하면 open skip → 파일 미생성 · 스케줄은 조회 실패', () => {
@@ -390,3 +409,13 @@ describe('opsSnapshot — 기본 조회 경계(부재 DB vs 진짜 빈 레지스
     }
   });
 });
+
+describe('readRecentFailureLogs — bounded scan (review must-fix)', () => {
+  test('asks the store for a bounded newest-first page of the last 10 minutes', () => {
+    const seen: Array<{ sinceMs?: number; limit?: number }> = [];
+    const rows = readRecentFailureLogs({ query: (q: unknown) => { seen.push(q as never); return []; } } as never, 1_000_000_000, 500);
+    expect(rows).toEqual([]);
+    expect(seen).toEqual([{ sinceMs: 1_000_000_000 - 600_000, limit: 500 }]);
+  });
+});
+

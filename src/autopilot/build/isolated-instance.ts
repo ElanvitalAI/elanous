@@ -15,9 +15,10 @@ import { createWorktree, linkWorktreeDependencies, removeWorktree, worktreeParen
 import { configuredWorktreeRoot, getUserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';
 import { runGitCommand } from '../../git-fs/runner.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../../nexus/default-port.js';
 
 /** 정식 데몬 포트 — 격리는 이 포트를 절대 쓰지 않는다. */
-export const PRODUCTION_PORT = 31415;
+export const PRODUCTION_PORT = DEFAULT_NEXUS_HTTP_PORT;
 /** 격리 포트 범위(정식 회피). */
 export const ISOLATED_PORT_BASE = 31416;
 export const ISOLATED_PORT_SPAN = 84; // 31416~31499

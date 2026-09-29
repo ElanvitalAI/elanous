@@ -4,12 +4,7 @@
 // for a given PaneRef. Maintains a cache keyed by (windowId, paneId)
 // so repeated describe/snapshot/addTap calls don't churn wrappers.
 //
-// The factory provides three resolve paths:
-//   1. resolveFromContent(ref, content) — wrap a legacy PaneContent
-//   2. resolveFromTerminal(ref, term)   — wrap a matrix TerminalInstance
-//   3. resolveFromHandle(ref, handle)   — wrap a Shell Runner ShellHandle
-//   4. resolveFromWidget(ref, inst, def) — wrap a WidgetInstance + Widget
-//   5. resolvePlaceholder(ref, reason)   — empty / error / loading slot
+// The factory wraps terminals, shell handles and widgets, or supplies placeholders.
 //
 // Dashboard integration (per LESSONS L5 risk discipline): this module
 // only provides the resolve API. VW composer / capture engine call
@@ -19,11 +14,9 @@
 //
 // See: 내부 문서 `PLAN-session-vw-term-infra-wiring` §6 (W1 · C7)
 
-import type { PaneContent } from '../virtual-windows/pane-content.js';
 import type { ShellHandle } from '../shell-runner/types.js';
 import type { TerminalInstance } from '../terminal-matrix/types.js';
 import type { Widget, WidgetInstance } from '../widgets/types.js';
-import { PaneContentAdapter } from './content-adapter.js';
 import { ExternalTerminalPane } from './external-terminal-pane.js';
 import { PlaceholderPane, type PlaceholderReason } from './placeholder-pane.js';
 import { TerminalPane } from './terminal-pane.js';
@@ -34,16 +27,6 @@ import type { Pane, PaneRef } from './types.js';
 /** A resolver factory. Usually a singleton per dashboard session. */
 export class PaneFactory {
   private readonly cache = new Map<string, Pane>();
-
-  /** Wrap an existing PaneContent (legacy VW pane content) as a Pane. */
-  resolveFromContent(ref: PaneRef, content: PaneContent): Pane {
-    const key = cacheKey(ref);
-    const cached = this.cache.get(key);
-    if (cached && cached.kind.kind !== 'placeholder') return cached;
-    const pane = new PaneContentAdapter(ref, content);
-    this.cache.set(key, pane);
-    return pane;
-  }
 
   /** Wrap a TerminalMatrix TerminalInstance as a Pane. */
   resolveFromTerminal(ref: PaneRef, term: TerminalInstance): Pane {

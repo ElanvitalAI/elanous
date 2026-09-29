@@ -32,7 +32,6 @@ const DEFAULT_FORBIDDEN_PREFIXES: readonly string[] = [
   '../pty-shell/',
   '../shell-runner/',
   '../terminal-matrix/',
-  '../virtual-windows/',
   // Input stack — dashboard-owned.
   '../input-core/',
   '../mouse-',

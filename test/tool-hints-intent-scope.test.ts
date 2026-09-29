@@ -320,20 +320,23 @@ describe('intentScope — live catalog under discipline', () => {
       recentUserText: '끝나면 아이폰으로 알려줘',
     }));
     expect(decision.filtered).toContain('iphone_notify');
+    expect(decision.filtered).toContain('elanous_hold');
     // Fleet intent alone must not pull dashboard-surface tools.
     expect(decision.filtered).not.toContain('dashboard_widget_toggle');
   });
 
-  test('ops-ui intent restores dashboard_* and window_* but not iphone_*', () => {
+  // #21723: the live catalog no longer registers window_create; PTY control remains an ops-ui tool.
+  test('ops-ui intent restores dashboard and PTY controls but not iphone_*', () => {
     process.env[ENV_FLAG] = '1';
     const skill = nativeToolCatalog.filter(t => t.defaultEnabled && (t.host.includes('skill') || t.host.includes('all')));
     const decision = evaluateGate(skill, [], collectSignals({
       cwd: tmpdir(),
       recentUserText: '창 하나 더 만들어서 대시보드 위젯 켜줘',
     }));
-    expect(decision.filtered).toContain('window_create');
+    expect(decision.filtered).toContain('pty_control');
     expect(decision.filtered).toContain('dashboard_widget_toggle');
     expect(decision.filtered).not.toContain('iphone_notify');
+    expect(decision.filtered).not.toContain('elanous_hold');
   });
 
   test('every tool in the catalog carries an intentScope tag', () => {

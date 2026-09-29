@@ -4,8 +4,7 @@
 // `├─ [Md #3] SMOKE.md (41.9KB)`) in the log pane, we open a small
 // anchored selector listing the actions they'd otherwise have to
 // type slash-commands for: drop, copy the token, copy the source
-// path. Mirrors the vw-selector-popup + context-menu pattern — a
-// SelectView wrapped in BoxView, mounted as a modal surface via
+// path. A SelectView wrapped in BoxView, mounted as a modal surface via
 // mountViewAsModalSurface (so it picks up the standard modal-stack
 // key routing, focus tracking, and context-key tier management).
 //

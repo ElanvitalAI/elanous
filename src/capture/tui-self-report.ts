@@ -97,6 +97,13 @@ export function createTuiFrameObserver(
 export interface TuiControlTargetDeps {
   injectKey?: (key: Key) => boolean;
   splitKeys?: (input: string) => Key[];
+  /** The foreground terminal's real size; `undefined` when it cannot be known (stdout is not a TTY). */
+  dims?: () => { readonly cols: number; readonly rows: number } | undefined;
+}
+
+function stdoutDims(): { cols: number; rows: number } | undefined {
+  const out = process.stdout;
+  return out.isTTY && out.columns > 0 && out.rows > 0 ? { cols: out.columns, rows: out.rows } : undefined;
 }
 
 export interface TuiControlTarget extends PtyControlTarget {
@@ -108,11 +115,14 @@ export interface TuiControlTarget extends PtyControlTarget {
 export function createTuiControlTarget(surfaceId: string, deps: TuiControlTargetDeps = {}): TuiControlTarget {
   const inject = deps.injectKey ?? injectKey;
   const parse = deps.splitKeys ?? splitKeys;
+  const dims = deps.dims ?? stdoutDims;
   let alive = true;
   let accessMode: PtyAccessMode = 'write';
   let transitionPolicy: PtyTransitionPolicy = 'open';
   return {
     id: surfaceId,
+    get cols() { return dims()?.cols; },
+    get rows() { return dims()?.rows; },
     get accessMode() { return accessMode; },
     set accessMode(mode: PtyAccessMode) { accessMode = mode; },
     get transitionPolicy() { return transitionPolicy; },

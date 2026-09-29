@@ -16,13 +16,23 @@
 //    exact collapse this whole axis exists to undo.
 
 import { AlertTriangle, BookOpen, CheckCircle2, CircleDashed, RefreshCw } from 'lucide-react';
+import { useEffect, useState } from 'react';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
 import {
   describeBlocked,
+  describeCreateFailure,
+  describePickFailure,
+  previewSystemSet,
   projectRulebookRows,
+  useCreateDesignSystem,
   useDesignCheck,
+  useDesignPreview,
+  useDesignPreviews,
+  useSetDesignDirection,
   type RulebookRowStatus,
 } from '@/nexus/hooks/use-design-check';
+import { DirectionCards } from './DirectionCards';
+import { MakeMySystem } from './MakeMySystem';
 
 const STATUS_LABEL: Record<RulebookRowStatus, string> = {
   missing: 'Missing',
@@ -126,6 +136,15 @@ function Verdict({ data }: { data: Extract<NonNullable<ReturnType<typeof useDesi
       </div>
 
       <dl className="grid grid-cols-1 gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+        <div className="truncate sm:col-span-2">
+          <dt className="inline font-medium">Repository: </dt>
+          <dd className="inline">
+            <code>{data.repoRoot}</code>
+            {data.repoSource && (
+              <span className="ml-1">({data.repoSource === 'config' ? 'harness.defaultRepo' : 'daemon folder'})</span>
+            )}
+          </dd>
+        </div>
         <div className="truncate">
           <dt className="inline font-medium">Document: </dt>
           <dd className="inline"><code>{data.documentPath}</code></dd>
@@ -167,13 +186,41 @@ function Verdict({ data }: { data: Extract<NonNullable<ReturnType<typeof useDesi
 /** B5 — visual direction. Rendered BELOW the rulebooks and visually quieter:
  *  rulebooks are a contract (a missing one fails the check), a direction is a
  *  choice. Giving them equal weight would make "nobody picked yet" read as a
- *  problem on every freshly scaffolded project. */
+ *  problem on every freshly scaffolded project.
+ *
+ *  RFC design loop §B — the cards pick: one POST writes the same files the
+ *  CLI `repo design-direction --set` writes, into the repository shown above. */
 function Directions({ data }: { data: Extract<NonNullable<ReturnType<typeof useDesignCheck>['data']>, { ok: true }> }) {
+  const pick = useSetDesignDirection();
+  const create = useCreateDesignSystem();
+  const previews = useDesignPreviews();
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [highlightId, setHighlightId] = useState<string | null>(null);
   const dirs = data.directions;
+  useEffect(() => {
+    if (!highlightId || !dirs) return;
+    const card = document.querySelector(`[data-direction-id="${highlightId.replace(/"/g, '')}"]`);
+    card?.scrollIntoView({ block: 'nearest' });
+  }, [highlightId, dirs]);
   if (!dirs) return null;
+  const pendingId = pick.isPending ? (pick.variables ?? null) : null;
   return (
     <section className="space-y-2">
       <h2 className="text-sm font-medium">Design direction</h2>
+      <MakeMySystem
+        pending={create.isPending}
+        result={create.data ?? null}
+        error={create.isError ? describeCreateFailure(create.error) : null}
+        onCreate={(body) => {
+          create.mutate(body, {
+            onSuccess: (made) => setHighlightId(made.id),
+          });
+        }}
+        onSelect={(id) => {
+          setHighlightId(id);
+          pick.mutate(id);
+        }}
+      />
       {dirs.unavailable && (
         <p className="rounded-md bg-error/10 p-2 text-sm text-error">
           Declared direction <code>{dirs.unavailable}</code> is not registered.
@@ -182,31 +229,90 @@ function Directions({ data }: { data: Extract<NonNullable<ReturnType<typeof useD
       {dirs.declared === null && !dirs.unavailable && (
         <p className="text-sm text-muted-foreground">None declared — pick one below.</p>
       )}
-      <ul className="grid grid-cols-1 gap-1 sm:grid-cols-2">
-        {dirs.available.map((d) => {
-          const chosen = d.id === dirs.declared;
-          return (
-            <li
-              key={d.id}
-              className={`flex items-center gap-2 rounded-md border px-3 py-2 text-sm ${chosen ? 'border-primary' : ''}`}
-            >
-              {/* Swatch comes straight from the theme tokens the daemon sent —
-                  the panel never invents a colour, so a theme edit shows up here
-                  without a second place to update. */}
-              <span
-                aria-hidden
-                className="h-4 w-4 shrink-0 rounded-full border"
-                style={{ backgroundColor: d.swatch.accent, borderColor: d.swatch.muted }}
-              />
-              <span className="min-w-0 flex-1 truncate">
-                <code>{d.id}</code>
-                <span className="ml-2 text-xs text-muted-foreground">{d.mood}</span>
-              </span>
-              {chosen && <span className="shrink-0 text-xs text-primary">declared</span>}
-            </li>
-          );
-        })}
-      </ul>
+      {pick.isError && (
+        <p className="rounded-md bg-error/10 p-2 text-sm text-error">{describePickFailure(pick.error)}</p>
+      )}
+      {openId && (
+        <PreviewFrame
+          system={openId}
+          onClose={() => setOpenId(null)}
+          onSelect={() => pick.mutate(openId)}
+          selecting={pendingId === openId}
+          busy={pendingId !== null}
+          alreadySelected={dirs.declared === openId}
+        />
+      )}
+      <DirectionCards
+        available={dirs.available}
+        declared={dirs.declared}
+        pendingId={pendingId}
+        previews={previewSystemSet(previews.data?.previews)}
+        onPreview={(id) => setOpenId(id)}
+        onPick={(id) => pick.mutate(id)}
+      />
     </section>
+  );
+}
+
+/** Untrusted preview HTML. Empty sandbox — no scripts, no same-origin. */
+function PreviewFrame({
+  system,
+  onClose,
+  onSelect,
+  selecting,
+  busy,
+  alreadySelected,
+}: {
+  system: string;
+  onClose: () => void;
+  onSelect: () => void;
+  selecting: boolean;
+  busy: boolean;
+  alreadySelected: boolean;
+}) {
+  const preview = useDesignPreview(system);
+  return (
+    <div className="space-y-2 rounded-md border p-3">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-sm font-medium">Preview · <code>{system}</code></p>
+        <div className="flex items-center gap-2">
+          {alreadySelected ? (
+            <span className="text-xs text-primary">Selected</span>
+          ) : (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={onSelect}
+              className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted disabled:opacity-50"
+              aria-label={`Select ${system}`}
+            >
+              {selecting ? 'Selecting…' : 'Select'}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-2.5 py-1 text-xs hover:bg-muted"
+            aria-label="Close preview"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+      {preview.isLoading && <p className="text-sm text-muted-foreground">Loading preview…</p>}
+      {preview.isError && (
+        <p className="text-sm text-error">
+          Could not load the preview: {preview.error instanceof Error ? preview.error.message : String(preview.error)}
+        </p>
+      )}
+      {preview.data && (
+        <iframe
+          sandbox=""
+          srcDoc={preview.data.html}
+          title={`Preview · ${system}`}
+          className="h-80 w-full rounded-md border bg-white"
+        />
+      )}
+    </div>
   );
 }

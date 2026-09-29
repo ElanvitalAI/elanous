@@ -166,6 +166,8 @@ export interface AbandonedClassificationResult {
   readonly credentialFailure?: true;
   /** Preserved independently of the selected classification. */
   readonly providerError?: true;
+  /** Category of the provider error admitted by the caller, when observed. */
+  readonly providerErrorCategory?: 'quota' | 'credential' | 'request' | 'other';
   /** Preserved independently of the selected classification. Only `true` is recorded. */
   readonly citedEvidenceExists?: true;
   readonly mustFixReported: boolean;
@@ -276,6 +278,7 @@ export function classifyAbandonedRun(input: AbandonedClassificationInput): Aband
     ...(input.quotaAccountAvailability ? { quotaAccountAvailability: input.quotaAccountAvailability } : {}),
     ...(input.credentialFailure === true ? { credentialFailure: true } : {}),
     ...(input.providerError === true ? { providerError: true } : {}),
+    ...(input.providerError === true && input.providerErrorCategory ? { providerErrorCategory: input.providerErrorCategory } : {}),
     ...(input.citedEvidenceExists === true ? { citedEvidenceExists: true } : {}),
     mustFixReported,
     ...(blocked

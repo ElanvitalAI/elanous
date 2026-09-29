@@ -1,0 +1,40 @@
+graph_id: release-loop
+loop:
+  title: 릴리스
+  description: 승인된 판을 빌드·검증·게시한다
+  trigger:
+    events: [manual]
+version: 1
+entry_node: version-release
+dry_run_await_approval: true
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
+  - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
+  - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: start }
+  - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: start }
+  - { node_id: prepare, kind: agent, recipe: 'cmd:prepare', max_visits: 1, notify: start }
+  - { node_id: upgrade, kind: gate, recipe: 'cmd:upgrade', max_visits: 1 }
+  - { node_id: tui, kind: gate, recipe: 'cmd:tui', max_visits: 1 }
+  - { node_id: docs, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
+  - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
+  - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1 }
+  - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1 }
+  - { node_id: verify, kind: gate, recipe: 'cmd:verify', max_visits: 1 }
+  - { node_id: version-dev-bump, kind: git, recipe: 'cmd:version-dev-bump', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: version-release, on: outcome, map: { ok: cutoff, fail: failed, error: failed } }
+  - { from: cutoff, on: outcome, map: { ok: gate, fail: failed, error: failed } }
+  - { from: gate, on: outcome, map: { ok: pwa, fail: failed, error: failed } }
+  - { from: pwa, on: outcome, map: { ok: prepare, fail: failed, error: failed } }
+  - { from: prepare, on: outcome, map: { ok: upgrade, fail: failed, error: failed } }
+  - { from: upgrade, on: outcome, map: { ok: tui, fail: failed, error: failed } }
+  - { from: tui, on: outcome, map: { ok: docs, fail: failed, error: failed } }
+  - { from: docs, on: outcome, map: { ok: approve-publish, fail: failed, error: failed } }
+  - { from: approve-publish, on: outcome, map: { ok: publish, fail: failed } }
+  - { from: publish, on: outcome, map: { ok: docs-land, fail: failed, error: failed } }
+  - { from: docs-land, on: outcome, map: { ok: verify, fail: failed, error: failed } }
+  - { from: verify, on: outcome, map: { ok: version-dev-bump, fail: failed, error: failed } }
+  - { from: version-dev-bump, on: outcome, map: { ok: done, fail: failed, error: failed } }

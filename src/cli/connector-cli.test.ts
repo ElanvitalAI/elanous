@@ -334,6 +334,38 @@ test('signed internal receive and polling deduplicate the same revision in both 
   }
 });
 
+test('signed webhook and pull skip a projected revision without posting or recreating a task', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'connector-projection-'));
+  roots.push(root);
+  const ledger = new EventLedger(join(root, 'events.jsonl'));
+  const now = Date.now();
+  const updatedAt = new Date(now).toISOString();
+  const issue = { id: 'issue-1', identifier: 'ELA-1', title: 'Projected', priority: 2, updatedAt };
+  ledger.record('linear', 'outgoing:state:issue-1:hash', { ref: issue.id, occurredAt: updatedAt });
+  const rawBody = JSON.stringify({ type: 'Issue', action: 'update', webhookTimestamp: now, data: issue });
+  const secret = 'webhook-secret';
+  let posts = 0;
+  const lines: string[] = [];
+  const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
+    if (String(url).includes('api.linear.app')) return Response.json({ data: { issues: { nodes: [issue], pageInfo: { hasNextPage: false } } } });
+    if (init?.method === 'POST') posts++;
+    return Response.json({ tasks: [] });
+  }) as typeof fetch;
+  const deps = { ledger, fetch: fetchFn, baseUrl: 'http://127.0.0.1:31415', bearerToken: 'test-token',
+    getSecret: async (id: string) => id === 'connector.linear.webhookSecret' ? secret : 'api-key',
+    output: (line: string) => lines.push(line), log: (() => {}) as any };
+  expect(await runLinearWebhook({ rawBody, signature: createHmac('sha256', secret).update(rawBody).digest('hex'), deliveryId: 'delivery-1', now }, deps)).toBe(0);
+  expect(await runLinearSync({ team: 'ELA' }, deps)).toBe(0);
+  expect(posts).toBe(0);
+  expect(lines).toEqual(['connector linear receive: ignored']);
+  const previouslyParsed = parseLinearWebhook({ type: 'Issue', action: 'update', data: issue }, 'queued-delivery', new EventLedger(join(root, 'empty.jsonl')))!;
+  expect(await applyLinearEvents([previouslyParsed], {}, deps)).toBe(0);
+  expect(lines.at(-1)).toBe('ELA-1\t-\tskipped-seen');
+  expect(posts).toBe(0);
+  expect(ledger.seen('linear', 'delivery-1')).toBe(false);
+  expect(ledger.seen('linear', 'queued-delivery')).toBe(false);
+});
+
 test('set-key reads stdin dependency and saves without printing value', async () => {
   const output: string[] = [];
   let saved: [string, string] | undefined;

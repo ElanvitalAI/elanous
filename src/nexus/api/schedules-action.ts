@@ -18,9 +18,13 @@ interface ScheduleActionBody {
   command?: string;
   category?: string;
   note?: string;
+  confirm?: boolean;
 }
 
-export async function handleSchedulesActionPost(req: Request): Promise<Response> {
+export async function handleSchedulesActionPost(
+  req: Request,
+  dispatch?: (args: Record<string, unknown>) => Promise<unknown>,
+): Promise<Response> {
   let body: ScheduleActionBody;
   try {
     body = (await req.json()) as ScheduleActionBody;
@@ -29,9 +33,14 @@ export async function handleSchedulesActionPost(req: Request): Promise<Response>
   }
   const action = typeof body.action === 'string' ? body.action.trim() : '';
   if (!action) return jsonResponse({ error: 'action 필수 (adopt/release/enable/disable/delete/update/create)' }, 400);
+  if (['delete', 'migrate', 'adopt', 'release'].includes(action) && body.confirm !== true) {
+    const id = typeof body.id === 'string' ? body.id : '';
+    return jsonResponse({ dryRun: true, action, id,
+      plan: `${id || '(id 미지정)'}: ${action} 적용 예정 — confirm:true 로 확인 후 실행.` });
+  }
 
-  const { dispatchScheduleManage } = await import('../../domains/schedule-manage-tool.js');
-  const result = await dispatchScheduleManage({
+  const run = dispatch ?? (await import('../../domains/schedule-manage-tool.js')).dispatchScheduleManage;
+  const result = await run({
     action,
     ...(body.id !== undefined ? { id: body.id } : {}),
     ...(body.cron !== undefined ? { cron: body.cron } : {}),

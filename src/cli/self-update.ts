@@ -4,6 +4,7 @@ import { homedir, platform, userInfo } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { decideRestartNeeded, type RestartNeededResult } from './nexus-restart-needed.js';
 import { debug } from '../debug/log.js';
+import { envLiteral } from '../platform/env-literal.js';
 
 export interface SelfUpdateOptions {
   from?: string;
@@ -42,6 +43,8 @@ export interface SelfUpdateDeps {
   /** 텔레그램 러너 서비스(`elanous telegram service --install`)가 깔려 있나 — 주입 안 하면 서비스 파일 존재로 본다. */
   telegramRunnerInstalled?: () => boolean;
   out?: { log: (s: string) => void; error: (s: string) => void };
+  /** 판올림 성공 알림(주입 안 하면 sendOutbound 'report' · 시험에선 안 보냄). */
+  notice?: (text: string) => void;
 }
 
 export interface SelfUpdateResult {
@@ -217,6 +220,24 @@ function defaultRelinkCurrent(versionName: string): void {
   renameSync(tmp, join(root, 'current'));
 }
 
+/** 판올림 성공 알림 한 줄(대표 09-28 «수정·배포 과정이 매끄럽지 않다») — 사람이 «무엇을 해야 새 판을 보나»를 바로 안다. */
+export function formatUpdateNotice(result: Pick<SelfUpdateResult, 'installedVersion' | 'restarted' | 'decision' | 'pwaBuiltCommit'>): string | null {
+  if (!result.installedVersion) return null;
+  const restartLine = result.restarted
+    ? '넥서스 재시작함 — 열린 PWA 탭의 터미널·채팅 연결이 끊겼다 → **새로고침** 하면 다시 붙는다'
+    : '넥서스 재시작 안 함(화면·스크립트만 바뀜)';
+  const pwaLine = result.pwaBuiltCommit || result.restarted
+    ? 'PWA 새 화면: 열린 탭은 **새로고침** 해야 보인다'
+    : 'PWA 변경 없음';
+  return [`🔄 **운영 판올림** \`${result.installedVersion}\``, `  • ${restartLine}`, `  • ${pwaLine}`].join('\n');
+}
+
+function defaultNotice(text: string): void {
+  // 시험에선 텔레그램으로 나가지 않는다.
+  if (process.env.NODE_ENV === 'test') return;
+  import('../domains/outbound-alert.js').then((m) => { m.sendOutbound(text, 'report'); }).catch(() => {});
+}
+
 function defaultAlert(text: string): void {
   import('../domains/outbound-alert.js').then((m) => { m.sendOutbound(text, 'alert'); }).catch(() => {});
 }
@@ -378,7 +399,7 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     return { status: result.status, stderr: result.error?.message ?? result.stderr ?? '' };
   });
   try {
-    const install = run('bash', ['-s', '--', '--no-modify-path', '--prefix', prefix], prefix, installer, { ELANOUS_VERSION: version ?? '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: base });
+    const install = run('bash', ['-s', '--', '--no-modify-path', '--prefix', prefix], prefix, installer, envLiteral({ ELANOUS_VERSION: version ?? '', ELANOUS_INSTALL_SOURCE: '', ELANOUS_RELEASE_BASE: base }));
     if (install.status !== 0) return fail(1, `설치 실패: ${install.stderr.trim() || install.status}`);
     const metadata: unknown = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8'));
     const installedVersion = typeof metadata === 'object' && metadata !== null && 'version' in metadata && typeof metadata.version === 'string'
@@ -490,6 +511,10 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
       });
     } catch { /* 관측 실패가 갱신을 막지 않는다 */ }
     if (options.alert && result.exitCode !== 0 && !alerted) alertOnce(`⛔ elanous self-update 실패(exit ${result.exitCode}): ${result.reason}`);
+    if (result.exitCode === 0) {
+      const notice = formatUpdateNotice(result);
+      if (notice) (deps.notice ?? defaultNotice)(notice);
+    }
     if (options.json) out.log(JSON.stringify(result));
     else out.log(`self-update: installed=${result.installedVersion ?? 'none'} decision=${result.decision?.verdict ?? 'unknown'} restarted=${result.restarted} pruned=${result.prune ? (result.prune.skipped ? `skip(${result.prune.skipped})` : result.prune.removed.length) : 'n/a'} reason=${result.reason}`);
     return result;
@@ -510,6 +535,22 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
       decision = await (deps.decide ?? decideRestartNeeded)({ to: head.stdout.trim(), cwd: checkout, out: silence });
     } catch (error) {
       decision = { exitCode: 2, reason: `판정 실패: ${String(error)}` };
+    }
+    const depsDirs = options.skipPwaBuild ? [checkout] : [checkout, join(checkout, 'apps/pwa')];
+    for (const dir of depsDirs) {
+      const started = Date.now();
+      let ok = false;
+      let tail = '';
+      try {
+        const installed = run('bun', ['install', '--frozen-lockfile'], dir, { timeout: 15 * 60_000 });
+        ok = installed.status === 0;
+        tail = (installed.stderr?.trim() || installed.stdout?.trim() || '').split(/\r?\n/).filter((line) => line.trim()).at(-1)?.trim().slice(0, 500) ?? '';
+      } catch (error) {
+        tail = String(error).split(/\r?\n/).at(-1)?.trim().slice(0, 500) ?? '';
+      }
+      try { debug.log('self-update', 'deps-install', { dir, ok, ms: Date.now() - started }); }
+      catch { /* 관측 실패가 갱신을 막지 않는다 */ }
+      if (!ok) return emit({ exitCode: 1, installedVersion: null, decision, restarted: false, reason: `의존 설치 실패: ${tail || '출력 없음'}` });
     }
     if (!options.skipPwaBuild) {
       const commit = head.stdout.trim().slice(0, 12);
@@ -558,7 +599,12 @@ export async function runSelfUpdate(options: SelfUpdateOptions = {}, deps: SelfU
     runnerOutcome = updateTelegramRunner(decision, options.restart === true, deps, run, checkout);
     try { debug.log('self-update', 'telegram-runner', { ...runnerOutcome, installedVersion }); } catch { /* */ }
     if (runnerOutcome.verdict === 'failed' && options.alert) alertOnce(`⚠️ elanous self-update: 텔레그램 러너 재시작 실패 — ${runnerOutcome.reason}`);
-    if (decision.verdict !== 'restart' || decision.exitCode !== 11) {
+    // ⛔ `build`(PWA 만 바뀜)도 재시작한다 — 이 길은 새 판을 `versions/<새 판>` 에 깔고 `current` 를 옮긴다.
+    //    도는 넥서스는 «부팅 때의» 판 디렉터리에서 정적 파일을 서빙하므로, 재시작 없이는 새 PWA 가 영영 안 보인다
+    //    (2026-09-28 실측: decision=build · restarted=false 뒤에도 운영이 옛 빌드 id 를 서빙 → kickstart 뒤에야 새 id).
+    //    `build = 재빌드만` 은 체크아웃에서 도는 데몬(같은 apps/pwa/out 을 읽는다)의 전제였다.
+    const needsRestart = (decision.verdict === 'restart' && decision.exitCode === 11) || (decision.verdict === 'build' && decision.exitCode === 10);
+    if (!needsRestart) {
       return emit({ exitCode: 0, installedVersion, decision, restarted: false, prune, relay, reason: decision.exitCode === 2 ? `판정 모름: ${decision.reason ?? '이유 없음'}` : `판정 ${decision.verdict ?? 'unknown'}: 재시작 불필요` });
     }
     if (!options.restart) return emit({ exitCode: 0, installedVersion, decision, restarted: false, prune, reason: '--restart 없음: 재시작하지 않음' });

@@ -48,6 +48,7 @@ import {
 } from '@/nexus/hooks/use-workflows';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
 import type {
+  GraphKindEntry,
   WorkflowSummary,
   WorkflowRunEvent,
 } from '@/nexus/client';
@@ -86,7 +87,7 @@ nodes:
     bash: echo hello
 `;
 
-export function WorkflowsPanel() {
+export function WorkflowsPanel({ palette }: { palette?: GraphKindEntry[] } = {}) {
   // SSG safety (Archon-port follow-up · 2026-05-08): the static export
   // prerenders this page without a NexusProvider in scope, so any
   // `useNexusClient`-bound hook would throw and abort `next build`.
@@ -96,7 +97,7 @@ export function WorkflowsPanel() {
   // configured baseUrl see on first paint.
   const optionalClient = useOptionalNexusClient();
   if (!optionalClient) return <WorkflowsUnconfigured />;
-  return <WorkflowsPanelInner />;
+  return <WorkflowsPanelInner palette={palette} />;
 }
 
 function WorkflowsUnconfigured() {
@@ -118,7 +119,7 @@ function WorkflowsUnconfigured() {
   );
 }
 
-function WorkflowsPanelInner() {
+function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   const list = useWorkflows();
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [draftYaml, setDraftYaml] = useState<string>('');
@@ -126,10 +127,8 @@ function WorkflowsPanelInner() {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [creatingNew, setCreatingNew] = useState(false);
   const [newName, setNewName] = useState('');
-  // T2B Phase 1 (2026-05-08): YAML / Graph toggle. Phase 2 will turn
-  // the graph view into an editor; for now it's read-only — flips back
-  // to YAML automatically when the user starts editing.
-  const [editorMode, setEditorMode] = useState<'yaml' | 'graph'>('yaml');
+  // Keep the YAML subview available for raw edits; open the existing graph editor first.
+  const [editorMode, setEditorMode] = useState<'yaml' | 'graph'>('graph');
   // §5.2 follow-up — Active Runs view replaces the editor pane
   // entirely while toggled. Picking a run row swaps it back to the
   // editor with the run loaded into the right panel.
@@ -615,6 +614,7 @@ function WorkflowsPanelInner() {
             <div className="flex flex-1 flex-col overflow-hidden bg-surface">
               <div className={selectedNodeId ? 'flex-1 min-h-[180px] overflow-hidden' : 'flex-1 overflow-hidden'}>
                 <WorkflowGraph
+                  palette={palette}
                   yaml={draftYaml}
                   editable={!isReadonly}
                   onChangeYaml={setDraftYaml}

@@ -17,6 +17,11 @@
 #    triage 는 방문 수·반복 열쇠를 보고 스스로 `needs-deeper-observation` / `needs-grounding` / `exhausted` 를 고른다.
 # ⭐ 이 파일은 «표준»이다 — 런 슈퍼바이저는 이 파일을 고치지 않고, 카탈로그 원형(spawn: runtime)을 판 상태 패치로 얹는다(§3.4 G1·G2).
 graph_id: heal-loop
+loop:
+  title: 치유
+  description: 실패를 관측하고 원인을 분류해 수복한다
+  trigger:
+    events: [failure]
 version: 1
 entry_node: collect
 terminal_nodes: [done, failed]

@@ -327,16 +327,56 @@ describe('self-update — injected commands only', () => {
     expect(result).toMatchObject({ exitCode: 0, installedVersion: '1.0.0-abcdef123456', restarted: true, decision: { verdict: 'restart' } });
     expect(f.calls).toEqual([
       'git rev-parse --show-toplevel', 'git rev-parse --verify HEAD', 'git diff --quiet HEAD --',
-      `decide ${sha} ${checkout}`, 'bun bin/elanous.mjs nexus build', `bash ${checkout}/scripts/install.sh --no-modify-path`,
+      `decide ${sha} ${checkout}`, 'bun install --frozen-lockfile', 'bun install --frozen-lockfile', 'bun bin/elanous.mjs nexus build', `bash ${checkout}/scripts/install.sh --no-modify-path`,
       'prune 1.0.0-abcdef123456  3', 'launchctl kickstart -k gui/501/com.elanous.nexus', 'verify abcdef123456',
     ]);
     expect(JSON.parse(f.lines[0]!)).toEqual(result);
   });
+  test('installs root then PWA dependencies before build, using each checkout cwd', async () => {
+    const f = fixture();
+    const calls: Array<{ args: string[]; cwd: string }> = [];
+    const run = f.deps.run!;
+    f.deps.run = (cmd, args, cwd, options) => {
+      calls.push({ args, cwd });
+      return run(cmd, args, cwd, options);
+    };
+    await runSelfUpdate({}, f.deps);
+    expect(calls.slice(0, 4)).toEqual([
+      { args: ['install', '--frozen-lockfile'], cwd: checkout },
+      { args: ['install', '--frozen-lockfile'], cwd: join(checkout, 'apps/pwa') },
+      { args: ['bin/elanous.mjs', 'nexus', 'build'], cwd: checkout },
+      { args: [join(checkout, 'scripts/install.sh'), '--no-modify-path'], cwd: checkout },
+    ]);
+  });
+
+  test.each([checkout, join(checkout, 'apps/pwa')])('failed dependency install in %s leaves the old version untouched', async (failedDir) => {
+    const f = fixture();
+    const calls: string[] = [];
+    const alerts: string[] = [];
+    f.deps.run = (cmd, args, cwd) => {
+      calls.push(`${cmd} ${args.join(' ')} @ ${cwd}`);
+      return { status: cwd === failedDir ? 1 : 0, stderr: cwd === failedDir ? 'first line\nlast diagnostic\n' : '' };
+    };
+    const result = await runSelfUpdate({ restart: true, alert: true }, {
+      ...f.deps,
+      alert: (text) => alerts.push(text),
+      installedVersion: () => { throw new Error('must not inspect installed version'); },
+      pruneVersions: () => { throw new Error('must not prune'); },
+      verifyRestart: async () => { throw new Error('must not restart'); },
+    });
+    expect(result).toMatchObject({ exitCode: 1, installedVersion: null, restarted: false, reason: '의존 설치 실패: last diagnostic' });
+    expect(calls).toEqual(failedDir === checkout
+      ? [`bun install --frozen-lockfile @ ${checkout}`]
+      : [`bun install --frozen-lockfile @ ${checkout}`, `bun install --frozen-lockfile @ ${join(checkout, 'apps/pwa')}`]);
+    expect(alerts).toHaveLength(1);
+  });
+
   test('a failed PWA build returns the output tail and alerts once without installing, relinking or restarting', async () => {
     const f = fixture();
     const alerts: string[] = [];
     const sideEffects: string[] = [];
     f.deps.run = (cmd, args, cwd, options) => {
+      if (args[0] === 'install') return { status: 0, stderr: '' };
       expect([cmd, args, cwd, options]).toEqual(['bun', ['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 900_000 }]);
       f.calls.push('bun build failed');
       return { status: 1, stdout: 'first line\n', stderr: 'build error\nfinal diagnostic\n' };
@@ -362,7 +402,7 @@ describe('self-update — injected commands only', () => {
     const f = fixture();
     f.deps.run = (cmd, args, cwd, options) => {
       f.calls.push(`${cmd} ${args.join(' ')}`);
-      if (cmd === 'bun') {
+      if (cmd === 'bun' && args[0] !== 'install') {
         expect([args, cwd, options]).toEqual([['bin/elanous.mjs', 'nexus', 'build'], checkout, { timeout: 900_000 }]);
       }
       return { status: 0, stderr: '' };
@@ -380,7 +420,7 @@ describe('self-update — injected commands only', () => {
   test('explicit --skip-pwa-build preserves the checkout install path without running a build', async () => {
     const f = fixture();
     f.deps.run = (cmd, args) => {
-      expect(cmd).not.toBe('bun');
+      if (cmd === 'bun') expect(args).toEqual(['install', '--frozen-lockfile']);
       f.calls.push(`${cmd} ${args.join(' ')}`);
       return { status: 0, stderr: '' };
     };
@@ -389,19 +429,20 @@ describe('self-update — injected commands only', () => {
     expect(result.pwaBuiltCommit).toBeUndefined();
     expect(result.pwaBuiltAt).toBeUndefined();
     expect(f.calls).toContain(`bash ${checkout}/scripts/install.sh --no-modify-path`);
+    expect(f.calls.filter((call) => call === 'bun install --frozen-lockfile')).toHaveLength(1);
   });
 
   test('installation routing forwards explicit skip to the checkout', async () => {
     const f = fixture();
     f.deps.run = (cmd, args) => {
-      expect(cmd).not.toBe('bun');
+      if (cmd === 'bun') expect(args).toEqual(['install', '--frozen-lockfile']);
       f.calls.push(`${cmd} ${args.join(' ')}`);
       return { status: 0, stderr: '' };
     };
     const result = await runUpdateForInstallation({ from: checkout, skipPwaBuild: true }, { checkout: f.deps });
     expect(result.exitCode).toBe(0);
     expect(f.calls).toContain(`bash ${checkout}/scripts/install.sh --no-modify-path`);
-    expect(f.calls.some((call) => call.startsWith('bun '))).toBe(false);
+    expect(f.calls.filter((call) => call.startsWith('bun '))).toEqual(['bun install --frozen-lockfile']);
   });
 
   test('no --restart means no service command and an explicit reason', async () => {
@@ -412,14 +453,25 @@ describe('self-update — injected commands only', () => {
     expect(f.calls.filter((s) => s.startsWith('launchctl'))).toHaveLength(0);
     expect(f.lines).toHaveLength(1);
   });
-  for (const verdict of ['build', 'none'] as const) {
-    test(`${verdict} does not restart with --restart`, async () => {
-      const f = fixture({ exitCode: verdict === 'build' ? 10 : 0, verdict });
-      const result = await runSelfUpdate({ restart: true }, f.deps);
-      expect(result.restarted).toBe(false);
-      expect(f.calls.some((s) => s.startsWith('launchctl'))).toBe(false);
-    });
-  }
+  test('none does not restart with --restart', async () => {
+    const f = fixture({ exitCode: 0, verdict: 'none' });
+    const result = await runSelfUpdate({ restart: true }, f.deps);
+    expect(result.restarted).toBe(false);
+    expect(f.calls.some((s) => s.startsWith('launchctl'))).toBe(false);
+  });
+  // 2026-09-28 — PWA 만 바뀐 판을 깔고 재시작하지 않자 운영이 옛 PWA 를 계속 서빙했다(넥서스는 부팅 때의 판 디렉터리를 읽는다).
+  test('build (PWA-only) restarts with --restart — the running nexus serves its boot-time version dir', async () => {
+    const f = fixture({ exitCode: 10, verdict: 'build' });
+    const result = await runSelfUpdate({ restart: true }, f.deps);
+    expect(f.calls.some((s) => s.startsWith('launchctl'))).toBe(true);
+    expect(result.restarted).toBe(true);
+  });
+  test('build without --restart installs but does not restart', async () => {
+    const f = fixture({ exitCode: 10, verdict: 'build' });
+    const result = await runSelfUpdate({}, f.deps);
+    expect(result.restarted).toBe(false);
+    expect(f.calls.some((s) => s.startsWith('launchctl'))).toBe(false);
+  });
   test('unknown exit 2 installs but never restarts; preserves reason', async () => {
     const f = fixture({ exitCode: 2, reason: '데몬 무응답' });
     const result = await runSelfUpdate({ restart: true }, f.deps);
@@ -615,4 +667,14 @@ describe('self-update — relay (T5 · 2026-09-24)', () => {
     expect(files).toContain('scripts/openai-relay-server.ts');
     expect(files.length).toBeGreaterThan(1);
   });
+});
+
+import { formatUpdateNotice } from './self-update.js';
+test('판올림 알림 — 재시작이면 «새로고침» 두 줄 · 판이 없으면 null', () => {
+  const t = formatUpdateNotice({ installedVersion: '0.2.4-dev.0-abc', restarted: true, decision: null })!;
+  expect(t).toContain('0.2.4-dev.0-abc');
+  expect(t).toContain('넥서스 재시작함');
+  expect(t).toContain('새로고침');
+  expect(formatUpdateNotice({ installedVersion: 'x', restarted: false, decision: null })).toContain('재시작 안 함');
+  expect(formatUpdateNotice({ installedVersion: null, restarted: false, decision: null })).toBeNull();
 });

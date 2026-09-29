@@ -1,5 +1,8 @@
 # ElanousAgent
 
+> **Beta** — Elanous is provided as is (Apache-2.0) until the stable release. Get stable release news at [elanous.ai](https://elanous.ai).
+> **베타** — 정식 릴리스 전까지 Elanous 는 있는 그대로(Apache-2.0) 제공됩니다. 정식 릴리스 소식은 [elanous.ai](https://elanous.ai) 에서 받으세요.
+
 > The name joins *élan* (the drive to act) and *nous* (mind). The agent
 > observes itself, reasons about what it sees, and repairs itself; a person is called only when it cannot (一約之觀).
 

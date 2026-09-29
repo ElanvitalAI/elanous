@@ -49,6 +49,12 @@ const nextConfig: NextConfig = {
     NEXT_PUBLIC_BUILD_TIME: BUILD_TIME,
     NEXT_PUBLIC_BUILD_SHA: BUILD_SHA,
   },
+  // 정적 생성 워커 상한 — Next 기본은 «CPU − 1» 이다. Pod 안에서도 호스트 코어 수(node-b = 32)가 보여 워커가
+  // 최대 31 개 뜨고, 하나가 1~2.6GB 라 32Gi Pod 가 OOMKilled 됐다(2026-09-28 F-M1 런 · 🅣 가설 · 한 프로세스 최대 2.6GB 실측).
+  // 4 면 이 맥(10코어)의 빌드 시간은 거의 같다. `ELANOUS_PWA_BUILD_CPUS` 로 바꿀 수 있다.
+  experimental: {
+    cpus: Math.max(1, Number(process.env.ELANOUS_PWA_BUILD_CPUS) || 4),
+  },
 };
 
 export default nextConfig;

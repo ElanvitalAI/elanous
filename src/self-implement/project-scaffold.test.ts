@@ -127,7 +127,7 @@ describe('scaffoldProject', () => {
 
     expect(result.status).toBe('provisioned');
     if (result.status === 'not-applicable') throw new Error('expected provisioned scaffold');
-    expect(result.ignoreFile).toEqual({ added: 23, preserved: 0 });
+    expect(result.ignoreFile).toEqual({ added: 31, preserved: 0, created: true });
     expect(calls).toContainEqual(['init']);
     expect(result.created).toEqual(expect.arrayContaining(paths(result.target)));
     expect(result.created).toEqual(expect.arrayContaining([join(result.target, '.elanous'), join(result.target, 'docs', 'goals')]));
@@ -221,7 +221,7 @@ describe('scaffoldProject', () => {
 
     expect(result.status).toBe('already-git');
     if (result.status === 'not-applicable') throw new Error('expected already-git scaffold');
-    expect(result.ignoreFile).toEqual({ added: 23, preserved: 1 });
+    expect(result.ignoreFile).toEqual({ added: 31, preserved: 1, created: false });
     expect(result.created).toEqual(expect.arrayContaining(paths(result.target)));
     expect(result.created).toEqual(expect.arrayContaining([join(result.target, '.elanous'), join(result.target, 'docs', 'goals')]));
     expect(result.created).not.toContain(join(result.target, 'docs', 'pdca'));

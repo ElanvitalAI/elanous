@@ -15,6 +15,7 @@
 // without touching http-server.ts again.
 
 import { randomUUID } from 'node:crypto';
+import { matchTempToken } from '../../auth/temp-tokens.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname } from 'node:path';
 
@@ -213,6 +214,7 @@ type AuthReason =
   | 'same-origin'
   | 'untrusted-same-origin-peer'
   | 'bearer-match'
+  | 'temp-token'
   | 'no-bearer-configured'
   | 'missing-auth-header'
   | 'bearer-length-mismatch'
@@ -259,6 +261,8 @@ function decideAuth(req: Request, opts: MetaApiOpts): { ok: boolean; reason: Aut
     return { ok: false, reason: peerRejected ? 'untrusted-same-origin-peer' : 'missing-auth-header' };
   }
   const offered = auth.slice('Bearer '.length).trim();
+  // 단기 소유자 토큰(`elanous token issue` · 해시·만료 대조) — 소유자 토큰과 같은 권한 · 수명만 짧다.
+  if (offered.startsWith('elt_') && matchTempToken(offered)) return { ok: true, reason: 'temp-token' };
   if (offered.length !== token.length) return { ok: false, reason: 'bearer-length-mismatch' };
   let diff = 0;
   for (let i = 0; i < offered.length; i += 1) {

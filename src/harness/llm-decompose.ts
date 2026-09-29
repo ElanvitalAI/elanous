@@ -37,7 +37,7 @@ const observationErrorReason = (error: unknown): string => {
 export async function llmDecomposeSteps(
   objective: string,
   callable: DecomposeCallable,
-  opts?: { context?: string; maxTasks?: number; promptProfile?: DecomposePromptProfile; signal?: AbortSignal },
+  opts?: { context?: string; maxTasks?: number; promptProfile?: DecomposePromptProfile; signal?: AbortSignal; onRationale?: (rationale: string) => void },
 ): Promise<string[]> {
   const startedAt = Date.now();
   const promptProfileObservation = opts?.promptProfile ? { promptProfile: opts.promptProfile } : {};
@@ -59,6 +59,7 @@ export async function llmDecomposeSteps(
     );
     const steps = result.proposal.tasks.map((t) => t.title).filter((t) => !!t && t.trim().length > 0);
     observe({ inputLength: objective.length, taskCount: result.proposal.tasks.length, durationMs: Date.now() - startedAt, failed: false, ...promptProfileObservation });
+    try { opts?.onRationale?.(result.proposal.rationale); } catch { /* Observation cannot change the proposed steps. */ }
     return steps;
   } catch (error) {
     observe({ inputLength: objective.length, taskCount: 0, durationMs: Date.now() - startedAt, failed: true, error: observationErrorReason(error), ...promptProfileObservation });

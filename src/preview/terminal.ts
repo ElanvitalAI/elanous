@@ -127,6 +127,18 @@ const defaultSpawn: SpawnFn = (shell, args, o) => {
   return pty.spawn(shell, args, o as any) as IPty;
 };
 
+/** node-pty 네이티브 `resize(fd, cols, rows)` 를 임의의 master fd(우리 dup)에 부른다. 'ok' 또는 실패 사유. */
+export function resizeMasterFd(fd: number, cols: number, rows: number): string {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-explicit-any
+    const native: any = require('node-pty/lib/utils').loadNativeModule('pty').module;
+    native.resize(fd, cols, rows);
+    return 'ok';
+  } catch (e) {
+    return String(e);
+  }
+}
+
 /** Known POSIX-y user login shells. We only inject `-l -i` defaults for
  *  these; arbitrary `shell` strings (matrix `tailscale`/`ssh` wrappers)
  *  fall through with `[]`. */
@@ -583,7 +595,18 @@ export class PreviewTerminal {
     if (cols === this.term.cols && rows === this.term.rows) return;
     try { this.term.resize(cols, rows); } catch { /* ignore */ }
     if (this.registryHandle) { try { this.registryHandle.resize(cols, rows); } catch { /* ignore */ } }
-    else { try { this.pty?.resize(cols, rows); } catch { /* ignore */ } }
+    else if (this.pty) {
+      // Bun + node-pty quirk(머리말) — node-pty 가 쥔 master fd 는 Bun 에서 EBADF 라 `pty.resize` 가
+      // ioctl 에서 던진다. 종전엔 그 오류를 삼켜서 ***웹 터미널 PTY 가 영영 80×24*** 였다(2026-09-28 실측:
+      // xterm 172칸 ↔ `stty size` 24 80 — 셸이 80칸에서 접어 프롬프트·긴 명령이 깨졌다).
+      // ⇒ 우리가 dup 해 둔 fd 로 같은 네이티브 resize(TIOCSWINSZ)를 부른다. 커널이 SIGWINCH 를 보낸다.
+      try {
+        this.pty.resize(cols, rows);
+      } catch (e) {
+        const viaDup = this.dupFd >= 0 ? resizeMasterFd(this.dupFd, cols, rows) : 'no-dup-fd';
+        debug.log('preview.terminal', 'resize.fallback', { cols, rows, reason: String(e), viaDup });
+      }
+    }
   }
 
   /** Kill the shell, close the master fd, dispose the emulator. Safe

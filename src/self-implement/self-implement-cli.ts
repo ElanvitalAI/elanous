@@ -52,6 +52,9 @@ export interface SelfImplementCliOpts {
   progress?: DevPipelineDeps['progress'];
   /** Caller-allocated run identity. Omitted callers let the harness mint its own. */
   runId?: string;
+  /** --child-llm-provider ⊕ --child-llm-model (both or neither). */
+  childLlmProvider?: string;
+  childLlmModel?: string;
 }
 
 export interface SelfImplementCliDeps {
@@ -163,6 +166,10 @@ export async function runSelfImplementCliCommand(
         ? await deps.resolveWantAutoReview(false)
         : resolveAutoReview(getUserConfig().autoReview?.mode ?? 'opt-in', false)
       : undefined;
+    const childProvider = opts.childLlmProvider?.trim();
+    const childModel = opts.childLlmModel?.trim();
+    if (!childProvider !== !childModel) throw new Error('--child-llm-provider and --child-llm-model go together');
+    const childLlm = childProvider && childModel ? { provider: childProvider, model: childModel, source: 'flag' as const } : undefined;
     const spec = buildSelfImplementDevSpec({
       feature,
       ...(opts.base ? { base: opts.base } : {}),
@@ -183,6 +190,7 @@ export async function runSelfImplementCliCommand(
       ...(opts.documentReferences ? { documentReferences: opts.documentReferences } : {}),
       ...(opts.naturalLanguageDispatch ? { naturalLanguageDispatch: true } : {}),
       ...(opts.runId ? { runId: opts.runId } : {}),
+      ...(childLlm ? { childLlm } : {}),
       entry: opts.entry ?? 'external-verbatim', // CLI = 외부 창구(외부가 프롬프트 엔지니어 → verbatim 존중)
     });
     spec.entrance = opts.naturalLanguageDispatch ? 'nl-self-implement' : 'cli-self-implement';

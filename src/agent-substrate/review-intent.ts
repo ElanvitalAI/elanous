@@ -14,12 +14,16 @@ import { unified } from 'unified';
 
 import { parseGoalType, type GoalType } from '../self-implement/goal-author.js';
 import type { DesignCheckOutcome } from '../design/design-check.js';
+import type { DesignGateResult } from '../design/design-gate.js';
+import type { PriorDraftFinding } from '../self-implement/prior-draft-findings.js';
 
 export interface ReviewIntentInput {
   /** 무엇을 왜 — 골 원문. */
   readonly goal: string;
   /** 직전 라운드에서 이미 재주입된 must-fix(스테일 재지적 차단). */
   readonly appliedLastRound?: readonly string[];
+  /** Same-goal, other-run draft reviewer must-fix findings to re-evaluate against this diff. */
+  readonly priorRunFindings?: readonly PriorDraftFinding[];
   /** 현재 rework 라운드(0-base). */
   readonly round?: number;
   /** 리뷰 artifact·관측 로그를 잇는 실행 식별자. */
@@ -70,6 +74,7 @@ export interface ReviewIntentInput {
   } | null;
   /** Read-only comparison of the worktree DESIGN.md declaration and installed craft rulebooks. */
   readonly designCheck?: DesignCheckOutcome;
+  readonly designGate?: DesignGateResult | { readonly unmeasured: string };
 }
 
 export const MAX_REVIEW_INTENT_CHARS = 4000;
@@ -150,6 +155,16 @@ function runFactsBlock(i: Readonly<ReviewIntentInput>): Block | undefined {
   return { ...block, minimumText: `${RUN_FACTS_TITLE}\n${minimumItems.map((item) => `- ${item}`).join('\n')}` };
 }
 
+function priorRunFindingsBlock(findings: ReviewIntentInput['priorRunFindings']): Block | undefined {
+  if (!findings?.some((finding) => finding.items.length)) return undefined;
+  const title = '앞 런이 남긴 지적(같은 골 · 다른 런)';
+  const items = findings.flatMap((finding) => finding.items.map((item) => `- #${finding.pr} · 라운드 ${finding.round} · ${item}`));
+  return {
+    title,
+    text: `${title}\n${items.join('\n')}\n각 항목이 이 diff 에서 닫혔는지 판정하라 — 닫히지 않았고 이 PR 범위에 해당하면 must-fix 로 올린다 · 해당 없으면 이유 한 줄`,
+  };
+}
+
 function preexistingFailuresBlock(items: ReviewIntentInput['preexistingTestFailures']): Block | undefined {
   const failures = items?.map((item) => item.trim()).filter(Boolean) ?? [];
   return failures.length
@@ -193,6 +208,29 @@ function designCheckBlock(outcome: ReviewIntentInput['designCheck']): Block | un
         `- 미설치 선언: ${outcome.unavailableRulebooks.join(', ') || '(없음)'}`,
       ].join('\n'),
     };
+}
+
+function designGateBlock(outcome: ReviewIntentInput['designGate']): Block | undefined {
+  if (!outcome) return undefined;
+  if ('unmeasured' in outcome) {
+    const title = '디자인 게이트 — 측정 불가';
+    return { title, text: `${title}\n측정 불가: ${outcome.unmeasured}` };
+  }
+  if (outcome.verdict === 'not-applicable') return undefined;
+  if (outcome.verdict === 'pass') {
+    const title = `디자인 게이트 통과(방향 ${outcome.direction})`;
+    return { title, text: title };
+  }
+  const title = `디자인 게이트 — must-fix 후보(P0 ${outcome.p0Total})`;
+  const findings = outcome.files.flatMap((file) => file.findings
+    .filter((finding) => finding.severity === 'p0')
+    .map((finding) => `${file.path}:${finding.line ?? '?'} ${finding.rule}`));
+  const shown = findings.slice(0, 20);
+  const omitted = findings.length - shown.length;
+  return {
+    title,
+    text: [title, ...shown.map((finding) => `- ${finding}`), ...(omitted ? [`- …${omitted}개 생략`] : [])].join('\n'),
+  };
 }
 
 function shardSiblingsBlock(siblings: ReviewIntentInput['shardSiblings']): Block | undefined {
@@ -501,11 +539,13 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   // ⭐ **자식이 낸 증거**(diff 밖 이행 · base 적색 · 직전 반영분)를 한 묶음으로 잡아 둔다 — 아래 예산
   //   배분에서 **목표 본문보다 먼저** 채우기 위해서다. 제목 문자열이 아니라 **동일성**으로 가른다.
   const applied = listBlock('직전 라운드 반영분', i.appliedLastRound);
+  const priorFindings = priorRunFindingsBlock(i.priorRunFindings);
   const preexisting = preexistingFailuresBlock(i.preexistingTestFailures);
   const importerTestsNotRun = importerTestsNotRunBlock(i.importerTestsNotRun);
   const claims = diffOutsideClaimsBlock(i.diffOutsideClaims);
   const gateEvidence = gateEvidenceBlock(i.gateEvidenceNote);
   const designCheck = designCheckBlock(i.designCheck);
+  const designGate = designGateBlock(i.designGate);
   const shardSiblings = shardSiblingsBlock(i.shardSiblings);
   const coverage = evidenceCoverageBlock(i.evidenceCoverage);
   const goalFile = goalFileBlock(i.goalFile);
@@ -520,6 +560,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   //   ⚠️ 이것은 «렌더 순서»만 바꾼다 — 예산 배분 순서(`order`)와 보호 블록은 아래에서 따로 정한다.
   const blocks: Block[] = [
     runFacts,
+    priorFindings,
     goalFile,
     goalType,
     goal,
@@ -529,6 +570,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
     importerTestsNotRun,
     gateEvidence,
     designCheck,
+    designGate,
     shardSiblings,
     coverage,
     claims,
@@ -542,7 +584,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   //   `…[N개 생략됨]`** 이 됐다. 그러면 리뷰는 *"실행하지 않았다 · 증거가 없다"* 를 적고 — 그것이
   //   **리뷰 입장에서 사실**이라 반박도 안 된다. 두 트랙 합쳐 **여섯 런**이 이 사인으로 죽었다.
   //   ⭐ 목표 본문을 뒤로 미뤄도 잃는 것이 적다 — **수용기준·경계는 이미 추출돼 보호 블록**에 있다.
-  const evidenceBlocks = [applied, preexisting, importerTestsNotRun, gateEvidence, designCheck, shardSiblings, coverage, claims, runFacts, goalFile].filter((b): b is Block => Boolean(b));
+  const evidenceBlocks = [priorFindings, designGate, applied, preexisting, importerTestsNotRun, gateEvidence, designCheck, shardSiblings, coverage, claims, runFacts, goalFile].filter((b): b is Block => Boolean(b));
   const otherBlocks = blocks.filter((block) => !protectedBlocks.includes(block) && !evidenceBlocks.includes(block) && block !== goal);
   const order = [...protectedBlocks, ...evidenceBlocks, ...otherBlocks, ...(goal ? [goal] : [])];
   // ⛔⭐⭐⭐ 1차는 우선순위와 무관하게 공정 몫까지만 준다. 목표 본문은 이미 추출된

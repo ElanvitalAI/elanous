@@ -5,6 +5,7 @@ import {
   SchedulerPanel,
   ScheduleLoadContent,
   fetchScheduleLoad,
+  parseIdsFilter,
   isCurrentScheduleRequest,
   reportScheduleLoadFailure,
   type ScheduleJob,
@@ -66,7 +67,7 @@ describe('SchedulerPanel · render contract', () => {
         <SchedulerPanel />
       </DaemonContext.Provider>,
     );
-    expect(html).toContain('Scheduler');
+    expect(html).toContain('Schedules');
     expect(html).toContain('Loading schedules…');
   });
 
@@ -109,7 +110,8 @@ describe('SchedulerPanel · fetch and request generation', () => {
     const messages: string[] = [];
     if (load.kind === 'error') reportScheduleLoadFailure(load.reason, (message) => messages.push(message));
 
-    expect(paths).toEqual(['/v1/dashboard/schedules']);
+    // 새 읽기 API 가 먼저 · 판올림 전 데몬이면 옛 대시보드 경로로 한 번 더.
+    expect(paths).toEqual(['/v1/schedules?includeOff=1', '/v1/dashboard/schedules']);
     expect(load).toEqual({ kind: 'error', reason: 'daemon unavailable' });
     expect(messages).toEqual(['scheduler load failed: daemon unavailable']);
   });
@@ -182,5 +184,41 @@ describe('SchedulerPanel · 배선 핀 (지우면 실패한다)', () => {
     for (const text of ['Loading schedules…', 'Failed to load schedules', 'no schedules']) {
       expect(PANEL_SRC).toContain(text);
     }
+  });
+});
+
+describe('SchedulerPanel · /v1/schedules cards', () => {
+  test('cards map to rows: «켜짐» comes from state, not registry enabled; next and duplicate carried', async () => {
+    const card = {
+      id: 'abc', name: 'drafts sweep', source: 'crontab', cron: '*/10 * * * *', intervalMs: null,
+      command: 'bun bin/elanous.mjs harness drafts sweep', runVia: 'crontab', category: 'maintenance', domain: 'elanous', note: null,
+      state: 'firing' as const, registryEnabled: false, next: ['2099-01-01T00:10:00.000Z'],
+      lastRun: { at: '2026-09-28T00:00:00.000Z', status: 'ok', exit: 0, durationMs: 1200, via: 'crontab' }, flags: ['duplicate'],
+    };
+    const off = { ...card, id: 'off', name: 'old job', state: 'off' as const, registryEnabled: true, flags: [], lastRun: null };
+    const launchd = { ...card, id: 'launchd:com.elanous.nexus', name: 'nexus', source: 'launchd', runVia: 'launchd', cron: null, state: 'live' as const, flags: ['no-history'], lastRun: null };
+    const paths: string[] = [];
+    const load = await fetchScheduleLoad(async (path) => { paths.push(path); return { schedules: [card, off, launchd], count: 3 }; });
+    expect(paths).toEqual(['/v1/schedules?includeOff=1']);
+    if (load.kind !== 'ready') throw new Error('expected ready');
+    const [a, b] = load.data.jobs;
+    expect(a).toMatchObject({ enabled: true, state: 'firing', lastStatus: 'ok', runVia: 'crontab' });
+    // 레지스트리는 enabled 인데 발화 경로가 없다 ⇒ 꺼짐.
+    expect(b).toMatchObject({ enabled: false, state: 'off' });
+    expect(load.data.byState).toEqual({ firing: 1, off: 1, live: 1 });
+    const html = render(load);
+    expect(html).toContain('발화 중');
+    expect(html).toContain('꺼짐');
+    expect(html).toContain('duplicate');
+    // launchd 는 레지스트리 조작 대상이 아니다 — 액션 없음(✕ 는 crontab 두 행에만).
+    expect(html.split('>✕<').length - 1).toBe(2);
+  });
+});
+
+describe('SchedulerPanel · ?ids= filter (Missions «이 미션을 부르는 스케줄»)', () => {
+  test('exact id list, empty → null', () => {
+    expect(parseIdsFilter('?ids=a,b%3Ac')).toEqual(['a', 'b:c']);
+    expect(parseIdsFilter('?ids=')).toBeNull();
+    expect(parseIdsFilter('')).toBeNull();
   });
 });

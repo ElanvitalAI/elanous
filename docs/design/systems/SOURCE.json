@@ -1,0 +1,291 @@
+{
+  "repo": "https://github.com/nexu-io/open-design",
+  "commit": "1b47e60bd46641469fcd8b69c496c4e3a548bc28",
+  "syncedAt": "2026-09-27",
+  "license": "Apache-2.0",
+  "selection": {
+    "categories": [
+      "Modern & Minimal",
+      "Bold & Expressive",
+      "Morphism & Effects",
+      "Layout & Structure",
+      "Retro & Nostalgic",
+      "Creative & Artistic",
+      "Professional & Corporate",
+      "Starter"
+    ],
+    "deniedIds": [
+      "ant",
+      "material",
+      "lingo",
+      "levels"
+    ],
+    "files": [
+      "DESIGN.md",
+      "tokens.css",
+      "manifest.json"
+    ]
+  },
+  "systems": [
+    {
+      "id": "application",
+      "name": "Application",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "artistic",
+      "name": "Artistic",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "bento",
+      "name": "Bento",
+      "category": "Layout & Structure"
+    },
+    {
+      "id": "bold",
+      "name": "Bold",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "brutalism",
+      "name": "Brutalism",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "cafe",
+      "name": "Cafe",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "claymorphism",
+      "name": "Claymorphism",
+      "category": "Morphism & Effects"
+    },
+    {
+      "id": "clean",
+      "name": "Clean",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "colorful",
+      "name": "Colorful",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "contemporary",
+      "name": "Contemporary",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "corporate",
+      "name": "Corporate",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "cosmic",
+      "name": "Cosmic",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "creative",
+      "name": "Creative",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "dashboard",
+      "name": "Dashboard",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "default",
+      "name": "Neutral Modern",
+      "category": "Starter"
+    },
+    {
+      "id": "dithered",
+      "name": "Dithered",
+      "category": "Retro & Nostalgic"
+    },
+    {
+      "id": "doodle",
+      "name": "Doodle",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "dramatic",
+      "name": "Dramatic",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "editorial",
+      "name": "Editorial",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "elegant",
+      "name": "Elegant",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "energetic",
+      "name": "Energetic",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "enterprise",
+      "name": "Enterprise",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "expressive",
+      "name": "Expressive",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "fantasy",
+      "name": "Fantasy",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "flat",
+      "name": "Flat",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "friendly",
+      "name": "Friendly",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "glassmorphism",
+      "name": "Glassmorphism",
+      "category": "Morphism & Effects"
+    },
+    {
+      "id": "gradient",
+      "name": "Gradient",
+      "category": "Morphism & Effects"
+    },
+    {
+      "id": "luxury",
+      "name": "Luxury",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "minimal",
+      "name": "Minimal",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "modern",
+      "name": "Modern",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "mono",
+      "name": "Mono",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "neobrutalism",
+      "name": "Neobrutalism",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "neon",
+      "name": "Neon",
+      "category": "Morphism & Effects"
+    },
+    {
+      "id": "neumorphism",
+      "name": "Neumorphism",
+      "category": "Morphism & Effects"
+    },
+    {
+      "id": "paper",
+      "name": "Paper",
+      "category": "Retro & Nostalgic"
+    },
+    {
+      "id": "perspective",
+      "name": "Perspective",
+      "category": "Layout & Structure"
+    },
+    {
+      "id": "premium",
+      "name": "Premium",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "professional",
+      "name": "Professional",
+      "category": "Professional & Corporate"
+    },
+    {
+      "id": "publication",
+      "name": "Publication",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "refined",
+      "name": "Refined",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "retro",
+      "name": "Retro",
+      "category": "Retro & Nostalgic"
+    },
+    {
+      "id": "shadcn",
+      "name": "Shadcn",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "simple",
+      "name": "Simple",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "skeumorphism",
+      "name": "Skeumorphism",
+      "category": "Morphism & Effects"
+    },
+    {
+      "id": "sleek",
+      "name": "Sleek",
+      "category": "Modern & Minimal"
+    },
+    {
+      "id": "spacious",
+      "name": "Spacious",
+      "category": "Layout & Structure"
+    },
+    {
+      "id": "storytelling",
+      "name": "Storytelling",
+      "category": "Creative & Artistic"
+    },
+    {
+      "id": "tom-modern",
+      "name": "Tom Modern Design",
+      "category": "Starter"
+    },
+    {
+      "id": "vibrant",
+      "name": "Vibrant",
+      "category": "Bold & Expressive"
+    },
+    {
+      "id": "vintage",
+      "name": "Vintage",
+      "category": "Retro & Nostalgic"
+    },
+    {
+      "id": "warm-editorial",
+      "name": "Warm Editorial",
+      "category": "Starter"
+    }
+  ]
+}

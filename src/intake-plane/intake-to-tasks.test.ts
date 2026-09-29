@@ -1,10 +1,10 @@
 import { expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, appendFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ingestIntakeItems, loadIntakeLedger, markIntakeItem } from './items.js';
 import { TASK_DEFAULTS } from '../task-orchestrator/types.js';
-import { interpretIntakeInput, interpretIntakeItem, runIntakeToTasks, toIntakeTaskRequest, type IntakeToTasksDeps, type IntakeTaskRequest } from './intake-to-tasks.js';
+import { interpretIntakeInput, interpretIntakeItem, runIntakeToTasks, toIntakeTaskRequest } from './intake-to-tasks.js';
 
 test('invalid interpretations are rejected, valid interpretations retain idempotent intake provenance', () => {
   expect(interpretIntakeItem('not json')).toBeNull();
@@ -94,101 +94,67 @@ test('request without a URL keeps a stable intake identity and omits URL', () =>
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('Nexus deduplication routes the item without counting an existing task as created', async () => {
+test('deduplicated goal line is consumed without changing intake item status', async () => {
   const root = mkdtempSync(join(tmpdir(), 'intake-deduplicated-'));
   try {
+    const dir = join(root, 'intake', 'outbox', 'goals');
+    mkdirSync(dir, { recursive: true });
+    appendFileSync(join(dir, '2026-09-01.jsonl'), JSON.stringify({ id: 'source', fact: 'Build a feature', current: 'Absent' }) + '\n');
     ingestIntakeItems(root, 'github', [{ url: 'https://github.com/example/existing' }]);
     const id = [...loadIntakeLedger(root).items.keys()][0]!;
-    markIntakeItem(root, id, { status: 'queued' });
-    const result = await runIntakeToTasks(root, {}, {
-      llm: async () => '{"title":"Investigate","description":"Inspect","priority":"low"}',
-      post: async () => ({ taskId: 'task:existing', deduplicated: true }),
-    });
-    expect(result).toEqual({
-      processed: 1, created: 0, skipped: 0, failed: 0,
-      items: [{ id, status: 'deduplicated', taskId: 'task:existing' }],
-    });
-    expect(loadIntakeLedger(root).items.get(id)?.status).toBe('routed');
+    const response = JSON.stringify({ tasks: [{ type: 'implement', title: 'Build feature', description: 'Implement', priority: 'low', acceptanceCriteria: ['Focused test passes'] }], questions: [] });
+    const deps = { llm: async () => response, post: async () => ({ taskId: 'task:existing', deduplicated: true }) };
+    const result = await runIntakeToTasks(root, {}, deps);
+    expect(result).toMatchObject({ processed: 1, created: 0, skipped: 0, failed: 0,
+      items: [{ status: 'deduplicated', taskId: 'task:existing', types: ['implement'] }] });
+    expect((await runIntakeToTasks(root, {}, deps)).processed).toBe(0);
+    expect(loadIntakeLedger(root).items.get(id)?.status).toBe('new');
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('runner selects oldest queued up to limit, skips invalid LLM, retries failures and never writes in dry-run', async () => {
+test('runner retries a failed POST using the same task reference without consuming the goal line', async () => {
   const root = mkdtempSync(join(tmpdir(), 'intake-runner-'));
   try {
-    for (const [n, day] of [[3, '03'], [1, '01'], [2, '02'], [4, '04']] as const) {
-      ingestIntakeItems(root, 'github', [{ url: `https://github.com/example/repo${n}`, observedAt: `2026-09-${day}T00:00:00Z` }]);
-    }
-    const items = [...loadIntakeLedger(root).items.values()];
-    for (const item of items) markIntakeItem(root, item.id, { status: 'queued' });
-    const ordered = items.sort((a, b) => a.observedAt.localeCompare(b.observedAt));
-    let llmCalls: string[] = [];
-    const posts: IntakeTaskRequest[] = [];
-    const marks: string[] = [];
-    let failFirst = true;
-    const deps: IntakeToTasksDeps = {
-      llm: async (item) => {
-        llmCalls.push(item.id);
-        return item.id === ordered[1]!.id ? 'invalid' : '{"title":"Investigate","description":"Inspect","priority":"low"}';
-      },
-      post: async (request) => {
-        posts.push(request);
-        if (failFirst && request.external.ref === ordered[0]!.id) throw new Error('Nexus unavailable');
-        return { taskId: `task:${request.external.ref}` };
-      },
-      mark: (instanceRoot, id, patch) => {
-        marks.push(id);
-        return markIntakeItem(instanceRoot, id, patch);
+    const dir = join(root, 'intake', 'outbox', 'goals');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '2026-09-01.jsonl'), JSON.stringify({ fact: 'Implement retry', current: 'Missing' }) + '\n');
+    const refs: string[] = [];
+    let fail = true;
+    const deps = {
+      llm: async () => JSON.stringify({ tasks: [{ type: 'operate', title: 'Retry', description: 'Inspect', priority: 'medium', acceptanceCriteria: ['Run check'] }], questions: [] }),
+      post: async (request: { external: { ref: string } }) => {
+        refs.push(request.external.ref);
+        if (fail) throw new Error('Nexus unavailable');
+        return { taskId: 'task:retry' };
       },
     };
-    const dry = await runIntakeToTasks(root, { limit: 3, dryRun: true }, deps);
-    expect(dry.items.map((row) => row.status)).toEqual(['dry-run', 'skipped', 'dry-run']);
-    expect(dry).toMatchObject({ processed: 3, created: 0, skipped: 1, failed: 0 });
-    expect(posts).toHaveLength(0);
-    expect(marks).toHaveLength(0);
-    expect([...loadIntakeLedger(root).items.values()].every((item) => item.status === 'queued')).toBe(true);
-    llmCalls = [];
-    const live = await runIntakeToTasks(root, { limit: 3 }, deps);
-    expect(llmCalls).toEqual(ordered.slice(0, 3).map((item) => item.id));
-    expect(live.items.map((row) => row.status)).toEqual(['failed', 'skipped', 'created']);
-    expect(live).toMatchObject({ processed: 3, created: 1, skipped: 1, failed: 1 });
-    expect(posts.map((post) => post.external)).toEqual([ordered[0], ordered[2]].map((item) => ({
-      provider: 'intake', ref: item!.id, url: item!.url,
-    })));
-    expect(loadIntakeLedger(root).items.get(ordered[0]!.id)?.status).toBe('queued');
-    expect(loadIntakeLedger(root).items.get(ordered[1]!.id)?.status).toBe('queued');
-    expect(loadIntakeLedger(root).items.get(ordered[2]!.id)?.status).toBe('routed');
-    expect(loadIntakeLedger(root).items.get(ordered[3]!.id)?.status).toBe('queued');
-    expect(marks).toEqual([ordered[2]!.id]);
-    failFirst = false;
-    const retry = await runIntakeToTasks(root, { limit: 3 }, deps);
-    expect(retry.items.map((row) => row.status)).toEqual(['created', 'skipped', 'created']);
-    expect(posts.filter((post) => post.external.ref === ordered[2]!.id)).toHaveLength(1);
-    expect(posts.filter((post) => post.external.ref === ordered[0]!.id)).toHaveLength(2);
-    expect(posts[0]!.external).toEqual(posts[2]!.external);
-    expect(retry).toMatchObject({ processed: 3, created: 2, skipped: 1, failed: 0 });
-    expect(loadIntakeLedger(root).items.get(ordered[3]!.id)?.status).toBe('routed');
-    expect(marks).toEqual([ordered[2]!.id, ordered[0]!.id, ordered[3]!.id]);
+    expect((await runIntakeToTasks(root, { dryRun: true }, deps)).items[0]).toMatchObject({ status: 'dry-run', types: ['operate'] });
+    expect(refs).toEqual([]);
+    expect(await runIntakeToTasks(root, {}, deps)).toMatchObject({ processed: 1, failed: 1 });
+    fail = false;
+    expect(await runIntakeToTasks(root, {}, deps)).toMatchObject({ processed: 1, created: 1, failed: 0 });
+    expect(refs).toHaveLength(2);
+    expect(refs[0]).toBe(refs[1]);
+    expect((await runIntakeToTasks(root, {}, deps)).processed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('limit zero performs no calls; an unsuccessful POST response leaves the item queued', async () => {
+test('limit zero performs no calls; an unsuccessful POST response leaves the goal unconsumed', async () => {
   const root = mkdtempSync(join(tmpdir(), 'intake-post-failure-'));
   try {
-    ingestIntakeItems(root, 'github', [{ url: 'https://github.com/example/failure' }]);
-    const id = [...loadIntakeLedger(root).items.keys()][0]!;
-    markIntakeItem(root, id, { status: 'queued' });
+    const dir = join(root, 'intake', 'outbox', 'goals');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '2026-09-01.jsonl'), JSON.stringify({ fact: 'Investigate failure', current: 'Missing' }) + '\n');
     let calls = 0;
     const deps = {
-      llm: async () => { calls++; return '{"title":"Investigate","description":"Inspect","priority":"low"}'; },
+      llm: async () => { calls++; return JSON.stringify({ tasks: [{ type: 'research', title: 'Investigate', description: 'Inspect', priority: 'low', acceptanceCriteria: ['Check results'] }], questions: [] }); },
       post: async () => { calls++; return { taskId: '' }; },
     };
-    expect(await runIntakeToTasks(root, { limit: 0 }, deps)).toEqual({
-      processed: 0, created: 0, skipped: 0, failed: 0, items: [],
-    });
+    expect(await runIntakeToTasks(root, { limit: 0 }, deps)).toEqual({ processed: 0, created: 0, skipped: 0, failed: 0, items: [] });
     expect(calls).toBe(0);
     const failed = await runIntakeToTasks(root, { limit: 1 }, deps);
     expect(failed).toMatchObject({ processed: 1, created: 0, skipped: 0, failed: 1 });
-    expect(loadIntakeLedger(root).items.get(id)?.status).toBe('queued');
     expect(calls).toBe(2);
+    expect((await runIntakeToTasks(root, { limit: 1 }, deps)).processed).toBe(1);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect, spyOn } from 'bun:test';
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -3088,11 +3088,30 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
 describe('dev-pipeline — self-mission target seam forwarding', () => {
   const selfResult = { ok: true } as SelfImplementResult;
 
+  it('non-interactive target without --yes refuses before git init or either child seam', async () => {
+    const directory = mkdtempSync(join(homedir(), 'dev-pipeline-consent-refusal-'));
+    let provisioned = false;
+    let seamsBuilt = false;
+    try {
+      await expect(runDevPipeline(T({ target: directory, humanReadableOutput: false }), {
+        nonGitInteractive: false,
+        askNonGitInit: async () => { throw new Error('must not ask'); },
+        provisionRepository: () => { provisioned = true; throw new Error('must not provision'); },
+        buildSelfImplementSeams: () => { seamsBuilt = true; return {} as SelfImplementSeams; },
+      })).rejects.toMatchObject({ exitCode: 2, message: expect.stringContaining('git init') });
+      expect(provisioned).toBe(false);
+      expect(seamsBuilt).toBe(false);
+      expect(existsSync(join(directory, '.git'))).toBe(false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('valid non-git directory is resolved, provisioned, and reaches the injected self-mission seam plan', async () => {
     const directory = mkdtempSync(join(homedir(), 'dev-pipeline-target-'));
     let received: ResolvedDevPlan | undefined;
     try {
-      await runDevPipeline(T({ target: directory, humanReadableOutput: false }), {
+      await runDevPipeline(T({ target: directory, assumeYes: true, humanReadableOutput: false }), {
         buildSelfImplementSeams: (plan) => { received = plan; return {} as SelfImplementSeams; },
         runSelfImplement: async () => selfResult,
       });
@@ -3113,7 +3132,7 @@ describe('dev-pipeline — self-mission target seam forwarding', () => {
     let childOptions: SelfImplementOptions | undefined;
     const remoteCalls: Array<{ cwd: string; args: string[] }> = [];
     try {
-      await runDevPipeline(T({ target: directory, entrance: 'cli-harness-say', humanReadableOutput: false }), {
+      await runDevPipeline(T({ target: directory, entrance: 'cli-harness-say', assumeYes: true, humanReadableOutput: false }), {
         runGit: (cwd, args) => {
           remoteCalls.push({ cwd, args });
           return { status: 0, stdout: '', stderr: '' };
@@ -3134,7 +3153,7 @@ describe('dev-pipeline — self-mission target seam forwarding', () => {
     let seamsBuilt = false;
     let childStarted = false;
     try {
-      await expect(runDevPipeline(T({ target: directory, completion: 'pr', humanReadableOutput: false }), {
+      await expect(runDevPipeline(T({ target: directory, completion: 'pr', assumeYes: true, humanReadableOutput: false }), {
         runGit: () => ({ status: 0, stdout: '', stderr: '' }),
         buildSelfImplementSeams: () => { seamsBuilt = true; return {} as SelfImplementSeams; },
         runSelfImplement: async () => { childStarted = true; return selfResult; },

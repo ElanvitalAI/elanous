@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.gate.json",
+  "include": ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts", "types/next-process-env-mirror.d.ts"],
+  "exclude": ["**/node_modules/**", "docs/**", "**/.next/**", "apps/pwa/**", "**/*.test.ts", "**/*.test.tsx", "**/*.test.mts", "**/*.test.cts", "**/*.spec.ts", "**/*.spec.tsx", "**/*.spec.mts", "**/*.spec.cts", "test/**", "tests/**", "**/test/**", "**/tests/**", "**/__tests__/**", "**/__specs__/**", "**/spec/**"]
+}

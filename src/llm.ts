@@ -3873,8 +3873,7 @@ export const PROVIDERS: Record<string, LLMProvider> = {
   anthropic: AnthropicProvider,
   local: LocalProvider,
   gemini: GeminiProvider,
-  // 대표 2026-09-23 — codex 처럼 «팩토리를 감싼» 항목. ⛔ 자동 폴백 후보(AUTOMATIC_PROVIDER_ORDER)엔 «없다» —
-  //   과금 경로라 명시 선택(config·`openrouter/` 모델·`--role-llm`)으로만 온다.
+  // OpenRouter is considered for auto selection only after subscription and other key candidates.
   openrouter: {
     name: 'openrouter',
     get defaultModel() { return OPENROUTER_MODEL; },
@@ -3885,7 +3884,7 @@ export const PROVIDERS: Record<string, LLMProvider> = {
 };
 
 const AUTOMATIC_PROVIDER_ORDER = ['grok', 'anthropic', 'gemini', 'local'] as const;
-const PROVIDER_DECISION_ORDER = ['grok', 'anthropic', 'openai', 'gemini', 'local'] as const;
+const PROVIDER_DECISION_ORDER = ['grok', 'anthropic', 'openai', 'gemini', 'local', 'openrouter'] as const;
 const SUBSCRIPTION_DECISION_ORDER = ['openai-codex', 'grok'] as const;
 
 type AutomaticProviderName = typeof AUTOMATIC_PROVIDER_ORDER[number];
@@ -3941,6 +3940,17 @@ function automaticProviderCandidates(): Array<LLMProvider & { name: AutomaticPro
 
 function providerDecisionCandidates(): Array<LLMProvider & { name: ProviderDecisionName }> {
   return PROVIDER_DECISION_ORDER.map((name) => PROVIDERS[name]! as LLMProvider & { name: ProviderDecisionName });
+}
+
+function codexOAuthAvailable(): boolean {
+  try {
+    const account = resolveCodexAccount(process.env, { storedHome: (key) => loadTokens(key)?.codexHome });
+    if (loadTokens(account.storeKey)) return true;
+    const home = effectiveCodexHome(account, null, process.env).home;
+    return !!home && readCodexMirrorTokens(join(home, 'auth.json')) !== null;
+  } catch {
+    return false;
+  }
 }
 
 function subscriptionDecision(): ProviderDecision | undefined {
@@ -4038,7 +4048,7 @@ export function decideProviderForConfig(
   const selectedModel = modelHint || configModel || defaultModelForProvider(provider);
   switch (provider) {
     case 'openai-codex':
-      return { provider, model: selectedModel, auth: loadTokens('openai-codex') ? 'oauth' : apiKey ? 'apikey' : 'none' };
+      return { provider, model: selectedModel, auth: codexOAuthAvailable() ? 'oauth' : apiKey ? 'apikey' : 'none' };
     case 'grok':
       return { provider, model: selectedModel, auth: authKindForProvider('grok', selectedModel, apiKey) };
     case 'openai':
@@ -4073,7 +4083,7 @@ function authKindForProvider(provider: string, model: string, apiKey?: string): 
   if (provider === 'openrouter') return getOpenRouterApiKey() ? 'apikey' : 'none';
   if (provider === 'openai-codex') {
     try {
-      return loadTokens('openai-codex') ? 'oauth' : 'none';
+      return codexOAuthAvailable() ? 'oauth' : 'none';
     } catch {
       return 'none';
     }
@@ -4203,13 +4213,14 @@ export function getProvider(model?: string): LLMProvider {
     // ids (e.g. `claude-opus-4-7`) so prefix matching works. Existing
     // full ids pass through unchanged.
     const resolved = resolveModelAlias(model) ?? model;
-    const m = resolved.toLowerCase();
-    if (m.startsWith('local:')) return LocalProvider;
-    if (m.startsWith('gpt-') || m.startsWith('o1-') || m.startsWith('o3-') || m.startsWith('o4-')) return OpenAIProvider;
-    if (m.startsWith('claude-')) return AnthropicProvider;
-    if (m.startsWith('grok-')) return GrokProvider;
-    if (m.startsWith('gemini-')) return GeminiProvider;
-    if (m.startsWith('openrouter/')) return PROVIDERS.openrouter!;
+    // Preserve the historical Chat Completions route for gpt-* model-only
+    // requests, including future ids that the current catalog does not list.
+    if (resolved.toLowerCase().startsWith('gpt-')) return PROVIDERS.openai!;
+    const adapted = inferProviderFromModel(resolved);
+    if (adapted === 'openai-codex') return PROVIDERS['openai-codex']!;
+    const inferred = registryInferProviderFromModel(resolved);
+    if (inferred && PROVIDERS[inferred]) return PROVIDERS[inferred]!;
+    if (adapted && PROVIDERS[adapted]) return PROVIDERS[adapted]!;
     // Unknown prefix — look up by exact name match on defaults
     for (const p of Object.values(PROVIDERS)) {
       if (p.defaultModel === resolved) return p;
@@ -4239,8 +4250,9 @@ export function getProvider(model?: string): LLMProvider {
   for (const p of automaticProviderCandidates()) {
     if (p.available()) return p;
   }
+  if (PROVIDERS.openrouter!.available()) return PROVIDERS.openrouter!;
 
-  throw new Error(noProviderAvailableMessage());
+  throw new NoLlmProviderAvailableError();
 }
 
 /**
@@ -4249,9 +4261,16 @@ export function getProvider(model?: string): LLMProvider {
  * codex 구독을 «자동 후보로 안 쓰는» 경로라, codex 로그인이 «있는» 사람이 가장 먼저
  * 여기 떨어진다 — 그 사람에게 필요한 것은 키가 아니라 provider 한 줄이다.
  */
+export class NoLlmProviderAvailableError extends Error {
+  constructor() {
+    super(noProviderAvailableMessage());
+    this.name = 'NoLlmProviderAvailableError';
+  }
+}
+
 export function noProviderAvailableMessage(): string {
   const head = 'No LLM provider available.';
-  const keys = 'XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, or LOCAL_LLM_URL';
+  const keys = 'XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, or LOCAL_LLM_URL';
   let codexOauth = false;
   try {
     codexOauth = authKindForProvider('openai-codex', defaultModelForProvider('openai-codex')) === 'oauth';
@@ -10613,7 +10632,9 @@ export async function streamLLMWithTools(
 // `baseUrl` in config.
 
 import type { LLMConfig as UCLLMConfig, UserConfig } from './user-config.js';
-import { loadTokens } from './oauth/store.js';
+import { loadTokens, readCodexMirrorTokens } from './oauth/store.js';
+import { resolveCodexAccount, effectiveCodexHome } from './oauth/codex-account.js';
+import { join } from 'node:path';
 import {
   CODEX_API_BASE_URL, getCodexUserAgent, loadFreshCodexAuthState,
 } from './oauth/codex.js';
@@ -10791,9 +10812,8 @@ function makeCodexProvider(cfg: UCLLMConfig): LLMProvider {
   // resolve (with refresh) inside the async generator so we never
   // block constructor-time callers. available() returns true if EITHER
   // OAuth tokens or an apiKey is configured.
-  const initialTokens = loadTokens('openai-codex');
   const apiKey = cfg.apiKey;
-  const hasOAuth = !!initialTokens;
+  const hasOAuth = codexOAuthAvailable();
   // store=true wave: closure-scoped state so multi-turn callers
   // (dashboard reusing the same provider across a chat session) get
   // delta-only continuation. Single-turn callers (eval-prompt-cli
@@ -11200,7 +11220,7 @@ export function getProviderForConfig(
     ? decision.provider.slice('auto:'.length)
     : decision.provider;
   if (provider === 'auto') {
-    if (resolvedProviderName === 'auto') throw new Error(noProviderAvailableMessage());
+    if (resolvedProviderName === 'auto') throw new NoLlmProviderAvailableError();
     if (!isKnownProviderName(resolvedProviderName)) {
       throw new Error(`unknown provider: ${resolvedProviderName}`);
     }

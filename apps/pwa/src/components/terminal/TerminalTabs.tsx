@@ -41,7 +41,7 @@ const STORAGE_KEY = 'elanous.webterm.tabs';
 const HIDDEN_STORAGE_KEY = 'elanous.webterm.hidden-tabs';
 
 export type InitialTerminalState =
-  | { status: 'pending' }
+  | { status: 'pending'; slow?: boolean }
   | { status: 'ready'; issuedBy: 'daemon' | 'local'; fallbackReason?: string };
 
 interface Props {
@@ -337,7 +337,7 @@ type TabDebugLog = (category: string, snapshot?: unknown) => void;
  *  tsc 게이트가 「기존 타입에 필수 필드 추가」로 읽어 저장소 전체 검사로 승격하고 무관한 기존
  *  부채 52건으로 FAIL 한다(2026-08-18 실측 · 새 타입엔 깨질 호출자가 없다 · 별건 등재). */
 interface SpawnFailure {
-  readonly spawnFailure: 'no-acp' | 'no-session' | 'spawn-error';
+  readonly spawnFailure: 'no-acp' | 'no-session' | 'spawn-error' | 'spawn-timeout';
   /** 예외 문면. 사람이 원인을 좁히는 데 쓴다(관측에만 실린다). */
   readonly detail?: string;
 }
@@ -346,11 +346,22 @@ function isSpawnFailure(value: unknown): value is SpawnFailure {
   return typeof value === 'object' && value !== null && typeof (value as SpawnFailure).spawnFailure === 'string';
 }
 
+/** 버린 초기 발급 응답이 데몬에 «새로 만든» 셸이면 그 열쇠를 돌려준다(치우기용). 붙은(attached) 셸·실패·모름은 null — 남의 셸을 지우지 않는다. */
+export function orphanedInitialSpawn(response: unknown): { sessionId: string; terminalId: string } | null {
+  const r = response as { status?: unknown; sessionId?: unknown; terminalId?: unknown } | null | undefined;
+  if (!r || r.status !== 'spawned' || typeof r.sessionId !== 'string' || typeof r.terminalId !== 'string') return null;
+  if (!r.sessionId.trim() || !r.terminalId.trim()) return null;
+  return { sessionId: r.sessionId, terminalId: r.terminalId };
+}
+
 /** Records every pre-result state of the explicit new-terminal request. */
 export async function spawnNewTerminal(
   acp: SpawnAcp | null,
   sessionId: string | null,
   log: TabDebugLog = debugLog,
+  timeoutMs = SPAWN_HARD_TIMEOUT_MS,
+  onSlow?: () => void,
+  slowMs = INITIAL_TERMINAL_TIMEOUT_MS,
 ): Promise<unknown> {
   log('webterm.tabs.add.start', { hasAcp: Boolean(acp), hasSessionId: Boolean(sessionId) });
   if (!acp || !sessionId) {
@@ -359,13 +370,32 @@ export async function spawnNewTerminal(
     return { spawnFailure };
   }
   log('webterm.tabs.add.spawn-pending', { sessionId });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // ⛔ 느리다고 «버리지» 않는다 — 8초에 로컬 이름으로 넘어가면 데몬이 늦게 만든 셸과 XtermView 가 만든 셸이 «둘» 이 됐다
+  //    (2026-09-28 운영 · 부하 300 대 · 실 브라우저: preview-1·preview-2 ⊕ term-… 중복 · 11×5 셸). ⇒ 8초엔 «느림» 만 알리고
+  //    진짜 응답을 기다린다. 상한(90초)은 «데몬이 끝내 답하지 않음» 을 위한 것이다.
+  const slowTimer = onSlow ? setTimeout(() => { log('webterm.tabs.add.spawn-slow', { sessionId, slowMs }); onSlow(); }, slowMs) : undefined;
   try {
-    return await acp.send('terminal/spawn', { sessionId });
+    // ⛔ 응답을 «영원히» 기다리지 않는다 — 데몬이 답을 안 주면 «이름 준비 중»이 끝나지 않는다(대표 2026-09-28).
+    const timedOut = new Promise<SpawnFailure>((resolve) => {
+      timer = setTimeout(() => resolve({ spawnFailure: 'spawn-timeout' }), timeoutMs);
+    });
+    const result = await Promise.race([acp.send('terminal/spawn', { sessionId }), timedOut]);
+    if (isSpawnFailure(result)) log('webterm.tabs.add.spawn-timeout', { sessionId, timeoutMs });
+    return result;
   } catch (e) {
     log('webterm.tabs.add.spawn-error', { reason: String(e) });
     return { spawnFailure: 'spawn-error' as const, detail: String(e) };
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    if (slowTimer !== undefined) clearTimeout(slowTimer);
   }
 }
+
+/** 이만큼 지나면 «데몬이 느립니다» 를 알린다(버리지 않는다). ACP 가 아예 안 열리는 경우엔 이 시각에 로컬 이름으로 내려간다. */
+export const INITIAL_TERMINAL_TIMEOUT_MS = 8000;
+/** spawn 응답의 최종 상한 — 넘으면 로컬 이름으로 내려가고 사유(`spawn-timeout`)를 배너에 싣는다. */
+export const SPAWN_HARD_TIMEOUT_MS = 90_000;
 
 export function TerminalTabs({
   activeId,
@@ -390,6 +420,7 @@ export function TerminalTabs({
   activeIdRef.current = activeId;
   const initialSpawnGenerationRef = useRef(0);
   const initialSpawnPendingRef = useRef(false);
+  const acpWaitSinceRef = useRef<number | null>(null);
   /** ⛔ 이 마운트에서 «발급»을 마쳤나 — 발급한 탭을 아래 effect 가 `restored-tab` 으로 다시
    *  라벨하면 daemon 출처와 실패 사유가 «덮인다»(무인 리뷰 must-fix · 2026-08-18 `#10105`).
    *  ⚠️ 내 하니스에서는 우연히 daemon 이 마지막이었지만 «순서는 계약이 아니다». */
@@ -593,8 +624,20 @@ export function TerminalTabs({
     initialSpawnPendingRef.current = true;
     const generation = ++initialSpawnGenerationRef.current;
     onInitialTerminalState?.({ status: 'pending' });
-    const response = await spawnNewTerminal(acp, sessionId);
-    if (generation !== initialSpawnGenerationRef.current || tabsRef.current.length > 0) return;
+    const response = await spawnNewTerminal(acp, sessionId, debugLog, SPAWN_HARD_TIMEOUT_MS, () => {
+      if (generation === initialSpawnGenerationRef.current) onInitialTerminalState?.({ status: 'pending', slow: true });
+    });
+    // ⛔ 버리는 길에서도 pending 을 «푼다» — 종전엔 그대로 return 해서 다음 발급이 첫 줄에서 막혀
+    //    «터미널 이름을 준비하는 중…» 이 영원히 남았다(대표 2026-09-28 · 빈 데몬 ⊕ 사이드 탭 진입 실측).
+    if (generation !== initialSpawnGenerationRef.current || tabsRef.current.length > 0) {
+      initialSpawnPendingRef.current = false;
+      const orphan = orphanedInitialSpawn(response);
+      debugLog('webterm.tabs.initial.discarded', { reason: generation !== initialSpawnGenerationRef.current ? 'session-changed' : 'tabs-present', orphan });
+      // 버린 응답이 데몬에 «새로 만든» 셸이면 치운다 — 종전엔 첫 방문마다 아무 탭도 안 붙은 셸이 하나씩 남았다(2026-09-28).
+      //   destroy 는 그 셸을 등록한 세션으로 찾으므로 지금 연결로 보내도 된다(서버 lookupPreviewTerminal).
+      if (orphan) void acpRef.current?.send('terminal/destroy', orphan).catch((e: unknown) => debugLog('webterm.tabs.initial.orphan-destroy-error', { ...orphan, reason: String(e) }));
+      return;
+    }
     const resolved = resolveNewTabId(response, tabsRef.current);
     const next = [resolved.id];
     // ⛔ 표시를 «먼저» 세운다 — setTabs/onActiveChange 가 동기 재렌더를 일으키면 아래 effect 가
@@ -631,11 +674,29 @@ export function TerminalTabs({
     const acp = acpRef.current;
     if (!acp || acp.state !== 'OPEN') {
       onInitialTerminalState?.({ status: 'pending' });
-      return;
+      // ⛔ 연결이 안 열리면 «이름 준비»가 아니라 «연결 못 함»이다 — 상한 뒤 로컬 이름으로 내려가
+      //    터미널을 그린다(XtermView 가 자기 연결로 다시 붙는다) ⊕ 사유를 배너에 싣는다.
+      if (acpWaitSinceRef.current === null) acpWaitSinceRef.current = Date.now();
+      const left = Math.max(0, INITIAL_TERMINAL_TIMEOUT_MS - (Date.now() - acpWaitSinceRef.current));
+      const timer = setTimeout(() => {
+        if (tabsRef.current.length > 0 || acpRef.current?.state === 'OPEN') return;
+        const id = nextDefaultId(tabsRef.current);
+        initialIssuedRef.current = true;
+        persist([id]);
+        setTabs([id]);
+        onActiveChange(id);
+        onInitialTerminalState?.({ status: 'ready', issuedBy: 'local', fallbackReason: 'acp-not-open' });
+        debugLog('webterm.tabs.initial', { id, issuedBy: 'local', fallbackReason: 'acp-not-open', waitedMs: Date.now() - (acpWaitSinceRef.current ?? Date.now()) });
+      }, left);
+      return () => clearTimeout(timer);
     }
+    acpWaitSinceRef.current = null;
+    // ⛔ 여기서 세대를 올리지 않는다 — 이 effect 는 부모가 매 렌더 새 콜백을 주면 «발급 중에» 다시 돈다.
+    //    세대를 올리면 이미 데몬이 만든 터미널의 응답을 버린다(셸만 새고 화면은 영원히 pending).
+    //    응답을 버려야 하는 경우(세션이 바뀜)는 세션 effect 가 세대를 올린다.
     void issueInitialTerminal(acp);
-    return () => { initialSpawnGenerationRef.current += 1; };
-  }, [acpReadyGeneration, activeId, issueInitialTerminal, onActiveChange, onInitialTerminalState, suspendInitialSpawn, tabs.length]);
+    return undefined;
+  }, [acpReadyGeneration, activeId, issueInitialTerminal, onActiveChange, onInitialTerminalState, persist, suspendInitialSpawn, tabs.length]);
 
   /** WT-B4 — 새 탭의 이름을 «데몬이» 짓는다.
    *

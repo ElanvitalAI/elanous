@@ -1,7 +1,7 @@
 // PWA · Nexus client tests (Phase N-4 PR ν)
 
 import { describe, test, expect, spyOn } from 'bun:test';
-import { createNexusClient, NexusApiError, NexusTimeoutError, type AnswerPriorityResponse } from './client';
+import { createNexusClient, NexusApiError, NexusTimeoutError, type AnswerPriorityResponse, type TaskCardWire } from './client';
 
 interface MockFetchCall {
   url: string;
@@ -101,6 +101,64 @@ describe('Read endpoints', () => {
     const client = createNexusClient({ baseUrl: BASE, fetchImpl });
     await client.getTab('chat:1');
     expect(calls[0].url).toContain('chat%3A1');
+  });
+});
+
+describe('Task card read endpoints', () => {
+  test('list and single-card GETs return their respective response envelopes', async () => {
+    const cards: TaskCardWire[] = [
+      { id: 'card-1', goalId: 'goal-1', title: 'First', status: 'open', createdAt: '2026-09-29T00:00:00Z', sections: [] },
+      { id: 'card-2', goalId: 'goal-2', title: 'Second', status: 'closed', createdAt: '2026-09-29T01:00:00Z', sections: [] },
+    ];
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/task-cards': () => ({ status: 200, body: { cards } }),
+      '/v1/task-cards/card-1': () => ({ status: 200, body: { card: cards[0] } }),
+    });
+    const client = createNexusClient({ baseUrl: `${BASE}/`, token: 'card-token', fetchImpl });
+    expect(await client.getTaskCards()).toEqual({ cards });
+    expect(await client.getTaskCard('card-1')).toEqual({ card: cards[0] });
+    expect(calls.map(({ url, init }) => [url, init?.method, init?.body])).toEqual([
+      [`${BASE}/v1/task-cards`, 'GET', undefined],
+      [`${BASE}/v1/task-cards/card-1`, 'GET', undefined],
+    ]);
+    for (const call of calls) {
+      expect((call.init?.headers as Record<string, string>).authorization).toBe('Bearer card-token');
+    }
+  });
+
+  test('single-card id is encoded as one path segment', async () => {
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/task-cards/with/slash?and=query': () => ({ status: 200, body: { card: {
+        id: 'with/slash?and=query', goalId: 'goal-1', title: 'Encoded', status: 'open', createdAt: '2026-09-29T00:00:00Z', sections: [],
+      } } }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl });
+    expect((await client.getTaskCard('with/slash?and=query')).card.id).toBe('with/slash?and=query');
+    expect(calls[0].url).toBe(`${BASE}/v1/task-cards/with%2Fslash%3Fand%3Dquery`);
+  });
+
+  test('list and single-card 404s retain status, path, and response body', async () => {
+    const body = { error: 'not_found' };
+    const { fetchImpl, calls } = makeMockFetch({
+      '/v1/task-cards': () => ({ status: 404, body }),
+      '/v1/task-cards/missing': () => ({ status: 404, body }),
+    });
+    const client = createNexusClient({ baseUrl: BASE, fetchImpl });
+    for (const [call, path] of [
+      [() => client.getTaskCards(), '/v1/task-cards'],
+      [() => client.getTaskCard('missing'), '/v1/task-cards/missing'],
+    ] as const) {
+      try {
+        await call();
+        throw new Error('expected a 404');
+      } catch (error) {
+        expect(error).toBeInstanceOf(NexusApiError);
+        expect((error as NexusApiError).status).toBe(404);
+        expect((error as NexusApiError).path).toBe(path);
+        expect((error as NexusApiError).body).toEqual(body);
+      }
+    }
+    expect(calls).toHaveLength(2);
   });
 });
 

@@ -134,6 +134,18 @@ describe('tool spec shapes', () => {
     expect(presetEnum).toContain('three-split');
     const membersMax = (spec.parameters.properties as any).members?.maxItems;
     expect(membersMax).toBe(4);
+    expect(spec.description).toContain('Unsupported: agent rooms need the removed rich TUI');
+  });
+
+  test('valid compose returns the removed rich TUI error without spawning', async () => {
+    const reg = new AgentRoomRegistry();
+    const result = await dispatchAgentRoomCompose({
+      preset: 'two-split',
+      members: [{ brandRef: 'codex' }, { brandRef: 'claude' }],
+    }, reg);
+    expect(result.isError).toBe(true);
+    expect(result.output).toContain('agent rooms need the removed rich TUI (virtual windows)');
+    expect(reg.list()).toEqual([]);
   });
 });
 

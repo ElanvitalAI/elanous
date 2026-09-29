@@ -90,7 +90,11 @@ function pickVoice(language: string | undefined): SpeechSynthesisVoice | null {
 }
 
 export function useVoiceTts(opts: UseVoiceTtsOpts): UseVoiceTtsResult {
-  const supported = isSpeechSynthesisSupported();
+  // ⛔ 렌더 중에 브라우저를 묻지 않는다 — 정적 export 는 서버(창 없음)에서 «미지원»으로 그리고
+  //    브라우저 첫 렌더가 «지원»으로 그리면 React #418 하이드레이션 오류가 난다(09-28 Chat 탭 실측 ·
+  //    음성 오버레이의 «음성 응답» 버튼). 첫 렌더는 서버와 같이 false, 마운트 뒤에 잰다.
+  const [supported, setSupported] = useState(false);
+  useEffect(() => { setSupported(isSpeechSynthesisSupported()); }, []);
   const [, forceRender] = useState({});
   const bufferRef = useRef<string>('');
   const enabledRef = useRef(opts.enabled);

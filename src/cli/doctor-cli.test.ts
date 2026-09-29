@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
-import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport, registerDoctorCommand, runDoctor, summarizeDoctorCapabilities } from './doctor-cli.js';
+import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
 import { checkReadiness } from './doctor-readiness.js';
 import { applySudoFixes } from './doctor-fix.js';
 import type { UserConfig } from '../user-config.js';
@@ -56,6 +57,8 @@ const resources = `resources:
     free_fallback: ""
 `;
 
+const formatDoctorReport = (report: Parameters<typeof renderDoctorReport>[0]) => renderDoctorReport(report, { credentials: true });
+
 function credentialBlock(formatted: string, name: string, nextName?: string): string {
   const start = formatted.indexOf(`${name}:`);
   const end = nextName === undefined ? formatted.length : formatted.indexOf(`${nextName}:`, start + 1);
@@ -64,6 +67,507 @@ function credentialBlock(formatted: string, name: string, nextName?: string): st
 }
 
 describe('doctor CLI', () => {
+  test('default shows readiness and action items before a one-line credentials summary; --credentials reveals details without changing JSON', async () => {
+    const report = runDoctor(options({
+      env: { ENV_ONLY: 'secret' },
+      readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/resources.yaml' ? resources : '',
+      readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false },
+    }));
+    const plain = renderDoctorReport(report);
+    const detailed = renderDoctorReport(report, { credentials: true });
+    expect(plain.startsWith('준비 상태:')).toBe(true);
+    expect(plain).toContain('할 일 1개: provider-decision');
+    expect(plain.indexOf('할 일 1개:')).toBeLessThan(plain.indexOf('자격증명: 1/6 resolved'));
+    expect(plain).not.toContain('ENV_ONLY: resolved');
+    expect(plain).not.toContain('Free fallback:');
+    expect(detailed).toContain('ENV_ONLY: resolved (env)');
+    expect(detailed).toContain('Free fallback: use the free search route');
+    const outputs: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, { ...options({ readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false }, env: { ENV_ONLY: 'secret' } }),
+      out: { log: (value) => outputs.push(value) }, setExitCode: () => {} });
+    await program.parseAsync(['doctor'], { from: 'user' });
+    await program.parseAsync(['doctor', '--credentials'], { from: 'user' });
+    await program.parseAsync(['doctor', '--json'], { from: 'user' });
+    await program.parseAsync(['doctor', '--json', '--credentials'], { from: 'user' });
+    expect(outputs[0]).not.toContain('ENV_ONLY: resolved');
+    expect(outputs[1]).toContain('ENV_ONLY: resolved (env)');
+    expect(JSON.parse(outputs[2]!)).toEqual(JSON.parse(outputs[3]!));
+  });
+
+  test('human-readable Free fallback removes source paths and internal notes but JSON keeps catalog prose', () => {
+    const report = runDoctor(options({ readFile: (path) => path === '/repo/.env.example' ? 'TAVILY_API_KEY=\nAPIFY_TOKEN=\n'
+      : path === '/repo/catalog/resources.yaml' ? `resources:\n  - env: [TAVILY_API_KEY]\n    required_for: [web-search]\n    free_fallback: "ddg + jina — skills/omni-crawl/src/free.ts (freeAvailable() is unconditionally true)"\n  - env: [APIFY_TOKEN]\n    required_for: [x-scraping]\n    free_fallback: "None for its declared purpose. Measured: skills/omni-crawl/scripts/main.ts:386 throws APIFY_TOKEN 미설정"\n` : '' }));
+    const plain = renderDoctorReport(report);
+    const detailed = renderDoctorReport(report, { credentials: true });
+    expect(plain).toContain('free alternative: ddg + jina');
+    expect(plain).not.toContain('skills/omni-crawl/');
+    expect(detailed).not.toContain('skills/omni-crawl/');
+    expect(detailed).not.toContain('Measured:');
+    expect(JSON.stringify(report)).toContain('skills/omni-crawl/scripts/main.ts:386');
+    const catalog = runDoctor(options({
+      repositoryRoot: process.cwd(),
+      readFile: (path) => readFileSync(path, 'utf8'),
+      exists: () => false,
+      env: {},
+      userConfig: userConfig(),
+    }));
+    const freeLines = renderDoctorReport(catalog, { credentials: true }).split('\n').filter((line) => /Free fallback|free alternative/.test(line));
+    expect(freeLines.length).toBeGreaterThan(0);
+    expect(freeLines.filter((line) => /\b(?:src|skills|scripts|catalog|test)\/|\b[\w-]+\.ts(?::\d+)?|MEASURED|Measured:|📏|CHANGED/.test(line))).toEqual([]);
+  });
+
+  test('without an LLM --advise retains the exact original table and exit code, with a one-line setup hint', async () => {
+    const run = async (args: string[]) => {
+      const lines: string[] = [];
+      const codes: number[] = [];
+      const program = new Command();
+      registerDoctorCommand(program, {
+        ...options({ readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false },
+          readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
+          commandExists: () => false }),
+        resolveAdviceProvider: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
+        out: { log: (line) => lines.push(line) }, setExitCode: (code) => codes.push(code),
+      });
+      await program.parseAsync(['doctor', ...args], { from: 'user' });
+      return { text: lines.join('\n'), codes };
+    };
+    const base = await run([]);
+    const advised = await run(['--advise']);
+    const hint = 'LLM 없음 — 구독이 있으면 `elanous llm detect --probe --apply`, 없으면 `elanous login openai-codex`(기기 코드) 뒤 다시 `elanous doctor --advise`';
+    expect(advised.text).toBe(`${base.text}\n${hint}`);
+    expect(advised.codes).toEqual(base.codes);
+    const json = await run(['--advise', '--json']);
+    expect(JSON.parse(json.text).advise).toMatchObject({ ok: false, provider: 'auto', model: '(none)', reason: hint });
+  });
+
+  test('no-LLM advice uses the measured provider-decision remedy rather than inventing a command', async () => {
+    const lines: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false },
+        checkReadiness: (deps) => {
+          const readiness = checkReadiness(deps);
+          readiness.items.find((item) => item.id === 'provider-decision')!.remedy = 'elanous login openai-codex --device';
+          return readiness;
+        } }),
+      resolveAdviceProvider: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--json'], { from: 'user' });
+    const result = JSON.parse(lines.at(-1)!);
+    expect(result.readiness.items.find((item: { id: string }) => item.id === 'provider-decision').remedy).toBe('elanous login openai-codex --device');
+    expect(result.advise.reason).toContain('`elanous login openai-codex --device`');
+  });
+
+  test('doctor --advise passes the detected locale to the LLM prompt', async () => {
+    const previous = process.env.ELANOUS_LANG;
+    const lines: string[] = [];
+    let prompt = '';
+    try {
+      process.env.ELANOUS_LANG = 'ko';
+      const program = new Command();
+      registerDoctorCommand(program, {
+        ...options({ readiness: { provider: 'grok', serviceFile: null, health: null } }),
+        resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+        adviseLlm: async (text) => { prompt = text; return JSON.stringify({ summary: '요약', order: [], manual: [] }); },
+        out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+      });
+      await program.parseAsync(['doctor', '--advise', '--json'], { from: 'user' });
+      const sent = JSON.parse(prompt);
+      expect(sent.instruction).toContain('Write summary, why and manual in Korean.');
+      expect(sent.readiness.find((item: { id: string }) => item.id === 'service-version'))
+        .toMatchObject({ status: 'ok', evidence: 'no service installed; nothing to compare' });
+      expect(JSON.parse(lines.at(-1)!).advise.summary).toBe('요약');
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_LANG;
+      else process.env.ELANOUS_LANG = previous;
+    }
+  });
+
+  test('--advise --fix executes only selected catalog repairs after consent and keeps manual suggestions read-only', async () => {
+    const outputs: string[] = [];
+    const confirmed: string[] = [];
+    const previews: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', installPrefix: null, platform: 'linux', distro: 'amzn2', rgOnPath: false, tmpdirSameFsAsBunCache: false } }),
+      home: '/tmp/doctor-advice-fixture', cacheDir: '/tmp/doctor-advice-fixture/cache',
+      installStaticTool: () => ({ ok: true, detail: 'installed' }), readdir: () => [],
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async () => JSON.stringify({ summary: 'install rg first', order: [{ readinessId: 'harness-tools', fixId: 'static-tools', why: 'needed' }], manual: ['login by hand'] }),
+      adviceInteractive: true,
+      confirmAdvice: async (message) => { confirmed.push(message); return true; },
+      out: { log: (line) => outputs.push(line) }, err: { error: (line) => previews.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--json'], { from: 'user' });
+    const output = JSON.parse(outputs.at(-1)!);
+    expect(confirmed).toEqual(['위 1개를 실행할까요? [y/N] ']);
+    expect(output.advise).toMatchObject({ ok: true, provider: 'grok', model: 'grok-test', dropped: 0 });
+    expect(output.results.items.every((item: { id: string; reason?: string }) => item.id === 'static-tools' || item.reason === 'not selected')).toBe(true);
+    expect(output.advise.manual).toEqual(['login by hand']);
+    expect(previews[0]).toContain('순서  항목  수리 id  이유');
+  });
+  test('--advise --fix --yes routes selected git-install through the catalog installer only', async () => {
+    const lines: string[] = [];
+    let gitRuns = 0;
+    let staticRuns = 0;
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', platform: 'linux', distro: 'debian', rgOnPath: false },
+        readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
+        commandExists: (name) => name === 'apt-get' }),
+      platform: 'linux', isRoot: true,
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async () => JSON.stringify({ summary: 'git first', order: [{ readinessId: 'gh-auth', fixId: 'git-install', why: 'needed' }], manual: [] }),
+      runGitInstallCommand: () => { gitRuns++; return { status: 0 }; },
+      installStaticTool: () => { staticRuns++; return { ok: true, detail: 'unexpected' }; },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--yes', '--json'], { from: 'user' });
+    const result = JSON.parse(lines.at(-1)!);
+    expect(result.advise.ok).toBe(true);
+    expect(result.gitInstall.ran).toBe(true);
+    expect(gitRuns).toBeGreaterThan(0);
+    expect(staticRuns).toBe(0);
+    expect(result.results.items.every((item: { reason?: string }) => item.reason === 'not selected')).toBe(true);
+  });
+
+  test('advised repairs execute in displayed order across git and catalog, not in catalog order', async () => {
+    const events: string[] = [];
+    const lines: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', installPrefix: null, platform: 'linux', distro: 'debian', ghOnPath: false, rgOnPath: false, ghVersion: '1.0.0', pythonEnv: { status: 'fixable', evidence: 'venv missing' } },
+        readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
+        commandExists: (name) => name === 'apt-get' }),
+      isRoot: true, platform: 'linux',
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async () => JSON.stringify({ summary: 'ordered', order: [
+        { readinessId: 'python-env', fixId: 'python-env', why: 'first' },
+        { readinessId: 'gh-auth', fixId: 'git-install', why: 'second' },
+        { readinessId: 'harness-tools', fixId: 'static-tools', why: 'third' },
+      ], manual: [] }),
+      pythonSetup: () => { events.push('python-env'); return 0; },
+      recheckPythonEnv: () => 'ok',
+      runGitInstallCommand: (command, args) => { if (command === 'git' && args[0] === 'init') { expect(args[1]).toStartWith(join(tmpdir(), 'elanous-doctor-git-')); events.push('git-install'); } return { status: 0 }; },
+      installStaticTool: () => { events.push('static-tools'); return { ok: true, detail: 'installed' }; },
+      smokeCheck: () => true,
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--yes', '--json'], { from: 'user' });
+    expect(events).toEqual(['python-env', 'git-install', 'static-tools']);
+    expect(JSON.parse(lines.at(-1)!).results.items.filter((item: { result: string }) => item.result === 'fixed').map((item: { id: string }) => item.id)).toEqual(['python-env', 'static-tools']);
+  });
+
+  test('advised fix cannot select repairs of credential stores or configuration files', async () => {
+    const lines: string[] = [];
+    let prompt = '';
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: {
+        provider: 'grok', serviceFile: { path: '/unit.service', text: 'Environment=OPENROUTER_API_KEY=sk-or-v1-secret' },
+      } }),
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async (text) => { prompt = text; return JSON.stringify({ summary: 'move credential', order: [{ readinessId: 'service-secrets', fixId: 'service-secrets', why: 'suggested' }], manual: [] }); },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--json'], { from: 'user' });
+    const advice = JSON.parse(lines.at(-1)!).advise;
+    expect(advice.order).toEqual([]);
+    expect(advice.dropped).toBe(1);
+    expect(JSON.parse(prompt).plan.some((item: { id: string }) => ['service-secrets', 'service-file', 'key-cache-permissions', 'private-files'].includes(item.id))).toBe(false);
+  });
+
+  test('service-file in the real plan is rejected by advice and never rewritten on --yes', async () => {
+    const lines: string[] = [];
+    const writes: string[] = [];
+    const unit = '/opt/elanous/versions/1.0/node_modules/elanous/bin/elanous.mjs';
+    let prompt = '';
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', platform: 'linux', serviceFile: { path: '/unit.service', text: `ExecStart=${unit}` } },
+        exists: (path) => path === '/opt/elanous/current/node_modules/elanous/' }),
+      readFile: (path) => path === '/repo/.env.example' ? example : path === '/unit.service' ? `ExecStart=${unit}` : '',
+      writeFile: (path) => { writes.push(path); },
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async (text) => { prompt = text; return JSON.stringify({ summary: 'rewrite', order: [{ readinessId: 'service-file', fixId: 'service-file', why: 'change unit' }], manual: [] }); },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--yes', '--json'], { from: 'user' });
+    const result = JSON.parse(lines.at(-1)!);
+    expect(result.plan.items.find((item: { id: string }) => item.id === 'service-file')?.status).toBe('fixable');
+    expect(JSON.parse(prompt).plan.some((item: { id: string }) => item.id === 'service-file')).toBe(false);
+    expect(result.advise).toMatchObject({ order: [], dropped: 1 });
+    expect(result.results.items.find((item: { id: string }) => item.id === 'service-file')).toMatchObject({ result: 'skipped', reason: 'not selected' });
+    expect(writes).toEqual([]);
+  });
+
+  test('--advise refuses sudo/restart side channels before running doctor', async () => {
+    for (const flag of ['--sudo', '--restart']) {
+      const errors: string[] = [];
+      const codes: number[] = [];
+      const program = new Command();
+      registerDoctorCommand(program, {
+        ...options(), err: { error: (line) => errors.push(line) }, setExitCode: (code) => codes.push(code),
+      });
+      await program.parseAsync(['doctor', '--advise', '--fix', '--yes', flag], { from: 'user' });
+      expect(errors[0]).toContain('--advise does not run');
+      expect(codes).toEqual([1]);
+    }
+  });
+
+  test('failed advice with --yes still leaves LLM credential migration unselected', async () => {
+    const lines: string[] = [];
+    let migrated = 0;
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'auto', serviceFile: { path: '/unit.service', text: 'Environment=OPENROUTER_API_KEY=sk-or-v1-secret' } } }),
+      resolveAdviceProvider: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
+      writeFile: () => { migrated++; },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--yes', '--json'], { from: 'user' });
+    const result = JSON.parse(lines.at(-1)!);
+    expect(result.advise.ok).toBe(false);
+    expect(result.results.items.every((item: { id: string; result: string }) => item.id !== 'service-secrets' || item.result === 'skipped')).toBe(true);
+    expect(migrated).toBe(0);
+  });
+
+  test('advised --fix --yes only executes ids from the model-vetted plan when the plan changes', async () => {
+    const lines: string[] = [];
+    let migrated = 0;
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', serviceFile: { path: '/unit.service', text: 'Environment=OPENROUTER_API_KEY=sk-or-v1-secret' } } }),
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async () => JSON.stringify({ summary: 'empty order', order: [], manual: [] }),
+      writeFile: () => { migrated++; },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--yes', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!).results.items.every((item: { reason?: string }) => item.reason === 'not selected')).toBe(true);
+    expect(migrated).toBe(0);
+  });
+
+  test('successful --advise --fix without consent stays read-only', async () => {
+    const lines: string[] = [];
+    let applied = 0;
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', platform: 'linux', distro: 'amzn2', rgOnPath: false } }),
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async () => JSON.stringify({ summary: 'rg first', order: [{ readinessId: 'harness-tools', fixId: 'static-tools', why: 'needed' }], manual: [] }),
+      adviceInteractive: false,
+      installStaticTool: () => { applied++; return { ok: true, detail: 'unexpected' }; },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!).advise.ok).toBe(true);
+    expect(applied).toBe(0);
+  });
+
+  test('failed advice falls back to the deterministic --fix plan and never runs a model-selected repair', async () => {
+    const lines: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', rgOnPath: false, platform: 'linux', distro: 'amzn2' } }),
+      resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+      adviseLlm: async () => 'not JSON',
+      installStaticTool: () => { throw new Error('unexpected repair'); },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--json'], { from: 'user' });
+    const result = JSON.parse(lines.at(-1)!);
+    expect(result.advise).toMatchObject({ ok: false, reason: 'invalid JSON' });
+    expect(result.plan.items.some((item: { id: string }) => item.id === 'static-tools')).toBe(true);
+    expect(result.results).toBeUndefined();
+  });
+
+  test('failed advice --fix --yes applies the same non-advisable and advisable repairs as plain --fix --yes', async () => {
+    const homes = [mkdtempSync(join(tmpdir(), 'elanous-doctor-base-')), mkdtempSync(join(tmpdir(), 'elanous-doctor-failed-advice-'))];
+    const run = async (args: string[], home: string) => {
+      const lines: string[] = [];
+      const executed: string[] = [];
+      const program = new Command();
+      registerDoctorCommand(program, {
+        ...options({
+          env: { SHELL: '/bin/bash' },
+          exists: existsSync,
+          readFile: (path) => path === '/repo/.env.example' ? example : path.startsWith(home) ? readFileSync(path, 'utf8') : '',
+          readiness: { provider: 'grok', platform: 'linux', distro: 'amzn2', rgOnPath: false, tmpdirSameFsAsBunCache: false },
+        }),
+        home,
+        resolveAdviceProvider: () => ({ provider: 'grok', model: 'grok-test', auth: 'oauth' }),
+        adviseLlm: async () => 'not JSON',
+        installStaticTool: () => { executed.push('static-tools'); return { ok: true, detail: 'installed' }; },
+        smokeCheck: () => true,
+        out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+      });
+      await program.parseAsync(['doctor', ...args, '--json'], { from: 'user' });
+      const result = JSON.parse(lines.at(-1)!);
+      return { plan: result.plan.items, items: result.results.items, executed, advice: result.advise };
+    };
+    try {
+      const plain = await run(['--fix', '--yes'], homes[0]!);
+      const failed = await run(['--advise', '--fix', '--yes'], homes[1]!);
+      for (const result of [plain, failed]) {
+        expect(result.plan.find((item: { id: string }) => item.id === 'bun-tmpdir')?.status).toBe('fixable');
+        expect(result.plan.find((item: { id: string }) => item.id === 'static-tools')?.status).toBe('fixable');
+        expect(result.items.find((item: { id: string }) => item.id === 'bun-tmpdir')?.result).toBe('fixed');
+        expect(result.items.find((item: { id: string }) => item.id === 'static-tools')?.result).toBe('fixed');
+        expect(result.executed).toEqual(['static-tools']);
+      }
+      expect(failed.advice).toMatchObject({ ok: false, reason: 'invalid JSON' });
+      expect(failed.items.map((item: { id: string; result: string; reason?: string }) => ({ id: item.id, result: item.result, reason: item.reason })))
+        .toEqual(plain.items.map((item: { id: string; result: string; reason?: string }) => ({ id: item.id, result: item.result, reason: item.reason })));
+    } finally {
+      for (const home of homes) rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('--advise --fix --yes with no LLM falls back to the deterministic catalog', async () => {
+    const lines: string[] = [];
+    let staticRuns = 0;
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'auto', llmCredentialAvailable: false, platform: 'linux', distro: 'amzn2', rgOnPath: false } }),
+      resolveAdviceProvider: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
+      installStaticTool: () => { staticRuns++; return { ok: true, detail: 'unexpected' }; },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--yes', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!).advise.ok).toBe(false);
+    expect(staticRuns).toBeGreaterThan(0);
+  });
+
+  test('--advise --fix failure retains the old git-install consent path', async () => {
+    const lines: string[] = [];
+    let gitRuns = 0;
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'auto', llmCredentialAvailable: false },
+        readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
+        commandExists: () => false }),
+      platform: 'linux',
+      resolveAdviceProvider: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
+      gitInteractive: true,
+      isRoot: true,
+      commandExists: (name) => name === 'apt-get',
+      readiness: { distro: 'debian' },
+      confirmGitInstall: async () => { gitRuns++; return true; },
+      runGitInstallCommand: () => { gitRuns++; return { status: 0 }; },
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--advise', '--fix', '--json'], { from: 'user' });
+    expect(JSON.parse(lines.at(-1)!).advise.ok).toBe(false);
+    expect(gitRuns).toBeGreaterThan(0);
+  });
+
+  test('missing required git fails, prints a platform fix, and JSON lists requiredMissing; optional commands do not fail', async () => {
+    const catalog = 'commands:\n  - name: git\n    tier: required\n  - name: optional-tool\n    tier: capability\n';
+    for (const installed of [false, true]) {
+      for (const json of [false, true]) {
+        const output: string[] = [];
+        const codes: number[] = [];
+        const program = new Command();
+        registerDoctorCommand(program, {
+          ...options({
+            platform: 'linux', readiness: { distro: 'debian' },
+            readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? catalog : '',
+            commandExists: (name) => name === 'sudo' || name === 'apt-get' || (installed && name === 'git'),
+          }),
+          out: { log: (line) => output.push(line) }, setExitCode: (code) => codes.push(code),
+        });
+        await program.parseAsync(['doctor', ...(json ? ['--json'] : [])], { from: 'user' });
+        if (json) expect(JSON.parse(output[0]!).requiredMissing).toEqual(installed ? [] : ['git']);
+        else if (!installed) {
+          expect(output[0]).toContain('⛔ 필수 명령 없음: git');
+          expect(output[0]).toContain('git: missing (required)\n  Fix: sudo apt-get update && sudo apt-get install -y git');
+        }
+        expect(codes).toEqual(installed ? [] : [1]);
+      }
+    }
+  });
+
+  test('default git installer sends child stdout off the JSON CLI stdout', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'elanous-doctor-json-git-'));
+    try {
+      writeFileSync(join(dir, 'sudo'), '#!/bin/sh\nprintf "installer-output\\n"\n', { mode: 0o755 });
+      writeFileSync(join(dir, 'git'), '#!/bin/sh\nprintf "git version fake\\n"\n', { mode: 0o755 });
+      const script = `import { Command } from 'commander';
+import { registerDoctorCommand } from './src/cli/doctor-cli.ts';
+const program = new Command();
+let gitChecks = 0;
+registerDoctorCommand(program, {
+  repositoryRoot: '/repo', platform: 'linux', readiness: { distro: 'debian' },
+  readFile: (path) => path === '/repo/.env.example' ? 'ONE_KEY=\\n' : path === '/repo/catalog/external-commands.yaml' ? 'commands:\\n  - name: git\\n    tier: required\\n' : '',
+  commandExists: (name) => name === 'sudo' || name === 'apt-get' || (name === 'git' && ++gitChecks > 1),
+  userConfig: { registry: { discovery: { firecrawl: {} } } }, env: { PATH: process.env.PATH },
+  cacheDir: ${JSON.stringify(dir)}, exists: () => false,
+});
+await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' });`;
+      const result = spawnSync(process.execPath, ['-e', script], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ''}` },
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.stdout).not.toContain('installer-output');
+      expect(result.stdout).not.toContain('git version fake');
+      expect(result.stderr).toContain('installer-output');
+      expect(result.stderr).toContain('git version fake');
+      expect(JSON.parse(result.stdout).gitInstall).toMatchObject({ ran: true, ok: true });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test('a broken required command fails but missing optional commands do not', async () => {
+    const broken = formatDoctorReport({ ok: true, credentials: [], externalCommands: [
+      { name: 'required-tool', tier: 'required', status: 'broken' },
+      { name: 'optional-tool', tier: 'capability', status: 'missing' },
+    ] });
+    expect(broken).toContain('⛔ 필수 명령 없음: required-tool');
+    const both = formatDoctorReport({ ok: true, credentials: [], externalCommands: [
+      { name: 'git', tier: 'required', status: 'missing' },
+      { name: 'bun', tier: 'required', status: 'broken' },
+    ] });
+    expect(both).toContain('⛔ 필수 명령 없음: git, bun');
+    const brokenOutput: string[] = [];
+    const brokenCodes: number[] = [];
+    const brokenProgram = new Command();
+    registerDoctorCommand(brokenProgram, {
+      ...options({
+        platform: 'darwin',
+        readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml'
+          ? 'commands:\n  - name: node-pty\n    tier: required\n    probe: native-module\n  - name: optional-tool\n    tier: capability\n' : '',
+        loadNativeModule: () => true,
+        resolveNativeModuleDir: () => '/mod/node-pty',
+        isExecutable: () => false,
+        commandExists: () => false,
+      }),
+      out: { log: (line) => brokenOutput.push(line) }, setExitCode: (code) => brokenCodes.push(code),
+    });
+    await brokenProgram.parseAsync(['doctor'], { from: 'user' });
+    expect(brokenOutput[0]).toContain('⛔ 필수 명령 없음: node-pty');
+    expect(brokenOutput[0]).toContain('node-pty: broken (required)');
+    expect(brokenCodes).toEqual([1]);
+    const output: string[] = [];
+    const codes: number[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({
+        platform: 'darwin',
+        readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: required-tool\n    tier: required\n  - name: optional-tool\n    tier: capability\n' : '',
+        commandExists: (name) => name === 'required-tool',
+      }),
+      out: { log: (line) => output.push(line) }, setExitCode: (code) => codes.push(code),
+    });
+    await program.parseAsync(['doctor', '--json'], { from: 'user' });
+    expect(JSON.parse(output[0]!).requiredMissing).toEqual([]);
+    expect(codes).toEqual([]);
+  });
+
   test('joins resource metadata by env name while preserving absent fields and conditional formatting', () => {
     const report = runDoctor(options({ readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/resources.yaml' ? resources : '' }));
 
@@ -266,7 +770,9 @@ describe('doctor CLI', () => {
     const tavilyBlock = credentialBlock(formatted, 'TAVILY_API_KEY', 'TAVILY_KEY');
     const elevenLabsBlock = credentialBlock(formatted, 'ELEVENLABS_API_KEY', 'GOOGLE_API_KEY');
 
-    expect(tavilyBlock).toContain('Free fallback [auto]: ddg + jina — skills/omni-crawl/src/free.ts (freeAvailable() is unconditionally true)');
+    expect(tavilyBlock.split('\n').filter((line) => line.includes('Free fallback'))).toEqual(['  Free fallback [auto]: ddg + jina']);
+    expect(tavilyBlock).not.toContain('skills/omni-crawl/src/free.ts');
+    expect(tavilyBlock).not.toContain('freeAvailable()');
     expect(elevenLabsBlock).toContain('Required for: tts, streaming-stt');
     expect(elevenLabsBlock).not.toContain('Free fallback:');
   });
@@ -569,7 +1075,7 @@ describe('doctor CLI', () => {
       repositoryRoot: root,
       readFile: (path) => readFileSync(path, 'utf8'),
       exists: () => false,
-      commandExists: () => false,
+      commandExists: (name) => name === 'git' || name === 'bun',
       loadNativeModule: () => false,
       env: {},
       userConfig: userConfig(),
@@ -1141,9 +1647,9 @@ describe('doctor CLI', () => {
       userConfig: userConfig(),
     });
     const formatted = formatDoctorReport(report);
-    const start = formatted.indexOf('node-pty:');
+    const start = formatted.indexOf('\nnode-pty: broken (capability)') + 1;
     const next = formatted.indexOf('\n', formatted.indexOf('  Fix:', start));
-    const nodePty = formatted.slice(start, next);
+    const nodePty = formatted.slice(start, next < 0 ? undefined : next);
     const fix = nodePty.slice(nodePty.indexOf('  Fix:'));
 
     expect(report.externalCommands.find((command) => command.name === 'node-pty')?.status).toBe('broken');
@@ -1325,9 +1831,9 @@ describe('doctor CLI', () => {
     expect(formatted).toContain('  gh-auth: ok');
     expect(formatted).toContain('  install-path: ok');
     expect(formatted).toContain('  service-version: ok');
-    // 준비 상태는 맨 끝(터미널에서 보이는 자리) — 능력 목록 «뒤», 마지막 줄은 할 일 요약.
-    expect(formatted.indexOf('준비 상태:')).toBeGreaterThan(formatted.indexOf('못 하는 일:'));
-    expect(formatted.trimEnd().split('\n').at(-1)).toMatch(/^할 일 (없음\.|\d+개: )/);
+    expect(formatted.startsWith('준비 상태:')).toBe(true);
+    expect(formatted.indexOf('할 일 없음.')).toBeLessThan(formatted.indexOf('자격증명:'));
+    expect(formatted.indexOf('자격증명:')).toBeLessThan(formatted.indexOf('External commands:'));
     expect(exitCodes).toEqual([]);
     expect(formatted).not.toContain('--fix');
   });
@@ -1390,6 +1896,7 @@ describe('doctor CLI', () => {
         calls.push('gh-auth');
         return 1;
       },
+      checkPythonEnv: () => null,
       platform: 'darwin',
     }));
     const formatted = formatDoctorReport(report);
@@ -1455,14 +1962,13 @@ esac
     });
     try {
       await program.parseAsync(['doctor', '--fix', '--yes', '--sudo'], { from: 'user' });
-      const command = 'sudo apt-get update && sudo apt-get install -y ripgrep && sudo apt-get update && sudo apt-get install -y nodejs npm && sudo npm install -g @openai/codex';
+      const command = 'sudo apt-get update && sudo apt-get install -y ripgrep';
       expect(lines.join('\n')).toContain(`harness-tools: manual — ${command}`);
+      expect(lines.join('\n')).toContain('https://nodejs.org/en/download');
       expect(sudoPlans).toEqual([[command]]);
       expect(lines.join('\n')).toContain(`ran — ${command}`);
       expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual([
         'sudo|apt-get update', 'apt-get|update', 'sudo|apt-get install -y ripgrep', 'apt-get|install -y ripgrep',
-        'sudo|apt-get update', 'apt-get|update', 'sudo|apt-get install -y nodejs npm', 'apt-get|install -y nodejs npm',
-        'sudo|npm install -g @openai/codex', 'npm|install -g @openai/codex',
       ]);
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
@@ -1620,7 +2126,7 @@ esac
     expect(failed('install-path')?.evidence).not.toContain('checkout');
     expect(JSON.stringify(failedInstall)).not.toContain('install-secret');
     expect(formatDoctorReport(failedInstall)).not.toContain('install-secret');
-    expect(by('service-version')?.status).toBe('unknown');
+    expect(by('service-version')).toMatchObject({ status: 'ok', evidence: 'no service installed; nothing to compare' });
     expect(by('service-version')?.evidence).not.toMatch(/down|stopped|안 돈다/);
     expect(formatted).not.toContain('config-secret');
     expect(formatted).not.toContain('auth-secret');
@@ -1710,5 +2216,57 @@ describe('defaultProbeHostEnvironment (L0 · injected probes, no real docker/kub
     });
     expect(probe.docker?.info).toEqual({ kind: 'timeout' });
     expect(probe.memory).toEqual({ totalBytes: null, availableBytes: null, source: '/proc/meminfo' });
+  });
+
+  test('daemon health is probed at the injected endpoint, never a guessed port', () => {
+    const health = 'http://127.0.0.1:45678/v1/health';
+    const calls: string[][] = [];
+    setFetchHealthSpawnForTest(((cmd: string, args: readonly string[]) => {
+      calls.push([cmd, ...args]);
+      return { status: 0, stdout: JSON.stringify({ daemonSha: 'injected' }), stderr: '' };
+    }) as typeof spawnSync);
+    try {
+      const report = runDoctor(options({
+        readiness: undefined,
+        resolveDaemonEndpoint: () => ({ healthUrl: health }),
+        listAuthProviders: () => [],
+        codeRevision: () => 'abc',
+        readInstallPrefix: () => null,
+        ghAuthStatus: () => null,
+        commandExists: () => false,
+      }));
+      expect(report.ok).toBe(true);
+      const curled = calls.filter((argv) => argv[0] === 'curl').flat();
+      expect(curled).toContain(health);
+      expect(curled.join(' ')).not.toContain('31415');
+      expect(JSON.stringify(report.readiness)).toContain('injected');
+    } finally {
+      setFetchHealthSpawnForTest(null);
+    }
+  });
+
+  test('a null daemon endpoint is no daemon, and health is not probed at a guessed port', () => {
+    const calls: string[][] = [];
+    setFetchHealthSpawnForTest(((cmd: string, args: readonly string[]) => {
+      calls.push([cmd, ...args]);
+      return { status: 0, stdout: JSON.stringify({ daemonSha: 'should-not-run' }), stderr: '' };
+    }) as typeof spawnSync);
+    try {
+      const report = runDoctor(options({
+        readiness: undefined,
+        resolveDaemonEndpoint: () => null,
+        listAuthProviders: () => [],
+        codeRevision: () => 'abc',
+        readInstallPrefix: () => null,
+        ghAuthStatus: () => null,
+        commandExists: () => false,
+      }));
+      expect(report.ok).toBe(true);
+      expect(calls.filter((argv) => argv[0] === 'curl')).toEqual([]);
+      expect(JSON.stringify(report.readiness)).not.toContain('31415');
+      expect(JSON.stringify(report.readiness)).not.toContain('should-not-run');
+    } finally {
+      setFetchHealthSpawnForTest(null);
+    }
   });
 });

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ncs": {
+      "command": "bun",
+      "args": ["${CODEX_PLUGIN_ROOT}/connectors/ncs/server.ts"],
+      "env": { "NCS_SERVICE_KEY": "${NCS_SERVICE_KEY}" }
+    }
+  }
+}

@@ -13,6 +13,7 @@
 // ⭐ 이 파일의 판정은 «순수»다. 스토어·신호·설정을 «인자»로 받아서, 테스트가 실물 없이 전수로 문다.
 //   (전역을 읽는 순간 「무엇을 보고 정했나」가 안 보이게 된다 — 이 트랙이 오늘 네 번 밟은 형태다.)
 
+import { emitDecision } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
 import type { CodexAccountResolution } from './codex-account.js';
 
@@ -25,6 +26,9 @@ export interface RotationCandidate {
   readonly reached: boolean | undefined;
   /** 브랜드 총량 사용률. 신호가 없거나 옛 형식이면 undefined다. */
   readonly usedPercent?: number;
+  /** 선불 크레딧 잔액·보유(모르면 없다). 크레딧 정책에서 «어느 계정 크레딧으로» 갈지 고른다. */
+  readonly creditBalance?: number;
+  readonly hasCredits?: boolean;
 }
 
 /** ⛔ 비공개 — 밖에서 이름으로 부를 소비처가 없다(리뷰 must-fix: dead export 금지). */
@@ -41,6 +45,8 @@ type RotationReason =
   | 'reset-credit-unknown'
   /** 찼는데 갈 곳이 없다 — 홈을 아는 다른 계정이 없거나 그들도 찼다. */
   | 'no-candidate'
+  /** 찼고 구독 잔량이 남은 계정도 없지만 대표 가 크레딧 사용을 허가했다 — 지금 계정에 머물러 선불 크레딧으로 계속(grok 폴백 안 함). */
+  | 'credits-allowed'
   /** 넘겼다. */
   | 'rotated';
 
@@ -90,6 +96,11 @@ interface RotationInput {
   /** «먼저 쓸» 계정 순서(설정 `llm.codexAccountOrder`). 없으면 이름 코드포인트 순.
    *  ⛔ 여기 없는 계정은 버리지 않는다 — 뒤로 가서 이름순으로 붙는다. */
   readonly accountOrder?: readonly string[];
+  /** `llm.codexCreditsAllowed` — 참이면 갈 곳이 없을 때 «no-candidate» 대신 «credits-allowed» 로 머문다. */
+  readonly creditsAllowed?: boolean;
+  /** 지금 계정의 크레딧 잔액·보유(모르면 없다). */
+  readonly currentCreditBalance?: number;
+  readonly currentHasCredits?: boolean;
 }
 
 /**
@@ -201,6 +212,25 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
   const to = usable[0];
   if (!to) {
     if (input.resetCreditAvailability === 'available') return { reason: 'reset-credit-available', candidateCount, accountThresholds };
+    // 대표 크레딧 허가: 구독 잔량이 남은 계정이 없으면 크레딧으로 계속 — 한도가 찬 요청은 서버가 선불 크레딧으로 넘긴다.
+    // 🩸 09-28 실측: default 크레딧만 시간당 ~5,200 씩 줄고 team·third(합 ~5.5만)는 0 — «지금 계정에 머문다»만으로는
+    //   한 계정 크레딧이 바닥나면 남은 크레딧을 두고 폴백(grok)으로 갔다. ⇒ 크레딧이 «더 많이» 남은 계정으로 옮긴다.
+    //   흔들림 방지: 지금 계정 크레딧이 없거나(보유 false · 잔액 ≤0) 다른 계정이 20% 넘게 많을 때만.
+    if (input.creditsAllowed === true) {
+      const richest = otherCandidates
+        .filter((c) => c.home.length > 0 && c.hasCredits !== false && typeof c.creditBalance === 'number' && c.creditBalance > 0)
+        .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
+      // 지금 계정 신호를 귀속할 수 없을 때(기본 계정 `source=default`)는 후보 목록의 같은 이름 줄을 쓴다 —
+      //   후보는 같은 홈 해석으로 신호를 읽었다(09-28 운영: default 가 «사용=? · 찼나=모름»이라 잔액을 못 봐 머물렀다).
+      const self = input.candidates.find((c) => c.name === input.current.name);
+      const cur = input.currentCreditBalance ?? self?.creditBalance;
+      const curHas = input.currentHasCredits ?? self?.hasCredits;
+      const currentDry = curHas === false || (typeof cur === 'number' && cur <= 0);
+      if (richest && (currentDry || (typeof cur === 'number' && richest.creditBalance! > cur * 1.2))) {
+        return { reason: 'rotated', candidateCount, accountThresholds, to: richest };
+      }
+      return { reason: 'credits-allowed', candidateCount, accountThresholds };
+    }
     return { reason: 'no-candidate', candidateCount, accountThresholds };
   }
   if (resetCreditUnknown) return { reason: 'reset-credit-unknown', candidateCount, accountThresholds, to };
@@ -244,6 +274,25 @@ export function observeRotation(decision: RotationDecision, from: string): void 
   }, { level: decision.reason === 'rotated' || decision.reason === 'reset-credit-unknown' ? 'warn' : 'debug' });
   for (const account of decision.accountThresholds ?? []) {
     debug.log('oauth.codex-account', 'rotation-account-threshold', account);
+  }
+  // Live 탭 MAX 모드에서만(부하 0 기본) — «무엇을 · 왜 · 목적 · 어디로».
+  if (decision.reason !== 'explicit' && decision.reason !== 'disabled') {
+    const fromRow = decision.accountThresholds?.find((a) => a.name === from);
+    const toCredit = decision.to?.creditBalance;
+    const why = typeof toCredit === 'number'
+      // 금액은 문장에 넣지 않는다 — 판단 사유는 Live·Trace 카드에 글자로 뜨고 공개 캡처가 문장 속 숫자를 못 가린다(09-28 🅣).
+      ? `구독 한도 전부 참 · ${decision.to!.name} 크레딧이 가장 많다`
+      : fromRow ? `${from} ${fromRow.usedPercent ?? '?'}% · 임계 ${fromRow.thresholdPercent}%` : `판정 ${decision.reason}`;
+    emitDecision({
+      kind: 'ROUTE',
+      what: decision.to ? `codex 계정 ${from} → ${decision.to.name}` : `codex 계정 ${from} 유지 (${decision.reason})`,
+      reason: why,
+      purpose: decision.reason === 'credits-allowed' ? '한도가 찼다 — 정책상 크레딧으로 계속'
+        : typeof toCredit === 'number' ? '크레딧을 세 계정에 고르게 · 한 계정이 먼저 마르지 않게' : '구독 한도 보존 · 끊김 없이 계속',
+      target: decision.to?.name ?? from,
+      refs: { account: decision.to?.name ?? from },
+      ...(decision.candidateCount !== undefined ? { paths: decision.candidateCount } : {}),
+    });
   }
 }
 

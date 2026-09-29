@@ -18,10 +18,15 @@ import type { WorkflowEntry } from '../workflow-runtime/types.js';
 import type { TaskStore } from '../task-orchestrator/store.js';
 import { taskToWorkflowEntry } from '../task-orchestrator/task-to-workflow.js';
 import { isTerminalStatus } from '../task-orchestrator/types.js';
-import { listSchedules, markResult, setRunVia, type ScheduleRow } from './schedule-registry.js';
+import { listSchedules, markResult, type ScheduleRow } from './schedule-registry.js';
 import { defaultCatchupEligible, type SpawnOutcome } from './schedule-runner.js';
 import { prevScheduledFire } from './cron-match.js';
 import { scheduleJobToTask } from './schedule-to-task.js';
+
+/** Disabled schedules must not be re-registered just because their run_via is trigger. */
+export function scheduledRunViaById(rows: readonly ScheduleRow[]): Map<string, string | null> {
+  return new Map(rows.map(row => [row.id, row.enabled ? row.run_via : null]));
+}
 
 /**
  * 부팅 재등록 — TaskStore 의 scheduleText 달린 비-terminal task 를 workflow 데몬에
@@ -31,7 +36,7 @@ import { scheduleJobToTask } from './schedule-to-task.js';
 export function registerScheduledToxTasks(
   store: TaskStore,
   registerWorkflow: (entry: WorkflowEntry) => void,
-  /** 레지스트리의 그 잡이 지금 무엇으로 도나(`run_via`). 주면 `trigger` 가 아닌 잡의 파생 task 는 등록하지 않는다.
+  /** 레지스트리의 그 잡이 지금 무엇으로 도나(`run_via`). Disabled 잡은 null 로 전달한다. 주면 `trigger` 가 아닌 잡의 파생 task 는 등록하지 않는다.
    *  🩸 2026-09-27: `schedule release` 뒤 남은 파생 task 가 재시작마다 트리거로 다시 등록돼 crontab ⊕ 트리거 두 번 돌 뻔했다. */
   runViaOf?: (jobId: string) => string | null,
 ): { registered: number; skipped: number; skippedNotTrigger: number } {
@@ -97,7 +102,7 @@ export function migrateJobToTrigger(deps: MigrateJobDeps, jobId: string): Migrat
     registered = true;
   }
 
-  setRunVia(deps.scheduleDb, jobId, 'trigger');
+  deps.scheduleDb.run(`UPDATE schedule_registry SET source = 'trigger', enabled = 1, disabled_reason = NULL, run_via = 'trigger' WHERE id = ?`, [jobId]);
 
   let crontabRemoved = false;
   if (job.raw && deps.removeCrontabLine) {

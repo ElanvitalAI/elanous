@@ -2,13 +2,14 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { runMcpLogin } from '../src/cli/mcp-login.js';
 import {
+  loadStoredRegistration,
   mcpOAuthStorePath,
   type McpOAuthFetch,
 } from '../src/mcp/mcp-oauth.js';
-import { loadTokens } from '../src/oauth/store.js';
+import { loadTokens, saveTokens } from '../src/oauth/store.js';
 
 const ENDPOINT = 'https://mcp.example.test/mcp';
 const RESOURCE = 'https://auth.example.test/resource';
@@ -171,6 +172,205 @@ describe('runMcpLogin', () => {
       });
       expect(result.exitCode).toBe(1); expect(counts.token).toBe(0);
       if (redirect) await expect(fetch(redirect)).rejects.toBeDefined();
+    }
+  });
+});
+
+function readBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+async function strictAuthServer(): Promise<{
+  base: string;
+  close: () => Promise<void>;
+  authorizeRedirects: string[];
+  authorizeStatuses: number[];
+  registrations: number;
+}> {
+  const registered = new Map<string, string>();
+  const authorizeRedirects: string[] = [];
+  const authorizeStatuses: number[] = [];
+  let registrations = 0;
+  let clients = 0;
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const origin = `http://127.0.0.1:${req.socket.localPort}`;
+    if (req.method === 'GET' && url.pathname === '/.well-known/oauth-protected-resource') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ resource: `${origin}/mcp`, authorization_servers: [origin] }));
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/.well-known/oauth-authorization-server') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({
+        issuer: origin,
+        authorization_endpoint: `${origin}/authorize`,
+        token_endpoint: `${origin}/token`,
+        registration_endpoint: `${origin}/register`,
+        code_challenge_methods_supported: ['S256'],
+      }));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/register') {
+      registrations += 1;
+      const body = JSON.parse(await readBody(req)) as { redirect_uris?: string[] };
+      const redirect = body.redirect_uris?.[0] ?? '';
+      clients += 1;
+      const clientId = `client-${clients}`;
+      registered.set(clientId, redirect);
+      res.writeHead(201, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ client_id: clientId }));
+      return;
+    }
+    if (req.method === 'GET' && url.pathname === '/authorize') {
+      const redirect = url.searchParams.get('redirect_uri') ?? '';
+      const clientId = url.searchParams.get('client_id') ?? '';
+      authorizeRedirects.push(redirect);
+      const allowed = registered.get(clientId);
+      if (!allowed || redirect !== allowed) {
+        authorizeStatuses.push(400);
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: 'invalid redirect_uri' }));
+        return;
+      }
+      authorizeStatuses.push(302);
+      const target = new URL(redirect);
+      target.searchParams.set('code', 'auth-code');
+      target.searchParams.set('state', url.searchParams.get('state') ?? '');
+      res.writeHead(302, { location: target.toString() });
+      res.end();
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/token') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ access_token: 'access-token', refresh_token: 'refresh-token', expires_in: 3600, token_type: 'Bearer' }));
+      return;
+    }
+    if (req.method === 'POST' && url.pathname === '/mcp') {
+      res.writeHead(401, { 'www-authenticate': `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource"` });
+      res.end();
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('auth server has no port');
+  return {
+    base: `http://127.0.0.1:${address.port}`,
+    authorizeRedirects,
+    authorizeStatuses,
+    get registrations() { return registrations; },
+    close: () => new Promise((resolve) => server.close(() => resolve())),
+  };
+}
+
+const passthrough: McpOAuthFetch = (url, init) => fetch(url, init);
+
+async function finishBrowser(url: string, seen?: string[]): Promise<void> {
+  if (seen) seen.push(new URL(url).searchParams.get('redirect_uri') ?? '');
+  const authorize = await fetch(url, { redirect: 'manual' });
+  const location = authorize.headers.get('location');
+  if (!location) throw new Error(`authorize HTTP ${authorize.status}`);
+  await fetch(location);
+}
+
+describe('strict redirect_uri login', () => {
+  test('두 번째 로그인도 첫 등록 redirect_uri 로 인가된다', async () => {
+    isolated();
+    const auth = await strictAuthServer();
+    try {
+      const seen: string[] = [];
+      const login = () => runMcpLogin({
+        serverId: 'strict',
+        readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
+        fetch: passthrough,
+        persistDiscoveryFn: () => ({ written: false }),
+        openBrowser: (url) => finishBrowser(url, seen),
+      });
+      const first = await login();
+      const second = await login();
+      expect(first.exitCode).toBe(0);
+      expect(second.exitCode).toBe(0);
+      expect(auth.authorizeStatuses).toEqual([302, 302]);
+      expect(auth.authorizeRedirects[1]).toBe(auth.authorizeRedirects[0]);
+      expect(seen[1]).toBe(seen[0]);
+      expect(auth.registrations).toBe(1);
+    } finally {
+      await auth.close();
+    }
+  });
+
+  test('등록된 포트를 다른 소켓이 잡고 있으면 다시 동적 등록한다', async () => {
+    isolated();
+    const auth = await strictAuthServer();
+    const holder = createServer((_req, res) => { res.end(); });
+    try {
+      const first = await runMcpLogin({
+        serverId: 'strict',
+        readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
+        fetch: passthrough,
+        persistDiscoveryFn: () => ({ written: false }),
+        openBrowser: (url) => finishBrowser(url),
+      });
+      expect(first.exitCode).toBe(0);
+      const stored = loadStoredRegistration(auth.base);
+      const port = Number(new URL(stored?.redirectUri ?? 'http://127.0.0.1').port);
+      await new Promise<void>((resolve, reject) => {
+        holder.once('error', reject);
+        holder.listen(port, '127.0.0.1', () => resolve());
+      });
+      const before = auth.registrations;
+      const second = await runMcpLogin({
+        serverId: 'strict',
+        readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
+        fetch: passthrough,
+        persistDiscoveryFn: () => ({ written: false }),
+        openBrowser: (url) => finishBrowser(url),
+      });
+      const again = loadStoredRegistration(auth.base);
+      expect(second.exitCode).toBe(0);
+      expect(auth.registrations).toBe(before + 1);
+      expect(again?.clientId).not.toBe(stored?.clientId);
+      expect(again?.redirectUri).not.toBe(stored?.redirectUri);
+    } finally {
+      await new Promise<void>((resolve) => holder.close(() => resolve()));
+      await auth.close();
+    }
+  });
+
+  test('redirect_uri 기록이 없는 옛 등록은 첫 로그인에서 다시 등록한다', async () => {
+    isolated();
+    const auth = await strictAuthServer();
+    try {
+      saveTokens(auth.base, { accessToken: '', refreshToken: '', expiresAt: null }, {
+        authMode: 'mcp-oauth',
+        accountUuid: 'legacy-client',
+        mirrorCodex: false,
+      }, mcpOAuthStorePath());
+      const result = await runMcpLogin({
+        serverId: 'strict',
+        readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
+        fetch: passthrough,
+        persistDiscoveryFn: () => ({ written: false }),
+        openBrowser: (url) => finishBrowser(url),
+      });
+      const stored = loadStoredRegistration(auth.base);
+      expect(result.exitCode).toBe(0);
+      expect(auth.registrations).toBe(1);
+      expect(stored?.clientId).not.toBe('legacy-client');
+      expect(stored?.redirectUri).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/oauth\/callback$/);
+    } finally {
+      await auth.close();
     }
   });
 });

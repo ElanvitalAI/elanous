@@ -427,7 +427,7 @@ function helpOutput(): AgentRoomSlashResult {
     name: 'agent-room',
     args: [],
     logLines: [
-      '/agent-room — multi-agent VW layout (H6 P4 · Bundle 1)',
+      '/agent-room — unsupported: agent rooms need the removed rich TUI (virtual windows)',
       '  /agent-room <N> <brand1> ... <brandN> [--focus <idx>]   N ∈ {2,3,4} · side-by-side',
       '  /showroom [--focus <idx>]            codex + claude 2-pane showroom',
       '  /agent-room preset <name> <brands...> [--focus <idx>]   name = two-split · three-split · four-quad',
@@ -462,6 +462,7 @@ function showroomHelpOutput(): AgentRoomSlashResult {
       '  /showroom <lane1> <lane2> [<lane3> [<lane4>]]   N ∈ {2,3,4}',
       '  /showroom <lanes...> --focus <idx>          choose initial focus',
       '  /showroom help                              this text',
+      '  Room composition is unsupported: agent rooms need the removed rich TUI (virtual windows).',
       '',
       '  Lane token grammar:',
       '    role:provider[:transport]            full triple',

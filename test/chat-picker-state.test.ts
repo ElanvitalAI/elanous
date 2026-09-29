@@ -150,14 +150,14 @@ describe('dispatch slash', () => {
     expect((action as { text: string }).text.startsWith('/')).toBe(true);
   });
 
-  test('Enter without navigation + non-exact match → autofill (no submit)', async () => {
+  test('Enter without navigation + non-exact match submits the typed slash unchanged', async () => {
     const s = createPickerState({ commands: cmds });
     const b = buf('/h');
     await s.refresh(b);
     const r = await s.dispatch(key('enter'), b);
     expect(r.consumed).toBe(true);
     const action = (r as { consumed: true; action: BufferAction }).action;
-    expect(action.kind).toBe('splice');
+    expect(action).toEqual({ kind: 'submit', text: '/h' });
   });
 
   test('Enter on exact typed name submits even without nav', async () => {
@@ -186,14 +186,17 @@ describe('dispatch arg', () => {
     expect((action as { text: string }).text).toBe('/plugin activate');
   });
 
-  test('Enter on empty currentArg + selection → submit', async () => {
+  test('Enter on empty currentArg only selects a subcommand after navigation', async () => {
     const s = createPickerState({ commands: cmds });
     const b = buf('/plugin ');
     await s.refresh(b);
     const r = await s.dispatch(key('enter'), b);
-    const action = (r as { consumed: true; action: BufferAction }).action;
-    expect(action.kind).toBe('submit');
-    expect((action as { text: string }).text).toBe('/plugin list');
+    expect((r as { consumed: true; action: BufferAction }).action).toEqual({ kind: 'submit', text: '/plugin' });
+
+    await s.dispatch(key('down'), b);
+    await s.dispatch(key('up'), b);
+    const selected = await s.dispatch(key('enter'), b);
+    expect((selected as { consumed: true; action: BufferAction }).action).toEqual({ kind: 'submit', text: '/plugin list' });
   });
 
   test('sequential refreshes narrow currentArg prefix filter in place', async () => {
@@ -553,13 +556,13 @@ describe('golden path', () => {
     expect(a.kind).toBe('submit');
   });
 
-  test('3: Enter with no nav + non-exact → autofill only (no submit)', async () => {
+  test('3: Enter with no nav + non-exact → submit literal input', async () => {
     const s = createPickerState({ commands: cmds });
     const b = buf('/');
     await s.refresh(b);
     const r = await s.dispatch(key('enter'), b);
     const a = (r as { consumed: true; action: BufferAction }).action;
-    expect(a.kind).toBe('splice');
+    expect(a).toEqual({ kind: 'submit', text: '/' });
   });
 
   test('7: Tab on dir invalidates cache + next refresh re-fetches', async () => {
@@ -584,13 +587,15 @@ describe('golden path', () => {
     expect(fetched).toEqual(['sr', 'src/']);
   });
 
-  test('8: picker-open + onBufferEdit clears nav so stray Enter re-autofills', async () => {
+  test('8: picker-open + onBufferEdit clears nav so Enter submits the typed text', async () => {
     const s = createPickerState({ commands: cmds });
     await s.refresh(buf('/he'));
     await s.dispatch(key('down'), buf('/he'));
     expect(s._snapshot().pickerNavigated).toBe(true);
     s.onBufferEdit();
     expect(s._snapshot().pickerNavigated).toBe(false);
+    const result = await s.dispatch(key('enter'), buf('/he'));
+    expect((result as { consumed: true; action: BufferAction }).action).toEqual({ kind: 'submit', text: '/he' });
   });
 
   test('10: bracketed-paste body never reaches dispatch (caller gates)', async () => {

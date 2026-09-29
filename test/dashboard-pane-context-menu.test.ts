@@ -4,7 +4,7 @@ import { registerDashboardPaneTitleContextMenus } from '../src/dashboard-pane-co
 import type { HitTarget } from '../src/display/types.js';
 
 describe('registerDashboardPaneTitleContextMenus', () => {
-  test('browser pane title offers popup and vw actions', () => {
+  test('browser pane title offers popup without a VW action', () => {
     const providers = createMenuProviderRegistry();
     registerDashboardPaneTitleContextMenus(providers);
     const hit: HitTarget = { kind: 'pane-title', paneId: 'wd-browser' };
@@ -15,7 +15,6 @@ describe('registerDashboardPaneTitleContextMenus', () => {
       .map((i) => (i.kind === 'command' ? i.id : ''));
     expect(ids).toEqual([
       'dashboard-pane.open-popup',
-      'dashboard-pane.open-vw',
       'dashboard-pane.clipboard-companion',
       'dashboard-pane.memo-companion',
       'dashboard-pane.detail-companion',
@@ -51,7 +50,6 @@ describe('registerDashboardPaneTitleContextMenus', () => {
       .map((i) => (i.kind === 'command' ? i.id : ''));
     expect(ids).toEqual([
       'dashboard-pane.open-popup',
-      'dashboard-pane.open-vw',
       'dashboard-pane.restore-view-panes',
       'dashboard-pane.clipboard-companion',
       'dashboard-pane.memo-companion',

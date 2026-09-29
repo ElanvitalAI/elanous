@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -7,12 +7,102 @@ const root = resolve(import.meta.dir, '../..');
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-function spawnGraph(stateRoot: string, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
-  const proc = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'graph', ...args], {
-    cwd: root, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: stateRoot },
+function spawnGraphAt(stateRoot: string, cwd: string, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
+  const proc = Bun.spawnSync(['bun', join(root, 'bin/elanous.mjs'), `--test=${stateRoot}`, 'graph', ...args], {
+    cwd, stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ELANOUS_STATE_DIR: stateRoot },
   });
   return { code: proc.exitCode, stdout: new TextDecoder().decode(proc.stdout), stderr: new TextDecoder().decode(proc.stderr) };
 }
+
+function spawnGraph(stateRoot: string, ...args: string[]): { code: number | null; stdout: string; stderr: string } {
+  return spawnGraphAt(stateRoot, root, ...args);
+}
+
+test('graph tick defaults to idle and --start passes JSON input, prints results, and does not restart a finished run', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-tick-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const graph = join(dir, 'graph.yaml');
+  const executed = join(dir, 'executed');
+  writeFileSync(join(dir, 'recipes.yaml'), `a:\n  command: "printf x >> '${executed}'"\n`);
+  writeFileSync(graph, `graph_id: cli-tick\nversion: 1\nentry_node: a\nterminal_nodes: [done]\nnodes:\n  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1, notify: false }\n  - { node_id: done, kind: gate, max_visits: 1 }\nedges:\n  - { from: a, to: done }\n`);
+  const idle = spawnGraphAt(stateRoot, dir, 'tick', graph, '--json');
+  expect(idle.code).toBe(0);
+  expect(JSON.parse(idle.stdout)).toEqual({ action: 'idle' });
+  expect(existsSync(executed)).toBe(false);
+  const started = spawnGraphAt(stateRoot, dir, 'tick', graph, '--start', '--input', '{"job":7}', '--json');
+  expect(started.code).toBe(0);
+  expect(JSON.parse(started.stdout)).toMatchObject({ action: 'started', status: 'done', runId: expect.any(String) });
+  expect(readFileSync(executed, 'utf8')).toBe('x');
+  const runId = JSON.parse(started.stdout).runId as string;
+  expect(JSON.parse(readFileSync(join(stateRoot, 'graph-runs', 'cli-tick', `${runId}.json`), 'utf8')).input).toEqual({ job: 7 });
+  const following = spawnGraphAt(stateRoot, dir, 'tick', graph);
+  expect(following.code).toBe(0);
+  expect(following.stdout).toContain('graph tick: idle');
+  expect(readFileSync(executed, 'utf8')).toBe('x');
+}, 30000);
+
+test('graph tick waits for approval and resumes the same run without replaying completed nodes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-tick-resume-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const graph = join(dir, 'graph.yaml');
+  const executed = join(dir, 'executed');
+  writeFileSync(join(dir, 'recipes.yaml'), `a:\n  command: "printf a >> '${executed}'"\ngate:\n  approval: "Publish?"\nb:\n  command: "printf b >> '${executed}'"\n`);
+  writeFileSync(graph, `graph_id: cli-tick-resume\nversion: 1\nentry_node: a\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: a, kind: agent, recipe: 'cmd:a', max_visits: 1 }\n  - { node_id: gate, kind: judge, recipe: 'approval:gate', max_visits: 1, notify: false }\n  - { node_id: b, kind: agent, recipe: 'cmd:b', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - { from: a, to: gate }\n  - from: gate\n    on: outcome\n    map: { ok: b, fail: failed }\n  - { from: b, to: done }\n`);
+  const started = spawnGraphAt(stateRoot, dir, 'tick', graph, '--start', '--json');
+  expect(started.code).toBe(0);
+  const first = JSON.parse(started.stdout);
+  expect(first).toMatchObject({ action: 'started', status: 'awaiting-approval' });
+  const waiting = spawnGraphAt(stateRoot, dir, 'tick', graph, '--start', '--json');
+  expect(waiting.code).toBe(0);
+  expect(JSON.parse(waiting.stdout)).toEqual({ action: 'waiting', runId: first.runId, status: 'awaiting-approval' });
+  expect(readFileSync(executed, 'utf8')).toBe('a');
+  expect(spawnGraphAt(stateRoot, dir, 'approve', 'cli-tick-resume', first.runId).code).toBe(0);
+  const resumed = spawnGraphAt(stateRoot, dir, 'tick', graph, '--json');
+  expect(resumed.code).toBe(0);
+  expect(JSON.parse(resumed.stdout)).toEqual({ action: 'resumed', runId: first.runId, status: 'done' });
+  expect(readFileSync(executed, 'utf8')).toBe('ab');
+}, 30000);
+
+test('graph tick rejects invalid input and inputs without --start before creating any run', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-tick-input-'));
+  dirs.push(dir);
+  const graph = join(dir, 'graph.yaml');
+  writeFileSync(graph, 'unused');
+  const stateRoot = join(dir, 'state');
+  for (const args of [['--input', '{}'], ['--start', '--input', '{bad'], ['--start', '--input', '[]'], ['--start', '--input', 'null']]) {
+    const result = spawnGraphAt(stateRoot, dir, 'tick', graph, ...args);
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(`graph tick: ${args[0] === '--input' ? '--input requires --start' : '--input must be a JSON object'}`);
+    expect(result.stdout).toBe('');
+  }
+  expect(existsSync(join(stateRoot, 'graph-runs'))).toBe(false);
+}, 30000);
+
+test('graph notify --dry-run prints the target events without sending or writing the ledger', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-notify-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const runDir = join(stateRoot, 'graph-runs', 'cli-notice');
+  mkdirSync(runDir, { recursive: true });
+  mkdirSync(join(dir, 'graphs'));
+  writeFileSync(join(dir, 'graphs', 'notice.yaml'), 'graph_id: cli-notice\nnodes:\n  - { node_id: gate }\n');
+  const statePath = join(runDir, 'run-1.json');
+  const state = { graphId: 'cli-notice', runId: 'run-1', status: 'awaiting-approval', path: ['gate'], nodes: [],
+    pending: { nodeId: 'gate', message: 'Publish now?', since: '2026-01-01T00:00:00Z' }, executed: 0, dryRun: false, statePath };
+  writeFileSync(statePath, JSON.stringify(state));
+  const before = readFileSync(statePath, 'utf8');
+  const preview = spawnGraphAt(stateRoot, dir, 'notify', '--dry-run');
+  expect(preview.code).toBe(0);
+  expect(preview.stdout).toContain('Publish now?');
+  expect(preview.stdout).toContain('Approve: elanous graph approve cli-notice run-1');
+  expect(preview.stdout).toContain('pending graph notifications: 1');
+  expect(readFileSync(statePath, 'utf8')).toBe(before);
+  expect(existsSync(join(stateRoot, 'graph-runs', 'notifications.jsonl'))).toBe(false);
+  const repeated = spawnGraphAt(stateRoot, dir, 'notify', '--dry-run');
+  expect(repeated.stdout).toBe(preview.stdout);
+}, 30000);
 
 test('real CLI awaits approval, reports message, records decision and resumes without replay', () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-cli-approval-'));
@@ -120,6 +210,36 @@ edges:
   expect(JSON.parse(status.stdout)).toEqual(persisted);
 }, 30000);
 
+test('CLI --resume --from restarts the failed path and writes progress only to stderr', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'graph-cli-from-'));
+  dirs.push(dir);
+  const stateRoot = join(dir, 'state');
+  const graph = join(dir, 'graph.yaml');
+  const marker = join(dir, 'marker');
+  writeFileSync(join(dir, 'recipes.yaml'), `first:\n  command: "printf a >> '${marker}'"\nsecond:\n  command: "test -f '${join(dir, 'ready')}' && printf b >> '${marker}'"\n`);
+  writeFileSync(graph, `graph_id: cli-from\nversion: 1\nentry_node: first\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 1 }\n  - { node_id: second, kind: agent, recipe: 'cmd:second', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - { from: first, to: second }\n  - from: second\n    on: outcome\n    map: { ok: done, fail: failed }\n`);
+  const first = spawnGraph(stateRoot, 'run', graph, '--json');
+  expect(first.code).toBe(1);
+  expect(first.stderr).toMatch(/\[graph\] first start \(0\.00s\)/);
+  expect(first.stderr).toMatch(/\[graph\] second fail \([0-9.]+s\)/);
+  const saved = JSON.parse(first.stdout);
+  expect(saved.status).toBe('failed');
+  expect(readFileSync(marker, 'utf8')).toBe('a');
+  const invalid = spawnGraph(stateRoot, 'run', graph, '--resume', saved.runId, '--from', 'absent', '--json');
+  expect(invalid.code).toBe(1);
+  expect(invalid.stderr).toContain('--from node');
+  expect(readFileSync(marker, 'utf8')).toBe('a');
+  writeFileSync(join(dir, 'ready'), 'yes');
+  const resumed = spawnGraph(stateRoot, 'run', graph, '--resume', saved.runId, '--from', 'second', '--json');
+  expect(resumed.code).toBe(0);
+  expect(resumed.stderr).toMatch(/\[graph\] second start \(0\.00s\)/);
+  expect(resumed.stderr).toMatch(/\[graph\] second ok \([0-9.]+s\)/);
+  expect(resumed.stderr).not.toContain('[graph] first start');
+  expect(JSON.parse(resumed.stdout)).toMatchObject({ status: 'done', path: ['first', 'second', 'done'], resume: { from: 'second', previousStatus: 'failed' } });
+  expect(readFileSync(marker, 'utf8')).toBe('ab');
+  expect(spawnGraph(stateRoot, 'run', graph, '--from', 'second').stderr).toContain('--from requires --resume');
+}, 30000);
+
 test('spawned graph run rejects --input unless it is a JSON object before writing a run', () => {
   const dir = mkdtempSync(join(tmpdir(), 'graph-cli-invalid-input-'));
   dirs.push(dir);
@@ -159,8 +279,8 @@ edges:
   const pending = JSON.parse(first.stdout);
   expect(pending.status).toBe('awaiting-approval');
   const env = { ...process.env, ELANOUS_STATE_DIR: stateRoot };
-  const approve = Bun.spawn(['bun', 'bin/elanous.mjs', '--test', 'graph', 'approve', pending.graphId, pending.runId, '--by', 'first'], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
-  const reject = Bun.spawn(['bun', 'bin/elanous.mjs', '--test', 'graph', 'approve', pending.graphId, pending.runId, '--reject', '--by', 'second'], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
+  const approve = Bun.spawn(['bun', 'bin/elanous.mjs', `--test=${stateRoot}`, 'graph', 'approve', pending.graphId, pending.runId, '--by', 'first'], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
+  const reject = Bun.spawn(['bun', 'bin/elanous.mjs', `--test=${stateRoot}`, 'graph', 'approve', pending.graphId, pending.runId, '--reject', '--by', 'second'], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
   const [approvedCode, rejectedCode] = await Promise.all([approve.exited, reject.exited]);
   expect([approvedCode, rejectedCode].sort()).toEqual([0, 1]);
   const winner = approvedCode === 0 ? 'approved' : 'rejected';
@@ -203,7 +323,7 @@ edges:
   expect(first.status).toBe('awaiting-approval');
   expect(spawnGraph(stateRoot, 'approve', first.graphId, first.runId).code).toBe(0);
   const env = { ...process.env, ELANOUS_STATE_DIR: stateRoot };
-  const firstResume = Bun.spawn(['bun', 'bin/elanous.mjs', '--test', 'graph', 'run', graph, '--resume', first.runId, '--json'], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
+  const firstResume = Bun.spawn(['bun', 'bin/elanous.mjs', `--test=${stateRoot}`, 'graph', 'run', graph, '--resume', first.runId, '--json'], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
   try {
     for (let i = 0; i < 100 && !existsSync(marker); i++) await Bun.sleep(50);
     expect(existsSync(marker)).toBe(true);

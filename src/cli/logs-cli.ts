@@ -38,7 +38,7 @@ import { readScopedRenderLogs } from '../mss/logging/scoped-level.js';
 import { formatClock } from '../time/format.js';
 import { HARNESS_SPACE_KINDS } from '../harness/harness-space.js';
 import { LogCursorNotFoundError, STORE_SAFETY_MAX } from '../mss/logging/log-store.js';
-import { readNexusRuntime } from '../nexus/runtime.js';
+import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { tokenizeGrepPhrase } from '../domains/logs-tool.js';
@@ -46,6 +46,8 @@ import { LOG_AXIS_CATEGORIES, knownLogAxes, resolveLogAxis } from '../mss/loggin
 import { KNOWN_LOG_EVENT_NAMES } from './log-event-names.js';
 import { bookmarkAttachDefaults } from './remote-resolve.js';
 import { RemotesStore } from './remotes.js';
+import { detectRepeatedFailures, explainFailure } from '../domains/repeated-failure.js';
+import { redactSecretText } from '../debug/log.js';
 
 export interface LogsCliOpts {
   follow?: boolean;
@@ -74,6 +76,8 @@ export interface LogsCliOpts {
   /** rework-budget data.recurrenceDisagreement 값 필터. */
   reworkRecurrenceDisagreement?: string;
   since?: string;
+  topFailures?: boolean;
+  threshold?: string;
   /** ⭐ 창의 **끝**을 닫는다 — `--since` 와 대칭(상대 표기·ISO·epoch). */
   until?: string;
   /**
@@ -1434,7 +1438,15 @@ export function aggregateListEvents(
 /** 조회 또는 follow. follow 는 Ctrl-C 까지 블록. 복수 타겟(--all)은 ts 병합. */
 export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): Promise<number> {
   const remoteFlag = resolveLogsRemoteFlag(opts);
-  if (remoteFlag !== undefined) return runLogsCliRemote(opts, remoteFlag, deps);
+  if (remoteFlag !== undefined) {
+    if (opts.topFailures) { console.error('elanous logs: --top-failures 는 로컬 스토어 조회에서만 지원'); return 1; }
+    return runLogsCliRemote(opts, remoteFlag, deps);
+  }
+  if (opts.topFailures && opts.follow) { console.error('elanous logs: --top-failures 는 --follow 와 함께 쓸 수 없다'); return 1; }
+  const threshold = opts.threshold === undefined ? 20 : Number(opts.threshold);
+  if (opts.topFailures && (!Number.isSafeInteger(threshold) || threshold < 1)) {
+    console.error('elanous logs: --threshold 는 양의 정수여야 한다'); return 1;
+  }
 
   const { query, error } = buildQuery(opts);
   if (error) { console.error(`elanous logs: ${error}`); return 1; }
@@ -1474,6 +1486,31 @@ export async function runLogsCli(opts: LogsCliOpts, deps: RunLogsCliDeps = {}): 
     return 1;
   }
   if (missing.length > 0) console.error(`elanous logs: 스킵 — ${missing.join(' · ')}`);
+  if (opts.topFailures) {
+    const rows: LogStoreRow[] = [];
+    const unreadable: string[] = [];
+    // Query the entire selected window, not the usual most recent page: a high-volume log can exceed --limit.
+    const windowQuery = { ...query };
+    delete windowQuery.limit;
+    for (const { name, store } of opened) {
+      try {
+        for (const row of store.queryAll({ ...windowQuery, sinceMs: query.sinceMs ?? Date.now() - 10 * 60_000 })) rows.push(row);
+      }
+      catch (e) { unreadable.push(name); console.error(`elanous logs: ${name} 조회 실패 — ${e instanceof Error ? e.message : String(e)}`); }
+    }
+    const groups = detectRepeatedFailures(rows, { threshold }).map((group) => ({
+      ...group,
+      key: redactSecretText(group.key), reason: redactSecretText(group.reason),
+      explanation: redactSecretText(explainFailure(group)),
+    }));
+    if (opts.json) console.log(JSON.stringify({ groups, unreadable }));
+    else {
+      console.log('개수  영역  사유  원인 — 조치');
+      for (const group of groups) console.log(`${group.count}  ${group.area}  ${group.reason}  ${group.explanation}`);
+    }
+    for (const { store } of opened) store.close();
+    return unreadable.length ? 2 : 0;
+  }
   if (opts.json) {
     const meta = `${JSON.stringify({ _meta: { type: 'log-query-opened-stores', stores: openedStores, scope, queryStatus } })}\n`;
     await new Promise<void>((resolve, reject) => process.stdout.write(meta, (error) => error ? reject(error) : resolve()));
@@ -1768,11 +1805,8 @@ export function runLogsInstances(opts: { json?: boolean }): number {
 
 // ── elanous logs level [lvl] — 데몬 REST 경유 (런타임 상태) ────────────────
 
-function daemonBase(): string {
-  const rt = readNexusRuntime();
-  const rawHost = rt?.httpHost ?? '127.0.0.1';
-  const host = rawHost === '0.0.0.0' || rawHost === '::' ? '127.0.0.1' : rawHost;
-  return `http://${host}:${rt?.httpPort ?? 31415}`;
+function daemonBase(): string | null {
+  return resolveDaemonEndpoint()?.baseUrl ?? null;
 }
 
 function readToken(): string | null {
@@ -1782,6 +1816,10 @@ function readToken(): string | null {
 
 export async function runLogsLevel(level: string | undefined, opts: { json?: boolean; render?: string }): Promise<number> {
   const base = daemonBase();
+  if (!base) {
+    console.error('elanous logs level: 이 우주의 데몬 주소를 모른다 — 포트를 짐작하지 않는다. 데몬을 띄우거나 주소를 확인하세요.');
+    return 1;
+  }
   const token = readToken();
   const headers: Record<string, string> = token ? { authorization: `Bearer ${token}` } : {};
   // OH9 — --render on|off (레벨과 직교 축). level 없이 render 만 보낼 수 있고,
@@ -1864,6 +1902,8 @@ const logsCmd = program.command('logs')
   .option('--before <cursor>', '⭐ 페이지 커서 — 행 id 또는 연합 --json 메타의 nextCursors JSON 객체')
   .option('--session <id>', 'session_id 필터')
   .option('--limit <n>', '최대 행 수 (기본 100 · 로컬 직독은 1000 에 갇히지 않는다 — 그 상한은 HTTP 경계로 옮겼다)')
+  .option('--top-failures', '최근 실패를 레벨 무관하게 사유별 집계 (기본 10m)')
+  .option('--threshold <n>', '반복 실패 최소 횟수 (기본 20)')
   .option('--json', 'JSON 출력')
   .option('--json-data', '--json 출력에서 JSON data를 파싱된 값으로 출력')
   .option('--test', 'cwd 레포의 격리 테스트 인스턴스(.elanous-test/) 로그를 본다 (LF7-b)')

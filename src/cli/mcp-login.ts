@@ -2,8 +2,16 @@ import { execFile } from 'node:child_process';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { promisify } from 'node:util';
 import { getUserConfig, reloadUserConfig, saveUserConfig, type McpServerSpec } from '../user-config.js';
-import { exchangeAuthorizationCode, prepareMcpOAuthAuthorization, type McpOAuthFetch } from '../mcp/mcp-oauth.js';
+import {
+  discoverMcpOAuth,
+  exchangeAuthorizationCode,
+  loadStoredRegistration,
+  loopbackRedirectPort,
+  prepareMcpOAuthAuthorization,
+  type McpOAuthFetch,
+} from '../mcp/mcp-oauth.js';
 import { parseWwwAuthenticate } from '../mcp/client.js';
+import { debug } from '../debug/log.js';
 
 const CALLBACK_PATH = '/oauth/callback';
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -58,20 +66,25 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
 
   let server: Server | undefined;
   try {
-    const listener = await listenForCallback(opts.createListener);
-    server = listener.server;
+    const early = await listenForCallback(opts.createListener, 0);
+    server = early.server;
     const challenge = await requestChallenge(spec.url, opts.fetch);
     if (!challenge.resourceMetadata) {
       out.error(`✗ server '${opts.serverId}' did not provide a 401 Bearer resource_metadata challenge`);
       return { exitCode: 1 };
     }
-    const authorization = await prepareMcpOAuthAuthorization({
+    const opened = await openLoginListener({
+      early,
+      serverId: opts.serverId,
       resourceMetadataUrl: challenge.resourceMetadata,
-      scope: challenge.scope,
-      redirectUri: listener.redirectUri,
+      ...(challenge.scope ? { scope: challenge.scope } : {}),
       resourceUrl: spec.url,
       ...(opts.fetch ? { fetch: opts.fetch } : {}),
+      ...(opts.createListener ? { createListener: opts.createListener } : {}),
     });
+    const listener = opened.listener;
+    server = listener.server;
+    const authorization = opened.authorization;
     const callbackPromise = listener.wait(authorization.request.state, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     // Browser launch can synchronously trigger the loopback callback; mark its
     // rejection handled before awaiting the launch so OAuth errors stay in this flow.
@@ -115,6 +128,12 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
     out.log(`  도는 데몬에 반영하려면: elanous mcp reload`);
     return { exitCode: 0 };
   } catch (error) {
+    const stage = loginFailureStage(error);
+    debug.log('mcp.login', 'failed', {
+      serverId: opts.serverId,
+      stage,
+      reason: error instanceof Error ? error.message : String(error),
+    });
     out.error(`✗ MCP login failed: ${error instanceof Error ? error.message : String(error)}`);
     return { exitCode: 1 };
   } finally {
@@ -132,7 +151,96 @@ async function requestChallenge(url: string, fetchFn?: McpOAuthFetch): Promise<{
   return parseWwwAuthenticate(response.headers.get('www-authenticate') ?? '');
 }
 
-async function listenForCallback(createListener: McpLoginOpts['createListener']): Promise<{
+function loginFailureStage(error: unknown): 'authorization' | 'token' | 'login' {
+  const code = error && typeof error === 'object' && 'code' in error ? String((error as { code: unknown }).code) : '';
+  if (code === 'token' || code === 'refresh' || code === 'state-mismatch') return 'token';
+  if (code === 'registration' || code === 'discovery' || code === 'identity-mismatch' || code === 's256-unsupported') {
+    return 'authorization';
+  }
+  return 'login';
+}
+
+async function openLoginListener(opts: {
+  serverId: string;
+  resourceMetadataUrl: string;
+  scope?: string;
+  resourceUrl: string;
+  fetch?: McpOAuthFetch;
+  createListener?: McpLoginOpts['createListener'];
+  early: Awaited<ReturnType<typeof listenForCallback>>;
+}): Promise<{ listener: Awaited<ReturnType<typeof listenForCallback>>; authorization: Awaited<ReturnType<typeof prepareMcpOAuthAuthorization>> }> {
+  const prior = await priorRegistration(opts);
+  const preferred = loopbackRedirectPort(prior?.redirectUri);
+  if (preferred === null && (prior === null || prior.redirectUri)) {
+    const listener = opts.early;
+    debug.log('mcp.login', 'callback-port', { serverId: opts.serverId, source: 'fresh' });
+    const authorization = await prepareMcpOAuthAuthorization({
+      resourceMetadataUrl: opts.resourceMetadataUrl,
+      scope: opts.scope,
+      redirectUri: listener.redirectUri,
+      resourceUrl: opts.resourceUrl,
+      ...(opts.fetch ? { fetch: opts.fetch } : {}),
+    });
+    return { listener, authorization };
+  }
+  await closeServer(opts.early.server);
+  if (preferred !== null) {
+    try {
+      const listener = await listenForCallback(opts.createListener, preferred);
+      debug.log('mcp.login', 'callback-port', { serverId: opts.serverId, source: 'registered' });
+      const authorization = await prepareMcpOAuthAuthorization({
+        resourceMetadataUrl: opts.resourceMetadataUrl,
+        scope: opts.scope,
+        redirectUri: listener.redirectUri,
+        resourceUrl: opts.resourceUrl,
+        ...(opts.fetch ? { fetch: opts.fetch } : {}),
+      });
+      return { listener, authorization };
+    } catch (error) {
+      if (!isAddressInUse(error)) throw error;
+    }
+  }
+  const listener = await listenForCallback(opts.createListener, 0);
+  debug.log('mcp.login', 'callback-port', {
+    serverId: opts.serverId,
+    source: 'reregistered',
+    reason: preferred === null ? 'missing-redirect-uri' : 'port-in-use',
+  });
+  const authorization = await prepareMcpOAuthAuthorization({
+    resourceMetadataUrl: opts.resourceMetadataUrl,
+    scope: opts.scope,
+    redirectUri: listener.redirectUri,
+    resourceUrl: opts.resourceUrl,
+    ...(opts.fetch ? { fetch: opts.fetch } : {}),
+    forceReregister: true,
+  });
+  return { listener, authorization };
+}
+
+async function priorRegistration(opts: {
+  resourceMetadataUrl: string;
+  resourceUrl: string;
+  fetch?: McpOAuthFetch;
+}): Promise<ReturnType<typeof loadStoredRegistration>> {
+  try {
+    const discovered = await discoverMcpOAuth(opts.resourceMetadataUrl, {
+      resourceUrl: opts.resourceUrl,
+      ...(opts.fetch ? { fetch: opts.fetch } : {}),
+    });
+    return loadStoredRegistration(discovered.metadata.issuer);
+  } catch {
+    return null;
+  }
+}
+
+function isAddressInUse(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && 'code' in error && (error as { code: unknown }).code === 'EADDRINUSE');
+}
+
+async function listenForCallback(
+  createListener: McpLoginOpts['createListener'],
+  port: number,
+): Promise<{
   server: Server;
   redirectUri: string;
   wait: (expectedState: string, timeoutMs: number) => Promise<Callback>;
@@ -209,7 +317,7 @@ async function listenForCallback(createListener: McpLoginOpts['createListener'])
     };
     server.once('error', onError);
     server.once('listening', onListening);
-    server.listen(0, '127.0.0.1');
+    server.listen(port, '127.0.0.1');
   });
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('loopback listener did not provide a TCP port');

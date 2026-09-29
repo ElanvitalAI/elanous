@@ -1780,6 +1780,21 @@ describe('terminal control endpoint', () => {
     expect(calls).toEqual([['pty-control', 'input-key', { chars: '\u001b[A' }, { timeoutMs: 2_000 }]]);
   });
 
+  test('HTTP mouse coordinates cross the same owner IPC and invalid coordinates stop before dispatch', async () => {
+    const calls: unknown[] = [];
+    const owner = { async requestRemotePtyControl(id: string, action: string, payload: unknown) {
+      calls.push([id, action, payload]);
+      return { status: 'denied' as const, reason: 'PTY mouse mode is off' };
+    } };
+    const response = await handleTerminalControl(controlReq({ action: 'input-mouse', x: 10, y: 5, kind: 'click' }), opts, 'pty-control', owner);
+    expect(response.status).toBe(409);
+    await expect(response.json()).resolves.toMatchObject({ action: 'input-mouse', status: 'denied', reason: 'PTY mouse mode is off' });
+    expect(calls).toEqual([['pty-control', 'input-mouse', { x: 10, y: 5, kind: 'click' }]]);
+    const invalid = await handleTerminalControl(controlReq({ action: 'input-mouse', x: 0, y: 5, kind: 'click' }), opts, 'pty-control', owner);
+    expect(invalid.status).toBe(400);
+    expect(calls).toHaveLength(1);
+  });
+
   test('forwards an ANSI snapshot payload and preserves its screen result', async () => {
     const calls: Array<[string, string, unknown, { timeoutMs?: number } | undefined]> = [];
     const response = await handleTerminalControl(controlReq({ action: 'snapshot', ansi: true }), opts, 'pty-control', {

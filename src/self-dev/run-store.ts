@@ -15,7 +15,9 @@
  *
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21 §5 (S3).
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { debug } from '../debug/log.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { loadRunLedger, queryInterruptedRunLedgers, runLedgerDir, type RunLedgerEntry } from '../self-implement/run-ledger.js';
 import { join, resolve, sep } from 'node:path';
@@ -109,14 +111,27 @@ function runPath(runId: string, dir: string): string {
 }
 
 function loadSelfDevRunFromPath(path: string): SelfDevRunState | null {
+  const runId = path.slice(path.lastIndexOf(sep) + 1, -'.json'.length);
   try {
-    const o = JSON.parse(readFileSync(path, 'utf-8')) as SelfDevRunState;
-    return typeof o.runId === 'string' && Array.isArray(o.results) ? o : null;
-  } catch { return null; }
+    const o = JSON.parse(readFileSync(path, 'utf-8')) as SelfDevRunState | null;
+    if (o && typeof o.runId === 'string' && Array.isArray(o.results)) return o;
+    try { debug.log('self-dev.run-store', 'read-failed', { runId, reason: 'invalid checkpoint shape' }); } catch { /* preserve fail-soft reads */ }
+  } catch (error) {
+    try { debug.log('self-dev.run-store', 'read-failed', { runId, reason: String(error) }); } catch { /* preserve fail-soft reads */ }
+  }
+  return null;
 }
 
 function writeSelfDevRun(state: SelfDevRunState, dir: string): void {
-  writeFileSync(runPath(state.runId, dir), JSON.stringify(state, null, 2), 'utf-8');
+  const path = runPath(state.runId, dir);
+  const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(tempPath, JSON.stringify(state, null, 2), 'utf-8');
+    renameSync(tempPath, path);
+  } catch (error) {
+    try { unlinkSync(tempPath); } catch { /* write may have failed before creating it */ }
+    throw error;
+  }
 }
 
 function mergeParticipants(

@@ -9,7 +9,8 @@
 // whatever this returns, which keeps the interesting logic testable.
 
 import { describe, expect, test } from 'bun:test';
-import { projectRulebookRows, describeBlocked } from './use-design-check';
+import { projectRulebookRows, describeBlocked, groupDirections, describePickFailure, describeCreateFailure, previewSystemSet } from './use-design-check';
+import { NexusApiError, type DesignDirectionView } from '../client';
 
 describe('projectRulebookRows', () => {
   test('splits shipped-but-undeclared out as its own state', () => {
@@ -92,5 +93,53 @@ describe('describeBlocked', () => {
 
   test('an unknown reason still names itself instead of going generic', () => {
     expect(describeBlocked('some-future-reason', null)).toContain('some-future-reason');
+  });
+});
+
+// RFC design loop §B — card grouping and pick-failure copy.
+
+describe('groupDirections', () => {
+  const d = (id: string, source?: DesignDirectionView['source']): DesignDirectionView => ({
+    id, mood: '', isDark: false, isPastel: false, swatch: { text: '#000', accent: '#000', muted: '#000' }, source,
+  });
+  test('design systems first, everything else is a theme, daemon order kept', () => {
+    const g = groupDirections([d('nord'), d('paper', 'design-system'), d('mine', 'document'), d('minimal', 'design-system')]);
+    expect(g.systems.map((x) => x.id)).toEqual(['paper', 'minimal']);
+    expect(g.themes.map((x) => x.id)).toEqual(['nord', 'mine']);
+  });
+});
+
+describe('previewSystemSet', () => {
+  test('collects system ids and treats a missing list as empty', () => {
+    expect([...previewSystemSet([{ system: 'paper' }, { system: 'minimal' }])].sort()).toEqual(['minimal', 'paper']);
+    expect(previewSystemSet(undefined).size).toBe(0);
+  });
+});
+
+describe('describePickFailure', () => {
+  test('names the daemon reason', () => {
+    expect(describePickFailure(new NexusApiError(400, '/v1/design-direction', { ok: false, reason: 'unknown-direction' })))
+      .toContain('does not know');
+    expect(describePickFailure(new NexusApiError(409, '/v1/design-direction', { ok: false, reason: 'no-repository' })))
+      .toContain('harness.defaultRepo');
+  });
+  test('401 without a reason says owner only', () => {
+    expect(describePickFailure(new NexusApiError(401, '/v1/design-direction', null))).toContain('owner');
+  });
+});
+
+describe('describeCreateFailure', () => {
+  test('names bad-url, id-taken, extract-failed, and a busy 429', () => {
+    expect(describeCreateFailure(new NexusApiError(400, '/v1/design-system', { ok: false, reason: 'bad-url' })))
+      .toContain('http');
+    expect(describeCreateFailure(new NexusApiError(409, '/v1/design-system', { ok: false, reason: 'id-taken' })))
+      .toContain('already taken');
+    expect(describeCreateFailure(new NexusApiError(502, '/v1/design-system', { ok: false, reason: 'extract-failed' })))
+      .toContain('could not be measured');
+    expect(describeCreateFailure(new NexusApiError(429, '/v1/design-system', { ok: false, reason: 'busy' })))
+      .toContain('wait');
+  });
+  test('401 without a reason says owner only', () => {
+    expect(describeCreateFailure(new NexusApiError(401, '/v1/design-system', null))).toContain('owner');
   });
 });

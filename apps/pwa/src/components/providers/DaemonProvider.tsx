@@ -67,6 +67,15 @@ export function DaemonProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const handler = (e: StorageEvent): void => {
+      // 다른 탭(설정)에서 토큰·주소를 바꾸면 이 탭도 바로 따른다 — 종전엔 열린 터미널 탭이 새로고침 전까지
+      // 옛(만료된) 토큰으로 붙으려다 auth_failed 를 냈다(2026-09-28 운영 · 실 브라우저).
+      if (e.key === 'elanous.daemon.token' || e.key === 'elanous.nexus.baseUrl') {
+        const cfg = loadDaemonConfig();
+        client.updateConfig(cfg);
+        setConfigState(cfg);
+        debugLog('webterm.provider.daemon.config-cross-tab', { key: e.key, hasToken: !!cfg.token });
+        return;
+      }
       if (e.key !== 'elanous.daemon.sessionId') return;
       // newValue is null on removeItem; don't clobber active state
       // when another tab clears their session.
@@ -82,7 +91,7 @@ export function DaemonProvider({ children }: { children: React.ReactNode }) {
     };
     window.addEventListener('storage', handler);
     return () => window.removeEventListener('storage', handler);
-  }, []);
+  }, [client]);
 
   const setConfig = (next: Partial<DaemonConfig>): void => {
     setConfigState((prev) => {

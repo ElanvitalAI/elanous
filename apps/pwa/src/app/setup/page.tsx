@@ -50,6 +50,8 @@ export default function SetupPage() {
 
   const [mounted, setMounted] = useState(false);
   const [load, setLoad] = useState<LoadState>({ status: 'idle' });
+  const [loadingSince, setLoadingSince] = useState(() => Date.now());
+  const [loadingSeconds, setLoadingSeconds] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [submit, setSubmit] = useState<SubmitState>({ status: 'idle' });
@@ -58,6 +60,8 @@ export default function SetupPage() {
 
   const refresh = useCallback(async () => {
     if (!client) return;
+    setLoadingSeconds(0);
+    setLoadingSince(Date.now());
     setLoad({ status: 'loading' });
     try {
       const snapshot = await client.getLlmProviders();
@@ -71,7 +75,14 @@ export default function SetupPage() {
     if (mounted && client) void refresh();
   }, [mounted, client, refresh]);
 
+  useEffect(() => {
+    if (load.status !== 'loading') return;
+    const timer = window.setInterval(() => setLoadingSeconds(Math.floor((Date.now() - loadingSince) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [load.status, loadingSince]);
+
   const providers = load.status === 'ok' ? load.snapshot.providers : [];
+  const subscriptionProvider = providers.find((provider) => provider.flow === 'codex');
   const selectedOption: LlmProviderEntry | null = useMemo(
     () => providers.find((p) => p.provider === selected) ?? null,
     [providers, selected],
@@ -108,7 +119,19 @@ export default function SetupPage() {
   if (!mounted || !client) return null;
 
   if (load.status === 'loading' || load.status === 'idle') {
-    return <p className="text-sm text-muted-foreground">Loading providers…</p>;
+    return (
+      <section role="status" aria-live="polite" className="flex flex-col gap-4">
+        <p className="text-sm text-muted-foreground">공급자 확인 중 · {loadingSeconds}초</p>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-hidden="true">
+          {[0, 1, 2].map((index) => (
+            <div key={index} className="h-24 animate-pulse rounded border border-border bg-card p-3">
+              <div className="mb-3 h-4 w-1/2 rounded bg-muted" />
+              <div className="h-3 w-3/4 rounded bg-muted" />
+            </div>
+          ))}
+        </div>
+      </section>
+    );
   }
 
   if (load.status === 'error') {
@@ -126,6 +149,25 @@ export default function SetupPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      {subscriptionProvider ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-primary/30 bg-primary/5 p-4">
+          <p className="text-sm font-medium">구독이 있으면 추가 비용 없이</p>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => {
+              setSelected(subscriptionProvider.provider);
+              setApiKey('');
+              setSubmit({ status: 'idle' });
+              window.requestAnimationFrame(() => {
+                document.getElementById('selected-provider')?.scrollIntoView({ behavior: 'smooth' });
+              });
+            }}
+          >
+            {subscriptionProvider.label} 구독 로그인 보기
+          </Button>
+        </div>
+      ) : null}
       <ProviderGrid
         providers={providers}
         selected={selected}
@@ -147,7 +189,10 @@ export default function SetupPage() {
           위에서 provider 를 선택해주세요.
         </p>
       )}
-      <ChildLlmPreferenceCard />
+      <details className="rounded border border-border bg-card">
+        <summary className="cursor-pointer p-4 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">고급 · 자식 LLM 선호</summary>
+        <div className="p-4 pt-0"><ChildLlmPreferenceCard /></div>
+      </details>
       <AnswerDepthCard />
     </div>
   );
@@ -267,7 +312,7 @@ function SelectedProviderPanel({
   const isInteractiveFlow = provider.flow === 'codex' || provider.flow === 'local';
 
   return (
-    <section className="flex flex-col gap-4 rounded border border-border bg-card p-4">
+    <section id="selected-provider" className="flex flex-col gap-4 rounded border border-border bg-card p-4">
       <header className="flex flex-col gap-1">
         <h3 className="text-base font-semibold">{provider.label}</h3>
         <p className="text-xs text-muted-foreground">{provider.description}</p>

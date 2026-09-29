@@ -178,40 +178,60 @@ describe('RunScenario runtime', () => {
         return { mounted: true };
       },
     });
-    const res = await rt.run({ id: 'hello', target: { kind: 'window', windowId: 7 } }, CTX);
+    const res = await rt.run({ id: 'hello', target: { kind: 'modal', modalId: 'picker' } }, CTX);
     const payload = JSON.parse(res.output);
     expect(payload.ok).toBe(true);
-    expect(payload.target).toEqual({ kind: 'window', windowId: 7 });
-    expect(capturedTarget).toEqual({ kind: 'window', windowId: 7 });
+    expect(payload.target).toEqual({ kind: 'modal', modalId: 'picker' });
+    expect(capturedTarget).toEqual({ kind: 'modal', modalId: 'picker' });
   });
 
-  test('malformed target → ok:false before mount', async () => {
+  test('well-formed window and pane targets are unsupported, malformed addresses are not mislabeled', async () => {
     const catalog = makeCatalog([HELLO_DEF]);
-    const rt = createRunScenarioRuntime({ getCatalog: () => catalog });
-    const res = await rt.run({ id: 'hello', target: { kind: 'window', windowId: 'NaN' } }, CTX);
-    const payload = JSON.parse(res.output);
-    expect(payload.ok).toBe(false);
-    expect(payload.error).toMatch(/malformed `target`/);
+    let mounts = 0;
+    const rt = createRunScenarioRuntime({
+      getCatalog: () => catalog,
+      onMount: () => { mounts++; return { mounted: true }; },
+    });
+    for (const target of [
+      { kind: 'window', windowId: 7 },
+      { kind: 'pane', ref: { windowId: '7', paneId: 'p-1', runnerLabel: 'runner' } },
+    ]) {
+      const payload = JSON.parse((await rt.run({ id: 'hello', target }, CTX)).output);
+      expect(payload.ok).toBe(false);
+      expect(payload.mounted).toBe(false);
+      expect(payload.target).toEqual(target);
+      expect(payload.error).toBe(`RunScenario: target kind "${target.kind}" is not a scenario mount destination`);
+    }
+    for (const target of [
+      { kind: 'window', windowId: '7' },
+      { kind: 'pane', ref: { windowId: 7, paneId: 'p-1' } },
+      { kind: 'pane', ref: { windowId: '7', paneId: 'p-1', runnerLabel: 2 } },
+    ]) {
+      const payload = JSON.parse((await rt.run({ id: 'hello', target }, CTX)).output);
+      expect(payload.ok).toBe(false);
+      expect(payload.error).toBe('RunScenario: malformed `target` SurfaceAddress');
+    }
+    expect(mounts).toBe(0);
   });
 
   test('target requested without onMount support → explicit unsupported-target error', async () => {
     const catalog = makeCatalog([HELLO_DEF]);
     const rt = createRunScenarioRuntime({ getCatalog: () => catalog });
-    const res = await rt.run({ id: 'hello', target: { kind: 'window', windowId: 3 } }, CTX);
+    const res = await rt.run({ id: 'hello', target: { kind: 'widget', widgetId: 'wd-log' } }, CTX);
     const payload = JSON.parse(res.output);
     expect(payload.ok).toBe(false);
     expect(payload.mounted).toBe(false);
     expect(payload.error).toMatch(/does not support target-aware mounts/);
-    expect(payload.target).toEqual({ kind: 'window', windowId: 3 });
+    expect(payload.target).toEqual({ kind: 'widget', widgetId: 'wd-log' });
   });
 
   test('onMount can return mounted:false with explicit unsupported reason', async () => {
     const catalog = makeCatalog([HELLO_DEF]);
     const rt = createRunScenarioRuntime({
       getCatalog: () => catalog,
-      onMount: () => ({ mounted: false, error: 'unsupported target kind "window"' }),
+      onMount: () => ({ mounted: false, error: 'unsupported target kind "widget"' }),
     });
-    const res = await rt.run({ id: 'hello', target: { kind: 'window', windowId: 5 } }, CTX);
+    const res = await rt.run({ id: 'hello', target: { kind: 'widget', widgetId: 'wd-log' } }, CTX);
     const payload = JSON.parse(res.output);
     expect(payload.ok).toBe(false);
     expect(payload.mounted).toBe(false);
@@ -224,10 +244,7 @@ describe('RunScenario runtime', () => {
       getCatalog: () => catalog,
       onMount: (_widgets, target) => {
         if (!target || target.kind !== 'input') return { mounted: false, error: 'unexpected target' };
-        return {
-          mounted: false,
-          error: 'RunScenario: target kind "input" is not a mount container; target binding currently mounts widgets and panes, not live input surfaces',
-        };
+        return { mounted: false, error: 'RunScenario: target kind "input" is not a mount container' };
       },
     });
     const res = await rt.run({ id: 'hello', target: { kind: 'input', inputId: 'chat-main' } }, CTX);

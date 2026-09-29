@@ -15,7 +15,9 @@
 // commands. Full key-routing and LLM tool dispatch land in Phase 4.
 
 import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from 'fs';
-import { join, resolve } from 'path';
+import { basename, dirname, join, resolve } from 'path';
+import { listInstalledPlugins } from '../install/plugin-install.js';
+import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { homedir } from 'os';
 import type {
   ElanousPlugin, PluginContext, SlashCommand, PaneSlot, KeyEvent, Action, LLMToolDef,
@@ -51,6 +53,8 @@ import { buildPromptInjection, getPromptBankStore } from '../../prompt-bank/inde
 import { getGlobalElementRegistry, publishElementEvent } from '../../element-registry/index.js';
 import { mintPluginUri } from '../../mss/uri/builder.js';
 import type { PluginUri } from '../../mss/uri/brand.js';
+import { loadPluginNodes } from '../../graph-kinds/plugin-nodes.js';
+import { getNodeKindRegistration, listNodeKinds, unregisterPluginNodeKind, type NodeKindEntry } from '../../graph-kinds/registry.js';
 
 /** Clamp a tool handler's return value to something short enough for
  *  the debug log. Preserves the shape for JSON.stringify so small
@@ -203,6 +207,8 @@ export interface PluginHostOptions {
   statePersistence?: import('../../plugin-state/persistence.js').PluginStatePersistence;
   /** Optional user plugin directory, primarily for isolated host instances. */
   userDir?: string;
+  /** Optional pack directory for isolated discovery tests. */
+  packsDir?: string;
 }
 
 // Parse a Keybinding.key string ('C-S-p', 'tab', 'escape') into its
@@ -224,10 +230,12 @@ export function matchesKey(spec: string, ev: KeyEvent): boolean {
 }
 
 export const BUILTIN_DIR = resolve(import.meta.dir, '..', '..', '..', 'plugins');
+export const PACKS_DIR = resolve(import.meta.dir, '..', '..', '..', 'packs');
 export const USER_DIR = join(homedir(), '.claude', 'plugins');
 
 export class PluginHost {
   private available = new Map<string, PluginEntry>();
+  private discoveredNodeKinds = new Map<string, NodeKindEntry>();
   private activeEntry: ActivePlugin | null = null;
   private hooks: HostHooks;
   /** Optional widget host. When set, plugin-host calls buildLayout on
@@ -241,6 +249,7 @@ export class PluginHost {
   private capabilityPolicy = new PluginCapabilityPolicy();
   private trustStore: PluginTrustStore;
   private userDir: string;
+  private packsDir: string;
   private tasks = new PluginTaskService();
   private themeCache = new Map<string, { mtimeMs: number; tokens: ThemeTokenInput }>();
   /** PX-2 P4: plugin-state persistence backend (optional). */
@@ -259,6 +268,7 @@ export class PluginHost {
     this.widgetHost = widgetHost;
     this.trustStore = opts.trustStore ?? new PluginTrustStore();
     this.userDir = opts.userDir ?? USER_DIR;
+    this.packsDir = opts.packsDir ?? PACKS_DIR;
     this.statePersistence = opts.statePersistence ?? null;
     this.registerExecutionHistoryTools();
     this.registerThemeTools();
@@ -474,15 +484,86 @@ export class PluginHost {
     this.widgetHost = widgetHost;
   }
 
-  /** Scan both built-in and user directories, importing every plugin.ts. */
+  /** Scan built-in and user directories, then ledger-listed installations and declared nodes from plugins and packs. */
   async discover(): Promise<void> {
+    for (const owner of this.discoveredNodeKinds.values()) {
+      if (owner.plugin) unregisterPluginNodeKind(owner.graph, owner.kind, owner.plugin, owner);
+    }
+    this.discoveredNodeKinds.clear();
     this.available.clear();
     await this.scanDir(BUILTIN_DIR, 'builtin');
     await this.scanDir(this.userDir, 'user');
+    try {
+      const root = elanousStateRoot();
+      const ledgerPath = join(root, 'plugins', 'installed.json');
+      if (existsSync(ledgerPath)) {
+        const ledger: unknown = JSON.parse(readFileSync(ledgerPath, 'utf8'));
+        if (!Array.isArray(ledger) || !ledger.every(row => row && typeof row === 'object'
+          && typeof row.name === 'string' && typeof row.version === 'string' && typeof row.market === 'string')) throw new Error('invalid plugin ledger');
+        const registered = new Set(ledger.map(row => `${row.market}/${row.name}/${row.version}`));
+        for (const installed of listInstalledPlugins(root)) {
+          if (!registered.has(`${installed.market}/${installed.name}/${installed.version}`)) continue;
+          await this.scanDir(dirname(installed.path), 'installed', basename(installed.path), installed.name);
+        }
+      }
+    } catch {
+      this.hooks.log('⚠ plugin installed.json is invalid; skipping installed plugins');
+      debug.log('plugin.discovery', 'error', { reason: 'invalid installed plugin ledger' }, { level: 'warn' });
+    }
+    for (const entry of this.available.values()) {
+      this.loadDiscoveredNodes(entry.path, entry.manifest);
+    }
+    this.scanPackNodes();
     debug.log('plugin.discovery', 'complete', { count: this.available.size });
   }
 
-  private async scanDir(dir: string, source: PluginSource): Promise<void> {
+  private loadDiscoveredNodes(pluginDir: string, manifest: PluginManifest): void {
+    const before = new Set(listNodeKinds().map((entry) => `${entry.graph}:${entry.kind}`));
+    try {
+      const result = loadPluginNodes(pluginDir, manifest);
+      for (const error of result.errors) {
+        this.hooks.log(`⚠ plugin "${manifest.id}" node skipped: ${error}`);
+        debug.log('plugin.discovery', 'error', { plugin: manifest.id, reason: String(error) }, { level: 'error' });
+      }
+    } catch (err: any) {
+      const reason = err?.message || String(err);
+      this.hooks.log(`⚠ plugin "${manifest.id}" nodes failed to load: ${reason}`);
+      debug.log('plugin.discovery', 'error', { plugin: manifest.id, reason }, { level: 'error' });
+    } finally {
+      for (const entry of listNodeKinds()) {
+        const key = `${entry.graph}:${entry.kind}`;
+        if (!before.has(key) && entry.plugin === manifest.id) {
+          const registered = getNodeKindRegistration(entry.graph, entry.kind);
+          if (registered) this.discoveredNodeKinds.set(key, registered);
+        }
+      }
+    }
+  }
+
+  private scanPackNodes(): void {
+    if (!existsSync(this.packsDir)) return;
+    let names: string[];
+    try {
+      names = readdirSync(this.packsDir);
+    } catch (err: any) {
+      debug.log('plugin.discovery', 'error', { plugin: null, reason: err?.message || String(err) }, { level: 'error' });
+      return;
+    }
+    for (const name of names) {
+      const packDir = join(this.packsDir, name);
+      try {
+        if (!statSync(packDir).isDirectory() || !existsSync(join(packDir, 'plugin.json'))) continue;
+        const { manifest } = loadPluginManifestFromDir(packDir, { id: name, main: './plugin.ts' });
+        this.loadDiscoveredNodes(packDir, manifest);
+      } catch (err: any) {
+        const reason = err?.message || String(err);
+        this.hooks.log(`⚠ failed to load pack manifest ${name}: ${reason}`);
+        debug.log('plugin.discovery', 'error', { plugin: name, reason }, { level: 'error' });
+      }
+    }
+  }
+
+  private async scanDir(dir: string, source: PluginSource, onlyEntry?: string, expectedId?: string): Promise<void> {
     const exists = existsSync(dir);
     if (!exists) {
       debug.log('plugin.discovery', 'scan', { dir, source, exists, count: 0 });
@@ -490,7 +571,7 @@ export class PluginHost {
     }
     let entries: string[] = [];
     try {
-      entries = readdirSync(dir);
+      entries = onlyEntry ? [onlyEntry] : readdirSync(dir);
     } catch (err: any) {
       debug.log('plugin.discovery', 'scan', { dir, source, exists, count: 0 });
       debug.log('plugin.discovery', 'error', {
@@ -505,6 +586,13 @@ export class PluginHost {
       let isDir = false;
       try { isDir = statSync(pluginDir).isDirectory(); } catch { continue; }
       if (!isDir) continue;
+      // Portable graph bundles are installer inputs, not legacy repository plugins.
+      if (source === 'builtin' && existsSync(join(pluginDir, 'plugin.json'))) {
+        try {
+          const raw = JSON.parse(readFileSync(join(pluginDir, 'plugin.json'), 'utf8'));
+          if (raw?.extensions?.['ai.elanous'] && !raw.main) continue;
+        } catch { /* manifest loader below reports malformed files */ }
+      }
       const hasLegacyEntry = existsSync(join(pluginDir, 'plugin.ts'));
       let manifestLoad: ReturnType<typeof loadPluginManifestFromDir>;
       try {
@@ -515,6 +603,8 @@ export class PluginHost {
         debug.log('plugin.discovery', 'error', { plugin: name, reason }, { level: 'error' });
         continue;
       }
+      if (expectedId && manifestLoad.manifest.id !== expectedId) continue;
+      if (source === 'installed' && this.available.has(manifestLoad.manifest.id)) continue;
       const entry = join(pluginDir, manifestLoad.manifest.main);
       if (!existsSync(entry)) {
         // Only warn when the directory *looks like* a plugin — i.e. it

@@ -1,6 +1,7 @@
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, spyOn } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { addSelfDevRunParticipant, checkpointDependenciesForRun, closeSelfDevRunParticipant, saveSelfDevRun, loadSelfDevRun, listSelfDevRuns, listParkedGoals, listCombinedParkedGoals, parkedGoalsPopulationNotice, scanParkedGoals, countRunningGoals, countUnconvergeableRunLedgers, recordSelfDevRunSupervisorStop, resolveParkedSelfDevRun, failureClassificationForInterruptionVerdict, extractParkedGoalLedgerArtifactEvidence, PARKED_GOALS_LEDGER_STATUS, PARKED_GOALS_LIMITATION, type SelfDevRunState } from './run-store.js';
@@ -25,6 +26,103 @@ describe('self-dev run-store (S3 persistence)', () => {
     expect(loaded?.runId).toBe('run-1');
     expect(loaded?.results[0]).toMatchObject({ feature: 'A', status: 'done', prUrl: 'https://x/1' });
   });
+
+  test('read failures report the run ID and reason while preserving null', () => {
+    const dir = tmp();
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(loadSelfDevRun('absent', dir)).toBeNull();
+      writeFileSync(join(dir, 'broken.json'), '{not-json', 'utf8');
+      expect(loadSelfDevRun('broken', dir)).toBeNull();
+      expect(log).toHaveBeenCalledWith('self-dev.run-store', 'read-failed', expect.objectContaining({
+        runId: 'broken', reason: expect.stringContaining('SyntaxError'),
+      }));
+      expect(log).toHaveBeenCalledWith('self-dev.run-store', 'read-failed', expect.objectContaining({
+        runId: 'absent', reason: expect.stringContaining('ENOENT'),
+      }));
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('two real children exchange 200 large checkpoints without observing a partial JSON', async () => {
+    const dir = tmp();
+    const runId = 'concurrent-checkpoint';
+    const count = 200;
+    const payload = 'x'.repeat(1024 * 1024 + 1);
+    saveSelfDevRun({
+      runId, createdAt: 1, updatedAt: 0,
+      results: [{ taskId: 't1', feature: 'A', status: 'done', screenTail: payload }],
+    }, dir);
+    const storeUrl = new URL('./run-store.ts', import.meta.url).href;
+    const setup = `
+      import { existsSync, writeFileSync } from 'node:fs';
+      import { join } from 'node:path';
+      import { loadSelfDevRun, saveSelfDevRun } from ${JSON.stringify(storeUrl)};
+      const [dir, runId, countText] = process.argv.slice(1);
+      const count = Number(countText);
+      const waitFor = async (path) => {
+        const deadline = Date.now() + 10000;
+        while (!existsSync(path)) {
+          if (existsSync(join(dir, 'reader-failed'))) throw new Error('reader reported a partial checkpoint');
+          if (Date.now() > deadline) throw new Error('checkpoint exchange timed out: ' + path);
+          await new Promise(resolve => setTimeout(resolve, 1));
+        }
+      };
+    `;
+    const writer = Bun.spawn({
+      cmd: [process.execPath, '-e', `${setup}
+        const payload = 'x'.repeat(1024 * 1024 + 1);
+        for (let i = 1; i <= count; i++) {
+          await waitFor(join(dir, 'ack-' + (i - 1)));
+          saveSelfDevRun({ runId, createdAt: 1, updatedAt: i,
+            results: [{ taskId: 't1', feature: 'A', status: 'done', screenTail: payload }] }, dir);
+        }
+      `, dir, runId, String(count)],
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    const reader = Bun.spawn({
+      cmd: [process.execPath, '-e', `${setup}
+        writeFileSync(join(dir, 'ack-0'), 'ready');
+        let reads = 0;
+        try {
+          for (let i = 1; i <= count; i++) {
+            let state;
+            do {
+              state = loadSelfDevRun(runId, dir);
+              reads++;
+              if (!state) throw new Error('null checkpoint at iteration ' + i + ' read ' + reads);
+              if (state.results[0]?.screenTail?.length !== 1024 * 1024 + 1)
+                throw new Error('partial checkpoint at iteration ' + i);
+              if (state.updatedAt < i) await new Promise(resolve => setTimeout(resolve, 0));
+            } while (state.updatedAt < i);
+            writeFileSync(join(dir, 'ack-' + i), 'read');
+          }
+          console.log('200 intact checkpoints; reads=' + reads);
+        } catch (error) {
+          writeFileSync(join(dir, 'reader-failed'), String(error));
+          throw error;
+        }
+      `, dir, runId, String(count)],
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    try {
+      const [writerCode, readerCode] = await Promise.all([writer.exited, reader.exited]);
+      const writerError = await new Response(writer.stderr).text();
+      const readerError = await new Response(reader.stderr).text();
+      expect(readerError).toBe('');
+      expect(readerCode).toBe(0);
+      expect(writerError).toBe('');
+      expect(writerCode).toBe(0);
+      expect(await new Response(reader.stdout).text()).toContain('200 intact checkpoints; reads=');
+      expect(loadSelfDevRun(runId, dir)?.updatedAt).toBe(count);
+      expect(readdirSync(dir).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    } finally {
+      writer.kill();
+      reader.kill();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 90_000);
 
   test('new-run checkpoint maps goal IDs to predecessor IDs and explicit no-dependency shards', () => {
     expect(checkpointDependenciesForRun(null, [
@@ -134,6 +232,14 @@ describe('self-dev run-store (S3 persistence)', () => {
 
   test('save is fail-soft on a bad dir (never throws)', () => {
     expect(() => saveSelfDevRun(run('x', 1), '/proc/nonexistent/cannot/write')).not.toThrow();
+  });
+
+  test('failed replacement removes its temporary file without changing the target', () => {
+    const dir = tmp();
+    mkdirSync(join(dir, 'unreplaceable.json'));
+    saveSelfDevRun(run('unreplaceable', 100), dir);
+    expect(readdirSync(dir).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    expect(existsSync(join(dir, 'unreplaceable.json'))).toBeTrue();
   });
 
   test('participant registrations preserve earlier participants for the same run', () => {

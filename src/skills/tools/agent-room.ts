@@ -1,28 +1,6 @@
-// H6 P4 · LLM tools for agent-room composition.
-//
-// Three tools, mirroring the slash surface:
-//   - AgentRoomCompose — launch N agents into one VW with a preset
-//   - AgentRoomList    — read live rooms
-//   - AgentRoomClose   — dispose one room (idempotent)
-//
-// Output contract matches the budget + policy tool family:
-//   `{ output: string; metadata: object; isError?: true }`.
-//
-// Safety (PLAN §D10):
-//   - Compose is T2 · `safety: ['agent','vw']` · turn cost scales with N
-//     so the metadata includes `budgetAdvisory` with the worst-case
-//     session-window usage across providers. LLM is expected to relay
-//     the warning to the user via AskUserQuestion when >= 70%.
-//   - Close is destructive but equivalent to a VW close; user can
-//     always restart the same spec.
+// AgentRoomCompose returns an unsupported error; list and close retain their registry behavior.
 
 import type { LLMToolSpec } from '../../llm.js';
-import { getUsageStore } from '../../budget/usage-store.js';
-import type { UsageProvider } from '../../budget/types.js';
-import {
-  createDefaultPolicyDecide,
-} from './agent-room-slash.js';
-import { buildAgentRoom } from '../../agent-room/room-builder.js';
 import {
   getDefaultAgentRoomRegistry,
   type AgentRoomRegistry,
@@ -32,56 +10,7 @@ import {
   AGENT_ROOM_ROLE_HINTS,
   presetArityFor,
   isAgentRoomPresetName,
-  isAgentRoomRoleHint,
-  type AgentRoomMember,
-  type AgentRoomSpec,
 } from '../../agent-room/types.js';
-
-// ─── Shared helpers ──────────────────────────────────────────────────
-
-/** Compute worst-case session-window usage across providers. Returns
- *  0 when no snapshots are available. Used by `AgentRoomCompose`'s
- *  `budgetAdvisory` metadata. */
-function computeCurrentUsagePercent(): { percent: number; provider?: UsageProvider } {
-  const store = getUsageStore();
-  let worst = 0;
-  let worstProvider: UsageProvider | undefined;
-  for (const p of store.listProviders()) {
-    const snap = store.getSnapshot(p);
-    if (!snap) continue;
-    for (const w of snap.windows) {
-      if (w.kind !== 'session') continue;
-      const used = 100 - (w.remainingPercent ?? 100);
-      if (used > worst) {
-        worst = used;
-        worstProvider = p;
-      }
-    }
-  }
-  return worstProvider ? { percent: worst, provider: worstProvider } : { percent: worst };
-}
-
-const BUDGET_WARN_THRESHOLD = 70;
-
-function buildBudgetAdvisory(agentCount: number): {
-  currentUsagePercent: number;
-  estimatedTurnMultiplier: number;
-  warning?: string;
-} {
-  const { percent, provider } = computeCurrentUsagePercent();
-  const advisory: { currentUsagePercent: number; estimatedTurnMultiplier: number; warning?: string } = {
-    currentUsagePercent: Math.round(percent * 10) / 10,
-    estimatedTurnMultiplier: agentCount,
-  };
-  if (percent >= BUDGET_WARN_THRESHOLD) {
-    advisory.warning =
-      `current session usage ${advisory.currentUsagePercent}% ` +
-      (provider ? `(${provider}) ` : '') +
-      `· ${agentCount} agents active means ~${agentCount}x turn cost · ` +
-      `consider AskUserQuestion before composing the room`;
-  }
-  return advisory;
-}
 
 // ─── AgentRoomCompose ────────────────────────────────────────────────
 
@@ -126,12 +55,8 @@ export function buildAgentRoomComposeTool(): LLMToolSpec {
   return {
     name: 'AgentRoomCompose',
     description:
-      'Create a VW agent room with N panes (2/3/4), each running a different brand agent. ' +
-      'Use for multi-agent workflows (plan/exec/review). `brandRef: "auto"` delegates brand ' +
-      'selection to the policy router using `roleHint` (when set) or pane-index defaults ' +
-      '(0=plan, 1=exec, 2=review, 3=reflect). Returns a `budgetAdvisory` — WARN and surface ' +
-      'to the user via AskUserQuestion when `currentUsagePercent >= 70`. N agents run ' +
-      'concurrently, so turn cost scales by N.',
+      'Unsupported: agent rooms need the removed rich TUI (virtual windows). ' +
+      'AgentRoomCompose remains available by name but returns an error when called.',
     parameters: {
       type: 'object',
       properties: {
@@ -167,11 +92,11 @@ export function buildAgentRoomComposeTool(): LLMToolSpec {
         },
         roomTitle: {
           type: 'string',
-          description: 'VW title. Defaults to `agent-room-<seq>`.',
+          description: 'Room title (unsupported).',
         },
         focusIndex: {
           type: 'number',
-          description: '0-based pane index to focus initially. Default 0.',
+          description: '0-based pane index (unsupported).',
         },
       },
       required: ['preset', 'members'],
@@ -182,7 +107,7 @@ export function buildAgentRoomComposeTool(): LLMToolSpec {
 
 export async function dispatchAgentRoomCompose(
   rawArgs: Record<string, unknown>,
-  registry: AgentRoomRegistry = getDefaultAgentRoomRegistry(),
+  _registry: AgentRoomRegistry = getDefaultAgentRoomRegistry(),
 ): Promise<AgentRoomComposeResult> {
   const preset = typeof rawArgs.preset === 'string' ? rawArgs.preset : '';
   if (!isAgentRoomPresetName(preset)) {
@@ -199,70 +124,13 @@ export async function dispatchAgentRoomCompose(
       preset,
     );
   }
-  const members: AgentRoomMember[] = [];
   for (let i = 0; i < rawMembers.length; i++) {
     const raw = rawMembers[i] as Record<string, unknown>;
     if (!raw || typeof raw.brandRef !== 'string' || !raw.brandRef.trim()) {
       return errorResult(`AgentRoomCompose: member[${i}].brandRef must be non-empty string`, preset);
     }
-    const hint = isAgentRoomRoleHint(raw.roleHint) ? raw.roleHint : undefined;
-    members.push({
-      brandRef: raw.brandRef,
-      ...(hint ? { roleHint: hint } : {}),
-      ...(typeof raw.cwd === 'string' ? { cwd: raw.cwd } : {}),
-      ...(Array.isArray(raw.extraArgs)
-        ? { extraArgs: raw.extraArgs.filter((x) => typeof x === 'string') as readonly string[] }
-        : {}),
-      ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
-    });
   }
-  const spec: AgentRoomSpec = {
-    preset,
-    members,
-    layoutMode: 'single-vw',
-    ...(typeof rawArgs.roomTitle === 'string' ? { roomTitle: rawArgs.roomTitle } : {}),
-    ...(typeof rawArgs.focusIndex === 'number' ? { focusIndex: rawArgs.focusIndex } : {}),
-  };
-  try {
-    const result = await buildAgentRoom(spec, {
-      registry,
-      policyDecide: createDefaultPolicyDecide(),
-    });
-    const advisory = buildBudgetAdvisory(result.room.members.length);
-    const memberMeta = result.room.members.map((m) => ({
-      sessionId: m.sessionId,
-      paneId: m.paneId,
-      brand: m.brand,
-      ...(m.roleHint ? { roleHint: m.roleHint } : {}),
-    }));
-    const lines: string[] = [];
-    lines.push(`AgentRoomCompose: ${result.room.id} · window ${result.room.windowId} · preset ${preset}`);
-    for (const m of memberMeta) {
-      lines.push(`  ${m.brand}${m.roleHint ? ` [${m.roleHint}]` : ''} · pane ${m.paneId}`);
-    }
-    if (result.warnings.length > 0) {
-      lines.push(`  warnings: ${result.warnings.length}`);
-    }
-    if (advisory.warning) {
-      lines.push(`  budget: ${advisory.warning}`);
-    }
-    return {
-      output: lines.join('\n'),
-      metadata: {
-        roomId: result.room.id,
-        windowId: result.room.windowId,
-        preset,
-        members: memberMeta,
-        warnings: [...result.warnings],
-        budgetAdvisory: advisory,
-      },
-    };
-  } catch (err) {
-    return errorResult(
-      `AgentRoomCompose: ${err instanceof Error ? err.message : String(err)}`,
-      preset,
-    );
-  }
+  return errorResult('AgentRoomCompose: agent rooms need the removed rich TUI (virtual windows)', preset);
 }
 
 function errorResult(message: string, preset: string): AgentRoomComposeResult {
@@ -367,7 +235,7 @@ export function buildAgentRoomCloseTool(): LLMToolSpec {
   return {
     name: 'AgentRoomClose',
     description:
-      'Close an agent room — dispose all member agents and close the VW. ' +
+      'Close an existing agent room and dispose its member agents. ' +
       'Idempotent: a second call on the same id returns `closed: false` without error.',
     parameters: {
       type: 'object',

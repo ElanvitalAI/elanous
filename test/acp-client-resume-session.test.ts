@@ -5,7 +5,7 @@ import { AcpResumeSessionUnsupportedError } from '../src/acp/capabilities.js';
 import { debug } from '../src/debug/log.js';
 
 type ResumeConnection = {
-  unstable_resumeSession: (request: {
+  resumeSession: (request: {
     sessionId: SessionId;
     cwd: string;
     mcpServers: unknown[];
@@ -31,11 +31,11 @@ describe('AcpAgent.resumeSession', () => {
 
   test('delegates the advertised capability through the single unstable SDK call and observes it', async () => {
     const agent = new AcpAgent({ backendId: 'claude', cwd: '/workspace', log: () => {} });
-    const response = { models: null };
+    const response = { configOptions: null };
     const connection = {
-      unstable_resumeSession: async () => response,
+      resumeSession: async () => response,
     };
-    const unstableResumeSession = spyOn(connection, 'unstable_resumeSession');
+    const unstableResumeSession = spyOn(connection, 'resumeSession');
     const events: Array<{ category: string; event: string; data: unknown }> = [];
     const logSpy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
       events.push({ category, event, data });
@@ -58,9 +58,9 @@ describe('AcpAgent.resumeSession', () => {
   test('rejects an unadvertised resume capability without calling the SDK', async () => {
     const agent = new AcpAgent({ backendId: 'claude', cwd: '/workspace' });
     const connection = {
-      unstable_resumeSession: async () => ({ models: null }),
+      resumeSession: async () => ({ configOptions: null }),
     };
-    const unstableResumeSession = spyOn(connection, 'unstable_resumeSession');
+    const unstableResumeSession = spyOn(connection, 'resumeSession');
     setConnection(agent, connection);
     recordCapabilities(agent, false);
 

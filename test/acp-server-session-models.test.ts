@@ -23,6 +23,13 @@ import {
   getSessionTierOverride,
 } from '../src/model-tier/session-override.js';
 
+/** ACP 1.x: the session model list is the `model` select in `configOptions`. */
+function modelValues(session: { configOptions?: Array<{ id: string; type?: string; options?: unknown }> | null }): string[] {
+  const option = session.configOptions?.find((entry) => entry.id === 'model');
+  const options = (option?.options ?? []) as Array<{ value?: string }>;
+  return options.map((entry) => entry.value!).filter(Boolean);
+}
+
 function expectedModelIds(providers: readonly LlmTierProvider[]): string[] {
   return providers.flatMap((provider) => Object.entries(LLM_TIER_MAP_BY_PROVIDER[provider])
     .map(([tier, spec]) => `${provider}:${tier}:${spec.model}`));
@@ -165,10 +172,12 @@ describe('runAcpServer() newSession models', () => {
     await client.initialize({ protocolVersion: 1, clientCapabilities: {} });
     const response = await client.newSession({ cwd: '/tmp', mcpServers: [] });
 
-    expect(response.models?.availableModels.map((model) => model.modelId).sort())
-      .toEqual(expectedModelIds(TIER_PROVIDERS).sort());
-    expect(response.models?.availableModels).not.toHaveLength(0);
-    expect(response.models?.availableModels.some((model) => model.modelId === response.models?.currentModelId)).toBe(true);
+    const values = modelValues(response);
+    expect([...values].sort()).toEqual(expectedModelIds(TIER_PROVIDERS).sort());
+    expect(values).not.toHaveLength(0);
+    const option = response.configOptions?.find((entry) => entry.id === 'model') as { category?: string; currentValue?: string } | undefined;
+    expect(option?.category).toBe('model');
+    expect(values).toContain(option?.currentValue ?? '<none>');
   });
 
   test('stores only advertised selections per session with rationale and lifecycle observation', async () => {
@@ -199,10 +208,10 @@ describe('runAcpServer() newSession models', () => {
     await client.initialize({ protocolVersion: 1, clientCapabilities: {} });
     const first = await client.newSession({ cwd: '/tmp', mcpServers: [] });
     const second = await client.newSession({ cwd: '/tmp', mcpServers: [] });
-    const selectedModelId = first.models!.availableModels.at(-1)!.modelId;
+    const selectedModelId = modelValues(first).at(-1)!;
     const [, expectedTier] = selectedModelId.split(':', 3);
 
-    await client.unstable_setSessionModel({ sessionId: first.sessionId, modelId: selectedModelId });
+    await client.setSessionConfigOption({ sessionId: first.sessionId, configId: 'model', value: selectedModelId });
 
     const override = getSessionTierOverride(first.sessionId);
     expect(override).toMatchObject({ llm: expectedTier });
@@ -213,9 +222,10 @@ describe('runAcpServer() newSession models', () => {
       && (event.data as { sessionId?: string; modelId?: string }).sessionId === first.sessionId
       && (event.data as { sessionId?: string; modelId?: string }).modelId === selectedModelId)).toBe(true);
 
-    await expect(client.unstable_setSessionModel({
+    await expect(client.setSessionConfigOption({
       sessionId: second.sessionId,
-      modelId: 'unadvertised:best:model',
+      configId: 'model',
+      value: 'unadvertised:best:model',
     })).rejects.toMatchObject({
       code: -32602,
       message: 'Invalid params: unadvertised session model',
@@ -258,12 +268,13 @@ describe('runAcpServer() newSession models', () => {
     delete catalog.grok.best;
     catalog.grok.best = { ...original, model: 'catalog-changed-after-advertisement' };
     try {
-      await client.unstable_setSessionModel({ sessionId: session.sessionId, modelId: advertisedModelId });
+      await client.setSessionConfigOption({ sessionId: session.sessionId, configId: 'model', value: advertisedModelId });
       expect(getSessionTierOverride(session.sessionId)).toMatchObject({ llm: 'best' });
 
-      await expect(client.unstable_setSessionModel({
+      await expect(client.setSessionConfigOption({
         sessionId: session.sessionId,
-        modelId: changedModelId,
+        configId: 'model',
+        value: changedModelId,
       })).rejects.toMatchObject({
         code: -32602,
         message: 'Invalid params: unadvertised session model',
@@ -316,11 +327,12 @@ describe('runAcpServer() newSession models', () => {
       secondClient.initialize({ protocolVersion: 1, clientCapabilities: {} }),
     ]);
     const first = await firstClient.newSession({ cwd: '/tmp', mcpServers: [] });
-    const selectedModelId = first.models!.availableModels.at(-1)!.modelId;
+    const selectedModelId = modelValues(first).at(-1)!;
 
-    await expect(secondClient.unstable_setSessionModel({
+    await expect(secondClient.setSessionConfigOption({
       sessionId: first.sessionId,
-      modelId: selectedModelId,
+      configId: 'model',
+      value: selectedModelId,
     })).rejects.toMatchObject({
       code: -32602,
       message: 'Invalid params: unknown or unadvertised session',

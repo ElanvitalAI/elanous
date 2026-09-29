@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -15,12 +15,17 @@ type BashRun = WorkflowDeps['runBash'];
 export interface GraphRunState {
   graphId: string;
   runId: string;
+  startedAt?: string;
+  finishedAt?: string;
   status: 'running' | 'done' | 'failed' | 'budget-exceeded' | 'awaiting-approval';
   path: string[];
   nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string }>;
   input?: unknown;
   pending?: { nodeId: string; message: string; since: string; notifiedAt?: string; decision?: 'approved' | 'rejected'; decidedBy?: string; decidedAt?: string };
   approvalSourceHash?: string;
+  /** Hash of the graph and recipes used for this run; required to safely restart a failed path. */
+  sourceHash?: string;
+  resume?: { from: string; at: string; previousStatus: 'failed' };
   executed: number;
   dryRun: boolean;
   statePath: string;
@@ -31,6 +36,7 @@ export interface GraphRunOptions {
   dryRun?: boolean;
   runId?: string;
   resumeRunId?: string;
+  fromNodeId?: string;
   deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void };
 }
 
@@ -65,6 +71,15 @@ function resolveNodeRecipe(node: GraphNodeSpec, recipes: Record<string, Recipe>,
   }
   const command = roleCommand(node.recipe, recipes, catalogRoles);
   return command ? { command } : {};
+}
+
+function approvalMessage(template: string, input: unknown): string {
+  if (!template.includes('{{input.version}}')) return template;
+  const version = input && typeof input === 'object' && 'version' in input ? (input as { version: unknown }).version : undefined;
+  if (typeof version !== 'string' || !/^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(version)) {
+    throw new Error('approval input.version must be a release version');
+  }
+  return template.replaceAll('{{input.version}}', version);
 }
 
 function recipesFor(path: string, recipeSource: string): Record<string, Recipe> {
@@ -218,6 +233,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   }
   const graphId = safeSegment(graph.graphId);
   if (options.resumeRunId && options.runId) throw new Error('runId and resumeRunId cannot be combined');
+  if (options.fromNodeId && !options.resumeRunId) throw new Error('--from requires --resume');
   const runId = safeSegment(options.resumeRunId ?? options.runId ?? randomUUID());
   const statePath = graphRunPath(graphId, runId, options.deps?.root ?? effectiveInstanceRoot());
   // A resume owns the run from the first state read through its last write and command.
@@ -234,7 +250,52 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   try {
   const state: GraphRunState = options.resumeRunId
     ? readGraphRun(graphId, runId, options.deps?.root ?? effectiveInstanceRoot())
-    : { graphId, runId, status: 'running', path: [], nodes: [], ...(options.input === undefined ? {} : { input: options.input }), executed: 0, dryRun: options.dryRun === true, statePath };
+    : { graphId, runId, startedAt: new Date().toISOString(), status: 'running', path: [], nodes: [], sourceHash: approvalSourceHash, ...(options.input === undefined ? {} : { input: options.input }), executed: 0, dryRun: options.dryRun === true, statePath };
+  if (options.fromNodeId) {
+    if (state.status !== 'failed' || state.pending || state.dryRun) throw new Error('--from requires a failed, non-dry run without pending approval');
+    if (!state.sourceHash || state.sourceHash !== approvalSourceHash) throw new Error('graph or recipes changed since failed run');
+    const from = state.path.indexOf(options.fromNodeId);
+    if (from < 0 || state.path.lastIndexOf(options.fromNodeId) !== from || graph.terminalNodes.includes(options.fromNodeId)) throw new Error(`--from node is not unique on the saved executable path: ${options.fromNodeId}`);
+    if (state.path.length !== state.nodes.length || state.nodes.some((record, i) => record.nodeId !== state.path[i]) ||
+      state.executed !== state.nodes.filter((record) => record.executed).length) {
+      throw new Error('saved run path and node records do not match');
+    }
+    for (let i = 0; i < state.path.length; i++) {
+      const recorded = state.nodes[i]!;
+      const spec = graph.nodes.find((node) => node.nodeId === recorded.nodeId);
+      if (!spec) throw new Error(`saved path has undeclared node: ${recorded.nodeId}`);
+      if (i > 0) {
+        const prior = state.nodes[i - 1]!;
+        const reported = lastJsonObject(prior.output)?.outcome;
+        const next = nextNode(graph.edges, prior.nodeId, prior.ok ? 'ok' : 'fail', typeof reported === 'string' ? reported : undefined);
+        if (next !== recorded.nodeId) throw new Error('saved run path does not follow graph edges');
+      } else if (recorded.nodeId !== graph.entryNode) throw new Error('saved run path does not start at entry node');
+      if (i < from && !recorded.ok) throw new Error('cannot preserve a failed predecessor when resuming');
+      const approved = resolveNodeRecipe(spec, recipes, catalogRoles).approval;
+      if (approved && i >= from) throw new Error('cannot restart across an approval decision');
+      if (approved && i < from) {
+        // A JSON state alone is not evidence of approval: require the immutable decision claim for this visit.
+        const decisionFile = `${statePath}.${i + 1}.decision.json`;
+        let decision: { nodeId?: string; decision?: string; decidedAt?: string };
+        try { decision = JSON.parse(readFileSync(decisionFile, 'utf8')); }
+        catch { throw new Error(`missing approval decision for ${recorded.nodeId}`); }
+        if (decision.nodeId !== recorded.nodeId || decision.decision !== 'approved' || decision.decidedAt !== recorded.decidedAt || !recorded.ok) {
+          throw new Error(`invalid approval decision for ${recorded.nodeId}`);
+        }
+      }
+    }
+    if (resolveNodeRecipe(graph.nodes.find((node) => node.nodeId === options.fromNodeId)!, recipes, catalogRoles).approval) {
+      throw new Error('--from cannot restart an approval node');
+    }
+    state.path = state.path.slice(0, from);
+    state.nodes = state.nodes.slice(0, from);
+    state.executed = state.nodes.filter((node) => node.executed).length;
+    state.status = 'running';
+    state.resume = { from: options.fromNodeId, at: new Date().toISOString(), previousStatus: 'failed' };
+    // Persist the restart boundary before executing it, so previous outputs remain durable.
+    persistGraphRun(state);
+    debug.log('graph.run', 'resume', { graphId, runId, from: options.fromNodeId });
+  }
   if (options.resumeRunId && state.status === 'running' && state.pending) {
     throw new Error(`run is not awaiting approval: ${graphId}/${runId}`);
   }
@@ -251,11 +312,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.resumeRunId && state.status === 'awaiting-approval' && state.approvalSourceHash !== approvalSourceHash) {
     throw new Error(`approval source changed since run was paused: ${graphId}/${runId}`);
   }
-  const persist = () => persistGraphRun(state);
+  const persist = () => {
+    if (state.status === 'done' || state.status === 'failed' || state.status === 'budget-exceeded') state.finishedAt ??= new Date().toISOString();
+    persistGraphRun(state);
+  };
   const log = options.deps?.log ?? ((event: string, data: Record<string, unknown>) => debug.log('graph.runner', event, data));
   const visits = new Map<string, number>();
   for (const nodeId of state.path) visits.set(nodeId, (visits.get(nodeId) ?? 0) + 1);
-  let current: string | undefined = state.pending?.nodeId ?? state.path.at(-1) ?? graph.entryNode;
+  let current: string | undefined = options.fromNodeId ?? state.pending?.nodeId ?? state.path.at(-1) ?? graph.entryNode;
   if (!options.resumeRunId) {
     mkdirSync(dirname(statePath), { recursive: true });
     if (readdirSync(dirname(statePath)).some((file) => file.startsWith(`${runId}.json.`) && file.endsWith('.decision.json'))) {
@@ -272,7 +336,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (!node) throw new Error(`undeclared node: ${current}`);
     const resumingPending = state.pending?.nodeId === current;
     const completed = [...state.nodes].reverse().find((recorded) => recorded.nodeId === current && recorded.executed);
-    const resumingCompleted = options.resumeRunId !== undefined && !!completed && state.path.at(-1) === current && !resumingPending;
+    const resumingCompleted = options.resumeRunId !== undefined && !options.fromNodeId && !!completed && state.path.at(-1) === current && !resumingPending;
     if (!resumingPending && !resumingCompleted && (visits.get(current) ?? 0) >= node.maxVisits) {
       state.status = 'budget-exceeded';
       log('budget-exceeded', { graphId, runId, nodeId: current });
@@ -285,17 +349,18 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const resolved = resolveNodeRecipe(node, recipes, catalogRoles);
     const command = resolved.command;
-    const approval = resolved.approval;
+    const approval = resolved.approval ? { approval: approvalMessage(resolved.approval.approval, state.input) } : undefined;
     if (resumingPending && (!approval || approval.approval !== state.pending?.message)) {
       throw new Error(`pending approval no longer matches graph: ${current}`);
     }
-    if (approval && !state.dryRun && !state.pending?.decision) {
+    // Graphs may opt into previewing the approval boundary in dry runs.
+    if (approval && (!state.dryRun || document.dry_run_await_approval === true) && !state.pending?.decision) {
       if (!state.pending) {
         state.pending = { nodeId: current, message: approval.approval, since: new Date().toISOString() };
         state.approvalSourceHash = approvalSourceHash;
       }
       state.status = 'awaiting-approval';
-      if (!state.pending.notifiedAt) {
+      if (!state.dryRun && !state.pending.notifiedAt) {
         try {
           log('approval-pending', { graphId, runId, nodeId: current, message: state.pending.message, since: state.pending.since });
           state.pending = { ...state.pending, notifiedAt: new Date().toISOString() };
@@ -308,6 +373,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       break;
     }
     state.status = 'running';
+    const startedAt = performance.now();
+    console.error(`[graph] ${current} start (0.00s)`);
+    debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: 'start', dryRun: state.dryRun });
     log('node-start', { graphId, runId, nodeId: current, visit: visits.get(current), dryRun: state.dryRun });
     persist();
     let ok = approval && !state.dryRun ? state.pending?.decision === 'approved' : true;
@@ -327,7 +395,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
         code = result.exitCode;
         return result;
       };
-      const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env: { ...process.env, ELANOUS_GRAPH_CONTEXT: contextPath } } as NodeExecContext;
+      const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env: { ...process.env, ELANOUS_GRAPH_CONTEXT: contextPath, ELANOUS_GRAPH_DIR: dirname(resolve(path)) } } as NodeExecContext;
       const result = await executeBashNode({ id: current, type: 'bash', bash: command.command, ...(command.timeout_ms ? { idle_timeout: command.timeout_ms } : {}) } as BashNode, ctx, { runBash } as WorkflowDeps);
       output = result.output;
       ok = result.ok;
@@ -341,7 +409,11 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       output = completed.output;
       error = completed.error;
     } else {
-      state.nodes.push({ nodeId: current, ok, exit, executed: !!command && !state.dryRun, ...(command && !state.dryRun ? { output } : {}), ...(error ? { error } : {}),
+      // 승인 노드도 결과를 «값»으로 남긴다 — 뒤 노드가 문맥(outputs)에서 승인 여부를 확인할 수 있게(발행 노드가 승인 없이 돌지 않도록).
+      if (approval && !state.dryRun && !command) {
+        output = JSON.stringify({ outcome: ok ? 'approved' : 'rejected', ...(state.pending?.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending?.decidedAt ?? null });
+      }
+      state.nodes.push({ nodeId: current, ok, exit, executed: !!command && !state.dryRun, ...((command || approval) && !state.dryRun && output !== undefined ? { output } : {}), ...(error ? { error } : {}),
         ...(approval && state.pending ? { ...(state.pending.decidedBy === undefined ? {} : { decidedBy: state.pending.decidedBy }), decidedAt: state.pending.decidedAt } : {}) });
     }
     if (approval) {
@@ -350,6 +422,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
     const reported = command && !state.dryRun ? lastJsonObject(resumingCompleted ? completed?.output : output)?.outcome : undefined;
     const namedOutcome = typeof reported === 'string' ? reported : undefined;
+    const seconds = Number(((performance.now() - startedAt) / 1000).toFixed(2));
+    console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
+    debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });
     log('node-end', { graphId, runId, nodeId: current, ok, exit, ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
     persist();
     if (graph.terminalNodes.includes(current)) {

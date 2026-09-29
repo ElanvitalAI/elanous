@@ -124,7 +124,8 @@ export function createCodexFetcher(opts: CodexFetcherOpts = {}): ProviderFetcher
       const usedPercent = snapshot.windows
         .filter((window) => window.model === undefined)
         .reduce<number | undefined>((max, window) => max === undefined || window.used > max ? window.used : max, undefined);
-      writeQuotaSignal(snapshot.rateLimitReached, usedPercent, opts.codexHome, opts.quotaSignalStorage);
+      writeQuotaSignal(snapshot.rateLimitReached, usedPercent, opts.codexHome, opts.quotaSignalStorage,
+        snapshot.credits ? { balance: snapshot.credits.balance, hasCredits: snapshot.credits.hasCredits } : undefined);
       return snapshot;
     },
   };

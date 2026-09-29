@@ -22,6 +22,8 @@ import type {
   NexusEvent,
 } from './types';
 
+const TASK_CARDS_PATH = '/v1/task-cards';
+
 export class NexusApiError extends Error {
   constructor(
     public readonly status: number,
@@ -80,6 +82,15 @@ export interface ModelTierPutWire {
   smartDefaults?: SmartDefaultsUserConfigWire | null;
 }
 
+export interface TaskCardWire {
+  id: string;
+  goalId: string;
+  title: string;
+  status: 'open' | 'closed';
+  createdAt: string;
+  sections: Array<{ key: string; owner: string; content: string; createdAt: string }>;
+}
+
 export interface NexusClientOpts {
   baseUrl: string;
   /** Test seam — defaults to globalThis.fetch. */
@@ -97,6 +108,8 @@ export interface NexusClient {
   getNexus(): Promise<NexusSnapshot>;
   getTabs(opts?: { kind?: NexusTabKind }): Promise<{ tabs: NexusTabState[] }>;
   getTab(id: string): Promise<{ tab: NexusTabState; recentEvents: NexusEvent[] }>;
+  getTaskCards(): Promise<{ cards: TaskCardWire[] }>;
+  getTaskCard(id: string): Promise<{ card: TaskCardWire }>;
   /** PWA mirror PR 1 — chat-backend Quick Setup snapshot. PR 2's
    *  QuickSetupCard component consumes this to mirror the TUI Settings
    *  card on mobile / iOS / remote PWA users. Cache-free; the PWA's
@@ -115,6 +128,17 @@ export interface NexusClient {
   getTemplates(): Promise<{ templates: TemplateSummary[] }>;
   getTemplate(name: string): Promise<{ template: NexusTemplate }>;
   saveTemplate(body: SaveTemplateBody): Promise<{ saved: true; name: string; path?: string }>;
+  // ---- plugins market (daemon-verified, read-only) ----
+  getPluginsIndex(): Promise<MarketIndexResponse>;
+  getInstalledPlugins(): Promise<InstalledPluginWire[]>;
+  // ---- harness execution graphs (core read-only · mine editable) ----
+  getRunGraphs(): Promise<{ graphs: RunGraphSummary[] }>;
+  getRunGraph(id: string): Promise<RunGraphDetail>;
+  getRunGraphYaml(id: string): Promise<{ id: string; source: 'core' | 'mine'; editable: boolean; yaml: string }>;
+  putRunGraphYaml(id: string, yaml: string): Promise<{ id: string; source: 'mine'; editable: true; saved: true }>;
+  cloneRunGraph(id: string, newId: string): Promise<{ id: string; source: 'mine'; editable: true; clonedFrom: string }>;
+  getGraphKinds(graph: 'workflow' | 'harness'): Promise<{ kinds: GraphKindEntry[] }>;
+  validateGraph(graph: 'workflow' | 'harness', yaml: string): Promise<GraphValidationResponse>;
   // ---- workflows (Archon-port T2.3) ----
   getWorkflows(): Promise<{ workflows: WorkflowSummary[] }>;
   getWorkflow(name: string): Promise<WorkflowDetail>;
@@ -207,6 +231,33 @@ export interface NexusClient {
   getWorktrees(): Promise<WorktreesResponse>;
   /** B4 — craft-rulebook verdict for the daemon's active repository. */
   getDesignCheck(): Promise<DesignCheckResponse>;
+  /** Live 탭 — 런 원장. */
+  getHarnessRuns(): Promise<HarnessRunsResponse>;
+  /** Live 탭 — 로그 조회(최신순). `store` 는 다른 인스턴스 읽기 전용. */
+  getLogs(query: LogsQuery): Promise<LogsResponse>;
+  /** Live 탭 — 로그 저장소가 있는 인스턴스 목록. */
+  getLogInstances(): Promise<LogInstancesResponse>;
+  /** Live 탭 MAX — 하니스 상세 계측 스위치(🅢 #21452 · 소유자 토큰). */
+  getLiveDetail(): Promise<LiveDetailState>;
+  /** Live 탭 SHIPPED — GitHub 병합 PR 수(🅢 09-28 ① · 우주와 무관). 못 셌으면 `merged: null` ⊕ 이유. */
+  getLiveShipped(since: string): Promise<LiveShippedResponse>;
+  /** Trace 탭 — 판단 사슬(🅣 #21590 `GET /v1/trace`). 서버가 여러 우주를 모아 사슬·사실(PR·커밋·화면)을 붙여 준다. */
+  getTrace(query: TraceQuery): Promise<TraceResponse>;
+  /** Trace L4 — 로그 한 줄 원문(비밀 가림 · `ref = log:<우주>:<id>`). */
+  getTraceEvidence(ref: string): Promise<TraceEvidenceResponse>;
+  /** Live 탭 런 서랍 — 그 런의 화면 끝부분(`self screen --run` 과 같은 해석). */
+  getRunScreen(runId: string, lines?: number): Promise<RunScreenResponse>;
+  /** 하니스 런 멈춤(부드러운 멈춤 · 화면 키 = spaceId). */
+  stopHarness(spaceId: string): Promise<{ stopped?: string; error?: string }>;
+  setLiveDetail(body: { scope: string; ttlMin: number; by?: string }): Promise<LiveDetailState>;
+  /** RFC design loop §B — write the chosen direction into the same repository
+   *  the design check reads (owner auth; same function as the CLI `--set`). */
+  setDesignDirection(id: string): Promise<SetDesignDirectionResponse>;
+  /** POST /v1/design-system — make a library system from a URL or a palette. */
+  createDesignSystem(body: CreateDesignSystemBody): Promise<CreateDesignSystemResponse>;
+  /** RFC design loop §A2 — HTML previews under the design-check repository. */
+  listDesignPreviews(): Promise<DesignPreviewsResponse>;
+  getDesignPreview(system: string): Promise<DesignPreviewDocument>;
   /** HANDOFF §4.2 — GUI cleanup for worktrees + orphan sessions.
    *  Posts the path of a non-main worktree (or an orphaned session's
    *  worktreePath) to remove it. `force` runs `git worktree remove
@@ -247,6 +298,55 @@ export interface SaveTemplateBody {
   description?: string;
   fromRegistry?: boolean;
   tabs?: NexusTemplate['tabs'];
+}
+
+export interface GraphKindEntry {
+  graph: 'workflow' | 'harness';
+  kind: string;
+  plugin?: string | null;
+  description: string;
+  schema?: Record<string, unknown>;
+  core: boolean;
+}
+
+export interface GraphValidationResponse {
+  ok: boolean;
+  errors: Array<{ message: string; path?: string }>;
+  ignoredKeys: string[];
+}
+
+export interface MarketPluginWire {
+  name: string;
+  version: string;
+  description?: string;
+  category?: string;
+  capabilities: string[];
+  connectors: Array<{ id: string; kind: string; userConfig: Array<{ key: string; label: string; secret: boolean }> }>;
+  graphs?: string[];
+  pricing: { model: 'free' | 'one-time' | 'subscription'; amount?: number; currency?: string; period?: string };
+  sha256: string;
+}
+export interface MarketIndexResponse {
+  markets: Array<{ name: string; signature: 'ok' | 'missing' | 'unknown-key' | 'malformed' | 'stale'; detail?: string; plugins: MarketPluginWire[] }>;
+}
+export interface InstalledPluginWire { name: string; version: string; market: string; path: string; sha256: string | null; installedAt?: string }
+
+// F-M1 — server-authoritative core graph snapshot; no mutation endpoints.
+export interface RunGraphSummary {
+  id: string;
+  source: 'core' | 'mine';
+  editable: boolean;
+  nodeCount: number;
+}
+
+export interface RunGraphDetail {
+  id: string;
+  source: 'core' | 'mine';
+  editable: boolean;
+  entry_node: string;
+  terminal_nodes: string[];
+  nodes: Array<{ node_id: string; kind: string; recipe: string; max_visits: number }>;
+  edges: Array<{ from: string; to?: string; on?: string; map?: Record<string, string> }>;
 }
 
 // Archon-port T2.3 wire format — PWA `/workflows` (T2A) consumes these.
@@ -676,6 +776,8 @@ export interface WorktreesResponse {
 export interface DesignCheckOk {
   ok: true;
   repoRoot: string;
+  /** Where the daemon found the repository: `harness.defaultRepo` or its own cwd. */
+  repoSource?: 'config' | 'cwd' | null;
   documentPath: string;
   craftDirectory: string;
   /** Every rulebook elanous ships — lets the panel show "available but not
@@ -708,7 +810,85 @@ export interface DesignDirectionView {
   mood: string;
   isDark: boolean;
   isPastel: boolean;
-  swatch: { text: string; accent: string; muted: string };
+  swatch: { text: string; accent: string; muted: string; bg?: string; fg?: string };
+  /** RFC design loop §B — optional so an older daemon still parses. */
+  label?: string;
+  source?: 'theme' | 'document' | 'design-system';
+  typography?: { display: string | null; body: string | null } | null;
+  category?: string | null;
+}
+
+// Live 탭(2026-09-28 · 내부 문서 `PLAN-live-signals-tab-teaser-and-web-2026-09-28`) — 기존 끝점만 모은다.
+// GET /v1/harness/runs · GET /v1/logs · GET /v1/logs/instances. 새 필드는 전부 선택적(옛 데몬 호환).
+export interface HarnessRunEntry {
+  runId: string;
+  status: string;
+  lifecycle?: string;
+  lastActivityTimestamp?: string | null;
+  lastPhase?: string | null;
+}
+export interface HarnessRunsResponse {
+  entries: HarnessRunEntry[];
+  counts?: Record<string, number>;
+  total?: number;
+}
+export interface LogRow {
+  id?: number;
+  ts: string;
+  level?: string;
+  instance?: string;
+  surface?: string;
+  category: string;
+  event: string;
+  data?: Record<string, unknown> | null;
+}
+export interface LogsResponse { ok: boolean; logs: LogRow[]; count: number; ts?: string }
+export interface LogInstance { name: string; alive?: boolean; dbExists?: boolean; current?: boolean }
+export interface LogInstancesResponse { ok: boolean; self?: string; instances: LogInstance[] }
+export interface TraceQuery { level: 'L0' | 'L1' | 'L2' | 'L3'; runId?: string; store?: string; limit?: number; kind?: string; q?: string; from?: number }
+export interface TraceEventWire {
+  id: string; ts: string; universe: string; runId?: string; parentRunId?: string; phase?: string; kind: string;
+  what: string; why?: string; purpose?: string; target?: string; paths?: number | string[];
+  refs: { pr?: string | number; commit?: string; logId: string; screen?: string; llmRequestId?: string };
+}
+export interface TraceNodeWire { id: string; level: string; label: string; count: number; universe?: string; runId?: string; firstTs?: string; lastTs?: string }
+export interface TraceResponse { ok: boolean; nodes?: TraceNodeWire[]; edges?: Array<{ source: string; target: string; kind: string }>; events: TraceEventWire[]; truncated: boolean; stores?: string[]; failedStores?: Array<{ name: string; reason: string }> }
+export interface TraceEvidenceResponse { ok: boolean; ref: string; evidence?: { ts: string; instance: string; category: string; event: string; data: unknown } }
+export interface LiveShippedResponse { merged: number | null; since: string; repo?: string; source?: string; reason?: string; cached?: boolean }
+export interface RunScreenResponse { runId: string; screenKey: string | null; text: string | null; stoppable: boolean; outcome?: 'complete' | 'incomplete' | null; reason?: string; lastEvent?: { category: string; event: string; timestamp: string } | null }
+export interface LiveDetailState { on: boolean; scope?: string | null; since?: string | null; until?: string | null; remainingMs?: number | null }
+export interface LogsQuery { category?: string; since?: string; limit?: number; store?: string; event?: string }
+
+// RFC design loop §B — POST /v1/design-direction wire format. Mirrors
+// `src/nexus/api/design-check.ts:handleDesignDirectionPost`. A refusal comes
+// back as a NexusApiError whose body carries `reason`.
+export type SetDesignDirectionResponse = {
+  ok: true;
+  documentPath: string;
+  direction: string;
+  repoRoot?: string;
+  repoSource?: 'config' | 'cwd' | null;
+};
+
+/** POST /v1/design-system. Mirrors `handleDesignSystemCreate`. */
+export type CreateDesignSystemBody =
+  | { kind: 'url'; url: string; id?: string; name?: string; base?: string }
+  | { kind: 'palette'; colors: string[]; id: string; name?: string; base?: string };
+
+export interface CreatedDesignSystemToken {
+  token: string;
+  value: string;
+  from: string;
+}
+
+export interface CreateDesignSystemResponse {
+  ok: true;
+  id: string;
+  dir: string;
+  tokens: CreatedDesignSystemToken[];
+  unread: number;
+  warnings: string[];
+  extractDir?: string;
 }
 export interface DesignCheckBlocked {
   ok: false;
@@ -720,6 +900,23 @@ export interface DesignCheckBlocked {
   exitCode: 1;
 }
 export type DesignCheckResponse = DesignCheckOk | DesignCheckBlocked;
+
+/** GET /v1/design-previews. New fields stay optional so an older daemon still parses. */
+export interface DesignPreviewEntry {
+  system: string;
+  bytes?: number;
+  modifiedAt?: string;
+}
+export interface DesignPreviewsResponse {
+  repoRoot?: string | null;
+  repoSource?: 'config' | 'cwd' | null;
+  previews: DesignPreviewEntry[];
+}
+/** GET /v1/design-previews/<system>. */
+export interface DesignPreviewDocument {
+  system: string;
+  html: string;
+}
 
 // HANDOFF §4.2 — POST /v1/worktrees/dispose wire format. Mirrors
 // `src/nexus/api/worktrees.ts:DisposeWorktreeRequest/Response`.
@@ -923,6 +1120,8 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
       return request<{ tabs: NexusTabState[] }>('GET', `/v1/nexus/tabs${q}`);
     },
     getTab: (id) => request('GET', `/v1/nexus/tabs/${encodeURIComponent(id)}`),
+    getTaskCards: () => request('GET', TASK_CARDS_PATH),
+    getTaskCard: (id) => request('GET', `${TASK_CARDS_PATH}/${encodeURIComponent(id)}`),
     getChatBackendDetection: () => request<ChatBackendDetection>('GET', '/v1/nexus/chat-backend-detection'),
     mintConnectToken: () => request<MintConnectToken>('POST', '/v1/nexus/connect-info/mint-token', {}),
     // ---- tabs mutation ----
@@ -942,6 +1141,24 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getTemplates: () => request('GET', '/v1/nexus/templates'),
     getTemplate: (name) => request('GET', `/v1/nexus/templates/${encodeURIComponent(name)}`),
     saveTemplate: (body) => request('POST', '/v1/nexus/templates', body),
+    getPluginsIndex: () => request('GET', '/v1/plugins/index'),
+    getInstalledPlugins: () => request('GET', '/v1/plugins'),
+    getRunGraphs: () => request('GET', '/v1/graphs'),
+    getRunGraph: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}`),
+    getRunGraphYaml: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/yaml`),
+    putRunGraphYaml: (id, yaml) => request('PUT', `/v1/graphs/${encodeURIComponent(id)}/yaml`, { yaml }),
+    cloneRunGraph: (id, newId) => request('POST', `/v1/graphs/${encodeURIComponent(id)}/clone`, { newId }),
+    getGraphKinds: (graph) => request('GET', `/v1/graph/kinds?graph=${graph}`),
+    validateGraph: async (graph, yaml) => {
+      try {
+        return await request<GraphValidationResponse>('POST', '/v1/graphs/validate', { graph, yaml });
+      } catch (error) {
+        if (error instanceof NexusApiError && error.status === 422 && error.body && typeof error.body === 'object' && 'ok' in error.body) {
+          return error.body as GraphValidationResponse;
+        }
+        throw error;
+      }
+    },
     // ---- workflows (Archon-port T2.3) ----
     getWorkflows: () => request('GET', '/v1/workflows'),
     getWorkflow: (name) => request('GET', `/v1/workflows/${encodeURIComponent(name)}`),
@@ -1003,6 +1220,34 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     getRegistryCatalog: () => request<RegistryCatalogResponse>('GET', '/v1/registry/catalog'),
     getWorktrees: () => request('GET', '/v1/worktrees'),
     getDesignCheck: () => request('GET', '/v1/design-check'),
+    getHarnessRuns: () => request('GET', '/v1/harness/runs'),
+    getLogs: (query) => {
+      const q = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') q.set(k, String(v));
+      return request('GET', `/v1/logs?${q.toString()}`);
+    },
+    getLogInstances: () => request('GET', '/v1/logs/instances'),
+    getLiveDetail: () => request('GET', '/v1/live/detail'),
+    getTrace: (q) => {
+      const p = new URLSearchParams({ level: q.level });
+      if (q.runId) p.set('runId', q.runId);
+      if (q.store) p.set('store', q.store);
+      if (q.limit) p.set('limit', String(q.limit));
+      if (q.kind) p.set('kind', q.kind);
+      if (q.q) p.set('q', q.q);
+      if (q.from) p.set('from', new Date(q.from).toISOString());
+      return request('GET', `/v1/trace?${p}`);
+    },
+    // ⛔ ref 를 다시 인코딩하지 않는다 — 서버가 우주 이름을 이미 인코딩해 실었고, 라우트는 날 pathname 을 `^log:` 로 읽는다.
+    getTraceEvidence: (ref) => request('GET', `/v1/trace/evidence/${ref}`),
+    getLiveShipped: (since) => request('GET', `/v1/live/shipped?since=${encodeURIComponent(since)}`),
+    getRunScreen: (runId, lines = 60) => request('GET', `/v1/harness/run-screen?runId=${encodeURIComponent(runId)}&lines=${lines}`),
+    stopHarness: (spaceId) => request('POST', '/v1/harness/stop', { spaceId }),
+    setLiveDetail: (body) => request('POST', '/v1/live/detail', body),
+    setDesignDirection: (id) => request('POST', '/v1/design-direction', { id }),
+    createDesignSystem: (body) => request('POST', '/v1/design-system', body),
+    listDesignPreviews: () => request('GET', '/v1/design-previews'),
+    getDesignPreview: (system) => request('GET', `/v1/design-previews/${encodeURIComponent(system)}`),
     disposeWorktree: (body) => request('POST', '/v1/worktrees/dispose', body),
     // ---- log streaming ----
     getLogsTail: (id, lopts) => {

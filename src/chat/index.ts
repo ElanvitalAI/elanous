@@ -413,12 +413,13 @@ export interface SlashCommand {
 
 // Default commands available in the input
 export const SLASH_COMMANDS: SlashCommand[] = [
+  { name: 'directive', aliases: [], description: 'Record a directive as a Linear issue' },
   { name: 'run-skill', aliases: ['rs', 'run'], description: 'Execute a skill via its SKILL.md prompt' },
   { name: 'ad', aliases: [], description: 'Create an advertising plan from a URL, brief, or attached image' },
   // B4 — craft rulebook verdict, same resolution as `elanous repo design-check`
   //   and the PWA `/design-check` panel. Listed (not baselined as hidden) on
   //   purpose: a surface nobody can discover is not a surface.
-  { name: 'design',    aliases: ['design-check'], description: 'Craft rulebooks — 이 저장소 DESIGN.md 가 선언한 규칙집 · 못 찾은 것 · elanous 가 주는데 선언 안 된 것. /design [--declared]', subcommands: ['--declared'] },
+  { name: 'design',    aliases: ['design-check'], description: 'Craft rulebooks — 이 저장소 DESIGN.md 가 선언한 규칙집 · 못 찾은 것 · elanous 가 주는데 선언 안 된 것. /design [--declared] · /design pick [번호|id] 디자인 방향 선택', subcommands: ['--declared', 'pick'] },
   { name: 'provider',  aliases: ['p'],          description: 'LLM providers — /provider (list) · next (cycle, also Alt+M / pill click) · use <name> · pick (visual picker) · reset', subcommands: ['next', 'use', 'pick', 'picker', 'menu', 'reset', 'list'] },
   { name: 'reasoning', aliases: ['r', 'think'],  description: 'Reasoning level (codex effort + summary, anthropic extended-thinking budget) — /reasoning [off|low|medium|high|xhigh] (cycle when no arg · xhigh 는 모델 상한이 xhigh 이상일 때만 wire 에 실린다, 아니면 high 로 깎인다)', subcommands: ['off', 'low', 'medium', 'high', 'xhigh'] },
   { name: 'model',     aliases: ['m'],           description: 'Switch active model — /model <codex|terra|sol|luna|opus|sonnet|grok> (list + current when no arg). OpenAI 는 Codex(Responses API)만. effort 는 /reasoning.', subcommands: ['codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },

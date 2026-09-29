@@ -2,10 +2,9 @@
 //
 // Wraps a Shell Runner ShellHandle (mode='vw' · runner-label-bound
 // PreviewTerminal) as a Pane. Phase 1 scope is a thin structural
-// wrapper; the actual external-terminal rendering already lives in
-// src/shell-runner/external-terminal-pane.ts (the NT-C1b component).
-// This class merely exposes the Pane contract over that existing
-// runtime — describe() exposes the runner label, snapshot() calls
+// wrapper over the ShellHandle. The retired VW PaneContent adapter is
+// not used by this Pane contract — describe() exposes the runner label,
+// snapshot() calls
 // into the Shell Runner's bookmark/renderForLLM, and addTap('raw')
 // subscribes to the engine chunk stream.
 //

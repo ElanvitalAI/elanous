@@ -12,13 +12,6 @@ describe('createCompactSurfaceRuntime', () => {
       openBrowserPreviewModal: () => {},
       openDashboardPaneModal: () => {},
       openCompanionPopup: () => {},
-      spawnBrowserVirtualWindow: () => {},
-      spawnPreviewVirtualWindow: () => {},
-      spawnBrowserPreviewVirtualWindow: () => {},
-      spawnScratchVirtualWindow: () => {},
-      spawnSimVirtualWindow: () => {},
-      currentVirtualWindowId: () => null,
-      openVwCompanion: () => {},
     });
 
     expect(runtime.buildTargets().map((item) => item.id)).toEqual([
@@ -30,10 +23,6 @@ describe('createCompactSurfaceRuntime', () => {
       'companion:clipboard',
       'companion:memo',
       'companion:detail',
-      'vw:browser-preview',
-      'vw:sim',
-      'vw:browser',
-      'vw:preview',
     ]);
   });
 
@@ -51,13 +40,6 @@ describe('createCompactSurfaceRuntime', () => {
       openBrowserPreviewModal: () => calls.push('pane:browser-preview'),
       openDashboardPaneModal: (pane) => calls.push(`pane:${pane}`),
       openCompanionPopup: (key) => calls.push(`companion:${key}`),
-      spawnBrowserVirtualWindow: () => calls.push('vw:browser'),
-      spawnPreviewVirtualWindow: () => calls.push('vw:preview'),
-      spawnBrowserPreviewVirtualWindow: () => calls.push('vw:browser-preview'),
-      spawnScratchVirtualWindow: () => calls.push('vw:scratch'),
-      spawnSimVirtualWindow: () => calls.push('vw:sim'),
-      currentVirtualWindowId: () => 7,
-      openVwCompanion: (windowId, key) => calls.push(`vw-companion:${windowId}:${key}`),
       onWarning: (message) => calls.push(`warn:${message}`),
     });
 
@@ -71,9 +53,9 @@ describe('createCompactSurfaceRuntime', () => {
       'reopen:browser',
       'focus:browser',
       'companion:memo',
-      'vw-companion:7:detail',
-      'vw:sim',
-      'vw:preview',
+      'warn:unsupported dashboard surface: vw-companion:detail',
+      'warn:unsupported dashboard surface: vw:sim',
+      'warn:unsupported dashboard surface: vw:preview',
     ]);
   });
 });

@@ -23,6 +23,7 @@ import { spawnSync as defaultSpawnSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 import { readNexusRuntime, type NexusRuntimeMeta } from '../nexus/runtime.js';
 
 export interface IosBindOpts {
@@ -58,8 +59,6 @@ export interface IosBindOpts {
   readTokenFn?: () => string | null;
   /** Test seam — host fallback (production daily driver 의 default). */
   hostFallback?: string;
-  /** Test seam — port fallback. */
-  portFallback?: number;
 }
 
 export interface IosBindResult {
@@ -79,7 +78,6 @@ export interface IosBindResult {
 
 const DEFAULT_BUNDLE_ID = 'com.elanvitalai.elanous.ios';
 const DEFAULT_HOST_FALLBACK = 'localhost';
-const DEFAULT_PORT_FALLBACK = 31415;
 
 /** `~/.elanous/acp-token` 읽기. 부재 시 null. */
 function defaultReadToken(): string | null {
@@ -120,18 +118,33 @@ export function runNexusIosBind(opts: IosBindOpts = {}): IosBindResult {
   const readRuntime = opts.readRuntimeFn ?? readNexusRuntime;
   const readToken = opts.readTokenFn ?? defaultReadToken;
   const hostFallback = opts.hostFallback ?? DEFAULT_HOST_FALLBACK;
-  const portFallback = opts.portFallback ?? DEFAULT_PORT_FALLBACK;
   const dryRun = opts.dryRun ?? false;
 
   // 1) daemon 현재 host/port — override 가 우선 · 없으면 runtime sidecar ·
-  //    그것도 없으면 fallback (localhost:31415).
+  //    port 가 없으면 현재 우주의 daemon endpoint 를 조회한다.
   // daemon httpHost 가 `0.0.0.0` (모든 interface bind) 이면 simulator 입장에서
   // connect 가능한 loopback alias 로 치환. iOS simulator 는 host Mac 의 stack
   // 공유 → `localhost` / `127.0.0.1` 두 alias 모두 OK.
   const runtime = readRuntime();
-  const rawHost = opts.hostOverride ?? runtime?.httpHost ?? hostFallback;
+  const endpoint = opts.portOverride === undefined && runtime?.httpPort === undefined
+    ? resolveDaemonEndpoint()
+    : null;
+  const endpointUrl = endpoint ? new URL(endpoint.baseUrl) : null;
+  const resolvedPort = endpointUrl?.port ? Number(endpointUrl.port) : undefined;
+  const port = opts.portOverride ?? runtime?.httpPort ?? resolvedPort;
+  const rawHost = opts.hostOverride ?? runtime?.httpHost ?? endpointUrl?.hostname ?? hostFallback;
   const host = (rawHost === '0.0.0.0' || rawHost === '::') ? hostFallback : rawHost;
-  const port = opts.portOverride ?? runtime?.httpPort ?? portFallback;
+  if (port === undefined) {
+    return {
+      ok: false,
+      message: 'elanous nexus ios-bind: 데몬 주소를 모른다 — 데몬을 먼저 띄워라 (`elanous nexus run`)',
+      host,
+      port: 0,
+      tokenInjected: false,
+      tokenLength: 0,
+      bundleId,
+    };
+  }
 
   // 2) Token (선택)
   const tokenRaw = opts.noToken ? null : readToken();

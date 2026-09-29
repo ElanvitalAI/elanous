@@ -9,6 +9,7 @@ import { ToastProvider } from '@/components/providers/ToastProvider';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { AppShell } from '@/components/shell/AppShell';
 import { ServiceWorkerRegister } from '@/components/providers/ServiceWorkerRegister';
+import { NewBuildBanner } from '@/components/providers/NewBuildBanner';
 
 const geist = Geist({ subsets: ['latin'], variable: '--font-sans' });
 
@@ -47,6 +48,7 @@ export default function RootLayout({
       </head>
       <body className="min-h-screen bg-background text-foreground antialiased">
         <ServiceWorkerRegister />
+        <NewBuildBanner />
         <DaemonProvider>
           <NexusClientProvider>
             <ThemeProvider>

@@ -16,6 +16,7 @@ import { resolveGrokCredential } from '../grok/credential.js';
 import { getOpenRouterApiKey } from '../config.js';
 import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { loadTokens } from '../oauth/store.js';
+import { envLiteral } from '../platform/env-literal.js';
 import { describeResetCreditExpiry } from './codex-reset-credit-state.js';
 import { listCodexResetCredits, type CodexResetCreditsResult } from './codex-reset-credits.js';
 import type {
@@ -173,7 +174,7 @@ async function collectResetCreditExpiry(
   warningWindowMs: number | undefined,
   nowMs: number,
 ): Promise<ResetCreditExpiryAxis> {
-  const listed = await listResetCredits(home ? { env: { CODEX_HOME: home } } : {});
+  const listed = await listResetCredits(home ? { env: envLiteral({ CODEX_HOME: home }) } : {});
   if (!listed.ok) return { status: 'unavailable', detail: listed.kind };
   return describeResetCreditExpiry(listed.value.credits, warningWindowMs, nowMs);
 }

@@ -1,7 +1,6 @@
 import { expect, test } from 'bun:test';
 import { ptyWebAddress, resolvePtyWebAddress, formatPtyWebAddress } from './pty-web-address.js';
-import { runPtyList, type PtyTakeoverCommandDeps } from './pty-takeover-cli.js';
-import type { PtyManifestRow } from '../pty-shell/pty-manifest.js';
+import type { PwaInstanceListing } from './pwa-registry.js';
 
 const id = 'codex_12345678';
 const tailnet = { status: 'registered' as const, loopback: 'http://127.0.0.1:31415/app/', url: 'https://host.ts.net/app/', source: 'tailnet' as const };
@@ -13,27 +12,34 @@ test('tailnet resolution uses the selected URL for a direct PTY link', () => {
 });
 
 test('unavailable resolution and a throwing resolver return null URLs with a named reason', () => {
-  expect(resolvePtyWebAddress(id, () => ({ status: 'absent', reason: 'daemon-absent' })))
-    .toEqual({ webUrl: null, webUrlSource: null, pwaUnavailableReason: 'daemon-absent' });
+  expect(resolvePtyWebAddress(id, () => ({ status: 'absent', reason: 'daemon-absent' }), {
+    listFn: () => [],
+    lifecycleFn: () => null,
+    productionRootFn: () => '/production/empty',
+  })).toEqual({ webUrl: null, webUrlSource: null, pwaUnavailableReason: 'daemon-absent' });
   expect(resolvePtyWebAddress(id, () => { throw new Error('registry unavailable'); }))
     .toEqual({ webUrl: null, webUrlSource: null, pwaUnavailableReason: 'pwa-query-failed' });
 });
 
-test('shared address matches existing pty list --json webUrl', () => {
-  const row = {
-    id, kind: 'codex', cmd: 'codex', ownerPid: 1, ptyPid: 0, instance: 'test', startedAt: 1,
-    alive: true, exitCode: null, snapshot: '', snapshotAt: 0, outputBytesTotal: 0, updatedAt: 1, frame: '', frameAt: 0,
-    runId: '', runIdSource: '', spaceId: '', sessionId: '', parentPtyId: '', parentPid: 0, parentKind: '', closedAt: 0, codeSha: '',
-  } as PtyManifestRow;
-  const dbPath = '/test/pty/manifest.db';
-  const deps = {
-    getPty: () => undefined, requestPtyTakeover: () => false, requestRemote: async () => ({ status: 'unknown-pty' as const }),
-    isProcessAlive: () => true, now: () => 2,
-    currentManifestDbPath: () => dbPath, manifestTargets: () => [{ name: 'test', dbPath }], listManifestRowsAt: () => [row],
-    resolveNexusPwa: () => tailnet, resolveWorktreeProvenance: () => ({ known: false as const, provenanceReason: 'workdir-not-recorded' as const }),
-    log: () => {},
-  } satisfies PtyTakeoverCommandDeps;
-  const listed = JSON.parse(runPtyList(deps, { json: true }).message);
-  expect(listed[0].webUrl).toBe(ptyWebAddress(id, tailnet).webUrl);
-  expect(listed[0].webUrl).toBe(resolvePtyWebAddress(id, () => tailnet).webUrl);
+test('watch link uses the production daemon when this universe is daemon-absent', () => {
+  const productionRoot = '/production/elanous';
+  const address = resolvePtyWebAddress('pty-1', () => ({ status: 'absent', reason: 'daemon-absent' }), {
+    cwd: '/isolated/project',
+    nexusRootFn: () => '/isolated/nexus',
+    listForCwdFn: (cwd) => cwd === productionRoot ? [{ cwd: productionRoot, ports: [4455] } as PwaInstanceListing] : [],
+    lifecycleFn: () => null,
+    productionRootFn: () => productionRoot,
+  });
+  const formatted = formatPtyWebAddress(address);
+  expect(formatted.startsWith('http://127.0.0.1:4455/')).toBe(true);
+  expect(formatted).toContain('production daemon');
+  expect(formatted).not.toContain('web unavailable');
+  expect(formatted).not.toContain('web-unavailable');
+});
+
+test('shared address matches the resolver-selected PTY link', () => {
+  const selected = ptyWebAddress(id, tailnet);
+  expect(selected.webUrl).toBe('https://host.ts.net/app/term?pty=codex_12345678');
+  expect(resolvePtyWebAddress(id, () => tailnet)).toEqual(selected);
+  expect(formatPtyWebAddress(selected)).toBe('https://host.ts.net/app/term?pty=codex_12345678 (tailnet)');
 });

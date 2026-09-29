@@ -427,7 +427,7 @@ export type InitialTerminalSelectionResult = InitialTerminalSelection | NoInitia
 
 type InitialTerminalSelectionInput = {
   storedId: string | null;
-  terminals: readonly Pick<DaemonTerminalSummary, 'id' | 'alive'>[];
+  terminals: readonly (Pick<DaemonTerminalSummary, 'id' | 'alive'> & { cmd?: string })[];
 };
 
 type InitialTerminalSelectionWithFallbackInput = InitialTerminalSelectionInput & {
@@ -457,7 +457,11 @@ export function initialTerminalSelection(input: InitialTerminalSelectionWithoutF
   if (stored) return { terminalId: stored, reason: 'stored' };
   // ⛔ 목록 순서를 «그대로» 쓴다 — 서버가 정한 순서를 클라이언트가 다시 정렬하면
   //   두 자가 갈리고, 「왜 이것이 첫째인가」를 서버에 물을 수 없게 된다.
-  const live = input.terminals.find((terminal) => terminal.alive === true);
+  // ⛔ 터미널 탭은 «웹 셸»에만 붙는다 — 에이전트 PTY(codex_·self_·pty_…)를 고르면 XtermView 의
+  //   `terminal/spawn` 이 그 id 로 «새 셸»을 만들어 에이전트 행과 이름이 겹친다(대표 2026-09-28 실측:
+  //   그 뒤 `?pty=` 가 «2개 행과 맞아» 선택을 거부했다). 에이전트 PTY 는 PTY 목록·라이브·나란히가 보여 준다.
+  //   08-17 의 동기(«지어낸 preview-1» 금지)는 이제 데몬이 이름을 발급하므로 폴백 쪽이 맡는다.
+  const live = input.terminals.find((terminal) => terminal.alive === true && terminal.cmd === 'web-terminal');
   if (live) return { terminalId: live.id, reason: 'live-pty' };
   if (input.fallbackId !== undefined && input.fallbackId !== null) {
     return { terminalId: input.fallbackId, reason: 'fallback' };

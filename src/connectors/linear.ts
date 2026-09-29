@@ -1,5 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { debug } from '../debug/log.js';
+import { EventLedger } from './event-ledger.js';
 import type { ExternalTaskEvent, TaskConnector } from './types.js';
 
 export function verifyLinearWebhook({ rawBody, signature, secret, now = Date.now(), toleranceMs = 60_000 }: {
@@ -27,6 +28,8 @@ export function verifyLinearWebhook({ rawBody, signature, secret, now = Date.now
   return { ok: true };
 }
 
+const PRIORITY_RANK: Record<NonNullable<ExternalTaskEvent['priority']> | 'none', number> = { urgent: 0, high: 1, medium: 2, none: 2, low: 3 };
+
 function priorityOf(value: unknown): ExternalTaskEvent['priority'] {
   switch (value) {
     case 1: return 'urgent';
@@ -47,21 +50,26 @@ function asIssue(value: unknown): { id: string; identifier: string; title: strin
   return issue as ReturnType<typeof asIssue>;
 }
 
-export function parseLinearWebhook(body: unknown, deliveryId: string): ExternalTaskEvent | null {
+export function isLinearProjectionEcho(event: ExternalTaskEvent, ledger: EventLedger): boolean {
+  return event.provider === 'linear' && ledger.seenOutgoingChange('linear', event.ref, event.occurredAt);
+}
+
+export function parseLinearWebhook(body: unknown, deliveryId: string, ledger?: EventLedger): ExternalTaskEvent | null {
   if (!deliveryId || !body || typeof body !== 'object') return null;
   const payload = body as Record<string, unknown>;
   if (payload.type !== 'Issue' || (payload.action !== 'create' && payload.action !== 'update')) return null;
   const issue = asIssue(payload.data);
   if (!issue) return null;
-  return {
+  const event: ExternalTaskEvent = {
     provider: 'linear', eventId: deliveryId, kind: payload.action === 'create' ? 'created' : 'updated',
     ref: issue.id, identifier: issue.identifier, title: issue.title, body: issue.description ?? '',
     url: issue.url ?? '', priority: priorityOf(issue.priority), occurredAt: issue.updatedAt,
   };
+  return isLinearProjectionEcho(event, ledger ?? new EventLedger()) ? null : event;
 }
 
-export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, since, fetch: fetchFn = fetch }: {
-  apiKey: string; teamKey: string; labelOrPrefix?: string; since?: string; fetch?: typeof fetch;
+export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, since, fetch: fetchFn = fetch, ledger }: {
+  apiKey: string; teamKey: string; labelOrPrefix?: string; since?: string; fetch?: typeof fetch; ledger?: EventLedger;
 }): Promise<ExternalTaskEvent[]> {
   const query = `query ConnectorIssues($teamKey: String!, $after: String) {
     issues(filter: { team: { key: { eq: $teamKey } } }, first: 100, after: $after) {
@@ -70,6 +78,7 @@ export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, since,
     }
   }`;
   const events: ExternalTaskEvent[] = [];
+  const echoLedger = ledger ?? new EventLedger();
   let after: string | null = null;
   const cursors = new Set<string>();
   do {
@@ -99,16 +108,18 @@ export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, since,
           ['completed', 'canceled', 'duplicate'].includes((node.state as { type?: string } | undefined)?.type ?? '')) continue;
       if (labelOrPrefix && !issue.title.startsWith(labelOrPrefix) &&
           !(node.labels as { nodes?: Array<{ name: string }> } | undefined)?.nodes?.some(label => label.name === labelOrPrefix)) continue;
-      events.push({ provider: 'linear', eventId: `${issue.id}:${issue.updatedAt}`, kind: 'updated',
+      const event: ExternalTaskEvent = { provider: 'linear', eventId: `${issue.id}:${issue.updatedAt}`, kind: 'updated',
         ref: issue.id, identifier: issue.identifier, title: issue.title, body: issue.description ?? '',
-        url: issue.url ?? '', priority: priorityOf(issue.priority), occurredAt: issue.updatedAt });
+        url: issue.url ?? '', priority: priorityOf(issue.priority), occurredAt: issue.updatedAt };
+      if (!isLinearProjectionEcho(event, echoLedger)) events.push(event);
     }
     const page = result.data.issues.pageInfo;
     if (page?.hasNextPage && (!page.endCursor || cursors.has(page.endCursor))) throw new Error('Linear GraphQL pagination cursor missing or repeated');
     after = page?.hasNextPage ? page.endCursor : null;
     if (after) cursors.add(after);
   } while (after);
-  return events;
+  // Tasks tie-break on creation order and Urgent maps to high, so an Urgent issue must be created before a High one.
+  return events.sort((a, b) => PRIORITY_RANK[a.priority ?? 'none'] - PRIORITY_RANK[b.priority ?? 'none']);
 }
 
 export function toTaskRequest(event: ExternalTaskEvent): {

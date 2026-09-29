@@ -6,7 +6,7 @@ import { readNexusRuntime } from '../nexus/runtime.js';
 import { getSecretAsync, setSecretAsync } from '../nexus/config/secrets/index.js';
 import { debug } from '../debug/log.js';
 import { EventLedger } from '../connectors/event-ledger.js';
-import { fetchLinearIssues, linearConnector, toTaskRequest } from '../connectors/linear.js';
+import { fetchLinearIssues, isLinearProjectionEcho, linearConnector, parseLinearWebhook, toTaskRequest } from '../connectors/linear.js';
 import type { ExternalTaskEvent } from '../connectors/types.js';
 
 const SECRET_ID = 'connector.linear.apiKey';
@@ -104,6 +104,11 @@ export async function applyLinearEvents(events: ExternalTaskEvent[], opts: Pick<
   for (const event of events) {
     const fields = { traceId: randomUUID(), ref: event.ref, identifier: event.identifier, eventId: event.eventId };
     log('connector.linear', 'fetched', fields);
+    if (isLinearProjectionEcho(event, ledger)) {
+      results.push({ issue: event.identifier ?? event.ref, taskId: null, status: 'skipped-seen' });
+      log('connector.linear', 'skipped-seen', fields);
+      continue;
+    }
     const seen = ledger.seen(event.provider, linearConnector.idempotencyKey(event)) || ledger.seenChange(event.provider, event.ref, event.occurredAt);
     if (seen && !opts.dryRun) {
       if (existing === undefined) {
@@ -176,7 +181,7 @@ export async function runLinearWebhook(input: { rawBody: string | Uint8Array; si
   let body: unknown;
   try { body = JSON.parse(Buffer.from(input.rawBody).toString('utf8')); }
   catch { out('connector linear receive: invalid-body'); return 2; }
-  const event = linearConnector.parse(body, input.deliveryId);
+  const event = parseLinearWebhook(body, input.deliveryId, deps.ledger);
   if (!event) {
     out('connector linear receive: ignored');
     return 0;
@@ -194,6 +199,6 @@ export async function runLinearSync(opts: ConnectorSyncOptions, deps: ConnectorC
     (deps.output ?? console.log)('connector.linear.apiKey missing; run elanous connector linear set-key');
     return 2;
   }
-  const events = await fetchLinearIssues({ apiKey: key, teamKey: opts.team, labelOrPrefix: opts.prefix, fetch: deps.fetch ?? fetch });
+  const events = await fetchLinearIssues({ apiKey: key, teamKey: opts.team, labelOrPrefix: opts.prefix, fetch: deps.fetch ?? fetch, ledger: deps.ledger });
   return applyLinearEvents(events, opts, deps);
 }

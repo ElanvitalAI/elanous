@@ -311,7 +311,6 @@ test/user-config-notifications-schema.test.ts
 test/user-config-path-redirect.test.ts
 test/user-config-self-implement-auto-open-pr.test.ts
 test/user-config.test.ts
-test/virtual-windows/layout/persistence.test.ts
 test/voice-cost-tracker.test.ts
 test/voice-discord-voice-channel-adapter.test.ts
 test/voice-streaming-stt-singleton.test.ts

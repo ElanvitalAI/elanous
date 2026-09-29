@@ -66,6 +66,8 @@ export interface ProviderAuthState {
   accountEmail?: string;
   accountUuid?: string;
   organizationUuid?: string;
+  /** MCP 동적 등록 때 쓴 redirect_uri. 선택 칸 — 없으면 옛 등록이다. */
+  redirectUri?: string;
   /** ⭐⭐ 이 계정의 공식 CLI 홈(= 미러 대상). ⛔ 이것이 «토큰과 함께» 저장되는 이유:
    *  미러 대상을 «주변 env/config»로 정하면, 저장하는 키와 미러 가는 홈이 «갈릴 수 있다»
    *  (2026-08-05 1R must-fix — `saveTokens('openai-codex:team')` 이 기본 홈을 오염시켰다).
@@ -167,13 +169,25 @@ function jwtExpMs(token: string): number | null {
  * expired 2026-05-13) while ~/.codex held a valid token refreshed
  * 2026-06-04 → `codex refresh failed: status=401` on every iPad chat turn.
  *
- * This compares the two access tokens' JWT `exp` and, when the mirror is
- * STRICTLY fresher (or elanous has no usable token), adopts the mirror's
- * access+refresh pair and persists it back to elanous's store (saveTokens
- * re-decodes ChatGPT claims + re-mirrors). Idempotent: when elanous's own
- * copy is fresher (the normal case right after a elanous-driven refresh) the
- * input state is returned unchanged, so the two never ping-pong.
+ * Selection shares this read-only parser with reconciliation, without
+ * persisting a credential or contacting an auth server.
  */
+export function readCodexMirrorTokens(mirrorPath: string = codexAuthPath()): OAuthTokens | null {
+  try {
+    const mirror = JSON.parse(readFileSync(mirrorPath, 'utf-8')) as { tokens?: Record<string, unknown> };
+    const access = mirror?.tokens?.access_token;
+    const refresh = mirror?.tokens?.refresh_token;
+    if (typeof access !== 'string' || !access || typeof refresh !== 'string' || !refresh) return null;
+    const expiresAt = jwtExpMs(access);
+    if (expiresAt === null) return null;
+    return { accessToken: access, refreshToken: refresh, expiresAt };
+  } catch {
+    return null;
+  }
+}
+
+/** Reconcile elanous's Codex tokens with the CLI mirror, adopting only a
+ * strictly fresher access token and persisting its rotated refresh token. */
 export function reconcileCodexTokensFromMirror(
   state: ProviderAuthState | null,
   elanousPath: string = authStorePath(),
@@ -185,23 +199,9 @@ export function reconcileCodexTokensFromMirror(
    *  기본값은 종전 키 — 기본 계정 호출자의 동작을 한 바이트도 안 바꾼다. */
   storeKey: string = 'openai-codex',
 ): ProviderAuthState | null {
-  let mirror: Record<string, unknown>;
-  try {
-    if (!existsSync(mirrorPath)) return state;
-    const parsed = JSON.parse(readFileSync(mirrorPath, 'utf-8'));
-    if (!parsed || typeof parsed !== 'object') return state;
-    mirror = parsed as Record<string, unknown>;
-  } catch {
-    return state;
-  }
-  const mt = (mirror.tokens && typeof mirror.tokens === 'object')
-    ? mirror.tokens as Record<string, unknown> : null;
-  const mirrorAccess = typeof mt?.access_token === 'string' ? mt.access_token : null;
-  const mirrorRefresh = typeof mt?.refresh_token === 'string' ? mt.refresh_token : null;
-  if (!mirrorAccess || !mirrorRefresh) return state;
-
-  const mirrorExp = jwtExpMs(mirrorAccess);
-  if (mirrorExp == null) return state;
+  const mirror = readCodexMirrorTokens(mirrorPath);
+  if (!mirror || mirror.expiresAt === null) return state;
+  const mirrorExp = mirror.expiresAt;
   // elanous's freshness = its access-token exp (fall back to stored
   // expiresAt, then -∞ when there is no usable token at all).
   const elanousExp = state
@@ -212,8 +212,8 @@ export function reconcileCodexTokensFromMirror(
   if (mirrorExp <= elanousExp) return state;
 
   const tokens: OAuthTokens = {
-    accessToken: mirrorAccess,
-    refreshToken: mirrorRefresh,
+    accessToken: mirror.accessToken,
+    refreshToken: mirror.refreshToken,
     expiresAt: mirrorExp,
     ...(state?.tokens.scope ? { scope: state.tokens.scope } : {}),
     tokenType: state?.tokens.tokenType ?? 'Bearer',
@@ -235,6 +235,8 @@ export interface WriteTokensOpts {
   accountEmail?: string;
   accountUuid?: string;
   organizationUuid?: string;
+  /** MCP 동적 등록 때 쓴 redirect_uri. 생략하면 기존 값을 유지한다. */
+  redirectUri?: string;
   /** ⭐⭐ 이 계정의 공식 CLI 홈(= 미러 대상). ⛔ 이것이 «토큰과 함께» 저장되는 이유:
    *  미러 대상을 «주변 env/config»로 정하면, 저장하는 키와 미러 가는 홈이 «갈릴 수 있다»
    *  (2026-08-05 1R must-fix — `saveTokens('openai-codex:team')` 이 기본 홈을 오염시켰다).
@@ -278,6 +280,7 @@ export function saveTokens(
     accountEmail: opts.accountEmail ?? existing?.accountEmail,
     accountUuid: opts.accountUuid ?? existing?.accountUuid,
     organizationUuid: opts.organizationUuid ?? existing?.organizationUuid,
+    redirectUri: opts.redirectUri ?? existing?.redirectUri,
     codexHome: opts.codexHome ?? existing?.codexHome,
     ...(chatGPT ? { chatGPT } : {}),
   };

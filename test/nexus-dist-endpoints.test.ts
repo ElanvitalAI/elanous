@@ -7,7 +7,7 @@
 // instead we test the building blocks that don't depend on disk and
 // verify the unhappy paths still return clean Responses).
 
-import { describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import {
   buildManifestXml,
   originForManifest,
@@ -16,6 +16,8 @@ import {
   handleDistInstallPage,
   type DistMeta,
 } from '../src/nexus/api/dist';
+import { runDistLink } from '../src/cli/nexus-dist';
+import { setResolveDaemonEndpointForTest } from '../src/nexus/daemon-endpoint';
 
 const SAMPLE: DistMeta = {
   file: 'ElanousiOS.ipa',
@@ -25,6 +27,78 @@ const SAMPLE: DistMeta = {
   title: 'Elanous',
   publishedAt: '2026-05-18T03:00:00.000Z',
 };
+
+describe('runDistLink · daemon endpoint', () => {
+  afterEach(() => setResolveDaemonEndpointForTest(null));
+
+  test('tailnet install and manifest URLs use the resolved daemon port', async () => {
+    setResolveDaemonEndpointForTest(() => ({
+      baseUrl: 'http://127.0.0.1:31432',
+      healthUrl: 'http://127.0.0.1:31432/v1/health',
+      pwaUrl: 'http://127.0.0.1:31432/app/',
+      source: 'registry',
+    }));
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      expect((await runDistLink({ readMetaFn: async () => SAMPLE, tailnetHostFn: async () => 'ipad.example.ts.net' })).exitCode).toBe(0);
+      const output = log.mock.calls.map(([line]) => String(line)).join('\n');
+      expect(output).toContain('itms-services://?action=download-manifest&url=' + encodeURIComponent('https://ipad.example.ts.net:31432/v1/dist/manifest.plist'));
+      expect(output).toContain('https://ipad.example.ts.net:31432/v1/dist/install');
+      expect(output).toContain('https://ipad.example.ts.net:31432/v1/dist/ElanousiOS.ipa');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('asks the resolver with purpose «watch» — dist is production-scoped, so a test-universe tree still reaches the production daemon', async () => {
+    const seen: unknown[] = [];
+    setResolveDaemonEndpointForTest((opts) => { seen.push(opts.purpose); return null; });
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await runDistLink({ readMetaFn: async () => SAMPLE, tailnetHostFn: async () => null });
+      expect(seen).toEqual(['watch']);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('without tailnet uses the resolved loopback URL', async () => {
+    setResolveDaemonEndpointForTest(() => ({
+      baseUrl: 'http://127.0.0.1:31432',
+      healthUrl: 'http://127.0.0.1:31432/v1/health',
+      pwaUrl: 'http://127.0.0.1:31432/app/',
+      source: 'registry',
+    }));
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await runDistLink({ readMetaFn: async () => SAMPLE, tailnetHostFn: async () => null });
+      const output = log.mock.calls.map(([line]) => String(line)).join('\n');
+      expect(output).toContain('Local manifest:  http://127.0.0.1:31432/v1/dist/manifest.plist');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('null endpoint prints one unknown-daemon line and no install links', async () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const log = spyOn(console, 'log').mockImplementation(() => {});
+    let tailnetProbed = false;
+    try {
+      expect((await runDistLink({
+        readMetaFn: async () => SAMPLE,
+        tailnetHostFn: async () => { tailnetProbed = true; return 'ipad.example.ts.net'; },
+      })).exitCode).toBe(0);
+      const lines = log.mock.calls.map(([line]) => String(line));
+      expect(lines.filter((line) => line.includes('데몬 주소를 모른다'))).toEqual([
+        '  데몬 주소를 모른다 — 데몬을 먼저 띄워라 (`elanous nexus run`)',
+      ]);
+      expect(lines.join('\n')).not.toMatch(/itms-services:|\/v1\/dist\/install|Local manifest:|IPA stream:/);
+      expect(tailnetProbed).toBe(false);
+    } finally {
+      log.mockRestore();
+    }
+  });
+});
 
 describe('buildManifestXml', () => {
   test('embeds bundle-identifier · version · title · IPA URL', () => {

@@ -21,6 +21,10 @@ function makeOut(): CapturedOut {
   };
 }
 
+/** Tests that exercise the admin hot-swap inject the daemon address.
+ *  Production resolves it; a missing daemon is not a guessed port. */
+const RESOLVED_DAEMON = { baseUrl: 'http://127.0.0.1:31415' };
+
 const aliveLock: NexusLockMeta = {
   pid: 12345,
   host: 'mbp.local',
@@ -153,6 +157,7 @@ describe('runPwaDev — admin endpoint hot-swap', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: () => aliveLock,
       isAliveNexusLockFn: () => true,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn,
       spawnFn: async () => 0,
     });
@@ -182,6 +187,7 @@ describe('runPwaDev — admin endpoint hot-swap', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: () => null,
       isAliveNexusLockFn: () => false,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn,
       spawnFn: async () => 0,
     });
@@ -221,6 +227,7 @@ describe('runPwaDev — admin endpoint hot-swap', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: () => aliveLock,
       isAliveNexusLockFn: () => true,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn: fetchFail(),
       spawnFn: async () => 0,
     });
@@ -247,6 +254,7 @@ describe('runPwaDev — admin endpoint hot-swap', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: () => aliveLock,
       isAliveNexusLockFn: () => true,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn,
       spawnFn: async () => 0,
     });
@@ -324,6 +332,7 @@ describe('runPwaDev — re-register watcher (BACKLOG #2)', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: readLockFn,
       isAliveNexusLockFn: () => true,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn: tracker.fn,
       reregisterPollIntervalMs: 25,
       spawnFn: async () => {
@@ -359,6 +368,7 @@ describe('runPwaDev — re-register watcher (BACKLOG #2)', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: readLockFn,
       isAliveNexusLockFn: () => true,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn: tracker.fn,
       reregisterPollIntervalMs: 20,
       spawnFn: async () => {
@@ -382,6 +392,7 @@ describe('runPwaDev — re-register watcher (BACKLOG #2)', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: () => stableLock,
       isAliveNexusLockFn: () => true,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn: tracker.fn,
       reregisterPollIntervalMs: 20,
       spawnFn: async () => {
@@ -412,6 +423,7 @@ describe('runPwaDev — re-register watcher (BACKLOG #2)', () => {
       skipNodeModulesCheck: true,
       readNexusLockFn: readLockFn,
       isAliveNexusLockFn: () => true,
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn: tracker.fn,
       reregisterPollIntervalMs: 0,
       spawnFn: async () => {
@@ -436,6 +448,7 @@ describe('runPwaDev — re-register watcher (BACKLOG #2)', () => {
       // see lock but isAliveFn returns false → no re-POST.
       readNexusLockFn: () => aliveLock,
       isAliveNexusLockFn: () => { aliveCalls += 1; return false; },
+      resolveEndpoint: () => RESOLVED_DAEMON,
       fetchFn: tracker.fn,
       reregisterPollIntervalMs: 15,
       spawnFn: async () => {

@@ -2,8 +2,8 @@
 // ── 크론 관측성 래퍼 (RFC-scheduler-execution-observability-memory·2026-07-15) ────────────────
 //
 // crontab 이 실제 스크립트를 이 래퍼로 감싸 실행하면, 그 파이어를 3계층(logs.db·레지스트리·자기기억)에
-// 기록한다. 사용:  bun scripts/cron-run.ts <target-script> [target-args...]
-//                 bun scripts/cron-run.ts --shell <interpreter> <target> [args...]
+// 기록한다. 사용:  bun scripts/cron-run.ts [--schedule-id <id>] <target-script> [target-args...]
+//                 bun scripts/cron-run.ts [--schedule-id <id>] --shell <interpreter> <target> [args...]
 //   예) cd <repo> && bun scripts/cron-run.ts scripts/community-buzz-cycle.ts --collect-only >> /tmp/x.log 2>&1
 //
 // ★ fail-open 불변식: 관측(sink 등록·레지스트리·기억) 무엇이 실패해도 자식은 반드시 실행하고 자식의
@@ -17,6 +17,12 @@ ensureCronNodePath();
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
+  const hasScheduleId = argv[0] === '--schedule-id';
+  const scheduleId = hasScheduleId ? argv.splice(0, 2)[1] : undefined;
+  if (hasScheduleId && (!scheduleId?.trim() || scheduleId === '--shell')) {
+    process.stderr.write('cron-run: --schedule-id 인자 필수\n');
+    process.exit(2);
+  }
   const shell = argv[0] === '--shell';
   const interpreter = shell ? argv[1] : process.execPath;
   const target = argv[shell ? 2 : 0];
@@ -48,14 +54,25 @@ async function main(): Promise<void> {
     db = rMod.openSchedulesDb();
     // 최신 crontab 인벤토리 반영(래핑된 라인도 unwrap-aware 로 동일 id 승계).
     try { rMod.inventoryCrontab(db); } catch { /* fail-soft */ }
-    const rows = rMod.listSchedules(db).filter((r) => r.name === name);
-    const activeRows = rows.filter((r) => r.enabled);
-    const selectedRow = activeRows[0] ?? rows[0];
-    if (selectedRow) {
-      id = selectedRow.id;
-      prevStatus = selectedRow.last_status ?? null;
-      activeScheduleRowsAmbiguous = activeRows.length > 1;
-    } else scheduleRowMissing = true;
+    if (scheduleId) {
+      // 명시된 id만 조회한다. 해당 행이 없더라도 이름으로 폴백해 다른 잡을 갱신하지 않는다.
+      const row = db.query('SELECT id, last_status FROM schedule_registry WHERE id = ?').get(scheduleId) as
+        | { id: string; last_status: string | null }
+        | undefined;
+      if (row) {
+        id = row.id;
+        prevStatus = row.last_status ?? null;
+      } else scheduleRowMissing = true;
+    } else {
+      const rows = rMod.listSchedules(db).filter((r) => r.name === name);
+      const activeRows = rows.filter((r) => r.enabled);
+      const selectedRow = activeRows[0] ?? rows[0];
+      if (selectedRow) {
+        id = selectedRow.id;
+        prevStatus = selectedRow.last_status ?? null;
+        activeScheduleRowsAmbiguous = activeRows.length > 1;
+      } else scheduleRowMissing = true;
+    }
   } catch (error) {
     prerequisiteFailed = true;
     prerequisiteError = error; // fail-open — 관측 없이도 자식은 실행

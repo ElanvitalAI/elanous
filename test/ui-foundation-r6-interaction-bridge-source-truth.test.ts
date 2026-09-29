@@ -7,17 +7,12 @@ function read(rel: string): string {
 }
 
 describe('ui foundation · R6 interaction bridge source truth', () => {
-  test('dashboard virtual windows exposes separate selector and context-menu callbacks', () => {
-    // 2026-07-07 · dashboard decomposition: src/dashboard-virtual-windows.ts
-    // moved to src/dashboard/windowing/virtual-windows.ts.
-    const src = read('src/dashboard/windowing/virtual-windows.ts');
-    expect(src).toContain('onShowSelector?:');
-    expect(src).toContain('onShowContextMenu?:');
-  });
-
   test('dashboard boots the remaining context-menu provider registry', () => {
     const ctxMenuBoot = read('src/dashboard/context-menu-provider-boot.ts');
-    expect(ctxMenuBoot).toContain('registerVirtualWindowContextMenus(providers, {');
+    expect(ctxMenuBoot).not.toContain('registerVirtualWindowContextMenus');
+    for (const provider of ['registerBrowserContextMenus', 'registerScratchContextMenus', 'registerDashboardPaneTitleContextMenus', 'registerDebugContextMenus']) {
+      expect(ctxMenuBoot).toContain(`${provider}(providers, {`);
+    }
 
     const dashboard = read('src/dashboard/index.ts');
     expect(dashboard).toContain('const ctxMenuProviders = bootDashboardContextMenuProviders({');

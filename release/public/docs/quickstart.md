@@ -41,6 +41,8 @@ What happens:
 
 Add `--no-auto-merge` if you want to merge pull requests yourself. Add `--dry-run` to see the plan without starting.
 
+Running the harness on a repository other than elanous itself is new and not fully measured yet (see [harness › Other repositories](harness.md#other-repositories)) — start with `--dry-run`, and use `--no-auto-merge` so you review and merge the pull request yourself.
+
 ## 4. Talk to it directly
 
 ```bash
@@ -48,6 +50,15 @@ elanous ask "what does src/app.ts do?"   # one question, one answer
 elanous agent "why is the build failing?" # one turn with file and shell tools
 elanous                                    # the terminal UI
 ```
+
+## 5. Open the web app
+
+```bash
+elanous nexus run      # start the daemon; the web app is served with it
+elanous nexus show     # prints the web app link (usually http://127.0.0.1:31415/app/)
+```
+
+On first open it takes you to model setup. See [Web app](pwa.md).
 
 ## Where to look next
 

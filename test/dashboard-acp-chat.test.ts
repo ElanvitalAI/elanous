@@ -416,6 +416,7 @@ describe('DashboardAcpChat — lifecycle', () => {
       expect(r.kind).toBe('help');
       if (r.kind === 'help') {
         expect(r.lines[0]).toContain('ACP chat');
+        expect(r.lines.join('\n')).not.toContain('/acp-vw');
       }
     });
 

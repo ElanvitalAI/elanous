@@ -15,4 +15,10 @@ elanous harness say "add a --json flag to the status command"
 
 Under the hood every job is one loop — observe, understand, heal — drawn as a graph that elanous reshapes while it runs, with posture deciding how hard it looks and how widely it grounds itself. See [Graph engineering and self-healing loops](graph-engineering.md).
 
+elanous also drives terminals itself — shells, Codex, Claude Code and another elanous — choosing the lowest tool that can do the job. See [PTY intelligence](pty-intelligence.md).
+
+Work that repeats — every morning, on every new request — runs as [loop agents](loop-agents.md); you can [build your own](build-a-loop-agent.md).
+
+Skills and graphs come as [plugins](plugins.md) from a signed marketplace — the same packages install in Codex; you can [build one](build-a-plugin.md).
+
 Start with [Install](install.md) and the [Quickstart](quickstart.md).

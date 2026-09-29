@@ -12,13 +12,15 @@ import {
   resolveCodexAccount, effectiveCodexHome, type CodexHomeSource, type CodexAccountResolution,
 } from './codex-account.js';
 import { authStorePath, defaultCodexHome, listProviders, loadTokens, saveTokens } from './store.js';
-import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaSignalUsedPercent, readQuotaSignalObservedAt, readQuotaSignalObservedAtRaw } from '../budget/codex-reset-credit-state.js';
+import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaSignalCredits, readQuotaSignalUsedPercent, readQuotaSignalObservedAt, readQuotaSignalObservedAtRaw } from '../budget/codex-reset-credit-state.js';
 import { getUserConfig } from '../user-config.js';
 import {
   decideCodexRotation, observeRotation, applyRotation, readCodexAccountRotationConfig, rotatedChildEnv,
   codexAccountThresholdPercent,
   type RotationCandidate,
 } from './codex-account-rotation.js';
+import { codexPolicyAllowsCredits, codexPolicyAllowsFallback, resolveCodexQuotaPolicy, type CodexQuotaPolicy, type ResolvedCodexQuotaPolicy } from './codex-quota-policy.js';
+import { emitDecision } from '../live/detail-switch.js';
 import { debug } from '../debug/log.js';
 import {
   decideFallback, normalizeFallbackChain, grokQuotaFromUsageSnapshot,
@@ -43,7 +45,7 @@ export function _setCodexAccountOutboundSenderForTesting(sender: CodexAccountOut
 /** ⛔⭐ 정적 import 로 읽는다 — 종전 `require()` 는 ESM 에서 «정의되지 않을 수 있고», 그러면
  *  fail-soft 가 삼켜 ***config false 가 영영 무시된다***(리뷰 should-fix: 노브가 no-op 이 된다).
  *  ⚠️ 순환 없음을 확인했다 — user-config 는 oauth 를 안 끌어온다. */
-type RotationConfig = { llm?: { codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; fallbackChain?: unknown } };
+type RotationConfig = { llm?: { codexAccountRotation?: boolean; codexAccountAlerts?: boolean; codexAccountRotationThresholdPercent?: unknown; codexAccountRotationThresholdPercentByAccount?: Readonly<Record<string, unknown>>; codexCreditsAllowed?: boolean; codexQuotaPolicy?: unknown; fallbackChain?: unknown } };
 
 function readUserConfig(): RotationConfig {
   return getUserConfig();
@@ -227,6 +229,29 @@ function pinnedAccountExhausted(home: string, accountName: string): boolean {
   return used >= threshold;
 }
 
+/** codex 한도 정책(`llm.codexQuotaPolicy` · 옛 `codexCreditsAllowed`) — 못 읽으면 `fallback`(크레딧은 돈이라 fail-closed). */
+export function codexQuotaPolicyFromConfig(): CodexQuotaPolicy {
+  try { return resolveCodexQuotaPolicy(configReader().llm).policy; } catch { return 'fallback'; }
+}
+
+function inspectedQuotaPolicy(): ResolvedCodexQuotaPolicy {
+  try { return resolveCodexQuotaPolicy(configReader().llm); } catch { return { policy: 'fallback', source: 'default' }; }
+}
+
+/** 지금 계정의 크레딧 신호 — 판정 입력 두 칸. 신호를 이 계정에 귀속할 수 없으면 비운다(모른다). */
+function currentCreditsInput(home: string | undefined, now: number): { currentCreditBalance?: number; currentHasCredits?: boolean } {
+  if (!home) return {};
+  const c = readQuotaSignalCredits(now, home);
+  return {
+    ...(c.balance === undefined ? {} : { currentCreditBalance: c.balance }),
+    ...(c.hasCredits === undefined ? {} : { currentHasCredits: c.hasCredits }),
+  };
+}
+
+function codexCreditsAllowedFromConfig(): boolean {
+  return codexPolicyAllowsCredits(codexQuotaPolicyFromConfig());
+}
+
 function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessEnv = process.env): RotationCandidate[] {
   return listCodexAccountsInStore(path)
     .map((row) => {
@@ -239,12 +264,15 @@ function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessE
         ?? (row.storeKey === 'openai-codex' ? resolveCodexAccount({ CODEX_HOME: env.CODEX_HOME } as unknown as NodeJS.ProcessEnv).home : undefined); // CODEX_HOME 한 칸만(이름 계정 설정을 안 끼운다 · 🅢 #21079 의도) — unknown 단언: Next 타입은 ProcessEnv 에 NODE_ENV 를 필수로 더해 PWA 빌드가 깨졌다
       if (!home) return null;
       const usedPercent = readQuotaSignalUsedPercent(now, home);
+      const credits = readQuotaSignalCredits(now, home);
       return {
         name: row.name,
         storeKey: row.storeKey,
         home,
         reached: readQuotaSignal(now, home),
         ...(usedPercent === undefined ? {} : { usedPercent }),
+        ...(credits.balance === undefined ? {} : { creditBalance: credits.balance }),
+        ...(credits.hasCredits === undefined ? {} : { hasCredits: credits.hasCredits }),
       };
     })
     .filter((c): c is RotationCandidate => c !== null);
@@ -445,6 +473,9 @@ export function inspectCodexRotation(
   readonly currentHome: string | undefined;
   readonly currentReached: boolean | undefined;
   readonly currentUsedPercent: number | undefined;
+  readonly currentCreditBalance: number | undefined;
+  readonly currentHasCredits: boolean | undefined;
+  readonly policy: ResolvedCodexQuotaPolicy;
   readonly explicit: boolean;
   readonly enabled: boolean;
   /** ⛔ «판정기가 실제로 쓴» 임계다 — raw config 가 아니다(리뷰 must-fix). */
@@ -481,10 +512,12 @@ export function inspectCodexRotation(
   const currentSignalAttributable = signalAttributableToAccount(currentHomeInfo);
   const currentReached = currentSignalAttributable && currentHome ? readQuotaSignal(now, currentHome) : undefined;
   const currentUsedPercent = currentSignalAttributable && currentHome ? readQuotaSignalUsedPercent(now, currentHome) : undefined;
+  const currentCredits = currentCreditsInput(currentSignalAttributable ? currentHome : undefined, now);
+  const policy = inspectedQuotaPolicy();
   const rawThreshold = rotationThresholdFromConfig();
   const thresholdPercentByAccount = rotationThresholdsByAccountFromConfig();
   const decision = decideCodexRotation({
-    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, candidates,
+    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, creditsAllowed: codexCreditsAllowedFromConfig(), ...currentCredits, candidates,
   });
   // ⛔⭐ 나이는 «만료돼도» 낸다 — 「65분 전」과 「3일 전」은 다른 진단이다(리뷰 must-fix).
   const observedAtByHome: Record<string, number> = {};
@@ -495,7 +528,9 @@ export function inspectCodexRotation(
     freshByHome[c.home] = readQuotaSignalObservedAt(now, c.home) !== undefined;
   }
   return {
-    current, currentHome, currentReached, currentUsedPercent,
+    current, currentHome, currentReached, currentUsedPercent, policy,
+    currentCreditBalance: currentSignalAttributable ? currentCredits.currentCreditBalance : candidates.find((c) => c.storeKey === current.storeKey)?.creditBalance,
+    currentHasCredits: currentSignalAttributable ? currentCredits.currentHasCredits : candidates.find((c) => c.storeKey === current.storeKey)?.hasCredits,
     currentObservedAt: currentHome ? readQuotaSignalObservedAtRaw(now, currentHome) : undefined,
     currentSignalFresh: currentHome ? readQuotaSignalObservedAt(now, currentHome) !== undefined : false,
     explicit, enabled,
@@ -579,6 +614,8 @@ export function resolveCodexAccountForRun(
     resetCreditAvailability: resetCreditAvailability(currentHome, now),
     thresholdPercent: rotationThresholdFromConfig(),
     thresholdPercentByAccount: rotationThresholdsByAccountFromConfig(),
+    creditsAllowed: codexCreditsAllowedFromConfig(),
+    ...currentCreditsInput(currentSignalAttributable ? currentHome : undefined, now),
     candidates,
   });
   observeRotation(decision, current.name);
@@ -701,11 +738,20 @@ export function resolveRunFallback(
       || snapshot.reason === 'no-candidate'
     ) {
       rotation = { reason: snapshot.reason };
+    } else if (snapshot.reason === 'credits-allowed') {
+      // 크레딧으로 머문다 — 폴백 판정엔 «한도 안»과 같다(체인을 타지 않는다).
+      rotation = { reason: 'not-reached' };
     } else {
       rotation = { reason: 'no-candidate' };
     }
 
-    const { chain, dropped, usedDefault } = normalizeFallbackChain(configReader().llm?.fallbackChain);
+    const normalized = normalizeFallbackChain(configReader().llm?.fallbackChain);
+    const { dropped, usedDefault } = normalized;
+    // 대표 정책 `within-quota` — codex 밖으로 폴백하지 않는다(회전만). 전부 차면 멈춘다.
+    const quotaPolicy = codexQuotaPolicyFromConfig();
+    const chain = codexPolicyAllowsFallback(quotaPolicy)
+      ? normalized.chain
+      : normalized.chain.filter((step) => step === 'codex-rotate');
     // ⛔ grok 가용성은 «호출자가 확정»해서 줄 수 있다(테스트 격리). 안 주면 여기서 잰다.
     // ⛔ «가용성 판정»이라 갱신을 유도하지 않는다 — 「자격이 있나」만 묻지 「지금 쓸 수 있나」를 묻지 않는다.
     //   (쓸 수 있는지는 실제 요청 경로가 접힌 해석으로 확인한다.)
@@ -721,7 +767,7 @@ export function resolveRunFallback(
 
     debug.log('oauth.fallback-chain', 'decide', {
       rotationReason: rotation.reason,
-      chain, usedDefault,
+      chain, usedDefault, quotaPolicy,
       rotationResult: rotation.reason,
       // ⛔⭐ 「안 줬다」를 «false 로 접지 않는다»(무인 리뷰 must-fix · UNKNOWN-DEFAULT).
       //   호출자가 이 값을 생략하면 그것은 「한도가 아니었다」가 «아니라» ***「안 쟀다」***다.
@@ -738,6 +784,24 @@ export function resolveRunFallback(
       ...(decision.action === 'stay' ? { why: decision.why } : {}),
       ...(decision.action === 'codex-rotate' ? { to: decision.to.name } : {}),
     });
+    if (decision.action === 'switch-backend') {
+      emitDecision({
+        kind: 'ROUTE',
+        what: `공급자 전환 codex → ${decision.backend}`,
+        reason: `회전 ${rotation.reason} · 정책 ${quotaPolicy}${fallbackInput.currentCredentialRateLimited ? ' · 한도 오류' : ''}`,
+        purpose: '작업을 멈추지 않고 이어 간다',
+        target: decision.backend,
+        paths: chain.length,
+      });
+    } else if (decision.action === 'stay' && rotation.reason === 'no-candidate' && !codexPolicyAllowsFallback(quotaPolicy)) {
+      emitDecision({
+        kind: 'ESCALATE',
+        what: 'codex 계정 전부 한도 — 멈춤',
+        reason: '정책 within-quota(한도 안에서만)',
+        purpose: '크레딧·다른 공급자로 비용을 쓰지 않는다',
+        target: '사람(리셋 대기)',
+      });
+    }
     return decision;
   } catch (err) {
     debug.log('oauth.fallback-chain', 'decide-failed', {

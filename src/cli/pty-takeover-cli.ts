@@ -16,6 +16,7 @@ import { getHarnessRunId, normalizeRunIdSource, type RunIdSource } from '../harn
 import { inspectControlInbox, type ControlInboxSnapshot } from '../harness/control-inbox.js';
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../pty-shell/pty-control-ipc.js';
 import { resolvePtySpecialKey } from '../pty-shell/pty-special-keys.js';
+import { encodeSgrMouse, mouseModeOffReason, type PtyMouseInput } from '../pty-shell/pty-mouse.js';
 import { resizePtyWithOutcome, writePtyWithOutcome } from '../pty-shell/pty-write-outcome.js';
 import type { PtyControlTarget, PtyHandle } from '../pty-shell/registry.js';
 import { ptyEventLogTargets, ptyManifestTargets } from '../domains/fleet.js';
@@ -26,6 +27,7 @@ import { terminalTreeLabel } from '../pty-shell/terminal-tree.js';
 import { RemotesStore } from './remotes.js';
 import { bookmarkAttachDefaults } from './remote-resolve.js';
 import { classifyFrameState, type FrameState } from '../capture/frame-state-detect.js';
+import { installMissingTool, waitForPtyCompletion, type ToolInstallDeps, type ToolInstallResult } from '../agent-mission/tool-install.js';
 
 interface PtyTakeoverCommandResult { readonly exitCode: 0 | 1 | 2; readonly message: string; readonly notice?: string; }
 /** ⚠️ 내부 타입 — 파일 밖 소비자 없음(dead export 금지·review · `pty-control-ipc.ts:7` 선례).
@@ -420,6 +422,7 @@ export interface PtyTakeoverCommandDeps {
 
 type RemoteTerminalControlBody =
   | { readonly action: 'input-text' | 'input-key'; readonly chars: string }
+  | ({ readonly action: 'input-mouse' } & PtyMouseInput)
   | { readonly action: 'snapshot'; readonly ansi?: true };
 
 type RemoteTerminalControlFetchResult =
@@ -1680,7 +1683,7 @@ function parseRemoteTerminalControl(body: unknown): PtyControlResult | null {
 }
 
 async function runPtyRemoteControl(
-  action: 'text' | 'key' | 'snapshot',
+  action: 'text' | 'key' | 'mouse' | 'snapshot',
   id: string,
   remote: string | boolean,
   body: RemoteTerminalControlBody,
@@ -2055,6 +2058,24 @@ export function runPtyKey(ref: string, key: string, repeat = 1, deps: PtyTakeove
   if (!Number.isInteger(repeat) || repeat < 1) return Promise.resolve({ exitCode: 1, message: 'pty key: repeat must be a positive integer' });
   try { const normalized = key.trim().toLowerCase(); return inject(ref, 'input-key', resolvePtySpecialKey(normalized).repeat(repeat), { key: normalized, repeat }, deps, actor); } catch (error) { return Promise.resolve({ exitCode: 1, message: `pty key: ${(error as Error).message}` }); }
 }
+export async function runPtyMouse(ref: string, input: PtyMouseInput, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> {
+  let chars: string;
+  try { chars = encodeSgrMouse(input); }
+  catch (error) { return { exitCode: 1, message: `pty mouse: ${(error as Error).message}` }; }
+  const resolvedRef = resolveId(ref, 'mouse', deps);
+  if (typeof resolvedRef !== 'string') return resolvedRef;
+  const id = resolvedRef;
+  const observed = { x: input.x, y: input.y, kind: input.kind, button: input.button ?? 'left', actor };
+  const handle = deps.getPty(id);
+  if (!handle) return mapResult('mouse', id, await deps.requestRemote(id, 'input-mouse', input, { actor }), deps, observed);
+  const resolved = localActor(id, actor, deps);
+  if (typeof resolved !== 'string') return mapResult('mouse', id, { status: 'denied', reason: resolved.reason }, deps, observed);
+  const off = mouseModeOffReason(handle);
+  if (off) return mapResult('mouse', id, { status: 'denied', reason: off }, deps, observed);
+  const outcome = writePtyWithOutcome(handle, chars, resolved);
+  return mapResult('mouse', id, outcome === 'success' ? { status: 'success' } : outcome === 'denied' ? { status: 'denied', reason: 'write-arbiter' } : { status: 'write-failed', reason: 'adapter-write' }, deps, observed);
+}
+
 export async function runPtyResize(ref: string, cols: number, rows: number, deps: PtyTakeoverCommandDeps = liveDeps, actor: PtyWriteActor = 'human'): Promise<PtyTakeoverCommandResult> {
   if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return { exitCode: 1, message: 'pty resize: cols and rows must be positive integers' };
   const refResult = resolveId(ref, 'resize', deps); if (typeof refResult !== 'string') return refResult;
@@ -2070,7 +2091,7 @@ export async function runPtyResize(ref: string, cols: number, rows: number, deps
       ? { status: 'denied', reason: 'write-arbiter' }
       : { status: 'failed', reason: 'resize-error' }, deps, observed);
 }
-export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverCommandDeps = liveDeps): void {
+export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverCommandDeps = liveDeps, toolInstallDeps: ToolInstallDeps = {}): void {
   const pty = program.command('pty').description(
     // ⭐ `<ref>` = id · nickname · unique prefix — **ref 를 받는 하위명령**이 resolvePtyRef 로 해석한다(`list` 는 인자 없음).
     //   종전 도움말은 `<ptyId>` 라 **실제보다 좁게** 적혀 있었다(구현은 처음부터 ref 를 받았다).
@@ -2123,6 +2144,28 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
   pty.command('wait <ref>').requiredOption('--until <state>', 'wait until idle, working, blocked, waiting, or done')
     .option('--timeout <ms>', 'timeout in milliseconds', '120000').option('--poll-ms <ms>', 'poll interval in milliseconds', '500')
     .description('Wait until the classified PTY screen reaches a state').action((id: string, opts: { until: string; timeout: string; pollMs: string }) => run(() => runPtyWait(id, opts.until, { timeoutMs: Number(opts.timeout), pollMs: Number(opts.pollMs) }, deps)));
+  pty.command('install-tool <ref> <tool>')
+    .description('Smoke-check a known tool in the PTY shell, install an unprivileged known remedy, and verify it')
+    .action((ref: string, tool: string) => run(async () => {
+      if (!['gh', 'rg', 'node', 'codex', 'jq', 'ffmpeg'].includes(tool)) {
+        return { exitCode: 2 as const, message: `pty install-tool: unsupported tool ${tool}` };
+      }
+      const inPty: ToolInstallDeps = {
+        typeLine: async (ptyRef, line) => {
+          const typed = await runPtyText(ptyRef, line, true, deps, 'agent');
+          if (typed.exitCode !== 0) throw new Error(typed.message);
+        },
+        waitIdle: (ptyRef, opts) => waitForPtyCompletion(ptyRef, opts, async (ref) => {
+          const snapshot = await runPtySnapshot(ref, deps);
+          if (snapshot.exitCode !== 0) throw new Error(snapshot.message);
+          return snapshot.message;
+        }),
+        ...toolInstallDeps,
+      };
+      const result: ToolInstallResult = await installMissingTool({ tool: tool as 'gh' | 'rg' | 'node' | 'codex' | 'jq' | 'ffmpeg', ptyRef: ref }, inPty);
+      return { exitCode: result.outcome === 'already' || result.outcome === 'installed' ? 0 as const : 1 as const,
+        message: `pty install-tool: ${result.outcome}: ${result.reason}${result.line ? ` · ${result.line}` : ''}${result.needsLogin && !result.reason.includes('codex authentication not verified') ? ' · codex authentication not verified; run codex login before authenticated work' : ''}` };
+    }));
   pty.command('snapshot <ref>').option('--ansi', 'reconstruct xterm cell attributes as terminal SGR sequences')
     .option('-r', 'render the PTY screen on the default remote bookmark (does not take a value)')
     .option('--remote <name>', 'render the PTY screen on a named remote bookmark')
@@ -2155,6 +2198,16 @@ export function registerPtyTakeoverCommands(program: Command, deps: PtyTakeoverC
         catch (error) { return Promise.resolve({ exitCode: 1, message: `pty key: ${(error as Error).message}` }); }
       });
     }));
+  pty.command('mouse <ref> <x> <y>').option('--button <button>', 'left, middle, or right', 'left').option('--scroll <direction>', 'up or down').option('-r', 'use default remote bookmark').option('--remote <name>', 'use named remote bookmark').option(...ACTOR_FLAG)
+    .description('Click or scroll a mouse-enabled SGR PTY (1-based column and row; disabled mode is refused by the owner)').action((id: string, x: string, y: string, opts: { button: string; scroll?: string; actor?: string; r?: boolean; remote?: string }) => run(() => withActor(opts, async (actor) => {
+      if (opts.scroll !== undefined && opts.scroll !== 'up' && opts.scroll !== 'down') return { exitCode: 1, message: 'pty mouse: --scroll must be up or down' };
+      if (opts.button !== 'left' && opts.button !== 'middle' && opts.button !== 'right') return { exitCode: 1, message: 'pty mouse: --button must be left, middle or right' };
+      const input: PtyMouseInput = { x: Number(x), y: Number(y), button: opts.button, kind: opts.scroll ? `scroll-${opts.scroll}` as 'scroll-up' | 'scroll-down' : 'click' };
+      try { encodeSgrMouse(input); } catch (error) { return { exitCode: 1, message: `pty mouse: ${(error as Error).message}` }; }
+      const remote = opts.remote ?? (opts.r === true ? true : undefined);
+      if (remote !== undefined && actor === 'agent') return { exitCode: 1, message: 'pty mouse: remote HTTP cannot verify same-run agent ownership; use the owner IPC instead' };
+      return remote === undefined ? runPtyMouse(id, input, deps, actor) : runPtyRemoteControl('mouse', id, remote, { action: 'input-mouse', ...input }, deps);
+    })));
   pty.command('resize <ref> <cols> <rows>').option(...ACTOR_FLAG)
     .description('Resize the PTY (gated by the same access matrix as input)').action((id: string, cols: string, rows: string, opts: { actor?: string }) => run(() => withActor(opts, (actor) => runPtyResize(id, Number(cols), Number(rows), deps, actor))));
 }

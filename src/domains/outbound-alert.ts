@@ -15,12 +15,19 @@ import { latestUserIntentTs } from '../user-intent/index.js';
 import { getUserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { debug } from '../debug/log.js';
+import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 // ★ origin 되돌림(대표 2026-07-12) — 미션 알림을 발신 채널(메인 Q&A 봇)로 되돌린다. type-only
 //   import 라 런타임 순환 없음(발송 로직은 이 파일에 self-contained). origin 없으면 report 폴백.
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
 import { conatusPath } from './conatus-data-dir.js';
 
-const NEXUS_URL = process.env.ELANOUS_NEXUS_URL || 'http://localhost:31415';
+/** Explicit `ELANOUS_NEXUS_URL` wins. Otherwise ask the daemon endpoint resolver.
+ *  A missing daemon is not a guessed port — the caller falls through to direct send. */
+function nexusUrl(): string | null {
+  const explicit = process.env.ELANOUS_NEXUS_URL?.trim();
+  if (explicit) return explicit;
+  return resolveDaemonEndpoint()?.baseUrl ?? null;
+}
 // 로컬 데몬이 getElanousConfigDir()/acp-token 에 발행한 loopback 토큰을 읽어 로컬
 // /v1/outbound 로 POST — getElanousConfigDir() 치환은 prod 동치(~/.elanous) + --config-dir 정합.
 const ACP_TOKEN_PATH = join(getElanousConfigDir(), 'acp-token');
@@ -277,7 +284,10 @@ export function deliver(text: string, kind = 'alert'): 'daemon' | 'direct' | fal
     let token = '';
     try { if (existsSync(ACP_TOKEN_PATH)) token = readFileSync(ACP_TOKEN_PATH, 'utf-8').trim(); } catch { /* no token */ }
     const headers = ['Content-Type: application/json', ...(token ? [`Authorization: Bearer ${token}`] : [])];
-    const j = curlPost(`${NEXUS_URL}/v1/outbound`, JSON.stringify({ text, markdown: false, kind }), headers);
+    const nexus = nexusUrl();
+    const j = nexus
+      ? curlPost(`${nexus}/v1/outbound`, JSON.stringify({ text, markdown: false, kind }), headers)
+      : null;
     const classification = classifyDaemonResponse(j);
     if (classification === 'ok') return 'daemon';
     const extra: Record<string, unknown> = { hasToken: token.length > 0 };

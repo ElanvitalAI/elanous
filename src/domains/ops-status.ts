@@ -23,7 +23,9 @@ import { proposalDraftPath } from '../autopilot/build/build-target.js';
 import { readFileSync, existsSync } from 'node:fs';
 import { openSchedulesDb, inventoryCrontab, listSchedules, installedCronRoot, repoRoot, scheduleHealth, type ScheduleHealth, type ScheduleRow } from './schedule-registry.js';
 import { loadMandate, type TradeMandate } from './trade-mandate.js';
-import { debug } from '../debug/log.js';
+import { debug, redactSecretText } from '../debug/log.js';
+import { LogStore, logsDbPath, type LogStoreRow } from '../mss/logging/log-store.js';
+import { detectRepeatedFailures, explainFailure } from './repeated-failure.js';
 
 /** 예약 레지스트리 조회 관측 — 실패가 0으로 접히지 않게 남기는 창구. */
 export const OPS_STATUS_LOG_CATEGORY = 'ops.status';
@@ -43,6 +45,8 @@ export interface OpsStatusOpts {
   mandate?: TradeMandate | null;
   /** 플랜 초안 아티팩트 경로 resolver(테스트 seam). 기본 proposalDraftPath. */
   planDraftFor?: (missionId: string) => string;
+  /** Health-only log reader seam; the default reads the current instance's last ten minutes read-only. */
+  recentLogs?: () => LogStoreRow[];
 }
 
 export interface CountByStatus { [status: string]: number }
@@ -281,7 +285,7 @@ function safeMandate(): TradeMandate | null {
 }
 
 export interface OpsAnomaly {
-  kind: 'blocked_task' | 'errored_loop' | 'orchestrator_stale' | 'schedule_stale' | 'schedule_error';
+  kind: 'blocked_task' | 'errored_loop' | 'orchestrator_stale' | 'schedule_stale' | 'schedule_error' | 'repeated_failure';
   entity: string;
   detail: string;
   since?: string;
@@ -291,6 +295,14 @@ export interface OpsHealthReport {
   healthy: boolean;
   anomalies: OpsAnomaly[];
   generatedAt: string;
+}
+
+/** Newest rows first, bounded: the health check must not load an unbounded 10-minute window into memory (review must-fix). */
+export const REPEATED_FAILURE_SCAN_LIMIT = 20_000;
+export function readRecentFailureLogs(store: Pick<LogStore, 'query'>, nowMs: number, limit = REPEATED_FAILURE_SCAN_LIMIT): LogStoreRow[] {
+  const rows = store.query({ sinceMs: nowMs - 10 * 60_000, limit });
+  if (rows.length >= limit) debug.log('ops.health', 'repeated-failure-scan-capped', { limit });
+  return rows;
 }
 
 /** 이상 판정(순수 집계) — 셀프교정(P3)의 입력. scheduleHealth 패턴 미러. */
@@ -327,6 +339,27 @@ export function opsHealth(opts: OpsStatusOpts = {}): OpsHealthReport {
     for (const e of snap.schedules.errored) {
       anomalies.push({ kind: 'schedule_error', entity: e.name, detail: `마지막 실행 error`, ...(e.lastRun ? { since: e.lastRun } : {}) });
     }
+  }
+
+  // Independent log check: an unreadable log store must not hide task/loop/schedule anomalies.
+  try {
+    const recentLogs = opts.recentLogs ?? (() => {
+      const path = logsDbPath();
+      if (!existsSync(path)) return [];
+      const store = LogStore.openReadOnly(path);
+      try { return readRecentFailureLogs(store, (opts.now ?? new Date()).getTime()); }
+      finally { store.close(); }
+    });
+    const groups = detectRepeatedFailures(recentLogs());
+    for (const group of groups) {
+      anomalies.push({
+        kind: 'repeated_failure', entity: redactSecretText(group.key),
+        detail: redactSecretText(explainFailure(group)), since: group.firstTs,
+      });
+    }
+    debug.log('ops.health', 'repeated-failure', { groups: groups.length, topCount: groups[0]?.count ?? 0 });
+  } catch (err) {
+    debug.log('ops.health', 'repeated-failure-skipped', { reason: redactSecretText(err instanceof Error ? err.message : String(err)) });
   }
 
   return { healthy: anomalies.length === 0, anomalies, generatedAt: snap.generatedAt };

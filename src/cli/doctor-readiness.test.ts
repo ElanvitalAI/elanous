@@ -104,7 +104,7 @@ describe('checkReadiness', () => {
     const tool = byId({ ...healthy, distro: 'debian', rgOnPath: false, codexOnPath: false, nodeOnPath: false }, 'harness-tools');
     expect(tool.status).toBe('manual');
     expect(tool.evidence).toContain('rg and codex missing');
-    expect(tool.remedy).toBe('sudo apt-get update && sudo apt-get install -y ripgrep && sudo apt-get update && sudo apt-get install -y nodejs npm && sudo npm install -g @openai/codex');
+    expect(tool.remedy).toBe('sudo apt-get update && sudo apt-get install -y ripgrep');
   });
 
   // 🩸 2026-09-25 amazonlinux:2: node 를 깔 줄이 없는데 `sudo npm install -g @openai/codex` 만 나가 npm 없음으로 죽었다.
@@ -137,10 +137,10 @@ describe('checkReadiness', () => {
     expect(unknown.remedy).toBeUndefined();
     expect(byId({ distro: 'unknown', rgOnPath: true, codexOnPath: false, nodeOnPath: true }, 'harness-tools').remedy).toBeUndefined();
     expect(byId({ distro: 'debian', rgOnPath: true, codexOnPath: false, nodeOnPath: false }, 'harness-tools').remedy)
-      .toBe('sudo apt-get update && sudo apt-get install -y nodejs npm && sudo npm install -g @openai/codex');
+      .toBe('Install Node.js 20+ using the official distribution instructions at https://nodejs.org/en/download');
     expect(byId({ rgOnPath: true, codexOnPath: true, nodeOnPath: true }, 'harness-tools').status).toBe('ok');
     const missingNode = byId({ distro: 'debian', rgOnPath: true, codexOnPath: true, nodeOnPath: false }, 'harness-tools');
-    expect(missingNode).toMatchObject({ status: 'manual', remedy: 'sudo apt-get update && sudo apt-get install -y nodejs npm' });
+    expect(missingNode).toMatchObject({ status: 'manual', remedy: 'Install Node.js 20+ using the official distribution instructions at https://nodejs.org/en/download' });
     expect(missingNode.evidence).toContain('node missing');
     const unknownMissingNode = byId({ distro: 'unknown', rgOnPath: true, codexOnPath: true, nodeOnPath: false }, 'harness-tools');
     expect(unknownMissingNode.status).toBe('manual');
@@ -313,6 +313,22 @@ describe('checkReadiness', () => {
     expect(item.evidence).not.toContain('sk-live-should-never-appear');
     expect(item.evidence).toContain('[redacted]');
     expect(item.evidence).not.toContain('matches');
+  });
+
+  test('no service file and no health response needs no version comparison or human action', () => {
+    const report = checkReadiness({ serviceFile: null, health: null });
+    expect(report.items.find((entry) => entry.id === 'service-version'))
+      .toEqual({ id: 'service-version', status: 'ok', evidence: 'no service installed; nothing to compare' });
+    expect(report.items.find((entry) => entry.id === 'service-file'))
+      .toMatchObject({ status: 'ok', evidence: 'no service file installed' });
+    expect(report.items.filter((entry) => entry.status === 'manual' || entry.status === 'fixable').map((entry) => entry.id))
+      .not.toContain('service-version');
+    for (const serviceFile of [{ path: '/unit.service', text: '[Service]' }, undefined]) {
+      expect(byId({ serviceFile, health: null }, 'service-version'))
+        .toEqual({ id: 'service-version', status: 'unknown', evidence: 'health did not respond; not measured' });
+    }
+    expect(byId({ serviceFile: null }, 'service-version'))
+      .toEqual({ id: 'service-version', status: 'unknown', evidence: 'health was not measured' });
   });
 
   test('health that does not respond is unknown, not a claim that the service is down', () => {

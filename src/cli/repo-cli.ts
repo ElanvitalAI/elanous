@@ -1,12 +1,19 @@
-import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { stdin, stdout } from 'node:process';
 import * as readline from 'node:readline/promises';
 import type { Command } from 'commander';
 
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
+import { applyDesignDirection } from '../design/apply-direction.js';
+import { createCustomSystemFromPalette, createCustomSystemFromUrl, unreadTokenCount } from '../design/custom-system-create.js';
+import { libraryDir } from '../design/design-library.js';
+import type { PromotedSystem } from '../design/system-from-extract.js';
+import { formatDesignGate, runDesignGate, type DesignGateDeps, type DesignGateResult } from '../design/design-gate.js';
 import { designCheckExitCode, resolveDesignCheck, type DesignCheckOutcome } from '../design/design-check.js';
-import { listDesignDirections, parseDeclaredDirection, writeDeclaredDirection } from '../design/design-directions.js';
+import { listAllDesignDirections, listDesignDirections, parseDeclaredDirection } from '../design/design-directions.js';
+import { defaultDesignSystemsDir, listDesignSystems } from '../design/design-systems.js';
 import { runScreenContrast } from '../design/screen-contrast-run.js';
 import { archiveObtainedNothing, formatArchiveRecord, runArchive, type ArchiveRecord } from '../webclone/archive-run.js';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
@@ -20,11 +27,26 @@ export interface RepoCliDeps extends RepositoryPublishDeps, ProjectScaffoldDeps 
   out?: { log: (message: string) => void; error: (message: string) => void };
   scaffoldProject?: (target: string, deps?: ProjectScaffoldDeps) => ProjectScaffoldResult;
   readFile?: (path: string, encoding: 'utf8') => string;
-  writeFile?: (path: string, contents: string) => void;
+  writeFile?: (path: string, contents: string, options?: { exclusive?: boolean; onCreated?: () => void }) => void;
   readdir?: (path: string) => readonly string[];
+  mkdir?: (path: string) => void;
+  removeFile?: (path: string) => void;
+  removeDir?: (path: string) => void;
+  renameFile?: (from: string, to: string) => void;
+  /** Where a document write really lands (a symlinked DESIGN.md resolves to its target) and that file's mode. */
+  documentTarget?: (path: string) => { path: string; mode?: number };
+  setFileMode?: (path: string, mode: number) => void;
   designCraftDirectory?: () => string;
+  designSystemsDirectory?: () => string;
   runArchive?: (options: Parameters<typeof runArchive>[0]) => Promise<ArchiveRecord>;
   setExitCode?: (code: number) => void;
+  makeDesignPreviews?: typeof import('../design/design-previews.js').makeDesignPreviews;
+  openDesignConfig?: typeof import('../design/open-design-client.js').openDesignConfig;
+  runDesignGate?: (input: { projectDir: string; base?: string; maxFiles?: number }, deps?: DesignGateDeps) => DesignGateResult;
+  designLibraryDirectory?: () => string;
+  /** `--out` 을 안 줬을 때 추출 원본이 놓이는 뿌리. 기본은 상태 루트 `design/extracts`. */
+  designExtractRoot?: () => string;
+  runExtractDesign?: typeof import('../webclone/extract-design-run.js').runExtractDesign;
 }
 
 async function confirmPublication(prompt: string): Promise<string | undefined> {
@@ -33,16 +55,31 @@ async function confirmPublication(prompt: string): Promise<string | undefined> {
   try { return await input.question(prompt); } catch { return undefined; } finally { input.close(); }
 }
 
-const liveDeps: Required<Pick<RepoCliDeps, 'cwd' | 'isTerminal' | 'confirm' | 'out' | 'scaffoldProject' | 'readFile' | 'writeFile' | 'readdir' | 'designCraftDirectory' | 'runArchive' | 'setExitCode'>> = {
+const liveDeps: Required<Pick<RepoCliDeps, 'cwd' | 'isTerminal' | 'confirm' | 'out' | 'scaffoldProject' | 'readFile' | 'writeFile' | 'readdir' | 'mkdir' | 'removeFile' | 'removeDir' | 'renameFile' | 'designCraftDirectory' | 'designSystemsDirectory' | 'runArchive' | 'setExitCode'>> = {
   cwd: () => process.cwd(),
   isTerminal: () => Boolean(stdin.isTTY),
   confirm: confirmPublication,
   out: console,
   scaffoldProject,
   readFile: (path) => readFileSync(path, 'utf8'),
-  writeFile: (path, contents) => writeFileSync(path, contents, 'utf8'),
+  writeFile: (path, contents, options) => {
+    if (!options?.exclusive) {
+      writeFileSync(path, contents, 'utf8');
+      return;
+    }
+    const fd = openSync(path, 'wx');
+    try {
+      options.onCreated?.();
+      writeFileSync(fd, contents, 'utf8');
+    } finally { closeSync(fd); }
+  },
   readdir: (path) => readdirSync(path),
+  mkdir: (path) => mkdirSync(path),
+  removeFile: (path) => unlinkSync(path),
+  removeDir: (path) => rmdirSync(path),
+  renameFile: (from, to) => renameSync(from, to),
   designCraftDirectory: () => resolve(import.meta.dir, '..', '..', 'docs', 'design', 'craft'),
+  designSystemsDirectory: defaultDesignSystemsDir,
   runArchive,
   setExitCode: (code) => { process.exitCode = code; },
 };
@@ -265,12 +302,8 @@ export async function runRepositoryDesignCheck(target: string | undefined, overr
   return exitCode;
 }
 
-/** B5 — 대화 시작에 내밀 「방향」을 보여주거나 고른다.
- *
- *  ⛔ 방향 «목록»을 여기서 만들지 않는다 — `listDesignDirections` 가 `THEME_REGISTRY`
- *  에서 도출하고, 이 함수는 그것을 렌더하거나 `DESIGN.md` 에 적기만 한다.
- *  ⭐ 대상 문서·규칙집 뿌리 결정은 `resolveRepositoryDesignCheck` 과 «같은 규칙»을
- *  써야 하므로 경로 계산을 복제하지 않고 그 자리(`join(cwd, 'DESIGN.md')`)를 따른다. */
+/** 테마와 번들 디자인 시스템의 방향을 보여주고, 시스템 선택 시 프로젝트에 토큰을 복사한다.
+ * 대상 문서 경로는 design-check 와 같은 resolver 를 사용한다. */
 export async function runRepositoryDesignDirection(
   target: string | undefined,
   chosen: string | undefined,
@@ -278,7 +311,43 @@ export async function runRepositoryDesignDirection(
 ): Promise<number> {
   const deps = { ...liveDeps, ...overrides };
   const documentPath = resolveRepositoryDesignTarget(target, deps.cwd(), deps.readdir);
-  const directions = listDesignDirections();
+  const systemsDir = deps.designSystemsDirectory();
+  if (chosen !== undefined) {
+    const result = applyDesignDirection(documentPath, chosen, {
+      systemsDir,
+      deps: {
+        ...(overrides.readFile && { readFile: overrides.readFile }),
+        ...(overrides.writeFile && { writeFile: overrides.writeFile }),
+        ...(overrides.readdir && { readdir: overrides.readdir }),
+        ...(overrides.mkdir && { mkdir: overrides.mkdir }),
+        ...(overrides.removeFile && { removeFile: overrides.removeFile }),
+        ...(overrides.removeDir && { removeDir: overrides.removeDir }),
+        ...(overrides.renameFile && { renameFile: overrides.renameFile }),
+        ...(overrides.documentTarget && { documentTarget: overrides.documentTarget }),
+        ...(overrides.setFileMode && { setFileMode: overrides.setFileMode }),
+      },
+    });
+    if (!result.ok) {
+      if (result.reason === 'cannot-read') {
+        deps.out.error(`Repository design direction blocked: cannot read ${documentPath}.`);
+        const resolution = designTargetResolutionMessage(target, deps.cwd(), documentPath);
+        if (resolution) deps.out.error(resolution);
+      } else if (result.reason === 'unknown-direction') {
+        deps.out.error(`Repository design direction blocked: unknown direction ${chosen}.`);
+        deps.out.error(`Available directions: ${result.availableDirections?.join(', ') || '(none)'}`);
+      } else if (result.reason === 'conflicting-system-file') {
+        deps.out.error(`Repository design direction blocked: conflicting system file ${result.path}; preserve or move the existing file before retrying.`);
+        debug.log('repo-design-direction', 'conflict', { documentPath, path: result.path, direction: chosen }, { level: 'warn' });
+      } else {
+        deps.out.error(`Repository design direction blocked: cannot write ${documentPath}.`);
+      }
+      return 1;
+    }
+    deps.out.log(`Design document: ${documentPath}`);
+    deps.out.log(`Design direction: ${chosen}`);
+    debug.log('repo-design-direction', 'done', { target: documentPath, direction: chosen, mode: 'write' });
+    return 0;
+  }
 
   let document: string;
   try {
@@ -291,34 +360,36 @@ export async function runRepositoryDesignDirection(
     return 1;
   }
 
-  if (chosen !== undefined) {
-    // ⛔ 모르는 이름을 «조용히» 쓰지 않는다. 쓰고 나면 그 문서는
-    //    「선언했는데 못 찾겠다」 상태가 되고, 그것을 만든 것이 우리가 된다.
-    if (!directions.some((d) => d.id === chosen)) {
-      deps.out.error(`Repository design direction blocked: unknown direction ${chosen}.`);
-      deps.out.error(`Available directions: ${directions.map((d) => d.id).join(', ') || '(none)'}`);
-      return 1;
-    }
-    try {
-      deps.writeFile(documentPath, writeDeclaredDirection(document, chosen));
-    } catch (err) {
-      deps.out.error(`Repository design direction blocked: cannot write ${documentPath}.`);
-      debug.log('repo-design-direction', 'write-failed', { documentPath, error: String(err) }, { level: 'error' });
-      return 1;
-    }
-    deps.out.log(`Design document: ${documentPath}`);
-    deps.out.log(`Design direction: ${chosen}`);
-    debug.log('repo-design-direction', 'done', { target: documentPath, direction: chosen, mode: 'write' });
-    return 0;
-  }
-
+  const librarySystemsDir = (overrides.designLibraryDirectory ?? libraryDir)();
+  const directions = listAllDesignDirections({ systemsDir, librarySystemsDir });
+  const themes = listDesignDirections();
+  const systems = listDesignSystems(systemsDir).filter((system) => !themes.some((theme) => theme.id === system.id));
+  // 라이브러리(내 시스템)는 번들과 «다른 묶음»이다 — 번들 목록에서 분류를 찾으면 custom id 에서 죽는다(09-28 실측).
+  const bundledIds = new Set(systems.map((system) => system.id));
+  const customs = listDesignSystems(librarySystemsDir)
+    .filter((system) => !bundledIds.has(system.id) && !themes.some((theme) => theme.id === system.id));
   const declaration = parseDeclaredDirection(document, directions);
   deps.out.log(`Design document: ${documentPath}`);
   deps.out.log(`Design direction: ${declaration.declared ?? '(none declared)'}`);
   if (declaration.unavailable) {
     deps.out.error(`Unavailable design direction: ${declaration.unavailable}`);
   }
-  for (const d of directions) {
+  deps.out.log(`Design systems (web · tokens) (${systems.length})`);
+  const systemLine = (d: (typeof directions)[number], category: string): void => {
+    const mark = d.id === declaration.declared ? '*' : ' ';
+    deps.out.log(`${mark} ${d.id}  [${category}] ${d.mood}  bg: ${d.swatch.bg}  fg: ${d.swatch.fg}  accent: ${d.swatch.accent}`);
+  };
+  for (const d of directions.filter((direction) => direction.source === 'design-system' && bundledIds.has(direction.id))) {
+    systemLine(d, systems.find((system) => system.id === d.id)?.category ?? '');
+  }
+  if (customs.length) {
+    deps.out.log(`My design systems (${librarySystemsDir}) (${customs.length})`);
+    for (const d of directions.filter((direction) => customs.some((system) => system.id === direction.id))) {
+      systemLine(d, customs.find((system) => system.id === d.id)?.category ?? 'Custom');
+    }
+  }
+  deps.out.log(`Terminal themes (${themes.length})`);
+  for (const d of themes) {
     const mark = d.id === declaration.declared ? '*' : ' ';
     deps.out.log(`${mark} ${d.id}  ${d.mood}`);
   }
@@ -329,6 +400,144 @@ export async function runRepositoryDesignDirection(
     debug.log('repo-design-direction', 'done', { target: documentPath, direction: declaration.declared, mode: 'read' });
   }
   return exitCode;
+}
+
+const OPEN_DESIGN_UNCONFIGURED = 'OpenDesign 이 설정되지 않았다 — design.openDesign.url · tokenFile';
+
+function formatPromotedSystem(system: PromotedSystem, savedDir: string): string[] {
+  return [
+    ...system.provenance.map((row) => `${row.token}  ${row.value}  ${row.from}`),
+    `못 읽은 칸 ${unreadTokenCount(system.tokensCss)}`,
+    `저장  ${savedDir}`,
+  ];
+}
+
+/** URL 하나에서 추출(`--no-assets` 와 같은 경로)한 뒤 라이브러리에 두고, `--set` 이면 프로젝트에 적용한다. */
+export async function runRepositoryDesignSystemFromUrl(
+  url: string,
+  options: { id?: string; name?: string; base?: string; set?: string; json?: boolean; out?: string },
+  overrides: RepoCliDeps = {},
+): Promise<number> {
+  const deps = { ...liveDeps, ...overrides };
+  const library = (overrides.designLibraryDirectory ?? libraryDir)();
+  const created = await createCustomSystemFromUrl(
+    { url, id: options.id, name: options.name, base: options.base, out: options.out },
+    {
+      libraryDirectory: () => library,
+      systemsDirectory: deps.designSystemsDirectory,
+      extractRoot: overrides.designExtractRoot,
+      readFile: deps.readFile,
+      runExtractDesign: overrides.runExtractDesign,
+    },
+  );
+  if (!created.ok) {
+    deps.out.error(`✗ ${created.detail ?? created.reason}`);
+    return 1;
+  }
+  const system = created.system;
+  if (options.json) {
+    deps.out.log(JSON.stringify({
+      id: created.id,
+      saved: created.dir,
+      extractDir: created.extractDir,
+      provenance: system.provenance,
+      tokensCss: system.tokensCss,
+    }, null, 2));
+  } else {
+    for (const line of formatPromotedSystem(system, created.dir)) deps.out.log(line);
+    if (created.extractDir) deps.out.log(`추출 원본  ${created.extractDir}`);
+  }
+  if (options.set) {
+    const documentPath = resolveRepositoryDesignTarget(options.set, deps.cwd(), deps.readdir);
+    const applied = applyDesignDirection(documentPath, created.id, {
+      systemsDir: deps.designSystemsDirectory(),
+      librarySystemsDir: library,
+    });
+    if (!applied.ok) {
+      deps.out.error(`design-system from-url 적용 실패: ${applied.reason}`);
+      return 1;
+    }
+    if (!options.json) deps.out.log(`적용  ${documentPath}`);
+  }
+  return 0;
+}
+
+/** 색만 주면 밝기·채도로 핵심 토큰을 정하고 나머지는 base 에서 채운다. */
+export async function runRepositoryDesignSystemFromPalette(
+  hexes: string,
+  options: { id?: string; name?: string; base?: string; json?: boolean },
+  overrides: RepoCliDeps = {},
+): Promise<number> {
+  const deps = { ...liveDeps, ...overrides };
+  const id = options.id?.trim() ?? '';
+  if (!id) {
+    deps.out.error('design-system from-palette 는 --id 가 필요하다.');
+    return 2;
+  }
+  const colors = hexes.split(',').map((hex) => hex.trim()).filter(Boolean);
+  const library = (overrides.designLibraryDirectory ?? libraryDir)();
+  const created = await createCustomSystemFromPalette(
+    { colors, id, name: options.name, base: options.base },
+    {
+      libraryDirectory: () => library,
+      systemsDirectory: deps.designSystemsDirectory,
+    },
+  );
+  if (!created.ok) {
+    deps.out.error(`✗ ${created.detail ?? created.reason}`);
+    return 1;
+  }
+  const system = created.system;
+  if (options.json) {
+    deps.out.log(JSON.stringify({
+      id: created.id,
+      saved: created.dir,
+      provenance: system.provenance,
+      tokensCss: system.tokensCss,
+    }, null, 2));
+  } else {
+    for (const line of formatPromotedSystem(system, created.dir)) deps.out.log(line);
+  }
+  return 0;
+}
+
+/** 후보 시스템 2~3개의 시안을 OpenDesign 에서 받아 `<dir>/design/previews/<system>.html` 로 둔다. */
+export async function runRepositoryDesignPreview(
+  target: string | undefined,
+  options: { brief?: string; systems?: string; agent?: string; json?: boolean },
+  overrides: RepoCliDeps = {},
+): Promise<number> {
+  const deps = { ...liveDeps, ...overrides };
+  const brief = options.brief?.trim() ?? '';
+  const systems = (options.systems ?? '').split(',').map((system) => system.trim()).filter(Boolean);
+  if (!brief || systems.length === 0) {
+    deps.out.error('design-preview 는 --brief 와 --systems 가 필요하다.');
+    return 2;
+  }
+  const agent = options.agent ?? 'codex';
+  if (agent !== 'codex' && agent !== 'claude') {
+    deps.out.error(`design-preview agent 는 codex 또는 claude 만 받는다: ${agent}`);
+    return 2;
+  }
+  const loadConfig = overrides.openDesignConfig ?? (await import('../design/open-design-client.js')).openDesignConfig;
+  const connection = loadConfig();
+  if (!connection) {
+    deps.out.error(OPEN_DESIGN_UNCONFIGURED);
+    return 2;
+  }
+  const repoRoot = resolve(deps.cwd(), target ?? '.');
+  const make = overrides.makeDesignPreviews ?? (await import('../design/design-previews.js')).makeDesignPreviews;
+  const results = await make({ repoRoot, brief, systems, agentId: agent }, { connection });
+  if (options.json) {
+    deps.out.log(JSON.stringify(results, null, 2));
+  } else {
+    for (const result of results) {
+      deps.out.log(result.ok && result.path
+        ? `${result.system}  ${result.path}`
+        : `${result.system}  ${result.reason ?? result.status}`);
+    }
+  }
+  return results.some((result) => result.ok) || results.length === 0 ? 0 : 1;
 }
 
 export async function runRepositoryPublish(target: string | undefined, overrides: RepoCliDeps = {}): Promise<number> {
@@ -410,6 +619,51 @@ export function registerRepoCommands(program: Command, overrides: RepoCliDeps = 
         await registerStandaloneLogSink('repo-design-direction');
       } catch { /* fail-open — 관측 배선이 명령을 막지 않는다 */ }
       const code = await runRepositoryDesignDirection(target, opts.set, deps);
+      if (code !== 0) deps.setExitCode(code);
+    });
+  repo.command('design-preview [project-directory]')
+    .description('후보 디자인 시스템의 시안을 OpenDesign 에서 받아 design/previews 에 둔다')
+    .requiredOption('--brief <text>', '시안에 쓸 한 줄 브리프')
+    .requiredOption('--systems <list>', '쉼표로 구분한 시스템 id (예: minimal,editorial)')
+    .option('--agent <id>', 'codex 또는 claude', 'codex')
+    .option('--json', '기계용 JSON')
+    .action(async (target: string | undefined, opts: { brief?: string; systems?: string; agent?: string; json?: boolean }) => {
+      try {
+        const { registerStandaloneLogSink } = await import('../domains/standalone-log-sink.js');
+        await registerStandaloneLogSink('repo-design-preview');
+      } catch { /* fail-open — 관측 배선이 명령을 막지 않는다 */ }
+      const code = await runRepositoryDesignPreview(target, opts, deps);
+      if (code !== 0) deps.setExitCode(code);
+    });
+  const designSystem = repo.command('design-system').description('추출값 또는 팔레트를 내 디자인 시스템으로 올려 라이브러리에 둔다');
+  designSystem.command('from-url <url>')
+    .description('URL 하나에서 토큰을 재고 번들 시스템과 같은 모양으로 라이브러리에 저장한다')
+    .option('--id <id>', '시스템 id (기본: 호스트 첫 라벨)')
+    .option('--name <name>', '표시 이름 (기본: id)')
+    .option('--base <system-id>', '못 읽은 칸만 이 번들 시스템 값으로 채운다')
+    .option('--set <project>', '저장 뒤 그 프로젝트 DESIGN.md 에 적용한다')
+    .option('--out <dir>', '추출 산출 뿌리 (기본: 상태 루트 design/extracts)')
+    .option('--json', '기계용 JSON')
+    .action(async (url: string, opts: { id?: string; name?: string; base?: string; set?: string; out?: string; json?: boolean }) => {
+      try {
+        const { registerStandaloneLogSink } = await import('../domains/standalone-log-sink.js');
+        await registerStandaloneLogSink('repo-design-system');
+      } catch { /* fail-open */ }
+      const code = await runRepositoryDesignSystemFromUrl(url, opts, deps);
+      if (code !== 0) deps.setExitCode(code);
+    });
+  designSystem.command('from-palette <hexes>')
+    .description('쉼표로 구분한 색만으로 시스템을 만든다 — 나머지는 --base 에서')
+    .requiredOption('--id <id>', '시스템 id')
+    .option('--name <name>', '표시 이름 (기본: id)')
+    .option('--base <system-id>', '색으로 정하지 못한 칸을 이 시스템에서 채운다', 'minimal')
+    .option('--json', '기계용 JSON')
+    .action(async (hexes: string, opts: { id?: string; name?: string; base?: string; json?: boolean }) => {
+      try {
+        const { registerStandaloneLogSink } = await import('../domains/standalone-log-sink.js');
+        await registerStandaloneLogSink('repo-design-system');
+      } catch { /* fail-open */ }
+      const code = await runRepositoryDesignSystemFromPalette(hexes, opts, deps);
       if (code !== 0) deps.setExitCode(code);
     });
   repo.command('design-extract <url>')
@@ -607,8 +861,9 @@ export function registerRepoCommands(program: Command, overrides: RepoCliDeps = 
     .description('산출물(HTML+CSS)이 AI 기본값 냄새(anti-ai-slop P0)를 내는지 검사 — 씨앗 DESIGN.md 를 기준으로')
     .option('--css <file>', 'CSS 경로 (기본: 같은 폴더의 styles.css)')
     .option('--design <file>', '씨앗 DESIGN.md (기본: 같은 폴더)')
+    .option('--tokens <file>', '디자인 시스템 tokens.css (기본: 씨앗 `## Design direction` 절의 `- tokens:` 줄)')
     .option('--json', '기계용 JSON')
-    .action(async (htmlPath: string, opts: { css?: string; design?: string; json?: boolean }) => {
+    .action(async (htmlPath: string, opts: { css?: string; design?: string; tokens?: string; json?: boolean }) => {
       // 독립 CLI 프로세스도 logs.db sink를 명시 등록해야 `design.lint` 원장이 조회된다.
       try {
         const { registerStandaloneLogSink } = await import('../domains/standalone-log-sink.js');
@@ -617,11 +872,35 @@ export function registerRepoCommands(program: Command, overrides: RepoCliDeps = 
       // ⛔ 재구현하지 않는다 — `lint-artifact-run.ts` 가 정본이고 스크립트도 같은 것을 부른다.
       try {
         const { formatLintDesignRun, runLintDesign } = await import('../design/lint-artifact-run.js');
-        const result = runLintDesign({ htmlPath, cssPath: opts.css, designPath: opts.design });
+        const result = runLintDesign({ htmlPath, cssPath: opts.css, designPath: opts.design, tokensPath: opts.tokens });
         if (opts.json) deps.out.log(JSON.stringify(result, null, 2));
         else for (const line of formatLintDesignRun(result)) deps.out.log(line);
         // ⛔ P0 는 «결과»다 — 0 이 아니면 종료 코드로 말한다(무인 게이트가 이것을 읽는다).
         if (result.p0Count > 0) deps.setExitCode(1);
+      } catch (error) {
+        deps.out.error(`✗ ${error instanceof Error ? error.message : String(error)}`);
+        deps.setExitCode(2);
+      }
+    });
+  repo.command('design-gate [project-directory]')
+    .description('프로젝트의 바뀐 HTML 이 고른 디자인 방향을 따랐는지 한 판정으로 낸다 — LLM 없음')
+    .option('--base <ref>', '이 ref...HEAD 에서 바뀐 .html 만 잰다 (없으면 프로젝트의 모든 .html)')
+    .option('--json', '사람 출력 없이 결과 JSON 한 줄')
+    .action(async (projectDirectory: string | undefined, opts: { base?: string; json?: boolean }) => {
+      try {
+        const { registerStandaloneLogSink } = await import('../domains/standalone-log-sink.js');
+        await registerStandaloneLogSink('repo-design-gate');
+      } catch { /* 판정은 관측 부트스트랩 실패와 무관하게 계속 낸다 */ }
+      try {
+        const projectDir = resolve(projectDirectory ?? deps.cwd());
+        const result = (deps.runDesignGate ?? runDesignGate)({ projectDir, base: opts.base });
+        const payload = JSON.stringify(result);
+        if (opts.json) deps.out.log(payload);
+        else {
+          for (const line of formatDesignGate(result)) deps.out.log(line);
+          deps.out.log(payload);
+        }
+        if (result.verdict === 'fail') deps.setExitCode(1);
       } catch (error) {
         deps.out.error(`✗ ${error instanceof Error ? error.message : String(error)}`);
         deps.setExitCode(2);

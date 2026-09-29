@@ -496,7 +496,6 @@
 1	handoff-doc-link	test/integration/README.md
 1	handoff-doc-link	test/logs-timeline.test.ts
 1	handoff-doc-link	test/nexus-multi-llm-wire-smoke.test.ts
-1	handoff-doc-link	test/virtual-windows-skip-store-alt.test.ts
 1	handoff-doc-link	test/voice-wiring.test.ts
 4	pilot-tree	scripts/botlab/bot-canary.test.ts
 1	pilot-tree	scripts/botlab/bot-fault-drill.sh
@@ -704,12 +703,6 @@
 2	plan-doc-link	src/verifier/builtins/code-feedback.ts
 1	plan-doc-link	src/verifier/builtins/test-heuristic.ts
 1	plan-doc-link	src/verifier/types.ts
-1	plan-doc-link	src/virtual-windows/layout/persistence.ts
-1	plan-doc-link	src/virtual-windows/layout/presets.ts
-1	plan-doc-link	src/virtual-windows/layout/restore-planner.ts
-1	plan-doc-link	src/virtual-windows/layout/serializer.ts
-1	plan-doc-link	src/virtual-windows/layout/tree.ts
-1	plan-doc-link	src/virtual-windows/layout/types.ts
 1	plan-doc-link	src/widget-routing/terminal-pane-behavior.ts
 1	plan-doc-link	src/widgets/types.ts
 1	plan-doc-link	test/acp-session-id-unique.test.ts

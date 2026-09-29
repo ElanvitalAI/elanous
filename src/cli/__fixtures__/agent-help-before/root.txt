@@ -15,7 +15,9 @@ Commands:
   pr                                           PR landing commands
   repo                                         명시적 로컬 저장소 GitHub 비공개 발행
   role                                         관제부 Primary 임대 조회 및 수동 넘김
+  machine                                      기계 식별자 · 맡은 일 · 자리 후보 순위
   where [options]                              지금 이 프로세스가 어느 인스턴스(prod/test)에 속하는지와 그 이유를 보여준다 (READ-ONLY)
+  shadow                                       git 아닌 폴더의 이력을 인스턴스 밖 그림자 저장소에 남긴다
   leader                                       은퇴한 리더 트리 명령
   pod                                          Pod 명령 Job — 하니스 없이 명령 하나를 돌리고 산출을 돌려받는다
   browser                                      🎨 봇이 모는 브라우저 페이지 «안»에 그린다 — 도형 · 캔들 차트 · 지우기
@@ -26,10 +28,12 @@ Commands:
   doctor [options]                             Reports whether credentials resolve and where each resolution comes from
   control                                      독립 관제부
   resources                                    관제부 자원 조회
+  hooks                                        외부 웹훅 수신·재전송
   setup [options]                              Check OpenAI Codex setup and guide each missing credential step
   grounding                                    그라운딩 출처 레지스트리
   graph                                        Run a declared command graph or inspect its latest run
   launch-head                                  발사 앞 머리 — 골이 Pod 로 가도 되는지 판정
+  connector                                    External task connectors
   python                                       elanous 가 쓰는 파이썬(해석 · 점검 · elanous venv 셋업) — RFC-doctor-fix-build-toolchain-and-python-by-distro
   self-update|update [options]                 설치본은 릴리스로, 체크아웃은 깨끗한 체크아웃으로 갱신하고 승인 시 넥서스 재시작 · `elanous update` 와 같다 · `--auto on` 이면 매일 자동
   measure-fabric-arc-ab                        Fabric 분해 아크의 축소/전체 그라운딩 A/B를 관측하고 표와 JSON 결과를 낸다
@@ -74,7 +78,8 @@ Commands:
   keys [options] [context]                     Print all keybindings + slash commands. Optional context filter.
   finance                                      Native finance/investment logic (SSOT) — skill thin-client 진입점
   config                                       Inspect and edit ~/.config/elanous/config.json
-  task|tasks [args...]                         Retired — use `elanous wf` (workflow-runtime DAG · supersedes scheduler v2)
+  tasks|task                                   TOX 태스크 조회 및 승인
+  labels                                       PR 라벨 등록표 조회·GitHub 동기화
   ask [options] <text...>                      Alias for `elanous chat --new`: send one query and print the reply
   onboarding [options] [step]                  Run the first-run wizard. Pass a step name (llm|skills|obsidian|telegram|discord|voice-ai) to run only that step.
   login                                        Authenticate to an LLM provider via OAuth

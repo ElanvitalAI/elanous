@@ -22,6 +22,9 @@ import type { AcpServerHandle } from '../acp/server.js';
 import { debug } from '../debug/log.js';
 import { getDefaultPaneFactory } from '../panes/factory.js';
 import { webTerminalPaneRef } from '../panes/web-terminal-pane.js';
+import { listPty, registerPtyControlTarget, startPtyControlPoller, type PtyControlTarget } from '../pty-shell/registry.js';
+import { upsertPtyManifest, markPtyManifestClosed, touchLivePtyManifest } from '../pty-shell/pty-manifest.js';
+import { tapPtyOutput } from '../pty-shell/pty-recording.js';
 
 interface SessionTap {
   unsubscribe: () => void;
@@ -42,6 +45,60 @@ interface Entry {
 }
 
 const entries = new Map<PreviewTerminal, Entry>();
+const recordTargets = new Map<PreviewTerminal, { dispose: () => void; id: string }>();
+
+function releaseRecordTarget(pt: PreviewTerminal): void {
+  const target = recordTargets.get(pt);
+  if (!target) return;
+  recordTargets.delete(pt);
+  try { target.dispose(); }
+  catch (error) { debug.log('pty.record', 'webterm-close-error', { ptyId: target.id, error: String(error) }); }
+}
+
+function attachRecordTarget(pt: PreviewTerminal, terminalId: string): { dispose: () => void; id: string } | undefined {
+  // Registry-backed previews already own their output tap, manifest and control poller.
+  if (listPty().some((handle) => handle.pid === pt.pid && handle.kind === 'preview')) return undefined;
+  const id = `webterm:${terminalId}:${pt.pid}`;
+  const target: PtyControlTarget = {
+    id,
+    get cols() { return pt.cols; }, get rows() { return pt.rows; },
+    accessMode: 'read', transitionPolicy: 'locked',
+    setAccessMode(value) { return value === 'read'; },
+    isAlive: () => pt.isAlive,
+    canWrite: () => false,
+    write: () => {},
+    resize: () => {},
+  };
+  const unregister = registerPtyControlTarget(target);
+  let off: (() => void) | undefined;
+  try {
+    off = pt.addRawOutputTap((chunk) => {
+      try { tapPtyOutput(id, chunk); }
+      catch (error) { debug.log('pty.record', 'tap-error', { ptyId: id, error: String(error) }); }
+    });
+    const startedAt = Date.now();
+    upsertPtyManifest({ id, kind: 'webterm', cmd: 'web-terminal', ptyPid: pt.pid, startedAt, now: startedAt });
+    const stopPoller = startPtyControlPoller();
+    const heartbeat = setInterval(() => {
+      if (!pt.isAlive) { releaseRecordTarget(pt); return; }
+      touchLivePtyManifest(new Set([id]), Date.now());
+    }, 15_000);
+    heartbeat.unref?.();
+    const unsubscribe = off;
+    return { id, dispose: () => {
+      clearInterval(heartbeat);
+      unsubscribe();
+      unregister();
+      markPtyManifestClosed(id, null, Date.now());
+      stopPoller();
+    } };
+  } catch (error) {
+    off?.();
+    unregister();
+    debug.log('pty.record', 'webterm-target-error', { ptyId: id, error: String(error) });
+    return undefined;
+  }
+}
 
 /** Attach one ACP session to a shell. Re-attaching that session replaces only
  *  its output tap; the returned thunk detaches only this registration. */
@@ -56,6 +113,11 @@ export function registerPreviewTerminalForWebTap(
   if (entry && entry.terminalId !== terminalId) {
     unregisterPreviewTerminalForWebTap(pt);
     entry = undefined;
+  }
+  if (!pt.isAlive) releaseRecordTarget(pt);
+  if (pt.isAlive && !recordTargets.has(pt) && (process.env.NODE_ENV !== 'test' || process.env.ELANOUS_STATE_DIR)) {
+    const target = attachRecordTarget(pt, terminalId);
+    if (target) recordTargets.set(pt, target);
   }
   if (entry?.sessions.has(sessionId)) {
     // Replace only this session's tap; keep the entry and its activity clock.
@@ -126,6 +188,7 @@ function detachPreviewTerminalSession(pt: PreviewTerminal, sessionId: string): v
   e.sessions.get(sessionId)!.unsubscribe();
   e.sessions.delete(sessionId);
   if (e.sessions.size === 0) {
+    if (!pt.isAlive) releaseRecordTarget(pt);
     if (e.paneResolved) {
       try { getDefaultPaneFactory().invalidate(webTerminalPaneRef(e.terminalId)); }
       catch { /* factory may have reset */ }
@@ -141,8 +204,9 @@ function detachPreviewTerminalSession(pt: PreviewTerminal, sessionId: string): v
  *  thunk detaches only that session; the last detach invalidates its pane. */
 export function unregisterPreviewTerminalForWebTap(pt: PreviewTerminal): void {
   const e = entries.get(pt);
-  if (!e) return;
+  if (!e) { releaseRecordTarget(pt); return; }
   for (const tap of e.sessions.values()) tap.unsubscribe();
+  releaseRecordTarget(pt);
   if (e.paneResolved) {
     try { getDefaultPaneFactory().invalidate(webTerminalPaneRef(e.terminalId)); }
     catch { /* factory may have reset */ }
@@ -238,5 +302,6 @@ export function listPreviewTerminals(sessionId: string): PreviewTerminalListEntr
  *  `unregisterPreviewTerminalForWebTap` per terminal. */
 export function __resetPreviewTapRegistry(): void {
   for (const e of entries.values()) for (const tap of e.sessions.values()) tap.unsubscribe();
+  for (const pt of recordTargets.keys()) releaseRecordTarget(pt);
   entries.clear();
 }

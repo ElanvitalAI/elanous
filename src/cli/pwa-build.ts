@@ -68,8 +68,8 @@ export function resolvePwaCwd(argvBin: string): string | undefined {
  * the missing dep names (capped at 3 so the message stays short).
  *
  * 2026-07-11 — the required set is now derived from `apps/pwa/package.json`
- * `dependencies` (every runtime dep webpack must resolve) UNION a small core
- * safety list. The old hardcoded 3-item list only caught a missing dep if it
+ * `dependencies` (every runtime dep webpack must resolve) UNION `@types/*`
+ * devDependencies and a small core safety list. The old hardcoded 3-item list only caught a missing dep if it
  * happened to be one of those three: a stale tree missing `remark-wiki-link`
  * (but not dagre) sailed past the precheck straight into a cryptic webpack
  * "Module not found". Deriving from package.json makes the precheck
@@ -87,17 +87,17 @@ interface PwaBuildPrecheck {
   missing: string[];
 }
 
-/** Runtime deps webpack must resolve = `dependencies` from apps/pwa's
- *  package.json, unioned with the core safety list. Fail-soft: an unreadable
- *  package.json degrades to just the core list. */
+/** Runtime deps webpack must resolve plus @types devDependencies needed by tsc,
+ *  unioned with the core safety list. Fail-soft: an unreadable package.json
+ *  degrades to just the core list. */
 function pwaRequiredDeps(
   cwd: string,
   readFn: (p: string) => string,
 ): string[] {
   let declared: string[] = [];
   try {
-    const pkg = JSON.parse(readFn(joinPath(cwd, 'package.json'))) as { dependencies?: Record<string, string> };
-    declared = Object.keys(pkg.dependencies ?? {});
+    const pkg = JSON.parse(readFn(joinPath(cwd, 'package.json'))) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
+    declared = [...Object.keys(pkg.dependencies ?? {}), ...Object.keys(pkg.devDependencies ?? {}).filter((dep) => dep.startsWith('@types/'))];
   } catch { /* unreadable/absent package.json → core list only */ }
   return [...new Set([...declared, ...PWA_BUILD_REQUIRED_DEPS])];
 }
@@ -113,7 +113,15 @@ export function checkPwaBuildDeps(
   }
   const missing: string[] = [];
   for (const dep of pwaRequiredDeps(cwd, readFn)) {
-    if (!existsFn(joinPath(nm, dep, 'package.json'))) missing.push(dep);
+    const pkgPath = joinPath(nm, dep, 'package.json');
+    if (!existsFn(pkgPath)) { missing.push(dep); continue; }
+    if (dep.startsWith('@types/')) {
+      try {
+        const pkg = JSON.parse(readFn(pkgPath)) as { types?: string; typings?: string };
+        const declaration = pkg.types ?? pkg.typings ?? 'index.d.ts';
+        if (!existsFn(joinPath(nm, dep, declaration))) missing.push(dep);
+      } catch { missing.push(dep); }
+    }
   }
   return { ok: missing.length === 0, missing };
 }
@@ -132,10 +140,8 @@ export async function runPwaBuild(opts: PwaBuildOpts = {}): Promise<PwaBuildResu
   // case before webpack does and emits a one-line fix.
   const deps = checkPwaBuildDeps(cwd);
   if (!deps.ok) {
-    out.error(`✗ elanous nexus build: missing node_modules in ${cwd}`);
-    out.error(`  not installed: ${deps.missing.slice(0, 3).join(', ')}${deps.missing.length > 3 ? ` (+${deps.missing.length - 3} more)` : ''}`);
-    out.error(`  fix:  cd "${cwd}" && bun install`);
-    out.error('       (the tree that owns `apps/pwa` here was likely never `bun install`-ed, or the lockfile was stripped).');
+    out.error(`✗ elanous nexus build: missing or incomplete node_modules in ${cwd}: ${deps.missing.slice(0, 3).join(', ')}${deps.missing.length > 3 ? ` (+${deps.missing.length - 3} more)` : ''}`);
+    out.error(`  fix:  cd "${cwd}" && bun install --force`);
     return { exitCode: 1, cwd, durationMs: 0 };
   }
 

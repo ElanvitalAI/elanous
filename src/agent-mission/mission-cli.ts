@@ -8,12 +8,16 @@ import { readFileSync } from 'node:fs';
 import type { AgentBackend, AgentMissionResult, EvidenceMode } from './driver.js';
 import { buildAgentMissionDevSpec, executeAgentMissionReroute, type runDevPipeline } from '../self-dev/dev-pipeline.js';
 import { parsePositiveInt } from '../self-dev/dev-cli.js';
+import { parsePluginRef } from './in-agent-plugin.js';
 
 export interface MissionCliOpts {
   missionFile?: string;
   branch: string;
   base?: string;
   backend?: string;
+  chain?: string;
+  headless?: boolean;
+  plugin?: string;
   evidence?: string; // 'doc' | 'tsc' | 'test'
   docDir?: string;
   docGlob?: string;
@@ -43,9 +47,20 @@ export async function runAgentMissionCliCommand(
   deps: MissionCliDeps,
 ): Promise<MissionCliOutcome> {
   // ── backend 검증(fail-fast·단일 resolve) ──
+  const chain = opts.chain?.split(',').map((item) => item.trim());
+  if (chain && (opts.commit === false || !['codex,claude,elanous', 'codex,claude,codex,elanous'].includes(chain.join(',')) || (opts.backend && opts.backend !== 'codex') || opts.headless)) {
+    return { ok: false, message: '--chain 은 codex,claude[,codex],elanous 형식이며 --backend 는 첫 backend 와 같아야 하고 --headless/--no-commit 은 함께 쓸 수 없습니다', exitCode: 1 };
+  }
   let agentBackend: AgentBackend;
-  try { agentBackend = deps.resolveBackend(opts.backend); }
+  try { agentBackend = deps.resolveBackend(chain?.[0] ?? opts.backend); }
   catch (e) { return { ok: false, message: String((e as { message?: string })?.message ?? e), exitCode: 1 }; }
+  if (opts.headless && agentBackend.name !== 'claude') {
+    return { ok: false, message: '--headless 는 --backend claude 전용입니다', exitCode: 1 };
+  }
+  const plugin = opts.plugin ? parsePluginRef(opts.plugin) : null;
+  if (opts.plugin !== undefined && (!plugin || !['codex', 'claude'].includes(agentBackend.name) || opts.headless)) {
+    return { ok: false, message: '--plugin 은 codex/claude 대화형 backend 에서 <name>@<market> 형식이어야 합니다', exitCode: 1 };
+  }
 
   // ── mission 텍스트(verbatim: --mission-file 우선) ──
   const readFile = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
@@ -80,6 +95,9 @@ export async function runAgentMissionCliCommand(
   const spec = buildAgentMissionDevSpec({
     mission,
     backend: agentBackend.name,
+    ...(chain ? { chain: chain as ('codex' | 'claude' | 'elanous')[] } : {}),
+    ...(plugin ? { plugin } : {}),
+    ...(opts.headless ? { headless: true } : {}),
     branch: opts.branch,
     ...(opts.base ? { base: opts.base } : {}),
     ...(opts.enhance === false ? { enhanceOff: true } : {}),

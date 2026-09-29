@@ -4,12 +4,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { dashboardMatches, dashboardSourceLocations, readDashboardSources, type DashboardSource } from './helpers/dashboard-source.js';
 
-const MOUNT_IMPORT = /import\s*{[^}]*\bmountScenarioIntoTarget\b[^}]*}\s*from ['"](?:\.\.\/)+tool-runtime\/scenario-target-mount\.js['"]/;
-const MOUNT_CALL = /\(\s*deps\.mountIntoTarget\s*\?\?\s*mountScenarioIntoTarget\s*\)\s*\(/;
+const MODAL_IMPORT = /import\s*{[^}]*\bmountScenarioIntoModal\b[^}]*}\s*from ['"](?:\.\.\/)+tool-runtime\/scenario-modal-mount\.js['"]/;
+const WIDGET_IMPORT = /import\s*{[^}]*\bmountScenarioIntoWidget\b[^}]*}\s*from ['"](?:\.\.\/)+tool-runtime\/scenario-widget-mount\.js['"]/;
+const MODAL_CALL = /\(\s*deps\.mountIntoModal\s*\?\?\s*mountScenarioIntoModal\s*\)\s*\(/;
+const WIDGET_CALL = /\(\s*deps\.mountIntoWidget\s*\?\?\s*mountScenarioIntoWidget\s*\)\s*\(/;
 
+// #21723: dashboard wires modal/widget mount helpers separately; window/pane are unsupported.
 function sharedMountSources(sources: readonly DashboardSource[]): DashboardSource[] {
-  // This is a same-module source contract; proving boot reachability belongs to the later import-graph stage.
-  return sources.filter(({ text }) => MOUNT_IMPORT.test(text) && MOUNT_CALL.test(text));
+  // Both supported mounts must be wired in the same module, not assembled from unrelated imports.
+  return sources.filter(({ text }) => MODAL_IMPORT.test(text) && WIDGET_IMPORT.test(text)
+    && MODAL_CALL.test(text) && WIDGET_CALL.test(text));
 }
 
 function text(path: string): string {
@@ -20,10 +24,10 @@ describe('ui foundation · R9.U-5(b) target boundary source truth', () => {
   test('target mount helper locks the supported mount target roster and explicit unsupported reasons', () => {
     const src = text('../src/tool-runtime/scenario-target-mount.ts');
     expect(src).toContain("export const RUN_SCENARIO_MOUNT_TARGET_KINDS = [");
-    expect(src).toContain("'window'");
-    expect(src).toContain("'pane'");
-    expect(src).toContain("'modal'");
-    expect(src).toContain("'widget'");
+    expect(src.match(/RUN_SCENARIO_MOUNT_TARGET_KINDS = \[([^\]]+)\]/)?.[1]?.match(/'[^']+'/g))
+      .toEqual(["'modal'", "'widget'"]);
+    expect(src).toContain("case 'window':");
+    expect(src).toContain("case 'pane':");
     expect(src).toContain('not a mount container');
     expect(src).toContain('transient and not a scenario mount destination');
   });
@@ -32,12 +36,11 @@ describe('ui foundation · R9.U-5(b) target boundary source truth', () => {
     const sources = readDashboardSources();
     const shared = sharedMountSources(sources);
     expect(shared.length, `Missing shared target mount import and default call in the same file: ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
-    expect(dashboardMatches(MOUNT_IMPORT, shared).length,
-      `Missing shared mount import in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
-    expect(dashboardMatches(/mountScenarioIntoTarget/, shared).length,
-      `Missing shared mount identifier in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
-    expect(dashboardMatches(MOUNT_CALL, shared).length,
-      `Missing shared mount call in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
+    for (const pattern of [MODAL_IMPORT, WIDGET_IMPORT, MODAL_CALL, WIDGET_CALL]) {
+      expect(dashboardMatches(pattern, shared).length,
+        `Missing supported mount wiring in ${dashboardSourceLocations(sources)}`).toBeGreaterThan(0);
+    }
+    expect(dashboardMatches(/unsupportedRunScenarioTargetError\(target\)/, shared).length).toBeGreaterThan(0);
     const unsupported = dashboardMatches(/is not supported by the dashboard mount path yet/, sources);
     expect(unsupported, `Unexpected ad-hoc branch at ${unsupported.map(({ path, line }) => `${path}:${line}`).join(', ')}`).toEqual([]);
   });
@@ -48,11 +51,14 @@ describe('ui foundation · R9.U-5(b) target boundary source truth', () => {
     mkdirSync(dir, { recursive: true });
     try {
       writeFileSync(join(dir, 'index.ts'), 'export {};\n');
-      writeFileSync(join(dir, 'unused.ts'), "import { mountScenarioIntoTarget } from '../tool-runtime/scenario-target-mount.js';\n");
-      writeFileSync(join(dir, 'other.ts'), '(deps.mountIntoTarget ?? mountScenarioIntoTarget)(widgets, target, deps);\n');
+      writeFileSync(join(dir, 'unused.ts'), "import { mountScenarioIntoModal } from '../tool-runtime/scenario-modal-mount.js';\nimport { mountScenarioIntoWidget } from '../tool-runtime/scenario-widget-mount.js';\n");
+      writeFileSync(join(dir, 'other.ts'), '(deps.mountIntoModal ?? mountScenarioIntoModal)(widgets, target.modalId, deps);\n(deps.mountIntoWidget ?? mountScenarioIntoWidget)(widgets, target.widgetId, deps);\n');
       expect(sharedMountSources(readDashboardSources(dir))).toEqual([]);
-      writeFileSync(join(dir, 'other.ts'), "import { mountScenarioIntoTarget } from '../tool-runtime/scenario-target-mount.js';\n(deps.mountIntoTarget ?? mountScenarioIntoTarget)(widgets, target, deps);\n");
+      writeFileSync(join(dir, 'other.ts'), "import { mountScenarioIntoModal } from '../tool-runtime/scenario-modal-mount.js';\nimport { mountScenarioIntoWidget } from '../tool-runtime/scenario-widget-mount.js';\n(deps.mountIntoModal ?? mountScenarioIntoModal)(widgets, target.modalId, deps);\n(deps.mountIntoWidget ?? mountScenarioIntoWidget)(widgets, target.widgetId, deps);\n");
       expect(sharedMountSources(readDashboardSources(dir))).toHaveLength(1);
+      // Removing either mount call breaks the shared default path, not just its import.
+      writeFileSync(join(dir, 'other.ts'), "import { mountScenarioIntoModal } from '../tool-runtime/scenario-modal-mount.js';\nimport { mountScenarioIntoWidget } from '../tool-runtime/scenario-widget-mount.js';\n(deps.mountIntoModal ?? mountScenarioIntoModal)(widgets, target.modalId, deps);\n");
+      expect(sharedMountSources(readDashboardSources(dir))).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -60,7 +66,7 @@ describe('ui foundation · R9.U-5(b) target boundary source truth', () => {
 
   test('run scenario runtime spec names the supported target kinds explicitly', () => {
     const src = text('../src/tool-runtime/scenario-runtimes.ts');
-    expect(src).toContain("import { RUN_SCENARIO_MOUNT_TARGET_KINDS } from './scenario-target-mount.js';");
+    expect(src).toMatch(/import\s*\{[^}]*\bRUN_SCENARIO_MOUNT_TARGET_KINDS\b[^}]*\}\s*from ['"]\.\/scenario-target-mount\.js['"]/);
     expect(src).toContain('Supported mount destinations are ');
     expect(src).toContain('input/popover/inline/bg return explicit unsupported-target errors');
   });

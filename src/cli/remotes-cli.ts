@@ -6,6 +6,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { defaultAcpTokenPath } from '../nexus/api/connect-info.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 import {
   RemotesStore,
   deriveNameFromHost,
@@ -51,7 +52,7 @@ export async function connectRemote(opts: ConnectRemoteOpts): Promise<number> {
   const store = opts.store ?? new RemotesStore();
   let parsed: ReturnType<typeof normalizeHost>;
   try {
-    parsed = normalizeHost(opts.host, opts.port ?? 31415);
+    parsed = normalizeHost(opts.host, opts.port ?? DEFAULT_NEXUS_HTTP_PORT);
   } catch (err) {
     out.error(`elanous nexus connect: ${(err as Error).message}`);
     return 1;

@@ -140,13 +140,28 @@ function computeObsidianResolution(): ObsidianResolution {
   return { root: def, available: false, source: 'none' };
 }
 
+function configuredVaultOnDisk(): string | null {
+  try {
+    const v = getUserConfig().obsidian?.vault;
+    return v && existsSync(v) ? resolvePath(v) : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Resolve the Obsidian vault using the chain in
  *  `computeObsidianResolution`. The result is cached at process scope
  *  so a mid-session config wipe doesn't strand a running daemon. Pass
  *  `forceRefresh: true` to re-run the chain (used by tests + future
  *  `/reload-config` slash). */
 export function resolveObsidianRoot(opts?: { forceRefresh?: boolean }): ObsidianResolution {
-  if (cachedObsidian && !opts?.forceRefresh) return cachedObsidian;
+  if (cachedObsidian && !opts?.forceRefresh) {
+    // config 에 «다른, 실제로 있는» 볼트가 적히면 다시 푼다 — 터미널(`config set`·`config sync-test`)로 바꾼 볼트가
+    // 도는 데몬에 재시작 전까지 안 닿던 것(🅞 2026-09-28 실측). getUserConfig 는 파일 변경 시각으로 캐시돼 싸다.
+    // ⛔ config 가 지워졌거나 경로가 없으면 캐시를 지킨다(위 주석의 «세션 중 config 가 지워져도» 계약).
+    const configured = configuredVaultOnDisk();
+    if (!configured || configured === cachedObsidian.root) return cachedObsidian;
+  }
   const result = computeObsidianResolution();
   // Only cache successful resolutions — an `available: false` result
   // should re-attempt next call in case the user just created the vault.

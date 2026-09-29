@@ -4,6 +4,7 @@ import { classifyHeft, adversarialThreshold } from '../harness/harness-seams.js'
 import { llmDecomposeSteps } from '../harness/llm-decompose.js';
 import { GOAL_AUTHOR_COARSE_MAX_SLICES } from '../task-orchestrator/generator-prompt.js';
 import { getDefaultLogStore } from '../mss/logging/log-store.js';
+import { emitDecision } from '../live/detail-switch.js';
 import type { GoalAuthorDeps } from './goal-author.js';
 
 const GOAL_STEPS_DECOMPOSED_EVENT = 'goal-steps-decomposed';
@@ -63,10 +64,11 @@ export function createGoalAuthorDecomposeSteps(
 ): NonNullable<GoalAuthorDeps['decomposeSteps']> {
   return async (objective, options) => {
     const { streamLLM } = await import('../llm.js');
+    let decompositionRationale: string | undefined;
     const steps = await llmDecomposeSteps(
       objective,
       (input) => streamLLM([{ role: 'user', content: input.prompt }], () => {}, { reasoningEffort: 'high' }).then((text) => ({ text })),
-      { ...(options?.context ? { context: options.context } : {}), maxTasks: GOAL_AUTHOR_COARSE_MAX_SLICES, promptProfile: 'goal-author-coarse', ...(signal ? { signal } : {}) },
+      { ...(options?.context ? { context: options.context } : {}), maxTasks: GOAL_AUTHOR_COARSE_MAX_SLICES, promptProfile: 'goal-author-coarse', ...(signal ? { signal } : {}), onRationale: (rationale) => { decompositionRationale = rationale; } },
     );
     const heft = classifyHeft(objective);
     const adversarialReviewSource = config.adversarialReviewSource
@@ -101,7 +103,23 @@ export function createGoalAuthorDecomposeSteps(
       reviewExecuted,
       reviewSkipReason,
     });
-    if (!reviewExecuted) return steps;
+    const finalize = (finalSteps: string[], rationale?: string): string[] => {
+      if (finalSteps.length > 0 && rationale?.trim()) {
+        try {
+          emitDecision({
+            kind: 'PLAN',
+            what: finalSteps.length === 1 ? '분해 안 함(한 조각)' : `골을 조각 ${finalSteps.length}개로 분해`,
+            reason: rationale.trim().split(/\r?\n|(?<=[.!?。])\s+/)[0]!,
+            purpose: '조각마다 독립 런으로 · 실패를 작게 가둔다',
+            target: finalSteps.slice(0, 8).join(' · '),
+            paths: finalSteps.length,
+            ...(options?.runId === undefined ? {} : { runId: options.runId }),
+          });
+        } catch { /* Live detail cannot change the decomposition result. */ }
+      }
+      return finalSteps;
+    };
+    if (!reviewExecuted) return finalize(steps, decompositionRationale);
     const critic = (prompt: string) => streamLLM([{ role: 'user', content: prompt }], () => {}, { reasoningEffort: 'high' });
 
     try {
@@ -118,7 +136,7 @@ export function createGoalAuthorDecomposeSteps(
           byAxis,
           reviewEnabled,
         });
-        return critique.revisedSteps;
+        return finalize(critique.revisedSteps);
       }
 
       debug.log('goal-author', 'adversarial-sound', {
@@ -132,6 +150,6 @@ export function createGoalAuthorDecomposeSteps(
     } catch {
       // The red-team is advisory; authoring must retain the LLM decomposition on failure.
     }
-    return steps;
+    return finalize(steps, decompositionRationale);
   };
 }

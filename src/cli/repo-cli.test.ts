@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Command } from 'commander';
 
 import { listDesignDirections } from '../design/design-directions.js';
+import { defaultDesignSystemsDir, listDesignSystems } from '../design/design-systems.js';
 import type { ProjectScaffoldDeps, ProjectScaffoldResult } from '../self-implement/project-scaffold.js';
-import { registerRepoCommands, resolveRepositoryDesignCheck, resolveRepositoryDesignTarget, runRepositoryDesignCheck, runRepositoryDesignDirection, runRepositoryScaffold } from './repo-cli.js';
+import { registerRepoCommands, resolveRepositoryDesignCheck, resolveRepositoryDesignTarget, runRepositoryDesignCheck, runRepositoryDesignDirection, runRepositoryDesignPreview, runRepositoryDesignSystemFromPalette, runRepositoryDesignSystemFromUrl, runRepositoryScaffold } from './repo-cli.js';
+import type { DesignGateResult } from '../design/design-gate.js';
 import { debug } from '../debug/log.js';
 import * as standaloneLogSink from '../domains/standalone-log-sink.js';
 import type { ArchiveRecord } from '../webclone/archive-run.js';
@@ -26,7 +28,7 @@ const successfulScaffold = (target: string, _deps?: ProjectScaffoldDeps): Projec
   status: 'provisioned',
   target,
   resolution: { status: 'git-repo', kind: 'git-repo', target, repoRoot: target },
-  ignoreFile: { added: 3, preserved: 1 },
+  ignoreFile: { added: 3, preserved: 1, created: false },
   created: [`${target}/AGENTS.md`],
   existing: [],
 });
@@ -54,7 +56,7 @@ describe('repository scaffold CLI', () => {
         status: 'provisioned',
         target,
         resolution: { status: 'git-repo', kind: 'git-repo', target, repoRoot: target },
-        ignoreFile: { added: 0, preserved: 4 },
+        ignoreFile: { added: 0, preserved: 4, created: false },
         created: [],
         existing: [`${target}/AGENTS.md`],
       }),
@@ -141,6 +143,421 @@ describe('repository scaffold CLI', () => {
       'Ignore file added 3 entries and preserved 1 human-authored lines.',
     ]);
     expect(exitCodes).toEqual([]);
+  });
+});
+
+describe('repository design-system selection', () => {
+  test('registered --set minimal keeps its success lines and installs the bundled system', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'repo-direction-command-'));
+    try {
+      const documentPath = join(directory, 'DESIGN.md');
+      writeFileSync(documentPath, '# Design\n');
+      const output: string[] = [];
+      const errors: string[] = [];
+      const exitCodes: number[] = [];
+      const program = new Command();
+      registerRepoCommands(program, {
+        out: { log: (line) => output.push(line), error: (line) => errors.push(line) },
+        setExitCode: (code) => exitCodes.push(code),
+      });
+      await program.parseAsync(['node', 'test', 'repo', 'design-direction', directory, '--set', 'minimal']);
+      expect(output).toEqual([`Design document: ${documentPath}`, 'Design direction: minimal']);
+      expect(errors).toEqual([]);
+      expect(exitCodes).toEqual([]);
+      const source = join(defaultDesignSystemsDir(), 'minimal');
+      expect(readFileSync(join(directory, 'design/system/DESIGN.md'), 'utf8')).toBe(readFileSync(join(source, 'DESIGN.md'), 'utf8'));
+      expect(readFileSync(join(directory, 'design/system/tokens.css'), 'utf8')).toBe(readFileSync(join(source, 'tokens.css'), 'utf8'));
+      expect(readFileSync(documentPath, 'utf8')).toContain('- minimal\n- tokens: design/system/tokens.css\n');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test('--set retains the read failure and resolved directory hint without reporting success', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'repo-direction-unreadable-'));
+    try {
+      const documentPath = join(directory, 'DESIGN.md');
+      const output: string[] = [];
+      const errors: string[] = [];
+      const exitCodes: number[] = [];
+      const program = new Command();
+      registerRepoCommands(program, {
+        out: { log: (line) => output.push(line), error: (line) => errors.push(line) },
+        setExitCode: (code) => exitCodes.push(code),
+      });
+      await program.parseAsync(['node', 'test', 'repo', 'design-direction', directory, '--set', 'minimal']);
+      expect(output).toEqual([]);
+      expect(errors).toEqual([
+        `Repository design direction blocked: cannot read ${documentPath}.`,
+        `Repository design target ${directory} resolved to ${documentPath}.`,
+      ]);
+      expect(exitCodes).toEqual([1]);
+      expect(existsSync(join(directory, 'design'))).toBe(false);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test('a restricted DESIGN.md keeps its permission bits after selecting a system', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-mode-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      writeFileSync(documentPath, '# Design\n');
+      chmodSync(documentPath, 0o600);
+      expect(await runRepositoryDesignDirection(project, 'minimal', { out: { log: () => {}, error: () => {} } })).toBe(0);
+      expect(statSync(documentPath).mode & 0o777).toBe(0o600);
+      expect(readFileSync(documentPath, 'utf8')).toContain('- minimal');
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('a symlinked DESIGN.md stays a link and its target receives the direction', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-link-'));
+    try {
+      mkdirSync(join(project, 'docs'));
+      const real = join(project, 'docs', 'DESIGN-real.md');
+      writeFileSync(real, '# Design\n');
+      symlinkSync('docs/DESIGN-real.md', join(project, 'DESIGN.md'));
+      expect(await runRepositoryDesignDirection(project, 'minimal', { out: { log: () => {}, error: () => {} } })).toBe(0);
+      expect(lstatSync(join(project, 'DESIGN.md')).isSymbolicLink()).toBe(true);
+      expect(readFileSync(real, 'utf8')).toContain('- minimal');
+      expect(readdirSync(join(project, 'docs')).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('--set minimal copies both bundled files verbatim and writes three direction lines', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      writeFileSync(documentPath, '# Design\n\n## Craft rulebooks\n\n- color\n');
+      const output: string[] = [];
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        out: { log: (line) => output.push(line), error: (line) => output.push(`error:${line}`) },
+      })).toBe(0);
+      expect(readFileSync(join(project, 'design/system/DESIGN.md'), 'utf8'))
+        .toBe(readFileSync(join(defaultDesignSystemsDir(), 'minimal/DESIGN.md'), 'utf8'));
+      expect(readFileSync(join(project, 'design/system/tokens.css'), 'utf8'))
+        .toBe(readFileSync(join(defaultDesignSystemsDir(), 'minimal/tokens.css'), 'utf8'));
+      const commit = listDesignSystems(defaultDesignSystemsDir()).find((system) => system.id === 'minimal')!.sourceCommit.slice(0, 10);
+      expect(readFileSync(documentPath, 'utf8')).toContain(`## Design direction\n\n- minimal\n- tokens: design/system/tokens.css\n- source: open-design@${commit}\n`);
+      expect(readFileSync(documentPath, 'utf8')).toContain('- color');
+      expect(output).toEqual([`Design document: ${documentPath}`, 'Design direction: minimal']);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('replacing an existing direction with a system replaces only that section with three lines', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-replace-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      writeFileSync(documentPath, '# Design\n\n## Design direction\n\n- old-theme\n\n## Craft rulebooks\n\n- color\n');
+      expect(await runRepositoryDesignDirection(project, 'minimal', { out: { log: () => {}, error: () => {} } })).toBe(0);
+      const document = readFileSync(documentPath, 'utf8');
+      const commit = listDesignSystems(defaultDesignSystemsDir()).find((system) => system.id === 'minimal')!.sourceCommit.slice(0, 10);
+      expect(document).toContain(`## Design direction\n\n- minimal\n- tokens: design/system/tokens.css\n- source: open-design@${commit}\n\n## Craft rulebooks`);
+      expect(document).not.toContain('- old-theme');
+      expect(document).toContain('- color');
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('a conflicting system file blocks selection without changing user files or the declaration', async () => {
+    for (const conflictingFile of ['DESIGN.md', 'tokens.css']) {
+      const project = mkdtempSync(join(tmpdir(), 'repo-system-conflict-'));
+      try {
+        const documentPath = join(project, 'DESIGN.md');
+        const original = '# Design\n\n## Design direction\n\n- nord-light\n';
+        writeFileSync(documentPath, original);
+        const destination = join(project, 'design', 'system');
+        mkdirSync(destination, { recursive: true });
+        const source = join(defaultDesignSystemsDir(), 'minimal');
+        for (const file of ['DESIGN.md', 'tokens.css']) {
+          writeFileSync(join(destination, file), file === conflictingFile ? 'user customization\n' : readFileSync(join(source, file), 'utf8'));
+        }
+        const errors: string[] = [];
+        expect(await runRepositoryDesignDirection(project, 'minimal', {
+          out: { log: () => {}, error: (line) => errors.push(line) },
+        })).toBe(1);
+        expect(errors).toContain(`Repository design direction blocked: conflicting system file ${join(destination, conflictingFile)}; preserve or move the existing file before retrying.`);
+        expect(readFileSync(documentPath, 'utf8')).toBe(original);
+        expect(readFileSync(join(destination, conflictingFile), 'utf8')).toBe('user customization\n');
+        const otherFile = conflictingFile === 'DESIGN.md' ? 'tokens.css' : 'DESIGN.md';
+        expect(readFileSync(join(destination, otherFile), 'utf8')).toBe(readFileSync(join(source, otherFile), 'utf8'));
+      } finally { rmSync(project, { recursive: true, force: true }); }
+    }
+  });
+
+  test('selecting a system twice preserves identical existing files', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-repeat-'));
+    try {
+      writeFileSync(join(project, 'DESIGN.md'), '# Design\n');
+      expect(await runRepositoryDesignDirection(project, 'minimal', { out: { log: () => {}, error: () => {} } })).toBe(0);
+      const destination = join(project, 'design', 'system');
+      const before = ['DESIGN.md', 'tokens.css'].map((file) => readFileSync(join(destination, file), 'utf8'));
+      expect(await runRepositoryDesignDirection(project, 'minimal', { out: { log: () => {}, error: () => {} } })).toBe(0);
+      expect(['DESIGN.md', 'tokens.css'].map((file) => readFileSync(join(destination, file), 'utf8'))).toEqual(before);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('an injected write blocker cannot create files or directories through live filesystem defaults', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-blocked-'));
+    try {
+      const original = '# Design\n';
+      writeFileSync(join(project, 'DESIGN.md'), original);
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        writeFile: () => { throw new Error('writes blocked'); },
+        out: { log: () => {}, error: () => {} },
+      })).toBe(1);
+      expect(existsSync(join(project, 'design'))).toBe(false);
+      expect(readFileSync(join(project, 'DESIGN.md'), 'utf8')).toBe(original);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('complete injected filesystem writes a system without touching the live disk', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-virtual-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      const virtualFiles = new Map<string, string>([[documentPath, '# Design\n']]);
+      const virtualDirs = new Set([project]);
+      const sourceDir = defaultDesignSystemsDir();
+      const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        readFile: (path) => {
+          if (virtualFiles.has(path)) return virtualFiles.get(path)!;
+          if (path.startsWith(sourceDir)) return readFileSync(path, 'utf8');
+          throw missing();
+        },
+        readdir: (path) => { if (!virtualDirs.has(path)) throw missing(); return []; },
+        writeFile: (path, content, options) => {
+          if (options?.exclusive && virtualFiles.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+          virtualFiles.set(path, content);
+          options?.onCreated?.();
+        },
+        mkdir: (path) => { virtualDirs.add(path); },
+        removeFile: (path) => { virtualFiles.delete(path); },
+        removeDir: (path) => { virtualDirs.delete(path); },
+        renameFile: (from, to) => { virtualFiles.set(to, virtualFiles.get(from)!); virtualFiles.delete(from); },
+        out: { log: () => {}, error: () => {} },
+      })).toBe(0);
+      expect(virtualFiles.get(join(project, 'design/system/tokens.css'))).toBe(readFileSync(join(sourceDir, 'minimal/tokens.css'), 'utf8'));
+      expect(virtualFiles.get(join(project, 'design/system/DESIGN.md'))).toBe(readFileSync(join(sourceDir, 'minimal/DESIGN.md'), 'utf8'));
+      expect(virtualFiles.get(documentPath)).toContain('- minimal\n- tokens: design/system/tokens.css\n');
+      expect(existsSync(join(project, 'design'))).toBe(false);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('a virtual filesystem uses only injected operations, then rolls back only newly created paths on document failure', async () => {
+    const project = '/virtual/project';
+    const documentPath = join(project, 'DESIGN.md');
+    const designDir = join(project, 'design');
+    const systemDir = join(designDir, 'system');
+    const existingPath = join(systemDir, 'DESIGN.md');
+    const tokensPath = join(systemDir, 'tokens.css');
+    const source = join(defaultDesignSystemsDir(), 'minimal');
+    const original = '# Design\n';
+    const files = new Map<string, string>([[documentPath, original], [existingPath, readFileSync(join(source, 'DESIGN.md'), 'utf8')]]);
+    const dirs = new Set([project, designDir, systemDir]);
+    const errors: string[] = [];
+    const missing = () => Object.assign(new Error('missing'), { code: 'ENOENT' });
+    const deps = {
+      readdir: (path: string) => { if (!dirs.has(path)) throw missing(); return []; },
+      readFile: (path: string, _encoding: 'utf8') => {
+        if (files.has(path)) return files.get(path)!;
+        if (path.startsWith(defaultDesignSystemsDir())) return readFileSync(path, 'utf8');
+        throw missing();
+      },
+      writeFile: (path: string, content: string, options?: { exclusive?: boolean; onCreated?: () => void }) => {
+        if (path.startsWith(`${documentPath}.`) && path.endsWith('.tmp')) throw new Error('document write failed');
+        if (options?.exclusive && files.has(path)) throw Object.assign(new Error('exists'), { code: 'EEXIST' });
+        files.set(path, content);
+        options?.onCreated?.();
+      },
+      mkdir: (path: string) => { dirs.add(path); },
+      removeFile: (path: string) => { files.delete(path); },
+      removeDir: (path: string) => { dirs.delete(path); },
+      renameFile: (from: string, to: string) => { files.set(to, files.get(from)!); files.delete(from); },
+      out: { log: () => {}, error: (line: string) => errors.push(line) },
+    };
+    expect(await runRepositoryDesignDirection(project, 'minimal', deps)).toBe(1);
+    expect(errors).toContain(`Repository design direction blocked: cannot write ${documentPath}.`);
+    expect(files.get(documentPath)).toBe(original);
+    expect(files.get(existingPath)).toBe(readFileSync(join(source, 'DESIGN.md'), 'utf8'));
+    expect(files.has(tokensPath)).toBe(false);
+    expect(dirs.has(designDir)).toBe(true);
+    expect(dirs.has(systemDir)).toBe(true);
+  });
+
+  test('a confirmed exclusive create with a partial write is removed before failure returns', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-partial-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      const destination = join(project, 'design/system');
+      writeFileSync(documentPath, '# Design\n');
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        readFile: (path) => readFileSync(path, 'utf8'),
+        readdir: (path) => readdirSync(path),
+        writeFile: (path, content, options) => {
+          const fd = openSync(path, 'wx');
+          options?.onCreated?.();
+          try {
+            writeFileSync(fd, path === join(destination, 'tokens.css') ? content.slice(0, 10) : content);
+            if (path === join(destination, 'tokens.css')) throw new Error('partial write');
+          } finally { closeSync(fd); }
+        },
+        mkdir: (path) => mkdirSync(path),
+        removeFile: (path) => rmSync(path),
+        removeDir: (path) => rmdirSync(path),
+        renameFile: (from, to) => renameSync(from, to),
+        out: { log: () => {}, error: () => {} },
+      })).toBe(1);
+      expect(existsSync(join(project, 'design'))).toBe(false);
+      expect(readFileSync(documentPath, 'utf8')).toBe('# Design\n');
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('partial staged document write preserves the original and removes the temporary file', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-partial-document-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      const original = '# Design\n\n## Craft rulebooks\n\n- color\n';
+      writeFileSync(documentPath, original);
+      let stagedPath: string | undefined;
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        readFile: (path) => readFileSync(path, 'utf8'),
+        readdir: (path) => readdirSync(path),
+        writeFile: (path, content, options) => {
+          const fd = openSync(path, 'wx');
+          options?.onCreated?.();
+          try {
+            if (path.startsWith(`${documentPath}.`) && path.endsWith('.tmp')) {
+              stagedPath = path;
+              writeFileSync(fd, content.slice(0, 9));
+              throw new Error('partial staged document write');
+            }
+            writeFileSync(fd, content);
+          } finally { closeSync(fd); }
+        },
+        mkdir: (path) => mkdirSync(path),
+        removeFile: (path) => rmSync(path),
+        removeDir: (path) => rmdirSync(path),
+        renameFile: (from, to) => renameSync(from, to),
+        out: { log: () => {}, error: () => {} },
+      })).toBe(1);
+      expect(readFileSync(documentPath, 'utf8')).toBe(original);
+      expect(existsSync(join(project, 'design'))).toBe(false);
+      expect(stagedPath).toBeDefined();
+      expect(existsSync(stagedPath!)).toBe(false);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('non-EEXIST failure before exclusive creation preserves a concurrent writer’s file', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-failed-create-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      const original = '# Design\n';
+      const collision = join(project, 'design/system/tokens.css');
+      writeFileSync(documentPath, original);
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        readFile: (path) => readFileSync(path, 'utf8'),
+        readdir: (path) => readdirSync(path),
+        writeFile: (path, content, options) => {
+          if (path === collision) {
+            writeFileSync(path, 'concurrent author\n');
+            throw Object.assign(new Error('failed before exclusive create'), { code: 'EIO' });
+          }
+          const fd = openSync(path, 'wx');
+          options?.onCreated?.();
+          try { writeFileSync(fd, content); } finally { closeSync(fd); }
+        },
+        mkdir: (path) => mkdirSync(path),
+        removeFile: (path) => rmSync(path),
+        removeDir: (path) => rmdirSync(path),
+        renameFile: (from, to) => renameSync(from, to),
+        out: { log: () => {}, error: () => {} },
+      })).toBe(1);
+      expect(readFileSync(collision, 'utf8')).toBe('concurrent author\n');
+      expect(existsSync(join(project, 'design/system/DESIGN.md'))).toBe(false);
+      expect(readFileSync(documentPath, 'utf8')).toBe(original);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('exclusive-write collision preserves the file created between preflight and write', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-race-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      const destination = join(project, 'design/system');
+      const collision = join(destination, 'tokens.css');
+      const original = '# Design\n';
+      writeFileSync(documentPath, original);
+      const errors: string[] = [];
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        readFile: (path) => readFileSync(path, 'utf8'),
+        readdir: (path) => readdirSync(path),
+        writeFile: (path, content, options) => {
+          if (path === join(destination, 'DESIGN.md')) writeFileSync(collision, 'someone else\n', 'utf8');
+          writeFileSync(path, content, { encoding: 'utf8', flag: options?.exclusive ? 'wx' : 'w' });
+          options?.onCreated?.();
+        },
+        mkdir: (path) => mkdirSync(path),
+        removeFile: (path) => rmSync(path),
+        removeDir: (path) => rmdirSync(path),
+        renameFile: (from, to) => renameSync(from, to),
+        out: { log: () => {}, error: (line) => errors.push(line) },
+      })).toBe(1);
+      expect(errors).toContain(`Repository design direction blocked: conflicting system file ${collision}; preserve or move the existing file before retrying.`);
+      expect(readFileSync(collision, 'utf8')).toBe('someone else\n');
+      expect(existsSync(join(destination, 'DESIGN.md'))).toBe(false);
+      expect(readFileSync(documentPath, 'utf8')).toBe(original);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('a failed document write removes only directories and files created by that selection', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-system-rollback-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      const original = '# Design\n';
+      writeFileSync(documentPath, original);
+      expect(await runRepositoryDesignDirection(project, 'minimal', {
+        readFile: (path) => readFileSync(path, 'utf8'),
+        writeFile: (path, content, options) => {
+          if (path.startsWith(`${documentPath}.`) && path.endsWith('.tmp')) throw new Error('blocked document');
+          writeFileSync(path, content, { encoding: 'utf8', flag: options?.exclusive ? 'wx' : 'w' });
+          options?.onCreated?.();
+        },
+        readdir: (path) => readdirSync(path),
+        mkdir: (path) => mkdirSync(path),
+        removeFile: (path) => rmSync(path),
+        removeDir: (path) => rmdirSync(path),
+        renameFile: (from, to) => renameSync(from, to),
+        out: { log: () => {}, error: () => {} },
+      })).toBe(1);
+      expect(existsSync(join(project, 'design'))).toBe(false);
+      expect(readFileSync(documentPath, 'utf8')).toBe(original);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('theme --set still writes only its id, without creating system files', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-theme-'));
+    try {
+      const documentPath = join(project, 'DESIGN.md');
+      writeFileSync(documentPath, '# Design\n');
+      const theme = listDesignDirections()[0]!.id;
+      expect(await runRepositoryDesignDirection(project, theme, { out: { log: () => {}, error: () => {} } })).toBe(0);
+      expect(readFileSync(documentPath, 'utf8')).toBe(`# Design\n\n## Design direction\n\n- ${theme}\n`);
+      expect(existsSync(join(project, 'design/system'))).toBe(false);
+    } finally { rmSync(project, { recursive: true, force: true }); }
+  });
+
+  test('lists bundled systems and themes separately, and rejects unknown ids', async () => {
+    const project = mkdtempSync(join(tmpdir(), 'repo-list-'));
+    try {
+      writeFileSync(join(project, 'DESIGN.md'), '# Design\n');
+      const output: string[] = [];
+      const errors: string[] = [];
+      const deps = { out: { log: (line: string) => output.push(line), error: (line: string) => errors.push(line) } };
+      expect(await runRepositoryDesignDirection(project, undefined, deps)).toBe(0);
+      expect(listDesignSystems(defaultDesignSystemsDir()).length).toBeGreaterThanOrEqual(50);
+      expect(output).toContain(`Design systems (web · tokens) (${listDesignSystems(defaultDesignSystemsDir()).length})`);
+      expect(output).toContain(`Terminal themes (${listDesignDirections().length})`);
+      const minimal = listDesignSystems(defaultDesignSystemsDir()).find((system) => system.id === 'minimal')!;
+      expect(output).toContain(`  minimal  [${minimal.category}] ${minimal.summary}  bg: ${minimal.swatch.bg}  fg: ${minimal.swatch.fg}  accent: ${minimal.swatch.accent}`);
+      expect(await runRepositoryDesignDirection(project, 'unknown-style-id', deps)).toBe(1);
+      expect(errors).toContain('Repository design direction blocked: unknown direction unknown-style-id.');
+      expect(readFileSync(join(project, 'DESIGN.md'), 'utf8')).toBe('# Design\n');
+    } finally { rmSync(project, { recursive: true, force: true }); }
   });
 });
 
@@ -809,6 +1226,168 @@ describe('runRepositoryScaffold — 개설이 «관측에» 남는다', () => {
   });
 });
 
+describe('repo design-direction list with a custom library system', () => {
+  test('lists bundled and my systems in separate groups instead of crashing (09-28 live)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'repo-direction-custom-'));
+    const library = join(root, 'library');
+    const project = join(root, 'project');
+    mkdirSync(project);
+    writeFileSync(join(project, 'DESIGN.md'), '# Design\n');
+    const quiet = { log: () => {}, error: () => {} };
+    const output: string[] = [];
+    try {
+      expect(await runRepositoryDesignSystemFromPalette('#1f3a2e,#f4efe6,#c8553d', { id: 'forest-note', base: 'paper' }, {
+        designLibraryDirectory: () => library, designSystemsDirectory: defaultDesignSystemsDir, out: quiet,
+      })).toBe(0);
+      const code = await runRepositoryDesignDirection(project, undefined, {
+        designLibraryDirectory: () => library,
+        designSystemsDirectory: defaultDesignSystemsDir,
+        out: { log: (line) => output.push(line), error: (line) => output.push(`error:${line}`) },
+      });
+      expect(code).toBe(0);
+      const bundledHeader = output.findIndex((line) => line.startsWith('Design systems (web · tokens) ('));
+      const customHeader = output.findIndex((line) => line === `My design systems (${library}) (1)`);
+      expect(bundledHeader).toBeGreaterThanOrEqual(0);
+      expect(customHeader).toBeGreaterThan(bundledHeader);
+      expect(output[customHeader + 1]).toContain('forest-note  [Custom]');
+      expect(output.slice(bundledHeader + 1, customHeader).some((line) => line.includes('forest-note'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('repo design-system from-url extract root', () => {
+  const tokens = JSON.stringify({
+    customProperties: { '--bg': '#ffffff', '--fg': '#111111' },
+  });
+  const quiet = { log: () => {}, error: () => {} };
+  const fakeExtract = (outRoot: string) => ({
+    slug: 'linear-app',
+    outDir: join(outRoot, 'linear-app'),
+    viewport: { w: 1280, h: 800 },
+    tokenCount: 2,
+    paletteCount: 2,
+    roleCount: 0,
+    missingRoles: [] as readonly string[],
+    assets: [] as readonly string[],
+    assetNote: null,
+    honoursReducedMotion: null,
+    browserForcedReducedMotion: false,
+  });
+
+  test('--out 이 없으면 출력 뿌리가 designExtractRoot 아래이고 cwd 아래가 아니다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'repo-from-url-'));
+    const project = join(root, 'project');
+    const cache = join(root, 'state', 'design', 'extracts');
+    mkdirSync(project, { recursive: true });
+    const seen: string[] = [];
+    const output: string[] = [];
+    try {
+      const code = await runRepositoryDesignSystemFromUrl('https://linear.app', {}, {
+        cwd: () => project,
+        designExtractRoot: () => cache,
+        designLibraryDirectory: () => join(root, 'library'),
+        designSystemsDirectory: defaultDesignSystemsDir,
+        readFile: () => tokens,
+        runExtractDesign: async (options) => {
+          seen.push(options.outRoot);
+          return fakeExtract(options.outRoot);
+        },
+        out: { log: (line) => output.push(line), error: (line) => output.push(`error:${line}`) },
+      });
+      expect(code).toBe(0);
+      expect(seen).toEqual([cache]);
+      expect(seen[0]!.startsWith(project)).toBe(false);
+      expect(output.some((line) => line === `추출 원본  ${join(cache, 'linear-app')}`)).toBe(true);
+      expect(existsSync(join(project, '.design-extract'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('--out 을 주면 그 폴더가 출력 뿌리다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'repo-from-url-out-'));
+    const explicit = join(root, 'explicit-out');
+    const seen: string[] = [];
+    try {
+      const code = await runRepositoryDesignSystemFromUrl('https://linear.app', { out: explicit }, {
+        cwd: () => join(root, 'project'),
+        designExtractRoot: () => join(root, 'unused-cache'),
+        designLibraryDirectory: () => join(root, 'library'),
+        designSystemsDirectory: defaultDesignSystemsDir,
+        readFile: () => tokens,
+        runExtractDesign: async (options) => {
+          seen.push(options.outRoot);
+          return fakeExtract(options.outRoot);
+        },
+        out: quiet,
+      });
+      expect(code).toBe(0);
+      expect(seen).toEqual([explicit]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('--json 에 extractDir 이 있다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'repo-from-url-json-'));
+    const cache = join(root, 'cache');
+    const output: string[] = [];
+    try {
+      const code = await runRepositoryDesignSystemFromUrl('https://linear.app', { json: true }, {
+        cwd: () => join(root, 'project'),
+        designExtractRoot: () => cache,
+        designLibraryDirectory: () => join(root, 'library'),
+        designSystemsDirectory: defaultDesignSystemsDir,
+        readFile: () => tokens,
+        runExtractDesign: async (options) => fakeExtract(options.outRoot),
+        out: { log: (line) => output.push(line), error: (line) => output.push(`error:${line}`) },
+      });
+      expect(code).toBe(0);
+      const parsed = JSON.parse(output.join('\n')) as { extractDir?: string };
+      expect(parsed.extractDir).toBe(join(cache, 'linear-app'));
+      expect(output.join('\n')).not.toContain('추출 원본');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('repo design-system from-palette', () => {
+  test('저장하고 토큰 표와 못 읽은 칸 수와 경로를 낸다', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'repo-palette-'));
+    const library = join(root, 'library');
+    const output: string[] = [];
+    try {
+      const code = await runRepositoryDesignSystemFromPalette('#ffffff,#111111,#cc3344', {
+        id: 'ink-note', name: 'Ink Note', base: 'minimal',
+      }, {
+        designLibraryDirectory: () => library,
+        designSystemsDirectory: defaultDesignSystemsDir,
+        out: { log: (line) => output.push(line), error: (line) => output.push(`error:${line}`) },
+      });
+      expect(code).toBe(0);
+      expect(output.some((line) => line.startsWith('bg  #ffffff'))).toBe(true);
+      expect(output.some((line) => line.startsWith('accent  #cc3344'))).toBe(true);
+      expect(output.some((line) => line.startsWith('못 읽은 칸 '))).toBe(true);
+      expect(output.some((line) => line === `저장  ${join(library, 'ink-note')}`)).toBe(true);
+      expect(listDesignSystems(library).map((system) => system.id)).toEqual(['ink-note']);
+      const program = new Command();
+      const logged: string[] = [];
+      registerRepoCommands(program, {
+        designLibraryDirectory: () => library,
+        out: { log: (line) => logged.push(line), error: (line) => logged.push(`error:${line}`) },
+        setExitCode: () => {},
+      });
+      await program.parseAsync(['node', 'test', 'repo', 'design-system', 'from-palette', '#fff,#111', '--id', 'second-ink', '--base', 'minimal']);
+      expect(logged.some((line) => line.includes(join(library, 'second-ink')))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('repository command standalone log sink registration', () => {
   const surfaces: string[] = [];
   let sinkShouldFail = false;
@@ -913,6 +1492,25 @@ describe('repository command standalone log sink registration', () => {
     expect(exitCodes).toEqual([]);
   });
 
+  test('design-lint --tokens names the tokens file and its source', async () => {
+    installSinkSpy();
+    const directory = mkdtempSync(join(tmpdir(), 'repo-design-lint-tokens-'));
+    const htmlPath = join(directory, 'index.html');
+    const tokensPath = join(directory, 'tokens.css');
+    writeFileSync(htmlPath, '<h1>Title</h1>', 'utf8');
+    writeFileSync(join(directory, 'styles.css'), 'h1 { color: var(--fg); }', 'utf8');
+    writeFileSync(join(directory, 'DESIGN.md'), '# Design\n', 'utf8');
+    writeFileSync(tokensPath, ':root { --fg: #111111; --font-display: Georgia, serif; }', 'utf8');
+    const output: string[] = [];
+    const program = programFor({ out: { log: (line) => output.push(line), error: (line) => output.push(`error:${line}`) } });
+    try {
+      await program.parseAsync(['node', 'test', 'repo', 'design-lint', htmlPath, '--tokens', tokensPath]);
+      expect(output.join('\n')).toContain(`토큰    ${tokensPath} (출처 flag)`);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test('existing public, scaffold, design-lint, and publish sink names stay unchanged', async () => {
     installSinkSpy();
     const program = programFor({
@@ -927,5 +1525,131 @@ describe('repository command standalone log sink registration', () => {
     await program.parseAsync(['node', 'test', 'repo', 'publish', '/workspace/publish-project']);
 
     expect(surfaces).toEqual(['repo-public', 'repo-scaffold', 'repo-design-lint', 'repo-publish']);
+  });
+});
+
+describe('repository design-gate CLI', () => {
+  const gate = (verdict: DesignGateResult['verdict'], reason?: DesignGateResult['reason']): DesignGateResult => ({
+    verdict,
+    ...(reason ? { reason } : {}),
+    direction: verdict === 'not-applicable' && reason !== 'no-html' ? null : 'editorial',
+    tokensSource: verdict === 'not-applicable' ? null : 'design-direction',
+    p0Total: verdict === 'fail' ? 1 : 0,
+    advisoryTotal: 0,
+    files: verdict === 'not-applicable' ? [] : [{
+      path: 'index.html',
+      p0: verdict === 'fail' ? 1 : 0,
+      advisory: 0,
+      skipped: [],
+      findings: verdict === 'fail' ? [{ rule: 'display-font-mismatch', severity: 'p0', line: 1 }] : [],
+    }],
+    truncated: false,
+    omitted: 0,
+    checkedAt: '2026-09-27T00:00:00.000Z',
+  });
+
+  async function run(verdict: DesignGateResult['verdict'], options: { json?: boolean; throw?: boolean; reason?: DesignGateResult['reason'] } = {}) {
+    const output: string[] = [];
+    const errors: string[] = [];
+    const exitCodes: number[] = [];
+    const program = new Command();
+    registerRepoCommands(program, {
+      cwd: () => '/workspace/sample',
+      out: { log: (line) => output.push(line), error: (line) => errors.push(line) },
+      setExitCode: (code) => exitCodes.push(code),
+      runDesignGate: () => {
+        if (options.throw) throw new Error('git failed');
+        return gate(verdict, options.reason);
+      },
+    });
+    const args = ['node', 'test', 'repo', 'design-gate', '/workspace/sample'];
+    if (options.json) args.push('--json');
+    await program.parseAsync(args);
+    return { output, errors, exitCodes };
+  }
+
+  test('fail exits 1 and the last line parses as the result JSON', async () => {
+    const result = await run('fail');
+    expect(result.exitCodes).toEqual([1]);
+    expect(result.output[0]).toContain('design-gate fail');
+    expect(result.output.some((line) => line.includes('display-font-mismatch'))).toBe(true);
+    const parsed = JSON.parse(result.output.at(-1)!) as DesignGateResult;
+    expect(parsed.verdict).toBe('fail');
+    expect(parsed.p0Total).toBeGreaterThanOrEqual(1);
+  });
+
+  test('pass exits 0 and still ends with one JSON line', async () => {
+    const result = await run('pass');
+    expect(result.exitCodes).toEqual([]);
+    const parsed = JSON.parse(result.output.at(-1)!) as DesignGateResult;
+    expect(parsed.verdict).toBe('pass');
+  });
+
+  test('not-applicable exits 0', async () => {
+    const result = await run('not-applicable', { reason: 'no-direction' });
+    expect(result.exitCodes).toEqual([]);
+    const parsed = JSON.parse(result.output.at(-1)!) as DesignGateResult;
+    expect(parsed.verdict).toBe('not-applicable');
+    expect(parsed.reason).toBe('no-direction');
+  });
+
+  test('a git or read failure exits 2', async () => {
+    const result = await run('pass', { throw: true });
+    expect(result.exitCodes).toEqual([2]);
+    expect(result.errors).toEqual(['✗ git failed']);
+  });
+
+  test('--json prints only the result object', async () => {
+    const result = await run('fail', { json: true });
+    expect(result.output).toHaveLength(1);
+    expect(JSON.parse(result.output[0]!).verdict).toBe('fail');
+    expect(result.exitCodes).toEqual([1]);
+  });
+});
+
+describe('repository design-preview CLI', () => {
+  test('refuses with exit 2 when OpenDesign is not configured', async () => {
+    const errors: string[] = [];
+    const code = await runRepositoryDesignPreview('/workspace/sample', {
+      brief: 'a landing page',
+      systems: 'minimal,editorial',
+    }, {
+      openDesignConfig: () => null,
+      out: { log: () => {}, error: (line) => errors.push(line) },
+    });
+
+    expect(code).toBe(2);
+    expect(errors).toEqual(['OpenDesign 이 설정되지 않았다 — design.openDesign.url · tokenFile']);
+  });
+
+  test('--json prints one object per system', async () => {
+    const output: string[] = [];
+    const exitCodes: number[] = [];
+    const program = new Command();
+    registerRepoCommands(program, {
+      cwd: () => '/workspace',
+      openDesignConfig: () => ({ url: 'http://open-design.test', token: 'not-printed' }),
+      makeDesignPreviews: async () => ([
+        { system: 'minimal', ok: true, path: '/workspace/sample/design/previews/minimal.html', runId: 'run-a', status: 'succeeded' },
+        { system: 'editorial', ok: false, runId: 'run-b', status: 'failed', reason: 'failed' },
+      ]),
+      out: { log: (line) => output.push(line), error: (line) => output.push(`error:${line}`) },
+      setExitCode: (code) => exitCodes.push(code),
+    });
+
+    await program.parseAsync([
+      'node', 'test', 'repo', 'design-preview', 'sample',
+      '--brief', 'a landing page',
+      '--systems', 'minimal,editorial',
+      '--json',
+    ]);
+
+    const parsed = JSON.parse(output.join('\n')) as Array<{ system: string; ok: boolean; path?: string; runId?: string; status: string; reason?: string }>;
+    expect(parsed).toEqual([
+      { system: 'minimal', ok: true, path: '/workspace/sample/design/previews/minimal.html', runId: 'run-a', status: 'succeeded' },
+      { system: 'editorial', ok: false, runId: 'run-b', status: 'failed', reason: 'failed' },
+    ]);
+    expect(output.join('\n')).not.toContain('not-printed');
+    expect(exitCodes).toEqual([]);
   });
 });

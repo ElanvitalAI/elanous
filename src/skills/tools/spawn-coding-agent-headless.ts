@@ -1,10 +1,8 @@
 // Native tool: SpawnCodingAgentHeadless — I2 (텔레그램 코딩 에이전트).
 //
-// The VW-less sibling of SpawnCodingAgentInVW (src/skills/tools/
-// spawn-coding-agent-vw.ts). That one lands claude-code / codex in a
-// dashboard virtual-window terminal pane; this one lands them in a bare
-// PtyShell so a HEADLESS surface (telegram / continuation) can spawn a
-// sub coding-agent and drive its live terminal with the PtyShell family:
+// Lands claude-code / codex in a bare PtyShell so a HEADLESS surface
+// (telegram / continuation) can spawn a sub coding-agent and drive its
+// live terminal with the PtyShell family:
 //
 //   SpawnCodingAgentHeadless → process_id
 //     · PtyShellSnapshot  — read the agent's screen (it's a full-screen TUI)
@@ -17,8 +15,7 @@
 // prefer it for fire-and-forget "delegate this coding task, give me the
 // result". This tool is for when you want to DRIVE or SEE the agent's
 // actual terminal (observe its work, steer mid-run, or run a CLI that has
-// no ACP). Reuses the brand→binary resolution + macOS keychain-unlock
-// wrap from the VW path so `claude` can read its credentials.
+// no ACP). The macOS keychain-unlock wrap lets `claude` read its credentials.
 
 import { spawnSync } from 'node:child_process';
 import type { LLMToolSpec } from '../../llm.js';
@@ -26,7 +23,7 @@ import { getSessionCwd } from '../../session/working-dir.js';
 import { startPty, unregisterPty, type PtyHandle } from '../../pty-shell/registry.js';
 import { CodingAgentBinaryMissing } from '../../terminal/coding-agent.js';
 import { wrapCommandForKeychainUnlock, shouldWrapForKeychainUnlock } from '../../terminal/keychain-unlock.js';
-import type { CodingAgentBrand } from './spawn-coding-agent-vw.js';
+export type CodingAgentBrand = 'claude-code' | 'codex';
 
 const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms));
 
@@ -100,7 +97,7 @@ function resolveAndSpawn(
     throw new CodingAgentBinaryMissing(binary);
   }
   // Only `claude` reads the macOS keychain — wrap it in the SSH unlock
-  // preamble (same gate as the VW path) so credentials resolve. codex
+  // preamble so credentials resolve. codex
   // spawns as a plain direct binary.
   const wrap = brand === 'claude-code' && shouldWrapForKeychainUnlock();
   const wrapCommand = deps.wrapCommand ?? wrapCommandForKeychainUnlock;

@@ -365,8 +365,7 @@ export function dispatchDescribeSurface(
     case 'bg':
       return passthrough(addr, desc);
     case 'window': {
-      // B-13-α · Virtual Window as a surface. `desc` comes from
-      // window-surface-adapter (registered on VW spawn) — no per-kind
+      // B-13-α · Virtual Window as a surface. No per-kind
       // resolver like modal/widget because a VW is a layout container
       // rather than a single primitive. `detail` surfaces the
       // `windowId` + basic lifecycle metadata the SurfaceRegistry

@@ -67,7 +67,15 @@ export interface MissionSummary {
 }
 export interface DerivedJob {
   kind: 'cron' | 'task' | 'action';
+  /** 크론이면 스케줄 레지스트리 id(= `GET /v1/schedules` 카드 id) — Schedules 탭 링크에 쓴다. */
+  id?: string;
   name: string; status: DerivedStatus; detail: string | null;
+}
+
+/** 이 미션을 부르는 스케줄 — 계보의 크론 id 로 Schedules 탭을 정확히 거른다(이름 부분 일치 아님). 없으면 null. */
+export function missionSchedulesHref(derived: readonly DerivedJob[]): string | null {
+  const ids = derived.filter((d) => d.kind === 'cron' && d.id).map((d) => d.id!);
+  return ids.length ? `/scheduler?ids=${ids.map(encodeURIComponent).join(',')}` : null;
 }
 export interface MissionTrace {
   mission: MissionSummary; rollup: MissionRollup; derived: DerivedJob[]; note: string;

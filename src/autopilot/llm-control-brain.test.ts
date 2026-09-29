@@ -1,8 +1,10 @@
 // PLAN §7 P3b — LLM 제어 brain. 주입 stream(스텁)으로 순수 검증(실 LLM 무관).
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { createLlmControlBrain, parseControlDecision, extractFirstJsonObject, type StreamLLMFn } from './llm-control-brain.js';
 import { runPtyControlLoop, controlDepsForHandle, type ControlObservation, type RunSupervisor } from './pty-control-loop.js';
 import { decideInterventionStep } from '../self-implement/intervention-step.js';
+import { MAX_PTY_KEY_REPEAT } from '../pty-shell/pty-mouse.js';
 
 const obs = (over: Partial<ControlObservation> = {}): ControlObservation => {
   const observation = { screen: 'screen', state: 'idle' as const, step: 0, changed: false, ...over };
@@ -21,11 +23,25 @@ describe('parseControlDecision', () => {
   test('input — text 동반', () => {
     expect(parseControlDecision('{"action":"input","text":"go\\r"}')).toEqual({ action: 'input', text: 'go\r' });
   });
+  test('structured key mouse resize and unknown action is an error', () => {
+    expect(parseControlDecision('{"action":"key","name":"enter","repeat":2}')).toEqual({ action: 'key', name: 'enter', repeat: 2 });
+    expect(parseControlDecision(JSON.stringify({ action: 'key', name: 'enter', repeat: MAX_PTY_KEY_REPEAT }))).toEqual({ action: 'key', name: 'enter', repeat: MAX_PTY_KEY_REPEAT });
+    expect(() => parseControlDecision(JSON.stringify({ action: 'key', name: 'enter', repeat: MAX_PTY_KEY_REPEAT + 1 }))).toThrow('unknown or invalid PTY control action: key');
+    expect(() => parseControlDecision(JSON.stringify({ action: 'key', name: 'enter', repeat: Number.MAX_SAFE_INTEGER }))).toThrow('unknown or invalid PTY control action: key');
+    expect(parseControlDecision('{"action":"mouse","x":10,"y":5,"kind":"click"}')).toEqual({ action: 'mouse', x: 10, y: 5, kind: 'click' });
+    expect(parseControlDecision('{"action":"resize","cols":80,"rows":24}')).toEqual({ action: 'resize', cols: 80, rows: 24 });
+    expect(() => parseControlDecision('{"action":"imaginary"}')).toThrow('unknown or invalid PTY control action');
+  });
   test('done — reason', () => {
     expect(parseControlDecision('{"action":"done","reason":"완료"}')).toEqual({ action: 'done', reason: '완료' });
   });
   test('wait', () => {
     expect(parseControlDecision('{"action":"wait"}')).toEqual({ action: 'wait' });
+  });
+  test('handoff and ask-human retain only their specified decision fields', () => {
+    expect(parseControlDecision('{"action":"handoff","to":"claude","mission":"Review","carry":"diff"}')).toEqual({ action: 'handoff', to: 'claude', mission: 'Review', carry: 'diff' });
+    expect(parseControlDecision('{"action":"ask-human","reason":"login","url":"https://example.com/login","code":"ABCD-1234"}')).toEqual({ action: 'ask-human', reason: 'login', url: 'https://example.com/login', code: 'ABCD-1234' });
+    expect(() => parseControlDecision('{"action":"handoff","to":"unknown","mission":"Review"}')).toThrow('unknown or invalid PTY control action');
   });
   test('no-progress — reason 동반', () => {
     expect(parseControlDecision('{"action":"no-progress","reason":"화면이 멈췄지만 완료 표시는 없음"}'))
@@ -55,6 +71,115 @@ describe('parseControlDecision', () => {
 });
 
 describe('createLlmControlBrain', () => {
+  test('unknown action is logged as brain-error; the next prompt exposes unavailable action', async () => {
+    const seen: string[] = [];
+    const errors: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: { error?: string }) => {
+      if (event === 'brain-error') errors.push(data?.error ?? '');
+    }) as never);
+    const brain = createLlmControlBrain({ goal: 'click menu', stream: async (messages) => {
+      seen.push((messages[1] as { content: string }).content);
+      return seen.length === 1 ? '{"action":"mystery"}' : '{"action":"mouse","x":10,"y":5,"kind":"click","reason":"select"}';
+    } });
+    try {
+      await expect(brain.decide(obs({ subjectPtyId: 'pty_test' }))).rejects.toThrow('mystery');
+      expect(errors).toContainEqual(expect.stringContaining('mystery'));
+      expect(await brain.decide(obs({ unavailableAction: 'mouse: injectMouse unavailable', subjectPtyId: 'pty_test' }))).toEqual({ action: 'mouse', x: 10, y: 5, kind: 'click' });
+      expect(seen[1]).toContain('mouse: injectMouse unavailable');
+    } finally { log.mockRestore(); }
+  });
+
+  test('selected action emits ROUTE with PTY target and one-line rationale under MAX switch', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { resetLiveDetailCacheForTesting } = await import('../live/detail-switch.js');
+    const dir = mkdtempSync(join(tmpdir(), 'pty-route-'));
+    const before = process.env.ELANOUS_STATE_DIR;
+    const decisions: Array<Record<string, unknown>> = [];
+    const log = spyOn(debug, 'log').mockImplementation(((_category: string, event: string, data?: Record<string, unknown>) => {
+      if (event === 'decision' && data?.kind === 'ROUTE') decisions.push(data);
+    }) as never);
+    try {
+      process.env.ELANOUS_STATE_DIR = dir;
+      const { writeLiveDetail } = await import('../live/detail-switch.js');
+      writeLiveDetail({ scope: 'all', ttlMin: 1 }, { path: join(dir, 'live', 'detail.json') });
+      resetLiveDetailCacheForTesting();
+      const brain = createLlmControlBrain({ goal: 'select\nbutton', stream: async () => '{"action":"mouse","x":10,"y":5,"kind":"click","reason":"menu\\nitem visible"}' });
+      await brain.decide(obs({ subjectPtyId: 'pty_route_target' }));
+      expect(decisions).toEqual([expect.objectContaining({ kind: 'ROUTE', what: 'mouse click (10,5)', reason: 'menu item visible', purpose: 'select button', target: 'pty_route_target', phase: 'implement' })]);
+      // 구형 계약(input 은 reason 없이 와도 된다)이라도 실행되면 ROUTE 가 «근거 없음(—)» 으로 남는다(리뷰 must-fix).
+      decisions.length = 0;
+      const legacy = createLlmControlBrain({ goal: 'type', stream: async () => '{"action":"input","text":"ls"}' });
+      await legacy.decide(obs({ subjectPtyId: 'pty_route_target' }));
+      expect(decisions).toEqual([expect.objectContaining({ kind: 'ROUTE', what: 'input (2 chars)', reason: '—', target: 'pty_route_target' })]);
+      decisions.length = 0;
+      const waitOnly = createLlmControlBrain({ goal: 'wait', stream: async () => '{"action":"wait"}' });
+      await waitOnly.decide(obs({ subjectPtyId: 'pty_route_target' }));
+      expect(decisions).toEqual([]);
+      const withoutReason = createLlmControlBrain({ goal: 'select button', stream: async () => '{"action":"key","name":"enter"}' });
+      const noReasonWrites: string[] = [];
+      const rejected = await runPtyControlLoop(withoutReason, {
+        observe: () => 'menu', inject: (text) => { noReasonWrites.push(text); return true; },
+        injectKey: (name) => { noReasonWrites.push(name); return true; }, sleep: async () => {},
+        subjectPtyId: 'pty_route_target',
+      }, { maxSteps: 1, pollMs: 0 });
+      expect(rejected.termination).toEqual({ kind: 'error', message: 'PTY control action key missing brain reason' });
+      expect(noReasonWrites).toEqual([]);
+      expect(decisions).toHaveLength(0); // 거절된 구조 행동은 ROUTE 를 남기지 않는다(위에서 비웠다)
+      for (const [raw, action] of [
+        ['{"action":"key","name":"enter","reason":"  \\n  "}', 'key'],
+        ['{"action":"mouse","x":10,"y":5,"kind":"click"}', 'mouse'],
+        ['{"action":"resize","cols":80,"rows":24}', 'resize'],
+      ]) {
+        const missing = createLlmControlBrain({ goal: 'select button', stream: async () => raw });
+        await expect(missing.decide(obs({ subjectPtyId: 'pty_route_target' }))).rejects.toThrow(`PTY control action ${action} missing brain reason`);
+        expect(decisions).toHaveLength(0);
+      }
+      for (const [raw, what, rationale] of [
+        ['{"action":"input","text":"yes","reason":"prompt shown"}', 'input (3 chars)', 'prompt shown'],
+        ['{"action":"key","name":"tab","reason":"next field"}', 'key tab', 'next field'],
+        ['{"action":"resize","cols":80,"rows":24,"reason":"small viewport"}', 'resize 80x24', 'small viewport'],
+        ['{"action":"wait","reason":"child working"}', 'wait', 'child working'],
+        ['{"action":"done","reason":"task finished"}', 'done', 'task finished'],
+      ]) {
+        const selected = createLlmControlBrain({ goal: 'select button', stream: async () => raw });
+        await selected.decide(obs({ subjectPtyId: 'pty_route_target' }));
+        expect(decisions.at(-1)).toMatchObject({ kind: 'ROUTE', what, reason: rationale, target: 'pty_route_target' });
+      }
+      const { startPty, setPtyAdapterForTesting, unregisterPty } = await import('../pty-shell/registry.js');
+      setPtyAdapterForTesting(() => ({
+        pid: 9, write: () => {}, resize: () => {}, kill: () => {},
+        onData: () => ({ dispose() {} }), onExit: () => ({ dispose() {} }),
+      }));
+      let handleId: string | undefined;
+      try {
+        const handle = startPty({ cmd: 'x', accessMode: 'auto', detach: true });
+        handleId = handle.id;
+        const routed = createLlmControlBrain({ goal: 'select button', stream: async () => '{"action":"key","name":"enter","reason":"메뉴 선택"}' });
+        const result = await runPtyControlLoop(routed, { ...controlDepsForHandle(handle), sleep: async () => {} }, { maxSteps: 1, pollMs: 0 });
+        expect(result.termination.kind).toBe('budget');
+        expect(decisions.at(-1)).toMatchObject({ kind: 'ROUTE', what: 'key enter', reason: '메뉴 선택', target: handle.id, phase: 'implement' });
+      } finally {
+        if (handleId) unregisterPty(handleId);
+        setPtyAdapterForTesting(null);
+      }
+    } finally {
+      log.mockRestore(); resetLiveDetailCacheForTesting();
+      if (before === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = before;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test('unknown brain action terminates the loop as error rather than a wait step', async () => {
+    const brain = createLlmControlBrain({ goal: 'menu', stream: async () => '{"action":"not-real"}' });
+    const result = await runPtyControlLoop(brain, {
+      observe: () => 'menu', inject: () => { throw new Error('unexpected input'); }, sleep: async () => {},
+    }, { maxSteps: 2, pollMs: 0 });
+    expect(result.termination).toEqual({ kind: 'error', message: 'unknown or invalid PTY control action: not-real' });
+  });
+
   test('stream 결과를 결정으로 파싱 + 히스토리 축적', async () => {
     const seen: string[] = [];
     const stream: StreamLLMFn = async (messages) => {
@@ -74,6 +199,10 @@ describe('createLlmControlBrain', () => {
     // 'idle' 은 템플릿 고정문구에 없음 → 실제 obs.state 보간이어야만 등장(blocked 는 고정문구에 있어 Goodhart).
     await brain.decide(obs({ state: 'idle' }));
     expect(sys).toContain('ZEBRA_GOAL');
+    expect(sys).toContain('"key"');
+    expect(sys).toContain('"mouse"');
+    expect(sys).toContain('모드가 꺼져 있으면 거절');
+    expect(sys).toContain('"resize"');
     expect(sys).toMatch(/참고 신호\): idle/); // 실제 obs.state 보간 검증
   });
 
@@ -243,7 +372,7 @@ describe('createLlmControlBrain + controlDepsForHandle (실배선 통합)', () =
       for (const id of ids) unregisterPty(id);
       setPtyAdapterForTesting(null);
     }
-  });
+  }, 20_000);
 
   test('observe→화면→LLM 실경로 — onData 방출·화면 읽는 stub(review Goodhart 방지)', async () => {
     process.env.ELANOUS_STATE_DIR ||= '/tmp/p3b-brain-test';

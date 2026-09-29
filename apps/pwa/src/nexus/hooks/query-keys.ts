@@ -31,6 +31,8 @@ export const nexusKeys = {
   providers:        () => [...nexusKeys.all, 'providers'] as const,
   worktrees:        () => [...nexusKeys.all, 'worktrees'] as const,
   designCheck:      () => [...nexusKeys.all, 'design-check'] as const,
+  designPreviews:   () => [...nexusKeys.all, 'design-previews'] as const,
+  designPreview:    (system: string) => [...nexusKeys.all, 'design-preview', system] as const,
   // RFC #2161 Phase 3 — Layer A static catalog snapshot. Phase 5 adds
   // a sibling `resolvedView` key for live (apiKey/health) state.
   registryCatalog:  () => [...nexusKeys.all, 'registry-catalog'] as const,

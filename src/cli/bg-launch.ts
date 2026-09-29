@@ -5,6 +5,7 @@ import { join as joinPath } from 'node:path';
 import { nexusLogsDir, getTestStateRoot } from '../nexus/paths.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { isPidAlive } from '../process/pid-liveness.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 import {
   checkSetupStatus,
   renderSetupStatus,
@@ -34,7 +35,7 @@ function defaultProbeChild(child: BgChildHandle): BgChildProbeResult {
   return isPidAlive(child.pid) ? 'alive' : 'exited';
 }
 
-function lastMeaningfulLogLine(logPath: string): string | undefined {
+export function lastMeaningfulLogLine(logPath: string): string | undefined {
   let text = '';
   try {
     text = readFileSync(logPath, 'utf-8');
@@ -89,7 +90,7 @@ function defaultLogPath(stamp: string): string {
 function httpSummary(opts: BgLaunchOpts): string {
   const args = opts.forwardArgs ?? [];
   let host = '127.0.0.1';
-  let port = '31415';
+  let port = String(DEFAULT_NEXUS_HTTP_PORT);
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === '--http-host' && typeof args[i + 1] === 'string') host = args[i + 1]!;
     if (args[i] === '--http-port' && typeof args[i + 1] === 'string') port = args[i + 1]!;
@@ -191,7 +192,7 @@ export async function runBgLaunch(opts: BgLaunchOpts = {}): Promise<BgLaunchResu
       return { exitCode: 1, pid: child.pid, logPath };
     }
     if (setupMode) {
-      out.log(`셋업 모드로 떴습니다 — 브라우저로 셋업: ${httpSummary(opts)}/setup (빠진 것: ${boot.missing.join(', ')})`);
+      out.log(`셋업 모드로 떴습니다 — 브라우저로 셋업: ${httpSummary(opts)}/app/setup/ (빠진 것: ${boot.missing.join(', ')})`);
     }
     out.log('elanous nexus: started in background');
     out.log(`  pid       ${child.pid ?? '(unknown)'}`);

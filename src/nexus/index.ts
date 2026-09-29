@@ -31,6 +31,7 @@ import { resolveCurrentInstance } from '../instance/current.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { startPortLeaseHeartbeat } from '../control-plane/port-lease-heartbeat.js';
 import { PORT_BANDS } from '../control-plane/ports.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from './default-port.js';
 import { createNexusState } from './state/state.js';
 import { TabRegistry } from './state/tab-registry.js';
 import { createChatTabSpec } from './kinds/chat.js';
@@ -225,7 +226,8 @@ import type {
   AcpConnectionHandler,
   AcpTransportServer,
 } from '../acp/transport/types.js';
-import { createAuthVerifier, type AcpAuthTokenRecord } from '../acp/transport/auth.js';
+import { createAuthVerifier, type AcpAuthTokenRecord, type AcpAuthVerifier } from '../acp/transport/auth.js';
+import { matchTempToken } from '../auth/temp-tokens.js';
 import { loadEnvelope, type TokenStoreEnvelope, type TokenStorePaths } from '../auth/token-store.js';
 import {
   createVoiceRestHandler,
@@ -712,7 +714,19 @@ export function buildNexusWsBridgeAuth(
   if (!bearerToken) return {};
   return {
     // ⭐ 배열이 아니라 «공급자» — 매 핸드셰이크마다 봉투를 다시 읽는다.
-    wsAuthVerifier: createAuthVerifier(() => acceptedAcpTokens(bearerToken, paths)),
+    wsAuthVerifier: withTempTokens(createAuthVerifier(() => acceptedAcpTokens(bearerToken, paths)), paths?.configDir),
+  };
+}
+
+/** 단기 소유자 토큰(`elanous token issue`)도 ACP 웹소켓에서 받는다 — 기존 검증이 거부할 때만 해시·만료로 한 번 더 본다. */
+function withTempTokens(base: AcpAuthVerifier, dir?: string): AcpAuthVerifier {
+  return {
+    verify(raw) {
+      const first = base.verify(raw);
+      if (first.ok) return first;
+      const token = (raw as { token?: unknown } | null)?.token;
+      return typeof token === 'string' && matchTempToken(token, dir ? { dir } : {}) ? { ok: true } : first;
+    },
   };
 }
 
@@ -772,8 +786,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     if (boot.mode === 'setup') {
       process.env.ELANOUS_NEXUS_SETUP_MODE = '1';
       const host = opts.httpHost ?? '127.0.0.1';
-      const port = opts.httpStartPort ?? 31415;
-      console.log(`셋업 모드로 떴습니다 — 브라우저로 셋업: http://${host}:${port}/setup (빠진 것: ${boot.missing.join(', ')})`);
+      const port = opts.httpStartPort ?? DEFAULT_NEXUS_HTTP_PORT;
+      console.log(`셋업 모드로 떴습니다 — 브라우저로 셋업: http://${host}:${port}/app/setup/ (빠진 것: ${boot.missing.join(', ')})`);
     }
   }
 
@@ -1971,7 +1985,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
 
   if (!skipHttp) {
     const httpHost = opts.httpHost ?? '127.0.0.1';
-    const httpStartPort = opts.httpStartPort ?? 31415;
+    const httpStartPort = opts.httpStartPort ?? DEFAULT_NEXUS_HTTP_PORT;
     const editInPwaCtx = {
       signingKey: editInPwaSigningKey,
       nonceStore: editInPwaNonceStore,
@@ -2193,9 +2207,24 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       toxStore = new TaskStore();
       toxHandle = wireTox({
         graph: hydrateGraph(toxStore), store: toxStore,
+        getWorkflowDaemon: () => workflowDaemon ?? null,
         surfaces: {
           subagent,
-          externalExec: createExternalExecAdapter({ dispatch: dispatchSelfImplement, cwd: runtimeToolCwd ?? resolveToolCwd({ tools: 'chat', toolCwd: opts.toolCwd })!, subagent }),
+          externalExec: createExternalExecAdapter({
+            dispatch: dispatchSelfImplement,
+            cwd: runtimeToolCwd ?? resolveToolCwd({ tools: 'chat', toolCwd: opts.toolCwd })!, subagent,
+            gh: async (args) => {
+              const proc = Bun.spawn(['bun', joinPath(import.meta.dir, '../../bin/elanous.mjs'), 'gh', ...args], {
+                cwd: runtimeToolCwd ?? resolveToolCwd({ tools: 'chat', toolCwd: opts.toolCwd })!,
+                stdout: 'pipe', stderr: 'pipe',
+              });
+              const [stdout, stderr, exitCode] = await Promise.all([
+                new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
+              ]);
+              if (exitCode !== 0) throw new Error(stderr.trim() || `gh exited ${exitCode}`);
+              return stdout;
+            },
+          }),
         },
         log: (line) => console.debug('[nexus]', line),
       });
@@ -2411,10 +2440,10 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         // TaskStore 의 scheduleText 달린 비-terminal task 를 start() 전에 데몬 entries
         // 로 등록해, 이관잡이 데몬 재시작 후에도 발화하게 한다. best-effort.
         try {
-          const { registerScheduledToxTasks } = await import('../domains/schedule-migrate.js');
+          const { registerScheduledToxTasks, scheduledRunViaById } = await import('../domains/schedule-migrate.js');
           const { listSchedules } = await import('../domains/schedule-registry.js');
-          // 레지스트리가 «trigger» 라고 말하는 잡의 파생 task 만 등록한다(release 뒤 고아 task 의 이중 발화 방지).
-          const runViaById = new Map(listSchedules(bridgeScheduleDb).map((row) => [row.id, row.run_via] as const));
+          // 레지스트리의 enabled trigger 만 등록한다(release 뒤 고아·수동 비활성 task 의 발화 방지).
+          const runViaById = scheduledRunViaById(listSchedules(bridgeScheduleDb));
           const rr = registerScheduledToxTasks(bridgeTaskStore, (e) => workflowDaemon!.registerWorkflow(e), (jobId) => runViaById.get(jobId) ?? null);
           if (rr.registered > 0) {
             console.log(`[nexus] re-registered ${rr.registered} scheduled TOX task(s) as Schedule Triggers`);
@@ -3457,21 +3486,22 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     const io = defaultIO();
     // Phase 4 (2026-05-19) — tailscale probe 결과 + PWA build 상태 + port
     // 를 first-boot wizard 에 전달해서 banner 가 PWA URL 을 표시하도록.
-    const httpPort = runtime.httpPort ?? 31415;
+    const httpPort = httpServer?.port;
     const pwaBuilt = Boolean(pwaStaticDir);
-    const tailscale = await probeTailscale().catch(() => undefined);
+    const tailscale = httpPort !== undefined ? await probeTailscale().catch(() => undefined) : undefined;
     try {
       await runFirstBootWizard({
         io,
         setupStatus,
-        shouldRunTailscale: shouldAskPwaShareSwitch(),
-        httpPort,
+        shouldRunTailscale: httpPort !== undefined && shouldAskPwaShareSwitch(),
+        ...(httpPort !== undefined ? { httpPort } : {}),
         pwaBuilt,
         ...(tailscale ? { tailscale } : {}),
         runLlmStep: async (wizardIo) => {
           await runOnboardingStep('llm', { io: wizardIo });
         },
         runTailscaleWizard: async (wizardIo) => {
+          if (httpPort === undefined) return;
           await runPwaShareWizardIfAsk({
             port: httpPort,
             pwaBuilt,
@@ -3774,7 +3804,7 @@ export function readAcpToken(): string | undefined {
 function printBootBanner(runtime: NexusRuntimeMeta, pwaStaticDir?: string): void {
   const lines = [
     '',
-    `  elanous NEXUS · ${runtime.nexusVersion} · ${runtime.phase}`,
+    `  elanous NEXUS · ${runtime.nexusVersion}`,
     '  ──────────────────────────────────────────────────────',
     `  pid       ${runtime.pid}`,
     `  host      ${hostname()}`,
@@ -3797,12 +3827,9 @@ function printBootBanner(runtime: NexusRuntimeMeta, pwaStaticDir?: string): void
   }
   lines.push(
     '',
-    '  Phase N-5 PR χ — graceful exit 75 (OS supervisor restart).',
     '  Read-only routes:  GET /v1/{health,nexus,nexus/tabs,events}',
     '  Toggle keys: Ctrl-` (primary) · Ctrl-\\ (Korean IME / SSH friendly).',
-    '  SIGINT (Ctrl-C) → exit 0 (OS supervisor leaves nexus stopped).',
-    '  SIGTERM        → exit 75 + restart-state.json (OS supervisor respawns).',
-    '  PR ψ/ω add `elanous nexus install --launchd|--systemd-user`.',
+    '  Install service: elanous nexus install --launchd (macOS) or --systemd-user (Linux).',
     '',
     '  Ctrl-C to release lock and exit.',
     '',

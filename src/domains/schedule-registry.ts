@@ -17,6 +17,8 @@ import { createHash } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { prevScheduledFire } from './cron-match.js';
+import { debug } from '../debug/log.js';
+import { deriveScheduleName, ensureScheduleRunsSchema, recordScheduleRun } from './schedule-runs.js';
 
 /** 스케줄 레지스트리 DB 정본 경로 — state-dir 존중(lazy · Phase B). prod(ELANOUS_STATE_DIR
  *  미설정)=`~/.elanous/schedules.db`(무변경) · 격리 test 인스턴스=자기 루트(빈 시작). 종전
@@ -38,6 +40,7 @@ export interface ScheduleRow {
   category: ScheduleCategory;
   domain: string | null;   // finance | <future>
   enabled: number;
+  disabled_reason?: string | null; // vanished (inventory) | manual (explicit off) | null
   last_seen: string | null;
   last_run: string | null;
   note: string | null;
@@ -59,14 +62,14 @@ export function openSchedulesDb(path: string = schedulesDbPath()): Database {
   if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.run('PRAGMA busy_timeout = 2000');
-  const schemaObjects = db.prepare(`SELECT name FROM sqlite_master WHERE name IN ('schedule_registry', 'idx_sched_cat')`).all() as Array<{ name: string }>;
+  const schemaObjects = db.prepare(`SELECT name FROM sqlite_master WHERE name IN ('schedule_registry', 'idx_sched_cat', 'schedule_runs', 'idx_schedule_runs_schedule_fired')`).all() as Array<{ name: string }>;
   const schemaNames = new Set(schemaObjects.map(({ name }) => name));
   if (!schemaNames.has('schedule_registry')) {
     db.run(`CREATE TABLE IF NOT EXISTS schedule_registry(
       id TEXT PRIMARY KEY, name TEXT NOT NULL, source TEXT NOT NULL,
       cron TEXT, interval_ms INT, command TEXT,
       category TEXT NOT NULL, domain TEXT,
-      enabled INT DEFAULT 1, last_seen TEXT, last_run TEXT,
+      enabled INT DEFAULT 1, disabled_reason TEXT, last_seen TEXT, last_run TEXT,
       note TEXT, managed_by TEXT DEFAULT 'manual', raw TEXT,
       run_via TEXT DEFAULT 'crontab',
       last_status TEXT, last_exit INT, last_duration_ms INT,
@@ -77,6 +80,7 @@ export function openSchedulesDb(path: string = schedulesDbPath()): Database {
   // 마이그레이션 — 기존 DB에 없는 컬럼 추가(S2 run_via + 실행관측성 P1).
   const cols = (db.prepare(`PRAGMA table_info(schedule_registry)`).all() as Array<{ name: string }>).map(c => c.name);
   if (!cols.includes('run_via')) db.run(`ALTER TABLE schedule_registry ADD COLUMN run_via TEXT DEFAULT 'crontab'`);
+  if (!cols.includes('disabled_reason')) db.run(`ALTER TABLE schedule_registry ADD COLUMN disabled_reason TEXT`);
   // 실행 결과 추적(P1) — "발화만 기록"에서 "성공/실패·소요·경로까지" 확장.
   if (!cols.includes('last_status')) db.run(`ALTER TABLE schedule_registry ADD COLUMN last_status TEXT`);
   if (!cols.includes('last_exit')) db.run(`ALTER TABLE schedule_registry ADD COLUMN last_exit INT`);
@@ -85,6 +89,8 @@ export function openSchedulesDb(path: string = schedulesDbPath()): Database {
   if (!cols.includes('last_error')) db.run(`ALTER TABLE schedule_registry ADD COLUMN last_error TEXT`);
   // 오토파일럿 계보(AL2) — 이 크론을 만든 미션(apm_id). null=오토파일럿 산물 아님.
   if (!cols.includes('autopilot_id')) db.run(`ALTER TABLE schedule_registry ADD COLUMN autopilot_id TEXT`);
+  // 다시 열 때는 DDL 을 안 돌린다(기존 규칙) — 이력 표·색인이 이미 있으면 건너뛴다.
+  if (!schemaNames.has('schedule_runs') || !schemaNames.has('idx_schedule_runs_schedule_fired')) ensureScheduleRunsSchema(db);
   return db;
 }
 
@@ -134,6 +140,7 @@ export interface RunResult {
   durationMs?: number | null;      // 소요(ms)
   via?: string;                    // tick | catchup | manual
   error?: string | null;           // 에러 요약(있으면)
+  runId?: string | null;           // 외부 실행과의 상관관계
 }
 /** 직전 실행 상태 조회(자기기억 이상 온셋 dedup 용·데몬 경로). 없으면 null. */
 export function getLastStatus(db: Database, id: string): string | null {
@@ -142,12 +149,24 @@ export function getLastStatus(db: Database, id: string): string | null {
 }
 
 export function markResult(db: Database, id: string, r: RunResult): void {
+  const at = r.at ?? new Date().toISOString();
+  const via = r.via ?? 'tick';
   db.run(
     `UPDATE schedule_registry SET last_run=?, last_status=?, last_exit=?,
        last_duration_ms=?, last_via=?, last_error=? WHERE id=?`,
-    [r.at ?? new Date().toISOString(), r.status, r.exit ?? null,
-     r.durationMs ?? null, r.via ?? 'tick', r.error ?? null, id],
+    [at, r.status, r.exit ?? null,
+     r.durationMs ?? null, via, r.error ?? null, id],
   );
+  const row = db.query(`SELECT name FROM schedule_registry WHERE id = ?`).get(id) as { name: string } | null;
+  if (!row) return;
+  try {
+    recordScheduleRun(db, id, {
+      at, status: r.status, exit: r.exit ?? null,
+      durationMs: r.durationMs ?? null, via, runId: r.runId ?? process.env.ELANOUS_RUN_ID ?? null,
+    });
+  } catch (error) {
+    debug.log('schedule.registry', 'run-history-write-failed', { id, error: String(error) });
+  }
 }
 
 // ── 스케줄 헬스(P2 관측성) — "무엇이 밀렸나/실패했나" 순수 판정 ──────────
@@ -268,35 +287,42 @@ export function cronEntryId(cron: string, effectiveCommand: string): string {
 }
 
 /** ★ 관측성 래퍼 unwrap (RFC-scheduler-execution-observability·2026-07-15) — crontab 라인이
- *  `bun scripts/cron-run.ts scripts/X.ts --a` 로 래핑돼도 id/name 파생은 안쪽 실제 target 기준으로.
- *  `scripts/cron-run.ts ` 토큰만 제거 → 래핑 전 원본과 동일 문자열 → id(sha1) 불변·마이그레이션 0.
+ *  `bun scripts/cron-run.ts --schedule-id <id> scripts/X.ts --a` 로 래핑돼도 id/name 파생은 안쪽 실제 target 기준으로.
+ *  래퍼와 그 id 인자만 제거 → 래핑 전 원본과 동일 문자열 → id(sha1) 불변·마이그레이션 0.
  *  순수·멱등(비래핑 라인은 그대로 반환). */
 export function unwrapCronCommand(command: string): string {
-  const shell = command.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+--shell\s+/, '');
+  const shell = command.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?--shell\s+/, '');
   if (shell !== command) return shell;
-  return command.replace(/(?:[^\s]*\/)?cron-run\.ts\s+/, '');
+  return command.replace(/(?:[^\s]*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?/, '');
 }
 
-/** crontab 라인을 관측성 래퍼로 감싼다(P3) — `bun scripts/X.ts` → `bun scripts/cron-run.ts scripts/X.ts`.
+/** crontab 라인을 관측성 래퍼로 감싼다(P3) — `bun scripts/X.ts` → `bun scripts/cron-run.ts --schedule-id <id> scripts/X.ts`.
  *  bun .ts 잡만(.sh 는 bun 미실행·skip). 이미 래핑됐거나 cron-run 자신이면 그대로. 순수·멱등. */
 export function wrapCronLine(line: string): string {
   if (/cron-run\.ts/.test(line)) return line;                 // 이미 래핑
+  const parsed = parseCronLine(line);
+  if (!parsed) return line;
+  const id = cronEntryId(parsed.cron, parsed.command);
   // bun 직후의 target(상대 scripts/X.ts 또는 절대 .../scripts/X.ts) 앞에 래퍼 삽입. cron-run 자신 제외.
-  return line.replace(/(\bbun\s+)(\S*scripts\/(?!cron-run\b)[\w.-]+\.ts)/, '$1scripts/cron-run.ts $2');
+  return line.replace(/(\bbun\s+)(\S*scripts\/(?!cron-run\b)[\w.-]+\.ts)/, (_match, bun: string, target: string) =>
+    `${bun}scripts/cron-run.ts --schedule-id ${id} ${target}`);
 }
 
 /** 셸 해석기가 명시된 .sh 발화만 래핑한다. 원래 해석기 토큰과 인자를 그대로 보존한다. */
 export function wrapShellCronLine(line: string, opts: { bun: string; cronRun: string }): string {
-  if (/cron-run\.ts/.test(line) || !parseCronLine(line)) return line;
+  if (/cron-run\.ts/.test(line)) return line;
+  const parsed = parseCronLine(line);
+  if (!parsed) return line;
+  const id = cronEntryId(parsed.cron, parsed.command);
   return line.replace(/^(\s*\S+(?:\s+\S+){4}\s+(?:cd\s+\S+\s+&&\s+)?)((?:\S*\/)?(?:bash|zsh|sh))(?=\s+\S+\.sh(?:\s|$))/, (_match, prefix: string, interpreter: string) =>
-    `${prefix}${opts.bun} ${opts.cronRun} --shell ${interpreter}`);
+    `${prefix}${opts.bun} ${opts.cronRun} --schedule-id ${id} --shell ${interpreter}`);
 }
 
-/** wrapCronLine / wrapShellCronLine 역 — 래퍼 제거(가역). 비래핑 라인은 그대로. */
+/** wrapCronLine / wrapShellCronLine 역 — 래퍼와 id 인자 제거(가역). 비래핑 라인은 그대로. */
 export function unwrapCronLine(line: string): string {
-  const shell = line.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+--shell\s+/, '');
+  const shell = line.replace(/(?:\S*\/)?bun\s+(?:\S*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?--shell\s+/, '');
   if (shell !== line) return shell;
-  return line.replace(/(\bbun\s+)(?:\S*\/)?cron-run\.ts\s+/, '$1');
+  return line.replace(/(\bbun\s+)(?:\S*\/)?cron-run\.ts\s+(?:--schedule-id\s+\S+\s+)?/, '$1');
 }
 
 /** ★ 삭제 안전 가드(2026-07-15) — 대상 행의 crontab 라인(raw)을 다른 활성 행이 공유하나? 순수.
@@ -349,7 +375,9 @@ export function readCrontab(): string {
 export function inventoryCrontab(db: Database, opts: { crontab?: string; now?: string } = {}): { total: number; added: number; disabled: number; vanished: number } {
   const text = opts.crontab ?? readCrontab();
   const now = opts.now ?? new Date().toISOString();
-  const existing = new Set((db.prepare(`SELECT id FROM schedule_registry`).all() as Array<{ id: string }>).map(r => r.id));
+  const existing = new Map((db.prepare(`SELECT id, name, command, source, run_via FROM schedule_registry`).all() as Array<{
+    id: string; name: string; command: string | null; source: string; run_via: string;
+  }>).map(r => [r.id, r]));
   let total = 0, added = 0, disabled = 0, vanished = 0;
   const seenIds = new Set<string>();
   for (const line of text.split('\n')) {
@@ -364,9 +392,9 @@ export function inventoryCrontab(db: Database, opts: { crontab?: string; now?: s
       const off = parseDisabledCronLine(line);
       if (!off) continue;
       const offId = cronEntryId(off.cron, unwrapCronCommand(off.command));
-      if (!existing.has(offId)) continue;
+      if (existing.get(offId)?.source !== 'crontab' || existing.get(offId)?.run_via === 'trigger') continue;
       seenIds.add(offId);
-      db.run(`UPDATE schedule_registry SET enabled = 0, last_seen = ? WHERE id = ?`, [now, offId]);
+      db.run(`UPDATE schedule_registry SET enabled = 0, disabled_reason = 'manual', last_seen = ? WHERE id = ?`, [now, offId]);
       disabled++;
       continue;
     }
@@ -375,18 +403,31 @@ export function inventoryCrontab(db: Database, opts: { crontab?: string; now?: s
     //   → 래핑 전후 id(sha1) 동일·last_run/계보/adopt 승계·마이그레이션 0. command/raw 는 실제 라인 보존.
     const eff = unwrapCronCommand(parsed.command);
     const id = cronEntryId(parsed.cron, eff);
-    const name = scriptName(eff);
+    const prior = existing.get(id);
+    const name = prior && prior.command === parsed.command ? prior.name : deriveScheduleName(eff);
     const category = inferCategory(eff);
     seenIds.add(id);
-    if (!existing.has(id)) added++;
+    // A lingering crontab line after migration is not a request to override the
+    // trigger's state (including an explicit disable). Keep the migrated row intact.
+    if (prior?.run_via === 'trigger') continue;
+    if (!prior) added++;
     db.run(
       `INSERT INTO schedule_registry (id, name, source, cron, command, category, domain, enabled, last_seen, managed_by, raw)
        VALUES (?, ?, 'crontab', ?, ?, ?, 'finance', 1, ?, 'manual', ?)
        ON CONFLICT(id) DO UPDATE SET
          name=excluded.name, cron=excluded.cron, command=excluded.command,
-         category=excluded.category, enabled=1, last_seen=excluded.last_seen, raw=excluded.raw`,
+         category=excluded.category, enabled=1, disabled_reason=NULL, last_seen=excluded.last_seen, raw=excluded.raw`,
       [id, name, parsed.cron, parsed.command, category, now, line.trim()],
     );
+  }
+  // Only repair rows with recorded inventory provenance. Legacy disabled rows have
+  // no disable reason; last_via='trigger' alone cannot distinguish manual disable.
+  const repair = db.prepare(`SELECT id FROM schedule_registry WHERE source = 'crontab'
+    AND run_via = 'trigger' AND enabled = 0 AND last_via = 'trigger'
+    AND disabled_reason = 'vanished'`).all() as Array<{ id: string }>;
+  for (const { id } of repair) {
+    db.run(`UPDATE schedule_registry SET source = 'trigger', enabled = 1, disabled_reason = NULL WHERE id = ?`, [id]);
+    debug.log('schedule.registry', 'trigger-row-repaired', { id });
   }
   // ⭐ 줄이 통째로 지워진 crontab-origin 행 — 주석도 활성도 아니니 루프가 안 본다.
   //   ⛔ 행을 지우지 않는다(prune 계약). 끄기만 한다.
@@ -395,11 +436,11 @@ export function inventoryCrontab(db: Database, opts: { crontab?: string; now?: s
   //   ⛔ 빈 문자열은 읽기 실패와 같다 — 「전부 사라졌다」로 읽으면 한 번의 실패가 전 스케줄을 끈다.
   if (text !== '') {
     const missing = db.prepare(
-      `SELECT id FROM schedule_registry WHERE source = 'crontab' AND enabled = 1`,
+      `SELECT id FROM schedule_registry WHERE source = 'crontab' AND enabled = 1 AND run_via != 'trigger'`,
     ).all() as Array<{ id: string }>;
     for (const row of missing) {
       if (seenIds.has(row.id)) continue;
-      db.run(`UPDATE schedule_registry SET enabled = 0 WHERE id = ?`, [row.id]);
+      db.run(`UPDATE schedule_registry SET enabled = 0, disabled_reason = 'vanished' WHERE id = ?`, [row.id]);
       vanished++;
     }
   }

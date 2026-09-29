@@ -9,10 +9,10 @@ import { codexAccountThresholdPercent, type RotationCandidate } from '../../oaut
 
 export const POD_ACCOUNT_EXCLUDE_AT_PERCENT = 95;
 
-export interface PodAccountPlan { usable: string[]; excluded: Array<{ name: string; why: string }> }
+export interface PodAccountPlan { usable: string[]; excluded: Array<{ name: string; why: string }>; /** 크레딧으로 쓰는 계정(구독 잔량 0 · 대표 허가) — 로그에 «크레딧» 으로 보이게. */ creditAccounts?: string[] }
 
 export type PodProviderPlan =
-  | { provider: 'openai-codex'; accounts: string[]; excluded: PodAccountPlan['excluded']; grokSubscriptionEligible: boolean }
+  | { provider: 'openai-codex'; accounts: string[]; excluded: PodAccountPlan['excluded']; grokSubscriptionEligible: boolean; creditAccounts?: string[] }
   | { provider: 'grok'; excluded: PodAccountPlan['excluded']; grokSubscriptionEligible: boolean }
   | { provider: null; reasons: string[]; grokSubscriptionEligible: boolean };
 
@@ -24,12 +24,15 @@ export function planPodProvider(input: {
   grokApiKeyOptIn: boolean;
   excludeAt?: number;
   thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
+  /** 대표 크레딧 허가(`llm.codexCreditsAllowed`) — 구독 잔량 계정이 없으면 찬 계정을 크레딧으로 쓴다. */
+  creditsAllowed?: boolean;
 }): PodProviderPlan {
   const accounts = planPodAccounts(input.codexCandidates, {
     excludeAt: input.excludeAt,
     thresholdPercentByAccount: input.thresholdPercentByAccount,
+    creditsAllowed: input.creditsAllowed,
   });
-  if (accounts.usable.length) return { provider: 'openai-codex', accounts: accounts.usable, excluded: accounts.excluded, grokSubscriptionEligible: input.grokSubscription };
+  if (accounts.usable.length) return { provider: 'openai-codex', accounts: accounts.usable, excluded: accounts.excluded, grokSubscriptionEligible: input.grokSubscription, ...(accounts.creditAccounts ? { creditAccounts: accounts.creditAccounts } : {}) };
   if (input.grokSubscription || (input.grokApiKey && input.grokApiKeyOptIn)) return { provider: 'grok', excluded: accounts.excluded, grokSubscriptionEligible: input.grokSubscription };
   return {
     provider: null,
@@ -46,9 +49,10 @@ export function planPodAccounts(
   options: number | {
     thresholdPercentByAccount?: Readonly<Record<string, unknown>>;
     excludeAt?: number;
+    creditsAllowed?: boolean;
   } = {},
 ): PodAccountPlan {
-  const { thresholdPercentByAccount, excludeAt = POD_ACCOUNT_EXCLUDE_AT_PERCENT } =
+  const { thresholdPercentByAccount, excludeAt = POD_ACCOUNT_EXCLUDE_AT_PERCENT, creditsAllowed = false } =
     typeof options === 'number' ? { excludeAt: options } : options;
   const excluded: PodAccountPlan['excluded'] = [];
   const known: RotationCandidate[] = [];
@@ -63,7 +67,17 @@ export function planPodAccounts(
   }
   known.sort((a, b) => (a.usedPercent! - b.usedPercent!) || a.name.localeCompare(b.name));
   unknown.sort((a, b) => a.name.localeCompare(b.name));
-  return { usable: [...known, ...unknown].map((c) => c.name), excluded };
+  const usable = [...known, ...unknown].map((c) => c.name);
+  // 대표 크레딧 허가: 구독 잔량이 남은 계정이 «하나도» 없을 때만 찬 계정을 크레딧으로 쓴다(사용률 낮은 순) — 잔량 계정이 있으면 그쪽이 먼저다.
+  if (usable.length === 0 && creditsAllowed) {
+    const credit = candidates
+      .filter((c) => excluded.some((e) => e.name === c.name))
+      // 크레딧 잔액이 많은 계정부터(09-28 · 한 계정 크레딧만 타던 것) — 잔액을 모르면 사용률 낮은 순.
+      .sort((a, b) => ((b.creditBalance ?? -1) - (a.creditBalance ?? -1)) || ((a.usedPercent ?? 100) - (b.usedPercent ?? 100)) || a.name.localeCompare(b.name))
+      .map((c) => c.name);
+    return { usable: credit, excluded: [], creditAccounts: credit };
+  }
+  return { usable, excluded };
 }
 
 /** Job 마다 다음 계정 — 잔량 순으로 돌려 가며. 쓸 계정이 없으면 만들 때 이유를 대고 던진다. */

@@ -114,7 +114,7 @@ function WorktreesPanelInner() {
           <p className="text-[11px] font-mono text-muted-foreground">{repoRoot}</p>
         ) : (
           <p className="text-[11px] text-muted-foreground">
-            Not inside a git repo (NEXUS launched outside a checkout). Worktree list will be empty.
+            No repository found. Set <code className="font-mono">harness.defaultRepo</code> (absolute path) in Settings, or start NEXUS inside a checkout.
           </p>
         )}
       </header>

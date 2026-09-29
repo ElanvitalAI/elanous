@@ -1,8 +1,9 @@
 import { ResourceLedger, ResourceLedgerError, type ResourceRecord } from './ledger.js';
+import { DEFAULT_NEXUS_HTTP_PORT } from '../nexus/default-port.js';
 
 /** Inclusive port bands; only the test band is allocated by the coordinator. */
 export const PORT_BANDS = {
-  reserved: [31413, 31415, 31420],
+  reserved: [31413, DEFAULT_NEXUS_HTTP_PORT, 31420],
   test: { start: 31450, end: 31499 },
   offline: { start: 31500, end: 31509 },
 } as const;

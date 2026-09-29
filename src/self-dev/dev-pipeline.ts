@@ -41,6 +41,8 @@ import { buildReviewProviderAttempts, runReviewWithFallback, reviewFallbackModel
 import type { DefaultSeamsOptions } from '../self-implement/seams.js';
 import { harnessTargetOptions, resolveHarnessTarget, revalidateHarnessTarget, type HarnessTargetResolution } from '../self-implement/harness-target-options.js';
 import { provisionRepository, type RepoProvisionResult } from '../self-implement/repo-provision.js';
+import { decideNonGitInit } from '../self-implement/non-git-consent.js';
+import { createInterface } from 'node:readline/promises';
 import type { ChildLlmSelection } from '../agent/run-context.js';
 import type { SurfaceUx } from '../agent/surface-ux/types.js';
 
@@ -51,6 +53,9 @@ export type OrchestrateRuntime = Omit<OrchestrateSelfDevOptions, 'goals' | 'conc
 /** external+pty(agent-mission) 실행 옵션 — 통일 축 밖의 backend-특정 미션 실행 파라미터(무손실 재라우팅용).
  *  agent-mission-pty dispatch 에만 유효(그 외 dispatch 에 지정 시 planDevPipeline 이 거부·수락 후 무시 금지). */
 export interface DevMissionOpts {
+  chain?: readonly ('codex' | 'claude' | 'elanous')[];
+  plugin?: { plugin: string; marketplace: string };
+  headless?: boolean;
   evidence?: EvidenceMode;
   maxRounds?: number;
   commit?: boolean;
@@ -236,6 +241,8 @@ export interface DevPipelineSpec {
   entranceUnstamped?: 'interactive-dispatch';
   /** JSON CLI 출력에서는 사람이 읽는 진행 안내를 stdout에 섞지 않는다. */
   humanReadableOutput?: boolean;
+  /** Explicit authorization for Git initialization of a non-git project. */
+  assumeYes?: boolean;
   /** CLI 경계에서 한 번 읽은 Git 중단 상태 스냅샷. 같은 런의 plan 관측은 이 값만 기록한다. */
   /** ⛔⭐ **관측과 그 경로는 하나다**(무인 리뷰 must-fix) — 종전엔 `gitResidue` 와
    *  `gitResiduePath` 가 **독립 optional** 이라, 스냅샷만 넘기면 경로가 `process.cwd()` 로
@@ -297,7 +304,7 @@ export interface ResolvedDevPlan {
 }
 
 export class DevPipelineError extends Error {
-  constructor(message: string) { super(message); this.name = 'DevPipelineError'; }
+  constructor(message: string, readonly exitCode = 1) { super(message); this.name = 'DevPipelineError'; }
 }
 
 /** 사람이 읽는 계획 출력에 이미 결정된 base 선택을 그대로 드러낸다. */
@@ -412,6 +419,9 @@ export function planDevPipeline(spec: DevPipelineSpec): ResolvedDevPlan {
   // acp 는 cwd 세션 실행(worktree 없음) → branch/base 는 무의미 → 지정 시 거부(수락 후 무시 금지).
   if (dispatch === 'acp' && (spec.branch?.trim() || spec.base?.trim())) {
     throw new DevPipelineError('acp 는 cwd 세션 실행(worktree 없음) — branch/base 는 지원 안 함(pty 전용)');
+  }
+  if (spec.mission?.headless === true && (dispatch !== 'agent-mission-pty' || executor.kind !== 'external' || executor.backend !== 'claude')) {
+    throw new DevPipelineError('--headless 는 external Claude mission 전용입니다');
   }
   // mission 실행 옵션은 agent-mission-pty 에만 유효 — 그 외 dispatch 에 지정 시 거부(수락 후 무시 금지).
   const hasMissionOpts = !!spec.mission && Object.values(spec.mission).some((v) => v !== undefined);
@@ -606,6 +616,9 @@ export function toAgentMissionSpec(
     branch: plan.branch!,
     evidence: m.evidence ?? { kind: 'tsc' }, // 기본 tsc(mission 옵션 미지정 시)
     agent: resolveBackend(plan.executor.backend),
+    ...(m.headless === true ? { headless: true } : {}),
+    ...(m.chain ? { chain: m.chain } : {}),
+    ...(m.plugin ? { plugin: m.plugin } : {}),
     ...(plan.base ? { base: plan.base } : {}),
     ...(plan.enhance !== undefined ? { enhance: plan.enhance } : {}),
     ...(m.maxRounds !== undefined ? { maxRounds: m.maxRounds } : {}),
@@ -628,6 +641,9 @@ export function buildAgentMissionDevSpec(o: {
   backend: DevBackend;
   branch: string;
   base?: string;
+  headless?: boolean;
+  chain?: readonly ('codex' | 'claude' | 'elanous')[];
+  plugin?: { plugin: string; marketplace: string };
   /** --no-enhance 시 false(그 외 미지정 → driver 가 entry 로 구동). */
   enhanceOff?: boolean;
   evidence: EvidenceMode;
@@ -644,6 +660,9 @@ export function buildAgentMissionDevSpec(o: {
     ...(o.enhanceOff ? { enhance: false } : {}),
     mission: {
       evidence: o.evidence,
+      ...(o.headless === true ? { headless: true } : {}),
+      ...(o.chain ? { chain: o.chain } : {}),
+      ...(o.plugin ? { plugin: o.plugin } : {}),
       maxRounds: o.maxRounds,
       commit: o.commit,
       entry: 'elanous-apparatus',
@@ -696,6 +715,8 @@ export function buildSelfImplementDevSpec(o: {
   documentReferences?: readonly DocumentReferenceStatus[];
   naturalLanguageDispatch?: boolean;
   runId?: string;
+  /** --child-llm-provider/--child-llm-model: the Pod grok fallback pins its implementation child here. */
+  childLlm?: ChildLlmSelection;
 }): DevPipelineSpec {
   // planDevPipeline() is the runtime caller of resolveLaunchCapabilities(); preserve omission
   // until that resolver applies the shared launch default.
@@ -717,6 +738,7 @@ export function buildSelfImplementDevSpec(o: {
     ...(o.runId ? { runId: o.runId } : {}),
     self: {
       draft: o.draft,
+      ...(o.childLlm ? { childLlm: o.childLlm } : {}),
       ...(o.maxWaitSec !== undefined ? { maxWaitSec: o.maxWaitSec } : {}),
       ...(o.ground ? { ground: true } : {}),
       ...(o.entry ? { entry: o.entry } : {}),
@@ -907,6 +929,10 @@ export interface DevPipelineDeps {
   approver?: SelfImplementSeams['approvePr'];
   /** In-place repository promotion after target revalidation and before child execution. */
   provisionRepository?: (target: HarnessTargetResolution) => RepoProvisionResult;
+  /** Consent prompt seam; defaults to readline on a TTY. */
+  askNonGitInit?: (prompt: string) => Promise<string | undefined>;
+  /** Interactive detection seam; defaults to stdin TTY state (prompts go to stderr). */
+  nonGitInteractive?: boolean;
   /** elanous 도구 소스의 git 최상위(시험 seam). null = 체크아웃 아님(npm 설치). 미지정이면 실제로 잰다. */
   toolRepositoryRoot?: string | null;
   /** ACP 위임 실행(테스트 주입). signal 을 함께 받아 기본 경로와 취소 동작 일치(DI 계약 정합). */
@@ -1864,6 +1890,22 @@ async function runDevPipelineDispatch(
     const run = deps.runPtyDrive ?? (await import('../cli/pty-drive-cli.js')).runPtyDrive;
     return { plan, kind: 'shell-drive', result: await run(plan.drive!) };
   }
+  const confirmNonGit = async (target: string): Promise<void> => {
+    const ask = deps.askNonGitInit ?? (async (prompt: string) => {
+      const reader = createInterface({ input: process.stdin, output: process.stderr });
+      try { return await reader.question(prompt); }
+      finally { reader.close(); }
+    });
+    const decision = await decideNonGitInit({
+      target,
+      interactive: deps.nonGitInteractive ?? (process.stdin.isTTY === true),
+      assumeYes: spec.assumeYes === true,
+      ask,
+    });
+    if (decision !== 'init') {
+      throw new DevPipelineError('git 저장소가 필요합니다 — `git init` 하거나 `--yes` 로 다시 · (다음 판: 그림자 저장소 — RFC P19)', 2);
+    }
+  };
   const provisionForeignWorkingRepository = (cwd: string): void => {
     const topLevel = (dir: string): string | null => {
       const r = runGitCommand(dir, ['rev-parse', '--show-toplevel'], { encoding: 'utf8', timeout: 30_000 });
@@ -1908,10 +1950,17 @@ async function runDevPipelineDispatch(
       if (target.status !== 'git-repo' && target.status !== 'non-git-dir' && target.status !== 'file') {
         throw new DevPipelineError(`target 거부: ${target.reason ?? target.status}`);
       }
-      const provision = (deps.provisionRepository ?? provisionRepository)(target);
+      let provisionTarget = target;
+      if (target.status === 'non-git-dir') {
+        await confirmNonGit(target.canonicalTarget ?? target.target);
+        provisionTarget = revalidateHarnessTarget(target);
+        if (provisionTarget.status !== 'non-git-dir') throw new DevPipelineError(`target 거부: ${provisionTarget.reason ?? provisionTarget.status}`);
+      }
+      const provision = (deps.provisionRepository ?? provisionRepository)(provisionTarget);
       if (provision.status === 'provisioned') {
         plan.target = provision.resolution;
         emitHumanProgress(`[repo-provision] promoted ${provision.target}`, spec.humanReadableOutput !== false, deps.progress);
+        if (provision.ignoreFile.created) emitHumanProgress(`[repo-provision] .gitignore created ${provision.target}`, spec.humanReadableOutput !== false, deps.progress);
       } else {
         emitHumanProgress(`[repo-provision] ${provision.status} ${provision.target}`, spec.humanReadableOutput !== false, deps.progress);
       }
@@ -1921,12 +1970,23 @@ async function runDevPipelineDispatch(
       //   `--target` 블록에만 있어, 원격 없는 로컬 프로젝트가 `auto-merge` 로 떠서 끝에서야 PR 을 못 열고 멎었다
       //   (`gh pr list` 가 「no git remotes found」). 같은 판정을 작업 디렉토리 저장소에도 건다.
       //   원격이 있거나 못 읽으면 종전과 «동일»(elanous 자기 개발 경로 무영향).
-      applyRemoteLessCompletion(deps.cwd ?? process.cwd());
+      const cwd = deps.cwd ?? process.cwd();
+      const workingTarget = resolveHarnessTarget(cwd);
+      if (workingTarget.status === 'non-git-dir') {
+        await confirmNonGit(workingTarget.canonicalTarget ?? workingTarget.target);
+        const checked = revalidateHarnessTarget(workingTarget);
+        if (checked.status !== 'non-git-dir') throw new DevPipelineError(`target 거부: ${checked.reason ?? checked.status}`);
+        const provision = (deps.provisionRepository ?? provisionRepository)(checked);
+        if (provision.status !== 'provisioned') throw new DevPipelineError(`git 저장소 준비 실패: ${provision.status}`);
+        emitHumanProgress(`[repo-provision] promoted ${provision.target}`, spec.humanReadableOutput !== false, deps.progress);
+        if (provision.ignoreFile.created) emitHumanProgress(`[repo-provision] .gitignore created ${provision.target}`, spec.humanReadableOutput !== false, deps.progress);
+      }
+      applyRemoteLessCompletion(cwd);
       // ⛔ 2026-09-23 (벤더 A/B 실측) — 대상 저장소 준비(.gitignore 에 elanous 실행 산출물)가 `--target` 에만 걸려 있어,
       //   사용자 경로(`cd <프로젝트> && elanous harness say`)에선 `.elanous/debug/*.log`·`latest` 링크·liveness 하트비트가
       //   사용자 저장소 커밋에 섞였다 ⇒ 리뷰 must-fix(범위 이탈·diff 가 로그에 끊김·역방향 검증 실패) 로 kimi·glm 이 abandoned.
       //   ⇒ 작업 디렉토리가 «elanous 도구 자신의 저장소가 아닐 때만» 같은 준비를 건다(elanous 자기 개발 경로 무영향).
-      provisionForeignWorkingRepository(deps.cwd ?? process.cwd());
+      provisionForeignWorkingRepository(cwd);
     }
     const run = deps.runSelfImplement ?? (await import('../self-implement/orchestrator.js')).runSelfImplement;
     const defaultSeams = deps.buildSelfImplementSeams

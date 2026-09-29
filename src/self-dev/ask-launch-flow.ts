@@ -37,6 +37,7 @@ import {
 } from '../self-implement/goal-author-clarification.js';
 import { classifyReauthoredAsk, countMissingAuthoredConstraintMarkers, askGoalTypeDeclaration, declaredGoalType, parseGoalId } from '../self-implement/goal-author.js';
 import { observeFrontNodeEntry } from './graph-front-nodes.js';
+import { emitDecision } from '../live/detail-switch.js';
 import { decomposeSelfDevGoal, type SelfDevDecomposeOptions, type SelfDevDecomposition } from './decompose.js';
 import { observeDecomposerSelection, readFabricDecomposeConfig, selectFabricDecomposer } from './self-orchestrate-runtime.js';
 import type { GoalDocumentClarification } from '../self-implement/goal-author-clarification.js';
@@ -486,10 +487,11 @@ function preflightAxesForObservation(result: LaunchPreflightResult) {
   };
 }
 
-function observeLaunchPreflight(
+export function observeLaunchPreflight(
   deps: AskLaunchFlowDeps,
   phase: 'before-authoring' | 'before-launch',
   decision: ReturnType<typeof decideAskPreflight>,
+  runId?: string,
 ): void {
   const blockers = blockersForObservation(decision.result.blockers);
   deps.log('harness.preflight', {
@@ -499,6 +501,35 @@ function observeLaunchPreflight(
     blockerReasons: blockers,
     axes: preflightAxesForObservation(decision.result),
   }, 'info');
+  if (phase === 'before-authoring') {
+    try { emitAuthoringPreflightDecision(decision, runId); }
+    catch { /* Live detail cannot change the preflight outcome. */ }
+  }
+}
+
+function emitAuthoringPreflightDecision(
+  decision: ReturnType<typeof decideAskPreflight>,
+  runId?: string,
+): void {
+  const firstBlocker = decision.result.blockers[0];
+  if (firstBlocker && !decision.shouldLaunch) emitDecision({
+    kind: 'ESCALATE',
+    what: firstBlocker.detail.replace(/\s+/g, ' ').trim(),
+    reason: `${firstBlocker.name} — 예비 검사에서 막는 것 ${decision.result.blockers.length}건`,
+    purpose: '저작 전 막힘을 사람이 판단한다',
+    target: '사람(되묻기)',
+    ...(runId === undefined ? {} : { runId }),
+  });
+  else emitDecision({
+    kind: 'PLAN',
+    what: '저작 시작',
+    reason: firstBlocker
+      ? `예비 검사 통과 — --force-preflight 로 ${decision.result.blockers.length}건 우회; 저작 뒤 확정 재검사`
+      : '예비 검사 통과 — 막는 것 없음; 저작 뒤 확정 재검사',
+    purpose: '골을 저작하고 확정 재검사한다',
+    target: '저작',
+    ...(runId === undefined ? {} : { runId }),
+  });
 }
 
 /** ⛔⭐⭐ 막힘 처리는 «한 곳»에서만 — ⓪(저작 전)과 ⑵⑶⑷(저작 후)가 같은 물음·같은 계수를 쓴다.
@@ -629,7 +660,7 @@ async function runPrePreflight(
   );
   deps.print(`[ask] ⓪ 저작 전 예비 검사 — ask 힌트 경로 ${hints.length}개(추정)`);
   deps.print(renderLaunchPreflight(preDecision.result, input.forceRequested && preDecision.result.blockers.length > 0, 'before-authoring'));
-  observeLaunchPreflight(deps, 'before-authoring', preDecision);
+  observeLaunchPreflight(deps, 'before-authoring', preDecision, input.runId);
   // ⛔⭐ A2 「맹점 창」 — 원장에 «쓰지» 않고 이미 남는 관측을 «읽어» 같은 경로의 최근 저작을 본다.
   //   ⚠️ 순서: 내 `ask-pre-preflight` 를 «남기기 전에» 읽는다(자기 자신과 안 겹치게).
   const authoringSamples = deps.recentAuthoringSamples();

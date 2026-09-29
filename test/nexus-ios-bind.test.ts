@@ -8,8 +8,9 @@
 // xcrun · 파일시스템 · runtime sidecar 모두 mock — 시뮬레이터 부팅
 // 없이 검증.
 
-import { describe, test, expect } from 'bun:test';
+import { afterEach, describe, test, expect } from 'bun:test';
 import { runNexusIosBind } from '../src/cli/nexus-ios-bind';
+import { setResolveDaemonEndpointForTest } from '../src/nexus/daemon-endpoint';
 import type { NexusRuntimeMeta } from '../src/nexus/runtime';
 import type { SpawnSyncReturns } from 'node:child_process';
 
@@ -45,6 +46,8 @@ function captureSpawn(): {
 }
 
 describe('runNexusIosBind · L2 helper', () => {
+  afterEach(() => setResolveDaemonEndpointForTest(null));
+
   test('runtime sidecar 의 httpHost/httpPort 를 inject', () => {
     const spawn = captureSpawn();
     const result = runNexusIosBind({
@@ -75,15 +78,42 @@ describe('runNexusIosBind · L2 helper', () => {
     ]);
   });
 
-  test('runtime sidecar 부재 시 fallback (localhost:31415) 사용', () => {
+  test('runtime sidecar 부재 시 해석기 주소의 host/port 를 inject', () => {
+    setResolveDaemonEndpointForTest(() => ({
+      baseUrl: 'http://127.0.0.1:31432',
+      healthUrl: 'http://127.0.0.1:31432/v1/health',
+      pwaUrl: 'http://127.0.0.1:31432/app/',
+      source: 'registry',
+    }));
     const spawn = captureSpawn();
     const result = runNexusIosBind({
       spawnSyncFn: spawn.fn as never,
       readRuntimeFn: () => null,
       readTokenFn: () => null,
     });
-    expect(result.host).toBe('localhost');
-    expect(result.port).toBe(31415);
+    expect(result.ok).toBe(true);
+    expect(result.host).toBe('127.0.0.1');
+    expect(result.port).toBe(31432);
+    expect(spawn.calls).toHaveLength(2);
+    expect(spawn.calls[0]!.args).toContain('127.0.0.1');
+    expect(spawn.calls[1]!.args).toContain('31432');
+  });
+
+  test('runtime 포트와 해석기 모두 부재 시 아무 UserDefaults 도 쓰지 않는다', () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const spawn = captureSpawn();
+    const result = runNexusIosBind({
+      spawnSyncFn: spawn.fn as never,
+      readRuntimeFn: () => null,
+      readTokenFn: () => 'secret',
+      asciiKeyboard: true,
+      seedPrompt: 'hello',
+    });
+    expect(result.ok).toBe(false);
+    expect(result.message).toContain('데몬 주소를 모른다');
+    expect(result.message.split('\n')).toHaveLength(1);
+    expect(result.tokenInjected).toBe(false);
+    expect(spawn.calls).toHaveLength(0);
   });
 
   test('--no-token 옵션 시 token spawn 호출 안 함', () => {
@@ -286,6 +316,7 @@ describe('runNexusIosBind · L2 helper', () => {
   });
 
   test('hostOverride / portOverride 가 runtime sidecar 보다 우선', () => {
+    setResolveDaemonEndpointForTest(() => null);
     const spawn = captureSpawn();
     const result = runNexusIosBind({
       hostOverride: 'mbp.tail-xxx.ts.net',
@@ -296,6 +327,21 @@ describe('runNexusIosBind · L2 helper', () => {
     });
     expect(result.host).toBe('mbp.tail-xxx.ts.net');
     expect(result.port).toBe(31432);
+  });
+
+  test('portOverride is enough without runtime or resolver', () => {
+    setResolveDaemonEndpointForTest(() => null);
+    const spawn = captureSpawn();
+    const result = runNexusIosBind({
+      portOverride: 31432,
+      spawnSyncFn: spawn.fn as never,
+      readRuntimeFn: () => null,
+      readTokenFn: () => null,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.host).toBe('localhost');
+    expect(result.port).toBe(31432);
+    expect(spawn.calls).toHaveLength(2);
   });
 
   test('token 이 redact 되어 메시지에 노출 안 됨', () => {

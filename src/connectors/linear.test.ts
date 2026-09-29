@@ -1,5 +1,9 @@
 import { expect, test } from 'bun:test';
 import { createHmac } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { EventLedger } from './event-ledger.js';
 import { fetchLinearIssues, parseLinearWebhook, toTaskRequest, verifyLinearWebhook } from './linear.js';
 
 const now = Date.now();
@@ -47,10 +51,10 @@ test('GraphQL fetch maps priorities 1, 2, 3, 4, 0 to TOX and retains identifier 
   const events = await fetchLinearIssues({ apiKey: 'test-key', teamKey: 'ELA', fetch: fakeFetch as typeof fetch });
   expect(calls[0]?.url).toBe('https://api.linear.app/graphql');
   expect((calls[0]?.init.headers as Record<string, string>).Authorization).toBe('test-key');
-  expect(events.map(e => e.eventId)).toEqual([5, 6, 7, 8, 9].map(n => `id-${n}:${new Date(now).toISOString()}`));
-  expect(events.map(e => e.priority)).toEqual(['urgent', 'high', 'medium', 'low', null]);
-  expect(events.map(e => toTaskRequest(e).priority)).toEqual(['high', 'high', 'medium', 'low', 'medium']);
-  expect(events.map(e => toTaskRequest(e).title)).toEqual([5, 6, 7, 8, 9].map(n => `ELA-${n} Issue ${n}`));
+  expect(events.map(e => e.eventId)).toEqual([5, 6, 7, 9, 8].map(n => `id-${n}:${new Date(now).toISOString()}`));
+  expect(events.map(e => e.priority)).toEqual(['urgent', 'high', 'medium', null, 'low']);
+  expect(events.map(e => toTaskRequest(e).priority)).toEqual(['high', 'high', 'medium', 'medium', 'low']);
+  expect(events.map(e => toTaskRequest(e).title)).toEqual([5, 6, 7, 9, 8].map(n => `ELA-${n} Issue ${n}`));
   expect(toTaskRequest(events[0]!).description).toBe('원래 우선순위: Urgent\n\nWhat is done?');
   expect(toTaskRequest(events[0]!).external).toEqual({ provider: 'linear', ref: 'id-5', url: 'https://linear.app/issue/ELA-5', team: 'ELA' });
 });
@@ -69,6 +73,15 @@ test('GraphQL walks pages and filters by title prefix or label and updatedAt', a
   const events = await fetchLinearIssues({ apiKey: 'test-key', teamKey: 'ELA', labelOrPrefix: 'lab', since: '2026-01-01', fetch: fakeFetch as typeof fetch });
   expect(pages).toEqual([null, 'page-2']);
   expect(events.map(e => e.identifier)).toEqual(['ELA-5', 'ELA-8']);
+});
+
+test('GraphQL returns Urgent issues first so they are created before High ones', async () => {
+  const fakeFetch = async (_url: string | URL | Request, _init?: RequestInit) => Response.json({ data: { issues: {
+    nodes: [issue(4, 21), issue(2, 22), issue(0, 23), issue(1, 24), issue(3, 25), issue(1, 26)],
+    pageInfo: { hasNextPage: false, endCursor: null },
+  } } });
+  const events = await fetchLinearIssues({ apiKey: 'test-key', teamKey: 'ELA', fetch: fakeFetch as typeof fetch });
+  expect(events.map(e => e.identifier)).toEqual(['ELA-24', 'ELA-26', 'ELA-22', 'ELA-23', 'ELA-25', 'ELA-21']);
 });
 
 test('GraphQL requests state type and excludes completed, canceled and duplicate issues', async () => {
@@ -95,6 +108,36 @@ test('task title truncates at 80 characters with ellipsis after identifier', () 
   expect(task.title.length).toBe(80);
   expect(task.priority).toBe('high');
   expect(task.external.team).toBe('ELA');
+});
+
+test('webhook and pull ignore recent projector echoes but retain unrelated and later issue changes', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'linear-echo-'));
+  try {
+    const ledger = new EventLedger(join(dir, 'events.jsonl'));
+    const updatedAt = new Date().toISOString();
+    const ownIssue = { ...issue(1, 5), updatedAt };
+    const otherIssue = { ...issue(2, 6), updatedAt };
+    ledger.record('linear', 'outgoing:state:id-5:hash', { ref: ownIssue.id, occurredAt: updatedAt });
+    expect(parseLinearWebhook({ type: 'Issue', action: 'update', data: ownIssue }, 'own-delivery', ledger)).toBeNull();
+    expect(parseLinearWebhook({ type: 'Issue', action: 'update', data: otherIssue }, 'other-delivery', ledger)?.eventId).toBe('other-delivery');
+    expect(parseLinearWebhook({ type: 'Issue', action: 'update', data: { ...ownIssue, updatedAt: new Date(Date.parse(updatedAt) + 1000).toISOString() } }, 'later-delivery', ledger)?.eventId).toBe('later-delivery');
+    const fakeFetch = (async () => Response.json({ data: { issues: { nodes: [ownIssue, otherIssue, { ...ownIssue, updatedAt: new Date(Date.parse(updatedAt) + 1000).toISOString() }], pageInfo: { hasNextPage: false } } } })) as unknown as typeof fetch;
+    const events = await fetchLinearIssues({ apiKey: 'key', teamKey: 'ELA', ledger, fetch: fakeFetch });
+    expect(events.map(event => event.eventId)).toEqual([`id-5:${new Date(Date.parse(updatedAt) + 1000).toISOString()}`, `id-6:${updatedAt}`]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('an inbound ledger entry or an old projector entry does not suppress a normal webhook change', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'linear-echo-'));
+  try {
+    const ledger = new EventLedger(join(dir, 'events.jsonl'));
+    const currentIssue = { ...issue(1, 5), updatedAt: new Date().toISOString() };
+    const oldIssue = { ...issue(2, 6), updatedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() };
+    ledger.record('linear', 'inbound-delivery', { ref: currentIssue.id, occurredAt: currentIssue.updatedAt });
+    ledger.record('linear', 'outgoing:state:id-6:hash', { ref: oldIssue.id, occurredAt: oldIssue.updatedAt });
+    expect(parseLinearWebhook({ type: 'Issue', action: 'update', data: currentIssue }, 'new-delivery', ledger)?.eventId).toBe('new-delivery');
+    expect(parseLinearWebhook({ type: 'Issue', action: 'update', data: oldIssue }, 'old-delivery', ledger)?.eventId).toBe('old-delivery');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('GraphQL rejects a repeated pagination cursor rather than fetching forever', async () => {

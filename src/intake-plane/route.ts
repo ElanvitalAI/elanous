@@ -15,7 +15,8 @@ export interface IntakeCheckJson {
   goalDraftPaths?: string[];
 }
 
-export interface RouteResult { id: string; goals: number; manual: number; review: number; grounding: number; release: number; dryRun: boolean; skipped?: string }
+type RouteMeasurement = { unmeasured: number; measured: number };
+export interface RouteResult extends RouteMeasurement { id: string; goals: number; manual: number; review: number; grounding: number; release: number; dryRun: boolean; skipped?: string }
 
 /** 큐 파일의 날짜 — KST. 다이제스트가 KST 하루로 읽는다(07:00 KST 크론은 UTC 로 «전날»이다). */
 export const kstDay = (iso: string): string => new Date(Date.parse(iso) + 9 * 3600_000).toISOString().slice(0, 10);
@@ -50,8 +51,14 @@ function groundingHas(root: string, path: string): boolean {
  */
 export function routeIntakeItem(root: string, id: string, check: IntakeCheckJson, opts: { dryRun?: boolean; lastCommitOf?: LastCommitOf } = {}, now = new Date().toISOString()): RouteResult {
   const item = loadIntakeLedger(root).items.get(id);
-  if (!item) return { id, goals: 0, manual: 0, review: 0, grounding: 0, release: 0, dryRun: !!opts.dryRun, skipped: '원장에 없는 id' };
-  if (item.status === 'routed') return { id, goals: 0, manual: 0, review: 0, grounding: 0, release: 0, dryRun: !!opts.dryRun, skipped: '이미 routed' };
+  if (!item) return { id, goals: 0, manual: 0, review: 0, grounding: 0, release: 0, unmeasured: 0, measured: 0, dryRun: !!opts.dryRun, skipped: '원장에 없는 id' };
+  if (item.status === 'routed') return { id, goals: 0, manual: 0, review: 0, grounding: 0, release: 0, unmeasured: 0, measured: 0, dryRun: !!opts.dryRun, skipped: '이미 routed' };
+  const unmeasured = check.items.filter((c) => c.verdict === '못 쟀다').length;
+  const measured = check.items.length - unmeasured;
+  if (measured === 0 && unmeasured > 0) {
+    debug.log('intake.route', 'all-unmeasured', { id, unmeasured });
+    return { id, goals: 0, manual: 0, review: 0, grounding: 0, release: 0, unmeasured, measured, dryRun: !!opts.dryRun, skipped: '모든 주장을 못 쟀다 — 대조를 다시 돌려라' };
+  }
   const day = kstDay(now);
   const base = { id, at: now, source: item.source, ...(item.url ? { url: item.url } : {}), ...(check.commit ? { commit: check.commit } : {}) };
   const goals = check.items.filter((c) => c.verdict === '없음').map((c) => ({
@@ -88,8 +95,8 @@ export function routeIntakeItem(root: string, id: string, check: IntakeCheckJson
     appendJsonl(join(out, 'release', `${day}.jsonl`), release);
     markIntakeItem(root, id, { status: 'routed' }, now);
   }
-  debug.log('intake.route', 'item-routed', { id, goals: goals.length, manual: manual.length, review: review.length, grounding: grounding.length, release: release.length, dryRun: !!opts.dryRun });
-  return { id, goals: goals.length, manual: manual.length, review: review.length, grounding: grounding.length, release: release.length, dryRun: !!opts.dryRun };
+  debug.log('intake.route', 'item-routed', { id, goals: goals.length, manual: manual.length, review: review.length, grounding: grounding.length, release: release.length, unmeasured, measured, dryRun: !!opts.dryRun });
+  return { id, goals: goals.length, manual: manual.length, review: review.length, grounding: grounding.length, release: release.length, unmeasured, measured, dryRun: !!opts.dryRun };
 }
 
 function noteOf(item: IntakeItem): string | undefined {

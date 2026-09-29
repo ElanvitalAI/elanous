@@ -470,6 +470,16 @@ describe('PtyControl runtime', () => {
     expect(textProperty.description).toContain('key name');
   });
 
+  test('input-mouse sends structured coordinates to owner and rejects invalid coordinates', async () => {
+    const calls: unknown[][] = [];
+    inject({ requestPtyControl: async (...args) => { calls.push(args); return { status: 'denied', reason: 'PTY mouse mode is off' }; } });
+    const response = await dispatchPtyControl({ ptyId: 'pty-1', action: 'input-mouse', x: 10, y: 5, kind: 'click', actor: 'agent' });
+    expect(response.result).toEqual({ status: 'denied', reason: 'PTY mouse mode is off' });
+    expect(response.output).toContain('reason=PTY mouse mode is off');
+    expect(calls).toEqual([['pty-1', 'input-mouse', { x: 10, y: 5, kind: 'click', button: 'left' }, { actor: 'agent', timeoutMs: 2000 }]]);
+    await expect(dispatchPtyControl({ ptyId: 'pty-1', action: 'input-mouse', x: 0, y: 5, kind: 'click' })).rejects.toThrow("'x' must be a positive integer");
+  });
+
   test('resolves input-key names to PTY control bytes while input-text remains literal', async () => {
     const calls: unknown[][] = [];
     inject({ requestPtyControl: async (...args) => { calls.push(args); return { status: 'success' }; } });
