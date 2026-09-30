@@ -1,10 +1,11 @@
+<p align="center"><img src="https://elanous.ai/media/brand/elanous-180.png" width="112" alt="Elanous mark"></p>
+
 # Elanous
 
-> **Beta** — Elanous is provided as is (Apache-2.0) until the stable release. Get stable release news at [elanous.ai](https://elanous.ai).
-> **베타** — 정식 릴리스 전까지 Elanous 는 있는 그대로(Apache-2.0) 제공됩니다. 정식 릴리스 소식은 [elanous.ai](https://elanous.ai) 에서 받으세요. <!-- announce:allow B11 -->
+> **Public beta** — install it today; provided as is (Apache-2.0). The big update lands on October 28, 2026 — news at [elanous.ai](https://elanous.ai).
+> **공개 베타** — 지금 설치해 쓸 수 있습니다. 정식판 전까지 있는 그대로(Apache-2.0) 제공합니다. 2026년 10월 28일 대규모 업데이트 — 소식은 [elanous.ai](https://elanous.ai). <!-- announce:allow B11 -->
 
-> The name joins *élan* (the drive to act) and *nous* (mind). The agent
-> observes itself, reasons about what it sees, and repairs itself; a person is called only when it cannot (一約之觀).
+> **élan, and nous** — The red point at the center is *élan* — the drive to move on its own. The three white blades around it are *nous* — the mind that brings order. They turn one way — observe, understand, heal — widening a little with every turn. A spark meets a mind and keeps widening itself. That is Elanous.
 
 **A self-healing coding harness where eyes, hands, and memory all turn on
 one sentence — an agent that develops agents.**
