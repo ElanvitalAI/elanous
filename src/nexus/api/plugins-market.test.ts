@@ -1,10 +1,13 @@
-import { afterAll, afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { afterAll, afterEach, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { installPlugin, listInstalledPlugins } from '../../plugins/install/plugin-install.js';
+import * as debugModule from '../../debug/log.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateIndexKeyPair, signIndex } from '../../market/signed-index.js';
-import { handlePluginsGet, handlePluginsIndexGet, readMarketIndex } from './plugins-market.js';
+import { handlePluginsGet, handlePluginsIndexGet, handlePluginsInstall, handlePluginsMarketRefresh, handlePluginsRemove, readMarketIndex, safeDetail } from './plugins-market.js';
 import { createNexusState } from '../state/state.js';
 import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from './event-bus.js';
@@ -42,6 +45,7 @@ test('temporary state separates ok and missing and projects credential names onl
   expect(JSON.stringify(result)).not.toContain('DO_NOT_EXPOSE');
   expect(JSON.stringify(result)).not.toContain(pair.publicKey);
   expect(JSON.stringify(result)).not.toContain('index.sig');
+  expect(JSON.stringify(result)).not.toContain('marketplace.json');
 });
 
 test('owner index handler reads configured trust keys without exposing them', async () => {
@@ -77,7 +81,7 @@ test('unknown key, broken signature, malformed JSON are visible without leaking 
 
 test('a market directory with no index remains visible as malformed', () => {
   mkdirSync(join(root, 'markets', 'empty'), { recursive: true });
-  expect(readMarketIndex(root).markets).toEqual([{ name: 'empty', signature: 'malformed', detail: 'marketplace.json: not found', plugins: [] }]);
+  expect(readMarketIndex(root).markets).toEqual([{ name: 'empty', signature: 'malformed', detail: '마켓 인덱스를 찾지 못했습니다.', plugins: [] }]);
 });
 
 test('the index response carries no local filesystem path (browser must not learn the state root)', () => {
@@ -92,7 +96,7 @@ test('both handlers require owner; installed list is returned directly', async (
   expect(await handlePluginsGet(owner('/v1/plugins'), auth, root).json()).toEqual([]);
 });
 
-test('installed endpoint returns only installer inventory without inventing installation timestamps; removed paths do not break listing', async () => {
+test('installed endpoint returns recorded ISO installation times only; removed paths do not break listing', async () => {
   const makeSource = (id: string) => {
     const packageDir = join(root, id);
     mkdirSync(packageDir, { recursive: true });
@@ -102,23 +106,118 @@ test('installed endpoint returns only installer inventory without inventing inst
   };
   const removed = await installPlugin(makeSource('removed-plugin'), { root, yes: true });
   await installPlugin(makeSource('remaining-plugin'), { root, yes: true });
+  await installPlugin(makeSource('legacy-plugin'), { root, yes: true });
+  const ledgerPath = join(root, 'plugins', 'installed.json');
+  const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) as Array<{ name: string; installedAt?: string }>;
+  expect(ledger.find(entry => entry.name === 'remaining-plugin')?.installedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  const recordedTime = '2001-02-03T04:05:06.789Z';
+  writeFileSync(ledgerPath, JSON.stringify(ledger.map(entry => entry.name === 'legacy-plugin' ? { ...entry, installedAt: undefined } : entry.name === 'remaining-plugin' ? { ...entry, installedAt: recordedTime } : entry)));
+  const recordedRemaining = (JSON.parse(readFileSync(ledgerPath, 'utf8')) as typeof ledger).find(entry => entry.name === 'remaining-plugin');
+  expect(recordedRemaining?.installedAt).toBe(recordedTime);
   expect(await handlePluginsGet(owner('/v1/plugins'), auth, root).json()).toEqual(listInstalledPlugins(root));
   rmSync(removed.path, { recursive: true, force: true });
-  const response = await handlePluginsGet(owner('/v1/plugins'), auth, root).json();
-  expect(response).toEqual(listInstalledPlugins(root));
-  expect(response).toHaveLength(1);
-  expect(JSON.stringify(response)).not.toContain('installedAt');
+  const response = await handlePluginsGet(owner('/v1/plugins'), auth, root).json() as ReturnType<typeof listInstalledPlugins>;
+  const inventory = listInstalledPlugins(root);
+  expect(response).toEqual(inventory);
+  expect(response).toHaveLength(2);
+  const remaining = response.find(plugin => plugin.name === 'remaining-plugin');
+  expect(remaining?.installedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  expect(remaining?.installedAt).toBe(recordedRemaining?.installedAt);
+  expect(remaining?.installedAt).toBe(inventory.find(plugin => plugin.name === 'remaining-plugin')?.installedAt);
+  const legacy = response.find(plugin => plugin.name === 'legacy-plugin');
+  expect(legacy).toBeDefined();
+  expect(legacy).not.toHaveProperty('installedAt');
 });
 
-test('HTTP dispatcher connects only authenticated GET routes', async () => {
+test('install refuses capabilities outside explicit acceptance and streams a final failed line without secrets', async () => {
+  const source = join(root, 'consent-source');
+  mkdirSync(source, { recursive: true });
+  writeFileSync(join(source, 'plugin.json'), JSON.stringify({ id: 'consent-plugin', name: 'consent-plugin', version: '1.0.0', main: './plugin.ts', capabilities: [{ kind: 'network' }, { kind: 'filesystem' }], contributes: {} }));
+  writeFileSync(join(source, 'plugin.ts'), 'export default {}');
+  const archive = join(root, 'consent.tgz');
+  execFileSync('tar', ['-czf', archive, '-C', source, '.']);
+  const bytes = readFileSync(archive);
+  const market = sample('consent-market');
+  market.plugins[0]!.name = 'consent-plugin';
+  market.plugins[0]!.version = '1.0.0';
+  market.plugins[0]!.artifact = { sha256: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.length, key: 'consent.tgz' };
+  const pair = generateIndexKeyPair();
+  const signature = signIndex(Buffer.from(JSON.stringify(market)), pair.privateKeyPem, pair.keyId);
+  writeMarket('consent-market', market, signature);
+  writeFileSync(join(root, 'markets', 'consent-market', 'consent.tgz'), bytes);
+  const configPath = join(root, 'install-config.json');
+  writeFileSync(configPath, JSON.stringify({ market: { trustedKeys: [{ keyId: pair.keyId, publicKey: pair.publicKey }] } }));
+  const request = (acceptedCapabilities: string[]) => new Request('http://localhost/v1/plugins/install', { method: 'POST', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' }, body: JSON.stringify({ spec: 'consent-plugin@consent-market', acceptedCapabilities }) });
+  const logs: unknown[] = [];
+  const spy = spyOn(debugModule.debug, 'log').mockImplementation((...args) => { logs.push(args); });
+  try {
+    expect((await handlePluginsInstall(new Request('http://localhost/v1/plugins/install', { method: 'POST', headers: { authorization: 'Bearer wrong', 'sec-fetch-site': 'cross-site' }, body: '{}' }), auth, root, configPath)).status).toBe(401);
+    const refused = await handlePluginsInstall(request([]), auth, root, configPath);
+    expect(refused.headers.get('content-type')).toContain('application/x-ndjson');
+    const text = await refused.text();
+    expect(JSON.parse(text.trim().split('\n').at(-1)!)).toEqual({ event: 'failed', reason: 'consent-denied', detail: 'plugin capabilities require consent' });
+    expect(listInstalledPlugins(root).some(plugin => plugin.name === 'consent-plugin')).toBe(false);
+    expect(text).not.toContain('DO_NOT_EXPOSE');
+    expect(text).not.toContain(pair.publicKey);
+    expect(text).not.toContain(signature);
+    const partial = await handlePluginsInstall(request(['network']), auth, root, configPath);
+    expect(JSON.parse((await partial.text()).trim().split('\n').at(-1)!)).toEqual({ event: 'failed', reason: 'consent-denied', detail: 'plugin capabilities require consent' });
+    expect(listInstalledPlugins(root).some(plugin => plugin.name === 'consent-plugin')).toBe(false);
+    const accepted = await handlePluginsInstall(request(['network', 'filesystem']), auth, root, configPath);
+    expect(JSON.parse((await accepted.text()).trim().split('\n').at(-1)!)).toEqual({ event: 'done' });
+    expect(listInstalledPlugins(root).some(plugin => plugin.name === 'consent-plugin')).toBe(true);
+    expect(JSON.stringify(logs)).not.toContain('DO_NOT_EXPOSE');
+    expect(JSON.stringify(logs)).not.toContain(pair.publicKey);
+    expect(JSON.stringify(logs)).not.toContain(signature);
+  } finally { spy.mockRestore(); }
+});
+
+test('refresh and remove enforce owner authentication before mutation', async () => {
+  const post = new Request('http://localhost/v1/plugins/markets/elanous/refresh', { method: 'POST', headers: { authorization: 'Bearer wrong', 'sec-fetch-site': 'cross-site' } });
+  expect((await handlePluginsMarketRefresh(post, 'elanous', auth, { root })).status).toBe(401);
+  const pair = generateIndexKeyPair();
+  const index = sample('elanous');
+  const bytes = Buffer.from(JSON.stringify(index));
+  const signature = signIndex(bytes, pair.privateKeyPem, pair.keyId);
+  const fetcher = async (url: string | URL | Request) => new Response(String(url).endsWith('index.sig') ? signature : bytes);
+  const refreshLogs: unknown[] = [];
+  const logSpy = spyOn(debugModule.debug, 'log').mockImplementation((...args) => { refreshLogs.push(args); });
+  try {
+    const refreshed = await handlePluginsMarketRefresh(new Request(post.url, { method: 'POST', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' } }), 'elanous', auth,
+      { root, fetcher: fetcher as typeof fetch, trustedKeys: [{ keyId: pair.keyId, publicKey: pair.publicKey }] });
+    expect((await refreshed.json() as { ok: boolean; plugins: unknown[] }).plugins).toHaveLength(1);
+    expect(JSON.stringify(refreshLogs)).not.toContain(pair.publicKey);
+    expect(JSON.stringify(refreshLogs)).not.toContain(signature);
+    const failed = await handlePluginsMarketRefresh(new Request(post.url, { method: 'POST', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' } }), 'elanous', auth,
+      { root, fetcher: (async (_url: string | URL | Request) => { throw new Error('SECRET_PRIVATE_VALUE'); }) as unknown as typeof fetch });
+    expect(await failed.json()).toEqual({ ok: false, reason: 'io' });
+    expect(JSON.stringify(refreshLogs)).not.toContain('SECRET_PRIVATE_VALUE');
+  } finally { logSpy.mockRestore(); }
+  const del = new Request('http://localhost/v1/plugins/remaining-plugin', { method: 'DELETE', headers: { authorization: 'Bearer wrong', 'sec-fetch-site': 'cross-site' } });
+  expect(handlePluginsRemove(del, 'remaining-plugin', auth, root).status).toBe(401);
+  expect(await handlePluginsRemove(new Request(del.url, { method: 'DELETE', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' } }), 'remaining-plugin', auth, root).json()).toEqual({ removed: 1 });
+});
+
+test('HTTP dispatcher connects authenticated GET and write routes', async () => {
   const state = createNexusState({ nexusVersion: 'test', phase: 'test' });
   const bus = new NexusEventBus();
   state.bus = bus;
-  const opts = { state, registry: new TabRegistry(state), eventBus: bus, metaApi: auth };
+  const opts = { state, registry: new TabRegistry(state), eventBus: bus, metaApi: auth, pluginStateRoot: root };
   const route = (req: Request) => routeRequest(req, opts, { requestIP: () => ({ address: '203.0.113.1' }) } as never, null, createDevProxyRuntimeRef());
   expect((await route(owner('/v1/plugins/index', 'wrong')))?.status).toBe(401);
   expect((await route(owner('/v1/plugins', 'wrong')))?.status).toBe(401);
   expect((await route(owner('/v1/plugins/index')))?.status).toBe(200);
   expect((await route(owner('/v1/plugins')))?.status).toBe(200);
+  for (const [method, path] of [['POST', '/v1/plugins/install'], ['POST', '/v1/plugins/markets/elanous/refresh'], ['DELETE', '/v1/plugins/example-plugin']]) {
+    expect((await route(new Request(`http://localhost${path}`, { method, headers: { authorization: 'Bearer wrong', 'sec-fetch-site': 'cross-site' } })))?.status).toBe(401);
+  }
+  expect((await route(new Request('http://localhost/v1/plugins/install', { method: 'POST', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' }, body: '{}' })))?.status).toBe(400);
+  expect(await (await route(new Request('http://localhost/v1/plugins/example-plugin', { method: 'DELETE', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' } })))?.json()).toEqual({ removed: 0 });
   expect((await route(new Request('http://localhost/v1/plugins', { method: 'POST', headers: { authorization: 'Bearer owner-secret', 'sec-fetch-site': 'cross-site' } })))?.status).toBe(405);
+});
+
+test('safeDetail hides home paths, keeps one line, caps length', () => {
+  expect(safeDetail(new Error('artifact unavailable: /Users/someone/.elanous/markets/elanous/x.tgz\nmore'))).toBe('artifact unavailable: ~/.elanous/markets/elanous/x.tgz more');
+  expect(safeDetail(new Error('x'.repeat(500)))?.length).toBe(200);
+  expect(safeDetail(undefined)).toBeUndefined();
 });

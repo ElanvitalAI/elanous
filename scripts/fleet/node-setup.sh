@@ -71,11 +71,21 @@ else R "k3d registry create $REGISTRY --port 127.0.0.1:$REG_PORT >/tmp/fleet-reg
 #   `bridge` 에만 붙어 kubelet 이 `lookup k3d-elanous-registry: no such host` → Pod `ImagePullBackOff`(🅕 첫 Pod 사용에서 발견). 멱등.
 [ $CHECK = 1 ] || R "docker network inspect k3d-$CLUSTER >/dev/null 2>&1 && (docker network connect k3d-$CLUSTER k3d-$REGISTRY 2>/dev/null || true)" >/dev/null 2>&1
 fi
-# 클러스터가 그 레지스트리를 쓰나 — 안 쓰면(옛 클러스터) 돌고 있는 Job 이 없을 때만 다시 만든다.
+# 🪞 호스트 git 미러(대표 09-29) — Pod 는 GitHub 대신 이 미러에서 clone 한다(`ELANOUS_POD_HOST_MIRROR` · #21929).
+#   bare 미러 = 원격 ~/mirror/elanous-agent.git(없으면 만든다 · 갱신은 이 맥의 크론이 push). 클러스터 노드에 읽기 전용으로 붙인다.
+MIRROR_DIR='$HOME/mirror'; MIRROR_MOUNT=/mirror-host
+if R "test -d ~/mirror/elanous-agent.git"; then ok "호스트 git 미러 ~/mirror/elanous-agent.git"
+elif [ $CHECK = 1 ]; then todo "호스트 git 미러 ~/mirror/elanous-agent.git 생성(git init --bare) ⊕ 이 맥에서 첫 push"
+else R "mkdir -p ~/mirror && git init -q --bare ~/mirror/elanous-agent.git" && ok "호스트 git 미러 (생성 · 첫 push 는 이 맥 크론)" || { bad "미러 생성 실패"; exit 1; }; fi
+# 클러스터가 그 레지스트리를 쓰나 ⊕ 미러가 붙어 있나 — 둘 중 하나라도 아니면(옛 클러스터) 돌고 있는 Job 이 없을 때만 다시 만든다.
+#   ⛔ k3d 는 볼륨을 «클러스터 생성 때만» 붙인다 — 붙이려면 다시 만들 수밖에 없다.
 REG_WIRED=0; R "docker exec k3d-$CLUSTER-server-0 cat /etc/rancher/k3s/registries.yaml 2>/dev/null | grep -q k3d-$REGISTRY" && REG_WIRED=1
+MIRROR_WIRED=0; R "docker exec k3d-$CLUSTER-server-0 test -d $MIRROR_MOUNT/elanous-agent.git" && MIRROR_WIRED=1
+[ $MIRROR_WIRED = 1 ] || { [ $REG_WIRED = 1 ] && REG_WIRED=0 && MIRROR_ONLY=1; }
 if R "k3d cluster list $CLUSTER" >/dev/null 2>&1 && [ $REG_WIRED = 0 ]; then
-  RUNNING="$(R "KUBECONFIG=\$(k3d kubeconfig write $CLUSTER) kubectl get jobs -A --no-headers 2>/dev/null | grep -vc Complete || true" 2>/dev/null | tail -1)"; RUNNING="${RUNNING:-0}"
-  if [ $CHECK = 1 ]; then todo "클러스터 $CLUSTER 가 레지스트리를 안 쓴다 — 다시 만든다(도는 Job ${RUNNING:-?}개)"
+  # «실행 중»만 센다 — 실패로 끝난 Job 은 Complete 가 아니어도 도는 것이 아니다(09-29: `grep -vc Complete` 는 Failed 까지 세서 영원히 0 이 안 됐다).
+  RUNNING="$(R "KUBECONFIG=\$(k3d kubeconfig write $CLUSTER) kubectl get jobs -A -o jsonpath='{range .items[*]}{.status.active}{\"\\n\"}{end}' 2>/dev/null | awk '\$1>0' | wc -l | tr -d ' '" 2>/dev/null | tail -1)"; RUNNING="${RUNNING:-0}"
+  if [ $CHECK = 1 ]; then todo "클러스터 $CLUSTER 가 $([ "${MIRROR_ONLY:-0}" = 1 ] && echo "미러($MIRROR_MOUNT)를 안 붙였다" || echo "레지스트리를 안 쓴다") — 다시 만든다(도는 Job ${RUNNING:-?}개)"
   elif [ "${RUNNING:-0}" != "0" ]; then bad "클러스터 $CLUSTER 를 다시 만들어야 하는데 도는 Job 이 ${RUNNING}개 — 끝난 뒤 다시"; exit 1
   else R "k3d cluster delete $CLUSTER >/dev/null 2>&1" && ok "클러스터 $CLUSTER (레지스트리 연결 위해 지움)"; fi
 fi
@@ -83,7 +93,7 @@ if R "k3d cluster list $CLUSTER" >/dev/null 2>&1; then ok "클러스터 $CLUSTER
 elif [ $CHECK = 1 ]; then todo "클러스터 $CLUSTER 생성($K3S_IMAGE · API :$API_PORT · SAN $HOST ${TSNAME:-} · 레지스트리 k3d-$REGISTRY:$REG_PORT)"
 else
   SAN="--k3s-arg --tls-san=$HOST@server:0"; [ -n "$TSNAME" ] && SAN="$SAN --k3s-arg --tls-san=$TSNAME@server:0"
-  R "k3d cluster create $CLUSTER --image $K3S_IMAGE --no-lb --api-port 0.0.0.0:$API_PORT $SAN --registry-use k3d-$REGISTRY:$REG_PORT --wait --timeout 300s >/tmp/fleet-k3d-create.log 2>&1" && ok "클러스터 $CLUSTER (생성 · 레지스트리 k3d-$REGISTRY)" || { bad "클러스터 생성 실패 — 원격 /tmp/fleet-k3d-create.log"; exit 1; }
+  R "k3d cluster create $CLUSTER --image $K3S_IMAGE --no-lb --api-port 0.0.0.0:$API_PORT $SAN --registry-use k3d-$REGISTRY:$REG_PORT --volume $MIRROR_DIR:$MIRROR_MOUNT:ro@server:0 --wait --timeout 300s >/tmp/fleet-k3d-create.log 2>&1" && ok "클러스터 $CLUSTER (생성 · 레지스트리 k3d-$REGISTRY)" || { bad "클러스터 생성 실패 — 원격 /tmp/fleet-k3d-create.log"; exit 1; }
 fi
 # 7. 이 맥 kubeconfig 에 컨텍스트 pool-<호스트>
 # ⛔ «있다»로 끝내지 않는다 — 클러스터를 다시 만들면 인증서가 바뀌어 옛 컨텍스트가 x509 로 죽는다(2026-09-26 node-b:
@@ -114,9 +124,38 @@ PY
   KUBECONFIG=~/.kube/config:"$TMP/kc.yaml" kubectl config view --flatten > "$TMP/merged.yaml" && chmod 600 "$TMP/merged.yaml" && mv "$TMP/merged.yaml" ~/.kube/config && ok "kubeconfig 컨텍스트 $CTX (추가 · 현재 컨텍스트는 그대로)" || bad "kubeconfig 병합 실패"
 fi
 # 8. 네임스페이스 ⊕ 격리 정책
-if kubectl --context "$CTX" --request-timeout=10s get ns elanous-test >/dev/null 2>&1; then ok "elanous-test 네임스페이스"
-elif [ $CHECK = 1 ]; then todo "base.yaml ⊕ policy-internet.yaml 적용"
-else kubectl --context "$CTX" apply -f "$ROOT/docker/h1/base.yaml" -f "$ROOT/docker/h1/policy-internet.yaml" >/dev/null && ok "elanous-test 네임스페이스 ⊕ 정책 (적용)" || bad "적용 실패"; fi
+apply_base() {
+  if [ "$CHECK" = 1 ]; then
+    if ! kubectl --context "$CTX" --request-timeout=10s get ns elanous-test >/dev/null 2>&1; then
+      todo "base.yaml ⊕ policy-internet.yaml 적용"
+    elif kubectl --context "$CTX" diff -f "$ROOT/docker/h1/base.yaml" -f "$ROOT/docker/h1/policy-internet.yaml" >/dev/null 2>&1; then
+      ok "elanous-test 네임스페이스 ⊕ 정책"
+    else
+      local diff_status=$?
+      if [ "$diff_status" = 1 ]; then todo "base.yaml ⊕ policy-internet.yaml 적용"
+      else todo "base.yaml ⊕ policy-internet.yaml 적용 (못 쟀다)"; fi
+    fi
+    return
+  fi
+
+  local attempts=0 output retries
+  while [ "$attempts" -lt 6 ]; do
+    attempts=$((attempts+1))
+    if output=$(kubectl --context "$CTX" apply -f "$ROOT/docker/h1/base.yaml" -f "$ROOT/docker/h1/policy-internet.yaml" 2>&1); then
+      retries=$((attempts-1))
+      if [ "$retries" -eq 0 ]; then ok "elanous-test 네임스페이스 ⊕ 정책 (적용)"
+      else ok "elanous-test 네임스페이스 ⊕ 정책 (적용 · 재시도 $retries)"; fi
+      return
+    fi
+    if [[ "$output" != *'serviceaccount "default" not found'* ]] || [ "$attempts" -eq 6 ]; then
+      [ -z "$output" ] || printf '%s\n' "$output" >&2
+      bad "적용 실패 (재시도 $((attempts-1)))"
+      return
+    fi
+    sleep "${FLEET_APPLY_RETRY_SLEEP:-5}"
+  done
+}
+apply_base
 # 9. 판 대조 — k3s · 노드 준비
 v="$(kubectl --context "$CTX" --request-timeout=10s get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null)"
 want="${K3S_IMAGE##*:}"; want="${want/-k3s/+k3s}"

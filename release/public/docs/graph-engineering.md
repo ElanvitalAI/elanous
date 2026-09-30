@@ -16,7 +16,7 @@ flowchart LR
 
 The loop is the same whatever the domain. What changes from one domain to another is only:
 
-- **The senses and hands you attach.** A coding run observes tests and diffs and acts through a worktree; a trading run observes prices and news and acts through orders. Both plug into the same loop as *observe* nodes and *execute* nodes.
+- **The senses and hands you attach.** A coding run observes tests and diffs and acts through a worktree; a trading run observes prices and news (placing orders is not part of the open-source core). Both plug into the same loop as *observe* nodes and *execute* nodes.
 - **The posture.** How deep observation goes, how long the healing loop may run, how widely it grounds itself in outside sources, and which actions are allowed — all rise and fall with the situation, the way a readiness level does.
 
 ## Resolution rises with difficulty

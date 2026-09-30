@@ -34,8 +34,16 @@ export function loadPluginNodes(pluginDir: string, manifest: PluginManifest): Pl
       if (node.graph === 'workflow') {
         if (!node.run || typeof node.run !== 'object' || Array.isArray(node.run)) throw new Error('run must be an object');
         const spec = node.run as Record<string, unknown>;
-        if (Object.keys(spec).length !== 1 || !['bash', 'http', 'skill'].some((key) => key in spec)) {
-          throw new Error('run must contain exactly one bash, http or skill executor');
+        if (Object.keys(spec).length !== 1 || !['bash', 'http', 'skill', 'mcp'].some((key) => key in spec)) {
+          throw new Error('run must contain exactly one bash, http, skill or mcp executor');
+        }
+        if ('mcp' in spec) {
+          const mcp = spec.mcp;
+          if (!mcp || typeof mcp !== 'object' || Array.isArray(mcp)
+            || typeof (mcp as Record<string, unknown>).server !== 'string'
+            || typeof (mcp as Record<string, unknown>).tool !== 'string') {
+            throw new Error('mcp run requires server and tool');
+          }
         }
         run = spec as NodeKindRun;
       } else if (node.run !== undefined) {

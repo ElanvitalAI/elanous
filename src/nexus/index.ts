@@ -79,6 +79,8 @@ import { type PtyBackend, createWebtermSpawn, resolveWebtermCwd } from './webter
 import { SettingsTabController } from './config/settings-controller.js';
 import { tryRegisterSettings } from './boot/register-settings.js';
 import { registerMcpClients, type McpClientsHandle } from './boot/register-mcp-clients.js';
+import { syncInstalledPluginNodes } from '../graph-kinds/installed-plugin-nodes.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
 import type { McpReloadOutcome, McpReloadServerResult } from './api/admin-mcp-reload.js';
 import { loadOrCreateSigningKey, NonceStore } from './api/edit-in-pwa-core.js';
 import { subscribeErrorSnapshotWriter } from './supervisor/error-snapshot.js';
@@ -238,9 +240,8 @@ import {
   type PwaVoiceAdapter,
 } from '../voice/channel-adapters/pwa-voice-adapter.js';
 import { getIntakeStore } from '../intake-plane/runtime.js';
-import { existsSync, readFileSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
-import { getElanousConfigDir } from '../elanous-config-dir.js';
+import { ensureAuthToken } from '../auth/acp-token.js';
 import type { SupervisorSpawnBackend } from './supervisor/spawn.js';
 import type { HealthProbeBackend } from './supervisor/health.js';
 import { gracefulExit, cleanExit } from './supervisor/graceful-exit.js';
@@ -264,8 +265,10 @@ import { createGlobalSubagentCallable } from '../agent/subagent-callable.js';
 import { setAgentHopCap } from '../agent/registry.js';
 import type { SidebarTabSurface } from '../ui/widgets/sidebar-tab-surface.js';
 import { defaultIO, runOnboardingStep, type WizardIO } from '../onboarding.js';
+import { packageVersion } from '../version/code-revision.js';
 
-export const NEXUS_VERSION = '0.17.0';
+// 데몬 배너·`nexus status`·연결 라벨이 보이는 판 = 제품 판(`package.json`) — 옛 내부 상수 `0.17.0` 이 0.2.x 제품 옆에 떴다(🅞 M5 · M5c).
+export const NEXUS_VERSION = packageVersion();
 export const NEXUS_PHASE = 'N-5 PR χ (graceful exit + restart pending)';
 
 type TelegramAgentRunTurnFactory = typeof import('../telegram-agent.js').makeTelegramAgentRunTurn;
@@ -397,6 +400,8 @@ export interface RunNexusOptions {
    *  registry stays empty so the dispatcher's webterm interception
    *  is a no-op). */
   webtermSpawn?: (spec: { id: string; cwd?: string }) => PtyBackend;
+  /** Explicitly disable HTTP and ACP websocket token auth for this run. */
+  noAuth?: boolean;
   /** Skip the HTTP API server boot. Default: true in tests via
    *  detachForTesting; production runs always start the server. Tests
    *  that DO want the server can pass false explicitly. */
@@ -653,7 +658,7 @@ export interface RunNexusHandle {
 /** ACP WS auth gate for the NEXUS HTTP bridge.
  *  Same shape as `src/boot/acp-server.ts` websocket auth: pass
  *  `createAuthVerifier` only when a bearer token is configured;
- *  omit the field entirely for first-boot tokenless dogfood.
+ *  explicit no-auth opt-out omits the verifier.
  *  ⛔ `noAuth` was declared on WsBridgeOpts but the bridge NEVER read it
  *  (0 executable references) while this file assigned it — a value that
  *  flowed in and died. We removed the field rather than leave a knob that
@@ -710,7 +715,7 @@ export function buildNexusWsBridgeAuth(
   bearerToken: string | undefined,
   paths?: TokenStorePaths,
 ): Pick<NexusWsBridgeInit, 'wsAuthVerifier'> {
-  // ⛔ 첫 부팅 무인증 도그푸드는 그대로다 — 부팅 토큰이 «없으면» 검증기를 안 넘긴다.
+  // Explicit opt-out supplies no boot token, so the bridge has no verifier.
   if (!bearerToken) return {};
   return {
     // ⭐ 배열이 아니라 «공급자» — 매 핸드셰이크마다 봉투를 다시 읽는다.
@@ -764,6 +769,13 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   }
 
   const leasePortFromLauncher = checkLauncherLeaseBoot(opts, process.env, () => resolveCurrentInstance().kind);
+  const noAuth = opts.noAuth === true || process.env.ELANOUS_NEXUS_NO_AUTH === '1';
+  // Resolve before acquiring the daemon lock or binding HTTP. A broken token
+  // store must fail closed without leaving a half-booted Nexus behind.
+  const httpBootEnabled = !(opts.skipHttpServer ?? !!opts.detachForTesting);
+  const needsToken = httpBootEnabled && !(opts.skipRuntimeApi ?? !!opts.detachForTesting) && !noAuth;
+  const bearerToken = needsToken ? ensureAuthToken().token : undefined;
+  if (needsToken && !bearerToken) throw new Error('Nexus auth token is empty');
 
   // 설치본 전환 RFC 0b — 키는 launchd plist 가 아니라 키 캐시에서(캐시 우선 · 자식도 물려받는다). 값은 안 찍고 «이름만».
   if (!opts.detachForTesting) {
@@ -973,6 +985,11 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     });
     const startLevel = resolvedLevel.level;
     dbgMod.debug.setLevel(startLevel);
+    if (httpBootEnabled && noAuth) {
+      dbgMod.debug.log('nexus.auth', 'explicit-opt-out', {
+        source: opts.noAuth === true ? '--no-auth' : 'ELANOUS_NEXUS_NO_AUTH',
+      }, { level: 'warn' });
+    }
     dbgMod.debug.log('logging.level', 'startup-resolved', {
       level: startLevel, source: resolvedLevel.source,
       gateOpen: scopedMod.hotPathGateOpen(startLevel), surface: 'nexus',
@@ -1339,6 +1356,10 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   const acpAbortHolder: { current: (sessionId: string) => boolean } = {
     current: () => false,
   };
+
+  // Installed graph kinds do not depend on the runtime API or MCP server configuration.
+  try { syncInstalledPluginNodes(elanousStateRoot()); }
+  catch (error) { debug.log('graph.kinds', 'installed-sync-failed', { reason: String(error) }); }
 
   if (!skipRuntime) {
     // Tool surface — flag · env · UserConfig switch · switch default.
@@ -2000,11 +2021,6 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     let metaApiOpts: import('./api/meta-api.js').MetaApiOpts | undefined;
 
     if (!skipRuntime && runtimeHistory) {
-      // Bearer token — read from getElanousConfigDir()/acp-token (the
-      // canonical store `elanous serve` uses). Loopback default is
-      // noAuth; tests opt in by writing a token file before boot.
-      const bearerToken = readAcpToken();
-
       // Voice REST + adapter. createVoiceRestHandler is stateless;
       // the STT provider singleton (getDaemonSttProvider) returns
       // null until `initDaemonSttProvider()` is called — fine, the
@@ -2081,9 +2097,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       const surfaceForOpts = toolSurface(toolsKind);
       const toolCwdForOpts = resolveToolCwd({ tools: toolsKind, toolCwd: opts.toolCwd });
 
-      // Same shape as src/boot/acp-server.ts websocket auth: pass
-      // createAuthVerifier only when a token is present; omit it
-      // entirely for first-boot dogfood (tokenless ACP upgrade).
+      // ACP websocket and REST share the same boot token; explicit
+      // opt-out omits the websocket verifier as well.
       wsBridgeOpts = {
         ...(acpHandlerRef ? {
           acpOnConnection: async (conn) => {
@@ -2099,7 +2114,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       metaApiOpts = {
         voiceRest,
         ...(bearerToken ? { bearerToken } : {}),
-        noAuth: !bearerToken,
+        noAuth,
         history: runtimeHistory,
         intakeStore: getIntakeStore(),
         toolSurface: surfaceForOpts,
@@ -3048,7 +3063,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     }
     runtime.httpPort = httpServer.port;
     runtime.httpHost = httpServer.hostname;
-    runtime.httpAuth = 'off';
+    runtime.httpAuth = metaApiOpts && !metaApiOpts.noAuth ? 'on' : 'off';
     // The actual bound port (not the requested port or registry entry) is the member endpoint.
     try {
       const configured = (getUserConfig().raw?.nexus as { primary?: unknown } | undefined)?.primary;
@@ -3475,6 +3490,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   }
 
   printBootBanner(runtime, pwaStaticDir);
+  if (runtime.httpPort && noAuth) {
+    console.warn('  ⚠ NEXUS AUTH DISABLED (--no-auth / ELANOUS_NEXUS_NO_AUTH=1) — HTTP API and ACP websocket are unprotected.');
+  }
 
   // P.3 — first-boot PWA share wizard. Only runs in interactive TUI mode
   // when the switch is still 'ask'. Headless / non-TTY boots skip it (the
@@ -3782,23 +3800,6 @@ function shouldAskPwaShareSwitch(): boolean {
   } catch {
     return true;
   }
-}
-
-/** PR k — load the persistent ACP bearer token at
- *  `getElanousConfigDir()/acp-token`. Mirrors the helper in
- *  `boot/acp-server.ts` that `elanous serve` uses, so the same token
- *  gates daemon and NEXUS HTTP. Returns undefined when the token
- *  file is absent (loopback noAuth default — first-boot dogfood
- *  works without configuration). Read failures are swallowed. */
-export function readAcpToken(): string | undefined {
-  try {
-    const tokenPath = joinPath(getElanousConfigDir(), 'acp-token');
-    if (existsSync(tokenPath)) {
-      const tok = readFileSync(tokenPath, 'utf-8').trim();
-      return tok || undefined;
-    }
-  } catch { /* swallow */ }
-  return undefined;
 }
 
 function printBootBanner(runtime: NexusRuntimeMeta, pwaStaticDir?: string): void {

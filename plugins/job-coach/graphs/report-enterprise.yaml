@@ -1,0 +1,28 @@
+graph_id: job-coach-report-enterprise
+version: 1
+entry_node: intake
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: intake, kind: agent, recipe: 'cmd:intake', max_visits: 1 }
+  - { node_id: needs, kind: agent, recipe: 'cmd:needs', max_visits: 1 }
+  - { node_id: task, kind: agent, recipe: 'cmd:task', max_visits: 1 }
+  - { node_id: ncs-match, kind: agent, recipe: 'cmd:ncs-match', max_visits: 1 }
+  - { node_id: ai-fit, kind: agent, recipe: 'cmd:ai-fit', max_visits: 2 }
+  - { node_id: competency, kind: agent, recipe: 'cmd:competency', max_visits: 2 }
+  - { node_id: roadmap, kind: agent, recipe: 'cmd:roadmap', max_visits: 2 }
+  - { node_id: spec, kind: agent, recipe: 'cmd:spec', max_visits: 2 }
+  - { node_id: routing, kind: agent, recipe: 'cmd:routing', max_visits: 2 }
+  - { node_id: judge, kind: judge, recipe: 'cmd:judge-enterprise', max_visits: 2 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: intake, on: outcome, map: { ok: needs, fail: failed } }
+  - { from: needs, on: outcome, map: { ok: task, fail: failed } }
+  - { from: task, on: outcome, map: { ok: ncs-match, fail: failed } }
+  - { from: ncs-match, on: outcome, map: { ok: ai-fit, fail: failed } }
+  - { from: ai-fit, on: outcome, map: { ok: competency, fail: failed } }
+  - { from: competency, on: outcome, map: { ok: roadmap, fail: failed } }
+  - { from: roadmap, on: outcome, map: { ok: spec, fail: failed } }
+  - { from: spec, on: outcome, map: { ok: routing, fail: failed } }
+  - { from: routing, on: outcome, map: { ok: judge, fail: failed } }
+  - { from: judge, on: outcome, map: { ok: done, retry: ai-fit, fail: failed } }

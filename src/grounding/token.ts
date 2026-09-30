@@ -3,7 +3,7 @@
  *  Pod 는 호스트 우주를 «직접» 읽지 않는다(4우주·최소 자격). 대신 호스트 `POST /v1/grounding/query` 에
  *  «질의 → 인용»만 묻는다. 그 문을 여는 것이 이 토큰이다.
  *  - 모양: `base64url(payload).base64url(HMAC-SHA256)` · payload = `{v:1, runId, job, scope, exp}`.
- *    scope 는 `'grounding'` 또는 `'llm-credential'` — 같은 서명·검증·회수. 문은 scope 를 엄격히 가른다.
+ *    scope 는 `'grounding'` · `'llm-credential'` · `'gh-credential'` — 같은 서명·검증·회수. 문은 scope 를 엄격히 가른다.
  *  - 상태 없는 검증 — 엔드포인트는 `verifyGroundingToken` 하나만 부른다.
  *  - 키: 비밀 백엔드 `grounding/hmac`(없으면 처음 발급 때 무작위 32바이트로 만든다) — 호스트 밖으로 안 나간다.
  *  - 수명: `exp`(Job 기한) ⊕ 조기 회수 `revokeGroundingRun(runId)`(Job 이 끝나면 호스트가 부른다).
@@ -19,13 +19,15 @@ export const GROUNDING_TOKEN_ENV = 'ELANOUS_GROUNDING_TOKEN';
 export const GROUNDING_URL_ENV = 'ELANOUS_GROUNDING_URL';
 export const GROUNDING_HMAC_SECRET_ID = 'grounding/hmac';
 
-export const GROUNDING_TOKEN_SCOPES = ['grounding', 'llm-credential'] as const;
+export const GROUNDING_TOKEN_SCOPES = ['grounding', 'llm-credential', 'gh-credential'] as const;
 export type GroundingTokenScope = (typeof GROUNDING_TOKEN_SCOPES)[number];
 
 export interface GroundingClaims {
   readonly runId: string;
   readonly job: string;
   readonly scope: GroundingTokenScope;
+  /** GitHub credential relay only: full owner/repository bound by the host at issuance. */
+  readonly repository?: string;
   readonly exp: number;
 }
 
@@ -59,19 +61,22 @@ function sign(payload: string, key: string): string {
 }
 
 export async function mintGroundingToken(
-  claims: { runId: string; job: string; ttlMs: number; scope?: GroundingTokenScope },
+  claims: { runId: string; job: string; ttlMs: number; scope?: GroundingTokenScope; repository?: string },
   deps: GroundingTokenDeps = {},
 ): Promise<{ token: string; exp: number }> {
   const key = await (deps.key ?? (() => readKey(true)))();
   if (!key) throw new Error('grounding: 서명 키를 만들 수 없다(비밀 백엔드)');
   const scope: GroundingTokenScope = claims.scope ?? 'grounding';
+  if (claims.repository !== undefined && (scope !== 'gh-credential' || !/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(claims.repository) || claims.repository.split('/').some((part) => part === '.' || part === '..'))) {
+    throw new Error('grounding: invalid credential repository');
+  }
   const exp = (deps.now ?? Date.now)() + claims.ttlMs;
-  const payload = Buffer.from(JSON.stringify({ v: 1, runId: claims.runId, job: claims.job, scope, exp })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ v: 1, runId: claims.runId, job: claims.job, scope, ...(scope === 'gh-credential' ? { repository: claims.repository } : {}), exp })).toString('base64url');
   debug.log('grounding.token', 'minted', { runId: claims.runId, job: claims.job, scope, exp });
   return { token: `${payload}.${sign(payload, key)}`, exp };
 }
 
-/** 그라운딩 문은 scope `'grounding'` 만 받는다. `llm-credential` 은 `expectedScope` 로 따로 연다. */
+/** 그라운딩 문은 scope `'grounding'` 만 받는다. 자격 증명 scope 는 `expectedScope` 로 따로 연다. */
 export async function verifyGroundingToken(
   token: string,
   deps: GroundingTokenDeps & { readonly expectedScope?: GroundingTokenScope } = {},
@@ -92,9 +97,10 @@ export async function verifyGroundingToken(
   if (claims.v !== 1 || typeof claims.runId !== 'string' || typeof claims.job !== 'string' || typeof claims.exp !== 'number') return reject('malformed');
   const expected: GroundingTokenScope = deps.expectedScope ?? 'grounding';
   if (claims.scope !== expected) return reject('scope', claims.runId);
+  if (expected === 'gh-credential' && claims.repository !== undefined && (typeof claims.repository !== 'string' || !/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(claims.repository) || claims.repository.split('/').some((part) => part === '.' || part === '..'))) return reject('malformed', claims.runId);
   if ((deps.now ?? Date.now)() >= claims.exp) return reject('expired', claims.runId);
   if (isRevoked(claims.runId, deps)) return reject('revoked', claims.runId);
-  return { ok: true, runId: claims.runId, job: claims.job, scope: expected, exp: claims.exp };
+  return { ok: true, runId: claims.runId, job: claims.job, scope: expected, ...(expected === 'gh-credential' && claims.repository !== undefined ? { repository: claims.repository } : {}), exp: claims.exp };
 }
 
 /** Job 이 끝나면 호스트가 부른다 — 그 런의 토큰은 기한 전이라도 더는 안 통한다. */

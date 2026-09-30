@@ -16,7 +16,7 @@ export interface SelfSendCandidateDisplay {
   readonly hiddenStaleCount: number;
 }
 
-const SELF_SEND_GOAL_ATTEMPT_SUFFIX = /^(.*)-[0-9a-f]{8}$/;
+const SELF_SEND_GOAL_ATTEMPT_SUFFIX = /^(.*)-[0-9a-f]{8}(?:-r[a-z0-9]{6})?$/;
 
 function selfSendGoalPrefix(spaceId: string): string | undefined {
   return SELF_SEND_GOAL_ATTEMPT_SUFFIX.exec(spaceId)?.[1];
@@ -104,6 +104,7 @@ export interface SelfSendDecisionInput {
 
 export interface SelfSendDecisionDeps {
   resolveRunScreen(runId: string): SelfSendRunScreen;
+  podFragmentsForRun(runId: string): readonly { spaceId: string }[];
   resolveTarget(space: string): SelfSendTargetResolution;
   isPodFragment(spaceId: string): boolean;
   screens(): readonly SelfSendCandidate[];
@@ -122,26 +123,34 @@ export function decideSelfSend(input: SelfSendDecisionInput, deps: SelfSendDecis
   if (space !== undefined && opts.run !== undefined) return refuse('--run 과 space 는 함께 사용할 수 없습니다.\n', 2);
   if (opts.run !== undefined && opts.run.trim() === '') return refuse('--run 에 빈 runId 를 줄 수 없습니다.\n', 2);
   let requestedSpace = space;
+  let podRunSpace: string | undefined;
   if (opts.run !== undefined) {
     const resolved = deps.resolveRunScreen(opts.run);
-    if (resolved.logStoreStatus !== 'read') {
+    if (resolved.logStoreStatus !== 'read' && resolved.screenKey) {
       return refuse(`run 화면 해석 불가: 로그 스토어 ${resolved.logStoreStatus} (${resolved.logStorePath})\n`, 1);
     }
     if (!resolved.screenKey) {
-      const last = resolved.lastEvent;
-      const lastDetail = last
-        ? ` 마지막 이벤트: ${last.category}/${last.event} (${Number.isFinite(Date.parse(last.timestamp)) ? `${Math.max(0, Math.floor((now - Date.parse(last.timestamp)) / 60_000))}분 전` : '시각 알 수 없음'})`
-        : ' 마지막 이벤트: 없음';
-      const status = resolved.missingStatus;
-      const guidance = status === 'awaiting-start'
-        ? '아직 화면을 띄우기 전입니다. 되묻기에 답하거나 저작이 끝날 때까지 기다리세요.'
-        : status === 'pipeline-failed' ? '파이프라인이 오류로 멈췄습니다. 해당 error를 읽어 원인을 수리하세요.'
-          : status === 'cleaned' ? '하니스가 정리되어 화면이 없습니다. 필요하면 새 런을 시작하세요.'
-            : status === 'not-found' ? '이 runId의 이벤트가 없습니다. runId와 인스턴스 우주를 확인하세요.'
-              : '화면을 아직 분류할 수 없습니다. 마지막 이벤트를 조사하세요.';
-      return refuse(`run 화면 해석 불가: ${guidance}${lastDetail} (${opts.run})\n`, 1);
-    }
-    requestedSpace = normalizeSpaceId(resolved.screenKey);
+      const fragments = deps.podFragmentsForRun(opts.run);
+      if (fragments.length === 1) requestedSpace = podRunSpace = fragments[0]!.spaceId;
+      else {
+        if (fragments.length > 1) return refuse(`run 의 Pod 조각이 여러 개입니다: ${opts.run}. space 이름으로 다시 보내세요:\n${fragments.map((fragment) => `  ${fragment.spaceId}`).join('\n')}\n`, 2);
+        if (resolved.logStoreStatus !== 'read') {
+          return refuse(`run 화면 해석 불가: 로그 스토어 ${resolved.logStoreStatus} (${resolved.logStorePath}) · Pod 조각 기록도 0\n`, 1);
+        }
+        const last = resolved.lastEvent;
+        const lastDetail = last
+          ? ` 마지막 이벤트: ${last.category}/${last.event} (${Number.isFinite(Date.parse(last.timestamp)) ? `${Math.max(0, Math.floor((now - Date.parse(last.timestamp)) / 60_000))}분 전` : '시각 알 수 없음'})`
+          : ' 마지막 이벤트: 없음';
+        const status = resolved.missingStatus;
+        const guidance = status === 'awaiting-start'
+          ? '아직 화면을 띄우기 전입니다. 되묻기에 답하거나 저작이 끝날 때까지 기다리세요.'
+          : status === 'pipeline-failed' ? '파이프라인이 오류로 멈췄습니다. 해당 error를 읽어 원인을 수리하세요.'
+            : status === 'cleaned' ? '하니스가 정리되어 화면이 없습니다. 필요하면 새 런을 시작하세요.'
+              : status === 'not-found' ? '이 runId의 이벤트가 없습니다. runId와 인스턴스 우주를 확인하세요.'
+                : '화면을 아직 분류할 수 없습니다. 마지막 이벤트를 조사하세요.';
+        return refuse(`run 화면 해석 불가: ${guidance}${lastDetail} (${opts.run}) · Pod 조각 기록도 0\n`, 1);
+      }
+    } else requestedSpace = normalizeSpaceId(resolved.screenKey);
   }
   const hasMemo = opts.memo !== undefined;
   if (opts.stop && hasMemo) return refuse('self send에서는 --stop 과 --memo를 함께 사용할 수 없습니다.\n', 2);
@@ -158,7 +167,7 @@ export function decideSelfSend(input: SelfSendDecisionInput, deps: SelfSendDecis
     }
     requestedSpace = resolution.spaceId;
   }
-  if (requestedSpace !== undefined && deps.isPodFragment(requestedSpace)) {
+  if (requestedSpace !== undefined && (podRunSpace !== undefined || deps.isPodFragment(requestedSpace))) {
     return { kind: 'send', spaceId: requestedSpace, channel: 'pod', warnings: [] };
   }
   const screens = deps.screens();

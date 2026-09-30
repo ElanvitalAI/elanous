@@ -25,6 +25,7 @@ import {
   AcpTransportError,
   type AcpTransportConnection,
 } from '../acp/transport/index.js';
+import { debug } from '../debug/log.js';
 
 export interface ConnectWebSocketClientOpts {
   /** Full WebSocket URL — e.g. `ws://mbp.tailnet:31415/v1/acp`. */
@@ -42,10 +43,14 @@ export interface ConnectWebSocketClientOpts {
    *  ⛔ 없으면 서버가 핸드셰이크에 답하지 않을 때 이 Promise 가 «영원히» 안 풀린다 —
    *     그러면 호출자는 산출도 종료 코드도 못 얻는다(2026-08-31 실측: 100초 상한을 걸 때까지 매달렸다). */
   connectTimeoutMs?: number;
+  onDisconnect?(info: { reason: 'close' | 'error'; code?: number; afterMs: number; at: string; lastEventId?: string }): void;
 }
 
 /** ⏱️ 기본 연결 상한. 테일넷 왕복은 보통 수백 ms 라 넉넉하다. */
 export const DEFAULT_WS_CONNECT_TIMEOUT_MS = 10_000;
+
+/** Maximum NDJSON line inspected for an event id; ACP stream delivery is not limited. */
+const MAX_EVENT_ID_LINE_LENGTH = 64 * 1024;
 
 /** Connect to a Elanous daemon over its public WebSocket endpoint.
  *  Resolves with the bidirectional stream pair once the (optional)
@@ -72,6 +77,65 @@ export async function connectWebSocketClient(
     ws.binaryType = 'arraybuffer';
 
     let settled = false;
+    let connectedAt: number | null = null;
+    let disconnected = false;
+    let lastEventId: string | undefined;
+    let incomingLine = '';
+    let oversizedLine = false;
+    const lineDecoder = new TextDecoder();
+    const recordEventId = (line: string): void => {
+      try {
+        const message: unknown = JSON.parse(line);
+        if (message !== null && typeof message === 'object' && 'id' in message
+          && typeof message.id === 'string') lastEventId = message.id;
+      } catch { /* Non-JSON or incomplete ACP payload. */ }
+    };
+    const trackEventIds = (text: string): void => {
+      let start = 0;
+      while (start < text.length) {
+        const newline = text.indexOf('\n', start);
+        const end = newline < 0 ? text.length : newline;
+        const length = end - start;
+        if (!oversizedLine) {
+          if (incomingLine.length + length <= MAX_EVENT_ID_LINE_LENGTH) {
+            incomingLine += text.slice(start, end);
+          } else {
+            incomingLine = '';
+            oversizedLine = true;
+          }
+        }
+        if (newline < 0) break;
+        if (!oversizedLine) recordEventId(incomingLine);
+        incomingLine = '';
+        oversizedLine = false;
+        start = newline + 1;
+      }
+    };
+    const recordConnected = (): void => {
+      connectedAt = Date.now();
+      try {
+        const host = new URL(opts.url).hostname;
+        debug.log('tui-client.ws', 'connected', {
+          hostKind: host === 'localhost' || host === '127.0.0.1' || host === '::1' ? 'local' : 'remote',
+        });
+      } catch { /* observation must not prevent connection */ }
+    };
+    const disconnect = (reason: 'close' | 'error', code?: number): void => {
+      finishReadable();
+      if (connectedAt === null || disconnected) return;
+      disconnected = true;
+      trackEventIds(lineDecoder.decode());
+      if (incomingLine && !oversizedLine) recordEventId(incomingLine);
+      const info = {
+        reason,
+        ...(code !== undefined ? { code } : {}),
+        afterMs: Math.max(0, Date.now() - connectedAt),
+        at: new Date().toISOString(),
+        ...(lastEventId !== undefined ? { lastEventId } : {}),
+      };
+      try { debug.log('tui-client.ws', 'disconnect', info); } catch { /* observation must not prevent notification */ }
+      opts.onDisconnect?.(info);
+    };
     let authed = !opts.token; // noAuth mode = no handshake needed
     // ⛔ 「안 됐다」를 한 값으로 접지 않는다 — «어느 단계»에서 멎었는지 이름을 붙인다.
     //    소켓조차 안 열린 것과, 열렸는데 서버가 인증에 «답을 안 한» 것은 다른 결함이다.
@@ -152,6 +216,7 @@ export async function connectWebSocketClient(
         settled = true;
         clearConnectTimer();
         opts.signal?.removeEventListener('abort', onAbort);
+        recordConnected();
         resolve(buildConnection());
         return;
       }
@@ -183,6 +248,7 @@ export async function connectWebSocketClient(
             settled = true;
             clearConnectTimer();
             opts.signal?.removeEventListener('abort', onAbort);
+            recordConnected();
             resolve(buildConnection());
           }
         } else {
@@ -191,10 +257,11 @@ export async function connectWebSocketClient(
         return;
       }
       // Authed: forward bytes to the consumer's ReadableStream.
-      if (!readableController) return;
       const bytes = typeof ev.data === 'string'
         ? new TextEncoder().encode(ev.data)
         : new Uint8Array(ev.data as ArrayBuffer);
+      trackEventIds(lineDecoder.decode(bytes, { stream: true }));
+      if (!readableController) return;
       try { readableController.enqueue(bytes); }
       catch { /* stream already closed */ }
     });
@@ -221,7 +288,7 @@ export async function connectWebSocketClient(
     ws.addEventListener('error', () => {
       // Bun/browser WebSocket fires error then close; only treat the
       // pre-settled error as a connect failure. Post-settled errors
-      // close the readable stream — the consumer surfaces it.
+      // close the readable stream and notify the dashboard once.
       if (!settled) {
         // ⛔ 「연결 오류」 한 값으로 접지 않는다 — open «전»이면 소켓이 안 열린 것이고,
         //    open «뒤»면 서버가 붙여 놓고 인증에 답하지 않은 것이다. 다른 결함이다.
@@ -229,17 +296,17 @@ export async function connectWebSocketClient(
           ? `socket never opened: connection error (${opts.url})`
           : `server accepted the socket but never answered the auth handshake: connection error (${opts.url})`);
       } else {
-        finishReadable();
+        disconnect('error');
       }
     });
 
-    ws.addEventListener('close', () => {
+    ws.addEventListener('close', (ev: CloseEvent) => {
       if (!settled) {
         failConnect(stage === 'opening'
           ? `socket never opened: closed before ready (${opts.url})`
           : `server accepted the socket but never answered the auth handshake: closed before ready (${opts.url})`);
       } else {
-        finishReadable();
+        disconnect('close', ev.code);
       }
     });
   });

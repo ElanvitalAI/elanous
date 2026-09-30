@@ -36,8 +36,20 @@ function escapeRe(s: string): string {
 export function makePublicMasker(names: readonly string[]): (text: string, accountScope: boolean) => string {
   const alias = new Map(names.map((n, i) => [n, `account-${i + 1}`]));
   const accountRe = names.length ? new RegExp(`(^|[^\\w-])(${names.map(escapeRe).sort((a, b) => b.length - a.length).join('|')})(?![\\w-])`, 'g') : null;
+  // 호스트 이름(Pod 풀 기계 `node-b` · tailnet 주소 `*.ts.net`)도 공개 사진에 싣지 않는다 — 처음 본 순서로 `remote-N`.
+  const hosts = new Map<string, string>();
+  const hostAlias = (name: string) => {
+    const key = name.toLowerCase();
+    if (!hosts.has(key)) hosts.set(key, `remote-${hosts.size + 1}`);
+    const alias = hosts.get(key)!;
+    return name === name.toUpperCase() ? alias.toUpperCase() : alias;
+  };
   return (text, accountScope) => {
     let out = text
+      .replace(/\b[a-z0-9-]+\.tail[0-9a-f]+\.ts\.net\b/gi, 'tailnet-host')
+      .replace(/\bmsb\d+\b/gi, (m) => hostAlias(m))
+      // 이 기계(맥북) 약칭 — 카드·이슈 제목에 «mbp» 로 적힌다.
+      .replace(/\bmbp\b/gi, (m) => (m === m.toUpperCase() ? 'LOCAL' : 'local'))
       .replace(/\/Users\/[^/\s"']+/g, '~')
       .replace(/(크레딧|credits?|💳)(\s*[:=]?\s*)[\d][\d,.]*/gi, '$1$2•••')
       .replace(/[\d][\d,.]*(\s*)(크레딧|credits?)/gi, '•••$1$2')

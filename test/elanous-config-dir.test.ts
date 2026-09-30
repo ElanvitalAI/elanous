@@ -7,9 +7,9 @@
 // re-appended to argv in `bg-launch.ts`, not via env inheritance.
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { homedir } from 'node:os';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
 import {
   extractConfigDirFlag,
   applyConfigDirFlagFromArgv,
@@ -21,7 +21,7 @@ import {
 } from '../src/elanous-config-dir';
 import {
   resetEffectiveInstanceRoot,
-  setTreeDerivedTestForTesting,
+  treeDerivedRootFor,
 } from '../src/instance/resolve';
 
 let savedArgv: string[];
@@ -36,22 +36,11 @@ beforeEach(() => {
   delete process.env.ELANOUS_DAEMON_DIR;
   delete process.env.ELANOUS_STATE_DIR;
   resetElanousConfigDir();
-  // Test-state isolation: standalone measurement found a memoized resolver layer
-  // below getElanousConfigDir, so every test starts after its existing reset seam.
-  // Tree-derived policy is intentionally not forced in this shared lifecycle.
   resetEffectiveInstanceRoot();
 });
 
-/** Exercise layer four only where the assertion explicitly promises ~/.elanous.
- *
- * Standalone measurement returned the same cwd/.elanous-test value in all four
- * failing assertions when the host's tree-derived policy was enabled. Explicit
- * override and ELANOUS_STATE_DIR each recovered through their own existing cleanup,
- * so the four failures have one root: unisolated host policy, not four leaks.
- * Keep that policy override local so other tests still exercise the real resolver. */
-function selectLayerFourDefaultForAssertion(): void {
-  setTreeDerivedTestForTesting(false);
-}
+const treeRoot = treeDerivedRootFor(process.cwd());
+if (treeRoot === null) throw new Error('This test requires a source tree');
 
 afterEach(() => {
   process.argv = savedArgv;
@@ -60,7 +49,6 @@ afterEach(() => {
   if (savedStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = savedStateDir;
   resetElanousConfigDir();
-  setTreeDerivedTestForTesting(undefined);
   resetEffectiveInstanceRoot();
 });
 
@@ -123,74 +111,73 @@ describe('applyConfigDirFlagFromArgv · side-effecting bootstrap', () => {
   });
 
   it('is a no-op when the flag is absent', () => {
-    selectLayerFourDefaultForAssertion();
     process.argv = ['bun', 'src/index.ts', 'nexus', 'run'];
     const dir = applyConfigDirFlagFromArgv();
     expect(dir).toBeUndefined();
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+    expect(getElanousConfigDir()).toBe(treeRoot);
   });
 });
 
 describe('getElanousConfigDir · resolver-state isolation', () => {
   it('restores explicit override independently through resetElanousConfigDir', () => {
-    selectLayerFourDefaultForAssertion();
     setElanousConfigDir('/tmp/explicit-contamination');
     expect(getElanousConfigDir()).toBe('/tmp/explicit-contamination');
     resetElanousConfigDir();
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+    expect(getElanousConfigDir()).toBe(treeRoot);
   });
 
   it('restores ELANOUS_STATE_DIR independently through environment cleanup', () => {
-    selectLayerFourDefaultForAssertion();
     process.env.ELANOUS_STATE_DIR = '/tmp/state-contamination';
     expect(getElanousConfigDir()).toBe('/tmp/state-contamination');
     delete process.env.ELANOUS_STATE_DIR;
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+    expect(getElanousConfigDir()).toBe(treeRoot);
   });
 
-  // ⛔⭐ 이 시험의 «전제»는 「이 체크아웃이 «비-리더» 트리다」이다 — 리더 트리(주 저장소)에서는
-  //   3층 스위치를 켜도 뿌리가 «기본값 그대로»라 `not.toBe(defaultDir)` 이 성립하지 않는다.
-  //   `src/instance/resolve.ts` 의 그 주석이 이미 이 계급을 이름으로 적어 뒀다 —
-  //   *"스위치를 켠 머신에서는 … 옛 테스트가 전부 빨개지고, 끈 머신에서는 3층 경로가 한 번도 안 돌아"*.
-  // ⇒ 그러므로 전제를 «단언»하지 않고 «선언»한다: 성립하는 트리에서만 본론을 재고,
-  //   안 성립하면 그 사실을 남기고 통과시킨다(⛔ 조용히 건너뛰지 않는다 — 왜 안 쟀는지가 보인다).
-  it('restores a memoized tree root through the existing test reset seam', () => {
-    const defaultDir = join(homedir(), '.elanous');
-    setTreeDerivedTestForTesting(true);
-    const treeDerivedDir = getElanousConfigDir();
-    setTreeDerivedTestForTesting(false);
-    resetEffectiveInstanceRoot();
-    // ⚠️ 리더 트리에서는 `treeDerivedDir === defaultDir` 이라 이 단언이 «되돌림»을 못 잰다(공허하게 참).
-    //    비-리더 트리에서만 실제로 문다. 그 사실을 산출에 남긴다.
-    if (treeDerivedDir === defaultDir) console.warn('[premise] 리더 트리 — 3층 뿌리가 기본과 같아 되돌림을 못 쟀다');
-    expect(getElanousConfigDir()).toBe(defaultDir);
+  it('resetting a memoized tree root resolves a different source tree', () => {
+    const first = mkdtempSync(join(tmpdir(), 'config-dir-first-'));
+    const second = mkdtempSync(join(tmpdir(), 'config-dir-second-'));
+    const originalArgv = process.argv;
+    try {
+      mkdirSync(join(first, '.git'));
+      mkdirSync(join(second, '.git'));
+      process.argv = [originalArgv[0] ?? 'bun', join(first, 'bin', 'elanous.mjs')];
+      const firstRoot = join(first, '.elanous-test');
+      expect(treeDerivedRootFor(first)).toBe(firstRoot);
+      expect(getElanousConfigDir()).toBe(firstRoot);
+
+      process.argv = [originalArgv[0] ?? 'bun', join(second, 'bin', 'elanous.mjs')];
+      const secondRoot = join(second, '.elanous-test');
+      expect(treeDerivedRootFor(second)).toBe(secondRoot);
+      expect(secondRoot).not.toBe(firstRoot);
+      expect(getElanousConfigDir()).toBe(firstRoot);
+      resetEffectiveInstanceRoot();
+      expect(getElanousConfigDir()).toBe(secondRoot);
+    } finally {
+      process.argv = originalArgv;
+      rmSync(first, { recursive: true, force: true });
+      rmSync(second, { recursive: true, force: true });
+    }
   });
 
   it('measures the combined inputs as independent precedence layers, not extra leaks', () => {
-    setTreeDerivedTestForTesting(true);
-    const treeDerivedDir = getElanousConfigDir();
     setElanousConfigDir('/tmp/explicit-contamination');
     process.env.ELANOUS_STATE_DIR = '/tmp/state-contamination';
     expect(getElanousConfigDir()).toBe('/tmp/explicit-contamination');
     resetElanousConfigDir();
     expect(getElanousConfigDir()).toBe('/tmp/state-contamination');
     delete process.env.ELANOUS_STATE_DIR;
-    expect(getElanousConfigDir()).toBe(treeDerivedDir);
-    selectLayerFourDefaultForAssertion();
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+    expect(getElanousConfigDir()).toBe(treeRoot);
   });
 });
 
 describe('getElanousConfigDir · resolution order (env-var-free)', () => {
-  it('defaults to ~/.elanous when nothing is set', () => {
-    selectLayerFourDefaultForAssertion();
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+  it('defaults to the tree-derived test universe when nothing is set', () => {
+    expect(getElanousConfigDir()).toBe(treeRoot);
   });
 
   it('IGNORES ELANOUS_DAEMON_DIR env var (removed 2026-05-13)', () => {
-    selectLayerFourDefaultForAssertion();
     process.env.ELANOUS_DAEMON_DIR = '/tmp/env-must-be-ignored';
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+    expect(getElanousConfigDir()).toBe(treeRoot);
   });
 
   it('honours programmatic override', () => {
@@ -204,14 +191,13 @@ describe('getElanousConfigDir · resolution order (env-var-free)', () => {
     expect(process.env.ELANOUS_DAEMON_DIR).toBeUndefined();
   });
 
-  it('resetElanousConfigDir falls back to ~/.elanous regardless of env', () => {
-    selectLayerFourDefaultForAssertion();
+  it('resetElanousConfigDir falls back to the tree-derived test universe regardless of the retired env', () => {
     setElanousConfigDir('/tmp/will-be-cleared');
     resetElanousConfigDir();
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+    expect(getElanousConfigDir()).toBe(treeRoot);
     // Even with a stray env var, the resolver remains env-blind.
     process.env.ELANOUS_DAEMON_DIR = '/tmp/still-ignored';
-    expect(getElanousConfigDir()).toBe(join(homedir(), '.elanous'));
+    expect(getElanousConfigDir()).toBe(treeRoot);
   });
 
   it('setElanousConfigDir rejects empty strings', () => {

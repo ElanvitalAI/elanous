@@ -2,6 +2,18 @@
 
 **S** 인터뷰에서 직무 후보를 추출해 공공데이터포털의 NCS 능력단위와 비교하고, 외부 코스 조사로 보고서를 작성한다. **C** 실제 NCS 키와 코스 출처가 없으면 매칭·추천을 지어낼 수 없다. **Q** 이 패키지를 받은 사용자가 어떻게 실행하고 결과를 확인하는가? **A** 아래 실행 방법과 검증 방법을 따른다.
 
+## 개인 모드 · 기업 HRD 모드
+
+개인 모드(`report.yaml`)는 `## 희망 직무`, `## 경험`, `## 보유 역량` 인터뷰를 읽고 직무 후보 → NCS 매칭 → 검증된 과정 조사 → 자기보고 역량 갭 → 개인 보고서로 진행한다. NCS 키가 없으면 실패하며 확인된 과정 URL이 없으면 추천을 `미확인`으로 표시한다. 개인 보고서의 다섯 섹션과 기존 `research` 재시도 계약은 유지한다.
+
+기업 HRD 모드(`report-enterprise.yaml`)는 `## 기업 개요`, `## 교육 대상`, `## 현업 과제`, `## 교육 목표`, `## 현재 역량`, `## 교육 제약`의 인터뷰를 받는다. 가상 회사·가상 직원으로 입력을 시험하고 실제 직원 정보나 내부 정책을 예시 파일에 싣지 않는다. 같은 NCS 조회를 재사용해 니즈 → 현업 과제 → NCS → AI 적합성(비AI 대안 포함) → 역량 → 로드맵 → 교육 명세와 운영 경로를 만든 뒤 일곱 섹션을 판정한다. 섹션 또는 근거가 누락되면 보고 단계로 한 번 되돌리고 다시 판정한다. 인터뷰 진술은 자기보고이고, NCS 코드·과정/URL·사내 정책 및 AI 도입 승인은 조회·확인 전에는 `미확인`이다.
+
+```sh
+elanous graph run /absolute/path/to/installed/job-coach/graphs/report-enterprise.yaml --input '{"interview":"/private/path/to/fictional-enterprise.md"}' --json
+```
+
+기업 보고서는 `기업 개요 및 교육 대상`, `교육 니즈`, `직무·과제 및 NCS`, `AI 적합성`, `역량 진단`, `교육 로드맵`, `교육 명세·운영 경로` 순서다. NCS 조회에 실패하면 매칭을 발명하지 않고 런을 실패로 종료한다. `run-report` 스킬은 개인 보고서 진입이며 기업 모드는 다섯 개 기업 스킬(`enterprise-needs`, `enterprise-task-analysis`, `enterprise-ai-fit`, `enterprise-competency`, `enterprise-roadmap`)과 기업 그래프를 이용한다.
+
 ## 실행
 
 공공데이터포털 [한국산업인력공단 NCS 기준정보 조회](https://www.data.go.kr/data/15128213/openapi.do) 활용신청 후 키를 **환경변수 `NCS_SERVICE_KEY`** 로 설정한다. 설치 시 `credentials` 이벤트의 `ncs.serviceKey` 에 입력하는 경로는 플러그인 설치기가 담당한다. 저장소에는 키를 넣지 않는다. `.mcp.json`은 MCP stdio 서버를 번들로 제공한다. 레시피는 러너가 제공하는 `ELANOUS_GRAPH_DIR`을 기준으로 번들 스크립트를 찾고, MCP의 `${CODEX_PLUGIN_ROOT}`는 Codex가 설치한 플러그인의 절대 경로로 치환한다. 런타임에는 `bun`과 PATH의 `elanous research --json`가 필요하다. 중첩 elanous 호출에는 `--test`를 붙여 격리한다. 인터뷰 파일은 `## 희망 직무`, `## 경험`, `## 보유 역량`을 포함해야 한다.

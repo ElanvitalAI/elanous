@@ -41,23 +41,42 @@ grep -q '{{TS}}' "$BODY" || echo "⚠️ 본문에 {{TS}} 자리표시가 «없�
 
 # 트랙 신원은 «정본 한 곳»에서 읽는다 — scripts/coord-tracks.json. 못 읽으면 추측하지 않고 선다.
 TRACKS_FILE="$(dirname "$0")/coord-tracks.json"
-TRACKS=$(grep -o '"id": *"[A-Z]"' "$TRACKS_FILE" 2>/dev/null | grep -o '[A-Z]"$' | tr -d '"\n')
-[ -n "$TRACKS" ] || { echo "⛔ 트랙 정본을 읽지 못했다: $TRACKS_FILE — 발신하지 않는다" >&2; exit 4; }
+# 신원 = 2글자 id(OP·MK·TC·UX…) ⊕ 옛 한 글자 alias(S·T·O·F — 전환기엔 받되 경고). 목록은 정본에서만.
+IDS=$(grep -o '"id": *"[A-Z][A-Z]*"' "$TRACKS_FILE" 2>/dev/null | sed 's/.*"\([A-Z]*\)"$/\1/' | tr '\n' ' ')
+ALIASES=$(grep -o '"alias": *"[A-Z][A-Z]*"' "$TRACKS_FILE" 2>/dev/null | sed 's/.*"\([A-Z]*\)"$/\1/' | tr '\n' ' ')
+[ -n "$IDS" ] || { echo "⛔ 트랙 정본을 읽지 못했다: $TRACKS_FILE — 발신하지 않는다" >&2; exit 4; }
 ID="${COORD_ID:-S}"
-if [ "${#ID}" -ne 1 ] || [ "${TRACKS#*"$ID"}" = "$TRACKS" ]; then
-  echo "⛔ COORD_ID 는 트랙 정본($TRACKS_FILE)의 신원 [$TRACKS] 중 하나여야 한다(받은 값: $ID)" >&2; exit 4
-fi
+case " $IDS " in
+  *" $ID "*) ;;
+  *) case " $ALIASES " in
+       *" $ID "*) NEW=$(grep -o "\"id\": *\"[A-Z]*\", *\"title\": *\"[A-Z]*\", *\"alias\": *\"$ID\"" "$TRACKS_FILE" | sed 's/^"id": *"\([A-Z]*\)".*/\1/')
+                  echo "⚠️ 옛 한 글자 신원 [$ID] — 새 신원은 [${NEW:-?}] 다(전환기라 받는다)" >&2 ;;
+       *) echo "⛔ COORD_ID 는 트랙 정본($TRACKS_FILE)의 신원 [$IDS] (옛 [$ALIASES]) 중 하나여야 한다(받은 값: $ID)" >&2; exit 4 ;;
+     esac ;;
+esac
 FIRST=$(head -1 "$BODY")
+OTHER=""
+for T in $IDS $ALIASES; do
+  [ "$T" = "$ID" ] && continue
+  case "$FIRST" in "**[$T]**"*) OTHER="$T" ;; esac
+done
 case "$FIRST" in
   "**[$ID]**"*) ;;
-  \*\*\[[$TRACKS]\]\*\**)
-    echo "⛔ 신원 접두가 «내 것이 아니다» — 첫 줄이 ${FIRST%%\*\* *}** 로 시작한다(내 신원 = [$ID])." >&2
-    echo "   ⛔ 감시자는 startswith 로 고른다 ⇒ 상대는 이 글을 «자기 글»로 보고 건너뛴다. 발신하지 않는다." >&2
-    echo "   ✅ 수신자는 본문에 적어라: **[$ID]** … [T] 님께 …" >&2
-    exit 5 ;;
   *)
+    if [ -n "$OTHER" ]; then
+      echo "⛔ 신원 접두가 «내 것이 아니다» — 첫 줄이 **[$OTHER]** 로 시작한다(내 신원 = [$ID])." >&2
+      echo "   ⛔ 감시자는 startswith 로 고른다 ⇒ 상대는 이 글을 «자기 글»로 보고 건너뛴다. 발신하지 않는다." >&2
+      echo "   ✅ 수신자는 본문에 적어라: **[$ID]** … MK 님께 …" >&2
+      exit 5
+    fi
     echo "⛔ 첫 줄이 «**[$ID]**» 신원 접두로 시작하지 않는다 — 상대 감시자가 이 글을 못 고른다. 발신하지 않는다." >&2
     exit 5 ;;
+esac
+
+# 봉투 v2(RFC-coordination-cost §2 · C1 · 09-30): 첫 줄에 종류 다섯 중 하나 — 막지 않고 «알린다».
+case "$FIRST" in
+  *요청*|*결정*|*사고*|*보고*|*정정*) ;;
+  *) echo "⚠️ 첫 줄에 글 종류(요청·결정·사고·보고·정정)가 없다 — 받는 쪽 감시자가 즉시/모아 읽기를 못 가른다(발신은 한다)" >&2 ;;
 esac
 
 TS=$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M KST')
@@ -125,8 +144,26 @@ fi
 POST_OUTPUT=$(bun bin/elanous.mjs gh pr comment "$PR" --body-file "$TMP" 2>&1)
 RC=$?
 printf '%s\n' "$POST_OUTPUT" | tail -2
+VIA=""
+# `gh pr comment` goes through GraphQL; its secondary rate limit can block while REST still answers (GIT-S83).
+# 09-30: 채널 코멘트 1,500 뒤 GraphQL 이 «Something went wrong» 으로 연속 실패하고 REST 는 201 — 이 내부 오류도 REST 로 물러선다.
+#   ⛔ 다른 실패(PR 못 찾음 등)는 물러서지 않는다. 물러서기 전에 같은 첫 줄이 이미 올라갔는지 본다(부분 성공 → 이중 발신 방지).
+if [ "$RC" -ne 0 ] && printf '%s' "$POST_OUTPUT" | grep -qiE 'rate limit|Something went wrong'; then
+  echo "⚠️ GraphQL 실패(한도·내부 오류) — REST 로 한 번 물러선다(GIT-S83)" >&2
+  FIRSTOUT=$(head -1 "$TMP")
+  # issues 코멘트 목록은 오래된 순이고 정렬 인자를 안 받는다 ⇒ 최근 10분만 since 로 자른다.
+  SINCE10=$(date -u -v-10M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '-10 min' +%Y-%m-%dT%H:%M:%SZ)
+  if bun bin/elanous.mjs gh api "repos/{owner}/{repo}/issues/$PR/comments?since=$SINCE10&per_page=100" --jq '.[].body | split("\n")[0]' 2>/dev/null | grep -qxF -- "$FIRSTOUT"; then
+    echo "[coord-post] 같은 첫 줄이 이미 채널에 있다 — GraphQL 이 실제로는 올렸다(이중 발신 안 함)" >&2
+    exit 0
+  fi
+  POST_OUTPUT=$(bun bin/elanous.mjs gh api -X POST "repos/{owner}/{repo}/issues/$PR/comments" -F "body=@$TMP" -q .html_url 2>&1)
+  RC=$?
+  printf '%s\n' "$POST_OUTPUT" | tail -2
+  VIA=" · REST 폴백"
+fi
 if [ "$RC" -ne 0 ]; then
-  echo "⛔ 발신 실패 rc=$RC — «보냈다고 읽지 마라»" >&2
+  echo "⛔ 발신 실패 rc=$RC$VIA — «보냈다고 읽지 마라»" >&2
   exit "$RC"
 fi
-echo "[coord-post] 발신 성공 · 채널 #$PR · 신원 [$ID] · 시각 $TS" >&2
+echo "[coord-post] 발신 성공$VIA · 채널 #$PR · 신원 [$ID] · 시각 $TS" >&2

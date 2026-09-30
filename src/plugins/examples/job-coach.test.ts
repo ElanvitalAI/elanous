@@ -6,28 +6,37 @@ import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { handleRequest, tools } from '../../../plugins/job-coach/connectors/ncs/server.js';
 import { courseLinks } from '../../../plugins/job-coach/graphs/course-links.js';
+import { judgeGaps } from '../../../plugins/job-coach/graphs/gap-judge.js';
 import { runGraph } from '../../graph-runner/runner.js';
 
 const root = resolve(import.meta.dir, '../../../plugins/job-coach');
 const manifest = JSON.parse(readFileSync(join(root, 'plugin.json'), 'utf8'));
 const codex = JSON.parse(readFileSync(join(root, '.codex-plugin/plugin.json'), 'utf8'));
 
-test('portable and codex manifests share identity, relative paths and three skills', () => {
+test('portable and codex manifests register both modes and all eight skills', () => {
   expect([manifest.name, manifest.version]).toEqual([codex.name, codex.version]);
   expect(manifest.name).toBe('job-coach');
   const ext = manifest.extensions['ai.elanous'];
-  expect(ext.graphs).toEqual(['./graphs/report.yaml']);
-  expect(ext.capabilities).toEqual(['network:fetch']);
-  expect(ext.connectors).toEqual([{ id: 'ncs', fields: [{ name: 'serviceKey', secret: true }] }]);
+  const graphs = ['./graphs/report.yaml', './graphs/report-enterprise.yaml'];
+  const skills = ['interview-to-profile', 'career-report', 'run-report', 'enterprise-needs',
+    'enterprise-task-analysis', 'enterprise-ai-fit', 'enterprise-competency', 'enterprise-roadmap'];
+  expect(ext.graphs).toEqual(graphs);
+  expect(codex.extensions['ai.elanous'].graphs).toEqual(graphs);
+  // Public capability form (`build-a-plugin.md`): shown to the user before install.
+  expect(ext.capabilities).toEqual(['fs:workdir', 'net:apis.data.go.kr', 'proc:bun', 'proc:elanous', 'secret:ncs']);
+  // `env` routes the stored key to the name the NCS server reads (`connectors/ncs/server.ts`).
+  expect(ext.connectors).toEqual([{ id: 'ncs', fields: [{ name: 'serviceKey', secret: true, env: 'NCS_SERVICE_KEY' }] }]);
+  expect(manifest.skills).toBe('./skills/');
   expect(codex.skills).toBe('./skills/');
-  for (const ref of [...ext.graphs, codex.skills]) {
+  expect(manifest.contributes.skills.map((skill: { name: string }) => skill.name)).toEqual(skills);
+  expect(codex.contributes.skills.map((skill: { name: string }) => skill.name)).toEqual(skills);
+  for (const ref of [...graphs, manifest.skills, codex.skills, ...skills.map(name => `./skills/${name}/SKILL.md`)]) {
     expect(ref.startsWith('./')).toBe(true);
     expect(existsSync(resolve(root, ref))).toBe(true);
   }
   const mcp = JSON.parse(readFileSync(join(root, '.mcp.json'), 'utf8'));
   expect(mcp.mcpServers.ncs.args).toEqual(['${CODEX_PLUGIN_ROOT}/connectors/ncs/server.ts']);
   expect(existsSync(join(root, 'connectors/ncs/server.ts'))).toBe(true);
-  for (const name of ['interview-to-profile', 'career-report', 'run-report']) expect(existsSync(join(root, 'skills', name, 'SKILL.md'))).toBe(true);
 });
 
 test('graph CLI dry-run walks the declared success path without calling HTTP or commands', () => {
@@ -59,7 +68,7 @@ test('NCS MCP lists three tools and maps each to a real operation with fake HTTP
   expect(listing.result).toEqual({ tools });
   for (const [name, args, operation] of [
     ['ncs_search_units', { keyword: '데이터 분석' }, 'NCS007'],
-    ['ncs_unit', { code: '01020304' }, 'NCS005'],
+    ['ncs_unit', { code: '010203040001' }, 'NCS005'],
     ['ncs_classification', { level: 'detailed', code: '010203' }, 'NCS004'],
   ] as const) {
     const reply = await handleRequest({ id: 2, method: 'tools/call', params: { name, arguments: args } }, { key: 'fake', fetch: fake });
@@ -69,6 +78,8 @@ test('NCS MCP lists three tools and maps each to a real operation with fake HTTP
   }
   expect(calls[0]!.searchParams.get('SWRD')).toBe('데이터 분석');
   expect(calls[1]!.searchParams.get('NCS_SUBD_CD')).toBe('04');
+  expect(calls[1]!.searchParams.get('NCS_CL_CD')).toBe('01020304');
+  expect(calls[1]!.searchParams.get('NCS_COMPE_UNIT_CD')).toBe('010203040001');
   expect(calls[2]!.searchParams.get('NCS_SCLAS_CD')).toBe('03');
 });
 
@@ -118,32 +129,31 @@ test('profile reads LF and CRLF interviews identically', () => {
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
 
-test('gap marks only explicitly self-reported NCS units as possessed', () => {
-  const temp = mkdtempSync(join(tmpdir(), 'job-coach-gap-'));
-  try {
-    const context = join(temp, 'run.json.contexts', '1.json');
-    mkdirSync(join(temp, 'run.json.contexts'));
-    const classify = (skills: string[]) => {
-      writeFileSync(context, JSON.stringify({ input: {}, outputs: {
-        profile: { skills }, 'ncs-match': { units: [
-          { code: '01', name: '데이터 분석' }, { code: '02', name: '데이터' },
-        ] },
-      } }));
-      const result = spawnSync(Bun.which('bun')!, [join(root, 'graphs/run-step.ts'), 'gap'], {
-        encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context },
-      });
-      expect(result.status, result.stderr).toBe(0);
-      return JSON.parse(result.stdout).gaps as Array<{ code: string; name: string; status: string }>;
-    };
-    expect(classify(['데이터'])).toEqual([
-      { code: '01', name: '데이터 분석', status: '갭(증거 미확인)' },
-      { code: '02', name: '데이터', status: '보유(인터뷰 자기보고)' },
-    ]);
-    expect(classify(['데이터 분석'])).toEqual([
-      { code: '01', name: '데이터 분석', status: '보유(인터뷰 자기보고)' },
-      { code: '02', name: '데이터', status: '갭(증거 미확인)' },
-    ]);
-  } finally { rmSync(temp, { recursive: true, force: true }); }
+test('gap calls the judge once and downgrades quotes absent from the original interview', async () => {
+  const units = [
+    { code: '01', name: '데이터 분석', definition: '분석', level: '4', elements: [{ name: '자료 정리', criteria: '자료를 표로 정리한다' }] },
+    { code: '02', name: '시각화', definition: '차트', level: '3', elements: [{ name: '차트 제작', criteria: '차트를 만든다' }] },
+    { code: '03', name: '모델링', definition: '모델', level: '5', elements: [] },
+  ];
+  const interview = '가상 자료를 표로 정리했다. 차트를 일부 만들었다.';
+  let calls = 0;
+  const gaps = await judgeGaps(units, interview, async prompt => {
+    calls++;
+    expect(prompt).toContain('자료를 표로 정리한다');
+    expect(prompt).toContain('"level":"4"');
+    return JSON.stringify({ gaps: [
+      { code: '01', status: '보유', quote: '가상 자료를 표로 정리했다.' },
+      { code: '02', status: '부분', quote: '차트를 일부 만들었다.' },
+      { code: '03', status: '보유', quote: '인터뷰에 없는 문장이다.' },
+    ] });
+  });
+  expect(calls).toBe(1);
+  expect(gaps).toEqual([
+    { code: '01', name: '데이터 분석', status: '보유', quote: '가상 자료를 표로 정리했다.' },
+    { code: '02', name: '시각화', status: '부분', quote: '차트를 일부 만들었다.' },
+    { code: '03', name: '모델링', status: '갭', quote: '' },
+  ]);
+  expect((await judgeGaps(units, interview, async () => 'not json')).every(gap => gap.status === '갭')).toBe(true);
 });
 
 test('research leads require a publisher-declared course relevant to an NCS unit', async () => {
@@ -171,13 +181,21 @@ async function installedReport(retry: boolean, unrelated = false) {
     mkdirSync(elsewhere);
     mkdirSync(bin);
     const preload = join(temp, 'fake-fetch.ts');
-    writeFileSync(preload, `globalThis.fetch = (async (url) => String(url).includes('example.org/course') ? new Response('<script type="application/ld+json">{"@type":"Course","name":"데이터 시각화 실습","description":"데이터 시각화 능력단위 강좌"}</script>', {headers:{'content-type':'text/html'}}) : new Response(JSON.stringify({response:{header:{resultCode:'00'},body:{items:{item:[{NCS_CL_CD:'01020304',COMPE_UNIT_NAME:'데이터 시각화'}]}}}}))) as typeof fetch;\n`);
+    writeFileSync(preload, `globalThis.fetch = (async (url) => {
+  const target = new URL(String(url));
+  if (target.hostname === 'example.org' && target.pathname === '/course') return new Response('<script type="application/ld+json">{"@type":"Course","name":"데이터 시각화 실습","description":"데이터 시각화 능력단위 강좌"}</script>', {headers:{'content-type':'text/html'}});
+  if (target.pathname.endsWith('/NCS005') && (target.searchParams.get('NCS_COMPE_UNIT_CD') !== '010203040001' || target.searchParams.get('NCS_CL_CD') !== '01020304')) return new Response('wrong competency unit code', {status:422});
+  if (!target.pathname.endsWith('/NCS005') && !target.pathname.endsWith('/NCS007')) return new Response('unexpected NCS operation', {status:404});
+  const item = target.pathname.endsWith('/NCS005') ? {COMPE_UNIT_LVL:'4',COMPE_UNIT_ELEM:[{COMPE_UNIT_ELEM_NAME:'자료 정리',PERF_CRIT:'설문 자료를 표로 정리한다.'}]} : {NCS_CL_CD:'01020304',NCS_COMPE_UNIT_CD:'010203040001',COMPE_UNIT_NAME:'데이터 시각화'};
+  return new Response(JSON.stringify({response:{header:{resultCode:'00'},body:{items:{item:[item]}}}}));
+}) as typeof fetch;\n`);
     const bun = join(bin, 'bun');
     writeFileSync(bun, `#!/bin/sh\nexec '${Bun.which('bun')}' --preload '${preload}' "$@"\n`);
     chmodSync(bun, 0o755);
     const researchCalls = join(temp, 'research-calls');
+    const gapCalls = join(temp, 'gap-calls');
     const cli = join(bin, 'elanous');
-    writeFileSync(cli, `#!/bin/sh\n[ "$1" = '--test' ] && [ "$2" = 'research' ] && [ "$4" = '--json' ] || exit 17\necho called >> '${researchCalls}'\n${retry ? `[ "$(wc -l < '${researchCalls}')" -eq 1 ] && { printf '%s\\n' '{"output":"no results"}'; exit 0; }` : ''}\nprintf '%s\\n' '${unrelated ? '{"output":"- [자료](https://example.org/document)"}' : '{"output":"- [공개 강좌](https://example.org/course)"}'}'\n`);
+    writeFileSync(cli, `#!/bin/sh\n[ "$1" = '--test' ] || exit 17\nif [ "$2" = 'ask' ]; then\n  echo called >> '${gapCalls}'\n  printf '%s\\n' '{"reply":"{\\"gaps\\":[{\\"code\\":\\"010203040001\\",\\"status\\":\\"보유\\",\\"quote\\":\\"가상 동아리 설문 결과를 표로 정리했다.\\"}]}"}'\n  exit 0\nfi\n[ "$2" = 'research' ] && [ "$4" = '--json' ] || exit 17\necho called >> '${researchCalls}'\n${retry ? `[ "$(wc -l < '${researchCalls}')" -eq 1 ] && { printf '%s\\n' '{"output":"no results"}'; exit 0; }` : ''}\nprintf '%s\\n' '${unrelated ? '{"output":"- [자료](https://example.org/document)"}' : '{"output":"- [공개 강좌](https://example.org/course)"}'}'\n`);
     chmodSync(cli, 0o755);
     const commands: string[] = [];
     const state = await runGraph(join(installed, 'graphs/report.yaml'), {
@@ -195,6 +213,7 @@ async function installedReport(retry: boolean, unrelated = false) {
     const recipes = parseYaml(readFileSync(join(installed, 'graphs/recipes.yaml'), 'utf8')) as Record<string, { command: string }>;
     expect(commands).toEqual(state.path.filter(node => recipes[node]).map(node => recipes[node]!.command));
     expect(readFileSync(researchCalls, 'utf8').trim().split('\n')).toHaveLength(retry || unrelated ? 2 : 1);
+    expect(readFileSync(gapCalls, 'utf8').trim().split('\n')).toHaveLength(1);
     const report = readFileSync(join(state.statePath.slice(0, -5), 'report.md'), 'utf8');
     for (const section of ['직무', 'NCS 능력단위 매칭', '역량 갭', '추천 코스', '출처']) expect(report).toContain(`## ${section}`);
     if (unrelated) {
@@ -204,9 +223,9 @@ async function installedReport(retry: boolean, unrelated = false) {
       expect(report).toContain('https://example.org/course');
       expect(report).toContain('발행 페이지 Course 메타데이터의 이름·설명에서 NCS 능력단위');
     }
-    expect(report).toContain('01020304 데이터 시각화: 보유(인터뷰 자기보고)');
-    expect(report).not.toContain('가상 동아리 설문 결과를 표로 정리했다.');
-    expect(readFileSync(state.statePath, 'utf8')).not.toContain('가상 동아리 설문 결과를 표로 정리했다.');
+    expect(report).toContain('010203040001 데이터 시각화: 보유 — 인터뷰 인용: “가상 동아리 설문 결과를 표로 정리했다.”');
+    expect(report).toContain('수준 4 · 자료 정리: 설문 자료를 표로 정리한다.');
+    expect(readFileSync(state.statePath, 'utf8')).toContain('가상 동아리 설문 결과를 표로 정리했다.');
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }
 

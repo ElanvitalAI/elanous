@@ -13,12 +13,14 @@ describe('self send superseded explicit target protection — decision', () => {
     ledgers?: SelfSendLedger[];
     target?: ReturnType<SelfSendDecisionDeps['resolveTarget']>;
     pod?: boolean;
+    podFragments?: { spaceId: string }[];
     throwLedger?: boolean;
   } = {}) {
     const screens = options.screens ?? [screen(older)];
     const runScreens = options.runScreens ?? { [runId]: { screenKey: screens[0]?.spaceId } };
     const deps: SelfSendDecisionDeps = {
       resolveRunScreen: (id) => ({ logStoreStatus: 'read', logStorePath: '/test/logs.db', ...runScreens[id] }),
+      podFragmentsForRun: () => options.podFragments ?? [],
       resolveTarget: (spaceId) => options.target ?? { kind: 'space', spaceId },
       isPodFragment: () => options.pod ?? false,
       screens: () => screens,
@@ -50,7 +52,30 @@ describe('self send superseded explicit target protection — decision', () => {
     refused(decide({ opts: { run: runId, memo: 'memo' } }, { screens: [], runScreens: { [runId]: { screenKey: `${older}-` } } }), `해석한 화면이 없습니다: ${older}`, 1);
   });
   test('rejects an unresolved run without recording to any screen', () => {
-    refused(decide({ opts: { run: runId, memo: 'memo' } }, { runScreens: { [runId]: { missingStatus: 'not-found' } } }), 'run 화면 해석 불가:', 1);
+    const result = decide({ opts: { run: runId, memo: 'memo' } }, { runScreens: { [runId]: { missingStatus: 'not-found' } } });
+    refused(result, 'run 화면 해석 불가:', 1);
+    refused(result, 'Pod 조각 기록도 0', 1);
+  });
+  test('routes a screenless child run to its sole Pod fragment', () => {
+    expect(decide({ opts: { run: runId, memo: 'memo' } }, { runScreens: {}, podFragments: [{ spaceId: 'task-child' }] }))
+      .toEqual({ kind: 'send', spaceId: 'task-child', channel: 'pod', warnings: [] });
+  });
+  test('routes a screenless parent run to its sole Pod fragment', () => {
+    const parentRunId = 'run-parent';
+    expect(decide({ opts: { run: parentRunId, stop: true } }, { runScreens: {}, podFragments: [{ spaceId: 'task-child' }] }))
+      .toEqual({ kind: 'send', spaceId: 'task-child', channel: 'pod', warnings: [] });
+  });
+  test('refuses multiple Pod fragments for a screenless run and names every space', () => {
+    const result = decide({ opts: { run: runId, memo: 'memo' } }, { runScreens: {}, podFragments: [{ spaceId: 'task-a' }, { spaceId: 'task-b' }] });
+    refused(result, 'space 이름으로 다시 보내세요', 2);
+    refused(result, 'task-a', 2);
+    refused(result, 'task-b', 2);
+  });
+  test('keeps a resolved local screen ahead of Pod records', () => {
+    expect(decide({ opts: { run: runId, memo: 'memo' } }, { podFragments: [{ spaceId: 'task-child' }] })).toEqual(memo(older));
+  });
+  test('rejects conflicting controls even when a screenless run has one Pod fragment', () => {
+    refused(decide({ opts: { run: runId, stop: true, memo: 'memo' } }, { runScreens: {}, podFragments: [{ spaceId: 'task-child' }] }), '--stop 과 --memo', 2);
   });
   test('preserves unresolved run rejection before missing or conflicting control options', () => {
     for (const opts of [{ run: runId }, { run: runId, stop: true, memo: 'memo' }]) {
@@ -82,6 +107,16 @@ describe('self send superseded explicit target protection — decision', () => {
     const result = decide({ space: older }, { screens: [screen(older, 'alive', now - 2000), screen(newer, 'alive', now - 1000)] });
     refused(result, `${older} → ${newer}`, 2);
   });
+  test('groups legacy and run-suffixed attempts for explicit-target protection and candidate display', () => {
+    const legacy = 'self-impl-shared-goal-aaaaaaaa';
+    const suffixed = 'self-impl-shared-goal-bbbbbbbb-rc41218';
+    const candidates = [screen(legacy, 'alive', now - 2000), screen(suffixed, 'alive', now - 1000)];
+    refused(decide({ space: legacy }, { screens: candidates }), `${legacy} → ${suffixed}`, 2);
+    const display = formatSelfSendCandidateDisplay(candidates, { now });
+    expect(display.lines[0]).toContain('같은 골의 다른 시도');
+    expect(display.lines[1]).toContain('같은 골의 다른 시도 · 가장 최근');
+  });
+
   test('rejects a superseded explicit stop without recording it', () => {
     refused(decide({ space: older, opts: { stop: true } }, { screens: [screen(older, 'alive', now - 2000), screen(newer, 'alive', now - 1000)] }), '더 최근 시도로 교체되었습니다', 2);
   });

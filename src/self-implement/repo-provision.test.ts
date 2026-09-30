@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
 import { SENSITIVE_GLOBS } from '../boot/daemon-tools/path-guard.js';
@@ -23,6 +23,13 @@ import type { SelfImplementSeams } from './orchestrator.js';
 import { runRepositoryPublic, runRepositoryPublish } from '../cli/repo-cli.js';
 
 const directories: string[] = [];
+const createHomeDirectory = (prefix: string) => {
+  const home = resolveHarnessTarget(tmpdir()).canonicalHome;
+  if (!home) throw new Error('expected resolved target home');
+  const directory = mkdtempSync(join(home, prefix));
+  directories.push(directory);
+  return directory;
+};
 const createDirectory = (prefix = 'repo-provision-') => {
   const directory = mkdtempSync(join(tmpdir(), prefix));
   directories.push(directory);
@@ -340,8 +347,7 @@ describe('runDevPipeline repository provision wiring', () => {
   const spec = (target: string): DevPipelineSpec => ({ input: { text: 'implement feature' }, target, humanReadableOutput: false });
 
   test('interactive consent initializes and commits only non-ignored files', async () => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-consent-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-consent-');
     writeFileSync(join(directory, '.env'), 'secret');
     writeFileSync(join(directory, 'a.ts'), 'export {};');
     const prompts: string[] = [];
@@ -360,8 +366,7 @@ describe('runDevPipeline repository provision wiring', () => {
     { answer: 'y\n', initialized: true },
     { answer: 'n\n', initialized: false },
   ])('real CLI asks on TTY stdin with piped JSON stdout ($answer)', ({ answer, initialized }) => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-json-consent-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-json-consent-');
     writeFileSync(join(directory, '.env'), 'secret');
     writeFileSync(join(directory, 'a.ts'), 'export {};');
     // The CLI exits after the repository gate: an explicit remote-dependent completion needs a remote.
@@ -402,8 +407,7 @@ finally:
   }, 120_000);
 
   test('passes the revalidated non-git resolution to provision after consent', async () => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-revalidated-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-revalidated-');
     let given: HarnessTargetResolution | undefined;
     await runDevPipeline({ ...spec(directory), assumeYes: true }, {
       provisionRepository: (target) => { given = target; return provisionRepository(target); },
@@ -417,8 +421,7 @@ finally:
 
   test('declined and non-interactive launches do not create .git or call provision', async () => {
     for (const interactive of [true, false]) {
-      const directory = mkdtempSync(join(homedir(), 'dev-repo-refusal-'));
-      directories.push(directory);
+      const directory = createHomeDirectory('dev-repo-refusal-');
       let asked = 0;
       let provisioned = false;
       await expect(runDevPipeline(spec(directory), {
@@ -433,8 +436,7 @@ finally:
   });
 
   test('an existing git target does not ask or change its HEAD', async () => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-existing-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-existing-');
     git(directory, ['init']);
     git(directory, ['config', 'user.email', 'test@example.invalid']);
     git(directory, ['config', 'user.name', 'test']);
@@ -452,8 +454,7 @@ finally:
   });
 
   test('--yes flows through the CLI spec into a non-interactive target launch', async () => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-yes-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-yes-');
     const cliSpec = buildDevCliSpec({ text: 'implement feature' }, { kind: 'self' }, { target: directory, yes: true });
     expect(cliSpec.assumeYes).toBe(true);
     await runDevPipeline({ ...cliSpec, humanReadableOutput: false }, {
@@ -466,8 +467,7 @@ finally:
   });
 
   test('without --target, non-git working directory uses the same consent gate', async () => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-cwd-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-cwd-');
     await expect(runDevPipeline({ input: { text: 'implement feature' }, humanReadableOutput: false }, {
       cwd: directory, nonGitInteractive: false,
     })).rejects.toMatchObject({ exitCode: 2 });
@@ -481,8 +481,7 @@ finally:
   });
 
   test('provisions before building seams and child execution while preserving the resolved target contract', async () => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-provision-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-provision-');
     const order: string[] = [];
     let seamTarget: string | undefined;
     await runDevPipeline({ ...spec(directory), assumeYes: true }, {
@@ -506,8 +505,7 @@ finally:
   });
 
   test('does not build seams or run the child when provision fails', async () => {
-    const directory = mkdtempSync(join(homedir(), 'dev-repo-provision-'));
-    directories.push(directory);
+    const directory = createHomeDirectory('dev-repo-provision-');
     let downstream = false;
     await expect(runDevPipeline({ ...spec(directory), assumeYes: true }, {
       provisionRepository: () => { throw new Error('provision failed'); },
@@ -518,9 +516,8 @@ finally:
   });
 
   test('prints one readable status for promoted and existing-git targets', async () => {
-    const promoted = mkdtempSync(join(homedir(), 'repo-provision-readable-'));
-    const existing = mkdtempSync(join(homedir(), 'repo-provision-readable-'));
-    directories.push(promoted, existing);
+    const promoted = createHomeDirectory('repo-provision-readable-');
+    const existing = createHomeDirectory('repo-provision-readable-');
     git(existing, ['init']);
     const output: string[] = [];
     const original = console.log;

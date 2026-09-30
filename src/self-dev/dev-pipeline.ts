@@ -15,8 +15,12 @@
 //   self 는 backend 리스트 항목이 아니라 transport 축을 붕괴시키는 특수 갈래. 감독 축도 self=turn 레벨.
 
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { appendEvidenceLocationRequirement, extractVerbatimOriginalAsk, formatGoalFileLintFinding, inspectAskDecisionSignalMarker, leadingGoalMetadata, lintGoalFile, parseGoalId, parseGoalType, SUPERSEDED_BY_LINE, type GoalFileLintFinding, type GoalFileLintResult } from '../self-implement/goal-author.js';
+import { dispatchTask, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
+import { getNestDepth } from '../agent/nest-depth.js';
+import { appendRunLedgerEntry } from '../self-implement/run-ledger.js';
+import { appendEvidenceLocationRequirement, extractVerbatimOriginalAsk, formatGoalFileLintFinding, inspectAskDecisionSignalMarker, leadingGoalMetadata, lintGoalFile, parseGoalId, parseGoalType, tracedPathReferences, SUPERSEDED_BY_LINE, type GoalFileLintFinding, type GoalFileLintResult } from '../self-implement/goal-author.js';
 import { createRepositoryReferencedFileReader, type ReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { parseGoalDocumentClarifications } from '../self-implement/goal-author-clarification.js';
 import { requiredEvidenceFromGoal } from '../self-implement/off-diff-evidence.js';
@@ -55,6 +59,8 @@ export type OrchestrateRuntime = Omit<OrchestrateSelfDevOptions, 'goals' | 'conc
 export interface DevMissionOpts {
   chain?: readonly ('codex' | 'claude' | 'elanous')[];
   plugin?: { plugin: string; marketplace: string };
+  resources?: 'on' | 'off';
+  backendExplicit?: string;
   headless?: boolean;
   evidence?: EvidenceMode;
   maxRounds?: number;
@@ -619,6 +625,8 @@ export function toAgentMissionSpec(
     ...(m.headless === true ? { headless: true } : {}),
     ...(m.chain ? { chain: m.chain } : {}),
     ...(m.plugin ? { plugin: m.plugin } : {}),
+    ...(m.resources !== undefined ? { resources: m.resources } : {}),
+    ...(m.backendExplicit !== undefined ? { backendExplicit: m.backendExplicit } : {}),
     ...(plan.base ? { base: plan.base } : {}),
     ...(plan.enhance !== undefined ? { enhance: plan.enhance } : {}),
     ...(m.maxRounds !== undefined ? { maxRounds: m.maxRounds } : {}),
@@ -644,6 +652,8 @@ export function buildAgentMissionDevSpec(o: {
   headless?: boolean;
   chain?: readonly ('codex' | 'claude' | 'elanous')[];
   plugin?: { plugin: string; marketplace: string };
+  resources?: 'on' | 'off';
+  backendExplicit?: string;
   /** --no-enhance 시 false(그 외 미지정 → driver 가 entry 로 구동). */
   enhanceOff?: boolean;
   evidence: EvidenceMode;
@@ -663,6 +673,8 @@ export function buildAgentMissionDevSpec(o: {
       ...(o.headless === true ? { headless: true } : {}),
       ...(o.chain ? { chain: o.chain } : {}),
       ...(o.plugin ? { plugin: o.plugin } : {}),
+      ...(o.resources !== undefined ? { resources: o.resources } : {}),
+      ...(o.backendExplicit !== undefined ? { backendExplicit: o.backendExplicit } : {}),
       maxRounds: o.maxRounds,
       commit: o.commit,
       entry: 'elanous-apparatus',
@@ -918,6 +930,10 @@ export interface DevHarnessDispatchArgs extends Record<string, unknown> {
 }
 
 export interface DevPipelineDeps {
+  dispatchTask?: typeof dispatchTask;
+  dispatchTaskDeps?: DispatchTaskDeps;
+  /** Caller has already recorded this dispatch decision at an outer entrance. */
+  skipDispatchTask?: boolean;
   /** Caller-managed human progress sink (for example SurfaceUx.progress). Absent callers retain byte-for-byte CLI stdout. */
   progress?: SurfaceUx['progress'];
   runSelfImplement?: (o: SelfImplementOptions) => Promise<SelfImplementResult>;
@@ -1777,6 +1793,65 @@ export async function runDevPipeline(spec: DevPipelineSpec, deps: DevPipelineDep
   }
 }
 
+async function observeDevTaskDispatch(spec: DevPipelineSpec, plan: ResolvedDevPlan, deps: DevPipelineDeps): Promise<void> {
+  const skipped = plan.dispatch === 'interactive' && getNestDepth() > 0 ? 'nested-interactive'
+    : plan.relaunch === true ? 'relaunch'
+    : plan.dispatch === 'parallel' ? 'parallel-parent'
+    : deps.skipDispatchTask === true ? 'skipDispatchTask'
+    : process.env.ELANOUS_DISPATCH_RECORDED === '1' ? 'dispatch-recorded'
+    // `bun test` preload sets this so pipeline tests do not run the real gates (usage/recall
+    // lookups) on every launch; tests that inject a dispatcher or gates still observe.
+    : process.env.ELANOUS_EXECUTION_LOOP_DISPATCH === 'off' && !deps.dispatchTask && !deps.dispatchTaskDeps ? 'disabled'
+    : undefined;
+  if (skipped) {
+    try { debug.log('execution-loop.gate', 'dispatch-skipped', { reason: skipped, ...(spec.runId ? { runId: spec.runId } : {}) }); } catch { /* fail-soft */ }
+    return;
+  }
+  try {
+    const goalText = 'text' in plan.input ? plan.input.text : (deps.readFile ?? ((path: string) => readFileSync(path, 'utf8')))(plan.input.file);
+    const goalId = 'file' in plan.input ? parseGoalId(goalText) : null;
+    let recordedCardId: string | undefined;
+    const recordCard = (cardId: string): void => {
+      if (!spec.runId || recordedCardId) return;
+      recordedCardId = cardId;
+      try {
+        appendRunLedgerEntry({ timestamp: new Date().toISOString(), runId: spec.runId,
+          event: 'execution-loop-card', data: { cardId } });
+      } catch (error) {
+        try { debug.log('execution-loop.gate', 'ledger-unavailable', { reason: String(error) }); } catch { /* fail-soft */ }
+      }
+    };
+    const dispatchDeps: DispatchTaskDeps = {
+      ...deps.dispatchTaskDeps,
+      onCardCreated: (cardId) => {
+        recordCard(cardId);
+        deps.dispatchTaskDeps?.onCardCreated?.(cardId);
+      },
+    };
+    const work = Promise.resolve().then(() => (deps.dispatchTask ?? dispatchTask)({
+      goalId: goalId ?? `request-${createHash('sha256').update(goalText).digest('hex').slice(0, 32)}`,
+      title: goalText.split(/\r?\n/, 1)[0]?.trim() || 'Untitled request',
+      goalText,
+      targetPaths: 'file' in plan.input ? tracedPathReferences(goalText).map((reference) => reference.path) : [],
+      spec,
+      ...(spec.runId ? { runKey: spec.runId } : {}),
+    }, dispatchDeps));
+    // The default dispatcher bounds its gates to five seconds. Await its completed
+    // observation so short-lived callers cannot exit before decisions reach the card.
+    // Injected dispatchers retain an outer timeout to protect the original launch.
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const result = await (deps.dispatchTask
+      ? Promise.race([
+          work,
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('dispatch timeout after 5000ms')), 5_000); }),
+        ]).finally(() => { if (timeout) clearTimeout(timeout); })
+      : work);
+    recordCard(result.cardId);
+  } catch (error) {
+    try { debug.log('execution-loop.gate', 'dispatch-unavailable', { reason: String(error) }); } catch { /* fail-soft */ }
+  }
+}
+
 async function runDevPipelineDispatch(
   spec: DevPipelineSpec,
   deps: DevPipelineDeps,
@@ -1785,6 +1860,7 @@ async function runDevPipelineDispatch(
 ): Promise<DevPipelineRunResult> {
   const plan = planDevPipeline(spec);
   seen.plan = plan;
+  await observeDevTaskDispatch(spec, plan, deps);
   if (!plan.wired) {
     throw new DevPipelineError(
       `runDevPipeline: '${plan.dispatch}' 경로는 U4 골격에서 미배선(NotYetUnified). ` +

@@ -22,9 +22,14 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 | **Chat** | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](pwa-chat.md). |
 | **Terminal** | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and a live view of an agent's terminal from a link. See [Terminal](pwa-terminal.md). |
 | **Intake** | *Since 0.2.3.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](tasks-and-intake.md). |
+| **Approvals** | Things waiting for you: loop steps that ask a person before they go on, and pull requests held for your approval — each with its summary, changed files and checks. Approve, and the pull request is merged. |
 | **Live** | Your harness runs as they happen — stage bars, a stream of decisions (what, why, where to), gauges and the raw log. Everyday mode costs almost nothing; **Full show** records more and animates it, and switches itself off after 30 minutes. See [Live](pwa-live.md). |
 | **Trace** | Follow one run from the whole fleet down to a single decision and the log line behind it. Filters stack up as a lens you can peel back one chip at a time, and the address keeps the view so you can share it. See [Trace](pwa-trace.md). |
+| **Missions** | Mission lineage and the task board in one menu; you can also hand a new goal from here. |
+| **Design** | Pick a design system, see drafts, or derive one from a URL. See [Design systems](design.md). |
 | **Vault** | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](pwa-vault.md). |
+| **마켓** (Market) | Browse the signed plugin marketplaces, read a plugin's capabilities, install and remove plugins. See [Plugins](plugins.md). |
+| **Schedules** | Every scheduled job in one list — cron, the background service and loop triggers. |
 | **Settings** | Models and tiers, voice and text-to-speech, persona, notifications, theme and daemon health. |
 | **Setup** (`/setup`) | First-time setup in the browser. Today it covers the LLM provider; the other wizard steps still run in the terminal with `elanous onboarding`. |
 

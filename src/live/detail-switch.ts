@@ -7,7 +7,7 @@
 // 상태 = `<state>/live/detail.json` `{ scope: 'all' | '<runId>', until: <epoch ms>, by?, since }`.
 //   - 넥서스(`/v1/live/detail`)가 쓰고, 하니스·런(다른 프로세스)은 파일을 읽는다 — 프로세스 경계를 넘는 가장 단순한 관.
 //   - `until` 이 지나면 꺼진 것이다(자동 꺼짐 · 파일을 지우는 사람이 없어도 된다).
-// ⛔ 읽기 실패·깨진 파일은 «꺼짐» — 상세 관측은 비용이라 fail-closed.
+// ⛔ 읽기 실패·깨진 파일은 기본 «꺼짐» — 단 유효한 미래 ELANOUS_LIVE_DETAIL_UNTIL 은 전체 범위를 켠다.
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -107,10 +107,15 @@ export function selectLiveDetail(opts: DetailReadOptions = {}): LiveDetailSelect
   return { ...selection, state: parsed && parsed.until > now ? parsed : null };
 }
 
-/** 이 런에 상세 관측이 켜져 있나 — 두 뿌리에 공통인 5초 캐시. */
+/** 이 런에 상세 관측이 켜져 있나 — 파일은 5초 캐시, env 만료는 매번 확인한다. */
 export function isLiveDetailOn(runId?: string, opts: DetailReadOptions = {}): boolean {
   const now = opts.now ?? Date.now();
-  return matches(selectLiveDetail({ ...opts, now }).state, runId, now);
+  const state = selectLiveDetail({ ...opts, now }).state;
+  if (state) return matches(state, runId, now);
+  const rawUntil = process.env.ELANOUS_LIVE_DETAIL_UNTIL;
+  if (!rawUntil || !/^\d+$/.test(rawUntil)) return false;
+  const until = Number(rawUntil);
+  return Number.isSafeInteger(until) && until > now;
 }
 
 function matches(state: LiveDetailState | null, runId: string | undefined, now: number): boolean {

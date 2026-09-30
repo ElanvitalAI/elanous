@@ -48,7 +48,7 @@ test('loading reserves three provider cards and updates elapsed seconds every se
   let nextId = 0;
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
-    value: { setInterval: (fn: () => void, delay: number) => { expect(delay).toBe(1000); callbacks.set(++nextId, fn); return nextId; }, clearInterval: (id: number) => { callbacks.delete(id); } },
+    value: { addEventListener: () => {}, removeEventListener: () => {}, setInterval: (fn: () => void, delay: number) => { expect(delay).toBe(1000); callbacks.set(++nextId, fn); return nextId; }, clearInterval: (id: number) => { callbacks.delete(id); } },
   });
   try {
     await act(async () => { tree = mount(() => new Promise(() => {})); });
@@ -69,7 +69,7 @@ test('loading reserves three provider cards and updates elapsed seconds every se
 });
 
 test('subscription shortcut selects the catalog codex flow and child preferences stay collapsed', async () => {
-  Object.defineProperty(globalThis, 'window', { configurable: true, value: { setInterval, clearInterval, requestAnimationFrame: () => 0 } });
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: { addEventListener: () => {}, removeEventListener: () => {}, setInterval, clearInterval, requestAnimationFrame: () => 0 } });
   Object.defineProperty(globalThis, 'document', { configurable: true, value: { getElementById: () => null } });
   await act(async () => { tree = mount(async () => snapshot); });
   expect(tree!.root.findAllByType('details')).toHaveLength(2);

@@ -32,6 +32,12 @@ export function prodInstanceRoot(): string {
   return normRoot(join(homedir(), '.elanous'));
 }
 
+/** Release records are machine-wide except in an explicitly selected config universe. */
+export function releaseLedgerRoot(): string {
+  const { getElanousConfigDirOverride } = require('../elanous-config-dir.js') as typeof import('../elanous-config-dir.js');
+  return getElanousConfigDirOverride() ? effectiveInstanceRoot() : prodInstanceRoot();
+}
+
 export function resolveInstance(deps: ResolveDeps = {}): InstanceResolution {
   const prodRoot = normRoot(deps.prodRoot ?? prodInstanceRoot());
   if (deps.explicitFlagRoot?.trim()) {

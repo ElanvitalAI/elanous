@@ -1,0 +1,31 @@
+{
+ "pr": 21953,
+ "state": "MERGED",
+ "note": "실물 표본 — 09-29 ElanvitalAI/elanous#21953 의 PR 코멘트 8개(작성자 라운드 본문은 첫 두 줄로 줄임 · 리뷰어 라운드는 원문)",
+ "comments": [
+  {
+   "body": "<!-- elanous-pr-comment v1 role=author round=0 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 0: child implementation completed."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=reviewer round=0 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 0: reviewer requested 2 must-fix change(s).\n\n- 매니페스트가 없으면 `gather`는 성공하며 수집만 건너뛰지만, 승인 후 `apply-lines`는 매니페스트를 읽지 못해 실패합니다. 새 그래프가 이 경우를 지원할지 명시하고 두 노드의 동작을 일치시키세요.\n- `applyLines`는 완성형 한글 음절만 거부하므로 일본어·한자·분해된 한글 문장도 “English line”으로 반영합니다. 영어 문장만 적용하려는 조건을 실제로 검증하세요."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=author round=1 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 1: child implementation completed."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=reviewer round=1 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 1: reviewer requested 1 must-fix change(s).\n\n- `apply-lines.ts`의 `ENGLISH_LINE`은 허용 문자만 검사하므로 `!!!`나 `12345`도 영어 문장으로 간주해 매니페스트에 반영합니다. 영어 문장만 적용한다는 조건에 맞게 검증을 강화하고 해당 반례를 테스트하세요."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=author round=2 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 2: child implementation completed."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=reviewer round=2 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 2: reviewer requested 1 must-fix change(s).\n\n- `defaultPrBody`가 `gh pr view` 실패·타임아웃을 릴리스 노트가 없는 경우와 똑같이 `null`로 처리합니다. 조회에 실패해도 `gather`가 빈 문장을 기록하고 성공하므로, 조회 실패는 게이트 실패로 전파해야 합니다."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=author round=3 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 3: child implementation completed."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=reviewer round=3 run=run-33962896-d5a1-4a0a-b474-18c0f1047148 -->\nRound 3: reviewer requested 2 must-fix change(s).\n\n- 기존 PR/FAQ 파일이 있으면 `gather`는 새 LINES 파일을 만들고도 PR/FAQ를 갱신하지 않습니다. 특히 manifest가 나중에 생긴 재실행에서는 확인 단계에 공개 문장 표가 없는데 `apply-lines`는 그 문장을 적용할 수 있습니다. 확인 자료와 적용 대상을 일치시키거나 불일치 시 실패해야 합니다.\n- `applyLines`는 비영어 문장을 거부해도 `ok: true`를 반환해 그래프가 `check`로 진행합니다. 확인된 문장이 적용되지 않은 채 성공 경로에 남지 않도록 거부 항목을 게이트 실패로 처리하거나 후속 단계에서 해소 여부를 검증해야 합니다."
+  }
+ ]
+}

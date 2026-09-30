@@ -1,5 +1,7 @@
 'use client';
 
+import { maskCardsForPublic } from './card-public';
+import { cardMetaParts } from './card-meta';
 import { useEffect, useMemo, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { boardColumn, cardTitle, foldCard, type BoardColumn, type TaskCard, type TaskCardEntry, type TaskCardSection } from '@/lib/task-card-model';
@@ -12,6 +14,9 @@ const SECTIONS = new Set<TaskCardSection>([
 ]);
 
 /** The card journal is append-only; group entries before folding each task. */
+/** How often the board re-reads cards (the steward adds them on its own schedule). */
+export const BOARD_REFRESH_MS = 10_000;
+
 export function cardsFromEntries(entries: readonly TaskCardEntry[]): TaskCard[] {
   const byTask = new Map<string, TaskCardEntry[]>();
   for (const entry of entries) {
@@ -95,7 +100,7 @@ export function TaskBoardView({ cards, selectedId, onSelect, selectedCard, detai
                 className="w-full rounded-lg border border-border bg-card p-3 text-left text-sm hover:bg-accent/40">
                 <span className="block font-medium">{cardTitle(card)}</span>
                 <span className="block text-xs text-muted-foreground">
-                  Incidents {openIncidentCount(card)} · {card.runId?.slice(0, 8) ?? '—'} · <time dateTime={new Date(card.updatedAt).toISOString()}>{new Date(card.updatedAt).toISOString()}</time>
+                  <time dateTime={new Date(card.updatedAt).toISOString()} title={new Date(card.updatedAt).toLocaleString()}>{cardMetaParts(card, openIncidentCount(card), Date.now()).join(' · ')}</time>
                 </span>
               </button>
             ))}
@@ -131,6 +136,11 @@ export function TaskBoard() {
     setSelectedId(id);
   };
 
+  // «공개 캡처»(`?capture=public`) — 녹화 전에 카드 제목의 호스트·계정·경로·금액을 가린다(Live·Trace 와 같은 가면).
+  const [publicCapture, setPublicCapture] = useState(false);
+  useEffect(() => { if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('capture') === 'public') setPublicCapture(true); }, []);
+  const shownCards = useMemo(() => (publicCapture ? maskCardsForPublic(cards) : cards), [cards, publicCapture]);
+
   useEffect(() => {
     let cancelled = false;
     setCards([]);
@@ -142,14 +152,17 @@ export function TaskBoard() {
       return;
     }
     setMessage(null);
-    void client.getTaskCards().then(({ cards: loaded }) => {
-      if (!cancelled) setCards(loaded.map(cardFromWire));
+    const load = () => client.getTaskCards().then(({ cards: loaded }) => {
+      if (!cancelled) { setCards(loaded.map(cardFromWire)); setMessage(null); }
     }).catch((error: unknown) => {
       if (!cancelled) setMessage(error instanceof NexusApiError && error.status === 404
         ? 'Task cards are not available yet (pre-E1).'
         : error instanceof Error ? error.message : String(error));
     });
-    return () => { cancelled = true; };
+    void load();
+    // The steward writes cards on its own schedule — re-read so new cards appear without a reload.
+    const timer = setInterval(() => { void load(); }, BOARD_REFRESH_MS);
+    return () => { cancelled = true; clearInterval(timer); };
   }, [client]);
 
   useEffect(() => {
@@ -166,6 +179,6 @@ export function TaskBoard() {
   }, [client, selectedId]);
 
   return <>{message && <p role="status" className="p-4 text-sm text-muted-foreground">{message}</p>}
-    <TaskBoardView cards={cards} selectedId={selectedId} selectedCard={selectedCard} detailError={detailError} onSelect={selectCard} />
+    <TaskBoardView cards={shownCards} selectedId={selectedId} selectedCard={selectedCard} detailError={detailError} onSelect={selectCard} />
   </>;
 }

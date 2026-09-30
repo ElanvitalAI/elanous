@@ -1,10 +1,12 @@
 #!/usr/bin/env bun
-/** Import a public PR patch without fetching, committing, or publishing it. */
+/** Import a public PR patch without committing or publishing it. */
 import { spawnSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { loadExportConfig, selectExportFiles, transformExportFiles } from './public-export.js';
+import { debug } from '../src/debug/log.js';
+import { spawnSyncText } from '../src/util/spawn-sync-output.js';
 
 export type ImportKind = 'clean' | 'renamed' | 'transformed' | 'outside-export';
 export interface ImportFile { publicPath: string; sourcePath?: string; kind: ImportKind; reason?: string }
@@ -83,9 +85,7 @@ function gitApply(root: string, patch: string, check = false): string | undefine
 }
 
 function trackedFiles(root: string): string[] {
-  const result = spawnSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' });
-  if (result.status !== 0) throw new Error(`git ls-files failed: ${result.stderr}`);
-  return result.stdout.split('\0').filter(Boolean);
+  return spawnSyncText('git', ['ls-files', '-z'], { cwd: root, encoding: 'utf8' }).split('\0').filter(Boolean);
 }
 
 /** Classify against the real export, stage eligible edits, then write only on --apply. */
@@ -177,8 +177,82 @@ export function importPublicPatch(patch: string, root: string, apply = false, au
   } finally { rmSync(staging, { recursive: true, force: true }); }
 }
 
-/** CLI entrypoint: bun scripts/public-import-pr.ts [patch-file] --author 'Name <email>' [--apply]. */
-export function run(argv: readonly string[], root = process.cwd(), stdin?: string): number {
+interface GhResult { status: number | null; stdout: string; stderr?: string }
+interface RunDeps { gh?: (argv: readonly string[], root: string) => GhResult }
+
+function prAuthors(raw: string, databaseIdForLogin: (login: string) => number): string[] {
+  const parsed: unknown = JSON.parse(raw);
+  if (!parsed || typeof parsed !== 'object' || !('commits' in parsed) || !Array.isArray(parsed.commits) || !parsed.commits.length) {
+    throw new Error('PR has no commits');
+  }
+  const unique = new Map<string, string>();
+  const seenEmails = new Set<string>();
+  for (const commit of parsed.commits) {
+    const identities = commit?.authors ?? (commit?.author ? [commit.author] : []);
+    if (!Array.isArray(identities) || !identities.length) throw new Error('PR commit has no author');
+    for (const identity of identities) {
+      const name = identity?.name?.trim();
+      const email = identity?.email?.trim();
+      const login = identity?.login?.trim() ?? identity?.user?.login?.trim();
+      const key = login ? `login:${login.toLowerCase()}` : `email:${email?.toLowerCase()}`;
+      if (unique.has(key) || (email && seenEmails.has(email.toLowerCase()))) continue;
+      const id = identity?.user?.databaseId ?? identity?.id;
+      const numericId = /^[1-9]\d*$/.test(String(id)) ? Number(id) : undefined;
+      const address = email || (login && /^[A-Za-z0-9-]+$/.test(login)
+        ? `${numericId && Number.isSafeInteger(numericId) ? numericId : databaseIdForLogin(login)}+${login}@users.noreply.github.com`
+        : undefined);
+      if (typeof name !== 'string' || !/^[^<>\r\n]+$/.test(name) || !address || !/^[^<>\s@]+@[^<>\s@]+$/.test(address)) {
+        throw new Error('PR commit author lacks a valid name or email/identity');
+      }
+      unique.set(key, `${name} <${address}>`);
+      seenEmails.add(address.toLowerCase());
+    }
+  }
+  return [...unique.values()];
+}
+
+/** CLI entrypoint: patch + --author, or --pr <number> --repo <owner/name>. */
+export function run(argv: readonly string[], root = process.cwd(), stdin?: string, deps: RunDeps = {}): number {
+  const prMode = argv.includes('--pr') || argv.includes('--repo');
+  if (prMode) {
+    const prIndex = argv.indexOf('--pr');
+    const repoIndex = argv.indexOf('--repo');
+    const pr = argv[prIndex + 1];
+    const repo = argv[repoIndex + 1];
+    const flags = argv.filter((arg) => arg === '--apply' || arg === '--dry-run');
+    if (prIndex < 0 || repoIndex < 0 || !pr || !/^[1-9]\d*$/.test(pr) || !repo ||
+        !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo) ||
+        argv.length !== 4 + flags.length || flags.length > 1 ||
+        argv.some((arg, i) => (arg === '--pr' && i !== prIndex) || (arg === '--repo' && i !== repoIndex))) {
+      console.error('usage: bun scripts/public-import-pr.ts --pr <number> --repo <owner/name> [--dry-run|--apply]');
+      return 2;
+    }
+    try {
+      const gh = deps.gh ?? ((args: readonly string[], cwd: string) => spawnSync('gh', [...args], { cwd, encoding: 'utf8' }));
+      const fetch = (args: string[]): string => {
+        const result = gh(args, root);
+        if (result.status !== 0) throw new Error(result.stderr || `gh ${args[1]} failed`);
+        return result.stdout;
+      };
+      const patch = fetch(['pr', 'diff', pr, '--repo', repo]);
+      const authors = prAuthors(fetch(['pr', 'view', pr, '--repo', repo, '--json', 'commits']), (login) => {
+        const user: unknown = JSON.parse(fetch(['api', `users/${login}`]));
+        const id = user && typeof user === 'object' && 'id' in user ? user.id : undefined;
+        const resolvedLogin = user && typeof user === 'object' && 'login' in user ? user.login : undefined;
+        if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0 ||
+            typeof resolvedLogin !== 'string' || resolvedLogin.toLowerCase() !== login.toLowerCase()) {
+          throw new Error('GitHub user lacks a matching login or numeric database ID');
+        }
+        return id;
+      });
+      const result = importPublicPatch(patch, root, flags.includes('--apply'));
+      debug.log('public-import.pr', 'fetched', { repo, pr: Number(pr), files: result.files.length, authors: authors.length });
+      for (const file of result.files) console.log(`${file.kind}\t${file.publicPath}\t${file.sourcePath ?? '-'}${file.reason ? `\t${file.reason}` : ''}`);
+      console.log(`\nCommit message draft (not committed):\nImport public PR ${repo}#${pr}\n\nhttps://github.com/${repo}/pull/${pr}\n\n${authors.map((author) => `Co-Authored-By: ${author}`).join('\n')}`);
+      if (result.rc) console.error('import incomplete: one or more files were not applied');
+      return result.rc;
+    } catch (error) { console.error(`import failed: ${String(error)}`); return 1; }
+  }
   const apply = argv.includes('--apply');
   const authorIndex = argv.indexOf('--author');
   const author = authorIndex >= 0 ? argv[authorIndex + 1] : undefined;

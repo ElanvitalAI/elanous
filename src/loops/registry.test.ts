@@ -45,6 +45,21 @@ test('list joins graph and cron by path, excludes untriggered graph, exposes nex
   expect(() => loopStatus('plain', f.opts)).toThrow('loop not found');
 });
 
+test('a wrapper cron counts as the loop only when it declares the graph id in a trailing marker', () => {
+  const f = fixture();
+  const db = openSchedulesDb(join(f.root, 'wrap.db'));
+  inventoryCrontab(db, { crontab: [
+    '0 7 * * * zsh $HOME/wrap/daily-cron.sh  # elanous-loop=daily',
+    '0 8 * * * zsh $HOME/wrap/other.sh  # elanous-loop=daily-2',
+    '0 9 * * * zsh $HOME/wrap/mentions.sh graphs/daily/cron.yaml',
+  ].join('\n') + '\n' });
+  const rows = listSchedules(db);
+  db.close();
+  const daily = listLoops({ ...f.opts, schedules: rows }).find(l => l.id === 'daily');
+  expect(daily).toMatchObject({ enabled: true, nextRun: expect.any(String) });
+  expect(daily?.jobs.map(j => j.cron)).toEqual(['0 7 * * *']);
+});
+
 test('start plans absent cron, --yes registers; stop disables and start restores without deletion', async () => {
   const f = fixture();
   let line = '';
@@ -61,6 +76,8 @@ test('start plans absent cron, --yes registers; stop disables and start restores
     expect(await setLoopEnabled('daily', true, false, opts)).toMatchObject({ dryRun: true, changes: [{ action: 'create', cron: '0 7 * * *' }] });
     expect(line).toBe('');
     expect(await setLoopEnabled('daily', true, true, opts)).toMatchObject({ changed: true });
+    // cron runs in $HOME with a thin PATH — the line enters the package and names bun by absolute path.
+    expect(line).toContain(`cd ${f.opts.root} && ${process.execPath} bin/elanous.mjs graph run `);
     expect(listLoops(opts).find(l => l.id === 'daily')?.enabled).toBe(true);
     expect(await setLoopEnabled('daily', false, false, opts)).toMatchObject({ dryRun: true, changes: [{ action: 'disable' }] });
     expect(await setLoopEnabled('daily', false, true, opts)).toMatchObject({ changed: true });

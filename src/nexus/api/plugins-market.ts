@@ -4,7 +4,8 @@ import { elanousStateRoot } from '../../autopilot/state-paths.js';
 import { debug } from '../../debug/log.js';
 import { OFFICIAL_INDEX_KEYS } from '../../market/official-keys.js';
 import { verifyIndex, type MarketplaceIndex } from '../../market/signed-index.js';
-import { listInstalledPlugins } from '../../plugins/install/plugin-install.js';
+import { installPlugin, listInstalledPlugins, removePlugin, type InstallEvent } from '../../plugins/install/plugin-install.js';
+import { updateMarket, type MarketFetchOptions } from '../../plugins/install/market-fetch.js';
 import { userConfigPath } from '../../user-config.js';
 import { jsonResponse } from './json-response.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
@@ -66,7 +67,7 @@ export function readMarketIndex(root = elanousStateRoot(), trustedKeys: Readonly
     const dir = join(base, entry.name);
     const indexPath = [join(dir, 'marketplace.json'), join(dir, '.agents', 'plugins', 'marketplace.json')].find(existsSync);
     if (!indexPath) {
-      markets.push({ name: entry.name, signature: 'malformed', detail: 'marketplace.json: not found', plugins: [] });
+      markets.push({ name: entry.name, signature: 'malformed', detail: '마켓 인덱스를 찾지 못했습니다.', plugins: [] });
       continue;
     }
     let signature: MarketSignature = 'missing';
@@ -93,7 +94,7 @@ export function readMarketIndex(root = elanousStateRoot(), trustedKeys: Readonly
       signature = 'malformed';
       detail = 'marketplace.json: invalid market index';
     }
-    markets.push({ name: entry.name, signature, ...(detail ? { detail } : {}), plugins });
+    markets.push({ name: entry.name, signature, ...(detail ? { detail: '마켓 인덱스를 확인하지 못했습니다.' } : {}), plugins });
   }
   markets.sort((a, b) => a.name.localeCompare(b.name));
   debug.log('nexus.plugins-market', 'index', { markets: markets.length, ok: markets.filter(m => m.signature === 'ok').length, notOk: markets.filter(m => m.signature !== 'ok').length });
@@ -122,4 +123,87 @@ export function handlePluginsIndexGet(req: Request, opts: MetaApiOpts, root?: st
 export function handlePluginsGet(req: Request, opts: MetaApiOpts, root?: string): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
   return jsonResponse(listInstalledPlugins(root));
+}
+
+const MARKET_NAME = /^[a-z0-9][a-z0-9-]{1,39}$/;
+const MARKET_SPEC = /^[a-z0-9][a-z0-9-]{1,39}@[a-z0-9][a-z0-9-]{1,39}$/;
+
+/** 실패 원인 한 줄 — 사용자가 «왜» 를 볼 수 있게(2026-09-29 실물: «설치 중 오류가 발생했습니다» 만 보여 아티팩트 누락을 못 봤다). 홈 경로는 `~` 로 · 200자 · 한 줄. */
+export function safeDetail(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : undefined;
+  if (!message) return undefined;
+  return message.replace(/\/(?:Users|home)\/[^/\s]+/g, '~').replace(/\s+/g, ' ').trim().slice(0, 200) || undefined;
+}
+
+function safeReason(error: unknown): string {
+  const reason = error && typeof error === 'object' && 'reason' in error ? error.reason : undefined;
+  return typeof reason === 'string' && ['signature', 'scan', 'consent-denied', 'credentials', 'conflict', 'io'].includes(reason)
+    ? reason : 'io';
+}
+
+export async function handlePluginsMarketRefresh(req: Request, name: string, opts: MetaApiOpts, fetchOptions: MarketFetchOptions = {}): Promise<Response> {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (!MARKET_NAME.test(name)) return jsonResponse({ ok: false, reason: 'invalid-market' }, 400);
+  try {
+    const result = await updateMarket(name, fetchOptions);
+    const plugins = projectPlugins(result.index, name);
+    debug.log('nexus.plugins-market', 'refresh', { name, ok: true, count: plugins.length });
+    return jsonResponse({ ok: true, plugins });
+  } catch (error) {
+    const reason = safeReason(error);
+    debug.log('nexus.plugins-market', 'refresh', { name, ok: false, reason });
+    return jsonResponse({ ok: false, reason });
+  }
+}
+
+export async function handlePluginsInstall(req: Request, opts: MetaApiOpts, root?: string, configPath?: string): Promise<Response> {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  let body: unknown;
+  try { body = await req.json(); } catch { return jsonResponse({ error: 'bad_request' }, 400); }
+  const input = body as { spec?: unknown; acceptedCapabilities?: unknown } | null;
+  if (!input || typeof input.spec !== 'string' || !MARKET_SPEC.test(input.spec) ||
+    !Array.isArray(input.acceptedCapabilities) || !input.acceptedCapabilities.every(cap => typeof cap === 'string')) {
+    return jsonResponse({ error: 'bad_request' }, 400);
+  }
+  const spec = input.spec;
+  const accepted = new Set(input.acceptedCapabilities as string[]);
+  const trustedKeys = configuredTrustedKeys(configPath);
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      const send = (value: Record<string, unknown>) => controller.enqueue(encoder.encode(`${JSON.stringify(value)}\n`));
+      const onEvent = (event: InstallEvent) => {
+        if (event.event === 'consent') send({ event: 'consent', capabilities: event.capabilities, required: event.required });
+        else if (event.event === 'credentials') send({ event: 'credentials', required: event.connectors.some(c => c.fields.length > 0) });
+        else send({ event: event.event });
+      };
+      try {
+        await installPlugin(spec, {
+          ...(root ? { root } : {}), trustedKeys: [...OFFICIAL_INDEX_KEYS, ...trustedKeys],
+          onEvent, consent: capabilities => capabilities.every(cap => accepted.has(cap)),
+        });
+        debug.log('nexus.plugins-market', 'install', { spec, ok: true });
+      } catch (error) {
+        const reason = safeReason(error);
+        const detail = safeDetail(error);
+        debug.log('nexus.plugins-market', 'install', { spec, ok: false, reason, ...(detail ? { detail } : {}) });
+        send({ event: 'failed', reason, ...(detail ? { detail } : {}) });
+      } finally { controller.close(); }
+    },
+  });
+  return new Response(stream, { headers: { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store' } });
+}
+
+export function handlePluginsRemove(req: Request, name: string, opts: MetaApiOpts, root?: string): Response {
+  if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (!MARKET_NAME.test(name)) return jsonResponse({ error: 'bad_request' }, 400);
+  try {
+    const removed = removePlugin(name, root);
+    debug.log('nexus.plugins-market', 'remove', { name, removed });
+    return jsonResponse({ removed });
+  } catch (error) {
+    const reason = safeReason(error);
+    debug.log('nexus.plugins-market', 'remove', { name, reason });
+    return jsonResponse({ error: reason }, 500);
+  }
 }

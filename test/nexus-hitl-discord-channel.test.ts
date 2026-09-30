@@ -180,8 +180,7 @@ describe('createNexusDiscordHitlHandle', () => {
       bot: makeStubDiscordBot(),
     });
     await h!.stop();
-    await h!.stop();
-    expect(true).toBe(true);
+    await expect(h!.stop()).resolves.toBeUndefined();
   });
 });
 

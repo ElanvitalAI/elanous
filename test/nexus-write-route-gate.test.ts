@@ -15,6 +15,7 @@ import * as config from '../src/nexus/api/config.js';
 import * as discovery from '../src/nexus/api/registry-discovery.js';
 import * as autopilot from '../src/nexus/api/autopilot-handler.js';
 import * as channelBot from '../src/nexus/api/setup-channel-bot.js';
+import * as podCredential from '../src/nexus/api/pod-credential-api.js';
 
 const WRITE_PATHS = [
   '/v1/autopilot/run',
@@ -22,6 +23,7 @@ const WRITE_PATHS = [
   '/v1/config/secrets',
   '/v1/registry/discovery',
   '/v1/pod/credential/grok',
+  '/v1/pod/credential/github',
 ] as const;
 
 const CONNECT_INFO_PATH = '/v1/nexus/connect-info';
@@ -61,6 +63,22 @@ afterEach(() => {
 });
 
 describe('POST write routes — bearer gate', () => {
+  test('GitHub credential route uses gh-credential scope, not the Nexus or Grok bearer', async () => {
+    const gate = spyOn(podCredential, 'authenticatePodCredential').mockImplementation(async (_req, _deps, scope) => {
+      if (scope !== 'gh-credential') return { ok: false, response: Response.json({ error: 'wrong_scope' }, { status: 403 }) };
+      return { ok: true, runId: 'run', job: 'job', repository: 'owner/repo', exp: Date.now() + 60_000 };
+    });
+    const handler = spyOn(podCredential, 'handlePodGithubCredential').mockImplementation(async () => Response.json({ token: 'app', expires_at: '2030-01-01T00:00:00Z' }));
+    const server = startNexusHttpServer(serverFixture());
+    try {
+      const response = await fetch(`${server.url}/v1/pod/credential/github`, { method: 'POST', headers: { authorization: 'Bearer run-token' } });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ token: 'app', expires_at: '2030-01-01T00:00:00Z' });
+      expect(gate).toHaveBeenCalledTimes(1);
+      expect(handler).toHaveBeenCalledTimes(1);
+    } finally { server.stop(); handler.mockRestore(); gate.mockRestore(); }
+  });
+
   test.each([...WRITE_PATHS])('Authorization header 없이 %s 를 POST 하면 401', async (path) => {
     const server = startNexusHttpServer(serverFixture());
     try {

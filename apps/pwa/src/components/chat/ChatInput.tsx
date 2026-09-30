@@ -830,7 +830,9 @@ export function ChatInput({
           })}
         </ul>
       )}
-      <div className="relative flex items-end gap-2">
+      {/* 폰 폭(2026-09-30 실측 390px): 도구 묶음이 한 줄을 다 먹어 입력칸이 손가락 폭으로 줄었다 →
+          좁은 화면에선 도구를 윗줄 전체 폭으로, 입력칸·보내기를 아랫줄로. */}
+      <div className="relative flex flex-wrap items-end gap-2 sm:flex-nowrap">
         {/* Attach buttons — same Camera/File widgets as /term toolbar.
             onAttached bubbles each upload to ChatLayout's pending queue.
             R2 (BACKLOG-pwa-mobile-readiness §2.3 · 2026-05-09) — voice
@@ -842,7 +844,7 @@ export function ChatInput({
             plane (separate destination · review modal before commit).
             Component is named "Showroom*" for historical reasons but is
             surface-agnostic — uses useDaemon + Web Speech + intake REST. */}
-        <div className="flex shrink-0 items-center gap-0.5 pb-1">
+        <div className="flex shrink-0 basis-full items-center gap-0.5 pb-1 sm:basis-auto" data-elanous-composer-tools>
           <CameraAttachButton onAttached={onAttached ? (entry) => onAttached([entry]) : undefined} />
           <FileAttachButton onAttached={onAttached} />
           {/* R-OCR.2.1 (2026-05-09) — separate button from CameraAttach
@@ -868,7 +870,7 @@ export function ChatInput({
           rows={2}
           disabled={disabled}
           className={cn(
-            'min-h-[44px] max-h-[180px] flex-1 resize-y rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-ring',
+            'min-h-[44px] max-h-[180px] min-w-0 flex-1 resize-y rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-ring',
             isMeta && 'border-accent text-accent-foreground bg-accent/10',
             disabled && 'opacity-60',
           )}

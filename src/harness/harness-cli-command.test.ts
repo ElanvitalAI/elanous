@@ -1,8 +1,9 @@
 import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, spyOn, test } from 'bun:test';
+import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { debug } from '../debug/log.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { Command } from 'commander';
@@ -81,6 +82,7 @@ describe('harness CLI command', () => {
     mission?: Parameters<typeof installHarnessCliCommand>[1]['mission'],
     missionLoop?: Parameters<typeof installHarnessCliCommand>[1]['missionLoop'],
     draftSweep?: Parameters<typeof installHarnessCliCommand>[1]['draftSweep'],
+    podDispatchTask?: Parameters<typeof installHarnessCliCommand>[1]['podDispatchTask'],
   ) {
     const program = new Command().exitOverride();
     const harness = installHarnessCliCommand(program, {
@@ -93,6 +95,7 @@ describe('harness CLI command', () => {
       mission,
       missionLoop,
       draftSweep,
+      podDispatchTask,
     });
     return { program, harness };
   }
@@ -630,13 +633,129 @@ describe('harness CLI command', () => {
       process.exitCode = 0;
       await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
       expect(dispatch).toHaveBeenCalledTimes(1);
-      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: '/tmp/goal.md', podPool: 'pool-test:1' });
+      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: '/tmp/goal.md', podPool: 'pool-test:1' }, expect.objectContaining({ onOutput: expect.any(Function) }));
       expect(process.exitCode).toBe(0);
     } finally {
       dispatch.mockRestore();
       log.mockRestore();
       process.exitCode = previousExit;
     }
+  });
+
+  test('Pod ask/say record one host decision before dispatch and mark only a successful observation', async () => {
+    const goal = join(tmpdir(), `pod-observe-${crypto.randomUUID()}.md`);
+    writeFileSync(goal, '## Goal metadata\n- GoalId: 1234567890abcdef\n\nImplement the widget\n## TRACED PATHS\n- src/widget.ts\n');
+    const calls: unknown[] = [];
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation((args) => {
+      calls.push(['pod', args]);
+      return 0;
+    });
+    let fail = false;
+    const records: unknown[] = [];
+    const record = async (input: Parameters<NonNullable<Parameters<typeof installHarnessCliCommand>[1]['podDispatchTask']>>[0]) => {
+      records.push(input);
+      calls.push(['host', input]);
+      if (fail) throw new Error('observation failed');
+      return { cardId: 'card-host', mode: 'observe' as const, decisions: {} as never };
+    };
+    const { program } = install(async () => {}, async () => {}, undefined, undefined, undefined, undefined, undefined, record);
+    const exit = process.exitCode;
+    try {
+      process.exitCode = 0;
+      await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'pool-test:1', '--target', '/tmp/other']));
+      expect(process.exitCode).toBe(2);
+      process.exitCode = 0;
+      await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'write', 'goal', '--substrate', 'pod', '--dry-run']));
+      expect(records).toHaveLength(0);
+      expect(dispatch).toHaveBeenCalledTimes(0);
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ goalId: '1234567890abcdef', goalText: '## Goal metadata\n- GoalId: 1234567890abcdef\n\nImplement the widget\n## TRACED PATHS\n- src/widget.ts\n', targetPaths: ['src/widget.ts'], spec: { input: { file: goal } } });
+      expect(calls.map((entry) => (entry as string[])[0])).toEqual(['host', 'pod']);
+      expect(dispatch.mock.calls[0]?.[0]).toMatchObject({ entrance: 'cli-harness-ask', input: goal, podPool: 'pool-test:1', dispatchRecorded: true });
+      fail = true;
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'write', 'goal', '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
+      expect(records).toHaveLength(2);
+      expect(records[1]).toMatchObject({ goalId: expect.stringMatching(/^request-[0-9a-f]{32}$/), goalText: 'write goal', targetPaths: [], spec: { input: { text: 'write goal' } } });
+      expect(calls.map((entry) => (entry as string[])[0])).toEqual(['host', 'pod', 'host', 'pod']);
+      expect(dispatch.mock.calls[1]?.[0]).toEqual({ entrance: 'cli-harness-say', input: 'write goal', podPool: 'pool-test:1' });
+      expect(process.exitCode).toBe(0);
+    } finally {
+      dispatch.mockRestore();
+      process.exitCode = exit;
+      rmSync(goal, { force: true });
+    }
+  });
+
+  test('Pod ask with an unreadable goal still reaches Pod dispatch without falsely claiming a host recording', async () => {
+    const missing = join(tmpdir(), `pod-observe-missing-${crypto.randomUUID()}.md`);
+    const records: unknown[] = [];
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation(() => 0);
+    const exit = process.exitCode;
+    try {
+      process.exitCode = 0;
+      const { program } = install(async () => {}, undefined, undefined, undefined, undefined, undefined, undefined,
+        async (input) => { records.push(input); return { cardId: 'card', mode: 'observe', decisions: {} as never }; });
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', missing, '--substrate', 'pod', '--pod-pool', 'pool-test:1']);
+      expect(records).toEqual([]);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch.mock.calls[0]?.[0]).toEqual({ entrance: 'cli-harness-ask', input: missing, podPool: 'pool-test:1' });
+      expect(process.exitCode).toBe(0);
+    } finally {
+      dispatch.mockRestore();
+      process.exitCode = exit;
+    }
+  });
+
+  test('pod ask distinguishes a failed child result from a launch failure', async () => {
+    const previousExit = process.exitCode;
+    const record = async () => ({ cardId: 'card', mode: 'observe' as const, decisions: {} as never });
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation((_input, deps) => {
+      deps?.onOutput?.(JSON.stringify([{ status: 'failed', error: { code: 'pod-job-failed', message: 'Job si-x failed (container=Error/1) — childStage=error · childError=draft PR 생성 실패\nself-implement PR gh 실패: GraphQL: API rate limit already exceeded' } }]) + '\n');
+      return 1;
+    });
+    try {
+      const { program } = install(async () => {}, undefined, undefined, undefined, undefined, undefined, undefined, record);
+      process.exitCode = 0;
+      const child = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(child).toEqual(['Pod 안 자식이 실패했다 — draft PR 생성 실패']);
+      expect(dispatch.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ onOutput: expect.any(Function) }));
+      expect(process.exitCode).toBe(1);
+      dispatch.mockImplementation((_input, deps) => {
+        deps?.onOutput?.('[self-dev] 완료 — 0/1 done\n  ❌ failed · x — pod-job-failed: Job si-x failed (container=Error/1) — childStage=error · childError=draft PR 생성 실패\n');
+        return 1;
+      });
+      process.exitCode = 0;
+      const summary = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(summary).toEqual(['Pod 안 자식이 실패했다 — draft PR 생성 실패']);
+      dispatch.mockImplementation((_input, deps) => {
+        deps?.onOutput?.(JSON.stringify([{ status: 'failed', error: { code: 'pod-oom-killed', message: 'Job si-x failed (OOMKilled/137)' } }]) + '\n');
+        return 1;
+      });
+      process.exitCode = 0;
+      const oom = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(oom).toEqual(['Pod 실행이 실패했다 — Job si-x failed (OOMKilled/137)']);
+      dispatch.mockImplementation((_input, deps) => {
+        deps?.onOutput?.(JSON.stringify([{ status: 'failed', error: { code: 'pod-error', message: 'Pod 풀 준비 실패' } }]) + '\n');
+        return 1;
+      });
+      process.exitCode = 0;
+      const setup = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(setup).toEqual(['Pod 실행이 실패했다 — Pod 풀 준비 실패']);
+      dispatch.mockImplementation((_input, deps) => {
+        deps?.onOutput?.(JSON.stringify([{ status: 'failed', error: { code: 'pod-job-failed', message: 'Job si-x failed (container=Error/1) — childError=no-result-line' } }]) + '\n');
+        return 1;
+      });
+      process.exitCode = 0;
+      const missing = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(missing).toEqual(['Pod 실행이 실패했다 — Job si-x failed (container=Error/1) — childError=no-result-line']);
+      dispatch.mockImplementation(() => 1);
+      process.exitCode = 0;
+      const launch = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(launch).toEqual(['Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라']);
+      expect(process.exitCode).toBe(1);
+    } finally { dispatch.mockRestore(); process.exitCode = previousExit; }
   });
 
   test('ask and say expose and forward opaque --correlation without exposing it to plan or mission', async () => {
@@ -897,8 +1016,25 @@ describe('harness CLI command', () => {
       const { program } = install(async (...args) => { calls.push(args); });
       const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goalPath, '--dry-run']));
       expect(calls).toEqual([]);
-      expect(lines).toContain('[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
+      expect(lines).toContain('[dry-run] 전제 검사: ask 마커·릴리스 노트 린트만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
       expect(lines).toContain('[dry-run] ⚠️ ask 마커 — ❌ 불변식 — 마커가 «없다» (제목형 "## 불변식" 은 마커가 아니다 ⇒ "불변식: <문장>" 줄로 쓴다)');
+    } finally {
+      rmSync(goalPath, { force: true });
+    }
+  });
+
+  test('ask dry-run prints missing release-note fields as warnings without dispatching', async () => {
+    const goalPath = join(tmpdir(), `harness-release-note-${crypto.randomUUID()}.md`);
+    writeFileSync(goalPath, '## 릴리스 노트\n- 한 줄: Fix startup\n- 종류: fix\n');
+    try {
+      const calls: unknown[] = [];
+      const { program } = install(async (...args) => { calls.push(args); });
+      const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goalPath, '--dry-run']));
+      expect(calls).toEqual([]);
+      expect(lines.filter((line) => line.startsWith('[dry-run] ⚠️ 릴리스 노트 —'))).toEqual([
+        expect.stringContaining('문서 invalid or missing'),
+        expect.stringContaining('대상 invalid or missing'),
+      ]);
     } finally {
       rmSync(goalPath, { force: true });
     }
@@ -913,7 +1049,9 @@ describe('harness CLI command', () => {
 
     expect(calls).toEqual([]);
     expect(lines.some((line) => line.startsWith('[dry-run] ⚠️ ask 마커 — 골 문서 판독 실패: ENOENT: no such file or directory, open '))).toBe(true);
-    expect(lines).toContain('[dry-run] 골 종류·템플릿: 읽지 못함 · 미상');
+      expect(lines).toContain('[dry-run] 골 종류·템플릿: 읽지 못함 · 미상');
+      expect(lines.some((line) => line.startsWith('[dry-run] ⚠️ 릴리스 노트 —'))).toBe(false);
+
   });
 
   test('ask dry-run reports clean markers from a real inspectable goal and inspection failures distinctly', async () => {
@@ -952,7 +1090,7 @@ describe('harness CLI command', () => {
       const { program } = install(async (...args) => { calls.push(args); });
       const lines = await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goalPath, '--dry-run']));
       expect(calls).toEqual([]);
-      expect(lines).toContain('[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
+      expect(lines).toContain('[dry-run] 전제 검사: ask 마커·릴리스 노트 린트만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
       expect(lines.some((line) => line.includes('안 눌릴 신호'))).toBe(true);
       expect(lines.some((line) => line.startsWith('[dry-run] ⚠️ ask 마커 — ') && line.includes('안 눌릴 신호'))).toBe(true);
     } finally {
@@ -979,7 +1117,7 @@ describe('harness CLI command', () => {
       expect(lines).toContain('[dry-run] 입력: ' + goalPath);
       expect(lines).toContain('[dry-run] 입구: cli-harness-ask');
       expect(lines).toContain('[dry-run] 시작 예정: 워크트리 · 브랜치 · 자식 · 파이프라인');
-      expect(lines).toContain('[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
+      expect(lines).toContain('[dry-run] 전제 검사: ask 마커·릴리스 노트 린트만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
       expect(lines).toContain('[dry-run] ⚠️ ask 마커 — ⚠️ ask 마커 — 안 눌릴 신호 검사 실패: first line');
       expect(lines.some((line) => line.includes('second line'))).toBe(false);
       expect(lines.some((line) => line.includes('✅ ask 마커 — 경고 없음'))).toBe(false);
@@ -1311,7 +1449,7 @@ describe('harness CLI command', () => {
         `[dry-run] 입력: ${goalPath}`,
         '[dry-run] 입구: cli-harness-ask',
         '[dry-run] 시작 예정: 워크트리 · 브랜치 · 자식 · 파이프라인',
-        '[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음',
+        '[dry-run] 전제 검사: ask 마커·릴리스 노트 린트만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음',
         '[dry-run] ✅ ask 마커 — 경고 없음',
         '[dry-run] 골 종류·템플릿: implement · self-implement',
       ]);
@@ -1322,7 +1460,9 @@ describe('harness CLI command', () => {
   });
 
   test('ask and say dry-run preview distinct resolved target statuses without dispatching', async () => {
-    const inHome = mkdtempSync(join(homedir(), 'harness-target-dry-run-'));
+    const home = resolveHarnessTarget(tmpdir()).canonicalHome;
+    if (!home) throw new Error('expected resolved target home');
+    const inHome = mkdtempSync(join(home, 'harness-target-dry-run-'));
     const received: unknown[] = [];
     const { program } = install(
       async (...args) => { received.push(['ask', args]); },
@@ -1350,7 +1490,7 @@ describe('harness CLI command', () => {
     } finally {
       rmSync(inHome, { force: true, recursive: true });
     }
-  });
+  }, 60_000); // spawns the CLI four times — 17s alone on mbp (bun 1.4.2); the 5s default measured the machine, not the code
 
   test('ask dry-run gives --goal-type precedence over declared and default goal types', async () => {
     const root = mkdtempSync(join(tmpdir(), 'harness-dry-run-'));

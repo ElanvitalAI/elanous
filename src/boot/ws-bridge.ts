@@ -26,6 +26,7 @@ import type {
   PwaVoiceSession,
 } from '../voice/channel-adapters/pwa-voice-adapter.js';
 import { PWA_VOICE_FRAME_KIND } from '../voice/channel-adapters/pwa-voice-adapter.js';
+import { isSameOriginRequest } from './check-same-origin.js';
 import {
   buildDevProxyWsUrl,
   closeDevProxyUpstream,
@@ -47,6 +48,8 @@ export type WsLike = {
 
 export type BunServerLike = {
   upgrade: (req: Request, opts?: { data?: unknown; headers?: HeadersInit }) => boolean;
+  /** Bun's transport peer — used only for the same-origin exemption (HTTP 과 같은 규칙). */
+  requestIP?: (req: Request) => { address: string } | null;
 };
 
 export type WsHandlers = {
@@ -246,6 +249,14 @@ export function createWsBridge(opts: WsBridgeOpts): WsBridge {
             });
           }
           authed = true;
+        } else if (isSameOriginRequest(req, server.requestIP?.(req)?.address)) {
+          // ⭐ HTTP 의 same-origin 면제(`meta-api.ts` decideAuth)와 «같은» 규칙 — 루프백 직결 ⊕ 프록시 표지 없음 ⊕
+          //   Sec-Fetch-Site/Origin 이 같은 출처. 이 데몬이 내준 PWA 페이지가 토큰 없이 연 소켓이다.
+          // 🩸 2026-09-30 0.2.5 회귀: #21937 이 토큰을 «늘» 만들게 되면서 WS 검증기가 늘 켜졌고, 토큰을
+          //   저장하지 않은 PWA(새 설치 · 격리 넥서스)의 ACP 가 첫 `initialize` 에서 1008 auth_failed 로 닫혔다
+          //   — HTTP 는 이 면제로 살아 있어 «목록은 뜨는데 채팅·터미널만 죽는» 모양이 됐다.
+          authed = true;
+          trace('acp.ws.same-origin', { path: url.pathname });
         }
       }
       const acpState: AcpPerSocketState = {

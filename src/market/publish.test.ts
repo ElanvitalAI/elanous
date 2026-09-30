@@ -4,7 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { publishMarket } from './publish';
 import { generateIndexKeyPair, verifyIndex } from './signed-index';
 
@@ -84,6 +84,132 @@ describe('publishMarket', () => {
     writeFileSync(join(root, 'plugins', 'free-plugin', 'payload'), 'v2');
     expect(() => publishMarket(input)).toThrow('version-immutable');
     expect(JSON.parse(readFileSync(join(root, 'out', 'marketplace.json'), 'utf8')).sequence).toBe(2);
+  }));
+
+  test('reuses the recorded archive when only gzip bytes differ and still rejects changed content', () => fixture(root => {
+    plugin(root, 'free-plugin');
+    const outDir = join(root, 'out');
+    const input = { pluginsDir: join(root, 'plugins'), outDir,
+      market: { name: 'elanous', displayName: 'Elanous' }, key: generateIndexKeyPair() };
+    const first = publishMarket(input);
+    const originalSha = first.published[0]!.sha256;
+    const archiveDir = join(outDir, 'free-plugin', '1.0.0');
+    const originalPath = join(archiveDir, `${originalSha}.tgz`);
+    const tar = gunzipSync(readFileSync(originalPath));
+    const oldArchive = gzipSync(tar, { level: 1 });
+    const oldSha = createHash('sha256').update(oldArchive).digest('hex');
+    expect(oldSha).not.toBe(originalSha);
+    writeFileSync(join(archiveDir, `${oldSha}.tgz`), oldArchive);
+    rmSync(originalPath);
+    const historyPath = join(outDir, '.publication-history.json');
+    const history = JSON.parse(readFileSync(historyPath, 'utf8'));
+    history[0].sha256 = oldSha;
+    writeFileSync(historyPath, JSON.stringify(history));
+    const indexPath = join(outDir, 'marketplace.json');
+    const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+    index.plugins[0].artifact = { sha256: oldSha, bytes: oldArchive.length,
+      key: `free-plugin/1.0.0/${oldSha}.tgz` };
+    writeFileSync(indexPath, JSON.stringify(index));
+
+    const second = publishMarket(input);
+    expect(second).toMatchObject({ ok: true, sequence: 2,
+      published: [{ name: 'free-plugin', version: '1.0.0', sha256: oldSha }] });
+    const reused = JSON.parse(readFileSync(indexPath, 'utf8')).plugins[0].artifact;
+    expect(reused).toEqual(index.plugins[0].artifact);
+    expect(createHash('sha256').update(readFileSync(join(outDir, reused.key))).digest('hex')).toBe(oldSha);
+    expect(readFileSync(join(outDir, reused.key))).toEqual(oldArchive);
+    expect(readdirSync(archiveDir)).toEqual([`${oldSha}.tgz`]);
+    expect(JSON.parse(readFileSync(historyPath, 'utf8'))).toEqual(history);
+    expect(readFileSync(join(outDir, 'plugins', 'free-plugin', 'payload'), 'utf8')).toBe('v1');
+    expect(verifyIndex({ marketplaceBytes: readFileSync(indexPath),
+      signatureText: readFileSync(join(outDir, 'index.sig'), 'utf8'),
+      trustedKeys: [{ keyId: input.key.keyId, publicKey: input.key.publicKey }] }).ok).toBe(true);
+
+    rmSync(join(outDir, reused.key));
+    expect(() => publishMarket(input)).toThrow('version-immutable: free-plugin@1.0.0');
+    writeFileSync(join(outDir, reused.key), oldArchive);
+    writeFileSync(join(root, 'plugins', 'free-plugin', 'payload'), 'v2');
+    expect(() => publishMarket(input)).toThrow('version-immutable: free-plugin@1.0.0');
+    expect(JSON.parse(readFileSync(indexPath, 'utf8')).sequence).toBe(2);
+
+    writeFileSync(join(root, 'plugins', 'free-plugin', 'payload'), 'v1');
+    writeFileSync(join(outDir, reused.key), Buffer.from('not a gzip archive'));
+    expect(() => publishMarket(input)).toThrow('version-immutable: free-plugin@1.0.0');
+  }));
+
+  test('normalizes fields connectors only in the signed index, retaining the packaged manifest and env', () => fixture(root => {
+    plugin(root, 'free-plugin');
+    const manifestPath = join(root, 'plugins', 'free-plugin', 'plugin.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    const connectors = [{ id: 'credentials', fields: [
+      { name: 'serviceKey', secret: true },
+      { name: 'API_KEY', label: 'Custom key', secret: true, env: 'SERVICE_API_KEY' },
+    ] }];
+    manifest.extensions['ai.elanous'].connectors = connectors;
+    const original = JSON.stringify(manifest);
+    writeFileSync(manifestPath, original);
+    const pair = generateIndexKeyPair();
+    const outDir = join(root, 'out');
+    const result = publishMarket({ pluginsDir: join(root, 'plugins'), outDir,
+      market: { name: 'elanous', displayName: 'Elanous' }, key: pair });
+    expect(result.published.map(item => item.name)).toEqual(['free-plugin']);
+    const bytes = readFileSync(join(outDir, 'marketplace.json'));
+    const entry = JSON.parse(bytes.toString()).plugins[0];
+    expect(entry['ai.elanous'].connectors).toEqual([{ id: 'credentials', kind: 'credentials', userConfig: [
+      { key: 'serviceKey', label: 'serviceKey', secret: true },
+      { key: 'API_KEY', label: 'Custom key', secret: true, env: 'SERVICE_API_KEY' },
+    ] }]);
+    expect(verifyIndex({ marketplaceBytes: bytes, signatureText: readFileSync(join(outDir, 'index.sig'), 'utf8'),
+      trustedKeys: [{ keyId: pair.keyId, publicKey: pair.publicKey }] }).ok).toBe(true);
+    expect(readFileSync(manifestPath, 'utf8')).toBe(original);
+    expect(readFileSync(join(outDir, 'plugins', 'free-plugin', 'plugin.json'), 'utf8')).toBe(original);
+    const tar = gunzipSync(readFileSync(join(outDir, entry.artifact.key)));
+    const size = parseInt(tar.subarray(124, 136).toString().replace(/\0.*$/, '').trim(), 8);
+    const firstName = tar.subarray(0, 100).toString().replace(/\0.*$/, '');
+    const manifestOffset = firstName === 'plugin.json' ? 0 : 512 + Math.ceil(size / 512) * 512;
+    expect(tar.subarray(manifestOffset, manifestOffset + 100).toString().replace(/\0.*$/, '')).toBe('plugin.json');
+    const manifestSize = parseInt(tar.subarray(manifestOffset + 124, manifestOffset + 136).toString().replace(/\0.*$/, '').trim(), 8);
+    expect(tar.subarray(manifestOffset + 512, manifestOffset + 512 + manifestSize).toString()).toBe(original);
+  }));
+
+  test('skips malformed connectors without publishing their archive', () => fixture(root => {
+    plugin(root, 'invalid-plugin');
+    const manifestPath = join(root, 'plugins', 'invalid-plugin', 'plugin.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    manifest.extensions['ai.elanous'].connectors = [{ fields: [{ name: 'key', secret: true }] }];
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    const outDir = join(root, 'out');
+    const result = publishMarket({ pluginsDir: join(root, 'plugins'), outDir,
+      market: { name: 'elanous', displayName: 'Elanous' }, key: generateIndexKeyPair() });
+    expect(result.skipped).toContainEqual({ dir: 'invalid-plugin', reason: 'invalid-connectors' });
+    expect(result.published).toEqual([]);
+    expect(JSON.parse(readFileSync(join(outDir, 'marketplace.json'), 'utf8')).plugins).toEqual([]);
+    expect(existsSync(join(outDir, 'plugins', 'invalid-plugin'))).toBe(false);
+  }));
+
+  test('skips empty and whitespace-only credential keys in either connector shape', () => fixture(root => {
+    plugin(root, 'free-plugin');
+    for (const [name, connectors] of [
+      ['empty-fields', [{ id: 'credentials', fields: [{ name: '', secret: true }] }]],
+      ['blank-fields', [{ id: 'credentials', fields: [{ name: '   ', secret: true }] }]],
+      ['empty-user-config', [{ id: 'credentials', kind: 'api-key', userConfig: [{ key: '', label: 'Key', secret: true }] }]],
+      ['blank-user-config', [{ id: 'credentials', kind: 'api-key', userConfig: [{ key: ' \t ', label: 'Key', secret: true }] }]],
+    ] as const) {
+      plugin(root, name);
+      const path = join(root, 'plugins', name, 'plugin.json');
+      const manifest = JSON.parse(readFileSync(path, 'utf8'));
+      manifest.extensions['ai.elanous'].connectors = connectors;
+      writeFileSync(path, JSON.stringify(manifest));
+    }
+    const outDir = join(root, 'out');
+    const result = publishMarket({ pluginsDir: join(root, 'plugins'), outDir,
+      market: { name: 'elanous', displayName: 'Elanous' }, key: generateIndexKeyPair() });
+    expect(result.published.map(item => item.name)).toEqual(['free-plugin']);
+    expect(result.skipped).toEqual(['blank-fields', 'blank-user-config', 'empty-fields', 'empty-user-config']
+      .map(dir => ({ dir, reason: 'invalid-connectors' })));
+    expect(JSON.parse(readFileSync(join(outDir, 'marketplace.json'), 'utf8')).plugins.map((item: { name: string }) => item.name))
+      .toEqual(['free-plugin']);
+    for (const { dir } of result.skipped) expect(existsSync(join(outDir, 'plugins', dir))).toBe(false);
   }));
 
   test('refuses a changed name@version after an intervening index excluded the plugin', () => fixture(root => {
@@ -234,14 +360,24 @@ describe('publishMarket', () => {
     const result = publishMarket({ pluginsDir: join(repo, 'packs'), bundleRoot: repo, outDir: join(root, 'out'),
       market: { name: 'elanous', displayName: 'Elanous' }, key: pair });
     const byName = new Map(result.published.map(item => [item.name, item]));
-    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-hwp', 'elanous-media', 'video-broll']);
+    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-hwp', 'elanous-media', 'video-broll', 'video-explainer']);
     expect(byName.get('elanous-hwp')?.bundled).toEqual([]);
+    expect(byName.get('elanous-basics')?.version).toBe('0.1.1');
+    expect(JSON.parse(readFileSync(join(repo, 'packs', 'elanous-basics', '.codex-plugin', 'plugin.json'), 'utf8')).version).toBe('0.1.1');
     expect(byName.get('elanous-basics')?.bundled).toEqual(['omni-crawl', 'omni-digest', 'project-onboarding', 'grill-me', 'photo-intake-ocr']);
     expect(byName.get('elanous-media')?.bundled).toEqual(['video-builder', 'motion-broll']);
     expect(byName.get('video-broll')?.bundled).toEqual(['motion-broll', 'graphs/broll-line.yaml']);
+    expect(byName.get('video-explainer')?.bundled).toEqual(['explainer-video', 'graphs/explainer-line.yaml']);
     expect(result.skipped).toContainEqual({ dir: 'elanous-markets', reason: 'paid-not-allowed-in-M0' });
     const index = JSON.parse(readFileSync(join(root, 'out', 'marketplace.json'), 'utf8'));
     const entry = (name: string) => index.plugins.find((plugin: { name: string }) => plugin.name === name);
+    expect(entry('elanous-basics').version).toBe('0.1.1');
+    expect(entry('elanous-basics')['ai.elanous'].capabilities).toContain('secret:firecrawl');
+    expect(entry('elanous-basics')['ai.elanous'].connectors).toEqual([
+      { id: 'xai', kind: 'api-key', userConfig: [{ key: 'XAI_API_KEY', label: 'xAI API key', secret: true, env: 'XAI_API_KEY' }] },
+      { id: 'upstage', kind: 'api-key', userConfig: [{ key: 'UPSTAGE_API_KEY', label: 'Upstage API key', secret: true, env: 'UPSTAGE_API_KEY' }] },
+      { id: 'firecrawl', kind: 'api-key', userConfig: [{ key: 'FIRECRAWL_API_KEY', label: 'Firecrawl API key (optional)', secret: true, env: 'FIRECRAWL_API_KEY' }] },
+    ]);
     const broll = archiveNames(readFileSync(join(root, 'out', entry('video-broll').artifact.key)));
     expect(broll).toContain('graphs/broll-line.yaml');
     expect(broll).toContain('skills/motion-broll/SKILL.md');

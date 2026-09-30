@@ -14,6 +14,7 @@ import { openSurfaceEventsDb, recordEvent } from './surface-events.js';
 import { latestUserIntentTs } from '../user-intent/index.js';
 import { getUserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
+import { kindRouteTarget } from './telegram-kind-route.js';
 import { debug } from '../debug/log.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 // ★ origin 되돌림(대표 2026-07-12) — 미션 알림을 발신 채널(메인 Q&A 봇)로 되돌린다. type-only
@@ -295,7 +296,7 @@ export function deliver(text: string, kind = 'alert'): 'daemon' | 'direct' | fal
     logDaemonPath(classification, kind, extra);
   }
   // 2) fallback: 텔레그램 sendMessage 직접(3900자 분할) — 데몬 미경유라 클라가 원장 기록.
-  return sendTelegramDirect(text) ? 'direct' : false;
+  return sendTelegramDirect(text, kind) ? 'direct' : false;
 }
 
 /** 텔레그램 raw 발송(토큰·chatId 명시) — spill + 3900자 분할(줄 경계). thread 지원. */
@@ -320,7 +321,12 @@ function sendTelegramRaw(token: string, chatId: string | number, text: string, t
 }
 
 /** 텔레그램 직접 발송(TELEGRAM_BOT_TOKEN/CHAT_ID — env 우선, 없으면 CONATUS/.env). report 폴백. */
-function sendTelegramDirect(text: string): boolean {
+function sendTelegramDirect(text: string, kind?: string): boolean {
+  // A purpose kind with a channel role (intake · ops-*) goes to that channel even when the daemon is down.
+  try {
+    const target = kindRouteTarget(getUserConfig(), kind);
+    if (target) return sendTelegramRaw(target.botToken, String(target.chatId), text);
+  } catch { /* fall through to the legacy direct path */ }
   let tok = process.env.TELEGRAM_BOT_TOKEN || '';
   let chat = process.env.TELEGRAM_CHAT_ID || '';
   if (!tok || !chat) {

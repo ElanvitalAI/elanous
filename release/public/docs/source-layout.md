@@ -1,6 +1,6 @@
 # Source layout
 
-`src/` is ~4,400 files. The map below is the entry layer only — it is not
+`src/` is several thousand files (count them with `git ls-files src | wc -l`). The map below is the entry layer only — it is not
 the whole tree, and anything not listed here lives under a subdirectory.
 
 ```

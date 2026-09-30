@@ -2,7 +2,7 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { dispatchHarnessOnPod, podGoalText, podOrchestrateArgs } from './harness-pod-dispatch.js';
 
@@ -67,6 +67,46 @@ describe('harness say/ask --substrate pod', () => {
       expect(refused).toBe(2);
       expect(seen).toHaveLength(1);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('real spawned orchestrator stdout reaches the CLI observer without changing its exit status', async () => {
+    const output: string[] = [];
+    const stdout = spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const status = await dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'x' }, {
+        spawnChild: ((_cmd, _args, _opts) => spawn(process.execPath, ['-e', 'process.stdout.write("[result] pod-job-failed\\n"); process.exit(1)'], { stdio: ['ignore', 'pipe', 'ignore'] })) as typeof spawn,
+        onOutput: (chunk) => output.push(chunk),
+      });
+      expect(status).toBe(1);
+      expect(output.join('')).toBe('[result] pod-job-failed\n');
+      expect(stdout).toHaveBeenCalled();
+    } finally { stdout.mockRestore(); }
+  });
+
+  test('host dispatch marker travels to the orchestrator without changing Pod arguments', () => {
+    let seen: NodeJS.ProcessEnv | undefined;
+    const input = { entrance: 'cli-harness-say' as const, input: 'fix it', dispatchRecorded: true };
+    const run = (_cmd: string, _args: readonly string[], env: NodeJS.ProcessEnv) => { seen = env; return 0; };
+    expect(dispatchHarnessOnPod(input, { run })).toBe(0);
+    expect(seen?.ELANOUS_DISPATCH_RECORDED).toBe('1');
+    expect(podOrchestrateArgs(input, 'fix it')).toEqual(podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'fix it' }, 'fix it'));
+  });
+
+  test('unrecorded dispatch never inherits a stale host marker', () => {
+    const previous = process.env.ELANOUS_DISPATCH_RECORDED;
+    process.env.ELANOUS_DISPATCH_RECORDED = '1';
+    try {
+      let observed: string | undefined;
+      const input = { entrance: 'cli-harness-say' as const, input: 'fix it' };
+      expect(dispatchHarnessOnPod(input, { run: (_cmd, _args, env) => {
+        observed = env.ELANOUS_DISPATCH_RECORDED;
+        return 0;
+      } })).toBe(0);
+      expect(observed).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_DISPATCH_RECORDED;
+      else process.env.ELANOUS_DISPATCH_RECORDED = previous;
+    }
   });
 
   test('the exit status of the pod run is the harness exit status', () => {

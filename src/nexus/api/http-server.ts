@@ -17,6 +17,8 @@
 
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
+import { compareTokenConstTime } from '../../acp/transport/auth.js';
+import { ensureAuthToken } from '../../auth/acp-token.js';
 import type { NexusState } from '../state/state.js';
 import { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
 export { DEFAULT_NEXUS_HTTP_PORT } from '../default-port.js';
@@ -195,6 +197,7 @@ import { handleMcpResourceGet, MCP_RESOURCE_ROUTE_PATH } from './mcp-resource-ro
 // ⛔ 라우트 상수를 «디스패처»가 안 쓰고 문자열로 베끼고 있었다(16차 실측) — 잎에서 읽는다.
 import { APPROVALS_MERGES_PATH, DESIGN_DIRECTION_PATH, DESIGN_PREVIEW_PATH_PREFIX, DESIGN_PREVIEWS_PATH, DESIGN_SYSTEM_PATH, IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
 import { handleMergeApprovals } from './merge-approvals.js';
+import { GRAPH_APPROVALS_PATH, handleGraphApprovals } from './graph-approvals.js';
 import { handleLiveDetail, LIVE_DETAIL_PATH } from './live-detail.js';
 import { handleLiveShipped, LIVE_SHIPPED_PATH } from './live-shipped.js';
 import { handleMcpWidgetCall, MCP_WIDGET_CALL_ROUTE_PATH, persistWidgetTurnToSessionStore } from './mcp-widget-call-route.js';
@@ -300,6 +303,7 @@ import {
   handleVoiceCost,
   handleVoiceTranscribe,
   checkAuth,
+  bearerCredential,
   registerAuthPeerAddress,
   type MetaApiOpts,
 } from './meta-api.js';
@@ -332,7 +336,10 @@ import { handleTriggersSnapshot } from './triggers.js';
 import { handleWorkflowTemplatesList } from './workflow-templates.js';
 import { handleGraphsGet, handleGraphsMutation } from './graphs-api.js';
 import { handleGraphKindsGet, handleGraphsValidatePost } from './graph-kinds.js';
-import { handlePluginsIndexGet, handlePluginsGet } from './plugins-market.js';
+import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nodes.js';
+import { elanousStateRoot } from '../../autopilot/state-paths.js';
+import { handlePluginsIndexGet, handlePluginsGet, handlePluginsMarketRefresh, handlePluginsInstall, handlePluginsRemove } from './plugins-market.js';
+import { handlePluginsCredentialsGet, handlePluginsCredentialsPut } from './plugins-credentials-api.js';
 import {
   handleWorkflowsList,
 } from './workflows.js';
@@ -369,7 +376,7 @@ import {
   parseAgentCliSessionPath,
 } from './agent-cli.js';
 import { handleSessionTurnControl, SESSION_TURN_CONTROL_PATH } from '../../session/session-turn-control.js';
-import { authenticatePodCredential, handlePodGrokCredential, POD_CREDENTIAL_GROK_PATH } from './pod-credential-api.js';
+import { authenticatePodCredential, handlePodGrokCredential, handlePodGithubCredential, POD_CREDENTIAL_GROK_PATH, POD_CREDENTIAL_GITHUB_PATH } from './pod-credential-api.js';
 import { handleOutboundReport } from './outbound-report.js';
 import { handleSelfEvent } from './self-event.js';
 /** 매매 «실행»은 애드온이다(대표 09-20 결정 ③ · 별도 상용 저장소 · release/trading-export.yaml) — 공개 코어엔 없다.
@@ -436,6 +443,8 @@ export function probeNexusHttpPort(
 export type NexusWsBridgeInit = Omit<WsBridgeOpts, 'hostname' | 'port'>;
 
 export interface NexusHttpServerOpts {
+  /** Optional installer state root for isolated API consumers and tests. */
+  pluginStateRoot?: string;
   state: NexusState;
   registry: TabRegistry;
   eventBus: NexusEventBus;
@@ -822,19 +831,27 @@ export async function routeRequest(
   // Per-route checkAuth calls below stay in place.
   // OPTIONS is a CORS preflight and cannot carry Authorization; existing
   // handlers answer it themselves, so the gate does not swallow it.
+  // A runtime-less tab mutation still needs authentication before the
+  // dispatcher can return its 503. Do not enable this fallback for other paths.
+  const runtimeLessTabMutation = !opts.metaApi && method !== 'GET' && method !== 'OPTIONS'
+    && (pathname === '/v1/nexus/tabs' || pathname.startsWith('/v1/nexus/tabs/'));
   if (
     method !== 'OPTIONS'
     && pathname.startsWith('/v1/')
     && !isPublicRoute(method, pathname, { setupMode: false })
   ) {
-    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) {
+    const fallbackToken = runtimeLessTabMutation ? ensureAuthToken().token : undefined;
+    const offered = req.headers.get('authorization');
+    const fallbackAuthorized = fallbackToken !== undefined && offered?.startsWith('Bearer ') === true
+      && compareTokenConstTime(offered.slice('Bearer '.length).trim(), fallbackToken);
+    if (!(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized)) {
       const name = method === 'POST' && pathname === '/v1/tasks' && opts.metaApi
         ? matchIngestAuthorization(req)?.name
         : undefined;
       if (name === undefined) {
         debug.log('nexus.auth', 'default-deny', { method, pathname });
         // MCP 클라이언트(Claude Code)에게는 «할 일»을 말한다 — 안 그러면 OAuth 로 가서 /register 405 를 만난다.
-        if (pathname === '/v1/mcp') return mcpUnauthorizedResponse();
+        if (pathname === '/v1/mcp') return mcpUnauthorizedResponse(new URL(req.url).origin);
         return jsonResponse({ error: 'unauthorized' }, 401);
       }
       debug.log('nexus.auth', 'ingest-token', { name, pathname });
@@ -843,7 +860,7 @@ export async function routeRequest(
   // OAuth 동적 클라이언트 등록(RFC 7591) — Elanous 는 OAuth 를 쓰지 않는다. 405 대신 «이렇게 등록하라»를 돌려준다.
   if (method === 'POST' && pathname === '/register') {
     debug.log('nexus.auth', 'oauth-register-rejected', { pathname });
-    return oauthRegistrationRejected();
+    return oauthRegistrationRejected(new URL(req.url).origin);
   }
 
   // FU2 (2026-05-12) — root-level browser conveniences. The PWA serves
@@ -899,6 +916,12 @@ export async function routeRequest(
     });
   }
 
+  if (pathname === GRAPH_APPROVALS_PATH || pathname.startsWith(`${GRAPH_APPROVALS_PATH}/`)) {
+    return handleGraphApprovals(req, {
+      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      authReason: (request) => (opts.metaApi ? bearerCredential(request, opts.metaApi) : undefined),
+    });
+  }
   if (pathname === APPROVALS_MERGES_PATH || pathname.startsWith(`${APPROVALS_MERGES_PATH}/`)) {
     return handleMergeApprovals(req, {
       authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
@@ -1189,6 +1212,25 @@ export async function routeRequest(
   // Templates POST handled here too (PR κ).
   // Config / secrets PUT/POST/DELETE here too (PR μ).
   if (method !== 'GET') {
+    if (method === 'POST' && pathname === '/v1/plugins/install') {
+      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handlePluginsInstall(req, opts.metaApi, opts.pluginStateRoot);
+    }
+    const marketRefresh = /^\/v1\/plugins\/markets\/([^/]+)\/refresh$/.exec(pathname);
+    if (method === 'POST' && marketRefresh) {
+      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handlePluginsMarketRefresh(req, marketRefresh[1]!, opts.metaApi, { root: opts.pluginStateRoot });
+    }
+    const pluginCredentials = /^\/v1\/plugins\/([^/]+)\/credentials$/.exec(pathname);
+    if (method === 'PUT' && pluginCredentials) {
+      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handlePluginsCredentialsPut(req, pluginCredentials[1]!, opts.metaApi, opts.pluginStateRoot, opts.reloadMcpClients);
+    }
+    const pluginRemove = /^\/v1\/plugins\/([^/]+)$/.exec(pathname);
+    if (method === 'DELETE' && pluginRemove) {
+      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handlePluginsRemove(req, pluginRemove[1]!, opts.metaApi, opts.pluginStateRoot);
+    }
     if ((method === 'PUT' || method === 'POST') && pathname.startsWith('/v1/graphs/')) {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
       if (!checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
@@ -1214,6 +1256,11 @@ export async function routeRequest(
       const gate = await authenticatePodCredential(req);
       if (!gate.ok) return gate.response;
       return handlePodGrokCredential(req);
+    }
+    if (pathname === POD_CREDENTIAL_GITHUB_PATH && method === 'POST') {
+      const gate = await authenticatePodCredential(req, {}, 'gh-credential');
+      if (!gate.ok) return gate.response;
+      return handlePodGithubCredential(req);
     }
     if (pathname === '/v1/harness/ask' && method === 'POST') {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
@@ -2431,12 +2478,19 @@ export async function routeRequest(
   // surface (`/v1/workflows` · `~/.elanous/workflows-runs/`) covers the same
   // user need.
 
+  const pluginCredentialsGet = /^\/v1\/plugins\/([^/]+)\/credentials$/.exec(pathname);
+  if (method === 'GET' && pluginCredentialsGet) {
+    if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handlePluginsCredentialsGet(req, pluginCredentialsGet[1]!, opts.metaApi, opts.pluginStateRoot);
+  }
   if (method === 'GET' && (pathname === '/v1/plugins/index' || pathname === '/v1/plugins')) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
-    return pathname === '/v1/plugins/index' ? handlePluginsIndexGet(req, opts.metaApi) : handlePluginsGet(req, opts.metaApi);
+    return pathname === '/v1/plugins/index' ? handlePluginsIndexGet(req, opts.metaApi, opts.pluginStateRoot) : handlePluginsGet(req, opts.metaApi, opts.pluginStateRoot);
   }
   if (method === 'GET' && pathname === '/v1/graph/kinds') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    try { syncInstalledPluginNodes(opts.pluginStateRoot ?? elanousStateRoot()); }
+    catch (error) { debug.log('graph.kinds', 'installed-sync-failed', { reason: String(error) }); }
     return handleGraphKindsGet(req, opts.metaApi);
   }
   // F-M1 read + P-F1 raw YAML. Writes live in the mutation block and never touch core graphs/.

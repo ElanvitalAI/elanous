@@ -7,6 +7,41 @@ import { debug } from '../debug/log.js';
 import { packDirDeterministic } from './tgz.js';
 import { signIndex, verifyIndex, type MarketplaceIndex } from './signed-index.js';
 
+type IndexConnector = MarketplaceIndex['plugins'][number]['ai.elanous']['connectors'][number];
+
+function normalizeConnectors(connectors: unknown): { ok: true; value: IndexConnector[] } | { ok: false } {
+  if (!Array.isArray(connectors)) return { ok: false };
+  const value: IndexConnector[] = [];
+  const record = (item: unknown): item is Record<string, unknown> =>
+    item !== null && typeof item === 'object' && !Array.isArray(item);
+  for (const connector of connectors) {
+    if (!record(connector) || typeof connector.id !== 'string' || !connector.id) return { ok: false };
+    if (Array.isArray(connector.userConfig)) {
+      if (typeof connector.kind !== 'string' || !connector.userConfig.every((field: unknown) =>
+        record(field) && typeof field.key === 'string' && field.key.trim().length > 0 && typeof field.label === 'string' &&
+        typeof field.secret === 'boolean' && (field.env === undefined || typeof field.env === 'string'))) {
+        return { ok: false };
+      }
+      value.push(connector as IndexConnector);
+    } else if (Array.isArray(connector.fields)) {
+      if ((connector.kind !== undefined && typeof connector.kind !== 'string') || !connector.fields.every((field: unknown) =>
+        record(field) && typeof field.name === 'string' && field.name.trim().length > 0 && typeof field.secret === 'boolean' &&
+        (field.label === undefined || typeof field.label === 'string') &&
+        (field.env === undefined || typeof field.env === 'string'))) {
+        return { ok: false };
+      }
+      value.push({ id: connector.id, kind: (connector.kind ?? 'credentials') as string,
+        userConfig: connector.fields.map((field: Record<string, unknown>) => ({
+          key: field.name as string, label: (field.label ?? field.name) as string, secret: field.secret === true,
+          ...(field.env ? { env: field.env as string } : {}),
+        })) });
+    } else {
+      return { ok: false };
+    }
+  }
+  return { ok: true, value };
+}
+
 function unpackLocal(archive: Uint8Array, destination: string): void {
   const tar = gunzipSync(archive);
   const field = (part: Buffer) => part.toString('utf8').replace(/\0.*$/, '');
@@ -113,13 +148,15 @@ export function publishMarket(input: {
         skip('invalid-plugin.json'); continue;
       }
       const { category, bundle, ...metadata } = ai as MarketplaceIndex['plugins'][number]['ai.elanous'] & { category?: string; bundle?: unknown };
-      if (!Array.isArray(metadata.capabilities) || !Array.isArray(metadata.connectors) ||
+      if (!Array.isArray(metadata.capabilities) ||
           (category !== undefined && typeof category !== 'string')) {
         skip('invalid-plugin.json'); continue;
       }
       if (metadata.pricing !== undefined && metadata.pricing?.model !== 'free') {
         skip('paid-not-allowed-in-M0'); continue;
       }
+      const normalized = normalizeConnectors(metadata.connectors);
+      if (!normalized.ok) { skip('invalid-connectors'); continue; }
       const bundleItem = (item: unknown): item is string | { from: string; as: string } => typeof item === 'string' ||
         (!!item && typeof item === 'object' && !Array.isArray(item) && typeof (item as { from?: unknown }).from === 'string' &&
           typeof (item as { as?: unknown }).as === 'string');
@@ -208,7 +245,26 @@ export function publishMarket(input: {
         if (message.startsWith('bundle-conflict')) { skip('bundle-conflict'); continue; }
         throw error;
       }
-      const sha256 = createHash('sha256').update(archive).digest('hex');
+      let sha256 = createHash('sha256').update(archive).digest('hex');
+      const recorded = recordedHashes.get(JSON.stringify([manifest.name, manifest.version]));
+      if (recorded && recorded !== sha256) {
+        const existingPath = join(input.outDir, manifest.name, manifest.version, `${recorded}.tgz`);
+        let sameContent = false;
+        if (existsSync(existingPath)) {
+          try {
+            const existing = readFileSync(existingPath);
+            sameContent = createHash('sha256').update(existing).digest('hex') === recorded &&
+              gunzipSync(existing).equals(gunzipSync(archive));
+            if (sameContent) {
+              archive = existing;
+              sha256 = recorded;
+            }
+          } catch { /* An unreadable archive cannot prove immutability. */ }
+        }
+        if (!sameContent) throw new Error(`version-immutable: ${manifest.name}@${manifest.version}`);
+        debug.log('market.publish', 'reused-artifact', { name: manifest.name, version: manifest.version,
+          reason: 'same-content-different-gzip' });
+      }
       remember(manifest.name, manifest.version, sha256);
       const key = `${manifest.name}/${manifest.version}/${sha256}.tgz`;
       const source: MarketplaceIndex['plugins'][number]['source'] = input.source
@@ -218,7 +274,7 @@ export function publishMarket(input: {
         policy: { installation: 'AVAILABLE', authentication: 'ON_USE' },
         category: category ?? 'Productivity', version: manifest.version,
         description: manifest.description, artifact: { sha256, bytes: archive.length, key },
-        'ai.elanous': { ...metadata, pricing: metadata.pricing ?? { model: 'free' } },
+        'ai.elanous': { ...metadata, connectors: normalized.value, pricing: metadata.pricing ?? { model: 'free' } },
       });
       archives.push({ key, data: archive, name: dir });
       published.push({ name: manifest.name, version: manifest.version, sha256, bundled });

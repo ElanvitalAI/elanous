@@ -3,11 +3,11 @@
 // when assembling wsBridgeOpts (same shape as src/boot/acp-server.ts).
 
 import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildNexusWsBridgeAuth, readAcpToken, runNexus } from './index.js';
+import { buildNexusWsBridgeAuth, runNexus } from './index.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { setTestStateRoot } from './paths.js';
 import type { PwaShareDeps, PwaShareResult } from '../cli/pwa-share.js';
@@ -44,71 +44,195 @@ describe('Nexus wsBridgeOpts auth wiring', () => {
   });
 });
 
-describe('readAcpToken instance root', () => {
-  const tempDirs: string[] = [];
+describe('Nexus startup bearer token', () => {
+  let isolated: string;
+  let previousNoAuth: string | undefined;
+  beforeEach(() => {
+    isolated = mkdtempSync(join(tmpdir(), 'nexus-auth-boot-'));
+    setElanousConfigDir(isolated);
+    setTestStateRoot(isolated);
+    previousNoAuth = process.env.ELANOUS_NEXUS_NO_AUTH;
+    delete process.env.ELANOUS_NEXUS_NO_AUTH;
+  });
   afterEach(() => {
     resetElanousConfigDir();
-  });
-  afterAll(() => {
-    for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
-  });
-
-  test('returns the isolated config-dir token verbatim', () => {
-    const isolated = mkdtempSync(join(tmpdir(), 'nexus-acp-isolated-'));
-    tempDirs.push(isolated);
-    writeFileSync(join(isolated, 'acp-token'), 'isolated-token-obs-t413\n');
-    setElanousConfigDir(isolated);
-    expect(readAcpToken()).toBe('isolated-token-obs-t413');
+    setTestStateRoot(null);
+    if (previousNoAuth === undefined) delete process.env.ELANOUS_NEXUS_NO_AUTH;
+    else process.env.ELANOUS_NEXUS_NO_AUTH = previousNoAuth;
+    rmSync(isolated, { recursive: true, force: true });
   });
 
-  test('swallows a read failure and returns undefined', () => {
-    const isolated = mkdtempSync(join(tmpdir(), 'nexus-acp-unreadable-'));
-    tempDirs.push(isolated);
+  async function boot(noAuth?: boolean, realServer = false) {
+    let captured: import('./api/http-server.js').NexusHttpServerOpts | undefined;
+    const nexus = await runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      toolCwd: isolated, skipSupervisor: true, mcpEnabled: false, cleanGhostTailscaleServeFn: async () => {},
+      skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+      skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+      ...(noAuth === undefined ? {} : { noAuth }),
+      ...(realServer ? { httpStartPort: 49000 + Math.floor(Math.random() * 2000) } : {
+        startNexusHttpServerFn: ((opts: import('./api/http-server.js').NexusHttpServerOpts) => {
+          captured = opts;
+          return { port: 31415, hostname: '127.0.0.1', url: 'http://127.0.0.1:31415', stop: () => {} };
+        }) as typeof import('./api/http-server.js').startNexusHttpServer,
+      }),
+    });
+    if (!nexus || (!realServer && !captured) || !nexus.httpServer) throw new Error('Nexus did not bind');
+    return { nexus, captured: captured! };
+  }
+
+  test('live Nexus rejects a headerless REST mutation and unauthenticated ACP websocket', async () => {
+    const { nexus } = await boot(undefined, true);
+    const base = nexus.httpServer!.url;
+    try {
+      const rest = await fetch(`${base}/v1/nexus/tabs`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ kind: 'chat', id: 'unauthorized' }),
+      });
+      expect(rest.status).toBe(401);
+      expect(await rest.json()).toEqual({ error: 'unauthorized' });
+
+      const ws = new WebSocket(base.replace(/^http:/, 'ws:') + '/v1/acp');
+      try {
+        const opened = new Promise<void>((resolve, reject) => {
+          ws.addEventListener('open', () => resolve(), { once: true });
+          ws.addEventListener('error', () => reject(new Error('ACP websocket upgrade failed')), { once: true });
+        });
+        await Promise.race([opened, Bun.sleep(3_000).then(() => { throw new Error('ACP websocket open timed out'); })]);
+        const rejected = new Promise<{ code: number; reason: string }>((resolve, reject) => {
+          ws.addEventListener('close', event => resolve({ code: event.code, reason: event.reason }), { once: true });
+          ws.addEventListener('error', () => reject(new Error('ACP websocket failed before auth rejection')), { once: true });
+        });
+        ws.send(JSON.stringify({ kind: 'auth' }));
+        expect(await Promise.race([rejected, Bun.sleep(3_000).then(() => { throw new Error('ACP websocket auth rejection timed out'); })]))
+          .toEqual({ code: 1008, reason: 'auth_failed' });
+      } finally { ws.close(); }
+    } finally { nexus.release(); }
+  }, 20_000);
+
+  test('missing token is created with mode 0600 and gates both REST and websocket', async () => {
+    const { nexus, captured } = await boot();
+    try {
+      const path = join(isolated, 'acp-token');
+      expect(existsSync(path)).toBe(true);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      const token = readFileSync(path, 'utf8');
+      expect(token.length).toBeGreaterThan(0);
+      expect(captured.metaApi?.noAuth).toBe(false);
+      expect(captured.metaApi?.bearerToken).toBe(token);
+      expect(captured.wsBridge?.wsAuthVerifier?.verify({ kind: 'auth', token } as Parameters<NonNullable<NonNullable<typeof captured.wsBridge>['wsAuthVerifier']>['verify']>[0])).toEqual({ ok: true });
+      expect(nexus.runtime.httpAuth).toBe('on');
+    } finally { nexus.release(); }
+  });
+
+  test('existing token is reused without modifying its file contents', async () => {
+    const path = join(isolated, 'acp-token');
+    writeFileSync(path, `${CONFIGURED_TOKEN}\n`);
+    const { nexus, captured } = await boot();
+    try {
+      expect(readFileSync(path, 'utf8')).toBe(`${CONFIGURED_TOKEN}\n`);
+      expect(captured.metaApi?.bearerToken).toBe(CONFIGURED_TOKEN);
+    } finally { nexus.release(); }
+  });
+
+  test('explicit --no-auth and env=1 bypass both gates without creating a token', async () => {
+    for (const viaEnv of [false, true]) {
+      if (viaEnv) process.env.ELANOUS_NEXUS_NO_AUTH = '1';
+      const { nexus, captured } = await boot(viaEnv ? undefined : true);
+      try {
+        expect(captured.metaApi?.noAuth).toBe(true);
+        expect(captured.metaApi?.bearerToken).toBeUndefined();
+        expect(captured.wsBridge?.wsAuthVerifier).toBeUndefined();
+        expect(existsSync(join(isolated, 'acp-token'))).toBe(false);
+        expect(nexus.runtime.httpAuth).toBe('off');
+      } finally { nexus.release(); }
+    }
+  });
+
+  test('both explicit opt-outs print a banner warning and emit nexus.auth with source', async () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    const { debug } = await import('../debug/log.js');
+    const log = spyOn(debug, 'log');
+    try {
+      for (const viaEnv of [false, true]) {
+        warn.mockClear();
+        log.mockClear();
+        if (viaEnv) process.env.ELANOUS_NEXUS_NO_AUTH = '1';
+        let finish!: () => void;
+        const done = new Promise<void>(resolve => { finish = resolve; });
+        const boot = runNexus({
+          ...(viaEnv ? {} : { noAuth: true }), headless: true, headlessDoneForTesting: done,
+          skipHeadlessSetupCheckForTesting: true, autoMountShare: false,
+          skipHttpServer: false, skipRuntimeApi: false, skipSupervisor: true,
+          skipPushcutChannel: true, skipPwaChannel: true, skipTelegramChannel: true,
+          skipDiscordChannel: true, skipTerminalChannel: true, skipIntentPrediction: true,
+          toolCwd: isolated, mcpEnabled: false, cleanGhostTailscaleServeFn: async () => {},
+          startNexusHttpServerFn: (() => ({ port: 31415, hostname: '127.0.0.1', url: 'http://127.0.0.1:31415', stop: () => {} })) as typeof import('./api/http-server.js').startNexusHttpServer,
+        });
+        try {
+          const deadline = Date.now() + 8_000;
+          while (!warn.mock.calls.some(([message]) => String(message).includes('AUTH DISABLED')) && Date.now() < deadline) await Bun.sleep(5);
+          expect(warn.mock.calls.some(([message]) => String(message).includes('AUTH DISABLED'))).toBe(true);
+          expect(log.mock.calls.some(([category, event, data]) => category === 'nexus.auth'
+            && event === 'explicit-opt-out'
+            && (data as { source?: string }).source === (viaEnv ? 'ELANOUS_NEXUS_NO_AUTH' : '--no-auth'))).toBe(true);
+        } finally {
+          finish();
+          await boot;
+        }
+      }
+    } finally {
+      log.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  test('other env values are not opt-outs', async () => {
+    process.env.ELANOUS_NEXUS_NO_AUTH = 'true';
+    const { nexus, captured } = await boot();
+    try {
+      expect(captured.metaApi?.noAuth).toBe(false);
+      expect(captured.metaApi?.bearerToken).toBeDefined();
+    } finally { nexus.release(); }
+  });
+
+  test('empty existing token fails closed before the HTTP listener binds', async () => {
+    writeFileSync(join(isolated, 'acp-token'), '  \n');
+    let bound = false;
+    await expect(runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      toolCwd: isolated, skipSupervisor: true, mcpEnabled: false,
+      startNexusHttpServerFn: ((() => { bound = true; throw new Error('bound unexpectedly'); }) as unknown) as typeof import('./api/http-server.js').startNexusHttpServer,
+    })).rejects.toThrow('Nexus auth token is empty');
+    expect(bound).toBe(false);
+    expect(existsSync(join(isolated, 'nexus', '.lock'))).toBe(false);
+  });
+
+  test('token creation failure aborts before the HTTP listener binds', async () => {
+    const invalidConfigDir = join(isolated, 'config-file');
+    writeFileSync(invalidConfigDir, 'not a directory');
+    setElanousConfigDir(invalidConfigDir);
+    let bound = false;
+    await expect(runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      toolCwd: isolated, skipSupervisor: true, mcpEnabled: false,
+      startNexusHttpServerFn: ((() => { bound = true; throw new Error('bound unexpectedly'); }) as unknown) as typeof import('./api/http-server.js').startNexusHttpServer,
+    })).rejects.toThrow();
+    expect(bound).toBe(false);
+    expect(existsSync(join(isolated, 'nexus', '.lock'))).toBe(false);
+  });
+
+  test('token read failure aborts before the HTTP listener binds', async () => {
     mkdirSync(join(isolated, 'acp-token'));
-    setElanousConfigDir(isolated);
-    expect(readAcpToken()).toBeUndefined();
-  });
-
-  test('returns undefined when the isolated token file is absent', () => {
-    const isolated = mkdtempSync(join(tmpdir(), 'nexus-acp-absent-'));
-    tempDirs.push(isolated);
-    setElanousConfigDir(isolated);
-    expect(readAcpToken()).toBeUndefined();
-  });
-
-  test('does not read HOME/.elanous/acp-token when config-dir is isolated', () => {
-    const isolated = mkdtempSync(join(tmpdir(), 'nexus-acp-no-home-'));
-    const decoyHome = mkdtempSync(join(tmpdir(), 'nexus-acp-decoy-home-'));
-    tempDirs.push(isolated, decoyHome);
-    mkdirSync(join(decoyHome, '.elanous'));
-    writeFileSync(join(decoyHome, '.elanous', 'acp-token'), 'prod-decoy-token');
-    writeFileSync(join(isolated, 'acp-token'), 'isolated-token-obs-t413');
-    const prevHome = process.env.HOME;
-    process.env.HOME = decoyHome;
-    setElanousConfigDir(isolated);
-    try {
-      expect(readAcpToken()).toBe('isolated-token-obs-t413');
-    } finally {
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
-    }
-  });
-
-  test('empty isolated config-dir does not fall back to HOME token', () => {
-    const isolated = mkdtempSync(join(tmpdir(), 'nexus-acp-empty-iso-'));
-    const decoyHome = mkdtempSync(join(tmpdir(), 'nexus-acp-decoy-empty-'));
-    tempDirs.push(isolated, decoyHome);
-    mkdirSync(join(decoyHome, '.elanous'));
-    writeFileSync(join(decoyHome, '.elanous', 'acp-token'), 'prod-decoy-token');
-    const prevHome = process.env.HOME;
-    process.env.HOME = decoyHome;
-    setElanousConfigDir(isolated);
-    try {
-      expect(readAcpToken()).toBeUndefined();
-    } finally {
-      if (prevHome === undefined) delete process.env.HOME;
-      else process.env.HOME = prevHome;
-    }
+    let bound = false;
+    await expect(runNexus({
+      detachForTesting: true, skipHttpServer: false, skipRuntimeApi: false,
+      toolCwd: isolated, skipSupervisor: true, mcpEnabled: false,
+      startNexusHttpServerFn: ((() => { bound = true; throw new Error('bound unexpectedly'); }) as unknown) as typeof import('./api/http-server.js').startNexusHttpServer,
+    })).rejects.toThrow();
+    expect(bound).toBe(false);
+    expect(existsSync(join(isolated, 'nexus', '.lock'))).toBe(false);
   });
 });
 

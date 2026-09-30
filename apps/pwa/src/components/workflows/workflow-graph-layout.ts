@@ -191,9 +191,23 @@ export function classifyNodeVariant(node: { [k: string]: unknown }): NodeVariant
   return 'unknown';
 }
 
+/** Plugin node kind (`<plugin>:<name>`) — plugin nodes carry `kind` instead of a variant key,
+ *  so `classifyNodeVariant` says «unknown»; this is the name to show instead. */
+export function pluginNodeKind(node: { [k: string]: unknown }): string | null {
+  const kind = node['kind'];
+  return typeof kind === 'string' && /^[a-z0-9-]+:[a-z0-9-]+$/.test(kind) ? kind : null;
+}
+
+/** Badge text for a node card / editor header: the plugin kind for plugin nodes, else the variant. */
+export function nodeBadgeLabel(node: { [k: string]: unknown }, variant: NodeVariant): string {
+  return variant === 'unknown' ? pluginNodeKind(node) ?? variant : variant;
+}
+
 export interface GraphNode {
   id: string;
   variant: NodeVariant;
+  /** Badge text — `nodeBadgeLabel` (plugin kind for plugin nodes). */
+  badge: string;
   /** Short label rendered on the node card. */
   label: string;
   /** First line of the node's distinguishing payload (the prompt's
@@ -337,6 +351,14 @@ export function buildGraphFromDefinition(def: WorkflowDefinitionLike): {
     // Node-catalog v2 (2026-05-11) — derive multi-handle branch labels
     // so the custom node component can render N source handles
     // for if/switch nodes (visual polish · runtime stays single-output).
+    if (variant === 'unknown' && pluginNodeKind(raw as Record<string, unknown>)) {
+      // Plugin node — preview the first filled string input (e.g. the Markdown body).
+      const inputs = raw['inputs'];
+      const first = inputs && typeof inputs === 'object'
+        ? Object.values(inputs as Record<string, unknown>).find((v): v is string => typeof v === 'string' && v.trim() !== '')
+        : undefined;
+      preview = first ? firstLine(first) : '';
+    }
     let branches: string[] | undefined;
     if (variant === 'if') {
       branches = ['then', 'else'];
@@ -351,6 +373,7 @@ export function buildGraphFromDefinition(def: WorkflowDefinitionLike): {
     nodes.push({
       id: raw.id,
       variant,
+      badge: nodeBadgeLabel(raw as Record<string, unknown>, variant),
       label: raw.id,
       preview,
       hasWhen: typeof raw.when === 'string' && raw.when.trim() !== '',

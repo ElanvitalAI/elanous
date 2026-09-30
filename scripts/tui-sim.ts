@@ -45,6 +45,10 @@ import {
   writeFileSync, appendFileSync, readFileSync, mkdirSync, readdirSync, existsSync, unlinkSync, rmSync, renameSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
+import { getCapturedEnv } from '../src/shell-env-bootstrap.js';
+import { identityEnvKeys } from '../src/agent/identity-env.js';
+import { resolveKeyBytes, resolveKeyInput, writeKeyInput } from './lib/tui-sim-keys.js';
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -91,14 +95,18 @@ function writeMeta(id: string, m: Meta): void {
   renameSync(tmp, metaPath(id));
 }
 
-// ── named keys → escape sequences ──
-const KEYS: Record<string, string> = {
-  enter: '\r', return: '\r', tab: '\t', 'shift-tab': '\x1b[Z', esc: '\x1b', escape: '\x1b',
-  space: ' ', backspace: '\x7f', delete: '\x1b[3~',
-  up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D',
-  pageup: '\x1b[5~', pagedown: '\x1b[6~', home: '\x1b[H', end: '\x1b[F',
-  'ctrl-c': '\x03', 'ctrl-d': '\x04', 'ctrl-u': '\x15', 'ctrl-a': '\x01', 'ctrl-e': '\x05',
-};
+// ── optional child credential isolation ──
+const CLEAN_ENV_KEYS = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'COLORTERM', 'TZ', 'TMPDIR',
+  'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'LC_COLLATE', 'LC_NUMERIC', 'LC_TIME', 'LC_MONETARY',
+  'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION',
+]);
+
+/** Block everything except basic execution/locale variables after PTY env synthesis. */
+export function cleanPtyUnsetEnv(captured: Record<string, string>, parent: NodeJS.ProcessEnv): string[] {
+  return [...new Set([...Object.keys(captured), ...Object.keys(parent), ...identityEnvKeys()])]
+    .filter((key) => !CLEAN_ENV_KEYS.has(key));
+}
 
 // ── client: drop a command into inbox, optionally await result ──
 function argVal(args: string[], flag: string): string | null {
@@ -136,6 +144,10 @@ async function runDaemon(args: string[]): Promise<void> {
   const testMode = args.includes('--test');
   const autoWorktree = args.includes('--worktree');
   const explicitWorkdir = argVal(args, '--workdir');
+  const home = argVal(args, '--home');
+  const cleanEnv = args.includes('--clean-env');
+  if (args.includes('--home') && (!home || home.startsWith('--'))) { console.error('[tui-sim] --home requires a directory'); process.exit(1); }
+  const childHome = home ? resolve(home) : null;
   const cols = Number(argVal(args, '--cols')) || 220;
   const rows = Number(argVal(args, '--rows')) || 60;
   const bootSec = Number(argVal(args, '--boot')) || 8;
@@ -176,9 +188,12 @@ async function runDaemon(args: string[]): Promise<void> {
     + `# follow live:  tail -f ${forwardPath}\n\n`);
   console.error(`[tui-sim] start id=${id} workdir=${workdir} test=${testMode}`);
   console.error(`[tui-sim] 📡 live timeline → ${forwardPath}   (follow:  tail -f ${forwardPath})`);
+  if (childHome) mkdirSync(childHome, { recursive: true });
+  const unsetEnv = cleanEnv ? cleanPtyUnsetEnv(getCapturedEnv(), process.env) : undefined;
   const h: PtyHandle = startPty({
     cmd: 'bun', args: [binPath, ...isoArgs], cols, rows, workdir,
-    env: { ELANOUS_DRIVE_TUI: '1', ...(testMode ? { ELANOUS_STATE_DIR: testDir } : {}) },
+    env: { ELANOUS_DRIVE_TUI: '1', ...(testMode ? { ELANOUS_STATE_DIR: testDir } : {}), ...(childHome ? { HOME: childHome } : {}) },
+    ...(unsetEnv ? { unsetEnv } : {}),
   });
 
   const meta: Meta = {
@@ -296,9 +311,9 @@ async function runDaemon(args: string[]): Promise<void> {
           feed(text, verb === 'send');
           res = { ok: true, sent: text.length };
         } else if (verb === 'key') {
-          const seq = KEYS[String(cmd.name).toLowerCase()];
-          if (!seq) { res = { ok: false, error: `unknown key '${cmd.name}'` }; }
-          else { const n = Number(cmd.repeat) || 1; for (let i = 0; i < n; i++) h.write(seq); res = { ok: true }; }
+          const seq = resolveKeyInput(String(cmd.name));
+          if (seq === null) { res = { ok: false, error: `unknown key '${cmd.name}'` }; }
+          else { const n = Number(cmd.repeat) || 1; for (let i = 0; i < n; i++) writeKeyInput(h, seq); res = { ok: true }; }
         } else if (verb === 'mouse') {
           const x = Number(cmd.x), y = Number(cmd.y);
           const btn = cmd.button === 'right' ? 2 : cmd.button === 'middle' ? 1 : 0;
@@ -369,6 +384,23 @@ async function main(): Promise<void> {
   const verb = argv[0];
   const rest = argv.slice(1);
 
+  if (verb === '--help' || verb === 'help') {
+    console.log(`usage: tui-sim <verb> [args]
+  start [--id id] [--test] [--worktree] [--workdir dir] [--cols n] [--rows n]
+  start --home <dir>       Set the child TUI HOME (default: inherited).
+  start --clean-env        Allow only basic execution/locale env into the child (default: off).
+  send|type <id> <text>    Send text with|without Enter.
+  key <id> <name> [--repeat n]  Send a named key; unknown keys exit 1.
+  key names: enter/return/tab/shift-tab/esc/escape/space/backspace/delete/up/down/right/left/pageup/pagedown/home/end.
+  key ctrl-<a..z>         Send control byte (ctrl-j sends newline).
+  key ctrl-\\ | ctrl-]    Send 0x1c | 0x1d.
+  key alt-<key>           Send ESC followed by the named key or one character.
+  key shift-enter         Send ESC [ 13 ; 2 u.
+  key hex:<bytes>         Send raw hex bytes (e.g. hex:1b5b41).
+  resize <id> <cols> <rows>  Resize the running PTY.
+  mouse|dump|text|transcript|status|list|stop|promote|clean`);
+    return;
+  }
   if (verb === 'start') { await runDaemon(rest); return; }
 
   if (verb === 'list') {
@@ -394,9 +426,22 @@ async function main(): Promise<void> {
     }
     case 'key': {
       const name = rest[1];
+      if (!name || resolveKeyBytes(name) === null) { console.error(`알 수 없는 키 '${name}'`); process.exit(1); }
       const repeat = argVal(rest, '--repeat');
       const res = await sendCommand(id, 'key', { name, ...(repeat ? { repeat: Number(repeat) } : {}) }, true);
       console.log(res?.ok ? `✓ key ${name}` : `✗ ${res?.error}`);
+      if (!res?.ok) process.exitCode = 1;
+      break;
+    }
+    case 'resize': {
+      const cols = Number(rest[1]), rows = Number(rest[2]);
+      if (!Number.isSafeInteger(cols) || cols < 2 || !Number.isSafeInteger(rows) || rows < 2) {
+        console.error('usage: tui-sim resize <id> <cols> <rows> (positive integers >= 2)');
+        process.exit(1);
+      }
+      const res = await sendCommand(id, 'resize', { cols, rows }, true);
+      console.log(res?.ok ? `✓ resize ${cols}x${rows}` : `✗ ${res?.error ?? 'failed'}`);
+      if (!res?.ok) process.exitCode = 1;
       break;
     }
     case 'mouse': {
@@ -508,9 +553,9 @@ async function main(): Promise<void> {
       break;
     }
     default:
-      console.error(`unknown verb '${verb}'. verbs: start|send|type|key|mouse|dump|text|transcript|status|list|promote|clean|stop`);
+      console.error(`unknown verb '${verb}'. verbs: start|send|type|key|resize|mouse|dump|text|transcript|status|list|promote|clean|stop`);
       process.exit(1);
   }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+if (import.meta.main) main().catch((e) => { console.error(e); process.exit(1); });

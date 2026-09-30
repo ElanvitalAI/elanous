@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Command } from 'commander';
 import { planStart, registerStartCommand, runStart, type StartDeps } from './start-cli.js';
+import { checkReadiness } from './doctor-readiness.js';
+import { resolveUsableLlm } from '../llm/usable-llm.js';
+import { getUserConfig } from '../user-config.js';
 
 const INJECTED = {
   baseUrl: 'http://127.0.0.1:45678',
@@ -15,6 +21,7 @@ function fixture() {
   const output: string[] = [];
   const deps: StartDeps = {
     detect: async () => { calls.push('detect'); return [candidate]; },
+    resolveLlm: () => ({ usable: true, provider: 'openai-codex', via: 'login', why: 'LLM via login (openai-codex)' }),
     isTty: () => true,
     health: async () => { calls.push('health'); return true; },
     launch: async () => { calls.push('launch'); return { exitCode: 0 }; },
@@ -28,7 +35,7 @@ function fixture() {
 
 describe('start CLI', () => {
   test('pure plan ignores agent-cli as a direct LLM and never logs in without TTY or in JSON mode', () => {
-    const state = { providers: [{ provider: 'claude-code', auth: 'agent-cli' as const, available: true, rank: -2 }], tty: true, healthy: false };
+    const state = { providers: [{ provider: 'claude-code', auth: 'agent-cli' as const, available: true, rank: -2 }], llm: { usable: false, via: 'none' as const, why: 'no usable LLM route selected' }, tty: true, healthy: false };
     const plan = planStart({}, state);
     expect(plan.map((step) => [step.id, step.needed])).toEqual([
       ['detect-llm', true], ['login', true], ['check-daemon', true], ['launch-daemon', true], ['open-gui', true], ['open-tui', false],
@@ -37,8 +44,107 @@ describe('start CLI', () => {
     expect(planStart({ login: false }, state).find((step) => step.id === 'login')?.needed).toBe(false);
     expect(planStart({}, { ...state, discoveryFailed: true }).find((step) => step.id === 'login')?.needed).toBe(false);
     expect(planStart({ tui: true }, { ...state, tty: false, healthy: true }).map((step) => step.needed)).toEqual([true, false, true, false, false, true]);
-    expect(state).toEqual({ providers: [{ provider: 'claude-code', auth: 'agent-cli', available: true, rank: -2 }], tty: true, healthy: false });
+    expect(state).toEqual({ providers: [{ provider: 'claude-code', auth: 'agent-cli', available: true, rank: -2 }], llm: { usable: false, via: 'none', why: 'no usable LLM route selected' }, tty: true, healthy: false });
   });
+
+  test('planStart requires the selected route rather than treating discovered candidates as the route', () => {
+    const providers = [{ provider: 'openai-codex', auth: 'oauth' as const, available: true, rank: 0 }];
+    const base = { providers, tty: true, healthy: true };
+    const selected = { usable: true, provider: 'openai-codex', via: 'login' as const, why: 'LLM via login (openai-codex)' };
+    expect(planStart({}, { ...base, llm: selected }).find((step) => step.id === 'login')?.needed).toBe(false);
+    expect(planStart({}, { ...base, llm: { usable: false, via: 'none', why: 'no usable LLM route selected' } }).find((step) => step.id === 'login')?.needed).toBe(true);
+    expect(planStart({}, { ...base, llm: null }).find((step) => step.id === 'login')?.needed).toBe(false);
+    for (const provider of ['openai', 'local', 'anthropic']) {
+      expect(planStart({}, { ...base, llm: { usable: false, provider, via: 'none', why: 'no usable LLM route selected' } }).find((step) => step.id === 'login')?.needed).toBe(false);
+    }
+    expect(planStart({}, { ...base, llm: { usable: false, provider: 'openai-codex', via: 'none', why: 'no usable LLM route selected' } }).find((step) => step.id === 'login')?.needed).toBe(true);
+  });
+
+  test('selected auto route, not discovered candidate count, controls login and JSON availability', async () => {
+    const f = fixture();
+    f.deps.detect = async () => [{ provider: 'local', auth: 'local', source: 'env:LOCAL_LLM_URL', available: true, rank: 14 }];
+    f.deps.resolveLlm = () => ({ usable: false, via: 'none', why: 'no usable LLM route selected' });
+    const result = await runStart({ json: true, login: false }, f.deps);
+    expect(result.llm).toBe('missing');
+    expect(result.steps.find((step) => step.id === 'login')?.detail).not.toBe('LLM already available');
+    expect(JSON.parse(f.output[0]!).llm).toBe('missing');
+    f.deps.resolveLlm = () => ({ usable: true, provider: 'local', via: 'local-server', why: 'LLM via local-server (local)' });
+    expect((await runStart({ json: true, login: false }, f.deps)).llm).toBe('available');
+  });
+
+  test('start and doctor agree for login, key, local server and none, including unselected local server', async () => {
+    const config = { ...getUserConfig(), llm: { ...getUserConfig().llm, provider: 'auto' as const } };
+    for (const [selected, auth, available] of [
+      ['auto:openai-codex', 'oauth', true],
+      ['auto:openai', 'apikey', true],
+      ['auto:local', 'local', true],
+      ['auto', 'none', false],
+    ] as const) {
+      const usable = resolveUsableLlm({ config, decide: () => ({ provider: selected, auth, model: '(test)' }) });
+      const f = fixture();
+      f.deps.detect = async () => [{ provider: 'local', auth: 'local', source: 'env:LOCAL_LLM_URL', available: true, rank: 14 }];
+      f.deps.resolveLlm = () => usable;
+      const result = await runStart({ json: true, login: false }, f.deps);
+      const decision = checkReadiness({ provider: 'auto', usableLlm: usable }).items.find((item) => item.id === 'provider-decision')!;
+      expect(result.llm === 'available').toBe(available);
+      expect(decision.status === 'ok').toBe(available);
+      expect(decision.evidence).toContain(available ? usable.via : 'via none');
+    }
+  });
+
+  test('real unprovided CLI selectors agree for isolated auto/local, key, none and an unselected local route', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-start-doctor-'));
+    const home = join(root, 'home');
+    const isolated = join(root, 'isolated');
+    mkdirSync(home);
+    mkdirSync(isolated);
+    writeFileSync(join(isolated, 'config.json'), JSON.stringify({ llm: { provider: 'auto' } }));
+    mkdirSync(join(home, '.elanous'));
+    writeFileSync(join(home, '.elanous', 'auth.json'), JSON.stringify({ version: 1, providers: {
+      'openai-codex': { tokens: { accessToken: 'fixture-access', refreshToken: 'fixture-refresh', expiresAt: null }, lastRefresh: 'fixture' },
+    } }));
+    const entry = join(process.cwd(), 'bin/elanous.mjs');
+    const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: '', ELANOUS_CONFIG_DIR: isolated,
+      ELANOUS_STATE_DIR: isolated, CODEX_HOME: join(root, 'no-codex'), ELANOUS_CODEX_ACCOUNT: '', LOCAL_LLM_URL: '',
+      OPENAI_API_KEY: '', ANTHROPIC_API_KEY: '', GEMINI_API_KEY: '', GOOGLE_API_KEY: '', GROK_API_KEY: '',
+      XAI_API_KEY: '', OPENROUTER_API_KEY: '' };
+    const run = (command: 'start' | 'doctor', input: Record<string, string>) => {
+      const result = Bun.spawnSync([process.execPath, entry, `--test=${isolated}`, command, ...(command === 'start' ? ['--no-login', '--json'] : ['--json'])], {
+        cwd: process.cwd(), env: { ...env, ...input }, stdout: 'pipe', stderr: 'pipe', timeout: 20_000,
+      });
+      expect(result.signalCode).toBeUndefined();
+      expect(result.stdout.toString().trim()).not.toBe('');
+      return JSON.parse(result.stdout.toString());
+    };
+    try {
+      const loginStart = run('start', {});
+      const loginDoctor = run('doctor', {});
+      expect(loginStart.llm).toBe('available');
+      expect(loginDoctor.readiness.items.find((entry: { id: string }) => entry.id === 'provider-decision'))
+        .toMatchObject({ status: 'ok', evidence: 'llm.provider=auto → login openai-codex' });
+      rmSync(join(home, '.elanous', 'auth.json'));
+      for (const [input, expected, via] of [
+        [{ LOCAL_LLM_URL: 'http://127.0.0.1:12345/v1' }, 'available', 'local-server local'],
+        [{ OPENAI_API_KEY: 'sk-fixture-do-not-print' }, 'available', 'key openai'],
+        [{}, 'missing', 'via none'],
+      ] as const) {
+        const start = run('start', input);
+        const doctor = run('doctor', input);
+        const item = doctor.readiness.items.find((entry: { id: string }) => entry.id === 'provider-decision');
+        expect(start.llm).toBe(expected);
+        expect(item.status).toBe(expected === 'available' ? 'ok' : 'manual');
+        expect(item.evidence).toContain(via);
+        expect(JSON.stringify({ start, doctor })).not.toContain('sk-fixture-do-not-print');
+      }
+      writeFileSync(join(isolated, 'config.json'), JSON.stringify({ llm: { provider: 'openai' } }));
+      const start = run('start', { LOCAL_LLM_URL: 'http://127.0.0.1:12345/v1' });
+      const doctor = run('doctor', { LOCAL_LLM_URL: 'http://127.0.0.1:12345/v1' });
+      expect(start.llm).toBe('missing');
+      expect(doctor.readiness.items.find((entry: { id: string }) => entry.id === 'provider-decision').status).toBe('manual');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 90_000);
 
   test('healthy daemon is reused, GUI opens and no login or launch is invoked', async () => {
     const f = fixture();
@@ -53,6 +159,9 @@ describe('start CLI', () => {
     let probes = 0;
     let loggedIn = false;
     f.deps.detect = async () => { f.calls.push('detect'); return loggedIn ? [candidate] : []; };
+    f.deps.resolveLlm = () => loggedIn
+      ? { usable: true, provider: 'openai-codex', via: 'login', why: 'LLM via login (openai-codex)' }
+      : { usable: false, via: 'none', why: 'no usable LLM route selected' };
     f.deps.confirmLogin = async () => { f.calls.push('confirm'); return true; };
     f.deps.login = async () => { f.calls.push('login'); loggedIn = true; return true; };
     f.deps.health = async () => { f.calls.push('health'); return ++probes > 2; };
@@ -91,6 +200,7 @@ describe('start CLI', () => {
   test('non-TTY missing login is skipped; GUI fallback URL and JSON remain clean', async () => {
     const f = fixture();
     f.deps.detect = async () => [];
+    f.deps.resolveLlm = () => ({ usable: false, via: 'none', why: 'no usable LLM route selected' });
     f.deps.isTty = () => false;
     f.deps.confirmLogin = async () => { throw new Error('must not prompt'); };
     f.deps.openGui = async () => false;
@@ -114,6 +224,7 @@ describe('start CLI', () => {
   test('failed login leaves a non-secret next action while GUI remains usable', async () => {
     const f = fixture();
     f.deps.detect = async () => [];
+    f.deps.resolveLlm = () => ({ usable: false, via: 'none', why: 'no usable LLM route selected' });
     f.deps.confirmLogin = async () => true;
     f.deps.login = async () => { throw new Error('sk-my-secret-token'); };
     const result = await runStart({}, f.deps);
@@ -126,6 +237,7 @@ describe('start CLI', () => {
   test('discovery exception is unknown, never prompts or claims a missing LLM even if GUI opens', async () => {
     const f = fixture();
     f.deps.detect = async () => { throw new Error('sk-my-secret-token'); };
+    f.deps.resolveLlm = () => { throw new Error('sk-my-secret-token'); };
     f.deps.confirmLogin = async () => { f.calls.push('confirm'); return true; };
     const result = await runStart({}, f.deps);
     expect(result).toMatchObject({ exitCode: 1, llm: 'unknown', daemon: 'running', surface: 'gui' });
@@ -141,6 +253,10 @@ describe('start CLI', () => {
     const f = fixture();
     let attempts = 0;
     f.deps.detect = async () => { if (++attempts === 1) return []; throw new Error('sk-my-secret-token'); };
+    f.deps.resolveLlm = () => {
+      if (attempts > 1) throw new Error('sk-my-secret-token');
+      return { usable: false, via: 'none', why: 'no usable LLM route selected' };
+    };
     f.deps.confirmLogin = async () => true;
     f.deps.login = async () => true;
     const result = await runStart({}, f.deps);
@@ -153,6 +269,7 @@ describe('start CLI', () => {
 
     const json = fixture();
     json.deps.detect = async () => { throw new Error('sk-my-secret-token'); };
+    json.deps.resolveLlm = () => { throw new Error('sk-my-secret-token'); };
     const jsonResult = await runStart({ json: true }, json.deps);
     expect(JSON.parse(json.output[0]!)).toEqual(jsonResult);
     expect(jsonResult).toMatchObject({ exitCode: 1, llm: 'unknown', surface: 'gui' });
@@ -186,6 +303,7 @@ describe('start CLI', () => {
     try {
       const result = await runStart({}, {
         detect: async () => [candidate],
+        resolveLlm: () => ({ usable: true, provider: 'openai-codex', via: 'login', why: 'LLM via login (openai-codex)' }),
         isTty: () => true,
         resolveEndpoint: () => INJECTED,
         recordHealthUrl: (url) => healthUrls.push(`recorded:${url}`),
@@ -212,6 +330,7 @@ describe('start CLI', () => {
     try {
       const result = await runStart({ json: true }, {
         detect: async () => [candidate],
+        resolveLlm: () => ({ usable: true, provider: 'openai-codex', via: 'login', why: 'LLM via login (openai-codex)' }),
         isTty: () => true,
         resolveEndpoint: () => null,
         launch: async () => ({ exitCode: 0 }),
@@ -232,6 +351,7 @@ describe('start CLI', () => {
     const opened: string[] = [];
     const result = await runStart({}, {
       detect: async () => [candidate],
+      resolveLlm: () => ({ usable: true, provider: 'openai-codex', via: 'login', why: 'LLM via login (openai-codex)' }),
       isTty: () => true,
       health: async () => launched,
       launch: async () => { launched = true; return { exitCode: 0 }; },

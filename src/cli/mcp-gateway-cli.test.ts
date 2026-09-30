@@ -93,5 +93,9 @@ test('gateway help accepts token file or stdin but never token argv', () => {
   const gateway = command().commands[0]!.commands.find((entry) => entry.name() === 'gateway')!;
   const flags = gateway.options.map((option) => option.long);
   expect(flags).toContain('--nexus-token-file');
+  // 데몬 주소는 통합관제가 푼다 — 명시는 덮어쓰기일 뿐 필수가 아니다.
+  const nexusUrl = gateway.options.find((option) => option.long === '--nexus-url')!;
+  expect(nexusUrl.mandatory).toBe(false);
+  expect(nexusUrl.description).toContain('Default: the current daemon');
   expect(flags).not.toContain('--nexus-token');
 });

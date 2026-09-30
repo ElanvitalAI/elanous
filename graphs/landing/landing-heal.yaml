@@ -3,7 +3,7 @@ loop:
   title: 착지·치유
   description: 하니스 PR의 must-fix와 착지 뒤 검증 필요성을 관측한다
   trigger:
-    cron: '*/5 * * * *'
+    cron: '*/30 * * * *'
     events: [card]
 version: 1
 entry_node: collect

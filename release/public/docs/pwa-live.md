@@ -17,7 +17,7 @@ The page's labels are in Korean today, so this page gives each label as it appea
 | **BURN** | Model tokens per minute |
 | **BLOCKED** | Runs that are stuck |
 
-**런** (Runs): one row per run in the time window. Each row is a bar of six stages: **저작** (writing the goal), **분해** (splitting it into pieces), **구현** (implementing), **게이트** (checks), **리뷰** (unattended review) and **착지** (merging). A stage lights up when the run reaches it and turns red when something fails there. Click a row to see only that run; click it again, or **전체 보기** (show all), to go back.
+**런** (Runs): one row per run in the time window. Each row is a bar of six stages: **저작** (writing the goal), **분해** (splitting it into pieces), **구현** (implementing), **게이트** (checks), **리뷰** (unattended review) and **착지** (merging). A stage lights up when the run reaches it and turns red when something fails there. Click a row to open that run's drawer: its screen and log lines, **Trace 로 →** (open it in Trace), **MAX 이 런만** (Full show for this run only), **⏹ 멈춤** (stop, after one confirmation) and, when it waits for you, **승인 카드로 →** (to its approval card). Click the row again, or **✕**, to close it.
 
 **판단 스트림** (Decision stream): one line per decision, newest first, tagged with its kind:
 
@@ -37,7 +37,8 @@ At the bottom the page names its sources (the log and the harness run records) a
 ## Controls
 
 - **시간 창** (Time window): how far back to look.
-- **신호 출처** (Signal source): which elanous instance to read. **이 인스턴스** (this instance) is the default; an isolated test instance appears here too.
+- **신호 출처** (Signal source): which elanous instance to read. **이 인스턴스** (this instance) is the default; **전체(연합 · 최근 24시간에 쓰인 우주)** (all — every instance written to in the last 24 hours) reads them together, and an isolated test instance appears here too.
+- **공개 캡처** (Recording mode): for screenshots and recordings. It replaces account names with `account-N`, hides credits and dollar amounts, and masks home-folder paths and machine names. `?capture=public` in the address turns it on too.
 - **화려함 MAX** (Full show): see below.
 
 ## Everyday and Full show

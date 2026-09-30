@@ -6,8 +6,8 @@
 // these tests fail before users see a frozen `/chat` bubble.
 //
 // Two layers:
-// 1. Routing — unwired metaApi → 503 not-wired (mirrors the existing
-//    `/v1/prompt` stub contract in nexus-meta-api-runtime-stubs.test.ts).
+// 1. Routing — absent metaApi → default-deny 401 (before the
+//    `/v1/prompt` not-wired stub can run).
 // 2. SSE wire — wired metaApi → text-delta + turn-end event stream.
 //    `runCoreTurn` is spied so we can drive deltas without booting an
 //    LLM provider.
@@ -39,6 +39,7 @@ import { createNexusState } from '../src/nexus/state/state.js';
 import { TabRegistry } from '../src/nexus/state/tab-registry.js';
 import { createChatTabSpec } from '../src/nexus/kinds/chat.js';
 import { DaemonSessionHistory } from '../src/boot/daemon-runtime.js';
+import { toolSurface } from '../src/boot/daemon-tools/index.js';
 import * as coreTurnModule from '../src/core-turn/index.js';
 import * as userConfigModule from '../src/user-config.js';
 
@@ -117,7 +118,24 @@ async function drainSse(res: Response): Promise<SseEvent[]> {
 }
 
 describe('POST /v1/prompt/stream — SSE routing + wire contract', () => {
-  test('returns 503 not-wired when metaApi runtime is absent', async () => {
+  test('authenticated request with no history returns 503 after the auth gate', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix, eventBus: fix.bus, startPort: uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/prompt/stream`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
+        body: JSON.stringify({ userText: 'hi' }),
+      });
+      expect(res.status).toBe(503);
+      expect((await res.json()).error).toBe('meta-api-runtime-not-wired');
+    } finally { srv.stop(); }
+  });
+
+  test('returns 401 unauthorized when metaApi runtime is absent', async () => {
     const fix = makeFixture();
     const srv = startNexusHttpServer({
       ...fix,
@@ -130,9 +148,8 @@ describe('POST /v1/prompt/stream — SSE routing + wire contract', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ userText: 'hi' }),
       });
-      expect(res.status).toBe(503);
-      const body = await res.json();
-      expect(body.error).toBe('meta-api-runtime-not-wired');
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
@@ -852,13 +869,11 @@ describe('POST /v1/prompt/stream — SSE routing + wire contract', () => {
         });
         expect(res.status).toBe(200);
         await drainSse(res);
-        // The chat surface is coding tools, then shared core, finance, and skills.
-        expect(observedToolNames).toEqual([[
-          'Read', 'Grep', 'WebSearch', 'Plan', 'MarkStepDone', 'Edit', 'Write', 'Bash',
-          'delegate_code_agent', 'schedule_manage', 'session_manage', 'memory_recall',
-          'fact_check', 'self_recall', 'autopilot_missions', 'ops_status', 'se_build',
-          'logs_query', 'mission_decide', 'elanous_skills_list', 'skill_exec',
-        ]]);
+        // Compare the routed turn against the current chat surface, including
+        // newly exposed tools, rather than freezing an obsolete catalogue.
+        const expectedNames = toolSurface('chat').specs.map((spec) => spec.name);
+        expect(expectedNames).toContain('SelfImplement');
+        expect(observedToolNames).toEqual([expectedNames]);
       } finally { srv.stop(); }
     });
 

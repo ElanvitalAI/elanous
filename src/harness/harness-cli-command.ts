@@ -1,9 +1,10 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Command, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
-import { GOAL_TYPES, parseGoalType, type GoalType } from '../self-implement/goal-author.js';
+import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, tracedPathReferences, type GoalType } from '../self-implement/goal-author.js';
 import { templateForGoalType } from '../self-implement/graph-templates.js';
 import { listRunLedgers, loadFederatedRunLedger, loadRunLedger, runLedgerDir, type RunLedgerMatch } from '../self-implement/run-ledger.js';
 import { resolveChildLlmEffort, resolveImplementationChildModel } from '../self-dev/dev-cli.js';
@@ -12,6 +13,7 @@ import { queryRunningRuns } from '../self-implement/running-runs.js';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { runDraftSweep, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr } from '../self-dev/draft-sweep.js';
 import { debug } from '../debug/log.js';
+import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
 import { PR_LABELS } from '../github/pr-labels.js';
 import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
@@ -198,12 +200,15 @@ function printHarnessAskMarkerDryRun(goalPath?: string): void {
     const warnings = inspectHarnessAskMarkerWarnings(ask);
     if (warnings.length === 0) {
       console.log('[dry-run] ✅ ask 마커 — 경고 없음');
-      return;
+    } else {
+      for (const warning of warnings) console.log(`[dry-run] ⚠️ ask 마커 — ${warning}`);
     }
-    for (const warning of warnings) console.log(`[dry-run] ⚠️ ask 마커 — ${warning}`);
   } catch (error) {
     const message = error instanceof Error ? error.message.split('\n')[0] : String(error);
     console.log(`[dry-run] ⚠️ ask 마커 — 검사 실패: ${message}`);
+  }
+  for (const finding of lintGoalFile(ask, 'main').filter(({ tag }) => tag === 'release-note')) {
+    console.log(`[dry-run] ⚠️ 릴리스 노트 — ${finding.message}`);
   }
 }
 
@@ -218,7 +223,9 @@ function printHarnessLaunchDryRun(preview: {
   console.log(`[dry-run] 입력: ${preview.input}`);
   console.log(`[dry-run] 입구: ${preview.entrance}`);
   console.log(`[dry-run] 시작 예정: ${preview.wouldStart}`);
-  console.log('[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
+  console.log(preview.goalPath
+    ? '[dry-run] 전제 검사: ask 마커·릴리스 노트 린트만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음'
+    : '[dry-run] 전제 검사: ask 마커만 돌렸다 · 원격 조회(열린 PR·런 원장)는 돌리지 않음');
   printHarnessAskMarkerDryRun(preview.goalPath);
   if (preview.goalPath) console.log(renderGoalTemplateDryRun(preview.goalPath, preview.goalType));
   if (preview.target !== undefined) {
@@ -315,7 +322,8 @@ function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubs
   return resolved;
 }
 /** ⭐ 런 계약의 실행 칸 = pod — 호스트는 그래프를 안 돌리고 Pod 로 보낸다(harness-pod-dispatch.ts). */
-async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-say', input: string, pool: string): Promise<void> {
+async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-say', input: string, pool: string,
+  recordDispatch: (input: DispatchTaskInput, deps?: DispatchTaskDeps) => ReturnType<typeof dispatchTask> = dispatchTask): Promise<void> {
   const o = opts as HarnessSubstrateOpts;
   if (o.target !== undefined) {
     debug.log('harness.pod', 'target-refused', { target: o.target });
@@ -324,10 +332,59 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
     process.exitCode = 2;
     return;
   }
+  let dispatchRecorded = false;
+  try {
+    const goalText = entrance === 'cli-harness-ask' ? readFileSync(input, 'utf8') : input;
+    await recordDispatch({
+      goalId: (entrance === 'cli-harness-ask' ? parseGoalId(goalText) : null)
+        ?? `request-${createHash('sha256').update(goalText).digest('hex').slice(0, 32)}`,
+      title: goalText.split(/\r?\n/, 1)[0]?.trim() || 'Untitled request',
+      goalText,
+      targetPaths: entrance === 'cli-harness-ask' ? tracedPathReferences(goalText).map((reference) => reference.path) : [],
+      spec: { input: entrance === 'cli-harness-ask' ? { file: input } : { text: input }, humanReadableOutput: false },
+    });
+    dispatchRecorded = true;
+  } catch (error) {
+    try { debug.log('execution-loop.gate', 'dispatch-unavailable', { reason: String(error) }); } catch { /* fail-soft */ }
+  }
   const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
-  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) });
+  let output = '';
+  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) },
+    entrance === 'cli-harness-ask' ? { onOutput: (text) => { output = (output + text).slice(-16_000); } } : {});
   if (status !== 0) {
-    console.error('Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라');
+    let childError: string | undefined;
+    let podFailure: string | undefined;
+    let podJobFailed = false;
+    if (entrance === 'cli-harness-ask') {
+      for (const line of output.split('\n').reverse()) {
+        if (!line.trimStart().startsWith('[{') || !line.includes('"error"')) continue;
+        try {
+          const results: unknown = JSON.parse(line);
+          if (!Array.isArray(results)) continue;
+          for (const result of results) {
+            if (!result || typeof result !== 'object') continue;
+            const error = (result as { error?: { code?: string; message?: string } }).error;
+            if (typeof error?.code !== 'string' || typeof error.message !== 'string' || !error.code.startsWith('pod-')) continue;
+            if (error.code === 'pod-job-failed') {
+              podJobFailed = true;
+              childError = error.message.split('childError=')[1]?.split('\n', 1)[0];
+            }
+            podFailure = error.message;
+            break;
+          }
+        } catch { /* Non-result stdout cannot establish that a Pod child ran. */ }
+        if (podFailure) break;
+      }
+      if (!podFailure) {
+        const summary = output.split('\n').find((line) => /\s❌\sfailed · .* — pod-[\w-]+: /.test(line));
+        podFailure = summary?.split(/\s❌\sfailed · .* — pod-[\w-]+: /)[1];
+        podJobFailed = summary?.includes(' — pod-job-failed: ') ?? false;
+        if (podJobFailed) childError = podFailure?.split('childError=')[1]?.split('\n', 1)[0];
+      }
+    }
+    if (podJobFailed && childError && childError !== 'no-result-line') console.error(`Pod 안 자식이 실패했다 — ${childError}`);
+    else if (podFailure) console.error(`Pod 실행이 실패했다 — ${podFailure.split('\n', 1)[0]}`);
+    else console.error('Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라');
     process.exitCode = status;
   }
 }
@@ -1502,6 +1559,8 @@ export interface HarnessCliCommandDeps {
   draftSweep?: HarnessDraftSweepDeps;
   ask?: HarnessAskHandler;
   say?: HarnessSayHandler;
+  /** Observe-only Pod host dispatch seam. */
+  podDispatchTask?: (input: DispatchTaskInput, deps?: DispatchTaskDeps) => ReturnType<typeof dispatchTask>;
   plan?: HarnessPlanHandler;
   /** ⭐ `plan` 주입이 «없을 때» 가는 기본 분기. 시험이 이 자리로 «CLI 의 기본 배선»을 문다
    *  (⛔ 주입된 `plan` 이 파일을 스스로 만들면 그 시험은 배선을 «못 답한다» — 무인 리뷰 GOODHART 지적). */
@@ -1540,7 +1599,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-ask', goalPath, resolved.pool!) : ask(goalPath, normalizeHarnessAskSayOptions(opts));
+            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : ask(goalPath, normalizeHarnessAskSayOptions(opts));
           },
         );
       });
@@ -1564,7 +1623,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
               process.exitCode = 2;
               return Promise.resolve();
             }
-            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-say', sentence.join(' '), resolved.pool!) : say(sentence, normalizeHarnessAskSayOptions(opts));
+            return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask) : say(sentence, normalizeHarnessAskSayOptions(opts));
           },
         );
       });

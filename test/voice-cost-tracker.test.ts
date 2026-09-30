@@ -20,6 +20,7 @@ import {
 } from '../src/voice/cost-tracker.js';
 import { costForStt } from '../src/models/voice-costs.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir.js';
+import { effectiveInstanceRoot } from '../src/instance/resolve.js';
 import { voiceCostSegment } from '../src/status/bar.js';
 
 function tmpEventPath(): { path: string; cleanup: () => void } {
@@ -230,10 +231,10 @@ describe('PR-S1V.5 · voiceCostSegment renderer', () => {
 });
 
 describe('chore · defaultVoiceCostEventPath honours --config-dir', () => {
-  test('defaults to ~/.elanous/voice-cost-events.jsonl', () => {
+  test('defaults to the resolved instance root/voice-cost-events.jsonl', () => {
     resetElanousConfigDir();
     const path = defaultVoiceCostEventPath();
-    expect(path.endsWith('/.elanous/voice-cost-events.jsonl')).toBe(true);
+    expect(path).toBe(join(effectiveInstanceRoot(), 'voice-cost-events.jsonl'));
   });
 
   test('setElanousConfigDir reroutes the path', () => {

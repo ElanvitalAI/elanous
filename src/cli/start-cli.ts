@@ -1,7 +1,8 @@
 import { spawn, type SpawnOptions } from 'node:child_process';
 import { createInterface } from 'node:readline/promises';
 import type { Command } from 'commander';
-import { detectProviders, type DetectedProvider } from '../llm/provider-detect.js';
+import type { DetectedProvider } from '../llm/provider-detect.js';
+import { resolveUsableLlm, type UsableLlm } from '../llm/usable-llm.js';
 import { resolveDaemonEndpoint, type DaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
 import { runBgLaunch } from './bg-launch.js';
 
@@ -13,10 +14,13 @@ export interface StartOptions {
 }
 
 export interface StartState {
-  providers: readonly Pick<DetectedProvider, 'provider' | 'auth' | 'available' | 'rank'>[];
+  /** Discovery candidates are diagnostic only; the resolved route controls the plan. */
+  providers?: readonly Pick<DetectedProvider, 'provider' | 'auth' | 'available' | 'rank'>[];
   tty: boolean;
   healthy: boolean;
   discoveryFailed?: boolean;
+  /** Required selected runtime route; null means resolution failed, not an absent LLM. */
+  llm: UsableLlm | null;
 }
 
 export type StartStepId = 'detect-llm' | 'login' | 'check-daemon' | 'launch-daemon' | 'open-gui' | 'open-tui';
@@ -32,11 +36,13 @@ export interface StartResult {
 
 /** No I/O and no credential values: the same observations always produce the same actions. */
 export function planStart(options: StartOptions, state: StartState): StartPlannedStep[] {
-  const available = state.providers.some((entry) => entry.available && entry.auth !== 'agent-cli');
+  const available = state.llm?.usable === true;
+  // The offered login is the Codex device login: it only fixes the auto route or an explicit openai-codex.
+  const codexLoginFixes = state.llm?.provider === undefined || state.llm.provider === 'openai-codex';
   const gui = options.gui === true || options.tui !== true;
   return [
     { id: 'detect-llm', needed: true },
-    { id: 'login', needed: !state.discoveryFailed && !available && state.tty && options.json !== true && options.login !== false },
+    { id: 'login', needed: !state.discoveryFailed && state.llm !== null && !available && codexLoginFixes && state.tty && options.json !== true && options.login !== false },
     { id: 'check-daemon', needed: true },
     { id: 'launch-daemon', needed: !state.healthy },
     { id: 'open-gui', needed: gui },
@@ -45,7 +51,9 @@ export function planStart(options: StartOptions, state: StartState): StartPlanne
 }
 
 export interface StartDeps {
+  /** Optional diagnostic seam; never gates runtime route selection. */
   detect?: () => Promise<DetectedProvider[]>;
+  resolveLlm?: () => UsableLlm;
   isTty?: () => boolean;
   confirmLogin?: () => Promise<boolean>;
   login?: () => Promise<boolean>;
@@ -115,21 +123,25 @@ export async function runStart(options: StartOptions = {}, deps: StartDeps = {})
   const output = deps.output ?? console.log;
   const steps: StartStep[] = [];
   const record = (id: StartStepId, status: StartStep['status'], detail: string) => steps.push({ id, status, detail });
-  let providers: DetectedProvider[] = [];
+  let usable: UsableLlm | undefined;
   let discoveryFailed = false;
+  if (deps.detect) {
+    try { await deps.detect(); }
+    catch { /* Diagnostic candidate probe must not gate the runtime route. */ }
+  }
   try {
-    providers = await (deps.detect ?? detectProviders)();
-    record('detect-llm', 'done', 'LLM discovery finished');
+    usable = (deps.resolveLlm ?? resolveUsableLlm)();
+    record('detect-llm', 'done', 'LLM route resolved');
   } catch {
     discoveryFailed = true;
-    record('detect-llm', 'failed', 'LLM discovery failed');
+    record('detect-llm', 'failed', 'LLM route could not be resolved');
   }
   const tty = (deps.isTty ?? (() => process.stdin.isTTY === true))();
   let healthy = false;
   const probeHealth = deps.health ?? (() => defaultHealth(deps));
   try { healthy = await probeHealth(); } catch { /* No health response; try launch. */ }
-  const plan = planStart(options, { providers, tty, healthy, discoveryFailed });
-  let llm: StartResult['llm'] = discoveryFailed ? 'unknown' : providers.some((entry) => entry.available && entry.auth !== 'agent-cli') ? 'available' : 'missing';
+  const plan = planStart(options, { tty, healthy, discoveryFailed, llm: usable ?? null });
+  let llm: StartResult['llm'] = discoveryFailed ? 'unknown' : usable?.usable ? 'available' : 'missing';
   if (plan.find((entry) => entry.id === 'login')?.needed) {
     let agreed = false;
     try { agreed = await (deps.confirmLogin ?? confirmLogin)(); } catch { /* No consent. */ }
@@ -137,8 +149,12 @@ export async function runStart(options: StartOptions = {}, deps: StartDeps = {})
       try {
         if (await (deps.login ?? defaultLogin)()) {
           try {
-            providers = await (deps.detect ?? detectProviders)();
-            llm = providers.some((entry) => entry.available && entry.auth !== 'agent-cli') ? 'available' : 'missing';
+            if (deps.detect) {
+              try { await deps.detect(); }
+              catch { /* Runtime route decides. */ }
+            }
+            usable = (deps.resolveLlm ?? resolveUsableLlm)();
+            llm = usable.usable ? 'available' : 'missing';
             record('login', llm === 'available' ? 'done' : 'failed', llm === 'available' ? 'LLM login detected' : 'No usable LLM login detected');
           } catch {
             llm = 'unknown';
@@ -147,7 +163,8 @@ export async function runStart(options: StartOptions = {}, deps: StartDeps = {})
         } else record('login', 'failed', 'LLM login did not complete');
       } catch { record('login', 'failed', 'LLM login or discovery did not complete'); }
     } else record('login', 'skipped', 'Login declined');
-  } else record('login', 'skipped', llm === 'available' ? 'LLM already available' : llm === 'unknown' ? 'LLM discovery unavailable; login not offered' : 'Interactive login unavailable');
+  } else record('login', 'skipped', llm === 'available' ? 'LLM already available' : llm === 'unknown' ? 'LLM discovery unavailable; login not offered'
+    : usable?.provider !== undefined && usable.provider !== 'openai-codex' ? `Codex login does not configure llm.provider=${usable.provider}` : 'Interactive login unavailable');
   record('check-daemon', healthy ? 'done' : 'failed', healthy ? 'Daemon healthy' : 'Daemon did not respond');
   let daemon: StartResult['daemon'] = healthy ? 'running' : 'failed';
   if (plan.find((entry) => entry.id === 'launch-daemon')?.needed) {
@@ -197,7 +214,9 @@ export async function runStart(options: StartOptions = {}, deps: StartDeps = {})
   if (options.json) output(JSON.stringify(result));
   else {
     for (const step of steps) output(`${step.status === 'done' ? '✓' : step.status === 'failed' ? '✗' : '–'} ${step.id}: ${step.detail}`);
-    if (llm === 'missing') output('LLM not configured; run `elanous login openai-codex` or `elanous llm detect`.');
+    const selected = usable?.provider;
+    if (llm === 'missing' && selected !== undefined && selected !== 'openai-codex') output(`LLM not configured for llm.provider=${selected}; run \`elanous doctor\` for that provider's fix.`);
+    else if (llm === 'missing') output('LLM not configured; run `elanous login openai-codex` or `elanous llm detect`.');
     if (llm === 'unknown') output('LLM status unknown; discovery failed. Run `elanous llm detect` to check configuration.');
   }
   return result;

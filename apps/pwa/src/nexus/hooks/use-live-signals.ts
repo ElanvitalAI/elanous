@@ -21,6 +21,17 @@ export const LIVE_DECISION_CATEGORIES = 'harness.decision,oauth.codex-account,ha
 /** 조사 장면 — 판단 조회와 «따로» 묻는다. 한 조회에 섞으면 연합의 판단 줄이 상한(300)을 먹어 조사 줄이 밀려났다(09-28 실측). */
 export const LIVE_RESEARCH_CATEGORIES = 'research';
 
+/** 네 조회가 연 저장소의 합집합 ⊕ 못 읽은 저장소 이름(중복 제거). */
+export function storeCoverage(responses: ReadonlyArray<LogsResponse | undefined>): { stores: string[]; failedStores: string[]; registeredStores: number | null } {
+  const stores = new Set<string>(); const failed = new Set<string>(); let registered: number | null = null;
+  for (const r of responses) {
+    for (const s of r?.stores ?? []) stores.add(s);
+    for (const f of r?.failedStores ?? []) failed.add(f.name);
+    if (typeof r?.registeredStores === 'number') registered = Math.max(registered ?? 0, r.registeredStores);
+  }
+  return { stores: [...stores], failedStores: [...failed], registeredStores: registered };
+}
+
 export function useLiveSignals(opts: { store?: string; windowMinutes: number }) {
   const client = useNexusClient();
   const logQuery = (category: string, limit: number) => ({
@@ -42,6 +53,8 @@ export function useLiveSignals(opts: { store?: string; windowMinutes: number }) 
     error: runLogs.error ?? usageLogs.error ?? decisionLogs.error ?? null,
     dataUpdatedAt: Math.max(runLogs.dataUpdatedAt, usageLogs.dataUpdatedAt, decisionLogs.dataUpdatedAt, researchLogs.dataUpdatedAt),
     truncated: [runLogs, usageLogs, decisionLogs].some((q) => q.data && q.data.count >= (q === usageLogs ? 2000 : q === runLogs ? 1500 : 300)),
+    // 연합(`@active`)은 등록 저장소 전부가 아니라 «최근에 쓰인» 일부만 연다 — 몇 개를 열고 몇 개를 못 읽었는지 화면에 보인다(🅣 09-29: 우주 밖 런이 «판단 0»으로 보였다).
+    ...storeCoverage([runLogs.data, usageLogs.data, decisionLogs.data, researchLogs.data]),
   };
   const runs = useQuery<HarnessRunsResponse>({
     queryKey: ['live', 'runs'],

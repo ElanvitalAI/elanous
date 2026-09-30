@@ -27,9 +27,13 @@ export type HostRegateDeps = {
   log?: (event: 'passed' | 'failed' | 'unmeasured' | 'base-raced', data: Record<string, unknown>) => void;
 };
 
+const SPAWN_MAX_BUFFER = 256 * 1024 * 1024;
+
 const defaultCommand: NonNullable<HostRegateDeps['command']> = (bin, args, cwd, env) => {
-  const r = spawnSync(bin, [...args], { cwd, env: env ?? process.env, encoding: 'utf8', timeout: 600_000 });
-  return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? `${r.error.message} (command unavailable)` : '') };
+  // bun ≥1.4 applies Node's 1MB default maxBuffer and silently truncates — test output here is often larger.
+  const r = spawnSync(bin, [...args], { cwd, env: env ?? process.env, encoding: 'utf8', timeout: 600_000, maxBuffer: SPAWN_MAX_BUFFER });
+  const overflow = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS';
+  return { status: overflow ? null : r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? `${r.error.message} (${overflow ? `output exceeded ${SPAWN_MAX_BUFFER} bytes` : 'command unavailable'})` : '') };
 };
 
 /** The informational pr-land gate always returns zero; enforce its measured report and the combined test result instead. */

@@ -1,26 +1,27 @@
+import { debug } from '../../src/debug/log.js';
 import type { ReleaseManifest } from '../../src/release-loop/manifest.js';
 
-/** Render the cutoff's IN set, never the deferred or escalation lists. */
+/** Render public IN lines only; keep private titles and PR numbers out of release notes. */
 export function renderReleaseNotes(manifest: ReleaseManifest, version: string): string {
   const sections = [
     { heading: 'Behavior changes', kinds: ['feat', 'fix'] },
     { heading: 'Security', kinds: ['security'] },
-    { heading: 'Internal', kinds: ['internal'] },
-    { heading: 'Other changes', kinds: ['unknown'] },
   ] as const;
   const lines = [`# ${version}`, ''];
+  let shown = 0;
   for (const section of sections) {
-    const entries = manifest.in.filter((entry) => section.kinds.some((kind) => kind === (entry.kind ?? 'unknown')));
+    const entries = manifest.in.filter((entry) => section.kinds.some((kind) => kind === entry.kind) && entry.line);
     if (!entries.length) continue;
     lines.push(`## ${section.heading}`, '');
     for (const entry of entries) {
-      const label = (entry.line ?? entry.title).replace(/\r?\n/g, ' ').trim();
-      lines.push(entry.prNumber === undefined
-        ? `- ${label}`
-        : `- ${label} ([#${entry.prNumber}](https://github.com/ElanvitalAI/elanous/pull/${entry.prNumber}))`);
+      lines.push(`- ${entry.line!.replace(/\r?\n/g, ' ').trim()}`);
+      shown++;
     }
     lines.push('');
   }
+  const omitted = manifest.in.length - shown;
+  if (omitted) lines.push(`Plus ${omitted} internal ${omitted === 1 ? 'change' : 'changes'}.`);
+  debug.log('release-loop.docs', 'notes-rendered', { version, shown, omitted });
   return `${lines.join('\n').trimEnd()}\n`;
 }
 
@@ -33,8 +34,8 @@ export function flipNextReleaseMarkers(text: string, version: string): string {
  * Fold notes that landed before the release loop (a PR appending its own line, a headline paragraph)
  * into the rendered notes instead of refusing or overwriting them. Paragraphs before any section stay
  * under the title (the headline slot); list lines the cutoff did not render keep their own `##` section
- * (lines outside any section go to «Also in this release»). A line that differs from a rendered one only
- * by the trailing PR link is the same line. Folding its own output again gives the same bytes.
+ * (lines outside any section go to «Also in this release»). A hand-written link cannot be identified
+ * as generator output from its shape alone. Folding its own output again gives the same bytes.
  */
 export function foldPreLandedNotes(existing: string, rendered: string): { text: string; folded: number } {
   const key = (line: string) => line.trim().replace(/\s*\(\[#\d+\]\([^)]*\)\)\s*$/, '').trim();
@@ -46,12 +47,14 @@ export function foldPreLandedNotes(existing: string, rendered: string): { text: 
   const alreadyRendered = (line: string, section: string | null) => section === null ? renderedAll.has(key(line)) : (renderedBySection.get(section)?.has(key(line)) ?? false);
   const paragraphs: string[] = [];
   const sections = new Map<string, string[]>();
+  const [title, ...rest] = rendered.trimEnd().split('\n');
+  const footer = rest.find((line) => /^Plus \d+ internal changes?\.$/.test(line));
   const DEFAULT = '## Also in this release';
   let heading: string | null = null;
   for (const raw of existing.split(/\r?\n/)) {
     const line = raw.trimEnd();
     const trimmed = line.trim();
-    if (/^#\s/.test(trimmed)) continue;
+    if (/^#\s/.test(trimmed) || /^Plus \d+ internal changes?\.$/.test(trimmed)) continue;
     if (!trimmed) {
       // Keep paragraph breaks (collapse runs of blank lines to one) in the headline block and in sections.
       if (heading === null) { if (paragraphs.length && paragraphs.at(-1) !== '') paragraphs.push(''); }
@@ -75,9 +78,9 @@ export function foldPreLandedNotes(existing: string, rendered: string): { text: 
     }
   }
   // Rendered notes = title ⊕ ordered `##` sections. A pre-landed section with the same heading merges into it.
-  const [title, ...rest] = rendered.trimEnd().split('\n');
   const renderedSections: Array<{ heading: string; lines: string[] }> = [];
   for (const line of rest) {
+    if (line === footer) continue;
     if (/^##\s/.test(line.trim())) renderedSections.push({ heading: line.trim(), lines: [] });
     else if (renderedSections.length && line.trim()) renderedSections.at(-1)!.lines.push(line);
   }
@@ -97,6 +100,10 @@ export function foldPreLandedNotes(existing: string, rendered: string): { text: 
   while (paragraphs.at(-1) === '') paragraphs.pop();
   if (paragraphs.length) parts.push(paragraphs.join('\n'), '');
   for (const section of renderedSections) parts.push(section.heading, '', ...section.lines, '');
-  for (const [name, lines] of sections) { parts.push(name, '', ...lines, ''); folded += Math.max(lines.filter(Boolean).length, 1); }
+  for (const [name, lines] of sections) {
+    parts.push(name, '', ...lines, '');
+    folded += Math.max(lines.filter(Boolean).length, 1);
+  }
+  if (footer) parts.push(footer);
   return { text: `${parts.join('\n').trimEnd()}\n`, folded };
 }

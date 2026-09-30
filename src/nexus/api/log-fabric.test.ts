@@ -402,8 +402,10 @@ describe('연합 조회 (LF7-d) — ?store= 리졸버 + /v1/logs/instances', () 
       dbMtimeMs: (path) => (path === fresh ? now - 60_000 : path === stale ? now - 3 * 86_400_000 : null),
     });
     expect(res.status).toBe(200);
-    const j = await res.json() as { logs: Array<{ event: string; instance?: string }>; stores: string[] };
+    const j = await res.json() as { logs: Array<{ event: string; instance?: string }>; stores: string[]; registeredStores: number | null };
     expect(j.stores.slice(1)).toEqual(['test:fresh']);
+    // 분모: 이 인스턴스 ⊕ db 가 있는 우주 둘(fresh·stale) — db 없는 nodb 는 세지 않는다(🅕 머리 줄 «20/906»).
+    expect(j.registeredStores).toBe(3);
     expect(j.logs.some((l) => l.event === 'fresh.ok' && l.instance === 'test:fresh')).toBe(true);
     self.close();
     rmSync(dir, { recursive: true, force: true });

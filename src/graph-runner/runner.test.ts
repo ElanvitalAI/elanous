@@ -1,9 +1,12 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { decideGraphApproval, latestGraphRun, runGraph } from './runner.js';
+import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -41,6 +44,58 @@ edges:
 `);
   return { graph, root };
 }
+
+test('installed plugin graphs receive only their own credential environment', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'graph-credential-'));
+  dirs.push(root);
+  const previous = process.env.ELANOUS_STATE_DIR;
+  const previousOwn = process.env.SAMPLE_PLUGIN_KEY;
+  const previousOther = process.env.OTHER_PLUGIN_KEY;
+  process.env.ELANOUS_STATE_DIR = root;
+  try {
+    for (const name of ['sample-plugin', 'other-plugin']) {
+      const path = join(root, 'plugins', 'local', name, '1.0.0');
+      mkdirSync(path, { recursive: true });
+      writeFileSync(join(path, 'plugin.ts'), 'export default {}');
+      writeFileSync(join(path, 'plugin.json'), JSON.stringify({ id: name, version: '1.0.0', main: './plugin.ts',
+        contributes: { connectors: [{ id: 'service', fields: [{ name: 'KEY', env: `${name.replace('-', '_').toUpperCase()}_KEY` }] }] } }));
+    }
+    setPluginCredentials('sample-plugin', { KEY: 'sample-secret' }, root);
+    setPluginCredentials('other-plugin', { KEY: 'other-secret' }, root);
+    const { graph: source } = fixture('exit 0');
+    const graph = join(root, 'plugins', 'local', 'sample-plugin', '1.0.0', 'graphs', 'graph.yaml');
+    mkdirSync(join(graph, '..'), { recursive: true });
+    writeFileSync(graph, readFileSync(source, 'utf8'));
+    writeFileSync(join(graph, '..', 'recipes.yaml'), readFileSync(join(source, '..', 'recipes.yaml'), 'utf8'));
+    const envs: NodeJS.ProcessEnv[] = [];
+    process.env.OTHER_PLUGIN_KEY = 'inherited-other-secret';
+    process.env.SAMPLE_PLUGIN_KEY = 'inherited-own-secret';
+    const run = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => {
+      envs.push(opts.env!);
+      return { stdout: 'sample-secret', stderr: '', exitCode: 0 };
+    } } });
+    expect(run.status).toBe('done');
+    expect(envs).toHaveLength(2);
+    expect(envs[0]?.SAMPLE_PLUGIN_KEY).toBe('sample-secret');
+    expect(envs[0]?.OTHER_PLUGIN_KEY).toBeUndefined();
+    expect(JSON.stringify(run.nodes)).toContain('[REDACTED]');
+    expect(JSON.stringify(run)).not.toContain('sample-secret');
+    expect(JSON.stringify(run)).not.toContain('other-secret');
+    const outside = await runGraph(source, { deps: { root, runBash: async (_body, opts) => {
+      expect(opts.env?.SAMPLE_PLUGIN_KEY).toBeUndefined();
+      expect(opts.env?.OTHER_PLUGIN_KEY).toBeUndefined();
+      return { stdout: '', stderr: '', exitCode: 0 };
+    } } });
+    expect(outside.status).toBe('done');
+  } finally {
+    if (previousOther === undefined) delete process.env.OTHER_PLUGIN_KEY;
+    else process.env.OTHER_PLUGIN_KEY = previousOther;
+    if (previousOwn === undefined) delete process.env.SAMPLE_PLUGIN_KEY;
+    else process.env.SAMPLE_PLUGIN_KEY = previousOwn;
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+    else process.env.ELANOUS_STATE_DIR = previous;
+  }
+});
 
 test('two successful commands reach done and persist both outcomes', async () => {
   const { graph, root } = fixture('exit 0');
@@ -583,5 +638,31 @@ test('a node\'s last-line JSON outcome picks the matching branch and the next no
     expect(other.path).toEqual(['classify', 'a', 'done']);
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 09-30 🅢: 작업 트리 `graph run … --config-dir ~/.elanous` 의 `cmd:` 자식이 코드 위치로 시험 우주를 새로 골랐다.
+test('an explicit config dir is pinned into every cmd child env; without one the child env is left as the parent had it', async () => {
+  const { graph, root } = fixture('exit 0');
+  const explicit = mkdtempSync(join(tmpdir(), 'graph-universe-'));
+  const envs: NodeJS.ProcessEnv[] = [];
+  const priorConfig = process.env.ELANOUS_CONFIG_DIR;
+  delete process.env.ELANOUS_CONFIG_DIR;
+  try {
+    setElanousConfigDir(explicit);
+    const expectedConfig = getElanousConfigDir();
+    const expectedState = effectiveInstanceRoot();
+    const pinned = await runGraph(graph, { deps: { root, runBash: async (_body, opts) => { envs.push(opts.env!); return { stdout: '', stderr: '', exitCode: 0 }; } } });
+    expect(pinned.status).toBe('done');
+    expect(envs.length).toBeGreaterThan(0);
+    expect(envs.every((env) => env.ELANOUS_CONFIG_DIR === expectedConfig && env.ELANOUS_STATE_DIR === expectedState)).toBe(true);
+    resetElanousConfigDir();
+    envs.length = 0;
+    await runGraph(graph, { deps: { root, runBash: async (_body, opts) => { envs.push(opts.env!); return { stdout: '', stderr: '', exitCode: 0 }; } } });
+    expect(envs.every((env) => env.ELANOUS_CONFIG_DIR === undefined)).toBe(true);
+  } finally {
+    resetElanousConfigDir();
+    if (priorConfig === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = priorConfig;
+    rmSync(explicit, { recursive: true, force: true });
   }
 });

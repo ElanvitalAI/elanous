@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { AppRouterContext } from 'next/dist/shared/lib/app-router-context.shared-runtime';
 import { cn } from '@/lib/utils';
+import { usePwaRole } from '@/lib/pwa-role';
+import { visibleForRole } from '@/lib/route-maturity';
 import { splitWelcomeRoutes } from './welcome-core-routes';
 import { useNexusHealthIfMounted } from '@/nexus/hooks/use-nexus-state';
 import { setupModeRedirect } from '@/lib/setup-mode';
@@ -62,6 +64,12 @@ const WELCOME_MENU_ITEMS: readonly RouteGuidanceItem[] = [
   { href: '/setup', label: 'Setup', navigable: true },
 ];
 
+const REPAIR_ITEMS: readonly RouteGuidanceItem[] = [
+  { href: '/morning', label: '아침 브리핑', navigable: true },
+  { href: '/settings/devices', label: '기기 목록', navigable: true },
+  { href: '/workflows/chat-ui', label: '워크플로 채팅', navigable: true },
+];
+
 function routeGuidanceTestId(href: SidebarRouteHref): string {
   return `route-guidance-${href === '/' ? 'root' : href.slice(1).replaceAll('/', '-')}`;
 }
@@ -117,7 +125,10 @@ function WelcomeHomeRedirect() {
 }
 
 function WelcomeHomeView() {
-  const { core, more } = splitWelcomeRoutes(WELCOME_MENU_ITEMS);
+  const role = usePwaRole();
+  const { core, more } = splitWelcomeRoutes(
+    WELCOME_MENU_ITEMS.filter((item) => visibleForRole(role, item.href)),
+  );
   return (
     <main data-testid="welcome-home" className="min-h-screen bg-gradient-to-b from-background via-background to-muted/40 px-6 py-12 sm:px-10">
       <div className="mx-auto flex w-full max-w-5xl flex-col gap-10">
@@ -130,15 +141,22 @@ function WelcomeHomeView() {
         </header>
 
         <RouteGuidanceList ariaLabel="핵심 화면" items={core} />
-        <details className="rounded-2xl border border-border/60 bg-card/60 p-5">
-          <summary className="cursor-pointer font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-            모든 화면 ({more.length})
-          </summary>
-          <div className="mt-4">
-            <RouteGuidanceList ariaLabel="나머지 화면" items={more} />
-          </div>
-        </details>
-
+        {more.length > 0 && (
+          <details className="rounded-2xl border border-border/60 bg-card/60 p-5">
+            <summary className="cursor-pointer font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              모든 화면 ({more.length})
+            </summary>
+            <div className="mt-4">
+              <RouteGuidanceList ariaLabel="나머지 화면" items={more} />
+            </div>
+          </details>
+        )}
+        {REPAIR_ITEMS.some((item) => visibleForRole(role, item.href)) && (
+          <details className="rounded-2xl border border-border/60 bg-card/60 p-5">
+            <summary className="cursor-pointer font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">고치는 중인 화면</summary>
+            <div className="mt-4"><RouteGuidanceList ariaLabel="고치는 중인 화면" items={REPAIR_ITEMS.filter((item) => visibleForRole(role, item.href))} /></div>
+          </details>
+        )}
       </div>
     </main>
   );

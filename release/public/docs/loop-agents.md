@@ -12,21 +12,7 @@ elanous ships an example loop, `stale-draft-digest` (every morning, list open dr
 
 ## For everyone — see and run loops
 
-Loops are found in the `graphs/` folder of the directory you run these commands from. With the one-line installer that folder is inside the installed copy, so go there first (in a checkout, stay in the checkout):
-
-```bash
-cd ~/.local/share/elanous/current/node_modules/elanous   # installed copy; skip in a checkout
-```
-
-Run elsewhere, `loop list` prints `[]` and `graph run graphs/…` cannot find the file.
-
-```bash
-elanous graph run graphs/examples/stale-draft-digest/stale-draft-digest.yaml --dry-run   # walk the steps without running anything
-elanous schedule list                                          # what runs on a schedule
-elanous schedule disable <id>                                  # pause a scheduled loop (reversible)
-```
-
-Every loop in one list:
+The `loop` commands find the loops that ship with your installed copy, from any folder:
 
 ```bash
 elanous loop list                        # each loop: trigger (cron), enabled or not, last run, next run
@@ -34,7 +20,10 @@ elanous loop status stale-draft-digest   # one loop with its recent runs
 elanous loop run stale-draft-digest --dry-run   # walk the steps without running anything
 elanous loop start stale-draft-digest    # preview the schedule change · add --yes to apply it
 elanous loop stop stale-draft-digest --yes      # remove the schedule
+elanous schedule list                    # everything that runs on a schedule
 ```
+
+To run a graph file directly, give its path — `elanous graph run <path/to/graph.yaml> --dry-run`; a relative path is read from the folder you are in.
 
 `start` and `stop` only preview until you add `--yes`.
 
@@ -44,7 +33,16 @@ The **steward** is elanous's own task loop. What you ask for becomes a task (a L
 
 It only asks you about money, publishing, security and anything that cannot be undone. The first version only records its decisions so you can compare them with your own before it acts.
 
-*Status:* in progress (see the release notes).
+```bash
+elanous directive add "Add a Usage section to the README" --dry-run   # preview the task; drop --dry-run to create the Linear issue
+elanous card list                        # tasks as cards
+elanous card show <id>                   # one card and its sections
+elanous loop start steward               # preview the schedule (every 15 minutes, 08:00-23:00, and on new directives) · add --yes to apply
+```
+
+The steward needs a Linear connection and is off until you start it.
+
+The **landing-and-healing loop** (`landing-heal`) watches the harness's own pull requests for review findings that must be fixed and for checks that are due after a merge. It is off by default too — `elanous loop status landing-heal` shows its schedule.
 
 ## For developers — build your own
 

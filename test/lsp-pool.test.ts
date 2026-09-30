@@ -75,7 +75,6 @@ describe('LSP pool · config-driven branches', () => {
 
   test('__resetLspPoolForTests is idempotent on an empty pool', () => {
     __resetLspPoolForTests();
-    __resetLspPoolForTests();
-    expect(true).toBe(true);
+    expect(() => __resetLspPoolForTests()).not.toThrow();
   });
 });

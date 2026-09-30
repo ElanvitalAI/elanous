@@ -27,6 +27,8 @@
 // cache, but the constant is in place so Phase 4 doesn't need a
 // breaking schema change.
 
+importScripts('sw-strategies.js');
+
 const CACHE_VERSION = 'v4-phase-4-offline-cache';
 const CACHE_PREFIX = 'elanous-pwa-';
 // Phase 2 — dedicated cache for incoming share-target POST payloads.
@@ -48,6 +50,8 @@ const PRECACHE = `${CACHE_PREFIX}precache-${CACHE_VERSION}`;
 const PRECACHE_URLS = [
   '/app/offline.html',
   '/app/manifest.webmanifest',
+  '/app/icons/elanous-192.png',
+  '/app/icons/elanous-512.png',
 ];
 
 self.addEventListener('install', (event) => {
@@ -118,60 +122,18 @@ self.addEventListener('fetch', (event) => {
 
   if (url.pathname.startsWith('/app/_next/static/')
       || url.pathname.startsWith('/app/fonts/')) {
-    event.respondWith(cacheFirst(req));
+    event.respondWith(cacheFirst(req, self.caches, fetch, RUNTIME_CACHE));
     return;
   }
   if (req.mode === 'navigate'
       || (req.headers.get('accept') || '').includes('text/html')) {
     if (url.pathname.startsWith('/app/')) {
-      event.respondWith(networkFirstWithOfflineFallback(req));
+      event.respondWith(networkFirstWithOfflineFallback(req, self.caches, fetch, RUNTIME_CACHE, PRECACHE));
       return;
     }
   }
   // Default: passthrough.
 });
-
-async function cacheFirst(request) {
-  const cache = await self.caches.open(RUNTIME_CACHE);
-  const cached = await cache.match(request);
-  if (cached) return cached;
-  try {
-    const fresh = await fetch(request);
-    if (fresh.ok) {
-      // Don't cache opaque or partial responses.
-      cache.put(request, fresh.clone()).catch(() => { /* swallow */ });
-    }
-    return fresh;
-  } catch (e) {
-    // Cache miss + offline = give the user something. The runtime
-    // cache may have a stale fingerprinted asset under a slightly
-    // different query — best effort.
-    return new Response('', { status: 504, statusText: 'offline + uncached' });
-  }
-}
-
-async function networkFirstWithOfflineFallback(request) {
-  try {
-    const fresh = await fetch(request);
-    if (fresh.ok) {
-      const cache = await self.caches.open(RUNTIME_CACHE);
-      cache.put(request, fresh.clone()).catch(() => { /* swallow */ });
-    }
-    return fresh;
-  } catch {
-    const cache = await self.caches.open(RUNTIME_CACHE);
-    const cached = await cache.match(request);
-    if (cached) return cached;
-    // Absolute last resort — the precached offline shell.
-    const precache = await self.caches.open(PRECACHE);
-    const offline = await precache.match('/app/offline.html');
-    if (offline) return offline;
-    return new Response('Offline · daemon unreachable', {
-      status: 503,
-      headers: { 'content-type': 'text/plain; charset=utf-8' },
-    });
-  }
-}
 
 async function handleSharePost(request) {
   try {

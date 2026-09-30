@@ -186,9 +186,10 @@ async function fetchMarketIndex(name: string, opts: MarketFetchOptions): Promise
   const load = async (file: string): Promise<Uint8Array> => {
     const url = new URL(file, market.url);
     let response: Response;
-    try { response = await fetcher(url.href); }
-    catch (error) { throw new MarketFetchError('io', `market fetch failed (${file}): ${error instanceof Error ? error.message : String(error)}`); }
+    try { response = await fetcher(url.href, { redirect: 'error' }); }
+    catch { throw new MarketFetchError('io', `market fetch failed (${file}): network error`); }
     if (!response.ok) throw new MarketFetchError('io', `market fetch failed (${file}): HTTP ${response.status}`);
+    if (response.redirected || (response.url && response.url !== url.href)) throw new MarketFetchError('io', `market fetch was redirected (${file})`);
     if (!response.body) throw new MarketFetchError('io', `market fetch failed (${file}): missing response body`);
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
@@ -203,7 +204,7 @@ async function fetchMarketIndex(name: string, opts: MarketFetchOptions): Promise
       }
     } catch (error) {
       if (error instanceof MarketFetchError) throw error;
-      throw new MarketFetchError('io', `market fetch failed (${file}): ${error instanceof Error ? error.message : String(error)}`);
+      throw new MarketFetchError('io', `market fetch failed (${file}): network error`);
     } finally {
       void reader.cancel().catch(() => {});
       reader.releaseLock();

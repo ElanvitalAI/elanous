@@ -22,11 +22,12 @@ export function slugifyFeature(feature: string): string {
 /** 하니스가 만드는 `self-impl/<슬러그>-<8자리 16진수>` 브랜치 이름.
  *  goalId 가 있으면 읽는 자(`branchGoalId`, `/(?:^|-)goalid-([^/-]+)-/`)와 호환되는
  *  `goalid-<id>-` 구간을 슬러그 앞에 싣는다. 없으면 기존과 바이트 단위로 같다. */
-export function plannedSelfImplBranch(feature: string, goalId?: string): string {
+export function plannedSelfImplBranch(feature: string, goalId?: string, runId?: string): string {
   const slug = slugifyFeature(feature);
   const id = goalId?.trim() ?? '';
-  if (!id) return `${WORKTREE_BRANCH_PREFIX}${slug}`;
+  const runSuffix = runId === undefined ? '' : `-r${runId.replace(/^run-/i, '').replace(/[^a-z0-9]/gi, '').slice(0, 6).toLowerCase()}`;
+  if (!id) return `${WORKTREE_BRANCH_PREFIX}${slug}${runSuffix}`;
   const readable = slug.replace(/-[0-9a-f]{8}$/, '');
   const digest = createHash('sha256').update(id).digest('hex').slice(0, 8);
-  return `${WORKTREE_BRANCH_PREFIX}goalid-${id}-${readable}-${digest}`;
+  return `${WORKTREE_BRANCH_PREFIX}goalid-${id}-${readable}-${digest}${runSuffix}`;
 }

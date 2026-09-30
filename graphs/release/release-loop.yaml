@@ -1,3 +1,4 @@
+# Inputs gateRemote (SSH host, e.g. node-b) and gateRemoteMirror (bare mirror path, default ~/mirror/elanous-agent.git): run gate sweeps in temporary remote clones without a matching caller checkout; omit gateRemote for local execution.
 graph_id: release-loop
 loop:
   title: 릴리스
@@ -17,6 +18,8 @@ nodes:
   - { node_id: upgrade, kind: gate, recipe: 'cmd:upgrade', max_visits: 1 }
   - { node_id: tui, kind: gate, recipe: 'cmd:tui', max_visits: 1 }
   - { node_id: docs, kind: agent, recipe: 'cmd:docs', max_visits: 1 }
+  - { node_id: notes-check, kind: gate, recipe: 'cmd:notes-check', max_visits: 1 }
+  - { node_id: auto-approve, kind: gate, recipe: 'cmd:auto-approve', max_visits: 1 }
   - { node_id: approve-publish, kind: hitl, recipe: 'approval:publish', max_visits: 1 }
   - { node_id: publish, kind: git, recipe: 'cmd:publish-command', max_visits: 1 }
   - { node_id: docs-land, kind: git, recipe: 'cmd:docs-land', max_visits: 1 }
@@ -32,7 +35,9 @@ edges:
   - { from: prepare, on: outcome, map: { ok: upgrade, fail: failed, error: failed } }
   - { from: upgrade, on: outcome, map: { ok: tui, fail: failed, error: failed } }
   - { from: tui, on: outcome, map: { ok: docs, fail: failed, error: failed } }
-  - { from: docs, on: outcome, map: { ok: approve-publish, fail: failed, error: failed } }
+  - { from: docs, on: outcome, map: { ok: notes-check, fail: failed, error: failed } }
+  - { from: notes-check, on: outcome, map: { ok: auto-approve, fail: failed, error: failed } }
+  - { from: auto-approve, on: outcome, map: { ok: publish, fail: approve-publish, error: approve-publish } }
   - { from: approve-publish, on: outcome, map: { ok: publish, fail: failed } }
   - { from: publish, on: outcome, map: { ok: docs-land, fail: failed, error: failed } }
   - { from: docs-land, on: outcome, map: { ok: verify, fail: failed, error: failed } }

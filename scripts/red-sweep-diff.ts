@@ -71,7 +71,7 @@ export async function main(argv: readonly string[]): Promise<number> {
   const grown = diffs.filter((d) => d.newRed.length > 0);
   if (argv.includes('--notify') && grown.length > 0) {
     const { sendOutbound } = await import('../src/domains/outbound-alert.js');
-    sendOutbound(`⚠️ **파일별 빨강 스윕 — 새 빨강**\n\n${grown.map(renderDiff).join('\n\n')}`, 'alert');
+    sendOutbound(`⚠️ **파일별 빨강 스윕 — 새 빨강**\n\n${grown.map(renderDiff).join('\n\n')}`, 'ops-alert');
   }
   return diffs.length === 0 ? 2 : 0;
 }

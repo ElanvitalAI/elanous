@@ -28,13 +28,21 @@
 //     daemon exit.
 
 import type { McpServerSpec } from '../../user-config.js';
-import { McpClient, McpConnectionError } from '../../mcp/client.js';
+import { McpClient, McpConnectionError, type McpToolCallResult } from '../../mcp/client.js';
 import {
   createMcpProxyRuntime,
   createMcpToolAuthorizer,
 } from '../../mcp/proxy-runtime.js';
 import { registerToolRuntime, unregisterToolRuntime } from '../../tool-runtime/registry.js';
 import { debug, redactSecretText } from '../../debug/log.js';
+import { elanousStateRoot } from '../../autopilot/state-paths.js';
+import { spawn as nodeSpawn } from 'node:child_process';
+import { listNodeKinds } from '../../graph-kinds/registry.js';
+import { syncInstalledPluginNodes } from '../../graph-kinds/installed-plugin-nodes.js';
+import { listInstalledPlugins } from '../../plugins/install/plugin-install.js';
+import { pluginEnv, credentialStatus } from '../../plugins/install/plugin-credentials.js';
+import { existsSync, realpathSync } from 'node:fs';
+import { resolve, sep } from 'node:path';
 
 export interface McpClientsHandle {
   /** Live clients (one per successfully started server). */
@@ -172,24 +180,64 @@ export async function registerMcpClients(
   // breadcrumbs when a child (e.g. xcrun mcpbridge) deadlocked elanous's
   // boot. The trace category prefix `mcp.client.boot.*` keeps these
   // distinct from any per-call instrumentation a future PR adds.
+  const injectedValuesByServer = new Map<string, string[]>();
+  const redactPluginValues = (text: string): string => {
+    try {
+      const root = elanousStateRoot();
+      const current = [...new Set(listInstalledPlugins(root).map(item => item.name))]
+        .flatMap(name => Object.values(pluginEnv(name, root)));
+      return redactValues(text, [...current, ...injectedValuesByServer.values()].flat());
+    } catch { return '[REDACTED]'; }
+  };
   const bootLogger = (id: string) => (event: string, data?: Record<string, unknown>) => {
     try {
-      debug.log('mcp.client.boot', event, { id, ...(data ?? {}) });
+      const safe = data ? Object.fromEntries(Object.entries(data).map(([key, value]) =>
+        [key, typeof value === 'string' ? redactPluginValues(value) : value])) : {};
+      debug.log('mcp.client.boot', event, { id, ...safe });
     } catch { /* logger must never throw the boot */ }
   };
   const createClient =
     opts.createClient ??
-    ((spec: McpServerSpec) =>
-      spec.transport === 'http'
-        ? new McpClient({
-            id: spec.id,
-            url: spec.url,
-            logger: bootLogger(spec.id),
-            ...(spec.oauthIssuer ? { oauthIssuer: spec.oauthIssuer } : {}),
-            ...(spec.oauthTokenEndpoint ? { oauthTokenEndpoint: spec.oauthTokenEndpoint } : {}),
-            ...(spec.bearerTokenEnv ? { bearerTokenEnv: spec.bearerTokenEnv } : {}),
-          })
-        : new McpClient({ id: spec.id, command: spec.command, logger: bootLogger(spec.id) }));
+    ((spec: McpServerSpec) => {
+      if (spec.transport === 'http') return new McpClient({
+        id: spec.id, url: spec.url, logger: bootLogger(spec.id),
+        ...(spec.oauthIssuer ? { oauthIssuer: spec.oauthIssuer } : {}),
+        ...(spec.oauthTokenEndpoint ? { oauthTokenEndpoint: spec.oauthTokenEndpoint } : {}),
+        ...(spec.bearerTokenEnv ? { bearerTokenEnv: spec.bearerTokenEnv } : {}),
+      });
+      const root = elanousStateRoot();
+      const installed = listInstalledPlugins(root);
+      const owners = [...new Set(listNodeKinds('workflow').filter(entry =>
+        !entry.core && entry.plugin && entry.run && 'mcp' in entry.run && entry.run.mcp.server === spec.id,
+      ).map(entry => entry.plugin!))];
+      const commandOwners = [...new Set(installed.filter(item => {
+        const dir = realpathSync(item.path);
+        return spec.command.some(arg => {
+          if (typeof arg !== 'string' || !existsSync(arg)) return false;
+          try { return realpathSync(resolve(arg)).startsWith(`${dir}${sep}`); }
+          catch { return false; }
+        });
+      }).map(item => item.name))];
+      const selected = commandOwners.length === 1 && owners.length === 1 && owners[0] === commandOwners[0]
+        ? commandOwners[0] : undefined;
+      return new McpClient({ id: spec.id, command: spec.command, logger: bootLogger(spec.id),
+        spawn: (cmd, args) => {
+          const declaredEnv = [...new Set(listInstalledPlugins(root).map(item => item.name))]
+            .flatMap(name => credentialStatus(name, root).fields.map(field => field.env));
+          const childEnv = { ...process.env };
+          for (const key of declaredEnv) delete childEnv[key];
+          injectedValuesByServer.delete(spec.id);
+          if (selected) {
+            const env = pluginEnv(selected, root);
+            const fields = credentialStatus(selected, root).fields.filter(field => field.set).map(field => field.name);
+            debug.log('plugin.credentials', 'injected', { plugin: selected, fields, count: fields.length });
+            Object.assign(childEnv, env);
+            injectedValuesByServer.set(spec.id, Object.values(env));
+          }
+          return nodeSpawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv });
+        },
+      });
+    });
   const handshakeTimeoutMs = opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const setTimeoutFn = opts.setTimeoutFn
     ?? ((cb: () => void, ms: number) => {
@@ -204,6 +252,11 @@ export async function registerMcpClients(
   const perServer: Record<string, McpServerBootResult> = {};
   let registered = 0;
 
+  if (opts.servers.some(spec => spec.transport === 'stdio') && !opts.createClient) {
+    try { syncInstalledPluginNodes(elanousStateRoot()); }
+    catch (error) { debug.log('graph.kinds', 'installed-sync-failed', { reason: String(error) }); }
+  }
+
   for (const spec of opts.servers) {
     const serverHandshakeTimeoutMs = spec.handshakeTimeoutMs ?? handshakeTimeoutMs;
     if (spec.enabled === false) {
@@ -213,6 +266,20 @@ export async function registerMcpClients(
     let client: McpClient | undefined;
     try {
       client = createClient(spec) as McpClient;
+      if (!opts.createClient && spec.transport === 'stdio') {
+        const originalCallTool = client.callTool.bind(client);
+        client.callTool = async (name: string, args: Record<string, unknown>): Promise<McpToolCallResult> => {
+          const values = injectedValuesByServer.get(spec.id) ?? [];
+          try {
+            const result = await originalCallTool(name, args);
+            return maskInjectedValues(result, values) as McpToolCallResult;
+          } catch (err) {
+            if (err instanceof Error) err.message = redactValues(err.message, values);
+            else throw new Error(redactValues(String(err), values));
+            throw err;
+          }
+        };
+      }
       await withTimeout(`mcp.${spec.id}.start`, () => client!.start(), serverHandshakeTimeoutMs, setTimeoutFn, clearTimeoutFn);
       const tools = await withTimeout(
         `mcp.${spec.id}.listTools`,
@@ -287,7 +354,7 @@ export async function registerMcpClients(
       }
       const msg = err instanceof Error ? err.message : String(err);
       const reasonClass = classifyMcpConnectFailure(err);
-      const detail = redactSecretText(msg);
+      const detail = redactPluginValues(redactSecretText(msg));
       perServer[spec.id] = { status: 'failed', toolCount: 0, reason: detail, reasonClass };
       try {
         debug.log('mcp.client.boot', 'connect-failed', { id: spec.id, reason: reasonClass, detail });
@@ -303,6 +370,7 @@ export async function registerMcpClients(
       if (client) {
         try { await client.dispose(); } catch { /* best-effort */ }
       }
+      injectedValuesByServer.delete(spec.id);
     }
   }
 
@@ -328,6 +396,7 @@ export async function registerMcpClients(
           }),
         ),
       );
+      injectedValuesByServer.clear();
     },
   };
 }
@@ -337,4 +406,20 @@ function defaultLogger(): McpBootLogger {
     info: (line) => console.info(line),
     warn: (line) => console.warn(line),
   };
+}
+
+function redactValues(text: string, values: readonly string[]): string {
+  return values.filter(value => value.length > 0)
+    .reduce((safe, value) => safe.replaceAll(value, '[REDACTED]'), text);
+}
+
+/** Mask injected credential values anywhere in an MCP result — string values **and object keys**
+ *  (a server can echo a secret back as a key, e.g. `structuredContent: { [secret]: "ok" }`). */
+export function maskInjectedValues(value: unknown, values: readonly string[]): unknown {
+  if (typeof value === 'string') return redactValues(value, values);
+  if (Array.isArray(value)) return value.map(item => maskInjectedValues(item, values));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [redactValues(key, values), maskInjectedValues(item, values)]));
+  }
+  return value;
 }

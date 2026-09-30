@@ -27,6 +27,11 @@ export function readSavedCursor(root: string): number {
   try { return Number(JSON.parse(readFileSync(cursorFile(root), 'utf8')).lastId) || 0; } catch { return 0; }
 }
 
+/** When the cursor last moved (= a run last found a new saved message). Undefined before the first message. */
+export function readSavedCursorAt(root: string): string | undefined {
+  try { const at = JSON.parse(readFileSync(cursorFile(root), 'utf8')).at; return typeof at === 'string' ? at : undefined; } catch { return undefined; }
+}
+
 function writeSavedCursor(root: string, lastId: number): void {
   mkdirSync(intakeLedgerDir(root), { recursive: true });
   writeFileSync(cursorFile(root), JSON.stringify({ lastId, at: new Date().toISOString() }) + '\n');

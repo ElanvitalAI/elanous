@@ -75,22 +75,44 @@ function makeVoiceAdapter(available: boolean): PwaVoiceAdapter {
 }
 
 describe('NEXUS WS bridge — /v1/acp + /v1/voice/ws (PR c)', () => {
-  test('without wsBridge opts, /v1/acp returns 404', async () => {
+  test('without wsBridge or metaApi, /v1/acp returns 401 before HTTP fallback', async () => {
     const fix = makeFixture();
     const port = uniquePort();
     const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
     try {
       const res = await fetch(`${srv.url}/v1/acp`);
-      expect(res.status).toBe(404);
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
-  test('without wsBridge opts, /v1/voice/ws returns 404', async () => {
+  test('without wsBridge or metaApi, /v1/voice/ws returns 401 before HTTP fallback', async () => {
     const fix = makeFixture();
     const port = uniquePort();
     const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
     try {
       const res = await fetch(`${srv.url}/v1/voice/ws`);
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toEqual({ error: 'unauthorized' });
+    } finally { srv.stop(); }
+  });
+
+  test('without wsBridge, authenticated /v1/acp returns 404', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false } });
+    try {
+      const res = await fetch(`${srv.url}/v1/acp`, { headers: { authorization: 'Bearer test-token' } });
+      expect(res.status).toBe(404);
+    } finally { srv.stop(); }
+  });
+
+  test('without wsBridge, authenticated /v1/voice/ws returns 404', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false } });
+    try {
+      const res = await fetch(`${srv.url}/v1/voice/ws`, { headers: { authorization: 'Bearer test-token' } });
       expect(res.status).toBe(404);
     } finally { srv.stop(); }
   });
@@ -102,10 +124,11 @@ describe('NEXUS WS bridge — /v1/acp + /v1/voice/ws (PR c)', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: port,
+      metaApi: { bearerToken: 'test-token', noAuth: false },
       wsBridge: { trace: () => { /* silent */ } },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/acp`);
+      const res = await fetch(`${srv.url}/v1/acp`, { headers: { authorization: 'Bearer test-token' } });
       expect(res.status).toBe(404);
     } finally { srv.stop(); }
   });
@@ -117,6 +140,7 @@ describe('NEXUS WS bridge — /v1/acp + /v1/voice/ws (PR c)', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: port,
+      metaApi: { bearerToken: 'test-token', noAuth: false },
       wsBridge: {
         voiceAdapter: makeVoiceAdapter(/* available */ false),
         trace: () => { /* silent */ },
@@ -136,6 +160,7 @@ describe('NEXUS WS bridge — /v1/acp + /v1/voice/ws (PR c)', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: port,
+      metaApi: { bearerToken: 'test-token', noAuth: false },
       wsBridge: { acpOnConnection: handler, trace: () => { /* silent */ } },
     });
     try {
@@ -162,6 +187,7 @@ describe('NEXUS WS bridge — /v1/acp + /v1/voice/ws (PR c)', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: port,
+      metaApi: { bearerToken: 'test-token', noAuth: false },
       wsBridge: { voiceAdapter: adapter, trace: () => { /* silent */ } },
     });
     try {
@@ -183,6 +209,7 @@ describe('NEXUS WS bridge — /v1/acp + /v1/voice/ws (PR c)', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: port,
+      metaApi: { bearerToken: 'test-token', noAuth: false },
       wsBridge: {
         acpOnConnection: handler,
         voiceAdapter: makeVoiceAdapter(true),

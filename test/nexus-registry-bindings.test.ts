@@ -1,7 +1,7 @@
 // NEXUS · subsystem registry / bindings tests (Phase N-3.5 PR τ)
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -21,6 +21,7 @@ import {
 import { parseBindingPath } from '../src/nexus/api/registry.js';
 import { nexusBindingsDir } from '../src/nexus/paths.js';
 import { runNexus, type RunNexusHandle } from '../src/nexus/index.js';
+import { ensureAuthToken } from '../src/auth/acp-token.js';
 import { makeTestSpawnBackend } from '../src/nexus/supervisor/spawn.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 
@@ -228,22 +229,54 @@ describe('HTTP /v1/registry/bindings', () => {
   let baseUrl: string;
 
   beforeEach(async () => {
+    writeFileSync(join(tmpRoot, 'acp-token'), 'test-token');
+    expect(ensureAuthToken().token).toBe('test-token');
     handle = await runNexus({
       detachForTesting: true,
       skipHttpServer: false,
+      skipRuntimeApi: false,
+      skipPushcutChannel: true,
+      skipPwaChannel: true,
+      skipTelegramChannel: true,
+      skipDiscordChannel: true,
+      skipTerminalChannel: true,
+      skipIntentPrediction: true,
+      toolCwd: tmpRoot,
       httpStartPort: 41000 + Math.floor(Math.random() * 2000),
       supervisorSpawnBackend: makeTestSpawnBackend(),
+      mcpEnabled: false,
+      skipEnvMigration: true,
+      cleanGhostTailscaleServeFn: async () => {},
     });
     baseUrl = handle!.httpServer!.url;
   });
   afterEach(() => { handle?.release(); handle = undefined; });
 
   async function call(path: string, init: RequestInit = {}): Promise<{ status: number; body: any }> {
-    const res = await fetch(`${baseUrl}${path}`, init);
+    const headers = new Headers(init.headers);
+    headers.set('authorization', 'Bearer test-token');
+    const res = await fetch(`${baseUrl}${path}`, { ...init, headers });
     let body: unknown = null;
     try { body = await res.json(); } catch { /* not JSON */ }
     return { status: res.status, body: body as any };
   }
+
+  test('without credentials, registry route is denied before dispatch', async () => {
+    const response = await fetch(`${baseUrl}/v1/registry/bindings`, {
+      headers: { authorization: 'Bearer wrong-token' },
+    });
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({ error: 'unauthorized' });
+  });
+
+  test('runNexus boots authenticated bindings route with existing bindings', async () => {
+    setBinding('pushcut', 'existing', { sessionId: 'existing-session' });
+    const response = await call('/v1/registry/bindings?channel=pushcut');
+    expect(response.status).toBe(200);
+    expect(response.body.bindings).toEqual([
+      expect.objectContaining({ key: 'existing', sessionId: 'existing-session' }),
+    ]);
+  });
 
   test('GET /v1/registry/bindings → empty channels', async () => {
     const res = await call('/v1/registry/bindings');

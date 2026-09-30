@@ -301,6 +301,15 @@ export function activeStoreNames(deps: LogFabricDeps, nowMs = Date.now()): strin
   return names;
 }
 
+/** 등록된 로그 저장소 수(이 인스턴스 ⊕ logs.db 가 있는 우주) — `@active` 가 연 수의 «분모». 못 세면 `null`(0 으로 접지 않는다). */
+export function registeredLogStoreCount(deps: Pick<LogFabricDeps, 'instances'> = {}): number | null {
+  try {
+    const names = new Set((deps.instances ?? readLogInstances)().filter((view) => view.dbExists).map((view) => view.name));
+    names.add(resolveLogInstanceName());
+    return names.size;
+  } catch { return null; }
+}
+
 export function handleLogsQuery(req: Request, opts: MetaApiOpts, deps: LogFabricDeps = {}): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
   const url = new URL(req.url);
@@ -374,7 +383,7 @@ export function handleLogsQuery(req: Request, opts: MetaApiOpts, deps: LogFabric
     ts: new Date().toISOString(),
     ...(failedStores.length ? { failedStores } : {}),
     ...(selection.storeLimitReached ? { storeLimitReached: true } : {}),
-    ...(activeStores ? { stores: activeStores } : {}),
+    ...(activeStores ? { stores: activeStores, registeredStores: registeredLogStoreCount(deps) } : {}),
   }, 200);
 }
 

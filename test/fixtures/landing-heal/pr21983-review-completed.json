@@ -1,0 +1,12 @@
+{
+ "pr": 21983,
+ "note": "실물 표본 — 09-29 #21983 코멘트(작성자 라운드는 첫 두 줄 · 리뷰어 «review completed (warn)» 원문 — 요약 본문에 «- » 글머리가 들어 있다)",
+ "comments": [
+  {
+   "body": "<!-- elanous-pr-comment v1 role=author round=0 run=run-cf486783-f97f-4024-855c-0c1a36831388 -->\nRound 0: child implementation completed."
+  },
+  {
+   "body": "<!-- elanous-pr-comment v1 role=reviewer round=0 run=run-cf486783-f97f-4024-855c-0c1a36831388 -->\nRound 0: review completed (warn).\n\n- Review summary: ⚠️ 자율 PR 리뷰: WARN\n**Should-fix**\n- `report` 반환값과 디버그 로그에는 열린 항목 수가 분리되지만, `emitDecision` 메시지는 여전히 미해결·미상 합계만 보여준다. 운영자가 결정 피드만 본다면 마지막 라운드의 `open` 2건을 구별할 수 없으므로 소비 경로를 확인해야 한다."
+  }
+ ]
+}

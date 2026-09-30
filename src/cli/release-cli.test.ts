@@ -1,10 +1,13 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { listChecklist, devVersion } from '../release-loop/checklist.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { releaseLedgerRoot } from '../instance/resolve.js';
 import { isPrerelease, isReleaseVersion, planPublish, publishRelease, registerReleaseCommands, tagRelease, verifyChecksums, verifyRelease, releaseNotesPageUrl, type ReleaseManifest, type Runner } from './release-cli.js';
 
 function fixture() {
@@ -29,6 +32,77 @@ function fixture() {
   writeFileSync(notes, 'notes');
   return { out, dist, manifest, notes };
 }
+
+describe('release checklist CLI', () => {
+  test('add → set → status JSON · actor · 사람 상태 · rm, 기존 help 명령 보존', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-checklist-cli-'));
+    setElanousConfigDir(dir);
+    const oldTrack = process.env.ELANOUS_TRACK;
+    process.env.ELANOUS_TRACK = 'T';
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
+    try {
+      await run('--version', '9.9.9', 'add', 'K1', '첫 칸');
+      await run('--version', '9.9.9', 'set', 'K1', '--status', 'red', '--evidence', '#1');
+      await run('--version', '9.9.9', 'status', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '9.9.9', red: 1, blocked: ['K1'] });
+      expect(listChecklist('9.9.9').history.at(-2)).toMatchObject({ by: 'T', id: 'K1', field: 'evidence', to: '#1', dev: devVersion() });
+      expect(listChecklist('9.9.9').history.at(-1)).toMatchObject({ by: 'T', id: 'K1', field: 'status', to: 'red', dev: devVersion() });
+      await run('status', '--version', '9.9.9');
+      expect(lines.slice(-4).join('\n')).toContain('🔴 칸: K1');
+      await run('list', '--version', '9.9.9', '--json');
+      expect(JSON.parse(lines.at(-1)!).items).toHaveLength(1);
+      await run('rm', 'K1', '--version', '9.9.9');
+      expect(listChecklist('9.9.9').items).toHaveLength(0);
+      const cmd = new Command(); registerReleaseCommands(cmd);
+      const release = cmd.commands.find((c) => c.name() === 'release')!;
+      expect(release.commands.map((c) => c.name())).toEqual(['checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes']);
+      expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
+      expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
+      expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
+    } finally {
+      output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+      if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
+    }
+  });
+
+  test('판 번호가 다른 판의 별칭과 충돌해도 실제 판 번호를 우선한다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-checklist-collision-'));
+    setElanousConfigDir(dir);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ release: { codenames: { '0.2.5': '9.9.9', '9.9.9': 'graph' } } }));
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
+    try {
+      await run('--version', '9.9.9', 'add', 'K1', 'real version');
+      await run('status', '--version', '9.9.9', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '9.9.9', codename: 'graph', yellow: 1 });
+      expect(listChecklist('0.2.5').items).toHaveLength(0);
+      await run('status', '--version', 'graph', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '9.9.9', yellow: 1 });
+    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('기본 개발판·별칭 조회·씨앗 CLI', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-checklist-alias-'));
+    setElanousConfigDir(dir);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ release: { codenames: { '0.2.5': 'graph' } } }));
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
+    try {
+      await run('seed', '--from', join(import.meta.dir, '..', '..', 'docs/ROADMAP-releases-0.2.5-and-0.2.6-2026-09-29.md'));
+      await run('status', '--version', 'graph', '--json');
+      const result = JSON.parse(lines.at(-1)!);
+      expect(result).toMatchObject({ version: '0.2.5', codename: 'graph', dev: devVersion() });
+      expect(result.items.length).toBeGreaterThan(12);
+      expect(result.history[0].dev).toBe(devVersion());
+      await run('status', '--version', 'graph');
+      expect(lines.at(-4)).toContain('0.2.5 (graph)');
+    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
 
 describe('release — 버전·자산', () => {
   test('버전 모양: x.y.z 와 -rc/-alpha/-beta.N 만 · 접두 v 는 아니다', () => {
@@ -85,13 +159,13 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
     const calls: string[] = [];
     const noRelease: Runner = (c, a) => { calls.push(`${c} ${a[0]} ${a[1]}`); return { status: c === 'gh' && a[1] === 'view' ? 1 : 0, stdout: '', stderr: '' }; };
     try {
-      const dry = await publishRelease({ dir: f.out, notesFile: f.notes, log: () => {} }, noRelease);
+      const dry = await publishRelease({ dir: f.out, notesFile: f.notes, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, noRelease);
       expect(dry.published).toBe(false);
       expect(calls).toEqual(['gh release view']);
       const exists: Runner = () => ({ status: 0, stdout: '', stderr: '' });
-      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, log: () => {} }, exists)).rejects.toThrow('이미 있는 릴리스');
+      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, exists)).rejects.toThrow('이미 있는 릴리스');
       writeFileSync(join(f.dist, 'elanous.tgz'), 'changed');
-      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, log: () => {} }, noRelease)).rejects.toThrow('elanous.tgz');
+      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, noRelease)).rejects.toThrow('elanous.tgz');
     } finally { rmSync(f.out, { recursive: true, force: true }); }
   });
 
@@ -100,9 +174,13 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
     const calls: string[] = [];
     const observations: Array<{ category: string; event: string; data: unknown }> = [];
     const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { observations.push({ category, event, data }); });
+    // The machine release ledger is real state (the next gate reads it) — a test must never write there.
+    const realRecord = join(releaseLedgerRoot(), 'release', '0.1.1', 'release.json');
+    const realBefore = existsSync(realRecord) ? statSync(realRecord).mtimeMs : null;
     try {
-      const r = await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls));
+      const r = await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, tagRunner(calls));
       expect(r.published).toBe(true);
+      expect(existsSync(realRecord) ? statSync(realRecord).mtimeMs : null).toBe(realBefore);
       const published = calls.findIndex((c) => c.startsWith('gh release create'));
       const tagged = calls.findIndex((c) => c.startsWith('git tag -a v0.1.1 '));
       expect(published).toBeGreaterThan(calls.findIndex((c) => c === 'git push origin HEAD:main'));
@@ -120,7 +198,7 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
     const f = fixture();
     const calls: string[] = [];
     try {
-      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls, { releaseFails: true }))).rejects.toThrow('release failed');
+      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, tagRunner(calls, { releaseFails: true }))).rejects.toThrow('release failed');
       expect(calls.filter((c) => c.startsWith('git tag ') || c.startsWith('git push origin refs/tags/'))).toHaveLength(0);
       expect(() => readFileSync(join(f.out, 'release', '0.1.1', 'release.json'))).toThrow();
     } finally { rmSync(f.out, { recursive: true, force: true }); }
@@ -130,7 +208,7 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
     const f = fixture();
     const calls: string[] = [];
     try {
-      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls, { tagPushFails: true }))).rejects.toThrow('tag push failed');
+      await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, tagRunner(calls, { tagPushFails: true }))).rejects.toThrow('tag push failed');
       expect(calls.some((c) => c.startsWith('git tag -a v0.1.1 '))).toBe(true);
       expect(() => readFileSync(join(f.out, 'release', '0.1.1', 'release.json'))).toThrow();
     } finally { rmSync(f.out, { recursive: true, force: true }); }
@@ -141,7 +219,7 @@ describe('release publish — 되돌릴 수 없으니 기본은 «보기만»', 
     try {
       for (const conflict of [{ local: 'b'.repeat(40) }, { remote: 'b'.repeat(40) }]) {
         const calls: string[] = [];
-        await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, log: () => {} }, tagRunner(calls, conflict))).rejects.toThrow('태그 충돌');
+        await expect(publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: f.out, ledgerRoot: f.out, log: () => {} }, tagRunner(calls, conflict))).rejects.toThrow('태그 충돌');
         expect(calls.filter((c) => c.startsWith('git tag ') || c.startsWith('git push ') || c.startsWith('gh release create'))).toHaveLength(0);
       }
     } finally { rmSync(f.out, { recursive: true, force: true }); }
@@ -308,7 +386,7 @@ describe('release yank — 설치기 리다이렉트 반영을 기다린다(📏
 
 describe('release --json — stdout 은 결과 한 줄(T-R 그래프 간선용)', () => {
   test('yank --json 보기만: stdout 이 JSON 한 줄 · ok true · applied false', () => {
-    const r = Bun.spawnSync(['bun', 'bin/elanous.mjs', 'release', 'yank', '--version', '9.9.9', '--json', '--public-repo', 'nobody-xyz/none'], { cwd: join(import.meta.dir, '..', '..'), stdout: 'pipe', stderr: 'pipe' });
+    const r = Bun.spawnSync(['bun', 'bin/elanous.mjs', '--test', 'release', 'yank', '--version', '9.9.9', '--json', '--public-repo', 'nobody-xyz/none'], { cwd: join(import.meta.dir, '..', '..'), stdout: 'pipe', stderr: 'pipe' });
     const lines = r.stdout.toString().trim().split('\n');
     expect(lines).toHaveLength(1);
     const d = JSON.parse(lines[0]!);
@@ -337,4 +415,43 @@ describe('release verify — 노트 페이지가 문서 사이트에 있나(🅕
     expect(lines.join('\n')).toContain('release/public/docs/releases/0.2.2.md');
     expect(releaseNotesPageUrl('0.3.0-rc.1')).toBeNull();
   });
+
+  test('publish persists identical 0600 release metadata in the machine ledger and worktree universe', async () => {
+    const f = fixture();
+    const ledgerRoot = join(f.out, 'machine-ledger');
+    const instanceRoot = join(f.out, 'worktree-universe');
+    try {
+      expect((await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot, ledgerRoot, log: () => {} }, tagRunner([]))).published).toBe(true);
+      const paths = [ledgerRoot, instanceRoot].map((root) => join(root, 'release/0.1.1/release.json'));
+      expect(readFileSync(paths[0]!, 'utf8')).toBe(readFileSync(paths[1]!, 'utf8'));
+      for (const path of paths) {
+        expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({ sourceCommit: f.manifest.sourceCommit, publishedAt: expect.any(String) });
+        expect(statSync(path).mode & 0o777).toBe(0o600);
+      }
+    } finally { rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+  test('explicit config directory prevents publish from writing to another ledger universe', async () => {
+    const f = fixture();
+    const instanceRoot = join(f.out, 'explicit-universe');
+    const other = join(f.out, 'outside-ledger');
+    setElanousConfigDir(instanceRoot);
+    try {
+      expect((await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot, ledgerRoot: other, log: () => {} }, tagRunner([]))).published).toBe(true);
+      expect(existsSync(join(instanceRoot, 'release/0.1.1/release.json'))).toBe(true);
+      expect(existsSync(join(other, 'release/0.1.1/release.json'))).toBe(false);
+      await publishRelease({ dir: f.out, notesFile: f.notes, yes: true, repoRoot: f.out, instanceRoot: other, ledgerRoot: other, log: () => {} }, tagRunner([]));
+      expect(existsSync(join(other, 'release/0.1.1/release.json'))).toBe(false);
+    } finally { resetElanousConfigDir(); rmSync(f.out, { recursive: true, force: true }); }
+  });
+
+});
+
+// 09-30: 이 파일의 publish 시험이 ledgerRoot 를 안 넘겨 `releaseLedgerRoot()` = 본집 `~/.elanous` 에 가짜 0.1.1 release.json 을 썼다
+// (진짜 v0.1.1 기록을 덮어 released 해석이 0.1.1 로 틀어졌다). 모든 publishRelease 호출은 두 뿌리를 시험 폴더로 못 박는다.
+test('every publishRelease call in this file pins both instanceRoot and ledgerRoot, so no run can write the production ledger', () => {
+  const source = readFileSync(import.meta.path, 'utf8');
+  const calls = [...source.matchAll(/publishRelease\(\{([^}]*)\}/g)].map((m) => m[1]!);
+  expect(calls.length).toBeGreaterThan(5);
+  expect(calls.filter((args) => !/\binstanceRoot\b/.test(args) || !/\bledgerRoot\b/.test(args))).toEqual([]);
 });

@@ -18,6 +18,7 @@ export interface MissionCliOpts {
   chain?: string;
   headless?: boolean;
   plugin?: string;
+  resources?: 'on' | 'off';
   evidence?: string; // 'doc' | 'tsc' | 'test'
   docDir?: string;
   docGlob?: string;
@@ -61,6 +62,9 @@ export async function runAgentMissionCliCommand(
   if (opts.plugin !== undefined && (!plugin || !['codex', 'claude'].includes(agentBackend.name) || opts.headless)) {
     return { ok: false, message: '--plugin 은 codex/claude 대화형 backend 에서 <name>@<market> 형식이어야 합니다', exitCode: 1 };
   }
+  if (opts.resources !== undefined && opts.resources !== 'on' && opts.resources !== 'off') {
+    return { ok: false, message: '--resources 는 on|off 여야 합니다', exitCode: 1 };
+  }
 
   // ── mission 텍스트(verbatim: --mission-file 우선) ──
   const readFile = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
@@ -97,6 +101,8 @@ export async function runAgentMissionCliCommand(
     backend: agentBackend.name,
     ...(chain ? { chain: chain as ('codex' | 'claude' | 'elanous')[] } : {}),
     ...(plugin ? { plugin } : {}),
+    resources: opts.resources ?? 'on',
+    ...(opts.backend ? { backendExplicit: opts.backend } : {}),
     ...(opts.headless ? { headless: true } : {}),
     branch: opts.branch,
     ...(opts.base ? { base: opts.base } : {}),

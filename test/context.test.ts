@@ -328,7 +328,6 @@ describe('tokenizeInput', () => {
   });
 
   test('supports ~/ home-relative paths', () => {
-    // Use ~/.elanous-tok-fixture.txt — create in real homedir then clean.
     const home = homedir();
     const name = `.elanous-tok-fixture-${Date.now()}.txt`;
     const abs = join(home, name);
@@ -337,7 +336,7 @@ describe('tokenizeInput', () => {
       const reg = createContextRegistry();
       const { added, text } = tokenizeInput(`read ~/${name}`, reg);
       expect(added).toHaveLength(1);
-      expect(added[0]!.attachment.sourcePath).toBe(abs);
+      expect(added[0]!.attachment.sourcePath).toBe(realpathSync(abs));
       expect(text).toBe(`read ${added[0]!.attachment.token}`);
     } finally {
       rmSync(abs, { force: true });

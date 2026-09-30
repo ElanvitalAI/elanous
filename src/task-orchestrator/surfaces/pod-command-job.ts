@@ -6,12 +6,14 @@
 // 명령 인자는 셸 문자열로 이어붙이지 않고 `"$@"` 로 따로 인용한다.
 
 import { spawnSync } from 'node:child_process';
+import { isAbsolute } from 'node:path';
+import { getUserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { collectPodArtifacts } from './pod-artifact-return.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
 import { readSkillEnvFiles } from './pod-skills.js';
-import { podSourceScript } from './pod-source-receive.js';
+import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import {
   POD_CHILD_REQUESTS,
   POD_JOB_DEADLINE_SECONDS,
@@ -73,6 +75,10 @@ export interface PodCommandJobInput {
   llm?: 'grok';
   /** 저장소를 clone 한다 — 비공개 저장소라 GitHub 토큰이 Secret 으로 간다(명시 opt-in). 기본은 clone 없이 `~/work` 에서 이미지의 `elanous` 로 돈다. */
   clone?: boolean;
+  hostMirror?: string;
+  /** 컨테이너 메모리 한도(기본 16Gi) — 게이트가 파일 하나 격리 Job 에 올린다. */
+  memoryLimit?: string;
+  source?: PodSource;
   deadlineSeconds: number;
   runId?: string;
 }
@@ -100,7 +106,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
     ...credLines,
     'curl -s -m 3 -o /dev/null http://host.orb.internal:31415/health && { echo "[pod] ISOLATION FAIL"; exit 3; }',
     ...(o.clone
-      ? ['export GH_TOKEN="$(cat /creds/gh-token)" && gh auth setup-git', podSourceScript({ kind: 'default' }, o.repoUrl)]
+      ? ['export GH_TOKEN="$(cat /creds/gh-token)" && gh auth setup-git', podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl)]
       : ['mkdir -p ~/work && cd ~/work']),
     `set -- ${quotedArgs}`,
     '"$@"',
@@ -125,16 +131,22 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
           initContainers: [{ name: 'isolation-gate', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never', command: ['bash', '-c'], args: [GATE] }],
           containers: [{
             name: 'child', image: o.image, imagePullPolicy: o.imagePullPolicy ?? 'Never',
-            resources: { requests: { ...POD_CHILD_REQUESTS }, limits: { memory: '16Gi', cpu: '4' } },
+            resources: { requests: { ...POD_CHILD_REQUESTS }, limits: { memory: o.memoryLimit ?? '16Gi', cpu: '4' } },
             command: ['bash', '-c'], args: [script],
             env: [
               ...(o.runId ? [{ name: 'ELANOUS_RUN_ID', value: o.runId }] : []),
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               { name: 'ELANOUS_POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
             ],
-            ...(secretKeys ? { volumeMounts: [{ name: 'creds', mountPath: '/creds', readOnly: true }] } : {}),
+            ...(secretKeys || o.hostMirror ? { volumeMounts: [
+              ...(secretKeys ? [{ name: 'creds', mountPath: '/creds', readOnly: true }] : []),
+              ...(o.hostMirror ? [{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }] : []),
+            ] } : {}),
           }],
-          ...(secretKeys ? { volumes: [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }] } : {}),
+          ...(secretKeys || o.hostMirror ? { volumes: [
+            ...(secretKeys ? [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }] : []),
+            ...(o.hostMirror ? [{ name: 'host-mirror', hostPath: { path: o.hostMirror, type: 'Directory' } }] : []),
+          ] } : {}),
         },
       },
     },
@@ -188,6 +200,10 @@ export interface RunPodCommandOptions {
   skills?: readonly string[];
   llm?: 'grok';
   clone?: boolean;
+  hostMirror?: string;
+  /** 컨테이너 메모리 한도(기본 16Gi). */
+  memoryLimit?: string;
+  source?: PodSource;
   ghToken?: () => string;
   deadlineSeconds?: number;
   namespace?: string;
@@ -207,6 +223,7 @@ export interface RunPodCommandOptions {
   sleep?: (ms: number) => Promise<void>;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
   env?: NodeJS.ProcessEnv;
+  configHostMirror?: () => string | undefined;
 }
 
 function jobFinished(types: string): 'complete' | 'failed' | null {
@@ -243,6 +260,9 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const deadlineSeconds = options.deadlineSeconds ?? POD_COMMAND_DEADLINE_SECONDS;
   const name = options.name ?? podJobName(`cmd-${Date.now().toString(36)}`);
   const env = options.env ?? process.env;
+  const hostMirror = (options.hostMirror ?? env.ELANOUS_POD_HOST_MIRROR
+    ?? (options.configHostMirror ?? (() => getUserConfig().pod?.hostMirror))())?.trim() || undefined;
+  if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
 
   let member: PodPoolMember | null = null;
   let pool = options.poolScheduler;
@@ -307,7 +327,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
     const manifest = podCommandJobManifest({
       name, namespace, image: member?.imageRef ?? image,
       ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
-      repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}), deadlineSeconds,
+      repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
+      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(options.memoryLimit ? { memoryLimit: options.memoryLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found']);

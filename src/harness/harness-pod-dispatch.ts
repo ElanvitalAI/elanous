@@ -19,6 +19,8 @@ export interface HarnessPodDispatchInput {
   /** say 의 문장, 또는 ask 의 골 문서 경로. */
   readonly input: string;
   readonly podPool?: string;
+  /** Host already recorded the observe-only dispatch; suppress a second decision in the Pod. */
+  readonly dispatchRecorded?: boolean;
   /** Pod 메모리 등급(standard|high) — 오케스트레이터 환경 `ELANOUS_POD_MEMORY_TIER` 로 Job 까지 간다. */
   readonly podMemory?: string;
   readonly autoMerge?: boolean;
@@ -49,7 +51,7 @@ export function podOrchestrateArgs(input: HarnessPodDispatchInput, goal: string)
   ];
 }
 
-type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => number | null; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn };
+type PodDispatchDeps = { run?: (cmd: string, args: readonly string[], env: NodeJS.ProcessEnv) => number | null; readFile?: (path: string) => string; cwd?: string; spawnChild?: typeof spawn; onOutput?: (text: string) => void };
 
 export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDispatchDeps & { run: NonNullable<PodDispatchDeps['run']> }): number;
 export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps?: PodDispatchDeps): number | Promise<number>;
@@ -68,6 +70,8 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
   const args = podOrchestrateArgs(input, goal);
   const env = { ...process.env };
   delete env.ELANOUS_POD_GOAL_DOC;
+  delete env.ELANOUS_DISPATCH_RECORDED;
+  if (input.dispatchRecorded) env.ELANOUS_DISPATCH_RECORDED = '1';
   if (input.podMemory) env.ELANOUS_POD_MEMORY_TIER = input.podMemory;
   if (input.entrance === 'cli-harness-ask') {
     const root = findGitDir(cwd)?.root;
@@ -84,7 +88,9 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     goalChars: goal.length, ...(input.entrance === 'cli-harness-ask' ? { goalPath: input.input } : {}),
   });
   const run = deps.run ?? ((cmd: string, a: readonly string[], childEnv: NodeJS.ProcessEnv) => new Promise<number>((resolveStatus) => {
-    const child = (deps.spawnChild ?? spawn)(cmd, [...a], { stdio: 'inherit', env: childEnv });
+    const child = (deps.spawnChild ?? spawn)(cmd, [...a], { stdio: deps.onOutput ? ['inherit', 'pipe', 'inherit'] : 'inherit', env: childEnv });
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => { process.stdout.write(chunk); deps.onOutput?.(chunk); });
     let forwarded: NodeJS.Signals | undefined;
     const forward = (signal: NodeJS.Signals) => {
       forwarded = signal;

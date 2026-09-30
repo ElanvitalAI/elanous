@@ -168,11 +168,8 @@ describe('BackgroundNotifier · log fallback', () => {
     const pc = makeFakePushcut({ configured: false });
     const h = makeHarness(pc);
     // No logFallback passed · just silence.
-    h.signalWaiting();
+    expect(() => h.signalWaiting()).not.toThrow();
     await flush();
-    // No throw · no side effect observable. Test is that it doesn't
-    // throw · if we reach this line we're good.
-    expect(true).toBe(true);
     h.notifier.dispose();
   });
 });
@@ -194,7 +191,6 @@ describe('BackgroundNotifier · dispose', () => {
     const pc = makeFakePushcut();
     const h = makeHarness(pc);
     h.notifier.dispose();
-    h.notifier.dispose(); // no throw
-    expect(true).toBe(true);
+    expect(() => h.notifier.dispose()).not.toThrow();
   });
 });

@@ -10,7 +10,7 @@ import { makeTestSpawnBackend } from '../src/nexus/supervisor/spawn.js';
 import { createDefaultHealthProbeBackend } from '../src/nexus/supervisor/health.js';
 import { createDaemonTabSpec } from '../src/nexus/kinds/daemon.js';
 import type { PtyBackend } from '../src/nexus/webterm/pty.js';
-import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+import { getElanousConfigDir, setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
 
 let tmpRoot: string;
 let prevHome: string | undefined;
@@ -75,9 +75,9 @@ beforeEach(async () => {
   prevDc = process.env.ELANOUS_DISCORD_BOT_TOKEN;
   process.env.HOME = tmpRoot;
   mkdirSync(join(tmpRoot, '.elanous'), { recursive: true });
-  writeFileSync(join(tmpRoot, '.elanous', 'acp-token'), bearerToken);
   process.env.ELANOUS_NEXUS_DIR = tmpRoot;
   setElanousConfigDir(tmpRoot);
+  writeFileSync(join(getElanousConfigDir(), 'acp-token'), bearerToken);
   delete process.env.ELANOUS_TELEGRAM_BOT_TOKEN;
   delete process.env.ELANOUS_DISCORD_BOT_TOKEN;
   handle = await runNexus({
@@ -606,7 +606,7 @@ describe('tab mutation authentication', () => {
     expect(handle!.registry.has('chat:bearer-success')).toBe(true);
   });
 
-  test('rejects every mutation when the authorization runtime is unavailable', async () => {
+  test('rejects headerless mutations when the API runtime is unavailable', async () => {
     handle?.release();
     handle = await runNexus({
       detachForTesting: true,
@@ -637,10 +637,21 @@ describe('tab mutation authentication', () => {
     ];
 
     for (const [path, init] of requests) {
-      const res = await call(path, init);
-      expect(res.status).toBe(503);
-      expect(res.body.error).toBe('meta-api-runtime-not-wired');
+      const res = await unauthenticatedCall(path, init);
+      expect(res.status).toBe(401);
+      expect(res.body.error).toBe('unauthorized');
     }
+
+    const authenticated = await unauthenticatedCall('/v1/nexus/tabs', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${bearerToken}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ kind: 'chat', id: 'chat:runtime-unavailable' }),
+    });
+    expect(authenticated.status).toBe(503);
+    expect(authenticated.body.error).toBe('meta-api-runtime-not-wired');
 
     expect(handle!.registry.has('chat:runtime-unavailable')).toBe(false);
     const protectedTab = handle!.registry.get('d:auth-runtime-unavailable');

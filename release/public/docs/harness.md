@@ -84,6 +84,8 @@ These apply to both `harness say` and `harness ask`:
 |---|---|
 | `elanous harness worktrees` | Every worktree the harness made, and whether it is safe to remove |
 | `elanous harness clean` | Remove finished harness worktrees — a dry run unless you add `--yes`; worktrees with an open pull request are always kept |
+| `elanous harness stop <runId>` | Stop one run — its orchestrator process, and its Kubernetes job if it ran on a cluster |
+| `elanous harness processes` | The processes this repository started, grouped by resource use and age (read-only; kills nothing) |
 | `elanous self run-ledger` | The observation ledger of a run |
 | `elanous logs --space <runId>` | The log of one run |
 

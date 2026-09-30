@@ -1,7 +1,7 @@
 // I10 (2026-05-12) — GET /v1/intake/runs e2e + emit-on-preview integration.
 //
 // Verifies that:
-//   1. The endpoint returns 503 when metaApi is unwired.
+//   1. The endpoint returns 401 when metaApi is unwired.
 //   2. An empty file → empty result (no error).
 //   3. A preview call emits a row that the read endpoint surfaces.
 //   4. Aggregates roll up across multiple preview calls.
@@ -55,7 +55,7 @@ async function uniquePort(): Promise<number> {
 }
 
 describe('I10 GET /v1/intake/runs', () => {
-  test('returns 503 when metaApi runtime is unwired', async () => {
+  test('returns 401 when metaApi runtime is unwired', async () => {
     const fix = makeFixture();
     const srv = startNexusHttpServer({
       ...fix,
@@ -64,9 +64,24 @@ describe('I10 GET /v1/intake/runs', () => {
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/runs`);
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
       const body = await res.json();
-      expect(body.error).toBe('meta-api-runtime-not-wired');
+      expect(body.error).toBe('unauthorized');
+    } finally { srv.stop(); }
+  });
+
+  test('wired metaApi without bearer denies before the runs handler', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix,
+      eventBus: fix.bus,
+      startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/intake/runs`);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
@@ -76,10 +91,10 @@ describe('I10 GET /v1/intake/runs', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/intake/runs`);
+      const res = await fetch(`${srv.url}/v1/intake/runs`, { headers: { authorization: 'Bearer test-token' } });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.total).toBe(0);
@@ -95,16 +110,16 @@ describe('I10 GET /v1/intake/runs', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const preview = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: 'memo for I10' }),
       });
       expect(preview.status).toBe(200);
-      const runs = await fetch(`${srv.url}/v1/intake/runs`);
+      const runs = await fetch(`${srv.url}/v1/intake/runs`, { headers: { authorization: 'Bearer test-token' } });
       const body = await runs.json();
       expect(body.total).toBe(1);
       expect(body.rows.length).toBe(1);
@@ -126,17 +141,17 @@ describe('I10 GET /v1/intake/runs', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       for (let i = 0; i < 3; i += 1) {
         await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
           body: JSON.stringify({ rawText: `memo ${i}` }),
         });
       }
-      const runs = await fetch(`${srv.url}/v1/intake/runs`);
+      const runs = await fetch(`${srv.url}/v1/intake/runs`, { headers: { authorization: 'Bearer test-token' } });
       const body = await runs.json();
       expect(body.total).toBe(3);
       expect(body.aggregates.byKind.preview).toBe(3);
@@ -150,17 +165,17 @@ describe('I10 GET /v1/intake/runs', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       for (let i = 0; i < 5; i += 1) {
         await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
           method: 'POST',
-          headers: { 'content-type': 'application/json' },
+          headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
           body: JSON.stringify({ rawText: `memo ${i}` }),
         });
       }
-      const runs = await fetch(`${srv.url}/v1/intake/runs?limit=2`);
+      const runs = await fetch(`${srv.url}/v1/intake/runs?limit=2`, { headers: { authorization: 'Bearer test-token' } });
       const body = await runs.json();
       expect(body.total).toBe(5);            // all 5 in the file
       expect(body.rows.length).toBe(2);      // but only 2 surfaced

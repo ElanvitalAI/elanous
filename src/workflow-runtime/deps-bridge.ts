@@ -40,11 +40,12 @@ import {
  *  optional `signal` is forwarded to the skill runner so workflow-level
  *  abort propagates. Returns the skill's full response text. */
 export function buildRunSkill(opts: { signal?: AbortSignal } = {}) {
-  return async function runSkill(slug: string, args: string): Promise<string> {
-    const manifest = parseSkillMd(slug, LOCAL_SKILLS_DIR);
+  return async function runSkill(slug: string, args: string, runOpts: { skillsDir?: string } = {}): Promise<string> {
+    // 플러그인 노드는 자기 팩의 `skills/` 를 먼저 본다 — 설치자 HOME 에 기대지 않는다(🅕 K3 실물 09-30).
+    const manifest = (runOpts.skillsDir ? parseSkillMd(slug, runOpts.skillsDir) : null) ?? parseSkillMd(slug, LOCAL_SKILLS_DIR);
     if (!manifest) {
       throw new Error(
-        `unknown skill '${slug}'. Skills are loaded from ${LOCAL_SKILLS_DIR} (or ~/.claude/skills) — check the slug or add a SKILL.md.`,
+        `unknown skill '${slug}'. Skills are loaded from ${runOpts.skillsDir ? `${runOpts.skillsDir}, then ` : ''}${LOCAL_SKILLS_DIR} (or ~/.claude/skills) — check the slug or add a SKILL.md.`,
       );
     }
     let buffered = '';

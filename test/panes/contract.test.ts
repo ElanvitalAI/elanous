@@ -82,13 +82,16 @@ describe('Phase 1 — PlaceholderPane implements full Pane contract', () => {
 
   test('mount + unmount are idempotent', () => {
     const pane = new PlaceholderPane(makeRef('p1'), 'empty');
-    const ctx = makeCtx();
+    let registered = 0;
+    const ctx: PaneContext = {
+      ...makeCtx(),
+      onUnmount: () => { registered++; },
+    };
     pane.mount(ctx);
     pane.mount(ctx);  // second call should be a no-op
+    expect(registered).toBe(1);
     pane.unmount();
-    pane.unmount();  // second call should be a no-op
-    // No exception = pass.
-    expect(true).toBe(true);
+    expect(() => pane.unmount()).not.toThrow();
   });
 });
 

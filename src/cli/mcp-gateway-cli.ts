@@ -6,6 +6,7 @@ import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { issueMcpPat, listMcpPats, revokeMcpPat } from '../mcp-gateway/pat-store.js';
 import { startMcpGateway } from '../mcp-gateway/gateway.js';
+import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 
 function privateTokenFile(path: string): string {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -47,12 +48,15 @@ export function registerMcpGatewayCommands(mcp: Command): void {
     .description('Owner-PAT authenticated public MCP relay to the scoped NEXUS endpoint')
     .option('--host <host>', 'Bind host', '127.0.0.1')
     .option('--port <port>', 'Bind port', '31482')
-    .requiredOption('--nexus-url <url>', 'NEXUS base URL')
+    .option('--nexus-url <url>', 'NEXUS base URL. Default: the current daemon (elanous nexus show).')
     .option('--public-url <url>', 'Public HTTPS origin used in protected resource metadata')
     .option('--nexus-token-file <path>', 'Private file holding the mcp-public NEXUS token; use - for stdin')
-    .action(safeAction(async (opts: { host: string; port: string; nexusUrl: string; publicUrl?: string; nexusTokenFile?: string }) => {
+    .action(safeAction(async (opts: { host: string; port: string; nexusUrl?: string; publicUrl?: string; nexusTokenFile?: string }) => {
       const port = Number(opts.port);
       if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error('invalid gateway port');
+      // 데몬 주소는 짐작하지 않는다 — 통합관제(daemon-endpoint)에 묻고, 모르면 멈춘다(대표 09-28).
+      const nexusUrl = opts.nexusUrl ?? resolveDaemonEndpoint()?.baseUrl;
+      if (!nexusUrl) throw new Error('daemon address unknown — pass --nexus-url or start the daemon (elanous nexus show)');
       if (!opts.publicUrl) throw new Error('--public-url <url> required for protected-resource metadata');
       if (!opts.nexusTokenFile) throw new Error('--nexus-token-file <path|-> required (no token argv)');
       if (opts.nexusTokenFile === '-' && process.stdin.isTTY) throw new Error('pipe the nexus token on stdin');
@@ -66,7 +70,7 @@ export function registerMcpGatewayCommands(mcp: Command): void {
         if (!stat.isFile() || (stat.mode & 0o077) !== 0) throw new Error('PAT store must be a private regular file (0600)');
       } finally { closeSync(fd); }
       listMcpPats(patRoot);
-      const server = startMcpGateway({ host: opts.host, port, nexusUrl: opts.nexusUrl, nexusToken, patRoot, publicUrl: opts.publicUrl });
+      const server = startMcpGateway({ host: opts.host, port, nexusUrl, nexusToken, patRoot, publicUrl: opts.publicUrl });
       process.stderr.write(`MCP gateway listening on ${server.hostname}:${server.port}\n`);
     }));
 

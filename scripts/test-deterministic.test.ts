@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -199,7 +199,9 @@ test('deterministic runner probe', async () => {
       pid: process.pid,
       ppid: process.ppid,
       HOME: process.env.HOME,
-      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? null,
+      ELANOUS_TEST_HOME: process.env.ELANOUS_TEST_HOME,
+      ELANOUS_HOST_ID: process.env.ELANOUS_HOST_ID ?? null,
       ELANOUS_STATE_DIR: process.env.ELANOUS_STATE_DIR,
       ELANOUS_CONFIG_DIR: process.env.ELANOUS_CONFIG_DIR,
       ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? null,
@@ -220,6 +222,11 @@ test('deterministic runner probe', async () => {
     await Bun.sleep(60_000);
   }
   if (mode === 'hang') await Bun.sleep(60_000);
+  if (mode === 'xdg-warning') {
+    const { userConfigPath } = await import(${JSON.stringify(join(import.meta.dir, '../src/user-config.ts'))});
+    const resolved = userConfigPath();
+    if (resolved !== process.env.ELANOUS_STATE_DIR + '/config.json') throw new Error('config escaped isolated root: ' + resolved);
+  }
   if (mode === 'stdout-marker') console.log('DETERMINISTIC_STDOUT_VISIBLE');
   if (mode === 'exit-1') throw new Error('forced child failure');
 }, 70_000);
@@ -231,7 +238,9 @@ async function waitForProbe(path: string): Promise<{
   pid: number;
   ppid: number;
   HOME: string;
-  XDG_CONFIG_HOME?: string;
+  XDG_CONFIG_HOME?: string | null;
+  ELANOUS_TEST_HOME?: string;
+  ELANOUS_HOST_ID?: string | null;
   ELANOUS_STATE_DIR?: string;
   ELANOUS_CONFIG_DIR?: string;
   ANTHROPIC_API_KEY?: string | null;
@@ -273,9 +282,12 @@ describe('scripts/test-deterministic.ts preservation', () => {
   test('keeps the human deterministic entrypoint wired to the credential filter and redirected roots', () => {
     expect(source).toContain("import { isCredentialKey } from './lib/deterministic-env.js';");
     expect(source).toContain("'ELANOUS_HARNESS_SPACE'");
-    expect(source).toContain('!isCredentialKey(key) && !HARNESS_TEST_ENV_KEYS.includes');
+    expect(source).toContain('!isCredentialKey(key)');
+    expect(source).toContain('!HARNESS_TEST_ENV_KEYS.includes');
+    expect(source).toContain('!EXECUTION_ORIGIN_ENV_KEYS.includes');
     expect(source).toContain('env.HOME = testRoot;');
-    expect(source).toContain("env.XDG_CONFIG_HOME = join(testRoot, '.config');");
+    expect(source).toContain('delete env.XDG_CONFIG_HOME;');
+    expect(source).toContain('env.ELANOUS_TEST_HOME = testRoot;');
     expect(source).toContain("env.ELANOUS_STATE_DIR = join(testRoot, 'state');");
     expect(source).toContain("env.ELANOUS_CONFIG_DIR = join(testRoot, 'config');");
     expect(source).toContain('env,');
@@ -332,6 +344,8 @@ describe('prepareIsolatedTestEnv', () => {
       APIFY_TOKEN: 'live-token',
       OPENAI_BASE_URL: 'https://example.invalid',
       HOME: '/real/home',
+      XDG_CONFIG_HOME: '/real/.config',
+      ELANOUS_TEST_HOME: '/real/test-home',
       ELANOUS_STATE_DIR: '/real/state',
       ELANOUS_CONFIG_DIR: '/real/config',
       ELANOUS_HARNESS_SPACE: 'self-implement',
@@ -340,13 +354,23 @@ describe('prepareIsolatedTestEnv', () => {
       ELANOUS_HARNESS_ROLE: 'executor',
       ELANOUS_HARNESS_DETACHED: '1',
       ELANOUS_RUN_ID: 'run-parent',
+      ELANOUS_HOST_ID: 'x',
+      ELANOUS_RUN_CONTEXT: 'self-implement',
+      ELANOUS_PARENT_RUN_ID: 'run-ancestor',
+      ELANOUS_PARENT_PTY_ID: 'pty-ancestor',
+      ELANOUS_PARENT_SELF_DEV_RUNS_DIR: '/real/runs',
+      ELANOUS_SUBSTRATE: 'pod',
+      ELANOUS_ARM_ID: 'arm-parent',
+      ELANOUS_STATE_DIR_SOURCE: 'derived',
+      ELANOUS_CODEX_ACCOUNT: 'team',
       PATH: '/usr/bin',
     }, testRoot);
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
     expect(env.APIFY_TOKEN).toBeUndefined();
     expect(env.OPENAI_BASE_URL).toBe('https://example.invalid');
     expect(env.HOME).toBe(testRoot);
-    expect(env.XDG_CONFIG_HOME).toBe(`${testRoot}/.config`);
+    expect(env.XDG_CONFIG_HOME).toBeUndefined();
+    expect(env.ELANOUS_TEST_HOME).toBe(testRoot);
     expect(env.ELANOUS_STATE_DIR).toBe(`${testRoot}/state`);
     expect(env.ELANOUS_CONFIG_DIR).toBe(`${testRoot}/config`);
     expect(env.ELANOUS_HARNESS_SPACE).toBeUndefined();
@@ -354,7 +378,11 @@ describe('prepareIsolatedTestEnv', () => {
     expect(env.ELANOUS_HARNESS_BOUNDARY).toBeUndefined();
     expect(env.ELANOUS_HARNESS_ROLE).toBeUndefined();
     expect(env.ELANOUS_HARNESS_DETACHED).toBeUndefined();
-    expect(env.ELANOUS_RUN_ID).toBeUndefined();
+    for (const key of [
+      'ELANOUS_RUN_ID', 'ELANOUS_HOST_ID', 'ELANOUS_RUN_CONTEXT',
+      'ELANOUS_PARENT_RUN_ID', 'ELANOUS_PARENT_PTY_ID', 'ELANOUS_PARENT_SELF_DEV_RUNS_DIR',
+      'ELANOUS_SUBSTRATE', 'ELANOUS_ARM_ID', 'ELANOUS_STATE_DIR_SOURCE', 'ELANOUS_CODEX_ACCOUNT',
+    ]) expect(env[key]).toBeUndefined();
     expect(env.PATH).toBe('/usr/bin');
   });
 });
@@ -781,6 +809,34 @@ describe('runDeterministicTests lifecycle', () => {
 });
 
 describe('runtime entrypoint', () => {
+  test('strips parent host identity and keeps the XDG deprecation warning off child stderr with a legacy config present', async () => {
+    const directory = makeRoot('elanous-deterministic-live-');
+    const legacyHome = makeRoot('elanous-deterministic-legacy-');
+    const legacyDir = join(legacyHome, '.config', 'elanous');
+    mkdirSync(legacyDir, { recursive: true });
+    const legacyConfig = join(legacyDir, 'config.json');
+    writeFileSync(legacyConfig, '{"llm":{"provider":"auto"}}');
+    const probePath = join(directory, 'probe.json');
+    const child = startRunner({
+      DETERMINISTIC_RUNNER_PROBE_PATH: probePath,
+      DETERMINISTIC_RUNNER_PROBE_MODE: 'xdg-warning',
+      ELANOUS_HOST_ID: 'x',
+      ELANOUS_TEST_HOME: legacyHome,
+      XDG_CONFIG_HOME: join(legacyHome, '.config'),
+      ELANOUS_TEST_FORCE_XDG_WARNING: '1',
+      ELANOUS_STATE_DIR_SOURCE: 'derived',
+    }, writeProbeTest(directory));
+    const result = await collect(child);
+    const probe = await waitForProbe(probePath);
+    expect(result.code).toBe(0);
+    expect(probe.ELANOUS_HOST_ID).toBeNull();
+    expect(probe.XDG_CONFIG_HOME).toBeNull();
+    expect(probe.ELANOUS_TEST_HOME).toBe(probe.HOME);
+    expect(result.stderr).not.toContain('XDG_CONFIG_HOME is set');
+    expect(readFileSync(legacyConfig, 'utf8')).toBe('{"llm":{"provider":"auto"}}');
+    expect(existsSync(probe.HOME)).toBe(false);
+  }, 15_000);
+
   test('SIGTERM from the live entrypoint ends the direct child and removes the temporary root', async () => {
     const directory = makeRoot('elanous-deterministic-live-');
     const probePath = join(directory, 'probe.json');
@@ -796,7 +852,8 @@ describe('runtime entrypoint', () => {
     try {
       const probe = await waitForProbe(probePath);
       expect(probe.HOME.includes(TEMP_ROOT_PREFIX)).toBe(true);
-      expect(probe.XDG_CONFIG_HOME).toBe(`${probe.HOME}/.config`);
+      expect(probe.XDG_CONFIG_HOME).toBeNull();
+      expect(probe.ELANOUS_TEST_HOME).toBe(probe.HOME);
       expect(probe.ELANOUS_STATE_DIR).toBe(`${probe.HOME}/state`);
       expect(probe.ELANOUS_CONFIG_DIR).toBe(`${probe.HOME}/config`);
       expect(probe.ANTHROPIC_API_KEY).toBeNull();

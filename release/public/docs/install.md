@@ -8,11 +8,7 @@ elanous runs on **Bun** (not Node) on macOS, Linux and WSL2; Windows native Powe
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 ```
 
-Or with npm (needs [Bun](https://bun.sh) on your `PATH`):
-
-```bash
-npm install -g elanous
-```
+The `elanous` package on npm is older than the latest release — use the one-line installer above. The npm path returns to this page when npm is published with every release.
 
 Coming from **monad** (0.1.x)? Don't use `monad update` to move — see [Moving from monad](update-and-uninstall.md#moving-from-monad).
 
@@ -67,7 +63,7 @@ elanous doctor --fix --yes                        # builds node-pty
 
 The Codex CLI needs **Node.js 20 or newer** — Debian 12's own `nodejs` package is 18, so install Node from [nodejs.org](https://nodejs.org/en/download) (or your distribution's Node 20+ source) before `npm install -g @openai/codex`.
 
-That is enough to boot. To run the daemon and the harness, let `doctor` install what they need — build tools and the node-pty rebuild, a pinned static `gh`, `rg`, Node and the Codex CLI (about 80 seconds on a bare Debian 12 VM):
+That is enough to boot. To run the daemon and the harness, let `doctor` fix what it can — the node-pty rebuild, a pinned static `gh` and the Python environment (`python3-venv`, with `--sudo`). It does **not** install Node or the Codex CLI: install Node.js 20+ as above, then `npm install -g @openai/codex`.
 
 ```bash
 elanous doctor --fix --yes --sudo
@@ -120,5 +116,6 @@ If you run the background service, restart it after an update — see [troublesh
 
 - On Linux, `node-pty` has no prebuilt binary; elanous falls back to Bun's own PTY and nothing breaks. `elanous doctor --fix --yes` rebuilds it when a C++ toolchain is present.
 - If `bun install` silently skips an optional dependency on Linux, check whether `TMPDIR` and Bun's cache are on different filesystems — `elanous doctor` reports it as `bun-tmpdir`, and `elanous doctor --fix --yes` adds the fix to your shell startup file. See [troubleshooting](troubleshooting.md#bun-skips-an-optional-dependency).
+- If the service log says the web app is not built, set `ELANOUS_PWA_STATIC_DIR` to a built web app folder (`apps/pwa/out` in a checkout, after `elanous nexus build`).
 
 Next: [quickstart](quickstart.md).

@@ -1,5 +1,6 @@
 'use client';
 
+import { HideInPublicCapture } from '@/lib/public-capture';
 import {
   forwardRef,
   useCallback,
@@ -538,11 +539,11 @@ export const TerminalChatDock = forwardRef<TerminalChatDockHandle, Props>(functi
             </button>
           )}
           <SessionPill />
-          <BudgetPill />
+          <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
           {/* PP-V-2 webterm (BACKLOG-webterm §3.1 · 2026-05-07) — month-to-date
               STT/TTS USD pill mirror of /chat header. PR #1891 컴포넌트 재사용 ·
               daemon URL 미설정 시 자동 hidden. */}
-          <VoiceCostPill />
+          <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
           {pendingPrompt && (
             <Button
               variant="destructive"

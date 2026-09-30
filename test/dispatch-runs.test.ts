@@ -63,7 +63,7 @@ async function uniquePort(): Promise<number> {
 }
 
 describe('D8 GET /v1/dispatch/runs', () => {
-  test('returns 503 when metaApi runtime is unwired', async () => {
+  test('returns 401 when metaApi runtime is unwired', async () => {
     const fix = makeFixture();
     const srv = startNexusHttpServer({
       ...fix,
@@ -72,7 +72,23 @@ describe('D8 GET /v1/dispatch/runs', () => {
     });
     try {
       const res = await fetch(`${srv.url}/v1/dispatch/runs`);
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
+    } finally { srv.stop(); }
+  });
+
+  test('wired metaApi without bearer denies before the runs handler', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix,
+      eventBus: fix.bus,
+      startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/dispatch/runs`);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
@@ -82,10 +98,10 @@ describe('D8 GET /v1/dispatch/runs', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/dispatch/runs`);
+      const res = await fetch(`${srv.url}/v1/dispatch/runs`, { headers: { authorization: 'Bearer test-token' } });
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.total).toBe(0);
@@ -102,10 +118,10 @@ describe('D8 GET /v1/dispatch/runs', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/dispatch/runs`);
+      const res = await fetch(`${srv.url}/v1/dispatch/runs`, { headers: { authorization: 'Bearer test-token' } });
       const body = await res.json();
       expect(body.total).toBe(3);
       expect(body.rows[0].taskId).toBe('task:c');
@@ -125,10 +141,10 @@ describe('D8 GET /v1/dispatch/runs', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/dispatch/runs?limit=2`);
+      const res = await fetch(`${srv.url}/v1/dispatch/runs?limit=2`, { headers: { authorization: 'Bearer test-token' } });
       const body = await res.json();
       expect(body.total).toBe(5);
       expect(body.rows.length).toBe(2);

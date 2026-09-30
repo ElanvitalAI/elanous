@@ -81,6 +81,102 @@ describe('packSourceBundle', () => {
     } finally { rmSync(f.dir, { recursive: true, force: true }); }
   });
 
+  test('no mirrorHead produces a full bundle fetchable into an empty repository', () => {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.repo, 'a.txt'), 'no mirror disk version\n');
+      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out });
+      const empty = join(f.dir, 'empty');
+      git(f.dir, 'init', empty);
+      git(empty, 'bundle', 'verify', bundle.bundlePath);
+      git(empty, 'fetch', bundle.bundlePath, 'refs/elanous/pod-source/*:refs/remotes/bundle/*');
+      expect(git(empty, 'show', `${bundle.headCommit}:a.txt`)).toBe('no mirror disk version');
+      expect(git(empty, 'rev-parse', `${bundle.headCommit}^`)).toBe(f.base);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('mirrorHead limits a thin bundle to history absent from the mirror, preserving the selected file scope', () => {
+    const f = fixture();
+    try {
+      const mirror = join(f.dir, 'mirror');
+      git(f.dir, 'clone', f.remote, mirror);
+      writeFileSync(join(f.repo, 'a.txt'), 'remote update\n');
+      git(f.repo, 'add', 'a.txt');
+      git(f.repo, 'commit', '-m', 'remote update');
+      git(f.repo, 'push', 'origin', 'main');
+      const base = git(f.repo, 'rev-parse', 'HEAD');
+      writeFileSync(join(f.repo, 'a.txt'), 'chosen disk version\n');
+      writeFileSync(join(f.repo, 'b.txt'), 'unrelated disk version\n');
+      const before = snapshot(f.repo);
+      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'files', base, paths: ['a.txt'], outDir: f.out, mirrorHead: f.base });
+      expect(snapshot(f.repo)).toEqual(before);
+      expect(bundle.baseCommit).toBe(base);
+      expect(bundle.fileCount).toBe(1);
+      expect(git(f.repo, 'bundle', 'list-heads', bundle.bundlePath)).toContain(bundle.headCommit);
+      const empty = join(f.dir, 'empty');
+      git(f.dir, 'init', empty);
+      expect(() => git(empty, 'bundle', 'verify', bundle.bundlePath)).toThrow();
+      expect(git(mirror, 'rev-parse', 'HEAD')).toBe(f.base);
+      git(mirror, 'bundle', 'verify', bundle.bundlePath);
+      git(mirror, 'fetch', bundle.bundlePath, 'refs/elanous/pod-source/*:refs/remotes/bundle/*');
+      expect(git(mirror, 'show', `${bundle.headCommit}:a.txt`)).toBe('chosen disk version');
+      expect(git(mirror, 'show', `${bundle.headCommit}:b.txt`)).toBe('original b');
+      expect(git(mirror, 'rev-parse', `${bundle.headCommit}^`)).toBe(base);
+      expect(git(f.repo, 'for-each-ref', '--format=%(refname)', 'refs/elanous/pod-source')).toBe('');
+      expect(existsSync(join(f.out, 'index.tmp'))).toBe(false);
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('unavailable or unrelated mirrorHead falls back to a full bundle fetchable into an empty repository', () => {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.repo, 'a.txt'), 'fallback disk version\n');
+      const orphan = join(f.dir, 'unrelated');
+      git(f.dir, 'init', orphan);
+      git(orphan, 'config', 'user.name', 'Test');
+      git(orphan, 'config', 'user.email', 'test@example.org');
+      writeFileSync(join(orphan, 'foreign.txt'), 'unrelated\n');
+      git(orphan, 'add', '-A');
+      git(orphan, 'commit', '-m', 'unrelated history');
+      git(f.repo, 'fetch', orphan, 'HEAD');
+      const unrelatedHead = git(f.repo, 'rev-parse', 'FETCH_HEAD');
+      const before = snapshot(f.repo);
+      for (const mirrorHead of ['f'.repeat(40), unrelatedHead]) {
+        const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, mirrorHead });
+        const empty = join(f.dir, `empty-${mirrorHead}`);
+        git(f.dir, 'init', empty);
+        git(empty, 'bundle', 'verify', bundle.bundlePath);
+        git(empty, 'fetch', bundle.bundlePath, 'refs/elanous/pod-source/*:refs/remotes/bundle/*');
+        expect(git(empty, 'show', `${bundle.headCommit}:a.txt`)).toBe('fallback disk version');
+        expect(git(empty, 'rev-parse', `${bundle.headCommit}^`)).toBe(f.base);
+      }
+      expect(snapshot(f.repo)).toEqual(before);
+      expect(existsSync(join(f.out, 'index.tmp'))).toBe(false);
+      expect(git(f.repo, 'for-each-ref', '--format=%(refname)', 'refs/elanous/pod-source')).toBe('');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
+  test('mirrorHead newer than the source base falls back to a self-contained bundle', () => {
+    const f = fixture();
+    try {
+      writeFileSync(join(f.repo, 'a.txt'), 'new remote version\n');
+      git(f.repo, 'add', 'a.txt');
+      git(f.repo, 'commit', '-m', 'advance mirror');
+      git(f.repo, 'push', 'origin', 'main');
+      const mirrorHead = git(f.repo, 'rev-parse', 'HEAD');
+      git(f.repo, 'reset', '--hard', f.base);
+      writeFileSync(join(f.repo, 'a.txt'), 'chosen older base version\n');
+      const bundle = packSourceBundle({ repoDir: f.repo, kind: 'worktree', base: f.base, outDir: f.out, mirrorHead });
+      const empty = join(f.dir, 'empty');
+      git(f.dir, 'init', empty);
+      git(empty, 'bundle', 'verify', bundle.bundlePath);
+      git(empty, 'fetch', bundle.bundlePath, 'refs/elanous/pod-source/*:refs/remotes/bundle/*');
+      expect(git(empty, 'show', `${bundle.headCommit}:a.txt`)).toBe('chosen older base version');
+      expect(git(empty, 'rev-parse', `${bundle.headCommit}^`)).toBe(f.base);
+      expect(git(f.repo, 'for-each-ref', '--format=%(refname)', 'refs/elanous/pod-source')).toBe('');
+    } finally { rmSync(f.dir, { recursive: true, force: true }); }
+  });
+
   test('files packs only selected disk paths relative to base, not unrelated staged changes', () => {
     const f = fixture();
     try {

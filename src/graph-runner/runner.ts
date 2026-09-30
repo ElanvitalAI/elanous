@@ -1,9 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
+import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
+import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { loadNodeCatalog } from '../self-implement/graph-catalog.js';
 import { parseGraphTemplateYaml, type GraphEdgeSpec, type GraphNodeSpec } from '../self-implement/graph-yaml.js';
@@ -215,6 +219,17 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const parsed = parseGraphTemplateYaml(stringifyYaml(document), path);
   if (!parsed.template || parsed.errors.length) throw new Error(parsed.errors.map((e) => `${e.path}: ${e.message}`).join('\n'));
   const graph = parsed.template;
+  const pluginRoot = elanousStateRoot();
+  const graphFile = realpathSync(path);
+  const installed = listInstalledPlugins(pluginRoot);
+  const owner = installed.find(item => {
+    const graphsDir = join(item.path, 'graphs');
+    return existsSync(graphsDir) && graphFile.startsWith(`${realpathSync(graphsDir)}${sep}`);
+  });
+  const credentials = owner ? pluginEnv(owner.name, pluginRoot) : {};
+  const declaredEnv = [...new Set(installed.map(item => item.name))]
+    .flatMap(name => credentialStatus(name, pluginRoot).fields.map(field => field.env));
+  const credentialFields = owner ? credentialStatus(owner.name, pluginRoot).fields.filter(field => field.set).map(field => field.name) : [];
   for (const terminal of graph.terminalNodes) {
     if (terminal !== 'done' && terminal !== 'failed') {
       throw new Error(`unsupported terminal node: ${terminal} (expected done or failed)`);
@@ -390,17 +405,32 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       mkdirSync(dirname(contextPath), { recursive: true });
       writeFileSync(contextPath, JSON.stringify({ graphId, runId, nodeId: current, input: state.input ?? null, outputs }, null, 2) + '\n');
       let code: number | null = null;
+      const redactCredentials = (text: string) => Object.values(credentials).filter(value => value.length > 0)
+        .reduce((safe, value) => safe.replaceAll(value, '[REDACTED]'), text);
       const runBash: BashRun = async (body, opts) => {
         const result = await (options.deps?.runBash ?? realRunBash)(body, opts);
         code = result.exitCode;
-        return result;
+        return { ...result, stdout: redactCredentials(result.stdout), stderr: redactCredentials(result.stderr) };
       };
-      const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env: { ...process.env, ELANOUS_GRAPH_CONTEXT: contextPath, ELANOUS_GRAPH_DIR: dirname(resolve(path)) } } as NodeExecContext;
+      if (owner) debug.log('plugin.credentials', 'injected', { plugin: owner.name, fields: credentialFields, count: credentialFields.length });
+      const env = { ...process.env };
+      for (const key of declaredEnv) delete env[key];
+      Object.assign(env, credentials);
+      // 러너가 명시로 받은 우주(`--config-dir`)를 `cmd:` 자식에 못 박는다 — 자식이 코드 위치(소스 트리)로 시험 우주를 새로 고르던 구멍
+      //   (09-30 🅢 스튜어드: 작업 트리 `graph run … --config-dir ~/.elanous` 의 자식 triage 가 «apiKey missing» · 0.2.5 컷 릴리스 루프도 같은 발사 줄).
+      if (getElanousConfigDirOverride()) {
+        env.ELANOUS_CONFIG_DIR = getElanousConfigDir();
+        env.ELANOUS_STATE_DIR = effectiveInstanceRoot();
+        debug.log('graph-runner', 'child-universe-pinned', { graphId, runId, node: current, configDir: env.ELANOUS_CONFIG_DIR, stateDir: env.ELANOUS_STATE_DIR });
+      }
+      env.ELANOUS_GRAPH_CONTEXT = contextPath;
+      env.ELANOUS_GRAPH_DIR = dirname(resolve(path));
+      const ctx = { arguments: '', artifactsDir: dirname(statePath), outputs: {}, resolvedProvider: undefined, resolvedModel: undefined, toolPolicy: {}, env } as NodeExecContext;
       const result = await executeBashNode({ id: current, type: 'bash', bash: command.command, ...(command.timeout_ms ? { idle_timeout: command.timeout_ms } : {}) } as BashNode, ctx, { runBash } as WorkflowDeps);
       output = result.output;
       ok = result.ok;
       exit = code;
-      error = result.error;
+      error = result.error ? redactCredentials(result.error) : undefined;
       state.executed++;
     }
     if (resumingCompleted && completed) {

@@ -7,7 +7,7 @@
 // just verify the boot translates flags → calls correctly.
 
 import { describe, expect, test, mock, spyOn, beforeEach, afterEach } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -183,6 +183,23 @@ describe('bootAcpServer dispatch', () => {
     expect(existsSync(tokenPath)).toBe(true);
     expect(readFileSync(tokenPath, 'utf8')).toBe('stub-token-xyz');
     expect(tokenPath.startsWith(isolatedConfigDir ?? '')).toBe(true);
+  });
+
+  test('websocket token creation failure aborts boot without exposing a token', async () => {
+    const tokenPath = acpTokenPath();
+    symlinkSync(join(isolatedConfigDir!, 'missing', 'token'), tokenPath);
+    const stderr = { writes: [] as string[], write: (s: string) => { stderr.writes.push(s); } };
+
+    try {
+      await expect(bootAcpServer(
+        { transport: 'websocket', port: 4242 },
+        { stderr, shutdownSignal: makePreAbortedSignal() },
+      )).rejects.toHaveProperty('code', 'ENOENT');
+      expect(runCalls).toHaveLength(0);
+      expect(stderr.writes.join('')).not.toContain('stub-token-xyz');
+    } finally {
+      unlinkSync(tokenPath);
+    }
   });
 
   test('websocket with --no-auth → banner says AUTH DISABLED', async () => {

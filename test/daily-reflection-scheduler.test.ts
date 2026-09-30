@@ -164,15 +164,16 @@ describe('startDailyReflectionScheduler · fireNow + polish', () => {
 describe('startDailyReflectionScheduler · clamp', () => {
   test('hour > 23 clamps to 23', () => {
     const timer = makeFakeTimer();
-    // Just verify construction does not throw on out-of-range input.
+    const events: Array<Record<string, unknown> | undefined> = [];
     const scheduler = startDailyReflectionScheduler({
       hour: 99,
       minute: 99,
       setInterval: timer.setInterval,
       clearInterval: timer.clearInterval,
+      log: (event, payload) => { if (event === 'boot') events.push(payload); },
     });
+    expect(events[0]).toMatchObject({ hour: 23, minute: 59 });
     scheduler.stop();
-    expect(true).toBe(true);
   });
 });
 

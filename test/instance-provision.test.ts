@@ -9,17 +9,23 @@
 //   ① 물질화(provisionDerivedUniverse) — 자식이 태어날 우주에 config 를 미리 깐다
 //   ② fail-fast(runOnboarding) — 그래도 빈 우주면 즉시·읽히는 에러로 죽는다(무한 대기 금지)
 
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import * as os from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../src/debug/log.js';
 import { setGitCommandRunnerForTesting } from '../src/git-fs/runner.js';
 import { provisionDerivedUniverse } from '../src/instance/provision.js';
 import { setTreeDerivedTestForTesting } from '../src/instance/resolve.js';
+import { spawnSyncText } from '../src/util/spawn-sync-output.js';
+
+/** macOS aliases /var → /private/var; run() has already removed the temp tree, so normalise the string (no filesystem lookup). */
+const realPath = (p: string | null | undefined): string => String(p).replace(/^\/private(?=\/var\/)/, '');
+
+const { tmpdir } = os;
 
 type ChildProvisionResult = {
-  outcome?: string; root?: string | null; hasConfig?: boolean; provider?: unknown;
+  outcome?: string; root?: string | null; treeRoot?: string; hasConfig?: boolean; provider?: unknown;
   needsOnboarding?: boolean; auxCopied?: boolean; derivedUntouched?: boolean;
   threw?: boolean; error?: string;
 };
@@ -82,6 +88,7 @@ describe('provisionDerivedUniverse — 자식이 태어날 우주를 채운다',
       //   그래서 물질화된 config 를 실제 로더로 읽어 needsOnboarding 을 직접 단정한다.
       const script = `
         const {provisionDerivedUniverse}=require('${process.cwd()}/src/instance/provision.ts');
+        const {treeDerivedRootFor}=require('${process.cwd()}/src/instance/resolve.ts');
         const {needsOnboarding}=await import('${process.cwd()}/src/onboarding.ts');
         const {getUserConfig}=require('${process.cwd()}/src/user-config.ts');
         const {readFileSync,existsSync}=require('node:fs');
@@ -95,7 +102,7 @@ describe('provisionDerivedUniverse — 자식이 태어날 우주를 채운다',
         let onb=null;
         if(has){ try{ onb=needsOnboarding(getUserConfig(cfgPath)); }catch(e){ onb='ERR:'+e.message; } }
         console.log(JSON.stringify({
-          outcome:r.outcome, root:r.root, hasConfig:has,
+          outcome:r.outcome, root:r.root, treeRoot:treeDerivedRootFor(process.cwd()), hasConfig:has,
           provider:parsed&&parsed.llm&&parsed.llm.provider,
           needsOnboarding:onb,
           auxCopied: !!r.root && existsSync((r.root||'')+'/auth.json'),
@@ -129,7 +136,9 @@ describe('provisionDerivedUniverse — 자식이 태어날 우주를 채운다',
   test('★빈 파생 우주를 물질화한다 — needsOnboarding 이 실제로 false 가 된다', async () => {
     const out = await run({ switchOn: true });
     expect(out.outcome).toBe('provisioned');
-    expect(out.root?.endsWith('.elanous-test')).toBe(true);
+    expect(out.treeRoot?.endsWith('.elanous-test')).toBe(true);
+    // macOS: tmpdir() is /var/… while one side comes back as /private/var/… — compare real paths on BOTH sides.
+    expect(realPath(out.root)).toBe(realPath(out.treeRoot));
     expect(out.hasConfig).toBe(true);            // ★종전엔 config.json 이 아예 없었다
     // ★이게 이 트랙의 진짜 계약이다 — 자식이 죽던 조건은 provider 부재가 아니라
     //   needsOnboarding(= !onboarding.completed) 이었다. sync 가 그 필드를 떨어뜨리면
@@ -146,6 +155,8 @@ describe('provisionDerivedUniverse — 자식이 태어날 우주를 채운다',
     const out = await run({ switchOn: true, explicitRoot });
     expect(out.outcome).toBe('explicit');
     expect(out.root).toBe(explicitRoot);
+    expect(out.treeRoot?.endsWith('.elanous-test')).toBe(true);
+    expect(out.root).not.toBe(out.treeRoot);
     expect(out.hasConfig).toBe(false);
     expect(out.derivedUntouched).toBe(true);     // ★파생 루트는 생성조차 안 됐다(자격 확산 0)
   }, 90_000);
@@ -153,6 +164,8 @@ describe('provisionDerivedUniverse — 자식이 태어날 우주를 채운다',
   test('이미 config 가 있으면 건드리지 않는다 (덮어쓰기 금지)', async () => {
     const out = await run({ switchOn: true, preExisting: true });
     expect(out.outcome).toBe('already');
+    // macOS: tmpdir() is /var/… while one side comes back as /private/var/… — compare real paths on BOTH sides.
+    expect(realPath(out.root)).toBe(realPath(out.treeRoot));
   }, 90_000);
 
   // fail-open 계약(리뷰 should-fix) — 물질화가 깨져도 **던지지 않는다**. 부모가 자식의 우주
@@ -161,6 +174,8 @@ describe('provisionDerivedUniverse — 자식이 태어날 우주를 채운다',
     // `.elanous-test` 를 **파일**로 만들어 두면 그 밑에 디렉터리를 못 만든다 = 복사 실패.
     const out = await run({ switchOn: true, blockRootAsFile: true });
     expect(out.outcome).toBe('failed');
+    // macOS: tmpdir() is /var/… while one side comes back as /private/var/… — compare real paths on BOTH sides.
+    expect(realPath(out.root)).toBe(realPath(out.treeRoot));
     expect(out.threw).toBeFalsy();          // ★던졌다면 스폰이 막힌다
     expect(out.error).toBeTruthy();         // 사유는 남는다(관측 + 반환값)
   }, 90_000);
@@ -169,7 +184,8 @@ describe('provisionDerivedUniverse — 자식이 태어날 우주를 채운다',
   test('폐기 키 treeDerivedTest:false 로는 3층을 끄지 못한다 (늘 켬 · 설정 졸업 1-d)', async () => {
     const out = await run({ switchOn: false });
     expect(out.outcome).toBe('provisioned');
-    expect(out.root).not.toBe(null);
+    // macOS: tmpdir() is /var/… while one side comes back as /private/var/… — compare real paths on BOTH sides.
+    expect(realPath(out.root)).toBe(realPath(out.treeRoot));
   }, 90_000);
 });
 
@@ -186,6 +202,8 @@ describe('provisionDerivedUniverse — 모든 결과를 관측한다', () => {
     const previousStateDir = process.env.ELANOUS_STATE_DIR;
     const previousConfigDir = process.env.ELANOUS_CONFIG_DIR;
     const previousNexusDir = process.env.ELANOUS_NEXUS_DIR;
+    const homedirSpy = spyOn(os, 'homedir').mockReturnValue(home);
+    const previousArgv = process.argv;
     try {
       mkdirSync(join(home, '.elanous'));
       writeFileSync(join(home, '.elanous', 'config.json'), JSON.stringify({
@@ -196,6 +214,7 @@ describe('provisionDerivedUniverse — 모든 결과를 관측한다', () => {
       writeFileSync(join(home, '.elanous', 'leader.json'), JSON.stringify({ tree: '/other', promotedAt: 'x' }));
       writeFileSync(join(home, '.elanous', 'auth.json'), JSON.stringify({ token: 'fake' }));
       mkdirSync(join(tree, '.git'));
+      process.argv = [previousArgv[0] ?? 'bun', join(tree, 'bin', 'elanous.mjs')];
       process.env.HOME = home;
       delete process.env.ELANOUS_STATE_DIR;
       delete process.env.ELANOUS_CONFIG_DIR;
@@ -204,6 +223,8 @@ describe('provisionDerivedUniverse — 모든 결과를 관측한다', () => {
       return run(tree);
     } finally {
       setTreeDerivedTestForTesting(undefined);
+      process.argv = previousArgv;
+      homedirSpy.mockRestore();
       if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome;
       if (previousStateDir === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previousStateDir;
       if (previousConfigDir === undefined) delete process.env.ELANOUS_CONFIG_DIR; else process.env.ELANOUS_CONFIG_DIR = previousConfigDir;
@@ -254,21 +275,14 @@ describe('provisionDerivedUniverse — 모든 결과를 관측한다', () => {
     });
   });
 
-  test('switch-off 는 상속 우주 실행을 정확히 한 번 관측하고 반환값은 바꾸지 않는다', () => {
-    let callerSuppliedCwd = '';
+  test('폐기된 switch-off 설정은 파생 우주를 막지 않는다', () => {
     const { result, calls } = withProvisionFixture(false, tree => {
-      callerSuppliedCwd = tree;
+      mkdirSync(join(tree, '.elanous-test'));
+      writeFileSync(join(tree, '.elanous-test', 'config.json'), '{}');
       return captureObservation(() => provisionDerivedUniverse(tree));
     });
-    expect(result).toEqual({ outcome: 'switch-off', root: null });
-    expect(calls).toEqual([[
-      'instance.provision',
-      'switch-off',
-      {
-        cwd: callerSuppliedCwd,
-        why: '3층 OFF — 파생 우주 없음; 명시 우주도 없으면 자식이 상속된 운영 config-dir 범위에서 실행된다',
-      },
-    ]]);
+    expect(result).toEqual({ outcome: 'already', root: expect.stringContaining('.elanous-test') });
+    expect(calls).toEqual([]);
   });
 
   test('기존 관측 결과와 반환값은 그대로다', () => {
@@ -279,18 +293,26 @@ describe('provisionDerivedUniverse — 모든 결과를 관측한다', () => {
       why: '스포너가 우주를 명시 — 파생이 없으므로 물질화 대상 아님(자격 확산 방지)',
     }]]);
 
-    const noTree = withProvisionFixture(true, tree => captureObservation(() => provisionDerivedUniverse(join(tree, '..', 'not-a-tree'))));
+    const noTree = withProvisionFixture(true, tree => {
+      const originalArgv = process.argv;
+      process.argv = [originalArgv[0] ?? 'bun', join(tree, '..', 'not-a-tree', 'elanous.mjs')];
+      try { return captureObservation(() => provisionDerivedUniverse(join(tree, '..', 'not-a-tree'))); }
+      finally { process.argv = originalArgv; }
+    });
     expect(noTree.result).toEqual({ outcome: 'no-tree', root: null });
     expect(noTree.calls).toEqual([['instance.provision', 'no-tree', {
       cwd: expect.any(String), why: '3층 ON 이나 cwd 위쪽에 git 트리가 없어 자식 우주를 특정 못 함',
     }]]);
 
-    const materialized = withProvisionFixture(true, tree => captureObservation(() => provisionDerivedUniverse(tree)));
-    expect(materialized.result).toEqual({ outcome: 'provisioned', root: join((materialized.calls[0][2] as { cwd: string }).cwd, '.elanous-test') });
-    expect(materialized.calls).toEqual([['instance.provision', 'materialized', {
-      cwd: expect.any(String), root: expect.any(String), copied: expect.any(Array), skippedMissing: expect.any(Array), telegramMode: expect.any(String),
-      why: '빈 파생 우주 — 물질화 없이는 자식이 온보딩 마법사에 걸려 타임아웃한다',
-    }]]);
+    const materialized = withProvisionFixture(true, tree => ({ tree, ...captureObservation(() => provisionDerivedUniverse(tree)) }));
+    expect(materialized.result).toEqual({ outcome: 'provisioned', root: join(materialized.tree, '.elanous-test') });
+    expect(materialized.calls).toEqual([
+      ['config.test-sync', 'secrets-stripped', { count: 0, paths: [] }],
+      ['instance.provision', 'materialized', {
+        cwd: expect.any(String), root: expect.any(String), copied: expect.any(Array), skippedMissing: expect.any(Array), telegramMode: expect.any(String),
+        why: '빈 파생 우주 — 물질화 없이는 자식이 온보딩 마법사에 걸려 타임아웃한다',
+      }],
+    ]);
 
     const already = withProvisionFixture(true, tree => {
       mkdirSync(join(tree, '.elanous-test'));
@@ -337,10 +359,13 @@ describe('provisionDerivedUniverse — 모든 결과를 관측한다', () => {
       return captureObservation(() => provisionDerivedUniverse(tree));
     });
     expect(failed.result).toEqual({ outcome: 'failed', root: expect.any(String), error: expect.any(String) });
-    expect(failed.calls).toEqual([['instance.provision', 'failed', {
-      cwd: expect.any(String), root: expect.any(String), error: expect.any(String),
-      why: '물질화 실패 — 자식은 그대로 진행(fail-open)하나 온보딩에 걸릴 수 있다',
-    }, { level: 'warn' }]]);
+    expect(failed.calls).toEqual([
+      ['config.test-sync', 'secrets-stripped', { count: 0, paths: [] }],
+      ['instance.provision', 'failed', {
+        cwd: expect.any(String), root: expect.any(String), error: expect.any(String),
+        why: '물질화 실패 — 자식은 그대로 진행(fail-open)하나 온보딩에 걸릴 수 있다',
+      }, { level: 'warn' }],
+    ]);
   });
 });
 
@@ -477,7 +502,10 @@ describe('물질화 봉인 — 자식의 git add -A 로도 자격이 새지 않�
       expect(staged).toContain('README.md');            // 정상 파일은 담긴다(봉인이 과하지 않다)
       expect(staged).not.toMatch(/\.elanous-test/);       // ★자격은 담기지 않는다
       spawnSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'x'], { cwd: tree });
-      const tracked = spawnSync('git', ['ls-files'], { cwd: tree, encoding: 'utf8' }).stdout ?? '';
+      expect(() => spawnSyncText('git', ['ls-files', '--not-a-valid-option'], { cwd: tree, encoding: 'utf8' }))
+        .toThrow(/git ls-files --not-a-valid-option failed \(status=/);
+      const tracked = spawnSyncText('git', ['ls-files'], { cwd: tree, encoding: 'utf8' });
+      expect(tracked).toContain('README.md');
       expect(tracked).not.toMatch(/\.elanous-test/);      // ★히스토리에도 없다
       // 그리고 봉인은 자기 자신도 숨긴다 — 남의 레포 status 에 우리 파일이 뜨면 안 된다.
       const st = spawnSync('git', ['status', '--porcelain'], { cwd: tree, encoding: 'utf8' }).stdout ?? '';

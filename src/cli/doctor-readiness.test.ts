@@ -25,7 +25,7 @@ function byId(deps: ReadinessDeps, id: string): ReadinessItem {
 
 const healthy: ReadinessDeps = {
   provider: 'openai-codex',
-  codexLogin: true,
+  usableLlm: { usable: true, provider: 'openai-codex', via: 'login', why: 'login' },
   ghOnPath: true,
   ghAuthStatus: 0,
   pathEntries: ['/usr/bin'],
@@ -37,38 +37,64 @@ const healthy: ReadinessDeps = {
 describe('checkReadiness', () => {
   // 2026-09-24 결정(#20142) 뒤 계약: auto + codex 로그인은 «정상»이다.
   test('provider auto with a codex login is ok — codex first, rotation and fallback chain apply', () => {
-    const item = byId({ ...healthy, provider: 'auto', codexLogin: true }, 'provider-decision');
+    const item = byId({ ...healthy, provider: 'auto', usableLlm: { usable: true, provider: 'openai-codex', via: 'login', why: 'login' } }, 'provider-decision');
     expect(item.status).toBe('ok');
-    expect(item.evidence).toContain('fallbackChain');
+    expect(item.evidence).toContain('login openai-codex');
     expect(item.remedy).toBeUndefined();
   });
 
   test('an unknown provider value is not echoed into the report', () => {
-    const item = byId({ ...healthy, provider: 'grok-AKIAIOSFODNN7EXAMPLE', codexLogin: false }, 'provider-decision');
+    const item = byId({ ...healthy, provider: 'grok-AKIAIOSFODNN7EXAMPLE' }, 'provider-decision');
     expect(item.evidence).not.toContain('AKIA');
     expect(item.evidence).toContain('value not shown');
   });
 
-  test('an explicit provider is ok even when a codex login is present', () => {
-    const item = byId({ ...healthy, provider: 'grok', codexLogin: true }, 'provider-decision');
+  test('an explicit provider with a measured login is ok', () => {
+    const item = byId({ ...healthy, provider: 'grok' }, 'provider-decision');
     expect(item.status).toBe('ok');
     expect(item.remedy).toBeUndefined();
   });
 
-  test('provider auto without a codex login is ok, and an unmeasured login stays unknown', () => {
-    const absent = byId({ ...healthy, provider: 'auto', codexLogin: false }, 'provider-decision');
-    expect(absent.status).toBe('ok');
-    expect(absent.evidence).toContain('no codex login');
-    const unmeasured = byId({ ...healthy, provider: 'auto', codexLogin: null }, 'provider-decision');
+  test('an explicit provider without a measured route stays unknown even if its name is configured', () => {
+    for (const usableLlm of [undefined, null]) {
+      const item = byId({ provider: 'grok', usableLlm }, 'provider-decision');
+      expect(item).toEqual({ id: 'provider-decision', status: 'unknown', evidence: 'llm.provider=grok route was not measured' });
+    }
+  });
+
+  test('an unavailable explicit openai or local route names a remedy for that selected provider', () => {
+    const unavailable = { usable: false, via: 'none' as const, why: 'no usable LLM route selected' };
+    expect(byId({ provider: 'openai', usableLlm: unavailable }, 'provider-decision'))
+      .toMatchObject({ status: 'manual', remedy: 'Set OPENAI_API_KEY or llm.apiKey for openai' });
+    expect(byId({ provider: 'local', usableLlm: unavailable }, 'provider-decision'))
+      .toMatchObject({ status: 'manual', remedy: 'Set llm.baseUrl or LOCAL_LLM_URL for local' });
+    expect(byId({ provider: 'openai-codex', usableLlm: unavailable }, 'provider-decision').remedy)
+      .toBe('elanous login openai-codex');
+  });
+
+  test('an unavailable route consumes only the allowlisted reason, never a credential', () => {
+    const secret = 'sk-live-should-never-appear';
+    const missing = byId({ provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' } }, 'provider-decision');
+    expect(missing.evidence).toContain('no usable LLM route selected');
+    const unsafe = byId({ provider: 'auto', usableLlm: { usable: false, via: 'none', why: secret } }, 'provider-decision');
+    expect(unsafe.evidence).toContain('route unavailable');
+    expect(JSON.stringify(unsafe)).not.toContain(secret);
+  });
+
+  test('provider auto reports the selected key route; an unmeasured route stays unknown', () => {
+    const key = byId({ ...healthy, provider: 'auto', usableLlm: { usable: true, provider: 'openai', via: 'key', why: 'key' } }, 'provider-decision');
+    expect(key.status).toBe('ok');
+    expect(key.evidence).toContain('key openai');
+    const unmeasured = byId({ ...healthy, provider: 'auto', usableLlm: null }, 'provider-decision');
     expect(unmeasured.status).toBe('unknown');
-    expect(unmeasured.evidence).not.toContain('no codex login');
+    expect(unmeasured.evidence).toContain('not measured');
   });
 
   test('an omitted provider is unmeasured, while an empty provider is the auto default', () => {
-    const omitted = byId({ ...healthy, provider: undefined, codexLogin: true }, 'provider-decision');
+    const omitted = byId({ ...healthy, provider: undefined }, 'provider-decision');
     expect(omitted.status).toBe('unknown');
     expect(omitted.evidence).not.toContain('no codex login');
-    const empty = byId({ ...healthy, provider: '  ', codexLogin: true }, 'provider-decision');
+    const empty = byId({ ...healthy, provider: '  ' }, 'provider-decision');
     expect(empty.status).toBe('ok');
   });
 
@@ -116,7 +142,7 @@ describe('checkReadiness', () => {
 
   test('existing readiness items retain identical status, evidence and remedy across harness probes', () => {
     const base: ReadinessDeps = {
-      provider: 'auto', codexLogin: false, llmCredentialAvailable: false,
+      provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' },
       ghOnPath: false, platform: 'linux', distro: 'debian',
       buildToolchain: { make: false, cxx20: false }, nodePty: 'broken',
       pythonEnv: { status: 'manual', evidence: 'python missing', remedy: 'pyenv install 3.12.12' },
@@ -358,7 +384,7 @@ describe('checkReadiness', () => {
   test('every item has the readiness shape and a one-line remedy when present', () => {
     const report = checkReadiness({
       provider: 'auto',
-      codexLogin: true,
+      usableLlm: { usable: true, provider: 'openai-codex', via: 'login', why: 'login' },
       ghOnPath: false,
       installPrefix: '/opt/elanous',
       pathEntries: [],
@@ -412,7 +438,6 @@ describe('checkReadiness', () => {
     const github = 'ghp_shouldneverappear1234567890';
     const report = checkReadiness({
       provider: `grok-${github}`,
-      codexLogin: true,
       ghOnPath: true,
       ghAuthStatus: 1,
       installPrefix: `/opt/${secret}/elanous`,
@@ -426,7 +451,7 @@ describe('checkReadiness', () => {
     expect(text).not.toContain(github);
     expect(text).not.toContain('ghp_');
     expect(text).not.toMatch(/api[_-]?key|bearer|password/i);
-    expect(report.items.find((entry) => entry.id === 'provider-decision')?.status).toBe('ok');
+    expect(report.items.find((entry) => entry.id === 'provider-decision')?.status).toBe('unknown');
     expect(report.items.find((entry) => entry.id === 'service-version')?.evidence).not.toContain(secret);
     const install = report.items.find((entry) => entry.id === 'install-path');
     // 가려야 하는 경로엔 실행 불가능한 자리표시자 명령을 주지 않는다(리뷰 must-fix) — 사람 몫.
@@ -483,10 +508,11 @@ describe('readiness — T2 additions (2026-09-24)', () => {
   const find = (deps: Parameters<typeof checkReadiness>[0], id: string) => checkReadiness(deps).items.find((entry) => entry.id === id)!;
 
   test('auto with no login and no LLM key is manual, not a false green', () => {
-    expect(find({ provider: 'auto', codexLogin: false, llmCredentialAvailable: false }, 'provider-decision'))
+    expect(find({ provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' } }, 'provider-decision'))
       .toMatchObject({ status: 'manual', remedy: 'elanous login openai-codex' });
-    expect(find({ provider: 'auto', codexLogin: false, llmCredentialAvailable: true }, 'provider-decision').status).toBe('ok');
-    expect(find({ provider: 'auto', codexLogin: false, llmCredentialAvailable: null }, 'provider-decision').status).toBe('ok');
+    expect(find({ provider: 'auto', usableLlm: { usable: true, provider: 'local', via: 'local-server', why: 'local' } }, 'provider-decision'))
+      .toMatchObject({ status: 'ok', evidence: 'llm.provider=auto → local-server local' });
+    expect(find({ provider: 'auto', usableLlm: null }, 'provider-decision').status).toBe('unknown');
   });
 
   test('service file: version folder is fixable, bare elanous is manual, stable path is ok, absent is ok, unmeasured is unknown', () => {

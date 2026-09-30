@@ -13,7 +13,9 @@
 // ★ 제1원칙: front door 결정 observe(harness.frontdoor) — objective digest·autoDrive·terminal.
 //   autoDrive 'safe'(기본): 저위험 자율·고위험(PR open)만 ux.confirm(막 채널 없으면 fail-closed).
 
+import { createHash } from 'node:crypto';
 import { tierModel } from '../../llm/model-defaults.js';
+import { dispatchTask, type DispatchTaskDeps } from '../../execution-loop/dispatch-task.js';
 import type { LLMToolSpec } from '../../llm.js';
 import type { DaemonToolDispatchCtx } from '../../boot/daemon-tools/types.js';
 import type { SelfImplementSeams } from '../../self-implement/orchestrator.js';
@@ -96,6 +98,9 @@ export function buildRunDevHarnessTool(): LLMToolSpec {
 export interface DevHarnessDeps {
   /** 하니스 구동(기본 runStagedHarnessOnSurface). */
   runHarness?: (opts: RunHarnessOnSurfaceOptions) => Promise<HarnessResult>;
+  /** In-process 실행 직전의 관측 전용 디스패치 seam. */
+  dispatchTask?: typeof dispatchTask;
+  dispatchTaskDeps?: DispatchTaskDeps;
   /** seam 팩토리(기본 defaultSeams). */
   seamsFactory?: (o: DefaultSeamsOptions) => SelfImplementSeams;
   /** 비대화형 HITL relay 팩토리 seam(기본 buildLlmHitlRelay). */
@@ -468,6 +473,43 @@ export async function dispatchRunDevHarness(
   const runHarness = deps?.runHarness ?? runStagedHarnessOnSurface;
   const knobs = resolveHarnessKnobs(rawArgs, ctx?.userText);   // ★ B1 관통 — C1~C4 노브를 surface 파라미터에서 막으로
   const harnessMention = harnessMentionState(ctx?.userText);
+  // Outer pipeline/Pod observations are not repeated; this decision never controls the harness.
+  const dispatchSkipped = rawArgs.plan_staged === true ? 'plan-staged'
+    : rawArgs.dispatch_recorded === true || process.env.ELANOUS_DISPATCH_RECORDED === '1' ? 'dispatch-recorded'
+    : process.env.ELANOUS_EXECUTION_LOOP_DISPATCH === 'off' && !deps?.dispatchTask && !deps?.dispatchTaskDeps ? 'disabled'
+    : undefined;
+  if (dispatchSkipped) {
+    try { debug.log('execution-loop.gate', 'dispatch-skipped', { reason: dispatchSkipped, runId }); } catch { /* fail-soft */ }
+  } else {
+    try {
+      const spec = { input: { text: objective }, executor: { kind: 'self' as const }, plan: true, runId };
+      const observer = new AbortController();
+      const timeoutMs = Math.min(5_000, Math.max(0, deps?.dispatchTaskDeps?.timeoutMs ?? 5_000));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => (deps?.dispatchTask ?? dispatchTask)({
+            goalId: `request-${createHash('sha256').update(objective).digest('hex').slice(0, 32)}`,
+            title: objective.split(/\r?\n/, 1)[0]?.trim() || 'Untitled request',
+            goalText: objective,
+            targetPaths: [],
+            spec,
+            runKey: runId,
+          }, { ...deps?.dispatchTaskDeps, signal: observer.signal })),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              observer.abort();
+              reject(new Error(`dispatch observation timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    } catch (error) {
+      try { debug.log('execution-loop.gate', 'dispatch-unavailable', { reason: String(error), runId }); } catch { /* fail-soft */ }
+    }
+  }
   const result = await runHarness({
     // ⛔⭐ `naturalLanguageDispatch` 를 «단정»하지 않는다 — 증거로 정한다.
     //   이 함수는 «둘» 이 지난다: ⑴ 모델이 부른 도구(사용자 턴 문면이 ctx.userText 로 온다)

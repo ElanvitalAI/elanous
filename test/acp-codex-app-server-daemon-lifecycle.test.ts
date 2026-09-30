@@ -443,15 +443,23 @@ describe('CodexAppServerAgent · M6 · hibernate', () => {
   });
 
   test('stop() clears the idle timer', async () => {
-    const h = makeFactoryHarness({ idleTimeoutMs: 25, idleCheckMs: 5 });
+    const h = makeFactoryHarness({ idleTimeoutMs: 1_000, idleCheckMs: 5 });
+    const agentWithIdleCheck = h.agent as unknown as { checkIdle: () => void; idleTimerHandle: unknown };
+    const checkIdle = agentWithIdleCheck.checkIdle.bind(h.agent);
+    let idleChecks = 0;
+    agentWithIdleCheck.checkIdle = () => {
+      idleChecks++;
+      checkIdle();
+    };
     await bringUp(h);
+    await new Promise((r) => setTimeout(r, 25));
+    expect(idleChecks).toBeGreaterThan(0);
     await h.agent.stop();
-    // No subsequent hibernate after stop — child is already torn down,
-    // and the timer must not still be firing. Wait past threshold.
+    const checksAtStop = idleChecks;
+    // A lingering interval would still call checkIdle even though stop nulled the client and handle.
     await new Promise((r) => setTimeout(r, 60));
-    // No assertion on `killed` (stop already called kill); we rely on
-    // not throwing. Existence of this test gates against zombie timers
-    // emitting "checkIdle on null client" log noise.
-    expect(true).toBe(true);
+    expect(idleChecks - checksAtStop).toBe(0);
+    expect(h.transports).toHaveLength(1);
+    expect(agentWithIdleCheck.idleTimerHandle).toBeNull();
   });
 });

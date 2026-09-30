@@ -48,7 +48,7 @@ elanous intake digest                  # today's summary: what was absorbed, one
 
 | | Status |
 |---|---|
-| One item → one task, marked as a code change (`[dev]`) or a job to run (`[run]`) | 🔄 in progress (a `to-tasks` intake command) |
+| Goal lines and idea notes → tasks, each typed **implement**, **research**, **document** or **operate**: `elanous intake to-tasks` (`--dry-run` to preview; needs the daemon running; at most 5 per run unless you pass `--limit`) | ✅ 0.2.4 |
 | One item → several tasks, each typed as **run**, **implement**, **research** or **composite** | 📋 designed |
 | Duplicate detection against existing tasks and past runs | 📋 designed |
 
@@ -91,6 +91,8 @@ elanous connector linear sync --team ENG --prefix "[elanous]"
 - Done, canceled and duplicate issues are skipped. One failing issue does not stop the rest; it is retried on the next sync.
 - Put `[dev]` in an issue title to send it to the harness once approved; otherwise it runs as a job.
 
+**Send an instruction to Linear as an issue:** `elanous directive add "<instruction>" --dry-run` shows how it will be filed; drop `--dry-run` to create the issue. In the terminal UI, `/directive <text>` does the same.
+
 **3. Or receive webhooks** instead of syncing: store the signing secret with `elanous connector linear set-webhook-secret` (stdin) and run the receiver with `elanous hooks serve`. Signatures are checked and replayed deliveries are refused. The receiver needs a public HTTPS address in front of it.
 
 | | Status |
@@ -107,7 +109,7 @@ Everything above works with no tracker connected. What a tracker gives you and w
 | A tracker gives you | In elanous | Status |
 |---|---|---|
 | Issues, states, priority, sub-issues, projects | Tasks (with dependencies, parent task, mission, acceptance criteria) | ✅ |
-| A board | TUI board, the web app task panel | ✅ · 🔄 one shared list and approval view |
+| A board | TUI board, the web app task panel, task cards (`elanous card list` / `card show <id>`; a card board among the web app's Labs pages — turn on «Labs 탭 보기» (show Labs tabs) in Settings), and the web app's **Approvals** page | ✅ 0.2.4 |
 | Filing by message or email | Telegram `/work`, the web app intake page | ✅ 0.2.3 · 📋 email |
 | Triage suggestions and rules | Interpretation and auto-run rules | 🔄 · 📋 condition → action rules |
 | Cycle time and lead time | Task timestamps and the run ledger | 📋 `tasks stats` |

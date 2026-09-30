@@ -14,7 +14,8 @@
 import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import { GROUNDING_TOKEN_ENV, GROUNDING_URL_ENV, mintGroundingToken, revokeGroundingRun, type GroundingTokenScope } from '../../grounding/token.js';
-import { POD_CREDENTIAL_GROK_PATH } from '../../nexus/api/pod-credential-api.js';
+import { POD_CREDENTIAL_GROK_PATH, POD_CREDENTIAL_GITHUB_PATH, POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV, installationRepositories } from '../../nexus/api/pod-credential-api.js';
+import { githubInstallationCredential } from '../../auth/github-app-token.js';
 import { POD_CREDENTIAL_TOKEN_ENV, POD_CREDENTIAL_URL_ENV } from '../../grok/credential.js';
 import { collectPodLedgers, createPodLedgerFollower } from './pod-ledger-collect.js';
 import { collectPodArtifacts } from './pod-artifact-return.js';
@@ -47,6 +48,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, normalize, relative, resolve, sep } from 'node:path';
 import { findGitDir } from '../../git-fs/locate.js';
 import { debug } from '../../debug/log.js';
+import { selectLiveDetail } from '../../live/detail-switch.js';
 import { authStorePath } from '../../oauth/store.js';
 import { grokAuthFilePath, resolveGrokCredential } from '../../grok/credential.js';
 import { defaultGrokModel } from '../../grok/models.js';
@@ -57,6 +59,14 @@ import { parseSelfImplementJson, type SelfImplementJobDone, type SelfImplementJo
 import { codexQuotaPolicyFromConfig } from '../../oauth/codex-account-store.js';
 
 export type Kubectl = (args: readonly string[], input?: string) => { status: number | null; stdout: string; stderr: string };
+
+// gh auth login may reject installation tokens when validating /user. Its config is
+// still the credential source for gh and setup-git's helper. Install it privately
+// on that failure; rename keeps concurrent readers from seeing a partial token.
+const APP_GH_CONFIG_PATH = '$HOME/.config/gh';
+const APP_GH_AUTH_SCRIPT = 'const fs=require("node:fs"),path=require("node:path"),crypto=require("node:crypto");const token=fs.readFileSync(0,"utf8").trim();if(!/^[A-Za-z0-9_]+$/.test(token))process.exit(1);const dir=process.env.GH_CONFIG_DIR||path.join(process.env.HOME,".config/gh");fs.mkdirSync(dir,{recursive:true,mode:0o700});const dest=path.join(dir,"hosts.yml"),temp=path.join(dir,".hosts.yml."+crypto.randomUUID());try{fs.writeFileSync(temp,"github.com:\\n    oauth_token: "+token+"\\n    git_protocol: https\\n",{mode:0o600,flag:"wx"});fs.renameSync(temp,dest);fs.chmodSync(dest,0o600)}finally{try{fs.unlinkSync(temp)}catch{}}';
+const APP_GH_AUTH_COMMAND = `bun -e '${APP_GH_AUTH_SCRIPT}'`;
+const APP_GH_EXEC = `unset GH_TOKEN GITHUB_TOKEN; GH_CONFIG_DIR="${APP_GH_CONFIG_PATH}" exec "$@"`;
 
 export interface PodSpawnOptions {
   /** 이미지 판(라벨 elanous.commit) — 주입(시험·감독기가 이미 잰 값). 없으면 docker 로 잰다. */
@@ -75,6 +85,10 @@ export interface PodSpawnOptions {
   /** 클러스터 안 이미지(`docker/harness/run.sh` 가 만드는 `elanous-harness:local`). */
   image?: string;
   repoUrl?: string;
+  /** 호스트 Git 미러 디렉터리 — 명시 옵션 > 환경변수 > pod.hostMirror. */
+  hostMirror?: string;
+  /** 설정 읽기(시험 주입). kubectl 주입 시험에서는 기본 사용자 설정을 읽지 않는다. */
+  configHostMirror?: () => string | undefined;
   /** 원천 — 없으면 종전 `git clone --depth 50`. bundle 이면 apply 뒤 kubectl cp 로 싣는다. */
   source?: PodSource;
   /** 호스트 환경에서 읽어 Pod env 로 넣을 키 이름(예: OPENROUTER_API_KEY · ANTHROPIC_API_KEY) — 벤치마크 과금 경로. */
@@ -101,15 +115,22 @@ export interface PodSpawnOptions {
   pool?: PodPoolScheduler;
   /** ☸️ 원격 그라운딩 주소(P13) — 없으면 호스트 env ELANOUS_GROUNDING_URL → 설정 pod.groundingUrl. 셋 다 없으면 토큰을 안 만든다. */
   groundingUrl?: string;
-  /** 시험 심 — 토큰 발급·회수. scope 는 그라운딩 발급에는 안 넘기고, grok 구독 중계 발급에만 'llm-credential' 로 넘긴다. */
-  mintGrounding?: (claims: { runId: string; job: string; ttlMs: number; scope?: GroundingTokenScope }) => Promise<{ token: string; exp: number }>;
+  /** 시험 심 — 토큰 발급·회수. GitHub credential 토큰에는 호스트가 검증한 저장소를 서명한다. */
+  mintGrounding?: (claims: { runId: string; job: string; ttlMs: number; scope?: GroundingTokenScope; repository?: string }) => Promise<{ token: string; exp: number }>;
   revokeGrounding?: (runId: string) => void;
+  /** Test seam for the host's repository-scoped GitHub App installation token. */
+  githubInstallation?: (repository: string) => { token: string; expires_at?: string; expiresAt?: string | number } | null;
+  /** GitHub installation repository lookup; required to prove the scoped token matches owner/name. */
+  githubRepositories?: (token: string) => Promise<readonly string[] | null>;
+  now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   credentials?: (account: string) => { elanousAuth: string; codexAuth: string; ghToken: string };
   grokCredentials?: () => { grokAuth?: string; grokApiKey?: string; ghToken: string };
   /** 호스트 키 캐시(`~/.cache/<소문자 이름>`)에서 키를 읽는다(시험 주입) — env 에 없을 때. */
   readKeyCache?: (name: string) => string | undefined;
   env?: NodeJS.ProcessEnv;
+  /** Detail switch file (test injection; defaults to the host's local/production selection). */
+  liveDetailFile?: string;
 }
 
 export function defaultKubectl(args: readonly string[], input?: string): { status: number | null; stdout: string; stderr: string } {
@@ -186,6 +207,14 @@ export function defaultGhToken(): string {
   const r = spawnSync('gh', ['auth', 'token'], { encoding: 'utf8' });
   if (r.status !== 0 || !r.stdout.trim()) throw new Error('gh auth token 실패 — 호스트에서 gh auth login');
   return r.stdout.trim();
+}
+
+/** Bind credential issuance to the repository the host actually supplied to the Pod. */
+function githubRepositoryFromUrl(repoUrl: string): string | null {
+  const match = /^(?:https:\/\/github\.com\/|git@github\.com:)([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+?)(?:\.git)?\/?$/.exec(repoUrl);
+  const owner = match?.[1];
+  const name = match?.[2];
+  return owner && name && ![owner, name].some((part) => part === '.' || part === '..') ? `${owner}/${name}` : null;
 }
 
 /** Job 스크립트의 salvage 단계 — 자식 rc 가 0 이 아닐 때만, 변경·미푸시 커밋이 있는 격리 워크트리를 `salvage/<job>/<worktree>` 로 push.
@@ -297,13 +326,13 @@ export function podRunLabels(o: { runId?: string; parentRunId?: string }): Recor
 
 /** Pod 메모리 «등급» — 대표 09-27: PWA Pod 골이 16Gi 에서 OOM 으로 죽는다 ⇒ «high» 등급을 옵션으로 고른다.
  *  등급 = `standard`(`ELANOUS_POD_MEMORY` 또는 16Gi) · `high`(`ELANOUS_POD_MEMORY_HIGH` 또는 32Gi · standard 보다 작아지지 않는다).
- *  고르는 순서(앞이 이긴다): ① 발사 옵션 `--pod-memory <등급>`(→ `ELANOUS_POD_MEMORY_TIER`) ② 골 문면 한 줄 `Pod 메모리: high` ③ 자동 — 골 문면에 `apps/pwa/` 면 high ④ standard.
+ *  고르는 순서(앞이 이긴다): ① 발사 옵션 `--pod-memory <등급>`(→ `ELANOUS_POD_MEMORY_TIER`) ② 조각 문면 한 줄 `Pod 메모리: high|standard` ③ 조각의 `apps/pwa/` ④ 부모 골 본문의 같은 두 규칙 ⑤ standard.
  *  node-b 노드 할당 가능 약 251Gi. */
 export const POD_MEMORY_DEFAULT = '16Gi';
 export const POD_MEMORY_HIGH_DEFAULT = '32Gi';
 export const POD_MEMORY_TIERS = ['standard', 'high'] as const;
 export type PodMemoryTier = (typeof POD_MEMORY_TIERS)[number];
-export type PodMemorySource = 'option' | 'goal-line' | 'pwa-auto' | 'default';
+export type PodMemorySource = 'option' | 'goal-line' | 'pwa-auto' | 'default' | 'parent-goal-line' | 'parent-pwa-auto';
 const PWA_PATH = /(?:^|[\s`'"(,·])apps\/pwa\//m;
 const GOAL_LINE = /^\s*(?:Pod 메모리|pod-memory)\s*:\s*(standard|high)\s*$/im;
 
@@ -322,12 +351,15 @@ function memoryGi(v: string): number | null {
   return m[2] === 'Gi' ? Number(m[1]) : Number(m[1]) / 1024;
 }
 
-export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>): { limit: string; tier: PodMemoryTier; source: PodMemorySource } {
+export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>>, parentGoal?: string): { limit: string; tier: PodMemoryTier; source: PodMemorySource } {
   const option = parsePodMemoryTier(env.ELANOUS_POD_MEMORY_TIER);
   const line = parsePodMemoryTier(GOAL_LINE.exec(feature)?.[1]);
+  const parentLine = !option && !line && !goalTouchesPwa(feature) ? parsePodMemoryTier(GOAL_LINE.exec(parentGoal ?? '')?.[1]) : null;
   const [tier, source]: [PodMemoryTier, PodMemorySource] = option ? [option, 'option']
     : line ? [line, 'goal-line']
     : goalTouchesPwa(feature) ? ['high', 'pwa-auto']
+    : parentLine ? [parentLine, 'parent-goal-line']
+    : parentGoal && goalTouchesPwa(parentGoal) ? ['high', 'parent-pwa-auto']
     : ['standard', 'default'];
   const base = env.ELANOUS_POD_MEMORY?.trim() || POD_MEMORY_DEFAULT;
   if (tier === 'standard') return { limit: base, tier, source };
@@ -336,7 +368,7 @@ export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Read
   return { limit: a !== null && b !== null && a > b ? base : high, tier, source };
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[] }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean }): Record<string, unknown> {
   const quoted = o.args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
   const goalPath = o.goalDoc ? `'${(o.goalDoc.startsWith('-') ? `./${o.goalDoc}` : o.goalDoc).replace(/'/g, `'\\''`)}'` : undefined;
   const askBaseIndex = o.goalDoc ? o.args.indexOf('--base') : -1;
@@ -351,7 +383,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
       : o.grokCredential === 'api_key'
         ? 'mkdir -p ~/.grok && install -m 600 /creds/grok-api-key ~/.grok/api-key && export XAI_API_KEY="$(cat ~/.grok/api-key)" && export ELANOUS_LLM_PROVIDER=grok'
         : o.codexAccounts ? podCodexAccountScript(o.codexAccounts) : `mkdir -p ~/.elanous ~/.codex && cp /creds/elanous-auth.json ~/.elanous/auth.json && cp /creds/codex-auth.json ~/.codex/auth.json && chmod 600 ~/.elanous/auth.json ~/.codex/auth.json\n${podQuotaPolicyExport()}`,
-    'export GH_TOKEN="$(cat /creds/gh-token)"',
+    o.appCredential ? `unset GH_TOKEN GITHUB_TOKEN; export GH_CONFIG_DIR="${APP_GH_CONFIG_PATH}"; mkdir -p "$GH_CONFIG_DIR" && chmod 700 "$GH_CONFIG_DIR" && { gh auth login --with-token < /creds/gh-token >/dev/null 2>&1 || ${APP_GH_AUTH_COMMAND} < /creds/gh-token; } && chmod 600 "$GH_CONFIG_DIR/hosts.yml" && chmod 700 "$GH_CONFIG_DIR" || exit 7` : 'export GH_TOKEN="$(cat /creds/gh-token)"',
     // 🔑 스킬 키(.env) — 이미지엔 없다. 이 런의 Secret 에서 각 스킬 폴더로 0600 복사(값은 로그에 안 나온다).
     ...(o.skillEnvs?.length ? [`for n in ${o.skillEnvs.join(' ')}; do [ -d ~/.claude/skills/$n ] && install -m 600 /creds/skillenv-$n ~/.claude/skills/$n/.env; done; echo "[pod] skill env: ${o.skillEnvs.join(',')}"`] : []),
     'git config --global user.name "elanous pod child" && git config --global user.email "noreply@anthropic.com" && gh auth setup-git',
@@ -465,9 +497,9 @@ if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
               ...Object.entries(o.armEnv ?? {}).map(([name, value]) => ({ name, value })),
               ...o.passEnv.map((key) => ({ name: key, valueFrom: { secretKeyRef: { name: `${o.name}-creds`, key: `env-${key}` } } })),
             ],
-            volumeMounts: [{ name: 'creds', mountPath: '/creds', readOnly: true }],
+            volumeMounts: [{ name: 'creds', mountPath: '/creds', readOnly: true }, ...(o.hostMirror ? [{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }] : [])],
           }],
-          volumes: [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }],
+          volumes: [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }, ...(o.hostMirror ? [{ name: 'host-mirror', hostPath: { path: o.hostMirror, type: 'Directory' } }] : [])],
         },
       },
     },
@@ -495,12 +527,34 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
   const namespace = options.namespace ?? 'elanous-test';
   const image = options.image ?? 'elanous-harness:local';
   const repoUrl = options.repoUrl ?? 'https://github.com/ElanvitalAI/elanous';
+  const repository = githubRepositoryFromUrl(repoUrl);
   const env = options.env ?? process.env;
+  const hostMirror = (options.hostMirror ?? env.ELANOUS_POD_HOST_MIRROR ?? (options.configHostMirror ?? (options.kubectl ? () => undefined : configHostMirror))())?.trim() || undefined;
+  if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
   const hostSupervised = options.hostSupervised ?? true;
   return (input) => {
     const name = podJobName(input.spaceId);
-    const { limit: memoryLimit, tier: memoryTier, source: memorySource } = podMemoryLimitFor(input.feature, env);
-    debug.log('self-implement.pod', 'memory-limit', { spaceId: input.spaceId, memoryLimit, tier: memoryTier, source: memorySource });
+    const featureMemory = podMemoryLimitFor(input.feature, env);
+    let parentGoal: string | undefined;
+    let parentGoalUnreadable = false;
+    let inheritedFrom: string | undefined;
+    if (featureMemory.source === 'default' && env.ELANOUS_POD_GOAL_DOC) {
+      try {
+        const requestedPath = normalize(env.ELANOUS_POD_GOAL_DOC);
+        if (isAbsolute(requestedPath) || requestedPath === '..' || requestedPath.startsWith(`..${sep}`) || requestedPath === '.') throw new Error('invalid goal path');
+        const root = findGitDir(process.cwd())?.root;
+        if (!root) throw new Error('no repository');
+        const realRoot = realpathSync(root);
+        const goalFile = realpathSync(resolve(realRoot, requestedPath));
+        const withinRoot = relative(realRoot, goalFile);
+        if (withinRoot === '..' || withinRoot.startsWith(`..${sep}`) || isAbsolute(withinRoot)) throw new Error('outside repository');
+        parentGoal = readFileSync(goalFile, 'utf8').replace(/\r\n/g, '\n').split(/^## 실행 기록(?:\n|$)/m, 1)[0];
+        inheritedFrom = withinRoot;
+      } catch { parentGoalUnreadable = true; }
+    }
+    const { limit: memoryLimit, tier: memoryTier, source: memorySource } = parentGoal === undefined ? featureMemory : podMemoryLimitFor(input.feature, env, parentGoal);
+    debug.log('self-implement.pod', 'memory-limit', { spaceId: input.spaceId, memoryLimit, tier: memoryTier, source: memorySource,
+      ...(memorySource.startsWith('parent-') ? { inheritedFrom } : {}), ...(parentGoalUnreadable ? { parentGoal: 'unreadable' } : {}) });
     const childRunId = mintRunId();
     const parentRunId = env.ELANOUS_RUN_ID?.trim();
     const address = `self-impl:${input.spaceId}`;
@@ -548,6 +602,8 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           debug.log('self-implement.pod', unavailableEvent, { job: name, reason: error instanceof Error ? error.message : String(error) });
           return { status: 'unavailable', childLedgerIncomplete: false, samples: [] };
         }
+        const via = /^ELANOUS_POD_SOURCE_VIA (mirror|github)\r?$/m.exec(full.stdout)?.[1];
+        if (via) debug.log('self-implement.pod', 'source-via', { job: name, via });
         let ledgerIncomplete = false;
         let childLedgerIncomplete = false;
         let artifactIncomplete = false;
@@ -604,9 +660,9 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
         }
         // Grok 자격은 전용 Secret 키 하나로만 보낸다 — passEnv 의 API 키 중복 전달은 막는다.
-        const passKeys = grok
-          ? (options.passEnv ?? []).filter((key) => !['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'].includes(key))
-          : options.passEnv ?? [];
+        const passKeys = (options.passEnv ?? []).filter((key) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL'
+          && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV
+          && (!grok || !['XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY'].includes(key)));
         const skillEnvs: Record<string, string> = options.skillEnv
           ? (options.readSkillEnv ?? (() => readSkillEnvFiles(resolvePodSkills(env).skills)))()
           : {};
@@ -632,6 +688,34 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
         } else if (grokSubscription && !groundingUrl) {
           debug.log('self-implement.pod', 'credential-relay-skipped', { reason: 'no-host-url' });
         }
+        const now = options.now ?? Date.now;
+        const issueVerifiedAppCredential = async (): Promise<{ token: string; expiresAt: number } | null> => {
+          if (!repository) return null;
+          // This is the same repository-scoped, contents+pull_requests installation request on launch and refresh.
+          const candidate = (options.githubInstallation ?? ((repo) => githubInstallationCredential({ scope: { repository: repo.split('/')[1]! } })))(repository);
+          if (!candidate?.token) return null;
+          const expiry = candidate.expires_at ?? ('expiresAt' in candidate ? candidate.expiresAt : undefined);
+          const expiresAt = typeof expiry === 'number' ? expiry : Date.parse(expiry ?? '');
+          if (!Number.isFinite(expiresAt) || expiresAt <= now()) return null;
+          const available = await (options.githubRepositories ?? installationRepositories)(candidate.token);
+          return available?.length === 1 && available[0]?.toLowerCase() === repository.toLowerCase()
+            ? { token: candidate.token, expiresAt } : null;
+        };
+        let appCredential: Awaited<ReturnType<typeof issueVerifiedAppCredential>> = null;
+        try { appCredential = await issueVerifiedAppCredential(); }
+        catch { debug.log('self-implement.pod', 'github-app-unavailable', { job: name, reason: 'mint-or-verification-failed' }); }
+        const githubRelay = appCredential && groundingUrl && repository
+          ? await mint({ runId: groundingRunId, job: name, ttlMs: groundingTtlMs, scope: 'gh-credential', repository })
+          : null;
+        if (githubRelay) {
+          groundingMinted = groundingRunId;
+          debug.log('self-implement.pod', 'github-credential-relay', { job: name, runId: groundingRunId, exp: githubRelay.exp });
+        }
+        // The host polling loop is a refresh path even when the Pod cannot reach the relay.
+        const hostRefresh = Boolean(appCredential);
+        const podGhToken = hostRefresh ? appCredential!.token : creds.ghToken;
+        const githubPassKeys = hostRefresh ? passKeys.filter((key) => !['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'].includes(key)) : passKeys;
+        let ghTokenExpiresAt = hostRefresh ? appCredential!.expiresAt : null;
         const requestedGoalDoc = env.ELANOUS_POD_GOAL_DOC;
         const requestedPath = requestedGoalDoc ? normalize(requestedGoalDoc) : undefined;
         if (requestedPath && (isAbsolute(requestedPath) || requestedPath === '..' || requestedPath.startsWith(`..${sep}`) || requestedPath === '.')) {
@@ -700,17 +784,18 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
               : codexCredentials
                 ? Object.fromEntries(codexCredentials.map((candidate, i) => [`codex-${i}.json`, JSON.stringify({ elanousAuth: candidate.elanousAuth, codexAuth: candidate.codexAuth })]))
                 : { 'elanous-auth.json': (creds as ReturnType<typeof hostCredentials>).elanousAuth, 'codex-auth.json': (creds as ReturnType<typeof hostCredentials>).codexAuth }),
-            'gh-token': creds.ghToken, feature: input.feature,
+            'gh-token': podGhToken, feature: input.feature,
             ...(goalDocument !== undefined ? { 'goal-doc': goalDocument } : {}),
             ...Object.fromEntries(Object.entries(skillEnvs).map(([n, text]) => [`skillenv-${n}`, text])),
             ...(grounding ? { [`env-${GROUNDING_TOKEN_ENV}`]: grounding.token } : {}),
             ...(credentialRelay ? { [`env-${POD_CREDENTIAL_TOKEN_ENV}`]: credentialRelay.token } : {}),
-            ...Object.fromEntries(passKeys.map((k) => [k, env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k)] as const).filter(([, v]) => v).map(([k, v]) => [`env-${k}`, v!])),
+            ...(githubRelay ? { [`env-${POD_GITHUB_CREDENTIAL_TOKEN_ENV}`]: githubRelay.token } : {}),
+            ...Object.fromEntries(githubPassKeys.map((k) => [k, env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k)] as const).filter(([, v]) => v).map(([k, v]) => [`env-${k}`, v!])),
           },
         };
         const hostKey = (k: string): string | undefined => env[k] ?? (options.readKeyCache ?? defaultReadKeyCache)(k);
-        const passEnv = passKeys.filter((k) => hostKey(k));
-        const missing = passKeys.filter((k) => !hostKey(k));
+        const passEnv = githubPassKeys.filter((k) => hostKey(k));
+        const missing = githubPassKeys.filter((k) => !hostKey(k));
         if (missing.length) debug.log('self-implement.pod', 'pass-env-missing', { job: name, missing }, { level: 'warn' });
         // ☸️ 재개(P3 · 2026-09-26): 같은 이름의 Job 이 이미 있으면 «지우지 않고» 붙는다 — 호스트가 끊긴 동안에도 원격은 계속 돌았다.
         //   🩸 종전엔 여기서 delete 부터 해서, 재개가 원격에서 멀쩡히 돌던 Job 을 죽였다. 실패로 끝난 Job 만 지우고 다시 만든다.
@@ -726,9 +811,12 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           const existingJob = kubectl(['-n', namespace, 'get', 'job', name, '-o', 'json']);
           if (existingJob.status === 0) {
             try {
-              const job = JSON.parse(existingJob.stdout) as { spec?: { template?: { spec?: { containers?: Array<{ name?: string; env?: Array<{ name: string; value?: string }> }> } } } };
-              const inherited = job.spec?.template?.spec?.containers?.find((c) => c.name === 'child')?.env?.find((e) => e.name === 'ELANOUS_RUN_ID')?.value;
+              const job = JSON.parse(existingJob.stdout) as { spec?: { template?: { spec?: { containers?: Array<{ name?: string; args?: string[]; env?: Array<{ name: string; value?: string }> }> } } } };
+              const child = job.spec?.template?.spec?.containers?.find((c) => c.name === 'child');
+              const inherited = child?.env?.find((e) => e.name === 'ELANOUS_RUN_ID')?.value;
               if (inherited && inherited !== parentRunId && inherited === normalizeRunId(inherited)) liveChildRunId = inherited;
+              // A resumed App Job has an unknown remaining lifetime; refresh its gh config on the first live poll.
+              ghTokenExpiresAt = child?.args?.[0]?.includes('gh auth login --with-token < /creds/gh-token') ? now() : null;
             } catch { /* The existing Job's identity must be verified before following it. */ }
           }
           if (liveChildRunId === launchRunId) {
@@ -737,6 +825,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           }
         }
         if (reattach) debug.log('self-implement.pod', 'job-reattach', { job: name, conditions: existingConditions.join(' ') || 'running', spaceId: input.spaceId });
+        if (!hostRefresh && ghTokenExpiresAt === null && !githubRelay) debug.log('self-implement.pod', 'gh-token-app-skipped', { job: name, reason: 'no-verified-app-or-refresh-path' });
         if (!reattach) {
         if (/Failed|FailureTarget/.test(existingConditions.join(' ')) && collectFullLogs('failed-job-logs-unavailable').status === 'incomplete') {
           return { exitCode: 1, output: '', error: { code: 'pod-collection-incomplete', message: `Job ${name} recovery incomplete — old Job retained` } };
@@ -748,15 +837,23 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           ...passEnv,
           ...(grounding ? [GROUNDING_TOKEN_ENV] : []),
           ...(credentialRelay ? [POD_CREDENTIAL_TOKEN_ENV] : []),
+          ...(githubRelay ? [POD_GITHUB_CREDENTIAL_TOKEN_ENV] : []),
         ];
-        const jobArmEnv = grounding || credentialRelay
+        const detail = selectLiveDetail(options.liveDetailFile ? { path: options.liveDetailFile } : {}).state;
+        const detailUntil = detail && (detail.scope === 'all' || detail.scope === parentRunId || detail.scope === launchRunId) && detail.until > Date.now()
+          ? String(detail.until) : undefined;
+        const armEnv = Object.fromEntries(Object.entries(options.armEnv ?? {}).filter(([key]) => key !== 'ELANOUS_LIVE_DETAIL_UNTIL' && key !== POD_GITHUB_CREDENTIAL_TOKEN_ENV && key !== POD_GITHUB_CREDENTIAL_URL_ENV && (!hostRefresh || !['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'].includes(key))));
+        const jobArmEnv = grounding || credentialRelay || githubRelay || env.ELANOUS_DISPATCH_RECORDED === '1' || options.armEnv || detailUntil
           ? {
-              ...(options.armEnv ?? {}),
+              ...armEnv,
+              ...(detailUntil ? { ELANOUS_LIVE_DETAIL_UNTIL: detailUntil } : {}),
+              ...(env.ELANOUS_DISPATCH_RECORDED === '1' ? { ELANOUS_DISPATCH_RECORDED: '1' } : {}),
               ...(grounding ? { [GROUNDING_URL_ENV]: groundingUrl! } : {}),
               ...(credentialRelay ? { [POD_CREDENTIAL_URL_ENV]: `${new URL(groundingUrl!).origin}${POD_CREDENTIAL_GROK_PATH}` } : {}),
+              ...(githubRelay ? { [POD_GITHUB_CREDENTIAL_URL_ENV]: `${new URL(groundingUrl!).origin}${POD_CREDENTIAL_GITHUB_PATH}` } : {}),
             }
-          : options.armEnv;
-        const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
+          : undefined;
+        const job = podJobManifest({ name, namespace, image: jobImage, ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}), repoUrl, ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), args, passEnv: jobPassEnv, deadlineSeconds: options.deadlineSeconds ?? POD_JOB_DEADLINE_SECONDS, ...(goalDoc ? { goalDoc } : {}), runId: launchRunId, ...(parentRunId ? { parentRunId } : {}), ...(jobArmEnv ? { armEnv: jobArmEnv } : {}), hostId: resolveHostId(env), skillEnvs: Object.keys(skillEnvs), memoryLimit, imageCommit: options.imageCommit !== undefined ? options.imageCommit : options.kubectl ? null : podImageFreshness({ image }).imageCommit, ...(grok ? { grokCredential: 'grokAuth' in creds && creds.grokAuth ? 'subscription' as const : 'api_key' as const } : {}), ...(codexAccounts ? { codexAccounts } : {}), ...(hostRefresh ? { appCredential: true } : {}) });   // kubectl 주입(=시험)이면 docker 를 부르지 않는다
         const a = kubectl(['apply', '-f', '-'], JSON.stringify(job));
         if (a.status !== 0) { cleanupSecret(); return { exitCode: 1, output: a.stderr, error: { code: 'pod-apply', message: a.stderr.trim() } }; }
         if (options.source?.kind === 'bundle') {
@@ -791,7 +888,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           try { appendRunLedgerEntry({ runId: parentRunId, event: 'pod-child-run', data: { childRunId: liveChildRunId, job: name, ...(goalFile ? { goalFile } : {}) } }, ledgerDir); }
           catch (error) { debug.log('self-implement.pod', 'parent-ledger-unavailable', { job: name, reason: error instanceof Error ? error.message : String(error) }); }
         }
-        writePodFragment({ spaceId: input.spaceId, context, namespace, job: name, inboxDir: POD_CONTROL_INBOX_DIR }, env);
+        writePodFragment({ spaceId: input.spaceId, context, namespace, job: name, inboxDir: POD_CONTROL_INBOX_DIR, ...(liveChildRunId === normalizeRunId(liveChildRunId) ? { runId: liveChildRunId } : {}), ...(parentRunId && normalizeRunId(parentRunId) === parentRunId ? { parentRunId } : {}) }, env);
         recorded = true;
         debug.log('self-implement.pod', 'job-applied', { job: name, namespace, ...(member ? { context: member.context } : {}), image: jobImage, spaceId: input.spaceId, passEnv, extraArgs: options.extraArgs ?? [], ...(options.armEnv?.ELANOUS_ARM_ID ? { armId: options.armEnv.ELANOUS_ARM_ID } : {}) });
         let state: 'complete' | 'failed' | 'aborted' = 'failed';
@@ -828,6 +925,22 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             } catch { /* Pod 가 사라졌거나 조회 불가 — 종료 사유는 미상. */ }
             debug.log('self-implement.pod', 'container-terminated', { job: name, container: 'child', reason: containerReason, exitCode: containerExitCode, jobReason: failedReason || null, memoryLimit });
             break;
+          }
+          if (ghTokenExpiresAt !== null && ghTokenExpiresAt - now() <= 10 * 60_000) {
+            try {
+              const fresh = await issueVerifiedAppCredential();
+              if (!fresh) throw new Error('mint-or-verification-failed');
+              // No bearer in argv, stdout, stderr, or the run ledger. kubectl receives it only over stdin.
+              const installed = kubectl(['-n', namespace, 'exec', '-i', `job/${name}`, '-c', 'child', '--', 'sh', '-c', APP_GH_EXEC, 'sh', 'gh', 'auth', 'login', '--with-token'], `${fresh.token}\n`);
+              if (installed.status !== 0) {
+                const fallback = kubectl(['-n', namespace, 'exec', '-i', `job/${name}`, '-c', 'child', '--', 'sh', '-c', APP_GH_EXEC, 'sh', 'bun', '-e', APP_GH_AUTH_SCRIPT], `${fresh.token}\n`);
+                if (fallback.status !== 0) throw new Error('exec-failed');
+              }
+              ghTokenExpiresAt = fresh.expiresAt;
+              debug.log('self-implement.pod', 'gh-token-refreshed', { job: name, expiresAt: new Date(fresh.expiresAt).toISOString() });
+            } catch {
+              debug.log('self-implement.pod', 'gh-token-refresh-failed', { job: name, reason: 'mint-verification-or-exec-failed' });
+            }
           }
           try { follower?.poll(); } catch (e) { debug.log('self-implement.pod', 'ledger-live-unavailable', { job: name, reason: e instanceof Error ? e.message : String(e) }); }
           await sleep(options.pollMs ?? 15_000);
@@ -919,7 +1032,13 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
           try { const { appendGoalExecutionRecord } = await import('../../self-implement/orchestrator.js'); appendGoalExecutionRecord(goalFile, record); }
           catch (error) { debug.log('self-implement.pod', 'goal-record-unavailable', { job: name, childRunId: liveChildRunId, reason: error instanceof Error ? error.message : String(error) }); }
         }
-        debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, ledgerCompleteness });
+        const childFailure = state === 'failed' && containerReason !== 'OOMKilled' && failedReason !== 'DeadlineExceeded'
+          ? lastPodChildFailure(logs) : null;
+        if (childFailure) debug.log('self-implement.pod', 'child-error', { job: name, stage: childFailure.stage, error: childFailure.error }, { compact: { stringMax: 500 } });
+        debug.log('self-implement.pod', 'job-finished', { job: name, ...(member ? { context: member.context } : {}), state, containerReason, stage: disposition?.stage ?? null, prUrl: disposition?.prUrl ?? null, childRunId: liveChildRunId, ledgerCompleteness,
+          ...(state === 'failed' && containerReason !== 'OOMKilled' && failedReason !== 'DeadlineExceeded'
+            ? { ...(childFailure ? { childStage: childFailure.stage } : {}), childError: childFailure?.error ?? 'no-result-line' } : {}) },
+          state === 'failed' && containerReason !== 'OOMKilled' && failedReason !== 'DeadlineExceeded' ? { compact: { stringMax: 500 } } : undefined);
         const tail = podRunResultLine(logs, salvage);
         if (state === 'aborted') return { exitCode: null, output: tail, error: { code: 'aborted', message: 'aborted — Job deleted' }, ...(disposition ? { disposition } : {}) };
         const deadlineExceeded = state === 'failed' && failedReason === 'DeadlineExceeded';
@@ -944,7 +1063,7 @@ export function podSelfImplementSpawn(options: PodSpawnOptions = {}): SelfImplem
             : state === 'failed'
               ? containerReason === 'OOMKilled'
                 ? { error: { code: 'pod-oom-killed', message: `Job ${name} failed (OOMKilled/${containerExitCode ?? 'unknown'}, memoryLimit=${memoryLimit})\n${formatLastMemSample(samples.at(-1))}` } }
-                : { error: { code: 'pod-job-failed', message: `Job ${name} failed${failedReason || containerReason ? ` (${[failedReason, containerReason ? `container=${containerReason}/${containerExitCode ?? 'unknown'}` : ''].filter(Boolean).join(', ')})` : ''}` } }
+                : { error: { code: 'pod-job-failed', message: `Job ${name} failed${failedReason || containerReason ? ` (${[failedReason, containerReason ? `container=${containerReason}/${containerExitCode ?? 'unknown'}` : ''].filter(Boolean).join(', ')})` : ''}${childFailure ? ` — childStage=${childFailure.stage} · childError=${childFailure.error}` : ' — childError=no-result-line'}` } }
               : {}),
           ...(finishedDisposition ? { disposition: finishedDisposition } : {}),
         };
@@ -1004,6 +1123,23 @@ export function recordPodSalvage(logs: string, job: string, log: (category: stri
   const rows = parsePodSalvageLines(logs);
   for (const row of rows) log('self-implement.pod', 'salvage-pushed', { job, branch: row.branch, commit: row.commit });
   return rows.map((row) => row.branch);
+}
+
+function lastPodChildFailure(logs: string): { stage: string; error: string } | null {
+  for (const line of logs.split('\n').reverse()) {
+    if (!line.trimStart().startsWith('{')) continue;
+    let result: unknown;
+    try { result = JSON.parse(line); } catch { continue; }
+    if (!result || typeof result !== 'object' || Array.isArray(result)) continue;
+    const row = result as Record<string, unknown>;
+    if (typeof row.stage !== 'string' || typeof row.ok !== 'boolean') continue;
+    if (row.ok !== false || typeof row.error !== 'string') return null;
+    const lines = row.error.replace(/\/home\/[^/\s]+\//g, '~/').split(/\r\n|\n|\r/);
+    const first = lines[0]!.slice(0, 240);
+    const last = lines.at(-1)!.slice(0, 240);
+    return { stage: row.stage, error: first === last ? first : `${first}\n${last}` };
+  }
+  return null;
 }
 
 /** 사람용 런 결과 한 줄 — 수확 브랜치가 있으면 «수확할 브랜치: …» 를 붙인다. */
@@ -1181,6 +1317,14 @@ export function podImageFreshness(deps: {
   return imageCommit === headCommit
     ? { imageCommit, headCommit, fresh: true, reason: 'HEAD 와 같다' }
     : { imageCommit, headCommit, fresh: false, reason: `이미지 ${imageCommit.slice(0, 12)} ≠ HEAD ${headCommit.slice(0, 12)}` };
+}
+
+function configHostMirror(): string | undefined {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { getUserConfig } = require('../../user-config.js') as typeof import('../../user-config.js');
+    return getUserConfig().pod?.hostMirror;
+  } catch { return undefined; }
 }
 
 function configGroundingUrl(): string | undefined {

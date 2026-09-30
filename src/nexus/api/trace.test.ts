@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, unlinkSync } from 'node:fs';
+import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { prodInstanceRoot } from '../../instance/resolve.js';
@@ -170,8 +171,8 @@ describe('authenticated trace and evidence', () => {
         const query = { limit: 1001, ...(search ? { grep: search } : {}) };
         const selected = (runId ? store.queryTraceRun(runId, query) : store.query(query))
           .filter((entry) => !kind || JSON.parse(entry.data!).kind === kind || (kind === 'VERIFY' && entry.event === 'VERIFY'));
-        const expected = JSON.stringify({ ok: true, ...buildTrace(selected.slice(0, 100), level, selected.length > 100), stores: [store.instance] });
-        const actual = await handleTrace(req(path), open, { store: () => store, queryLog: () => {} }).text();
+        const expected = JSON.stringify({ ok: true, ...buildTrace(selected.slice(0, 100), level, selected.length > 100), stores: [store.instance], registeredStores: 1 });
+        const actual = await handleTrace(req(path), open, { store: () => store, instances: () => [], queryLog: () => {} }).text();
         expect(actual).toBe(expected);
       }
     } finally { store.close(); }
@@ -257,6 +258,38 @@ describe('authenticated trace and evidence', () => {
       expect(handleTraceEvidence(req('/v1/trace/evidence/log:test%3Atwo:99'), open, 'log:test%3Atwo:99', deps).status).toBe(404);
     } finally { one.close(); two.close(); }
   });
+  it('counts registered log stores outside @active and reports registry read failures as null', async () => {
+    const self = seed(resolveLogInstanceName());
+    const recent = seed('test:recent');
+    const views = [view('test:recent'), view('test:stale'), { ...view('test:empty'), dbExists: false }];
+    const path = '/v1/trace?level=L1&store=@active';
+    const deps = {
+      store: () => self, instances: () => views,
+      dbMtimeMs: (dbPath: string) => dbPath.includes('recent') ? Date.now() : Date.now() - 3 * 86_400_000,
+      openRemoteStore: () => recent, closeRemoteStore: () => {}, queryLog: () => {},
+    };
+    try {
+      const counted = await handleTrace(req(path), open, deps).json() as { registeredStores: number | null; stores: string[] };
+      expect(counted.registeredStores).toBe(3);
+      expect(counted.stores).toEqual([self.instance, 'test:recent']);
+      const expectedRuns = [self, recent].flatMap((store) => store.aggregateRuns({}, 500).map((run) => ({ ...run, universe: store.instance })));
+      const { registeredStores, ...existingFields } = counted;
+      expect(JSON.stringify(existingFields)).toBe(JSON.stringify({ ok: true, ...buildRunTrace(expectedRuns, 'L1'), stores: [self.instance, 'test:recent'] }));
+      const unreadable = await handleTrace(req(path), open, {
+        ...deps, instances: () => { throw new Error('registry unavailable'); },
+      }).json() as { registeredStores: number | null; stores: string[] };
+      expect(unreadable.registeredStores).toBeNull();
+      expect(unreadable.stores).toEqual([self.instance]);
+      const rowMode = await handleTrace(req('/v1/trace?level=L3'), open, {
+        ...deps, instances: () => { throw new Error('registry unavailable'); },
+      }).json() as { registeredStores: number | null };
+      expect(rowMode.registeredStores).toBeNull();
+      const selfRegistered = await handleTrace(req('/v1/trace?level=L3'), open, {
+        ...deps, instances: () => [view(self.instance), ...views],
+      }).json() as { registeredStores: number | null };
+      expect(selfRegistered.registeredStores).toBe(3);
+    } finally { self.close(); recent.close(); }
+  });
   it('expands @active through log fabric and excludes stale universes', async () => {
     const self = seed(resolveLogInstanceName());
     const recent = seed('test:recent');
@@ -276,6 +309,181 @@ describe('authenticated trace and evidence', () => {
       expect(new Set(body.nodes.filter((node) => node.id.startsWith('universe:')).map((node) => node.id))).toEqual(new Set([`universe:${self.instance}`, 'universe:test:recent']));
       expect(opened).toEqual(['test:recent']);
     } finally { self.close(); recent.close(); }
+  });
+  it('resolves an L3 run outside @active by its ledger and reports a missing ledger distinctly', async () => {
+    const runId = 'run-318ea5d4-a21b-4fc2-ae24-3177278b2036';
+    const root = mkdtempSync(join(tmpdir(), 'elanous-trace-ledger-'));
+    const bDir = join(root, 'b');
+    const ledgerDir = runLedgerDir(bDir);
+    mkdirSync(ledgerDir, { recursive: true });
+    const ledger = runLedgerPath(runId, ledgerDir);
+    writeFileSync(ledger, `${JSON.stringify({ runId, event: 'start', data: {} })}\n`);
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    const a = new LogStore(':memory:', { instance: 'test:a' });
+    const b = new LogStore(':memory:', { instance: 'test:b' });
+    b.insertBatch(['VERIFY', 'HEAL', 'SHIP'].map((kind, index) => ({ rec: {
+      ts: new Date(Date.parse(ts) + index * 1000).toISOString(), category: 'harness.decision', event: 'decision',
+      data: { runId, kind, phase: 'gate', what: kind },
+    }, surface: 'nexus' })));
+    const views = [{ ...view('test:a'), stateDir: join(root, 'a') }, { ...view('test:b'), stateDir: bDir }];
+    const opened: string[] = [];
+    const closed: string[] = [];
+    const deps = {
+      store: () => self, instances: () => views,
+      dbMtimeMs: (path: string) => path.includes('test:a') ? Date.now() : Date.now() - 3 * 86_400_000,
+      openRemoteStore: (v: LogInstanceView) => { opened.push(v.name); return v.name === 'test:a' ? a : b; },
+      closeRemoteStore: (store: LogStore) => { closed.push(store.instance); }, queryLog: () => {},
+    };
+    const path = `/v1/trace?level=L3&runId=${runId}&store=@active`;
+    try {
+      const found = await handleTrace(req(path), open, deps).json() as { events: Array<{ kind: string; universe: string }>; stores: string[]; resolvedFrom?: string; runUniverse?: string };
+      expect(found.events.map((event) => event.kind)).toEqual(['SHIP', 'HEAL', 'VERIFY']);
+      expect(found.events.every((event) => event.universe === 'test:b')).toBe(true);
+      expect(found.resolvedFrom).toBe('ledger');
+      expect(found.stores).toEqual([self.instance, 'test:a', 'test:b']);
+      expect(found.runUniverse).toBe('test:b');
+      expect(opened).toEqual(['test:a', 'test:b']);
+      expect(closed).toEqual(['test:a', 'test:b']);
+      const l2Found = await handleTrace(req(path.replace('level=L3', 'level=L2')), open, deps).json() as { events: unknown[]; resolvedFrom?: string; runUniverse?: string };
+      expect(l2Found).toMatchObject({ resolvedFrom: 'ledger', runUniverse: 'test:b' });
+      expect(l2Found.events).toHaveLength(3);
+      unlinkSync(ledger);
+      const missing = await handleTrace(req(path), open, deps).json() as { events: unknown[]; stores: string[]; runUniverse?: string; checked?: number; resolvedFrom?: string };
+      expect(missing.events).toHaveLength(0);
+      expect(missing.runUniverse).toBe('not-found');
+      expect(missing.checked).toBe(2);
+      expect(missing.resolvedFrom).toBeUndefined();
+      expect(missing.stores).toEqual([self.instance, 'test:a']);
+      expect(opened).toEqual(['test:a', 'test:b', 'test:a', 'test:b', 'test:a']);
+      const l2 = await handleTrace(req(path.replace('level=L3', 'level=L2')), open, deps).json() as { runUniverse: string; checked: number; events: unknown[] };
+      expect(l2).toMatchObject({ runUniverse: 'not-found', checked: 2, events: [] });
+    } finally { self.close(); a.close(); b.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('still resolves the run by its ledger when one selected store fails to open, and keeps reporting that failure', async () => {
+    const runId = 'run-318ea5d4-a21b-4fc2-ae24-3177278b2036';
+    const root = mkdtempSync(join(tmpdir(), 'elanous-trace-failed-store-'));
+    const bDir = join(root, 'b');
+    const ledgerDir = runLedgerDir(bDir);
+    mkdirSync(ledgerDir, { recursive: true });
+    writeFileSync(runLedgerPath(runId, ledgerDir), `${JSON.stringify({ runId, event: 'start', data: {} })}\n`);
+    const a = new LogStore(':memory:', { instance: 'test:a' });
+    const b = new LogStore(':memory:', { instance: 'test:b' });
+    b.insertBatch([{ rec: { ts, category: 'harness.decision', event: 'decision', data: { runId, kind: 'SHIP', what: 'merged' } }, surface: 'nexus' }]);
+    const views = [{ ...view('test:a'), stateDir: join(root, 'a') }, { ...view('test:b'), stateDir: bDir }];
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    // `test:empty` is selected but has no log db — the production daemon's own tree-derived universe looked like this.
+    views.push({ ...view('test:empty'), dbExists: false, stateDir: join(root, 'empty') });
+    const deps = {
+      store: () => self,
+      instances: () => views,
+      dbMtimeMs: (path: string) => path.includes('test:a') ? Date.now() : Date.now() - 3 * 86_400_000,
+      openRemoteStore: (v: LogInstanceView) => v.name === 'test:a' ? a : b,
+      closeRemoteStore: () => {}, queryLog: () => {},
+    };
+    const path = `/v1/trace?level=L3&runId=${runId}&store=@active,test:empty`;
+    try {
+      const res = handleTrace(req(path), open, deps);
+      const body = await res.json() as { ok: boolean; events: Array<{ kind: string }>; resolvedFrom?: string; runUniverse?: string; failedStores?: Array<{ name: string }>; truncated: boolean };
+      expect(res.status).toBe(200);
+      expect(body.ok).toBe(true);
+      expect(body.events.map((event) => event.kind)).toEqual(['SHIP']);
+      expect(body).toMatchObject({ resolvedFrom: 'ledger', runUniverse: 'test:b', truncated: true });
+      expect(body.failedStores?.map((f) => f.name)).toEqual(['test:empty']);
+    } finally { self.close(); a.close(); b.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('reports a selected universe with a ledger but no matching log rows instead of not-found', async () => {
+    const runId = 'run-318ea5d4-a21b-4fc2-ae24-3177278b2036';
+    const root = mkdtempSync(join(tmpdir(), 'elanous-trace-selected-ledger-'));
+    const aDir = join(root, 'a');
+    const ledgerDir = runLedgerDir(aDir);
+    mkdirSync(ledgerDir, { recursive: true });
+    writeFileSync(runLedgerPath(runId, ledgerDir), `${JSON.stringify({ runId, event: 'start', data: {} })}\n`);
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    const a = new LogStore(':memory:', { instance: 'test:a' });
+    const b = new LogStore(':memory:', { instance: 'test:b' });
+    a.insertBatch([{ rec: { ts, category: 'harness.decision', event: 'decision', data: { runId, kind: 'VERIFY', what: 'gate' } }, surface: 'nexus' }]);
+    const views = [{ ...view('test:a'), stateDir: aDir }, { ...view('test:b'), stateDir: join(root, 'b') }];
+    const opened: string[] = [];
+    const deps = {
+      store: () => self, instances: () => views,
+      dbMtimeMs: (path: string) => path.includes('test:a') ? Date.now() : Date.now() - 3 * 86_400_000,
+      openRemoteStore: (v: LogInstanceView) => { opened.push(v.name); return v.name === 'test:a' ? a : b; },
+      closeRemoteStore: () => {}, queryLog: () => {},
+    };
+    try {
+      for (const lens of ['q=does-not-match', 'from=2026-09-29', 'to=2026-09-27']) {
+        const body = await handleTrace(req(`/v1/trace?level=L3&runId=${runId}&store=@active&${lens}`), open, deps).json() as {
+          events: unknown[]; runUniverse?: string; resolvedFrom?: string; stores: string[];
+        };
+        expect(body.events).toEqual([]);
+        expect(body).toMatchObject({ runUniverse: 'test:a', resolvedFrom: 'ledger', stores: [self.instance, 'test:a'] });
+      }
+      const empty = new LogStore(':memory:', { instance: 'test:a' });
+      try {
+        const noRows = await handleTrace(req(`/v1/trace?level=L2&runId=${runId}&store=@active`), open, {
+          ...deps, openRemoteStore: () => empty,
+        }).json() as { events: unknown[]; runUniverse?: string; resolvedFrom?: string };
+        expect(noRows).toMatchObject({ events: [], runUniverse: 'test:a', resolvedFrom: 'ledger' });
+      } finally { empty.close(); }
+      expect(opened).toEqual(['test:a', 'test:a', 'test:a']);
+    } finally { self.close(); a.close(); b.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+  it('does not classify a failed ledger lookup as a missing run', async () => {
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    const a = new LogStore(':memory:', { instance: 'test:a' });
+    const views = [view('test:a'), { ...view('test:b'), stateDir: '/inaccessible-state' }];
+    const runId = 'run-318ea5d4-a21b-4fc2-ae24-3177278b2036';
+    const examined: string[] = [];
+    const opened: string[] = [];
+    try {
+      const response = handleTrace(req(`/v1/trace?level=L3&runId=${runId}&store=@active`), open, {
+        store: () => self, instances: () => views,
+        dbMtimeMs: (path) => path.includes('test:a') ? Date.now() : Date.now() - 3 * 86_400_000,
+        openRemoteStore: (view) => { opened.push(view.name); return a; }, closeRemoteStore: () => {}, queryLog: () => {},
+        ledgerStat: (path) => { examined.push(path); if (path.includes('inaccessible-state')) throw Object.assign(new Error('permission denied'), { code: 'EACCES' }); throw Object.assign(new Error('not found'), { code: 'ENOENT' }); },
+      });
+      expect(response.status).toBe(503);
+      const body = await response.json() as { ok: boolean; error: string; reason: string; runUniverse?: string };
+      expect(body).toMatchObject({ ok: false, error: 'run-universe-unavailable' });
+      expect(body.reason).toContain("test:b");
+      expect(body.runUniverse).toBeUndefined();
+      expect(examined).toEqual([runLedgerPath(runId, runLedgerDir('/tmp')), runLedgerPath(runId, runLedgerDir('/inaccessible-state'))]);
+      expect(opened).toEqual(['test:a']);
+    } finally { self.close(); a.close(); }
+  });
+  it('does not call an unqueried selected universe not-found when another selected store was read', async () => {
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    const a = new LogStore(':memory:', { instance: 'test:a' });
+    const runId = 'run-318ea5d4-a21b-4fc2-ae24-3177278b2036';
+    const path = `/v1/trace?level=L3&runId=${runId}&store=@active`;
+    const views = [view('test:a'), view('test:b')];
+    const active = { store: () => self, instances: () => views,
+      dbMtimeMs: (path: string) => path.includes('test:a') ? Date.now() : Date.now() - 3 * 86_400_000,
+      closeRemoteStore: () => {}, queryLog: () => {} };
+    try {
+      const openFailure = handleTrace(req(path), open, { ...active, openRemoteStore: () => null });
+      expect(openFailure.status).toBe(503);
+      expect(await openFailure.json()).toMatchObject({ ok: false, error: 'log-store-unavailable', failedStores: [{ name: 'test:a' }] });
+      const queryFailure = handleTrace(req(path), open, { ...active,
+        openRemoteStore: () => ({ queryTraceRun: () => { throw new Error('read failed'); } }) as unknown as LogStore });
+      expect(queryFailure.status).toBe(503);
+      expect(await queryFailure.json()).toMatchObject({ ok: false, error: 'log-store-unavailable', failedStores: [{ name: 'test:a', reason: 'read failed' }] });
+      const root = mkdtempSync(join(tmpdir(), 'elanous-trace-found-unavailable-'));
+      try {
+        const bDir = join(root, 'b');
+        const ledgerDir = runLedgerDir(bDir);
+        mkdirSync(ledgerDir, { recursive: true });
+        writeFileSync(runLedgerPath(runId, ledgerDir), `${JSON.stringify({ runId, event: 'start' })}\n`);
+        const found = handleTrace(req(path), open, { ...active, instances: () => [views[0]!, { ...views[1]!, stateDir: bDir }],
+          openRemoteStore: (v: LogInstanceView) => v.name === 'test:a' ? a : null });
+        expect(found.status).toBe(503);
+        expect(await found.json()).toMatchObject({ ok: false, error: 'log-store-unavailable', failedStores: [{ name: 'test:b' }] });
+        const foundQueryFailure = handleTrace(req(path), open, { ...active, instances: () => [views[0]!, { ...views[1]!, stateDir: bDir }],
+          openRemoteStore: (v: LogInstanceView) => v.name === 'test:a' ? a : ({ queryTraceRun: () => { throw new Error('ledger store unreadable'); } }) as unknown as LogStore });
+        expect(foundQueryFailure.status).toBe(503);
+        expect(await foundQueryFailure.json()).toMatchObject({ ok: false, error: 'log-store-unavailable', failedStores: [{ name: 'test:b', reason: 'ledger store unreadable' }] });
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    } finally { self.close(); a.close(); }
   });
   it('returns partial federation failures with the successful rows', async () => {
     const self = seed(resolveLogInstanceName());

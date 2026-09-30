@@ -1,6 +1,7 @@
 import { resolveDaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
 import { RemotesStore } from './remotes.js';
 import { bookmarkAttachDefaults } from './remote-resolve.js';
+import { getNodeKind } from '../graph-kinds/registry.js';
 
 export type McpCliClassification =
   | 'ok'
@@ -84,7 +85,15 @@ export async function callDaemonMcpTool(opts: {
   arguments: Record<string, unknown>;
   endpoint?: string | ResolvedEndpoint;
   fetchFn?: McpCallOpts['fetchFn'];
+  pluginKind?: string;
 }): Promise<unknown> {
+  if (opts.pluginKind) {
+    const entry = getNodeKind('workflow', opts.pluginKind);
+    if (!entry || entry.core || !entry.plugin || !entry.run || !('mcp' in entry.run)
+      || opts.tool !== `${entry.run.mcp.server}.${entry.run.mcp.tool}`) {
+      throw new McpCliFailure('mcp-usage-error', 'invalid plugin MCP kind');
+    }
+  }
   const endpoint = typeof opts.endpoint === 'string' ? { url: opts.endpoint } : opts.endpoint;
   const resolved = endpoint ? { ok: true as const, value: endpoint } : resolveMcpEndpoint({});
   if (!resolved.ok) throw new McpCliFailure(resolved.classification, resolved.message);

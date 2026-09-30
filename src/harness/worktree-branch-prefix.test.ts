@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { branchGoalId } from '../cli/pr-lineage.js';
+import { branchGoalId, branchLineageSlug } from '../cli/pr-lineage.js';
 import { WORKTREE_BRANCH_PREFIX, plannedSelfImplBranch, slugifyFeature } from './worktree-branch-prefix.js';
 
 describe('plannedSelfImplBranch — goal id segment', () => {
@@ -40,6 +40,28 @@ describe('plannedSelfImplBranch — goal id segment', () => {
     const first = plannedSelfImplBranch(feature, '667c0b5f0fa204d6');
     const second = plannedSelfImplBranch(feature, 'c969c242a28942b0');
     expect(first.slice(-8)).not.toBe(second.slice(-8));
+  });
+
+  test('two runs of one goal have distinct names and shared lineage while the legacy name is unchanged', () => {
+    const feature = 'Shared Prefix';
+    const goalId = '4b852b3a0f863ad2';
+    const legacy = plannedSelfImplBranch(feature, goalId);
+    const first = plannedSelfImplBranch(feature, goalId, 'run-c41218b4-9383-458c-b944-9f7351062861');
+    const second = plannedSelfImplBranch(feature, goalId, 'run-0557cdea-0000-4000-8000-000000000000');
+    expect(legacy).toBe(`self-impl/goalid-${goalId}-shared-prefix-0486e54f`);
+    expect(first).toBe(`${legacy}-rc41218`);
+    expect(second).toBe(`${legacy}-r0557cd`);
+    expect(first).not.toBe(second);
+    for (const branch of [legacy, first, second]) {
+      expect(branchLineageSlug(branch)).toBe(branchLineageSlug(legacy));
+      expect(branchGoalId(branch)).toBe(goalId);
+    }
+  });
+
+  test('run suffix strips run- and separators then lowercases six alphanumerics without a goal id', () => {
+    const legacy = plannedSelfImplBranch('Shared Prefix');
+    expect(plannedSelfImplBranch('Shared Prefix', undefined, 'run-C4-12_18b4')).toBe(`${legacy}-rc41218`);
+    expect(plannedSelfImplBranch('Shared Prefix')).toBe(legacy);
   });
 
   test('long feature plus goalId keeps readable length and self-impl/ prefix', () => {

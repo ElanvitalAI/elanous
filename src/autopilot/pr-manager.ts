@@ -9,11 +9,14 @@
 // 구현을 교체(누적 아님). 기존 PR 없으면 새로 생성.
 
 import { spawnSync } from 'node:child_process';
+import { githubAutomationToken } from '../auth/github-app-token.js';
 import { debug } from '../debug/log.js';
+import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
 import { runGitWithRetry } from '../git-fs/retry.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { isElanousRuntimeArtifactPath } from '../self-implement/gate-scope.js';
 import { isTransientExecutionFailure } from '../self-dev/execution-transient.js';
+import { withGhRestFallback } from './gh-rest-fallback.js';
 
 /** ★ stderr 캡처(대표 2026-07-21·관측 갭) — 종전엔 stdout 만 담아 git/gh 실패 사유가 소실됐다
  *  (705308: makePr 실패가 bare null 로 뭉뚱그려져 triage 가 "인증·네트워크"로 환각 오라우팅).
@@ -22,12 +25,55 @@ export interface CmdResult { ok: boolean; out: string; err?: string }
 /** 명령 실행 추상화(주입형·테스트 스텁) — git/gh 를 실제로 돌리지 않고 로직 검증. */
 export type CmdRunner = (cmd: string, args: readonly string[], opts?: { cwd?: string }) => CmdResult;
 
+const GH_TOKEN_REFRESH_WINDOW_MS = 10 * 60_000;
+let cachedRelayToken: { url: string; bearer: string; original: string | undefined; token: string; expiresAt: number } | undefined;
+
+/** The runner is synchronous; ask the host relay synchronously before starting gh. */
+function relayGhToken(env: NodeJS.ProcessEnv): string | null {
+  const url = env[POD_GITHUB_CREDENTIAL_URL_ENV];
+  const bearer = env[POD_GITHUB_CREDENTIAL_TOKEN_ENV];
+  if (!url || !bearer) return null;
+  const now = Date.now();
+  const original = env.GH_TOKEN;
+  if (cachedRelayToken?.url === url && cachedRelayToken.bearer === bearer && cachedRelayToken.original === original
+    && now + GH_TOKEN_REFRESH_WINDOW_MS < cachedRelayToken.expiresAt) return cachedRelayToken.token;
+  try {
+    const response = spawnSync('curl', [
+      '--silent', '--show-error', '--fail', '--noproxy', '*', '--max-time', '10',
+      '--request', 'POST', '--header', '@-', url,
+    ], { input: `Authorization: Bearer ${bearer}\n`, encoding: 'utf8', timeout: 12_000, maxBuffer: 64 * 1024, env });
+    if (response.error || response.status !== 0) throw new Error('request-failed');
+    const body: unknown = JSON.parse(response.stdout);
+    const token = body && typeof body === 'object' ? (body as { token?: unknown }).token : undefined;
+    const expiry = body && typeof body === 'object' ? (body as { expires_at?: unknown }).expires_at : undefined;
+    const expiresAt = typeof expiry === 'string' ? Date.parse(expiry) : NaN;
+    if (typeof token !== 'string' || !token || !Number.isFinite(expiresAt) || expiresAt <= now + GH_TOKEN_REFRESH_WINDOW_MS) throw new Error('invalid-response');
+    cachedRelayToken = { url, bearer, original, token, expiresAt };
+    return token;
+  } catch {
+    debug.log('pr-manager', 'gh-token', { reason: 'refresh-failed' }, { level: 'warn' });
+    return cachedRelayToken?.url === url && cachedRelayToken.bearer === bearer && cachedRelayToken.original === original
+      && now < cachedRelayToken.expiresAt ? cachedRelayToken.token : null;
+  }
+}
+
+/** Environment for a `gh` call made by automation: the Pod relay token, else the GitHub App token when the
+ *  caller set no GH_TOKEN — so PRs, merges and PR comments all act as the App, not the person logged into `gh`. */
+export function ghAutomationEnv(env: NodeJS.ProcessEnv = process.env, appToken: () => string | null = githubAutomationToken): NodeJS.ProcessEnv {
+  const token = relayGhToken(env) ?? (!Object.hasOwn(env, 'GH_TOKEN') ? appToken() : null);
+  return token ? { ...env, GH_TOKEN: token } : env;
+}
+
 /** 기본 러너 — spawnSync(dep-free). 실패/예외는 ok=false. stdout·stderr 모두 캡처. */
 export const defaultCmdRunner: CmdRunner = (cmd, args, opts) => {
   try {
-    // env: process.env — 최소 PATH(cron)에서도 ensure-bin-path 보강 PATH 로 gh 를 찾도록 명시 전달.
-    const r = spawnSync(cmd, [...args], { encoding: 'utf-8', timeout: 120_000, env: process.env, ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
-    return { ok: r.status === 0, out: (r.stdout ?? '').trim(), err: (r.stderr ?? '').trim() };
+    // Relay only applies to gh; without it, retain caller GH_TOKEN and the existing App fallback.
+    const env = cmd === 'gh' ? ghAutomationEnv(process.env) : process.env;
+    // bun ≥1.4 applies Node's 1MB default maxBuffer and silently truncates (`gh pr diff`, file lists) — raise it and
+    // never read an overflow as success.
+    const r = spawnSync(cmd, [...args], { encoding: 'utf-8', timeout: 120_000, maxBuffer: 256 * 1024 * 1024, env, ...(opts?.cwd ? { cwd: opts.cwd } : {}) });
+    const overflow = (r.error as NodeJS.ErrnoException | undefined)?.code === 'ENOBUFS';
+    return { ok: r.status === 0 && !overflow, out: (r.stdout ?? '').trim(), err: [(r.stderr ?? '').trim(), overflow ? 'output exceeded 256MiB (ENOBUFS)' : ''].filter(Boolean).join('\n') };
   } catch (e) { return { ok: false, out: '', err: e instanceof Error ? e.message : String(e) }; }
 };
 
@@ -259,7 +305,8 @@ function isTransientPushFailure(detail: string): boolean {
 }
 
 /** ★ PR 매니저 팩토리(대표 2026-07-12) — CmdRunner 주입(테스트 스텁). 실 배선은 기본 러너. */
-export function makePrManager(run: CmdRunner = defaultCmdRunner): PrManager {
+export function makePrManager(runner: CmdRunner = defaultCmdRunner): PrManager {
+  const run = withGhRestFallback(runner);
   const findPrForBranchOutcome = (branch: string, cwd?: string): FindPrForBranchOutcome => {
     // ⛔ 표식은 base 를 「생략했다」는 뜻이지 브랜치 이름이 아니다. 그대로 `gh --head` 로 넘기면
     //    gh 가 `no pull requests found for branch "elanous:default-branch"` 를 stderr 로 뱉는다.

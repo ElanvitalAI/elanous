@@ -4,6 +4,7 @@ import { describe, expect, it } from 'bun:test';
 import {
   buildGraphFromDefinition,
   classifyNodeVariant,
+  nodeBadgeLabel,
   workflowToLayout,
   type WorkflowDefinitionLike,
 } from './workflow-graph-layout';
@@ -283,5 +284,19 @@ describe('workflowToLayout — _meta.layout overrides (ROADMAP W3)', () => {
     const layout = workflowToLayout(def);
     expect(layout.bounds.width).toBeGreaterThan(10_000);
     expect(layout.bounds.height).toBeGreaterThan(10_000);
+  });
+});
+
+describe('plugin node badge (K3 실물 2026-09-30 · plugin nodes showed «UNKNOWN»)', () => {
+  it('a plugin kind node is labelled by its kind and previews its first input', () => {
+    const graph = buildGraphFromDefinition({ name: 'w', nodes: [{ id: 'report', kind: 'elanous-hwp:from-md', inputs: { markdown: '# 주간 보고\n- 한 줄', template: 'report' } }] } as never);
+    const node = graph.nodes.find((n) => n.id === 'report')!;
+    expect(node.badge).toBe('elanous-hwp:from-md');
+    expect(node.preview).toBe('# 주간 보고');
+    expect(nodeBadgeLabel({ kind: 'elanous-hwp:to-md' }, 'unknown')).toBe('elanous-hwp:to-md');
+  });
+  it('core nodes keep their variant badge', () => {
+    expect(nodeBadgeLabel({ bash: 'echo hi' }, 'bash')).toBe('bash');
+    expect(nodeBadgeLabel({}, 'unknown')).toBe('unknown');
   });
 });

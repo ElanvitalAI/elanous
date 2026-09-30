@@ -3,11 +3,24 @@
   "name": "job-coach",
   "version": "0.1.0",
   "description": "Interview-to-NCS competency gap and cited course report.",
+  "skills": "./skills/",
+  "contributes": {
+    "skills": [
+      { "name": "interview-to-profile" },
+      { "name": "career-report" },
+      { "name": "run-report" },
+      { "name": "enterprise-needs" },
+      { "name": "enterprise-task-analysis" },
+      { "name": "enterprise-ai-fit" },
+      { "name": "enterprise-competency" },
+      { "name": "enterprise-roadmap" }
+    ]
+  },
   "extensions": {
     "ai.elanous": {
-      "graphs": ["./graphs/report.yaml"],
-      "capabilities": ["network:fetch"],
-      "connectors": [{ "id": "ncs", "fields": [{ "name": "serviceKey", "secret": true }] }]
+      "graphs": ["./graphs/report.yaml", "./graphs/report-enterprise.yaml"],
+      "capabilities": ["fs:workdir", "net:apis.data.go.kr", "proc:bun", "proc:elanous", "secret:ncs"],
+      "connectors": [{ "id": "ncs", "fields": [{ "name": "serviceKey", "secret": true, "env": "NCS_SERVICE_KEY" }] }]
     }
   }
 }

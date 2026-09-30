@@ -1,0 +1,6 @@
+{
+  "font": "바탕",
+  "size_pt": 12,
+  "margin_mm": { "left": 30, "right": 30, "top": 25, "bottom": 25 },
+  "table": { "header": "bold", "border": "solid" }
+}

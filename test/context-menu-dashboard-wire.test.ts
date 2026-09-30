@@ -269,9 +269,7 @@ describe('CMX-2 · wire · transient handle cleanup', () => {
   test('dispose is idempotent', () => {
     const h = harness();
     h.wire.dispose();
-    h.wire.dispose();
-    // No assertion — just confirms no throw.
-    expect(true).toBe(true);
+    expect(() => h.wire.dispose()).not.toThrow();
   });
 
   test('provider returning null → no menu shown, not consumed', () => {

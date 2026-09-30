@@ -92,10 +92,13 @@ whether to trust it, elanous answers that screen before it types the mission.
   (`/plugins` in Codex, `/plugin install` in Claude Code), installs the plugin
   from that marketplace, and then runs the mission with its skill. The official
   marketplace is `elanous` (see [Plugins](plugins.md)).
-- `--chain` — one mission passes through several agents in order, for example
-  Codex builds, Claude Code reviews, and elanous checks the evidence and opens
-  the pull request. The reviewer gets the builder's diff and the next agent
-  gets a short summary — never the raw screen.
+- `--chain codex,claude,elanous` (or `codex,claude,codex,elanous`) — Codex
+  builds, Claude Code reviews, (Codex fixes,) and elanous checks the evidence
+  and opens the pull request. Other orders are refused, and `--chain` cannot be
+  combined with `--headless` or `--no-commit`. The reviewer gets the builder's
+  diff and the next agent gets a short summary — never the raw screen.
+- `--backend` also accepts `gemini`, `grok` and `aside` — see
+  [Recommended programs](recommended-programs.md#agents-you-can-hand-work-to).
 
 ## Watch it
 
@@ -109,10 +112,17 @@ terminals can sit side by side. See [Terminal](pwa-terminal.md) and
 When an agent shows a sign-in screen, elanous stops and sends you the link or
 device code — it does not sign in for you.
 
-*Coming next:* if you have signed in once in a browser profile that elanous
-can drive, elanous will approve the agent's sign-in page in that browser —
-but only when the page is a plain "authorize" or "enter code" screen. Any
-password, two-step, captcha or passkey prompt goes back to you.
+If you have signed in once in a browser that elanous can drive, you can
+approve a waiting sign-in by hand:
+
+```bash
+elanous agent-mission browser-login --pty <ref> --provider codex   # or claude
+elanous agent-mission browser-login --pty <ref> --provider codex --dry-run   # only look
+```
+
+It approves only a plain "authorize" or "enter code" page. Any password,
+two-step, captcha or passkey prompt goes back to you. Missions do not do this
+on their own yet.
 
 ## Status
 
@@ -122,4 +132,4 @@ password, two-step, captcha or passkey prompt goes back to you.
 | Driving Codex / Claude Code / elanous in a PTY | Available (Claude Code needs you signed in) |
 | Handing results from one agent to the next in one mission (`--chain`) | Available |
 | Installing a plugin inside the agent's own screen (`--plugin`) | Available for Codex (recorded end to end) · Claude Code uses `/plugin install` |
-| Browser-assisted sign-in | In progress |
+| Browser-assisted sign-in | Manual (`agent-mission browser-login`) · automatic use during a mission is in progress |

@@ -8,6 +8,7 @@ import { ThemeProvider } from '@/components/providers/ThemeProvider';
 import { ToastProvider } from '@/components/providers/ToastProvider';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { AppShell } from '@/components/shell/AppShell';
+import { MaturityBanner } from '@/components/shell/MaturityBanner';
 import { ServiceWorkerRegister } from '@/components/providers/ServiceWorkerRegister';
 import { NewBuildBanner } from '@/components/providers/NewBuildBanner';
 
@@ -15,9 +16,17 @@ const geist = Geist({ subsets: ['latin'], variable: '--font-sans' });
 
 export const metadata: Metadata = {
   title: 'elanous',
-  description: 'monad-agent unified PWA — voice · chat · intake · control · terminal.',
+  description: 'elanous — voice · chat · intake · control · terminal.',
   manifest: '/app/manifest.webmanifest',
   applicationName: 'elanous',
+  // 대표 확정 아이콘 V6 «엘랑 소용돌이» — 원천 docs/brand/icon/ (2026-09-30)
+  icons: {
+    icon: [
+      { url: '/app/icons/elanous-32.png', sizes: '32x32', type: 'image/png' },
+      { url: '/app/icons/elanous-16.png', sizes: '16x16', type: 'image/png' },
+    ],
+    apple: [{ url: '/app/icons/elanous-180.png', sizes: '180x180', type: 'image/png' }],
+  },
 };
 
 export const viewport: Viewport = {
@@ -54,7 +63,7 @@ export default function RootLayout({
             <ThemeProvider>
               <TooltipProvider>
                 <ToastProvider>
-                  <AppShell>{children}</AppShell>
+                  <AppShell><MaturityBanner />{children}</AppShell>
                 </ToastProvider>
               </TooltipProvider>
             </ThemeProvider>

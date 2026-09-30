@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { parse as parseYaml } from 'yaml';
-import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
+import { defaultProbeHostEnvironment, defaultReadInstallPrefix, formatDoctorReport as renderDoctorReport, humanBreaks, registerDoctorCommand, runDoctor, setFetchHealthSpawnForTest, summarizeDoctorCapabilities } from './doctor-cli.js';
 import { checkReadiness } from './doctor-readiness.js';
 import { applySudoFixes } from './doctor-fix.js';
 import type { UserConfig } from '../user-config.js';
@@ -67,24 +67,45 @@ function credentialBlock(formatted: string, name: string, nextName?: string): st
 }
 
 describe('doctor CLI', () => {
+  test('humanBreaks hides development notes and keeps user-facing prose after removing source paths', () => {
+    for (const value of [
+      'unmeasured',
+      '4 test errors on a fresh Linux machine',
+      '19 test failures on a fresh Linux machine',
+      'measured with 75% capacity',
+      'quota-exhausted run',
+      'postmortem classified the run',
+      'Chrome 을 못 찾았다',
+    ]) expect(humanBreaks(value)).toBeUndefined();
+    expect(humanBreaks('measured with 75% quota in the postmortem')).toBeUndefined();
+    expect(humanBreaks('Browser automation is unavailable — src/browser-cdp/client.ts:23')).toBe('Browser automation is unavailable');
+    expect(humanBreaks('Browser automation is unavailable')).toBe('Browser automation is unavailable');
+  });
+
+  test('an empty readiness report prints English headings and no action items', () => {
+    const formatted = renderDoctorReport({ ok: true, credentials: [], externalCommands: [], readiness: { items: [] } });
+    expect(formatted).toStartWith('Readiness:\nNothing to do.\nCredentials:');
+    expect(formatted).toContain('Available:\n  None.\nUnavailable:\n  None.');
+  });
+
   test('default shows readiness and action items before a one-line credentials summary; --credentials reveals details without changing JSON', async () => {
     const report = runDoctor(options({
       env: { ENV_ONLY: 'secret' },
       readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/resources.yaml' ? resources : '',
-      readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false },
+      readiness: { provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' } },
     }));
     const plain = renderDoctorReport(report);
     const detailed = renderDoctorReport(report, { credentials: true });
-    expect(plain.startsWith('준비 상태:')).toBe(true);
-    expect(plain).toContain('할 일 1개: provider-decision');
-    expect(plain.indexOf('할 일 1개:')).toBeLessThan(plain.indexOf('자격증명: 1/6 resolved'));
+    expect(plain.startsWith('Readiness:')).toBe(true);
+    expect(plain).toContain('To do (1): provider-decision — each line above ends with its fix');
+    expect(plain.indexOf('To do (1):')).toBeLessThan(plain.indexOf('Credentials: 1/6 resolved'));
     expect(plain).not.toContain('ENV_ONLY: resolved');
     expect(plain).not.toContain('Free fallback:');
     expect(detailed).toContain('ENV_ONLY: resolved (env)');
     expect(detailed).toContain('Free fallback: use the free search route');
     const outputs: string[] = [];
     const program = new Command();
-    registerDoctorCommand(program, { ...options({ readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false }, env: { ENV_ONLY: 'secret' } }),
+    registerDoctorCommand(program, { ...options({ readiness: { provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' } }, env: { ENV_ONLY: 'secret' } }),
       out: { log: (value) => outputs.push(value) }, setExitCode: () => {} });
     await program.parseAsync(['doctor'], { from: 'user' });
     await program.parseAsync(['doctor', '--credentials'], { from: 'user' });
@@ -123,7 +144,7 @@ describe('doctor CLI', () => {
       const codes: number[] = [];
       const program = new Command();
       registerDoctorCommand(program, {
-        ...options({ readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false },
+        ...options({ readiness: { provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' } },
           readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
           commandExists: () => false }),
         resolveAdviceProvider: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
@@ -145,7 +166,7 @@ describe('doctor CLI', () => {
     const lines: string[] = [];
     const program = new Command();
     registerDoctorCommand(program, {
-      ...options({ readiness: { provider: 'auto', codexLogin: false, llmCredentialAvailable: false },
+      ...options({ readiness: { provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' } },
         checkReadiness: (deps) => {
           const readiness = checkReadiness(deps);
           readiness.items.find((item) => item.id === 'provider-decision')!.remedy = 'elanous login openai-codex --device';
@@ -431,7 +452,7 @@ describe('doctor CLI', () => {
     let staticRuns = 0;
     const program = new Command();
     registerDoctorCommand(program, {
-      ...options({ readiness: { provider: 'auto', llmCredentialAvailable: false, platform: 'linux', distro: 'amzn2', rgOnPath: false } }),
+      ...options({ readiness: { provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' }, platform: 'linux', distro: 'amzn2', rgOnPath: false } }),
       resolveAdviceProvider: () => ({ provider: 'auto', model: '(none)', auth: 'none' }),
       installStaticTool: () => { staticRuns++; return { ok: true, detail: 'unexpected' }; },
       out: { log: (line) => lines.push(line) }, setExitCode: () => {},
@@ -446,7 +467,7 @@ describe('doctor CLI', () => {
     let gitRuns = 0;
     const program = new Command();
     registerDoctorCommand(program, {
-      ...options({ readiness: { provider: 'auto', llmCredentialAvailable: false },
+      ...options({ readiness: { provider: 'auto', usableLlm: { usable: false, via: 'none', why: 'no usable LLM route selected' } },
         readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
         commandExists: () => false }),
       platform: 'linux',
@@ -482,7 +503,7 @@ describe('doctor CLI', () => {
         await program.parseAsync(['doctor', ...(json ? ['--json'] : [])], { from: 'user' });
         if (json) expect(JSON.parse(output[0]!).requiredMissing).toEqual(installed ? [] : ['git']);
         else if (!installed) {
-          expect(output[0]).toContain('⛔ 필수 명령 없음: git');
+          expect(output[0]).toContain('⛔ Required commands missing: git');
           expect(output[0]).toContain('git: missing (required)\n  Fix: sudo apt-get update && sudo apt-get install -y git');
         }
         expect(codes).toEqual(installed ? [] : [1]);
@@ -527,12 +548,12 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       { name: 'required-tool', tier: 'required', status: 'broken' },
       { name: 'optional-tool', tier: 'capability', status: 'missing' },
     ] });
-    expect(broken).toContain('⛔ 필수 명령 없음: required-tool');
+    expect(broken).toContain('⛔ Required commands missing: required-tool');
     const both = formatDoctorReport({ ok: true, credentials: [], externalCommands: [
       { name: 'git', tier: 'required', status: 'missing' },
       { name: 'bun', tier: 'required', status: 'broken' },
     ] });
-    expect(both).toContain('⛔ 필수 명령 없음: git, bun');
+    expect(both).toContain('⛔ Required commands missing: git, bun');
     const brokenOutput: string[] = [];
     const brokenCodes: number[] = [];
     const brokenProgram = new Command();
@@ -549,7 +570,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       out: { log: (line) => brokenOutput.push(line) }, setExitCode: (code) => brokenCodes.push(code),
     });
     await brokenProgram.parseAsync(['doctor'], { from: 'user' });
-    expect(brokenOutput[0]).toContain('⛔ 필수 명령 없음: node-pty');
+    expect(brokenOutput[0]).toContain('⛔ Required commands missing: node-pty');
     expect(brokenOutput[0]).toContain('node-pty: broken (required)');
     expect(brokenCodes).toEqual([1]);
     const output: string[] = [];
@@ -611,10 +632,10 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     expect(summary.unavailable).toEqual([{ credential: 'UNAVAILABLE_KEY', name: 'web-search', freeFallback: 'use local search' }]);
     expect(summary.unknownCredentials).toEqual(['UNKNOWN_KEY', 'EMPTY_UNKNOWN_KEY', 'RESOLVED_UNMAPPED_KEY', 'RESOLVED_EMPTY_MAPPING_KEY']);
     expect(categorizedCredentials).toEqual(summaryTarget);
-    expect(formatted).toContain('할 수 있는 일:\n  tts — unlocked by AVAILABLE_KEY');
-    expect(formatted).toContain('못 하는 일:\n  web-search — unlock with UNAVAILABLE_KEY; free alternative: use local search');
+    expect(formatted).toContain('Available:\n  tts — unlocked by AVAILABLE_KEY');
+    expect(formatted).toContain('Unavailable:\n  web-search — unlock with UNAVAILABLE_KEY; free alternative: use local search');
     expect(formatted).toContain('Unknown by credential:\n  UNKNOWN_KEY');
-    expect(formatted.indexOf('External commands:')).toBeLessThan(formatted.indexOf('할 수 있는 일:'));
+    expect(formatted.indexOf('External commands:')).toBeLessThan(formatted.indexOf('Available:'));
     expect(formatted).toContain('RESOLVED_UNMAPPED_KEY: resolved (env) — resolved from environment');
     expect(formatted).toContain('RESOLVED_EMPTY_MAPPING_KEY: resolved (env) — resolved from environment');
   });
@@ -635,9 +656,9 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
 
     expect(formatted).toContain('AVAILABLE_KEY: resolved (env) — resolved from environment');
     expect(formatted).toContain('existing-command: missing (required)');
-    expect(formatted.indexOf('할 수 있는 일:')).toBeGreaterThan(existingOutputEnd);
-    expect(formatted.indexOf('할 수 있는 일:')).toBeLessThan(formatted.indexOf('못 하는 일:'));
-    expect(formatted.indexOf('못 하는 일:')).toBeLessThan(formatted.indexOf('Unknown by credential:'));
+    expect(formatted.indexOf('Available:')).toBeGreaterThan(existingOutputEnd);
+    expect(formatted.indexOf('Available:')).toBeLessThan(formatted.indexOf('Unavailable:'));
+    expect(formatted.indexOf('Unavailable:')).toBeLessThan(formatted.indexOf('Unknown by credential:'));
     expect(formatted).toContain('  tts — unlocked by AVAILABLE_KEY');
     expect(formatted).toContain('  web-search — unlock with UNAVAILABLE_KEY; free alternative: use local search');
     expect(formatted).toContain('  UNKNOWN_KEY');
@@ -699,7 +720,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       { credential: 'ELEVENLABS_API_KEY', name: 'streaming-stt' },
     ]);
     expect(summary.unknownCredentials).toEqual(['ENV_ONLY', 'CACHE_ONLY', 'TAVILY_API_KEY', 'FIRECRAWL_API_KEY', 'MISSING_KEY']);
-    expect(formatted).toContain('못 하는 일:\n  tts — unlock with ELEVENLABS_API_KEY');
+    expect(formatted).toContain('Unavailable:\n  tts — unlock with ELEVENLABS_API_KEY');
     expect(formatted).toContain('Unknown by credential:\n  ENV_ONLY');
 
     const output: string[] = [];
@@ -712,7 +733,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       setExitCode: (code) => exitCodes.push(code),
     });
     await program.parseAsync(['node', 'elanous', 'doctor']);
-    expect(output[0]).toContain('못 하는 일:');
+    expect(output[0]).toContain('Unavailable:');
     expect(exitCodes).toEqual([]);
   });
 
@@ -956,9 +977,38 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       { name: 'mac-command', tier: 'platform', status: 'skipped', platform: 'darwin' },
     ]);
     expect(formatted).toContain('External commands:\nfound-command: found (required)');
-    expect(formatted).toContain('missing-command: missing (capability)\n  Breaks: unmeasured');
+    expect(formatted).toContain('missing-command: missing (capability)');
+    expect(formatted).not.toContain('  Breaks:');
     expect(formatted).not.toContain('nothing breaks');
     expect(formatted).toContain('mac-command: skipped (darwin-only)');
+  });
+
+  test('missing commands omit development Breaks notes in human output but retain them in --json', async () => {
+    const catalog = `commands:
+  - name: unmeasured-tool
+    tier: capability
+    breaks: unmeasured
+  - name: test-errors-tool
+    tier: capability
+    breaks: 4 test errors on a fresh Linux machine
+`;
+    const output: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({
+        readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? catalog : '',
+        commandExists: () => false,
+      }),
+      out: { log: (line) => output.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor'], { from: 'user' });
+    await program.parseAsync(['doctor', '--json'], { from: 'user' });
+    expect(output[0]).toContain('unmeasured-tool: missing (capability)');
+    expect(output[0]).toContain('test-errors-tool: missing (capability)');
+    expect(output[0]).not.toContain('Breaks:');
+    expect(output[0]).not.toContain('unmeasured-tool: missing (capability)\n  Breaks:');
+    expect(JSON.parse(output[1]!).externalCommands.map((command: { breaks: string }) => command.breaks))
+      .toEqual(['unmeasured', '4 test errors on a fresh Linux machine']);
   });
 
   test('native-module probe reports found for a loadable module and missing for an unresolvable one without throwing', () => {
@@ -1039,7 +1089,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     });
   });
 
-  test('names a missing node-pty with its Breaks text without changing doctor exit code', async () => {
+  test('hides a missing node-pty development Breaks note without changing its fix or doctor exit code', async () => {
     const root = process.cwd();
     const catalog = readFileSync(`${root}/catalog/external-commands.yaml`, 'utf8');
     const parsed = parseYaml(catalog) as {
@@ -1064,7 +1114,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
 
     expect(nodePtyLine).toMatchObject({ name: 'node-pty', status: 'missing', breaks: nodePty?.breaks, fix: nodePty?.fix });
     expect(formatted).toContain('node-pty: missing (capability)');
-    expect(formatted).toContain(`  Breaks: ${nodePty?.breaks}`);
+    expect(formatted).not.toContain(`  Breaks: ${nodePty?.breaks}`);
     expect(formatted).toContain(`  Fix: ${nodePty?.fix}`);
     expect(report.ok).toBe(true);
 
@@ -1085,7 +1135,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     });
     await program.parseAsync(['node', 'elanous', 'doctor']);
     expect(output[0]).toContain('node-pty: missing (capability)');
-    expect(output[0]).toContain(`  Breaks: ${nodePty?.breaks}`);
+    expect(output[0]).not.toContain(`  Breaks: ${nodePty?.breaks}`);
     expect(output[0]).toContain(`  Fix: ${nodePty?.fix}`);
     expect(exitCodes).toEqual([]);
   });
@@ -1121,7 +1171,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       { name: 'found-with-fix', tier: 'required', status: 'found', breaks: 'boot breaks', fix: 'should not print' },
     ]);
     expect(formatted).toContain('missing-with-fix: missing (capability)\n  Breaks: unnamed pty absence\n  Fix: On Linux, node-pty builds when node-gyp is present');
-    expect(missingWithoutFix).toBe('missing-without-fix: missing (capability)\n  Breaks: unmeasured\n');
+    expect(missingWithoutFix).toBe('missing-without-fix: missing (capability)\n');
     expect(missingWithoutFix).not.toContain('Fix:');
     expect(foundWithFix).toContain('found-with-fix: found (required)');
     expect(foundWithFix).not.toContain('Fix:');
@@ -1591,7 +1641,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     expect(nodePty).toContain('  Fix: chmod +x grants execute permission on spawn-helper');
     expect(nodePty).not.toContain('node-gyp');
     expect(nodePty).not.toContain('missing module copy');
-    expect(formatted).toContain('missing-command: missing (capability)\n  Breaks: unmeasured\n  Fix: install the missing command');
+    expect(formatted).toContain('missing-command: missing (capability)\n  Fix: install the missing command');
     expect(formatted).not.toContain('Broken:');
   });
 
@@ -1778,7 +1828,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       ...options({
         readiness: {
           provider: 'openai-codex',
-          codexLogin: true,
+          usableLlm: { usable: true, provider: 'openai-codex', via: 'login', why: 'login' },
           ghOnPath: true,
           ghAuthStatus: 0,
           rgOnPath: true,
@@ -1801,7 +1851,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     const report = runDoctor(options({
       readiness: {
         provider: 'openai-codex',
-        codexLogin: true,
+        usableLlm: { usable: true, provider: 'openai-codex', via: 'login', why: 'login' },
         ghOnPath: true,
         ghAuthStatus: 0,
         rgOnPath: true,
@@ -1826,14 +1876,14 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     }));
     const formatted = lines.join('\n');
     expect(report.readiness?.items.every((entry) => entry.status === 'ok')).toBe(true);
-    expect(formatted).toContain('준비 상태:');
+    expect(formatted).toContain('Readiness:');
     expect(formatted).toContain('  provider-decision: ok');
     expect(formatted).toContain('  gh-auth: ok');
     expect(formatted).toContain('  install-path: ok');
     expect(formatted).toContain('  service-version: ok');
-    expect(formatted.startsWith('준비 상태:')).toBe(true);
-    expect(formatted.indexOf('할 일 없음.')).toBeLessThan(formatted.indexOf('자격증명:'));
-    expect(formatted.indexOf('자격증명:')).toBeLessThan(formatted.indexOf('External commands:'));
+    expect(formatted.startsWith('Readiness:')).toBe(true);
+    expect(formatted.indexOf('Nothing to do.')).toBeLessThan(formatted.indexOf('Credentials:'));
+    expect(formatted.indexOf('Credentials:')).toBeLessThan(formatted.indexOf('External commands:'));
     expect(exitCodes).toEqual([]);
     expect(formatted).not.toContain('--fix');
   });
@@ -1845,7 +1895,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     program.exitOverride();
     const readiness = {
       provider: 'auto' as const,
-      codexLogin: true,
+      usableLlm: { usable: true, provider: 'openai-codex', via: 'login' as const, why: 'login' },
       ghOnPath: true,
       ghAuthStatus: 1,
       installPrefix: '/opt/elanous',
@@ -1864,13 +1914,55 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     program.parse(['doctor'], { from: 'user' });
 
     const formatted = lines.join('\n');
-    expect(formatted).toContain('준비 상태:');
+    expect(formatted).toContain('Readiness:');
     expect(formatted).toContain('provider-decision: ok');
     expect(formatted).toContain('gh-auth: manual');
     expect(formatted).toContain('gh auth login');
     expect(formatted).toContain('install-path: fixable');
     expect(formatted).toContain('service-version: unknown');
     expect(exitCodes).toEqual([]);
+  });
+
+  test('injected userConfig supplies both the provider label and the resolved route, including CLI fix planning', async () => {
+    const config = { ...userConfig(), llm: { provider: 'local', baseUrl: 'http://localhost:1234' } } as UserConfig;
+    const lines: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({
+        readiness: undefined,
+        userConfig: config,
+        getUserConfig: () => { throw new Error('must not consult another config'); },
+        checkPythonEnv: () => null,
+        probeBuildToolchain: () => ({ make: null, cxx20: null }),
+        probeHostEnvironment: () => null,
+      }),
+      out: { log: (line) => lines.push(line) },
+      setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--json'], { from: 'user' });
+    const report = JSON.parse(lines.at(-1)!);
+    expect(report.ok).toBe(true);
+    expect(report.readiness.items.find((item: { id: string }) => item.id === 'provider-decision'))
+      .toMatchObject({ status: 'ok', evidence: 'llm.provider=local → local-server local' });
+    await program.parseAsync(['doctor', '--fix', '--json'], { from: 'user' });
+    const planned = JSON.parse(lines.at(-1)!);
+    expect(planned.report.readiness.items.find((item: { id: string }) => item.id === 'provider-decision'))
+      .toMatchObject({ status: 'ok', evidence: 'llm.provider=local → local-server local' });
+  });
+
+  test('runDoctor --json readiness resolves an auto route independently of credential names', () => {
+    const route = { usable: true, provider: 'local', via: 'local-server' as const, why: 'LLM via local-server (local)' };
+    const report = runDoctor(options({
+      readiness: undefined,
+      userConfig: { ...userConfig(), llm: { provider: 'auto' } } as UserConfig,
+      resolveLlm: () => route,
+      checkPythonEnv: () => null,
+      probeBuildToolchain: () => ({ make: null, cxx20: null }),
+      probeHostEnvironment: () => null,
+    }));
+    const selected = report.readiness?.items.find((item) => item.id === 'provider-decision');
+    expect(selected).toMatchObject({ status: 'ok', evidence: 'llm.provider=auto → local-server local' });
+    expect(JSON.stringify(report)).not.toContain('sk-secret');
   });
 
   test('runDoctor resolves readiness from injected read-only lookups when readiness is omitted', () => {
@@ -1885,9 +1977,9 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
         calls.push(`exists:${name}`);
         return name === 'gh';
       },
-      listAuthProviders: () => {
-        calls.push('auth');
-        return [`openai-codex:${secret}`, github];
+      resolveLlm: () => {
+        calls.push('route');
+        return { usable: true, provider: 'openai-codex', via: 'login', why: 'login' };
       },
       codeRevision: () => 'abc123def4567890abc123def4567890abc123de',
       fetchHealth: () => ({ daemonSha: 'fffffffffff' }),
@@ -1902,7 +1994,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     const formatted = formatDoctorReport(report);
     const by = (id: string) => report.readiness?.items.find((entry) => entry.id === id);
 
-    expect(calls).toContain('auth');
+    expect(calls).toContain('route');
     expect(calls).toContain('gh-auth');
     expect(by('provider-decision')).toMatchObject({ status: 'ok' });
     expect(by('gh-auth')).toMatchObject({ status: 'manual', remedy: 'gh auth login' });
@@ -1913,7 +2005,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     expect(by('service-version')?.status).toBe('manual');
     expect(by('service-version')?.evidence).toContain('fffffffffff');
     expect(by('service-version')?.evidence).toContain('abc123def4567890abc123def4567890abc123de');
-    expect(formatted).toContain('준비 상태:');
+    expect(formatted).toContain('Readiness:');
     expect(JSON.stringify(report)).not.toContain(secret);
     expect(JSON.stringify(report)).not.toContain(github);
     expect(JSON.stringify(report)).not.toContain('ghp_');
@@ -1963,6 +2055,10 @@ esac
     try {
       await program.parseAsync(['doctor', '--fix', '--yes', '--sudo'], { from: 'user' });
       const command = 'sudo apt-get update && sudo apt-get install -y ripgrep';
+      expect(lines.join('\n')).toContain('Fix plan:');
+      expect(lines.join('\n')).toContain('Applied:');
+      expect(lines.join('\n')).toContain(`Sudo installation: ran — ${command}`);
+      expect(lines.join('\n')).not.toContain('sudo 설치:');
       expect(lines.join('\n')).toContain(`harness-tools: manual — ${command}`);
       expect(lines.join('\n')).toContain('https://nodejs.org/en/download');
       expect(sudoPlans).toEqual([[command]]);
@@ -1973,6 +2069,40 @@ esac
     } finally {
       rmSync(sandbox, { recursive: true, force: true });
     }
+  });
+
+  test('doctor --fix uses an English git installation heading without changing its detail', async () => {
+    const lines: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({
+        platform: 'linux', readiness: { distro: 'debian' },
+        readFile: (path) => path === '/repo/.env.example' ? example : path === '/repo/catalog/external-commands.yaml' ? 'commands:\n  - name: git\n    tier: required\n' : '',
+        commandExists: (name) => name === 'apt-get',
+      }),
+      isRoot: true, gitInteractive: false,
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--fix'], { from: 'user' });
+    expect(lines.join('\n')).toContain('Fix plan:');
+    expect(lines.join('\n')).toContain('Git installation: 설치하지 않음 — --fix --yes 또는 대화형 동의가 필요합니다.');
+    expect(lines.join('\n')).not.toContain('git 설치:');
+  });
+
+  test('doctor --fix --yes --restart uses an English service restart heading without changing the result reason', async () => {
+    const lines: string[] = [];
+    const program = new Command();
+    registerDoctorCommand(program, {
+      ...options({ readiness: { provider: 'grok', platform: 'linux', installPrefix: null, serviceFile: null } }),
+      home: '/tmp/doctor-restart-heading-fixture', cacheDir: '/tmp/doctor-restart-heading-fixture/cache',
+      applyServiceRestart: async () => ({ result: 'skipped', reason: 'the service already runs this code' }),
+      out: { log: (line) => lines.push(line) }, setExitCode: () => {},
+    });
+    await program.parseAsync(['doctor', '--fix', '--yes', '--restart'], { from: 'user' });
+    expect(lines.join('\n')).toContain('Fix plan:');
+    expect(lines.join('\n')).toContain('Applied:');
+    expect(lines.join('\n')).toContain('Service restart: skipped — the service already runs this code');
+    expect(lines.join('\n')).not.toContain('서비스 재시작:');
   });
 
   test('unknown distro shows missing harness names in the fix plan without inventing sudo commands', async () => {
@@ -2143,7 +2273,7 @@ describe('doctor — retired config keys', () => {
     }));
     expect(report.ok).toBe(true);
     expect(report.retiredConfigKeys?.map(({ path }) => path)).toEqual(['tools.selfImplement.decompositionShadow']);
-    expect(formatDoctorReport(report)).toContain('더는 안 쓰는 설정 키: tools.selfImplement.decompositionShadow');
+    expect(formatDoctorReport(report)).toContain('Retired config key: tools.selfImplement.decompositionShadow');
   });
 
   test('says nothing when the config has no retired key or cannot be read', () => {
@@ -2152,7 +2282,7 @@ describe('doctor — retired config keys', () => {
       readFile: (path) => path === '/cfg/config.json' ? '{"tools":{}}' : path === '/repo/.env.example' ? example : path === '/repo/catalog/resources.yaml' ? resources : '',
     }));
     expect(report.retiredConfigKeys).toEqual([]);
-    expect(formatDoctorReport(report)).not.toContain('더는 안 쓰는 설정 키');
+    expect(formatDoctorReport(report)).not.toContain('Retired config key');
   });
 });
 

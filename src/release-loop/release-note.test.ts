@@ -22,6 +22,25 @@ test('valid four-field PR section parses and render/parse round trips', () => {
   });
 });
 
+test('multiple PR release-note sections use the last and report the count', () => {
+  const automatic = '## 릴리스 노트\n- 한 줄: 하니스 자동 생성\n- 종류: internal\n- 문서: 없음(하니스 자동 생성)\n- 대상: next\n';
+  const amended = '## 릴리스 노트\n- 한 줄: Adds plugin credentials.\n- 종류: feat\n- 문서: docs/plugins.md\n- 대상: next\n';
+  expect(parseReleaseNoteSection(`${automatic}\n## 검증\n내용\n${amended}`)).toEqual({
+    fragment: { line: 'Adds plugin credentials.', kind: 'feat', docs: { path: 'docs/plugins.md' }, target: 'next' },
+    problems: ['multiple release-note sections (2); using the last'],
+  });
+  expect(parseReleaseNoteSection(`${automatic}${amended}${automatic}`)).toEqual({
+    fragment: { line: '하니스 자동 생성', kind: 'internal', docs: { none: '하니스 자동 생성' }, target: 'next' },
+    problems: ['multiple release-note sections (3); using the last'],
+  });
+  expect(parseReleaseNoteSection(`${automatic}\n\`\`\`md\n${amended}\`\`\`\n`)).toEqual({
+    fragment: { line: '하니스 자동 생성', kind: 'internal', docs: { none: '하니스 자동 생성' }, target: 'next' }, problems: [],
+  });
+  expect(parseReleaseNoteSection(`${automatic}${amended.replace('- 종류: feat', '- 종류: bugfix')}`)).toEqual({
+    problems: ['종류', 'multiple release-note sections (2); using the last'],
+  });
+});
+
 test('harness release note uses the valid goal section rather than the PR title', () => {
   const note = harnessReleaseNote(`## 목표\n일을 완성한다\n${renderReleaseNoteSection(fragment)}\n## 검증\n`, 'fallback title');
   expect(note).toEqual({ line: fragment.line, kind: fragment.kind, docs: fragment.docs, target: fragment.target });

@@ -211,11 +211,12 @@ describe('resolver — reserved-key rebind rejection', () => {
 
 describe('context stack', () => {
   test('push + pop round-trips', () => {
-    // Implicit default stack is ['global'] after reset.
-    pushContext('sync-mode');
-    popContext('sync-mode');
-    // No assertion needed — absence of throw means state restored.
-    expect(true).toBe(true);
+    registerAction({ id: 'test.sync', handler: () => {} });
+    addDefaultBinding({ matcher: 'ctrl+p', actionId: 'test.sync', context: 'input' });
+    pushContext('input');
+    expect(resolveInputEvent(keyEvent(k('p', { ctrl: true })))?.actionId).toBe('test.sync');
+    popContext('input');
+    expect(resolveInputEvent(keyEvent(k('p', { ctrl: true })))).toBeNull();
   });
 
   test('replaceContext swaps one tag for another', () => {

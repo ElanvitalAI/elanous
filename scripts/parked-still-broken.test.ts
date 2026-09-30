@@ -10,7 +10,7 @@ function withFixture(run: (fixture: string, goals: string) => void): void {
   const goals = join(fixture, 'goals');
   try {
     mkdirSync(goals, { recursive: true });
-    writeFileSync(join(fixture, 'pass.test.ts'), "import { expect, test } from 'bun:test'; test('passes', () => expect(true).toBe(true));\n");
+    writeFileSync(join(fixture, 'pass.test.ts'), "import { expect, test } from 'bun:test'; test('passes', () => expect(Bun.file('pass.test.ts').size).toBeGreaterThan(0));\n");
     writeFileSync(join(fixture, 'fail.test.ts'), "import { expect, test } from 'bun:test'; test('fails', () => expect(true).toBe(false));\n");
     writeFileSync(join(fixture, 'source.ts'), '');
     writeFileSync(join(goals, 'pass.md'), '대상 경로: pass.test.ts\n- GoalId: pass\n');

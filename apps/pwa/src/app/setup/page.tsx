@@ -9,6 +9,7 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { ChildLlmPreferenceCard } from '@/components/settings/ChildLlmPreferenceCard';
+import { PwaRolePicker } from '@/components/shell/PwaRolePicker';
 import { AnswerDepthCard } from '@/components/settings/AnswerDepthCard';
 import { ApiKeyField, validateApiKey } from '@/components/ui/api-key-field';
 import { Button } from '@/components/ui/button';
@@ -115,40 +116,47 @@ export default function SetupPage() {
     }
   }, [client, selectedOption, apiKey, router]);
 
-  // SSG safety: NexusProvider 미mount 시 silent hide (mirror QuickSetupCard).
-  if (!mounted || !client) return null;
+  // SSG safety: browser-only provider data is not rendered before mount.
+  if (!mounted || !client) return <PwaRolePicker />;
 
   if (load.status === 'loading' || load.status === 'idle') {
     return (
-      <section role="status" aria-live="polite" className="flex flex-col gap-4">
-        <p className="text-sm text-muted-foreground">공급자 확인 중 · {loadingSeconds}초</p>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-hidden="true">
-          {[0, 1, 2].map((index) => (
-            <div key={index} className="h-24 animate-pulse rounded border border-border bg-card p-3">
-              <div className="mb-3 h-4 w-1/2 rounded bg-muted" />
-              <div className="h-3 w-3/4 rounded bg-muted" />
-            </div>
-          ))}
-        </div>
-      </section>
+      <div className="flex flex-col gap-6">
+        <PwaRolePicker />
+        <section role="status" aria-live="polite" className="flex flex-col gap-4">
+          <p className="text-sm text-muted-foreground">공급자 확인 중 · {loadingSeconds}초</p>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2" aria-hidden="true">
+            {[0, 1, 2].map((index) => (
+              <div key={index} className="h-24 animate-pulse rounded border border-border bg-card p-3">
+                <div className="mb-3 h-4 w-1/2 rounded bg-muted" />
+                <div className="h-3 w-3/4 rounded bg-muted" />
+              </div>
+            ))}
+          </div>
+        </section>
+      </div>
     );
   }
 
   if (load.status === 'error') {
     return (
-      <div className="flex flex-col gap-3 rounded border border-destructive/40 bg-destructive/5 p-4">
-        <p className="text-sm text-destructive">
-          Provider 카탈로그 로드 실패: {load.message}
-        </p>
-        <Button variant="outline" size="sm" onClick={refresh}>
-          다시 시도
-        </Button>
+      <div className="flex flex-col gap-6">
+        <PwaRolePicker />
+        <div className="flex flex-col gap-3 rounded border border-destructive/40 bg-destructive/5 p-4">
+          <p className="text-sm text-destructive">
+            Provider 카탈로그 로드 실패: {load.message}
+          </p>
+          <Button variant="outline" size="sm" onClick={refresh}>
+            다시 시도
+          </Button>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="flex flex-col gap-6">
+      <PwaRolePicker />
       {subscriptionProvider ? (
         <div className="flex flex-wrap items-center justify-between gap-3 rounded border border-primary/30 bg-primary/5 p-4">
           <p className="text-sm font-medium">구독이 있으면 추가 비용 없이</p>

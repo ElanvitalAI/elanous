@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asideBackend, claudeTrustChoice, submitSeparately, geminiBackend, buildMissionWorktreeProvenance, buildScreenLogPayload, checkEvidence, claudeBackend, codexBackend, collectTscDiagnostics, createMissionControlBrain, createMissionSearch, createMissionVerifyDone, grokBackend, recordMissionWorktreeProvenance, runAgentMission, runTsc, SCREEN_LOG_TAIL_MAX_LINE_LENGTH, SCREEN_LOG_TAIL_MAX_LINES, type EvidenceMode } from './driver.js';
@@ -15,6 +15,10 @@ import type { LLMMessage } from '../llm.js';
 import type { TypecheckError } from '../typecheck-ratchet.js';
 import { decideInterventionStep } from '../self-implement/intervention-step.js';
 import type { PtyControlDeps, RunSupervisor } from '../autopilot/pty-control-loop.js';
+import type { AgentMissionSpec, AgentMissionDeps } from './driver.js';
+import { planMissionResources, type ResourcePlan } from './resource-ladder.js';
+import { generateIndexKeyPair, signIndex, type MarketplaceIndex } from '../market/signed-index.js';
+import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 
 const observation = {
   screen: 'agent screen',
@@ -39,6 +43,206 @@ function scriptedStream(raw: string): StreamLLMFn {
   return async () => raw;
 }
 
+describe('pre-mission resource ladder on PTY dispatch', () => {
+  const plan: ResourcePlan = {
+    needs: ['basics', 'unavailable'], have: ['ready-tool'],
+    plugin: { plugin: 'elanous-basics', marketplace: 'elanous', source: 'official-index' },
+    backend: { name: 'claude', why: 'ready' },
+    gaps: [{ need: 'unavailable', candidates: [] }], decisions: [],
+  };
+  const launch = async (over: Partial<AgentMissionSpec> = {}, extra: Partial<AgentMissionDeps> = {}) => {
+    const dir = mkdtempSync(join(tmpdir(), 'mission-resources-'));
+    const events: string[] = [];
+    const writes: string[] = [];
+    const calls: Array<{ mission: string; options: unknown }> = [];
+    const installs: string[] = [];
+    try {
+      const result = await runAgentMission({ mission: 'List skills', repo: dir, branch: 'fixture', agent: codexBackend,
+        evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, enhance: false, commit: false,
+        // The ladder runs only on an explicit `on` (what the CLI passes by default).
+        screensDir: join(dir, 'screens'), resources: 'on', ...over,
+      }, {
+        createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
+        recordWorktreeProvenance: () => {},
+        startPty: ((opts) => ({ id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
+          isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => 'ready',
+          renderScreenPng: async () => null, write: (s: string) => { writes.push(s); events.push(`write:${s}`); }, kill: () => {},
+        } as unknown as PtyHandle)),
+        planMissionResources: async (mission, _deps, options) => { calls.push({ mission, options }); events.push('plan'); return plan; },
+        installPlugin: async (request) => { installs.push(`${request.plugin}@${request.marketplace}`); events.push('install'); return { outcome: 'installed' }; },
+        runControlLoop: async () => ({ termination: { kind: 'success' }, steps: 1 }) as never,
+        checkEvidence: () => ({ ok: true, path: dir }),
+        ...extra,
+      });
+      return { result, events, writes, calls, installs, prompt: existsSync(join(dir, '.mission-prompt.md')) ? readFileSync(join(dir, '.mission-prompt.md'), 'utf8') : null };
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  };
+
+  test('official suggestion installs before mission and appends only resource names; backend stays selected', async () => {
+    const { result, events, calls, installs, prompt } = await launch({ backendExplicit: 'codex' });
+    expect(result.detail).toBe('완료(증거 충족)');
+    expect(calls).toEqual([{ mission: 'List skills', options: { backend: 'codex', plugin: undefined, resources: 'on', deadlineMs: 20_000 } }]);
+    expect(installs).toEqual(['elanous-basics@elanous']);
+    expect(events.slice(0, 2)).toEqual(['plan', 'install']);
+    expect(events[2]).toContain('.mission-prompt.md');
+    expect(prompt).toContain('List skills\n\n설치된 elanous-basics');
+    expect(prompt).toContain('[elanous 자원]\n보유: ready-tool\n설치: elanous-basics@elanous\n미충족: unavailable');
+    expect(prompt).not.toContain('claude');
+  });
+
+  test('signed name mention reaches the driver installer before mission dispatch without an explicit plugin', async () => {
+    const key = generateIndexKeyPair();
+    const official: MarketplaceIndex = { name: 'elanous', interface: { displayName: 'Official' }, sequence: 1, plugins: [{
+      name: 'elanous-basics', version: '1.0.0', description: 'basic skills', source: { source: 'url' },
+      artifact: { sha256: '0'.repeat(64), bytes: 0, key: 'basics.tgz' },
+      'ai.elanous': { capabilities: ['omni-crawl'], connectors: [], pricing: { model: 'free' } },
+    }] };
+    const bytes = Buffer.from(JSON.stringify(official));
+    const keys = OFFICIAL_INDEX_KEYS as { keyId: string; publicKey: string }[];
+    const observed: Array<{ step: string; data: Record<string, unknown> }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, step: string, data: Record<string, unknown>) => {
+      if (category === 'agent-mission.resources') observed.push({ step, data });
+    }) as typeof debug.log;
+    keys.push({ keyId: key.keyId, publicKey: key.publicKey });
+    try {
+      const result = await launch({ mission: 'List the skills the elanous-basics plugin provides', backendExplicit: 'codex' }, {
+        planMissionResources,
+        resourceLadder: {
+          readOfficialIndex: async () => ({ marketplaceBytes: bytes, signatureText: signIndex(bytes, key.privateKeyPem, key.keyId) }),
+          inferNeeds: async () => '{"needs":["unlisted skill"]}',
+          readers: { codex: () => [], claude: () => [], grok: () => [] },
+          readInstalledPlugins: () => [], discover: async () => [], decide: () => {},
+        },
+      });
+      expect(result.result.detail).toBe('완료(증거 충족)');
+      expect(result.calls).toEqual([]);
+      expect(result.installs).toEqual(['elanous-basics@elanous']);
+      expect(result.events[0]).toBe('install');
+      expect(result.prompt).toContain('설치된 elanous-basics');
+      expect(observed.some(event => event.step === 'official-index' && event.data.kind === 'ROUTE' && event.data.what === '공식 플러그인 선택')).toBe(true);
+      expect(observed.some(event => event.step === 'planned' && event.data.suggestedPlugin === 'elanous-basics')).toBe(true);
+      expect(observed.some(event => event.step === 'plan-failed')).toBe(false);
+    } finally { keys.pop(); debug.log = originalLog; }
+  });
+
+  test('an unset resources mode (library callers) skips the ladder like off', async () => {
+    const { calls } = await launch({ resources: undefined });
+    expect(calls).toHaveLength(0);
+  });
+
+  test('resources off skips planning and leaves the typed mission unchanged', async () => {
+    const { result, calls, installs, writes } = await launch({ resources: 'off' });
+    expect(result.ok).toBe(true);
+    expect(calls).toHaveLength(0);
+    expect(installs).toHaveLength(0);
+    expect(writes).toEqual(['List skills', '\r']);
+  });
+
+  test('explicit plugin wins over suggestion and retains the original installation behavior', async () => {
+    const { calls, installs, prompt } = await launch({ plugin: { plugin: 'manual', marketplace: 'other' } });
+    expect(calls[0]?.options).toEqual({ backend: undefined, plugin: 'manual@other', resources: 'on', deadlineMs: 20_000 });
+    expect(installs).toEqual(['manual@other']);
+    expect(prompt).toContain('설치: manual@other');
+    expect(prompt).not.toContain('설치된 elanous-basics');
+  });
+
+  test('a never-settling ladder times out at 20 seconds and still sends the original mission', async () => {
+    const original = debug.log;
+    const logs: unknown[][] = [];
+    debug.log = ((...args: unknown[]) => { logs.push(args); }) as typeof debug.log;
+    try {
+      const { result, writes } = await launch({}, { planMissionResources: async () => new Promise<ResourcePlan>(() => {}) });
+      expect(result.ok).toBe(true);
+      expect(writes).toEqual(['List skills', '\r']);
+      expect(logs).toContainEqual(['agent-mission.resources', 'plan-failed', { reason: 'resource ladder timeout (20s)' }, { level: 'warn' }]);
+    } finally { debug.log = original; }
+  }, 30_000);
+
+  test('suggested installer exception does not prevent mission dispatch', async () => {
+    const original = debug.log;
+    const logs: unknown[][] = [];
+    debug.log = ((...args: unknown[]) => { logs.push(args); }) as typeof debug.log;
+    try {
+      const { result, prompt } = await launch({}, { installPlugin: async () => { throw new Error('network failed'); } });
+      expect(result.ok).toBe(true);
+      expect(prompt).toContain('설치: 없음');
+      expect(logs).toContainEqual(['agent-mission.resources', 'install-failed', { plugin: 'elanous-basics', reason: 'installer-error' }, { level: 'warn' }]);
+    } finally { debug.log = original; }
+  });
+
+  test('explicit plugin installation failure still blocks dispatch', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mission-explicit-plugin-'));
+    const writes: string[] = [];
+    let killed = false;
+    try {
+      const result = await runAgentMission({ mission: 'List skills', repo: dir, branch: 'fixture', agent: codexBackend,
+        evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, resources: 'off', commit: false,
+        plugin: { plugin: 'manual', marketplace: 'other' }, screensDir: join(dir, 'screens'),
+      }, {
+        createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
+        recordWorktreeProvenance: () => {},
+        startPty: ((opts) => ({ id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
+          isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => 'ready',
+          renderScreenPng: async () => null, write: (s: string) => writes.push(s), kill: () => { killed = true; },
+        } as unknown as PtyHandle)),
+        installPlugin: async () => ({ outcome: 'escalate', reason: 'plugins-disabled' }),
+      });
+      expect(result).toMatchObject({ ok: false, detail: '플러그인 설치 ESCALATE (plugins-disabled) — 미션은 전송하지 않았다' });
+      expect(writes).toEqual([]);
+      expect(killed).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('resource names never carry secrets or terminal control bytes into the prompt', async () => {
+    const { prompt } = await launch({}, { planMissionResources: async () => ({
+      ...plan, have: ['token=sk-abcdef', 'ready\u001b[31m'], gaps: [{ need: 'password=very-secret', candidates: [] }, { need: 'https://example.invalid/key', candidates: [] }],
+    }) });
+    expect(prompt).not.toContain('sk-abcdef');
+    expect(prompt).not.toContain('very-secret');
+    expect(prompt).not.toContain('example.invalid');
+    expect(prompt).not.toContain('\u001b');
+  });
+
+  test('ladder rejection warns then sends the original mission', async () => {
+    const original = debug.log;
+    const logs: unknown[][] = [];
+    debug.log = ((...args: unknown[]) => { logs.push(args); }) as typeof debug.log;
+    try {
+      const { result, writes, installs } = await launch({}, { planMissionResources: async () => { throw new Error('offline'); } });
+      expect(result.ok).toBe(true);
+      expect(writes).toEqual(['List skills', '\r']);
+      expect(installs).toHaveLength(0);
+      expect(logs).toContainEqual(['agent-mission.resources', 'plan-failed', { reason: 'offline' }, { level: 'warn' }]);
+    } finally { debug.log = original; }
+  });
+
+  test('failed suggested installation warns and sends the mission without claiming installation', async () => {
+    const original = debug.log;
+    const logs: unknown[][] = [];
+    debug.log = ((...args: unknown[]) => { logs.push(args); }) as typeof debug.log;
+    try {
+      const { result, prompt } = await launch({}, { installPlugin: async () => ({ outcome: 'escalate', reason: 'plugins-disabled' }) });
+      expect(result.ok).toBe(true);
+      expect(prompt).toContain('설치: 없음');
+      expect(prompt).not.toContain('설치된 elanous-basics');
+      expect(logs).toContainEqual(['agent-mission.resources', 'install-failed', { plugin: 'elanous-basics', reason: 'plugins-disabled' }, { level: 'warn' }]);
+    } finally { debug.log = original; }
+  });
+
+  test('only the official marketplace is eligible even if an injected plan claims official provenance', async () => {
+    const { installs, prompt } = await launch({}, { planMissionResources: async () => ({ ...plan, plugin: { ...plan.plugin!, marketplace: 'other' } }) });
+    expect(installs).toHaveLength(0);
+    expect(prompt).toContain('설치: 없음');
+  });
+
+  test('unverified plugin suggestion is not installed', async () => {
+    const { installs, prompt } = await launch({}, { planMissionResources: async () => ({ ...plan, plugin: { ...plan.plugin!, source: 'community' as 'official-index' } }) });
+    expect(installs).toHaveLength(0);
+    expect(prompt).toContain('설치: 없음');
+  });
+});
+
 test('runAgentMission re-emits exactly once on its Codex child exit with the spawned CODEX_HOME and runId', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mission-pty-usage-'));
   const home = join(dir, 'codex-home');
@@ -50,7 +254,7 @@ test('runAgentMission re-emits exactly once on its Codex child exit with the spa
     let spawnedId = '';
     let spawnedRunId = '';
     const result = await runAgentMission({ mission: 'done', repo: dir, branch: 'fixture', agent: codexBackend,
-      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, commit: false,
+      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, resources: 'off', commit: false,
       screensDir: join(dir, 'screens'),
     }, {
       createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
@@ -96,7 +300,7 @@ test('runAgentMission hands a brain-selected review to the existing launcher in 
   let created = 0;
   try {
     const result = await runAgentMission({ mission: 'Build feature', repo: dir, branch: 'fixture', agent: codexBackend,
-      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, commit: false,
+      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, resources: 'off', commit: false,
       screensDir: join(dir, 'screens'),
     }, {
       createWorktree: (() => { created++; return { path: dir, branch: 'fixture', base: 'HEAD' }; }) as never,
@@ -131,12 +335,131 @@ test('runAgentMission hands a brain-selected review to the existing launcher in 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+describe('agent-mission handoff commit and PR', () => {
+  const run = async (origin: 'local' | 'github-pushurl-local' | 'github' | 'github-ssh' | 'github-scp', commit = true, prFails = false, stagePrompt = false) => {
+    const root = mkdtempSync(join(tmpdir(), 'mission-pr-handoff-'));
+    const repo = join(root, 'repo');
+    const bare = join(root, 'origin.git');
+    const events: string[] = [];
+    const logs: unknown[][] = [];
+    const originalLog = debug.log;
+    let prCalls = 0;
+    debug.log = ((...args: unknown[]) => { logs.push(args); }) as typeof debug.log;
+    try {
+      git(root, 'init', '-q', '--bare', bare);
+      git(root, 'init', '-q', '-b', 'main', repo);
+      git(repo, 'config', 'user.email', 'mission@example.test');
+      git(repo, 'config', 'user.name', 'Mission Test');
+      writeFileSync(join(repo, 'seed.txt'), 'seed');
+      git(repo, 'add', '.');
+      git(repo, 'commit', '-qm', 'seed');
+      git(repo, 'checkout', '-qb', 'fixture');
+      const originUrl = origin === 'local' ? bare : origin === 'github-ssh' ? 'ssh://git@github.com/x/y.git'
+        : origin === 'github-scp' ? 'git@github.com:x/y.git' : 'https://github.com/x/y.git';
+      git(repo, 'remote', 'add', 'origin', originUrl);
+      if (origin === 'github-pushurl-local') {
+        git(repo, 'config', 'remote.origin.pushurl', bare);
+        expect(git(repo, 'remote', 'get-url', 'origin')).toBe('https://github.com/x/y.git');
+        expect(git(repo, 'remote', 'get-url', '--push', 'origin')).toBe(bare);
+      } else if (origin !== 'local') {
+        // Preserve the GitHub destination URL; a local SSH transport stands in for the unreachable server.
+        // The PR runner only succeeds once that endpoint has received the branch.
+        const ssh = join(root, 'ssh-fixture.sh');
+        writeFileSync(ssh, `#!/bin/sh\ncase "$*" in *github.com*x/y.git*) ;; *) exit 80 ;; esac\nexec git-receive-pack '${bare}'\n`);
+        chmodSync(ssh, 0o755);
+        git(repo, 'config', 'core.sshCommand', ssh);
+        if (origin === 'github') git(repo, 'config', 'url.ssh://git@github.com/.insteadOf', 'https://github.com/');
+        expect(git(repo, 'remote', 'get-url', '--push', 'origin')).toContain('github.com');
+      }
+      const result = runAgentMission({ mission: 'Build feature', repo, branch: 'fixture', agent: codexBackend,
+        evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, resources: 'on', commit,
+        screensDir: join(repo, 'screens'),
+      }, {
+        createWorktree: (() => ({ path: repo, branch: 'fixture', base: 'main' })) as never,
+        recordWorktreeProvenance: () => {},
+        planMissionResources: async () => ({ needs: [], have: ['available'], backend: { name: 'codex', why: 'selected' }, gaps: [], decisions: [] } satisfies ResourcePlan),
+        startPty: ((opts) => ({ id: opts.id!, kind: opts.kind!, nickname: 'fixture', accessMode: 'auto',
+          isAlive: () => true, canWrite: () => true, drainDelta: () => '', renderScreen: async () => 'done',
+          renderScreenPng: async () => null, write: () => {}, kill: () => {},
+        } as unknown as PtyHandle)),
+        checkEvidence: () => { events.push('evidence'); return { ok: true, path: repo }; },
+        commitWorktree: (cwd, message) => {
+          events.push('commit');
+          expect(existsSync(join(cwd, '.mission-prompt.md'))).toBe(false);
+          git(cwd, 'add', '-A');
+          git(cwd, 'commit', '-qm', message);
+          return { ok: true, out: 'committed' };
+        },
+        dispatchOpenPullRequest: () => {
+          expect(git(bare, 'rev-parse', 'refs/heads/fixture')).toBe(git(repo, 'rev-parse', 'HEAD'));
+          prCalls++;
+          events.push('pr');
+          if (prFails) throw new Error('PR runner failed');
+          return { output: 'opened', url: 'https://github.com/x/y/pull/1', number: 1 };
+        },
+        runControlLoop: (async (_brain: RunSupervisor, controlDeps: PtyControlDeps) => {
+          expect(readFileSync(join(repo, '.mission-prompt.md'), 'utf8')).toContain('Build feature');
+          if (stagePrompt) git(repo, 'add', '--', '.mission-prompt.md');
+          writeFileSync(join(repo, 'output.txt'), 'feature');
+          try {
+            await controlDeps.handoff!({ action: 'handoff', to: 'elanous', mission: 'Gate' }, observation);
+          } catch (error) {
+            return { termination: { kind: 'error', message: String(error) }, steps: 1 } as never;
+          }
+          return { termination: { kind: 'success' }, steps: 1 } as never;
+        }) as never,
+      });
+      if (!commit || prFails) {
+        await expect(result).rejects.toThrow(!commit ? 'requires commit authorization' : 'PR runner failed');
+        expect(prCalls).toBe(prFails ? 1 : 0);
+        if (prFails) {
+          expect(git(bare, 'rev-parse', 'refs/heads/fixture')).toBe(git(repo, 'rev-parse', 'HEAD'));
+          expect(events.indexOf('evidence')).toBeLessThan(events.indexOf('commit'));
+          expect(events.indexOf('commit')).toBeLessThan(events.indexOf('pr'));
+          expect(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD')).not.toContain('.mission-prompt.md');
+        } else {
+          expect(events).not.toContain('evidence');
+        }
+        return;
+      }
+      const settled = await result;
+      expect(settled.ok).toBe(true);
+      expect(settled.committed).toBe(true);
+      expect(git(repo, 'ls-tree', '-r', '--name-only', 'HEAD')).not.toContain('.mission-prompt.md');
+      expect(git(bare, 'rev-parse', 'refs/heads/fixture')).toBe(git(repo, 'rev-parse', 'HEAD'));
+      expect(events.indexOf('evidence')).toBeLessThan(events.indexOf('commit'));
+      expect(events.indexOf('commit')).toBeLessThan(origin === 'local' || origin === 'github-pushurl-local' ? events.length : events.indexOf('pr'));
+      expect(logs).toContainEqual(['agent-mission', 'handoff-prompt-file-removed', { existed: true }]);
+      if (origin === 'local' || origin === 'github-pushurl-local') {
+        expect(prCalls).toBe(0);
+        expect(settled).toMatchObject({ pr: 'skipped', reason: 'origin-not-github' });
+        expect(logs).toContainEqual(['agent-mission', 'handoff-pr-skipped', { reason: 'origin-not-github' }]);
+      } else {
+        expect(prCalls).toBe(1);
+        expect(settled.pr).toBeUndefined();
+      }
+    } finally {
+      debug.log = originalLog;
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  test('local bare origin pushes a prompt-free commit and skips PR', async () => run('local'));
+  test('GitHub fetch URL with local pushurl skips PR after pushing to the local bare origin', async () => run('github-pushurl-local'));
+  test('GitHub HTTPS origin still calls the PR runner after its branch reaches the GitHub destination', async () => run('github'));
+  test('GitHub SSH origin still calls the PR runner after its branch reaches the GitHub destination', async () => run('github-ssh'));
+  test('GitHub scp-style origin still calls the PR runner after its branch reaches the GitHub destination', async () => run('github-scp'));
+  test('staged internal prompt is removed from the handoff commit', async () => run('local', true, false, true));
+  test('GitHub HTTPS PR failure remains a failure after push', async () => run('github', true, true));
+  test('commit authorization is still required before handoff', async () => run('local', false));
+});
+
 test('Claude handoff login escalation failure cannot fall through to a successful single-backend result', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'mission-login-fail-'));
   let killed = false;
   try {
     await expect(runAgentMission({ mission: 'Build', repo: dir, branch: 'fixture', agent: codexBackend,
-      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, commit: false,
+      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, resources: 'off', commit: false,
       screensDir: join(dir, 'screens'),
     }, {
       createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
@@ -165,7 +488,7 @@ test('brain gate failure is surfaced instead of falling through to a success res
   let killed = false;
   try {
     await expect(runAgentMission({ mission: 'Build', repo: dir, branch: 'fixture', agent: codexBackend,
-      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, commit: true,
+      evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ }, memory: false, resources: 'off', commit: true,
       screensDir: join(dir, 'screens'),
     }, {
       createWorktree: (() => ({ path: dir, branch: 'fixture', base: 'HEAD' })) as never,
@@ -195,7 +518,7 @@ test('explicit chain uses the same handoff coordinator and launch path: codex �
   try {
     const result = await runAgentMission({ mission: 'Build feature', repo: dir, branch: 'fixture', agent: codexBackend,
       chain: ['codex', 'claude', 'elanous'], evidence: { kind: 'doc', dirRel: 'docs', glob: /fixture/ },
-      memory: false, commit: true, screensDir: join(dir, 'screens'),
+      memory: false, resources: 'off', commit: true, screensDir: join(dir, 'screens'),
     }, {
       createWorktree: (() => { created++; return { path: dir, branch: 'fixture', base: 'HEAD' }; }) as never,
       recordWorktreeProvenance: () => {},

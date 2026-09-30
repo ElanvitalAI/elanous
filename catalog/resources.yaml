@@ -88,7 +88,7 @@ resources:
     auth: api-key
     env: [GEMINI_API_KEY]
     required_for: [gemini-llm]
-    free_fallback: "gemini-llm 만 못 쓴다 — 일반 LLM 능력은 llm.fallbackChain 이 덮는다 (📏 2026-09-22 실측 체인 = codex-rotate → grok · 이 프로바이더는 체인에 없다)"
+    free_fallback: "only gemini-llm itself is unavailable — general LLM work is covered by llm.fallbackChain (📏 2026-09-22 measured chain = codex-rotate → grok · this provider is not in the chain)"
     reads: catalog/providers/gemini.yaml
     free_fallback_mode: auto
     free_fallback_note: >-
@@ -121,7 +121,7 @@ resources:
     auth: api-key
     env: [ZHIPU_API_KEY, GLM_API_KEY, BIGMODEL_API_KEY]   # ONE account, three names
     required_for: [zhipu-llm]
-    free_fallback: "zhipu-llm 만 못 쓴다 — 일반 LLM 능력은 llm.fallbackChain 이 덮는다 (📏 2026-09-22: 체인에 없다)"
+    free_fallback: "only zhipu-llm itself is unavailable — general LLM work is covered by llm.fallbackChain (📏 2026-09-22: not in the chain)"
     reads: src/config.ts:213
     free_fallback_mode: auto
     free_fallback_note: >-
@@ -135,7 +135,7 @@ resources:
     auth: api-key
     env: [DASHSCOPE_API_KEY, QWEN_API_KEY]                # ONE account, two names
     required_for: [dashscope-llm]
-    free_fallback: "dashscope-llm 만 못 쓴다 — 일반 LLM 능력은 llm.fallbackChain 이 덮는다 (📏 2026-09-22: 체인에 없다)"
+    free_fallback: "only dashscope-llm itself is unavailable — general LLM work is covered by llm.fallbackChain (📏 2026-09-22: not in the chain)"
     reads: src/config.ts:204
     free_fallback_mode: auto
     free_fallback_note: >-
@@ -149,7 +149,7 @@ resources:
     auth: api-key
     env: [MOONSHOT_API_KEY, KIMI_API_KEY]                 # ONE account, two names
     required_for: [moonshot-llm]
-    free_fallback: "moonshot-llm 만 못 쓴다 — 일반 LLM 능력은 llm.fallbackChain 이 덮는다 (📏 2026-09-22: 체인에 없다)"
+    free_fallback: "only moonshot-llm itself is unavailable — general LLM work is covered by llm.fallbackChain (📏 2026-09-22: not in the chain)"
     reads: src/config.ts:194
     free_fallback_mode: auto
     free_fallback_note: >-
@@ -163,7 +163,7 @@ resources:
     auth: api-key
     env: [OPENROUTER_API_KEY]                         # 키 캐시 ~/.cache/openrouter_api_key 가 먼저
     required_for: [openrouter-llm]
-    free_fallback: "openrouter-llm(kimi·qwen·glm 경로)만 못 쓴다 — 자동 폴백 후보가 «아니라» 명시 선택으로만 온다(2026-09-23)"
+    free_fallback: "only openrouter-llm (the kimi · qwen · glm route) is unavailable — it is never an automatic fallback, only an explicit choice (2026-09-23)"
     reads: src/config.ts:172
     free_fallback_mode: auto
     free_fallback_note: >-
@@ -235,7 +235,7 @@ resources:
     auth: api-key
     env: [REDDIT_CLIENT_SECRET]
     required_for: [community-buzz]
-    free_fallback: RSS 폴백(무자격) — parse-reddit.ts 2경로 중 ② · 볼륨/긍부정/freshness 만(ups 없음) · rate-limit 로 10분 간격 권장 · 로그 = community-buzz-cycle.ts:106
+    free_fallback: "RSS fallback (no credentials) — volume, sentiment and freshness only (no upvotes) · keep at least 10 minutes between runs for the rate limit · MEASURED: second of two paths in parse-reddit.ts · log = community-buzz-cycle.ts:106"
     reads: src/domains/community-buzz/parse-reddit.ts:27
     free_fallback_mode: auto
     free_fallback_note: >-

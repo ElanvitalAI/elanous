@@ -8,7 +8,7 @@ const schema = (properties: Record<string, unknown>, required: string[]) => ({ t
 const text = { type: 'string' };
 export const tools = [
   { name: 'ncs_search_units', description: 'Search NCS competency units by keyword (NCS007).', inputSchema: schema({ keyword: text }, ['keyword']) },
-  { name: 'ncs_unit', description: 'Look up a competency unit by NCS classification code (NCS005).', inputSchema: schema({ code: text }, ['code']) },
+  { name: 'ncs_unit', description: 'Look up a competency unit by its NCS_COMPE_UNIT_CD (NCS005).', inputSchema: schema({ code: text }, ['code']) },
   { name: 'ncs_classification', description: 'List NCS classifications at major, middle, minor or detailed level (NCS001–004). Parent codes are required below major.', inputSchema: schema({ level: { type: 'string', enum: ['major', 'middle', 'minor', 'detailed'] }, code: text }, ['level']) },
 ];
 
@@ -31,9 +31,10 @@ export async function callNcsTool(name: string, args: Arguments, options: { key?
   } else if (name === 'ncs_unit') {
     operation = 'NCS005';
     const code = required(args.code, 'code');
-    if (!/^\d{8,}$/.test(code)) throw new Error('code must contain the complete numeric NCS classification code');
+    if (!/^\d{8,}$/.test(code)) throw new Error('code must contain the complete numeric NCS competency unit code');
     for (const [field, start, end] of [['NCS_LCLAS_CD', 0, 2], ['NCS_MCLAS_CD', 2, 4], ['NCS_SCLAS_CD', 4, 6], ['NCS_SUBD_CD', 6, 8]] as const) params.set(field, code.slice(start, end));
-    params.set('NCS_CL_CD', code);
+    params.set('NCS_CL_CD', code.slice(0, 8));
+    params.set('NCS_COMPE_UNIT_CD', code);
   } else if (name === 'ncs_classification') {
     const levels = { major: 1, middle: 2, minor: 3, detailed: 4 } as const;
     if (typeof args.level !== 'string' || !Object.hasOwn(levels, args.level)) throw new Error('level must be major, middle, minor or detailed');

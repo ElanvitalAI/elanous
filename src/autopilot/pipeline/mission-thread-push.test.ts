@@ -34,8 +34,7 @@ describe('mission-thread-push — edge-trigger tail', () => {
 
   test('store 가 null 이면 no-op watcher(관측만·throw 없음)', () => {
     const w = watchMissionActivity({ onWake: () => { throw new Error('should not fire'); }, store: null });
-    w.stop(); // throw 없이 정지
-    expect(true).toBe(true);
+    expect(() => w.stop()).not.toThrow();
   });
 
   test('worker 활동이 onWake 를 edge-trigger 한다', async () => {

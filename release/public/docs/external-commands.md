@@ -1,7 +1,8 @@
 # External commands
 
 Beyond Bun and git, elanous spawns these. None are needed to boot; each gates
-one capability. Counted from `src/` and `scripts/` on 2026-09-20:
+one capability. `elanous doctor` shows which ones this machine has, and
+`elanous env profile` describes the environment it detected.
 
 | command | used for |
 |---|---|
@@ -9,6 +10,12 @@ one capability. Counted from `src/` and `scripts/` on 2026-09-20:
 | `gh` | pull requests, harness base selection |
 | `rg` (ripgrep) | code search — **the test suite needs it too** |
 | `codex` | ACP delegate / harness implement on the codex backend |
+| `claude`, `gemini`, `grok` | coding agents elanous drives in a terminal (`agent-mission --backend`) |
+| `tailscale` | sharing the web app with your other devices (`nexus pwa share`) |
+| `docker` | optional container runtime (for example OpenDesign previews in [Design systems](design.md)) |
+| `kubectl` | running harness work on a Kubernetes cluster |
+| Chrome or Chromium | browser checks and page capture over the DevTools protocol |
+| `tmux` | naming the session when the terminal UI runs inside tmux |
 | `curl`, `ssh`, `rsync`, `unzip` | fetching, remote nodes, installers |
 | `crontab` | scheduled missions |
 | `ffmpeg`, `magick`, `sox`, `tesseract`, `chafa` | media / ad pipeline, OCR, terminal images |

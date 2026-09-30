@@ -60,11 +60,12 @@ export const TRACK_SCRUBS: { pattern: RegExp; replace: string; why: string }[] =
 /** 잔여 표식 — 하나라도 남으면 rc=1 */
 const TRACK_REGISTRY = JSON.parse(
   readFileSync(join(import.meta.dir, 'coord-tracks.json'), 'utf8'),
-) as { tracks: { id: string; mark: string }[] };
+) as { tracks: { id: string; mark: string; alias?: string }[] };
 const TRACK_MARKS = TRACK_REGISTRY.tracks.map((t) => t.mark).join('');
-const TRACK_IDS = TRACK_REGISTRY.tracks.map((t) => t.id).join('');
+/** 2글자 신원(OP·MK·TC·UX) ⊕ 옛 한 글자 별칭(S·T·O·F) — 둘 다 공개 문서에 남으면 안 된다. */
+const TRACK_NAMES = [...new Set(TRACK_REGISTRY.tracks.flatMap((t) => [t.id, t.alias ?? '']).filter(Boolean))].join('|');
 /** 잔여 표식 — 트랙 정본(`coord-tracks.json`)에서 파생한다. 트랙을 더해도 여기는 고치지 않는다. */
-export const TRACK_RESIDUE = new RegExp(`[${TRACK_MARKS}]|(?<![\\w\\]])\\[[${TRACK_IDS}]\\](?!\\()`, 'gu');
+export const TRACK_RESIDUE = new RegExp(`[${TRACK_MARKS}]|(?<![\\w\\]])\\[(?:${TRACK_NAMES})\\](?!\\()`, 'gu');
 
 export function scrubTrackMarks(md: string): { text: string; applied: string[] } {
   let text = md;

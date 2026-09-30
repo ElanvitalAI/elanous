@@ -505,7 +505,10 @@ BACKUP_OK=1
 if [ "${ELANOUS_BACKUP_NO_HEARTBEAT:-0}" = "1" ]; then
   echo "  (심박 끔 — ELANOUS_BACKUP_NO_HEARTBEAT=1 · 시험 전용)" >&2
 elif [ -n "$HB_REPO" ] && [ -f "$HB_REPO/scripts/botlab/heartbeat-emit.sh" ]; then
-  bash "$HB_REPO/scripts/botlab/heartbeat-emit.sh" backup "$BACKUP_OK" "$HB_REPO" "$BACKUP_SOURCE"
+  # 심박은 «운영» 우주로 — 백업이 뜨는 것이 운영 ~/.elanous 이다. 크론은 환경변수가 없고 소스 트리는
+  # 트리 파생 시험 우주로 풀려(`where` layer=tree-derived) 심박이 «격리라 안 밀었다»로 3일 멎었다(09-30).
+  ELANOUS_STATE_DIR="${ELANOUS_STATE_DIR:-$HOME/.elanous}" ELANOUS_CONFIG_DIR="${ELANOUS_CONFIG_DIR:-$HOME/.elanous}" \
+    bash "$HB_REPO/scripts/botlab/heartbeat-emit.sh" backup "$BACKUP_OK" "$HB_REPO" "$BACKUP_SOURCE"
 else
   echo "  ⚠️ 심박을 «못 보냈다» — 저장소 자리를 못 찾았다(HB_REPO=${HB_REPO:-없음})" >&2
 fi

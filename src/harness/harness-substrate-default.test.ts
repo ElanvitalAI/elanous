@@ -102,7 +102,7 @@ describe('harness substrate default', () => {
     try {
       await program.parseAsync(['node', 'elanous', 'harness', 'say', 'goal']);
       expect(dispatched).toHaveBeenCalledTimes(1);
-      expect(dispatched).toHaveBeenCalledWith(expect.objectContaining({ entrance: 'cli-harness-say', podPool: 'legacy-pool@host:4' }));
+      expect(dispatched).toHaveBeenCalledWith(expect.objectContaining({ entrance: 'cli-harness-say', podPool: 'legacy-pool@host:4' }), expect.anything());
     } finally {
       console.log = original;
       dispatched.mockRestore();
@@ -164,8 +164,8 @@ describe('harness substrate default', () => {
       await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/goal']);
       await program.parseAsync(['node', 'elanous', 'harness', 'say', 'goal']);
       expect(dispatched).toHaveBeenCalledTimes(2);
-      expect(dispatched).toHaveBeenCalledWith(expect.objectContaining({ entrance: 'cli-harness-ask', podPool: 'pool-test:2' }));
-      expect(dispatched).toHaveBeenCalledWith(expect.objectContaining({ entrance: 'cli-harness-say', podPool: 'pool-test:2' }));
+      expect(dispatched).toHaveBeenCalledWith(expect.objectContaining({ entrance: 'cli-harness-ask', podPool: 'pool-test:2' }), expect.anything());
+      expect(dispatched).toHaveBeenCalledWith(expect.objectContaining({ entrance: 'cli-harness-say', podPool: 'pool-test:2' }), expect.anything());
       await program.parseAsync(['node', 'elanous', 'harness', 'ask', '/goal', '--substrate', 'local']);
       expect(local).toEqual(['ask']);
       expect(dispatched).toHaveBeenCalledTimes(2);

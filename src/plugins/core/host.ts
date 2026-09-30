@@ -233,6 +233,14 @@ export const BUILTIN_DIR = resolve(import.meta.dir, '..', '..', '..', 'plugins')
 export const PACKS_DIR = resolve(import.meta.dir, '..', '..', '..', 'packs');
 export const USER_DIR = join(homedir(), '.claude', 'plugins');
 
+/** 코드 없이 스킬·그래프만 싣는 팩인가 — 진입점이 기본값(`./plugin.ts`)이고 파일이 없으며, 스킬·그래프를 선언하거나 `skills/` 폴더가 있다. */
+export function isSkillOnlyPack(pluginDir: string, manifest: { main: string; contributes?: { skills?: unknown[]; graphs?: unknown[] } }, hasLegacyEntry: boolean): boolean {
+  if (hasLegacyEntry) return false;
+  if (manifest.main !== './plugin.ts') return false; // 명시한 진입점이 없으면 그건 결함이다 — 경고를 유지한다.
+  const declares = (manifest.contributes?.skills?.length ?? 0) > 0 || (manifest.contributes?.graphs?.length ?? 0) > 0;
+  return declares || existsSync(join(pluginDir, 'skills'));
+}
+
 export class PluginHost {
   private available = new Map<string, PluginEntry>();
   private discoveredNodeKinds = new Map<string, NodeKindEntry>();
@@ -614,6 +622,12 @@ export class PluginHost {
         // ~/.claude/plugins/{cache,data,marketplaces} internal state)
         // are silently skipped: they never intended to be plugins.
         const looksLikePlugin = hasLegacyEntry || !manifestLoad.inferred;
+        // 스킬·그래프만 싣는 팩(공식 `elanous-basics` 등)은 코드 진입점이 없다 — 매니페스트가 `main` 을
+        // 적지 않아 기본값 `./plugin.ts` 가 들어온 것뿐이다. 부팅마다 «main not found» 경고를 내지 않는다.
+        if (looksLikePlugin && isSkillOnlyPack(pluginDir, manifestLoad.manifest, hasLegacyEntry)) {
+          debug.log('plugin.discovery', 'skill-only', { plugin: manifestLoad.manifest.id });
+          continue;
+        }
         if (looksLikePlugin) {
           this.hooks.log(`⚠ plugin "${manifestLoad.manifest.id}" main not found: ${manifestLoad.manifest.main}`);
           debug.log('plugin.discovery', 'error', {

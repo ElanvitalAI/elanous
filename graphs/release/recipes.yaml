@@ -6,7 +6,8 @@ cutoff:
   timeout_ms: 600000
 gate:
   command: 'bun scripts/release-loop/gate-node.ts --json'
-  timeout_ms: 7200000
+  # 4h — the Pod gate took 2h02m on 09-30 (G1f ②) and the 0.2.5 loop was cut at exactly 2h with no verdict; K9 (≤15 min) is the real fix.
+  timeout_ms: 14400000
 pwa:
   command: 'bun scripts/release-loop/node-verdict.ts pwa'
   timeout_ms: 1800000
@@ -22,6 +23,12 @@ tui:
 docs:
   command: 'bun scripts/release-loop/docs-node.ts --json'
   timeout_ms: 1800000
+notes-check:
+  command: 'bun scripts/announce-loop/check-node.ts --json'
+  timeout_ms: 600000
+auto-approve:
+  command: 'bun scripts/release-loop/auto-approve-node.ts'
+  timeout_ms: 600000
 publish:
   approval: 'v{{input.version}} 공개 발행 — 되돌릴 수 없다. 승인하시겠습니까?'
 publish-command:

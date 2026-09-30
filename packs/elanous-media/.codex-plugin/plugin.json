@@ -1,0 +1,12 @@
+{
+  "name": "elanous-media",
+  "version": "0.1.0",
+  "description": "Official elanous media skills: build videos and author word-timed motion B-roll.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "elanous-media",
+    "shortDescription": "Video building and motion B-roll skills",
+    "developerName": "ElanvitalAI",
+    "category": "Productivity"
+  }
+}

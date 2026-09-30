@@ -340,9 +340,7 @@ describe('runNexus intent-prediction wire', () => {
     expect(h.intentPrediction).toBeDefined();
     h.release();
     activeHandle = undefined;
-    // Calling release again should not throw.
-    // (Internal dispose is wrapped in try/catch.)
-    expect(true).toBe(true);
+    expect(() => h.release()).not.toThrow();
   });
 
   test('intentContextProvider override is used by the service', async () => {

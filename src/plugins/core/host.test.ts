@@ -157,3 +157,21 @@ describe('PluginHost user-dir contract vs Claude package management', () => {
     }
   });
 });
+
+describe('skill-only packs (no main) boot quietly', () => {
+  test('a manifest pack with skills/ and no plugin.ts is not warned as «main not found»; an explicit missing main still is', async () => {
+    const userDir = createDir('elanous-host-skill-only-');
+    const skillPack = join(userDir, 'skill-pack');
+    mkdirSync(join(skillPack, 'skills', 'hello'), { recursive: true });
+    writeFileSync(join(skillPack, 'plugin.json'), JSON.stringify({ id: 'skill-pack', version: '0.1.0' }));
+    writeFileSync(join(skillPack, 'skills', 'hello', 'SKILL.md'), '# hello\n');
+    const broken = join(userDir, 'broken-pack');
+    mkdirSync(broken, { recursive: true });
+    writeFileSync(join(broken, 'plugin.json'), JSON.stringify({ id: 'broken-pack', version: '0.1.0', main: './dist/index.js' }));
+    const warnings: string[] = [];
+    const host = new PluginHost({ ...hooks, log: (m) => warnings.push(m) }, null, { userDir });
+    await host.discover();
+    expect(warnings.some((w) => w.includes('skill-pack') && w.includes('main not found'))).toBe(false);
+    expect(warnings.some((w) => w.includes('broken-pack') && w.includes('main not found'))).toBe(true);
+  });
+});

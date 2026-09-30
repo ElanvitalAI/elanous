@@ -32,6 +32,7 @@ import { quoteShellArg } from '../cli/logs-cli.js';
 import type { HarnessGroundingProvenance } from './context-capsule.js';
 import { hasGoalStepCodeName } from './goal-step-code-name.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
+import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 
 // ⭐ `situation`/`complication` 은 **선택**이다 — 안 오면 `scqaNarrative` 가 종전 문면을 쓴다.
 //   ⛔ 필수로 만들지 않는다: 그러면 인핸싱이 폴백으로 떨어진 저작(LLM 실패·`disabled`)이 전부 죽는다.
@@ -334,7 +335,7 @@ function endGoalAuthorPhase(phase: GoalAuthorTimedPhase, startedAt: number, auth
 
 export type GoalFileLintLevel = 'ERROR' | 'WARN';
 
-export type GoalFileLintTag = 'canonical-structure' | 'evidence-section' | 'boundary-size' | 'launch-branch' | 'unanswered-clarification' | 'shell-damage' | 'traced-path' | 'grounding-evidence' | 'empty-result-population' | 'decision-signal-numeric-source' | 'decision-signal-numeric-coverage' | 'decision-signal-proxy-expectation' | 'out-of-target-requirement' | 'heading-form-marker' | 'blanket-invariant' | 'self-question-subject' | 'artifact-launch-declaration' | 'all-negative-signals' | 'unreadable-signals' | 'alternative-signals' | 'count-observation' | 'identifier-name-observation' | 'self-reported-observation' | 'default-invocation-observation';
+export type GoalFileLintTag = 'canonical-structure' | 'evidence-section' | 'boundary-size' | 'launch-branch' | 'unanswered-clarification' | 'shell-damage' | 'traced-path' | 'grounding-evidence' | 'empty-result-population' | 'decision-signal-numeric-source' | 'decision-signal-numeric-coverage' | 'decision-signal-proxy-expectation' | 'out-of-target-requirement' | 'heading-form-marker' | 'blanket-invariant' | 'self-question-subject' | 'artifact-launch-declaration' | 'all-negative-signals' | 'unreadable-signals' | 'alternative-signals' | 'count-observation' | 'identifier-name-observation' | 'self-reported-observation' | 'default-invocation-observation' | 'release-note';
 
 type GoalFileLintOrigin =
   | { readonly kind: 'known-incident'; readonly incident: string; readonly reference: string }
@@ -369,6 +370,7 @@ export const GOAL_FILE_LINT_ORIGINS: Record<GoalFileLintTag, GoalFileLintOrigin>
   'identifier-name-observation': { kind: 'known-incident', incident: "an authored observation of 'the list of test names this file registers' produced a test that greps its own source for test-name strings, which passes with every named test body emptied; 59 of 3164 goal documents carried the same wording", reference: 'PR #15791 (closed; superseded by #15802); docs/harness/observability/ISSUES.md OBS-T415' },
   'self-reported-observation': { kind: 'known-incident', incident: "an authored observation of 'the captureScope field of the emitted JSON' stayed green across two failed implementations: a Chrome CLI flag Chrome silently ignores (capture stayed 1280x900 against a true 4651) and a CDP call that timed out leaving no file at all, both of which still emitted captureScope:'full-page'", reference: 'docs/manual/MANUAL-web-clone-to-reproducible-resource-2026-09-08.md section 6b; PR #16201; measured 2026-09-08: 190 of 2867 goal documents that carry a decision signal match this shape, three times the 63 that match identifier-name-observation' },
   'default-invocation-observation': { kind: 'known-incident', incident: 'a scripts/*.ts checker landed green from fixture tests and, run once with no arguments from the repository root, reported covered 1 and uncovered 22 because its default catalog path never opened the map the goal named', reference: 'PR #19126; measured 2026-09-20 against the same-day controls #19123 and #19127' },
+  'release-note': { kind: 'unknown-origin', label: 'ORIGIN-UNKNOWN' },
 } as const satisfies Record<GoalFileLintTag, GoalFileLintOrigin>;
 
 /** Machine-countable reason for a finding that retains the canonical-structure tag. */
@@ -1452,6 +1454,21 @@ export function lintGoalFile(document: string, branch: string, deps: GoalFileLin
   for (const finding of askSectionCountLintFindings(document)) findings.push(finding);
   for (const finding of headingFormMarkerLintFindings(document)) findings.push(finding);
   for (const finding of blanketInvariantLintFindings(document)) findings.push(finding);
+  const releaseNote = parseReleaseNoteSection(document);
+  for (const problem of releaseNote.problems) {
+    findings.push({
+      level: 'WARN', tag: 'release-note',
+      message: `## 릴리스 노트 ${problem} invalid or missing; use - 한 줄: English summary, - 종류: feat|fix|security|internal (feature → feat), - 문서: path or 없음(이유), - 대상: next|later`,
+    });
+  }
+  if (releaseNote.fragment || releaseNote.problems.length) {
+    const section = markdownSection(document, '릴리스 노트') ?? '';
+    const kind = releaseNote.fragment?.kind ?? /^[ \t]*- 종류:[ \t]*(.*?)[ \t]*$/m.exec(section)?.[1];
+    const line = releaseNote.fragment?.line ?? /^[ \t]*- 한 줄:[ \t]*(.*?)[ \t]*$/m.exec(section)?.[1];
+    if (kind && ['feat', 'fix', 'security'].includes(kind) && line && /[가-힣ㄱ-ㅎㅏ-ㅣ]/u.test(line)) {
+      findings.push({ level: 'WARN', tag: 'release-note', message: '## 릴리스 노트 한 줄: 공개 노트에 실리는 문장은 영어로(internal 은 한국어 무방)' });
+    }
+  }
   for (const violation of selfQuestionSubjectViolations) {
     findings.push({
       level: 'WARN',

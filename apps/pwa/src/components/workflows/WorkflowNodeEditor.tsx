@@ -18,6 +18,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Trash2, X } from 'lucide-react';
 import {
   classifyNodeVariant,
+  nodeBadgeLabel,
   type NodeVariant,
   type WorkflowDefinitionLike,
 } from './workflow-graph-layout';
@@ -29,6 +30,8 @@ import { DiscordTriggerEditor } from './triggers/DiscordTriggerEditor';
 import { TelegramTriggerEditor } from './triggers/TelegramTriggerEditor';
 import { ManualTriggerEditor } from './triggers/ManualTriggerEditor';
 import { ChatTriggerEditor } from './triggers/ChatTriggerEditor';
+import { SchemaForm, type SchemaValue } from './SchemaForm';
+import type { GraphKindEntry } from '@/nexus/client';
 
 interface WorkflowNodeEditorProps {
   /** Parsed workflow definition the form pulls the current node from. */
@@ -46,6 +49,9 @@ interface WorkflowNodeEditorProps {
   /** Called when the user clicks "Delete node" — parent invokes the
    *  existing `defDeleteNode` helper. */
   onDelete: () => void;
+  /** Server vocabulary (`GET /v1/graph/kinds?graph=workflow`). A plugin
+   *  kind that carries a `schema` gets a generated form for `inputs`. */
+  palette?: GraphKindEntry[];
 }
 
 const AUTO_SAVE_DEBOUNCE_MS = 500;
@@ -57,6 +63,7 @@ export function WorkflowNodeEditor({
   onChange,
   onClose,
   onDelete,
+  palette,
 }: WorkflowNodeEditorProps) {
   const node = useMemo(
     () => (definition.nodes ?? []).find((n) => n.id === nodeId) ?? null,
@@ -101,6 +108,28 @@ export function WorkflowNodeEditor({
     setDraftWhen(typeof node['when'] === 'string' ? (node['when'] as string) : '');
     setDraftDeps(Array.isArray(node['depends_on']) ? [...(node['depends_on'] as string[])] : []);
   }, [nodeId, node]);
+
+  // Plugin node `inputs` — schema form (0.2.5 K3). Local draft + debounced
+  // commit like the other fields; compared by JSON so the parent → node →
+  // draft round trip never re-commits (no render loop).
+  const kindSchema = useMemo(() => {
+    const kind = typeof node?.['kind'] === 'string' ? (node['kind'] as string) : null;
+    return kind ? palette?.find((e) => e.kind === kind && e.schema)?.schema ?? null : null;
+  }, [node, palette]);
+  const nodeInputs = useMemo<SchemaValue>(() => {
+    const raw = node?.['inputs'];
+    return raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as SchemaValue) : {};
+  }, [node]);
+  const [draftInputs, setDraftInputs] = useState<SchemaValue>(nodeInputs);
+  useEffect(() => { setDraftInputs(nodeInputs); }, [nodeId, nodeInputs]);
+  useEffect(() => {
+    if (!node || !kindSchema) return;
+    if (JSON.stringify(draftInputs) === JSON.stringify(nodeInputs)) return;
+    const t = setTimeout(() => {
+      onChange({ ...definition, nodes: (definition.nodes ?? []).map((n) => (n.id === nodeId ? { ...n, inputs: draftInputs } : n)) });
+    }, AUTO_SAVE_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [draftInputs, nodeInputs, kindSchema, node, nodeId, definition, onChange]);
 
   // Build a patch from the current draft state. Only includes fields
   // that have actually changed to keep the diff narrow.
@@ -230,7 +259,7 @@ export function WorkflowNodeEditor({
       <header className="flex items-center justify-between px-3 py-2">
         <div className="flex items-center gap-2">
           <span className="rounded bg-surface px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-text-tertiary">
-            {variant}
+            {node ? nodeBadgeLabel(node, variant) : variant}
           </span>
           <span className="font-mono text-xs text-text-primary">{nodeId}</span>
         </div>
@@ -272,6 +301,9 @@ export function WorkflowNodeEditor({
             className="w-full rounded-md border border-border bg-surface px-2 py-1 font-mono text-xs"
           />
         </Field>
+        {kindSchema && (
+          <SchemaForm schema={kindSchema} value={draftInputs} onChange={setDraftInputs} />
+        )}
         {variant === 'bash' && (
           <Field label="bash" full>
             <textarea

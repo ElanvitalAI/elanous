@@ -19,6 +19,9 @@ describe('MCP OAuth 안내 — 실제 라우터', () => {
     const body = await res.json() as { hint?: string };
     expect(body.hint).toContain('elanous mcp serve');
     expect(body.hint).not.toContain('owner-secret');
+    // 포트를 짐작하지 않는다 — 요청이 닿은 origin 을 그대로 안내한다.
+    expect(body.hint).toContain('http://remote.invalid/v1/mcp');
+    expect(body.hint).not.toContain('31415');
   });
 
   it('OAuth 동적 등록(POST /register)은 405 가 아니라 RFC 7591 오류 ⊕ 할 일', async () => {
@@ -28,6 +31,7 @@ describe('MCP OAuth 안내 — 실제 라우터', () => {
     expect(body.error).toBe('invalid_client_metadata');
     expect(body.error_description).toContain('Authorization');
     expect(body.error_description).toContain('~/.elanous/acp-token');
+    expect(body.error_description).toContain('http://remote.invalid/v1/mcp');
   });
 
   it('다른 경로의 401 은 그대로(안내는 /v1/mcp 에만)', async () => {

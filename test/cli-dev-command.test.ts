@@ -3,7 +3,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'child_process';
-import { mkdtempSync, writeFileSync, rmSync, realpathSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { snapshotWorktreeRoot, sweepNewEmptyWorktreeRoots } from './helpers/worktree-root-leak.js';
@@ -15,16 +15,44 @@ let worktreeRootBefore: ReadonlySet<string> = new Set();
 beforeAll(() => { worktreeRootBefore = snapshotWorktreeRoot(); });
 afterAll(() => { sweepNewEmptyWorktreeRoots(worktreeRootBefore); });
 
-const ENTRY = resolve(import.meta.dir, '..', 'src', 'index.ts');
 const CLI = resolve(import.meta.dir, '..', 'bin', 'elanous.mjs');
+const childRoot = mkdtempSync(join(tmpdir(), 'elanous-cli-dev-child-'));
+const childHome = join(childRoot, 'home');
+const childConfig = join(childRoot, 'config');
+const childState = join(childRoot, 'state');
+for (const dir of [childHome, childConfig, childState]) mkdirSync(dir, { recursive: true });
+writeFileSync(join(childState, 'config.json'), '{}');
+afterAll(() => rmSync(childRoot, { recursive: true, force: true }));
+
+function childEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (/^(?:OPENAI|ANTHROPIC|CLAUDE|GOOGLE|GEMINI|GROK|XAI|OPENROUTER|AZURE_OPENAI|AWS|CODEX)_/.test(key)
+      || /^(?:ELANOUS_(?:RUN_ID|TEST_HOME|CONFIG_DIR|STATE_DIR|STATE_DIR_SOURCE|CODEX_ACCOUNT|LLM_API_KEY)|CODEX_HOME)$/.test(key)) delete env[key];
+  }
+  return {
+    ...env, NODE_ENV: 'development', HOME: childHome, XDG_CONFIG_HOME: childConfig, XDG_STATE_HOME: childState, ELANOUS_TEST_HOME: childHome,
+    ELANOUS_CONFIG_DIR: childConfig, ELANOUS_STATE_DIR: childState,
+    CODEX_HOME: join(childHome, '.codex'), ...extra,
+  };
+}
+
+function assertNoProductionConfigMaterialization(output: string): void {
+  expect(output).not.toContain('[test-isolation] 운영 config 물질화');
+}
+
 function run(args: string[]): { code: number; out: string } {
-  const r = spawnSync('bun', [ENTRY, ...args], { encoding: 'utf-8', env: { ...process.env, NODE_ENV: 'development' } });
-  return { code: r.status ?? 1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+  const r = spawnSync('bun', [CLI, `--test=${childState}`, ...args], { encoding: 'utf-8', env: childEnv({ NODE_ENV: 'test' }) });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  assertNoProductionConfigMaterialization(out);
+  return { code: r.status ?? 1, out };
 }
 
 function runIsolatedCli(args: string[], cwd?: string): { code: number; out: string } {
-  const r = spawnSync('bun', [CLI, '--test', ...args], { cwd, encoding: 'utf-8', env: { ...process.env, NODE_ENV: 'development' } });
-  return { code: r.status ?? 1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
+  const r = spawnSync('bun', [CLI, `--test=${childState}`, ...args], { cwd, encoding: 'utf-8', env: childEnv({ NODE_ENV: 'test' }) });
+  const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+  assertNoProductionConfigMaterialization(out);
+  return { code: r.status ?? 1, out };
 }
 
 function git(cwd: string, args: string[]): void {
@@ -66,56 +94,34 @@ function createGitFixture(behind: number | 'no-origin'): { invoked: string; clea
 }
 
 function runDevFixture(cwd: string, runId: string): {
-  killedBySignal: string | null;
   output: string;
   logs: Array<{ event: string; data: string }>;
 } {
-  const env = {
-    ...process.env,
-    NODE_ENV: undefined,
-    ELANOUS_STATE_DIR: undefined,
-    ELANOUS_CONFIG_DIR: undefined,
-    ELANOUS_RUN_ID: runId,
-  };
-  const result = spawnSync('bun', [CLI, '--test', 'dev', 'runtime git fixture', '--backend', 'codex', '--transport', 'acp', '--no-open-pr'], {
-    cwd, env, encoding: 'utf8', timeout: 15_000,
+  const env = childEnv({ ELANOUS_RUN_ID: runId });
+  const result = spawnSync('bun', [CLI, `--test=${childState}`, 'dev', 'runtime git fixture', '--backend', 'codex', '--transport', 'acp'], {
+    cwd, env, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL',
   });
-  // ⛔⭐ 자식의 종료 상태를 버리지 않는다(무인 리뷰 should-fix).
-  //   ⚠️ 실측(2026-08-03): 이 자식은 **15초 안에 스스로 안 끝난다** — `timeout` 이 SIGTERM 으로 죽인다.
-  //      그런데 초판은 stdout 만 읽어 **죽은 줄 모르고 통과**했다. 즉 *"파이프라인이 계속 간다"* 는
-  //      주장이 실제로는 검증되지 않았다(경고가 죽기 전에 찍혔을 뿐이다).
-  //   ⇒ 그래서 `signal` 을 무조건 실패로 두지 않는다(그건 이 fixture 의 **의도된 정지**다).
-  //      대신 **정지가 파이프라인 진입 전이었는지 후였는지**를 가른다 — `plan` 관측이 그 경계다.
-  //      호출부가 `plan` 유무를 단언하므로 여기서는 spawn 자체의 실패만 시끄럽게 던진다.
-  //   ⚠️ bun/node 는 이 정지를 **`error.code === 'ETIMEDOUT'`** 로 준다(`signal` 이 아니다 · 실측).
-  //      둘 다 「의도된 정지」로 묶고, 그 밖의 spawn 실패만 즉시 던진다.
-  const stoppedByFixture = (result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT'
-    || result.signal != null;
-  if (result.error && !stoppedByFixture) {
-    throw new Error(`dev spawn 실패(결함 아님): ${result.error.message}`);
+  // 프로세스 종료와 pipeline 진입을 별개로 확인한다. 관측 `plan` 이 없으면
+  // 경고를 출력했어도 실행 경로에 닿지 못한 것이다.
+  if (result.error || result.signal) {
+    throw new Error(`dev spawn 실패: ${result.error?.message ?? result.signal}`);
   }
-  const logResult = spawnSync('bun', [CLI, '--test', 'logs', '--exact-category', 'dev-pipeline', '--since', '10m', '--json', '--limit', '10'], {
-    cwd, env, encoding: 'utf8', timeout: 15_000,
+  const logResult = spawnSync('bun', [CLI, `--test=${childState}`, 'logs', '--exact-category', 'dev-pipeline', '--since', '10m', '--json', '--limit', '10'], {
+    cwd, env, encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL',
   });
   if (logResult.error) throw new Error(`logs spawn 실패: ${logResult.error.message}`);
   if (logResult.signal) throw new Error(`logs 가 시그널로 죽었다(관측을 못 읽었다): signal=${logResult.signal}`);
-  expect(logResult.status).toBe(0);
+  expect(result.status, `${result.stdout ?? ''}${result.stderr ?? ''}`).toBe(2);
+  expect(logResult.status, `${logResult.stdout ?? ''}${logResult.stderr ?? ''}`).toBe(0);
   const logs = logResult.stdout.trim().split('\n').filter(Boolean)
-    .map((line) => JSON.parse(line) as { event: string; data: string });
-  // ⭐ 여기가 그 경계다 — `plan` 은 `runDevPipeline` 진입의 관측이다. 시그널로 죽었는데 `plan` 이
-  //   없으면 그 정지는 **파이프라인 진입 전**이었다는 뜻이고, 그때는 이 fixture 가 재려던
-  //   *"경고 뒤에도 발사가 계속된다"* 가 성립하지 않는다 ⇒ 조용히 통과시키지 않는다.
-  if (stoppedByFixture && !logs.some(({ event }) => event === 'plan')) {
-    throw new Error(
-      `dev 가 파이프라인 진입 전에 멈췄다: signal=${result.signal ?? '-'} `
-      + `error=${(result.error as NodeJS.ErrnoException | undefined)?.code ?? '-'}`,
-    );
-  }
-  return {
-    killedBySignal: result.signal ?? null,
-    output: `${result.stdout ?? ''}${result.stderr ?? ''}`,
-    logs,
-  };
+    .map((line) => JSON.parse(line) as { event: string; data: string })
+    .filter((record) => {
+      try { return (JSON.parse(record.data) as { runId?: string }).runId === runId; } catch { return false; }
+    });
+  expect(logs.some(({ event }) => event === 'plan')).toBe(true);
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`;
+  assertNoProductionConfigMaterialization(output);
+  return { output, logs };
 }
 
 describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
@@ -136,11 +142,11 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     expect(all.out).toContain('--context');
     expect(all.out).toContain('--context-text');
     expect(all.out).toContain('--no-supervise');
-    expect(all.out).toContain('--supervise-rounds');
+    expect(all.out).toContain('--child-llm-effort');
+    expect(all.out).not.toContain('--supervise-rounds');
   });
 
-  // ⛔ 대표 2026-08-22: 슈퍼바이저가 «기본 ON» 이 됐다. 종전 계약(「--supervise 와 함께만 유효」)은
-  //   뜻을 잃었고, 남는 참인 계약은 ***「끈 채로 상한을 주지 못한다」*** ⊕ 「상한 값이 양의 정수」다.
+  // dev 에서 은퇴한 상한 옵션은 값과 --no-supervise 조합에 관계없이 파서가 거부한다.
   it('--supervise-rounds fails with --no-supervise and with invalid limits, before self execution', () => {
     for (const args of [
       ['dev', 'do not launch', '--no-supervise', '--supervise-rounds', '2'],
@@ -153,7 +159,7 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     }
   });
 
-  it('⭐ 기본이 «켜짐»이다 — --supervise-rounds 만 줘도 거부되지 않는다(대표 2026-08-22)', () => {
+  it('기본 감독을 끄는 --no-supervise 는 help-all 에 계속 노출한다', () => {
     const all = run(['dev', '--help-all']);
     expect(all.code).toBe(0);
     expect(all.out).toContain('--no-supervise');
@@ -178,19 +184,22 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     try {
       writeFileSync(goalPath, validGoal('- src/index.ts — goal evidence\n- missing.ts — nonfatal diagnostic'));
       const derived = runIsolatedCli(['dev', '--file', goalPath, '--backend', 'codex', '--transport', 'acp', '--allow-goal-lint-errors']);
-      expect(derived.code, derived.out).toBe(0);
+      expect(derived.code, derived.out).toBe(2);
+      expect(derived.out).toContain('acp 완료 · ok=false');
       expect(derived.out).toContain('Reviewer context: 1 loaded, 1 not loaded.');
       expect(derived.out).toContain('- src/index.ts');
       expect(derived.out).toContain('- missing.ts: missing');
 
       const explicit = runIsolatedCli(['dev', '--file', goalPath, '--backend', 'codex', '--transport', 'acp', '--context', 'src/self-dev/dev-cli.ts', '--allow-goal-lint-errors']);
-      expect(explicit.code, explicit.out).toBe(0);
+      expect(explicit.code, explicit.out).toBe(2);
+      expect(explicit.out).toContain('acp 완료 · ok=false');
       expect(explicit.out).toContain('Reviewer context: 1 loaded, 0 not loaded.');
       expect(explicit.out).toContain('- src/self-dev/dev-cli.ts');
       expect(explicit.out).not.toContain('- src/index.ts');
 
       const text = runIsolatedCli(['dev', 'text goal', '--backend', 'codex', '--transport', 'acp']);
-      expect(text.code).toBe(0);
+      expect(text.code, text.out).toBe(2);
+      expect(text.out).toContain('acp 완료 · ok=false');
       expect(text.out).not.toContain('Reviewer context:');
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -228,7 +237,7 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
       expect(result.output).toContain('origin/main보다 2개 커밋 뒤처져 있습니다');
       const behindEvents = result.logs.filter(({ event }) => event === 'worktree-behind-main');
       expect(behindEvents).toHaveLength(1);
-      expect(JSON.parse(behindEvents[0]!.data)).toEqual({ runId, behind: 2 });
+      expect(JSON.parse(behindEvents[0]!.data)).toMatchObject({ runId, behind: 2, hostId: expect.any(String) });
       expect(result.logs.some(({ event }) => event === 'plan')).toBe(true);
     } finally {
       fixture.cleanup();
@@ -266,28 +275,39 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     writeFileSync(invalidIsolationRoot, 'blocks directory creation\n');
     let testFailed = true;
     try {
-      const result = spawnSync('bun', [CLI, '--test', 'dev', 'exercise child dispatch', '--elanous', '--goal', 'exercise child dispatch', '--isolated-root', invalidIsolationRoot, '--worktree', '--json'], {
+      const result = spawnSync('bun', [CLI, `--test=${childState}`, 'dev', 'exercise child dispatch', '--elanous', '--hold', '--isolated-root', invalidIsolationRoot, '--worktree', '--json'], {
         cwd: fixture.invoked,
         encoding: 'utf8',
-        timeout: 15_000,
-        env: { ...process.env, ELANOUS_RUN_ID: runId },
+        timeout: 15_000, killSignal: 'SIGKILL',
+        env: childEnv({ ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
       });
       expect(result.error).toBeUndefined();
+      assertNoProductionConfigMaterialization(`${result.stdout ?? ''}${result.stderr ?? ''}`);
       expect(result.signal).toBeNull();
-      expect(result.status).toBe(1);
-      const jsonStart = result.stdout.indexOf('{');
-      expect(jsonStart).toBeGreaterThanOrEqual(0);
-      const output = JSON.parse(result.stdout.slice(jsonStart)) as { error: string; autoWorktree: { environment: { branch: string }; worktree: { path: string; branch: string; owner: string; command: string; createdAt: string } } };
-      const worktreePath = locateHarnessWorktree(fixture.invoked, `dev/${runId}`);
-      expect(output.error).toMatch(/not-a-directory|ENOTDIR/);
+      expect(result.status, `${result.stdout ?? ''}${result.stderr ?? ''}`).toBe(1);
+      const jsonStart = result.stdout.lastIndexOf('\n{');
+      expect(jsonStart, result.stdout).toBeGreaterThanOrEqual(0);
+      const output = JSON.parse(result.stdout.slice(jsonStart + 1)) as { error: string; autoWorktree: { environment: { branch: string }; worktree: { path: string; branch: string; owner: string; command: string; createdAt: string } } };
+      const worktreePath = findHarnessWorktree(fixture.invoked, `dev/${runId}`).path;
+      expect(worktreePath).toBeDefined();
+      expect(output.error).toMatch(/held elanous TUI owner exited before registering a PTY/);
+      expect(result.stdout).toContain('"held":false');
+      const ownerLogPath = output.error.match(/전문: (.+\.log)\)/)?.[1];
+      expect(ownerLogPath).toBeDefined();
+      const ownerLog = readFileSync(ownerLogPath!, 'utf8');
+      assertNoProductionConfigMaterialization(ownerLog);
+      expect(ownerLog).toContain(`cannot establish isolated elanous TUI root at ${invalidIsolationRoot}`);
+      expect(ownerLog).toContain('EEXIST');
       expect(output.autoWorktree.environment.branch).toBe('main');
-      // 산출이 «실제로 만들어진» 워크트리를 가리키는가 — 위치는 git 이 답한다.
-      expect(output.autoWorktree.worktree).toMatchObject({ path: worktreePath, branch: `dev/${runId}`, owner: `dev:${runId}`, command: 'dev' });
-      // ⛔⭐ 위치 «계약»은 「사람 트리 안에 쓰지 않는다」 하나다(2026-08-02 인시던트).
-      //   디렉토리 «이름 규칙»은 계약이 아니므로 고정하지 않는다(리뷰 #10554 should-fix).
-      expect(worktreePath.startsWith(`${resolve(realpathSync(fixture.invoked))}/`)).toBe(false);
+      expect(output.autoWorktree.worktree).toMatchObject({ branch: `dev/${runId}`, owner: `dev:${runId}`, command: 'dev' });
+      expect(worktreePath!.startsWith(`${realpathSync(fixture.invoked)}/`)).toBe(false);
+      const resolvedDevWorktree = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: output.autoWorktree.worktree.path, encoding: 'utf8' });
+      expect(resolvedDevWorktree.status).toBe(0);
+      expect(resolvedDevWorktree.stdout.trim()).toBe(worktreePath!);
       expect(output.autoWorktree.worktree.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
       expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.command'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe('dev');
+      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.owner'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe(`dev:${runId}`);
+      expect(readFileSync(invalidIsolationRoot, 'utf8')).toBe('blocks directory creation\n');
       testFailed = false;
     } finally {
       // ⛔ 성공/실패 «어느 경로에서도» 판정자에게 다시 물어 지운다(리뷰 must-fix).
@@ -296,14 +316,6 @@ describe('elanous dev — 실험 엔트리 등록·검증(subprocess)', () => {
     }
   }, 30_000);
 
-/** ⛔⭐ 워크트리 «위치»를 손으로 계산하지 않는다 — 판정자(git)에게 묻는다.
- *
- *  실측(2026-08-20): 이 두 시험은 경로를 `<invoked>/../invoked.worktrees/dev-<runId>` 로 «계산»했는데
- *  제품이 워크트리를 사람 트리 옆에서 하니스 루트(`~/.elanous/worktrees/…`) 아래로 옮기면서 빨개졌다.
- *  ⇒ 늙은 것은 제품이 아니라 «시험의 좌표»였다.
- *
- *  ⭐ 그래서 좌표를 «약화»시키는 대신 축을 바꾼다 — 위치는 git 에게 묻고,
- *  대신 ***「사람 트리 «안»에 만들지 않는다」***는 그 이사의 «이유»를 여기서 문다(종전엔 아무도 안 물었다). */
 /** ⛔⭐ 「없다」와 「못 봤다」를 «다른 값»으로 돌려준다 — 이 저장소가 반복해 밟은 축이다.
  *  `{ found }` = 정말 없다(안 만들어졌다) · `{ path }` = 찾았다 · throw = «조회 자체»가 실패했다. */
 function findHarnessWorktree(repoCwd: string, branch: string): { readonly path?: string } {
@@ -318,14 +330,6 @@ function findHarnessWorktree(repoCwd: string, branch: string): { readonly path?:
     if (line.trim() === `branch refs/heads/${branch}` && current) return { path: current };
   }
   return {};
-}
-
-function locateHarnessWorktree(repoCwd: string, branch: string): string {
-  const found = findHarnessWorktree(repoCwd, branch);
-  if (found.path === undefined) {
-    throw new Error(`worktree for branch ${branch} not found (repo=${repoCwd})`);
-  }
-  return found.path;
 }
 
 /** ⛔⭐ 하니스 워크트리는 «사람 트리 밖»(하니스 루트)에 생긴다 —
@@ -390,12 +394,12 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     });
   });
 
-  it('drive --json --worktree runs a real failing child in the created worktree and preserves drive provenance', () => {
+  it('drive --worktree runs a real failing child and preserves git worktree metadata', () => {
     const fixture = createGitFixture(0);
     const runId = `drive-worktree-failure-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     let testFailed = true;
     try {
-      const result = spawnSync('bun', [CLI, '--test', 'drive', 'printf child-dispatch-failed >&2; exit 23', '--goal', 'observe the child failure', '--worktree', '--json'], {
+      const result = spawnSync('bun', [CLI, `--test=${childState}`, 'drive', 'printf child-dispatch-failed >&2; exit 23', '--goal', 'observe the child failure', '--worktree'], {
         cwd: fixture.invoked,
         encoding: 'utf8',
         // ⛔⭐ 이 창은 «고정 상수가 아니라 관측값»이다 — 실측 2026-08-20 (같은 코드, 같은 기계):
@@ -405,17 +409,27 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
         //     (그날 이 저장소의 워크트리가 275개였다 · git worktree 조작이 전수를 훑는다).
         //   ⇒ 그러니 이 값을 다시 올리기 전에 «워크트리 수»를 먼저 재라 —
         //     창을 올리는 것은 증상 완화이고, 수가 늘면 또 넘는다.
-        timeout: 60_000,
-        env: { ...process.env, ELANOUS_RUN_ID: runId },
+        timeout: 60_000, killSignal: 'SIGKILL',
+        env: childEnv({ ELANOUS_RUN_ID: runId, NODE_ENV: 'test' }),
       });
       expect(result.error).toBeUndefined();
+      assertNoProductionConfigMaterialization(`${result.stdout ?? ''}${result.stderr ?? ''}`);
       expect(result.signal).toBeNull();
-      expect(result.status).toBe(23);
-      expect(`${result.stdout}${result.stderr}`).toContain('child-dispatch-failed');
-      const worktreePath = locateHarnessWorktree(fixture.invoked, `dev/${runId}`);
-      expect(worktreePath.startsWith(`${resolve(realpathSync(fixture.invoked))}/`)).toBe(false);
-      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.owner'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe(`dev:${runId}`);
+      expect(result.status, `${result.stdout ?? ''}${result.stderr ?? ''}`).toBe(23);
+      // PTY merges child stderr into the CLI stdout stream; require the actual output, not the echoed command.
+      expect(result.stdout).toMatch(/(?:^|\n)child-dispatch-failed(?:\r?\n|$)/);
+      const worktreePath = findHarnessWorktree(fixture.invoked, `dev/${runId}`).path;
+      expect(worktreePath).toBeDefined();
+      const reportedPath = result.stdout.match(/^worktree\.path: (.+)$/m)?.[1];
+      expect(reportedPath).toBeDefined();
+      const resolvedDriveWorktree = spawnSync('git', ['rev-parse', '--show-toplevel'], { cwd: reportedPath!, encoding: 'utf8' });
+      expect(resolvedDriveWorktree.status).toBe(0);
+      expect(resolvedDriveWorktree.stdout.trim()).toBe(worktreePath!);
+      expect(result.stdout).toContain(`worktree.branch: dev/${runId}`);
+      expect(result.stdout).toContain(`worktree.command: drive`);
+      expect(worktreePath!.startsWith(`${realpathSync(fixture.invoked)}/`)).toBe(false);
       expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.command'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe('drive');
+      expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.owner'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toBe(`dev:${runId}`);
       expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.createdAt'], { cwd: worktreePath, encoding: 'utf8' }).stdout.trim()).toMatch(/^\d{4}-\d{2}-\d{2}T/);
       testFailed = false;
     } finally {
@@ -434,11 +448,13 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     expect(selfImplement.out).toContain('--observe-only');
   });
 
-  it('external backend + --branch 누락 → 거부(exit≠0)', () => {
+  it('external backend + --branch 누락 → agent-mission 대응 명령을 안내하고 branch 부재를 거부한다', () => {
     const r = run(['dev', '기능', '--backend', 'codex']);
     expect(r.code).not.toBe(0);
-    expect(r.out).toContain('--branch');
-  });
+    expect(r.out).toContain('elanous agent-mission mission --backend codex');
+    expect(r.out).toMatch(/--branch.*(?:필수|필요|없)/);
+    expect(r.out).not.toContain('무효한 옵션: context');
+  }, 30_000);
 
   it('--file 과 <text> 동시 → 상호배타 거부(exit≠0·조용한 무시 없음)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'devcli-'));
@@ -494,18 +510,14 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
     }
   }, 15_000);
 
-  // ⚠️ 이 케이스만 실제 제어 루프를 끝까지 돈다 — `exit 7` 은 즉시 죽지만 루프는 그 사실을
-  //    brain 에게 한 번 물어본 뒤에야 수렴하므로(자식 사망 판정이 decide 뒤에 있다) 실 LLM
-  //    왕복 1회가 낀다. 실측 5.5초 > 기본 한도 5초라 넘겨야 한다. 자격증명이 없으면 brain 이
-  //    fail-fast 하고 error 로 수렴하는데, 그때도 **자식의 exit 7 이 그대로 나와야** 한다
-  //    (그것이 이 테스트가 지키는 계약 — 루프의 판정이 아니라 자식의 상태가 답이다).
+  // 실제 셸 제어 루프는 임시 cwd 에서만 구동한다. 자격증명 없이도 자식 종료 코드를 전파한다.
   it('drive subprocess는 실제 shell child exit code를 그대로 전파한다', () => {
-    const r = run(['drive', 'exit 7', '--goal', 'finish', '--poll-ms', '0']);
-    expect(r.code).toBe(7);
+    const r = run(['drive', 'exit 7', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
+    expect(r.code, r.out).toBe(7);
   }, 30_000);
 
   it('drive subprocess는 성공 자식의 exit 0 도 그대로 전파한다', () => {
-    const r = run(['drive', 'true', '--goal', 'finish', '--poll-ms', '0']);
+    const r = run(['drive', 'true', '--goal', 'finish', '--poll-ms', '0', '--cwd', childRoot]);
     expect(r.code).toBe(0);
   }, 30_000);
 
@@ -515,7 +527,7 @@ function cleanupHarnessWorktree(repoCwd: string, branch: string, testAlreadyFail
       expect(r.code).not.toBe(0);
       expect(r.out).toContain('drive: 지원하지 않는 옵션');
     }
-  });
+  }, 30_000);
 
   it('U6 — --backend self --transport acp → 거부(self 는 transport-free·silent-ignore 금지)', () => {
     const r = run(['dev', '기능', '--backend', 'self', '--transport', 'acp']);
@@ -602,7 +614,7 @@ describe('은퇴 입구가 «사람 눈에» 닿는다 (subprocess · RFC-one-do
     expect(help.code, help.out).toBe(0);
     expect(help.out).toContain('DEPRECATED');
     expect(help.out).toContain('cli-harness-dogfood');       // 어느 입구인지 «이름»으로
-    expect(help.out).toContain('elanous dev --ask');           // ⛔ 갈 곳이 «있어야» 한다
+    expect(help.out).toContain('elanous harness ask <골문서>'); // ⛔ 갈 곳이 «있어야» 한다
     // ⭐ 원래 설명을 «잃지 않는다» — 앞에 붙일 뿐이다.
     expect(help.out).toContain('RunDevHarness로 HITL 유지');
   }, 60_000);

@@ -1,0 +1,12 @@
+{
+  "name": "video-broll",
+  "version": "0.1.0",
+  "description": "Cut word-timed motion B-roll into a talking-head video.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "video-broll",
+    "shortDescription": "Word-timed motion B-roll for talking-head videos",
+    "developerName": "ElanvitalAI",
+    "category": "Productivity"
+  }
+}

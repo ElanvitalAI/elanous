@@ -52,15 +52,16 @@ Every round is saved under the state folder (`graph-runs/stale-draft-digest/`), 
 
 ## 4. Put it on a trigger
 
-```bash
-elanous schedule create --cron "0 9 * * *" \
-  --command "elanous graph run graphs/examples/stale-draft-digest/stale-draft-digest.yaml" --dry-run   # see the plan
-```
+The graph's own `loop.trigger` (here `cron: "0 9 * * *"`) is the schedule:
 
-Drop `--dry-run` to register it. `elanous schedule disable <id>` pauses it.
+```bash
+elanous loop start stale-draft-digest          # preview the crontab change
+elanous loop start stale-draft-digest --yes    # apply it
+elanous loop stop stale-draft-digest --yes     # remove it again
+```
 
 ## 5. Going further
 
 - **Decide, don't just run** — a `judge` step can send a round back (for example "the report is empty → collect again") within `max_visits`.
 - **Ask a person** — a `hitl` step with a recipe `approval: "<question>"` stops the round until someone approves.
-- **Your own step kinds and sharing** — a plugin can add step kinds (`nodes`) and ship whole loops; see [Build a plugin](build-a-plugin.md). Sharing a loop through a marketplace by name is coming.
+- **Your own step kinds and sharing** — a plugin can add step kinds (`nodes`) and ship whole loops; see [Build a plugin](build-a-plugin.md). Package the loop in a plugin and others install it by name: `elanous plugin add <plugin>@<market>`.

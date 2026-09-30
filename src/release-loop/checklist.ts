@@ -1,0 +1,191 @@
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { Database } from 'bun:sqlite';
+import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { debug } from '../debug/log.js';
+import { releaseLedgerRoot } from '../instance/resolve.js';
+
+export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done';
+export interface ChecklistItem {
+  id: string;
+  title: string;
+  status: ChecklistStatus;
+  owner?: string;
+  evidence?: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+export interface ChecklistHistory {
+  at: string;
+  by: string;
+  id: string;
+  field: string;
+  from: unknown;
+  to: unknown;
+  released: string;
+  dev: string;
+}
+export interface Checklist {
+  version: string;
+  released: string;
+  dev: string;
+  items: ChecklistItem[];
+  history: ChecklistHistory[];
+}
+
+export function devVersion(): string {
+  return (JSON.parse(readFileSync(join(import.meta.dir, '..', '..', 'package.json'), 'utf8')) as { version: string }).version;
+}
+
+function releasedVersion(): string {
+  const dir = join(releaseLedgerRoot(), 'release');
+  if (!existsSync(dir)) return '';
+  return readdirSync(dir).filter((v) => /^\d+\.\d+\.\d+$/.test(v) && existsSync(join(dir, v, 'release.json')))
+    .filter((v) => {
+      try { const record = JSON.parse(readFileSync(join(dir, v, 'release.json'), 'utf8')) as { version?: string; publishedAt?: string }; return record.version === v && typeof record.publishedAt === 'string'; }
+      catch { return false; }
+    })
+    .sort((a, b) => {
+      const aa = a.split('.').map(Number), bb = b.split('.').map(Number);
+      return (bb[0]! - aa[0]!) || (bb[1]! - aa[1]!) || (bb[2]! - aa[2]!);
+    })[0] ?? '';
+}
+
+function pathFor(v: string): string {
+  if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(v)) throw new Error(`체크리스트 판이 아니다: ${v}`);
+  return join(releaseLedgerRoot(), 'release', v, 'checklist.json');
+}
+
+export function listChecklist(v: string): Checklist {
+  const path = pathFor(v);
+  if (existsSync(path)) {
+    const data = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
+    refresh(data);
+    return data;
+  }
+  return { version: v, released: releasedVersion(), dev: devVersion(), items: [], history: [] };
+}
+
+// SQLite's OS-backed write lock is released when the owning process exits, even without a finally block.
+// Hold it across the JSON read/modify/atomic-rename sequence so writers never use stale snapshots.
+function mutate(v: string, apply: (data: Checklist) => boolean): Checklist {
+  const path = pathFor(v);
+  mkdirSync(dirname(path), { recursive: true });
+  const lock = `${path}.mutex.sqlite`;
+  const db = new Database(lock, { create: true, strict: true });
+  try {
+    chmodSync(lock, 0o600);
+    db.exec('PRAGMA busy_timeout = 10000');
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const data = listChecklist(v);
+      if (apply(data)) save(v, data);
+      db.exec('COMMIT');
+      return data;
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  } finally { db.close(); }
+}
+
+function save(v: string, data: Checklist): void {
+  const path = pathFor(v);
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+    chmodSync(temp, 0o600);
+    renameSync(temp, path);
+  } finally { if (existsSync(temp)) rmSync(temp); }
+}
+
+function change(data: Checklist, id: string, field: string, from: unknown, to: unknown, by: string, at: string): void {
+  data.history.push({ at, by, id, field, from: from ?? null, to: to ?? null, released: data.released, dev: data.dev });
+  debug.log('release-loop.checklist', 'change', { version: data.version, id, field, from: from ?? null, to: to ?? null, by });
+}
+
+function refresh(data: Checklist): void { data.released = releasedVersion(); data.dev = devVersion(); }
+
+export function addItem(v: string, input: { id: string; title: string; owner?: string }): Checklist {
+  if (!input.id.trim()) throw new Error('칸 id 가 비었다');
+  if (!input.title.trim()) throw new Error('칸 제목이 비었다');
+  return mutate(v, (data) => {
+    if (data.items.some((item) => item.id === input.id)) throw new Error(`이미 있는 칸: ${input.id}`);
+    const by = process.env.ELANOUS_TRACK || 'cli';
+    const at = new Date().toISOString();
+    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), updatedAt: at, updatedBy: by };
+    data.items.push(item);
+    change(data, item.id, 'add', null, item, by, at);
+    return true;
+  });
+}
+
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string }, by: string): Checklist {
+  return mutate(v, (data) => {
+    const item = data.items.find((i) => i.id === id);
+    if (!item) throw new Error(`없는 칸: ${id}`);
+    if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new Error(`잘못된 상태: ${patch.status}`);
+    const fields = (['evidence', 'owner', 'status'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
+    if (fields.length === 0) return false;
+    const at = new Date().toISOString();
+    for (const field of fields) {
+      const from = item[field];
+      const to = patch[field]!;
+      (item as unknown as Record<string, unknown>)[field] = to;
+      item.updatedAt = at;
+      item.updatedBy = by;
+      change(data, id, field, from, to, by, at);
+    }
+    return true;
+  });
+}
+
+export function removeItem(v: string, id: string, by: string): Checklist {
+  return mutate(v, (data) => {
+    const index = data.items.findIndex((i) => i.id === id);
+    if (index < 0) throw new Error(`없는 칸: ${id}`);
+    const at = new Date().toISOString();
+    const [item] = data.items.splice(index, 1);
+    change(data, id, 'remove', item, null, by, at);
+    return true;
+  });
+}
+
+export function summarize(v: string): ChecklistSummary {
+  return summarizeChecklist(listChecklist(v));
+}
+
+export interface ChecklistSummary { green: number; yellow: number; red: number; done: number; blocked: string[]; byOwner: Record<string, number> }
+
+export function summarizeChecklist(data: Checklist): ChecklistSummary {
+  const summary = { green: 0, yellow: 0, red: 0, done: 0, blocked: [] as string[], byOwner: Object.create(null) as Record<string, number> };
+  for (const item of data.items) {
+    summary[item.status]++;
+    if (item.status === 'red') summary.blocked.push(item.id);
+    const owner = item.owner ?? 'unassigned';
+    summary.byOwner[owner] = (summary.byOwner[owner] ?? 0) + 1;
+  }
+  return summary;
+}
+
+export function seedFromRoadmap(v: string, markdown: string): Checklist {
+  return mutate(v, (data) => {
+    let added = false;
+    for (const line of markdown.split('\n')) {
+      const match = /^\|\s*(K\d+[a-z]?[′']?)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|/.exec(line);
+      if (!match || data.items.some((i) => i.id === match[1])) continue;
+      const id = match[1]!;
+      const title = match[2]!;
+      const icon = match[3]!.trim();
+      const status: ChecklistStatus = icon.startsWith('🟢') ? 'green' : icon.startsWith('🔴') ? 'red' : icon.startsWith('✅') ? 'done' : 'yellow';
+      const at = new Date().toISOString();
+      const by = process.env.ELANOUS_TRACK || 'cli';
+      const item: ChecklistItem = { id, title, status, updatedAt: at, updatedBy: by };
+      data.items.push(item);
+      change(data, id, 'add', null, item, by, at);
+      added = true;
+    }
+    return added;
+  });
+}

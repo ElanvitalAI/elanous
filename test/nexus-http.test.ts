@@ -38,6 +38,9 @@ function makeFixture(): { state: ReturnType<typeof createNexusState>; registry: 
   return { state, registry, bus };
 }
 
+const AUTH = { authorization: 'Bearer test-token' };
+const META_API = { bearerToken: 'test-token', noAuth: false };
+
 async function uniquePort(): Promise<number> {
   // Pick a port unlikely to collide with parallel tests.
   return 41000 + Math.floor(Math.random() * 2000);
@@ -95,10 +98,20 @@ describe('NexusEventBus', () => {
 });
 
 describe('HTTP routes (read-only)', () => {
+  test('without metaApi, private route returns 401 before tab lookup', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: await uniquePort() });
+    try {
+      const res = await fetch(`${srv.url}/v1/nexus/tabs/nope`);
+      expect(res.status).toBe(401);
+      await expect(res.json()).resolves.toEqual({ error: 'unauthorized' });
+    } finally { srv.stop(); }
+  });
+
   test('GET /v1/health returns aggregate counts', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
       const res = await fetch(`${srv.url}/v1/health`);
       const body = await res.json();
@@ -114,9 +127,9 @@ describe('HTTP routes (read-only)', () => {
     const fix = makeFixture();
     pushEvent(fix.state, { kind: 'nexus.boot' });
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const res = await fetch(`${srv.url}/v1/nexus`);
+      const res = await fetch(`${srv.url}/v1/nexus`, { headers: AUTH });
       const body = await res.json();
       expect(body.tabs).toHaveLength(2);
       expect(body.recentEvents.length).toBeGreaterThan(0);
@@ -127,9 +140,9 @@ describe('HTTP routes (read-only)', () => {
   test('GET /v1/nexus/tabs?kind=chat filters by kind', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const res = await fetch(`${srv.url}/v1/nexus/tabs?kind=chat`);
+      const res = await fetch(`${srv.url}/v1/nexus/tabs?kind=chat`, { headers: AUTH });
       const body = await res.json();
       expect(body.tabs).toHaveLength(1);
       expect(body.tabs[0].spec.id).toBe('chat:1');
@@ -139,9 +152,9 @@ describe('HTTP routes (read-only)', () => {
   test('GET /v1/nexus/tabs?kind=bogus returns 400', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const res = await fetch(`${srv.url}/v1/nexus/tabs?kind=bogus`);
+      const res = await fetch(`${srv.url}/v1/nexus/tabs?kind=bogus`, { headers: AUTH });
       expect(res.status).toBe(400);
     } finally { srv.stop(); }
   });
@@ -151,9 +164,9 @@ describe('HTTP routes (read-only)', () => {
     pushEvent(fix.state, { kind: 'tab.up', tabId: 'chat:1' });
     pushEvent(fix.state, { kind: 'tab.up', tabId: 'webterm:1' });
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const res = await fetch(`${srv.url}/v1/nexus/tabs/chat:1`);
+      const res = await fetch(`${srv.url}/v1/nexus/tabs/chat:1`, { headers: AUTH });
       const body = await res.json();
       expect(body.tab.spec.id).toBe('chat:1');
       // Filtered to this tab id only.
@@ -164,9 +177,9 @@ describe('HTTP routes (read-only)', () => {
   test('GET /v1/nexus/tabs/:id 404s unknown id', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const res = await fetch(`${srv.url}/v1/nexus/tabs/nope`);
+      const res = await fetch(`${srv.url}/v1/nexus/tabs/nope`, { headers: AUTH });
       expect(res.status).toBe(404);
     } finally { srv.stop(); }
   });
@@ -174,9 +187,9 @@ describe('HTTP routes (read-only)', () => {
   test('unknown route returns 404 json', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const res = await fetch(`${srv.url}/v1/somewhere/else`);
+      const res = await fetch(`${srv.url}/v1/somewhere/else`, { headers: AUTH });
       expect(res.status).toBe(404);
       const body = await res.json();
       expect(body.error).toBe('not-found');
@@ -186,9 +199,9 @@ describe('HTTP routes (read-only)', () => {
   test('non-GET method returns 405', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const res = await fetch(`${srv.url}/v1/health`, { method: 'POST' });
+      const res = await fetch(`${srv.url}/v1/health`, { method: 'POST', headers: AUTH });
       expect(res.status).toBe(405);
     } finally { srv.stop(); }
   });
@@ -196,9 +209,9 @@ describe('HTTP routes (read-only)', () => {
   test('port auto-pick advances when first port is busy', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const blocker = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const blocker = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
-      const next = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+      const next = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
       try {
         expect(next.port).toBeGreaterThan(port);
         expect(next.port).toBeLessThanOrEqual(port + 16);
@@ -211,10 +224,10 @@ describe('SSE /v1/events', () => {
   test('streams events filtered by topic prefix', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
       const ctrl = new AbortController();
-      const res = await fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl.signal });
+      const res = await fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl.signal, headers: AUTH });
       expect(res.status).toBe(200);
       expect(res.headers.get('content-type') ?? '').toContain('text/event-stream');
 
@@ -248,10 +261,10 @@ describe('SSE /v1/events', () => {
   test('PR b · empty topics param = receive all events (wildcard)', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
       const ctrl = new AbortController();
-      const res = await fetch(`${srv.url}/v1/events`, { signal: ctrl.signal });
+      const res = await fetch(`${srv.url}/v1/events`, { signal: ctrl.signal, headers: AUTH });
       expect(res.status).toBe(200);
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
@@ -276,10 +289,10 @@ describe('SSE /v1/events', () => {
   test('PR b · multiple prefixes match by union', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
       const ctrl = new AbortController();
-      const res = await fetch(`${srv.url}/v1/events?topics=tab.,nexus.`, { signal: ctrl.signal });
+      const res = await fetch(`${srv.url}/v1/events?topics=tab.,nexus.`, { signal: ctrl.signal, headers: AUTH });
       const reader = res.body!.getReader();
       const decoder = new TextDecoder();
       let buf = '';
@@ -305,13 +318,13 @@ describe('SSE /v1/events', () => {
   test('PR b · multiple subscribers each receive matching frames', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
       const ctrl1 = new AbortController();
       const ctrl2 = new AbortController();
       const [res1, res2] = await Promise.all([
-        fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl1.signal }),
-        fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl2.signal }),
+        fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl1.signal, headers: AUTH }),
+        fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl2.signal, headers: AUTH }),
       ]);
       const r1 = res1.body!.getReader();
       const r2 = res2.body!.getReader();
@@ -339,10 +352,10 @@ describe('SSE /v1/events', () => {
   test('PR b · frame format follows SSE spec (event: + data: pair)', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
       const ctrl = new AbortController();
-      const res = await fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl.signal });
+      const res = await fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl.signal, headers: AUTH });
       const reader = res.body!.getReader();
       const dec = new TextDecoder();
       let buf = '';
@@ -364,11 +377,11 @@ describe('SSE /v1/events', () => {
   test('PR b · subscriber count returns to baseline after client abort', async () => {
     const fix = makeFixture();
     const port = await uniquePort();
-    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
+    const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port, metaApi: META_API });
     try {
       const baseline = fix.bus.size();
       const ctrl = new AbortController();
-      const res = await fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl.signal });
+      const res = await fetch(`${srv.url}/v1/events?topics=tab.`, { signal: ctrl.signal, headers: AUTH });
       // Drain initial comment frame so the subscriber is registered.
       const reader = res.body!.getReader();
       await reader.read();

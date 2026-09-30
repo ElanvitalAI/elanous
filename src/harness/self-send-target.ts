@@ -1,12 +1,15 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
+import { normalizeRunId } from './harness-space.js';
 import { controlInboxPath, type ControlMemoPayload } from './control-inbox.js';
 import { sendPodControl } from './pod-control-send.js';
 import type { Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 
 export interface PodFragmentRecord {
   spaceId: string;
+  runId?: string;
+  parentRunId?: string;
   context: string;
   namespace: string;
   job: string;
@@ -27,6 +30,24 @@ export function readPodFragment(spaceId: string, env?: NodeJS.ProcessEnv): PodFr
 
 export function podFragmentFinished(spaceId: string, env?: NodeJS.ProcessEnv): boolean {
   return existsSync(`${podRecordPath(spaceId, env)}.finished`);
+}
+
+export function listPodFragmentsForRun(runId: string, env?: NodeJS.ProcessEnv): PodFragmentRecord[] {
+  if (!runId || runId !== normalizeRunId(runId)) return [];
+  const dir = dirname(podRecordPath('fragment', env));
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return []; }
+  const suffix = '.inbox.pod.json';
+  const matches: PodFragmentRecord[] = [];
+  for (const name of names) {
+    if (!name.endsWith(suffix)) continue;
+    const spaceId = name.slice(0, -suffix.length);
+    if (podFragmentFinished(spaceId, env)) continue;
+    const record = readPodFragment(spaceId, env);
+    if (record && ((record.runId === runId && normalizeRunId(record.runId) === runId)
+      || (record.parentRunId === runId && normalizeRunId(record.parentRunId) === runId))) matches.push(record);
+  }
+  return matches;
 }
 
 export function writePodFragment(record: PodFragmentRecord, env?: NodeJS.ProcessEnv): void {

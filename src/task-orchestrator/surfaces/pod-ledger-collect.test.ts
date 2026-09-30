@@ -1,11 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { appendRunLedgerEntry, runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { collectPodLedgers, createPodLedgerFollower, parsePodLedgerChunks } from './pod-ledger-collect.js';
-import { writeFileSync } from 'node:fs';
 
 const runId = 'run-12345678-1234-1234-1234-123456789abc';
 const otherId = 'run-87654321-1234-1234-1234-123456789abc';
@@ -117,7 +117,7 @@ describe('pod ledger live follower', () => {
     const podFile = ['{"a":1}\n{"b":', '2}\n{"c":3}\n'];
     let served = 0;
     const scripts: string[] = [];
-    const f = createPodLedgerFollower({ runId, dir, log: noLog, exec: (script) => { scripts.push(script); return { status: 0, stdout: podFile[served++] ?? '', stderr: '' }; } });
+    const f = createPodLedgerFollower({ runId, dir, log: noLog, exec: (script) => { scripts.push(script); return { status: 0, stdout: `${podFile[served++] ?? ''}\nELANOUS_ACTIVITY 0\n`, stderr: '' }; } });
     f.poll();
     expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('{"a":1}\n');   // 반쪽 줄은 잡아 둔다
     f.poll();
@@ -153,7 +153,7 @@ describe('pod ledger live follower', () => {
         runId, dir, now: () => minute * 60_000,
         log: (_c, event, data) => events.push({ event, data }),
         onStall: (message) => messages.push(message),
-        exec: () => ({ status: 0, stdout: chunks.shift() ?? '', stderr: '' }),
+        exec: () => ({ status: 0, stdout: `${chunks.shift() ?? ''}\nELANOUS_ACTIVITY 0\n`, stderr: '' }),
       });
       chunks.push('{"event":"pipeline-node-entry"}\n');
       f.poll();
@@ -164,7 +164,7 @@ describe('pod ledger live follower', () => {
       expect(events.filter(({ event }) => event === 'stalled')).toEqual([{
         event: 'stalled', data: { runId, lastProgressEvent: 'pipeline-node-entry', idleMinutes: 30 },
       }]);
-      expect(messages).toEqual(['[pod] 진행 없음 30분 — 마지막 진행 pipeline-node-entry']);
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장·작업 트리 모두 조용함 · 마지막 진행 pipeline-node-entry']);
       expect(events.filter(({ event }) => event === 'ledger-live-appended')).toHaveLength(41);
       expect(events[0]).toEqual({ event: 'ledger-live-appended', data: {
         runId, lines: 1, bytes: Buffer.byteLength('{"event":"pipeline-node-entry"}\n'),
@@ -190,8 +190,8 @@ describe('pod ledger live follower', () => {
         { event: 'stalled', data: { runId, lastProgressEvent: 'gated', idleMinutes: 30 } },
       ]);
       expect(messages).toEqual([
-        '[pod] 진행 없음 30분 — 마지막 진행 pipeline-node-entry',
-        '[pod] 진행 없음 30분 — 마지막 진행 gated',
+        '[pod] 진행 없음 30분 — 원장·작업 트리 모두 조용함 · 마지막 진행 pipeline-node-entry',
+        '[pod] 진행 없음 30분 — 원장·작업 트리 모두 조용함 · 마지막 진행 gated',
       ]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -206,7 +206,7 @@ describe('pod ledger live follower', () => {
         runId, dir, now: () => minute * 60_000, stallMinutes: 30,
         log: (_c, event, data) => events.push({ event, data }),
         onStall: (message) => messages.push(message),
-        exec: () => ({ status: 0, stdout: 'not json\n', stderr: '' }),
+        exec: () => ({ status: 0, stdout: 'not json\n\nELANOUS_ACTIVITY 0\n', stderr: '' }),
       });
       f.poll();
       minute = 35;
@@ -220,9 +220,9 @@ describe('pod ledger live follower', () => {
       f.poll();
       expect(events.filter(({ event }) => event === 'stalled').map(({ data }) => data.idleMinutes)).toEqual([35, 60, 90]);
       expect(messages).toEqual([
-        '[pod] 진행 없음 35분 — 마지막 진행 없음',
-        '[pod] 진행 없음 60분 — 마지막 진행 없음',
-        '[pod] 진행 없음 90분 — 마지막 진행 없음',
+        '[pod] 진행 없음 35분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음',
+        '[pod] 진행 없음 60분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음',
+        '[pod] 진행 없음 90분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음',
       ]);
       expect(events.some(({ event }) => event === 'stall-cleared')).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -238,7 +238,7 @@ describe('pod ledger live follower', () => {
         runId, dir, now: () => minute * 60_000,
         log: (_c, event, data) => events.push({ event, data }),
         onStall: (message) => messages.push(message),
-        exec: () => ({ status: 0, stdout: '', stderr: '' }),
+        exec: () => ({ status: 0, stdout: '\nELANOUS_ACTIVITY 0\n', stderr: '' }),
       });
       f.poll();
       minute = 180;
@@ -246,7 +246,7 @@ describe('pod ledger live follower', () => {
       expect(events.filter(({ event }) => event === 'stalled')).toEqual([
         { event: 'stalled', data: { runId, lastProgressEvent: null, idleMinutes: 180 } },
       ]);
-      expect(messages).toEqual(['[pod] 진행 없음 180분 — 마지막 진행 없음']);
+      expect(messages).toEqual(['[pod] 진행 없음 180분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음']);
       minute = 209;
       f.poll();
       expect(messages).toHaveLength(1);
@@ -254,8 +254,8 @@ describe('pod ledger live follower', () => {
       f.poll(); f.poll();
       expect(events.filter(({ event }) => event === 'stalled').map(({ data }) => data.idleMinutes)).toEqual([180, 210]);
       expect(messages).toEqual([
-        '[pod] 진행 없음 180분 — 마지막 진행 없음',
-        '[pod] 진행 없음 210분 — 마지막 진행 없음',
+        '[pod] 진행 없음 180분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음',
+        '[pod] 진행 없음 210분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음',
       ]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -270,12 +270,12 @@ describe('pod ledger live follower', () => {
         runId, dir, now: () => minute * 60_000,
         log: (_c, event, data) => events.push({ event, data }),
         onStall: (message) => messages.push(message),
-        exec: () => ({ status: 0, stdout: '', stderr: '' }),
+        exec: () => ({ status: 0, stdout: '\nELANOUS_ACTIVITY 0\n', stderr: '' }),
       });
       f.poll();
       for (minute of [30, 60, 90]) { f.poll(); f.poll(); }
       expect(events.filter(({ event }) => event === 'stalled').map(({ data }) => data.idleMinutes)).toEqual([30, 60, 90]);
-      expect(messages).toEqual([30, 60, 90].map((n) => `[pod] 진행 없음 ${n}분 — 마지막 진행 없음`));
+      expect(messages).toEqual([30, 60, 90].map((n) => `[pod] 진행 없음 ${n}분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음`));
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -288,7 +288,7 @@ describe('pod ledger live follower', () => {
       const f = createPodLedgerFollower({
         runId, dir, now: () => minute * 60_000, stallMinutes: 5,
         log: (_c, event, data) => events.push({ event, data }), onStall: () => {},
-        exec: () => ({ status: 0, stdout: chunks.shift() ?? '', stderr: '' }),
+        exec: () => ({ status: 0, stdout: `${chunks.shift() ?? ''}\nELANOUS_ACTIVITY 0\n`, stderr: '' }),
       });
       f.poll();
       minute = 5;
@@ -311,10 +311,326 @@ describe('pod ledger live follower', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  test('worktree changes keep a ledger-silent child alive and activity logs are throttled', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-'));
+    try {
+      let minute = 0;
+      let files = 1;
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({
+        runId, dir, now: () => minute * 60_000,
+        log: (_c, event, data) => events.push({ event, data }),
+        onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: `\nELANOUS_ACTIVITY ${files}\n`, stderr: '' }),
+      });
+      for (minute = 0; minute <= 35; minute++) f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toEqual([]);
+      expect(messages).toEqual([]);
+      expect(events.filter(({ event }) => event === 'worktree-activity')).toHaveLength(8);
+      expect(events.filter(({ event }) => event === 'worktree-activity')[0]).toEqual({ event: 'worktree-activity', data: { runId, files: 1 } });
+      expect(f.owned).toBe(false);
+      minute = 36;
+      files = 0;
+      f.poll();
+      expect(messages).toEqual([]);
+      minute = 65;
+      f.poll();
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장·작업 트리 모두 조용함 · 마지막 진행 worktree-activity']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('ledger and activity stay byte-separated, including a split ledger line', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-bytes-'));
+    try {
+      const bytes = ['{"event":"start"}\n{"event":"fin', 'ish"}\n'];
+      const scripts: string[] = [];
+      let index = 0;
+      const f = createPodLedgerFollower({ runId, dir, log: noLog, exec: (script) => {
+        scripts.push(script);
+        return { status: 0, stdout: `${bytes[index++] ?? ''}\nELANOUS_ACTIVITY 2\n`, stderr: '' };
+      } });
+      f.poll(); f.poll();
+      expect(readFileSync(runLedgerPath(runId, dir)).equals(Buffer.from(bytes.join('')))).toBe(true);
+      expect(scripts[1]).toContain(`tail -c +${Buffer.byteLength(bytes[0]!) + 1} `);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a ledger event containing the activity marker text remains intact', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-text-'));
+    try {
+      const bytes = '{"event":"ELANOUS_ACTIVITY recorded"}\n';
+      const f = createPodLedgerFollower({ runId, dir, log: noLog,
+        exec: () => ({ status: 0, stdout: `${bytes}\nELANOUS_ACTIVITY 0\n`, stderr: '' }),
+      });
+      f.poll();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(bytes);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('measurement failure falls back to ledger progress and marks the warning as unmeasured', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-failure-'));
+    try {
+      let minute = 0;
+      const events: string[] = [];
+      const messages: string[] = [];
+      const chunks = ['{"event":"start"}\n\nELANOUS_ACTIVITY 0\n', '\nELANOUS_ACTIVITY_ERROR\n', '\nELANOUS_ACTIVITY nonsense\n'];
+      const f = createPodLedgerFollower({ runId, dir, now: () => minute * 60_000,
+        log: (_c, event) => events.push(event), onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: chunks.shift() ?? '\nELANOUS_ACTIVITY_ERROR\n', stderr: '' }),
+      });
+      f.poll();
+      minute = 15;
+      f.poll();
+      minute = 30;
+      f.poll();
+      expect(events.filter((event) => event === 'stalled')).toHaveLength(1);
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장 조용함 · 마지막 진행 start (작업 트리 못 잼)']);
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('{"event":"start"}\n');
+      minute = 31;
+      chunks.push('{"event":"resumed"}\n');
+      f.poll();
+      expect(events.filter((event) => event === 'stall-cleared')).toHaveLength(1);
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('{"event":"start"}\n{"event":"resumed"}\n');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('exec command errors cannot claim the worktree was quiet', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-exec-failure-'));
+    try {
+      let minute = 0;
+      const messages: string[] = [];
+      const events: string[] = [];
+      const f = createPodLedgerFollower({ runId, dir, now: () => minute * 60_000,
+        onStall: (message) => messages.push(message), log: (_c, event) => events.push(event),
+        exec: () => ({ status: 1, stdout: '', stderr: 'exec failed' }),
+      });
+      minute = 30;
+      f.poll();
+      expect(events).toEqual(['ledger-live-unavailable', 'stalled']);
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장 못 잼 · 마지막 진행 없음 (작업 트리 못 잼)']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  function ownedTree(root: string, name: string, id = runId): string {
+    const path = join(root, 'worktrees', 'repo-hash', 'repo.worktrees', name);
+    mkdirSync(path, { recursive: true });
+    expect(spawnSync('git', ['init', '-q', path]).status).toBe(0);
+    expect(spawnSync('git', ['-C', path, 'config', 'extensions.worktreeConfig', 'true']).status).toBe(0);
+    expect(spawnSync('git', ['-C', path, 'config', '--worktree', 'elanous.harness.owner', `dev:${id}`]).status).toBe(0);
+    return path;
+  }
+
+  test('another run changing files cannot suppress this run\'s stall', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-concurrent-'));
+    try {
+      const own = ownedTree(dir, 'own');
+      const other = ownedTree(dir, 'other', otherId);
+      const base = 1_800_000_000_000;
+      let time = base;
+      const messages: string[] = [];
+      const counts: number[] = [];
+      const f = createPodLedgerFollower({ runId, dir: join(dir, 'host'), now: () => time,
+        log: noLog, onStall: (message) => messages.push(message),
+        exec: (command) => {
+          const r = spawnSync('sh', ['-c', command], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' });
+          expect(r.status).toBe(0);
+          const match = /^\nELANOUS_ACTIVITY (\d+)\n$/.exec(r.stdout);
+          expect(match).not.toBeNull();
+          counts.push(Number(match![1]));
+          return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+        },
+      });
+      for (let minute = 1; minute <= 30; minute++) {
+        const file = join(other, 'busy.txt');
+        writeFileSync(file, 'changed');
+        utimesSync(file, (base + minute * 60_000) / 1_000, (base + minute * 60_000) / 1_000);
+        time = base + minute * 60_000;
+        f.poll();
+      }
+      expect(counts).toEqual(Array(30).fill(0));
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음']);
+      const file = join(own, 'active.txt');
+      writeFileSync(file, 'own change');
+      utimesSync(file, (base + 31 * 60_000) / 1_000, (base + 31 * 60_000) / 1_000);
+      time = base + 31 * 60_000;
+      f.poll();
+      expect(counts.at(-1)).toBe(1);
+      expect(messages).toHaveLength(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('two worktrees claiming one run are unmeasured rather than credited as progress', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-ambiguous-'));
+    try {
+      ownedTree(dir, 'first');
+      const second = ownedTree(dir, 'second');
+      const file = join(second, 'busy.txt');
+      writeFileSync(file, 'ambiguous');
+      const base = 1_800_000_000_000;
+      utimesSync(file, (base + 1_000) / 1_000, (base + 1_000) / 1_000);
+      let time = base;
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({ runId, dir: join(dir, 'host'), now: () => time, log: noLog,
+        onStall: (message) => messages.push(message),
+        exec: (command) => {
+          const r = spawnSync('sh', ['-c', command], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' });
+          expect(r.status).toBe(0);
+          expect(r.stdout).toBe('\nELANOUS_ACTIVITY_ERROR\n');
+          return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+        },
+      });
+      time = base + 30 * 60_000;
+      f.poll();
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장 조용함 · 마지막 진행 없음 (작업 트리 못 잼)']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('unattributed worktrees are unmeasured, not quiet or progress', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-unknown-'));
+    try {
+      const other = ownedTree(dir, 'other', otherId);
+      const base = 1_800_000_000_000;
+      const file = join(other, 'busy.txt');
+      writeFileSync(file, 'other run');
+      utimesSync(file, (base + 1_000) / 1_000, (base + 1_000) / 1_000);
+      let time = base;
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({ runId, dir: join(dir, 'host'), now: () => time,
+        log: noLog, onStall: (message) => messages.push(message),
+        exec: (command) => {
+          const r = spawnSync('sh', ['-c', command], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' });
+          expect(r.status).toBe(0);
+          expect(r.stdout).toBe('\nELANOUS_ACTIVITY_ERROR\n');
+          return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+        },
+      });
+      time = base + 30 * 60_000;
+      f.poll();
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장 조용함 · 마지막 진행 없음 (작업 트리 못 잼)']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('real sh command counts a changed regular file but never returns its name or contents', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-shell-'));
+    try {
+      const tree = ownedTree(dir, 'shell-run');
+      mkdirSync(runLedgerDir(dir));
+      const podBytes = '{"event":"pod-start"}\n';
+      writeFileSync(runLedgerPath(runId, runLedgerDir(dir)), podBytes);
+      const base = Date.now();
+      let time = base;
+      writeFileSync(join(tree, 'secret.txt'), 'private content');
+      utimesSync(join(tree, 'secret.txt'), (base + 1_000) / 1_000, (base + 1_000) / 1_000);
+      let script = '';
+      let firstOutput = '';
+      const f = createPodLedgerFollower({ runId, dir: join(dir, 'host'), now: () => time, log: noLog,
+        exec: (command) => {
+          script = command;
+          const r = spawnSync('sh', ['-c', command], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' });
+          firstOutput = r.stdout;
+          return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+        },
+      });
+      time = base + 2_000;
+      f.poll();
+      expect(firstOutput).toBe(`${podBytes}\nELANOUS_ACTIVITY 1\n`);
+      const r = spawnSync('sh', ['-c', script], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' });
+      expect(r.status).toBe(0);
+      expect(r.stdout).toBe(`${podBytes}\nELANOUS_ACTIVITY 1\n`);
+      expect(readFileSync(runLedgerPath(runId, join(dir, 'host')), 'utf8')).toBe(podBytes);
+      expect(r.stdout).not.toContain('secret.txt');
+      expect(r.stdout).not.toContain('private content');
+      mkdirSync(join(tree, 'node_modules'));
+      writeFileSync(join(tree, 'node_modules', 'package.js'), 'private dependency');
+      expect(spawnSync('sh', ['-c', script], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' }).stdout).toBe(`${podBytes}\nELANOUS_ACTIVITY 1\n`);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('real shell follower counts only modifications since the previous poll', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-window-'));
+    try {
+      const tree = ownedTree(dir, 'window-run');
+      const file = join(tree, 'changed.txt');
+      const base = 1_800_000_000_000;
+      let time = base;
+      const counts: number[] = [];
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const f = createPodLedgerFollower({ runId, dir: join(dir, 'host'), now: () => time,
+        log: (_c, event, data) => events.push({ event, data }),
+        exec: (command) => {
+          const r = spawnSync('sh', ['-c', command], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' });
+          expect(r.status).toBe(0);
+          const match = /^\nELANOUS_ACTIVITY (\d+)\n$/.exec(r.stdout);
+          expect(match).not.toBeNull();
+          counts.push(Number(match![1]));
+          return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+        },
+      });
+      writeFileSync(file, 'first');
+      utimesSync(file, (base + 1_000) / 1_000, (base + 1_000) / 1_000);
+      time = base + 2_000;
+      f.poll();
+      time = base + 10_000;
+      f.poll();
+      writeFileSync(file, 'second');
+      utimesSync(file, (base + 11_000) / 1_000, (base + 11_000) / 1_000);
+      time = base + 20_000;
+      f.poll();
+      time = base + 30_000;
+      f.poll();
+      expect(counts).toEqual([1, 0, 1, 0]);
+      expect(events.filter(({ event }) => event === 'worktree-activity')).toEqual([
+        { event: 'worktree-activity', data: { runId, files: 1 } },
+      ]);
+      expect(events.some(({ event }) => event === 'stalled')).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a future-dated file cannot masquerade as progress on repeated real shell polls', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-activity-future-'));
+    try {
+      const tree = ownedTree(dir, 'future-run');
+      const file = join(tree, 'future.txt');
+      const base = 1_800_000_000_000;
+      const future = base + 60 * 60_000;
+      let time = base;
+      const counts: number[] = [];
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({ runId, dir: join(dir, 'host'), now: () => time,
+        log: noLog, onStall: (message) => messages.push(message),
+        exec: (command) => {
+          const r = spawnSync('sh', ['-c', command], { env: { ...process.env, ELANOUS_STATE_DIR: dir }, encoding: 'utf8' });
+          expect(r.status).toBe(0);
+          const match = /^\nELANOUS_ACTIVITY (\d+)\n$/.exec(r.stdout);
+          expect(match).not.toBeNull();
+          counts.push(Number(match![1]));
+          return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+        },
+      });
+      writeFileSync(file, 'unchanged');
+      utimesSync(file, future / 1_000, future / 1_000);
+      time = base + 1_000;
+      f.poll();
+      time = base + 2_000;
+      f.poll();
+      time = base + 30 * 60_000;
+      f.poll();
+      expect(counts).toEqual([0, 0, 0]);
+      expect(messages).toEqual(['[pod] 진행 없음 30분 — 원장·작업 트리 모두 조용함 · 마지막 진행 없음']);
+      time = future + 1_000;
+      f.poll();
+      time = future + 2_000;
+      f.poll();
+      expect(counts).toEqual([0, 0, 0, 1, 0]);
+      expect(messages).toHaveLength(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('the final collection replaces the partial live copy (and only that one)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ledger-live-'));
     const full = '{"a":1}\n{"b":2}\n{"done":true}\n';
-    const f = createPodLedgerFollower({ runId, dir, log: noLog, exec: () => ({ status: 0, stdout: '{"a":1}\n', stderr: '' }) });
+    const f = createPodLedgerFollower({ runId, dir, log: noLog, exec: () => ({ status: 0, stdout: '{"a":1}\n\nELANOUS_ACTIVITY 0\n', stderr: '' }) });
     f.poll();
     collectPodLedgers(transfer(runId, full).join('\n'), { dir, log: noLog, replace: new Set(f.owned ? [runId] : []) });
     expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(full);

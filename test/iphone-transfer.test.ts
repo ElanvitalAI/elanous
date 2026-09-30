@@ -205,9 +205,9 @@ describe('servePushcutFiles', () => {
         const res = await fetch(served.urls[0]!, { signal: AbortSignal.timeout(200) });
         // If we get here, the server was still up — that's a failure.
         expect(res.status).toBeUndefined();
-      } catch {
+      } catch (error) {
         // Expected: server is closed, connect refused.
-        expect(true).toBe(true);
+        expect(error).toBeInstanceOf(TypeError);
       }
     }
   });

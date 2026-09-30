@@ -68,14 +68,12 @@ describe('trigger-event-bridge', () => {
 
   it('no-op when bus unwired', () => {
     setTriggerEventBus(null);
-    // Should not throw.
-    publishTriggerSubscribed({ workflowName: 'wf', nodeId: 'tick', variant: 'schedule' });
-    publishTriggerFired({
+    expect(() => publishTriggerSubscribed({ workflowName: 'wf', nodeId: 'tick', variant: 'schedule' })).not.toThrow();
+    expect(() => publishTriggerFired({
       workflowName: 'wf',
       nodeId: 'tick',
       variant: 'schedule',
       result: { ok: true, runId: 'r' },
-    });
-    expect(true).toBe(true);
+    })).not.toThrow();
   });
 });

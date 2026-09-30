@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { dispatchPodSelfSend, finishPodFragment, readPodFragment, resolveSelfSendTarget, writePodFragment, type SelfSendTargetDeps } from './self-send-target.js';
+import { dispatchPodSelfSend, finishPodFragment, listPodFragmentsForRun, readPodFragment, resolveSelfSendTarget, writePodFragment, type SelfSendTargetDeps } from './self-send-target.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +27,28 @@ test('Pod dispatch uses the recorded target, refuses a finished fragment, and le
     finishPodFragment('pod-a', env);
     expect(readPodFragment('pod-a', env)).toBeNull();
     expect(() => dispatchPodSelfSend('pod-a', { stop: true }, () => { throw new Error('must not exec'); }, env)).toThrow('self send 대상 조각이 이미 끝났다: pod-a');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('listPodFragmentsForRun finds only unfinished records with exact child or parent run IDs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-run-target-'));
+  const env = { ELANOUS_STATE_DIR: root };
+  const base = { context: 'ctx', namespace: 'ns', job: 'job', inboxDir: '/tmp/inbox' };
+  const runId = 'run-123';
+  try {
+    const child = { ...base, spaceId: 'task-child', runId };
+    const parent = { ...base, spaceId: 'task-parent', runId: 'run-other', parentRunId: runId };
+    writePodFragment(child, env);
+    writePodFragment(parent, env);
+    writePodFragment({ ...base, spaceId: 'task-other', runId: 'run-1234' }, env);
+    writePodFragment({ ...base, spaceId: 'task-finished', runId }, env);
+    finishPodFragment('task-finished', env);
+    writePodFragment({ ...base, spaceId: 'task-legacy' }, env);
+    expect(readPodFragment('task-legacy', env)).toEqual({ ...base, spaceId: 'task-legacy' });
+    expect(listPodFragmentsForRun(runId, env).map((record) => record.spaceId).sort()).toEqual(['task-child', 'task-parent']);
+    expect(listPodFragmentsForRun('run-1234', env).map((record) => record.spaceId)).toEqual(['task-other']);
+    expect(listPodFragmentsForRun('run-missing', env)).toEqual([]);
+    expect(listPodFragmentsForRun('run-123/..', env)).toEqual([]);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

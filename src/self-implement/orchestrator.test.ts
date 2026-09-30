@@ -339,7 +339,8 @@ describe('runSelfImplement — shared worktree branch prefix', () => {
         },
       }),
     });
-    expect(createdBranch).toBe(`${WORKTREE_BRANCH_PREFIX}${slugifyFeature('Shared Prefix')}`);
+    expect(createdBranch).toStartWith(`${WORKTREE_BRANCH_PREFIX}${slugifyFeature('Shared Prefix')}-r`);
+    expect(createdBranch).toMatch(/-r[a-z0-9]{6}$/);
   });
 
   test('embeds goalId so branchGoalId reads it back from the created branch', async () => {
@@ -356,25 +357,67 @@ describe('runSelfImplement — shared worktree branch prefix', () => {
         },
       }),
     });
-    expect(createdBranch).toBe(plannedSelfImplBranch(feature, goalId));
+    expect(createdBranch).toStartWith(`${plannedSelfImplBranch(feature, goalId)}-r`);
+    expect(createdBranch).toMatch(/-r[a-z0-9]{6}$/);
     expect(branchGoalId(createdBranch)).toBe(goalId);
+  });
+
+  test('passes the resolved run-specific branch to createWorktree', async () => {
+    const feature = 'One goal two runs';
+    const goalId = '4b852b3a0f863ad2';
+    const runId = 'run-c41218b4-9383-458c-b944-9f7351062861';
+    let createdBranch = '';
+    const planned: Record<string, unknown>[] = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category === 'self-implement.branch' && event === 'planned') planned.push(data as Record<string, unknown>);
+    }) as typeof debug.log;
+    try {
+      await runSelfImplement({
+        feature, goalId, runId,
+        seams: seams({
+          createWorktree: async ({ branch, runId: receivedRunId }) => {
+            createdBranch = branch;
+            expect(receivedRunId).toBe(runId);
+            return { path: `/wt/${branch}`, branch, resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) };
+          },
+        }),
+      });
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+    }
+    expect(createdBranch).toBe(plannedSelfImplBranch(feature, goalId, runId));
+    expect(createdBranch).toEndWith('-rc41218');
+    expect(planned).toEqual([{ runId, goalId, branch: createdBranch, runSuffix: '-rc41218' }]);
   });
 
   test('keeps an explicit branchName even when goalId is present', async () => {
     let createdBranch = '';
-    await runSelfImplement({
-      feature: 'ignored for naming',
-      goalId: '667c0b5f0fa204d6',
-      branchName: 'custom/keep-me',
-      seams: seams({
-        createWorktree: async ({ branch }) => {
-          createdBranch = branch;
-          return { path: `/wt/${branch}`, branch };
-        },
-      }),
-    });
+    const goalId = '667c0b5f0fa204d6';
+    const runId = 'run-c41218b4-9383-458c-b944-9f7351062861';
+    const planned: Record<string, unknown>[] = [];
+    const originalLog = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      if (category === 'self-implement.branch' && event === 'planned') planned.push(data as Record<string, unknown>);
+    }) as typeof debug.log;
+    try {
+      await runSelfImplement({
+        feature: 'ignored for naming',
+        goalId, runId,
+        branchName: 'custom/keep-me',
+        seams: seams({
+          createWorktree: async ({ branch }) => {
+            createdBranch = branch;
+            return { path: `/wt/${branch}`, branch };
+          },
+        }),
+      });
+    } finally {
+      (debug as { log: typeof debug.log }).log = originalLog;
+    }
     expect(createdBranch).toBe('custom/keep-me');
     expect(branchGoalId(createdBranch)).toBeNull();
+    expect(planned).toEqual([{ runId, goalId, branch: createdBranch, runSuffix: null }]);
   });
 
   test('observeOnly generated branch also carries goalId', async () => {
@@ -386,7 +429,7 @@ describe('runSelfImplement — shared worktree branch prefix', () => {
       observeOnly: true,
       seams: seams({}),
     });
-    expect(result.branch).toBe(plannedSelfImplBranch(feature, goalId));
+    expect(result.branch).toBe(plannedSelfImplBranch(feature, goalId, result.runId));
     expect(branchGoalId(result.branch ?? '')).toBe(goalId);
   });
 });
@@ -14042,7 +14085,8 @@ describe('runSelfImplement — PR title path extraction', () => {
     await runSelfImplement({ feature, seams: s });
 
     expect(openedTitle).toBe('산문 제목이 경로 목록보다 우선한다');
-    expect(createdBranch).toBe(`${WORKTREE_BRANCH_PREFIX}${slugifyFeature(feature)}`);
+    expect(createdBranch).toStartWith(`${WORKTREE_BRANCH_PREFIX}${slugifyFeature(feature)}-r`);
+    expect(createdBranch).toMatch(/-r[a-z0-9]{6}$/);
   });
 
   test.each(['', '   '])('falls back to the unchanged path title for a missing or whitespace-only prose title (%j)', async (titleValue) => {
@@ -14383,7 +14427,7 @@ describe('runSelfImplement — supervisor input next-round reinjection', () => {
 
     expect(result.stage).toBe('pr-opened');
     expect(features).toHaveLength(1);
-    expect(inbox).toEqual([{ spaceId: 'feature-5a9c816d', memo: '다음 라운드에서 회귀 테스트를 추가하라' }]);
+    expect(inbox).toEqual([{ spaceId: expect.stringMatching(/^feature-5a9c816d-r[a-z0-9]{6}$/), memo: '다음 라운드에서 회귀 테스트를 추가하라' }]);
     expect(deliveries).toEqual([{ state: 'inbox-delivered' }]);
   });
 

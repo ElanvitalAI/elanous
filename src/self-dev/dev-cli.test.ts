@@ -771,6 +771,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
 
   const openDraft = (): { isDraft: boolean; state: string } => ({ isDraft: true, state: 'OPEN' });
   const pr = (n: number): string => `https://github.com/acme/elanous/pull/${n}`;
+  const lineageDraft = (url: string) => ({ ...openDraft(), headRefName: `self-impl/draft-triage-abcdef12-r${Number(url.split('/').at(-1)!).toString(16).padStart(6, '0')}` });
   const executeAfterStartDraftTriage = async (
     feature: string,
     execute: (relaunch?: boolean) => Promise<import('../self-implement/orchestrator.js').SelfImplementResult>,
@@ -1942,7 +1943,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       let turn = 0;
       await devCli.executeDevSelfRun('draft triage', async () => selfResult({ prUrl: urls[Math.min(turn++, urls.length - 1)] }), {
         rounds: 2,
-        viewDraftPr: openDraft,
+        viewDraftPr: lineageDraft,
         closeDraftPr: (url, comment) => { closed.push({ url, comment }); return true; },
         commentDraftPr: (url, comment) => { kept.push({ url, comment }); return true; },
       });
@@ -1951,7 +1952,57 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(kept.map(({ url }) => url)).toEqual([pr(1)]);
     expect(kept[0]!.comment).toContain('멈춘 사유 max-rounds');
     expect(kept[0]!.comment).toContain('이 draft 가 이 골의 유일한 사람 판단 대상');
-    expectTerminalWithoutFinalStatus(events, { draftTriage: { closed: [2], kept: 1, closeFailed: [], skippedNotDraft: [] } });
+    expectTerminalWithoutFinalStatus(events, { draftTriage: { closed: [2], kept: [1], closeFailed: [], skippedNotDraft: [] } });
+  });
+
+  it('비수렴 종결은 같은 계보 A만 #B로 대체하고 다른 조각 C와 B를 남긴다', async () => {
+    const branches = [
+      'self-impl/at-the-existing-pod-job-launch-path-in-s-54a32edd-r9a5cf3',
+      'self-impl/at-the-existing-pod-job-launch-path-in-s-54a32edd-r1b2c3d',
+      'self-impl/in-the-existing-collectpodartifacts-retu-22aaa333-r9a5cf3',
+    ];
+    const closed: Array<{ url: string; comment: string }> = [];
+    const kept: Array<{ url: string; comment: string }> = [];
+    const logs: Array<{ category: string; event: string; data: unknown }> = [];
+    const sink = spyOn(debug, 'log').mockImplementation((category, event, data) => { logs.push({ category, event, data }); });
+    let turn = 0;
+    let terminalTriage: unknown;
+    try {
+      await devCli.executeDevSelfRun('distinct pieces', async () => selfResult({ prUrl: pr(++turn) }), {
+        rounds: 2,
+        viewDraftPr: (url) => ({ ...openDraft(), headRefName: branches[Number(url.split('/').at(-1)) - 1] }),
+        closeDraftPr: (url, comment) => { closed.push({ url, comment }); return true; },
+        commentDraftPr: (url, comment) => { kept.push({ url, comment }); return true; },
+      });
+      terminalTriage = logs.find(({ category, event }) => category === 'self-implement' && event === 'run-terminal')?.data;
+    } finally { sink.mockRestore(); }
+    expect(terminalTriage).toEqual(expect.objectContaining({ draftTriage: { closed: [1], kept: [2, 3], closeFailed: [], skippedNotDraft: [] } }));
+    expect(closed).toEqual([{ url: pr(1), comment: '하니스 종결 트리아지: 최신 산출 #2 로 대체됨' }]);
+    expect(kept.map(({ url }) => url).sort()).toEqual([pr(2), pr(3)]);
+    expect(kept.every(({ comment }) => comment.includes('사람 판단 대상') && !comment.includes('유일한'))).toBe(true);
+    expect(logs).toContainEqual({ category: 'self-dev.triage', event: 'kept-distinct-piece', data: {
+      pr: 2, lineage: 'at-the-existing-pod-job-launch-path-in-s', keptLineage: 'in-the-existing-collectpodartifacts-retu',
+    } });
+    expect(logs).toContainEqual({ category: 'self-dev.triage', event: 'kept-distinct-piece', data: {
+      pr: 3, lineage: 'in-the-existing-collectpodartifacts-retu', keptLineage: 'at-the-existing-pod-job-launch-path-in-s',
+    } });
+  });
+
+  it('headRefName 을 못 읽은 열린 draft는 다른 계보의 대체 대상으로 닫지 않는다', async () => {
+    const closed: string[] = [];
+    const kept: string[] = [];
+    let turn = 0;
+    const events = await observeRunExit('draft-triage-unknown-branch', async () => {
+      await devCli.executeDevSelfRun('unknown branch', async () => selfResult({ prUrl: pr(++turn) }), {
+        rounds: 1,
+        viewDraftPr: (url) => url === pr(1) ? { ...openDraft(), headRefName: null as never } : lineageDraft(url),
+        closeDraftPr: (url) => { closed.push(url); return true; },
+        commentDraftPr: (url) => { kept.push(url); return true; },
+      });
+    });
+    expect(closed).toEqual([]);
+    expect(kept).toEqual([pr(1), pr(2)]);
+    expectTerminalWithoutFinalStatus(events, { draftTriage: { closed: [], kept: [1, 2], closeFailed: [], skippedNotDraft: [] } });
   });
 
   it('collectRunDraftPrUrls 는 나중에 merged 로 다시 온 URL 을 빼고 마지막 관측 순서를 지킨다', () => {
@@ -1968,7 +2019,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       executePiece: async (feature) => selfResult(feature === 'part a'
         ? { stage: 'merged', merged: true, prUrl: pr(5), prNumber: 5 }
         : { prUrl: pr(4) }),
-      viewDraftPr: openDraft,
+      viewDraftPr: lineageDraft,
       closeDraftPr: (url) => { closed.push(url); return true; },
       commentDraftPr: (url, comment) => { kept.push({ url, comment }); return true; },
     });
@@ -2026,7 +2077,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
         return selfResult({ prUrl: pr(turn) });
       }, {
         rounds: 1,
-        viewDraftPr: openDraft,
+        viewDraftPr: lineageDraft,
         closeDraftPr: () => false,
         commentDraftPr: (_url, comment) => { kept.push(comment); return true; },
       });
@@ -2034,7 +2085,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     expect(kept).toHaveLength(1);
     expect(kept[0]).not.toContain('유일한 사람 판단 대상');
     expect(kept[0]).toContain('닫지 못한 draft 도 남아 있다: #1');
-    expectTerminalWithoutFinalStatus(events, { draftTriage: { closed: [], kept: 2, closeFailed: [1], skippedNotDraft: [] } });
+    expectTerminalWithoutFinalStatus(events, { draftTriage: { closed: [], kept: [2], closeFailed: [1], skippedNotDraft: [] } });
   });
 
   it('draft 를 모은 «뒤» 재발사가 던지면 조회·닫기·코멘트 0회 · draftTriage 없음 · 원래 예외 전파', async () => {

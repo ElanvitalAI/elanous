@@ -36,7 +36,9 @@ describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => 
     expect(Object.hasOwn(spec!, 'enhance')).toBe(false);
     expect(Object.hasOwn(spec!.mission!, 'deliverableHint')).toBe(false);
     expect(Object.hasOwn(spec!.mission!, 'screensDir')).toBe(false);
-    expect(spec!.mission).toMatchObject({ evidence: { kind: 'tsc' }, maxRounds: 16, commit: true, entry: 'elanous-apparatus' });
+    expect(spec!.mission).toMatchObject({ evidence: { kind: 'tsc' }, maxRounds: 16, commit: true, entry: 'elanous-apparatus', resources: 'on' });
+    expect(Object.hasOwn(spec!.mission!, 'backendExplicit')).toBe(false);
+    expect(toAgentMissionSpec('기능 A', planDevPipeline(spec!), () => BACKEND).resources).toBe('on');
     expect(passed!.resolveBackend!()).toBe(BACKEND); // 검증된 backend 주입(재resolve 없음)
   });
 
@@ -72,6 +74,26 @@ describe('runAgentMissionCliCommand — 성공경로(주입·무실행)', () => 
     expect(spec!.mission).toMatchObject({ maxRounds: 9, commit: false, deliverableHint: 'PPT', screensDir: '/s', entry: 'elanous-apparatus' });
     expect((spec!.mission!.evidence as { kind: string; dirRel: string }).kind).toBe('doc');
     expect((spec!.mission!.evidence as { dirRel: string }).dirRel).toBe('docs/x');
+  });
+
+  it('--resources off 와 명시 --backend/--plugin 은 pipeline 을 지나 driver spec 까지 보존한다', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ resources: 'off', backend: 'codex', plugin: 'manual@other' }), {
+      resolveBackend: () => BACKEND, runDevPipeline: cap.fn,
+    });
+    expect(out.ok).toBe(true);
+    const s = toAgentMissionSpec('M', planDevPipeline(cap.last().spec!), () => BACKEND);
+    expect(s).toMatchObject({ resources: 'off', backendExplicit: 'codex', plugin: { plugin: 'manual', marketplace: 'other' } });
+    expect(s.agent).toBe(BACKEND);
+  });
+
+  it('잘못된 --resources 는 실행 전에 거부한다', async () => {
+    const cap = captureRun();
+    const out = await runAgentMissionCliCommand(['M'], baseOpts({ resources: 'invalid' as 'on' }), {
+      resolveBackend: () => BACKEND, runDevPipeline: cap.fn,
+    });
+    expect(out).toEqual({ ok: false, message: '--resources 는 on|off 여야 합니다', exitCode: 1 });
+    expect(cap.last().spec).toBeUndefined();
   });
 
   it('doc evidence — docGlob 의 source/flags 무손실', async () => {

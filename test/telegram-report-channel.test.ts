@@ -286,3 +286,42 @@ describe('sendReportPhotoBuffer', () => {
     expect(ok).toBe(false);
   });
 });
+
+describe('purpose kind → channel role (explicit channels)', () => {
+  const tg = {
+    enabled: true, botToken: 'MAIN:tok',
+    reportChannel: { chatId: 222, botToken: 'CONATUS:tok' },
+    channels: [
+      { name: 'main', botToken: 'MAIN:tok', chatId: 111, interactive: true, roles: ['qa', 'default', 'system', 'mission'] },
+      { name: 'conatus', botToken: 'CONATUS:tok', chatId: 222, interactive: true, roles: ['investment', 'signal'] },
+    ],
+  };
+
+  test('intake · ops kinds go to the channel with the mapped role; plain report/alert keep the legacy report channel', () => {
+    const cfg = buildUserConfig(writeCfg(tg));
+    for (const kind of ['intake', 'ops-report', 'ops-alert', 'ops-health']) expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: 'MAIN:tok', chatId: 111 });
+    for (const kind of [undefined, 'report', 'alert']) expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
+  });
+
+  test('telegram.kindRoles overrides the default table (and can send a kind to investment)', () => {
+    const cfg = buildUserConfig(writeCfg({ ...tg, kindRoles: { intake: 'investment', report: 'system', bad: 3 } }));
+    expect(cfg.telegram.kindRoles).toEqual({ intake: 'investment', report: 'system' });
+    expect(resolveReportTarget(cfg, 'intake')).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
+    expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: 'MAIN:tok', chatId: 111 });
+  });
+
+  test('without explicit channels a purpose kind keeps the legacy report channel (public configs unchanged)', () => {
+    const { channels: _c, ...legacy } = tg;
+    const cfg = buildUserConfig(writeCfg(legacy));
+    expect(resolveReportTarget(cfg, 'intake')).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
+  });
+
+  test('sendTelegramReport with kind posts to the role channel bot', async () => {
+    const cfg = buildUserConfig(writeCfg(tg));
+    const urls: string[] = [];
+    const fetchImpl = (async (url: string, init?: RequestInit) => { urls.push(`${url} ${String(init?.body ?? '')}`); return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } })); }) as unknown as typeof fetch;
+    expect(await sendTelegramReport(cfg, 'hello', { kind: 'intake', fetchImpl, markdown: false })).toBe(true);
+    expect(urls.some((u) => u.includes('/botMAIN:tok/sendMessage') && u.includes('111'))).toBe(true);
+    expect(urls.some((u) => u.includes('CONATUS'))).toBe(false);
+  });
+});

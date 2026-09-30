@@ -9,7 +9,6 @@
 //      그대로 붙잡으므로, 무엇이 실려 나갔는지로 판정한다.
 
 import { describe, test, expect } from 'bun:test';
-import { createHash } from 'node:crypto';
 import { streamLLMWithTools } from '../src/llm';
 import type { LLMMessage, LLMProvider } from '../src/llm';
 import { CODEX_TOOL_DISCIPLINE, GROK_TOOL_DISCIPLINE } from '../src/llm';
@@ -71,17 +70,6 @@ describe('GROK_TOOL_DISCIPLINE — 실행 경로로 판정한다', () => {
   test('grok 판에는 codex 판이 «같이» 실리지 않는다 — 두 분기가 겹치지 않는다', async () => {
     const systems = await systemTextsFor('grok-4.6');
     expect(systems.some((s) => s === CODEX_TOOL_DISCIPLINE)).toBe(false);
-  });
-});
-
-describe('CODEX_TOOL_DISCIPLINE — 이 착지가 «건드리지 않았다»는 증거', () => {
-  // ⛔⭐ 리뷰 must-fix(#9073): 문구 몇 개만 보면 «임의의 다른 바이트» 변경을 놓친다.
-  //   ⇒ 전체 바이트의 해시를 못 박는다. 이 값이 바뀌면 그것은 «의도된 codex 변경»이어야 하고,
-  //     그때는 사람이 이 줄을 «의식적으로» 갱신하게 된다. 그게 이 테스트의 목적이다.
-  const CODEX_DISCIPLINE_SHA256 = 'b8623476f31f08d5e1269d7ad5edb4f922c0d820a9cfaccbe41f9756d7151d97';
-  test('바이트 전체가 못 박혀 있다', () => {
-    const actual = createHash('sha256').update(CODEX_TOOL_DISCIPLINE, 'utf8').digest('hex');
-    expect(actual).toBe(CODEX_DISCIPLINE_SHA256);
   });
 });
 

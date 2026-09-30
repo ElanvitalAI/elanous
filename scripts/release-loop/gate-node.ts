@@ -5,19 +5,26 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
-import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
+import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
 import { diffFailures, parseFailures } from './gate-diff';
 import { deriveCdpTestPatterns } from '../test-deterministic';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
+import { runPodCommand, type RunPodCommandOptions, type PodCommandResult } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 
 interface CommandResult { rc: number; output: string }
 export interface GateRunner {
   command(cmd: string, args: string[], cwd: string): Promise<CommandResult>;
-  sweep(tree: string, logDir?: string): Promise<CommandResult>;
+  localCommand(cmd: string, args: string[], cwd: string): Promise<CommandResult>;
+  sweep(tree: string, logDir?: string, pod?: GateOptions['pod']): Promise<CommandResult>;
   add(tree: string, commit: string): Promise<void>;
   remove(tree: string): Promise<void>;
   snapshot(tree: string, commit: string): Promise<void>;
   removeSnapshot(tree: string): Promise<void>;
+  /** Absolute remote bare mirror path, set before preparing the remote trees. */
+  remoteMirror?: string;
 }
 export interface GateOptions {
   commit: string;
@@ -25,8 +32,11 @@ export interface GateOptions {
   baselineVersion?: string;
   baselineCommit?: string;
   remote?: string;
+  remoteMirror?: string;
   instanceRoot?: string;
+  ledgerRoot?: string;
   repo?: string;
+  pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number };
 }
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
@@ -34,26 +44,49 @@ export interface GateResult {
   introduced: string[];
   preexisting: number;
   fixed: number;
+  baselineSource?: 'ledger' | 'instance' | 'swept';
   durationMs: number;
   error?: string;
+  stalledShards?: Array<{ shard: number; files: string[]; reason: 'incomplete' | 'no-output' | 'job-failed' | 'unattributed'; lastFile?: string; summaryFailures?: number; namedFailures?: number; detail?: string }>;
+  partialSummary?: { pass: number; fail: number; errors: number; ran: number; files: number };
 }
 
 const sha = /^[0-9a-f]{7,40}$/i;
 const versionPattern = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
 const failureFile = (root: string, version: string) => join(root, 'release', version, 'gate-failures.json');
 const quote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`;
+const defaultRemoteMirror = '~/mirror/elanous-agent.git';
 
 function check(result: CommandResult, label: string): void {
   if (result.rc !== 0) throw new Error(`${label} failed (rc=${result.rc}): ${result.output.slice(-500)}`);
 }
 
 type SweepFailures = { failures: string[]; errors: string[] };
-const summaryCount = (output: string, label: string) => Number(new RegExp(`(?:^|\\n)\\s*(\\d+) ${label}s?\\s*(?:\\n|$)`).exec(output)?.[1] ?? NaN);
+// A test may spawn a nested `bun test` whose own summary lines land earlier in the same output
+// (09-29 0.2.4 gate: «0 fail · Ran 2 tests across 1 file» at line 6765 of a 60064-test sweep) —
+// the sweep's own summary is always the «last» one, so read the last match, never the first.
+const lastMatch = (output: string, pattern: RegExp): RegExpExecArray | null => {
+  let last: RegExpExecArray | null = null;
+  for (const m of output.matchAll(new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`))) last = m as RegExpExecArray;
+  return last;
+};
+const summaryCount = (output: string, label: string) => Number(lastMatch(output, new RegExp(`(?:^|\\n)\\s*(\\d+) ${label}s?\\s*(?=\\n|$)`))?.[1] ?? NaN);
+/** bun reads a bare positional as a substring filter (`test` matches every *.test.ts); `./` makes it a path. */
+const asPath = (path: string) => path.startsWith('./') || path.startsWith('/') ? path : `./${path}`;
+export const POD_ISOLATION_MEMORY_LIMIT = '32Gi';
 const tail40 = (output: string) => output.trimEnd().split(/\r?\n/).slice(-40).join('\n');
+const lastStartedTestFile = (output: string, paths: string[]): string | undefined => {
+  let last: string | undefined;
+  for (const line of output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').split(/\r?\n/)) {
+    const header = /^(?:\.\/)?((?:[\w.-]+\/)*[\w.-]+\.test\.tsx?):/.exec(line.trim());
+    if (header && paths.includes(header[1]!)) last = header[1];
+  }
+  return last;
+};
 
 function failuresOf(run: CommandResult, label: string): SweepFailures {
   const output = run.output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
-  const ran = /Ran (\d+) tests? across ([1-9]\d*) files?/.exec(output);
+  const ran = lastMatch(output, /Ran (\d+) tests? across ([1-9]\d*) files?/);
   const reportedErrors = summaryCount(output, 'error');
   const errorCount = Number.isNaN(reportedErrors) ? 0 : reportedErrors;
   const incomplete = (reason: string) => new Error(`${label} incomplete (rc=${run.rc}; Ran=${ran ? ran[0] : 'missing'}; errors=${Number.isNaN(reportedErrors) ? 'missing' : errorCount}; ${reason})\n${tail40(output)}`);
@@ -81,17 +114,192 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
   return { failures, errors: [...new Set(errors)].sort() };
 }
 
-/** Commands on the remote host use the same absolute repository path as the caller. */
-export function createGateRunner(repo: string, remote?: string, commandOverride?: GateRunner['command']): GateRunner {
-  const command: GateRunner['command'] = commandOverride ?? (async (cmd: string, args: string[], cwd: string): Promise<CommandResult> => {
-    const executable = remote ? 'ssh' : cmd;
-    const argv = remote ? [remote, `cd ${quote(cwd)} && ${[cmd, ...args].map(quote).join(' ')}`] : args;
-    const run = spawnSync(executable, argv, { cwd: remote ? repo : cwd, encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
+class StalledPodShards extends Error {
+  constructor(readonly stalledShards: NonNullable<GateResult['stalledShards']>, readonly partialSummary: NonNullable<GateResult['partialSummary']>) {
+    super(`pod sweep incomplete: stalled shards ${stalledShards.map(({ shard }) => shard).join(', ')}`);
+  }
+}
+
+export function createGateRunner(repo: string, remote?: string, commandOverride?: GateRunner['command'], podCommand: (options: RunPodCommandOptions) => Promise<PodCommandResult> = runPodCommand, poolOverride?: PodPoolScheduler, podLogTail?: (job: PodCommandResult) => string): GateRunner {
+  let remoteMirror: string | undefined;
+  const localCommand: GateRunner['command'] = async (cmd, args, cwd) => {
+    const run = spawnSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
     return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}${run.error ? `\n${run.error}` : ''}` };
-  });
+  };
+  const command: GateRunner['command'] = commandOverride ?? (remote
+    ? async (cmd, args, cwd) => {
+      const run = spawnSync('ssh', [remote, `PATH=$HOME/.bun/bin:/opt/homebrew/bin:$PATH; export PATH; cd ${quote(cwd)} && ${[cmd, ...args].map(quote).join(' ')}`],
+        { encoding: 'utf8', maxBuffer: 128 * 1024 * 1024 });
+      return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}${run.error ? `\n${run.error}` : ''}` };
+    }
+    : localCommand);
+  const podSweep = async (tree: string, logDir: string | undefined, pod: NonNullable<GateOptions['pod']>): Promise<CommandResult> => {
+    const shardCount = pod.shards ?? 8;
+    const deadlineSeconds = pod.shardTimeoutSeconds ?? 1200;
+    if (!pod.pool || !Number.isSafeInteger(shardCount) || shardCount < 1
+      || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1) throw new Error('invalid pod sweep options');
+    const head = await command('git', ['rev-parse', 'HEAD'], tree);
+    check(head, 'cut tree HEAD');
+    const commit = head.output.trim();
+    if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('invalid cut tree HEAD');
+    const listed = await command('git', ['ls-files', '*.test.*'], tree);
+    check(listed, 'git ls-files tests');
+    const files = listed.output.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file)).sort();
+    if (files.some((file) => file.startsWith('-') || file.startsWith('/') || file.startsWith('./')
+      || file.split('/').some((part) => !part || part === '.' || part === '..') || /[\r\n]/.test(file))) throw new Error('unsafe pod test path');
+    if (new Set(files).size !== files.length) throw new Error('duplicate pod test path');
+    if (!files.length) throw new Error('sweep incomplete: no tests ran');
+    const cdp = await command('rg', ['-l', '--glob', '*.test.ts', '-e', 'requireCdpBase', '-e', '9333', 'test', 'scripts'], tree);
+    if (cdp.rc !== 0 && cdp.rc !== 1) throw new Error(`CDP pattern discovery failed (rc=${cdp.rc}): ${tail40(cdp.output)}`);
+    const cdpPatterns = cdp.output.split(/\r?\n/).filter((path) => path.endsWith('.test.ts'));
+    // CDP 시험은 `test:deterministic` 이 스스로 뺀다 — 조각에 그것만 남으면 bun «시험 없음» exit 1 을 «불완전»으로 읽었다(09-30 G1d 실측 둘).
+    // bun 의 탐색은 숨은 디렉터리(`.x/`)를 안 연다 — 사람의 `bun test` 가 한 번도 안 돌리는 빈 픽스처가 조각에 혼자 남아 «Ran 0 tests» 를 «불완전»으로 읽었다(09-30 G1e 5번 조각).
+    const assignable = files.filter((file) => !cdpPatterns.includes(file) && !file.split('/').some((part) => part.startsWith('.')));
+    if (!assignable.length) throw new Error('sweep incomplete: no tests ran');
+    const shards = Array.from({ length: Math.min(shardCount, assignable.length) }, () => [] as string[]);
+    assignable.forEach((file, index) => shards[index % shards.length]!.push(file));
+    const ready = poolOverride ? undefined : checkPodPool(parsePodPool(pod.pool), defaultKubectl);
+    if (ready && !ready.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
+    const poolScheduler = poolOverride ?? new PodPoolScheduler(ready!.ready);
+    const jobLogTail = (job: PodCommandResult): string => {
+      if (podLogTail) return podLogTail(job);
+      for (const member of poolScheduler.members) {
+        const logs = defaultKubectl(['--context', member.context, '-n', 'elanous-test', 'logs', `job/${job.job}`, '-c', 'child', '--tail=200']);
+        if (logs.status === 0 && logs.stdout) return logs.stdout;
+      }
+      return '';
+    };
+    type ShardRun = { output: string; rc: number; pass: number; fail: number; errors: number; ran: number; files: number };
+    type ShardReason = NonNullable<GateResult['stalledShards']>[number]['reason'];
+    // 깊이 끝 OOM 조각은 «조각 전체»를 파일 하나씩 격리한다 — 상한 40 이면 나머지가 못 잰 채 남았다(09-30 ① 7번 조각 110 파일).
+    const isolationRemaining = shards.map((paths) => paths.length);
+    const runShard = async (paths: string[], shard: number, depth = 0, branch = ''): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
+      const ignores = cdpPatterns.filter((pattern) => paths.includes(pattern))
+        .flatMap((pattern) => ['--path-ignore-patterns', pattern]);
+      // 파일별 소요는 junit 으로 남긴다 — 콘솔 요약(판정 원천)은 그대로이고, 느린 시험 목록(K10 D4)·계층 분리(D2)의 자가 된다.
+      const args = ['bun', 'run', 'test:deterministic', ...ignores, ...paths.map(asPath)].map(quote).join(' ')
+        + ' --reporter=junit --reporter-outfile="$HOME/outbox/junit.xml"';
+      const start = Date.now();
+      let output: string | undefined;
+      let junit: string | undefined;
+      let rc: number | undefined;
+      let jobExitCode: number | undefined;
+      let lastFile: string | undefined;
+      let jobFailed = false;
+      try {
+        const job = await podCommand({
+          pool: pod.pool, poolScheduler, clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds,
+          // 실패 뒤 다시 도는 파일 하나짜리 Job 은 메모리 한도를 올린다 — 16Gi 에선 무거운 한 파일이 혼자서도 OOM 이었다(09-30 `unwired-exports`).
+          ...(paths.length === 1 && depth >= 1 ? { memoryLimit: POD_ISOLATION_MEMORY_LIMIT } : {}),
+          name: `gate-${randomUUID()}`,
+          command: ['bash', '-lc', `mkdir -p "$HOME/outbox"; (cd .. && cd repo && bun install && (cd apps/pwa && bun install) && ${args}) 2>&1 | tee "$HOME/outbox/shard.log"; echo \${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"`],
+        });
+        jobExitCode = job.exitCode;
+        const logPath = join(job.artifactsDir, 'shard.log');
+        const rcPath = join(job.artifactsDir, 'shard.rc');
+        output = existsSync(logPath) ? readFileSync(logPath, 'utf8') : undefined;
+        const junitPath = join(job.artifactsDir, 'junit.xml');
+        junit = existsSync(junitPath) ? readFileSync(junitPath, 'utf8') : undefined;
+        const rcText = existsSync(rcPath) ? readFileSync(rcPath, 'utf8').trim() : '';
+        rc = /^\d+$/.test(rcText) && Number.isSafeInteger(Number(rcText)) ? Number(rcText) : undefined;
+        lastFile = output === undefined ? undefined : lastStartedTestFile(output, paths);
+        if (!lastFile && (job.exitCode !== 0 || rc === undefined || (rc !== 0 && rc !== 1))) {
+          try { lastFile = lastStartedTestFile(jobLogTail(job).split(/\r?\n/).slice(-200).join('\n'), paths); }
+          catch { /* Log retrieval is diagnostic; do not hide the stalled shard. */ }
+        }
+      } catch {
+        jobFailed = true;
+      }
+      const durationMs = Date.now() - start;
+      if (logDir) {
+        mkdirSync(logDir, { recursive: true });
+        const destination = join(logDir, `pod-${shard}${branch}.log`);
+        if (output !== undefined) writeFileSync(destination, output, { mode: 0o600 });
+        else rmSync(destination, { force: true });
+        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths }) + '\n', { mode: 0o600 });
+        const junitDestination = join(logDir, `pod-${shard}${branch}.junit.xml`);
+        if (junit !== undefined) writeFileSync(junitDestination, junit, { mode: 0o600 });
+        else rmSync(junitDestination, { force: true });
+      }
+      debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1 });
+      const clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+      const ran = clean && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/);
+      const passes = clean === undefined ? NaN : summaryCount(clean, 'pass');
+      const fails = clean === undefined ? NaN : summaryCount(clean, 'fail');
+      let reason: ShardReason | undefined;
+      let namedFailures: number | undefined;
+      let unattributedDetail: string | undefined;
+      if (jobFailed || (jobExitCode !== undefined && jobExitCode !== 0) || (rc !== undefined && rc !== 0 && rc !== 1)) reason = 'job-failed';
+      else if (!clean || rc === undefined) reason = 'no-output';
+      else if (!ran || !Number.isFinite(passes) || !Number.isFinite(fails)
+        || Number(ran[2]) === 0 || Number(ran[2]) > paths.length || Number(ran[1]) === 0) reason = 'incomplete';
+      else {
+        try {
+          const attributed = failuresOf({ rc, output: clean }, `pod-${shard} shard`);
+          if (attributed.failures.length !== fails) reason = 'unattributed';
+        } catch (error) {
+          reason = 'unattributed';
+          // 어떤 수가 어긋났는지(요약·이름·오류 귀속) 첫 줄을 싣는다 — 수만으론 원인 파일을 못 찾았다(09-30 ① 1번 조각).
+          unattributedDetail = (error instanceof Error ? error.message : String(error)).split('\n', 1)[0]!.slice(0, 300);
+        }
+        if (reason === 'unattributed') namedFailures = [...clean.matchAll(/\(fail\)\s+.+?(?:\s+\[[\d.]+(?:ms|s)\])?\s*$/gm)].length;
+      }
+      if (reason) {
+        // 깊이 2 에서 «이름 없는 실패»·«불완전»도 파일 단위로 가른다 — 아니면 149파일 조각의 실패 하나가 끝까지 주인 없이 남는다(09-30 G1e 7번 조각: 요약 28 · 이름 27).
+        // 로그 없이 죽은 조각(`no-output` · OOM)도 같다 — 09-30 G1f ② 4-0-0 은 150파일이 격리 0 으로 남았다.
+        if (depth === 2 && paths.length > 1) {
+          const count = Math.min(paths.length, isolationRemaining[shard]!);
+          isolationRemaining[shard]! -= count;
+          const children = await Promise.all(paths.slice(0, count).map(async (file, index) => {
+            const child = await runShard([file], shard, depth + 1, `${branch}-file-${index}`);
+            debug.log('release-loop.gate', 'pod-shard-isolate', { shard, file, outcome: child.stalled[0]?.reason ?? 'ok' });
+            return child;
+          }));
+          return { runs: children.flatMap((child) => child.runs), stalled: [
+            ...children.flatMap((child) => child.stalled),
+            ...(paths.length > count ? [{ shard, files: paths.slice(count), reason,
+              ...(lastFile ? { lastFile } : {}),
+            }] : []),
+          ] };
+        }
+        if (depth === 2 || paths.length === 1) return { runs: [], stalled: [{ shard, files: paths, reason,
+          ...(lastFile ? { lastFile } : {}),
+          ...(reason === 'unattributed' ? { summaryFailures: fails, namedFailures, ...(unattributedDetail ? { detail: unattributedDetail } : {}) } : {}),
+        }] };
+        debug.log('release-loop.gate', 'pod-shard-split', { shard, depth, files: paths, reason });
+        const middle = Math.ceil(paths.length / 2);
+        const children = await Promise.all([
+          runShard(paths.slice(0, middle), shard, depth + 1, `${branch}-0`),
+          runShard(paths.slice(middle), shard, depth + 1, `${branch}-1`),
+        ]);
+        return { runs: children.flatMap((child) => child.runs), stalled: children.flatMap((child) => child.stalled) };
+      }
+      return { runs: [{ output: clean!, rc: rc!, pass: passes, fail: fails,
+        errors: Number.isNaN(summaryCount(clean!, 'error')) ? 0 : summaryCount(clean!, 'error'),
+        ran: Number(ran![1]), files: Number(ran![2]) }], stalled: [] };
+    };
+    // 모든 조각이 끝난 뒤 판정한다 — 한 조각의 예외로 먼저 돌아가면 다른 Pod 가 도는 채로 정리가 시작된다(#22002 리뷰 R3).
+    const settled = await Promise.allSettled(shards.map((paths, shard) => runShard(paths, shard)));
+    const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (rejected) throw rejected.reason;
+    const results = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
+    const stalledShards = results.flatMap((result) => result.stalled);
+    const measured = results.flatMap((result) => result.runs);
+    const total = measured.reduce((sum, run) => ({ pass: sum.pass + run.pass, fail: sum.fail + run.fail,
+      errors: sum.errors + run.errors, ran: sum.ran + run.ran, files: sum.files + run.files }),
+    { pass: 0, fail: 0, errors: 0, ran: 0, files: 0 });
+    if (stalledShards.length) throw new StalledPodShards(stalledShards, total);
+    if (total.ran === 0 && total.errors === 0) throw new Error('sweep incomplete: no tests ran');
+    const outputs = measured.map((run) => run.output.replace(/(?:^|\n)\s*\d+ (?:pass|fail|errors?)\s*(?=\n|$)/g, '\n').replace(/Ran \d+ tests? across \d+ files?\.?/g, ''));
+    return { rc: total.fail + total.errors ? 1 : 0, output: outputs.join('\n') + `\n${total.pass} pass\n${total.fail} fail\n${total.errors} errors\nRan ${total.ran} tests across ${total.files} files.\n` };
+  };
   return {
     command,
-    async sweep(tree, logDir) {
+    localCommand: commandOverride && !remote ? commandOverride : localCommand,
+    get remoteMirror() { return remoteMirror; },
+    set remoteMirror(path) { remoteMirror = path; },
+    async sweep(tree, logDir, pod) {
+      if (pod) return podSweep(tree, logDir, pod);
       const listed = await command('git', ['ls-files', '*.test.*'], tree);
       check(listed, 'git ls-files tests');
       const files = listed.output.split(/\r?\n/).filter((file) => /\.test\.(?:tsx?|jsx?|mts|cts)$/.test(file));
@@ -114,7 +322,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         const start = Date.now();
         const groupIgnores = cdpPatterns.filter((pattern) => group.paths.some((p) => pattern === p || pattern.startsWith(`${p}/`)))
           .flatMap((pattern) => ['--path-ignore-patterns', pattern]);
-        const run = await command('bun', ['run', 'test:deterministic', ...groupIgnores, ...group.paths], tree);
+        const run = await command('bun', ['run', 'test:deterministic', ...groupIgnores, ...group.paths.map(asPath)], tree);
         if (logDir) {
           mkdirSync(logDir, { recursive: true });
           writeFileSync(join(logDir, `${group.name}.log`), run.output, { mode: 0o600 });
@@ -124,7 +332,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         try { failuresOf(run, `${group.name} shard`); }
         catch (error) { throw new Error(`${group.name} shard: ${error instanceof Error ? error.message : String(error)}`); }
         const clean = run.output.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
-        const ran = /Ran (\d+) tests? across (\d+) files?/.exec(clean)!;
+        const ran = lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/)!;
         const passes = summaryCount(clean, 'pass');
         if (!Number.isFinite(passes) && Number(ran[1]) > 0) throw new Error(`${group.name} shard incomplete (rc=${run.rc}; pass summary missing)\n${tail40(clean)}`);
         total = { pass: total.pass + (Number.isNaN(passes) ? 0 : passes), fail: total.fail + summaryCount(clean, 'fail'),
@@ -135,14 +343,31 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       if (!outputs.length || (total.ran === 0 && total.errors === 0)) throw new Error('sweep incomplete: no tests ran');
       return { rc: total.fail + total.errors ? 1 : 0, output: outputs.join('\n') + `\n${total.pass} pass\n${total.fail} fail\n${total.errors} errors\nRan ${total.ran} tests across ${total.files} files.\n` };
     },
-    async add(tree, commit) { check(await command('git', ['worktree', 'add', '--detach', tree, commit], repo), 'git worktree add'); },
-    async remove(tree) { check(await command('git', ['worktree', 'remove', '--force', tree], repo), 'git worktree remove'); },
+    async add(tree, commit) {
+      if (remote) {
+        if (!remoteMirror) throw new Error('remote mirror not prepared');
+        check(await command('git', ['clone', '--no-checkout', remoteMirror, tree], dirname(tree)), 'remote tree clone');
+        check(await command('git', ['-C', tree, 'fetch', 'origin', `refs/elanous/gate/${commit}`], dirname(tree)), 'remote tree fetch');
+        check(await command('git', ['-C', tree, 'checkout', '--detach', commit], dirname(tree)), 'remote tree checkout');
+      } else check(await command('git', ['worktree', 'add', '--detach', tree, commit], repo), 'git worktree add');
+    },
+    async remove(tree) {
+      if (remote) check(await command('rm', ['-rf', '--', tree], dirname(tree)), 'remote tree cleanup');
+      else check(await command('git', ['worktree', 'remove', '--force', tree], repo), 'git worktree remove');
+    },
     async snapshot(tree, commit) {
-      check(await command('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, tree], repo), 'baseline snapshot clone');
-      check(await command('git', ['checkout', '--quiet', '--detach', commit], tree), 'baseline snapshot checkout');
+      if (remote) {
+        if (!remoteMirror) throw new Error('remote mirror not prepared');
+        check(await command('git', ['clone', '--no-checkout', remoteMirror, tree], dirname(tree)), 'baseline snapshot clone');
+        check(await command('git', ['-C', tree, 'fetch', 'origin', `refs/elanous/gate/${commit}`], dirname(tree)), 'baseline snapshot fetch');
+        check(await command('git', ['-C', tree, 'checkout', '--detach', commit], dirname(tree)), 'baseline snapshot checkout');
+      } else {
+        check(await command('git', ['clone', '--quiet', '--shared', '--no-checkout', repo, tree], repo), 'baseline snapshot clone');
+        check(await command('git', ['checkout', '--quiet', '--detach', commit], tree), 'baseline snapshot checkout');
+      }
     },
     async removeSnapshot(tree) {
-      if (remote) check(await command('rm', ['-r', '--', tree], repo), 'baseline snapshot cleanup');
+      if (remote) check(await command('rm', ['-rf', '--', tree], dirname(tree)), 'baseline snapshot cleanup');
       else rmSync(tree, { recursive: true, force: true });
     },
   };
@@ -179,7 +404,24 @@ function fileOf(id: string): string {
 
 export async function judgeGate(opts: GateOptions, runner: GateRunner = createGateRunner(opts.repo ?? process.cwd(), opts.remote)): Promise<GateResult> {
   const start = Date.now();
-  const root = opts.instanceRoot ?? effectiveInstanceRoot();
+  const explicitConfig = getElanousConfigDirOverride();
+  const root = explicitConfig ? effectiveInstanceRoot() : (opts.instanceRoot ?? effectiveInstanceRoot());
+  const ledger = explicitConfig ? root : (opts.ledgerRoot ?? releaseLedgerRoot());
+  const roots = [...new Set([ledger, root])];
+  const cachedBaseline = (version: string, commit: string) => {
+    for (const [index, location] of roots.entries()) {
+      const saved = readBaseline(location, version);
+      if (saved?.commit === commit) return { saved, source: index === 0 && location !== root ? 'ledger' as const : 'instance' as const };
+    }
+    return undefined;
+  };
+  const baselineReleaseCommit = (version: string) => {
+    for (const location of roots) {
+      const path = join(location, 'release', version, 'release.json');
+      if (existsSync(path)) return baselineCommit(location, version);
+    }
+    return baselineCommit(root, version);
+  };
   const repo = resolve(opts.repo ?? process.cwd());
   const result: GateResult = { outcome: 'error', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, durationMs: 0 };
   let work: string | undefined;
@@ -191,24 +433,53 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       || (opts.baselineVersion && !versionPattern.test(opts.baselineVersion))
       || (opts.baselineCommit && !sha.test(opts.baselineCommit))) throw new Error('invalid commit or version');
     if (!opts.baselineVersion) throw new Error('previous release version required (--baseline-version)');
+    if (opts.pod && (!opts.pod.pool || !Number.isSafeInteger(opts.pod.shards ?? 8) || (opts.pod.shards ?? 8) < 1
+      || !Number.isSafeInteger(opts.pod.shardTimeoutSeconds ?? 1200) || (opts.pod.shardTimeoutSeconds ?? 1200) < 1)) throw new Error('invalid pod sweep options');
     if (opts.remote && !/^(?:[\w.-]+@)?[\w.-]+$/.test(opts.remote)) throw new Error('invalid ssh host');
     if (opts.remote) {
-      const temporary = await runner.command('mktemp', ['-d', '/tmp/release-gate-XXXXXXXX'], repo);
+      runner.remoteMirror = undefined;
+      const configured = opts.remoteMirror ?? defaultRemoteMirror;
+      if (!/^(?:\/|~\/)[\w./-]+$/.test(configured) || configured.split('/').includes('..')) throw new Error('invalid remote mirror path');
+      const home = configured.startsWith('~/') ? await runner.command('sh', ['-c', 'printf "%s\\n" "$HOME"'], '/tmp') : undefined;
+      if (home) check(home, 'remote home');
+      const homePath = home?.output.split(/\r?\n/).find((line) => line.startsWith('/'));
+      if (home && (!homePath || !/^\/[^\r\n]*$/.test(homePath))) throw new Error('invalid remote home');
+      const mirror = configured.startsWith('~/') ? join(homePath!, configured.slice(2)) : configured;
+      const baseSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
+      cachedBaseline(opts.baselineVersion, baseSha);
+      const present = await runner.command('test', ['-d', mirror], '/tmp');
+      if (present.rc === 1) {
+        check(await runner.command('mkdir', ['-p', dirname(mirror)], '/tmp'), 'remote mirror parent');
+        check(await runner.command('git', ['init', '--bare', mirror], '/tmp'), 'remote mirror init');
+      } else check(present, 'remote mirror lookup');
+      const bare = await runner.command('git', ['--git-dir', mirror, 'rev-parse', '--is-bare-repository'], '/tmp');
+      check(bare, 'remote mirror inspection');
+      if (!bare.output.split(/\r?\n/).includes('true')) throw new Error('remote mirror is not bare');
+      for (const commit of new Set([opts.commit, baseSha])) {
+        const ref = `refs/elanous/gate/${commit}`;
+        const found = await runner.command('git', ['--git-dir', mirror, 'show-ref', '--verify', '--quiet', ref], '/tmp');
+        if (found.rc === 1) check(await runner.localCommand('git', ['push', `${opts.remote}:${mirror}`, `${commit}:${ref}`], repo), `remote push ${commit}`);
+        else check(found, `remote mirror ref ${commit}`);
+      }
+      runner.remoteMirror = mirror;
+      const temporary = await runner.command('mktemp', ['-d', '/tmp/release-gate-XXXXXXXX'], '/tmp');
       check(temporary, 'remote mktemp');
-      work = temporary.output.trim();
+      const paths = temporary.output.split(/\r?\n/).filter((line) => /^\/tmp\/release-gate-[\w-]+$/.test(line));
+      if (paths.length !== 1) throw new Error('could not create temporary work directory');
+      work = paths[0]!;
     } else work = mkdtempSync(join(tmpdir(), 'release-gate-'));
-    if (!work || (opts.remote && !/^\/tmp\/release-gate-[\w-]+$/.test(work))) throw new Error('could not create temporary work directory');
     const cutTree = join(work, 'cut');
     trees.push(cutTree);
     await runner.add(cutTree, opts.commit);
     for (const dir of [cutTree, join(cutTree, 'apps/pwa')]) check(await runner.command('bun', ['install'], dir), `bun install ${dir}`);
-    const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', 'cut'));
+    const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', 'cut'), opts.pod);
     const cut = failuresOf(cutRun, 'cut sweep');
     cutFailures = cut;
-    const saved = readBaseline(root, opts.baselineVersion);
-    const baseSha = opts.baselineCommit ?? baselineCommit(root, opts.baselineVersion);
-    if (saved && opts.baselineCommit && saved.commit !== baseSha) throw new Error('cached baseline commit does not match requested baseline commit');
-    const trusted = saved?.commit === baseSha ? saved : undefined;
+    const baseSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
+    const cached = cachedBaseline(opts.baselineVersion, baseSha);
+    const trusted = cached?.saved;
+    result.baselineSource = trusted ? cached!.source : 'swept';
+    debug.log('release-loop.gate', 'baseline', { version: opts.baselineVersion, source: result.baselineSource, commit: baseSha });
     let baseTree: string | undefined;
     const getBaseTree = async () => {
       if (!baseTree) {
@@ -234,16 +505,16 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     result.fixed = diff.fixed.length;
     result.preexisting = diff.common.length;
     for (const file of new Set(diff.newFailures.map(fileOf))) {
-      const isolated = await runner.command('bun', ['run', 'test:deterministic', file], cutTree);
+      const isolated = await runner.command('bun', ['run', 'test:deterministic', asPath(file)], cutTree);
       const isolatedCut = failuresOf(isolated, `cut isolated ${file}`);
       const reproduced = new Set([...isolatedCut.failures, ...isolatedCut.errors]);
       const candidates = diff.newFailures.filter((id) => fileOf(id) === file && reproduced.has(id));
       if (candidates.length === 0) continue;
       const baselineTree = await getBaseTree();
-      const previous = await runner.command('bun', ['run', 'test:deterministic', file], baselineTree);
+      const previous = await runner.command('bun', ['run', 'test:deterministic', asPath(file)], baselineTree);
       let oldFailures: Set<string>;
-      if (/No tests found/i.test(previous.output) && previous.rc === 1) {
-        const lookup = await runner.command('git', ['ls-tree', '--name-only', baseSha, '--', file], repo);
+      if (/No tests found|had no matches/i.test(previous.output) && previous.rc === 1) {
+        const lookup = await runner.command('git', ['ls-tree', '--name-only', baseSha, '--', file], opts.remote ? baselineTree : repo);
         if (lookup.rc !== 0 || lookup.output.trim()) throw new Error(`baseline isolated run incomplete: ${file}`);
         oldFailures = new Set();
       } else {
@@ -258,6 +529,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     result.outcome = result.introduced.length ? 'regression' : 'ok';
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error);
+    if (error instanceof StalledPodShards) {
+      result.stalledShards = error.stalledShards;
+      result.partialSummary = error.partialSummary;
+    }
   } finally {
     if (baseSnapshot && work) {
       try { await runner.removeSnapshot(join(work, 'baseline')); }
@@ -269,22 +544,25 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     }
     if (work) {
       try {
-        if (opts.remote) check(await runner.command('rmdir', [work], repo), 'remote temporary directory cleanup');
+        if (opts.remote) check(await runner.command('rm', ['-rf', '--', work], '/tmp'), 'remote temporary directory cleanup');
         else rmSync(work, { recursive: true, force: true });
       } catch (error) { result.outcome = 'error'; result.error = `cleanup: ${String(error)}`; }
     }
+    if (opts.remote) runner.remoteMirror = undefined;
     result.durationMs = Date.now() - start;
   }
   if (result.outcome !== 'error' && cutFailures) {
     try {
-      const path = failureFile(root, opts.version);
-      mkdirSync(dirname(path), { recursive: true });
-      const temp = join(dirname(path), `.gate-failures-${process.pid}-${randomUUID()}.tmp`);
-      try {
-        writeFileSync(temp, JSON.stringify({ commit: opts.commit, failures: cutFailures.failures, ...(cutFailures.errors.length ? { errors: cutFailures.errors } : {}) }, null, 2) + '\n', { mode: 0o600 });
-        chmodSync(temp, 0o600);
-        renameSync(temp, path);
-      } finally { if (existsSync(temp)) rmSync(temp); }
+      for (const location of roots) {
+        const path = failureFile(location, opts.version);
+        mkdirSync(dirname(path), { recursive: true });
+        const temp = join(dirname(path), `.gate-failures-${process.pid}-${randomUUID()}.tmp`);
+        try {
+          writeFileSync(temp, JSON.stringify({ commit: opts.commit, failures: cutFailures.failures, ...(cutFailures.errors.length ? { errors: cutFailures.errors } : {}) }, null, 2) + '\n', { mode: 0o600 });
+          chmodSync(temp, 0o600);
+          renameSync(temp, path);
+        } finally { if (existsSync(temp)) rmSync(temp); }
+      }
     } catch (error) {
       result.outcome = 'error';
       result.error = `baseline persistence: ${String(error)}`;
@@ -313,20 +591,30 @@ function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOptions | 'he
     baselineVersion: typeof fromGraph.previousVersion === 'string' ? fromGraph.previousVersion : undefined,
     baselineCommit: typeof fromGraph.previousCommit === 'string' ? fromGraph.previousCommit : undefined,
     remote: typeof fromGraph.gateRemote === 'string' ? fromGraph.gateRemote : undefined,
+    remoteMirror: typeof fromGraph.gateRemoteMirror === 'string' ? fromGraph.gateRemoteMirror : undefined,
+    pod: typeof fromGraph.gatePodPool === 'string' ? {
+      pool: fromGraph.gatePodPool,
+      ...(fromGraph.gatePodShards !== undefined ? { shards: Number(fromGraph.gatePodShards) } : {}),
+      ...(fromGraph.gatePodShardTimeoutSeconds !== undefined ? { shardTimeoutSeconds: Number(fromGraph.gatePodShardTimeoutSeconds) } : {}),
+    } : undefined,
   };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === '--help') return 'help';
     if (arg === '--json') continue;
-    const key = ({ '--commit': 'commit', '--version': 'version', '--baseline-version': 'baselineVersion', '--baseline-commit': 'baselineCommit', '--remote': 'remote' } as Record<string, keyof GateOptions>)[arg!];
+    const key = ({ '--commit': 'commit', '--version': 'version', '--baseline-version': 'baselineVersion', '--baseline-commit': 'baselineCommit', '--remote': 'remote', '--remote-mirror': 'remoteMirror', '--pod-pool': 'pod', '--pod-shards': 'pod', '--pod-shard-timeout-seconds': 'pod' } as Record<string, keyof GateOptions>)[arg!];
     if (!key) throw new Error(`unknown option: ${arg}`);
     const value = args[++i];
     if (!value || value.startsWith('--')) throw new Error(`value required for ${arg}`);
-    if (key === 'commit') opts.commit = value;
+    if (arg === '--pod-pool') opts.pod = { ...opts.pod, pool: value };
+    else if (arg === '--pod-shards') opts.pod = { pool: opts.pod?.pool ?? '', ...opts.pod, shards: Number(value) };
+    else if (arg === '--pod-shard-timeout-seconds') opts.pod = { pool: opts.pod?.pool ?? '', ...opts.pod, shardTimeoutSeconds: Number(value) };
+    else if (key === 'commit') opts.commit = value;
     else if (key === 'version') opts.version = value;
     else if (key === 'baselineVersion') opts.baselineVersion = value;
     else if (key === 'baselineCommit') opts.baselineCommit = value;
     else if (key === 'remote') opts.remote = value;
+    else if (key === 'remoteMirror') opts.remoteMirror = value;
   }
   return opts;
 }
@@ -338,7 +626,7 @@ if (import.meta.main) {
   try {
     const opts = parseOptions(process.argv.slice(2), process.env);
     if (opts === 'help') {
-      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--json]\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.');
+      console.log('Usage: bun scripts/release-loop/gate-node.ts --commit <sha> --version <v> [--baseline-version <prev>] [--baseline-commit <sha>] [--remote <ssh-host>] [--remote-mirror <path>] [--pod-pool <pool>] [--pod-shards <n>] [--pod-shard-timeout-seconds <n>] [--json]\nWithout flags, input.commit, input.version and input.previousVersion come from the JSON file at ELANOUS_GRAPH_CONTEXT.');
       process.exit(0);
     }
     version = opts.version;

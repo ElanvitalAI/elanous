@@ -116,58 +116,51 @@ describe('mp4 · probe caching', () => {
 // ── End-to-end (gated) — runs only when ffmpeg is available ─────
 
 const ffmpegAvailable = await probeFfmpeg().then(p => !!p, () => false);
+const endToEndTest = ffmpegAvailable ? test : test.skip;
 
-if (ffmpegAvailable) {
-  describe('mp4 · end-to-end (ffmpeg present)', () => {
-    test('encodes 3 ANSI frames into a valid MP4 buffer', async () => {
-      const mp4 = await encodeMp4({
-        frames: [
-          { ansi: 'aa\n--' },
-          { ansi: 'bb\n--' },
-          { ansi: 'cc\n--' },
-        ],
+describe('mp4 · end-to-end (ffmpeg present)', () => {
+  endToEndTest('encodes 3 ANSI frames into a valid MP4 buffer', async () => {
+    const mp4 = await encodeMp4({
+      frames: [
+        { ansi: 'aa\n--' },
+        { ansi: 'bb\n--' },
+        { ansi: 'cc\n--' },
+      ],
+      dims: TINY_DIMS,
+      fps: 5,
+    });
+    expect(Buffer.isBuffer(mp4)).toBe(true);
+    expect(mp4.length).toBeGreaterThan(100);
+    expect(isMp4Buffer(mp4)).toBe(true);
+  });
+
+  endToEndTest('rejects with Mp4EncodeError when ffmpeg arg list is invalid', async () => {
+    // Force an invalid codec to make ffmpeg exit non-zero.
+    await expect(
+      encodeMp4({
+        frames: [{ ansi: 'a' }, { ansi: 'b' }],
         dims: TINY_DIMS,
-        fps: 5,
-      });
-      expect(Buffer.isBuffer(mp4)).toBe(true);
-      expect(mp4.length).toBeGreaterThan(100);
+        codec: 'definitely-not-a-codec',
+      }),
+    ).rejects.toBeInstanceOf(Mp4EncodeError);
+  });
+
+  // ⭐ pngPath 실 프레임(keyframe 하이라이트릴 경로) — 서로 다른 해상도 실 PNG → 해상도 통일 → 실 ffmpeg → 유효 MP4.
+  endToEndTest('pngPath 실 프레임(다른 해상도) → 유효 MP4(mock 아닌 실 인코딩·must-fix)', async () => {
+    const { svgToPng } = await import('../src/capture/encoders/png.js');
+    const dir = mkdtempSync(join(tmpdir(), 'mp4-e2e-png-'));
+    try {
+      const p1 = join(dir, 'a.png');
+      const p2 = join(dir, 'b.png');
+      // 이모지 없는 단순 도형 SVG — sharp 안전(Pango abort 무관)·서로 다른 dims(해상도 통일 경로 실증).
+      writeFileSync(p1, await svgToPng('<svg xmlns="http://www.w3.org/2000/svg" width="20" height="16"><rect width="20" height="16" fill="#111"/></svg>', { background: '#000' }));
+      writeFileSync(p2, await svgToPng('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><rect width="32" height="24" fill="#222"/></svg>', { background: '#000' }));
+      const mp4 = await encodeMp4({ frames: [{ pngPath: p1 }, { pngPath: p2 }], fps: 1 });
       expect(isMp4Buffer(mp4)).toBe(true);
-    });
-
-    test('rejects with Mp4EncodeError when ffmpeg arg list is invalid', async () => {
-      // Force an invalid codec to make ffmpeg exit non-zero.
-      await expect(
-        encodeMp4({
-          frames: [{ ansi: 'a' }, { ansi: 'b' }],
-          dims: TINY_DIMS,
-          codec: 'definitely-not-a-codec',
-        }),
-      ).rejects.toBeInstanceOf(Mp4EncodeError);
-    });
-
-    // ⭐ pngPath 실 프레임(keyframe 하이라이트릴 경로) — 서로 다른 해상도 실 PNG → 해상도 통일 → 실 ffmpeg → 유효 MP4.
-    test('pngPath 실 프레임(다른 해상도) → 유효 MP4(mock 아닌 실 인코딩·must-fix)', async () => {
-      const { svgToPng } = await import('../src/capture/encoders/png.js');
-      const dir = mkdtempSync(join(tmpdir(), 'mp4-e2e-png-'));
-      try {
-        const p1 = join(dir, 'a.png');
-        const p2 = join(dir, 'b.png');
-        // 이모지 없는 단순 도형 SVG — sharp 안전(Pango abort 무관)·서로 다른 dims(해상도 통일 경로 실증).
-        writeFileSync(p1, await svgToPng('<svg xmlns="http://www.w3.org/2000/svg" width="20" height="16"><rect width="20" height="16" fill="#111"/></svg>', { background: '#000' }));
-        writeFileSync(p2, await svgToPng('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24"><rect width="32" height="24" fill="#222"/></svg>', { background: '#000' }));
-        const mp4 = await encodeMp4({ frames: [{ pngPath: p1 }, { pngPath: p2 }], fps: 1 });
-        expect(isMp4Buffer(mp4)).toBe(true);
-        expect(mp4.length).toBeGreaterThan(100);
-      } finally { rmSync(dir, { recursive: true, force: true }); }
-    }, 20000);
-  });
-} else {
-  describe.skip('mp4 · end-to-end (ffmpeg present)', () => {
-    test('skipped: ffmpeg not on PATH', () => {
-      expect(true).toBe(true);
-    });
-  });
-}
+      expect(mp4.length).toBeGreaterThan(100);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 20000);
+});
 
 // ── PNG 직접 프레임(pngPath) + 해상도 통일 — keyframe 하이라이트릴 경로 회귀 가드(2026-07-26) ──
 describe('mp4 · readPngDims (순수·헤더만)', () => {

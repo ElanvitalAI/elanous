@@ -50,6 +50,13 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     why: 'Pod grok access relay (#20789); Pods hold no nexus bearer — pod-credential-api.ts verifies its own llm-credential token (verifyGroundingToken expectedScope) before reading the body',
   },
   {
+    method: 'POST',
+    match: 'exact',
+    path: '/v1/pod/credential/github',
+    selfVerified: true,
+    why: 'Pod GitHub App credential relay verifies its own run-scoped gh-credential token before minting a repository-scoped installation token',
+  },
+  {
     method: 'GET',
     match: 'prefix',
     path: '/v1/setup/',

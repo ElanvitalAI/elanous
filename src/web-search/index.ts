@@ -8,6 +8,7 @@
 import { buildGrokWebSearchProvider } from './grok.js';
 import { buildFirecrawlWebSearchProvider } from './firecrawl.js';
 import { buildTavilyWebSearchProvider } from './tavily.js';
+import { buildFreeWebSearchProvider } from './free.js';
 import { isTavilySearchEnabled } from '../user-config.js';
 import {
   type WebSearchProvider,
@@ -34,6 +35,7 @@ function registerBuiltins(): void {
   if (isTavilySearchEnabled()) providers.push(buildTavilyWebSearchProvider());
   providers.push(buildGrokWebSearchProvider());
   providers.push(buildFirecrawlWebSearchProvider());
+  providers.push(buildFreeWebSearchProvider());
 }
 registerBuiltins();
 

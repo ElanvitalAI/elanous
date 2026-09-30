@@ -54,7 +54,7 @@ function usableInstallMetadataCommit(commit: string): string | undefined {
   return revision;
 }
 
-function readInstallMetadataCommit(metadataPath: string): string | undefined {
+export function readInstallMetadataCommit(metadataPath: string): string | undefined {
   try {
     const parsed: unknown = JSON.parse(readFileSync(metadataPath, 'utf8'));
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;

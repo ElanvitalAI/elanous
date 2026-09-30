@@ -45,6 +45,7 @@ import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChildLlmPreference, type ChildLlmPreferenceInput, type ResolvedChildLlmPreference } from '../self-implement/child-llm-preference.js';
 import { readCachedGrokQuota } from '../oauth/codex-account-store.js';
 import { queryAbandonedDraftPrs, type AbandonedDraftPr } from '../cli/logs-abandoned-draft-prs.js';
+import { branchLineageSlug } from '../cli/pr-lineage.js';
 import { decideDraft, type DraftTriagePr } from './draft-triage-rules.js';
 import { resolveLogTargets } from '../cli/logs-cli.js';
 import { LogStore } from '../mss/logging/log-store.js';
@@ -196,12 +197,12 @@ export interface DevSelfRunExecution {
 
 interface DraftTriage {
   closed: number[];
-  kept: number | null;
+  kept: number[] | null;
   closeFailed: number[];
   skippedNotDraft: number[];
 }
 
-export type DraftPrViewState = { isDraft: boolean; state: string } | null;
+export type DraftPrViewState = { isDraft: boolean; state: string; headRefName?: string } | null;
 
 export interface DraftPrInventory {
   readonly open: readonly (DraftTriagePr & { url: string; openedAtMs: number; runId?: string | null })[];
@@ -294,11 +295,13 @@ function defaultViewDraftPr(prUrl: string, timeoutMs?: number): DraftPrViewState
   if (IN_TEST_PROCESS()) return null;
   const target = draftPrTargetFromUrl(prUrl);
   if (!target) return null;
-  const view = spawnSync('gh', ['pr', 'view', String(target.number), '--repo', target.repository, '--json', 'isDraft,state'], { encoding: 'utf8', ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) });
+  const view = spawnSync('gh', ['pr', 'view', String(target.number), '--repo', target.repository, '--json', 'isDraft,state,headRefName'], { encoding: 'utf8', ...(timeoutMs === undefined ? {} : { timeout: timeoutMs }) });
   if (view.status !== 0) return null;
   try {
-    const parsed = JSON.parse(view.stdout) as { isDraft?: unknown; state?: unknown };
-    return typeof parsed.isDraft === 'boolean' && typeof parsed.state === 'string' ? { isDraft: parsed.isDraft, state: parsed.state } : null;
+    const parsed = JSON.parse(view.stdout) as { isDraft?: unknown; state?: unknown; headRefName?: unknown };
+    return typeof parsed.isDraft === 'boolean' && typeof parsed.state === 'string'
+      ? { isDraft: parsed.isDraft, state: parsed.state, ...(typeof parsed.headRefName === 'string' ? { headRefName: parsed.headRefName } : {}) }
+      : null;
   } catch {
     return null;
   }
@@ -946,41 +949,58 @@ export async function executeDevSelfRun(
     const view = supervise?.viewDraftPr ?? defaultViewDraftPr;
     const closeDraft = supervise?.closeDraftPr ?? defaultCloseDraftPr;
     const commentDraft = supervise?.commentDraftPr ?? defaultCommentDraftPr;
-    const openDrafts: string[] = [];
+    const openDrafts: Array<{ url: string; lineage: string | null }> = [];
     const skippedNotDraft: number[] = [];
     for (const prUrl of drafts) {
       let live: DraftPrViewState = null;
       try { live = view(prUrl); } catch { live = null; }
-      if (live?.isDraft === true && live.state === 'OPEN') openDrafts.push(prUrl);
-      else {
+      if (live?.isDraft === true && live.state === 'OPEN') {
+        openDrafts.push({ url: prUrl, lineage: live.headRefName ? branchLineageSlug(live.headRefName) : null });
+      } else {
         const number = prNumberFromUrl(prUrl);
         if (number !== null) skippedNotDraft.push(number);
       }
     }
-    const keptUrl = converged ? undefined : openDrafts.at(-1);
-    const kept = keptUrl === undefined ? null : prNumberFromUrl(keptUrl);
+    const keptByLineage = new Map<string, string>();
+    if (!converged) {
+      for (const draft of openDrafts) {
+        if (draft.lineage !== null) keptByLineage.set(draft.lineage, draft.url);
+      }
+    }
+    const keptDrafts = converged ? [] : openDrafts.filter(({ url, lineage }) => lineage === null || keptByLineage.get(lineage) === url);
+    const kept = keptDrafts.length === 0 ? null : keptDrafts.flatMap(({ url }) => {
+      const number = prNumberFromUrl(url);
+      return number === null ? [] : [number];
+    });
     const closed: number[] = [];
     const closeFailed: number[] = [];
     const landed = mergedNumbers.map((n) => `#${n}`).join(' ') || '없음';
-    for (const prUrl of openDrafts) {
-      if (prUrl === keptUrl) continue;
-      const number = prNumberFromUrl(prUrl);
+    for (const { url, lineage } of openDrafts) {
+      if (!converged && (lineage === null || keptByLineage.get(lineage) === url)) continue;
+      const number = prNumberFromUrl(url);
+      const keptInLineage = lineage === null ? null : prNumberFromUrl(keptByLineage.get(lineage)!);
       const comment = converged
         ? `하니스 종결 트리아지: 이 런이 수렴해 대체됨 — 착지 ${landed}`
-        : `하니스 종결 트리아지: 최신 산출 #${kept ?? 'unknown'} 로 대체됨`;
+        : `하니스 종결 트리아지: 최신 산출 #${keptInLineage ?? 'unknown'} 로 대체됨`;
       let ok = false;
-      try { ok = closeDraft(prUrl, comment); } catch { ok = false; }
+      try { ok = closeDraft(url, comment); } catch { ok = false; }
       if (number === null) continue;
       if (ok) closed.push(number);
       else closeFailed.push(number);
     }
-    if (keptUrl !== undefined) {
+    for (const { url, lineage } of keptDrafts) {
+      const keptLineage = [...keptByLineage.keys()].find((other) => other !== lineage);
+      if (lineage !== null && keptLineage !== undefined) {
+        try { debug.log('self-dev.triage', 'kept-distinct-piece', { pr: prNumberFromUrl(url), lineage, keptLineage }); } catch { /* fail-open */ }
+      }
       const rounds = Math.max(1, executedRounds);
-      const handoff = closeFailed.length === 0
-        ? '이 draft 가 이 골의 유일한 사람 판단 대상'
-        : `닫지 못한 draft 도 남아 있다: ${closeFailed.map((n) => `#${n}`).join(' ')}`;
+      const handoff = closeFailed.length > 0
+        ? `닫지 못한 draft 도 남아 있다: ${closeFailed.map((n) => `#${n}`).join(' ')}`
+        : lineage === null ? '브랜치 계보 미확인 — 사람 판단 대상'
+          : keptDrafts.length === 1 ? '이 draft 가 이 골의 유일한 사람 판단 대상'
+            : '이 draft 가 이 계보의 사람 판단 대상';
       const comment = `하니스 종결 트리아지: 멈춘 사유 ${supervisorStopReason ?? 'unsupervised'} · 라운드 ${rounds} · 착지한 조각 PR ${landed} · ${handoff}`;
-      try { commentDraft(keptUrl, comment); } catch { /* fail-open */ }
+      try { commentDraft(url, comment); } catch { /* fail-open */ }
     }
     draftTriage = { closed, kept, closeFailed, skippedNotDraft };
   };

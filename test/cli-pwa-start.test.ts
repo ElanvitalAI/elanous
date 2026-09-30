@@ -163,6 +163,17 @@ describe('runPwaStart — local test-port lease', () => {
 });
 
 describe('runPwaStart — static mode (default)', () => {
+  test('forwards explicit no-auth only to its daemon child', async () => {
+    const calls: string[][] = [];
+    for (const noAuth of [undefined, true]) {
+      await runPwaStart({ ...NO_SHARE, mode: 'static', noAuth,
+        bgLaunchFn: async opts => { calls.push(opts.forwardArgs ?? []); return { exitCode: 0 }; },
+      });
+    }
+    expect(calls[0]).not.toContain('--no-auth');
+    expect(calls[1]).toContain('--no-auth');
+  });
+
   test('starts background nexus with webterm surface, NO dev tail', async () => {
     let forwardArgs: string[] = [];
     let devLaunchCalls = 0;

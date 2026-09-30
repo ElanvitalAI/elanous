@@ -11,6 +11,8 @@
 // the report channel while interactive Q&A stays on the main bot.
 
 import { TelegramBot } from './telegram.js';
+import { kindRouteTarget } from './domains/telegram-kind-route.js';
+export { DEFAULT_KIND_ROLES, roleForKind } from './domains/telegram-kind-route.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { UserConfig } from './user-config.js';
 import { findSessionByTelegramChat, createSession, appendMessage } from './session/index.js';
@@ -49,11 +51,13 @@ export interface ReportTarget {
   chatId: number;
 }
 
-/** Resolve the report-channel send target from config, or null when the
- *  feature is unconfigured. `botToken` falls back to the main Q&A bot
- *  token when the report channel is served by the same bot. Returns null
- *  when neither a report-channel token nor a main token is available. */
-export function resolveReportTarget(cfg: UserConfig): ReportTarget | null {
+/** Resolve the send target. With a purpose `kind` that maps to a role and explicit `telegram.channels`,
+ *  the channel holding that role wins (fallback: the `default` channel). Otherwise the legacy report
+ *  channel: `botToken` falls back to the main Q&A bot token when the report channel is served by the
+ *  same bot. Returns null when nothing is configured. */
+export function resolveReportTarget(cfg: UserConfig, kind?: string): ReportTarget | null {
+  const routed = kindRouteTarget(cfg, kind);
+  if (routed) return routed;
   const rc = cfg.telegram.reportChannel;
   if (!rc || !Number.isFinite(rc.chatId)) return null;
   const botToken = rc.botToken ?? resolveChannelBotToken('telegram', cfg)?.token;
@@ -67,6 +71,8 @@ export interface SendReportOpts {
   markdown?: boolean;
   /** DI seam for tests — passed through to the send-only TelegramBot. */
   fetchImpl?: typeof fetch;
+  /** Purpose of the message — routes to a channel role (see `DEFAULT_KIND_ROLES`). */
+  kind?: string;
 }
 
 /** Send a report to the configured report channel. Returns false (a
@@ -78,7 +84,7 @@ export async function sendTelegramReport(
   text: string,
   opts: SendReportOpts = {},
 ): Promise<boolean> {
-  const target = resolveReportTarget(cfg);
+  const target = resolveReportTarget(cfg, opts.kind);
   if (!target || !text) return false;
   const bot = new TelegramBot({
     token: target.botToken,

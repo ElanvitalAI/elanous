@@ -1,12 +1,13 @@
 import { getDefaultLogStore, resolveLogInstanceName, LogStore, type LogStoreRow, type LogQuery } from '../../mss/logging/log-store.js';
 import { readLogInstances, type LogInstanceView } from '../../mss/logging/instance-registry.js';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { prodInstanceRoot } from '../../instance/resolve.js';
 import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
-import { activeStoreNames, parseSinceParam, type LogFabricDeps } from './log-fabric.js';
+import { activeStoreNames, parseSinceParam, type LogFabricDeps, registeredLogStoreCount } from './log-fabric.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { jsonResponse } from './json-response.js';
+import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 
 export type TraceLevel = 'L0' | 'L1' | 'L2' | 'L3';
 export interface TraceEvent {
@@ -201,12 +202,19 @@ export function buildRunTrace(
 
 export interface TraceDeps extends LogFabricDeps {
   queryLog?: (details: { stores: string[]; level: TraceLevel; count: number; truncated: boolean; mode: 'rows' | 'runs'; runs: number }) => void;
+  ledgerStat?: (path: string) => void;
 }
 function storeNames(url: URL, deps: TraceDeps): string[] {
   const names = [...new Set(url.searchParams.getAll('store').flatMap((v) => v.split(',')).map((v) => v.trim()).filter(Boolean))];
-  return names.includes('@active') ? [...new Set([...activeStoreNames(deps), ...names.filter((n) => n !== '@active')])]
-    : (names.length ? names : [url.searchParams.get('universe') || resolveLogInstanceName()]);
+  if (names.includes('@active')) {
+    let active: string[];
+    try { active = activeStoreNames(deps); }
+    catch { active = [resolveLogInstanceName()]; }
+    return [...new Set([...active, ...names.filter((n) => n !== '@active')])];
+  }
+  return names.length ? names : [url.searchParams.get('universe') || resolveLogInstanceName()];
 }
+const registeredStoreCount = (deps: TraceDeps): number | null => registeredLogStoreCount(deps);
 function selectedStores(names: string[], deps: TraceDeps): { name: string; store: LogStore | null; remote: boolean; error?: string }[] {
   const selfName = resolveLogInstanceName();
   const self = names.includes(selfName) ? (deps.store ?? getDefaultLogStore)() : null;
@@ -266,6 +274,22 @@ function sortRows(a: LogStoreRow, b: LogStoreRow): number {
   return b.ts_ms - a.ts_ms || b.id - a.id || a.instance.localeCompare(b.instance);
 }
 
+function findRunUniverse(runId: string, selected: readonly string[], deps: TraceDeps): { universe?: string; checked: number } {
+  let checked = 0;
+  const views = (deps.instances ?? readLogInstances)();
+  for (const view of [...views.filter((v) => selected.includes(v.name)), ...views.filter((v) => !selected.includes(v.name))]) {
+    checked++;
+    try {
+      (deps.ledgerStat ?? statSync)(runLedgerPath(runId, runLedgerDir(view.stateDir)));
+      return { universe: view.name, checked };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw new Error(`unable to check run ledger for '${view.name}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return { checked };
+}
+
 /** Read-only bounded log-fabric fan-in, authenticated before any store access. */
 export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {}): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
@@ -300,7 +324,7 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
       const trace = buildRunTrace(runs, parsed.level as 'L0' | 'L1');
       trace.truncated = runLimitReached || failures.length > 0;
       try { (deps.queryLog ?? ((details) => debug.log('logs.trace', 'query', details)))({ stores: names, level: parsed.level, count: trace.events.length, truncated: trace.truncated, mode: 'runs', runs: runs.length }); } catch { /* query logging must not block reads */ }
-      return jsonResponse({ ok: true, ...trace, stores: names, ...(failures.length ? { failedStores: failures } : {}) }, 200);
+      return jsonResponse({ ok: true, ...trace, stores: names, registeredStores: registeredStoreCount(deps), ...(failures.length ? { failedStores: failures } : {}) }, 200);
     }
     const failures: Array<{ name: string; reason: string }> = [];
     const rows: LogStoreRow[] = [];
@@ -321,10 +345,37 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
       } catch (e) { failures.push({ name: entry.name, reason: e instanceof Error ? e.message : String(e) }); }
     }
     if (!opened) return jsonResponse({ ok: false, error: 'log-store-unavailable', failedStores: failures }, 503);
+    const runId = url.searchParams.get('runId');
+    let resolution: { universe?: string; checked: number } | undefined;
+    if ((parsed.level === 'L2' || parsed.level === 'L3') && runId && !rows.some((row) => matches(row, url)) && !requestedUniverse) {
+      // A store with no log db at all («has no log store yet» — e.g. the daemon's own tree-derived universe) cannot
+      // hold the run, so it must not block the ledger lookup. A store that exists but failed to open/read still does:
+      // «could not read» is never answered as «not there». The reply keeps `failedStores` either way.
+      const blocking = failures.filter((failure) => !/has no log store yet/.test(failure.reason));
+      if (blocking.length) return jsonResponse({ ok: false, error: 'log-store-unavailable', failedStores: failures }, 503);
+      try { resolution = findRunUniverse(runId, names, deps); }
+      catch (error) { return jsonResponse({ ok: false, error: 'run-universe-unavailable', reason: error instanceof Error ? error.message : String(error) }, 503); }
+      try { debug.log('nexus.trace', 'run-universe-resolved', { runId, universe: resolution.universe ?? 'not-found', checked: resolution.checked }); } catch { /* observation must not block reads */ }
+      if (resolution.universe && !names.includes(resolution.universe)) {
+        const name = resolution.universe;
+        names.push(name);
+        const [entry] = selectedStores([name], deps);
+        if (!entry?.store) return jsonResponse({ ok: false, error: 'log-store-unavailable', failedStores: [{ name, reason: entry?.error ?? 'log-store-unavailable' }] }, 503);
+        stores.push(entry);
+        try {
+          const query: LogQuery = { sinceMs: parsed.from, untilMs: parsed.to, limit: TRACE_LIMIT + 1 };
+          const search = url.searchParams.get('q');
+          if (search) query.grep = search;
+          const page = entry.store.queryTraceRun(runId, query);
+          if (page.length > TRACE_LIMIT) candidateLimitReached = true;
+          rows.push(...page.map((row) => ({ ...row, instance: row.instance || name })));
+        } catch (e) { return jsonResponse({ ok: false, error: 'log-store-unavailable', failedStores: [{ name, reason: e instanceof Error ? e.message : String(e) }] }, 503); }
+      }
+    }
     const filtered = rows.filter((row) => matches(row, url)).sort(sortRows);
     const trace = buildTrace(filtered.slice(0, parsed.limit), parsed.level, filtered.length > parsed.limit || candidateLimitReached || failures.length > 0);
     try { (deps.queryLog ?? ((details) => debug.log('logs.trace', 'query', details)))({ stores: names, level: parsed.level, count: trace.events.length, truncated: trace.truncated, mode: 'rows', runs: trace.nodes.filter((node) => node.level === 'L1' && node.count > 0).length }); } catch { /* query logging must not block reads */ }
-    return jsonResponse({ ok: true, ...trace, stores: names, ...(failures.length ? { failedStores: failures } : {}) }, 200);
+    return jsonResponse({ ok: true, ...trace, stores: names, registeredStores: registeredStoreCount(deps), ...(resolution ? resolution.universe ? { resolvedFrom: 'ledger' as const, runUniverse: resolution.universe } : { runUniverse: 'not-found' as const, checked: resolution.checked } : {}), ...(failures.length ? { failedStores: failures } : {}) }, 200);
   } finally { closeStores(stores, deps); }
 }
 

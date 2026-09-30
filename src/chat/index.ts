@@ -107,8 +107,26 @@ import {
 import { resolveTextInputControlAction } from './input-control-key.js';
 import { resolveTextInputEditAction } from './input-edit-key.js';
 import { resolveTextInputTextAction } from './input-text-key.js';
+import { classifyLeftoverInput, summarizeSubmitText } from './submit-trace.js';
 
 import { perf } from '../perf-counters.js';
+
+let lastSubmitAt: number | null = null;
+
+function traceAfterSubmitKey(key: Key): void {
+  if (lastSubmitAt === null) return;
+  const withinMs = Date.now() - lastSubmitAt;
+  if (withinMs > 1000) {
+    lastSubmitAt = null;
+    return;
+  }
+  if (key.ctrl || key.alt) return;
+  const input = key.name === 'paste' ? key.paste ?? '' : key.name;
+  if (!input || (key.name !== 'paste' && [...input].length !== 1)) return;
+  lastSubmitAt = null;
+  const kind = classifyLeftoverInput(input, withinMs);
+  if (kind) debug.log('chat.input.leftover', 'after-submit', { withinMs, kind });
+}
 
 /** Row where the input prompt starts — set by the textInput paint
  *  loop so writeTerminal knows which rows to invalidate in the
@@ -419,14 +437,14 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   // B4 — craft rulebook verdict, same resolution as `elanous repo design-check`
   //   and the PWA `/design-check` panel. Listed (not baselined as hidden) on
   //   purpose: a surface nobody can discover is not a surface.
-  { name: 'design',    aliases: ['design-check'], description: 'Craft rulebooks — 이 저장소 DESIGN.md 가 선언한 규칙집 · 못 찾은 것 · elanous 가 주는데 선언 안 된 것. /design [--declared] · /design pick [번호|id] 디자인 방향 선택', subcommands: ['--declared', 'pick'] },
+  { name: 'design',    aliases: ['design-check'], description: 'Design rulebooks this repository declares · /design [--declared] · /design pick [number|id] to choose a design direction', subcommands: ['--declared', 'pick'] },
   { name: 'provider',  aliases: ['p'],          description: 'LLM providers — /provider (list) · next (cycle, also Alt+M / pill click) · use <name> · pick (visual picker) · reset', subcommands: ['next', 'use', 'pick', 'picker', 'menu', 'reset', 'list'] },
   { name: 'reasoning', aliases: ['r', 'think'],  description: 'Reasoning level (codex effort + summary, anthropic extended-thinking budget) — /reasoning [off|low|medium|high|xhigh] (cycle when no arg · xhigh 는 모델 상한이 xhigh 이상일 때만 wire 에 실린다, 아니면 high 로 깎인다)', subcommands: ['off', 'low', 'medium', 'high', 'xhigh'] },
   { name: 'model',     aliases: ['m'],           description: 'Switch active model — /model <codex|terra|sol|luna|opus|sonnet|grok> (list + current when no arg). OpenAI 는 Codex(Responses API)만. effort 는 /reasoning.', subcommands: ['codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },
   { name: 'local',     aliases: ['ll'],         description: 'Local OpenAI-compatible LLM — ping / models / test / use', subcommands: ['ping', 'models', 'test', 'use', 'status'] },
   { name: 'session',   aliases: ['sess'],       description: 'Session resume — list / load / sync / new (handoff from mobile)', subcommands: ['list', 'load', 'sync', 'new'] },
-  { name: 'resume',    aliases: [],             description: 'Resume session — 픽커에서 선택 · /resume <id-prefix> 즉시 로드 (TUI 부활 S-a)' },
-  { name: 'fork',      aliases: [],             description: 'Fork — 현 시점 전체 복사로 새 세션 분기 (codex /fork 동형)' },
+  { name: 'resume',    aliases: [],             description: 'Pick a past session, or load one by id prefix · /resume <id-prefix>' },
+  { name: 'fork',      aliases: [],             description: 'Copy this session into a new one' },
   { name: 'rewind',    aliases: [],             description: 'Rewind — 과거 user 턴 픽커로 되감기 (원본 보존 · 새 세션 분기 · /rewind <n> 숏컷)' },
   // TUI 부활 C-a (2026-07-12): autopilot 미션 TUI 표면 — CLI 동등 단일 창구 소비.
   { name: 'mission',   aliases: [],             description: 'Autopilot 미션 — list(+헬스) · trace <id> 계보 · arm <id> 승인 (구체화/종료는 CLI)', subcommands: ['list', 'trace', 'arm'] },
@@ -468,7 +486,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'acp',    aliases: [], description: 'ACP chat — stream claude-code / codex / gemini replies into the chat pane (not a VW spawn). /acp codex points at the canonical codex app-server path; /acp cas is a synonym.', subcommands: ['claude', 'codex', 'gemini', 'cas', 'cancel', 'status', 'drop'] },
   { name: 'conv', aliases: [], description: 'Conversation widget/popup host — /conv list · /conv open <session-id> · /conv layout <cascade|tile|stack> · /conv focus <next|prev>.', subcommands: ['list', 'ls', 'open', 'layout', 'focus'] },
   { name: 'handoff', aliases: [], description: 'H5 P3 cross-agent context handoff: /handoff <from_session_id> <to_brand> [--channels r,p,m] [--prompt "prefix"]. Takes source session snapshot (filtered by channels if observer present) and launches target via adapter registry. Brands: codex · claude · claude-code · gemini · elanous.' },
-  { name: 'remaining', aliases: [], description: '계정마다 행으로 「지금 쓸 수 있는 것이 얼마나 남았나」를 본다 — 크레딧 축과 구독 축을 갈라 낸다. 화면은 명령 산출을 그대로 읽는다.' },
+  { name: 'remaining', aliases: [], description: 'What each account has left' },
   { name: 'agent-room', aliases: [], description: 'H6 P4 VW agent-room — /agent-room <N> <brands...> · /agent-room list · /agent-room close <id> · N ∈ {2,3,4} · brands: codex/claude/gemini/elanous/auto/lll:<m>', subcommands: ['list', 'close', 'preset', 'help'] },
   { name: 'showroom', aliases: ['sr'], description: 'Showroom v2 multi-LLM lane composer — /showroom (default 2-pane) · /showroom <lane1> <lane2> [<lane3> [<lane4>]] · lane = role:provider[:transport] · roles plan/build/exec/review/reflect · pair with /lane and /relay for cross-lane handoffs.', subcommands: ['help'] },
   { name: 'reply',   aliases: [], description: 'H6 P5 AgentReply — /reply <target-session-id> <message...> · send message to a live session, capture the response · flags: --from · --channels r,m · --idle-ms · --timeout-ms', subcommands: ['help'] },
@@ -701,6 +719,8 @@ export async function textInput(opts: {
    *  typing. The host is expected to mutate its own state; the input
    *  redraws the bar + picker on top afterward. */
   onMouse?: (mouse: { row: number; col: number; type: 'click' | 'double-click' | 'right-click' | 'scroll-up' | 'scroll-down' | 'drag' | 'release'; shift?: boolean }) => void | boolean | Promise<void | boolean>;
+  /** Scroll the host's chat log from the input without editing its buffer. */
+  onScrollKey?: (name: 'pageup' | 'pagedown') => boolean | void;
   /** MX11b — key interceptor called BEFORE textInput's own key
    *  handling. Host returns 'consumed' to short-circuit the event
    *  (no further input processing), 'passthrough' to let the default
@@ -1331,13 +1351,15 @@ export async function textInput(opts: {
     writeTerminal(endTextInputCursor(opts.cursorSink));
     return result;
   };
-  const submitBufferResult = (text: string): InputResult => (
-    finalizeInput({
+  const submitBufferResult = (text: string): InputResult => {
+    debug.log('chat.input.submit', 'summary', summarizeSubmitText(text.trim()));
+    lastSubmitAt = Date.now();
+    return finalizeInput({
       text: text.trim(),
       submitted: true,
       ...(pendingExternalSubmitSource ? { externalSubmitSource: pendingExternalSubmitSource } : {}),
-    })
-  );
+    });
+  };
   const currentBufferText = (): string => lines.join('\n').trim();
 
   // Expose drawAll so the host can ping us to re-paint after an
@@ -1401,6 +1423,7 @@ export async function textInput(opts: {
     }
 
     const key = await (opts.readKey ?? (() => readKey('input')))();
+    traceAfterSubmitKey(key);
 
     // Raw-key trace — diagnoses "modifier bit dropped before global-action
     // matcher saw the chord" cases (e.g. tablet terminal apps that
@@ -1625,6 +1648,11 @@ export async function textInput(opts: {
         drawAll();
         continue;
       }
+    }
+
+    if (!key.ctrl && (key.name === 'pageup' || key.name === 'pagedown') && opts.onScrollKey) {
+      if (opts.onScrollKey(key.name) !== false) drawAll();
+      continue;
     }
 
     const controlAction = resolveTextInputControlAction(key, {
@@ -1897,6 +1925,7 @@ export function attachStreamingKeys(
   };
   function deliver(keys: readonly Key[]): void {
     for (const key of keys) {
+      traceAfterSubmitKey(key);
       traceKey(key, 'stream');
       try {
         const r = handler(key);

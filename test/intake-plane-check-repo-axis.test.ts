@@ -1,26 +1,21 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { GAP_VERDICTS, intakeCheckReportJson, renderIntakeCheckReport, runIntakeCheck, runIntakeCheckDocument } from '../src/intake-plane/check.js';
 import { buildIntakeDocumentStageCallables } from '../src/intake-plane/runtime-callables.js';
+import { createIntakeFakeRepo } from './helpers/intake-fake-repo.js';
 
 const roots: string[] = [];
 const token = ['sample', 'repo', 'marker', 'q7'].join('-');
-function fakeRepo() {
-  const root = mkdtempSync(join(tmpdir(), 'intake-axis-'));
-  roots.push(root);
-  for (const dir of ['catalog', 'src', 'docs']) mkdirSync(join(root, dir), { recursive: true });
-  writeFileSync(join(root, 'catalog/resources.yaml'), 'resources: []\n');
-  writeFileSync(join(root, 'catalog/external-commands.yaml'), 'commands: []\n');
-  writeFileSync(join(root, 'src/index.ts'), '');
-  writeFileSync(join(root, 'docs/FAQ.md'), '# FAQ\n');
-  writeFileSync(join(root, 'docs/PRFAQ-elanous-docs-working-backwards-2026-09-22.md'), '# FAQ\n');
-  return { root, readFile: (path: string) => readFileSync(path, 'utf8'), commit: () => 'test',
-    draftDir: join(root, 'drafts'), log: () => {} };
-}
+const fakeRepo = () => createIntakeFakeRepo(roots, 'intake-axis-');
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const fact = () => ({ text: `elanous 에 \`${token}\` 가 있다` });
+
+test('fake repository supplies every ruler source without an unmeasured verdict', () => {
+  const item = runIntakeCheck([fact()], fakeRepo()).items[0]!;
+  expect(item.verdict).toBe('없음');
+  expect(item.failures).toEqual([]);
+});
 
 test('documentation-only match is a mention, not behavioral evidence', () => {
   const deps = fakeRepo();

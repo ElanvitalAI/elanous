@@ -1,4 +1,30 @@
+import { parse } from '../../src/agent-substrate/pr-comment-meta.js';
+
 export type MustFixVerdict = 'resolved' | 'unresolved' | 'unknown';
+export interface ReviewRoundMatch {
+  text: string;
+  verdict: 'rereviewed' | 'open';
+  run: string;
+  round: number;
+}
+
+/** A later reviewer round in the same run is evidence of rereview, not proof of repair. */
+const MUST_FIX_ROUND = /^Round \d+: reviewer requested \d+ must-fix change\(s\)\.$/m;
+
+export function classifyReviewRounds(comments: Array<{ body?: string }>): ReviewRoundMatch[] {
+  const reviews = comments.flatMap(({ body }) => {
+    if (!body) return [];
+    const meta = parse(body);
+    return meta?.role === 'reviewer' && meta.run && meta.round !== undefined
+      ? [{ body, run: meta.run, round: meta.round }] : [];
+  });
+  // 항목은 «must-fix 요청» 라운드에서만 센다 — «review completed (warn)» 의 요약 본문에도 «- » 글머리가 들어 있다(#21983 실물).
+  return reviews.flatMap(({ body, run, round }) => !MUST_FIX_ROUND.test(body) ? [] :
+    [...body.matchAll(/^- (.+)$/gm)].map((item) => ({
+      text: item[1]!, run, round,
+      verdict: reviews.some((review) => review.run === run && review.round > round) ? 'rereviewed' as const : 'open' as const,
+    })));
+}
 
 /** Match only named evidence in a PR's final patch, never an earlier review round. */
 export function matchMustFix(mustFix: string, finalDiff: string): MustFixVerdict {

@@ -1,6 +1,28 @@
 import { describe, expect, test } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
+import { splitKeys, KeyStreamParser } from './tui.js';
+
+describe('raw terminal control keys', () => {
+  test('LF is Ctrl+J, not Enter', () => {
+    expect(splitKeys('\n')).toEqual([{ name: 'j', ctrl: true, shift: false, alt: false, raw: '\n' }]);
+  });
+
+  test('CR remains Enter', () => {
+    expect(splitKeys('\r')).toEqual([{ name: 'enter', ctrl: false, shift: false, alt: false, raw: '\r' }]);
+  });
+
+  test('FS is Ctrl+\\, not Ctrl+4', () => {
+    expect(splitKeys('\x1c')).toEqual([{ name: '\\', ctrl: true, shift: false, alt: false, raw: '\x1c' }]);
+  });
+
+  test('bracketed paste keeps LF as text, not a Ctrl+J keystroke', () => {
+    expect(new KeyStreamParser().push('\x1b[200~a\nb\x1b[201~')).toEqual([{
+      name: 'paste', ctrl: false, shift: false,
+      raw: '\x1b[200~a\nb\x1b[201~', paste: 'a\nb',
+    }]);
+  });
+});
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const TUI_PATH = join(REPO_ROOT, 'src/tui.ts');

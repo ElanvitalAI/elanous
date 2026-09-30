@@ -24,14 +24,14 @@
 // no dashboard, no tui-client — verified by the expanded guard
 // test.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { dirname, join as joinPath } from 'node:path';
+import { ensureAuthToken } from '../auth/acp-token.js';
 
 import {
   listenUnixSocket,
   listenWebSocket,
-  generateAuthToken,
   createAuthVerifier,
 } from '../acp/transport/index.js';
 import { runAcpServer, type AcpServerOptions } from '../acp/server.js';
@@ -108,20 +108,6 @@ export function parseAcpBootArgs(argv: readonly string[]): AcpBootOptions {
   const toolCwd = readFlagValue(argv, '--tool-cwd');
   if (toolCwd !== undefined) opts.toolCwd = toolCwd;
   return opts;
-}
-
-/** Load or mint a persistent auth token for websocket boot. Stored
- *  at `~/.elanous/acp-token` with 0600 perms so the socket-holding
- *  user can bind-mount it into a parent client config. */
-function ensureAuthToken(): { token: string; path: string } {
-  const tokenPath = joinPath(getElanousConfigDir(), 'acp-token');
-  mkdirSync(dirname(tokenPath), { recursive: true });
-  if (existsSync(tokenPath)) {
-    return { token: readFileSync(tokenPath, 'utf-8').trim(), path: tokenPath };
-  }
-  const token = generateAuthToken();
-  writeFileSync(tokenPath, token, { mode: 0o600 });
-  return { token, path: tokenPath };
 }
 
 /** Resolved daemon-runtime status surfaced in the startup banner.

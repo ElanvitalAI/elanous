@@ -7,14 +7,13 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 
 import { elanousStateRoot } from './state-paths.js';
 import { autopilotMissionsDbPath } from './mission-registry.js';
 import { autopilotArmingPath, selfHealArmed } from './arming.js';
 import { resolveTelegramBotToken } from './mission-notify.js';
 import { setUserConfigOverlay, type UserConfig } from '../user-config.js';
-import { setTreeDerivedTestForTesting } from '../instance/resolve.js';
+import { resetEffectiveInstanceRoot, resolveInstance } from '../instance/resolve.js';
 
 const savedStateDir = process.env.ELANOUS_STATE_DIR;
 
@@ -24,16 +23,14 @@ function restoreEnv(): void {
 }
 
 describe('elanousStateRoot — ELANOUS_STATE_DIR 존중 (lazy)', () => {
-  // ⚠️ 이 단언은 **1·2층(명시 축)** 을 시험한다. 3층(트리 파생)은 **개발자 머신의
-  //    `~/.elanous/config.json`** 을 읽으므로 선언하지 않으면 *"미설정 = ~/.elanous"* 가 체크아웃에 따라
-  //    깨진다(비-리더 트리에서는 `<트리>/.elanous-test`). 시험 대상 축을 고정한다.
-  beforeEach(() => setTreeDerivedTestForTesting(false));
-  afterEach(() => { setTreeDerivedTestForTesting(undefined); restoreEnv(); });
+  beforeEach(() => resetEffectiveInstanceRoot());
+  afterEach(() => { restoreEnv(); resetEffectiveInstanceRoot(); });
 
-  it('미설정 = ~/.elanous · 설정 = 그 루트 (미션 DB·무장 경로 동반 이동)', () => {
+  it('미설정 = 해석된 테스트 우주 · 설정 = 그 루트 (미션 DB·무장 경로 동반 이동)', () => {
     delete process.env.ELANOUS_STATE_DIR;
-    expect(elanousStateRoot()).toBe(join(homedir(), '.elanous'));
-    expect(autopilotMissionsDbPath()).toBe(join(homedir(), '.elanous', 'autopilot/autopilot_missions.db'));
+    const root = resolveInstance().root;
+    expect(elanousStateRoot()).toBe(root);
+    expect(autopilotMissionsDbPath()).toBe(join(root, 'autopilot/autopilot_missions.db'));
 
     process.env.ELANOUS_STATE_DIR = '/x/repo/.elanous-test';
     expect(elanousStateRoot()).toBe('/x/repo/.elanous-test');

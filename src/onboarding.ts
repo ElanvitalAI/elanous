@@ -1193,6 +1193,27 @@ export function shouldRefuseInteractiveOnboarding(
   return o.ctx !== 'production' || !o.stdinIsTTY;
 }
 
+export class OnboardingRefusedError extends Error {
+  readonly code = 'onboarding-refused' as const;
+
+  constructor(message: string, readonly reason: 'non-tty' | 'autonomous-empty-universe') {
+    super(message);
+    this.name = 'OnboardingRefusedError';
+  }
+}
+
+/** Handle only typed refusals; the agent setup hint applies to its non-TTY path alone. */
+export function handleOnboardingRefusal(error: unknown, entrance: 'agent' | 'other'): boolean {
+  if (!(error instanceof OnboardingRefusedError) || error.code !== 'onboarding-refused') return false;
+  if (entrance === 'agent' && error.reason === 'non-tty') {
+    console.error('elanous agent needs a configured LLM. Run `elanous setup` in a terminal, or `elanous setup --non-interactive --config <path>` for unattended setup.');
+  } else {
+    console.error(error.message);
+  }
+  process.exitCode = 2;
+  return true;
+}
+
 function refuseInteractiveOnboardingIfNeeded(opts: RunWizardOpts, path: string): void {
   const ctx = getRunContext();
   const stdinIsTTY = !!input.isTTY;
@@ -1208,15 +1229,17 @@ function refuseInteractiveOnboardingIfNeeded(opts: RunWizardOpts, path: string):
       : '자율 컨텍스트에서 대화형 온보딩 요청 — 우주가 비어 있다(물질화 누락)',
   }, { level: 'error' });
   if (nonTTY) {
-    throw new Error(
+    throw new OnboardingRefusedError(
       '대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다. '
       + '무인 설정은 `elanous setup --non-interactive --config <path>`를 사용하라.',
+      'non-tty',
     );
   }
-  throw new Error(
+  throw new OnboardingRefusedError(
     `온보딩 마법사는 자율 컨텍스트(${ctx})에서 뜰 수 없다 — config 가 비어 있다(${path}). `
     + '자식 우주가 물질화되지 않았다는 뜻이다: `elanous config sync-test --state-dir <그 우주>` '
     + '로 깔거나, 스포너가 provisionDerivedUniverse 를 부르는지 확인하라.',
+    'autonomous-empty-universe',
   );
 }
 

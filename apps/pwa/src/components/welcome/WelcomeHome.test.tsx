@@ -36,6 +36,10 @@ describe('WelcomeHome — core routes and not-found guidance', () => {
     }
     expect(html).not.toContain('참고 주소');
     expect(html).not.toContain('data-route-kind="reference"');
+    expect(html).toContain('고치는 중인 화면');
+    for (const href of ['/morning', '/settings/devices', '/workflows/chat-ui']) {
+      expect(html.indexOf(`data-testid="${routeGuidanceTestId(href)}"`)).toBeGreaterThan(html.indexOf('고치는 중인 화면'));
+    }
   });
 
   test('keeps full menu and non-menu references on the not-found guidance list', () => {

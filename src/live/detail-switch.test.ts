@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +8,15 @@ import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-di
 
 const dirs: string[] = [];
 const tmp = () => { const d = mkdtempSync(join(tmpdir(), 'live-detail-')); dirs.push(d); return join(d, 'live', 'detail.json'); };
-afterEach(() => { resetElanousConfigDir(); resetLiveDetailCacheForTesting(); for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+const originalDetailUntil = process.env.ELANOUS_LIVE_DETAIL_UNTIL;
+beforeEach(() => { delete process.env.ELANOUS_LIVE_DETAIL_UNTIL; });
+afterEach(() => {
+  if (originalDetailUntil === undefined) delete process.env.ELANOUS_LIVE_DETAIL_UNTIL;
+  else process.env.ELANOUS_LIVE_DETAIL_UNTIL = originalDetailUntil;
+  resetElanousConfigDir();
+  resetLiveDetailCacheForTesting();
+  for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+});
 
 test('기본은 꺼짐 — 파일이 없거나 깨졌으면 상세 관측을 안 낸다(fail-closed)', () => {
   const path = tmp();
@@ -80,6 +88,42 @@ test('두 파일의 5초 캐시 — 파일 추가와 삭제는 만료 전까지 
   writeFileSync(production, JSON.stringify({ scope: 'all', since: 12_000, until: 12_000 }));
   expect(isLiveDetailOn('r', { path: local, prodPath: production, now: 12_001 })).toBe(true);
   expect(isLiveDetailOn('r', { path: local, prodPath: production, now: 16_003 })).toBe(false);
+});
+
+test('env until 이 미래면 파일 부재·off 에서 모든 런을 켜고 만료 시 즉시 끈다', () => {
+  const path = tmp();
+  process.env.ELANOUS_LIVE_DETAIL_UNTIL = '2000';
+  expect(isLiveDetailOn(undefined, { path, now: 1_000 })).toBe(true);
+  expect(isLiveDetailOn('any-run', { path, now: 1_000 })).toBe(true);
+  expect(selectLiveDetail({ path, now: 1_000 })).toMatchObject({ state: null, source: null, path: null });
+  writeLiveDetail({ ttlMin: 0 }, { path, now: 1_000 });
+  expect(isLiveDetailOn('other-run', { path, now: 1_001 })).toBe(true);
+  expect(isLiveDetailOn('other-run', { path, now: 2_000 })).toBe(false);
+});
+
+test('env until 은 만료·잘못된 값이면 무시하며 파일의 활성 범위를 넓히지 않는다', () => {
+  const path = tmp();
+  for (const value of ['1000', 'not-a-date', '2000oops', '2e3', '-1', 'Infinity', '9007199254740992', '']) {
+    process.env.ELANOUS_LIVE_DETAIL_UNTIL = value;
+    expect(isLiveDetailOn('run-1', { path, now: 1_000 })).toBe(false);
+  }
+  process.env.ELANOUS_LIVE_DETAIL_UNTIL = '2000';
+  writeLiveDetail({ scope: 'run-7', ttlMin: 10 }, { path, now: 1_000 });
+  expect(isLiveDetailOn('run-7', { path, now: 1_001 })).toBe(true);
+  expect(isLiveDetailOn('run-8', { path, now: 1_001 })).toBe(false);
+});
+
+test('emitDecision 은 env until 로 게이트하고 만료 또는 잘못된 값에서는 내지 않는다', () => {
+  const path = tmp();
+  const event = { kind: 'ROUTE' as const, what: 'env gate', reason: 'reason', purpose: 'test', target: 'target', runId: 'run-1' };
+  process.env.ELANOUS_LIVE_DETAIL_UNTIL = '2000';
+  expect(emitDecision(event, { path, now: 1_000 })).toBe(true);
+  expect(emitDecision({ ...event, what: 'expired' }, { path, now: 2_000 })).toBe(false);
+  process.env.ELANOUS_LIVE_DETAIL_UNTIL = 'bad';
+  expect(emitDecision({ ...event, what: 'malformed' }, { path, now: 1_001 })).toBe(false);
+  writeLiveDetail({ ttlMin: 0 }, { path, now: 1_000 });
+  process.env.ELANOUS_LIVE_DETAIL_UNTIL = '3000';
+  expect(emitDecision({ ...event, what: 'file off' }, { path, now: 1_001 })).toBe(true);
 });
 
 test('넥서스 끝점 — 소유자만 · POST 로 켜고 GET 으로 본다 · 나쁜 값 거절', async () => {

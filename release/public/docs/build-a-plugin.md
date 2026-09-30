@@ -41,7 +41,7 @@ That is all the folder holds. The skill and the graph stay where they already li
 | `graphs` | Graph files inside the package that elanous registers. Only listed graphs are registered — the loader does not scan folders. A listed graph that is not in the package stops the publish for this plugin (`graph-missing`). |
 | `nodes` | Custom node kinds the plugin adds (`./nodes/<kind>.yaml`), registered as `<plugin>:<kind>` when elanous finds the installed plugin. Each node declares `kind`, `graph` (`workflow` or `harness`), `inputs` (a JSON Schema — the editor builds its form from it) and `run` — one of `bash`, `http`, `skill` or `mcp`. A node with an unknown `run` is skipped with a warning; the rest of the plugin still loads. |
 | `capabilities` | What the plugin may touch, shown to the user before install: `fs:workdir`, `net:<host>`, `proc:<binary>`, `agent:<backend>`, `secret:<service>`. |
-| `connectors` | Services the plugin connects to, with the settings it asks the user for; fields marked secret are write-only. |
+| `connectors` | Services the plugin connects to and the settings it asks the user for: `{ "id", "kind", "userConfig": [{ "key", "label", "secret", "env" }] }`. Values are set with `elanous plugin credentials` or the web app and reach the plugin's graphs and servers as environment variables — named by `env`, or `ELANOUS_PLUGIN_<PLUGIN>_<KEY>` when `env` is absent. Fields marked secret are write-only. |
 | `pricing` | `{ "model": "free" }`. Only free plugins are published for now. |
 
 `.codex-plugin/plugin.json` carries the Codex fields (`name`, `version`, `description`, `"skills": "./skills/"`, `interface`) so Codex installs the same package.

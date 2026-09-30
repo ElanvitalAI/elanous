@@ -326,7 +326,8 @@ function parseKey(data: string | Buffer): Key {
   if (s === '\x1b[3~') return K('delete');
 
   // Special keys
-  if (s === '\r' || s === '\n')   return K('enter');
+  if (s === '\r')                 return K('enter');
+  if (s === '\n')                 return K('j', true); // Ctrl+J → LF
   if (s === ' ')                  return K('space');
   if (s === '\x1b')               return K('escape');
   if (s === '\t')                 return K('tab');
@@ -341,7 +342,7 @@ function parseKey(data: string | Buffer): Key {
   // fallback for plain terminals. Ctrl+1 has no distinct wire form;
   // Ctrl+3 collides with Escape — so those must come via modKeys.
   if (s === '\x00')  return K('2', true); // Ctrl+2 → NUL
-  if (s === '\x1c')  return K('4', true); // Ctrl+4 → FS
+  if (s === '\x1c')  return K('\\', true); // Ctrl+\\ → FS; Ctrl+4 shares this byte, so requires kitty/modifyOtherKeys
   if (s === '\x1d')  return K('5', true); // Ctrl+5 → GS
   if (s.length === 1 && s.charCodeAt(0) < 32) {
     return K(String.fromCharCode(s.charCodeAt(0) + 96), true);

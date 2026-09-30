@@ -163,9 +163,7 @@ describe('createMissionTurnEmitter · resilience', () => {
       missionIdOverride: 'm',
       now: fixedNow(),
     });
-    // 본 호출이 throw 하면 test fail. emitter 의 try/catch 가 swallow 해야.
-    await emitter.start();
-    await emitter.end('done');
-    expect(true).toBe(true);
+    await expect(emitter.start()).resolves.toBeUndefined();
+    await expect(emitter.end('done')).resolves.toBeUndefined();
   });
 });

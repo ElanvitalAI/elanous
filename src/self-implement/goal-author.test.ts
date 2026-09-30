@@ -9,6 +9,7 @@ import { groundMissionInCodebase } from '../autopilot/mission-codebase-gate.js';
 import { REQUIRED_EVIDENCE_COMMAND_SEPARATOR, requiredEvidenceFromGoal } from './off-diff-evidence.js';
 import { setMissionSlugStreamForTest } from '../autopilot/mission-registry.js';
 import { debug } from '../debug/log.js';
+import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 import { applyHarnessPolicy } from './harness-policy.js';
 import { requestTestScenario, type TestScenarioLaunchInput } from './test-scenario-request.js';
 import { parseGoalAuthorClarifications, parseGoalAuthorParent, parseGoalDocumentClarifications, serializeGoalAuthorClarification } from './goal-author-clarification.js';
@@ -8171,13 +8172,13 @@ describe('goal-file lint origins', () => {
     'decision-signal-numeric-source', 'decision-signal-numeric-coverage', 'decision-signal-proxy-expectation',
     'out-of-target-requirement', 'heading-form-marker', 'blanket-invariant', 'self-question-subject',
     'artifact-launch-declaration', 'all-negative-signals', 'unreadable-signals', 'alternative-signals', 'count-observation',
-    'identifier-name-observation', 'self-reported-observation', 'default-invocation-observation',
+    'identifier-name-observation', 'self-reported-observation', 'default-invocation-observation', 'release-note',
   ];
 
   test('has one explicit origin entry for every existing lint tag', () => {
     expect(Object.keys(GOAL_FILE_LINT_ORIGINS).sort()).toEqual([...tags].sort());
     expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'known-incident')).toHaveLength(16);
-    expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'unknown-origin')).toHaveLength(8);
+    expect(Object.values(GOAL_FILE_LINT_ORIGINS).filter((origin) => origin.kind === 'unknown-origin')).toHaveLength(9);
     for (const origin of Object.values(GOAL_FILE_LINT_ORIGINS)) {
       if (origin.kind === 'known-incident') {
         expect(origin.incident).not.toHaveLength(0);
@@ -8205,6 +8206,74 @@ describe('goal-file lint origins', () => {
       incident: 'nine required sections blocked handwritten goals',
       reference: 'git:d2c18dd58 (#6789)',
     });
+  });
+});
+
+describe('lintGoalFile · release notes', () => {
+  const releaseFindings = (section: string) => lintGoalFile(`${GOAL_WITHOUT_ARTIFACT_LAUNCH_DECLARATION}\n\n${section}`, 'main')
+    .filter((finding) => finding.tag === 'release-note');
+  const valid = '## 릴리스 노트\n- 한 줄: Improve goal lint\n- 종류: feat\n- 문서: 없음(internal tooling)\n- 대상: next';
+
+  test('accepts a section the release parser accepts', () => {
+    expect(parseReleaseNoteSection(valid).problems).toEqual([]);
+    expect(releaseFindings(valid)).toEqual([]);
+  });
+
+  test('warns about an unrecognized kind and suggests feat instead of feature without blocking launch', () => {
+    const invalid = valid.replace('종류: feat', '종류: feature');
+    expect(parseReleaseNoteSection(invalid).problems).toEqual(['종류']);
+    const findings = releaseFindings(invalid);
+    expect(findings).toHaveLength(1);
+    expect(findings[0]!.level).toBe('WARN');
+    expect(findings[0]!.message).toInclude('종류');
+    expect(findings[0]!.message).toInclude('feature → feat');
+  });
+
+  test('warns about missing documentation and target fields', () => {
+    const invalid = valid.replace('- 문서: 없음(internal tooling)\n- 대상: next', '');
+    expect(parseReleaseNoteSection(invalid).problems).toEqual(['문서', '대상']);
+    const findings = releaseFindings(invalid);
+    expect(findings).toHaveLength(2);
+    expect(findings.map((finding) => finding.message)).toEqual([expect.stringContaining('문서'), expect.stringContaining('대상')]);
+    expect(findings.every((finding) => finding.level === 'WARN')).toBe(true);
+  });
+
+  test('warns for the referenced fix goal shape without documentation or target', () => {
+    const findings = releaseFindings('## 릴리스 노트\n- 한 줄: Fix model doctor disagreement\n- 종류: fix');
+    expect(findings).toHaveLength(2);
+    expect(findings.every((finding) => finding.level === 'WARN')).toBe(true);
+    expect(findings.map((finding) => finding.message)).toEqual([
+      expect.stringContaining('문서 invalid or missing'), expect.stringContaining('대상 invalid or missing'),
+    ]);
+  });
+
+  test('warns when a public release line contains Korean', () => {
+    for (const kind of ['feat', 'fix', 'security']) {
+      const findings = releaseFindings(valid.replace('종류: feat', `종류: ${kind}`).replace('Improve goal lint', '골 린트 개선'));
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({ level: 'WARN', message: expect.stringContaining('영어로') });
+    }
+  });
+
+  test('warns about Korean in a public line even when the parser also reports missing fields', () => {
+    const findings = releaseFindings('## 릴리스 노트\n- 한 줄: 골 린트 개선\n- 종류: fix');
+    expect(findings.map((finding) => finding.message)).toEqual([
+      expect.stringContaining('문서 invalid or missing'),
+      expect.stringContaining('대상 invalid or missing'),
+      expect.stringContaining('영어로'),
+    ]);
+  });
+
+  test('ignores a release-note heading inside a fenced example', () => {
+    expect(releaseFindings('```md\n## 릴리스 노트\n- 종류: feature\n```')).toEqual([]);
+  });
+
+  test('allows a Korean line for internal changes', () => {
+    expect(releaseFindings(valid.replace('종류: feat', '종류: internal').replace('Improve goal lint', '골 린트 개선'))).toEqual([]);
+  });
+
+  test('leaves a goal without a release-note section silent', () => {
+    expect(releaseFindings('')).toEqual([]);
   });
 });
 

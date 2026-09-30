@@ -47,7 +47,8 @@ test('CLI writes IN-only release notes, flips every public-doc marker, and regis
   expect(first.status).toBe(0);
   expect(first.output).toMatchObject({ outcome: 'ok', version: '9.9.9' });
   const notes = readFileSync(join(notesDir, '9.9.9.md'), 'utf8');
-  expect(notes).toContain('## Behavior changes\n\n- New behavior ([#42](https://github.com/ElanvitalAI/elanous/pull/42))');
+  expect(notes).toContain('## Behavior changes\n\n- New behavior');
+  expect(notes).not.toContain('github.com');
   expect(notes).not.toContain('later');
   expect(readFileSync(join(docsDir, 'architecture.md'), 'utf8')).toBe('✅ in v9.9.9\n🔄 in progress\n📋 designed\n');
   expect(readFileSync(join(docsDir, 'harness.md'), 'utf8')).toBe('✅ in v9.9.9\n');
@@ -93,6 +94,16 @@ for (const failedFile of ['9.9.9.md', 'harness.md', 'pages.json']) {
   });
 }
 
+test('CLI rerun keeps previously landed linked and unlinked notes when their origin is unknown', () => {
+  const { root, run, notesDir } = fixture();
+  const notes = join(notesDir, '9.9.9.md');
+  expect(run(['--version', '9.9.9', '--base', root, '--json']).status).toBe(0);
+  const existing = '# 9.9.9\n\nLaunch headline.\n\n## Behavior changes\n\n- Hand-written fix ([#52](https://github.com/ElanvitalAI/elanous/pull/52))\n- Hand-written unlinked fix.\n';
+  writeFileSync(notes, existing);
+  expect(run(['--version', '9.9.9', '--base', root, '--json']).status).toBe(0);
+  expect(readFileSync(notes, 'utf8')).toBe(existing);
+});
+
 test('pre-existing unrelated release notes without a pages entry are folded in, never overwritten or refused', () => {
   const { root, run, notesDir } = fixture();
   const notes = join(notesDir, '9.9.9.md');
@@ -101,7 +112,7 @@ test('pre-existing unrelated release notes without a pages entry are folded in, 
   expect(result.status).toBe(0);
   const text = readFileSync(notes, 'utf8');
   expect(text).toStartWith('# 9.9.9\n\nUnrelated notes.\n');
-  expect(text).toContain('- New behavior ([#42]');
+  expect(text).toContain('- New behavior');
 });
 
 // Real sample (main, 09-29): #21496 landed its own line into releases/0.2.4.md before the release loop ran,
@@ -115,7 +126,7 @@ test('a line a PR landed early and a headline paragraph are both kept around the
   expect(result.status).toBe(0);
   const text = readFileSync(notes, 'utf8');
   expect(text).toStartWith('# 9.9.9\n\nElanous now drives coding agents from inside their own screens.\n');
-  expect(text).toContain('## Behavior changes\n\n- New behavior ([#42]');
+  expect(text).toContain('## Behavior changes\n\n- New behavior');
   expect(text).toContain(`## Also in this release\n\n${landed}\n`);
   expect(text.split(landed).length - 1).toBe(1);
   const pages = JSON.parse(readFileSync(join(root, 'website/pages.json'), 'utf8'));
@@ -155,7 +166,7 @@ test('paragraph breaks inside a pre-landed section are kept · a same-text line 
   expect(run(['--version', '9.9.9', '--base', root, '--json']).status).toBe(0);
   const text = readFileSync(notes, 'utf8');
   expect(text).toContain('## Known issues\n\nFirst note.\n\nSecond note.\n\n- New behavior\n');
-  expect(text).toContain('## Behavior changes\n\n- New behavior ([#42]');
+  expect(text).toContain('## Behavior changes\n\n- New behavior');
 });
 
 test('merging into a rendered section keeps a paragraph apart from the rendered list', () => {
@@ -163,7 +174,7 @@ test('merging into a rendered section keeps a paragraph apart from the rendered 
   const notes = join(notesDir, '9.9.9.md');
   writeFileSync(notes, '## Behavior changes\n\n- New behavior\n\nA note about this change.\n');
   expect(run(['--version', '9.9.9', '--base', root, '--json']).status).toBe(0);
-  expect(readFileSync(notes, 'utf8')).toContain('- New behavior ([#42](https://github.com/ElanvitalAI/elanous/pull/42))\n\nA note about this change.\n');
+  expect(readFileSync(notes, 'utf8')).toContain('- New behavior\n\nA note about this change.\n');
 });
 
 test('a pre-landed section with the same heading as a rendered one merges into it', () => {
@@ -172,7 +183,7 @@ test('a pre-landed section with the same heading as a rendered one merges into i
   writeFileSync(notes, '## Behavior changes\n\n- Early line under the same heading.\n');
   expect(run(['--version', '9.9.9', '--base', root, '--json']).status).toBe(0);
   const text = readFileSync(notes, 'utf8');
-  expect(text).toContain('## Behavior changes\n\n- New behavior ([#42](https://github.com/ElanvitalAI/elanous/pull/42))\n- Early line under the same heading.\n');
+  expect(text).toContain('## Behavior changes\n\n- New behavior\n- Early line under the same heading.\n');
   expect(text.match(/## Behavior changes/g)).toHaveLength(1);
   expect(text).not.toContain('## Also in this release');
 });

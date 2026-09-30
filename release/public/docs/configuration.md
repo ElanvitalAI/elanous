@@ -40,7 +40,7 @@ or, from a checkout, `bash scripts/add-api-key.sh OPENROUTER_API_KEY`. `elanous 
 |---|---|
 | `llm.provider` | Default model provider (`openai-codex`, `grok`, `openrouter`, `anthropic`, `gemini`, `local`, …) |
 | `llm.model` | Default model for that provider (leave unset to use the provider's default tier) |
-| `llm.fallbackChain` | Providers to try, in order, when the default cannot answer |
+| `llm.fallbackChain` | Where to go when every Codex account is used up: `codex-rotate` (another Codex account) and `grok`; other names are ignored. Default is both — set `["codex-rotate"]` to never fall back to Grok |
 | `roleLlm` | A different model per role (planning, review, …) |
 
 See [providers](providers.md) for what each provider needs.
@@ -60,22 +60,22 @@ See [providers](providers.md) for what each provider needs.
 `~/.elanous/config.json` holds user-level settings beyond env vars.
 (Older builds wrote `~/.config/elanous/config.json`; that path still appears in
 the source but the live config directory is `~/.elanous` — check yours with
-`elanous where`.)
+`elanous config path`.)
 
 | Section     | Purpose                                                                  |
 |-------------|--------------------------------------------------------------------------|
-| `llm`       | provider (`auto`/`grok`/`openai`/`anthropic`/`local`/`openai-codex`),    |
+| `llm`       | provider (`auto`/`openai-codex`/`grok`/`openai`/`anthropic`/`gemini`/`openrouter`/`local`), |
 |             | `apiKey`, `model`, `baseUrl` (for local / codex proxies)                 |
 | `skills`    | `activeSet` preset + `dirs[]` — scan multiple SKILL.md roots at once     |
 | `obsidian`  | `vault` (absolute path)                                                  |
 | `telegram`  | `enabled`, `botToken`, `allowedUsers[]`, `homeChannel`                   |
 | `onboarding`| `completed`, `completedAt`, `version`                                    |
 
-**Skill dir presets** — `claudecode` (`~/.claude/skills`), `opencode`
-(`~/.config/opencode/skills`, default), `codex` (`~/.codex/skills`),
+**Skill dir presets** — `claudecode` (`~/.claude/skills`, default), `opencode`
+(`~/.config/opencode/skills`), `codex` (`~/.codex/skills`),
 `hermes` (`~/.hermes/skills`), `openclaw` (`~/.openclaw/workspace/skills`),
 or `custom` for your own paths. Multiple dirs can be scanned
 simultaneously (first-dir-wins on name collisions).
 
-Re-run the wizard any time: `elanous setup`.
+Re-run the wizard any time: `elanous onboarding` (or one step, for example `elanous onboarding telegram`).
 

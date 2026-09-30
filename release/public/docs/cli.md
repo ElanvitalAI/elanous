@@ -1,6 +1,6 @@
 # CLI reference
 
-Generated from `elanous <command> --help` for the 31 commands this manual uses. Every command also answers `--help`; `elanous --help` lists all of them, including maintainer tools not covered here.
+Generated from `elanous <command> --help` for the 55 commands this manual uses. Every command also answers `--help`; `elanous --help` lists all of them, including maintainer tools not covered here.
 
 ## `elanous acp`
 
@@ -36,6 +36,28 @@ elanous agent [options] [command] [text...]
 |---|---|
 | `dispatch [options] <subagent_type> <prompt...>` | Spawn one sub-agent from the terminal and print its final message. Observe with `elanous logs --category agent.spawn` / `--category agent.done` — the printed cid pairs the two. |
 
+## `elanous agent-mission`
+
+Agent-mission CLI — missions, review watching and setup for external agent backends (codex [default] · claude · gemini · grok · aside). `codex` is a deprecated alias (kept for compatibility).
+
+```text
+elanous agent-mission|codex [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `capabilities [options]` | List codex, claude and grok service capabilities (read only) |
+| `install-from-docs [options] <tool>` | Read the official install docs and pick a safe install line — sudo is left to a person |
+| `browser-login [options]` | Approve a CLI login using a pre-authenticated local browser session |
+| `plan [options] <mission>` | Detect the environment and show where the tool ladder starts (installs nothing, runs no mission) |
+| `mission|run [options] [text...]` | ★ Open the chosen backend in a PTY (default codex --yolo · --backend for claude/gemini/grok/aside) and run the mission to completion in a worktree (input → result → next input). Subscription mode · omni-crawl fallback · evidence gate (doc\|tsc\|test). Your text is passed verbatim, with additive enhancement inside elanous (on by default · anti-drift). Logs: elanous logs --category agent-mission |
+| `review-loop [options] <pr>` | ★ Read a PR review (OK / needs work / rejected) and react — on needs work the agent (default codex) applies the comments and pushes again; on rejected it asks a person. Logs: elanous logs --category review-loop |
+| `review-stats [options]` | ★ Learning loop — statistics on unattended review decisions (regression rate by weight) plus suggested weight thresholds. Logs: elanous logs --category review-loop |
+| `review-watch [options]` | ★ Standing poller — periodically polls open PRs with the opt-in label (auto-review) and runs review-loop unattended when a new human review appears. Logs: elanous logs --category review-watch |
+| `setup` | One command: OAuth / API-key auth + model picker + save config |
+| `models` | Print the curated Codex model catalog |
+| `config-migrate [options]` | Write/refresh the managed [mcp_servers.elanous-tools] block in ~/.codex/config.toml. Idempotent · creates a .bak snapshot · `--remove` strips the block. |
+
 ## `elanous ask`
 
 Alias for `elanous chat --new`: send one query and print the reply
@@ -61,7 +83,7 @@ elanous attach [options]
 | Option | Description |
 |---|---|
 | `--socket <path>` | Override the unix socket path (default: ~/.elanous/elanous.sock) |
-| `--host <hostport>` | Remote daemon host:port (e.g. mbp.tailnet:31415). Coerced to ws://&lt;hostport&gt;/v1/acp. |
+| `--host <hostport>` | Remote daemon host:port (e.g. laptop.tailnet:31415). Coerced to ws://&lt;hostport&gt;/v1/acp. |
 | `--url <wsurl>` | Remote daemon WS URL (e.g. ws://host:31415/v1/acp). Overrides --host. |
 | `-r, --remote [name]` | Bookmark name (`-r` alone = default). Fills host/token-file; explicit --url/--host/--token/--token-file win. |
 | `--token <token>` | Bearer token for remote auth. Overrides --token-file and ELANOUS_TOKEN. |
@@ -75,6 +97,19 @@ elanous attach [options]
 | `--assert-tool-max <spec...>` | Assert: daemon tool fired ≤N times. Format: ToolName=N (one-shot only) |
 | `-i, --interactive` | Start an interactive REPL — type messages, get streamed responses (slash commands: /quit /new /list /help) |
 | `--cwd <path>` | Working directory reported in newSession() (default: "&lt;current directory&gt;") |
+
+## `elanous card`
+
+Inspect task cards
+
+```text
+elanous card [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `show [options] <id>` | Show a task card and its sections |
+| `list [options]` | List task cards |
 
 ## `elanous chat`
 
@@ -111,6 +146,45 @@ elanous config [options] [command]
 | `promote [options] <path...>` | Propagate field(s) from the test config to production (per-field raw patch · multiple paths · dry-run by default · --yes to apply) |
 | `mission` | Inspect or edit llm.missionRouting (mission → provider table) |
 
+## `elanous connector`
+
+External task connectors
+
+```text
+elanous connector [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `linear` | Linear issues to TOX tasks |
+
+## `elanous control`
+
+Standalone control plane
+
+```text
+elanous control [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `serve [options]` | Run the control plane in the foreground |
+| `member [options]` | Register and heartbeat this joined machine's resources in the foreground |
+| `join [options]` | Join using the primary control plane's address and a machine-scoped token |
+| `token` | Manage per-machine scoped tokens |
+
+## `elanous directive`
+
+Turn instructions into Linear issues
+
+```text
+elanous directive [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `add [options] <text>` |  |
+
 ## `elanous discord-test`
 
 Standalone TEST discord session (SAME app/token, scoped to discord.testChannel.channelId) with ISOLATED state, WITHOUT touching the production daemon. Restart THIS process to test code changes; the live daemon stays up.
@@ -138,10 +212,52 @@ elanous doctor [options]
 | Option | Description |
 |---|---|
 | `--json` | structured output |
-| `--fix` | show reversible repairs (read-only unless --yes) |
+| `--credentials` | show per-credential details in human-readable output |
+| `--fix` | show repairs; git installation asks on a TTY (other repairs require --yes) |
+| `--advise` | ask the configured LLM to rank catalog repairs (read-only advice) |
 | `--yes` | apply planned doctor repairs (requires --fix) |
 | `--sudo` | also run the planned sudo install lines — only where `sudo -n true` works (requires --fix --yes) |
 | `--restart` | restart the nexus service when it runs a different version than this installed copy, then verify it (requires --fix --yes · interrupts bots, terminals and running turns) |
+
+## `elanous env`
+
+Environment detection
+
+```text
+elanous env [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `profile [options]` | Show the environment profile (read-only) |
+
+## `elanous graph`
+
+Run a declared command graph or inspect its latest run
+
+```text
+elanous graph [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `run [options] <file>` |  |
+| `tick [options] <file>` | Advance one graph run, resuming a pending decision or starting only when requested |
+| `notify [options]` | Deliver graph run events not yet recorded in the notification ledger |
+| `approve [options] <graph_id> <run_id>` |  |
+| `status [options] <graph_id>` |  |
+
+## `elanous grounding`
+
+Grounding source registry
+
+```text
+elanous grounding [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `sources` | List, add and remove registered grounding sources and check their freshness |
 
 ## `elanous harness`
 
@@ -155,10 +271,13 @@ elanous harness [options] [command]
 |---|---|
 | `deliverable-verify [options] <goal-path>` | Observe the addresses a goal document declares as Port. By default only looks at what is already running — with --launch it starts the deliverable, checks it, and always stops it. |
 | `processes` | Classify, read-only, the OS processes this repository started: heavy resource users vs long-lived ones. Kills nothing. |
+| `budget [options]` | Decide whether to run this round from preferences, usage and limits. With --json the last line is the outcome JSON. |
+| `drafts` | Tidy up harness draft PRs |
 | `ask [options] <goal-path>` | Run from a goal document path |
 | `say [options] <sentence...>` | Run from a sentence |
 | `plan [options] <sentence...>` | Write an RFC without executing it |
 | `mission [options] <mission-ids...>` | Solve one or more existing missions with the harness |
+| `stop [options] <runId>` | Stop one run — its orchestrator process (only when the start time in pid.json matches) ⊕ the Pod Job labelled elanous.run=&lt;runId&gt; |
 | `clean [options]` | Clean harness disposable worktrees + branches (default prefix comes from the creator's constant). ⚠️ Worktrees with an open PR are always kept. Dry-run by default (plan only · --yes to remove). |
 | `worktree` | Create a harness worktree. |
 | `worktrees [options]` | Judge every registered worktree, read-only, by PR · dirty state · output · session ownership. Never removes anything by default. |
@@ -170,6 +289,54 @@ elanous harness [options] [command]
 | `verify-url [options] <url>` | Open a deployed/local URL with the cdp (default) or aside backend and verify the render (screenshot + body/title diagnostics). CDP reuses an attached browser on port 9222; skips if no backend is available. |
 | `map [options]` | Harness self-description — prints the stage pipeline (order · role), execution spaces and terminal states (no side effects). |
 | `orchestrate [options] <goals...>` | Parallel self-dev — run several goals at once, each as an isolated-worktree self-implement subprocess, with a concurrency cap. |
+
+## `elanous hooks`
+
+Receive and redeliver outside webhooks
+
+```text
+elanous hooks [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `serve [options]` | Run the webhook receiver in the foreground |
+| `status` | Pending webhook count and last delivery time |
+
+## `elanous intake`
+
+Check outside facts and documents against current elanous, or take them in as tasks
+
+```text
+elanous intake [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `check [options]` | Check a list of facts, a document path, a URL or standard input against current elanous. Gaps and stale parts only produce goal drafts. |
+| `collect-pod [options] <dir>` | Safely collect Pod intake output into the vault and mark it in the intake ledger |
+| `ingest [options]` | Put collector output (JSONL · one line = {url,title,text,kind,signals,…}) into the intake ledger in shape — the same item is merged |
+| `items [options]` | Show intake ledger items (most recently seen first) |
+| `mark [options] <id>` | Update an intake ledger item's status and output (for example absorbed ⊕ the note path after absorbing) |
+| `digest [options]` | Daily intake digest — what was absorbed that day by axis · each note's one-line conclusion · goal candidates. As a note section (Markdown) or to the Telegram report channel |
+| `route [options] <id>` | Split an absorbed item's check result (intake check --json) into output queues — nothing → goals · judgement needed on docs only → manual · note → grounding candidate |
+| `grounding-sync [options]` | Copy notes from the grounding candidate queue into a single registrable document folder (the registry is only read) |
+| `queue [options]` | Automatic intake queue — pick saved Telegram links first in their own lane, then move the general share to queued up to the daily limit |
+| `to-tasks [options]` | Interpret unconsumed goal lines and public idea notes and register them as Nexus tasks (at most 5 by default) |
+| `collect-telegram-saved [options]` | Read Telegram «Saved Messages» (read-only) into the intake ledger (only after the cursor · host only · personal memos stay user-private) |
+| `collect-github [options]` | Collect GitHub repositories on topics of interest by stars into the intake ledger (recently created or pushed only · growth from star snapshots) |
+
+## `elanous keys`
+
+Print all keybindings + slash commands. Optional context filter.
+
+```text
+elanous keys [options] [context]
+```
+
+| Option | Description |
+|---|---|
+| `--audit` | Print context-aware duplicate/chord audit |
 
 ## `elanous local`
 
@@ -233,6 +400,8 @@ elanous logs [options] [command]
 | `--before <cursor>` | ⭐ Page cursor — a row id, or the nextCursors JSON object from federated --json metadata |
 | `--session <id>` | Filter by session_id |
 | `--limit <n>` | Maximum rows (default 100 · local reads are not capped at 1000 — that cap moved to the HTTP boundary) |
+| `--top-failures` | Count recent failures by reason, whatever their level (default 10m) |
+| `--threshold <n>` | Minimum count for a repeated failure (default 20) |
 | `--json` | JSON output |
 | `--json-data` | Emit JSON data as parsed values in --json output |
 | `--test` | Read the logs of the isolated test instance (.elanous-test/) of the repo in the current directory |
@@ -253,6 +422,48 @@ elanous logs [options] [command]
 | `unclosed [options]` | Work that started but never finished, oldest first — hang candidates. ⛔ Sets no threshold (the reader picks the cut with --older-than) |
 | `abandoned-draft-prs [options]` | Count and name abandoned draft PRs that have no salvage verdict yet (read-only · no closing/labels/comments) |
 
+## `elanous loop`
+
+Inspect and control graph-backed loop agents
+
+```text
+elanous loop [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` |  |
+| `status [options] <id>` |  |
+| `start [options] <id>` |  |
+| `stop [options] <id>` |  |
+| `run [options] <id>` |  |
+
+## `elanous machine`
+
+Machine identifier · assigned work · ranked placement candidates
+
+```text
+elanous machine [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `set [options]` |  |
+| `show [options]` |  |
+
+## `elanous market`
+
+Signed plugin marketplace
+
+```text
+elanous market [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `publish [options]` | Publish a local signed marketplace index and archives |
+| `keygen [options]` | Generate a local test index signing key |
+
 ## `elanous mcp`
 
 MCP (Model Context Protocol) server / client integration
@@ -263,6 +474,9 @@ elanous mcp [options] [command]
 
 | Subcommand | Description |
 |---|---|
+| `gateway [options]` | Owner-PAT authenticated public MCP relay to the scoped NEXUS endpoint |
+| `token` | Manage owner-only MCP personal access tokens |
+| `nexus-token` | Issue a gateway-only NEXUS mcp-public token |
 | `serve` | Run a stdio MCP server exposing the configured mcp.servers as proxy tools (used by `claude mcp add elanous -- elanous mcp serve`) |
 | `login [options] <serverId>` | Acquire and persist OAuth credentials for one configured HTTP MCP server. |
 | `reload [options]` | Re-read user-config and rebuild the running daemon's MCP clients — no daemon restart. Use after editing mcp.servers[] or `elanous mcp login`. |
@@ -302,6 +516,7 @@ elanous nexus [options] [command]
 
 | Subcommand | Description |
 |---|---|
+| `ingest-token` | Manage POST /v1/tasks-only bearer tokens |
 | `run [options]` | Boot the NEXUS daemon. Default = headless + PWA-ready. Lifecycle auto-detected from TTY (fork+detach when interactive, inline blocking under launchd / systemd / Docker / nohup). Stop with `nexus pwa stop`. |
 | `status` | Print NEXUS lock + runtime sidecar state. Same as `elanous nexus --status`. |
 | `stop` | Send SIGINT to the local NEXUS lock holder. Same as `elanous nexus --stop`. |
@@ -321,6 +536,19 @@ elanous nexus [options] [command]
 | `install [options]` | Install nexus as an OS-supervised service (launchd / systemd) |
 | `uninstall [options]` | Remove the launchd LaunchAgent / systemd-user unit installed by `nexus install` |
 
+## `elanous onboarding`
+
+Run the first-run wizard. Pass a step name (llm|skills|obsidian|telegram|discord|voice-ai) to run only that step.
+
+```text
+elanous onboarding [options] [step]
+```
+
+| Option | Description |
+|---|---|
+| `--config <path>` | Load answers from a JSON answer file (overrides interactive prompts) |
+| `--non-interactive` | Run without prompts — resolve all answers from --config + env vars |
+
 ## `elanous ops`
 
 Operations observation (READ-ONLY) — current state, anomalies and transitions of missions · tasks · contract loops · orchestrators. --json for scripts.
@@ -337,6 +565,22 @@ elanous ops [options] [command]
 | `mission [options] <id>` | One mission in detail — content + per-phase diagnosis (failClass · recommended heal) + related tasks/schedules/autonomous actions + transitions |
 | `mission-log [options] <id>` | Tail a mission's run log (run.log) — the evidence behind the diagnosis (survives reboot) |
 | `build [options] [buildId]` | Observe/control isolated builds — list when no id, snapshot with a buildId. --follow streams like tail -f, --stop stops a running build |
+
+## `elanous plugin`
+
+Install and manage Elanous plugins
+
+```text
+elanous plugin [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `add [options] <spec>` | Install a local path, pinned git plugin or signed market plugin |
+| `market` | Manage signed plugin marketplaces |
+| `list [options]` | List installed plugins |
+| `credentials [options] <plugin>` | Show or update installed plugin credential status |
+| `remove <name>` | Remove installed plugin versions |
 
 ## `elanous provider`
 
@@ -370,10 +614,27 @@ elanous pty [options] [command]
 | `release <ref>` | Return human-owned PTY control to its prior mode |
 | `state [options] <ref>` | Classify the current PTY screen state |
 | `wait [options] <ref>` | Wait until the classified PTY screen reaches a state |
+| `install-tool <ref> <tool>` | Smoke-check a known tool in the PTY shell, install an unprivileged known remedy, and verify it |
 | `snapshot [options] <ref>` | Render the current PTY screen without requesting write ownership |
 | `text [options] <ref> <text>` | Inject literal text — no newline unless --enter |
 | `key [options] <ref> <key>` | Inject a named special key (enter/esc/tab/up/… · see 'pty list' for &lt;ref&gt;) |
+| `mouse [options] <ref> <x> <y>` | Click or scroll a mouse-enabled SGR PTY (1-based column and row; disabled mode is refused by the owner) |
 | `resize [options] <ref> <cols> <rows>` | Resize the PTY (gated by the same access matrix as input) |
+| `record [options] <ref>` | Record PTY output as asciicast v2; --stop saves the capture |
+
+## `elanous python`
+
+The Python elanous uses (resolve · check · set up the elanous venv)
+
+```text
+elanous python [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `where [options]` | Which Python is used (ELANOUS_PYTHON &gt; elanous venv &gt; pyenv .python-version &gt; PATH) |
+| `check [options]` | python-env readiness (version · venv · declared module imports) — exit 0 ok · 10 fixable · 2 manual |
+| `setup [options]` | Create the elanous venv (~/.local/share/elanous/python/venv · --system-site-packages) and install declared dependencies — plan only by default |
 
 ## `elanous registry`
 
@@ -388,22 +649,6 @@ elanous registry [options] [command]
 | `drift [options]` | Audit whether routing pins (alias · tier-map · mission-router) match the catalog's active ids — proposes changes for a human (never applies them) |
 | `discover [options]` | Run the chosen discovery sources and merge into the existing snapshot — dry-run by default · --write to record · no S3 push |
 
-## `elanous release`
-
-One public release — prepare (local) → publish (--yes) → verify
-
-```text
-elanous release [options] [command]
-```
-
-| Subcommand | Description |
-|---|---|
-| `prepare [options]` | Clean source → public copy → commit on top of the public repository's history → PWA → bundle and checksums → local end-to-end (no network writes) |
-| `yank [options]` | Pull a release — demote it to pre-release and point Latest at the previous stable version (assets are kept · --undo reverts). Without --yes it only shows the plan |
-| `publish [options]` | ⛔ Cannot be undone — pushes to the public repository and creates the GitHub release. Without --yes it only shows the plan |
-| `verify [options]` | End to end from the public URL — in a clean temporary home: install → --version → self-update → uninstall |
-| `notes [options]` | Draft a changelog from the landings between two refs (edit it before publishing) |
-
 ## `elanous repl`
 
 Sticky multi-turn REPL — same session across turns, no per-turn process boot. Drives chat / agent / scenario from one shell. Uses --new for a fresh session, --session <id> to resume, --scenario <yaml> for a scripted run, JSONL on stdin for piped automation.
@@ -417,12 +662,138 @@ elanous repl [options]
 | `--new` | Force a new session at boot instead of resuming the active one |
 | `--session <id>` | Resume an explicit session (id or unique prefix) |
 | `--scenario <path>` | Run a YAML multi-turn scenario before handing back to interactive (or exit) |
-| `--replay <session-id>` | Re-execute the user prompts from a previous session in a fresh REPL run (BACKLOG #5). User prompts are extracted in order and fed through the same dispatcher as --scenario; assistant/tool messages and attachments are dropped. Mutually exclusive with --scenario. |
+| `--replay <session-id>` | Re-execute the user prompts from a previous session in a fresh REPL run. User prompts are extracted in order and fed through the same dispatcher as --scenario; assistant/tool messages and attachments are dropped. Mutually exclusive with --scenario. |
 | `--exit-after-scenario` | Exit after the scenario / replay completes (default true when stdin is not a TTY) |
 | `--no-exit-after-scenario` | Stay in the interactive prompt after the scenario / replay completes (TTY default) |
 | `--json` | Emit one JSON line per turn (sessionId/provider/model/reply/...) instead of streaming text |
 | `--no-tools` | Disable the tool loop and run a text-only chat REPL (parity with telegram/discord callers) |
 | `--stdin-jsonl` | Force JSONL-on-stdin mode even when stdin is a TTY (useful for testing automation paths) |
+
+## `elanous repo`
+
+Publish an explicit local repository to GitHub as private
+
+```text
+elanous repo [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `public [project-directory]` | Switch an existing private GitHub repository in the project directory to public, after a full history check and an explicit confirmation |
+| `scaffold [project-directory]` | Prepare the project directory's repository and create missing skeleton documents |
+| `design-check [project-directory-or-design-path]` | Check whether the craft rulebooks declared in the project directory or DESIGN.md path match the current rulebooks |
+| `design-direction [options] [project-directory-or-design-path]` | Show the visual direction declared in the project directory or DESIGN.md path (no argument), or declare it with --set |
+| `design-preview [options] [project-directory]` | Fetch drafts of candidate design systems from OpenDesign into design/previews |
+| `design-system` | Promote extracted values or a palette into your own design system in the library |
+| `design-extract [options] <url>` | Extract «assets + DESIGN.md» from a live web page — palette, typefaces, motion and contrast pairs in the format elanous reads |
+| `webclone-judge [options] <clone-dir>` | Judge web-clone output on two axes — files ⊕ layout (CDP). Logged as webclone.judge |
+| `design-screen-contrast [options] <ansi-path>` | Check text contrast in an ANSI screen snapshot — give it the output of `elanous pty snapshot &lt;ref&gt; --ansi` as a file |
+| `design-css [options] <design-md>` | Generate CSS tokens from a seed DESIGN.md — ⛔ only measured values (fields it could not extract are noted as comments) |
+| `design-lint [options] <html-path>` | Check whether output (HTML+CSS) smells of AI defaults (anti-ai-slop P0), measured against the seed DESIGN.md |
+| `design-gate [options] [project-directory]` | Give one verdict on whether the project's changed HTML follows the chosen design direction — no LLM |
+| `design-archive [options] <url>` | Archive a live page's originals (full capture · html · css · js · assets) and build derivatives and an index — ⛔ the originals bucket must be named explicitly |
+| `publish [project-directory]` | Check the local git repository in the project directory, then with one confirmation create a private GitHub repository and push the current branch |
+
+## `elanous research`
+
+Research with several web search engines (searches available providers in parallel)
+
+```text
+elanous research [options] <query...>
+```
+
+| Option | Description |
+|---|---|
+| `--engines <ids>` | Search engine IDs (comma-separated; default: all available) |
+| `--limit <count>` | Results per engine (1–20) (default: "5") |
+| `--json` | Print results and per-engine metadata as JSON |
+
+## `elanous resources`
+
+Query control plane resources
+
+```text
+elanous resources [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `where [options] <nameOrKind>` | Find by name or kind |
+| `list [options]` | List resources |
+
+## `elanous role`
+
+Show the control plane primary lease and hand it over manually
+
+```text
+elanous role [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `whoami` | The name this machine uses in the lease, and where it came from |
+| `set-machine <name>` | Set the lease machine name explicitly (control/machine.json) |
+| `status [options]` |  |
+| `watch [options]` | Watch, renew and take over the primary lease at boot |
+| `claim [options]` |  |
+| `accept [options]` |  |
+| `handoff [options]` |  |
+
+## `elanous schedule`
+
+Schedule/cron CRUD (keeps the registry, crontab and memory consistent). --json for programmatic use.
+
+```text
+elanous schedule [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` | List all cron jobs (category filter) |
+| `inspect [options] <id>` | Details + recent deliveries |
+| `runs [options] <id>` | Schedule run history (newest first) |
+| `create [options]` | New cron job (cron expression + command). Automatic backup; adds cd, bun and logging. |
+| `update [options] <id>` | Change a cron time |
+| `enable [options] <id>` | Enable a job |
+| `disable [options] <id>` | Disable a job (commented out) |
+| `delete [options] <id>` | Delete (automatic backup · recoverable). Dry-run by default · --yes to apply |
+| `wrap [options] [id]` | ★ Observability wrap — wrap bun .ts cron jobs in cron-run.ts so each firing is recorded in three places (logs.db · registry · self-memory). No id = every .ts cron job. Dry-run by default · --yes to apply (automatic backup · keeps the id across unwrap · reversible) |
+| `unwrap [options] [id]` | Remove the observability wrapper (reversible) — no id = every wrapped cron job. Dry-run by default · --yes to apply |
+| `migrate [options] <id>` | Move to a fabric Schedule Trigger (fired by the elanous daemon). Dry-run by default · --yes to apply |
+| `adopt [options] <id>` | Alias of migrate (merged when schedule-runner was retired). Dry-run by default · --yes to apply |
+| `release [options] <id>` | Restore to running from crontab. Dry-run by default · --yes to apply |
+| `retarget [options]` | Replace cron cd &lt;folder&gt; in bulk — the --from folder with the --to folder. Dry-run by default · --yes to apply (automatic backup). Errors if the target folder does not exist. |
+
+## `elanous self author`
+
+Only write a natural-language ask or an open clarification as a grounded eight-section goal file, or check an existing goal file with --lint.
+
+```text
+elanous self author [options] [ask...]
+```
+
+| Option | Description |
+|---|---|
+| `--cwd <path>` | Repository root to ground the goal in and write it under docs/goals/ (default: "&lt;current directory&gt;") |
+| `--lint <goalFile>` | Check a goal file read-only; cannot be combined with other author arguments |
+| `--print-template` | Print the canonical goal section skeleton and required levels read-only; cannot be combined with other author arguments |
+| `--inspect-decision-signal <text>` | Check right away whether the verdict-signal marker matches the release marker pattern; writes no goal |
+| `--inspect-invariant <text>` | Check right away the invariant markers, their parsing and the grounding evidence in the actual repository; writes no goal |
+| `--inspect-boundary <text>` | Check right away the boundary markers and their parsing; writes no goal |
+| `--inspect-artifact-launch <goalFile>` | Check right away the goal document's optional deliverable launch declaration; writes no goal |
+| `--inspect-test-scenario <scenarioFile>` | Check right away a test scenario document's deliverable kind and live-check contract; writes no goal |
+| `--inspect-target-paths <text>` | Check right away the target-path hint on the first non-empty line of the ask; writes no goal |
+| `--parent-goal-file <path>` | Repository-relative path of the parent goal document that produced this goal |
+| `--parent-question-id <id>` | ID of the parent goal's open question that produced this goal |
+| `--from-clarification <goalFile#questionId>` | Fill in the ask and parent source automatically from an open clarification |
+| `--supersedes <goalFile>` | Inherit the GoalId of an earlier goal document and record a Superseded-By back link |
+| `--root-intent <text>` | Single-line root purpose to record for a new root, or for a legacy parent without RootIntent |
+| `--goal-type <type>` | Goal type (implement, research, document, operate) |
+| `--adversarial-review` | Run adversarial review of the goal decomposition regardless of the threshold |
+| `--disable-adversarial-review` | Do not run adversarial review of the goal decomposition |
+| `--enqueue` | Put the authored goal into the goal queue of the daemon's resident loop (needs --termination-command) |
+| `--termination-command <cmd>` | Termination command to use when queueing (exit 0 means the goal is done) |
+| `--termination-timeout <ms>` | Time limit for the termination command in ms (default: "5000") |
 
 ## `elanous self entrances`
 
@@ -452,9 +823,6 @@ elanous self orchestrate [options] [goals...]
 | `--open-pr` | Each job: open a draft PR when the gate and review pass (passes --open-pr to each self-implement · promotion goes through the review node) |
 | `--base <branch>` | Base branch for each job's PR |
 | `--decompose` | Split one goal with an LLM into a dependency sub-DAG (parallel by topology, hot files serialized), then run it |
-| `--pod-skill-env` | pod: pass the keys (.env) of required skills (config pod-skills.txt) to this run as a Secret — explicit opt-in (paid credits) · never baked into the image |
-| `--pod-pool <spec>` | pod pool — context[@ssh-host][:cap], comma-separated, first wins (e.g. pool-a@host-a:12,pool-b@host-b:3) · otherwise ELANOUS_POD_POOL · otherwise the current context alone |
-| `--reduce` | At the end, gather the pieces that opened PRs into one integration branch (one gate run) and one PR — pairs with `--open-pr` · cannot be combined with `--auto-merge` (elanous self reduce) |
 | `--substrate <kind>` | Where to run: local (default · isolated worktree) \| pod (Kubernetes Job · docker/harness image) |
 | `--pod-account <name>` | pod: codex account (~/.elanous/auth.json openai-codex:&lt;name&gt; · a copy without the refresh token) · if omitted, a broker hands each Job the account with the most remaining quota |
 | `--no-pod-rebuild` | pod: do not rebuild the image even if its version (elanous.commit) differs from HEAD — the measurement then measures the image's version |
@@ -492,23 +860,6 @@ elanous self recall [options] <query...>
 | `--all-instances` | Federated recall across every registered elanous instance (fleet · read-only union) |
 | `--include-test` | Include isolated test instances in the federation (excluded by default) |
 | `--include-observer-output` | Include output generated by observers in the recall (excluded by default) |
-
-## `elanous self reduce`
-
-Fleet reduce — merge the open piece PRs one by one onto the base with merge --no-ff → on conflict, stop and name the piece and files → change-scope gate → one integration PR (piece PRs are not closed)
-
-```text
-elanous self reduce [options]
-```
-
-| Option | Description |
-|---|---|
-| `--prs <numbers>` | Open PR numbers to combine (comma-separated · merged in the order given) |
-| `--base <branch>` | Base branch (default: "main") |
-| `--branch <name>` | Integration branch name (default reduce/&lt;time&gt;) |
-| `--title <text>` | Integration PR title |
-| `--dry-run` | Merge and gate only — no push, PR or comments |
-| `--skip-gate` | Skip the gate (not recommended) |
 
 ## `elanous self repair-signals`
 
@@ -554,6 +905,7 @@ elanous self-update|update [options]
 | `--json` | Print the result as JSON |
 | `--keep <n>` | Recent versions to keep after install (installed copy: current and previous; checkout: current and the daemon's version are protected · 0 = no cleanup) (default: "3") |
 | `--alert` | Also send failures (exit≠0) as an alert — for unattended cron runs |
+| `--skip-pwa-build` | Explicitly skip the PWA build before a checkout install |
 | `--auto <on|off|status>` | Automatic updates — a macOS launchd agent or Linux systemd timer runs `self-update --restart --alert` every day at 04:17 (not turned on if a cron entry already runs it) |
 
 ## `elanous session`
@@ -592,12 +944,59 @@ elanous session [options] [command]
 Check OpenAI Codex setup and guide each missing credential step
 
 ```text
-elanous setup [options]
+elanous setup [options] [command]
 ```
 
 | Option | Description |
 |---|---|
 | `--non-interactive` | Report setup state without prompts or writes |
+
+| Subcommand | Description |
+|---|---|
+| `claude-code [options]` | Plan or install the elanous Claude Code plugin |
+
+## `elanous start`
+
+Discover LLM, ensure Nexus is healthy, and open the GUI or TUI
+
+```text
+elanous start [options]
+```
+
+| Option | Description |
+|---|---|
+| `--gui` | Open the browser UI (default) |
+| `--tui` | Open the terminal UI instead |
+| `--no-login` | Do not offer interactive LLM login |
+| `--json` | Print one secret-free JSON result |
+
+## `elanous task`
+
+View and approve tasks
+
+```text
+elanous tasks|task [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` | View tasks in priority and creation-time order |
+| `show [options] <id>` | Show task details |
+| `approve <id...>` | Approve an outside task |
+
+## `elanous tasks`
+
+View and approve tasks
+
+```text
+elanous tasks|task [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` | View tasks in priority and creation-time order |
+| `show [options] <id>` | Show task details |
+| `approve <id...>` | Approve an outside task |
 
 ## `elanous telegram`
 
@@ -642,6 +1041,7 @@ elanous self-update|update [options]
 | `--json` | Print the result as JSON |
 | `--keep <n>` | Recent versions to keep after install (installed copy: current and previous; checkout: current and the daemon's version are protected · 0 = no cleanup) (default: "3") |
 | `--alert` | Also send failures (exit≠0) as an alert — for unattended cron runs |
+| `--skip-pwa-build` | Explicitly skip the PWA build before a checkout install |
 | `--auto <on|off|status>` | Automatic updates — a macOS launchd agent or Linux systemd timer runs `self-update --restart --alert` every day at 04:17 (not turned on if a cron entry already runs it) |
 
 ## `elanous usage`
@@ -658,12 +1058,12 @@ elanous usage [options] [command]
 
 | Subcommand | Description |
 |---|---|
-| `runs [options]` | Aggregate stored llm-usage logs by run, model and billing path |
+| `runs [options]` | Aggregate saved llm-usage logs by run, or by role and call site |
 | `reset [options]` | ⛔ Cannot be undone — spends one Codex reset credit to restart that account's weekly window now |
 
 ## `elanous wf`
 
-Run YAML DAG workflows (workflow-runtime · prompt|bash|skill|cft|approval|if|switch|iteration|classify|extract|set|filter|template|http|showroom|scheduleTrigger|webhookTrigger|discordTrigger|telegramTrigger|manualTrigger|chatTrigger nodes). Aliases: `workflows` (plural) · `workflow` (singular).
+Run YAML DAG workflows (workflow-runtime · prompt|bash|skill|cft|approval|if|switch|iteration|classify|extract|set|filter|template|http|showroom|task|scheduleTrigger|webhookTrigger|discordTrigger|telegramTrigger|manualTrigger|chatTrigger nodes). Aliases: `workflows` (plural) · `workflow` (singular).
 
 ```text
 elanous wf|workflows [options] [command]

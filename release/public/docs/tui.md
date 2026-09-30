@@ -21,7 +21,7 @@ and attaches it automatically:
 
 Text-kind attachments are prepended as labeled code-fenced sections
 ahead of your question. Images ride as multimodal ContentBlocks when the
-routed model is vision-capable (see `isLikelyVisionModel()`).
+routed model can read images.
 
 Paths accepted: absolute (`/path/to/f.pdf`), home-relative (`~/doc.pdf`),
 `./` or `../`, and quoted (`"name with space.pdf"`). URLs are skipped.
@@ -29,20 +29,35 @@ Symlinks resolve to their canonical target (two links → one attachment).
 
 ## Slash commands
 
+The commands you will use most. The TUI has more — open the help overlay with `/help` (or `/?`) for the full list.
+
 | Command | Alias | Purpose |
 |---------|-------|---------|
+| `/harness <sentence>` | | Hand work to the harness (also `plan`, `runs`, `stop <id>`) |
 | `/run-skill <name> [args]` | `/rs`, `/run` | Execute a SKILL.md |
 | `/provider` | `/p` | List providers + availability |
-| `/summarize-skill` | `/ss`, `/sum` | AI summary of the focused skill |
+| `/model [name]` | `/m` | Switch the active model (lists them with no argument) |
+| `/reasoning [off\|low\|medium\|high\|xhigh]` | `/r`, `/think` | Reasoning level |
+| `/resume [id]` | | Pick a past session, or load one by id prefix |
+| `/fork` | | Copy this session into a new one |
+| `/session list\|load\|new` | `/sess` | Manage sessions |
+| `/remaining` | | What each account has left |
+| `/memory list\|search\|add` | `/mem` | Memory |
+| `/directive <text>` | | Record an instruction as a Linear issue |
+| `/design` | `/design-check` | Design rulebooks this repository declares |
+| `/term` | `/terminal` | Terminal modal (spawn, attach, switch) |
+| `/setup` | | Setup wizard guide (`/setup reset` re-runs it next start) |
 | `/context` | `/ctx` | Table of attached files |
 | `/context clear [big]` | | Drop all attachments (or ≥100KB ones) |
 | `/context drop <id>` | | Drop a single attachment |
-| `/paste` | `/v` | Attach clipboard image (macOS) |
+| `/paste` | | Attach clipboard image (macOS) |
 | `/sync` | `/s` | Enter sync mode |
-| `/plugin list\|activate\|deactivate\|reload` | `/p`, `/plugins` | Manage plugins |
+| `/plugin list\|activate\|deactivate\|reload` | `/plugins` | Manage plugins |
 | `/clear` | `/cls` | Clear log pane (keeps attachments) |
 | `/help` | `/?` | Keybinding overlay |
 | `/quit` | `/q`, `/exit` | Exit |
+
+`elanous keys` prints every keybinding and slash command.
 
 ## Argument autocomplete
 
@@ -72,7 +87,7 @@ the pasted text is plain.
 
 ## Terminal compatibility
 
-ElanousAgent uses SGR mouse reporting (`CSI ?1000h` + `?1006h`). Most
+Elanous uses SGR mouse reporting (`CSI ?1000h` + `?1006h`). Most
 modern terminals forward mouse events to the app when this is enabled.
 
 | Terminal | Mouse / right-click | Notes |

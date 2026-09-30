@@ -9,7 +9,7 @@
 // 재사용: startPty(Bun 네이티브 PTY)·createWorktree·streamLLM·worktreeHasChanges·commitWorktree.
 import { execFileSync, spawnSync, spawn as spawnChild } from 'node:child_process';
 import { homedir } from 'node:os';
-import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, statSync, readlinkSync, realpathSync, lstatSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, statSync, readlinkSync, realpathSync, lstatSync, unlinkSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, relative, resolve, isAbsolute, sep } from 'node:path';
 import { startPty, mintPtyId, onPtyEvent, type PtyHandle, type StartOpts } from '../pty-shell/registry.js';
@@ -34,8 +34,10 @@ import { runWithControlObserve } from '../capture/control-observe-adapter.js';
 import { buildMissionProvision, sanitizeForPtyInput, type ProvisionRequest, type ProvisionResult } from './provision.js';
 import { checkClaudeSubscription } from './claude-subscription.js';
 import { handoffMission, waitForHumanLogin, type HandoffOperations } from './handoff.js';
+import { dispatchOpenPullRequest } from '../tool-runtime/git-pr-runtime.js';
 import { runClaudeHeadless } from './claude-headless.js';
 import { installPluginInsideAgent, type PluginRequest, type PluginDeps } from './in-agent-plugin.js';
+import { planMissionResources, type ResourceLadderDeps, type ResourcePlan } from './resource-ladder.js';
 import { ensureRunId } from '../harness/harness-space.js';
 import { recordHarnessWorktreeProvenance } from '../harness/harness-worktree-add.js';
 import { resolveInstanceName } from '../instance-identity.js';
@@ -459,6 +461,10 @@ export interface AgentMissionSpec {
   headless?: boolean;
   /** Install in the agent's own UI before sending the mission. */
   plugin?: Pick<PluginRequest, 'plugin' | 'marketplace'>;
+  /** Pre-mission resource judgment; off skips it. */
+  resources?: 'on' | 'off';
+  /** Only the caller's explicit backend selection, not the resolved default. */
+  backendExplicit?: string;
   /** Explicit backend sequence; transitions use the same handoff coordinator as brain decisions. */
   chain?: readonly ('codex' | 'claude' | 'elanous')[];
   /**
@@ -496,7 +502,8 @@ export interface AgentMissionResult {
   ok: boolean;
   worktree: string;
   branch: string | null;
-  reason?: 'aborted' | 'outside-write';
+  reason?: 'aborted' | 'outside-write' | 'origin-not-github';
+  pr?: 'skipped';
   paths?: string[];
   rounds: number;
   evidencePath: string | null;
@@ -526,6 +533,7 @@ export interface AgentMissionDeps {
   runClaudeHeadless?: typeof runClaudeHeadless;
   checkEvidence?: typeof checkEvidence;
   commitWorktree?: typeof commitWorktree;
+  dispatchOpenPullRequest?: typeof dispatchOpenPullRequest;
   terminateProcessTree?: typeof terminateMissionProcessTree;
   repoStatus?: (repo: string) => string | Promise<string>;
   emitDecision?: typeof emitDecision;
@@ -546,6 +554,8 @@ export interface AgentMissionDeps {
   initialTsc?: ReturnType<typeof collectTscDiagnostics> | null;
   installPlugin?: typeof installPluginInsideAgent;
   pluginDeps?: PluginDeps;
+  resourceLadder?: ResourceLadderDeps;
+  planMissionResources?: typeof planMissionResources;
 }
 
 const DEFAULT_OMNI = `${process.env.HOME}/.claude/skills/omni-crawl/scripts/main.ts`;
@@ -1644,16 +1654,55 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     screen = await (deps.awaitMission ? deps.awaitMission(trusted) : trusted);
   }
 
-  if (spec.plugin) {
-    const plugin = await (deps.installPlugin ?? installPluginInsideAgent)(
-      { agent: backend.name as 'codex' | 'claude', ...spec.plugin }, h,
-      { ...(backend.handleTrust ? { handleTrust: backend.handleTrust } : {}), ...deps.pluginDeps, write: drive },
-    );
-    if (plugin.outcome !== 'installed') {
-      stopLive();
-      try { h.kill(); } catch { /* already exited */ }
-      return { ok: false, worktree: wt.path, branch: wt.branch, rounds: 0, evidencePath: null,
-        committed: false, usedOmniCrawl: false, detail: `플러그인 설치 ESCALATE (${plugin.reason}) — 미션은 전송하지 않았다` };
+  let resourcePlan: ResourcePlan | undefined;
+  // Only an explicit `on` runs the ladder (the CLI passes `on` by default). Library callers and fake-PTY
+  // tests that leave it unset keep the pre-ladder behaviour — 09-29 #21849 made them wait on a real LLM.
+  if (spec.resources === 'on') {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      resourcePlan = await Promise.race([
+        (deps.planMissionResources ?? planMissionResources)(spec.mission, deps.resourceLadder ?? {}, {
+          backend: spec.backendExplicit,
+          plugin: spec.plugin ? `${spec.plugin.plugin}@${spec.plugin.marketplace}` : undefined,
+          resources: spec.resources,
+          deadlineMs: 20_000,
+        }),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error('resource ladder timeout (20s)')), 20_000); }),
+      ]);
+      debug.log('agent-mission.resources', 'planned', {
+        have: resourcePlan.have.length, gaps: resourcePlan.gaps.length,
+        suggestedPlugin: resourcePlan.plugin?.plugin, suggestedBackend: resourcePlan.backend?.name,
+        executedBackend: backend.name,
+      });
+    } catch (error) {
+      debug.log('agent-mission.resources', 'plan-failed', { reason: error instanceof Error ? error.message : String(error) }, { level: 'warn' });
+    } finally { if (timer) clearTimeout(timer); }
+  }
+  const suggestedPlugin = resourcePlan?.plugin?.source === 'official-index' && !spec.plugin
+    && !spec.headless && (backend.name === 'codex' || backend.name === 'claude')
+    && resourcePlan.plugin.marketplace === 'elanous'
+    && /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(resourcePlan.plugin.plugin)
+    ? { plugin: resourcePlan.plugin.plugin, marketplace: resourcePlan.plugin.marketplace } : undefined;
+  const requestedPlugin = spec.plugin ?? suggestedPlugin;
+  let installedPlugin: typeof requestedPlugin;
+  if (requestedPlugin) {
+    try {
+      const plugin = await (deps.installPlugin ?? installPluginInsideAgent)(
+        { agent: backend.name as 'codex' | 'claude', ...requestedPlugin }, h,
+        { ...(backend.handleTrust ? { handleTrust: backend.handleTrust } : {}), ...deps.pluginDeps, write: drive },
+      );
+      if (plugin.outcome !== 'installed') {
+        if (spec.plugin) {
+          stopLive();
+          try { h.kill(); } catch { /* already exited */ }
+          return { ok: false, worktree: wt.path, branch: wt.branch, rounds: 0, evidencePath: null,
+            committed: false, usedOmniCrawl: false, detail: `플러그인 설치 ESCALATE (${plugin.reason}) — 미션은 전송하지 않았다` };
+        }
+        debug.log('agent-mission.resources', 'install-failed', { plugin: requestedPlugin.plugin, reason: plugin.reason }, { level: 'warn' });
+      } else installedPlugin = requestedPlugin;
+    } catch (error) {
+      if (spec.plugin) throw error;
+      debug.log('agent-mission.resources', 'install-failed', { plugin: requestedPlugin.plugin, reason: 'installer-error' }, { level: 'warn' });
     }
   }
 
@@ -1683,7 +1732,15 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     else debug.log('agent-mission', 'memory', { injected: false });
   }
 
-  if (spec.plugin) missionText = `${missionText}\n\n설치된 ${spec.plugin.plugin} 플러그인에서 실제 스킬을 확인하고 ${spec.plugin.plugin}:<skill> 형식으로 해당 스킬을 사용하라.`;
+  if (installedPlugin) missionText = `${missionText}\n\n설치된 ${installedPlugin.plugin} 플러그인에서 실제 스킬을 확인하고 ${installedPlugin.plugin}:<skill> 형식으로 해당 스킬을 사용하라.`;
+  if (resourcePlan) {
+    const safeName = (name: string) => sanitizeForPtyInput(name, 80)
+      .replace(/\b(?:bearer|secret|password|token|api.?key|authorization)\s*[:=]\s*\S+|(?:sk-[\w-]+|gh[pousr]_[\w-]+|github_pat_[\w-]+|AIza[\w-]+|xox[baprs]-[\w-]+)/gi, '[redacted]')
+      .replace(/https?:\/\/\S+/gi, '[redacted]');
+    const have = resourcePlan.have.slice(0, 5).map(safeName);
+    const gaps = resourcePlan.gaps.slice(0, 5).map(gap => safeName(gap.need));
+    missionText = `${missionText}\n\n[elanous 자원]\n보유: ${have.join(', ') || '없음'}\n설치: ${installedPlugin ? `${installedPlugin.plugin}@${installedPlugin.marketplace}` : '없음'}\n미충족: ${gaps.join(', ') || '없음'}`;
+  }
   if (deps.isMissionAborted?.()) throw new Error('MISSION_ABORTED');
   // 미션 전송 — 인핸싱/기억으로 가공됐으면(멀티라인) 파일로 떨궈 read 지시(TUI 멀티라인 위험·verbatim 보존).
   //   원문 그대로면(단문) 타이핑.
@@ -1738,6 +1795,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   };
   let pendingHandoff: { to: 'codex' | 'claude'; mission: string; summary: string } | undefined;
   let gatedHandoff = false;
+  let handoffPrSkipped = false;
   let transitionFailure: string | undefined;
   const handoffOps: HandoffOperations = {
     start: async (to, mission) => { pendingHandoff = { to, mission, summary: controllerSummary }; },
@@ -1765,11 +1823,30 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       if (spec.commit === false) throw new Error('elanous PR handoff requires commit authorization');
       const ev = (deps.checkEvidence ?? evidenceCheck)(worktree, spec.evidence);
       if (!ev.ok) throw new Error(`handoff evidence gate failed: ${ev.retry ?? 'missing evidence'}`);
+      const promptFile = join(worktree, '.mission-prompt.md');
+      let promptExisted = false;
+      try { lstatSync(promptFile); promptExisted = true; } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (promptExisted) unlinkSync(promptFile);
+      debug.log('agent-mission', 'handoff-prompt-file-removed', { existed: promptExisted });
+      const stagedPrompt = execFileSync('git', ['ls-files', '--cached', '--', '.mission-prompt.md'], { cwd: worktree, encoding: 'utf8' });
+      if (stagedPrompt.trim()) {
+        execFileSync('git', ['rm', '-f', '--cached', '--', '.mission-prompt.md'], { cwd: worktree, encoding: 'utf8' });
+      }
+      if (execFileSync('git', ['ls-files', '--cached', '--', '.mission-prompt.md'], { cwd: worktree, encoding: 'utf8' }).trim()) {
+        throw new Error('handoff prompt file remains in commit index');
+      }
       const commit = (deps.commitWorktree ?? commitWorktree)(worktree, `chore(agent-mission): ${spec.branch} handoff`);
       if (!commit.ok) throw new Error(`handoff commit failed: ${commit.out}`);
       execFileSync('git', ['push', '-u', 'origin', `HEAD:${spec.branch}`], { cwd: worktree, encoding: 'utf8', timeout: 120_000 });
-      const { dispatchOpenPullRequest } = await import('../tool-runtime/git-pr-runtime.js');
-      dispatchOpenPullRequest({ title: `agent-mission: ${spec.branch}`, body: deps.originalMission ?? spec.mission, head: spec.branch, base: spec.base ?? 'main' }, { cwd: worktree });
+      const pushUrls = execFileSync('git', ['remote', 'get-url', '--push', '--all', 'origin'], { cwd: worktree, encoding: 'utf8' }).trim().split('\n');
+      if (!pushUrls.length || !pushUrls.every((url) => /^(?:https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)[^/]+\/[^/]+\/?$/i.test(url))) {
+        handoffPrSkipped = true;
+        debug.log('agent-mission', 'handoff-pr-skipped', { reason: 'origin-not-github' });
+      } else {
+        (deps.dispatchOpenPullRequest ?? dispatchOpenPullRequest)({ title: `agent-mission: ${spec.branch}`, body: deps.originalMission ?? spec.mission, head: spec.branch, base: spec.base ?? 'main' }, { cwd: worktree });
+      }
       gatedHandoff = true;
     },
     ...deps.handoffOperations,
@@ -1879,7 +1956,9 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (gatedHandoff && control.termination.kind !== 'error') {
     stopLive();
     try { h.kill(); } catch { /* noop */ }
-    return { ok: true, worktree: wt.path, branch: wt.branch, rounds: control.steps, evidencePath: wt.path, committed: true, usedOmniCrawl: usedOmni, detail: '완료(증거 게이트·PR)' };
+    return { ok: true, worktree: wt.path, branch: wt.branch, rounds: control.steps, evidencePath: wt.path, committed: true, usedOmniCrawl: usedOmni,
+      ...(handoffPrSkipped ? { pr: 'skipped' as const, reason: 'origin-not-github' as const } : {}),
+      detail: handoffPrSkipped ? '완료(증거 게이트·push·PR 생략)' : '완료(증거 게이트·PR)' };
   }
   const done = control.termination.kind === 'success';
   const round = control.steps;

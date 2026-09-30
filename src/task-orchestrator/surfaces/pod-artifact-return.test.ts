@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
-import { collectPodArtifacts, parsePodArtifactChunks } from './pod-artifact-return.js';
+import { LogStore } from '../../mss/logging/log-store.js';
+import { collectPodArtifacts, importPodDecisionLogs, parsePodArtifactChunks } from './pod-artifact-return.js';
 
 function transfer(path: string, bytes: Buffer): string[] {
   const token = Buffer.from(path).toString('base64url');
@@ -24,6 +25,31 @@ describe('pod artifact return', () => {
       expect(events).toContainEqual({ category: 'self-implement.pod', event: 'pod-logs-returned', data: { job: 'si-job', path: destination, lines: 2 } });
       expect(events.some(({ event }) => event === 'pod-logs-missing')).toBe(false);
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('imports only harness.decision rows into the launching host log store', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pod-artifacts-'));
+    const store = new LogStore(':memory:');
+    const text = [
+      JSON.stringify({ ts: '2026-09-01T00:00:01.000Z', category: 'harness.decision', event: 'decision', surface: 'nexus', level: 'info', data: { kind: 'KEEP', runId: 'child-run', reason: 'ok' } }),
+      JSON.stringify({ ts: '2026-09-01T00:00:02.000Z', category: 'self-implement.pod', event: 'noise', data: { runId: 'child-run' } }),
+      JSON.stringify({ ts: '2026-09-01T00:00:03.000Z', category: 'harness.decision', event: 'decision', data: { kind: 'DROP' } }),
+      'not-json',
+      JSON.stringify({ ts: '2026-09-01T00:00:04.000Z', category: 'harness.decision', event: 'decision', data: { kind: 'ESCALATE', runId: 'child-run-2' } }),
+      '',
+    ].join('\n');
+    try {
+      const result = importPodDecisionLogs(Buffer.from(text), 'si-job', store);
+      expect(result).toEqual({ imported: 2, skipped: 3 });
+      const rows = store.query({ exactCategories: ['harness.decision'], limit: 10 });
+      expect(rows.map((row) => ({ ts: row.ts, event: row.event, surface: row.surface, data: JSON.parse(row.data ?? '{}') }))).toEqual([
+        { ts: '2026-09-01T00:00:04.000Z', event: 'decision', surface: 'pod', data: { kind: 'ESCALATE', runId: 'child-run-2', podJob: 'si-job', importedFrom: 'pod' } },
+        { ts: '2026-09-01T00:00:01.000Z', event: 'decision', surface: 'nexus', data: { kind: 'KEEP', runId: 'child-run', reason: 'ok', podJob: 'si-job', importedFrom: 'pod' } },
+      ]);
+      collectPodArtifacts(transfer('pod-logs/logs.jsonl', Buffer.from(text)).join('\n'), { dir, job: 'si-job', logStore: store });
+      expect(store.query({ exactCategories: ['harness.decision'], limit: 10 })).toHaveLength(4);
+      expect(store.query({ exactCategories: ['self-implement.pod'], limit: 10 })).toHaveLength(0);
+    } finally { store.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('reports absent, export failure, size-skipped and host-skipped pod logs with a reason', () => {

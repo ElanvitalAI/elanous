@@ -128,9 +128,14 @@ export interface NexusClient {
   getTemplates(): Promise<{ templates: TemplateSummary[] }>;
   getTemplate(name: string): Promise<{ template: NexusTemplate }>;
   saveTemplate(body: SaveTemplateBody): Promise<{ saved: true; name: string; path?: string }>;
-  // ---- plugins market (daemon-verified, read-only) ----
+  // ---- plugins market (daemon-verified reads and owner-only mutations) ----
   getPluginsIndex(): Promise<MarketIndexResponse>;
   getInstalledPlugins(): Promise<InstalledPluginWire[]>;
+  refreshPluginMarket(name: string): Promise<{ ok: boolean; plugins?: MarketPluginWire[]; reason?: string }>;
+  installMarketPlugin(spec: string, acceptedCapabilities: string[], onLine: (line: string) => void): Promise<void>;
+  removeMarketPlugin(name: string): Promise<{ removed: number }>;
+  getPluginCredentials(name: string): Promise<PluginCredentialsStatus>;
+  putPluginCredentials(name: string, fields: Record<string, string | null>): Promise<{ set: string[] }>;
   // ---- harness execution graphs (core read-only · mine editable) ----
   getRunGraphs(): Promise<{ graphs: RunGraphSummary[] }>;
   getRunGraph(id: string): Promise<RunGraphDetail>;
@@ -330,6 +335,7 @@ export interface MarketIndexResponse {
   markets: Array<{ name: string; signature: 'ok' | 'missing' | 'unknown-key' | 'malformed' | 'stale'; detail?: string; plugins: MarketPluginWire[] }>;
 }
 export interface InstalledPluginWire { name: string; version: string; market: string; path: string; sha256: string | null; installedAt?: string }
+export interface PluginCredentialsStatus { fields: Array<{ name: string; env: string; set: boolean }> }
 
 // F-M1 — server-authoritative core graph snapshot; no mutation endpoints.
 export interface RunGraphSummary {
@@ -842,7 +848,7 @@ export interface LogRow {
   event: string;
   data?: Record<string, unknown> | null;
 }
-export interface LogsResponse { ok: boolean; logs: LogRow[]; count: number; ts?: string }
+export interface LogsResponse { ok: boolean; logs: LogRow[]; count: number; ts?: string; stores?: string[]; failedStores?: Array<{ name: string; reason: string }>; registeredStores?: number }
 export interface LogInstance { name: string; alive?: boolean; dbExists?: boolean; current?: boolean }
 export interface LogInstancesResponse { ok: boolean; self?: string; instances: LogInstance[] }
 export interface TraceQuery { level: 'L0' | 'L1' | 'L2' | 'L3'; runId?: string; store?: string; limit?: number; kind?: string; q?: string; from?: number }
@@ -1110,6 +1116,35 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     }
   }
 
+  async function installMarketPlugin(spec: string, acceptedCapabilities: string[], onLine: (line: string) => void): Promise<void> {
+    const path = '/v1/plugins/install';
+    const res = await fetchImpl(`${baseUrl}${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...(optsToken ? { authorization: `Bearer ${optsToken}` } : {}) },
+      body: JSON.stringify({ spec, acceptedCapabilities }),
+    });
+    if (res.status === 401) reportAuthRequired(path);
+    if (!res.ok) throw new NexusApiError(res.status, path, await res.json());
+    if (!res.body) throw new Error('설치 진행 정보를 읽을 수 없습니다.');
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let pending = '';
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        pending += decoder.decode(value, { stream: true });
+        let end: number;
+        while ((end = pending.indexOf('\n')) !== -1) {
+          const line = pending.slice(0, end).trim();
+          pending = pending.slice(end + 1);
+          if (line) onLine(line);
+        }
+      }
+      pending += decoder.decode();
+      if (pending.trim()) onLine(pending.trim());
+    } finally { reader.releaseLock(); }
+  }
+
   return {
     baseUrl,
     // ---- read ----
@@ -1143,6 +1178,11 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     saveTemplate: (body) => request('POST', '/v1/nexus/templates', body),
     getPluginsIndex: () => request('GET', '/v1/plugins/index'),
     getInstalledPlugins: () => request('GET', '/v1/plugins'),
+    refreshPluginMarket: (name) => request('POST', `/v1/plugins/markets/${encodeURIComponent(name)}/refresh`, {}),
+    installMarketPlugin,
+    removeMarketPlugin: (name) => request('DELETE', `/v1/plugins/${encodeURIComponent(name)}`),
+    getPluginCredentials: (name) => request('GET', `/v1/plugins/${encodeURIComponent(name)}/credentials`),
+    putPluginCredentials: (name, fields) => request('PUT', `/v1/plugins/${encodeURIComponent(name)}/credentials`, { fields }),
     getRunGraphs: () => request('GET', '/v1/graphs'),
     getRunGraph: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}`),
     getRunGraphYaml: (id) => request('GET', `/v1/graphs/${encodeURIComponent(id)}/yaml`),

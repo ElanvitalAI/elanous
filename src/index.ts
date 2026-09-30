@@ -115,7 +115,7 @@ import { DEFAULT_REVIEW_BACKEND } from './agent-substrate/acp-reviewer.js';
 import type { ReviewResult } from './agent-substrate/pr-reviewer.js';
 import type { ReviewVerdict } from './agent-mission/review-loop.js';
 import type { SyncMode } from './types.js';
-import { runOnboarding, runOnboardingStep, runOnboardingNonInteractive, needsOnboarding, type OnboardingStepId } from './onboarding.js';
+import { runOnboarding, runOnboardingStep, runOnboardingNonInteractive, needsOnboarding, handleOnboardingRefusal, type OnboardingStepId } from './onboarding.js';
 import {
   getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig,
   backupUserConfig, backupConfigPath, addRotationEntry, type RotationEntry,
@@ -2088,13 +2088,14 @@ harnessCmd
   });
 harnessCmd
   .command('stop <runId>')
-  .description('런 하나를 멈춘다 — 오케스트레이터 프로세스(pid.json 의 시작 시각이 맞을 때만) ⊕ 라벨 elanous.run=<runId> Pod Job')
+  .description('런 하나를 멈춘다 — pid.json 시작 시각 대조 ⊕ 런 발사 프로세스 표 조회 ⊕ 라벨 elanous.run=<runId> Pod Job')
   .option('--context <ctx...>', 'kube 문맥(여러 번 · 기본 = 알려진 문맥 전부)')
   .option('--json', 'JSON 출력')
-  .action(async (runId: string, opts: { context?: string[]; json?: boolean }) => {
+  .option('--dry-run', '프로세스 후보만 보고 신호·Pod Job 삭제는 하지 않는다')
+  .action(async (runId: string, opts: { context?: string[]; json?: boolean; dryRun?: boolean }) => {
     const { stopHarnessRun, defaultHarnessStopDeps, formatHarnessStop } = await import('./harness/harness-stop.js');
     try {
-      const result = await stopHarnessRun(runId, defaultHarnessStopDeps(), opts.context);
+      const result = await stopHarnessRun(runId, defaultHarnessStopDeps(), opts.context, opts.dryRun === true);
       process.stdout.write(`${opts.json ? JSON.stringify(result) : formatHarnessStop(result)}\n`);
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
@@ -4238,8 +4239,9 @@ const selfOrchestrateCmd = selfCmd
             if (!opts.json) ui.info(`[pod] 이미지 다시 굽기 — ${image.reason} (~1분)`);
             const { spawnSync } = await import('node:child_process');
             const top = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).stdout.trim() || process.cwd();
-            const b = spawnSync('bash', [`${top}/docker/harness/build.sh`], { encoding: 'utf8', timeout: 900_000 });
-            if (b.status !== 0) { ui.error(`--substrate pod: 이미지 굽기 실패 rc=${b.status}: ${(b.stdout + b.stderr).slice(-400)}`); process.exit(2); }
+            // bun 1.4 applies the 1 MiB default maxBuffer: a docker build log past it kills the child (ENOBUFS · status null).
+            const b = spawnSync('bash', [`${top}/docker/harness/build.sh`], { encoding: 'utf8', timeout: 900_000, maxBuffer: 64 * 1024 * 1024 });
+            if (b.status !== 0) { ui.error(`--substrate pod: 이미지 굽기 실패 rc=${b.status}${b.error ? ` (${(b.error as NodeJS.ErrnoException).code ?? b.error.message})` : ''}: ${(b.stdout + b.stderr).slice(-400)}`); process.exit(2); }
             image = podImageFreshness();
           }
         }
@@ -4410,7 +4412,7 @@ const selfOrchestrateCmd = selfCmd
         ...results.map((r) => {
           const icon = r.status === 'done' ? '✅' : r.status === 'cancelled' ? '⛔' : '❌';
           const disp = r.merged ? ` → merged ${r.prUrl}` : r.prUrl ? ` → PR ${r.prUrl}` : r.stage ? ` [${r.stage}]` : '';
-          return `  ${icon} ${r.status} · ${r.feature.slice(0, 56)}${disp}${r.error ? ` — ${r.error.code}` : ''}`;
+          return `  ${icon} ${r.status} · ${r.feature.slice(0, 56)}${disp}${r.error ? ` — ${r.error.code}${r.error.code === 'pod-job-failed' ? `: ${r.error.message}` : ''}` : ''}`;
         }),
       ].join('\n'));
       await reportRun(results);
@@ -4608,7 +4610,7 @@ selfCmd
   .action(async (space: string | undefined, opts: { stop?: boolean; memo?: string; run?: string; includeStale?: boolean; readWait?: string }) => {
     const { classifyRunScreenMissing, queryRunScreenKey, listRunLedgers } = await import('./self-implement/run-ledger.js');
     const { getPtyManifest, listPtyManifestRows } = await import('./pty-shell/pty-manifest.js');
-    const { readPodFragment, podFragmentFinished, dispatchPodSelfSend } = await import('./harness/self-send-target.js');
+    const { readPodFragment, podFragmentFinished, listPodFragmentsForRun, dispatchPodSelfSend } = await import('./harness/self-send-target.js');
     const { listHarnessScreens, readHarnessHeartbeat } = await import('./harness/harness-screen.js');
     const decision = decideSelfSend({ space, opts, now: Date.now() }, {
       resolveRunScreen: (runId) => {
@@ -4616,6 +4618,7 @@ selfCmd
         return { ...resolved, missingStatus: resolved.screenKey ? undefined : classifyRunScreenMissing(resolved.lastEvent) };
       },
       resolveTarget: (target) => resolveSelfSendTarget(target, { getPtyManifest, listPtyManifestRows }),
+      podFragmentsForRun: (runId) => listPodFragmentsForRun(runId),
       isPodFragment: (spaceId) => Boolean(readPodFragment(spaceId) || podFragmentFinished(spaceId)),
       screens: () => listHarnessScreens().map((screen): SelfSendCandidate => {
         const heartbeat = readHarnessHeartbeat(screen.spaceId);
@@ -5426,6 +5429,30 @@ program.command('ad [input...]')
   });
 
 registerDocsCommands(program);
+// Private local decision ledger follows the same JS-only dispatch path as directives.
+if (existsSync(resolve(import.meta.dir, 'cli/decisions-cli.ts')) || existsSync(resolve(import.meta.dir, 'cli/decisions-cli.js'))) {
+  program.command('decisions').description('대표 결정 로컬 원장').allowUnknownOption().allowExcessArguments(true)
+    .action(async (_opts: unknown, command: Command) => {
+      try { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('decisions'); }
+      catch { /* Logging must not prevent recording a decision. */ }
+      const privateDecisionsModule: string = './cli/decisions-cli.js';
+      const { registerDecisionsCommands } = await import(privateDecisionsModule) as { registerDecisionsCommands: (program: Command) => void };
+      const privateProgram = new Command();
+      registerDecisionsCommands(privateProgram);
+      await privateProgram.parseAsync(['decisions', ...command.args], { from: 'user' });
+    });
+}
+// Private command is absent from the public export; JS-only distributions still register it.
+if (existsSync(resolve(import.meta.dir, 'cli/directives-cli.ts')) || existsSync(resolve(import.meta.dir, 'cli/directives-cli.js'))) {
+  program.command('directives').description('대표 지시 로컬 색인·검색').allowUnknownOption().allowExcessArguments(true)
+    .action(async (_opts: unknown, command: Command) => {
+      const privateDirectivesModule: string = './cli/directives-cli.js';
+      const { registerDirectivesCommands } = await import(privateDirectivesModule) as { registerDirectivesCommands: (program: Command) => void };
+      const privateProgram = new Command();
+      registerDirectivesCommands(privateProgram);
+      await privateProgram.parseAsync(['directives', ...command.args], { from: 'user' });
+    });
+}
 registerFleetCommands(program);
 
 // ── ops (운영 관측 — 지금 뭐 도나·이상 없나·상태 전이) ──
@@ -5592,6 +5619,7 @@ agentCmd
   .option('--backend <id>', `외부 에이전트 backend (${agentBackendHelpList}). 각 CLI auto-approve 모드로 PTY 구동. 미등록 지정 시 명시 에러(조용한 codex 폴백 없음·애그노스틱)`)
   .option('--chain <backends>', '한 미션의 backend 사슬 (예: codex,claude,elanous)')
   .option('--plugin <name@market>', '에이전트 화면 안에서 플러그인을 설치하고 그 스킬로 미션 실행 (codex/claude)')
+  .addOption(new Option('--resources <mode>', '미션 전 자원 판단 사다리 (on|off, 기본 on)').choices(['on', 'off']).default('on'))
   .option('--headless', 'Claude 구독 CLI를 비대화형 stream-json 모드로 실행 (claude backend 전용)')
   .action(async (textParts: string[], opts: Record<string, any>) => {
     // 구독 모드 보장 — 브레인(streamLLM)·codex 둘 다 ChatGPT 구독으로 (API 과금 회피).
@@ -7815,6 +7843,16 @@ sessionCmd
     console.log(res.formatted ?? '(no context)');
   });
 
+async function runOnboardingForCli(): Promise<boolean> {
+  try {
+    await runOnboarding();
+    return true;
+  } catch (error) {
+    if (handleOnboardingRefusal(error, 'other')) return false;
+    throw error;
+  }
+}
+
 function announceChatToolsCompatibility(): void {
   process.stderr.write('`chat --tools` is a compatibility entrypoint; use `elanous agent` for tool-loop calls.\n');
   debug.log('chat.tools-compatibility', 'invoked', { toolLoopEnabled: true });
@@ -7841,7 +7879,7 @@ program
     const cfg = getUserConfig();
     if (needsOnboarding(cfg)) {
       ui.info('No config yet — launching setup wizard first.');
-      await runOnboarding();
+      if (!await runOnboardingForCli()) return;
     }
     const refreshed = reloadUserConfig();
     // ★ 관측갭 수리(2026-07-21·제1원칙·트랙A) — self-implement 자식 goal-loop(`chat --goal-loop`)은 데몬과
@@ -7885,7 +7923,7 @@ program
   .option('--new', 'Force a new session at boot instead of resuming the active one')
   .option('--session <id>', 'Resume an explicit session (id or unique prefix)')
   .option('--scenario <path>', 'Run a YAML multi-turn scenario before handing back to interactive (or exit)')
-  .option('--replay <session-id>', 'Re-execute the user prompts from a previous session in a fresh REPL run (BACKLOG #5). User prompts are extracted in order and fed through the same dispatcher as --scenario; assistant/tool messages and attachments are dropped. Mutually exclusive with --scenario.')
+  .option('--replay <session-id>', 'Re-execute the user prompts from a previous session in a fresh REPL run. User prompts are extracted in order and fed through the same dispatcher as --scenario; assistant/tool messages and attachments are dropped. Mutually exclusive with --scenario.')
   .option('--exit-after-scenario', 'Exit after the scenario / replay completes (default true when stdin is not a TTY)')
   .option('--no-exit-after-scenario', 'Stay in the interactive prompt after the scenario / replay completes (TTY default)')
   .option('--json', 'Emit one JSON line per turn (sessionId/provider/model/reply/...) instead of streaming text')
@@ -7908,7 +7946,7 @@ program
     const cfg = getUserConfig();
     if (needsOnboarding(cfg)) {
       ui.info('No config yet — launching setup wizard first.');
-      await runOnboarding();
+      if (!await runOnboardingForCli()) return;
     }
     const refreshed = reloadUserConfig();
     const { runRepl } = await import('./repl/index.js');
@@ -8471,7 +8509,7 @@ program
     'ACP client for the running elanous daemon. Three modes: handshake-only (default), one-shot (--message), interactive REPL (--interactive). Local (unix socket) or remote (--host / --url) over Tailscale.',
   )
   .option('--socket <path>', 'Override the unix socket path (default: ~/.elanous/elanous.sock)')
-  .option('--host <hostport>', 'Remote daemon host:port (e.g. mbp.tailnet:31415). Coerced to ws://<hostport>/v1/acp.')
+  .option('--host <hostport>', 'Remote daemon host:port (e.g. laptop.tailnet:31415). Coerced to ws://<hostport>/v1/acp.')
   .option('--url <wsurl>', 'Remote daemon WS URL (e.g. ws://host:31415/v1/acp). Overrides --host.')
   .option('-r, --remote [name]', 'Bookmark name (`-r` alone = default). Fills host/token-file; explicit --url/--host/--token/--token-file win.')
   .option('--token <token>', 'Bearer token for remote auth. Overrides --token-file and ELANOUS_TOKEN.')
@@ -8945,6 +8983,7 @@ const nexusRunCmd = nexusCmd
   .option('--watch', 'Static-mode: fs.watch loop inside daemon — source edits auto-rebuild apps/pwa. Default on for `nexus run` (no args), off for `--test`.')
   .option('--no-watch', 'Disable the static-mode fs.watch loop (canonical entry default-on).')
   .option('--no-mcp', 'Skip the entire MCP-client boot wire (every `mcp.servers[]` in user-config). Use when a misbehaving server (e.g. xcrun mcpbridge tools/list hang) drags every startup through its 8s timeout.')
+  .option('--no-auth', 'Explicitly disable Nexus HTTP and ACP websocket bearer authentication (unsafe).')
   .option('--dispatch', '§5-③ — enable the autonomous idle-continuation scheduler for this run (drives an active auto-mode goal on idle). Same as user-config `dispatch.enabled`. Default off — ignites self-firing turns, so opt-in.')
   .option('--force', 'Take the lock even if another nexus instance is recorded as running.')
   .option('--status', 'Alias for `elanous nexus status` (or test-mode status when combined with --test).')
@@ -8980,6 +9019,7 @@ const nexusRunCmd = nexusCmd
     autoRestart?: boolean;
     watch?: boolean;
     mcp?: boolean;
+    auth?: boolean;
     fresh?: boolean;
     force?: boolean;
     dispatch?: boolean;
@@ -9129,6 +9169,7 @@ const nexusRunCmd = nexusCmd
           preflightStaleServe: true,
           verifyListen: true,
           ...(opts.mcp === false ? { mcpEnabled: false } : {}),
+          ...(opts.auth === false ? { noAuth: true } : {}),
           ...(opts.https ? { https: true } : {}),
           ...(resolvedPort !== undefined ? { httpPort: resolvedPort } : {}),
           ...(opts.force ? { force: true } : {}),
@@ -9156,6 +9197,7 @@ const nexusRunCmd = nexusCmd
         // it — service-manager production posture stays watch-off.
         ...((bgChild ? opts.watch === true : watchOn) ? { pwaWatch: true } : {}),
         ...(opts.mcp === false ? { mcpEnabled: false } : {}),
+        ...(opts.auth === false ? { noAuth: true } : {}),
         ...(opts.force ? { force: true } : {}),
         ...(opts.dispatch ? { dispatch: true } : {}),
         ...(opts.toolCwd ? { toolCwd: opts.toolCwd } : {}),
@@ -9187,6 +9229,7 @@ const nexusRunCmd = nexusCmd
       ...(opts.rebuild ? { rebuild: true } : {}),
       ...(watchOnTty ? { watch: true } : {}),
       ...(opts.mcp === false ? { mcpEnabled: false } : {}),
+      ...(opts.auth === false ? { noAuth: true } : {}),
     });
     process.exit(result.exitCode);
   });
@@ -10560,7 +10603,7 @@ async function main(): Promise<void> {
   // gates on config completeness — no entry-mode branch.)
   const cfg = getUserConfig();
   if (needsOnboarding(cfg)) {
-    await runOnboarding();
+    if (!await runOnboardingForCli()) return;
   }
 
   // Active-provider banner so users know WHICH model/auth is about to

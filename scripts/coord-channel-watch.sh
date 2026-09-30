@@ -107,13 +107,20 @@ fi
 # 🆕 2026-09-24 (🅞 보고): 「나에게 온 «요청»」 표지가 🅢 로 고정돼 있었다 — `--track O` 감시에서 🅢·🅣 앞 요청이
 #   «🅞 에게 온 요청»으로 뜨고, 🅞 앞 요청은 일반어(부탁드립니다)가 없으면 안 떴다.
 #   ⇒ 표지를 트랙 정본(scripts/coord-tracks.json)에서 $TRACK 으로 찾아 식을 짓는다. 일반어는 «내 표지와 함께»일 때만.
-MARK=$(grep -o "\"id\": *\"$TRACK\", *\"mark\": *\"[^\"]*\"" "$(dirname "$0")/coord-tracks.json" 2>/dev/null | sed 's/.*"mark": *"//; s/"$//')
+#   🆕 09-30 역할 재편: 신원이 2글자 id(TC) ⊕ 직함(CTO) ⊕ 옛 alias(O) 셋이다 — --track 은 id·alias 어느 쪽도 받고,
+#   «내 글» 거르기와 «나에게 온 요청» 표지는 셋을 다 본다(전환기엔 옛 접두로 쓴 글도 내 글이다).
+ENTRY=$(jq -c --arg t "$TRACK" '[.tracks[] | select(.id == $t or .alias == $t)][0] // empty' "$(dirname "$0")/coord-tracks.json" 2>/dev/null)
+MARK=$(printf '%s' "$ENTRY" | jq -r '.mark // empty' 2>/dev/null)
+SELF_ID=$(printf '%s' "$ENTRY" | jq -r '.id // empty' 2>/dev/null); SELF_ID=${SELF_ID:-$TRACK}
+SELF_ALIAS=$(printf '%s' "$ENTRY" | jq -r '.alias // empty' 2>/dev/null); SELF_ALIAS=${SELF_ALIAS:-$SELF_ID}
+SELF_TITLE=$(printf '%s' "$ENTRY" | jq -r '.title // empty' 2>/dev/null)
+NAMES_ADDR="\\\\[$SELF_ID\\\\] 님|\\\\[$SELF_ALIAS\\\\] 님|$SELF_ID 님|$SELF_ID 께${SELF_TITLE:+|$SELF_TITLE 님|$SELF_TITLE 께}"
 if [ -n "$MARK" ]; then
-  REQ_ADDR="$MARK 께|$MARK 에게|$MARK 께서|$MARK 에 요청|$MARK 님|\\\\[$TRACK\\\\] 님"
+  REQ_ADDR="$MARK 께|$MARK 에게|$MARK 께서|$MARK 에 요청|$MARK 님|$NAMES_ADDR"
   REQ_MARK="$MARK"
 else
   echo "⚠️ 트랙 정본에서 $TRACK 의 표지를 못 찾았다 — 요청 표지는 [$TRACK] 님 만 본다" >&2
-  REQ_ADDR="\\\\[$TRACK\\\\] 님"
+  REQ_ADDR="$NAMES_ADDR"
   REQ_MARK="\\\\[$TRACK\\\\]"
 fi
 
@@ -123,6 +130,9 @@ LOCKDIR="$TMP/ch${PR_NUM}-$TRACK.lock"
 # 본문 기준선 — ⭐ 프로세스가 아니라 «파일»에 둔다. 그래서 감시가 죽어 있던 구간의 본문 변경도
 # 부활 «첫 주기»에 뜬다(매뉴얼 §「부활 구간은 못 본다」의 **본문 축만** 닫힌다 — 코멘트 축은 그대로).
 BODYFILE="$TMP/ch${PR_NUM}-$TRACK.body"
+# 코멘트 기준선(since)도 «파일»에 둔다(RFC-coordination-cost §7a · C1 · 09-30) — 재기동·30분 만기 재무장 뒤에도
+# 끊긴 자리부터 이어 읽는다. 24시간보다 오래된 기준선은 버리고 지금부터(한 번에 쏟아지는 것 방지).
+SINCEFILE="$TMP/ch${PR_NUM}-$TRACK.since"
 
 # 기동시각 — 소유 판정의 유일한 근거(PID 는 재사용된다). 공백은 정규화해서 비교한다.
 proc_started() {
@@ -416,7 +426,7 @@ fetch_comments() {   # $1=since(ISO8601) → stdout=포맷된 신규 행 · rc=0
   #     그 글은 필터를 «통과»했고 창에도 떴다 — 그런데 다른 글 사이에 섞여 «요청»으로 안 보였다.
   #   🔑 그러므로 결손은 「고르기」가 아니라 ***「고른 뒤 «구분»하지 않은 것」***이다.
   #   ⛔ 표지를 «본문 앞»에 둔다 — 뒤에 두면 BODY_CHARS 절단에 잘려 사라진다.
-  fmt="select(((.body | sub(\"^[[:space:]#]+\"; \"\")) | (startswith(\"**[$TRACK]\") or startswith(\"[$TRACK]\"))) | not)
+  fmt="select(((.body | sub(\"^[[:space:]#]+\"; \"\")) | (startswith(\"**[$SELF_ID]\") or startswith(\"[$SELF_ID]\") or startswith(\"**[$SELF_ALIAS]\") or startswith(\"[$SELF_ALIAS]\"))) | not)
        | \"[#$PR_NUM 신규 id=\" + (.id|tostring) + \" \" + .created_at + \" @\" + .login + \"]\"
          + (if ((.body | test(\"$REQ_ADDR\")) or ((.body | test(\"$REQ_MARK\")) and (.body | test(\"부탁드립니다|부탁합니다\")))) then \" 🙋‼️ 나에게 온 «요청»\" else \"\" end)
          + \" \" + (.body[:$BODY_CHARS] | gsub(\"\n\"; \" ⏎ \"))"
@@ -501,6 +511,14 @@ watch_loop() {
     echo "  📄 «본문» 감시 ON · 기준선 «없음» ⇒ 첫 주기를 기준선으로 삼고 이벤트를 안 낸다"
   fi
   last=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [ -s "$SINCEFILE" ]; then
+    local saved; saved=$(head -1 "$SINCEFILE" 2>/dev/null)
+    if [[ "$saved" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] \
+       && [ -z "$(find "$SINCEFILE" -mmin +1440 2>/dev/null)" ]; then
+      last="$saved"
+      echo "  🔁 코멘트 기준선 이어 읽기 since=$last (파일 $SINCEFILE) — 죽어 있던 구간도 첫 주기에 뜬다"
+    fi
+  fi
   while true; do
     sleep "$INTERVAL"
     now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -530,6 +548,7 @@ watch_loop() {
       fi
       [ -n "$out" ] && printf '%s\n' "$out"
       last="$now"
+      printf '%s\n' "$last" > "$SINCEFILE" 2>/dev/null || true
       # ⭐ 실패하다 «돌아왔으면» 한 줄로 말한다 — 조용히 복구되면 아무도 «공백 구간»이 있었음을 모른다.
       if [ "$WATCH_FAILS" -gt 0 ]; then
         printf '✅ [#%s 조회 «회복» %s] 연속 실패 %s회 뒤 성공 — 그 사이도 since=%s 로 «이어 붙였다»(놓친 것 없음)\n' \

@@ -235,11 +235,11 @@ export function formatUpdateNotice(result: Pick<SelfUpdateResult, 'installedVers
 function defaultNotice(text: string): void {
   // 시험에선 텔레그램으로 나가지 않는다.
   if (process.env.NODE_ENV === 'test') return;
-  import('../domains/outbound-alert.js').then((m) => { m.sendOutbound(text, 'report'); }).catch(() => {});
+  import('../domains/outbound-alert.js').then((m) => { m.sendOutbound(text, 'ops-report'); }).catch(() => {});
 }
 
 function defaultAlert(text: string): void {
-  import('../domains/outbound-alert.js').then((m) => { m.sendOutbound(text, 'alert'); }).catch(() => {});
+  import('../domains/outbound-alert.js').then((m) => { m.sendOutbound(text, 'ops-alert'); }).catch(() => {});
 }
 
 export interface VersionPruneOutcome {
@@ -296,8 +296,11 @@ export function childPath(env: NodeJS.ProcessEnv = process.env, execPath: string
   return current.split(':').includes(bunDir) ? current : [bunDir, current].filter(Boolean).join(':');
 }
 
+// bun 1.4 는 maxBuffer(기본 1MiB)를 넘는 출력을 자르고 자식을 죽인다 — 설치·빌드 로그는 그보다 클 수 있다.
+const SPAWN_MAX_BUFFER = 64 * 1024 * 1024;
+
 const execute = (command: string, args: string[], cwd: string, options?: { timeout?: number }) => {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout: options?.timeout, maxBuffer: options?.timeout ? 64 * 1024 * 1024 : undefined, env: { ...process.env, PATH: childPath() } });
+  const result = spawnSync(command, args, { cwd, encoding: 'utf8', timeout: options?.timeout, maxBuffer: SPAWN_MAX_BUFFER, env: { ...process.env, PATH: childPath() } });
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.error?.message ?? result.stderr ?? '' };
 };
 
@@ -395,7 +398,7 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     }
   } catch { previous = ''; }
   const run = deps.run ?? ((command: string, args: string[], cwd: string, input?: string, env?: NodeJS.ProcessEnv) => {
-    const result = spawnSync(command, args, { cwd, encoding: 'utf8', input, env: { ...process.env, ...env, PATH: childPath() } });
+    const result = spawnSync(command, args, { cwd, encoding: 'utf8', input, maxBuffer: SPAWN_MAX_BUFFER, env: { ...process.env, ...env, PATH: childPath() } });
     return { status: result.status, stderr: result.error?.message ?? result.stderr ?? '' };
   });
   try {

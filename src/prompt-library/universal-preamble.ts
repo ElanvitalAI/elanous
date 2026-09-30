@@ -59,6 +59,10 @@ export const PROJECT_ANCHOR_NON_CANDIDATE_FILENAMES = ['CLAUDE.md'] as const;
 export const PROJECT_TREE_MAX_CHARS = 8 * 1024;
 export const PROJECT_TREE_DIR_ENTRY_LIMIT = 20;
 
+const NO_TOOLS_VERIFICATION_GUIDANCE = `## Chat without tools — verify rather than guess
+This conversation has tools disabled. Do not guess repository or real-time facts that require verification, such as file counts, file contents, commits, or the current time. Say you cannot check them here. The project tree above is for navigation, not evidence for counts.
+To check these facts, enable tools with \`elanous agent …\` or \`elanous chat --tools …\`.`;
+
 // P4 (2026-05-03) — Family-agnostic coding-agent lifecycle. Maps the
 // three user-facing pipelines to an explicit tool-batch sequence so every
 // model (not just codex) follows the same shape. Pattern source:
@@ -673,8 +677,7 @@ export function loadProjectAnchor(cwd: string): ProjectAnchorResult {
   return result;
 }
 
-/** Build the surface-agnostic preamble. Currently MVP — emits zero or
- *  one system message (project anchor). Surfaces spread the result
+/** Build the surface-agnostic preamble. Surfaces spread the result
  *  into their own preamble; e.g.
  *
  *  ```ts
@@ -728,6 +731,9 @@ export function buildUniversalPreamble(ctx: UniversalPreambleContext): LLMMessag
       role: 'system',
       content: `## Project Layout (top-level + 1 depth)\n\n\`\`\`\n${tree.content}\n\`\`\`\n\nUse this layout to pick directories directly instead of issuing broad project-root Grep/Glob calls. When AGENTS.md / CLAUDE.md describe a track or subsystem, this layout shows where its files actually live.`,
     });
+  }
+  if (!ctx.enabledTools?.length) {
+    out.push({ role: 'system', content: NO_TOOLS_VERIFICATION_GUIDANCE });
   }
   // P4 (2026-05-03) — Family-agnostic coding-agent lifecycle. Append
   // before family addendum so codex (which has its own discipline

@@ -6,8 +6,9 @@
 
 | Command | What it does |
 |---|---|
+| `elanous start` | One command to begin: finds a model, starts the background service if needed and opens the web app (`--tui` for the terminal UI) |
 | `elanous doctor` | Report which credentials resolve and from where, plus a readiness section (provider, `gh` sign-in, `PATH`, background service version, Linux `TMPDIR`) — `--json` for machines |
-| `elanous doctor --fix` / `--fix --yes` | Show / apply the reversible repairs (the `PATH` block, key-cache permissions, the Linux `TMPDIR` block); startup files are backed up first |
+| `elanous doctor --fix` / `--fix --yes` | Show / apply the reversible repairs (the `PATH` block, key-cache permissions, the Linux `TMPDIR` block); startup files are backed up first. A missing git is offered interactively on a terminal; everything else needs `--yes` |
 | `elanous setup` | Walk through missing setup steps (`--non-interactive` only reports) |
 | `elanous login openai-codex` | Sign in with a ChatGPT subscription |
 | `elanous login status` / `elanous login logout <provider>` | List / forget stored sign-ins |
@@ -38,6 +39,16 @@ Useful `harness say` / `harness ask` options: `--dry-run` (plan only), `--no-aut
 | `elanous harness clean` | Remove finished harness worktrees (dry run unless `--yes`; open PRs are always kept) |
 | `elanous ops status` | What the autonomous parts are doing right now |
 
+## Tasks, loops and plugins
+
+| Command | What it does |
+|---|---|
+| `elanous tasks list` / `elanous tasks approve <id>` | See queued tasks / approve one that came from outside |
+| `elanous card list` / `elanous card show <id>` | Tasks as cards, and one card with its sections |
+| `elanous directive add "<instruction>" --dry-run` | Preview an instruction as a Linear issue; drop `--dry-run` to create it |
+| `elanous loop list` / `status` / `run` | Loop agents — see [Loop agents](loop-agents.md) |
+| `elanous plugin add` / `list` / `remove` | Install and manage plugins — see [Plugins](plugins.md) |
+
 ## Settings and models
 
 | Command | What it does |
@@ -56,4 +67,4 @@ Useful `harness say` / `harness ask` options: `--dry-run` (plan only), `--no-aut
 | `elanous nexus install --launchd` (macOS) · `--systemd-user` (Linux) | Run it at login; API keys are read from the key cache, not written into the service file |
 | `elanous nexus build` | Build the web app (from a checkout — see [install](install.md#known-limits)) |
 | `elanous nexus restart-needed` | Say whether the running service needs a restart, only a web-app build, or nothing (exit 0 none · 10 build · 11 restart · 2 unknown) |
-| `elanous self-update [--restart]` | Install the current checkout, then restart the service only if it is needed and you passed `--restart` |
+| `elanous update [--restart]` | Update to the latest release (`--version <v>` for a specific one; from a checkout, reinstall that checkout); restart the service only if it is needed and you passed `--restart`. Same as `self-update`. `elanous update --auto on` updates daily |

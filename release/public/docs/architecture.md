@@ -68,7 +68,7 @@ elanous logs --event pipeline-node-entry --limit 40 --all --include-test --json 
 | Workflow | `src/workflow-runtime/` | YAML DAG engine (`elanous wf`) |
 | Tasks | `src/task-orchestrator/` | task store, runtimes, surfaces, task-to-workflow conversion |
 
-**Intake has three live entrances** — Telegram, the terminal UI, and an internal API path used by system repair. Other channels (PWA, voice, CLI) are declared but have no producer yet. In particular, `elanous harness say` from a terminal goes straight to the harness and **does not pass through intake** (no triage, domain or phase decomposition).
+**Intake has three live entrances** — Telegram, the terminal UI, and an internal API path used by system repair. The PWA, voice and CLI channels are declared but nothing feeds them yet. The web app's **Intake** page is a separate door: it sends what you type to your notes or to the harness without passing through this pipeline. In particular, `elanous harness say` from a terminal goes straight to the harness and **does not pass through intake** (no triage, domain or phase decomposition).
 
 **The intended shape:** intake turns a sentence into tasks, the task manager runs a task by starting a graph, and a workflow is the body of one node in that graph. That joins the two missing links without building a new engine — see [Graph engineering](graph-engineering.md#workflows-tasks-and-intake).
 

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { spawnSyncText } from '../src/util/spawn-sync-output.js';
 
 export function publishInternalDist(checkout: string, out: string, keep = 3): { ok: true; version: string; commit: string; sha256: string; out: string; pwaBuild: 'present' | 'missing' } {
   checkout = resolve(checkout);
@@ -42,9 +43,7 @@ export function publishInternalDist(checkout: string, out: string, keep = 3): { 
     const isBuildOutput = (path: string): boolean => path.startsWith('apps/pwa/out/') || path === 'src/version/packed-revision.json';
     const publishedPaths = [...new Set([...packedPaths, 'scripts/install.sh'])].filter((path) => !isBuildOutput(path));
     const pwaBuild: 'present' | 'missing' = packedPaths.includes('apps/pwa/out/index.html') ? 'present' : 'missing';
-    const tracked = spawnSync('git', ['ls-files', '--cached', '-z'], { cwd: checkout, encoding: 'utf8' });
-    if (tracked.status !== 0) throw new Error(`cannot list committed files: ${tracked.stderr}`);
-    const committed = new Set(tracked.stdout.split('\0').filter(Boolean));
+    const committed = new Set(spawnSyncText('git', ['ls-files', '--cached', '-z'], { cwd: checkout, encoding: 'utf8' }).split('\0').filter(Boolean));
     const uncommitted = publishedPaths.filter((path) => !committed.has(path));
     if (uncommitted.length) throw new Error(`packed files not committed at HEAD: ${uncommitted.join(', ')}`);
     const changed = spawnSync('git', ['diff', '--quiet', 'HEAD', '--', ...publishedPaths], { cwd: checkout, encoding: 'utf8' });

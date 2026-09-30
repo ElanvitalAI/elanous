@@ -85,6 +85,24 @@ describe('coord-post.sh — 신원 관문', () => {
     expect(source).toContain('coord-tracks.json');
   });
 
+  test('✅ 2글자 신원(OP·MK·TC·UX)이 통과하고 · 옛 한 글자는 경고 뒤 통과한다 (09-30 역할 재편)', async () => {
+    const r = await runPost('**[TC]** 내 신원\n{{TS}}\n', { COORD_ID: 'TC' }, 0);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('신원 [TC]');
+    expect(r.stderr).not.toContain('옛 한 글자');
+    const old = await runPost('**[O]** 내 신원\n{{TS}}\n', { COORD_ID: 'O' }, 0);
+    expect(old.status).toBe(0);
+    expect(old.stderr).toContain('옛 한 글자 신원 [O] — 새 신원은 [TC]');
+  });
+
+  test('⛔ 2글자 신원이 남의 2글자·옛 접두로 쓰면 «발신하지 않는다» (rc=5)', async () => {
+    for (const body of ['**[MK]** 님께\n{{TS}}\n', '**[T]** 님께\n{{TS}}\n']) {
+      const r = await runPost(body, { COORD_ID: 'TC' });
+      expect(r.status).toBe(5);
+      expect(r.stderr).toContain('내 것이 아니다');
+    }
+  });
+
   test('⛔ 트랙 정본에 «없는» 신원은 거부한다 (rc=4)', async () => {
     const r = await runPost('**[Q]** 없는 트랙\n{{TS}}\n', { COORD_ID: 'Q' });
     expect(r.status).toBe(4);
@@ -237,5 +255,63 @@ describe('coord-post.sh — 신원 관문', () => {
     expect(r.stdout).toContain('**[S]** 기존 본문');
     expect(r.stdout).not.toContain('{{TS}}');
     expect(r.stdout).not.toContain('stub gh');
+  });
+});
+
+// ── GraphQL 2차 한도 → REST 폴백 (GIT-S83 · 2026-09-29) ─────────────────────
+// `gh pr comment` 가 «rate limit» 으로 실패하는 창에서도 REST(`gh api …/issues/<n>/comments`)는 답했다.
+async function runPostRouted(prCommentOut: string, prCommentExit: number, apiExit: number) {
+  const dir = await mkdtemp(join(tmpdir(), 'coord-post-rest-'));
+  const file = join(dir, 'body.md');
+  await writeFile(file, '**[S]** 내 신원\n{{TS}}\n');
+  const bin = join(dir, 'bin');
+  await mkdir(bin, { recursive: true });
+  const calls = join(dir, 'calls.log');
+  await writeFile(join(bin, 'bun'), [
+    '#!/bin/sh',
+    `echo "$*" >> "${calls}"`,
+    'case "$*" in',
+    `  *"gh pr comment"*) echo "${prCommentOut}"; exit ${prCommentExit} ;;`,
+    `  *"gh api"*) echo "https://github.com/o/r/pull/1#issuecomment-1"; exit ${apiExit} ;;`,
+    'esac',
+    'exit 9',
+  ].join('\n'));
+  await chmod(join(bin, 'bun'), 0o755);
+  const r = spawnSync('bash', [script, file], {
+    encoding: 'utf8',
+    env: { ...process.env, CH_PR: '99999999', PATH: `${bin}:${process.env.PATH ?? ''}` },
+    cwd: resolve(import.meta.dir, '..'),
+  });
+  const log = await readFile(calls, 'utf8').catch(() => '');
+  return { r, log };
+}
+
+describe('coord-post.sh — GraphQL 한도면 REST 로 한 번 물러선다', () => {
+  test('✅ rate limit → REST 발신 성공 · 상태 줄에 «REST 폴백»', async () => {
+    const { r, log } = await runPostRouted('GraphQL: API rate limit already exceeded for user ID 1.', 1, 0);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('발신 성공 · REST 폴백');
+    expect(log).toContain('gh api -X POST repos/{owner}/{repo}/issues/99999999/comments');
+    expect(log).toMatch(/-F body=@\S+/);
+  });
+
+  test('⛔ rate limit → REST 도 실패면 실패로 끝난다', async () => {
+    const { r } = await runPostRouted('GraphQL: API rate limit already exceeded', 1, 1);
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('발신 실패');
+    expect(r.stderr).toContain('REST 폴백');
+  });
+
+  test('✅ GraphQL 내부 오류(Something went wrong) → REST 발신 성공(09-30 채널 1,500 실측)', async () => {
+    const { r, log } = await runPostRouted('GraphQL: Something went wrong while executing your query on 2026-09-30T04:10:17Z.', 1, 0);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('발신 성공 · REST 폴백');
+    expect(log).toContain('gh api -X POST repos/{owner}/{repo}/issues/99999999/comments');
+  });
+
+  test('⛔ 한도가 아닌 실패는 물러서지 않는다(REST 호출 0)', async () => {
+    const { r, log } = await runPostRouted('GraphQL: Could not resolve to a PullRequest', 1, 0);
+    expect(r.status).toBe(1);
+    expect(log).not.toContain('gh api');
   });
 });

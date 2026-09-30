@@ -75,4 +75,20 @@ describe('approvals page speed', () => {
     await f.list();
     expect(f.calls.filter((args) => args[1] === 'list')).toHaveLength(2);
   });
+
+  test('a failed read is shared inside the cache window too, then retried after it', async () => {
+    clearApprovalsReadCache();
+    const f = slowFixture({ readCacheMs: 15_000 });
+    const failing: MergeApprovalsDeps = {
+      ...f.deps,
+      gh: async (args) => { f.calls.push(args); return { ok: false, stdout: '', stderr: 'API rate limit exceeded', code: 1 }; },
+    };
+    const list = () => handleMergeApprovals(new Request(base), failing);
+    await list();
+    await list();
+    expect(f.calls.filter((args) => args[1] === 'list')).toHaveLength(1);
+    f.advance(16_000);
+    await list();
+    expect(f.calls.filter((args) => args[1] === 'list')).toHaveLength(2);
+  });
 });

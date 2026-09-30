@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import type { Command } from 'commander';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { discoverChromeBinary } from '../browser-cdp/client.js';
-import { listProviders } from '../oauth/store.js';
+import { resolveUsableLlm, type UsableLlm } from '../llm/usable-llm.js';
 import { detectLocale } from '../expression/locale.js';
 import { findRetiredConfigKeysInFile, getUserConfig, type RetiredConfigKey, type UserConfig } from '../user-config.js';
 import { codeRevision } from '../version/code-revision.js';
@@ -142,7 +142,8 @@ export interface DoctorOptions {
    */
   readiness?: ReadinessDeps;
   checkReadiness?: (deps: ReadinessDeps) => ReadinessReport;
-  /** Read-only auth-store provider names. Values are never requested. */
+  resolveLlm?: () => UsableLlm;
+  /** Legacy read-only seam; route selection no longer uses provider-name presence. */
   listAuthProviders?: () => readonly string[];
   /** Read-only `codeRevision()`. */
   codeRevision?: () => string | undefined;
@@ -186,15 +187,6 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const tavilyNames = new Set(['TAVILY_API_KEY', 'TAVILY_KEY']);
-
-function codexLoginPresent(providers: readonly string[]): boolean {
-  return providers.some((name) => name === 'openai-codex' || name.startsWith('openai-codex:'));
-}
-
-/** Presence only. Token strings from the auth store never leave this function. */
-function defaultListAuthProviders(): readonly string[] {
-  return listProviders();
-}
 
 function defaultCodeRevision(): string | undefined {
   try {
@@ -294,7 +286,6 @@ interface ReadinessLookup {
   platform: NodeJS.Platform;
   commandExists: (name: string) => boolean;
   getConfig: () => UserConfig;
-  listAuthProviders: () => readonly string[];
   codeRevision: () => string | undefined;
   fetchHealth: () => { daemonSha?: string } | null;
   readInstallPrefix: () => string | null | undefined;
@@ -306,8 +297,6 @@ interface ReadinessLookup {
   /** 저장소가 시험한 bun 판(`.bun-version`) · 지금 도는 bun 판(시험 seam). */
   bunPin?: () => string | null;
   bunVersion?: () => string | null;
-  /** LLM 키가 하나라도 풀렸나(자격 보고서에서 · 없으면 못 쟀다). */
-  llmKeyResolved?: boolean;
   /** `/etc/os-release` 본문(시험 seam) — 못 읽으면 null. */
   readOsRelease?: () => string | null;
   /** 빌드 도구 탐침(시험 seam). */
@@ -371,19 +360,6 @@ function resolveReadinessDeps(lookup: ReadinessLookup): ReadinessDeps {
   if (provider !== null && provider !== 'auto' && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(provider)) {
     provider = null;
   }
-  let codexLogin: boolean | null = null;
-  let anyLogin: boolean | null = null;
-  try {
-    const providers = lookup.listAuthProviders();
-    codexLogin = codexLoginPresent(providers);
-    anyLogin = providers.length > 0;
-  } catch {
-    codexLogin = null;
-  }
-  // 로그인이 있거나 LLM 키가 풀렸으면 true · 둘 다 «아니라고 잰» 경우만 false · 하나라도 못 쟀으면 null.
-  const llmCredentialAvailable = anyLogin === true || lookup.llmKeyResolved === true
-    ? true
-    : anyLogin === false && lookup.llmKeyResolved === false ? false : null;
   const pathEntries = (lookup.env.PATH ?? '').split(lookup.pathDelimiter).filter((entry) => entry.length > 0);
   let ghOnPath: boolean | null = null;
   let ghAuthStatus: number | null = null;
@@ -466,8 +442,6 @@ function resolveReadinessDeps(lookup: ReadinessLookup): ReadinessDeps {
   }
   return {
     provider,
-    codexLogin,
-    llmCredentialAvailable,
     ghOnPath,
     ghAuthStatus,
     ghVersion,
@@ -1045,8 +1019,7 @@ export function runDoctor(options: DoctorOptions = {}): DoctorReport {
         pathDelimiter,
         platform,
         commandExists,
-        getConfig,
-        listAuthProviders: options.listAuthProviders ?? defaultListAuthProviders,
+        getConfig: () => resolutionOptions.userConfig,
         codeRevision: options.codeRevision ?? defaultCodeRevision,
         fetchHealth: options.fetchHealth ?? (() => defaultFetchHealth(options.resolveDaemonEndpoint ?? resolveDaemonEndpoint)),
         readInstallPrefix: options.readInstallPrefix ?? (() => defaultReadInstallPrefix(root, exists)),
@@ -1054,12 +1027,17 @@ export function runDoctor(options: DoctorOptions = {}): DoctorReport {
         ghAuthStatus: options.ghAuthStatus ?? (() => defaultGhAuthStatus(commandExists)),
         ghVersion: options.ghVersion ?? (() => defaultGhVersion(commandExists)),
         tmpdirSameFsAsBunCache: options.tmpdirSameFsAsBunCache ?? (() => defaultTmpdirSameFsAsBunCache(env)),
-        llmKeyResolved: llmKeyResolvedFrom(credentials),
         nodePty: nodePtyStatus(externalCommands.commands),
         ...(options.probeBuildToolchain ? { probeBuildToolchain: options.probeBuildToolchain } : {}),
         ...(options.checkPythonEnv ? { checkPythonEnv: options.checkPythonEnv } : {}),
         ...(options.probeHostEnvironment ? { probeHostEnvironment: options.probeHostEnvironment } : {}),
       });
+    // An injected readiness snapshot stays as-is. For a real machine, measure the
+    // same runtime route as `start` rather than inferring usability from key names.
+    if (options.readiness === undefined && readiness.provider !== null) {
+      try { readiness.usableLlm = options.resolveLlm ? options.resolveLlm() : resolveUsableLlm({ config: resolutionOptions.userConfig }); }
+      catch { readiness.usableLlm = null; }
+    }
     return {
       ok: true,
       credentials,
@@ -1083,15 +1061,14 @@ function formatReadiness(readiness: ReadinessReport | undefined): string[] {
   if (readiness === undefined) return [];
   const todo = readiness.items.filter((entry) => entry.status === 'manual' || entry.status === 'fixable');
   return [
-    '준비 상태:',
+    'Readiness:',
     ...readiness.items.map((entry) => {
       const remedy = entry.remedy === undefined ? '' : ` — ${entry.remedy}`;
       return `  ${entry.id}: ${entry.status} — ${entry.evidence}${remedy}`;
     }),
     todo.length === 0
-      ? '할 일 없음.'
-      // 처방은 줄마다 이미 있다 — 「fixable」이 곧 `doctor --fix` 는 아니다(install-path 의 처방은 export 한 줄).
-      : `할 일 ${todo.length}개: ${todo.map((entry) => entry.id).join(', ')} — 처방은 위 각 줄 끝`,
+      ? 'Nothing to do.'
+      : `To do (${todo.length}): ${todo.map((entry) => entry.id).join(', ')} — each line above ends with its fix`,
   ];
 }
 
@@ -1105,14 +1082,21 @@ function humanFreeFallback(value: string): string {
     .replace(/\s{2,}/g, ' ').trim().replace(/[—–·;,\s]+$/, '');
 }
 
+export function humanBreaks(value: string): string | undefined {
+  if (value.trim().toLowerCase() === 'unmeasured'
+    || /\b\d+ test (failures|errors)\b|\bmeasured\b|\bpostmortem\b|\bquota\b/i.test(value)
+    || /[가-힣ㄱ-ㅎㅏ-ㅣ]/.test(value)) return undefined;
+  return humanFreeFallback(value) || undefined;
+}
+
 function formatCapabilitySummary(summary: DoctorCapabilitySummary): string[] {
   const unavailable = summary.unavailable.map((capability) =>
     `  ${capability.name} — unlock with ${capability.credential}${capability.freeFallback !== undefined && humanFreeFallback(capability.freeFallback) ? `; free alternative: ${humanFreeFallback(capability.freeFallback)}` : ''}`,
   );
   return [
-    '할 수 있는 일:',
+    'Available:',
     ...(summary.available.length === 0 ? ['  None.'] : summary.available.map((capability) => `  ${capability.name} — unlocked by ${capability.credential}`)),
-    '못 하는 일:',
+    'Unavailable:',
     ...(unavailable.length === 0 ? ['  None.'] : unavailable),
     'Unknown by credential:',
     ...(summary.unknownCredentials.length === 0 ? ['  Empty.'] : summary.unknownCredentials.map((credential) => `  ${credential}`)),
@@ -1129,8 +1113,8 @@ export function formatDoctorReport(report: DoctorReport, options: { credentials?
   const satisfied = report.credentials.filter((credential) => !credential.resolved && credential.satisfiedBy !== undefined).length;
   return [
     ...formatReadiness(report.readiness),
-    ...(requiredMissing.length ? [`⛔ 필수 명령 없음: ${requiredMissing.join(', ')}`] : []),
-    `자격증명: ${resolved}/${report.credentials.length} resolved${satisfied ? ` · ${satisfied} satisfied by alternative names` : ''} · details: elanous doctor --credentials`,
+    ...(requiredMissing.length ? [`⛔ Required commands missing: ${requiredMissing.join(', ')}`] : []),
+    `Credentials: ${resolved}/${report.credentials.length} resolved${satisfied ? ` · ${satisfied} satisfied by alternative names` : ''} · details: elanous doctor --credentials`,
     ...(options.credentials ? report.credentials.map((credential) => [
       `${credential.name}: ${credential.resolved ? 'resolved' : 'unresolved'} (${credential.source}) — ${credential.note}`,
       ...(credential.satisfiedBy !== undefined ? [`  Satisfied by: ${credential.satisfiedBy.name} (${credential.satisfiedBy.source})`] : []),
@@ -1138,14 +1122,15 @@ export function formatDoctorReport(report: DoctorReport, options: { credentials?
       ...(credential.freeFallback !== undefined ? [`  Free fallback${credential.freeFallbackMode === 'auto' || credential.freeFallbackMode === 'manual' || credential.freeFallbackMode === 'none' ? ` [${credential.freeFallbackMode}]` : ''}: ${humanFreeFallback(credential.freeFallback)}`] : []),
     ].join('\n')) : []),
     ...(report.catalogMetadataUnavailable ? ['Catalog metadata unavailable: could not read catalog/resources.yaml.'] : []),
-    ...(report.retiredConfigKeys ?? []).map(({ path, reason }) => `더는 안 쓰는 설정 키: ${path} — ${reason}`),
+    ...(report.retiredConfigKeys ?? []).map(({ path, reason }) => `Retired config key: ${path} — ${reason}`),
     'External commands:',
     ...report.externalCommands.map((command) => {
       const breaks = command.status === 'broken' ? command.breaks_broken ?? command.breaks : command.breaks;
+      const visibleBreaks = breaks === undefined ? undefined : humanBreaks(breaks);
       const fix = command.status === 'broken' ? command.fix_broken ?? command.fix : command.fix;
       return [
         `${command.name}: ${command.status === 'skipped' ? `skipped (${command.platform}-only)` : `${command.status} (${command.tier})`}${command.detail === undefined ? '' : ` — ${command.detail}`}`,
-        ...((command.status === 'missing' || command.status === 'broken') && breaks !== undefined ? [`  Breaks: ${breaks}`] : []),
+        ...((command.status === 'missing' || command.status === 'broken') && visibleBreaks !== undefined ? [`  Breaks: ${visibleBreaks}`] : []),
         ...((command.status === 'missing' || command.status === 'broken') && fix !== undefined ? [`  Fix: ${fix}`] : []),
       ].join('\n');
     }),
@@ -1260,13 +1245,12 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         home: deps.home,
         cacheDir: deps.cacheDir,
         readdir: deps.readdir,
-        readiness: deps.readiness ?? resolveReadinessDeps({
+        readiness: deps.readiness ?? { ...resolveReadinessDeps({
           env: deps.env ?? process.env,
           pathDelimiter: deps.pathDelimiter ?? delimiter,
           platform: deps.platform ?? process.platform,
           commandExists: deps.commandExists ?? ((name) => (deps.env ?? process.env).PATH?.split(deps.pathDelimiter ?? delimiter).some((dir) => existsSync(join(dir, name))) ?? false),
-          getConfig: deps.getUserConfig ?? getUserConfig,
-          listAuthProviders: deps.listAuthProviders ?? defaultListAuthProviders,
+          getConfig: () => deps.userConfig ?? (deps.getUserConfig ?? getUserConfig)(),
           codeRevision: deps.codeRevision ?? defaultCodeRevision,
           fetchHealth: deps.fetchHealth ?? (() => defaultFetchHealth(deps.resolveDaemonEndpoint ?? resolveDaemonEndpoint)),
           readInstallPrefix: deps.readInstallPrefix ?? (() => defaultReadInstallPrefix(deps.repositoryRoot ?? repositoryRoot, deps.exists ?? existsSync)),
@@ -1274,13 +1258,15 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           // gh 판은 수리 계획에 쓰인다(낡은 gh → 정적 gh) — 🩸 09-25: 여기서 안 재서 계획은 보고서에만 뜨고 적용이 안 됐다.
           ghVersion: deps.ghVersion ?? (() => defaultGhVersion((name) => (deps.env ?? process.env).PATH?.split(deps.pathDelimiter ?? delimiter).some((dir) => existsSync(join(dir, name))) ?? false)),
           tmpdirSameFsAsBunCache: deps.tmpdirSameFsAsBunCache ?? (() => defaultTmpdirSameFsAsBunCache(deps.env ?? process.env)),
-          // 보고서와 같은 자로 — 로그인도 LLM 키도 없으면 계획에 «사람 한 줄»(로그인)이 실린다(🅢 #20263 ③).
-          ...(source.ok ? { llmKeyResolved: llmKeyResolvedFrom(source.credentials), nodePty: nodePtyStatus(source.externalCommands) } : {}),
+          ...(source.ok ? { nodePty: nodePtyStatus(source.externalCommands) } : {}),
           // L0 칸(substrate·docker·kubernetes·memory)은 «정보성·선택 기능»이라 수리 계획에 싣지 않는다 —
           // `--sudo` 가 `sudo systemctl start docker` 를 «설치 줄»로 치지 않게 하고, docker·kubectl 탐침(최대 수 초)을 두 번 돌리지 않는다.
           // 보고서(`runDoctor`)에는 그대로 나온다.
           probeHostEnvironment: () => null,
-        }),
+        }), usableLlm: (() => {
+          try { return deps.resolveLlm ? deps.resolveLlm() : resolveUsableLlm({ config: deps.userConfig ?? (deps.getUserConfig ?? getUserConfig)() }); }
+          catch { return null; }
+        })() },
         exists: deps.exists,
         readFile: deps.readFile,
         writeFile: deps.writeFile,
@@ -1374,16 +1360,16 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
       else out.log([
         formatDoctorReport(currentReport, { credentials: opts.credentials }),
         ...(advice ? [formatDoctorAdvice(advice)] : []),
-        '수정 계획:',
+        'Fix plan:',
         ...plan.items.map((item) => `  ${item.id}: ${item.status} — ${item.path} — ${item.action}${item.reason ? ` — ${item.reason}` : ''}`),
         ...plan.manual.map((item) => `  ${item.id}: manual${item.remedy ? ` — ${item.remedy}` : ''}`),
         ...manualCommandFixes(currentReport).map((line) => `  ${line}`),
-        ...(gitInstall ? [`git 설치: ${gitInstall.detail}${gitPlan?.note ? ` — ${gitPlan.note}` : ''}`] : []),
+        ...(gitInstall ? [`Git installation: ${gitInstall.detail}${gitPlan?.note ? ` — ${gitPlan.note}` : ''}`] : []),
         ...(sudoResult ? [sudoResult.sudoAvailable
-          ? `sudo 설치: ${sudoResult.runs.length ? sudoResult.runs.map((entry) => `${entry.result} — ${entry.command}${entry.detail ? ` — ${entry.detail}` : ''}`).join(' · ') : '칠 줄 없음'}`
-          : 'sudo 설치: 건너뜀 — 이 기계는 sudo 에 암호가 필요하다(sudo -n true 실패). 위 «manual» 줄을 직접 치세요.'] : []),
-        ...(results ? ['적용 결과:', ...results.items.map((item) => `  ${item.id}: ${item.result} — ${item.path}${item.reason ? ` — ${item.reason}` : ''}`)] : ['적용하려면 --fix --yes']),
-        ...(restartResult ? [`서비스 재시작: ${restartResult.result} — ${restartResult.reason}`] : []),
+          ? `Sudo installation: ${sudoResult.runs.length ? sudoResult.runs.map((entry) => `${entry.result} — ${entry.command}${entry.detail ? ` — ${entry.detail}` : ''}`).join(' · ') : '칠 줄 없음'}`
+          : 'Sudo installation: 건너뜀 — 이 기계는 sudo 에 암호가 필요하다(sudo -n true 실패). 위 «manual» 줄을 직접 치세요.'] : []),
+        ...(results ? ['Applied:', ...results.items.map((item) => `  ${item.id}: ${item.result} — ${item.path}${item.reason ? ` — ${item.reason}` : ''}`)] : ['적용하려면 --fix --yes']),
+        ...(restartResult ? [`Service restart: ${restartResult.result} — ${restartResult.reason}`] : []),
       ].join('\n'));
       const exitCode = Math.max(results?.exitCode ?? 0, sudoResult?.exitCode ?? 0, restartResult?.result === 'failed' ? 1 : 0, currentReport.requiredMissing?.length ? 1 : 0, gitInstall?.ran && !gitInstall.ok ? 1 : 0);
       if (results || exitCode) setExitCode(exitCode);

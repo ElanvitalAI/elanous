@@ -1,12 +1,29 @@
 # Discord voice channel
 
+## Set up the bot
+
+Voice runs on the same Discord bot you chat with in text. Set it up once:
+
+```bash
+elanous onboarding discord
+```
+
+The wizard shows where to create the bot in the Discord developer portal (copy
+its token, turn on the **Message Content Intent**, invite it to your server),
+then asks for the bot token, the Discord user IDs allowed to talk to it
+(`discord.allowedUsers`) and an optional home channel for scheduled messages.
+It saves them to your config (`discord.botToken`, `discord.enabled`). The bot
+then answers in servers and DMs whenever the daemon runs.
+
+## Voice
+
 Discord now has two different voice-capable surfaces:
 
 - text channel / DM voice attachments
 - live voice channel round-trip
 
 The live voice-channel path is configured from `voice.discord.voiceChannel`
-in `~/.config/elanous/config.json`:
+in the active config (`elanous config path`, normally `~/.elanous/config.json`):
 
 ```json
 {

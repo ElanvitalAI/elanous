@@ -1,0 +1,6 @@
+{
+  "font": "맑은 고딕",
+  "size_pt": 11,
+  "margin_mm": { "left": 25, "right": 25, "top": 20, "bottom": 20 },
+  "table": { "header": "bold", "border": "solid" }
+}

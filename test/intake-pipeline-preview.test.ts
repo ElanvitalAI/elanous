@@ -38,7 +38,7 @@ async function uniquePort(): Promise<number> {
 }
 
 describe('FU3 /v1/intake/pipeline-preview', () => {
-  test('returns 503 when metaApi runtime is unwired', async () => {
+  test('returns 401 when metaApi runtime is unwired', async () => {
     const fix = makeFixture();
     const srv = startNexusHttpServer({
       ...fix,
@@ -51,9 +51,28 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ rawText: 'hello' }),
       });
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
       const body = await res.json();
-      expect(body.error).toBe('meta-api-runtime-not-wired');
+      expect(body.error).toBe('unauthorized');
+    } finally { srv.stop(); }
+  });
+
+  test('wired metaApi without bearer denies before body validation', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix,
+      eventBus: fix.bus,
+      startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
@@ -63,12 +82,12 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({}),
       });
       expect(res.status).toBe(400);
@@ -81,12 +100,12 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: '==== Group ====\n- do thing X' }),
       });
       expect(res.status).toBe(200);
@@ -131,12 +150,12 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: 'do thing X', register: true }),
       });
       expect(res.status).toBe(200);
@@ -161,12 +180,12 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: 'plain memo', useRealEnrich: true }),
       });
       expect(res.status).toBe(200);
@@ -185,12 +204,12 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({
           rawText: 'plain memo',
           useRealLlm: false,
@@ -213,12 +232,12 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({
           rawText: 'redo this please',
           refinementHint: 'missions 더 작게',
@@ -244,7 +263,7 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       // Skeleton fallback produces exactly one task at m-1/t-1, so a
@@ -252,7 +271,7 @@ describe('FU3 /v1/intake/pipeline-preview', () => {
       // task. The skip surface is the user's signal.
       const res = await fetch(`${srv.url}/v1/intake/pipeline-preview`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({
           rawText: 'do thing X',
           register: true,

@@ -10,6 +10,7 @@ import { parsePodArtifactChunks } from './pod-artifact-return.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
+import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
 import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
@@ -17,6 +18,8 @@ import { loadTokens } from '../../oauth/store.js';
 import { resolveCodexAccount } from '../../oauth/codex-account.js';
 import { statSync } from 'node:fs';
 import { orchestrateSelfDev } from '../../self-dev/orchestrate.js';
+import { mintGroundingToken } from '../../grounding/token.js';
+import { handlePodGithubCredential, resetPodCredentialRateForTesting } from '../../nexus/api/pod-credential-api.js';
 
 const CREDS = () => ({ elanousAuth: '{"m":1}', codexAuth: '{"c":1}', ghToken: 'gho_x' });
 
@@ -383,6 +386,132 @@ describe('pod grok credentials', () => {
     expect(secret.stringData['env-ELANOUS_POD_CREDENTIAL_TOKEN']).toBeUndefined();
     expect(job.spec.template.spec.containers[0].env.map((entry: { name: string }) => entry.name)).not.toContain('ELANOUS_POD_CREDENTIAL_URL');
   });
+});
+
+describe('pod memory inheritance from parent goal', () => {
+  test('a pathless PWA shard inherits 32Gi from the goal body, not its execution ledger', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-memory-parent-'));
+    const previous = process.cwd();
+    const goal = 'docs/goals/pwa.md';
+    const feature = 'Implement SchemaForm.tsx using flattenSchema and validateSchema';
+    const events: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-parent-memory-test', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'memory-limit') events.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      mkdirSync(join(root, 'docs', 'goals'), { recursive: true });
+      process.chdir(root);
+      const spawn = async (spaceId: string, env: NodeJS.ProcessEnv, text = feature) => {
+        const { k, calls } = fakeKubectl(['Complete'], '');
+        const stamp = { orchestrationId: 'a5096ecf-cb0b-4dd9-84eb-bfdffa07a280', shardId: 'task:abcdef', totalShards: 1, position: 1, summary: text.trim().replace(/\s+/g, ' '), siblings: [] };
+        await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env })({ feature: `${text}\n\n## Shard identity\n${JSON.stringify(stamp)}`, spaceId }).done;
+        const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((m) => m.kind === 'Job');
+        expect(job.spec.template.spec.containers[0].args[0]).toContain('elanous self implement "$(cat /creds/feature)" --json');
+        return job.spec.template.spec.containers[0].resources.limits.memory as string;
+      };
+      const env = { ELANOUS_POD_GOAL_DOC: goal };
+      writeFileSync(join(root, goal), '# PWA goal\n대상 경로: apps/pwa/src/components/workflows/SchemaForm.tsx\n\n## 실행 기록\nPod 메모리: standard\n');
+      expect(await spawn('parent-pwa', env)).toBe('32Gi');
+      expect(events.at(-1)).toMatchObject({ tier: 'high', source: 'parent-pwa-auto', memoryLimit: '32Gi', inheritedFrom: goal });
+      writeFileSync(join(root, goal), '# unrelated goal\n대상 경로: packages/ui/SchemaForm.tsx\n\n## 실행 기록\n대상 경로: apps/pwa/old.tsx\n');
+      expect(await spawn('parent-other', env)).toBe('16Gi');
+      expect(events.at(-1)).toMatchObject({ tier: 'standard', source: 'default', memoryLimit: '16Gi' });
+      writeFileSync(join(root, goal), '# goal\nPod 메모리: high\n');
+      expect(await spawn('parent-line', env)).toBe('32Gi');
+      expect(events.at(-1)).toMatchObject({ tier: 'high', source: 'parent-goal-line', memoryLimit: '32Gi', inheritedFrom: goal });
+      writeFileSync(join(root, goal), '# goal\nPod 메모리: standard\n대상 경로: apps/pwa/src/foo.tsx\n');
+      expect(await spawn('parent-standard', env)).toBe('16Gi');
+      expect(events.at(-1)).toMatchObject({ tier: 'standard', source: 'parent-goal-line', memoryLimit: '16Gi', inheritedFrom: goal });
+      expect(await spawn('option-first', { ...env, ELANOUS_POD_MEMORY_TIER: 'standard' })).toBe('16Gi');
+      expect(events.at(-1)).toMatchObject({ tier: 'standard', source: 'option', memoryLimit: '16Gi' });
+      expect(await spawn('shard-standard', env, `${feature}\nPod 메모리: standard`)).toBe('16Gi');
+      expect(events.at(-1)).toMatchObject({ tier: 'standard', source: 'goal-line', memoryLimit: '16Gi' });
+      expect(await spawn('shard-high', env, `대상 경로: apps/pwa/SchemaForm.tsx\n${feature}`)).toBe('32Gi');
+      expect(events.at(-1)).toMatchObject({ tier: 'high', source: 'pwa-auto', memoryLimit: '32Gi' });
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('unreadable parent is observed without changing the shard memory decision', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-memory-unreadable-'));
+    const previous = process.cwd();
+    const events: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-parent-unreadable-test', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'memory-limit') events.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      process.chdir(root);
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_GOAL_DOC: 'missing.md' } })({ feature: 'Implement SchemaForm.tsx using flattenSchema and validateSchema', spaceId: 'missing-parent' }).done;
+      expect(events).toEqual([expect.objectContaining({ tier: 'standard', source: 'default', memoryLimit: '16Gi', parentGoal: 'unreadable' })]);
+      expect(calls.some((call) => call.args.endsWith('apply -f -'))).toBe(false);
+    } finally { off(); process.chdir(previous); rmSync(root, { recursive: true, force: true }); }
+  });
+});
+
+test('the host detail switch reaches only matching Pod runs before expiry without changing the Job script or Secret', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'pod-live-detail-'));
+  const path = join(root, 'detail.json');
+  const parent = 'run-detail-parent';
+  const until = Date.now() + 30 * 60_000;
+  const launch = async (spaceId: string) => {
+    resetLiveDetailCacheForTesting();
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_RUN_ID: parent, ELANOUS_LIVE_DETAIL_UNTIL: String(until) }, passEnv: ['ELANOUS_LIVE_DETAIL_UNTIL'], armEnv: { ELANOUS_LIVE_DETAIL_UNTIL: String(until) }, liveDetailFile: path })({ feature: 'fix it', spaceId }).done;
+    expect(result.exitCode).toBe(0);
+    const [secret, job] = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+    expect([secret.kind, job.kind]).toEqual(['Secret', 'Job']);
+    const child = job.spec.template.spec.containers[0];
+    const detailEnv = child.env.filter((entry: { name: string }) => entry.name === 'ELANOUS_LIVE_DETAIL_UNTIL');
+    const baseline = podJobManifest({ name: job.metadata.name, namespace: 'elanous-test', image: 'elanous-harness:local', repoUrl: 'https://github.com/ElanvitalAI/elanous', args: ['--open-pr', '--no-supervise'], passEnv: [], deadlineSeconds: POD_JOB_DEADLINE_SECONDS, runId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID').value, parentRunId: parent, hostId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_HOST_ID')?.value });
+    const preserved = structuredClone(job);
+    preserved.spec.template.spec.containers[0].env = child.env.filter((entry: { name: string }) => entry.name !== 'ELANOUS_LIVE_DETAIL_UNTIL');
+    expect(preserved).toEqual(baseline);
+    expect(secret.stringData['env-ELANOUS_LIVE_DETAIL_UNTIL']).toBeUndefined();
+    return detailEnv;
+  };
+  try {
+    expect(await launch('detail-off')).toEqual([]);
+    writeFileSync(path, '{broken');
+    expect(await launch('detail-invalid')).toEqual([]);
+    writeFileSync(path, JSON.stringify({ scope: 'all', until: Date.now() - 1, since: 0 }));
+    expect(await launch('detail-expired')).toEqual([]);
+    writeFileSync(path, JSON.stringify({ scope: 'all', until: Date.now(), since: 0 }));
+    expect(await launch('detail-at-boundary')).toEqual([]);
+    writeFileSync(path, JSON.stringify({ scope: 'run-unrelated', until, since: 0 }));
+    expect(await launch('detail-other-run')).toEqual([]);
+    writeFileSync(path, JSON.stringify({ scope: parent, until, since: 0 }));
+    expect(await launch('detail-parent')).toEqual([{ name: 'ELANOUS_LIVE_DETAIL_UNTIL', value: String(until) }]);
+    writeFileSync(path, JSON.stringify({ scope: 'all', until, since: 0 }));
+    expect(await launch('detail-all')).toEqual([{ name: 'ELANOUS_LIVE_DETAIL_UNTIL', value: String(until) }]);
+    const { k, calls } = fakeKubectl(['Complete'], '');
+    resetLiveDetailCacheForTesting();
+    await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {}, liveDetailFile: path })({ feature: 'fix it', spaceId: 'detail-child-run' }).done;
+    const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((manifest) => manifest.kind === 'Job');
+    const childEnv = job.spec.template.spec.containers[0].env as Array<{ name: string; value?: string }>;
+    const childId = childEnv.find((entry) => entry.name === 'ELANOUS_RUN_ID')!.value!;
+    writeFileSync(path, JSON.stringify({ scope: childId, until, since: 0 }));
+    const another = fakeKubectl(['Complete'], '');
+    resetLiveDetailCacheForTesting();
+    await podSelfImplementSpawn({ kubectl: another.k, credentials: CREDS, env: {}, liveDetailFile: path })({ feature: 'fix it', spaceId: 'detail-distinct-child' }).done;
+    const distinct = another.calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!)).find((manifest) => manifest.kind === 'Job');
+    expect(distinct.spec.template.spec.containers[0].env.some((entry: { name: string }) => entry.name === 'ELANOUS_LIVE_DETAIL_UNTIL')).toBe(false);
+  } finally { resetLiveDetailCacheForTesting(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test('a host-recorded dispatch marker reaches the actual Pod Job without altering its launch script', async () => {
+  const { k, calls } = fakeKubectl(['Complete'], '');
+  await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_DISPATCH_RECORDED: '1' } })({ feature: 'fix it', spaceId: 'dispatch-recorded' }).done;
+  const job = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!))
+    .find((manifest) => manifest.kind === 'Job');
+  expect(job.spec.template.spec.containers[0].env).toContainEqual({ name: 'ELANOUS_DISPATCH_RECORDED', value: '1' });
+  const base = { name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: ['--open-pr'], passEnv: [], deadlineSeconds: 60 };
+  const plain = podJobManifest(base) as { spec: { template: { spec: { containers: Array<{ args: string[]; env: Array<{ name: string }> }> } } } };
+  const marked = podJobManifest({ ...base, armEnv: { ELANOUS_DISPATCH_RECORDED: '1' } }) as typeof plain;
+  expect(plain.spec.template.spec.containers[0]!.env.some((item) => item.name === 'ELANOUS_DISPATCH_RECORDED')).toBe(false);
+  expect(marked.spec.template.spec.containers[0]!.args).toEqual(plain.spec.template.spec.containers[0]!.args);
+  expect(job.spec.template.spec.containers[0].args[0]).toContain('elanous self implement');
 });
 
 describe('pod memory evidence', () => {
@@ -1273,7 +1402,7 @@ describe('podSelfImplementSpawn', () => {
 
   test('manifest hands off the fixed inbox and host records the active fragment until Job completion', async () => {
     const root = mkdtempSync(join(tmpdir(), 'pod-record-'));
-    const env = { ELANOUS_STATE_DIR: root };
+    const env = { ELANOUS_STATE_DIR: root, ELANOUS_RUN_ID: 'run-parent-1' };
     let finish!: () => void;
     const wait = new Promise<void>((resolve) => { finish = resolve; });
     let polls = 0;
@@ -1287,15 +1416,99 @@ describe('podSelfImplementSpawn', () => {
     };
     try {
       const { done } = podSelfImplementSpawn({ kubectl, credentials: CREDS, env, sleep: () => wait })({ feature: 'goal', spaceId: 'pod-fragment' });
+      for (let i = 0; i < 5 && !calls.some((call) => call.args.includes('apply')); i++) await Promise.resolve();
       const record = readPodFragment('pod-fragment', env);
       const job = calls.filter((call) => call.args.includes('apply')).map((call) => JSON.parse(call.input!)).find((manifest) => manifest.kind === 'Job');
-      expect(job.spec.template.spec.containers[0].env).toContainEqual({ name: CONTROL_INBOX_DIR_ENV, value: '/tmp/elanous-control.inbox' });
-      expect(record).toEqual({ spaceId: 'pod-fragment', context: 'test-context', namespace: 'elanous-test', job: podJobName('pod-fragment'), inboxDir: '/tmp/elanous-control.inbox' });
+      const jobEnv = job.spec.template.spec.containers[0].env as Array<{ name: string; value: string }>;
+      expect(jobEnv).toContainEqual({ name: CONTROL_INBOX_DIR_ENV, value: '/tmp/elanous-control.inbox' });
+      const childRunId = jobEnv.find((entry) => entry.name === 'ELANOUS_RUN_ID')?.value;
+      expect(childRunId).toMatch(/^run-[0-9a-f-]{36}$/);
+      expect(jobEnv).toContainEqual({ name: 'ELANOUS_PARENT_RUN_ID', value: env.ELANOUS_RUN_ID });
+      expect(record).toEqual({ spaceId: 'pod-fragment', runId: childRunId, parentRunId: env.ELANOUS_RUN_ID, context: 'test-context', namespace: 'elanous-test', job: podJobName('pod-fragment'), inboxDir: '/tmp/elanous-control.inbox' });
       finish();
       await done;
       expect(readPodFragment('pod-fragment', env)).toBeNull();
       expect(podFragmentFinished('pod-fragment', env)).toBe(true);
     } finally { finish(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('failed child reports the last result line, GraphQL failure and redacted first/last error lines', async () => {
+    const error = 'draft PR 생성 실패(worktree·branch 보존 · self-impl/src-nexus-api-trace-ts-src-nexus-api-tra-4131fa54 · /home/ubuntu/.elanous/worktrees/ubuntu-678d8d02/repo.worktrees/self-impl-src-nexus-api-trace-ts-src-nexus-api-tra-4131fa54)\nself-implement PR gh 실패: GraphQL: API rate limit already exceeded for user ID 19355785.';
+    const finalLine = JSON.stringify({ stage: 'error', ok: false, error });
+    const previous = JSON.stringify({ stage: 'earlier', ok: false, error: 'not the failure' });
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    const off = debug.registerSink({ name: 'pod-child-result-line', emit: (record) => {
+      if (record.category === 'self-implement.pod' && ['job-finished', 'child-error'].includes(record.event)) events.push({ event: record.event, data: record.data as Record<string, unknown> });
+    } });
+    const kubectl: Kubectl = (args) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.includes('get') && args.includes('pods')) return { status: 0, stdout: '2026-09-29T03:11:00Z\tError\t1\n', stderr: '' };
+      if (args.includes('get') && args.includes('job')) return { status: 0, stdout: 'Failed', stderr: '' };
+      if (args.includes('logs')) return { status: 0, stdout: `noise\n${previous}\n${finalLine}\nELANOUS_POD_SALVAGE_NONE clean\n`, stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'pr-rate-limit' }).done;
+      expect(result.error?.code).toBe('pod-job-failed');
+      expect(result.error?.message).toContain('container=Error/1');
+      expect(result.error?.message).toContain('GraphQL: API rate limit already exceeded');
+      expect(result.error?.message).toContain('~/.elanous/worktrees/');
+      expect(result.error?.message).not.toContain('/home/ubuntu/');
+      expect(result.error?.message).not.toContain('not the failure');
+      expect(result.error?.message?.split('childError=')[1]?.split('\n')).toHaveLength(2);
+      expect(result.error?.message?.split('childError=')[1]?.split('\n').every((line) => line.length <= 240)).toBe(true);
+      expect(events).toContainEqual({ event: 'child-error', data: expect.objectContaining({ job: podJobName('pr-rate-limit'), stage: 'error', error: expect.stringContaining('GraphQL: API rate limit already exceeded') }) });
+      expect(events.find((e) => e.event === 'job-finished')?.data).toMatchObject({ childStage: 'error', childError: expect.stringContaining('GraphQL: API rate limit already exceeded') });
+      expect(String(events.find((e) => e.event === 'job-finished')?.data.childError)).not.toContain('/home/ubuntu/');
+      expect(events.find((e) => e.event === 'job-finished')?.data.childError).toEqual(result.error?.message?.split('childError=')[1]);
+    } finally { off(); }
+  });
+
+  test('failed child error bounds each endpoint independently and retains the last line', async () => {
+    const first = 'first-' + 'a'.repeat(300);
+    const last = 'last-GraphQL: API rate limit already exceeded ' + 'z'.repeat(300);
+    const { k } = fakeKubectl(['Failed'], JSON.stringify({ stage: 'error', ok: false, error: `${first}\nintermediate line\n${last}` }));
+    const finished: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-error-endpoints', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'error-endpoints' }).done;
+      const childError = `${first.slice(0, 240)}\n${last.slice(0, 240)}`;
+      expect(result.error?.message).toContain(`childStage=error · childError=${childError}`);
+      expect(result.error?.message).not.toContain('intermediate line');
+      expect(finished[0]).toMatchObject({ childStage: 'error', childError });
+    } finally { off(); }
+  });
+
+  test('a failed Job whose last result is successful does not reuse an earlier failure', async () => {
+    const logs = `${JSON.stringify({ stage: 'error', ok: false, error: 'earlier failure' })}\n${JSON.stringify({ stage: 'merged', ok: true })}\n`;
+    const { k } = fakeKubectl(['Failed'], logs);
+    const finished: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-last-result-line', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'last-result-line' }).done;
+      expect(result.error?.message).toContain('childError=no-result-line');
+      expect(result.error?.message).not.toContain('earlier failure');
+      expect(finished[0]).toMatchObject({ childError: 'no-result-line' });
+    } finally { off(); }
+  });
+
+  test('a failed Job without a result line records no-result-line', async () => {
+    const { k } = fakeKubectl(['Failed'], 'no result here');
+    const finished: Array<Record<string, unknown>> = [];
+    const off = debug.registerSink({ name: 'pod-missing-result-line', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event === 'job-finished') finished.push(record.data as Record<string, unknown>);
+    } });
+    try {
+      const result = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: {} })({ feature: 'x', spaceId: 'missing-result-line' }).done;
+      expect(result.error?.message).toContain('childError=no-result-line');
+      expect(finished[0]).toMatchObject({ state: 'failed', childError: 'no-result-line' });
+      expect(finished[0]).not.toHaveProperty('childStage');
+    } finally { off(); }
   });
 
   test('a failed Job is a non-zero exit with a named error', async () => {
@@ -1327,6 +1540,8 @@ describe('podSelfImplementSpawn', () => {
       expect(r.disposition?.failureClassification).toBe('run-deadline-exceeded');
       const logged = records.find((record) => record.category === 'self-implement.pod' && record.event === 'deadline-exceeded');
       expect(logged?.data).toMatchObject({ job: podJobName('deadline'), deadlineSeconds: 10_800, childClassification: 'quota-exhausted', prUrl: 'https://github.com/o/r/pull/3', branch: 'si/deadline' });
+      expect(records.find((record) => record.category === 'self-implement.pod' && record.event === 'job-finished')?.data).not.toHaveProperty('childError');
+      expect(records.some((record) => record.category === 'self-implement.pod' && record.event === 'child-error')).toBe(false);
     } finally { off(); }
   });
   test('failed Job reads the newest child termination by creation time: OOM, Error, or unknown', async () => {
@@ -1383,7 +1598,7 @@ describe('podSelfImplementSpawn', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     const r = await podSelfImplementSpawn({ kubectl: k, sleep: async () => {}, credentials: CREDS })({ feature: 'x', spaceId: 'backoff' }).done;
-    expect(r.error).toEqual({ code: 'pod-job-failed', message: `Job ${podJobName('backoff')} failed (BackoffLimitExceeded)` });
+    expect(r.error).toEqual({ code: 'pod-job-failed', message: `Job ${podJobName('backoff')} failed (BackoffLimitExceeded) — childError=no-result-line` });
     expect(r.disposition?.failureClassification).toBeUndefined();
   });
 
@@ -2283,6 +2498,448 @@ describe('pod grounding token', () => {
     if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
     return { status: 0, stdout: '', stderr: '' };
   }) as Kubectl;
+  test('different owner with the same repository name never receives an App token or credential relay', async () => {
+    const applied: string[] = [];
+    const issued: string[] = [];
+    await podSelfImplementSpawn({
+      kubectl: k(applied), pollMs: 1, imageCommit: null, sleep: async () => {}, credentials: CREDS,
+      repoUrl: 'https://github.com/expected/shared.git', env: {}, groundingUrl: 'https://host:31415',
+      githubInstallation: (repository) => { issued.push(repository); return { token: 'wrong-owner-installation', expires_at: '2030-01-01T00:00:00Z' }; },
+      githubRepositories: async () => ['other/shared'],
+      mintGrounding: async () => ({ token: 'grounding-only', exp: 9 }), revokeGrounding: () => {},
+    })({ spaceId: 'owner-mismatch', feature: 'f' }).done;
+    const secret = JSON.parse(applied.find((a) => a.includes('"kind":"Secret"'))!) as { stringData: Record<string, string> };
+    expect(issued).toEqual(['expected/shared']);
+    expect(secret.stringData['gh-token']).toBe('gho_x');
+    expect(secret.stringData['env-ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN']).toBeUndefined();
+    expect(applied.find((a) => a.includes('"kind":"Job"'))!).not.toContain('ELANOUS_POD_GITHUB_CREDENTIAL_URL');
+  });
+
+  test('without a relay the host refreshes a verified App token; unavailable or unverified Apps keep the human credential', async () => {
+    for (const [spaceId, installation, repositories, expected] of [
+      ['app-no-grounding', () => ({ token: 'scoped-installation', expires_at: new Date(Date.now() + 3600_000).toISOString() }), async () => ['owner/repo'], 'scoped-installation'],
+      ['app-missing', () => null, async () => ['owner/repo'], 'gho_x'],
+      ['app-mint-failed', () => { throw new Error('sensitive mint exception'); }, async () => ['owner/repo'], 'gho_x'],
+      ['app-lookup-failed', () => ({ token: 'unchecked-installation', expires_at: new Date(Date.now() + 3600_000).toISOString() }), async () => { throw new Error('sensitive lookup exception'); }, 'gho_x'],
+    ] as const) {
+      const applied: string[] = [];
+      const eventsForSkipped = new Set<string>();
+      const off = debug.registerSink({ name: `app-skip-${spaceId}`, emit: (record) => {
+        if (record.category === 'self-implement.pod' && record.event === 'gh-token-app-skipped') eventsForSkipped.add(spaceId);
+      } });
+      let minted = 0;
+      try {
+        const result = await podSelfImplementSpawn({
+          kubectl: k(applied), pollMs: 1, imageCommit: null, sleep: async () => {}, credentials: CREDS,
+          repoUrl: 'git@github.com:owner/repo.git', env: {},
+          githubInstallation: installation, githubRepositories: repositories,
+          mintGrounding: async () => { minted++; return { token: 'unexpected', exp: 1 }; },
+          revokeGrounding: () => { throw new Error('unexpected revoke'); },
+        })({ spaceId, feature: 'f' }).done;
+        const [secret, job] = applied.map((text) => JSON.parse(text)).filter((m) => m.kind === 'Secret' || m.kind === 'Job');
+        expect(result.exitCode).toBe(0);
+        expect(secret.stringData['gh-token']).toBe(expected);
+        const script: string = job.spec.template.spec.containers[0].args[0];
+        expect(script).toContain(expected === 'scoped-installation' ? 'gh auth login --with-token < /creds/gh-token' : 'export GH_TOKEN="$(cat /creds/gh-token)"');
+        expect(script.includes('gh auth login --with-token < /creds/gh-token')).toBe(expected === 'scoped-installation');
+        expect(eventsForSkipped.has(spaceId)).toBe(expected === 'gho_x');
+        expect(secret.stringData['env-ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN']).toBeUndefined();
+        expect(job.spec.template.spec.containers[0].env.some((entry: { name: string }) => entry.name.startsWith('ELANOUS_POD_GITHUB_CREDENTIAL_'))).toBe(false);
+        expect(minted).toBe(0);
+        expect(JSON.stringify(job)).not.toContain('sensitive');
+      } finally { off(); }
+    }
+  });
+
+  test('an App Job rejects ambient GitHub token env so gh and git use the host-refreshed credential', async () => {
+    for (const app of [true, false]) {
+      const { k, calls } = fakeKubectl(['Complete'], '');
+      await podSelfImplementSpawn({
+        kubectl: k, credentials: CREDS, env: { GH_TOKEN: 'ambient-one', GITHUB_TOKEN: 'ambient-two', GH_CONFIG_DIR: '/ambient-config' },
+        passEnv: ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR'], armEnv: { GH_TOKEN: 'arm-one', GITHUB_TOKEN: 'arm-two', GH_CONFIG_DIR: '/arm-config' },
+        githubInstallation: () => app ? { token: 'scoped-installation', expiresAt: new Date(Date.now() + 3600_000).toISOString() } : null,
+        githubRepositories: async () => ['ElanvitalAI/elanous'],
+      })({ spaceId: `github-env-${app}`, feature: 'x' }).done;
+      const [secret, job] = calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+      const env = job.spec.template.spec.containers[0].env as Array<{ name: string }>;
+      expect(secret.stringData['gh-token']).toBe(app ? 'scoped-installation' : CREDS().ghToken);
+      for (const key of ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_CONFIG_DIR']) {
+        expect(secret.stringData[`env-${key}`]).toBe(app ? undefined : key === 'GH_TOKEN' ? 'ambient-one' : key === 'GITHUB_TOKEN' ? 'ambient-two' : '/ambient-config');
+        expect(env.filter((entry) => entry.name === key)).toHaveLength(app ? 0 : 2);
+      }
+    }
+  });
+
+  test('App launch logs in through gh stdin, with a private gh config read by gh and git', () => {
+    const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, appCredential: true }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
+    const line = script.split('\n').find((part) => part.startsWith('unset GH_TOKEN GITHUB_TOKEN;'))!;
+    const home = mkdtempSync(join(tmpdir(), 'pod-gh-app-'));
+    try {
+      const gh = Bun.which('gh');
+      expect(gh).toBeTruthy();
+      const bin = join(home, 'bin'); mkdirSync(bin);
+      // Avoid GitHub's online token validation; exercise the script's stdin and the real gh/git config readers.
+      writeFileSync(join(bin, 'gh'), `#!/bin/bash
+if [ "$1" = auth ] && [ "$2" = login ]; then
+  [ "$3" = --with-token ] || exit 9
+  read -r token
+  mkdir -p "$GH_CONFIG_DIR"
+  printf 'github.com:\\n    oauth_token: %s\\n    git_protocol: https\\n' "$token" > "$GH_CONFIG_DIR/hosts.yml"
+  printf 'version: "1"\\n' > "$GH_CONFIG_DIR/config.yml"
+else
+  exec ${JSON.stringify(gh)} "$@"
+fi
+`);
+      chmodSync(join(bin, 'gh'), 0o700);
+      const credential = join(home, 'gh-token');
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, GH_TOKEN: 'ghp_human', GITHUB_TOKEN: 'ghp_human', GH_CONFIG_DIR: join(home, 'wrong-gh'), XDG_CONFIG_HOME: join(home, 'wrong-xdg') };
+      writeFileSync(credential, 'ghs_FIRST\n');
+      const launchLine = line.replaceAll('/creds/gh-token', credential);
+      const launch = Bun.spawnSync(['bash', '-c', launchLine], { env });
+      expect(launch.exitCode).toBe(0);
+      const auth = join(home, '.config/gh/hosts.yml');
+      expect(readFileSync(auth, 'utf8')).toContain('oauth_token: ghs_FIRST');
+      expect(statSync(auth).mode & 0o777).toBe(0o600);
+      expect(statSync(join(home, '.config/gh')).mode & 0o777).toBe(0o700);
+      const ghEnv = { ...env, GH_CONFIG_DIR: join(home, '.config/gh'), GH_TOKEN: '', GITHUB_TOKEN: '' };
+      expect(Bun.spawnSync([gh!, 'auth', 'token'], { env: ghEnv }).stdout.toString().trim()).toBe('ghs_FIRST');
+      writeFileSync(credential, 'ghs_SECOND\n');
+      const refresh = Bun.spawnSync(['bash', '-c', `GH_CONFIG_DIR="$HOME/.config/gh" gh auth login --with-token < "${credential}"`], { env: ghEnv });
+      expect(refresh.exitCode).toBe(0);
+      expect(readFileSync(auth, 'utf8')).toContain('oauth_token: ghs_SECOND');
+      expect(Bun.spawnSync([gh!, 'auth', 'token'], { env: ghEnv }).stdout.toString().trim()).toBe('ghs_SECOND');
+      const gitEnv = { ...ghEnv, GIT_CONFIG_GLOBAL: join(home, '.gitconfig'), GIT_TERMINAL_PROMPT: '0' };
+      expect(Bun.spawnSync([gh!, 'auth', 'setup-git'], { env: gitEnv }).exitCode).toBe(0);
+      expect(execFileSync('git', ['credential', 'fill'], { env: gitEnv, input: 'protocol=https\nhost=github.com\n\n', encoding: 'utf8' })).toContain('password=ghs_SECOND');
+      const failingBin = join(home, 'failing-bin'); mkdirSync(failingBin);
+      writeFileSync(join(failingBin, 'gh'), '#!/bin/sh\nexit 1\n');
+      chmodSync(join(failingBin, 'gh'), 0o700);
+      writeFileSync(credential, 'ghs_FALLBACK\n');
+      const fallback = Bun.spawnSync(['bash', '-c', launchLine], { env: { ...env, PATH: `${failingBin}:${process.env.PATH}` } });
+      expect(fallback.exitCode).toBe(0);
+      expect(readFileSync(auth, 'utf8')).toContain('oauth_token: ghs_FALLBACK');
+      expect(statSync(auth).mode & 0o777).toBe(0o600);
+      expect(Bun.spawnSync([gh!, 'auth', 'token'], { env: ghEnv }).stdout.toString().trim()).toBe('ghs_FALLBACK');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('host exec writes the child gh config despite a different XDG_CONFIG_HOME and GH_CONFIG_DIR', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-gh-refresh-config-'));
+    const start = Date.now();
+    const gh = Bun.which('gh');
+    expect(gh).toBeTruthy();
+    const bin = join(home, 'bin'); mkdirSync(bin);
+    writeFileSync(join(bin, 'gh'), `#!/bin/sh
+if [ "$1" = auth ] && [ "$2" = login ]; then
+  read -r token
+  mkdir -p "$GH_CONFIG_DIR"
+  printf 'github.com:\\n    oauth_token: %s\\n    git_protocol: https\\n' "$token" > "$GH_CONFIG_DIR/hosts.yml"
+  printf 'version: "1"\\n' > "$GH_CONFIG_DIR/config.yml"
+else
+  exec ${JSON.stringify(gh)} "$@"
+fi
+`);
+    chmodSync(join(bin, 'gh'), 0o700);
+    const childEnv = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}`, GH_CONFIG_DIR: join(home, 'other-config'), XDG_CONFIG_HOME: join(home, 'other-xdg') };
+    let polls = 0;
+    let issued = 0;
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((arg) => arg.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: '' };
+      if (args.includes('apply') && input && JSON.parse(input).kind === 'Job') {
+        const script = JSON.parse(input).spec.template.spec.containers[0].args[0] as string;
+        const line = script.split('\n').find((part) => part.startsWith('unset GH_TOKEN GITHUB_TOKEN;'))!;
+        const creds = join(home, 'gh-token'); writeFileSync(creds, 'ghs_FIRST\n');
+        const launch = Bun.spawnSync(['bash', '-c', line.replaceAll('/creds/gh-token', creds)], { env: childEnv });
+        expect(launch.exitCode).toBe(0);
+      }
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: ++polls > 1 ? 'Complete' : '', stderr: '' };
+      if (args.includes('exec') && args.includes('--with-token')) {
+        const command = args.slice(args.indexOf('--') + 1);
+        const run = Bun.spawnSync(command, { env: childEnv, stdin: Buffer.from(input!), stdout: 'pipe', stderr: 'pipe' });
+        return { status: run.exitCode, stdout: run.stdout.toString(), stderr: run.stderr.toString() };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {}, now: () => start, sleep: async () => {},
+        githubInstallation: () => ({ token: issued++ === 0 ? 'ghs_FIRST' : 'ghs_SECOND', expiresAt: start + (issued === 1 ? 5 : 60) * 60_000 }),
+        githubRepositories: async () => ['ElanvitalAI/elanous'],
+      })({ spaceId: 'refresh-config', feature: 'x' }).done;
+      expect(issued).toBe(2);
+      expect(readFileSync(join(home, '.config/gh/hosts.yml'), 'utf8')).toContain('oauth_token: ghs_SECOND');
+      expect(Bun.spawnSync([gh!, 'auth', 'token'], { env: { ...childEnv, GH_TOKEN: '', GITHUB_TOKEN: '', GH_CONFIG_DIR: join(home, '.config/gh') } }).stdout.toString().trim()).toBe('ghs_SECOND');
+      expect(existsSync(join(home, 'other-config/hosts.yml'))).toBe(false);
+      expect(existsSync(join(home, 'other-xdg/gh/hosts.yml'))).toBe(false);
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('host pushes a newly verified App token over exec stdin at the ten-minute boundary without exposing either bearer', async () => {
+    const start = Date.now();
+    let clock = start;
+    let issued = 0;
+    let polls = 0;
+    const calls: Array<{ args: readonly string[]; input?: string }> = [];
+    const refreshAtPoll: number[] = [];
+    const events: Array<{ event: string; data: unknown }> = [];
+    const off = debug.registerSink({ name: 'pod-app-host-refresh', emit: (record) => {
+      if (record.category === 'self-implement.pod') events.push({ event: record.event, data: record.data });
+    } });
+    const kubectl: Kubectl = (args, input) => {
+      calls.push({ args: [...args], input });
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: '' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: ++polls > 3 ? 'Complete' : '', stderr: '' };
+      if (args.includes('exec') && args.includes('--with-token')) refreshAtPoll.push(polls);
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      const result = await podSelfImplementSpawn({
+        kubectl, credentials: CREDS, env: {}, now: () => clock, sleep: async () => { clock += 60_000; },
+        repoUrl: 'https://github.com/owner/repo.git',
+        githubInstallation: (repository) => {
+          expect(repository).toBe('owner/repo');
+          return ++issued === 1
+            ? { token: 'ghs_FIRST', expiresAt: start + 11 * 60_000 }
+            : { token: 'ghs_SECOND', expiresAt: start + 60 * 60_000 };
+        },
+        githubRepositories: async (token) => token === 'ghs_FIRST' || token === 'ghs_SECOND' ? ['owner/repo'] : [],
+      })({ spaceId: 'host-refresh', feature: 'x' }).done;
+      expect(result.exitCode).toBe(0);
+      const [secret, job] = calls.filter((call) => call.args.at(-3) === 'apply').map((call) => JSON.parse(call.input!));
+      expect(secret.stringData['gh-token']).toBe('ghs_FIRST');
+      const script: string = job.spec.template.spec.containers[0].args[0];
+      expect(script).toContain('gh auth login --with-token < /creds/gh-token >/dev/null 2>&1 || bun -e');
+      expect(script).toContain('&& chmod 600 "$GH_CONFIG_DIR/hosts.yml" && chmod 700 "$GH_CONFIG_DIR" || exit 7');
+      expect(script).not.toContain('export GH_TOKEN=');
+      expect(script.indexOf('gh auth login --with-token')).toBeLessThan(script.indexOf('gh auth setup-git'));
+      const refresh = calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'));
+      expect(refresh).toHaveLength(1);
+      expect(refresh[0]!.args).toEqual(['--context', 'ctx', '-n', 'elanous-test', 'exec', '-i', `job/${podJobName('host-refresh')}`, '-c', 'child', '--', 'sh', '-c', 'unset GH_TOKEN GITHUB_TOKEN; GH_CONFIG_DIR="$HOME/.config/gh" exec "$@"', 'sh', 'gh', 'auth', 'login', '--with-token']);
+      expect(refresh[0]!.input).toBe('ghs_SECOND\n');
+      expect(refreshAtPoll).toEqual([2]);
+      expect(issued).toBe(2);
+      expect(polls).toBe(4);
+      expect(events.filter((row) => row.event === 'gh-token-refreshed')).toEqual([{ event: 'gh-token-refreshed', data: expect.objectContaining({ job: podJobName('host-refresh'), expiresAt: new Date(start + 60 * 60_000).toISOString() }) }]);
+      for (const token of ['ghs_FIRST', 'ghs_SECOND']) {
+        expect(JSON.stringify(calls.map((call) => call.args))).not.toContain(token);
+        expect(JSON.stringify(events)).not.toContain(token);
+      }
+    } finally { off(); }
+  });
+
+  test('a token expiring within ten minutes is launched with the host refresh path and renewed on the first live poll', async () => {
+    const start = Date.now();
+    let issued = 0;
+    let polls = 0;
+    const calls: Array<{ args: readonly string[]; input?: string }> = [];
+    const kubectl: Kubectl = (args, input) => {
+      calls.push({ args: [...args], input });
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: '' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: ++polls > 1 ? 'Complete' : '', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    await podSelfImplementSpawn({
+      kubectl, credentials: CREDS, env: {}, now: () => start, sleep: async () => {},
+      githubInstallation: () => ({ token: issued++ === 0 ? 'ghs_FIRST' : 'ghs_SECOND', expiresAt: start + (issued === 1 ? 5 : 60) * 60_000 }),
+      githubRepositories: async () => ['ElanvitalAI/elanous'],
+    })({ spaceId: 'short-lived-app', feature: 'x' }).done;
+    const secret = calls.filter((call) => call.args.includes('apply') && call.input).map((call) => JSON.parse(call.input!)).find((manifest) => manifest.kind === 'Secret');
+    expect(secret.stringData['gh-token']).toBe('ghs_FIRST');
+    expect(calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toEqual([expect.objectContaining({ input: 'ghs_SECOND\n' })]);
+    expect(issued).toBe(2);
+  });
+
+  test('a wrong-repository refresh never reaches the Pod and retries a verified token on the next poll', async () => {
+    const start = Date.now();
+    let clock = start;
+    let issued = 0;
+    let polls = 0;
+    const calls: Array<{ args: readonly string[]; input?: string }> = [];
+    const events: Array<{ event: string; data: unknown }> = [];
+    const off = debug.registerSink({ name: 'app-refresh-scope-test', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event.startsWith('gh-token-refresh')) events.push({ event: record.event, data: record.data });
+    } });
+    const kubectl: Kubectl = (args, input) => {
+      calls.push({ args: [...args], input });
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: '' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: ++polls > 3 ? 'Complete' : '', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      await podSelfImplementSpawn({
+        kubectl, credentials: CREDS, env: {}, repoUrl: 'https://github.com/owner/repo.git',
+        now: () => clock, sleep: async () => { clock += 60_000; },
+        githubInstallation: () => ({ token: ['ghs_FIRST', 'ghs_WRONG', 'ghs_SECOND'][issued++]!, expires_at: new Date(start + (issued === 1 ? 11 : 60) * 60_000).toISOString() }),
+        githubRepositories: async (token) => token === 'ghs_WRONG' ? ['other/repo'] : ['owner/repo'],
+      })({ spaceId: 'refresh-repository-scope', feature: 'x' }).done;
+      expect(issued).toBe(3);
+      expect(events.map(({ event }) => event)).toEqual(['gh-token-refresh-failed', 'gh-token-refreshed']);
+      expect(JSON.stringify(events)).not.toContain('ghs_WRONG');
+      const pushed = calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'));
+      expect(pushed).toHaveLength(1);
+      expect(pushed[0]!.input).toBe('ghs_SECOND\n');
+      expect(JSON.stringify(calls.map((call) => call.args))).not.toContain('ghs_WRONG');
+    } finally { off(); }
+  });
+
+  test('a resumed App Job refreshes its unknown expiry on the first live poll without changing the existing Job', async () => {
+    const start = Date.now();
+    const calls: Array<{ args: readonly string[]; input?: string }> = [];
+    let polls = 0;
+    let issued = 0;
+    const appManifest = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, appCredential: true }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
+    const appScript = appManifest.spec.template.spec.containers[0]!.args[0]!;
+    const kubectl: Kubectl = (args, input) => {
+      calls.push({ args: [...args], input });
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 0, stdout: '0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b ', stderr: '' };
+      if (args.includes('-o') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ spec: { template: { spec: { containers: [{ name: 'child', args: [appScript], env: [{ name: 'ELANOUS_RUN_ID', value: 'run-reattached-app-1' }] }] } } } }), stderr: '' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: ++polls > 1 ? 'Complete' : '', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS, now: () => start, env: {},
+      githubInstallation: () => ({ token: issued++ === 0 ? 'ghs_FIRST' : 'ghs_SECOND', expires_at: new Date(start + 60 * 60_000).toISOString() }),
+      githubRepositories: async () => ['ElanvitalAI/elanous'], sleep: async () => {},
+    })({ spaceId: 'reattached-app', feature: 'x' }).done;
+    expect(result.exitCode).toBe(0);
+    expect(issued).toBe(2);
+    expect(calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toEqual([expect.objectContaining({ input: 'ghs_SECOND\n' })]);
+    expect(calls.some((call) => call.args.includes('apply'))).toBe(false);
+  });
+
+  test('reattached App Job retries a failed host issuance on the next poll', async () => {
+    const appManifest = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, appCredential: true }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
+    const script = appManifest.spec.template.spec.containers[0]!.args[0]!;
+    const calls: Array<{ args: readonly string[]; input?: string }> = [];
+    const events: string[] = [];
+    const off = debug.registerSink({ name: 'reattached-app-mint-retry', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event.startsWith('gh-token-refresh')) events.push(record.event);
+    } });
+    let polls = 0;
+    let issued = 0;
+    const kubectl: Kubectl = (args, input) => {
+      calls.push({ args: [...args], input });
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 0, stdout: '0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b ', stderr: '' };
+      if (args.includes('-o') && args.includes('json')) return { status: 0, stdout: JSON.stringify({ spec: { template: { spec: { containers: [{ name: 'child', args: [script], env: [{ name: 'ELANOUS_RUN_ID', value: 'run-reattached-mint-retry-1' }] }] } } } }), stderr: '' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: ++polls > 2 ? 'Complete' : '', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      const result = await podSelfImplementSpawn({ kubectl, credentials: CREDS, env: {}, sleep: async () => {},
+        githubInstallation: () => ++issued === 3 ? { token: 'ghs_SECOND', expires_at: new Date(Date.now() + 3600_000).toISOString() } : null,
+        githubRepositories: async () => ['ElanvitalAI/elanous'],
+      })({ spaceId: 'reattached-mint-retry', feature: 'x' }).done;
+      expect(result.exitCode).toBe(0);
+      expect(issued).toBe(3);
+      expect(events).toEqual(['gh-token-refresh-failed', 'gh-token-refreshed']);
+      expect(calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toEqual([expect.objectContaining({ input: 'ghs_SECOND\n' })]);
+      expect(calls.some((call) => call.args.includes('apply'))).toBe(false);
+    } finally { off(); }
+  });
+
+  test('a failed host push retries at the next poll with a fresh verified token; a human-token Job remains byte-identical', async () => {
+    // The frozen human Job carries the host quota policy; pin it so the snapshot does not depend on this machine's config.
+    const savedPolicy = process.env.ELANOUS_CODEX_QUOTA_POLICY;
+    process.env.ELANOUS_CODEX_QUOTA_POLICY = 'credits';
+    const start = Date.now();
+    let clock = start;
+    let issued = 0;
+    let polls = 0;
+    let pushes = 0;
+    const calls: Array<{ args: readonly string[]; input?: string }> = [];
+    const events: Array<{ event: string; data: unknown }> = [];
+    const off = debug.registerSink({ name: 'pod-app-host-retry', emit: (record) => {
+      if (record.category === 'self-implement.pod' && record.event.startsWith('gh-token-')) events.push({ event: record.event, data: record.data });
+    } });
+    const kubectl: Kubectl = (args, input) => {
+      calls.push({ args: [...args], input });
+      if (args.includes('current-context')) return { status: 0, stdout: 'ctx', stderr: '' };
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: '' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: ++polls > 3 ? 'Complete' : '', stderr: '' };
+      if (args.includes('exec') && args.includes('--with-token')) return { status: 1, stdout: '', stderr: 'sensitive stderr ghs_SECOND' };
+      if (args.includes('exec') && args.includes('bun')) return { status: ++pushes === 1 ? 1 : 0, stdout: '', stderr: 'sensitive stderr ghs_SECOND' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    try {
+      await podSelfImplementSpawn({
+        kubectl, credentials: CREDS, env: {}, now: () => clock, sleep: async () => { clock += 60_000; },
+        githubInstallation: () => ({ token: issued++ === 0 ? 'ghs_FIRST' : 'ghs_SECOND', expires_at: new Date(start + (issued === 1 ? 11 : 60) * 60_000).toISOString() }),
+        githubRepositories: async () => ['ElanvitalAI/elanous'],
+      })({ spaceId: 'retry-push', feature: 'x' }).done;
+      expect(pushes).toBe(2);
+      expect(events.map((row) => row.event)).toEqual(['gh-token-refresh-failed', 'gh-token-refreshed']);
+      expect(calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toHaveLength(2);
+      const fallbackCalls = calls.filter((call) => call.args.includes('exec') && call.args.includes('bun'));
+      expect(fallbackCalls).toHaveLength(2);
+      expect(fallbackCalls.every((call) => call.args.includes('unset GH_TOKEN GITHUB_TOKEN; GH_CONFIG_DIR="$HOME/.config/gh" exec "$@"') && call.input === 'ghs_SECOND\n')).toBe(true);
+      expect(JSON.stringify(events)).not.toContain('ghs_SECOND');
+      const human = fakeKubectl(['', '', 'Complete'], '');
+      await podSelfImplementSpawn({ kubectl: human.k, credentials: CREDS, env: { ELANOUS_HOST_ID: 'frozen-human-host' }, githubInstallation: () => null, sleep: async () => {} })({ spaceId: 'human-token', feature: 'x' }).done;
+      const [secret, job] = human.calls.filter((call) => call.args.endsWith('apply -f -')).map((call) => JSON.parse(call.input!));
+      expect(secret.stringData).toEqual({ 'elanous-auth.json': CREDS().elanousAuth, 'codex-auth.json': CREDS().codexAuth, 'gh-token': CREDS().ghToken, feature: 'x' });
+      const child = job.spec.template.spec.containers[0];
+      // Frozen from HEAD before host refresh: full human Job including script, env, mounts and volume.
+      const previousHumanJob = "{\"apiVersion\":\"batch/v1\",\"kind\":\"Job\",\"metadata\":{\"name\":\"si-human-token-2ed574b3\",\"namespace\":\"elanous-test\",\"labels\":{\"elanous.substrate\":\"pod\",\"elanous.job\":\"si-human-token-2ed574b3\",\"elanous.run\":\"RUN_ID_PLACEHOLDER\"}},\"spec\":{\"backoffLimit\":0,\"ttlSecondsAfterFinished\":7200,\"activeDeadlineSeconds\":10800,\"template\":{\"metadata\":{\"labels\":{\"elanous.job\":\"si-human-token-2ed574b3\",\"elanous.run\":\"RUN_ID_PLACEHOLDER\"}},\"spec\":{\"restartPolicy\":\"Never\",\"securityContext\":{\"runAsUser\":1000,\"fsGroup\":1000},\"initContainers\":[{\"name\":\"isolation-gate\",\"image\":\"elanous-harness:local\",\"imagePullPolicy\":\"Never\",\"command\":[\"bash\",\"-c\"],\"args\":[\"ok=0\\nfor i in $(seq 1 60); do\\n  if curl -s -m 1 -o /dev/null http://host.orb.internal:31415/health || curl -s -m 1 -o /dev/null http://core.elanous-prod:8080/; then ok=0; else ok=$((ok+1)); fi\\n  [ \\\"$ok\\\" -ge 3 ] && { echo \\\"[gate] isolation enforced after ${i} probes\\\"; exit 0; }\\n  sleep 0.5\\ndone\\necho \\\"[gate] ISOLATION NOT ENFORCED within 30s\\\"; exit 1\"]}],\"containers\":[{\"name\":\"child\",\"image\":\"elanous-harness:local\",\"imagePullPolicy\":\"Never\",\"resources\":{\"requests\":{\"cpu\":\"1\",\"memory\":\"4Gi\"},\"limits\":{\"memory\":\"16Gi\",\"cpu\":\"4\"}},\"command\":[\"bash\",\"-c\"],\"args\":[\"set -u\\nmkdir -p ~/.elanous ~/.codex && cp /creds/elanous-auth.json ~/.elanous/auth.json && cp /creds/codex-auth.json ~/.codex/auth.json && chmod 600 ~/.elanous/auth.json ~/.codex/auth.json\\nexport ELANOUS_CODEX_QUOTA_POLICY='credits'\\nexport GH_TOKEN=\\\"$(cat /creds/gh-token)\\\"\\ngit config --global user.name \\\"elanous pod child\\\" && git config --global user.email \\\"noreply@anthropic.com\\\" && gh auth setup-git\\ncurl -s -m 3 -o /dev/null http://host.orb.internal:31415/health && { echo \\\"[pod] ISOLATION FAIL\\\"; exit 3; }\\nif [ -e repo ]; then exit 5; fi\\nif [ -d '/host-mirror' ] && git -C '/host-mirror' rev-parse --verify HEAD >/dev/null 2>&1 && git clone -q --shared -- '/host-mirror' repo && git -C repo rev-parse --verify HEAD >/dev/null 2>&1; then\\n  git -C repo remote set-url origin 'https://github.com/ElanvitalAI/elanous' || exit 5\\n  source_via=mirror\\nelse\\n  if [ -e repo ]; then rm -r -- repo || exit 5; fi\\n  git clone -q --depth 50 'https://github.com/ElanvitalAI/elanous' repo || exit 5\\n  source_via=github\\nfi\\nprintf 'ELANOUS_POD_SOURCE_VIA %s\\\\n' \\\"$source_via\\\"\\ncd repo || exit 5\\nif [ \\\"$source_via\\\" = mirror ]; then\\n  remote_head=$(git ls-remote origin HEAD | cut -f1) || exit 5\\n  if ! [[ \\\"$remote_head\\\" =~ ^[0-9a-f]{40}$ ]]; then exit 5; fi\\n  if [ \\\"$remote_head\\\" != \\\"$(git rev-parse HEAD)\\\" ]; then\\n    git fetch --depth 50 origin HEAD && git reset --hard FETCH_HEAD || exit 5\\n  fi\\nfi\\nhead=$(git rev-parse HEAD)\\nprintf 'ELANOUS_POD_SOURCE default %s\\\\n' \\\"$head\\\"\\n(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, \\\"%25\\\", s); gsub(/:/, \\\"%3A\\\", s); gsub(/ /, \\\"%20\\\", s); gsub(/\\\\t/, \\\"%09\\\", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, \\\"\\\"); n=split($0, a, /[[:space:]]+/); cmd=\\\"<redacted>\\\"; if (name==\\\"sleep\\\" && a[2]==\\\"30\\\") cmd=\\\"sleep 30\\\" (n>2 ? \\\" <redacted>\\\" : \\\"\\\"); else if (name==\\\"bun\\\") { cmd=\\\"bun <redacted>\\\"; if (a[2]==\\\"test\\\") cmd=\\\"bun test <redacted>\\\"; else if (a[2]==\\\"run\\\") cmd=\\\"bun run <redacted>\\\"; else if ((a[2]==\\\"x\\\" || a[2]==\\\"exec\\\") && a[3]==\\\"tsc\\\") cmd=\\\"bun x tsc <redacted>\\\" } else if (name==\\\"tsc\\\") cmd=\\\"tsc <redacted>\\\"; else if (name==\\\"elanous\\\") { cmd=\\\"elanous <redacted>\\\"; if (a[2]==\\\"self\\\") cmd=\\\"elanous self <redacted>\\\"; else if (a[2]==\\\"harness\\\") cmd=\\\"elanous harness <redacted>\\\" } else if (name==\\\"node\\\") cmd=\\\"node <redacted>\\\"; if (name==\\\"sleep\\\" && cmd==\\\"<redacted>\\\") cmd=\\\"sleep <redacted>\\\"; else if (cmd==\\\"<redacted>\\\" && name!=\\\"bash\\\" && name!=\\\"sh\\\") name=\\\"other\\\"; printf \\\" %s:%s:%s\\\", rss, encode(name), encode(substr(cmd,1,120)) }'); printf \\\"ELANOUS_MEM %s %s%s\\\\n\\\" \\\"$(date +%s)\\\" \\\"$mem\\\" \\\"$top\\\"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!\\nelanous self implement \\\"$(cat /creds/feature)\\\" --json '--open-pr' '--no-supervise' > /tmp/si.out 2>&1; rc=$?\\ncat /tmp/si.out\\n[ -f scripts/usage-rollup.ts ] && bun scripts/usage-rollup.ts --since 12h || echo \\\"ELANOUS_USAGE_ROLLUP {\\\"measured\\\":false,\\\"reason\\\":\\\"no rollup script\\\"}\\\"\\nif mkdir -p \\\"$HOME/outbox/pod-logs\\\" && elanous logs --all --include-test --since 12h --limit 20000 --json > \\\"$HOME/outbox/pod-logs/logs.jsonl\\\"; then\\n  logs_size=$(( $(wc -c < \\\"$HOME/outbox/pod-logs/logs.jsonl\\\") ))\\n  if [ \\\"$logs_size\\\" -gt 4500000 ]; then\\n    tail -c 4500000 \\\"$HOME/outbox/pod-logs/logs.jsonl\\\" | tail -n +2 > \\\"$HOME/outbox/pod-logs/logs.jsonl.tail\\\" && mv -f \\\"$HOME/outbox/pod-logs/logs.jsonl.tail\\\" \\\"$HOME/outbox/pod-logs/logs.jsonl\\\"\\n    printf 'ELANOUS_POD_LOGS_TRUNCATED %s %s\\\\n' \\\"$logs_size\\\" \\\"$(( $(wc -c < \\\"$HOME/outbox/pod-logs/logs.jsonl\\\") ))\\\"\\n  fi\\nelse\\n  logs_rc=$?\\n  rm -f \\\"$HOME/outbox/pod-logs/logs.jsonl\\\"\\n  printf 'ELANOUS_POD_LOGS_UNAVAILABLE export-exit-%s\\\\n' \\\"$logs_rc\\\"\\nfi\\nset -o pipefail\\nartifact_bytes=0\\nif [ -d \\\"$HOME/outbox\\\" ]; then\\n  while IFS= read -r -d '' file; do\\n    [ -f \\\"$file\\\" ] && [ ! -L \\\"$file\\\" ] || continue\\n    relative=${file#\\\"$HOME/outbox/\\\"}\\n    size=$(( $(wc -c < \\\"$file\\\") ))\\n    if [ \\\"$size\\\" -gt 5242880 ] || [ $((artifact_bytes + size)) -gt 20971520 ]; then\\n      printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\\\n' \\\"$relative\\\" \\\"$size\\\"\\n      continue\\n    fi\\n    path_token=$(printf '%s' \\\"$relative\\\" | base64 | tr -d '\\\\n' | tr '+/' '-_' | tr -d '=')\\n    if encoded=$(gzip -c \\\"$file\\\" | base64 | tr -d '\\\\n'); then\\n      artifact_bytes=$((artifact_bytes + size))\\n      total=$(( (${#encoded} + 7999) / 8000 ))\\n      for ((n=1; n<=total; n++)); do\\n        chunk=${encoded:$(( (n-1)*8000 )):8000}\\n        printf 'ELANOUS_POD_ARTIFACT %s %s/%s %s\\\\n' \\\"$path_token\\\" \\\"$n\\\" \\\"$total\\\" \\\"$chunk\\\"\\n      done\\n    else\\n      printf 'ELANOUS_POD_ARTIFACT_SKIPPED %s %s\\\\n' \\\"$relative\\\" \\\"$size\\\"\\n    fi\\n  done < <(find \\\"$HOME/outbox\\\" -type f -print0)\\nfi\\nfound=0\\nfor ledger in \\\"${ELANOUS_STATE_DIR:-$HOME/.elanous}\\\"/run-ledger/*.jsonl; do\\n  [ -f \\\"$ledger\\\" ] || continue\\n  found=1\\n  run_id=${ledger##*/}; run_id=${run_id%.jsonl}\\n  if encoded=$(gzip -c \\\"$ledger\\\" | base64 | tr -d '\\\\n'); then\\n    total=$(( (${#encoded} + 7999) / 8000 ))\\n    for ((n=1; n<=total; n++)); do\\n      chunk=${encoded:$(( (n-1)*8000 )):8000}\\n      printf 'ELANOUS_RUN_LEDGER %s %s/%s %s\\\\n' \\\"$run_id\\\" \\\"$n\\\" \\\"$total\\\" \\\"$chunk\\\"\\n    done\\n  else\\n    echo \\\"[pod] ledger transfer failed: $run_id\\\" >&2\\n  fi\\ndone\\nif [ \\\"$found\\\" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi\\nkill \\\"$mem_sampler_pid\\\" 2>/dev/null || true\\nwait \\\"$mem_sampler_pid\\\" 2>/dev/null || true\\ntail -n 1 /tmp/si.out\\nif [ \\\"${rc:-0}\\\" -ne 0 ]; then\\n  job_name=\\\"${ELANOUS_POD_NAME:-unknown-job}\\\"\\n  salvage_any=0\\n  while IFS= read -r wt; do\\n    [ -n \\\"$wt\\\" ] || continue\\n    case \\\"$wt\\\" in\\n      /*) ;;\\n      *) printf 'ELANOUS_POD_SALVAGE_NONE bad-worktree-path\\\\n'; continue ;;\\n    esac\\n    wt_name=$(basename -- \\\"$wt\\\")\\n    case \\\"$wt_name\\\" in\\n      ''|.*|*/*|*'..'*) printf 'ELANOUS_POD_SALVAGE_NONE bad-worktree-name\\\\n'; continue ;;\\n    esac\\n    branch=\\\"salvage/${job_name}/${wt_name}\\\"\\n    case \\\"$branch\\\" in\\n      salvage/*) ;;\\n      *) printf 'ELANOUS_POD_SALVAGE_NONE refused-prefix\\\\n'; continue ;;\\n    esac\\n    case \\\"$branch\\\" in\\n      main|self-impl|self-impl/*) printf 'ELANOUS_POD_SALVAGE_NONE refused-prefix\\\\n'; continue ;;\\n    esac\\n    (\\n      set +e\\n      cd -- \\\"$wt\\\" || { printf 'ELANOUS_POD_SALVAGE_NONE cd-failed\\\\n'; exit 0; }\\n      git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { printf 'ELANOUS_POD_SALVAGE_NONE not-a-worktree\\\\n'; exit 0; }\\n      dirty=0\\n      git diff --quiet || dirty=1\\n      git diff --cached --quiet || dirty=1\\n      if [ -n \\\"$(git ls-files --others --exclude-standard)\\\" ]; then dirty=1; fi\\n      ahead=0\\n      if git rev-parse --verify HEAD >/dev/null 2>&1; then\\n        if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then\\n          if [ \\\"$(git rev-list --count '@{u}..HEAD' 2>/dev/null || true)\\\" != 0 ]; then ahead=1; fi\\n        else\\n          if git rev-parse --verify origin/HEAD >/dev/null 2>&1; then\\n            base=$(git rev-parse origin/HEAD)\\n          elif git rev-parse --verify origin/main >/dev/null 2>&1; then\\n            base=$(git rev-parse origin/main)\\n          else\\n            base=$(git rev-list --max-parents=0 HEAD 2>/dev/null | head -n 1)\\n          fi\\n          if [ -n \\\"$base\\\" ] && [ \\\"$(git rev-list --count \\\"${base}..HEAD\\\" 2>/dev/null || true)\\\" != 0 ]; then ahead=1; fi\\n        fi\\n      fi\\n      if [ \\\"$dirty\\\" -eq 0 ] && [ \\\"$ahead\\\" -eq 0 ]; then\\n        printf 'ELANOUS_POD_SALVAGE_NONE clean\\\\n'\\n        exit 0\\n      fi\\n      if [ \\\"$dirty\\\" -eq 1 ]; then\\n        git add -A -- . || { printf 'ELANOUS_POD_SALVAGE_NONE add-failed\\\\n'; exit 0; }\\n        git commit -m \\\"salvage: ${job_name} rc=${rc}\\\" || { printf 'ELANOUS_POD_SALVAGE_NONE commit-failed\\\\n'; exit 0; }\\n      fi\\n      git push origin \\\"HEAD:refs/heads/${branch}\\\" || { printf 'ELANOUS_POD_SALVAGE_NONE push-failed\\\\n'; exit 0; }\\n      commit=$(git rev-parse HEAD) || { printf 'ELANOUS_POD_SALVAGE_NONE rev-parse-failed\\\\n'; exit 0; }\\n      printf 'ELANOUS_POD_SALVAGE %s %s\\\\n' \\\"$branch\\\" \\\"$commit\\\"\\n    )\\n    salvage_any=1\\n  done < <(git worktree list --porcelain | awk '/^worktree / { sub(/^worktree /, \\\"\\\"); print }')\\n  if [ \\\"$salvage_any\\\" -eq 0 ]; then printf 'ELANOUS_POD_SALVAGE_NONE no-worktree\\\\n'; fi\\nfi\\nexit $rc\"],\"env\":[{\"name\":\"ELANOUS_RUN_ID\",\"value\":\"RUN_ID_PLACEHOLDER\"},{\"name\":\"ELANOUS_SUBSTRATE\",\"value\":\"pod\"},{\"name\":\"ELANOUS_CONTROL_INBOX_DIR\",\"value\":\"/tmp/elanous-control.inbox\"},{\"name\":\"ELANOUS_POD_NAME\",\"valueFrom\":{\"fieldRef\":{\"fieldPath\":\"metadata.name\"}}},{\"name\":\"ELANOUS_NODE_NAME\",\"valueFrom\":{\"fieldRef\":{\"fieldPath\":\"spec.nodeName\"}}},{\"name\":\"ELANOUS_POD_NAMESPACE\",\"valueFrom\":{\"fieldRef\":{\"fieldPath\":\"metadata.namespace\"}}},{\"name\":\"ELANOUS_SUBSTRATE\",\"value\":\"pod\"},{\"name\":\"ELANOUS_RUN_CONTRACT\",\"value\":\"{\\\"substrate\\\":\\\"pod\\\"}\"}],\"volumeMounts\":[{\"name\":\"creds\",\"mountPath\":\"/creds\",\"readOnly\":true}]}],\"volumes\":[{\"name\":\"creds\",\"secret\":{\"secretName\":\"si-human-token-2ed574b3-creds\",\"defaultMode\":256}}]}}}}";
+      const actualRunId = child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID').value;
+      const expectedHumanJob = JSON.parse(previousHumanJob.replaceAll('RUN_ID_PLACEHOLDER', actualRunId));
+      expectedHumanJob.spec.template.spec.containers[0].env.splice(6, 0, { name: 'ELANOUS_HOST_ID', value: 'frozen-human-host' });
+      expect(JSON.stringify(job)).toBe(JSON.stringify(expectedHumanJob));
+      expect(child.args[0]).toContain('export GH_TOKEN="$(cat /creds/gh-token)"');
+      expect(human.calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toHaveLength(0);
+    } finally {
+      off();
+      if (savedPolicy === undefined) delete process.env.ELANOUS_CODEX_QUOTA_POLICY; else process.env.ELANOUS_CODEX_QUOTA_POLICY = savedPolicy;
+    }
+  });
+
+  test('host-bound run token from Pod issuance reaches GitHub relay for exactly its repository', async () => {
+    resetPodCredentialRateForTesting();
+    const applied: string[] = [];
+    const revoked: string[] = [];
+    const now = Date.parse('2026-09-26T12:00:00Z');
+    const tokenDeps = { key: async () => 'run-signing-key', now: () => now, revokedPath: join(mkdtempSync(join(tmpdir(), 'pod-gh-')), 'revoked.jsonl') };
+    const issued: string[] = [];
+    const minted: Array<{ runId: string; job: string; ttlMs: number; scope?: string; repository?: string }> = [];
+    await podSelfImplementSpawn({
+      kubectl: k(applied), pollMs: 1, imageCommit: null, sleep: async () => {}, credentials: CREDS,
+      repoUrl: 'https://github.com/host-owner/run-repo.git', env: { ELANOUS_RUN_ID: 'host-run', ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN: 'attacker-token' },
+      passEnv: ['ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN'], armEnv: { ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN: 'attacker-token' },
+      groundingUrl: 'https://host:31415',
+      now: () => now,
+      githubInstallation: (repository) => { issued.push(repository); return { token: 'initial-installation', expires_at: new Date(now + 3600_000).toISOString() }; },
+      githubRepositories: async () => ['host-owner/run-repo'],
+      mintGrounding: (claims) => { minted.push(claims); return mintGroundingToken(claims, tokenDeps); }, revokeGrounding: (runId) => revoked.push(runId),
+    })({ spaceId: 's', feature: 'f' }).done;
+    expect(minted).toEqual([
+      { runId: 'host-run', job: podJobName('s'), ttlMs: POD_JOB_DEADLINE_SECONDS * 1000 },
+      { runId: 'host-run', job: podJobName('s'), ttlMs: POD_JOB_DEADLINE_SECONDS * 1000, scope: 'gh-credential', repository: 'host-owner/run-repo' },
+    ]);
+    const secret = JSON.parse(applied.find((a) => a.includes('"kind":"Secret"'))!) as { stringData: Record<string, string> };
+    const job = applied.find((a) => a.includes('"kind":"Job"'))!;
+    expect(secret.stringData['gh-token']).toBe('initial-installation');
+    const bearer = secret.stringData['env-ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN'];
+    expect(typeof bearer).toBe('string');
+    expect(job).not.toContain(bearer!);
+    expect(job).not.toContain('attacker-token');
+    expect(secret.stringData['env-ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN']).not.toBe('attacker-token');
+    expect(job).toContain('"name":"ELANOUS_POD_GITHUB_CREDENTIAL_TOKEN","valueFrom":{"secretKeyRef"');
+    expect(job).toContain('"name":"ELANOUS_POD_GITHUB_CREDENTIAL_URL","value":"https://host:31415/v1/pod/credential/github"');
+    const response = await handlePodGithubCredential(new Request('https://host:31415/v1/pod/credential/github', {
+      method: 'POST', headers: { authorization: `Bearer ${bearer}` }, body: JSON.stringify({ repository: 'attacker-repo' }),
+    }), { token: tokenDeps, now: () => now, mintInstallation: (repository) => {
+      issued.push(repository);
+      return { token: 'fresh-installation', expires_at: new Date(now + 3600_000).toISOString() };
+    }, installationRepositories: async () => ['host-owner/run-repo'] });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ token: 'fresh-installation', expires_at: new Date(now + 3600_000).toISOString() });
+    expect(issued).toEqual(['host-owner/run-repo', 'host-owner/run-repo']);
+    expect(revoked).toEqual(['host-run']);
+    resetPodCredentialRateForTesting();
+  });
   test('with a grounding URL: token only in the Secret, URL as plain env, revoked when the Job ends', async () => {
     const applied: string[] = [];
     const revoked: string[] = [];
@@ -2308,6 +2965,7 @@ describe('pod grounding token', () => {
     }) as typeof debug.log);
     try {
       await podSelfImplementSpawn({
+        githubInstallation: () => null,
         provider: 'grok', kubectl: k(applied), pollMs: 1, imageCommit: null, sleep: async () => {},
         grokCredentials: () => ({ grokAuth: JSON.stringify({ scope: { key: 'access-x' } }), ghToken: 'gh' }),
         env: { ELANOUS_RUN_ID: 'run-g1' }, deadlineSeconds: 180,
@@ -2336,6 +2994,7 @@ describe('pod grounding token', () => {
     const applied: string[] = [];
     const minted: Array<{ scope?: string }> = [];
     await podSelfImplementSpawn({
+        githubInstallation: () => null,
       kubectl: k(applied), pollMs: 1, imageCommit: null, sleep: async () => {},
       credentials: () => ({ ...CREDS(), grokAuth: JSON.stringify({ scope: { key: 'access-x' } }) }),
       env: { ELANOUS_RUN_ID: 'run-g1' },
@@ -2385,6 +3044,7 @@ describe('pod grounding token', () => {
     const applied: string[] = [];
     const minted: Array<{ scope?: string }> = [];
     await podSelfImplementSpawn({
+        githubInstallation: () => null,
       provider: 'grok', grokApiKeyOptIn: true, kubectl: k(applied), pollMs: 1, imageCommit: null, sleep: async () => {},
       grokCredentials: () => ({ grokApiKey: 'paid-key', ghToken: 'gh' }),
       env: {}, groundingUrl: 'https://host:31415',

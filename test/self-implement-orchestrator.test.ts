@@ -8,6 +8,7 @@ import { join, relative } from 'node:path';
 import { debug } from '../src/debug/log.js';
 import { boundReadableText, buildImplementAbortRecord, classifyObservationMeasurement, formatImplementAbortProgressLine, IMPLEMENT_ABORT_REASON_MAX_CHARS, makeRunObserver, runSelfImplement, slugifyFeature, type GoalExecutionRecord, type SelfImplementSeams } from '../src/self-implement/orchestrator.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../src/git-fs/worktree.js';
+import { plannedSelfImplBranch } from '../src/harness/worktree-branch-prefix.js';
 import { appendRunLedgerEntry, loadRunLedger, queryMergeAttribution, queryMergedRunLedgers } from '../src/self-implement/run-ledger.js';
 import { insertGoalRunRecord, loadGoalRunRecordsByRunId } from '../src/self-implement/goal-run-store.js';
 import { PIPELINE_EDGES_BY_NODE, type PipelineNodeId } from '../src/self-implement/pipeline-shape.js';
@@ -386,9 +387,9 @@ describe('runSelfImplement — 파이프라인 시퀀싱', () => {
     expect(r.ok).toBe(true);
     expect(r.stage).toBe('pr-opened');
     expect(r.prNumber).toBe(1);
-    // ⭐ #6268(RUN-S1) 이후 슬러그 뒤에 sha256 8자가 붙는다 — 동시 런이 한 워크트리를 밟지
-    //    않게 하려는 것이므로, 값을 굳히지 말고 **계약(슬러그 + 8자 hex)** 을 단언한다.
-    expect(r.branch).toMatch(/^self-impl\/add-foo-endpoint-[0-9a-f]{8}$/);
+    // 기본 브랜치는 기존 feature 해시 뒤에 이 실행에서 확정한 runId의 접미사를 붙인다.
+    expect(r.branch).toBe(plannedSelfImplBranch('add foo endpoint', undefined, r.runId));
+    expect(r.branch).toMatch(/^self-impl\/add-foo-endpoint-[0-9a-f]{8}-r[a-z0-9]{6}$/);
   });
 
   it('writes the classified review diff through the real goal-run store without changing the result', async () => {

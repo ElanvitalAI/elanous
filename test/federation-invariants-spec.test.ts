@@ -26,6 +26,8 @@ import {
   type SurfaceFocus,
 } from '../src/display/types.js';
 import { resolveKeyAlias } from '../src/input-core/key-alias-table.js';
+import { isModalSurface, type ModalSurface } from '../src/display/modal-stack.js';
+import type { DisplaySurface } from '../src/display/types.js';
 
 // ─── Helpers ──────────────────────────────────────────────────
 
@@ -90,17 +92,35 @@ describe('F2 · Focus implies dispatch precedence (Q3 enum)', () => {
 
 describe('F3 · Modals that capture input must paint (type-enforced)', () => {
   test('ModalSurface type requires paint + bounds (compile-time)', () => {
-    // Documented in src/display/modal-stack.ts as:
-    //   interface ModalSurface extends DisplaySurface {
-    //     paint: (...) => string;
-    //     bounds: ModalBounds;
-    //     ...
-    //   }
-    // The TS type system enforces this; if a caller forgets either,
-    // tsc errors at the call site. This test serves as a contract
-    // marker — the assertion is trivial because the real check is
-    // upstream of runtime.
-    expect(true).toBe(true);
+    const modal: ModalSurface = {
+      id: 'test-modal',
+      owner: 'dashboard',
+      focus: 'owns',
+      priority: 1,
+      kind: 'modal',
+      render: () => [],
+      bounds: { row: 1, col: 1, width: 10, height: 3 },
+      paint: () => 'modal painted',
+    };
+    // @ts-expect-error ModalSurface requires paint even when bounds is supplied.
+    const missingPaint: ModalSurface = {
+      id: 'no-paint', owner: 'dashboard', focus: 'owns', priority: 1,
+      kind: 'modal', render: () => [],
+      bounds: { row: 1, col: 1, width: 10, height: 3 },
+    };
+    // @ts-expect-error ModalSurface requires bounds even when paint is supplied.
+    const missingBounds: ModalSurface = {
+      id: 'no-bounds', owner: 'dashboard', focus: 'owns', priority: 1,
+      kind: 'modal', render: () => [], paint: () => 'modal painted',
+    };
+    const surface: DisplaySurface = modal;
+    expect(isModalSurface(surface)).toBe(true);
+    expect(isModalSurface(missingPaint)).toBe(false);
+    expect(isModalSurface(missingBounds)).toBe(false);
+    if (isModalSurface(surface)) {
+      expect(surface.paint()).toBe('modal painted');
+      expect(surface.bounds).toEqual({ row: 1, col: 1, width: 10, height: 3 });
+    }
   });
 });
 

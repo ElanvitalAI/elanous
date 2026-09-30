@@ -1,0 +1,12 @@
+{
+  "name": "elanous-basics",
+  "version": "0.1.1",
+  "description": "Official elanous essentials for research, onboarding and everyday productivity.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "elanous-basics",
+    "shortDescription": "Research and productivity skills for elanous",
+    "developerName": "ElanvitalAI",
+    "category": "Productivity"
+  }
+}

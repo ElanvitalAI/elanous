@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildIntakeDigest, noteOneLiner, renderDigestMarkdown, renderDigestTelegram } from '../src/intake-plane/digest.js';
@@ -56,4 +56,16 @@ test('텔레그램 짧은 판 — 수 · 요약 · 골 후보 수 · 옵시디�
   expect(t).toContain('엘라누스에 없는 것 1건');
   expect(t).toContain('🟡 사람이 가를 것 2건');
   expect(t).toContain('obsidian://open?vault=ElanvitalAI&file=01.%20Knowledge%2FYoutube%2F_trend%2F20260926_%ED%9D%A1%EC%88%98%ED%9B%84%EB%B3%B4');
+});
+
+test('저장된 메시지 새 글이 이틀 넘게 없으면 노트·텔레그램 판에 경고 줄 · 이틀 안이면 없다 · 커서가 없으면 없다', () => {
+  const r = root();
+  expect(buildIntakeDigest(r, '2026-09-30', () => undefined, new Date('2026-09-30T00:00:00Z')).savedSilence).toBeUndefined();
+  mkdirSync(join(r, 'intake'), { recursive: true });
+  writeFileSync(join(r, 'intake', 'telegram-saved.cursor.json'), JSON.stringify({ lastId: 8773, at: '2026-09-28T22:07:49.773Z' }) + '\n');
+  expect(buildIntakeDigest(r, '2026-09-30', () => undefined, new Date('2026-09-29T23:30:00Z')).savedSilence).toBeUndefined();
+  const d = buildIntakeDigest(r, '2026-10-01', () => undefined, new Date('2026-10-01T00:00:00Z'));
+  expect(d.savedSilence).toEqual({ days: 2, lastNewAt: '2026-09-28T22:07:49.773Z' });
+  expect(renderDigestMarkdown(d)).toContain('새 글을 2일째 못 받았다(마지막 새 글 수집 2026-09-29)');
+  expect(renderDigestTelegram(d)).toContain('⚠️ 저장된 메시지 새 글 2일째 0');
 });

@@ -34,7 +34,7 @@ test('parser consumes the actual Bun failure reporter, including the file header
 });
 
 test('deliberate parser fixture failure', () => {
-  if (process.env.GATE_PARSER_PROBE === '1') expect(1).toBe(2);
+  if (process.env.GATE_PARSER_PROBE === '1') expect(parseFailures(output)).toHaveLength(0);
 });
 
 test('diffFailures compares identities, not totals or emission order', () => {

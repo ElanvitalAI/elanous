@@ -98,13 +98,14 @@ function asItem(pr: RawPr) {
 }
 
 // A page load fires the list twice (the daemon client settles) and polls cards — identical reads share one gh call.
+// Failures are shared too: during a GitHub rate-limit window a retry per request only deepens the limit (GIT-S83).
 const readCache = new Map<string, { at: number; value: Promise<GhResult> }>();
 export function clearApprovalsReadCache(): void { readCache.clear(); }
 function cachedRead(args: string[], ttlMs: number, now: number, call: () => Promise<GhResult>): Promise<GhResult> {
   const key = args.join('\u0000');
   const hit = readCache.get(key);
   if (hit && now - hit.at < ttlMs) return hit.value;
-  const value = call().then((result) => { if (!result.ok) readCache.delete(key); return result; });
+  const value = call();
   readCache.set(key, { at: now, value });
   return value;
 }

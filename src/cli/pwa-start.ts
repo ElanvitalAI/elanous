@@ -126,6 +126,8 @@ export interface PwaStartOpts {
    *  MCP-client boot is skipped (PR1 2026-05-13). Default undefined =
    *  leave the decision to the daemon-side `mcp.enabled` config. */
   mcpEnabled?: boolean;
+  /** Forward an explicit --no-auth opt-out to the detached Nexus child. */
+  noAuth?: boolean;
   out?: { log: (s: string) => void; error: (s: string) => void };
   // ─── Test seams ─────────────────────────────────────────────
   bgLaunchFn?: (opts: {
@@ -237,6 +239,7 @@ function collectForwardArgs(opts: PwaStartOpts, httpPort: number): string[] {
   // those gates only matter on the parent (build runs before fork).
   if (opts.watch && (opts.mode ?? 'static') === 'static') args.push('--watch');
   if (opts.mcpEnabled === false) args.push('--no-mcp');
+  if (opts.noAuth === true) args.push('--no-auth');
   return args;
 }
 

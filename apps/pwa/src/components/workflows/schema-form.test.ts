@@ -178,3 +178,25 @@ describe('validateSchemaValue', () => {
     expect(validateSchemaValue(typeless, { settings: { name: 'ok' } })).toEqual([]);
   });
 });
+
+describe('multi-line string fields (K3 실물 2026-09-30 · Markdown line breaks were dropped)', () => {
+  const schema = {
+    type: 'object',
+    properties: {
+      markdown: { type: 'string', title: 'Markdown 본문' },
+      note: { type: 'string', title: 'Note', 'x-multiline': true },
+      template: { type: 'string', title: '양식', enum: ['report', 'official-letter'] },
+      path: { type: 'string', title: '입력 경로' },
+      token: { type: 'string', title: 'Body token', format: 'password' },
+    },
+  };
+  it('markdown/본문 and x-multiline become multi-line · enum, path and secrets stay single-line', () => {
+    const fields = Object.fromEntries(flattenSchema(schema).fields.map((f) => [f.path, f]));
+    expect(fields.markdown!.multiline).toBe(true);
+    expect(fields.note!.multiline).toBe(true);
+    expect(fields.template!.multiline).toBe(false);
+    expect(fields.path!.multiline).toBe(false);
+    expect(fields.token!.multiline).toBe(false);
+    expect(flattenSchema(schema).unsupported.some((u) => u.includes('note'))).toBe(false);
+  });
+});

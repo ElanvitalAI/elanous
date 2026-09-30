@@ -3307,9 +3307,14 @@ export async function runSelfImplement(opts: SelfImplementOptions): Promise<Self
   if (opts.childLlm && (typeof opts.childLlm.provider !== 'string' || !opts.childLlm.provider.trim() || typeof opts.childLlm.model !== 'string' || !opts.childLlm.model.trim())) {
     throw new Error('childLlm.provider and childLlm.model must both be non-empty');
   }
-  const branch = opts.branchName ?? plannedSelfImplBranch(opts.feature, opts.goalId);
   const identity = resolveRunIdentity({ explicit: opts.runId });
   const { runId } = identity;
+  const branch = opts.branchName ?? plannedSelfImplBranch(opts.feature, opts.goalId, runId);
+  try {
+    debug.log('self-implement.branch', 'planned', {
+      runId, goalId: opts.goalId, branch, runSuffix: opts.branchName === undefined ? branch.match(/-r[a-z0-9]{6}$/)?.[0] ?? null : null,
+    });
+  } catch { /* observation must not block the run */ }
   const attemptOrdinal = incrementRunAttemptOrdinal(runId);
   const shardIdentity = parseRunShardIdentity(opts.feature);
   const observeOuter = makeRunObserver(runId, opts.goalId, debug.log.bind(debug), opts.seams.writeRunLedger, shardIdentity);
@@ -4517,8 +4522,8 @@ async function runSelfImplementInner(
     roundClassifications.push(classification);
     onRoundClassification(classification);
   };
-  const branch = opts.branchName ?? plannedSelfImplBranch(opts.feature, opts.goalId);
   const { runId, source: runIdSource } = identity ?? resolveRunIdentity({ explicit: opts.runId });
+  const branch = opts.branchName ?? plannedSelfImplBranch(opts.feature, opts.goalId, runId);
   try {
     debug.log('run-identity', 'own', {
       runId, branch, source: runIdSource, nestDepth: nestInfo().depth, ...originObservationFields(),

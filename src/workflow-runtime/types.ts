@@ -672,7 +672,8 @@ export interface WorkflowDeps {
    *  `dispatchTaskCreate`. */
   createTask?: (req: WorkflowTaskRequest) => Promise<WorkflowTaskResult>;
   /** Invoke a registered skill by slug. */
-  runSkill?: (slug: string, args: string) => Promise<string>;
+  /** `opts.skillsDir` — 먼저 찾을 스킬 폴더(플러그인 노드 = 그 플러그인의 `skills/`). 없으면 종전 위치. */
+  runSkill?: (slug: string, args: string, opts?: { skillsDir?: string }) => Promise<string>;
   /** Invoke a CFT method by name. */
   runCft?: (method: string, config: Record<string, unknown>) => Promise<unknown>;
   /** Evaluate a declared judgment contract through an injected implementation. */

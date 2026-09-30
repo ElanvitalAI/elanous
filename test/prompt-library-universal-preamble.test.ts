@@ -5,6 +5,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import {
   PROJECT_ANCHOR_MAX_CHARS,
@@ -73,20 +74,19 @@ afterEach(() => {
 });
 
 describe('buildUniversalPreamble + loadProjectAnchor', () => {
-  test('returns lifecycle-only when neither AGENTS.md nor CLAUDE.md exists', () => {
-    // P4 (2026-05-03) — coding-agent lifecycle is family-agnostic, so it
-    // emits even with no project anchor.
+  test('returns no-tools guidance and lifecycle when neither AGENTS.md nor CLAUDE.md exists', () => {
     const msgs = buildUniversalPreamble({ cwd: tmp });
-    expect(msgs.length).toBe(1);
-    expect((msgs[0]!.content as string)).toContain('Coding Agent Pipelines');
+    expect(msgs).toHaveLength(2);
+    expect((msgs[0]!.content as string)).toContain('tools disabled');
+    expect((msgs[1]!.content as string)).toContain('Coding Agent Pipelines');
     expect(loadProjectAnchor(tmp).content).toBeNull();
   });
 
   test('emits anchor + tree + lifecycle when AGENTS.md exists', () => {
     writeFileSync(join(tmp, 'AGENTS.md'), '# Agents guide\nUse this guide.\n');
     const msgs = buildUniversalPreamble({ cwd: tmp });
-    // [anchor, project-tree (W4-B), lifecycle]
-    expect(msgs.length).toBe(3);
+    // [anchor, project-tree (W4-B), no-tools guidance, lifecycle]
+    expect(msgs.length).toBe(4);
     expect(msgs[0]!.role).toBe('system');
     const content = msgs[0]!.content;
     expect(typeof content).toBe('string');
@@ -96,8 +96,43 @@ describe('buildUniversalPreamble + loadProjectAnchor', () => {
     // Project Layout (tree) landed second.
     expect((msgs[1]!.content as string)).toContain('## Project Layout');
     expect((msgs[1]!.content as string)).toContain('AGENTS.md');
-    // Lifecycle addendum landed third.
+    expect(msgs[2]!.role).toBe('system');
+    const guidance = msgs[2]!.content as string;
+    expect(guidance).toContain('tools disabled');
+    expect(guidance).toContain('Do not guess repository or real-time facts');
+    expect(guidance).toContain('file counts, file contents, commits, or the current time');
+    expect(guidance).toContain('cannot check');
+    expect(guidance).toContain('for navigation, not evidence for counts');
+    expect(guidance).toContain('elanous agent …');
+    expect(guidance).toContain('elanous chat --tools …');
+    expect((msgs[3]!.content as string)).toContain('Coding Agent Pipelines');
+    // src/cli/agent-cli.ts runChatTurnCli calls buildUniversalPreamble and joins its messages before runTurn({ systemPrompt }).
+    const systemPrompt = msgs.map(m => m.content as string).filter(Boolean).join('\n\n');
+    expect(systemPrompt.indexOf('## Project Layout')).toBeLessThan(systemPrompt.indexOf('## Chat without tools'));
+    expect(systemPrompt).toContain('Do not guess repository or real-time facts');
+  });
+
+  test('empty enabledTools also emits exactly one guidance message after the tree', () => {
+    writeFileSync(join(tmp, 'README.md'), '# Hello\n');
+    const msgs = buildUniversalPreamble({ cwd: tmp, enabledTools: [] });
+    expect(msgs).toHaveLength(3);
+    expect((msgs[0]!.content as string)).toContain('## Project Layout');
+    expect(msgs[1]).toEqual(expect.objectContaining({ role: 'system' }));
+    expect((msgs[1]!.content as string)).toContain('Do not guess repository or real-time facts');
     expect((msgs[2]!.content as string)).toContain('Coding Agent Pipelines');
+  });
+
+  test('enabled Read tool preserves the tool-enabled preamble', () => {
+    writeFileSync(join(tmp, 'AGENTS.md'), '# Agents guide\n');
+    const msgs = buildUniversalPreamble({ cwd: tmp, enabledTools: ['Read'] });
+    const expected = buildUniversalPreamble({ cwd: tmp })
+      .filter(m => !(m.content as string).startsWith('## Chat without tools'));
+    expect(msgs.slice(0, -1)).toEqual(expected);
+    expect(msgs.at(-1)!.role).toBe('system');
+    expect((msgs.at(-1)!.content as string)).toContain('# Session-specific guidance');
+    expect(msgs.every(m => !(m.content as string).startsWith('## Chat without tools'))).toBe(true);
+    const systemPrompt = msgs.map(m => m.content as string).filter(Boolean).join('\n\n');
+    expect(systemPrompt).not.toContain('## Chat without tools');
   });
 
   test('exports the project anchor candidates and policy-observed CLAUDE filename declarations', () => {
@@ -283,6 +318,42 @@ describe('buildUniversalPreamble + loadProjectAnchor', () => {
   });
 });
 
+test('runChatTurnCli supplies the guidance in the actual tool-disabled system prompt, not the tool-enabled prompt', () => {
+  const stateDir = mkdtempSync(join(tmpdir(), 'elanous-cli-preamble-'));
+  try {
+    const cliModule = `${import.meta.dir}/../src/cli/agent-cli.ts`;
+    const configModule = `${import.meta.dir}/../src/user-config.ts`;
+    const child = spawnSync('bun', ['--eval', `
+      import { getUserConfig } from ${JSON.stringify(configModule)};
+      import { runChatTurnCli } from ${JSON.stringify(cliModule)};
+      const cfg = getUserConfig();
+      cfg.chat.toolDeny = [];
+      const prompts = [];
+      const capture = async (input) => {
+        prompts.push({ systemPrompt: input.systemPrompt, tools: input.tools?.length ?? 0 });
+        return { provider: 'test', model: 'test' };
+      };
+      for (const enableTools of [false, true]) {
+        await runChatTurnCli({ cfg, userText: 'How many files?', explicitSessionId: undefined, reuseActive: false, forceNew: true, json: true, enableTools, runTurn: capture });
+      }
+      console.log(JSON.stringify(prompts));
+    `], {
+      encoding: 'utf8',
+      env: { ...process.env, ELANOUS_STATE_DIR: stateDir, ELANOUS_HARNESS_SPACE: '', ELANOUS_HARNESS_SPACE_ID: '', ELANOUS_RUN_ID: '' },
+    });
+    expect(child.status).toBe(0);
+    const prompts = JSON.parse(child.stdout.trim().split('\n').at(-1)!) as { systemPrompt: string; tools: number }[];
+    expect(prompts).toHaveLength(2);
+    expect(prompts[0]!.tools).toBe(0);
+    expect(prompts[0]!.systemPrompt).toContain('Do not guess repository or real-time facts');
+    expect(prompts[0]!.systemPrompt.indexOf('## Project Layout')).toBeLessThan(prompts[0]!.systemPrompt.indexOf('## Chat without tools'));
+    expect(prompts[1]!.tools).toBeGreaterThan(0);
+    expect(prompts[1]!.systemPrompt).not.toContain('## Chat without tools');
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 describe('buildDashboardTurnPreamble — universal layer integration', () => {
   test('includes the universal preamble first when anchor files exist', async () => {
     writeFileSync(join(tmp, 'AGENTS.md'), '# Anchor sentinel TEST_F_INCLUDED\n');
@@ -318,12 +389,13 @@ describe('buildUniversalPreamble — codex-family addendum (fix L-1) + lifecycle
   test('codex family appends the behavioral discipline addendum after anchor + tree + lifecycle', () => {
     writeFileSync(join(tmp, 'AGENTS.md'), '# Anchor v1\n');
     const msgs = buildUniversalPreamble({ cwd: tmp, modelFamily: 'codex' });
-    // [anchor, project-tree, lifecycle, codex addendum]
-    expect(msgs.length).toBe(4);
+    // [anchor, project-tree, no-tools guidance, lifecycle, codex addendum]
+    expect(msgs.length).toBe(5);
     expect((msgs[0]!.content as string)).toContain('# Anchor v1');
     expect((msgs[1]!.content as string)).toContain('## Project Layout');
-    expect((msgs[2]!.content as string)).toContain('Coding Agent Pipelines');
-    const addendum = msgs[3]!.content as string;
+    expect((msgs[2]!.content as string)).toContain('Chat without tools');
+    expect((msgs[3]!.content as string)).toContain('Coding Agent Pipelines');
+    const addendum = msgs[4]!.content as string;
     expect(addendum).toContain('Codex Behavioral Discipline');
     // Fix L-1 sections:
     expect(addendum).toContain('Avoid Wasted Tokens');
@@ -344,40 +416,43 @@ describe('buildUniversalPreamble — codex-family addendum (fix L-1) + lifecycle
   test('claude family appends the anthropic addendum (Wave 3, 2026-05-04) but not the codex addendum', () => {
     writeFileSync(join(tmp, 'AGENTS.md'), '# Anchor v1\n');
     const msgs = buildUniversalPreamble({ cwd: tmp, modelFamily: 'claude' });
-    // [anchor, project-tree, lifecycle, claude-addendum]
-    expect(msgs.length).toBe(4);
+    // [anchor, project-tree, no-tools guidance, lifecycle, claude-addendum]
+    expect(msgs.length).toBe(5);
     expect((msgs[0]!.content as string)).not.toContain('Codex Behavioral Discipline');
     expect((msgs[1]!.content as string)).toContain('## Project Layout');
-    expect((msgs[2]!.content as string)).toContain('Coding Agent Pipelines');
-    expect((msgs[3]!.content as string)).toContain('Claude Behavioral Discipline');
+    expect((msgs[2]!.content as string)).toContain('Chat without tools');
+    expect((msgs[3]!.content as string)).toContain('Coding Agent Pipelines');
+    expect((msgs[4]!.content as string)).toContain('Claude Behavioral Discipline');
     // Wave 3 — engineering-standards directives (read-first, no gold-
     // plating, faithful reporting, verification) sourced from ref/
     // claude-code-fork getSimpleDoingTasksSection.
-    expect((msgs[3]!.content as string)).toContain('Read Before Proposing Changes');
-    expect((msgs[3]!.content as string)).toContain('Faithful Reporting');
+    expect((msgs[4]!.content as string)).toContain('Read Before Proposing Changes');
+    expect((msgs[4]!.content as string)).toContain('Faithful Reporting');
   });
 
   test('omitted modelFamily defaults to no codex addendum (still gets tree + lifecycle)', () => {
     writeFileSync(join(tmp, 'AGENTS.md'), '# Anchor v1\n');
     const msgs = buildUniversalPreamble({ cwd: tmp });
-    // [anchor, project-tree, lifecycle]
-    expect(msgs.length).toBe(3);
+    // [anchor, project-tree, no-tools guidance, lifecycle]
+    expect(msgs.length).toBe(4);
     expect((msgs[0]!.content as string)).not.toContain('Codex Behavioral Discipline');
     expect((msgs[1]!.content as string)).toContain('## Project Layout');
-    expect((msgs[2]!.content as string)).toContain('Coding Agent Pipelines');
+    expect((msgs[2]!.content as string)).toContain('Chat without tools');
+    expect((msgs[3]!.content as string)).toContain('Coding Agent Pipelines');
   });
 
   test('codex addendum still emits even when no anchor files exist', () => {
-    // Empty cwd — no anchor files. Now emits [lifecycle, codex addendum].
+    // Empty cwd — no anchor files. Emits [no-tools guidance, lifecycle, codex addendum].
     const msgs = buildUniversalPreamble({ cwd: tmp, modelFamily: 'codex' });
-    expect(msgs.length).toBe(2);
-    expect((msgs[0]!.content as string)).toContain('Coding Agent Pipelines');
-    expect((msgs[1]!.content as string)).toContain('Codex Behavioral Discipline');
+    expect(msgs.length).toBe(3);
+    expect((msgs[0]!.content as string)).toContain('Chat without tools');
+    expect((msgs[1]!.content as string)).toContain('Coding Agent Pipelines');
+    expect((msgs[2]!.content as string)).toContain('Codex Behavioral Discipline');
   });
 
   test('lifecycle includes 분석/구현/디버깅 pipelines verbatim (P4)', () => {
     const msgs = buildUniversalPreamble({ cwd: tmp });
-    const lifecycle = msgs[0]!.content as string;
+    const lifecycle = msgs[1]!.content as string;
     expect(lifecycle).toContain('분석');
     expect(lifecycle).toContain('구현');
     expect(lifecycle).toContain('디버깅');
@@ -486,19 +561,21 @@ describe('buildUniversalPreamble — project tree integration (W4-B)', () => {
     // Empty tmp, no AGENTS.md/CLAUDE.md → no anchor, no tree (empty
     // dir → tree returns null)
     const msgs = buildUniversalPreamble({ cwd: tmp });
-    // [lifecycle only] — empty cwd has no tree to emit
-    expect(msgs.length).toBe(1);
-    expect((msgs[0]!.content as string)).toContain('Coding Agent Pipelines');
+    // Empty cwd has no tree to emit.
+    expect(msgs.length).toBe(2);
+    expect((msgs[0]!.content as string)).toContain('Chat without tools');
+    expect((msgs[1]!.content as string)).toContain('Coding Agent Pipelines');
   });
 
   test('emits tree alongside lifecycle when cwd has files (no anchor)', () => {
     writeFileSync(join(tmp, 'README.md'), '# Hello\n');
     const msgs = buildUniversalPreamble({ cwd: tmp });
-    // [tree, lifecycle]
-    expect(msgs.length).toBe(2);
+    // [tree, no-tools guidance, lifecycle]
+    expect(msgs.length).toBe(3);
     expect((msgs[0]!.content as string)).toContain('## Project Layout');
     expect((msgs[0]!.content as string)).toContain('- README.md');
-    expect((msgs[1]!.content as string)).toContain('Coding Agent Pipelines');
+    expect((msgs[1]!.content as string)).toContain('Chat without tools');
+    expect((msgs[2]!.content as string)).toContain('Coding Agent Pipelines');
   });
 });
 

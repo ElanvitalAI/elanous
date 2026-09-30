@@ -25,9 +25,20 @@ export interface SchemaValidationError {
   message: string;
 }
 
+/** A string field renders as a multi-line box when the schema says so (`format: textarea|multiline|markdown`,
+ *  `x-multiline: true`) or when its key/title names a body of text (markdown · 본문 · body · text) —
+ *  a one-line `<input>` silently drops the line breaks of a Markdown body (K3 실물 2026-09-30). */
+function isMultilineString(kind: SchemaFieldType | null, node: Record<string, unknown>, path: string): boolean {
+  if (node.format === 'textarea' || node.format === 'multiline' || node.format === 'markdown' || node['x-multiline'] === true) return true;
+  if (kind !== 'string' || Array.isArray(node.enum) || node.format === 'password' || node.format === 'secret' || node.writeOnly === true) return false;
+  const key = path.split('.').at(-1) ?? '';
+  const title = typeof node.title === 'string' ? node.title : '';
+  return /markdown|body|text/i.test(key) || /markdown|본문/i.test(title);
+}
+
 const MAX_DEPTH = 6;
 const KEYWORDS = new Set([
-  'type', 'title', 'description', 'default', 'enum', 'format', 'writeOnly',
+  'type', 'title', 'description', 'default', 'enum', 'format', 'writeOnly', 'x-multiline',
   'properties', 'required', 'items', 'minLength', 'maxLength', 'pattern',
   'minimum', 'maximum', 'minItems', 'maxItems',
 ]);
@@ -100,7 +111,7 @@ export function flattenSchema(schema: unknown): FlattenedSchema {
         required,
         ...(Object.hasOwn(node, 'default') ? { default: node.default } : {}),
         ...(Array.isArray(node.enum) ? { enum: [...node.enum] } : {}),
-        multiline: node.format === 'textarea' || node.format === 'multiline',
+        multiline: isMultilineString(fieldKind, node, path),
         secret: node.format === 'password' || node.format === 'secret' || node.writeOnly === true,
       });
     }

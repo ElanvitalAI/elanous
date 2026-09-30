@@ -1,0 +1,17 @@
+{
+  "description": "손으로 쓴 개인정보 없는 앞 분류기 예시 — 규칙 미판정 문장",
+  "items": [
+    { "id": "absorb-1", "text": "이 기술 발표에서 핵심 논점이 뭔지 알고 싶어.", "expected": "absorb" },
+    { "id": "absorb-2", "text": "긴 글의 주요 주장만 파악하고 싶어.", "expected": "absorb" },
+    { "id": "absorb-3", "text": "이 자료는 어떤 배경에서 나왔는지 살펴봐.", "expected": "absorb" },
+    { "id": "tasks-1", "text": "문서 제목 확인하고 표 오타 검토한 다음 회의실 예약도 챙겨야 해.", "expected": "tasks" },
+    { "id": "tasks-2", "text": "청구서 확인, 일정 변경, 메일 답장 각각 챙기자.", "expected": "tasks" },
+    { "id": "tasks-3", "text": "오늘은 재고 파악하고 전등 교체 일정도 따로 잡아야겠어.", "expected": "tasks" },
+    { "id": "graph-1", "text": "이 입력부터 결과까지 이어지는 처리 과정을 자동화하고 싶어.", "expected": "graph" },
+    { "id": "graph-2", "text": "데이터가 들어오면 검사 후 분류해서 다음 단계로 넘기는 흐름이 필요해.", "expected": "graph" },
+    { "id": "graph-3", "text": "요청 접수부터 승인과 배포까지 한 흐름으로 묶자.", "expected": "graph" },
+    { "id": "ask-human-1", "text": "이거 어떻게 할까?", "expected": "ask-human" },
+    { "id": "ask-human-2", "text": "지금은 어느 방향이 좋을지 모르겠어.", "expected": "ask-human" },
+    { "id": "ask-human-3", "text": "그건 상황을 보고 결정하자.", "expected": "ask-human" }
+  ]
+}

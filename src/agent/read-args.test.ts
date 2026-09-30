@@ -5,7 +5,7 @@
 // 다 받는지 실제 dispatch 로 확인. 스키마 파괴 없이 backward-compatible.
 
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resolveReadPathArg, READ_PATH_SCHEMA_PROPS } from './read-args.js';
@@ -67,5 +67,8 @@ describe('두 Read 서피스 — file_path/path 모두 수용(실 dispatch)', ()
   });
 
   // 정리
-  test('cleanup', () => { rmSync(dir, { recursive: true, force: true }); expect(true).toBe(true); });
+  test('cleanup', () => {
+    rmSync(dir, { recursive: true, force: true });
+    expect(existsSync(dir)).toBe(false);
+  });
 });

@@ -5,6 +5,8 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { usePwaRole } from '@/lib/pwa-role';
+import { visibleForRole } from '@/lib/route-maturity';
 import { NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, SIDEBAR_NAV_ITEMS, visibleNavGroups } from './sidebar-nav-items';
 import { NAV_PREFS_EVENT, readFlag } from './nav-visibility-prefs';
 import { SidebarWorkflowInvoker } from './SidebarWorkflowInvoker';
@@ -51,14 +53,14 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
   const pathname = usePathname();
   const router = useRouter();
   const current = normalizePath(pathname ?? '/');
-  // Sidebar nav workspace 통합 — kind 가 있는 nav 는 /workspace?intent=<kind>
-  // 로 우회. /workspace 진입 자체 (kind=null) + 명시적 /chat 등 deep link 는
-  // 기존 Link 동작 그대로.
+  const role = usePwaRole();
+  // Workspace intent is only used for roles whose menus include the beta workspace.
+  // General users follow stable direct links; typed addresses keep working for everyone.
   const handleNavClick = (
     item: typeof NAV_ITEMS[number],
     e: React.MouseEvent<HTMLAnchorElement>,
   ): void => {
-    if (item.kind === null) return; // /workspace direct link
+    if (item.kind === null || role === 'general') return; // General users stay on the selected stable destination.
     // Cmd/Ctrl-click → 새 탭에서 single-page route 직접 열림 (browser default).
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     e.preventDefault();
@@ -74,9 +76,9 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
     window.addEventListener('storage', read);
     return () => { window.removeEventListener(NAV_PREFS_EVENT, read); window.removeEventListener('storage', read); };
   }, []);
-  const groups = visibleNavGroups(NAV_ITEMS, prefs);
+  const groups = visibleNavGroups(NAV_ITEMS, prefs, role);
   const renderItem = (item: typeof NAV_ITEMS[number]) => {
-          // Voice ('/') matches only an exact '/'. Other routes match
+    // Voice ('/') matches only an exact '/'. Other routes match
     // exact OR any nested path so that future child routes
     // (e.g. /intake/<id>) keep the parent highlighted.
     const active =
@@ -172,7 +174,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
           export crashes on /workflows, /tasks, etc. with
           "useSearchParams() should be wrapped in a suspense
           boundary". */}
-      {prefs.showLabs && (
+      {prefs.showLabs && visibleForRole(role, '/showroom') && (
         <Suspense fallback={null}>
           <ShowroomSidebarSection compact={compact} onNavigate={onNavigate} />
         </Suspense>
@@ -180,7 +182,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
       {/* BACKLOG #3 — sticky workflow invoker. Hidden in compact rail
           (no horizontal room). Silently absent when NexusClient is
           missing (SSR / dev). */}
-      {prefs.showLabs && <SidebarWorkflowInvoker compact={compact} />}
+      {prefs.showLabs && visibleForRole(role, '/workflows') && <SidebarWorkflowInvoker compact={compact} />}
     </nav>
   );
 }

@@ -141,7 +141,7 @@ export function resolveChannels(
 async function deliverTelegram(cfg: UserConfig, msg: OutboundMsg, deps: RouterDeps): Promise<ChannelResult> {
   const fmt = formatForChannel('telegram', msg);
   const send = deps.telegramSend ?? sendTelegramReport;
-  const ok = await send(cfg, fmt.text, { markdown: fmt.markdown ?? msg.markdown, fetchImpl: deps.fetchImpl });
+  const ok = await send(cfg, fmt.text, { markdown: fmt.markdown ?? msg.markdown, fetchImpl: deps.fetchImpl, kind: msg.kind });
   return ok ? { type: 'telegram', ok: true } : { type: 'telegram', ok: false, error: 'not-configured' };
 }
 

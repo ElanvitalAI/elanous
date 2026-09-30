@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { INTAKE_PROMISE_SOURCES, runIntakeCheck, type IntakeCheckDeps } from '../src/intake-plane/check.js';
+import { runIntakeCheck } from '../src/intake-plane/check.js';
 import { buildIntakeDocumentStageCallables } from '../src/intake-plane/runtime-callables.js';
+import { createIntakeFakeRepo } from './helpers/intake-fake-repo.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -13,17 +13,7 @@ const common = ['sample', 'common', 'name', 'k3'].join('-');
 const specific = ['sample', 'specific', 'name', 'k3'].join('-');
 const absent = ['sample', 'absent', 'name', 'k3'].join('-');
 
-function fixture(): IntakeCheckDeps {
-  const root = mkdtempSync(join(tmpdir(), 'intake-common-'));
-  roots.push(root);
-  for (const dir of ['catalog', 'src', 'docs']) mkdirSync(join(root, dir), { recursive: true });
-  writeFileSync(join(root, 'catalog/resources.yaml'), 'resources: []\n');
-  writeFileSync(join(root, 'catalog/external-commands.yaml'), 'commands: []\n');
-  writeFileSync(join(root, 'src/index.ts'), '');
-  for (const rel of INTAKE_PROMISE_SOURCES) writeFileSync(join(root, rel), '# FAQ\n');
-  return { root, readFile: (path) => readFileSync(path, 'utf8'), commit: () => 'fixture',
-    draftDir: join(root, 'drafts'), log: () => {} };
-}
+const fixture = () => createIntakeFakeRepo(roots, 'intake-common-');
 
 /** Enough comment lines that the implementation byte budget runs out before any executable support. */
 function makeCommon(root: string): void {

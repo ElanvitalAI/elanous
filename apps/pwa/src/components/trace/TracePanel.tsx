@@ -187,7 +187,7 @@ function TracePanelInner() {
             {c.label} ✕
           </button>
         ))}
-        <span className="ml-2 text-muted-foreground">신호 {rows.length} · 런 {model.runs.length} · 우주 {model.universes.length}{logs.truncated ? ' · ⚠ 조회 상한에 닿음' : ''}</span>
+        <span className="ml-2 text-muted-foreground">신호 {rows.length} · 런 {model.runs.length} · 우주 {model.universes.length}{logs.stores.length > 0 ? ` · 저장소 ${logs.stores.length}${logs.registeredStores ? `/${logs.registeredStores}` : ''}${logs.failedStores.length ? ` (${logs.failedStores.length} 못 읽음)` : ''}` : ''}{logs.truncated ? ' · ⚠ 조회 상한에 닿음' : ''}</span>
       </div>
 
       {/* 필터 칩 — 누르면 렌즈에 쌓인다 · 개수 = 그 칩을 누르면 남는 런 */}

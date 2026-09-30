@@ -2,23 +2,14 @@ import { afterEach, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { GAP_VERDICTS, INTAKE_PROMISE_SOURCES, runIntakeCheck, runIntakeCheckDocument, type IntakeCheckDeps } from '../src/intake-plane/check.js';
+import { GAP_VERDICTS, runIntakeCheck, runIntakeCheckDocument } from '../src/intake-plane/check.js';
 import { buildIntakeDocumentStageCallables } from '../src/intake-plane/runtime-callables.js';
+import { createIntakeFakeRepo } from './helpers/intake-fake-repo.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function fixture(): IntakeCheckDeps {
-  const root = mkdtempSync(join(tmpdir(), 'intake-path-'));
-  roots.push(root);
-  for (const dir of ['catalog', 'src', 'docs']) mkdirSync(join(root, dir), { recursive: true });
-  writeFileSync(join(root, 'catalog/resources.yaml'), 'resources: []\n');
-  writeFileSync(join(root, 'catalog/external-commands.yaml'), 'commands: []\n');
-  writeFileSync(join(root, 'src/index.ts'), '');
-  for (const rel of INTAKE_PROMISE_SOURCES) writeFileSync(join(root, rel), '# FAQ\n');
-  return { root, readFile: (path) => readFileSync(path, 'utf8'), commit: () => 'fixture',
-    draftDir: join(root, 'drafts'), log: () => {} };
-}
+const fixture = () => createIntakeFakeRepo(roots, 'intake-path-');
 
 const claim = (name: string) => ({ text: `elanous 에 \`${name}\` 가 있다` });
 

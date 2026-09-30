@@ -282,7 +282,7 @@ export function registerIntakeCommands(program: Command): void {
         const { sendTelegramReport } = await import('../telegram-report.js');
         const { getUserConfig } = await import('../user-config.js');
         const text = renderDigestTelegram(d, { ...(opts.vault ? { vaultRoot: opts.vault } : {}), ...(opts.note ? { notePath: opts.note } : {}) });
-        const sent = await sendTelegramReport(getUserConfig(), text, { markdown: true });
+        const sent = await sendTelegramReport(getUserConfig(), text, { markdown: true, kind: 'intake' });
         debug.log('intake.digest', 'telegram', { day, absorbed: d.absorbed.length, goals: d.goals.length, sent });
         console.log(sent ? `텔레그램 보고 채널로 보냈다 (${day} · 흡수 ${d.absorbed.length} · 골 후보 ${d.goals.length})` : '텔레그램 보고 채널 설정이 없다(telegram.reportChannel) — 보내지 않음');
         if (!sent) process.exitCode = 3;

@@ -1,5 +1,6 @@
 const SELF_IMPL_PREFIX = 'self-impl/';
 const LINEAGE_HASH_SUFFIX = /-[0-9a-f]{7,8}$/i;
+const RUN_SUFFIX = /-r[a-z0-9]{6}$/i;
 /**
  * Formal new-generation segment after `self-impl/`: dash-delimited `-goalid-<id>-`.
  * ⛔ A substring like `mygoalid-foo` is not that segment — it has no leading `-`/`^` boundary.
@@ -9,7 +10,7 @@ const GOAL_ID_SEGMENT = /(?:^|-)goalid-([^/-]+)-/;
 /** Lineage slug of a harness branch: `self-impl/<slug>-<7–8 hex>`, or null when the name is not that shape. */
 export function branchLineageSlug(branch: string): string | null {
   if (!branch.startsWith(SELF_IMPL_PREFIX)) return null;
-  const rest = branch.slice(SELF_IMPL_PREFIX.length);
+  const rest = branch.slice(SELF_IMPL_PREFIX.length).replace(RUN_SUFFIX, '');
   const hash = LINEAGE_HASH_SUFFIX.exec(rest);
   return hash ? rest.slice(0, rest.length - hash[0].length) : rest;
 }

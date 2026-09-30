@@ -58,6 +58,8 @@ elanous nexus run      # start the daemon; the web app is served with it
 elanous nexus show     # prints the web app link (usually http://127.0.0.1:31415/app/)
 ```
 
+Or run `elanous start` — it looks for a model (offering sign-in if it finds none), starts the daemon if needed and opens the web app. Add `--tui` for the terminal UI instead.
+
 On first open it takes you to model setup. See [Web app](pwa.md).
 
 ## Where to look next

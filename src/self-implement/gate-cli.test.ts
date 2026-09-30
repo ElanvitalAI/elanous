@@ -103,7 +103,7 @@ describe('runSelfGateCli', () => {
         "    state: process.env.ELANOUS_STATE_DIR,",
         "    config: process.env.ELANOUS_CONFIG_DIR,",
         "  }));",
-        "  expect(true).toBe(true);",
+        "  expect(Bun.file('env.json').size).toBeGreaterThan(0);",
         "});",
       ].join('\n'),
     });

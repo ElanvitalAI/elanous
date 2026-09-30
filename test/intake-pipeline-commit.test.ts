@@ -63,7 +63,7 @@ async function uniquePort(): Promise<number> {
 }
 
 describe('FU-I7c /v1/intake/pipeline-commit', () => {
-  test('returns 503 when metaApi runtime is unwired', async () => {
+  test('returns 401 when metaApi runtime is unwired', async () => {
     const fix = makeFixture();
     const srv = startNexusHttpServer({
       ...fix,
@@ -76,9 +76,28 @@ describe('FU-I7c /v1/intake/pipeline-commit', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ rawText: 'x' }),
       });
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
       const body = await res.json();
-      expect(body.error).toBe('meta-api-runtime-not-wired');
+      expect(body.error).toBe('unauthorized');
+    } finally { srv.stop(); }
+  });
+
+  test('wired metaApi without bearer denies before body validation', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix,
+      eventBus: fix.bus,
+      startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
@@ -88,12 +107,12 @@ describe('FU-I7c /v1/intake/pipeline-commit', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({}),
       });
       expect(res.status).toBe(400);
@@ -106,12 +125,12 @@ describe('FU-I7c /v1/intake/pipeline-commit', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: 'do thing X' }),
       });
       expect(res.status).toBe(200);
@@ -135,12 +154,12 @@ describe('FU-I7c /v1/intake/pipeline-commit', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({
           rawText: 'do thing X',
           includeTaskKeys: ['m-99/t-99'], // no match → register nothing
@@ -162,12 +181,12 @@ describe('FU-I7c /v1/intake/pipeline-commit', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: 'just a memo' }),
       });
       expect(res.status).toBe(200);
@@ -187,12 +206,12 @@ describe('FU-I7c /v1/intake/pipeline-commit', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({
           rawText: 'try again',
           refinementHint: 'missions 더 작게',
@@ -212,18 +231,18 @@ describe('FU-I7c /v1/intake/pipeline-commit', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const first = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: 'same memo' }),
       });
       const firstBody = await first.json();
       const second = await fetch(`${srv.url}/v1/intake/pipeline-commit`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', authorization: 'Bearer test-token' },
         body: JSON.stringify({ rawText: 'same memo' }),
       });
       const secondBody = await second.json();

@@ -52,8 +52,15 @@ async function uniquePort(): Promise<number> {
   return 54000 + Math.floor(Math.random() * 2000);
 }
 
+function authorizedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(url, {
+    ...init,
+    headers: { ...init.headers, authorization: 'Bearer test-token' },
+  });
+}
+
 describe('M4-6 workflow lifecycle endpoint', () => {
-  test('GET returns 503 when metaApi unwired', async () => {
+  test('GET returns 401 when metaApi unwired, before reaching the route', async () => {
     const fix = makeFixture();
     const srv = startNexusHttpServer({
       ...fix,
@@ -62,7 +69,23 @@ describe('M4-6 workflow lifecycle endpoint', () => {
     });
     try {
       const res = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`);
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
+    } finally { srv.stop(); }
+  });
+
+  test('GET returns 401 without bearer even when metaApi is wired', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix,
+      eventBus: fix.bus,
+      startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
@@ -72,10 +95,10 @@ describe('M4-6 workflow lifecycle endpoint', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`);
+      const res = await authorizedFetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.workflow).toBe('quick-summary');
@@ -89,10 +112,10 @@ describe('M4-6 workflow lifecycle endpoint', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const put = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
+      const put = await authorizedFetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'draft' }),
@@ -101,7 +124,7 @@ describe('M4-6 workflow lifecycle endpoint', () => {
       const putBody = await put.json();
       expect(putBody.ok).toBe(true);
       expect(putBody.status).toBe('draft');
-      const get = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`);
+      const get = await authorizedFetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`);
       const getBody = await get.json();
       expect(getBody.status).toBe('draft');
     } finally { srv.stop(); }
@@ -113,10 +136,10 @@ describe('M4-6 workflow lifecycle endpoint', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
+      const res = await authorizedFetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'archived' }),
@@ -131,10 +154,10 @@ describe('M4-6 workflow lifecycle endpoint', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
+      const res = await authorizedFetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: 'not json',
@@ -149,10 +172,10 @@ describe('M4-6 workflow lifecycle endpoint', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/workflows/does-not-exist/lifecycle`, {
+      const res = await authorizedFetch(`${srv.url}/v1/workflows/does-not-exist/lifecycle`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'draft' }),
@@ -170,15 +193,15 @@ describe('M4-6 workflow lifecycle endpoint', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
+      await authorizedFetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'draft' }),
       });
-      const res = await fetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
+      const res = await authorizedFetch(`${srv.url}/v1/workflows/quick-summary/lifecycle`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'active' }),

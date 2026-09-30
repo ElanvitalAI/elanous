@@ -197,6 +197,57 @@ describe('/v1/acp upgrade auth', () => {
     await conns[0]!.close();
   });
 
+  // 0.2.5 회귀(2026-09-30): 토큰을 저장하지 않은 PWA 가 이 데몬이 내준 페이지에서 연 ACP 소켓 — HTTP 와 같은 same-origin 면제.
+  function sameOriginAcpRequest(extra?: Record<string, string>): Request {
+    const headers = new Headers({
+      upgrade: 'websocket', connection: 'Upgrade',
+      host: '127.0.0.1:31415', origin: 'http://127.0.0.1:31415', 'sec-fetch-site': 'same-origin',
+      ...extra,
+    });
+    return new Request(`http://127.0.0.1:31415${WS_ACP_PATH}`, { headers });
+  }
+  function serverWithPeer(address: string | null) {
+    const server = makeServer();
+    return Object.assign(server, { requestIP: () => (address ? { address } : null) });
+  }
+
+  test('same-origin PWA socket from loopback is authed without a token (0.2.5 PWA regression)', async () => {
+    const conns: AcpTransportConnection[] = [];
+    const bridge = createWsBridge({
+      hostname: '127.0.0.1', port: 31415, wsAuthVerifier: makeVerifier(),
+      acpOnConnection: (c) => { conns.push(c); }, trace: () => {},
+    });
+    const server = serverWithPeer('127.0.0.1');
+    expect(bridge.tryUpgrade(sameOriginAcpRequest(), server)).toBeUndefined();
+    const ws = socketFromUpgrade(server);
+    bridge.websocket.open?.(ws);
+    bridge.websocket.message?.(ws, '{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+    expect(ws.closed).toBeNull();
+    expect(await readAcpChunk(conns[0]!)).toContain('initialize');
+    await conns[0]!.close();
+  });
+
+  test('same-origin exemption does not open for proxied, remote, cross-site or unknown peers', () => {
+    const cases: Array<[string, Request, string | null]> = [
+      ['tailscale serve proxy', sameOriginAcpRequest({ 'x-forwarded-for': '100.1.2.3' }), '127.0.0.1'],
+      ['remote peer', sameOriginAcpRequest(), '100.81.37.51'],
+      ['cross-site page', sameOriginAcpRequest({ 'sec-fetch-site': 'cross-site', origin: 'https://evil.example' }), '127.0.0.1'],
+      ['unknown peer', sameOriginAcpRequest(), null],
+    ];
+    for (const [label, req, peer] of cases) {
+      const bridge = createWsBridge({
+        hostname: '127.0.0.1', port: 31415, wsAuthVerifier: makeVerifier(),
+        acpOnConnection: () => {}, trace: () => {},
+      });
+      const server = serverWithPeer(peer);
+      bridge.tryUpgrade(req, server);
+      const ws = socketFromUpgrade(server);
+      bridge.websocket.open?.(ws);
+      bridge.websocket.message?.(ws, '{"jsonrpc":"2.0","id":1,"method":"initialize"}');
+      expect({ label, code: ws.closed?.code }).toEqual({ label, code: 1008 });
+    }
+  });
+
   test('tokenless first-message auth: {"kind":"auth","token"} → {"ok":true} then ACP', async () => {
     const conns: AcpTransportConnection[] = [];
     const bridge = createWsBridge({

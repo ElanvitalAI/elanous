@@ -1,5 +1,9 @@
 import { describe, it, expect, spyOn } from 'bun:test';
-import { makePrManager, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, type CmdRunner, type CmdResult } from './pr-manager.js';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { POD_GITHUB_CREDENTIAL_TOKEN_ENV, POD_GITHUB_CREDENTIAL_URL_ENV } from '../nexus/api/pod-credential-api.js';
+import { ghAutomationEnv, defaultCmdRunner, makePrManager, extractPrNumber, resolveDeliverableBase, prBaseFromComparison, collectLandedCommitsOnBase, landingHistoryGitLogArgs, type CmdRunner, type CmdResult } from './pr-manager.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
 import { debug } from '../debug/log.js';
 
@@ -988,4 +992,101 @@ describe('makePrManager.closePr / mergePr', () => {
   it('PR URL 아니면 false', () => {
     expect(makePrManager(stubRunner().run).closePr('bad')).toBe(false);
   });
+});
+
+describe('defaultCmdRunner — Pod GitHub credential relay', () => {
+  it('refreshes before gh, caches until within ten minutes of expiry, and leaves other commands alone', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-manager-relay-'));
+    const saved = {
+      path: process.env.PATH,
+      gh: process.env.GH_TOKEN,
+      url: process.env[POD_GITHUB_CREDENTIAL_URL_ENV],
+      bearer: process.env[POD_GITHUB_CREDENTIAL_TOKEN_ENV],
+    };
+    const now = Date.now();
+    let clock = now;
+    const time = spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      writeFileSync(join(dir, 'gh'), '#!/bin/sh\nprintf "%s" "$GH_TOKEN"\n');
+      writeFileSync(join(dir, 'curl'), `#!/bin/sh\ncat > ${JSON.stringify(join(dir, 'authorization'))}\nprintf '%s\\n' "$*" >> ${JSON.stringify(join(dir, 'requests'))}\ncat ${JSON.stringify(join(dir, 'response'))}\n`);
+      chmodSync(join(dir, 'gh'), 0o755);
+      chmodSync(join(dir, 'curl'), 0o755);
+      process.env.PATH = `${dir}:${saved.path ?? ''}`;
+      process.env.GH_TOKEN = 'original-token';
+      process.env[POD_GITHUB_CREDENTIAL_URL_ENV] = 'http://relay.local/v1/pod/credential/github';
+      process.env[POD_GITHUB_CREDENTIAL_TOKEN_ENV] = 'run-bearer';
+      writeFileSync(join(dir, 'response'), JSON.stringify({ token: 'new-token', expires_at: new Date(now + 3_600_000).toISOString() }));
+      expect(defaultCmdRunner('gh', ['auth', 'status'])).toMatchObject({ ok: true, out: 'new-token' });
+      writeFileSync(join(dir, 'response'), JSON.stringify({ token: 'renewed-token', expires_at: new Date(now + 7_200_000).toISOString() }));
+      expect(defaultCmdRunner('gh', ['pr', 'list'])).toMatchObject({ ok: true, out: 'new-token' });
+      expect(readFileSync(join(dir, 'requests'), 'utf8').trim().split('\n')).toHaveLength(1);
+      expect(readFileSync(join(dir, 'requests'), 'utf8')).toContain('--request POST --header @- http://relay.local/v1/pod/credential/github');
+      expect(readFileSync(join(dir, 'authorization'), 'utf8')).toBe('Authorization: Bearer run-bearer\n');
+      expect(readFileSync(join(dir, 'requests'), 'utf8')).not.toContain('run-bearer');
+      clock = now + 3_000_000; // exactly ten minutes remain
+      expect(defaultCmdRunner('gh', ['pr', 'view'])).toMatchObject({ ok: true, out: 'renewed-token' });
+      expect(defaultCmdRunner('gh', ['pr', 'list'])).toMatchObject({ ok: true, out: 'renewed-token' });
+      expect(readFileSync(join(dir, 'requests'), 'utf8').trim().split('\n')).toHaveLength(2);
+      expect(defaultCmdRunner(process.execPath, ['-e', 'process.stdout.write(process.env.GH_TOKEN)'])).toMatchObject({ ok: true, out: 'original-token' });
+    } finally {
+      time.mockRestore();
+      for (const [key, value] of [
+        ['PATH', saved.path], ['GH_TOKEN', saved.gh],
+        [POD_GITHUB_CREDENTIAL_URL_ENV, saved.url], [POD_GITHUB_CREDENTIAL_TOKEN_ENV, saved.bearer],
+      ] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('logs a redacted gh-token refresh failure and retains the caller token', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pr-manager-relay-failed-'));
+    const saved = {
+      path: process.env.PATH, gh: process.env.GH_TOKEN,
+      url: process.env[POD_GITHUB_CREDENTIAL_URL_ENV], bearer: process.env[POD_GITHUB_CREDENTIAL_TOKEN_ENV],
+    };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      writeFileSync(join(dir, 'gh'), '#!/bin/sh\nprintf "%s" "$GH_TOKEN"\n');
+      writeFileSync(join(dir, 'curl'), '#!/bin/sh\nprintf "%s" "secret-error" >&2\nexit 22\n');
+      chmodSync(join(dir, 'gh'), 0o755);
+      chmodSync(join(dir, 'curl'), 0o755);
+      process.env.PATH = `${dir}:${saved.path ?? ''}`;
+      process.env.GH_TOKEN = 'original-token';
+      process.env[POD_GITHUB_CREDENTIAL_URL_ENV] = 'http://relay.local/v1/pod/credential/github';
+      process.env[POD_GITHUB_CREDENTIAL_TOKEN_ENV] = 'run-bearer-failed';
+      expect(defaultCmdRunner('gh', ['pr', 'list'])).toMatchObject({ ok: true, out: 'original-token' });
+      expect(log).toHaveBeenCalledWith('pr-manager', 'gh-token', { reason: 'refresh-failed' }, { level: 'warn' });
+      expect(JSON.stringify(log.mock.calls)).not.toContain('run-bearer-failed');
+      expect(JSON.stringify(log.mock.calls)).not.toContain('secret-error');
+      delete process.env[POD_GITHUB_CREDENTIAL_URL_ENV];
+      expect(defaultCmdRunner('gh', ['pr', 'list'])).toMatchObject({ ok: true, out: 'original-token' });
+      expect(log.mock.calls.filter(([, event]) => event === 'gh-token')).toHaveLength(1);
+    } finally {
+      log.mockRestore();
+      for (const [key, value] of [
+        ['PATH', saved.path], ['GH_TOKEN', saved.gh],
+        [POD_GITHUB_CREDENTIAL_URL_ENV, saved.url], [POD_GITHUB_CREDENTIAL_TOKEN_ENV, saved.bearer],
+      ] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('defaultCmdRunner — bun ≥1.4 1MB maxBuffer', () => {
+  it('reads a 2MB stdout whole instead of silently truncating it', () => {
+    const r = defaultCmdRunner(process.execPath, ['-e', "process.stdout.write('x'.repeat(2_000_000))"]);
+    expect(r.ok).toBe(true);
+    expect(r.out.length).toBe(2_000_000);
+  });
+});
+
+it('ghAutomationEnv: App token when the caller set no GH_TOKEN · a caller GH_TOKEN wins · no App keeps the env', () => {
+  const env = { PATH: '/bin' } as NodeJS.ProcessEnv;
+  expect(ghAutomationEnv(env, () => 'ghs_app').GH_TOKEN).toBe('ghs_app');
+  expect(ghAutomationEnv({ ...env, GH_TOKEN: 'caller' }, () => 'ghs_app').GH_TOKEN).toBe('caller');
+  expect(ghAutomationEnv(env, () => null)).toBe(env);
 });

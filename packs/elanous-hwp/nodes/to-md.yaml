@@ -1,0 +1,15 @@
+kind: to-md
+graph: workflow
+title: HWP/HWPX → Markdown
+description: 한국 업무 문서에서 제목·문단·표를 읽는다
+inputs:
+  type: object
+  required: [path]
+  properties:
+    path: { type: string, title: 입력 HWP/HWPX 경로 }
+outputs:
+  type: object
+  properties:
+    markdown: { type: string }
+run:
+  skill: { name: hwp-read, prompt: "{{inputs.path}}" }

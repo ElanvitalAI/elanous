@@ -739,6 +739,7 @@ type WorkflowNodeData = {
   raw: {
     id: string;
     variant: NodeVariant;
+    badge: string;
     preview: string;
     hasWhen: boolean;
     triggerRule?: string;
@@ -834,7 +835,7 @@ function CompactNodeCard({
           color: 'white',
         }}
       >
-        {raw.variant}
+        {raw.badge}
       </span>
       <span style={{ fontSize: 11, fontWeight: 500 }}>{raw.id}</span>
       {tone && (
@@ -865,6 +866,7 @@ function renderNodeCard(
   n: {
     id: string;
     variant: NodeVariant;
+    badge: string;
     preview: string;
     hasWhen: boolean;
     triggerRule?: string;
@@ -903,7 +905,7 @@ function renderNodeCard(
             color: 'white',
           }}
         >
-          {n.variant}
+          {n.badge}
         </span>
         <span style={{ fontWeight: 500, fontSize: 11 }}>{n.id}</span>
         {tone && (

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mintGroundingToken, revokeGroundingRun, verifyGroundingToken } from './token.js';
+import { GROUNDING_TOKEN_SCOPES, mintGroundingToken, revokeGroundingRun, verifyGroundingToken } from './token.js';
 
 describe('grounding token — Pod asks the host for citations, never reads the host universe', () => {
   const key = async () => 'k-test';
@@ -37,6 +37,32 @@ describe('grounding token — Pod asks the host for citations, never reads the h
     revokeGroundingRun('run-a', d);
     expect((await verifyGroundingToken(a.token, d)).ok).toBe(false);
     expect((await verifyGroundingToken(b.token, d)).ok).toBe(true);
+  });
+
+  test('gh-credential uses the same signed run claims, but neither other scope can cross its gate', async () => {
+    const d = deps();
+    expect(GROUNDING_TOKEN_SCOPES).toContain('gh-credential');
+    const claims = { runId: 'run-gh', job: 'si-gh', ttlMs: 60_000 };
+    const gh = await mintGroundingToken({ ...claims, scope: 'gh-credential' }, d);
+    const ground = await mintGroundingToken(claims, d);
+    const llm = await mintGroundingToken({ ...claims, scope: 'llm-credential' }, d);
+
+    expect(gh.exp).toBe(61_000);
+    expect(await verifyGroundingToken(gh.token, { ...d, expectedScope: 'gh-credential' })).toEqual({
+      ok: true, runId: 'run-gh', job: 'si-gh', scope: 'gh-credential', exp: 61_000,
+    });
+    expect(await verifyGroundingToken(gh.token, d)).toEqual({ ok: false, reason: 'scope' });
+    expect(await verifyGroundingToken(gh.token, { ...d, expectedScope: 'llm-credential' })).toEqual({ ok: false, reason: 'scope' });
+    expect(await verifyGroundingToken(ground.token, { ...d, expectedScope: 'gh-credential' })).toEqual({ ok: false, reason: 'scope' });
+    expect(await verifyGroundingToken(llm.token, { ...d, expectedScope: 'gh-credential' })).toEqual({ ok: false, reason: 'scope' });
+  });
+
+  test('gh-credential rejects an expired or revoked run through the shared verifier', async () => {
+    const d = deps();
+    const { token } = await mintGroundingToken({ runId: 'run-gh', job: 'si-gh', ttlMs: 60_000, scope: 'gh-credential' }, d);
+    expect(await verifyGroundingToken(token, { ...d, expectedScope: 'gh-credential', now: () => 61_000 })).toEqual({ ok: false, reason: 'expired' });
+    revokeGroundingRun('run-gh', d);
+    expect(await verifyGroundingToken(token, { ...d, expectedScope: 'gh-credential' })).toEqual({ ok: false, reason: 'revoked' });
   });
 
   test('llm-credential shares the same sign/verify/revoke path and scopes do not cross', async () => {

@@ -16,6 +16,12 @@ export interface LogLineEntry {
   ts: number;
 }
 
+export function appendLogLine(lines: LogLineEntry[], entry: LogLineEntry, maxLines: number): LogLineEntry[] {
+  const next = [...lines, entry];
+  if (next.length > maxLines) next.splice(0, next.length - maxLines);
+  return next;
+}
+
 export interface UseTabLogsStreamOpts {
   /** Max lines to keep in memory. Default 1000. */
   maxLines?: number;
@@ -62,10 +68,7 @@ export function useTabLogsStream(id: string, opts: UseTabLogsStreamOpts = {}): U
       onLine: ({ stream, line }) => {
         seqRef.current += 1;
         const entry: LogLineEntry = { seq: seqRef.current, stream, line, ts: Date.now() };
-        bufferRef.current.push(entry);
-        if (bufferRef.current.length > maxLines) {
-          bufferRef.current.splice(0, bufferRef.current.length - maxLines);
-        }
+        bufferRef.current = appendLogLine(bufferRef.current, entry, maxLines);
         if (!pausedRef.current) flush();
       },
       onError: () => setConnected(false),

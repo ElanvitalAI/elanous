@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +14,7 @@ import {
 } from './pod-command-job.js';
 import type { Kubectl } from './self-implement-pod.js';
 import { PodPoolScheduler, type PodPoolMember } from './pod-pool.js';
+import { podSourceScript } from './pod-source-receive.js';
 
 const base = {
   name: 'cmd-1',
@@ -28,6 +30,25 @@ function manifest(over: Partial<Parameters<typeof podCommandJobManifest>[0]> = {
 }
 
 describe('pod command job manifest', () => {
+  test('memoryLimit raises only the container memory limit; omitted keeps 16Gi and the pre-change bytes', () => {
+    const original = manifest({ clone: true });
+    const raised = manifest({ clone: true, memoryLimit: '32Gi' });
+    const limits = (m: ReturnType<typeof manifest>) => (m.spec as { template: { spec: { containers: Array<{ resources: { limits: { memory: string } } }> } } }).template.spec.containers[0]!.resources.limits;
+    expect(limits(original).memory).toBe('16Gi');
+    expect(limits(raised).memory).toBe('32Gi');
+    expect(JSON.stringify(manifest({ clone: true, memoryLimit: undefined }))).toBe(JSON.stringify(original));
+  });
+
+  test('hostMirror mounts a read-only Directory; omitted mirror preserves the pre-change manifest bytes', () => {
+    const original = manifest({ clone: true });
+    const withMirror = manifest({ clone: true, hostMirror: '/mirror-host/elanous-agent.git' });
+    const spec = (withMirror.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }> } } }).template.spec;
+    expect(spec.volumes).toContainEqual({ name: 'host-mirror', hostPath: { path: '/mirror-host/elanous-agent.git', type: 'Directory' } });
+    expect(spec.containers[0]!.volumeMounts).toContainEqual({ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true });
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('a64741991413fe657333bb998fd76621272b1c15fd6422caeb4f006c84f1e4f0');
+    expect(JSON.stringify(manifest({ clone: true, hostMirror: undefined }))).toBe(JSON.stringify(original));
+  });
+
   test('skills·llm 이 없으면 Secret 자격 키가 0개다', () => {
     const job = manifest();
     const script = podCommandScript(job);
@@ -62,6 +83,18 @@ describe('pod command job manifest', () => {
     expect(spec.template.spec.volumes).toBeDefined();
     const secret = commandJobSecret({ name: base.name, namespace: base.namespace, skills: [], skillEnvText: {}, ghToken: 'tok' });
     expect(podCommandSecretKeys(secret)).toEqual(['gh-token']);
+  });
+
+  // SHA-256 of the JSON manifest produced by the pre-change HEAD pod-command-job.ts with base + clone: true.
+  test('commit source checks out the requested SHA; omitted source retains the default manifest bytes', () => {
+    const source = { kind: 'commit' as const, sha: 'a'.repeat(40) };
+    const original = 'a64741991413fe657333bb998fd76621272b1c15fd6422caeb4f006c84f1e4f0';
+    const script = podCommandScript(manifest({ clone: true, source }));
+    expect(script).toContain(podSourceScript(source, base.repoUrl));
+    expect(script).toContain(`git checkout --detach ${source.sha}`);
+    expect(createHash('sha256').update(JSON.stringify(manifest({ clone: true, source: { kind: 'default' } }))).digest('hex')).toBe(original);
+    expect(createHash('sha256').update(JSON.stringify(manifest({ clone: true }))).digest('hex')).toBe(original);
+    expect(JSON.stringify(manifest({ source }))).toBe(JSON.stringify(manifest()));
   });
 
   test("skills: ['yt-vault'] 는 skillenv-yt-vault 하나뿐이다", () => {
@@ -118,6 +151,60 @@ describe('pod command job manifest', () => {
 });
 
 describe('runPodCommand', () => {
+  test('clone command passes the commit source through to the Job script', async () => {
+    const inputs: string[] = [];
+    const source = { kind: 'commit' as const, sha: 'a'.repeat(40) };
+    await runPodCommand({ command: ['true'], clone: true, source, ghToken: () => 'test-token',
+      kubectl: (args, input) => {
+        if (input) inputs.push(input);
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, imageCommit: null, name: 'commit-source', artifactsRoot: '/tmp/pod-command-commit-test',
+    });
+    const job = inputs.map((body) => JSON.parse(body) as { kind: string }).find((item) => item.kind === 'Job');
+    expect(job).toBeDefined();
+    expect(podCommandScript(job!)).toContain(podSourceScript(source, 'https://github.com/ElanvitalAI/elanous'));
+  });
+
+  test('runPodCommand selects hostMirror by option > env > config and permits explicit opt-out', async () => {
+    const applied: Array<Record<string, unknown>> = [];
+    const run = async (hostMirror: string | undefined, env: NodeJS.ProcessEnv) => {
+      await runPodCommand({ command: ['true'], clone: true, ghToken: () => 'token', hostMirror, env,
+        configHostMirror: () => '/config/mirror.git',
+        kubectl: (args, input) => {
+          if (input) {
+            const body = JSON.parse(input) as Record<string, unknown>;
+            if (body.kind === 'Job') applied.push(body);
+          }
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        }, imageCommit: null, name: `mirror-${applied.length}`, artifactsRoot: '/tmp/pod-command-mirror-test',
+      });
+      const job = applied.at(-1)! as { spec: { template: { spec: { volumes: Array<{ hostPath?: { path: string } }> } } } };
+      return job.spec.template.spec.volumes.find((volume) => volume.hostPath)?.hostPath?.path;
+    };
+    expect(await run(undefined, {})).toBe('/config/mirror.git');
+    expect(await run(undefined, { ELANOUS_POD_HOST_MIRROR: '/env/mirror.git' })).toBe('/env/mirror.git');
+    expect(await run('/option/mirror.git', { ELANOUS_POD_HOST_MIRROR: '/env/mirror.git' })).toBe('/option/mirror.git');
+    expect(await run(' ', { ELANOUS_POD_HOST_MIRROR: '/env/mirror.git' })).toBeUndefined();
+    await expect(run('relative/mirror', {})).rejects.toThrow('absolute directory path');
+  });
+
+  test('clone-free Job mounts a configured host mirror when an environment mirror is set', async () => {
+    const inputs: string[] = [];
+    await runPodCommand({ command: ['true'], env: { ELANOUS_POD_HOST_MIRROR: '/srv/mirror' },
+      kubectl: (args, input) => {
+        if (input) inputs.push(input);
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, imageCommit: null, name: 'no-mirror', artifactsRoot: '/tmp/pod-command-no-mirror-test',
+    });
+    const job = inputs.map((body) => JSON.parse(body) as { kind: string; spec?: { template: { spec: { volumes?: unknown; containers: Array<{ volumeMounts?: unknown }> } } } }).find((item) => item.kind === 'Job');
+    expect(job).toBeDefined();
+    expect(job!.spec!.template.spec.volumes).toEqual([{ name: 'host-mirror', hostPath: { path: '/srv/mirror', type: 'Directory' } }]);
+    expect(job!.spec!.template.spec.containers[0]!.volumeMounts).toEqual([{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }]);
+  });
+
   test('풀 자리를 잡고 Job 을 적용한 뒤 산출을 회수하고 Secret 을 한 번 지운다', async () => {
     const calls: string[][] = [];
     const inputs: string[] = [];
@@ -162,6 +249,7 @@ describe('runPodCommand', () => {
     expect(String(finished?.command).length).toBeLessThanOrEqual(80);
     expect(inputs.some((body) => body.includes('skillenv-yt-vault') && body.includes('"kind":"Secret"'))).toBe(true);
     expect(inputs.some((body) => body.includes('"kind":"Job"') && body.includes('\\"$@\\"'))).toBe(true);
+    expect(inputs.filter((body) => body.includes('"kind":"Job"')).every((body) => !body.includes('host-mirror'))).toBe(true);
   });
 });
 

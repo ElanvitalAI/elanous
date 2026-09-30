@@ -70,3 +70,8 @@ if (inheritedHarnessRun || !process.env.ELANOUS_STATE_DIR?.trim()) {
     try { rmSync(isolated, { recursive: true, force: true }); } catch { /* fail-soft */ }
   });
 }
+
+// 실행 루프 관문(dispatchTask · #21964) — `runDevPipeline` 의 기본 관문은 예산·기억 조회를 실제로 돌려
+// 한 번에 수 초가 걸린다. 파이프라인 시험 수십 개가 5초 제한에 걸렸다(09-29 · main 에서 7건 · #22005 에서 20건).
+// 관문을 재는 시험은 dispatchTask 나 dispatchTaskDeps 를 주입하므로 이 값과 무관하게 돈다. 미설정일 때만.
+process.env.ELANOUS_EXECUTION_LOOP_DISPATCH ??= 'off';

@@ -42,6 +42,7 @@ fi
 | `exec-standard.yaml` | *"이 파이프라인을 «정기적으로» 어떻게 도나"* | `delivered` · `skipped` · `failed` · `unobserved` |
 | 🆕 `film-production-standard.yaml` | *"편집 앱을 스크립트로 몰아 한 편을 만들고 소셜까지 어떻게 내나"* | `delivered` · `master-only` · `host-blocked` · `blocked` · `unobserved` |
 | 🆕 `character-video-standard.yaml` | *"레퍼런스에서 캐릭터를 세우고, 연출된 컷을 뽑고, 편집까지 어떻게 한 루프로 도나"* | `delivered` · `rendered-unedited` · `blocked` · `unobserved` |
+| 🆕 `explainer-line.yaml` | *"사실 목록으로 «N가지 한 번에» 설명 영상을 어떻게 만들어 검사까지 가나"* (스킬 `explainer-video` · 팩 `video-explainer`) | `delivered` · `needs-human` · `blocked` · `unobserved` |
 | `overlays/render-patient.yaml` | 「같은 회차에서 N번 되돌아왔다」면 예산을 올린다 | — |
 | 🆕 `vlog-found-footage-pipeline.declaration.yaml` | *"남이 찍어 보낸 소재에서 «이야기»를 어떻게 뽑아 납품까지 가나"* | `delivered` · `needs-human` · `blocked` · `unobserved` |
 | 🆕 `video-production-pipeline.declaration.yaml` | *"영상 한 편을 «어느 갈래든» 어떻게 만들어 납품까지 가나"* | `delivered` · `needs-human` · `blocked` · `unobserved` |

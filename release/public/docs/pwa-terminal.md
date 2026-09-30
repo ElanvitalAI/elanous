@@ -22,6 +22,11 @@ as it appears on screen, with the meaning in brackets.
     terminal UI running in another window on the daemon's machine.
   - **PTY 목록** (PTY list) — every terminal the daemon knows about, with its
     history.
+- **▦ 나란히** (side by side) shows up to three live terminals next to each
+  other — agent terminals first. Each pane names its agent and has a strip
+  with what elanous just did there and why. Pick the panes from the chips at
+  the top; the address keeps your choice (`?wall=<id>,<id>`), so you can share
+  the view.
 
 The connection status (`ACP: 연결됨` — connected) is shown in the corner of
 the terminal. From 0.2.2, keys you type while it still says `연결 중`

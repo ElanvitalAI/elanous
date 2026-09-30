@@ -20,9 +20,13 @@ export function publicNotes(markdown: string, pages: { pages: Array<{ id: string
 export function runPublish(run: CommandRunner = runCommand) {
   const context = readGraphContext();
   const version = context.input.version;
-  // ⛔ 승인 노드가 «approved» 를 남기지 않았으면 발행하지 않는다(그래프 밖에서 부르거나 간선이 바뀌어도).
-  if (context.outputs['approve-publish']?.outcome !== 'approved') {
-    return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: approve-publish is not approved' };
+  // A measured automatic decision or the existing human approval must authorize publication.
+  const auto = context.outputs['auto-approve'];
+  if (context.outputs['approve-publish']?.outcome !== 'approved' &&
+    !(auto?.outcome === 'ok' && auto.decidedBy === 'release-loop metrics'
+      && Array.isArray(auto.metrics) && auto.metrics.length === 8
+      && auto.metrics.every((metric: unknown) => metric && typeof metric === 'object' && 'verdict' in metric && metric.verdict === 'pass'))) {
+    return { outcome: 'fail' as const, verdict: 'fail' as const, summary: 'publish blocked: neither auto-approve nor approve-publish approved' };
   }
   for (const node of ['gate', 'pwa', 'upgrade', 'tui', 'prepare', 'docs']) {
     if (context.outputs[node]?.outcome !== 'ok') return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `publish blocked: ${node} outcome is not ok` };

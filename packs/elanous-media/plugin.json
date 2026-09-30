@@ -1,0 +1,16 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "elanous-media",
+  "version": "0.1.0",
+  "description": "Official elanous media skills: build videos and author word-timed motion B-roll.",
+  "extensions": {
+    "ai.elanous": {
+      "bundle": ["skills/video-builder", "skills/motion-broll"],
+      "capabilities": ["fs:workdir", "proc:node", "proc:python3", "proc:ffmpeg"],
+      "connectors": [],
+      "pricing": { "model": "free" },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

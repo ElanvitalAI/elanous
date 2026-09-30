@@ -60,7 +60,7 @@ import { pwaReachableSrcFiles } from './pwa-import-graph.js';
 import { stageNonGitDir, stageFile, applyShadowToTarget, applyFileToTarget } from './shadow-stage.js';
 import type { TargetKind } from './target-kind.js';
 import { basename } from 'node:path';
-import { makePrManager, type PrManager } from '../autopilot/pr-manager.js';
+import { ghAutomationEnv, makePrManager, type PrManager } from '../autopilot/pr-manager.js';
 import { defaultSpawnGh, lookupOpenDraftPrs } from '../cli/logs-abandoned-draft-prs.js';
 import { loadRunLedger, runLedgerDir } from './run-ledger.js';
 import { readdirSync } from 'node:fs';
@@ -2347,8 +2347,10 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     closePr: (prUrl, comment) => (o.prManager ?? makePrManager()).closePr(prUrl, comment),
 
     postPrComment: async ({ number, body, cwd }) => {
+      // Round comments go out as the GitHub App like the PR itself — a personal `gh` login made the owner a
+      // participant and mailed them on merge (#22089).
       await execFileAsync('gh', ['pr', 'comment', String(number), '--body', body], {
-        cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024,
+        cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env),
       });
     },
 

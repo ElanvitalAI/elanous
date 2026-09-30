@@ -1,0 +1,16 @@
+kind: from-md
+graph: workflow
+title: Markdown → HWPX
+description: 표준 양식을 사용해 HWPX 문서를 만든다
+inputs:
+  type: object
+  required: [markdown, template]
+  properties:
+    markdown: { type: string, title: Markdown 본문, x-multiline: true }
+    template: { type: string, title: 양식, enum: [report, official-letter] }
+outputs:
+  type: object
+  properties:
+    output: { type: string }
+run:
+  skill: { name: hwp-write, prompt: "template={{inputs.template}}\n{{inputs.markdown}}" }

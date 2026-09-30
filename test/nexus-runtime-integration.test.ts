@@ -13,7 +13,7 @@
 // no real ACP runtime spawn).
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,6 +21,9 @@ import { runNexus, type RunNexusHandle } from '../src/nexus/index.js';
 import { setIntakeStoreForTest } from '../src/intake-plane/runtime.js';
 import { createIntakeStore } from '../src/intake-plane/store.js';
 import { createStubPwaVoiceAdapter } from '../src/voice/channel-adapters/pwa-voice-adapter.js';
+import { getElanousConfigDir, setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+
+const bearerToken = 'nexus-runtime-integration-test-token';
 
 let tmpRoot: string;
 let prevNexusDir: string | undefined;
@@ -33,6 +36,8 @@ beforeEach(() => {
   prevNexusDir = process.env.ELANOUS_NEXUS_DIR;
   prevHome = process.env.HOME;
   process.env.ELANOUS_NEXUS_DIR = tmpRoot;
+  setElanousConfigDir(tmpRoot);
+  writeFileSync(join(getElanousConfigDir(), 'acp-token'), bearerToken, { mode: 0o600 });
   // Override HOME so the acp-token loader + intake archive default
   // never touch the developer's real ~/.elanous. Intake archive uses
   // os.homedir() at module-load; we additionally swap the singleton
@@ -57,12 +62,19 @@ afterEach(async () => {
   else process.env.HOME = prevHome;
   if (prevVault === undefined) delete process.env.ELANOUS_OBSIDIAN_VAULT;
   else process.env.ELANOUS_OBSIDIAN_VAULT = prevVault;
+  resetElanousConfigDir();
   setIntakeStoreForTest(null);
   try { rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* swallow */ }
 });
 
 function uniquePort(): number {
   return 49000 + Math.floor(Math.random() * 2000);
+}
+
+function authenticatedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set('authorization', `Bearer ${bearerToken}`);
+  return fetch(url, { ...init, headers });
 }
 
 async function bootNexus(extra: Parameters<typeof runNexus>[0] = {}): Promise<RunNexusHandle> {
@@ -92,7 +104,8 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/sessions returns sessions list (was 503)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/sessions`);
+    expect((await fetch(`${h.httpServer!.url}/v1/sessions`)).status).toBe(401);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/sessions`);
     expect(res.status).toBe(200);
     const body = await res.json() as { sessions: unknown[] };
     expect(Array.isArray(body.sessions)).toBe(true);
@@ -100,7 +113,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('POST /v1/sessions/external registers session (was 503)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/sessions/external`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/sessions/external`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: 'test-pr-k-1', origin: 'pwa' }),
@@ -114,7 +127,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/intake returns empty list (was 503)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/intake`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/intake`);
     expect(res.status).toBe(200);
     const body = await res.json() as { sessions: unknown[] };
     expect(Array.isArray(body.sessions)).toBe(true);
@@ -122,7 +135,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('POST /v1/intake creates intake session (was 503)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/intake`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/intake`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text: 'remember to ship pr-k', mode: 'review' }),
@@ -135,7 +148,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/control-signals returns observer snapshot (was 503)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/control-signals?limit=10`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/control-signals?limit=10`);
     expect(res.status).toBe(200);
     const body = await res.json() as { total: number; items: unknown[] };
     expect(typeof body.total).toBe('number');
@@ -144,7 +157,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/simulations returns scenarios catalog (was 503)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/simulations`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/simulations`);
     expect(res.status).toBe(200);
     const body = await res.json() as { scenarios: unknown[] };
     expect(Array.isArray(body.scenarios)).toBe(true);
@@ -152,7 +165,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/tools returns active tool surface (was 503)', async () => {
     const h = await bootNexus({ tools: 'readonly' });
-    const res = await fetch(`${h.httpServer!.url}/v1/tools`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/tools`);
     expect(res.status).toBe(200);
     const body = await res.json() as { kind: string; specs: { name: string }[] };
     expect(body.kind).toBe('readonly');
@@ -164,7 +177,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/voice/cost returns monthly summary (PR d · runtime gates removed)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/voice/cost`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/voice/cost`);
     expect(res.status).toBe(200);
     const body = await res.json() as { totalUsd: number };
     expect(typeof body.totalUsd).toBe('number');
@@ -172,7 +185,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/push/vapid-public-key returns key (PR d · runtime gates removed)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/push/vapid-public-key`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/push/vapid-public-key`);
     expect(res.status).toBe(200);
     const body = await res.json() as { publicKey: string };
     expect(typeof body.publicKey).toBe('string');
@@ -187,7 +200,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
   // through the live http-server so a routing regression fails loud.
   test('POST /v1/notification-action records intent feedback (route guard)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/notification-action`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/notification-action`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ sessionId: 'sess-r3', action: 'intent-0' }),
@@ -209,7 +222,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
   test('POST /v1/intent-prediction/:sessionId/feedback round-trip (route guard)', async () => {
     const h = await bootNexus();
     const sessId = 'sess-feedback-guard';
-    const res = await fetch(
+    const res = await authenticatedFetch(
       `${h.httpServer!.url}/v1/intent-prediction/${sessId}/feedback`,
       {
         method: 'POST',
@@ -248,7 +261,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
     const form = new FormData();
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     form.append('image', new Blob([png], { type: 'image/png' }), 'guard.png');
-    const res = await fetch(`${h.httpServer!.url}/v1/notes/from-image`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/notes/from-image`, {
       method: 'POST',
       body: form,
     });
@@ -268,7 +281,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
   // succeed end-to-end through the live http-server.
   test('POST /v1/notes/save is wired (route guard · happy path 201)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/notes/save`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/notes/save`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -291,7 +304,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
   // derivation is exercised in `sessions-active.test.ts`.
   test('GET /v1/sessions/active returns 200 with sessions array (route guard)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/sessions/active`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/sessions/active`);
     expect(res.status).toBe(200);
     const body = await res.json() as {
       ok: boolean;
@@ -306,7 +319,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
   // R5.4 — `/v1/sessions/:id/decision` route guard.
   test('POST /v1/sessions/:id/decision returns 200 + echo (route guard)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/sessions/sess-r5/decision`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/sessions/sess-r5/decision`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ decision: 'approve' }),
@@ -324,17 +337,22 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('OPTIONS /v1/sessions/:id/decision returns 204 (preflight)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/sessions/sess-r5/decision`, {
+    const request = new Request(`${h.httpServer!.url}/v1/sessions/sess-r5/decision`, {
       method: 'OPTIONS',
+      headers: { origin: 'http://localhost:3000', 'access-control-request-method': 'POST' },
     });
+    expect(request.headers.has('authorization')).toBe(false);
+    const res = await fetch(request);
     expect(res.status).toBe(204);
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
+    expect(res.headers.get('access-control-allow-methods')).toContain('POST');
+    expect(res.headers.get('access-control-allow-headers')).toContain('authorization');
   });
 
   // R6.2 — `/v1/reflection/today` route guard.
   test('GET /v1/reflection/today returns 200 + snapshot (route guard)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/reflection/today`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/reflection/today`);
     expect(res.status).toBe(200);
     const body = await res.json() as {
       ok: boolean;
@@ -348,24 +366,28 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('GET /v1/reflection/2026-05-08 (specific date) returns 200', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/reflection/2026-05-08`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/reflection/2026-05-08`);
     expect(res.status).toBe(200);
   });
 
   test('GET /v1/reflection/garbage → 404 (route does not match)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/reflection/yesterday`);
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/reflection/yesterday`);
     expect(res.status).toBe(404);
   });
 
   test('OPTIONS /v1/notes/save returns 204 with CORS headers (preflight)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/notes/save`, {
+    const request = new Request(`${h.httpServer!.url}/v1/notes/save`, {
       method: 'OPTIONS',
+      headers: { origin: 'http://localhost:3000', 'access-control-request-method': 'POST' },
     });
+    expect(request.headers.has('authorization')).toBe(false);
+    const res = await fetch(request);
     expect(res.status).toBe(204);
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
     expect(res.headers.get('access-control-allow-methods')).toContain('POST');
+    expect(res.headers.get('access-control-allow-headers')).toContain('authorization');
   });
 
   // R-OCR.4 (2026-05-09) — metric snapshot + event endpoint guards.
@@ -377,13 +399,13 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
   test('GET /v1/metrics/notes-from-image reflects save activity (route + collector wire)', async () => {
     const h = await bootNexus();
     // Trigger a save to advance the counter.
-    const saveRes = await fetch(`${h.httpServer!.url}/v1/notes/save`, {
+    const saveRes = await authenticatedFetch(`${h.httpServer!.url}/v1/notes/save`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ markdown: '# metric round-trip\n\nbody' }),
     });
     expect(saveRes.status).toBe(201);
-    const snapRes = await fetch(`${h.httpServer!.url}/v1/metrics/notes-from-image`);
+    const snapRes = await authenticatedFetch(`${h.httpServer!.url}/v1/metrics/notes-from-image`);
     expect(snapRes.status).toBe(200);
     const body = await snapRes.json() as {
       ok: boolean;
@@ -396,13 +418,13 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('POST /v1/metrics/notes-event records a client cancel event', async () => {
     const h = await bootNexus();
-    const ev = await fetch(`${h.httpServer!.url}/v1/metrics/notes-event`, {
+    const ev = await authenticatedFetch(`${h.httpServer!.url}/v1/metrics/notes-event`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'cancel', polishMode: 'minimal' }),
     });
     expect(ev.status).toBe(200);
-    const snap = await fetch(`${h.httpServer!.url}/v1/metrics/notes-from-image`);
+    const snap = await authenticatedFetch(`${h.httpServer!.url}/v1/metrics/notes-from-image`);
     const body = await snap.json() as {
       snapshot: { client: { cancel: number } };
     };
@@ -411,26 +433,35 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
 
   test('OPTIONS /v1/metrics/notes-event returns 204 with CORS headers', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/metrics/notes-event`, {
+    const request = new Request(`${h.httpServer!.url}/v1/metrics/notes-event`, {
       method: 'OPTIONS',
+      headers: { origin: 'http://localhost:3000', 'access-control-request-method': 'POST' },
     });
+    expect(request.headers.has('authorization')).toBe(false);
+    const res = await fetch(request);
     expect(res.status).toBe(204);
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
+    expect(res.headers.get('access-control-allow-methods')).toContain('POST');
+    expect(res.headers.get('access-control-allow-headers')).toContain('authorization');
   });
 
   test('OPTIONS /v1/notes/from-image returns 204 with CORS headers (preflight)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/notes/from-image`, {
+    const request = new Request(`${h.httpServer!.url}/v1/notes/from-image`, {
       method: 'OPTIONS',
+      headers: { origin: 'http://localhost:3000', 'access-control-request-method': 'POST' },
     });
+    expect(request.headers.has('authorization')).toBe(false);
+    const res = await fetch(request);
     expect(res.status).toBe(204);
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
     expect(res.headers.get('access-control-allow-methods')).toContain('POST');
+    expect(res.headers.get('access-control-allow-headers')).toContain('authorization');
   });
 
   test('POST /v1/hitl/callback/:id returns 404 for unknown id (was 503)', async () => {
     const h = await bootNexus();
-    const res = await fetch(`${h.httpServer!.url}/v1/hitl/callback/req-no-such-thing`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/hitl/callback/req-no-such-thing`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ answer: true }),
@@ -447,7 +478,7 @@ describe('NEXUS runtime wire-up integration (PR k)', () => {
     // Give the scheduler one tick so the listener is registered before
     // the POST hits NEXUS — defensive against a race on slower CI.
     await new Promise((resolve) => setTimeout(resolve, 10));
-    const res = await fetch(`${h.httpServer!.url}/v1/hitl/callback/${requestId}`, {
+    const res = await authenticatedFetch(`${h.httpServer!.url}/v1/hitl/callback/${requestId}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ answer: false }),

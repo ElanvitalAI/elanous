@@ -1,11 +1,91 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { handleOnboardingRefusal, OnboardingRefusedError } from '../onboarding.js';
 
 const root = new URL('../../', import.meta.url).pathname;
 const fixture = new URL('./__fixtures__/agent-help-before/', import.meta.url);
+
+describe('agent CLI onboarding refusal', () => {
+  test('unconfigured agent with closed stdin exits 2 with one English stderr hint and no stack', () => {
+    const home = mkdtempSync(join(tmpdir(), 'elanous-agent-cli-onboarding-'));
+    const stateDir = join(home, 'state');
+    const configDir = join(home, 'config');
+    mkdirSync(stateDir);
+    mkdirSync(configDir);
+    try {
+      const env = { ...process.env };
+      for (const key of ['XDG_CONFIG_HOME', 'ELANOUS_CONFIG_DIR', 'ELANOUS_HARNESS_SPACE', 'ELANOUS_HARNESS_SPACE_ID', 'ELANOUS_RUN_CONTEXT']) delete env[key];
+      const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${stateDir}`, 'agent', 'hi'], {
+        cwd: root,
+        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_CONFIG_DIR: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        input: '', encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stderr).toBe('elanous agent needs a configured LLM. Run `elanous setup` in a terminal, or `elanous setup --non-interactive --config <path>` for unattended setup.\n');
+      expect(result.stderr).not.toContain('onboarding.ts');
+      expect(result.stderr).not.toMatch(/^\s*at /m);
+      expect(result.stderr).not.toContain('Bun v');
+      expect(result.stdout).not.toContain('onboarding.ts');
+      expect(result.stdout).not.toMatch(/^\s*at /m);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('unconfigured chat with closed stdin preserves its refusal instead of the agent hint', () => {
+    const home = mkdtempSync(join(tmpdir(), 'elanous-chat-cli-onboarding-'));
+    const stateDir = join(home, 'state');
+    const configDir = join(home, 'config');
+    mkdirSync(stateDir);
+    mkdirSync(configDir);
+    try {
+      const env = { ...process.env };
+      for (const key of ['ELANOUS_HARNESS_SPACE', 'ELANOUS_HARNESS_SPACE_ID', 'ELANOUS_RUN_CONTEXT']) delete env[key];
+      const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${stateDir}`, 'chat', 'hi'], {
+        cwd: root,
+        env: { ...env, HOME: home, XDG_CONFIG_HOME: configDir, ELANOUS_CONFIG_DIR: configDir, ELANOUS_STATE_DIR: stateDir, ELANOUS_SUPPRESS_XDG_WARNING: '1' },
+        input: '', encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stderr).toBe(2);
+      expect(result.stderr).toContain('대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다.');
+      expect(result.stderr).not.toContain('elanous agent needs a configured LLM');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test('autonomous empty-universe refusal retains its materialization diagnosis', () => {
+    const error = new OnboardingRefusedError('자식 우주가 물질화되지 않았다', 'autonomous-empty-universe');
+    const stderr = spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    try {
+      expect(error.code).toBe('onboarding-refused');
+      for (const entrance of ['agent', 'other'] as const) {
+        expect(handleOnboardingRefusal(error, entrance)).toBe(true);
+        expect(stderr).toHaveBeenCalledWith(error.message);
+        expect(process.exitCode).toBe(2);
+      }
+    } finally {
+      stderr.mockRestore();
+      process.exitCode = before;
+    }
+  });
+});
+
+test('unrelated errors are not handled as onboarding refusals', () => {
+  const before = process.exitCode;
+  try {
+    expect(handleOnboardingRefusal(new Error('synthetic unrelated failure'), 'agent')).toBe(false);
+    expect(process.exitCode).toBe(before);
+  } finally {
+    process.exitCode = before;
+  }
+});
 
 describe('agent CLI chat-turn errors', () => {
   const runFailure = (message: string) => {

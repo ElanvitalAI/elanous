@@ -13,6 +13,7 @@ type PackOptions = {
   paths?: string[];
   outDir: string;
   maxSizeBytes?: number;
+  mirrorHead?: string;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
 };
 
@@ -108,7 +109,21 @@ export function packSourceBundle(options: PackOptions): PackedBundle {
     ref = `refs/elanous/pod-source/${randomUUID()}`;
     git(root, env, 'update-ref', ref, headCommit);
     createdBundle = true;
-    git(root, env, 'bundle', 'create', bundlePath, `${baseCommit}..${ref}`);
+    let bundleRevision = ref;
+    if (options.mirrorHead !== undefined) {
+      // A thin bundle is usable only when its excluded history belongs to the packed base's lineage.
+      const mirrorHead = options.mirrorHead;
+      let sharedHistory = false;
+      if (/^[0-9a-f]{40,64}$/.test(mirrorHead)) {
+        try {
+          git(root, env, 'cat-file', '-e', `${mirrorHead}^{commit}`);
+          git(root, env, 'merge-base', '--is-ancestor', mirrorHead, baseCommit);
+          sharedHistory = true;
+        } catch { /* The mirror is unavailable or unrelated; include all history instead. */ }
+      }
+      bundleRevision = sharedHistory ? `${mirrorHead}..${ref}` : ref;
+    }
+    git(root, env, 'bundle', 'create', bundlePath, bundleRevision);
     git(root, env, 'update-ref', '-d', ref, headCommit);
     ref = undefined;
     const sizeBytes = statSync(bundlePath).size;

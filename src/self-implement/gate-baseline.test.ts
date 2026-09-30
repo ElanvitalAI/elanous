@@ -1138,10 +1138,10 @@ describe('gate baseline — 시험 타임아웃은 introduced 회귀가 아니�
     mkdirSync(join(cwd, 'test'), { recursive: true });
     writeFileSync(join(cwd, 'test/evidence.test.js'), [
       "import { expect, test } from 'bun:test';",
-      "test('plain pass', () => expect(true).toBe(true));",
-      "test('entity & pass', () => expect(true).toBe(true));",
+      "test('plain pass', () => expect(Bun.file('package.json').size).toBeGreaterThan(0));",
+      "test('entity & pass', () => expect(Bun.file('package.json').size).toBeGreaterThan(0));",
       "test('failed', () => expect(true).toBe(false));",
-      "test.skip('skipped', () => expect(true).toBe(true));",
+      "test.skip('skipped', () => expect(Bun.file('package.json').size).toBeGreaterThan(0));",
     ].join('\n'));
     git(cwd, 'add', '-A');
     git(cwd, 'commit', '-m', 'base junit evidence');
@@ -1187,7 +1187,7 @@ describe('gate baseline — 시험 타임아웃은 introduced 회귀가 아니�
     const testFile = join(cwd, 'test/timeout.test.js');
     writeFileSync(testFile, [
       "import { expect, test } from 'bun:test';",
-      "test('slow only on head', () => expect(true).toBe(true));",
+      "test('slow only on head', () => expect(Bun.file('package.json').size).toBeGreaterThan(0));",
     ].join('\n'));
     git(cwd, 'add', '-A');
     git(cwd, 'commit', '-m', 'base timeout pass');
@@ -3140,3 +3140,21 @@ describe('gate baseline — introduced 재실행 강등', () => {
     expect(formatGateBaselineNote(report, 0)).toContain('introduced=1');
   });
 });
+
+test('a rerun whose test traps SIGTERM still returns at the timeout instead of waiting for the test to finish', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'gate-sigterm-trap-'));
+  try {
+    writeFileSync(join(dir, 'trap.test.ts'), [
+      "import { test } from 'bun:test';",
+      "process.on('SIGTERM', () => {});",
+      "test('ignores SIGTERM', async () => { await new Promise((resolve) => setTimeout(resolve, 30_000)); }, 60_000);",
+      '',
+    ].join('\n'));
+    const started = Date.now();
+    const observation = rerunBunSingleTest(dir, 'trap.test.ts', 'ignores SIGTERM', 1_500);
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(observation).toBeUndefined();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 40_000);

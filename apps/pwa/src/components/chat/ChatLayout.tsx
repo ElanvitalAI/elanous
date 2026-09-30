@@ -1,5 +1,6 @@
 'use client';
 
+import { HideInPublicCapture } from '@/lib/public-capture';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Mic, MicOff } from 'lucide-react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
@@ -838,11 +839,11 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})}
             {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
           />
-          <BudgetPill />
+          <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
           {/* FU PP-V-2 (2026-05-07) — month-to-date STT/TTS USD pill.
               voice cost 노출 위치는 BudgetPill 옆이 자연 (양쪽 모두
               월 누적 비용). daemon URL 미설정 시 자동 hidden. */}
-          <VoiceCostPill />
+          <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
         </div>
         <div className="flex items-center gap-2">
           {/* Phase 1 (voice 일원화) — header mic toggle (large).

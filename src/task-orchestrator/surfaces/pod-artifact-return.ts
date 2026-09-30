@@ -2,6 +2,8 @@ import { lstatSync, mkdirSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { debug } from '../../debug/log.js';
+import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
+import type { LogRecord } from '../../mss/logging/record.js';
 
 const FILE_LIMIT = 5 * 1024 * 1024;
 const TOTAL_LIMIT = 20 * 1024 * 1024;
@@ -79,14 +81,63 @@ export function parsePodArtifactChunks(logs: string): ParseResult {
   return error.length ? { error, artifacts } : artifacts;
 }
 
+const POD_LOGS_PATH = 'pod-logs/logs.jsonl';
+
+function childRunId(data: unknown): string | undefined {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return undefined;
+  const value = (data as Record<string, unknown>).runId;
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function decisionRecord(line: string): { rec: LogRecord; surface: string } | undefined {
+  let parsed: unknown;
+  try { parsed = JSON.parse(line); } catch { return undefined; }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+  const row = parsed as Record<string, unknown>;
+  if (row.category !== 'harness.decision') return undefined;
+  if (typeof row.ts !== 'string' || typeof row.event !== 'string') return undefined;
+  const runId = childRunId(row.data);
+  if (!runId) return undefined;
+  const data = { ...(row.data as Record<string, unknown>), podJob: '', importedFrom: 'pod' as const };
+  return {
+    rec: {
+      ts: row.ts,
+      category: 'harness.decision',
+      event: row.event,
+      data,
+      ...(typeof row.level === 'string' ? { level: row.level as LogRecord['level'] } : {}),
+      ...(typeof row.trace_id === 'string' ? { trace_id: row.trace_id } : {}),
+    },
+    surface: typeof row.surface === 'string' && row.surface ? row.surface : 'pod',
+  };
+}
+
+/** Import only harness.decision rows from a returned pod log into the launching host store. */
+export function importPodDecisionLogs(bytes: Buffer, job: string, store: LogStore | null = getDefaultLogStore()): { imported: number; skipped: number } {
+  if (!store) return { imported: 0, skipped: 0 };
+  const text = bytes.toString('utf8');
+  const rows: Array<{ rec: LogRecord; surface: string }> = [];
+  let skipped = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (!line) continue;
+    const row = decisionRecord(line);
+    if (!row) { skipped += 1; continue; }
+    row.rec.data = { ...(row.rec.data as Record<string, unknown>), podJob: job };
+    rows.push(row);
+  }
+  if (rows.length > 0) store.insertBatch(rows);
+  return { imported: rows.length, skipped };
+}
+
 /** Reject symlink parents as well as lexical traversal; never replace a host file. */
-export function collectPodArtifacts(logs: string, { dir, job, log = (c, e, d) => debug.log(c, e, d) }: {
+export function collectPodArtifacts(logs: string, { dir, job, log = (c, e, d) => debug.log(c, e, d), logStore = getDefaultLogStore() }: {
   dir: string;
   job: string;
   log?: (category: string, event: string, data: Record<string, unknown>) => void;
+  logStore?: LogStore | null;
 }): void {
   const parsed = parsePodArtifactChunks(logs);
-  const podLogsPath = 'pod-logs/logs.jsonl';
+  const podLogsPath = POD_LOGS_PATH;
   let podLogsReturned = false;
   let podLogsMissingReason = logs.split(/\r?\n/).find((line) => line.startsWith(`ELANOUS_POD_ARTIFACT_SKIPPED ${podLogsPath} `))
     ? 'artifact skipped (size limit or encoding failure)'
@@ -123,7 +174,14 @@ export function collectPodArtifacts(logs: string, { dir, job, log = (c, e, d) =>
       log('self-implement.pod', 'artifact-collected', { job, path, bytes: bytes.length });
       if (path === podLogsPath) {
         podLogsReturned = true;
-        log('self-implement.pod', 'pod-logs-returned', { job, path: destination, lines: bytes.length ? bytes.toString('utf8').split('\n').length - (bytes.at(-1) === 10 ? 1 : 0) : 0 });
+        const lines = bytes.length ? bytes.toString('utf8').split('\n').length - (bytes.at(-1) === 10 ? 1 : 0) : 0;
+        log('self-implement.pod', 'pod-logs-returned', { job, path: destination, lines });
+        try {
+          const imported = importPodDecisionLogs(bytes, job, logStore);
+          log('self-implement.pod', 'pod-decisions-imported', { job, imported: imported.imported, skipped: imported.skipped });
+        } catch (error) {
+          log('self-implement.pod', 'pod-logs-import-failed', { job, reason: error instanceof Error ? error.message : String(error) });
+        }
       }
     } catch (e) {
       const reason = (e as NodeJS.ErrnoException).code === 'EEXIST' ? 'exists' : e instanceof Error ? e.message : String(e);

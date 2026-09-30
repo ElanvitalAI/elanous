@@ -30,9 +30,10 @@ function blankFencedCode(text: string): string {
 
 export function parseReleaseNoteSection(rawPrBody: string): { fragment?: Section; problems: string[] } {
   const prBody = blankFencedCode(rawPrBody);
-  const start = /^## 릴리스 노트[ \t]*\r?$/m.exec(prBody);
+  const sections = [...prBody.matchAll(/^## 릴리스 노트[ \t]*\r?$/gm)];
+  const start = sections.at(-1);
   if (!start) return { problems: [] };
-  const rest = prBody.slice(start.index + start[0].length).replace(/^\r?\n/, '');
+  const rest = prBody.slice(start.index! + start[0].length).replace(/^\r?\n/, '');
   const nextHeading = /^ {0,3}#{1,6}(?:[ \t]+|$)/m.exec(rest);
   const body = nextHeading ? rest.slice(0, nextHeading.index) : rest;
   const fields = new Map<string, string>();
@@ -51,7 +52,9 @@ export function parseReleaseNoteSection(rawPrBody: string): { fragment?: Section
   if (duplicates.has('종류') || !kind || !['fix', 'feat', 'security', 'internal'].includes(kind)) problems.push('종류');
   if (duplicates.has('문서') || !doc || (doc.startsWith('없음') ? !/^없음\([^\s()]+(?:[^()]*)\)$/.test(doc) : !/^\S+$/.test(doc))) problems.push('문서');
   if (duplicates.has('대상') || (target !== 'next' && target !== 'later')) problems.push('대상');
-  if (problems.length) return { problems };
+  const invalid = problems.length > 0;
+  if (sections.length > 1) problems.push(`multiple release-note sections (${sections.length}); using the last`);
+  if (invalid) return { problems };
   return {
     fragment: {
       line: line!, kind: kind as Section['kind'],

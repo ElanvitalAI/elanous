@@ -18,7 +18,9 @@ import { TabRegistry } from '../src/nexus/state/tab-registry.js';
 import { createNexusState } from '../src/nexus/state/state.js';
 import { runNexus, type RunNexusHandle } from '../src/nexus/index.js';
 import { makeTestSpawnBackend } from '../src/nexus/supervisor/spawn.js';
-import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+import { getElanousConfigDir, setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+
+const bearerToken = 'nexus-templates-test-token';
 
 let tmpRoot: string;
 let prevNexus: string | undefined;
@@ -27,6 +29,7 @@ beforeEach(() => {
   prevNexus = process.env.ELANOUS_NEXUS_DIR;
   process.env.ELANOUS_NEXUS_DIR = tmpRoot;
   setElanousConfigDir(tmpRoot);
+  writeFileSync(join(getElanousConfigDir(), 'acp-token'), bearerToken, { mode: 0o600 });
 });
 afterEach(() => {
   if (prevNexus === undefined) delete process.env.ELANOUS_NEXUS_DIR;
@@ -314,15 +317,20 @@ describe('runNexus integration · template option', () => {
   });
 });
 
+function authenticatedFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  headers.set('authorization', `Bearer ${bearerToken}`);
+  return fetch(url, { ...init, headers });
+}
+
 describe('HTTP routes · /v1/nexus/templates', () => {
   let handle: RunNexusHandle | undefined;
   let baseUrl: string;
   let prevHome: string | undefined;
 
   beforeEach(async () => {
-    // Isolate HOME so skipRuntimeApi:false wires metaApi with noAuth
-    // (no ~/.elanous/acp-token) and the write-route gate evaluates auth
-    // instead of treating an unwired runtime as 401.
+    // Isolate HOME; skipRuntimeApi:false wires metaApi so the write-route
+    // gate evaluates auth rather than an unwired runtime.
     prevHome = process.env.HOME;
     process.env.HOME = tmpRoot;
     handle = await runNexus({
@@ -350,7 +358,8 @@ describe('HTTP routes · /v1/nexus/templates', () => {
   });
 
   test('GET /v1/nexus/templates → 4 builtins', async () => {
-    const res = await fetch(`${baseUrl}/v1/nexus/templates`);
+    expect((await fetch(`${baseUrl}/v1/nexus/templates`)).status).toBe(401);
+    const res = await authenticatedFetch(`${baseUrl}/v1/nexus/templates`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.templates).toHaveLength(4);
@@ -359,7 +368,7 @@ describe('HTTP routes · /v1/nexus/templates', () => {
   });
 
   test('GET /v1/nexus/templates/voice → full template', async () => {
-    const res = await fetch(`${baseUrl}/v1/nexus/templates/voice`);
+    const res = await authenticatedFetch(`${baseUrl}/v1/nexus/templates/voice`);
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.template.name).toBe('voice');
@@ -367,14 +376,14 @@ describe('HTTP routes · /v1/nexus/templates', () => {
   });
 
   test('GET /v1/nexus/templates/missing → 404', async () => {
-    const res = await fetch(`${baseUrl}/v1/nexus/templates/no-such`);
+    const res = await authenticatedFetch(`${baseUrl}/v1/nexus/templates/no-such`);
     expect(res.status).toBe(404);
     const body = await res.json();
     expect(body.error).toBe('template-not-found');
   });
 
   test('POST /v1/nexus/templates fromRegistry → saves', async () => {
-    const res = await fetch(`${baseUrl}/v1/nexus/templates`, {
+    const res = await authenticatedFetch(`${baseUrl}/v1/nexus/templates`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'my-snapshot', description: 'live snapshot' }),
@@ -384,12 +393,12 @@ describe('HTTP routes · /v1/nexus/templates', () => {
     expect(body.saved).toBe(true);
     expect(body.name).toBe('my-snapshot');
     // Verify it's now in the list
-    const list = await (await fetch(`${baseUrl}/v1/nexus/templates`)).json();
+    const list = await (await authenticatedFetch(`${baseUrl}/v1/nexus/templates`)).json();
     expect(list.templates.find((s: { name: string }) => s.name === 'my-snapshot')).toBeDefined();
   });
 
   test('POST builtin name → 409', async () => {
-    const res = await fetch(`${baseUrl}/v1/nexus/templates`, {
+    const res = await authenticatedFetch(`${baseUrl}/v1/nexus/templates`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'default' }),
@@ -400,7 +409,7 @@ describe('HTTP routes · /v1/nexus/templates', () => {
   });
 
   test('POST without name → 400', async () => {
-    const res = await fetch(`${baseUrl}/v1/nexus/templates`, {
+    const res = await authenticatedFetch(`${baseUrl}/v1/nexus/templates`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ description: 'noop' }),
@@ -411,7 +420,7 @@ describe('HTTP routes · /v1/nexus/templates', () => {
   });
 
   test('POST unsafe name → 400 invalid-name', async () => {
-    const res = await fetch(`${baseUrl}/v1/nexus/templates`, {
+    const res = await authenticatedFetch(`${baseUrl}/v1/nexus/templates`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ name: '../escape' }),

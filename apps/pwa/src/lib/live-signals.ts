@@ -5,6 +5,7 @@
 // ⛔ 값을 지어내지 않는다 — 로그에 없는 단계는 «안 보였다»로 남는다(«통과»로 칠하지 않는다).
 
 import type { HarnessRunEntry, LogRow } from '@/nexus/client';
+import { gateDecisionText } from './live-gate-decision';
 
 export const LIVE_STAGES = ['author', 'decompose', 'build', 'gate', 'review', 'land'] as const;
 export type LiveStage = (typeof LIVE_STAGES)[number];
@@ -277,15 +278,19 @@ export function buildLiveBoard(
     const kind = decisionKind(row);
     if (!kind) continue;
     if (row.category !== 'harness.decision' && emittedKinds.has(kind)) continue;
-    const why = str(d.reason) ?? str(d.why);
-    const purpose = str(d.purpose);
-    const target = str(d.target) ?? str(d.to) ?? str(d.account) ?? (kind === 'SHIP' && (str(d.pr) ?? (num(d.prNumber) ? String(num(d.prNumber)) : null)) ? `#${str(d.pr) ?? num(d.prNumber)}` : null);
+    const gateText = row.category === 'harness.decision' && typeof d.what === 'string'
+      ? gateDecisionText(d.what, str(d.reason) ?? undefined) : null;
+    const why = gateText?.why ?? str(d.reason) ?? str(d.why);
+    // Gate identifiers and free-form purpose may contain account names or local paths.
+    const purpose = gateText ? null : str(d.purpose);
+    const target = gateText ? null : str(d.target) ?? str(d.to) ?? str(d.account) ?? (kind === 'SHIP' && (str(d.pr) ?? (num(d.prNumber) ? String(num(d.prNumber)) : null)) ? `#${str(d.pr) ?? num(d.prNumber)}` : null);
+    const cardRunId = gateText ? null : runId;
     if (kind === 'HEAL' && runId) healed.add(runId);
     const paths = num(d.paths) || undefined;
-    stream.push({ ts: row.ts, kind, runId, what: decisionText(row, kind), why, purpose, target, ...(paths ? { paths } : {}) });
+    stream.push({ ts: row.ts, kind, runId: cardRunId, what: gateText?.what ?? decisionText(row, kind), why, purpose, target, ...(paths ? { paths } : {}) });
     const lacks = [why ? null : 'why', purpose ? null : 'purpose', target ? null : 'target'].filter(Boolean) as string[];
     if (lacks.length) {
-      const key = `${row.category} ${row.event}`;
+      const key = gateText ? 'harness.decision decision' : `${row.category} ${row.event}`;
       const m = missing.get(key) ?? { count: 0, lacks: new Set<string>() };
       m.count += 1; lacks.forEach((l) => m.lacks.add(l));
       missing.set(key, m);

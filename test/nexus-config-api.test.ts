@@ -1,7 +1,7 @@
 // NEXUS · /v1/config/* HTTP route tests (Phase N-3 PR μ)
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runNexus, type RunNexusHandle } from '../src/nexus/index.js';
@@ -18,7 +18,9 @@ import {
   writeSwitchValue,
   readSwitchValue,
 } from '../src/nexus/config/user-config.js';
-import { setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+import { getElanousConfigDir, setElanousConfigDir, resetElanousConfigDir } from '../src/elanous-config-dir.js';
+
+const bearerToken = 'nexus-config-api-test-token';
 
 let tmpRoot: string;
 let prevHome: string | undefined;
@@ -36,6 +38,7 @@ beforeEach(async () => {
   prevDc = process.env.ELANOUS_DISCORD_BOT_TOKEN;
   prevTools = process.env.ELANOUS_TOOLS;
   setElanousConfigDir(tmpRoot);
+  writeFileSync(join(getElanousConfigDir(), 'acp-token'), bearerToken, { mode: 0o600 });
   process.env.HOME = tmpRoot;
   process.env.ELANOUS_NEXUS_DIR = tmpRoot;
   delete process.env.ELANOUS_TELEGRAM_BOT_TOKEN;
@@ -47,8 +50,8 @@ beforeEach(async () => {
   // We need a custom http server start so we can inject hotApplyHandler.
   // Use detachForTesting to prevent the SIGINT wait, then start the http
   // server manually with our context.
-  // skipRuntimeApi:false wires metaApi (noAuth when HOME has no acp-token)
-  // so POST /v1/config/secrets is gated on auth, not an unwired runtime.
+  // skipRuntimeApi:false wires metaApi so POST /v1/config/secrets
+  // is gated on auth, not an unwired runtime.
   handle = await runNexus({
     detachForTesting: true,
     skipRuntimeApi: false,
@@ -90,7 +93,9 @@ afterEach(() => {
 void (() => hotApplyCalls);
 
 async function call(path: string, init: RequestInit = {}): Promise<{ status: number; body: any }> {
-  const res = await fetch(`${baseUrl}${path}`, init);
+  const headers = new Headers(init.headers);
+  headers.set('authorization', `Bearer ${bearerToken}`);
+  const res = await fetch(`${baseUrl}${path}`, { ...init, headers });
   let body: unknown = null;
   try { body = await res.json(); } catch { /* not JSON */ }
   return { status: res.status, body: body as any };
@@ -117,6 +122,11 @@ describe('Tailscale Serve ghost preflight', () => {
 });
 
 describe('GET /v1/config', () => {
+  test('requires the token before returning the config', async () => {
+    expect((await fetch(`${baseUrl}/v1/config`)).status).toBe(401);
+    expect((await call('/v1/config')).status).toBe(200);
+  });
+
   test('returns full UserConfig', async () => {
     patchUserConfig((c) => writeSwitchValue(c, 'global.tools', 'webterm'));
     const res = await call('/v1/config');

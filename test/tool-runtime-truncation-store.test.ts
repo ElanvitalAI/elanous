@@ -9,9 +9,8 @@ import {
 } from '../src/tool-runtime/truncation-store.js';
 import {
   effectiveInstanceRoot,
-  prodInstanceRoot,
+  resolveInstance,
   resetEffectiveInstanceRoot,
-  setTreeDerivedTestForTesting,
 } from '../src/instance/resolve.js';
 
 const originalStateDir = process.env.ELANOUS_STATE_DIR;
@@ -19,7 +18,6 @@ const originalStateDir = process.env.ELANOUS_STATE_DIR;
 function restoreInstanceResolution(): void {
   if (originalStateDir === undefined) delete process.env.ELANOUS_STATE_DIR;
   else process.env.ELANOUS_STATE_DIR = originalStateDir;
-  setTreeDerivedTestForTesting(undefined);
   resetEffectiveInstanceRoot();
 }
 
@@ -28,10 +26,10 @@ describe('tool-runtime truncation store', () => {
     const isolatedRoot = mkdtempSync(join(tmpdir(), 'tool-results-instance-'));
     try {
       delete process.env.ELANOUS_STATE_DIR;
-      setTreeDerivedTestForTesting(false);
       resetEffectiveInstanceRoot();
-      expect(effectiveInstanceRoot()).toBe(prodInstanceRoot());
-      expect(toolOutputStoreRoot()).toBe(join(prodInstanceRoot(), 'tool-results'));
+      const resolvedRoot = resolveInstance().root;
+      expect(effectiveInstanceRoot()).toBe(resolvedRoot);
+      expect(toolOutputStoreRoot()).toBe(join(resolvedRoot, 'tool-results'));
 
       process.env.ELANOUS_STATE_DIR = isolatedRoot;
       expect(effectiveInstanceRoot()).toBe(isolatedRoot);

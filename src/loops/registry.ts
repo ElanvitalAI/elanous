@@ -48,9 +48,13 @@ function graphFiles(dir: string): string[] {
   return entries.flatMap(e => e.isDirectory() ? graphFiles(join(dir, e.name)) : e.isFile() && /\.ya?ml$/.test(e.name) ? [join(dir, e.name)] : []).sort();
 }
 
+/** A wrapper cron that runs the graph itself declares its loop with a trailing `# elanous-loop=<graph_id>` comment. */
+const LOOP_MARKER = /#\s*elanous-loop=([A-Za-z0-9][\w.-]*)\s*$/;
+
 /** Match only the actual graph CLI invocation, not a filename mentioned in a shell argument. */
-export function graphJobMatches(command: string | null, file: string, root: string): boolean {
+export function graphJobMatches(command: string | null, file: string, root: string, graphId?: string): boolean {
   if (!command) return false;
+  if (graphId && command.match(LOOP_MARKER)?.[1] === graphId) return true;
   const invocation = /(?:^|&&\s*|;\s*)(?:(?:\S*\/)?(?:bun|node)\s+(?:\S*\/)?bin\/elanous\.mjs|(?:\S*\/)?elanous)\s+(?:--test(?:=\S+|\s+\S+)\s+)?graph\s+run\s+(['"]?)([^\s'";&|]+)\1(?=\s|$|[;&|])/g;
   for (const match of command.matchAll(invocation)) {
     const arg = match[2]!;
@@ -100,8 +104,17 @@ function schedules(opts: LoopRegistryOptions): ScheduleRow[] {
   } finally { db.close(); }
 }
 
+/** Where loop graphs live and where their cron line `cd`s — the same rule as the other elanous crons:
+ *  the installed package when there is one, else this checkout. Never the caller's cwd: a loop started
+ *  from a disposable worktree would schedule a cron into a directory that is about to disappear (🅣 09-29). */
+export function defaultLoopRoot(): string {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { installedCronRoot, repoRoot } = require('../domains/schedule-registry.js') as typeof import('../domains/schedule-registry.js');
+  return installedCronRoot() ?? repoRoot();
+}
+
 export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
-  const root = resolve(opts.root ?? process.cwd());
+  const root = resolve(opts.root ?? defaultLoopRoot());
   const stateRoot = opts.stateRoot ?? effectiveInstanceRoot();
   const rows = schedules(opts);
   const loops: LoopEntry[] = [];
@@ -117,7 +130,7 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
     const trigger = header?.trigger && typeof header.trigger === 'object' && !Array.isArray(header.trigger) ? header.trigger as Record<string, unknown> : null;
     const declaredCron = typeof trigger?.cron === 'string' ? trigger.cron : null;
     const events = Array.isArray(trigger?.events) ? trigger.events.filter((e): e is string => typeof e === 'string') : [];
-    const matched = rows.filter(row => graphJobMatches(row.command, file, root) && row.source === 'crontab' && row.run_via === 'crontab' && row.disabled_reason !== 'vanished');
+    const matched = rows.filter(row => graphJobMatches(row.command, file, root, doc.graph_id as string) && row.source === 'crontab' && row.run_via === 'crontab' && row.disabled_reason !== 'vanished');
     if (!declaredCron && !events.length && !matched.length) continue;
     if (!/^[a-zA-Z0-9][\w.-]*$/.test(doc.graph_id)) throw new Error(`unsafe loop graph_id: ${doc.graph_id}`);
     if (loops.some(loop => loop.id === doc.graph_id)) throw new Error(`duplicate loop graph_id: ${doc.graph_id}`);
@@ -142,6 +155,15 @@ export function loopStatus(id: string, opts: LoopRegistryOptions = {}): LoopEntr
   return { ...loop, recentRuns: recent };
 }
 
+/** The crontab line a loop runs — same shape as the other elanous crons: cron starts in $HOME with a thin PATH,
+ *  so a bare `elanous graph run <relative file>` fails silently every tick (09-29 steward). */
+export function loopCronCommand(id: string, file: string, root: string, bun = process.execPath): string {
+  // Quote only when needed: the other crons (and `graphJobMatches`) use bare absolute paths.
+  const q = (value: string) => /^[\w./@+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+  const log = `/tmp/elanous-loop-${id.replace(/[^\w.-]/g, '_')}.log`;
+  return `cd ${q(root)} && ${q(bun)} bin/elanous.mjs graph run ${q(file)} >> ${log} 2>&1`;
+}
+
 export async function setLoopEnabled(id: string, enabled: boolean, yes = false, opts: LoopRegistryOptions = {}): Promise<unknown> {
   const loop = loopStatus(id, opts);
   const action = enabled ? 'start' : 'stop';
@@ -149,7 +171,7 @@ export async function setLoopEnabled(id: string, enabled: boolean, yes = false, 
   const pending = loop.jobs.filter(job => job.enabled !== enabled);
   if (!pending.length && loop.jobs.length) return { action, id, changed: false, enabled: loop.enabled };
   const changes = loop.jobs.length ? pending.map(job => ({ action: enabled ? 'enable' : 'disable', id: job.id })) :
-    [{ action: 'create', cron: loop.trigger.cron, command: `elanous graph run ${loop.file}` }];
+    [{ action: 'create', cron: loop.trigger.cron, command: loopCronCommand(id, loop.file, resolve(opts.root ?? defaultLoopRoot())) }];
   if (!yes) return { action, id, dryRun: true, changes, note: 'Apply with --yes (crontab backup).' };
   const dispatch = opts.scheduleAction ?? (async (kind: 'create' | 'enable' | 'disable', args: Record<string, unknown>) => {
     const { dispatchScheduleManage } = await import('../domains/schedule-manage-tool.js');
@@ -170,5 +192,5 @@ export async function setLoopEnabled(id: string, enabled: boolean, yes = false, 
 export async function runLoop(id: string, dryRun = false, opts: LoopRegistryOptions = {}): Promise<GraphRunState> {
   const loop = loopStatus(id, opts);
   debug.log('loops.registry', 'run', { id, dryRun });
-  return runGraph(join(resolve(opts.root ?? process.cwd()), loop.file), { dryRun, deps: { root: opts.stateRoot ?? effectiveInstanceRoot() } });
+  return runGraph(join(resolve(opts.root ?? defaultLoopRoot()), loop.file), { dryRun, deps: { root: opts.stateRoot ?? effectiveInstanceRoot() } });
 }

@@ -933,13 +933,6 @@ describe('TelegramBot', () => {
     expect(graph.size()).toBe(1);
   });
 
-  test('empty allowlist allows everyone (fail-open is deliberate)', () => {
-    // Document current behavior: allowedUsers.size === 0 → allow all.
-    // Keeps "just set a token and chat" workflow intact for solo devs.
-    // The onboarding wizard warns when allowlist is empty.
-    expect(true).toBe(true);
-  });
-
   test('sendMessage returns { messageId } so callers can edit', async () => {
     const { fetchImpl } = makeStubFetch(() => ({ message_id: 7 }));
     const bot = new TelegramBot({

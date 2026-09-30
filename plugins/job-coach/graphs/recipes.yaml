@@ -16,3 +16,30 @@ report:
 judge:
   command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" judge'
   timeout_ms: 30000
+intake:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" intake'
+  timeout_ms: 30000
+needs:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" needs'
+  timeout_ms: 30000
+task:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" task'
+  timeout_ms: 30000
+ai-fit:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" ai-fit'
+  timeout_ms: 30000
+competency:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" competency'
+  timeout_ms: 30000
+roadmap:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" roadmap'
+  timeout_ms: 30000
+spec:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" spec'
+  timeout_ms: 30000
+routing:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" routing'
+  timeout_ms: 30000
+judge-enterprise:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" judge-enterprise'
+  timeout_ms: 30000

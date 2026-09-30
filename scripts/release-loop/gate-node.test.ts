@@ -1,21 +1,26 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { createGateRunner, graphGateResult, judgeGate, type GateRunner } from './gate-node';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
+import { debug } from '../../src/debug/log.js';
+import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 
 const CUT = 'a'.repeat(40), BASE = 'b'.repeat(40);
 const A = 'src/a.test.ts > A', B = 'src/b.test.ts > B', C = 'src/c.test.ts > C', D = 'src/d.test.ts > D';
 const scratch: string[] = [];
-afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { resetElanousConfigDir(); for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'gate-node-unit-'));
   scratch.push(root);
   const instanceRoot = join(root, 'instance');
   mkdirSync(join(instanceRoot, 'release/1.0.0'), { recursive: true });
   writeFileSync(join(instanceRoot, 'release/1.0.0/release.json'), JSON.stringify({ sourceCommit: BASE }));
-  return { root, instanceRoot };
+  return { root, instanceRoot, ledgerRoot: join(root, 'machine-ledger') };
 }
 function runOutput(ids: string[]): string {
   return ids.map((id) => {
@@ -24,14 +29,21 @@ function runOutput(ids: string[]): string {
   }).join('') + `\n${ids.length} fail\nRan ${Math.max(1, ids.length)} tests across ${Math.max(1, ids.length)} files.\n`;
 }
 function fake(cut = [A, B, C], baseline = [A, D], cached = true) {
-  const { root, instanceRoot } = fixture();
+  const { root, instanceRoot, ledgerRoot } = fixture();
   if (cached) writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: BASE, failures: baseline }));
   const calls: string[] = [];
   const runner: GateRunner = {
+    async localCommand(cmd, args, cwd) {
+      calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+      return { rc: 0, output: '' };
+    },
     async command(cmd, args, cwd) {
       calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+      if (cmd === 'sh') return { rc: 0, output: '/home/remote\n' };
+      if (cmd === 'git' && args.includes('rev-parse')) return { rc: 0, output: 'true\n' };
+      if (cmd === 'git' && args.includes('show-ref')) return { rc: 1, output: '' };
       if (cmd === 'bun' && args[0] === 'run') {
-        const file = args[2];
+        const file = args[2]!.replace(/^\.\//, '');
         const ids = cwd.endsWith('/cut') ? (file === 'src/c.test.ts' ? [] : file === 'src/b.test.ts' ? [B] : [A])
           : file === 'src/b.test.ts' ? [] : [A];
         return { rc: ids.length ? 1 : 0, output: runOutput(ids) };
@@ -48,9 +60,9 @@ function fake(cut = [A, B, C], baseline = [A, D], cached = true) {
     async snapshot(tree, sha) { calls.push(`snapshot ${sha} @${tree}`); },
     async removeSnapshot(tree) { calls.push(`removeSnapshot @${tree}`); },
   };
-  return { root, instanceRoot, runner, calls };
+  return { root, instanceRoot, ledgerRoot, runner, calls };
 }
-const options = (instanceRoot: string) => ({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot });
+const options = (instanceRoot: string) => ({ commit: CUT, version: '1.0.1', baselineVersion: '1.0.0', instanceRoot, ledgerRoot: join(dirname(instanceRoot), 'machine-ledger') });
 
 test('cut A/B/C versus baseline A/D reruns B and C; only reproduced B is introduced', async () => {
   const { root, instanceRoot, runner, calls } = fake();
@@ -66,9 +78,66 @@ test('cut A/B/C versus baseline A/D reruns B and C; only reproduced B is introdu
   const path = join(instanceRoot, 'release/1.0.1/gate-failures.json');
   expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ commit: CUT, failures: [A, B, C] });
   expect(statSync(path).mode & 0o777).toBe(0o600);
+  expect(JSON.parse(readFileSync(join(root, 'machine-ledger/release/1.0.1/gate-failures.json'), 'utf8'))).toEqual({ commit: CUT, failures: [A, B, C] });
   expect(existsSync(join(root, 'release/1.0.1/gate-failures.json'))).toBe(false);
   expect(calls.filter((c) => c.startsWith('remove '))).toHaveLength(1);
   expect(calls.filter((c) => c.startsWith('removeSnapshot '))).toHaveLength(1);
+});
+
+test('machine ledger baseline is reused across empty worktree universes; stale commit is swept', async () => {
+  const { instanceRoot, ledgerRoot, runner, calls } = fake([A], [A], false);
+  const previous = join(ledgerRoot, 'release/0.2.3');
+  mkdirSync(previous, { recursive: true });
+  writeFileSync(join(previous, 'release.json'), JSON.stringify({ sourceCommit: BASE }));
+  const cached = join(previous, 'gate-failures.json');
+  writeFileSync(cached, JSON.stringify({ commit: BASE, failures: [A] }));
+  const opts = { ...options(instanceRoot), ledgerRoot, version: '0.2.4', baselineVersion: '0.2.3' };
+  const observations: Array<{ category: string; event: string; data: unknown }> = [];
+  const observation = spyOn(debug, 'log').mockImplementation((category, event, data) => { observations.push({ category, event, data }); });
+  try {
+    expect(await judgeGate(opts, runner)).toMatchObject({ outcome: 'ok', baselineSource: 'ledger', preexisting: 1 });
+    expect(calls.filter((c) => c.includes('/baseline') && c.startsWith('sweep '))).toHaveLength(0);
+    expect(observations).toContainEqual({ category: 'release-loop.gate', event: 'baseline', data: { version: '0.2.3', source: 'ledger', commit: BASE } });
+    for (const location of [ledgerRoot, instanceRoot]) {
+      const path = join(location, 'release/0.2.4/gate-failures.json');
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ commit: CUT, failures: [A] });
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    }
+    calls.length = 0;
+    writeFileSync(cached, JSON.stringify({ commit: 'c'.repeat(40), failures: [A] }));
+    expect(await judgeGate(opts, runner)).toMatchObject({ outcome: 'ok', baselineSource: 'swept' });
+    expect(calls.filter((c) => c.includes('/baseline') && c.startsWith('sweep '))).toHaveLength(1);
+  } finally { observation.mockRestore(); }
+});
+
+test('instance fallback uses the instance manifest and cache when machine ledger is missing', async () => {
+  const { root, instanceRoot, runner, calls } = fake([A], [A]);
+  const result = await judgeGate({ ...options(instanceRoot), ledgerRoot: join(root, 'empty-ledger') }, runner);
+  expect(result).toMatchObject({ outcome: 'ok', baselineSource: 'instance' });
+  expect(calls.filter((c) => c.startsWith('sweep '))).toHaveLength(1);
+});
+
+test('stale ledger cache falls back to a matching instance cache for an explicit baseline commit', async () => {
+  const { instanceRoot, ledgerRoot, runner, calls } = fake([A], [A]);
+  const stale = join(ledgerRoot, 'release/1.0.0/gate-failures.json');
+  mkdirSync(dirname(stale), { recursive: true });
+  writeFileSync(stale, JSON.stringify({ commit: 'c'.repeat(40), failures: [B] }));
+  expect(await judgeGate({ ...options(instanceRoot), baselineCommit: BASE }, runner)).toMatchObject({ outcome: 'ok', baselineSource: 'instance', preexisting: 1 });
+  expect(calls.filter((c) => c.startsWith('sweep '))).toHaveLength(1);
+  expect(calls.filter((c) => c.startsWith(`snapshot ${BASE}`))).toHaveLength(0);
+});
+
+test('an explicit config directory confines the release ledger even with a distinct injected ledger root', async () => {
+  const { root, instanceRoot, runner } = fake([A], [A]);
+  setElanousConfigDir(instanceRoot);
+  expect(releaseLedgerRoot()).toBe(instanceRoot);
+  const other = join(root, 'outside-ledger');
+  expect(await judgeGate({ ...options(instanceRoot), ledgerRoot: other }, runner)).toMatchObject({ outcome: 'ok', baselineSource: 'instance' });
+  expect(existsSync(join(other, 'release/1.0.1/gate-failures.json'))).toBe(false);
+  expect(await judgeGate({ ...options(other), ledgerRoot: other }, runner)).toMatchObject({ outcome: 'ok', baselineSource: 'instance' });
+  expect(existsSync(join(other, 'release/1.0.1/gate-failures.json'))).toBe(false);
+  resetElanousConfigDir();
+  expect(releaseLedgerRoot()).toBe(prodInstanceRoot());
 });
 
 test('cached baseline avoids a baseline sweep even when an isolated comparison is necessary', async () => {
@@ -87,8 +156,36 @@ test('cached baseline avoids baseline worktree entirely when cut has no new fail
   expect(calls.filter((c) => c.startsWith('sweep '))).toHaveLength(1);
 });
 
+test('remote command transport starts in /tmp, not the caller checkout', async () => {
+  const { root } = fixture();
+  const repo = join(root, 'caller-repo');
+  const bin = join(root, 'bin');
+  mkdirSync(bin);
+  const record = join(root, 'ssh-args.json');
+  const shim = join(bin, 'ssh');
+  writeFileSync(shim, `#!/usr/bin/env bun\nimport { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(record)}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }));\n`);
+  chmodSync(shim, 0o700);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath ?? ''}`;
+  try {
+    expect((await createGateRunner(repo, 'test-host').command('mktemp', ['-d', '/tmp/release-gate-XXXXXXXX'], '/tmp')).rc).toBe(0);
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+  }
+  const call = JSON.parse(readFileSync(record, 'utf8')) as { argv: string[]; cwd: string };
+  expect(call.argv).toEqual(['test-host', "PATH=$HOME/.bun/bin:/opt/homebrew/bin:$PATH; export PATH; cd '/tmp' && 'mktemp' '-d' '/tmp/release-gate-XXXXXXXX'"]);
+  expect(call.cwd).not.toBe(repo);
+});
+
 test('remote gate keeps the cut and cached baseline on the same host and cleans both', async () => {
   const { instanceRoot, runner, calls } = fake();
+  const sweep = runner.sweep;
+  const logDirs: string[] = [];
+  runner.sweep = async (tree, logDir) => {
+    logDirs.push(logDir!);
+    return sweep(tree, logDir);
+  };
   const command = runner.command;
   runner.command = async (cmd, args, cwd) => cmd === 'mktemp'
     ? { rc: 0, output: '/tmp/release-gate-remote123\n' }
@@ -96,9 +193,243 @@ test('remote gate keeps the cut and cached baseline on the same host and cleans 
   expect(await judgeGate({ ...options(instanceRoot), remote: 'test-host' }, runner)).toMatchObject({ outcome: 'regression', introduced: [B] });
   expect(calls.filter((call) => call.startsWith(`add ${BASE}`))).toHaveLength(0);
   expect(calls.filter((call) => call.startsWith('sweep '))).toHaveLength(1);
+  expect(logDirs).toEqual([join(instanceRoot, 'release/1.0.1/gate-logs/cut')]);
   expect(calls.some((call) => call.startsWith(`snapshot ${BASE} @/tmp/release-gate-remote123/baseline`))).toBe(true);
   expect(calls.some((call) => call.startsWith('removeSnapshot @/tmp/release-gate-remote123/baseline'))).toBe(true);
-  expect(calls.some((call) => call.startsWith('rmdir /tmp/release-gate-remote123 '))).toBe(true);
+  expect(calls).toContain('add ' + CUT + ' @/tmp/release-gate-remote123/cut');
+  for (const commit of [CUT, BASE]) {
+    expect(calls).toContain(`git push test-host:/home/remote/mirror/elanous-agent.git ${commit}:refs/elanous/gate/${commit} @${process.cwd()}`);
+  }
+  expect(calls).toContain('rm -rf -- /tmp/release-gate-remote123 @/tmp');
+  expect(calls.filter((call) => call.endsWith(`@${process.cwd()}`)).every((call) => call.startsWith('git push '))).toBe(true);
+});
+
+test('remote mktemp path is recovered when ssh prints a warning after stdout', async () => {
+  const { instanceRoot, runner, calls } = fake([A], [A]);
+  const original = runner.command;
+  runner.command = async (cmd, args, cwd) => cmd === 'mktemp'
+    ? { rc: 0, output: '/tmp/release-gate-warning123\n\nWarning: Permanently added host key\n' }
+    : original(cmd, args, cwd);
+  expect(await judgeGate({ ...options(instanceRoot), remote: 'test-host' }, runner)).toMatchObject({ outcome: 'ok' });
+  expect(calls).toContain('rm -rf -- /tmp/release-gate-warning123 @/tmp');
+});
+
+test('remote push failure returns error before creating temporary trees', async () => {
+  const { instanceRoot, runner, calls } = fake();
+  runner.localCommand = async (cmd, args, cwd) => {
+    calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+    return { rc: 128, output: 'commit unavailable' };
+  };
+  const result = await judgeGate({ ...options(instanceRoot), remote: 'test-host' }, runner);
+  expect(result).toMatchObject({ outcome: 'error', error: expect.stringContaining(`remote push ${CUT} failed (rc=128): commit unavailable`) });
+  expect(calls.some((call) => call.startsWith('mktemp ') || call.startsWith('sweep '))).toBe(false);
+});
+
+test('an existing non-bare remote mirror is rejected without pushing', async () => {
+  const { instanceRoot, runner, calls } = fake();
+  const command = runner.command;
+  runner.command = async (cmd, args, cwd) => cmd === 'git' && args.includes('rev-parse')
+    ? { rc: 0, output: 'false\n' }
+    : command(cmd, args, cwd);
+  expect(await judgeGate({ ...options(instanceRoot), remote: 'test-host' }, runner)).toMatchObject({
+    outcome: 'error', error: 'remote mirror is not bare',
+  });
+  expect(calls.some((call) => call.startsWith('git push ') || call.startsWith('mktemp '))).toBe(false);
+});
+
+test('remote checkout failure cleans up without starting a sweep', async () => {
+  const { root, instanceRoot } = fixture();
+  const calls: string[] = [];
+  const runner = createGateRunner(root, 'test-host', async (cmd, args, cwd) => {
+    calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+    if (cmd === 'mktemp') return { rc: 0, output: '/tmp/release-gate-prepfailed\n' };
+    if (cmd === 'git' && args.includes('rev-parse')) return { rc: 0, output: 'true\n' };
+    if (cmd === 'git' && args.includes('show-ref')) return { rc: 0, output: '' };
+    if (cmd === 'git' && args.includes('checkout')) return { rc: 128, output: 'unavailable' };
+    return { rc: 0, output: '' };
+  });
+  expect(await judgeGate({ ...options(instanceRoot), remote: 'test-host', remoteMirror: '/mirror.git' }, runner)).toMatchObject({
+    outcome: 'error', error: expect.stringContaining('remote tree checkout failed (rc=128): unavailable'),
+  });
+  expect(calls).toContain('rm -rf -- /tmp/release-gate-prepfailed @/tmp');
+  expect(calls.some((call) => call.startsWith('sweep ') || call.startsWith('bun '))).toBe(false);
+});
+
+test('remote runner uses only the temporary checkout for git operations', async () => {
+  const { root, instanceRoot } = fixture();
+  const repo = join(root, 'caller-only-repo');
+  mkdirSync(repo);
+  expect(spawnSync('git', ['init', '-q', repo]).status).toBe(0);
+  const calls: string[] = [];
+  const mirror = '/remote/mirror.git';
+  const runner = createGateRunner(repo, 'test-host', async (cmd, args, cwd) => {
+    calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+    if (cmd === 'mktemp') return { rc: 0, output: '/tmp/release-gate-isolated\n' };
+    if (cmd === 'git' && args.includes('show-ref')) return { rc: 1, output: '' };
+    if (cmd === 'git' && args.includes('rev-parse')) return { rc: 0, output: 'true\n' };
+    if (cmd === 'bun' && args[0] === 'run') {
+      const failures = cwd.endsWith('/cut') ? [B] : [];
+      return { rc: failures.length ? 1 : 0, output: runOutput(failures) };
+    }
+    return { rc: 0, output: '' };
+  });
+  runner.localCommand = async (cmd, args, cwd) => {
+    calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+    return { rc: 0, output: '' };
+  };
+  runner.sweep = async () => ({ rc: 0, output: runOutput([]) });
+  expect(await judgeGate({ ...options(instanceRoot), remote: 'test-host', remoteMirror: mirror, repo, baselineCommit: BASE }, runner)).toMatchObject({ outcome: 'ok' });
+  expect(calls).toContain(`git clone --no-checkout ${mirror} /tmp/release-gate-isolated/cut @/tmp/release-gate-isolated`);
+  expect(calls).toContain(`git clone --no-checkout ${mirror} /tmp/release-gate-isolated/baseline @/tmp/release-gate-isolated`);
+  for (const commit of [CUT, BASE]) expect(calls).toContain(`git push test-host:${mirror} ${commit}:refs/elanous/gate/${commit} @${repo}`);
+  expect(calls).toContain('rm -rf -- /tmp/release-gate-isolated @/tmp');
+  expect(calls.filter((call) => call.endsWith(`@${repo}`)).every((call) => call.startsWith('git push '))).toBe(true);
+  calls.length = 0;
+  writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: BASE, failures: [A] }));
+  runner.sweep = async () => ({ rc: 1, output: runOutput([A, B]) });
+  expect(await judgeGate({ ...options(instanceRoot), remote: 'test-host', remoteMirror: mirror, repo, baselineCommit: BASE }, runner)).toMatchObject({ outcome: 'regression' });
+  expect(calls).toContain(`git clone --no-checkout ${mirror} /tmp/release-gate-isolated/baseline @/tmp/release-gate-isolated`);
+  expect(calls.every((call) => !call.includes(`--shared --no-checkout ${repo}`))).toBe(true);
+});
+
+test('remote preparation uses a bare mirror without the caller checkout on the remote', async () => {
+  const { root, instanceRoot } = fixture();
+  const origin = join(root, 'origin');
+  const caller = join(root, 'caller');
+  mkdirSync(origin);
+  const git = (cwd: string, ...args: string[]) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+  expect(git(origin, 'init', '-q').status).toBe(0);
+  writeFileSync(join(origin, 'tracked.txt'), 'baseline');
+  expect(git(origin, 'add', 'tracked.txt').status).toBe(0);
+  expect(git(origin, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'baseline').status).toBe(0);
+  const baseline = git(origin, 'rev-parse', 'HEAD').stdout.trim();
+  writeFileSync(join(origin, 'tracked.txt'), 'cut');
+  expect(git(origin, 'add', 'tracked.txt').status).toBe(0);
+  expect(git(origin, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'cut').status).toBe(0);
+  const cut = git(origin, 'rev-parse', 'HEAD').stdout.trim();
+  expect(git(root, 'clone', '-q', '--no-checkout', origin, caller).status).toBe(0);
+  expect(git(caller, 'remote', 'set-url', 'origin', 'https://example.invalid/unavailable.git').status).toBe(0);
+  // The remote is always a Linux host whose work dir is `/tmp/release-gate-*` (the code refuses anything else) — mirror
+  // that literally; `tmpdir()` is `/var/folders/…` on macOS and made this test red on mbp only.
+  const remoteWork = mkdtempSync('/tmp/release-gate-');
+  scratch.push(remoteWork);
+  const mirror = join(root, 'mirror.git');
+  const calls: string[] = [];
+  const runner = createGateRunner(caller, 'test-host', async (cmd, args, cwd) => {
+    calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+    if (cmd === 'mktemp') return { rc: 0, output: `${remoteWork}\n` };
+    if (cmd === 'bun' && args[0] === 'run') {
+      const failures = cwd.endsWith('/cut') ? [B] : [];
+      return { rc: failures.length ? 1 : 0, output: runOutput(failures) };
+    }
+    if (cmd === 'bun') return { rc: 0, output: '' };
+    if (cmd === 'rm') {
+      rmSync(args.at(-1)!, { recursive: true, force: true });
+      return { rc: 0, output: '' };
+    }
+    const run = spawnSync(cmd, args, { cwd, encoding: 'utf8' });
+    return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}` };
+  });
+  runner.localCommand = async (cmd, args, cwd) => {
+    calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
+    const run = spawnSync(cmd, ['push', mirror, ...args.slice(2)], { cwd, encoding: 'utf8' });
+    return { rc: run.status ?? 2, output: `${run.stdout ?? ''}\n${run.stderr ?? ''}` };
+  };
+  runner.sweep = async (tree) => {
+    expect(readFileSync(join(tree, 'tracked.txt'), 'utf8')).toBe(tree.endsWith('/cut') ? 'cut' : 'baseline');
+    expect(git(tree, 'rev-parse', 'HEAD').stdout.trim()).toBe(tree.endsWith('/cut') ? cut : baseline);
+    return { rc: 0, output: runOutput([]) };
+  };
+  expect(await judgeGate({ ...options(instanceRoot), commit: cut, baselineCommit: baseline, repo: caller, remote: 'test-host', remoteMirror: mirror }, runner)).toMatchObject({ outcome: 'ok' });
+  for (const commit of [cut, baseline]) expect(calls).toContain(`git push test-host:${mirror} ${commit}:refs/elanous/gate/${commit} @${caller}`);
+  expect(calls).toContain(`git clone --no-checkout ${mirror} ${remoteWork}/cut @${remoteWork}`);
+  expect(calls).toContain(`git -C ${remoteWork}/cut fetch origin refs/elanous/gate/${cut} @${remoteWork}`);
+  expect(calls).toContain(`git -C ${remoteWork}/cut checkout --detach ${cut} @${remoteWork}`);
+  expect(calls).toContain(`git clone --no-checkout ${mirror} ${remoteWork}/baseline @${remoteWork}`);
+  expect(calls).toContain(`git -C ${remoteWork}/baseline fetch origin refs/elanous/gate/${baseline} @${remoteWork}`);
+  expect(calls).toContain(`git -C ${remoteWork}/baseline checkout --detach ${baseline} @${remoteWork}`);
+  expect(calls.filter((call) => call.endsWith(`@${caller}`)).every((call) => call.startsWith('git push '))).toBe(true);
+  expect(git(mirror, 'for-each-ref', '--format=%(refname)').stdout.trim().split('\n').sort()).toEqual(
+    [cut, baseline].map((commit) => `refs/elanous/gate/${commit}`).sort(),
+  );
+  expect(existsSync(remoteWork)).toBe(false);
+  calls.length = 0;
+  mkdirSync(remoteWork);
+  runner.sweep = async () => { throw new Error('remote sweep stopped'); };
+  expect(await judgeGate({ ...options(instanceRoot), commit: cut, baselineCommit: baseline, repo: caller, remote: 'test-host', remoteMirror: mirror }, runner)).toMatchObject({
+    outcome: 'error', error: 'remote sweep stopped',
+  });
+  expect(existsSync(remoteWork)).toBe(false);
+  expect(calls.some((call) => call.startsWith('git push '))).toBe(false);
+  mkdirSync(remoteWork);
+  writeFileSync(join(instanceRoot, 'release/1.0.0/gate-failures.json'), JSON.stringify({ commit: baseline, failures: [A] }));
+  runner.sweep = async (tree) => ({ rc: 1, output: runOutput(tree.endsWith('/cut') ? [A, B] : [A]) });
+  expect(await judgeGate({ ...options(instanceRoot), commit: cut, baselineCommit: baseline, repo: caller, remote: 'test-host', remoteMirror: mirror }, runner)).toMatchObject({ outcome: 'regression', introduced: [B] });
+  expect(calls).toContain(`git clone --no-checkout ${mirror} ${remoteWork}/baseline @${remoteWork}`);
+  expect(existsSync(remoteWork)).toBe(false);
+  expect(existsSync(caller)).toBe(true);
+});
+
+test('real SSH transport pushes to a bare mirror without the caller path or GitHub credentials', async () => {
+  const { root, instanceRoot } = fixture();
+  const source = join(root, 'source');
+  const caller = join(root, 'caller');
+  const mirror = join(root, 'remote-mirror.git');
+  const bin = join(root, 'bin');
+  mkdirSync(source);
+  mkdirSync(bin);
+  const git = (cwd: string, ...args: string[]) => spawnSync('git', args, { cwd, encoding: 'utf8' });
+  expect(git(source, 'init', '-q').status).toBe(0);
+  writeFileSync(join(source, 'tracked.txt'), 'baseline');
+  expect(git(source, 'add', 'tracked.txt').status).toBe(0);
+  expect(git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'baseline').status).toBe(0);
+  const baseline = git(source, 'rev-parse', 'HEAD').stdout.trim();
+  writeFileSync(join(source, 'tracked.txt'), 'cut');
+  expect(git(source, 'add', 'tracked.txt').status).toBe(0);
+  expect(git(source, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'cut').status).toBe(0);
+  const cut = git(source, 'rev-parse', 'HEAD').stdout.trim();
+  expect(git(root, 'clone', '-q', '--no-checkout', source, caller).status).toBe(0);
+  expect(git(caller, 'remote', 'set-url', 'origin', 'https://example.invalid/unavailable.git').status).toBe(0);
+  const sshCalls = join(root, 'ssh-calls');
+  const shim = join(bin, 'ssh');
+  writeFileSync(shim, `#!/usr/bin/env bun\nimport { appendFileSync } from 'node:fs';\nimport { spawnSync } from 'node:child_process';\nconst command = process.argv.slice(3).join(' ');\nappendFileSync(${JSON.stringify(sshCalls)}, command + '\\n');\nif (command.includes(${JSON.stringify(caller)})) process.exit(91);\nconst run = spawnSync('sh', ['-c', command], { stdio: 'inherit' });\nprocess.exit(run.status ?? 2);\n`);
+  chmodSync(shim, 0o700);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath ?? ''}`;
+  try {
+    const runner = createGateRunner(caller, 'test-host');
+    const command = runner.command;
+    let remoteWork = '';
+    runner.command = async (cmd, args, cwd) => {
+      if (cmd === 'bun' && args[0] === 'install') return { rc: 0, output: '' };
+      const result = await command(cmd, args, cwd);
+      if (cmd === 'mktemp') remoteWork = result.output.trim();
+      return result;
+    };
+    runner.sweep = async (tree) => {
+      expect(readFileSync(join(tree, 'tracked.txt'), 'utf8')).toBe(tree.endsWith('/cut') ? 'cut' : 'baseline');
+      return { rc: 0, output: runOutput([]) };
+    };
+    const result = await judgeGate({ ...options(instanceRoot), commit: cut, baselineCommit: baseline, repo: caller, remote: 'test-host', remoteMirror: mirror }, runner);
+    expect(result).toMatchObject({ outcome: 'ok' });
+    expect(git(mirror, 'for-each-ref', '--format=%(refname)').stdout.trim().split('\n').sort()).toEqual(
+      [cut, baseline].map((commit) => `refs/elanous/gate/${commit}`).sort(),
+    );
+    expect(readFileSync(sshCalls, 'utf8')).not.toContain(caller);
+    expect(remoteWork).toMatch(/^\/tmp\/release-gate-/);
+    expect(existsSync(remoteWork)).toBe(false);
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH;
+    else process.env.PATH = oldPath;
+  }
+});
+
+test('an unsafe remote mirror path fails before any remote commands', async () => {
+  const { instanceRoot, runner, calls } = fake();
+  expect(await judgeGate({ ...options(instanceRoot), remote: 'test-host', remoteMirror: '/tmp/../caller' }, runner)).toMatchObject({
+    outcome: 'error', error: 'invalid remote mirror path',
+  });
+  expect(calls).toHaveLength(0);
 });
 
 test('an invalid remote host fails closed before creating a remote directory', async () => {
@@ -118,7 +449,7 @@ test('baseline isolated failure reclassifies the candidate as preexisting', asyn
   const { instanceRoot, runner } = fake([B], []);
   const old = runner.command;
   runner.command = async (cmd, args, cwd) => {
-    if (cmd === 'bun' && args[2] === 'src/b.test.ts' && cwd.endsWith('/baseline')) return { rc: 1, output: runOutput([B]) };
+    if (cmd === 'bun' && args[2] === './src/b.test.ts' && cwd.endsWith('/baseline')) return { rc: 1, output: runOutput([B]) };
     return old(cmd, args, cwd);
   };
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'ok', introduced: [], preexisting: 1 });
@@ -128,8 +459,8 @@ test('new test file missing from baseline is introduced only after cut isolation
   const { instanceRoot, runner, calls } = fake([B], []);
   const command = runner.command;
   runner.command = async (cmd, args, cwd) => {
-    if (cmd === 'bun' && args[2] === 'src/b.test.ts' && cwd.endsWith('/baseline')) {
-      return { rc: 1, output: 'No tests found\n' };
+    if (cmd === 'bun' && args[2] === './src/b.test.ts' && cwd.endsWith('/baseline')) {
+      return { rc: 1, output: 'Test filter "./src/b.test.ts" had no matches in --cwd="/tmp/baseline"\n' };
     }
     if (cmd === 'git' && args[0] === 'ls-tree') return { rc: 0, output: '' };
     return command(cmd, args, cwd);
@@ -144,6 +475,22 @@ test('an incomplete sweep is an error, not a clean release', async () => {
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'error', error: expect.stringContaining('cut sweep incomplete') });
 });
 
+test('a nested bun test summary earlier in the output does not replace the sweep summary', async () => {
+  // Real sample (09-29 0.2.4 gate `test.log`): a test spawned a nested `bun test` whose «0 fail · Ran 2 tests across 1 file»
+  // sat at line 6765 of a 60064-test sweep; the first-match parser read it and called the finished sweep «incomplete».
+  const plain = fake();
+  const expected = await judgeGate(options(plain.instanceRoot), plain.runner);
+  const { instanceRoot, runner } = fake();
+  const sweep = runner.sweep;
+  runner.sweep = async (tree, logDir) => {
+    const run = await sweep(tree, logDir);
+    return { ...run, output: `src/nested.test.ts:\n\n 1 pass\n 0 fail\nRan 2 tests across 1 file. [75.00ms]\n${run.output}` };
+  };
+  const judged = await judgeGate(options(instanceRoot), runner);
+  expect(judged.outcome).not.toBe('error');
+  expect(judged).toMatchObject({ outcome: expected.outcome, introduced: (expected as { introduced?: string[] }).introduced });
+});
+
 test('missing failure summary is an error even if the runner exited zero', async () => {
   const { instanceRoot, runner } = fake();
   runner.sweep = async () => ({ rc: 0, output: 'Ran 1 test across 1 file.\n' });
@@ -156,11 +503,16 @@ test('a zero-exit sweep reporting failures cannot be called healthy', async () =
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'error', error: expect.stringContaining('failure attribution incomplete') });
 });
 
-test('a cached baseline for another commit is rejected instead of silently reused', async () => {
-  const { instanceRoot, runner } = fake();
+test('an explicit baseline commit rejects stale caches and sweeps when neither location matches', async () => {
+  const { instanceRoot, ledgerRoot, runner, calls } = fake([A], [A]);
+  const stale = join(ledgerRoot, 'release/1.0.0/gate-failures.json');
+  mkdirSync(dirname(stale), { recursive: true });
+  writeFileSync(stale, JSON.stringify({ commit: 'd'.repeat(40), failures: [B] }));
   expect(await judgeGate({ ...options(instanceRoot), baselineCommit: 'c'.repeat(40) }, runner)).toMatchObject({
-    outcome: 'error', error: expect.stringContaining('cached baseline commit does not match'),
+    outcome: 'ok', baselineSource: 'swept', preexisting: 1,
   });
+  expect(calls.filter((c) => c.startsWith('sweep '))).toHaveLength(2);
+  expect(calls.filter((c) => c.startsWith('add ' + 'c'.repeat(40)))).toHaveLength(1);
 });
 
 test('cached failures are rejected when release metadata names a different source commit', async () => {
@@ -203,7 +555,7 @@ test('baseline single-file preexistence is checked once per file, including mult
   const { instanceRoot, runner, calls } = fake([B, B2], []);
   const old = runner.command;
   runner.command = async (cmd, args, cwd) => {
-    if (cmd === 'bun' && args[2] === 'src/b.test.ts') {
+    if (cmd === 'bun' && args[2] === './src/b.test.ts') {
       calls.push(`${cmd} ${args.join(' ')} @${cwd}`);
       return { rc: 1, output: runOutput(cwd.endsWith('/cut') ? [B, B2] : [B]) };
     }
@@ -229,8 +581,10 @@ test('four shard sweep combines file failures and passes explicit CDP ignores', 
     if (cmd === 'bun' && args[0] === 'run') {
       seen.push(args);
       const path = args.at(-1)!;
-      const ids = path === 'src/cli' ? ['src/cli/a.test.ts > A'] : path === 'src/agent' ? ['src/agent/b.test.ts > B'] : [];
-      return { rc: ids.length ? 1 : 0, output: `0 pass\n${runOutput(ids)}` };
+      const ids = path === './src/cli' ? ['src/cli/a.test.ts > A'] : path === './src/agent' ? ['src/agent/b.test.ts > B'] : [];
+      // A test that spawns `bun test` prints its own summary first — only the runner's LAST one counts.
+      const nested = path === './test' ? '3 pass\n0 fail\nRan 3 tests across 1 file.\n' : '';
+      return { rc: ids.length ? 1 : 0, output: `${nested}0 pass\n${runOutput(ids)}` };
     }
     return original(cmd, args, cwd);
   });
@@ -240,10 +594,575 @@ test('four shard sweep combines file failures and passes explicit CDP ignores', 
   expect(sweep.output).toContain('2 fail\n0 errors\nRan 4 tests across 4 files.');
   expect(sweep.output).toContain('src/cli/a.test.ts:');
   expect(sweep.output).toContain('src/agent/b.test.ts:');
-  expect(seen.map((args) => args.at(-1))).toEqual(['src/cli', 'src/agent', 'test', 'scripts']);
+  // bun reads a bare `test` as a substring filter (every *.test.ts) — shards must pass paths.
+  expect(seen.map((args) => args.at(-1))).toEqual(['./src/cli', './src/agent', './test', './scripts']);
   expect(seen[3]).toContain('--path-ignore-patterns');
   for (const args of seen.slice(0, 3)) expect(args).not.toContain('--path-ignore-patterns');
   for (const name of ['src-cli', 'src-rest', 'test', 'other']) expect(existsSync(join(logDir, `${name}.log`))).toBe(true);
+});
+
+test('cut Pod shards are balanced, concurrent, commit-pinned and preserve the serial gate judgment', async () => {
+  const { root, instanceRoot, runner: fixtureRunner, calls } = fake([], []);
+  const files = ['src/cli/a.test.ts', 'src/b.test.ts', 'src/c.test.ts', 'src/d.test.ts', 'src/e.test.ts',
+    'src/f.test.ts', 'test/g.test.ts', 'test/h.test.ts', 'scripts/i.test.ts', 'scripts/j.test.ts'];
+  const sortedFiles = [...files].sort();
+  const treeHead = 'c'.repeat(40);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const original = fixtureRunner.command;
+  const outputFor = (paths: string[]) => {
+    const ids = paths.includes('src/b.test.ts') ? [B] : [];
+    return { rc: ids.length ? 1 : 0, output: `${paths.length - ids.length} pass\n${ids.map((id) => `${id.split(' > ')[0]}:\n(fail) B [1.00ms]\n`).join('')}\n${ids.length} fail\nRan ${paths.length} tests across ${paths.length} files.\n` };
+  };
+  const serialGroups: string[][] = [];
+  const command: GateRunner['command'] = async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: `${treeHead}\n` };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: `${[...files].reverse().join('\n')}\n` };
+    if (cmd === 'bun' && args[0] === 'run' && (args.length > 3 || ['./src/cli', './test', './scripts'].includes(args[2] ?? ''))) {
+      const paths = files.filter((file) => args.slice(2).some((arg) => {
+        const path = arg.replace(/^\.\//, '');
+        return file === path || file.startsWith(`${path}/`);
+      }));
+      serialGroups.push(paths);
+      return outputFor(paths);
+    }
+    return original(cmd, args, cwd);
+  };
+  const serialRunner = createGateRunner(repo, 'test-host', command);
+  const serialGateRunner = { ...fixtureRunner, sweep: (tree: string, logDir?: string) => serialRunner.sweep(tree, logDir) };
+  const serial = await judgeGate({ ...options(instanceRoot), repo }, serialGateRunner);
+  expect(serial).toMatchObject({ outcome: 'regression', introduced: [B] });
+  const serialFailures = JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8')) as { failures: string[] };
+  expect(serialGroups).toEqual([files.slice(0, 1), files.slice(1, 6), files.slice(6, 8), files.slice(8)]);
+  expect(serialGroups.flat().sort()).toEqual(sortedFiles);
+  for (const group of ['src-cli', 'src-rest', 'test', 'other']) {
+    expect(existsSync(join(instanceRoot, `release/1.0.1/gate-logs/cut/${group}.log`))).toBe(true);
+  }
+  expect(serialFailures.failures).toEqual([B]);
+  const invoked: Array<RunPodCommandOptions> = [];
+  let active = 0;
+  let peak = 0;
+  let release!: () => void;
+  const concurrent = new Promise<void>((resolve) => { release = resolve; });
+  const pod = async (o: RunPodCommandOptions) => {
+    invoked.push(o);
+    active++;
+    peak = Math.max(peak, active);
+    if (active === 3) release();
+    await concurrent;
+    const paths = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    const { rc, output } = outputFor(paths);
+    const artifactsDir = join(root, `artifacts-${invoked.indexOf(o)}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), output);
+    writeFileSync(join(artifactsDir, 'shard.rc'), `${rc}\n`);
+    active--;
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  };
+  const runner = createGateRunner(repo, undefined, command, pod, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+  runner.add = fixtureRunner.add;
+  runner.remove = fixtureRunner.remove;
+  runner.snapshot = fixtureRunner.snapshot;
+  runner.removeSnapshot = fixtureRunner.removeSnapshot;
+  const observed: Array<{ category: string; event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { observed.push({ category, event, data }); });
+  try {
+    const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 3 } }, runner);
+    expect(result).toMatchObject({ outcome: serial.outcome, introduced: serial.introduced, preexisting: serial.preexisting, fixed: serial.fixed });
+    const podFailures = JSON.parse(readFileSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'), 'utf8')) as { failures: string[] };
+    expect(podFailures.failures).toEqual(serialFailures.failures);
+    expect(result.introduced).toEqual(serial.introduced);
+    expect(invoked).toHaveLength(3);
+    expect(peak).toBe(3);
+    expect(invoked.every((o) => o.pool === 'pool-test' && o.clone === true && o.deadlineSeconds === 1200 && JSON.stringify(o.source) === JSON.stringify({ kind: 'commit', sha: treeHead }))).toBe(true);
+    expect(new Set(invoked.map((o) => o.name)).size).toBe(3);
+    expect(new Set(invoked.map((o) => o.poolScheduler)).size).toBe(1);
+    expect(invoked.map((o) => sortedFiles.filter((f) => o.command[2]!.includes(`'./${f}'`)))).toEqual([
+      [sortedFiles[0], sortedFiles[3], sortedFiles[6], sortedFiles[9]],
+      [sortedFiles[1], sortedFiles[4], sortedFiles[7]], [sortedFiles[2], sortedFiles[5], sortedFiles[8]],
+    ]);
+    expect(invoked[0]!.command[2]).toContain('cd repo && bun install && (cd apps/pwa && bun install) &&');
+    expect(invoked[0]!.command[2]).toContain('2>&1 | tee "$HOME/outbox/shard.log"; echo ${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"');
+    const logs = join(instanceRoot, 'release/1.0.1/gate-logs/cut');
+    for (let i = 0; i < 3; i++) {
+      expect(existsSync(join(logs, `pod-${i}.log`))).toBe(true);
+      expect(JSON.parse(readFileSync(join(logs, `pod-${i}.json`), 'utf8'))).toMatchObject({ rc: i === 2 ? 1 : 0, files: sortedFiles.filter((_, index) => index % 3 === i), durationMs: expect.any(Number) });
+    }
+    expect(observed.filter((item) => item.category === 'release-loop.gate' && item.event === 'pod-shard')).toHaveLength(3);
+    expect(observed.filter((item) => item.event === 'pod-shard').map((item) => item.data)).toEqual([
+      { shard: 0, files: sortedFiles.filter((_, index) => index % 3 === 0), durationMs: expect.any(Number), rc: 0, attempt: 1 },
+      { shard: 1, files: sortedFiles.filter((_, index) => index % 3 === 1), durationMs: expect.any(Number), rc: 0, attempt: 1 },
+      { shard: 2, files: sortedFiles.filter((_, index) => index % 3 === 2), durationMs: expect.any(Number), rc: 1, attempt: 1 },
+    ]);
+    expect(calls.filter((call) => call.startsWith('sweep '))).toHaveLength(0);
+  } finally { log.mockRestore(); }
+});
+
+test('cut Pod sweep leaves baseline execution on the serial path when the baseline cache is absent', async () => {
+  const { root, instanceRoot, runner: fixtureRunner, calls } = fake([], [], false);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const file = 'src/a.test.ts';
+  const command: GateRunner['command'] = async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: `${file}\n` };
+    if (cmd === 'bun' && args[0] === 'run') return { rc: 0, output: `1 pass\n0 fail\nRan 1 test across 1 file.\n` };
+    return fixtureRunner.command(cmd, args, cwd);
+  };
+  let podCalls = 0;
+  const runner = createGateRunner(repo, 'test-host', command, async () => {
+    podCalls++;
+    const artifactsDir = join(root, `cut-shard-${podCalls}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), `1 pass\n0 fail\nRan 1 test across 1 file.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+  runner.add = fixtureRunner.add;
+  runner.remove = fixtureRunner.remove;
+  runner.snapshot = fixtureRunner.snapshot;
+  runner.removeSnapshot = fixtureRunner.removeSnapshot;
+  const serialSweep = runner.sweep;
+  const sweptTrees: string[] = [];
+  runner.sweep = async (tree, logDir, pod) => {
+    sweptTrees.push(tree);
+    return serialSweep(tree, logDir, pod);
+  };
+  const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 1 } }, runner);
+  expect(result).toMatchObject({ outcome: 'ok', baselineSource: 'swept' });
+  expect(sweptTrees.map((tree) => tree.split('/').at(-1))).toEqual(['cut', 'baseline']);
+  expect(podCalls).toBe(1);
+  expect(calls.filter((call) => call.startsWith(`add ${BASE}`))).toHaveLength(1);
+});
+
+test('Pod sweep defaults to eight shards with a 1200-second deadline', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 10 }, (_, i) => `src/${String.fromCharCode(97 + i)}.test.ts`);
+  const invoked: RunPodCommandOptions[] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    invoked.push(o);
+    const artifactsDir = join(root, `default-shard-${invoked.length}`);
+    mkdirSync(artifactsDir);
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    writeFileSync(join(artifactsDir, 'shard.log'), `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 8, k3dCluster: 'test' }]));
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test' });
+  expect(invoked).toHaveLength(8);
+  expect(invoked.every((o) => o.deadlineSeconds === 1200 && o.source?.kind === 'commit')).toBe(true);
+  expect(result.rc).toBe(0);
+  expect(result.output).toContain('Ran 10 tests across 10 files.');
+  await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 3, shardTimeoutSeconds: 17 });
+  expect(invoked.slice(8)).toHaveLength(3);
+  expect(invoked.slice(8).every((o) => o.deadlineSeconds === 17)).toBe(true);
+});
+
+test('Pod accepts Ran 4 tests across 3 files out of four assigned without retrying', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 12 }, (_, i) => `src/${String.fromCharCode(97 + i)}.test.ts`);
+  const calls: number[] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const paths = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(paths.length);
+    const artifactsDir = join(root, `short-summary-${calls.length}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), `4 pass\n0 fail\nRan 4 tests across ${paths.includes(files[0]!) ? 3 : 4} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 3 });
+  expect(calls).toEqual([4, 4, 4]);
+  expect(result.rc).toBe(0);
+  expect(result.output).toContain('Ran 12 tests across 11 files.');
+});
+
+test('Pod splits OOMKilled four-file shard into two two-file jobs without repeating original', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 12 }, (_, i) => `src/${String.fromCharCode(97 + i)}.test.ts`);
+  const calls: number[] = [];
+  const splitEvents: unknown[] = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && event === 'pod-shard-split') splitEvents.push(data);
+  });
+  try {
+    const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+      return fixtureRunner.command(cmd, args, cwd);
+    }, async (o) => {
+      const paths = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+      const inFirst = paths.some((file) => files.indexOf(file) % 3 === 0);
+      if (inFirst) calls.push(paths.length);
+      const artifactsDir = join(root, `oom-shard-${o.name}`);
+      mkdirSync(artifactsDir);
+      if (inFirst && paths.length === 4) return { exitCode: 137, artifactsDir, job: 'fake' };
+      writeFileSync(join(artifactsDir, 'shard.log'), `${paths.length} pass\n0 fail\nRan ${paths.length} tests across ${paths.length} files.\n`);
+      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: 'fake' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+    const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 3 });
+    expect(calls).toEqual([4, 2, 2]);
+    expect(result.rc).toBe(0);
+    expect(result.output).toContain('Ran 12 tests across 12 files.');
+    expect(splitEvents).toContainEqual({ shard: 0, depth: 0, files: [files[0], files[3], files[6], files[9]], reason: 'job-failed' });
+  } finally { log.mockRestore(); }
+});
+
+test('Pod isolates an OOM file and retains the other three measured passes', async () => {
+  const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['src/a.test.ts', 'src/boom.test.ts', 'src/c.test.ts', 'src/d.test.ts'];
+  const calls: string[][] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(assigned);
+    const artifactsDir = join(root, `oom-${calls.length}`);
+    mkdirSync(artifactsDir);
+    if (assigned.includes('src/boom.test.ts')) return { exitCode: 137, artifactsDir, job: 'fake' };
+    writeFileSync(join(artifactsDir, 'shard.log'), `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]),
+  () => 'startup\nsrc/boom.test.ts:\n');
+  runner.add = fixtureRunner.add;
+  runner.remove = fixtureRunner.remove;
+  const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 1 } }, runner);
+  expect(result).toMatchObject({ outcome: 'error', stalledShards: [
+    { reason: 'job-failed', files: ['src/boom.test.ts'], lastFile: 'src/boom.test.ts' },
+  ], partialSummary: { pass: 3, fail: 0, errors: 0, ran: 3, files: 3 } });
+  expect(result.stalledShards).toHaveLength(1);
+  expect(calls).toEqual([files, files.slice(0, 2), files.slice(2), [files[0]!], [files[1]!]]);
+  expect(existsSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'))).toBe(false);
+});
+
+test('Pod OOM retains a root-level last started file from a partial shard.log even when the job log differs', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['foo.test.ts', 'src/a.test.ts', 'src/c.test.ts', 'src/d.test.ts'];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    if (assigned.includes('foo.test.ts')) {
+      writeFileSync(join(artifactsDir, 'shard.log'), 'src/a.test.ts:\nstartup\nfoo.test.ts:\n');
+      return { exitCode: 137, artifactsDir, job: 'fake' };
+    }
+    writeFileSync(join(artifactsDir, 'shard.log'), `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]),
+  () => 'src/a.test.ts:\n');
+  await expect(runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 })).rejects.toMatchObject({
+    stalledShards: [{ shard: 0, reason: 'job-failed', files: ['foo.test.ts'], lastFile: 'foo.test.ts' }],
+    partialSummary: { pass: 3, fail: 0, ran: 3, files: 3 },
+  });
+});
+
+test('Pod isolates two-file depth-two OOM leaves without losing healthy file results', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['src/a.test.ts', 'src/b.test.ts', 'src/boom.test.ts', 'src/d.test.ts',
+    'src/e.test.ts', 'src/f.test.ts', 'src/g.test.ts', 'src/h.test.ts'];
+  const calls: string[][] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(assigned);
+    const artifactsDir = join(root, `deep-${calls.length}`);
+    mkdirSync(artifactsDir);
+    if (assigned.includes('src/boom.test.ts')) return { exitCode: 137, artifactsDir, job: 'fake' };
+    writeFileSync(join(artifactsDir, 'shard.log'), `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => 'src/boom.test.ts:\n');
+  await expect(runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 })).rejects.toMatchObject({
+    stalledShards: [{ shard: 0, files: ['src/boom.test.ts'], reason: 'job-failed', lastFile: 'src/boom.test.ts' }],
+    partialSummary: { pass: 7, fail: 0, ran: 7, files: 7 },
+  });
+  expect(calls).toContainEqual(['src/boom.test.ts', 'src/d.test.ts']);
+  expect(calls).toContainEqual(['src/boom.test.ts']);
+  expect(calls).toContainEqual(['src/d.test.ts']);
+});
+
+test('Pod isolates every file of an out-of-memory shard so only the files that fail alone stay stalled', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 44 }, (_, index) => `src/file-${String(index).padStart(2, '0')}.test.ts`);
+  const calls: string[][] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(assigned);
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    if (assigned.length > 1 || assigned[0] === files[43]) return { exitCode: 137, artifactsDir, job: 'fake' };
+    writeFileSync(join(artifactsDir, 'shard.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
+  try {
+    await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+    throw new Error('expected the one stalled file');
+  } catch (error) {
+    const result = error as { stalledShards: Array<{ files: string[]; reason: string }>; partialSummary: { pass: number; files: number } };
+    expect(result.partialSummary).toMatchObject({ pass: 43, files: 43 });
+    expect(result.stalledShards.flatMap((item) => item.files).sort()).toEqual([files[43]]);
+    expect(result.stalledShards.every((item) => item.reason === 'job-failed')).toBe(true);
+  }
+  expect(calls.filter((assigned) => assigned.length === 1)).toHaveLength(44);
+});
+
+test('Pod isolates every file of a depth-two shard that ends with no output', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 44 }, (_, index) => `src/quiet-${String(index).padStart(2, '0')}.test.ts`);
+  const calls: string[][] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(assigned);
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    // 여러 파일 조각은 로그도 rc 도 남기지 않는다(no-output) · 파일 하나면 통과
+    if (assigned.length > 1 || assigned[0] === files[43]) return { exitCode: 0, artifactsDir, job: 'fake' };
+    writeFileSync(join(artifactsDir, 'shard.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
+  try {
+    await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+    throw new Error('expected the one stalled file');
+  } catch (error) {
+    const result = error as { stalledShards: Array<{ files: string[]; reason: string }>; partialSummary: { pass: number; files: number } };
+    expect(result.partialSummary).toMatchObject({ pass: 43, files: 43 });
+    expect(result.stalledShards.flatMap((item) => item.files).sort()).toEqual([files[43]]);
+    expect(result.stalledShards.every((item) => item.reason === 'no-output')).toBe(true);
+  }
+  expect(calls.filter((assigned) => assigned.length === 1)).toHaveLength(44);
+});
+
+test('Pod records the mismatch at an unattributed leaf', async () => {
+  const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts', 'src/d.test.ts'];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    const output = assigned.includes('src/b.test.ts')
+      ? `src/b.test.ts:\n(fail) B [1.00ms]\n0 pass\n2 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`
+      : `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`;
+    writeFileSync(join(artifactsDir, 'shard.log'), output);
+    writeFileSync(join(artifactsDir, 'shard.rc'), assigned.includes('src/b.test.ts') ? '1\n' : '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]));
+  runner.add = fixtureRunner.add;
+  runner.remove = fixtureRunner.remove;
+  const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 1 } }, runner);
+  expect(result).toMatchObject({ outcome: 'error', stalledShards: [
+    { shard: 0, reason: 'unattributed', files: ['src/b.test.ts'], summaryFailures: 2, namedFailures: 1 },
+  ], partialSummary: { pass: 3, fail: 0, ran: 3, files: 3 } });
+  expect(result.stalledShards).toHaveLength(1);
+  expect(result.stalledShards?.[0]?.detail).toContain('failure attribution incomplete: summary=2, identified=1');
+});
+
+test('Pod splits a shard when fail summary names fewer failures than reported', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 4 }, (_, i) => `src/${String.fromCharCode(97 + i)}.test.ts`);
+  const calls: number[] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const paths = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(paths.length);
+    const artifactsDir = join(root, `unattributed-${calls.length}`);
+    mkdirSync(artifactsDir);
+    const output = paths.length === 4
+      ? `src/a.test.ts:\n(fail) A [1.00ms]\n2 pass\n2 fail\nRan 4 tests across 4 files.\n`
+      : `${paths.length} pass\n0 fail\nRan ${paths.length} tests across ${paths.length} files.\n`;
+    writeFileSync(join(artifactsDir, 'shard.log'), output);
+    writeFileSync(join(artifactsDir, 'shard.rc'), paths.length === 4 ? '1\n' : '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+  expect(calls).toEqual([4, 2, 2]);
+  expect(result.rc).toBe(0);
+});
+
+test('Pod splits a shard whose summary omits assigned files and fails closed at depth two', async () => {
+  const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 10 }, (_, i) => `src/${String.fromCharCode(97 + i)}.test.ts`);
+  const attempts = [0, 0, 0];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const shard = files.findIndex((file) => o.command[2]!.includes(`'./${file}'`)) % 3;
+    attempts[shard]!++;
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    const reported = shard === 1 ? 0 : assigned.length;
+    const artifactsDir = join(root, `partial-${shard}-${attempts[shard]}`);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), `${reported} pass\n0 fail\nRan ${reported} tests across ${reported} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+  runner.add = fixtureRunner.add;
+  runner.remove = fixtureRunner.remove;
+  runner.snapshot = fixtureRunner.snapshot;
+  runner.removeSnapshot = fixtureRunner.removeSnapshot;
+  const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 3 } }, runner);
+  expect(attempts).toEqual([1, 5, 1]);
+  expect(result).toMatchObject({ outcome: 'error', stalledShards: [
+    { shard: 1, files: [files[1]], reason: 'incomplete' },
+    { shard: 1, files: [files[4]], reason: 'incomplete' },
+    { shard: 1, files: [files[7]], reason: 'incomplete' },
+  ] });
+  expect(existsSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'))).toBe(false);
+});
+
+test('Pod splits only incomplete shards and reports stalled leaves instead of publishing a baseline', async () => {
+  for (const [alwaysStall, missingSummary] of [[false, false], [false, true], [true, false], [true, true]]) {
+    const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    const files = Array.from({ length: 10 }, (_, i) => `src/${String.fromCharCode(97 + i)}.test.ts`);
+    const original = fixtureRunner.command;
+    const attempts: number[] = [0, 0, 0];
+    const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+      return original(cmd, args, cwd);
+    }, async (o) => {
+      const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+      const shard = files.indexOf(assigned[0]!) % 3;
+      attempts[shard]!++;
+      const artifactsDir = join(root, `retry-${shard}-${attempts[shard]}`);
+      mkdirSync(artifactsDir);
+      const incomplete = shard === 1 && (assigned.length === 3 || alwaysStall);
+      if (!incomplete || missingSummary) writeFileSync(join(artifactsDir, 'shard.log'), incomplete ? 'no summary\n' : `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+      if (!incomplete || missingSummary) writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: 'fake' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+    runner.add = fixtureRunner.add;
+    runner.remove = fixtureRunner.remove;
+    runner.snapshot = fixtureRunner.snapshot;
+    runner.removeSnapshot = fixtureRunner.removeSnapshot;
+    const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 3 } }, runner);
+    expect(attempts).toEqual([1, alwaysStall ? 5 : 3, 1]);
+    if (alwaysStall) {
+      expect(result).toMatchObject({ outcome: 'error', stalledShards: [
+        { shard: 1, files: [files[1]], reason: missingSummary ? 'incomplete' : 'no-output' },
+        { shard: 1, files: [files[4]], reason: missingSummary ? 'incomplete' : 'no-output' },
+        { shard: 1, files: [files[7]], reason: missingSummary ? 'incomplete' : 'no-output' },
+      ] });
+      expect(existsSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'))).toBe(false);
+    } else expect(result).toMatchObject({ outcome: 'ok', introduced: [] });
+  }
+});
+
+test('Pod splits thrown timeout or artifact retrieval errors and reports stalled leaves', async () => {
+  for (const recover of [true, false]) {
+    const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
+    const repo = join(root, 'repo');
+    mkdirSync(repo);
+    const files = Array.from({ length: 10 }, (_, i) => `src/${String.fromCharCode(97 + i)}.test.ts`);
+    const attempts = [0, 0, 0];
+    const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+      return fixtureRunner.command(cmd, args, cwd);
+    }, async (o) => {
+      const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+      const shard = files.indexOf(assigned[0]!) % 3;
+      attempts[shard]!++;
+      if (shard === 1 && (assigned.length === 3 || !recover)) throw new Error('artifact retrieval timeout');
+      const artifactsDir = join(root, `exception-${shard}-${attempts[shard]}`);
+      mkdirSync(artifactsDir);
+      writeFileSync(join(artifactsDir, 'shard.log'), `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: 'fake' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 3, k3dCluster: 'test' }]));
+    runner.add = fixtureRunner.add;
+    runner.remove = fixtureRunner.remove;
+    runner.snapshot = fixtureRunner.snapshot;
+    runner.removeSnapshot = fixtureRunner.removeSnapshot;
+    const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 3 } }, runner);
+    expect(attempts).toEqual([1, recover ? 3 : 5, 1]);
+    if (recover) expect(result).toMatchObject({ outcome: 'ok', introduced: [] });
+    else {
+      expect(result).toMatchObject({ outcome: 'error', stalledShards: [
+        { shard: 1, files: [files[1]], reason: 'job-failed' },
+        { shard: 1, files: [files[4]], reason: 'job-failed' },
+        { shard: 1, files: [files[7]], reason: 'job-failed' },
+      ] });
+      expect(existsSync(join(instanceRoot, 'release/1.0.1/gate-failures.json'))).toBe(false);
+    }
+  }
 });
 
 test('a shard with no Ran summary reports its name, rc and last output', async () => {
@@ -262,7 +1181,7 @@ test('file-level errors compare against the baseline and only reproduced new err
   const errorOutput = (file: string) => `${file}:\n# Unhandled error between tests\n0 fail\n1 errors\nRan 1 test across 1 file.\n`;
   const old = runner.command;
   runner.sweep = async (tree) => ({ rc: 1, output: errorOutput(tree.endsWith('/cut') ? 'src/b.test.ts' : 'src/a.test.ts') });
-  runner.command = async (cmd, args, cwd) => cmd === 'bun' && args[0] === 'run' && args[2] === 'src/b.test.ts'
+  runner.command = async (cmd, args, cwd) => cmd === 'bun' && args[0] === 'run' && args[2] === './src/b.test.ts'
     ? { rc: cwd.endsWith('/cut') ? 1 : 0, output: cwd.endsWith('/cut') ? errorOutput('src/b.test.ts') : runOutput([]) }
     : old(cmd, args, cwd);
   const cached = join(instanceRoot, 'release/1.0.0/gate-failures.json');
@@ -270,6 +1189,41 @@ test('file-level errors compare against the baseline and only reproduced new err
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'regression', introduced: ['src/b.test.ts > [error]'] });
   writeFileSync(cached, JSON.stringify({ commit: BASE, failures: [], errors: ['src/b.test.ts > [error]'] }));
   expect(await judgeGate(options(instanceRoot), runner)).toMatchObject({ outcome: 'ok', introduced: [] });
+});
+
+test('CLI and graph Pod options reach the cut gate and reject invalid shard counts before checkout', () => {
+  const { root } = fixture();
+  const context = join(root, 'pod-context.json');
+  writeFileSync(context, JSON.stringify({ input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gatePodPool: 'pool-test', gatePodShards: 0 }, outputs: {} }));
+  const graph = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--json'], {
+    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context },
+  });
+  expect(graph.status).toBe(2);
+  expect(JSON.parse(graph.stdout.trim())).toMatchObject({ outcome: 'error', error: 'invalid pod sweep options' });
+  const cli = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--commit', CUT, '--version', '1.0.1', '--baseline-version', '1.0.0', '--pod-shards', '0', '--pod-pool', 'pool-test', '--json'], {
+    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: '/nonexistent/context.json' },
+  });
+  expect(cli.status).toBe(2);
+  expect(JSON.parse(cli.stdout.trim())).toMatchObject({ outcome: 'error', error: 'invalid pod sweep options' });
+});
+
+test('graph gateRemoteMirror input is validated before touching the remote host', () => {
+  const { root } = fixture();
+  const context = join(root, 'context.json');
+  writeFileSync(context, JSON.stringify({ input: { commit: CUT, version: '1.0.1', previousVersion: '1.0.0', gateRemote: 'test-host', gateRemoteMirror: '/tmp/../caller' }, outputs: {} }));
+  const result = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--json'], {
+    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: context },
+  });
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'error', error: 'invalid remote mirror path' });
+});
+
+test('CLI --remote-mirror is validated before touching the remote host', () => {
+  const result = spawnSync('bun', [resolve(import.meta.dir, 'gate-node.ts'), '--commit', CUT, '--version', '1.0.1', '--baseline-version', '1.0.0', '--baseline-commit', BASE, '--remote', 'test-host', '--remote-mirror', '/tmp/../caller', '--json'], {
+    encoding: 'utf8', env: { ...process.env, ELANOUS_GRAPH_CONTEXT: '/nonexistent/context.json' },
+  });
+  expect(result.status).toBe(2);
+  expect(JSON.parse(result.stdout.trim())).toMatchObject({ outcome: 'error', error: 'invalid remote mirror path' });
 });
 
 test('graph gateRemote input is validated by the existing ssh host guard', () => {
@@ -365,5 +1319,153 @@ test('--help prints options and exits 0 without invoking a gate', () => {
   expect(result.status).toBe(0);
   expect(result.stdout).toContain('--baseline-version');
   expect(result.stdout).toContain('--remote');
+  expect(result.stdout).toContain('--remote-mirror');
+  expect(result.stdout).toContain('--pod-pool');
+  expect(result.stdout).toContain('--pod-shards');
   expect(result.stdout).toContain('--json');
+});
+
+test('Pod sweep waits for every shard to finish before reporting a shard error', async () => {
+  const { root } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['src/a.test.ts', 'src/b.test.ts'];
+  let slowFinished = false;
+  const runner = createGateRunner(repo, undefined, async (cmd, args) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return { rc: 0, output: '' };
+  }, async (o) => {
+    const slow = o.command[2]!.includes("'./src/b.test.ts'");
+    const artifactsDir = join(root, slow ? 'slow' : 'fast');
+    mkdirSync(artifactsDir, { recursive: true });
+    if (slow) { await new Promise((r) => setTimeout(r, 50)); slowFinished = true; }
+    writeFileSync(join(artifactsDir, 'shard.log'), '1 pass\n0 fail\nRan 1 tests across 1 files.\n');
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: slow ? 0 : 1, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 2, k3dCluster: 'test' }]));
+  await expect(runner.sweep(repo, undefined, { pool: 'pool-test', shards: 2 })).rejects.toMatchObject({
+    stalledShards: [{ shard: 0, files: [files[0]], reason: 'job-failed' }],
+  });
+  expect(slowFinished).toBe(true);
+});
+
+test('Pod sweep never assigns a CDP test to a shard, and only single-file isolation Jobs get the larger memory limit', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['scripts/webclone/check-layout-landmark.test.ts', 'src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts', 'src/d.test.ts'];
+  const calls: Array<{ files: string[]; memoryLimit?: string }> = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 0, output: 'scripts/webclone/check-layout-landmark.test.ts\n' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push({ files: assigned, ...(o.memoryLimit ? { memoryLimit: o.memoryLimit } : {}) });
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    if (assigned.length > 1) return { exitCode: 137, artifactsDir, job: 'fake' };
+    writeFileSync(join(artifactsDir, 'shard.log'), '1 pass\n0 fail\nRan 1 test across 1 file.\n');
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+  expect(result.output).toContain('Ran 4 tests across 4 files.');
+  expect(calls.some((call) => call.files.includes('scripts/webclone/check-layout-landmark.test.ts'))).toBe(false);
+  expect(calls.filter((call) => call.files.length === 1).every((call) => call.memoryLimit === '32Gi')).toBe(true);
+  expect(calls.filter((call) => call.files.length > 1).every((call) => call.memoryLimit === undefined)).toBe(true);
+});
+
+test('Pod isolates every file of a depth-two unattributed shard so the unnamed failure lands on one file', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 44 }, (_, index) => `src/file-${String(index).padStart(2, '0')}.test.ts`);
+  const culprit = files[17]!;
+  const calls: string[][] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(assigned);
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    // The culprit adds one failure to the summary that no «(fail)» line names — as in the 09-30 G1e shard 7 (summary 28 · named 27).
+    const bad = assigned.includes(culprit);
+    const pass = assigned.length - (bad ? 1 : 0);
+    writeFileSync(join(artifactsDir, 'shard.log'), `${pass} pass\n${bad ? 1 : 0} fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), bad ? '1\n' : '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
+  try {
+    await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+    throw new Error('expected the one unattributed file');
+  } catch (error) {
+    const result = error as { stalledShards: Array<{ files: string[]; reason: string }>; partialSummary: { pass: number; files: number } };
+    expect(result.stalledShards).toEqual([expect.objectContaining({ files: [culprit], reason: 'unattributed' })]);
+    expect(result.partialSummary).toMatchObject({ pass: 43, files: 43 });
+  }
+  expect(calls.filter((assigned) => assigned.length === 1).map((assigned) => assigned[0])).toContain(culprit);
+});
+
+test('Pod sweep never assigns a test under a hidden directory, which bun discovery never opens', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const hidden = ['scripts/.parked-still-broken-fixture/pass.test.ts', 'scripts/.parked-still-broken-fixture/fail.test.ts'];
+  const files = [...hidden, 'src/a.test.ts', 'src/b.test.ts'];
+  const calls: string[][] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push(assigned);
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    // An empty fixture run alone is «Ran 0 tests» — the gate reads that as incomplete, so it must never be scheduled.
+    const tests = assigned.filter((file) => !hidden.includes(file)).length;
+    writeFileSync(join(artifactsDir, 'shard.log'), `${tests} pass\n0 fail\nRan ${tests} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 4 });
+  expect(result.output).toContain('Ran 2 tests across 2 files.');
+  expect(calls.flat().some((file) => hidden.includes(file))).toBe(false);
+});
+
+test('Pod shards ask bun for a junit report and keep it beside the shard log, without changing the console the verdict reads', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = ['src/a.test.ts', 'src/b.test.ts'];
+  const commands: string[] = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    commands.push(o.command[2]!);
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    writeFileSync(join(artifactsDir, 'junit.xml'), assigned.map((file) => `<testsuite name="${file}" file="${file}" time="1.5">`).join('\n'));
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
+  const logDir = join(root, 'logs');
+  const result = await runner.sweep(repo, logDir, { pool: 'pool-test', shards: 1 });
+  expect(result.output).toContain('Ran 2 tests across 2 files.');
+  expect(commands.every((command) => command.includes('--reporter=junit --reporter-outfile="$HOME/outbox/junit.xml"'))).toBe(true);
+  expect(readFileSync(join(logDir, 'pod-0.junit.xml'), 'utf8')).toContain('file="src/b.test.ts" time="1.5"');
 });

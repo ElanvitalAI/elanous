@@ -1,7 +1,7 @@
 import type { Command } from 'commander';
 import { resolve } from 'node:path';
 import { getUserConfig, reloadUserConfig } from '../user-config.js';
-import { needsOnboarding, runOnboarding } from '../onboarding.js';
+import { handleOnboardingRefusal, needsOnboarding, runOnboarding } from '../onboarding.js';
 import { runTurn, ensureCliSession, sessionBudget } from '../session/chat.js';
 import { NoLlmProviderAvailableError, noProviderAvailableMessage } from '../llm.js';
 import { resolveSessionId, getActiveSessionId, setActiveSessionId } from '../session/index.js';
@@ -93,7 +93,12 @@ export function registerAgentCommands(program: Command): void {
     const cfg = getUserConfig();
     if (needsOnboarding(cfg)) {
       ui.info('No config yet — launching setup wizard first.');
-      await runOnboarding();
+      try {
+        await runOnboarding();
+      } catch (error) {
+        if (handleOnboardingRefusal(error, 'agent')) return;
+        throw error;
+      }
     }
     const refreshed = reloadUserConfig();
     await runChatTurnCli({

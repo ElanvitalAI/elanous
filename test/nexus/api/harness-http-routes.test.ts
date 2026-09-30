@@ -93,22 +93,8 @@ describe('harness HTTP routes', () => {
     );
   });
 
-  test('return 503 before meta API wiring without reaching handlers', async () => {
+  test('return 401 before meta API wiring without reaching handlers', async () => {
     const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort() });
-    try {
-      for (const route of routes) {
-        const response = await fetch(`${server.url}${route.path}`, request(route));
-        expect(response.status).toBe(503);
-        await expect(response.json()).resolves.toEqual({ error: 'meta-api-runtime-not-wired' });
-      }
-      expect(calls).toEqual(expectedCalls(0));
-    } finally {
-      server.stop();
-    }
-  });
-
-  test('return 401 before reaching handlers when authentication fails', async () => {
-    const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort(), metaApi: { bearerToken: 'test-token' } });
     try {
       for (const route of routes) {
         const response = await fetch(`${server.url}${route.path}`, request(route));
@@ -121,8 +107,35 @@ describe('harness HTTP routes', () => {
     }
   });
 
+  test('return 401 before reaching handlers when authentication fails', async () => {
+    const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort(), metaApi: { bearerToken: 'test-token', noAuth: false } });
+    try {
+      for (const route of routes) {
+        const response = await fetch(`${server.url}${route.path}`, request(route));
+        expect(response.status).toBe(401);
+        await expect(response.json()).resolves.toEqual({ error: 'unauthorized' });
+      }
+      expect(calls).toEqual(expectedCalls(0));
+    } finally {
+      server.stop();
+    }
+  });
+
+  test('authenticated unknown harness route reaches the behind-gate 404', async () => {
+    const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort(), metaApi: { bearerToken: 'test-token', noAuth: false } });
+    try {
+      const response = await fetch(`${server.url}/v1/harness/not-a-route`, {
+        headers: { authorization: 'Bearer test-token' },
+      });
+      expect(response.status).toBe(404);
+      expect(calls).toEqual(expectedCalls(0));
+    } finally {
+      server.stop();
+    }
+  });
+
   test('dispatch authenticated requests to every exported handler through the HTTP server', async () => {
-    const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort(), metaApi: { bearerToken: 'test-token' } });
+    const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort(), metaApi: { bearerToken: 'test-token', noAuth: false } });
     try {
       for (const route of routes) {
         const response = await fetch(`${server.url}${route.path}`, request(route, true));
@@ -140,7 +153,7 @@ describe('harness HTTP routes', () => {
   });
 
   test('preserves run-events handler responses and GET-only routing', async () => {
-    const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort(), metaApi: { bearerToken: 'test-token' } });
+    const server = startNexusHttpServer({ ...fixture(), startPort: await uniquePort(), metaApi: { bearerToken: 'test-token', noAuth: false } });
     try {
       const missingRunId = await fetch(`${server.url}/v1/harness/run-events`, { headers: { authorization: 'Bearer test-token' } });
       expect(missingRunId.status).toBe(400);
@@ -174,7 +187,7 @@ describe('harness HTTP routes', () => {
       });
       return Response.json({ handler: 'handleHarnessAskPost' }, { status: 202 });
     };
-    const server = startNexusHttpServer({ state, registry, eventBus, startPort: await uniquePort(), metaApi: { bearerToken: 'test-token' } });
+    const server = startNexusHttpServer({ state, registry, eventBus, startPort: await uniquePort(), metaApi: { bearerToken: 'test-token', noAuth: false } });
     try {
       const response = await fetch(`${server.url}/v1/harness/ask`, {
         method: 'POST',

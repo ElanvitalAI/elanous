@@ -1,8 +1,8 @@
 // NEXUS N-1.5 PR d — voice / push / attachments meta-API routing tests.
 //
 // Verifies the route table on NEXUS HTTP server:
-//  · without `metaApi` opts → all meta-API paths return 503
-//  · with `metaApi` opts but missing dependencies → graceful 401/503
+//  · without `metaApi` opts → protected paths return 401; public VAPID key stays 503
+//  · with authenticated `metaApi` opts but missing dependencies → graceful 503
 //  · auth gating respects bearerToken / noAuth
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
@@ -54,7 +54,7 @@ function uniquePort(): number {
 }
 
 describe('NEXUS meta-API — voice / push / attachments (PR d)', () => {
-  test('without metaApi opts, /v1/push/vapid-public-key returns 503', async () => {
+  test('without metaApi opts, public /v1/push/vapid-public-key returns 503', async () => {
     const fix = makeFixture();
     const port = uniquePort();
     const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
@@ -66,7 +66,7 @@ describe('NEXUS meta-API — voice / push / attachments (PR d)', () => {
     } finally { srv.stop(); }
   });
 
-  test('without metaApi opts, /v1/push/subscribe POST returns 503', async () => {
+  test('without metaApi opts, /v1/push/subscribe POST returns 401', async () => {
     const fix = makeFixture();
     const port = uniquePort();
     const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
@@ -76,27 +76,77 @@ describe('NEXUS meta-API — voice / push / attachments (PR d)', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({}),
       });
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
-  test('without metaApi opts, /v1/voice/cost returns 503', async () => {
+  test('without metaApi opts, /v1/voice/cost returns 401', async () => {
     const fix = makeFixture();
     const port = uniquePort();
     const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
     try {
       const res = await fetch(`${srv.url}/v1/voice/cost`);
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
-  test('without metaApi opts, /v1/attachments POST returns 503', async () => {
+  test('without metaApi opts, /v1/attachments POST returns 401', async () => {
     const fix = makeFixture();
     const port = uniquePort();
     const srv = startNexusHttpServer({ ...fix, eventBus: fix.bus, startPort: port });
     try {
       const res = await fetch(`${srv.url}/v1/attachments`, { method: 'POST' });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
+    } finally { srv.stop(); }
+  });
+
+  test('authenticated /v1/push/subscribe reaches body validation', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix, eventBus: fix.bus, startPort: uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/push/subscribe`, {
+        method: 'POST',
+        headers: { authorization: 'Bearer test-token', 'content-type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      expect(res.status).toBe(400);
+    } finally { srv.stop(); }
+  });
+
+  test('authenticated /v1/attachments reaches upload validation', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix, eventBus: fix.bus, startPort: uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/attachments`, {
+        method: 'POST', headers: { authorization: 'Bearer test-token' },
+      });
+      expect(res.status).toBe(400);
+    } finally { srv.stop(); }
+  });
+
+  test('authenticated /v1/voice/cost with no voiceRest returns 503', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix,
+      eventBus: fix.bus,
+      startPort: uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/voice/cost`, {
+        headers: { authorization: 'Bearer test-token' },
+      });
       expect(res.status).toBe(503);
+      expect((await res.json()).error).toBe('voice-rest-disabled');
     } finally { srv.stop(); }
   });
 
@@ -115,17 +165,19 @@ describe('NEXUS meta-API — voice / push / attachments (PR d)', () => {
     } finally { srv.stop(); }
   });
 
-  test('with metaApi noAuth=true, voice transcribe falls through to 503 (no voiceRest)', async () => {
+  test('authenticated voice transcribe falls through to 503 (no voiceRest)', async () => {
     const fix = makeFixture();
     const port = uniquePort();
     const srv = startNexusHttpServer({
       ...fix,
       eventBus: fix.bus,
       startPort: port,
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/voice/transcribe`, { method: 'POST' });
+      const res = await fetch(`${srv.url}/v1/voice/transcribe`, {
+        method: 'POST', headers: { authorization: 'Bearer test-token' },
+      });
       expect(res.status).toBe(503);
       const body = await res.json();
       expect(body.error).toBe('voice-rest-disabled');
@@ -135,9 +187,8 @@ describe('NEXUS meta-API — voice / push / attachments (PR d)', () => {
   // VAPID public key happy path is not covered here — the
   // `web-push` npm package is not installed in this repo's bun test
   // environment (same reason `daemon-public-server.test.ts` skips it
-  // on main HEAD). We instead verify the *not-wired* path (503) via
-  // the test above; the wired path is covered by integration testing
-  // post-T3 reactivation.
+  // on main HEAD). We verify the public route's *not-wired* path (503)
+  // above; the wired path is covered by integration testing post-T3.
 
   test('non-meta-api routes (e.g., /v1/health) work alongside metaApi opts', async () => {
     const fix = makeFixture();
@@ -146,7 +197,7 @@ describe('NEXUS meta-API — voice / push / attachments (PR d)', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: port,
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       const res = await fetch(`${srv.url}/v1/health`);
@@ -161,10 +212,12 @@ describe('NEXUS meta-API — voice / push / attachments (PR d)', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: port,
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/attachments/not-a-valid-id`);
+      const res = await fetch(`${srv.url}/v1/attachments/not-a-valid-id`, {
+        headers: { authorization: 'Bearer test-token' },
+      });
       expect(res.status).toBe(400);
     } finally { srv.stop(); }
   });

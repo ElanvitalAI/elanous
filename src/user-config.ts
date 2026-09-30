@@ -784,6 +784,12 @@ export interface TelegramChannel {
 }
 
 /** 저장된 telegram.channels[] 파싱. 각 항목은 botToken+chatId 필수. fail-soft. */
+function normalizeKindRoles(raw: unknown): Record<string, string> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out = Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter((e): e is [string, string] => typeof e[1] === 'string' && e[1].length > 0));
+  return Object.keys(out).length ? out : undefined;
+}
+
 function normalizeTelegramChannels(raw: unknown): TelegramChannel[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const out: TelegramChannel[] = [];
@@ -824,6 +830,9 @@ export interface TelegramConfig {
   /** 누가 Q&A 폴링을 하나 — 기본(없음·`'nexus'`)은 넥서스 데몬, `'standalone'` 이면
    *  넥서스는 폴링하지 않고 `elanous telegram run` 이 맡는다. */
   poller?: 'nexus' | 'standalone';
+  /** 발송 목적(kind) → 채널 역할. 명시 `channels` 가 있을 때만 쓴다 — 표에 없는 kind 는 옛 `reportChannel` 로 간다.
+   *  기본표는 `DEFAULT_KIND_ROLES`(telegram-report.ts) · 여기 값이 덮어쓴다. */
+  kindRoles?: Record<string, string>;
 }
 
 const TELEGRAM_DEFAULTS: TelegramConfig = { enabled: false, allowedUsers: [] };
@@ -3315,12 +3324,12 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 
 export interface UserConfig {
   /** Steward loop: observe-only until an independently approved act implementation exists. */
-  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number } };
+  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string> } };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
   harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
-  pod?: { pool?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string };
+  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -4106,6 +4115,15 @@ function observeRetiredConfigKeysOnce(raw: Record<string, unknown>): void {
   } catch { /* observation must never break config loading */ }
 }
 
+/** Owner tracks the steward may assign (key → what that track owns). The one place the role table lives. */
+function parseStewardTracks(input: unknown): Record<string, string> | undefined {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
+  const out = Object.fromEntries(Object.entries(input as Record<string, unknown>)
+    .filter((e): e is [string, string] => /^[A-Za-z][\w-]{0,15}$/.test(e[0]) && typeof e[1] === 'string' && e[1].trim().length > 0)
+    .map(([k, v]) => [k, v.trim()]));
+  return Object.keys(out).length ? out : undefined;
+}
+
 function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
   const value = (input as Record<string, unknown>).steward;
@@ -4124,6 +4142,7 @@ function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
     ...(typeof s.linearTeam === 'string' && s.linearTeam.trim() ? { linearTeam: s.linearTeam.trim() } : {}),
     ...(Object.keys(roles).length ? { roles } : {}),
     ...(typeof s.budget === 'number' && Number.isFinite(s.budget) && s.budget >= 0 ? { budget: s.budget } : {}),
+    ...(parseStewardTracks(s.tracks) ? { tracks: parseStewardTracks(s.tracks)! } : {}),
   } };
 }
 
@@ -4233,6 +4252,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   return {
     pod: {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
+      ...(typeof legacyPod.hostMirror === 'string' && legacyPod.hostMirror.trim() ? { hostMirror: legacyPod.hostMirror.trim() } : {}),
       ...(typeof legacyPod.groundingUrl === 'string' ? { groundingUrl: legacyPod.groundingUrl } : {}),
     },
     harness: {
@@ -4372,6 +4392,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       channels: normalizeTelegramChannels(tg.channels),
       testChannel: normalizeTestChannel(tg.testChannel),
       ...(tg.poller === 'standalone' || tg.poller === 'nexus' ? { poller: tg.poller } : {}),
+      ...(normalizeKindRoles(tg.kindRoles) ? { kindRoles: normalizeKindRoles(tg.kindRoles)! } : {}),
     },
     discord: {
       enabled: dc.enabled === true,
@@ -5426,6 +5447,11 @@ export function saveUserConfig(
   const rawHarness = rawRest.harness && typeof rawRest.harness === 'object' && !Array.isArray(rawRest.harness)
     ? rawRest.harness as Record<string, unknown> : {};
   delete rawRest.harness;
+  if (cfg.pod?.hostMirror) {
+    const rawPod = rawRest.pod && typeof rawRest.pod === 'object' && !Array.isArray(rawRest.pod)
+      ? rawRest.pod as Record<string, unknown> : {};
+    rawRest.pod = { ...rawPod, hostMirror: cfg.pod.hostMirror };
+  }
 
   const out: Record<string, unknown> = {
     harness: stripUndef({

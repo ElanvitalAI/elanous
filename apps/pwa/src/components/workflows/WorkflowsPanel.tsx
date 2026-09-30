@@ -13,6 +13,7 @@
 
 'use client';
 
+import { newWorkflowNameProblem, withWorkflowName, workflowSaveErrorText } from './workflow-save';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   GitBranch,
@@ -127,6 +128,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [creatingNew, setCreatingNew] = useState(false);
   const [newName, setNewName] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
   // Keep the YAML subview available for raw edits; open the existing graph editor first.
   const [editorMode, setEditorMode] = useState<'yaml' | 'graph'>('graph');
   // §5.2 follow-up — Active Runs view replaces the editor pane
@@ -298,21 +300,26 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   };
 
   const handleSave = async () => {
+    setSaveError(null);
+    if (creatingNew) {
+      const problem = newWorkflowNameProblem(newName);
+      if (problem) { setSaveError(problem); return; }
+    }
     const targetName = creatingNew ? newName.trim() : selectedName;
     if (!targetName) return;
-    if (creatingNew && !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(targetName)) {
-      // surface via the validation panel
-      return;
-    }
+    // The daemon rejects a body whose `name:` differs from the path (422 name mismatch) —
+    // a new workflow's YAML still says `my-workflow` until we write the typed name into it.
+    const yaml = creatingNew ? withWorkflowName(draftYaml, targetName) : draftYaml;
+    if (yaml !== draftYaml) setDraftYaml(yaml);
     try {
       await save.mutateAsync({
         name: targetName,
-        body: { yaml: draftYaml, scope: 'project' },
+        body: { yaml, scope: 'project' },
       });
       setCreatingNew(false);
       setSelectedName(targetName);
-    } catch {
-      // mutation error surfaces in the badge
+    } catch (err) {
+      setSaveError(workflowSaveErrorText(err));
     }
   };
 
@@ -634,6 +641,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
                   <WorkflowNodeEditor
                     definition={parsedDef}
                     nodeId={selectedNodeId}
+                    palette={palette}
                     onChange={(nextDef) => setDraftYaml(definitionToYaml(nextDef))}
                     onClose={() => setSelectedNodeId(null)}
                     onDelete={() => {
@@ -700,6 +708,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
             </ul>
           )}
           <footer className="flex items-center justify-end gap-2 border-t border-border px-3 py-2">
+            {saveError && <p role="alert" className="mr-auto text-[11px] text-error">{saveError}</p>}
             {selectedName && !isReadonly && !creatingNew && (
               <button
                 type="button"

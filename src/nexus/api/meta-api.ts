@@ -254,6 +254,10 @@ function decideAuth(req: Request, opts: MetaApiOpts): { ok: boolean; reason: Aut
   if (isSameOriginRequest(req, peerAddress)) return { ok: true, reason: 'same-origin' };
   const peerRejected = req.headers.get('sec-fetch-site') === 'same-origin'
     && !isTrustedSameOriginPeer(peerAddress);
+  return decideBearer(req, opts, peerRejected);
+}
+
+function decideBearer(req: Request, opts: MetaApiOpts, peerRejected = false): { ok: boolean; reason: AuthReason } {
   const token = opts.bearerToken;
   if (!token) return { ok: false, reason: peerRejected ? 'untrusted-same-origin-peer' : 'no-bearer-configured' };
   const auth = req.headers.get('authorization') ?? '';
@@ -271,6 +275,16 @@ function decideAuth(req: Request, opts: MetaApiOpts): { ok: boolean; reason: Aut
   return diff === 0
     ? { ok: true, reason: 'bearer-match' }
     : { ok: false, reason: 'bearer-mismatch' };
+}
+
+/** Bearer-only credential check that ignores the same-origin shortcut. `checkAuth` returns
+ * `same-origin` before it ever looks at the Authorization header, so a paired PWA that sends its
+ * token is still reported as same-origin — write paths that must not trust same-origin alone
+ * (graph approvals) ask this instead. Returns the credential kind, or undefined if none matched. */
+export function bearerCredential(req: Request, opts: MetaApiOpts): 'noauth' | 'bearer-match' | 'temp-token' | undefined {
+  if (opts.noAuth) return 'noauth';
+  const decision = decideBearer(req, opts);
+  return decision.ok && (decision.reason === 'bearer-match' || decision.reason === 'temp-token') ? decision.reason : undefined;
 }
 
 // Exported so sibling NEXUS API modules (e.g. T5.G `tasks-scheduler.ts`)

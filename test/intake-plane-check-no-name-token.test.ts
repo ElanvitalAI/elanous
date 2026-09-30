@@ -1,7 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import {
   GAP_VERDICTS,
   intakeCheckReportJson,
@@ -11,6 +9,7 @@ import {
   type IntakeCheckDeps,
 } from '../src/intake-plane/check.js';
 import { buildIntakeDocumentStageCallables } from '../src/intake-plane/runtime-callables.js';
+import { createIntakeFakeRepo } from './helpers/intake-fake-repo.js';
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -18,17 +17,7 @@ afterEach(() => {
 });
 
 function fixture(over: Partial<IntakeCheckDeps> = {}): IntakeCheckDeps {
-  const root = mkdtempSync(join(tmpdir(), 'intake-no-name-'));
-  dirs.push(root);
-  return {
-    root,
-    draftDir: join(root, 'drafts'),
-    readFile: () => '',
-    listFiles: () => [],
-    commit: () => 'fixture',
-    log: () => {},
-    ...over,
-  };
+  return { ...createIntakeFakeRepo(dirs, 'intake-no-name-'), listFiles: () => [], ...over };
 }
 
 const unnamed = 'elanous 는 목표 수행 중 정보가 모자라면 사용자에게 질문한다';

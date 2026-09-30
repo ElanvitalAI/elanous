@@ -57,7 +57,7 @@ describe('TaskBoardView detail wiring', () => {
       expect(markup).toContain(`aria-label="${name} column"`);
     }
     expect(markup).toContain('Inspect board');
-    expect(markup).toContain('Incidents 1 · 12345678');
+    expect(markup).toContain('사고 1 · 런 12345678');
     expect(markup).toContain('2023-11-14T22:13:23.000Z');
     expect(markup).not.toContain('12345678-90ab');
   });
@@ -73,8 +73,8 @@ describe('TaskBoardView detail wiring', () => {
     expect(openIncidentCount(open)).toBe(2);
     expect(openIncidentCount(resolved)).toBe(1);
     const markup = renderToStaticMarkup(<TaskBoardView cards={[resolved]} selectedId={null} onSelect={() => {}} />);
-    expect(markup).toContain('Incidents 1 ·');
-    expect(markup).not.toContain('Incidents 2 ·');
+    expect(markup).toContain('사고 1 ·');
+    expect(markup).not.toContain('사고 2 ·');
     const wire: TaskCardWire = {
       id: 'task-1', goalId: 'goal-1', title: 'Incident transitions', status: 'open',
       createdAt: '2023-11-14T22:13:20.000Z',

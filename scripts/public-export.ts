@@ -23,6 +23,7 @@ import { userInfo } from 'node:os';
 import { dirname, join, posix, resolve } from 'node:path';
 import ts from 'typescript';
 import { parse } from 'yaml';
+import { spawnSyncText } from '../src/util/spawn-sync-output.js';
 
 export interface ExportTransform {
   readonly id: string;
@@ -369,9 +370,7 @@ export function summarizeLeaks(hits: readonly LeakHit[]): Record<string, { hits:
 }
 
 function trackedFiles(root: string): string[] {
-  const listed = spawnSync('git', ['-C', root, 'ls-files', '-z'], { encoding: 'utf8' });
-  if (listed.status !== 0) throw new Error(`git ls-files failed: ${listed.stderr.trim()}`);
-  return listed.stdout.split('\0').filter(Boolean);
+  return spawnSyncText('git', ['-C', root, 'ls-files', '-z']).split('\0').filter(Boolean);
 }
 
 export function run(argv: readonly string[], root = resolve(import.meta.dir, '..')): number {

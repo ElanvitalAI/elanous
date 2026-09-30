@@ -91,12 +91,15 @@ describe('http-server dispatch · GET /v1/devices through fetch', () => {
       ...fixture,
       eventBus: fixture.bus,
       startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
       devices: {
         fleetSource: staticDeviceFleetSource([]),
       },
     });
     try {
-      const response = await fetch(`${server.url}/v1/devices`);
+      const response = await fetch(`${server.url}/v1/devices`, {
+        headers: { authorization: 'Bearer test-token' },
+      });
       expect(response.status).toBe(200);
       expect(response.status).not.toBe(404);
       expect(response.status).not.toBe(405);
@@ -106,15 +109,30 @@ describe('http-server dispatch · GET /v1/devices through fetch', () => {
     }
   });
 
+  test('without metaApi, devices route is denied before reaching its handler', async () => {
+    const fixture = makeHttpFixture();
+    const server = startNexusHttpServer({
+      ...fixture, eventBus: fixture.bus, startPort: await uniquePort(),
+    });
+    try {
+      const response = await fetch(`${server.url}/v1/devices`);
+      expect(response.status).toBe(401);
+      await expect(response.json()).resolves.toEqual({ error: 'unauthorized' });
+    } finally { server.stop(); }
+  });
+
   test('unwired devices route preserves the 503 not-wired response', async () => {
     const fixture = makeHttpFixture();
     const server = startNexusHttpServer({
       ...fixture,
       eventBus: fixture.bus,
       startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const response = await fetch(`${server.url}/v1/devices`);
+      const response = await fetch(`${server.url}/v1/devices`, {
+        headers: { authorization: 'Bearer test-token' },
+      });
       expect(response.status).toBe(503);
       await expect(response.json()).resolves.toEqual({ error: 'devices-not-wired' });
     } finally {

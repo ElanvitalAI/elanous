@@ -125,13 +125,18 @@ export function createPodLedgerFollower(opts: {
   let disabled = false;
   let lastProgressAt = now();
   let lastProgressEvent: string | null = null;
+  let lastActivityMeasuredAt = lastProgressAt;
+  let lastActivityLogAt = -Infinity;
   let nextStallMinute = stallMinutes;
   let stalled = false;
-  function checkStall() {
+  function checkStall(ledgerRead: boolean, activityMeasured: boolean) {
     const idleMinutes = Math.max(0, (now() - lastProgressAt) / 60_000);
     if (idleMinutes >= nextStallMinute) {
       log('self-implement.pod', 'stalled', { runId: opts.runId, lastProgressEvent, idleMinutes });
-      onStall(`[pod] 진행 없음 ${Math.floor(idleMinutes)}분 — 마지막 진행 ${lastProgressEvent ?? '없음'}`);
+      const observation = ledgerRead
+        ? (activityMeasured ? '원장·작업 트리 모두 조용함' : '원장 조용함')
+        : '원장 못 잼';
+      onStall(`[pod] 진행 없음 ${Math.floor(idleMinutes)}분 — ${observation} · 마지막 진행 ${lastProgressEvent ?? '없음'}${activityMeasured ? '' : ' (작업 트리 못 잼)'}`);
       stalled = true;
       nextStallMinute = (Math.floor(idleMinutes / stallMinutes) + 1) * stallMinutes;
     }
@@ -145,13 +150,38 @@ export function createPodLedgerFollower(opts: {
         log('self-implement.pod', 'ledger-live-skipped', { runId: opts.runId, reason: 'host-ledger-exists' });
         return;
       }
-      const r = opts.exec(`f="\${ELANOUS_STATE_DIR:-$HOME/.elanous}/run-ledger/${opts.runId}.jsonl"; [ -f "$f" ] || exit 0; tail -c +${offset + 1} "$f"`);
-      if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); checkStall(); return; }
-      if (!r.stdout) { checkStall(); return; }
-      offset += Buffer.byteLength(r.stdout);
-      const text = pending + r.stdout;
+      const since = `${Math.floor(lastActivityMeasuredAt / 1000)}.${String(lastActivityMeasuredAt % 1000).padStart(3, '0')}`;
+      const measurementStartedAt = now();
+      const until = `${Math.floor(measurementStartedAt / 1000)}.${String(measurementStartedAt % 1000).padStart(3, '0')}`;
+      const r = opts.exec(`s="\${ELANOUS_STATE_DIR:-$HOME/.elanous}"; f="$s/run-ledger/${opts.runId}.jsonl"; w="$s/worktrees"; if [ -f "$f" ]; then tail -c +${offset + 1} "$f" || exit 1; fi; target=''; matches=0; for tree in "$w"/*/*.worktrees/*; do [ -e "$tree/.git" ] || continue; owner=$(git -C "$tree" config --worktree --get elanous.harness.owner 2>/dev/null) || continue; [ "$owner" = 'dev:${opts.runId}' ] || continue; target="$tree"; matches=$((matches + 1)); done; if [ "$matches" -eq 1 ]; then activity=$(find "$target" -type d \\( -name .git -o -name node_modules \\) -prune -o -type f -newermt '@${since}' ! -newermt '@${until}' -printf . 2>/dev/null) && printf '\\nELANOUS_ACTIVITY %s\\n' "\${#activity}" || printf '\\nELANOUS_ACTIVITY_ERROR\\n'; else printf '\\nELANOUS_ACTIVITY_ERROR\\n'; fi`);
+      if (r.status !== 0) { log('self-implement.pod', 'ledger-live-unavailable', { runId: opts.runId, status: r.status, stderr: r.stderr.trim().slice(0, 200) }); checkStall(false, false); return; }
+      const marker = r.stdout.lastIndexOf('\nELANOUS_ACTIVITY');
+      const activityLine = marker < 0 ? '' : r.stdout.slice(marker + 1);
+      const activityMatch = /^ELANOUS_ACTIVITY (0|[1-9]\d*)\n$/.exec(activityLine);
+      const activityMeasured = !!activityMatch && Number.isSafeInteger(Number(activityMatch[1]));
+      // A missing measurement trailer is still a usable ledger response unless it contains activity protocol bytes.
+      const ledgerBytes = marker < 0 ? (r.stdout.includes('ELANOUS_ACTIVITY') ? '' : r.stdout) : r.stdout.slice(0, marker);
+      if (activityMeasured) {
+        lastActivityMeasuredAt = measurementStartedAt;
+        const files = Number(activityMatch![1]);
+        if (files > 0) {
+          const idleMinutes = Math.max(0, (now() - lastProgressAt) / 60_000);
+          if (stalled) log('self-implement.pod', 'stall-cleared', { runId: opts.runId, idleMinutes });
+          stalled = false;
+          lastProgressAt = now();
+          lastProgressEvent = 'worktree-activity';
+          nextStallMinute = stallMinutes;
+          if (now() - lastActivityLogAt >= 5 * 60_000) {
+            log('self-implement.pod', 'worktree-activity', { runId: opts.runId, files });
+            lastActivityLogAt = now();
+          }
+        }
+      }
+      if (!ledgerBytes) { checkStall(true, activityMeasured); return; }
+      offset += Buffer.byteLength(ledgerBytes);
+      const text = pending + ledgerBytes;
       const cut = text.lastIndexOf('\n');
-      if (cut < 0) { pending = text; checkStall(); return; }
+      if (cut < 0) { pending = text; checkStall(true, activityMeasured); return; }
       const complete = text.slice(0, cut + 1);
       pending = text.slice(cut + 1);
       mkdirSync(dir, { recursive: true });
@@ -171,7 +201,7 @@ export function createPodLedgerFollower(opts: {
         lastProgressEvent = event;
         nextStallMinute = stallMinutes;
       }
-      checkStall();
+      checkStall(true, activityMeasured);
     },
   };
 }

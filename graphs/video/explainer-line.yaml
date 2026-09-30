@@ -1,0 +1,58 @@
+# «N가지 한 번에 정리» explainer: facts → script → timed VO → composition → checked render → measured QC.
+# Engine = skills/explainer-video (vo.ts · build.mjs). Render/snapshot/check = the existing hyperframes-render recipe.
+# ⚠️ Recipes explainer-script / explainer-vo / explainer-build / explainer-qc are declared here and not yet coded
+#    (src/video-pipeline/recipes) — a walk stops at the first of them as «unknown recipe». Until then the skill runs these steps.
+graph_id: explainer-line
+version: 1
+entry_node: script
+terminal_nodes: [delivered, needs-human, blocked, unobserved]
+nodes:
+  - node_id: script
+    kind: agent
+    recipe: explainer-script
+    max_visits: 3
+    contract: { inputs: [facts, sources], tools: read-only, outputs: [script_path] }
+  - node_id: vo
+    kind: agent
+    recipe: explainer-vo
+    max_visits: 2
+    contract: { inputs: [script_path], tools: network-write, outputs: [vo_dir, narration_seconds] }
+  - node_id: build
+    kind: agent
+    recipe: explainer-build
+    max_visits: 3
+    contract: { inputs: [script_path, vo_dir], tools: workspace-write, outputs: [hyperframes_project, timeline_path] }
+  - node_id: render
+    kind: gate
+    recipe: hyperframes-render
+    max_visits: 2
+    contract: { inputs: [hyperframes_project], tools: workspace-write, outputs: [hf_render_path, hf_snapshot_dir, hf_check] }
+  - node_id: qc
+    kind: gate
+    recipe: explainer-qc
+    max_visits: 2
+    contract: { inputs: [hf_render_path, script_path], tools: read-and-run, outputs: [vo_match, loudness_lufs, true_peak_db] }
+  - node_id: delivered
+    kind: judge
+    recipe: terminal-delivered
+    max_visits: 1
+  - node_id: needs-human
+    kind: judge
+    recipe: terminal-needs-human
+    max_visits: 1
+  - node_id: blocked
+    kind: judge
+    recipe: terminal-blocked
+    max_visits: 1
+  - node_id: unobserved
+    kind: judge
+    recipe: terminal-unobserved
+    max_visits: 1
+edges:
+  - { from: script, on: outcome, map: { ok: vo, no-facts: needs-human, unmeasurable: unobserved } }
+  - { from: vo, on: outcome, map: { ok: build, no-key: needs-human, error: blocked, unmeasurable: unobserved } }
+  - { from: build, on: outcome, map: { ok: render, bad-script: script, error: blocked, unmeasurable: unobserved } }
+  # check/snapshot failures are layout faults → rebuild; a wrong-length render is a timing fault → rebuild too.
+  - { from: render, on: outcome, map: { ok: qc, check-fail: build, render-mismatch: build, unmeasurable: unobserved } }
+  # speech ≠ script → re-voice that line; loudness off → rebuild (mix lives in the composition); public release is a human call.
+  - { from: qc, on: outcome, map: { pass: delivered, vo-mismatch: vo, loudness: build, public: needs-human, unmeasurable: unobserved } }

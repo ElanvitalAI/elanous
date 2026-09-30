@@ -1,0 +1,12 @@
+{
+  "name": "video-explainer",
+  "version": "0.1.0",
+  "description": "Narrated «N things at once» explainer videos from a list of facts.",
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "video-explainer",
+    "shortDescription": "Narrated explainer videos with word-timed captions",
+    "developerName": "ElanvitalAI",
+    "category": "Productivity"
+  }
+}

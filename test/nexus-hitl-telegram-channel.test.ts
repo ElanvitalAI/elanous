@@ -175,9 +175,7 @@ describe('createNexusTelegramHitlHandle', () => {
   test('stop() is idempotent', async () => {
     const h = createNexusTelegramHitlHandle({ token: 't:1', chatId: 1, bot: makeStubBot() });
     await h!.stop();
-    await h!.stop();
-    // The bot's `running` flag flips false; second call is harmless.
-    expect(true).toBe(true);
+    await expect(h!.stop()).resolves.toBeUndefined();
   });
 });
 

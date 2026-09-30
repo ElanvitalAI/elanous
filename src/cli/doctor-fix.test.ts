@@ -531,6 +531,8 @@ describe('doctor --fix', () => {
       registerDoctorCommand(program, {
         ...fileDeps,
         env: { ...fileDeps.env, PATH: '/usr/bin' },
+        // git 이 없을 때의 설치 계획 항목은 플랫폼에 따라 갈린다(리눅스 = 설치 줄 · «failed» → 종료 1) — 🩸 맥에서만 1 fail 이었다(M5f).
+        platform: 'linux',
         repositoryRoot: '/repo',
         readFile: (path) => path === '/repo/.env.example' ? 'ONE_KEY=\nOTHER_KEY=\n' : path === '/repo/catalog/external-commands.yaml' ? 'commands: []\n' : f.deps.readFile!(path),
         rename: f.deps.rename,

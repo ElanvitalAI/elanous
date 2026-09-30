@@ -28,6 +28,8 @@ import { Crosshair,
   type LucideIcon,
 } from 'lucide-react';
 import type { WorkspaceTabKind } from '@/lib/workspace/types';
+import type { PwaRole } from '@/lib/pwa-role';
+import { visibleForRole } from '@/lib/route-maturity';
 import { PRIVATE_SIDEBAR_NAV_ITEMS } from './sidebar-nav-private';
 
 export interface SidebarNavItem {
@@ -53,12 +55,14 @@ export type NavVisibility = 'public' | 'labs' | 'hidden';
 export function visibleNavGroups(
   items: readonly SidebarNavItem[],
   prefs: { showLabs: boolean; showHidden: boolean },
+  role: PwaRole = 'owner',
 ): { main: SidebarNavItem[]; labs: SidebarNavItem[]; hidden: SidebarNavItem[] } {
   const level = (item: SidebarNavItem): NavVisibility => item.visibility ?? 'public';
+  const allowed = items.filter((item) => visibleForRole(role, item.href));
   return {
-    main: items.filter((item) => level(item) === 'public'),
-    labs: prefs.showLabs ? items.filter((item) => level(item) === 'labs') : [],
-    hidden: prefs.showHidden ? items.filter((item) => level(item) === 'hidden') : [],
+    main: allowed.filter((item) => level(item) === 'public'),
+    labs: prefs.showLabs ? allowed.filter((item) => level(item) === 'labs') : [],
+    hidden: prefs.showHidden ? allowed.filter((item) => level(item) === 'hidden') : [],
   };
 }
 

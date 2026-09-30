@@ -141,6 +141,20 @@ describe('nexus /v1 default-deny', () => {
     }
   });
 
+  test('the Pod GitHub relay POST passes default-deny to its own token gate, not other methods', async () => {
+    expect(isPublicRoute('POST', '/v1/pod/credential/github', { setupMode: false })).toBe(true);
+    expect(isPublicRoute('GET', '/v1/pod/credential/github', { setupMode: false })).toBe(false);
+    const server = start();
+    const logSpy = spyOn(debug, 'log');
+    try {
+      expect(await statusOf(server, '/v1/pod/credential/github', { method: 'POST' })).toBe(401);
+      expect(logSpy.mock.calls.some(([cat, event, data]) =>
+        cat === 'nexus.auth' && event === 'default-deny' && (data as { pathname?: string } | undefined)?.pathname === '/v1/pod/credential/github')).toBe(false);
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   test('20 random /v1 paths outside the allowlist are all 401', async () => {
     expect(RANDOM_OUTSIDE_PATHS).toHaveLength(20);
     const server = start();

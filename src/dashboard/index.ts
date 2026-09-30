@@ -5,11 +5,14 @@
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join } from 'path';
+import { fileURLToPath } from 'node:url';
+import { createStaleInstallCheck, readCurrentInstalledCommit, readDashboardBootCommit, STALE_INSTALL_CHECK_INTERVAL_MS, versionedDashboardInstallDir } from './stale-install-check.js';
 import { spawn, spawnSync } from 'node:child_process';
 import { $ } from 'bun';
 import { LOCAL_SKILLS_DIR, SERVICE_NAMES, DATA_DIR, OBSIDIAN_VAULT } from '../config.js';
 import { dispatchDashboardSessionRuntimeTool } from './session-runtime-dispatch.js';
 import { buildAdRunSetup } from '../ad-pipeline/ad-run-setup.js';
+import { nextChatScrollOffset } from '../chat/log-scroll-key.js';
 import type { CommandRunner } from '../ad-pipeline/higgsfield-backend.js';
 import type { ShootRunOptions } from '../ad-pipeline/shoot-run.js';
 import type { QcThresholds } from '../ad-pipeline/qc.js';
@@ -602,6 +605,7 @@ import {
 import { createDashboardInlineSetupFlow } from './setup-inline.js';
 import { resolveDashboardChatMainThemeCommand } from './input/chat-main-theme-command.js';
 import { resolveDashboardChatMainLogCommand } from './input/chat-main-log-command.js';
+import { noProviderReply } from './input/no-provider-reply.js';
 import {
   dashboardLogHelpLines,
   resolveDashboardLogFilterAction,
@@ -1066,6 +1070,7 @@ import { bootDashboardHitl } from './hitl-boot.js';
 import { attachDashboardFilePathToken } from './file-path-attachment.js';
 import { bootDashboardSlashExecutor } from './slash-executor-boot.js';
 import { buildDashboardSlashRegistry, type DashboardSlashContext } from './slash-runtime/index.js';
+import { unknownSlashReply } from './slash-runtime/unknown-slash-reply.js';
 import { resolveSurfaceUx } from '../agent/surface-ux/build.js';
 import type { SurfaceUx } from '../agent/surface-ux/types.js';
 import { getDefaultQuestionChannels, type QuestionChannel } from '../hitl/question.js';
@@ -4239,6 +4244,36 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     } catch { /* noop */ }
   }, 5_000);
   (gitDirtyTimer as unknown as { unref?: () => void }).unref?.();
+  // The running module's installed version, not the user's working directory, is the baseline.
+  const dashboardCodeRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  const versionDir = versionedDashboardInstallDir(dashboardCodeRoot);
+  const staleInstallCheck = createStaleInstallCheck({
+    codeRoot: dashboardCodeRoot,
+    bootCommit: versionDir ? readDashboardBootCommit(versionDir) : undefined,
+    readInstalledCommit: readCurrentInstalledCommit,
+    now: Date.now,
+  });
+  if (versionDir) {
+    const checkInstall = (): void => {
+      const result = staleInstallCheck.check();
+      debug.log('dashboard.version', 'install-check', {
+        state: result.state, bootCommit: result.bootCommit, installedCommit: result.installedCommit,
+      });
+      if (staleInstallCheck.shouldNotify(result)) {
+        chatLines.push(C.warning(`elanous 가 새 판으로 바뀌었다 (${result.bootCommit!.slice(0, 7)} → ${result.installedCommit!.slice(0, 7)}) · TUI 를 다시 띄워라`));
+        chatScrollOffset = -1;
+        try { draw(); } catch { /* TUI torn down */ }
+      }
+    };
+    checkInstall();
+    const installCheckTimer = setInterval(checkInstall, STALE_INSTALL_CHECK_INTERVAL_MS);
+    installCheckTimer.unref?.();
+  } else {
+    const result = staleInstallCheck.check();
+    debug.log('dashboard.version', 'install-check', {
+      state: result.state, bootCommit: result.bootCommit, installedCommit: result.installedCommit,
+    });
+  }
   // Phase T1 — unified terminal matrix. Wraps sessionRegistry during
   // the migration window: spawns flow through `matrix.spawn()` so we
   // get a single `term:<N>` id space, character/transport fields,
@@ -15343,7 +15378,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     ).persistToolOutputPreview;
     acpPtyAvailable = (await import('../pty-shell/registry.js')).ptyAvailable;
     const dashboardAcpBootResult = await bootDashboardAcpSession({
-        ...(opts.remote ? { remote: opts.remote } : {}),
+        ...(opts.remote ? {
+          remote: opts.remote,
+          onRemoteDisconnect: () => {
+            pushChatLine(C.warning('  ⚠ 데몬 연결이 끊겼다 · 입력 중인 글은 그대로다 · 다시 붙으려면 TUI 를 다시 띄워라'));
+            draw();
+          },
+        } : {}),
         ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
         getCwd: () => getSessionCwd(),
         getChatHistory: () => chat.history,
@@ -16742,6 +16783,17 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               : '/quit /clear (run `elanous setup` — no LLM provider available)',
             debugLog: debug.enabled ? (event, label, payload) => debug.log(event, label, payload) : undefined,
             textInputOpts: {
+              onScrollKey: (name) => {
+                const { rows } = termSize();
+                const viewport = computePromptFrameLogViewportBounds(
+                  rows, computePaneH(rows), getLayoutPromptFrame(rows),
+                );
+                chatScrollOffset = nextChatScrollOffset(
+                  chatScrollOffset, name, Math.max(1, viewport.height),
+                  Math.max(0, chatLines.length - viewport.height),
+                );
+                draw();
+              },
               // TUI 부활 후속 — Esc·Esc = /rewind 픽커 (codex backtrack
               // 제스처 · resolveEscEscRewind 순수 판정). 빈 버퍼에서만
               // prime · 1.5s 창. 힌트는 세션 1회.
@@ -18453,17 +18505,9 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                   const handled = await pluginHost.dispatchSlash(cmdLower, args);
                   if (handled) { chatScrollOffset = -1; continue; }
                 }
-                const retiredHarnessCommand = ({
-                  ask: '/harness ask <무엇을 왜 고칠지 한 문장>',
-                  say: '/harness ask <무엇을 왜 고칠지 한 문장>',
-                  implement: '/harness implement <feature>',
-                  dev: '/harness dev <무엇을 왜 고칠지 한 문장>',
-                } as Record<string, string>)[cmdLower];
-                if (retiredHarnessCommand) {
-                  chatLines.push(C.warning(`/${cmdLower} has moved; use ${retiredHarnessCommand}`));
-                } else {
-                  chatLines.push(C.warning(`Unknown command: /${cmdLower}`));
-                  chatLines.push(C.muted('Type /help for the list of commands.'));
+                const replyLines = unknownSlashReply(cmdLower, dashboardSlashRegistry.names());
+                for (const [index, line] of replyLines.entries()) {
+                  chatLines.push(index === 0 ? C.warning(line) : C.muted(line));
                 }
                 chatScrollOffset = -1;
                 continue; // stay in input mode
@@ -18475,7 +18519,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
 
           // ── Q&A chat — requires at least one LLM provider ──
           if (!anyProviderAvailable()) {
-            chatLines.push(C.warning('No LLM provider available. Run `elanous setup` or `elanous codex setup`.'));
+            const reply = noProviderReply(input.text);
+            for (const line of reply.lines) {
+              chatLines.push(line.tone === 'warning' ? C.warning(line.text) : C.muted(line.text));
+            }
+            inputPrefixState.set(reply.prefill);
+            nextInitial = inputPrefixState.consumeInitialText('plain');
             continue; // stay in input mode
           }
 

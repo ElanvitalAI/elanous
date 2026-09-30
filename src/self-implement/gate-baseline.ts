@@ -682,7 +682,9 @@ function runIsolatedBunTest(cwd: string, args: string[], timeout: number): Proce
     return { status: null, stdout: '', stderr: message, error: error instanceof Error ? error : new Error(message) };
   }
   try {
-    return spawnSync('bun', ['test', ...args], { cwd, env: isolated.env, encoding: 'utf8', timeout, maxBuffer: 32 * 1024 * 1024 });
+    // SIGKILL — a test that traps SIGTERM while blocked in a native wait never runs its handler, so spawnSync
+    // waited forever and its drive grandchildren lived on as ppid=1 orphans (09-30 O1: 19 processes, up to 11h).
+    return spawnSync('bun', ['test', ...args], { cwd, env: isolated.env, encoding: 'utf8', timeout, killSignal: 'SIGKILL', maxBuffer: 32 * 1024 * 1024 });
   } finally {
     isolated.cleanup();
   }

@@ -65,3 +65,17 @@ describe('PTY 벽 의도 띠 — oauth 줄 없이 판단 줄만 올 때(🅞 09-
     expect(accountNames([row('harness.decision', 'decision', { what: '계정 회전', account: 'team' })])).toEqual(['team']);
   });
 });
+
+describe('host names (🅞 00:18 · TZ4 take showed a MSB1 node)', () => {
+  test('Pod pool machines and tailnet hosts become stable aliases', () => {
+    const masked = maskRowsForPublic([
+      row('harness.substrate', 'dispatch', { pool: 'pool-node-b@node-b:8', note: 'ran on MSB1' }),
+      row('pod.pool', 'slot', { pool: 'pool-msb2@msb2:8', url: 'https://mbp.tailnet-example.ts.net:31415/app/' }),
+    ]);
+    const text = JSON.stringify(masked);
+    expect(text).not.toMatch(/msb\d/i);
+    expect(text).not.toContain('ts.net');
+    expect(masked[0]!.data).toMatchObject({ pool: 'pool-remote-1@remote-1:8', note: 'ran on REMOTE-1' });
+    expect(masked[1]!.data).toMatchObject({ pool: 'pool-remote-2@remote-2:8', url: 'https://tailnet-host:31415/app/' });
+  });
+});

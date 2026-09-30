@@ -1,12 +1,15 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { dlopen, FFIType } from 'bun:ffi';
 import { loadPluginManifestFromDir, type PluginManifest } from '../core/manifest.js';
+import { loadPluginNodes } from '../../graph-kinds/plugin-nodes.js';
+import { getNodeKindRegistration, listNodeKinds, unregisterPluginNodeKind } from '../../graph-kinds/registry.js';
 import { verifyIndex, type MarketplaceIndex, type VerifyIndexResult } from '../../market/signed-index.js';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
+import { ensureMarketIndex, MarketFetchError, type MarketFetchOptions } from './market-fetch.js';
 
 const NAME = /^[a-z0-9][a-z0-9-]{1,39}$/;
 const VERSION = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][a-zA-Z0-9.-]+)?$/;
@@ -18,7 +21,7 @@ export type InstallEvent =
   | { event: 'verify'; signature: 'ok' | 'missing' | 'bad'; scan: 'safe' | 'caution' | 'dangerous' }
   | { event: 'consent'; capabilities: string[]; required: boolean }
   | { event: 'credentials'; connectors: Array<{ id: string; fields: Array<{ name: string; secret: boolean }> }> }
-  | { event: 'registered'; kinds: string[]; graphs: string[]; skills: string[] }
+  | { event: 'registered'; /** Vocab file paths, not graph node kinds. */ kinds: string[]; nodes: string[]; nodeErrors: number; graphs: string[]; skills: string[] }
   | { event: 'done'; plugin: string; version: string; path: string };
 
 export interface InstalledPlugin {
@@ -27,6 +30,8 @@ export interface InstalledPlugin {
   market: string;
   path: string;
   sha256: string | null;
+  /** Absent for installations recorded before timestamps were introduced. */
+  installedAt?: string;
 }
 
 export interface InstallOptions {
@@ -34,12 +39,15 @@ export interface InstallOptions {
   marketDir?: string;
   cwd?: string;
   allowUnsigned?: boolean;
+  refresh?: boolean;
   yes?: boolean;
   trustedKeys?: ReadonlyArray<{ keyId: string; publicKey: string }>;
   verifySignature?: typeof verifyIndex;
   hashArtifact?: (bytes: Uint8Array) => string;
   onEvent?: (event: InstallEvent) => void;
   consent?: (capabilities: string[]) => boolean | Promise<boolean>;
+  fetcher?: MarketFetchOptions['fetcher'];
+  configPath?: string;
 }
 
 export class PluginInstallError extends Error {
@@ -115,28 +123,8 @@ function marketEntry(spec: string, opts: InstallOptions): { market: string; entr
   return { market, entry: matches[0]!, signature };
 }
 
-function unpackArchive(bytes: Uint8Array, target: string): void {
-  const archive = join(dirname(target), 'artifact.tgz');
-  writeFileSync(archive, bytes);
-  try {
-    const entries = child('tar', ['-tzf', archive]).split('\n');
-    for (const item of entries) {
-      if (item === '.' || item === './') continue;
-      inside(target, item.replace(/^\.\//, ''));
-    }
-    // Links and special entries can write outside the destination before a post-extract scan.
-    const types = child('tar', ['-tvzf', archive]).split('\n');
-    if (types.some(line => line && !['-', 'd'].includes(line[0]!))) fail('scan', 'artifact contains links or special files');
-    mkdirSync(target);
-    child('tar', ['-xzf', archive, '-C', target, '--no-same-owner', '--no-same-permissions']);
-    safeTree(target);
-  } finally {
-    rmSync(archive, { force: true });
-  }
-}
-
-export function resolvePluginSource(spec: string, target: string, opts: InstallOptions = {}): { market: string; sha256: string | null; signature: 'ok' | 'missing'; expectedName?: string; expectedVersion?: string } {
-  if (/^[a-z0-9][a-z0-9-]{1,39}@[a-z0-9][a-z0-9-]{1,39}$/.test(spec) && !existsSync(resolve(opts.cwd ?? process.cwd(), spec))) {
+/** Offline: a signed index placed in `<markets>/<name>/` without a configured URL (pre-fetch behaviour — kept). */
+function localMarketSource(spec: string, target: string, opts: InstallOptions): ResolvedPluginSource {
     const { market, entry, signature } = marketEntry(spec, opts);
     const source = entry.source;
     const sourceRoot = dirname(indexPath(market, opts));
@@ -159,7 +147,100 @@ export function resolvePluginSource(spec: string, target: string, opts: InstallO
       fail('io', `market entry has no verifiable artifact: ${entry.name}`);
     }
     return { market, sha256: entry.artifact?.sha256 ?? null, signature, expectedName: entry.name, expectedVersion: entry.version };
+}
+
+function hasLocalMarketIndex(market: string, opts: InstallOptions): boolean {
+  const base = resolve(opts.marketDir ?? join(opts.root ?? elanousStateRoot(), 'markets'));
+  return [join(base, market, 'marketplace.json'), join(base, market, '.agents', 'plugins', 'marketplace.json')].some(existsSync);
+}
+
+function unpackArchive(bytes: Uint8Array, target: string): void {
+  const archive = join(dirname(target), 'artifact.tgz');
+  writeFileSync(archive, bytes);
+  try {
+    const entries = child('tar', ['-tzf', archive]).split('\n');
+    for (const item of entries) {
+      if (item === '.' || item === './') continue;
+      inside(target, item.replace(/^\.\//, ''));
+    }
+    // Links and special entries can write outside the destination before a post-extract scan.
+    const types = child('tar', ['-tvzf', archive]).split('\n');
+    if (types.some(line => line && !['-', 'd'].includes(line[0]!))) fail('scan', 'artifact contains links or special files');
+    mkdirSync(target);
+    child('tar', ['-xzf', archive, '-C', target, '--no-same-owner', '--no-same-permissions']);
+    safeTree(target);
+  } finally {
+    rmSync(archive, { force: true });
   }
+}
+
+type ResolvedPluginSource = { market: string; sha256: string | null; signature: 'ok' | 'missing'; expectedName?: string; expectedVersion?: string };
+
+function marketSpec(spec: string, opts: InstallOptions): boolean {
+  return /^[a-z0-9][a-z0-9-]{1,39}@[a-z0-9][a-z0-9-]{1,39}$/.test(spec) && !existsSync(resolve(opts.cwd ?? process.cwd(), spec));
+}
+
+async function fetchedMarketSource(spec: string, target: string, opts: InstallOptions): Promise<ResolvedPluginSource> {
+  const [name, marketName] = spec.split('@') as [string, string];
+  let marketIndex: Awaited<ReturnType<typeof ensureMarketIndex>>;
+  try {
+    marketIndex = await ensureMarketIndex(marketName, {
+      root: opts.root, marketDir: opts.marketDir, configPath: opts.configPath, fetcher: opts.fetcher,
+      refresh: opts.refresh, verifySignature: opts.verifySignature, trustedKeys: opts.trustedKeys,
+    });
+  } catch (error) {
+    if (error instanceof MarketFetchError && /^market not configured: /.test(error.message) && hasLocalMarketIndex(marketName, opts)) {
+      return localMarketSource(spec, target, opts);
+    }
+    if (error instanceof MarketFetchError) throw new PluginInstallError(error.reason, error.message);
+    throw error;
+  }
+  const matches = marketIndex.index.plugins.filter(entry => entry.name === name);
+  if (matches.length !== 1) fail('io', `plugin not found or ambiguous in ${marketName}: ${name}`);
+  const entry = matches[0]!;
+  const artifact = entry.artifact;
+  if (!artifact || typeof artifact.key !== 'string' || !artifact.key || !HASH.test(artifact.sha256)
+    || !Number.isSafeInteger(artifact.bytes) || artifact.bytes < 0) fail('io', 'invalid artifact key, hash or size');
+  // Check the key as written, before URL resolution folds `..`/`.` or percent-encoded separators away.
+  if (!/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)*$/.test(artifact.key) || artifact.key.split('/').some(part => part === '.' || part === '..')) fail('io', 'unsafe artifact key');
+  const base = new URL(marketIndex.market.url);
+  const url = new URL(artifact.key, base);
+  if (url.protocol !== 'https:' || url.origin !== base.origin || !url.pathname.startsWith(base.pathname)
+    || url.username || url.password || url.search || url.hash || /[\\?#]/.test(artifact.key)) fail('io', 'unsafe artifact key');
+  let response: Response;
+  // The URL checks above hold only if no redirect moves the download elsewhere.
+  try { response = await (opts.fetcher ?? fetch)(url.href, { redirect: 'error' }); }
+  catch { fail('io', 'artifact fetch failed: network error'); }
+  if (!response.ok || !response.body) fail('io', `artifact fetch failed: HTTP ${response.status}`);
+  if (response.redirected || (response.url && response.url !== url.href)) fail('io', 'artifact fetch was redirected');
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > artifact.bytes) fail('scan', 'artifact sha256 or size mismatch');
+      chunks.push(value);
+    }
+  } finally {
+    void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  if (length !== artifact.bytes || (opts.hashArtifact ?? (data => createHash('sha256').update(data).digest('hex')))(bytes).toLowerCase() !== artifact.sha256.toLowerCase()) {
+    fail('scan', 'artifact sha256 or size mismatch');
+  }
+  unpackArchive(bytes, target);
+  return { market: marketName, sha256: artifact.sha256, signature: marketIndex.signature, expectedName: name, expectedVersion: entry.version };
+}
+
+export function resolvePluginSource(spec: string, target: string, opts: InstallOptions = {}): ResolvedPluginSource {
+  // Synchronous callers keep the offline contract: a signed index already placed under `<markets>/<name>/`.
+  if (marketSpec(spec, opts)) return localMarketSource(spec, target, opts);
   const local = resolve(opts.cwd ?? process.cwd(), spec);
   if (existsSync(local)) {
     copyPlugin(realpathSync(local), target);
@@ -187,19 +268,63 @@ function gitSource(url: string, destination: string, path?: unknown, sha?: unkno
   }
 }
 
+function hasSkill(dir: string): boolean {
+  if (!existsSync(dir)) return false;
+  return readdirSync(dir, { withFileTypes: true }).some(entry => entry.isDirectory() && existsSync(join(dir, entry.name, 'SKILL.md')));
+}
+
+function inspectPluginNodes(packageRoot: string, manifest: PluginManifest): { nodes: string[]; nodeErrors: number } {
+  if (!manifest.contributes.nodes?.length) return { nodes: [], nodeErrors: 0 };
+  // Registration validates each staged definition. Use a private identity so existing installations
+  // cannot reject an otherwise valid kind as a duplicate; only this inspection's entries are removed.
+  const inspectionId = `inspect-${randomUUID().replaceAll('-', '')}`;
+  let nodeErrors = 0;
+  const nodes: string[] = [];
+  try {
+    nodeErrors = loadPluginNodes(packageRoot, { ...manifest, id: inspectionId }).errors.length;
+  } finally {
+    for (const entry of listNodeKinds()) {
+      if (entry.plugin !== inspectionId) continue;
+      nodes.push(`${manifest.id}:${entry.kind.slice(inspectionId.length + 1)}`);
+      const registered = getNodeKindRegistration(entry.graph, entry.kind);
+      if (registered) unregisterPluginNodeKind(entry.graph, entry.kind, inspectionId, registered);
+    }
+  }
+  return { nodes, nodeErrors };
+}
+
+function declaresMain(packageRoot: string): boolean {
+  for (const file of ['plugin.json', join('.codex-plugin', 'plugin.json')]) {
+    const path = join(packageRoot, file);
+    if (!existsSync(path)) continue;
+    try {
+      const raw: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      if (raw && typeof raw === 'object' && 'main' in raw) return true;
+    } catch { return true; }
+  }
+  return !existsSync(join(packageRoot, 'plugin.json')) && !existsSync(join(packageRoot, '.codex-plugin', 'plugin.json'));
+}
+
 export async function installPlugin(spec: string, opts: InstallOptions = {}): Promise<InstalledPlugin> {
   const root = resolve(opts.root ?? elanousStateRoot());
   const stageRoot = join(root, 'plugins', '.staging');
   mkdirSync(stageRoot, { recursive: true });
   const stage = mkdtempSync(join(stageRoot, 'plugin-'));
   try {
-    const source = resolvePluginSource(spec, join(stage, 'package'), opts);
+    const source = marketSpec(spec, opts)
+      ? await fetchedMarketSource(spec, join(stage, 'package'), opts)
+      : resolvePluginSource(spec, join(stage, 'package'), opts);
     const manifest: PluginManifest = loadPluginManifestFromDir(join(stage, 'package'), { id: source.expectedName ?? basename(spec) }).manifest;
     if (!NAME.test(manifest.id) || !VERSION.test(manifest.version)) fail('io', 'invalid plugin name or version');
     if (source.expectedName && (manifest.id !== source.expectedName || manifest.version !== source.expectedVersion)) fail('conflict', 'market name or version differs from manifest');
     const packageRoot = join(stage, 'package');
     const mainPath = inside(packageRoot, manifest.main);
-    if (!existsSync(mainPath) || !realpathSync(mainPath).startsWith(`${realpathSync(packageRoot)}${sep}`)) fail('io', `plugin main not found or unsafe: ${manifest.main}`);
+    // A skills/graphs-only pack (official `elanous-basics`) declares no `main` — the default `./plugin.ts` is not a promise.
+    // …but only a pack that ships something to install (skills or graphs) may omit it.
+    const shipsAssets = hasSkill(join(packageRoot, 'skills')) || (manifest.contributes.graphs?.length ?? 0) > 0;
+    if (existsSync(mainPath) || declaresMain(packageRoot) || !shipsAssets) {
+      if (!existsSync(mainPath) || !realpathSync(mainPath).startsWith(`${realpathSync(packageRoot)}${sep}`)) fail('io', `plugin main not found or unsafe: ${manifest.main}`);
+    }
     const name = manifest.id;
     const version = manifest.version;
     for (const asset of [...(manifest.contributes.graphs ?? []), ...(manifest.contributes.vocab ?? [])]) {
@@ -228,12 +353,13 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
           .map(entry => entry.name).sort()
         : []
       : manifest.contributes.skills.map(skill => skill.name ?? skill.id ?? '').filter(Boolean);
-    emit({ event: 'registered', kinds, graphs, skills });
+    const { nodes, nodeErrors } = inspectPluginNodes(packageRoot, manifest);
+    emit({ event: 'registered', kinds, nodes, nodeErrors, graphs, skills });
     const installed = withLedgerLock(root, () => {
       if (existsSync(destination)) fail('conflict', `plugin already installed: ${name}@${version}`);
       mkdirSync(dirname(destination), { recursive: true });
       renameSync(join(stage, 'package'), destination);
-      const item = { name, version, market: source.market, path: destination, sha256: source.sha256 };
+      const item = { name, version, market: source.market, path: destination, sha256: source.sha256, installedAt: new Date().toISOString() };
       try {
         writeLedger(root, [...listInstalledPlugins(root), item]);
       } catch (error) {
@@ -323,7 +449,8 @@ function writeLedger(root: string, entries: InstalledPlugin[]): void {
   const unique = new Map(entries.map(entry => [`${entry.market}/${entry.name}/${entry.version}`, entry]));
   const temp = `${ledger}.${process.pid}.tmp`;
   try {
-    writeFileSync(temp, JSON.stringify([...unique.values()].map(({ name, version, market, sha256 }) => ({ name, version, market, sha256 })), null, 2));
+    writeFileSync(temp, JSON.stringify([...unique.values()].map(({ name, version, market, sha256, installedAt }) =>
+      ({ name, version, market, sha256, ...(installedAt === undefined ? {} : { installedAt }) })), null, 2));
     renameSync(temp, ledger);
   } finally {
     rmSync(temp, { force: true });
@@ -334,7 +461,7 @@ export function listInstalledPlugins(root = elanousStateRoot()): InstalledPlugin
   const base = join(root, 'plugins');
   if (!existsSync(base)) return [];
   const result: InstalledPlugin[] = [];
-  let ledger: Array<Pick<InstalledPlugin, 'name' | 'version' | 'market' | 'sha256'>> = [];
+  let ledger: Array<Pick<InstalledPlugin, 'name' | 'version' | 'market' | 'sha256' | 'installedAt'>> = [];
   try {
     ledger = JSON.parse(readFileSync(join(base, 'installed.json'), 'utf8'));
     if (!Array.isArray(ledger)) ledger = [];
@@ -348,8 +475,12 @@ export function listInstalledPlugins(root = elanousStateRoot()): InstalledPlugin
         const path = join(base, market.name, name.name, version.name);
         try {
           const manifest = loadPluginManifestFromDir(path, { id: name.name }).manifest;
-          if (manifest.id === name.name && manifest.version === version.name) result.push({ name: name.name, version: version.name, market: market.name, path,
-            sha256: ledger.find(entry => entry.name === name.name && entry.version === version.name && entry.market === market.name)?.sha256 ?? null });
+          if (manifest.id === name.name && manifest.version === version.name) {
+            const recorded = ledger.find(entry => entry.name === name.name && entry.version === version.name && entry.market === market.name);
+            result.push({ name: name.name, version: version.name, market: market.name, path,
+              sha256: recorded?.sha256 ?? null,
+              ...(typeof recorded?.installedAt === 'string' ? { installedAt: recorded.installedAt } : {}) });
+          }
         } catch { /* malformed packages are not installed plugins */ }
       }
     }

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { failureReason } from '../../domains/repeated-failure.js';
 import { McpConnectionError } from '../../mcp/client.js';
-import { registerMcpClients } from './register-mcp-clients.js';
+import { maskInjectedValues, registerMcpClients } from './register-mcp-clients.js';
 
 const stdioServer = (id: string, handshakeTimeoutMs?: number) => ({
   id,
@@ -128,4 +128,10 @@ describe('registerMcpClients connect-failed trace', () => {
     }
     await handle.shutdown();
   });
+});
+
+test('MCP results mask injected credential values in object keys as well as values', () => {
+  const secret = 'plugin-secret-value-0123456789';
+  const masked = maskInjectedValues({ structuredContent: { [secret]: 'ok', nested: [{ [`x-${secret}`]: secret }] } }, [secret]);
+  expect(JSON.stringify(masked)).not.toContain(secret);
 });

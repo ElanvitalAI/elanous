@@ -1,0 +1,18 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "video-broll",
+  "version": "0.1.0",
+  "description": "Cut word-timed motion B-roll into a talking-head video: align, plan density, author clips with a coding agent, composite and QC.",
+  "extensions": {
+    "ai.elanous": {
+      "bundle": ["skills/motion-broll", { "from": "graphs/video/broll-line.yaml", "as": "graphs/broll-line.yaml" }],
+      "graphs": ["graphs/broll-line.yaml"],
+      "capabilities": ["fs:workdir", "proc:ffmpeg", "proc:node", "proc:python3", "agent:codex", "agent:claude"],
+      "connectors": [],
+      "requires": { "tools": ["ffmpeg", "node", "python3"] },
+      "pricing": { "model": "free" },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

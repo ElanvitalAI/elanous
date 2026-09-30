@@ -5,11 +5,15 @@
 // values are single-quoted so the substituted text cannot become shell syntax.
 
 import { callDaemonMcpTool } from '../cli/mcp-call.js';
+import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { pluginEnv } from '../plugins/install/plugin-credentials.js';
 import { debug } from '../debug/log.js';
 import { getNodeKind, type NodeKindEntry, type NodeKindRun } from '../graph-kinds/registry.js';
 import { executeBashNode } from './nodes/bash.js';
 import { executeHttpRequestNode } from './nodes/http.js';
 import { executeSkillNode } from './nodes/skill.js';
+import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
+import { join } from 'node:path';
 import type { DagNode, NodeExecContext, NodeOutput, PluginKindNode, WorkflowDeps } from './types.js';
 
 const PLACEHOLDER = /\{\{([^{}]*)\}\}/g;
@@ -93,7 +97,7 @@ export async function executePluginKindNode(
     if ('mcp' in entry.run) {
       const spec = entry.run.mcp;
       const args = Object.fromEntries(Object.entries(spec.args ?? {}).map(([key, value]) => [key, substituteMcpArg(value, node.inputs)]));
-      const result = await callDaemonMcpTool({ tool: `${spec.server}.${spec.tool}`, arguments: args });
+      const result = await callDaemonMcpTool({ tool: `${spec.server}.${spec.tool}`, arguments: args, pluginKind: node.kind });
       const record = result && typeof result === 'object' && !Array.isArray(result)
         ? result as { content?: unknown; structuredContent?: unknown }
         : {};
@@ -104,7 +108,12 @@ export async function executePluginKindNode(
         throw new Error('unsupported MCP tool result: expected text-only content');
       }
       const output = (record.content as Array<{ text: string }>).map((item) => item.text).join('\n');
-      return { ok: true, output, durationMs: Date.now() - startedAt };
+      let credentials: Record<string, string> = {};
+      try { credentials = pluginEnv(entry.plugin!, elanousStateRoot()); }
+      catch { /* Registered kinds may also be used without an installed plugin. */ }
+      const safe = Object.values(credentials).filter(value => value.length > 0)
+        .reduce((text, value) => text.replaceAll(value, '[REDACTED]'), output);
+      return { ok: true, output: safe, durationMs: Date.now() - startedAt };
     }
     if ('bash' in entry.run) {
       const bash = substituteInputs(entry.run.bash, node.inputs, true);
@@ -122,16 +131,35 @@ export async function executePluginKindNode(
       }, ctx, deps);
     }
     const spec = (entry.run as { skill: { name: string; prompt?: string } }).skill;
+    // 플러그인 kind 의 스킬은 그 플러그인 설치 폴더의 `skills/` 에서 먼저 찾는다(팩이 스킬 본체를 싣는다 · `elanous-hwp` → `hwp-write`).
+    let skillsDir: string | undefined;
+    if (entry.plugin) {
+      try {
+        const installed = listInstalledPlugins(elanousStateRoot()).find((item) => item.name === entry.plugin);
+        if (installed) skillsDir = join(installed.path, 'skills');
+      } catch { /* 설치 원장을 못 읽으면 종전 위치만 */ }
+    }
+    debug.log('workflow.plugin-kind', 'skill-dir', { plugin: entry.plugin ?? null, skill: spec.name, skillsDir: skillsDir ?? null });
+    const skillDeps: WorkflowDeps = skillsDir && deps.runSkill
+      ? { ...deps, runSkill: (slug, args) => deps.runSkill!(slug, args, { skillsDir }) }
+      : deps;
     return await executeSkillNode({
       ...node,
       skill: substituteInputs(spec.name, node.inputs, false),
       ...(spec.prompt !== undefined ? { arguments: substituteInputs(spec.prompt, node.inputs, false) } : {}),
-    }, ctx, deps);
+    }, ctx, skillDeps);
   } catch (err) {
+    let message = err instanceof Error ? err.message : String(err);
+    if ('mcp' in entry.run && entry.plugin) {
+      try {
+        const credentials = pluginEnv(entry.plugin, elanousStateRoot());
+        for (const value of Object.values(credentials)) if (value) message = message.replaceAll(value, '[REDACTED]');
+      } catch { /* Registered kinds may also be used without an installed plugin. */ }
+    }
     return {
       ok: false,
       output: '',
-      error: err instanceof Error ? err.message : String(err),
+      error: message,
       durationMs: Date.now() - startedAt,
     };
   }

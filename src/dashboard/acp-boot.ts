@@ -83,6 +83,8 @@ export interface DashboardAcpBootDeps {
    *  callbacks become unused — the daemon's `runTurn` owns those.
    *  `getCwd()` is still consulted to populate `newSession(cwd)`. */
   remote?: { url: string; token?: string; label?: string };
+  /** Notifies the dashboard when an established remote connection drops. */
+  onRemoteDisconnect?: () => void;
   /** Tier 1 daemon-resume — when set together with `remote`,
    *  the boot flips from `DashboardSession.attach()`
    *  (which mints a new sessionId) to `attachExisting({sessionId})`
@@ -205,6 +207,7 @@ export async function bootDashboardAcpSession(
           url: deps.remote!.url,
           ...(deps.remote!.token ? { token: deps.remote!.token } : {}),
           ...(deps.remote!.label ? { label: deps.remote!.label } : {}),
+          onDisconnect: () => deps.onRemoteDisconnect?.(),
         }),
     });
     recordDashboardAcpBootOutcome(result);

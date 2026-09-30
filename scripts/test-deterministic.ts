@@ -51,7 +51,24 @@ const HARNESS_TEST_ENV_KEYS = [
   'ELANOUS_HARNESS_BOUNDARY',
   'ELANOUS_HARNESS_ROLE',
   'ELANOUS_HARNESS_DETACHED',
+] as const;
+
+// Discovery: rg -n "process\.env\.ELANOUS_(HOST|RUN|ORIGIN|SUPERVISOR|PARENT)" src
+// These are ambient execution identities, not inputs to a deterministic test.
+// debug.log also attributes SUBSTRATE and ARM_ID to every plain-object record.
+const EXECUTION_ORIGIN_ENV_KEYS = [
+  'ELANOUS_HOST_ID',
   'ELANOUS_RUN_ID',
+  'ELANOUS_RUN_CONTEXT',
+  'ELANOUS_PARENT_RUN_ID',
+  'ELANOUS_PARENT_PTY_ID',
+  'ELANOUS_PARENT_SELF_DEV_RUNS_DIR',
+  'ELANOUS_SUBSTRATE',
+  'ELANOUS_ARM_ID',
+  // Parent account selection changes CLI rotation assertions in the child.
+  'ELANOUS_CODEX_ACCOUNT',
+  // A parent's derived-root label must not reclassify a test's explicit state dir.
+  'ELANOUS_STATE_DIR_SOURCE',
 ] as const;
 
 export type ShutdownSignal = 'SIGINT' | 'SIGTERM';
@@ -254,10 +271,16 @@ export async function terminateDirectChild(
 
 export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: string): NodeJS.ProcessEnv {
   const env = Object.fromEntries(
-    Object.entries(sourceEnv).filter(([key]) => !isCredentialKey(key) && !HARNESS_TEST_ENV_KEYS.includes(key as typeof HARNESS_TEST_ENV_KEYS[number])),
+    Object.entries(sourceEnv).filter(([key]) => !isCredentialKey(key)
+      && !HARNESS_TEST_ENV_KEYS.includes(key as typeof HARNESS_TEST_ENV_KEYS[number])
+      && !EXECUTION_ORIGIN_ENV_KEYS.includes(key as typeof EXECUTION_ORIGIN_ENV_KEYS[number])),
   );
   env.HOME = testRoot;
-  env.XDG_CONFIG_HOME = join(testRoot, '.config');
+  // userConfigPath() warns whenever XDG_CONFIG_HOME is set, including when
+  // config.json is absent. Use its non-XDG path; migrateLegacyXdgUserConfig()
+  // resolves the old path through ELANOUS_TEST_HOME rather than the real home.
+  delete env.XDG_CONFIG_HOME;
+  env.ELANOUS_TEST_HOME = testRoot;
   // ⚠️ Redirect elanous's OWN roots explicitly — do not merely inherit them.
   // `ELANOUS_STATE_DIR` / `ELANOUS_CONFIG_DIR` are absolute paths that win over
   // HOME, so a developer who exports either one keeps pointing the "isolated"
@@ -267,9 +290,8 @@ export function prepareIsolatedTestEnv(sourceEnv: NodeJS.ProcessEnv, testRoot: s
   // isolation legible in the child's own environment rather than implied.
   env.ELANOUS_STATE_DIR = join(testRoot, 'state');
   env.ELANOUS_CONFIG_DIR = join(testRoot, 'config');
-  // A deterministic test child must not inherit the harness run identity:
-  // logger API-shape tests use its absence to validate legacy records.
-  delete env.ELANOUS_RUN_ID;
+  // All ambient execution identities are removed by EXECUTION_ORIGIN_ENV_KEYS
+  // above, before the child is spawned; logger API-shape tests need their absence.
   // ⚠️ No `ELANOUS_TEST_DETERMINISTIC` marker is exported. Nothing reads it yet,
   // and an env var with no consumer is a surface that looks like a contract
   // while guaranteeing nothing — a later test could branch on it believing it

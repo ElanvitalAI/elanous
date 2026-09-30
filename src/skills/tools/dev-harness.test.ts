@@ -12,6 +12,8 @@ import type { DefaultSeamsOptions } from '../../self-implement/seams.js';
 import type { LlmHitlRelayDeps } from '../../harness/llm-hitl-relay.js';
 import type { HitlRelay } from '../../harness/detached-hitl.js';
 import { debug } from '../../debug/log.js';
+import { dispatchTask, type DispatchTaskInput, type DispatchTaskResult } from '../../execution-loop/dispatch-task.js';
+import { CardStore } from '../../task-cards/card-store.js';
 
 const okResult: HarnessResult = { runId: 'test-run', ok: true, terminal: 'deployed', rounds: 2, deployRef: 'https://pr/1', state: {} as never };
 
@@ -275,6 +277,150 @@ describe('dispatchRunDevHarness — 스레딩', () => {
     const res = await dispatchRunDevHarness({ objective: 'x' }, {} as DaemonToolDispatchCtx, d);
     expect(res.output).toContain('escalated');
     expect(res.output).toContain('HITL 필요');
+  });
+});
+
+describe('dispatchRunDevHarness — execution-loop observation', () => {
+  const originalRecorded = process.env.ELANOUS_DISPATCH_RECORDED;
+  afterEach(() => {
+    if (originalRecorded === undefined) delete process.env.ELANOUS_DISPATCH_RECORDED;
+    else process.env.ELANOUS_DISPATCH_RECORDED = originalRecorded;
+  });
+
+  test('real nonempty gate decisions, including stop, do not change harness options or result', async () => {
+    delete process.env.ELANOUS_DISPATCH_RECORDED;
+    const root = mkdtempSync(join(tmpdir(), 'dev-harness-dispatch-'));
+    const args = { objective: '  Create widget  ', runId: 'run-observed', auto_drive: 'on', sizing_mode: 'off' };
+    const baseline = deps();
+    const observed = deps();
+    const order: string[] = [];
+    const inputs: DispatchTaskInput[] = [];
+    try {
+      const baselineResult = await dispatchRunDevHarness({ ...args, plan_staged: true }, undefined, baseline.deps);
+      let dispatchResult: DispatchTaskResult | undefined;
+      observed.deps.dispatchTask = async (input, dispatchDeps) => {
+        order.push('dispatch');
+        inputs.push(input);
+        dispatchResult = await dispatchTask(input, dispatchDeps);
+        return dispatchResult;
+      };
+      observed.deps.dispatchTaskDeps = {
+        createStore: () => new CardStore(root),
+        budgetGate: async () => ({ decision: { action: 'stop', reasons: ['no quota'] }, explanation: 'no quota' }),
+        placementGate: () => ({ decision: { substrate: 'unknown', pool: null, source: 'unknown', poolReachability: 'unknown', localReasons: [], unknownInputs: [] }, explanation: 'unknown' }),
+        relationGate: async () => ({ decision: { action: 'record', overlappingCards: [], preflightOverlaps: 'unknown', dependsOn: 'unknown', similarCards: 'unknown', sameGoalActiveRuns: [] }, explanation: 'none' }),
+        memoryGate: async () => ({ decision: { action: 'record', context: 'remember', fragmentIds: [] }, explanation: 'remember' }),
+        emitDecision: () => true,
+        log: () => {},
+      };
+      const runHarness = observed.deps.runHarness!;
+      observed.deps.runHarness = async (opts) => { order.push('harness'); return runHarness(opts); };
+      const result = await dispatchRunDevHarness(args, undefined, observed.deps);
+      expect(order).toEqual(['dispatch', 'harness']);
+      expect(inputs).toHaveLength(1);
+      expect(inputs[0]).toMatchObject({ goalText: 'Create widget', title: 'Create widget', runKey: 'run-observed', targetPaths: [], spec: { input: { text: 'Create widget' }, plan: true, runId: 'run-observed' } });
+      expect(dispatchResult?.mode).toBe('observe');
+      expect(dispatchResult?.decisions.budget.decision).toMatchObject({ action: 'stop' });
+      expect(dispatchResult?.decisions.placement.decision).toMatchObject({ substrate: 'unknown' });
+      expect(dispatchResult?.decisions.relation.decision).toMatchObject({ action: 'record' });
+      expect(dispatchResult?.decisions.memory.decision).toMatchObject({ action: 'record' });
+      const optionValues = (opts: RunHarnessOnSurfaceOptions) => Object.fromEntries(Object.entries(opts).map(([key, value]) => [
+        key,
+        key === 'ux' ? { surface: opts.ux.surface, interactive: opts.ux.interactive, keys: Object.keys(opts.ux).sort() }
+          : key === 'seams' ? Object.keys(opts.seams).sort()
+            : typeof value === 'function' ? '[function]' : value,
+      ]));
+      expect(optionValues(observed.calls[0]!)).toEqual(optionValues(baseline.calls[0]!));
+      expect(result).toEqual(baselineResult);
+      const store = new CardStore(root);
+      try {
+        const cards = store.listCards();
+        expect(cards).toHaveLength(1);
+        expect(cards[0]!.sections.map((section) => section.key.split(':')[0])).toEqual(['gates', 'relations', 'memory']);
+      } finally { store.close(); }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('deadline aborts a non-settling observer without blocking the harness', async () => {
+    delete process.env.ELANOUS_DISPATCH_RECORDED;
+    const order: string[] = [];
+    const { deps: d } = deps();
+    d.dispatchTaskDeps = { timeoutMs: 20 };
+    d.dispatchTask = async (_input, dispatchDeps) => {
+      order.push('dispatch-start');
+      dispatchDeps?.signal?.addEventListener('abort', () => { order.push('abort'); }, { once: true });
+      return new Promise(() => {});
+    };
+    d.runHarness = async () => { order.push('harness'); return okResult; };
+    expect((await dispatchRunDevHarness({ objective: 'Create widget' }, undefined, d)).output).toContain('deployed');
+    expect(order).toEqual(['dispatch-start', 'abort', 'harness']);
+  });
+
+  test('real dispatch abort closes its card before harness despite a gate completing later', async () => {
+    delete process.env.ELANOUS_DISPATCH_RECORDED;
+    const root = mkdtempSync(join(tmpdir(), 'dev-harness-abort-'));
+    let release!: () => void;
+    const pending = new Promise<string>((resolve) => { release = () => resolve('late memory'); });
+    const { deps: d } = deps();
+    const order: string[] = [];
+    d.dispatchTaskDeps = {
+      timeoutMs: 20,
+      createStore: () => new CardStore(root),
+      budgetGate: async () => ({ decision: { action: 'stop', reasons: [] }, explanation: 'stop' }),
+      placementGate: () => ({ decision: { substrate: 'unknown', pool: null, source: 'unknown', poolReachability: 'unknown', localReasons: [], unknownInputs: [] }, explanation: 'unknown' }),
+      relationGate: async () => ({ decision: { action: 'record', overlappingCards: [], preflightOverlaps: 'unknown', dependsOn: 'unknown', similarCards: 'unknown', sameGoalActiveRuns: [] }, explanation: 'none' }),
+      memoryGate: async () => { await pending; order.push('late-gate'); return { decision: { action: 'record', context: 'late memory', fragmentIds: [] }, explanation: 'late' }; },
+      emitDecision: () => true,
+      log: () => {},
+    };
+    d.runHarness = async () => { order.push('harness'); return okResult; };
+    try {
+      const result = await dispatchRunDevHarness({ objective: 'Create widget' }, undefined, d);
+      expect(result.output).toContain('deployed');
+      const store = new CardStore(root);
+      const before = store.listCards();
+      expect(before).toHaveLength(1);
+      expect(before[0]!.sections).toHaveLength(0);
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(store.listCards()).toEqual(before);
+      expect(order).toEqual(['harness', 'late-gate']);
+      store.close();
+    } finally {
+      release();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('failed observation still launches the harness with the same output', async () => {
+    delete process.env.ELANOUS_DISPATCH_RECORDED;
+    const order: string[] = [];
+    const { deps: d } = deps();
+    d.dispatchTask = async () => { order.push('dispatch'); throw new Error('card unavailable'); };
+    d.runHarness = async () => { order.push('harness'); return okResult; };
+    const result = await dispatchRunDevHarness({ objective: 'Create widget' }, undefined, d);
+    expect(order).toEqual(['dispatch', 'harness']);
+    expect(result.output).toContain('deployed');
+  });
+
+  test('detached parent and already-recorded in-process launches do not duplicate a dispatch', async () => {
+    delete process.env.ELANOUS_DISPATCH_RECORDED;
+    let dispatches = 0;
+    const { deps: d } = deps();
+    d.dispatchTask = async () => { dispatches++; throw new Error('dispatch must be skipped'); };
+    await dispatchRunDevHarness({ objective: 'Create widget' }, { surfaceHitlChannels: [yesChannel()] } as unknown as DaemonToolDispatchCtx, {
+      ...d, dispatchDetached: async () => ({ output: 'detached' }),
+    });
+    expect(dispatches).toBe(0);
+    await dispatchRunDevHarness({ objective: 'Create widget', plan_staged: true }, undefined, d);
+    expect(dispatches).toBe(0);
+    await dispatchRunDevHarness({ objective: 'Create widget', dispatch_recorded: true }, undefined, d);
+    expect(dispatches).toBe(0);
+    process.env.ELANOUS_DISPATCH_RECORDED = '1';
+    await dispatchRunDevHarness({ objective: 'Create widget' }, undefined, d);
+    expect(dispatches).toBe(0);
   });
 });
 

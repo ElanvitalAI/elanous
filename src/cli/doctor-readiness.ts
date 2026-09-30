@@ -1,4 +1,5 @@
 import { remediesFor, type DistroFamily } from './doctor-distro.js';
+import type { UsableLlm } from '../llm/usable-llm.js';
 import { providerSecretNames } from '../nexus/install/launchd.js';
 import { win32 } from 'node:path';
 /**
@@ -42,13 +43,8 @@ export interface ReadinessDeps {
    * must pass `null` rather than omit it).
    */
   provider?: string | null;
-  /**
-   * Codex subscription login is present. `null` means not measured.
-   * The token itself is never passed in.
-   */
-  codexLogin?: boolean | null;
-  /** LLM 을 부를 자격이 «하나라도» 있나(어떤 로그인이든 · LLM 키가 풀렸든). 없으면(undefined/null) 못 쟀다. */
-  llmCredentialAvailable?: boolean | null;
+  /** Selected runtime route, already resolved with the runtime auto selector. null = unmeasured. */
+  usableLlm?: UsableLlm | null;
   /** `gh` is on PATH. `null` means not measured. */
   ghOnPath?: boolean | null;
   /** `gh --version` 의 판 · null/undefined = 못 쟀다. */
@@ -210,23 +206,19 @@ function providerDecision(deps: ReadinessDeps): ReadinessItem {
     return item('provider-decision', 'unknown', 'llm.provider was not measured');
   }
   const provider = deps.provider.trim() || 'auto';
-  if (provider !== 'auto') {
-    // 아는 provider 이름만 보여 준다 — 설정 칸에 자격 같은 값이 들어와 있어도 보고에 싣지 않는다.
-    const shown = KNOWN_PROVIDERS.has(provider) ? provider : '(set · value not shown)';
-    return item('provider-decision', 'ok', `llm.provider=${shown}`);
+  const shown = KNOWN_PROVIDERS.has(provider) ? provider : '(set · value not shown)';
+  if (deps.usableLlm == null) return item('provider-decision', 'unknown', `llm.provider=${shown} route was not measured`);
+  const { usable, provider: selected, via, why } = deps.usableLlm;
+  if (!usable) {
+    const reason = why === 'no usable LLM route selected' ? why : 'route unavailable';
+    const remedy = provider === 'auto' || provider === 'openai-codex' ? 'elanous login openai-codex'
+      : provider === 'openai' ? 'Set OPENAI_API_KEY or llm.apiKey for openai'
+      : provider === 'local' ? 'Set llm.baseUrl or LOCAL_LLM_URL for local'
+      : KNOWN_PROVIDERS.has(provider) ? `Configure credentials for llm.provider=${provider}` : undefined;
+    return item('provider-decision', 'manual', `llm.provider=${shown} selected no usable LLM (via none) — ${reason}`, remedy);
   }
-  if (deps.codexLogin === undefined || deps.codexLogin === null) {
-    return item('provider-decision', 'unknown', 'llm.provider=auto but codex login was not measured');
-  }
-  if (deps.codexLogin === true) {
-    // 2026-09-24 결정(`#20142`) — auto 는 codex 구독을 먼저 쓰고 계정 회전·llm.fallbackChain 이 뒤를 잇는다.
-    return item('provider-decision', 'ok', 'llm.provider=auto uses the codex login first; account rotation and llm.fallbackChain apply');
-  }
-  // 🩸 2026-09-24 빈 VM(🅢 #20263): 로그인도 키도 없는데 여기서 `ok` 가 나왔다(거짓 초록) — auto 가 고를 것이 없다.
-  if (deps.llmCredentialAvailable === false) {
-    return item('provider-decision', 'manual', 'llm.provider=auto but no LLM login or key was found — LLM commands will fail', 'elanous login openai-codex');
-  }
-  return item('provider-decision', 'ok', 'llm.provider=auto and no codex login');
+  const selectedName = selected && KNOWN_PROVIDERS.has(selected) ? selected : 'selected provider';
+  return item('provider-decision', 'ok', `llm.provider=${shown} → ${via} ${selectedName}`);
 }
 
 /** Debian 계열 apt 의 gh 는 GH_MIN_VERSION 미만이다(📏 09-25: Debian 12 = 2.23 · Ubuntu 24.04 = 2.45) — apt 로 깔면 곧바로

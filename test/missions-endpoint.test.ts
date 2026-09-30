@@ -83,8 +83,12 @@ async function uniquePort(): Promise<number> {
   return 50000 + Math.floor(Math.random() * 2000);
 }
 
+function authorizedFetch(url: string): Promise<Response> {
+  return fetch(url, { headers: { authorization: 'Bearer test-token' } });
+}
+
 describe('M4-3 GET /v1/missions', () => {
-  test('returns 503 when metaApi runtime is unwired', async () => {
+  test('returns 401 when metaApi runtime is unwired, before reaching the route', async () => {
     const fix = makeFixture();
     const srv = startNexusHttpServer({
       ...fix,
@@ -93,7 +97,23 @@ describe('M4-3 GET /v1/missions', () => {
     });
     try {
       const res = await fetch(`${srv.url}/v1/missions`);
-      expect(res.status).toBe(503);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
+    } finally { srv.stop(); }
+  });
+
+  test('returns 401 without bearer even when metaApi runtime is wired', async () => {
+    const fix = makeFixture();
+    const srv = startNexusHttpServer({
+      ...fix,
+      eventBus: fix.bus,
+      startPort: await uniquePort(),
+      metaApi: { bearerToken: 'test-token', noAuth: false },
+    });
+    try {
+      const res = await fetch(`${srv.url}/v1/missions`);
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally { srv.stop(); }
   });
 
@@ -103,10 +123,10 @@ describe('M4-3 GET /v1/missions', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/missions`);
+      const res = await authorizedFetch(`${srv.url}/v1/missions`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.total).toBe(0);
@@ -121,10 +141,10 @@ describe('M4-3 GET /v1/missions', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/missions`);
+      const res = await authorizedFetch(`${srv.url}/v1/missions`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.total).toBe(1);
@@ -145,14 +165,14 @@ describe('M4-3 GET /v1/missions', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
       // Default new mission status = 'planning' (createMission).
-      const planning = await fetch(`${srv.url}/v1/missions?status=planning`);
+      const planning = await authorizedFetch(`${srv.url}/v1/missions?status=planning`);
       const planningBody = await planning.json();
       expect(planningBody.total).toBe(1);
-      const completed = await fetch(`${srv.url}/v1/missions?status=completed`);
+      const completed = await authorizedFetch(`${srv.url}/v1/missions?status=completed`);
       const completedBody = await completed.json();
       expect(completedBody.total).toBe(0);
     } finally { srv.stop(); }
@@ -166,10 +186,10 @@ describe('M4-3 GET /v1/missions/:id', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/missions/does-not-exist`);
+      const res = await authorizedFetch(`${srv.url}/v1/missions/does-not-exist`);
       expect(res.status).toBe(404);
     } finally { srv.stop(); }
   });
@@ -181,10 +201,10 @@ describe('M4-3 GET /v1/missions/:id', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/missions/${missionId}`);
+      const res = await authorizedFetch(`${srv.url}/v1/missions/${missionId}`);
       expect(res.status).toBe(200);
       const body = await res.json();
       expect(body.mission.id).toBe(missionId);
@@ -206,10 +226,10 @@ describe('M4-3 GET /v1/missions/:id', () => {
       ...fix,
       eventBus: fix.bus,
       startPort: await uniquePort(),
-      metaApi: { noAuth: true },
+      metaApi: { bearerToken: 'test-token', noAuth: false },
     });
     try {
-      const res = await fetch(`${srv.url}/v1/missions/`);
+      const res = await authorizedFetch(`${srv.url}/v1/missions/`);
       expect(res.status).toBe(400);
     } finally { srv.stop(); }
   });
