@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="generator" content="Docusaurus v3.10.2">
 <title data-rh="true">Configuration | Elanous</title><meta data-rh="true" name="viewport" content="width=device-width,initial-scale=1"><meta data-rh="true" name="twitter:card" content="summary_large_image"><meta data-rh="true" property="og:url" content="https://docs.elanous.ai/ko/reference/configuration"><meta data-rh="true" property="og:locale" content="ko"><meta data-rh="true" property="og:locale:alternate" content="en"><meta data-rh="true" name="docusaurus_locale" content="ko"><meta data-rh="true" name="docsearch:language" content="ko"><meta data-rh="true" name="docusaurus_version" content="current"><meta data-rh="true" name="docusaurus_tag" content="docs-default-current"><meta data-rh="true" name="docsearch:version" content="current"><meta data-rh="true" name="docsearch:docusaurus_tag" content="docs-default-current"><meta data-rh="true" property="og:title" content="Configuration | Elanous"><meta data-rh="true" name="description" content="Where configuration lives and the keys you will touch."><meta data-rh="true" property="og:description" content="Where configuration lives and the keys you will touch."><link data-rh="true" rel="canonical" href="https://docs.elanous.ai/ko/reference/configuration"><link data-rh="true" rel="alternate" href="https://docs.elanous.ai/reference/configuration" hreflang="en"><link data-rh="true" rel="alternate" href="https://docs.elanous.ai/ko/reference/configuration" hreflang="ko"><link data-rh="true" rel="alternate" href="https://docs.elanous.ai/reference/configuration" hreflang="x-default"><script data-rh="true" type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"Configuration","item":"https://docs.elanous.ai/ko/reference/configuration"}]}</script><link rel="stylesheet" href="/ko/assets/css/styles.50fdacab.css">
-<script src="/ko/assets/js/runtime~main.5fe83ad3.js" defer="defer"></script>
+<script src="/ko/assets/js/runtime~main.2ed466c9.js" defer="defer"></script>
 <script src="/ko/assets/js/main.795bde34.js" defer="defer"></script>
 </head>
 <body>
@@ -73,7 +73,7 @@
 
 
 
-<table><thead><tr><th>Path</th><th>Meaning</th></tr></thead><tbody><tr><td><code>llm.provider</code></td><td>Default model provider (<code>openai-codex</code>, <code>grok</code>, <code>openrouter</code>, <code>anthropic</code>, <code>gemini</code>, <code>local</code>, …)</td></tr><tr><td><code>llm.model</code></td><td>Default model for that provider (leave unset to use the provider&#x27;s default tier)</td></tr><tr><td><code>llm.fallbackChain</code></td><td>Providers to try, in order, when the default cannot answer</td></tr><tr><td><code>roleLlm</code></td><td>A different model per role (planning, review, …)</td></tr></tbody></table>
+<table><thead><tr><th>Path</th><th>Meaning</th></tr></thead><tbody><tr><td><code>llm.provider</code></td><td>Default model provider (<code>openai-codex</code>, <code>grok</code>, <code>openrouter</code>, <code>anthropic</code>, <code>gemini</code>, <code>local</code>, …)</td></tr><tr><td><code>llm.model</code></td><td>Default model for that provider (leave unset to use the provider&#x27;s default tier)</td></tr><tr><td><code>llm.fallbackChain</code></td><td>Where to go when every Codex account is used up: <code>codex-rotate</code> (another Codex account) and <code>grok</code>; other names are ignored. Default is both — set <code>[&quot;codex-rotate&quot;]</code> to never fall back to Grok</td></tr><tr><td><code>roleLlm</code></td><td>A different model per role (planning, review, …)</td></tr></tbody></table>
 <p>See <a class="" href="/ko/models/providers">providers</a> for what each provider needs.</p>
 <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="environment-variables">Environment variables<a href="#environment-variables" class="hash-link" aria-label="Environment variables에 대한 직접 링크" title="Environment variables에 대한 직접 링크" translate="no">​</a></h2>
 
@@ -110,7 +110,7 @@
 <p><code>~/.elanous/config.json</code> holds user-level settings beyond env vars.
 (Older builds wrote <code>~/.config/elanous/config.json</code>; that path still appears in
 the source but the live config directory is <code>~/.elanous</code> — check yours with
-<code>elanous where</code>.)</p>
+<code>elanous config path</code>.)</p>
 
 
 
@@ -144,9 +144,9 @@ the source but the live config directory is <code>~/.elanous</code> — check yo
 
 
 
-<table><thead><tr><th>Section</th><th>Purpose</th></tr></thead><tbody><tr><td><code>llm</code></td><td>provider (<code>auto</code>/<code>grok</code>/<code>openai</code>/<code>anthropic</code>/<code>local</code>/<code>openai-codex</code>),</td></tr><tr><td></td><td><code>apiKey</code>, <code>model</code>, <code>baseUrl</code> (for local / codex proxies)</td></tr><tr><td><code>skills</code></td><td><code>activeSet</code> preset + <code>dirs[]</code> — scan multiple SKILL.md roots at once</td></tr><tr><td><code>obsidian</code></td><td><code>vault</code> (absolute path)</td></tr><tr><td><code>telegram</code></td><td><code>enabled</code>, <code>botToken</code>, <code>allowedUsers[]</code>, <code>homeChannel</code></td></tr><tr><td><code>onboarding</code></td><td><code>completed</code>, <code>completedAt</code>, <code>version</code></td></tr></tbody></table>
-<p><strong>Skill dir presets</strong> — <code>claudecode</code> (<code>~/.claude/skills</code>), <code>opencode</code>
-(<code>~/.config/opencode/skills</code>, default), <code>codex</code> (<code>~/.codex/skills</code>),
+<table><thead><tr><th>Section</th><th>Purpose</th></tr></thead><tbody><tr><td><code>llm</code></td><td>provider (<code>auto</code>/<code>openai-codex</code>/<code>grok</code>/<code>openai</code>/<code>anthropic</code>/<code>gemini</code>/<code>openrouter</code>/<code>local</code>),</td></tr><tr><td></td><td><code>apiKey</code>, <code>model</code>, <code>baseUrl</code> (for local / codex proxies)</td></tr><tr><td><code>skills</code></td><td><code>activeSet</code> preset + <code>dirs[]</code> — scan multiple SKILL.md roots at once</td></tr><tr><td><code>obsidian</code></td><td><code>vault</code> (absolute path)</td></tr><tr><td><code>telegram</code></td><td><code>enabled</code>, <code>botToken</code>, <code>allowedUsers[]</code>, <code>homeChannel</code></td></tr><tr><td><code>onboarding</code></td><td><code>completed</code>, <code>completedAt</code>, <code>version</code></td></tr></tbody></table>
+<p><strong>Skill dir presets</strong> — <code>claudecode</code> (<code>~/.claude/skills</code>, default), <code>opencode</code>
+(<code>~/.config/opencode/skills</code>), <code>codex</code> (<code>~/.codex/skills</code>),
 <code>hermes</code> (<code>~/.hermes/skills</code>), <code>openclaw</code> (<code>~/.openclaw/workspace/skills</code>),
 or <code>custom</code> for your own paths. Multiple dirs can be scanned
 simultaneously (first-dir-wins on name collisions).</p>

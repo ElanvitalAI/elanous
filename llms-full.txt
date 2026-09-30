@@ -23,6 +23,14 @@ Work that repeats — every morning, on every new request — runs as [loop agen
 
 Skills and graphs come as [plugins](/using-elanous/plugins) from a signed marketplace — the same packages install in Codex; you can [build one](/using-elanous/build-a-plugin).
 
+## The name and the mark — élan, and nous
+
+<img src="https://elanous.ai/media/brand/elanous-180.png" width="96" alt="Elanous mark" />
+
+The red point at the center is *élan* — the drive to move on its own. The three white blades around it are *nous* — the mind that brings order. They turn one way — observe, understand, heal — widening a little with every turn. A spark meets a mind and keeps widening itself. That is Elanous.
+
+*Elanous* joins Bergson's *élan vital* — the vital impulse that gave Elanvital AI its name — with Anaxagoras' *nous*, the mind that sets the world turning.
+
 Start with [Install](/getting-started/install) and the [Quickstart](/getting-started/quickstart).
 
 ---
@@ -39,11 +47,7 @@ elanous runs on **Bun** (not Node) on macOS, Linux and WSL2; Windows native Powe
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 ```
 
-Or with npm (needs [Bun](https://bun.sh) on your `PATH`):
-
-```bash
-npm install -g elanous
-```
+The `elanous` package on npm is older than the latest release — use the one-line installer above. The npm path returns to this page when npm is published with every release.
 
 Coming from **monad** (0.1.x)? Don't use `monad update` to move — see [Moving from monad](/getting-started/update-and-uninstall#moving-from-monad).
 
@@ -98,7 +102,7 @@ elanous doctor --fix --yes                        # builds node-pty
 
 The Codex CLI needs **Node.js 20 or newer** — Debian 12's own `nodejs` package is 18, so install Node from [nodejs.org](https://nodejs.org/en/download) (or your distribution's Node 20+ source) before `npm install -g @openai/codex`.
 
-That is enough to boot. To run the daemon and the harness, let `doctor` install what they need — build tools and the node-pty rebuild, a pinned static `gh`, `rg`, Node and the Codex CLI (about 80 seconds on a bare Debian 12 VM):
+That is enough to boot. To run the daemon and the harness, let `doctor` fix what it can — the node-pty rebuild, a pinned static `gh` and the Python environment (`python3-venv`, with `--sudo`). It does **not** install Node or the Codex CLI: install Node.js 20+ as above, then `npm install -g @openai/codex`.
 
 ```bash
 elanous doctor --fix --yes --sudo
@@ -151,6 +155,7 @@ If you run the background service, restart it after an update — see [troublesh
 
 - On Linux, `node-pty` has no prebuilt binary; elanous falls back to Bun's own PTY and nothing breaks. `elanous doctor --fix --yes` rebuilds it when a C++ toolchain is present.
 - If `bun install` silently skips an optional dependency on Linux, check whether `TMPDIR` and Bun's cache are on different filesystems — `elanous doctor` reports it as `bun-tmpdir`, and `elanous doctor --fix --yes` adds the fix to your shell startup file. See [troubleshooting](/help/troubleshooting#bun-skips-an-optional-dependency).
+- If the service log says the web app is not built, set `ELANOUS_PWA_STATIC_DIR` to a built web app folder (`apps/pwa/out` in a checkout, after `elanous nexus build`).
 
 Next: [quickstart](/getting-started/quickstart).
 
@@ -217,6 +222,8 @@ elanous                                    # the terminal UI
 elanous nexus run      # start the daemon; the web app is served with it
 elanous nexus show     # prints the web app link (usually http://127.0.0.1:31415/app/)
 ```
+
+Or run `elanous start` — it looks for a model (offering sign-in if it finds none), starts the daemon if needed and opens the web app. Add `--tui` for the terminal UI instead.
 
 On first open it takes you to model setup. See [Web app](/surfaces/pwa).
 
@@ -547,8 +554,9 @@ Source: https://docs.elanous.ai/using-elanous/commands/
 
 | Command | What it does |
 |---|---|
+| `elanous start` | One command to begin: finds a model, starts the background service if needed and opens the web app (`--tui` for the terminal UI) |
 | `elanous doctor` | Report which credentials resolve and from where, plus a readiness section (provider, `gh` sign-in, `PATH`, background service version, Linux `TMPDIR`) — `--json` for machines |
-| `elanous doctor --fix` / `--fix --yes` | Show / apply the reversible repairs (the `PATH` block, key-cache permissions, the Linux `TMPDIR` block); startup files are backed up first |
+| `elanous doctor --fix` / `--fix --yes` | Show / apply the reversible repairs (the `PATH` block, key-cache permissions, the Linux `TMPDIR` block); startup files are backed up first. A missing git is offered interactively on a terminal; everything else needs `--yes` |
 | `elanous setup` | Walk through missing setup steps (`--non-interactive` only reports) |
 | `elanous login openai-codex` | Sign in with a ChatGPT subscription |
 | `elanous login status` / `elanous login logout <provider>` | List / forget stored sign-ins |
@@ -578,6 +586,16 @@ Useful `harness say` / `harness ask` options: `--dry-run` (plan only), `--no-aut
 | `elanous harness worktrees` | Worktrees the harness made, and whether each is safe to remove |
 | `elanous harness clean` | Remove finished harness worktrees (dry run unless `--yes`; open PRs are always kept) |
 | `elanous ops status` | What the autonomous parts are doing right now |
+
+## Tasks, loops and plugins
+
+| Command | What it does |
+|---|---|
+| `elanous tasks list` / `elanous tasks approve <id>` | See queued tasks / approve one that came from outside |
+| `elanous card list` / `elanous card show <id>` | Tasks as cards, and one card with its sections |
+| `elanous directive add "<instruction>" --dry-run` | Preview an instruction as a Linear issue; drop `--dry-run` to create it |
+| `elanous loop list` / `status` / `run` | Loop agents — see [Loop agents](/using-elanous/loop-agents) |
+| `elanous plugin add` / `list` / `remove` | Install and manage plugins — see [Plugins](/using-elanous/plugins) |
 
 ## Settings and models
 
@@ -689,6 +707,8 @@ These apply to both `harness say` and `harness ask`:
 |---|---|
 | `elanous harness worktrees` | Every worktree the harness made, and whether it is safe to remove |
 | `elanous harness clean` | Remove finished harness worktrees — a dry run unless you add `--yes`; worktrees with an open pull request are always kept |
+| `elanous harness stop <runId>` | Stop one run — its orchestrator process, and its Kubernetes job if it ran on a cluster |
+| `elanous harness processes` | The processes this repository started, grouped by resource use and age (read-only; kills nothing) |
 | `elanous self run-ledger` | The observation ledger of a run |
 | `elanous logs --space <runId>` | The log of one run |
 
@@ -796,10 +816,13 @@ whether to trust it, elanous answers that screen before it types the mission.
   (`/plugins` in Codex, `/plugin install` in Claude Code), installs the plugin
   from that marketplace, and then runs the mission with its skill. The official
   marketplace is `elanous` (see [Plugins](/using-elanous/plugins)).
-- `--chain` — one mission passes through several agents in order, for example
-  Codex builds, Claude Code reviews, and elanous checks the evidence and opens
-  the pull request. The reviewer gets the builder's diff and the next agent
-  gets a short summary — never the raw screen.
+- `--chain codex,claude,elanous` (or `codex,claude,codex,elanous`) — Codex
+  builds, Claude Code reviews, (Codex fixes,) and elanous checks the evidence
+  and opens the pull request. Other orders are refused, and `--chain` cannot be
+  combined with `--headless` or `--no-commit`. The reviewer gets the builder's
+  diff and the next agent gets a short summary — never the raw screen.
+- `--backend` also accepts `gemini`, `grok` and `aside` — see
+  [Recommended programs](/getting-started/recommended-programs#agents-you-can-hand-work-to).
 
 ## Watch it
 
@@ -813,10 +836,17 @@ terminals can sit side by side. See [Terminal](/surfaces/pwa-terminal) and
 When an agent shows a sign-in screen, elanous stops and sends you the link or
 device code — it does not sign in for you.
 
-*Coming next:* if you have signed in once in a browser profile that elanous
-can drive, elanous will approve the agent's sign-in page in that browser —
-but only when the page is a plain "authorize" or "enter code" screen. Any
-password, two-step, captcha or passkey prompt goes back to you.
+If you have signed in once in a browser that elanous can drive, you can
+approve a waiting sign-in by hand:
+
+```bash
+elanous agent-mission browser-login --pty <ref> --provider codex   # or claude
+elanous agent-mission browser-login --pty <ref> --provider codex --dry-run   # only look
+```
+
+It approves only a plain "authorize" or "enter code" page. Any password,
+two-step, captcha or passkey prompt goes back to you. Missions do not do this
+on their own yet.
 
 ## Status
 
@@ -826,7 +856,7 @@ password, two-step, captcha or passkey prompt goes back to you.
 | Driving Codex / Claude Code / elanous in a PTY | Available (Claude Code needs you signed in) |
 | Handing results from one agent to the next in one mission (`--chain`) | Available |
 | Installing a plugin inside the agent's own screen (`--plugin`) | Available for Codex (recorded end to end) · Claude Code uses `/plugin install` |
-| Browser-assisted sign-in | In progress |
+| Browser-assisted sign-in | Manual (`agent-mission browser-login`) · automatic use during a mission is in progress |
 
 ---
 
@@ -882,7 +912,7 @@ elanous intake digest                  # today's summary: what was absorbed, one
 
 | | Status |
 |---|---|
-| One item → one task, marked as a code change (`[dev]`) or a job to run (`[run]`) | 🔄 in progress (a `to-tasks` intake command) |
+| Goal lines and idea notes → tasks, each typed **implement**, **research**, **document** or **operate**: `elanous intake to-tasks` (`--dry-run` to preview; needs the daemon running; at most 5 per run unless you pass `--limit`) | ✅ 0.2.4 |
 | One item → several tasks, each typed as **run**, **implement**, **research** or **composite** | 📋 designed |
 | Duplicate detection against existing tasks and past runs | 📋 designed |
 
@@ -925,6 +955,8 @@ elanous connector linear sync --team ENG --prefix "[elanous]"
 - Done, canceled and duplicate issues are skipped. One failing issue does not stop the rest; it is retried on the next sync.
 - Put `[dev]` in an issue title to send it to the harness once approved; otherwise it runs as a job.
 
+**Send an instruction to Linear as an issue:** `elanous directive add "<instruction>" --dry-run` shows how it will be filed; drop `--dry-run` to create the issue. In the terminal UI, `/directive <text>` does the same.
+
 **3. Or receive webhooks** instead of syncing: store the signing secret with `elanous connector linear set-webhook-secret` (stdin) and run the receiver with `elanous hooks serve`. Signatures are checked and replayed deliveries are refused. The receiver needs a public HTTPS address in front of it.
 
 | | Status |
@@ -941,7 +973,7 @@ Everything above works with no tracker connected. What a tracker gives you and w
 | A tracker gives you | In elanous | Status |
 |---|---|---|
 | Issues, states, priority, sub-issues, projects | Tasks (with dependencies, parent task, mission, acceptance criteria) | ✅ |
-| A board | TUI board, the web app task panel | ✅ · 🔄 one shared list and approval view |
+| A board | TUI board, the web app task panel, task cards (`elanous card list` / `card show <id>`; a card board among the web app's Labs pages — turn on «Labs 탭 보기» (show Labs tabs) in Settings), and the web app's **Approvals** page | ✅ 0.2.4 |
 | Filing by message or email | Telegram `/work`, the web app intake page | ✅ 0.2.3 · 📋 email |
 | Triage suggestions and rules | Interpretation and auto-run rules | 🔄 · 📋 condition → action rules |
 | Cycle time and lead time | Task timestamps and the run ledger | 📋 `tasks stats` |
@@ -972,21 +1004,7 @@ elanous ships an example loop, `stale-draft-digest` (every morning, list open dr
 
 ## For everyone — see and run loops
 
-Loops are found in the `graphs/` folder of the directory you run these commands from. With the one-line installer that folder is inside the installed copy, so go there first (in a checkout, stay in the checkout):
-
-```bash
-cd ~/.local/share/elanous/current/node_modules/elanous   # installed copy; skip in a checkout
-```
-
-Run elsewhere, `loop list` prints `[]` and `graph run graphs/…` cannot find the file.
-
-```bash
-elanous graph run graphs/examples/stale-draft-digest/stale-draft-digest.yaml --dry-run   # walk the steps without running anything
-elanous schedule list                                          # what runs on a schedule
-elanous schedule disable <id>                                  # pause a scheduled loop (reversible)
-```
-
-Every loop in one list:
+The `loop` commands find the loops that ship with your installed copy, from any folder:
 
 ```bash
 elanous loop list                        # each loop: trigger (cron), enabled or not, last run, next run
@@ -994,7 +1012,10 @@ elanous loop status stale-draft-digest   # one loop with its recent runs
 elanous loop run stale-draft-digest --dry-run   # walk the steps without running anything
 elanous loop start stale-draft-digest    # preview the schedule change · add --yes to apply it
 elanous loop stop stale-draft-digest --yes      # remove the schedule
+elanous schedule list                    # everything that runs on a schedule
 ```
+
+To run a graph file directly, give its path — `elanous graph run <path/to/graph.yaml> --dry-run`; a relative path is read from the folder you are in.
 
 `start` and `stop` only preview until you add `--yes`.
 
@@ -1004,7 +1025,16 @@ The **steward** is elanous's own task loop. What you ask for becomes a task (a L
 
 It only asks you about money, publishing, security and anything that cannot be undone. The first version only records its decisions so you can compare them with your own before it acts.
 
-*Status:* in progress (see the release notes).
+```bash
+elanous directive add "Add a Usage section to the README" --dry-run   # preview the task; drop --dry-run to create the Linear issue
+elanous card list                        # tasks as cards
+elanous card show <id>                   # one card and its sections
+elanous loop start steward               # preview the schedule (every 15 minutes, 08:00-23:00, and on new directives) · add --yes to apply
+```
+
+The steward needs a Linear connection and is off until you start it.
+
+The **landing-and-healing loop** (`landing-heal`) watches the harness's own pull requests for review findings that must be fixed and for checks that are due after a merge. It is off by default too — `elanous loop status landing-heal` shows its schedule.
 
 ## For developers — build your own
 
@@ -1068,18 +1098,19 @@ Every round is saved under the state folder (`graph-runs/stale-draft-digest/`), 
 
 ## 4. Put it on a trigger
 
-```bash
-elanous schedule create --cron "0 9 * * *" \
-  --command "elanous graph run graphs/examples/stale-draft-digest/stale-draft-digest.yaml" --dry-run   # see the plan
-```
+The graph's own `loop.trigger` (here `cron: "0 9 * * *"`) is the schedule:
 
-Drop `--dry-run` to register it. `elanous schedule disable <id>` pauses it.
+```bash
+elanous loop start stale-draft-digest          # preview the crontab change
+elanous loop start stale-draft-digest --yes    # apply it
+elanous loop stop stale-draft-digest --yes     # remove it again
+```
 
 ## 5. Going further
 
 - **Decide, don't just run** — a `judge` step can send a round back (for example "the report is empty → collect again") within `max_visits`.
 - **Ask a person** — a `hitl` step with a recipe `approval: "<question>"` stops the round until someone approves.
-- **Your own step kinds and sharing** — a plugin can add step kinds (`nodes`) and ship whole loops; see [Build a plugin](/using-elanous/build-a-plugin). Sharing a loop through a marketplace by name is coming.
+- **Your own step kinds and sharing** — a plugin can add step kinds (`nodes`) and ship whole loops; see [Build a plugin](/using-elanous/build-a-plugin). Package the loop in a plugin and others install it by name: `elanous plugin add <plugin>@<market>`.
 
 ---
 
@@ -1096,9 +1127,11 @@ A plugin is a folder of skills — and, for elanous, graphs — that you install
 | `elanous-basics` | Research and everyday skills: web search and crawling (`omni-crawl`), link digests (`omni-digest`), project onboarding (`project-onboarding`), a grilling interviewer (`grill-me`), photo OCR intake (`photo-intake-ocr`) | Free |
 | `elanous-media` | Video skills: building videos (`video-builder`) and word-timed motion B-roll (`motion-broll`) | Free |
 | `video-broll` | The first plugin with a graph: cut word-timed motion B-roll into a talking-head video (align words → plan density → author clips with a coding agent → composite → check) | Free |
+| `elanous-hwp` | Korean HWP/HWPX documents: read to Markdown (`hwp-read`), write from templates (`hwp-write`), fill existing forms (`hwp-fill`), plus `to-md`/`from-md` step kinds for graphs | Free |
+| `job-coach` | Career coaching from an interview: job candidates matched to Korea's NCS competency units, researched courses and a report — a personal mode and an enterprise HRD mode | Free |
 | `elanous-markets` | Market research and asset analysis skills | Listed only — not published yet |
 
-Some skills need a key for an outside service (for example `omni-digest` uses xAI, `photo-intake-ocr` uses Upstage). The pack lists these as `secret:<service>` capabilities so you see them before you install.
+Some skills need a key for an outside service (for example `omni-digest` uses xAI, `photo-intake-ocr` uses Upstage, `job-coach` uses a public-data NCS service key). The pack lists these as `secret:<service>` capabilities so you see them before you install, and asks for them as connection settings — see [Connection settings](#connection-settings) below.
 
 ### Install in Codex
 
@@ -1120,22 +1153,46 @@ The skills appear in Codex as `<plugin>:<skill>`, for example `elanous-basics:om
 
 ### Install in elanous
 
+By name, from the official marketplace:
+
 ```bash
-elanous plugin add ./path/to/plugin                     # a folder on this machine
-elanous plugin add https://github.com/<owner>/<repo>.git#<commit>:<subfolder>  # a pinned commit of a git repository
+elanous plugin add elanous-basics@elanous      # fetches the signed index, checks the signature and the package hash
 elanous plugin list
 elanous plugin remove <name>
 ```
 
+`plugin add` shows the capabilities for you to approve (`--yes` approves them), names the connection settings the plugin will ask for (it never prints their values), and registers the plugin's graphs and skills — and any custom node kinds it declares, as `<plugin>:<kind>`. `--json` prints each step as one line of JSON.
+
+Other sources:
+
+```bash
+elanous plugin add ./path/to/plugin                     # a folder on this machine
+elanous plugin add https://github.com/<owner>/<repo>.git#<commit>:<subfolder>  # a pinned commit of a git repository
+elanous plugin market add <name> <https-url>            # another signed marketplace
+elanous plugin market update                            # refresh the signed indexes
+```
+
 For the git form, the URL must end in `.git` and `<commit>` must be the full 40-character commit hash; a subfolder is only accepted with a pinned commit.
 
-`plugin add` shows the capabilities for you to approve (`--yes` approves them), names the connector settings the plugin will ask for (it never prints their values), and registers the plugin's graphs and skills — and any custom node kinds it declares, as `<plugin>:<kind>`. `--json` prints each step as one line of JSON.
+### Install in the web app
 
-Installing **by name from a marketplace** (`elanous plugin add <plugin>@<market>`, which fetches and verifies the signed index first) is **coming**. Until then, install the official plugins in Codex as above, or from the repository with a pinned commit.
+Open **마켓** (Market) in the web app, choose **공식 마켓 받기** (get the official marketplace), open a plugin and press **동의하고 설치** (approve and install) after reading its capabilities. The progress shows each step — download, signature check, consent, registration. Installed plugins can be removed from the same page.
+
+### Connection settings
+
+A plugin that talks to an outside service declares the keys it needs. Set them once; elanous passes them to that plugin's graphs and servers as environment variables and never shows the values again:
+
+```bash
+elanous plugin credentials job-coach                          # which fields exist, and whether each is set
+elanous plugin credentials job-coach --stdin serviceKey       # read one value from standard input
+elanous plugin credentials job-coach --unset serviceKey
+```
+
+In the web app the same fields appear under the installed plugin as **연결 정보** (connection settings) — a password field per key, marked saved or empty.
 
 ### Is it really ours?
 
-Every marketplace ships `index.sig` next to its `marketplace.json`: an Ed25519 signature over the exact bytes of the index. The official marketplace is signed with the published key `4d809b69` (the installer will trust it by default); the signed index is also served at https://elanvitalai.github.io/elanous-plugins/marketplace.json. The elanous installer (coming, above) checks it against the keys it trusts before it uses the list, and refuses an index whose sequence number goes backwards — an attempt to serve an older list.
+Every marketplace ships `index.sig` next to its `marketplace.json`: an Ed25519 signature over the exact bytes of the index. The official marketplace is signed with the published key `4d809b69` (the installer will trust it by default); the signed index is also served at https://elanvitalai.github.io/elanous-plugins/marketplace.json. The elanous installer checks it against the keys it trusts before it uses the list, and refuses an index whose sequence number goes backwards — an attempt to serve an older list.
 
 ## For developers
 
@@ -1188,7 +1245,7 @@ That is all the folder holds. The skill and the graph stay where they already li
 | `graphs` | Graph files inside the package that elanous registers. Only listed graphs are registered — the loader does not scan folders. A listed graph that is not in the package stops the publish for this plugin (`graph-missing`). |
 | `nodes` | Custom node kinds the plugin adds (`./nodes/<kind>.yaml`), registered as `<plugin>:<kind>` when elanous finds the installed plugin. Each node declares `kind`, `graph` (`workflow` or `harness`), `inputs` (a JSON Schema — the editor builds its form from it) and `run` — one of `bash`, `http`, `skill` or `mcp`. A node with an unknown `run` is skipped with a warning; the rest of the plugin still loads. |
 | `capabilities` | What the plugin may touch, shown to the user before install: `fs:workdir`, `net:<host>`, `proc:<binary>`, `agent:<backend>`, `secret:<service>`. |
-| `connectors` | Services the plugin connects to, with the settings it asks the user for; fields marked secret are write-only. |
+| `connectors` | Services the plugin connects to and the settings it asks the user for: `{ "id", "kind", "userConfig": [{ "key", "label", "secret", "env" }] }`. Values are set with `elanous plugin credentials` or the web app and reach the plugin's graphs and servers as environment variables — named by `env`, or `ELANOUS_PLUGIN_<PLUGIN>_<KEY>` when `env` is absent. Fields marked secret are write-only. |
 | `pricing` | `{ "model": "free" }`. Only free plugins are published for now. |
 
 `.codex-plugin/plugin.json` carries the Codex fields (`name`, `version`, `description`, `"skills": "./skills/"`, `interface`) so Codex installs the same package.
@@ -1253,6 +1310,10 @@ elanous session new                    # start a fresh one, mark active
 elanous session resume <idPrefix>      # resume by full id or short prefix
 elanous session show [idPrefix]        # print transcript of active / given session
 elanous session delete <idPrefix>      # remove a session
+elanous session search "<text>"        # search message text across sessions
+elanous session export [idPrefix]      # write a transcript to a markdown file (--to <path>)
+elanous session fork <idPrefix>        # copy a session into a new one
+elanous session watch [idPrefix]       # follow new messages live
 
 elanous chat "hello world"             # one-shot turn in active session
 elanous chat --new "fresh topic"       # force a new session
@@ -1483,7 +1544,7 @@ and attaches it automatically:
 
 Text-kind attachments are prepended as labeled code-fenced sections
 ahead of your question. Images ride as multimodal ContentBlocks when the
-routed model is vision-capable (see `isLikelyVisionModel()`).
+routed model can read images.
 
 Paths accepted: absolute (`/path/to/f.pdf`), home-relative (`~/doc.pdf`),
 `./` or `../`, and quoted (`"name with space.pdf"`). URLs are skipped.
@@ -1491,19 +1552,35 @@ Symlinks resolve to their canonical target (two links → one attachment).
 
 ## Slash commands
 
+The commands you will use most. The TUI has more — open the help overlay with `/help` (or `/?`) for the full list.
+
 | Command | Alias | Purpose |
 |---------|-------|---------|
+| `/harness <sentence>` | | Hand work to the harness (also `plan`, `runs`, `stop <id>`) |
 | `/run-skill <name> [args]` | `/rs`, `/run` | Execute a SKILL.md |
 | `/provider` | `/p` | List providers + availability |
+| `/model [name]` | `/m` | Switch the active model (lists them with no argument) |
+| `/reasoning [off\|low\|medium\|high\|xhigh]` | `/r`, `/think` | Reasoning level |
+| `/resume [id]` | | Pick a past session, or load one by id prefix |
+| `/fork` | | Copy this session into a new one |
+| `/session list\|load\|new` | `/sess` | Manage sessions |
+| `/remaining` | | What each account has left |
+| `/memory list\|search\|add` | `/mem` | Memory |
+| `/directive <text>` | | Record an instruction as a Linear issue |
+| `/design` | `/design-check` | Design rulebooks this repository declares |
+| `/term` | `/terminal` | Terminal modal (spawn, attach, switch) |
+| `/setup` | | Setup wizard guide (`/setup reset` re-runs it next start) |
 | `/context` | `/ctx` | Table of attached files |
 | `/context clear [big]` | | Drop all attachments (or ≥100KB ones) |
 | `/context drop <id>` | | Drop a single attachment |
-| `/paste` | `/v` | Attach clipboard image (macOS) |
+| `/paste` | | Attach clipboard image (macOS) |
 | `/sync` | `/s` | Enter sync mode |
 | `/plugin list\|activate\|deactivate\|reload` | `/plugins` | Manage plugins |
 | `/clear` | `/cls` | Clear log pane (keeps attachments) |
 | `/help` | `/?` | Keybinding overlay |
 | `/quit` | `/q`, `/exit` | Exit |
+
+`elanous keys` prints every keybinding and slash command.
 
 ## Argument autocomplete
 
@@ -1629,7 +1706,7 @@ elanous logs --event pipeline-node-entry --limit 40 --all --include-test --json 
 | Workflow | `src/workflow-runtime/` | YAML DAG engine (`elanous wf`) |
 | Tasks | `src/task-orchestrator/` | task store, runtimes, surfaces, task-to-workflow conversion |
 
-**Intake has three live entrances** — Telegram, the terminal UI, and an internal API path used by system repair. Other channels (PWA, voice, CLI) are declared but have no producer yet. In particular, `elanous harness say` from a terminal goes straight to the harness and **does not pass through intake** (no triage, domain or phase decomposition).
+**Intake has three live entrances** — Telegram, the terminal UI, and an internal API path used by system repair. The PWA, voice and CLI channels are declared but nothing feeds them yet. The web app's **Intake** page is a separate door: it sends what you type to your notes or to the harness without passing through this pipeline. In particular, `elanous harness say` from a terminal goes straight to the harness and **does not pass through intake** (no triage, domain or phase decomposition).
 
 **The intended shape:** intake turns a sentence into tasks, the task manager runs a task by starting a graph, and a workflow is the body of one node in that graph. That joins the two missing links without building a new engine — see [Graph engineering](/concepts/graph-engineering#workflows-tasks-and-intake).
 
@@ -1705,7 +1782,7 @@ flowchart LR
 
 The loop is the same whatever the domain. What changes from one domain to another is only:
 
-- **The senses and hands you attach.** A coding run observes tests and diffs and acts through a worktree; a trading run observes prices and news and acts through orders. Both plug into the same loop as *observe* nodes and *execute* nodes.
+- **The senses and hands you attach.** A coding run observes tests and diffs and acts through a worktree; a trading run observes prices and news (placing orders is not part of the open-source core). Both plug into the same loop as *observe* nodes and *execute* nodes.
 - **The posture.** How deep observation goes, how long the healing loop may run, how widely it grounds itself in outside sources, and which actions are allowed — all rise and fall with the situation, the way a readiness level does.
 
 ## Resolution rises with difficulty
@@ -1832,7 +1909,7 @@ elanous graph status <graph_id>
 
 Source: https://docs.elanous.ai/concepts/source-layout/
 
-`src/` is ~4,400 files. The map below is the entry layer only — it is not
+`src/` is several thousand files (count them with `git ls-files src | wc -l`). The map below is the entry layer only — it is not
 the whole tree, and anything not listed here lives under a subdirectory.
 
 ```
@@ -2023,6 +2100,23 @@ else until you do.
 
 Source: https://docs.elanous.ai/surfaces/discord/
 
+## Set up the bot
+
+Voice runs on the same Discord bot you chat with in text. Set it up once:
+
+```bash
+elanous onboarding discord
+```
+
+The wizard shows where to create the bot in the Discord developer portal (copy
+its token, turn on the **Message Content Intent**, invite it to your server),
+then asks for the bot token, the Discord user IDs allowed to talk to it
+(`discord.allowedUsers`) and an optional home channel for scheduled messages.
+It saves them to your config (`discord.botToken`, `discord.enabled`). The bot
+then answers in servers and DMs whenever the daemon runs.
+
+## Voice
+
 Discord now has two different voice-capable surfaces:
 
 - text channel / DM voice attachments
@@ -2106,9 +2200,14 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 | **Chat** | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](/surfaces/pwa-chat). |
 | **Terminal** | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and a live view of an agent's terminal from a link. See [Terminal](/surfaces/pwa-terminal). |
 | **Intake** | *Since 0.2.3.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](/using-elanous/tasks-and-intake). |
+| **Approvals** | Things waiting for you: loop steps that ask a person before they go on, and pull requests held for your approval — each with its summary, changed files and checks. Approve, and the pull request is merged. |
 | **Live** | Your harness runs as they happen — stage bars, a stream of decisions (what, why, where to), gauges and the raw log. Everyday mode costs almost nothing; **Full show** records more and animates it, and switches itself off after 30 minutes. See [Live](/surfaces/pwa-live). |
 | **Trace** | Follow one run from the whole fleet down to a single decision and the log line behind it. Filters stack up as a lens you can peel back one chip at a time, and the address keeps the view so you can share it. See [Trace](/surfaces/pwa-trace). |
+| **Missions** | Mission lineage and the task board in one menu; you can also hand a new goal from here. |
+| **Design** | Pick a design system, see drafts, or derive one from a URL. See [Design systems](/using-elanous/design). |
 | **Vault** | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](/surfaces/pwa-vault). |
+| **마켓** (Market) | Browse the signed plugin marketplaces, read a plugin's capabilities, install and remove plugins. See [Plugins](/using-elanous/plugins). |
+| **Schedules** | Every scheduled job in one list — cron, the background service and loop triggers. |
 | **Settings** | Models and tiers, voice and text-to-speech, persona, notifications, theme and daemon health. |
 | **Setup** (`/setup`) | First-time setup in the browser. Today it covers the LLM provider; the other wizard steps still run in the terminal with `elanous onboarding`. |
 
@@ -2275,6 +2374,11 @@ as it appears on screen, with the meaning in brackets.
     terminal UI running in another window on the daemon's machine.
   - **PTY 목록** (PTY list) — every terminal the daemon knows about, with its
     history.
+- **▦ 나란히** (side by side) shows up to three live terminals next to each
+  other — agent terminals first. Each pane names its agent and has a strip
+  with what elanous just did there and why. Pick the panes from the chips at
+  the top; the address keeps your choice (`?wall=<id>,<id>`), so you can share
+  the view.
 
 The connection status (`ACP: 연결됨` — connected) is shown in the corner of
 the terminal. From 0.2.2, keys you type while it still says `연결 중`
@@ -2432,7 +2536,7 @@ The page's labels are in Korean today, so this page gives each label as it appea
 | **BURN** | Model tokens per minute |
 | **BLOCKED** | Runs that are stuck |
 
-**런** (Runs): one row per run in the time window. Each row is a bar of six stages: **저작** (writing the goal), **분해** (splitting it into pieces), **구현** (implementing), **게이트** (checks), **리뷰** (unattended review) and **착지** (merging). A stage lights up when the run reaches it and turns red when something fails there. Click a row to see only that run; click it again, or **전체 보기** (show all), to go back.
+**런** (Runs): one row per run in the time window. Each row is a bar of six stages: **저작** (writing the goal), **분해** (splitting it into pieces), **구현** (implementing), **게이트** (checks), **리뷰** (unattended review) and **착지** (merging). A stage lights up when the run reaches it and turns red when something fails there. Click a row to open that run's drawer: its screen and log lines, **Trace 로 →** (open it in Trace), **MAX 이 런만** (Full show for this run only), **⏹ 멈춤** (stop, after one confirmation) and, when it waits for you, **승인 카드로 →** (to its approval card). Click the row again, or **✕**, to close it.
 
 **판단 스트림** (Decision stream): one line per decision, newest first, tagged with its kind:
 
@@ -2452,7 +2556,8 @@ At the bottom the page names its sources (the log and the harness run records) a
 ## Controls
 
 - **시간 창** (Time window): how far back to look.
-- **신호 출처** (Signal source): which elanous instance to read. **이 인스턴스** (this instance) is the default; an isolated test instance appears here too.
+- **신호 출처** (Signal source): which elanous instance to read. **이 인스턴스** (this instance) is the default; **전체(연합 · 최근 24시간에 쓰인 우주)** (all — every instance written to in the last 24 hours) reads them together, and an isolated test instance appears here too.
+- **공개 캡처** (Recording mode): for screenshots and recordings. It replaces account names with `account-N`, hides credits and dollar amounts, and masks home-folder paths and machine names. `?capture=public` in the address turns it on too.
 - **화려함 MAX** (Full show): see below.
 
 ## Everyday and Full show
@@ -2593,7 +2698,7 @@ From Live, open a run and click **Trace 로 →** to land on that run at L2. **�
 
 Source: https://docs.elanous.ai/operations/doctor/
 
-`elanous doctor` tells you what this machine still needs. It never changes anything unless you ask it to.
+`elanous doctor` tells you what this machine still needs. It never changes anything unless you ask it to (the one exception: with `--fix` on a terminal it may offer to install git, and waits for your answer).
 
 ```bash
 elanous doctor
@@ -2617,23 +2722,26 @@ elanous doctor
 | `build-toolchain` · `node-pty` | The compiler and the terminal library load |
 | `python-env` | The Python environment and its required modules |
 | `docker` · `kubernetes` · `memory` | Optional container runtime, cluster and available memory |
+| `bun-tmpdir` | `TMPDIR` and Bun's cache are on the same filesystem (Linux) |
 
 The last line counts what is left to do.
 
 ## Fixing things
 
 ```bash
-elanous doctor --fix              # show the repairs it would make (read-only)
+elanous doctor --fix              # show the repairs it would make
 elanous doctor --fix --yes        # apply them
 elanous doctor --fix --yes --sudo # also run the planned sudo install lines (only where sudo works without a password)
 ```
 
 | Option | What it does |
 |---|---|
-| `--fix` | Show reversible repairs; read-only on its own |
+| `--fix` | Show reversible repairs. On a terminal it may offer to install a missing git; everything else needs `--yes` |
 | `--yes` | Apply the planned repairs (with `--fix`) |
 | `--sudo` | Also run the planned `sudo` install lines, only where `sudo -n true` works (with `--fix --yes`) |
 | `--restart` | Restart the background service when it runs a different version than this copy, then verify it (with `--fix --yes`; interrupts bots, terminals and running turns) |
+| `--credentials` | Show details for each credential in the normal output |
+| `--advise` | Ask your configured model to rank the suggested repairs (advice only; changes nothing) |
 | `--json` | Structured output |
 
 ⚠️ Some headings and remedies are still printed in Korean. The check names and the `ok` / `manual` status are in English.
@@ -2892,7 +3000,7 @@ or, from a checkout, `bash scripts/add-api-key.sh OPENROUTER_API_KEY`. `elanous 
 |---|---|
 | `llm.provider` | Default model provider (`openai-codex`, `grok`, `openrouter`, `anthropic`, `gemini`, `local`, …) |
 | `llm.model` | Default model for that provider (leave unset to use the provider's default tier) |
-| `llm.fallbackChain` | Providers to try, in order, when the default cannot answer |
+| `llm.fallbackChain` | Where to go when every Codex account is used up: `codex-rotate` (another Codex account) and `grok`; other names are ignored. Default is both — set `["codex-rotate"]` to never fall back to Grok |
 | `roleLlm` | A different model per role (planning, review, …) |
 
 See [providers](/models/providers) for what each provider needs.
@@ -2912,19 +3020,19 @@ See [providers](/models/providers) for what each provider needs.
 `~/.elanous/config.json` holds user-level settings beyond env vars.
 (Older builds wrote `~/.config/elanous/config.json`; that path still appears in
 the source but the live config directory is `~/.elanous` — check yours with
-`elanous where`.)
+`elanous config path`.)
 
 | Section     | Purpose                                                                  |
 |-------------|--------------------------------------------------------------------------|
-| `llm`       | provider (`auto`/`grok`/`openai`/`anthropic`/`local`/`openai-codex`),    |
+| `llm`       | provider (`auto`/`openai-codex`/`grok`/`openai`/`anthropic`/`gemini`/`openrouter`/`local`), |
 |             | `apiKey`, `model`, `baseUrl` (for local / codex proxies)                 |
 | `skills`    | `activeSet` preset + `dirs[]` — scan multiple SKILL.md roots at once     |
 | `obsidian`  | `vault` (absolute path)                                                  |
 | `telegram`  | `enabled`, `botToken`, `allowedUsers[]`, `homeChannel`                   |
 | `onboarding`| `completed`, `completedAt`, `version`                                    |
 
-**Skill dir presets** — `claudecode` (`~/.claude/skills`), `opencode`
-(`~/.config/opencode/skills`, default), `codex` (`~/.codex/skills`),
+**Skill dir presets** — `claudecode` (`~/.claude/skills`, default), `opencode`
+(`~/.config/opencode/skills`), `codex` (`~/.codex/skills`),
 `hermes` (`~/.hermes/skills`), `openclaw` (`~/.openclaw/workspace/skills`),
 or `custom` for your own paths. Multiple dirs can be scanned
 simultaneously (first-dir-wins on name collisions).
@@ -2937,7 +3045,7 @@ Re-run the wizard any time: `elanous onboarding` (or one step, for example `elan
 
 Source: https://docs.elanous.ai/reference/cli/
 
-Generated from `elanous <command> --help` for the 31 commands this manual uses. Every command also answers `--help`; `elanous --help` lists all of them, including maintainer tools not covered here.
+Generated from `elanous <command> --help` for the 55 commands this manual uses. Every command also answers `--help`; `elanous --help` lists all of them, including maintainer tools not covered here.
 
 ## `elanous acp`
 
@@ -2972,6 +3080,28 @@ elanous agent [options] [command] [text...]
 | Subcommand | Description |
 |---|---|
 | `dispatch [options] <subagent_type> <prompt...>` | Spawn one sub-agent from the terminal and print its final message. Observe with `elanous logs --category agent.spawn` / `--category agent.done` — the printed cid pairs the two. |
+
+## `elanous agent-mission`
+
+Agent-mission CLI — missions, review watching and setup for external agent backends (codex [default] · claude · gemini · grok · aside). `codex` is a deprecated alias (kept for compatibility).
+
+```text
+elanous agent-mission|codex [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `capabilities [options]` | List codex, claude and grok service capabilities (read only) |
+| `install-from-docs [options] <tool>` | Read the official install docs and pick a safe install line — sudo is left to a person |
+| `browser-login [options]` | Approve a CLI login using a pre-authenticated local browser session |
+| `plan [options] <mission>` | Detect the environment and show where the tool ladder starts (installs nothing, runs no mission) |
+| `mission|run [options] [text...]` | ★ Open the chosen backend in a PTY (default codex --yolo · --backend for claude/gemini/grok/aside) and run the mission to completion in a worktree (input → result → next input). Subscription mode · omni-crawl fallback · evidence gate (doc\|tsc\|test). Your text is passed verbatim, with additive enhancement inside elanous (on by default · anti-drift). Logs: elanous logs --category agent-mission |
+| `review-loop [options] <pr>` | ★ Read a PR review (OK / needs work / rejected) and react — on needs work the agent (default codex) applies the comments and pushes again; on rejected it asks a person. Logs: elanous logs --category review-loop |
+| `review-stats [options]` | ★ Learning loop — statistics on unattended review decisions (regression rate by weight) plus suggested weight thresholds. Logs: elanous logs --category review-loop |
+| `review-watch [options]` | ★ Standing poller — periodically polls open PRs with the opt-in label (auto-review) and runs review-loop unattended when a new human review appears. Logs: elanous logs --category review-watch |
+| `setup` | One command: OAuth / API-key auth + model picker + save config |
+| `models` | Print the curated Codex model catalog |
+| `config-migrate [options]` | Write/refresh the managed [mcp_servers.elanous-tools] block in ~/.codex/config.toml. Idempotent · creates a .bak snapshot · `--remove` strips the block. |
 
 ## `elanous ask`
 
@@ -3013,6 +3143,19 @@ elanous attach [options]
 | `-i, --interactive` | Start an interactive REPL — type messages, get streamed responses (slash commands: /quit /new /list /help) |
 | `--cwd <path>` | Working directory reported in newSession() (default: "&lt;current directory&gt;") |
 
+## `elanous card`
+
+Inspect task cards
+
+```text
+elanous card [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `show [options] <id>` | Show a task card and its sections |
+| `list [options]` | List task cards |
+
 ## `elanous chat`
 
 Send one message in the active session (or a new one) and print the reply
@@ -3048,6 +3191,45 @@ elanous config [options] [command]
 | `promote [options] <path...>` | Propagate field(s) from the test config to production (per-field raw patch · multiple paths · dry-run by default · --yes to apply) |
 | `mission` | Inspect or edit llm.missionRouting (mission → provider table) |
 
+## `elanous connector`
+
+External task connectors
+
+```text
+elanous connector [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `linear` | Linear issues to TOX tasks |
+
+## `elanous control`
+
+Standalone control plane
+
+```text
+elanous control [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `serve [options]` | Run the control plane in the foreground |
+| `member [options]` | Register and heartbeat this joined machine's resources in the foreground |
+| `join [options]` | Join using the primary control plane's address and a machine-scoped token |
+| `token` | Manage per-machine scoped tokens |
+
+## `elanous directive`
+
+Turn instructions into Linear issues
+
+```text
+elanous directive [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `add [options] <text>` |  |
+
 ## `elanous discord-test`
 
 Standalone TEST discord session (SAME app/token, scoped to discord.testChannel.channelId) with ISOLATED state, WITHOUT touching the production daemon. Restart THIS process to test code changes; the live daemon stays up.
@@ -3075,10 +3257,52 @@ elanous doctor [options]
 | Option | Description |
 |---|---|
 | `--json` | structured output |
-| `--fix` | show reversible repairs (read-only unless --yes) |
+| `--credentials` | show per-credential details in human-readable output |
+| `--fix` | show repairs; git installation asks on a TTY (other repairs require --yes) |
+| `--advise` | ask the configured LLM to rank catalog repairs (read-only advice) |
 | `--yes` | apply planned doctor repairs (requires --fix) |
 | `--sudo` | also run the planned sudo install lines — only where `sudo -n true` works (requires --fix --yes) |
 | `--restart` | restart the nexus service when it runs a different version than this installed copy, then verify it (requires --fix --yes · interrupts bots, terminals and running turns) |
+
+## `elanous env`
+
+Environment detection
+
+```text
+elanous env [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `profile [options]` | Show the environment profile (read-only) |
+
+## `elanous graph`
+
+Run a declared command graph or inspect its latest run
+
+```text
+elanous graph [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `run [options] <file>` |  |
+| `tick [options] <file>` | Advance one graph run, resuming a pending decision or starting only when requested |
+| `notify [options]` | Deliver graph run events not yet recorded in the notification ledger |
+| `approve [options] <graph_id> <run_id>` |  |
+| `status [options] <graph_id>` |  |
+
+## `elanous grounding`
+
+Grounding source registry
+
+```text
+elanous grounding [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `sources` | List, add and remove registered grounding sources and check their freshness |
 
 ## `elanous harness`
 
@@ -3092,10 +3316,13 @@ elanous harness [options] [command]
 |---|---|
 | `deliverable-verify [options] <goal-path>` | Observe the addresses a goal document declares as Port. By default only looks at what is already running — with --launch it starts the deliverable, checks it, and always stops it. |
 | `processes` | Classify, read-only, the OS processes this repository started: heavy resource users vs long-lived ones. Kills nothing. |
+| `budget [options]` | Decide whether to run this round from preferences, usage and limits. With --json the last line is the outcome JSON. |
+| `drafts` | Tidy up harness draft PRs |
 | `ask [options] <goal-path>` | Run from a goal document path |
 | `say [options] <sentence...>` | Run from a sentence |
 | `plan [options] <sentence...>` | Write an RFC without executing it |
 | `mission [options] <mission-ids...>` | Solve one or more existing missions with the harness |
+| `stop [options] <runId>` | Stop one run — its orchestrator process (only when the start time in pid.json matches) ⊕ the Pod Job labelled elanous.run=&lt;runId&gt; |
 | `clean [options]` | Clean harness disposable worktrees + branches (default prefix comes from the creator's constant). ⚠️ Worktrees with an open PR are always kept. Dry-run by default (plan only · --yes to remove). |
 | `worktree` | Create a harness worktree. |
 | `worktrees [options]` | Judge every registered worktree, read-only, by PR · dirty state · output · session ownership. Never removes anything by default. |
@@ -3107,6 +3334,54 @@ elanous harness [options] [command]
 | `verify-url [options] <url>` | Open a deployed/local URL with the cdp (default) or aside backend and verify the render (screenshot + body/title diagnostics). CDP reuses an attached browser on port 9222; skips if no backend is available. |
 | `map [options]` | Harness self-description — prints the stage pipeline (order · role), execution spaces and terminal states (no side effects). |
 | `orchestrate [options] <goals...>` | Parallel self-dev — run several goals at once, each as an isolated-worktree self-implement subprocess, with a concurrency cap. |
+
+## `elanous hooks`
+
+Receive and redeliver outside webhooks
+
+```text
+elanous hooks [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `serve [options]` | Run the webhook receiver in the foreground |
+| `status` | Pending webhook count and last delivery time |
+
+## `elanous intake`
+
+Check outside facts and documents against current elanous, or take them in as tasks
+
+```text
+elanous intake [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `check [options]` | Check a list of facts, a document path, a URL or standard input against current elanous. Gaps and stale parts only produce goal drafts. |
+| `collect-pod [options] <dir>` | Safely collect Pod intake output into the vault and mark it in the intake ledger |
+| `ingest [options]` | Put collector output (JSONL · one line = {url,title,text,kind,signals,…}) into the intake ledger in shape — the same item is merged |
+| `items [options]` | Show intake ledger items (most recently seen first) |
+| `mark [options] <id>` | Update an intake ledger item's status and output (for example absorbed ⊕ the note path after absorbing) |
+| `digest [options]` | Daily intake digest — what was absorbed that day by axis · each note's one-line conclusion · goal candidates. As a note section (Markdown) or to the Telegram report channel |
+| `route [options] <id>` | Split an absorbed item's check result (intake check --json) into output queues — nothing → goals · judgement needed on docs only → manual · note → grounding candidate |
+| `grounding-sync [options]` | Copy notes from the grounding candidate queue into a single registrable document folder (the registry is only read) |
+| `queue [options]` | Automatic intake queue — pick saved Telegram links first in their own lane, then move the general share to queued up to the daily limit |
+| `to-tasks [options]` | Interpret unconsumed goal lines and public idea notes and register them as Nexus tasks (at most 5 by default) |
+| `collect-telegram-saved [options]` | Read Telegram «Saved Messages» (read-only) into the intake ledger (only after the cursor · host only · personal memos stay user-private) |
+| `collect-github [options]` | Collect GitHub repositories on topics of interest by stars into the intake ledger (recently created or pushed only · growth from star snapshots) |
+
+## `elanous keys`
+
+Print all keybindings + slash commands. Optional context filter.
+
+```text
+elanous keys [options] [context]
+```
+
+| Option | Description |
+|---|---|
+| `--audit` | Print context-aware duplicate/chord audit |
 
 ## `elanous local`
 
@@ -3170,6 +3445,8 @@ elanous logs [options] [command]
 | `--before <cursor>` | ⭐ Page cursor — a row id, or the nextCursors JSON object from federated --json metadata |
 | `--session <id>` | Filter by session_id |
 | `--limit <n>` | Maximum rows (default 100 · local reads are not capped at 1000 — that cap moved to the HTTP boundary) |
+| `--top-failures` | Count recent failures by reason, whatever their level (default 10m) |
+| `--threshold <n>` | Minimum count for a repeated failure (default 20) |
 | `--json` | JSON output |
 | `--json-data` | Emit JSON data as parsed values in --json output |
 | `--test` | Read the logs of the isolated test instance (.elanous-test/) of the repo in the current directory |
@@ -3190,6 +3467,48 @@ elanous logs [options] [command]
 | `unclosed [options]` | Work that started but never finished, oldest first — hang candidates. ⛔ Sets no threshold (the reader picks the cut with --older-than) |
 | `abandoned-draft-prs [options]` | Count and name abandoned draft PRs that have no salvage verdict yet (read-only · no closing/labels/comments) |
 
+## `elanous loop`
+
+Inspect and control graph-backed loop agents
+
+```text
+elanous loop [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` |  |
+| `status [options] <id>` |  |
+| `start [options] <id>` |  |
+| `stop [options] <id>` |  |
+| `run [options] <id>` |  |
+
+## `elanous machine`
+
+Machine identifier · assigned work · ranked placement candidates
+
+```text
+elanous machine [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `set [options]` |  |
+| `show [options]` |  |
+
+## `elanous market`
+
+Signed plugin marketplace
+
+```text
+elanous market [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `publish [options]` | Publish a local signed marketplace index and archives |
+| `keygen [options]` | Generate a local test index signing key |
+
 ## `elanous mcp`
 
 MCP (Model Context Protocol) server / client integration
@@ -3200,6 +3519,9 @@ elanous mcp [options] [command]
 
 | Subcommand | Description |
 |---|---|
+| `gateway [options]` | Owner-PAT authenticated public MCP relay to the scoped NEXUS endpoint |
+| `token` | Manage owner-only MCP personal access tokens |
+| `nexus-token` | Issue a gateway-only NEXUS mcp-public token |
 | `serve` | Run a stdio MCP server exposing the configured mcp.servers as proxy tools (used by `claude mcp add elanous -- elanous mcp serve`) |
 | `login [options] <serverId>` | Acquire and persist OAuth credentials for one configured HTTP MCP server. |
 | `reload [options]` | Re-read user-config and rebuild the running daemon's MCP clients — no daemon restart. Use after editing mcp.servers[] or `elanous mcp login`. |
@@ -3239,6 +3561,7 @@ elanous nexus [options] [command]
 
 | Subcommand | Description |
 |---|---|
+| `ingest-token` | Manage POST /v1/tasks-only bearer tokens |
 | `run [options]` | Boot the NEXUS daemon. Default = headless + PWA-ready. Lifecycle auto-detected from TTY (fork+detach when interactive, inline blocking under launchd / systemd / Docker / nohup). Stop with `nexus pwa stop`. |
 | `status` | Print NEXUS lock + runtime sidecar state. Same as `elanous nexus --status`. |
 | `stop` | Send SIGINT to the local NEXUS lock holder. Same as `elanous nexus --stop`. |
@@ -3258,6 +3581,19 @@ elanous nexus [options] [command]
 | `install [options]` | Install nexus as an OS-supervised service (launchd / systemd) |
 | `uninstall [options]` | Remove the launchd LaunchAgent / systemd-user unit installed by `nexus install` |
 
+## `elanous onboarding`
+
+Run the first-run wizard. Pass a step name (llm|skills|obsidian|telegram|discord|voice-ai) to run only that step.
+
+```text
+elanous onboarding [options] [step]
+```
+
+| Option | Description |
+|---|---|
+| `--config <path>` | Load answers from a JSON answer file (overrides interactive prompts) |
+| `--non-interactive` | Run without prompts — resolve all answers from --config + env vars |
+
 ## `elanous ops`
 
 Operations observation (READ-ONLY) — current state, anomalies and transitions of missions · tasks · contract loops · orchestrators. --json for scripts.
@@ -3274,6 +3610,22 @@ elanous ops [options] [command]
 | `mission [options] <id>` | One mission in detail — content + per-phase diagnosis (failClass · recommended heal) + related tasks/schedules/autonomous actions + transitions |
 | `mission-log [options] <id>` | Tail a mission's run log (run.log) — the evidence behind the diagnosis (survives reboot) |
 | `build [options] [buildId]` | Observe/control isolated builds — list when no id, snapshot with a buildId. --follow streams like tail -f, --stop stops a running build |
+
+## `elanous plugin`
+
+Install and manage Elanous plugins
+
+```text
+elanous plugin [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `add [options] <spec>` | Install a local path, pinned git plugin or signed market plugin |
+| `market` | Manage signed plugin marketplaces |
+| `list [options]` | List installed plugins |
+| `credentials [options] <plugin>` | Show or update installed plugin credential status |
+| `remove <name>` | Remove installed plugin versions |
 
 ## `elanous provider`
 
@@ -3307,10 +3659,27 @@ elanous pty [options] [command]
 | `release <ref>` | Return human-owned PTY control to its prior mode |
 | `state [options] <ref>` | Classify the current PTY screen state |
 | `wait [options] <ref>` | Wait until the classified PTY screen reaches a state |
+| `install-tool <ref> <tool>` | Smoke-check a known tool in the PTY shell, install an unprivileged known remedy, and verify it |
 | `snapshot [options] <ref>` | Render the current PTY screen without requesting write ownership |
 | `text [options] <ref> <text>` | Inject literal text — no newline unless --enter |
 | `key [options] <ref> <key>` | Inject a named special key (enter/esc/tab/up/… · see 'pty list' for &lt;ref&gt;) |
+| `mouse [options] <ref> <x> <y>` | Click or scroll a mouse-enabled SGR PTY (1-based column and row; disabled mode is refused by the owner) |
 | `resize [options] <ref> <cols> <rows>` | Resize the PTY (gated by the same access matrix as input) |
+| `record [options] <ref>` | Record PTY output as asciicast v2; --stop saves the capture |
+
+## `elanous python`
+
+The Python elanous uses (resolve · check · set up the elanous venv)
+
+```text
+elanous python [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `where [options]` | Which Python is used (ELANOUS_PYTHON &gt; elanous venv &gt; pyenv .python-version &gt; PATH) |
+| `check [options]` | python-env readiness (version · venv · declared module imports) — exit 0 ok · 10 fixable · 2 manual |
+| `setup [options]` | Create the elanous venv (~/.local/share/elanous/python/venv · --system-site-packages) and install declared dependencies — plan only by default |
 
 ## `elanous registry`
 
@@ -3325,22 +3694,6 @@ elanous registry [options] [command]
 | `drift [options]` | Audit whether routing pins (alias · tier-map · mission-router) match the catalog's active ids — proposes changes for a human (never applies them) |
 | `discover [options]` | Run the chosen discovery sources and merge into the existing snapshot — dry-run by default · --write to record · no S3 push |
 
-## `elanous release`
-
-One public release — prepare (local) → publish (--yes) → verify
-
-```text
-elanous release [options] [command]
-```
-
-| Subcommand | Description |
-|---|---|
-| `prepare [options]` | Clean source → public copy → commit on top of the public repository's history → PWA → bundle and checksums → local end-to-end (no network writes) |
-| `yank [options]` | Pull a release — demote it to pre-release and point Latest at the previous stable version (assets are kept · --undo reverts). Without --yes it only shows the plan |
-| `publish [options]` | ⛔ Cannot be undone — pushes to the public repository and creates the GitHub release. Without --yes it only shows the plan |
-| `verify [options]` | End to end from the public URL — in a clean temporary home: install → --version → self-update → uninstall |
-| `notes [options]` | Draft a changelog from the landings between two refs (edit it before publishing) |
-
 ## `elanous repl`
 
 Sticky multi-turn REPL — same session across turns, no per-turn process boot. Drives chat / agent / scenario from one shell. Uses --new for a fresh session, --session <id> to resume, --scenario <yaml> for a scripted run, JSONL on stdin for piped automation.
@@ -3354,12 +3707,138 @@ elanous repl [options]
 | `--new` | Force a new session at boot instead of resuming the active one |
 | `--session <id>` | Resume an explicit session (id or unique prefix) |
 | `--scenario <path>` | Run a YAML multi-turn scenario before handing back to interactive (or exit) |
-| `--replay <session-id>` | Re-execute the user prompts from a previous session in a fresh REPL run (BACKLOG #5). User prompts are extracted in order and fed through the same dispatcher as --scenario; assistant/tool messages and attachments are dropped. Mutually exclusive with --scenario. |
+| `--replay <session-id>` | Re-execute the user prompts from a previous session in a fresh REPL run. User prompts are extracted in order and fed through the same dispatcher as --scenario; assistant/tool messages and attachments are dropped. Mutually exclusive with --scenario. |
 | `--exit-after-scenario` | Exit after the scenario / replay completes (default true when stdin is not a TTY) |
 | `--no-exit-after-scenario` | Stay in the interactive prompt after the scenario / replay completes (TTY default) |
 | `--json` | Emit one JSON line per turn (sessionId/provider/model/reply/...) instead of streaming text |
 | `--no-tools` | Disable the tool loop and run a text-only chat REPL (parity with telegram/discord callers) |
 | `--stdin-jsonl` | Force JSONL-on-stdin mode even when stdin is a TTY (useful for testing automation paths) |
+
+## `elanous repo`
+
+Publish an explicit local repository to GitHub as private
+
+```text
+elanous repo [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `public [project-directory]` | Switch an existing private GitHub repository in the project directory to public, after a full history check and an explicit confirmation |
+| `scaffold [project-directory]` | Prepare the project directory's repository and create missing skeleton documents |
+| `design-check [project-directory-or-design-path]` | Check whether the craft rulebooks declared in the project directory or DESIGN.md path match the current rulebooks |
+| `design-direction [options] [project-directory-or-design-path]` | Show the visual direction declared in the project directory or DESIGN.md path (no argument), or declare it with --set |
+| `design-preview [options] [project-directory]` | Fetch drafts of candidate design systems from OpenDesign into design/previews |
+| `design-system` | Promote extracted values or a palette into your own design system in the library |
+| `design-extract [options] <url>` | Extract «assets + DESIGN.md» from a live web page — palette, typefaces, motion and contrast pairs in the format elanous reads |
+| `webclone-judge [options] <clone-dir>` | Judge web-clone output on two axes — files ⊕ layout (CDP). Logged as webclone.judge |
+| `design-screen-contrast [options] <ansi-path>` | Check text contrast in an ANSI screen snapshot — give it the output of `elanous pty snapshot &lt;ref&gt; --ansi` as a file |
+| `design-css [options] <design-md>` | Generate CSS tokens from a seed DESIGN.md — ⛔ only measured values (fields it could not extract are noted as comments) |
+| `design-lint [options] <html-path>` | Check whether output (HTML+CSS) smells of AI defaults (anti-ai-slop P0), measured against the seed DESIGN.md |
+| `design-gate [options] [project-directory]` | Give one verdict on whether the project's changed HTML follows the chosen design direction — no LLM |
+| `design-archive [options] <url>` | Archive a live page's originals (full capture · html · css · js · assets) and build derivatives and an index — ⛔ the originals bucket must be named explicitly |
+| `publish [project-directory]` | Check the local git repository in the project directory, then with one confirmation create a private GitHub repository and push the current branch |
+
+## `elanous research`
+
+Research with several web search engines (searches available providers in parallel)
+
+```text
+elanous research [options] <query...>
+```
+
+| Option | Description |
+|---|---|
+| `--engines <ids>` | Search engine IDs (comma-separated; default: all available) |
+| `--limit <count>` | Results per engine (1–20) (default: "5") |
+| `--json` | Print results and per-engine metadata as JSON |
+
+## `elanous resources`
+
+Query control plane resources
+
+```text
+elanous resources [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `where [options] <nameOrKind>` | Find by name or kind |
+| `list [options]` | List resources |
+
+## `elanous role`
+
+Show the control plane primary lease and hand it over manually
+
+```text
+elanous role [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `whoami` | The name this machine uses in the lease, and where it came from |
+| `set-machine <name>` | Set the lease machine name explicitly (control/machine.json) |
+| `status [options]` |  |
+| `watch [options]` | Watch, renew and take over the primary lease at boot |
+| `claim [options]` |  |
+| `accept [options]` |  |
+| `handoff [options]` |  |
+
+## `elanous schedule`
+
+Schedule/cron CRUD (keeps the registry, crontab and memory consistent). --json for programmatic use.
+
+```text
+elanous schedule [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` | List all cron jobs (category filter) |
+| `inspect [options] <id>` | Details + recent deliveries |
+| `runs [options] <id>` | Schedule run history (newest first) |
+| `create [options]` | New cron job (cron expression + command). Automatic backup; adds cd, bun and logging. |
+| `update [options] <id>` | Change a cron time |
+| `enable [options] <id>` | Enable a job |
+| `disable [options] <id>` | Disable a job (commented out) |
+| `delete [options] <id>` | Delete (automatic backup · recoverable). Dry-run by default · --yes to apply |
+| `wrap [options] [id]` | ★ Observability wrap — wrap bun .ts cron jobs in cron-run.ts so each firing is recorded in three places (logs.db · registry · self-memory). No id = every .ts cron job. Dry-run by default · --yes to apply (automatic backup · keeps the id across unwrap · reversible) |
+| `unwrap [options] [id]` | Remove the observability wrapper (reversible) — no id = every wrapped cron job. Dry-run by default · --yes to apply |
+| `migrate [options] <id>` | Move to a fabric Schedule Trigger (fired by the elanous daemon). Dry-run by default · --yes to apply |
+| `adopt [options] <id>` | Alias of migrate (merged when schedule-runner was retired). Dry-run by default · --yes to apply |
+| `release [options] <id>` | Restore to running from crontab. Dry-run by default · --yes to apply |
+| `retarget [options]` | Replace cron cd &lt;folder&gt; in bulk — the --from folder with the --to folder. Dry-run by default · --yes to apply (automatic backup). Errors if the target folder does not exist. |
+
+## `elanous self author`
+
+Only write a natural-language ask or an open clarification as a grounded eight-section goal file, or check an existing goal file with --lint.
+
+```text
+elanous self author [options] [ask...]
+```
+
+| Option | Description |
+|---|---|
+| `--cwd <path>` | Repository root to ground the goal in and write it under docs/goals/ (default: "&lt;current directory&gt;") |
+| `--lint <goalFile>` | Check a goal file read-only; cannot be combined with other author arguments |
+| `--print-template` | Print the canonical goal section skeleton and required levels read-only; cannot be combined with other author arguments |
+| `--inspect-decision-signal <text>` | Check right away whether the verdict-signal marker matches the release marker pattern; writes no goal |
+| `--inspect-invariant <text>` | Check right away the invariant markers, their parsing and the grounding evidence in the actual repository; writes no goal |
+| `--inspect-boundary <text>` | Check right away the boundary markers and their parsing; writes no goal |
+| `--inspect-artifact-launch <goalFile>` | Check right away the goal document's optional deliverable launch declaration; writes no goal |
+| `--inspect-test-scenario <scenarioFile>` | Check right away a test scenario document's deliverable kind and live-check contract; writes no goal |
+| `--inspect-target-paths <text>` | Check right away the target-path hint on the first non-empty line of the ask; writes no goal |
+| `--parent-goal-file <path>` | Repository-relative path of the parent goal document that produced this goal |
+| `--parent-question-id <id>` | ID of the parent goal's open question that produced this goal |
+| `--from-clarification <goalFile#questionId>` | Fill in the ask and parent source automatically from an open clarification |
+| `--supersedes <goalFile>` | Inherit the GoalId of an earlier goal document and record a Superseded-By back link |
+| `--root-intent <text>` | Single-line root purpose to record for a new root, or for a legacy parent without RootIntent |
+| `--goal-type <type>` | Goal type (implement, research, document, operate) |
+| `--adversarial-review` | Run adversarial review of the goal decomposition regardless of the threshold |
+| `--disable-adversarial-review` | Do not run adversarial review of the goal decomposition |
+| `--enqueue` | Put the authored goal into the goal queue of the daemon's resident loop (needs --termination-command) |
+| `--termination-command <cmd>` | Termination command to use when queueing (exit 0 means the goal is done) |
+| `--termination-timeout <ms>` | Time limit for the termination command in ms (default: "5000") |
 
 ## `elanous self entrances`
 
@@ -3389,9 +3868,6 @@ elanous self orchestrate [options] [goals...]
 | `--open-pr` | Each job: open a draft PR when the gate and review pass (passes --open-pr to each self-implement · promotion goes through the review node) |
 | `--base <branch>` | Base branch for each job's PR |
 | `--decompose` | Split one goal with an LLM into a dependency sub-DAG (parallel by topology, hot files serialized), then run it |
-| `--pod-skill-env` | pod: pass the keys (.env) of required skills (config pod-skills.txt) to this run as a Secret — explicit opt-in (paid credits) · never baked into the image |
-| `--pod-pool <spec>` | pod pool — context[@ssh-host][:cap], comma-separated, first wins (e.g. pool-a@host-a:12,pool-b@host-b:3) · otherwise ELANOUS_POD_POOL · otherwise the current context alone |
-| `--reduce` | At the end, gather the pieces that opened PRs into one integration branch (one gate run) and one PR — pairs with `--open-pr` · cannot be combined with `--auto-merge` (elanous self reduce) |
 | `--substrate <kind>` | Where to run: local (default · isolated worktree) \| pod (Kubernetes Job · docker/harness image) |
 | `--pod-account <name>` | pod: codex account (~/.elanous/auth.json openai-codex:&lt;name&gt; · a copy without the refresh token) · if omitted, a broker hands each Job the account with the most remaining quota |
 | `--no-pod-rebuild` | pod: do not rebuild the image even if its version (elanous.commit) differs from HEAD — the measurement then measures the image's version |
@@ -3429,23 +3905,6 @@ elanous self recall [options] <query...>
 | `--all-instances` | Federated recall across every registered elanous instance (fleet · read-only union) |
 | `--include-test` | Include isolated test instances in the federation (excluded by default) |
 | `--include-observer-output` | Include output generated by observers in the recall (excluded by default) |
-
-## `elanous self reduce`
-
-Fleet reduce — merge the open piece PRs one by one onto the base with merge --no-ff → on conflict, stop and name the piece and files → change-scope gate → one integration PR (piece PRs are not closed)
-
-```text
-elanous self reduce [options]
-```
-
-| Option | Description |
-|---|---|
-| `--prs <numbers>` | Open PR numbers to combine (comma-separated · merged in the order given) |
-| `--base <branch>` | Base branch (default: "main") |
-| `--branch <name>` | Integration branch name (default reduce/&lt;time&gt;) |
-| `--title <text>` | Integration PR title |
-| `--dry-run` | Merge and gate only — no push, PR or comments |
-| `--skip-gate` | Skip the gate (not recommended) |
 
 ## `elanous self repair-signals`
 
@@ -3491,6 +3950,7 @@ elanous self-update|update [options]
 | `--json` | Print the result as JSON |
 | `--keep <n>` | Recent versions to keep after install (installed copy: current and previous; checkout: current and the daemon's version are protected · 0 = no cleanup) (default: "3") |
 | `--alert` | Also send failures (exit≠0) as an alert — for unattended cron runs |
+| `--skip-pwa-build` | Explicitly skip the PWA build before a checkout install |
 | `--auto <on|off|status>` | Automatic updates — a macOS launchd agent or Linux systemd timer runs `self-update --restart --alert` every day at 04:17 (not turned on if a cron entry already runs it) |
 
 ## `elanous session`
@@ -3529,12 +3989,59 @@ elanous session [options] [command]
 Check OpenAI Codex setup and guide each missing credential step
 
 ```text
-elanous setup [options]
+elanous setup [options] [command]
 ```
 
 | Option | Description |
 |---|---|
 | `--non-interactive` | Report setup state without prompts or writes |
+
+| Subcommand | Description |
+|---|---|
+| `claude-code [options]` | Plan or install the elanous Claude Code plugin |
+
+## `elanous start`
+
+Discover LLM, ensure Nexus is healthy, and open the GUI or TUI
+
+```text
+elanous start [options]
+```
+
+| Option | Description |
+|---|---|
+| `--gui` | Open the browser UI (default) |
+| `--tui` | Open the terminal UI instead |
+| `--no-login` | Do not offer interactive LLM login |
+| `--json` | Print one secret-free JSON result |
+
+## `elanous task`
+
+View and approve tasks
+
+```text
+elanous tasks|task [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` | View tasks in priority and creation-time order |
+| `show [options] <id>` | Show task details |
+| `approve <id...>` | Approve an outside task |
+
+## `elanous tasks`
+
+View and approve tasks
+
+```text
+elanous tasks|task [options] [command]
+```
+
+| Subcommand | Description |
+|---|---|
+| `list [options]` | View tasks in priority and creation-time order |
+| `show [options] <id>` | Show task details |
+| `approve <id...>` | Approve an outside task |
 
 ## `elanous telegram`
 
@@ -3579,6 +4086,7 @@ elanous self-update|update [options]
 | `--json` | Print the result as JSON |
 | `--keep <n>` | Recent versions to keep after install (installed copy: current and previous; checkout: current and the daemon's version are protected · 0 = no cleanup) (default: "3") |
 | `--alert` | Also send failures (exit≠0) as an alert — for unattended cron runs |
+| `--skip-pwa-build` | Explicitly skip the PWA build before a checkout install |
 | `--auto <on|off|status>` | Automatic updates — a macOS launchd agent or Linux systemd timer runs `self-update --restart --alert` every day at 04:17 (not turned on if a cron entry already runs it) |
 
 ## `elanous usage`
@@ -3595,12 +4103,12 @@ elanous usage [options] [command]
 
 | Subcommand | Description |
 |---|---|
-| `runs [options]` | Aggregate stored llm-usage logs by run, model and billing path |
+| `runs [options]` | Aggregate saved llm-usage logs by run, or by role and call site |
 | `reset [options]` | ⛔ Cannot be undone — spends one Codex reset credit to restart that account's weekly window now |
 
 ## `elanous wf`
 
-Run YAML DAG workflows (workflow-runtime · prompt|bash|skill|cft|approval|if|switch|iteration|classify|extract|set|filter|template|http|showroom|scheduleTrigger|webhookTrigger|discordTrigger|telegramTrigger|manualTrigger|chatTrigger nodes). Aliases: `workflows` (plural) · `workflow` (singular).
+Run YAML DAG workflows (workflow-runtime · prompt|bash|skill|cft|approval|if|switch|iteration|classify|extract|set|filter|template|http|showroom|task|scheduleTrigger|webhookTrigger|discordTrigger|telegramTrigger|manualTrigger|chatTrigger nodes). Aliases: `workflows` (plural) · `workflow` (singular).
 
 ```text
 elanous wf|workflows [options] [command]
@@ -3635,7 +4143,8 @@ elanous where [options]
 Source: https://docs.elanous.ai/reference/external-commands/
 
 Beyond Bun and git, elanous spawns these. None are needed to boot; each gates
-one capability. Counted from `src/` and `scripts/` on 2026-09-20:
+one capability. `elanous doctor` shows which ones this machine has, and
+`elanous env profile` describes the environment it detected.
 
 | command | used for |
 |---|---|
@@ -3643,6 +4152,12 @@ one capability. Counted from `src/` and `scripts/` on 2026-09-20:
 | `gh` | pull requests, harness base selection |
 | `rg` (ripgrep) | code search — **the test suite needs it too** |
 | `codex` | ACP delegate / harness implement on the codex backend |
+| `claude`, `gemini`, `grok` | coding agents elanous drives in a terminal (`agent-mission --backend`) |
+| `tailscale` | sharing the web app with your other devices (`nexus pwa share`) |
+| `docker` | optional container runtime (for example OpenDesign previews in [Design systems](/using-elanous/design)) |
+| `kubectl` | running harness work on a Kubernetes cluster |
+| Chrome or Chromium | browser checks and page capture over the DevTools protocol |
+| `tmux` | naming the session when the terminal UI runs inside tmux |
 | `curl`, `ssh`, `rsync`, `unzip` | fetching, remote nodes, installers |
 | `crontab` | scheduled missions |
 | `ffmpeg`, `magick`, `sox`, `tesseract`, `chafa` | media / ad pipeline, OCR, terminal images |
@@ -3821,8 +4336,9 @@ A shorter command (`eln`), a web app tab to approve and merge, tasks from Linear
 
 ```bash
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash   # one line
-npm install -g elanous                                                                         # or npm (needs Bun on PATH)
 ```
+
+npm had not been updated for 0.2.3; the one-line installer above is the way to install this release.
 
 ## Read this first — behaviour changes
 
@@ -3874,8 +4390,9 @@ Security hardening for the local daemon, a simpler rule for which environment a 
 
 ```bash
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash   # one line
-npm install -g elanous                                                                         # or npm (needs Bun on PATH)
 ```
+
+npm had not been updated for 0.2.2; the one-line installer above is the way to install this release.
 
 ## Security
 
@@ -3912,8 +4429,9 @@ A security fix for S3 storage, fixes found by installing on a bare Ubuntu 26.04 
 
 ```bash
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash   # one line
-npm install -g elanous                                                                         # or npm (needs Bun on PATH)
 ```
+
+npm had not been updated for 0.2.1; the one-line installer above is the way to install this release.
 
 ## S3 storage: no default bucket
 

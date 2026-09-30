@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="generator" content="Docusaurus v3.10.2">
 <title data-rh="true">The TUI | Elanous</title><meta data-rh="true" name="viewport" content="width=device-width,initial-scale=1"><meta data-rh="true" name="twitter:card" content="summary_large_image"><meta data-rh="true" property="og:url" content="https://docs.elanous.ai/using-elanous/tui"><meta data-rh="true" property="og:locale" content="en"><meta data-rh="true" property="og:locale:alternate" content="ko"><meta data-rh="true" name="docusaurus_locale" content="en"><meta data-rh="true" name="docsearch:language" content="en"><meta data-rh="true" name="docusaurus_version" content="current"><meta data-rh="true" name="docusaurus_tag" content="docs-default-current"><meta data-rh="true" name="docsearch:version" content="current"><meta data-rh="true" name="docsearch:docusaurus_tag" content="docs-default-current"><meta data-rh="true" property="og:title" content="The TUI | Elanous"><meta data-rh="true" name="description" content="The 3-pane dashboard: attachments, slash commands, clipboard, terminals."><meta data-rh="true" property="og:description" content="The 3-pane dashboard: attachments, slash commands, clipboard, terminals."><link data-rh="true" rel="canonical" href="https://docs.elanous.ai/using-elanous/tui"><link data-rh="true" rel="alternate" href="https://docs.elanous.ai/using-elanous/tui" hreflang="en"><link data-rh="true" rel="alternate" href="https://docs.elanous.ai/ko/using-elanous/tui" hreflang="ko"><link data-rh="true" rel="alternate" href="https://docs.elanous.ai/using-elanous/tui" hreflang="x-default"><script data-rh="true" type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"The TUI","item":"https://docs.elanous.ai/using-elanous/tui"}]}</script><link rel="stylesheet" href="/assets/css/styles.50fdacab.css">
-<script src="/assets/js/runtime~main.fe77b8db.js" defer="defer"></script>
+<script src="/assets/js/runtime~main.23c42999.js" defer="defer"></script>
 <script src="/assets/js/main.f933fde9.js" defer="defer"></script>
 </head>
 <body>
@@ -83,11 +83,12 @@ and attaches it automatically:</p>
 <table><thead><tr><th>Extension</th><th>Kind</th><th>Extractor</th><th>Byte cap</th></tr></thead><tbody><tr><td><code>.txt</code></td><td>text</td><td>UTF-8 readFile</td><td>20 KB</td></tr><tr><td><code>.md</code></td><td>md</td><td>UTF-8 readFile</td><td>20 KB</td></tr><tr><td><code>.pdf</code></td><td>pdf</td><td><code>pdf-parse</code> v2 (<code>PDFParse.getText</code>)</td><td>20 KB</td></tr><tr><td><code>.docx</code></td><td>docx</td><td><code>mammoth.extractRawText</code></td><td>20 KB</td></tr><tr><td><code>.xlsx</code></td><td>xlsx</td><td><code>xlsx</code> → all sheets, first 100 rows ea</td><td>20 KB</td></tr><tr><td><code>.png</code></td><td>image</td><td>sharp resize (1568×1568, JPEG ladder)</td><td>3 MB encoded</td></tr><tr><td><code>.jpg</code> <code>.jpeg</code></td><td>image</td><td>same</td><td>3 MB encoded</td></tr><tr><td><code>.gif</code></td><td>image</td><td>same (static frame)</td><td>3 MB encoded</td></tr><tr><td><code>.webp</code></td><td>image</td><td>same</td><td>3 MB encoded</td></tr></tbody></table>
 <p>Text-kind attachments are prepended as labeled code-fenced sections
 ahead of your question. Images ride as multimodal ContentBlocks when the
-routed model is vision-capable (see <code>isLikelyVisionModel()</code>).</p>
+routed model can read images.</p>
 <p>Paths accepted: absolute (<code>/path/to/f.pdf</code>), home-relative (<code>~/doc.pdf</code>),
 <code>./</code> or <code>../</code>, and quoted (<code>&quot;name with space.pdf&quot;</code>). URLs are skipped.
 Symlinks resolve to their canonical target (two links → one attachment).</p>
 <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="slash-commands">Slash commands<a href="#slash-commands" class="hash-link" aria-label="Direct link to Slash commands" title="Direct link to Slash commands" translate="no">​</a></h2>
+<p>The commands you will use most. The TUI has more — open the help overlay with <code>/help</code> (or <code>/?</code>) for the full list.</p>
 
 
 
@@ -153,7 +154,68 @@ Symlinks resolve to their canonical target (two links → one attachment).</p>
 
 
 
-<table><thead><tr><th>Command</th><th>Alias</th><th>Purpose</th></tr></thead><tbody><tr><td><code>/run-skill &lt;name&gt; [args]</code></td><td><code>/rs</code>, <code>/run</code></td><td>Execute a SKILL.md</td></tr><tr><td><code>/provider</code></td><td><code>/p</code></td><td>List providers + availability</td></tr><tr><td><code>/context</code></td><td><code>/ctx</code></td><td>Table of attached files</td></tr><tr><td><code>/context clear [big]</code></td><td></td><td>Drop all attachments (or ≥100KB ones)</td></tr><tr><td><code>/context drop &lt;id&gt;</code></td><td></td><td>Drop a single attachment</td></tr><tr><td><code>/paste</code></td><td><code>/v</code></td><td>Attach clipboard image (macOS)</td></tr><tr><td><code>/sync</code></td><td><code>/s</code></td><td>Enter sync mode</td></tr><tr><td><code>/plugin list|activate|deactivate|reload</code></td><td><code>/plugins</code></td><td>Manage plugins</td></tr><tr><td><code>/clear</code></td><td><code>/cls</code></td><td>Clear log pane (keeps attachments)</td></tr><tr><td><code>/help</code></td><td><code>/?</code></td><td>Keybinding overlay</td></tr><tr><td><code>/quit</code></td><td><code>/q</code>, <code>/exit</code></td><td>Exit</td></tr></tbody></table>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Command</th><th>Alias</th><th>Purpose</th></tr></thead><tbody><tr><td><code>/harness &lt;sentence&gt;</code></td><td></td><td>Hand work to the harness (also <code>plan</code>, <code>runs</code>, <code>stop &lt;id&gt;</code>)</td></tr><tr><td><code>/run-skill &lt;name&gt; [args]</code></td><td><code>/rs</code>, <code>/run</code></td><td>Execute a SKILL.md</td></tr><tr><td><code>/provider</code></td><td><code>/p</code></td><td>List providers + availability</td></tr><tr><td><code>/model [name]</code></td><td><code>/m</code></td><td>Switch the active model (lists them with no argument)</td></tr><tr><td><code>/reasoning [off|low|medium|high|xhigh]</code></td><td><code>/r</code>, <code>/think</code></td><td>Reasoning level</td></tr><tr><td><code>/resume [id]</code></td><td></td><td>Pick a past session, or load one by id prefix</td></tr><tr><td><code>/fork</code></td><td></td><td>Copy this session into a new one</td></tr><tr><td><code>/session list|load|new</code></td><td><code>/sess</code></td><td>Manage sessions</td></tr><tr><td><code>/remaining</code></td><td></td><td>What each account has left</td></tr><tr><td><code>/memory list|search|add</code></td><td><code>/mem</code></td><td>Memory</td></tr><tr><td><code>/directive &lt;text&gt;</code></td><td></td><td>Record an instruction as a Linear issue</td></tr><tr><td><code>/design</code></td><td><code>/design-check</code></td><td>Design rulebooks this repository declares</td></tr><tr><td><code>/term</code></td><td><code>/terminal</code></td><td>Terminal modal (spawn, attach, switch)</td></tr><tr><td><code>/setup</code></td><td></td><td>Setup wizard guide (<code>/setup reset</code> re-runs it next start)</td></tr><tr><td><code>/context</code></td><td><code>/ctx</code></td><td>Table of attached files</td></tr><tr><td><code>/context clear [big]</code></td><td></td><td>Drop all attachments (or ≥100KB ones)</td></tr><tr><td><code>/context drop &lt;id&gt;</code></td><td></td><td>Drop a single attachment</td></tr><tr><td><code>/paste</code></td><td></td><td>Attach clipboard image (macOS)</td></tr><tr><td><code>/sync</code></td><td><code>/s</code></td><td>Enter sync mode</td></tr><tr><td><code>/plugin list|activate|deactivate|reload</code></td><td><code>/plugins</code></td><td>Manage plugins</td></tr><tr><td><code>/clear</code></td><td><code>/cls</code></td><td>Clear log pane (keeps attachments)</td></tr><tr><td><code>/help</code></td><td><code>/?</code></td><td>Keybinding overlay</td></tr><tr><td><code>/quit</code></td><td><code>/q</code>, <code>/exit</code></td><td>Exit</td></tr></tbody></table>
+<p><code>elanous keys</code> prints every keybinding and slash command.</p>
 <h2 class="anchor anchorTargetStickyNavbar_Vzrq" id="argument-autocomplete">Argument autocomplete<a href="#argument-autocomplete" class="hash-link" aria-label="Direct link to Argument autocomplete" title="Direct link to Argument autocomplete" translate="no">​</a></h2>
 <p>After typing a command name and a space, Tab / Up / Down navigate
 argument suggestions. Enter on an empty current arg accepts the
