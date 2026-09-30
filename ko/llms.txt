@@ -19,6 +19,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 - [Commands you will use](https://docs.elanous.ai/using-elanous/commands/): The handful of commands that cover daily use.
 - [The harness](https://docs.elanous.ai/using-elanous/harness/): say, ask and goal documents.
+- [Working backwards](https://docs.elanous.ai/using-elanous/working-backwards/): Write the finished result first, then turn it into a goal the harness can prove.
 - [PTY intelligence](https://docs.elanous.ai/using-elanous/pty-intelligence/): elanous drives terminals and coding agents from inside their own screens.
 - [Tasks and intake](https://docs.elanous.ai/using-elanous/tasks-and-intake/): Anything you send becomes tasks — Telegram, the web app, links, YouTube, Linear — run by the harness or an agent.
 - [Loop agents](https://docs.elanous.ai/using-elanous/loop-agents/): Work that repeats runs as loop agents you can list, start and stop.
@@ -70,6 +71,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Releases
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
+- [0.2.6](https://docs.elanous.ai/releases/0-2-6/): Changes in 0.2.6.
 - [0.2.5](https://docs.elanous.ai/releases/0-2-5/): Changes in 0.2.5.
 - [0.2.3](https://docs.elanous.ai/releases/0-2-3/): A shorter command, an Approvals tab that merges, tasks from Linear and other tools, several machines as one, a lighter terminal UI.
 - [0.2.2](https://docs.elanous.ai/releases/0-2-2/): Daemon security hardening, one rule for which environment a command runs in, web setup for chat bots, a lighter install.
