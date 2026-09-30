@@ -59,6 +59,9 @@ export interface IosBindOpts {
   readTokenFn?: () => string | null;
   /** Test seam — host fallback (production daily driver 의 default). */
   hostFallback?: string;
+  /** Test seam — `defaults write` 가 쓸 도메인. 기본은 설치된 앱 «컨테이너»의 plist 경로다.
+   *  `spawnSyncFn` 만 주입된 시험은 bundle id 그대로(실 `xcrun` 을 부르지 않는다). */
+  resolveDomainFn?: (bundleId: string) => string;
 }
 
 export interface IosBindResult {
@@ -90,6 +93,16 @@ function defaultReadToken(): string | null {
   }
 }
 
+/** 앱이 실제로 읽는 도메인 — 설치된 앱의 데이터 컨테이너 plist(확장자 없이).
+ *  ⚠️ `defaults write <bundleId>` 는 시뮬레이터 «전역» 도메인에 쓴다. 앱은 자기 컨테이너 plist 를 읽으므로,
+ *  앱이 한 번이라도 설정을 저장한 뒤로는 그 값이 이긴다(2026-09-30 실측: 연결 링크로 받은 만료 임시 토큰이
+ *  컨테이너에 남아 ios-bind 가 «✓» 를 찍고도 앱은 401 을 받았다). 컨테이너를 못 찾으면 bundle id 로 폴백한다. */
+function defaultResolveDomain(bundleId: string): string {
+  const r = defaultSpawnSync('xcrun', ['simctl', 'get_app_container', 'booted', bundleId, 'data'], { stdio: 'pipe' });
+  const dir = r.status === 0 ? String(r.stdout ?? '').trim() : '';
+  return dir ? join(dir, 'Library', 'Preferences', bundleId) : bundleId;
+}
+
 /** UserDefaults write 1 회. spawnSync exit code 0 = 성공. */
 function defaultsWrite(
   spawnFn: typeof defaultSpawnSync,
@@ -119,6 +132,8 @@ export function runNexusIosBind(opts: IosBindOpts = {}): IosBindResult {
   const readToken = opts.readTokenFn ?? defaultReadToken;
   const hostFallback = opts.hostFallback ?? DEFAULT_HOST_FALLBACK;
   const dryRun = opts.dryRun ?? false;
+  const resolveDomain = opts.resolveDomainFn
+    ?? (opts.spawnSyncFn || dryRun ? (id: string) => id : defaultResolveDomain);
 
   // 1) daemon 현재 host/port — override 가 우선 · 없으면 runtime sidecar ·
   //    port 가 없으면 현재 우주의 daemon endpoint 를 조회한다.
@@ -150,20 +165,22 @@ export function runNexusIosBind(opts: IosBindOpts = {}): IosBindResult {
   const tokenRaw = opts.noToken ? null : readToken();
   const token = tokenRaw ?? '';
 
-  // 3) UserDefaults write 3 회 (host · port · token)
+  // 3) UserDefaults write 3 회 (host · port · token) — 앱 컨테이너 도메인에
+  const domain = resolveDomain(bundleId);
   const lines: string[] = [];
-  const hostResult = defaultsWrite(spawnFn, bundleId, 'nexusHost', 'string', host, dryRun);
+  if (domain !== bundleId) lines.push(`  domain  앱 컨테이너 (${bundleId}) — 앱이 실행 중이면 끄고 다시 켜야 읽는다`);
+  const hostResult = defaultsWrite(spawnFn, domain, 'nexusHost', 'string', host, dryRun);
   lines.push(`  host  ${hostResult.ok ? '✓' : '✗'}  ${hostResult.cmd}`);
-  const portResult = defaultsWrite(spawnFn, bundleId, 'nexusPort', 'int', String(port), dryRun);
+  const portResult = defaultsWrite(spawnFn, domain, 'nexusPort', 'int', String(port), dryRun);
   lines.push(`  port  ${portResult.ok ? '✓' : '✗'}  ${portResult.cmd}`);
 
   let tokenInjected = false;
   let tokenLength = 0;
   if (!opts.noToken && token.length > 0) {
-    const tokenResult = defaultsWrite(spawnFn, bundleId, 'bearerToken', 'string', token, dryRun);
+    const tokenResult = defaultsWrite(spawnFn, domain, 'bearerToken', 'string', token, dryRun);
     tokenInjected = tokenResult.ok;
     tokenLength = token.length;
-    lines.push(`  token ${tokenResult.ok ? '✓' : '✗'}  xcrun simctl spawn booted defaults write ${bundleId} bearerToken <${tokenLength}-char redacted>`);
+    lines.push(`  token ${tokenResult.ok ? '✓' : '✗'}  xcrun simctl spawn booted defaults write ${domain} bearerToken <${tokenLength}-char redacted>`);
   } else if (opts.noToken) {
     lines.push(`  token —   (skipped · --no-token)`);
   } else {
@@ -173,19 +190,19 @@ export function runNexusIosBind(opts: IosBindOpts = {}): IosBindResult {
   let asciiKeyboardOk = true;
   if (opts.asciiKeyboard !== undefined) {
     const value = opts.asciiKeyboard ? 'true' : 'false';
-    const r = defaultsWrite(spawnFn, bundleId, 'asciiKeyboard', 'bool', value, dryRun);
+    const r = defaultsWrite(spawnFn, domain, 'asciiKeyboard', 'bool', value, dryRun);
     asciiKeyboardOk = r.ok;
     lines.push(`  ascii ${r.ok ? '✓' : '✗'}  ${r.cmd}`);
   }
 
   let seedPromptOk = true;
   if (opts.seedPrompt !== undefined) {
-    const r = defaultsWrite(spawnFn, bundleId, 'seedPrompt', 'string', opts.seedPrompt, dryRun);
+    const r = defaultsWrite(spawnFn, domain, 'seedPrompt', 'string', opts.seedPrompt, dryRun);
     seedPromptOk = r.ok;
     const preview = opts.seedPrompt.length > 24
       ? opts.seedPrompt.slice(0, 24) + '…'
       : opts.seedPrompt;
-    lines.push(`  seed  ${r.ok ? '✓' : '✗'}  xcrun simctl spawn booted defaults write ${bundleId} seedPrompt "${preview}" (${opts.seedPrompt.length} chars)`);
+    lines.push(`  seed  ${r.ok ? '✓' : '✗'}  xcrun simctl spawn booted defaults write ${domain} seedPrompt "${preview}" (${opts.seedPrompt.length} chars)`);
   }
 
   const allOk = hostResult.ok && portResult.ok

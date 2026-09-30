@@ -280,7 +280,7 @@ function recordedString(entries: readonly RunLedgerEntry[], field: string): stri
   return undefined;
 }
 
-function summarizeTerminalLedger(runId: string, entries: readonly RunLedgerEntry[]): RunLedgerSummary {
+export function summarizeTerminalLedger(runId: string, entries: readonly RunLedgerEntry[]): RunLedgerSummary {
   const last = entries.at(-1)?.timestamp;
   if (!last || !Number.isFinite(Date.parse(last)) || !hasTerminalRunStatus(entries)) throw new Error('ledger changed since plan');
   const terminator = [...entries].reverse().find((entry) => entry.event === 'human-stop' || entry.event === 'terminal'

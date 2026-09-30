@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { diffFailures, parseFailures } from './gate-diff';
+import { diffFailures, junitFailures, parseFailures } from './gate-diff';
 
 const output = `bun test v1.4.2
 src/demo/a.test.ts:
@@ -40,4 +40,13 @@ test('deliberate parser fixture failure', () => {
 test('diffFailures compares identities, not totals or emission order', () => {
   const A = 'src/a.test.ts > A', B = 'src/b.test.ts > B', C = 'src/c.test.ts > C', D = 'src/d.test.ts > D';
   expect(diffFailures([A, B, C, C], [D, A, D])).toEqual({ newFailures: [B, C], fixed: [D], common: [A] });
+});
+
+test('junitFailures names failed testcases with their describe path in the console shape', () => {
+  const xml = `<testsuites><testsuite name="src/a.test.ts" file="src/a.test.ts">
+    <testsuite name="outer"><testcase name="ok case" file="src/a.test.ts" /><testcase name="bad &amp; worse" file="src/a.test.ts"><failure message="m"/></testcase></testsuite>
+    <testcase name="top level" file="src/a.test.ts"><failure/></testcase>
+  </testsuite></testsuites>`;
+  expect(junitFailures(xml)).toEqual(['src/a.test.ts > outer > bad & worse', 'src/a.test.ts > top level']);
+  expect(parseFailures('src/a.test.ts:\n(fail) outer > bad & worse [1.00ms]\n')).toEqual(['src/a.test.ts > outer > bad & worse']);
 });

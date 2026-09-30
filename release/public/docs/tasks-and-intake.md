@@ -2,7 +2,7 @@
 
 **In one sentence:** whatever you throw at elanous — a sentence in Telegram, a note in the web app, a link, a YouTube video, an issue in Linear — lands in one place, becomes one or more **tasks**, and each task is run by the part of elanous that fits it (the harness for code changes, an agent with tools for jobs that only need running).
 
-This page separates what ships today from what is in progress. Status marks: ✅ in the latest release · 🟡 on main, in the next release · 🔄 in progress · 📋 designed.
+This page separates what ships today from what is in progress. Status marks: ✅ in the latest release · ✅ in v0.2.5 · 🔄 in progress · 📋 designed.
 
 ## The shape
 
@@ -29,7 +29,7 @@ flowchart LR
 | Telegram, a plain sentence | A normal chat answer. | ✅ · 🔄 recording it in the intake ledger |
 | Web app intake page | A live preview of how the front door reads your text, then absorb or send to the harness. | ✅ 0.2.3 |
 | Web app chat | A normal chat turn. | ✅ · 🔄 front door for chat |
-| TUI | Links are summarized by the matching skill; «하니스로 구현 …» offers the harness to the model. | ✅ |
+| TUI | Links are summarized by the matching skill; a request that starts with the harness phrase ("implement with the harness …") offers the harness to the model. | ✅ |
 | Daily collection | Trending videos, saved Telegram messages and GitHub activity are collected every morning, absorbed, checked against elanous, and summarized in a daily digest. | ✅ |
 | Linear | Issues become tasks, by sync or by webhook (below). | ✅ 0.2.3 |
 
@@ -109,7 +109,7 @@ Everything above works with no tracker connected. What a tracker gives you and w
 | A tracker gives you | In elanous | Status |
 |---|---|---|
 | Issues, states, priority, sub-issues, projects | Tasks (with dependencies, parent task, mission, acceptance criteria) | ✅ |
-| A board | TUI board, the web app task panel, task cards (`elanous card list` / `card show <id>`; a card board among the web app's Labs pages — turn on «Labs 탭 보기» (show Labs tabs) in Settings), and the web app's **Approvals** page | ✅ 0.2.4 |
+| A board | TUI board, the web app task panel, task cards (`elanous card list` / `card show <id>`; a card board among the web app's Labs pages — turn on "Show Labs tabs" in Settings), and the web app's **Approvals** page | ✅ 0.2.4 |
 | Filing by message or email | Telegram `/work`, the web app intake page | ✅ 0.2.3 · 📋 email |
 | Triage suggestions and rules | Interpretation and auto-run rules | 🔄 · 📋 condition → action rules |
 | Cycle time and lead time | Task timestamps and the run ledger | 📋 `tasks stats` |

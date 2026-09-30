@@ -1,0 +1,24 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "geo-check",
+  "version": "0.1.0",
+  "description": "Measure brand mentions and citations in AI answers and web results.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [
+        "./graphs/geo-check.yaml"
+      ],
+      "capabilities": [
+        "fs:workdir",
+        "proc:bun",
+        "proc:elanous"
+      ],
+      "connectors": [],
+      "pricing": {
+        "model": "free"
+      },
+      "trust": "official",
+      "category": "Marketing"
+    }
+  }
+}

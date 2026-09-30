@@ -1,0 +1,20 @@
+graph_id: geo-check
+version: 1
+entry_node: questions
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: questions, kind: agent, recipe: 'cmd:questions', max_visits: 1 }
+  - { node_id: answers, kind: agent, recipe: 'cmd:answers', max_visits: 1 }
+  - { node_id: web, kind: agent, recipe: 'cmd:web', max_visits: 1 }
+  - { node_id: score, kind: agent, recipe: 'cmd:score', max_visits: 1 }
+  - { node_id: suggest, kind: agent, recipe: 'cmd:suggest', max_visits: 1 }
+  - { node_id: report, kind: agent, recipe: 'cmd:report', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: questions, on: outcome, map: { ok: answers, fail: failed } }
+  - { from: answers, on: outcome, map: { ok: web, fail: failed } }
+  - { from: web, on: outcome, map: { ok: score, fail: failed } }
+  - { from: score, on: outcome, map: { ok: suggest, fail: failed } }
+  - { from: suggest, on: outcome, map: { ok: report, fail: failed } }
+  - { from: report, on: outcome, map: { ok: done, fail: failed } }

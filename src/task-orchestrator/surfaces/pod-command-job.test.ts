@@ -49,6 +49,27 @@ describe('pod command job manifest', () => {
     expect(JSON.stringify(manifest({ clone: true, hostMirror: undefined }))).toBe(JSON.stringify(original));
   });
 
+  test('opt-in Bun cache mounts writable DirectoryOrCreate without changing the omitted manifest or host mirror', () => {
+    const original = manifest({ clone: true });
+    const cached = manifest({ clone: true, hostMirror: '/srv/mirror', bunCache: '/srv/bun-cache' });
+    const spec = (cached.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }>; initContainers: Array<{ volumeMounts?: unknown[] }> } } }).template.spec;
+    expect(spec.volumes).toEqual([
+      { name: 'creds', secret: { secretName: 'cmd-1-creds', defaultMode: 0o400 } },
+      { name: 'host-mirror', hostPath: { path: '/srv/mirror', type: 'Directory' } },
+      { name: 'bun-cache', hostPath: { path: '/srv/bun-cache', type: 'DirectoryOrCreate' } },
+    ]);
+    expect(spec.containers[0]!.volumeMounts).toEqual([
+      { name: 'creds', mountPath: '/creds', readOnly: true },
+      { name: 'host-mirror', mountPath: '/host-mirror', readOnly: true },
+      { name: 'bun-cache', mountPath: '/bun-cache', readOnly: false },
+    ]);
+    expect(spec.initContainers[0]!.volumeMounts).toBeUndefined();
+    expect(podCommandScript(cached)).toContain('if [ -d /bun-cache ] && [ -w /bun-cache ]; then export BUN_INSTALL_CACHE_DIR=/bun-cache; fi;');
+    expect(createHash('sha256').update(JSON.stringify(original)).digest('hex')).toBe('a64741991413fe657333bb998fd76621272b1c15fd6422caeb4f006c84f1e4f0');
+    expect(JSON.stringify(manifest({ clone: true, bunCache: undefined }))).toBe(JSON.stringify(original));
+    expect(podCommandScript(original)).not.toContain('BUN_INSTALL_CACHE_DIR');
+  });
+
   test('skills·llm 이 없으면 Secret 자격 키가 0개다', () => {
     const job = manifest();
     const script = podCommandScript(job);
@@ -188,6 +209,31 @@ describe('runPodCommand', () => {
     expect(await run('/option/mirror.git', { ELANOUS_POD_HOST_MIRROR: '/env/mirror.git' })).toBe('/option/mirror.git');
     expect(await run(' ', { ELANOUS_POD_HOST_MIRROR: '/env/mirror.git' })).toBeUndefined();
     await expect(run('relative/mirror', {})).rejects.toThrow('absolute directory path');
+  });
+
+  test('runPodCommand passes the optional Bun cache host path to the Job without adding a default mount', async () => {
+    const applied: Array<Record<string, unknown>> = [];
+    const run = async (bunCache?: string) => {
+      await runPodCommand({ command: ['true'], bunCache, env: {}, configHostMirror: () => undefined,
+        kubectl: (args, input) => {
+          if (input) applied.push(JSON.parse(input) as Record<string, unknown>);
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        }, imageCommit: null, name: 'bun-cache-test', artifactsRoot: '/tmp/pod-command-bun-cache-test',
+      });
+      return applied.filter((body) => body.kind === 'Job').at(-1)!;
+    };
+    const cached = await run('/srv/bun-cache');
+    const spec = (cached.spec as { template: { spec: { volumes: unknown[]; containers: Array<{ volumeMounts: unknown[] }> } } }).template.spec;
+    expect(spec.volumes).toEqual([{ name: 'bun-cache', hostPath: { path: '/srv/bun-cache', type: 'DirectoryOrCreate' } }]);
+    expect(spec.containers[0]!.volumeMounts).toEqual([{ name: 'bun-cache', mountPath: '/bun-cache', readOnly: false }]);
+    expect(podCommandScript(cached)).toContain('BUN_INSTALL_CACHE_DIR=/bun-cache');
+    const omitted = await run();
+    const omittedSpec = (omitted.spec as { template: { spec: { volumes?: unknown; containers: Array<{ volumeMounts?: unknown }> } } }).template.spec;
+    expect(omittedSpec.volumes).toBeUndefined();
+    expect(omittedSpec.containers[0]!.volumeMounts).toBeUndefined();
+    expect(podCommandScript(omitted)).not.toContain('BUN_INSTALL_CACHE_DIR');
+    await expect(runPodCommand({ command: ['true'], bunCache: 'relative/cache', env: {}, kubectl: () => ({ status: 0, stdout: '', stderr: '' }) })).rejects.toThrow('absolute directory path');
   });
 
   test('clone-free Job mounts a configured host mirror when an environment mirror is set', async () => {

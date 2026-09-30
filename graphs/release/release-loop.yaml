@@ -12,6 +12,7 @@ terminal_nodes: [done, failed]
 nodes:
   - { node_id: version-release, kind: git, recipe: 'cmd:version-release', max_visits: 1 }
   - { node_id: cutoff, kind: judge, recipe: 'cmd:cutoff', max_visits: 1 }
+  - { node_id: checklist-gate, kind: gate, recipe: 'cmd:checklist-gate', max_visits: 1 }
   - { node_id: gate, kind: gate, recipe: 'cmd:gate', max_visits: 1, notify: start }
   - { node_id: pwa, kind: gate, recipe: 'cmd:pwa', max_visits: 1, notify: start }
   - { node_id: prepare, kind: agent, recipe: 'cmd:prepare', max_visits: 1, notify: start }
@@ -29,7 +30,8 @@ nodes:
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
   - { from: version-release, on: outcome, map: { ok: cutoff, fail: failed, error: failed } }
-  - { from: cutoff, on: outcome, map: { ok: gate, fail: failed, error: failed } }
+  - { from: cutoff, on: outcome, map: { ok: checklist-gate, fail: failed, error: failed } }
+  - { from: checklist-gate, on: outcome, map: { ok: gate, fail: failed, error: failed } }
   - { from: gate, on: outcome, map: { ok: pwa, fail: failed, error: failed } }
   - { from: pwa, on: outcome, map: { ok: prepare, fail: failed, error: failed } }
   - { from: prepare, on: outcome, map: { ok: upgrade, fail: failed, error: failed } }

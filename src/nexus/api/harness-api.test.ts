@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { GoalRunRecord } from '../../self-implement/goal-run-store.js';
 import { readReportOrigin } from '../../self-implement/report-origin.js';
@@ -15,6 +15,9 @@ import {
   handleHarnessRunEventsGet,
   handleHarnessRunsGet,
   handleHarnessStopPost,
+  collectFinishedRuns,
+  listLandedPrs,
+  _resetLandedPrsCacheForTest,
 } from './harness-api.js';
 
 const request = (path: string, body?: unknown) => new Request(`http://nexus.test${path}`, {
@@ -526,7 +529,7 @@ describe('harness API handlers', () => {
 
   test('runs preserves the shared structured observation', async () => {
     const shared = { entries: [], counts: { running: 0 }, total: 0 };
-    const response = handleHarnessRunsGet(new Request('http://nexus.test/v1/harness/runs'), {}, {
+    const response = await handleHarnessRunsGet(new Request('http://nexus.test/v1/harness/runs'), {}, {
       queryRunningRuns: ((options: unknown) => {
         expect(options).toEqual({ includeTest: false });
         return shared;
@@ -534,6 +537,150 @@ describe('harness API handlers', () => {
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual(shared);
+  });
+
+  test('runs with finishedSince adds terminated ledger summaries; without it the shape is unchanged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'harness-finished-'));
+    try {
+      const line = (runId: string, timestamp: string, event: string, data: Record<string, unknown>) =>
+        `${JSON.stringify({ timestamp, runId, event, data: { ...data, runId }, pieceTotal: 1 })}\n`;
+      const since = Date.parse('2026-09-30T00:00:00.000Z');
+      writeFileSync(join(dir, 'run-merged.jsonl'),
+        line('run-merged', '2026-09-30T01:00:00.000Z', 'start', { feature: `  로그인 버튼이 안 눌린다 ${'x'.repeat(300)}` })
+        + line('run-merged', '2026-09-30T01:20:00.000Z', 'pr-opened', { url: 'https://github.com/o/n/pull/42', number: 42 })
+        + line('run-merged', '2026-09-30T01:21:00.000Z', 'merge-decision', { decision: 'auto', reason: 'ok' })
+        + line('run-merged', '2026-09-30T01:25:00.000Z', 'merged', { number: 42, merged: true })
+        + line('run-merged', '2026-09-30T01:26:00.000Z', 'run-status', { stage: 'merged', runStatus: 'completed' }));
+      writeFileSync(join(dir, 'run-failed.jsonl'),
+        line('run-failed', '2026-09-30T03:00:00.000Z', 'start', { feature: '검색 속도' })
+        + line('run-failed', '2026-09-30T03:10:00.000Z', 'run-status', { stage: 'failed', runStatus: 'failed' }));
+      writeFileSync(join(dir, 'run-live.jsonl'),
+        line('run-live', '2026-09-30T04:00:00.000Z', 'start', { feature: '아직 도는 중' }));
+      // 어제 끝났지만 파일이 오늘 만져진 런 — endedAt 이 창 밖이면 빠진다.
+      writeFileSync(join(dir, 'run-yesterday.jsonl'),
+        line('run-yesterday', '2026-09-29T10:00:00.000Z', 'run-status', { stage: 'failed', runStatus: 'failed' }));
+      writeFileSync(join(dir, 'run-broken.jsonl'), '{not json}\n');
+      writeFileSync(join(dir, 'notes.txt'), 'ignored');
+      const shared = {
+        entries: [
+          { runId: 'run-live', status: 'running', ledgerDirectories: [dir] },
+          { runId: 'run-unknown', status: 'running', ledgerDirectories: [] },
+        ],
+        counts: { running: 2 }, total: 2,
+      };
+      _resetLandedPrsCacheForTest();
+      const deps = {
+        queryRunningRuns: (() => shared) as never, ledgerDir: dir, log: () => {},
+        landed: { repoSlug: async () => 'o/n', runGh: async () => ({ ok: true, exitCode: 0, stdout: '[]', stderr: '' }) },
+      };
+
+      const plain = handleHarnessRunsGet(new Request('http://nexus.test/v1/harness/runs'), {}, deps);
+      expect(plain).toBeInstanceOf(Response);
+      expect(await (plain as Response).json()).toEqual(shared);
+
+      const response = await handleHarnessRunsGet(new Request(`http://nexus.test/v1/harness/runs?finishedSince=${since}`), {}, deps);
+      expect(response.status).toBe(200);
+      const body = await response.json() as { entries: unknown[]; finished: Array<Record<string, unknown>>; finishedObservation: Record<string, unknown>; landed: unknown[] };
+      // 도는 항목에 원장 `start.feature` 가 붙는다 — 원장이 없으면 칸이 없다.
+      expect(body.entries).toEqual([
+        { runId: 'run-live', status: 'running', ledgerDirectories: [dir], objective: '아직 도는 중' },
+        { runId: 'run-unknown', status: 'running', ledgerDirectories: [] },
+      ]);
+      expect(body.landed).toEqual([]);
+      expect(body.finished.map((run) => run.runId)).toEqual(['run-failed', 'run-merged']);
+      expect(body.finished[0]).toEqual({ runId: 'run-failed', status: 'failed', endedAt: '2026-09-30T03:10:00.000Z', stage: 'failed', objective: '검색 속도' });
+      const merged = body.finished[1]!;
+      expect(merged).toMatchObject({ status: 'completed', stage: 'merged', prUrl: 'https://github.com/o/n/pull/42', merged: true, mergeDecision: 'auto' });
+      expect((merged.objective as string).startsWith('로그인 버튼이 안 눌린다')).toBe(true);
+      expect((merged.objective as string).length).toBe(160);
+      expect(body.finishedObservation).toMatchObject({ sinceMs: since, scannedFiles: 5, skippedFiles: 1, limit: 20 });
+
+      const bad = await handleHarnessRunsGet(new Request('http://nexus.test/v1/harness/runs?finishedSince=soon'), {}, deps);
+      expect(bad.status).toBe(400);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('landed lists PRs merged since the cutoff through the injected gh runner and caches 60s', async () => {
+    _resetLandedPrsCacheForTest();
+    const since = Date.parse('2026-09-29T15:00:00.000Z');
+    const calls: string[][] = [];
+    let now = Date.parse('2026-09-30T08:00:00.000Z');
+    const landed = {
+      repoSlug: async () => 'ElanvitalAI/elanous',
+      now: () => now,
+      runGh: async (args: string[]) => {
+        calls.push(args);
+        return {
+          ok: true, exitCode: 0, stderr: '',
+          stdout: JSON.stringify([
+            { number: 22180, title: '오늘 착지 A', url: 'https://example.test/pull/22180', mergedAt: '2026-09-30T05:00:00Z' },
+            { number: 22190, title: '오늘 착지 B', url: 'https://example.test/pull/22190', mergedAt: '2026-09-30T07:30:00Z' },
+            { number: 22001, title: '어제', url: 'https://example.test/pull/22001', mergedAt: '2026-09-29T10:00:00Z' },
+            { number: 'bad' },
+          ]),
+        };
+      },
+    };
+    const deps = { queryRunningRuns: (() => ({ entries: [], counts: {}, total: 0 })) as never, ledgerDir: join(tmpdir(), 'missing-ledger-dir'), landed };
+    const response = await handleHarnessRunsGet(new Request(`http://nexus.test/v1/harness/runs?finishedSince=${since}`), {}, deps);
+    const body = await response.json() as { landed: Array<{ number: number }>; landedError?: string; finished: unknown[] };
+    expect(body.landed.map((pr) => pr.number)).toEqual([22190, 22180]);
+    expect(body.landedError).toBeUndefined();
+    expect(body.finished).toEqual([]);
+    expect(calls).toEqual([[
+      'pr', 'list', '--repo', 'ElanvitalAI/elanous', '--state', 'merged', '--base', 'main',
+      '--search', 'merged:>=2026-09-29T15:00:00Z', '--json', 'number,title,url,mergedAt', '--limit', '30',
+    ]]);
+    // 60초 안에는 gh 를 다시 부르지 않는다.
+    now += 30_000;
+    expect((await listLandedPrs(since, landed)).cached).toBe(true);
+    now += 31_000;
+    await listLandedPrs(since, landed);
+    expect(calls).toHaveLength(2);
+  });
+
+  test('landed failures and timeouts become landedError, never a thrown error or a blocked response', async () => {
+    _resetLandedPrsCacheForTest();
+    const failed = await listLandedPrs(0, {
+      repoSlug: async () => 'o/n',
+      runGh: async () => ({ ok: false, exitCode: 4, stdout: '', stderr: 'HTTP 401: Bad credentials\nmore' }),
+    });
+    expect(failed).toEqual({ prs: [], error: 'gh failed rc=4: HTTP 401: Bad credentials' });
+    expect(await listLandedPrs(0, { repoSlug: async () => null })).toEqual({ prs: [], error: 'no-repository' });
+    expect((await listLandedPrs(0, { repoSlug: async () => 'o/n', runGh: async () => ({ ok: true, exitCode: 0, stdout: 'not json', stderr: '' }) })).prs).toEqual([]);
+    const started = Date.now();
+    const slow = await listLandedPrs(0, { repoSlug: async () => 'o/n', timeoutMs: 50, runGh: () => new Promise(() => {}) });
+    expect(slow).toEqual({ prs: [], error: 'timeout 50ms' });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    // 상한(30)만큼 오면 «더 있을 수 있다»를 표시한다.
+    const full = Array.from({ length: 30 }, (_, i) => ({ number: i, title: `t${i}`, url: `https://example.test/pull/${i}`, mergedAt: '2026-09-30T05:00:00Z' }));
+    const capped = await listLandedPrs(1, { repoSlug: async () => 'o/n', runGh: async () => ({ ok: true, exitCode: 0, stdout: JSON.stringify(full), stderr: '' }) });
+    expect(capped.truncated).toBe(true);
+    _resetLandedPrsCacheForTest();
+    // 실패는 캐시하지 않는다 — 다음 요청이 다시 묻는다.
+    let asked = 0;
+    await listLandedPrs(0, { repoSlug: async () => 'o/n', runGh: async () => { asked += 1; return { ok: true, exitCode: 0, stdout: '[]', stderr: '' }; } });
+    expect(asked).toBe(1);
+  });
+
+  test('finished runs are capped at 20 newest by endedAt', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'harness-finished-cap-'));
+    try {
+      for (let i = 0; i < 25; i += 1) {
+        const runId = `run-${String(i).padStart(2, '0')}`;
+        const ts = new Date(Date.parse('2026-09-30T00:00:00.000Z') + i * 60_000).toISOString();
+        writeFileSync(join(dir, `${runId}.jsonl`), `${JSON.stringify({ timestamp: ts, runId, event: 'run-status', data: { runStatus: 'completed' } })}\n`);
+      }
+      const result = collectFinishedRuns(dir, 0);
+      expect(result.runs).toHaveLength(20);
+      expect(result.runs[0]!.runId).toBe('run-24');
+      expect(result.runs.at(-1)!.runId).toBe('run-05');
+      expect(collectFinishedRuns(join(dir, 'missing'), 0)).toEqual({ runs: [], scannedFiles: 0, skippedFiles: 0 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('run events return only timestamp/id-ordered skeleton events for a run', async () => {

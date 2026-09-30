@@ -67,6 +67,8 @@ import { runUrlRoute } from './skills/url-route-exec.js';
 import { recordRoutedLinkAbsorbed } from './intake-plane/link-ledger.js';
 import { classifyFrontInput } from './intake-plane/front-classifier.js';
 import { effectiveInstanceRoot } from './instance/resolve.js';
+import { getElanousConfigDir } from './elanous-config-dir.js';
+import { defaultFieldEvent, FieldUploadError, parseFieldCaption, resolveFieldMime, saveFieldMedia } from './field/field-media.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -105,6 +107,10 @@ export interface TgIncoming {
   botId?: string;
   /** 답장 대상 메시지의 텍스트(force_reply 정정 가로채기용). parseUpdate 가 채운다. */
   replyToText?: string;
+  /** 앨범(media group) id — `#현장` 캡션은 앨범의 첫 항목에만 붙으므로 나머지를 같은 행사로 묶는 데 쓴다. */
+  mediaGroupId?: string;
+  /** 영상 — `#현장` 저장 전용. `attachments` 에 넣지 않는다(LLM 경로의 동작을 안 바꾸려고). */
+  video?: TgIncomingAttachment;
 }
 
 /** Streaming surface passed to the message handler. The handler can
@@ -200,6 +206,10 @@ export interface TelegramBotOpts {
    *  independently of the LLM chat path. Best-effort: errors are
    *  swallowed by the caller — never blocks chat reply. */
   onTriggerTap?: (event: TgTriggerEvent) => void | Promise<void>;
+  /** `#현장` 기본 행사 — 없으면 `slashContext.userConfig.telegram.fieldDefaultEvent` · 그것도 없으면 `field-<로컬 날짜>`. */
+  fieldDefaultEvent?: string;
+  /** 시험 seam — 현장 폴더 뿌리(기본 `getElanousConfigDir()`). */
+  fieldRootDir?: () => string;
 }
 
 /** Surface-unification v2 (FU-2) — Telegram trigger event passed to
@@ -314,6 +324,13 @@ export class TelegramBot {
    *  the bot under Telegram's ~30/sec global cap without blocking
    *  further if load is bursty but average-safe. */
   private readonly globalWindow: number[] = [];
+  private readonly fieldDefaultEventOpt?: string;
+  private readonly fieldRootDir: () => string;
+  /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
+  private readonly fieldGroups = new Map<string, {
+    event: string; at: number; chatId: number; threadId?: number; replyTo: number; count: number;
+    timer?: ReturnType<typeof setTimeout>;
+  }>();
 
   constructor(opts: TelegramBotOpts) {
     if (!opts.token) throw new Error('TelegramBot: token required');
@@ -340,6 +357,8 @@ export class TelegramBot {
     this.slashCommands = opts.slashCommands ?? [];
     this.slashContext = opts.slashContext;
     this.voiceAdapter = opts.voiceAdapter;
+    this.fieldDefaultEventOpt = opts.fieldDefaultEvent;
+    this.fieldRootDir = opts.fieldRootDir ?? getElanousConfigDir;
     if (opts.onTriggerTap) {
       // Assign through `as unknown` to bypass `readonly` + private —
       // the tap is set once at construction and never reassigned.
@@ -1347,11 +1366,82 @@ export class TelegramBot {
     return false;
   }
 
+  /** `#현장` 캡션 사진·영상(이미지·영상 문서 포함)을 현장 폴더에 저장하고 한 줄로 답한다.
+   *  처리했으면 true. 저장 규칙은 HTTP 입구와 같은 `saveFieldMedia` 다. */
+  private async tryHandleFieldUpload(ctx: TgIncoming): Promise<boolean> {
+    const media = [
+      ...ctx.attachments.filter((a) => a.kind === 'photo'
+        || (a.kind === 'document' && resolveFieldMime(a.mimeType, a.fileName ?? '') !== null)),
+      ...(ctx.video ? [ctx.video] : []),
+    ];
+    if (media.length === 0) return false;
+    const now = this.nowImpl();
+    for (const [id, g] of this.fieldGroups) if (now - g.at > 10 * 60_000 && !g.timer) this.fieldGroups.delete(id);
+    const tag = parseFieldCaption(ctx.text);
+    const group = ctx.mediaGroupId ? this.fieldGroups.get(ctx.mediaGroupId) : undefined;
+    if (!tag && !group) return false;
+    const event = tag
+      ? tag.event ?? defaultFieldEvent(
+        this.fieldDefaultEventOpt ?? this.slashContext?.userConfig?.telegram?.fieldDefaultEvent, new Date(now))
+      : group!.event;
+
+    let count: number | null = null;
+    let failure: string | null = null;
+    try {
+      const inputs = [];
+      for (const att of media) {
+        const downloaded = await this.downloadFile(att.fileId);
+        try {
+          inputs.push({
+            originalName: att.fileName ?? downloaded.fileName ?? 'media',
+            mimeType: att.mimeType ?? (att.kind === 'photo' ? 'image/jpeg' : undefined),
+            bytes: new Uint8Array(readFileSync(downloaded.localPath)),
+          });
+        } finally {
+          try { unlinkSync(downloaded.localPath); } catch { /* 이미 없음 */ }
+        }
+      }
+      // 글(자막)은 캡션이 달린 항목에만 있다 — 앨범이면 첫 장에만 붙는다(MK 2026-09-30).
+      count = saveFieldMedia(inputs, { rootDir: this.fieldRootDir(), event, device: 'telegram', ...(tag?.text ? { caption: tag.text } : {}) }).count;
+      debug.log('field.upload', 'saved', { surface: 'telegram', files: inputs.length, count, album: !!ctx.mediaGroupId });
+    } catch (err) {
+      failure = err instanceof FieldUploadError ? err.code : 'download-failed';
+      debug.log('field.upload', 'refused', { surface: 'telegram', reason: failure });
+    }
+
+    if (failure !== null) {
+      await this.sendMessage(ctx.chatId, `현장 저장 실패 · ${event} · ${failure}`, { replyTo: ctx.messageId, threadId: ctx.threadId });
+      return true;
+    }
+    const line = (n: number) => `현장 폴더에 저장 · ${event} · 지금 ${n}장`;
+    if (!ctx.mediaGroupId) {
+      await this.sendMessage(ctx.chatId, line(count!), { replyTo: ctx.messageId, threadId: ctx.threadId });
+      return true;
+    }
+    // 앨범은 항목마다 답하지 않는다 — 마지막 항목 뒤 한 번(디바운스)만 최신 수로 답한다.
+    const entry = group ?? { event, at: now, chatId: ctx.chatId, threadId: ctx.threadId, replyTo: ctx.messageId, count: 0 };
+    entry.at = now;
+    entry.count = count!;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      void this.sendMessage(entry.chatId, line(entry.count), { replyTo: entry.replyTo, threadId: entry.threadId })
+        .catch((e) => this.log(`field reply failed: ${e instanceof Error ? e.message : String(e)}`));
+    }, 1500);
+    (entry.timer as { unref?: () => void }).unref?.();
+    this.fieldGroups.set(ctx.mediaGroupId, entry);
+    return true;
+  }
+
   private async handleIncoming(ctx: TgIncoming): Promise<void> {
     if (!this.isOwnerAllowed(ctx.userId)) {
       await this.refuseMessage(ctx);
       return;
     }
+    // 현장 업로드 — `#현장` 캡션(또는 태그된 앨범의 나머지)의 사진·영상은 LLM 대신 현장 폴더로.
+    if (await this.tryHandleFieldUpload(ctx)) return;
+    // 영상은 `#현장` 저장 전용으로만 파싱한다 — 그 밖의 영상은 종전처럼 무시한다.
+    if (ctx.video && ctx.attachments.length === 0) return;
     // Cascade-zyu U2 — capture utterance intent at update ingress.
     try {
       const { userIntentLogger } = await import('./user-intent/index.js');
@@ -2069,6 +2159,7 @@ export class TelegramBot {
 interface PhotoSize { file_id: string; file_size?: number; width: number; height: number }
 interface VoiceLike { file_id: string; file_size?: number; mime_type?: string; duration?: number }
 interface DocumentLike { file_id: string; file_size?: number; mime_type?: string; file_name?: string }
+interface VideoLike { file_id: string; file_size?: number; mime_type?: string; file_name?: string; duration?: number }
 
 interface RawUpdate {
   update_id: number;
@@ -2083,6 +2174,8 @@ interface RawUpdate {
     voice?: VoiceLike;
     audio?: VoiceLike;
     document?: DocumentLike;
+    video?: VideoLike;
+    media_group_id?: string;
     reply_to_message?: { text?: string; message_id?: number };
   };
   callback_query?: {
@@ -2175,8 +2268,20 @@ export function parseUpdate(u: RawUpdate): TgIncoming | null {
     });
   }
 
+  // 영상은 `#현장` 저장 전용 — 태그된 캡션이거나 앨범 항목일 때만 싣는다(그 밖의 영상은 종전처럼 무시).
+  const video = m.video && (parseFieldCaption(m.caption) || m.media_group_id)
+    ? {
+        kind: 'document' as const,
+        fileId: m.video.file_id,
+        fileSize: m.video.file_size,
+        mimeType: m.video.mime_type ?? 'video/mp4',
+        fileName: m.video.file_name,
+        duration: m.video.duration,
+      }
+    : undefined;
+
   // Skip updates with zero signal: no text AND no attachments.
-  if (typeof m.text !== 'string' && attachments.length === 0) return null;
+  if (typeof m.text !== 'string' && attachments.length === 0 && !video) return null;
 
   const isDm = m.chat.type === 'private';
   return {
@@ -2191,6 +2296,8 @@ export function parseUpdate(u: RawUpdate): TgIncoming | null {
     isGroup: !isDm,
     attachments,
     ...(m.reply_to_message?.text ? { replyToText: m.reply_to_message.text } : {}),
+    ...(m.media_group_id ? { mediaGroupId: m.media_group_id } : {}),
+    ...(video ? { video } : {}),
   };
 }
 

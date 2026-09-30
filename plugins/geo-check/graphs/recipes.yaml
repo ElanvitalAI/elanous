@@ -1,0 +1,18 @@
+questions:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" questions'
+  timeout_ms: 120000
+answers:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" answers'
+  timeout_ms: 600000
+web:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" web'
+  timeout_ms: 600000
+score:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" score'
+  timeout_ms: 30000
+suggest:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" suggest'
+  timeout_ms: 120000
+report:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" report'
+  timeout_ms: 30000

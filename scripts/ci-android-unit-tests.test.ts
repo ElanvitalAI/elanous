@@ -765,3 +765,11 @@ describe('resolveJdk21Home — ⛔ 사람이 매번 JAVA_HOME 을 붙여야 하�
     expect(resolveJdk21Home(() => null)).toBeNull();
   });
 });
+
+describe('⛔ 게이트가 «이 커밋»을 잰다 — Gradle 캐시를 끈다', () => {
+  test('러너가 build·configuration 캐시를 끄고 과제를 다시 돌린다', () => {
+    // 🩸 09-30(UX · #22211 · #22218): gradle.properties 가 두 캐시를 켜 두어, 고친 뒤에도 고치기 전 클래스로 시험이 돌았다.
+    const src = readFileSync(new URL('./run-android-unit-tests.ts', import.meta.url), 'utf8');
+    for (const flag of ['--no-configuration-cache', '--no-build-cache', '--rerun-tasks']) expect(src).toContain(`"${flag}"`);
+  });
+});

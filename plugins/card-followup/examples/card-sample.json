@@ -1,0 +1,7 @@
+{
+  "image": "/absolute/path/to/fictional-card.png",
+  "context": "가상 행사에서 가상 제품 데모를 짧게 이야기했습니다.",
+  "sender": "가상 발신자 · 가상 발신 회사",
+  "language": "ko",
+  "outDir": "/absolute/path/to/private-output"
+}

@@ -1,5 +1,7 @@
-import { readFileSync, writeFileSync } from 'node:fs';
-import { relative } from 'node:path';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { hasTerminalRunStatus, loadRunLedger, runLedgerDir, runLedgerPath, type RunLedgerEntry } from '../../self-implement/run-ledger.js';
+import { summarizeTerminalLedger } from '../../self-implement/run-ledger-compact.js';
 import { debug } from '../../debug/log.js';
 import { enqueueSoftStop } from '../../harness/control-inbox.js';
 import { listHarnessScreens, readHarnessScreenTail } from '../../harness/harness-screen.js';
@@ -103,6 +105,10 @@ export interface HarnessApiDeps {
   readonly createAcceptanceId?: () => string;
   readonly log?: (event: string, data: Record<string, unknown>) => void;
   readonly createFeedbackEmitter?: (acceptanceId: string) => (env: FeedbackEnvelope) => void | Promise<void>;
+  /** 시험 심 — `?finishedSince=` 가 읽는 원장 디렉터리(기본 `runLedgerDir()`). */
+  readonly ledgerDir?: string;
+  /** 시험 심 — `?finishedSince=` 의 `landed`(gh 실행기·저장소·시간 초과). */
+  readonly landed?: LandedPrsDeps;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -338,10 +344,218 @@ export function handleHarnessAskStatusGet(req: Request, _metaApi: HarnessMetaApi
   });
 }
 
-/** Return the structured shared running-runs observation without human rendering. */
-export function handleHarnessRunsGet(_req: Request, _metaApi: HarnessMetaApi, deps: HarnessApiDeps = {}): Response {
+/** One terminated run for `GET /v1/harness/runs?finishedSince=` (iPhone «오늘 끝난 일» · 2026-09-30). */
+export interface HarnessFinishedRun {
+  runId: string;
+  status: string;
+  endedAt: string;
+  /** 마지막 `run-status` 의 `stage`(예: `merged`·`pr-declined`) — 칩을 더 정확히 고를 때. */
+  stage?: string;
+  objective?: string;
+  prUrl?: string;
+  /** `merged` 이벤트의 값 — 이벤트가 없으면 칸이 없다(«병합 안 됨»으로 접지 않는다). */
+  merged?: boolean;
+  /** 마지막 `merge-decision` 의 `decision`(`auto`·`hitl`) — 병합 «결정»이지 병합 «사실»이 아니다. */
+  mergeDecision?: string;
+}
+
+export const FINISHED_RUNS_LIMIT = 20;
+export const FINISHED_RUNS_MAX_FILES = 300;
+export const FINISHED_RUNS_MAX_FILE_BYTES = 5 * 1024 * 1024;
+const FINISHED_OBJECTIVE_MAX_CHARS = 160;
+
+/**
+ * 원장 디렉터리에서 `sinceMs` 이후에 쓰인 «끝난» 런을 요약한다. 읽기는 묶여 있다 —
+ * mtime 최신 {@link FINISHED_RUNS_MAX_FILES} 개만 보고, {@link FINISHED_RUNS_MAX_FILE_BYTES} 를 넘는 파일은 건너뛴다.
+ */
+export function collectFinishedRuns(dir: string, sinceMs: number): { runs: HarnessFinishedRun[]; scannedFiles: number; skippedFiles: number } {
+  let names: string[];
+  try { names = readdirSync(dir); }
+  catch { return { runs: [], scannedFiles: 0, skippedFiles: 0 }; }
+  const candidates: Array<{ runId: string; mtimeMs: number; size: number }> = [];
+  for (const name of names) {
+    if (!name.endsWith('.jsonl')) continue;
+    try {
+      const st = statSync(join(dir, name));
+      if (st.isFile() && st.mtimeMs >= sinceMs) candidates.push({ runId: name.slice(0, -'.jsonl'.length), mtimeMs: st.mtimeMs, size: st.size });
+    } catch { /* 사이에 지워졌다 */ }
+  }
+  candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  const scanned = candidates.slice(0, FINISHED_RUNS_MAX_FILES);
+  let skippedFiles = candidates.length - scanned.length;
+  const runs: HarnessFinishedRun[] = [];
+  for (const file of scanned) {
+    if (file.size > FINISHED_RUNS_MAX_FILE_BYTES) { skippedFiles += 1; continue; }
+    let entries: RunLedgerEntry[] | null;
+    try { entries = loadRunLedger(file.runId, dir); }
+    catch { skippedFiles += 1; continue; }
+    if (!entries?.length || !hasTerminalRunStatus(entries)) continue;
+    let summary: ReturnType<typeof summarizeTerminalLedger>;
+    try { summary = summarizeTerminalLedger(file.runId, entries); }
+    catch { skippedFiles += 1; continue; }
+    if (!(Date.parse(summary.endedAt) >= sinceMs)) continue;
+    const feature = entries.find((entry) => entry.event === 'start' && typeof entry.data.feature === 'string')?.data.feature as string | undefined;
+    const objective = feature?.trim().slice(0, FINISHED_OBJECTIVE_MAX_CHARS);
+    const mergedEvent = [...entries].reverse().find((entry) => entry.event === 'merged' && typeof entry.data.merged === 'boolean');
+    const decision = [...entries].reverse().find((entry) => entry.event === 'merge-decision' && typeof entry.data.decision === 'string');
+    const statusEntry = [...entries].reverse().find((entry) => entry.event === 'run-status' && typeof entry.data.stage === 'string');
+    runs.push({
+      runId: summary.runId,
+      status: summary.status,
+      endedAt: summary.endedAt,
+      ...(statusEntry ? { stage: statusEntry.data.stage as string } : {}),
+      ...(objective ? { objective } : {}),
+      ...(summary.prUrl ? { prUrl: summary.prUrl } : {}),
+      ...(mergedEvent ? { merged: mergedEvent.data.merged as boolean } : {}),
+      ...(decision ? { mergeDecision: decision.data.decision as string } : {}),
+    });
+  }
+  runs.sort((a, b) => Date.parse(b.endedAt) - Date.parse(a.endedAt));
+  return { runs: runs.slice(0, FINISHED_RUNS_LIMIT), scannedFiles: scanned.length, skippedFiles };
+}
+
+/** 도는 런의 목표 — 그 런 원장의 첫 `start.data.feature`(≤160자). 원장 경로는 그 항목이 준 디렉터리들만 본다(런 수만큼만 읽는다). */
+export function runObjectiveFromLedgers(runId: string, directories: readonly string[]): string | undefined {
+  for (const dir of directories) {
+    try {
+      if (statSync(runLedgerPath(runId, dir)).size > FINISHED_RUNS_MAX_FILE_BYTES) continue;
+      const feature = loadRunLedger(runId, dir)?.find((entry) => entry.event === 'start' && typeof entry.data.feature === 'string')?.data.feature;
+      const objective = typeof feature === 'string' ? feature.trim().slice(0, FINISHED_OBJECTIVE_MAX_CHARS) : '';
+      if (objective) return objective;
+    } catch { /* 없거나 못 읽음 — 다음 디렉터리 */ }
+  }
+  return undefined;
+}
+
+// ── 오늘 착지(= main 에 병합된 PR) — 원장은 Pod·시험 우주의 런을 못 보므로 GitHub 이 정본이다 ──
+
+/** `landed` 한 줄 — `gh pr list --json number,title,url,mergedAt` 모양 그대로. */
+export interface HarnessLandedPr {
+  number: number;
+  title: string;
+  url: string;
+  mergedAt: string;
+}
+
+export const LANDED_PRS_LIMIT = 30;
+export const LANDED_PRS_TIMEOUT_MS = 4_000;
+const LANDED_CACHE_MS = 60_000;
+const landedCache = new Map<string, { at: number; prs: HarnessLandedPr[]; truncated: boolean }>();
+let cachedRepoSlug: string | null | undefined;
+
+export function _resetLandedPrsCacheForTest(): void {
+  landedCache.clear();
+  cachedRepoSlug = undefined;
+}
+
+export interface LandedPrsDeps {
+  /** gh 실행기(기본 = `git-fs/gh-cli` 의 재시도 게이트웨이 · 비동기). */
+  readonly runGh?: (args: string[]) => Promise<{ ok: boolean; exitCode: number; stdout: Buffer | string; stderr: Buffer | string }>;
+  /** 저장소 `owner/name` — 기본은 데몬이 아는 저장소 뿌리(`harness.defaultRepo` → cwd)의 origin. */
+  readonly repoSlug?: () => Promise<string | null>;
+  readonly timeoutMs?: number;
+  readonly now?: () => number;
+}
+
+async function defaultRepoSlug(): Promise<string | null> {
+  if (cachedRepoSlug !== undefined) return cachedRepoSlug;
+  const [{ resolveWorktreesRepoRoot }, { slugFromRemote }] = await Promise.all([import('./worktrees.js'), import('./live-shipped.js')]);
+  const root = resolveWorktreesRepoRoot();
+  if (!root) return (cachedRepoSlug = null);
+  const proc = Bun.spawn(['git', '-C', root, 'remote', 'get-url', 'origin'], { stdout: 'pipe', stderr: 'ignore' });
+  const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+  return (cachedRepoSlug = code === 0 ? slugFromRemote(out) : null);
+}
+
+async function defaultRunGh(args: string[]) {
+  const { runGhCliWithResultAsync } = await import('../../git-fs/gh-cli.js');
+  return runGhCliWithResultAsync(args);
+}
+
+function isLandedPr(value: unknown): value is HarnessLandedPr {
+  const v = value as Partial<HarnessLandedPr> | null;
+  return !!v && typeof v.number === 'number' && typeof v.title === 'string' && typeof v.url === 'string' && typeof v.mergedAt === 'string';
+}
+
+/** `sinceMs` 이후 main 에 병합된 PR(최신순 ≤30). 실패·시간 초과는 던지지 않고 `error` 로 돌려준다. 성공만 60초 캐시한다. */
+export async function listLandedPrs(sinceMs: number, deps: LandedPrsDeps = {}): Promise<{ prs: HarnessLandedPr[]; error?: string; cached?: boolean; truncated?: boolean }> {
+  const now = deps.now?.() ?? Date.now();
+  const sinceIso = new Date(Math.floor(sinceMs / 60_000) * 60_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const hit = landedCache.get(sinceIso);
+  if (hit && now - hit.at < LANDED_CACHE_MS) return { prs: hit.prs, cached: true, ...(hit.truncated ? { truncated: true } : {}) };
+  const timeoutMs = deps.timeoutMs ?? LANDED_PRS_TIMEOUT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<{ prs: HarnessLandedPr[]; error: string }>((resolve) => {
+    timer = setTimeout(() => resolve({ prs: [], error: `timeout ${timeoutMs}ms` }), timeoutMs);
+  });
+  const work = (async (): Promise<{ prs: HarnessLandedPr[]; error?: string; truncated?: boolean }> => {
+    try {
+      const slug = await (deps.repoSlug ?? defaultRepoSlug)();
+      if (!slug) return { prs: [], error: 'no-repository' };
+      const result = await (deps.runGh ?? defaultRunGh)([
+        'pr', 'list', '--repo', slug, '--state', 'merged', '--base', 'main',
+        '--search', `merged:>=${sinceIso}`,
+        '--json', 'number,title,url,mergedAt', '--limit', String(LANDED_PRS_LIMIT),
+      ]);
+      if (!result.ok) {
+        const stderr = String(result.stderr).trim().split('\n')[0] ?? '';
+        return { prs: [], error: `gh failed rc=${result.exitCode}${stderr ? `: ${redactSecretText(stderr).slice(0, 120)}` : ''}` };
+      }
+      const parsed: unknown = JSON.parse(String(result.stdout));
+      if (!Array.isArray(parsed)) return { prs: [], error: 'gh returned non-array' };
+      const prs = parsed.filter(isLandedPr)
+        .filter((pr) => Date.parse(pr.mergedAt) >= sinceMs)
+        .sort((a, b) => Date.parse(b.mergedAt) - Date.parse(a.mergedAt));
+      // gh 가 상한만큼 줬으면 더 있을 수 있다 — «전부»라고 말하지 않는다.
+      const truncated = parsed.length >= LANDED_PRS_LIMIT;
+      landedCache.set(sinceIso, { at: now, prs, truncated });
+      return { prs, ...(truncated ? { truncated: true } : {}) };
+    } catch (error) {
+      return { prs: [], error: message(error).slice(0, 120) };
+    }
+  })();
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Return the structured shared running-runs observation without human rendering.
+ *  `?finishedSince=<epoch ms>` 가 있으면(iPhone «오늘» · 2026-09-30) 셋을 더한다 —
+ *  `finished`(이 우주 원장의 끝난 런 · 최신순 ≤20) · `landed`(그 시각 뒤 main 에 병합된 PR · ≤30 · 실패면 `[]` ⊕ `landedError`) ·
+ *  도는 항목마다 `objective`(그 런 원장의 `start.feature`). 없으면 응답은 종전 그대로다(동기 응답). */
+export function handleHarnessRunsGet(req: Request, _metaApi: HarnessMetaApi, deps: HarnessApiDeps = {}): Response | Promise<Response> {
   const runs: RunningRunsResult = (deps.queryRunningRuns ?? queryRunningRuns)({ includeTest: false });
-  return json(runs);
+  const raw = new URL(req.url).searchParams.get('finishedSince');
+  if (raw === null) return json(runs);
+  const sinceMs = Number(raw);
+  if (!raw.trim() || !Number.isFinite(sinceMs) || sinceMs < 0) {
+    return json({ error: 'usage: GET /v1/harness/runs?finishedSince=<epoch ms>' }, 400);
+  }
+  return (async () => {
+    const landedWork = listLandedPrs(sinceMs, deps.landed ?? {});
+    const dir = deps.ledgerDir ?? runLedgerDir();
+    const finished = collectFinishedRuns(dir, sinceMs);
+    const entries = runs.entries.map((entry) => {
+      const objective = runObjectiveFromLedgers(entry.runId, entry.ledgerDirectories?.length ? entry.ledgerDirectories : [dir]);
+      return objective ? { ...entry, objective } : entry;
+    });
+    const landed = await landedWork;
+    debug.log('harness-http', 'runs-finished', {
+      sinceMs, count: finished.runs.length, scannedFiles: finished.scannedFiles, skippedFiles: finished.skippedFiles,
+      landed: landed.prs.length, landedCached: landed.cached === true, ...(landed.error ? { landedError: landed.error } : {}),
+    });
+    return json({
+      ...runs,
+      entries,
+      finished: finished.runs,
+      finishedObservation: { sinceMs, scannedFiles: finished.scannedFiles, skippedFiles: finished.skippedFiles, limit: FINISHED_RUNS_LIMIT },
+      landed: landed.prs,
+      ...(landed.truncated ? { landedTruncated: true } : {}),
+      ...(landed.error ? { landedError: landed.error } : {}),
+    });
+  })();
 }
 
 /** Return the human-readable skeleton events persisted for one harness run. */

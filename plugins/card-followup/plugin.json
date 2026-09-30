@@ -1,0 +1,25 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "card-followup",
+  "version": "0.1.0",
+  "description": "Business card photo to researched follow-up and LinkedIn drafts. Drafts are never sent.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [
+        "./graphs/card-followup.yaml"
+      ],
+      "capabilities": [
+        "fs:workdir",
+        "proc:bun",
+        "proc:elanous",
+        "proc:codex"
+      ],
+      "connectors": [],
+      "pricing": {
+        "model": "free"
+      },
+      "trust": "official",
+      "category": "Marketing"
+    }
+  }
+}

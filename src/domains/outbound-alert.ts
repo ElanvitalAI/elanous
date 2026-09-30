@@ -116,10 +116,10 @@ function deferOutbound(text: string, kind: string, origin?: MissionOrigin | null
     mkdirSync(dirname(path), { recursive: true });
     const rec = { ts: new Date().toISOString(), kind, text, ...(origin ? { origin } : {}) };
     appendFileSync(path, JSON.stringify(rec) + '\n');
-    console.log(`[outbound] 야간 무음(00:00~06:30 KST) — 보류 적재 (${kind})`);
+    console.error(`[outbound] 야간 무음(00:00~06:30 KST) — 보류 적재 (${kind})`);
     logSend('deferred', kind, { reason: 'quiet-hours' });  // 밀림 적재 관측
   } catch (e) {
-    console.log(`[outbound] 보류 적재 실패 — 콘솔 출력\n${text}`, e instanceof Error ? e.message : '');
+    console.error(`[outbound] 보류 적재 실패 — 콘솔 출력\n${text}`, e instanceof Error ? e.message : '');
   }
 }
 
@@ -238,7 +238,7 @@ export function sendOutbound(text: string, kind = 'alert', origin?: MissionOrigi
     return true; // 보류 = 수락 (호출측 재시도/에러 루프 방지)
   }
   const bypass = inQuietHours();
-  if (bypass) console.log('[outbound] 야간 무음 우회 — 최근 사용자 활동(깨어있음) → 즉시 발송 + 보류분 flush');
+  if (bypass) console.error('[outbound] 야간 무음 우회 — 최근 사용자 활동(깨어있음) → 즉시 발송 + 보류분 flush');
   try { flushDeferred(); } catch { /* fail-soft */ }
   // ★ 발송 관측(대표 지시) — 발송 시각·mode·밀림(burst) 판정을 logs.db 에. burst=최근 2분 5건+
   //   (몰려 나가는 중 = 밀림 의심). `elanous logs --category outbound.send` 로 실시간/밀림 구분.
@@ -275,7 +275,7 @@ export function classifyDaemonResponse(j: unknown): DaemonPathClass {
 function logDaemonPath(classification: DaemonPathClass, kind: string, extra: Record<string, unknown> = {}): void {
   try { debug.log('outbound.send', 'daemon-path', { classification, kind, ...extra }); } catch { /* fail-soft */ }
   if (classification === 'ok') return;
-  try { console.log(`[outbound] daemon-path ${classification}`); } catch { /* fail-soft */ }
+  try { console.error(`[outbound] daemon-path ${classification}`); } catch { /* fail-soft */ }
 }
 
 /** elanous `/v1/outbound` 우선 → 실패 시 텔레그램 직접. 성공 경로 반환(원장 중복방지용). */
@@ -334,6 +334,6 @@ function sendTelegramDirect(text: string, kind?: string): boolean {
     tok = tok || env.TELEGRAM_BOT_TOKEN || '';
     chat = chat || env.TELEGRAM_CHAT_ID || '';
   }
-  if (!tok || !chat) { console.log('[outbound] 토큰/chat 미설정 — 콘솔 출력\n' + text); return false; }
+  if (!tok || !chat) { console.error('[outbound] 토큰/chat 미설정 — 콘솔 출력\n' + text); return false; }
   return sendTelegramRaw(tok, chat, text);
 }

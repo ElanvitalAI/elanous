@@ -41,6 +41,7 @@ describe('release checklist CLI', () => {
     process.env.ELANOUS_TRACK = 'T';
     const lines: string[] = [];
     const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
     const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
     try {
       await run('--version', '9.9.9', 'add', 'K1', '첫 칸');
@@ -62,7 +63,7 @@ describe('release checklist CLI', () => {
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
     } finally {
-      output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+      jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
       if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
     }
   });
@@ -73,6 +74,7 @@ describe('release checklist CLI', () => {
     writeFileSync(join(dir, 'config.json'), JSON.stringify({ release: { codenames: { '0.2.5': '9.9.9', '9.9.9': 'graph' } } }));
     const lines: string[] = [];
     const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
     const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
     try {
       await run('--version', '9.9.9', 'add', 'K1', 'real version');
@@ -81,7 +83,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('0.2.5').items).toHaveLength(0);
       await run('status', '--version', 'graph', '--json');
       expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '9.9.9', yellow: 1 });
-    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('기본 개발판·별칭 조회·씨앗 CLI', async () => {
@@ -90,9 +92,10 @@ describe('release checklist CLI', () => {
     writeFileSync(join(dir, 'config.json'), JSON.stringify({ release: { codenames: { '0.2.5': 'graph' } } }));
     const lines: string[] = [];
     const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
     const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
     try {
-      await run('seed', '--from', join(import.meta.dir, '..', '..', 'docs/ROADMAP-releases-0.2.5-and-0.2.6-2026-09-29.md'));
+      await run('seed', '--version', '0.2.5', '--from', join(import.meta.dir, '..', '..', 'docs/ROADMAP-releases-0.2.5-and-0.2.6-2026-09-29.md'));
       await run('status', '--version', 'graph', '--json');
       const result = JSON.parse(lines.at(-1)!);
       expect(result).toMatchObject({ version: '0.2.5', codename: 'graph', dev: devVersion() });
@@ -100,7 +103,7 @@ describe('release checklist CLI', () => {
       expect(result.history[0].dev).toBe(devVersion());
       await run('status', '--version', 'graph');
       expect(lines.at(-4)).toContain('0.2.5 (graph)');
-    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+    } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

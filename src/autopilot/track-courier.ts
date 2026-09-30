@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { debug, redactSecretText } from '../debug/log.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
-import { inferPhaseTrack, loadTrackRegistry } from './mission-phase-track.js';
+import { inferPhaseTrack, loadTrackRegistry, trackPostIds } from './mission-phase-track.js';
 import type { TrackAgentInput, TrackAgentRunner } from './track-agent.js';
 
 type CourierConfig = NonNullable<NonNullable<UserConfig['autopilot']>['trackCourier']>;
@@ -66,7 +66,7 @@ export async function trackAlive(track: string, deps: CourierDeps = {}): Promise
     const comments = await (deps.listComments ?? (() => defaultComments(config.channelPr!, now, minutesFor(config))))();
     if (!Array.isArray(comments)) throw new Error('comments response is not an array');
     const timestamps = comments
-      .filter((c) => c && typeof c.body === 'string' && c.body.startsWith(`**[${track}]**`))
+      .filter((c) => c && typeof c.body === 'string' && trackPostIds(track).some((id) => c.body.startsWith(`**[${id}]**`)))
       .map((c) => Date.parse(c.created_at))
       .filter((at) => Number.isFinite(at) && at <= now);
     if (!timestamps.length) return { alive: false, lastPostAt: null, reason: 'no-post' };

@@ -242,6 +242,20 @@ test('credentials CLI sets, reads stdin, unsets and never prints values', async 
   }
 }, 20_000);
 
+test('plugin make help exposes name, dir, run, input and json', async () => {
+  const result = await cli(temp(), ['make', '--help']);
+  expect(result.code).toBe(0);
+  for (const flag of ['--name', '--dir', '--run', '--input', '--json']) expect(result.output).toContain(flag);
+});
+
+test('plugin make rejects an existing --name before invoking codex and reports JSON failure', async () => {
+  const root = temp();
+  mkdirSync(join(root, 'plugins-local', 'taken'), { recursive: true });
+  const result = await cli(root, ['make', 'something', '--name', 'taken', '--json']);
+  expect(result.code).toBe(1);
+  expect(JSON.parse(result.output)).toMatchObject({ status: 'failed', errors: [expect.stringContaining('already exists')] });
+});
+
 test('index registers the plugin CLI command', () => {
   const index = readFileSync(join(repo, 'src', 'index.ts'), 'utf8');
   expect(index).toContain('registerPluginCommands(program);');

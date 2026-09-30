@@ -833,6 +833,8 @@ export interface TelegramConfig {
   /** 발송 목적(kind) → 채널 역할. 명시 `channels` 가 있을 때만 쓴다 — 표에 없는 kind 는 옛 `reportChannel` 로 간다.
    *  기본표는 `DEFAULT_KIND_ROLES`(telegram-report.ts) · 여기 값이 덮어쓴다. */
   kindRoles?: Record<string, string>;
+  /** `#현장` 캡션에 행사 슬러그가 없을 때 쓸 기본 행사(예: `marketers-night-2026-10`). 없으면 `field-<로컬 날짜>`. */
+  fieldDefaultEvent?: string;
 }
 
 const TELEGRAM_DEFAULTS: TelegramConfig = { enabled: false, allowedUsers: [] };
@@ -4393,6 +4395,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       testChannel: normalizeTestChannel(tg.testChannel),
       ...(tg.poller === 'standalone' || tg.poller === 'nexus' ? { poller: tg.poller } : {}),
       ...(normalizeKindRoles(tg.kindRoles) ? { kindRoles: normalizeKindRoles(tg.kindRoles)! } : {}),
+      ...(str(tg.fieldDefaultEvent) ? { fieldDefaultEvent: str(tg.fieldDefaultEvent)! } : {}),
     },
     discord: {
       enabled: dc.enabled === true,
@@ -5565,6 +5568,7 @@ export function saveUserConfig(
       // ★ 2026-09-25: `poller`(T1 분리 스위치)가 파서엔 있고 이 whitelist 에 없어 `config set telegram.poller` 가
       //   「직렬화 드롭」으로 조용히 사라졌다 — 운영 전환 스위치를 켤 방법이 없었다(07-22 botUsername 과 같은 모양).
       poller: cfg.telegram.poller,
+      fieldDefaultEvent: cfg.telegram.fieldDefaultEvent,
     }),
     discord: stripUndef({
       enabled: cfg.discord.enabled,

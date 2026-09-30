@@ -12,7 +12,7 @@ import { Frames, launch, PUBLIC_LEAK_CHECK, sleep } from './lib/cdp.js';
 const arg = (k: string) => { const i = process.argv.indexOf(`--${k}`); return i > 0 ? process.argv[i + 1] : undefined; };
 const flag = (k: string) => process.argv.includes(`--${k}`);
 const rawUrl = arg('url'); const out = arg('out');
-if (!rawUrl || !out) { console.error('usage: --url <url> --out <dir> [--secs N] [--size WxH] [--mobile] [--type text] [--shot] [--token-stdin]'); process.exit(64); }
+if (!rawUrl || !out) { console.error('usage: --url <url> --out <dir> [--secs N] [--size WxH] [--mobile] [--type text] [--shot] [--token-stdin] [--eval <js>]'); process.exit(64); }
 const mobile = flag('mobile');
 const [W, H] = mobile ? [390, 844] : (arg('size') ?? '1920x1080').split('x').map(Number);
 const DPR = mobile ? 3 : 1; const SECS = Number(arg('secs') ?? 20);
@@ -26,6 +26,9 @@ if (flag('token-stdin')) {
   if (temp) { await cdp.send('Page.navigate', { url: `${u.origin}/app/` }); await sleep(3000); await cdp.ev(`localStorage.setItem('elanous.daemon.token', ${JSON.stringify(temp)})`); }
 }
 await cdp.send('Page.navigate', { url: u.toString() }); await sleep(8000);
+// --eval <js>: 녹화 전에 화면 상태를 맞춘다(출처 선택·토글·배너 닫기) — 기록에 남도록 그대로 찍는다.
+const pre = arg('eval');
+if (pre) { console.log('eval', await cdp.ev<string>(`(()=>{try{${pre};return 'ok'}catch(e){return 'error: '+e}})()`)); await sleep(4000); }
 const check = async (tag: string) => console.log(tag, await cdp.ev<string>(PUBLIC_LEAK_CHECK));
 await check('before');
 if (flag('shot')) { const f = join(out, `shot-${W}x${H}.png`); await cdp.png(f); console.log('png', f); cdp.close(); process.exit(0); }

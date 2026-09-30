@@ -11,6 +11,7 @@ import { emitDecision } from '../live/detail-switch.js';
 import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 import { installPlugin, listInstalledPlugins, PluginInstallError, removePlugin, type InstallEvent } from '../plugins/install/plugin-install.js';
 import { credentialStatus, setPluginCredentials } from '../plugins/install/plugin-credentials.js';
+import { makePlugin } from '../plugins/maker/plugin-maker.js';
 
 function keys(): ReadonlyArray<{ keyId: string; publicKey: string }> {
   const configPath = userConfigPath();
@@ -56,6 +57,32 @@ function safeCause(error: unknown): string {
 
 export function registerPluginCommands(program: Command): void {
   const plugin = program.command('plugin').description('Install and manage Elanous plugins');
+  plugin.command('make <request>').description('Write, validate and install a local graph plugin from one request')
+    .option('--name <slug>', 'Local plugin name')
+    .option('--dir <parent>', 'Parent directory (default: instance plugins-local)')
+    .option('--run', 'Run the installed graph')
+    .option('--input <json>', 'JSON input for --run')
+    .option('--json', 'Print the result as JSON')
+    .action(async (request: string, opts: { name?: string; dir?: string; run?: boolean; input?: string; json?: boolean }) => {
+      try {
+        const result = await makePlugin({ request, name: opts.name, parentDir: opts.dir, run: opts.run,
+          ...(opts.input === undefined ? {} : { input: JSON.parse(opts.input) as unknown }) });
+        if (opts.json) stdout.write(JSON.stringify(result) + '\n');
+        else {
+          console.log(`뼈대 ${result.timings.scaffold}ms · 작성 ${result.timings.write}ms`);
+          console.log(`검증 오류 ${result.errors.length} · ${result.timings.validate}ms${result.timings.repair === undefined ? '' : ` · 수리 ${result.timings.repair}ms`}`);
+          console.log(`설치 ${result.timings.install === 0 && result.status === 'failed' ? '미실행' : result.status === 'failed' && result.timings.run === undefined ? '실패' : '완료'} · ${result.timings.install}ms (${result.dir})`);
+          if (opts.run) console.log(`실행 ${result.runStatus ?? '미실행'} · ${result.timings.run ?? 0}ms`);
+          for (const error of result.errors) console.error(error);
+        }
+        if (result.status === 'failed') process.exitCode = 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (opts.json) stdout.write(JSON.stringify({ status: 'failed', errors: [message] }) + '\n');
+        else console.error(`plugin make failed: ${message}`);
+        process.exitCode = 1;
+      }
+    });
   plugin.command('add <spec>').description('Install a local path, pinned git plugin or signed market plugin')
     .option('--yes', 'Accept requested capabilities')
     .option('--json', 'NDJSON progress events')

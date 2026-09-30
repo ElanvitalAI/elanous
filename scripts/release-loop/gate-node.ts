@@ -7,10 +7,12 @@ import { dirname, join, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
-import { diffFailures, parseFailures } from './gate-diff';
+import { diffFailures, junitFailures, parseFailures } from './gate-diff';
+import { planShards, readFileDurations } from './shard-plan';
 import { deriveCdpTestPatterns } from '../test-deterministic';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
 import { runPodCommand, type RunPodCommandOptions, type PodCommandResult } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
+import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from '../../src/task-orchestrator/surfaces/pod-bun-cache.js';
 import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 
@@ -36,7 +38,7 @@ export interface GateOptions {
   instanceRoot?: string;
   ledgerRoot?: string;
   repo?: string;
-  pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number };
+  pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string };
 }
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
@@ -134,7 +136,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     }
     : localCommand);
   const podSweep = async (tree: string, logDir: string | undefined, pod: NonNullable<GateOptions['pod']>): Promise<CommandResult> => {
-    const shardCount = pod.shards ?? 8;
+    const shardCount = pod.shards ?? 24;
     const deadlineSeconds = pod.shardTimeoutSeconds ?? 1200;
     if (!pod.pool || !Number.isSafeInteger(shardCount) || shardCount < 1
       || !Number.isSafeInteger(deadlineSeconds) || deadlineSeconds < 1) throw new Error('invalid pod sweep options');
@@ -156,11 +158,19 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     // bun 의 탐색은 숨은 디렉터리(`.x/`)를 안 연다 — 사람의 `bun test` 가 한 번도 안 돌리는 빈 픽스처가 조각에 혼자 남아 «Ran 0 tests» 를 «불완전»으로 읽었다(09-30 G1e 5번 조각).
     const assignable = files.filter((file) => !cdpPatterns.includes(file) && !file.split('/').some((part) => part.startsWith('.')));
     if (!assignable.length) throw new Error('sweep incomplete: no tests ran');
-    const shards = Array.from({ length: Math.min(shardCount, assignable.length) }, () => [] as string[]);
-    assignable.forEach((file, index) => shards[index % shards.length]!.push(file));
+    const durations = pod.durationSource ? readFileDurations(pod.durationSource) : new Map<string, number>();
+    const shards = planShards(assignable, durations, shardCount);
+    const known = assignable.filter((file) => durations.has(file)).length;
+    debug.log('release-loop.gate', 'pod-shard-plan', {
+      shards: shards.length, known, unknown: assignable.length - known,
+      maxPlannedSeconds: Math.max(...shards.map((shard) => shard.plannedSeconds)),
+      source: durations.size ? pod.durationSource : 'none',
+    });
     const ready = poolOverride ? undefined : checkPodPool(parsePodPool(pod.pool), defaultKubectl);
     if (ready && !ready.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
     const poolScheduler = poolOverride ?? new PodPoolScheduler(ready!.ready);
+    const bunCache = process.env[POD_BUN_CACHE_HOST_PATH]?.trim() || undefined;
+    const cachePrefix = bunCache ? `${podBunCacheVolume(bunCache).shellPrefix} ` : '';
     const jobLogTail = (job: PodCommandResult): string => {
       if (podLogTail) return podLogTail(job);
       for (const member of poolScheduler.members) {
@@ -172,7 +182,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     type ShardRun = { output: string; rc: number; pass: number; fail: number; errors: number; ran: number; files: number };
     type ShardReason = NonNullable<GateResult['stalledShards']>[number]['reason'];
     // 깊이 끝 OOM 조각은 «조각 전체»를 파일 하나씩 격리한다 — 상한 40 이면 나머지가 못 잰 채 남았다(09-30 ① 7번 조각 110 파일).
-    const isolationRemaining = shards.map((paths) => paths.length);
+    const isolationRemaining = shards.map((item) => item.files.length);
+    const estimated = (paths: string[]) => paths.reduce((sum, file) => {
+      const value = durations.get(file);
+      return sum + (value !== undefined && Number.isFinite(value) && value >= 0 ? value : unknownSeconds);
+    }, 0);
+    const knownTimes = assignable.map((file) => durations.get(file)).filter((value): value is number => value !== undefined && Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+    const unknownSeconds = knownTimes.length ? (knownTimes[Math.floor((knownTimes.length - 1) / 2)]! + knownTimes[Math.floor(knownTimes.length / 2)]!) / 2 : 1;
     const runShard = async (paths: string[], shard: number, depth = 0, branch = ''): Promise<{ runs: ShardRun[]; stalled: NonNullable<GateResult['stalledShards']> }> => {
       const ignores = cdpPatterns.filter((pattern) => paths.includes(pattern))
         .flatMap((pattern) => ['--path-ignore-patterns', pattern]);
@@ -189,10 +205,11 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       try {
         const job = await podCommand({
           pool: pod.pool, poolScheduler, clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds,
+          ...(bunCache ? { bunCache } : {}),
           // 실패 뒤 다시 도는 파일 하나짜리 Job 은 메모리 한도를 올린다 — 16Gi 에선 무거운 한 파일이 혼자서도 OOM 이었다(09-30 `unwired-exports`).
           ...(paths.length === 1 && depth >= 1 ? { memoryLimit: POD_ISOLATION_MEMORY_LIMIT } : {}),
           name: `gate-${randomUUID()}`,
-          command: ['bash', '-lc', `mkdir -p "$HOME/outbox"; (cd .. && cd repo && bun install && (cd apps/pwa && bun install) && ${args}) 2>&1 | tee "$HOME/outbox/shard.log"; echo \${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"`],
+          command: ['bash', '-lc', `mkdir -p "$HOME/outbox"; ${cachePrefix}(cd .. && cd repo && bun install && (cd apps/pwa && bun install) && ${args}) 2>&1 | tee "$HOME/outbox/shard.log"; echo \${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"`],
         });
         jobExitCode = job.exitCode;
         const logPath = join(job.artifactsDir, 'shard.log');
@@ -216,13 +233,13 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         const destination = join(logDir, `pod-${shard}${branch}.log`);
         if (output !== undefined) writeFileSync(destination, output, { mode: 0o600 });
         else rmSync(destination, { force: true });
-        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths }) + '\n', { mode: 0o600 });
+        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths, plannedSeconds: estimated(paths) }) + '\n', { mode: 0o600 });
         const junitDestination = join(logDir, `pod-${shard}${branch}.junit.xml`);
         if (junit !== undefined) writeFileSync(junitDestination, junit, { mode: 0o600 });
         else rmSync(junitDestination, { force: true });
       }
-      debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1 });
-      const clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+      debug.log('release-loop.gate', 'pod-shard', { shard, files: paths, durationMs, rc: rc ?? null, attempt: depth + 1, installSeconds: parseInstallSeconds(output ?? '') });
+      let clean = output?.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
       const ran = clean && lastMatch(clean, /Ran (\d+) tests? across (\d+) files?/);
       const passes = clean === undefined ? NaN : summaryCount(clean, 'pass');
       const fails = clean === undefined ? NaN : summaryCount(clean, 'fail');
@@ -243,6 +260,21 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           unattributedDetail = (error instanceof Error ? error.message : String(error)).split('\n', 1)[0]!.slice(0, 300);
         }
         if (reason === 'unattributed') namedFailures = [...clean.matchAll(/\(fail\)\s+.+?(?:\s+\[[\d.]+(?:ms|s)\])?\s*$/gm)].length;
+        // 콘솔 요약은 실패를 세는데 `(fail)` 이름 줄이 하나도 없으면 같은 조각의 junit 에서 이름을 가져온다
+        // (10-01 0.2.6 게이트: `--dots` 로 도는 한 파일 조각이 이름 없이 끝나 게이트 전체가 error 로 멈췄다).
+        if (reason === 'unattributed' && namedFailures === 0 && junit) {
+          const named = junitFailures(junit);
+          if (named.length === fails) {
+            const patched = `${clean}\n${named.map((id) => { const cut = id.indexOf(' > '); return `${id.slice(0, cut)}:\n(fail) ${id.slice(cut + 3)}`; }).join('\n')}\n`;
+            try {
+              if (failuresOf({ rc, output: patched }, `pod-${shard} shard`).failures.length === fails) {
+                clean = patched;
+                reason = undefined;
+                debug.log('release-loop.gate', 'pod-shard-junit-attribution', { shard, files: paths, failures: named });
+              }
+            } catch { /* 그래도 못 맞추면 원래대로 멈춘다 */ }
+          }
+        }
       }
       if (reason) {
         // 깊이 2 에서 «이름 없는 실패»·«불완전»도 파일 단위로 가른다 — 아니면 149파일 조각의 실패 하나가 끝까지 주인 없이 남는다(09-30 G1e 7번 조각: 요약 28 · 이름 27).
@@ -279,7 +311,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         ran: Number(ran![1]), files: Number(ran![2]) }], stalled: [] };
     };
     // 모든 조각이 끝난 뒤 판정한다 — 한 조각의 예외로 먼저 돌아가면 다른 Pod 가 도는 채로 정리가 시작된다(#22002 리뷰 R3).
-    const settled = await Promise.allSettled(shards.map((paths, shard) => runShard(paths, shard)));
+    const settled = await Promise.allSettled(shards.map((item, shard) => runShard(item.files, shard)));
     const rejected = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
     if (rejected) throw rejected.reason;
     const results = settled.flatMap((result) => result.status === 'fulfilled' ? [result.value] : []);
@@ -433,7 +465,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       || (opts.baselineVersion && !versionPattern.test(opts.baselineVersion))
       || (opts.baselineCommit && !sha.test(opts.baselineCommit))) throw new Error('invalid commit or version');
     if (!opts.baselineVersion) throw new Error('previous release version required (--baseline-version)');
-    if (opts.pod && (!opts.pod.pool || !Number.isSafeInteger(opts.pod.shards ?? 8) || (opts.pod.shards ?? 8) < 1
+    if (opts.pod && (!opts.pod.pool || !Number.isSafeInteger(opts.pod.shards ?? 24) || (opts.pod.shards ?? 24) < 1
       || !Number.isSafeInteger(opts.pod.shardTimeoutSeconds ?? 1200) || (opts.pod.shardTimeoutSeconds ?? 1200) < 1)) throw new Error('invalid pod sweep options');
     if (opts.remote && !/^(?:[\w.-]+@)?[\w.-]+$/.test(opts.remote)) throw new Error('invalid ssh host');
     if (opts.remote) {
@@ -472,7 +504,8 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     trees.push(cutTree);
     await runner.add(cutTree, opts.commit);
     for (const dir of [cutTree, join(cutTree, 'apps/pwa')]) check(await runner.command('bun', ['install'], dir), `bun install ${dir}`);
-    const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', 'cut'), opts.pod);
+    const cutRun = await runner.sweep(cutTree, join(root, 'release', opts.version, 'gate-logs', 'cut'),
+      opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut') } : undefined);
     const cut = failuresOf(cutRun, 'cut sweep');
     cutFailures = cut;
     const baseSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);

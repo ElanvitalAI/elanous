@@ -14,6 +14,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { BROLL } from './recipes/broll.js';
 import { CHARACTER } from './recipes/character.js';
+import { EXPLAINER } from './recipes/explainer.js';
 import { FILM } from './recipes/film.js';
 import { FREE_LINE } from './recipes/free-line.js';
 import { HYPERFRAMES } from './recipes/hyperframes.js';
@@ -21,8 +22,8 @@ import { UPSTREAM } from './recipes/upstream.js';
 import { VLOG } from './recipes/vlog.js';
 import { UNOBSERVED, type Recipe, type RecipeCtx } from './recipes/types.js';
 
-/** ⛔ 순서가 뜻이다 — 같은 이름이면 뒤가 이긴다. HYPERFRAMES 는 새 이름뿐이라 기존 키를 덮지 않는다. */
-export const ALL_RECIPES: Readonly<Record<string, Recipe>> = { ...UPSTREAM, ...FREE_LINE, ...VLOG, ...FILM, ...CHARACTER, ...HYPERFRAMES, ...BROLL };
+/** ⛔ 순서가 뜻이다 — 같은 이름이면 뒤가 이긴다. HYPERFRAMES · EXPLAINER 는 기존 키를 덮지 않는다. */
+export const ALL_RECIPES: Readonly<Record<string, Recipe>> = { ...UPSTREAM, ...FREE_LINE, ...VLOG, ...FILM, ...CHARACTER, ...HYPERFRAMES, ...BROLL, ...EXPLAINER };
 
 export interface GraphSpecLike {
   readonly graph_id: string;

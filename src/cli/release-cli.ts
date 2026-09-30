@@ -22,7 +22,8 @@ import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { userConfigPath } from '../user-config.js';
-import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus } from '../release-loop/checklist.js';
+import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition } from '../release-loop/checklist.js';
+import { writeStdoutJson } from './stdout-json.js';
 
 export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
 const SEMVER = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -466,11 +467,11 @@ function checklistVersion(input: string | undefined, codenames: Record<string, s
   return resolved;
 }
 
-function checklistOutput(v: string, codenames: Record<string, string>, mode: 'list' | 'status', json?: boolean): void {
+async function checklistOutput(v: string, codenames: Record<string, string>, mode: 'list' | 'status', json?: boolean): Promise<void> {
   const data = listChecklist(v);
   const summary = summarizeChecklist(data);
   const result = { ...data, codename: codenames[v] ?? '', ...summary };
-  if (json) { console.log(JSON.stringify(result)); return; }
+  if (json) { await writeStdoutJson(`${JSON.stringify(result)}\n`); return; }
   console.log(`${v}${result.codename ? ` (${result.codename})` : ''} · 공개 ${data.released || '없음'} · 개발 ${data.dev}`);
   if (mode === 'list') {
     for (const item of data.items) console.log(`${({ green: '🟢', yellow: '🟡', red: '🔴', done: '✅' } as const)[item.status]} ${item.id} ${item.title}${item.owner ? ` · ${item.owner}` : ''}`);
@@ -492,26 +493,28 @@ export function registerReleaseCommands(program: Command): void {
     return { version: checklistVersion(opts.version, codenames), codenames, json: opts.json };
   };
   const withContext = (cmd: Command) => cmd.option('--version <v>', '판 또는 별칭').option('--json', '결과 JSON');
-  withContext(checklist.command('list').description('모든 칸')).action((_opts: unknown, cmd: Command) => {
+  withContext(checklist.command('list').description('모든 칸')).action(async (_opts: unknown, cmd: Command) => {
     const { version, codenames, json } = context(cmd);
-    checklistOutput(version, codenames, 'list', json);
+    await checklistOutput(version, codenames, 'list', json);
   });
-  withContext(checklist.command('status').description('상태 요약')).action((_opts: unknown, cmd: Command) => {
+  withContext(checklist.command('status').description('상태 요약')).action(async (_opts: unknown, cmd: Command) => {
     const { version, codenames, json } = context(cmd);
-    checklistOutput(version, codenames, 'status', json);
+    await checklistOutput(version, codenames, 'status', json);
   });
   withContext(checklist.command('add <id> <title>').description('칸 추가')).option('--owner <owner>', '담당').action((id: string, title: string, opts: { owner?: string }, cmd: Command) => {
     const { version, json } = context(cmd);
     const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}) });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
-  withContext(checklist.command('set <id>').description('칸 상태·근거·담당 갱신'))
+  withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
     .option('--status <status>', 'green|yellow|red|done').option('--evidence <evidence>', '근거').option('--owner <owner>', '담당')
-    .action((id: string, opts: { status?: string; evidence?: string; owner?: string }, cmd: Command) => {
+    .option('--disposition <disposition>', 'move|known-issue|block')
+    .action((id: string, opts: { status?: string; evidence?: string; owner?: string; disposition?: string }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new Error(`잘못된 상태: ${opts.status}`);
-      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined) throw new Error('갱신할 칸을 지정하라');
-      const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new Error(`잘못된 처분: ${opts.disposition}`);
+      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined) throw new Error('갱신할 칸을 지정하라');
+      const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}) }, process.env.ELANOUS_TRACK || 'cli');
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 갱신`);
     });
   withContext(checklist.command('rm <id>').description('칸 삭제')).action((id: string, _opts: unknown, cmd: Command) => {

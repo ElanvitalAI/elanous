@@ -7,10 +7,10 @@
     "ai.elanous": {
       "bundle": ["skills/explainer-video", { "from": "graphs/video/explainer-line.yaml", "as": "graphs/explainer-line.yaml" }],
       "graphs": ["graphs/explainer-line.yaml"],
-      "nodes": ["./nodes/explainer.yaml"],
+      "nodes": ["./nodes/explainer.yaml", "./nodes/field-reel.yaml"],
       "capabilities": ["fs:workdir", "proc:node", "proc:bun", "proc:npx", "proc:ffmpeg", "net:api.elevenlabs.io", "net:cdn.jsdelivr.net", "secret:elevenlabs"],
       "connectors": [
-        { "id": "elevenlabs", "kind": "api-key", "userConfig": [{ "key": "ELEVENLABS_API_KEY", "label": "ElevenLabs API key", "secret": true, "env": "ELEVENLABS_API_KEY" }] }
+        { "id": "elevenlabs", "kind": "api-key", "userConfig": [{ "key": "ELEVENLABS_API_KEY", "label": "ElevenLabs API key (optional — without it a draft system voice is used on macOS)", "secret": true, "env": "ELEVENLABS_API_KEY" }] }
       ],
       "requires": { "tools": ["node", "bun", "npx", "ffmpeg"] },
       "pricing": { "model": "free" },

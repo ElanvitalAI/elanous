@@ -18,7 +18,54 @@ interface GraphApprovalItem {
   recent: Array<{ nodeId: string; ok: boolean; outcome?: string; summary?: string }>;
 }
 
+/** One decision this daemon applied through `POST /v1/graph-approvals/:graphId/:runId`. */
+interface GraphApprovalDecided {
+  graphId: string;
+  runId: string;
+  nodeId: string;
+  decision: 'approved' | 'rejected';
+  decidedAt: string;
+}
+
+export const GRAPH_DECISION_RING_CAPACITY = 100;
+export const GRAPH_DECISION_RING_MAX_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * Recent decisions, in memory. The undecided list drops a run the moment it is decided, so
+ * another device (Fold ↔ iPhone) could only see «gone» — this ring lets it say «승인됨/거절됨».
+ * ⚠️ In-memory: a daemon restart forgets it, and a decision made outside this process
+ * (`elanous graph approve` CLI) is not recorded — clients keep a «decided elsewhere» fallback.
+ */
+export function createGraphDecisionRing(opts: { capacity?: number; maxAgeMs?: number; now?: () => number } = {}) {
+  const capacity = opts.capacity ?? GRAPH_DECISION_RING_CAPACITY;
+  const maxAgeMs = opts.maxAgeMs ?? GRAPH_DECISION_RING_MAX_AGE_MS;
+  const now = opts.now ?? Date.now;
+  let entries: Array<{ atMs: number; record: GraphApprovalDecided }> = [];
+  const prune = () => {
+    const cutoff = now() - maxAgeMs;
+    entries = entries.filter((entry) => entry.atMs > cutoff).slice(-capacity);
+  };
+  return {
+    record(decision: Omit<GraphApprovalDecided, 'decidedAt'>): void {
+      const atMs = now();
+      entries.push({ atMs, record: { ...decision, decidedAt: new Date(atMs).toISOString() } });
+      prune();
+    },
+    /** Newest first, pruned by age and capacity. */
+    list(): GraphApprovalDecided[] {
+      prune();
+      return entries.map((entry) => entry.record).reverse();
+    },
+  };
+}
+
+export type GraphDecisionRing = ReturnType<typeof createGraphDecisionRing>;
+
+const defaultDecisionRing = createGraphDecisionRing();
+
 interface GraphApprovalsDeps {
+  /** Injected in tests; production shares one per-process ring. */
+  decisions?: GraphDecisionRing;
   authorize?: (request: Request) => boolean;
   /** Credential the request carries, checked independently of same-origin (`bearerCredential`).
    * A decision needs a bearer token: same-origin alone is not trusted because behind
@@ -90,7 +137,8 @@ export async function handleGraphApprovals(req: Request, deps: GraphApprovalsDep
   if (!deps.authorize?.(req)) return jsonResponse({ error: 'unauthorized' }, 401);
   if (pathname === GRAPH_APPROVALS_PATH) {
     if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
-    return jsonResponse({ items: list(deps.root ?? effectiveInstanceRoot()) });
+    // ⭐ `items` is unchanged; `decided` is additive (newest first) for other devices' cards.
+    return jsonResponse({ items: list(deps.root ?? effectiveInstanceRoot()), decided: (deps.decisions ?? defaultDecisionRing).list() });
   }
   if (req.method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
   const authReason = deps.authReason?.(req);
@@ -120,6 +168,7 @@ export async function handleGraphApprovals(req: Request, deps: GraphApprovalsDep
     if (error instanceof Error && error.message.startsWith('run is not awaiting an undecided approval:')) return jsonResponse({ error: 'already-decided' }, 409);
     throw error;
   }
+  (deps.decisions ?? defaultDecisionRing).record({ graphId, runId, nodeId, decision });
   debug.log('approvals.graph', 'decided', { graphId, runId, nodeId, decision, by: `pwa:${authReason}` });
   return jsonResponse({ graphId, runId, decision });
 }

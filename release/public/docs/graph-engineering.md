@@ -97,7 +97,7 @@ A run can execute on your machine or on a remote pod. The **run contract** decid
 
 ## What ships today, what is in progress
 
-| | Status (✅ in the latest release · 🟡 on main, in the next release · 🔄 in progress · 📋 designed) |
+| | Status (✅ in the latest release · ✅ in v0.2.5 · 🔄 in progress · 📋 designed) |
 |---|---|
 | Harness runs (implement · research · document · operate templates) | ✅ ships — the orchestrator drives them; the graph declaration is checked against every step |
 | Graph runner with approval pauses and resume (`elanous graph run` · `graph approve` · `graph run --resume`) | ✅ ships |

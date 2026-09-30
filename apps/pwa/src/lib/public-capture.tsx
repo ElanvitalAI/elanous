@@ -14,5 +14,6 @@ export function usePublicCapture(): boolean {
 
 /** Renders nothing in public capture — for money/usage chips (USD · credits) that must not appear in public footage. */
 export function HideInPublicCapture({ children }: { children: ReactNode }) {
-  return usePublicCapture() ? null : <>{children}</>;
+  const hidden = usePublicCapture();
+  return hidden ? null : <>{children}</>;
 }

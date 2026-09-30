@@ -1,0 +1,17 @@
+kind: field-reel
+graph: workflow
+title: 현장 즉석 영상
+description: 폰 사진·짧은 영상 폴더로 세로 30~60초 현장 영상(자막 · CI)을 만든다
+inputs:
+  type: object
+  required: [folder]
+  properties:
+    folder: { type: string, title: 사진·영상 폴더 (예 ~/.elanous/field/<행사>/) }
+    title: { type: string, title: 제목 }
+    sub: { type: string, title: 부제(날짜 · 장소) }
+outputs:
+  type: object
+  properties:
+    video: { type: string }
+run:
+  skill: { name: explainer-video, prompt: "현장 영상(field reel): 폴더 {{inputs.folder}} · 제목 {{inputs.title}} · 부제 {{inputs.sub}} — engine/reel.sh 로 만든다" }

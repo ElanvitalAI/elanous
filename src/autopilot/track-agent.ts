@@ -6,7 +6,7 @@ import { debug, redactSecretText } from '../debug/log.js';
 import { getOrCreatePersonaSession } from '../session/index.js';
 import { getUserConfig } from '../user-config.js';
 import { decideBudget, readBudgetInputsLive } from '../self-implement/budget-gate.js';
-import { loadTrackRegistry } from './mission-phase-track.js';
+import { findTrack } from './mission-phase-track.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 export type TrackAgentInput = { missionId: string; taskId: string; title: string; prompt: string; track: string };
@@ -45,7 +45,7 @@ const forbidden = /\b(?:delete|remove|deploy|publish|release|restart|reboot|merg
 let running = 0;
 
 function context(input: TrackAgentInput, repo: string): string {
-  const track = loadTrackRegistry().find(({ id }) => id === input.track);
+  const track = findTrack(input.track);
   if (!track) throw new Error('unknown track');
   const docs = resolve(repo, 'docs');
   let handoff = '';
@@ -94,7 +94,7 @@ export async function decideTrackAction(input: TrackAgentInput, deps: RunnerDeps
 export async function executeTrackAction(decision: TrackAgentDecision, input: TrackAgentInput, deps: RunnerDeps = {}): Promise<TrackAgentResult> {
   if (decision.action !== 'say') return { status: 'held', detail: decision.reason ?? '사람 확인' };
   if (forbidden.test(`${input.title}\n${input.prompt}`)) return { status: 'held', detail: '금지 작업 — 사람 확인' };
-  if (!loadTrackRegistry().some(({ id }) => id === input.track)) return { status: 'held', detail: '트랙 미정 — 사람 확인' };
+  if (!findTrack(input.track)) return { status: 'held', detail: '트랙 미정 — 사람 확인' };
   try {
     const checkBudget = deps.checkBudget ?? (async () => {
       const action = decideBudget(await readBudgetInputsLive()).action;

@@ -26,6 +26,7 @@ import { CLI_HARNESS_DOGFOOD_ENTRANCE, CLI_HARNESS_ORCHESTRATE_ENTRANCE, describ
 import { collectCommandEntrances, renderCommandEntrances } from './self-dev/entrance-inventory.js';
 import { isGoalAuthorFileName } from './self-implement/goal-document.js';
 import { DEV_PIPELINE_SINK_SURFACE } from './self-implement/self-cli-sink-surface.js';
+import { registerPrivateLedgerCommands } from './cli/private-ledger-commands.js';
 import { applyTestStateDirFlagFromArgv } from './cli/test-state-dir-flag.js';
 import { applyTestFlagFromArgv, observeTestFlagOwnership, uncoveredTestFlagPaths, staleTestFlagPaths } from './cli/test-flag.js';
 import { registerPtyTakeoverCommands } from './cli/pty-takeover-cli.js';
@@ -5429,30 +5430,7 @@ program.command('ad [input...]')
   });
 
 registerDocsCommands(program);
-// Private local decision ledger follows the same JS-only dispatch path as directives.
-if (existsSync(resolve(import.meta.dir, 'cli/decisions-cli.ts')) || existsSync(resolve(import.meta.dir, 'cli/decisions-cli.js'))) {
-  program.command('decisions').description('대표 결정 로컬 원장').allowUnknownOption().allowExcessArguments(true)
-    .action(async (_opts: unknown, command: Command) => {
-      try { await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('decisions'); }
-      catch { /* Logging must not prevent recording a decision. */ }
-      const privateDecisionsModule: string = './cli/decisions-cli.js';
-      const { registerDecisionsCommands } = await import(privateDecisionsModule) as { registerDecisionsCommands: (program: Command) => void };
-      const privateProgram = new Command();
-      registerDecisionsCommands(privateProgram);
-      await privateProgram.parseAsync(['decisions', ...command.args], { from: 'user' });
-    });
-}
-// Private command is absent from the public export; JS-only distributions still register it.
-if (existsSync(resolve(import.meta.dir, 'cli/directives-cli.ts')) || existsSync(resolve(import.meta.dir, 'cli/directives-cli.js'))) {
-  program.command('directives').description('대표 지시 로컬 색인·검색').allowUnknownOption().allowExcessArguments(true)
-    .action(async (_opts: unknown, command: Command) => {
-      const privateDirectivesModule: string = './cli/directives-cli.js';
-      const { registerDirectivesCommands } = await import(privateDirectivesModule) as { registerDirectivesCommands: (program: Command) => void };
-      const privateProgram = new Command();
-      registerDirectivesCommands(privateProgram);
-      await privateProgram.parseAsync(['directives', ...command.args], { from: 'user' });
-    });
-}
+registerPrivateLedgerCommands(program);
 registerFleetCommands(program);
 
 // ── ops (운영 관측 — 지금 뭐 도나·이상 없나·상태 전이) ──
@@ -9933,6 +9911,22 @@ nexusCmd
       console.error(`systemd: uninstall failed: ${res.reason}`);
       process.exit(1);
     }
+  });
+
+// 휴대폰 앱 온보딩 — 링크 하나(⊕ QR)로 이 Mac 의 넥서스에 붙인다(대표 2026-09-30 · 아이폰 첫 화면 단순화).
+program
+  .command('phone')
+  .description('Connect the phone app to this Mac')
+  .command('link')
+  .description('Print a one-tap connect link (and a QR code) for the Elanous phone app')
+  .option('--simulator', 'Use the loopback address (the simulator on this Mac) instead of the tailnet address — `--local` is taken by the global remote flag')
+  .option('--android [serial]', 'Hand the link straight to a USB-connected Android phone (adb reverse + am start · the token is never printed)')
+  .option('--temp', 'Use a short-lived token instead of the owner token')
+  .option('--ttl <duration>', 'Lifetime for --temp (max 24h)', '24h')
+  .option('--no-qr', 'Do not print a QR code')
+  .action(async (opts: { simulator?: boolean; android?: boolean | string; temp?: boolean; ttl: string; qr: boolean }) => {
+    const { runPhoneLink } = await import('./cli/phone-link.js');
+    process.exitCode = await runPhoneLink({ local: opts.simulator, android: opts.android, temp: opts.temp, ttl: opts.ttl, qr: opts.qr });
   });
 
 // ── ACP — Agent Client Protocol (claude-code, codex, ...) ──

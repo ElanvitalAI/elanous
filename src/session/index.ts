@@ -434,12 +434,20 @@ function readIndex(root: string = sessionRoot()): SessionMeta[] {
   }
 }
 
-function writeIndex(entries: SessionMeta[], root: string = sessionRoot()): void {
+// 여러 프로세스(`elanous ask` 동시 실행 등)가 같은 목록을 «읽고-고치고-통째로 쓰기» 한다.
+// 쓰기 직전 잠금 안에서 디스크의 최신 목록을 다시 읽어 id 로 합치고, 임시 파일 이름은 프로세스마다 다르게 한다
+// (10-01 MK 재현: 고정 `index.json.tmp` → 한쪽 ENOENT · 덮어쓰기로 남의 세션이 목록에서 사라짐).
+function writeIndex(entries: SessionMeta[], root: string = sessionRoot(), removed: Iterable<string> = []): void {
   ensureRoots(root);
   const p = indexPath(root);
-  const tmp = p + '.tmp';
-  writeFileSync(tmp, JSON.stringify(entries, null, 2) + '\n', 'utf-8');
-  renameSync(tmp, p);
+  withDirLock(join(root, '.index.lock'), INDEX_LOCK_TIMEOUT_MS, () => {
+    const mine = new Set(entries.map((m) => m.id));
+    const gone = new Set(removed);
+    const peers = readIndex(root).filter((m) => !mine.has(m.id) && !gone.has(m.id));
+    const tmp = `${p}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+    writeFileSync(tmp, JSON.stringify([...peers, ...entries], null, 2) + '\n', 'utf-8');
+    renameSync(tmp, p);
+  });
 }
 
 // ── Tier 1 Phase 3 — listener primitive ──────────────────────────────
@@ -661,7 +669,7 @@ export function rewriteSessionMessages(
   const body = messages
     .map(m => JSON.stringify(m.turn_id !== undefined ? m : { ...m, turn_id: mintTurnUri() }))
     .join('\n');
-  const tmp = file + '.tmp';
+  const tmp = `${file}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
   writeFileSync(tmp, body ? body + '\n' : '', 'utf-8');
   renameSync(tmp, file);
 
@@ -800,8 +808,13 @@ function residentSessionLockPath(root: string): string {
 
 function withResidentSessionLock<T>(root: string, action: () => T): T {
   ensureRoots(root);
-  const lock = residentSessionLockPath(root);
-  const deadline = Date.now() + RESIDENT_SESSION_LOCK_TIMEOUT_MS;
+  return withDirLock(residentSessionLockPath(root), RESIDENT_SESSION_LOCK_TIMEOUT_MS, action);
+}
+
+const INDEX_LOCK_TIMEOUT_MS = 10_000;
+
+function withDirLock<T>(lock: string, timeoutMs: number, action: () => T): T {
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     try {
       mkdirSync(lock);
@@ -814,7 +827,7 @@ function withResidentSessionLock<T>(root: string, action: () => T): T {
           continue;
         }
       } catch { continue; }
-      if (Date.now() >= deadline) throw new Error(`timed out acquiring resident session lock for ${root}`);
+      if (Date.now() >= deadline) throw new Error(`timed out acquiring lock ${lock}`);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
       void error;
     }
@@ -855,7 +868,7 @@ export function deleteSession(id: string, root: string = sessionRoot()): boolean
   const before = idx.length;
   const next = idx.filter(m => m.id !== id);
   if (next.length === before) return false;
-  writeIndex(next, root);
+  writeIndex(next, root, [id]);
   // Clear active marker if it pointed at the deleted session.
   if (getActiveSessionId() === id) clearActiveSessionId();
   return true;
@@ -876,7 +889,7 @@ export function deleteSessions(ids: string[], root: string = sessionRoot()): num
   const idx = readIndex(root);
   const next = idx.filter(m => !set.has(m.id));
   const removed = idx.length - next.length;
-  if (removed > 0) writeIndex(next, root);
+  if (removed > 0) writeIndex(next, root, set);
   const active = getActiveSessionId();
   if (active && set.has(active)) clearActiveSessionId();
   return removed;

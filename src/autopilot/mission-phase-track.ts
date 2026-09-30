@@ -1,7 +1,17 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-type TrackEntry = { id: string; mark: string; owns: string[] };
+type TrackEntry = { id: string; mark: string; owns: string[]; alias?: string };
+
+// Seat ids became two letters on 09-30 (#22085) with the old one-letter id kept as `alias`.
+// A track named either way is the same seat — posts and inputs still carry the old letter during the switch.
+export function findTrack(idOrAlias: string, registry: TrackEntry[] = loadTrackRegistry()): TrackEntry | undefined {
+  return registry.find((track) => track.id === idOrAlias || track.alias === idOrAlias);
+}
+export function trackPostIds(idOrAlias: string, registry: TrackEntry[] = loadTrackRegistry()): string[] {
+  const track = findTrack(idOrAlias, registry);
+  return [...new Set([idOrAlias, ...(track ? [track.id, ...(track.alias ? [track.alias] : [])] : [])])];
+}
 
 export function loadTrackRegistry(path = resolve(import.meta.dir, '../../scripts/coord-tracks.json')): TrackEntry[] {
   try {

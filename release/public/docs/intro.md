@@ -21,4 +21,12 @@ Work that repeats — every morning, on every new request — runs as [loop agen
 
 Skills and graphs come as [plugins](plugins.md) from a signed marketplace — the same packages install in Codex; you can [build one](build-a-plugin.md).
 
+## The name and the mark — élan, and nous
+
+<img src="https://elanous.ai/media/brand/elanous-180.png" width="96" alt="Elanous mark" />
+
+The red point at the center is *élan* — the drive to move on its own. The three white blades around it are *nous* — the mind that brings order. They turn one way — observe, understand, heal — widening a little with every turn. A spark meets a mind and keeps widening itself. That is Elanous.
+
+*Elanous* joins Bergson's *élan vital* — the vital impulse that gave Elanvital AI its name — with Anaxagoras' *nous*, the mind that sets the world turning.
+
 Start with [Install](install.md) and the [Quickstart](quickstart.md).

@@ -78,6 +78,25 @@ describe('runNexusIosBind · L2 helper', () => {
     ]);
   });
 
+  test('앱 컨테이너 도메인이 있으면 전역 bundle 도메인이 아니라 그 plist 에 쓴다 (앱이 읽는 곳)', () => {
+    const spawn = captureSpawn();
+    const domain = '/sim/data/Containers/Data/Application/X/Library/Preferences/com.elanvitalai.elanous.ios';
+    const result = runNexusIosBind({
+      spawnSyncFn: spawn.fn as never,
+      resolveDomainFn: () => domain,
+      readRuntimeFn: () => makeRuntime({ httpHost: '127.0.0.1', httpPort: 31415 }),
+      readTokenFn: () => 'test-token-1234567890',
+    });
+    expect(result.ok).toBe(true);
+    expect(spawn.calls).toHaveLength(3);
+    for (const call of spawn.calls) {
+      expect(call.args[5]).toBe(domain);
+      expect(call.args).not.toContain('com.elanvitalai.elanous.ios');
+    }
+    expect(result.message).toContain('앱 컨테이너');
+    expect(result.message).not.toContain('test-token-1234567890');
+  });
+
   test('runtime sidecar 부재 시 해석기 주소의 host/port 를 inject', () => {
     setResolveDaemonEndpointForTest(() => ({
       baseUrl: 'http://127.0.0.1:31432',

@@ -12,6 +12,36 @@
 elanous graph run /absolute/path/to/installed/job-coach/graphs/report-enterprise.yaml --input '{"interview":"/private/path/to/fictional-enterprise.md"}' --json
 ```
 
+### 기업 모드 샘플 입력 (가상 정보만)
+
+다음은 **가상 인물** 민서 하와 **가상 회사** 푸른달 스튜디오의 예시다. 이미지 경로는 실제 사진이 아닌 플레이스홀더이며, 인터뷰 안의 참고용 표기일 뿐이다. 그래프 입력 필드는 `interview` 하나로, 이미지 파일을 읽거나 전송하는 입력은 없다. 비공개 작업 디렉터리에 `fictional-enterprise.md`로 저장한 뒤 위 명령의 `interview` 경로를 그 파일의 절대 경로로 바꾼다.
+
+```markdown
+## 기업 개요
+푸른달 스튜디오 (가상 회사). 이미지 참고 경로: /placeholder/images/fictional-company.png
+
+## 교육 대상
+민서 하 (가상 인물), 문서 기획 담당자
+
+## 현업 과제
+가상 행사 안내 문서의 기획
+
+## 교육 목표
+행사 안내 문서를 요구사항에 맞게 기획한다
+
+## 현재 역량
+문서 작성 경험 (자기보고)
+
+## 교육 제약
+예산과 승인 여부 미확인
+```
+
+### 입력·출력과 프라이버시 경계
+
+입력은 기업 모드 인터뷰 Markdown **파일의 비공개 절대 경로**를 담은 `--input '{"interview":"/private/path/to/fictional-enterprise.md"}'`이다. 위 여섯 `##` 섹션이 필요하다. 실제 직원 이름·사진·인사정보·사내 기밀을 샘플, 명령 인자 또는 공개 저장소에 넣지 않는다. 실제 인터뷰를 사용할 경우에도 민감 정보를 제거하고 접근 제한된 저장소에서만 실행한다. 그래프 러너는 입력·노드 stdout을 런 상태와 컨텍스트 JSON에 저장하므로 **파일 경로만 인자로 넘겨도 보고서와 런 상태에는 인터뷰에서 파생된 직무·역량이 남는다**. 파일 경로가 개인정보 비노출이나 무저장을 보장하는 것은 아니다.
+
+출력은 CLI의 상태 JSON(`statePath`와 `done`/`failed`) 및 그 상태 경로와 같은 디렉터리의 `<run-id>/report.md`다. 보고서는 아래 일곱 섹션으로 구성된다. NCS 조회가 실패하면 `failed`로 끝나며 확인되지 않은 과정·URL 및 내부 승인 여부는 `미확인`으로 남긴다. **No-send boundary:** 이 그래프 실행은 보고서를 로컬에 작성하는 경로이며 메신저·이메일로 보고서를 보내거나 마켓에 게시하는 단계가 없다. `--no-send` 플래그를 지원한다고 가정하지 않는다. 다만 NCS API 조회 및 외부 과정 조사는 네트워크 요청이므로 오프라인·무외부전송 실행이 아니다. 보고서 배포나 마켓 게시/시장 출시는 이 플러그인 README의 범위 밖이다.
+
 기업 보고서는 `기업 개요 및 교육 대상`, `교육 니즈`, `직무·과제 및 NCS`, `AI 적합성`, `역량 진단`, `교육 로드맵`, `교육 명세·운영 경로` 순서다. NCS 조회에 실패하면 매칭을 발명하지 않고 런을 실패로 종료한다. `run-report` 스킬은 개인 보고서 진입이며 기업 모드는 다섯 개 기업 스킬(`enterprise-needs`, `enterprise-task-analysis`, `enterprise-ai-fit`, `enterprise-competency`, `enterprise-roadmap`)과 기업 그래프를 이용한다.
 
 ## 실행

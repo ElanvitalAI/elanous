@@ -31,7 +31,7 @@ describe('mission phase track', () => {
 
   test('punctuated English ownership keywords still match case-insensitively', () => {
     expect(inferPhaseTrack('B-ROLL', registry)).toMatchObject({ track: 'MK', reason: 'keyword' });
-    expect(inferPhaseTrack('ELANOUS.AI', registry)).toMatchObject({ track: 'UX', reason: 'keyword' });
+    expect(inferPhaseTrack('ELANOUS.AI', registry)).toMatchObject({ track: 'MK', reason: 'keyword' });
     expect(inferPhaseTrack('UI', registry)).toMatchObject({ track: 'UX', reason: 'keyword' });
   });
 

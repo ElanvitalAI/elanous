@@ -40,8 +40,8 @@ describe('track courier', () => {
       const routed = await routeMissionPhases(mission.id, { store, config, now, listComments: comments });
       expect(routed[1]?.prompt).toBe('영상 티저');
       expect(routed.map(({ taskId, track, route, reason }) => ({ taskId, track, route, reason }))).toEqual([
-        { taskId: tasks[0]!.id, track: 'F', route: 'human', reason: '12분 전 발신' },
-        { taskId: tasks[1]!.id, track: 'T', route: 'agent', reason: '90분 무발신' },
+        { taskId: tasks[0]!.id, track: 'UX', route: 'human', reason: '12분 전 발신' },
+        { taskId: tasks[1]!.id, track: 'MK', route: 'agent', reason: '90분 무발신' },
         { taskId: tasks[2]!.id, track: null, route: 'unassigned', reason: 'none' },
       ]);
       expect(await trackAlive('T', { now, config, listComments: comments })).toEqual({ alive: false, lastPostAt: new Date(now - 90 * 60_000).toISOString(), reason: 'stale' });
@@ -53,8 +53,8 @@ describe('track courier', () => {
     const { store, mission } = fixture();
     try {
       const routed = await routeMissionPhases(mission.id, { store, config, now, listComments: () => { throw new Error('offline'); } });
-      expect(routed[0]).toMatchObject({ track: 'F', route: 'human', reason: 'unmeasured' });
-      expect(routed[1]).toMatchObject({ track: 'T', route: 'human', reason: 'unmeasured' });
+      expect(routed[0]).toMatchObject({ track: 'UX', route: 'human', reason: 'unmeasured' });
+      expect(routed[1]).toMatchObject({ track: 'MK', route: 'human', reason: 'unmeasured' });
     } finally { store.close(); }
   });
 
@@ -84,7 +84,7 @@ describe('track courier', () => {
       decideTrackAction: async (input: { taskId: string; prompt: string; missionId: string; track: string }) => {
         expect(input.prompt).toBe('영상 티저');
         expect(input.missionId).toBe(mission.id);
-        expect(input.track).toBe('T');
+        expect(input.track).toBe('MK');
         return { action: 'say' as const, reason: input.taskId };
       },
       executeTrackAction: async (decision: { reason?: string }) => {
@@ -102,7 +102,7 @@ describe('track courier', () => {
       expect(executed).toEqual([tasks[1]!.id]);
       finish({ status: 'launched', detail: 'detached harness say' });
       for (let i = 0; i < 10 && sent.length < 2; i++) await Bun.sleep(1);
-      expect(sent[1]).toBe(`**[E]** {{TS}} T · ${tasks[1]!.id} · launched · detached harness say`);
+      expect(sent[1]).toBe(`**[E]** {{TS}} MK · ${tasks[1]!.id} · launched · detached harness say`);
     } finally { store.close(); }
   });
 
@@ -123,8 +123,8 @@ describe('track courier', () => {
       for (let i = 0; i < 20 && sent.length < 3; i++) await Bun.sleep(1);
       expect(decisions).toEqual([tasks[1]!.id, extra.id]);
       expect(sent).toHaveLength(3);
-      expect(sent[1]).toBe(`**[E]** {{TS}} T · ${tasks[1]!.id} · launched`);
-      expect(sent[2]).toBe(`**[E]** {{TS}} T · ${extra.id} · launched`);
+      expect(sent[1]).toBe(`**[E]** {{TS}} MK · ${tasks[1]!.id} · launched`);
+      expect(sent[2]).toBe(`**[E]** {{TS}} MK · ${extra.id} · launched`);
     } finally { store.close(); }
   });
 

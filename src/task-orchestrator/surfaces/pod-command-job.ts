@@ -11,6 +11,7 @@ import { getUserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { collectPodArtifacts } from './pod-artifact-return.js';
+import { podBunCacheVolume } from './pod-bun-cache.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
 import { readSkillEnvFiles } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
@@ -76,6 +77,7 @@ export interface PodCommandJobInput {
   /** 저장소를 clone 한다 — 비공개 저장소라 GitHub 토큰이 Secret 으로 간다(명시 opt-in). 기본은 clone 없이 `~/work` 에서 이미지의 `elanous` 로 돈다. */
   clone?: boolean;
   hostMirror?: string;
+  bunCache?: string;
   /** 컨테이너 메모리 한도(기본 16Gi) — 게이트가 파일 하나 격리 Job 에 올린다. */
   memoryLimit?: string;
   source?: PodSource;
@@ -94,6 +96,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(name)) throw new Error(`pod command skill name rejected: ${name}`);
   }
   const grok = o.llm === 'grok';
+  const bunCache = o.bunCache ? podBunCacheVolume(o.bunCache) : undefined;
   const quotedArgs = o.command.map(bashSingleQuote).join(' ');
   const credLines = [
     ...(grok ? ['mkdir -p ~/.grok && install -m 600 /creds/grok-auth.json ~/.grok/auth.json'] : []),
@@ -108,6 +111,7 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
     ...(o.clone
       ? ['export GH_TOKEN="$(cat /creds/gh-token)" && gh auth setup-git', podSourceScript(o.source ?? { kind: 'default' }, o.repoUrl)]
       : ['mkdir -p ~/work && cd ~/work']),
+    ...(bunCache ? [bunCache.shellPrefix] : []),
     `set -- ${quotedArgs}`,
     '"$@"',
     'rc=$?',
@@ -138,14 +142,16 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
               { name: 'ELANOUS_SUBSTRATE', value: 'pod' },
               { name: 'ELANOUS_POD_NAME', valueFrom: { fieldRef: { fieldPath: 'metadata.name' } } },
             ],
-            ...(secretKeys || o.hostMirror ? { volumeMounts: [
+            ...(secretKeys || o.hostMirror || bunCache ? { volumeMounts: [
               ...(secretKeys ? [{ name: 'creds', mountPath: '/creds', readOnly: true }] : []),
               ...(o.hostMirror ? [{ name: 'host-mirror', mountPath: '/host-mirror', readOnly: true }] : []),
+              ...(bunCache ? [bunCache.volumeMount] : []),
             ] } : {}),
           }],
-          ...(secretKeys || o.hostMirror ? { volumes: [
+          ...(secretKeys || o.hostMirror || bunCache ? { volumes: [
             ...(secretKeys ? [{ name: 'creds', secret: { secretName: `${o.name}-creds`, defaultMode: 0o400 } }] : []),
             ...(o.hostMirror ? [{ name: 'host-mirror', hostPath: { path: o.hostMirror, type: 'Directory' } }] : []),
+            ...(bunCache ? [bunCache.volume] : []),
           ] } : {}),
         },
       },
@@ -201,6 +207,7 @@ export interface RunPodCommandOptions {
   llm?: 'grok';
   clone?: boolean;
   hostMirror?: string;
+  bunCache?: string;
   /** 컨테이너 메모리 한도(기본 16Gi). */
   memoryLimit?: string;
   source?: PodSource;
@@ -263,6 +270,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const hostMirror = (options.hostMirror ?? env.ELANOUS_POD_HOST_MIRROR
     ?? (options.configHostMirror ?? (() => getUserConfig().pod?.hostMirror))())?.trim() || undefined;
   if (hostMirror && !isAbsolute(hostMirror)) throw new Error('pod.hostMirror must be an absolute directory path');
+  const bunCache = options.bunCache?.trim() || undefined;
+  if (bunCache && !isAbsolute(bunCache)) throw new Error('pod.bunCache must be an absolute directory path');
 
   let member: PodPoolMember | null = null;
   let pool = options.poolScheduler;
@@ -328,7 +337,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       name, namespace, image: member?.imageRef ?? image,
       ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
-      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(options.memoryLimit ? { memoryLimit: options.memoryLimit } : {}), deadlineSeconds,
+      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(options.memoryLimit ? { memoryLimit: options.memoryLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found']);

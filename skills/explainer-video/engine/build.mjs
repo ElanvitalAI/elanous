@@ -26,7 +26,7 @@ const C = { deep: "#1D2751", deep2: "#141C3D", black: "#000000", ink: "#F2F1EE",
 const markSrc = readFileSync(process.env.ELANOUS_MARK ?? join(here, "brand", "elanous-mark-on-dark.svg"), "utf8");
 const markPaths = [...markSrc.matchAll(/<path d="([^"]*)"/g)].map((m) => m[1]);
 const mark = (size, blade = C.ink, dot = C.red, cls = "") =>
-  `<svg class="${cls}" width="${size}" height="${size}" viewBox="150 150 724 724">${markPaths.map((d) => `<path d="${d}" fill="${blade}"/>`).join("")}<circle cx="512" cy="512" r="62" fill="${dot}"/></svg>`;
+  `<svg class="${cls}" width="${size}" height="${size}" viewBox="150 150 724 724">${markPaths.map((d) => `<path d="${d}" fill="${blade}"/>`).join("")}<circle cx="512" cy="512" r="76" fill="${dot}"/></svg>`;
 
 // ── timing from alignment ───────────────────────────────────────────────────────
 const vo = (key) => JSON.parse(readFileSync(join(proj, "source", "vo", `${key}.json`), "utf8"));

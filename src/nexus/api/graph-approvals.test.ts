@@ -7,7 +7,7 @@ import { TabRegistry } from '../state/tab-registry.js';
 import { NexusEventBus } from './event-bus.js';
 import { routeRequest } from './http-server.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
-import { handleGraphApprovals } from './graph-approvals.js';
+import { createGraphDecisionRing, handleGraphApprovals } from './graph-approvals.js';
 
 test('approval implementation types remain private to the handler module', () => {
   const source = readFileSync(new URL('./graph-approvals.ts', import.meta.url), 'utf8');
@@ -68,6 +68,7 @@ test('POST decides with runner claim, hides the run on next GET; 404/409/400 and
   const url = 'http://localhost/v1/graph-approvals/release-loop/waiting';
   const deps = {
     root,
+    decisions: createGraphDecisionRing({ now: () => Date.parse('2026-09-30T09:00:00Z') }),
     authorize: (req: Request) => req.headers.get('authorization') === 'Bearer owner-secret',
     authReason: (req: Request) => req.headers.get('authorization') === 'Bearer owner-secret' ? 'bearer-match' : undefined,
   };
@@ -87,8 +88,13 @@ test('POST decides with runner claim, hides the run on next GET; 404/409/400 and
   expect(await approved.json()).toEqual({ graphId: 'release-loop', runId: 'waiting', decision: 'approved' });
   expect(JSON.parse(readFileSync(join(dir, 'waiting.json.2.decision.json'), 'utf8'))).toMatchObject({ nodeId: 'approve-publish', decision: 'approved', decidedBy: 'pwa:bearer-match' });
   expect(JSON.parse(readFileSync(join(dir, 'waiting.json'), 'utf8')).pending.decision).toBeUndefined();
-  await expect((await call('http://localhost/v1/graph-approvals')).json()).resolves.toEqual({ items: [] });
+  await expect((await call('http://localhost/v1/graph-approvals')).json()).resolves.toEqual({
+    items: [],
+    decided: [{ graphId: 'release-loop', runId: 'waiting', nodeId: 'approve-publish', decision: 'approved', decidedAt: '2026-09-30T09:00:00.000Z' }],
+  });
   expect((await call(url, 'POST', { decision: 'rejected' })).status).toBe(409);
+  // A refused (409) decision is not recorded.
+  expect(((await (await call('http://localhost/v1/graph-approvals')).json()) as { decided: unknown[] }).decided).toHaveLength(1);
 });
 
 test('HTTP dispatcher uses owner checkAuth for both routes', async () => {
@@ -103,7 +109,9 @@ test('HTTP dispatcher uses owner checkAuth for both routes', async () => {
     const approved = await request('/v1/graph-approvals/release-loop/waiting', 'POST', { decision: 'approved' });
     expect(approved?.status).toBe(200);
     expect(await approved?.json()).toEqual({ graphId: 'release-loop', runId: 'waiting', decision: 'approved' });
-    expect(await (await request('/v1/graph-approvals'))?.json()).toEqual({ items: [] });
+    const after = await (await request('/v1/graph-approvals'))?.json() as { items: unknown[]; decided: Array<Record<string, unknown>> };
+    expect(after.items).toEqual([]);
+    expect(after.decided[0]).toMatchObject({ graphId: 'release-loop', runId: 'waiting', nodeId: 'approve-publish', decision: 'approved' });
   } finally {
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previous;
@@ -154,4 +162,29 @@ test('same-origin PWA: list passes, decision needs the paired token even though 
     if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
     else process.env.ELANOUS_STATE_DIR = previous;
   }
+});
+
+test('decision ring: newest first, capped, ages out with the injected clock', () => {
+  let now = 0;
+  const ring = createGraphDecisionRing({ capacity: 3, maxAgeMs: 1_000, now: () => now });
+  for (const runId of ['a', 'b', 'c', 'd']) {
+    ring.record({ graphId: 'g', runId, nodeId: 'n', decision: runId === 'b' ? 'rejected' : 'approved' });
+    now += 100;
+  }
+  expect(ring.list().map((entry) => entry.runId)).toEqual(['d', 'c', 'b']);
+  expect(ring.list()[2]).toEqual({ graphId: 'g', runId: 'b', nodeId: 'n', decision: 'rejected', decidedAt: new Date(100).toISOString() });
+  now = 1_150; // b (t=100) is 1050ms old → gone; c (t=200) stays
+  expect(ring.list().map((entry) => entry.runId)).toEqual(['d', 'c']);
+  now = 10_000;
+  expect(ring.list()).toEqual([]);
+});
+
+test('default ring caps at 100 and keeps 30 minutes', () => {
+  let now = 0;
+  const ring = createGraphDecisionRing({ now: () => now });
+  for (let i = 0; i < 120; i += 1) ring.record({ graphId: 'g', runId: `r${i}`, nodeId: 'n', decision: 'approved' });
+  expect(ring.list()).toHaveLength(100);
+  expect(ring.list()[0]!.runId).toBe('r119');
+  now = 30 * 60 * 1000 + 1;
+  expect(ring.list()).toEqual([]);
 });

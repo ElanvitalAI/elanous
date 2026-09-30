@@ -198,6 +198,7 @@ import { handleMcpResourceGet, MCP_RESOURCE_ROUTE_PATH } from './mcp-resource-ro
 import { APPROVALS_MERGES_PATH, DESIGN_DIRECTION_PATH, DESIGN_PREVIEW_PATH_PREFIX, DESIGN_PREVIEWS_PATH, DESIGN_SYSTEM_PATH, IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
 import { handleMergeApprovals } from './merge-approvals.js';
 import { GRAPH_APPROVALS_PATH, handleGraphApprovals } from './graph-approvals.js';
+import { FIELD_SERVER_MAX_BODY_BYTES, FIELD_UPLOADS_PATH, handleFieldUploads } from './field-uploads.js';
 import { handleLiveDetail, LIVE_DETAIL_PATH } from './live-detail.js';
 import { handleLiveShipped, LIVE_SHIPPED_PATH } from './live-shipped.js';
 import { handleMcpWidgetCall, MCP_WIDGET_CALL_ROUTE_PATH, persistWidgetTurnToSessionStore } from './mcp-widget-call-route.js';
@@ -739,6 +740,8 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
         port,
         hostname,
         idleTimeout: 255,
+        // Bun 기본 128 MB 로는 현장 업로드(파일 200 MB · 요청 500 MB · JSON base64)가 못 들어온다.
+        maxRequestBodySize: FIELD_SERVER_MAX_BODY_BYTES,
         fetch: async (req: Request, srv: unknown) =>
           (await routeRequest(req, opts, srv as BunServerLike, bridge, devProxyRef, { hostname, port })) ??
           new Response(null, { status: 101 }),
@@ -920,6 +923,12 @@ export async function routeRequest(
     return handleGraphApprovals(req, {
       authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
       authReason: (request) => (opts.metaApi ? bearerCredential(request, opts.metaApi) : undefined),
+    });
+  }
+  // 현장 업로드(owner 전용) — GET 목록 · POST 저장. 저장 규칙 정본 = src/field/field-media.ts.
+  if (pathname === FIELD_UPLOADS_PATH && (method === 'GET' || method === 'POST')) {
+    return handleFieldUploads(req, {
+      authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
     });
   }
   if (pathname === APPROVALS_MERGES_PATH || pathname.startsWith(`${APPROVALS_MERGES_PATH}/`)) {

@@ -42,6 +42,7 @@ The outro gives one line that sums everything up, then the CTA.
 - Makes one `/with-timestamps` call per beat and writes `source/vo/<key>.mp3` and `<key>.json`, where the JSON holds per-character times.
 - A beat whose text hash is unchanged is skipped, so you can edit one line and re-run.
 - The key comes from `ELEVENLABS_API_KEY`, which the plugin connector sets (`elanous plugin credentials video-explainer`). Never print it.
+- **No key** → a draft voice from macOS `say` (a Korean system voice; `EXPLAINER_SAY_VOICE` picks one). Character times are then spread over the measured length — captions still land per line, keyword timing is approximate. Use it for unattended runs and rehearsals; use ElevenLabs for anything public.
 
 ## 3. Compose — `node $SKILL/engine/build.mjs <project>/script.json`
 
@@ -85,6 +86,23 @@ The reference supplies the **grammar** (components and staging), never its colou
 - **Motif**: the V6 «엘랑 소용돌이» mark (`engine/brand/`), used in three places — a slow, faint rotation behind the scene, the header, and the chapter cards.
 
 Why these choices, what the reference does, and what we can and cannot reproduce: `내부 문서 `RESEARCH-explainer-video-reference-decomposition-2026-09-30``.
+
+## Field reel — photos from the venue → a vertical video in about a minute
+
+```bash
+zsh $SKILL/engine/reel.sh <folder> --title "마케터의 밤" --sub "2026.10.02 · 서울"
+```
+
+- **Input**: a folder of phone photos (jpg · png · heic) and short clips (mp4 · mov). The default upload folder is `~/.elanous/field/<event>/`.
+- **Order**: by capture time (`mdls` creation date), then by file name.
+- **Captions**: optional `<folder>/captions.txt`, one line per item as `파일명 | 자막`. Items without a line get no caption.
+- **Output**:
+  - `<folder>/reel/reel-9x16.mp4` at 1080×1920, 30–60 s.
+  - A black title card, then each item: photos for 3.5 s with a slow zoom, clips for their first 5 s.
+  - One caption line per item, the V6 header, an Icarus Red progress bar, and an end card with elanous.ai.
+- **Fitting to length**: over 60 s drops items from the middle, keeping the first and last. Under 30 s stretches the photos.
+- **Measured**: 7 items → 31.2 s video in 56–83 s end to end (M-series Mac, `hyperframes render`).
+- **Before posting**: people's faces need their consent. Run the same 1 fps OCR check as any public video.
 
 ## Graph
 

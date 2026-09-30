@@ -175,7 +175,7 @@ function daemonPathLogs(): Logged[] {
 
 function captureConsole(run: () => void): string[] {
   const lines: string[] = [];
-  const spy = spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+  const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(' '));
   });
   try {

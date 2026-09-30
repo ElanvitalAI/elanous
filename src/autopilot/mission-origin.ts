@@ -13,19 +13,35 @@ import { getUserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { join } from 'node:path';
 
-export interface MissionOrigin {
-  channel: 'telegram' | 'pwa' | 'voice' | 'cli' | 'api' | 'tui';
+interface MissionOriginBase {
   /** 텔레그램: 답장할 chat id. */
   chatId?: number;
   /** 텔레그램: 수신 봇 식별(botId=토큰 prefix). 발송 시 config 에서 토큰 해석. */
   botId?: string;
-  /** 텔레그램 스레드(포럼) — 있으면 답장에 붙임. */
-  threadId?: number;
   /** HITL 승인/거절 버튼을 단 알림 메시지의 message_id. 크로스서피스 싱크용 —
    *  PWA/텔레그램 어느 쪽에서 해소돼도 이 좌표(chatId+botId+이 id)로 텔레그램 메시지를
    *  edit("승인됨/거절됨")하고 버튼을 제거한다. 버튼 발송 성공 시에만 기록. */
   hitlMessageId?: number;
 }
+
+export type MissionOrigin = MissionOriginBase & (
+  | {
+      channel: 'telegram' | 'pwa' | 'voice' | 'cli' | 'api' | 'tui';
+      /** 텔레그램 스레드(포럼) — 있으면 답장에 붙임. */
+      threadId?: number;
+      channelId?: never;
+    }
+  | {
+      channel: 'discord';
+      /** Discord origin channel (snowflake). */
+      channelId: string;
+      /** Discord thread (snowflake), if the request came from a thread.
+       *  ⛔ `threadId` 가 아니다 — 텔레그램 `threadId?: number` 와 같은 이름이면 유니온에서 `string|number` 로 넓어져
+       *  텔레그램 발송부 20여 곳의 타입이 깨진다(2026-10-01 PWA 빌드 실패 · #22246). */
+      discordThreadId?: string;
+      threadId?: never;
+    }
+);
 
 function originDir(): string {
   // core 미션 fabric = autopilot/ (conatus/ 는 투자 customer 네임스페이스·대표 정정 2026-07-11).

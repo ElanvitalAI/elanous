@@ -6,12 +6,14 @@ import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
 
 export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done';
+export type ChecklistDisposition = 'move' | 'known-issue' | 'block';
 export interface ChecklistItem {
   id: string;
   title: string;
   status: ChecklistStatus;
   owner?: string;
   evidence?: string;
+  disposition?: ChecklistDisposition;
   updatedAt: string;
   updatedBy: string;
 }
@@ -121,12 +123,13 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition }, by: string): Checklist {
   return mutate(v, (data) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new Error(`없는 칸: ${id}`);
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new Error(`잘못된 상태: ${patch.status}`);
-    const fields = (['evidence', 'owner', 'status'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
+    if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new Error(`잘못된 처분: ${patch.disposition}`);
+    const fields = (['evidence', 'owner', 'status', 'disposition'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
     for (const field of fields) {
@@ -167,6 +170,29 @@ export function summarizeChecklist(data: Checklist): ChecklistSummary {
     summary.byOwner[owner] = (summary.byOwner[owner] ?? 0) + 1;
   }
   return summary;
+}
+
+export interface ChecklistGate {
+  ok: boolean;
+  red: string[];
+  undecided: string[];
+  blocked: string[];
+  moved: string[];
+  knownIssues: Array<{ id: string; title: string; evidence: string }>;
+}
+
+export function checklistGate(v: string): ChecklistGate {
+  const result: ChecklistGate = { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] };
+  for (const item of listChecklist(v).items) {
+    if (item.status === 'red') result.red.push(item.id);
+    if (item.status !== 'yellow') continue;
+    if (item.disposition === 'block') result.blocked.push(item.id);
+    else if (item.disposition === 'move') result.moved.push(item.id);
+    else if (item.disposition === 'known-issue') result.knownIssues.push({ id: item.id, title: item.title, evidence: item.evidence ?? '' });
+    else result.undecided.push(item.id);
+  }
+  result.ok = result.red.length === 0 && result.undecided.length === 0 && result.blocked.length === 0;
+  return result;
 }
 
 export function seedFromRoadmap(v: string, markdown: string): Checklist {
