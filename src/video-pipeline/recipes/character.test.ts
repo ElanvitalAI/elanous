@@ -3,7 +3,7 @@
 // ⛔ 무는 것: 관문이 «진짜로» 가르나 ⊕ 눈이 봐야 하는 판정은 말해 주지 않으면 «통과하지 않는다» ⊕ 되돌이가 수렴하나.
 //   🩸 2026-09-23 실물(NOVA): fullbleed → shots → «같은» 샷 → fullbleed … 예산이 다할 때까지 돌았다.
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ffmpeg } from './ffmpeg.js';
@@ -81,6 +81,70 @@ describe('⭐ 되돌이 수렴 — fullbleed 로 돌아온 샷 노드는 «같�
     expect((await directedShots(ctxOf({ shot_sources }))).outcome).toBe('ok');
     expect((await directedShots(ctxOf({ shot_sources, fullbleed_cuts: ['wide'] }))).outcome).toBe('error');
   });
+});
+
+it('directedShots 는 임시 DB 에서 샷별 참고를 기록하고 DB 부재에도 outcome 을 보존한다', async () => {
+  const file = join(root, 'vflow.ndjson');
+  const base = { url: 'https://example.test/tracking', model: 'seedance-2-0', category: 'camera', name: 'Tracking', description: '', prompt: 'slow tracking shot', keywords: ['tracking'], author: 'Aster', authorUrl: 'https://example.test/aster' };
+  writeFileSync(file, [
+    { ...base, spec: { camera: ['tracking'] }, video: { url: 'https://example.test/video.mp4' } },
+    { ...base, url: 'https://example.test/orbit', spec: { camera: ['orbit'] }, video: { url: 'https://example.test/orbit.mp4' } },
+    base,
+  ].map((row) => JSON.stringify(row)).join('\n'));
+  const state = { shot_sources: { a: join(root, 'wide.mp4') }, shot_prompts: { a: 'slow tracking shot of a person' }, shot_model: 'seedance', vflow_file: file };
+  const result = await directedShots(ctxOf(state));
+  expect(result.outcome).toBe('ok');
+  expect(result.produced?.shot_references).toEqual({ a: [{
+    url: 'https://example.test/tracking', videoUrl: 'https://example.test/video.mp4', model: 'seedance-2-0',
+    name: 'Tracking', author: 'Aster', authorUrl: 'https://example.test/aster', camera: ['tracking'],
+  }] });
+  expect(result.note).toContain('vflow 참고 1샷/1샷');
+  const missing = await directedShots(ctxOf({ ...state, vflow_file: join(root, 'missing.ndjson') }));
+  expect(missing.outcome).toBe('ok');
+  expect(missing.note).toContain('vflow DB 없음');
+  expect((await directedShots(ctxOf({ ...state, fullbleed_cuts: ['wide'] }))).outcome).toBe('error');
+  const multi = await directedShots(ctxOf({ ...state, shot_prompts: { a: 'tracking orbit shot' } }));
+  expect((multi.produced?.shot_references as Record<string, unknown[]>).a).toHaveLength(2);
+  const noCamera = await directedShots(ctxOf({ ...state, shot_prompts: { a: 'a person waits' } }));
+  expect((noCamera.produced?.shot_references as Record<string, unknown[]>).a).toEqual([]);
+});
+
+it('directedShots 는 실제 파일이 있는 shot_sources 키만 참고에 연결하고 샷 수에 센다', async () => {
+  const file = join(root, 'vflow-source-keys.ndjson');
+  writeFileSync(file, JSON.stringify({
+    url: 'https://example.test/tracking', model: 'seedance-2-0', category: 'camera',
+    name: 'Tracking', description: '', prompt: 'slow tracking shot', keywords: ['tracking'],
+    author: 'Aster', authorUrl: 'https://example.test/aster',
+    spec: { camera: ['tracking'] }, video: { url: 'https://example.test/tracking.mp4' },
+  }));
+  const shot_sources = { a: join(root, 'wide.mp4'), c: join(root, 'missing-shot.mp4') };
+  const shot_prompts = { b: 'slow tracking shot', c: 'slow tracking shot' };
+  const result = await directedShots(ctxOf({ shot_sources, shot_prompts, vflow_file: file }));
+  expect(result.outcome).toBe('ok');
+  expect(result.produced?.shot_paths).toEqual([join(root, 'wide.mp4')]);
+  expect(result.produced?.shot_references).toEqual({});
+  expect(result.note).toContain('vflow 참고 0샷/1샷');
+  const matched = await directedShots(ctxOf({ shot_sources, shot_prompts: { a: 'slow tracking shot', b: 'slow tracking shot', c: 'slow tracking shot' }, vflow_file: file }));
+  expect(Object.keys(matched.produced?.shot_references as Record<string, unknown>)).toEqual(['a']);
+  expect((matched.produced?.shot_references as Record<string, unknown[]>).a).toHaveLength(1);
+  expect(matched.note).toContain('vflow 참고 1샷/1샷');
+});
+
+it('directedShots 는 카메라 용어의 단어 경계를 검사해 ecstatic 안의 static 을 참조하지 않는다', async () => {
+  const file = join(root, 'vflow-camera-boundary.ndjson');
+  writeFileSync(file, JSON.stringify({
+    url: 'https://example.test/static', model: 'seedance-2-0', category: 'camera',
+    name: 'Static shot', description: '', prompt: 'static shot', keywords: ['static'],
+    author: 'Aster', authorUrl: 'https://example.test/aster',
+    spec: { camera: ['static'] }, video: { url: 'https://example.test/static.mp4' },
+  }));
+  const state = { shot_sources: { a: join(root, 'wide.mp4') }, vflow_file: file };
+  const falseMatch = await directedShots(ctxOf({ ...state, shot_prompts: { a: 'ecstatic crowd' } }));
+  expect(falseMatch.outcome).toBe('ok');
+  expect((falseMatch.produced?.shot_references as Record<string, unknown[]>).a).toEqual([]);
+  expect(falseMatch.note).toContain('vflow 참고 0샷/1샷');
+  const exactMatch = await directedShots(ctxOf({ ...state, shot_prompts: { a: 'static shot of the crowd' } }));
+  expect((exactMatch.produced?.shot_references as Record<string, unknown[]>).a).toHaveLength(1);
 });
 
 describe('⭐ 편집이 «다시 그린» 9:16 을 실제로 쓴다 (🩸 2026-09-23: 키가 어긋나 16:9 를 잘라 썼다)', () => {

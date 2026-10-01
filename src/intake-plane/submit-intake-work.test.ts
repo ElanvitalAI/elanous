@@ -14,7 +14,7 @@ const OWNER: IntakeWorkOrigin = { kind: 'owner', ledgerSource: 'pwa' };
 const TELEGRAM: IntakeWorkOrigin = { kind: 'external', ledgerSource: 'telegram-bot', provider: 'telegram', ref: '42:7' };
 
 function fakeDeps() {
-  const ingested: Array<{ source: IntakeSource; raws: RawIntakeItem[] }> = [];
+  const ingested: Array<{ source: IntakeSource | import('./items.js').RegisteredIntakeSourceKind; raws: RawIntakeItem[] }> = [];
   const tasks: CreateTaskInput[] = [];
   const asks: string[] = [];
   const logs: Array<{ event: string; data: Record<string, unknown> }> = [];
@@ -70,6 +70,33 @@ describe('submitIntakeWork', () => {
     const res = await submitIntakeWork({ text: '구현해 줘: 버튼 색', track: 'graph', origin: OWNER }, deps);
     expect(asks).toEqual(['구현해 줘: 버튼 색']);
     expect(res).toEqual({ ok: true, track: 'graph', acceptanceId: 'acc-1' });
+  });
+
+  test('a seat document goes to the exec request instead of harness ask and retains reportTo', async () => {
+    const reportTo = { channel: 'telegram' as const, chatId: -100123, botId: 'bot-1' };
+    const { deps, asks } = fakeDeps();
+    const routed: unknown[] = [];
+    deps.seatDoc = async input => { routed.push(input); return { id: 'exec-1' }; };
+    const res = await submitIntakeWork({ text: '@CMO 10-28 마케팅 전략 한 장', track: 'graph', origin: { ...TELEGRAM, reportTo } }, deps);
+    expect(res).toEqual({ ok: true, track: 'graph', acceptanceId: 'exec-1' });
+    expect(asks).toEqual([]);
+    expect(routed).toEqual([{ text: '@CMO 10-28 마케팅 전략 한 장', reportTo, deps: undefined }]);
+    await submitIntakeWork({ text: '@TC 로그인 버그 고쳐줘', track: 'graph', origin: { ...TELEGRAM, reportTo } }, deps);
+    expect(asks).toEqual(['@TC 로그인 버그 고쳐줘']);
+    expect(routed).toHaveLength(1);
+  });
+
+  test('CO1 — a non-code @coo request goes to the planner path with reportTo; a @coo code request stays a harness ask', async () => {
+    const reportTo = { channel: 'discord' as const, channelId: 'c-1' };
+    const { deps, asks } = fakeDeps();
+    const routed: unknown[] = [];
+    deps.seatDoc = async input => { routed.push(input); return { id: 'exec-2' }; };
+    const res = await submitIntakeWork({ text: '@coo 내일 마케터스 나이트 준비 나눠 줘', track: 'graph', origin: { ...TELEGRAM, reportTo } }, deps);
+    expect(res).toEqual({ ok: true, track: 'graph', acceptanceId: 'exec-2' });
+    expect(routed).toEqual([{ text: '@coo 내일 마케터스 나이트 준비 나눠 줘', reportTo, deps: undefined }]);
+    await submitIntakeWork({ text: '@coo 로그인 버그 고쳐줘', track: 'graph', origin: { ...TELEGRAM, reportTo } }, deps);
+    expect(asks).toEqual(['@coo 로그인 버그 고쳐줘']);
+    expect(routed).toHaveLength(1);
   });
 
   test('graph forwards external reportTo as the harness ask origin', async () => {

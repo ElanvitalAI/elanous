@@ -23,6 +23,8 @@
 import { markdownToTelegramHtml as _unusedMarkdownFn } from './telegram-format.js'; // eslint-disable-line @typescript-eslint/no-unused-vars
 import { debug } from './debug/log.js';
 import { getUserConfig } from './user-config.js';
+import { handleDiscordSeatWork, type DiscordSeatWorkDeps } from './intake-plane/discord-seat-work.js';
+import { parseSeatAddress } from './seat-address/seat-address.js';
 
 // Telegram's HTML markdown isn't directly useful for Discord (Discord
 // uses CommonMark + its own subset). Import kept as a reminder that
@@ -163,6 +165,8 @@ export interface DiscordBotOpts {
    *  primary `onMessage` LLM chat path. Errors are swallowed by the
    *  caller — this is a best-effort fan-out. */
   onTriggerTap?: (event: DcTriggerEvent) => void | Promise<void>;
+  /** Override the intake door's dependencies for isolated Discord seat-work tests. */
+  seatWorkDeps?: DiscordSeatWorkDeps;
 }
 
 /** Surface-unification v2 — minimal trigger-side event shape. Maps
@@ -204,6 +208,8 @@ export class DiscordBot {
   private readonly token: string;
   private readonly allowedUsers: Set<string>;
   private readonly guildTextChannels: Set<string>;
+  /** The bot's own user id (from READY) — EV12c lets an allowlisted @mention open any guild channel. */
+  private selfUserId: string | undefined;
   private readonly onMessage: DcMessageHandler;
   private readonly maxChars: number;
   private readonly log: (msg: string) => void;
@@ -216,6 +222,7 @@ export class DiscordBot {
   private readonly onReaction: ((event: DcReactionEvent) => void | Promise<void>) | null;
   /** Surface-unification v2 (FU-1) — workflow-runtime tap. */
   private readonly onTriggerTap: ((event: DcTriggerEvent) => void | Promise<void>) | null;
+  private readonly seatWorkDeps: DiscordSeatWorkDeps;
   private ws: WebSocket | null = null;
   private running = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -239,6 +246,7 @@ export class DiscordBot {
     this.onInteraction = opts.onInteraction ?? null;
     this.onReaction = opts.onReaction ?? null;
     this.onTriggerTap = opts.onTriggerTap ?? null;
+    this.seatWorkDeps = opts.seatWorkDeps ?? {};
   }
 
   /** Send a raw payload on the gateway WebSocket. Voice adapter uses
@@ -604,6 +612,7 @@ export class DiscordBot {
             session_id?: string;
           };
           this.log(`READY — logged in as @${d.user?.username ?? '?'} (${d.user?.id ?? '?'})`);
+          if (d.user?.id) this.selfUserId = d.user.id;
           if (this.voiceTap?.onReady && d.session_id && d.user?.id) {
             try { this.voiceTap.onReady(d.session_id, d.user.id); }
             catch (err: any) { this.log(`voice tap onReady failed: ${err?.message ?? err}`); }
@@ -684,6 +693,20 @@ export class DiscordBot {
 
   // ── Message routing ────────────────────────────────────────
 
+  /** EV12c — true when this message @mentions the bot itself (mentions array or the raw `<@id>` token). */
+  private mentionsSelf(m: Record<string, unknown>, text: string): boolean {
+    const self = this.selfUserId;
+    if (!self) return false;
+    if (Array.isArray(m.mentions) && (m.mentions as Array<{ id?: unknown }>).some(u => String(u?.id) === self)) return true;
+    return text.includes(`<@${self}>`) || text.includes(`<@!${self}>`);
+  }
+
+  private stripSelfMention(text: string): string {
+    const self = this.selfUserId;
+    if (!self) return text;
+    return text.split(`<@!${self}>`).join('').split(`<@${self}>`).join('').replace(/\s+/g, ' ').trim();
+  }
+
   private async handleMessageCreate(m: Record<string, unknown>): Promise<void> {
     // Ignore bot's own messages (DM reply from our own send would
     // re-enter here).
@@ -692,19 +715,25 @@ export class DiscordBot {
 
     // DM-only v1 scope: guild_id is absent for DM channels.
     // Voice channel commands (`/voice-join`, `/voice-leave`,
-    // `/voice-status`) intentionally bypass DM-only — they need a
-    // guild context to operate. Everything else stays DM-routed so
-    // unrelated guild traffic doesn't reach the LLM path.
+    // `/voice-status`) and allowlisted, seat-addressed work bypass
+    // DM-only. All other guild traffic stays gated unless explicitly
+    // configured as a guild text channel.
     const isDm = !m.guild_id;
+    const rawText = typeof m.content === 'string' ? m.content : '';
+    const mentionsSelf = this.mentionsSelf(m, rawText);
     if (!isDm && !this.guildTextChannels.has(String(m.channel_id))) {
-      const trimmed = typeof m.content === 'string' ? m.content.trim() : '';
-      if (!/^\/voice-(join|leave|status)\b/.test(trimmed)) return;
+      if (!/^\/voice-(join|leave|status)\b/.test(rawText.trim())
+          && !(this.allowedUsers.has(author.id) && (parseSeatAddress(rawText) || mentionsSelf))) {
+        debug.log('discord.trigger', 'dropped', { reason: 'guild-not-chat', channelId: String(m.channel_id) });
+        return;
+      }
     }
 
     // Allowlist enforcement. An empty allowlist refuses everyone —
     // safer default than "open to the world" when the bot runs
     // with no user config.
     if (this.allowedUsers.size > 0 && !this.allowedUsers.has(author.id)) {
+      debug.log('discord.trigger', 'dropped', { reason: 'not-allowed', isDm });
       this.log(`discord: refusing unknown user ${author.id}`);
       try {
         await this.sendMessage(
@@ -738,7 +767,7 @@ export class DiscordBot {
       channelId: String(m.channel_id),
       userId: author.id,
       userName: author.username,
-      text: typeof m.content === 'string' ? m.content : '',
+      text: mentionsSelf ? this.stripSelfMention(rawText) : rawText,
       messageId: String(m.id),
       isDm,
       attachments,
@@ -787,6 +816,27 @@ export class DiscordBot {
       } catch (err: unknown) {
         const reason = err instanceof Error ? err.message : String(err);
         this.log(`discord trigger tap failed: ${reason}`);
+      }
+    }
+
+    // Addressed work is submitted only by configured owners; ordinary chat keeps its existing path.
+    if (this.allowedUsers.has(author.id) && parseSeatAddress(ctx.text)) {
+      const threadId = typeof m.thread_id === 'string' && m.thread_id ? m.thread_id : undefined;
+      const replyChannelId = threadId ?? ctx.channelId;
+      try {
+        const seatReply = await handleDiscordSeatWork(ctx.text, {
+          channelId: replyChannelId,
+          messageId: ctx.messageId,
+          ...(threadId ? { threadId } : {}),
+        }, this.seatWorkDeps);
+        if (seatReply !== null) {
+          await this.sendMessage(replyChannelId, seatReply);
+          return;
+        }
+      } catch (err: unknown) {
+        this.log(`discord seat work failed: ${err instanceof Error ? err.message : String(err)}`);
+        await this.sendMessage(replyChannelId, '좌석 요청을 접수하지 못했습니다. 잠시 후 다시 보내 주세요.');
+        return;
       }
     }
 

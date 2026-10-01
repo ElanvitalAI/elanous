@@ -1,4 +1,5 @@
-import { test, expect, describe, spyOn } from 'bun:test';
+import { test, expect, describe, spyOn, beforeEach, afterEach } from 'bun:test';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -10,6 +11,16 @@ import { analyzeRepairSignals, CLASSIFICATION_HINTS } from './repair-signals.js'
 function tmp(): string {
   return mkdtempSync(join(tmpdir(), 'self-dev-runs-'));
 }
+
+let mirrorLedgerRoot: string;
+beforeEach(() => {
+  mirrorLedgerRoot = tmp();
+  setElanousConfigDir(mirrorLedgerRoot);
+});
+afterEach(() => {
+  resetElanousConfigDir();
+  rmSync(mirrorLedgerRoot, { recursive: true, force: true });
+});
 
 const run = (id: string, updatedAt: number): SelfDevRunState => ({
   runId: id,
@@ -79,7 +90,7 @@ describe('self-dev run-store (S3 persistence)', () => {
             results: [{ taskId: 't1', feature: 'A', status: 'done', screenTail: payload }] }, dir);
         }
       `, dir, runId, String(count)],
-      stdout: 'pipe', stderr: 'pipe',
+      stdout: 'pipe', stderr: 'pipe', env: { ...process.env, HOME: mirrorLedgerRoot },
     });
     const reader = Bun.spawn({
       cmd: [process.execPath, '-e', `${setup}
@@ -104,7 +115,7 @@ describe('self-dev run-store (S3 persistence)', () => {
           throw error;
         }
       `, dir, runId, String(count)],
-      stdout: 'pipe', stderr: 'pipe',
+      stdout: 'pipe', stderr: 'pipe', env: { ...process.env, HOME: mirrorLedgerRoot },
     });
     try {
       const [writerCode, readerCode] = await Promise.all([writer.exited, reader.exited]);
@@ -184,7 +195,7 @@ describe('self-dev run-store (S3 persistence)', () => {
       const resumed = Bun.spawnSync({
         cmd: [process.execPath, 'src/index.ts', 'self', 'orchestrate', 'noop', '--resume', state.runId, '--json'],
         cwd: process.cwd(),
-        env: { ...process.env, ELANOUS_STATE_DIR: stateDir },
+        env: { ...process.env, HOME: mirrorLedgerRoot, ELANOUS_STATE_DIR: stateDir },
         stdout: 'pipe',
         stderr: 'pipe',
       });
@@ -593,7 +604,7 @@ describe('listCombinedParkedGoals', () => {
       cwd: process.cwd(),
       encoding: 'utf8',
       timeout: 60_000,
-      env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
+      env: { ...process.env, HOME: mirrorLedgerRoot, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
     });
 
     expect(result.error).toBeUndefined();
@@ -628,7 +639,7 @@ describe('listCombinedParkedGoals', () => {
       cwd: process.cwd(),
       encoding: 'utf8',
       timeout: 60_000,
-      env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
+      env: { ...process.env, HOME: mirrorLedgerRoot, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
     });
 
     expect(human.error).toBeUndefined();
@@ -725,13 +736,13 @@ describe('listCombinedParkedGoals', () => {
       cwd: process.cwd(),
       encoding: 'utf8',
       timeout: 60_000,
-      env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
+      env: { ...process.env, HOME: mirrorLedgerRoot, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
     });
     const human = spawnSync('bun', ['bin/elanous.mjs', 'self', 'parked'], {
       cwd: process.cwd(),
       encoding: 'utf8',
       timeout: 60_000,
-      env: { ...process.env, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
+      env: { ...process.env, HOME: mirrorLedgerRoot, ELANOUS_DEBUG_LEVEL: 'off', ELANOUS_STATE_DIR: stateDir },
     });
 
     expect(result.error).toBeUndefined();

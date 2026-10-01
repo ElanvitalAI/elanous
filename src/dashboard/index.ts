@@ -16779,7 +16779,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             preferHistoryArrowKeys: slashQuickMode,
             history: inputHistory,
             placeholder: anyProviderAvailable()
-              ? '/command, or type a question (inline /path/to.pdf to attach)'
+              ? '말 한 줄로 시작 — 질문하거나 «하니스로 구현 …» · /command · /path/to.pdf 첨부'
               : '/quit /clear (run `elanous setup` — no LLM provider available)',
             debugLog: debug.enabled ? (event, label, payload) => debug.log(event, label, payload) : undefined,
             textInputOpts: {

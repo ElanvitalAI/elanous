@@ -60,8 +60,8 @@ export const PROJECT_TREE_MAX_CHARS = 8 * 1024;
 export const PROJECT_TREE_DIR_ENTRY_LIMIT = 20;
 
 const NO_TOOLS_VERIFICATION_GUIDANCE = `## Chat without tools — verify rather than guess
-This conversation has tools disabled. Do not guess repository or real-time facts that require verification, such as file counts, file contents, commits, or the current time. Say you cannot check them here. The project tree above is for navigation, not evidence for counts.
-To check these facts, enable tools with \`elanous agent …\` or \`elanous chat --tools …\`.`;
+This conversation has tools disabled. Do not guess repository or real-time facts that require verification, such as file counts, file contents, commits, or the current date or time. When asked for facts you cannot verify here (including repository state, files, and dates), explicitly say you cannot check them in this mode. The project tree above is for navigation, not evidence for counts.
+Give one line explaining how to enable tools: \`elanous agent "<your question>"\`.`;
 
 // P4 (2026-05-03) — Family-agnostic coding-agent lifecycle. Maps the
 // three user-facing pipelines to an explicit tool-batch sequence so every

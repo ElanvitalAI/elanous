@@ -37,7 +37,8 @@ print(json.dumps({"src": os.environ["SRC"], "out": os.environ["OUT"],
                   "width": int(os.environ["W"]), "height": int(os.environ["H"]),
                   "blur": float(os.environ["BLUR"]), "mirror": os.environ["MIRROR"] == "1"}))')
 
-TMP=$(mktemp -t reframe).js
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/reframe.XXXXXX") || { echo "⛔ 임시 스크립트를 만들지 못했다" >&2; exit 1; }
+TMP="$TMP_DIR/reframe.js"
 CFG="$CFG" python3 -c '
 import os, io, sys
 src = io.open(sys.argv[1], encoding="utf-8").read()
@@ -46,6 +47,7 @@ io.open(sys.argv[2], "w", encoding="utf-8").write(src.replace("__CFG__", os.envi
 
 out=$(python3 "$AFF" run "$TMP" 2>&1); rc=$?
 rm -f "$TMP"
+rmdir "$TMP_DIR"
 echo "$out"
 # ⛔ aff.py 는 스크립트 «안»의 오류도 exit 0 으로 낼 수 있다 — 산출을 «읽어서» 가른다.
 if printf '%s' "$out" | grep -qE '^Error:|Uncaught|TypeError|ReferenceError'; then exit 1; fi

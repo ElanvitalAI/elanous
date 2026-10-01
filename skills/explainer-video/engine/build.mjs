@@ -22,7 +22,7 @@ const W = 1920, H = 1080, FPS = 30;
 // ── palette (Elanvital CI · RCBC guide) ─────────────────────────────────────────
 const C = { deep: "#1D2751", deep2: "#141C3D", black: "#000000", ink: "#F2F1EE", red: "#E95047", muted: "rgba(242,241,238,0.62)", line: "rgba(242,241,238,0.86)", faint: "rgba(242,241,238,0.10)" };
 
-// ── mark (V6 «엘랑 소용돌이», docs/brand/icon) ───────────────────────────────────
+// ── mark (V6 «엘랑 소용돌이», engine/brand/) ─────────────────────────────────────
 const markSrc = readFileSync(process.env.ELANOUS_MARK ?? join(here, "brand", "elanous-mark-on-dark.svg"), "utf8");
 const markPaths = [...markSrc.matchAll(/<path d="([^"]*)"/g)].map((m) => m[1]);
 const mark = (size, blade = C.ink, dot = C.red, cls = "") =>

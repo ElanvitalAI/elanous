@@ -1,3 +1,5 @@
+import { classifyShortQuestion } from '../chat/short-question.js';
+import { getUserConfig } from '../user-config.js';
 import { runCoreTurn } from '../core-turn/index.js';
 import type { LLMMessage, LLMToolSpec } from '../llm.js';
 import { maybeImageBearingResult } from '../llm.js';
@@ -83,6 +85,8 @@ export function summarizeToolResult(result: unknown): string | undefined {
 
 export async function runDaemonPromptTurn(opts: {
   history: DaemonSessionHistory;
+  /** B1 빠른 경로 스위치 — 없으면 config `chat.fastPath`(기본 true). 시험·호출부가 못 박을 때만 준다. */
+  fastPathEnabled?: boolean;
   request: DaemonPromptRequest;
   /** Optional multimodal prompt blocks for the current user turn.
    *  When present, history persistence keeps the ACP block shape
@@ -173,6 +177,19 @@ export async function runDaemonPromptTurn(opts: {
     reason: surfaceResolutionReason,
     hasUserText: request.userText.length > 0,
   });
+  const hasAttachments = (opts.promptBlocks?.length ? opts.promptBlocks : request.userContent)
+    ?.some((block) => block.type !== 'text') ?? false;
+  // SW2 스위치 `chat.fastPath`(기본 켜짐 · PWA «짧은 물음은 빠르게» 카드) — 끄면 분류하지 않는다.
+  const fastPathEnabled = opts.fastPathEnabled ?? (() => { try { return getUserConfig().chat?.fastPath !== false; } catch { return true; } })();
+  const { fast, reason } = fastPathEnabled
+    ? classifyShortQuestion(request.userText, { hasAttachments })
+    : { fast: false, reason: 'disabled' };
+  const activeToolSurface = fast ? undefined : toolSurface;
+  const toolsBefore = toolSurface && toolSurface.kind !== 'none' ? toolSurface.specs.length : 0;
+  const tools: LLMToolSpec[] = activeToolSurface && activeToolSurface.kind !== 'none'
+    ? activeToolSurface.specs
+    : [];
+  debug.log('chat.fast-path', 'decided', { fast, reason, toolsBefore, toolsAfter: tools.length });
   // Image-pipeline followup #4 (2026-05-05) — when the webterm surface
   // is active, prepend a daemon-context block ("Current ACP sessionId:
   // …" + active terminals) to the system prompt so the LLM has the
@@ -181,21 +198,18 @@ export async function runDaemonPromptTurn(opts: {
   const augmentedSystemPrompt = appendWebtermContext(
     request.effectiveSystemPrompt,
     request.sessionId,
-    toolSurface,
+    activeToolSurface,
   );
   const ctrl = new AbortController();
   if (opts.signal) {
     if (opts.signal.aborted) ctrl.abort();
     else opts.signal.addEventListener('abort', () => ctrl.abort(), { once: true });
   }
-  const tools: LLMToolSpec[] = toolSurface && toolSurface.kind !== 'none'
-    ? toolSurface.specs
-    : [];
   const toolCwdResolver = createToolCwdResolver({
-    tools: toolSurface?.kind ?? 'none',
+    tools: activeToolSurface?.kind ?? 'none',
     ...(opts.toolCwd !== undefined ? { toolCwd: opts.toolCwd } : {}),
   });
-  const rawDispatchTool = toolSurface && toolSurface.kind !== 'none'
+  const rawDispatchTool = activeToolSurface && activeToolSurface.kind !== 'none'
     ? async (name: string, args: Record<string, unknown>, perCallCtx?: { callId: string }): Promise<unknown> => {
         const dispatchCtrl = new AbortController();
         const onAbort = (): void => dispatchCtrl.abort();
@@ -204,7 +218,7 @@ export async function runDaemonPromptTurn(opts: {
           // Image-pipeline followup #1 (2026-05-05) — pass the current
           // request.sessionId through so WebTerminal* tools can auto-
           // resolve scope when the LLM omits sessionId from args.
-          return await toolSurface.dispatch(name, args, {
+          return await activeToolSurface.dispatch(name, args, {
             cwd: toolCwdResolver.cwd!,
             resolveWriteCwd: toolCwdResolver.resolveWriteCwd,
             signal: dispatchCtrl.signal,
@@ -246,9 +260,13 @@ export async function runDaemonPromptTurn(opts: {
       })
     : null;
   const dispatchTool = terminal ? terminal.dispatch : rawDispatchTool;
-  const effectiveSystemPrompt = terminal
-    ? terminal.systemPromptParts.join('\n\n')
-    : augmentedSystemPrompt;
+  const fastPathGuidance = '확인이 필요하면 "확인해 볼까요?" 한 줄로 끝낸다';
+  const effectiveSystemPrompt = fast
+    ? [augmentedSystemPrompt, fastPathGuidance].filter(Boolean).join('\n')
+    : terminal
+      ? terminal.systemPromptParts.join('\n\n')
+      : augmentedSystemPrompt;
+  const isFirstTurn = history.get(request.sessionId).length === 0;
   const messages = opts.promptBlocks && opts.promptBlocks.length > 0
     ? appendUserPromptBlocksAndBuildMessages(
         history,
@@ -262,6 +280,9 @@ export async function runDaemonPromptTurn(opts: {
         request.userText,
         effectiveSystemPrompt,
       );
+  if (fast && !isFirstTurn) {
+    messages.unshift({ role: 'system', content: fastPathGuidance });
+  }
   const result = await runCoreTurn({
     sessionId: request.sessionId,
     userText: request.userText,

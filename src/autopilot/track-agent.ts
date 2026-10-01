@@ -8,6 +8,7 @@ import { getUserConfig } from '../user-config.js';
 import { decideBudget, readBudgetInputsLive } from '../self-implement/budget-gate.js';
 import { findTrack } from './mission-phase-track.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { decideShadowTrackAction, launchTrackAgentShadow, type ShadowOptions } from './track-agent-shadow.js';
 
 export type TrackAgentInput = { missionId: string; taskId: string; title: string; prompt: string; track: string };
 export type TrackAgentDecision = { action: 'say' | 'hold'; reason?: string };
@@ -25,6 +26,8 @@ type RunnerDeps = {
   session?: (persona: string) => string;
   root?: string;
   maxConcurrent?: number;
+  shadow?: boolean;
+  shadowOptions?: ShadowOptions;
 };
 const root = resolve(import.meta.dir, '../..');
 // The installed package is not a git checkout — the daemon's target repository comes first.
@@ -41,7 +44,8 @@ const runCli = async (args: string[]): Promise<{ stdout: string }> => {
   const { argv, env } = universeLaunch(args);
   return exec('bun', argv, { cwd: repoDir(), env, timeout: 120_000, maxBuffer: 1024 * 1024, encoding: 'utf8' });
 };
-const forbidden = /\b(?:delete|remove|deploy|publish|release|restart|reboot|merge|force|pay|purchase|secret|credential|sudo|rm\s+-rf|config\s+set)\b|(?:^|\s)--prod\b|삭제|배포|게시|릴리스|재시작|재부팅|병합|결제|자격|비밀|강제/i;
+const forbiddenActionRegex = /\b(?:delete|remove|deploy|publish|release|restart|reboot|merge|force|pay|purchase|secret|credential|sudo|rm\s+-rf|config\s+set)\b|(?:^|\s)--prod\b|삭제|배포|게시|릴리스|재시작|재부팅|병합|결제|자격|비밀|강제/i;
+export const TRACK_AGENT_FORBIDDEN_ACTION_REGEX = new RegExp(forbiddenActionRegex.source, forbiddenActionRegex.flags);
 let running = 0;
 
 function context(input: TrackAgentInput, repo: string): string {
@@ -70,6 +74,17 @@ function context(input: TrackAgentInput, repo: string): string {
 }
 
 export async function decideTrackAction(input: TrackAgentInput, deps: RunnerDeps = {}): Promise<TrackAgentDecision> {
+  if (!(deps.shadow ?? getUserConfig().autopilot?.trackAgent?.shadow ?? false)) {
+    return decideTrackActionOnce(input, deps);
+  }
+  return decideShadowTrackAction(input, (value) => decideTrackActionOnce(value, deps), {
+    ...deps.shadowOptions,
+    maxDecisionsPerDay: deps.shadowOptions?.maxDecisionsPerDay
+      ?? getUserConfig().autopilot?.trackAgent?.shadowMaxDecisionsPerDay ?? 20,
+  });
+}
+
+async function decideTrackActionOnce(input: TrackAgentInput, deps: RunnerDeps): Promise<TrackAgentDecision> {
   try {
     const prompt = context(input, deps.root ?? repoDir());
     const persona = `track-${input.track}`;
@@ -83,7 +98,7 @@ export async function decideTrackAction(input: TrackAgentInput, deps: RunnerDeps
     const values = decision as Record<string, unknown>;
     if (!['say', 'hold'].includes(String(values.action)) || (values.reason !== undefined && typeof values.reason !== 'string')
       || Object.keys(values).some((key) => !['action', 'reason'].includes(key))) throw new Error('invalid decision');
-    if (typeof values.reason === 'string' && forbidden.test(values.reason)) throw new Error('forbidden action');
+    if (typeof values.reason === 'string' && forbiddenActionRegex.test(values.reason)) throw new Error('forbidden action');
     return decision as TrackAgentDecision;
   } catch (error) {
     log('decision-failed', { track: input.track, taskId: input.taskId, error: redactSecretText(String(error)) });
@@ -93,7 +108,7 @@ export async function decideTrackAction(input: TrackAgentInput, deps: RunnerDeps
 
 export async function executeTrackAction(decision: TrackAgentDecision, input: TrackAgentInput, deps: RunnerDeps = {}): Promise<TrackAgentResult> {
   if (decision.action !== 'say') return { status: 'held', detail: decision.reason ?? '사람 확인' };
-  if (forbidden.test(`${input.title}\n${input.prompt}`)) return { status: 'held', detail: '금지 작업 — 사람 확인' };
+  if (forbiddenActionRegex.test(`${input.title}\n${input.prompt}`)) return { status: 'held', detail: '금지 작업 — 사람 확인' };
   if (!findTrack(input.track)) return { status: 'held', detail: '트랙 미정 — 사람 확인' };
   try {
     const checkBudget = deps.checkBudget ?? (async () => {
@@ -112,6 +127,11 @@ export async function executeTrackAction(decision: TrackAgentDecision, input: Tr
   running++;
   let held = false;
   try {
+    if (deps.shadow ?? getUserConfig().autopilot?.trackAgent?.shadow ?? false) {
+      const result = await launchTrackAgentShadow(input, deps.shadowOptions);
+      log('shadow-orchestrate', { track: input.track, taskId: input.taskId, status: result.status, detail: result.detail });
+      return result;
+    }
     const launch = deps.launch ?? (async (args: string[]) => {
       const { argv, env } = universeLaunch(args);
       const child = spawn('bun', argv, { cwd: repoDir(), env, stdio: 'ignore', detached: true });

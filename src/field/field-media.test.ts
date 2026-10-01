@@ -142,6 +142,16 @@ describe('field captions (reel subtitles)', () => {
     expect(parseFieldCaption('그냥 사진')).toBeNull();
   });
 
+  test('each file caption writes a normalized line against its saved name', () => {
+    const rootDir = root();
+    const result = saveFieldMedia([
+      { originalName: 'a.jpg', mimeType: 'image/jpeg', bytes: bytes(1), caption: '첫 줄 | 하나' },
+      { originalName: 'b.jpg', mimeType: 'image/jpeg', bytes: bytes(1), caption: '두 번째\n줄' },
+    ], { rootDir, event: 'ev', device: 'd', now: NOW });
+    expect(readFileSync(join(result.dir, 'captions.txt'), 'utf8')).toBe(
+      `${result.saved[0]!.name} | 첫 줄 ｜ 하나\n${result.saved[1]!.name} | 두 번째 줄\n`);
+  });
+
   test('a caption becomes one captions.txt line on the first saved file only', async () => {
     const { saveFieldMedia, FIELD_CAPTIONS_FILE } = await import('./field-media.js');
     const { readFileSync } = await import('node:fs');

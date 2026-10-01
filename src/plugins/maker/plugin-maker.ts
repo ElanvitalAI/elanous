@@ -1,4 +1,5 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
@@ -33,12 +34,23 @@ export interface MakePluginResult {
   timings: { scaffold: number; write: number; validate: number; repair?: number; install: number; run?: number };
 }
 
-export async function codexWrite(dir: string, prompt: string): Promise<void> {
-  const child = Bun.spawn(['codex', 'exec', '-C', dir, '-s', 'workspace-write', '--skip-git-repo-check', '-o', join(dir, '.codex-last-message.txt'), prompt], {
-    cwd: dir, stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
-  });
-  const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
-  if (code !== 0) throw new Error(`codex exec failed (${code}): ${stderr.trim().slice(0, 500)}`);
+/** Run codex in the plugin folder without leaving run debris there: the last message goes to a temp file, and a
+ *  `.elanous/` that the run created (debug logs and a `latest` symlink from elanous processes codex starts in that
+ *  folder) is removed — the installer refuses symlinks, so the debris made every freshly written plugin uninstallable
+ *  (10-01 live `plugin node add`). A `.elanous/` that existed before the run is left alone. */
+export async function codexWrite(dir: string, prompt: string, bin = 'codex'): Promise<void> {
+  const scratch = mkdtempSync(join(tmpdir(), 'elanous-codex-'));
+  const stateDirExisted = existsSync(join(dir, '.elanous'));
+  try {
+    const child = Bun.spawn([bin, 'exec', '-C', dir, '-s', 'workspace-write', '--skip-git-repo-check', '-o', join(scratch, 'last-message.txt'), prompt], {
+      cwd: dir, stdin: 'ignore', stdout: 'ignore', stderr: 'pipe',
+    });
+    const [code, stderr] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+    if (code !== 0) throw new Error(`codex exec failed (${code}): ${stderr.trim().slice(0, 500)}`);
+  } finally {
+    if (!stateDirExisted) rmSync(join(dir, '.elanous'), { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 function scaffold(dir: string, slug: string, request: string): void {

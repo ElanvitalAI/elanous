@@ -10,6 +10,7 @@ import type { GuardianSpec } from './guardian/types.js';
 import { ptyAvailable } from './pty-shell/registry.js';
 import { krFlowAvailable } from './skills/tools/kr-flow.js';
 import { SELF_COGNITION_MCP_CATALOG_ENTRIES } from './tool-runtime/self-cognition-runtimes.js';
+import { SKILLS_LIST_DESCRIPTION } from './onboarding/entry-hints.js';
 
 export type { NativeToolHost } from './tool-surface.js';
 import type { NativeToolHost } from './tool-surface.js';
@@ -549,7 +550,7 @@ export const nativeToolCatalog: NativeToolCatalogEntry[] = [
     kind: 'other',
     aliases: ['ElanousSkillsList'],
     displayName: 'ElanousSkillsList',
-    description: 'Enumerate installed elanous skills (~/.elanous/skills/* + SKILL.md first line). Read-only.',
+    description: SKILLS_LIST_DESCRIPTION,
     promptSummary: '`elanous_skills_list` (list installed skill names before skill_exec when the exact name is unknown)',
     host: ['skill', 'tui', 'mcp'],
     safety: ['read-only'],

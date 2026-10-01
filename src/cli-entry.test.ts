@@ -66,6 +66,37 @@ function runBinWithDelayedStdout(args: string[], env: NodeJS.ProcessEnv = {}): {
 }
 
 describe('배포 엔트리 bin/elanous.mjs', () => {
+  test('release checklist 중복 칸과 없는 칸은 두 줄의 사용자 오류만 stderr로 낸다', () => {
+    const id = `cli-user-error-${process.pid}-${Date.now()}`;
+    const version = '99.99.99';
+    const added = runBin(['--test', 'release', 'checklist', '--version', version, 'add', id, 'test item']);
+    expect(added.status).toBe(0);
+    try {
+      const duplicate = runBin(['--test', 'release', 'checklist', '--version', version, 'add', id, 'again']);
+      expect(duplicate.status).toBe(1);
+      expect(duplicate.stdout).toBe('');
+      expect(duplicate.stderr.trim()).toBe(`❌ 이미 있는 칸: ${id}\n  ↳ set <id> 로 고친다`);
+      expect(duplicate.stderr).not.toMatch(/^\s*at\s|^Bun v/m);
+
+      const missing = runBin(['--test', 'release', 'checklist', '--version', version, 'set', `${id}-absent`, '--status', 'red']);
+      expect(missing.status).toBe(1);
+      expect(missing.stdout).toBe('');
+      expect(missing.stderr.trim()).toBe(`❌ 없는 칸: ${id}-absent\n  ↳ list 로 칸 목록을 본다`);
+      expect(missing.stderr).not.toMatch(/^\s*at\s|^Bun v/m);
+    } finally {
+      const removed = runBin(['--test', 'release', 'checklist', '--version', version, 'rm', id]);
+      expect(removed.status).toBe(0);
+    }
+  }, SPAWN_TIMEOUT_MS * 4);
+
+  test('예상하지 못한 예외는 코드 프레임과 스택을 보존한다', () => {
+    const missing = join(tmpdir(), `missing-checklist-seed-${process.pid}-${Date.now()}.md`);
+    const result = runBin(['--test', 'release', 'checklist', 'seed', '--from', missing]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('ENOENT');
+    expect(result.stderr).toMatch(/^\s*at\s/m);
+  }, SPAWN_TIMEOUT_MS);
+
   test('--version 이 산출을 낸다 (조용한 no-op 이 아니다)', () => {
     const { stdout, stderr, status } = runBin(['--version']);
     // ⛔ exit 0 만으로는 못 가른다 — 죽은 엔트리도 exit 0 였다. 산출을 재야 한다.
@@ -123,6 +154,13 @@ describe('배포 엔트리 bin/elanous.mjs', () => {
     const { stdout, stderr, status } = runBin(['--help']);
     expect(status).toBe(0);
     expect(`${stdout}${stderr}`).not.toMatch(/^\s*repro(?:\||\s|$)/m);
+  }, SPAWN_TIMEOUT_MS);
+
+  test('top-level help advertises ACP server and websocket transport', () => {
+    const { stdout, status } = runBin(['--test', '--help']);
+    expect(status).toBe(0);
+    expect(stdout).toContain('--acp-server');
+    expect(stdout).toContain('--transport=websocket');
   }, SPAWN_TIMEOUT_MS);
 
   test('nexus run 도움말 끝은 등록된 숨은 옵션의 수와 이름을 알린다', () => {

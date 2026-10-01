@@ -40,7 +40,7 @@ type FakePage = {
   title?: string;
   bodyText?: string;
   elements: FakeElement[];
-  images?: Array<{ complete: boolean; naturalWidth: number }>;
+  images?: Array<{ complete: boolean; naturalWidth: number; loading?: string; rect?: { top: number; bottom: number; left: number; right: number }; getBoundingClientRect?: () => { top: number; bottom: number; left: number; right: number } }>;
 };
 
 function textElement(text: string, children: FakeElement[] = [], options: Pick<FakeElement, 'display' | 'visibility'> = {}): FakeElement {
@@ -90,13 +90,14 @@ function fakeClient(over: FakeOptions = {}): CdpClient {
         const document = {
           title: page.title ?? 'Deployed Page',
           body: { innerText: page.bodyText ?? nodes.map(({ nodeValue }) => nodeValue).join(' ') },
-          images: page.images ?? [],
+          images: (page.images ?? []).map((image) => ({ ...image, getBoundingClientRect: image.getBoundingClientRect ?? (() => image.rect ?? { top: 1000, bottom: 1100, left: 0, right: 100 }) })),
           createTreeWalker: () => {
             let index = 0;
             return { nextNode: () => nodes[index++] ?? null };
           },
         };
         const window = {
+          innerHeight: 800, innerWidth: 600,
           getComputedStyle: (element: FakeElement) => ({ display: element.display ?? 'block', visibility: element.visibility ?? 'visible' }),
         };
         return new Function('document', 'window', 'NodeFilter', `return ${expr}`)(document, window, { SHOW_TEXT: 4 });
@@ -208,6 +209,46 @@ describe('verifyDeployedPage (B2)', () => {
     expect(r.structuredFindings).toContainEqual(expect.objectContaining({ kind: 'unloaded-image', certainty: 'confirmed' }));
     expect(r.structuredFindings).toContainEqual(expect.objectContaining({ kind: 'empty-title', certainty: 'confirmed' }));
     expect(r.findings).toContain('로드되지 못한 그림 2개');
+  });
+
+  test('CDP: 화면 밖 lazy 셋은 ok이고 pendingLazyImages로만 보고', async () => {
+    const images = Array.from({ length: 3 }, () => ({ complete: false, naturalWidth: 0, loading: 'lazy' }));
+    const r = await verifyDeployedPage('https://lazy.example', {
+      connect: async () => fakeClient({ page: { title: 'Lazy page', bodyText: '본문 길이가 충분한 정상 페이지입니다', elements: [], images } }),
+    });
+    expect(r).toMatchObject({ ok: true, findings: [], pendingLazyImages: 3, screenshotBytes: 7 });
+    expect(r.structuredFindings).toBeUndefined();
+  });
+
+  test('CDP: 화면 안 미완료 lazy와 깨진 완료 그림은 unloaded-image', async () => {
+    const r = await verifyDeployedPage('https://broken.example', {
+      connect: async () => fakeClient({ page: { bodyText: '본문 길이가 충분한 정상 페이지입니다', elements: [], images: [
+        { complete: false, naturalWidth: 0, loading: 'lazy', rect: { top: 30, bottom: 130, left: 10, right: 110 } },
+        { complete: true, naturalWidth: 0, loading: 'lazy' },
+      ] } }),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.findings).toContain('로드되지 못한 그림 2개');
+  });
+
+  test('aside: 삽입된 관측 스크립트의 화면 밖 lazy 셋은 실패가 아닌 pending', async () => {
+    const images = Array.from({ length: 3 }, () => ({ complete: false, naturalWidth: 0, loading: 'lazy', getBoundingClientRect: () => ({ top: 1000, bottom: 1100, left: 0, right: 100 }) }));
+    const r = await verifyDeployedPage('https://lazy.example', {
+      backend: 'aside',
+      runAside: async (_command, args) => {
+        const document = { body: { innerText: '본문 길이가 충분한 정상 페이지입니다' }, images };
+        const window = { innerHeight: 800, innerWidth: 600 };
+        const evaluate = (fn: () => unknown) => new Function('document', 'window', `return (${fn.toString()})()`)(document, window);
+        const output: string[] = [];
+        await new Function('openTab', 'closeTab', 'console', `return (async () => { ${args[1]} })()`) (
+          async () => ({ title: async () => 'Lazy page', evaluate, screenshot: async () => Buffer.from('PNGDATA') }),
+          async () => {}, { log: (line: string) => output.push(line) },
+        );
+        return { stdout: `${output.join('\n')}\n[ok | 1ms]` };
+      },
+    });
+    expect(r).toMatchObject({ ok: true, findings: [], pendingLazyImages: 3, title: 'Lazy page' });
+    expect(r.structuredFindings).toBeUndefined();
   });
 
   test('표현식은 중첩된 한 번의 문구를 중복으로 오판하지 않는다', async () => {
@@ -339,6 +380,15 @@ describe('verifyDeployedPage (B2)', () => {
     expect(r).toEqual({ ok: true, url: 'https://aside.example/path?quoted="yes"', title: 'Aside page', bodyLength: 88, screenshotBytes: 11, findings: [], unmeasured: ['javascript-errors'] });
   });
 
+  test('Aside 미실행 문구가 페이지 제목이면 정상 ok 관측으로 유지한다', async () => {
+    const url = 'https://aside.example';
+    const r = await verifyDeployedPage(url, {
+      backend: 'aside',
+      runAside: async () => ({ stdout: '{"title":"Aside isn\'t running","bodyLength":88,"unloadedImageCount":0,"screenshotBytes":11}\n[ok | 12ms]', stderr: '', exitCode: 0 }),
+    });
+    expect(r).toEqual({ ok: true, url, title: "Aside isn't running", bodyLength: 88, screenshotBytes: 11, findings: [], unmeasured: ['javascript-errors'] });
+  });
+
   test('aside 기본 executor는 non-zero 종료여도 ok 표지가 있으면 성공으로 판정한다', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'aside-nonzero-'));
     const command = join(directory, 'aside');
@@ -359,6 +409,67 @@ describe('verifyDeployedPage (B2)', () => {
     });
     expect(r.unmeasured).toEqual(['javascript-errors']);
     expect(r.structuredFindings?.map(({ kind }) => kind)).toEqual(['empty-body', 'unloaded-image', 'empty-title']);
+  });
+
+  test('aside가 안 떠 있으면 stderr와 rc를 사용해 페이지 오류 대신 hint·미측정 skip으로 보고한다', async () => {
+    const url = 'https://aside.example';
+    const calls: Array<{ url: string; kind: string }> = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'verify-aside-skipped') calls.push(data as { url: string; kind: string });
+    });
+    try {
+      const r = await verifyDeployedPage(url, {
+        backend: 'aside',
+        runAside: async () => ({ stdout: '', stderr: "Failed to request daemon auth challenge: The operation was aborted due to timeout\nAside isn't running on this machine.", exitCode: 1 }),
+      });
+      expect(r).toEqual({ ok: false, url, skipped: 'aside-not-running', findings: ['Aside 브라우저가 안 떠 있음 — Aside 브라우저를 켜고 다시 · 또는 `aside exec --host <host>`'], unmeasured: ['javascript-errors', 'screenshot'] });
+      expect(r.structuredFindings).toBeUndefined();
+      expect(r.screenshotBytes).toBeUndefined();
+      expect(calls).toEqual([{ url, kind: 'not-running' }]);
+      const report = formatVerifyUrlReport(url, r).join('\n');
+      expect(report).toContain('⚪ Aside 검증 건너뜀');
+      expect(report).not.toContain('⚠️ 문제 감지');
+      expect(report).toContain('Aside 브라우저가 안 떠 있음');
+      expect(report).toContain('스크린샷: 못 쟀다');
+      expect(report).not.toContain('스크린샷: 0 bytes');
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('daemon auth challenge timeout만 있으면 같은 skip이며 kind는 auth-timeout', async () => {
+    const calls: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((_category, event, data) => {
+      if (event === 'verify-aside-skipped') calls.push((data as { kind: string }).kind);
+    });
+    try {
+      const r = await verifyDeployedPage('https://aside.example', {
+        backend: 'aside',
+        runAside: async () => ({ stdout: '', stderr: 'Failed to request daemon auth challenge: The operation was aborted due to timeout', exitCode: 1 }),
+      });
+      expect(r.skipped).toBe('aside-not-running');
+      expect(r.ok).toBe(false);
+      expect(r.unmeasured).toEqual(['javascript-errors', 'screenshot']);
+      expect(r.findings[0]).toContain('Aside 브라우저를 켜고 다시');
+      expect(r.structuredFindings).toBeUndefined();
+      expect(calls).toEqual(['auth-timeout']);
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('aside 기본 executor도 stderr의 앱 부재를 skip으로 전달한다', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'aside-not-running-'));
+    const command = join(directory, 'aside');
+    await writeFile(command, '#!/bin/sh\necho "Aside isn\x27t running on this machine." >&2\nexit 1\n', 'utf8');
+    await chmod(command, 0o755);
+    try {
+      const r = await verifyDeployedPage('https://aside.example', { backend: 'aside', asideCommand: command });
+      expect(r.skipped).toBe('aside-not-running');
+      expect(r.structuredFindings).toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   test('aside 실행 파일 부재는 no-aside로 fail-soft skip한다', async () => {
@@ -404,7 +515,7 @@ describe('verifyDeployedPage (B2)', () => {
       backend: 'aside',
       runAside: async () => ({ stdout: 'ReferenceError: missingFn is not defined\n\x1b[2m[error | 12ms]\x1b[0m' }),
     });
-    expect(r.findings[0]).toContain('aside repl reported error');
+    expect(r.findings[0]).toContain('aside repl reported error (repl-error)');
     expect(r.structuredFindings).toEqual([expect.objectContaining({ kind: 'aside-error', certainty: 'confirmed' })]);
   });
 
@@ -413,7 +524,7 @@ describe('verifyDeployedPage (B2)', () => {
       backend: 'aside',
       runAside: async () => ({ stdout: '\x1b[2m{"title":"Aside page","bodyLength":88,"unloadedImageCount":0,"screenshotBytes":11}\x1b[0m' }),
     });
-    expect(r.findings[0]).toContain('aside observation output missing completion marker');
+    expect(r.findings[0]).toContain('aside observation output missing completion marker (no-marker)');
     expect(r.structuredFindings).toEqual([expect.objectContaining({ kind: 'aside-error', certainty: 'confirmed' })]);
   });
 

@@ -1,6 +1,6 @@
 {
   "name": "elanous",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Self-healing coding harness where eyes, hands, and memory all turn on one sentence — it authors its own goals, implements them in isolated worktrees, and reviews its own work.",
   "license": "Apache-2.0",
   "author": "Elanvital AI",
@@ -11,8 +11,8 @@
   },
   "type": "module",
   "bin": {
-    "elanous": "./bin/elanous.mjs",
-    "eln": "./bin/elanous.mjs"
+    "elanous": "./bin/elanous.cjs",
+    "eln": "./bin/elanous.cjs"
   },
   "engines": {
     "bun": ">=1.3.5"
@@ -111,7 +111,6 @@
     "remark-rehype": "^11.1.2",
     "sharp": "^0.34.5",
     "shiki": "^4.0.2",
-    "telegram": "^2.26.22",
     "typescript": "^5.7.0",
     "unified": "^11.0.5",
     "web-push": "^3.6.7",
@@ -119,7 +118,8 @@
     "yaml": "^2.8.3"
   },
   "optionalDependencies": {
-    "node-pty": "^1.1.0"
+    "node-pty": "^1.1.0",
+    "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@types/bun": "^1.2.0",

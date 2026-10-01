@@ -111,6 +111,21 @@ describe('harness API handlers', () => {
     expect(logs.filter((event) => event === 'ask-origin-ignored')).toHaveLength(1);
   });
 
+  test('ask forwards a Discord origin (the shape discord-seat-work sends) instead of logging invalid-origin (EV12b)', async () => {
+    const origin = { channel: 'discord' as const, channelId: '123456789012345678', discordThreadId: '987654321098765432' };
+    const launches: Array<{ env?: Record<string, string> }> = [];
+    const logs: string[] = [];
+    const response = await handleHarnessAskPost(request('/v1/harness/ask', { text: 'ask', origin }), {}, {
+      log: (event) => { logs.push(event); },
+      runAskLaunchFlow: async () => ({ kind: 'launch', goalFile: '/tmp/GOAL.md' }) as never,
+      launchDevGoalFileDetached: async (input) => { launches.push(input); },
+    });
+    expect(response.status).toBe(202);
+    await Bun.sleep(0);
+    expect(logs).not.toContain('ask-origin-ignored');
+    expect(readReportOrigin(launches[0]!.env ?? {})).toEqual(origin);
+  });
+
   test('ask emits an empty sessionId without changing the accepted response when omitted', async () => {
     const feedback: unknown[] = [];
     const response = await handleHarnessAskPost(request('/v1/harness/ask', { text: 'ask' }), {}, {

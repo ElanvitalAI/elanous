@@ -31,7 +31,7 @@ function run(args: string[], env: ReturnType<typeof setup> = setup(), path = pro
   const result = spawnSync('/bin/bash', [installer, ...args], {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ...extra },
+    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ELANOUS_INSTALL_LANG: 'en', ...extra },
   });
   return { ...env, result };
 }
@@ -78,7 +78,7 @@ function pack(destination: string): string {
 
 describe('scripts/install.sh', () => {
   test('package bin exposes elanous and eln through the same entrypoint, without mda', () => {
-    expect(packageJson.bin).toEqual({ elanous: './bin/elanous.mjs', eln: './bin/elanous.mjs' });
+    expect(packageJson.bin).toEqual({ elanous: './bin/elanous.cjs', eln: './bin/elanous.cjs' });
   });
 
   test('--help names every supported argument', () => {
@@ -223,7 +223,7 @@ describe('scripts/install.sh', () => {
     const missing = spawnSync(elanous, ['--version'], { encoding: 'utf8', env: { HOME: env.home, PATH: '/usr/bin:/bin' } });
     expect(missing.status).toBe(127);
     expect(missing.stdout).toBe('');
-    expect(missing.stderr).toBe(`bun 을 찾을 수 없습니다: ${unavailable} — 설치기를 다시 실행하세요\n`);
+    expect(missing.stderr).toBe(`bun not found: ${unavailable} — run the installer again\n`);
   }, 120_000);
 
   test('preserves the first installation startup file across a real reinstallation', () => {
@@ -441,20 +441,19 @@ describe('scripts/install.sh', () => {
   }, 120_000);
 
   // 결정 2026-09-23 — Phase 3 「사람 손」: 설치가 끝나면 «지금 상태로 계산한» 다음 걸음을 말한다.
-  test('ends with state-aware next steps — login only when not logged in, never a provider-config step', () => {
+  test('ends with next steps in order — new shell → elanous first setup → harness say · no separate login · never a provider-config step (INST1)', () => {
     const env = setup();
     const fresh = run(['--no-modify-path'], env);
     expect(fresh.result.status, fresh.result.stderr).toBe(0);
     const next = fresh.result.stdout.slice(fresh.result.stdout.indexOf('Next:'));
-    expect(next).toContain('elanous login openai-codex');
-    expect(next).toContain('eln harness say');
-    expect(next).toContain('elanous harness say');
+    const shell = next.indexOf('to PATH');
+    const firstSetup = next.indexOf('# first-time setup');
+    const say = next.indexOf('harness say');
+    expect(shell).toBeGreaterThan(-1);
+    expect(firstSetup).toBeGreaterThan(shell);
+    expect(say).toBeGreaterThan(firstSetup);
+    expect(next).not.toContain('elanous login');   // first-time setup signs in
     expect(next).not.toContain('llm.provider');   // auto 는 로그인만 있으면 런타임이 codex 로 고른다(#19950)
-    mkdirSync(join(env.home, '.elanous'), { recursive: true });
-    writeFileSync(join(env.home, '.elanous', 'auth.json'), JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: {} } } }));
-    const again = run(['--no-modify-path'], env);
-    expect(again.result.status, again.result.stderr).toBe(0);
-    expect(again.result.stdout.slice(again.result.stdout.indexOf('Next:'))).not.toContain('elanous login');
   }, 180_000);
 
   test('Next suggests build tools then node-pty rebuild and ripgrep only when missing on Debian PATH', () => {
@@ -611,16 +610,16 @@ describe('scripts/install.sh', () => {
     expect(spawnSync('tar', ['-xzf', tgz, '-C', unpacked]).status).toBe(0);
     const pkgFile = join(unpacked, 'package', 'package.json');
     const pkg = JSON.parse(readFileSync(pkgFile, 'utf8')) as Record<string, unknown>;
-    pkg.version = `${packageJson.version}-rollbacktest`;
+    pkg.version = `${packageJson.version}+rollbacktest`;
     writeFileSync(pkgFile, JSON.stringify(pkg));
     const second = join(work, 'second.tgz');
     expect(spawnSync('tar', ['-czf', second, '-C', unpacked, 'package']).status).toBe(0);
     const upgraded = run(['--no-modify-path', '--source', second], env);
     expect(upgraded.result.status, upgraded.result.stderr).toBe(0);
-    expect(readlinkSync(join(prefix, 'current'))).toBe(`versions/${packageJson.version}-rollbacktest`);
+    expect(readlinkSync(join(prefix, 'current'))).toBe(`versions/${packageJson.version}+rollbacktest`);
     const switched = spawnSync(elanous, ['--version'], { encoding: 'utf8', env: { HOME: env.home, PATH: '/usr/bin:/bin' } });
     expect(switched.status, switched.stderr).toBe(0);
-    expect(switched.stdout).toContain(`${packageJson.version}-rollbacktest`);
+    expect(switched.stdout).toContain(`${packageJson.version}+rollbacktest`);
     expect(existsSync(join(prefix, 'versions', firstDir, 'node_modules', 'elanous'))).toBe(true);   // 옛 버전은 남는다
   }, 240_000);
 
@@ -756,4 +755,102 @@ test('reuses bun from ${BUN_INSTALL}/bin when bun is not on PATH', () => {
     expect(`${r.stdout}${r.stderr}`).toContain('REUSED-BUN');
     expect(`${r.stdout}${r.stderr}`).not.toContain('installing bun');
   } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+describe('INST2 — finish in the same window', () => {
+  function fakeSetup(dir: string): { exec: string; record: string } {
+    const record = join(dir, 'setup-called');
+    const exec = join(dir, 'fake-setup');
+    writeFileSync(exec, `#!/bin/sh\nprintf '%s\\n' "$@" > '${record}'\n`, { mode: 0o755 });
+    return { exec, record };
+  }
+
+  test('interactive: starts first-time setup with the absolute wrapper after the Next list', () => {
+    const env = setup();
+    const { exec, record } = fakeSetup(env.dir);
+    const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('Starting first-time setup');
+    expect(result.stdout).not.toContain('Run: ');
+    expect(readFileSync(record, 'utf8').trim()).toBe(join(realpathSync(prefix), 'bin', 'elanous'));
+  }, 180_000);
+
+  test('non-interactive: never starts setup and the first Next line is the absolute Run command', () => {
+    const env = setup();
+    const { exec, record } = fakeSetup(env.dir);
+    const { prefix, result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0', ELANOUS_INSTALL_SETUP_EXEC: exec });
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(record)).toBe(false);
+    const next = result.stdout.slice(result.stdout.indexOf('Next:')).split('\n');
+    expect(next.find((line) => line.includes('Run: '))).toContain(`Run: ${join(realpathSync(prefix), 'bin', 'elanous')}`);
+    expect(result.stdout).not.toContain('Starting first-time setup');
+  }, 180_000);
+
+  test('--no-setup: an interactive terminal still does not start setup', () => {
+    const env = setup();
+    const { exec, record } = fakeSetup(env.dir);
+    const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(record)).toBe(false);
+    expect(result.stdout).not.toContain('Starting first-time setup');
+  }, 180_000);
+
+  test('the registry fallback keeps bun noise («Blocked N postinstalls») off the screen when it succeeds', () => {
+    const env = setup();
+    const realBun = spawnSync('/bin/bash', ['-c', 'command -v bun'], { encoding: 'utf8' }).stdout.trim();
+    const shim = join(env.dir, 'shim');
+    mkdirSync(shim);
+    // offline add fails (cache miss) · registry add prints the noise and then really installs.
+    writeFileSync(join(shim, 'bun'), `#!/bin/sh\ncase "$*" in\n  *"add --no-save --offline"*) exit 1 ;;\n  *"add --no-save"*) echo "Blocked 3 postinstalls. Run \\\`bun pm untrusted\\\` for details."; exec '${realBun}' "$@" --offline ;;\nesac\nexec '${realBun}' "$@"\n`, { mode: 0o755 });
+    const { result } = run(['--no-modify-path', '--no-setup'], env, `${shim}:${process.env.PATH ?? ''}`, repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '0' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(`${result.stdout}${result.stderr}`).toContain('fetching them from the npm registry');
+    expect(`${result.stdout}${result.stderr}`).not.toContain('Blocked 3 postinstalls');
+  }, 180_000);
+});
+
+describe('INST1 — one language · no silent downgrade · ask before updating', () => {
+  function plantInstalled(prefix: string, version: string): void {
+    mkdirSync(prefix, { recursive: true });
+    writeFileSync(join(prefix, 'install.json'), JSON.stringify({ version, versionDir: `versions/${version}`, source: 'test', installedAt: '2026-10-01T00:00:00Z' }));
+  }
+
+  test('an older package than the installed one changes nothing and says how to go back on purpose', () => {
+    const env = setup();
+    plantInstalled(env.prefix, '99.0.0');
+    const { result } = run(['--no-modify-path', '--no-setup'], env);
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain('--allow-downgrade');
+    expect(existsSync(join(env.prefix, 'current'))).toBe(false);
+    expect(existsSync(join(env.prefix, 'bin', 'elanous'))).toBe(false);
+  }, 180_000);
+
+  test('--allow-downgrade installs the older package', () => {
+    const env = setup();
+    plantInstalled(env.prefix, '99.0.0');
+    const { result } = run(['--no-modify-path', '--no-setup', '--allow-downgrade'], env);
+    expect(result.status, result.stderr).toBe(0);
+    expect(existsSync(join(env.prefix, 'bin', 'elanous'))).toBe(true);
+  }, 180_000);
+
+  test('an interactive re-run asks before updating — «n» leaves the installation as it is', () => {
+    const env = setup();
+    plantInstalled(env.prefix, '0.0.1');
+    const { result } = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_ANSWER: 'n', CI: '' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('Update to');
+    expect(result.stdout).toContain('Left elanous 0.0.1 as it is.');
+    expect(existsSync(join(env.prefix, 'bin', 'elanous'))).toBe(false);
+  }, 180_000);
+
+  test('a Korean locale gets the whole normal path in Korean (polite form), English otherwise', () => {
+    const env = setup();
+    const ko = run(['--no-modify-path', '--no-setup'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_LANG: 'ko' });
+    expect(ko.result.status, ko.result.stderr).toBe(0);
+    expect(ko.result.stdout).toContain('설치했습니다');
+    expect(ko.result.stdout).toContain('다음:');
+    expect(ko.result.stdout).toContain('첫 설정');
+    expect(ko.result.stdout).not.toContain('Next:');
+    expect(ko.result.stdout).not.toMatch(/쓰십시오|않았다 —/);
+  }, 180_000);
 });

@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import { debug } from '../../debug/log.js';
 import { decideGraphApproval, lastJsonObject, type GraphRunState } from '../../graph-runner/runner.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
+import { getElanousConfigDir } from '../../elanous-config-dir.js';
 import { jsonResponse } from './json-response.js';
+import { applyFeedEdit, feedFolderFor, isFeedPreviewMessage, mediaContentType, readFeedDraft, resolveFeedMedia, writeFeedDraft, type FeedDraft } from './graph-approvals-feed.js';
 
 export const GRAPH_APPROVALS_PATH = '/v1/graph-approvals';
 const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -16,6 +18,8 @@ interface GraphApprovalItem {
   since: string;
   path: string[];
   recent: Array<{ nodeId: string; ok: boolean; outcome?: string; summary?: string }>;
+  /** EV10d — present only for a `{"kind":"feed-preview"}` approval whose run folder holds a valid draft. */
+  feed?: Omit<FeedDraft, 'folder'>;
 }
 
 /** One decision this daemon applied through `POST /v1/graph-approvals/:graphId/:runId`. */
@@ -72,6 +76,8 @@ interface GraphApprovalsDeps {
    * `tailscale serve` every tailnet peer (Pod included) arrives from loopback. */
   authReason?: (request: Request) => string | undefined;
   root?: string;
+  /** Config dir whose `field/<slug>` folders may hold feed drafts (EV10d). */
+  configDir?: string;
 }
 
 const DECISION_AUTH_REASONS = new Set(['bearer-match', 'temp-token', 'noauth']);
@@ -96,7 +102,16 @@ function undecided(state: GraphRunState, root: string): boolean {
     && Array.isArray(state.path) && !existsSync(join(root, 'graph-runs', state.graphId, `${state.runId}.json.${state.path.length}.decision.json`));
 }
 
-function list(root: string): GraphApprovalItem[] {
+function feedFor(state: GraphRunState, configDir: string): Omit<FeedDraft, 'folder'> | undefined {
+  if (!isFeedPreviewMessage(state.pending?.message ?? '')) return undefined;
+  const folder = feedFolderFor(state, configDir);
+  const draft = folder ? readFeedDraft(folder) : null;
+  if (!draft) return undefined;
+  const { folder: _folder, ...rest } = draft;
+  return rest;
+}
+
+function list(root: string, configDir: string): GraphApprovalItem[] {
   const dir = join(root, 'graph-runs');
   let graphs: Dirent[];
   try { graphs = readdirSync(dir, { withFileTypes: true }); }
@@ -113,6 +128,7 @@ function list(root: string): GraphApprovalItem[] {
       const state = readRun(root, graph.name, runId);
       if (!state || !undecided(state, root) || !Array.isArray(state.nodes)) continue;
       const pending = state.pending!;
+      const feed = feedFor(state, configDir);
       items.push({
         graphId: state.graphId, runId: state.runId, nodeId: pending.nodeId, message: pending.message,
         since: pending.since, path: state.path,
@@ -124,6 +140,7 @@ function list(root: string): GraphApprovalItem[] {
             ...(typeof output?.summary === 'string' ? { summary: output.summary } : {}),
           };
         }),
+        ...(feed ? { feed } : {}),
       });
     }
   }
@@ -131,14 +148,17 @@ function list(root: string): GraphApprovalItem[] {
 }
 
 export async function handleGraphApprovals(req: Request, deps: GraphApprovalsDeps = {}): Promise<Response> {
-  const pathname = new URL(req.url).pathname;
+  const url = new URL(req.url);
+  const pathname = url.pathname;
+  const sub = /^\/v1\/graph-approvals\/([^/]+)\/([^/]+)\/(feed-draft|media)$/.exec(pathname);
   const match = /^\/v1\/graph-approvals\/([^/]+)\/([^/]+)$/.exec(pathname);
-  if (pathname !== GRAPH_APPROVALS_PATH && !match) return jsonResponse({ error: 'not-found' }, 404);
+  if (pathname !== GRAPH_APPROVALS_PATH && !match && !sub) return jsonResponse({ error: 'not-found' }, 404);
   if (!deps.authorize?.(req)) return jsonResponse({ error: 'unauthorized' }, 401);
+  if (sub) return handleFeed(req, url, sub[1]!, sub[2]!, sub[3] as 'feed-draft' | 'media', deps);
   if (pathname === GRAPH_APPROVALS_PATH) {
     if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
     // ⭐ `items` is unchanged; `decided` is additive (newest first) for other devices' cards.
-    return jsonResponse({ items: list(deps.root ?? effectiveInstanceRoot()), decided: (deps.decisions ?? defaultDecisionRing).list() });
+    return jsonResponse({ items: list(deps.root ?? effectiveInstanceRoot(), deps.configDir ?? getElanousConfigDir()), decided: (deps.decisions ?? defaultDecisionRing).list() });
   }
   if (req.method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
   const authReason = deps.authReason?.(req);
@@ -171,4 +191,51 @@ export async function handleGraphApprovals(req: Request, deps: GraphApprovalsDep
   (deps.decisions ?? defaultDecisionRing).record({ graphId, runId, nodeId, decision });
   debug.log('approvals.graph', 'decided', { graphId, runId, nodeId, decision, by: `pwa:${authReason}` });
   return jsonResponse({ graphId, runId, decision });
+}
+
+/** EV10d — `PUT …/:graphId/:runId/feed-draft` (사람 수정 저장) · `GET …/:graphId/:runId/media?path=` (초안 미디어). */
+async function handleFeed(req: Request, url: URL, rawGraphId: string, rawRunId: string, kind: 'feed-draft' | 'media', deps: GraphApprovalsDeps): Promise<Response> {
+  let graphId: string;
+  let runId: string;
+  try { graphId = decodeURIComponent(rawGraphId); runId = decodeURIComponent(rawRunId); }
+  catch { return jsonResponse({ error: 'not-found' }, 404); }
+  if (!validSegment(graphId) || !validSegment(runId)) return jsonResponse({ error: 'not-found' }, 404);
+  const root = deps.root ?? effectiveInstanceRoot();
+  const state = readRun(root, graphId, runId);
+  const folder = state && isFeedPreviewMessage(state.pending?.message ?? '') ? feedFolderFor(state, deps.configDir ?? getElanousConfigDir()) : null;
+  if (!state || !folder) {
+    debug.log('approvals.feed', 'refused', { graphId, reason: 'not-feed' });
+    return jsonResponse({ error: 'not-found' }, 404);
+  }
+  if (kind === 'media') {
+    if (req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    const file = resolveFeedMedia(folder, url.searchParams.get('path') ?? '');
+    if (!file) {
+      debug.log('approvals.feed', 'refused', { graphId, reason: 'media-path' });
+      return jsonResponse({ error: 'not-found' }, 404);
+    }
+    debug.log('approvals.feed', 'media-served', { graphId });
+    return new Response(Bun.file(file), { headers: { 'content-type': mediaContentType(file), 'cache-control': 'private, max-age=60' } });
+  }
+  if (req.method !== 'PUT') return jsonResponse({ error: 'method-not-allowed' }, 405);
+  const authReason = deps.authReason?.(req);
+  if (!authReason || !DECISION_AUTH_REASONS.has(authReason)) {
+    debug.log('approvals.feed', 'refused', { graphId, reason: 'pairing-required' });
+    return jsonResponse({ error: 'pairing-required' }, 403);
+  }
+  if (!undecided(state, root)) return jsonResponse({ error: 'already-decided' }, 409);
+  const current = readFeedDraft(folder);
+  if (!current) return jsonResponse({ error: 'not-found' }, 404);
+  let body: unknown;
+  try { body = await req.json(); }
+  catch { return jsonResponse({ error: 'bad_request' }, 400); }
+  const result = applyFeedEdit(current, body);
+  if (!result.ok) {
+    debug.log('approvals.feed', 'refused', { graphId, reason: result.error });
+    return jsonResponse({ error: result.error }, 400);
+  }
+  writeFeedDraft(folder, result.draft);
+  debug.log('approvals.feed', 'draft-saved', { graphId, revision: result.draft.revision });
+  const { folder: _folder, ...feed } = result.draft;
+  return jsonResponse({ graphId, runId, feed });
 }

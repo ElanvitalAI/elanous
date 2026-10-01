@@ -16,10 +16,14 @@ const graph = parseYaml(readFileSync(graphFile, 'utf8')) as {
 };
 const recipes = parseYaml(readFileSync(join(dir, 'recipes.yaml'), 'utf8')) as Record<string, { command: string }>;
 const fakeSource = `#!/usr/bin/env bun
+import { appendFileSync } from 'node:fs';
 const [kind, ...args] = process.argv.slice(2);
+if (process.env.GEO_CHECK_CALL_LOG) appendFileSync(process.env.GEO_CHECK_CALL_LOG, JSON.stringify({kind,args,provider:process.env.ELANOUS_LLM_PROVIDER ?? null})+'\\n');
 const question = args.at(-1) || '';
 if (kind === 'research') { if (process.env.GEO_CHECK_NO_WEB) { console.log(JSON.stringify({query:question+' site https://elanous.ai/',output:'omni_search — 0 hits',metadata:{}})); process.exit(0); } console.log(JSON.stringify({query:question,output:'- [Guide](https://www.elanous.ai/guide)\\n  snippet',metadata:{}})); process.exit(0); }
 if (kind !== 'ask') process.exit(2);
+if (process.env.GEO_CHECK_NO_BARE && args.includes('--bare')) { console.error("error: unknown option '--bare'"); process.exit(1); }
+if (process.env.GEO_CHECK_ECHO_CWD) { console.log(JSON.stringify({reply:'cwd='+process.cwd()+' tool='+(process.env.ELANOUS_TOOL_CWD ?? 'none')})); process.exit(0); }
 if (question.includes('Generate exactly 5')) { console.log(JSON.stringify({reply:JSON.stringify(['What is an AI assistant?', 'Which assistant is best?', 'How can I automate?', 'What tools compare?', 'How much does it cost?'])})); process.exit(0); }
 if (question.includes('Using ONLY this score table')) { console.log(JSON.stringify({reply:JSON.stringify([1,2,3].map(n=>({suggestion:'Write FAQ '+n,evidence:{question:'Which assistant is best?',engine:'grok'}})))})); process.exit(0); }
 if (process.env.GEO_CHECK_REPLY) { console.log(JSON.stringify({provider:process.env.ELANOUS_LLM_PROVIDER,reply:process.env.GEO_CHECK_REPLY})); process.exit(0); }
@@ -33,11 +37,11 @@ function fixture() {
   chmodSync(bin, 0o755);
   return { root, bin, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
-async function step(name: string, input: Record<string, unknown>, outputs: Record<string, unknown>, bin: string, root: string) {
+async function step(name: string, input: Record<string, unknown>, outputs: Record<string, unknown>, bin: string, root: string, callLog?: string, extraEnv: Record<string, string> = {}) {
   const contextDir = join(root, 'run.json.contexts');
   const file = join(contextDir, `${name}.json`);
   await Bun.write(file, JSON.stringify({ input, outputs }));
-  const proc = Bun.spawn(['bun', join(dir, 'run-step.ts'), name], { env: { ...process.env, GEO_CHECK_ELANOUS_BIN: bin, ELANOUS_GRAPH_CONTEXT: file }, stdout: 'pipe', stderr: 'pipe' });
+  const proc = Bun.spawn(['bun', join(dir, 'run-step.ts'), name], { env: { ...process.env, GEO_CHECK_ELANOUS_BIN: bin, ELANOUS_GRAPH_CONTEXT: file, ...(callLog ? { GEO_CHECK_CALL_LOG: callLog } : {}), ...extraEnv }, stdout: 'pipe', stderr: 'pipe' });
   const [out, err, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   expect(exit).toBe(0);
   expect(err).toBe('');
@@ -51,6 +55,32 @@ test('six graph nodes connect only through their step recipes', () => {
     expect(recipes[name]?.command).toBe(`bun "$ELANOUS_GRAPH_DIR/run-step.ts" ${name}`);
     expect(graph.edges[index]?.map).toEqual({ ok: steps[index + 1] ?? 'done', fail: 'failed' });
   }
+});
+
+test('fake CLI receives bare JSON only for answers; questions and suggest retain their ask arguments', async () => {
+  const f = fixture();
+  try {
+    const callLog = join(f.root, 'calls.jsonl');
+    const questions = await step('questions', { brand: 'Elanous' }, {}, f.bin, f.root, callLog);
+    expect(questions).toMatchObject({ calls: 1, errors: 0 });
+    const answers = await step('answers', { brand: 'Elanous', engines: ['openai-codex', 'grok'] }, { questions: { questions: ['Which assistant is best?'] } }, f.bin, f.root, callLog);
+    expect(answers).toMatchObject({ calls: 2, errors: 1, outcome: 'ok' });
+    const suggest = await step('suggest', { brand: 'Elanous' }, { score: { table: [
+      { question: 'Which assistant is best?', engine: 'grok', error: 'credential unavailable', mention: false, citation: false },
+    ] } }, f.bin, f.root, callLog);
+    expect(suggest).toMatchObject({ calls: 1, errors: 0 });
+    expect(suggest.suggestions).toHaveLength(3);
+
+    const calls = readFileSync(callLog, 'utf8').trim().split('\n').map(row => JSON.parse(row) as { kind: string; args: string[]; provider: string | null });
+    expect(calls).toHaveLength(4);
+    expect(calls[0]).toMatchObject({ kind: 'ask', provider: null });
+    expect(calls[0]!.args).toEqual(['--json', 'Generate exactly 5 potential customer questions about the category of Elanous. Respond ONLY with a JSON array of 5 question strings. Do not include the brand name in any question.']);
+    expect(calls[1]).toEqual({ kind: 'ask', args: ['--bare', '--json', 'Which assistant is best?'], provider: 'openai-codex' });
+    expect(calls[2]).toEqual({ kind: 'ask', args: ['--bare', '--json', 'Which assistant is best?'], provider: 'grok' });
+    expect(calls[3]).toMatchObject({ kind: 'ask', provider: null });
+    expect(calls[3]!.args).toEqual(['--json', 'Using ONLY this score table, return a JSON array of 3 to 5 improvement suggestions. Each must have "suggestion" (FAQ question, FAQPage/Organization structured data, comparison document, etc.) and "evidence" containing a question and engine from the missing cells. Evidence cells: [{"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]. Score table: [{"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]']);
+    expect(readFileSync(join(dir, 'run-step.ts'), 'utf8')).not.toMatch(/(?:from\s*|import\s*\()['"][^'"]*src\//);
+  } finally { f.cleanup(); }
 });
 
 test('missing brand and invalid engines emit final-line JSON errors', async () => {
@@ -194,4 +224,47 @@ slowTest('a bare domain in the answer is a citation even when web search returns
 slowTest('a brand domain that appears only in the research query is not a citation', async () => {
   // The fake research echoes «<question> site https://elanous.ai/» as its query and returns no result links.
   expect(await citationRun('Several assistants exist; pick one that fits.')).toMatchObject({ mention: false, citation: false });
+});
+
+test('answers are asked from an empty folder, not the folder the graph runs in', async () => {
+  const f = fixture();
+  try {
+    const repo = mkdtempSync(join(tmpdir(), 'brand-repo-'));
+    writeFileSync(join(repo, 'AGENTS.md'), 'Elanous is this project.');
+    const contextDir = join(f.root, 'run.json.contexts');
+    const file = join(contextDir, 'answers.json');
+    await Bun.write(file, JSON.stringify({ input: { brand: 'Elanous', engines: ['openai-codex'] }, outputs: { questions: { questions: ['What tools exist?'] } } }));
+    const proc = Bun.spawn(['bun', join(dir, 'run-step.ts'), 'answers'], {
+      cwd: repo, env: { ...process.env, GEO_CHECK_ELANOUS_BIN: f.bin, ELANOUS_GRAPH_CONTEXT: file, GEO_CHECK_ECHO_CWD: '1', ELANOUS_TOOL_CWD: repo }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const [out, , exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    expect(exit).toBe(0);
+    const answer = String((JSON.parse(out.trim().split('\n').at(-1)!) as { answers: { answer: string }[] }).answers[0]!.answer);
+    expect(answer).toContain('geo-check-');
+    expect(answer).not.toContain(repo);
+    expect(answer).toContain('tool=none');
+    rmSync(repo, { recursive: true, force: true });
+  } finally { f.cleanup(); }
+});
+
+test('an installed elanous without ask --bare falls back to plain ask and marks the row', async () => {
+  const f = fixture();
+  try {
+    const callLog = join(f.root, 'calls.jsonl');
+    const answers = await step('answers', { brand: 'Elanous', engines: ['openai-codex'] }, { questions: { questions: ['What assistant should I use?'] } }, f.bin, f.root, callLog, { GEO_CHECK_NO_BARE: '1' });
+    expect(answers).toMatchObject({ calls: 1, errors: 0, outcome: 'ok' });
+    expect(answers.answers[0]).toMatchObject({ engine: 'openai-codex', answer: 'Visit https://elanous.ai/guide for details.', bare: false });
+    const calls = readFileSync(callLog, 'utf8').trim().split('\n').map(row => JSON.parse(row) as { args: string[] });
+    expect(calls.map(c => c.args)).toEqual([['--bare', '--json', 'What assistant should I use?'], ['--json', 'What assistant should I use?']]);
+  } finally { f.cleanup(); }
+});
+
+test('other ask failures are not retried without --bare', async () => {
+  const f = fixture();
+  try {
+    const callLog = join(f.root, 'calls.jsonl');
+    const answers = await step('answers', { brand: 'Elanous', engines: ['grok'] }, { questions: { questions: ['Which assistant is best?'] } }, f.bin, f.root, callLog);
+    expect(answers).toMatchObject({ calls: 1, errors: 1, outcome: 'fail' });
+    expect(readFileSync(callLog, 'utf8').trim().split('\n')).toHaveLength(1);
+  } finally { f.cleanup(); }
 });

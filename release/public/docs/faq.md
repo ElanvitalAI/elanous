@@ -59,4 +59,4 @@ Treat only capabilities with a written free fallback as dependable without payme
 
 ## How many steps from install to a first change?
 
-With a ChatGPT subscription and GitHub already signed in, three commands: `elanous doctor`, `elanous login openai-codex`, then `elanous harness say "<what you want>"` from your project. See [install](install.md) and [quickstart](quickstart.md).
+With a ChatGPT subscription, the first time is a few steps: run the installer, open a new shell, `elanous login openai-codex` (open the link and type the device code), answer first-time setup when you first run `elanous` (it asks for the model provider again and for an Obsidian vault path), then `elanous harness say "<what you want>"` from your project. Signing in to GitHub (`gh`) lets it open pull requests. See [install](install.md) and [quickstart](quickstart.md).

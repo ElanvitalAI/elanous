@@ -31,7 +31,7 @@ test('reads saved flags on mount and writes the key once per toggle', async () =
   const hidden = host.querySelector('[data-elanous-action="menu-show-hidden"]') as HTMLInputElement;
   expect(labs.checked).toBe(false);
   expect(hidden.checked).toBe(true);
-  expect(host.textContent).toContain('Workflows');
+  expect(host.textContent).toContain('Showroom');
   expect(host.textContent).toContain('Dashboard');
   // linkedom 은 체크박스 기본 동작(값 뒤집기)을 안 한다 — 브라우저처럼 값을 바꾼 뒤 click 사건을 보낸다.
   await act(async () => { labs.checked = true; labs.dispatchEvent(new window.Event('click', { bubbles: true })); });

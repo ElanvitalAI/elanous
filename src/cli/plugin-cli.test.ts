@@ -256,6 +256,21 @@ test('plugin make rejects an existing --name before invoking codex and reports J
   expect(JSON.parse(result.output)).toMatchObject({ status: 'failed', errors: [expect.stringContaining('already exists')] });
 });
 
+test('plugin node add CLI dispatches to addAndInstallNode with --kind and one-line --json', async () => {
+  const help = await cli(temp(), ['node', 'add', '--help']);
+  expect(help.code).toBe(0);
+  expect(help.output).toContain('--kind');
+  expect(help.output).toContain('--json');
+  const root = temp();
+  const source = fixture(join(temp(), 'source'));
+  const result = await cli(root, ['node', 'add', source, 'a node', '--kind', 'INVALID', '--json']);
+  expect(result.code).toBe(1);
+  expect(result.output.trim().split('\n')).toHaveLength(1);
+  expect(JSON.parse(result.output)).toEqual({ status: 'failed', errors: ['invalid node request or kind: INVALID'] });
+  expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
+  expect((await cli(root, ['add', '--help'])).output).toContain('--allow-unsigned');
+}, 20_000);
+
 test('index registers the plugin CLI command', () => {
   const index = readFileSync(join(repo, 'src', 'index.ts'), 'utf8');
   expect(index).toContain('registerPluginCommands(program);');

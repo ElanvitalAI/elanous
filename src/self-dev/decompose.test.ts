@@ -54,6 +54,12 @@ describe('buildSelfDevDecomposePrompt', () => {
     expect(priorityRule).toMatch(/investigate.*design.*add-one-unit.*wire-into-existing.*verify/);
   });
 
+  test('keeps definition with registration or wiring for a handler, CLI command and graph node', () => {
+    const prompt = buildSelfDevDecomposePrompt('Add a handler');
+    expect(prompt).toContain('Keep a definition and its registration/wiring in the same sub-feature');
+    expect(prompt).toContain('a handler with its route, a command with its CLI registration, a node with its graph/recipe entry');
+  });
+
   test('places DEFINE FROM WIRE before self-contained work to prevent dead-code', () => {
     const p = buildSelfDevDecomposePrompt('build a widget');
     const defineFromWireRule = '- SEPARATE DEFINE FROM WIRE: adding a new function/type/export is a SEPARATE task from wiring it into an existing runtime call site. A task that both defines a new symbol AND integrates it across modules tends to leave dead-code (defined but never called) that fails integration gates. Pattern: (a) add the function + its unit test; then (b) a dependent task that wires it into the specific existing call site — name the exact `file.ts:function` to modify.';

@@ -2,6 +2,7 @@
 
 // Trace 그래프(RFC v6 §4) — d3 힘 배치 ⊕ 줌·팬 ⊕ 드래그(고정·두 번 클릭 해제) ⊕ 호버 1-hop 강조 ⊕ 클릭 선택 ⊕ 더블클릭 한 층 내려가기.
 // «화려함은 주의를 옮기는 데만»(§1 ③): 입자·글로우 없음 · 선택·호버 경로만 밝고 나머지는 18% 로 가라앉는다 · 전환 250ms.
+// 포커스 줌(2026-10-01 대표 «런을 고르면 해상도가 바뀌며 포커스»): 선택 = 그 노드로 부드럽게 확대 · 선택 해제 = 전체로 · 층 전환 = 멀리서 다가오듯 맞춤.
 // 톤은 v5 와 같은 남색·인디고·파스텔. ⛔ 마운트 뒤에만 d3 를 붙인다(정적 export 하이드레이션).
 
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -59,6 +60,31 @@ export function neighbors(edges: readonly TraceEdge[], id: string | null): Set<s
   return out;
 }
 
+export type ZoomT = { x: number; y: number; k: number };
+
+/** 한 노드를 화면 가운데에 배율 k 로 놓는 줌 변환. */
+export function focusTransform(p: { x: number; y: number }, width: number, height: number, k: number): ZoomT {
+  return { x: width / 2 - p.x * k, y: height / 2 - p.y * k, k };
+}
+
+/** 두 줌 변환 사이 t(0~1) — 화면 가운데가 보는 «세계 점»은 곧게, 배율은 기하로 옮긴다(확대·축소가 한쪽으로 쏠리지 않는다). */
+export function lerpTransform(a: ZoomT, b: ZoomT, t: number, width: number, height: number): ZoomT {
+  const ca = { x: (width / 2 - a.x) / a.k, y: (height / 2 - a.y) / a.k };
+  const cb = { x: (width / 2 - b.x) / b.k, y: (height / 2 - b.y) / b.k };
+  const k = a.k * Math.pow(b.k / a.k, t);
+  const cx = ca.x + (cb.x - ca.x) * t; const cy = ca.y + (cb.y - ca.y) * t;
+  return { x: width / 2 - cx * k, y: height / 2 - cy * k, k };
+}
+
+export function easeInOutCubic(t: number): number {
+  return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+}
+
+/** 선택 포커스 배율 — 전체 맞춤보다 2.4배 · 1.2~3.5 사이(작은 그래프는 과하게 키우지 않는다). */
+export function focusScale(fitK: number): number {
+  return Math.max(1.2, Math.min(3.5, fitK * 2.4));
+}
+
 export function TraceGraph({ nodes, edges, selected, onSelect, onDrill, height = 560 }: {
   nodes: TraceNode[];
   edges: TraceEdge[];
@@ -75,6 +101,9 @@ export function TraceGraph({ nodes, edges, selected, onSelect, onDrill, height =
   litRef.current = lit;
   const cbRef = useRef({ onSelect, onDrill, setHover });
   cbRef.current = { onSelect, onDrill, setHover };
+  // 줌 상태 — 배치 effect 가 채우고, 선택 effect 가 읽어 포커스로 옮긴다.
+  const animateRef = useRef<((from: ZoomT, to: ZoomT, ms: number) => void) | null>(null);
+  const zoomRef = useRef<{ apply: (t: ZoomT) => void; cur: ZoomT; fit: ZoomT | null; width: number; nodes: SimNode[]; raf: number } | null>(null);
 
   // ⛔ 배치는 «구조»가 바뀔 때만 다시 한다 — Trace 는 로그를 5초마다 새로 받아 nodes 배열이 매번 새것이라,
   //    종전엔 5초마다 그래프가 처음부터 다시 퍼졌다(튀고 · 첫 화면 맞춤이 들쭉날쭉 · 09-28 실측).
@@ -142,22 +171,62 @@ export function TraceGraph({ nodes, edges, selected, onSelect, onDrill, height =
     const z = zoom<SVGSVGElement, unknown>().scaleExtent([0.2, 6]).on('zoom', (e) => {
       if (e.sourceEvent) userMoved = true;
       g.attr('transform', e.transform.toString());
+      if (zoomRef.current) zoomRef.current.cur = { x: e.transform.x, y: e.transform.y, k: e.transform.k };
     });
     root.call(z as never).on('dblclick.zoom', null).on('click', () => cbRef.current.onSelect(null));
-    root.call(z.transform as never, zoomIdentity);
+    const apply = (t: ZoomT) => { root.call(z.transform as never, zoomIdentity.translate(t.x, t.y).scale(t.k)); };
+    if (zoomRef.current) cancelAnimationFrame(zoomRef.current.raf);
+    zoomRef.current = { apply, cur: { x: 0, y: 0, k: 1 }, fit: null, width, nodes: simNodes, raf: 0 };
+    apply({ x: 0, y: 0, k: 1 });
     // 첫 화면 맞춤 — 런이 70 개로 늘자 힘 배치가 화면 밖까지 퍼져 첫 화면에 노드 일부가 안 보였다(09-28 실측).
     //   배치가 가라앉으면 모든 노드(⊕ 이름 여백)가 들어오게 한 번 맞춘다.
+    const reduce = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const animate = (from: ZoomT, to: ZoomT, ms: number) => {
+      const zr = zoomRef.current;
+      if (!zr) return;
+      cancelAnimationFrame(zr.raf);
+      if (reduce || ms <= 0) { apply(to); return; }
+      const t0 = performance.now();
+      const step = (now: number) => {
+        const t = Math.min(1, (now - t0) / ms);
+        apply(lerpTransform(from, to, easeInOutCubic(t), width, height));
+        if (t < 1 && zoomRef.current === zr) zr.raf = requestAnimationFrame(step);
+      };
+      zr.raf = requestAnimationFrame(step);
+    };
+    animateRef.current = animate;
     const fit = () => {
       if (userMoved || simNodes.length === 0) return;
       const t = fitTransform(simNodes.map((n) => ({ x: n.x ?? 0, y: n.y ?? 0, r: nodeRadius(n) })), width, height);
-      root.call(z.transform as never, zoomIdentity.translate(t.x, t.y).scale(t.k));
+      if (zoomRef.current) zoomRef.current.fit = t;
+      // 층 전환 = 멀리서 다가오듯 — 맞춤의 절반 배율(같은 중심)에서 맞춤으로 700ms.
+      const from = focusTransform({ x: (width / 2 - t.x) / t.k, y: (height / 2 - t.y) / t.k }, width, height, t.k * 0.5);
+      animate(from, t, 700);
     };
     // 배치가 거의 가라앉을 때(alpha < 0.05) 한 번 맞춘다 — 이르면(펼쳐지는 중) 너무 크게 키운다(09-28 실측: 1.2초 맞춤이 1440 에서 41 → 16).
     let fitted = false;
     sim.on('tick.fit', () => { if (!fitted && sim.alpha() < 0.05) { fitted = true; fit(); } });
     sim.on('end.fit', () => { if (!fitted) { fitted = true; fit(); } });
-    return () => { sim.stop(); };
+    return () => { sim.stop(); if (zoomRef.current) cancelAnimationFrame(zoomRef.current.raf); };
   }, [sig, height]);
+
+  // 포커스 줌 — 선택하면 그 노드를 가운데로 확대(650ms), 선택을 풀면 전체 맞춤으로(550ms). 호버는 줌하지 않는다.
+  const hadSelection = useRef(false);
+  useEffect(() => {
+    const zr = zoomRef.current; const animate = animateRef.current;
+    if (!zr || !animate) return;
+    const svg = svgRef.current;
+    const width = svg?.clientWidth || zr.width;
+    if (selected) {
+      const n = zr.nodes.find((d) => d.id === selected);
+      if (!n || n.x == null || n.y == null) return;
+      hadSelection.current = true;
+      animate(zr.cur, focusTransform({ x: n.x, y: n.y }, width, height, focusScale(zr.fit?.k ?? zr.cur.k)), 650);
+    } else if (hadSelection.current && zr.fit) {
+      hadSelection.current = false;
+      animate(zr.cur, zr.fit, 550);
+    }
+  }, [selected, height, sig]);
 
   // 강조 — 선택·호버의 1-hop 만 밝게, 나머지는 가라앉는다(250ms).
   useEffect(() => {

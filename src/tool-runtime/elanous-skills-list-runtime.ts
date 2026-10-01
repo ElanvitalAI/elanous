@@ -2,7 +2,7 @@
 // `elanous_skills_list` MCP tool. Mirrors the daemon-side ACP method
 // `elanous/skills/list` (src/acp/server.ts:2241) but session-agnostic so
 // the codex app-server can call it through the elanous-tools MCP server
-// without first opening an ACP session. Enumerates `~/.elanous/skills/*`
+// without first opening an ACP session. Enumerates configured skill roots
 // and surfaces the first non-heading line of each SKILL.md as the
 // description.
 //
@@ -14,6 +14,7 @@
 import { join } from 'node:path';
 import { readdir, readFile } from 'node:fs/promises';
 import { defaultSkillDirs } from '../user-config.js';
+import { SKILLS_LIST_DESCRIPTION } from '../onboarding/entry-hints.js';
 import type { LLMToolSpec } from '../llm.js';
 import type { ToolRuntime } from './types.js';
 
@@ -41,8 +42,7 @@ export interface ElanousSkillsListResult extends Record<string, unknown> {
 export function buildElanousSkillsListTool(): LLMToolSpec {
   return {
     name: 'elanous_skills_list',
-    description:
-      'List installed elanous skills (sub-directories of ~/.elanous/skills with optional SKILL.md). Codex app-server callback via the elanous-tools MCP server. Read-only.',
+    description: SKILLS_LIST_DESCRIPTION,
     parameters: {
       type: 'object',
       properties: {

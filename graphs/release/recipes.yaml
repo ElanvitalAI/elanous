@@ -26,6 +26,9 @@ tui:
 docs:
   command: 'bun scripts/release-loop/docs-node.ts --json'
   timeout_ms: 1800000
+known-issues:
+  command: 'bun scripts/release-loop/known-issues-node.ts'
+  timeout_ms: 600000
 notes-check:
   command: 'bun scripts/announce-loop/check-node.ts --json'
   timeout_ms: 600000
@@ -37,12 +40,19 @@ publish:
 publish-command:
   command: 'bun scripts/release-loop/publish-node.ts'
   timeout_ms: 1800000
+npm-publish:
+  command: 'bun scripts/release-loop/npm-publish-node.ts'
+  # 40m default wait + two 5m commands + up to 83 bounded 15s registry inspections.
+  timeout_ms: 4500000
 docs-land:
   command: 'bun scripts/release-loop/docs-land-node.ts'
   timeout_ms: 1800000
 verify:
   command: 'bun scripts/release-loop/verify-node.ts'
   timeout_ms: 1800000
+ops-upgrade:
+  command: 'bun scripts/release-loop/ops-upgrade-node.ts'
+  timeout_ms: 1200000
 version-dev-bump:
   command: 'bun scripts/release-loop/version-node.ts dev-bump --json'
   timeout_ms: 1800000

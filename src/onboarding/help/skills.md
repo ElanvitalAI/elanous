@@ -16,4 +16,4 @@ per line, blank line to finish. Paths that don't exist yet are
 kept anyway so you can create them later.
 
 You can change the active preset any time via:
-    elanous setup skills
+    elanous onboarding skills

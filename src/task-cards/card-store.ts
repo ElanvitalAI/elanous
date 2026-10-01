@@ -38,7 +38,7 @@ type CardEvent =
  *  A key is `<section>` or `<section>:<idempotency key>`: the same section can be appended many times over a
  *  task's life (e.g. workspace diff updates), and the same full key is written once. `incidents` is open to any loop. */
 export const SECTION_OWNERS: Readonly<Record<string, string | null>> = {
-  intake: 'steward', triage: 'steward',
+  intake: 'steward', triage: 'steward', launch: 'steward', outcome: 'steward',
   gates: 'execution-loop', relations: 'execution-loop', memory: 'execution-loop',
   workspace: 'executor', run: 'executor',
   landing: 'landing-loop', release: 'release-loop',

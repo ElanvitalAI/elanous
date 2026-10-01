@@ -998,9 +998,8 @@ async function plan() {
     return where.length ? `${u} → 구간을 «${where.join('/')}» 까지` : `${u} → ⛔ 스핀 결손`;
   });
 
-  sayUnprobed();
-
   if (COMPACT) {
+    sayUnprobed();
     // ⛔ 노드별로 찍지 않는다 — encode 가 세 번 나온다. 능력 단위로 «접는다».
     const seen = new Map<string, { impl?: Impl; required: boolean }>();
     for (const o of out) for (const p of o.picks) {
@@ -1138,6 +1137,7 @@ async function plan() {
     return;
   }
 
+  sayUnprobed();
   console.log(`\n🧱 추천 스택 — 구간 ${nodes[0].id} → ${nodes[nodes.length - 1].id} · 선호 ${TIER_MARK[prefer]}`);
   console.log(`   설정: ${LOADED.source}${MACHINE ? ` · 기계 «${MACHINE_NAME}»` : ''}`);
   if (MISSING.size) console.log(`   ⚠️ 없다고 «가정»한 것: ${[...MISSING].join(', ')}`);

@@ -239,6 +239,9 @@ export function registerProviderCommands(program: Command): void {
       // ⛔⭐ 「후보」는 판정기가 «자기 자신을 뺀» 것이다 — 표면이 현재 계정을 후보로 보여 주면
       //   ***있지도 않은 선택지를 말한다***(리뷰 must-fix). 판정기와 같은 기준(storeKey)으로 거른다.
       const shownCandidates = s.candidates.filter((c) => c.storeKey !== s.current.storeKey);
+      const { codexCreditPlanFromDisk } = await import('./codex-credit-plan-view.js');
+      const { formatCodexCreditPlan } = await import('../budget/codex-credit-plan.js');
+      const creditPlan = codexCreditPlanFromDisk(now);
       const ageMinOf = (home: string | undefined): number | null => {
         if (!home) return null;
         const at = home === s.currentHome ? s.currentObservedAt : s.observedAtByHome[home];
@@ -258,6 +261,7 @@ export function registerProviderCommands(program: Command): void {
       if (opts.json) {
         await writeStdoutJson(JSON.stringify({
           policy: { value: s.policy.policy, source: s.policy.source },
+          creditPlan,
           universe: {
             instanceRoot, signalDir, authStore: authStorePath(),
             // ⭐ JSON 에도 싣는다 — 화면만 알면 스크립트가 못 센다
@@ -303,6 +307,7 @@ export function registerProviderCommands(program: Command): void {
       const policySource = s.policy.source === 'legacy-credits' ? ' · 옛 codexCreditsAllowed 에서'
         : s.policy.source === 'default' ? ' · 기본값' : '';
       console.log(`정책      ${s.policy.policy} (${CODEX_QUOTA_POLICY_LABEL[s.policy.policy]} · llm.codexQuotaPolicy)${policySource}`);
+      for (const line of formatCodexCreditPlan(creditPlan)) console.log(line);
       console.log(`지금 계정 ${s.current.name}  (source=${s.current.source})`);
       console.log(`          홈=${s.currentHome ?? '(모름)'}  사용=${s.currentUsedPercent ?? '?'}%  찼나=${s.currentReached ?? '모름'}  신호=${ageOf(s.currentHome)}  크레딧=${creditText(s.currentCreditBalance, s.currentHasCredits)}`);
       console.log('후보');

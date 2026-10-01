@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -913,7 +913,12 @@ describe('repository scan', () => {
     const result = checkDomainBoundary({});
     const { output } = runCli(process.cwd());
 
-    expect(result.summary.total).toBe(161);
+    const domainFiles = readdirSync(join(process.cwd(), 'src', 'domains'))
+      .filter((name) => name.endsWith('.ts') && !name.endsWith('.test.ts'));
+    expect(result.summary.total).toBe(domainFiles.length);
+    expect(result.records.map((record) => record.path)).toEqual(
+      domainFiles.map((name) => `src/domains/${name}`).sort((left, right) => left.localeCompare(right)),
+    );
     expect(result.summary.core).toBeGreaterThan(0);
     expect(result.summary.unknown).toBeLessThan(109);
     expect(result.summary.core + result.summary['company-only'] + result.summary.unknown).toBe(result.summary.total);

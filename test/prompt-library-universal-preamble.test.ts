@@ -100,11 +100,12 @@ describe('buildUniversalPreamble + loadProjectAnchor', () => {
     const guidance = msgs[2]!.content as string;
     expect(guidance).toContain('tools disabled');
     expect(guidance).toContain('Do not guess repository or real-time facts');
-    expect(guidance).toContain('file counts, file contents, commits, or the current time');
-    expect(guidance).toContain('cannot check');
+    expect(guidance).toContain('file counts, file contents, commits, or the current date or time');
+    expect(guidance).toContain('explicitly say you cannot check them in this mode');
+    expect(guidance).toContain('repository state, files, and dates');
     expect(guidance).toContain('for navigation, not evidence for counts');
-    expect(guidance).toContain('elanous agent …');
-    expect(guidance).toContain('elanous chat --tools …');
+    expect(guidance).toContain('Give one line explaining how to enable tools: `elanous agent "<your question>"`');
+    expect(guidance).not.toContain('elanous chat --tools');
     expect((msgs[3]!.content as string)).toContain('Coding Agent Pipelines');
     // src/cli/agent-cli.ts runChatTurnCli calls buildUniversalPreamble and joins its messages before runTurn({ systemPrompt }).
     const systemPrompt = msgs.map(m => m.content as string).filter(Boolean).join('\n\n');
@@ -346,9 +347,13 @@ test('runChatTurnCli supplies the guidance in the actual tool-disabled system pr
     expect(prompts).toHaveLength(2);
     expect(prompts[0]!.tools).toBe(0);
     expect(prompts[0]!.systemPrompt).toContain('Do not guess repository or real-time facts');
+    expect(prompts[0]!.systemPrompt).toContain('repository state, files, and dates');
+    expect(prompts[0]!.systemPrompt).toContain('explicitly say you cannot check them in this mode');
+    expect(prompts[0]!.systemPrompt).toContain('Give one line explaining how to enable tools: `elanous agent "<your question>"`');
     expect(prompts[0]!.systemPrompt.indexOf('## Project Layout')).toBeLessThan(prompts[0]!.systemPrompt.indexOf('## Chat without tools'));
     expect(prompts[1]!.tools).toBeGreaterThan(0);
     expect(prompts[1]!.systemPrompt).not.toContain('## Chat without tools');
+    expect(prompts[1]!.systemPrompt).not.toContain('Give one line explaining how to enable tools');
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

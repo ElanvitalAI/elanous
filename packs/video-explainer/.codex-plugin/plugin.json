@@ -1,6 +1,6 @@
 {
   "name": "video-explainer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Narrated «N things at once» explainer videos from a list of facts.",
   "skills": "./skills/",
   "interface": {

@@ -66,6 +66,7 @@ import {
   type ElanousTermPayload,
 } from './elanous-extensions.js';
 import { createMissionTurnEmitter } from './mission-turn-emit.js';
+import { ElanousAwarePeers } from './elanous-aware-peers.js';
 import { enqueuePendingUserInput } from '../session/pending-input.js';
 import {
   ELANOUS_ASK_CANCEL_METHOD,
@@ -879,6 +880,10 @@ let activeAcpBroadcaster:
   | ((sessionId: string, update: unknown) => Promise<{ delivered: number }>)
   | null = null;
 
+let activeAcpFeedbackBroadcaster:
+  | ((sessionId: string, env: FeedbackEnvelope) => Promise<{ delivered: number }>)
+  | null = null;
+
 // P0b(DESIGN-cross-surface-autonomy-membrane §10) — ACP ask pusher(elanous/ask → iPhone/PWA 시트)를 모듈-레벨로
 // 노출. daemon-runtime 이 코어 데몬 턴(SelfImplement dispatch)에 SurfaceUx confirm/question 채널을 주입할 때
 // createAcp*Channel(sessionId, getActiveAcpAskPusher()) 로 사용. sessionPeers 로 라우팅(연결 무관)·fail-soft(null=drop).
@@ -894,8 +899,8 @@ export function getActiveAcpBroadcaster():
 }
 
 /** PLAN-ios-rich-dev-feedback-hydrate · M1-S (2026-05-13) — typed
- *  adapter on top of `activeAcpBroadcaster` that fans out a
- *  `FeedbackEnvelope` as a `elanous/feedback/emit` envelope packaged
+ *  adapter that fans out a `FeedbackEnvelope` only to peers advertising
+ *  `_meta.elanous`, as a `elanous/feedback/emit` envelope packaged
  *  inside an `agent_thought_chunk` sessionUpdate.
  *
  *  Why `agent_thought_chunk` instead of a native `sessionUpdate:
@@ -912,15 +917,7 @@ export function getActiveAcpBroadcaster():
 export function getActiveAcpFeedbackBroadcaster():
   | ((sessionId: string, env: FeedbackEnvelope) => Promise<{ delivered: number }>)
   | null {
-  const inner = activeAcpBroadcaster;
-  if (!inner) return null;
-  return (sessionId, env) => {
-    const text = formatElanousFeedbackEnvelope({ method: 'emit', payload: env });
-    return inner(sessionId, {
-      sessionUpdate: 'agent_thought_chunk',
-      content: { type: 'text', text },
-    });
-  };
+  return activeAcpFeedbackBroadcaster;
 }
 
 /** PLAN-ios-rich-dev-feedback-hydrate M4 (HUD) — fan-out across ALL
@@ -989,6 +986,9 @@ interface AcpServerContext {
    *  fan-out walks the set so multi-surface clients (e.g. web PWA
    *  + TUI on the same id) all see the same stream. */
   sessionPeers: Map<string, Set<SessionPeer>>;
+  awarePeers: ElanousAwarePeers<SessionPeer>;
+  /** One skip diagnostic per session, cleared when its last peer leaves. */
+  plainEnvelopeLogged: Set<string>;
   dualRole: DualRoleManager;
   /** Mints the unique suffix of a new session id. Injected so tests can
    *  pin it deterministically — production wires `mintAcpSessionToken`. */
@@ -1029,6 +1029,21 @@ interface SessionPeer {
   peerId: string | null;
 }
 
+function isFeedbackTextUpdate(update: unknown): boolean {
+  if (!update || typeof update !== 'object') return false;
+  const u = update as { sessionUpdate?: unknown; content?: { type?: unknown; text?: unknown } };
+  return u.sessionUpdate === 'agent_thought_chunk'
+    && u.content?.type === 'text'
+    && typeof u.content.text === 'string'
+    && u.content.text.startsWith('[elanous/feedback/emit] ');
+}
+
+function logSkippedPlainEnvelope(ctx: AcpServerContext, sessionId: string, kind: string): void {
+  if (ctx.plainEnvelopeLogged.has(sessionId)) return;
+  ctx.plainEnvelopeLogged.add(sessionId);
+  debug.log('acp.envelope', 'skipped-plain-client', { sessionId, kind });
+}
+
 /** Wire a single `AgentSideConnection` onto the provided ndJsonStream.
  *  Owns all per-connection state (clientUiCaps, boundConnection ref,
  *  per-peer `AcpServerHandle`) so stdio and transport paths diverge
@@ -1038,7 +1053,7 @@ function wireAcpConnection(
   stream: ReturnType<typeof ndJsonStream>,
   ctx: AcpServerContext,
 ): AgentSideConnection {
-  const { sessions, sessionPeers, dualRole, opts } = ctx;
+  const { sessions, sessionPeers, awarePeers, plainEnvelopeLogged, dualRole, opts } = ctx;
   // 2026-05-13 (M2 of AskUserQuestion cross-surface) — bound connection
   // widened to expose `extMethod` + `extNotification` (SDK's elanous
   // extension escape hatch). pushAskRequest / pushAskCancel route through
@@ -1132,6 +1147,10 @@ function wireAcpConnection(
       }
       return { delivered: 0 };
     }
+    if (isFeedbackTextUpdate(update) && !awarePeers.isElanousAware(sessionId)) {
+      logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+      return { delivered: 0 };
+    }
     let delivered = 0;
     let dedupedByPeerId = 0;
     const tasks: Promise<unknown>[] = [];
@@ -1141,6 +1160,10 @@ function wireAcpConnection(
     // 은 모두 distinct peer 으로 취급해 send (degraded compat).
     const seenPeerIds = new Set<string>();
     for (const p of peers) {
+      if (isFeedbackTextUpdate(update) && !awarePeers.isPeerAware(p)) {
+        logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+        continue;
+      }
       if (opts2?.uiGate && !p.getUiCaps()[opts2.uiGate]) continue;
       if (opts2?.termGate && !p.getTermCaps()[opts2.termGate]) continue;
       if (p.peerId !== null) {
@@ -1380,6 +1403,7 @@ function wireAcpConnection(
       clientUiCaps = parsed.ui;
       clientTermCaps = parsed.term;
       clientAskCaps = parsed.ask;
+      awarePeers.markPeer(peer, req.clientCapabilities);
       debug.log('acp.session', 'initialize', {
         protocolVersion: req.protocolVersion,
         clientName: req.clientInfo?.name ?? 'absent',
@@ -3316,7 +3340,10 @@ function wireAcpConnection(
       if (!set) continue;
       set.delete(peer);
       const remaining = set.size;
-      if (remaining === 0) sessionPeers.delete(sid);
+      if (remaining === 0) {
+        sessionPeers.delete(sid);
+        plainEnvelopeLogged.delete(sid);
+      }
       if (debug.enabled) {
         debug.log('acp.peer.unregister', sid, { remainingPeers: remaining });
       }
@@ -3451,10 +3478,14 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
     return true;
   });
   const sessionPeers = new Map<string, Set<SessionPeer>>();
+  const awarePeers = new ElanousAwarePeers(sessionPeers);
+  const plainEnvelopeLogged = new Set<string>();
   const dualRole = opts.dualRoleManager ?? globalDualRoleManager();
   const ctx: AcpServerContext = {
     sessions,
     sessionPeers,
+    awarePeers,
+    plainEnvelopeLogged,
     dualRole,
     nextSessionToken: mintAcpSessionToken,
     agentName: opts.agentName ?? 'elanous-agent',
@@ -3478,9 +3509,17 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
       }
       return { delivered: 0 };
     }
+    if (isFeedbackTextUpdate(update) && !awarePeers.isElanousAware(sessionId)) {
+      logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+      return { delivered: 0 };
+    }
     const tasks: Promise<unknown>[] = [];
     let delivered = 0;
     for (const p of peers) {
+      if (isFeedbackTextUpdate(update) && !awarePeers.isPeerAware(p)) {
+        logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+        continue;
+      }
       delivered += 1;
       tasks.push(p.sessionUpdate({ sessionId, update }));
     }
@@ -3496,19 +3535,52 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
     await Promise.allSettled(tasks);
     return { delivered };
   };
+  activeAcpFeedbackBroadcaster = async (sessionId, env) => {
+    const text = formatElanousFeedbackEnvelope({ method: 'emit', payload: env });
+    const peers = sessionPeers.get(sessionId);
+    if (!peers || peers.size === 0) return { delivered: 0 };
+    if (!awarePeers.isElanousAware(sessionId)) {
+      logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+      return { delivered: 0 };
+    }
+    let delivered = 0;
+    const tasks: Promise<unknown>[] = [];
+    for (const peer of peers) {
+      if (!awarePeers.isPeerAware(peer)) {
+        logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+        continue;
+      }
+      delivered += 1;
+      tasks.push(peer.sessionUpdate({
+        sessionId,
+        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } },
+      }));
+    }
+    await Promise.allSettled(tasks);
+    return { delivered };
+  };
   // PLAN-ios-rich-dev-feedback-hydrate M4 (2026-05-13) — all-sessions
   // fan-out for process-wide envelope kinds (hud.segment). Iterates
-  // sessionPeers + delegates each session to activeAcpBroadcaster
+  // sessionPeers and gates each attached connection independently
   // (consistent transport · same agent_thought_chunk text-in-text shape).
   activeAcpAllSessionsFeedbackBroadcaster = async (envProto) => {
     let fannedTo = 0;
     let delivered = 0;
     for (const [sessionId, peers] of sessionPeers) {
       if (peers.size === 0) continue;
-      fannedTo += 1;
+      if (!awarePeers.isElanousAware(sessionId)) {
+        logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+        continue;
+      }
       const env = { ...envProto, sessionId } as FeedbackEnvelope;
       const text = formatElanousFeedbackEnvelope({ method: 'emit', payload: env });
+      let any = false;
       for (const peer of peers) {
+        if (!awarePeers.isPeerAware(peer)) {
+          logSkippedPlainEnvelope(ctx, sessionId, 'feedback');
+          continue;
+        }
+        any = true;
         try {
           await peer.sessionUpdate({
             sessionId,
@@ -3522,6 +3594,7 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
           /* swallow — best-effort fan-out */
         }
       }
+      if (any) fannedTo += 1;
     }
     return { delivered, fannedTo };
   };
@@ -3593,6 +3666,7 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
       try { await transport.close(); } catch { /* ignore */ }
       acpServerDisposeSessions(sessions, dualRole);
       activeAcpBroadcaster = null;
+      activeAcpFeedbackBroadcaster = null;
       activeAcpAskPusher = null;
       activeAcpAllSessionsFeedbackBroadcaster = null;
       activeAcpAllSessionsTermFrameBroadcaster = null;
@@ -3621,7 +3695,9 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
   } finally {
     acpServerDisposeSessions(sessions, dualRole);
     activeAcpBroadcaster = null;
+    activeAcpFeedbackBroadcaster = null;
     activeAcpAskPusher = null;
+    activeAcpAllSessionsFeedbackBroadcaster = null;
     activeAcpAllSessionsTermFrameBroadcaster = null;
     if (debug.enabled) {
       debug.log('acp.broadcaster.lifecycle', 'clear', { mode: 'stdio' });

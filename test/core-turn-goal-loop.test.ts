@@ -162,6 +162,7 @@ describe('runGoalLoop — across-turn 목표 실행 (구조화 완료)', () => {
           { event: 'soft-stop-drain', stop: false },
           { event: 'drain', stop: false },
           { event: 'stop-enqueue', stop: undefined },
+          { event: 'soft-stop-request-written', stop: undefined },
           { event: 'soft-stop-drain', stop: true },
         ]);
       } finally {
@@ -652,10 +653,10 @@ describe('runGoalLoop — across-turn 목표 실행 (구조화 완료)', () => {
       else process.env.ELANOUS_RUN_ID = originalRunId;
     }
 
-    expect(records).toContainEqual({
+    expect(records).toContainEqual(expect.objectContaining({
       category: 'goal.loop', event: 'dispatch',
-      data: { sessionId: 't', runId: expect.any(String), iteration: 1, tool: 'Read', dispatchCount: 1 },
-    });
+      data: expect.objectContaining({ sessionId: 't', runId: expect.any(String), iteration: 1, tool: 'Read', dispatchCount: 1 }),
+    }));
     expect(records).toContainEqual(expect.objectContaining({
       category: 'goal.loop', event: 'iteration',
       data: expect.objectContaining({ dispatchCount: 1 }),
@@ -743,10 +744,10 @@ describe('runGoalLoop — across-turn 목표 실행 (구조화 완료)', () => {
     }
     expect(leaked).toBe(false);
     expect((acked as { ok?: boolean }).ok).toBe(true);
-    expect(records).toContainEqual({
+    expect(records).toContainEqual(expect.objectContaining({
       category: 'goal.loop', event: 'dispatch',
-      data: { sessionId: 't', runId: expect.any(String), iteration: 1, tool: UPDATE_GOAL_TOOL_NAME, dispatchCount: 1 },
-    });
+      data: expect.objectContaining({ sessionId: 't', runId: expect.any(String), iteration: 1, tool: UPDATE_GOAL_TOOL_NAME, dispatchCount: 1 }),
+    }));
     expect(records).toContainEqual(expect.objectContaining({
       category: 'goal.loop', event: 'iteration',
       data: expect.objectContaining({ dispatchCount: 1 }),

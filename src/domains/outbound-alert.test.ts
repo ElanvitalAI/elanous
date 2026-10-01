@@ -1,5 +1,6 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, spyOn, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, it, setSystemTime, spyOn, test } from 'bun:test';
 import * as childProcess from 'node:child_process';
+import * as fs from 'node:fs';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,7 +15,9 @@ import {
   flushLagWarnMin,
   inQuietHours,
   kstMinutes,
+  sendOutbound,
 } from './outbound-alert.js';
+import type { MissionOrigin } from '../autopilot/mission-origin.js';
 
 const TOUCHED_ENV = [
   FLUSH_LAG_WARN_MIN_ENV,
@@ -159,18 +162,33 @@ describe('flushDeferred 관측 — 경로 · 밀림 경고 등급', () => {
 type LogFn = typeof debug.log;
 type Logged = { category: string; event: string; data: unknown };
 
-const ENV_KEYS = ['SEND_VIA_ELANOUS', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'ELANOUS_NEXUS_URL'] as const;
+const ENV_KEYS = ['SEND_VIA_ELANOUS', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'ELANOUS_TELEGRAM_BOT_TOKEN', 'ELANOUS_NEXUS_URL', 'ELANOUS_DISCORD_BOT_TOKEN'] as const;
 
 const savedEnv: Record<string, string | undefined> = {};
 const logged: Logged[] = [];
 let originalLog: LogFn;
 let curlSpy: ReturnType<typeof spyOn> | undefined;
 let daemonBody: string | null | 'throw' = '{"delivered":true}';
+let discordBody: string | null = '{"id":"posted"}';
+const discordRequests: Array<{ url: string; body: string; headers: string[] }> = [];
 const telegramUrls: string[] = [];
+const telegramBodies: string[] = [];
 const outboundUrls: string[] = [];
 
 function daemonPathLogs(): Logged[] {
   return logged.filter((row) => row.category === 'outbound.send' && row.event === 'daemon-path');
+}
+
+function outcomeLogs(): Logged[] {
+  return logged.filter((row) => row.category === 'outbound.send' && ['sent', 'deferred', 'failed'].includes(row.event));
+}
+
+function expectOutcome(event: 'sent' | 'deferred' | 'failed', text: string, kind: string): void {
+  const rows = outcomeLogs();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.event).toBe(event);
+  expect(rows[0]!.data).toEqual({ kind, source: 'src/domains/outbound-alert.test.ts', chars: text.length });
+  expect(JSON.stringify(rows[0]!.data)).not.toContain(text);
 }
 
 function captureConsole(run: () => void): string[] {
@@ -205,7 +223,10 @@ beforeEach(() => {
   process.env.TELEGRAM_CHAT_ID = '12345';
   logged.length = 0;
   telegramUrls.length = 0;
+  telegramBodies.length = 0;
   outboundUrls.length = 0;
+  discordRequests.length = 0;
+  discordBody = '{"id":"posted"}';
   daemonBody = '{"delivered":true}';
   originalLog = debug.log.bind(debug) as LogFn;
   (debug as { log: LogFn }).log = ((category: string, event: string, data?: unknown) => {
@@ -214,6 +235,7 @@ beforeEach(() => {
   curlSpy = spyOn(childProcess, 'execFileSync').mockImplementation(((
     _cmd: string,
     args: readonly string[] | undefined,
+    opts?: { input?: string },
   ) => {
     const url = String(args?.[args.length - 1] ?? '');
     if (url.includes('/v1/outbound')) {
@@ -224,7 +246,12 @@ beforeEach(() => {
     }
     if (url.includes('api.telegram.org')) {
       telegramUrls.push(url);
+      telegramBodies.push(opts?.input ?? '');
       return JSON.stringify({ ok: true });
+    }
+    if (url.startsWith('https://discord.com/api/v10/channels/')) {
+      discordRequests.push({ url, body: opts?.input ?? '', headers: (args ?? []).flatMap((arg, i, all) => arg === '-H' ? [all[i + 1]!] : []) });
+      return discordBody ?? 'not-json';
     }
     throw new Error(`unexpected curl ${url}`);
   }) as never);
@@ -232,6 +259,7 @@ beforeEach(() => {
 
 afterEach(() => {
   setResolveDaemonEndpointForTest(null);
+  setSystemTime();
   curlSpy?.mockRestore();
   curlSpy = undefined;
   (debug as { log: LogFn }).log = originalLog;
@@ -239,6 +267,190 @@ afterEach(() => {
     if (savedEnv[key] === undefined) delete process.env[key];
     else process.env[key] = savedEnv[key];
   }
+});
+
+describe('sendOutbound outcome ledger', () => {
+  const text = 'private-alert-body';
+  const kind = 'ops-alert';
+  const daytime = () => setSystemTime(new Date('2026-10-01T03:00:00Z'));
+
+  beforeEach(() => {
+    daytime();
+    flushDeferred();
+    logged.length = 0;
+    outboundUrls.length = 0;
+    telegramUrls.length = 0;
+  });
+
+  test('daemon success records one sent with source and length, never body', () => {
+    expect(sendOutbound(text, kind)).toBe(true);
+    expect(outboundUrls).toHaveLength(1);
+    expectOutcome('sent', text, kind);
+  });
+
+  test('quiet hours record one deferred without transmitting', () => {
+    setSystemTime(new Date('2026-10-01T16:00:00Z'));
+    expect(sendOutbound(text, kind)).toBe(true);
+    expect(outboundUrls).toHaveLength(0);
+    expect(telegramUrls).toHaveLength(0);
+    expectOutcome('deferred', text, kind);
+  });
+
+  test('daemon rejection and direct fallback failure record one failed', () => {
+    daemonBody = JSON.stringify({ error: 'unauthorized' });
+    curlSpy?.mockImplementation(((_cmd: string, args: readonly string[] | undefined) => {
+      const url = String(args?.[args.length - 1] ?? '');
+      if (url.includes('/v1/outbound')) return daemonBody;
+      throw new Error('telegram down');
+    }) as never);
+    expect(sendOutbound(text, kind)).toBe(false);
+    expectOutcome('failed', text, kind);
+  });
+
+  test('direct fallback success records one sent after daemon rejection', () => {
+    daemonBody = JSON.stringify({ error: 'unauthorized' });
+    expect(sendOutbound(text, kind)).toBe(true);
+    expect(outboundUrls).toHaveLength(1);
+    expect(telegramUrls).toHaveLength(1);
+    expectOutcome('sent', text, kind);
+  });
+
+  test('origin success records one sent without report fanout', () => {
+    process.env.ELANOUS_DISCORD_BOT_TOKEN = 'discord-test-token';
+    expect(sendOutbound(text, kind, { channel: 'discord', channelId: '123' })).toBe(true);
+    expect(discordRequests).toHaveLength(1);
+    expect(outboundUrls).toHaveLength(0);
+    expectOutcome('sent', text, kind);
+  });
+
+  test('origin failure followed by daemon success still records one sent', () => {
+    delete process.env.ELANOUS_DISCORD_BOT_TOKEN;
+    expect(sendOutbound(text, kind, { channel: 'discord', channelId: '123' })).toBe(true);
+    expect(outboundUrls).toHaveLength(1);
+    expectOutcome('sent', text, kind);
+  });
+
+  test('distinct origin surfaces in one host retain their sender names, not argv', () => {
+    const argv = process.argv[1];
+    process.argv[1] = '/tmp/shared-daemon.ts';
+    try {
+      expect(sendOutbound(text, kind, { channel: 'cli', surface: 'codex-quota-alert' })).toBe(true);
+      expect(sendOutbound(text, kind, { channel: 'cli', surface: 'ops-health-check' })).toBe(true);
+      expect(outcomeLogs().map(row => (row.data as { source: string }).source))
+        .toEqual(['codex-quota-alert', 'ops-health-check']);
+      expect(outcomeLogs().map(row => row.event)).toEqual(['sent', 'sent']);
+      expect(outcomeLogs().every(row => !JSON.stringify(row.data).includes(text))).toBe(true);
+    } finally { process.argv[1] = argv; }
+  });
+
+  test('callers with the same filename in different directories keep distinct source paths', () => {
+    const realError = globalThis.Error;
+    const errorSpy = spyOn(globalThis, 'Error');
+    try {
+      for (const path of ['/repo/src/alpha/index.ts', '/repo/src/beta/index.ts']) {
+        errorSpy.mockImplementation((() => ({ stack: `Error\n    at sendOutbound (/repo/src/domains/outbound-alert.ts:258:18)\n    at producer (${path}:12:3)` })) as never);
+        expect(sendOutbound(text, kind)).toBe(true);
+      }
+      const sources = outcomeLogs().map(row => (row.data as { source: string }).source);
+      expect(sources).toHaveLength(2);
+      expect(sources[0]).not.toBe(sources[1]);
+      expect(sources[0]).toMatch(/src\/alpha\/index\.ts$/);
+      expect(sources[1]).toMatch(/src\/beta\/index\.ts$/);
+    } finally {
+      errorSpy.mockRestore();
+      globalThis.Error = realError;
+    }
+  });
+
+  test('failed queue append records failed only, not deferred', () => {
+    setSystemTime(new Date('2026-10-01T16:00:00Z'));
+    const appendSpy = spyOn(fs, 'appendFileSync').mockImplementation(() => { throw new Error('queue unavailable'); });
+    try {
+      captureConsole(() => {
+        expect(sendOutbound(text, kind, { channel: 'cli', surface: 'codex-quota-alert' })).toBe(true);
+      });
+      expect(outcomeLogs()).toHaveLength(1);
+      expect(outcomeLogs()[0]!.event).toBe('failed');
+      expect(outcomeLogs()[0]!.data).toEqual({ kind, source: 'codex-quota-alert', chars: text.length });
+      expect(JSON.stringify(outcomeLogs()[0]!.data)).not.toContain(text);
+      expect(outboundUrls).toHaveLength(0);
+      expect(telegramUrls).toHaveLength(0);
+    } finally { appendSpy.mockRestore(); }
+  });
+});
+
+describe('origin delivery', () => {
+  const discord = (thread?: string): MissionOrigin => ({ channel: 'discord', channelId: 'parent-123', ...(thread ? { discordThreadId: thread } : {}) });
+  const daytime = () => setSystemTime(new Date('2026-10-01T03:00:00Z'));
+
+  test('Discord channel and thread receive results with Bot authentication, without report fanout', () => {
+    daytime();
+    process.env.ELANOUS_DISCORD_BOT_TOKEN = 'discord-test-token';
+    expect(sendOutbound('channel result', 'alert', discord())).toBe(true);
+    expect(sendOutbound('thread result', 'alert', discord('thread-456'))).toBe(true);
+    expect(discordRequests.map(r => r.url)).toEqual([
+      'https://discord.com/api/v10/channels/parent-123/messages',
+      'https://discord.com/api/v10/channels/thread-456/messages',
+    ]);
+    expect(discordRequests.map(r => JSON.parse(r.body).content)).toEqual(['channel result', 'thread result']);
+    expect(discordRequests[0]!.headers).toContain('Authorization: Bot discord-test-token');
+    expect(discordRequests[0]!.headers).toContain('Content-Type: application/json');
+    expect(outboundUrls).toEqual([]);
+    expect(telegramUrls).toEqual([]);
+  });
+
+  test('Discord output exceeding 2000 characters is sent as separate messages', () => {
+    daytime();
+    process.env.ELANOUS_DISCORD_BOT_TOKEN = 'discord-test-token';
+    const text = 'x'.repeat(2100);
+    expect(sendOutbound(text, 'alert', discord())).toBe(true);
+    expect(discordRequests.map(r => JSON.parse(r.body).content)).toEqual(['x'.repeat(2000), 'x'.repeat(100)]);
+  });
+
+  test('Discord missing token and failed REST response fall back to report', () => {
+    daytime();
+    delete process.env.ELANOUS_DISCORD_BOT_TOKEN;
+    expect(sendOutbound('no token', 'alert', discord())).toBe(true);
+    expect(discordRequests).toEqual([]);
+    expect(outboundUrls).toHaveLength(1);
+    process.env.ELANOUS_DISCORD_BOT_TOKEN = 'discord-test-token';
+    discordBody = '{"message":"Missing Access"}';
+    expect(sendOutbound('failed send', 'alert', discord('thread-456'))).toBe(true);
+    expect(discordRequests).toHaveLength(1);
+    expect(outboundUrls).toHaveLength(2);
+  });
+
+  test('Telegram origin retains chat and forum thread routing', () => {
+    daytime();
+    process.env.ELANOUS_TELEGRAM_BOT_TOKEN = 'telegram-origin-test-token';
+    const origin: MissionOrigin = { channel: 'telegram', chatId: 98765, threadId: 42 };
+    expect(sendOutbound('telegram result', 'alert', origin)).toBe(true);
+    expect(telegramUrls).toEqual(['https://api.telegram.org/bottelegram-origin-test-token/sendMessage']);
+    const body = new URLSearchParams(telegramBodies[0]);
+    expect(body.get('chat_id')).toBe('98765');
+    expect(body.get('message_thread_id')).toBe('42');
+    expect(body.get('text')).toContain('telegram result');
+    expect(outboundUrls).toEqual([]);
+  });
+
+  test('deferred Discord origins group separately by thread, not just parent channel', () => {
+    process.env.ELANOUS_DISCORD_BOT_TOKEN = 'discord-test-token';
+    const dir = mkdtempSync(join(tmpdir(), 'outbound-discord-'));
+    try {
+      const path = join(dir, 'outbound_deferred.jsonl');
+      writeFileSync(path, [discord('thread-a'), discord('thread-b'), discord('thread-a')]
+        .map((origin, i) => JSON.stringify({ ts: isoAgo(10), kind: 'alert', text: `result-${i}`, origin })).join('\n') + '\n');
+      expect(flushDeferred(path)).toBe(3);
+      expect(discordRequests.map(r => r.url)).toEqual([
+        'https://discord.com/api/v10/channels/thread-a/messages',
+        'https://discord.com/api/v10/channels/thread-b/messages',
+      ]);
+      expect(discordRequests[0]!.body).toContain('result-0');
+      expect(discordRequests[0]!.body).toContain('result-2');
+      expect(discordRequests[0]!.body).not.toContain('result-1');
+      expect(discordRequests[1]!.body).toContain('result-1');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('classifyDaemonResponse', () => {

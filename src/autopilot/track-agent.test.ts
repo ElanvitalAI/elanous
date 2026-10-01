@@ -2,11 +2,51 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decideTrackAction, executeTrackAction, universeLaunch } from './track-agent.js';
+import { TRACK_AGENT_FORBIDDEN_ACTION_REGEX, decideTrackAction, executeTrackAction, universeLaunch } from './track-agent.js';
 
 const input = { missionId: 'apm_test', taskId: 'task:test', title: '티저 제작', prompt: '영상 티저', track: 'T' };
 
 describe('track agent', () => {
+  test('the exported forbidden-action regex matches the decision and launch gates', async () => {
+    const forbidden = ['deploy site', '운영 배포', 'run with --prod', 'config set llm.model x'];
+    const allowed = ['draft a teaser', '티저 제작'];
+    for (const phrase of forbidden) {
+      expect(TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test(phrase)).toBe(true);
+      const decision = await decideTrackAction(input, {
+        shadow: false, session: () => 'sess_test',
+        run: async () => ({ stdout: JSON.stringify({ reply: JSON.stringify({ action: 'say', reason: phrase }) }) }),
+      });
+      expect(decision.action).toBe('hold');
+      let launched = false;
+      const result = await executeTrackAction({ action: 'say' }, { ...input, prompt: phrase }, {
+        shadow: false, checkBudget: async () => true, launch: async () => { launched = true; },
+      });
+      expect(result).toEqual({ status: 'held', detail: '금지 작업 — 사람 확인' });
+      expect(launched).toBe(false);
+    }
+    for (const phrase of allowed) expect(TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test(phrase)).toBe(false);
+  });
+
+  test('mutating the exported regex cannot bypass the decision or launch gate', async () => {
+    const originalTest = TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test;
+    try {
+      TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test = () => false;
+      const decision = await decideTrackAction(input, {
+        shadow: false, session: () => 'sess_test',
+        run: async () => ({ stdout: JSON.stringify({ reply: JSON.stringify({ action: 'say', reason: 'deploy site' }) }) }),
+      });
+      expect(decision.action).toBe('hold');
+      let launched = false;
+      const result = await executeTrackAction({ action: 'say' }, { ...input, prompt: 'deploy site' }, {
+        shadow: false, checkBudget: async () => true, launch: async () => { launched = true; },
+      });
+      expect(result).toEqual({ status: 'held', detail: '금지 작업 — 사람 확인' });
+      expect(launched).toBe(false);
+    } finally {
+      TRACK_AGENT_FORBIDDEN_ACTION_REGEX.test = originalTest;
+    }
+  });
+
   test('tool-free resident turn uses track ownership, handoff and phase context', async () => {
     const root = mkdtempSync(join(tmpdir(), 'track-agent-'));
     const docs = join(root, 'docs');
@@ -28,6 +68,54 @@ describe('track agent', () => {
       expect(calls[0]?.at(-1)).toContain(input.prompt);
       expect(calls[0]?.at(-1)).toContain(input.taskId);
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('shadow cap holds before the ordinary decision path and cannot reach execution', async () => {
+    const ledgerDir = mkdtempSync(join(tmpdir(), 'track-agent-cap-'));
+    let sessions = 0;
+    let decisions = 0;
+    let budgets = 0;
+    let orchestrations = 0;
+    try {
+      const decision = await decideTrackAction(input, {
+        shadow: true, shadowOptions: { ledgerDir, maxDecisionsPerDay: 0 },
+        session: () => { sessions++; return 'sess_test'; },
+        run: async () => { decisions++; return { stdout: JSON.stringify({ reply: '{"action":"say"}' }) }; },
+      });
+      expect(decision).toEqual({ action: 'hold', reason: '일일 판정 상한' });
+      expect([sessions, decisions]).toEqual([0, 0]);
+      const result = await executeTrackAction(decision, input, {
+        shadow: true, shadowOptions: { ledgerDir, orchestrate: async () => {
+          orchestrations++;
+          return { stdout: '[]' };
+        } }, checkBudget: async () => { budgets++; return true; },
+      });
+      expect(result).toEqual({ status: 'held', detail: '일일 판정 상한' });
+      expect([budgets, orchestrations]).toEqual([0, 0]);
+    } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
+  });
+
+  test('shadow execution keeps forbidden-task, track and budget gates before orchestration', async () => {
+    const ledgerDir = mkdtempSync(join(tmpdir(), 'track-agent-shadow-'));
+    let launches = 0;
+    let budgets = 0;
+    const deps = { shadow: true, shadowOptions: { ledgerDir, orchestrate: async () => {
+      launches++;
+      return { stdout: JSON.stringify([{ status: 'done', worktreePath: '/tmp/shadow-run' }]) };
+    } }, checkBudget: async () => { budgets++; return true; },
+    launch: async () => { throw new Error('ordinary launch must not run'); } };
+    try {
+      expect(await executeTrackAction({ action: 'say' }, { ...input, prompt: 'deploy the site' }, deps))
+        .toEqual({ status: 'held', detail: '금지 작업 — 사람 확인' });
+      expect(await executeTrackAction({ action: 'say' }, { ...input, track: 'unknown' }, deps))
+        .toEqual({ status: 'held', detail: '트랙 미정 — 사람 확인' });
+      expect(await executeTrackAction({ action: 'say' }, input, { ...deps, checkBudget: async () => false }))
+        .toEqual({ status: 'held', detail: '예산 관문' });
+      expect([budgets, launches]).toEqual([0, 0]);
+      expect(await executeTrackAction({ action: 'say' }, input, deps))
+        .toEqual({ status: 'launched', detail: '/tmp/shadow-run' });
+      expect([budgets, launches]).toEqual([1, 1]);
+    } finally { rmSync(ledgerDir, { recursive: true, force: true }); }
   });
 
   test('invalid JSON and forbidden verbs fail closed before launch', async () => {

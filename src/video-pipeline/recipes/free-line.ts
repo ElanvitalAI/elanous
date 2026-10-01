@@ -11,6 +11,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { ffmpeg, probeDuration, run } from './ffmpeg.js';
 import { inspectDeliverables } from './shipcheck.js';
 import type { Recipe, RecipeCtx, RecipeResult } from './types.js';
@@ -110,6 +111,19 @@ export const placeClips: Recipe = async (ctx) => {
 };
 
 // ══ ⑨ overlay — 그 «위» 자막 층 (free: ffmpeg-ass) ═══════════════════════
+/** 설치된 한글 폰트를 실제 언어 지원으로 확인한다. fontconfig 의 기본 폰트 폴백만 믿지 않는다. */
+export function koreanCaptionFont(): { path: string; family: string } | null {
+  const apple = ['/System/Library/Fonts/AppleSDGothicNeo.ttc',
+    '/System/Library/Fonts/Supplemental/AppleGothic.ttf'].find(existsSync);
+  if (apple) return { path: apple, family: 'AppleSDGothicNeo' };
+  const match = spawnSync('fc-match', ['-f', '%{family}\t%{file}\t%{lang}\n', ':lang=ko'],
+    { encoding: 'utf8', timeout: 10_000 });
+  if (match.status !== 0) return null;
+  const [families, path, langs] = (match.stdout ?? '').trim().split('\t');
+  if (!families || !path || !langs?.split('|').includes('ko') || !existsSync(path)) return null;
+  return { path, family: families.split(',')[0]!.trim() };
+}
+
 export const drawCaptions: Recipe = async (ctx) => {
   const edlJson = need<string>(ctx, 'edl_json');
   if (!edlJson) return missing('edl_json');
@@ -119,8 +133,7 @@ export const drawCaptions: Recipe = async (ctx) => {
     cuts = j.cuts; W = j.w ?? W; H = j.h ?? H;   // ⛔ 자막 틀은 «조립이 쓴 캔버스»를 따라간다
   } catch (e) { return { outcome: 'error', note: `edl 을 못 읽었다: ${(e as Error).message}` }; }
 
-  const font = ['/System/Library/Fonts/AppleSDGothicNeo.ttc',
-                '/System/Library/Fonts/Supplemental/AppleGothic.ttf'].find((f) => existsSync(f));
+  const font = koreanCaptionFont();
   if (!font) {
     // ⛔ 폰트가 없으면 drawtext/ass 가 «조용히» 빈 층을 만든다 — 그것을 성공으로 내지 않는다.
     return { outcome: 'unmeasurable', note: '한글 폰트를 못 찾았다 — 자막을 «그릴 수 없다»(실패가 아니라 못 함)' };
@@ -146,7 +159,7 @@ export const drawCaptions: Recipe = async (ctx) => {
     '[V4+ Styles]',
     'Format: Name,Fontname,Fontsize,PrimaryColour,OutlineColour,BackColour,Bold,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding',
     // ⛔ 크기·여백을 «캔버스에 비례»로 — 고정값이면 세로 영상에서 글자가 작아지고 여백이 어긋난다.
-    `Style: Default,AppleSDGothicNeo,${Math.round(H * 0.045)},&H00FFFFFF,&H00000000,&H80000000,1,1,3,1,2,`
+    `Style: Default,${font.family},${Math.round(H * 0.045)},&H00FFFFFF,&H00000000,&H80000000,1,1,3,1,2,`
       + `${Math.round(W * 0.07)},${Math.round(W * 0.07)},${Math.round(H * 0.08)},1`, '',
     '[Events]',
     'Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text',

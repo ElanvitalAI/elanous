@@ -389,7 +389,13 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
       }
     }
     if (shared.names.has(name)) {
-      return shared.dispatch(name, args); // L2 core + L3 finance(gated) — buildSharedAppTools 단일 dispatch
+      // L2 core + L3 finance(gated) — buildSharedAppTools 단일 dispatch · B5: 진행 한 줄(emitFeedback)·세션·호출 id 를 넘긴다.
+      return shared.dispatch(name, args, {
+        surface: 'tui',
+        ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+        ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),
+        ...(ctx.emitFeedback ? { emitFeedback: ctx.emitFeedback } : {}),
+      });
     }
     if (name === 'Bash') {
       // PLAN-ios-rich-dev-feedback-hydrate M3 (2026-05-13) — pass

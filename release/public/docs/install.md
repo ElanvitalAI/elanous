@@ -8,7 +8,7 @@ elanous runs on **Bun** (not Node) on macOS, Linux and WSL2; Windows native Powe
 curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 ```
 
-The `elanous` package on npm is older than the latest release — use the one-line installer above. The npm path returns to this page when npm is published with every release.
+The `elanous` package is also on npm (`npm i -g elanous`), but it needs **Bun 1.3.5+** on your PATH — without Bun the first run stops with "bun: No such file". The one-line installer above sets Bun up for you, so it is the simpler path.
 
 Coming from **monad** (0.1.x)? Don't use `monad update` to move — see [Moving from monad](update-and-uninstall.md#moving-from-monad).
 

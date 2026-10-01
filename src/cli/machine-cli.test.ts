@@ -1,12 +1,51 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { stringify } from 'yaml';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { machineConfigPath } from '../roles/machine-name.js';
+import { loadMachineLedger, machineLedgerPath, machineMarkdownPath, renderLedgerMarkdown } from '../machines/machine-ledger.js';
 import { readMachineProfile } from '../roles/machine-profile.js';
 import { registerMachineCommands } from './machine-cli.js';
+
+test('registered --test machine render --check uses the checked-in YAML and generated Markdown', () => {
+  const root = mkdtempSync(join(tmpdir(), 'machine-render-process-'));
+  try {
+    const result = spawnSync('bun', ['bin/elanous.mjs', '--test', 'machine', 'render', '--check'], {
+      encoding: 'utf8', env: { ...process.env, NODE_ENV: 'test', ELANOUS_STATE_DIR: root },
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('machine render --check OK');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('machine render --check rejects stale Markdown and passes after render', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'machine-render-cli-'));
+  const previous = process.cwd();
+  const original = console.log;
+  console.log = () => {};
+  try {
+    mkdirSync(join(root, 'docs/ops'), { recursive: true });
+    writeFileSync(machineLedgerPath(root), stringify({ title: 'Ledger', policy: ['YAML source'], machines: [{ id: 'mbp', name: 'mbp', specs: 'M5', locationStatus: 'office', role: 'work', duties: 'build' }], devices: [], rules: [], changes: [] }));
+    process.chdir(root);
+    const run = async (args: string[]) => {
+      const program = new Command();
+      registerMachineCommands(program);
+      await program.parseAsync(['node', 'elanous', 'machine', ...args]);
+    };
+    await expect(run(['render', '--check'])).rejects.toThrow('missing');
+    await run(['render']);
+    await run(['render', '--check']);
+    expect(readFileSync(machineMarkdownPath(root), 'utf8')).toBe(renderLedgerMarkdown(loadMachineLedger(root)));
+    writeFileSync(machineMarkdownPath(root), 'stale');
+    await expect(run(['render', '--check'])).rejects.toThrow('stale');
+    await run(['ledger-set', 'mbp', 'role', 'control']);
+    await run(['render', '--check']);
+    expect(loadMachineLedger(root).machines[0]?.role).toBe('control');
+  } finally { process.chdir(previous); console.log = original; rmSync(root, { recursive: true, force: true }); }
+});
 
 test('registered --test CLI sets and shows an isolated profile end-to-end', () => {
   const root = mkdtempSync(join(tmpdir(), 'machine-cli-process-'));

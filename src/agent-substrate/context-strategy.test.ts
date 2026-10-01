@@ -1,6 +1,7 @@
 // agent-loop-substrate 조각2 — context 전략 검증 (2026-07-19)
 import { test, expect, describe } from 'bun:test';
 import { createDefaultContextStrategy, type ContextStrategy } from './context-strategy.js';
+import { shouldAutoCompact } from '../compact/auto.js';
 import type { LLMMessage } from '../llm.js';
 
 describe('context-strategy (조각2·pluggable context 전략)', () => {
@@ -32,7 +33,7 @@ describe('context-strategy (조각2·pluggable context 전략)', () => {
     const strat = createDefaultContextStrategy();
     // 큰 tool_result 로 임계를 넘겨 압축이 발동하게(개수는 그대로, 내용만 축소되는 경로).
     // huge 는 preserveLastN(기본 6) 밖(앞쪽)에 둬야 L1(tool-output-budget)이 잘라낸다.
-    const huge = 'x'.repeat(600_000); // ~150K tok(ascii/4) > 0.85·128K(gpt-5 window)
+    const huge = 'x'.repeat(600_000); // ~150K estimated tokens; 128K working budget fires independently of the model catalog window.
     const msgs: LLMMessage[] = [
       { role: 'user', content: 'task anchor' },
       { role: 'assistant', content: [{ type: 'tool_result', tool_use_id: 't1', content: huge }] },
@@ -43,7 +44,9 @@ describe('context-strategy (조각2·pluggable context 전략)', () => {
       { role: 'user', content: 'tail-a' },
       { role: 'assistant', content: 'tail-b' },
     ];
-    const r = await strat.compact(msgs, { model: 'gpt-5.6-terra', config: { enabled: true, triggerRatio: 0.85, preserveLastN: 4, preserveFirstN: 1 } });
+    const config = { enabled: true, triggerRatio: 0.85, preserveLastN: 4, preserveFirstN: 1, partial: false, workingBudgetTokens: 128_000 };
+    expect(shouldAutoCompact(msgs, 'gpt-5.6-terra', config).reason).toBe('threshold-exceeded');
+    const r = await strat.compact(msgs, { model: 'gpt-5.6-terra', config });
     expect(r.fired).toBe(true);
     expect(r.afterTokens).toBeLessThan(r.beforeTokens); // 실제 크기 감소
     expect(r.reduced).toBe(true);                        // 개수 동일해도 토큰 감소면 reduced

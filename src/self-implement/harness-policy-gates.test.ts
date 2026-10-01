@@ -93,3 +93,23 @@ test('runner exception is a named measurement failure, not a pass', () => {
   } });
   expect(result).toEqual({ passed: false, failures: [{ gate: 'isolation-gate', lines: [expect.stringContaining('scan unavailable')] }] });
 });
+
+test('LEAK1: public-export-leak runs with the same changed files and its failure reaches the child with the file and line', () => {
+  const cwd = fixture();
+  const pass = () => 0;
+  let seen: string[] = [];
+  const result = runHarnessPolicyGates({ cwd, changedFiles: ['src/a.test.ts'], gates: {
+    'isolation-gate': pass, 'mock-module-restore-gate': pass, 'model-hardcode-gate': pass, 'daemon-port-gate': pass,
+    'public-export-leak': (out) => { seen = out.args; out.error('   src/a.test.ts:3  ceo-mark'); return 1; },
+  } });
+  expect(seen).toEqual(['--changed-files', 'src/a.test.ts']);
+  expect(result).toMatchObject({ passed: false, failures: [{ gate: 'public-export-leak', lines: [expect.stringContaining('src/a.test.ts:3  ceo-mark'), expect.stringContaining('violation detected')] }] });
+});
+
+test('LEAK1: the real public-export-leak gate does not fail a tree it cannot measure', () => {
+  const cwd = fixture();
+  const pass = () => 0;
+  expect(runHarnessPolicyGates({ cwd, changedFiles: ['src/x.ts'], gates: {
+    'isolation-gate': pass, 'mock-module-restore-gate': pass, 'model-hardcode-gate': pass, 'daemon-port-gate': pass,
+  } })).toEqual({ passed: true, failures: [] });
+});

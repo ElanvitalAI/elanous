@@ -10,7 +10,8 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { LogRow } from '@/nexus/client';
-import { clockTime, DECISION_KINDS, LIVE_STAGES, LIVE_STAGE_LABEL, type DecisionKind, type DecisionLine, type LiveBoardData, type LiveRun } from '@/lib/live-signals';
+import { clockTime, DECISION_KINDS, foldForRole, LIVE_STAGES, LIVE_STAGE_LABEL, type DecisionKind, type DecisionLine, type LiveBoardData, type LiveRun } from '@/lib/live-signals';
+import type { PwaRole } from '@/lib/pwa-role';
 import { buildJudgmentGraph, newDecisionKeys, stepForces, type GraphNode, type JudgmentGraph } from '@/lib/live-graph';
 import { gateTally, histogram, modelSiteHeatmap, modelTicker, planPieces, podDispatches, runEventKinds, runSpans, runUniverses, stageLoad, stageRetries, usageCandles, usageRequests, type UsageReq } from '@/lib/live-v5';
 
@@ -65,6 +66,8 @@ export interface LiveMaxStageProps {
   /** 무대를 열면 리플레이 한 바퀴(기본 켬 · 시험은 끈다). */
   autoReplay?: boolean;
   onSelectRun?: (runId: string) => void;
+  /** 없으면 오너 — 디버깅 무대는 원문 그대로. */
+  role?: PwaRole;
 }
 
 /** ④ 오늘 최고의 런 — 병합된 런 중 라운드(스스로 고친 횟수)가 가장 많은 것 · 없으면 지금 도는 런. */
@@ -78,7 +81,7 @@ export function bestRun(board: LiveBoardData): { run: LiveRun; why: 'merged' | '
   return flying ? { run: flying, why: 'in-flight' } : null;
 }
 
-export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, sourceLabel = 'this instance', shippedSource = 'log', autoReplay = true, publicCapture = false, onSelectRun }: LiveMaxStageProps) {
+export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, sourceLabel = 'this instance', shippedSource = 'log', autoReplay = true, publicCapture = false, onSelectRun, role = 'owner' }: LiveMaxStageProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const graphRef = useRef<JudgmentGraph>({ nodes: [], edges: [] });
   const particlesRef = useRef<Particle[]>([]);
@@ -413,7 +416,7 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
           {cycleRun ? (
             <button type="button" className="block w-full text-left" onClick={() => onSelectRun?.(cycleRun.runId)} data-live-v5-best>
               <div className="flex items-center gap-2">
-                <span className="font-mono text-[11px] text-slate-400">{cycleRun.runId}</span>
+                <span className="font-mono text-[11px] text-slate-400">{role === 'owner' ? cycleRun.runId : '런'}</span>
                 {best?.why === 'merged' ? <Badge tone="ok">VERIFIED · MERGED{cycleRun.pr ? ` #${cycleRun.pr}` : ''}</Badge> : <Badge tone="live">IN FLIGHT</Badge>}
               </div>
               <div className="mt-1 flex items-baseline gap-3">
@@ -485,7 +488,7 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
           >
             {replaying ? `REPLAY · ${queueRef.current.length}` : '▶ REPLAY'}
           </button>
-          {card && <DecisionCard item={card.item} folding={card.folding} />}
+          {card && <DecisionCard item={card.item} folding={card.folding} role={role} />}
         </Panel>
         <Panel className="col-span-12 xl:col-span-2" title="STATS" stat={`${nextIn}S`}>
           <dl className="grid grid-cols-2 gap-x-2 gap-y-1.5 font-mono" data-live-v5-stats>
@@ -725,7 +728,7 @@ function GateBars({ pass, fail, verdicts }: { pass: number; fail: number; verdic
 }
 
 /** 판단 카드 — 세 칸(무엇·왜·어디로). 접히면 작아지며 사라지고 그 순간 입자가 날아간다. */
-function DecisionCard({ item, folding }: { item: DecisionCardItem; folding: boolean }) {
+function DecisionCard({ item, folding, role }: { item: DecisionCardItem; folding: boolean; role: PwaRole }) {
   const { line } = item;
   const color = KIND_COLOR[line.kind];
   return (
@@ -737,12 +740,12 @@ function DecisionCard({ item, folding }: { item: DecisionCardItem; folding: bool
       <div className="mb-2 flex items-center gap-2 font-mono text-[11px] lg:text-[10px]">
         <span style={{ color }}>● {line.kind}</span>
         <span className="text-slate-500">{clockTime(line.ts)}</span>
-        {line.runId && <span className="text-slate-500">{line.runId.replace(/^run-/, '').slice(0, 8)}</span>}
+        {role === 'owner' && line.runId && <span className="text-slate-500">{line.runId.replace(/^run-/, '').slice(0, 8)}</span>}
         {line.paths ? <span className="ml-auto text-slate-400">PATHS {line.paths}</span> : null}
       </div>
       <div className="grid grid-cols-3 gap-2 text-[11px] leading-snug">
         <Cell label="무엇 · WHAT" value={line.what} strong />
-        <Cell label="왜 · WHY" value={line.why ?? line.purpose} />
+        <Cell label="왜 · WHY" value={foldForRole(line.why, role) ?? line.purpose} />
         <Cell label="어디로 · TO" value={line.target} accent={color} />
       </div>
     </div>

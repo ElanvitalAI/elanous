@@ -19,6 +19,10 @@ req.usesLanguageCorrection = true
 try? VNImageRequestHandler(cgImage: cg, options: [:]).perform([req])
 let obs = req.results ?? []
 print("regions=\\(obs.count)")
-for o in obs { if let t = o.topCandidates(1).first { print(String(format: "  %.2f  %@", t.confidence, t.string)) } }
+for o in obs { if let t = o.topCandidates(1).first {
+    // Vision boundingBox is normalized with a lower-left origin; preserve that coordinate system.
+    let box = o.boundingBox
+    print(String(format: "  %.2f  %@ box=%.6f,%.6f,%.6f,%.6f", t.confidence, t.string, box.origin.x, box.origin.y, box.size.width, box.size.height))
+} }
 `);
 });

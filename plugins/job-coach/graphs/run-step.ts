@@ -230,7 +230,7 @@ async function run(step: string) {
     const profile = value(outputs.profile);
     const query = `${list(profile.jobs).join(' ')} 역량 교육 과정 강의 공식 출처`;
     if (!query.trim()) throw new Error('missing job for research');
-    const cli = Bun.spawn(['elanous', '--test', 'research', query, '--json'], { env: process.env, stdout: 'pipe', stderr: 'pipe' });
+    const cli = Bun.spawn(['elanous', 'research', query, '--json'], { env: process.env, stdout: 'pipe', stderr: 'pipe' });
     const stdout = await new Response(cli.stdout).text();
     const stderr = await new Response(cli.stderr).text();
     if (await cli.exited !== 0) throw new Error(`research failed: ${stderr.slice(0, 300)}`);
@@ -253,7 +253,7 @@ async function run(step: string) {
       return;
     }
     const gaps = await judgeGaps(units, interview, async prompt => {
-      const cli = Bun.spawn(['elanous', '--test', 'ask', '--json', prompt], { env: process.env, stdout: 'pipe', stderr: 'pipe' });
+      const cli = Bun.spawn(['elanous', 'ask', '--json', prompt], { env: process.env, stdout: 'pipe', stderr: 'pipe' });
       const stdout = await new Response(cli.stdout).text();
       await new Response(cli.stderr).text();
       if (await cli.exited !== 0) throw new Error('gap LLM failed');

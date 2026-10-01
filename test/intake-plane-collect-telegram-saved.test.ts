@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   collectTelegramSaved, readSavedCursor, savedMessageToRaws, type FetchSavedMessages, type SavedMessage,
+  gramjsFetchSaved,
 } from '../src/intake-plane/collect-telegram-saved.js';
 import { listIntakeItems } from '../src/intake-plane/items.js';
 
@@ -72,4 +73,10 @@ test('⛔ 읽기 모듈은 보내기·지우기 경로를 쓰지 않는다', () 
     expect(src.includes(forbidden)).toBe(false);
   }
   expect(src).toContain("getMessages('me'");
+});
+
+test('optional telegram module missing → a clear reason, not a raw import error', async () => {
+  const env = { TELEGRAM_API_ID: '1', TELEGRAM_API_HASH: 'h', TELEGRAM_USER_SESSION: 's' } as NodeJS.ProcessEnv;
+  const missing = async () => { throw new Error("Cannot find package 'telegram'"); };
+  await expect(gramjsFetchSaved(env, missing)).rejects.toThrow('선택 의존');
 });

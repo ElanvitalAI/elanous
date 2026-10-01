@@ -47,7 +47,7 @@ describe('llm-cost-ledger pagination', () => {
     expect(collected.lines).toHaveLength(2);
   });
 
-  it('prints measurable USD and unknown remainder together, and keeps omitted tokens out of known totals', () => {
+  it('prints catalog-priced totals and keeps omitted tokens out of known totals', () => {
     const summary = {
       ...summarizeLlmUsageRows([
         JSON.stringify({ category: 'llm.usage', data: { model: 'gpt-5.6-terra', inputTokens: 1_000_000, outputTokens: 0 } }),
@@ -56,20 +56,37 @@ describe('llm-cost-ledger pagination', () => {
       ], {}),
       incomplete: false,
     };
-    expect(summary.knownUsd).toBe(2.5);
-    expect(summary.partialUsd).toBe(15);
-    expect(summary.measurableUsd).toBe(17.5);
-    expect(summary.unknownRows).toBe(1);
-    expect(summary.unknownModels).toEqual(['gpt-5.6-luna']);
+    expect(summary.knownUsd).toBe(2.000009);
+    expect(summary.partialUsd).toBe(12);
+    expect(summary.measurableUsd).toBe(14.000009);
+    expect(summary.unknownRows).toBe(0);
+    expect(summary.unknownModels).toEqual([]);
     expect(summary.partialRows).toBe(1);
     expect(summary.partialModels).toEqual(['gpt-5.6-terra']);
     const printed = formatLlmCostLedger(summary);
-    expect(printed).toContain('measurableUsd 17.5');
-    expect(printed).toContain('knownUsd 2.5');
-    expect(printed).toContain('partialUsd 15');
-    expect(printed).toContain('unknownRows 1');
-    expect(printed).toContain('unknownModels gpt-5.6-luna');
+    expect(printed).toContain('measurableUsd 14.000009');
+    expect(printed).toContain('knownUsd 2.000009');
+    expect(printed).toContain('partialUsd 12');
+    expect(printed).toContain('unknownRows 0');
+    expect(printed).toContain('unknownModels (none)');
     expect(printed).toContain('incomplete false');
+  });
+
+  it('prints measurable USD and unknown remainder together', () => {
+    const summary = {
+      ...summarizeLlmUsageRows([
+        JSON.stringify({ model: 'gpt-5.6-terra', inputTokens: 1_000_000, outputTokens: 0 }),
+        JSON.stringify({ model: 'unpriced-model', inputTokens: 3, outputTokens: 1 }),
+        JSON.stringify({ model: 'gpt-5.6-terra', outputTokens: 1_000_000 }),
+      ], {}),
+      incomplete: false,
+    };
+    expect(summary.knownUsd).toBe(2);
+    expect(summary.partialUsd).toBe(12);
+    expect(summary.measurableUsd).toBe(14);
+    expect(summary.unknownRows).toBe(1);
+    expect(summary.unknownModels).toEqual(['unpriced-model']);
+    expect(formatLlmCostLedger(summary)).toContain('unknownModels unpriced-model');
   });
 
   it('adds the priced portion of a partial row to the total without calling it known', () => {
@@ -77,8 +94,8 @@ describe('llm-cost-ledger pagination', () => {
       JSON.stringify({ model: 'gpt-5.6-terra', outputTokens: 1_000_000 }),
     ], {});
     expect(summary.knownUsd).toBe(0);
-    expect(summary.partialUsd).toBe(15);
-    expect(summary.measurableUsd).toBe(15);
+    expect(summary.partialUsd).toBe(12);
+    expect(summary.measurableUsd).toBe(12);
     expect(summary.partialRows).toBe(1);
     expect(summary.unknownRows).toBe(0);
   });

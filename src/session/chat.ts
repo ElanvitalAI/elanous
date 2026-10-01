@@ -30,6 +30,7 @@ import {
 import { buildMemoryInjection, buildMemoryInjectionLLM } from '../memory.js';
 import { getUserConfig } from '../user-config.js';
 import { budgetModel } from '../llm/model-defaults.js';
+import { explicitTurnTier } from '../model-tier/turn-tier.js';
 import { recordTurn } from '../status/metrics.js';
 import {
   buildTerminalCapableTurn,
@@ -375,7 +376,18 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     return trimToBudget(wire, opts.maxTokens ?? DEFAULT_TOKEN_BUDGET);
   };
 
-  const provider = opts.provider ?? getProviderForConfig(opts.userConfig, opts.llmOpts?.model);
+  const explicitTier = opts.llmOpts?.model ? undefined : explicitTurnTier(opts.userConfig, opts.sessionId);
+  const llmOpts = explicitTier ? {
+    ...(opts.llmOpts ?? {}), model: explicitTier.model,
+    ...(explicitTier.reasoningEffort && !opts.llmOpts?.reasoningEffort ? { reasoningEffort: explicitTier.reasoningEffort } : {}),
+  } : opts.llmOpts;
+  if (explicitTier) {
+    debug.log('llm.tier', 'turn-tier-applied', {
+      sessionId: opts.sessionId, tier: explicitTier.tier, source: explicitTier.source, model: explicitTier.model,
+      reasoningEffort: llmOpts?.reasoningEffort ?? null,
+    });
+  }
+  const provider = opts.provider ?? getProviderForConfig(opts.userConfig, llmOpts?.model);
   let kept: LLMMessage[] = [];
   let dropped = 0;
   let used = 0;
@@ -394,7 +406,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
       specs: opts.tools,
       dispatch: rawDispatchTool,
       systemPromptParts: effectiveSystemPrompt ? [effectiveSystemPrompt] : [],
-      ...(opts.llmOpts ? { llmOpts: opts.llmOpts } : {}),
+      ...(llmOpts ? { llmOpts } : {}),
     };
     const terminal = hasPtyShellTool
       ? isTerminalCapableTurn(terminalBase)
@@ -409,7 +421,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     if (terminal) {
       effectiveSystemPrompt = terminal.systemPromptParts.join('\n\n');
     }
-    const turnLlmOpts = terminal ? terminal.llmOpts : opts.llmOpts;
+    const turnLlmOpts = terminal ? terminal.llmOpts : llmOpts;
     ({ kept, dropped, used } = assembleTurnMessages(effectiveSystemPrompt));
     // Durable tool telemetry (추적성) — pair each call's args (onToolCall) with its
     // result (onToolResult) and persist a role:'tool' message so later "어떤 도구
@@ -477,7 +489,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
     }
   } else {
     ({ kept, dropped, used } = assembleTurnMessages(effectiveSystemPrompt));
-    const plainOpts = opts.signal ? { ...(opts.llmOpts ?? {}), signal: opts.signal } : (opts.llmOpts ?? {});
+    const plainOpts = opts.signal ? { ...(llmOpts ?? {}), signal: opts.signal } : (llmOpts ?? {});
     const stream = provider.streamChat
       ? provider.streamChat(kept, plainOpts)
       : wrapTextOnly(provider.chat(kept, plainOpts));
@@ -529,7 +541,7 @@ export async function runTurn(opts: RunTurnOpts): Promise<RunTurnResult> {
   // status bar (CTX bar · $ · 🚀) reflects the latest numbers. Uses
   // rough estimates — providers that expose real `usage` fields can
   // override via opts.llmOpts in a later phase.
-  const resolvedModel = opts.llmOpts?.model ?? provider.defaultModel;
+  const resolvedModel = llmOpts?.model ?? provider.defaultModel;
   recordTurn({
     model: resolvedModel,
     estimatedPromptText: [...messages, userMsg].map(m =>

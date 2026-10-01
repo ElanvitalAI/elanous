@@ -221,6 +221,7 @@ describe('formatUnifiedUsage ⊕ CLI 가 같은 문면을 낸다', () => {
     const program = new Command();
     registerUsageCommand(program, {
       collect: async () => report,
+      creditPlan: () => null,
       out: { log: (s) => { lines.push(s); } },
     });
     await program.parseAsync(['usage'], { from: 'user' });

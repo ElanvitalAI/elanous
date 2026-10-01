@@ -15,6 +15,7 @@
 // Port policy (N1-2 decision): auto-pick from 31415 upward. Actual port
 // is recorded in runtime.json + printed in boot banner.
 
+import { getUserConfig } from '../../user-config.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
@@ -198,7 +199,11 @@ import { handleMcpResourceGet, MCP_RESOURCE_ROUTE_PATH } from './mcp-resource-ro
 import { APPROVALS_MERGES_PATH, DESIGN_DIRECTION_PATH, DESIGN_PREVIEW_PATH_PREFIX, DESIGN_PREVIEWS_PATH, DESIGN_SYSTEM_PATH, IPA_PATH_PREFIX, MANIFEST_PATH } from './rest-route-paths.js';
 import { handleMergeApprovals } from './merge-approvals.js';
 import { GRAPH_APPROVALS_PATH, handleGraphApprovals } from './graph-approvals.js';
-import { FIELD_SERVER_MAX_BODY_BYTES, FIELD_UPLOADS_PATH, handleFieldUploads } from './field-uploads.js';
+import { handleExecRequests } from './exec-requests.js';
+import { handleSeatRequests, SEAT_REQUESTS_PATH, type SeatRequestsDeps } from './seat-requests.js';
+import { handleConsultRequests, CONSULT_REQUESTS_PATH, type ConsultRequestsDeps } from './consult-requests.js';
+import { ExecRequestRunner } from '../../exec-requests/runner.js';
+import { FIELD_SERVER_MAX_BODY_BYTES, FIELD_UPLOADS_PATH, FIELD_REEL_PATH, FIELD_REEL_FILE_PATH, handleFieldUploads } from './field-uploads.js';
 import { handleLiveDetail, LIVE_DETAIL_PATH } from './live-detail.js';
 import { handleLiveShipped, LIVE_SHIPPED_PATH } from './live-shipped.js';
 import { handleMcpWidgetCall, MCP_WIDGET_CALL_ROUTE_PATH, persistWidgetTurnToSessionStore } from './mcp-widget-call-route.js';
@@ -236,6 +241,7 @@ import {
   parseErrorsPath,
 } from './errors.js';
 import { handleChatBackendDetection } from './chat-backend-detection.js';
+import { handleChatFastPathConfig } from './chat-fast-path-config.js';
 import { connectInfoTokenAllowed, handleConnectInfoGet, handleConnectTokenMint, type ConnectInfoCtx } from './connect-info.js';
 import { handleStaticAppRequest, pathMatchesStaticPrefix } from './static-app.js';
 import {
@@ -446,6 +452,9 @@ export type NexusWsBridgeInit = Omit<WsBridgeOpts, 'hostname' | 'port'>;
 export interface NexusHttpServerOpts {
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
+  execRequests?: ExecRequestRunner;
+  seatRequests?: SeatRequestsDeps;
+  consultRequests?: ConsultRequestsDeps;
   state: NexusState;
   registry: TabRegistry;
   eventBus: NexusEventBus;
@@ -748,6 +757,8 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
         ...(websocketHandler ? { websocket: websocketHandler } : {}),
       } as unknown as Parameters<typeof Bun.serve>[0];
       server = Bun.serve(fetchOpts);
+      // 데몬이 «실제로» 떴을 때만 재시작 복구(맡긴 일) — 주입된 러너(시험)는 건드리지 않는다.
+      if (!opts.execRequests) { try { execRequestRunner().reconcileInterrupted(); } catch { /* 복구 실패가 서버 기동을 막지 않는다 */ } }
       resolvedPort = port;
       break;
     } catch (err) {
@@ -784,6 +795,13 @@ function isPortBusy(err: unknown): boolean {
   if (e.errno === -48 || e.errno === -98) return true;     // darwin / linux
   const msg = e.message ?? String(err);
   return /EADDRINUSE|address already in use/i.test(msg);
+}
+
+let execRequestRunnerInstance: ExecRequestRunner | undefined;
+/** 게으른 한 벌 — import 만으로는 만들지 않는다(재시작 복구가 import 에 묶이지 않게). */
+function execRequestRunner(): ExecRequestRunner {
+  execRequestRunnerInstance ??= new ExecRequestRunner();
+  return execRequestRunnerInstance;
 }
 
 export async function routeRequest(
@@ -834,16 +852,26 @@ export async function routeRequest(
   // Per-route checkAuth calls below stay in place.
   // OPTIONS is a CORS preflight and cannot carry Authorization; existing
   // handlers answer it themselves, so the gate does not swallow it.
-  // A runtime-less tab mutation still needs authentication before the
-  // dispatcher can return its 503. Do not enable this fallback for other paths.
-  const runtimeLessTabMutation = !opts.metaApi && method !== 'GET' && method !== 'OPTIONS'
-    && (pathname === '/v1/nexus/tabs' || pathname.startsWith('/v1/nexus/tabs/'));
+  // Without metaApi, only the owner bearer may reach these runtime-less
+  // meta-API stubs. All other private paths remain default-denied.
+  const runtimeLessMetaRoute = !opts.metaApi && (
+    (method !== 'GET' && method !== 'OPTIONS'
+      && (pathname === '/v1/nexus/tabs' || pathname.startsWith('/v1/nexus/tabs/')))
+    || (method === 'GET' && (
+      ['/v1/simulations', '/v1/tools', '/v1/intake', '/v1/sessions', '/v1/control-signals', '/v1/turns/last/screenshot'].includes(pathname)
+      || pathname.startsWith('/v1/recordings/')
+    ))
+    || (method === 'POST' && (
+      ['/v1/intake', '/v1/sessions/external', '/v1/control-signals', '/v1/prompt'].includes(pathname)
+      || pathname.startsWith('/v1/hitl/callback/')
+    ))
+  );
   if (
     method !== 'OPTIONS'
     && pathname.startsWith('/v1/')
     && !isPublicRoute(method, pathname, { setupMode: false })
   ) {
-    const fallbackToken = runtimeLessTabMutation ? ensureAuthToken().token : undefined;
+    const fallbackToken = runtimeLessMetaRoute ? ensureAuthToken().token : undefined;
     const offered = req.headers.get('authorization');
     const fallbackAuthorized = fallbackToken !== undefined && offered?.startsWith('Bearer ') === true
       && compareTokenConstTime(offered.slice('Bearer '.length).trim(), fallbackToken);
@@ -919,6 +947,25 @@ export async function routeRequest(
     });
   }
 
+  if (pathname === SEAT_REQUESTS_PATH) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleSeatRequests(req, opts.seatRequests);
+  }
+
+  if (pathname === CONSULT_REQUESTS_PATH) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleConsultRequests(req, opts.consultRequests);
+  }
+
+  if (pathname === '/v1/exec-requests' || pathname.startsWith('/v1/exec-requests/')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (/^\/v1\/exec-requests\/[^/]+\/files\//.test(pathname)) {
+      const credential = bearerCredential(req, opts.metaApi);
+      if (credential !== 'bearer-match' && credential !== 'temp-token') return jsonResponse({ error: 'unauthorized' }, 401);
+    }
+    return handleExecRequests(req, opts.execRequests ?? execRequestRunner());
+  }
+
   if (pathname === GRAPH_APPROVALS_PATH || pathname.startsWith(`${GRAPH_APPROVALS_PATH}/`)) {
     return handleGraphApprovals(req, {
       authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
@@ -926,9 +973,11 @@ export async function routeRequest(
     });
   }
   // 현장 업로드(owner 전용) — GET 목록 · POST 저장. 저장 규칙 정본 = src/field/field-media.ts.
-  if (pathname === FIELD_UPLOADS_PATH && (method === 'GET' || method === 'POST')) {
+  if ((pathname === FIELD_UPLOADS_PATH && (method === 'GET' || method === 'POST'))
+    || ((pathname === FIELD_REEL_PATH || pathname === FIELD_REEL_FILE_PATH) && method === 'GET')) {
     return handleFieldUploads(req, {
       authorize: (request) => !!opts.metaApi && checkAuth(request, opts.metaApi),
+      configuredEvent: () => { try { return getUserConfig().telegram?.fieldDefaultEvent; } catch { return undefined; } },
     });
   }
   if (pathname === APPROVALS_MERGES_PATH || pathname.startsWith(`${APPROVALS_MERGES_PATH}/`)) {
@@ -1215,6 +1264,11 @@ export async function routeRequest(
   if (method === 'POST' && pathname === '/v1/graphs/validate') {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleGraphsValidatePost(req, opts.metaApi);
+  }
+
+  if (pathname === '/v1/config/chat-fast-path' && (method === 'GET' || method === 'PUT')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleChatFastPathConfig(req);
   }
 
   // Mutation routes (PR ι) — POST/PATCH/DELETE on /v1/nexus/tabs[/:id[/action]].

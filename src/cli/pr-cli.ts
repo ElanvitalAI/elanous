@@ -17,6 +17,7 @@ import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-g
 import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
 import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
 import { runPublicLeakGate } from '../../scripts/ci-public-leak-gate.js';
+import { exportLeakCheck, type ExportLeakCheck } from '../../scripts/ci-public-export-leak-gate.js';
 import { checkCommands, extractElanousCommands, type Finding as DocsCliFinding } from '../../scripts/docs-cli-check.js';
 import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 import { isGoalDocumentFileName } from '../self-implement/goal-document.js';
@@ -68,6 +69,8 @@ export interface PrLandOpts {
   excludeActiveRunFiles?: boolean;
   excludeActiveRunSources?: boolean;
   landReason?: string;
+  /** Land even though changed files would leak into the public export (the reason goes in --land-reason). */
+  allowPublicLeak?: boolean;
 }
 
 export interface PrGranularityOpts {
@@ -101,6 +104,8 @@ export interface PrLandDeps {
   runDaemonPortGate?: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean;
   /** 공개 유출 래칫(경고 전용) — 반환 0 통과 · 1 늘었다 · 2 못 쟀다. */
   runPublicLeakGate?: (changedFiles: readonly string[], out: { log: (message: string) => void; error: (message: string) => void }) => number;
+  /** Test seam — the post-transform export leak check on changed files. */
+  runExportLeakCheck?: (changedFiles: readonly string[], cwd: string) => ExportLeakCheck;
   /** 공개 문서의 `elanous …` 호출 ↔ 실제 `--help` 대조(경고 전용) — 바뀐 공개 문서 경로를 받아 어긋남 목록을 돌려준다. */
   runDocsCliCheck?: (docFiles: readonly string[]) => DocsCliFinding[];
   /** 변경 시험 파일 간 간섭 검사 심(시험 주입용). */
@@ -267,6 +272,35 @@ export function runPrLandIsolationGate(
  *  계기: 기준선 뒤 3시간 만에 🅢 착지분에서 유출 증가 다섯을 이 게이트가 잡았다 — 착지 순간에 보여야 그 자리에서 고친다. */
 function runPrLandPublicLeakGate(changedFiles: readonly string[], out: { log: (message: string) => void; error: (message: string) => void }): number {
   return runPublicLeakGate({ args: ['--changed-files', ...changedFiles], log: out.log, error: out.log });
+}
+
+/** The prepare check on this landing's changed files — scripts/ci-public-export-leak-gate.ts. */
+export function runPrLandExportLeakCheck(changedFiles: readonly string[], cwd: string): ExportLeakCheck {
+  const top = runGitCommand(cwd, ['rev-parse', '--show-toplevel'], { encoding: 'utf-8' });
+  return exportLeakCheck(changedFiles, top.status === 0 && String(top.stdout ?? '').trim() ? String(top.stdout).trim() : cwd);
+}
+
+/** Blocks the landing when changed files would leak into the public export, unless allowPublicLeak. Returns false to stop. */
+export function exportLeakBlock(
+  changedFiles: readonly string[] | undefined,
+  check: () => ExportLeakCheck,
+  allow: boolean,
+  out: { log: (message: string) => void; error: (message: string) => void },
+): boolean {
+  if (!changedFiles || changedFiles.length === 0) return true;
+  let result: ExportLeakCheck;
+  try { result = check(); } catch (error) { result = { measured: false, hits: [], detail: error instanceof Error ? error.message : String(error) }; }
+  record('public-export-leak', result.measured ? result.hits.length === 0 || allow : true, { measured: result.measured, hits: result.hits.length, allowed: allow && result.hits.length > 0 });
+  if (!result.measured) { out.log(`⚠ public-export-leak: 못 쟀다(${result.detail ?? '?'}) — 착지는 막지 않는다. 확인: bun scripts/public-export.ts --leak-check --files <파일…>`); return true; }
+  if (result.hits.length === 0) { out.log('✓ public-export-leak: 바뀐 파일이 공개본에 사적 흔적을 싣지 않는다(prepare 와 같은 변환 뒤).'); return true; }
+  const write = allow ? out.log : out.error;
+  write(`${allow ? '⚠' : '✗'} public-export-leak: 바뀐 파일 ${result.hits.length}곳이 공개본에 사적 흔적을 싣는다 — 다음 release prepare 가 여기서 실패한다:`);
+  for (const h of result.hits.slice(0, 20)) write(`   ${h.file}:${h.line}  ${h.marker}`);
+  if (result.hits.length > 20) write(`   … 외 ${result.hits.length - 20}곳`);
+  write('   확인: bun scripts/public-export.ts --leak-check --all --files <파일…>');
+  if (allow) { out.log('   --allow-public-leak 로 넘긴다(이유는 --land-reason).'); return true; }
+  out.error('   고치거나, 공개본과 무관한 것이 확실하면 --allow-public-leak --land-reason "<이유>" 로 넘긴다.');
+  return false;
 }
 
 export function publicLeakWarning(
@@ -1286,6 +1320,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
 
   const changedPaths = currentChangePaths(run, cwd, staged, base, out);
   publicLeakWarning(changedPaths, deps.runPublicLeakGate ?? runPrLandPublicLeakGate, out);
+  if (!exportLeakBlock(changedPaths, () => (deps.runExportLeakCheck ?? runPrLandExportLeakCheck)(changedPaths ?? [], cwd), opts.allowPublicLeak === true, out)) return 1;
   if (publicDocPaths(changedPaths, () => true).length > 0) {
     const top = run('git', ['rev-parse', '--show-toplevel'], { cwd });
     const docsRoot = top.ok && top.out.trim() ? top.out.trim() : cwd;
@@ -1549,6 +1584,7 @@ export function registerPrCommands(program: Command, deps: PrLandDeps = {}): voi
     .option('--exclude-active-run-files', '도는 런과 겹친 파일을 이번 착지에서 제외')
     .option('--exclude-active-run-sources', '⚠ 위험: --exclude-active-run-files 가 골 문서가 아닌 파일(소스)을 빼도 착지를 강행')
     .option('--land-reason <text>', '권고를 보고도 지금 내는 이유(예: 남이 기다리는 차단 해제)')
+    .option('--allow-public-leak', '바뀐 파일이 공개본에 사적 흔적을 실어도 착지(이유는 --land-reason)')
     .action(async (opts: PrLandOpts) => {
       // ⛔⭐⭐⭐ **관측 sink 를 먼저 건다** — 라이브 도그푸드가 잡은 결함(2026-08-03).
       //   단위 테스트는 `debug.log` 가 **불렸다**를 단언하지만, standalone CLI 는 sink 를 등록하지

@@ -27,6 +27,7 @@ import type { RunIdSource } from '../harness/harness-space.js';
 import { withFileLockSync } from '../storage/file-lock.js';
 import type { SelfDevJobResult, SelfDevGoal } from './orchestrate.js';
 import type { SupervisorStopReason } from './run-supervisor.js';
+import { loadMirroredRunRecord, mirrorRunRecord } from './run-record-mirror.js';
 
 export interface SelfDevRunParticipant {
   id: string;
@@ -151,18 +152,26 @@ export function saveSelfDevRun(state: SelfDevRunState, dir = selfDevRunsDir()): 
     withFileLockSync(join(dir, `${state.runId}.lock`), () => {
       const current = loadSelfDevRunFromPath(runPath(state.runId, dir));
       const participants = mergeParticipants(current?.participants, state.participants);
-      writeSelfDevRun({
+      const saved = {
         ...state,
         ...(participants === undefined ? {} : { participants }),
         ...(current?.parkedResolution && !state.parkedResolution ? { parkedResolution: current.parkedResolution } : {}),
-      }, dir);
+      };
+      writeSelfDevRun(saved, dir);
+      mirrorRunRecord(saved, dir);
     });
   } catch { /* fail-soft — a lost checkpoint just means no resume, not a crash */ }
 }
 
 /** Load a run checkpoint by id, or null if absent/corrupt. */
 export function loadSelfDevRun(runId: string, dir = selfDevRunsDir()): SelfDevRunState | null {
-  return loadSelfDevRunFromPath(runPath(runId, dir));
+  const primary = loadSelfDevRunFromPath(runPath(runId, dir));
+  if (primary) return primary;
+  const mirrored = loadMirroredRunRecord(runId);
+  if (mirrored) {
+    try { debug.log('self-dev.run-store', 'read-from-mirror', { runId }); } catch { /* preserve fail-soft reads */ }
+  }
+  return mirrored;
 }
 
 /** Add one participant without losing registrations made by another caller for this run. */

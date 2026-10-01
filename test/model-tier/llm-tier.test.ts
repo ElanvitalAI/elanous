@@ -39,19 +39,19 @@ describe('M2-1 · LLM_TIER_MAP_BY_PROVIDER · invariants', () => {
     }
   });
 
-  test('cloud providers all ship today', () => {
+  test('wired cloud providers ship while declared-only and local ladders remain WIP', () => {
     for (const provider of providers) {
-      if (provider === 'local') continue;
+      const status = ['local', 'kimi', 'qwen', 'glm'].includes(provider) ? 'wip' : 'shipping';
       for (const tier of MODEL_TIERS) {
-        expect(LLM_TIER_MAP_BY_PROVIDER[provider][tier].status).toBe('shipping');
+        expect(LLM_TIER_MAP_BY_PROVIDER[provider][tier].status).toBe(status);
       }
     }
   });
 
-  test('loaded tier raises reasoning to high (where supported)', () => {
+  test('loaded tier uses the provider-specific reasoning ceiling', () => {
     for (const provider of providers) {
-      if (provider === 'local') continue;
-      expect(LLM_TIER_MAP_BY_PROVIDER[provider].loaded.reasoningLevel).toBe('high');
+      const level = provider === 'local' ? undefined : provider === 'openai-codex' ? 'medium' : 'high';
+      expect(LLM_TIER_MAP_BY_PROVIDER[provider].loaded.reasoningLevel).toBe(level);
     }
   });
 

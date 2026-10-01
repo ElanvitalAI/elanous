@@ -15,6 +15,8 @@ import { existsSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import type { LLMToolSpec } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { runRecall, type RecallSearch } from '../tool-runtime/self-cognition-runtimes.js';
+import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { SCHEDULE_MANAGE_SPEC, dispatchScheduleManage } from './schedule-manage-tool.js';
 import { SESSION_MANAGE_SPEC, dispatchSessionQuery } from './session-query-tool.js';
 import { AUTOPILOT_MISSION_SPEC, dispatchAutopilotMissions } from '../autopilot/mission-tool.js';
@@ -43,6 +45,7 @@ const MEMORY_RECALL_SPEC: LLMToolSpec = {
       sinceHours: { type: 'number', description: '조회 기간 시간(기본 168=7일).' },
       limit: { type: 'number', description: '반환 건수(기본 8).' },
       restoreId: { type: 'string', description: '느린 복원(선택) — archived 후보의 id 를 지정하면 그 cold 기억을 S3 에서 복원(recall_count++·warm 재활성화)해 본문 반환. 회상 결과 archived 에 관련 후보가 있고 본문이 필요할 때만.' },
+      timeBudgetMs: { type: 'number', description: '기억 조회 시간 예산(밀리초·기본 60000). 초과 시 찾은 것까지 부분 반환.' },
     },
     required: [],
   },
@@ -50,7 +53,7 @@ const MEMORY_RECALL_SPEC: LLMToolSpec = {
 
 /** memory_recall 코어(db 주입·테스트 가능). restoreId 지정 시 느린 복원(축B P2), 아니면 회상 + archive 발견.
  *  recency+importance+relevance 스코어. restoreDeps 는 테스트 S3 mock(생략 시 기본 S3). */
-export function recallOrRestore(mdb: Database, args: Record<string, unknown>, restoreDeps?: ArchiveS3Deps): unknown {
+export function recallOrRestore(mdb: Database, args: Record<string, unknown>, restoreDeps?: ArchiveS3Deps, onPartial?: (result: Record<string, unknown>) => void): unknown {
   // ★ 축B P2 느린 복원 — restoreId 지정 시 cold 기억을 S3 에서 명시적 복원(recall_count++·warm 재활성화).
   //   자동 아님(명시적) = 복원 폭주 방지. 죽어있던 restoreFromArchive 호출부 배선.
   if (typeof args.restoreId === 'string' && args.restoreId) {
@@ -75,15 +78,17 @@ export function recallOrRestore(mdb: Database, args: Record<string, unknown>, re
     ...(typeof args.sinceHours === 'number' ? { sinceHours: args.sinceHours } : {}),
     ...(typeof args.limit === 'number' ? { limit: args.limit } : {}),
   });
+  const mappedHits = hits.map(h => ({
+    when: h.ts, surface: h.surface, kind: h.kind,
+    text: h.text.slice(0, 400), importance: h.importance,
+    score: Math.round(h.score * 1000) / 1000,
+  }));
+  onPartial?.({ hits: mappedHits, count: hits.length });
   // M2 — cold(S3 보관) 기억 메타 발견(본문 fetch 없음·빠름). 존재+id 알리고 복원은 restoreId 로 명시적.
   const q = typeof args.query === 'string' ? String(args.query) : '';
   const archived = q ? searchArchive(mdb, q, { ...(typeof args.domain === 'string' && args.domain ? { domain: String(args.domain) } : {}), limit: 3 }) : [];
   return {
-    hits: hits.map(h => ({
-      when: h.ts, surface: h.surface, kind: h.kind,
-      text: h.text.slice(0, 400), importance: h.importance,
-      score: Math.round(h.score * 1000) / 1000,
-    })),
+    hits: mappedHits,
     count: hits.length,
     ...(archived.length ? { archived: archived.map(a => ({ id: a.id, when: a.ts, summary: a.summary, note: 'cold·S3 보관(restoreId 로 느린 복원)' })) } : {}),
     note: '내가 발송/통지한 것의 원장 회상(크로스서피스 기억·hot/warm). archived=흐려져 S3 로 이관된 cold 기억(존재+id·본문은 restoreId 로 느린 복원). 비었으면 해당 기간 발송 없음.',
@@ -91,18 +96,18 @@ export function recallOrRestore(mdb: Database, args: Record<string, unknown>, re
 }
 
 /** memory_recall 공유 구현(finance-tools 에서 이관). db 열기 + recallOrRestore 위임. */
-async function dispatchMemoryRecall(args: Record<string, unknown>): Promise<unknown> {
+async function dispatchMemoryRecall(args: Record<string, unknown>, onPartial?: (result: Record<string, unknown>) => void): Promise<unknown> {
   if (!existsSync(surfaceEventsDbPath())) {
     return { hits: [], note: '발송 원장 미생성 — 아직 기록된 발송이 없음(데몬 재시작 후 sendOutbound부터 적재).' };
   }
   const mdb = openSurfaceEventsDb();
-  try { return recallOrRestore(mdb, args); }
+  try { return recallOrRestore(mdb, args, undefined, onPartial); }
   catch (e) { return { error: `기억 회상 실패: ${e instanceof Error ? e.message.slice(0, 100) : String(e)}` }; }
   finally { mdb.close(); }
 }
 
 /** L2 코어 앱 도구 dispatch 핸들러 — 이름 → 구현. 새 코어 도구는 여기 추가. */
-const CORE_TOOL_HANDLERS: Record<string, (args: Record<string, unknown>) => Promise<unknown>> = {
+const CORE_TOOL_HANDLERS: Record<string, (args: Record<string, unknown>, onPartial?: (result: Record<string, unknown>) => void) => Promise<unknown>> = {
   schedule_manage: dispatchScheduleManage,
   session_manage: (args) => dispatchSessionQuery(args), // 대화 세션 검색·열람·목록·삭제(내용/ID/텔레그램)
   memory_recall: dispatchMemoryRecall,
@@ -115,26 +120,44 @@ const CORE_TOOL_HANDLERS: Record<string, (args: Record<string, unknown>) => Prom
   mission_decide: dispatchMissionDecide, // 미션 결정 기록(re-ground·defer·boundary…)·3박자 주입·코어
 };
 
+/** Worker-side search entry: dispatch must not re-enter its own budget wrapper. */
+export function dispatchRecallUnbudgeted(name: 'memory_recall' | 'self_recall', args: Record<string, unknown>, onPartial: (result: Record<string, unknown>) => void): Promise<unknown> {
+  return CORE_TOOL_HANDLERS[name]!(args, onPartial);
+}
+
 /** L2 코어 앱 도구 spec 목록(전 서피스 공용). */
-export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC];
+const SELF_RECALL_BUDGET_SPEC: LLMToolSpec = {
+  ...SELF_RECALL_SPEC,
+  parameters: {
+    ...SELF_RECALL_SPEC.parameters,
+    properties: {
+      ...(SELF_RECALL_SPEC.parameters.properties as Record<string, unknown>),
+      timeBudgetMs: { type: 'number', description: '기억 조회 시간 예산(밀리초·기본 60000). 초과 시 찾은 것까지 부분 반환.' },
+    },
+  },
+};
+export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC];
 
 export interface CoreTools {
   specs: LLMToolSpec[];
   names: Set<string>;
-  dispatch: (name: string, args: Record<string, unknown>) => Promise<unknown>;
+  dispatch: (name: string, args: Record<string, unknown>, onPartial?: (result: Record<string, unknown>) => void, context?: ToolRuntimeContext) => Promise<unknown>;
 }
 
 /** 서피스 무관 코어 앱 도구 세트. 모든 서피스가 이걸 조립 → 코어 도구 단일 출처 상속.
  *  L1(native)·L3(finance 팩)와 조합해 쓴다. dispatch 는 이름으로 라우팅(미등록=error). */
-export function buildCoreTools(): CoreTools {
+export function buildCoreTools(recallSearch?: RecallSearch): CoreTools {
   const names = new Set(CORE_TOOL_SPECS.map(s => s.name));
   return {
     specs: CORE_TOOL_SPECS,
     names,
-    dispatch: async (name, args) => {
+    dispatch: async (name, args, onPartial, context) => {
       const h = CORE_TOOL_HANDLERS[name];
       if (!h) return { error: `unknown core tool: ${name}` };
-      return h(args);
+      if (name === 'memory_recall' || name === 'self_recall') {
+        return runRecall(name, args, context ?? { surface: 'skill' }, recallSearch, onPartial);
+      }
+      return h(args, onPartial);
     },
   };
 }

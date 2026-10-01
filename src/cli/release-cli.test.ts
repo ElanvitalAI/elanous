@@ -58,10 +58,11 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes']);
+      expect(release.commands.map((c) => c.name())).toEqual(['checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'run']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
+      expect(release.commands.find((c) => c.name() === 'run')!.helpInformation()).toContain('--if-ready');
     } finally {
       jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
       if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
@@ -104,6 +105,214 @@ describe('release checklist CLI', () => {
       await run('status', '--version', 'graph');
       expect(lines.at(-4)).toContain('0.2.5 (graph)');
     } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('release run CLI', () => {
+  test('--dry-run --json prints the complete ledger/config input on stdout without invoking the checklist or graph', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-run-cli-'));
+    const ledger = join(dir, 'ledger');
+    mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const loop = { gatePodPool: 'gate-pool', gatePodShards: 4, gatePodShardTimeoutSeconds: 240,
+      gateRemote: 'node-b', gateRemoteMirror: '/mirror/repo.git', opsHosts: ['local', 'node-b'], internalDist: '~/dist', opsRestart: true };
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ release: { loop } }));
+    let checklistCalls = 0;
+    let graphCalls = 0;
+    const stdout: string[] = [];
+    const stderr: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write);
+    const error = spyOn(console, 'error').mockImplementation((line: string) => { stderr.push(line); });
+    const before = process.exitCode;
+    try {
+      const cli = new Command();
+      registerReleaseCommands(cli, { ledgerRoot: ledger, configPath,
+        checklist: () => { checklistCalls++; throw new Error('dry-run invoked checklist'); },
+        graph: async () => { graphCalls++; throw new Error('dry-run invoked graph'); } });
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--json'], { from: 'user' });
+      expect(stdout).toHaveLength(1);
+      expect(stdout[0]!.endsWith('\n')).toBe(true);
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { ...loop, version: '0.2.4', previousVersion: '0.2.3' } });
+      expect(stderr.join('\n')).toContain('"previousVersion":"0.2.3"');
+      expect([checklistCalls, graphCalls]).toEqual([0, 0]);
+      expect(process.exitCode ?? 0).toBe(0);
+    } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('--dry-run --if-ready preserves the input preview without checking readiness, running the graph or writing a lock', async () => {
+    for (const blocked of [true, false]) {
+      const dir = mkdtempSync(join(tmpdir(), 'release-run-preview-'));
+      const ledger = join(dir, 'ledger');
+      mkdirSync(join(ledger, 'release', '0.2.3'), { recursive: true });
+      writeFileSync(join(ledger, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+      const target = join(ledger, 'release', '0.2.4');
+      const stdout: string[] = [];
+      const human: string[] = [];
+      const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string | Uint8Array, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+      const output = spyOn(console, 'log').mockImplementation((line: string) => { human.push(line); });
+      const before = process.exitCode;
+      let checklistCalls = 0;
+      let graphCalls = 0;
+      try {
+        process.exitCode = 0;
+        const cli = new Command();
+        registerReleaseCommands(cli, { ledgerRoot: ledger, config: { gatePodPool: 'preview-pool' },
+          checklist: () => { checklistCalls++; return { ok: !blocked, red: blocked ? ['K13'] : [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
+          graph: async () => { graphCalls++; throw new Error('preview invoked graph'); } });
+        await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready', '--json'], { from: 'user' });
+        expect(stdout).toHaveLength(1);
+        expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: true, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool' } });
+        expect([checklistCalls, graphCalls]).toEqual([0, 0]);
+        expect(existsSync(target)).toBe(false);
+        expect(process.exitCode).toBe(0);
+        await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run', '--if-ready'], { from: 'user' });
+        expect(human).toHaveLength(1);
+        expect(human[0]).toStartWith('· 드라이런 0.2.4 · 입력 ');
+        expect(JSON.parse(human[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'preview-pool' });
+        expect([checklistCalls, graphCalls]).toEqual([0, 0]);
+        expect(existsSync(target)).toBe(false);
+        expect(process.exitCode).toBe(0);
+      } finally { process.exitCode = before ?? 0; write.mockRestore(); output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
+  test('--dry-run human output includes every graph input field without running the graph', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-run-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const before = process.exitCode;
+    try {
+      const cli = new Command();
+      registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool', gateRemote: 'node-b' },
+        graph: async () => { throw new Error('dry-run invoked graph'); } });
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--dry-run'], { from: 'user' });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('드라이런');
+      expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateRemote: 'node-b' });
+      expect(process.exitCode ?? 0).toBe(0);
+    } finally { process.exitCode = before ?? 0; output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('--if-ready skips a blocked checklist with exit 0 and one JSON line; plain run remains exit 1', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-run-if-ready-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const stdout: string[] = [];
+    const human: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string, callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); callback?.(); return true; }) as typeof process.stdout.write);
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { human.push(line); });
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    let graphCalls = 0;
+    const args = { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: false, red: ['K13'], undecided: ['K14'], blocked: ['K15'], moved: [], knownIssues: [] }),
+      graph: async () => { graphCalls++; throw new Error('blocked release invoked graph'); } };
+    const cli = new Command(); registerReleaseCommands(cli, args);
+    try {
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--json'], { from: 'user' });
+      expect(stdout).toEqual([`${JSON.stringify({ skipped: true, reason: 'checklist-blocked', detail: 'K13, K14, K15' })}\n`]);
+      expect(graphCalls).toBe(0);
+      expect(process.exitCode).toBe(0);
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready'], { from: 'user' });
+      expect(human).toEqual(['· 준비 안 됨 0.2.4 · checklist-blocked · K13, K14, K15']);
+      expect(process.exitCode).toBe(0);
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout[1]!)).toMatchObject({ ok: false, error: expect.stringContaining('K13') });
+      expect(graphCalls).toBe(0);
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = before ?? 0; write.mockRestore(); output.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('--if-ready honors publishedAt and holds a lock while the real graph runs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-run-if-ready-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const target = join(dir, 'release', '0.2.4');
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, 'release.json'), JSON.stringify({ version: '0.2.4', publishedAt: 'published now' }));
+    const stdout: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string, callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); callback?.(); return true; }) as typeof process.stdout.write);
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    let graphCalls = 0;
+    const cli = new Command(); registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      graph: async () => { graphCalls++; expect(JSON.parse(readFileSync(join(target, 'run.lock'), 'utf8')).pid).toBe(process.pid); return { status: 'done' } as never; } });
+    try {
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout[0]!)).toEqual({ skipped: true, reason: 'already-published', detail: 'published now' });
+      expect(graphCalls).toBe(0);
+      rmSync(join(target, 'release.json'));
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout[1]!)).toMatchObject({ ok: true, state: { status: 'done' } });
+      expect(graphCalls).toBe(1);
+      expect(existsSync(join(target, 'run.lock'))).toBe(false);
+      expect(process.exitCode).toBe(0);
+    } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('--if-ready graph error keeps exit 1 and removes the lock', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-run-if-ready-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const stdout: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string, callback?: (error?: Error | null) => void) => { stdout.push(String(chunk)); callback?.(); return true; }) as typeof process.stdout.write);
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    const lock = join(dir, 'release', '0.2.4', 'run.lock');
+    const cli = new Command(); registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+      checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+      graph: async () => { expect(existsSync(lock)).toBe(true); throw new Error('graph failed'); } });
+    try {
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--if-ready', '--json'], { from: 'user' });
+      expect(stdout).toEqual([`${JSON.stringify({ ok: false, error: 'graph failed' })}\n`]);
+      expect(existsSync(lock)).toBe(false);
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('run executes the runner, reports graph status, and keeps blocked releases fail-closed in JSON', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-run-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const stdout: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => { stdout.push(String(chunk)); return true; }) as typeof process.stdout.write);
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    let checklistCalls = 0;
+    let graphCalls = 0;
+    const cli = new Command();
+    registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+      checklist: (version) => { expect(version).toBe('0.2.4'); checklistCalls++; return { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }; },
+      graph: async (path, opts) => { expect(path).toEndWith('graphs/release/release-loop.yaml'); expect(opts.input.previousVersion).toBe('0.2.3'); graphCalls++; return { status: 'awaiting-approval', runId: 'run-1' } as never; } });
+    try {
+      await cli.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout[0]!)).toEqual({ ok: true, dryRun: false, input: { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool' }, state: { status: 'awaiting-approval', runId: 'run-1' } });
+      expect([checklistCalls, graphCalls]).toEqual([1, 1]);
+      expect(process.exitCode ?? 0).toBe(0);
+      const blocked = new Command();
+      registerReleaseCommands(blocked, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+        checklist: () => ({ ok: false, red: ['K13'], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+        graph: async () => { graphCalls++; throw new Error('blocked release invoked graph'); } });
+      await blocked.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout[1]!)).toMatchObject({ ok: false, error: expect.stringContaining('K13') });
+      expect(graphCalls).toBe(1);
+      expect(process.exitCode).toBe(1);
+      process.exitCode = 0;
+      const failed = new Command();
+      registerReleaseCommands(failed, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+        graph: async () => ({ status: 'failed' }) as never });
+      await failed.parseAsync(['release', 'run', '--version', '0.2.4', '--json'], { from: 'user' });
+      expect(JSON.parse(stdout[2]!)).toMatchObject({ ok: false, state: { status: 'failed' } });
+      expect(process.exitCode).toBe(1);
+    } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

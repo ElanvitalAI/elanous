@@ -221,6 +221,8 @@ describe('mktemp portability', () => {
     expect(mktempViolations('tag=foo#bar; TMP="$(mktemp -t foo)"')).toEqual(['mktemp -t foo']);
     expect(mktempViolations('TMP="$( # don\'t regress\nmktemp -t foo\n)"')).toEqual(['mktemp -t foo']);
     expect(mktempViolations('TMP="$(mktemp -t foo.XXXXXX)"')).toEqual([]);
+    expect(mktempViolations('TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/foo.XXXXXX")"')).toEqual([]);
+    expect(mktempViolations('TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/foo")"')).toEqual(['mktemp -d "${TMPDIR:-/tmp}/foo"']);
     expect(mktempViolations('TMP="$(mktemp \\"${TMPDIR:-/tmp}/a b.XXXXXX\\")"')).toEqual([]);
     expect(mktempViolations("TMP='$(mktemp -t foo)' ")).toEqual([]);
     expect(mktempViolations('  mktemp foo')).toEqual(['mktemp foo']);

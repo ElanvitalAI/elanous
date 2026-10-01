@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../src/debug/log.js';
 import { originObservationFields } from '../src/agent/origin-observation.js';
@@ -151,7 +152,8 @@ describe('origin observation fields', () => {
   test('self and dev establish origin before their log sink registration', () => {
     const source = readFileSync(join(process.cwd(), 'src/index.ts'), 'utf8');
     const selfHook = source.slice(source.indexOf("selfCmd.hook('preAction'"), source.indexOf("selfCmd\n  .command('author"));
-    const devAction = source.slice(source.indexOf(".command('dev [text...]')"), source.indexOf("program.parseAsync"));
+    const devStart = source.indexOf(".command('dev [text...]')");
+    const devAction = source.slice(devStart, source.indexOf('const input = buildDevCommandInput(pipelineInput)', devStart));
 
     expect(selfHook.indexOf('establishExecutionOrigin()')).toBeGreaterThanOrEqual(0);
     expect(selfHook.indexOf('establishExecutionOrigin()')).toBeLessThan(selfHook.indexOf('registerStandaloneLogSink(surface)'));
@@ -186,35 +188,41 @@ describe('origin observation fields', () => {
 
   test('dev-pipeline plan emits the fifth requested payload from the real isolated CLI boundary', () => {
     const runId = `run-origin-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const env = {
-      ...process.env,
-      NODE_ENV: undefined,
-      ELANOUS_STATE_DIR: undefined,
-      ELANOUS_CONFIG_DIR: undefined,
-      ELANOUS_RUN_ID: runId,
-      ELANOUS_ORIGIN_ROOT: 'external-agent',
-      ELANOUS_ORIGIN_AGENT: 'codex',
-      ELANOUS_ORIGIN_SESSION: 'session-origin-observation',
-      ELANOUS_CONTROLLER: 'parent-elanous',
-    };
-    const dev = spawnSync('bun', ['bin/elanous.mjs', '--test', 'dev', 'origin event test', '--backend', 'codex', '--transport', 'acp', '--no-open-pr'], {
-      cwd: process.cwd(), env, encoding: 'utf8', timeout: 15_000,
-    });
-    // ⛔ 종료 코드를 단언하지 않는다(리뷰 3R) — ACP backend 는 plan 기록 뒤 실제 연결을 기다리므로
-    //    종료는 **timeout 이 끊는 방식**에 달렸고 그것은 환경마다 다르다(`2`·`143`·`null`).
-    //    ⚠️ 종전 단언은 **자기 바로 위 주석과 모순**이었다 — *"timeout 은 실행 결과일 뿐 별개다"* 라고
-    //    적고서 그 결과를 단언했다. ⇒ 이 테스트가 재는 것은 **관측 payload 가 생겼는가** 하나다.
-    const logs = spawnSync('bun', ['bin/elanous.mjs', '--test', 'logs', '--test', '--exact-category', 'dev-pipeline', '--event', 'plan', '--grep', runId, '--since', '10m', '--json', '--limit', '5'], {
-      cwd: process.cwd(), env, encoding: 'utf8', timeout: 15_000,
-    });
-    expect(logs.status).toBe(0);
-    const outputRows = logs.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { _meta?: unknown; data?: unknown });
-    const rows = outputRows.filter((row) => row._meta === undefined);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toEqual(expect.objectContaining({ data: expect.any(String) }));
-    expect(JSON.parse(rows[0]!.data as string)).toEqual(expect.objectContaining({
-      runId, dispatch: 'acp', executor: 'external', wired: true, nestDepth: expect.any(Number),
-      originRoot: 'external-agent', originAgent: 'codex', originSession: 'session-origin-observation', controller: 'parent-elanous',
-    }));
+    const fixtureRoot = mkdtempSync(join(tmpdir(), 'origin-observation-'));
+    const stateDir = join(fixtureRoot, '.elanous-test');
+    mkdirSync(stateDir);
+    writeFileSync(join(stateDir, 'config.json'), JSON.stringify({ llm: { provider: 'local', baseUrl: 'http://127.0.0.1:1' } }));
+    try {
+      const env = {
+        ...process.env,
+        NODE_ENV: undefined,
+        ELANOUS_STATE_DIR: undefined,
+        ELANOUS_CONFIG_DIR: undefined,
+        ELANOUS_RUN_ID: runId,
+        ELANOUS_ORIGIN_ROOT: 'external-agent',
+        ELANOUS_ORIGIN_AGENT: 'codex',
+        ELANOUS_ORIGIN_SESSION: 'session-origin-observation',
+        ELANOUS_CONTROLLER: 'parent-elanous',
+      };
+      const cli = join(import.meta.dir, '..', 'bin', 'elanous.mjs');
+      const dev = spawnSync('bun', [cli, `--test=${stateDir}`, 'dev', 'origin event test', '--backend', 'codex', '--transport', 'acp'], {
+        cwd: fixtureRoot, env, encoding: 'utf8', timeout: 15_000,
+      });
+      // ACP may wait for a connection after recording the plan; only the observed payload is asserted.
+      const logs = spawnSync('bun', [cli, `--test=${stateDir}`, 'logs', '--test', '--exact-category', 'dev-pipeline', '--event', 'plan', '--grep', runId, '--since', '10m', '--json', '--limit', '5'], {
+        cwd: fixtureRoot, env, encoding: 'utf8', timeout: 15_000,
+      });
+      expect(logs.status, `dev: ${dev.stdout}\n${dev.stderr}\nlogs: ${logs.stdout}\n${logs.stderr}`).toBe(0);
+      const outputRows = logs.stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as { _meta?: unknown; data?: unknown });
+      const rows = outputRows.filter((row) => row._meta === undefined);
+      expect(rows, `dev: ${dev.stdout}\n${dev.stderr}\nlogs: ${logs.stdout}\n${logs.stderr}`).toHaveLength(1);
+      expect(rows[0]).toEqual(expect.objectContaining({ data: expect.any(String) }));
+      expect(JSON.parse(rows[0]!.data as string)).toEqual(expect.objectContaining({
+        runId, dispatch: 'acp', executor: 'external', wired: true, nestDepth: expect.any(Number),
+        originRoot: 'external-agent', originAgent: 'codex', originSession: 'session-origin-observation', controller: 'parent-elanous',
+      }));
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   }, 35_000);
 });

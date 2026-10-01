@@ -43,3 +43,27 @@ export function recordTriageOnCards(decisions: ScheduledDecision[], issues: Tria
     if (!deps.store) store.close();
   }
 }
+
+function recordOnCard(section: 'launch' | 'outcome', issue: Pick<TriageIssue, 'identifier' | 'title'>, value: object, deps: StewardCardDeps): void {
+  const store = deps.store ?? new CardStore(deps.root);
+  try {
+    const content = redactSecrets(JSON.stringify(value));
+    const key = `${section}:${createHash('sha256').update(content).digest('hex')}`;
+    const card = store.createCard({ goalId: `linear:${issue.identifier}`, title: redactSecrets(issue.title) });
+    if (!card.sections.some(item => item.key === key)) {
+      store.appendSection(card.id, { key, owner: 'steward', content });
+    }
+  } finally {
+    if (!deps.store) store.close();
+  }
+}
+
+/** Append a launch revision to the issue card; an identical retry keeps its original section. */
+export function recordLaunchOnCard(issue: Pick<TriageIssue, 'identifier' | 'title'>, launch: object, deps: StewardCardDeps = {}): void {
+  recordOnCard('launch', issue, launch, deps);
+}
+
+/** Append an outcome revision to the issue card without replacing earlier sections. */
+export function recordOutcomeOnCard(issue: Pick<TriageIssue, 'identifier' | 'title'>, outcome: object, deps: StewardCardDeps = {}): void {
+  recordOnCard('outcome', issue, outcome, deps);
+}

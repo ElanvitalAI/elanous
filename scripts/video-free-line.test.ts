@@ -4,17 +4,22 @@
  */
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { koreanCaptionFont } from '../src/video-pipeline/recipes/free-line.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
 const CLI = join(HERE, 'video-free-line.ts');
+const TEST_WALKER = join(HERE, 'video-free-line-test-walker.ts');
 
-function run(args: string[]): { status: number; out: string } {
-  const r = spawnSync('bun', [CLI, ...args], { cwd: REPO, encoding: 'utf8', timeout: 600_000 });
+function run(args: string[], walker?: string): { status: number; out: string } {
+  const r = spawnSync(process.execPath, [CLI, ...args], {
+    cwd: REPO, encoding: 'utf8', timeout: 600_000,
+    env: walker ? { ...process.env, GRAPH_WALKER: walker } : process.env,
+  });
   if (r.status === null) throw new Error(`죽었다(signal=${r.signal})`);
   return { status: r.status, out: `${r.stdout}${r.stderr}` };
 }
@@ -37,10 +42,47 @@ function probeField(path: string, entries: string, key: string, stream = 'v:0'):
 
 // ⛔ ffmpeg 가 없는 기계에서는 이 시험이 «못 돈다» — 「실패」로 읽지 않는다.
 const HAS_FFMPEG = spawnSync('ffmpeg', ['-version'], { encoding: 'utf8' }).status === 0;
-const HAS_WALKER = existsSync(`${process.env.HOME}/temp/agentic-consulting/scripts/graph-walk.ts`);
-const LIVE = HAS_FFMPEG && HAS_WALKER;
+const HAS_FFPROBE = spawnSync('ffprobe', ['-version'], { encoding: 'utf8' }).status === 0;
+const HAS_WALKER = existsSync(process.env.GRAPH_WALKER ?? `${process.env.HOME}/temp/agentic-consulting/scripts/graph-walk.ts`);
+const HAS_KOREAN_FONT = koreanCaptionFont() !== null;
+const HAS_ASS_FILTER = HAS_FFMPEG && spawnSync('ffmpeg', ['-hide_banner', '-filters'], { encoding: 'utf8' }).stdout?.includes(' ass ') === true;
+const HAS_TEST_WALKER = existsSync(TEST_WALKER);
+const SCENE_READY = HAS_FFMPEG && HAS_FFPROBE && HAS_KOREAN_FONT && HAS_ASS_FILTER && HAS_TEST_WALKER;
+const MISSING_SCENE_TOOLS = [
+  !HAS_FFMPEG && 'ffmpeg', !HAS_FFPROBE && 'ffprobe', !HAS_ASS_FILTER && 'ffmpeg ass 필터',
+  !HAS_KOREAN_FONT && '한글 폰트', !HAS_TEST_WALKER && '시험 graph-walk',
+].filter((tool): tool is string => Boolean(tool)).join('·');
+const MEDIA = HAS_FFMPEG && HAS_FFPROBE;
+const LIVE = MEDIA && HAS_WALKER && HAS_KOREAN_FONT;
+const MISSING_LIVE_TOOLS = [
+  !HAS_FFMPEG && 'ffmpeg', !HAS_FFPROBE && 'ffprobe', !HAS_WALKER && 'graph-walk',
+  !HAS_KOREAN_FONT && '한글 폰트',
+].filter((tool): tool is string => Boolean(tool)).join('·');
 
-describe.if(LIVE)('무료 라인 — 실물 주행', () => {
+it.skipIf(process.platform !== 'linux' || !MEDIA || !HAS_ASS_FILTER || !HAS_KOREAN_FONT)(
+  `Linux scene/SRT/음악 시험은 외부 graph-walk·Apple 폰트에 묶이지 않는다 (결손: ${MISSING_SCENE_TOOLS || '없음'})`, () => {
+    expect(HAS_TEST_WALKER).toBe(true);
+    expect(SCENE_READY).toBe(true);
+  });
+
+it.skipIf(process.platform !== 'linux' || !HAS_KOREAN_FONT)('Linux 한글 폰트는 Apple 경로 없이 자막 레시피에 도달한다', async () => {
+  const font = koreanCaptionFont();
+  expect(font?.path).toBeDefined();
+  expect(font?.family).toBeDefined();
+  const work = mkdtempSync(join(tmpdir(), 'fl-ko-font-'));
+  try {
+    const edl = join(work, 'edl.json');
+    writeFileSync(edl, JSON.stringify({ cuts: [{ asset: '/unused.png', dur: 2, text: '하나' }], w: 480, h: 480 }));
+    const { drawCaptions } = await import('../src/video-pipeline/recipes/free-line.js');
+    const result = await drawCaptions({ workdir: work, state: { edl_json: edl }, log: () => {} });
+    expect(result.outcome).toBe('ok');
+    const ass = readFileSync(join(work, 'overlay.ass'), 'utf8');
+    expect(ass).toContain(`Style: Default,${font!.family},`);
+    expect(ass).toContain('하나');
+  } finally { rmSync(work, { recursive: true, force: true }); }
+});
+
+describe.skipIf(!LIVE)(`무료 라인 — 실물 주행 (결손: ${MISSING_LIVE_TOOLS || '없음'})`, () => {
   const out = mkdtempSync(join(tmpdir(), 'fl-test-'));
   const r = run(['--synth', '3', '--out', out, '--captions', '하나|둘|셋', '--specs', '640x640']);
 
@@ -83,7 +125,9 @@ describe.if(LIVE)('무료 라인 — 실물 주행', () => {
   });
 });
 
-describe.if(LIVE)('⛔ 빨간 길 — 되읽기가 «실제로» 무나', () => {
+describe.skipIf(!MEDIA)(`⛔ 빨간 길 — 되읽기가 «실제로» 무나 (결손: ${[
+  !HAS_FFMPEG && 'ffmpeg', !HAS_FFPROBE && 'ffprobe',
+].filter(Boolean).join('·') || '없음'})`, () => {
   it('zoompan 함정으로 만든 파일을 wrong-length 로 잡는다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fl-trap-'));
     const plate = join(dir, 'p.png'), bad = join(dir, 'trap.mp4');
@@ -100,7 +144,9 @@ describe.if(LIVE)('⛔ 빨간 길 — 되읽기가 «실제로» 무나', () => 
     expect(res.outcome).toBe('wrong-length');          // ⭐ 이것이 초록이면 그 관문은 아무것도 안 잰다
     expect(res.note ?? '').toContain('프레임');
   });
+});
 
+describe('⛔ 빨간 길 — 외부 도구 없이 입력 결손을 진단한다', () => {
   it('없는 파일은 «못 쟀다»다 — 실패가 아니다', async () => {
     const { probeMaster } = await import('../src/video-pipeline/recipes/free-line.js');
     const res = await probeMaster({ workdir: tmpdir(), state: { master: '/nope.mp4', target_dur: 1 }, log: () => {} });
@@ -114,6 +160,17 @@ describe.if(LIVE)('⛔ 빨간 길 — 되읽기가 «실제로» 무나', () => 
 });
 
 describe('인자 계약 — 준비 실패는 exit 3 다', () => {
+  it('워커가 없을 때 준비 실패를 성공이나 원격 실패로 부르지 않는다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fl-no-walker-'));
+    try {
+      const r = spawnSync(process.execPath, [CLI, '--synth', '3'], {
+        cwd: REPO, encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, GRAPH_WALKER: join(dir, 'absent-graph-walk.ts') },
+      });
+      expect(r.status).toBe(3);
+      expect(`${r.stdout}${r.stderr}`).toContain('워커를 못 찾았다');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('소재도 --synth 도 없으면 exit 3', () => {
     expect(run([]).status).toBe(3);
   });
@@ -129,7 +186,7 @@ describe('인자 계약 — 준비 실패는 exit 3 다', () => {
 //   🩸 여기 오기 전까지는 걸음 시나리오(목)에서만 증명돼 있었다 —
 //      실물 주행은 «곧은 길»로만 갔고 방문 #2 가 0건이었다. 그것이 정직한 미결이었다.
 //   🔑 그리고 이것이 이 그래프의 교리다: ***게이트는 «찾기만» 하고 고치는 것은 그 일을 하는 노드다.***
-describe.if(LIVE)('♻️ 자기 수복 — 게이트가 찾고 상류가 고친다', () => {
+describe.skipIf(!LIVE)(`♻️ 자기 수복 — 게이트가 찾고 상류가 고친다 (결손: ${MISSING_LIVE_TOOLS || '없음'})`, () => {
   const src = mkdtempSync(join(tmpdir(), 'heal-src-'));
   const out = mkdtempSync(join(tmpdir(), 'heal-out-'));
   const lavfi = (spec: string, to: string): void => {
@@ -188,7 +245,7 @@ describe.if(LIVE)('♻️ 자기 수복 — 게이트가 찾고 상류가 고친
 // ⛔⭐⭐ qc — ***「가장 조용한 거짓말」을 픽셀로 잡는가.***
 //   🩸 직전까지 qc 는 «파일 크기»만 봤고, 스스로 「검정프레임·자막누락은 안 봤다」고 적고 있었다.
 //   🔑 자막 누락은 ***종료코드로 원리상 못 잡는다*** — 폰트를 못 찾아도 ffmpeg 는 exit 0 이다.
-describe.if(LIVE)('👁️ qc — 픽셀로 본다', () => {
+describe.skipIf(!LIVE)(`👁️ qc — 픽셀로 본다 (결손: ${MISSING_LIVE_TOOLS || '없음'})`, () => {
   const out = mkdtempSync(join(tmpdir(), 'qc-'));
   const r = run(['--synth', '3', '--out', out, '--captions', '하나|둘|셋', '--specs', '480x480']);
 
@@ -254,9 +311,18 @@ describe.if(LIVE)('👁️ qc — 픽셀로 본다', () => {
   });
 });
 
+describe('qc — 입력 결손은 외부 도구 없이 못 쟀다로 끝난다', () => {
+  it('master 가 없으면 «못 쟀다»다 — 통과가 아니다', async () => {
+    const { inspectMaster } = await import('../src/video-pipeline/recipes/qc.js');
+    const res = await inspectMaster({ workdir: tmpdir(), state: { master: '/nope.mp4' }, log: () => {} });
+    expect(res.outcome).toBe('unmeasurable');
+    expect(res.note).toContain('master 가 없다');
+  });
+});
+
 // ⛔⭐ `--scene` — ***종합 러너와 무료 라인 사이의 «손»을 없앤 자리.***
 //   🔑 파이프라인이 「다음에 이걸 치세요」라고 말하면 그 자리는 아직 «안 이어진» 것이다.
-describe.if(HAS_FFMPEG)('--scene — 미리 만든 소재·나레이션을 «그대로» 받는다', () => {
+describe.skipIf(!SCENE_READY)(`--scene — 미리 만든 소재·나레이션을 «그대로» 받는다 (결손: ${MISSING_SCENE_TOOLS || '없음'})`, () => {
   const src = mkdtempSync(join(tmpdir(), 'scene-src-'));
   const work = mkdtempSync(join(tmpdir(), 'scene-work-'));
   const imgs: string[] = [];
@@ -274,7 +340,7 @@ describe.if(HAS_FFMPEG)('--scene — 미리 만든 소재·나레이션을 «그
   writeFileSync(scenePath, JSON.stringify({
     images: imgs, vo, music: null, captions: ['하나', '둘', '셋'], specs: ['480x480'],
   }), 'utf8');
-  const r = run(['--scene', scenePath, '--out', join(work, 'out')]);
+  const r = run(['--scene', scenePath, '--out', join(work, 'out')], TEST_WALKER);
 
   it('scene.json «하나»로 끝까지 간다 — 손이 없다', () => {
     expect(r.out).toContain('delivered');
@@ -302,7 +368,7 @@ describe.if(HAS_FFMPEG)('--scene — 미리 만든 소재·나레이션을 «그
 // ⛔⭐⭐ 받아쓰기 정렬 — ***이 파이프라인의 마지막 「균등분할」을 없앤 자리.***
 //   🩸 그전까지 `align` 은 언제나 계획 길이(또는 총 길이 ÷ 컷 수)를 썼고 note 가 그 한계를 말했다.
 //   🔑 ***그 note 가 「없어지는 것」이 이 축이 닫혔다는 신호다.***
-describe.if(HAS_FFMPEG)('📝 받아쓰기(SRT)로 정렬한다 — 균등분할이 아니다', () => {
+describe.skipIf(!SCENE_READY)(`📝 받아쓰기(SRT)로 정렬한다 — 균등분할이 아니다 (결손: ${MISSING_SCENE_TOOLS || '없음'})`, () => {
   const work = mkdtempSync(join(tmpdir(), 'srt-'));
   const src = mkdtempSync(join(tmpdir(), 'srt-src-'));
   const imgs: string[] = [];
@@ -327,7 +393,7 @@ describe.if(HAS_FFMPEG)('📝 받아쓰기(SRT)로 정렬한다 — 균등분할
     images: imgs, vo, vo_srt: srt, music: null,
     captions: ['첫 줄', '둘째 줄', '셋째 줄'], specs: ['480x480'],
   }), 'utf8');
-  const r = run(['--scene', scene, '--out', join(work, 'out')]);
+  const r = run(['--scene', scene, '--out', join(work, 'out')], TEST_WALKER);
 
   it('끝까지 가고 «받아쓰기로 정렬»했다고 말한다', () => {
     expect(r.status).toBe(0);
@@ -361,7 +427,7 @@ describe.if(HAS_FFMPEG)('📝 받아쓰기(SRT)로 정렬한다 — 균등분할
 //   🩸 2026-09-22: `amix` 의 기본이 «평균»(normalize=1)이라, 로그는 「음악 넣었다」인데
 //      ***음악 있는 판이 더 조용했고 무음 구간 수가 똑같았다***(= 안 들어간 것).
 //   🔑 ***「섞었다」는 스트림이 아니라 «귀에 닿는 값»으로 확인해야 한다.***
-describe.if(HAS_FFMPEG)('🎵 음악 믹스 — 「넣었다」를 음량으로 확인한다', () => {
+describe.skipIf(!SCENE_READY)(`🎵 음악 믹스 — 「넣었다」를 음량으로 확인한다 (결손: ${MISSING_SCENE_TOOLS || '없음'})`, () => {
   const work = mkdtempSync(join(tmpdir(), 'mix-'));
   const src = mkdtempSync(join(tmpdir(), 'mix-src-'));
   const imgs: string[] = [];
@@ -382,7 +448,9 @@ describe.if(HAS_FFMPEG)('🎵 음악 믹스 — 「넣었다」를 음량으로 
   function build(music: string | null, out: string): void {
     const sc = join(work, `scene-${music ? 'm' : 'n'}.json`);
     writeFileSync(sc, JSON.stringify({ images: imgs, vo, music, captions: ['하나', '둘'], specs: ['480x480'] }), 'utf8');
-    run(['--scene', sc, '--out', out]);
+    const result = run(['--scene', sc, '--out', out], TEST_WALKER);
+    expect(result.status, result.out).toBe(0);
+    expect(existsSync(join(out, 'master.mp4'))).toBe(true);
   }
   function silences(f: string): number {
     const r = spawnSync('ffmpeg', ['-hide_banner', '-i', f, '-af', 'silencedetect=n=-40dB:d=0.4', '-f', 'null', '-'],

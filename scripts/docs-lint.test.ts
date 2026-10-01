@@ -17,4 +17,4 @@ test('docs lint의 코드 식별자 대조는 opt-in이며 기본 출력 계약�
   expect(baseline.stdout).toContain('docs lint — 1개 검사');
   expect(baseline.stdout).not.toContain('코드 식별자 기준:');
   expect(checked.stdout).toContain('코드 식별자 기준: 문서의 단일 inline code(`name`)만 TypeScript AST Identifier 인벤토리와 대조한다');
-});
+}, 30_000);

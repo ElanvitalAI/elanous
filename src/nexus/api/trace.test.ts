@@ -310,7 +310,7 @@ describe('authenticated trace and evidence', () => {
       expect(opened).toEqual(['test:recent']);
     } finally { self.close(); recent.close(); }
   });
-  it('resolves an L3 run outside @active by its ledger and reports a missing ledger distinctly', async () => {
+  it('resolves an L3 run outside @active by its ledger, then scans its logs when the ledger is absent', async () => {
     const runId = 'run-318ea5d4-a21b-4fc2-ae24-3177278b2036';
     const root = mkdtempSync(join(tmpdir(), 'elanous-trace-ledger-'));
     const bDir = join(root, 'b');
@@ -348,17 +348,85 @@ describe('authenticated trace and evidence', () => {
       expect(l2Found).toMatchObject({ resolvedFrom: 'ledger', runUniverse: 'test:b' });
       expect(l2Found.events).toHaveLength(3);
       unlinkSync(ledger);
-      const missing = await handleTrace(req(path), open, deps).json() as { events: unknown[]; stores: string[]; runUniverse?: string; checked?: number; resolvedFrom?: string };
-      expect(missing.events).toHaveLength(0);
-      expect(missing.runUniverse).toBe('not-found');
-      expect(missing.checked).toBe(2);
-      expect(missing.resolvedFrom).toBeUndefined();
-      expect(missing.stores).toEqual([self.instance, 'test:a']);
-      expect(opened).toEqual(['test:a', 'test:b', 'test:a', 'test:b', 'test:a']);
-      const l2 = await handleTrace(req(path.replace('level=L3', 'level=L2')), open, deps).json() as { runUniverse: string; checked: number; events: unknown[] };
-      expect(l2).toMatchObject({ runUniverse: 'not-found', checked: 2, events: [] });
+      const scanned = await handleTrace(req(path), open, deps).json() as { events: Array<{ kind: string }>; stores: string[]; runUniverse?: string; checked?: number; resolvedFrom?: string; truncated: boolean };
+      expect(scanned.events.map((event) => event.kind)).toEqual(['SHIP', 'HEAL', 'VERIFY']);
+      expect(scanned).toMatchObject({ runUniverse: 'test:b', checked: 2, resolvedFrom: 'log-scan', truncated: false });
+      expect(scanned.stores).toEqual([self.instance, 'test:a', 'test:b']);
+      expect(opened).toEqual(['test:a', 'test:b', 'test:a', 'test:b', 'test:a', 'test:a', 'test:b', 'test:b']);
+      const l2 = await handleTrace(req(path.replace('level=L3', 'level=L2')), open, deps).json() as { runUniverse: string; checked: number; events: unknown[]; resolvedFrom: string };
+      expect(l2).toMatchObject({ runUniverse: 'test:b', checked: 2, resolvedFrom: 'log-scan' });
+      expect(l2.events).toHaveLength(3);
     } finally { self.close(); a.close(); b.close(); rmSync(root, { recursive: true, force: true }); }
   });
+  it('reports a complete log-scan miss without claiming an absent ledger is a found universe', async () => {
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    const other = new LogStore(':memory:', { instance: 'test:other' });
+    const root = mkdtempSync(join(tmpdir(), 'elanous-trace-absent-'));
+    try {
+      const result = await handleTrace(req('/v1/trace?level=L2&runId=run-no-ledger-or-logs'), open, {
+        store: () => self, instances: () => [{ ...view('test:other'), stateDir: root }],
+        openRemoteStore: () => other, closeRemoteStore: () => {}, queryLog: () => {},
+      }).json() as { runUniverse: string; checked: number; truncated: boolean; resolvedFrom?: string; events: unknown[] };
+      expect(result).toMatchObject({ runUniverse: 'not-found', checked: 1, truncated: false, events: [] });
+      expect(result.resolvedFrom).toBeUndefined();
+    } finally { self.close(); other.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('does not report not-found when the only registered database could not be scanned', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-trace-unreadable-'));
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    try {
+      for (const failure of ['open', 'query'] as const) {
+        const response = handleTrace(req('/v1/trace?level=L2&runId=run-unreadable'), open, {
+          store: () => self, instances: () => [{ ...view('test:unreadable'), stateDir: root }],
+          openRemoteStore: () => failure === 'open' ? null : ({
+            queryTraceRun: () => { throw new Error('read failed'); }, close: () => {},
+          }) as unknown as LogStore,
+          queryLog: () => {},
+        });
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({
+          runUniverse: 'unresolved', checked: 1, truncated: false, events: [],
+        });
+      }
+    } finally { self.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('reports a bounded scan as unresolved rather than not-found', async () => {
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    const views = Array.from({ length: 201 }, (_, i) => view(`test:scan-${i}`));
+    let opens = 0;
+    try {
+      const result = await handleTrace(req('/v1/trace?level=L3&runId=run-outside-scan-cap'), open, {
+        store: () => self, instances: () => views,
+        ledgerStat: () => { throw Object.assign(new Error('not found'), { code: 'ENOENT' }); },
+        openRemoteStore: () => { opens++; return { queryTraceRun: () => [], close: () => {} } as unknown as LogStore; },
+        queryLog: () => {},
+      }).json() as { runUniverse: string; checked: number; truncated: boolean; events: unknown[] };
+      expect(result).toMatchObject({ runUniverse: 'unresolved', checked: 200, truncated: true, events: [] });
+      expect(opens).toBe(200);
+    } finally { self.close(); }
+  });
+
+  it('skips unreadable unselected databases while scanning for a ledgerless run', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-trace-scan-failure-'));
+    const self = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    const found = new LogStore(':memory:', { instance: 'test:found' });
+    found.insertBatch([{ rec: { ts, category: 'harness.review', event: 'passed', data: { run_id: 'run-ledgerless', phase: 'review' } }, surface: 'nexus' }]);
+    const views = ['test:failed', 'test:found'].map((name) => ({ ...view(name), stateDir: root }));
+    const opened: string[] = [];
+    try {
+      const body = await handleTrace(req('/v1/trace?level=L2&runId=run-ledgerless'), open, {
+        store: () => self, instances: () => views,
+        openRemoteStore: (v) => { opened.push(v.name); if (v.name === 'test:failed') throw new Error('unreadable'); return found; },
+        closeRemoteStore: () => {}, queryLog: () => {},
+      }).json() as { runUniverse: string; checked: number; resolvedFrom: string; events: Array<{ universe: string }> };
+      expect(body).toMatchObject({ runUniverse: 'test:found', checked: 2, resolvedFrom: 'log-scan' });
+      expect(body.events.map((event) => event.universe)).toEqual(['test:found']);
+      expect(opened).toEqual(['test:failed', 'test:found', 'test:found']);
+    } finally { self.close(); found.close(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('still resolves the run by its ledger when one selected store fails to open, and keeps reporting that failure', async () => {
     const runId = 'run-318ea5d4-a21b-4fc2-ae24-3177278b2036';
     const root = mkdtempSync(join(tmpdir(), 'elanous-trace-failed-store-'));

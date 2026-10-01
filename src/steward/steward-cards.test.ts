@@ -1,7 +1,10 @@
 import { expect, test } from 'bun:test';
-import { recordTriageOnCards, type StewardCardStore } from './steward-cards.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { recordLaunchOnCard, recordOutcomeOnCard, recordTriageOnCards, type StewardCardStore } from './steward-cards.js';
 import { scheduleTriage, triageIssues, type ScheduledDecision, type TriageIssue } from './triage.js';
-import type { TaskCard } from '../task-cards/card-store.js';
+import { CardStore, foldSections, type TaskCard } from '../task-cards/card-store.js';
 
 const issues: TriageIssue[] = [
   { identifier: 'ELA-1', ref: 'one', title: 'Build', body: 'source detail' },
@@ -95,4 +98,56 @@ test('a forced HITL rung cannot be written as now even from an inconsistent sche
   const store = fakeStore();
   recordTriageOnCards([{ ...decisions[2]!, disposition: 'now' }], issues, { store });
   expect(JSON.parse(store.cards[0]!.sections[1]!.content).disposition).toBe('hitl');
+});
+
+test('launch and outcome updates preserve intake, triage and other content without duplicate keys', () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-card-recorders-'));
+  try {
+    recordTriageOnCards(decisions.slice(0, 1), issues, { root });
+    const store = new CardStore(root);
+    try {
+      const original = store.createCard({ goalId: 'linear:ELA-1', title: 'ignored on retry' });
+      store.appendSection(original.id, { key: 'incidents:existing', owner: 'reviewer', content: 'keep this verbatim' });
+      const before = store.getCard(original.id)!;
+      const launch = { status: 'shadow', command: 'bun run something' };
+      const outcome = { status: 'completed', runId: 'run-1' };
+      recordLaunchOnCard(issues[0]!, launch, { root });
+      recordLaunchOnCard(issues[0]!, launch, { store });
+      recordOutcomeOnCard(issues[0]!, outcome, { root });
+      recordOutcomeOnCard(issues[0]!, outcome, { store });
+      const card = store.getCard(original.id)!;
+      expect(card.title).toBe(before.title);
+      expect(card.sections.slice(0, before.sections.length)).toEqual(before.sections);
+      expect(card.sections.map(section => section.key.split(':')[0])).toEqual(['intake', 'triage', 'incidents', 'launch', 'outcome']);
+      expect(new Set(card.sections.map(section => section.key)).size).toBe(card.sections.length);
+      expect(JSON.parse(foldSections(card).launch!.content)).toEqual(launch);
+      expect(JSON.parse(foldSections(card).outcome!.content)).toEqual(outcome);
+
+      recordLaunchOnCard(issues[0]!, { status: 'live', runId: 'run-1' }, { store });
+      recordOutcomeOnCard(issues[0]!, { status: 'failed', runId: 'run-1' }, { store });
+      const revised = store.getCard(original.id)!;
+      expect(revised.sections.slice(0, card.sections.length)).toEqual(card.sections);
+      expect(new Set(revised.sections.map(section => section.key)).size).toBe(revised.sections.length);
+      expect(JSON.parse(foldSections(revised).launch!.content)).toEqual({ status: 'live', runId: 'run-1' });
+      expect(JSON.parse(foldSections(revised).outcome!.content)).toEqual({ status: 'failed', runId: 'run-1' });
+    } finally {
+      store.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('launch and outcome recorders redact secrets before storing and deduplicating sections', () => {
+  const store = fakeStore();
+  const token = `sk-${'x'.repeat(20)}`;
+  const issue = { identifier: 'ELA-4', title: `Secret ${token}` };
+  recordLaunchOnCard(issue, { command: `launch ${token}` }, { store });
+  recordLaunchOnCard(issue, { command: `launch ${token}` }, { store });
+  recordOutcomeOnCard(issue, { reason: `failed ${token}` }, { store });
+  recordOutcomeOnCard(issue, { reason: `failed ${token}` }, { store });
+  expect(store.cards).toHaveLength(1);
+  expect(store.cards[0]!.sections.map(section => section.key.split(':')[0])).toEqual(['launch', 'outcome']);
+  expect(JSON.stringify(store.cards)).not.toContain(token);
+  expect(store.cards[0]!.title).toContain('<redacted>');
 });

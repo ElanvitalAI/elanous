@@ -1,13 +1,10 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { autoApproveConfirmChannel, assertThrowawayTarget, formatHarnessDogfoodReport, HARNESS_DOGFOOD_DEPRECATION_NOTICE, HARNESS_DOGFOOD_REPLACEMENT_FROM_GOAL_FILE, HARNESS_DOGFOOD_REPLACEMENT_FROM_SENTENCE, HARNESS_DOGFOOD_REPLACEMENT, refuseHarnessDogfoodCli, runHarnessDogfood } from './dogfood.js';
 
 const THROWAWAY = join(tmpdir(), 'dogfood-target');   // 시스템 temp 하위 = 허용
-
-afterEach(() => {
-  process.exitCode = 0;
-});
 
 describe('harness dogfood adapter', () => {
   test('uses an explicit always-yes confirmation channel', async () => {
@@ -105,31 +102,13 @@ describe('harness dogfood CLI entrance — refuse, do not dispatch', () => {
     expect(HARNESS_DOGFOOD_DEPRECATION_NOTICE).toContain(HARNESS_DOGFOOD_REPLACEMENT_FROM_GOAL_FILE);
   });
 
-  test('retired harness dogfood command emits the new destination and exits non-zero', async () => {
-    const { program } = await import('../index.js');
-    const originalExitCode = process.exitCode;
-    const originalStderrWrite = process.stderr.write;
-    const originalLog = console.log;
-    const output: string[] = [];
-    process.stderr.write = ((chunk: string | Uint8Array) => {
-      output.push(String(chunk));
-      return true;
-    }) as typeof process.stderr.write;
-    console.log = (...args: unknown[]) => {
-      output.push(args.map(String).join(' '));
-    };
-    try {
-      process.exitCode = 0;
-      await program.parseAsync(['node', 'elanous', 'harness', 'dogfood', '/tmp/throwaway', 'objective']);
-      const emitted = output.join('');
-      const observedExitCode: string | number | null | undefined = process.exitCode;
-      expect(emitted).toContain('elanous harness ask <골문서>');
-      expect(observedExitCode).toBe(1);
-      expect(observedExitCode).not.toBe(0);
-    } finally {
-      process.stderr.write = originalStderrWrite;
-      console.log = originalLog;
-      process.exitCode = originalExitCode;
-    }
-  });
+  test('retired harness dogfood command emits the new destination and exits non-zero', () => {
+    const cli = join(import.meta.dir, '../../bin/elanous.mjs');
+    const result = spawnSync('bun', [cli, '--test', 'harness', 'dogfood', join(tmpdir(), 'throwaway'), 'objective'], {
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', timeout: 30_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stderr + result.stdout).toContain('elanous harness ask <골문서>');
+  }, 35_000);
 });

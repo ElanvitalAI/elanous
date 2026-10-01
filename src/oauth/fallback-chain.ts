@@ -69,8 +69,8 @@ export function normalizeFallbackChain(
 /** 회전 판정이 낸 이유 — `codex-account-rotation.ts` 의 `RotationReason` 과 같은 어휘.
  *  ⛔ 그쪽 타입이 비공개라 구조적으로 받는다(그 파일의 리뷰 규율: dead export 금지). */
 export type RotationOutcome =
-  | { readonly reason: 'rotated' | 'reset-credit-unknown'; readonly to: RotationCandidate }
-  | { readonly reason: 'explicit' | 'disabled' | 'not-reached' | 'reset-credit-available' | 'no-candidate' };
+  | { readonly reason: 'rotated' | 'reset-credit-unknown' | 'credit-pace'; readonly to: RotationCandidate }
+  | { readonly reason: 'explicit' | 'disabled' | 'not-reached' | 'credit-pace' | 'reset-credit-available' | 'no-candidate' };
 
 export type FallbackDecision =
   /** codex 계정을 갈아탄다(종전 동작). */
@@ -156,14 +156,14 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
     return stepAfter(chain, currentStep, grokAvailable, grokQuota, 'chain-exhausted');
   }
   if (rotation.reason === 'explicit') return { action: 'stay', why: 'explicit' };
-  if (rotation.reason === 'not-reached') {
+  if (rotation.reason === 'not-reached' || (rotation.reason === 'credit-pace' && !('to' in rotation))) {
     return { action: 'stay', why: 'not-reached' };
   }
   if (rotation.reason === 'reset-credit-available' && stayOnResetCreditAvailable) {
     return { action: 'stay', why: 'reset-credit-available' };
   }
 
-  if (rotation.reason === 'rotated' || rotation.reason === 'reset-credit-unknown') {
+  if (rotation.reason === 'rotated' || rotation.reason === 'reset-credit-unknown' || (rotation.reason === 'credit-pace' && 'to' in rotation)) {
     // 회전이 답을 냈는데 체인이 codex-rotate 를 «빼» 놨다면 그 뜻을 존중하고
     // 다음 칸으로 간다(회전을 원치 않는 구성).
     if (chain.includes('codex-rotate')) return { action: 'codex-rotate', to: rotation.to };
@@ -172,7 +172,7 @@ export function decideFallback(input: FallbackInput): FallbackDecision {
 
   // no-candidate | disabled | reset-credit-available(기본) — codex 축이 끝났다. 다음 칸을 본다.
   // ⛔ 다음 칸이 «없을 때»의 이름만 고른다. 진행(stepAfterCodex)은 그대로다.
-  const fallbackWhy = stayReasonWhenCodexAxisEnds(rotation.reason);
+  const fallbackWhy = stayReasonWhenCodexAxisEnds(rotation.reason === 'credit-pace' ? 'no-candidate' : rotation.reason);
   return stepAfterCodex(chain, grokAvailable, grokQuota, fallbackWhy);
 }
 

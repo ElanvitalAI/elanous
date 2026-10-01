@@ -5,12 +5,14 @@ terminal_nodes: [done, failed]
 nodes:
   - { node_id: read-card, kind: agent, recipe: 'cmd:read-card', max_visits: 1 }
   - { node_id: research, kind: agent, recipe: 'cmd:research', max_visits: 1 }
+  - { node_id: strategy, kind: agent, recipe: 'cmd:strategy', max_visits: 1 }
   - { node_id: draft, kind: agent, recipe: 'cmd:draft', max_visits: 1 }
   - { node_id: report, kind: agent, recipe: 'cmd:report', max_visits: 1 }
   - { node_id: done, kind: gate, max_visits: 1 }
   - { node_id: failed, kind: gate, max_visits: 1 }
 edges:
   - { from: read-card, on: outcome, map: { ok: research, fail: failed } }
-  - { from: research, on: outcome, map: { ok: draft, fail: failed } }
+  - { from: research, on: outcome, map: { ok: strategy, fail: failed } }
+  - { from: strategy, on: outcome, map: { ok: draft, fail: failed } }
   - { from: draft, on: outcome, map: { ok: report, fail: failed } }
   - { from: report, on: outcome, map: { ok: done, fail: failed } }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import type { LogRow } from '@/nexus/client';
-import { buildLiveSnapshot, cardText, classifySignal, logLine, redactLogText } from './live-signals';
+import { buildLiveSnapshot, cardText, classifySignal, foldForRole, isRawErrorText, logLine, redactLogText } from './live-signals';
 
 const now = Date.parse('2026-09-28T01:00:00.000Z');
 const at = (min: number) => new Date(now - min * 60_000).toISOString();
@@ -56,6 +56,31 @@ describe('buildLiveSnapshot', () => {
 
   test('judgment cards read like decisions, newest first', () => {
     expect(snap.cards.map((c) => c.text)).toEqual(['게이트 실패 → 수리 라운드', '자동 병합 #101', '리뷰 판정: rework · #101 · 요구 2']);
+  });
+});
+
+describe('foldForRole (LIVE1)', () => {
+  test('isRawErrorText catches ENOENT, Error:, and path shapes, not plain reasons', () => {
+    expect(isRawErrorText('Error: ENOENT: no such file or directory')).toBe(true);
+    expect(isRawErrorText('EACCES')).toBe(true);
+    expect(isRawErrorText('EPERM')).toBe(true);
+    expect(isRawErrorText('ECONNRESET')).toBe(true);
+    expect(isRawErrorText('TypeError: x')).toBe(true);
+    expect(isRawErrorText('stack overflow in parser')).toBe(true);
+    expect(isRawErrorText('at buildLive (live-signals.ts:10:1)')).toBe(true);
+    expect(isRawErrorText('/Users/me/repo/file.ts')).toBe(true);
+    expect(isRawErrorText('/home/ubuntu/repo')).toBe(true);
+    expect(isRawErrorText('C:\\Users\\me\\file.ts')).toBe(true);
+    expect(isRawErrorText('default 95%')).toBe(false);
+    expect(isRawErrorText('로컬 부하 9.1')).toBe(false);
+  });
+  test('non-owner folds raw errors and leaves plain reasons; owner keeps the original', () => {
+    const raw = 'Error: ENOENT: no such file or directory, open /home/ubuntu/x';
+    expect(foldForRole(raw, 'general')).toBe('실패 — 자세한 사유는 오너 화면에서');
+    expect(foldForRole(raw, 'contributor')).toBe('실패 — 자세한 사유는 오너 화면에서');
+    expect(foldForRole(raw, 'owner')).toBe(raw);
+    expect(foldForRole('default 95%', 'general')).toBe('default 95%');
+    expect(foldForRole(null, 'general')).toBeNull();
   });
 });
 
@@ -136,5 +161,22 @@ describe('09-28 S decisions', () => {
       row(1, 'review-loop', 'judge-verdict', { runId: 'r', pr: '1', verdict: 'pass', round: 1 }),
     ], [], { now, windowMinutes: 60 });
     expect(board.stream.map((s) => s.what)).toEqual(['리뷰 판정: pass · #1', 'codex team']);
+  });
+});
+
+describe('파드 런 단계(S4a) — self-implement.pod.ledger 의 data.stage 가 단계 줄을 켠다', () => {
+  const pod = (stage: string, status = 'delivered') => classifySignal({ category: 'self-implement.pod.ledger', event: 'progress-delivery-outcome', level: 'debug', data: { runId: 'run-x', stage, status } });
+  test('구현·게이트·리뷰·착지', () => {
+    expect(pod('implementing').stage).toBe('build');
+    expect(pod('gating').stage).toBe('gate');
+    expect(pod('reviewing').stage).toBe('review');
+    expect(pod('pr-opened').stage).toBe('land');
+    expect(pod('merged').tone).toBe('ok');
+  });
+  test('막힘·실패는 빨강 · 모르는 단계는 단계 밖', () => {
+    expect(pod('review-blocked')).toEqual({ stage: 'review', tone: 'bad' });
+    expect(pod('gating', 'failed').tone).toBe('bad');
+    expect(pod('queued').stage).toBeNull();
+    expect(classifySignal({ category: 'self-implement.pod.ledger', event: 'pipeline-node-entry', level: 'debug', data: null }).stage).toBeNull();
   });
 });

@@ -84,6 +84,8 @@ export const NON_MENU_SIDEBAR_ROUTE_CATEGORIES = [
   'error-page',
   'unwired-screen',
   'diagnostic-readonly',
+  'contact-form',
+  'beta-direct-link',
 ];
 
 export type NonMenuSidebarRouteCategory = typeof NON_MENU_SIDEBAR_ROUTE_CATEGORIES[number];
@@ -105,6 +107,9 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/workflows/chat-ui', category: 'workflow-subflow', reason: 'Workflows에서 여는 hosted chat 하위 흐름.' },
   { href: '/', category: 'root-welcome', reason: '첫 방문자를 위한 루트 welcome 화면.' },
   { href: '/404', category: 'error-page', reason: '오류 페이지.' },
+  { href: '/consult', category: 'contact-form', reason: 'AX 도입 상담·과정 문의를 접수하는 입력 화면(CS1 · #22436).' },
+  { href: '/exec', category: 'beta-direct-link', reason: 'COO 에게 맡기기·맡긴 일(PAR-A5 · #22524) — beta 라 메뉴 대신 링크로 연다.' },
+  { href: '/field', category: 'beta-direct-link', reason: '현장 올리기(PAR-EV10 · #22527) — beta 라 메뉴 대신 링크로 연다.' },
   { href: '/morning', category: 'unwired-screen', reason: '부르는 백엔드가 아직 없는 미배선 화면.' },
   // 481c22af2 로 diagnostic-readonly 분류가 생겼다. `/design-check` 는 2026-09-28 탭 다이어트에서
   // 메뉴 «Design» 으로 올라갔다(카드·시안·내 시스템 — 디자인 시스템 공개 결정).

@@ -1600,7 +1600,7 @@ describe('harness CLI command', () => {
     const excludedLines = await runProcesses(excludedOnly);
     const excludedText = excludedLines.join('\n');
     expect(excludedText).toContain('모집단 제외 2행');
-    expect(excludedText).toContain('제외 기준: command에 elanous.mjs를 포함하지 않은 행');
+    expect(excludedText).toContain('제외 기준: command에 elanous.mjs가 없고 시험 데몬·러너 대상도 아닌 행');
     expect(excludedText).toContain('분류 제외 0행');
     expect(excludedText).toContain('부모 생존 제외 0행');
     expect(excludedText).toContain('자원소비 0 · 장기실행만 0');
@@ -1626,6 +1626,53 @@ describe('harness CLI command', () => {
     expect(mixedText).toContain('모집단 제외 1행');
     expect(mixedText).toContain('자원소비 1 · 장기실행만 0');
     expect(mixedText).not.toContain('pid=12862');
+  });
+
+  test('fake ps keeps legacy groups unchanged while reporting orphan test daemons and gate runners as read-only garbage', async () => {
+    const daemonCommand = 'bun /tmp/elanous-nexus-cli-X/daemon.ts /private/tmp/elanous-nexus-cli-X/.elanous-test';
+    const longCommand = 'bun bin/elanous.mjs --test harness processes';
+    const ps = [
+      `101 1 80.0 03:00:00 ${daemonCommand}`,
+      '102 1 70.0 04:00:00 bun test /tmp/elanous/repo.worktrees/self-impl/gate.test.ts',
+      `103 1 60.0 04:00:00 ${longCommand}`,
+      '104 1 0.1 04:00:00 bun /opt/current/node_modules/elanous/bin/elanous.mjs nexus run',
+      `105 1 0.1 00:30:00 ${daemonCommand}`,
+      `106 1 0.1 04:00:00 ${daemonCommand} extra`,
+    ].join('\n');
+    const listed = parseHarnessProcessPsOutput(ps);
+    expect(listed.status).toBe('ok');
+    if (listed.status !== 'ok') throw new Error('expected ps observation');
+    expect(listed.records.map(({ pid }) => pid)).toEqual([101, 102, 103, 104, 105, 106]);
+    const report = buildHarnessProcessReport(listed, [], DEFAULT_HARNESS_PROCESS_THRESHOLDS, 'subset',
+      { status: 'ok', pids: [106] }, () => null);
+    expect(report.resourceConsuming.map(({ pid }) => pid)).toEqual([103]);
+    expect(report.longRunningOnly.map(({ pid }) => pid)).toEqual([104]);
+    expect(report.garbage.map(({ pid, reason }) => ({ pid, reason }))).toEqual([
+      { pid: 101, reason: 'orphan-test-daemon' },
+      { pid: 102, reason: 'orphan-test-runner' },
+      { pid: 103, reason: 'orphan-elanous' },
+    ]);
+    const lines = await runProcesses(listed, [], { status: 'ok', pids: [106] });
+    expect(lines).toContain('자원소비 1 · 장기실행만 1');
+    expect(lines).toContain('가비지 3:');
+    expect(lines).not.toContain('관찰 대상 없음');
+    expect(lines.at(-3)).toContain(`pid=101 ppid=1 elapsed=3h 00m reason=orphan-test-daemon command=${daemonCommand}`);
+    expect(lines.at(-2)).toContain('pid=102 ppid=1 elapsed=4h 00m reason=orphan-test-runner command=bun test');
+    expect(lines.at(-1)).toContain(`pid=103 ppid=1 elapsed=4h 00m reason=orphan-elanous command=${longCommand}`);
+    const listedBaseline = parseHarnessProcessPsOutput([ps.split('\n')[2], ps.split('\n')[3]].join('\n'));
+    const baseline = buildHarnessProcessReport(listedBaseline, [], DEFAULT_HARNESS_PROCESS_THRESHOLDS,
+      'subset', { status: 'ok', pids: [106] }, () => null);
+    expect(report.resourceConsuming.map(({ pid }) => pid)).toEqual(baseline.resourceConsuming.map(({ pid }) => pid));
+    expect(report.longRunningOnly.map(({ pid }) => pid)).toEqual(baseline.longRunningOnly.map(({ pid }) => pid));
+  });
+
+  test('garbage command display stops at 120 characters', () => {
+    const command = `bun /tmp/elanous-nexus-X/daemon.ts /tmp/.elanous-test ${'x'.repeat(150)}`;
+    const report = buildHarnessProcessReport([processFixture({ pid: 89, elapsedSeconds: 11_000, command })]);
+    const rendered = renderHarnessProcessReport(report);
+    expect(rendered.at(-1)).toEndWith(`command=${command.slice(0, 120)}`);
+    expect(rendered.at(-1)).not.toContain(command);
+    expect(rendered).toContain('가비지 1:');
   });
 
   test('process reports classify only parent-absent processes and retain worktree, launchd, and ownership distinctions', async () => {

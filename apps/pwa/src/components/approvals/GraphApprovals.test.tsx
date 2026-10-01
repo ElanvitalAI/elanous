@@ -3,6 +3,7 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import type { GraphApproval } from '@/lib/graph-approvals-api';
 import { GraphApprovals } from './GraphApprovals';
+import { feedItem } from './feed-fixtures';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -77,4 +78,34 @@ test('reject asks again, cancellation does not write, confirmation decides and r
   expect(prompts).toHaveLength(2);
   expect(decisions).toEqual(['rejected']);
   expect(tree!.toJSON()).toBeNull();
+});
+
+test('EV10d — a feed approval sits under «게시 대기»; nothing but GETs to /v1/graph-approvals happens before the final-post confirm', async () => {
+  const requests: Array<{ path: string; method: string }> = [];
+  let answer = false;
+  let items: GraphApproval[] = [feedItem];
+  globalThis.window = {
+    setInterval: () => 1, clearInterval: () => {}, confirm: () => answer,
+  } as unknown as Window & typeof globalThis;
+  const client = {
+    fetchResponse: async (path: string, init?: RequestInit) => {
+      requests.push({ path, method: init?.method ?? 'GET' });
+      if (init?.method === 'POST') { items = []; return Response.json({ graphId: 'field-feed', runId: 'run-1', decision: 'approved' }); }
+      if (path.includes('/media?')) return new Response('img');
+      return Response.json({ items });
+    },
+  };
+  await act(async () => {
+    tree = create(<DaemonContext.Provider value={{ client } as never}><GraphApprovals /></DaemonContext.Provider>);
+  });
+  expect(tree!.root.findByProps({ 'aria-label': '게시 대기' })).toBeDefined();
+  expect(tree!.root.findAllByProps({ 'aria-label': '실행 승인' })).toHaveLength(0);
+  const publish = () => tree!.root.findAllByType('button').find((b) => b.props.children === '최종 게시')!;
+  await act(async () => { publish().props.onClick(); });
+  expect(requests.every((r) => r.path.startsWith('/v1/graph-approvals') && r.method === 'GET')).toBe(true);
+  answer = true;
+  await act(async () => { publish().props.onClick(); });
+  const writes = requests.filter((r) => r.method !== 'GET');
+  expect(writes).toEqual([{ path: '/v1/graph-approvals/field-feed/run-1', method: 'POST' }]);
+  expect(requests.every((r) => r.path.startsWith('/v1/graph-approvals'))).toBe(true);
 });

@@ -192,3 +192,34 @@ describe('buildDiscordTriggerTap · closure semantics', () => {
     expect(logged[0]).toContain('sync throw');
   });
 });
+
+describe('createNexusDiscordTriggerBot · EV12c chat channels', () => {
+  class IdleWs {
+    readyState = 0;
+    onopen: unknown = null; onmessage: unknown = null; onclose: unknown = null; onerror: unknown = null;
+    addEventListener(): void {}
+    removeEventListener(): void {}
+    send(): void {}
+    close(): void {}
+  }
+  const build = (guildTextChannels?: string[]) => createNexusDiscordTriggerBot({
+    token: 'tok-test',
+    allowedUsers: ['u1'],
+    dispatch: async () => undefined,
+    ...(guildTextChannels ? { guildTextChannels } : {}),
+    fetchImpl: (async () => new Response('{}')) as unknown as typeof fetch,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    wsImpl: IdleWs as any,
+    log: () => {},
+  })!;
+
+  it('forwards discord.chatChannels into the bot as guild text channels; absent stays DM-only', async () => {
+    const scoped = build(['1500000000000000001']);
+    const empty = build();
+    const channels = (h: typeof scoped) => [...(h.bot as unknown as { guildTextChannels: Set<string> }).guildTextChannels];
+    expect(channels(scoped)).toEqual(['1500000000000000001']);
+    expect(channels(empty)).toEqual([]);
+    await scoped.stop();
+    await empty.stop();
+  });
+});

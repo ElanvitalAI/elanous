@@ -8,6 +8,8 @@ import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot, releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
 import { diffFailures, junitFailures, parseFailures } from './gate-diff';
+import { loadEnvKnownFailures, splitKnownEnv } from './env-known-failures';
+import { baselineFromCutLogs } from './baseline-from-logs';
 import { planShards, readFileDurations } from './shard-plan';
 import { deriveCdpTestPatterns } from '../test-deterministic';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
@@ -16,7 +18,7 @@ import { POD_BUN_CACHE_HOST_PATH, parseInstallSeconds, podBunCacheVolume } from 
 import { PodPoolScheduler, parsePodPool, checkPodPool } from '../../src/task-orchestrator/surfaces/pod-pool.js';
 import { defaultKubectl } from '../../src/task-orchestrator/surfaces/self-implement-pod.js';
 
-interface CommandResult { rc: number; output: string }
+interface CommandResult { rc: number; output: string; passedIds?: string[] }
 export interface GateRunner {
   command(cmd: string, args: string[], cwd: string): Promise<CommandResult>;
   localCommand(cmd: string, args: string[], cwd: string): Promise<CommandResult>;
@@ -38,7 +40,7 @@ export interface GateOptions {
   instanceRoot?: string;
   ledgerRoot?: string;
   repo?: string;
-  pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string };
+  pod?: { pool: string; shards?: number; shardTimeoutSeconds?: number; durationSource?: string; bunCache?: string };
 }
 export interface GateResult {
   outcome: 'ok' | 'regression' | 'error';
@@ -46,7 +48,9 @@ export interface GateResult {
   introduced: string[];
   preexisting: number;
   fixed: number;
-  baselineSource?: 'ledger' | 'instance' | 'swept';
+  knownEnv: number;
+  knownEnvCleared: string[];
+  baselineSource?: 'ledger' | 'instance' | 'cut-logs' | 'swept';
   durationMs: number;
   error?: string;
   stalledShards?: Array<{ shard: number; files: string[]; reason: 'incomplete' | 'no-output' | 'job-failed' | 'unattributed'; lastFile?: string; summaryFailures?: number; namedFailures?: number; detail?: string }>;
@@ -64,6 +68,38 @@ function check(result: CommandResult, label: string): void {
 }
 
 type SweepFailures = { failures: string[]; errors: string[] };
+
+/** Only named, completed JUnit cases can prove a listed failure passed in this cut. */
+function junitPassedIds(xml: string): string[] {
+  const passed = new Set<string>();
+  const suites: string[] = [];
+  let file: string | undefined;
+  let open: { id: string; passed: boolean } | undefined;
+  const decode = (value: string) => value.replace(/&(?:quot|apos|lt|gt|amp|#\d+|#x[\da-fA-F]+);/g, (entity) => {
+    const named: Record<string, string> = { '&quot;': '"', '&apos;': "'", '&lt;': '<', '&gt;': '>', '&amp;': '&' };
+    if (entity in named) return named[entity]!;
+    const code = entity.startsWith('&#x') ? Number.parseInt(entity.slice(3, -1), 16) : Number(entity.slice(2, -1));
+    return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : entity;
+  });
+  for (const match of xml.matchAll(/<(\/?)\s*(testsuite|testcase|failure|error|skipped)\b([^>]*?)(\/?)>/g)) {
+    const [, closing, tag, attrs, selfClosing] = match;
+    const attr = (name: string) => { const found = new RegExp(`\\b${name}="([^"]*)"`).exec(attrs!); return found ? decode(found[1]!) : undefined; };
+    if (tag === 'testsuite') {
+      if (closing) { suites.pop(); if (!suites.length) file = undefined; }
+      else if (!selfClosing) { suites.push(attr('name') ?? ''); if (suites.length === 1) file = attr('file') ?? attr('name'); }
+    } else if (tag === 'testcase') {
+      if (closing) { if (open?.passed) passed.add(open.id); open = undefined; }
+      else {
+        const name = [...suites.slice(1), attr('name') ?? ''].join(' > ');
+        const path = attr('file') ?? file;
+        const id = path && name ? `${path} > ${name}` : undefined;
+        if (selfClosing) { if (id) passed.add(id); }
+        else open = id ? { id, passed: true } : undefined;
+      }
+    } else if (!closing && open) open.passed = false;
+  }
+  return [...passed].sort();
+}
 // A test may spawn a nested `bun test` whose own summary lines land earlier in the same output
 // (09-29 0.2.4 gate: «0 fail · Ran 2 tests across 1 file» at line 6765 of a 60064-test sweep) —
 // the sweep's own summary is always the «last» one, so read the last match, never the first.
@@ -76,6 +112,11 @@ const summaryCount = (output: string, label: string) => Number(lastMatch(output,
 /** bun reads a bare positional as a substring filter (`test` matches every *.test.ts); `./` makes it a path. */
 const asPath = (path: string) => path.startsWith('./') || path.startsWith('/') ? path : `./${path}`;
 export const POD_ISOLATION_MEMORY_LIMIT = '32Gi';
+/** Integration tests that the Pod sweep does not run — each is judged by a real run elsewhere at the cut.
+ *  0.2.7 run 5 (10-01): `scripts/install.test.ts` (real `bun pm pack` → `bun add` installs, 301 s alone on node-b)
+ *  sat in a shard of its own past the 1200 s deadline with no output and stopped the whole gate. Judged on the
+ *  mbp at the cut instead (TD1 moves it to the integration line). Keep this list short and explained. */
+export const POD_SWEEP_INTEGRATION_ONLY: readonly string[] = ['scripts/install.test.ts'];
 const tail40 = (output: string) => output.trimEnd().split(/\r?\n/).slice(-40).join('\n');
 const lastStartedTestFile = (output: string, paths: string[]): string | undefined => {
   let last: string | undefined;
@@ -92,10 +133,15 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
   const reportedErrors = summaryCount(output, 'error');
   const errorCount = Number.isNaN(reportedErrors) ? 0 : reportedErrors;
   const incomplete = (reason: string) => new Error(`${label} incomplete (rc=${run.rc}; Ran=${ran ? ran[0] : 'missing'}; errors=${Number.isNaN(reportedErrors) ? 'missing' : errorCount}; ${reason})\n${tail40(output)}`);
-  if (!ran || (Number(ran[1]) === 0 && errorCount === 0) || (run.rc !== 0 && run.rc !== 1)) throw incomplete('summary/exit');
   const count = summaryCount(output, 'fail');
   const failures = parseFailures(output);
   const occurrences = [...output.matchAll(/\(fail\)\s+.+?(?:\s+\[[\d.]+(?:ms|s)\])?\s*$/gm)].length;
+  // A test that leaves process.exitCode set leaks a non-zero exit into a run whose own summary is complete and clean
+  // (0.2.7 gate: agent-cli at v0.2.6 · 12 pass · 0 fail · rc 2). The summary is the verdict; read that exit as clean.
+  const leakedExit = !!ran && run.rc !== 0 && run.rc !== 1 && count === 0 && errorCount === 0 && occurrences === 0
+    && !/^# Unhandled error between tests/m.test(output);
+  const rc = leakedExit ? 0 : run.rc;
+  if (!ran || (Number(ran[1]) === 0 && errorCount === 0) || (rc !== 0 && rc !== 1)) throw incomplete('summary/exit');
   // Bun reports file-level unhandled errors separately from test failures.
   const errors: string[] = [];
   let file: string | undefined;
@@ -110,7 +156,7 @@ function failuresOf(run: CommandResult, label: string): SweepFailures {
   }
   if (errors.length !== errorCount) throw incomplete(`error attribution identified=${errors.length}`);
   if (!Number.isFinite(count) || count !== occurrences || (count > 0 && failures.length === 0)
-    || (run.rc === 1 && count === 0 && errorCount === 0) || (run.rc === 0 && count + errorCount > 0)) {
+    || (rc === 1 && count === 0 && errorCount === 0) || (rc === 0 && count + errorCount > 0)) {
     throw incomplete(`failure attribution incomplete: summary=${count}, identified=${failures.length}`);
   }
   return { failures, errors: [...new Set(errors)].sort() };
@@ -156,7 +202,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const cdpPatterns = cdp.output.split(/\r?\n/).filter((path) => path.endsWith('.test.ts'));
     // CDP 시험은 `test:deterministic` 이 스스로 뺀다 — 조각에 그것만 남으면 bun «시험 없음» exit 1 을 «불완전»으로 읽었다(09-30 G1d 실측 둘).
     // bun 의 탐색은 숨은 디렉터리(`.x/`)를 안 연다 — 사람의 `bun test` 가 한 번도 안 돌리는 빈 픽스처가 조각에 혼자 남아 «Ran 0 tests» 를 «불완전»으로 읽었다(09-30 G1e 5번 조각).
-    const assignable = files.filter((file) => !cdpPatterns.includes(file) && !file.split('/').some((part) => part.startsWith('.')));
+    const assignable = files.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
+      && !file.split('/').some((part) => part.startsWith('.')));
+    const integrationOnly = files.filter((file) => POD_SWEEP_INTEGRATION_ONLY.includes(file));
+    if (integrationOnly.length) debug.log('release-loop.gate', 'pod-sweep-integration-only', { files: integrationOnly });
     if (!assignable.length) throw new Error('sweep incomplete: no tests ran');
     const durations = pod.durationSource ? readFileDurations(pod.durationSource) : new Map<string, number>();
     const shards = planShards(assignable, durations, shardCount);
@@ -169,7 +218,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     const ready = poolOverride ? undefined : checkPodPool(parsePodPool(pod.pool), defaultKubectl);
     if (ready && !ready.ok) throw new Error('pod command: 풀의 노드가 하나도 준비되지 않았다');
     const poolScheduler = poolOverride ?? new PodPoolScheduler(ready!.ready);
-    const bunCache = process.env[POD_BUN_CACHE_HOST_PATH]?.trim() || undefined;
+    const configCache = typeof pod.bunCache === 'string' ? pod.bunCache.trim() : '';
+    const envCache = process.env[POD_BUN_CACHE_HOST_PATH]?.trim();
+    const bunCache = configCache || envCache || undefined;
+    debug.log('release-loop.gate', 'pod-bun-cache', { source: configCache ? 'config' : envCache ? 'env' : 'none' });
     const cachePrefix = bunCache ? `${podBunCacheVolume(bunCache).shellPrefix} ` : '';
     const jobLogTail = (job: PodCommandResult): string => {
       if (podLogTail) return podLogTail(job);
@@ -179,7 +231,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       }
       return '';
     };
-    type ShardRun = { output: string; rc: number; pass: number; fail: number; errors: number; ran: number; files: number };
+    type ShardRun = { output: string; rc: number; pass: number; fail: number; errors: number; ran: number; files: number; passedIds: string[] };
     type ShardReason = NonNullable<GateResult['stalledShards']>[number]['reason'];
     // 깊이 끝 OOM 조각은 «조각 전체»를 파일 하나씩 격리한다 — 상한 40 이면 나머지가 못 잰 채 남았다(09-30 ① 7번 조각 110 파일).
     const isolationRemaining = shards.map((item) => item.files.length);
@@ -233,7 +285,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
         const destination = join(logDir, `pod-${shard}${branch}.log`);
         if (output !== undefined) writeFileSync(destination, output, { mode: 0o600 });
         else rmSync(destination, { force: true });
-        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths, plannedSeconds: estimated(paths) }) + '\n', { mode: 0o600 });
+        writeFileSync(join(logDir, `pod-${shard}${branch}.json`), JSON.stringify({ durationMs, rc: rc ?? null, files: paths, plannedSeconds: estimated(paths), shardCount: shards.length, commit }) + '\n', { mode: 0o600 });
         const junitDestination = join(logDir, `pod-${shard}${branch}.junit.xml`);
         if (junit !== undefined) writeFileSync(junitDestination, junit, { mode: 0o600 });
         else rmSync(junitDestination, { force: true });
@@ -308,7 +360,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       }
       return { runs: [{ output: clean!, rc: rc!, pass: passes, fail: fails,
         errors: Number.isNaN(summaryCount(clean!, 'error')) ? 0 : summaryCount(clean!, 'error'),
-        ran: Number(ran![1]), files: Number(ran![2]) }], stalled: [] };
+        ran: Number(ran![1]), files: Number(ran![2]), passedIds: junit ? junitPassedIds(junit) : [] }], stalled: [] };
     };
     // 모든 조각이 끝난 뒤 판정한다 — 한 조각의 예외로 먼저 돌아가면 다른 Pod 가 도는 채로 정리가 시작된다(#22002 리뷰 R3).
     const settled = await Promise.allSettled(shards.map((item, shard) => runShard(item.files, shard)));
@@ -323,7 +375,8 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     if (stalledShards.length) throw new StalledPodShards(stalledShards, total);
     if (total.ran === 0 && total.errors === 0) throw new Error('sweep incomplete: no tests ran');
     const outputs = measured.map((run) => run.output.replace(/(?:^|\n)\s*\d+ (?:pass|fail|errors?)\s*(?=\n|$)/g, '\n').replace(/Ran \d+ tests? across \d+ files?\.?/g, ''));
-    return { rc: total.fail + total.errors ? 1 : 0, output: outputs.join('\n') + `\n${total.pass} pass\n${total.fail} fail\n${total.errors} errors\nRan ${total.ran} tests across ${total.files} files.\n` };
+    return { rc: total.fail + total.errors ? 1 : 0, output: outputs.join('\n') + `\n${total.pass} pass\n${total.fail} fail\n${total.errors} errors\nRan ${total.ran} tests across ${total.files} files.\n`,
+      passedIds: [...new Set(measured.flatMap((run) => run.passedIds))].sort() };
   };
   return {
     command,
@@ -455,7 +508,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     return baselineCommit(root, version);
   };
   const repo = resolve(opts.repo ?? process.cwd());
-  const result: GateResult = { outcome: 'error', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, durationMs: 0 };
+  const result: GateResult = { outcome: 'error', commit: opts.commit, introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], durationMs: 0 };
   let work: string | undefined;
   let baseSnapshot = false;
   let cutFailures: SweepFailures | undefined;
@@ -510,8 +563,9 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     cutFailures = cut;
     const baseSha = opts.baselineCommit ?? baselineReleaseCommit(opts.baselineVersion);
     const cached = cachedBaseline(opts.baselineVersion, baseSha);
-    const trusted = cached?.saved;
-    result.baselineSource = trusted ? cached!.source : 'swept';
+    const recorded = cached ? undefined : baselineFromCutLogs(join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut'), baseSha);
+    const trusted = cached?.saved ?? (recorded?.complete ? recorded : undefined);
+    result.baselineSource = cached ? cached.source : recorded?.complete ? 'cut-logs' : 'swept';
     debug.log('release-loop.gate', 'baseline', { version: opts.baselineVersion, source: result.baselineSource, commit: baseSha });
     let baseTree: string | undefined;
     const getBaseTree = async () => {
@@ -534,7 +588,14 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
       baseline = failuresOf(baseRun, 'baseline sweep');
     }
     for (const id of [...baseline.failures, ...baseline.errors, ...cut.failures, ...cut.errors]) fileOf(id);
-    const diff = diffFailures([...cut.failures, ...cut.errors], [...baseline.failures, ...baseline.errors]);
+    const known = opts.pod ? loadEnvKnownFailures(repo) : new Set<string>();
+    const cutIds = [...cut.failures, ...cut.errors];
+    const baselineIds = [...baseline.failures, ...baseline.errors];
+    const countedCut = splitKnownEnv(cutIds, known);
+    const countedBaseline = splitKnownEnv(baselineIds, known);
+    result.knownEnv = countedCut.knownEnv.length;
+    result.knownEnvCleared = [...new Set(cutRun.passedIds ?? [])].filter((id) => known.has(id) && !cutIds.includes(id)).sort();
+    const diff = diffFailures(countedCut.counted, countedBaseline.counted);
     result.fixed = diff.fixed.length;
     result.preexisting = diff.common.length;
     for (const file of new Set(diff.newFailures.map(fileOf))) {
@@ -584,7 +645,7 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     if (opts.remote) runner.remoteMirror = undefined;
     result.durationMs = Date.now() - start;
   }
-  if (result.outcome !== 'error' && cutFailures) {
+  if (cutFailures && !result.stalledShards?.length) {
     try {
       for (const location of roots) {
         const path = failureFile(location, opts.version);
@@ -608,10 +669,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
 export function graphGateResult(result: GateResult, graph: boolean) {
   return { ...result, ...(graph && result.outcome === 'regression' ? { outcome: 'fail' as const } : {}),
     verdict: result.outcome === 'ok' ? 'pass' as const : 'fail' as const,
-    summary: result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}` };
+    summary: (result.outcome === 'ok' ? `새 회귀 ${result.introduced.length} · 기존 ${result.preexisting} · 고침 ${result.fixed}` : `게이트 ${result.outcome}: ${result.error ?? result.introduced.length + ' new regressions'}`) + ` · 환경 알려진 실패 ${result.knownEnv}` };
 }
 
-function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOptions | 'help' {
+export function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOptions | 'help' {
   const context = env.ELANOUS_GRAPH_CONTEXT && args.every((arg) => arg === '--json') ? readGraphContext(env) : undefined;
   const fromGraph: Record<string, unknown> = context?.input ?? {};
   const graphCommit = context?.outputs['version-release']?.commit;
@@ -629,6 +690,7 @@ function parseOptions(args: string[], env: NodeJS.ProcessEnv): GateOptions | 'he
       pool: fromGraph.gatePodPool,
       ...(fromGraph.gatePodShards !== undefined ? { shards: Number(fromGraph.gatePodShards) } : {}),
       ...(fromGraph.gatePodShardTimeoutSeconds !== undefined ? { shardTimeoutSeconds: Number(fromGraph.gatePodShardTimeoutSeconds) } : {}),
+      ...(typeof fromGraph.gatePodBunCache === 'string' && fromGraph.gatePodBunCache.trim() ? { bunCache: fromGraph.gatePodBunCache } : {}),
     } : undefined,
   };
   for (let i = 0; i < args.length; i++) {
@@ -665,7 +727,7 @@ if (import.meta.main) {
     version = opts.version;
     result = await judgeGate(opts);
   } catch (error) {
-    result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, durationMs: Date.now() - start, error: String(error) };
+    result = { outcome: 'error', commit: '', introduced: [], preexisting: 0, fixed: 0, knownEnv: 0, knownEnvCleared: [], durationMs: Date.now() - start, error: String(error) };
   }
   if (result.error) console.error(result.error);
   debug.log('release-loop.gate', 'result', { version, outcome: result.outcome });

@@ -29,6 +29,21 @@ describe('execution origin without leader authority', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  test('a global install inside a git-tracked prefix (Homebrew, dotfiles home) is still the installed copy', () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'elanous-git-prefix-')));
+    try {
+      mkdirSync(join(dir, '.git'), { recursive: true });
+      for (const rel of ['lib/node_modules/elanous/bin/elanous.mjs', '.bun/install/global/node_modules/elanous/bin/elanous.mjs', 'pnpm/global/5/node_modules/elanous/bin/elanous.mjs']) {
+        const script = join(dir, rel);
+        mkdirSync(join(script, '..'), { recursive: true });
+        writeFileSync(script, '');
+        expect(treeFromScriptPath(script)).toBeNull();
+        expect(isInstalledCopyScript(script)).toBe(true);
+        expect(resolveInstance({ installedCopy: isInstalledCopyScript(script), treeTestRoot: join(dir, '.elanous-test') }).kind).toBe('prod');
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('retired status and claim cannot select or materialize a leader tree', () => {
     const messages: string[] = [];
     const errors: string[] = [];

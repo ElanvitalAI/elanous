@@ -43,6 +43,9 @@ describe('environment CLI and display-only mission plan', () => {
     expect(chooseRung('열린 PR 중 사흘 넘은 draft 목록', profile).rung).toBe(2);
     expect(chooseRung('결제 모듈에 재시도 추가하고 PR', profile).rung).toBe(4);
     expect(chooseRung('큰 리팩터 · 다른 눈 리뷰까지', profile).rung).toBe(5);
-    expect(invoke('agent-mission', '--help').stdout).toContain('mission [options] [text...]');
+    const help = invoke('agent-mission', '--help');
+    expect(help.code).toBe(0);
+    expect(help.stdout).toContain('mission|run [options] [text...]');
+    expect(invoke('agent-mission', 'mission', '--help').stdout).toContain('Usage: elanous agent-mission mission|run [options] [text...]');
   });
 });

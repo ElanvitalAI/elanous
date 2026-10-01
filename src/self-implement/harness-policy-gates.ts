@@ -4,8 +4,9 @@ import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-ga
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
 import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
 import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
+import { runPublicExportLeakGate } from '../../scripts/ci-public-export-leak-gate.js';
 
-type GateName = 'isolation-gate' | 'mock-module-restore-gate' | 'model-hardcode-gate' | 'daemon-port-gate';
+type GateName = 'isolation-gate' | 'mock-module-restore-gate' | 'model-hardcode-gate' | 'daemon-port-gate' | 'public-export-leak';
 type GateOutput = { args: string[]; cwd: string; log: (line: string) => void; error: (line: string) => void };
 type GateRunner = (out: GateOutput) => number;
 
@@ -27,6 +28,8 @@ export function runHarnessPolicyGates(input: {
     ['mock-module-restore-gate', input.gates?.['mock-module-restore-gate'] ?? runMockModuleRestoreGate],
     ['model-hardcode-gate', input.gates?.['model-hardcode-gate'] ?? runModelHardcodeGate],
     ['daemon-port-gate', input.gates?.['daemon-port-gate'] ?? ((out) => runDaemonPortGate({ log: out.log, error: out.error, cwd: out.cwd, args: [] }))],
+    // LEAK1 — the check release prepare fails on, before the harness lands (0.2.7: a mark in a test title).
+    ['public-export-leak', input.gates?.['public-export-leak'] ?? runPublicExportLeakGate],
   ];
   const failures: Array<{ gate: GateName; lines: string[] }> = [];
   for (const [gate, run] of runners) {

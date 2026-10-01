@@ -76,16 +76,10 @@ describe('dashboard → session-runtime 진행 엔벨로프 배선 (wire pin)', 
   });
 
   test('SelfImplement production implement 호출이 sparse 표면 진행을 기존 implementing progress relay로 잇는다', () => {
-    // 🪞⭐⭐ 2026-08-26 — 옛 앵커 «쌍»이 깨졌다.
-    //   ❌ 옛 것  slice('impl = await withStepTimeout(s.implement({' … "}), T.implement, 'implement')")
-    //   📏 지금   인자가 ***호이스팅***됐다 — `implementPromise = s.implement({ … })` 를 만들고
-    //             나중에 `await withStepTimeout(implementPromise, T.implement, 'implement')`
-    //   ⇒ 두 앵커가 «둘 다» -1 이 되어 slice 가 ***빈 문자열***이었고, toContain 이 그걸 물었다.
-    //   🚨 그리고 그것이 이 시험의 «위험»이다 — 앵커가 깨지면 ***빈 문자열을 검사***하게 되어
-    //      「계약이 사라졌다」와 「내 앵커가 늙었다」가 ***같은 실패 모양***이 된다.
-    //   🩹 그래서 ⓐ 앵커를 «지금 구조»로 옮기고 ⓑ ***잘라 낸 조각이 비지 않았는지를 «먼저» 문다.***
+    // The implement arguments are hoisted into implementPromise; the timed await
+    // follows later. Both anchors must exist before inspecting the wire between them.
     const implStart = orchestrator.indexOf('implementPromise = s.implement({');
-    const implEnd = orchestrator.indexOf("await withStepTimeout(implementPromise, T.implement, 'implement')");
+    const implEnd = orchestrator.indexOf("await stepTimeout(implementPromise, T.implement, 'implement')");
     expect(implStart).toBeGreaterThan(0);
     expect(implEnd).toBeGreaterThan(implStart);
     const implementCall = orchestrator.slice(implStart, implEnd);

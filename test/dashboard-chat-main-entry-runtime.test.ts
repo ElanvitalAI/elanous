@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-
 import type { PromptFrame } from '../src/display/prompt-frame.js';
 import { runDashboardChatMainEntry } from '../src/dashboard/input/chat-main-entry-runtime.js';
+
+const escapeKey = async () => ({ name: 'escape', ctrl: false, shift: false });
 
 describe('dashboard chat-main entry runtime', () => {
   test('paints the frame before stdout renders the initial text', async () => {
@@ -31,16 +32,15 @@ describe('dashboard chat-main entry runtime', () => {
         debugLog: (event, label, payload) => { debugEvents.push({ event, label, payload }); },
         history: [],
         placeholder: 'placeholder',
-        textInputOpts: { onEscape: () => false },
+        textInputOpts: { onEscape: () => false, readKey: escapeKey },
       });
 
-      process.stdin.emit('data', '\\u001b');
       await pending;
 
       expect(order.indexOf('paint-frame-now')).toBeGreaterThanOrEqual(0);
-      expect(order.indexOf('paint-frame-now')).toBeLessThan(
-        order.findIndex((entry) => entry.includes('zzz')),
-      );
+      const initialTextAt = order.findIndex((entry) => entry.includes('zzz'));
+      expect(initialTextAt).toBeGreaterThanOrEqual(0);
+      expect(order.indexOf('paint-frame-now')).toBeLessThan(initialTextAt);
       expect(debugEvents).toContainEqual({
         event: 'chat-main.entry-runtime',
         label: 'frame-painted-before-input',
@@ -71,10 +71,9 @@ describe('dashboard chat-main entry runtime', () => {
         debugLog: (event, label, payload) => { debugEvents.push({ event, label, payload }); },
         history: [],
         placeholder: 'placeholder',
-        textInputOpts: { onEscape: () => false },
+        textInputOpts: { onEscape: () => false, readKey: escapeKey },
       });
 
-      process.stdin.emit('data', '\\u001b');
       await pending;
 
       expect(debugEvents.map(({ label }) => label)).not.toContain('frame-painted-before-input');
@@ -103,12 +102,11 @@ describe('dashboard chat-main entry runtime', () => {
         dispatchGlobalAction: async () => {},
         history: [],
         placeholder: 'placeholder',
-        textInputOpts: { onEscape: () => false },
+        textInputOpts: { onEscape: () => false, readKey: escapeKey },
       });
       await Promise.resolve();
       armedDuringInput = promptCtl.repaint !== initialRepaint;
       const armed = promptCtl.repaint;
-      process.stdin.emit('data', '\u001b');
       await pending;
       expect(armedDuringInput).toBe(true);
       expect(promptCtl.repaint).not.toBe(armed);
@@ -152,10 +150,10 @@ describe('dashboard chat-main entry runtime', () => {
         placeholder: 'placeholder',
         textInputOpts: {
           onEscape: () => false,
+          readKey: escapeKey,
         },
       });
 
-      process.stdin.emit('data', '\u001b');
       const result = await pending;
 
       expect(typeof result.submitted).toBe('boolean');
@@ -193,11 +191,11 @@ describe('dashboard chat-main entry runtime', () => {
         placeholder: 'placeholder',
         textInputOpts: {
           onEscape: () => false,
+          readKey: async () => ({ name: 'enter', ctrl: false, shift: false }),
         },
+        initialText: 'hi',
       });
 
-      process.stdin.emit('data', 'hi');
-      process.stdin.emit('data', '\r');
       const result = await pending;
 
       expect(result.submitted).toBe(true);

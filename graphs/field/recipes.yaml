@@ -1,0 +1,12 @@
+# reel: 데몬 자동 렌더가 이미 끝냈으면 그대로 쓴다(같은 사진을 두 번 렌더하지 않는다). 릴스가 실패해도 캐러셀은 간다.
+reel:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/field-feed/reel-node.ts"'
+  timeout_ms: 600000
+feed:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/field-feed/feed-node.ts"'
+  timeout_ms: 300000
+post:
+  approval: '{"kind":"feed-preview"}'
+deliver:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../scripts/field-feed/deliver-node.ts"'
+  timeout_ms: 300000

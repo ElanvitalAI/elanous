@@ -32,11 +32,15 @@ function executable(path: string, body: string) {
 function fakeElanous(path: string, drafts: Data[], research = '', counter?: string) {
   executable(path, `#!/usr/bin/env node
 const fs=require('node:fs');
-const [, , , cmd, , payload]=process.argv;
+// An installed plugin runs outside any git tree, where the real CLI refuses \`--test\` (no isolation root).
+if (process.argv.includes('--test')) { process.stderr.write('[--test] 격리 루트를 정할 수 없습니다\\n'); process.exit(1); }
+const [, , cmd, , payload]=process.argv;
 fs.appendFileSync(${JSON.stringify(path + '.calls')}, process.argv.slice(2).join(' ')+'\\n');
 if (cmd==='research') { process.stdout.write(JSON.stringify({output:${JSON.stringify(research)}})+'\\n'); process.exit(0); }
 if (cmd!=='ask') process.exit(17);
 const p=JSON.parse(payload);
+if (p.task==='strategy') { process.stdout.write(JSON.stringify({reply:JSON.stringify({fit:{score:85,label:'high',reasons:[{text:'제안 적합',basis:'offer'},{text:'회사 조사',basis:'S1'},{text:'직함',basis:'card'}]},approach:{who:p.card.name,problem:'후속 대화',proposal:'가상 제품 데모',channel:'email',timing:'다음 주'},nextAction:{what:'후속 연락',due:'다음 주'},approachBasis:{who:['card'],problem:['context'],proposal:[p.offer?'offer':'assumption'],channel:['assumption'],timing:['assumption']},nextActionBasis:{what:['assumption'],due:['assumption']}})})+'\\n'); process.exit(0); }
+if (p.task==='strategy-verify') { process.stdout.write(JSON.stringify({reply:JSON.stringify({unsupportedReasons:p.claims.filter(s=>s.text.includes('세계')).map(s=>s.i),unsupportedApproach:p.approach.filter(s=>s.text.includes('세계')).map(s=>s.field),unsupportedAction:p.nextAction.filter(s=>s.text.includes('세계')).map(s=>s.field)})})+'\\n'); process.exit(0); }
 if (p.task==='verify') { process.stdout.write(JSON.stringify({reply:JSON.stringify({unsupported:p.sentences.filter(s=>s.text.includes('세계')).map(s=>s.i)})})+'\\n'); process.exit(0); }
 const counter=${JSON.stringify(counter ?? path + '.count')};
 fs.appendFileSync(counter,'x');
@@ -80,7 +84,7 @@ test('counterexamples reject bad input and preserve only sourced facts', () => {
   expect(noJson.output.reason).toContain('JSON 없는 설명 문장입니다.');
   const research = step('research', {}, { 'read-card': card.output }, env);
   expect(research.output).toMatchObject({ summary: null, news: [], sources: [] });
-  const draft = step('draft', { context: contextLine }, { 'read-card': card.output, research: research.output }, { ...env, CARD_FOLLOWUP_ELANOUS_BIN: longAsk });
+  const draft = step('draft', { context: contextLine }, { 'read-card': card.output, research: research.output, strategy: { approach: { problem: '대화', proposal: '후속', channel: 'LinkedIn' } } }, { ...env, CARD_FOLLOWUP_ELANOUS_BIN: longAsk });
   expect(draft.output.destination).toEqual(['LinkedIn']);
   expect(draft.output.linkedin).toBe('짧은 초대');
   expect(readFileSync(join(temp, 'ask.count'), 'utf8')).toBe('xx');
@@ -122,7 +126,7 @@ test('unsupported claims fail, identity-only drafts pass with no research', () =
   expect(fixed.output.body).not.toContain('세계');
   rmSync(fixed.temp, { recursive: true, force: true });
   rmSync(temp, { recursive: true, force: true });
-});
+}, 30_000);
 
 test('installed graph completes and writes all three drafts with sources', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'card-graph-'));
@@ -148,16 +152,34 @@ test('installed graph completes and writes all three drafts with sources', async
     } },
   });
   expect(state.status).toBe('done');
-  const recipes = parseYaml(readFileSync(join(installed, 'graphs/recipes.yaml'), 'utf8')) as Record<string, { command: string }>;
-  expect(commands).toEqual(['read-card', 'research', 'draft', 'report'].map(id => recipes[id]!.command));
+  const recipes = parseYaml(readFileSync(join(installed, 'graphs/recipes.yaml'), 'utf8')) as Record<string, { command: string; timeout_ms: number }>;
+  expect(commands).toEqual(['read-card', 'research', 'strategy', 'draft', 'report'].map(id => recipes[id]!.command));
+  // Up to four LLM calls (write ⊕ verify, one retry) — 120 s was hit live on 10-01.
+  expect(recipes.strategy!.timeout_ms).toBe(300000);
+  expect(recipes.draft!.timeout_ms).toBe(300000);
   const report = readFileSync(join(state.statePath.slice(0, -5), 'followup.md'), 'utf8');
-  for (const heading of ['팔로업 메일', 'LinkedIn 초대 문구', '대화 이어 갈 질문']) expect(report).toContain(`## ${heading}`);
+  // The report is shown on screens: the CRM line names the file, never the home path.
+  expect(report).toContain('파일: crm.csv');
+  expect(report).not.toContain(homedir());
+  const headings = ['① 사람·회사 분석', '② CRM 한 줄', '③ 타겟 판정', '④ 접근 전략', '⑤ 메일·LinkedIn 초안'];
+  expect([...report.matchAll(/^## (.+)$/gm)].slice(0, 5).map(match => match[1])).toEqual(headings);
+  for (const heading of ['팔로업 메일', 'LinkedIn 초대 문구', '대화 이어 갈 질문']) expect(report).toContain(`### ${heading}`);
   expect(report).toContain('https://example.test/company');
   expect(report).toContain('가상 행사에서 가상 제품 데모를 짧게 이야기했습니다.');
   const output = JSON.parse(readFileSync(join(state.statePath.slice(0, -5), 'followup.json'), 'utf8')) as Data;
   const finalDraft = output.draft as Data;
   const finalResearch = output.research as Data;
   expect(output.sent).toBe(false);
+  expect(output.fit).toMatchObject({ score: null, label: 'unknown' });
+  expect(output.approach).toMatchObject({ who: '가상 인물', channel: 'email' });
+  expect(output.nextAction).toMatchObject({ what: '후속 연락' });
+  expect(report).toContain('- 어떤 문제: 후속 대화');
+  expect(report).toContain('- 어떤 제안: 가상 제품 데모');
+  expect(report).toContain('- 다음 행동: 후속 연락 · 기한: 다음 주');
+  expect(output.crm).toBe(join(state.statePath.slice(0, -5), 'crm.csv'));
+  expect(readFileSync(output.crm as string, 'utf8')).toContain('person@example.test');
+  expect(report).toContain('offer 입력이 없어 맞음을 판정하지 않았다');
+  expect(readFileSync(join(bin, 'elanous.calls'), 'utf8')).not.toContain('--test');
   expect((finalDraft.body as string).length).toBeGreaterThanOrEqual(120);
   expect((finalDraft.body as string).length).toBeLessThanOrEqual(200);
   expect(finalDraft.body).toContain(contextLine);
@@ -169,8 +191,28 @@ test('installed graph completes and writes all three drafts with sources', async
     expect([finalDraft.subject, finalDraft.body, finalDraft.linkedin, finalDraft.question].join(' ')).toContain(fact.text);
     expect(report).toContain(`${fact.text} — ${fact.url}`);
   }
+  // Real codex reads every argument after `-i` as an image, so the prompt must come first and `-i <image>` last.
+  const codexCall = readFileSync(calls, 'utf8').trim().split('\n')[0]!;
+  expect(codexCall.startsWith('exec --skip-git-repo-check ')).toBe(true);
+  expect(codexCall.endsWith(`-i ${image}`)).toBe(true);
   expect(readFileSync(join(bin, 'elanous.calls'), 'utf8')).toContain('--limit 5 가상 회사');
   expect(readFileSync(join(bin, 'elanous.calls'), 'utf8')).toContain('--limit 5 가상 인물 가상 회사');
+  const crm = output.crm as string;
+  const withOffer = await runGraph(join(installed, 'graphs/card-followup.yaml'), {
+    input: { image, context: contextLine, sender: '가상 발신자', offer: '가상 회사 대상 제품 데모', crm },
+    deps: { root: join(temp, 'offer-state'), runBash: async (command, opts) => {
+      const response = spawnSync('/bin/bash', ['-c', command], { cwd: elsewhere, encoding: 'utf8', env: { ...opts.env, PATH: `${bin}:${process.env.PATH}`, CARD_FOLLOWUP_CODEX_BIN: join(bin, 'codex'), CARD_FOLLOWUP_ELANOUS_BIN: join(bin, 'elanous') } });
+      return { stdout: response.stdout, stderr: response.stderr, exitCode: response.status ?? 1 };
+    } },
+  });
+  expect(withOffer.status).toBe('done');
+  const offered = JSON.parse(readFileSync(join(withOffer.statePath.slice(0, -5), 'followup.json'), 'utf8')) as Data;
+  expect(offered.fit).toMatchObject({ score: 85, label: 'high' });
+  expect(offered.crm).toBe(crm);
+  expect(offered.sent).toBe(false);
+  const rows = readFileSync(crm, 'utf8').trim().split('\n');
+  expect(rows).toHaveLength(2);
+  expect(rows[1]).toContain(',85,high,');
   rmSync(join(bin, 'elanous.count'), { force: true });
   fakeElanous(join(bin, 'elanous'), [{ subject: '팔로업', body: '가상 회사는 세계 최대 기업입니다.', linkedin: '초대', question: '질문' }]);
   const rejected = await runGraph(join(installed, 'graphs/card-followup.yaml'), {
@@ -181,5 +223,145 @@ test('installed graph completes and writes all three drafts with sources', async
     } },
   });
   expect(rejected.status).not.toBe('done');
+  rmSync(temp, { recursive: true, force: true });
+});
+
+test('strategy uses offer and a custom local CRM path; drafts receive the chosen approach', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'card-offer-'));
+  try {
+    const fake = join(temp, 'elanous');
+    const crm = join(temp, 'contacts.csv');
+    const contextLine = '가상 행사에서 만났습니다.';
+    const body = `${contextLine} ${'후속 대화를 이어가고 가상 제품 데모를 함께 검토하고 싶습니다. '.repeat(4)}`;
+    fakeElanous(fake, [{ subject: '데모 제안', body, linkedin: '데모를 논의하고 싶습니다.', question: '언제 이야기를 나눌까요?' }]);
+    const card = { card: { name: '가상 인물', company: '가상 회사', email: 'person@example.test', language: 'ko' } };
+    const research = { sources: [{ title: '가상 회사 소개', url: 'https://example.test/company', snippet: '소개' }] };
+    const env = { CARD_FOLLOWUP_ELANOUS_BIN: fake };
+    const strategy = step('strategy', { context: contextLine, offer: '가상 제품은 고객을 위한 서비스', crm }, { 'read-card': card, research }, env);
+    expect(strategy.output.outcome).toBe('ok');
+    expect(strategy.output.fit).toMatchObject({ score: 85, label: 'high', reasons: [{ basis: 'offer' }, { basis: 'S1' }, { basis: 'card' }] });
+    expect(strategy.output.crm).toBe(crm);
+    expect(strategy.output.crmRow).toMatchObject({ fit_score: '85', fit_label: 'high', interest: '후속 대화', next_action: '후속 연락' });
+    expect(readFileSync(crm, 'utf8')).toContain('person@example.test');
+    const relativeCrm = step('strategy', { context: contextLine, crm: 'contacts.csv' }, { 'read-card': card, research }, env);
+    expect(relativeCrm.output).toMatchObject({ outcome: 'fail', reason: 'crm: 절대 경로 필요' });
+    const draft = step('draft', { context: contextLine }, { 'read-card': card, research, strategy: strategy.output }, env);
+    expect(draft.output.outcome).toBe('ok');
+    const calls = readFileSync(`${fake}.calls`, 'utf8');
+    expect(calls).toContain('"problem":"후속 대화"');
+    expect(calls).toContain('"proposal":"가상 제품 데모"');
+    expect(calls).toContain('"channel":"email"');
+    expect(calls).not.toContain('--test');
+    // The approach is guidance, not an exemption from the sentence-level source verifier.
+    const unsupported = join(temp, 'unsupported-approach');
+    fakeElanous(unsupported, [{ subject: '데모 제안', body: `${contextLine} 귀사는 세계 최대 기업입니다. ${'후속 대화를 제안드립니다. '.repeat(6)}`, linkedin: '초대', question: '질문' }]);
+    const rejected = step('draft', { context: contextLine }, { 'read-card': card, research, strategy: strategy.output }, { CARD_FOLLOWUP_ELANOUS_BIN: unsupported });
+    expect(rejected.output).toMatchObject({ outcome: 'fail' });
+    expect(rejected.output.reason).toContain('출처 없는 회사 사실');
+    expect(readFileSync(`${unsupported}.count`, 'utf8')).toBe('xxx');
+    rmSync(rejected.temp, { recursive: true, force: true });
+    rmSync(strategy.temp, { recursive: true, force: true });
+    rmSync(relativeCrm.temp, { recursive: true, force: true });
+    rmSync(draft.temp, { recursive: true, force: true });
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('report refuses missing strategy fields instead of writing an incomplete plan', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'card-missing-strategy-'));
+  try {
+    const input = { outDir: temp };
+    const outputs = { 'read-card': { card: { name: '가상 인물' } }, research: { sources: [] },
+      strategy: { fit: { score: null, label: 'unknown', reasons: [] }, crm: join(temp, 'crm.csv'), crmRow: { fit_label: 'unknown' },
+        approach: { who: '가상 인물', problem: '후속 대화', proposal: '데모', channel: 'email' }, nextAction: { what: '메일 작성', due: '내일' } },
+      draft: { subject: '제목', linkedin: '초대', question: '질문' } };
+    const result = step('report', input, outputs, {});
+    expect(result.output).toMatchObject({ outcome: 'fail', reason: '전략 없음' });
+    expect(() => readFileSync(join(temp, 'followup.md'), 'utf8')).toThrow();
+    rmSync(result.temp, { recursive: true, force: true });
+  } finally { rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('a card language read as «English» drafts in en instead of failing', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'card-language-'));
+  const contextLine = 'We met at the event.';
+  const fake = join(temp, 'elanous');
+  fakeElanous(fake, [{ subject: 'Follow-up', body: `${contextLine} ${'I enjoyed our talk and would like to continue it soon. '.repeat(3)}`.slice(0, 190), linkedin: 'Nice to meet you.', question: 'What should we explore next?' }]);
+  const card = { card: { name: 'Fictional Person', company: 'Fictional Co', email: null, language: 'English' } };
+  const result = step('draft', { context: contextLine }, { 'read-card': card, research: { sources: [] } }, { CARD_FOLLOWUP_ELANOUS_BIN: fake });
+  expect(result.output.outcome).toBe('ok');
+  expect(result.output.language).toBe('en');
+  rmSync(result.temp, { recursive: true, force: true });
+  rmSync(temp, { recursive: true, force: true });
+});
+
+test('research summary comes only from results that name the card company or its site', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'card-research-'));
+  const fake = join(temp, 'elanous');
+  fakeElanous(fake, [], '- [Vital AI](https://www.vital.ai/)\n- [Elanvital AI home](https://elanvital.ai/)\n- [Other news](https://example.test/news)');
+  const card = { card: { name: 'Jiwoo Han', company: 'Elanvital AI', url: 'elanous.ai', language: 'en' } };
+  const hit = step('research', {}, { 'read-card': card }, { CARD_FOLLOWUP_ELANOUS_BIN: fake });
+  expect(hit.output.summary).toBe('Elanvital AI home');
+  expect((hit.output.sources as { url: string }[])[0]!.url).toBe('https://elanvital.ai/');
+  fakeElanous(fake, [], '- [Vital AI](https://www.vital.ai/)\n- [Other news](https://example.test/news)');
+  const miss = step('research', {}, { 'read-card': card }, { CARD_FOLLOWUP_ELANOUS_BIN: fake });
+  expect(miss.output.summary).toBeNull();
+  for (const r of [hit, miss]) rmSync(r.temp, { recursive: true, force: true });
+  rmSync(temp, { recursive: true, force: true });
+});
+
+test('sources keep only the card company or site — no same-name strangers, no logo rows', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'card-sources-'));
+  const fake = join(temp, 'elanous');
+  fakeElanous(fake, [], [
+    '- [Acme Cloud home](https://acme.example/)',
+    '-   [![](https://img.example/acme-logo.svg)](https://img.example/acme-logo.svg)',
+    '- [Acme logo](https://cdn.example/acme.png)',
+    '- [Jordan Park — Portfolio](https://jordan-park-portfolio.example/)',
+    '- [Jordan Park - IMDb](https://imdb.example/name/nm1)',
+    '- [Acme Cloud pricing](https://acme.example/pricing)',
+    '- [Home — Jordan Park](https://jordan.acme-hosting.example/)',
+    '- [Jordan Park — Acme Cloud engineer](https://social.example/in/jordan-park)',
+    '- [Portfolio](https://someone.acme.example.app/)',
+    '- https://acmecloud-fan.hosting.example/',
+  ].join('\n'));
+  const card = { card: { name: 'Jordan Park', company: 'Acme Cloud', url: 'acme.example', language: 'en' } };
+  const result = step('research', {}, { 'read-card': card }, { CARD_FOLLOWUP_ELANOUS_BIN: fake });
+  expect((result.output.sources as { url: string }[]).map(s => s.url)).toEqual(['https://acme.example/', 'https://acme.example/pricing']);
+  expect(result.output.news).toEqual(['Acme Cloud pricing']);
+  expect(result.output.dropped).toBe(6);
+  rmSync(result.temp, { recursive: true, force: true });
+  rmSync(temp, { recursive: true, force: true });
+});
+
+test('research also searches the card site — the company name alone ranks other companies above it', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'card-site-query-'));
+  const fake = join(temp, 'elanous');
+  fakeElanous(fake, [], '- [Elanvital AI](https://elanvital.ai/)');
+  const withSite = step('research', {}, { 'read-card': { card: { name: 'Joosung Jin', company: 'Elanvital AI', url: 'https://www.elanvital.ai/', language: 'en' } } }, { CARD_FOLLOWUP_ELANOUS_BIN: fake });
+  const calls = readFileSync(`${fake}.calls`, 'utf8').trim().split('\n').filter(l => l.startsWith('research'));
+  // queries run in parallel, so the call order is not fixed
+  expect(calls.sort()).toEqual(['research --json --limit 5 Elanvital AI', 'research --json --limit 5 Joosung Jin Elanvital AI', 'research --json --limit 5 elanvital.ai'].sort());
+  rmSync(`${fake}.calls`, { force: true });
+  const noSite = step('research', {}, { 'read-card': { card: { name: 'Joosung Jin', company: 'Elanvital AI', language: 'en' } } }, { CARD_FOLLOWUP_ELANOUS_BIN: fake });
+  expect(readFileSync(`${fake}.calls`, 'utf8').trim().split('\n').filter(l => l.startsWith('research')).sort()).toEqual(['research --json --limit 5 Elanvital AI', 'research --json --limit 5 Joosung Jin Elanvital AI']);
+  for (const r of [withSite, noSite]) rmSync(r.temp, { recursive: true, force: true });
+  rmSync(temp, { recursive: true, force: true });
+});
+
+test('an English card translates a Korean meeting note instead of pasting it into the mail', () => {
+  const temp = mkdtempSync(join(tmpdir(), 'card-cross-language-'));
+  const contextLine = '마케터의 밤에서 인사';
+  const english = 'Great to meet you at Marketers Night. I would love to show a short demo that takes one request from a single line to a finished result, if useful.';
+  const fake = join(temp, 'elanous');
+  fakeElanous(fake, [
+    { subject: 'Follow-up', body: `Hi, ${contextLine}. ${english}`, linkedin: 'Nice to meet you.', question: 'What should we try first?' },
+    { subject: 'Follow-up', body: english, linkedin: 'Nice to meet you at Marketers Night.', question: 'What should we try first?' },
+  ]);
+  const card = { card: { name: 'Fictional Person', company: 'Fictional Co', email: null, language: 'en' } };
+  const result = step('draft', { context: contextLine }, { 'read-card': card, research: { sources: [] } }, { CARD_FOLLOWUP_ELANOUS_BIN: fake });
+  expect(result.output.outcome).toBe('ok');
+  expect(String(result.output.body)).toBe(english);
+  expect(/[가-힣]/.test(String(result.output.body))).toBe(false);
+  rmSync(result.temp, { recursive: true, force: true });
   rmSync(temp, { recursive: true, force: true });
 });

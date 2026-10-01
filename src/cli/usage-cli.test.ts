@@ -61,9 +61,28 @@ describe('usage runs', () => {
       const lines: string[] = [];
       const command = new Command();
       const report: Awaited<ReturnType<typeof collectUnifiedUsage>> = { rows: [], accountCounts: { codex: 0, grok: 0, openrouter: 0 } };
-      registerUsageCommand(command, { collect: async () => report, out: { log: (line) => lines.push(line) } });
+      registerUsageCommand(command, { collect: async () => report, creditPlan: () => null, out: { log: (line) => lines.push(line) } });
       await command.parseAsync(['usage', '--json'], { from: 'user' });
-      expect(lines).toEqual([JSON.stringify(report, null, 2)]);
+      expect(lines).toEqual([JSON.stringify({ ...report, codexCreditPlan: null }, null, 2)]);
     } finally { store.close(); }
+  });
+
+  it('prints the codex credit plan under the table and carries the same values in --json', async () => {
+    const report: Awaited<ReturnType<typeof collectUnifiedUsage>> = { rows: [], accountCounts: { codex: 0, grok: 0, openrouter: 0 } };
+    const plan = { expiresAt: '2026-12-31', daysLeft: 92, totalBalance: 45_000, unknownBalances: 0, accounts: [{ name: 'team', balance: 45_000, expires: null }],
+      dailyNeeded: 45_000 / 92, targetPerDay: null, actualPerDay: 500, actualSpanDays: 7, note: '연말까지 소진' };
+    const text: string[] = [];
+    const a = new Command();
+    registerUsageCommand(a, { collect: async () => report, creditPlan: () => plan, out: { log: (line) => text.push(line) } });
+    await a.parseAsync(['usage'], { from: 'user' });
+    const shown = text.join('\n');
+    expect(shown).toContain('codex 크레딧');
+    expect(shown).toContain('계산      만료까지 92일 · 하루 소진 필요 489 · 최근 7일 실제 500/일');
+    expect(shown).toContain('메모      연말까지 소진');
+    const json: string[] = [];
+    const b = new Command();
+    registerUsageCommand(b, { collect: async () => report, creditPlan: () => plan, out: { log: (line) => json.push(line) } });
+    await b.parseAsync(['usage', '--json'], { from: 'user' });
+    expect(JSON.parse(json[0]!).codexCreditPlan).toEqual(plan);
   });
 });

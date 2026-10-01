@@ -250,7 +250,7 @@ describe('track courier', () => {
     let decisions = 0;
     const sent: string[] = [];
     setUserConfigOverlay((cfg) => ({ ...cfg, autopilot: { ...cfg.autopilot,
-      trackAgent: { enabled: true, maxConcurrent: 2 } } }));
+      trackAgent: { enabled: true, maxConcurrent: 2, shadow: false, shadowMaxDecisionsPerDay: 20 } } }));
     try {
       await deliverMissionPhases(mission.id, { store, config, now, listComments: comments,
         agentRunner: {
@@ -368,11 +368,11 @@ describe('track courier', () => {
     try {
       const path = join(dir, 'config.json');
       writeFileSync(path, JSON.stringify({ autopilot: { trackAgent: {} } }));
-      expect(buildUserConfig(path).autopilot?.trackAgent).toEqual({ enabled: false, maxConcurrent: 2 });
+      expect(buildUserConfig(path).autopilot?.trackAgent).toEqual({ enabled: false, maxConcurrent: 2, shadow: false, shadowMaxDecisionsPerDay: 20 });
       writeFileSync(path, JSON.stringify({ autopilot: { trackAgent: { enabled: true, maxConcurrent: 99 } } }));
-      expect(buildUserConfig(path).autopilot?.trackAgent).toEqual({ enabled: true, maxConcurrent: 2 });
+      expect(buildUserConfig(path).autopilot?.trackAgent).toEqual({ enabled: true, maxConcurrent: 2, shadow: false, shadowMaxDecisionsPerDay: 20 });
       writeFileSync(path, JSON.stringify({ autopilot: { trackAgent: { enabled: true, maxConcurrent: 1 } } }));
-      expect(buildUserConfig(path).autopilot?.trackAgent).toEqual({ enabled: true, maxConcurrent: 1 });
+      expect(buildUserConfig(path).autopilot?.trackAgent).toEqual({ enabled: true, maxConcurrent: 1, shadow: false, shadowMaxDecisionsPerDay: 20 });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

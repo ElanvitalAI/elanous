@@ -38,6 +38,7 @@ import { ChannelBotSetupCard } from './ChannelBotSetupCard';
 import { PushcutSettingsCard } from './PushcutSettingsCard';
 import { IntentPanelSettingsCard } from './IntentPanelSettingsCard';
 import { ChatRoutingCard } from './ChatRoutingCard';
+import { FastReplyCard } from './FastReplyCard';
 import { NotesMetricsCard } from './NotesMetricsCard';
 import { OcrPrefsCard } from './OcrPrefsCard';
 import { LlmHostsCard } from './LlmHostsCard';
@@ -584,6 +585,7 @@ export function SettingsPanel() {
 
       {/* Chat input automatic-routing preference (default OFF). */}
       <ChatRoutingCard />
+      <FastReplyCard />
 
       {/* CV-3 dogfood follow-up (2026-05-09) — IntentPanel display
           mode (fixed/popup/off). Persisted via localStorage shim in

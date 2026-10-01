@@ -51,6 +51,11 @@ delete process.env.ELANOUS_ESCALATE_MODEL;
 process.env.ELANOUS_SSH_HOSTS_PATH = join(tmpdir(), `elanous-test-ssh-hosts-${process.pid}`, 'absent.json');
 delete process.env.ELANOUS_MEDIA_HOST;
 
+// The GitHub App key is machine-level (~/.elanous/secrets/github-app). A test that reaches it mints a real
+// bot token on the network, and that token can end up in a real gh under a temp HOME (10-01 keychain dialogs).
+// Point the App config at nothing; App tests pass `configPath` explicitly.
+process.env.ELANOUS_GITHUB_APP_CONFIG_PATH = join(tmpdir(), `elanous-test-github-app-${process.pid}`, 'absent.json');
+
 const inheritedHarnessRun = Boolean(process.env.ELANOUS_RUN_ID?.trim());
 if (inheritedHarnessRun || !process.env.ELANOUS_STATE_DIR?.trim()) {
   const isolated = join(tmpdir(), `elanous-test-global-${process.pid}`);

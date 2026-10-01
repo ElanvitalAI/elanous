@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const repo = join(import.meta.dir, '..');
@@ -25,5 +26,8 @@ function version(cwd: string): string {
 //      cwd 를 따르면 pilot 바이너리가 «남의 트리» sha 를 자신 있게 말한다.
 test('version reports the package version and current checkout revision', () => {
   const output = version(repo);
-  expect(output).toMatch(/^1\.0\.0\s+[0-9a-f]+$/i);
+  const packageVersion = (JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')) as { version: string }).version;
+  const head = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' });
+  expect(head.status, head.stderr).toBe(0);
+  expect(output).toBe(`${packageVersion} ${head.stdout.trim()}`);
 });

@@ -51,7 +51,9 @@ export interface OAuthTokens {
   tokenType?: string;
 }
 
-export type CodexMirrorResult = 'written' | 'not-created-missing-cli-fields' | 'write-failed';
+export type CodexMirrorResult = 'written' | 'not-created-missing-cli-fields' | 'write-failed'
+  // AUTH1 — ~/.codex is the Codex CLI's file: never mix another account's tokens into it.
+  | 'skipped-different-account' | 'skipped-unknown-account';
 
 export interface ProviderAuthState {
   tokens: OAuthTokens;
@@ -245,6 +247,9 @@ export interface WriteTokensOpts {
   /** Default true for 'openai-codex'. Set false to skip the ~/.codex
    *  mirror (e.g. in tests that shouldn't touch the user's home). */
   mirrorCodex?: boolean;
+  /** AUTH1 — when the Codex CLI file belongs to a different account, replace it wholly with this
+   *  login (id_token · account_id · tokens) instead of leaving it. Only on explicit user consent. */
+  replaceDifferentCodexAccount?: boolean;
   /** Explicit ChatGPT claims override. Normally left undefined — for
    *  'openai-codex' with OAuth tokens, saveTokens auto-decodes the
    *  access-token JWT so every refresh site picks up fresh claims
@@ -296,7 +301,10 @@ export function saveTokens(
       ?? (provider === 'openai-codex' ? defaultCodexHome(process.env) : undefined);
     if (home) {
       // loginWithCodex → saveTokens reaches the Codex CLI mirror on each token save.
-      state.codexMirrorResult = mirrorCodexAuth(tokens, state.lastRefresh, join(home, 'auth.json'));
+      state.codexMirrorResult = mirrorCodexAuth(tokens, state.lastRefresh, join(home, 'auth.json'), {
+        knownAccountId: state.chatGPT?.accountId,
+        replaceDifferentAccount: opts.replaceDifferentCodexAccount === true,
+      });
     }
     // ⛔ 이름 계정인데 홈을 모르면 «미러하지 않는다» — 모르는 곳에 토큰을 쓰지 않는다
   }
@@ -377,7 +385,12 @@ export function assertMirrorTargetIsSafeUnderTest(mirrorPath: string): void {
  *  under `oauth.codex-mirror`. ⛔ The 2026-08-05 incident had to be traced by
  *  guessing from the file's `last_refresh` FORMAT, which is deduction, not
  *  observation. Token values are never logged — path + error kind only. */
-function mirrorCodexAuth(tokens: OAuthTokens, lastRefresh: string, mirrorPath: string = codexAuthPath()): CodexMirrorResult {
+function mirrorCodexAuth(
+  tokens: OAuthTokens,
+  lastRefresh: string,
+  mirrorPath: string = codexAuthPath(),
+  account: { knownAccountId?: string; replaceDifferentAccount?: boolean } = {},
+): CodexMirrorResult {
   assertMirrorTargetIsSafeUnderTest(mirrorPath);
   try {
     const path = mirrorPath;
@@ -400,21 +413,45 @@ function mirrorCodexAuth(tokens: OAuthTokens, lastRefresh: string, mirrorPath: s
       && tokens.idToken.length > 0
       && typeof accountId === 'string'
       && accountId.length > 0;
+    // AUTH1 — the file is the Codex CLI's. Same account: rotate tokens as before. Different account
+    // (or ours unknown): leave it untouched unless the user asked to replace it — the old «hasBase»
+    // path kept the file's id_token/account_id and wrote our tokens next to them (two accounts mixed).
+    // Our account: id_token claim → stored claim → the access token's own claim. Refresh responses
+    // carry no id_token, and named rotation accounts keep their CLI homes in sync through this path —
+    // so an unknown account keeps the old rotation behaviour; only «both known and different» is refused.
+    const ourAccount = (typeof accountId === 'string' && accountId) || account.knownAccountId
+      || extractChatGPTClaims(tokens.accessToken)?.accountId || undefined;
+    const baseTokens = (existing.tokens && typeof existing.tokens === 'object') ? existing.tokens as Record<string, unknown> : {};
+    const baseAccount = typeof baseTokens.account_id === 'string' && baseTokens.account_id ? baseTokens.account_id : undefined;
+    let replaceWholly = false;
+    if (hasBase && baseAccount && !ourAccount) debug.log('oauth.codex-mirror', 'account-unknown', { path });
+    if (hasBase && baseAccount && ourAccount) {
+      if (ourAccount !== baseAccount) {
+        if (!account.replaceDifferentAccount || !canCreateUsableMirror) {
+          debug.log('oauth.codex-mirror', 'skipped-different-account', { path, replaceRequested: account.replaceDifferentAccount === true });
+          return 'skipped-different-account';
+        }
+        replaceWholly = true;
+      }
+    }
+
     if (!hasBase && !canCreateUsableMirror) {
       debug.log('oauth.codex-mirror', 'not-created-missing-cli-fields', { path });
       return 'not-created-missing-cli-fields';
     }
 
     mkdirSync(dirname(path), { recursive: true });
+    if (replaceWholly) existing = {};
+    const fresh = !hasBase || replaceWholly;
     const priorTokens = (existing.tokens && typeof existing.tokens === 'object')
       ? existing.tokens as Record<string, unknown> : {};
     existing.tokens = {
       ...priorTokens,
-      ...(hasBase ? {} : { id_token: tokens.idToken, account_id: accountId }),
+      ...(fresh ? { id_token: tokens.idToken, account_id: accountId } : {}),
       access_token: tokens.accessToken,
       refresh_token: tokens.refreshToken,
     };
-    if (!hasBase) {
+    if (fresh) {
       existing.OPENAI_API_KEY = null;
       existing.auth_mode = 'chatgpt';
     }

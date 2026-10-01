@@ -7,6 +7,10 @@
 
 > **élan, and nous** — The red point at the center is *élan* — the drive to move on its own. The three white blades around it are *nous* — the mind that brings order. They turn one way — observe, understand, heal — widening a little with every turn. A spark meets a mind and keeps widening itself. That is Elanous.
 
+**One line in. Merged code out. Watch every decision.**
+
+Four pillars in one body: mission fabric · graph engineering · PTY & browser intelligence · loop agents — on observe, understand, heal.
+
 **A self-healing coding harness where eyes, hands, and memory all turn on
 one sentence — an agent that develops agents.**
 

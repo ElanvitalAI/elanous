@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const documentPath = `${import.meta.dir}/../docs/RESEARCH-graph-promotion-first-live-run-2026-09-08.md`;
 const runId = 'run-16dbf868-4e60-4547-bdab-15a9e6643bee';
@@ -22,7 +25,9 @@ async function measuredRows(): Promise<LedgerRow[]> {
   return all.slice(0, end + 1);
 }
 
-test('research graph promotion record matches the cutoff run-ledger projection', async () => {
+// Requires the 2026-09-08 live run ledger; rerun on a machine with that run's state dir.
+const ledgerPath = join(process.env.ELANOUS_STATE_DIR ?? join(homedir(), '.elanous'), 'run-ledger', `${runId}.jsonl`);
+test.skipIf(!existsSync(ledgerPath))('research graph promotion record matches the cutoff run-ledger projection', async () => {
   const documentText = await Bun.file(documentPath).text();
   const rows = await measuredRows();
   const observedNodes = rows.filter((row) => row.event === 'pipeline-node-entry').map((row) => String(row.data.node));

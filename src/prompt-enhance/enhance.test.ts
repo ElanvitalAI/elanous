@@ -167,7 +167,7 @@ describe('enhance — LLM usage 관측', () => {
         {
           site: 'prompt-enhance', model: 'gpt-5.6-terra',
           inputTokens: 1_000_000, outputTokens: 0,
-          cost: { kind: 'known', model: 'gpt-5.6-terra', usd: 2.5, source: 'catalog', cacheReadPricedAt: 'input-rate', cacheWritePricedAt: 'input-rate' },
+          cost: { kind: 'known', model: 'gpt-5.6-terra', usd: 2, source: 'catalog', cacheReadPricedAt: 'input-rate', cacheWritePricedAt: 'input-rate' },
         },
         {
           site: 'prompt-enhance', model: 'claude-sonnet-4-6',

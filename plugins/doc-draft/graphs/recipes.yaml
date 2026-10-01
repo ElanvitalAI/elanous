@@ -1,0 +1,9 @@
+draft:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" draft'
+  timeout_ms: 120000
+check:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" check'
+  timeout_ms: 30000
+report:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" report'
+  timeout_ms: 30000

@@ -147,6 +147,28 @@ export function fullScreenIO(opts: FullScreenIOOpts = {}): WizardIO {
     out.write(composeFullPaint(spec));
   };
 
+  // OB4(2026-10-01 · 0.2.6 실물): print() 는 «다음 질문 화면»에 묻어 그린다 — 그런데 기기 코드 로그인처럼
+  //   질문 없이 오래 기다리는 구간에선 다음 화면이 오지 않아 코드·URL 이 끝내 안 보이고, 원시 모드라 Ctrl-C 도
+  //   신호가 안 돼 «멈춤»이 됐다. 질문이 없을 때 print 는 곧바로 메시지 화면을 그리고 Ctrl-C 감시를 붙인다.
+  let questionDepth = 0;
+  let idleWatcher: ((chunk: string | Buffer) => void) | null = null;
+  const detachIdleWatcher = (): void => {
+    if (idleWatcher) { inp.off('data', idleWatcher); idleWatcher = null; }
+  };
+  const attachIdleWatcher = (): void => {
+    if (idleWatcher || !inp.isTTY) return;
+    idleWatcher = (chunk) => {
+      const s = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+      if (s.includes('\x03')) handleSigInt();
+    };
+    inp.on('data', idleWatcher);
+  };
+  const inQuestion = async <R>(fn: () => Promise<R>): Promise<R> => {
+    detachIdleWatcher();
+    questionDepth++;
+    try { return await fn(); } finally { questionDepth--; }
+  };
+
   // ── Raw key reader ──────────────────────────────────────────────
   const readKey = (): Promise<MiniKey> =>
     new Promise((resolve) => {
@@ -159,7 +181,12 @@ export function fullScreenIO(opts: FullScreenIOOpts = {}): WizardIO {
     });
 
   // ── choose ─────────────────────────────────────────────────────
-  const choose = async <T>(
+  const choose = <T>(
+    prompt: string,
+    options: ChoiceOption<T>[],
+    opts: ChooseOpts = {},
+  ): Promise<T> => inQuestion(() => chooseInner(prompt, options, opts));
+  const chooseInner = async <T>(
     prompt: string,
     options: ChoiceOption<T>[],
     opts: ChooseOpts = {},
@@ -343,11 +370,11 @@ export function fullScreenIO(opts: FullScreenIOOpts = {}): WizardIO {
 
   // ── ask ────────────────────────────────────────────────────────
   const ask = async (prompt: string): Promise<string> => {
-    return askInternal(prompt, false);
+    return inQuestion(() => askInternal(prompt, false));
   };
 
   const askSecret = async (prompt: string): Promise<string> => {
-    return askInternal(prompt, true);
+    return inQuestion(() => askInternal(prompt, true));
   };
 
   const askInternal = async (prompt: string, mask: boolean): Promise<string> => {
@@ -407,6 +434,10 @@ export function fullScreenIO(opts: FullScreenIOOpts = {}): WizardIO {
     // box — the wizard frame already contains the same info.
     if (isBannerLine(text)) return;
     messages.push({ text, kind: 'plain' });
+    if (questionDepth === 0) {
+      paint(buildScreenSpec({ kind: 'message', lines: [] }, 'Ctrl-C cancel'));
+      attachIdleWatcher();
+    }
   };
 
   return {
@@ -414,6 +445,7 @@ export function fullScreenIO(opts: FullScreenIOOpts = {}): WizardIO {
     askSecret,
     print,
     close: () => {
+      detachIdleWatcher();
       exitRaw();
       // Final clear so any leftover screen does not interfere with
       // the post-wizard CLI banner / dashboard.

@@ -214,3 +214,27 @@ test('existing name refuses before codex without overwriting', async () => {
   await expect(makePlugin({ request: 'anything', name: 'taken', parentDir: parent, deps: { codex: async () => { calls++; } } })).rejects.toThrow('already exists');
   expect(calls).toBe(0);
 });
+
+test('codexWrite leaves no run debris a fresh plugin cannot be installed with', async () => {
+  const { chmodSync, existsSync: exists, mkdtempSync: mkd, mkdirSync: mkdir, readdirSync: ls, rmSync: rm, writeFileSync: write } = await import('node:fs');
+  const { tmpdir: tmp } = await import('node:os');
+  const { join: j } = await import('node:path');
+  const { codexWrite } = await import('./plugin-maker.js');
+  const root = mkd(j(tmp(), 'codex-debris-'));
+  const fake = j(root, 'fake-codex');
+  // Stands in for codex: writes the requested file, the -o message, and the debug tree an elanous child leaves in cwd.
+  write(fake, `#!/bin/sh
+out=""; prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+echo done > "$out"; echo node > nodes.yaml
+mkdir -p .elanous/debug && echo log > .elanous/debug/debug-1.log && ln -sf "$PWD/.elanous/debug/debug-1.log" .elanous/debug/latest
+`);
+  chmodSync(fake, 0o755);
+  try {
+    const fresh = j(root, 'fresh'); mkdir(fresh);
+    await codexWrite(fresh, 'write a node', fake);
+    expect(ls(fresh).sort()).toEqual(['nodes.yaml']);
+    const kept = j(root, 'kept'); mkdir(j(kept, '.elanous'), { recursive: true }); write(j(kept, '.elanous', 'mine.txt'), 'x');
+    await codexWrite(kept, 'write a node', fake);
+    expect(exists(j(kept, '.elanous', 'mine.txt'))).toBe(true);
+  } finally { rm(root, { recursive: true, force: true }); }
+});

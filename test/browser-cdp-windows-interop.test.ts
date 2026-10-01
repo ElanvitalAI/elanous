@@ -10,13 +10,20 @@ const WINDOWS_WSL_CANDIDATES = [
 ];
 
 describe('Windows browser discovery from WSL', () => {
-  test('uses exactly the four Windows Edge and Chrome candidates in their defined order', () => {
+  test('prefers Linux Chrome in WSL, then checks Windows Edge and Chrome candidates in order', () => {
+    const linuxCandidates = [
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium',
+      '/usr/bin/chromium-browser',
+      '/snap/bin/chromium',
+    ];
     for (const expected of WINDOWS_WSL_CANDIDATES) {
       expect(discoverChromeBinary({
         env: {},
         platform: 'linux',
         readFile: (path) => path === '/proc/version' ? 'Linux version 5.15.0-Microsoft-standard-WSL2' : null,
-        existsSync: (path) => path === expected || path === '/usr/bin/google-chrome',
+        existsSync: (path) => path === expected,
       })).toBe(expected);
     }
 
@@ -30,7 +37,19 @@ describe('Windows browser discovery from WSL', () => {
         return path === '/usr/bin/google-chrome';
       },
     })).toBe('/usr/bin/google-chrome');
-    expect(inspected).toEqual([...WINDOWS_WSL_CANDIDATES, '/usr/bin/google-chrome']);
+    expect(inspected).toEqual(['/usr/bin/google-chrome']);
+
+    inspected.length = 0;
+    expect(discoverChromeBinary({
+      env: {},
+      platform: 'linux',
+      readFile: () => 'Linux version 5.15.0-microsoft-standard-WSL2',
+      existsSync: (path) => {
+        inspected.push(path);
+        return false;
+      },
+    })).toBeNull();
+    expect(inspected).toEqual([...linuxCandidates, ...WINDOWS_WSL_CANDIDATES]);
   });
 
   test('does not inspect Windows candidates outside Windows interop', () => {

@@ -32,3 +32,26 @@ describe('graphSignature — 같은 구조면 다시 배치하지 않는다', ()
     expect(graphSignature([n('a')], [{ source: 'a', target: 'a2', kind: 'contains' }])).not.toBe(base);
   });
 });
+
+describe('포커스 줌 — 선택한 노드로 부드럽게', () => {
+  test('focusTransform 은 그 노드를 화면 가운데에 놓는다', async () => {
+    const { focusTransform } = await import('./TraceGraph');
+    const t = focusTransform({ x: 100, y: 50 }, 800, 600, 2);
+    expect(100 * t.k + t.x).toBe(400);
+    expect(50 * t.k + t.y).toBe(300);
+  });
+  test('lerpTransform 은 양 끝이 같고 배율은 기하로 옮긴다', async () => {
+    const { lerpTransform, focusTransform } = await import('./TraceGraph');
+    const a = focusTransform({ x: 0, y: 0 }, 800, 600, 1);
+    const b = focusTransform({ x: 200, y: 100 }, 800, 600, 4);
+    const at0 = lerpTransform(a, b, 0, 800, 600); const at1 = lerpTransform(a, b, 1, 800, 600);
+    expect(at0).toEqual(a);
+    expect(at1.k).toBeCloseTo(4); expect(at1.x).toBeCloseTo(b.x); expect(at1.y).toBeCloseTo(b.y);
+    expect(lerpTransform(a, b, 0.5, 800, 600).k).toBeCloseTo(2);
+  });
+  test('easeInOutCubic 은 0·½·1 을 지난다 · focusScale 은 1.2~3.5', async () => {
+    const { easeInOutCubic, focusScale } = await import('./TraceGraph');
+    expect(easeInOutCubic(0)).toBe(0); expect(easeInOutCubic(0.5)).toBe(0.5); expect(easeInOutCubic(1)).toBe(1);
+    expect(focusScale(0.2)).toBe(1.2); expect(focusScale(1)).toBe(2.4); expect(focusScale(3)).toBe(3.5);
+  });
+});

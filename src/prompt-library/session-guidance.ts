@@ -115,9 +115,15 @@ export function buildSessionGuidanceAddendum(
   }
 
   if (items.length === 0) return [];
+  // B4 — 파일 수 규칙. 명령을 실제로 돌릴 도구(Bash·PtyShellStart·WebTerminal*)가 있을 때만 `git ls-files` 로 세라고 하고,
+  // Read 만 켜진 세션에선 셀 수 없으니 추측하지 말고 확인 불가라고 답하게 한다(EVAL q09 «959» vs 실측 778 · 리뷰 3라운드 must-fix).
+  const canRunCommands = enabledTools.some(name => /^(Bash|PtyShellStart|WebTerminal)/.test(name));
+  const fileCountRule = canRunCommands
+    ? '저장소의 파일 수·목록은 저장소 루트에서 `git ls-files <경로>`로 추적 파일 기준으로 센다 — 하위 디렉터리에서 실행 중이면 저장소 루트로 이동해서 세고, 다른 기준이면 그 기준을 답에 적는다.'
+    : '이 세션에는 명령을 실행할 도구가 없다 — 저장소의 파일 수는 추측하지 말고 «이 모드에서는 셀 수 없다»고 답한다(도구로 센 목록이 대화에 있으면 그 기준을 밝히고 쓴다).';
   return [{
     role: 'system',
-    content: '# Session-specific guidance\n\n' +
+    content: `${fileCountRule}\n\n` + '# Session-specific guidance\n\n' +
       items.map(s => `- ${s}`).join('\n'),
   }];
 }

@@ -4,12 +4,14 @@ export type PwaRole = 'owner' | 'contributor' | 'general';
 export const PWA_ROLE_KEY = 'elanous.pwa.role';
 export const PWA_ROLE_EVENT = 'elanous:pwa-role';
 
+/** MAT2 — a device that never picked a role sees only stable screens (대표 «완성도 낮은 것은 노출하지 않는다»).
+ *  The owner picks «오너» once in /setup → 화면 역할; that choice is stored on this device. */
 export function readPwaRole(): PwaRole {
   try {
     const value = window.localStorage.getItem(PWA_ROLE_KEY);
-    if (value === 'general' || value === 'contributor') return value;
+    if (value === 'owner' || value === 'contributor' || value === 'general') return value;
   } catch { /* Storage can be unavailable. */ }
-  return 'owner';
+  return 'general';
 }
 
 export function writePwaRole(role: PwaRole): void {
@@ -31,5 +33,5 @@ function subscribeRole(onChange: () => void): () => void {
 }
 
 export function usePwaRole(): PwaRole {
-  return useSyncExternalStore(subscribeRole, readPwaRole, () => 'owner');
+  return useSyncExternalStore(subscribeRole, readPwaRole, () => 'general');
 }

@@ -1,4 +1,5 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 type Data = Record<string, unknown>;
@@ -22,9 +23,18 @@ const engines = input.engines === undefined ? ['openai-codex', 'grok'] : strings
 if (!engines.length || engines.length > 3 || engines.length !== new Set(engines).size || (input.engines !== undefined && (!Array.isArray(input.engines) || strings(input.engines).length !== input.engines.length))) throw new Error('engines must contain 1 to 3 distinct names');
 const cli = process.env.GEO_CHECK_ELANOUS_BIN || 'elanous';
 
+// Ask from an empty folder: run inside a brand's own repository, `elanous ask` carries that project's
+// context (AGENTS.md and the like) and the answers «know» the brand — a marketer's folder inflated mentions 0/10 → 9/10.
+const neutralDir = mkdtempSync(join(tmpdir(), 'geo-check-'));
+function neutralEnv(engine?: string): Record<string, string | undefined> {
+  const { ELANOUS_TOOL_CWD: _tool, ...rest } = process.env;
+  return { ...rest, PWD: neutralDir, ...(engine ? { ELANOUS_LLM_PROVIDER: engine } : {}) };
+}
+
 async function invoke(args: string[], engine?: string): Promise<unknown> {
   const proc = Bun.spawn([cli, ...args], {
-    env: { ...process.env, ...(engine ? { ELANOUS_LLM_PROVIDER: engine } : {}) },
+    cwd: neutralDir,
+    env: neutralEnv(engine),
     stdout: 'pipe', stderr: 'pipe',
   });
   const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
@@ -32,6 +42,14 @@ async function invoke(args: string[], engine?: string): Promise<unknown> {
   const last = stdout.trim().split('\n').at(-1);
   if (!last) throw new Error('CLI returned no JSON');
   return JSON.parse(last) as unknown;
+}
+// An installed elanous older than `ask --bare` rejects the flag; ask the plain way and mark the row so the report can say so.
+async function askEngine(question: string, engine: string): Promise<{ answer: string; bare: boolean }> {
+  try { return { answer: reply(await invoke(['ask', '--bare', '--json', question], engine)), bare: true }; }
+  catch (e) {
+    if (!/unknown option '--bare'/.test(errorLine(e))) throw e;
+    return { answer: reply(await invoke(['ask', '--json', question], engine)), bare: false };
+  }
 }
 function reply(raw: unknown): string {
   const result = object(raw);
@@ -105,7 +123,10 @@ async function run(step: string): Promise<void> {
     const answers: Data[] = [];
     let failures = 0;
     for (const question of questions) for (const engine of engines) {
-      try { answers.push({ question, engine, answer: reply(await invoke(['ask', '--json', question], engine)) }); }
+      try {
+        const { answer, bare } = await askEngine(question, engine);
+        answers.push({ question, engine, answer, ...(bare ? {} : { bare: false }) });
+      }
       catch (e) { failures++; answers.push({ question, engine, error: errorLine(e) }); }
     }
     output({ answers, outcome: failures === answers.length ? 'fail' : 'ok' }, answers.length, failures);

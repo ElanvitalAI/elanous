@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
+import { CliUserError } from '../cli/cli-user-error.js';
 import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
 
 const roots: string[] = [];
@@ -11,6 +12,27 @@ function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checkl
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  test('입력 오류 여덟 곳은 문구를 보존하고 이미/없는 칸에만 hint를 제공한다', () => {
+    root();
+    const expectInputError = (run: () => unknown, message: string, hint?: string) => {
+      let caught: unknown;
+      try { run(); } catch (error) { caught = error; }
+      expect(caught).toBeInstanceOf(CliUserError);
+      expect((caught as CliUserError).message).toBe(message);
+      expect((caught as CliUserError).hint).toBe(hint);
+    };
+    expectInputError(() => listChecklist('bad'), '체크리스트 판이 아니다: bad');
+    expectInputError(() => addItem('9.9.9', { id: ' ', title: 'title' }), '칸 id 가 비었다');
+    expectInputError(() => addItem('9.9.9', { id: 'K1', title: ' ' }), '칸 제목이 비었다');
+    addItem('9.9.9', { id: 'K1', title: 'first' });
+    expectInputError(() => addItem('9.9.9', { id: 'K1', title: 'again' }), '이미 있는 칸: K1', 'set <id> 로 고친다');
+    expectInputError(() => setItem('9.9.9', 'absent', { status: 'red' }, 'T'), '없는 칸: absent', 'list 로 칸 목록을 본다');
+    expectInputError(() => setItem('9.9.9', 'K1', { status: 'invalid' as 'red' }, 'T'), '잘못된 상태: invalid');
+    expectInputError(() => setItem('9.9.9', 'K1', { disposition: 'invalid' as 'move' }, 'T'), '잘못된 처분: invalid');
+    expectInputError(() => removeItem('9.9.9', 'absent', 'T'), '없는 칸: absent', 'list 로 칸 목록을 본다');
+    expect(listChecklist('9.9.9').items.map((item) => item.id)).toEqual(['K1']);
+  });
+
   test('실물 로드맵 씨앗: K 전체·첫 이모지·K4 변경과 재씨앗 불변', () => {
     const dir = root();
     const markdown = readFileSync(join(import.meta.dir, '..', '..', 'docs/ROADMAP-releases-0.2.5-and-0.2.6-2026-09-29.md'), 'utf8');

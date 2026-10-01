@@ -1,0 +1,14 @@
+graph_id: doc-draft
+version: 1
+entry_node: draft
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: draft, kind: agent, recipe: 'cmd:draft', max_visits: 1 }
+  - { node_id: check, kind: agent, recipe: 'cmd:check', max_visits: 1 }
+  - { node_id: report, kind: agent, recipe: 'cmd:report', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: draft, on: outcome, map: { ok: check, fail: failed } }
+  - { from: check, on: outcome, map: { ok: report, fail: failed } }
+  - { from: report, on: outcome, map: { ok: done, fail: failed } }

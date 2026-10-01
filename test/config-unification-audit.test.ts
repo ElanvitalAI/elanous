@@ -47,13 +47,20 @@ function* walkTs(dir: string, base: string): Iterable<{ rel: string; abs: string
     const s = statSync(abs);
     if (s.isDirectory()) {
       yield* walkTs(abs, rel);
-    } else if (entry.endsWith('.ts') && !entry.endsWith('.d.ts')) {
+    } else if (entry.endsWith('.ts') && !entry.endsWith('.d.ts') && !entry.endsWith('.test.ts')) {
       yield { rel: `src/${rel}`, abs };
     }
   }
 }
 
 describe('Phase 5 · consumer audit · grep guard', () => {
+  test('scans production TypeScript but not test fixtures containing legacy paths', () => {
+    const scanned = [...walkTs(SRC_ROOT, '')].map(({ rel }) => rel);
+    expect(scanned).toContain('src/user-config.ts');
+    expect(scanned).not.toContain('src/version/code-revision.test.ts');
+    expect(scanned.every((rel) => !rel.endsWith('.test.ts'))).toBe(true);
+  });
+
   test('production code has no `~/.config/elanous/{config,policy,budget}` literals outside legacy migrate helpers', () => {
     const offenders: string[] = [];
     for (const { rel, abs } of walkTs(SRC_ROOT, '')) {

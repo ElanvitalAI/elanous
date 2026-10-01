@@ -13,6 +13,8 @@ import {
 } from './codex-account.js';
 import { authStorePath, defaultCodexHome, listProviders, loadTokens, saveTokens } from './store.js';
 import { readFreshAvailabilityState, quotaSignalDir, readQuotaSignal, readQuotaSignalCredits, readQuotaSignalUsedPercent, readQuotaSignalObservedAt, readQuotaSignalObservedAtRaw } from '../budget/codex-reset-credit-state.js';
+import { creditPaceStatus } from '../budget/codex-credit-pace.js';
+import { loadLlmPolicy } from '../policy/llm-policy.js';
 import { getUserConfig } from '../user-config.js';
 import {
   decideCodexRotation, observeRotation, applyRotation, readCodexAccountRotationConfig, rotatedChildEnv,
@@ -278,6 +280,13 @@ function buildRotationCandidates(path: string, now: number, env: NodeJS.ProcessE
     .filter((c): c is RotationCandidate => c !== null);
 }
 
+function rotationCreditPace(candidates: readonly RotationCandidate[], now: number) {
+  const policy = loadLlmPolicy({ now: new Date(now) }).policy;
+  const balances = Object.fromEntries(candidates.filter((c) => c.creditBalance !== undefined)
+    .map((c) => [c.name, c.creditBalance!]));
+  return creditPaceStatus({ policy, balances, now: new Date(now) });
+}
+
 function formatUsedPercent(value: number | undefined): string {
   return value === undefined ? 'unknown' : `${value}%`;
 }
@@ -517,7 +526,7 @@ export function inspectCodexRotation(
   const rawThreshold = rotationThresholdFromConfig();
   const thresholdPercentByAccount = rotationThresholdsByAccountFromConfig();
   const decision = decideCodexRotation({
-    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, creditsAllowed: codexCreditsAllowedFromConfig(), ...currentCredits, candidates,
+    current, explicit, enabled, disabledProvenance: rotationConfig.state, currentReached, currentUsedPercent, accountOrder: accountOrderFromConfig(), resetCreditAvailability: resetCreditAvailability(currentHome, now), thresholdPercent: rawThreshold, thresholdPercentByAccount, creditsAllowed: codexCreditsAllowedFromConfig(), ...currentCredits, candidates, creditPace: rotationCreditPace(candidates, now),
   });
   // ⛔⭐ 나이는 «만료돼도» 낸다 — 「65분 전」과 「3일 전」은 다른 진단이다(리뷰 must-fix).
   const observedAtByHome: Record<string, number> = {};
@@ -603,6 +612,7 @@ export function resolveCodexAccountForRun(
   const candidates = buildRotationCandidates(path, now, env);
   const currentSignalAttributable = signalAttributableToAccount(currentHomeInfo);
 
+  const creditPace = rotationCreditPace(candidates, now);
   const decision = decideCodexRotation({
     current,
     explicit,
@@ -617,6 +627,13 @@ export function resolveCodexAccountForRun(
     creditsAllowed: codexCreditsAllowedFromConfig(),
     ...currentCreditsInput(currentSignalAttributable ? currentHome : undefined, now),
     candidates,
+    creditPace,
+  });
+  debug.log('codex.rotation', 'credit-pace', {
+    active: creditPace.active,
+    todaySpent: creditPace.todaySpent,
+    target: creditPace.target,
+    to: decision.reason === 'credit-pace' ? decision.to?.name ?? current.name : decision.to?.name,
   });
   observeRotation(decision, current.name);
   const resolved = applyRotation(current, decision);
@@ -726,7 +743,7 @@ export function resolveRunFallback(
   try {
     const snapshot = inspectCodexRotation(env, deps.storePath ? { storePath: deps.storePath } : {});
     let rotation: RotationOutcome;
-    if ((snapshot.reason === 'rotated' || snapshot.reason === 'reset-credit-unknown') && snapshot.to) {
+    if ((snapshot.reason === 'rotated' || snapshot.reason === 'reset-credit-unknown' || snapshot.reason === 'credit-pace') && snapshot.to) {
       // ⛔ 스냅샷은 이름만 준다 — 후보 목록에서 «그 객체»를 되찾는다(홈까지 필요하다).
       const to = snapshot.candidates.find((c) => c.name === snapshot.to);
       rotation = to ? { reason: snapshot.reason, to } : { reason: 'no-candidate' };
@@ -734,6 +751,7 @@ export function resolveRunFallback(
       snapshot.reason === 'explicit'
       || snapshot.reason === 'disabled'
       || snapshot.reason === 'not-reached'
+      || snapshot.reason === 'credit-pace'
       || snapshot.reason === 'reset-credit-available'
       || snapshot.reason === 'no-candidate'
     ) {

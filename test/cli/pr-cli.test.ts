@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import { Command } from 'commander';
 import { debug } from '../../src/debug/log.js';
 import { setGitCommandRunnerForTesting } from '../../src/git-fs/runner.js';
-import { parseNumstat, parsePorcelainStatus, registerPrCommands, runPrGranularity, runPrLand, decideOverlapLanding, overlapDecisionFromConfirm, publicLeakWarning, docsCliWarning, publicDocPaths, OVERLAP_DECISION_PROMPT, createOverlapConfirmChannel, formatCommitMessageFallbackNotice, formatLandReasonNotice, codePointLength, branchLineageSlug, findSiblingPrs } from '../../src/cli/pr-cli.js';
+import { parseNumstat, parsePorcelainStatus, registerPrCommands, runPrGranularity, runPrLand, decideOverlapLanding, overlapDecisionFromConfirm, publicLeakWarning, exportLeakBlock, runPrLandExportLeakCheck, docsCliWarning, publicDocPaths, OVERLAP_DECISION_PROMPT, createOverlapConfirmChannel, formatCommitMessageFallbackNotice, formatLandReasonNotice, codePointLength, branchLineageSlug, findSiblingPrs } from '../../src/cli/pr-cli.js';
 import type { ConfirmOpts, ConfirmResult } from '../../src/hitl/confirm.js';
 import { LANDING_HISTORY_META_MARK, TOP_PREFIX_COUNT_LIMIT } from '../../src/cli/pr-granularity.js';
 import type { CmdRunner, FindPrForBranchOutcome, MergePrOutcome, PrManager, UpsertPrInput, UpsertPrOutcome } from '../../src/autopilot/pr-manager.js';
@@ -64,6 +64,7 @@ const baseDeps = {
   currentBranch: () => 'feat/land', resolveBase: () => 'origin/main', run: baseLookupRun, listUnfinishedRuns: () => [] as const,
   queryRunningRuns: () => runningRuns([]), runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true, runDaemonPortGate: () => true,
   runPublicLeakGate: () => 0,
+  runExportLeakCheck: () => ({ measured: true, hits: [] }),
   isInteractive: () => false,
 };
 
@@ -2489,3 +2490,50 @@ describe('pr land — ungrounded-plan-artifacts 경고 배선', () => {
     expect(said).toContain('untracked-files');
   });
 });
+
+describe('public-export-leak at landing (LEAK1)', () => {
+  const io = () => { const log: string[] = []; const error: string[] = []; return { log, error, out: { log: (m: string) => log.push(m), error: (m: string) => error.push(m) } }; };
+  const hit = { file: 'src/a.test.ts', line: 3, marker: 'ceo-mark' };
+
+  it('a changed file that would leak after the export transforms stops the landing', () => {
+    const o = io();
+    expect(exportLeakBlock(['src/a.test.ts'], () => ({ measured: true, hits: [hit] }), false, o.out)).toBe(false);
+    expect(o.error.join('\n')).toContain('src/a.test.ts:3  ceo-mark');
+    expect(o.error.join('\n')).toContain('--allow-public-leak');
+  });
+
+  it('--allow-public-leak lands with a warning; no hits and «could not measure» both land', () => {
+    const allowed = io();
+    expect(exportLeakBlock(['src/a.test.ts'], () => ({ measured: true, hits: [hit] }), true, allowed.out)).toBe(true);
+    expect(allowed.error).toEqual([]);
+    expect(allowed.log.join('\n')).toContain('src/a.test.ts:3  ceo-mark');
+    const clean = io();
+    expect(exportLeakBlock(['src/a.ts'], () => ({ measured: true, hits: [] }), false, clean.out)).toBe(true);
+    expect(clean.log[0]).toContain('✓ public-export-leak');
+    const unmeasured = io();
+    expect(exportLeakBlock(['src/a.ts'], () => { throw new Error('boom'); }, false, unmeasured.out)).toBe(true);
+    expect(unmeasured.log[0]).toContain('못 쟀다(boom)');
+    const none = io();
+    expect(exportLeakBlock([], () => { throw new Error('must not run'); }, false, none.out)).toBe(true);
+  });
+
+  it('runPrLand returns 1 before upsert when the check finds a leak', async () => {
+    const { manager, calls } = fakeManager();
+    const o = io();
+    const code = await runPrLand({ title: 't', body: 'b' }, {
+      ...baseDeps, manager, out: o.out,
+      run: (cmd: string, args: readonly string[]) => (cmd === 'git' && args[0] === 'diff' ? { ok: true, out: 'src/a.test.ts\n' } : baseLookupRun(cmd, args)),
+      runExportLeakCheck: () => ({ measured: true, hits: [hit] }),
+    } as never);
+    expect(code).toBe(1);
+    expect(o.error.join('\n')).toContain('✗ public-export-leak');
+    expect(calls).not.toContain('upsert');
+    expect(calls).not.toContain('merge');
+  });
+
+  it('the real check measures this repository (a clean exported file has no hits)', () => {
+    const r = runPrLandExportLeakCheck(['src/cli/pr-cli.ts'], process.cwd());
+    expect(r).toEqual({ measured: true, hits: [] });
+  }, 180_000);
+});
+

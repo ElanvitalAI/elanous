@@ -31,8 +31,8 @@ const cap = (sd: ReturnType<typeof sdb>, type: string, text: string, importance 
   });
 
 // surface_events taste.capture → knowledge.db taste 벡터 시드.
-async function seed(sd: ReturnType<typeof sdb>, kd: ReturnType<typeof kdb>) {
-  await syncTasteVectors({ surfaceDb: sd, knowledgeDb: kd, embed: fakeEmbed });
+async function seed(sd: ReturnType<typeof sdb>, kd: ReturnType<typeof kdb>, nowMs?: number) {
+  await syncTasteVectors({ surfaceDb: sd, knowledgeDb: kd, embed: fakeEmbed, nowMs });
 }
 
 const onCfg = () => setUserConfigOverlay((c) => ({ ...c, taste: { captureEnabled: true, proposeEnabled: true } }));
@@ -160,7 +160,7 @@ describe('runProposalGate — 제안+각인 오케스트레이터', () => {
     const capturedAt = new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000);
     cap(sd, 'recurring_topic', '투자 전략', 5, capturedAt);
     cap(sd, 'recurring_topic', '투자 포트폴리오', 5, capturedAt);
-    await seed(sd, kd);
+    await seed(sd, kd, now.getTime());
     const p = runProposalGate({ knowledgeDb: kd, surfaceDb: sd, now, threshold: 0.5 });
     expect(p.length).toBeGreaterThanOrEqual(1);
     expect(queryEvents(sd, { category: 'taste.propose' }).length).toBeGreaterThanOrEqual(1);

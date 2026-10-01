@@ -311,7 +311,7 @@ describe('harness worktree add', () => {
   test('CLI emits structured creation data, persists owner metadata, and rejects a duplicate branch', () => {
     const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
     const cli = join(projectRoot, 'bin', 'elanous.mjs');
-    const first = spawnSync('bun', [cli, '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/cli', '--base', 'HEAD', '--owner', 'cli-session', '--json'], { cwd: repo, encoding: 'utf8' });
+    const first = spawnSync('bun', [cli, '--test', '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/cli', '--base', 'HEAD', '--owner', 'cli-session', '--json'], { cwd: repo, encoding: 'utf8' });
     expect(first.status).toBe(0);
     const created = JSON.parse(first.stdout) as { path: string; branch: string; resolvedBase: string; baseFreshness: string; owner: string; command: string; createdAt: string };
     expect(created.path).toMatch(/^\//);
@@ -324,7 +324,7 @@ describe('harness worktree add', () => {
     expect(spawnSync('git', ['config', '--worktree', '--get', 'elanous.harness.owner'], { cwd: created.path, encoding: 'utf8' }).stdout.trim()).toBe('cli-session');
     expect(spawnSync('git', ['status', '--porcelain'], { cwd: created.path, encoding: 'utf8' }).stdout).toBe('');
 
-    const duplicate = spawnSync('bun', [cli, '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/cli'], { cwd: repo, encoding: 'utf8' });
+    const duplicate = spawnSync('bun', [cli, '--test', '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/cli'], { cwd: repo, encoding: 'utf8' });
     expect(duplicate.status).not.toBe(0);
     expect(duplicate.stderr + duplicate.stdout).toContain('already used by worktree');
     expect(duplicate.stderr + duplicate.stdout).toContain(created.path);
@@ -333,7 +333,7 @@ describe('harness worktree add', () => {
   test('CLI prints non-JSON creation fields instead of succeeding silently', () => {
     const projectRoot = dirname(dirname(fileURLToPath(import.meta.url)));
     const cli = join(projectRoot, 'bin', 'elanous.mjs');
-    const result = spawnSync('bun', [cli, '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/text'], { cwd: repo, encoding: 'utf8' });
+    const result = spawnSync('bun', [cli, '--test', '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/text'], { cwd: repo, encoding: 'utf8' });
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('path: ');
     expect(result.stdout).toContain('branch: feature/text');
@@ -346,7 +346,7 @@ describe('harness worktree add', () => {
     const cli = join(projectRoot, 'bin', 'elanous.mjs');
     const nested = join(repo, 'nested', 'directory');
     mkdirSync(nested, { recursive: true });
-    const fromNested = spawnSync('bun', [cli, '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/nested', '--json'], { cwd: nested, encoding: 'utf8' });
+    const fromNested = spawnSync('bun', [cli, '--test', '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/nested', '--json'], { cwd: nested, encoding: 'utf8' });
     expect(fromNested.status).toBe(0);
     expect(JSON.parse(fromNested.stdout).path).toBe(join(worktreeParentDir(repo, join(root, 'worktrees')), 'feature-nested'));
 
@@ -359,14 +359,14 @@ describe('harness worktree add', () => {
     const linkedHead = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: linked, encoding: 'utf8' }).stdout.trim();
     expect(linkedHead).not.toBe(mainHead);
 
-    const fromLinked = spawnSync('bun', [cli, '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/from-linked', '--json'], { cwd: linked, encoding: 'utf8' });
+    const fromLinked = spawnSync('bun', [cli, '--test', '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/from-linked', '--json'], { cwd: linked, encoding: 'utf8' });
     expect(fromLinked.status).toBe(0);
     const linkedCreated = JSON.parse(fromLinked.stdout) as { path: string; resolvedBase: string };
     expect(linkedCreated.path).toBe(join(worktreeParentDir(repo, join(root, 'worktrees')), 'feature-from-linked'));
     expect(linkedCreated.resolvedBase).toBe(linkedHead);
     expect(spawnSync('git', ['rev-parse', 'HEAD'], { cwd: linkedCreated.path, encoding: 'utf8' }).stdout.trim()).toBe(linkedHead);
 
-    const explicit = spawnSync('bun', [cli, '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/explicit-main', '--base', mainHead, '--json'], { cwd: linked, encoding: 'utf8' });
+    const explicit = spawnSync('bun', [cli, '--test', '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/explicit-main', '--base', mainHead, '--json'], { cwd: linked, encoding: 'utf8' });
     expect(explicit.status).toBe(0);
     expect((JSON.parse(explicit.stdout) as { resolvedBase: string }).resolvedBase).toBe(mainHead);
   }, 15_000);
@@ -379,7 +379,7 @@ describe('harness worktree add', () => {
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     writeFileSync(join(hookDir, 'git'), `#!/bin/sh\nif [ "$1" = "config" ] && [ "$2" = "extensions.worktreeConfig" ]; then echo owner-config-failed >&2; exit 41; fi\nexec "${realGit}" "$@"\n`);
     spawnSync('chmod', ['+x', join(hookDir, 'git')]);
-    const failed = spawnSync('bun', [cli, '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/rollback', '--owner', 'session-fail'], {
+    const failed = spawnSync('bun', [cli, '--test', '--config-dir', join(root, 'config'), 'harness', 'worktree', 'add', 'feature/rollback', '--owner', 'session-fail'], {
       cwd: repo,
       encoding: 'utf8',
       env: { ...process.env, PATH: `${hookDir}:${process.env.PATH}` },

@@ -18,7 +18,7 @@ describe('runDaemonPromptTurn', () => {
       };
     });
     const history = new DaemonSessionHistory();
-    const result = await runDaemonPromptTurn({
+    const result = await runDaemonPromptTurn({ fastPathEnabled: false,
       history,
       request: {
         sessionId: 'sess-1',
@@ -434,7 +434,7 @@ describe('runDaemonPromptTurn', () => {
       return { stopReason: 'end_turn', finalText: 'ok' };
     });
     const history = new DaemonSessionHistory();
-    await runDaemonPromptTurn({
+    await runDaemonPromptTurn({ fastPathEnabled: false,
       history,
       request: {
         sessionId: 'sess-none',

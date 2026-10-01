@@ -62,14 +62,33 @@ export interface CodexSetupResult {
 
 // ── Picker helpers (shared with onboarding) ──────────────────────────
 
-export async function pickCodexAuthMode(io: WizardIO): Promise<CodexAuthMode> {
-  const existing = loadTokens('openai-codex');
-  if (existing) {
-    const exp = existing.tokens.expiresAt;
-    const when = exp != null
-      ? (Date.now() > exp ? 'EXPIRED' : `${Math.round((exp - Date.now()) / 60000)}min left`)
-      : 'no expiry tracked';
-    io.print(`  OAuth tokens already on file (${when}).`);
+export interface CodexAuthModeDeps {
+  loadTokens?: typeof loadTokens;
+  /** OB1 — a codex CLI login (~/.codex/auth.json) the runtime already uses; default = `inspectSubscription`. */
+  hasCodexCliLogin?: () => boolean;
+}
+
+export async function pickCodexAuthMode(io: WizardIO, deps: CodexAuthModeDeps = {}): Promise<CodexAuthMode> {
+  const existing = (deps.loadTokens ?? loadTokens)('openai-codex');
+  // OB1 (10-01): a user already signed in to the codex CLI was sent through the device-code flow again,
+  // because only elanous's own token store counted. The runtime reads ~/.codex/auth.json, so it counts too.
+  // Same judgment as the runtime (`codexOAuthAvailable` in llm.ts) — two judgments drifting apart was the bug.
+  const codexCli = !existing && (deps.hasCodexCliLogin ?? (() => {
+    try {
+      const { codexOAuthAvailable } = require('../llm.js') as typeof import('../llm.js');
+      return codexOAuthAvailable();
+    } catch { return false; }
+  }))();
+  if (existing || codexCli) {
+    if (existing) {
+      const exp = existing.tokens.expiresAt;
+      const when = exp != null
+        ? (Date.now() > exp ? 'EXPIRED' : `${Math.round((exp - Date.now()) / 60000)}min left`)
+        : 'no expiry tracked';
+      io.print(`  OAuth tokens already on file (${when}).`);
+    } else {
+      io.print('  Found your ChatGPT/Codex login from the codex CLI (~/.codex/auth.json).');
+    }
     // Sprint 11 — chooseFrom Yes/No so fullScreenIO renders the arrow
     // picker (with 'y'/'n' + 한글 자모 quick-pick from PR #986 + #988)
     // instead of a bare text input. The runner distinguishes 'oauth-keep'

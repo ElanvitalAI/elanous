@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { debug } from '../debug/log.js';
 import { releaseLedgerRoot } from '../instance/resolve.js';
+import { CliUserError } from '../cli/cli-user-error.js';
 
 export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done';
 export type ChecklistDisposition = 'move' | 'known-issue' | 'block';
@@ -54,7 +55,7 @@ function releasedVersion(): string {
 }
 
 function pathFor(v: string): string {
-  if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(v)) throw new Error(`체크리스트 판이 아니다: ${v}`);
+  if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(v)) throw new CliUserError(`체크리스트 판이 아니다: ${v}`);
   return join(releaseLedgerRoot(), 'release', v, 'checklist.json');
 }
 
@@ -110,10 +111,10 @@ function change(data: Checklist, id: string, field: string, from: unknown, to: u
 function refresh(data: Checklist): void { data.released = releasedVersion(); data.dev = devVersion(); }
 
 export function addItem(v: string, input: { id: string; title: string; owner?: string }): Checklist {
-  if (!input.id.trim()) throw new Error('칸 id 가 비었다');
-  if (!input.title.trim()) throw new Error('칸 제목이 비었다');
+  if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
+  if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   return mutate(v, (data) => {
-    if (data.items.some((item) => item.id === input.id)) throw new Error(`이미 있는 칸: ${input.id}`);
+    if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
     const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), updatedAt: at, updatedBy: by };
@@ -126,9 +127,9 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
 export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition }, by: string): Checklist {
   return mutate(v, (data) => {
     const item = data.items.find((i) => i.id === id);
-    if (!item) throw new Error(`없는 칸: ${id}`);
-    if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new Error(`잘못된 상태: ${patch.status}`);
-    if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new Error(`잘못된 처분: ${patch.disposition}`);
+    if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
+    if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
+    if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
     const fields = (['evidence', 'owner', 'status', 'disposition'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
@@ -147,7 +148,7 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
 export function removeItem(v: string, id: string, by: string): Checklist {
   return mutate(v, (data) => {
     const index = data.items.findIndex((i) => i.id === id);
-    if (index < 0) throw new Error(`없는 칸: ${id}`);
+    if (index < 0) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
     const at = new Date().toISOString();
     const [item] = data.items.splice(index, 1);
     change(data, id, 'remove', item, null, by, at);

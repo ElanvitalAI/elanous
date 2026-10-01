@@ -279,7 +279,7 @@ export function SessionsListPanel() {
     <div className="mx-auto max-w-3xl space-y-3 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h1 className="text-lg font-semibold">Sessions <span className="text-sm font-normal text-muted-foreground">대화 세션 (CLI · 텔레그램)</span></h1>
+          <h1 className="text-lg font-semibold">대화 세션 <span className="text-sm font-normal text-muted-foreground">CLI · 텔레그램</span></h1>
           <p className="text-xs text-muted-foreground">
             {sessions
               ? (filtered && filtered.length !== sessions.length

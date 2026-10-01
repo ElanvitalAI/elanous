@@ -310,3 +310,31 @@ describe('normalizeKeyForMatch · Hangul jamo → qwerty', () => {
     expect(normalizeKeyForMatch('한')).toBe('한'); // composed syllable not mapped
   });
 });
+
+describe('fullScreenIO.print while no question is pending (OB4 · 0.2.6 실물: 기기 코드가 안 보이고 멈춤)', () => {
+  test('after a pick, print paints immediately so the device code and URL are visible during the wait', async () => {
+    const { input, output, written, queueKey } = makeFakeIO();
+    const io = fullScreenIO({ input, output });
+    const promise = io.choose!('Auth mode:', [{ key: '1', label: 'OAuth', value: 'oauth' }, { key: '2', label: 'Skip', value: 'skip' }]);
+    queueKey('1');
+    expect(await promise).toBe('oauth');
+    const before = written.length;
+    io.print('    1) Open in any browser: https://example.test/device');
+    io.print('    2) Enter code:          ABCD-EFGH');
+    const painted = written.slice(before).join('');
+    expect(painted).toContain('Enter code:          ABCD-EFGH');
+    expect(painted).toContain('Open in any browser');
+    expect(painted).toContain('Ctrl-C cancel');
+  });
+
+  test('print inside a pending question still waits for that question screen (no extra paint)', async () => {
+    const { input, output, written, queueKey } = makeFakeIO();
+    const io = fullScreenIO({ input, output });
+    const promise = io.choose!('Pick:', [{ key: '1', label: 'A', value: 'a' }, { key: '2', label: 'B', value: 'b' }]);
+    const before = written.length;
+    io.print('note during question');
+    expect(written.length).toBe(before);
+    queueKey('1');
+    expect(await promise).toBe('a');
+  });
+});

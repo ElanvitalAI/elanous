@@ -12,6 +12,7 @@ import { findClaudeModel } from '../anthropic/models.js';
 import { findCodexModel } from '../codex/models.js';
 import * as modelDefaults from '../llm/model-defaults.js';
 import * as llm from '../llm.js';
+import { BUILTIN_CATALOG } from '../intelligence-map/model-catalog.js';
 
 function fakeSkill(over: Partial<SkillIndexEntry>): SkillIndexEntry {
   return {
@@ -110,7 +111,7 @@ describe('LLM usage 관측', () => {
     } finally { log.mockRestore(); budget.mockRestore(); }
   });
 
-  test('동적 skill 호출은 onUsage를 실행하고 알려진/미확인 비용을 debug.log에 싣는다', async () => {
+  test('동적 skill 호출은 onUsage를 실행하고 카탈로그 단가를 debug.log에 싣는다', async () => {
     const log = spyOn(debug, 'log').mockImplementation(() => undefined);
     const stream = spyOn(llm, 'streamLLM').mockImplementation(async (_messages, onChunk, opts) => {
       opts?.onUsage?.({ inputTokens: 1_000_000, outputTokens: 0 });
@@ -123,6 +124,7 @@ describe('LLM usage 관측', () => {
       model.mockReturnValue('gpt-5.6-terra');
       expect(await pickSkillsViaLlm('reuse photo intake', skills, 1)).toEqual(['photo-intake-ocr']);
       model.mockReturnValue('gpt-5.6-luna');
+      expect(BUILTIN_CATALOG.models.find((entry) => entry.id === 'gpt-5.6-luna')?.inputPerMtok).toBe(1);
       expect(await pickSkillsViaLlm('reuse photo intake', skills, 1)).toEqual(['photo-intake-ocr']);
       const usageLogs = log.mock.calls.filter((call) => call[0] === 'llm.usage' && call[1] === 'llm-usage');
       expect(usageLogs.map((call) => call[2])).toEqual([
@@ -134,7 +136,7 @@ describe('LLM usage 관측', () => {
         {
           site: 'codebase-gate-dynamic', model: 'gpt-5.6-luna',
           inputTokens: 1_000_000, outputTokens: 0,
-          cost: { kind: 'unknown', model: 'gpt-5.6-luna' },
+          cost: { kind: 'known', model: 'gpt-5.6-luna', usd: BUILTIN_CATALOG.models.find((model) => model.id === 'gpt-5.6-luna')!.inputPerMtok, source: 'catalog', cacheReadPricedAt: 'input-rate', cacheWritePricedAt: 'input-rate' },
         },
       ]);
     } finally {

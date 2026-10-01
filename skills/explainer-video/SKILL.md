@@ -35,7 +35,7 @@ The grammar of a chapter (take it from the reference, don't improvise):
 
 The outro gives one line that sums everything up, then the CTA.
 
-⛔ Every claim must trace to a merged change or a measured run, listed in `sources`. Don't write «fully autonomous», dates you can't promise, or comparisons (`docs/marketing/GUIDE-launch-tone-and-banned-claims-*`).
+⛔ Every claim must trace to a merged change or a measured run, listed in `sources`. Don't write «fully autonomous», dates you can't promise, or comparisons with other products.
 
 ## 2. Voice — `bun $SKILL/engine/vo.ts <project>/script.json`
 
@@ -85,7 +85,7 @@ The reference supplies the **grammar** (components and staging), never its colou
 - **Text**: `#F2F1EE`.
 - **Motif**: the V6 «엘랑 소용돌이» mark (`engine/brand/`), used in three places — a slow, faint rotation behind the scene, the header, and the chapter cards.
 
-Why these choices, what the reference does, and what we can and cannot reproduce: `내부 문서 `RESEARCH-explainer-video-reference-decomposition-2026-09-30``.
+The reference is used only for its structure (header, chapter cards, a diagram that moves one step per line, keyword-timed captions). Its colours, artwork and voice are not reproduced.
 
 ## Field reel — photos from the venue → a vertical video in about a minute
 
@@ -95,13 +95,16 @@ zsh $SKILL/engine/reel.sh <folder> --title "마케터의 밤" --sub "2026.10.02 
 
 - **Input**: a folder of phone photos (jpg · png · heic) and short clips (mp4 · mov). The default upload folder is `~/.elanous/field/<event>/`.
 - **Order**: by capture time (`mdls` creation date), then by file name.
-- **Captions**: optional `<folder>/captions.txt`, one line per item as `파일명 | 자막`. Items without a line get no caption.
+- **Captions**: optional `<folder>/captions.txt`, one line per item as `파일명 | 자막`. A photo without a line gets one line from a vision model (`codex exec -i`, all photos in parallel, 30 s cap each); if that fails it shows «현장 N». `FIELD_REEL_VISION=0` turns the vision step off.
+- **Title**: `--title`, or `title.txt` through the daemon. A slug-like title (`field-2026-10-01`) is replaced by a vision headline read from the first three photos (event or company names on screen first). The date line defaults to the first photo's capture date (KST).
+- **Music**: `FIELD_REEL_BGM=<file>` or `~/.cache/elanous-explainer/bgm/field.wav` — cut to length, faded in and out, leveled to about −16 LUFS. No file means no music. Use only licensed tracks (the default cache holds an Epidemic Sound download); the file is never committed.
 - **Output**:
-  - `<folder>/reel/reel-9x16.mp4` at 1080×1920, 30–60 s.
-  - A black title card, then each item: photos for 3.5 s with a slow zoom, clips for their first 5 s.
-  - One caption line per item, the V6 header, an Icarus Red progress bar, and an end card with elanous.ai.
-- **Fitting to length**: over 60 s drops items from the middle, keeping the first and last. Under 30 s stretches the photos.
-- **Measured**: 7 items → 31.2 s video in 56–83 s end to end (M-series Mac, `hyperframes render`).
+  - `<folder>/reel/reel-9x16.mp4` at 1080×1920, 24–60 s.
+  - An intro card (kicker, mark, title word by word, red rule, date), then each item: photos for about 4–6 s. A landscape photo is shown whole over a blurred fill of itself; a portrait photo fills the frame. Each move overlaps the next with a slide and a red wipe on the cut.
+  - Per item a counter (`01 / 03`), the caption rising word by word, and a red rule. The V6 header, an Icarus Red progress bar, and an end card with elanous.ai.
+  - `--part body` renders the photos only (no cards, no music) — for an instant version that stitches pre-rendered cards around it.
+- **Fitting to length**: over 60 s drops items from the middle, keeping the first and last. Under 24 s stretches the photos.
+- **Measured**: 3 photos → 24 s video in 28 s end to end, of which vision 8.7 s and render 15.9 s (M-series Mac, 10-01). Earlier: 7 items → 31.2 s video in 56–83 s.
 - **Before posting**: people's faces need their consent. Run the same 1 fps OCR check as any public video.
 
 ## Graph
@@ -114,4 +117,4 @@ zsh $SKILL/engine/reel.sh <folder> --title "마케터의 밤" --sub "2026.10.02 
   - speech mismatch → vo;
   - bad script → script;
   - public release → needs-human.
-- **Not coded yet**: the `explainer-*` recipes. Until they are, you run these steps from this skill.
+- **Recipes**: the `explainer-*` recipes are in the elanous core, but `graph run` does not yet accept this graph's terminal nodes. The video-explainer plugin therefore ships the skill and nodes only; run these steps from this skill. The graph comes with plugin 0.2.0.

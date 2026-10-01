@@ -9,12 +9,14 @@ const originalWindow = globalThis.window;
 afterEach(() => { globalThis.window = originalWindow; });
 
 describe('local PWA role', () => {
-  test('no browser, absent or unrecognized stored value defaults to owner', () => {
-    expect(readPwaRole()).toBe('owner');
+  test('MAT2 — no browser, absent or unrecognized stored value defaults to general; a stored owner stays owner', () => {
+    expect(readPwaRole()).toBe('general');
     let saved: string | null = null;
     globalThis.window = { localStorage: { getItem: () => saved } } as unknown as Window & typeof globalThis;
-    expect(readPwaRole()).toBe('owner');
+    expect(readPwaRole()).toBe('general');
     saved = 'unknown';
+    expect(readPwaRole()).toBe('general');
+    saved = 'owner';
     expect(readPwaRole()).toBe('owner');
     saved = 'contributor';
     expect(readPwaRole()).toBe('contributor');
@@ -71,7 +73,7 @@ describe('local PWA role', () => {
     }
   });
 
-  test('blocked storage keeps the owner fallback and still notifies', () => {
+  test('blocked storage keeps the general fallback and still notifies', () => {
     const events: string[] = [];
     globalThis.window = {
       localStorage: {
@@ -80,8 +82,8 @@ describe('local PWA role', () => {
       },
       dispatchEvent: (event: Event) => { events.push(event.type); return true; },
     } as unknown as Window & typeof globalThis;
-    writePwaRole('general');
-    expect(readPwaRole()).toBe('owner');
+    writePwaRole('owner');
+    expect(readPwaRole()).toBe('general');
     expect(events).toEqual([PWA_ROLE_EVENT]);
   });
 });

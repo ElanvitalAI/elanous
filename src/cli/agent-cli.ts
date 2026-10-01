@@ -393,8 +393,8 @@ tierCmd
  *  When `json` is true, the function suppresses the streaming text +
  *  ui.info trailer and instead emits exactly ONE JSON line on stdout
  *  at end-of-turn:
- *    {sessionId, provider, model, reply, logPath, budget, durationMs,
- *     turnIndex, ts}
+ *    {sessionId, provider, model, reply, finalReply, transcript, logPath,
+ *     budget, durationMs, ts}
  *  Stable shape so LLMs can self-spawn `elanous chat` for follow-ups
  *  without parsing human-readable terminal output. */
 export async function runChatTurnCli(opts: {
@@ -442,12 +442,14 @@ export async function runChatTurnCli(opts: {
     dbg.setAmbientSessionId?.(session.id);
   } catch { /* debug module unavailable — fine */ }
   const replyChunks: string[] = [];
-  // 어시스턴트 메시지 경계(도구 호출)로 자른 본문 조각 — 마지막 «비어 있지 않은» 조각이 finalReply.
+  // Tool calls delimit assistant messages. finalReply retains its last non-empty-message meaning.
   let segmentChunks: string[] = [];
   let lastSegment = '';
+  let finalMessage = '';
+  let sawToolCall = false;
   const closeSegment = (): void => {
-    const text = segmentChunks.join('').trim();
-    if (text) lastSegment = text;
+    finalMessage = segmentChunks.join('').trim();
+    if (finalMessage) lastSegment = finalMessage;
     segmentChunks = [];
   };
   if (!opts.json) {
@@ -528,15 +530,17 @@ export async function runChatTurnCli(opts: {
       userText: opts.userText,
       systemPrompt: agentSystemPrompt,
       onDelta: (d) => {
-        if (opts.json) { replyChunks.push(d); segmentChunks.push(d); }
-        else process.stdout.write(d);
+        replyChunks.push(d);
+        segmentChunks.push(d);
+        if (!opts.json && !opts.enableTools) process.stdout.write(d);
       },
       tools: cliToolSpecs,
       dispatchTool,
       ...(opts.goalLoop ? { goalLoop: true } : {}),
       onToolCall: (call) => {
-        // 도구 호출 뒤의 본문은 «새» 어시스턴트 메시지다 — 직전 조각을 마감한다(finalReply 용).
-        if (opts.json) closeSegment();
+        // The next delta belongs to the next assistant message.
+        sawToolCall = true;
+        closeSegment();
         if (!opts.json) {
           process.stdout.write(`\n  ⏺ ${call.name}(${truncateArgsForLog(call.args)})\n`);
         }
@@ -555,6 +559,12 @@ export async function runChatTurnCli(opts: {
     }
     throw err;
   }
+  if (!sawToolCall && replyChunks.length === 0 && result.text) {
+    replyChunks.push(result.text);
+    segmentChunks.push(result.text);
+    if (!opts.json && !opts.enableTools) process.stdout.write(result.text);
+  }
+  closeSegment();
   if (opts.json) {
     let logPath: string | null = null;
     try {
@@ -566,11 +576,9 @@ export async function runChatTurnCli(opts: {
       sessionId: session.id,
       provider: result.provider,
       model: result.model ?? null,
-      reply: replyChunks.join(''),
-      // ⭐ 2026-09-23 — `reply` 는 «모든 턴·모든 목표 루프 반복»의 본문을 이어 붙인다(뜻은 그대로 둔다 · 소비자 보호).
-      //   그래서 모델이 반복마다 최종 답을 다시 말하면 같은 문장이 여러 번 나온다(실측: kimi 3회·grok 2회).
-      //   `finalReply` = 마지막 어시스턴트 메시지 본문 — 「최종 답만」이 필요한 소비자용(뒤호환 추가 칸).
-      finalReply: (closeSegment(), lastSegment),
+      reply: finalMessage,
+      transcript: replyChunks.join(''),
+      finalReply: lastSegment,
       budget: sessionBudget(session.id),
       durationMs: Date.now() - startedAt,
       logPath,
@@ -579,7 +587,8 @@ export async function runChatTurnCli(opts: {
     await writeStdoutJson(JSON.stringify(out) + '\n');
     return;
   }
-  process.stdout.write('\n');
+  if (opts.enableTools) process.stdout.write(`${finalMessage}\n`);
+  else process.stdout.write('\n');
   ui.info(`[session ${session.id.slice(0, 8)}  ${result.provider}${result.model ? '/' + result.model : ''}  ${sessionBudget(session.id)}]`);
 }
 

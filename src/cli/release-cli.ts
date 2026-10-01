@@ -5,6 +5,7 @@
 //   elanous release tag --version <x.y.z> --source <commit> [--yes]
 //   elanous release verify  [--version <x.y.z>]
 //   elanous release notes   --from <ref> [--to <ref>]
+//   elanous release run     --version <x.y.z> [--dry-run] [--json] [--if-ready]
 //
 // 🩸 계기(2026-09-25 v0.1.0 첫 공개): 손으로 밟은 절차에서 둘을 빠뜨릴 뻔했다 — 공개본 git 커밋(판 커밋이 공개본 커밋이 된다) ·
 //    PWA 빌드(빌드 산출은 공개본에 안 실린다 → 빠뜨리면 «웹 화면 없는 판»). 절차를 명령으로 굳힌다.
@@ -24,6 +25,9 @@ import { envLiteral } from '../platform/env-literal.js';
 import { userConfigPath } from '../user-config.js';
 import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition } from '../release-loop/checklist.js';
 import { writeStdoutJson } from './stdout-json.js';
+import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
+import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
+import { runReleaseIfReady } from './release-run-if-ready.js';
 
 export const DEFAULT_PUBLIC_REPO = 'ElanvitalAI/elanous';
 const SEMVER = /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/;
@@ -482,7 +486,7 @@ async function checklistOutput(v: string, codenames: Record<string, string>, mod
   }
 }
 
-export function registerReleaseCommands(program: Command): void {
+export function registerReleaseCommands(program: Command, releaseRunDeps: UnattendedReleaseDeps = {}): void {
   const release = program.command('release').description('공개 배포 한 판 — prepare(로컬) → publish(--yes) → verify (docs/manual/MANUAL-versioning-and-release-2026-09-25.md)');
   const checklist = release.command('checklist').description('판별 확인표 조회·갱신')
     .option('--version <v>', '판 또는 별칭(기본: package.json 의 개발판에서 -dev.N 제거)')
@@ -586,5 +590,42 @@ export function registerReleaseCommands(program: Command): void {
     .action(async (o: { from: string; to: string }) => {
       const { draftReleaseNotes, readLandedCommits, renderReleaseNotes } = await import('../../scripts/release-notes.js');
       console.log(renderReleaseNotes(draftReleaseNotes(readLandedCommits(o.from, o.to), o.from, o.to)));
+    });
+  release.command('run')
+    .description('릴리스 루프 실행 — 원장 직전 판과 release.loop 설정으로 그래프 입력 구성 · --dry-run 은 입력만 출력')
+    .requiredOption('--version <v>', '공개할 판(x.y.z)')
+    .option('--dry-run', '체크리스트·그래프 실행 없이 전체 입력 보기')
+    .option('--if-ready', '준비되지 않았으면 사유를 출력하고 성공으로 건너뛴다')
+    .option('--json', '결과 한 줄 JSON(stdout) · 사람 줄은 stderr')
+    .action(async (o: { version: string; dryRun?: boolean; ifReady?: boolean; json?: boolean }) => {
+      if (o.ifReady && !o.dryRun) {
+        try {
+          const outcome = await runReleaseIfReady(o.version, {
+            ledgerRoot: releaseRunDeps.ledgerRoot,
+            readiness: (version, options) => releaseReadiness(version, { ledgerRoot: releaseRunDeps.ledgerRoot, checklist: releaseRunDeps.checklist, ...options }),
+            run: () => runUnattendedRelease({ version: o.version }, releaseRunDeps),
+          });
+          if (outcome.skipped) {
+            if (o.json) await writeStdoutJson(`${JSON.stringify(outcome)}\n`);
+            else console.log(`· 준비 안 됨 ${o.version} · ${outcome.reason} · ${outcome.detail}`);
+            return;
+          }
+          const result = outcome.result;
+          const ok = result.dryRun || result.state?.status === 'done' || result.state?.status === 'awaiting-approval';
+          (o.json ? console.error : console.log)(`${result.dryRun ? '· 드라이런' : '▶ 릴리스 루프'} ${result.input.version} · 입력 ${JSON.stringify(result.input)}`);
+          if (o.json) await writeStdoutJson(`${JSON.stringify({ ok, ...result })}\n`);
+          if (!ok && !process.exitCode) process.exitCode = 1;
+        } catch (e) {
+          if (o.json) await writeStdoutJson(`${JSON.stringify({ ok: false, error: (e as Error).message })}\n`);
+          else console.error(`⛔ ${(e as Error).message}`);
+          process.exitCode = 1;
+        }
+        return;
+      }
+      await jsonAction(o.json, async (log) => {
+        const result = await runUnattendedRelease({ version: o.version, dryRun: o.dryRun }, releaseRunDeps);
+        log(`${result.dryRun ? '· 드라이런' : '▶ 릴리스 루프'} ${result.input.version} · 입력 ${JSON.stringify(result.input)}`);
+        return result;
+      }, (r) => r.dryRun || r.state?.status === 'done' || r.state?.status === 'awaiting-approval');
     });
 }

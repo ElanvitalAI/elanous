@@ -1,5 +1,84 @@
 import { describe, expect, test } from 'bun:test';
 import { decideCodexRotation } from './codex-account-rotation.js';
+import { decideFallback } from './fallback-chain.js';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { recordCreditBalances } from '../budget/codex-credit-pace.js';
+import { writeQuotaSignal } from '../budget/codex-reset-credit-state.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { inspectCodexRotation, resolveCodexAccountForRun, _setCodexAccountOutboundSenderForTesting } from './codex-account-store.js';
+import { saveTokens } from './store.js';
+describe('일별 선불 크레딧 페이스', () => {
+  const current = { name: 'third', storeKey: 'k-third', home: '/h/third', source: 'default' } as const;
+  const team = { name: 'team', storeKey: 'k-team', home: '/h/team', reached: true, usedPercent: 100, creditBalance: 65_833, hasCredits: true };
+  const base = { current, explicit: false, enabled: true, currentReached: false, currentUsedPercent: 90, resetCreditAvailability: 'unavailable', candidates: [team] } as const;
+  test('찬 team 구독의 크레딧을 미달 몫만큼 먼저 쓰고, 몫이 차면 기존 판정으로 돌아간다', () => {
+    expect(decideCodexRotation({ ...base, creditPace: { active: true } }).reason).toBe('credit-pace');
+    expect(decideCodexRotation({ ...base, creditPace: { active: true } }).to?.name).toBe('team');
+    expect(decideFallback({ rotation: { reason: 'credit-pace', to: team }, chain: ['codex-rotate', 'grok'], grokAvailable: true }))
+      .toEqual({ action: 'codex-rotate', to: team });
+    expect(decideFallback({ rotation: { reason: 'credit-pace' }, chain: ['codex-rotate', 'grok'], grokAvailable: true }))
+      .toEqual({ action: 'stay', why: 'not-reached' });
+    expect(decideCodexRotation({ ...base, creditPace: { active: false } }).reason).toBe('not-reached');
+    expect(decideCodexRotation(base).reason).toBe('not-reached');
+  });
+  test('미달 구독·크레딧 불명 또는 없음이면 페이스가 아닌 기존 규칙', () => {
+    for (const candidate of [{ ...team, reached: false, usedPercent: 8 }, { ...team, creditBalance: 0 }, { ...team, hasCredits: false }]) {
+      expect(decideCodexRotation({ ...base, candidates: [candidate], creditPace: { active: true } }).reason).toBe('not-reached');
+    }
+  });
+  test('잔액 많은 찬 계정을 선택하고 명시/비활성 설정은 페이스보다 우선한다', () => {
+    const alternatives = [team, { ...team, name: 'backup', storeKey: 'k-backup', creditBalance: 90_000 }];
+    expect(decideCodexRotation({ ...base, candidates: alternatives, creditPace: { active: true } }).to?.name).toBe('backup');
+    expect(decideCodexRotation({ ...base, candidates: alternatives, explicit: true, creditPace: { active: true } }).reason).toBe('explicit');
+    expect(decideCodexRotation({ ...base, candidates: alternatives, enabled: false, creditPace: { active: true } }).reason).toBe('disabled');
+  });
+  test('현재 계정이 찬 구독이며 크레딧을 보유하면 그 자리에 머문다', () => {
+    expect(decideCodexRotation({ ...base, currentReached: true, currentUsedPercent: 100, currentCreditBalance: 10, currentHasCredits: true, creditPace: { active: true } }).reason).toBe('credit-pace');
+    expect(decideCodexRotation({ ...base, currentReached: true, currentUsedPercent: 100, currentCreditBalance: 10, currentHasCredits: true, creditPace: { active: true } }).to).toBeUndefined();
+  });
+});
+
+test('policy + ledger + quota signal feed both inspection and runtime rotation', () => {
+  const root = mkdtempSync(join(tmpdir(), 'codex-pace-wiring-'));
+  const previous = process.env.ELANOUS_STATE_DIR;
+  const previousSource = process.env.ELANOUS_STATE_DIR_SOURCE;
+  try {
+    process.env.ELANOUS_STATE_DIR = root;
+    delete process.env.ELANOUS_STATE_DIR_SOURCE;
+    setElanousConfigDir(root);
+    mkdirSync(join(root, 'policy'), { recursive: true });
+    writeFileSync(join(root, 'policy/llm.yaml'), 'credits:\n  codex: use\n  pace:\n    targetPerDay: 2200\n    until: 2099-12-31\n');
+    const storePath = join(root, 'auth.json');
+    const homes: Record<string, string> = Object.fromEntries(['third', 'team'].map(name => [name, join(root, name)]));
+    for (const name of ['third', 'team']) {
+      mkdirSync(homes[name]!, { recursive: true });
+      saveTokens(`openai-codex:${name}`, { accessToken: 'a', refreshToken: 'r', expiresAt: null }, { mirrorCodex: false, codexHome: homes[name] }, storePath);
+    }
+    writeQuotaSignal(undefined, 90, homes.third, undefined, { balance: 0, hasCredits: false });
+    writeQuotaSignal(undefined, 100, homes.team, undefined, { balance: 65_833, hasCredits: true });
+    recordCreditBalances({ team: 65_833 }, new Date());
+    _setCodexAccountOutboundSenderForTesting(() => true);
+    const env = { ELANOUS_CODEX_ACCOUNT: '', CODEX_HOME: homes.third } as NodeJS.ProcessEnv;
+    // The unpinned default path needs to resolve to third while the account remains non-explicit.
+    saveTokens('openai-codex', { accessToken: 'a', refreshToken: 'r', expiresAt: null }, { mirrorCodex: false, codexHome: homes.third }, storePath);
+    expect(inspectCodexRotation(env, { storePath }).reason).toBe('credit-pace');
+    expect(inspectCodexRotation(env, { storePath }).to).toBe('team');
+    expect(resolveCodexAccountForRun(env, { storePath }).name).toBe('team');
+    recordCreditBalances({ team: 62_000 }, new Date());
+    writeQuotaSignal(undefined, 100, homes.team, undefined, { balance: 62_000, hasCredits: true });
+    expect(inspectCodexRotation(env, { storePath }).reason).toBe('reset-credit-unknown');
+    expect(resolveCodexAccountForRun(env, { storePath }).name).toBe('third');
+  } finally {
+    _setCodexAccountOutboundSenderForTesting(null);
+    resetElanousConfigDir();
+    if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
+    if (previousSource === undefined) delete process.env.ELANOUS_STATE_DIR_SOURCE; else process.env.ELANOUS_STATE_DIR_SOURCE = previousSource;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 describe('크레딧 정책 — 크레딧이 더 남은 계정으로 (09-28)', () => {
   const cand = (name: string, creditBalance?: number, hasCredits?: boolean) => ({
     name, storeKey: `k-${name}`, home: `/h/${name}`, reached: true as const, usedPercent: 100,

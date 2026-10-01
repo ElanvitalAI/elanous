@@ -91,19 +91,24 @@ describe('PWA daemon guidance uses the live nexus run command', () => {
     expectCurrentGuidance(out.logs, 'elanous nexus run --hmr');
   });
 
-  test('pwa dev recommends nexus run when there is no live lock', async () => {
+  test('pwa dev reports an unknown daemon address without guessing a nexus port', async () => {
     const out = makeOut();
 
     await runPwaDev({
       cwd: '/fake/apps/pwa',
       skipNodeModulesCheck: true,
+      resolveEndpoint: () => null,
       readNexusLockFn: () => null,
       isAliveNexusLockFn: () => false,
       spawnFn: async () => 0,
       out,
     });
 
-    expectCurrentGuidance(out.logs, 'elanous nexus run');
+    expect(out.logs.join('\n')).toContain('daemon address unknown — a port is not guessed. Pass --nexus-url or start the daemon.');
+    expect(out.logs.join('\n')).toContain('→ cross-origin (always):           http://localhost:3210/app/');
+    for (const deprecatedCommand of DEPRECATED_PWA_GUIDANCE) {
+      expect(out.logs.join('\n')).not.toContain(deprecatedCommand);
+    }
   });
 
   test('pwa share preserves its requested port while recommending nexus run', async () => {

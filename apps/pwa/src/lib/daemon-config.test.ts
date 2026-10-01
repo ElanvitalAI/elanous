@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 
-import { loadDaemonConfig, saveDaemonConfig } from './daemon-config';
+import { clearSetupScope, loadDaemonConfig, readSetupScope, saveDaemonConfig } from './daemon-config';
 
 declare const globalThis: {
   window?: unknown;
@@ -116,9 +116,40 @@ describe('daemon-config — NEXUS PR a (v6) baseUrl cutover', () => {
     expect(localStorage.getItem('elanous.daemon.token')).toBe('t1');
   });
 
-  test('SSR (no window) yields empty config', () => {
+  test('reads a future setup-scope expiry without changing bearer or config', () => {
+    const expiresAt = Date.now() + 60_000;
+    localStorage.setItem('elanous.daemon.setupScopeExpiresAt', String(expiresAt));
+    saveDaemonConfig({ baseUrl: 'https://nexus.example', token: 'bearer', provider: 'claude' });
+    expect(readSetupScope()).toBe(expiresAt);
+    expect(loadDaemonConfig()).toEqual({
+      baseUrl: 'https://nexus.example', token: 'bearer', provider: 'claude',
+    });
+  });
+
+  test('rejects expired or invalid setup-scope expiry and removes only its key', () => {
+    localStorage.setItem('elanous.daemon.token', 'bearer');
+    for (const raw of [String(Date.now() - 1), 'not-a-date', 'Infinity', '']) {
+      localStorage.setItem('elanous.daemon.setupScopeExpiresAt', raw);
+      expect(readSetupScope()).toBeNull();
+      expect(localStorage.getItem('elanous.daemon.setupScopeExpiresAt')).toBeNull();
+      expect(localStorage.getItem('elanous.daemon.token')).toBe('bearer');
+    }
+  });
+
+  test('clears only setup-scope expiry, including when it is absent', () => {
+    localStorage.setItem('elanous.daemon.setupScopeExpiresAt', String(Date.now() + 60_000));
+    localStorage.setItem('elanous.daemon.token', 'bearer');
+    clearSetupScope();
+    clearSetupScope();
+    expect(readSetupScope()).toBeNull();
+    expect(localStorage.getItem('elanous.daemon.token')).toBe('bearer');
+  });
+
+  test('SSR (no window) yields empty config and no setup scope', () => {
     delete (globalThis as { window?: unknown }).window;
     const cfg = loadDaemonConfig();
     expect(cfg).toEqual({ baseUrl: '', token: '', provider: '' });
+    expect(readSetupScope()).toBeNull();
+    clearSetupScope();
   });
 });

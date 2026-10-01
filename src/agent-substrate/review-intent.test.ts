@@ -161,6 +161,33 @@ describe('buildReviewIntent design gate', () => {
 });
 
 describe('buildReviewIntent', () => {
+  test('shard boundary gets budget before a long goal; JSON footer is absent from the goal block', () => {
+    const identity = {
+      orchestrationId: 'run-1', shardId: 'handler', totalShards: 3, position: 1,
+      summary: 'Build the handler', siblings: [
+        { shardId: 'route', summary: 'Register the route' },
+        { shardId: 'screen', summary: 'Build the screen' },
+      ],
+    };
+    const goal = `G${'x'.repeat(6000)}\n\n## Shard identity\n${JSON.stringify(identity)}`;
+    const out = buildReviewIntent({ goal });
+    expect(out.length).toBeLessThanOrEqual(MAX_REVIEW_INTENT_CHARS);
+    expect(out).toContain('형제 조각이 맡는 일:');
+    expect(out).toContain('- route: Register the route');
+    expect(out).toContain('- screen: Build the screen');
+    expect(out.indexOf('조각 경계')).toBeLessThan(out.indexOf('목표'));
+    expect(out).not.toContain('## Shard identity');
+    expect(out).not.toContain('"orchestrationId"');
+  });
+
+  test('missing or malformed shard JSON preserves the pre-change review string byte-for-byte', () => {
+    expect(buildReviewIntent({ goal: '  게이트 스코프를 고친다  ' }))
+      .toBe('골 종류와 성공 조건\n종류: implement\n성공: 게이트 통과와 PR 머지다.\n\n목표\n게이트 스코프를 고친다');
+    const malformed = 'G\n\n## Shard identity\n{"shardId":';
+    expect(buildReviewIntent({ goal: malformed }))
+      .toBe(`골 종류와 성공 조건\n종류: implement\n성공: 게이트 통과와 PR 머지다.\n\n목표\n${malformed}`);
+  });
+
   test('prior-run findings require a decision but an absent or empty list leaves the intent byte-identical', () => {
     const baseline = buildReviewIntent({ goal: 'G' });
     const finding = { pr: 21457, runId: 'run-old', round: 1, items: ['프록시가 압축 응답 헤더를 그대로 넘긴다'] };

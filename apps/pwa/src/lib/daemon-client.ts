@@ -67,6 +67,81 @@ export interface LlmHostsResponse {
   parseError?: string;
 }
 
+export interface ConsultRequest {
+  name: string;
+  org?: string;
+  kind: 'company' | 'personal';
+  interest: 'A' | 'B';
+  contact: string;
+  consent: true;
+}
+
+export type ConsultRequestResult =
+  | { receiptId: string; receivedAt: string }
+  | { error: 'bad_request'; field: string };
+
+export interface SeatSummary { id: string; title: string }
+export interface SeatRequestItem {
+  receiptId: string;
+  seat: string;
+  text: string;
+  queuedAt: string;
+  status: 'queued';
+}
+export interface SeatRequestsResponse {
+  items: SeatRequestItem[];
+  seats: SeatSummary[];
+}
+export interface SeatRequestReceipt { receiptId: string; seat: string; queuedAt: string }
+
+export interface FieldUploadResult {
+  event: string;
+  count: number;
+}
+
+export interface FieldReelStatus {
+  event: string;
+  state: string;
+  items: number;
+  url?: string;
+}
+
+export type ExecRequestStatus = 'planning' | 'running' | 'done' | 'failed';
+export type ExecSeatStatus = 'waiting' | 'running' | 'done' | 'failed';
+export interface ExecRequestSeat {
+  seat: string;
+  title: string;
+  status: ExecSeatStatus;
+  graphId?: string;
+  runId?: string;
+  reason?: string;
+}
+export interface ExecRequestItem {
+  id: string;
+  text: string;
+  createdAt: string;
+  status: ExecRequestStatus;
+  seats: ExecRequestSeat[];
+  resultCount: number;
+}
+export interface ExecRequestDetail extends Omit<ExecRequestItem, 'resultCount'> {
+  summary: string;
+  results: Array<{
+    seat: string;
+    kind: 'report' | 'pdf' | 'video' | 'image' | 'text' | 'link';
+    title: string;
+    url: string;
+    sources?: Array<{ title: string; url: string }>;
+  }>;
+  approvals: Array<{ graphId: string; runId: string; message: string }>;
+}
+
+export class SeatRequestError extends Error {
+  constructor(public readonly status: number, public readonly code: string, public readonly seats: SeatSummary[] = []) {
+    super(code);
+  }
+}
+
 export interface PromptRequest {
   sessionId?: string;
   userText: string;
@@ -379,6 +454,112 @@ export class DaemonClient {
 
   async health(): Promise<{ ok: boolean }> {
     return this.fetchJson<{ ok: boolean }>('/v1/health');
+  }
+
+  async fieldDefaultEvent(): Promise<{ defaultEvent: string }> {
+    return this.fetchJson('/v1/field/uploads');
+  }
+
+  async fieldReelStatus(event: string): Promise<FieldReelStatus> {
+    return this.fetchJson(`/v1/field/reel?event=${encodeURIComponent(event)}`);
+  }
+
+  /** Browser upload progress needs XHR; the same daemon URL and bearer are used as fetchJson. */
+  uploadField(event: string, files: File[], caption: string, onProgress: (percent: number) => void): Promise<FieldUploadResult> {
+    const form = new FormData();
+    files.forEach((file) => form.append('file', file, file.name));
+    files.forEach(() => form.append('capturedAt', ''));
+    const query = new URLSearchParams({ event, device: 'pwa' });
+    if (caption.trim()) {
+      query.set('caption', caption.trim());
+      form.append('caption', caption.trim());
+    }
+    const path = `/v1/field/uploads?${query}`;
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', this.url(path));
+      if (this.cfg.token) xhr.setRequestHeader('authorization', `Bearer ${this.cfg.token}`);
+      xhr.upload.onprogress = (progress) => {
+        if (progress.lengthComputable && progress.total > 0) {
+          onProgress(Math.min(100, Math.round(progress.loaded * 100 / progress.total)));
+        }
+      };
+      xhr.onerror = () => reject(new Error('field upload: network error'));
+      xhr.onload = () => {
+        if (xhr.status === 401) reportAuthRequired(path);
+        let body: { ok?: boolean; error?: string; reason?: string; event?: string; count?: number };
+        try { body = JSON.parse(xhr.responseText); }
+        catch { reject(new Error(`field upload ${xhr.status}: invalid response`)); return; }
+        if (typeof body !== 'object' || body === null) {
+          reject(new Error(`field upload ${xhr.status}: invalid response`));
+          return;
+        }
+        if (xhr.status < 200 || xhr.status >= 300 || body.ok !== true) {
+          reject(new Error(body.reason ?? body.error ?? `field upload ${xhr.status}`));
+          return;
+        }
+        if (typeof body.event !== 'string' || typeof body.count !== 'number') {
+          reject(new Error(`field upload ${xhr.status}: invalid response`));
+          return;
+        }
+        resolve({ event: body.event, count: body.count });
+      };
+      xhr.send(form);
+    });
+  }
+
+  async submitConsultRequest(request: ConsultRequest): Promise<ConsultRequestResult> {
+    const path = '/v1/consult-requests';
+    const res = await this.fetchResponse(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+    if (res.status === 202) return (await res.json()) as { receiptId: string; receivedAt: string };
+    if (res.status === 400) return (await res.json()) as { error: 'bad_request'; field: string };
+    throw new Error(`consult-requests ${res.status}`);
+  }
+
+  async listExecRequests(): Promise<{ items: ExecRequestItem[] }> {
+    return this.fetchJson('/v1/exec-requests');
+  }
+
+  async getExecRequest(id: string): Promise<ExecRequestDetail> {
+    return this.fetchJson(`/v1/exec-requests/${encodeURIComponent(id)}`);
+  }
+
+  async submitExecRequest(text: string): Promise<{ id: string; status: 'planning' }> {
+    const path = '/v1/exec-requests';
+    const res = await this.fetchResponse(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    if (res.status !== 202) throw new Error(`exec-requests ${res.status}`);
+    return (await res.json()) as { id: string; status: 'planning' };
+  }
+
+  async listSeatRequests(options: { seat?: string; limit?: number } = {}): Promise<SeatRequestsResponse> {
+    const query = new URLSearchParams();
+    if (options.seat !== undefined) query.set('seat', options.seat);
+    if (options.limit !== undefined) query.set('limit', String(options.limit));
+    const suffix = query.size ? `?${query}` : '';
+    return this.fetchJson<SeatRequestsResponse>(`/v1/seat-requests${suffix}`);
+  }
+
+  async submitSeatRequest(request: { seat?: string; text: string }, idempotencyKey: string): Promise<SeatRequestReceipt> {
+    const path = '/v1/seat-requests';
+    const response = await this.fetchResponse(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'Idempotency-Key': idempotencyKey },
+      body: JSON.stringify(request),
+    });
+    const body = await response.json() as SeatRequestReceipt | { error?: string; seats?: SeatSummary[] };
+    if (!response.ok) {
+      const error = body as { error?: string; seats?: SeatSummary[] };
+      throw new SeatRequestError(response.status, error.error ?? `http-${response.status}`, error.seats ?? []);
+    }
+    return body as SeatRequestReceipt;
   }
 
   /** Phase B-4 follow-up (2026-05-06) — long-lived observer SSE for a

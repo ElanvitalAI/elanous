@@ -113,6 +113,7 @@ const baseDeps: PrLandDeps = {
   queryRunningRuns: () => emptyRunningRuns,
   runTypecheckGate: () => true,
   runIsolationGate: () => true,
+  runExportLeakCheck: () => ({ measured: true, hits: [] }),
   isInteractive: () => false,
 };
 

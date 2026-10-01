@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
-import { PROVIDERS, resolveDefaultProvider, streamLLM, type LLMProvider } from './llm.js';
+import { PROVIDERS, streamLLM, type LLMProvider } from './llm.js';
+import { setUserConfigOverlay } from './user-config.js';
 
 async function observeAttempts(run: () => Promise<unknown>) {
   const done: Record<string, unknown>[] = [];
@@ -59,17 +60,19 @@ test('streamLLM attributes measured and unmeasured usage to its active model', a
 });
 
 test('streamLLM attributes a 503 failure and fallback success to their respective active models', async () => {
-  const initial = resolveDefaultProvider();
+  setUserConfigOverlay((config) => ({ ...config, llm: { ...config.llm, provider: 'auto', fallbackChain: ['codex-rotate', 'grok'] } }));
+  const grokAvailable = spyOn(PROVIDERS.grok!, 'available').mockReturnValue(true);
+  const initial = PROVIDERS['openai-codex']!;
   const originalStreams = new Map(Object.values(PROVIDERS).map((provider) => [provider.name, provider.streamChat]));
-  for (const provider of Object.values(PROVIDERS)) {
-    provider.streamChat = provider.name === initial.name
-      ? async function* () { throw new Error('503 provider overloaded'); }
-      : async function* () { yield { type: 'text', delta: 'fallback' }; };
-  }
 
   try {
+    for (const provider of Object.values(PROVIDERS)) {
+      provider.streamChat = provider.name === initial.name
+        ? async function* () { throw new Error('503 provider overloaded'); }
+        : async function* () { yield { type: 'text', delta: 'fallback' }; };
+    }
     const observed = await observeAttempts(async () => {
-      await expect(streamLLM([{ role: 'user', content: 'question' }], () => {})).resolves.toBe('fallback');
+      await expect(streamLLM([{ role: 'user', content: 'question' }], () => {}, { initialProvider: initial })).resolves.toBe('fallback');
     });
     const fallbackDone = observed.done[0]!;
 
@@ -85,5 +88,7 @@ test('streamLLM attributes a 503 failure and fallback success to their respectiv
     expect(fallbackDone.model).not.toBe(initial.defaultModel);
   } finally {
     for (const provider of Object.values(PROVIDERS)) provider.streamChat = originalStreams.get(provider.name);
+    grokAvailable.mockRestore();
+    setUserConfigOverlay(null);
   }
 });

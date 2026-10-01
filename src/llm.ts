@@ -3942,7 +3942,8 @@ function providerDecisionCandidates(): Array<LLMProvider & { name: ProviderDecis
   return PROVIDER_DECISION_ORDER.map((name) => PROVIDERS[name]! as LLMProvider & { name: ProviderDecisionName });
 }
 
-function codexOAuthAvailable(): boolean {
+/** Exported (OB1) so onboarding and `setup` judge «is there a usable ChatGPT/Codex login» exactly as the runtime does. */
+export function codexOAuthAvailable(): boolean {
   try {
     const account = resolveCodexAccount(process.env, { storedHome: (key) => loadTokens(key)?.codexHome });
     if (loadTokens(account.storeKey)) return true;
@@ -4478,9 +4479,9 @@ async function consumeProviderText(
 export async function streamLLM(
   messages: LLMMessage[],
   onChunk: (delta: string, full: string) => void,
-  opts: LLMOpts & { provider?: LLMProvider; onResolvedProvider?: (provider: string) => void } = {},
+  opts: LLMOpts & { provider?: LLMProvider; initialProvider?: LLMProvider; onResolvedProvider?: (provider: string, model: string) => void } = {},
 ): Promise<string> {
-  let activeProvider = opts.provider ?? resolveDefaultProvider(opts.model);
+  let activeProvider = opts.provider ?? opts.initialProvider ?? resolveDefaultProvider(opts.model);
   const attemptedProviders = new Set<string>([activeProvider.name]);
   let blockedProviders: ProviderFallbackAttempt[] = [];
   let modelOverride = opts.model;
@@ -4493,7 +4494,7 @@ export async function streamLLM(
     );
     activeProvider = finalized.provider;
     const activeModel = finalized.model;
-    opts.onResolvedProvider?.(activeProvider.name);
+    opts.onResolvedProvider?.(activeProvider.name, activeModel);
     debug.log('llm.router', 'streamLLM', {
       provider: activeProvider.name,
       model: activeModel,

@@ -4,9 +4,13 @@ read-card:
 research:
   command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" research'
   timeout_ms: 120000
+# strategy·draft make up to four LLM calls (write ⊕ verify, one retry) — 61–80 s clean, a retry doubles it (10-01 live: 120 s timeout hit).
+strategy:
+  command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" strategy'
+  timeout_ms: 300000
 draft:
   command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" draft'
-  timeout_ms: 120000
+  timeout_ms: 300000
 report:
   command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" report'
   timeout_ms: 30000

@@ -66,6 +66,7 @@ describe('checkCredentialNameDrift', () => {
     expect(result).toEqual({ envExampleOnly: [], resourceMapOnly: [], both: expect.any(Array), unreadable: [] });
     // 벙어리 방지 — 목록이 비면 「일치」가 공허하게 참이 된다.
     expect(result.both.length).toBeGreaterThan(20);
+    expect(result.both).toContain('ANTHROPIC_API_KEY');
   });
 });
 

@@ -91,6 +91,8 @@ export function startA2AServer(opts: A2AServerOptions): Bun.Server<undefined> {
     history ??= new DaemonSessionHistory();
     const result = await (opts.runDaemonTurn ?? runDaemonPromptTurn)({
       history,
+      // A peer agent delegates work, not small talk: never drop its tools for a short message (#22430 fast path).
+      fastPathEnabled: false,
       request: {
         sessionId: contextId,
         userText: text,

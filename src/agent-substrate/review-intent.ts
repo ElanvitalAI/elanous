@@ -16,6 +16,7 @@ import { parseGoalType, type GoalType } from '../self-implement/goal-author.js';
 import type { DesignCheckOutcome } from '../design/design-check.js';
 import type { DesignGateResult } from '../design/design-gate.js';
 import type { PriorDraftFinding } from '../self-implement/prior-draft-findings.js';
+import { parseShardIdentity, shardBoundaryBlock, withoutShardIdentity } from './shard-boundary-intent.js';
 
 export interface ReviewIntentInput {
   /** 무엇을 왜 — 골 원문. */
@@ -534,7 +535,9 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   // ⚠️ 목표 블록에는 **추출된 절을 뺀 나머지**를 넣는다(리뷰 should-fix) — 골 원문을 통째로 넣고
   //   그 안의 수용기준을 다시 목록으로 붙이면 **같은 내용이 두 번** 들어가 4000자 예산을 먹고,
   //   후순위 블록(스코프 경계)이 불필요하게 잘린다.
-  const goalBody = stripExtractedSections(i.goal).trim();
+  const identity = parseShardIdentity(i.goal);
+  const shardBoundary = identity ? { title: '조각 경계', text: `조각 경계\n${shardBoundaryBlock(identity)}` } : undefined;
+  const goalBody = stripExtractedSections(identity ? withoutShardIdentity(i.goal) : i.goal).trim();
   const goal = goalBody ? { title: '목표', text: `목표\n${goalBody}` } : undefined;
   // ⭐ **자식이 낸 증거**(diff 밖 이행 · base 적색 · 직전 반영분)를 한 묶음으로 잡아 둔다 — 아래 예산
   //   배분에서 **목표 본문보다 먼저** 채우기 위해서다. 제목 문자열이 아니라 **동일성**으로 가른다.
@@ -563,6 +566,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
     priorFindings,
     goalFile,
     goalType,
+    shardBoundary,
     goal,
     listBlock('수용기준', acceptance),
     applied,
@@ -584,7 +588,7 @@ export function buildReviewIntent(i: Readonly<ReviewIntentInput>): string {
   //   `…[N개 생략됨]`** 이 됐다. 그러면 리뷰는 *"실행하지 않았다 · 증거가 없다"* 를 적고 — 그것이
   //   **리뷰 입장에서 사실**이라 반박도 안 된다. 두 트랙 합쳐 **여섯 런**이 이 사인으로 죽었다.
   //   ⭐ 목표 본문을 뒤로 미뤄도 잃는 것이 적다 — **수용기준·경계는 이미 추출돼 보호 블록**에 있다.
-  const evidenceBlocks = [priorFindings, designGate, applied, preexisting, importerTestsNotRun, gateEvidence, designCheck, shardSiblings, coverage, claims, runFacts, goalFile].filter((b): b is Block => Boolean(b));
+  const evidenceBlocks = [shardBoundary, priorFindings, designGate, applied, preexisting, importerTestsNotRun, gateEvidence, designCheck, shardSiblings, coverage, claims, runFacts, goalFile].filter((b): b is Block => Boolean(b));
   const otherBlocks = blocks.filter((block) => !protectedBlocks.includes(block) && !evidenceBlocks.includes(block) && block !== goal);
   const order = [...protectedBlocks, ...evidenceBlocks, ...otherBlocks, ...(goal ? [goal] : [])];
   // ⛔⭐⭐⭐ 1차는 우선순위와 무관하게 공정 몫까지만 준다. 목표 본문은 이미 추출된

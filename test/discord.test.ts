@@ -378,6 +378,40 @@ describe('DiscordBot', () => {
     expect(received).toEqual(['TESTCH']);
   });
 
+  // EV12c — an allowlisted user @mentioning the bot opens any guild channel; the mention token is stripped.
+  test('allowlisted @mention of the bot is answered in an unscoped guild channel, mention stripped', async () => {
+    MockWs.instances.length = 0;
+    const { fetchImpl } = makeStubFetch(() => ({ id: 'msg' }));
+    const received: Array<{ channelId: string; text: string }> = [];
+    const bot = new DiscordBot({
+      token: 'xyz', allowedUsers: ['user-42'],
+      onMessage: async (ctx) => { received.push({ channelId: ctx.channelId, text: ctx.text }); return 'ok'; },
+      fetchImpl, wsImpl: MockWs as any,
+    });
+    const p = bot.start();
+    await new Promise(r => setTimeout(r, 5));
+    const ws = MockWs.instances[0]!;
+    ws.fire({ op: 10, d: { heartbeat_interval: 41250 } });
+    ws.fire({ op: 0, t: 'READY', s: 1, d: { user: { id: 'BOT1', username: 'monad_agent' }, session_id: 's' } });
+    const guildMsg = (id: string, author: string, content: string, mentions: string[] = []) => ({
+      op: 0, t: 'MESSAGE_CREATE', s: 2,
+      d: {
+        id, channel_id: 'MONAD', guild_id: 'G1', content,
+        mentions: mentions.map(m => ({ id: m })),
+        author: { id: author, username: 'u', bot: false },
+      },
+    });
+    ws.fire(guildMsg('m1', 'user-42', '<@BOT1> 하이?', ['BOT1']));   // mention → flows
+    ws.fire(guildMsg('m2', 'user-42', '<@!BOT1>  상태'));             // nick-form token, no mentions array → flows
+    ws.fire(guildMsg('m3', 'user-42', '하이?'));                      // no mention, unscoped → gated
+    ws.fire(guildMsg('m4', 'stranger', '<@BOT1> 하이?', ['BOT1']));  // not allowlisted → gated
+    await new Promise(r => setTimeout(r, 50));
+    bot.stop();
+    ws.close();
+    await p;
+    expect(received).toEqual([{ channelId: 'MONAD', text: '하이?' }, { channelId: 'MONAD', text: '상태' }]);
+  });
+
   test('DM from non-allowlisted user gets refusal message', async () => {
     MockWs.instances.length = 0;
     const { fetchImpl, calls } = makeStubFetch(() => ({ id: 'msg' }));

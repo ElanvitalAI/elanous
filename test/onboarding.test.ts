@@ -8,13 +8,16 @@
 //   4. markOnboardingComplete fires (onboarding.completed = true).
 //   5. Telegram can be skipped cleanly.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runOnboarding, runOnboardingStep, scriptedIO, needsOnboarding, resetOnboardingMarker, shouldRefuseInteractiveOnboarding } from '../src/onboarding';
 import { CODEX_MODELS } from '../src/codex/models';
 import { buildUserConfig, resetUserConfig } from '../src/user-config';
+
+// Onboarding now detects real subscription logins (OB1); scripted tests pin «nothing detected».
+const NO_SUBSCRIPTION_DETECT = { detectProviders: async () => [], hasCodexCliLogin: () => false };
 
 let root: string;
 let cfgPath: string;
@@ -143,10 +146,10 @@ describe('interactive onboarding refusal', () => {
     expect(existsSync(cfgPath)).toBe(true);
   });
 
-  test('piped setup llm refuses before prompting or saving config', async () => {
+  test('piped setup refuses before prompting or saving config', async () => {
     const stateRoot = mkdtempSync(join(tmpdir(), 'onboarding-piped-cli-'));
     try {
-      const proc = Bun.spawn(['bun', 'bin/elanous.mjs', '--test', 'setup', 'llm'], {
+      const proc = Bun.spawn(['bun', 'bin/elanous.mjs', '--test', 'setup'], {
         cwd: join(import.meta.dir, '..'),
         env: {
           ...process.env,
@@ -166,7 +169,7 @@ describe('interactive onboarding refusal', () => {
         new Response(proc.stderr).text(),
       ]);
       expect(code).not.toBe(0);
-      expect(`${stdout}\n${stderr}`).toContain('elanous setup --non-interactive --config <path>');
+      expect(`${stdout}\n${stderr}`).toContain('대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다. 무인 설정은 `elanous setup --non-interactive`를 사용하라.');
       expect(existsSync(join(stateRoot, '.elanous-test', 'config.json'))).toBe(false);
     } finally {
       rmSync(stateRoot, { recursive: true, force: true });
@@ -200,7 +203,7 @@ describe('onboarding wizard', () => {
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
 
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('openai-codex');
     expect(cfg.llm.apiKey).toBe('sk-test-codex-1234567890abcdef');
     expect(cfg.llm.model).toBe('codex-mini-latest');
@@ -246,8 +249,7 @@ describe('onboarding wizard', () => {
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
 
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       telegramDeps: { validateToken: false },
       // Bundle 1' · stub local probe to 0 models so the wizard falls
       // through to the manual model + baseUrl prompts that this test
@@ -280,8 +282,7 @@ describe('onboarding wizard', () => {
       'n',          // Discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       localProbeDeps: {
         probe: async () => [{
           id: 'llama3.2',
@@ -311,8 +312,7 @@ describe('onboarding wizard', () => {
       'n',          // Discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       localProbeDeps: {
         probe: async () => [
           { id: 'llama3.2', label: 'Llama 3.2', runtime: 'ollama', nodeId: 'local', baseUrl: 'http://localhost:11434/v1' },
@@ -339,8 +339,7 @@ describe('onboarding wizard', () => {
       'n',          // Discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       localProbeDeps: {
         probe: async () => [
           { id: 'llama3.2', label: 'Llama 3.2', runtime: 'ollama', nodeId: 'local', baseUrl: 'http://localhost:11434/v1' },
@@ -364,8 +363,7 @@ describe('onboarding wizard', () => {
       'n',                              // Discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       localProbeDeps: { probe: async () => [] },
     });
     expect(cfg.llm.provider).toBe('local');
@@ -388,8 +386,7 @@ describe('onboarding wizard', () => {
       'n',                              // Discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       localProbeDeps: {
         probe: async () => { throw new Error('probe blew up'); },
       },
@@ -399,24 +396,43 @@ describe('onboarding wizard', () => {
     expect(io.outputs.join('\n')).toMatch(/probe failed: probe blew up/);
   });
 
-  test('all-default path: just press enter everywhere → auto provider', async () => {
-    // Fresh config has provider='auto', so defaultIdx lands on the 'auto'
-    // choice (index 6). The wizard skips api-key/model/baseUrl prompts
-    // for auto, so only 4 blanks + 'n' are consumed after the LLM pick.
+  test('all-default path with no subscription detected → ChatGPT/Codex is preselected (OB1), not env-only auto', async () => {
+    // OB1 (10-01): the old default was «Auto-detect (env vars)», so a subscriber pressing Enter got nothing.
     const io = scriptedIO([
-      '',          // LLM: default → auto (current provider)
-      '',          // Skills: default (1 = opencode)
+      '',          // LLM: default → OpenAI Codex (no subscription detected)
+      '3',         // Codex auth: skip (no network in tests)
+      '',          // Codex model: default
+      '',          // Skills: default
       '',          // no extra dirs
       '',          // Obsidian: default vault
       'n',         // Telegram: no
       'n',         // Discord: no
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
-    expect(cfg.llm.provider).toBe('auto');
-    expect(cfg.skills.activeSet).toBe('claudecode');
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
+    expect(cfg.llm.provider).toBe('openai-codex');
     expect(cfg.telegram.enabled).toBe(false);
     expect(cfg.onboarding.completed).toBe(true);
+  });
+
+  test('a detected Grok subscription is preselected and announced (OB1)', async () => {
+    const printed: string[] = [];
+    let llmDefault: number | undefined;
+    const io = scriptedIO([]);
+    const capture: typeof io = {
+      ...io,
+      print: (line: string) => { printed.push(line); },
+      choose: async (_prompt, choices, opts, stepId) => {
+        if (stepId === 'llm') { llmDefault = opts?.defaultIndex; throw new Error('stop-after-llm-pick'); }
+        return choices[opts?.defaultIndex ?? 0]!.value;
+      },
+    };
+    await runOnboarding({
+      grokDeps: { detectProviders: async () => [{ provider: 'grok', auth: 'oauth', source: 'grok-auth', available: true, rank: 1 }], hasCodexCliLogin: () => false },
+      io: capture, path: cfgPath,
+    }).catch((error: Error) => { if (!String(error.message).includes('stop-after-llm-pick')) throw error; });
+    expect(printed.some(line => line.includes('Found Grok subscription') && line.includes('~/.grok/auth.json'))).toBe(true);
+    expect(llmDefault).toBe(2); // 3) Grok (xAI) — zero-based index 2
   });
 
   test('auto provider skips api key / model prompts', async () => {
@@ -429,7 +445,7 @@ describe('onboarding wizard', () => {
       'n',        // Discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('auto');
     expect(cfg.llm.apiKey).toBeUndefined();
     expect(cfg.llm.model).toBeUndefined();
@@ -448,8 +464,61 @@ describe('onboarding wizard', () => {
       'n',  // Step 5 — Discord: disabled
       '1',  // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(needsOnboarding(cfg)).toBe(false);
+  });
+
+  test('post-save continue-here reuses daemon endpoint, 24h phone link and optional QR without exposing tokens in debug', async () => {
+    const { debug } = await import('../src/debug/log');
+    const logged: unknown[][] = [];
+    const logSpy = spyOn(debug, 'log').mockImplementation((...args) => { logged.push(args); });
+    const qrCalls: string[] = [];
+    const token = 'elt_test+secret/for-encoding';
+    const io = scriptedIO(['10', '1', root, 'n', 'n', '1']);
+    try {
+      await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath, continueHereDeps: {
+        showNexus: async () => ({ status: 'unregistered', urls: {
+          pwa: { loopback: 'http://127.0.0.1:31415/app/', tailnet: 'https://machine.ts.net/app/' },
+          rest: { loopback: 'http://127.0.0.1:31415/v1/', tailnet: 'https://machine.ts.net/v1/' },
+          sse: { loopback: 'http://127.0.0.1:31415/v1/events' },
+        } }),
+        issueToken: () => ({ token }),
+        renderQr: (link) => { qrCalls.push(link); return 'QR IMAGE'; },
+      } });
+      const link = qrCalls[0]!;
+      expect(link).toStartWith('elanous://connect?');
+      expect(new URL(link).searchParams.get('host')).toBe('machine.ts.net');
+      expect(new URL(link).searchParams.get('tls')).toBe('1');
+      expect(new URL(link).searchParams.get('token')).toBe(token);
+      const output = io.outputs.join('\n');
+      expect(output).toContain('Browser: https://machine.ts.net/app/');
+      expect(output).toContain(`Phone: ${link}`);
+      expect(output).toContain('QR IMAGE');
+      expect(io.outputs.filter(line => line.includes(link))).toEqual([`  Phone: ${link}`]);
+      expect(logged).toContainEqual(['onboarding.continue-here', 'phone-link-issued', { kind: 'tailnet', tls: true, temp: true }]);
+      expect(logged).toContainEqual(['onboarding.continue-here', 'shown', { daemonRunning: true, interactive: true, phoneLinkIssued: true, telegramEnabled: false }]);
+      expect(JSON.stringify(logged)).not.toContain(token);
+      expect(JSON.stringify(logged)).not.toContain('elanous://connect');
+      expect(buildUserConfig(cfgPath).onboarding.completed).toBe(true);
+    } finally { logSpy.mockRestore(); }
+  });
+
+  test('post-save absent daemon keeps start/browser/phone commands and never issues a token', async () => {
+    const io = scriptedIO(['10', '1', root, 'n', 'n', '1']);
+    let issued = 0;
+    let rendered = 0;
+    await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath, continueHereDeps: {
+      showNexus: async () => ({ status: 'absent' }),
+      issueToken: () => { issued++; return { token: 'elt_no_daemon' }; },
+      renderQr: () => { rendered++; return 'QR IMAGE'; },
+    } });
+    const output = io.outputs.join('\n');
+    expect(output).toContain('Start the daemon: `elanous nexus run`');
+    expect(output).toContain('Browser: `elanous nexus show`');
+    expect(output).toContain('Phone: `elanous phone link --temp --ttl 24h`');
+    expect(output).not.toContain('elt_no_daemon');
+    expect(issued).toBe(0);
+    expect(rendered).toBe(0);
   });
 
   test('scripted IO captures prompts for debugging', async () => {
@@ -462,7 +531,7 @@ describe('onboarding wizard', () => {
       'n',  // Step 5 — Discord: disabled
       '1',  // Step 6 — Voice & AI: Smart defaults
     ]);
-    await runOnboarding({ io, path: cfgPath });
+    await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     const prompts = io.outputs.join('\n');
     // The scripted wizard runs six configuration steps; the seventh slot
     // is reserved for the interactive-only wrap-up recap.
@@ -494,8 +563,7 @@ describe('onboarding wizard', () => {
       'n',                     // discord: no
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       telegramDeps: { validateToken: true, fetchImpl: fakeFetch },
     });
     expect(cfg.telegram.enabled).toBe(true);
@@ -521,8 +589,7 @@ describe('onboarding wizard', () => {
       'n',                     // discord: no
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       telegramDeps: { validateToken: true, fetchImpl: (async () => ({ json: async () => ({ ok: true, result: {} }) })) as any },
     });
     expect(cfg.telegram.enabled).toBe(true);
@@ -543,7 +610,7 @@ describe('onboarding wizard', () => {
       'n',        // discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('openai-codex');
     expect(cfg.llm.apiKey).toBeUndefined();
     const output = io.outputs.join('\n');
@@ -563,7 +630,7 @@ describe('onboarding wizard', () => {
       'n',         // discord
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('auto');
   });
 
@@ -575,7 +642,7 @@ describe('onboarding wizard', () => {
       'n',                     // discord: no
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.discord.enabled).toBe(false);
     expect(cfg.discord.botToken).toBeUndefined();
     expect(cfg.discord.allowedUsers).toEqual([]);
@@ -593,8 +660,7 @@ describe('onboarding wizard', () => {
       '345678901234567890',                   // home channel
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       discordDeps: { validateToken: false },
     });
     expect(cfg.discord.enabled).toBe(true);
@@ -614,8 +680,7 @@ describe('onboarding wizard', () => {
       '',                                     // no home channel
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       discordDeps: { validateToken: false },
     });
     expect(cfg.discord.allowedUsers).toEqual(['123456789012345678', '234567890123456789']);
@@ -634,8 +699,7 @@ describe('onboarding wizard', () => {
       '',                   // no home
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       discordDeps: { validateToken: true, fetchImpl: (async () => ({ ok: true, json: async () => ({}) })) as any },
     });
     expect(cfg.discord.enabled).toBe(true);
@@ -661,8 +725,7 @@ describe('onboarding wizard', () => {
       '',
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       discordDeps: { validateToken: true, fetchImpl: fakeFetch },
     });
     expect(cfg.discord.enabled).toBe(true);
@@ -678,7 +741,7 @@ describe('onboarding wizard', () => {
       '10', '1', '', 'n', 'n',  // auto / opencode / no extras / default obsidian / no telegram / no discord
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.onboarding.completed).toBe(true);
     expect(cfg.skills.activeSet).toBe('claudecode');
 
@@ -715,8 +778,7 @@ describe('onboarding wizard', () => {
       '',
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    await runOnboarding({
-      io, path: cfgPath,
+    await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       discordDeps: { validateToken: false },
     });
     const summary = io.outputs.join('\n');
@@ -745,8 +807,7 @@ describe('onboarding wizard', () => {
       'n',
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       telegramDeps: { validateToken: true, fetchImpl: fakeFetch },
     });
     expect(cfg.telegram.botToken).toBe('12345:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef');
@@ -770,7 +831,7 @@ describe('onboarding wizard', () => {
       'n',                  // discord
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.apiKey).toBe('sk-final-too-short');
     expect(io.outputs.join('\n')).toMatch(/looks too short/);
   });
@@ -791,8 +852,7 @@ describe('onboarding wizard', () => {
       '',
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({
-      io, path: cfgPath,
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath,
       discordDeps: { validateToken: true, fetchImpl: fakeFetch },
     });
     expect(cfg.discord.botToken).toBe('MTAxNzMtBOT.GabCdEf-Y9.aBcDeFgHiJkLmNoPqRsTuVwXyZ012345678901');
@@ -806,7 +866,7 @@ describe('onboarding wizard', () => {
     const cfg = await runOnboarding({
       io,
       path: cfgPath,
-      grokDeps: {
+      grokDeps: { ...NO_SUBSCRIPTION_DETECT,
         resolveCredential: () => ({
           kind: 'subscription',
           baseUrl: 'https://cli-chat-proxy.grok.com/v1',
@@ -831,7 +891,7 @@ describe('onboarding wizard', () => {
     const cfg = await runOnboarding({
       io,
       path: cfgPath,
-      grokDeps: {
+      grokDeps: { ...NO_SUBSCRIPTION_DETECT,
         resolveCredential: () => ({
           kind: 'subscription',
           baseUrl: 'https://cli-chat-proxy.grok.com/v1',
@@ -859,7 +919,7 @@ describe('onboarding wizard', () => {
       io,
       path: cfgPath,
       initial,
-      grokDeps: {
+      grokDeps: { ...NO_SUBSCRIPTION_DETECT,
         resolveCredential: () => ({
           kind: 'subscription',
           baseUrl: 'https://cli-chat-proxy.grok.com/v1',
@@ -880,7 +940,7 @@ describe('onboarding wizard', () => {
     const cfg = await runOnboarding({
       io,
       path: cfgPath,
-      grokDeps: {
+      grokDeps: { ...NO_SUBSCRIPTION_DETECT,
         resolveCredential: () => ({
           kind: 'subscription',
           baseUrl: 'https://cli-chat-proxy.grok.com/v1',
@@ -921,7 +981,7 @@ describe('onboarding wizard', () => {
     await runOnboarding({
       io,
       path: cfgPath,
-      grokDeps: {
+      grokDeps: { ...NO_SUBSCRIPTION_DETECT,
         resolveCredential: () => ({
           kind: 'api_key',
           baseUrl: 'https://api.x.ai/v1',
@@ -949,7 +1009,7 @@ describe('onboarding wizard', () => {
       'n',                   // discord
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('grok');
     expect(cfg.llm.apiKey).toBe('xai-1234567890abcdef');
     expect(io.outputs.join('\n')).toMatch(/whitespace/);
@@ -973,7 +1033,7 @@ describe('onboarding wizard', () => {
       'n',     // Discord off
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('auto');
     expect(cfg.skills.activeSet).toBe('claudecode');
     expect(cfg.onboarding.completed).toBe(true);
@@ -992,7 +1052,7 @@ describe('onboarding wizard', () => {
       'n',     // Discord
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('auto');
     expect(cfg.obsidian.vault).toBe(vault);
     expect(cfg.telegram.enabled).toBe(false);
@@ -1015,7 +1075,7 @@ describe('onboarding wizard', () => {
       'n', 'n',
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
-    const cfg = await runOnboarding({ io, path: cfgPath });
+    const cfg = await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath });
     expect(cfg.llm.provider).toBe('auto');
     expect(io.outputs.join('\n')).toMatch(/no match for "\$"/);
   });

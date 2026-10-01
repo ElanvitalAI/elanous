@@ -1,6 +1,6 @@
 import { test, expect, describe, spyOn } from 'bun:test';
 import { debug } from '../debug/log.js';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveSelfDevRun, loadSelfDevRun, selfDevRunsDir } from './run-store.js';
@@ -811,7 +811,8 @@ describe('산출물의 «눈» — 판정 «전»에 보고, 「안 쟀다」와
         storageSource: 'run-store-dir',
       },
     });
-    expect(loadSelfDevRun(legacyRunId, isolatedDir)).toBeNull();
+    // loadSelfDevRun falls back to the machine-ledger mirror (#22313), so check isolatedDir's own checkpoint file.
+    expect(existsSync(join(isolatedDir, `${legacyRunId}.json`))).toBe(false);
 
     const missingDir = join(mkdtempSync(join(tmpdir(), 'supervisor-stop-missing-dir-')), 'absent');
     const missingDirectoryEvents: Array<{ event: string; data: Record<string, unknown> }> = [];

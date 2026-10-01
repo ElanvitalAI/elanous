@@ -142,3 +142,25 @@ describe('회귀 가드 — 호출 지점에 모델 이름을 박지 않는다',
     expect(offenders).toEqual([]);
   });
 });
+
+describe('tierModel — `auto` uses the decided provider ladder (GRK1)', () => {
+  it('a grok-only auto config asks for grok models, not Claude', async () => {
+    const { setUserConfigOverlay } = await import('../user-config.js');
+    const { setAutoProviderDecisionForTest } = await import('./model-defaults.js');
+    setUserConfigOverlay((cfg) => ({ ...cfg, llm: { ...cfg.llm, provider: 'auto' } }));
+    try {
+      setAutoProviderDecisionForTest(() => 'grok');
+      expect(budgetModel()).toBe(tierModel('budget', 'grok'));
+      expect(tierModel('balanced')).toBe(tierModel('balanced', 'grok'));
+      expect(budgetModel()).not.toMatch(/^claude-/);
+      setAutoProviderDecisionForTest(() => 'openai-codex');
+      expect(budgetModel()).toBe(tierModel('budget', 'openai-codex'));
+      setAutoProviderDecisionForTest(() => undefined);
+      expect(tierModel('balanced')).toBe(tierModel('balanced', 'auto'));
+      expect(tierModel('budget', 'anthropic')).toBe('claude-haiku-4-5');
+    } finally {
+      setAutoProviderDecisionForTest(undefined);
+      setUserConfigOverlay(null);
+    }
+  });
+});

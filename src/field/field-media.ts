@@ -52,6 +52,8 @@ export interface FieldMediaInput {
   bytes: Uint8Array;
   /** 촬영 시각(ISO 문자열·epoch ms). 못 읽으면 업로드 시각. */
   capturedAt?: string | number | Date;
+  /** 이 파일에 붙일 자막. */
+  caption?: string;
 }
 
 export interface FieldSaveOptions {
@@ -178,7 +180,7 @@ export function saveFieldMedia(inputs: FieldMediaInput[], opts: FieldSaveOptions
     total += size;
     if (total > FIELD_MAX_REQUEST_BYTES) throw new FieldUploadError('too-large', 'the request exceeds 250 MB');
     const name = `${fieldTimestamp(input.capturedAt, now)}-${opts.device}-${sanitizeFieldName(input.originalName, mime)}`;
-    return { name, bytes: input.bytes };
+    return { name, bytes: input.bytes, caption: input.caption };
   });
 
   mkdirSync(dir, { recursive: true });
@@ -190,8 +192,11 @@ export function saveFieldMedia(inputs: FieldMediaInput[], opts: FieldSaveOptions
     atomicWrite(dir, name, item.bytes);
     saved.push({ name, bytes: item.bytes.byteLength });
   }
-  const line = normalizeFieldCaption(opts.caption);
-  if (line && saved[0]) appendFileSync(join(dir, FIELD_CAPTIONS_FILE), `${saved[0].name} | ${line}\n`);
+  const lines = planned.flatMap((item, i) => {
+    const line = normalizeFieldCaption(item.caption ?? (i === 0 ? opts.caption : undefined));
+    return line ? [`${saved[i]!.name} | ${line}\n`] : [];
+  });
+  if (lines.length) appendFileSync(join(dir, FIELD_CAPTIONS_FILE), lines.join(''));
   const count = refreshFieldReady(dir);
   return { event: opts.event, dir, saved, count };
 }

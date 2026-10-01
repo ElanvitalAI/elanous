@@ -128,6 +128,7 @@ export function nonInteractiveIO(opts: NonInteractiveOptions = {}): WizardIO {
       section = STEP_SECTIONS[spec.index];
     },
     print,
+    nonInteractive: true,
     complete: reportUnusedAnswers,
     close: () => { /* no resources to release */ },
   };

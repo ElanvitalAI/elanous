@@ -16,9 +16,12 @@ import { createCdpClientFromEndpoint, CdpUnavailable, type CdpClient } from '../
 import { captureWithTimeout, describeCaptureFailure } from './browser-capture-timeout.js';
 import { debug } from '../debug/log.js';
 import { stripScreenAnsi } from './harness-screen.js';
+import { classifyAsideRun, type AsideRunStatus } from './aside-run-status.js';
+import { IMAGE_LOAD_STATE_SOURCE } from './image-load-state.js';
 
 const execFileAsync = promisify(execFile);
-const DEFAULT_ASIDE_TIMEOUT_MS = 10_000;
+// Longer than aside's own ~10 s daemon auth-challenge timeout, so «Aside isn't running» reaches stderr before we kill it (10-01 live).
+const DEFAULT_ASIDE_TIMEOUT_MS = 30_000;
 // Observed load events and complete page content arrive within this window; timeout remains non-blocking.
 const CDP_LOAD_WAIT_TIMEOUT_MS = 3_000;
 
@@ -74,6 +77,8 @@ export interface DeployVerifyResult {
   title?: string;
   bodyLength?: number;
   screenshotBytes?: number;
+  /** 아직 화면 밖이라 요청되지 않은 lazy 그림 수(실패가 아님). */
+  pendingLazyImages?: number;
   /** 렌더 문제(빈 페이지·에러 등). ok=false 면 최소 1건. */
   findings: string[];
   /** findings와 병행하는 등급 있는 판정. 정상·CDP 미가용 결과에는 생략해 기존 결과 모양을 보존한다. */
@@ -81,10 +86,10 @@ export interface DeployVerifyResult {
   /** 측정하지 못한 선택적 신호. 빈 배열은 생략하므로 문제 없음과 구별된다. */
   unmeasured?: DeployUnmeasuredCheck[];
   /** 관측 백엔드 미가용으로 검증 스킵됨(배포는 막지 않음). */
-  skipped?: 'no-cdp' | 'no-aside';
+  skipped?: 'no-cdp' | 'no-aside' | 'aside-not-running';
 }
 
-export type AsideRunner = (command: string, args: string[], options: { timeout: number }) => Promise<{ stdout: string }>;
+export type AsideRunner = (command: string, args: string[], options: { timeout: number }) => Promise<{ stdout: string; stderr?: string; exitCode?: number | null; timedOut?: boolean }>;
 
 export interface DeployVerifyDeps {
   /** 기본 CDP 또는 별도 브라우저 세션을 쓰는 aside. */
@@ -121,8 +126,17 @@ interface PageState {
   title: string;
   bodyLength: number;
   unloadedImageCount: number;
+  pendingLazyImages: number;
   consecutiveDuplicateText: string | null;
 }
+
+const IMAGE_COUNTS_EXPRESSION = `(${IMAGE_LOAD_STATE_SOURCE})(Array.from(document.images, (image) => {
+  const rect = image.getBoundingClientRect();
+  return {
+    complete: image.complete, naturalWidth: image.naturalWidth, loading: image.loading,
+    inViewport: rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth,
+  };
+}))`;
 
 const PAGE_STATE_EXPRESSION = `(() => {
   const isVisible = (element) => {
@@ -141,10 +155,12 @@ const PAGE_STATE_EXPRESSION = `(() => {
     }
   }
   const consecutiveDuplicateText = textUnits.find((text, index) => text === textUnits[index + 1]) ?? null;
+  const imageCounts = ${IMAGE_COUNTS_EXPRESSION};
   return {
     title: document.title,
     bodyLength: document.body ? document.body.innerText.length : 0,
-    unloadedImageCount: Array.from(document.images).filter((image) => !image.complete || image.naturalWidth === 0).length,
+    unloadedImageCount: imageCounts.broken,
+    pendingLazyImages: imageCounts.pendingLazy,
     consecutiveDuplicateText,
   };
 })()`;
@@ -169,7 +185,7 @@ function buildAsideScript(url: string): string {
     '  const page = await openTab(url);',
     '  try {',
     '    const title = await page.title();',
-    "    const state = await page.evaluate(() => ({ bodyLength: document.body?.innerText.length ?? 0, unloadedImageCount: Array.from(document.images).filter((image) => !image.complete || image.naturalWidth === 0).length }));",
+    `    const state = await page.evaluate(() => { const imageCounts = ${IMAGE_COUNTS_EXPRESSION}; return { bodyLength: document.body?.innerText.length ?? 0, unloadedImageCount: imageCounts.broken, pendingLazyImages: imageCounts.pendingLazy }; });`,
     '    const screenshot = await page.screenshot({ fullPage: true });',
     '    console.log(JSON.stringify({ title, ...state, screenshotBytes: screenshot?.length ?? 0 }));',
     '  } finally { try { await closeTab(page); } catch {} }',
@@ -177,7 +193,7 @@ function buildAsideScript(url: string): string {
   ].join('\n');
 }
 
-function parseAsideObservation(stdout: string): { title: string; bodyLength: number; unloadedImageCount: number; screenshotBytes: number } {
+function parseAsideObservation(stdout: string): { title: string; bodyLength: number; unloadedImageCount: number; pendingLazyImages: number; screenshotBytes: number } {
   const normalizedStdout = stripScreenAnsi(stdout);
   const verdict = normalizedStdout.trimEnd().match(/\[(ok|error)\s*\|[^\]]+\]\s*$/);
   if (!verdict) throw new Error('aside observation output missing completion marker');
@@ -189,16 +205,17 @@ function parseAsideObservation(stdout: string): { title: string; bodyLength: num
       const result: unknown = JSON.parse(line.trim());
       parsedJson = true;
       if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('aside observation JSON must be an object');
-      const { title, bodyLength, unloadedImageCount, screenshotBytes } = result as Record<string, unknown>;
+      const { title, bodyLength, unloadedImageCount, pendingLazyImages = 0, screenshotBytes } = result as Record<string, unknown>;
       if (
         typeof title !== 'string'
         || typeof bodyLength !== 'number' || !Number.isFinite(bodyLength) || bodyLength < 0
         || typeof unloadedImageCount !== 'number' || !Number.isFinite(unloadedImageCount) || unloadedImageCount < 0
+        || typeof pendingLazyImages !== 'number' || !Number.isFinite(pendingLazyImages) || pendingLazyImages < 0
         || typeof screenshotBytes !== 'number' || !Number.isFinite(screenshotBytes) || screenshotBytes < 0
       ) {
         throw new Error('aside observation JSON has invalid required fields');
       }
-      return { title, bodyLength, unloadedImageCount, screenshotBytes };
+      return { title, bodyLength, unloadedImageCount, pendingLazyImages, screenshotBytes };
     } catch (error) {
       if (parsedJson) throw error;
     }
@@ -206,9 +223,9 @@ function parseAsideObservation(stdout: string): { title: string; bodyLength: num
   throw new Error('aside observation output missing JSON');
 }
 
-function asideErrorResult(url: string, error: unknown): DeployVerifyResult {
+function asideErrorResult(url: string, error: unknown, kind?: AsideRunStatus['kind']): DeployVerifyResult {
   const message = error instanceof Error ? error.message : String(error);
-  const errorFinding = finding('aside-error', `aside 검증 오류: ${message.slice(0, 120)}`, 'confirmed');
+  const errorFinding = finding('aside-error', `aside 검증 오류: ${message.slice(0, 120)}${kind ? ` (${kind})` : ''}`, 'confirmed');
   observe('verify-aside-failed', { url: url.slice(0, 80), error: message.slice(0, 120) });
   return { ok: false, url, findings: [errorFinding.message], structuredFindings: [errorFinding], unmeasured: ['javascript-errors'] };
 }
@@ -224,15 +241,21 @@ async function verifyAsidePage(url: string, deps: DeployVerifyDeps): Promise<Dep
     const runAside = deps.runAside ?? (async (command, args, options) => {
       try {
         const result = await execFileAsync(command, args, { ...options, encoding: 'utf8' });
-        return { stdout: result.stdout };
+        return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error;
-        const stdout = (error as { stdout?: unknown }).stdout;
-        if (typeof stdout === 'string') return { stdout };
+        const { stdout, stderr, code, killed, signal } = error as { stdout?: unknown; stderr?: unknown; code?: unknown; killed?: unknown; signal?: unknown };
+        if (typeof stdout === 'string' || typeof stderr === 'string') {
+          return {
+            stdout: typeof stdout === 'string' ? stdout : '', stderr: typeof stderr === 'string' ? stderr : '',
+            exitCode: typeof code === 'number' ? code : null,
+            ...(killed === true || typeof signal === 'string' ? { timedOut: true } : {}),
+          };
+        }
         throw error;
       }
     });
-    let observation: { stdout: string };
+    let observation: Awaited<ReturnType<AsideRunner>>;
     try {
       observation = await runAside(deps.asideCommand ?? 'aside', ['repl', script], { timeout: deps.asideTimeoutMs ?? DEFAULT_ASIDE_TIMEOUT_MS });
     } catch (error) {
@@ -242,13 +265,20 @@ async function verifyAsidePage(url: string, deps: DeployVerifyDeps): Promise<Dep
       }
       return asideErrorResult(url, error);
     }
+    const status = classifyAsideRun({ stdout: observation.stdout, stderr: observation.stderr ?? '', exitCode: observation.exitCode ?? null, timedOut: observation.timedOut === true });
+    if (status.kind === 'not-running' || status.kind === 'auth-timeout') {
+      observe('verify-aside-skipped', { url, kind: status.kind });
+      return { ok: false, url, skipped: 'aside-not-running', findings: [status.hint ?? 'Aside 브라우저를 켜고 다시'], unmeasured: ['javascript-errors', 'screenshot'] };
+    }
+    if (status.kind === 'repl-error') return asideErrorResult(url, new Error('aside repl reported error'), status.kind);
+    if (status.kind === 'no-marker') return asideErrorResult(url, new Error('aside observation output missing completion marker'), status.kind);
     const state = parseAsideObservation(observation.stdout);
     const structuredFindings: DeployVerifyFinding[] = [];
     if (state.bodyLength < minBody) structuredFindings.push(finding('empty-body', `페이지 본문이 비어있음(len=${state.bodyLength}·렌더 실패 의심)`, 'suspected'));
     if (state.unloadedImageCount) structuredFindings.push(finding('unloaded-image', `로드되지 못한 그림 ${state.unloadedImageCount}개`, 'confirmed'));
     if (!state.title.trim()) structuredFindings.push(finding('empty-title', '문서 제목이 비어있음', 'confirmed'));
     const findings = structuredFindings.map(({ message }) => message);
-    const result: DeployVerifyResult = { ok: findings.length === 0, url, title: state.title, bodyLength: state.bodyLength, screenshotBytes: state.screenshotBytes, findings, unmeasured: ['javascript-errors'], ...(structuredFindings.length ? { structuredFindings } : {}) };
+    const result: DeployVerifyResult = { ok: findings.length === 0, url, title: state.title, bodyLength: state.bodyLength, screenshotBytes: state.screenshotBytes, findings, unmeasured: ['javascript-errors'], ...(state.pendingLazyImages ? { pendingLazyImages: state.pendingLazyImages } : {}), ...(structuredFindings.length ? { structuredFindings } : {}) };
     observe('verified-aside', { url: url.slice(0, 80), ok: result.ok, bodyLength: state.bodyLength, bytes: state.screenshotBytes, findings: findings.length, unmeasured: result.unmeasured });
     return result;
   } catch (error) {
@@ -334,6 +364,7 @@ async function verifyCdpPage(url: string, deps: DeployVerifyDeps): Promise<Deplo
     return {
       ok, url, title, bodyLength, screenshotBytes: buf?.length ?? 0, findings,
       ...(structuredFindings.length ? { structuredFindings } : {}),
+      ...(state?.pendingLazyImages ? { pendingLazyImages: state.pendingLazyImages } : {}),
       ...(unmeasured ? { unmeasured } : {}),
     };
   } catch (e) {
@@ -362,9 +393,9 @@ export function formatVerifyUrlReport(
   const shotNote = shot === undefined ? '' : shot.written ? ` → ${shot.path}` : ` → ⛔ 못 씀(${shot.path})`;
   const lines = [
     `\n━━ 배포 검증: ${url} ━━`,
-    `  ${result.ok ? '✅ 렌더 정상' : '⚠️ 문제 감지'}`,
+    `  ${result.skipped === 'aside-not-running' ? '⚪ Aside 검증 건너뜀' : result.ok ? '✅ 렌더 정상' : '⚠️ 문제 감지'}`,
     `  title: ${result.title || '(없음)'}`,
-    `  본문 길이: ${result.bodyLength ?? '?'} · 스크린샷: ${result.screenshotBytes ?? 0} bytes${shotNote}`,
+    `  본문 길이: ${result.bodyLength ?? '?'} · 스크린샷: ${result.skipped === 'aside-not-running' ? '못 쟀다' : `${result.screenshotBytes ?? 0} bytes`}${shotNote}`,
   ];
   for (const f of result.findings) lines.push(`  - ${f}`);
   // ⛔⭐ 「못 쟀다」는 초록도 빨강도 아닌 «제 칸»이다 — 「없다」로 접지 않는다.

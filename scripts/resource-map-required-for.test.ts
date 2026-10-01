@@ -5,6 +5,7 @@ import { parse as parseYaml } from 'yaml';
 
 type Resource = {
   id?: unknown;
+  auth?: unknown;
   env?: unknown;
   required_for?: unknown;
   required_for_unknown?: unknown;
@@ -24,6 +25,16 @@ const existingRequiredFor = {
   'telegram-bot': ['outbound-alerts'],
   'telegram-mtproto': ['telegram-inject'],
   github: ['docs-lint', 'nightly-docops'],
+  openrouter: ['openrouter-llm'],
+  'claude-code-oauth': ['claude-budget-usage'],
+  'discord-hitl-bot': ['hitl-discord-approval'],
+  'telegram-hitl-bot': ['hitl-telegram-approval'],
+  'telegram-dogfood-script': ['c5-telegram-stream-dogfood'],
+  'edge-tts': ['tts'],
+  'macos-say': ['tts'],
+  topview: ['image-gen', 'video-gen', 'avatar-rig', 'canvas', 'music-gen', 'export'],
+  higgsfield: ['image-gen', 'video-gen'],
+  'epidemic-sound': ['licensed-music'],
 };
 
 const existingFreeFallback = {
@@ -44,6 +55,7 @@ const baselineEnvByResourceId: Record<string, string[]> = {
   zhipu: ['ZHIPU_API_KEY', 'GLM_API_KEY', 'BIGMODEL_API_KEY'],
   dashscope: ['DASHSCOPE_API_KEY', 'QWEN_API_KEY'],
   moonshot: ['MOONSHOT_API_KEY', 'KIMI_API_KEY'],
+  openrouter: ['OPENROUTER_API_KEY'],
   tavily: ['TAVILY_API_KEY', 'TAVILY_KEY'],
   firecrawl: ['FIRECRAWL_API_KEY'],
   jina: ['JINA_API_KEY'],
@@ -67,6 +79,10 @@ const baselineEnvByResourceId: Record<string, string[]> = {
   'aws-s3': ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY'],
   'typesafe-jev': ['TYPESAFE_API_KEY'],
   'elanous-llm-bridge': ['ELANOUS_LLM_API_KEY'],
+  'claude-code-oauth': ['CLAUDE_CODE_OAUTH_TOKEN'],
+  'discord-hitl-bot': ['ELANOUS_DISCORD_HITL_BOT_TOKEN'],
+  'telegram-hitl-bot': ['ELANOUS_TELEGRAM_HITL_BOT_TOKEN'],
+  'telegram-dogfood-script': ['TG_TOKEN'],
 };
 
 function nonEmpty(value: unknown): boolean {
@@ -84,12 +100,16 @@ function hasEnvField(resource: Resource): boolean {
   return Object.prototype.hasOwnProperty.call(resource, 'env');
 }
 
+function isKeylessResource(resource: Resource): boolean {
+  return resource.auth === 'none' || resource.auth === 'mcp' || resource.auth === 'cli-login';
+}
+
 function assertRequiredFor(resources: Resource[]): void {
   for (const resource of resources) {
     if (!resource || typeof resource !== 'object') throw new Error('resource must be an object');
     if (!hasEnvField(resource)) continue;
-    if (!Array.isArray(resource.env) || resource.env.length === 0 || !resource.env.every((name) => typeof name === 'string' && name.trim().length > 0)) {
-      throw new Error('env resource must have a non-empty env array of names');
+    if (!Array.isArray(resource.env) || (!isKeylessResource(resource) && resource.env.length === 0) || !resource.env.every((name) => typeof name === 'string' && name.trim().length > 0)) {
+      throw new Error('env resource must have a non-empty env array of names unless auth is none, mcp, or cli-login');
     }
     const hasRequiredFor = Object.hasOwn(resource, 'required_for');
     const hasUnknown = Object.hasOwn(resource, 'required_for_unknown');
@@ -116,7 +136,7 @@ function assertRequiredFor(resources: Resource[]): void {
 function envByResourceId(resources: Resource[]): Record<string, string[]> {
   const result: Record<string, string[]> = {};
   for (const resource of resources) {
-    if (!hasEnvField(resource)) continue;
+    if (!hasEnvField(resource) || (isKeylessResource(resource) && Array.isArray(resource.env) && resource.env.length === 0)) continue;
     if (typeof resource.id !== 'string' || resource.id.trim() === '') throw new Error('env resource must have a non-empty id');
     if (!Array.isArray(resource.env) || !resource.env.every((name) => typeof name === 'string')) throw new Error('env resource must have an env array');
     if (Object.hasOwn(result, resource.id)) throw new Error(`duplicate resource id: ${resource.id}`);
@@ -142,6 +162,22 @@ describe('resource map required_for ratchet', () => {
     const byId = new Map(resources.map((resource) => [String(resource.id), resource]));
     for (const [id, requiredFor] of Object.entries(existingRequiredFor)) expect(byId.get(id)?.required_for).toEqual(requiredFor);
     for (const [id, fallback] of Object.entries(existingFreeFallback)) expect(byId.get(id)?.free_fallback).toBe(fallback);
+  });
+
+  test.each(['none', 'mcp', 'cli-login'])('accepts keyless %s resources with required_for and reads', (auth) => {
+    const resources = parseResources(`resources:\n  - id: keyless\n    auth: ${auth}\n    env: []\n    required_for: [feature]\n    reads: src/example.ts\n`);
+    expect(() => assertRequiredFor(resources)).not.toThrow();
+    expect(envByResourceId(resources)).toEqual({});
+  });
+
+  test('rejects empty env for a credential-bearing resource', () => {
+    expect(() => assertRequiredFor(parseResources('resources:\n  - id: credential\n    auth: api-key\n    env: []\n    required_for: [feature]\n    reads: src/example.ts\n')))
+      .toThrow('env resource must have a non-empty env array of names unless auth is none, mcp, or cli-login');
+  });
+
+  test('rejects a keyless resource without required_for or required_for_unknown', () => {
+    expect(() => assertRequiredFor(parseResources('resources:\n  - id: keyless\n    auth: none\n    env: []\n')))
+      .toThrow('env resource must have exactly one required_for or required_for_unknown field');
   });
 
   test('rejects an env resource with neither mapping', () => {
@@ -181,7 +217,7 @@ describe('resource map required_for ratchet', () => {
   });
 
   test.each(['resources:\n  - env: []\n', 'resources:\n  - env: SOME_KEY\n'])('rejects malformed env fields: %s', (source) => {
-    expect(() => assertRequiredFor(parseResources(source))).toThrow('env resource must have a non-empty env array of names');
+    expect(() => assertRequiredFor(parseResources(source))).toThrow('env resource must have a non-empty env array of names unless auth is none, mcp, or cli-login');
   });
 
   test('rejects credential replacement or movement between resource IDs', () => {

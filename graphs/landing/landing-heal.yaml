@@ -12,11 +12,13 @@ nodes:
   - { node_id: collect, kind: observe, recipe: 'cmd:collect', max_visits: 1 }
   - { node_id: must-fix-match, kind: judge, recipe: 'cmd:must-fix-match', max_visits: 1 }
   - { node_id: verify-needed, kind: observe, recipe: 'cmd:verify-needed', max_visits: 1 }
+  - { node_id: clean-checkout, kind: observe, recipe: 'cmd:clean-checkout', max_visits: 1 }
   - { node_id: report, kind: observe, recipe: 'cmd:report', max_visits: 1 }
   - { node_id: done, kind: gate, recipe: none, max_visits: 1 }
   - { node_id: failed, kind: gate, recipe: none, max_visits: 1 }
 edges:
   - { from: collect, on: outcome, map: { ok: must-fix-match, fail: failed } }
   - { from: must-fix-match, on: outcome, map: { ok: verify-needed, fail: failed } }
-  - { from: verify-needed, on: outcome, map: { ok: report, fail: failed } }
+  - { from: verify-needed, on: outcome, map: { ok: clean-checkout, fail: failed } }
+  - { from: clean-checkout, on: outcome, map: { ok: report, fail: failed } }
   - { from: report, on: outcome, map: { ok: done, fail: failed } }

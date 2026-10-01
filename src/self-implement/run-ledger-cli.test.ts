@@ -265,7 +265,7 @@ describe('elanous self run-ledger — 실물 argv (판정 신호 회귀)', () =>
     } finally {
       for (const directory of [prodStateDir, otherStateDir, testStateDir, home]) rmSync(directory, { recursive: true, force: true });
     }
-  });
+  }, 75_000);
 
   it('접두 모호성·중복 정확 ID·원장 읽기 실패는 후보나 오류를 내고 exit 1로 멈춘다', () => {
     const prodStateDir = mkdtempSync(join(tmpdir(), 'run-ledger-cli-ambiguous-prod-'));

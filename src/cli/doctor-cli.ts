@@ -34,6 +34,7 @@ import { ADVISABLE_DOCTOR_FIX_IDS, adviseDoctorFixes, type DoctorAdvice } from '
 import { gitInstallPlan } from './git-install-plan.js';
 import { detectDistroFamily, parseOsRelease } from './doctor-distro.js';
 import { checkPythonEnv } from './python-cli.js';
+import { describeModes, formatModeLine, type DoctorMode } from './doctor-modes.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -99,6 +100,8 @@ export interface DoctorReport {
   externalCommands: DoctorExternalCommand[];
   requiredMissing?: string[];
   capabilitySummary?: DoctorCapabilitySummary;
+  /** Read-only configuration and chat-use status. Present on a successful report. */
+  modes?: DoctorMode[];
   /** F1 readiness. Present on a successful report. Absent when the report itself failed. */
   readiness?: ReadinessReport;
   reason?: string;
@@ -1044,6 +1047,7 @@ export function runDoctor(options: DoctorOptions = {}): DoctorReport {
       externalCommands: externalCommands.commands,
       requiredMissing,
       capabilitySummary: summarizeDoctorCapabilities(credentials),
+      modes: describeModes(resolutionOptions.userConfig),
       readiness: evaluateReadiness(readiness),
       retiredConfigKeys: findRetiredConfigKeysInFile(options.configPath, readFile),
       ...(resourceMetadata.available ? {} : { catalogMetadataUnavailable: true }),
@@ -1136,6 +1140,7 @@ export function formatDoctorReport(report: DoctorReport, options: { credentials?
     }),
     ...(report.externalCommandsCatalogUnavailable ? [`External commands catalog unavailable: ${report.externalCommandsCatalogReason ?? 'catalog/external-commands.yaml is unavailable.'}`] : []),
     ...formatCapabilitySummary(capabilitySummary),
+    ...(report.modes ? ['모드:', ...report.modes.map((row) => `  ${formatModeLine(row)}`)] : []),
   ].join('\n');
 }
 

@@ -159,7 +159,7 @@ describe('result-card widget — render', () => {
 });
 
 describe('result-card widget — onKey', () => {
-  test('Enter on focused card returns submit with widgetId', () => {
+  test('Enter on focused card returns submit with widgetId as text', () => {
     const state = resultCardWidget.initialState({ personaName: 'X', stance: 'bull' });
     const action = resultCardWidget.onKey!(
       { name: 'enter' },
@@ -168,7 +168,7 @@ describe('result-card widget — onKey', () => {
     );
     expect(action.type).toBe('submit');
     if (action.type === 'submit') {
-      expect((action.payload as any).widgetId).toBe('card-7');
+      expect(action.text).toBe('card-7');
     }
   });
 
@@ -196,7 +196,7 @@ describe('result-card widget — onKey', () => {
 });
 
 describe('result-card widget — onMouse', () => {
-  test('click submits widgetId payload', () => {
+  test('click submits widgetId as text', () => {
     const state = resultCardWidget.initialState({ personaName: 'X', stance: 'bull' });
     const action = resultCardWidget.onMouse!(
       { type: 'click', row: 2, col: 4 },
@@ -205,11 +205,11 @@ describe('result-card widget — onMouse', () => {
     );
     expect(action.type).toBe('submit');
     if (action.type === 'submit') {
-      expect((action.payload as any).widgetId).toBe('card-3');
+      expect(action.text).toBe('card-3');
     }
   });
 
-  test('double-click also submits widgetId payload', () => {
+  test('double-click also submits widgetId as text', () => {
     const state = resultCardWidget.initialState({ personaName: 'X', stance: 'bull' });
     const action = resultCardWidget.onMouse!(
       { type: 'double-click', row: 2, col: 4 },
@@ -218,7 +218,7 @@ describe('result-card widget — onMouse', () => {
     );
     expect(action.type).toBe('submit');
     if (action.type === 'submit') {
-      expect((action.payload as any).widgetId).toBe('card-4');
+      expect(action.text).toBe('card-4');
     }
   });
 

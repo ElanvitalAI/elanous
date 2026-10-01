@@ -11,7 +11,7 @@ import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { CONTROL_INBOX_DIR_ENV } from '../../harness/control-inbox.js';
 import { podFragmentFinished, readPodFragment } from '../../harness/self-send-target.js';
 import { resetLiveDetailCacheForTesting } from '../../live/detail-switch.js';
-import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
+import { POD_JOB_DEADLINE_SECONDS, POD_LOGS_KEEP_BYTES, hostCredentials, k8sLabelValue, podRunLabels, hostGrokCredentials, podJobManifest, podJobName, podSalvageScript, podEarlySalvageScript, podGithubWatchdogScript, POD_GH_STALE_SECONDS, podSelfImplementSpawn, recordPodSalvage, parseMemSamples, podRunResultLine, type Kubectl } from './self-implement-pod.js';
 import type { PodSource } from './pod-source-receive.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { loadTokens } from '../../oauth/store.js';
@@ -330,6 +330,45 @@ esac
 });
 
 describe('pod grok credentials', () => {
+  test('POD4: a token expiring within 3 h is refreshed on the host before the copy, and only then shipped', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-grok-refresh-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      const authPath = join(home, '.grok', 'auth.json');
+      writeFileSync(authPath, JSON.stringify({ 'https://auth.x.ai::client': { key: 'old-access', expires_at: new Date(Date.now() + 60_000).toISOString(), refresh_token: 'r' } }));
+      let refreshed = 0;
+      const out = hostGrokCredentials({ home, env: {}, ghToken: () => 'gh', refresh: () => {
+        refreshed += 1;
+        writeFileSync(authPath, JSON.stringify({ 'https://auth.x.ai::client': { key: 'new-access', expires_at: new Date(Date.now() + 6 * 3600_000).toISOString(), refresh_token: 'r' } }));
+      } });
+      expect(refreshed).toBe(1);
+      expect(out.grokAuth).toContain('new-access');
+      expect(out.grokAuth).not.toContain('old-access');
+      expect(out.grokAuth).not.toContain('refresh_token');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('POD4: when the host refresh cannot extend it, the copy is refused with a reason instead of shipping a dying token', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-grok-stale-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({ 'https://auth.x.ai::client': { key: 'old-access', expires_at: new Date(Date.now() - 60_000).toISOString(), refresh_token: 'r' } }));
+      expect(() => hostGrokCredentials({ home, env: {}, ghToken: () => 'gh', refresh: () => {} })).toThrow('3시간 안에 만료');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
+  test('POD4: a token with hours to spare is not refreshed', () => {
+    const home = mkdtempSync(join(tmpdir(), 'pod-grok-fresh-'));
+    try {
+      mkdirSync(join(home, '.grok'));
+      writeFileSync(join(home, '.grok', 'auth.json'), JSON.stringify({ 'https://auth.x.ai::client': { key: 'fresh', expires_at: new Date(Date.now() + 5 * 3600_000).toISOString() } }));
+      let refreshed = 0;
+      const out = hostGrokCredentials({ home, env: {}, ghToken: () => 'gh', refresh: () => { refreshed += 1; } });
+      expect(refreshed).toBe(0);
+      expect(out.grokAuth).toContain('fresh');
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
   test('subscription: copies access token and expiry, not refresh; fake kubectl receives no codex credentials', async () => {
     const home = mkdtempSync(join(tmpdir(), 'pod-grok-'));
     try {
@@ -3223,4 +3262,84 @@ test('the Pod start script hands the host codex quota policy down, so a Pod chil
   } finally {
     if (saved === undefined) delete process.env.ELANOUS_CODEX_QUOTA_POLICY; else process.env.ELANOUS_CODEX_QUOTA_POLICY = saved;
   }
+});
+
+describe('pod GitHub token watchdog (host refresher gone)', () => {
+  const appScript = (extra: Record<string, unknown> = {}) => (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, appCredential: true, ...extra }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
+
+  test('App-credential Pods start the watchdog before the child and stop it before the final salvage; others do not', () => {
+    const script = appScript();
+    const watch = podGithubWatchdogScript(POD_GH_STALE_SECONDS);
+    expect(POD_GH_STALE_SECONDS).toBeGreaterThan(50 * 60);
+    expect(POD_GH_STALE_SECONDS).toBeLessThan(60 * 60);
+    expect(script).toContain(watch);
+    expect(script.indexOf(watch)).toBeLessThan(script.indexOf('elanous self implement'));
+    expect(script.indexOf('kill "$gh_watch_pid"')).toBeLessThan(script.indexOf(podSalvageScript()));
+    expect(jobScript()).not.toContain('gh_watch_pid');
+    expect(appScript({ githubStaleSeconds: 120 })).toContain('[ "$age" -ge 120 ]');
+  });
+
+  function repoWithDirtyWorktree() {
+    const root = mkdtempSync(join(tmpdir(), 'pod-gh-watch-'));
+    const bare = join(root, 'remote.git');
+    const main = join(root, 'main');
+    const wt = join(root, 'wt-child');
+    const gh = join(root, 'gh');
+    execFileSync('git', ['init', '--bare', '-q', bare]);
+    execFileSync('git', ['clone', '-q', bare, main]);
+    for (const [k, v] of [['user.email', 'pod@example.com'], ['user.name', 'pod']]) execFileSync('git', ['-C', main, 'config', k!, v!]);
+    writeFileSync(join(main, 'README'), 'base\n');
+    execFileSync('git', ['-C', main, 'add', 'README']);
+    execFileSync('git', ['-C', main, 'commit', '-qm', 'base']);
+    execFileSync('git', ['-C', main, 'push', '-q', 'origin', 'HEAD:refs/heads/main']);
+    execFileSync('git', ['-C', main, 'fetch', '-q', 'origin']);
+    execFileSync('git', ['-C', main, 'worktree', 'add', '-q', '-b', 'child', wt, 'origin/main']);
+    writeFileSync(join(wt, 'README'), 'edited\n');
+    writeFileSync(join(wt, 'new.txt'), 'untracked\n');
+    execFileSync('mkdir', ['-p', gh]);
+    writeFileSync(join(gh, 'hosts.yml'), 'github.com: {}\n');
+    const env = { ...process.env, ELANOUS_POD_NAME: 'job-w', GH_CONFIG_DIR: gh, GIT_AUTHOR_NAME: 'pod', GIT_AUTHOR_EMAIL: 'pod@example.com', GIT_COMMITTER_NAME: 'pod', GIT_COMMITTER_EMAIL: 'pod@example.com' };
+    return { root, bare, main, wt, gh, env };
+  }
+
+  test('real bash: a stale hosts.yml pushes a snapshot of the dirty worktree and leaves the child untouched', () => {
+    const r = repoWithDirtyWorktree();
+    try {
+      execFileSync('touch', ['-t', '202001010000', join(r.gh, 'hosts.yml')]);
+      const headBefore = execFileSync('git', ['-C', r.wt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const statusBefore = execFileSync('git', ['-C', r.wt, 'status', '--porcelain'], { encoding: 'utf8' });
+      const run = Bun.spawnSync(['bash', '-c', `cd ${r.main}\n${podGithubWatchdogScript(60, 1)}\nwait "$gh_watch_pid"`], { env: r.env });
+      const lines = run.stdout.toString().trim().split('\n');
+      expect(lines[0]).toMatch(/^ELANOUS_POD_GH_STALE \d+$/);
+      const pushed = lines.find((l) => l.startsWith('ELANOUS_POD_SALVAGE ') && l.includes('wt-child'));
+      expect(pushed).toBeDefined();
+      const [, branch, commit] = pushed!.split(' ');
+      expect(branch).toBe('salvage/job-w/wt-child-early');
+      expect(execFileSync('git', ['-C', r.bare, 'rev-parse', branch!], { encoding: 'utf8' }).trim()).toBe(commit);
+      expect(execFileSync('git', ['-C', r.bare, 'show', `${commit}:README`], { encoding: 'utf8' })).toBe('edited\n');
+      expect(execFileSync('git', ['-C', r.bare, 'show', `${commit}:new.txt`], { encoding: 'utf8' })).toBe('untracked\n');
+      expect(execFileSync('git', ['-C', r.wt, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()).toBe(headBefore);
+      expect(execFileSync('git', ['-C', r.wt, 'status', '--porcelain'], { encoding: 'utf8' })).toBe(statusBefore);
+    } finally { rmSync(r.root, { recursive: true, force: true }); }
+  });
+
+  test('real bash: a hosts.yml the host keeps rewriting never fires', () => {
+    const r = repoWithDirtyWorktree();
+    try {
+      const run = Bun.spawnSync(['bash', '-c', `cd ${r.main}\n${podGithubWatchdogScript(60, 1)}\nsleep 3; kill "$gh_watch_pid"; wait "$gh_watch_pid" 2>/dev/null; echo DONE`], { env: r.env });
+      expect(run.stdout.toString()).toBe('DONE\n');
+      expect(execFileSync('git', ['-C', r.bare, 'branch', '--list', 'salvage/*'], { encoding: 'utf8' }).trim()).toBe('');
+    } finally { rmSync(r.root, { recursive: true, force: true }); }
+  });
+
+  test('early snapshot of a clean worktree pushes nothing', () => {
+    const r = repoWithDirtyWorktree();
+    try {
+      execFileSync('git', ['-C', r.wt, 'checkout', '-q', '--', 'README']);
+      rmSync(join(r.wt, 'new.txt'));
+      const run = Bun.spawnSync(['bash', '-c', `cd ${r.main}\n${podEarlySalvageScript()}`], { env: r.env });
+      expect(run.stdout.toString()).not.toContain('ELANOUS_POD_SALVAGE ');
+      expect(run.stdout.toString()).toContain('ELANOUS_POD_SALVAGE_NONE clean');
+    } finally { rmSync(r.root, { recursive: true, force: true }); }
+  });
 });

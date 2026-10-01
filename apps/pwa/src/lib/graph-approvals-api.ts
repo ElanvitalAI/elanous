@@ -6,6 +6,39 @@ export interface GraphApproval {
   since: string;
   path: string[];
   recent: Array<{ nodeId: string; ok: boolean; outcome?: string; summary?: string }>;
+  /** EV10d — a «게시 대기» feed draft (only for feed-preview approvals). */
+  feed?: FeedDraft;
+}
+
+export interface FeedSlide { image: string; caption: string; include: boolean }
+export interface FeedDraft {
+  revision: number;
+  updatedBy: string;
+  brand?: { name?: string; handle?: string; avatar?: string | null };
+  cover: { text: string; sub: string; image?: string };
+  slides: FeedSlide[];
+  caption: { hook: string; body: string };
+  hashtags: string[];
+  location: string | null;
+  reel: string | null;
+}
+/** What «수정 저장» sends — the server keeps every other field as it was. */
+export interface FeedEdit {
+  slides: Array<{ image: string; caption: string; include: boolean }>;
+  caption: { hook: string; body: string };
+  hashtags: string[];
+  cover: { text: string; sub: string };
+  location: string | null;
+}
+
+export function feedEditOf(draft: FeedDraft): FeedEdit {
+  return {
+    slides: draft.slides.map(({ image, caption, include }) => ({ image, caption, include })),
+    caption: { hook: draft.caption.hook, body: draft.caption.body },
+    hashtags: [...draft.hashtags],
+    cover: { text: draft.cover.text, sub: draft.cover.sub },
+    location: draft.location,
+  };
 }
 
 export type GraphApprovalDecision = 'approved' | 'rejected';
@@ -53,5 +86,17 @@ export function createGraphApprovalsApi(opts: { baseUrl?: string; fetchImpl?: ty
     decide: (graphId: string, runId: string, decision: GraphApprovalDecision) => call<{ graphId: string; runId: string; decision: GraphApprovalDecision }>(
       `${PATH}/${encodeURIComponent(graphId)}/${encodeURIComponent(runId)}`, { method: 'POST', body: JSON.stringify({ decision }) },
     ),
+    /** EV10d «수정 저장» — overwrites the run's draft; the approval stays pending. */
+    saveFeedDraft: (graphId: string, runId: string, edit: FeedEdit) => call<{ graphId: string; runId: string; feed: FeedDraft }>(
+      `${PATH}/${encodeURIComponent(graphId)}/${encodeURIComponent(runId)}/feed-draft`, { method: 'PUT', body: JSON.stringify(edit) },
+    ),
+    /** Draft media as a blob (images need the owner bearer, so <img src> cannot fetch them directly). */
+    feedMedia: async (graphId: string, runId: string, path: string): Promise<Blob> => {
+      const target = `${PATH}/${encodeURIComponent(graphId)}/${encodeURIComponent(runId)}/media?path=${encodeURIComponent(path)}`;
+      const request: RequestInit = { headers: opts.authHeader ? { authorization: opts.authHeader } : {} };
+      const response = opts.client ? await opts.client.fetchResponse(target, request) : await fetchImpl(`${baseUrl}${target}`, request);
+      if (!response.ok) throw new GraphApprovalsApiError(response.status, 'media-failed');
+      return response.blob();
+    },
   };
 }

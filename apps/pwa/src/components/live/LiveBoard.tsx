@@ -3,7 +3,8 @@
 // Live 탭 판 — 진짜 신호만 그린다(props 만 · 시험이 몰 수 있다).
 // 기획 §0b(v3 요소표) · §0c(v4 두 모드): `practical`(기본 · 표·막대 · 애니메이션 없음) / `max`(화려함 MAX).
 
-import { clockTime, DECISION_KINDS, LIVE_STAGES, LIVE_STAGE_LABEL, type DecisionKind, type LiveBoardData, type LiveRun } from '@/lib/live-signals';
+import { clockTime, DECISION_KINDS, foldForRole, isRawErrorText, LIVE_STAGES, LIVE_STAGE_LABEL, type DecisionKind, type LiveBoardData, type LiveRun } from '@/lib/live-signals';
+import type { PwaRole } from '@/lib/pwa-role';
 import { cn } from '@/lib/utils';
 
 export type LiveMode = 'practical' | 'max';
@@ -23,12 +24,16 @@ export interface LiveBoardProps {
   mode: LiveMode;
   onSelectRun?: (runId: string) => void;
   selectedRunId?: string | null;
+  /** 없으면 오너 — 기존 시험·디버깅 화면은 바이트까지 같다. */
+  role?: PwaRole;
 }
 
-export function LiveBoard({ board, lines, mode, onSelectRun, selectedRunId }: LiveBoardProps) {
+export function LiveBoard({ board, lines, mode, onSelectRun, selectedRunId, role = 'owner' }: LiveBoardProps) {
   const max = mode === 'max';
+  const owner = role === 'owner';
   const g = board.gauges;
   const { snapshot } = board;
+  const foldedErrors = owner ? 0 : board.stream.filter((s) => s.why != null && isRawErrorText(s.why)).length;
   return (
     <div className={cn('space-y-4', max && 'live-max')} data-live-mode={mode}>
       {/* ③ 계기판 */}
@@ -51,7 +56,7 @@ export function LiveBoard({ board, lines, mode, onSelectRun, selectedRunId }: Li
         ) : (
           <ul className="space-y-1.5">
             {snapshot.runs.slice(0, 12).map((run) => (
-              <RunBar key={run.runId} run={run} round={board.rounds[run.runId]} max={max} selected={run.runId === selectedRunId} onSelect={onSelectRun} />
+              <RunBar key={run.runId} run={run} round={board.rounds[run.runId]} max={max} selected={run.runId === selectedRunId} onSelect={onSelectRun} owner={owner} />
             ))}
           </ul>
         )}
@@ -71,8 +76,8 @@ export function LiveBoard({ board, lines, mode, onSelectRun, selectedRunId }: Li
               {board.stream.slice(0, 40).map((s, i) => (
                 <li key={`${s.ts}-${i}`} className={cn('leading-relaxed', max && i === 0 && 'live-line-in', max && s.kind === 'SHIP' && 'live-ship')}>
                   <span className="text-muted-foreground"><span title={s.ts}>{clockTime(s.ts)}</span> </span>
-                  <span className={KIND_STYLE[s.kind]}>[{s.kind}]</span> {s.what}
-                  {s.why && <span className="text-muted-foreground"> · 왜: {s.why}</span>}
+                  <span className={KIND_STYLE[s.kind]}>[{s.kind}]</span> {owner ? s.what : foldForRole(s.what.replace(/run-[0-9a-f]{8}-[^\s]*/gi, ''), role)}
+                  {s.why && <span className="text-muted-foreground"> · 왜: {foldForRole(s.why, role)}</span>}
                   {s.purpose && <span className="text-muted-foreground"> · 목적: {s.purpose}</span>}
                   {s.target && <span className="text-muted-foreground"> → {s.target}</span>}
                 </li>
@@ -100,12 +105,16 @@ export function LiveBoard({ board, lines, mode, onSelectRun, selectedRunId }: Li
       </div>
 
       <div className="grid gap-4 lg:grid-cols-2">
+        {owner ? (
         <section className="space-y-2" aria-label="흐르는 로그">
           <h2 className="text-sm font-medium">흐르는 로그</h2>
           <pre className="max-h-60 overflow-auto rounded-md border bg-muted/30 p-2 text-[11px] leading-relaxed" data-live-log>
             {lines.slice(0, 60).join('\n') || '—'}
           </pre>
         </section>
+        ) : foldedErrors > 0 ? (
+          <p className="text-xs text-muted-foreground" data-live-folded-errors>오류 {foldedErrors}건 접힘</p>
+        ) : null}
         {/* 빈 칸 표 — 판단에 «왜·목적·보낸 곳»이 없는 자리(🅢·🅣 가 계측을 심는다) */}
         <section className="space-y-2" aria-label="빈 칸 표">
           <h2 className="text-sm font-medium">빈 칸 표 <span className="text-xs text-muted-foreground">판단 로그에 없는 칸</span></h2>
@@ -138,7 +147,7 @@ function Gauge({ label, hint, value, tone = 'idle', max }: { label: string; hint
   );
 }
 
-function RunBar({ run, round, max, selected, onSelect }: { run: LiveRun; round?: number; max: boolean; selected: boolean; onSelect?: (runId: string) => void }) {
+function RunBar({ run, round, max, selected, onSelect, owner }: { run: LiveRun; round?: number; max: boolean; selected: boolean; onSelect?: (runId: string) => void; owner: boolean }) {
   return (
     <li>
       <button
@@ -147,7 +156,7 @@ function RunBar({ run, round, max, selected, onSelect }: { run: LiveRun; round?:
         onClick={() => onSelect?.(run.runId)}
         className={cn('flex w-full items-center gap-3 rounded-md border px-3 py-2 text-left text-xs hover:bg-muted/40', selected && 'ring-1 ring-primary')}
       >
-        <span className="w-24 shrink-0 truncate font-mono text-[11px] text-muted-foreground">{run.runId.replace(/^run-/, '').slice(0, 8)}</span>
+        <span className="w-24 shrink-0 truncate font-mono text-[11px] text-muted-foreground">{owner ? run.runId.replace(/^run-/, '').slice(0, 8) : '런'}</span>
         <span className="flex flex-1 gap-1" aria-label="단계">
           {LIVE_STAGES.map((stage) => {
             const tone = run.stages[stage];

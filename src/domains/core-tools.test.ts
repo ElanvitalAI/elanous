@@ -77,7 +77,7 @@ describe('L2 배선 가드 (서피스 무관 코어 노출)', () => {
   test('buildSharedAppTools(단일 조립기)가 buildCoreTools 를 품는다(core 단일 출처 유지)', () => {
     const src = read('../agent/shared-app-tools.ts');
     expect(src).toContain('buildCoreTools()');
-    expect(src).toContain('core.dispatch(name, args)');
+    expect(src).toContain('core.dispatch(name, args'); // B5: 뒤에 런타임 문맥 인자가 붙는다
   });
   test('finance 팩(finance-tools)은 코어 도구를 더 이상 안 품는다(강결합 해소)', () => {
     const src = read('./finance-tools.ts');

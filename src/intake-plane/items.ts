@@ -4,19 +4,22 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { findTrack } from '../autopilot/mission-phase-track.js';
 
 export const INTAKE_SOURCES = ['x', 'youtube', 'github', 'telegram-saved', 'telegram-bot', 'memo', 'pwa'] as const;
+export type RegisteredIntakeSourceKind = 'rss' | 'command';
 export type IntakeSource = typeof INTAKE_SOURCES[number];
-export type IntakeKind = 'video' | 'repo' | 'post' | 'article' | 'note';
+export type IntakeKind = 'video' | 'repo' | 'post' | 'article' | 'note' | 'rss';
 export type IntakePrivacy = 'public' | 'user-private';
 export const INTAKE_STATUSES = ['new', 'queued', 'absorbed', 'checked', 'routed', 'discarded', 'deferred'] as const;
 export type IntakeStatus = typeof INTAKE_STATUSES[number];
 
 export interface IntakeItem {
   id: string;
-  source: IntakeSource;
+  source: IntakeSource | RegisteredIntakeSourceKind;
   /** 같은 항목이 다른 입력원에서도 왔으면 여기 모인다 — «두 입력원에서 동시에 뜬 것»이 신호다. */
-  sources: IntakeSource[];
+  sources: (IntakeSource | RegisteredIntakeSourceKind)[];
+  seat?: string;
   url?: string;
   kind: IntakeKind;
   title?: string;
@@ -34,6 +37,7 @@ export interface IntakeItem {
 
 /** 수집기가 내는 한 줄 — 모양 맞추기 전. */
 export interface RawIntakeItem {
+  seat?: string;
   url?: string;
   title?: string;
   text?: string;
@@ -76,13 +80,23 @@ export function canonicalUrl(raw: string): string | undefined {
   return `https://${host}${path}${q}`;
 }
 
-export function intakeItemId(source: IntakeSource, raw: Pick<RawIntakeItem, 'url' | 'text'>): string {
-  const url = raw.url ? canonicalUrl(raw.url) : undefined;
-  const basis = url ?? `${source}:${(raw.text ?? '').trim().slice(0, 200)}`;
-  return createHash('sha256').update(basis).digest('hex').slice(0, 16);
+function normalizedSeat(seat: unknown): string | undefined {
+  if (seat === undefined) return undefined;
+  if (typeof seat !== 'string') throw new Error(`알 수 없는 자리: ${String(seat)}`);
+  const track = findTrack(seat.trim());
+  if (!track) throw new Error(`알 수 없는 자리: ${seat}`);
+  return track.id;
 }
 
-function kindFor(source: IntakeSource, url: string | undefined): IntakeKind {
+export function intakeItemId(source: IntakeSource | RegisteredIntakeSourceKind, raw: Pick<RawIntakeItem, 'url' | 'text'> & { seat?: string }): string {
+  const seat = normalizedSeat(raw.seat);
+  const url = raw.url ? canonicalUrl(raw.url) : undefined;
+  const basis = url ?? `${source}:${(raw.text ?? '').trim().slice(0, 200)}`;
+  // Unassigned items retain their original IDs; assigned items have an independent lifecycle per seat.
+  return createHash('sha256').update(seat ? JSON.stringify([seat, basis]) : basis).digest('hex').slice(0, 16);
+}
+
+function kindFor(source: IntakeSource | RegisteredIntakeSourceKind, url: string | undefined): IntakeKind {
   if (url?.startsWith('https://www.youtube.com/')) return 'video';
   if (url?.startsWith('https://github.com/')) return 'repo';
   if (url?.startsWith('https://x.com/')) return 'post';
@@ -91,12 +105,13 @@ function kindFor(source: IntakeSource, url: string | undefined): IntakeKind {
 }
 
 /** 개인 메모 입력원은 user-private — 원문을 바깥 LLM 에 보내지 않는다(RFC §3.4). PWA 칸에 사람이 쓴 글도 같다(RFC-pwa-intake-front-door). */
-export function privacyFor(source: IntakeSource): IntakePrivacy {
+export function privacyFor(source: IntakeSource | RegisteredIntakeSourceKind): IntakePrivacy {
   return source === 'telegram-saved' || source === 'memo' || source === 'pwa' ? 'user-private' : 'public';
 }
 
 /** ① 모양 맞추기 — 수집기 한 줄 → IntakeItem. 비어 있으면(URL·본문 둘 다 없음) null. */
-export function shapeIntakeItem(source: IntakeSource, raw: RawIntakeItem, now: string): IntakeItem | null {
+export function shapeIntakeItem(source: IntakeSource | RegisteredIntakeSourceKind, raw: RawIntakeItem, now: string): IntakeItem | null {
+  const seat = normalizedSeat(raw.seat);
   const url = raw.url ? canonicalUrl(raw.url) : undefined;
   const text = raw.text?.trim() || undefined;
   if (!url && !text) return null;
@@ -104,9 +119,10 @@ export function shapeIntakeItem(source: IntakeSource, raw: RawIntakeItem, now: s
   const signals: Record<string, number> = {};
   for (const [k, v] of Object.entries(raw.signals ?? {})) if (Number.isFinite(v)) signals[`${source}.${k}`] = v;
   return {
-    id: intakeItemId(source, { url, text }),
+    id: intakeItemId(source, { url, text, seat }),
     source,
     sources: [source],
+    ...(seat ? { seat } : {}),
     ...(url ? { url } : {}),
     kind: raw.kind ?? kindFor(source, url),
     ...(raw.title?.trim() ? { title: raw.title.trim().slice(0, 300) } : {}),
@@ -155,7 +171,7 @@ const SETTLED: ReadonlySet<IntakeStatus> = new Set(['absorbed', 'discarded', 'ro
  * ② 중복 없애기 — 같은 id 는 새 항목을 만들지 않고 신호·입력원을 합친다.
  * 이미 흡수·버림·갈래가 끝난 것은 «seen» 으로 세고 상태를 되돌리지 않는다(다시 올리지 않는다).
  */
-export function ingestIntakeItems(instanceRoot: string, source: IntakeSource, raws: RawIntakeItem[], now = new Date().toISOString(),
+export function ingestIntakeItems(instanceRoot: string, source: IntakeSource | RegisteredIntakeSourceKind, raws: RawIntakeItem[], now = new Date().toISOString(),
   log: (event: string, data: Record<string, unknown>) => void = (e, d) => { debug.log('intake.normalize', e, d); }): IngestResult {
   const { items: existing, badLines } = loadIntakeLedger(instanceRoot);
   const result: IngestResult = { shaped: 0, added: 0, merged: 0, seen: 0, skipped: 0, badLines };
@@ -203,9 +219,9 @@ export function markIntakeItem(instanceRoot: string, id: string, patch: { status
   return true;
 }
 
-export function listIntakeItems(instanceRoot: string, filter: { status?: IntakeStatus; source?: IntakeSource } = {}): IntakeItem[] {
+export function listIntakeItems(instanceRoot: string, filter: { status?: IntakeStatus; source?: IntakeSource; seat?: string } = {}): IntakeItem[] {
   return [...loadIntakeLedger(instanceRoot).items.values()]
-    .filter((i) => (!filter.status || i.status === filter.status) && (!filter.source || i.sources.includes(filter.source)))
+    .filter((i) => (!filter.status || i.status === filter.status) && (!filter.source || i.sources.includes(filter.source)) && (!filter.seat || i.seat === filter.seat))
     .sort((a, b) => b.lastSeenAt.localeCompare(a.lastSeenAt));
 }
 

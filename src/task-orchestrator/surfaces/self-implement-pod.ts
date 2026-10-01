@@ -50,7 +50,7 @@ import { findGitDir } from '../../git-fs/locate.js';
 import { debug } from '../../debug/log.js';
 import { selectLiveDetail } from '../../live/detail-switch.js';
 import { authStorePath } from '../../oauth/store.js';
-import { grokAuthFilePath, resolveGrokCredential } from '../../grok/credential.js';
+import { grokAuthFilePath, isGrokSubscriptionExpiring, refreshGrokSubscriptionToken, resolveGrokCredential } from '../../grok/credential.js';
 import { defaultGrokModel } from '../../grok/models.js';
 import { resolveHostId } from '../../platform/host-id.js';
 import { envLiteral } from '../../platform/env-literal.js';
@@ -171,12 +171,26 @@ export function hostCredentials(account: string, storePath: string = authStorePa
   return { elanousAuth, codexAuth, ghToken: ghToken() };
 }
 
-/** resolveGrokCredential 과 동일한 출처를 읽되 Pod 로는 refresh 없는 access 사본만 보낸다. */
+/** A Pod gets a refresh-less access copy, so the copy must outlive the Job: same rule as the Codex path (3 h). */
+export const POD_GROK_MIN_VALIDITY_MS = 3 * 3600_000;
+
+/** resolveGrokCredential 과 동일한 출처를 읽되 Pod 로는 refresh 없는 access 사본만 보낸다.
+ *  POD4 (10-01): the copy used to ship whatever the host had — an AUTH1 shard copied a token that had expired
+ *  4 minutes earlier and died at `grok-credential-preflight status=expired`. Refresh on the host first. */
 export function hostGrokCredentials(opts: {
   home?: string; env?: NodeJS.ProcessEnv; apiKeyOptIn?: boolean; ghToken?: () => string;
+  /** Test seams — the host refresh (read-only `grok models`) and the expiry probe. */
+  refresh?: () => void; isExpiring?: () => boolean;
 } = {}): { grokAuth?: string; grokApiKey?: string; ghToken: string } {
-  const credential = resolveGrokCredential({ home: opts.home, env: opts.env });
+  let credential = resolveGrokCredential({ home: opts.home, env: opts.env });
   if (credential?.kind === 'subscription') {
+    const expiring = opts.isExpiring ?? (() => isGrokSubscriptionExpiring({ home: opts.home, bufferMs: POD_GROK_MIN_VALIDITY_MS }));
+    if (expiring()) {
+      try { (opts.refresh ?? (() => { refreshGrokSubscriptionToken({ home: opts.home }); }))(); } catch { /* judged below */ }
+      if (expiring()) throw new Error('grok: 구독 access 토큰이 3시간 안에 만료 — 호스트 갱신(grok models)도 못 늘렸다 · 호스트에서 grok login 후 다시');
+      credential = resolveGrokCredential({ home: opts.home, env: opts.env });
+      if (credential?.kind !== 'subscription') throw new Error('grok: 갱신 뒤 구독 자격을 다시 읽지 못했다');
+    }
     const scopes = JSON.parse(readFileSync(grokAuthFilePath(opts.home), 'utf8')) as Record<string, unknown>;
     const redacted: Record<string, { key: string; expires_at?: string; user_id?: string }> = {};
     for (const [name, value] of Object.entries(scopes)) {
@@ -219,6 +233,64 @@ function githubRepositoryFromUrl(repoUrl: string): string | null {
 
 /** Job 스크립트의 salvage 단계 — 자식 rc 가 0 이 아닐 때만, 변경·미푸시 커밋이 있는 격리 워크트리를 `salvage/<job>/<worktree>` 로 push.
  *  main·self-impl/ 로는 절대 안 민다. 실패해도 제어 흐름을 바꾸지 않는다(호출자는 이 뒤에 `exit $rc`). */
+/**
+ * App installation tokens live one hour and only the host process renews them (at 10 minutes left).
+ * If that process dies (host reboot), nothing renews the Pod's token. hosts.yml unchanged for this long
+ * means the host is gone. Push a snapshot while the token still works.
+ */
+export const POD_GH_STALE_SECONDS = 53 * 60;
+
+/** Snapshot every worktree to salvage/<job>/<wt>-early without touching the child's index, worktree or HEAD. */
+export function podEarlySalvageScript(): string {
+  return [
+    'job_name="${ELANOUS_POD_NAME:-unknown-job}"',
+    'while IFS= read -r wt; do',
+    '  [ -n "$wt" ] || continue',
+    '  case "$wt" in /*) ;; *) continue ;; esac',
+    '  wt_name=$(basename -- "$wt")',
+    "  case \"$wt_name\" in ''|.*|*/*|*'..'*) continue ;; esac",
+    '  branch="salvage/${job_name}/${wt_name}-early"',
+    '  (',
+    '    set +e',
+    '    cd -- "$wt" || exit 0',
+    '    head=$(git rev-parse --verify -q HEAD) || { printf \'ELANOUS_POD_SALVAGE_NONE early-no-head\\n\'; exit 0; }',
+    '    idx=$(mktemp) || exit 0',
+    '    cp -- "$(git rev-parse --git-path index)" "$idx" 2>/dev/null || :',
+    '    GIT_INDEX_FILE="$idx" git add -A -- . >/dev/null 2>&1',
+    '    tree=$(GIT_INDEX_FILE="$idx" git write-tree 2>/dev/null)',
+    '    rm -f -- "$idx"',
+    '    [ -n "$tree" ] || { printf \'ELANOUS_POD_SALVAGE_NONE early-write-tree-failed\\n\'; exit 0; }',
+    '    base=$(git rev-parse --verify -q origin/HEAD || git rev-parse --verify -q origin/main || true)',
+    '    if [ "$tree" = "$(git rev-parse "${head}^{tree}")" ]; then',
+    '      if [ -z "$base" ] || [ "$(git rev-list --count "${base}..${head}" 2>/dev/null || echo 1)" = 0 ]; then printf \'ELANOUS_POD_SALVAGE_NONE clean\\n\'; exit 0; fi',
+    '      commit=$head',
+    '    else',
+    '      commit=$(git commit-tree "$tree" -p "$head" -m "salvage(early): ${job_name} host token refresh stopped") || { printf \'ELANOUS_POD_SALVAGE_NONE commit-failed\\n\'; exit 0; }',
+    '    fi',
+    '    git push --force origin "${commit}:refs/heads/${branch}" || { printf \'ELANOUS_POD_SALVAGE_NONE push-failed\\n\'; exit 0; }',
+    "    printf 'ELANOUS_POD_SALVAGE %s %s\\n' \"$branch\" \"$commit\"",
+    '  )',
+    "done < <(git worktree list --porcelain 2>/dev/null | awk '/^worktree / { sub(/^worktree /, \"\"); print }')",
+  ].join('\n');
+}
+
+/** Background watchdog: fires the early snapshot once when hosts.yml has not been rewritten for staleSeconds. */
+export function podGithubWatchdogScript(staleSeconds: number, intervalSeconds = 30): string {
+  return [
+    '(',
+    `  while sleep ${intervalSeconds}; do`,
+    '    f="$GH_CONFIG_DIR/hosts.yml"',
+    '    m=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null) || continue',
+    '    age=$(( $(date +%s) - m ))',
+    `    [ "$age" -ge ${staleSeconds} ] || continue`,
+    "    printf 'ELANOUS_POD_GH_STALE %s\\n' \"$age\"",
+    `    ${podEarlySalvageScript().split('\n').join('\n    ')}`,
+    '    break',
+    '  done',
+    ') & gh_watch_pid=$!',
+  ].join('\n');
+}
+
 export function podSalvageScript(): string {
   return [
     'if [ "${rc:-0}" -ne 0 ]; then',
@@ -368,7 +440,7 @@ export function podMemoryLimitFor(feature: string, env: NodeJS.ProcessEnv | Read
   return { limit: a !== null && b !== null && a > b ? base : high, tier, source };
 }
 
-export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean }): Record<string, unknown> {
+export function podJobManifest(o: { name: string; namespace: string; image: string; /** 레지스트리 이미지면 IfNotPresent(노드가 pull) · 반입 이미지면 Never. */ imagePullPolicy?: 'Never' | 'IfNotPresent'; repoUrl: string; source?: PodSource; hostMirror?: string; args: readonly string[]; passEnv: readonly string[]; deadlineSeconds: number; runId?: string; parentRunId?: string; armEnv?: Readonly<Record<string, string>>; hostId?: string; imageCommit?: string | null; skillEnvs?: readonly string[]; memoryLimit?: string; goalDoc?: string; grokCredential?: 'subscription' | 'api_key'; codexAccounts?: readonly string[]; appCredential?: boolean; /** Test seam — default POD_GH_STALE_SECONDS. */ githubStaleSeconds?: number }): Record<string, unknown> {
   const quoted = o.args.map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(' ');
   const goalPath = o.goalDoc ? `'${(o.goalDoc.startsWith('-') ? `./${o.goalDoc}` : o.goalDoc).replace(/'/g, `'\\''`)}'` : undefined;
   const askBaseIndex = o.goalDoc ? o.args.indexOf('--base') : -1;
@@ -394,6 +466,7 @@ export function podJobManifest(o: { name: string; namespace: string; image: stri
     ] : []),
     // Only fixed command shapes leave the Pod; arbitrary argv (including shell -c text) is never emitted.
     `(while :; do { mem=$(if [ -r /sys/fs/cgroup/memory.current ]; then cat /sys/fs/cgroup/memory.current; elif [ -r /sys/fs/cgroup/memory/memory.usage_in_bytes ]; then cat /sys/fs/cgroup/memory/memory.usage_in_bytes; else printf -- -; fi); top=$(ps -eo rss=,comm=,args= --sort=-rss | head -5 | awk 'function encode(s) { gsub(/%/, "%25", s); gsub(/:/, "%3A", s); gsub(/ /, "%20", s); gsub(/\\t/, "%09", s); return s } { rss=$1; name=$2; sub(/^[[:space:]]*[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]*/, ""); n=split($0, a, /[[:space:]]+/); cmd="<redacted>"; if (name=="sleep" && a[2]=="30") cmd="sleep 30" (n>2 ? " <redacted>" : ""); else if (name=="bun") { cmd="bun <redacted>"; if (a[2]=="test") cmd="bun test <redacted>"; else if (a[2]=="run") cmd="bun run <redacted>"; else if ((a[2]=="x" || a[2]=="exec") && a[3]=="tsc") cmd="bun x tsc <redacted>" } else if (name=="tsc") cmd="tsc <redacted>"; else if (name=="elanous") { cmd="elanous <redacted>"; if (a[2]=="self") cmd="elanous self <redacted>"; else if (a[2]=="harness") cmd="elanous harness <redacted>" } else if (name=="node") cmd="node <redacted>"; if (name=="sleep" && cmd=="<redacted>") cmd="sleep <redacted>"; else if (cmd=="<redacted>" && name!="bash" && name!="sh") name="other"; printf " %s:%s:%s", rss, encode(name), encode(substr(cmd,1,120)) }'); printf "ELANOUS_MEM %s %s%s\\n" "$(date +%s)" "$mem" "$top"; } || true; sleep 15 || break; done) & mem_sampler_pid=$!`,
+    ...(o.appCredential ? [podGithubWatchdogScript(o.githubStaleSeconds ?? POD_GH_STALE_SECONDS)] : []),
     // 마지막 줄 JSON 이 «맨 끝»이어야 한다(parseSelfImplementJson) — rollup 은 그 앞에.
     goalPath
       ? `elanous harness ask ${goalPath} --json${quotedAsk} > /tmp/si.out 2>&1; rc=$?; bun -e 'const fs=require("fs");const p="/tmp/si.out";const s=fs.readFileSync(p,"utf8");const line=s.trimEnd().split("\\n").at(-1);try{const o=JSON.parse(line);if(o.kind==="self"&&o.result&&typeof o.result==="object")fs.appendFileSync(p,"\\n"+JSON.stringify({...o.result,...(typeof o.ok==="boolean"?{ok:o.ok}:{})})+"\\n")}catch{}'`
@@ -454,6 +527,7 @@ for ledger in "\${ELANOUS_STATE_DIR:-$HOME/.elanous}"/run-ledger/*.jsonl; do
 done
 if [ "$found" -eq 0 ]; then echo ELANOUS_RUN_LEDGER_NONE; fi`,
     'kill "$mem_sampler_pid" 2>/dev/null || true',
+    ...(o.appCredential ? ['kill "$gh_watch_pid" 2>/dev/null || true'] : []),
     'wait "$mem_sampler_pid" 2>/dev/null || true',
     'tail -n 1 /tmp/si.out',
     podSalvageScript(),

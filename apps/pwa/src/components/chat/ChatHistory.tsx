@@ -230,8 +230,9 @@ export function ChatHistory({ messages, pending, tabId }: Props) {
 
   if (messages.length === 0 && !pending) {
     return (
-      <div className="flex flex-1 items-center justify-center p-8 text-center text-sm text-muted-foreground">
-        Start a conversation. Type <code className="mx-1 rounded bg-muted px-1.5 py-0.5 font-mono text-xs">:help</code> to see meta commands.
+      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-8 text-center text-sm text-muted-foreground">
+        <p>무엇이든 말을 걸어 보세요.</p>
+        <p className="text-xs"><code className="rounded bg-muted px-1.5 py-0.5 font-mono">:help</code> 를 치면 명령 목록이 나옵니다.</p>
       </div>
     );
   }

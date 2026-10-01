@@ -7,6 +7,7 @@ import { debug } from '../../src/debug/log.js';
 import { emitDecision } from '../../src/live/detail-switch.js';
 import { parse } from '../../src/agent-substrate/pr-comment-meta.js';
 import { classifyReviewRounds, matchMustFix, type MustFixVerdict } from './must-fix-match.js';
+import { verifyCleanCheckout, type CheckoutResult } from './clean-checkout.js';
 
 interface PullRequest {
   number: number;
@@ -17,7 +18,7 @@ interface PullRequest {
   files: Array<{ path: string }>;
 }
 interface Match { pr: number; text: string; verdict: MustFixVerdict | 'rereviewed' | 'open'; run?: string; round?: number; resolvedIn?: number[] }
-interface GraphContext { runId?: string; input?: { windowMinutes?: number; mustFixByPr?: Record<string, string[]> }; outputs?: Record<string, unknown>; decision?: typeof emitDecision }
+interface GraphContext { runId?: string; input?: { windowMinutes?: number; mustFixByPr?: Record<string, string[]>; postVerified?: boolean }; outputs?: Record<string, unknown>; decision?: typeof emitDecision }
 export type RunCommand = (args: string[]) => string;
 // 상주 루프(30분마다)는 사람 계정 한도를 쓰지 않는다 — 부른 쪽이 GH_TOKEN 을 주지 않았으면 GitHub App 설치 토큰으로(09-29 한도 소진).
 // 발급 함수마다 한 번(프로세스 전역 한 칸이면 앞선 호출의 진짜 토큰이 주입한 가짜를 이긴다 — 09-29 시험 실패 출력에 토큰이 찍혔다).
@@ -93,7 +94,7 @@ export function resolvedInPrs(body: string | undefined): number[] {
   return match ? [...match[1]!.matchAll(/#(\d+)/g)].map((m) => Number(m[1])) : [];
 }
 
-export function runMission(mission: string, ctx: GraphContext, run: RunCommand = gh, now = new Date()): Record<string, unknown> {
+export function runMission(mission: string, ctx: GraphContext, run: RunCommand = gh, now = new Date(), verify = verifyCleanCheckout): Record<string, unknown> {
   switch (mission) {
     case 'collect': {
       const minutes = ctx.input?.windowMinutes ?? 60;
@@ -156,6 +157,37 @@ export function runMission(mission: string, ctx: GraphContext, run: RunCommand =
       }).map((pr) => pr.number);
       return { outcome: 'ok', verifyNeeded, verified };
     }
+    case 'clean-checkout': {
+      const needed = output(ctx, 'verify-needed').verifyNeeded as number[];
+      const candidates = pullRequests(ctx).filter((pr) => needed.includes(pr.number))
+        .sort((a, b) => Date.parse(a.mergedAt ?? '') - Date.parse(b.mergedAt ?? '') || a.number - b.number).slice(0, 2);
+      const results: CheckoutResult[] = [];
+      for (const pr of candidates) {
+        let mergeSha = '';
+        try {
+          const details = JSON.parse(run(['pr', 'view', String(pr.number), '--json', 'mergeCommit'])) as { mergeCommit?: { oid?: string } };
+          mergeSha = details.mergeCommit?.oid ?? '';
+          if (!/^[a-f0-9]{40,64}$/i.test(mergeSha)) throw new Error('mergeCommit.oid unavailable or invalid');
+        } catch (error) {
+          results.push({ pr: pr.number, mergeSha: '', ok: false, steps: [{ name: 'merge commit', ok: false, seconds: 0, tail: String(error).split('\n').slice(-20).join('\n') }] });
+          debug.log('landing-heal', 'clean-checkout', { pr: pr.number, ok: false, seconds: 0 });
+          continue;
+        }
+        let result: CheckoutResult;
+        try {
+          result = verify({ pr: pr.number, mergeSha, files: pr.files.map((file) => file.path) });
+        } catch (error) {
+          result = { pr: pr.number, mergeSha, ok: false, steps: [{ name: 'clean checkout', ok: false, seconds: 0, tail: String(error).split('\n').slice(-20).join('\n') }] };
+        }
+        results.push(result);
+        debug.log('landing-heal', 'clean-checkout', { pr: pr.number, ok: result.ok, seconds: result.steps.reduce((sum, step) => sum + step.seconds, 0) });
+        if (result.ok && ctx.input?.postVerified === true) {
+          const summary = result.steps.filter((step) => step.name !== 'worktree remove').map((step) => step.name).join(' · ');
+          run(['pr', 'comment', String(pr.number), '--body', `landing-verified: ${mergeSha.slice(0, 8)} · clean checkout · ${summary}`]);
+        }
+      }
+      return { outcome: 'ok', results };
+    }
     case 'report': {
       const collected = pullRequests(ctx);
       const prs = collected.length;
@@ -165,6 +197,9 @@ export function runMission(mission: string, ctx: GraphContext, run: RunCommand =
       const mustFixRereviewed = matches.filter((item) => item.verdict === 'rereviewed').length;
       const mustFixUnresolved = mustFixOpen + mustFixUnknown;
       const verifyNeeded = output(ctx, 'verify-needed').verifyNeeded as number[];
+      const checkoutResults = ctx.outputs?.['clean-checkout'] ? output(ctx, 'clean-checkout').results as CheckoutResult[] : undefined;
+      const checkoutPassed = checkoutResults?.filter((item) => item.ok).length ?? 0;
+      const checkoutFailed = checkoutResults?.filter((item) => !item.ok).map((item) => item.pr) ?? [];
       const mergedPrs = new Set(collected.filter((pr) => pr.state === 'MERGED').map((pr) => pr.number));
       const landedOpen = matches.filter((item) => item.verdict === 'open' && mergedPrs.has(item.pr));
       const unresolved = matches.filter((item) => item.verdict === 'unresolved').length;
@@ -174,7 +209,7 @@ export function runMission(mission: string, ctx: GraphContext, run: RunCommand =
       (ctx.decision ?? emitDecision)({
         kind: 'VERIFY',
         what: `착지·치유 관측: PR ${prs}건${open ? ` — 열린 must-fix ${open}건(PR ${openPrs.map((pr) => `#${pr}`).join(', ')})` : ''}`,
-        reason: `열린 채 착지 ${open}건 · 미해결 ${unresolved}건 · 미상 ${mustFixUnknown}건 · 다시 봄 ${mustFixRereviewed}건 · 착지 뒤 검증 필요 ${verifyNeeded.length}건`,
+        reason: `열린 채 착지 ${open}건 · 미해결 ${unresolved}건 · 미상 ${mustFixUnknown}건 · 다시 봄 ${mustFixRereviewed}건 · 착지 뒤 검증 필요 ${verifyNeeded.length}건${checkoutResults ? ` · 검증 성공 ${checkoutPassed} · 실패 ${checkoutFailed.length}(PR ${checkoutFailed.map((pr) => `#${pr}`).join(', ') || '없음'})` : ''}`,
         purpose: '착지 후속 작업 관측', target: 'landing-heal', ...(ctx.runId ? { runId: ctx.runId } : {}),
       });
       return { outcome: 'ok', prs, mustFixUnresolved, mustFixOpen, mustFixUnknown, mustFixRereviewed, verifyNeeded };

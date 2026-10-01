@@ -8,6 +8,7 @@ import { activeStoreNames, parseSinceParam, type LogFabricDeps, registeredLogSto
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { jsonResponse } from './json-response.js';
 import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
+import { scanStoresForRun } from './trace-run-scan.js';
 
 export type TraceLevel = 'L0' | 'L1' | 'L2' | 'L3';
 export interface TraceEvent {
@@ -346,7 +347,8 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
     }
     if (!opened) return jsonResponse({ ok: false, error: 'log-store-unavailable', failedStores: failures }, 503);
     const runId = url.searchParams.get('runId');
-    let resolution: { universe?: string; checked: number } | undefined;
+    let resolution: { universe?: string; checked: number; truncated?: boolean; unresolved?: boolean } | undefined;
+    let resolvedFrom: 'ledger' | 'log-scan' | undefined;
     if ((parsed.level === 'L2' || parsed.level === 'L3') && runId && !rows.some((row) => matches(row, url)) && !requestedUniverse) {
       // A store with no log db at all («has no log store yet» — e.g. the daemon's own tree-derived universe) cannot
       // hold the run, so it must not block the ledger lookup. A store that exists but failed to open/read still does:
@@ -356,6 +358,20 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
       try { resolution = findRunUniverse(runId, names, deps); }
       catch (error) { return jsonResponse({ ok: false, error: 'run-universe-unavailable', reason: error instanceof Error ? error.message : String(error) }, 503); }
       try { debug.log('nexus.trace', 'run-universe-resolved', { runId, universe: resolution.universe ?? 'not-found', checked: resolution.checked }); } catch { /* observation must not block reads */ }
+      if (resolution.universe) resolvedFrom = 'ledger';
+      else {
+        let views: LogInstanceView[];
+        try { views = (deps.instances ?? readLogInstances)(); }
+        catch (error) { return jsonResponse({ ok: false, error: 'run-universe-unavailable', reason: error instanceof Error ? error.message : String(error) }, 503); }
+        resolution = scanStoresForRun(runId, views, (view) => {
+          const store = (deps.openRemoteStore ?? ((v: LogInstanceView) => LogStore.openReadOnly(v.dbPath)))(view);
+          if (!store) return null;
+          return { queryTraceRun: (id, query) => store.queryTraceRun(id, query),
+            close: () => (deps.closeRemoteStore ?? ((s: LogStore) => s.close()))(store) };
+        }, { sinceMs: parsed.from, untilMs: parsed.to });
+        if (resolution.universe) resolvedFrom = 'log-scan';
+        try { debug.log('nexus.trace', 'run-universe-scanned', { runId, universe: resolution.universe ?? (resolution.truncated || resolution.unresolved ? 'unresolved' : 'not-found'), checked: resolution.checked, truncated: resolution.truncated }); } catch { /* observation must not block reads */ }
+      }
       if (resolution.universe && !names.includes(resolution.universe)) {
         const name = resolution.universe;
         names.push(name);
@@ -373,9 +389,9 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
       }
     }
     const filtered = rows.filter((row) => matches(row, url)).sort(sortRows);
-    const trace = buildTrace(filtered.slice(0, parsed.limit), parsed.level, filtered.length > parsed.limit || candidateLimitReached || failures.length > 0);
+    const trace = buildTrace(filtered.slice(0, parsed.limit), parsed.level, filtered.length > parsed.limit || candidateLimitReached || failures.length > 0 || resolution?.truncated === true);
     try { (deps.queryLog ?? ((details) => debug.log('logs.trace', 'query', details)))({ stores: names, level: parsed.level, count: trace.events.length, truncated: trace.truncated, mode: 'rows', runs: trace.nodes.filter((node) => node.level === 'L1' && node.count > 0).length }); } catch { /* query logging must not block reads */ }
-    return jsonResponse({ ok: true, ...trace, stores: names, registeredStores: registeredStoreCount(deps), ...(resolution ? resolution.universe ? { resolvedFrom: 'ledger' as const, runUniverse: resolution.universe } : { runUniverse: 'not-found' as const, checked: resolution.checked } : {}), ...(failures.length ? { failedStores: failures } : {}) }, 200);
+    return jsonResponse({ ok: true, ...trace, stores: names, registeredStores: registeredStoreCount(deps), ...(resolution ? resolution.universe ? { resolvedFrom, runUniverse: resolution.universe, ...(resolvedFrom === 'log-scan' ? { checked: resolution.checked } : {}) } : { runUniverse: resolution.truncated || resolution.unresolved ? 'unresolved' as const : 'not-found' as const, checked: resolution.checked } : {}), ...(failures.length ? { failedStores: failures } : {}) }, 200);
   } finally { closeStores(stores, deps); }
 }
 

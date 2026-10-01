@@ -50,7 +50,7 @@ describe('elanous repro tool surface selection', () => {
   test('chat selects daemon chat specs and dispatcher', async () => {
     const selected = buildEvalPromptToolSurface('chat', 'claude', cfg);
     expect(selected.specs.map((tool) => tool.name)).toContain('schedule_manage');
-    expect(selected.specs.map((tool) => tool.name)).not.toContain('SelfImplement');
+    expect(selected.specs.map((tool) => tool.name)).toContain('SelfImplement');
     expect(selected.daemon?.kind).toBe('chat');
     const result = await selected.daemon?.dispatch(
       'ToolSearch',
@@ -131,7 +131,7 @@ describe('elanous repro tool surface selection', () => {
   test('min/max assertions reject unavailable surface tools before measurement', async () => {
     const chatTools = buildEvalPromptToolSurface('chat', 'claude', cfg).specs.map((tool) => tool.name);
     const message =
-      `tool assertion references unavailable tool(s) for surface "chat": "SelfImplement", "NoSuchTool"; ` +
+      `tool assertion references unavailable tool(s) for surface "chat": "NoSuchTool"; ` +
       `surface has ${chatTools.length} tool(s): ${chatTools.join(', ')}`;
 
     expect(() => rejectAssertionsOutsideToolSurface(
@@ -140,6 +140,12 @@ describe('elanous repro tool surface selection', () => {
       'chat',
       chatTools,
     )).toThrow(message);
+    expect(() => rejectAssertionsOutsideToolSurface(
+      { SelfImplement: 1 },
+      undefined,
+      'chat',
+      chatTools,
+    )).not.toThrow();
 
     const provider = {
       name: 'scripted',
@@ -156,7 +162,7 @@ describe('elanous repro tool surface selection', () => {
       assertToolMin: { SelfImplement: 1 },
       assertToolMax: { NoSuchTool: 0 },
     })).rejects.toThrow(
-      'tool assertion references unavailable tool(s) for surface "chat": "SelfImplement", "NoSuchTool"; surface has',
+      'tool assertion references unavailable tool(s) for surface "chat": "NoSuchTool"; surface has',
     );
   });
 

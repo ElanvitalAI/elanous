@@ -1,0 +1,694 @@
+{
+  "env": "linux-pod",
+  "measuredAt": "2026-10-01",
+  "tests": [
+    {
+      "id": "apps/pwa/src/components/voice/TailscaleSecurityBanner.test.tsx > TailscaleSecurityBanner SSR and hydration behavior > continues rendering when the dismissal storage read throws",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "apps/pwa/src/components/voice/TailscaleSecurityBanner.test.tsx > TailscaleSecurityBanner SSR and hydration behavior > dismisses through a user click and persists the established session key",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "apps/pwa/src/components/voice/TailscaleSecurityBanner.test.tsx > TailscaleSecurityBanner SSR and hydration behavior > hides when a secure status is synchronized after hydration",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "apps/pwa/src/components/voice/TailscaleSecurityBanner.test.tsx > TailscaleSecurityBanner SSR and hydration behavior > hydrates matching SSR markup without recoverable or uncaught errors and retains guidance",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "apps/pwa/src/components/voice/TailscaleSecurityBanner.test.tsx > TailscaleSecurityBanner SSR and hydration behavior > reflects a stored dismissal only after hydration while SSR initially renders the banner",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "apps/pwa/src/components/voice/TailscaleSecurityBanner.test.tsx > TailscaleSecurityBanner SSR and hydration behavior > uses the live localhost secure-context check only after matching the override-free SSR banner",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > `no crontab for` stderr도 원격 래퍼의 부재 전용 코드로 읽고 기존 사본과 나이표를 보존한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > `no crontab for` 없는 원격 종료 코드 43은 부재로 오판하지 않고 옛 사본과 나이표를 보존한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > crontab 나이표 제거도 실패하면 보존을 주장하지 않고 제거 실패를 말한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > crontab 나이표 커밋 실패는 새 사본과 옛 나이표를 결합하지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > 빈 원격 crontab 은 원격 래퍼의 빈 산출을 부재로 읽되 본체 미러는 성공으로 남는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > 성공한 원격 crontab 은 완전 수신 뒤 사본과 자체 나이표를 만든다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > 원격 crontab 전송 실패는 옛 사본과 나이표를 보존한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/mirror-remote-logs.test.ts > 🗓️ 원격 crontab 미러 — ⛔ logs 미러의 성공을 뒤집지 않는다 > 원격 출력 `cat` 실패는 부분 사본을 게시하지 않고 옛 사본과 나이표를 보존한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/sync-vm-tree.test.ts > sync-vm-tree source-only rsync > dry-run lists the planned transfer and does not mutate the remote tree",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/sync-vm-tree.test.ts > sync-vm-tree source-only rsync > keeps node_modules, .git, logs, tests, .env, and credentials off the transfer list and destination",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/sync-vm-tree.test.ts > sync-vm-tree source-only rsync > keeps token, service-account, deploy key, and *.secret files off dry-run and send lists",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/sync-vm-tree.test.ts > sync-vm-tree source-only rsync > never passes --delete to rsync",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/sync-vm-tree.test.ts > sync-vm-tree source-only rsync > prints an explicit zero-transfer result instead of hiding a successful empty send",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/botlab/sync-vm-tree.test.ts > sync-vm-tree source-only rsync > sends approved source files and reports transferred file and byte counts",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/collect-market-daily.test.ts > collect-market-daily.sh > derives SK/data/x_asset.db, passes it via --db, and preserves the daily log path",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/collect-market-daily.test.ts > collect-market-daily.sh > names a missing SK-derived target database and exits nonzero",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/collect-market-daily.test.ts > collect-market-daily.sh > names and propagates collector failure with a nonzero exit",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/release-loop/version-node.test.ts > actual repository lockfile accepts bumped manifest with frozen install",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/skill-boundary.test.ts > skill boundary — derived, never hand-listed > the real skills all judge, and the investment skills are add-ons",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/edition-check.test.ts > spawn: --skip-ruler-stability 는 그 칸을 rc=2 로 남기고 ruler-stability.sh 를 안 부른다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/edition-check.test.ts > spawn: 조용함은 mirror-age 앞이고 흔들림은 기존 여덟 뒤에만 돈다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/finish-ruler-empty.test.ts > finish-ruler empty baseline gate > reports empty names and blocks positive control and ready stamp with repair-only guidance",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/finish-ruler-empty.test.ts > finish-ruler empty baseline gate > writes an empty-baseline confirmation into a successful ready stamp",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/lint-zsh-special-var.test.ts > lint-zsh-special-var > bash 파일의 path 는 안 잡는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/lint-zsh-special-var.test.ts > lint-zsh-special-var > harvest-best-controls.sh 실물은 0건이다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/lint-zsh-special-var.test.ts > lint-zsh-special-var > heredoc python 블록 안의 path= 는 안 잡는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/lint-zsh-special-var.test.ts > lint-zsh-special-var > 주석의 path 할당은 안 잡는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/lint-zsh-special-var.test.ts > lint-zsh-special-var > 최상위 path 할당(typeset · for · path=)을 잡는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/lint-zsh-special-var.test.ts > lint-zsh-special-var > 함수 안 local/typeset path 만 있는 zsh 는 안 잡는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > %cpu 가 --max-orphan-cpu 이상인 PPID=1 만 막고, 미만·0%·비고아는 안 막는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > --max-orphan-cpu 0 은 %cpu 0 인 PPID=1 도 막는 후보다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > 1분 로드가 --max-load 보다 크면 rc=1",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > pgrep 무매치(rc 1·빈 stdout)는 함대 0이지 못 잰 것이 아니다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > pgrep 이 127 이고 stdout 이 비면 함대 0·통과로 접지 않고 그 축만 못 잰다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > ps 가 실패해도 이미 잰 함대 초과(rc=1)를 삼키지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > 막는 후보는 %cpu 내림차순 상위 5줄과 «나머지 N개»만 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > 세 축이 임계 안이면 rc=0",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > 임계를 안 주면 함대·로드·고아를 «안 본다»고 적고 rc=2, CPU 0% 고아는 판정과 무관하다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/machine-quiet.test.ts > 함대가 --max-fleet 보다 크면 rc=1",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > --with-photos 는 래스터만 해시 접두를 떼고 복사한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > photo0.webp 가 디렉터리면 복사가 실패하고 rc 2 이며 성공을 말하지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 같은 출력 경로에서 --with-photos 뒤 플래그 없으면 래스터를 걷고 MANIFEST 만 남긴다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 기본 갈래가 걷을 수 없는 img 잔여가 있으면 rc 2 이고 성공을 말하지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 두 갈래의 MANIFEST 머리말은 서로 다르다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 사진 갈래는 «소유하지 않은» 파일을 덮지 않는다 — 바이트를 남기고 rc 2 (2026-09-23 실물 데이터 소실 회귀)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 사진 갈래를 두 번 돌리면 «자기 것»은 덮고 rc 0 이다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 폰트가 없으면 두 갈래 모두 rc 1 이다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 플래그 없으면 img 에 MANIFEST.md 만 남고 래스터는 0이다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 한 번만 접두를 뗀 사진 산출은 기본 재실행에서 걷히고 MANIFEST 만 남는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/make-assetpack.test.ts > make-assetpack > 해시 접두 없는 사용자 파일은 기본 갈래가 지우지 않고 rc 2 로 거부한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/mirror-age.test.ts > edition-check는 재료 미러의 rc 2를 UNMEAS로 전파한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/mirror-age.test.ts > edition-check는 조용함을 재료 미러보다 앞에 두고, 미러는 기존 original-mirror 인자로 부른다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/mirror-age.test.ts > mirror-age > 12시간 경계 양쪽과 여러 미러를 fetchedAt만으로 한 줄씩 판정한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/mirror-age.test.ts > mirror-age > MIRROR.json 부재, fetchedAt 부재, 파싱 불가는 모두 못 쟀다 rc 2다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/mirror-age.test.ts > mirror-age > 파일 mtime이 아니라 MIRROR.json fetchedAt으로 판정한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-provenance.test.ts > ruler-provenance > 뒤처진 자는 몇 커밋 뒤인지와 사람이 읽을 한 줄을 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-provenance.test.ts > ruler-provenance > 새로 세운 에디션에 자의 커밋 sha 와 뜬 시각이 적힌다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-provenance.test.ts > ruler-provenance > 출처가 없는 옛 에디션은 모른다 — 최신으로 읽히지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-provenance.test.ts > ruler-provenance > 출처를 못 적어도 에디션 세우기는 막지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > --min-pass 를 넘고 폭도 칸도 안정이면 rc=0 이고 최저 ≥ K 를 한 줄에 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > 기본 runs 는 3 이고 순차로만 돈다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > 빈 JSON 도 rc=2",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > 안정한 자재는 rc=0 이고 판정 줄에 통과·폭·칸·로드가 있다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > 자 산출을 못 내면 rc=2 이고 안정으로 접지하지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > 칸 수가 회차마다 다르면 폭이 spread 안이어도 rc=1",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > 통과 폭이 spread 를 넘으면 rc=1 이고 뒤집힌 칸과 게이트별 내역을 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-stability.test.ts > ruler-stability > 폭이 작아도 통과가 --min-pass 미만이면 rc=1 이고 판정 한 줄에 최저를 같이 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-version.test.ts > ruler-version rc 계약 > 12시간을 넘긴 기준선은 rc 1 이고 ***origin-drift 로 재라***를 같이 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-version.test.ts > ruler-version rc 계약 > rc 1 과 rc 2 는 «다른 값»이다 — 「묵었다」와 「못 쟀다」를 한 칸으로 접지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-version.test.ts > ruler-version rc 계약 > 기준선 시각을 못 읽으면 rc 2 — ⛔ 「새것」이 아니다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/ruler-version.test.ts > ruler-version rc 계약 > 최근 기준선은 rc 0 이고 「묵었다」고 말하지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/task-refs-exist.test.ts > task-refs-exist > assetpack/img/MANIFEST.md 를 백틱으로 대면 결손이 아니라 실재로 센다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/task-refs-exist.test.ts > task-refs-exist > 근거가 전부 실재하면 rc 0 이고 전부 실재한다 고 말한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/task-refs-exist.test.ts > task-refs-exist > 끝 개행 없는 마지막 줄의 부재 설명도 결손으로 세지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/task-refs-exist.test.ts > task-refs-exist > 부재를 설명하는 줄은 별도 칸으로 세고 근거로 댄 없는 이름은 결손으로 남긴다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/task-refs-exist.test.ts > task-refs-exist > 이름으로 빼는 산출 자리와 못 잰 rc 2 는 그대로다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/task-refs-exist.test.ts > task-refs-exist > 정말로 없는 이름은 rc 1 이고 본 자리를 같이 적는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/tool-census.test.ts > tool-census > loop/ 를 재면 개수가 0보다 큰 갈래가 둘 이상이고 미분류를 숨기지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/tool-census.test.ts > tool-census > 임시 트리에만 더한 파일은 스크립트를 고치지 않아도 기대 갈래로 들어간다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/wire-pages-23.test.ts > derives index link-table targets one level upward while preserving exempt targets",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/loop/wire-pages-23.test.ts > does not overwrite an existing derived specification",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main RenderProbe wiring > 로컬 링크가 우세한 미러 진입 문서는 링크 수와 self-contained 상태를 보존한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main RenderProbe wiring > 원격 링크가 60% 이상인 미러 진입 문서를 non-self-contained로 기록한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main RenderProbe wiring > 통제한 로컬 원문과 성공 프로브가 최종 렌더 위치까지 JSON 산출로 연결된다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main mirror-entry locality wiring > 네트워크 지배 미러는 참조 수를 내고 픽셀 차이를 품질로 읽을 수 없다고 말한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main mirror-entry locality wiring > 로컬 지배 미러는 참조 수를 내고 네트워크 지배 경고를 내지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main mirror-entry locality wiring > 미러 진입 문서가 없으면 참조 수와 지배 판정을 못 쟀다로 보존한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main overlay observability wiring > 원본과 사본 처리 수를 더해 내고 잔여 덮개면 픽셀 차이를 미신뢰로 표시한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "scripts/webclone/measure-fidelity.test.ts > main screenshot reliability wiring > 실제 정상·빈 PNG를 기본 통계 추출 경로로 읽어 RMSE를 보존하고 미러 공백 사유를 JSON에 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/acp/grok-leader-manager.test.ts > GrokLeaderManager · ensureLeader idempotency contract > ensureLeader returns state object (does not throw)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/autopilot/build/isolated-instance.test.ts > createIsolatedInstance — 주입 worktree > ★ defaultMergeMainIntoWorktree — fetch 실패 → error / up-to-date / merged (실 git)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/autopilot/mission-phase-track.test.ts > mission phase track > coord-channel-watch.sh actual mark extraction reads every mark by 2-letter id and by old alias",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/cli/doctor-fix.test.ts > doctor --fix > registered doctor command preserves ordinary output; fix dry-run and yes JSON use the engine",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/self-implement/goal-run-store.test.ts > GoalRunStore > marks recurrence counts and ordinals unavailable when prior history is truncated",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/self-implement/run-chain-query.test.ts > queryRunChain > pages past a full matching dispatch result page to find an old matching session",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/task-orchestrator/surfaces/pod-source-receive.test.ts > podSourceScript > bundle script clones the verified bundle and refuses a one-character sha256 change",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/video-pipeline/recipes/vlog.test.ts > vlog 레시피 — 실제 ffmpeg > ⭐ build-layers — 덮는 층(스크림·자막)이 «투명»하다 (🩸 불투명 자막이 영상 전체를 덮었다)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/voice/voice-tts-singleton-usable.test.ts > TTS provider availability and free fallback > linux without free binaries returns original choice and logs all tried ids",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > runArchive 관측 > done 로거가 던져도 성공 결과를 반환하고 failed를 남기지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > runArchive 관측 > failed 로거가 던져도 원래 오류를 재전파한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > runArchive 관측 > 성공 시 URL·보관 결과·경과 시간을 done 이벤트로 남긴다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 미러 브라우저 재열기 > 진입 파일 또는 미러 CDP 재열기가 없으면 unmeasured로 보관을 보존한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 미러 진입 링크 자립 진단 > 주입 spawnSync가 만든 로컬 0·원격 다수 진입 문서는 수와 오프라인 경고를 낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 미러 진입 링크 자립 진단 > 주입 spawnSync가 만든 로컬 다수 진입 문서는 경고하지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 미러 진입 링크 자립 진단 > 진입 문서가 없으면 링크 수와 진단을 측정 불가로 보존하고 경고하지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 부분 원문 보관 표식 > 시간 초과여도 받은 원문을 올리고 비초록 요약·상태 마커·archivePartial을 남긴다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 부분 원문 보관 표식 > 완주 보관은 기존 초록 요약과 원문 키만 유지하고 상태 마커를 올리지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > error 없는 SIGTERM 결과는 외부 종료로 보고 failed로 기록한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > runArchive가 실제 wget 호출에 www 형제 제한, 기존 깊이와 파일명 정규화 인자를 전달한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > wget 종료 코드 0은 completed와 열린 미러로 보관한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > wget 종료 코드 8은 일부 서버 오류 완료로 열고 실패로 부르지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 경로 URL의 .html 미러 파일을 진입점으로 선택해 completed로 기록한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 다른 wget 비영 종료 코드는 failed와 닫힌 미러로 보관한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 비 www 요청도 runArchive wget 인자와 record에 두 형제 호스트를 전달한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 뿌리 index.html은 경로 후보보다 먼저 선택한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 뿌리와 경로 후보가 모두 없으면 index-missing으로 남긴다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 실제 spawnSync 시간 상한 결과를 주입하면 timed-out으로 기록한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 실제 wget은 POSIX ERE를 컴파일해 www 형제 자산만 받고 외부 호스트는 받지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 정상 wget 완료 뒤 index가 없으면 index-missing으로 기록한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 종료 코드를 얻지 못한 외부 종료는 0과 구별해 failed로 보관한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 주소가 아닌 입력은 실제 wget 호출에서 host traversal을 열지 않는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 코드 8이어도 진입 문서가 없으면 index-missing이 우선한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 브라우저 재현 가능한 미러 계약 > 후행 슬래시 URL은 디렉터리가 아닌 경로 index.html을 진입점으로 선택한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 원문 보관 키 안전성 > ?·# 원문 키는 건너뛰고 일반 키만 올리며 실패를 이름으로 남긴다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/archive-run.test.ts > 원문 보관 키 안전성 > 일반 원문 키는 바꾸지 않고 모두 업로드한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/extract-design-run.test.ts > runExtractDesign 관측 > failed 로거가 던져도 원래 오류를 재전파한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "src/webclone/extract-design-run.test.ts > runExtractDesign 관측 > 초기 실패를 failed 이벤트로 남기고 같은 예외를 재전파한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/acp-subagent-wire-meta.test.ts > AcpAgent.prompt · _meta forwarding > undefined meta → request omits _meta field",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/ad-production.test.ts > renders planned captions after assembly while preserving the uncaptained master and named failures",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/ad-qc-measure.test.ts > QC measurement adapter > uses distinct OCR artifacts for repeated and parallel video measurement plans",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/android-chat-fold-two-pane.test.ts > 안드로이드 폴드 2-pane — 행동 검증의 «자리»가 있나 > debug XML 리포트에서 ChatScreenLayoutTest 재생성 케이스가 실행·통과했다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/android-debug-cleartext-network-security.test.ts > android debug-only local-host cleartext > merged debug manifest permits cleartext; merged release does not",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/barsnap-python-disproof.test.ts > barsnap python disproof runs and every check passes",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/ch5730-watch-delivery.test.ts > ch5730-watch delivery — 배달 목적지를 «다른 값»으로 낸다 > ✅ 스트리밍 — 호출자에게 간다(Monitor 안이 이 모양)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/ch5730-watch-delivery.test.ts > ch5730-watch delivery — 배달 목적지를 «다른 값»으로 낸다 > 🚨 /dev/null — 산출이 버려진다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/ch5730-watch-delivery.test.ts > ch5730-watch delivery — 배달 목적지를 «다른 값»으로 낸다 > 🚨 «파일» — [S] 가 밟은 그 상태. 살아 있어도 그 창엔 안 온다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/ch5730-watch-delivery.test.ts > ch5730-watch status — «성공» 분기가 배달 줄을 실제로 붙인다 > ✅ 살아있음 + 📮 배달 줄이 «같이» 나온다 (adopt 로 임의 pid 를 소유로 등록)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/harness-orchestrate-options.test.ts > elanous harness orchestrate — self orchestrate option parity > --help exposes --auto-review and --decompose",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/harness-orchestrate-options.test.ts > elanous harness orchestrate — self orchestrate option parity > still rejects options that are not attached to harness orchestrate by name",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/identity-env.test.ts > 배선 — spawnCodingAgent 가 정체성을 싣는다 > registry.spawn 에 넘어가는 env 에 정체성이 있다 (buildPtyEnv 우회 시 실패)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/llm-openrouter-provider.test.ts > OpenRouter provider wire > ⛔ 교차 경로 — config 가 grok 이면 그 키·baseUrl 을 OpenRouter 로 «안» 보낸다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/llm-tool-hydration.test.ts > streamLLMWithTools — 하이드레이션 흡수 (gap④) > ⭐ 소환한 툴이 다음 턴 프로바이더 tools 에 실제로 들어간다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/mission-capabilities/market-quotes-multi.test.ts > market.quotes.multi capability provider > keeps the repository daily collector executable and preserves a failed collector status",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/mss/logging/debug-integration.test.ts > src/debug/log — MSS M2.1 backward-compat integration > legacy API shape — ts/category/event/data preserved",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/nexus-api-terminals.test.ts > handleTerminalsList > merges web preview PTYs into local and federated lists with their first registration time",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/persistent-grounding-runtime.test.ts > PersistentGrounding ToolRuntime > default registration alias dispatch runs the guarded search loop and records session observations",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/persistent-grounding-runtime.test.ts > PersistentGrounding ToolRuntime > generates one session ID for ambient observations and grounding when no session ID is supplied",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/plugin-hooks-shell.test.ts > shell-hook > stdout JSON object → output",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/plugin-manifest-hooks.test.ts > plugin-host hook registration > end-to-end dispatch through registered manifest hook",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/preview-terminal.test.ts > PreviewTerminal > resize reaches the kernel PTY — the shell sees the new size (stty size)",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/shell-audit-log.test.ts > shell-primitive audit-log: programmatic sink > run event includes truncated when output exceeds budget",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/shell-primitive.test.ts > shell-primitive: runShell (no approval) > maxOutputChars truncates and sets truncated=true",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/skill-tool-mermaid.test.ts > dispatchMermaidRender — happy path > renders a simple flowchart to Unicode boxes",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/voice-tts-providers.test.ts > TTS provider availability and unpaid default > falls back to edge-tts, not openai-tts, when nobody chose and no credential resolves",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/voice-tts-providers.test.ts > TTS provider availability and unpaid default > reports edge-tts and macos-say usable without credentials",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-edition-preflight.test.ts > 판 발사 전 관문 > UNDECIDED-AXIS 표지만 있어도 잡는다 — 옛 문장이 없어도",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-edition-preflight.test.ts > 판 발사 전 관문 > 「문면은 네 글로」인데 면제 선언이 없으면 말한다 — 있으면 «안» 말한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-edition-preflight.test.ts > 판 발사 전 관문 > 미결 선언이 있으면 «고르고 쏴라»고 말한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-edition-preflight.test.ts > 판 발사 전 관문 > 인자가 없으면 쓰는 법을 대고 rc=2",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-edition-preflight.test.ts > 판 발사 전 관문 > 팔 사이 하위 절이 같으면 «변수가 하나다»라고 말한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-edition-preflight.test.ts > 판 발사 전 관문 > 팔 사이 하위 절이 다르면 «그 줄»을 댄다 — 그것이 변수다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-lint-stale-round-name.test.ts > 옛 판 이름 린터 > 옛 판 산출을 대조군으로 보는 줄은 안 잡는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-lint-stale-round-name.test.ts > 옛 판 이름 린터 > 이 판의 «팔»을 가리키는 옛 이름을 잡는다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-lint-stale-round-name.test.ts > 옛 판 이름 린터 > 저장소의 발사기 전수가 지금 깨끗하다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-lint-stale-round-name.test.ts > 옛 판 이름 린터 > 주석 안의 옛 이름은 안 잡는다 — 그것은 「왜 고쳤나」의 기록이다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    },
+    {
+      "id": "test/webclone-prepare-edition-task-args.test.ts > 조립선의 과제문 인자 통과 > zsh 문법이 성립한다",
+      "reason": "passes on macOS, fails on the Linux pod"
+    }
+  ]
+}

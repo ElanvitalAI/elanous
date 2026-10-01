@@ -66,5 +66,5 @@ test('fails closed when the query cannot return the repository default branch', 
   const result = await runWindowLandings(null, ['201\tstable\tf40-fix']);
 
   expect(result.exitCode).toBe(1);
-  expect(result.stdout.toString()).toContain('저장소 기본 브랜치를 못 읽었다');
+  expect(result.stderr.toString()).toContain('기본 브랜치 조회가 실패했다');
 });

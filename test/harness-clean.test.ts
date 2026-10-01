@@ -39,13 +39,17 @@ const indexLock = "fatal: Unable to create '/repo/.git/index.lock': File exists"
 
 type LegacyPlanInput = Omit<Parameters<typeof planHarnessCleanImpl>[0], 'unmergedCommitCounts' | 'uncommittedChanges'>
   & Partial<Pick<Parameters<typeof planHarnessCleanImpl>[0], 'unmergedCommitCounts' | 'uncommittedChanges'>>;
-const planHarnessClean = (input: LegacyPlanInput) => planHarnessCleanImpl({
-  ...input,
-  unmergedCommitCounts: input.unmergedCommitCounts ?? new Map([...new Set([...input.branches, ...input.worktrees.map((worktree) => worktree.branch)])].map((branch) => [branch, 0])),
-  uncommittedChanges: input.uncommittedChanges ?? new Map([...new Set([...input.branches, ...input.worktrees.map((worktree) => worktree.branch)])].map((branch) => [branch, false])),
-  changedFileCounts: new Map([...new Set([...input.branches, ...input.worktrees.map((worktree) => worktree.branch)])].map((branch) => [branch, 0])),
-  readWorktreeProvenance: () => ({ owner: 'dev:test-harness', command: 'elanous dev', createdAt: '2026-08-05T00:00:00.000Z' }),
-});
+const planHarnessClean = (input: LegacyPlanInput) => {
+  const branches = [...new Set([...input.branches, ...input.worktrees.map((worktree) => worktree.branch)])];
+  return planHarnessCleanImpl({
+    ...input,
+    unmergedCommitCounts: input.unmergedCommitCounts ?? new Map(branches.map((branch) => [branch, 0])),
+    uncommittedChanges: input.uncommittedChanges ?? new Map(branches.map((branch) => [branch, false])),
+    changedFileCounts: input.changedFileCounts ?? new Map(branches.map((branch) => [branch, 0])),
+    branchContents: input.branchContents ?? new Map(branches.filter((branch) => input.worktrees.some((wt) => wt.branch === branch)).map((branch) => [branch, (input.unmergedCommitCounts?.get(branch) ?? 0) > 0 ? 'differs' as const : 'already-contained' as const])),
+    readWorktreeProvenance: input.readWorktreeProvenance ?? (() => ({ owner: 'dev:test-harness', command: 'elanous dev', createdAt: '2026-08-05T00:00:00.000Z' })),
+  });
+};
 
 describe('listHarnessWorktrees — git() transient Git retry', () => {
   const successfulWorktree = 'worktree /repo.worktrees/dev-retry\nHEAD deadbeef\nbranch refs/heads/dev/retry\n';
@@ -644,7 +648,7 @@ describe('planHarnessClean — 미머지 커밋·미커밋 변경 보존', () =>
     const plan = planHarnessClean(base);
     expect(plan.remove.map((item) => item.branch)).toEqual(['dev/clean']);
     const preserved = new Map(plan.preserve.map((item) => [item.branch, item.reason]));
-    expect(preserved.get('dev/commits')).toContain('assessment=needs-human:no-pr-with-output');
+    expect(preserved.get('dev/commits')).toContain('assessment=needs-human:no-pr-content-differs');
     expect(preserved.get('dev/changes')).toContain('assessment=do-not-touch:dirty-worktree');
     expect(preserved.get('dev/commit-query-failed')).toContain('assessment=unjudgeable:measurement-unavailable');
     expect(preserved.get('dev/change-query-failed')).toContain('assessment=unjudgeable:measurement-unavailable');
@@ -670,7 +674,7 @@ describe('planHarnessClean — 미머지 커밋·미커밋 변경 보존', () =>
   it('보고 화면은 각 보존 이유와 보존 대상을 구분해 말한다', () => {
     const plan = planHarnessClean(base);
     const lines = renderHarnessCleanReport({ plan, removed: [], failed: [], dryRun: true }, 'all').join('\n');
-    expect(lines).toContain('assessment=needs-human:no-pr-with-output');
+    expect(lines).toContain('assessment=needs-human:no-pr-content-differs');
     expect(lines).toContain('assessment=do-not-touch:dirty-worktree');
     expect(lines).toContain('assessment=unjudgeable:measurement-unavailable');
     expect(lines).toContain('assessment=do-not-touch:open-pr');
@@ -686,12 +690,14 @@ describe('harness clean branch safety measurement — worktree HEAD and fail-clo
     const safety = measureBranchSafety(worktrees, ['dev/a'], (args) => {
       calls.push(args);
       if (args.includes('rev-list')) return { status: 0, stdout: '2\n', stderr: '' };
-      return { status: 0, stdout: ' M src/a.ts\n', stderr: '' };
+      if (args.includes('status')) return { status: 0, stdout: ' M src/a.ts\n', stderr: '' };
+      return { status: 0, stdout: 'src/a.ts\0', stderr: '' };
     });
     expect(calls).toEqual([
       ['-C', '/wt/dev/a', 'rev-list', '--count', 'origin/main..HEAD'],
       ['-C', '/wt/dev/a', 'status', '--porcelain'],
       ['-C', '/wt/dev/a', 'diff', '--name-only', '-z', 'origin/main...HEAD'],
+      ['-C', '/wt/dev/a', 'diff', '--name-only', '-z', 'origin/main', 'HEAD', '--', 'src/a.ts'],
     ]);
     expect(safety.unmergedCommitCounts.get('dev/a')).toBe(2);
     expect(safety.uncommittedChanges.get('dev/a')).toBe(true);
@@ -1043,9 +1049,7 @@ describe('harness clean — 스코프를 산출에 싣는다 (0건과 「안 봤
     const bare = 'self-' + 'impl/';
     const quoted = "'" + bare + "'";
 
-    // ⓐ 생성 측·CLI 는 «맨 문자열»을 하나도 갖지 않아야 한다.
-    //    ⭐ 생성부는 템플릿 리터럴(`${PREFIX}${slug}`)이라 따옴표 검사로는 «못 잡는다» —
-    //      실측으로 확인했다(따옴표만 보던 초판은 생성 측 되돌림 뮤테이션에 안 물렸다).
+    // ⓐ 생성 측·CLI 는 접두 리터럴을 복제하지 않는다. 생성은 공유 팩토리를 호출한다.
     for (const rel of ['src/self-implement/orchestrator.ts', 'src/index.ts']) {
       const src = readFileSync(join(root, rel), 'utf8');
       expect(`${rel}: ${src.includes(bare) ? '접두 재출현' : '(없음)'}`).toBe(`${rel}: (없음)`);
@@ -1063,7 +1067,7 @@ describe('harness clean — 스코프를 산출에 싣는다 (0건과 「안 봤
     // ⭐ [파일, 식, «기대 개수»] — 개수를 박아 「하나만 남기기」를 막는다.
     const useSites: Array<[string, string, number]> = [
       ['src/harness/harness-clean.ts', 'opts.branchPrefix ?? WORKTREE_BRANCH_PREFIX', 1],
-      ['src/self-implement/orchestrator.ts', '${WORKTREE_BRANCH_PREFIX}${slugifyFeature(opts.feature)}', 2],
+      ['src/self-implement/orchestrator.ts', 'plannedSelfImplBranch(opts.feature, opts.goalId, runId)', 2],
       // ⛔ index.ts 는 «조합된 식»을 문다 — 식별자만 보면 import 줄로도 통과한다.
       ['src/index.ts', '기본 ${WORKTREE_BRANCH_PREFIX_HELP}', 1],
     ];
@@ -1086,7 +1090,7 @@ describe('harness clean — 스코프를 산출에 싣는다 (0건과 「안 봤
     // ⛔⭐⭐⭐ 「접두가 없다」만으로는 «별도 상수 복제»를 못 잡는다(무인 리뷰 must-fix).
     //   ⇒ 양쪽이 «그 모듈에서» 가져오는지를 «직접» 문다. 다른 상수를 만들면 여기가 운다.
     const importer = 'worktree-branch-prefix';
-    for (const rel of ['src/harness/harness-clean.ts', 'src/self-implement/orchestrator.ts', 'src/index.ts']) {
+    for (const rel of ['src/harness/harness-clean.ts', 'src/index.ts']) {
       const src = readFileSync(join(root, rel), 'utf8');
       // ⛔⭐⭐⭐ 「바인딩이 있나」로도 부족하다 — «미사용 import + 다른 이름의 별도 상수»가 빠져나간다
       //   (무인 리뷰가 두 번 짚었다: `const CLEAN_PREFIX = '…'` 을 기본값으로 쓰면 통과했다).
@@ -1094,6 +1098,10 @@ describe('harness clean — 스코프를 산출에 싣는다 (0건과 「안 봤
       const bound = new RegExp(`import\\s*\\{[^}]*WORKTREE_BRANCH_PREFIX[^}]*\\}\\s*from\\s*['"][^'"]*${importer}`).test(src);
       expect(`${rel}: bound=${bound}`).toBe(`${rel}: bound=true`);
     }
+    const branchFactory = readFileSync(join(root, 'src/harness/worktree-branch-prefix.ts'), 'utf8');
+    expect(branchFactory).toContain('return `${WORKTREE_BRANCH_PREFIX}${slug}${runSuffix}`');
+    expect(branchFactory).toContain('return `${WORKTREE_BRANCH_PREFIX}goalid-${id}-${readable}-${digest}${runSuffix}`');
+    expect(readFileSync(join(root, 'src/self-implement/orchestrator.ts'), 'utf8')).toContain("from '../harness/worktree-branch-prefix.js'");
   });
 
   it('--prefix는 공유 기본값을 덮고, «실제 조회 필터»가 그 값을 쓴다', () => {
@@ -1545,7 +1553,6 @@ describe('harness clean — 측정 배선 (exec → measurement → planner)', (
 
   it('워크트리 없는 병합 브랜치는 reclaim-safe:merged-no-worktree 이고 «제거 후보에 오른다» (워크트리가 없어도 브랜치는 남는다)', () => {
     const run: GitRunner = (args) => {
-      if (args.includes('--merged')) return { status: 0, stdout: 'dev/merged-gone\n', stderr: '' };
       if (args[0] === 'for-each-ref') return { status: 0, stdout: 'dev/merged-gone 0 0\n', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
@@ -1555,7 +1562,7 @@ describe('harness clean — 측정 배선 (exec → measurement → planner)', (
       worktrees: [],
       branches: ['dev/merged-gone'],
       openPr: new Set(),
-      mergedPr: new Set(),
+      mergedPr: new Set(['dev/merged-gone']),
       mode: 'all',
       ...measured,
     });
@@ -1616,6 +1623,8 @@ describe('harness clean — 측정 배선 (exec → measurement → planner)', (
     const run: GitRunner = (args) => {
       if (args.includes('rev-list')) return { status: 0, stdout: '2\n', stderr: '' };
       if (args.includes('--porcelain')) return { status: 0, stdout: '', stderr: '' };
+      if (args.includes('origin/main...HEAD')) return { status: 0, stdout: 'src/a.ts\0', stderr: '' };
+      if (args.includes('origin/main') && args.includes('HEAD')) return { status: 0, stdout: 'src/a.ts\0', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
     const measured = measureBranchSafety([wt('dev/x')], ['dev/x'], run);
@@ -1630,7 +1639,7 @@ describe('harness clean — 측정 배선 (exec → measurement → planner)', (
     } as never);
     // ⛔ 손으로 넣은 Map 이 아니라 **측정이 낸 Map** 으로 판정한 결과다.
     expect(plan.remove).toHaveLength(0);
-    expect(plan.preserve.some((p) => p.reason.includes('assessment=needs-human:no-pr-with-output'))).toBe(true);
+    expect(plan.preserve.some((p) => p.reason.includes('assessment=needs-human:no-pr-content-differs'))).toBe(true);
   });
 
   it('⭐⭐⭐ execHarnessClean → measurement → planner 가 **결정적으로** 이어진다 (환경 무관)', () => {
@@ -1645,18 +1654,20 @@ describe('harness clean — 측정 배선 (exec → measurement → planner)', (
       if (a.includes('branch --list')) return { status: 0, stdout: 'self-impl/a\n', stderr: '' };
       if (a.includes('rev-list')) return { status: 0, stdout: '7\n', stderr: '' };
       if (a.includes('--porcelain')) return { status: 0, stdout: '', stderr: '' };
+      if (a.includes('origin/main...HEAD')) return { status: 0, stdout: 'src/a.ts\0', stderr: '' };
+      if (a.includes('origin/main HEAD --')) return { status: 0, stdout: 'src/a.ts\0', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
     // ⭐ `gh` 도 주입한다 — 안 하면 실제 조회 실패 시 `query-failed` 가 먼저 걸려
     //   새 보존 이유를 한 번도 안 재고 통과한다(무인 리뷰 must-fix).
-    const runGh = () => ({ status: 0, stdout: '' });
+    const runGh = () => ({ status: 0, stdout: JSON.stringify({ data: { repository: { b0: { nodes: [] } } } }) });
     const res = execHarnessClean({ mode: 'abandoned', dryRun: true, branchPrefix: 'self-impl/', run, runGh, readWorktreeProvenance: () => ({ owner: 'dev:run', command: 'elanous dev', createdAt: '2026-08-05T00:00:00.000Z' }) });
     // ⭐ 우리가 준 7 이 planner 를 통과해 이 이유로 나왔다면 배선이 살아 있다.
     // ⛔ 조회 주입이 **둘 다** 걸렸는지 문다 — worktree 쪽을 안 물면 실제 저장소가 답해도 통과한다
     //   (초판 반증이 안 물었던 이유다).
     expect(res.plan.scope?.matchedBranches).toBe(1);
     expect(res.plan.scope?.matchedWorktrees).toBe(1);
-    expect(res.plan.preserve.some((p) => p.reason.includes('assessment=needs-human:no-pr-with-output'))).toBe(true);
+    expect(res.plan.preserve).toEqual([expect.objectContaining({ branch: 'self-impl/a', reason: expect.stringContaining('assessment=needs-human:no-pr-content-differs') })]);
     expect(res.plan.remove).toHaveLength(0);
   }, 120_000);
 });
@@ -1681,14 +1692,17 @@ describe('harness clean — 주입한 실행기가 삭제까지 간다', () => {
       if (a.includes('branch --list')) return { status: 0, stdout: 'self-impl/a\n', stderr: '' };
       if (a.includes('rev-list')) return { status: 0, stdout: '0\n', stderr: '' };   // 미머지 0 ⇒ 정리 대상
       if (a.includes('--porcelain')) return { status: 0, stdout: '', stderr: '' };
+      if (a.includes('origin/main...HEAD')) return { status: 0, stdout: 'src/a.ts\0', stderr: '' };
+      if (a.includes('origin/main HEAD --')) return { status: 0, stdout: '', stderr: '' }; // 내용은 main 에 이미 착지
       return { status: 0, stdout: '', stderr: '' };
     };
     const res = execHarnessClean({
       mode: 'abandoned', dryRun: false, branchPrefix: 'self-impl/',
-      run, runGh: () => ({ status: 0, stdout: '' }),
+      run, runGh: () => ({ status: 0, stdout: JSON.stringify({ data: { repository: { b0: { nodes: [] } } } }) }),
       readWorktreeProvenance: () => ({ owner: 'dev:run', command: 'elanous dev', createdAt: '2026-08-05T00:00:00.000Z' }),
     });
     // ⭐ 삭제가 실제로 일어났고, 그 명령이 **우리 실행기**를 통과했다.
+    expect(res.plan.preserve).toEqual([]);
     expect(res.removed.length).toBeGreaterThan(0);
     // ⭐ **두 삭제 명령의 정확한 argv** 를 각각 문다(무인 리뷰 must-fix) —
     //   부분 문자열 하나만 보면 `worktree remove` 쪽 배선이 빠져도 통과한다.

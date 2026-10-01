@@ -12,6 +12,7 @@ import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 import { installPlugin, listInstalledPlugins, PluginInstallError, removePlugin, type InstallEvent } from '../plugins/install/plugin-install.js';
 import { credentialStatus, setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { makePlugin } from '../plugins/maker/plugin-maker.js';
+import { addAndInstallNode } from '../plugins/maker/node-install.js';
 
 function keys(): ReadonlyArray<{ keyId: string; publicKey: string }> {
   const configPath = userConfigPath();
@@ -80,6 +81,30 @@ export function registerPluginCommands(program: Command): void {
         const message = error instanceof Error ? error.message : String(error);
         if (opts.json) stdout.write(JSON.stringify({ status: 'failed', errors: [message] }) + '\n');
         else console.error(`plugin make failed: ${message}`);
+        process.exitCode = 1;
+      }
+    });
+  plugin.command('node').description('Manage plugin workflow nodes')
+    .command('add <dir> <request>').description('Write, validate and install a workflow node in a plugin')
+    .option('--kind <slug>', 'Workflow node kind')
+    .option('--yes', 'Accept requested capabilities')
+    .option('--json', 'Print the result as one JSON line')
+    .action(async (dir: string, request: string, opts: { kind?: string; yes?: boolean; json?: boolean }) => {
+      try {
+        const result = await addAndInstallNode({ dir, request, kind: opts.kind, yes: opts.yes,
+          deps: { consent: capabilities => askConsent(capabilities, !!opts.json) } });
+        if (opts.json) stdout.write(JSON.stringify(result) + '\n');
+        else {
+          console.log(`작성 ${result.timings.write}ms · 검증 ${result.timings.validate}ms${result.timings.repair === undefined ? '' : ` · 수리 ${result.timings.repair}ms`}`);
+          console.log(`설치 ${result.plugin ? '완료' : result.status === 'failed' && result.timings.install === 0 ? '미실행' : '실패'} · ${result.timings.install}ms`);
+          console.log(`동기화 ${result.status === 'installed' ? '완료' : result.plugin ? '실패' : '미실행'} · ${result.timings.sync}ms`);
+          for (const error of result.errors) console.error(error);
+        }
+        if (result.status === 'failed') process.exitCode = 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (opts.json) stdout.write(JSON.stringify({ status: 'failed', errors: [message] }) + '\n');
+        else console.error(`plugin node add failed: ${message}`);
         process.exitCode = 1;
       }
     });

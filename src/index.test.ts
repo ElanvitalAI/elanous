@@ -465,14 +465,14 @@ describe('mcp serve handshake timeout wiring', () => {
     };
 
     expect(await boot([{ id: 'default', transport: 'stdio', command: ['fake'] }])).toEqual({
-      default: { status: 'failed', toolCount: 0, reason: 'mcp.default.start-timeout after 8000ms' },
+      default: { status: 'failed', toolCount: 0, reason: 'mcp.default.start-timeout after 8000ms', reasonClass: 'handshake-timeout' },
     });
     expect(await boot([
       { id: 'global', transport: 'stdio', command: ['fake'] },
       { id: 'server', transport: 'stdio', command: ['fake'], handshakeTimeoutMs: 13 },
     ], 7)).toEqual({
-      global: { status: 'failed', toolCount: 0, reason: 'mcp.global.start-timeout after 7ms' },
-      server: { status: 'failed', toolCount: 0, reason: 'mcp.server.start-timeout after 13ms' },
+      global: { status: 'failed', toolCount: 0, reason: 'mcp.global.start-timeout after 7ms', reasonClass: 'handshake-timeout' },
+      server: { status: 'failed', toolCount: 0, reason: 'mcp.server.start-timeout after 13ms', reasonClass: 'handshake-timeout' },
     });
     expect(observedTimeouts).toEqual([8000, 7, 13]);
   });
@@ -4266,7 +4266,8 @@ describe('self orchestrate 시작 안내 배선 (보조 — 소스만 답할 수
 });
 
 describe('chat --json finalReply (2026-09-23)', () => {
-  test('reply 는 모든 조각을 잇고, finalReply 는 «마지막 어시스턴트 메시지»만 — 목표 루프가 최종 답을 반복해도 한 번', async () => {
+  // #22316: `reply` became the final answer; the joined text moved to `transcript`.
+  test('reply·finalReply 는 «마지막 어시스턴트 메시지»만, transcript 는 모든 조각 — 목표 루프가 최종 답을 반복해도 한 번', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'elanous-cli-final-reply-'));
     const indexModule = new URL('./index.ts', import.meta.url).pathname;
     const configModule = new URL('./user-config.ts', import.meta.url).pathname;
@@ -4291,9 +4292,10 @@ describe('chat --json finalReply (2026-09-23)', () => {
         stdout: 'pipe', stderr: 'pipe',
       });
       expect(result.exitCode, new TextDecoder().decode(result.stderr)).toBe(0);
-      const out = JSON.parse(new TextDecoder().decode(result.stdout).trim().split('\n').at(-1)!) as { reply: string; finalReply: string };
-      expect(out.reply).toBe('읽겠습니다.name=x scripts=3name=x scripts=3');
+      const out = JSON.parse(new TextDecoder().decode(result.stdout).trim().split('\n').at(-1)!) as { reply: string; finalReply: string; transcript: string };
+      expect(out.reply).toBe('name=x scripts=3');
       expect(out.finalReply).toBe('name=x scripts=3');
+      expect(out.transcript).toBe('읽겠습니다.name=x scripts=3name=x scripts=3');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

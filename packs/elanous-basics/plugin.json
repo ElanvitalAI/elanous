@@ -1,7 +1,7 @@
 {
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "elanous-basics",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Official elanous essentials for research, onboarding and everyday productivity.",
   "extensions": {
     "ai.elanous": {

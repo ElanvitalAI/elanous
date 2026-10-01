@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
 import { buildUserConfig, type UserConfig as MainUserConfig } from '../src/user-config.js';
+import { SKILLS_STEP_COMMAND, UNATTENDED_SETUP_COMMAND } from '../src/onboarding/entry-hints.js';
 import {
   checkSetupStatus,
   renderSetupStatus,
@@ -147,14 +148,15 @@ describe('Q.1 · checkSetupStatus', () => {
     });
     const hintFor = (id: string) => [...result.required, ...result.recommended].find((item) => item.id === id)?.hint;
 
-    expect(hintFor('llm')).toContain('elanous setup llm');
+    expect(hintFor('llm')).toContain('elanous onboarding llm');
     expect(hintFor('llm')).toContain('elanous nexus');
     expect(hintFor('skill-dirs')).toContain('create the missing skill directories');
     expect(hintFor('skill-dirs')).toContain('choose an already-existing skill directory');
-    expect(hintFor('skill-dirs')).not.toContain('elanous setup skills');
+    expect(hintFor('skill-dirs')).toContain(SKILLS_STEP_COMMAND);
     expect(hintFor('channel-bot')).toContain('elanous nexus channel-bot setup telegram|discord');
     for (const id of ['llm', 'skill-dirs', 'channel-bot']) {
-      expect(hintFor(id)).toContain('elanous setup --non-interactive --config <ans.json>');
+      expect(hintFor(id)).toContain(UNATTENDED_SETUP_COMMAND);
+      expect(hintFor(id)).not.toContain('elanous setup --non-interactive --config');
     }
   });
 
@@ -180,7 +182,7 @@ describe('Q.1 · checkSetupStatus', () => {
     const renderedItem = (label: string) => out.lines.find((line) => line.includes(label));
 
     for (const label of ['LLM provider', 'Skill dirs', 'Channel bot']) {
-      expect(renderedItem(label)).toContain('elanous setup --non-interactive --config <ans.json>');
+      expect(renderedItem(label)).toContain(UNATTENDED_SETUP_COMMAND);
     }
     for (const label of ['PWA build', 'OS install']) {
       expect(renderedItem(label)).not.toContain('--non-interactive');
@@ -215,7 +217,7 @@ describe('Q.1 · checkSetupStatus', () => {
     expect(skillDirs?.detail).toBe('1 dir · 0 exist · missing: /missing/skills');
     expect(skillDirs?.hint).toContain('create');
     expect(skillDirs?.hint).toContain('choose an already-existing skill directory');
-    expect(skillDirs?.hint).toContain('elanous setup --non-interactive --config <ans.json>');
+    expect(skillDirs?.hint).toContain(UNATTENDED_SETUP_COMMAND);
   });
 
   test('one of two skill dirs exists → skill-dirs passes with missing detail', () => {
@@ -260,7 +262,7 @@ describe('Q.1 · checkSetupStatus', () => {
     const result: SetupCheckResult = {
       ok: false,
       required: [
-        { id: 'llm', label: 'LLM provider', passed: false, hint: 'run `elanous setup llm`' },
+        { id: 'llm', label: 'LLM provider', passed: false, hint: 'run `elanous onboarding llm`' },
         { id: 'pwa-build', label: 'PWA build', passed: true, hint: 'run `elanous nexus build`' },
       ],
       recommended: [

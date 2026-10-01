@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, test, spyOn } from 'bun:test';
 import { runInNewContext } from 'node:vm';
 import { createScenarios, createScenariosWithReplay, selectScenarios, validateBaseUrl } from './scenarios.js';
@@ -37,7 +38,11 @@ describe('PWA scenario data and port isolation', () => {
     expect(byId('N5a').steps.find((s) => s.kind === 'waitFor' && typeof s.jsPredicate === 'string' && s.jsPredicate.includes('data-auto-submit'))).toMatchObject({ timeoutMs: 5_000, withinChipMs: true });
     expect(byId('N5a').expect[0]?.js).toContain('data-auto-submit');
     expect(byId('N6a').steps.some((s) => s.kind === 'click' && s.selector?.includes('classify'))).toBe(false);
-    expect(byId('C2a').steps[1]).toEqual({ kind: 'waitFor', selector: 'textarea[placeholder^="message"]', timeoutMs: 20_000 });
+    expect(byId('C2a').steps[1]).toEqual({ kind: 'waitFor', selector: 'textarea[placeholder^="message"], textarea[placeholder^="메시지"]', timeoutMs: 20_000 });
+    // The live ChatInput placeholder must match the selector (10-01 #22558 changed the copy and the release PWA node failed C1·C2a·C2b).
+    const chatInputSource = readFileSync(new URL('../../../apps/pwa/src/components/chat/ChatInput.tsx', import.meta.url), 'utf8');
+    const placeholder = /placeholder="([^"]+)"/.exec(chatInputSource)?.[1] ?? '';
+    expect(['message', '메시지'].some((prefix) => placeholder.startsWith(prefix))).toBe(true);
   });
 
   test('T4a reads replay twice, fails a single marker, and rejects spawned shells', async () => {

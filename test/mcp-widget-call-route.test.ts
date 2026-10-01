@@ -69,7 +69,7 @@ describe('MCP widget call route', () => {
     expect(calls).toEqual([{ name: 'paint', args: { shade: 'blue' } }]);
   });
 
-  test('rejects unauthenticated, malformed, prefixed local names, and oversized bodies before registry dispatch', async () => {
+  test('rejects unauthenticated, malformed local names, and oversized bodies before registry dispatch', async () => {
     const dispatched: string[] = [];
     const options = routeOptions({
       authorize: () => false,
@@ -79,7 +79,7 @@ describe('MCP widget call route', () => {
     expect(unauthorized.status).toBe(401);
     expect(dispatched).toEqual([]);
 
-    const malformed = await handleMcpWidgetCall(request({ toolName: 'other.paint', args: {} }), routeOptions({
+    const malformed = await handleMcpWidgetCall(request({ toolName: 'other/paint', args: {} }), routeOptions({
       getRuntime: (id) => { dispatched.push(id); return {}; },
     }));
     expect(malformed.status).toBe(400);

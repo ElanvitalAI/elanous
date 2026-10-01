@@ -11,6 +11,7 @@ import { writeStdoutFully } from './stdout-flush.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig } from '../user-config.js';
+import { registerIntakeSourceCommands } from './intake-source-cli.js';
 
 export interface IntakeToTasksCliDeps {
   root: string;
@@ -91,6 +92,7 @@ export function resolveIntakeCheckRoot(
 export function registerIntakeCommands(program: Command): void {
   // ── intake check — 바깥 사실을 elanous 현재와 대조 (태스크 등록 없음) ──
   const intakeCmd = program.command('intake').description('바깥 사실·문서를 elanous 현재와 대조하거나 태스크로 받는다');
+  registerIntakeSourceCommands(intakeCmd);
   intakeCmd.hook('preAction', async () => {
     try {
       const { registerStandaloneLogSink } = await import('../domains/standalone-log-sink.js');
@@ -217,7 +219,9 @@ export function registerIntakeCommands(program: Command): void {
       const { readPipedStdin } = await import('./piped-stdin.js');
       const text = opts.file ? readFileSync(opts.file, 'utf8') : (await readPipedStdin()) ?? '';
       const { raws, bad } = parseRawIntakeJsonl(text);
-      const result = ingestIntakeItems(effectiveInstanceRoot(), opts.source as (typeof INTAKE_SOURCES)[number], raws);
+      let result: ReturnType<typeof ingestIntakeItems>;
+      try { result = ingestIntakeItems(effectiveInstanceRoot(), opts.source as (typeof INTAKE_SOURCES)[number], raws); }
+      catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 2; return; }
       const out = { source: opts.source, inputLines: raws.length + bad, badInputLines: bad, ...result };
       if (opts.json) await writeStdoutFully(JSON.stringify(out, null, 2));
       else console.log(`흡수 원장 · ${opts.source}: 새 ${result.added} · 합침 ${result.merged} · 이미 끝난 것 ${result.seen} · 버림 ${result.skipped}${bad ? ` · 깨진 입력 ${bad}` : ''}${result.badLines ? ` · 깨진 원장 줄 ${result.badLines}` : ''}`);
@@ -228,14 +232,20 @@ export function registerIntakeCommands(program: Command): void {
     .description('흡수 원장 항목 보기 (최근 본 순)')
     .option('--status <status>', 'new | queued | absorbed | checked | routed | discarded | deferred')
     .option('--source <source>', '입력원으로 거르기')
+    .option('--seat <id>', '자리 id (별칭 허용; 자리 없는 옛 항목은 제외)')
     .option('--limit <n>', '최대 줄 수 (기본 30)')
     .option('--json', '구조화 출력')
-    .action(async (opts: { status?: string; source?: string; limit?: string; json?: boolean }) => {
+    .action(async (opts: { status?: string; source?: string; seat?: string; limit?: string; json?: boolean }) => {
       const { listIntakeItems } = await import('../intake-plane/items.js');
       const { effectiveInstanceRoot } = await import('../instance/resolve.js');
+      const { canonicalSeat } = await import('../intake-plane/intake-sources.js');
+      let seat: string | undefined;
+      try { seat = opts.seat === undefined ? undefined : canonicalSeat(opts.seat); }
+      catch (error) { console.error((error as Error).message); process.exitCode = 2; return; }
       const all = listIntakeItems(effectiveInstanceRoot(), {
         ...(opts.status ? { status: opts.status as never } : {}),
         ...(opts.source ? { source: opts.source as never } : {}),
+        ...(seat ? { seat } : {}),
       });
       const limit = Math.max(1, Number(opts.limit ?? 30) || 30);
       const shown = all.slice(0, limit);

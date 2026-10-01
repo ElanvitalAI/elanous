@@ -60,14 +60,26 @@ export async function collectTelegramSaved(root: string, fetch: FetchSavedMessag
 }
 
 /** GramJS 사용자 세션으로 `me` 대화를 읽는 실제 구현. 자격이 없으면 이유를 담아 던진다(값은 싣지 않는다). */
-export async function gramjsFetchSaved(env: NodeJS.ProcessEnv = process.env): Promise<{ fetch: FetchSavedMessages; close: () => Promise<void> }> {
+type GramjsModules = { TelegramClient: typeof import('telegram').TelegramClient; StringSession: typeof import('telegram/sessions').StringSession };
+const loadGramjs = async (): Promise<GramjsModules> => ({
+  TelegramClient: (await import('telegram')).TelegramClient,
+  StringSession: (await import('telegram/sessions')).StringSession,
+});
+
+export async function gramjsFetchSaved(
+  env: NodeJS.ProcessEnv = process.env,
+  load: () => Promise<GramjsModules> = loadGramjs,
+): Promise<{ fetch: FetchSavedMessages; close: () => Promise<void> }> {
   const apiId = Number(env.TELEGRAM_API_ID ?? 0);
   const apiHash = env.TELEGRAM_API_HASH ?? '';
   const session = env.TELEGRAM_USER_SESSION ?? '';
   const missing = [!apiId && 'TELEGRAM_API_ID', !apiHash && 'TELEGRAM_API_HASH', !session && 'TELEGRAM_USER_SESSION'].filter(Boolean);
   if (missing.length) throw new Error(`텔레그램 사용자 세션 자격이 없다: ${missing.join(' · ')} (docs/manual/MANUAL-telegram-unmanned-test-2026-07-21.md §1~§3)`);
-  const { TelegramClient } = await import('telegram');
-  const { StringSession } = await import('telegram/sessions');
+  // `telegram` is an optional dependency: its native websocket helpers have no Linux ARM64 build, so npm may leave it out.
+  let modules: GramjsModules;
+  try { modules = await load(); }
+  catch { throw new Error('텔레그램 사용자 세션 모듈(telegram)이 이 설치에 없다 — 선택 의존이라 Linux ARM64 등에서는 빠진다(npm i -g telegram 으로 따로 깔 수 있다)'); }
+  const { TelegramClient, StringSession } = modules;
   const client = new TelegramClient(new StringSession(session), apiId, apiHash, { connectionRetries: 3 });
   client.setLogLevel('error' as never);   // 연결 로그가 표준출력을 채우지 않게
   await client.connect();

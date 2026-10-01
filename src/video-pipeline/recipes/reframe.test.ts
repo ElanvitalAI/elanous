@@ -6,11 +6,12 @@
  *   고객 기계(앱 없음)에서 처음 터진다.
  * 🔑 ***내가 가진 환경이 「통과」한 것을 「검증」으로 읽지 않는다.***
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, test, spyOn } from 'bun:test';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { run } from './ffmpeg.js';
+import * as ffmpeg from './ffmpeg.js';
+const { run } = ffmpeg;
 import { affinityReachable, reframeOne, resetAffinityReachCache, sayReframe } from './reframe.js';
 
 const HOME = process.env.HOME ?? '/tmp';
@@ -31,15 +32,17 @@ describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
 
   test('⛔ 도달성 probe 가 «한 런에 한 번»만 든다 (SSE 가 안 닫혀서 매번 최대 시간을 쓴다)', () => {
     resetAffinityReachCache();
-    const t0 = Date.now();
-    const first = affinityReachable();
-    const t1 = Date.now();
-    for (let i = 0; i < 5; i++) affinityReachable();
-    const t2 = Date.now();
-    // ⛔ 캐시가 «값을 바꾸면» 안 된다 — 빨라지기만 해야 한다.
-    expect(affinityReachable()).toBe(first);
-    // 뒤 5번이 첫 1번보다 «훨씬» 싸다. ⚠️ 첫 판정이 null 이면 캐시를 «안 하므로» 이 비교를 건너뛴다.
-    if (first !== null) expect(t2 - t1).toBeLessThan(Math.max(50, (t1 - t0) / 2));
+    const probe = spyOn(ffmpeg, 'run').mockImplementation(() => ({ ok: false, code: 7, signal: null, out: '000', err: '' }));
+    try {
+      expect(affinityReachable()).toBe(false);
+      for (let i = 0; i < 5; i++) expect(affinityReachable()).toBe(false);
+      expect(probe).toHaveBeenCalledTimes(1);
+      resetAffinityReachCache();
+      probe.mockImplementation(() => ({ ok: false, code: 28, signal: null, out: '000', err: 'timeout' }));
+      expect(affinityReachable()).toBeNull();
+      expect(affinityReachable()).toBeNull();
+      expect(probe).toHaveBeenCalledTimes(3); // 측정 불가는 캐시하지 않는다.
+    } finally { probe.mockRestore(); resetAffinityReachCache(); }
   }, T);
   test('⛔ 산출이 «홈 밖»이면 Affinity 를 건너뛰고 ffmpeg 로 간다 ⊕ «이유»를 들고 간다', () => {
     const d = mkdtempSync(join(tmpdir(), 'rf-'));
@@ -59,15 +62,18 @@ describe('reframe — Affinity 가 없어도 «끝까지» 간다', () => {
 
   test('⛔ 러너가 «없어도» 멈추지 않는다 (앱이 없는 고객 기계의 모습)', () => {
     const d = mkdtempSync(join(HOME, '.rf-'));             // 홈 아래 — 경로 때문이 아님을 분리한다
+    const src = mkSrc(d, 800, 600);
+    const out = join(d, 'out.png');
+    resetAffinityReachCache();
+    const probe = spyOn(ffmpeg, 'run').mockImplementation((cmd, args, timeout) =>
+      cmd === 'curl' ? { ok: true, out: '200', err: '', code: 0, signal: null } : run(cmd, args, timeout));
     try {
-      const src = mkSrc(d, 800, 600);
-      const out = join(d, 'out.png');
       const r = reframeOne({ src, out, width: 1080, height: 1920, scriptDir: '/없는/스크립트/뿌리' });
       expect(r.ok).toBe(true);
       expect(r.method).toBe('ffmpeg-blur');
       expect(sizeOf(out)).toBe('1080,1920');
       expect(r.skipped[0]?.why).toContain('러너가 없다');
-    } finally { rmSync(d, { recursive: true, force: true }); }
+    } finally { probe.mockRestore(); resetAffinityReachCache(); rmSync(d, { recursive: true, force: true }); }
   }, T);
 
   test('⛔ 원본이 «없으면» 실패를 «실패로» 말한다 (조용히 통과하지 않는다)', () => {

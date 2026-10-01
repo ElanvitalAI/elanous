@@ -14,6 +14,15 @@ function routeGuidanceTestId(href: string): string {
 }
 
 describe('WelcomeHome — core routes and not-found guidance', () => {
+  test('MAT2 — a device with no chosen role renders only stable tiles (no beta/tool/ops, no repair list)', () => {
+    const html = decodedHtml(renderToStaticMarkup(<WelcomeHome />));
+    for (const hidden of ['/approvals', '/scheduler', '/trace', '/intake', '/design-check']) {
+      expect(html).not.toContain(`data-testid="${routeGuidanceTestId(hidden)}"`);
+    }
+    expect(html).toContain(`data-testid="${routeGuidanceTestId('/chat')}"`);
+    expect(html).not.toContain('고치는 중인 화면');
+  });
+
   test('renders a welcome-home root with the headline', () => {
     const html = renderToStaticMarkup(<WelcomeHome />);
     expect(html).toContain('data-testid="welcome-home"');
@@ -21,7 +30,7 @@ describe('WelcomeHome — core routes and not-found guidance', () => {
   });
 
   test('shows core tiles first and nests every other menu tile in the closed all-screens disclosure', () => {
-    const html = decodedHtml(renderToStaticMarkup(<WelcomeHome />));
+    const html = decodedHtml(renderToStaticMarkup(<WelcomeHome role="owner" />));
     const { core, more } = splitWelcomeRoutes([...SIDEBAR_NAV_ITEMS, { href: '/setup' }]);
     expect(html).toContain('aria-label="핵심 화면"');
     expect(html).toContain('<details');

@@ -1,0 +1,24 @@
+# 현장 피드 (EV10c · EV10d · 대표 10-01 18:4x) — 현장 폴더 → 릴스 ⊕ 4:5 캐러셀 ⊕ 캡션 → «게시 대기» → 사람이 고치고 «최종 게시» → 게시 준비 묶음.
+# 정본 = <folder>/feed/feed-draft.json. PWA «게시 대기» 카드가 그 파일을 고치고(PUT), 승인 뒤 deliver 가 그 최신본을 읽는다.
+# 시작·재개 = scripts/field-feed/start.ts(런을 띄우고 승인 결정이 기록되면 --resume). ⛔ 인스타 자동 게시 없음.
+graph_id: field-feed
+loop:
+  title: 현장 피드
+  description: 현장 사진에서 릴스·캐러셀·캡션을 만들어 게시 대기열에 올리고, 사람이 승인하면 게시 준비 묶음을 보낸다
+  trigger:
+    events: [manual]
+version: 1
+entry_node: reel
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: reel, kind: agent, recipe: 'cmd:reel', max_visits: 1 }
+  - { node_id: feed, kind: agent, recipe: 'cmd:feed', max_visits: 1 }
+  - { node_id: post, kind: hitl, recipe: 'approval:post', max_visits: 1 }
+  - { node_id: deliver, kind: agent, recipe: 'cmd:deliver', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: reel, on: outcome, map: { ok: feed, fail: feed, error: feed } }
+  - { from: feed, on: outcome, map: { ok: post, fail: failed, error: failed } }
+  - { from: post, on: outcome, map: { ok: deliver, fail: failed, error: failed } }
+  - { from: deliver, on: outcome, map: { ok: done, fail: failed, error: failed } }

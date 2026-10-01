@@ -101,7 +101,8 @@ describe('NL routing corpus runner safety gate', () => {
       expect(result.exitCode).not.toBe(0);
       expect(result.stdout).toBe('');
       expect(result.stderr).toContain('exposed mutating tools can modify this worktree');
-      expect(result.stderr).toContain('Exposed mutating tools: Bash.');
+      expect(result.stderr).toContain('Unprotected host mutating tools exposed: Bash, Edit, Write.');
+      expect(result.stderr).toContain('Exposed mutating tools: Bash, Edit, Write.');
       expect(result.stderr).toContain('Known mutating tool surface: SelfImplement, Bash, Edit, Write.');
       expect(result.stderr).toContain(NL_ROUTING_UNSAFE_RUN_ENV);
     } finally {

@@ -121,6 +121,8 @@ interface UserCodeResponse {
   device_auth_id: string;
   interval?: number;
   expires_in?: number;
+  verification_uri_complete?: string;
+  verification_uri?: string;
 }
 
 interface PollSuccessResponse {
@@ -278,7 +280,8 @@ export async function loginWithCodex(opts: CodexLoginOpts = {}): Promise<Provide
   const userCode = await requestDeviceCode({ fetchImpl });
   const serverInterval = typeof userCode.interval === 'number' ? userCode.interval * 1000 : 0;
   const pollInterval = Math.max(reportedInterval, serverInterval || 0);
-  onProgress({ type: 'user_code', userCode: userCode.user_code, loginUrl: CODEX_DEVICE_LOGIN_URL });
+  onProgress({ type: 'user_code', userCode: userCode.user_code,
+    loginUrl: userCode.verification_uri_complete || userCode.verification_uri || CODEX_DEVICE_LOGIN_URL });
 
   // 2) Poll until ready or timeout.
   const startedAt = Date.now();

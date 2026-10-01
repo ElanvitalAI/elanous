@@ -11,6 +11,7 @@
  *     표지 = LEAK_MARKERS(줄 단위 흔적 · 문서 링크는 private 에 «실재»하는 이름만) — rc 는 이것만 센다.
  *     참고 = `runtime-path-outside-export`(공개 코드가 공개본에 없는 경로를 쥔다) — rc 에 안 센다 · 판정은 public-export-test-run 의 exportOnly=0.
  *   bun scripts/public-export.ts --out <dir>            # 트리 복사 ⊕ replace 적용 ⊕ 유출 검사(있으면 rc=1 · 복사는 한다)
+ *   bun scripts/public-export.ts --leak-check --files a b …  # 그 파일들만 — prepare 와 같은 변환·치환 «뒤»에 잰다(pr land 가 부른다)
  *
  * ⛔ 목록 밖은 «전부» private 에 남는다 — 이 스크립트가 무엇을 «더» 넣는 일은 없다.
  * ⛔ 원천은 `git ls-files`(추적 파일)다 — 작업 트리의 untracked·ignored 는 원리상 안 간다.
@@ -379,6 +380,9 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
   const pathIndex = argv.indexOf('--path');
   const pathPrefix = pathIndex >= 0 ? argv[pathIndex + 1] : undefined;
   if (pathIndex >= 0 && !pathPrefix) { console.error('⛔ --path needs a prefix'); return 2; }
+  const filesIndex = argv.indexOf('--files');
+  const onlyFiles = filesIndex >= 0 ? new Set(argv.slice(filesIndex + 1).filter((a) => !a.startsWith('--'))) : undefined;
+  const inScope = (f: string) => (!pathPrefix || f.startsWith(pathPrefix)) && (!onlyFiles || onlyFiles.has(f));
   const outIndex = argv.indexOf('--out');
   const out = outIndex >= 0 ? argv[outIndex + 1] : undefined;
   if (outIndex >= 0 && !out) { console.error('⛔ --out needs a directory'); return 2; }
@@ -411,9 +415,9 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
       if (!existsSync(join(root, src))) { console.error(`⛔ replace source missing: ${src}`); return 2; }
       contents.set(dest, readFileSync(join(root, src), 'utf8'));
     }
-    const scanned = pathPrefix ? files.filter((f) => f.startsWith(pathPrefix)) : files;
+    const scanned = files.filter(inScope);
     const realDocs = privateDocNames(tracked, files);
-    const before = [...scanLeaks(root, scanned, LEAK_MARKERS, undefined, realDocs), ...scanRuntimePaths(root, files, tracked).filter((h) => !pathPrefix || h.file.startsWith(pathPrefix))];
+    const before = [...scanLeaks(root, scanned, LEAK_MARKERS, undefined, realDocs), ...scanRuntimePaths(root, files, tracked).filter((h) => inScope(h.file))];
     const transformedByRules = transformExportFiles(contents, config, files);
     // ⭐ 개인 치환표(저장소 밖) — 규칙 변환 «뒤»에 건다. 없으면 «못 봤다»로 막는다.
     const redactions = loadPrivateRedactions();
@@ -445,12 +449,12 @@ export function run(argv: readonly string[], root = resolve(import.meta.dir, '..
       console.error(`exported ${files.length} files (+${Object.keys(config.replace).length} replaced) → ${target}`);
     }
     const hits = [
-      ...gitIgnoredExportFiles(root, files).filter((f) => !pathPrefix || f.startsWith(pathPrefix)).map((file) => ({ marker: 'export-gitignored', file, line: 0, text: '공개본 .gitignore 에 걸린다 — 커밋하면 사라진다' })),
+      ...gitIgnoredExportFiles(root, files).filter(inScope).map((file) => ({ marker: 'export-gitignored', file, line: 0, text: '공개본 .gitignore 에 걸린다 — 커밋하면 사라진다' })),
       ...scanLeaks(root, scanned, LEAK_MARKERS, transformed.contents, realDocs),
       ...(redactions ? scanLeaks(root, scanned, privateIdentifierMarkers(redactions), transformed.contents, realDocs) : []),
       ...(!redactions && !noPrivateList ? [{ marker: 'private-identifiers-unchecked', file: privateRedactionsPath(), line: 0, text: 'private redaction list missing' }] : []),
     ];
-    const advisory = scanRuntimePaths(root, files, tracked, transformed.contents).filter((h) => !pathPrefix || h.file.startsWith(pathPrefix));
+    const advisory = scanRuntimePaths(root, files, tracked, transformed.contents).filter((h) => inScope(h.file));
     const summary = summarizeLeaks(hits);
     const advisorySummary = summarizeLeaks(advisory);
     const beforeSummary = summarizeLeaks(before);

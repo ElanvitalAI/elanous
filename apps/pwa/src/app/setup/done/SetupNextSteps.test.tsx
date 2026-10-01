@@ -2,11 +2,12 @@ import { expect, test } from 'bun:test';
 import { act, create } from 'react-test-renderer';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import type { NexusClient } from '@/nexus/client';
+import { createNexusClient, type NexusClient } from '@/nexus/client';
 import { NexusProvider } from '@/nexus/hooks/use-nexus-context';
 import { ChannelBotSetupCard } from '@/components/settings/ChannelBotSetupCard';
 import { ObsidianSkillsCard } from '@/components/settings/ObsidianSkillsCard';
-import { SetupNextSteps } from './SetupNextSteps';
+import { recommendedSetup } from '../../../../../../src/cli/setup-recommend';
+import { SetupNextSteps, SetupRecommendations } from './SetupNextSteps';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -39,6 +40,46 @@ test('both optional steps start collapsed; opening and postponing each mounts an
   expect(steps.findByProps({ 'data-testid': 'obsidian-skills-card' })).toBeDefined();
   await act(async () => { buttons().find(button => button.props.children === '나중에')!.props.onClick(); });
   expect(steps.findAllByType(ObsidianSkillsCard)).toHaveLength(0);
+  await act(async () => { tree.unmount(); });
+});
+
+test('recommendations match the CLI for current true and false values without a smart line', async () => {
+  for (const fastPath of [true, false]) {
+    const configClient = { getChatFastPath: async () => ({ enabled: fastPath }) } as unknown as NexusClient;
+    let tree!: ReturnType<typeof create>;
+    await act(async () => { tree = create(<NexusProvider client={configClient}><SetupRecommendations /></NexusProvider>); });
+    const section = tree.root.findByProps({ 'data-testid': 'setup-recommendations' });
+    expect(section.findAllByType('p').map(p => p.props.children)).toEqual(recommendedSetup({ chat: { fastPath } }));
+    const html = JSON.stringify(tree.toJSON());
+    expect(html).toContain('elanous doctor --fix --yes');
+    expect(html).toContain(`chat.fastPath=${fastPath}`);
+    expect(html).toContain(`elanous config set chat.fastPath ${!fastPath}`); // 켜져 있으면 끄기 · 꺼져 있으면 켜기
+    expect(html).not.toContain('smart');
+    await act(async () => { tree.unmount(); });
+  }
+});
+
+test('recommendations read the dedicated fastPath snapshot rather than the redacted Nexus config', async () => {
+  const paths: string[] = [];
+  const fetchImpl = Object.assign(async (input: RequestInfo | URL) => {
+    paths.push(String(input));
+    return new Response(JSON.stringify({ enabled: true }), { status: 200 });
+  }, { preconnect: () => {} });
+  const configClient = createNexusClient({ baseUrl: 'http://localhost', fetchImpl });
+  let tree!: ReturnType<typeof create>;
+  await act(async () => { tree = create(<NexusProvider client={configClient}><SetupRecommendations /></NexusProvider>); });
+  expect(paths).toEqual(['http://localhost/v1/config/chat-fast-path']);
+  expect(JSON.stringify(tree.toJSON())).toContain('chat.fastPath=true');
+  await act(async () => { tree.unmount(); });
+});
+
+test('unavailable config does not pretend fastPath is false', async () => {
+  const configClient = { getChatFastPath: async () => ({ enabled: undefined }) } as unknown as NexusClient;
+  let tree!: ReturnType<typeof create>;
+  await act(async () => { tree = create(<NexusProvider client={configClient}><SetupRecommendations /></NexusProvider>); });
+  const html = JSON.stringify(tree.toJSON());
+  expect(html).toContain('chat.fastPath 값을 읽을 수 없습니다');
+  expect(html).not.toContain('chat.fastPath=false');
   await act(async () => { tree.unmount(); });
 });
 

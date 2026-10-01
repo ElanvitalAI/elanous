@@ -22,17 +22,30 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36';
 const OUT_DIR = process.env.VFLOW_OUT ?? join(homedir(), 'docs', 'ref', 'vflow');
 const NDJSON = join(OUT_DIR, 'prompts.ndjson');
 const URLS = join(OUT_DIR, 'urls.txt');
-const CONCURRENCY = 4;
-const GAP_MS = 120;
+// ⚠️ 2026-10-01 실측: 4병렬·120ms 로 전수를 돌리면 수백 건 뒤 사이트가 429 를 낸다(재수집 404건 중 158건).
+// 기본을 낮추고, 429 는 «없다»가 아니라 «기다려라»로 읽는다(Retry-After 를 따른다).
+const CONCURRENCY = Number(process.env.VFLOW_CONCURRENCY ?? 2);
+const GAP_MS = Number(process.env.VFLOW_GAP_MS ?? 400);
+const MAX_429_RETRIES = 5;
 
 const argv = process.argv.slice(2);
 const limitAt = argv.indexOf('--limit');
 const LIMIT = limitAt >= 0 ? Number(argv[limitAt + 1]) : Infinity;
 
+let throttled = 0;
 async function get(url: string): Promise<string> {
-  const r = await fetch(url, { headers: { 'User-Agent': UA } });
-  if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return r.text();
+  for (let attempt = 0; ; attempt++) {
+    const r = await fetch(url, { headers: { 'User-Agent': UA } });
+    if (r.status === 429 && attempt < MAX_429_RETRIES) {
+      throttled++;
+      const after = Number(r.headers.get('retry-after'));
+      const waitMs = Number.isFinite(after) && after > 0 ? after * 1000 : 5000 * 2 ** attempt;
+      await new Promise((res) => setTimeout(res, waitMs));
+      continue;
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.text();
+  }
 }
 
 /** 사이트맵 전수 → 영문 `/prompts/` URL. ⛔ 번역판(`/{lang}/prompts/`)은 «같은 내용»이라 뺀다. */
@@ -166,14 +179,14 @@ async function main(): Promise<void> {
       catch { failed++; return null; }                  // ⛔ 「없다」가 아니라 «못 받았다»
     }));
     for (const r of rows) { if (r) { appendFileSync(NDJSON, JSON.stringify(r) + '\n'); ok++; } else noLd++; }
-    if ((i / CONCURRENCY) % 25 === 0) console.log(`  … ${ok + noLd}/${todo.length}  ok=${ok} 건너뜀=${noLd}`);
+    if ((i / CONCURRENCY) % 25 === 0) console.log(`  … ${ok + noLd}/${todo.length}  ok=${ok} 못받음=${failed} jsonld없음=${noLd - failed} 429대기=${throttled}`);
   }
   // ⛔ 수를 «도구가» 낸다 — 사람이 세지 않는다.
   writeFileSync(join(OUT_DIR, 'MANIFEST.txt'),
     [`source: https://vflow.live (robots: Allow: / · 2026-09-23 확인)`,
      `fetched: ${new Date().toISOString()}`,
      `urls_total: ${urls.length}`, `rows_ok: ${ok + done.size}`,
-     `skipped_no_jsonld: ${noLd - failed}`, `failed_fetch: ${failed}`,
+     `skipped_no_jsonld: ${noLd - failed}`, `failed_fetch: ${failed}`, `throttled_429_retries: ${throttled}`,
      `schema: url model category slug name description prompt keywords[] datePublished author authorUrl sourcePost thumb spec{duration,camera[],lighting[],mood[],difficulty,promptLanguage,includes[]} video{url,isoDuration,resolution,aspect}`,
      `refetch: bun scripts/vflow-collect.ts`, ''].join('\n'));
   console.log(`\n  ✅ ok ${ok} · 건너뜀 ${noLd - failed} · 못 받음 ${failed}  →  ${NDJSON}`);

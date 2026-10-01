@@ -4,6 +4,8 @@ import { describe, expect, test } from 'bun:test';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
+import { HARNESS_CORE_KINDS, getNodeKindRegistration, registerNodeKind, unregisterPluginNodeKind } from '../src/graph-kinds/registry.js';
+import { parseGraphTemplateYaml } from '../src/self-implement/graph-yaml.js';
 
 const ROOT = join(import.meta.dir, '..');
 const catalog = parseYaml(readFileSync(join(ROOT, 'graphs/catalog/catalog.yaml'), 'utf8')) as {
@@ -18,12 +20,24 @@ describe('graph node catalog', () => {
   const kinds = new Set([...catalog.kinds.existing, ...Object.keys(catalog.kinds.proposed)]);
 
   test('카탈로그 existing ⊕ proposed 는 그래프 파서 어휘와 같다', () => {
-    const yamlSource = readFileSync(join(ROOT, 'src/self-implement/graph-yaml.ts'), 'utf8');
-    const declared = /const KINDS = new Set<GraphNodeKind>\(\[([^\]]+)\]\)/.exec(yamlSource)?.[1];
-    expect(declared).toBeDefined();
-    const parserKinds = [...declared!.matchAll(/'([a-z]+)'/g)].map((m) => m[1]).sort();
-    expect([...kinds].sort()).toEqual(parserKinds);
+    expect([...kinds].sort()).toEqual([...HARNESS_CORE_KINDS].sort());
     expect(catalog.kinds.proposed).toEqual({});
+    for (const kind of kinds) {
+      const parsed = parseGraphTemplateYaml(`graph_id: catalog-kind\nversion: 1\nentry_node: node\nterminal_nodes: [node]\nnodes:\n  - node_id: node\n    kind: ${kind}\n    recipe: test\n    max_visits: 1\nedges: []\n`);
+      expect(parsed.errors).toEqual([]);
+      expect(parsed.template?.nodes[0]?.kind).toBe(kind);
+    }
+    expect(parseGraphTemplateYaml('graph_id: invalid\nversion: 1\nentry_node: node\nterminal_nodes: [node]\nnodes:\n  - node_id: node\n    kind: not-a-kind\n    recipe: test\n    max_visits: 1\nedges: []\n').errors.length).toBeGreaterThan(0);
+    const plugin = { graph: 'harness' as const, kind: 'catalog-probe:custom', plugin: 'catalog-probe', description: 'catalog probe', core: false };
+    expect(registerNodeKind(plugin)).toEqual({ ok: true });
+    try {
+      const parsed = parseGraphTemplateYaml('graph_id: plugin\nversion: 1\nentry_node: node\nterminal_nodes: [node]\nnodes:\n  - node_id: node\n    kind: catalog-probe:custom\n    recipe: test\n    max_visits: 1\nedges: []\n');
+      expect(parsed.errors).toEqual([]);
+      expect(parsed.template?.nodes[0]?.kind).toBe(plugin.kind);
+    } finally {
+      const registered = getNodeKindRegistration(plugin.graph, plugin.kind);
+      if (registered) unregisterPluginNodeKind(plugin.graph, plugin.kind, plugin.plugin, registered);
+    }
   });
 
   test('역할마다 칸이 다 있고 값이 어휘 안이다', () => {

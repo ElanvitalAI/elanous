@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
 import { AppRouterContext } from 'next/dist/shared/lib/app-router-context.shared-runtime';
 import { cn } from '@/lib/utils';
-import { usePwaRole } from '@/lib/pwa-role';
+import { usePwaRole, type PwaRole } from '@/lib/pwa-role';
 import { visibleForRole } from '@/lib/route-maturity';
 import { splitWelcomeRoutes } from './welcome-core-routes';
 import { useNexusHealthIfMounted } from '@/nexus/hooks/use-nexus-state';
@@ -103,13 +103,14 @@ export function RouteGuidanceList({ ariaLabel, items = ROUTE_GUIDANCE_ITEMS }: {
   );
 }
 
-export function WelcomeHome() {
+/** `role` overrides this device's stored role — static rendering (and tests) otherwise see `general` (MAT2). */
+export function WelcomeHome({ role }: { role?: PwaRole } = {}) {
   const routerContext = useContext(AppRouterContext);
-  if (routerContext == null) return <WelcomeHomeView />;
-  return <WelcomeHomeRedirect />;
+  if (routerContext == null) return <WelcomeHomeView role={role} />;
+  return <WelcomeHomeRedirect role={role} />;
 }
 
-function WelcomeHomeRedirect() {
+function WelcomeHomeRedirect({ role }: { role?: PwaRole }) {
   const router = useRouter();
   const pathname = usePathname();
   const healthQuery = useNexusHealthIfMounted();
@@ -121,11 +122,12 @@ function WelcomeHomeRedirect() {
     if (redirectTo === '/setup') router.replace('/setup');
   }, [redirectTo, router]);
 
-  return <WelcomeHomeView />;
+  return <WelcomeHomeView role={role} />;
 }
 
-function WelcomeHomeView() {
-  const role = usePwaRole();
+function WelcomeHomeView({ role: forced }: { role?: PwaRole }) {
+  const stored = usePwaRole();
+  const role = forced ?? stored;
   const { core, more } = splitWelcomeRoutes(
     WELCOME_MENU_ITEMS.filter((item) => visibleForRole(role, item.href)),
   );

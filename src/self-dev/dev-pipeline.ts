@@ -1871,7 +1871,10 @@ async function runDevPipelineDispatch(
   observeDevSelection('completion', plan.completion, plan.completionSource, plan.completionSource === 'request' ? spec.completion : undefined, entryRoute, spec.runId, plan.entrance, plan.entranceUnstamped);
   observeDevSelection('autoReview', plan.autoReview, plan.autoReviewSource, plan.autoReviewSource === 'request' ? spec.autoReview : undefined, entryRoute, spec.runId, plan.entrance, plan.entranceUnstamped);
   assertDispatchHonorsOptions(plan); // 미이행 옵션 거부(수락 후 무시 금지)
-  emitHumanProgress(completionAnnouncement(plan.completion), spec.humanReadableOutput !== false, deps.progress);
+  // CHAT1 — a plain chat turn (`interactive`) is not a dev run: its completion/base lines are noise to a person.
+  //   The selection is still observed above; only the human-facing lines are dev-run-only.
+  const devRunLines = plan.dispatch !== 'interactive';
+  if (devRunLines) emitHumanProgress(completionAnnouncement(plan.completion), spec.humanReadableOutput !== false, deps.progress);
   if (spec.notice) emitHumanProgress(spec.notice, spec.humanReadableOutput !== false, deps.progress);
 
   if (plan.dispatch === 'parallel') {
@@ -1899,8 +1902,8 @@ async function runDevPipelineDispatch(
     rule: plan.baseSelection?.rule ?? 'unspecified',
     evidence: plan.baseSelection?.evidence ?? 'not applicable',
   });
-  emitHumanProgress(formatDevBaseSelectionAnnouncement(plan), spec.humanReadableOutput !== false, deps.progress);
-  const nonDefaultBaseWarning = formatDevNonDefaultBaseWarning(plan);
+  if (devRunLines) emitHumanProgress(formatDevBaseSelectionAnnouncement(plan), spec.humanReadableOutput !== false, deps.progress);
+  const nonDefaultBaseWarning = devRunLines ? formatDevNonDefaultBaseWarning(plan) : undefined;
   if (nonDefaultBaseWarning) {
     emitHumanProgress(nonDefaultBaseWarning, spec.humanReadableOutput !== false, deps.progress);
   }

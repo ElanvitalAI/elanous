@@ -67,6 +67,40 @@ function credentialBlock(formatted: string, name: string, nextName?: string): st
 }
 
 describe('doctor CLI', () => {
+  test('doctor --json reports three modes and human output adds only the mode section', async () => {
+    const outputs: string[] = [];
+    const program = new Command();
+    const cfg = { ...userConfig(), modelTier: { llm: 'best' }, llm: { autoRoute: { enabled: true } } } as UserConfig;
+    const deps = options({ userConfig: cfg, env: { ENV_ONLY: 'secret' } });
+    const before = runDoctor(options({ userConfig: userConfig(), env: { ENV_ONLY: 'secret' } }));
+    const after = runDoctor(deps);
+    expect(after.ok).toBe(true);
+    expect(after.credentials).toEqual(before.credentials);
+    expect(after.capabilitySummary).toEqual(before.capabilitySummary);
+    expect(after.readiness).toEqual(before.readiness);
+    expect(after.requiredMissing).toEqual(before.requiredMissing);
+    expect(after.modes?.map(({ id, value, source, usedByChat }) => ({ id, value, source, usedByChat }))).toEqual([
+      { id: 'model-tier', value: 'best', source: 'config', usedByChat: false },
+      { id: 'auto-route', value: true, source: 'config', usedByChat: false },
+      { id: 'fast-mode', value: 'none', source: 'none', usedByChat: false },
+    ]);
+    registerDoctorCommand(program, { ...deps, out: { log: (line) => outputs.push(line) }, setExitCode: () => {} });
+    await program.parseAsync(['doctor'], { from: 'user' });
+    await program.parseAsync(['doctor', '--json'], { from: 'user' });
+    const text = outputs[0]!;
+    const json = JSON.parse(outputs[1]!);
+    expect(json.modes).toEqual(after.modes);
+    expect(json.credentials).toEqual(before.credentials);
+    expect(json.readiness).toEqual(before.readiness);
+    expect(text.split('\n').filter((line) => line.startsWith('  smart·') || line.startsWith('  빠른 모드:'))).toEqual([
+      '  smart·등급: best(설정) · 대화에 안 쓰임 — 대화 턴 모델 선택에 쓰이지 않는다(표시·전환 계획만)',
+      '  smart·자동 라우팅: true(설정) · 대화에 안 쓰임 — 오토파일럿 턴만 읽는다 · 켜기 = elanous config set llm.autoRoute.enabled true',
+      '  빠른 모드: none(없음) · 대화에 안 쓰임 — 스위치 없음(분류기 호출부 0)',
+    ]);
+    const baseline = renderDoctorReport({ ...after, modes: undefined });
+    expect(text).toBe(`${baseline}\n모드:\n${text.split('\n').slice(-3).join('\n')}`);
+  });
+
   test('humanBreaks hides development notes and keeps user-facing prose after removing source paths', () => {
     for (const value of [
       'unmeasured',

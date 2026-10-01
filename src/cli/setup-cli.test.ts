@@ -10,9 +10,9 @@ import type { UserConfig } from '../user-config.js';
 
 const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': { tokens: { accessToken: 'access', refreshToken: 'refresh' } } } });
 const CODEX_AUTH = JSON.stringify({ tokens: { access_token: 'access', refresh_token: 'refresh' } });
-const config = (provider?: string) => ({ llm: { provider } }) as UserConfig;
+const config = (provider?: string, fastPath = true) => ({ llm: { provider }, chat: { fastPath } }) as UserConfig;
 
-type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; nonInteractive?: boolean; stdinTty?: boolean; runtimeProvider?: string };
+type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number };
 
 async function runSetup(state: SetupState = {}) {
   const output: string[] = [];
@@ -21,6 +21,7 @@ async function runSetup(state: SetupState = {}) {
   const writes: UserConfig[] = [];
   const prompts: string[] = [];
   let doctorCalls = 0;
+  const doctorFixCalls: string[][] = [];
   let currentProvider = state.provider;
   const files = new Map<string, string>();
   if (state.elanous) files.set('/home/fake/.elanous/auth.json', state.elanousAuth ?? ELANOUS_AUTH);
@@ -34,7 +35,7 @@ async function runSetup(state: SetupState = {}) {
       if (value === undefined) throw new Error(`missing fake file: ${path}`);
       return value;
     },
-    getUserConfig: () => config(currentProvider),
+    getUserConfig: () => config(currentProvider, state.fastPath),
     saveUserConfig: (next) => { writes.push(next); currentProvider = next.llm.provider; },
     runDoctor: () => {
       doctorCalls += 1;
@@ -44,14 +45,15 @@ async function runSetup(state: SetupState = {}) {
         externalCommands: [{ name: 'codex', tier: 'required', status: state.externalReady === false ? 'missing' : 'found', breaks: 'Codex app-server integration' }],
       };
     },
-    prompt: async (message) => { prompts.push(message); return state.answer; },
+    prompt: async (message) => { prompts.push(message); return message.startsWith('추천대로') ? state.recommendationAnswer : state.answer; },
+    runDoctorFix: async (args) => { doctorFixCalls.push([...args]); return state.doctorFixExitCode ?? 0; },
     isStdinTty: () => state.stdinTty === true,
     out: { log: (line) => output.push(line), error: (line) => errors.push(line) },
     setExitCode: (code) => exitCodes.push(code),
     resolveRuntimeProvider: () => state.runtimeProvider,
   });
-  await program.parseAsync(['node', 'elanous', 'setup', ...(state.nonInteractive === false ? [] : ['--non-interactive'])]);
-  return { text: output.join('\n'), output, errors, exitCodes, writes, prompts, doctorCalls };
+  await program.parseAsync(['node', 'elanous', 'setup', ...(state.nonInteractive === false ? [] : ['--non-interactive']), ...(state.yes ? ['--yes'] : [])]);
+  return { text: output.join('\n'), output, errors, exitCodes, writes, prompts, doctorCalls, doctorFixCalls };
 }
 
 function section(text: string, heading: string, nextHeading?: string): string {
@@ -194,6 +196,48 @@ describe('setup Claude Code CLI', () => {
 });
 
 describe('setup CLI', () => {
+  test('setup completion prints the two recommendations with the current fastPath in both modes', async () => {
+    for (const fastPath of [true, false]) {
+      for (const nonInteractive of [true, false]) {
+        const result = await runSetup({ provider: 'openai-codex', fastPath, nonInteractive, stdinTty: true, recommendationAnswer: 'n' });
+        expect(result.output.at(-2)).toContain('고칠 것 고치기');
+        expect(result.output.at(-2)).toContain('elanous doctor --fix --yes');
+        expect(result.output.at(-1)).toContain(`chat.fastPath=${fastPath}`);
+        // #22463: 켜져 있으면 «끄기», 꺼져 있으면 «켜기» 명령을 준다.
+        expect(result.output.at(-1)).toContain(`elanous config set chat.fastPath ${!fastPath}`);
+        expect(result.output.filter(line => line.includes('고칠 것 고치기') || line.includes('짧은 물음은 빠르게'))).toHaveLength(2);
+        expect(result.writes).toEqual([]);
+        expect(result.prompts).toEqual(nonInteractive ? [] : ['추천대로 켤까요? [Y/n] ']);
+        expect(result.doctorFixCalls).toEqual([]);
+      }
+    }
+  });
+
+  test('--yes configures a missing provider before reporting readiness and running doctor on a non-TTY', async () => {
+    const unattended = await runSetup({ elanous: true, codex: true, nonInteractive: false, stdinTty: false, yes: true });
+    expect(unattended.prompts).toEqual([]);
+    expect(unattended.writes).toHaveLength(1);
+    expect(unattended.writes[0]!.llm.provider).toBe('openai-codex');
+    expect(section(unattended.text, 'Available now:', 'Unavailable until')).toContain('- OpenAI Codex-backed elanous sessions');
+    expect(unattended.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
+    expect(unattended.exitCodes).toEqual([0]);
+  });
+
+  test('TTY acceptance runs doctor --fix --yes once and propagates failure; --yes skips the prompt and non-TTY is allowed', async () => {
+    const accepted = await runSetup({ provider: 'openai-codex', nonInteractive: false, stdinTty: true, recommendationAnswer: '', doctorFixExitCode: 1 });
+    expect(accepted.prompts).toEqual(['추천대로 켤까요? [Y/n] ']);
+    expect(accepted.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
+    expect(accepted.exitCodes).toEqual([1]);
+    const unattended = await runSetup({ provider: 'openai-codex', nonInteractive: false, stdinTty: false, yes: true });
+    expect(unattended.prompts).toEqual([]);
+    expect(unattended.doctorFixCalls).toEqual([['doctor', '--fix', '--yes']]);
+    expect(unattended.exitCodes).toEqual([0]);
+    const reportOnly = await runSetup({ nonInteractive: true, stdinTty: false, yes: true });
+    expect(reportOnly.prompts).toEqual([]);
+    expect(reportOnly.writes).toEqual([]);
+    expect(reportOnly.doctorFixCalls).toEqual([]);
+  });
+
   test('non-interactive calls doctor, shows its detailed command report and all guidance, never prompts or writes, and succeeds', async () => {
     const result = await runSetup({ externalReady: false });
     const originalReport = [
@@ -218,7 +262,7 @@ describe('setup CLI', () => {
     expect(result.text).toContain('Would ask: Set llm.provider to openai-codex now? [y/N]');
   });
 
-  test('has no child-process or Bun.spawn execution boundary for browser-login commands', () => {
+  test('keeps browser-login commands as guidance rather than spawning them', () => {
     const source = readFileSync(fileURLToPath(new URL('./setup-cli.ts', import.meta.url)), 'utf8');
     expect(source).not.toMatch(/node:child_process|\bspawn\s*\(/);
     expect(source).not.toContain('Bun.spawn');
@@ -257,7 +301,7 @@ describe('setup CLI', () => {
   test('writes provider exactly once only after consent and recomputes the final capabilities after the write', async () => {
     const accepted = await runSetup({ elanous: true, codex: true, answer: 'y', nonInteractive: false, stdinTty: true });
     const declined = await runSetup({ elanous: true, codex: true, answer: 'n', nonInteractive: false, stdinTty: true });
-    expect(accepted.prompts).toHaveLength(1);
+    expect(accepted.prompts).toEqual(['Set llm.provider to openai-codex now? [y/N] ', '추천대로 켤까요? [Y/n] ']);
     expect(accepted.writes).toHaveLength(1);
     expect(accepted.writes[0]!.llm.provider).toBe('openai-codex');
     expect(section(accepted.text, 'Available now:', 'Unavailable until')).toContain('- OpenAI Codex-backed elanous sessions');

@@ -2626,9 +2626,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
               getBot: () => getBotRef.current,
               allowedUsers: [...cfg.discord.allowedUsers],
             });
+            const chatChannels = cfg.discord.chatChannels ?? [];
+            debug.log('nexus.discord', 'chat-channels', { count: chatChannels.length });
             const handle = createNexusDiscordTriggerBot({
               token: discordToken,
               allowedUsers: [...cfg.discord.allowedUsers],
+              ...(chatChannels.length ? { guildTextChannels: chatChannels } : {}),
               dispatch: (event) => workflowDaemon!.dispatchDiscord(event),
               onMessage: composedOnMessage,
               onInteraction: async (raw) => {

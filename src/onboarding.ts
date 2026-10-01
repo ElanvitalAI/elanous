@@ -25,6 +25,9 @@
 // back-fill merge — so tests don't need to stub config paths either.
 
 import { existsSync, statSync } from 'node:fs';
+import { delimiter, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { isHeadlessEnv, spawnCodexLogin, type CodexLoginResult } from './acp/codex-auth.js';
 import { getRunContext, type RunContext } from './agent/run-context.js';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
@@ -40,6 +43,7 @@ import {
 import { CODEX_DEFAULT_MODEL } from './llm.js';
 import { suggestSetupModel } from './model-tier/index.js';
 import { loginWithCodex, CODEX_DEVICE_LOGIN_URL } from './oauth/codex.js';
+import { loginWithCodexBrowser } from './oauth/codex-browser-login.js';
 import { loadTokens } from './oauth/store.js';
 import { TelegramBot } from './telegram.js';
 import { DiscordBot } from './discord.js';
@@ -54,6 +58,10 @@ import type {
 import { showStepOr, chooseFrom } from './onboarding/io-extended.js';
 import { askWithHelp } from './onboarding/wire-helpers.js';
 import { stepTransition } from './onboarding/transition.js';
+import { unattendedSetupHint } from './onboarding/entry-hints.js';
+import { continueHereLines } from './onboarding/continue-here.js';
+import type { NexusShowResult } from './cli/nexus-show.js';
+import type { IssuedTempToken } from './auth/temp-tokens.js';
 import {
   askValidated,
   validateIntList,
@@ -151,6 +159,8 @@ export interface WizardIO {
    *  and `ask` otherwise. */
   askSecret?(prompt: string, field?: string): Promise<string>;
   print(text: string): void;
+  /** Synthetic, unattended IO (never issue or display a connection token). */
+  nonInteractive?: boolean;
   /** Called once after a successful config save. */
   complete?(): void;
   close(): void;
@@ -325,6 +335,104 @@ export interface LocalProbeDeps {
 
 export interface GrokOnboardingDeps {
   resolveCredential?: () => GrokCredential | null;
+  /** Subscription detection for step 1 (OB1) — tests inject; default = `detectProviders`. */
+  detectProviders?: () => Promise<import('./llm/provider-detect.js').DetectedProvider[]>;
+  /** OB1 — does the codex CLI already hold a usable login (~/.codex/auth.json)? Tests inject. */
+  hasCodexCliLogin?: () => boolean;
+  loadCodexTokens?: typeof loadTokens;
+  /** Browser-first OAuth test seams. Defaults use the local environment. */
+  codexEnv?: NodeJS.ProcessEnv;
+  isHeadless?: (env: NodeJS.ProcessEnv) => boolean;
+  loginWithCodexBrowser?: typeof loginWithCodexBrowser;
+  spawnCodexLogin?: (opts: { deviceAuth: false; codexPath: string }) => Promise<CodexLoginResult>;
+  loginWithCodex?: typeof loginWithCodex;
+  /** Execute local browser/clipboard commands without a shell. Returns false when unavailable. */
+  runAuthCommand?: (command: string, args: string[], input?: string) => boolean;
+  authPlatform?: NodeJS.Platform;
+  /** OSC52 fallback, when clipboard commands are unavailable. */
+  writeAuthTerminal?: (data: string) => boolean;
+}
+
+function pathCodexBinary(env: NodeJS.ProcessEnv): string | null {
+  const binary = process.platform === 'win32' ? 'codex.exe' : 'codex';
+  for (const dir of (env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, binary);
+    try { if (existsSync(candidate) && statSync(candidate).isFile()) return candidate; }
+    catch { /* skip inaccessible PATH entries */ }
+  }
+  return null;
+}
+
+function runAuthCommand(command: string, args: string[], input?: string): boolean {
+  try {
+    const result = spawnSync(command, args, {
+      input,
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'ignore', 'ignore'],
+      timeout: 3_000,
+    });
+    return result.status === 0 && !result.error;
+  } catch { return false; }
+}
+
+function assistCodexDeviceLogin(
+  io: WizardIO,
+  url: string,
+  code: string,
+  deps: GrokOnboardingDeps,
+): void {
+  const env = deps.codexEnv ?? process.env;
+  const platform = deps.authPlatform ?? process.platform;
+  const execute = deps.runAuthCommand ?? runAuthCommand;
+  const local = !(deps.isHeadless ?? isHeadlessEnv)(env);
+  if (local) {
+    try {
+      if (platform === 'darwin') execute('open', [url]);
+      else if (platform === 'linux' || platform === 'freebsd' || platform === 'openbsd') execute('xdg-open', [url]);
+    } catch { /* browser is optional; URL remains visible */ }
+  }
+  let copied = false;
+  for (const [command, args] of platform === 'darwin'
+    ? [['pbcopy', []]] as Array<[string, string[]]>
+    : platform === 'linux' || platform === 'freebsd' || platform === 'openbsd'
+      ? [['wl-copy', []], ['xclip', ['-selection', 'clipboard']]] as Array<[string, string[]]>
+      : []) {
+    try { if (execute(command, args, code)) { copied = true; break; } }
+    catch { /* try the next clipboard */ }
+  }
+  if (!copied) {
+    try {
+      const write = deps.writeAuthTerminal ?? ((data: string) => {
+        if (!output.isTTY) return false;
+        output.write(data);
+        return true;
+      });
+      copied = write(`\x1b]52;c;${Buffer.from(code).toString('base64')}\x07`);
+    } catch { /* terminals without OSC52 still show the code */ }
+  }
+  if (copied) io.print('  코드를 복사했습니다.');
+  if (local) notifyDeviceCode(code, copied, platform, execute);
+}
+
+/** OB5c — on a desktop, raise an OS notification with the code so the person can paste it without
+ *  hunting for the terminal. Missing notifier (or headless) is skipped silently; the code never goes to logs. */
+function notifyDeviceCode(
+  code: string,
+  copied: boolean,
+  platform: NodeJS.Platform,
+  execute: (command: string, args: string[], input?: string) => boolean,
+): void {
+  const message = copied ? `인증 코드 ${code} — 클립보드에 복사됨 · 붙여넣기만` : `인증 코드 ${code}`;
+  let notified = false;
+  try {
+    if (platform === 'darwin') {
+      const quoted = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+      notified = execute('osascript', ['-e', `display notification ${quoted(message)} with title "Elanous"`]);
+    } else if (platform === 'linux' || platform === 'freebsd' || platform === 'openbsd') {
+      notified = execute('notify-send', ['Elanous', message]);
+    }
+  } catch { /* no notifier — the code stays on screen */ }
+  debug.log('onboarding.codex', 'device-code-notify', { platform, copied, notified });
 }
 
 /** Default probe — calls into the local-LLM manager's quad-probe
@@ -425,7 +533,18 @@ async function askLLM(
     excerpt: getMessages().setupStepLLMExcerpt,
     severity: 'required',
   });
-  const currentIdx = PROVIDER_CHOICES.findIndex(c => c.key === current.provider);
+  // OB1 (10-01): show subscriptions the machine already has and preselect one — the old default was the env-only
+  // «Auto-detect», so a ChatGPT/Codex or Grok subscriber pressing Enter got a setup that found nothing.
+  let detected: import('./llm/provider-detect.js').DetectedProvider[] = [];
+  try {
+    const detect = grokDeps.detectProviders ?? (async () => (await import('./llm/provider-detect.js')).detectProviders());
+    detected = await detect();
+  } catch { /* detection is advisory — the list still works */ }
+  const { subscriptionHint } = await import('./onboarding/subscription-hint.js');
+  const hint = subscriptionHint(detected);
+  for (const found of hint.found) io.print(found.line);
+  const configured = current.provider && current.provider !== 'auto' ? current.provider : undefined;
+  const currentIdx = PROVIDER_CHOICES.findIndex(c => c.key === (configured ?? hint.preferred));
   const providerOptions: ChoiceOption<ProviderChoice | WizardBackValue>[] =
     PROVIDER_CHOICES.map((c, i) => ({
       key: String(i + 1),
@@ -448,7 +567,7 @@ async function askLLM(
     && (grokDeps.resolveCredential ?? resolveGrokCredential)()?.kind === 'subscription';
   if (grokSubscription) io.print('  Found grok subscription (~/.grok/auth.json)');
   if (choice.key === 'auto') {
-    io.print('  → auto mode: will detect from XAI/OPENAI/ANTHROPIC/LOCAL_LLM env vars.');
+    io.print('  → auto mode: uses a subscription login it finds (ChatGPT/Codex ~/.codex · Grok ~/.grok) first, then XAI/OPENAI/ANTHROPIC/LOCAL_LLM env vars.');
     return out;
   }
 
@@ -456,26 +575,55 @@ async function askLLM(
   // Keeps onboarding and `elanous codex setup` in sync — one picker, one
   // curated model catalog, one source of truth for provider defaults.
   if (choice.key === 'openai-codex') {
-    const mode = await pickCodexAuthMode(io);
+    const mode = await pickCodexAuthMode(io, {
+      ...(grokDeps.hasCodexCliLogin ? { hasCodexCliLogin: grokDeps.hasCodexCliLogin } : {}),
+      ...(grokDeps.loadCodexTokens ? { loadTokens: grokDeps.loadCodexTokens } : {}),
+    });
     if (mode === 'oauth') {
-      io.print('  Launching device-code flow…');
-      try {
-        await loginWithCodex({
-          onProgress: (p) => {
-            if (p.type === 'user_code') {
-              io.print('');
-              io.print(`    1) Open in any browser: ${p.loginUrl}`);
-              io.print(`    2) Enter code:          ${p.userCode}`);
-              io.print('');
-              io.print('  Waiting for sign-in…');
-            }
-            if (p.type === 'saved') io.print('  Signed in. Tokens saved.');
-          },
-        });
-      } catch (err: any) {
-        io.print(`  ! OAuth failed: ${err?.message ?? err}`);
-        io.print(`    Navigate to ${CODEX_DEVICE_LOGIN_URL} manually,`);
-        io.print(`    or re-run \`elanous login openai-codex\` / \`elanous codex setup\` later.`);
+      const env = grokDeps.codexEnv ?? process.env;
+      let signedIn = false;
+      if (!(grokDeps.isHeadless ?? isHeadlessEnv)(env)) {
+        // Full-screen IO retains print() messages across redraws. Keep this
+        // waiting hint transient so it cannot reappear on the device-code screen.
+        if (io.showStep) output.write('  브라우저에서 로그인을 마치세요 — 끝나면 자동으로 이어집니다.\n');
+        else io.print('  브라우저에서 로그인을 마치세요 — 끝나면 자동으로 이어집니다.');
+        try {
+          await (grokDeps.loginWithCodexBrowser ?? loginWithCodexBrowser)();
+          signedIn = true;
+        } catch { /* try PATH Codex, then device code */ }
+        if (!signedIn) {
+          const codexPath = pathCodexBinary(env);
+          if (codexPath) {
+            try {
+              const result = await (grokDeps.spawnCodexLogin ?? spawnCodexLogin)({ deviceAuth: false, codexPath });
+              signedIn = result.ok;
+            } catch { /* device code remains available */ }
+          }
+        }
+        if (signedIn) io.print('  → using your ChatGPT/Codex login.');
+        else io.print('  브라우저 로그인이 안 됐습니다 — 코드로 이어갑니다');
+      }
+      if (!signedIn) {
+        io.print('  Launching device-code flow…');
+        try {
+          await (grokDeps.loginWithCodex ?? loginWithCodex)({
+            onProgress: (p) => {
+              if (p.type === 'user_code') {
+                io.print('');
+                io.print(`    1) Open in any browser: ${p.loginUrl}`);
+                io.print(`    2) Enter code:          ${p.userCode}`);
+                io.print('');
+                assistCodexDeviceLogin(io, p.loginUrl ?? CODEX_DEVICE_LOGIN_URL, p.userCode ?? '', grokDeps);
+                io.print('  Waiting for sign-in…');
+              }
+              if (p.type === 'saved') io.print('  Signed in. Tokens saved.');
+            },
+          });
+        } catch (err: any) {
+          io.print(`  ! OAuth failed: ${err?.message ?? err}`);
+          io.print(`    Navigate to ${CODEX_DEVICE_LOGIN_URL} manually,`);
+          io.print(`    or re-run \`elanous login openai-codex\` / \`elanous codex setup\` later.`);
+        }
       }
     } else if (mode === 'apikey') {
       // PR-Δ14 — askValidated catches blank/short/whitespace before
@@ -493,6 +641,8 @@ async function askLLM(
       );
       if (key.trim()) out.apiKey = key.trim();
       else if (current.apiKey) out.apiKey = current.apiKey;
+    } else if (mode === 'oauth-keep') {
+      io.print('  → using your existing ChatGPT/Codex login.');
     } else {
       io.print('  → skipped. Run `elanous codex setup` or `elanous login openai-codex` later.');
     }
@@ -1163,6 +1313,12 @@ export interface RunWizardOpts {
   grokDeps?: GrokOnboardingDeps;
   /** Internal ownership transfer for wrappers that explicitly complete IO. */
   deferComplete?: boolean;
+  /** Post-save connections; injection keeps wizard tests off the real daemon/token store. */
+  continueHereDeps?: {
+    showNexus?: () => Promise<Pick<NexusShowResult, 'urls' | 'status' | 'instance'>>;
+    issueToken?: () => Pick<IssuedTempToken, 'token'>;
+    renderQr?: (link: string) => string | undefined;
+  };
 }
 
 /** Pick the default IO. TTY → `fullScreenIO` (Phase 5: cleared
@@ -1206,7 +1362,7 @@ export class OnboardingRefusedError extends Error {
 export function handleOnboardingRefusal(error: unknown, entrance: 'agent' | 'other'): boolean {
   if (!(error instanceof OnboardingRefusedError) || error.code !== 'onboarding-refused') return false;
   if (entrance === 'agent' && error.reason === 'non-tty') {
-    console.error('elanous agent needs a configured LLM. Run `elanous setup` in a terminal, or `elanous setup --non-interactive --config <path>` for unattended setup.');
+    console.error(`elanous agent needs a configured LLM. Run \`elanous onboarding\` in a terminal, or ${unattendedSetupHint()} for unattended setup.`);
   } else {
     console.error(error.message);
   }
@@ -1231,7 +1387,7 @@ function refuseInteractiveOnboardingIfNeeded(opts: RunWizardOpts, path: string):
   if (nonTTY) {
     throw new OnboardingRefusedError(
       '대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다. '
-      + '무인 설정은 `elanous setup --non-interactive --config <path>`를 사용하라.',
+      + `무인 설정은 ${unattendedSetupHint()}를 사용하라.`,
       'non-tty',
     );
   }
@@ -1383,6 +1539,57 @@ export async function runOnboarding(opts: RunWizardOpts = {}): Promise<UserConfi
     io.print(`  Discord  : ${marked.discord.enabled ? 'enabled' : 'disabled'}`);
     io.print(`  ${i18nFormat(m.setupRerunHint, { cmd: 'elanous setup' })}`);
     io.print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+    const interactive = !io.nonInteractive && !!(opts.io || input.isTTY);
+    let shown: Pick<NexusShowResult, 'urls' | 'status' | 'instance'> | undefined;
+    try {
+      const showNexus = opts.continueHereDeps?.showNexus ?? (async () => {
+        const { runNexusShow } = await import('./cli/nexus-show.js');
+        return runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } });
+      });
+      shown = await showNexus();
+    } catch { /* Config was saved; daemon discovery is advisory. */ }
+    const daemonRunning = shown?.status === 'unregistered'
+      || (shown?.status === 'registered' && shown.instance?.alive === true);
+    const pwaUrl = daemonRunning ? shown?.urls?.pwa.tailnet ?? shown?.urls?.pwa.loopback : undefined;
+    let phoneLink: string | undefined;
+    if (interactive && daemonRunning && shown?.urls?.rest) {
+      try {
+        const { pickPhoneBase, endpointFromBaseUrl, buildPhoneConnectLink } = await import('./cli/phone-link.js');
+        const picked = pickPhoneBase(shown.urls.rest);
+        const endpoint = endpointFromBaseUrl(picked.base);
+        if (endpoint) {
+          const issued = opts.continueHereDeps?.issueToken
+            ? opts.continueHereDeps.issueToken()
+            : await (async () => {
+                const { issueTempToken, parseTtl } = await import('./auth/temp-tokens.js');
+                return issueTempToken({ ttlMs: parseTtl('24h'), label: 'phone' });
+              })();
+          phoneLink = buildPhoneConnectLink(endpoint, issued.token);
+          try { debug.log('onboarding.continue-here', 'phone-link-issued', { kind: picked.kind, tls: endpoint.tls, temp: true }); }
+          catch { /* Logging must not interrupt setup. */ }
+        }
+      } catch { /* No token/link on failure; show the manual command instead. */ }
+    }
+    const directions = continueHereLines({ daemonRunning, pwaUrl, phoneLink, telegramEnabled: marked.telegram.enabled, interactive });
+    if (io.nonInteractive) {
+      for (const line of directions) process.stdout.write(`${line}\n`);
+    } else {
+      io.print('');
+      for (const line of directions) io.print(line);
+    }
+    if (interactive && phoneLink) {
+      try {
+        const renderQr = opts.continueHereDeps?.renderQr ?? ((link: string) => {
+          const qr = spawnSync('qrencode', ['-t', 'ANSIUTF8', link], { encoding: 'utf8' });
+          return qr.status === 0 ? qr.stdout : undefined;
+        });
+        const qr = renderQr(phoneLink);
+        if (qr) io.print(qr);
+      } catch { /* qrencode is optional, exactly as with phone link. */ }
+    }
+    try { debug.log('onboarding.continue-here', 'shown', { daemonRunning, interactive, phoneLinkIssued: !!phoneLink, telegramEnabled: marked.telegram.enabled }); }
+    catch { /* Logging must not interrupt setup. */ }
     if (!opts.deferComplete) io.complete?.();
     return marked;
   } finally {

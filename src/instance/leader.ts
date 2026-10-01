@@ -2,7 +2,7 @@
 import { INSTALLED_PACKAGE_MARKERS, isInstalledPackagePath } from './installed-package.js';
 import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve, basename } from 'node:path';
 
 export interface LeaderRefusalRecord {
   refusedAt: string;
@@ -53,10 +53,22 @@ export function normalizeTree(p: string): string {
   try { return realpathSync(abs); } catch { return abs; }
 }
 
+/** npm/Homebrew/nvm `<prefix>/lib/node_modules` · bun `…/install/global/node_modules` · pnpm `…/global/<n>/node_modules`. */
+export function isGlobalNodeModules(dir: string): boolean {
+  if (basename(dir) !== 'node_modules') return false;
+  const parent = basename(dirname(dir));
+  return parent === 'lib' || parent === 'global' || (/^\d+$/.test(parent) && basename(dirname(dirname(dir))) === 'global');
+}
+
 export function treeFromScriptPath(scriptPath: string): string | null {
   let dir = dirname(normalizeTree(scriptPath));
   for (let i = 0; i < 30; i++) {
     if (existsSync(join(dir, '.git'))) return dir;
+    // A GLOBAL install stops at its node_modules: a git repo around the install prefix (Homebrew's /opt/homebrew
+    // is one; so is a dotfiles-managed home) is not this code's source tree. Without this stop `npm i -g` under
+    // Homebrew ran as a «source tree» test universe writing config to /opt/homebrew/.elanous-test (OB3 · 10-01).
+    // A project-local <checkout>/node_modules/elanous still resolves to the checkout (the existing design).
+    if (isGlobalNodeModules(dir)) return null;
     const parent = dirname(dir);
     if (parent === dir) return null;
     dir = parent;

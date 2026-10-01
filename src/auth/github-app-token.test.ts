@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it, spyOn } from 'bun:test';
+import { afterEach, describe, expect, it, spyOn, test } from 'bun:test';
 import { generateKeyPairSync, verify } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -266,5 +266,26 @@ describe('githubAutomationToken + defaultCmdRunner', () => {
       expect(githubAutomationToken({ configPath, fetch })).toBeNull();
       expect(JSON.stringify(log.mock.calls)).not.toContain('secret-');
     } finally { log.mockRestore(); }
+  });
+});
+
+describe('test runs never reach the machine App key', () => {
+  test('the bun test preload pins the App config to a missing file, so a default call mints nothing', () => {
+    const pinned = process.env.ELANOUS_GITHUB_APP_CONFIG_PATH;
+    expect(pinned).toBeTruthy();
+    expect(existsSync(pinned!)).toBe(false);
+    let called = 0;
+    expect(githubInstallationCredential({ fetch: () => { called += 1; return {}; } })).toBeNull();
+    expect(called).toBe(0);
+  });
+
+  test('ELANOUS_GITHUB_APP_CONFIG_PATH is the file the default call reads', () => {
+    const { configPath } = fixture();
+    const before = process.env.ELANOUS_GITHUB_APP_CONFIG_PATH;
+    process.env.ELANOUS_GITHUB_APP_CONFIG_PATH = configPath;
+    try {
+      const minted = githubInstallationCredential({ scope: { repository: 'repo-env' }, fetch: () => ({ token: 'ghs_env', expires_at: new Date(Date.now() + 3600_000).toISOString() }) });
+      expect(minted?.token).toBe('ghs_env');
+    } finally { process.env.ELANOUS_GITHUB_APP_CONFIG_PATH = before; }
   });
 });

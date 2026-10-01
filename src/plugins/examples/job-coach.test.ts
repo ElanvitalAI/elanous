@@ -195,7 +195,8 @@ async function installedReport(retry: boolean, unrelated = false) {
     const researchCalls = join(temp, 'research-calls');
     const gapCalls = join(temp, 'gap-calls');
     const cli = join(bin, 'elanous');
-    writeFileSync(cli, `#!/bin/sh\n[ "$1" = '--test' ] || exit 17\nif [ "$2" = 'ask' ]; then\n  echo called >> '${gapCalls}'\n  printf '%s\\n' '{"reply":"{\\"gaps\\":[{\\"code\\":\\"010203040001\\",\\"status\\":\\"보유\\",\\"quote\\":\\"가상 동아리 설문 결과를 표로 정리했다.\\"}]}"}'\n  exit 0\nfi\n[ "$2" = 'research' ] && [ "$4" = '--json' ] || exit 17\necho called >> '${researchCalls}'\n${retry ? `[ "$(wc -l < '${researchCalls}')" -eq 1 ] && { printf '%s\\n' '{"output":"no results"}'; exit 0; }` : ''}\nprintf '%s\\n' '${unrelated ? '{"output":"- [자료](https://example.org/document)"}' : '{"output":"- [공개 강좌](https://example.org/course)"}'}'\n`);
+    // An installed plugin runs outside any git tree, where the real CLI refuses `--test` (no isolation root).
+    writeFileSync(cli, `#!/bin/sh\ncase " $* " in *' --test '*) echo '[--test] 격리 루트를 정할 수 없습니다' >&2; exit 1;; esac\nif [ "$1" = 'ask' ]; then\n  echo called >> '${gapCalls}'\n  printf '%s\\n' '{"reply":"{\\"gaps\\":[{\\"code\\":\\"010203040001\\",\\"status\\":\\"보유\\",\\"quote\\":\\"가상 동아리 설문 결과를 표로 정리했다.\\"}]}"}'\n  exit 0\nfi\n[ "$1" = 'research' ] && [ "$3" = '--json' ] || exit 17\necho called >> '${researchCalls}'\n${retry ? `[ "$(wc -l < '${researchCalls}')" -eq 1 ] && { printf '%s\\n' '{"output":"no results"}'; exit 0; }` : ''}\nprintf '%s\\n' '${unrelated ? '{"output":"- [자료](https://example.org/document)"}' : '{"output":"- [공개 강좌](https://example.org/course)"}'}'\n`);
     chmodSync(cli, 0o755);
     const commands: string[] = [];
     const state = await runGraph(join(installed, 'graphs/report.yaml'), {

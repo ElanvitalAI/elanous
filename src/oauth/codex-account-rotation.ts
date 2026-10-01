@@ -47,6 +47,8 @@ type RotationReason =
   | 'no-candidate'
   /** 찼고 구독 잔량이 남은 계정도 없지만 대표 가 크레딧 사용을 허가했다 — 지금 계정에 머물러 선불 크레딧으로 계속(grok 폴백 안 함). */
   | 'credits-allowed'
+  /** 오늘 크레딧 몫을 먼저 쓰기 위해 찬 계정으로 이동하거나 머문다. */
+  | 'credit-pace'
   /** 넘겼다. */
   | 'rotated';
 
@@ -101,6 +103,7 @@ interface RotationInput {
   /** 지금 계정의 크레딧 잔액·보유(모르면 없다). */
   readonly currentCreditBalance?: number;
   readonly currentHasCredits?: boolean;
+  readonly creditPace?: { active: boolean };
 }
 
 /**
@@ -182,6 +185,23 @@ export function decideCodexRotation(input: RotationInput): RotationDecision {
   });
   if (input.explicit) return { reason: 'explicit', candidateCount, accountThresholds };
   if (!input.enabled) return { reason: 'disabled', candidateCount, accountThresholds, ...(input.disabledProvenance ? { disabledProvenance: input.disabledProvenance } : {}) };
+  if (input.creditPace?.active) {
+    const self = input.candidates.find((candidate) => candidate.name === input.current.name);
+    const eligible = (name: string, balance: number | undefined, hasCredits: boolean | undefined, home: string | undefined): boolean =>
+      !!home?.trim() && typeof balance === 'number' && Number.isFinite(balance) && balance > 0
+      && hasCredits !== false && accountThresholds.some((row) => row.name === name
+        && (row.status === 'reached' || row.status === 'threshold-reached'));
+    const currentBalance = input.currentCreditBalance ?? self?.creditBalance;
+    const currentHas = input.currentHasCredits ?? self?.hasCredits;
+    const to = otherCandidates.filter((candidate) => eligible(candidate.name, candidate.creditBalance, candidate.hasCredits, candidate.home))
+      .sort((a, b) => (b.creditBalance! - a.creditBalance!) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))[0];
+    if (eligible(input.current.name, currentBalance, currentHas, self?.home ?? input.current.home)) {
+      return { reason: 'credit-pace', candidateCount, accountThresholds };
+    }
+    if (to) {
+      return { reason: 'credit-pace', candidateCount, accountThresholds, to };
+    }
+  }
   const currentUsageUnknown = input.currentReached === undefined && input.currentUsedPercent == null;
   if (input.currentReached !== true && !currentUsageUnknown && accountThresholds[0]?.status !== 'threshold-reached') {
     return { reason: 'not-reached', candidateCount, accountThresholds };
@@ -271,7 +291,7 @@ export function observeRotation(decision: RotationDecision, from: string): void 
     ...(decision.reason === 'disabled' && decision.disabledProvenance
       ? { disabledProvenance: decision.disabledProvenance }
       : {}),
-  }, { level: decision.reason === 'rotated' || decision.reason === 'reset-credit-unknown' ? 'warn' : 'debug' });
+  }, { level: decision.reason === 'rotated' || decision.reason === 'reset-credit-unknown' || (decision.reason === 'credit-pace' && decision.to) ? 'warn' : 'debug' });
   for (const account of decision.accountThresholds ?? []) {
     debug.log('oauth.codex-account', 'rotation-account-threshold', account);
   }
@@ -279,7 +299,8 @@ export function observeRotation(decision: RotationDecision, from: string): void 
   if (decision.reason !== 'explicit' && decision.reason !== 'disabled') {
     const fromRow = decision.accountThresholds?.find((a) => a.name === from);
     const toCredit = decision.to?.creditBalance;
-    const why = typeof toCredit === 'number'
+    const why = decision.reason === 'credit-pace' ? '오늘 크레딧 몫을 먼저 쓴다'
+      : typeof toCredit === 'number'
       // 금액은 문장에 넣지 않는다 — 판단 사유는 Live·Trace 카드에 글자로 뜨고 공개 캡처가 문장 속 숫자를 못 가린다(09-28 🅣).
       ? `구독 한도 전부 참 · ${decision.to!.name} 크레딧이 가장 많다`
       : fromRow ? `${from} ${fromRow.usedPercent ?? '?'}% · 임계 ${fromRow.thresholdPercent}%` : `판정 ${decision.reason}`;
@@ -287,7 +308,8 @@ export function observeRotation(decision: RotationDecision, from: string): void 
       kind: 'ROUTE',
       what: decision.to ? `codex 계정 ${from} → ${decision.to.name}` : `codex 계정 ${from} 유지 (${decision.reason})`,
       reason: why,
-      purpose: decision.reason === 'credits-allowed' ? '한도가 찼다 — 정책상 크레딧으로 계속'
+      purpose: decision.reason === 'credit-pace' ? '하루 크레딧 몫을 채운 뒤 구독 순서로 복귀'
+        : decision.reason === 'credits-allowed' ? '한도가 찼다 — 정책상 크레딧으로 계속'
         : typeof toCredit === 'number' ? '크레딧을 세 계정에 고르게 · 한 계정이 먼저 마르지 않게' : '구독 한도 보존 · 끊김 없이 계속',
       target: decision.to?.name ?? from,
       refs: { account: decision.to?.name ?? from },
@@ -301,7 +323,7 @@ export function applyRotation(
   current: CodexAccountResolution,
   decision: RotationDecision,
 ): CodexAccountResolution {
-  if ((decision.reason !== 'rotated' && decision.reason !== 'reset-credit-unknown') || !decision.to) return current;
+  if ((decision.reason !== 'rotated' && decision.reason !== 'reset-credit-unknown' && decision.reason !== 'credit-pace') || !decision.to) return current;
   return {
     name: decision.to.name,
     storeKey: decision.to.storeKey,

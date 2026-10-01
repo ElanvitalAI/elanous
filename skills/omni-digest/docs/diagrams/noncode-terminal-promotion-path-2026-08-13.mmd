@@ -14,7 +14,7 @@ flowchart TD
   H{nonCodeOutcome exists?}:::gate
   I[observe deploy-no-changes<br/>return { ok:false, kind:none }]:::fail
   J{Evidence is artifact-created?}:::gate
-  K{PR #8731 · 2026-08-13<br/>existsSync(resolve(cwd, ref))?}:::gate
+  K{2026-08-13<br/>existsSync(resolve(cwd, ref))?}:::gate
   L[observe deploy-noncode-blocked<br/>reason: artifact-created-ref-missing<br/>then deploy-no-changes]:::fail
   M[Do not treat ref as a file<br/>published-url / execution-completed]:::data
   N[observe deploy-noncode<br/>return terminal:<br/>published or executed]:::pass

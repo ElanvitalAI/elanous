@@ -51,6 +51,88 @@ function plugin(root: string, name: string, pricing?: { model: string }): void {
 }
 
 describe('publishMarket', () => {
+  test('rejects internal references in the packaged bundle, caps hits, and still publishes clean packs', () => fixture(root => {
+    plugin(root, 'bad-plugin');
+    plugin(root, 'good-plugin');
+    writeFileSync(join(root, 'plugins', 'good-plugin', 'README.md'),
+      'const C = { deep: "#1D2751", red: "#E95047" }; #243063\nhttps://github.com/ElanvitalAI/elanous/releases/tag/v0.2.5');
+    writeFileSync(join(root, 'plugins', 'good-plugin', 'binary.dat'), Buffer.from('docs/marketing/\0PR #21849'));
+    mkdirSync(join(root, 'bundle'));
+    writeFileSync(join(root, 'bundle', 'script.json'),
+      'docs/marketing (LAUNCH 초안) · PR #21849 · 컷 e24cb6e\n' + 'docs/brand/icon\n'.repeat(25));
+    setBundle(root, 'bad-plugin', [{ from: 'bundle/script.json', as: 'script.json' }]);
+    const outDir = join(root, 'out');
+    const input = { pluginsDir: join(root, 'plugins'), bundleRoot: root, outDir,
+      market: { name: 'elanous', displayName: 'Elanous' }, key: generateIndexKeyPair() };
+    const result = publishMarket(input);
+    expect(result.ok).toBe(false);
+    expect(result.published.map(item => item.name)).toEqual(['good-plugin']);
+    expect(result.skipped).toEqual([{ dir: 'bad-plugin', reason: 'internal-reference', hits: [
+      { file: 'script.json', line: 1, marker: 'internal-doc-path' },
+      { file: 'script.json', line: 1, marker: 'private-pr-number' },
+      { file: 'script.json', line: 1, marker: 'cut-hash' },
+      ...Array.from({ length: 17 }, (_, i) => ({ file: 'script.json', line: i + 2, marker: 'internal-doc-path' as const })),
+    ] }]);
+    expect(existsSync(join(outDir, 'bad-plugin'))).toBe(false);
+    expect(existsSync(join(outDir, 'plugins', 'bad-plugin'))).toBe(false);
+    const index = JSON.parse(readFileSync(join(outDir, 'marketplace.json'), 'utf8'));
+    expect(index.plugins.map((item: { name: string }) => item.name)).toEqual(['good-plugin']);
+    const originalSha = result.published[0]!.sha256;
+    rmSync(join(root, 'plugins', 'bad-plugin'), { recursive: true });
+    const clean = publishMarket({ ...input, outDir: join(root, 'clean-out') });
+    expect(clean.ok).toBe(true);
+    expect(clean.published[0]!.sha256).toBe(originalSha);
+  }));
+
+  test('refuses Markdown links to internal document paths even when README contains a NUL byte', () => fixture(root => {
+    plugin(root, 'linked-plugin');
+    writeFileSync(join(root, 'plugins', 'linked-plugin', 'README.md'), '\0[문서](docs/marketing)');
+    const outDir = join(root, 'out');
+    const result = publishMarket({ pluginsDir: join(root, 'plugins'), outDir,
+      market: { name: 'elanous', displayName: 'Elanous' }, key: generateIndexKeyPair() });
+    expect(result.ok).toBe(false);
+    expect(result.skipped).toEqual([{ dir: 'linked-plugin', reason: 'internal-reference', hits: [
+      { file: 'README.md', line: 1, marker: 'internal-doc-path' },
+    ] }]);
+    expect(result.published).toEqual([]);
+    expect(existsSync(join(outDir, 'linked-plugin'))).toBe(false);
+  }));
+
+  test('refuses internal references in a README that contains an invalid UTF-8 byte', () => fixture(root => {
+    plugin(root, 'linked-plugin');
+    writeFileSync(join(root, 'plugins', 'linked-plugin', 'README.md'), Buffer.concat([Buffer.from([0xff]), Buffer.from('[문서](docs/marketing)')]));
+    const outDir = join(root, 'out');
+    const result = publishMarket({ pluginsDir: join(root, 'plugins'), outDir,
+      market: { name: 'elanous', displayName: 'Elanous' }, key: generateIndexKeyPair() });
+    expect(result.ok).toBe(false);
+    expect(result.skipped).toEqual([{ dir: 'linked-plugin', reason: 'internal-reference', hits: [
+      { file: 'README.md', line: 1, marker: 'internal-doc-path' },
+    ] }]);
+    expect(result.published).toEqual([]);
+    expect(existsSync(join(outDir, 'linked-plugin'))).toBe(false);
+  }));
+
+  test('CLI exits non-zero and shows hits in both human and JSON modes', () => fixture(root => {
+    plugin(root, 'bad-plugin');
+    plugin(root, 'good-plugin');
+    writeFileSync(join(root, 'plugins', 'bad-plugin', 'README.md'), 'docs/marketing · PR #21849 · 컷 e24cb6e');
+    const key = generateIndexKeyPair();
+    const keyPath = join(root, 'key.pem');
+    writeFileSync(keyPath, key.privateKeyPem);
+    for (const json of [false, true]) {
+      const result = spawnSync('bun', ['bin/elanous.mjs', '--test', 'market', 'publish',
+        '--dir', join(root, 'plugins'), '--out', join(root, json ? 'json-out' : 'human-out'),
+        '--key', keyPath, '--key-id', key.keyId, ...(json ? ['--json'] : [])],
+      { cwd: join(import.meta.dir, '../..'), encoding: 'utf8', timeout: 60000 });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('bad-plugin/README.md:1: internal-doc-path');
+      expect(result.stderr).toContain('bad-plugin/README.md:1: private-pr-number');
+      expect(result.stderr).toContain('bad-plugin/README.md:1: cut-hash');
+      if (json) expect(JSON.parse(result.stdout)).toMatchObject({ ok: false,
+        published: [{ name: 'good-plugin' }], skipped: [{ dir: 'bad-plugin', reason: 'internal-reference' }] });
+    }
+  }, true));
+
   test('publishes free only, signs exact bytes, advances sequence and rejects immutable version changes', () => fixture(root => {
     plugin(root, 'free-plugin');
     plugin(root, 'paid-plugin', { model: 'one-time' });
@@ -354,37 +436,38 @@ describe('publishMarket', () => {
     } finally { rmSync(outside, { recursive: true, force: true }); }
   }));
 
-  test('repository official packs publish the free packs, without copying skills into pack folders', () => fixture(root => {
+  test('repository official packs refuse bundled internal references and still publish clean packs', () => fixture(root => {
     const repo = join(import.meta.dir, '../..');
     const pair = generateIndexKeyPair();
     const result = publishMarket({ pluginsDir: join(repo, 'packs'), bundleRoot: repo, outDir: join(root, 'out'),
       market: { name: 'elanous', displayName: 'Elanous' }, key: pair });
     const byName = new Map(result.published.map(item => [item.name, item]));
-    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-hwp', 'elanous-media', 'video-broll', 'video-explainer']);
+    expect(result.ok).toBe(false);
+    expect([...byName.keys()].sort()).toEqual(['elanous-hwp', 'video-broll', 'video-explainer']);
     expect(byName.get('elanous-hwp')?.bundled).toEqual([]);
-    expect(byName.get('elanous-basics')?.version).toBe('0.1.1');
-    expect(JSON.parse(readFileSync(join(repo, 'packs', 'elanous-basics', '.codex-plugin', 'plugin.json'), 'utf8')).version).toBe('0.1.1');
-    expect(byName.get('elanous-basics')?.bundled).toEqual(['omni-crawl', 'omni-digest', 'project-onboarding', 'grill-me', 'photo-intake-ocr']);
-    expect(byName.get('elanous-media')?.bundled).toEqual(['video-builder', 'motion-broll']);
+    expect(JSON.parse(readFileSync(join(repo, 'packs', 'elanous-basics', '.codex-plugin', 'plugin.json'), 'utf8')).version).toBe('0.1.2');
     expect(byName.get('video-broll')?.bundled).toEqual(['motion-broll', 'graphs/broll-line.yaml']);
-    expect(byName.get('video-explainer')?.bundled).toEqual(['explainer-video', 'graphs/explainer-line.yaml']);
+    expect(byName.get('video-explainer')?.bundled).toEqual(['explainer-video']);
     expect(result.skipped).toContainEqual({ dir: 'elanous-markets', reason: 'paid-not-allowed-in-M0' });
+    expect(result.skipped).toContainEqual({ dir: 'elanous-basics', reason: 'internal-reference', hits: [
+      { file: 'skills/grill-me/SKILL.md', line: 131, marker: 'internal-doc-path' },
+      { file: 'skills/omni-digest/digest.md', line: 127, marker: 'internal-doc-path' },
+      { file: 'skills/omni-digest/digest.md', line: 130, marker: 'internal-doc-path' },
+    ] });
+    expect(result.skipped).toContainEqual({ dir: 'elanous-media', reason: 'internal-reference', hits: [
+      { file: 'skills/video-builder/SKILL.md', line: 30, marker: 'internal-doc-path' },
+      { file: 'skills/video-builder/SKILL.md', line: 220, marker: 'internal-doc-path' },
+    ] });
+    expect(existsSync(join(root, 'out', 'elanous-basics'))).toBe(false);
+    expect(existsSync(join(root, 'out', 'elanous-media'))).toBe(false);
     const index = JSON.parse(readFileSync(join(root, 'out', 'marketplace.json'), 'utf8'));
-    const entry = (name: string) => index.plugins.find((plugin: { name: string }) => plugin.name === name);
-    expect(entry('elanous-basics').version).toBe('0.1.1');
-    expect(entry('elanous-basics')['ai.elanous'].capabilities).toContain('secret:firecrawl');
-    expect(entry('elanous-basics')['ai.elanous'].connectors).toEqual([
-      { id: 'xai', kind: 'api-key', userConfig: [{ key: 'XAI_API_KEY', label: 'xAI API key', secret: true, env: 'XAI_API_KEY' }] },
-      { id: 'upstage', kind: 'api-key', userConfig: [{ key: 'UPSTAGE_API_KEY', label: 'Upstage API key', secret: true, env: 'UPSTAGE_API_KEY' }] },
-      { id: 'firecrawl', kind: 'api-key', userConfig: [{ key: 'FIRECRAWL_API_KEY', label: 'Firecrawl API key (optional)', secret: true, env: 'FIRECRAWL_API_KEY' }] },
-    ]);
+    expect(index.plugins.map((item: { name: string }) => item.name)).toEqual(result.published.map(item => item.name));
+    const entry = (name: string) => index.plugins.find((item: { name: string }) => item.name === name);
     const broll = archiveNames(readFileSync(join(root, 'out', entry('video-broll').artifact.key)));
     expect(broll).toContain('graphs/broll-line.yaml');
     expect(broll).toContain('skills/motion-broll/SKILL.md');
     expect(readFileSync(join(root, 'out', 'plugins', 'video-broll', 'graphs', 'broll-line.yaml')))
       .toEqual(readFileSync(join(repo, 'graphs', 'video', 'broll-line.yaml')));
-    const names = archiveNames(readFileSync(join(root, 'out', entry('elanous-basics').artifact.key)));
-    expect(names).toContain('skills/project-onboarding/SKILL.md');
     const hwp = archiveNames(readFileSync(join(root, 'out', entry('elanous-hwp').artifact.key)));
     expect(hwp).toContain('skills/hwp-read/SKILL.md');
     expect(hwp).toContain('scripts/hwp.py');
@@ -392,7 +475,7 @@ describe('publishMarket', () => {
     expect(verifyIndex({ marketplaceBytes: readFileSync(join(root, 'out', 'marketplace.json')),
       signatureText: readFileSync(join(root, 'out', 'index.sig'), 'utf8'),
       trustedKeys: [{ keyId: pair.keyId, publicKey: pair.publicKey }] }).ok).toBe(true);
-    expect(treeNames(join(root, 'out', 'plugins', 'elanous-basics'))).toEqual(names);
+    expect(treeNames(join(root, 'out', 'plugins', 'elanous-hwp'))).toEqual(hwp);
     expect(existsSync(join(repo, 'packs', 'elanous-basics', 'skills'))).toBe(false);
     expect(existsSync(join(repo, 'packs', 'video-broll', 'graphs'))).toBe(false);
   }));

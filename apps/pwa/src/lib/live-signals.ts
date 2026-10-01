@@ -20,7 +20,7 @@ export const LIVE_STAGE_LABEL: Record<LiveStage, string> = {
 };
 
 /** 로그가 가리키는 단계와 성격. 카테고리는 접두 일치. 없으면 null(단계 밖 신호 — 로그 줄로만 흐른다). */
-export function classifySignal(row: Pick<LogRow, 'category' | 'event' | 'level'>): {
+export function classifySignal(row: Pick<LogRow, 'category' | 'event' | 'level'> & { data?: LogRow['data'] }): {
   stage: LiveStage | null;
   tone: 'ok' | 'bad' | 'info';
 } {
@@ -29,6 +29,16 @@ export function classifySignal(row: Pick<LogRow, 'category' | 'event' | 'level'>
   const bad = row.level === 'error'
     || /(fail|reject|block|abandon|conflict|error|unconvergeable|timeout)/i.test(e);
   const tone = bad ? 'bad' : /(merged|pass|done|ok|opened|completed|approved)/i.test(e) ? 'ok' : 'info';
+  // 파드 런(S4a #22329) — 게이트·리뷰는 파드 안에서 돌고 호스트엔 `self-implement.pod.ledger` 사건이 `data.stage` 로 온다.
+  //   이 칸이 없으면 파드 런의 게이트·리뷰가 Trace·Live 에 영영 안 켜진다(2026-10-01 06:2x 실측: 단계 줄이 저작·분해·구현뿐).
+  if (c === 'self-implement.pod.ledger' && typeof row.data?.stage === 'string') {
+    const st = row.data.stage;
+    const status = typeof row.data.status === 'string' ? row.data.status : '';
+    const podTone = /(fail|block|abandon|reject|error)/i.test(status) || /(fail|block|abandon)/i.test(st) ? 'bad' : tone;
+    const stage: LiveStage | null = /^(implement|repair)/i.test(st) ? 'build' : /^gat/i.test(st) ? 'gate' : /^review/i.test(st) ? 'review'
+      : /(merged|pr-opened|landed|auto-merge)/i.test(st) ? 'land' : null;
+    if (stage) return { stage, tone: stage === 'land' && podTone !== 'bad' ? 'ok' : podTone };
+  }
   if (c.startsWith('goal-author') || c.startsWith('harness.frontdoor') || (c === 'dev-pipeline' && /^(plan|selection|base-selection)$/.test(e))) return { stage: 'author', tone };
   if ((c.startsWith('self-dev') && /decompos/i.test(e)) || (c === 'self-dev.orchestrate' && e === 'start')) return { stage: 'decompose', tone };
   if (c.startsWith('self-dev.spawn') || c.startsWith('harness.substrate') || c === 'self-implement' || (c === 'dev-pipeline' && e === 'harness.launch')) return { stage: 'build', tone };
@@ -167,6 +177,18 @@ export function clockTime(ts: string, timeZone?: string): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) return ts.slice(11, 19);
   return d.toLocaleTimeString('en-GB', { hour12: false, ...(timeZone ? { timeZone } : {}) });
+}
+
+/** 내부 오류·경로 원문인가 — 일반 역할 화면에 그대로 두면 안 되는 문면. */
+export function isRawErrorText(s: string): boolean {
+  return /Error:|ENOENT|EACCES|EPERM|ECONN|TypeError|\bstack\b|at\s+\S+\s+\(|\/Users\/|\/home\/|\\/.test(s);
+}
+
+/** 오너가 아니면 날것 오류 사유를 한 문장으로 접는다. 평문 사유는 그대로. */
+export function foldForRole(why: string | null, role: string): string | null {
+  if (why == null) return why;
+  if (role !== 'owner' && isRawErrorText(why)) return '실패 — 자세한 사유는 오너 화면에서';
+  return why;
 }
 
 /** 흐르는 로그 한 줄 — 시각(기기 시간대) · 카테고리 · 이벤트 · 짧은 요지. */

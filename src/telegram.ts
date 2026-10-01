@@ -66,9 +66,11 @@ import { observeDevRequestRouteFailSoft } from './skills/dev-request-router.js';
 import { runUrlRoute } from './skills/url-route-exec.js';
 import { recordRoutedLinkAbsorbed } from './intake-plane/link-ledger.js';
 import { classifyFrontInput } from './intake-plane/front-classifier.js';
+import { handleTelegramSeatWork, type TelegramSeatWorkDeps } from './intake-plane/telegram-seat-work.js';
 import { effectiveInstanceRoot } from './instance/resolve.js';
 import { getElanousConfigDir } from './elanous-config-dir.js';
 import { defaultFieldEvent, FieldUploadError, parseFieldCaption, resolveFieldMime, saveFieldMedia } from './field/field-media.js';
+import { scheduleFieldReel, type FieldReelOptions } from './field/field-reel.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -206,10 +208,14 @@ export interface TelegramBotOpts {
    *  independently of the LLM chat path. Best-effort: errors are
    *  swallowed by the caller — never blocks chat reply. */
   onTriggerTap?: (event: TgTriggerEvent) => void | Promise<void>;
+  /** Test seam for addressed seat intake; defaults to the real intake door. */
+  seatWorkDeps?: TelegramSeatWorkDeps;
   /** `#현장` 기본 행사 — 없으면 `slashContext.userConfig.telegram.fieldDefaultEvent` · 그것도 없으면 `field-<로컬 날짜>`. */
   fieldDefaultEvent?: string;
   /** 시험 seam — 현장 폴더 뿌리(기본 `getElanousConfigDir()`). */
   fieldRootDir?: () => string;
+  /** 시험에서는 실제 렌더 대신 가짜 실행기를 주입한다. */
+  fieldReel?: FieldReelOptions;
 }
 
 /** Surface-unification v2 (FU-2) — Telegram trigger event passed to
@@ -326,6 +332,8 @@ export class TelegramBot {
   private readonly globalWindow: number[] = [];
   private readonly fieldDefaultEventOpt?: string;
   private readonly fieldRootDir: () => string;
+  private readonly fieldReel?: FieldReelOptions;
+  private readonly seatWorkDeps: TelegramSeatWorkDeps;
   /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
   private readonly fieldGroups = new Map<string, {
     event: string; at: number; chatId: number; threadId?: number; replyTo: number; count: number;
@@ -359,6 +367,8 @@ export class TelegramBot {
     this.voiceAdapter = opts.voiceAdapter;
     this.fieldDefaultEventOpt = opts.fieldDefaultEvent;
     this.fieldRootDir = opts.fieldRootDir ?? getElanousConfigDir;
+    this.fieldReel = opts.fieldReel;
+    this.seatWorkDeps = opts.seatWorkDeps ?? {};
     if (opts.onTriggerTap) {
       // Assign through `as unknown` to bypass `readonly` + private —
       // the tap is set once at construction and never reassigned.
@@ -796,6 +806,7 @@ export class TelegramBot {
     replyTo?: number;
     threadId?: number;
     caption?: string;
+    mimeType?: string;
   } = {}): Promise<{ messageId: number } | undefined> {
     // Per-chat gap mirror — keep telegram happy on rapid document spills.
     const last = this.chatLastSentAt.get(chatId) ?? 0;
@@ -816,7 +827,7 @@ export class TelegramBot {
     new Uint8Array(blobBytes).set(bytes);
     form.set(
       'document',
-      new Blob([blobBytes], { type: 'text/plain' }),
+      new Blob([blobBytes], { type: opts.mimeType ?? 'text/plain' }),
       filename,
     );
 
@@ -1402,7 +1413,23 @@ export class TelegramBot {
         }
       }
       // 글(자막)은 캡션이 달린 항목에만 있다 — 앨범이면 첫 장에만 붙는다(MK 2026-09-30).
-      count = saveFieldMedia(inputs, { rootDir: this.fieldRootDir(), event, device: 'telegram', ...(tag?.text ? { caption: tag.text } : {}) }).count;
+      const saved = saveFieldMedia(inputs, { rootDir: this.fieldRootDir(), event, device: 'telegram', ...(tag?.text ? { caption: tag.text } : {}) });
+      count = saved.count;
+      scheduleFieldReel(saved.dir, {
+        ...this.fieldReel,
+        notificationKey: `telegram:${this.botId}:${ctx.chatId}:${ctx.threadId ?? ''}:${ctx.mediaGroupId ?? ctx.messageId}`,
+        onDone: async (result) => {
+          const reply = { replyTo: ctx.messageId, threadId: ctx.threadId };
+          if (result.ok && result.file) {
+            const sent = await this.sendDocument(ctx.chatId, readFileSync(result.file), 'reel-9x16.mp4', {
+              ...reply, mimeType: 'video/mp4', caption: `현장 영상 · ${event} · ${result.seconds}초`,
+            });
+            if (!sent) throw new Error('sendDocument failed');
+          } else {
+            await this.sendMessage(ctx.chatId, `현장 영상 실패 · ${event} · ${result.error ?? 'render failed'}`, reply);
+          }
+        },
+      });
       debug.log('field.upload', 'saved', { surface: 'telegram', files: inputs.length, count, album: !!ctx.mediaGroupId });
     } catch (err) {
       failure = err instanceof FieldUploadError ? err.code : 'download-failed';
@@ -1440,6 +1467,15 @@ export class TelegramBot {
     }
     // 현장 업로드 — `#현장` 캡션(또는 태그된 앨범의 나머지)의 사진·영상은 LLM 대신 현장 폴더로.
     if (await this.tryHandleFieldUpload(ctx)) return;
+    if (ctx.text.startsWith('@')) {
+      const reply = await handleTelegramSeatWork(ctx.text, {
+        chatId: ctx.chatId, messageId: ctx.messageId, threadId: ctx.threadId, botId: ctx.botId,
+      }, this.seatWorkDeps);
+      if (reply !== null) {
+        await this.sendMessage(ctx.chatId, reply, { replyTo: ctx.messageId, threadId: ctx.threadId });
+        return;
+      }
+    }
     // 영상은 `#현장` 저장 전용으로만 파싱한다 — 그 밖의 영상은 종전처럼 무시한다.
     if (ctx.video && ctx.attachments.length === 0) return;
     // Cascade-zyu U2 — capture utterance intent at update ingress.

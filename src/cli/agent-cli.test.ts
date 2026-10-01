@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleOnboardingRefusal, OnboardingRefusedError } from '../onboarding.js';
+import { unattendedSetupHint } from '../onboarding/entry-hints.js';
 
 const root = new URL('../../', import.meta.url).pathname;
 const fixture = new URL('./__fixtures__/agent-help-before/', import.meta.url);
@@ -25,7 +26,7 @@ describe('agent CLI onboarding refusal', () => {
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toBe('elanous agent needs a configured LLM. Run `elanous setup` in a terminal, or `elanous setup --non-interactive --config <path>` for unattended setup.\n');
+      expect(result.stderr).toBe(`elanous agent needs a configured LLM. Run \`elanous onboarding\` in a terminal, or ${unattendedSetupHint()} for unattended setup.\n`);
       expect(result.stderr).not.toContain('onboarding.ts');
       expect(result.stderr).not.toMatch(/^\s*at /m);
       expect(result.stderr).not.toContain('Bun v');
@@ -72,7 +73,7 @@ describe('agent CLI onboarding refusal', () => {
       }
     } finally {
       stderr.mockRestore();
-      process.exitCode = before;
+      process.exitCode = before ?? 0;
     }
   });
 });
@@ -83,7 +84,7 @@ test('unrelated errors are not handled as onboarding refusals', () => {
     expect(handleOnboardingRefusal(new Error('synthetic unrelated failure'), 'agent')).toBe(false);
     expect(process.exitCode).toBe(before);
   } finally {
-    process.exitCode = before;
+    process.exitCode = before ?? 0;
   }
 });
 
@@ -140,7 +141,8 @@ describe('agent CLI chat-turn errors', () => {
       });
       expect(result.error).toBeUndefined();
       expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toBe('No LLM provider available. Run `elanous setup` — with a subscription, `elanous login openai-codex` then `elanous config set llm.provider openai-codex`; with API keys, set XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, or LOCAL_LLM_URL.\n');
+      // #22294: with --json the dev pipeline's «[dev] …» progress lines go to stderr; the guidance is everything else.
+      expect(result.stderr.split('\n').filter((line) => !line.startsWith('[dev] ')).join('\n')).toBe('No LLM provider available. Run `elanous setup` — with a subscription, `elanous login openai-codex` then `elanous config set llm.provider openai-codex`; with API keys, set XAI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, or LOCAL_LLM_URL.\n');
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

@@ -77,8 +77,10 @@ describe('PFC-S5 P4 — recommendModel', () => {
     // 6GB free — defeats every local model in the May 2026 catalog
     // (smallest is glm-z1:9b @ 12GB minRamGb · kimi-vl-a3b @ 14GB).
     const rec = recommendModel('cheap', {}, buildCtx({ system: system(6) }));
-    // gpt-4o-mini ($0.15/$0.60 avg=0.375) cheapest paid under "cheap" filter.
-    expect(rec.recommended).toBe('gpt-4o-mini');
+    // Among enabled paid candidates, gpt-6-luna ($0.10/$0.50 avg=0.30)
+    // is cheaper than gpt-4o-mini ($0.15/$0.60 avg=0.375).
+    expect(rec.recommended).toBe('gpt-6-luna');
+    expect(rec.estimatedCostUsd).toBeCloseTo(0.0007, 4);
   });
 
   test('local_preferred returns local-only', () => {

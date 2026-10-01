@@ -131,7 +131,7 @@ export function signalsFromSnapshot(stars: number, prev: StarSnapshot | undefine
   return { stars, starsDelta, starsPerDay: starsDelta / span };
 }
 
-function appendSnapshots(root: string, rows: StarSnapshot[]): void {
+export function appendGithubStarSnapshots(root: string, rows: StarSnapshot[]): void {
   if (!rows.length) return;
   mkdirSync(intakeLedgerDir(root), { recursive: true });
   appendFileSync(githubStarsFile(root), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
@@ -154,6 +154,8 @@ export interface CollectGithubOpts {
   /** 스냅숏·비교의 «오늘». 생략하면 UTC 날짜. */
   day?: string;
   now?: () => Date;
+  /** 등록 원천이 질의 하나만 수집할 때; 생략 시 기존 관심 질의 전부. */
+  queries?: readonly string[];
 }
 
 /**
@@ -173,7 +175,7 @@ export async function collectGithubStars(
   const found: GithubStarRepo[] = [];
   // «급상승»은 최근에 생긴 저장소 중 별 순이다 — 전체 기간 별 순이면 활발한 거대 저장소가 매일 같은 목록으로 나온다(2026-09-26 검토).
   const windowStart = new Date(Date.parse(`${day}T00:00:00.000Z`) - days * 86_400_000).toISOString().slice(0, 10);
-  for (const query of GITHUB_STAR_QUERIES) {
+  for (const query of opts.queries ?? GITHUB_STAR_QUERIES) {
     const rows = await search(`${query} created:>=${windowStart}`, perQuery);
     const recent = rows.filter((r) => isRecentRepo(r, day, days));
     queries.push({ query, received: recent.length });
@@ -208,7 +210,7 @@ export async function collectGithubStars(
     day, days, perQuery, dryRun: !!opts.dryRun, queries, repos, raws: raws.length,
   };
   if (!opts.dryRun) {
-    appendSnapshots(root, repos.map((row) => ({ day, repo: row.repo, stars: row.stars })));
+    appendGithubStarSnapshots(root, repos.map((row) => ({ day, repo: row.repo, stars: row.stars })));
     result.ingest = ingestIntakeItems(root, 'github', raws);
   }
   debug.log('intake.collect', 'github-stars', {

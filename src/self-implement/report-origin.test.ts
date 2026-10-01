@@ -14,6 +14,23 @@ describe('report origin', () => {
     expect(readReportOrigin({ ELANOUS_REPORT_ORIGIN: JSON.stringify({ channel: 'unknown', chatId: 4 }) })).toBeNull();
   });
 
+  test('accepts a Discord origin (channel ⊕ optional thread snowflakes) — the harness door must not drop it (EV12b)', () => {
+    const channel = { channel: 'discord', channelId: '123456789012345678' } as const;
+    const thread = { channel: 'discord', channelId: '123456789012345678', discordThreadId: '987654321098765432' } as const;
+    expect(readReportOrigin(encodeReportOriginEnv(channel))).toEqual(channel);
+    expect(readReportOrigin(encodeReportOriginEnv(thread))).toEqual(thread);
+    for (const bad of [
+      { channel: 'discord' },
+      { channel: 'discord', channelId: 123456789012345678 },
+      { channel: 'discord', channelId: 'general' },
+      { channel: 'discord', channelId: '1', threadId: 5 },
+      { channel: 'discord', channelId: '1', chatId: 5 },
+      { channel: 'discord', channelId: '1', discordThreadId: 'x' },
+    ]) {
+      expect(readReportOrigin({ ELANOUS_REPORT_ORIGIN: JSON.stringify(bad) })).toBeNull();
+    }
+  });
+
   test('message contains the link and read-only takeover instruction', () => {
     const message = formatPtyLinkMessage({ webUrl: 'https://host/term?pty=self_12345678', ptyId: 'self_12345678', title: '빌드' });
     expect(message).toContain('https://host/term?pty=self_12345678');

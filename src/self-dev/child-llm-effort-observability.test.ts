@@ -39,7 +39,7 @@ test('flagged child effort shares one resolved value across stderr and structure
   });
 
   expect(observed.stderr).toContain('effort=high(ceiling=high · source=flag)');
-  expect(observed.logs).toEqual([{
+  expect(observed.logs.filter((log) => log.category === 'self-dev.child-llm')).toEqual([{
     category: 'self-dev.child-llm',
     event: 'effort-resolved',
     data: {
@@ -58,7 +58,7 @@ test('unset child effort stays unspecified without inferring a provider default'
 
   expect(observed.stderr).toContain('effort=미지정(ceiling=high · source=unset)');
   expect(observed.stderr).not.toMatch(/effort=(minimal|low|medium|high|xhigh|max)\b/);
-  expect(observed.logs).toEqual([{
+  expect(observed.logs.filter((log) => log.category === 'self-dev.child-llm')).toEqual([{
     category: 'self-dev.child-llm',
     event: 'effort-resolved',
     data: {

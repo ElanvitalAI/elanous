@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 const documentPath = `${import.meta.dir}/../docs/RESEARCH-yaml-graph-drove-a-real-mission-2026-09-08.md`;
 const graphPath = `${import.meta.dir}/../graphs/research-loop.yaml`;
@@ -19,7 +22,9 @@ async function measuredRows(): Promise<LedgerRow[]> {
   return stdout.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as LedgerRow);
 }
 
-test('YAML graph research record preserves the real run ledger values and mismatch', async () => {
+// Requires the 2026-09-08 live run ledger; rerun on a machine with that run's state dir.
+const ledgerPath = join(process.env.ELANOUS_STATE_DIR ?? join(homedir(), '.elanous'), 'run-ledger', `${runId}.jsonl`);
+test.skipIf(!existsSync(ledgerPath))('YAML graph research record preserves the real run ledger values and mismatch', async () => {
   const [documentText, graphText, rows] = await Promise.all([
     Bun.file(documentPath).text(),
     Bun.file(graphPath).text(),

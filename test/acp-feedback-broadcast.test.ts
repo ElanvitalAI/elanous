@@ -10,6 +10,8 @@
 //     tests).
 //  4. `delivered` count matches the underlying peer fan-out.
 //  5. Empty sessionId / unknown sessionId → delivered:0, no throw.
+//  6. Only peers advertising `clientCapabilities._meta.elanous` get
+//     envelopes (#22475) — a plain ACP client (Zed …) gets nothing.
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
@@ -46,9 +48,13 @@ interface ClientChannel {
 interface FanoutHarness {
   shutdown(): Promise<void>;
   channels: ClientChannel[];
-  initializeAndNewSession: (idx: number) => Promise<string>;
-  initializeAndLoadSession: (idx: number, sessionId: string) => Promise<void>;
+  initializeAndNewSession: (idx: number, opts?: { aware?: boolean }) => Promise<string>;
+  initializeAndLoadSession: (idx: number, sessionId: string, opts?: { aware?: boolean }) => Promise<void>;
 }
+
+// #22475 — feedback envelopes go only to connections that declare `_meta.elanous`.
+const AWARE_CAPS = { _meta: { elanous: { ui: { showToast: true } } } };
+const capsFor = (aware = true) => (aware ? AWARE_CAPS : {});
 
 async function bootFanoutServer(opts: { numClients: number }): Promise<FanoutHarness> {
   const bridges = Array.from({ length: opts.numClients }, () => createInProcessAcpBridge());
@@ -112,16 +118,16 @@ async function bootFanoutServer(opts: { numClients: number }): Promise<FanoutHar
     };
   });
 
-  const initializeAndNewSession: FanoutHarness['initializeAndNewSession'] = async (idx) => {
+  const initializeAndNewSession: FanoutHarness['initializeAndNewSession'] = async (idx, o) => {
     const ch = channels[idx]!;
-    await ch.conn.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await ch.conn.initialize({ protocolVersion: 1, clientCapabilities: capsFor(o?.aware) });
     const resp = await ch.conn.newSession({ cwd: process.cwd(), mcpServers: [] });
     return resp.sessionId;
   };
 
-  const initializeAndLoadSession: FanoutHarness['initializeAndLoadSession'] = async (idx, sessionId) => {
+  const initializeAndLoadSession: FanoutHarness['initializeAndLoadSession'] = async (idx, sessionId, o) => {
     const ch = channels[idx]!;
-    await ch.conn.initialize({ protocolVersion: 1, clientCapabilities: {} });
+    await ch.conn.initialize({ protocolVersion: 1, clientCapabilities: capsFor(o?.aware) });
     await ch.conn.loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] });
   };
 
@@ -249,6 +255,29 @@ describe('getActiveAcpFeedbackBroadcaster — wire shape', () => {
     // Same envelope on both peers — wire shape is identical.
     expect(a[0]).toEqual(env);
     expect(b[0]).toEqual(env);
+  });
+
+  test('skips a plain peer (no _meta.elanous) while an aware peer on the same session still receives', async () => {
+    harness = await bootFanoutServer({ numClients: 2 });
+    const sid = await harness.initializeAndNewSession(0);
+    await harness.initializeAndLoadSession(1, sid, { aware: false });
+
+    const env = buildThinkingEnvelope(sid);
+    const { delivered } = await getActiveAcpFeedbackBroadcaster()!(sid, env);
+    expect(delivered).toBe(1);
+
+    await waitFor(() => feedbackEnvelopesOf(harness!.channels[0]!, sid).length > 0);
+    expect(feedbackEnvelopesOf(harness.channels[0]!, sid)).toEqual([env]);
+    expect(feedbackEnvelopesOf(harness.channels[1]!, sid)).toEqual([]);
+  });
+
+  test('delivers nothing when every peer on the session is plain', async () => {
+    harness = await bootFanoutServer({ numClients: 1 });
+    const sid = await harness.initializeAndNewSession(0, { aware: false });
+
+    const { delivered } = await getActiveAcpFeedbackBroadcaster()!(sid, buildThinkingEnvelope(sid));
+    expect(delivered).toBe(0);
+    expect(feedbackEnvelopesOf(harness.channels[0]!, sid)).toEqual([]);
   });
 
   test('preserves payload narrowing across wire round-trip', async () => {

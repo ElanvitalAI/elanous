@@ -55,7 +55,10 @@ export function githubInstallationCredential(deps: GithubAutomationTokenDeps = {
     const rel = join('secrets', 'github-app', 'app.json');
     const own = join(getElanousConfigDir(), rel);
     // An explicit config-dir override (tests · `--config-dir`) is a deliberate boundary — never reach past it.
-    path = deps.configPath ?? (existsSync(own) || getElanousConfigDirOverride() ? own : join(prodInstanceRoot(), rel));
+    // ELANOUS_GITHUB_APP_CONFIG_PATH pins the machine-level fallback (the bun test preload points it at nothing,
+    // so tests never mint); an explicit config-dir override still wins.
+    const pinned = process.env.ELANOUS_GITHUB_APP_CONFIG_PATH?.trim();
+    path = deps.configPath ?? (getElanousConfigDirOverride() ? own : pinned || (existsSync(own) ? own : join(prodInstanceRoot(), rel)));
   }
   catch {
     try { debug.log('auth.github-app', 'token-failed', { reason: 'config-path-failed' }); } catch { /* fail open */ }

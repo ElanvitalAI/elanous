@@ -335,8 +335,16 @@ describe('legacy plugin classifier', () => {
       }, null, { userDir });
       await host.discover();
       const manifest = host.list().find((entry) => entry.manifest.id === 'botlab')!.manifest;
-      expect(Object.keys(manifest.contributes).sort()).toEqual(['commands', 'prompts']);
+      expect(Object.keys(manifest.contributes).sort()).toEqual(['commands', 'prompts', 'tasks']);
       expect(manifest.contributes.prompts).toHaveLength(1);
+      expect(manifest.contributes.tasks?.map((task) => task.id)).toEqual([
+        'routine-investor', 'routine-assistant', 'routine-newsbot',
+      ]);
+      expect(manifest.contributes.tasks?.map((task) => task.args)).toEqual([
+        ['scripts/botlab/bot-routine.ts', 'investor'],
+        ['scripts/botlab/bot-routine.ts', 'assistant'],
+        ['scripts/botlab/bot-routine.ts', 'newsbot'],
+      ]);
       expect(manifest.contributes.panes).toBeUndefined();
       const promptStore = getPromptBankStore();
       const before = {

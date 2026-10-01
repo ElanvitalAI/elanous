@@ -2,6 +2,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { gunzipSync } from 'node:zlib';
 import { debug } from '../../debug/log.js';
 import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
+import { ledgerLineToLogEvent } from './pod-ledger-events.js';
 
 type Ledger = { runId: string; jsonl: string };
 type Incomplete = { runId: string; reason: string };
@@ -124,7 +125,7 @@ export function createPodLedgerFollower(opts: {
   let owned = false;
   let disabled = false;
   let lastProgressAt = now();
-  let lastProgressEvent: string | null = null;
+  let visibleProgressEvent: string | null = null;
   let lastActivityMeasuredAt = lastProgressAt;
   let lastActivityLogAt = -Infinity;
   let nextStallMinute = stallMinutes;
@@ -132,11 +133,11 @@ export function createPodLedgerFollower(opts: {
   function checkStall(ledgerRead: boolean, activityMeasured: boolean) {
     const idleMinutes = Math.max(0, (now() - lastProgressAt) / 60_000);
     if (idleMinutes >= nextStallMinute) {
-      log('self-implement.pod', 'stalled', { runId: opts.runId, lastProgressEvent, idleMinutes });
+      log('self-implement.pod', 'stalled', { runId: opts.runId, lastProgressEvent: visibleProgressEvent, idleMinutes });
       const observation = ledgerRead
         ? (activityMeasured ? '원장·작업 트리 모두 조용함' : '원장 조용함')
         : '원장 못 잼';
-      onStall(`[pod] 진행 없음 ${Math.floor(idleMinutes)}분 — ${observation} · 마지막 진행 ${lastProgressEvent ?? '없음'}${activityMeasured ? '' : ' (작업 트리 못 잼)'}`);
+      onStall(`[pod] 진행 없음 ${Math.floor(idleMinutes)}분 — ${observation} · 마지막 진행 ${visibleProgressEvent ?? '없음'}${activityMeasured ? '' : ' (작업 트리 못 잼)'}`);
       stalled = true;
       nextStallMinute = (Math.floor(idleMinutes / stallMinutes) + 1) * stallMinutes;
     }
@@ -169,7 +170,7 @@ export function createPodLedgerFollower(opts: {
           if (stalled) log('self-implement.pod', 'stall-cleared', { runId: opts.runId, idleMinutes });
           stalled = false;
           lastProgressAt = now();
-          lastProgressEvent = 'worktree-activity';
+          visibleProgressEvent = 'worktree-activity';
           nextStallMinute = stallMinutes;
           if (now() - lastActivityLogAt >= 5 * 60_000) {
             log('self-implement.pod', 'worktree-activity', { runId: opts.runId, files });
@@ -190,6 +191,11 @@ export function createPodLedgerFollower(opts: {
       log('self-implement.pod', 'ledger-live-appended', { runId: opts.runId, lines: complete.split('\n').filter(Boolean).length, bytes: Buffer.byteLength(complete), offset });
       for (const line of complete.split('\n')) {
         if (!line) continue;
+        let logEvent: ReturnType<typeof ledgerLineToLogEvent>;
+        try {
+          logEvent = ledgerLineToLogEvent(line, opts.runId);
+          if (logEvent) log(logEvent.category, logEvent.event, logEvent.data);
+        } catch { /* A failed host log write must not interrupt ledger following or stall accounting. */ }
         let entry: unknown;
         try { entry = JSON.parse(line); } catch { continue; }
         const event = (entry && typeof entry === 'object' && 'event' in entry) ? entry.event : undefined;
@@ -198,7 +204,7 @@ export function createPodLedgerFollower(opts: {
         if (stalled) log('self-implement.pod', 'stall-cleared', { runId: opts.runId, idleMinutes });
         stalled = false;
         lastProgressAt = now();
-        lastProgressEvent = event;
+        visibleProgressEvent = logEvent?.event ?? '[redacted]';
         nextStallMinute = stallMinutes;
       }
       checkStall(true, activityMeasured);

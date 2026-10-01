@@ -15,13 +15,14 @@ CFG=$(OUT="$OUT" W="$W" H="$H" T="$TITLE" G="$TAG" F="$FOOT" python3 -c '
 import json, os
 print(json.dumps({"out": os.environ["OUT"], "width": int(os.environ["W"]), "height": int(os.environ["H"]),
                   "title": os.environ["T"], "tagline": os.environ["G"], "footer": os.environ["F"]}))')
-TMP=$(mktemp -t endcard).js
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/endcard.XXXXXX") || { echo "⛔ 임시 스크립트를 만들지 못했다" >&2; exit 1; }
+TMP="$TMP_DIR/endcard.js"
 CFG="$CFG" python3 -c '
 import os, io, sys
 io.open(sys.argv[2], "w", encoding="utf-8").write(
   io.open(sys.argv[1], encoding="utf-8").read().replace("__CFG__", os.environ["CFG"]))' "$HERE/endcard.js" "$TMP"
 out=$(python3 "$AFF" run "$TMP" 2>&1); rc=$?
-rm -f "$TMP"; echo "$out"
+rm -f "$TMP"; rmdir "$TMP_DIR"; echo "$out"
 printf '%s' "$out" | grep -qE '^Error:|Uncaught|TypeError|ReferenceError' && exit 1
 [ $rc -ne 0 ] && exit 1
 [ -f "$OUT" ] || { echo "⛔ 산출이 «없다»: $OUT" >&2; exit 1; }

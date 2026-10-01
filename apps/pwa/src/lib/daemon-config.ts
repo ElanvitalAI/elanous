@@ -24,6 +24,7 @@ const STORAGE_KEYS = {
   baseUrl: 'elanous.nexus.baseUrl',
   token: 'elanous.daemon.token',
   provider: 'elanous.daemon.provider',
+  setupScopeExpiresAt: 'elanous.daemon.setupScopeExpiresAt',
 } as const;
 
 const LEGACY_KEYS = {
@@ -100,6 +101,23 @@ export function saveDaemonConfig(cfg: Partial<DaemonConfig>): void {
   if (cfg.baseUrl !== undefined) localStorage.setItem(STORAGE_KEYS.baseUrl, cfg.baseUrl);
   if (cfg.token !== undefined) localStorage.setItem(STORAGE_KEYS.token, cfg.token);
   if (cfg.provider !== undefined) localStorage.setItem(STORAGE_KEYS.provider, cfg.provider);
+}
+
+export function readSetupScope(): number | null {
+  if (typeof window === 'undefined') return null;
+  const raw = localStorage.getItem(STORAGE_KEYS.setupScopeExpiresAt);
+  if (raw === null) return null;
+  const expiresAt = Number(raw);
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+    clearSetupScope();
+    return null;
+  }
+  return expiresAt;
+}
+
+export function clearSetupScope(): void {
+  if (typeof window === 'undefined') return;
+  localStorage.removeItem(STORAGE_KEYS.setupScopeExpiresAt);
 }
 
 export function buildAcpWsUrl(cfg: DaemonConfig): string {

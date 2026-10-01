@@ -11,7 +11,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/install.sh [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--no-bootstrap-bun] [--help]
+Usage: bash scripts/install.sh [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--no-bootstrap-bun] [--no-setup] [--yes] [--allow-downgrade] [--help]
        curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 
 Install elanous without contacting a package registry.
@@ -23,6 +23,9 @@ Install elanous without contacting a package registry.
                       (or set $ELANOUS_INSTALL_SOURCE; without either, fetch the verified latest release)
   --no-modify-path    do not append the elanous PATH block to a shell startup file
   --no-bootstrap-bun  fail instead of installing bun with its official installer when bun is missing
+  --no-setup          do not start first-time setup in this window after installing (interactive terminals only)
+  --yes               do not ask before updating an existing installation
+  --allow-downgrade   allow installing a version older than the one already installed
   --help, -h          show this help
 EOF
 }
@@ -35,6 +38,9 @@ PREFIX="${ELANOUS_INSTALL_PREFIX:-${XDG_DATA_HOME:-${HOME:?HOME is required}/.lo
 SOURCE="${ELANOUS_INSTALL_SOURCE:-}"
 MODIFY_PATH=1
 BOOTSTRAP_BUN=1
+RUN_SETUP=1
+ASSUME_YES=0
+ALLOW_DOWNGRADE=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -47,9 +53,29 @@ while [ "$#" -gt 0 ]; do
       SOURCE="$2"; shift 2 ;;
     --no-modify-path) MODIFY_PATH=0; shift ;;
     --no-bootstrap-bun) BOOTSTRAP_BUN=0; shift ;;
+    --no-setup) RUN_SETUP=0; shift ;;
+    --yes|-y) ASSUME_YES=1; shift ;;
+    --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
     *) echo "⛔ unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+# INST1 — one language per run: English by default, Korean when the locale is Korean (override: ELANOUS_INSTALL_LANG=en|ko).
+case "${ELANOUS_INSTALL_LANG:-${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}}" in
+  ko*) INSTALL_LANG=ko ;;
+  *) INSTALL_LANG=en ;;
+esac
+t() { if [ "$INSTALL_LANG" = ko ]; then printf '%s' "$2"; else printf '%s' "$1"; fi; }
+
+# Interactive = a person is at a terminal. `curl … | bash` gives us the script on stdin, so look at
+# stdout and /dev/tty, not stdin (rustup does the same). CI never counts as interactive.
+# ELANOUS_INSTALL_INTERACTIVE=0|1 overrides the probe (tests, wrappers).
+INTERACTIVE=0
+if [ -n "${ELANOUS_INSTALL_INTERACTIVE:-}" ]; then
+  [ "$ELANOUS_INSTALL_INTERACTIVE" = 1 ] && INTERACTIVE=1
+elif [ -z "${CI:-}" ] && [ -t 1 ] && { : </dev/tty; } 2>/dev/null; then
+  INTERACTIVE=1
+fi
 
 # bun 이 없으면 공식 설치기로 먼저 깐다 — «sh 한 번이면 알아서» (claude·grok 설치기와 같은 기대).
 # ⛔ 끄면(--no-bootstrap-bun) 공식 설치 명령을 안내하고 rc 127 로 멈춘다.
@@ -295,6 +321,30 @@ fi
 PACKAGE_VERSION="$(tar -xzOf "$INSTALL_TARBALL" package/package.json 2>/dev/null | bun -e 'const t=await Bun.stdin.text(); try { process.stdout.write(String(JSON.parse(t).version ?? "")) } catch {}' || true)"
 [ -n "$PACKAGE_VERSION" ] || { echo "⛔ package version missing in tarball: $INSTALL_TARBALL" >&2; exit 1; }
 case "$PACKAGE_VERSION" in */*|*..*) echo "⛔ unsafe package version: $PACKAGE_VERSION" >&2; exit 1 ;; esac
+
+# INST1 — an existing installation is never moved silently: no downgrade without --allow-downgrade
+# (10-01: a running mbp went 0.2.7 → 0.2.6 unnoticed), and an interactive re-run asks before updating.
+INSTALLED_VERSION=""
+if [ -f "$PREFIX/install.json" ]; then
+  INSTALLED_VERSION="$(bun -e 'try { const j=JSON.parse(await Bun.file(process.argv.at(-1)).text()); process.stdout.write(String(j.version ?? "")) } catch {}' "$PREFIX/install.json" || true)"
+fi
+if [ -n "$INSTALLED_VERSION" ]; then
+  ORDER="$(bun -e 'const [a,b]=process.argv.slice(-2); try { process.stdout.write(String(Bun.semver.order(a,b))) } catch { process.stdout.write("0") }' "$PACKAGE_VERSION" "$INSTALLED_VERSION" || echo 0)"
+  if [ "$ORDER" = "-1" ] && [ "$ALLOW_DOWNGRADE" -eq 0 ]; then
+    echo "⛔ $(t "elanous $INSTALLED_VERSION is installed; $PACKAGE_VERSION is older, so nothing was changed. To go back on purpose, rerun with --allow-downgrade." "elanous $INSTALLED_VERSION 이(가) 설치돼 있고 $PACKAGE_VERSION 은(는) 더 낮은 판이라 아무것도 바꾸지 않았습니다. 일부러 내리려면 --allow-downgrade 를 붙여 다시 실행하세요.")" >&2
+    exit 3
+  fi
+  if [ "$INTERACTIVE" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
+    printf '%s ' "$(t "elanous $INSTALLED_VERSION is already installed. Update to $PACKAGE_VERSION? [Y/n]" "elanous $INSTALLED_VERSION 이(가) 이미 설치돼 있습니다. $PACKAGE_VERSION 로 업데이트할까요? [Y/n]")"
+    if [ -n "${ELANOUS_INSTALL_ANSWER+x}" ]; then ANSWER="$ELANOUS_INSTALL_ANSWER"; else ANSWER=""; read -r ANSWER </dev/tty || ANSWER=""; fi
+    echo ""
+    case "$ANSWER" in
+      n|N|no|NO|No|아니오|아니요)
+        echo "$(t "Left elanous $INSTALLED_VERSION as it is." "elanous $INSTALLED_VERSION 을(를) 그대로 두었습니다.")"
+        exit 0 ;;
+    esac
+  fi
+fi
 VERSION_NAME="$PACKAGE_VERSION${VERSION_SUFFIX:-}"
 VERSION_DIR="$PREFIX/versions/$VERSION_NAME"
 mkdir -p "$VERSION_DIR"
@@ -312,15 +362,25 @@ printf '#!/bin/sh\nexec "%s" x node-gyp@latest "$@"\n' "$BUN_EXEC" > "$NATIVE_SH
 chmod +x "$NATIVE_SHIM/node-gyp"
 if ! (cd "$VERSION_DIR" && PATH="$NATIVE_SHIM:$PATH" bun add --no-save --offline "$INSTALL_TARBALL" >/dev/null 2>&1); then
   echo "dependencies not in the local bun cache — fetching them from the npm registry" >&2
-  (cd "$VERSION_DIR" && PATH="$NATIVE_SHIM:$PATH" bun add --no-save "$INSTALL_TARBALL")
+  # bun prints «Blocked N postinstalls» and progress noise here — keep it out of the screen unless this step fails.
+  ADD_LOG="$(mktemp "${TMPDIR:-/tmp}/elanous-bun-add.XXXXXX")"
+  ADD_RC=0
+  (cd "$VERSION_DIR" && PATH="$NATIVE_SHIM:$PATH" bun add --no-save "$INSTALL_TARBALL") >"$ADD_LOG" 2>&1 || ADD_RC=$?
+  if [ "$ADD_RC" -ne 0 ]; then
+    tail -n 20 "$ADD_LOG" >&2
+    rm -f "$ADD_LOG"; rm -rf "$NATIVE_SHIM"
+    exit "$ADD_RC"
+  fi
+  rm -f "$ADD_LOG"
 fi
 rm -rf "$NATIVE_SHIM"
 ln -sfn "versions/$VERSION_NAME" "$PREFIX/current"
 mkdir -p "$PREFIX/bin"
 # 절대 bun 경로를 설치 때 박고 엔트리는 current 를 거친다 — cron/systemd 의 짧은 PATH 와 판 전환 모두 지원.
 WRAPPER="$PREFIX/bin/.elanous-$$"
-printf '#!/bin/sh\n# elanous-wrapper\nif [ ! -x %s ]; then\n  printf '\''bun 을 찾을 수 없습니다: %%s — 설치기를 다시 실행하세요\\n'\'' %s >&2\n  exit 127\nfi\nexec %s %s "$@"\n' \
-  "$(shell_quote "$BUN_EXEC")" "$(shell_quote "$BUN_EXEC")" "$(shell_quote "$BUN_EXEC")" \
+BUN_MISSING_MSG="$(t 'bun not found: %s — run the installer again' 'bun 을 찾을 수 없습니다: %s — 설치기를 다시 실행하세요')"
+printf '#!/bin/sh\n# elanous-wrapper\nif [ ! -x %s ]; then\n  printf '\''%s\\n'\'' %s >&2\n  exit 127\nfi\nexec %s %s "$@"\n' \
+  "$(shell_quote "$BUN_EXEC")" "$BUN_MISSING_MSG" "$(shell_quote "$BUN_EXEC")" "$(shell_quote "$BUN_EXEC")" \
   "$(shell_quote "$PREFIX/current/node_modules/elanous/bin/elanous.mjs")" > "$WRAPPER"
 chmod +x "$WRAPPER"
 mv -f "$WRAPPER" "$PREFIX/bin/elanous"
@@ -329,7 +389,7 @@ ELN_ON_PATH="$(command -v eln 2>/dev/null || true)"
 if { [ -n "$ELN_ON_PATH" ] && [ "$ELN_ON_PATH" != "$ELN" ]; } ||
    { { [ -e "$ELN" ] || [ -L "$ELN" ]; } &&
      { [ -L "$ELN" ] || [ ! -f "$ELN" ] || [ "$(sed -n '2p' "$ELN")" != '# elanous-wrapper' ]; }; }; then
-  echo '⚠ eln: 이미 다른 명령이 있어 만들지 않았다 — elanous 로 쓰십시오'
+  echo "⚠ eln: $(t 'already used by another program, so it was not created — run elanous instead.' '이미 다른 프로그램이 eln 을 써서 만들지 않았습니다 — elanous 로 실행하세요.')"
   ELN_AVAILABLE=0
 else
   cp "$PREFIX/bin/elanous" "$ELN"
@@ -368,21 +428,26 @@ if [ "$MODIFY_PATH" -eq 1 ] && [ -n "${LOGIN_STARTUP:-}" ] && ! grep -Fqx "$MARK
   printf '\n%s\n%s\n%s\n' "$MARKER_START" "$PATH_LINE" "$MARKER_END" >> "$LOGIN_STARTUP"
 fi
 
-echo "Installed elanous $VERSION at $PREFIX/bin/elanous"
+echo "$(t "Installed elanous $VERSION at $PREFIX/bin/elanous" "elanous $VERSION 을(를) 설치했습니다: $PREFIX/bin/elanous")"
 
 # ── 다음 걸음 (2026-09-23 · Phase 3 「사람 손」) ─────────────────────────
 # ⛔ 설치가 끝나도 «무엇을 더 쳐야 하나»를 안 말하면, 빠뜨린 손이 나중에 «다른 원인의 얼굴»로 나타난다
 #   (예: 로그인 누락이 quota-exhausted 로 분류됐다 — 09-21 실측). 그래서 «지금 상태»로 계산해 말한다.
 #   provider 설정은 «안» 적는다 — 빈 config(auto)는 로그인만 있으면 런타임이 codex 로 고른다(#19950).
+# --no-setup keeps the prompt above but never starts setup.
+START_SETUP=$INTERACTIVE
+[ "$RUN_SETUP" -eq 1 ] || START_SETUP=0
+
 echo ""
-echo "Next:"
+echo "$(t 'Next:' '다음:')"
 STEP=1
+# INST1 order: new shell → elanous (first-time setup, which also signs in) → missing tools → harness say.
 case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
-  *) if [ "$MODIFY_PATH" -eq 1 ]; then echo "  $STEP) open a new shell (or: source $STARTUP)"; else echo "  $STEP) add $PREFIX/bin to PATH"; fi; STEP=$((STEP + 1)) ;;
+  *) if [ "$MODIFY_PATH" -eq 1 ]; then echo "  $STEP) $(t "open a new shell (or: source $STARTUP)" "새 셸을 여세요(또는: source $STARTUP)")"; else echo "  $STEP) $(t "add $PREFIX/bin to PATH" "$PREFIX/bin 을 PATH 에 넣으세요")"; fi; STEP=$((STEP + 1)) ;;
 esac
-if ! grep -q '"openai-codex"' "$HOME/.elanous/auth.json" 2>/dev/null; then
-  echo "  $STEP) elanous login openai-codex        # ChatGPT subscription (device code, no API key)"; STEP=$((STEP + 1))
+if [ "$START_SETUP" -eq 0 ]; then
+  echo "  $STEP) $(t "Run: $PREFIX/bin/elanous   # first-time setup (in a new shell: elanous)" "실행: $PREFIX/bin/elanous   # 첫 설정(새 셸에서는: elanous)")"; STEP=$((STEP + 1))
 fi
 # 🆕 2026-09-24 빈 VM 실측: 하니스(codex 백엔드)는 Codex CLI 를 자식으로 띄우는데 빈 기계엔 codex·node 가 «둘 다» 없었다.
 #    ⚠️ 아래 설치 줄은 빈 기계에서 아직 «안 쟀다» — `elanous doctor` 의 codex 줄이 판정한다.
@@ -440,8 +505,22 @@ elif ! gh auth status >/dev/null 2>&1; then
   echo "  $STEP) gh auth login                     # the harness opens pull requests with it"; STEP=$((STEP + 1))
 fi
 if [ "$ELN_AVAILABLE" -eq 1 ]; then
-  echo "  $STEP) eln harness say \"<one line of what you want>\" (or: elanous harness say)"
+  echo "  $STEP) $(t 'eln harness say "<one line of what you want>" (or: elanous harness say)' 'eln harness say "<하고 싶은 일 한 줄>" (또는: elanous harness say)')"
 else
-  echo "  $STEP) elanous harness say \"<one line of what you want>\""
+  echo "  $STEP) $(t 'elanous harness say "<one line of what you want>"' 'elanous harness say "<하고 싶은 일 한 줄>"')"
 fi
-echo "  check anytime: elanous setup --non-interactive"
+echo "  $(t 'check anytime: elanous setup --non-interactive' '언제든 점검: elanous setup --non-interactive')"
+
+# INST2 — finish in the same window: start first-time setup with the absolute wrapper (no source, no new shell).
+if [ "$START_SETUP" -eq 1 ]; then
+  echo ""
+  echo "$(t 'Starting first-time setup… (skip it next time with --no-setup)' '첫 설정을 시작합니다… (다음에 건너뛰려면 --no-setup)')"
+  case ":$PATH:" in
+    *":$PREFIX/bin:"*) ;;
+    *) echo "  $(t "(new shells will find elanous on PATH; this window uses $PREFIX/bin/elanous)" "(새 셸에서는 PATH 로 elanous 를 찾습니다 · 이 창은 $PREFIX/bin/elanous 를 씁니다)")" ;;
+  esac
+  if [ -n "${ELANOUS_INSTALL_SETUP_EXEC:-}" ]; then
+    exec "$ELANOUS_INSTALL_SETUP_EXEC" "$PREFIX/bin/elanous"
+  fi
+  exec "$PREFIX/bin/elanous" </dev/tty
+fi

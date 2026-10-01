@@ -1,4 +1,6 @@
 import type { Command } from 'commander';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { loadMachineLedger, machineMarkdownPath, renderLedgerMarkdown, setMachineField } from '../machines/machine-ledger.js';
 import { MACHINE_NAME, resolveMachineName } from '../roles/machine-name.js';
 import { readMachineProfile, seatRank, validSeatRank, writeMachineProfile } from '../roles/machine-profile.js';
 
@@ -27,6 +29,27 @@ export function registerMachineCommands(program: Command, root?: string): void {
       }
       writeMachineProfile({ id, duties, seats }, root);
       console.log(`machine · ${id} · ${duties.join(',') || '-'} · ${Object.entries(seats).map(([seat, value]) => `${seat}:${value.rank}`).join(',') || '-'}`);
+    });
+  machine.command('render').description('YAML 원장에서 Markdown 생성·검증')
+    .option('--check', 'Markdown 과 YAML 동기화 검증')
+    .action((opts: { check?: boolean }) => {
+      const markdown = renderLedgerMarkdown(loadMachineLedger(process.cwd()));
+      const path = machineMarkdownPath(process.cwd());
+      if (opts.check) {
+        let current: string;
+        try { current = readFileSync(path, 'utf8'); } catch { throw new Error(`machine ledger Markdown missing: ${path}`); }
+        if (current !== markdown) throw new Error(`machine ledger Markdown stale: ${path}`);
+        console.log('machine render --check OK');
+      } else {
+        writeFileSync(path, markdown, 'utf8');
+        console.log(`machine render · ${path}`);
+      }
+    });
+  machine.command('ledger-set').description('YAML 보유 자원 필드 수정')
+    .argument('<id>').argument('<field>').argument('<value>')
+    .action((id: string, field: string, value: string) => {
+      setMachineField(process.cwd(), id, field, value);
+      console.log(`machine ledger-set · ${id} · ${field}`);
     });
   machine.command('show').option('--json', 'JSON 출력')
     .action((opts: { json?: boolean }) => {

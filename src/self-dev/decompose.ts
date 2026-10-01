@@ -341,6 +341,7 @@ export function buildSelfDevDecomposePrompt(feature: string, maxTasks = DEFAULT_
     '## Rules',
     `- Emit at most ${maxTasks} sub-features. Fewer is better — do NOT over-split, except when a sub-feature mixes ${SELF_DEV_CONCERN_SPLIT_THRESHOLD} or more concern classes — ${SELF_DEV_CONCERN_CLASSES.join(' / ')} — split it into sibling sub-features.`,
     '- SEPARATE DEFINE FROM WIRE: adding a new function/type/export is a SEPARATE task from wiring it into an existing runtime call site. A task that both defines a new symbol AND integrates it across modules tends to leave dead-code (defined but never called) that fails integration gates. Pattern: (a) add the function + its unit test; then (b) a dependent task that wires it into the specific existing call site — name the exact `file.ts:function` to modify.',
+    '- Exception to SEPARATE DEFINE FROM WIRE: Keep a definition and its registration/wiring in the same sub-feature — a handler with its route, a command with its CLI registration, a node with its graph/recipe entry.',
     '- Each sub-feature must be a self-contained, mergeable unit of work.',
     '- `dependsOn`: list the `id`s of sub-features that MUST land first (e.g. a shared',
     '  type/interface before its consumers). Independent sub-features share NO dependency',

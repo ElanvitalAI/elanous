@@ -62,7 +62,7 @@ test('setup and settings mount the same three-choice picker', () => {
 });
 
 test('choosing a role immediately updates the sidebar in the same window', async () => {
-  let saved: string | null = null;
+  let saved: string | null = 'owner';
   const handlers = new Map<string, Set<EventListener>>();
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
@@ -101,4 +101,22 @@ test('choosing a role immediately updates the sidebar in the same window', async
   expect(links()).toContain('/scheduler');
   expect(welcomeLinks()).toContain('/scheduler');
   expect(handlers.get(PWA_ROLE_EVENT)?.size).toBeGreaterThan(0);
+});
+
+test('MAT2 — with no stored role the sidebar hides beta/tool/ops screens', async () => {
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: {
+      localStorage: { getItem: () => null, setItem: () => {} },
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+    },
+  });
+  await act(async () => { tree = create(<SidebarNav />); });
+  const links = tree!.root.findByType('nav').findAllByType('a').map((link) => link.props.href);
+  expect(links).toContain('/chat');
+  for (const hidden of ['/approvals', '/scheduler', '/trace', '/intake', '/design-check', '/autopilot', '/vault']) {
+    expect(links).not.toContain(hidden);
+  }
 });

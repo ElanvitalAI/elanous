@@ -16,15 +16,14 @@ describe('nexus/index.ts · Z13-d devices NEXUS DI forward (W9e-FU)', () => {
   });
 
   test('forward sits inside the startNexusHttpServer({...}) call block', () => {
-    // The opts object is built between `startNexusHttpServer({` and the
-    // closing `});`. Make sure our spread is inside this block so the
-    // handler actually receives it (not just declared and dropped).
-    const startIdx = SOURCE.indexOf('startNexusHttpServer({');
+    // The injected server function receives the opts object at this call site.
+    const startIdx = SOURCE.indexOf('httpServer = startHttpServer({');
     expect(startIdx).toBeGreaterThan(-1);
     const tail = SOURCE.slice(startIdx);
-    const closeIdx = tail.indexOf('});');
+    const closeIdx = tail.indexOf('\n    });');
     expect(closeIdx).toBeGreaterThan(-1);
     const optsBlock = tail.slice(0, closeIdx);
+    expect(optsBlock).toContain('fleetSource: devicesSubstrateHandle.source');
     expect(optsBlock).toMatch(/devicesSubstrateHandle\s*\?\s*\{\s*devices:/);
   });
 

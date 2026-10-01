@@ -47,6 +47,7 @@ import {
   GLM_MODEL,
 } from './config.js';
 import type { SkillTier } from './skills/runner.js';
+import { sharedAgentSkillRoots } from './skills/shared-agent-skill-roots.js';
 import {
   isModelTier,
   isModelTierPersona,
@@ -439,6 +440,8 @@ export type SkillSetName =
 export interface SkillsConfig {
   activeSet: SkillSetName;
   dirs: string[];
+  /** Include the existing shared ~/.agents/skills directory. Default true; false opts out. */
+  includeSharedAgentSkills?: boolean;
   /** Explicit skill-name allowlist. When set and non-empty, the skill
    *  index filters to this list — all other skills are hidden from
    *  routing, autocompletion, and `/run-skill`. Use when a project
@@ -505,6 +508,8 @@ export interface DefaultSkillDirsOptions {
   pluginsRoot?: string;
   /** Override the installed package root. Tests pass a temp root; production omits this. */
   bundledSkillsRoot?: string;
+  /** Override the shared-agent home for isolated discovery tests. */
+  sharedAgentHome?: string;
 }
 
 /** Resolve the `skills/` directory shipped with this installed package. */
@@ -526,6 +531,15 @@ export function defaultSkillDirs(
       else if (sk.dirs.length > 0) base = [...sk.dirs];
     } else if (sk.dirs.length > 0) {
       base = [...sk.dirs];
+    }
+    const shared = sharedAgentSkillRoots({
+      home: opts?.sharedAgentHome ?? REMOTE_HOME,
+      includeSharedAgentSkills: sk.includeSharedAgentSkills !== false,
+    });
+    try { debug.log('skills.roots', 'shared-agent', { found: shared.length }); }
+    catch { /* discovery remains fail-soft when observation is unavailable */ }
+    for (const dir of shared) {
+      if (!base.includes(dir)) base.push(dir);
     }
     base = sk.includeClaudePackageSkills === true
       ? appendClaudePackageSkillDirs(base, opts?.pluginsRoot)
@@ -685,6 +699,7 @@ function skillsDefaults(): SkillsConfig {
   return {
     activeSet: 'claudecode',
     dirs: d ? [d] : [],
+    includeSharedAgentSkills: true,
     allow: [],
     deny: [],
     urlRouting: urlRoutingDefaults(),
@@ -886,6 +901,9 @@ export interface DiscordConfig {
   allowedUsers: string[];
   /** Channel snowflake for cron / push output (optional). */
   homeChannel?: string;
+  /** EV12c — guild text channels where the production bot chats like a DM (allowlist still applies).
+   *  Empty / absent = DM-only, as before. */
+  chatChannels?: string[];
   /** Standalone `elanous discord-test` scope — same token, dedicated
    *  channel, isolated state. See DiscordTestChannel. */
   testChannel?: DiscordTestChannel;
@@ -896,6 +914,7 @@ const DISCORD_DEFAULTS: DiscordConfig = { enabled: false, allowedUsers: [] };
 // ── Onboarding ───────────────────────────────────────────────────────
 
 export interface OnboardingConfig {
+  webFirst?: boolean;
   completed: boolean;
   completedAt?: string;
   version: number;
@@ -1366,6 +1385,8 @@ export interface ChatCompactConfig {
 }
 
 export interface ChatConfig {
+  /** Short questions may receive a tool-free first reply. Default true. */
+  fastPath: boolean;
   conciseness: ChatConcisenessConfig;
   toolOutput: ChatToolOutputConfig;
   autoCompact: ChatAutoCompactConfig;
@@ -1392,6 +1413,7 @@ const CHAT_CONCISENESS_DEFAULTS: ChatConcisenessConfig = {
 };
 
 export const CHAT_DEFAULTS: ChatConfig = {
+  fastPath: true,
   conciseness: { ...CHAT_CONCISENESS_DEFAULTS },
   toolOutput: {
     persistOnOverflow: true,
@@ -3324,9 +3346,16 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 }
 
 
+export type SeatLoopMode = 'off' | 'shadow' | 'on';
+
+export interface SeatLoopConfig {
+  /** No seat actions by default; shadow observes without execution, on permits the seat loop to act. */
+  mode: SeatLoopMode;
+}
+
 export interface UserConfig {
-  /** Steward loop: observe-only until an independently approved act implementation exists. */
-  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string> } };
+  /** Steward and seat loops are parsed independently. An absent seat remains off. */
+  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number }; seat?: SeatLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
   harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string };
@@ -3430,7 +3459,7 @@ export interface UserConfig {
   /** 승인 뒤 조율 채널 페이즈 배달(기본 OFF) 및 트랙 에이전트(기본 OFF, 최대 동시 2개). */
   autopilot?: {
     trackCourier?: { enabled?: boolean; channelPr?: number; handoffMinutes?: number };
-    trackAgent?: { enabled: boolean; maxConcurrent: number };
+    trackAgent?: { enabled: boolean; maxConcurrent: number; shadow: boolean; shadowMaxDecisionsPerDay: number };
   };
   /** 하니스 예산 게이트 설정. 판정은 P15 — 여기선 칸만 싣는다. 파서는 항상 기본을 채운다.
    *  선택이다 — 기존 UserConfig 리터럴이 이 칸 없이 컴파일되게 한다. 해석기는 없으면 기본을 쓴다.
@@ -3618,6 +3647,10 @@ function parseAutopilotConfig(raw: unknown): UserConfig['autopilot'] | undefined
       enabled: v.enabled === true,
       maxConcurrent: typeof v.maxConcurrent === 'number' && Number.isSafeInteger(v.maxConcurrent) && v.maxConcurrent > 0
         ? Math.min(v.maxConcurrent, 2) : 2,
+      shadow: v.shadow === true,
+      shadowMaxDecisionsPerDay: typeof v.shadowMaxDecisionsPerDay === 'number'
+        && Number.isSafeInteger(v.shadowMaxDecisionsPerDay) && v.shadowMaxDecisionsPerDay >= 0
+        ? v.shadowMaxDecisionsPerDay : 20,
     };
   }
   return Object.keys(parsed).length > 0 ? parsed : undefined;
@@ -3649,6 +3682,7 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
 
 function defaultConfig(): UserConfig {
   return {
+    loops: { seat: { mode: 'off' } },
     skillRouter: { ...SR_DEFAULTS },
     llm: { ...LLM_DEFAULTS },
     skills: skillsDefaults(),
@@ -3661,6 +3695,7 @@ function defaultConfig(): UserConfig {
     logs: { retention: { ...LOGS_DEFAULTS.retention } },
     shell: { ...SHELL_DEFAULTS },
     chat: {
+      fastPath: CHAT_DEFAULTS.fastPath,
       conciseness: { ...CHAT_CONCISENESS_DEFAULTS },
       toolOutput: { ...CHAT_DEFAULTS.toolOutput },
       autoCompact: { ...CHAT_DEFAULTS.autoCompact },
@@ -4126,6 +4161,14 @@ function parseStewardTracks(input: unknown): Record<string, string> | undefined 
   return Object.keys(out).length ? out : undefined;
 }
 
+function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return { mode: 'off' };
+  const seat = (input as Record<string, unknown>).seat;
+  if (!seat || typeof seat !== 'object' || Array.isArray(seat)) return { mode: 'off' };
+  const mode = (seat as Record<string, unknown>).mode;
+  return { mode: mode === 'on' || mode === 'shadow' ? mode : 'off' };
+}
+
 function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
   const value = (input as Record<string, unknown>).steward;
@@ -4144,6 +4187,7 @@ function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
     ...(typeof s.linearTeam === 'string' && s.linearTeam.trim() ? { linearTeam: s.linearTeam.trim() } : {}),
     ...(Object.keys(roles).length ? { roles } : {}),
     ...(typeof s.budget === 'number' && Number.isFinite(s.budget) && s.budget >= 0 ? { budget: s.budget } : {}),
+    ...(typeof s.alertAfterFailures === 'number' && Number.isSafeInteger(s.alertAfterFailures) && s.alertAfterFailures > 0 ? { alertAfterFailures: s.alertAfterFailures } : {}),
     ...(parseStewardTracks(s.tracks) ? { tracks: parseStewardTracks(s.tracks)! } : {}),
   } };
 }
@@ -4374,6 +4418,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     skills: {
       activeSet: normalizeSkillSet(sk.activeSet),
       dirs: strArray(sk.dirs, skillsDefaults().dirs),
+      includeSharedAgentSkills: sk.includeSharedAgentSkills !== false,
       allow: strArray(sk.allow, []),
       deny: strArray(sk.deny, []),
       urlRouting: parseUrlRouting(sk.urlRouting),
@@ -4409,6 +4454,9 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       homeChannel: typeof dc.homeChannel === 'string' ? dc.homeChannel
         : typeof dc.homeChannel === 'number' ? String(dc.homeChannel) : undefined,
       testChannel: normalizeDiscordTestChannel((dc as Record<string, unknown>).testChannel),
+      ...(Array.isArray(dc.chatChannels)
+        ? { chatChannels: (dc.chatChannels as unknown[]).map(v => String(v).trim()).filter(Boolean) }
+        : {}),
       // Sprint 21 wiring sub-block (2026-05-01)
     },
     finance: {
@@ -4452,6 +4500,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       relaxedGates: fin.relaxedGates === true,
     },
     onboarding: {
+      ...(typeof ob2.webFirst === 'boolean' ? { webFirst: ob2.webFirst } : {}),
       completed: ob2.completed === true,
       completedAt: str(ob2.completedAt),
       version: typeof ob2.version === 'number' ? ob2.version : 0,
@@ -4498,6 +4547,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       allowDashboardOptionalTools: sh.allowDashboardOptionalTools !== false,
     },
     chat: {
+      fastPath: chat.fastPath === false || chat.fastPath === 'false' ? false : CHAT_DEFAULTS.fastPath,
       conciseness: {
         enabled: chatConciseness.enabled === false ? false : CHAT_CONCISENESS_DEFAULTS.enabled,
         finalMessageMaxLines: clampNum(
@@ -4876,7 +4926,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     goals: parseGoalsConfig(rawObj.goals),
     registry: parseRegistryConfig(rawObj.registry),
     tools: parseToolsConfig(rawObj.tools),
-    ...(stewardLoops ? { loops: stewardLoops } : {}),
+    loops: { ...(stewardLoops ?? {}), seat: parseSeatLoopsConfig(rawObj.loops) },
     // M1-1: sparse — undefined when the user hasn't set anything, so
     // resolvers fall through to zero-config defaults.
     ...spreadIfDefined('modelTier', parseModelTierConfig(rawObj.modelTier)),
@@ -5450,6 +5500,11 @@ export function saveUserConfig(
   const rawHarness = rawRest.harness && typeof rawRest.harness === 'object' && !Array.isArray(rawRest.harness)
     ? rawRest.harness as Record<string, unknown> : {};
   delete rawRest.harness;
+  const rawAutopilot = rawRest.autopilot && typeof rawRest.autopilot === 'object' && !Array.isArray(rawRest.autopilot)
+    ? rawRest.autopilot as Record<string, unknown> : {};
+  const rawLoops = rawRest.loops && typeof rawRest.loops === 'object' && !Array.isArray(rawRest.loops)
+    ? rawRest.loops as Record<string, unknown> : {};
+  if (cfg.loops) delete rawRest.loops;
   if (cfg.pod?.hostMirror) {
     const rawPod = rawRest.pod && typeof rawRest.pod === 'object' && !Array.isArray(rawRest.pod)
       ? rawRest.pod as Record<string, unknown> : {};
@@ -5466,6 +5521,24 @@ export function saveUserConfig(
       podPool: cfg.harness?.podPool,
     }),
     ...rawRest,
+    ...(cfg.loops ? { loops: {
+      ...rawLoops,
+      ...(cfg.loops.seat ? { seat: { mode: cfg.loops.seat.mode } } : {}),
+    } } : {}),
+    ...(cfg.autopilot ? { autopilot: {
+      ...rawAutopilot,
+      ...cfg.autopilot,
+      ...(cfg.autopilot.trackAgent ? { trackAgent: {
+        ...(rawAutopilot.trackAgent && typeof rawAutopilot.trackAgent === 'object' && !Array.isArray(rawAutopilot.trackAgent)
+          ? rawAutopilot.trackAgent as Record<string, unknown> : {}),
+        ...cfg.autopilot.trackAgent,
+      } } : {}),
+      ...(cfg.autopilot.trackCourier ? { trackCourier: {
+        ...(rawAutopilot.trackCourier && typeof rawAutopilot.trackCourier === 'object' && !Array.isArray(rawAutopilot.trackCourier)
+          ? rawAutopilot.trackCourier as Record<string, unknown> : {}),
+        ...cfg.autopilot.trackCourier,
+      } } : {}),
+    } } : {}),
     skillRouter: cfg.skillRouter,
     llm: stripUndef({
       provider: cfg.llm.provider,
@@ -5575,6 +5648,7 @@ export function saveUserConfig(
       botToken: cfg.discord.botToken,
       allowedUsers: [...cfg.discord.allowedUsers],
       homeChannel: cfg.discord.homeChannel,
+      chatChannels: cfg.discord.chatChannels ? [...cfg.discord.chatChannels] : undefined,
       testChannel: cfg.discord.testChannel
         ? stripUndef({
             channelId: cfg.discord.testChannel.channelId,
@@ -5601,6 +5675,7 @@ export function saveUserConfig(
       relaxedGates: cfg.finance.relaxedGates,
     }),
     onboarding: stripUndef({
+      webFirst: cfg.onboarding.webFirst,
       completed: cfg.onboarding.completed,
       completedAt: cfg.onboarding.completedAt,
       version: cfg.onboarding.version,
@@ -5609,6 +5684,7 @@ export function saveUserConfig(
     logs: cfg.logs,
     shell: cfg.shell,
     chat: stripUndef({
+      fastPath: cfg.chat.fastPath,
       conciseness: stripUndef({
         enabled: cfg.chat.conciseness.enabled,
         finalMessageMaxLines: cfg.chat.conciseness.finalMessageMaxLines,

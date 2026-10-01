@@ -29,7 +29,7 @@ type LoadState =
 // 2026-07-07 — SETUP_LINKS 데이터는 ./setup-links.ts 로 분리 (Next 15 가
 // page.tsx 의 비-Page export 를 거부: "not a valid Page export field").
 import { SETUP_LINKS, type SetupLinkCard } from './setup-links';
-import { SetupNextSteps } from './SetupNextSteps';
+import { SetupNextSteps, SetupRecommendations } from './SetupNextSteps';
 
 export default function SetupDonePage() {
   const client = useOptionalNexusClient();
@@ -59,6 +59,7 @@ export default function SetupDonePage() {
 
   return (
     <div className="flex flex-col gap-6">
+      <SetupRecommendations />
       <ActiveLlmCard load={load} />
 
       <section className="flex flex-col gap-3">

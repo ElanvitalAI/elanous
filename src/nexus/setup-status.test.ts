@@ -1,6 +1,13 @@
 import { describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
+import { buildUserConfig } from '../user-config.js';
+import { USER_CONFIG_VERSION } from './config/types.js';
+import { SKILLS_STEP_COMMAND, UNATTENDED_SETUP_COMMAND, unattendedSetupHint } from '../onboarding/entry-hints.js';
 import {
+  checkSetupStatus,
   readNexusSetupMode,
   setupBootMode,
   setupModeBootPlan,
@@ -11,6 +18,57 @@ import {
 function requiredItem(id: 'llm' | 'pwa-build', label: string, passed: boolean): SetupItem {
   return { id, label, passed, hint: '' };
 }
+
+test('empty setup status keeps the five checks and gives actionable onboarding hints', () => {
+  const cfg = buildUserConfig();
+  cfg.llm = { provider: 'local' };
+  cfg.skills = { ...cfg.skills, activeSet: 'custom', dirs: ['/not-an-existing-skill-dir'] };
+  const result = checkSetupStatus({
+    cfg,
+    nexusCfg: { version: USER_CONFIG_VERSION, global: {}, tabs: {} },
+    pwaBuilt: false,
+    exists: () => false,
+  });
+  expect(result.required.map(({ id, passed }) => ({ id, passed }))).toEqual([
+    { id: 'llm', passed: false }, { id: 'pwa-build', passed: false },
+  ]);
+  expect(result.recommended.map(({ id, passed }) => ({ id, passed }))).toEqual([
+    { id: 'channel-bot', passed: false }, { id: 'skill-dirs', passed: false },
+    { id: 'os-install', passed: false },
+  ]);
+  expect(result.ok).toBe(false);
+  for (const item of [result.required[0], result.recommended[0], result.recommended[1]]) {
+    expect(item!.hint).toContain(unattendedSetupHint());
+    expect(item!.hint).toContain(UNATTENDED_SETUP_COMMAND);
+    expect(item!.hint).not.toContain('elanous setup --non-interactive --config');
+  }
+  expect(result.recommended[1]!.hint).toContain(SKILLS_STEP_COMMAND);
+  expect(result.recommended[1]!.hint).toContain('create the missing skill directories');
+  expect(result.required[0]!.hint).toContain('elanous onboarding llm');
+  expect(result.required[1]!.hint).toBe('run `elanous nexus build`');
+});
+
+test('existing skill directory retains the passed status without a missing-dir hint', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'elanous-setup-skills-'));
+  try {
+    const cfg = buildUserConfig();
+    cfg.llm = { provider: 'local', baseUrl: 'http://localhost:11434/v1' };
+    cfg.skills = { ...cfg.skills, activeSet: 'custom', dirs: [dir] };
+    const result = checkSetupStatus({
+      cfg,
+      nexusCfg: { version: USER_CONFIG_VERSION, global: {}, tabs: {} },
+      pwaBuilt: true,
+      exists: (path) => path === dir,
+    });
+    expect(result.ok).toBe(true);
+    expect(result.recommended[1]).toMatchObject({
+      id: 'skill-dirs', passed: true, detail: '1 dir · 1 exist',
+      hint: '',
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 describe('setupBootMode', () => {
   test('required 전부 통과 → normal', () => {

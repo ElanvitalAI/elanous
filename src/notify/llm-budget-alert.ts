@@ -42,6 +42,8 @@ export interface LlmBudgetAlert {
 }
 
 const EXPIRY_WARN_DAYS = 7;
+/** 공개 알림에 표시할 수 있는 폴백 제공자명. 현재 폴백 체인의 외부 제공자는 grok 뿐이다. */
+const PUBLIC_FALLBACK_PROVIDERS = new Set(['grok']);
 /** 이 시각(서울) 뒤에야 «오늘 페이스가 느리다»를 말한다 — 아침에 0 인 건 정상이다. */
 const PACE_CHECK_HOUR = 18;
 
@@ -87,22 +89,26 @@ export function buildLlmBudgetAlert(now: LlmBudgetSnapshot, prevKey?: string): L
       `구독 계정 ${accounts}개 한도 · 크레딧·대체 모델도 못 씁니다.`,
       '할 일: 크레딧 사용을 허락하거나 대체 모델 키를 확인해 주세요.',
     ];
-  } else if (now.selected.reason === 'fallback' && now.fallback) {
-    const soonest = now.accounts.map((a) => a.resetInHours).filter((h): h is number => typeof h === 'number').sort((a, b) => a - b)[0];
-    key = `fallback:${now.fallback.provider}`;
+  } else if (now.selected.reason === 'fallback') {
+    const soonest = now.accounts.map((a) => a.resetInHours)
+      .filter((h): h is number => typeof h === 'number' && Number.isFinite(h) && h > 0)
+      .sort((a, b) => a - b)[0];
+    const candidate = now.fallback?.provider?.trim();
+    const provider = candidate && PUBLIC_FALLBACK_PROVIDERS.has(candidate) ? candidate : undefined;
+    key = `fallback:${provider || 'unknown'}`;
     lines = [
-      `⚠️ codex 를 못 써서 ${now.fallback.provider} 로 일하고 있습니다${typeof now.fallback.remainingPct === 'number' ? `(남은 ${Math.round(now.fallback.remainingPct)}%)` : ''}.`,
+      `⚠️ codex 를 못 써서 ${provider ? `${provider} 로` : '대체 모델로'} 일하고 있습니다${typeof now.fallback?.remainingPct === 'number' ? `(남은 ${Math.round(now.fallback.remainingPct)}%)` : ''}.`,
       soonest !== undefined ? `codex 는 ${Math.ceil(soonest)}시간 뒤 돌아옵니다.` : 'codex 가 언제 돌아오는지 아직 모릅니다.',
       '할 일: 없음 — 참고만 하세요.',
     ];
-  } else if (expiryDays !== undefined && expiryDays <= EXPIRY_WARN_DAYS && now.credits.total > 0) {
-    key = `expiry:${Math.max(0, expiryDays)}`;
+  } else if (expiryDays !== undefined && expiryDays >= 0 && expiryDays <= EXPIRY_WARN_DAYS && now.credits.total > 0) {
+    key = `expiry:${expiryDays}`;
     lines = [
-      `💳 크레딧 ${n(now.credits.total)} 이 ${expiryDays <= 0 ? '오늘' : `${expiryDays}일 뒤`} 사라집니다.`,
+      `💳 크레딧 ${n(now.credits.total)} 이 ${expiryDays === 0 ? '오늘' : `${expiryDays}일 뒤`} 사라집니다.`,
       creditsLine(now),
-      '할 일: 무거운 작업을 지금 맡기면 크레딧으로 돕니다.',
+      '할 일: 만료 전에 크레딧 사용을 확인해 주세요.',
     ];
-  } else if (now.credits.useFirst && now.credits.total > 0 && hour >= PACE_CHECK_HOUR && now.credits.usedToday < now.credits.paceTarget * 0.5) {
+  } else if (now.credits.useFirst && now.credits.total > 0 && (expiryDays === undefined || expiryDays >= 0) && hour >= PACE_CHECK_HOUR && now.credits.usedToday < now.credits.paceTarget * 0.5) {
     // 하루 한 번만 — 날짜를 열쇠에 넣는다.
     key = `pace-behind:${date}`;
     lines = [
@@ -115,5 +121,5 @@ export function buildLlmBudgetAlert(now: LlmBudgetSnapshot, prevKey?: string): L
   }
 
   const send = key !== 'ok' && key !== prevKey;
-  return { send, key, text: lines.join('\n') };
+  return { send, key, text: send ? lines.join('\n') : '' };
 }

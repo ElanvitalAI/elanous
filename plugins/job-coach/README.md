@@ -46,7 +46,7 @@ elanous graph run /absolute/path/to/installed/job-coach/graphs/report-enterprise
 
 ## 실행
 
-공공데이터포털 [한국산업인력공단 NCS 기준정보 조회](https://www.data.go.kr/data/15128213/openapi.do) 활용신청 후 키를 **환경변수 `NCS_SERVICE_KEY`** 로 설정한다. 설치 시 `credentials` 이벤트의 `ncs.serviceKey` 에 입력하는 경로는 플러그인 설치기가 담당한다. 저장소에는 키를 넣지 않는다. `.mcp.json`은 MCP stdio 서버를 번들로 제공한다. 레시피는 러너가 제공하는 `ELANOUS_GRAPH_DIR`을 기준으로 번들 스크립트를 찾고, MCP의 `${CODEX_PLUGIN_ROOT}`는 Codex가 설치한 플러그인의 절대 경로로 치환한다. 런타임에는 `bun`과 PATH의 `elanous research --json`가 필요하다. 중첩 elanous 호출에는 `--test`를 붙여 격리한다. 인터뷰 파일은 `## 희망 직무`, `## 경험`, `## 보유 역량`을 포함해야 한다.
+공공데이터포털 [한국산업인력공단 NCS 기준정보 조회](https://www.data.go.kr/data/15128213/openapi.do) 활용신청 후 키를 **환경변수 `NCS_SERVICE_KEY`** 로 설정한다. 설치 시 `credentials` 이벤트의 `ncs.serviceKey` 에 입력하는 경로는 플러그인 설치기가 담당한다. 저장소에는 키를 넣지 않는다. `.mcp.json`은 MCP stdio 서버를 번들로 제공한다. 레시피는 러너가 제공하는 `ELANOUS_GRAPH_DIR`을 기준으로 번들 스크립트를 찾고, MCP의 `${CODEX_PLUGIN_ROOT}`는 Codex가 설치한 플러그인의 절대 경로로 치환한다. 런타임에는 `bun`과 PATH의 `elanous research --json`가 필요하다. 중첩 elanous 호출은 그래프를 돌린 우주를 그대로 따른다(`--test` 를 붙이지 않는다 — 저장소 밖에서는 `--test` 가 격리 루트를 못 정해 멈춘다). 인터뷰 파일은 `## 희망 직무`, `## 경험`, `## 보유 역량`을 포함해야 한다.
 
 ```sh
 elanous graph run /absolute/path/to/installed/job-coach/graphs/report.yaml --input '{"interview":"/absolute/path/to/installed/job-coach/examples/interview-sample.md"}' --json

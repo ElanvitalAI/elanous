@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { createGraphApprovalsApi, graphApprovalErrorText, type GraphApproval, type GraphApprovalDecision } from '@/lib/graph-approvals-api';
 import { createLatestRequestGate, graphApprovalCard } from './graph-approval-card';
+import { FeedPreviewCard } from './FeedPreviewCard';
 
 export function GraphApprovals() {
   const { client } = useDaemon();
@@ -40,11 +41,19 @@ export function GraphApprovals() {
     finally { setBusy(false); }
   }
 
+  const feedItems = items.filter((item): item is GraphApproval & { feed: NonNullable<GraphApproval['feed']> } => !!item.feed);
+  const others = items.filter((item) => !item.feed);
   if (!items.length && !error) return null;
-  return <section aria-label="실행 승인" className="mx-auto max-w-3xl space-y-4 px-4 pt-6 text-foreground sm:px-8">
+  return <>
+  {feedItems.length > 0 && <section aria-label="게시 대기" className="mx-auto max-w-3xl space-y-4 px-4 pt-6 text-foreground sm:px-8">
+    <h2 className="text-xl font-semibold">게시 대기</h2>
+    <p className="text-sm text-muted-foreground">고쳐서 저장해도 대기열에 남습니다. «최종 게시»를 눌러야만 올라갑니다.</p>
+    {feedItems.map((item) => <FeedPreviewCard key={`${item.graphId}/${item.runId}`} item={item} api={api} onDecided={() => { gate.begin(); void refresh(); }} />)}
+  </section>}
+  {(others.length > 0 || error) && <section aria-label="실행 승인" className="mx-auto max-w-3xl space-y-4 px-4 pt-6 text-foreground sm:px-8">
     <h2 className="text-xl font-semibold">실행 승인</h2>
     {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
-    {items.map((item) => {
+    {others.map((item) => {
       const card = graphApprovalCard(item);
       return <article key={`${item.graphId}/${item.runId}`} className="rounded-xl border border-border bg-card p-5 shadow-sm">
         <h3 className="font-semibold">{card.title}</h3>
@@ -57,5 +66,6 @@ export function GraphApprovals() {
         </div>
       </article>;
     })}
-  </section>;
+  </section>}
+  </>;
 }

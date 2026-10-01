@@ -112,6 +112,87 @@ describe('pod run-ledger collection', () => {
 // 🅣 요청(2026-09-26): 런 «도중» 원장 증분 회수 — 호스트 슈퍼바이저가 Pod 걸음을 실시간으로 본다.
 describe('pod ledger live follower', () => {
   const noLog = () => {};
+
+  test('emits each valid remote ledger event while appending all complete bytes unchanged', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-live-events-'));
+    try {
+      const lines = [
+        '{"event":"gate-finished","data":{"stage":"gate","outcome":"pass"}}',
+        '{"event":"review-round","data":{"round":2,"mustFix":3,"files":["private.ts"],"reason":"token=sk-superSecret123456789"}}',
+        'broken json',
+        '{"event":"repair-finished","data":{"reason":"fixed"}}',
+      ];
+      const bytes = `${lines.join('\n')}\n`;
+      const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+      const follower = createPodLedgerFollower({ runId, dir,
+        log: (category, event, data) => events.push({ category, event, data }),
+        exec: () => ({ status: 0, stdout: `${bytes}\nELANOUS_ACTIVITY 0\n`, stderr: '' }),
+      });
+      follower.poll();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(bytes);
+      expect(events[0]).toEqual({ category: 'self-implement.pod', event: 'ledger-live-appended', data: {
+        runId, lines: 4, bytes: Buffer.byteLength(bytes), offset: Buffer.byteLength(bytes),
+      } });
+      expect(events.filter(({ category }) => category === 'self-implement.pod.ledger')).toEqual([
+        { category: 'self-implement.pod.ledger', event: 'gate-finished', data: { runId, stage: 'gate', outcome: 'pass' } },
+        { category: 'self-implement.pod.ledger', event: 'review-round', data: { runId, round: 2, mustFix: 3, filesCount: 1 } },
+        { category: 'self-implement.pod.ledger', event: 'repair-finished', data: { runId } },
+      ]);
+      expect(events).toHaveLength(4);
+      expect(JSON.stringify(events)).not.toContain('sk-superSecret123456789');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  test('secret reused in an event name never leaks through later stall reporting', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-live-unsafe-event-'));
+    try {
+      let minute = 0;
+      const bytes = '{"event":"review-opaque123","data":{"nested":{"token":"opaque123"}},"round":2}\n';
+      const events: Array<{ category: string; event: string; data: Record<string, unknown> }> = [];
+      const messages: string[] = [];
+      const f = createPodLedgerFollower({ runId, dir, now: () => minute * 60_000, stallMinutes: 5,
+        log: (category, event, data) => events.push({ category, event, data }),
+        onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: minute === 0 ? `${bytes}\nELANOUS_ACTIVITY 0\n` : '\nELANOUS_ACTIVITY 0\n', stderr: '' }),
+      });
+      f.poll();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe(bytes);
+      expect(events).toEqual([{ category: 'self-implement.pod', event: 'ledger-live-appended', data: {
+        runId, lines: 1, bytes: Buffer.byteLength(bytes), offset: Buffer.byteLength(bytes),
+      } }]);
+      minute = 5;
+      f.poll();
+      expect(events.at(-1)).toEqual({ category: 'self-implement.pod', event: 'stalled', data: {
+        runId, lastProgressEvent: '[redacted]', idleMinutes: 5,
+      } });
+      expect(messages).toEqual(['[pod] 진행 없음 5분 — 원장·작업 트리 모두 조용함 · 마지막 진행 [redacted]']);
+      expect(JSON.stringify(events)).not.toContain('opaque123');
+      expect(f.owned).toBe(true);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('failure to mirror a ledger event does not change append or progress accounting', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ledger-live-log-error-'));
+    try {
+      let minute = 0;
+      const messages: string[] = [];
+      const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+      const f = createPodLedgerFollower({ runId, dir, now: () => minute * 60_000, stallMinutes: 5,
+        log: (category, event, data) => {
+          if (category === 'self-implement.pod.ledger') throw new Error('host log unavailable');
+          events.push({ event, data });
+        },
+        onStall: (message) => messages.push(message),
+        exec: () => ({ status: 0, stdout: minute === 0 ? '{"event":"reviewed","data":{"round":1}}\n\nELANOUS_ACTIVITY 0\n' : '\nELANOUS_ACTIVITY 0\n', stderr: '' }),
+      });
+      f.poll();
+      expect(readFileSync(runLedgerPath(runId, dir), 'utf8')).toBe('{"event":"reviewed","data":{"round":1}}\n');
+      minute = 5;
+      f.poll();
+      expect(events.filter(({ event }) => event === 'stalled')).toEqual([{ event: 'stalled', data: { runId, lastProgressEvent: 'reviewed', idleMinutes: 5 } }]);
+      expect(messages).toHaveLength(1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('appends only complete lines, remembers the byte offset, and asks only for new bytes', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ledger-live-'));
     const podFile = ['{"a":1}\n{"b":', '2}\n{"c":3}\n'];

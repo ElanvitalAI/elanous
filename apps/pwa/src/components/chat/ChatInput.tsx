@@ -23,6 +23,8 @@ import {
 import { ElanousProviderChip } from '@/components/chat/ElanousProviderChip';
 import { useMissionRouter } from '@/lib/use-mission-router';
 import { DEFAULT_CHAT_ROUTING, getChatRouting, subscribeChatRouting } from '@/lib/chat-routing-storage';
+import { SeatRequestError, type SeatRequestReceipt, type SeatSummary } from '@/lib/daemon-client';
+import { SeatPicker } from './SeatPicker';
 
 const INPUT_PERSIST_DEBOUNCE_MS = 300;
 const EMPTY_ATTACHMENTS: AttachmentMeta[] = [];
@@ -186,7 +188,22 @@ export function ChatInput({
   onListSkills,
   prefill,
 }: Props) {
-  const { config } = useDaemon();
+  const { client, config } = useDaemon();
+  const [seats, setSeats] = useState<SeatSummary[]>([]);
+  const [selectedSeat, setSelectedSeat] = useState<string | null>(null);
+  const [seatReceipts, setSeatReceipts] = useState<SeatRequestReceipt[]>([]);
+  const [seatError, setSeatError] = useState('');
+  const [seatPending, setSeatPending] = useState(false);
+  const retryRef = useRef<{ seat?: string; text: string; key: string } | null>(null);
+  useEffect(() => {
+    let active = true;
+    // 자리 문을 모르는 클라이언트(옛 판·다른 화면의 가짜 클라이언트)면 칩 없이 채팅만 — 던지면 입력칸 전체가 멈춘다.
+    if (typeof client?.listSeatRequests !== 'function') return () => { active = false; };
+    client.listSeatRequests().then((response) => {
+      if (active) setSeats(response.seats);
+    }).catch(() => { /* chat stays available when the seat endpoint is unavailable */ });
+    return () => { active = false; };
+  }, [client]);
   const persistKey = snapshotKey('chatInput', tabId);
   const [value, setValue] = useState<string>(() => {
     const stash = loadSnapshot<string>(persistKey);
@@ -348,12 +365,53 @@ export function ChatInput({
     };
   }, [value, persistKey]);
 
+  const sendSeatRequest = async (request: { seat?: string; text: string; key: string }): Promise<void> => {
+    setSeatPending(true);
+    setSeatError('');
+    try {
+      const receipt = await client.submitSeatRequest({ seat: request.seat, text: request.text }, request.key);
+      setSeatReceipts((previous) => [...previous, receipt]);
+      retryRef.current = null;
+      setValue('');
+      clearSnapshot(persistKey);
+    } catch (error) {
+      retryRef.current = request;
+      if (error instanceof SeatRequestError && error.code === 'unknown-seat') {
+        setSeats(error.seats);
+        // 고른 자리가 서버 목록에서 사라졌으면 선택을 풀어 일반 채팅으로 돌아간다 — 숨은 선택이 남으면
+        // 해제할 칩도 없이 다음 글까지 없는 자리로 간다(리뷰 3라운드 must-fix).
+        if (selectedSeat && !error.seats.some((seat) => seat.id === selectedSeat)) {
+          setSelectedSeat(null);
+          retryRef.current = null;
+        }
+        setSeatError(`그 자리를 찾지 못했습니다 — ${error.seats.map((seat) => seat.title).join(', ')}`);
+      } else {
+        setSeatError('접수하지 못했습니다 — 잠시 뒤 다시');
+      }
+    } finally {
+      setSeatPending(false);
+    }
+  };
   const submit = (): void => submitText(value);
   const submitText = (text: string): void => {
     const trimmed = text.trim();
+    const addressed = /^@\S+\s+[\s\S]*\S$/.test(text.trimEnd());
+    if (disabled || seatPending) return;
+    if ((addressed || selectedSeat) && attachments.length) {
+      setSeatError('자리 요청에는 첨부파일을 보낼 수 없습니다');
+      return;
+    }
+    if ((addressed || selectedSeat) && trimmed) {
+      const request = addressed
+        ? { text: trimmed, key: crypto.randomUUID() }
+        : { seat: selectedSeat!, text: trimmed, key: crypto.randomUUID() };
+      const retry = retryRef.current;
+      const same = retry && retry.seat === request.seat && retry.text === request.text;
+      void sendSeatRequest(same ? retry : request);
+      return;
+    }
     // Allow attachment-only sends (no body text) so the user can ship a
     // file with no caption — LLM still gets the path lines prepended.
-    if (disabled) return;
     if (!trimmed && attachments.length === 0) return;
     // PWA Phase 1·E — record to promptHistory before clearing the buffer.
     // text-only or attachment-only turn 의 text 가 empty 일 수 있으니
@@ -621,6 +679,11 @@ export function ChatInput({
 
   return (
     <div className="border-t border-border bg-background p-3">
+      {seatReceipts.map((receipt) => <div key={receipt.receiptId} role="status" className="mb-2 rounded-md border border-border bg-card px-3 py-2 text-sm">
+        📨 {seats.find((seat) => seat.id === receipt.seat)?.title ?? receipt.seat} 접수 {receipt.receiptId} · 방금
+      </div>)}
+      {seatError && <p role="alert" className="mb-2 text-sm text-destructive">{seatError}</p>}
+      <SeatPicker seats={seats} selected={selectedSeat} onSelect={(seat) => { setSelectedSeat(seat); setSeatError(''); }} disabled={disabled || seatPending} />
       {/* PWA Phase 4·F — reverse history search overlay (priority 최상위). */}
       {reverseSearchActive && (
         <div className="mb-2 overflow-hidden rounded-md border border-border bg-card shadow-md">
@@ -866,9 +929,9 @@ export function ChatInput({
           value={value}
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={onKey}
-          placeholder="message · `:help` for commands · Shift+Enter for newline"
+          placeholder="메시지 · :help 명령 목록"
           rows={2}
-          disabled={disabled}
+          disabled={disabled || seatPending}
           className={cn(
             'min-h-[44px] max-h-[180px] min-w-0 flex-1 resize-y rounded-md border border-input bg-background px-3 py-2 text-sm shadow-xs focus:outline-none focus:ring-2 focus:ring-ring',
             isMeta && 'border-accent text-accent-foreground bg-accent/10',
@@ -908,7 +971,7 @@ export function ChatInput({
             </span>
           </button>
         )}
-        <Button onClick={submit} disabled={disabled || (!value.trim() && attachments.length === 0)} size="sm">
+        <Button onClick={submit} disabled={disabled || seatPending || (!value.trim() && attachments.length === 0)} size="sm">
           <Send className="h-4 w-4" />
         </Button>
       </div>

@@ -12,9 +12,13 @@ import { consumeCodexResetCredits, listCodexResetCredits } from '../budget/codex
 import { rollupRunUsage, type RunUsageInput } from '../budget/run-usage-rollup.js';
 import { LogStore, logsDbPath, type LogQuery, type LogStoreRow } from '../mss/logging/log-store.js';
 import { LOGS_SINCE_OPTION, parseSince } from './logs-cli.js';
+import { formatCodexCreditPlan, type CodexCreditPlan } from '../budget/codex-credit-plan.js';
+import { codexCreditPlanFromDisk } from './codex-credit-plan-view.js';
 
 export interface UsageCliDeps {
   readonly collect?: typeof collectUnifiedUsage;
+  /** Codex credit plan (disk only). Returns null when it cannot be read. */
+  readonly creditPlan?: () => CodexCreditPlan | null;
   readonly out?: { log: (s: string) => void };
   /** Read-only LogStore query seam; returns stored llm-usage rows, newest first. */
   readonly readRunLogs?: (query: LogQuery) => LogStoreRow[];
@@ -61,6 +65,10 @@ function usageData(row: LogStoreRow): RunUsageInput | null {
   } catch { return null; }
 }
 
+function defaultCreditPlan(): CodexCreditPlan | null {
+  try { return codexCreditPlanFromDisk(); } catch { return null; }
+}
+
 export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}): void {
   const out = deps.out ?? { log: (s: string) => console.log(s) };
   const collect = deps.collect ?? collectUnifiedUsage;
@@ -71,11 +79,13 @@ export function registerUsageCommand(program: Command, deps: UsageCliDeps = {}):
     .option('--json', 'JSON 출력 — 자격 값은 없다')
     .action(async (opts: { json?: boolean }) => {
       const report = await collect();
+      const creditPlan = (deps.creditPlan ?? defaultCreditPlan)();
       if (opts.json) {
-        out.log(JSON.stringify(report, null, 2));
+        out.log(JSON.stringify({ ...report, codexCreditPlan: creditPlan }, null, 2));
         return;
       }
       out.log(formatUnifiedUsage(report));
+      if (creditPlan) out.log(['', 'codex 크레딧', ...formatCodexCreditPlan(creditPlan).map((l) => `  ${l}`)].join('\n'));
     });
 
   usage

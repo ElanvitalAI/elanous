@@ -43,7 +43,8 @@ const tab = 'button[aria-label^="switch to "]';
 const terminal = '.xterm';
 const connected = '[aria-live="polite"]';
 // ChatInput 의 입력창(`apps/pwa/src/components/chat/ChatInput.tsx` placeholder) — testid 가 없어 placeholder 로 고른다.
-const chatInput = 'textarea[placeholder^="message"]';
+// Placeholder text is user copy (10-01 #22558 localized it and silently broke C1·C2a·C2b) — match both locales.
+const chatInput = 'textarea[placeholder^="message"], textarea[placeholder^="메시지"]';
 const intakeField = '[data-testid="intake-front-door-field"]';
 const terminalIdentity = `(() => { const sessionId = localStorage.getItem('elanous.daemon.sessionId'); const terminalId = Array.from(document.querySelectorAll('button[aria-label^="switch to "]')).find(node => node.title?.includes('지금 보는 터미널'))?.getAttribute('aria-label')?.slice('switch to '.length); return sessionId && terminalId ? { sessionId, terminalId } : null; })()`;
 const identity = (value: unknown): { sessionId: string; terminalId: string } | null => {

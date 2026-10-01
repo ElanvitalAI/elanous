@@ -375,6 +375,8 @@ describe('dispatchRunDevHarness — execution-loop observation', () => {
       emitDecision: () => true,
       log: () => {},
     };
+    // Keep the gate's own deadline longer than the frontdoor deadline: this case checks frontdoor abort, not gate timeout.
+    d.dispatchTask = (input, dispatchDeps) => dispatchTask(input, { ...dispatchDeps, timeoutMs: 5_000 });
     d.runHarness = async () => { order.push('harness'); return okResult; };
     try {
       const result = await dispatchRunDevHarness({ objective: 'Create widget' }, undefined, d);

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "doc-draft",
+  "version": "0.1.1",
+  "description": "Drafts one document from a request — executive one-pager, promo or event post, memo. Drafts only; never published.",
+  "extensions": {
+    "ai.elanous": {
+      "graphs": [
+        "./graphs/doc-draft.yaml"
+      ],
+      "capabilities": [
+        "fs:workdir",
+        "proc:bun",
+        "proc:elanous"
+      ],
+      "connectors": [],
+      "pricing": {
+        "model": "free"
+      },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

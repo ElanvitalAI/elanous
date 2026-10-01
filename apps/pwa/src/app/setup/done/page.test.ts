@@ -25,13 +25,22 @@ describe('SetupDonePage — Phase 2 mount surface', () => {
     const { act, create } = await import('react-test-renderer');
     const { NexusProvider } = await import('@/nexus/hooks/use-nexus-context');
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-    const client = { getLlmProviders: async () => ({ activeProvider: 'test' }) } as Parameters<typeof NexusProvider>[0]['client'];
+    const client = {
+      getLlmProviders: async () => ({ activeProvider: 'test' }),
+      getChatFastPath: async () => ({ enabled: true }),
+    } as Parameters<typeof NexusProvider>[0]['client'];
     let tree!: ReturnType<typeof create>;
     await act(async () => {
       tree = create(createElement(NexusProvider, { client, children: createElement(SetupDonePage) }));
     });
     const html = JSON.stringify(tree.toJSON());
     expect(html).toContain('곧장 chat 으로');
+    expect(html).toContain('elanous doctor --fix --yes');
+    expect(html).toContain('chat.fastPath=true');
+    expect(html).toContain('elanous config set chat.fastPath false');
+    expect(html).not.toContain('smart');
+    expect(html.indexOf('고칠 것 고치기')).toBeLessThan(html.indexOf('짧은 물음은 빠르게'));
+    expect(html.indexOf('짧은 물음은 빠르게')).toBeLessThan(html.indexOf('현재 LLM provider'));
     expect(html).toContain('다음 셋업(선택)');
     expect(html).toContain('필요하면 더 셋업하기');
     expect(tree.root.findByProps({ 'data-testid': 'setup-done-link-channels' }).props.href).toBe('/settings#channels');

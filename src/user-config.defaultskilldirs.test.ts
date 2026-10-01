@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { accessSync, chmodSync, constants as fsConstants, mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants as fsConstants, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -13,11 +13,16 @@ import {
   __resetClaudePackageSkillDirsCacheForTests,
   buildUserConfig,
   bundledSkillsDir,
-  defaultSkillDirs,
+  defaultSkillDirs as realDefaultSkillDirs,
   resetUserConfig,
   skillSetDir,
   type UserConfig,
 } from './user-config.js';
+
+// The shared ~/.agents/skills root exists on many real machines (codex·openclaw·hermes); these tests pin the
+// list without it unless a test passes its own `sharedAgentHome`, so they read the same on every host.
+const EMPTY_SHARED_HOME = mkdtempSync(join(tmpdir(), 'no-shared-agent-skills-'));
+const defaultSkillDirs: typeof realDefaultSkillDirs = (cfg, opts) => realDefaultSkillDirs(cfg, { sharedAgentHome: EMPTY_SHARED_HOME, ...opts });
 
 // defaultSkillDirs 는 cfg.skills.{activeSet,dirs,includeClaudePackageSkills} 만 읽으므로 부분 config 로 검증(나머지 필드 무관).
 function cfgWith(skills: Partial<UserConfig['skills']>): UserConfig {
@@ -82,6 +87,50 @@ describe('defaultSkillDirs — G9 P5a user-config 존중(skills.activeSet/dirs)'
 
   test('custom + dirs 비면 → ~/.claude/skills fallback 뒤 bundled skills/', () => {
     expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: [] }))).toEqual([skillSetDir('claudecode')!, bundled]);
+  });
+});
+
+describe('defaultSkillDirs — shared agent skills', () => {
+  test('missing shared root preserves preset/custom and bundled directory order', () => {
+    withTempRoot((home) => {
+      const opts = { sharedAgentHome: home, bundledSkillsRoot: home };
+      expect(defaultSkillDirs(cfgWith({ activeSet: 'codex' }), opts)).toEqual([skillSetDir('codex')!]);
+      expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: ['/a', '/b'] }), opts)).toEqual(['/a', '/b']);
+    });
+  });
+
+  test('existing shared root follows custom dirs and precedes package and bundled skills', () => {
+    withTempRoot((home) => {
+      const shared = join(home, '.agents', 'skills');
+      const pkg = join(home, 'pkg');
+      mkdirSync(shared, { recursive: true });
+      mkdirSync(join(pkg, 'skills'), { recursive: true });
+      mkdirSync(bundledSkillsDir(home));
+      writeLedger(home, { version: 2, plugins: {
+        'alpha@market': [{ scope: 'user', installPath: pkg, version: '1' }],
+      } }, emptyMarketplaces());
+      const opts = { sharedAgentHome: home, pluginsRoot: home, bundledSkillsRoot: home };
+      expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: ['/first'], includeClaudePackageSkills: true }), opts))
+        .toEqual(['/first', shared, join(pkg, 'skills'), bundledSkillsDir(home)]);
+      expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: [shared] }), opts)).toEqual([shared, bundledSkillsDir(home)]);
+      expect(defaultSkillDirs(cfgWith({ activeSet: 'custom', dirs: ['/first'], includeSharedAgentSkills: false }), opts))
+        .toEqual(['/first', bundledSkillsDir(home)]);
+      const before = readdirSync(shared);
+      defaultSkillDirs(cfgWith({}), opts);
+      expect(readdirSync(shared)).toEqual(before);
+    });
+  });
+
+  test('config parsing retains explicit false through config load; omission defaults true', () => {
+    withTempRoot((root) => {
+      const path = join(root, 'config.json');
+      writeFileSync(path, JSON.stringify({ skills: { includeSharedAgentSkills: false } }));
+      expect(buildUserConfig(path).skills.includeSharedAgentSkills).toBe(false);
+      writeFileSync(path, JSON.stringify({ skills: {} }));
+      expect(buildUserConfig(path).skills.includeSharedAgentSkills).toBe(true);
+      writeFileSync(path, JSON.stringify({ skills: { includeSharedAgentSkills: true } }));
+      expect(buildUserConfig(path).skills.includeSharedAgentSkills).toBe(true);
+    });
   });
 });
 

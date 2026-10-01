@@ -1,0 +1,8 @@
+{
+  "kind": "exec-onepager",
+  "topic": "Example product launch readiness",
+  "context": "Example research found three customer questions still unanswered.",
+  "audience": "Example leadership team",
+  "language": "ko",
+  "outDir": "/tmp/example-doc-draft"
+}

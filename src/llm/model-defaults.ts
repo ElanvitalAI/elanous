@@ -20,7 +20,30 @@ import { getUserConfig, type LLMProviderName, type ReasoningLevel } from '../use
  *     openai-codex 눈금이고 openai 기본값을 덮어쓰지 않는다.
  *  ⛔ Do not import this file from user-config — that is the cycle. */
 function activeProviderForDefaults(provider?: LLMProviderName): LLMProviderName {
-  return provider ?? getUserConfig().llm.provider;
+  if (provider) return provider;
+  const configured = getUserConfig().llm.provider;
+  return configured === 'auto' ? decidedAutoProvider() : configured;
+}
+
+/** `auto` has no ladder of its own — the tier map answers it with Anthropic's model, so a grok-only
+ *  (or codex-only) user asked for a Claude model at every tier call site and hit «set ANTHROPIC_API_KEY».
+ *  Resolve `auto` the way the router does (decideProviderForConfig) and use that provider's ladder.
+ *  Late require: llm.ts imports this module. */
+let decideAuto: () => LLMProviderName | undefined = () => {
+  const { decideProviderForConfig } = require('../llm.js') as typeof import('../llm.js');
+  const decided = String(decideProviderForConfig(getUserConfig()).provider).replace(/^auto:/, '');
+  return decided && decided !== 'auto' ? decided as LLMProviderName : undefined;
+};
+function decidedAutoProvider(): LLMProviderName {
+  try { return decideAuto() ?? 'auto'; } catch { return 'auto'; }
+}
+/** Test seam — swap the auto decision. */
+export function setAutoProviderDecisionForTest(fn: (() => LLMProviderName | undefined) | undefined): void {
+  decideAuto = fn ?? (() => {
+    const { decideProviderForConfig } = require('../llm.js') as typeof import('../llm.js');
+    const decided = String(decideProviderForConfig(getUserConfig()).provider).replace(/^auto:/, '');
+    return decided && decided !== 'auto' ? decided as LLMProviderName : undefined;
+  });
 }
 
 /** config/tier 해석이 «실패»했을 때만 타는 최후 폴백. 티어 사다리가 안 읽히는

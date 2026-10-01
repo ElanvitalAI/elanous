@@ -390,7 +390,7 @@ describe('docs/goals 전수 보존율', () => {
     console.log(`goal digest contracts: ${JSON.stringify([...contractTitles].sort())}`);
     expect(contractRetention).toBeGreaterThan(proseRetention);
     expect((retentionByPrefix.get('ACCEPTANCE CRITERIA')!.kept / retentionByPrefix.get('ACCEPTANCE CRITERIA')!.original) * 100).toBeGreaterThan(5.5);
-    expect([...contractTitles].some((title) => title.includes('관측') || title.includes('경계 조건'))).toBe(false);
+    expect([...contractTitles].filter((title) => title.startsWith('관측') || title.startsWith('경계 조건'))).toEqual([]);
   });
 
   it('같은 제목의 중간 occurrence가 빠져도 본문 접두사로 뒤 절 보존량을 정확히 대응한다', () => {

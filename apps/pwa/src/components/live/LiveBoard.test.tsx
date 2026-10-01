@@ -61,6 +61,11 @@ test('MAX stage: a new decision shows a three-cell card, then folds; replay queu
   expect(card?.textContent).toContain('Pod node-b 로 보낸다');
   expect(card?.textContent).toContain('로컬 부하 9.1');
   expect(card?.textContent).toContain('pool-node-b');
+  await act(async () => { root.render(<LiveMaxStage board={next} autoReplay={false} role="general" />); });
+  const folded = host.querySelector('[data-live-decision-card]');
+  expect(folded?.textContent).toContain('왜 · WHY');
+  expect(folded?.textContent).toContain('로컬 부하 9.1');
+  expect(folded?.textContent).not.toContain('aaaa1111');
   await act(async () => { await new Promise((res) => setTimeout(res, CARD_MS + 50)); });
   expect(host.querySelector('[data-live-decision-card]')?.getAttribute('style')).toContain('opacity:0');
   await act(async () => { await new Promise((res) => setTimeout(res, 300)); });
@@ -73,6 +78,29 @@ test('MAX stage: a new decision shows a three-cell card, then folds; replay queu
     g.requestAnimationFrame = saved.raf; g.cancelAnimationFrame = saved.caf;
   }
 }, 10_000);
+
+test('general role hides the raw log, folds error reasons, and drops run ids', async () => {
+  const { LiveBoard } = await import('./LiveBoard');
+  const raw = buildLiveBoard([
+    r(6, 'dev-pipeline', 'rejected', { runId: 'run-bbbb2222-cccc', reason: 'Error: ENOENT: no such file or directory, open /home/ubuntu/x' }),
+    r(4, 'oauth.codex-account', 'rotation', { account: 'team', reason: 'default 95%', runId: 'run-bbbb2222-cccc' }),
+  ], [], { now, windowMinutes: 60 });
+  await act(async () => {
+    root.render(<LiveBoard board={raw} lines={['00:00:00 x · runId=run-bbbb2222-cccc reason=Error: ENOENT']} mode="practical" role="general" />);
+  });
+  expect(host.querySelector('[data-live-log]')).toBeNull();
+  expect(host.querySelector('[aria-label="흐르는 로그"]')).toBeNull();
+  const stream = host.querySelector('[data-live-stream]')?.textContent ?? '';
+  expect(stream).toContain('왜: 실패 — 자세한 사유는 오너 화면에서');
+  expect(stream).toContain('왜: default 95%');
+  expect(stream).not.toContain('ENOENT');
+  expect(stream).not.toContain('run-bbbb2222');
+  expect(host.textContent).not.toContain('run-bbbb2222');
+  expect(host.querySelector('[data-live-folded-errors]')?.textContent).toBe('오류 1건 접힘');
+  expect(host.querySelector('[data-live-gauge="LIVE"]')?.textContent).toBe(String(raw.gauges.live));
+  expect(host.querySelector('[data-live-gauge="SHIPPED"]')?.textContent).toBe(String(raw.gauges.shipped));
+  expect(host.querySelector('[data-live-gauge="BURN"]')?.textContent).toBe(String(raw.gauges.burnTokensPerMin));
+});
 
 test('only decisions with a why or a target become cards (empty cards stay in the stream)', async () => {
   const { cardWorthy } = await import('./LiveMaxStage');

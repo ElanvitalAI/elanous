@@ -1,6 +1,6 @@
 # Quickstart
 
-From an installed `elanous` to a first change made for you — three commands if you already have a ChatGPT subscription and are signed in to GitHub.
+From an installed `elanous` to a first change made for you. The first time takes a few steps: open a new shell (or `source` your shell profile) so `elanous` is on your PATH, sign in with the ChatGPT device code (open the link it shows and type the code by hand), and answer first-time setup the first time you run `elanous` — it asks again which model provider to use and asks for your Obsidian vault path. After that, one sentence starts the work. Signing in to GitHub (`gh`) lets it open pull requests.
 
 ## 1. See what is missing
 

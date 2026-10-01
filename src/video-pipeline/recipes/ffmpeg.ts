@@ -17,7 +17,7 @@ export function run(bin: string, args: readonly string[], timeoutMs = 180_000): 
     ok: r.status === 0,
     code: r.status,
     signal: r.signal ?? null,
-    err: (r.stderr ?? '').trim(),
+    err: r.stderr?.trim() || r.error?.message || '',
     out: (r.stdout ?? '').trim(),
   };
 }

@@ -12,6 +12,7 @@ import { buildLiveBoard, logLine } from '@/lib/live-signals';
 import { selfHealedPrs } from '@/lib/live-v5';
 import { maskRowsForPublic } from '@/lib/live-public';
 import type { LogRow } from '@/nexus/client';
+import { usePwaRole } from '@/lib/pwa-role';
 import { LiveBoard, type LiveMode } from './LiveBoard';
 import { LiveMaxStage } from './LiveMaxStage';
 import { RunDrawer } from './RunDrawer';
@@ -36,6 +37,7 @@ export function LivePanel() {
 }
 
 function LivePanelInner() {
+  const role = usePwaRole();
   // ⛔ 기기 설정은 마운트 뒤에 읽는다(정적 export 하이드레이션 · #418). MAX 는 저장하지 않는다 — 늘 «알고» 켠다(v4).
   const [mode, setMode] = useState<LiveMode>('practical');
   const [maxUntil, setMaxUntil] = useState<number | null>(null);
@@ -186,9 +188,9 @@ function LivePanelInner() {
         <RunDrawer runId={selectedRunId} run={board.snapshot.runs.find((r) => r.runId === selectedRunId) ?? null} lines={lines} onClose={() => setSelectedRunId(null)} />
       )}
       {mode === 'max' ? (
-        <LiveMaxStage board={board} rows={rows} windowMinutes={windowMinutes} sourceLabel={store === FEDERATED ? 'federated' : store || 'this instance'} shippedSource={typeof shipped.data?.merged === 'number' ? 'github' : 'log'} publicCapture={publicCapture} onSelectRun={(id) => setSelectedRunId((cur) => (cur === id ? null : id))} />
+        <LiveMaxStage board={board} rows={rows} windowMinutes={windowMinutes} sourceLabel={store === FEDERATED ? 'federated' : store || 'this instance'} shippedSource={typeof shipped.data?.merged === 'number' ? 'github' : 'log'} publicCapture={publicCapture} role={role} onSelectRun={(id) => setSelectedRunId((cur) => (cur === id ? null : id))} />
       ) : (
-        <LiveBoard board={board} lines={lines} mode={mode} selectedRunId={selectedRunId} onSelectRun={(id) => setSelectedRunId((cur) => (cur === id ? null : id))} />
+        <LiveBoard board={board} lines={lines} mode={mode} role={role} selectedRunId={selectedRunId} onSelectRun={(id) => setSelectedRunId((cur) => (cur === id ? null : id))} />
       )}
       <p className={`text-[11px] text-muted-foreground ${mode === 'max' ? 'hidden' : ''}`}>
         갱신 5초 · 출처 <code>/v1/logs</code> · <code>/v1/harness/runs</code> · 비밀처럼 보이는 조각은 가린다.

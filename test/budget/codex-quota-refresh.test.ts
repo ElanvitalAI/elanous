@@ -162,7 +162,7 @@ describe('refreshCodexQuotaSignals', () => {
       },
     })).rejects.toThrow('store unreadable');
     // ⭐ 그래도 «왜» 실패했는지는 관측에 남는다
-    expect(observed.map((o) => o.event)).toContain('failed');
+    expect(observed.map((o) => o.event)).toContain('refresh-failed');
   });
 
   test('real account-home signals drive fresh versus refreshed results and preserve process.env', async () => {

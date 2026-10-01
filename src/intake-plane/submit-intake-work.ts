@@ -4,7 +4,7 @@
  *
  * - absorb → 흡수 원장(`ingestIntakeItems`) — URL 이 있으면 URL 마다, 없으면 글 한 덩이(PWA `absorbItemsFromText` 와 같은 규칙).
  * - tasks  → TOX(`dispatchTaskCreate`) — 외부 출처(텔레그램 등)는 `external` 로 실어 M1(backlog ⊕ 승인 대기)을 탄다.
- * - graph  → 하니스 ask(`handleHarnessAskPost` 를 요청 하나로 부른다 — 흐름을 복제하지 않는다).
+ * - graph  → 자리 문서 요청은 A5 실행 요청, 나머지는 하니스 ask(`handleHarnessAskPost`).
  * - ask-human → 실행하지 않는다. 고를 갈래를 돌려준다.
  *
  * 로그엔 원문이 아니라 길이만 남긴다(앞문 RFC · `user-private`).
@@ -16,6 +16,7 @@ import type { ExternalTaskSource } from '../task-orchestrator/types.js';
 import { TASK_DEFAULTS } from '../task-orchestrator/types.js';
 import { decideIntakeFrontRoute, type IntakeFrontRouteDecision } from './front-route-rules.js';
 import { ingestIntakeItems, intakeItemId, type IntakeSource, type RawIntakeItem } from './items.js';
+import { isCooPlannerRequest, isSeatDocRequest, submitSeatDocRequest, type SeatDocDeps } from './seat-doc-route.js';
 
 export type IntakeWorkTrack = 'absorb' | 'tasks' | 'graph';
 
@@ -40,6 +41,8 @@ export interface SubmitIntakeWorkDeps {
   ingest?: typeof ingestIntakeItems;
   createTask?: (input: CreateTaskInput) => Promise<{ taskId?: string; deduplicated?: boolean; output: string }>;
   askHarness?: (text: string, origin?: MissionOrigin) => Promise<{ acceptanceId?: string; error?: string }>;
+  seatDoc?: typeof submitSeatDocRequest;
+  seatDocDeps?: SeatDocDeps;
   handleHarnessAskPost?: typeof import('../nexus/api/harness-api.js').handleHarnessAskPost;
   log?: (event: string, data: Record<string, unknown>) => void;
 }
@@ -130,6 +133,11 @@ export async function submitIntakeWork(
       return { ok: true, track: 'tasks', taskId: res.taskId, deduplicated: res.deduplicated ?? false };
     }
     const reportTo = input.origin.kind === 'external' ? input.origin.reportTo : undefined;
+    if (isSeatDocRequest(text) || isCooPlannerRequest(text)) {
+      const { id } = await (deps.seatDoc ?? submitSeatDocRequest)({ text, reportTo, deps: deps.seatDocDeps });
+      log('submitted', { ...base, acceptanceId: id });
+      return { ok: true, track: 'graph', acceptanceId: id };
+    }
     const res = await (deps.askHarness ? deps.askHarness(text, reportTo) : defaultAskHarness(text, reportTo, deps.handleHarnessAskPost));
     if (!res.acceptanceId) {
       log('failed', { ...base, reason: res.error ?? 'no-acceptance-id' });

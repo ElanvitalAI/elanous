@@ -66,6 +66,8 @@ export interface NexusDiscordTriggerBotOpts {
    *  commands (/cc·/fork·/voice-join·…) route into the same composed
    *  message pipeline. Absent ⇒ interactions ignored (legacy). */
   onInteraction?: (raw: Record<string, unknown>) => void | Promise<void>;
+  /** EV12c — guild text channels answered like DMs (`discord.chatChannels`). Absent ⇒ DM-only. */
+  guildTextChannels?: string[];
   /** Optional logger. Defaults to `[discord/trigger]` prefix. */
   log?: (msg: string) => void;
   /** Test seam — pre-built DiscordBot (factory skips construction +
@@ -156,6 +158,7 @@ export function createNexusDiscordTriggerBot(
   const bot = opts.bot ?? new DiscordBot({
     token: opts.token,
     allowedUsers: opts.allowedUsers,
+    ...(opts.guildTextChannels?.length ? { guildTextChannels: opts.guildTextChannels } : {}),
     // Chat path: the injected self-turn handler (M4b nexus wire) or the
     // legacy trigger-only no-op. Workflows wanting a chat reply can
     // still declare a `chatTrigger` (routes via `/v1/workflows/chat/*`).

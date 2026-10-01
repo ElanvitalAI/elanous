@@ -85,7 +85,7 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
     const response = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'please run the tool' }),
     }), {
       noAuth: true,
       history: new DaemonSessionHistory(),
@@ -111,7 +111,7 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
     const response = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'please run the tool' }),
     }), {
       noAuth: true,
       history: new DaemonSessionHistory(),
@@ -126,7 +126,7 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
     const withBusResponse = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'please run the tool' }),
     }), {
       noAuth: true,
       history: new DaemonSessionHistory(),
@@ -150,7 +150,7 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
     const response = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'feedback-session', userText: 'please run the tool' }),
     }), {
       noAuth: true,
       history: new DaemonSessionHistory(),
@@ -179,7 +179,7 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
       const response = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: 'feedback-session', userText: 'hi' }),
+        body: JSON.stringify({ sessionId: 'feedback-session', userText: 'please run the tool' }),
       }), {
         noAuth: true,
         history: new DaemonSessionHistory(),
@@ -215,7 +215,7 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
       const response = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: 'feedback-session', userText: 'hi' }),
+        body: JSON.stringify({ sessionId: 'feedback-session', userText: 'please run the tool' }),
       }), {
         noAuth: true,
         history: new DaemonSessionHistory(),
@@ -242,7 +242,7 @@ describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
       try {
         const response = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
           method: 'POST', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sessionId: 'feedback-session', userText: 'hi' }),
+          body: JSON.stringify({ sessionId: 'feedback-session', userText: 'please run the tool' }),
         }), {
           noAuth: true, history: new DaemonSessionHistory(), toolSurface: feedbackToolSurface(), toolCwd: process.cwd(), eventBus,
         });
@@ -291,7 +291,7 @@ describe('POST /v1/prompt HITL channel wiring', () => {
 
     const withSession = await handlePromptPost(new Request('http://test/v1/prompt', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'pwa-hitl', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'pwa-hitl', userText: 'please run the tool' }),
     }), opts);
     expect(withSession.status).toBe(200);
     await dispatch!('SelfImplement', {});
@@ -302,7 +302,7 @@ describe('POST /v1/prompt HITL channel wiring', () => {
     received.length = 0;
     const withoutSession = await handlePromptPost(new Request('http://test/v1/prompt', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ userText: 'hi' }),
+      body: JSON.stringify({ userText: 'please run the tool' }),
     }), opts);
     expect(withoutSession.status).toBe(200);
     await dispatch!('SelfImplement', {});
@@ -324,7 +324,7 @@ describe('POST /v1/prompt HITL channel wiring', () => {
     };
     const response = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
       method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'pwa-hitl-stream', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'pwa-hitl-stream', userText: 'please run the tool' }),
     }), {
       noAuth: true, history: new DaemonSessionHistory(), toolSurface, toolCwd: process.cwd(),
       eventBus: new NexusEventBus(), hitlPending: createHitlPendingCallbacks(),
@@ -347,7 +347,7 @@ describe('POST /v1/prompt/stream turn-end provider tagging', () => {
     const res = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'sess-tag', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'sess-tag', userText: 'please run the tool' }),
     }), { noAuth: true, history: new DaemonSessionHistory(), hudStore });
 
     expect(res.status).toBe(200);
@@ -366,7 +366,7 @@ describe('POST /v1/prompt/stream turn-end provider tagging', () => {
     expect(push.mock.calls[0]![0]).toBe(hudStore);
     expect(push.mock.calls[0]![1]).toMatchObject({
       model: 'grok-4.6',
-      inputText: 'hi',
+      inputText: 'please run the tool',
       outputText: 'OK',
     });
   });
@@ -380,7 +380,7 @@ describe('POST /v1/prompt/stream turn-end provider tagging', () => {
     const res = await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'sess-legacy', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'sess-legacy', userText: 'please run the tool' }),
     }), { noAuth: true, history: new DaemonSessionHistory() });
 
     const events = await drainSse(res);
@@ -401,7 +401,7 @@ describe('POST /v1/prompt/stream turn-end provider tagging', () => {
     const res = await handlePromptPost(new Request('http://test/v1/prompt', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ sessionId: 'sess-json', userText: 'hi' }),
+      body: JSON.stringify({ sessionId: 'sess-json', userText: 'please run the tool' }),
     }), { noAuth: true, history: new DaemonSessionHistory() });
 
     expect(res.status).toBe(200);

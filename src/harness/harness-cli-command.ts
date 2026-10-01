@@ -21,6 +21,7 @@ import { getUserConfig } from '../user-config.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
 import { resolveHarnessSubstrate, type ResolvedHarnessSubstrate } from './harness-substrate-default.js';
 import { runHarnessPlanRfc } from './harness-plan-rfc.js';
+import { classifyGarbage, isGarbageProcessTarget, type GarbageProcess } from './process-garbage.js';
 import type { MissionSolveOutcome } from './mission-solve-loop.js';
 import { formatAxis, formatAxisObservations, inspectAskMarkers, inspectUnpressedDecisionSignals } from '../../scripts/ask-marker-check.js';
 
@@ -75,6 +76,7 @@ export class HarnessCliInputError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'HarnessCliInputError';
+    Object.defineProperty(this, Symbol.for('elanous.cli.HarnessCliInputError'), { value: true });
   }
 }
 
@@ -565,6 +567,7 @@ export interface HarnessProcessReport {
   readonly resourceConsuming: readonly HarnessProcessObservationRow[];
   readonly longRunningOnly: readonly HarnessProcessObservationRow[];
   readonly parentUnknown: readonly HarnessProcessObservationRow[];
+  readonly garbage: readonly GarbageProcess[];
 }
 
 export interface HarnessProcessObservationDeps {
@@ -762,16 +765,22 @@ export function buildHarnessProcessReport(
       resourceConsuming: [],
       longRunningOnly: [],
       parentUnknown: [],
+      garbage: [],
     };
   }
   const livePids = new Set(listed.livePids ?? listed.records.map((record) => record.pid));
   const universe = listed.pidUniverse ?? pidUniverse;
+  const garbage = classifyGarbage(listed.records.map((record) => ({
+    ...record,
+    launchd: resolveHarnessProcessLaunchdEvidence(record.pid, launchd),
+  })), { nowMs }).garbage;
   const resourceConsuming: HarnessProcessObservationRow[] = [];
   const longRunningOnly: HarnessProcessObservationRow[] = [];
   const parentUnknown: HarnessProcessObservationRow[] = [];
   let unclassifiedCount = 0;
   let parentPresentCount = 0;
   for (const record of listed.records) {
+    if (!record.command.includes('elanous.mjs')) continue;
     const classification = classifyHarnessProcess(record, thresholds);
     if (classification === undefined) {
       unclassifiedCount += 1;
@@ -811,6 +820,7 @@ export function buildHarnessProcessReport(
       resourceConsuming,
       longRunningOnly,
       parentUnknown,
+      garbage,
     };
   }
   return {
@@ -822,6 +832,7 @@ export function buildHarnessProcessReport(
     resourceConsuming,
     longRunningOnly,
     parentUnknown,
+    garbage,
   };
 }
 
@@ -855,6 +866,13 @@ function renderHarnessProcessRow(row: HarnessProcessObservationRow): string[] {
   ];
 }
 
+function renderGarbageGroup(garbage: readonly GarbageProcess[]): string[] {
+  return [
+    `가비지 ${garbage.length}:`,
+    ...garbage.map((row) => `- pid=${row.pid} ppid=${row.ppid} elapsed=${formatHarnessProcessElapsed(row.elapsedSeconds)} reason=${row.reason} command=${row.command.slice(0, 120)}`),
+  ];
+}
+
 export function renderHarnessProcessReport(report: HarnessProcessReport): string[] {
   const { resourceCpuPercent, longRunningElapsedSeconds } = report.thresholds;
   const lines = [
@@ -868,6 +886,7 @@ export function renderHarnessProcessReport(report: HarnessProcessReport): string
     const failure = report.observationFailure;
     lines.push(`관찰 실패/확인 불가 (${failure?.stage ?? 'ps-exec'}: ${failure?.reason ?? 'unknown observation failure'})`);
     lines.push('자원소비와 장기실행만은 확인하지 않았다 — 빈 관찰이 아니다');
+    lines.push('가비지 확인 불가 — ps 관찰 실패');
     return lines;
   }
   if (report.observationStatus === 'incomplete') {
@@ -877,7 +896,7 @@ export function renderHarnessProcessReport(report: HarnessProcessReport): string
   }
   if (report.excludedCount > 0) {
     lines.push(`모집단 제외 ${report.excludedCount}행`);
-    lines.push('제외 기준: command에 elanous.mjs를 포함하지 않은 행');
+    lines.push('제외 기준: command에 elanous.mjs가 없고 시험 데몬·러너 대상도 아닌 행');
   }
   lines.push(`분류 제외 ${report.unclassifiedCount}행`);
   lines.push(`부모 생존 제외 ${report.parentPresentCount}행`);
@@ -885,11 +904,13 @@ export function renderHarnessProcessReport(report: HarnessProcessReport): string
   if (report.parentUnknown.length > 0) lines.push(`부모 확인 불가 ${report.parentUnknown.length} — 자원소비/장기실행만에 넣지 않았다`);
   const empty = report.resourceConsuming.length === 0 && report.longRunningOnly.length === 0 && report.parentUnknown.length === 0;
   if (empty && report.observationStatus === 'ok') {
-    lines.push('관찰 대상 없음');
+    if (report.garbage.length === 0) lines.push('관찰 대상 없음');
+    lines.push(...renderGarbageGroup(report.garbage));
     return lines;
   }
   if (empty && report.observationStatus === 'incomplete') {
     lines.push('해석된 행 중 분류 대상이 없다 — 빈 관찰이 아니다');
+    lines.push(...renderGarbageGroup(report.garbage));
     return lines;
   }
   if (report.resourceConsuming.length > 0) {
@@ -904,6 +925,7 @@ export function renderHarnessProcessReport(report: HarnessProcessReport): string
     lines.push('부모 확인 불가:');
     for (const row of report.parentUnknown) lines.push(...renderHarnessProcessRow(row));
   }
+  lines.push(...renderGarbageGroup(report.garbage));
   return lines;
 }
 
@@ -944,7 +966,7 @@ function parseHarnessProcessPsLine(line: string): ParsedHarnessProcessPsLine {
   if (!match) return { kind: 'malformed', line: trimmed, pid: parseHarnessProcessPsPid(line) };
   const command = match[5]!.trim();
   const pid = Number(match[1]);
-  if (!command.includes('elanous.mjs')) return { kind: 'excluded', pid };
+  if (!isGarbageProcessTarget(command)) return { kind: 'excluded', pid };
   const elapsedSeconds = parsePsEtime(match[4]!);
   if (elapsedSeconds === undefined) return { kind: 'malformed', line: trimmed, pid };
   return {

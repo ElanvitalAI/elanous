@@ -82,7 +82,8 @@ test('dashboard boot and input do not import or read virtual windows', () => {
   expect(source('src/dashboard-pane-context-menu.ts')).not.toContain("id: 'dashboard-pane.open-vw'");
   expect(index).not.toContain('switchToVirtualWindow: () => {}');
   expect(index).not.toContain('virtualWindowsSwitchTo: () => {}');
-  expect(index).toContain('Unknown command: /${cmdLower}');
+  expect(index).toContain('unknownSlashReply(cmdLower, dashboardSlashRegistry.names())');
+  expect(source('src/dashboard/slash-runtime/unknown-slash-reply.ts')).toContain('Unknown command: /${slashName}');
 });
 
 test('VW spawn slashes and /bench are unregistered while /help remains available', async () => {

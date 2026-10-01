@@ -4,5 +4,8 @@ must-fix-match:
   command: 'bun scripts/landing-heal/run-mission.ts must-fix-match'
 verify-needed:
   command: 'bun scripts/landing-heal/run-mission.ts verify-needed'
+clean-checkout:
+  command: 'bun scripts/landing-heal/run-mission.ts clean-checkout'
+  timeout_ms: 1380000
 report:
   command: 'bun scripts/landing-heal/run-mission.ts report'

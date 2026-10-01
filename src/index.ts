@@ -62,6 +62,7 @@ import { registerModelWatchCommand } from './cli/model-watch-cli.js';
 import { registerIntakeCommands } from './cli/intake-cli.js';
 import { registerTasksCommands } from './cli/tasks-cli.js';
 import { registerLabelsCommands } from './cli/labels-cli.js';
+import { registerMsgCommands } from './cli/msg-cli.js';
 import { registerDoctorCommand } from './cli/doctor-cli.js';
 import { registerProviderCommands } from './cli/provider-cli.js';
 export { buildCodexAccountImportGuidance, setCodexAccountLogSinkModuleForTesting } from './cli/provider-cli.js';
@@ -74,6 +75,7 @@ import { registerGraphCommands } from './graph-runner/graph-cli.js';
 import { registerLoopCommands } from './loops/loop-cli.js';
 import { registerCardCommand } from './task-cards/card-cli.js';
 import { registerLaunchHeadCommands } from './launch-head/launch-head-cli.js';
+import { acpServerHelpText } from './boot/acp-server-help.js';
 // IMPORTANT: parse `--config-dir <dir>` + `--test-state-dir <dir>`
 // BEFORE Commander loads — the resolvers are read at module-init
 // time by several config-touching imports below, so the override
@@ -95,7 +97,8 @@ import type { AdPipelinePlan, AdPipelineResult } from './ad-pipeline/run.js';
 import type { AcpPermissionApprover } from './acp/client.js';
 import { runGitCommand } from './git-fs/runner.js';
 import { debug, redactSecretText, redactSecrets } from './debug/log.js';
-import { HarnessCliInputError, installHarnessCliCommand, type HarnessAskSayChildLlmOptions, type HarnessAskSayOptions, type HarnessPlanOptions } from './harness/harness-cli-command.js';
+import { installHarnessCliCommand, type HarnessAskSayChildLlmOptions, type HarnessAskSayOptions, type HarnessPlanOptions } from './harness/harness-cli-command.js';
+import { formatCliUserError, isCliUserError } from './cli/cli-user-error.js';
 import { dispatchSolveMission } from './skills/tools/solve-mission.js';
 import { performBrowserAction, type BrowserActionDeps, type BrowserActionResult } from './harness/browser-act.js';
 import { decideTypeAction, type TypeActionDecision, type TypeTarget } from './harness/browser-act-type.js';
@@ -152,7 +155,7 @@ async function readStdinLine(prompt: string = ''): Promise<string> {
   finally { rl.close(); }
 }
 import { loginWithCodex, CODEX_DEVICE_LOGIN_URL } from './oauth/codex.js';
-import { authStorePath, loadTokens, deleteTokens, listProviders as listAuthProviders } from './oauth/store.js';
+import { authStorePath, loadTokens, deleteTokens, saveTokens, listProviders as listAuthProviders, type CodexMirrorResult } from './oauth/store.js';
 import { renderKeyHelp, CONTEXT_LABELS, type KeyContext } from './keybindings.js';
 import { auditKeybindings, renderKeymapAudit } from './keymap-audit.js';
 import { runCodexSetup } from './codex/setup.js';
@@ -164,6 +167,7 @@ import { initSessionWorkingDir } from './session/working-dir.js';
 import { rewriteBareNexusToStatus } from './cli/nexus-entry.js';
 import { registerIngestTokenCommands } from './cli/ingest-token-cli.js';
 import { registerMcpGatewayCommands } from './cli/mcp-gateway-cli.js';
+import { registerRelayCommand } from './relay/relay-cli.js';
 import type { ReviewImage } from './agent-substrate/pr-reviewer.js';
 import {
   describeMissionRouting,
@@ -864,6 +868,14 @@ registerDoctorCommand(program);
 registerControlCommands(program);
 registerHooksCommands(program);
 registerSetupCommand(program);
+program.commands.find(command => command.name() === 'setup')!
+  .option('--terminal', 'Run the terminal onboarding wizard')
+  .hook('preAction', async (_command, action) => {
+    if (action.name() === 'setup' && action.opts().terminal) {
+      const completed = await runOnboardingForCli();
+      process.exit(completed ? 0 : (process.exitCode || 2));
+    }
+  });
 registerStartCommand(program);
 registerGroundingSourcesCli(program);
 registerGraphCommands(program);
@@ -905,6 +917,10 @@ marketCmd.command('publish').description('Publish a local signed marketplace ind
         console.log(`Published ${result.published.length} plugins (sequence ${result.sequence}); skipped ${result.skipped.length}`);
         for (const warning of result.warnings) console.warn(`⚠ ${warning.dir}: ${warning.graph} uses recipes it does not ship (${warning.recipes.join(', ')}) — third-party graphs should use their own recipes.yaml or custom nodes`);
       }
+      for (const item of result.skipped) {
+        for (const hit of item.hits ?? []) console.error(`${item.dir}/${hit.file}:${hit.line}: ${hit.marker}`);
+      }
+      if (!result.ok) process.exitCode = 1;
     } catch (error) {
       console.error(`market publish: ${error instanceof Error ? error.message : 'failed'}`);
       process.exitCode = 1;
@@ -1002,7 +1018,7 @@ program.command('self-update')
 
 program
   .name('elanous')
-  .description('TUI skill runner — Yazi-style 3-pane + multi-LLM, with remote sync, smart diff, and SQLite logging')
+  .description('말 한 줄로 시작: elanous harness say "…" — 끝까지 간다 · 다 보인다 · 스스로를 만들었다')
   .version(cliVersion())
   // Documentation-only entry — the flag is extracted from argv by
   // `applyConfigDirFlagFromArgv` at module init (above) so Commander
@@ -1028,6 +1044,7 @@ program
     '--test',
     '격리 테스트 인스턴스로 실행 — cwd 의 git 트리(worktree 포함)에서 `<트리>/.elanous-test` 를 루트로 잡고 state·config 두 축을 함께 격리한다. config 사본이 없으면 자동 물질화. `--test=<dir>` 로 루트 직접 지정 가능(값 문법은 `=` 형태 하나 — 모호함 없음). ELANOUS_STATE_DIR/--config-dir 을 손으로 줄 필요가 없다.',
   );
+program.addHelpText('after', acpServerHelpText());
 
 program
   .command('measure-fabric-arc-ab')
@@ -1075,6 +1092,8 @@ const mcpCmd = program
   .command('mcp')
   .description('MCP (Model Context Protocol) server / client integration');
 registerMcpGatewayCommands(mcpCmd);
+
+registerRelayCommand(program);
 
 mcpCmd
   .command('serve')
@@ -2951,6 +2970,9 @@ const harnessOrchestrateCmd = registerHarnessOrchestrateCapabilityOptions(
   });
 
 const selfCmd = program.command('self').description('Self-awareness memory — 외부 도구(Claude Code/Codex)가 구현/변경 이력을 elanous 기억에 주입·회상');
+
+// M12 Claude Code 의존도 계기판 — `elanous self dependence [--since] [--until] [--json]`(읽기만).
+{ const { registerDependenceCommand } = await import('./cli/dependence-gauge.js'); registerDependenceCommand(selfCmd); }
 
 function printExtendedOrchestrateHelp(command: Command, positional = '[goals...]'): void {
   const optionLines = command.options
@@ -7019,6 +7041,7 @@ missionCmd
 
 registerTasksCommands(program);
 registerLabelsCommands(program);
+registerMsgCommands(program);
 
 // ── ask alias (script-friendly one-shot query) ──
 program
@@ -7027,7 +7050,28 @@ program
   .option('--reuse', 'Reuse the active CLI session instead of creating a new one')
   .option('--session <id>', 'Continue an explicit session (id or unique prefix). Overrides --reuse and active session.')
   .option('--json', 'Emit a single JSON line {sessionId, provider, model, reply, logPath, budget} instead of streaming text + ui.info trailer. Stable shape for LLM self-spawn.')
-  .action(async (parts: string[], opts: { reuse?: boolean; session?: string; json?: boolean }) => {
+  .option('--bare', 'Send only this text to the model: no Elanous preamble, project tree, memory, tools or session')
+  .action(async (parts: string[], opts: { reuse?: boolean; session?: string; json?: boolean; bare?: boolean }) => {
+    if (opts.bare) {
+      try {
+        const { askBare } = await import('./cli/ask-bare.js');
+        const llm = await import('./llm.js');
+        const { getUserConfig } = await import('./user-config.js');
+        const { trimToBudget } = await import('./tokens.js');
+        const result = await askBare({ text: parts.join(' '), deps: {
+          getUserConfig, decideProviderForConfig: llm.decideProviderForConfig, getProviderForConfig: llm.getProviderForConfig,
+          streamLLM: llm.streamLLM, trimToBudget,
+        } });
+        if (opts.json) process.stdout.write(JSON.stringify({ sessionId: null, ...result, logPath: null, budget: null, bare: true }) + '\n');
+        else process.stdout.write(result.reply.endsWith('\n') ? result.reply : `${result.reply}\n`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (opts.json) process.stdout.write(JSON.stringify({ error: message, bare: true }) + '\n');
+        else console.error(`ask --bare failed: ${message}`);
+        process.exitCode = 1;
+      }
+      return;
+    }
     const cfg = reloadUserConfig();
     await runChatTurnCli({
       cfg,
@@ -7193,9 +7237,13 @@ program
   });
 
 // ── login (provider OAuth) ──
-export function codexLoginSuccessMessage(mirrorResult?: 'written' | 'not-created-missing-cli-fields' | 'write-failed'): string {
+export function codexLoginSuccessMessage(mirrorResult?: CodexMirrorResult): string {
   const prefix = `Signed in. Tokens at ${authStorePath()}.`;
   if (mirrorResult === 'written') return `${prefix} Mirrored to ~/.codex/auth.json.`;
+  if (mirrorResult === 'skipped-different-account') {
+    return `${prefix} Your Codex CLI login (~/.codex/auth.json) belongs to a different account — left unchanged. To switch it, run \`elanous login openai-codex --replace-codex-cli-login\`.`;
+  }
+  if (mirrorResult === 'skipped-unknown-account') return `${prefix} Codex CLI login left unchanged.`;
   if (mirrorResult === 'not-created-missing-cli-fields') {
     return `${prefix} Codex CLI mirror was not created because this login response lacked its required fields; run \`codex login\` once to initialize ~/.codex/auth.json.`;
   }
@@ -7208,7 +7256,8 @@ const loginCmd = program.command('login').description('Authenticate to an LLM pr
 loginCmd
   .command('openai-codex')
   .description('Sign in to OpenAI Codex via the ChatGPT device-code flow')
-  .action(async () => {
+  .option('--replace-codex-cli-login', 'if the Codex CLI (~/.codex/auth.json) is signed in to a different account, replace it with this login')
+  .action(async (opts: { replaceCodexCliLogin?: boolean }) => {
     ui.header('OpenAI Codex — device-code sign-in');
     try {
       const state = await loginWithCodex({
@@ -7233,7 +7282,21 @@ loginCmd
           }
         },
       });
-      ui.info(codexLoginSuccessMessage(state.codexMirrorResult));
+      // AUTH1 — another account's Codex CLI login is left alone unless the user says to replace it.
+      let mirrorResult = state.codexMirrorResult;
+      if (mirrorResult === 'skipped-different-account') {
+        let replace = opts.replaceCodexCliLogin === true;
+        if (!replace && process.stdin.isTTY && process.stdout.isTTY) {
+          const { createInterface } = await import('node:readline/promises');
+          const rl = createInterface({ input: process.stdin, output: process.stdout });
+          try {
+            const answer = await rl.question('  Your Codex CLI (~/.codex/auth.json) is signed in to a different account. Replace it with this login? [y/N] ');
+            replace = /^y(es)?$/i.test(answer.trim());
+          } finally { rl.close(); }
+        }
+        if (replace) mirrorResult = saveTokens('openai-codex', state.tokens, { replaceDifferentCodexAccount: true }).codexMirrorResult;
+      }
+      ui.info(codexLoginSuccessMessage(mirrorResult));
       ui.info(`Expires in ~${state.tokens.expiresAt ? Math.round((state.tokens.expiresAt - Date.now()) / 60000) : '?'}min; auto-refresh on next use.`);
     } catch (err: any) {
       ui.error(`login failed: ${err?.message ?? err}`);
@@ -7821,6 +7884,15 @@ sessionCmd
     console.log(res.formatted ?? '(no context)');
   });
 
+async function runFirstSetupForCli(cfg: ReturnType<typeof getUserConfig>, announceFallback = false): Promise<boolean> {
+  if (cfg.onboarding.webFirst === true) {
+    const { runWebFirstSetup } = await import('./onboarding/web-first.js');
+    if (await runWebFirstSetup({ config: cfg }) === 'link-shown') return false;
+    if (announceFallback) ui.info('No config yet — launching setup wizard first.');
+  }
+  return runOnboardingForCli();
+}
+
 async function runOnboardingForCli(): Promise<boolean> {
   try {
     await runOnboarding();
@@ -7856,8 +7928,8 @@ program
     if (opts.tools) announceChatToolsCompatibility();
     const cfg = getUserConfig();
     if (needsOnboarding(cfg)) {
-      ui.info('No config yet — launching setup wizard first.');
-      if (!await runOnboardingForCli()) return;
+      if (cfg.onboarding.webFirst !== true) ui.info('No config yet — launching setup wizard first.');
+      if (!await runFirstSetupForCli(cfg, true)) return;
     }
     const refreshed = reloadUserConfig();
     // ★ 관측갭 수리(2026-07-21·제1원칙·트랙A) — self-implement 자식 goal-loop(`chat --goal-loop`)은 데몬과
@@ -7923,8 +7995,8 @@ program
     }
     const cfg = getUserConfig();
     if (needsOnboarding(cfg)) {
-      ui.info('No config yet — launching setup wizard first.');
-      if (!await runOnboardingForCli()) return;
+      if (cfg.onboarding.webFirst !== true) ui.info('No config yet — launching setup wizard first.');
+      if (!await runFirstSetupForCli(cfg, true)) return;
     }
     const refreshed = reloadUserConfig();
     const { runRepl } = await import('./repl/index.js');
@@ -10597,7 +10669,7 @@ async function main(): Promise<void> {
   // gates on config completeness — no entry-mode branch.)
   const cfg = getUserConfig();
   if (needsOnboarding(cfg)) {
-    if (!await runOnboardingForCli()) return;
+    if (!await runFirstSetupForCli(cfg)) return;
   }
 
   // Active-provider banner so users know WHICH model/auth is about to
@@ -10681,8 +10753,8 @@ async function main(): Promise<void> {
 export function runCli(): void {
   main().catch((err) => {
     closeTui();
-    if (err instanceof HarnessCliInputError) {
-      console.error(`❌ ${err.message}`);
+    if (isCliUserError(err)) {
+      console.error(formatCliUserError(err));
       process.exit(1);
     }
     throw err;

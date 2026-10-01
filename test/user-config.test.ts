@@ -660,6 +660,19 @@ describe('user-config extended schema', () => {
     expect(c.telegram.allowedUsers).toEqual([]);
     expect(c.onboarding.completed).toBe(false);
     expect(c.onboarding.version).toBe(0);
+    expect(c.onboarding.webFirst).toBeUndefined();
+  });
+
+  test('onboarding.webFirst accepts only boolean and survives save + reload', () => {
+    for (const value of [true, false]) {
+      write({ onboarding: { webFirst: value } });
+      const cfg = buildUserConfig(cfgPath);
+      expect(cfg.onboarding.webFirst).toBe(value);
+      saveUserConfig(cfg, cfgPath);
+      expect(reloadUserConfig(cfgPath).onboarding.webFirst).toBe(value);
+    }
+    write({ onboarding: { webFirst: 'true' } });
+    expect(buildUserConfig(cfgPath).onboarding.webFirst).toBeUndefined();
   });
 
   test('llm.provider accepts valid enum; coerces unknown → auto', () => {
@@ -844,6 +857,16 @@ describe('user-config extended schema', () => {
     const reloaded = reloadUserConfig(cfgPath);
     expect(saved.raw).toBeUndefined();
     expect(reloaded.raw).toEqual(saved);
+  });
+
+  test('EV12c discord.chatChannels parses snowflakes as strings and survives save + reload', () => {
+    write({ discord: { enabled: true, allowedUsers: ['1'], chatChannels: ['1500000000000000001', 1500, ' ', ''] } });
+    const cfg = buildUserConfig(cfgPath);
+    expect(cfg.discord.chatChannels).toEqual(['1500000000000000001', '1500']);
+    saveUserConfig(cfg, cfgPath);
+    expect(reloadUserConfig(cfgPath).discord.chatChannels).toEqual(['1500000000000000001', '1500']);
+    write({ discord: { enabled: true, allowedUsers: [] } });
+    expect(buildUserConfig(cfgPath).discord.chatChannels).toBeUndefined();
   });
 
   test('ELANOUS_ESCALATE_PROVIDER retains priority when both provider env overrides are set', () => {

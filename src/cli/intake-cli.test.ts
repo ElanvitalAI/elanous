@@ -14,7 +14,7 @@ test('registers the complete intake command tree on a fresh Command with its hel
   expect(intake!.description()).toBe('바깥 사실·문서를 elanous 현재와 대조하거나 태스크로 받는다');
   expect(intake!.helpInformation()).toContain('elanous intake');
   expect(intake!.commands.map((command) => command.name())).toEqual([
-    'check', 'collect-pod', 'ingest', 'items', 'mark', 'digest', 'route',
+    'source', 'check', 'collect-pod', 'ingest', 'items', 'mark', 'digest', 'route',
     'grounding-sync', 'queue', 'to-tasks', 'collect-telegram-saved', 'collect-github',
   ]);
 
@@ -22,7 +22,8 @@ test('registers the complete intake command tree on a fresh Command with its hel
     check: { help: '사실 목록·문서 경로·URL·표준입력을 elanous 현재와 대조한다. 구멍/낡음은 골 초안만 쓴다.', options: ['--file', '--url', '--fact', '--json', '--author', '--author-max'] },
     'collect-pod': { help: 'Pod 흡수 산출을 볼트에 안전하게 수집하고 흡수 원장에 표시한다', options: ['--id', '--vault', '--dry-run', '--json'] },
     ingest: { help: '수집기 산출(JSONL · 한 줄 = {url,title,text,kind,signals,…})을 흡수 원장에 모양 맞춰 넣는다 — 같은 항목은 합친다', options: ['--source', '--file', '--json'] },
-    items: { help: '흡수 원장 항목 보기 (최근 본 순)', options: ['--status', '--source', '--limit', '--json'] },
+    items: { help: '흡수 원장 항목 보기 (최근 본 순)', options: ['--status', '--source', '--seat', '--limit', '--json'] },
+    source: { help: '자리별 흡수 원천과 주기 등록·조회·실행', options: [] },
     mark: { help: '흡수 원장 항목의 상태·산출을 갱신한다 (예: 흡수 뒤 absorbed ⊕ 노트 경로)', options: ['--status', '--output'] },
     digest: { help: '흡수 하루 다이제스트 — 그날 흡수한 것을 축별로 · 노트의 한 줄 결론 · 골 후보. 노트 절(마크다운) 또는 텔레그램 보고 채널로', options: ['--day', '--json', '--telegram', '--vault', '--note'] },
     route: { help: '흡수가 끝난 항목의 대조 결과(intake check --json)를 산출 큐로 나눈다 — 없음→goals · 문서뿐인 판단 필요→manual · 노트→grounding 후보', options: ['--check-json', '--dry-run', '--json'] },

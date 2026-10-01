@@ -5,6 +5,7 @@ import { gunzipSync } from 'node:zlib';
 import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { packDirDeterministic } from './tgz.js';
+import { scanPackInternalRefs, type InternalRefHit } from './pack-internal-refs.js';
 import { signIndex, verifyIndex, type MarketplaceIndex } from './signed-index.js';
 
 type IndexConnector = MarketplaceIndex['plugins'][number]['ai.elanous']['connectors'][number];
@@ -62,11 +63,35 @@ function unpackLocal(archive: Uint8Array, destination: string): void {
   }
 }
 
+function scanArchiveInternalRefs(archive: Uint8Array): InternalRefHit[] {
+  const tar = gunzipSync(archive);
+  const field = (part: Buffer) => part.toString('utf8').replace(/\0.*$/, '');
+  const files: { path: string; text: string }[] = [];
+  for (let offset = 0; offset + 512 <= tar.length;) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every(byte => byte === 0)) break;
+    const size = parseInt(field(header.subarray(124, 136)).trim(), 8);
+    const name = field(header.subarray(0, 100));
+    const prefix = field(header.subarray(345, 500));
+    const path = prefix ? `${prefix}/${name}` : name;
+    const contents = tar.subarray(offset + 512, offset + 512 + size);
+    // Recognized text formats remain scannable even if they contain a NUL byte.
+    const textFile = /(?:^|\/)(?:README|LICENSE|Dockerfile)(?:\.[^/]*)?$|\.(?:md|mdx|txt|json|jsonc|ya?ml|toml|xml|html?|css|scss|svg|mmd|sh|bash|py|js|jsx|mjs|cjs|ts|tsx|mts|cts|sql|csv)$/i.test(path);
+    if (textFile || !contents.includes(0)) {
+      // A known text format is decoded leniently — one invalid byte must not hide the rest of the file from the scan.
+      try { files.push({ path, text: new TextDecoder('utf-8', { fatal: !textFile }).decode(contents) }); }
+      catch { /* Binary files are not scanned as text. */ }
+    }
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return scanPackInternalRefs(files);
+}
+
 export interface PublishResult {
   ok: boolean;
   sequence: number;
   published: Array<{ name: string; version: string; sha256: string; bundled: string[] }>;
-  skipped: Array<{ dir: string; reason: string }>;
+  skipped: Array<{ dir: string; reason: string; hits?: InternalRefHit[] }>;
   /** Published anyway, but a reviewer should look (e.g. a third-party graph relying on core recipes). */
   warnings: Array<{ dir: string; graph: string; reason: 'third-party-core-recipe'; recipes: string[] }>;
 }
@@ -128,8 +153,8 @@ export function publishMarket(input: {
       currentName = dir;
       currentVersion = undefined;
       const manifestPath = join(folder, 'plugin.json');
-      const skip = (reason: string) => {
-        skipped.push({ dir, reason });
+      const skip = (reason: string, hits?: InternalRefHit[]) => {
+        skipped.push({ dir, reason, ...(hits ? { hits } : {}) });
         debug.log('market.publish', 'skipped', { name: dir, version: currentVersion, sequence, reason });
       };
       if (!existsSync(manifestPath)) { skip('missing-plugin.json'); continue; }
@@ -245,6 +270,8 @@ export function publishMarket(input: {
         if (message.startsWith('bundle-conflict')) { skip('bundle-conflict'); continue; }
         throw error;
       }
+      const hits = scanArchiveInternalRefs(archive);
+      if (hits.length) { skip('internal-reference', hits.slice(0, 20)); continue; }
       let sha256 = createHash('sha256').update(archive).digest('hex');
       const recorded = recordedHashes.get(JSON.stringify([manifest.name, manifest.version]));
       if (recorded && recorded !== sha256) {
@@ -318,7 +345,7 @@ export function publishMarket(input: {
       signatureText: readFileSync(join(input.outDir, 'index.sig'), 'utf8'), trustedKeys });
     if (!verified.ok) throw new Error(`index verification failed: ${verified.reason}: ${verified.detail}`);
     for (const item of published) debug.log('market.publish', 'published', { name: item.name, version: item.version, sequence });
-    return { ok: true, sequence, published, skipped, warnings };
+    return { ok: !skipped.some(item => item.reason === 'internal-reference'), sequence, published, skipped, warnings };
   } catch (error) {
     const rawReason = error instanceof Error ? error.message : 'unknown-error';
     const reason = input.key.privateKeyPem && rawReason.includes(input.key.privateKeyPem) ? 'invalid signing key' : rawReason;

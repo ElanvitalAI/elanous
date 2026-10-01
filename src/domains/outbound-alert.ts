@@ -6,7 +6,8 @@
 
 import * as childProcess from 'node:child_process';
 import { existsSync, readFileSync, appendFileSync, mkdirSync, unlinkSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { conatusEnv } from './conatus-env.js';
 import { spillLongContent } from '../storage/content-spill.js';
@@ -54,7 +55,7 @@ function recentSendBurst(): { recentCount: number; burst: boolean } {
 
 /** 발송 1건을 logs.db 에 관측(fail-open) — 발송 시각·mode·kind·밀림 판정. */
 function logSend(
-  mode: 'realtime' | 'deferred' | 'quiet-bypass' | 'flush',
+  mode: 'realtime' | 'quiet-bypass' | 'flush',
   kind: string,
   extra: Record<string, unknown> = {},
   opts?: { level?: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'critical' },
@@ -111,15 +112,16 @@ export function userRecentlyActive(now: Date = new Date()): boolean {
 
 /** 야간 보류 적재 (jsonl append — 크론 동시 실행에 안전). origin 있으면 함께 적재 —
  *  아침 flush 가 그 origin(발신 채널)으로 되돌려 발송(없으면 report 묶음). */
-function deferOutbound(text: string, kind: string, origin?: MissionOrigin | null, path = DEFERRED_PATH): void {
+function deferOutbound(text: string, kind: string, origin?: MissionOrigin | null, path = DEFERRED_PATH): boolean {
   try {
     mkdirSync(dirname(path), { recursive: true });
     const rec = { ts: new Date().toISOString(), kind, text, ...(origin ? { origin } : {}) };
     appendFileSync(path, JSON.stringify(rec) + '\n');
     console.error(`[outbound] 야간 무음(00:00~06:30 KST) — 보류 적재 (${kind})`);
-    logSend('deferred', kind, { reason: 'quiet-hours' });  // 밀림 적재 관측
+    return true;
   } catch (e) {
     console.error(`[outbound] 보류 적재 실패 — 콘솔 출력\n${text}`, e instanceof Error ? e.message : '');
+    return false;
   }
 }
 
@@ -139,8 +141,29 @@ function resolveBotToken(botId?: string): string | null {
   } catch { return null; }
 }
 
-/** origin(발신 채널)으로 직접 텔레그램 발송. telegram+chatId+토큰 해석 성공 시 true. */
+/** origin(발신 채널)으로 직접 발송. 실패하면 호출자가 report 폴백/재시도한다. */
 function deliverToOrigin(origin: MissionOrigin, text: string): boolean {
+  if (origin.channel === 'discord') {
+    if (!origin.channelId) return false;
+    try {
+      const token = resolveChannelBotToken('discord', getUserConfig())?.token;
+      if (!token) return false;
+      const channelId = origin.discordThreadId || origin.channelId;
+      const out = spillLongContent(text).text;
+      for (let start = 0; start < out.length;) {
+        let end = Math.min(start + 2000, out.length);
+        if (end < out.length && /[\uD800-\uDBFF]/.test(out[end - 1]!)) end--;
+        const response = curlPost(
+          `https://discord.com/api/v10/channels/${channelId}/messages`,
+          JSON.stringify({ content: out.slice(start, end) }),
+          [`Authorization: Bot ${token}`, 'Content-Type: application/json'],
+        );
+        if (typeof response?.id !== 'string' || !response.id) return false;
+        start = end;
+      }
+      return out.length > 0;
+    } catch { return false; }
+  }
   if (origin.channel !== 'telegram' || origin.chatId == null) return false;
   const token = resolveBotToken(origin.botId);
   if (!token) return false;
@@ -189,11 +212,13 @@ export function flushDeferred(path = DEFERRED_PATH): number {
   // origin 없는 것 = report 묶음(기존 동작·finance/크론 알림).
   const noOrigin = items.filter(i => !i.origin);
   if (noOrigin.length && deliver(fmt(noOrigin), 'report')) delivered += noOrigin.length;
-  // ★ origin 있는 것 = 발신 채널(botId+chatId)별 묶음으로 되돌려 발송(미션 알림 → 메인 Q&A 봇).
+  // origin 있는 것 = 발신 채널·스레드별로 묶어 서로 다른 수신자에게 섞이지 않게 발송.
   const groups = new Map<string, { origin: MissionOrigin; list: Item[] }>();
   for (const it of items) {
     if (!it.origin) continue;
-    const key = `${it.origin.botId ?? ''}:${it.origin.chatId ?? ''}`;
+    const key = it.origin.channel === 'discord'
+      ? JSON.stringify(['discord', it.origin.channelId, it.origin.discordThreadId ?? null])
+      : JSON.stringify([it.origin.channel, it.origin.botId ?? null, it.origin.chatId ?? null, it.origin.threadId ?? null]);
     if (!groups.has(key)) groups.set(key, { origin: it.origin, list: [] });
     groups.get(key)!.list.push(it);
   }
@@ -228,14 +253,26 @@ export function recordOutbound(text: string, kind: string): void {
 /** 발송 진입점 — 야간 무음 게이트(00:00~06:30 KST 보류) + 보류분 자동 플러시.
  *  origin(발신 채널) 이 주어지면 그 채널(메인 Q&A 봇 등)로 되돌려 발송 — 무음이면 origin 을
  *  함께 보류했다가 아침에 그 채널로 flush. origin 없거나 발송 실패 시 report 폴백(기존 동작). */
-export function sendOutbound(text: string, kind = 'alert', origin?: MissionOrigin | null): boolean {
+export function sendOutbound(text: string, kind = 'alert', origin?: (MissionOrigin & { surface?: string }) | null): boolean {
+  // Prefer the producer's surface; otherwise keep the caller's repository-relative path
+  // so two producers named index.ts cannot collapse into one sender.
+  const caller = new Error().stack?.split('\n')[2] ?? '';
+  const callerPath = caller.match(/(?:\(|\s)(file:\/\/[^\s()]+|\/[^\s()]+\.[cm]?[jt]s):\d+:\d+\)?/)?.[1];
+  const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+  const source = origin?.surface || (callerPath
+    ? relative(repoRoot, callerPath.startsWith('file://') ? fileURLToPath(callerPath) : callerPath).replace(/\\/g, '/')
+    : 'unknown');
+  const logOutcome = (event: 'sent' | 'deferred' | 'failed'): void => {
+    try { debug.log('outbound.send', event, { kind, source, chars: text.length }); } catch { /* fail-open */ }
+  };
   // ★ 무음 우회(대표 2026-07-14) — 사용자가 최근(기본 30분) genuine 인텐트(타이핑/버튼탭)를 냈으면
   //   깨어있으므로 야간 무음이어도 즉시 발송(사용자 발원 흐름의 결과물이 아침까지 묶이지 않게).
   //   우회 시 flushDeferred 로 그간 보류분도 함께 전달(사용자가 지금 볼 수 있음).
   if (inQuietHours() && !userRecentlyActive()) {
-    deferOutbound(text, kind, origin);
+    const queued = deferOutbound(text, kind, origin);
     recordOutbound(text, kind); // 보류도 논리적 발송 — 회상 대상(데몬 미경유라 클라 기록)
-    return true; // 보류 = 수락 (호출측 재시도/에러 루프 방지)
+    logOutcome(queued ? 'deferred' : 'failed');
+    return true; // 보류 시 수락 — 적재 오류에서도 기존 호출측 재시도 계약 유지
   }
   const bypass = inQuietHours();
   if (bypass) console.error('[outbound] 야간 무음 우회 — 최근 사용자 활동(깨어있음) → 즉시 발송 + 보류분 flush');
@@ -245,14 +282,16 @@ export function sendOutbound(text: string, kind = 'alert', origin?: MissionOrigi
   const { recentCount, burst } = recentSendBurst();
   logSend(bypass ? 'quiet-bypass' : 'realtime', kind, { burst, recentCount, ...(burst ? { backlog: true } : {}) });
   // ★ origin 되돌림(무음 밖) — 발신 채널로 직접 발송. 성공 시 종료, 실패면 report 폴백.
-  if (origin && origin.channel === 'telegram' && origin.chatId != null && deliverToOrigin(origin, text)) {
+  if (origin && deliverToOrigin(origin, text)) {
     recordOutbound(text, kind);
+    logOutcome('sent');
     return true;
   }
   const path = deliver(text, kind);
   // 원장 기록은 정확히 1회. 데몬 경유(daemon)면 /v1/outbound 핸들러(outbound-report.ts)
   // 가 기록하므로 클라는 중복 금지 — 직접 폴백(direct·데몬 다운)만 클라가 기록.
   if (path === 'direct') recordOutbound(text, kind);
+  logOutcome(path === false ? 'failed' : 'sent');
   return path !== false;
 }
 

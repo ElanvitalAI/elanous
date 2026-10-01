@@ -1,9 +1,10 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { Command } from 'commander';
-import { formatDoctorReport, runDoctor, type DoctorOptions, type DoctorReport } from './doctor-cli.js';
+import { Command } from 'commander';
+import { formatDoctorReport, registerDoctorCommand, runDoctor, type DoctorOptions, type DoctorReport } from './doctor-cli.js';
 import { applyClaudePluginSetup, planClaudePluginSetup } from './claude-plugin-setup.js';
+import { recommendedSetup } from './setup-recommend.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig, saveUserConfig, type UserConfig } from '../user-config.js';
 
@@ -20,6 +21,7 @@ type SetupStep = {
 
 export interface SetupCliDeps extends DoctorOptions {
   runDoctor?: (options: DoctorOptions) => DoctorReport;
+  runDoctorFix?: (args: readonly string[]) => Promise<number>;
   readFile?: (path: string) => string;
   exists?: (path: string) => boolean;
   homeDir?: () => string;
@@ -154,14 +156,16 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
   const setup = program.command('setup')
     .description('Check OpenAI Codex setup and guide each missing credential step')
     .option('--non-interactive', 'Report setup state without prompts or writes')
-    .action(async (opts: { nonInteractive?: boolean }) => {
+    .option('--yes', 'Set a missing Codex provider and apply recommended doctor repairs without asking')
+    .action(async (opts: { nonInteractive?: boolean; yes?: boolean }) => {
       const doctor = doctorRunner(deps);
       if (opts.nonInteractive) {
         out.log(formatSetupReport(doctor, setupSteps(deps), true));
+        for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
         setExitCode(0);
         return;
       }
-      if (!isStdinTty()) {
+      if (!isStdinTty() && !opts.yes) {
         (out.error ?? out.log)('대화형 온보딩은 stdin TTY가 있는 자리에서만 실행할 수 있다. 무인 설정은 `elanous setup --non-interactive`를 사용하라.');
         setExitCode(1);
         return;
@@ -169,8 +173,8 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       let steps = setupSteps(deps);
       const provider = steps[1]!;
       if (!provider.complete) {
-        const answer = await prompt('Set llm.provider to openai-codex now? [y/N] ');
-        if (answer?.trim().toLowerCase() === 'y') {
+        const approved = opts.yes || (await prompt('Set llm.provider to openai-codex now? [y/N] '))?.trim().toLowerCase() === 'y';
+        if (approved) {
           const config = (deps.getUserConfig ?? getUserConfig)();
           (deps.saveUserConfig ?? saveUserConfig)({ ...config, llm: { ...config.llm, provider: 'openai-codex' } });
           steps = setupSteps(deps);
@@ -179,6 +183,23 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         }
       }
       out.log(formatSetupReport(doctor, steps, false));
+      for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
+      const accepted = opts.yes || (isStdinTty() && /^(?:y|yes)?$/i.test((await prompt('추천대로 켤까요? [Y/n] '))?.trim() ?? 'n'));
+      if (accepted) {
+        const runDoctorFix = deps.runDoctorFix ?? (async (args: readonly string[]) => {
+          const doctorProgram = new Command();
+          let exitCode = 0;
+          registerDoctorCommand(doctorProgram, {
+            out,
+            err: { error: (message) => (out.error ?? out.log)(message) },
+            setExitCode: (code) => { exitCode = code; },
+          });
+          await doctorProgram.parseAsync([...args], { from: 'user' });
+          return exitCode;
+        });
+        setExitCode(await runDoctorFix(['doctor', '--fix', '--yes']));
+        return;
+      }
       setExitCode(0);
     });
 

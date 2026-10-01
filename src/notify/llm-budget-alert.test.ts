@@ -35,7 +35,7 @@ describe('NT1 LLM budget alert', () => {
 
   test('same state again is silent; a new day speaks once more', () => {
     const first = buildLlmBudgetAlert(snap());
-    expect(buildLlmBudgetAlert(snap(), first.key).send).toBe(false);
+    expect(buildLlmBudgetAlert(snap(), first.key)).toEqual({ send: false, key: first.key, text: '' });
     const nextDay = buildLlmBudgetAlert(snap({ at: '2026-10-01T10:00:00Z' }), first.key);
     expect(nextDay.key).toBe('pace-behind:2026-10-01');
     expect(nextDay.send).toBe(true);
@@ -67,9 +67,60 @@ describe('NT1 LLM budget alert', () => {
     expect(a.text).toContain('구독 계정 3개');
   });
 
-  test('credits about to expire outrank the pace line', () => {
+  test('credits about to expire outrank the pace line without asserting they are selected', () => {
     const a = buildLlmBudgetAlert(snap({ at: '2026-12-27T13:00:00Z' }));
     expect(a.key).toBe('expiry:4');
     expect(a.text.split('\n')[0]).toBe('💳 크레딧 199,287 이 4일 뒤 사라집니다.');
+    expect(a.text.split('\n')).toHaveLength(3);
+    expect(a.text).toContain('할 일: 만료 전에 크레딧 사용을 확인해 주세요.');
+    expect(a.text).not.toContain('크레딧으로 돕니다');
+    expect(a.text).not.toMatch(INTERNAL);
+    expect(buildLlmBudgetAlert(snap({ at: '2026-12-27T13:00:00Z' }), a.key)).toEqual({ send: false, key: a.key, text: '' });
+  });
+
+  test('expiry today is announced, but elapsed expiry is not called today', () => {
+    const today = buildLlmBudgetAlert(snap({ at: '2026-12-31T00:00:00Z' }));
+    expect(today.key).toBe('expiry:0');
+    expect(today.text).toContain('오늘 사라집니다');
+    const past = buildLlmBudgetAlert(snap({ at: '2027-01-01T13:30:00Z' }));
+    expect(past).toEqual({ send: false, key: 'ok', text: '' });
+  });
+
+  test('fallback takes priority over imminent expiry and never leaks internal account names', () => {
+    const a = buildLlmBudgetAlert(snap({ at: '2026-12-27T13:00:00Z', selected: { reason: 'fallback', account: 'third' }, fallback: { provider: 'grok', remainingPct: 37 } }));
+    expect(a.key).toBe('fallback:grok');
+    expect(a.text.split('\n')).toHaveLength(3);
+    expect(a.text).toContain('grok 로 일하고 있습니다');
+    expect(a.text).not.toContain('사라집니다');
+    expect(a.text).not.toMatch(INTERNAL);
+    expect(buildLlmBudgetAlert(snap({ at: '2026-12-27T13:00:00Z', selected: { reason: 'fallback' }, fallback: { provider: 'grok' } }), a.key).text).toBe('');
+  });
+
+  test('only public provider names appear in fallback text or key, regardless of account-list membership or case', () => {
+    for (const internalName of ['team', 'TEAM', 'ThIrD', 'private-account-not-in-list']) {
+      const state = snap({ selected: { reason: 'fallback', account: 'third' }, fallback: { provider: internalName } });
+      const a = buildLlmBudgetAlert(state);
+      expect(a.send).toBe(true);
+      expect(a.key).toBe('fallback:unknown');
+      expect(a.text).toContain('대체 모델로 일하고 있습니다');
+      expect(a.text).not.toContain(internalName);
+      expect(a.key).not.toContain(internalName);
+      expect(a.text).not.toMatch(INTERNAL);
+      expect(buildLlmBudgetAlert(state, a.key)).toEqual({ send: false, key: a.key, text: '' });
+    }
+  });
+
+  test('changing between unknown internal names keeps the same fallback key and stays silent', () => {
+    const first = buildLlmBudgetAlert(snap({ selected: { reason: 'fallback' }, fallback: { provider: 'TEAM' } }));
+    const changed = buildLlmBudgetAlert(snap({ selected: { reason: 'fallback' }, fallback: { provider: 'private-account-not-in-list' } }), first.key);
+    expect(changed).toEqual({ send: false, key: 'fallback:unknown', text: '' });
+  });
+
+  test('fallback without provider data does not falsely announce credit usage', () => {
+    const a = buildLlmBudgetAlert(snap({ at: '2026-12-27T13:00:00Z', selected: { reason: 'fallback', account: 'team' } }));
+    expect(a.key).toBe('fallback:unknown');
+    expect(a.text).toContain('대체 모델로 일하고 있습니다');
+    expect(a.text).not.toContain('크레딧');
+    expect(a.text).not.toMatch(INTERNAL);
   });
 });

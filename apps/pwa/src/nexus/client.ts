@@ -178,6 +178,7 @@ export interface NexusClient {
   rejectRun(runId: string, body?: { reason?: string }): Promise<{ ok: true; runId: string; decision: 'rejected' }>;
   // ---- config + secrets ----
   getConfig(): Promise<{ config: unknown }>;
+  getChatFastPath(): Promise<{ enabled: boolean }>;
   getSwitches(): Promise<{ switches: SwitchWire[] }>;
   getSwitch(id: string): Promise<{ switch: SwitchWire }>;
   putSwitch(id: string, body: { value: unknown }): Promise<PutSwitchResult>;
@@ -1227,6 +1228,7 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
       request('POST', `/v1/workflows/runs/${encodeURIComponent(runId)}/reject`, body ?? {}),
     // ---- config + secrets ----
     getConfig: () => request('GET', '/v1/config'),
+    getChatFastPath: () => request('GET', '/v1/config/chat-fast-path'),
     getSwitches: () => request('GET', '/v1/config/switches'),
     getSwitch: (id) => request('GET', `/v1/config/switches/${encodeURIComponent(id)}`),
     putSwitch: (id, body) => request('PUT', `/v1/config/switches/${encodeURIComponent(id)}`, body),

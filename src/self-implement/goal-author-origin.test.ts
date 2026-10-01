@@ -23,6 +23,7 @@ const preservedUnknownOriginTags: readonly GoalFileLintTag[] = [
   'unreadable-signals',
   'alternative-signals',
   'count-observation',
+  'release-note',
 ];
 
 const sampleFinding = (tag: GoalFileLintTag): GoalFileLintFinding => ({

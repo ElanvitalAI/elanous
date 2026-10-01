@@ -629,7 +629,7 @@ describe('mcp diagnose CLI path', () => {
       [`--test=${isolate}`, 'mcp', 'diagnose', 'iso-canary-ebf155ba'],
       { ...process.env, NODE_ENV: 'development' },
     );
-    expect(result.combined).toMatch(/\[test-isolation\]|격리/);
+    expect(result.combined).toContain('elanous mcp diagnose — 1 server to probe');
     expect(result.combined).toContain('iso-canary-ebf155ba');
     expect(result.combined).not.toContain("'iso-canary-ebf155ba' not found");
   }, 25_000);

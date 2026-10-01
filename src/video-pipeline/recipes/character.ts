@@ -14,8 +14,10 @@
  *     (📏 2026-09-23: 연출 있는 shot2 = 0.708 < 연출 없는 대조군 0.851).
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { searchVflowReferences } from '../vflow-reference.js';
 import { run } from './ffmpeg.js';
 import { resolvePython } from '../../python/resolve-python.js';
 import { UNOBSERVED, type Recipe } from './types.js';
@@ -111,14 +113,49 @@ export const identityHoldsGate: Recipe = async (ctx) => {
 export const directedShots: Recipe = async (ctx) => {
   const src = ctx.state.shot_sources as Record<string, string> | undefined;
   if (!src) return need('shot_sources');
-  const shot_paths = Object.values(src).filter(existsSync);
-  if (shot_paths.length === 0) return { outcome: 'error', note: '샷 0 — ⛔ 이 러너는 크레딧을 안 쓴다(Seedance·Kling 생성은 스킬 세션의 몫)' };
+  const prompts = ctx.state.shot_prompts as Record<string, string> | undefined;
+  const existingShots = Object.entries(src).filter(([, path]) => existsSync(path));
+  const shot_paths = existingShots.map(([, path]) => path);
+  const promptedShots = existingShots.filter(([shot]) => prompts?.[shot] !== undefined);
+  const shot_references: Record<string, { url: string; videoUrl: string | null; model: string; name: string; author: string | null; authorUrl: string | null; camera: string[] }[]> = {};
+  let referenceNote = '';
+  if (prompts && Object.keys(prompts).length && shot_paths.length) {
+    const file = (ctx.state.vflow_file as string | undefined) ?? join(homedir(), 'docs', 'ref', 'vflow', 'prompts.ndjson');
+    const taxonomy = readFileSync(join(import.meta.dir, '../../../graphs/video/reference/vflow-taxonomy.yaml'), 'utf8');
+    const cameraAxis = taxonomy.match(/^  camera_movement:.*\n((?:^    .*\n)*)/m)?.[1] ?? '';
+    const cameraTerms = [...cameraAxis.matchAll(/term:\s*([^,}]+)/g)].map((match) => match[1]!.trim());
+    // These shot-prompt camera terms supplement the site's taxonomy axis.
+    cameraTerms.push('crash zoom', 'dolly', 'static');
+    const cameraPatterns = cameraTerms.map((term) => {
+      const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return { term, pattern: new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, 'iu') };
+    });
+    let found = 0;
+    for (const [shot] of promptedShots) {
+      const prompt = prompts[shot]!;
+      const camera = cameraPatterns.filter(({ pattern }) => pattern.test(prompt)).map(({ term }) => term);
+      const result = searchVflowReferences(file, { camera, model: ctx.state.shot_model as string | undefined, limit: camera.length ? 3 : 0 });
+      if (!result.available) {
+        referenceNote = `vflow DB 없음(${result.reason})`;
+        break;
+      }
+      shot_references[shot] = result.rows.map((row) => ({
+        url: row.url, videoUrl: row.video?.url ?? null, model: row.model, name: row.name,
+        author: row.author, authorUrl: row.authorUrl, camera: row.spec?.camera ?? [],
+      }));
+      if (shot_references[shot]!.length) found++;
+    }
+    if (!referenceNote) referenceNote = `vflow 참고 ${found}샷/${shot_paths.length}샷`;
+  }
+  const note = (text: string) => referenceNote ? `${text}\n${referenceNote}` : text;
+  if (shot_paths.length === 0) return { outcome: 'error', produced: prompts ? { shot_references } : undefined, note: note('샷 0 — ⛔ 이 러너는 크레딧을 안 쓴다(Seedance·Kling 생성은 스킬 세션의 몫)') };
+  const produced = { shot_paths, shot_count: shot_paths.length, ...(prompts ? { shot_references } : {}) };
   // ⛔⭐ 되돌이 수렴(🩸 2026-09-23 실물: fullbleed → shots → «같은» 샷 → fullbleed … 예산 소진).
   //   리프레임 자가 「그 비율로 다시 렌더하라」고 돌려보냈는데 이 러너는 다시 그릴 수 없다(크레딧 무사용)
   //   ⇒ 같은 샷을 또 내면 같은 판정이 난다. 「못 다시 그린다」를 error 로 말해 `rendered-unedited` 로 끝낸다.
   const pending = (ctx.state.fullbleed_cuts as string[] | undefined) ?? [];
-  if (pending.length) return { outcome: 'error', produced: { shot_paths, shot_count: shot_paths.length }, note: `전용 비율 재렌더가 필요한 샷 ${pending.join(', ')} — ⛔ 이 러너는 다시 그리지 않는다(크레딧 무사용) · 그 비율 렌더를 스킬 세션에서 만든 뒤 native 로 넘겨라` };
-  return { outcome: 'ok', produced: { shot_paths, shot_count: shot_paths.length }, note: `샷 ${shot_paths.length}개 · ⚠️ 이미 생성된 것을 받았다` };
+  if (pending.length) return { outcome: 'error', produced, note: note(`전용 비율 재렌더가 필요한 샷 ${pending.join(', ')} — ⛔ 이 러너는 다시 그리지 않는다(크레딧 무사용) · 그 비율 렌더를 스킬 세션에서 만든 뒤 native 로 넘겨라`) };
+  return { outcome: 'ok', produced, note: note(`샷 ${shot_paths.length}개 · ⚠️ 이미 생성된 것을 받았다`) };
 };
 
 /** `08_shot_ruler.py` 의 `shot_variation` 한 칸만 읽는다(그 자가 «살아남은 유일한 칸»이라 스스로 적었다). */

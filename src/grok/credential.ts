@@ -35,11 +35,13 @@ export const GROK_SUBSCRIPTION_BASE_URL = 'https://cli-chat-proxy.grok.com/v1';
 /** API 키 경로 베이스(토큰 과금). */
 export const GROK_API_BASE_URL = 'https://api.x.ai/v1';
 
-/** 프록시가 요구하는 최소 CLI 버전(실측 426 문면). 이보다 낮으면 거절된다. */
-export const GROK_PROXY_MIN_CLI_VERSION = '0.1.202';
-/** 설치본을 못 읽었을 때 신고할 값. ⛔ 하한을 쓰면 프록시가 하한을 «올리는» 날
- *  전부 426 이 된다 — 그래서 아래 `detectGrokCliVersion()` 이 1순위다. */
-const GROK_PROXY_FALLBACK_CLI_VERSION = GROK_PROXY_MIN_CLI_VERSION;
+/** 프록시가 요구하는 최소 CLI 버전(실측 426 문면). 이보다 낮으면 거절된다.
+ *  2026-10-01 실측: «Your Grok CLI version (0.1.202) is outdated. Please update to version 1.0.13 or later». */
+export const GROK_PROXY_MIN_CLI_VERSION = '1.0.13';
+/** 설치본을 못 읽었을 때(grok CLI 없는 기계 · 파드) 신고할 값 — 하한이 아니라 실측된 최근 설치본.
+ *  ⛔ 하한을 쓰면 프록시가 하한을 «올리는» 날 전부 426 이 된다(10-01 파드 자식이 0.1.202 로 전부 거절됨).
+ *  그래서 아래 `detectGrokCliVersion()` 이 1순위다. */
+const GROK_PROXY_FALLBACK_CLI_VERSION = '1.0.41';
 
 /** 설치된 grok CLI 의 버전. ⭐ 하드코딩 하한 대신 «실제 설치본»을 신고한다.
  *

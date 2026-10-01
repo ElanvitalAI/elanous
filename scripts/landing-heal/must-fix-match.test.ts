@@ -156,21 +156,21 @@ test('landing graph is registered but not scheduled; all commands are observatio
   const parsed = parseGraphTemplateYaml(yaml, 'landing-heal.yaml');
   expect(parsed.errors).toEqual([]);
   expect(parsed.template?.nodes.map((node) => [node.nodeId, node.kind])).toEqual([
-    ['collect', 'observe'], ['must-fix-match', 'judge'], ['verify-needed', 'observe'], ['report', 'observe'], ['done', 'gate'], ['failed', 'gate'],
+    ['collect', 'observe'], ['must-fix-match', 'judge'], ['verify-needed', 'observe'], ['clean-checkout', 'observe'], ['report', 'observe'], ['done', 'gate'], ['failed', 'gate'],
   ]);
-  expect(parsed.template?.nodes.slice(0, 4).map((node) => node.recipe)).toEqual([
-    'cmd:collect', 'cmd:must-fix-match', 'cmd:verify-needed', 'cmd:report',
+  expect(parsed.template?.nodes.slice(0, 5).map((node) => node.recipe)).toEqual([
+    'cmd:collect', 'cmd:must-fix-match', 'cmd:verify-needed', 'cmd:clean-checkout', 'cmd:report',
   ]);
   expect(parsed.template?.edges.map((edge) => [edge.from, edge.map?.ok])).toEqual([
-    ['collect', 'must-fix-match'], ['must-fix-match', 'verify-needed'], ['verify-needed', 'report'], ['report', 'done'],
+    ['collect', 'must-fix-match'], ['must-fix-match', 'verify-needed'], ['verify-needed', 'clean-checkout'], ['clean-checkout', 'report'], ['report', 'done'],
   ]);
   const loop = listLoops({ root, schedules: [], stateRoot: join(root, '.elanous-test') }).find((item) => item.id === 'landing-heal');
   expect(loop?.trigger).toEqual({ cron: '*/30 * * * *', events: ['card'] });
   expect(loop?.enabled).toBe(false);
   const recipes = readFileSync(join(root, 'graphs/landing/recipes.yaml'), 'utf8');
   expect(recipes).not.toMatch(/gh pr (?:merge|comment)|git push/);
-  expect(recipes.match(/command:/g)).toHaveLength(4);
-  expect(recipes.match(/bun scripts\/landing-heal\/run-mission\.ts/g)).toHaveLength(4);
+  expect(recipes.match(/command:/g)).toHaveLength(5);
+  expect(recipes.match(/bun scripts\/landing-heal\/run-mission\.ts/g)).toHaveLength(5);
   const runner = readFileSync(join(root, 'scripts/landing-heal/run-mission.ts'), 'utf8');
   expect(runner).not.toMatch(/(?:spawnSync|run)\(['"](?:git|bun)['"],/);
   expect(runner).not.toMatch(/\b(?:writeFileSync|appendFileSync|unlinkSync|mkdirSync)\b/);

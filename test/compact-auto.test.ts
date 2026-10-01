@@ -19,7 +19,7 @@ describe('shouldAutoCompact', () => {
     );
     expect(decision.fire).toBe(false);
     expect(decision.reason).toBe('disabled');
-    expect(decision.windowTokens).toBe(1_000_000);
+    expect(decision.windowTokens).toBe(1_050_000);
     expect(decision.budgetTokens).toBe(256_000);
   });
 
@@ -32,7 +32,7 @@ describe('shouldAutoCompact', () => {
     expect(decision.fire).toBe(false);
     expect(decision.reason).toBe('under-threshold');
     expect(decision.maxTokens).toBe(256_000);
-    expect(decision.windowTokens).toBe(1_000_000);
+    expect(decision.windowTokens).toBe(1_050_000);
     expect(decision.budgetTokens).toBe(256_000);
   });
 
@@ -66,8 +66,8 @@ describe('shouldAutoCompact', () => {
       partialConfig,
     );
     expect(decision.fire).toBe(false);
-    expect(decision.maxTokens).toBe(1_000_000);
-    expect(decision.windowTokens).toBe(1_000_000);
+    expect(decision.maxTokens).toBe(1_050_000);
+    expect(decision.windowTokens).toBe(1_050_000);
     expect(decision.budgetTokens).toBeUndefined();
   });
 });

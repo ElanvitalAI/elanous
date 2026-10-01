@@ -133,6 +133,43 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
     }
   });
 
+  test('non-interactive post-save prints browser/phone commands but never issues a token or QR', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'onboarding-continue-headless-'));
+    const stdout = spyOn(process.stdout, 'write').mockImplementation(() => true);
+    let issueCalls = 0;
+    let qrCalls = 0;
+    try {
+      const config = await runOnboarding({
+        io: nonInteractiveIO({ answers: {
+          llm: { provider: 'auto' }, skills: { activeSet: 'claudecode' },
+          obsidian: { vault: root }, telegram: { enabled: false }, discord: { enabled: false },
+        }, env: {} }),
+        path: join(root, 'config.json'),
+        continueHereDeps: {
+          showNexus: async () => ({ status: 'unregistered', urls: {
+            pwa: { loopback: 'http://127.0.0.1:31415/app/' },
+            rest: { loopback: 'http://127.0.0.1:31415/v1/' },
+            sse: { loopback: 'http://127.0.0.1:31415/v1/events' },
+          } }),
+          issueToken: () => { issueCalls++; return { token: 'elt_must-not-appear' }; },
+          renderQr: () => { qrCalls++; return 'QR IMAGE'; },
+        },
+      });
+      expect(config.onboarding.completed).toBe(true);
+      const printed = stdout.mock.calls.flat().join('');
+      expect(printed).toContain('Browser: `elanous nexus show`');
+      expect(printed).toContain('Phone: `elanous phone link --temp --ttl 24h`');
+      expect(printed).not.toContain('http://127.0.0.1');
+      expect(printed).not.toContain('elt_must-not-appear');
+      expect(printed).not.toContain('QR IMAGE');
+      expect(issueCalls).toBe(0);
+      expect(qrCalls).toBe(0);
+    } finally {
+      stdout.mockRestore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('runOnboardingNonInteractive completes IO after saving English skills and Korean Gemini answers', async () => {
     const root = mkdtempSync(join(tmpdir(), 'onboarding-non-interactive-complete-'));
     const configPath = join(root, 'config.json');
@@ -373,7 +410,7 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
       });
 
       expect(cfg.llm.provider).toBe('openai-codex');
-      expect(stdout).not.toHaveBeenCalled();
+      expect(stdout.mock.calls.flat().join('')).toContain('Phone: `elanous phone link --temp --ttl 24h`');
       expect(stderr).not.toHaveBeenCalled();
       expect(stdout.mock.calls.flat().join('')).not.toContain('  → skipped.');
       expect(stderr.mock.calls.flat().join('')).not.toContain('  → skipped.');
@@ -402,13 +439,13 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
         },
       };
 
-      expect(await pickCodexAuthMode(io)).toBe('oauth');
+      expect(await pickCodexAuthMode(io, { hasCodexCliLogin: () => false })).toBe('oauth');
       saveTokens('openai-codex', {
         accessToken: 'existing-access-token',
         refreshToken: 'existing-refresh-token',
         expiresAt: Date.now() + 60_000,
       }, { authMode: 'chatgpt', mirrorCodex: false });
-      expect(await pickCodexAuthMode(io)).toBe('oauth-keep');
+      expect(await pickCodexAuthMode(io, { hasCodexCliLogin: () => false })).toBe('oauth-keep');
 
       expect(pickerIds).toEqual(['codex-auth-mode', 'codex-keep-tokens']);
     } finally {

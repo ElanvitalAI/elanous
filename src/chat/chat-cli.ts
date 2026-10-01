@@ -49,5 +49,8 @@ export function toDevChatOpts(opts: ChatCliOpts): DevChatOpts {
 export async function runChatCliCommand(text: string, opts: ChatCliOpts, deps: ChatCliDeps): Promise<void> {
   const spec = buildChatDevSpec(text, toDevChatOpts(opts));
   const run = deps.runDevPipeline ?? runDevPipeline;
-  await run(spec, { runChatTurn: deps.runChatTurn });
+  await run(spec, {
+    runChatTurn: deps.runChatTurn,
+    ...(opts.json ? { progress: (message: string) => { process.stderr.write(`${message}\n`); } } : {}),
+  });
 }

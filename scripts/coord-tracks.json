@@ -1,10 +1,10 @@
 {
   "_comment": "조율 채널 세션 신원의 정본(09-30 역할 재편). id = 2글자 신원(발신 접두 **[TC]**) · title = 직함 · alias = 옛 한 글자(기록 읽기·전환기 발신용) · mark = 옛 표지. 세션을 더하려면 여기 한 줄만 더한다 — coord-post.sh · coord-channel-watch.sh · build-docs-site.ts · mission-phase-track.ts 가 이 파일을 읽는다.",
   "tracks": [
-    { "id": "OP", "title": "COO", "alias": "S", "mark": "🅢", "owns": ["판올림", "컷", "체크리스트", "분배", "통합", "로드맵", "기획", "총괄", "전략", "인계", "release cut", "roadmap", "plan", "strategy"] },
-    { "id": "MK", "title": "CMO", "alias": "T", "mark": "🅣", "owns": ["블로그", "콘텐츠", "발행", "광고", "프로모션", "소구점", "마케팅", "영상", "비디오", "티저", "하이퍼프레임", "렌더", "blog", "content", "marketing", "ads", "video", "teaser", "render", "B-roll", "상표", "변리사", "브랜드", "trademark", "brand", "홈페이지", "웹사이트", "elanous.ai", "elanvital.ai", "website"] },
-    { "id": "TC", "title": "CTO", "alias": "O", "mark": "🅞", "owns": ["하니스", "게이트", "원장", "리뷰", "관측", "릴리스 루프", "흡수", "Obsidian", "매뉴얼", "문서", "기술", "harness", "gate", "ledger", "review", "observability", "intake", "manual", "docs"] },
-    { "id": "UX", "title": "CXO", "alias": "F", "mark": "🅕", "owns": ["PWA", "웹", "탭", "화면", "UI", "프론트엔드", "안드로이드", "아이폰", "데스크톱", "텔레그램", "디스코드", "메신저", "봇", "frontend", "web", "tab", "android", "ios", "desktop", "telegram", "discord", "bot"] },
+    { "id": "OP", "title": "COO", "alias": "S", "mark": "🅢", "runtime": "claude-code", "owns": ["판올림", "컷", "체크리스트", "분배", "통합", "로드맵", "기획", "총괄", "전략", "인계", "release cut", "roadmap", "plan", "strategy"] },
+    { "id": "MK", "title": "CMO", "alias": "T", "mark": "🅣", "runtime": "claude-code", "owns": ["블로그", "콘텐츠", "발행", "광고", "프로모션", "소구점", "마케팅", "영상", "비디오", "티저", "하이퍼프레임", "렌더", "blog", "content", "marketing", "ads", "video", "teaser", "render", "B-roll", "상표", "변리사", "브랜드", "trademark", "brand", "홈페이지", "웹사이트", "elanous.ai", "elanvital.ai", "website"] },
+    { "id": "TC", "title": "CTO", "alias": "O", "mark": "🅞", "runtime": "claude-code", "owns": ["하니스", "게이트", "원장", "리뷰", "관측", "릴리스 루프", "흡수", "Obsidian", "매뉴얼", "문서", "기술", "harness", "gate", "ledger", "review", "observability", "intake", "manual", "docs"] },
+    { "id": "UX", "title": "CXO", "alias": "F", "mark": "🅕", "runtime": "claude-code", "owns": ["PWA", "웹", "탭", "화면", "UI", "프론트엔드", "안드로이드", "아이폰", "데스크톱", "텔레그램", "디스코드", "메신저", "봇", "frontend", "web", "tab", "android", "ios", "desktop", "telegram", "discord", "bot"] },
     { "id": "E", "mark": "🅔", "owns": [] }
   ]
 }

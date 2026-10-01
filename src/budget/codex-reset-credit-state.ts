@@ -9,6 +9,7 @@
 //     ⇒ 직접 부르는 쪽은 «자기가» 감싸야 한다. 여기서 삼키면 저장 실패가 영영 안 보인다.
 //   ⭐ 반면 `writeQuotaSignal` 은 «판정 신호»라 조회를 막으면 안 되므로 자기가 삼킨다(아래 주석).
 
+import { appendCreditHistory } from './codex-credit-plan.js';
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -233,6 +234,7 @@ export function writeQuotaSignal(
       ...(typeof credits?.hasCredits === 'boolean' ? { hasCredits: credits.hasCredits } : {}),
     };
     writeFileSync(path, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+    if (next.creditsBalance !== undefined && next.measuredHome) appendCreditHistory(dirname(path), next.measuredHome, next.creditsBalance);
   } catch { /* fail-soft */ }
 }
 

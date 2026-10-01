@@ -10,7 +10,8 @@ nodes:
   - node_id: start
     kind: agent
     recipe: implement
-    max_visits: 1${extraNodeKey}
+    max_visits: 1
+    progress: [observed]${extraNodeKey}
 edges: []
 `;
 
@@ -36,7 +37,7 @@ describe('graph-declaration-loss', () => {
     const measurement = measureGraphDeclarationLoss(options({ '/graphs/fixture.yaml': graph(), '/graphs/overlays/overlay.yaml': overlay }));
     expect(measurement).toMatchObject({ scannedFiles: 2, graphs: 1, nodes: 1, discardedFields: 1, unknownNodeKeys: 0, unreadableFiles: 0 });
     expect(measurement.discardedFieldsByGraph).toEqual({ fixture: 1 });
-    expect(measurement.discardedFieldsByField).toEqual({ recipe: 1 });
+    expect(measurement.discardedFieldsByField).toEqual({ progress: 1 });
     expect(renderGraphDeclarationLoss(measurement)).toContain('unknown node keys 0');
   });
 

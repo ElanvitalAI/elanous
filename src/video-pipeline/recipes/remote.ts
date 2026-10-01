@@ -49,6 +49,9 @@ export function sshRun(host: string, cmd: string, timeoutMs = 1_800_000): Remote
     `bash -lc ${shq(cmd)}`], timeoutMs);
   const seconds = Math.round((Date.now() - t0) / 1000);
   if (r.ok) return { kind: 'ok', seconds };
+  if (r.code == null && r.signal == null) {
+    return { kind: 'unmeasurable', why: `${host} 에 «못 붙었다» — ssh 를 실행할 수 없다(${r.err || '종료 코드 없음'})`, seconds };
+  }
   // ⛔ ssh 자신이 못 붙은 것(255)과 «원격 명령이 실패한 것»을 섞지 않는다.
   if (r.code === 255 || r.signal !== null) {
     return { kind: 'unmeasurable', why: `${host} 에 «못 붙었다» — ${r.err.split('\n')[0] || `code=${r.code} signal=${r.signal}`}`, seconds };
@@ -61,7 +64,10 @@ export function scpFrom(host: string, remotePath: string, localPath: string): Re
   mkdirSync(join(localPath, '..'), { recursive: true });
   const r = run('scp', ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', `${host}:${remotePath}`, localPath], 600_000);
   if (r.ok) return { kind: 'ok', out: localPath };
-  if (r.code === 255) return { kind: 'unmeasurable', why: `${host} 에 «못 붙었다»` };
+  if (r.code == null && r.signal == null) {
+    return { kind: 'unmeasurable', why: `${host} 에 «못 붙었다» — scp 를 실행할 수 없다(${r.err || '종료 코드 없음'})` };
+  }
+  if (r.code === 255 || r.signal !== null) return { kind: 'unmeasurable', why: `${host} 에 «못 붙었다»` };
   return { kind: 'error', why: `가져오기 실패: ${r.err.split('\n')[0]}` };
 }
 

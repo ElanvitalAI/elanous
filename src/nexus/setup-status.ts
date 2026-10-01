@@ -13,6 +13,7 @@ import type { UserConfig as NexusUserConfig } from './config/types.js';
 import { resolveLaunchdEnvironment } from './install/launchd.js';
 import { resolveSystemdEnvironment } from './install/systemd.js';
 import { resolvePwaStaticDir } from './static-dir-resolve.js';
+import { SKILLS_STEP_COMMAND, unattendedSetupHint } from '../onboarding/entry-hints.js';
 
 export type SetupItemId = 'llm' | 'pwa-build' | 'channel-bot' | 'skill-dirs' | 'os-install';
 
@@ -97,8 +98,6 @@ export interface SetupCheckOpts {
   decideProviderForConfig?: typeof decideProviderForConfig;
 }
 
-const UNATTENDED_SETUP_HINT = 'unattended: `elanous setup --non-interactive --config <ans.json>`';
-
 function hasText(value: unknown): boolean {
   return typeof value === 'string' && value.trim().length > 0;
 }
@@ -146,7 +145,7 @@ function checkLlm(
     id: 'llm',
     label: 'LLM provider',
     passed,
-    hint: `run \`elanous setup llm\` or interactive \`elanous nexus\`; ${UNATTENDED_SETUP_HINT}`,
+    hint: `run \`elanous onboarding llm\` or interactive \`elanous nexus\`; ${unattendedSetupHint()}`,
     ...(detailProvider && detailProvider !== 'none' ? {
       detail: `provider=${detailProvider}${credential ? ` · credential=${credential}` : ''}`,
     } : {}),
@@ -173,7 +172,7 @@ function checkChannelBot(cfg: NexusUserConfig): SetupItem {
     id: 'channel-bot',
     label: 'Channel bot',
     passed: hasText(telegram) || hasText(discord),
-    hint: `run \`elanous nexus channel-bot setup telegram|discord\`; ${UNATTENDED_SETUP_HINT}`,
+    hint: `run \`elanous nexus channel-bot setup telegram|discord\`; ${unattendedSetupHint()}`,
   };
 }
 
@@ -187,7 +186,7 @@ function checkSkillDirs(cfg: MainUserConfig, exists: (path: string) => boolean):
     label: 'Skill dirs',
     passed: existingDirs.length > 0,
     hint: missingDirs.length > 0
-      ? `create the missing skill directories or choose an already-existing skill directory; ${UNATTENDED_SETUP_HINT}`
+      ? `create the missing skill directories or choose an already-existing skill directory; run \`${SKILLS_STEP_COMMAND}\`; ${unattendedSetupHint()}`
       : '',
     ...(dirs.length > 0 ? {
       detail: missingDirs.length > 0 ? `${detail} · missing: ${missingDirs.join(', ')}` : detail,

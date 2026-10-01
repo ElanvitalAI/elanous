@@ -863,7 +863,7 @@ describe('POST /v1/prompt/stream — SSE routing + wire contract', () => {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             sessionId: 'sess-tools-1',
-            userText: 'hi',
+            userText: 'please run the tool',
             tools: 'chat',
           }),
         });
@@ -898,7 +898,7 @@ describe('POST /v1/prompt/stream — SSE routing + wire contract', () => {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
             sessionId: 'sess-tools-2',
-            userText: 'hi',
+            userText: 'please run the tool',
             tools: 'readonly',
           }),
         });

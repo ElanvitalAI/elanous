@@ -30,6 +30,7 @@ import { surfaceEventsDbPath, openSurfaceEventsDb, recentSentDigest, recordInbou
 import { elanousSelfAccessPrompt, elanousSelfAmbientParts } from './self-ambient.js';
 import { localRefGroundingAmbient } from './ref-grounding.js';
 import { resolveRouteDecision } from '../llm/route-decision.js';
+import { explicitTurnTier } from '../model-tier/turn-tier.js';
 import type { RouteDecision } from '../llm/route-decision.js';
 import { debug } from '../debug/log.js';
 import { setEventLoopActivity } from '../debug/event-loop-watchdog.js';
@@ -59,7 +60,7 @@ function recentSentContext(): string {
  *  Bash + PtyShell + search), plus — when the finance domain pack is
  *  enabled (A0) — the analyst orientation + resource map + first-class
  *  finance tools. Drop-in for the hosting bot's `runTurnImpl`. */
-export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource): typeof runTurn {
+export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource, runTurnImpl: typeof runTurn = runTurn): typeof runTurn {
   if (surface !== 'telegram' && surface !== 'discord') {
     throw new Error(`Unsupported elanous agent session source: ${surface}`);
   }
@@ -110,7 +111,13 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource)
     // ⛔ 호출자가 모델을 핀했으면 «건드리지 않는다». 실패는 fail-soft — config 기본을 유지한다.
     let llmOpts = opts.llmOpts;
     let routeDecision: RouteDecision | undefined;
-    if (cfg.llm.provider === 'openai-codex') {
+    const explicitTier = opts.llmOpts?.model ? undefined : explicitTurnTier(cfg, opts.sessionId);
+    if (cfg.llm.provider === 'openai-codex' && explicitTier) {
+      llmOpts = { ...(llmOpts ?? {}), model: explicitTier.model };
+      debug.log('llm.route-decision', 'self-turn', {
+        surface, provider: cfg.llm.provider, model: explicitTier.model, skipped: 'explicit-tier',
+      });
+    } else if (cfg.llm.provider === 'openai-codex') {
       try {
         const decision = resolveRouteDecision({
           provider: cfg.llm.provider,
@@ -212,8 +219,19 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource)
       ...(surfaceFileSink ? { fileSink: surfaceFileSink } : {}),
     });
     llmOpts = terminal.llmOpts;
-    return runTurn({
+    let currentMessage = '';
+    let sawToolCall = false;
+    return runTurnImpl({
       ...opts,
+      onDelta: (delta) => {
+        currentMessage += delta;
+        opts.onDelta?.(delta);
+      },
+      onToolCall: (call) => {
+        currentMessage = '';
+        sawToolCall = true;
+        opts.onToolCall?.(call);
+      },
       llmOpts,
       systemPrompt: terminal.systemPromptParts.join('\n\n'),
       tools: terminal.specs,
@@ -226,11 +244,12 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource)
       // NEXT turn's memory_recall knows the task was CANCELLED, not silently
       // dropped or still running. Only turnAbort (=/cancel) aborts this signal.
       const wasAborted = opts.signal?.aborted === true;
+      const answer = sawToolCall ? currentMessage.trim() : result.text;
       const responseText = wasAborted
-        ? (result.text?.trim()
-            ? `${result.text}\n\n⏹️ 이 작업은 /cancel 로 취소되었습니다 (실행 중이던 Bash/PTY 종료됨).`
+        ? (answer?.trim()
+            ? `${answer}\n\n⏹️ 이 작업은 /cancel 로 취소되었습니다 (실행 중이던 Bash/PTY 종료됨).`
             : '⏹️ 작업이 /cancel 로 취소되었습니다. 실행 중이던 Bash/PTY 를 종료했습니다.')
-        : result.text;
+        : answer;
       // Block 3 — 대화 턴을 크로스서피스 기억에 기록(질의+응답·direction=inbound).
       // fail-soft·비동기(대화 지연 없음). 이후 memory_recall 이 과거 대화도 회상.
       try { recordInboundTurn({ surface, userText: opts.userText, responseText, sessionId: opts.sessionId }); } catch { /* noop */ }

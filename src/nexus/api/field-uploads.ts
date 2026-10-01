@@ -2,11 +2,13 @@
 // 저장 규칙은 src/field/field-media.ts 가 유일한 정본이고 텔레그램 `#현장` 도 같은 함수를 쓴다.
 
 import { debug } from '../../debug/log.js';
+import { readFieldReelStatus, scheduleFieldReel, fieldReelFile, hasFieldReelFile, type FieldReelOptions } from '../../field/field-reel.js';
 import { getElanousConfigDir } from '../../elanous-config-dir.js';
 import {
   FIELD_MAX_FILE_BYTES,
   FIELD_MAX_REQUEST_BYTES,
   FieldUploadError,
+  defaultFieldEvent,
   fieldEventDir,
   isFieldSlug,
   listFieldMedia,
@@ -16,6 +18,9 @@ import {
 import { jsonResponse } from './json-response.js';
 
 export const FIELD_UPLOADS_PATH = '/v1/field/uploads';
+export const FIELD_REEL_PATH = '/v1/field/reel';
+export const FIELD_REEL_FILE_PATH = '/v1/field/reel/file';
+const reelUrl = (event: string) => `${FIELD_REEL_FILE_PATH}?event=${encodeURIComponent(event)}`;
 
 /** 멀티파트 경계·헤더 여유. */
 const MULTIPART_SLACK_BYTES = 4 * 1024 * 1024;
@@ -29,6 +34,9 @@ interface FieldUploadsDeps {
   /** config 뿌리 — 기본 `getElanousConfigDir()`(데몬의 다른 저장소와 같은 해석). 시험은 temp 를 준다. */
   rootDir?: () => string;
   now?: () => Date;
+  reel?: FieldReelOptions;
+  /** 설정 `telegram.fieldDefaultEvent` — 앱이 «오늘» 행사 칸의 기본값으로 받는다(비면 field-<날짜>). */
+  configuredEvent?: () => string | undefined;
 }
 
 function errorResponse(error: FieldUploadError): Response {
@@ -52,6 +60,7 @@ async function readMultipart(req: Request): Promise<FieldMediaInput[]> {
   catch { throw new FieldUploadError('bad-request', 'invalid multipart body'); }
   const files = form.getAll('file').filter((v): v is File => typeof v !== 'string');
   const captured = parseCapturedAtList(form.getAll('capturedAt'));
+  const captions = form.getAll('caption').filter((v): v is string => typeof v === 'string');
   let total = 0;
   const inputs: FieldMediaInput[] = [];
   for (const [i, file] of files.entries()) {
@@ -63,6 +72,7 @@ async function readMultipart(req: Request): Promise<FieldMediaInput[]> {
       mimeType: file.type,
       bytes: new Uint8Array(await file.arrayBuffer()),
       ...(captured[i] ? { capturedAt: captured[i] } : {}),
+      ...((captions.length === 1 ? i === 0 : i < captions.length) ? { caption: captions[i] } : {}),
     });
   }
   return inputs;
@@ -89,22 +99,48 @@ async function readJson(req: Request): Promise<FieldMediaInput[]> {
       ...(typeof f.mimeType === 'string' ? { mimeType: f.mimeType } : {}),
       bytes: new Uint8Array(Buffer.from(f.dataBase64, 'base64')),
       ...(capturedAt !== undefined ? { capturedAt } : {}),
+      ...(typeof f.caption === 'string' ? { caption: f.caption } : {}),
     };
   });
 }
 
 export async function handleFieldUploads(req: Request, deps: FieldUploadsDeps = {}): Promise<Response> {
   const url = new URL(req.url);
-  if (url.pathname !== FIELD_UPLOADS_PATH) return jsonResponse({ error: 'not-found' }, 404);
+  if (![FIELD_UPLOADS_PATH, FIELD_REEL_PATH, FIELD_REEL_FILE_PATH].includes(url.pathname)) return jsonResponse({ error: 'not-found' }, 404);
   if (!deps.authorize?.(req)) return jsonResponse({ error: 'unauthorized' }, 401);
   const rootDir = (deps.rootDir ?? getElanousConfigDir)();
   const event = url.searchParams.get('event') ?? '';
+  // event 없는 GET = 기본 행사 이름만(앱 «오늘» 행사 칸 · 텔레그램 `#현장` 과 같은 기본).
+  if (req.method === 'GET' && !url.searchParams.has('event')) {
+    const defaultEvent = defaultFieldEvent((deps.configuredEvent ?? (() => undefined))(), (deps.now ?? (() => new Date()))());
+    return jsonResponse({ defaultEvent });
+  }
   if (!isFieldSlug(event)) return errorResponse(new FieldUploadError('bad-slug', 'event slug must match ^[a-z0-9][a-z0-9._-]{0,63}$'));
 
+  const dir = fieldEventDir(rootDir, event);
+  if (url.pathname !== FIELD_UPLOADS_PATH && req.method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
+  if (url.pathname === FIELD_REEL_PATH) {
+    const status = readFieldReelStatus(dir);
+    if (!status) return jsonResponse({ error: 'not-found' }, 404);
+    return jsonResponse({ event, state: status.state, items: status.items,
+      ...(status.seconds !== undefined ? { seconds: status.seconds } : {}),
+      ...(status.finishedAt ? { finishedAt: status.finishedAt } : {}),
+      ...(status.state === 'failed' && status.error ? { error: status.error } : {}),
+      ...(status.state === 'done' && hasFieldReelFile(fieldReelFile(dir)) ? { url: reelUrl(event) } : {}) });
+  }
+  if (url.pathname === FIELD_REEL_FILE_PATH) {
+    const status = readFieldReelStatus(dir);
+    const file = fieldReelFile(dir);
+    if (status?.state !== 'done' || !hasFieldReelFile(file)) return jsonResponse({ error: 'not-found' }, 404);
+    return new Response(Bun.file(file), { headers: { 'content-type': 'video/mp4' } });
+  }
   if (req.method === 'GET') {
-    const files = listFieldMedia(fieldEventDir(rootDir, event));
+    const files = listFieldMedia(dir);
+    const status = readFieldReelStatus(dir);
     debug.log('field.upload', 'listed', { count: files.length });
-    return jsonResponse({ event, count: files.length, files });
+    return jsonResponse({ event, count: files.length, files,
+      ...(status ? { reel: { status: status.state, updatedAt: status.updatedAt,
+        ...(status.state === 'done' && hasFieldReelFile(fieldReelFile(dir)) ? { url: reelUrl(event) } : {}) } } : {}) });
   }
   if (req.method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
 
@@ -131,6 +167,7 @@ export async function handleFieldUploads(req: Request, deps: FieldUploadsDeps = 
     debug.log('field.upload', 'saved', {
       surface: 'http', files: result.saved.length, bytes: result.saved.reduce((n, s) => n + s.bytes, 0), count: result.count,
     });
+    scheduleFieldReel(result.dir, deps.reel);
     return jsonResponse({ ok: true, event, saved: result.saved, count: result.count });
   } catch (error) {
     if (error instanceof FieldUploadError) {

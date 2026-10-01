@@ -23,12 +23,12 @@ patch:
 
 describe('decideTemplate — ② 변형', () => {
   const on = resolveGraphAuthority({ flag: true });
-  const off = resolveGraphAuthority({ flag: false });
-
-  it('⛔ 첫째 반증 — 승격이 «꺼져» 있으면 오버레이가 맞아도 «변형이 없다»', () => {
-    const r = decideTemplate({ goalType: 'implement', authority: off, overlays: [PATIENT], state: { attempts: 5 }, stage: 'launch' });
-    expect(r.appliedIds).toEqual([]);
-    expect(r.selections).toEqual([]);       // ⛔ 고르지도 «않는다» — 껐는데 세면 분모가 거짓이 된다
+  it('⛔ 첫째 반증 — 옛 꺼짐 플래그에도 그래프 권위가 유지되어 오버레이가 적용된다', () => {
+    const authority = resolveGraphAuthority({ flag: false });
+    expect(authority).toEqual({ enabled: true, source: 'default' });
+    const r = decideTemplate({ goalType: 'implement', authority, overlays: [PATIENT], state: { attempts: 5 }, stage: 'launch' });
+    expect(r.appliedIds).toEqual(['heal-patient-inline']);
+    expect(r.template.nodes[0]!.maxVisits).toBe(9);
   });
 
   it('조건이 맞으면 얹히고 «그 값이 실제로» 바뀐다', () => {

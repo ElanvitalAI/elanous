@@ -2,14 +2,14 @@
 //   이 PR 이 고친 결함은 전부 ***fail-open*** 이었다(승인해 놓고 값을 안 읽는다 · 기대 실패를
 //   못 재는데 통과한다 · 선언에 없는 노드를 ⚠️ 로 넘긴다). 그런 결함은 「초록」으로 안 보인다.
 //   ⇒ 그래서 이 파일은 «빨간 길»을 같이 밟는다 — 종료 코드가 0 이 아닌 경우를 먼저 적는다.
-import { describe, expect, it } from 'bun:test';
+import { afterAll, describe, expect, it } from 'bun:test';
 import { assembleFilmLineState, loadHyperframesProjects } from './video-film-line.js';
 import { parseArgv } from './lib/argv.js';
 import { summarizeTiers } from '../src/video-pipeline/tier-summary.js';
 import { CAPABILITIES, PROVIDERS } from '../src/video-pipeline/capabilities.js';
 import { gateByHost, hostLabel, isDefinitelyDown, type HostState } from '../src/video-pipeline/host-gating.js';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +19,14 @@ const REPO = join(HERE, '..');
 const CLI = join(HERE, 'video-pipeline.ts');
 const CHECK = join(HERE, 'check-graph-declaration.ts');
 const DECL_REL = 'graphs/video/video-production-pipeline.declaration.yaml';
+const FIXTURE_HOME = mkdtempSync(join(tmpdir(), 'vp-enabled-tools-'));
+mkdirSync(join(FIXTURE_HOME, '.elanous'), { recursive: true });
+mkdirSync(join(FIXTURE_HOME, '.claude', 'skills', 'hyperframes'), { recursive: true });
+writeFileSync(join(FIXTURE_HOME, '.elanous', 'config.json'), JSON.stringify({
+  mcp: { servers: [{ id: 'higgsfield-bridge', enabled: true }, { id: 'topview', enabled: true }] },
+}));
+const FIXTURE_ENV = { ...process.env, HOME: FIXTURE_HOME, ELANOUS_VIDEO_TOOLS: '', ELANOUS_VIDEO_SKIP_REMOTE_PROBE: '1' };
+afterAll(() => rmSync(FIXTURE_HOME, { recursive: true, force: true }));
 
 // 선언 하나만 갈아 끼운 «가짜 저장소»를 만든다. ⛔ 전부 mkdtemp 안이라 작업트리를 안 건드린다.
 function declDir(contents: string): string {
@@ -49,6 +57,14 @@ function out(script: string, args: string[], cwd = REPO): string {
 function outJson(script: string, args: string[], cwd = REPO): string {
   const r = spawnSync('bun', [script, ...args], { cwd, encoding: 'utf8', timeout: 90_000 });
   if (r.status === null) throw new Error(`죽었다(signal=${r.signal})`);
+  return r.stdout;
+}
+
+function configuredOut(args: string[]): string {
+  const r = spawnSync(process.execPath, [CLI, ...args], {
+    cwd: REPO, encoding: 'utf8', timeout: 90_000, env: FIXTURE_ENV,
+  });
+  if (r.status !== 0) throw new Error(`video-pipeline ${args.join(' ')}: exit=${r.status} ${r.stderr}`);
   return r.stdout;
 }
 
@@ -560,6 +576,16 @@ describe('plan — 가정을 사실로 단언하지 않는다', () => {
     }
   });
 
+  it('원격 도구를 못 물어본 plan --json 도 stdout 에 JSON 만 낸다', () => {
+    const r = spawnSync('bun', [CLI, 'plan', '--from', 'ground', '--to', 'deliver', '--json'], {
+      cwd: REPO, encoding: 'utf8', timeout: 90_000,
+      env: { ...process.env, ELANOUS_VIDEO_SKIP_REMOTE_PROBE: '1' },
+    });
+    expect(r.status).toBe(0);
+    expect(r.stdout.trimStart().startsWith('{')).toBe(true);
+    expect(() => JSON.parse(r.stdout)).not.toThrow();
+  });
+
   it('JSON 계약이 «출처»를 싣는다 — probe·plan 둘 다', () => {
     const c = cfg(ASSUME);
     for (const args of [['probe', '--json', '--machine', 'm', '--config', c],
@@ -784,6 +810,72 @@ describe('ssh probe — 「없다」와 「못 쟀다」를 가른다', () => {
 // ⛔⭐ 원격 생성의 «세 갈래» — ok · error · ***unmeasurable***.
 //   🔑 「호스트가 꺼져 있다」를 「못 만든다」로 접으면 ***무료 경로가 통째로 사라진다.***
 describe('원격 무료 생성 — 실패를 «셋»으로 가른다', () => {
+  it('ssh 가 PATH 에 없으면 «못 물어봤다»다 — 실행 실패를 원격 실패로 부르지 않는다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vp-no-ssh-'));
+    const bunPath = process.execPath;
+    const r = spawnSync(bunPath, ['-e', `
+      import { sshRun } from ${JSON.stringify(join(REPO, 'src/video-pipeline/recipes/remote.ts'))};
+      console.log(JSON.stringify(sshRun('nosuchhost-zzz-does-not-exist', 'echo hi', 30000)));
+    `], { cwd: REPO, encoding: 'utf8', timeout: 30_000, env: { ...process.env, PATH: dir } });
+    try {
+      expect(r.status).toBe(0);
+      const result = JSON.parse(r.stdout) as { kind: string; why: string };
+      expect(result.kind).toBe('unmeasurable');
+      expect(result.why).toContain('못 붙었다');
+      expect(result.why).toContain('ssh 를 실행할 수 없다');
+      expect(result.why).toMatch(/ENOENT|Executable not found/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('scp 가 PATH 에 없으면 «못 물어봤다»다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vp-no-scp-'));
+    const r = spawnSync(process.execPath, ['-e', `
+      import { scpFrom } from ${JSON.stringify(join(REPO, 'src/video-pipeline/recipes/remote.ts'))};
+      console.log(JSON.stringify(scpFrom('nosuchhost-zzz-does-not-exist', '/file', ${JSON.stringify(join(dir, 'file'))})));
+    `], { cwd: REPO, encoding: 'utf8', timeout: 30_000, env: { ...process.env, PATH: dir } });
+    try {
+      expect(r.status).toBe(0);
+      const result = JSON.parse(r.stdout) as { kind: string; why: string };
+      expect(result.kind).toBe('unmeasurable');
+      expect(result.why).toContain('못 붙었다');
+      expect(result.why).toContain('scp 를 실행할 수 없다');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('scp 가 실행된 뒤 0 아닌 종료 코드는 여전히 error 다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vp-scp-exit-'));
+    const scp = join(dir, 'scp');
+    writeFileSync(scp, '#!/bin/sh\necho transfer-failed >&2\nexit 7\n');
+    chmodSync(scp, 0o755);
+    const r = spawnSync(process.execPath, ['-e', `
+      import { scpFrom } from ${JSON.stringify(join(REPO, 'src/video-pipeline/recipes/remote.ts'))};
+      console.log(JSON.stringify(scpFrom('localhost', '/file', ${JSON.stringify(join(dir, 'file'))})));
+    `], { cwd: REPO, encoding: 'utf8', timeout: 30_000, env: { ...process.env, PATH: dir } });
+    try {
+      expect(r.status).toBe(0);
+      const result = JSON.parse(r.stdout) as { kind: string; why: string };
+      expect(result.kind).toBe('error');
+      expect(result.why).toContain('transfer-failed');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('붙은 뒤 원격 명령의 0 아닌 종료 코드는 여전히 error 다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vp-ssh-exit-'));
+    const ssh = join(dir, 'ssh');
+    writeFileSync(ssh, '#!/bin/sh\necho remote-command-failed >&2\nexit 7\n');
+    chmodSync(ssh, 0o755);
+    const r = spawnSync(process.execPath, ['-e', `
+      import { sshRun } from ${JSON.stringify(join(REPO, 'src/video-pipeline/recipes/remote.ts'))};
+      console.log(JSON.stringify(sshRun('localhost', 'exit 7', 30000)));
+    `], { cwd: REPO, encoding: 'utf8', timeout: 30_000, env: { ...process.env, PATH: dir } });
+    try {
+      expect(r.status).toBe(0);
+      const result = JSON.parse(r.stdout) as { kind: string; why: string };
+      expect(result.kind).toBe('error');
+      expect(result.why).toContain('remote-command-failed');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('못 붙는 호스트는 «못 물어봤다»다 — 실패가 아니다', async () => {
     const { sshRun } = await import('../src/video-pipeline/recipes/remote.js');
     const r = sshRun('nosuchhost-zzz-does-not-exist', 'echo hi', 30_000);
@@ -804,6 +896,19 @@ describe('원격 무료 생성 — 실패를 «셋»으로 가른다', () => {
     expect(run2(['--bogus', 'x'])).toBe(3);
     expect(run2(['--scene-file', join(REPO, 'graphs/video/scenes/elanvital-ad.json'),
                  '--host', 'nosuchhost-zzz-does-not-exist'])).toBe(2);
+  });
+
+  it('ssh 가 PATH 에 없는 종합 러너도 못 물어봤다로 종료 코드 2 를 낸다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'vp-full-no-ssh-'));
+    try {
+      const r = spawnSync(process.execPath, [join(HERE, 'video-full-line.ts'),
+        '--scene-file', join(REPO, 'graphs/video/scenes/elanvital-ad.json'),
+        '--host', 'nosuchhost-zzz-does-not-exist'], {
+        cwd: REPO, encoding: 'utf8', timeout: 90_000, env: { ...process.env, PATH: dir },
+      });
+      expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(2);
+      expect(`${r.stdout}${r.stderr}`).toContain('못 붙었다');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('장면 파일이 계약을 지킨다 — 장면 둘 이상 ⊕ 각 장면에 프롬프트와 자막', () => {
@@ -894,13 +999,13 @@ describe('summarizeTiers — 무료 도달 가능성', () => {
 //   🔑 그리고 여기서 갈리는 축이 하나 더 있다: ***「무료가 선언돼 있나」***.
 //      선언돼 있으면 «깔면 크레딧 0» 이 되고, 전부 유료면 깔아도 과금이 남는다 — 접으면 안 된다.
 describe('plan 구멍 처방 — 자리가 아니라 값을 댄다', () => {
-  const MISSING = ['plan', '--need', 'audio-mix', '--assume-missing', 'ffmpeg-audio,sox'];
+  const MISSING = ['plan', '--need', 'audio-mix', '--from', 'audio', '--to', 'audio', '--assume-missing', 'ffmpeg-audio,sox'];
 
   // ⚠️ 이름이 산출 «어딘가»에 있는 것으로는 못 잰다 — 옛 코드도 다른 절(「같은 능력의 다른 구현」)에서
   //   같은 이름을 찍었다. 실제로 이 시험의 첫 판이 «옛 코드에서도 통과»했다(t=0 에 이미 참).
   //   ⇒ 「구멍 처방 줄 «안»에 있나」로 묻는다.
-  it('⛔ 구멍 처방 «줄 안»에 선언된 구현 이름이 있다 — 종전엔 그 줄이 없었다', () => {
-    const line = out(CLI, MISSING).split('\n').find((l) => l.includes('↳ 선언된 구현'));
+  it('⛔ 구멍 처방 «줄 안»에 선언된 구현 이름이 있다', () => {
+    const line = out(CLI, MISSING).split('\n').find((l) => l.includes('↳ 선언된 구현') && l.includes('ffmpeg-audio'));
     expect(line).toBeDefined();
     expect(line!).toContain('ffmpeg-audio');
     expect(line!).toContain('sox');
@@ -916,11 +1021,13 @@ describe('plan 구멍 처방 — 자리가 아니라 값을 댄다', () => {
       gaps: string[];
       gapDetail: { gap: string; cap: string; declared: { id: string; tier: string }[]; freeDeclared: boolean }[];
     };
-    expect(j.gaps).toEqual(['audio/audio-mix']);          // 옛 계약이 «그대로»여야 한다
-    expect(j.gapDetail).toHaveLength(1);
-    expect(j.gapDetail[0].cap).toBe('audio-mix');
-    expect(j.gapDetail[0].freeDeclared).toBe(true);
-    expect(j.gapDetail[0].declared.map((d) => d.id).sort()).toEqual(['ffmpeg-audio', 'sox']);
+    expect(j.gaps).toEqual(['audio/audio-mix']);
+    const detail = j.gapDetail.find((d) => d.gap === 'audio/audio-mix');
+    expect(detail).toBeDefined();
+    expect(detail!.cap).toBe('audio-mix');
+    expect(detail!.freeDeclared).toBe(true);
+    expect(detail!.declared.map((d) => d.id).sort()).toEqual(['ffmpeg-audio', 'sox']);
+    expect(j.gapDetail.map((d) => d.gap)).toEqual(j.gaps);
   });
 });
 
@@ -934,8 +1041,8 @@ describe('drive 축 — 앱이 떠 있어야 하는 것을 «빠짐없이» 센�
   const FORCE_BLENDER = ['plan', '--need', 'app-control',
     '--assume-missing', 'bridge-ae,bridge-premiere,affinity', '--json'];
 
-  it('⛔ bridge-blender 를 고르면 «앱 필요»로 센다 — 종전엔 빈 배열이었다', () => {
-    const j = JSON.parse(outJson(CLI, FORCE_BLENDER)) as {
+  it('⛔ bridge-blender 를 고르면 «앱 필요»로 센다 — higgsfield-bridge 설정 필요', () => {
+    const j = JSON.parse(configuredOut(FORCE_BLENDER)) as {
       stack: { picks: { cap: string; impl: string | null }[] }[];
       handDriven: { impl: string; drive: string }[];
     };
@@ -945,10 +1052,10 @@ describe('drive 축 — 앱이 떠 있어야 하는 것을 «빠짐없이» 센�
     expect(j.handDriven.find((h) => h.impl === 'bridge-blender')?.drive).toBe('app-attached');
   });
 
-  it('⚠️ 호스트 축이 «없는» 클라우드 MCP 에는 「앱」을 말하지 않는다', () => {
-    const o = out(CLI, ['probe']);
+  it('⚠️ 호스트 축이 «없는» 클라우드 MCP 에는 「앱」을 말하지 않는다 — higgsfield-bridge·topview 설정 필요', () => {
+    const o = configuredOut(['probe']);
     const topview = o.split('\n').find((l) => l.includes('topview-canvas'));
-    const bridge = o.split('\n').find((l) => l.includes('bridge-ae'));
+    const bridge = o.split('\n').find((l) => l.includes('🔵owned') && l.includes('bridge-blender'));
     expect(topview).toBeDefined();
     expect(bridge).toBeDefined();
     expect(topview!).toContain('호스트 축 없음');
@@ -956,8 +1063,8 @@ describe('drive 축 — 앱이 떠 있어야 하는 것을 «빠짐없이» 센�
     expect(bridge!).toContain('앱');            // ⭐ 붙을 앱이 «있는» 것에는 말한다
   });
 
-  it('⛔ 「확인」이라 말하지 않는다 — 설정만 읽었지 서버를 찌르지 않았다', () => {
-    const o = out(CLI, ['probe']);
+  it('⛔ 「확인」이라 말하지 않는다 — MCP 서버 설정 필요', () => {
+    const o = configuredOut(['probe']);
     expect(o).not.toContain('서버만 확인');
     expect(o).toContain('설정만 확인');
   });
@@ -973,8 +1080,8 @@ describe('--verify-hosts — 호스트 축의 계약', () => {
     expect(o).not.toContain("모르는 플래그 '--verify-hosts'");
   });
 
-  it('⛔ 두 서피스가 «같은 모집단»을 본다 — 종전엔 JSON 만 affinity 를 담았다', () => {
-    const j = JSON.parse(outJson(CLI, ['probe', '--json'])) as {
+  it('⛔ 두 서피스가 «같은 모집단»을 본다 — MCP 서버 설정 필요', () => {
+    const j = JSON.parse(configuredOut(['probe', '--json'])) as {
       capabilities: { found: { id: string; drive?: string }[]; hosts: { impl: string; state: string }[] }[];
     };
     const appAttached = new Set(j.capabilities.flatMap((c) => c.found)
@@ -984,13 +1091,13 @@ describe('--verify-hosts — 호스트 축의 계약', () => {
     expect(appAttached.size).toBeGreaterThan(0);        // 전제: 표본이 비어 있지 않다
   });
 
-  it('⛔ 안 물었으면 「안 붙었다」가 아니라 «not-asked» 다 — 못 쟀다를 거짓으로 접지 않는다', () => {
-    const j = JSON.parse(outJson(CLI, ['probe', '--json'])) as {
+  it('⛔ 안 물었으면 「안 붙었다」가 아니라 «not-asked» 다 — MCP 서버 설정 필요', () => {
+    const j = JSON.parse(configuredOut(['probe', '--json'])) as {
       capabilities: { hosts: { impl: string; state: string }[] }[];
     };
     const states = new Set(j.capabilities.flatMap((c) => c.hosts).map((h) => h.state));
     expect([...states]).toEqual(['not-asked']);
-    expect(out(CLI, ['probe'])).toContain('--verify-hosts 로 물어본다');
+    expect(configuredOut(['probe'])).toContain('--verify-hosts 로 물어본다');
   });
 });
 
@@ -1039,8 +1146,8 @@ describe('provider 축 — 경계가 읽는 needsAccount', () => {
 //      ⇒ 읽는 사람은 「돈이 안 든다」에서 ***「그냥 쓰면 된다」***를 읽고 로그인에서 막힌다.
 //   🔑 이 조합(metered 는 비었는데 계정은 필요하다)이 «접으면 사라지는» 바로 그 칸이다.
 describe('plan 계정 축 — 돈 축과 «접지 않는다»', () => {
-  it('⛔ 돈이 «0» 이면서 계정이 «필요한» 스택이 있다 — 그 조합이 접히던 칸이다', () => {
-    const j = JSON.parse(outJson(CLI, ['plan', '--need', 'app-control', '--json'])) as {
+  it('⛔ 돈이 «0» 이면서 계정이 «필요한» 스택 — higgsfield-bridge 설정 필요', () => {
+    const j = JSON.parse(configuredOut(['plan', '--need', 'app-control', '--json'])) as {
       metered: string[]; accountsNeeded: { provider: string; auth: string | null }[];
     };
     expect(j.metered).toEqual([]);                                  // 돈은 «안» 든다
@@ -1048,8 +1155,8 @@ describe('plan 계정 축 — 돈 축과 «접지 않는다»', () => {
     expect(j.accountsNeeded.find((a) => a.provider === 'higgsfield-bridge')?.auth).toBe('oauth');
   });
 
-  it('사람 화면도 같은 말을 한다 — 한 서피스에만 있으면 «반드시» 샌다', () => {
-    const o = out(CLI, ['plan', '--need', 'app-control']);
+  it('사람 화면도 같은 말을 한다 — higgsfield-bridge 설정 필요', () => {
+    const o = configuredOut(['plan', '--need', 'app-control']);
     expect(o).toContain('계정이 필요한 구현');
     expect(o).toContain('higgsfield-bridge');
     expect(o).toContain('앱을 샀어도 계정 없이는 못 몬다');
@@ -1060,8 +1167,8 @@ describe('plan 계정 축 — 돈 축과 «접지 않는다»', () => {
     expect(o).toContain('계정이 필요한 구현 «0개»');
   });
 
-  it('⛔ 낡은 처방이 남아 있지 않다 — 도구가 할 수 있는 일을 사람에게 시키지 않는다', () => {
-    const o = out(CLI, ['plan', '--need', 'app-control']);
+  it('⛔ 낡은 처방이 남아 있지 않다 — higgsfield-bridge 설정 필요', () => {
+    const o = configuredOut(['plan', '--need', 'app-control', '--from', 'compose', '--to', 'overlay']);
     expect(o).not.toContain('get_host_status 로 물어라');
     expect(o).toContain('--verify-hosts');
   });
@@ -1122,6 +1229,70 @@ describe('호스트 문 — 한 방향으로만 연다', () => {
 //      ⇒ ***얹힌 오버레이가 «0장»이었고 그것이 조용했다.***
 //   🔑 조건은 «비교 하나»이고 사실은 «도구»가 값으로 낸다(`overlayState`).
 describe('오버레이 — 목적이 기본 템플릿을 변형한다', () => {
+  it('임시 HOME 의 활성 MCP 설정으로 실제 plan --need app-control --overlay --json 이 profile-gui-app 을 고른다', () => {
+    const env = FIXTURE_ENV;
+    const probe = spawnSync(process.execPath, [CLI, 'probe'], {
+      cwd: REPO, encoding: 'utf8', timeout: 90_000, env,
+    });
+    expect(probe.status, probe.stderr).toBe(0);
+    const topview = probe.stdout.split('\n').find((line) => line.includes('topview-canvas'));
+    const bridge = probe.stdout.split('\n').find((line) => line.includes('bridge-blender'));
+    expect(topview).toContain('호스트 축 없음');
+    expect(topview).not.toContain('앱');
+    expect(bridge).toContain('앱');
+    expect(probe.stdout).toContain('설정만 확인');
+    const probeJson = spawnSync(process.execPath, [CLI, 'probe', '--json'], {
+      cwd: REPO, encoding: 'utf8', timeout: 90_000, env,
+    });
+    expect(probeJson.status, probeJson.stderr).toBe(0);
+    const probeData = JSON.parse(probeJson.stdout) as {
+      capabilities: { found: { id: string; drive: string }[];
+        hosts: { impl: string; state: string }[] }[];
+    };
+    const attached = new Set(probeData.capabilities.flatMap((c) => c.found)
+      .filter((i) => i.drive === 'app-attached').map((i) => i.id));
+    const hosts = new Set(probeData.capabilities.flatMap((c) => c.hosts).map((h) => h.impl));
+    expect(attached.size).toBeGreaterThan(0);
+    expect(hosts).toEqual(attached);
+    expect(new Set(probeData.capabilities.flatMap((c) => c.hosts).map((h) => h.state)))
+      .toEqual(new Set(['not-asked']));
+    const r = spawnSync(process.execPath, [CLI, 'plan', '--need', 'app-control', '--overlay', '--json'], {
+      cwd: REPO, encoding: 'utf8', timeout: 90_000, env,
+    });
+    expect(r.status, r.stderr).toBe(0);
+    const plan = JSON.parse(r.stdout) as {
+      stack: { picks: { cap: string; impl: string | null }[] }[];
+      overlay: { state: Record<string, number>; selections: { overlayId: string; verdict: string }[];
+        patches: { overlayId: string; node: string; before: number; after: number }[]; error: string | null } | null;
+    };
+    expect(plan.stack.flatMap((n) => n.picks).filter((p) => p.cap === 'app-control')
+      .map((p) => p.impl)).toContain(process.platform === 'darwin' ? 'bridge-ae' : 'bridge-blender');
+    expect(plan.overlay?.error).toBeNull();
+    expect(plan.overlay?.state.selected_app_control).toBeGreaterThan(0);
+    expect(plan.overlay?.selections.find((s) => s.overlayId === 'profile-gui-app')?.verdict).toBe('applies');
+    const patches = plan.overlay?.patches.filter((p) => p.overlayId === 'profile-gui-app') ?? [];
+    expect(patches.map((p) => p.node).sort()).toEqual(['compose', 'render']);
+    for (const patch of patches) expect(patch.after).toBeGreaterThan(patch.before);
+
+    const shim = join(FIXTURE_HOME, 'darwin.ts');
+    writeFileSync(shim, `Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });\n`
+      + `await import(${JSON.stringify(CLI)});\n`);
+    const mac = spawnSync(process.execPath, [shim, 'plan', '--need', 'app-control', '--overlay', '--json'], {
+      cwd: REPO, encoding: 'utf8', timeout: 90_000, env,
+    });
+    expect(mac.status, mac.stderr).toBe(0);
+    const macPlan = JSON.parse(mac.stdout) as typeof plan;
+    expect(macPlan.stack.flatMap((n) => n.picks).filter((p) => p.cap === 'app-control')
+      .map((p) => p.impl)).toContain('bridge-ae');
+    expect(macPlan.overlay?.selections.find((s) => s.overlayId === 'profile-gui-app')?.verdict).toBe('applies');
+    const macProbe = spawnSync(process.execPath, [shim, 'probe'], {
+      cwd: REPO, encoding: 'utf8', timeout: 90_000, env,
+    });
+    expect(macProbe.status, macProbe.stderr).toBe(0);
+    expect(macProbe.stdout).toContain('topview-canvas');
+    expect(macProbe.stdout).toContain('bridge-ae');
+  });
+
   const j = (args: string[]) => JSON.parse(outJson(CLI, args)) as {
     overlay: null | {
       state: Record<string, number>;
@@ -1136,9 +1307,12 @@ describe('오버레이 — 목적이 기본 템플릿을 변형한다', () => {
     expect(out(CLI, ['plan', '--need', 'app-control'])).not.toContain('🪄');
   });
 
-  it('⭐ app-control 을 고른 계획엔 profile-gui-app 이 «얹힌다» — compose·render 예산이 바뀐다', () => {
-    const o = j(['plan', '--need', 'app-control', '--overlay', '--json']).overlay!;
-    expect(o.error).toBeNull();
+  it('⭐ app-control 을 고른 계획엔 profile-gui-app 이 «얹힌다» — MCP 설정 필요', () => {
+    const o = JSON.parse(configuredOut(['plan', '--need', 'app-control', '--overlay', '--json'])).overlay as
+      ReturnType<typeof j>['overlay'];
+    expect(o?.error).toBeNull();
+    expect(o).not.toBeNull();
+    if (!o) return;
     expect(o.state.selected_app_control).toBeGreaterThan(0);        // 전제: 표본이 정말 골랐다
     expect(o.selections.find((s) => s.overlayId === 'profile-gui-app')?.verdict).toBe('applies');
     const nodes = o.patches.filter((p) => p.overlayId === 'profile-gui-app').map((p) => p.node).sort();
@@ -1153,8 +1327,9 @@ describe('오버레이 — 목적이 기본 템플릿을 변형한다', () => {
     expect(o.selections.find((s) => s.overlayId === 'profile-gui-app')?.verdict).toBe('does-not-apply');
   });
 
-  it('⭐ 과금 스택엔 «다른» 오버레이가 얹힌다 — 목적이 변형을 고른다', () => {
-    const o = j(['plan', '--need', 'avatar-video', '--overlay', '--json']).overlay!;
+  it('⭐ 과금 스택엔 «다른» 오버레이가 얹힌다 — MCP 설정 필요', () => {
+    const o = JSON.parse(configuredOut(['plan', '--need', 'avatar-video', '--overlay', '--json'])).overlay as
+      NonNullable<ReturnType<typeof j>['overlay']>;
     expect(o.state.selected_metered_count).toBeGreaterThan(0);
     expect(o.selections.find((s) => s.overlayId === 'profile-credit-heavy')?.verdict).toBe('applies');
     expect(o.selections.find((s) => s.overlayId === 'profile-gui-app')?.verdict).toBe('does-not-apply');
@@ -1181,8 +1356,8 @@ describe('오버레이 — 목적이 기본 템플릿을 변형한다', () => {
 //   ⛔ 그런데 ***같은 칸의 note 가 이미 "미설치면 npx 로 돈다" 고 적고 있었다*** —
 //      선언과 탐침이 서로 다른 말을 했고, 산출은 탐침 편을 들었다.
 describe('skill 탐침 — 선언의 note 와 탐침이 같은 말을 한다', () => {
-  it('⭐ 스킬로 닿는 구현이 probe 에 «보인다»', () => {
-    const j = JSON.parse(outJson(CLI, ['probe', '--json'])) as {
+  it('⭐ 스킬로 닿는 구현이 probe 에 «보인다» — hyperframes 스킬 설정 필요', () => {
+    const j = JSON.parse(configuredOut(['probe', '--json'])) as {
       capabilities: { cap: string; found: { id: string; tier: string }[] }[];
     };
     const mg = j.capabilities.find((c) => c.cap === 'motion-graphics');
@@ -1190,8 +1365,8 @@ describe('skill 탐침 — 선언의 note 와 탐침이 같은 말을 한다', (
     expect(mg!.found.map((i) => i.id)).toContain('hyperframes');
   });
 
-  it('⭐ 무료 선호면 «그것»을 고른다 — 종전엔 「제한적」이라 적힌 것을 골랐다', () => {
-    const j = JSON.parse(outJson(CLI, ['plan', '--need', 'motion-graphics', '--prefer', 'free', '--json'])) as {
+  it('⭐ 무료 선호면 «그것»을 고른다 — hyperframes 스킬 설정 필요', () => {
+    const j = JSON.parse(configuredOut(['plan', '--need', 'motion-graphics', '--prefer', 'free', '--json'])) as {
       stack: { picks: { cap: string; impl: string | null }[] }[];
     };
     const picked = j.stack.flatMap((o) => o.picks).filter((p) => p.cap === 'motion-graphics').map((p) => p.impl);
@@ -1200,8 +1375,8 @@ describe('skill 탐침 — 선언의 note 와 탐침이 같은 말을 한다', (
     expect(picked).not.toContain('ffmpeg-motion');
   });
 
-  it('⛔ 「스킬이 있다」를 「지금 렌더된다」로 말하지 않는다 — note 가 그 경계를 적는다', () => {
-    const o = out(CLI, ['probe']);
+  it('⛔ 「스킬이 있다」를 「지금 렌더된다」로 말하지 않는다 — hyperframes 스킬 설정 필요', () => {
+    const o = configuredOut(['probe']);
     expect(o).toContain('hyperframes');
     // 선언의 note 가 «렌더 확정은 아직»을 말한다 — 산출이 과하게 약속하지 않는지
     expect(o).not.toContain('hyperframes 로 렌더된다');

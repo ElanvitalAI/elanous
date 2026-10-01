@@ -2,12 +2,23 @@ import type { MissionOrigin } from '../autopilot/mission-origin.js';
 
 export const REPORT_ORIGIN_ENV = 'ELANOUS_REPORT_ORIGIN';
 
-const CHANNELS = new Set<MissionOrigin['channel']>(['telegram', 'pwa', 'voice', 'cli', 'api', 'tui']);
+const CHANNELS = new Set<MissionOrigin['channel']>(['telegram', 'pwa', 'voice', 'cli', 'api', 'tui', 'discord']);
+const SNOWFLAKE = /^\d{1,20}$/;
 
 function isReportOrigin(value: unknown): value is MissionOrigin {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const origin = value as Record<string, unknown>;
   if (!CHANNELS.has(origin.channel as MissionOrigin['channel'])) return false;
+  // Discord carries its own reply target (channel ⊕ optional thread snowflakes) — same shape as MissionOrigin.
+  if (origin.channel === 'discord') {
+    for (const key of Object.keys(origin)) {
+      if (!['channel', 'channelId', 'discordThreadId', 'botId', 'hitlMessageId'].includes(key)) return false;
+    }
+    return typeof origin.channelId === 'string' && SNOWFLAKE.test(origin.channelId)
+      && (origin.discordThreadId === undefined || (typeof origin.discordThreadId === 'string' && SNOWFLAKE.test(origin.discordThreadId)))
+      && (origin.botId === undefined || (typeof origin.botId === 'string' && origin.botId.length > 0))
+      && (origin.hitlMessageId === undefined || Number.isSafeInteger(origin.hitlMessageId));
+  }
   if (origin.channel === 'telegram' && (!Number.isSafeInteger(origin.chatId) || origin.chatId === 0)) return false;
   for (const key of Object.keys(origin)) {
     if (!['channel', 'chatId', 'botId', 'threadId', 'hitlMessageId'].includes(key)) return false;
