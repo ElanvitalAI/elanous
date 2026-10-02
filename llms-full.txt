@@ -151,6 +151,16 @@ curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/unins
 
 If you run the background service, restart it after an update — see [troubleshooting](/help/troubleshooting#the-service-still-runs-the-old-version).
 
+## Error reports
+
+When Elanous hits an error, it sends a short report to the Elanous team so we can fix it. This is on by default, and the first run prints one line that says so and how to turn it off.
+
+- **Sent:** the error code, the message and stack trace (secrets and your home directory removed, file paths cut to the file name), the Elanous version and commit, where it happened (terminal UI, web app, CLI or daemon), your OS and CPU type, whether the background service was running, and a random install ID that is not derived from your machine or account.
+- **Not sent:** your name, email or Telegram user — unless you turn that on yourself (`elanous config set errorReports.identity true` plus `errorReports.email`).
+- **How often:** the same error at most once an hour. If sending fails, one copy is kept and sent again the next time Elanous starts, at most once a day.
+- **Kept:** 30 days, then deleted automatically.
+- **Turn off:** `elanous config set errorReports.enabled false`
+
 ## Known limits
 
 - On Linux, `node-pty` has no prebuilt binary; elanous falls back to Bun's own PTY and nothing breaks. `elanous doctor --fix --yes` rebuilds it when a C++ toolchain is present.
@@ -1700,6 +1710,51 @@ summarize Q3 findings: /Users/me/Q3.pdf and /Users/me/chart.png
 
 ---
 
+# Put an HTML page on the web with Vercel
+
+Source: https://docs.elanous.ai/using-elanous/deploy-html-with-vercel/
+
+When you make an HTML page with elanous — a report, a note, a diagram, a site draft — this guide puts it at a public address in a few minutes. It uses Vercel, a hosting service with a free plan.
+
+## 1. One-time setup
+
+1. Create an account at vercel.com. The free Hobby plan is for personal, non-commercial use; use a paid plan for business sites.
+2. Install the command-line tool and sign in:
+   ```bash
+   npm i -g vercel
+   vercel login
+   ```
+
+## 2. Deploy a folder
+
+Put the page and everything it uses (images, CSS) in one folder, with the main file named `index.html`. Then:
+
+```bash
+cd my-page
+vercel deploy --prod
+```
+
+The first time, answer the questions (project name, scope). Vercel prints the address, for example `https://my-page.vercel.app`.
+
+## 3. Update it
+
+Change the files and run `vercel deploy --prod` again in the same folder. The address stays the same.
+
+## 4. Optional
+
+| Want | Do |
+|---|---|
+| A preview address before going live | `vercel deploy` (without `--prod`) |
+| Your own domain | Vercel dashboard → Project → Settings → Domains |
+| Keep it out of search engines | Add `<meta name="robots" content="noindex">` to the page |
+
+## Before you publish
+
+- A deployed page is public. Do not put passwords, keys, personal data or private documents in the folder.
+- Check that you have the right to publish every image and text in it.
+
+---
+
 # How elanous works
 
 Source: https://docs.elanous.ai/concepts/architecture/
@@ -2261,21 +2316,23 @@ Stop a daemon you started by hand with `elanous nexus stop`.
 
 ## What is in it
 
-| Menu | What it does |
-|---|---|
-| **Chat** | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](/surfaces/pwa-chat). |
-| **Terminal** | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and a live view of an agent's terminal from a link. See [Terminal](/surfaces/pwa-terminal). |
-| **Intake** | *Since 0.2.3.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](/using-elanous/tasks-and-intake). |
-| **Approvals** | Things waiting for you: loop steps that ask a person before they go on, and pull requests held for your approval — each with its summary, changed files and checks. Approve, and the pull request is merged. |
-| **Live** | Your harness runs as they happen — stage bars, a stream of decisions (what, why, where to), gauges and the raw log. Everyday mode costs almost nothing; **Full show** records more and animates it, and switches itself off after 30 minutes. See [Live](/surfaces/pwa-live). |
-| **Trace** | Follow one run from the whole fleet down to a single decision and the log line behind it. Filters stack up as a lens you can peel back one chip at a time, and the address keeps the view so you can share it. See [Trace](/surfaces/pwa-trace). |
-| **Missions** | Mission lineage and the task board in one menu; you can also hand a new goal from here. |
-| **Design** | Pick a design system, see drafts, or derive one from a URL. See [Design systems](/using-elanous/design). |
-| **Vault** | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](/surfaces/pwa-vault). |
-| **마켓** (Market) | Browse the signed plugin marketplaces, read a plugin's capabilities, install and remove plugins. See [Plugins](/using-elanous/plugins). |
-| **Schedules** | Every scheduled job in one list — cron, the background service and loop triggers. |
-| **Settings** | Models and tiers, voice and text-to-speech, persona, notifications, theme and daemon health. |
-| **Setup** (`/setup`) | First-time setup in the browser. Today it covers the LLM provider; the other wizard steps still run in the terminal with `elanous onboarding`. |
+**Status** comes from one maturity table that every surface reads. **Stable** screens are shown to everyone. **Experimental** and **Tool** screens are hidden until you set the screen role to **Contributor** in Setup (`/setup` → screen role); **Operator** screens are for the person who runs the machine (**Owner**). Experimental screens work, but their layout and behaviour may still change.
+
+| Menu | Status | What it does |
+|---|---|---|
+| **Chat** | Stable | Talk to elanous with streaming replies, pick a session, a backend and a surface, and see the running budget. Voice input is available where the browser allows microphone access. See [Chat](/surfaces/pwa-chat). |
+| **Terminal** | Stable | Live terminals from your machine in the browser — several tabs, a modifier-key bar for touch keyboards, file and camera attachments, a mirror of the terminal UI, and a live view of an agent's terminal from a link. See [Terminal](/surfaces/pwa-terminal). |
+| **Intake** | Experimental | *Since 0.2.3.* One box for anything you want elanous to take — a link, a memo, a list or an instruction. It shows as you type how it reads the text, then you absorb it into your notes or send it to the harness. See [Tasks and intake](/using-elanous/tasks-and-intake). |
+| **Approvals** | Tool | Things waiting for you: loop steps that ask a person before they go on, and pull requests held for your approval — each with its summary, changed files and checks. Approve, and the pull request is merged. |
+| **Live** | Stable | Your harness runs as they happen — stage bars, a stream of decisions (what, why, where to), gauges and the raw log. Everyday mode costs almost nothing; **Full show** records more and animates it, and switches itself off after 30 minutes. See [Live](/surfaces/pwa-live). |
+| **Trace** | Experimental | Follow one run from the whole fleet down to a single decision and the log line behind it. Filters stack up as a lens you can peel back one chip at a time, and the address keeps the view so you can share it. See [Trace](/surfaces/pwa-trace). |
+| **Missions** | Experimental | Mission lineage and the task board in one menu; you can also hand a new goal from here. |
+| **Design** | Tool | Pick a design system, see drafts, or derive one from a URL. See [Design systems](/using-elanous/design). |
+| **Vault** | Experimental | Browse your Obsidian vault, read and edit notes, create new ones, and explore tags and the link graph. See [Vault](/surfaces/pwa-vault). |
+| **마켓** (Market) | Stable | Browse the signed plugin marketplaces, read a plugin's capabilities, install and remove plugins. See [Plugins](/using-elanous/plugins). |
+| **Schedules** | Operator | Every scheduled job in one list — cron, the background service and loop triggers. |
+| **Settings** | Experimental (always shown) | Models and tiers, voice and text-to-speech, persona, notifications, theme and daemon health. |
+| **Setup** (`/setup`) | Stable | First-time setup in the browser. Today it covers the LLM provider; the other wizard steps still run in the terminal with `elanous onboarding`. |
 
 ## Use it from another device
 
@@ -2327,6 +2384,8 @@ again.
 # Vault (Obsidian notes)
 
 Source: https://docs.elanous.ai/surfaces/pwa-vault/
+
+> **Experimental.** This screen is hidden by default. Set the screen role to **Contributor** in Setup (`/setup` → screen role) to show it. It works, but its layout and behaviour may still change.
 
 The **Vault** menu of the web app opens your Obsidian vault. You can browse
 it, search it, read and edit notes, create new ones, and explore tags and
@@ -2650,6 +2709,8 @@ If your system asks for reduced motion, Full show keeps the extra detail but dro
 # Trace (follow a run to the log line)
 
 Source: https://docs.elanous.ai/surfaces/pwa-trace/
+
+> **Experimental.** This screen is hidden by default. Set the screen role to **Contributor** in Setup (`/setup` → screen role) to show it. It works, but its layout and behaviour may still change.
 
 **Live** is the stage: everything that is happening, at a glance. **Trace** is the workbench next to it. You start from every run on every machine, narrow the view step by step, and end at a single decision and the exact log line behind it — with a command you can paste into a terminal to find that line again.
 
@@ -4389,6 +4450,14 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.8
+
+Source: https://docs.elanous.ai/releases/0-2-8/
+
+Plus 92 internal changes.
 
 ---
 

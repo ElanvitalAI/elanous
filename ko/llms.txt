@@ -29,6 +29,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 - [Sessions](https://docs.elanous.ai/using-elanous/sessions/): Conversation history, resume, and one-shot chat.
 - [Design systems](https://docs.elanous.ai/using-elanous/design/): Choose one of 52 bundled design systems for a web project, check pages against it with design-lint and design-gate, and optionally draw full previews with OpenDesign.
 - [The TUI](https://docs.elanous.ai/using-elanous/tui/): The 3-pane dashboard: attachments, slash commands, clipboard, terminals.
+- [Put an HTML page on the web with Vercel](https://docs.elanous.ai/using-elanous/deploy-html-with-vercel/): Publish a report, note or diagram page at a public address with Vercel — setup, deploy, update, preview, own domain, noindex.
 
 ## Concepts
 
@@ -71,6 +72,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Releases
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
+- [0.2.8](https://docs.elanous.ai/releases/0-2-8/): Changes in 0.2.8.
 - [0.2.7](https://docs.elanous.ai/releases/0-2-7/): Changes in 0.2.7.
 - [0.2.6](https://docs.elanous.ai/releases/0-2-6/): Changes in 0.2.6.
 - [0.2.5](https://docs.elanous.ai/releases/0-2-5/): Changes in 0.2.5.
