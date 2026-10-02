@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { isHeadlessEnv } from '../acp/codex-auth.js';
 import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import { debug } from '../debug/log.js';
+import { browserUnavailableReason } from '../oauth/browser-availability.js';
 import type { UserConfig } from '../user-config.js';
 
 export interface WebFirstSetupDeps {
@@ -13,6 +14,8 @@ export interface WebFirstSetupDeps {
   renderQr?: (link: string) => string | undefined;
   openBrowser?: (link: string) => boolean;
   isHeadless?: () => boolean;
+  browserEnv?: NodeJS.ProcessEnv;
+  browserPlatform?: NodeJS.Platform;
   print?: (line: string) => void;
 }
 
@@ -70,7 +73,11 @@ export async function runWebFirstSetup(deps: WebFirstSetupDeps): Promise<'link-s
   }
   print('터미널에서 하려면: `elanous setup --terminal`');
   let browserOpened = false;
-  if (!(deps.isHeadless ?? (() => isHeadlessEnv(process.env)))()) {
+  const why = browserUnavailableReason(deps.browserEnv ?? process.env, deps.browserPlatform ?? process.platform);
+  if (why) {
+    print(why);
+    debug.log('browser.open', 'skipped', { reason: why.includes('ssh') ? 'ssh' : 'no-display' });
+  } else if (!(deps.isHeadless ?? (() => isHeadlessEnv(deps.browserEnv ?? process.env)))()) {
     try {
       browserOpened = (deps.openBrowser ?? ((url: string) => {
         const command = process.platform === 'darwin' ? 'open' : process.platform === 'linux' || process.platform === 'freebsd' || process.platform === 'openbsd' ? 'xdg-open' : undefined;

@@ -18,6 +18,8 @@ export type FeedDraft = {
   hashtags: string[];
   location: string | null;
   reel: string | null;
+  /** deliver 가 남긴다 — 알림 경로(daemon·direct·failed·off)와 시각. 도착의 근거는 아니고 «어디로 보냈나»다. */
+  delivered?: { at: string; path: 'daemon' | 'direct' | 'failed' | 'off'; revision: number };
 };
 
 export const ENGINE = resolve(import.meta.dir, '../../skills/explainer-video/engine');

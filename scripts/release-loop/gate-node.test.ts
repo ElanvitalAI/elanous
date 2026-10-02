@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, graphGateResult, judgeGate, parseOptions, type GateRunner } from './gate-node';
+import { createGateRunner, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, type GateRunner } from './gate-node';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
@@ -1250,6 +1250,42 @@ test('Pod splits OOMKilled four-file shard into two two-file jobs without repeat
   } finally { log.mockRestore(); }
 });
 
+test('GT1: a 60-file root shard that OOMs retries as 27/27/6 chunks at once, never halving', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = Array.from({ length: 60 }, (_, i) => `src/f${String(i).padStart(2, '0')}.test.ts`);
+  const sizes: number[] = [];
+  const events: Array<[string, unknown]> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'release-loop.gate' && (event === 'pod-shard-split' || event === 'pod-shard-cap-split')) events.push([event, data]);
+  });
+  try {
+    const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+      return fixtureRunner.command(cmd, args, cwd);
+    }, async (o) => {
+      const paths = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+      sizes.push(paths.length);
+      const artifactsDir = join(root, `cap-shard-${o.name}`);
+      mkdirSync(artifactsDir);
+      if (paths.length > POD_SHARD_FILE_CAP) return { exitCode: 137, artifactsDir, job: 'fake' };
+      writeFileSync(join(artifactsDir, 'shard.log'), `${paths.length} pass\n0 fail\nRan ${paths.length} tests across ${paths.length} files.\n`);
+      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: 'fake' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]));
+    const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+    expect(sizes[0]).toBe(60);
+    expect(sizes.slice(1).sort((a, b) => b - a)).toEqual([27, 27, 6]);
+    expect(result.rc).toBe(0);
+    expect(result.output).toContain('Ran 60 tests across 60 files.');
+    expect(events.map(([event]) => event)).toEqual(['pod-shard-cap-split']);
+    expect(events[0]![1]).toMatchObject({ shard: 0, files: 60, chunks: 3, cap: 27 });
+  } finally { log.mockRestore(); }
+});
+
 test('Pod isolates an OOM file and retains the other three measured passes', async () => {
   const { root, instanceRoot, runner: fixtureRunner } = fake([], []);
   const repo = join(root, 'repo');
@@ -1799,6 +1835,34 @@ test('Pod sweep never assigns a CDP test to a shard, and only single-file isolat
   expect(calls.some((call) => call.files.includes('scripts/webclone/check-layout-landmark.test.ts'))).toBe(false);
   expect(calls.filter((call) => call.files.length === 1).every((call) => call.memoryLimit === '32Gi')).toBe(true);
   expect(calls.filter((call) => call.files.length > 1).every((call) => call.memoryLimit === undefined)).toBe(true);
+});
+
+test('a file measured at or above the heavy budget runs alone at the isolation limit from the first round', async () => {
+  const { root, runner: fixtureRunner } = fake([], []);
+  const repo = join(root, 'repo');
+  mkdirSync(join(repo, 'docs', 'measurements'), { recursive: true });
+  writeFileSync(join(repo, POD_MEMORY_SOURCE), `file\tsecs\trss_mb\nscripts/heavy.test.ts\t90\t${POD_HEAVY_FILE_MB}\nsrc/a.test.ts\t1\t${POD_HEAVY_FILE_MB - 1}\nsrc/b.test.ts\t1\t\n`);
+  const files = ['scripts/heavy.test.ts', 'src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'];
+  const calls: Array<{ files: string[]; memoryLimit?: string }> = [];
+  const runner = createGateRunner(repo, undefined, async (cmd, args, cwd) => {
+    if (cmd === 'rg') return { rc: 1, output: '' };
+    if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+    if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+    return fixtureRunner.command(cmd, args, cwd);
+  }, async (o) => {
+    const assigned = files.filter((file) => o.command[2]!.includes(`'./${file}'`));
+    calls.push({ files: assigned, ...(o.memoryLimit ? { memoryLimit: o.memoryLimit } : {}) });
+    const artifactsDir = join(root, o.name!);
+    mkdirSync(artifactsDir);
+    writeFileSync(join(artifactsDir, 'shard.log'), `${assigned.length} pass\n0 fail\nRan ${assigned.length} tests across ${assigned.length} files.\n`);
+    writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+    return { exitCode: 0, artifactsDir, job: 'fake' };
+  }, new PodPoolScheduler([{ context: 'pool-test', capacity: 4, k3dCluster: 'test' }]), () => '');
+  const result = await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 });
+  expect(result.output).toContain('Ran 4 tests across 4 files.');
+  expect(calls).toHaveLength(2);
+  expect(calls).toContainEqual({ files: ['scripts/heavy.test.ts'], memoryLimit: '32Gi' });
+  expect(calls).toContainEqual({ files: ['src/a.test.ts', 'src/b.test.ts', 'src/c.test.ts'] });
 });
 
 test('Pod isolates every file of a depth-two unattributed shard so the unnamed failure lands on one file', async () => {

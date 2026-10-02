@@ -523,7 +523,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       <span aria-live="polite" className="sr-only">ACP: {statusLabel}</span>
       <span className={`pointer-events-none absolute right-2 top-2 rounded bg-black/70 px-2 py-1 text-xs ${statusTone}`}>
         ACP: {statusLabel}
-        {acpState === 'CONNECTING' && ` · ${connectingDurationSeconds}초 · ${connectionTarget} · ${config.baseUrl}`}
+        {acpState === 'CONNECTING' && <span data-share-hide>{' · '}{`${connectingDurationSeconds}초 · ${connectionTarget} · ${config.baseUrl}`}</span>}
       </span>
     </div>
   );

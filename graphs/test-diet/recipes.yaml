@@ -1,0 +1,9 @@
+pick:
+  command: 'bun scripts/test-diet/node.ts pick'
+  timeout_ms: 120000
+measure:
+  command: 'bun scripts/test-diet/node.ts measure'
+  timeout_ms: 14400000
+record:
+  command: 'bun scripts/test-diet/node.ts record'
+  timeout_ms: 300000

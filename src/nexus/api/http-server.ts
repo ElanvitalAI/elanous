@@ -15,6 +15,7 @@
 // Port policy (N1-2 decision): auto-pick from 31415 upward. Actual port
 // is recorded in runtime.json + printed in boot banner.
 
+import { setInProcessOutbound } from '../../domains/outbound-alert.js';
 import { getUserConfig } from '../../user-config.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
@@ -385,6 +386,8 @@ import {
 import { handleSessionTurnControl, SESSION_TURN_CONTROL_PATH } from '../../session/session-turn-control.js';
 import { authenticatePodCredential, handlePodGrokCredential, handlePodGithubCredential, POD_CREDENTIAL_GROK_PATH, POD_CREDENTIAL_GITHUB_PATH } from './pod-credential-api.js';
 import { handleOutboundReport } from './outbound-report.js';
+import { handleErrorReportIngest } from './error-reports.js';
+import { routeOutboundInProcess } from './outbound-report.js';
 import { handleSelfEvent } from './self-event.js';
 /** 매매 «실행»은 애드온이다(대표 09-20 결정 ③ · 별도 상용 저장소 · release/trading-export.yaml) — 공개 코어엔 없다.
  *  있으면 그 경로를 켜고, 없으면 501. 경로를 변수로 둬 공개본 타입 검사가 «모듈 없음»으로 막히지 않게 한다. */
@@ -757,6 +760,8 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
         ...(websocketHandler ? { websocket: websocketHandler } : {}),
       } as unknown as Parameters<typeof Bun.serve>[0];
       server = Bun.serve(fetchOpts);
+      // OB8 — this process now answers /v1/outbound itself; its own sendOutbound calls must not curl it.
+      setInProcessOutbound(routeOutboundInProcess);
       // 데몬이 «실제로» 떴을 때만 재시작 복구(맡긴 일) — 주입된 러너(시험)는 건드리지 않는다.
       if (!opts.execRequests) { try { execRequestRunner().reconcileInterrupted(); } catch { /* 복구 실패가 서버 기동을 막지 않는다 */ } }
       resolvedPort = port;
@@ -781,6 +786,7 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
     url,
     stop() {
       try { server!.stop(true); } catch { /* idempotent */ }
+      setInProcessOutbound(null);
     },
   };
 }
@@ -876,7 +882,7 @@ export async function routeRequest(
     const fallbackAuthorized = fallbackToken !== undefined && offered?.startsWith('Bearer ') === true
       && compareTokenConstTime(offered.slice('Bearer '.length).trim(), fallbackToken);
     if (!(opts.metaApi ? checkAuth(req, opts.metaApi) : fallbackAuthorized)) {
-      const name = method === 'POST' && pathname === '/v1/tasks' && opts.metaApi
+      const name = method === 'POST' && (pathname === '/v1/tasks' || pathname === '/v1/reports/ingest') && opts.metaApi
         ? matchIngestAuthorization(req)?.name
         : undefined;
       if (name === undefined) {
@@ -1304,6 +1310,8 @@ export async function routeRequest(
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
       return handleTaskCreatePost(req, opts.metaApi);
     }
+    // ER2 — error reports forwarded by the bot VM (ingest token · same as /v1/tasks).
+    if (method === 'POST' && pathname === '/v1/reports/ingest') return handleErrorReportIngest(req);
     if (method === 'POST' && pathname.startsWith('/v1/tasks/') && pathname.endsWith('/approve')) {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
       let taskId: string;
@@ -1969,6 +1977,18 @@ export async function routeRequest(
     }
     // HANDOFF §4.2 follow-up — skill-side mirror of the workflow
     // router. Same regex → LLM cascade, applied to the skill index.
+    // SK2 (PWA) — skills the index could not read: list ⊕ confirmed repair.
+    if (pathname === '/v1/skills/problems' || pathname === '/v1/skills/problems/repair') {
+      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+      const { handleSkillProblems } = await import('./skill-problems.js');
+      return handleSkillProblems(req, opts.metaApi);
+    }
+    // SC1 (PWA · beta) — «공유용 캡처»: masked screen PNG in, metadata chunks stripped, stored under <configDir>/captures.
+    if (pathname === '/v1/captures' || pathname.startsWith('/v1/captures/')) {
+      if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+      const { handleShareCaptures } = await import('./share-captures.js');
+      return handleShareCaptures(req, opts.metaApi);
+    }
     if (pathname === '/v1/skills/route' && method === 'POST') {
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
       return handleSkillRoute(req, opts.metaApi);

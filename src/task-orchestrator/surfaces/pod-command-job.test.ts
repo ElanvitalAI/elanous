@@ -321,3 +321,76 @@ describe('명령 잡 자식 요청(requests) (2026-09-27)', () => {
   });
 });
 
+
+describe('POD1 — simultaneous pod runs never touch each other', () => {
+  // A tiny cluster: secrets keyed by name with their labels; `delete secret -l a=b,c=d` removes only matches.
+  function cluster() {
+    const secrets = new Map<string, Record<string, string>>();
+    const matches = (labels: Record<string, string>, selector: string) =>
+      selector.split(',').every((pair) => { const [k, v] = pair.split('='); return labels[k!] === v; });
+    const make = (failJobApply: boolean) => (args: readonly string[], input?: string) => {
+      if (input) {
+        const body = JSON.parse(input) as { kind: string; metadata: { name: string; labels?: Record<string, string> } };
+        if (body.kind === 'Secret') secrets.set(body.metadata.name, body.metadata.labels ?? {});
+        if (body.kind === 'Job' && failJobApply) return { status: 1, stdout: '', stderr: 'job apply refused' };
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (args.includes('delete') && args.includes('secret')) {
+        const at = args.indexOf('-l');
+        if (at >= 0) { for (const [n, l] of [...secrets]) if (matches(l, args[at + 1]!)) secrets.delete(n); }
+        else secrets.delete(args[args.indexOf('secret') + 1]!);
+        return { status: 0, stdout: '', stderr: '' };
+      }
+      if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+      return { status: 0, stdout: '0', stderr: '' };
+    };
+    return { secrets, make };
+  }
+
+  test('two launches in the same millisecond get different names, and the failing one cleans up only its own secret', async () => {
+    const realNow = Date.now;
+    Date.now = () => 1_790_000_000_000;
+    const c = cluster();
+    const names: string[] = [];
+    try {
+      // B starts first and keeps its secret while it runs (its kubectl never finishes the job here, so read secrets before A fails).
+      const bSecretNames = () => [...c.secrets.keys()];
+      const a = runPodCommand({ command: ['true'], skills: [], ghToken: () => 'tok-a', clone: true, kubectl: c.make(true), imageCommit: null, artifactsRoot: '/tmp/pod1-a' })
+        .catch((error: Error) => error.message);
+      const b = runPodCommand({ command: ['true'], skills: [], ghToken: () => 'tok-b', clone: true, kubectl: c.make(false), imageCommit: null, artifactsRoot: '/tmp/pod1-b' })
+        .then((r) => { names.push(r.job); return r; });
+      const [aResult] = await Promise.all([a, b]);
+      expect(String(aResult)).toContain('job apply refused');
+      expect(bSecretNames).toBeDefined();
+    } finally { Date.now = realNow; }
+    expect(names).toHaveLength(1);
+    // A's cleanup selected A's own launch label: B's secret survived until B's own cleanup removed it.
+    expect([...c.secrets.keys()]).toEqual([]);
+  });
+
+  test('the name carries a random tail and the job, its pod template and its secret carry this launch label', async () => {
+    const realNow = Date.now;
+    Date.now = () => 1_790_000_000_000;
+    const bodies: Array<{ kind: string; metadata: { name: string; labels?: Record<string, string> }; spec?: { template?: { metadata?: { labels?: Record<string, string> } } } }> = [];
+    const deletes: string[][] = [];
+    try {
+      const run = () => runPodCommand({ command: ['true'], ghToken: () => 'tok', clone: true, imageCommit: null, artifactsRoot: '/tmp/pod1-c',
+        kubectl: (args, input) => {
+          if (input) bodies.push(JSON.parse(input));
+          if (args.includes('delete')) deletes.push([...args]);
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        } });
+      const first = await run();
+      const second = await run();
+      expect(first.job).not.toBe(second.job);
+    } finally { Date.now = realNow; }
+    const job = bodies.find((b) => b.kind === 'Job')!;
+    const secret = bodies.find((b) => b.kind === 'Secret')!;
+    const launch = job.metadata.labels?.['elanous.launch'];
+    expect(launch).toMatch(/^[0-9a-f]{12}$/);
+    expect(job.spec?.template?.metadata?.labels?.['elanous.launch']).toBe(launch);
+    expect(secret.metadata.labels?.['elanous.launch']).toBe(launch);
+    expect(deletes.every((args) => args.includes('-l') && args[args.indexOf('-l') + 1]!.includes('elanous.launch='))).toBe(true);
+  });
+});

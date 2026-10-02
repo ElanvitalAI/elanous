@@ -2,7 +2,7 @@
 import { homedir } from 'node:os';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandResult, type CommandRunner } from './node-verdict.js';
 
-interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string }
+interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string }
 
 function firstLine(text: string): string { return text.trim().split(/\r?\n/)[0]?.trim() ?? ''; }
 
@@ -44,7 +44,8 @@ export function runOpsUpgrade(run: CommandRunner = runCommand) {
     }
     const command = (args: string[]): CommandResult => host === 'local'
       ? run('elanous', args)
-      : run('ssh', [host, `PATH="$HOME/.local/bin:$HOME/.bun/bin:$PATH"; export PATH; elanous ${args.map(quote).join(' ')}`]);
+      // The installer's own bin dir comes first — a --no-modify-path install (the bot VM) has elanous only there.
+      : run('ssh', [host, `PATH="$HOME/.local/share/elanous/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH"; export PATH; elanous ${args.map(quote).join(' ')}`]);
     let before = '';
     let after = '';
     try {
@@ -68,7 +69,14 @@ export function runOpsUpgrade(run: CommandRunner = runCommand) {
         results.push({ host, ok: false, before, after, error: `올렸는데 판이 그대로 (기대 ${version}, 실제 ${after || '없음'})` });
         continue;
       }
-      results.push({ host, ok: true, before, after });
+      // The webhook receiver (`elanous hooks serve`, a user systemd unit on the bot VM) keeps the old code until it
+      // restarts. try-restart touches it only where it runs; elsewhere the unit is absent and nothing happens.
+      let hooks: string | undefined;
+      if (host !== 'local' && context.input.opsRestart === true) {
+        const restarted = run('ssh', [host, 'systemctl --user try-restart elanous-hooks.service 2>/dev/null && systemctl --user is-active elanous-hooks.service 2>/dev/null || echo absent']);
+        hooks = firstLine(restarted.stdout) || 'absent';
+      }
+      results.push({ host, ok: true, before, after, ...(hooks ? { hooks } : {}) });
     } catch (error) {
       results.push({ host, ok: false, before, after, error: firstLine(String(error)) });
     }

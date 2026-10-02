@@ -22,6 +22,8 @@ async function codexStep(deps: GrokOnboardingDeps, inputs = ['1', '1', '']): Pro
         loadCodexTokens: () => null,
         // OB5b — own PKCE browser login runs first; unavailable by default so each test picks its path.
         loginWithCodexBrowser: async () => { throw new Error('unavailable'); },
+        // W3 asks «SSH · no display» from this env — default to a local desktop so the browser path stays under test.
+        codexEnv: { DISPLAY: ':0' },
         ...deps,
         runAuthCommand: (cmd, args, input) => {
           commands.push([cmd, args, input]);
@@ -66,7 +68,7 @@ describe('onboarding Codex OAuth browser-first', () => {
     expect(requests).toHaveLength(0);
     expect(commands).toHaveLength(0);
     expect(output).toContain('브라우저에서 로그인을 마치세요 — 끝나면 자동으로 이어집니다');
-    expect(output).toContain('→ using your ChatGPT/Codex login.');
+    expect(output).toContain('→ ChatGPT/Codex 로그인을 씁니다.');
   });
 
   test('browser spawn failure falls back to visible device code, auto-open and clipboard', async () => {
@@ -83,11 +85,11 @@ describe('onboarding Codex OAuth browser-first', () => {
       ['wl-copy', [], code],
       ['notify-send', ['Elanous', `인증 코드 ${code} — 클립보드에 복사됨 · 붙여넣기만`], undefined],
     ]);
-    expect(output).toContain(`Open in any browser: ${completeUrl}`);
-    expect(output).toContain(`Enter code:          ${code}`);
+    expect(output).toContain(`아무 브라우저에서 열기: ${completeUrl}`);
+    expect(output).toContain(`코드 입력:             ${code}`);
     expect(output).toContain('코드를 복사했습니다');
-    expect(output).toContain('Waiting for sign-in');
-    expect(output).toContain('Signed in. Tokens saved.');
+    expect(output).toContain('로그인을 기다리는 중');
+    expect(output).toContain('로그인했습니다. 저장했습니다.');
   });
 
   test('macOS local fallback uses open and pbcopy', async () => {
@@ -117,7 +119,7 @@ describe('onboarding Codex OAuth browser-first', () => {
     expect(browserCalls).toBe(0);
     expect(requests).toHaveLength(1);
     expect(commands).toEqual([['pbcopy', [], code]]);
-    expect(output).toContain(`Enter code:          ${code}`);
+    expect(output).toContain(`코드 입력:             ${code}`);
   });
 
   test('clipboard and browser command failures do not interrupt polling or hide URL/code', async () => {
@@ -132,10 +134,10 @@ describe('onboarding Codex OAuth browser-first', () => {
     });
     expect(requests).toHaveLength(1);
     expect(commands.map(([cmd]) => cmd)).toEqual(['xdg-open', 'wl-copy', 'xclip', 'notify-send']);
-    expect(output).toContain(`Open in any browser: ${completeUrl}`);
-    expect(output).toContain(`Enter code:          ${code}`);
+    expect(output).toContain(`아무 브라우저에서 열기: ${completeUrl}`);
+    expect(output).toContain(`코드 입력:             ${code}`);
     expect(output).not.toContain('코드를 복사했습니다');
-    expect(output).toContain('Signed in. Tokens saved.');
+    expect(output).toContain('로그인했습니다. 저장했습니다.');
   });
 
   test('OSC52 copies code when clipboard utilities are unavailable', async () => {
@@ -181,4 +183,15 @@ describe('onboarding Codex OAuth browser-first', () => {
     expect(commands).toHaveLength(0);
     expect(output).toContain('→ using your existing ChatGPT/Codex login.');
   });
+});
+
+test('OB5d — a headless onboarding prints why there is no browser before the device code', async () => {
+  const { output } = await codexStep({
+    codexEnv: { SSH_CLIENT: '10.0.0.2 51000 22' },
+    isHeadless: () => true,
+    authPlatform: 'linux',
+    loginWithCodex: deviceLogin([]),
+  });
+  expect(output).toContain('원격(ssh) 접속이고 화면이 없어 브라우저를 열 수 없습니다');
+  expect(output.indexOf('원격(ssh) 접속이고')).toBeLessThan(output.indexOf('코드 입력:'));
 });

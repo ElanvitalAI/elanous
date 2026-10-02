@@ -12,6 +12,7 @@ import {
 } from '../mcp/mcp-oauth.js';
 import { parseWwwAuthenticate } from '../mcp/client.js';
 import { debug } from '../debug/log.js';
+import { browserUnavailableReason } from '../oauth/browser-availability.js';
 
 const CALLBACK_PATH = '/oauth/callback';
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -31,6 +32,8 @@ export interface McpLoginOpts {
   readConfigFn?: () => { mcp?: { servers: McpServerSpec[] } };
   fetch?: McpOAuthFetch;
   openBrowser?: (url: string) => Promise<void>;
+  browserEnv?: NodeJS.ProcessEnv;
+  browserPlatform?: NodeJS.Platform;
   createListener?: (handler: (req: IncomingMessage, res: ServerResponse) => void) => Server;
   /** 발견한 issuer/tokenEndpoint 를 config 에 되쓰는 자리. 테스트 심. */
   persistDiscoveryFn?: (input: PersistDiscoveryInput) => PersistDiscoveryResult;
@@ -91,10 +94,16 @@ export async function runMcpLogin(opts: McpLoginOpts): Promise<McpLoginResult> {
     void callbackPromise.catch(() => undefined);
     out.log(`Open this URL to authorize '${opts.serverId}':`);
     out.log(authorization.request.url);
-    try {
-      await (opts.openBrowser ?? openDefaultBrowser)(authorization.request.url);
-    } catch {
-      out.error('Could not open the default browser; open the URL above manually.');
+    const why = browserUnavailableReason(opts.browserEnv ?? process.env, opts.browserPlatform ?? process.platform);
+    if (why) {
+      out.log(why);
+      debug.log('browser.open', 'skipped', { reason: why.includes('ssh') ? 'ssh' : 'no-display' });
+    } else {
+      try {
+        await (opts.openBrowser ?? openDefaultBrowser)(authorization.request.url);
+      } catch {
+        out.error('Could not open the default browser; open the URL above manually.');
+      }
     }
     const callback = await callbackPromise;
     await exchangeAuthorizationCode(authorization.metadata, authorization.request, callback, {

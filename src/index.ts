@@ -9,6 +9,9 @@ import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
 import { registerDocsCommands } from './cli/docs-cli.js';
 import { registerA2ACommands } from './cli/a2a-cli.js';
 import { registerPluginCommands } from './cli/plugin-cli.js';
+import { registerConnectCommand, registerSkillsCommands } from './cli/skills-cli.js';
+import { registerImportCommand } from './cli/import-cli.js';
+import { registerPersonaCommands } from './cli/persona-cli.js';
 import { registerFleetCommands } from './cli/fleet-cli.js';
 import { readPipedStdin } from './cli/piped-stdin.js';
 import { writeStdoutJson } from './cli/stdout-json.js';
@@ -885,6 +888,10 @@ registerCardCommand(program);
 registerLaunchHeadCommands(program);
 registerA2ACommands(program);
 registerPluginCommands(program);
+registerSkillsCommands(program);
+registerConnectCommand(program);
+registerImportCommand(program);
+registerPersonaCommands(program);
 
 const marketCmd = program.command('market').description('Signed plugin marketplace');
 marketCmd.command('publish').description('Publish a local signed marketplace index and archives')
@@ -4177,6 +4184,9 @@ const selfOrchestrateCmd = selfCmd
       });
       process.env[HARNESS_RUN_ID_ENV] = runId;
       reportRunId = runId;
+      // HS1 — `harness stop <runId>` must find this process from the moment the run ID exists.
+      try { (await import('./self-dev/orchestrate.js')).writeRunPidRecord(runId); }
+      catch (error) { debug.log('self-dev.orchestrate', 'early-pid-failed', { runId, error: String(error) }, { level: 'warn' }); }
       const createdAt = prior?.createdAt ?? Date.now();
       const { bindOrchestrateRunLedger } = await import('./self-dev/self-orchestrate-runtime.js');
       const { checkpoint } = bindOrchestrateRunLedger({
@@ -4302,7 +4312,26 @@ const selfOrchestrateCmd = selfCmd
           grokApiKeyOptIn = getUserConfig().harness?.pod?.grokApiKeyOptIn === true;
           const credential = resolveGrokCredential();
           const { resolveCodexQuotaPolicy, codexPolicyAllowsCredits, codexPolicyAllowsFallback } = await import('./oauth/codex-quota-policy.js');
-          const quotaPolicy = resolveCodexQuotaPolicy(getUserConfig().llm).policy;
+          const resolvedQuota = resolveCodexQuotaPolicy(getUserConfig().llm);
+          const quotaPolicy = resolvedQuota.policy;
+          // POL1 — say which policy this launch uses and where it came from; warn when a test universe disagrees with production.
+          try {
+            const { effectiveInstanceRoot, prodInstanceRoot } = await import('./instance/resolve.js');
+            const { describeLaunchQuotaPolicy } = await import('./oauth/codex-quota-policy.js');
+            const root = effectiveInstanceRoot();
+            const kind = root === prodInstanceRoot() ? 'prod' as const : 'test' as const;
+            let production: ReturnType<typeof resolveCodexQuotaPolicy> | undefined;
+            if (kind === 'test') {
+              try {
+                const { readFileSync } = await import('node:fs');
+                const prodLlm = (JSON.parse(readFileSync(`${prodInstanceRoot()}/config.json`, 'utf8')) as { llm?: Record<string, unknown> }).llm;
+                production = resolveCodexQuotaPolicy(prodLlm);
+              } catch { /* no production config on this machine */ }
+            }
+            const described = describeLaunchQuotaPolicy({ current: resolvedQuota, universe: { kind, root }, ...(production ? { production } : {}) });
+            debug.log('self-implement.pod', 'quota-policy', { policy: resolvedQuota.policy, source: resolvedQuota.source, universe: kind, productionPolicy: production?.policy ?? null });
+            if (!opts.json) { ui.info(described.line); if (described.warning) ui.warn(described.warning); }
+          } catch { /* the line is advice; the launch goes on */ }
           const plan = planPodProvider({
             codexCandidates: inspectCodexRotation().candidates,
             // Per-account caps (대표 default:97) override the Pod default cap — without them default was dropped at 60%.
@@ -7258,16 +7287,31 @@ loginCmd
   .description('Sign in to OpenAI Codex via the ChatGPT device-code flow')
   .option('--replace-codex-cli-login', 'if the Codex CLI (~/.codex/auth.json) is signed in to a different account, replace it with this login')
   .action(async (opts: { replaceCodexCliLogin?: boolean }) => {
-    ui.header('OpenAI Codex — device-code sign-in');
+    // OB5d — say why there is no browser (ssh · no display) and what to do instead; otherwise try the browser first.
+    const { browserUnavailableReason } = await import('./oauth/browser-availability.js');
+    const noBrowser = browserUnavailableReason();
+    let browserState: Awaited<ReturnType<typeof import('./oauth/codex-browser-login.js')['loginWithCodexBrowser']>> | null = null;
+    if (!noBrowser) {
+      ui.header('OpenAI Codex — 브라우저 로그인');
+      console.log('  브라우저에서 로그인을 마치세요 — 끝나면 자동으로 이어집니다.');
+      try {
+        const { loginWithCodexBrowser } = await import('./oauth/codex-browser-login.js');
+        browserState = await loginWithCodexBrowser();
+      } catch {
+        console.log('  브라우저 로그인이 안 됐습니다 — 코드로 이어갑니다.');
+      }
+    }
+    if (!browserState) ui.header('OpenAI Codex — 코드로 로그인');
+    if (noBrowser) console.log(`  ${noBrowser}`);
     try {
-      const state = await loginWithCodex({
+      const state = browserState ?? await loginWithCodex({
         onProgress: (p) => {
           if (p.type === 'user_code' && p.userCode) {
             console.log('');
-            console.log(`  1) Open in any browser:   ${p.loginUrl}`);
-            console.log(`  2) Enter this code:       ${p.userCode}`);
+            console.log(`  1) 아무 브라우저에서 열기: ${p.loginUrl}`);
+            console.log(`  2) 코드 입력:             ${p.userCode}`);
             console.log('');
-            console.log('  Waiting for sign-in… (Ctrl+C to cancel)');
+            console.log('  로그인을 기다리는 중… (취소: Ctrl+C)');
           }
           if (p.type === 'polling' && p.pollAttempt === 1) {
             process.stdout.write('  .');
@@ -9797,6 +9841,23 @@ nexusChannelBotCmd
     process.exit(result.exitCode);
   });
 
+// EN13 — bring an existing Telegram/Discord bot over from OpenClaw · Hermes · the previous elanous (~/.monad).
+nexusChannelBotCmd
+  .command('import')
+  .description('Find Telegram/Discord bot settings you already use (OpenClaw, Hermes, previous elanous), preview them with the token masked, and store them after you agree.')
+  .option('--yes', 'Import without asking')
+  .action(async (opts: { yes?: boolean }) => {
+    const { runChannelImport } = await import('./channel-import/run.js');
+    const { createInterface } = await import('node:readline/promises');
+    const ask = process.stdin.isTTY ? async (question: string): Promise<boolean> => {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try { const answer = (await rl.question(question)).trim(); return answer === '' || /^(y|yes|예|네)$/i.test(answer); }
+      finally { rl.close(); }
+    } : undefined;
+    const result = await runChannelImport({ yes: opts.yes, ...(ask ? { ask } : {}) });
+    process.exit(result.exitCode);
+  });
+
 // FU A6-real P5 (2026-05-11) — interactive Firecrawl setup.
 // Walks the user through CLI detection + API key entry + persist to
 // `registry.discovery.firecrawl.apiKey`. `--api-key <value>` skips
@@ -10461,6 +10522,14 @@ async function main(): Promise<void> {
   //   elanous --acp-server --transport=unix-socket --socket-path=/tmp/x.sock
   //   elanous --acp-server --transport=websocket --port=31415
   //   elanous --acp-server --transport=websocket --no-auth   # skip token check
+  if (rawArgs.includes('--acp-server') && rawArgs.includes('--login')) {
+    // EN10a — an ACP client's terminal auth re-launches `elanous --acp-server --login`: run the sign-in in that terminal and exit with its status.
+    const { ACP_LOGIN_SUBCOMMAND, currentLaunch } = await import('./acp/auth-methods.js');
+    const launch = currentLaunch();
+    const { spawnSync } = await import('node:child_process');
+    const run = spawnSync(launch.command, [...launch.args, ...ACP_LOGIN_SUBCOMMAND], { stdio: 'inherit' });
+    process.exit(run.status ?? 1);
+  }
   if (rawArgs.includes('--acp-server')) {
     const { bootAcpServer, parseAcpBootArgs } = await import('./boot/acp-server.js');
     const { createDaemonRuntime } = await import('./boot/daemon-runtime.js');
@@ -10751,12 +10820,18 @@ async function main(): Promise<void> {
  * 회귀 방어 = `src/cli-entry.test.ts`(실물 `bin/elanous.mjs` 를 spawn 한다).
  */
 export function runCli(): void {
-  main().catch((err) => {
+  main().catch(async (err) => {
     closeTui();
     if (isCliUserError(err)) {
       console.error(formatCliUserError(err));
       process.exit(1);
     }
+    // ER1 — a real crash is reported once (consented · scrubbed · never blocks more than the send timeout).
+    try {
+      const { reportError } = await import('./error-report/report.js');
+      const outcome = await reportError({ code: 'cli-crash', message: err instanceof Error ? `${err.name}: ${err.message}` : String(err), ...(err instanceof Error && err.stack ? { stack: err.stack } : {}), surface: 'cli' });
+      if (outcome.sent) console.error(`오류를 운영팀에 알렸습니다${outcome.reportId ? ` (보고 번호 ${outcome.reportId})` : ''}.`);
+    } catch { /* the crash itself is what matters */ }
     throw err;
   });
 }

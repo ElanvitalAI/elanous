@@ -1,0 +1,22 @@
+# TD2 — daily test review (shadow): pick a cost-weighted slice from the cursor ledger, measure each file alone on a
+# remote host, judge mechanically, append one ledger line «#a~#b» and draft a card. It never deletes or moves a test.
+# Inputs: budgetSecs (default 1800) · remote (default node-b) · mirror (default ~/mirror/elanous-agent.git)
+graph_id: test-diet
+loop:
+  title: 시험 들여다보기
+  description: 매일 시험 한 조각을 단독으로 재고 판정 초안을 남긴다
+  trigger:
+    events: [manual]
+version: 1
+entry_node: pick
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: pick, kind: judge, recipe: 'cmd:pick', max_visits: 1 }
+  - { node_id: measure, kind: gate, recipe: 'cmd:measure', max_visits: 1 }
+  - { node_id: record, kind: judge, recipe: 'cmd:record', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: pick, on: outcome, map: { ok: measure, fail: failed, error: failed } }
+  - { from: measure, on: outcome, map: { ok: record, fail: failed, error: failed } }
+  - { from: record, on: outcome, map: { ok: done, fail: failed, error: failed } }

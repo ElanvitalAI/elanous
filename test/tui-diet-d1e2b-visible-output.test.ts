@@ -34,7 +34,7 @@ describe('essential slash output', () => {
     ['undo', ['list'], '/undo:'], ['api-allow', ['list'], 'api-allow:'],
     ['resume-turn', ['list'], '/resume:'], ['plan', ['status'], 'plan mode:'],
     ['code-edit', ['status'], 'code-edit policy:'], ['wd', [], 'session working dir:'],
-    ['clear', [], 'Status cleared'],
+    ['clear', [], 'Chat log cleared'],
   ];
   for (const [name, args, expectedText] of commands) {
     test(`/${name} ${args.join(' ')} writes user-visible output`, async () => {

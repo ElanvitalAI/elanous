@@ -2609,10 +2609,16 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
               runTurnImpl,
               getBot: () => getBotRef.current,
             });
+            // DEC-TG(대표 10-02) — decision cards in the owner's Discord DM. Filled once the bot exists (below).
+            let decisionWire: import('../decisions/discord-decision-cards.js').DiscordDecisionWire | null = null;
             const composedOnMessage = async (
               ctx: import('../discord.js').DcIncoming,
               streamer?: import('../discord.js').DcMessageStreamer,
             ): Promise<string | void> => {
+              if (decisionWire && ctx.text.trim() === '/decisions') {
+                const { discordDecisionsCommand } = await import('../decisions/discord-decision-cards.js');
+                return discordDecisionsCommand(decisionWire.service, ctx);
+              }
               const voiceReply = await voiceWire.dispatchVoiceCommand(ctx);
               if (voiceReply !== null) return voiceReply;
               return selfOnMessage(ctx, streamer as never);
@@ -2635,7 +2641,8 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
               dispatch: (event) => workflowDaemon!.dispatchDiscord(event),
               onMessage: composedOnMessage,
               onInteraction: async (raw) => {
-                // C1 버튼 탭 우선(elanous-q: 소비) → 아니면 C3 슬래시.
+                // DEC-TG 결정 카드(dec:/decmemo:) → C1 버튼 탭(elanous-q: 소비) → 아니면 C3 슬래시.
+                if (decisionWire && await decisionWire.onInteraction(raw)) return;
                 if (await questionRuntime.handleComponentInteraction(raw)) return;
                 await slashWire.onInteraction(raw);
               },
@@ -2644,6 +2651,14 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
             if (handle) {
               getBotRef.current = handle.bot;
               workflowDiscordBot = handle;
+              if ((cfg.raw?.decisions as { cards?: unknown } | undefined)?.cards !== false) {
+                try {
+                  const { attachDiscordDecisionCards } = await import('../decisions/discord-decision-cards.js');
+                  decisionWire = attachDiscordDecisionCards(handle.bot, cfg);
+                } catch (err) {
+                  console.warn(`[nexus] decision cards (discord) not attached: ${err instanceof Error ? err.message : String(err)}`);
+                }
+              }
               void slashWire.registerCommands().catch((err: unknown) => {
                 console.warn(`[nexus] slash registration failed: ${err instanceof Error ? err.message : String(err)}`);
               });
@@ -2919,6 +2934,15 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         : readyCount === 1 ? readyServerIds[0] : undefined,
       readyCount,
     });
+    // TERM1 ④ — the first web-terminal spawn used to pay the login-shell env capture (spawnSync · ~3 s with the
+    // daemon frozen) and the terminal module import (~0.9 s). Warm both off the event loop shortly after boot.
+    if (!opts.startNexusHttpServerFn) {
+      const warm = setTimeout(() => {
+        void import('../shell-env-bootstrap.js').then(({ warmCapturedEnv }) => warmCapturedEnv()).catch(() => undefined);
+        void import('../web-terminal/preview-tap-registry.js').then(() => import('../preview/terminal.js')).catch(() => undefined);
+      }, 1_500);
+      (warm as { unref?: () => void }).unref?.();
+    }
     httpServer = startHttpServer({
       state,
       registry,

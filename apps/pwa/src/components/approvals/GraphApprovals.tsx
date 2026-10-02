@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
-import { createGraphApprovalsApi, graphApprovalErrorText, type GraphApproval, type GraphApprovalDecision } from '@/lib/graph-approvals-api';
+import { CONNECT_TOKEN_SETTINGS_HREF, createGraphApprovalsApi, graphApprovalErrorText, needsConnectToken, type GraphApproval, type GraphApprovalDecision } from '@/lib/graph-approvals-api';
 import { createLatestRequestGate, graphApprovalCard } from './graph-approval-card';
 import { FeedPreviewCard } from './FeedPreviewCard';
 
@@ -11,6 +11,7 @@ export function GraphApprovals() {
   const api = useMemo(() => createGraphApprovalsApi({ client }), [client]);
   const [items, setItems] = useState<GraphApproval[]>([]);
   const [error, setError] = useState('');
+  const [pairing, setPairing] = useState(false);
   const [busy, setBusy] = useState(false);
   const gate = useRef(createLatestRequestGate()).current;
   const refresh = useCallback(async () => {
@@ -20,7 +21,8 @@ export function GraphApprovals() {
       if (!gate.isLatest(token)) return;
       setItems(result.items);
       setError('');
-    } catch (err) { if (gate.isLatest(token)) setError(graphApprovalErrorText(err)); }
+      setPairing(false);
+    } catch (err) { if (gate.isLatest(token)) { setError(graphApprovalErrorText(err, 'list')); setPairing(needsConnectToken(err)); } }
   }, [api, gate]);
 
   useEffect(() => {
@@ -37,7 +39,7 @@ export function GraphApprovals() {
     try {
       await api.decide(item.graphId, item.runId, decision);
       await refresh();
-    } catch (err) { setError(graphApprovalErrorText(err)); }
+    } catch (err) { setError(graphApprovalErrorText(err, 'decide')); setPairing(needsConnectToken(err)); }
     finally { setBusy(false); }
   }
 
@@ -53,6 +55,7 @@ export function GraphApprovals() {
   {(others.length > 0 || error) && <section aria-label="실행 승인" className="mx-auto max-w-3xl space-y-4 px-4 pt-6 text-foreground sm:px-8">
     <h2 className="text-xl font-semibold">실행 승인</h2>
     {error && <p role="alert" className="text-sm text-red-600">{error}</p>}
+    {error && pairing && <p className="text-sm"><a href={CONNECT_TOKEN_SETTINGS_HREF} className="font-medium underline" data-connect-token-link>연결 토큰 칸 열기 →</a></p>}
     {others.map((item) => {
       const card = graphApprovalCard(item);
       return <article key={`${item.graphId}/${item.runId}`} className="rounded-xl border border-border bg-card p-5 shadow-sm">

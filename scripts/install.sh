@@ -177,7 +177,7 @@ for command in "${REQUIRED_COMMANDS[@]}"; do
   fi
 done
 for command in "${HARNESS_COMMANDS[@]}"; do
-  command -v "$command" >/dev/null 2>&1 || echo "⚠️ harness command missing: $command" >&2
+  command -v "$command" >/dev/null 2>&1 || echo "$(t "⚠️ harness command missing: $command (see Next below)" "⚠️ 하니스가 쓰는 명령이 없습니다: $command (아래 «다음» 참고)")" >&2
 done
 
 # bun 의 «실제 실행 파일» — PATH 의 이름이 아니라 bun 이 스스로 말하는 경로(링크를 끝까지 푼 것).
@@ -444,7 +444,7 @@ STEP=1
 # INST1 order: new shell → elanous (first-time setup, which also signs in) → missing tools → harness say.
 case ":$PATH:" in
   *":$PREFIX/bin:"*) ;;
-  *) if [ "$MODIFY_PATH" -eq 1 ]; then echo "  $STEP) $(t "open a new shell (or: source $STARTUP)" "새 셸을 여세요(또는: source $STARTUP)")"; else echo "  $STEP) $(t "add $PREFIX/bin to PATH" "$PREFIX/bin 을 PATH 에 넣으세요")"; fi; STEP=$((STEP + 1)) ;;
+  *) if [ "$START_SETUP" -eq 1 ]; then :; elif [ "$MODIFY_PATH" -eq 1 ]; then echo "  $STEP) $(t "open a new shell (or: source $STARTUP)" "새 셸을 여세요(또는: source $STARTUP)")"; STEP=$((STEP + 1)); else echo "  $STEP) $(t "add $PREFIX/bin to PATH" "$PREFIX/bin 을 PATH 에 넣으세요")"; STEP=$((STEP + 1)); fi ;;
 esac
 if [ "$START_SETUP" -eq 0 ]; then
   echo "  $STEP) $(t "Run: $PREFIX/bin/elanous   # first-time setup (in a new shell: elanous)" "실행: $PREFIX/bin/elanous   # 첫 설정(새 셸에서는: elanous)")"; STEP=$((STEP + 1))
@@ -473,7 +473,7 @@ if ! command -v make >/dev/null 2>&1 || ! command -v c++ >/dev/null 2>&1; then
   if [ -n "$BUILD_HINT" ]; then
     echo "  $STEP) $BUILD_HINT"; STEP=$((STEP + 1))
   fi
-  echo "  $STEP) elanous doctor --fix --yes       # rebuild node-pty after installing build tools"; STEP=$((STEP + 1))
+  echo "  $STEP) elanous doctor --fix --yes       # $(t 'rebuild node-pty after installing build tools' '빌드 도구를 깐 뒤 node-pty 다시 빌드')"; STEP=$((STEP + 1))
 fi
 if ! command -v rg >/dev/null 2>&1; then
   if [ -z "${OS_ID:-}" ] && [ -r "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}" ]; then
@@ -487,22 +487,22 @@ if ! command -v rg >/dev/null 2>&1; then
     Linux) case " ${OS_ID:-} ${OS_LIKE:-} " in
       *' debian '*|*' ubuntu '*) RG_HINT='sudo apt-get install -y ripgrep' ;;
       *' fedora '*) RG_HINT='sudo dnf install -y ripgrep' ;;
-      *) RG_HINT='install ripgrep (rg) with your package manager' ;;
+      *) RG_HINT="$(t 'install ripgrep (rg) with your package manager' '패키지 관리자로 ripgrep(rg)을 설치하세요')" ;;
     esac ;;
-    *) RG_HINT='install ripgrep (rg) with your package manager' ;;
+    *) RG_HINT="$(t 'install ripgrep (rg) with your package manager' '패키지 관리자로 ripgrep(rg)을 설치하세요')" ;;
   esac
   echo "  $STEP) $RG_HINT"; STEP=$((STEP + 1))
 fi
 if ! command -v codex >/dev/null 2>&1; then
   if ! command -v node >/dev/null 2>&1; then
-    echo "  $STEP) install Node.js 20+ (the Codex CLI runs on node)   # e.g. your package manager or https://nodejs.org"; STEP=$((STEP + 1))
+    echo "  $STEP) $(t 'install Node.js 20+ (the Codex CLI runs on node)   # e.g. your package manager or https://nodejs.org' 'Node.js 20 이상을 설치하세요(Codex CLI 가 node 로 돕니다)   # 예: 패키지 관리자 또는 https://nodejs.org')"; STEP=$((STEP + 1))
   fi
-  echo "  $STEP) npm install -g @openai/codex      # the harness drives the Codex CLI (not yet measured on a fresh machine)"; STEP=$((STEP + 1))
+  echo "  $STEP) npm install -g @openai/codex      # $(t 'the harness drives the Codex CLI' '하니스가 Codex CLI 를 씁니다')"; STEP=$((STEP + 1))
 fi
 if ! command -v gh >/dev/null 2>&1; then
-  echo "  $STEP) install gh, then: gh auth login   # the harness opens pull requests with it"; STEP=$((STEP + 1))
+  echo "  $STEP) $(t 'install gh, then: gh auth login   # the harness opens pull requests with it' 'gh 를 설치한 뒤: gh auth login   # 하니스가 PR 을 열 때 씁니다')"; STEP=$((STEP + 1))
 elif ! gh auth status >/dev/null 2>&1; then
-  echo "  $STEP) gh auth login                     # the harness opens pull requests with it"; STEP=$((STEP + 1))
+  echo "  $STEP) gh auth login                     # $(t 'the harness opens pull requests with it' '하니스가 PR 을 열 때 씁니다')"; STEP=$((STEP + 1))
 fi
 if [ "$ELN_AVAILABLE" -eq 1 ]; then
   echo "  $STEP) $(t 'eln harness say "<one line of what you want>" (or: elanous harness say)' 'eln harness say "<하고 싶은 일 한 줄>" (또는: elanous harness say)')"
@@ -519,8 +519,17 @@ if [ "$START_SETUP" -eq 1 ]; then
     *":$PREFIX/bin:"*) ;;
     *) echo "  $(t "(new shells will find elanous on PATH; this window uses $PREFIX/bin/elanous)" "(새 셸에서는 PATH 로 elanous 를 찾습니다 · 이 창은 $PREFIX/bin/elanous 를 씁니다)")" ;;
   esac
+  # INST3 (10-01 · node-c tmux): a wizard whose stdin is a fresh open of /dev/tty never saw a key on macOS — its event
+  # loop cannot watch that fd (the same binary started from a shell, which hands over the real tty, worked). So give it
+  # the real terminal device; fall back to /dev/tty only when there is none.
+  SETUP_TTY=/dev/tty
+  REAL_TTY="$(ps -o tty= -p $$ 2>/dev/null | tr -d ' ')"
+  case "$REAL_TTY" in
+    ''|'?'|'??') ;;
+    *) if [ -r "/dev/$REAL_TTY" ] && [ -w "/dev/$REAL_TTY" ]; then SETUP_TTY="/dev/$REAL_TTY"; fi ;;
+  esac
   if [ -n "${ELANOUS_INSTALL_SETUP_EXEC:-}" ]; then
-    exec "$ELANOUS_INSTALL_SETUP_EXEC" "$PREFIX/bin/elanous"
+    ELANOUS_INSTALL_SETUP_TTY="$SETUP_TTY" exec "$ELANOUS_INSTALL_SETUP_EXEC" "$PREFIX/bin/elanous"
   fi
-  exec "$PREFIX/bin/elanous" </dev/tty
+  exec "$PREFIX/bin/elanous" <"$SETUP_TTY"
 fi

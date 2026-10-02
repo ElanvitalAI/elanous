@@ -34,6 +34,7 @@ import { classifyPtyOwnerRunUsage, joinPtyLineage, resolveRunTermination, type P
 import { loadRunLedger, resolveFederatedRunLedgerDirectories, runLedgerDir } from '../../self-implement/run-ledger.js';
 import { requestRemotePtyControl, type PtyControlAction, type PtyControlPayload, type PtyControlRequestOptions, type PtyControlResult } from '../../pty-shell/pty-control-ipc.js';
 import { encodeSgrMouse, type PtyMouseInput } from '../../pty-shell/pty-mouse.js';
+import { createRunningRunsBackground, type RunningRunsBackground } from './running-runs-background.js';
 import { queryRunningRuns, type RunningRunAssessment, type RunningRunPresence, type RunningRunStatus, type RunningRunsResult } from '../../self-implement/running-runs.js';
 // ⭐P4 §4-1 — 표시 폭(wide-char/CJK/emoji 인지) SSOT. PNG 캔버스 cols 파생용.
 import { cellWidth } from '../../ui/printer.js';
@@ -492,6 +493,12 @@ function runningRunsCacheFor(
   binding.cache = createRunningRunsCache({ now: () => binding.now(), queryRunningRuns: injector });
   runningRunsCaches.set(injector, binding);
   return binding.cache;
+}
+
+let liveBackground: RunningRunsBackground | null = null;
+function liveRunningRunsBackground(): RunningRunsBackground {
+  liveBackground ??= createRunningRunsBackground();
+  return liveBackground;
 }
 
 const liveTerminalsListDeps: TerminalsListDeps = {
@@ -1054,17 +1061,26 @@ export function handleTerminalsList(req: Request, opts: MetaApiOpts, deps: Termi
   const resolveRunTerminationForRow = (runId: string): RunTermination => deps.runTerminated
     ? deps.runTerminated(runId, { includeTest })
     : 'ledger-indeterminate';
-  const runningRunsCache = runningRunsCacheFor(getRunningRuns, deps.now ?? Date.now);
   let runningRuns: RunningRunsResult | null = null;
   let runningRunsAgeMs = 0;
   let runningRunsQueryFailed = false;
-  try {
-    const cached = runningRunsCache({ includeTest });
-    runningRuns = cached.result;
-    runningRunsAgeMs = cached.ageMs;
-  } catch {
-    // Fail-soft and do not cache: subjects keep unknown assessments.
-    runningRunsQueryFailed = true;
+  if (getRunningRuns === queryRunningRuns) {
+    // Live daemon: never scan ledgers on this event loop (it froze web-terminal typing) — use the last snapshot a
+    // separate process refreshed. Before the first one lands, subjects keep unknown assessments and the age is null.
+    const snap = liveRunningRunsBackground().snapshot({ includeTest });
+    runningRuns = snap.result;
+    if (snap.ageMs === null) runningRunsQueryFailed = true;
+    else runningRunsAgeMs = snap.ageMs;
+  } else {
+    const runningRunsCache = runningRunsCacheFor(getRunningRuns, deps.now ?? Date.now);
+    try {
+      const cached = runningRunsCache({ includeTest });
+      runningRuns = cached.result;
+      runningRunsAgeMs = cached.ageMs;
+    } catch {
+      // Fail-soft and do not cache: subjects keep unknown assessments.
+      runningRunsQueryFailed = true;
+    }
   }
   const ptyLessSubAgentCollection = collectPtyLessSubAgents(
     getLogStore,

@@ -63,15 +63,15 @@ describe('repeated failure — failure shape rather than severity', () => {
 
   test('owner-token guidance requires both the ACP socket area and failure event', () => {
     const matching = detectRepeatedFailures([row(0, 'webterm.acp.close', 'close', 'socket closed: 1008: auth_failed')], { threshold: 1 })[0]!;
-    expect(explainFailure(matching)).toContain('Bearer token');
+    expect(explainFailure(matching)).toContain('연결 토큰 칸');
     const foreign = detectRepeatedFailures([row(1, 'payments.gateway.error', 'error', 'socket closed: 1008: auth_failed')], { threshold: 1 })[0]!;
     expect(explainFailure(foreign)).toContain('elanous logs --category payments.gateway');
-    expect(explainFailure(foreign)).not.toContain('Bearer token');
+    expect(explainFailure(foreign)).not.toContain('연결 토큰 칸');
     // Live 19:20 tick: the same ACP socket close surfaced through webterm.tabs list errors — same cause, same guidance.
     const tabs = detectRepeatedFailures([row(2, 'webterm.tabs.list.error', 'error', 'Error: socket closed: 1008: auth_failed')], { threshold: 1 })[0]!;
-    expect(explainFailure(tabs)).toContain('Bearer token');
+    expect(explainFailure(tabs)).toContain('연결 토큰 칸');
     const otherWebterm = detectRepeatedFailures([row(3, 'webterm.tabs.list.error', 'error', 'socket error: timeout')], { threshold: 1 })[0]!;
-    expect(explainFailure(otherWebterm)).not.toContain('Bearer token');
+    expect(explainFailure(otherWebterm)).not.toContain('연결 토큰 칸');
   });
 
   test('25 debug failures across category shapes, Error prefix and session IDs yield only the ACP group', () => {
@@ -83,7 +83,7 @@ describe('repeated failure — failure shape rather than severity', () => {
     expect(detectRepeatedFailures(rows, { threshold: 3 }).map((g) => [g.area, g.count]))
       .toEqual([['webterm.acp', 22], ['webterm.acp', 3], ['webterm.tabs', 3]]);
     expect(explainFailure(groups[0]!)).toContain('소유자 토큰');
-    expect(explainFailure(groups[0]!)).toContain('Connect token');
+    expect(explainFailure(groups[0]!)).toContain('연결 토큰 만들기');
     expect(explainFailure(groups[0]!)).toContain('만료');
     expect(explainFailure(groups[0]!)).not.toContain('토큰이 없어');
   });
@@ -111,7 +111,7 @@ describe('repeated failure — failure shape rather than severity', () => {
       expect(repeated).toHaveLength(1);
       expect(repeated[0]?.entity).toContain('webterm.acp');
       expect(repeated[0]?.detail).toContain('소유자 토큰');
-      expect(repeated[0]?.detail).toContain('Bearer token');
+      expect(repeated[0]?.detail).toContain('연결 토큰 칸');
       expect(repeated[0]?.since).toBe(rows[1]?.ts);
     } finally { store.close(); }
   });

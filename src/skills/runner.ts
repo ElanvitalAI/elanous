@@ -330,6 +330,15 @@ function parseTier(raw: unknown): SkillTier | undefined {
 
 const FRONTMATTER_RE = /^---\s*\n([\s\S]*?)\n---\s*\n?/;
 
+/** A frontmatter value as one line of text. Third-party SKILL.md files (~/.codex/skills, ~/.claude/skills …)
+ *  sometimes write `description:` as a YAML list; the parser then returns an array, and a 0.2.6 beta tester's
+ *  first screen crashed on `description.trim is not a function`. Lists are joined; anything else non-string is dropped. */
+export function frontmatterText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.filter((x): x is string => typeof x === 'string').join(' ').trim();
+  return '';
+}
+
 function parseFrontmatter(md: string): { fm: Record<string, any>; body: string } {
   const match = md.match(FRONTMATTER_RE);
   if (!match) return { fm: {}, body: md };
@@ -544,8 +553,8 @@ export function parseSkillMd(skillName: string, baseDir: string = LOCAL_SKILLS_D
   const cost = rawCost === 'light' || rawCost === 'heavy' ? rawCost : undefined;
 
   return {
-    name: fm['name'] || skillName,
-    description: fm['description'] || '',
+    name: frontmatterText(fm['name']) || skillName,
+    description: frontmatterText(fm['description']),
     model: fm['model'] || undefined,
     allowedTools,
     deniedTools,

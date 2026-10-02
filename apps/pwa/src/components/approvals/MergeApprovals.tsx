@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useDaemon } from '@/components/providers/DaemonProvider';
+import { usePwaRole } from '@/lib/pwa-role';
 import { approvalErrorText, createMergeApprovalsApi, type ApprovalGate, type MergeApproval } from '@/lib/merge-approvals-api';
 import { mergeabilityButtonLabel, pollMergeabilityUntilKnown } from './approval-brief';
 import { ApprovalsLoading } from './ApprovalsLoading';
@@ -77,6 +78,7 @@ function MergeabilityPoller({ card, api, attempt, onAttempt, onUpdate }: { card:
 }
 
 export function MergeApprovals() {
+  const role = usePwaRole();
   const { client } = useDaemon();
   const api = useMemo(() => createMergeApprovalsApi({ client }), [client]);
   const [cards, setCards] = useState<Card[]>([]);
@@ -160,12 +162,14 @@ export function MergeApprovals() {
     } finally { setBusy(null); }
   }
 
+  // TXT2 — an empty code-change queue is noise on a stable-only device (event phones); the owner still sees it.
+  if (role !== 'owner' && view === 'open' && !loading && !cards.length && !error) return null;
   return <main className="mx-auto max-w-3xl space-y-5 p-4 pb-20 text-foreground sm:p-8">
-    <header><h1 className="text-2xl font-semibold">Approvals</h1><p className="text-sm text-muted-foreground">아이디어 PR 변경 사항을 확인하고 승인합니다.</p></header>
+    <header><h1 className="text-2xl font-semibold">코드 변경 승인</h1><p className="text-sm text-muted-foreground">자동으로 만든 코드 변경(PR)을 확인하고 승인합니다.</p></header>
     <ApprovalViewTabs view={view} onChange={(next) => { setCards([]); setView(next); }} />
     {loading && <ApprovalsLoading view={view} target={expanded} />}
     {error && <p role="alert" className="text-red-600" data-approvals-error>{error.text}{error.href && <> <a href={error.href} className="font-semibold underline underline-offset-2" data-approvals-settings>설정 열기 →</a></>}</p>}
-    {!loading && !cards.length && !error && <p>{view === 'merged' ? '승인해 머지된 아이디어 PR 이 아직 없습니다.' : '승인을 기다리는 PR 이 없습니다.'}</p>}
+    {!loading && !cards.length && !error && <p>{view === 'merged' ? '승인해 반영된 코드 변경이 아직 없습니다.' : '승인을 기다리는 코드 변경이 없습니다.'}</p>}
     {cards.map((card) => {
       const merged = card.merged || card.state === 'MERGED';
       const closed = card.state !== 'OPEN' && !merged;

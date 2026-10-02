@@ -5,8 +5,9 @@ import { randomUUID } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { listFieldMedia } from './field-media.js';
+import { startFieldFeed, type FieldFeedStart } from './field-feed-auto.js';
 
-export interface FieldReelResult { ok: boolean; file?: string; seconds: number; error?: string }
+export interface FieldReelResult { ok: boolean; file?: string; seconds: number; error?: string; feed?: FieldFeedStart }
 export type FieldReelRunner = (dir: string, opts: { title: string; sub: string }) => Promise<FieldReelResult>;
 export interface FieldReelStatus {
   state: 'waiting' | 'rendering' | 'done' | 'failed';
@@ -26,6 +27,10 @@ export interface FieldReelOptions {
   onDone?: (result: FieldReelResult) => void | Promise<void>;
   /** 같은 수신자가 앨범 항목마다 예약해도 한 렌더당 한 번만 통지한다. */
   notificationKey?: string;
+  /** EV10e — 렌더 성공 뒤 인스타 피드 초안 런을 띄운다(기본 켬 · `false` 나 `ELANOUS_FIELD_FEED_AUTO=0` 이면 끔). */
+  autoFeed?: boolean;
+  /** 시험용 — 피드 시작을 바꿔 끼운다. */
+  startFeed?: (dir: string) => FieldFeedStart;
 }
 
 const REEL_FILE = 'reel-9x16.mp4';
@@ -160,6 +165,8 @@ async function render(dir: string, job: Job): Promise<void> {
       if (t.vision) debug.log('field.reel', 'vision', { event, ...t.vision, music: t.music === true });
     } catch { debug.log('field.reel', 'vision-unread', { event }); }
   }
+  // 뒤이은 업로드로 다시 렌더할 예정이면(dirty) 피드는 그 마지막 렌더 뒤에 한 번만 띄운다.
+  if (result.ok && !job.dirty) result = { ...result, feed: (renderOpts.startFeed ?? ((d: string) => startFieldFeed(d, { enabled: renderOpts.autoFeed })))(dir) };
   job.running = false;
   if (job.dirty) {
     writeStatus(dir, { state: 'waiting', items: listFieldMedia(dir).length });

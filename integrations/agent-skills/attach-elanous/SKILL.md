@@ -1,6 +1,7 @@
 ---
 name: attach-elanous
 description: Hand a coding task to Elanous, a local agent that takes one sentence through plan, implementation, tests, review and a pull request. Use when the user wants a change carried all the way to a PR ("have Elanous do it", "run it end to end", "open a PR for this"), or wants to connect Elanous to this agent as an MCP server.
+summary: Hand one coding task to Elanous, a local agent that carries it through plan, code, tests, review and a pull request.
 license: Apache-2.0
 compatibility: Requires the `elanous` CLI on PATH (macOS, Linux, Windows) and a git repository. Uses the user's own model subscriptions.
 metadata:
@@ -10,7 +11,7 @@ metadata:
 
 # Attach Elanous
 
-Elanous runs on the user's machine. Given one sentence, it writes a goal, works in an isolated git worktree, runs the tests that the change touches, reviews the result, and opens a pull request. Every decision it makes is recorded and can be replayed in its Trace view.
+Elanous runs on the user's machine. Given one sentence, it writes a goal, works in an isolated git worktree, runs the tests that the change touches, reviews the result, and opens a pull request. Its decisions are recorded on the user's machine.
 
 You are handing work over here. Do not also do the same change yourself.
 
@@ -55,7 +56,7 @@ Useful options:
 | `--no-auto-merge` | The user wants to review and merge the PR themselves |
 | `--target <dir>` | The work belongs to a different directory than the current one |
 
-The command prints a run id. Report it to the user together with what was asked. Elanous continues on its own; the result arrives as a pull request (or a branch when there is no remote).
+The command prints a run id. Report it to the user together with what was asked. Elanous continues on its own and reports the result, usually as a pull request.
 
 ## 3. Connect Elanous as an MCP server (optional)
 
@@ -70,6 +71,27 @@ Elanous ships a stdio MCP server. Register it in the agent's MCP configuration:
 ```
 
 After a restart, list the server's tools and use them instead of the CLI when they cover the request.
+
+## Examples
+
+1. Preview first, then run:
+
+   ```bash
+   elanous harness say --dry-run "add a --json flag to the status command; the existing status tests must still pass"
+   elanous harness say "add a --json flag to the status command; the existing status tests must still pass"
+   ```
+
+2. Leave the merge to the user:
+
+   ```bash
+   elanous harness say --no-auto-merge "fix the date parsing in src/report.ts so that 2026-10-02 is not read as UTC midnight; add a test"
+   ```
+
+3. Connect Elanous to this agent once, then use its tools:
+
+   ```json
+   { "mcpServers": { "elanous": { "command": "elanous", "args": ["mcp", "serve"] } } }
+   ```
 
 ## What to tell the user
 

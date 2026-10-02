@@ -198,3 +198,21 @@ test('status survives the renderer deleting reel/ mid-render', async () => {
   release();
   await until(() => readFieldReelStatus(dir)?.state === 'done');
 });
+
+test('EV10e — a successful render starts the feed once; the callback sees it; a failed render does not', async () => {
+  const dir = fixture();
+  media(dir, 1);
+  const starts: string[] = [];
+  const seen: (boolean | undefined)[] = [];
+  const startFeed = (d: string) => { starts.push(d); return { started: true, pid: 7 }; };
+  scheduleFieldReel(dir, { quietMs: 10, runner: async (folder) => ({ ok: true, file: output(folder), seconds: 1 }), startFeed, onDone: (r) => { seen.push(r.feed?.started); } });
+  await until(() => seen.length === 1);
+  expect(starts).toEqual([dir]);
+  const bad = fixture();
+  media(bad, 1);
+  const seenBad: unknown[] = [];
+  scheduleFieldReel(bad, { quietMs: 10, runner: async () => ({ ok: false, seconds: 0, error: 'x' }), startFeed, onDone: (r) => { seenBad.push(r.feed); } });
+  await until(() => seenBad.length === 1);
+  expect(seenBad).toEqual([undefined]);
+  expect(starts).toEqual([dir]);
+});

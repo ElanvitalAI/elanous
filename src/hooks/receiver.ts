@@ -4,6 +4,8 @@ import { userConfigPath } from '../user-config.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { HookQueue, type QueuedHook } from './queue.js';
 import { toExternalTask, verifyWebhook, type HookProvider } from './providers.js';
+import { drainReports, handleReportPost, ReportLimiter, ReportQueue, type ReceivedReport } from './error-report.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 
 export interface HookSecrets {
   linear?: string;
@@ -18,6 +20,8 @@ export interface HookReceiverOptions {
   now?: () => number;
   root?: string;
   retryBaseMs?: number;
+  /** ER2 — forward one queued error report to the Primary; default = POST /v1/reports/ingest over the tailnet. */
+  forwardReport?: (item: ReceivedReport) => Promise<boolean>;
 }
 
 /** `/v1/tasks` lives on the Primary's nexus API, not on the control plane — so the address is its own setting. */
@@ -42,8 +46,40 @@ async function forwardToPrimary(event: QueuedHook): Promise<Response> {
   });
 }
 
+async function forwardReportToPrimary(item: ReceivedReport): Promise<boolean> {
+  const config = JSON.parse(readFileSync(userConfigPath(), 'utf8')) as { hooks?: { primaryTokenRef?: string; primaryUrl?: unknown } };
+  const ref = config.hooks?.primaryTokenRef;
+  if (!ref) throw new Error('primary token reference missing');
+  const token = await getSecretAsync(ref);
+  if (!token) throw new Error('primary token missing');
+  const response = await fetch(new URL('/v1/reports/ingest', hooksPrimaryUrl(config)), {
+    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+    body: JSON.stringify(item), signal: AbortSignal.timeout(10_000),
+  });
+  return response.ok;
+}
+
 export function startHookReceiver(options: HookReceiverOptions): { url: string; stop: () => void; queue: HookQueue } {
   const queue = new HookQueue(options.root);
+  const reportQueue = new ReportQueue(options.root ?? effectiveInstanceRoot(), (event, data) => debug.log('hooks.reports', event, data));
+  const reportLimiter = new ReportLimiter(options.now ?? Date.now);
+  const forwardReport = options.forwardReport ?? forwardReportToPrimary;
+  let reportFailures = 0;
+  let reportNextAt = 0;
+  let reportsDraining = false;
+  async function drainReportQueue(): Promise<void> {
+    if (stopped || reportsDraining || Date.now() < reportNextAt) return;
+    reportsDraining = true;
+    try {
+      const result = await drainReports(reportQueue, forwardReport, (options.now ?? Date.now)());
+      if (result.delivered) debug.log('hooks.reports', 'forwarded', { delivered: result.delivered });
+      if (result.failed) {
+        reportFailures++;
+        reportNextAt = Date.now() + Math.min(300_000, Math.max(1, options.retryBaseMs ?? 1000) * 2 ** Math.min(reportFailures - 1, 20));
+        debug.log('hooks.reports', 'forward-failed', { queued: reportQueue.count(), failures: reportFailures });
+      } else reportFailures = 0;
+    } finally { reportsDraining = false; }
+  }
   const now = options.now ?? Date.now;
   const forward = options.forward ?? forwardToPrimary;
   const attempts = new Map<string, { next: number; failures: number }>();
@@ -75,6 +111,7 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
         })();
       }
     } finally {
+      void drainReportQueue();
       draining = false;
       if (!stopped) timer = setTimeout(() => { void drain(); }, Math.min(1000, options.retryBaseMs ?? 1000));
     }
@@ -83,7 +120,10 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
     async fetch(request) {
       const url = new URL(request.url);
       if (request.method === 'GET' && url.pathname === '/hooks/health')
-        return Response.json({ ok: true, queued: queue.count() });
+        return Response.json({ ok: true, queued: queue.count(), reportsQueued: reportQueue.count() });
+      if (request.method === 'POST' && url.pathname === '/v1/reports')
+        return handleReportPost(request, { limiter: reportLimiter, queue: reportQueue, ...(options.now ? { now: options.now } : {}),
+          log: (event, data) => debug.log('hooks.reports', event, data), wake: () => { reportNextAt = 0; void drainReportQueue(); } });
       if (request.method !== 'POST' || !/^\/hooks\/(linear|asana)$/.test(url.pathname)) return new Response('Not Found', { status: 404 });
       const provider = url.pathname.slice('/hooks/'.length) as HookProvider;
       const reject = (reason: string) => {

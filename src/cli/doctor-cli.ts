@@ -35,6 +35,9 @@ import { gitInstallPlan } from './git-install-plan.js';
 import { detectDistroFamily, parseOsRelease } from './doctor-distro.js';
 import { checkPythonEnv } from './python-cli.js';
 import { describeModes, formatModeLine, type DoctorMode } from './doctor-modes.js';
+import { formatDoctorLocalLlm, probeDoctorLocalLlm, type DoctorLocalLlm } from './doctor-local-llm.js';
+import type { LlmInventory } from '../llm/local-manager/types.js';
+import { buildDoctorBundle } from './doctor-bundle.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -102,6 +105,8 @@ export interface DoctorReport {
   capabilitySummary?: DoctorCapabilitySummary;
   /** Read-only configuration and chat-use status. Present on a successful report. */
   modes?: DoctorMode[];
+  /** Local LLM inventory; CLI probes separately so synchronous credential reports stay read-only and unchanged. */
+  localLlm?: DoctorLocalLlm;
   /** F1 readiness. Present on a successful report. Absent when the report itself failed. */
   readiness?: ReadinessReport;
   reason?: string;
@@ -186,6 +191,8 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   resolveAdviceProvider?: (config: UserConfig) => { provider: string; model: string; auth: string };
   confirmAdvice?: (message: string) => Promise<boolean>;
   adviceInteractive?: boolean;
+  /** Local-manager inventory seam; default calls getInventory(). */
+  localLlmInventory?: () => Promise<LlmInventory>;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1141,6 +1148,7 @@ export function formatDoctorReport(report: DoctorReport, options: { credentials?
     ...(report.externalCommandsCatalogUnavailable ? [`External commands catalog unavailable: ${report.externalCommandsCatalogReason ?? 'catalog/external-commands.yaml is unavailable.'}`] : []),
     ...formatCapabilitySummary(capabilitySummary),
     ...(report.modes ? ['모드:', ...report.modes.map((row) => `  ${formatModeLine(row)}`)] : []),
+    ...(report.localLlm ? formatDoctorLocalLlm(report.localLlm) : []),
   ].join('\n');
 }
 
@@ -1208,12 +1216,37 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
     .description('Reports whether credentials resolve and where each resolution comes from')
     .option('--json', 'structured output')
     .option('--credentials', 'show per-credential details in human-readable output')
+    .option('--bundle', 'write a redacted diagnostics archive for support')
+    .option('--out <dir>', 'output directory for --bundle')
     .option('--fix', 'show repairs; git installation asks on a TTY (other repairs require --yes)')
     .option('--advise', 'ask the configured LLM to rank catalog repairs (read-only advice)')
     .option('--yes', 'apply planned doctor repairs (requires --fix)')
     .option('--sudo', 'also run the planned sudo install lines — only where `sudo -n true` works (requires --fix --yes)')
     .option('--restart', 'restart the nexus service when it runs a different version than this installed copy, then verify it (requires --fix --yes · interrupts bots, terminals and running turns)')
-    .action(async (opts: { json?: boolean; credentials?: boolean; fix?: boolean; advise?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
+    .action(async (opts: { json?: boolean; credentials?: boolean; bundle?: boolean; out?: string; fix?: boolean; advise?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
+      if (opts.bundle) {
+        if (opts.fix || opts.advise || opts.yes || opts.sudo || opts.restart) {
+          err.error('--bundle cannot be combined with repair or advice options');
+          setExitCode(1);
+          return;
+        }
+        try {
+          // Same report as `doctor --json`, local LLM section included, so support sees what the user saw.
+          const doctorReport = runDoctor(deps);
+          if (doctorReport.ok) doctorReport.localLlm = await probeDoctorLocalLlm(deps.localLlmInventory);
+          const result = buildDoctorBundle({ outDir: opts.out ?? process.cwd(), doctorOptions: deps, doctorReport });
+          out.log(opts.json ? JSON.stringify(result) : [`Diagnostics: ${result.path} (${result.bytes} bytes)`, 'Contents:', ...result.files.map((file) => `  ${file}`)].join('\n'));
+        } catch {
+          err.error('Could not create diagnostics archive.');
+          setExitCode(1);
+        }
+        return;
+      }
+      if (opts.out !== undefined) {
+        err.error('--out requires --bundle');
+        setExitCode(1);
+        return;
+      }
       if (opts.yes && !opts.fix) {
         err.error('--yes requires --fix');
         setExitCode(1);
@@ -1240,6 +1273,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         setExitCode(1);
         return;
       }
+      report.localLlm = await probeDoctorLocalLlm(deps.localLlmInventory);
       if (!opts.fix && !opts.advise) {
         out.log(opts.json ? JSON.stringify(report, null, 2) : formatDoctorReport(report, { credentials: opts.credentials }));
         if (report.requiredMissing?.length) setExitCode(1);
@@ -1358,6 +1392,7 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
         : undefined;
       // PATH cannot change in this process; re-probe readiness rather than treating a saved block as PATH=ok.
       const currentReport = results || gitInstall?.ran ? runDoctor(deps) : report;
+      if (currentReport.ok) currentReport.localLlm = report.localLlm;
       if (gitInstall?.ran && gitInstall.ok && currentReport.requiredMissing?.includes('git')) {
         gitInstall.detail = 'git init 성공 · 현재 doctor PATH 에서 git 을 찾지 못했습니다. 새 셸에서 다시 확인하세요.';
       }

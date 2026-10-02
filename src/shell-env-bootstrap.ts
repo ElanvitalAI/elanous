@@ -88,7 +88,7 @@ export function parsePrintenv(raw: string): Record<string, string> {
  *    - HOME, USER, LOGNAME, SHELL, TERM
  *    - LANG / LC_* — locale matters for some prompts (starship, powerlevel)
  *  Everything else is left for the login shell itself to define. */
-export function runPrintenvCapture(): Record<string, string> | null {
+function captureSeed(): { shell: string; seedEnv: NodeJS.ProcessEnv } | null {
   const shell = process.env.SHELL;
   if (!shell) return null;
   const base = basename(shell);
@@ -103,6 +103,22 @@ export function runPrintenvCapture(): Record<string, string> | null {
   for (const [k, v] of Object.entries(process.env)) {
     if (k.startsWith('LC_') && typeof v === 'string') seedEnv[k] = v;
   }
+  return { shell, seedEnv };
+}
+
+/** printenv output → env, or null when it does not look like a real login env. */
+function acceptCapture(stdout: string): Record<string, string> | null {
+  if (!stdout) return null;
+  const parsed = parsePrintenv(stdout);
+  // Sanity: require PATH and at least 5 keys, else something is off.
+  if (!parsed.PATH || Object.keys(parsed).length < 5) return null;
+  return parsed;
+}
+
+export function runPrintenvCapture(): Record<string, string> | null {
+  const seed = captureSeed();
+  if (!seed) return null;
+  const { shell, seedEnv } = seed;
 
   let res: ReturnType<typeof spawnSync>;
   try {
@@ -119,12 +135,33 @@ export function runPrintenvCapture(): Record<string, string> | null {
   }
   if (res.status !== 0 && res.status !== null) return null;
   if (res.signal) return null;
-  const stdout = typeof res.stdout === 'string' ? res.stdout : '';
-  if (!stdout) return null;
-  const parsed = parsePrintenv(stdout);
-  // Sanity: require PATH and at least 5 keys, else something is off.
-  if (!parsed.PATH || Object.keys(parsed).length < 5) return null;
-  return parsed;
+  return acceptCapture(typeof res.stdout === 'string' ? res.stdout : '');
+}
+
+/** Fill the login-env cache off the event loop (daemon boot). The first web-terminal spawn otherwise ran the
+ *  `-l -i` printenv with spawnSync and froze the whole daemon for ~3 s (10-02 TERM1). A no-op once captured;
+ *  a failed warm leaves the cache empty so `getCapturedEnv()` still tries (and falls back) as before. */
+export async function warmCapturedEnv(spawn: typeof Bun.spawn = Bun.spawn): Promise<boolean> {
+  if (captured) return cached !== null;
+  if (process.env.ELANOUS_SKIP_LOGIN_ENV === '1' || process.env.TERM_PROGRAM === 'monad-agent-nested') return false;
+  const seed = captureSeed();
+  if (!seed) return false;
+  const start = Date.now();
+  try {
+    const proc = spawn([seed.shell, '-l', '-i', '-c', 'printenv'], { env: seed.seedEnv as Record<string, string>, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' });
+    const timer = setTimeout(() => proc.kill(), TIMEOUT_MS);
+    const [out, code] = await Promise.all([new Response(proc.stdout as ReadableStream).text(), proc.exited]);
+    clearTimeout(timer);
+    const parsed = code === 0 ? acceptCapture(out) : null;
+    if (captured) return cached !== null; // a synchronous capture won the race
+    if (!parsed) return false;
+    cached = parsed;
+    captured = true;
+    debug.log('shell.envbootstrap.capture', 'warmed', { ok: true, ms: Date.now() - start, keyCount: Object.keys(parsed).length });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Return the captured login env, running the capture on first call.

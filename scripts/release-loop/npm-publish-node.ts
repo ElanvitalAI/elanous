@@ -1,11 +1,11 @@
 #!/usr/bin/env bun
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { sendOutbound } from '../../src/domains/outbound-alert.js';
-import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { emitNodeResult, readGraphContext, type GraphContext } from './node-verdict.js';
 
 type Result = { outcome: 'ok' | 'fail'; verdict: 'pass' | 'fail'; summary: string; npm?: 'published' | 'already-published' | 'staged-not-visible'; humanAction?: 'npm-support' };
@@ -16,6 +16,8 @@ export interface NpmPublishDeps {
   registry?: Registry;
   sleep?: (ms: number) => Promise<void>;
   stateDir?: string;
+  /** Test seam — the production root whose secrets/npm-token is the last fallback. */
+  productionRoot?: string;
   alert?: (text: string, kind: string) => boolean;
   log?: (version: string, waitedMinutes: number) => void;
 }
@@ -48,7 +50,10 @@ export async function runNpmPublish(context: GraphContext = readGraphContext(), 
   try {
     if (context.outputs.publish?.outcome !== 'ok') throw new Error('publish must succeed before npm publish');
     const stateDir = deps.stateDir ?? effectiveInstanceRoot();
-    const candidate = join(stateDir, 'release', version, 'prepared', 'dist', 'elanous.tgz');
+    // REL3 — the archive prepare actually built (its output) wins over this process's universe: a resumed run can
+    // resolve another universe (10-01 0.2.7: prepared in the pilot test universe, resumed in production).
+    const prepared = context.outputs.prepare?.candidate;
+    const candidate = typeof prepared === 'string' && prepared.endsWith('.tgz') ? prepared : join(stateDir, 'release', version, 'prepared', 'dist', 'elanous.tgz');
     const run = deps.exec ?? exec;
     const readRegistry = deps.registry ?? registry;
     const wait = deps.sleep ?? sleep;
@@ -71,7 +76,8 @@ export async function runNpmPublish(context: GraphContext = readGraphContext(), 
     const before = await inspect();
     if (before.tagged) return { outcome: 'ok', verdict: 'pass', npm: 'already-published', summary: `npm ${version} already published with latest tag` };
     if (!before.visible) {
-      const tokenFile = context.input.npmTokenFile ?? join(stateDir, 'secrets', 'npm-token');
+      // The npm token is a machine secret (like the GitHub App key): input → this universe → the production root.
+      const tokenFile = context.input.npmTokenFile ?? [join(stateDir, 'secrets', 'npm-token'), join(deps.productionRoot ?? prodInstanceRoot(), 'secrets', 'npm-token')].find((p) => existsSync(p)) ?? join(stateDir, 'secrets', 'npm-token');
       if (typeof tokenFile !== 'string' || !tokenFile.trim()) throw new Error('input.npmTokenFile must be a path');
       token = readFileSync(tokenFile, 'utf8').trim();
       if (!token) throw new Error('npm token file empty');

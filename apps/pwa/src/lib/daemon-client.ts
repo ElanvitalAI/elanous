@@ -436,7 +436,21 @@ export class DaemonClient {
     return res;
   }
 
+  /** TERM1 · 10-02 — concurrent GETs of the terminal list share one request (several panels ask at once). */
+  private readonly inflightTerminals = new Map<string, Promise<unknown>>();
+
   async fetchJson<T = unknown>(path: string, init?: RequestInit): Promise<T> {
+    if (path.startsWith('/v1/terminals') && !path.startsWith('/v1/terminals/') && (!init || ((init.method ?? 'GET') === 'GET' && init.body === undefined))) {
+      const shared = this.inflightTerminals.get(path);
+      if (shared) return shared as Promise<T>;
+      const request = this.fetchJsonOnce<T>(path, init).finally(() => { this.inflightTerminals.delete(path); });
+      this.inflightTerminals.set(path, request);
+      return request;
+    }
+    return this.fetchJsonOnce<T>(path, init);
+  }
+
+  private async fetchJsonOnce<T = unknown>(path: string, init?: RequestInit): Promise<T> {
     const res = await this.fetchResponse(path, init);
     const ctype = res.headers.get('content-type') ?? '';
     const body = ctype.includes('application/json')

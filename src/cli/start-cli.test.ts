@@ -7,6 +7,7 @@ import { planStart, registerStartCommand, runStart, type StartDeps } from './sta
 import { checkReadiness } from './doctor-readiness.js';
 import { resolveUsableLlm } from '../llm/usable-llm.js';
 import { getUserConfig } from '../user-config.js';
+import { debug } from '../debug/log.js';
 
 const INJECTED = {
   baseUrl: 'http://127.0.0.1:45678',
@@ -29,6 +30,7 @@ function fixture() {
     openTui: async () => { calls.push('tui'); return 0; },
     output: (line) => output.push(line),
     resolveEndpoint: () => INJECTED,
+    browserEnv: {}, browserPlatform: 'darwin',
   };
   return { calls, output, deps };
 }
@@ -152,6 +154,29 @@ describe('start CLI', () => {
     expect(result).toMatchObject({ exitCode: 0, llm: 'available', daemon: 'running', surface: 'gui' });
     expect(f.calls).toEqual(['detect', 'health', 'gui:http://127.0.0.1:45678/app/']);
     expect(f.output.some((line) => line.includes('Daemon already healthy'))).toBe(true);
+  });
+
+  test('SSH Mac and displayless Linux skip GUI opener with reason and link; local Mac opens once', async () => {
+    for (const [env, platform, expected] of [
+      [{ SSH_CONNECTION: 'x' }, 'darwin', '원격(ssh)'],
+      [{}, 'linux', '화면(디스플레이)이 없는 세션'],
+      [{}, 'darwin', null],
+    ] as const) {
+      const f = fixture();
+      f.deps.browserEnv = env;
+      f.deps.browserPlatform = platform;
+      const result = await runStart({}, f.deps);
+      const opened = f.calls.filter(call => call.startsWith('gui:'));
+      expect(opened).toHaveLength(expected ? 0 : 1);
+      expect(result.steps.find(step => step.id === 'open-gui')?.detail).toContain(expected ? `Open manually: ${INJECTED.pwaUrl}` : `Opened ${INJECTED.pwaUrl}`);
+      expect(result.steps.find(step => step.id === 'open-gui')?.status).toBe(expected ? 'skipped' : 'done');
+      if (expected) {
+        expect(f.output.join('\n')).toContain(expected);
+        const event = debug.events(20).filter(e => e.category === 'browser.open').at(-1);
+        expect(event?.event).toBe('skipped');
+        expect(event?.data).toMatchObject({ reason: platform === 'darwin' ? 'ssh' : 'no-display' });
+      } else expect(result.surface).toBe('gui');
+    }
   });
 
   test('missing LLM offers login only with TTY consent; launch waits for health before TUI', async () => {
@@ -307,6 +332,7 @@ describe('start CLI', () => {
         isTty: () => true,
         resolveEndpoint: () => INJECTED,
         recordHealthUrl: (url) => healthUrls.push(`recorded:${url}`),
+        browserEnv: {}, browserPlatform: 'darwin',
         openGui: async (url) => { opened.push(url); return true; },
         output: () => {},
       });
@@ -360,6 +386,7 @@ describe('start CLI', () => {
         ? { ...INJECTED, baseUrl: 'http://127.0.0.1:31420', healthUrl: 'http://127.0.0.1:31420/v1/health', pwaUrl: 'http://127.0.0.1:31420/app/' }
         : null,
       openGui: async (url) => { opened.push(url); return true; },
+      browserEnv: {}, browserPlatform: 'darwin',
       output: () => {},
     });
     expect(result.daemon).toBe('started');

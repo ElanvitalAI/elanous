@@ -775,6 +775,45 @@ describe('INST2 — finish in the same window', () => {
     expect(readFileSync(record, 'utf8').trim()).toBe(join(realpathSync(prefix), 'bin', 'elanous'));
   }, 180_000);
 
+  test('INST3: inside a real terminal the wizard gets the terminal device itself, not a fresh /dev/tty', () => {
+    const env = setup();
+    const record = join(env.dir, 'setup-tty');
+    const exec = join(env.dir, 'fake-setup-tty');
+    writeFileSync(exec, `#!/bin/sh\nprintf '%s' "$ELANOUS_INSTALL_SETUP_TTY" > '${record}'\n`, { mode: 0o755 });
+    const command = ['/bin/bash', installer, '--no-modify-path'];
+    const argv = process.platform === 'darwin' ? ['-q', '/dev/null', ...command] : ['-qec', command.join(' '), '/dev/null'];
+    const result = spawnSync('script', argv, {
+      cwd: repoRoot, encoding: 'utf8',
+      env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, ELANOUS_INSTALL_LANG: 'en', CI: '' },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    const tty = readFileSync(record, 'utf8');
+    expect(tty).toMatch(/^\/dev\/(ttys?\d+|pts\/\d+)$/);
+    expect(tty).not.toBe('/dev/tty');
+  }, 180_000);
+
+  test('INST3: without a terminal the wizard falls back to /dev/tty', () => {
+    const env = setup();
+    const record = join(env.dir, 'setup-tty');
+    const exec = join(env.dir, 'fake-setup-tty');
+    writeFileSync(exec, `#!/bin/sh\nprintf '%s' "$ELANOUS_INSTALL_SETUP_TTY" > '${record}'\n`, { mode: 0o755 });
+    const { result } = run(['--no-modify-path'], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(readFileSync(record, 'utf8')).toBe('/dev/tty');
+  }, 180_000);
+
+  test('INST4: same-window setup drops the «new shell» step (numbering starts at 1) and Korean has no English lines of ours', () => {
+    const env = setup();
+    const { exec } = fakeSetup(env.dir);
+    const { result } = run([], env, process.env.PATH ?? '', repoRoot, { ELANOUS_INSTALL_INTERACTIVE: '1', ELANOUS_INSTALL_SETUP_EXEC: exec, CI: '', ELANOUS_INSTALL_LANG: 'ko' });
+    expect(result.status, result.stderr).toBe(0);
+    const next = result.stdout.slice(result.stdout.indexOf('다음:'), result.stdout.indexOf('첫 설정을 시작합니다'));
+    expect(next).not.toContain('새 셸을 여세요');
+    expect(next).toMatch(/\n {2}1\) /);
+    expect(next).not.toMatch(/install gh|install Node|the harness|rebuild node-pty|install ripgrep/);
+    expect(result.stderr).not.toContain('harness command missing');
+  }, 180_000);
+
   test('non-interactive: never starts setup and the first Next line is the absolute Run command', () => {
     const env = setup();
     const { exec, record } = fakeSetup(env.dir);

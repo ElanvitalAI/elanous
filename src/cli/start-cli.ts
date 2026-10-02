@@ -5,6 +5,8 @@ import type { DetectedProvider } from '../llm/provider-detect.js';
 import { resolveUsableLlm, type UsableLlm } from '../llm/usable-llm.js';
 import { resolveDaemonEndpoint, type DaemonEndpoint, type ResolveDaemonEndpointOpts } from '../nexus/daemon-endpoint.js';
 import { runBgLaunch } from './bg-launch.js';
+import { browserUnavailableReason } from '../oauth/browser-availability.js';
+import { debug } from '../debug/log.js';
 
 export interface StartOptions {
   gui?: boolean;
@@ -63,6 +65,8 @@ export interface StartDeps {
   openTui?: (json: boolean) => Promise<number>;
   sleep?: (ms: number) => Promise<void>;
   output?: (line: string) => void;
+  browserEnv?: NodeJS.ProcessEnv;
+  browserPlatform?: NodeJS.Platform;
   /** Test seam — daemon address. `null` means this universe has no daemon (do not guess a port).
    *  Called again after a launch so the opened address is the daemon that was just started. */
   resolveEndpoint?: (opts?: ResolveDaemonEndpointOpts) => DaemonEndpoint | null;
@@ -193,10 +197,15 @@ export async function runStart(options: StartOptions = {}, deps: StartDeps = {})
       if (!openUrl) {
         record('open-gui', 'failed', 'Daemon address unknown');
       } else {
-        try {
-          if (await (deps.openGui ?? defaultOpenGui)(openUrl)) surface = 'gui';
-        } catch { /* A browser is optional; retain the URL for manual opening. */ }
-        record('open-gui', surface === 'gui' ? 'done' : 'failed', surface === 'gui' ? `Opened ${openUrl}` : `Open manually: ${openUrl}`);
+        const why = browserUnavailableReason(deps.browserEnv ?? process.env, deps.browserPlatform ?? process.platform);
+        if (why) {
+          debug.log('browser.open', 'skipped', { reason: why.includes('ssh') ? 'ssh' : 'no-display' });
+        } else {
+          try {
+            if (await (deps.openGui ?? defaultOpenGui)(openUrl)) surface = 'gui';
+          } catch { /* A browser is optional; retain the URL for manual opening. */ }
+        }
+        record('open-gui', surface === 'gui' ? 'done' : why ? 'skipped' : 'failed', surface === 'gui' ? `Opened ${openUrl}` : `Open manually: ${openUrl}${why ? ` — ${why}` : ''}`);
       }
       record('open-tui', 'skipped', 'GUI selected');
     } else {

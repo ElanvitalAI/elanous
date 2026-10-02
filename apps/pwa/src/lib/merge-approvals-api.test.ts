@@ -69,8 +69,8 @@ describe('approval error text says the cause and the next step', () => {
     const out = approvalErrorText(new MergeApprovalsApiError(401, 'unauthorized'), 'x');
     expect(out.text).toContain('소유자 토큰');
     // Where to get it, not just that it is missing (대표 16:1x — the terminal banner said «붙이면» but not «어디서»).
-    expect(out.text).toContain('Connect token');
-    expect(out.text).toContain('Bearer token');
+    expect(out.text).toContain('연결 토큰 만들기');
+    expect(out.text).toContain('연결 토큰 칸');
     // Plain full-page link to the Bearer token field (the settings panel focuses it on this hash).
     expect(out.href).toBe('/app/settings/#bearer-token');
   });

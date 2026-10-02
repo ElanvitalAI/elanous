@@ -16,6 +16,7 @@ import {
   inQuietHours,
   kstMinutes,
   sendOutbound,
+  setInProcessOutbound,
 } from './outbound-alert.js';
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
 
@@ -703,3 +704,79 @@ describe('deliver()', () => {
     expect(telegramUrls.length).toBe(1);
   });
 });
+
+describe('OB8 — inside the daemon, deliver never curls its own /v1/outbound', () => {
+  afterEach(() => setInProcessOutbound(null));
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('routes in-process and makes no curl to /v1/outbound (the CS1 freeze)', async () => {
+    const calls: Array<[string, string]> = [];
+    setInProcessOutbound(async (text, kind) => { calls.push([text, kind]); return true; });
+    expect(deliver('seat-doc ready', 'report')).toBe('daemon');
+    await settle();
+    expect(calls).toEqual([['seat-doc ready', 'report']]);
+    expect(outboundUrls).toEqual([]);
+    expect(telegramUrls).toEqual([]);
+    expect(daemonPathLogs().map((row) => row.data)).toEqual([{ classification: 'ok', kind: 'report', inProcess: true }]);
+  });
+
+  it('an in-process failure falls back to Telegram directly, still without a self-call', async () => {
+    setInProcessOutbound(async () => false);
+    expect(deliver('rotation alert', 'alert')).toBe('daemon');
+    await settle();
+    expect(outboundUrls).toEqual([]);
+    expect(telegramUrls.length).toBe(1);
+    expect(classifications()).toEqual(['rejected']);
+    setInProcessOutbound(async () => { throw new Error('router down'); });
+    deliver('rotation alert 2', 'alert');
+    await settle();
+    expect(outboundUrls).toEqual([]);
+    expect(telegramUrls.length).toBe(2);
+  });
+
+  it('outside the daemon (nothing registered) the HTTP path is unchanged', () => {
+    expect(deliver('cron report', 'report')).toBe('daemon');
+    expect(outboundUrls.length).toBe(1);
+  });
+});
+
+describe('OB8b — when nothing can deliver, say why instead of a silent false', () => {
+  it('no daemon and no token: false, an undeliverable event with the universe, and one loud stderr line', () => {
+    setResolveDaemonEndpointForTest(() => null);
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
+    const conatus = process.env.CONATUS_ENV;
+    process.env.CONATUS_ENV = join(tmpdir(), 'outbound-alert-ob8b-no-creds.env');
+    const errors: string[] = [];
+    const errorSpy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { errors.push(args.join(' ')); });
+    try {
+      expect(deliver('field-feed ready', 'report')).toBe(false);
+    } finally {
+      errorSpy.mockRestore();
+      if (conatus === undefined) delete process.env.CONATUS_ENV; else process.env.CONATUS_ENV = conatus;
+    }
+    expect(outboundUrls).toEqual([]);
+    const row = logged.find((r) => r.category === 'outbound.send' && r.event === 'undeliverable');
+    expect(row?.data).toMatchObject({ kind: 'report', daemonPath: 'not-found' });
+    expect(['prod', 'test']).toContain((row?.data as { universe: string }).universe);
+    const loud = errors.find((line) => line.includes('⛔ 못 보냄(report)'));
+    expect(loud).toBeDefined();
+    expect(loud).toContain('데몬 not-found');
+    expect(loud).toContain('우주 ');
+  });
+
+  it('a reachable daemon that refuses still reports the class it got', () => {
+    daemonBody = '{"delivered":false}';
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_CHAT_ID;
+    const conatus = process.env.CONATUS_ENV;
+    process.env.CONATUS_ENV = join(tmpdir(), 'outbound-alert-ob8b-no-creds.env');
+    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    try { expect(deliver('x', 'alert')).toBe(false); } finally {
+      errorSpy.mockRestore();
+      if (conatus === undefined) delete process.env.CONATUS_ENV; else process.env.CONATUS_ENV = conatus;
+    }
+    expect(logged.find((r) => r.event === 'undeliverable')?.data).toMatchObject({ daemonPath: 'rejected' });
+  });
+});
+

@@ -44,7 +44,7 @@ export class MergeApprovalsApiError extends Error {
 export function approvalErrorText(err: unknown, fallback: string): { text: string; href?: string } {
   if (err instanceof MergeApprovalsApiError) {
     if (err.status === 401 || err.error === 'unauthorized') {
-      return { text: '이 기기에 소유자 토큰이 없어 승인 목록을 못 읽었습니다 — 이미 연결된 기기의 설정 › Connect token 에서 토큰을 만들어, 이 기기의 설정 › Daemon › Bearer token 칸에 붙이면 바로 보입니다.', href: '/app/settings/#bearer-token' };
+      return { text: '이 기기에 소유자 토큰이 없어 승인 목록을 못 읽었습니다 — 이미 연결된 기기의 설정 › 연결 토큰 만들기 에서 토큰을 만들어, 이 기기의 설정 › 데몬 연결 › 연결 토큰 칸에 붙이면 바로 보입니다.', href: '/app/settings/#bearer-token' };
     }
     if (err.error === 'gh-failed') {
       return { text: `데몬이 GitHub 를 읽지 못했습니다(데몬 기계의 gh 로그인·네트워크) — 잠시 뒤 다시 열어 보세요.${err.reason ? ` 사유: ${err.reason.split('\n')[0]!.slice(0, 160)}` : ''}` };

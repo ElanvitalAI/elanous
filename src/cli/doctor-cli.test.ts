@@ -98,7 +98,8 @@ describe('doctor CLI', () => {
       '  빠른 모드: none(없음) · 대화에 안 쓰임 — 스위치 없음(분류기 호출부 0)',
     ]);
     const baseline = renderDoctorReport({ ...after, modes: undefined });
-    expect(text).toBe(`${baseline}\n모드:\n${text.split('\n').slice(-3).join('\n')}`);
+    const modeLines = text.split('\n').filter((line) => line.startsWith('  smart·') || line.startsWith('  빠른 모드:'));
+    expect(text.startsWith(`${baseline}\n모드:\n${modeLines.join('\n')}\nLocal LLM:\n`)).toBe(true);
   });
 
   test('humanBreaks hides development notes and keeps user-facing prose after removing source paths', () => {
@@ -1853,7 +1854,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     expect(flat).toBe('/opt/old');
   });
 
-  test('runDoctor carries injected readiness and the text report names 준비 상태 without changing the exit code', () => {
+  test('runDoctor carries injected readiness and the text report names 준비 상태 without changing the exit code', async () => {
     const lines: string[] = [];
     const exitCodes: number[] = [];
     const program = new Command();
@@ -1880,7 +1881,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       setExitCode: (code) => exitCodes.push(code),
     });
 
-    program.parse(['doctor'], { from: 'user' });
+    await program.parseAsync(['doctor'], { from: 'user' });
 
     const report = runDoctor(options({
       readiness: {
@@ -1922,7 +1923,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
     expect(formatted).not.toContain('--fix');
   });
 
-  test('a bad readiness item is reported and still leaves the doctor exit code unchanged', () => {
+  test('a bad readiness item is reported and still leaves the doctor exit code unchanged', async () => {
     const lines: string[] = [];
     const exitCodes: number[] = [];
     const program = new Command();
@@ -1945,7 +1946,7 @@ await program.parseAsync(['doctor', '--fix', '--yes', '--json'], { from: 'user' 
       setExitCode: (code) => exitCodes.push(code),
     });
 
-    program.parse(['doctor'], { from: 'user' });
+    await program.parseAsync(['doctor'], { from: 'user' });
 
     const formatted = lines.join('\n');
     expect(formatted).toContain('Readiness:');

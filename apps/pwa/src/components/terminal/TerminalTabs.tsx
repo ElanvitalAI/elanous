@@ -604,7 +604,13 @@ export function TerminalTabs({
   useEffect(() => {
     if (!acpRef.current) return;
     void refreshFromDaemon();
-    const h = setInterval(() => { void refreshFromDaemon(); }, STATUS_POLL_MS);
+    // TERM1 · 10-02 — no status poll from a hidden tab, and never a second one while the last is still waiting.
+    let inFlight = false;
+    const h = setInterval(() => {
+      if (inFlight || (typeof document !== 'undefined' && document.hidden)) return;
+      inFlight = true;
+      void refreshFromDaemon().finally(() => { inFlight = false; });
+    }, STATUS_POLL_MS);
     return () => clearInterval(h);
     // intentional: only run on attach, not on tab list mutations
     // eslint-disable-next-line react-hooks/exhaustive-deps

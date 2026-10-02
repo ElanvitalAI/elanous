@@ -48,6 +48,10 @@ export function deriveForwardLevel(category: string): ForwardLevel {
 }
 
 const FLUSH_MS = 100;
+/** TERM1 · 10-02 — 운영 포워더의 배치 간격. 100ms 이던 때는 터미널에서 키 하나마다 POST 하나가 나갔다
+ *  (격리 데몬 실측: 키 → +100ms `/v1/debug-logs/batch`). 1.5초로 모으고, 한 배치가 차면 그 자리에서 보낸다
+ *  (잃지 않는다 · 페이지 이탈은 sendBeacon 이 그대로 비운다). 클래스 기본(100ms)은 시험이 쓴다. */
+export const PWA_FLUSH_MS = 1_500;
 const MAX_BATCH = 100;
 const QUEUE_CAP = 500;
 const ENDPOINT = '/v1/debug-logs/batch';
@@ -126,6 +130,7 @@ export class DebugForwarder {
     private readonly minLevel: ForwardLevel = 'debug',
     /** ⭐ 시험이 줄일 수 있게 열어 둔다 — 기본은 `POST_TIMEOUT_MS`. */
     private readonly postTimeoutMs: number = POST_TIMEOUT_MS,
+    private readonly flushMs: number = FLUSH_MS,
   ) {}
 
   health(): ForwarderHealth {
@@ -148,8 +153,13 @@ export class DebugForwarder {
       this.droppedByCap += overflow;
       this.queue.splice(0, overflow);
     }
+    if (this.queue.length >= MAX_BATCH && !this.inFlight) {
+      if (this.timer !== null) { clearTimeout(this.timer); this.timer = null; }
+      void this.flush();
+      return;
+    }
     if (this.timer === null) {
-      this.timer = setTimeout(() => { void this.flush(); }, FLUSH_MS);
+      this.timer = setTimeout(() => { void this.flush(); }, this.flushMs);
     }
   }
 
@@ -227,7 +237,7 @@ export class DebugForwarder {
       });
     }
     if (this.queue.length > 0 && this.timer === null) {
-      this.timer = setTimeout(() => { void this.flush(); }, FLUSH_MS);
+      this.timer = setTimeout(() => { void this.flush(); }, this.flushMs);
     }
   }
 
@@ -236,7 +246,7 @@ export class DebugForwarder {
   private scheduleRetry(): void {
     if (this.timer !== null) return;
     if (this.queue.length === 0) return;
-    const backoff = Math.min(FLUSH_MS * 2 ** this.consecutiveFailures, RETRY_MAX_MS);
+    const backoff = Math.min(this.flushMs * 2 ** this.consecutiveFailures, RETRY_MAX_MS);
     this.timer = setTimeout(() => { void this.flush(); }, backoff);
   }
 
@@ -312,7 +322,7 @@ function getForwarder(): DebugForwarder | null {
   if (typeof window === 'undefined') { forwarder = null; return null; }
   const knobs = readForwardKnobs();
   if (!knobs.forward) { forwarder = null; return null; }
-  const f = new DebugForwarder(defaultPost, knobs.level);
+  const f = new DebugForwarder(defaultPost, knobs.level, POST_TIMEOUT_MS, PWA_FLUSH_MS);
   try {
     window.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') f.beaconFlush();

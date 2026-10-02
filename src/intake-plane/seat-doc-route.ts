@@ -10,6 +10,7 @@ import { getElanousConfigDir } from '../elanous-config-dir.js';
 import type { ExecRequest } from '../exec-requests/store.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
+import { answerAsSeat, isNoGraphFailure } from './seat-answer.js';
 
 const POLL_MS = 5_000;
 const TIMEOUT_MS = 30 * 60_000;
@@ -34,7 +35,9 @@ export interface SeatDocDeps {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   pwaUrl?: () => string | undefined;
-  log?: (event: 'submitted' | 'research' | 'settled' | 'delivered' | 'delivery-failed', data: Record<string, unknown>) => void;
+  log?: (event: 'submitted' | 'research' | 'settled' | 'delivered' | 'delivery-failed' | 'seat-answer', data: Record<string, unknown>) => void;
+  /** EV12d — the seat's own answer when no installed graph fits (default = role file ⊕ owned checklist ⊕ recent, one LLM call). */
+  seatAnswer?: (seatAddress: string, question: string) => Promise<{ title: string; text: string } | null>;
 }
 
 export function isSeatDocRequest(text: string): boolean {
@@ -194,9 +197,20 @@ export async function submitSeatDocRequest({ text, reportTo, deps = {} }: {
     }
     log('settled', { id, status: result?.status ?? (lookupAvailable ? 'timeout' : 'lookup-unavailable'), lastConfirmedStatus });
     const links = result?.status === 'done' ? await fileLinks(id, result, deps) : new Map<string, string>();
+    let reply = message(id, result, withoutResearch, lookupAvailable, accessiblePwaUrl((deps.pwaUrl ?? chatPwaUrl)()), links);
+    if (isNoGraphFailure(result)) {
+      // EV12d — a question with no fitting graph gets the seat's own answer, not «문서 요청 실패».
+      const seat = result!.seats![0]!.seat;
+      try {
+        const answer = await (deps.seatAnswer ?? answerAsSeat)(seat, body);
+        if (answer) reply = `${answer.title} 답 (접수번호 ${id})\n${answer.text}`;
+        log('seat-answer', { id, seat, answered: !!answer });
+      } catch (error) {
+        log('seat-answer', { id, seat, answered: false, reason: String(error).slice(0, 200) });
+      }
+    }
     try {
-      const sent = await (deps.sendOutbound ?? sendOutbound)(message(id, result, withoutResearch, lookupAvailable,
-        accessiblePwaUrl((deps.pwaUrl ?? chatPwaUrl)()), links), 'report', reportTo);
+      const sent = await (deps.sendOutbound ?? sendOutbound)(reply, 'report', reportTo);
       log(sent ? 'delivered' : 'delivery-failed', { id });
     } catch (error) {
       log('delivery-failed', { id, reason: String(error).slice(0, 200) });

@@ -56,7 +56,7 @@ const BACKWARD_MARKER = /(?:등(?:의)?\s*)?(?:언급\s*)?시\s*(?:이?\s*스킬
  *  keywords. Empty array is a perfectly normal result (description
  *  without any recognized marker). */
 export function extractTriggers(description: string): string[] {
-  if (!description || !description.trim()) return [];
+  if (typeof description !== 'string' || !description.trim()) return [];
 
   const segments = extractTriggerSegments(description);
   const items: string[] = [];

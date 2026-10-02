@@ -299,3 +299,19 @@ describe('재시도가 «겹치지» 않는다 — 슬롯을 더 먹지 않는�
     expect(maxConcurrent).toBe(1);                // ⭐ 그래도 «겹치지» 않았다
   });
 });
+
+// TERM1 · 10-02 — typing in the terminal must not send one POST per key: the production forwarder batches 1.5 s,
+// and a full batch still goes at once.
+it('a slow-flush forwarder sends one batch for a burst of keys, and flushes a full batch immediately', async () => {
+  const bodies: string[] = [];
+  const f = new DebugForwarder(async (b) => { bodies.push(b); return true; }, 'debug', 1_000, 300);
+  for (let i = 0; i < 7; i++) f.push({ category: 'webterm.ws.frame.in', ts: Date.now(), snapshot: { i } } as never);
+  await new Promise((r) => setTimeout(r, 120));
+  expect(bodies).toHaveLength(0);
+  await new Promise((r) => setTimeout(r, 260));
+  expect(bodies).toHaveLength(1);
+  expect(JSON.parse(bodies[0]!).records).toHaveLength(7);
+  for (let i = 0; i < 100; i++) f.push({ category: 'webterm.ws.frame.in', ts: Date.now(), snapshot: { i } } as never);
+  await new Promise((r) => setTimeout(r, 10));
+  expect(bodies).toHaveLength(2);
+});

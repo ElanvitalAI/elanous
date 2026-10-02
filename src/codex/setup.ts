@@ -82,12 +82,14 @@ export async function pickCodexAuthMode(io: WizardIO, deps: CodexAuthModeDeps = 
   if (existing || codexCli) {
     if (existing) {
       const exp = existing.tokens.expiresAt;
-      const when = exp != null
-        ? (Date.now() > exp ? 'EXPIRED' : `${Math.round((exp - Date.now()) / 60000)}min left`)
-        : 'no expiry tracked';
-      io.print(`  OAuth tokens already on file (${when}).`);
+      const left = exp != null ? exp - Date.now() : null;
+      const when = left == null ? '만료 시각 모름'
+        : left <= 0 ? '만료됨'
+          : left >= 86_400_000 ? `약 ${Math.round(left / 86_400_000)}일 남음`
+            : left >= 3_600_000 ? `약 ${Math.round(left / 3_600_000)}시간 남음` : `약 ${Math.max(1, Math.round(left / 60_000))}분 남음`;
+      io.print(`  이미 로그인돼 있습니다(${when}).`);
     } else {
-      io.print('  Found your ChatGPT/Codex login from the codex CLI (~/.codex/auth.json).');
+      io.print('  Codex CLI 에 있는 ChatGPT/Codex 로그인을 찾았습니다(~/.codex/auth.json).');
     }
     // Sprint 11 — chooseFrom Yes/No so fullScreenIO renders the arrow
     // picker (with 'y'/'n' + 한글 자모 quick-pick from PR #986 + #988)
@@ -96,10 +98,10 @@ export async function pickCodexAuthMode(io: WizardIO, deps: CodexAuthModeDeps = 
     // rotation on an unnecessary refresh).
     const keep = await chooseFrom<boolean>(
       io,
-      'Keep using existing OAuth tokens?',
+      '지금 로그인을 그대로 쓸까요?',
       [
-        { key: 'y', label: 'Yes — keep them', value: true },
-        { key: 'n', label: 'No — re-run device-code flow', value: false },
+        { key: 'y', label: '예 — 그대로 씁니다', value: true },
+        { key: 'n', label: '아니오 — 다시 로그인합니다', value: false },
       ],
       { defaultIndex: 0 },
       undefined,
@@ -265,18 +267,18 @@ async function runCodexSetupImpl(
   let apiKey: string | undefined = initial.llm.apiKey;
 
   if (authMode === 'oauth') {
-    io.print('  Launching device-code flow…');
+    io.print('  코드로 로그인합니다…');
     try {
       await loginWithCodex({
         onProgress: (p) => {
           if (p.type === 'user_code') {
             io.print('');
-            io.print(`    1) Open in any browser: ${p.loginUrl}`);
-            io.print(`    2) Enter code:          ${p.userCode}`);
+            io.print(`    1) 아무 브라우저에서 열기: ${p.loginUrl}`);
+            io.print(`    2) 코드 입력:             ${p.userCode}`);
             io.print('');
-            io.print('  Waiting for sign-in…');
+            io.print('  로그인을 기다리는 중…');
           }
-          if (p.type === 'saved') io.print('  Signed in. Tokens saved.');
+          if (p.type === 'saved') io.print('  로그인했습니다. 저장했습니다.');
         },
         fetchImpl: opts.fetchImpl,
         sleepImpl: opts.sleepImpl,

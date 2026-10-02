@@ -3,7 +3,9 @@ import { visibleWidth } from '../../tui.js';
 
 const ESSENTIAL_KEYS = [
   ['Enter', 'Send message'],
-  ['Esc', 'Clear input / close help modal'],
+  // U1 · 2026-10-02 — stopping and queueing while an answer streams were missing from help (same line count:
+  // the modal has a row budget and falls back to the chat log when it is exceeded).
+  ['Esc', 'Stop the answer (Esc again = rewind) · clear input / close help'],
   ['Ctrl+U', 'Clear text before cursor'],
   ['Ctrl+W', 'Delete previous word'],
   ['Ctrl+← / →', 'Move by word'],
@@ -11,7 +13,7 @@ const ESSENTIAL_KEYS = [
   ['Home / End', 'Move to start / end of line'],
   ['Ctrl+A / E', 'Move to start / end of line'],
   ['PgUp / PgDn', 'Scroll chat log'],
-  ['Ctrl+↑', 'Recall sent line while streaming'],
+  ['Ctrl+↑', 'Recall a queued line (Enter while answering queues it)'],
 ] as const;
 
 function fitLine(text: string, width: number): string {

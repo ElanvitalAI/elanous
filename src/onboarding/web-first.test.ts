@@ -27,7 +27,7 @@ function fixture(overrides: Partial<WebFirstSetupDeps> = {}) {
     config: { onboarding: { completed: false, version: 0, webFirst: true } }, isTty: true,
     showNexus: async () => daemon(), issueSetupLinkToken: async () => ({ token: 'secret+/=' }),
     renderQr: link => { qrLinks.push(link); return 'QR image'; },
-    isHeadless: () => true, print: line => lines.push(line), ...overrides,
+    isHeadless: () => true, browserEnv: {}, browserPlatform: 'darwin', print: line => lines.push(line), ...overrides,
   };
   return { deps, lines, qrLinks };
 }
@@ -91,6 +91,31 @@ test('registered live daemon and successful browser open produce a link and safe
   const event = debug.events(20).filter(e => e.category === 'onboarding.web-first').at(-1);
   expect(event?.data).toMatchObject({ qr: false, browserOpened: true, remote: 'loopback' });
   expect(JSON.stringify(event)).not.toContain('secret');
+});
+
+test('SSH Mac and displayless Linux show the link and why without invoking the opener; local Mac opens once', async () => {
+  for (const [env, platform, expected] of [
+    [{ SSH_CONNECTION: 'x' }, 'darwin', '원격(ssh)'],
+    [{}, 'linux', '화면(디스플레이)이 없는 세션'],
+    [{}, 'darwin', null],
+  ] as const) {
+    const opened: string[] = [];
+    const { deps, lines } = fixture({
+      browserEnv: env, browserPlatform: platform, isHeadless: () => false,
+      openBrowser: url => { opened.push(url); return true; },
+    });
+    expect(await runWebFirstSetup(deps)).toBe('link-shown');
+    expect(lines).toContain('http://127.0.0.1:4321/setup#t=secret%2B%2F%3D');
+    if (expected) {
+      expect(opened).toEqual([]);
+      expect(lines.join('\n')).toContain(expected);
+      const event = debug.events(20).filter(e => e.category === 'browser.open').at(-1);
+      expect(event?.event).toBe('skipped');
+      expect(event?.data).toMatchObject({ reason: platform === 'darwin' ? 'ssh' : 'no-display' });
+    } else {
+      expect(opened).toEqual(['http://127.0.0.1:4321/setup#t=secret%2B%2F%3D']);
+    }
+  }
 });
 
 test('tailnet gets phone QR; browser opens loopback and failure does not cancel the link', async () => {

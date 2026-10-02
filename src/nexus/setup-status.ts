@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 
 import { debug } from '../debug/log.js';
-import { buildUserConfig, type UserConfig as MainUserConfig } from '../user-config.js';
+import { buildUserConfig, resolveSkillSources, type UserConfig as MainUserConfig } from '../user-config.js';
 import { decideProviderForConfig } from '../llm.js';
 import { resolveGrokCredential } from '../grok/credential.js';
 import { loadTokens } from '../oauth/store.js';
@@ -177,7 +177,12 @@ function checkChannelBot(cfg: NexusUserConfig): SetupItem {
 }
 
 function checkSkillDirs(cfg: MainUserConfig, exists: (path: string) => boolean): SetupItem {
-  const dirs = Array.isArray(cfg.skills.dirs) ? cfg.skills.dirs.filter(hasText) : [];
+  // EN5 — the same list the loader reads (resolveSkillSources): the preset and what `elanous connect` registered.
+  // Derived roots (shared ~/.agents/skills, Claude package roots) are optional extras, not «configured» dirs.
+  const dirs = resolveSkillSources(cfg)
+    .filter((source) => source.enabled && (source.kind === 'preset' || source.kind === 'connected'))
+    .map((source) => source.path)
+    .filter(hasText);
   const existingDirs = dirs.filter(exists);
   const missingDirs = dirs.filter((dir) => !exists(dir));
   const detail = `${dirs.length} dir${dirs.length === 1 ? '' : 's'} · ${existingDirs.length} exist`;

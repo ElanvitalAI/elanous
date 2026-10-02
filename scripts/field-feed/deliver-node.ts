@@ -5,7 +5,7 @@
 // ⛔ 인스타그램에 올리지 않는다 — 실제 Meta 게시는 다음 판.
 import { copyFileSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { sendOutbound } from '../../src/domains/outbound-alert.js';
+import { deliver as sendReport } from '../../src/domains/outbound-alert.js';
 import { coverHtml, readContext, readDraft, result, screenshot, slideHtml, writeDraft } from './lib.js';
 
 try {
@@ -41,12 +41,17 @@ try {
   if (reel) copyFileSync(join(folder, draft.reel!), reel);
 
   // FIELD_FEED_NOTIFY=0 — 시험·리허설에서 텔레그램으로 나가지 않게.
-  const sent = process.env.FIELD_FEED_NOTIFY === '0' ? false : sendOutbound([
+  // 경로(daemon=/v1/outbound 수락 · direct=텔레그램 직접 · false=실패)를 그대로 남긴다 — 10-01 운영 실측에서
+  // «notified:true» 만 있고 그래프 자식은 debug.log 가 꺼져 있어 도착 근거가 0 이었다. 사람이 «최종 게시»를 누른
+  // 직후라 야간 무음 보류는 걸지 않는다(sendOutbound 의 보류 대신 바로 보낸다).
+  const notify = process.env.FIELD_FEED_NOTIFY === '0' ? 'off' : sendReport([
     `✅ 승인됨 · 게시 준비 완료 — ${draft.event.title} (${draft.event.date})`,
     `캐러셀 ${included.length + 1}장${reel ? ' ⊕ 릴스 1편' : ''} · 초안 r${draft.revision}${draft.updatedBy === 'human' ? '(사람이 고침)' : ''}`,
     '', text, '', `묶음: ${ready}`, '(인스타그램 게시는 아직 사람이 한다 — 자동 게시는 다음 판)',
   ].join('\n'), 'report');
-  result({ ready, slides: included.length + 1, reel: Boolean(reel), redrawn, revision: draft.revision, notified: sent });
+  const delivered = { at: new Date().toISOString(), path: notify === false ? 'failed' : notify, revision: draft.revision };
+  writeDraft(folder, { ...(readDraft(folder) ?? draft), delivered } as typeof draft);
+  result({ ready, slides: included.length + 1, reel: Boolean(reel), redrawn, revision: draft.revision, notified: notify === 'daemon' || notify === 'direct', notifyPath: delivered.path });
 } catch (error) {
   console.log(JSON.stringify({ outcome: 'fail', reason: error instanceof Error ? error.message : String(error) }));
 }

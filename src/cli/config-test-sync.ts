@@ -41,6 +41,9 @@ export const TEST_SYNC_AUX_FILES: readonly string[] = [
   'llm-fallback.json', // 모델 폴백 체인
   'auth.json',         // oauth 자격 (LLM provider)
   'identity.json',     // self identity — 무해·자기인식 일관
+  // POL1 (10-01): the LLM policy (credit use · pace · grants). Without it a tree's test universe resolved «fallback»
+  // while production said «credits», and every harness run from a work tree went to grok.
+  'policy/llm.yaml',
 ];
 
 /** 의도적 제외 (복사 금지 — 이유 명시. 목록 변경 시 반드시 사유와 함께). */
@@ -201,6 +204,7 @@ export function syncTestConfig(testDir: string, srcDir: string = prodConfigDir()
     //   목록 뒤의 `auth.json`(codex 로그인)이 복사되지 않아 격리 우주의 자식이 codex 를 못 썼다.
     //   ⇒ 이미 같은 바이트면 건너뛴다(멱등) — 다르면 종전처럼 복사한다(실패는 그대로 드러난다).
     if (existsSync(to) && readFileSync(from).equals(readFileSync(to))) { chmodSync(to, 0o600); skippedIdentical.push(f); continue; }
+    mkdirSync(dirname(to), { recursive: true });
     copyFileSync(from, to);
     chmodSync(to, 0o600);
     copied.push(f);

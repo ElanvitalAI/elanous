@@ -104,3 +104,30 @@ test('CLI disposition set and piped 100-item status JSON remain complete', () =>
   expect(piped.stdout.trim()).toBe('100 known-issue 1');
   expect(readFileSync(join(dir, 'checklist.json'), 'utf8').length).toBeGreaterThan(68_000);
 }), 30_000);
+
+test('screen cells without a full 짝: line or with an untracked ⏳ warn without changing the verdict', () => isolated((root) => {
+  addItem('0.2.6', { id: 'NOLINE', title: 'no parity line', kind: 'screen' });
+  addItem('0.2.6', { id: 'SHORT', title: 'four columns', kind: 'screen' });
+  addItem('0.2.6', { id: 'UNTRACKED', title: 'untracked wait', kind: 'screen' });
+  addItem('0.2.6', { id: 'FULL', title: 'all tracked', kind: 'screen' });
+  addItem('0.2.6', { id: 'PLAIN', title: 'not a screen cell' });
+  setItem('0.2.6', 'NOLINE', { status: 'green', evidence: '#1 landed' }, 'TC');
+  setItem('0.2.6', 'SHORT', { status: 'green', evidence: '짝: PWA ✅ · 데스크톱 ✅ · 폴드 ✅ · 아이폰 ✅' }, 'TC');
+  setItem('0.2.6', 'UNTRACKED', { status: 'green', evidence: '#2\n짝: PWA ✅ · 데스크톱 ⏳(DT3) · 폴드 ❌(대안: 텔레그램) · 아이폰 ⏳(칸 F1b) · 아이패드 —' }, 'TC');
+  setItem('0.2.6', 'FULL', { status: 'green', evidence: '짝: PWA ✅ · 데스크톱 ✅ #3 · 폴드 ❌(대안: 텔레그램 @자리) · 아이폰 ⏳(칸 F1b) · 아이패드 ⏳(칸 F1b)' }, 'TC');
+  setItem('0.2.6', 'PLAIN', { status: 'green' }, 'TC');
+  const { code, result } = node(root, '0.2.6');
+  expect(code).toBe(0);
+  expect(result).toMatchObject({ outcome: 'ok', ok: true });
+  expect(result.parity!.map((p) => p.id)).toEqual(['NOLINE', 'SHORT', 'UNTRACKED']);
+  expect(result.parity!.find((p) => p.id === 'UNTRACKED')!.why).toBe('⏳ 에 (칸 …) 번호가 없다: 데스크톱');
+  expect(result.summary).toContain('⚠ 짝 경고 3(NOLINE, SHORT, UNTRACKED)');
+  expect(() => setItem('0.2.6', 'PLAIN', { kind: 'widget' as 'screen' }, 'TC')).toThrow('잘못된 종류');
+}));
+
+test('a moved screen cell keeps its kind in the next patch', () => isolated((root) => {
+  addItem('0.2.6', { id: 'S1', title: 'screen moved', kind: 'screen' });
+  setItem('0.2.6', 'S1', { disposition: 'move', evidence: '짝: PWA ✅ · 데스크톱 ⏳(칸 DT9) · 폴드 — · 아이폰 — · 아이패드 —' }, 'TC');
+  expect(node(root, '0.2.6').result).toMatchObject({ outcome: 'ok', moved: ['S1'], parity: [] });
+  expect(listChecklist('0.2.7').items[0]).toMatchObject({ id: 'S1', kind: 'screen' });
+}));

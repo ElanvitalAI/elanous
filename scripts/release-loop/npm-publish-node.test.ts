@@ -180,3 +180,20 @@ test('E401 and thrown command errors fail without disclosing token, cleaning npm
     expect(existsSync(thrownNpmrc)).toBe(false);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
+
+test('REL3: a resume in another universe publishes the archive prepare built and the production-root token', async () => {
+  const f = fixture();
+  const other = mkdtempSync(join(tmpdir(), 'npm-publish-other-universe-'));
+  const prod = mkdtempSync(join(tmpdir(), 'npm-publish-prod-root-'));
+  mkdirSync(join(prod, 'secrets'));
+  writeFileSync(join(prod, 'secrets', 'npm-token'), `${TOKEN}\n`, { mode: 0o600 });
+  const archive = join(f.root, 'release', VERSION, 'prepared', 'dist', 'elanous.tgz');
+  const context: GraphContext = { input: { version: VERSION, previousVersion: '0.2.5', npmWaitMinutes: 0 },
+    outputs: { publish: { outcome: 'ok' }, prepare: { outcome: 'ok', candidate: archive } } };
+  try {
+    const result = await runNpmPublish(context, { ...f.deps, stateDir: other, productionRoot: prod });
+    expect(f.commands[0]).toBe(`tar -xOzf ${archive} package/package.json`);
+    expect(f.commands.some((c) => c.startsWith(`npm publish ${archive} `))).toBe(true);
+    expect(result.outcome).toBe('ok');
+  } finally { rmSync(other, { recursive: true, force: true }); rmSync(prod, { recursive: true, force: true }); rmSync(f.root, { recursive: true, force: true }); }
+});

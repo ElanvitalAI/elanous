@@ -158,6 +158,9 @@ export interface TerminalPanelProps {
   onPtySelection?: (terminal: DaemonTerminalSummary) => void;
 }
 
+/** TERM1 — how long the plain terminal view waits before loading the PTY list. */
+export const PTY_LIST_DEFER_MS = 1_200;
+
 export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalPanelProps = {}) {
   const { client, config, sessionId } = useDaemon();
   // WT-X-1 — auto-reveal mobile modifier bar on touch devices
@@ -228,7 +231,12 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     if (panelView !== 'terminal' && panelView !== 'pty-list') return;
     let cancelled = false;
     setPtyListState('loading');
-    void (async () => {
+    // TERM1 · 10-02 — on the plain terminal view the PTY list is secondary: let the shell come up first, and let a
+    // second run of this effect (the client object settles right after mount) cancel the first instead of doubling
+    // the two heaviest calls (`/v1/terminals` ⊕ 200 log lines — 1.7–6.6 s each on the busy ops daemon).
+    // A link that names a PTY (`initialPtyId`) needs the list at once — only the plain terminal entry waits.
+    const delay = panelView === 'terminal' && !initialPtyId ? PTY_LIST_DEFER_MS : 0;
+    const timer = setTimeout(() => { void (async () => {
       try {
         const [terminalResult, progressResult] = await Promise.all([
           client.listTerminals(ptyTerminalListRequest(includeAllPtyInstances)),
@@ -250,9 +258,9 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
         setPtyListState('error');
         debugLog('webterm.pty-list.error', { reason: String(error) });
       }
-    })();
-    return () => { cancelled = true; };
-  }, [client, includeAllPtyInstances, panelView]);
+    })(); }, delay);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [client, includeAllPtyInstances, panelView, initialPtyId]);
   useEffect(() => {
     if (selectedPtyKey !== null && !ptyRows.some((terminal) => ptyRowKey(terminal) === selectedPtyKey)) {
       ptySnapshotRequestRef.current += 1;

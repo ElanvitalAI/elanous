@@ -437,11 +437,28 @@ const LLM_DEFAULTS: LLMConfig = { provider: 'auto' };
 export type SkillSetName =
   | 'claudecode' | 'opencode' | 'codex' | 'hermes' | 'openclaw' | 'custom';
 
+export type SkillSourceKind = 'preset' | 'shared' | 'connected' | 'package';
+
+/** One skill root elanous reads. `mode` is always `ref` today (the folder is read where it is). */
+export interface SkillSource {
+  id: string;
+  path: string;
+  kind: SkillSourceKind;
+  enabled: boolean;
+}
+
 export interface SkillsConfig {
   activeSet: SkillSetName;
   dirs: string[];
   /** Include the existing shared ~/.agents/skills directory. Default true; false opts out. */
   includeSharedAgentSkills?: boolean;
+  /**
+   * EN5 — the one source list. On disk it holds only what `elanous connect` registered (kind `connected`, read in
+   * place, never copied); the preset (`activeSet`/`dirs`), the shared `~/.agents/skills` root and Claude package
+   * roots are derived at read time by `resolveSkillSources()`. The dev-only `connected: string[]` key (EN9, never
+   * released) is read and folded in here; the next save writes `sources` instead.
+   */
+  sources?: SkillSource[];
   /** Explicit skill-name allowlist. When set and non-empty, the skill
    *  index filters to this list — all other skills are hidden from
    *  routing, autocompletion, and `/run-skill`. Use when a project
@@ -517,34 +534,84 @@ export function bundledSkillsDir(packageRoot: string = dirname(import.meta.dir))
   return join(packageRoot, 'skills');
 }
 
-export function defaultSkillDirs(
-  cfg?: UserConfig,
-  opts?: DefaultSkillDirsOptions,
-): string[] {
+function packageOptIn(cfg?: UserConfig): boolean {
+  try { return (cfg ?? getUserConfig()).skills.includeClaudePackageSkills === true; } catch { return false; }
+}
+
+/** Stable id for a connected root: the agent it belongs to, else the folder (plugin) name. */
+export function skillSourceId(path: string): string {
+  if (/[/\\]\.codex[/\\]skills\/?$/.test(path)) return 'codex';
+  if (/[/\\]\.claude[/\\]skills\/?$/.test(path)) return 'claude';
+  const parts = path.split(/[/\\]/).filter(Boolean);
+  const last = parts[parts.length - 1] === 'skills' ? parts[parts.length - 2] : parts[parts.length - 1];
+  return `plugin:${last ?? 'skills'}`;
+}
+
+/** Parse persisted `skills.sources` ⊕ the dev-only `skills.connected` key into connected sources (deduped by path). */
+export function parsePersistedSkillSources(rawSources: unknown, legacyConnected: unknown): SkillSource[] | undefined {
+  const out: SkillSource[] = [];
+  const seen = new Set<string>();
+  const push = (source: SkillSource) => { if (!seen.has(source.path)) { seen.add(source.path); out.push(source); } };
+  if (Array.isArray(rawSources)) {
+    for (const row of rawSources) {
+      if (!row || typeof row !== 'object') continue;
+      const r = row as Record<string, unknown>;
+      if (typeof r.path !== 'string' || !r.path.trim()) continue;
+      const path = r.path.trim();
+      push({ id: typeof r.id === 'string' && r.id.trim() ? r.id.trim() : skillSourceId(path), path, kind: 'connected', enabled: r.enabled !== false });
+    }
+  }
+  if (Array.isArray(legacyConnected)) {
+    for (const path of legacyConnected) if (typeof path === 'string' && path.trim()) push({ id: skillSourceId(path.trim()), path: path.trim(), kind: 'connected', enabled: true });
+  }
+  return out.length ? out : undefined;
+}
+
+/**
+ * ★ EN5 — the ONE function every reader uses (loader · setup checklist · connect · onboarding).
+ * Order is the historical order, so an old config resolves to exactly the old directory list:
+ * preset (activeSet/dirs) → shared ~/.agents/skills (only when it exists) → connected → Claude package roots (opt-in).
+ * Packaged `skills/` is appended by defaultSkillDirs, not listed here.
+ */
+export function resolveSkillSources(cfg?: UserConfig, opts?: DefaultSkillDirsOptions): SkillSource[] {
   const claudecode = skillSetDir('claudecode')!; // = ~/.claude/skills (LOCAL_SKILLS_DIR)
-  let base = [claudecode];
+  const preset = (paths: string[], id: string): SkillSource[] => paths.map((path, i) => ({ id: paths.length > 1 ? `${id}:${i + 1}` : id, path, kind: 'preset', enabled: true }));
+  let sources: SkillSource[] = preset([claudecode], 'claudecode');
   try {
     const sk = (cfg ?? getUserConfig()).skills;
     if (sk.activeSet !== 'custom') {
       const d = skillSetDir(sk.activeSet);
-      if (d) base = [d];
-      else if (sk.dirs.length > 0) base = [...sk.dirs];
+      if (d) sources = preset([d], sk.activeSet);
+      else if (sk.dirs.length > 0) sources = preset([...sk.dirs], 'custom');
     } else if (sk.dirs.length > 0) {
-      base = [...sk.dirs];
+      sources = preset([...sk.dirs], 'custom');
     }
+    const has = (path: string) => sources.some((source) => source.path === path);
     const shared = sharedAgentSkillRoots({
       home: opts?.sharedAgentHome ?? REMOTE_HOME,
       includeSharedAgentSkills: sk.includeSharedAgentSkills !== false,
     });
     try { debug.log('skills.roots', 'shared-agent', { found: shared.length }); }
     catch { /* discovery remains fail-soft when observation is unavailable */ }
-    for (const dir of shared) {
-      if (!base.includes(dir)) base.push(dir);
+    for (const path of shared) if (!has(path)) sources.push({ id: 'agents', path, kind: 'shared', enabled: true });
+    for (const source of sk.sources ?? []) if (!has(source.path)) sources.push({ ...source, kind: 'connected' });
+    if (sk.includeClaudePackageSkills === true) {
+      for (const path of appendClaudePackageSkillDirs([], opts?.pluginsRoot)) {
+        if (!has(path)) sources.push({ id: `package:${skillSourceId(path).replace(/^plugin:/, '')}`, path, kind: 'package', enabled: true });
+      }
     }
-    base = sk.includeClaudePackageSkills === true
-      ? appendClaudePackageSkillDirs(base, opts?.pluginsRoot)
-      : base;
   } catch { /* fail-soft — config 없거나 파싱 실패 시 기본 경로 */ }
+  return sources;
+}
+
+export function defaultSkillDirs(
+  cfg?: UserConfig,
+  opts?: DefaultSkillDirsOptions,
+): string[] {
+  const sources = resolveSkillSources(cfg, opts);
+  const paths = sources.filter((source) => source.enabled).map((source) => source.path);
+  // Historical: the package opt-in path also collapsed duplicate user dirs; the plain path kept them (index dedupes later).
+  const base = sources.some((source) => source.kind === 'package') || packageOptIn(cfg) ? uniqueSkillDirsPreserveOrder(paths) : paths;
   return appendBundledSkillsDir(base, opts?.bundledSkillsRoot);
 }
 
@@ -1382,6 +1449,28 @@ export interface ChatCompactConfig {
   archiveEnabled: boolean;
   archiveRetentionDays: number;
   archiveRetentionMb: number;
+}
+
+/** ER1 — 액티브 덤퍼(오류 자동 보고). 기본 켬(첫 실행 안내 한 번 · 대표 10-01) · 신원(email/telegramUser)은 따로 «예»일 때만. */
+export interface ErrorReportsConfig {
+  /** false = never send. Absent = on (the first-run notice says how to turn it off). */
+  enabled?: boolean;
+  /** true = also send email / telegramUser below with each report. Default false. */
+  identity?: boolean;
+  email?: string;
+  telegramUser?: string;
+}
+
+export function parseErrorReportsConfig(raw: unknown): ErrorReportsConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: ErrorReportsConfig = {};
+  if (r.enabled === false || r.enabled === 'false') out.enabled = false;
+  else if (r.enabled === true || r.enabled === 'true') out.enabled = true;
+  if (r.identity === true || r.identity === 'true') out.identity = true;
+  if (typeof r.email === 'string' && r.email.trim()) out.email = r.email.trim();
+  if (typeof r.telegramUser === 'string' && r.telegramUser.trim()) out.telegramUser = r.telegramUser.trim();
+  return Object.keys(out).length ? out : undefined;
 }
 
 export interface ChatConfig {
@@ -3373,6 +3462,8 @@ export interface UserConfig {
   logs: LogsConfig;
   shell: ShellConfig;
   chat: ChatConfig;
+  /** ER1 — optional so older fixtures stay valid; absent = defaults. */
+  errorReports?: ErrorReportsConfig;
   voice: VoiceConfig;
   intake: IntakeConfig;
   dashboard: DashboardConfig;
@@ -4419,6 +4510,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       activeSet: normalizeSkillSet(sk.activeSet),
       dirs: strArray(sk.dirs, skillsDefaults().dirs),
       includeSharedAgentSkills: sk.includeSharedAgentSkills !== false,
+      ...(() => { const sources = parsePersistedSkillSources(sk.sources, sk.connected); return sources ? { sources } : {}; })(),
       allow: strArray(sk.allow, []),
       deny: strArray(sk.deny, []),
       urlRouting: parseUrlRouting(sk.urlRouting),
@@ -4546,6 +4638,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       // false required to short-circuit `buildDashboardOptionalToolSpecs`.
       allowDashboardOptionalTools: sh.allowDashboardOptionalTools !== false,
     },
+    ...((): { errorReports?: ErrorReportsConfig } => { const er = parseErrorReportsConfig(rawObj.errorReports); return er ? { errorReports: er } : {}; })(),
     chat: {
       fastPath: chat.fastPath === false || chat.fastPath === 'false' ? false : CHAT_DEFAULTS.fastPath,
       conciseness: {
@@ -5590,6 +5683,10 @@ export function saveUserConfig(
     skills: stripUndef({
       activeSet: cfg.skills.activeSet,
       dirs: [...cfg.skills.dirs],
+      // EN5 — only connected roots are persisted (preset/shared/package are derived). The dev-only `connected` key is not written back.
+      sources: cfg.skills.sources && cfg.skills.sources.some((source) => source.kind === 'connected')
+        ? cfg.skills.sources.filter((source) => source.kind === 'connected').map(({ id, path, enabled }) => ({ id, path, enabled }))
+        : undefined,
       // Omit allow/deny when empty to keep disk JSON minimal for the
       // common "no filter" case.
       allow: cfg.skills.allow && cfg.skills.allow.length > 0 ? [...cfg.skills.allow] : undefined,
@@ -5683,6 +5780,7 @@ export function saveUserConfig(
     debug: cfg.debug,
     logs: cfg.logs,
     shell: cfg.shell,
+    errorReports: cfg.errorReports ? stripUndef({ ...cfg.errorReports }) : undefined,
     chat: stripUndef({
       fastPath: cfg.chat.fastPath,
       conciseness: stripUndef({

@@ -79,7 +79,7 @@ export function explainFailure(group: RepeatedFailureGroup): string {
   // the first live tick saw it as `webterm.tabs` (list errors re-raise the socket close) and sent the generic line.
   if (group.area.startsWith('webterm.') && /^socket closed: #: auth_failed$/i.test(group.reason)) {
     // Same words as the PWA banners (🅞 #21591·#21602 · 🅕 #21599) so the alert and the screen say one thing.
-    return '이 기기(브라우저)에 소유자 토큰이 없거나 틀리거나 만료돼 데몬이 연결을 거절한다 — 이미 연결된 기기의 설정 › Connect token 에서 토큰을 만들어, 이 기기의 설정 › Daemon › Bearer token 칸(/app/settings/#bearer-token)에 붙인다';
+    return '이 기기(브라우저)에 소유자 토큰이 없거나 틀리거나 만료돼 데몬이 연결을 거절한다 — 이미 연결된 기기의 설정 › 연결 토큰 만들기 에서 토큰을 만들어, 이 기기의 설정 › 데몬 연결 › 연결 토큰 칸(/app/settings/#bearer-token)에 붙인다';
   }
   const span = Date.parse(group.lastTs) - Date.parse(group.firstTs);
   const minutes = Number.isFinite(span) ? Math.max(1, Math.ceil(span / 60_000)) : 10;

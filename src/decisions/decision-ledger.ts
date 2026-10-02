@@ -15,11 +15,13 @@ export interface DecisionEntry {
   options: DecisionOption[]; recommendation: Recommendation; raisedAt?: string; importedAt?: string;
   raisedBy: { agent: string; track?: DecisionTrack; session?: string }; version?: Versions;
   status: 'open' | 'decided' | 'withdrawn'; refs?: string[];
+  /** DEC-TG — optional deadline (UTC). Cards remind the owner two hours before it. */
+  dueAt?: string;
   decidedAt?: string; decidedBy?: DecisionActor; choice?: string; note?: string; versionAtDecision?: Versions;
   withdrawnAt?: string; withdrawReason?: string;
   history: Array<{ type: 'raised' | 'options-added' | 'decided' | 'withdrawn'; at?: string; by: string; version?: Versions; choice?: string; reason?: string }>;
 }
-export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs'> & { raisedAt?: string };
+export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt'> & { raisedAt?: string };
 type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
 export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions }
 const CATEGORIES: readonly string[] = ['secret', 'publish', 'money', 'security', 'scope', 'irreversible', 'other'];
@@ -73,7 +75,8 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
   if ('option' in recommendation && !options.some(o => o.key === recommendation.option)) throw new Error('recommended option not found');
   return { ...input, title, scqa: { s, c, ...(q ? { q } : {}), ...(a ? { a } : {}) }, options, recommendation,
     raisedBy: { agent: safe(single(input.raisedBy.agent, 'agent')), ...(input.raisedBy.track ? { track: input.raisedBy.track } : {}), ...(input.raisedBy.session ? { session: safe(single(input.raisedBy.session, 'session')) } : {}) },
-    ...(input.refs ? { refs: input.refs.map(r => safe(single(r, 'ref'))) } : {}) };
+    ...(input.refs ? { refs: input.refs.map(r => safe(single(r, 'ref'))) } : {}),
+    ...(input.dueAt ? { dueAt: utc(input.dueAt) } : {}) };
 }
 
 export class DecisionLedger {

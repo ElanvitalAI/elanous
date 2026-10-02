@@ -919,6 +919,24 @@ export class TelegramBot {
     return undefined;
   }
 
+  /** DEC-TG — replace a message's text AND its inline keyboard (empty rows remove the buttons). */
+  async editMessageWithKeyboard(
+    chatId: number,
+    messageId: number,
+    text: string,
+    buttons: Array<Array<{ text: string; data: string }>>,
+  ): Promise<void> {
+    await this.throttledCall<unknown>(chatId, 'editMessageText', {
+      chat_id: chatId,
+      message_id: messageId,
+      text: text.length > this.maxChars ? `${text.slice(0, this.maxChars - 2)} …` : text,
+      reply_markup: { inline_keyboard: buttons.map((row) => row.map((b) => ({ text: b.text, callback_data: b.data.slice(0, 64) }))) },
+    });
+  }
+
+  /** True while the long-poll loop runs — only a polling bot should push decision cards (nexus may hold a send-only bot). */
+  isPolling(): boolean { return this.running; }
+
   /** T2-P6 — acknowledge a callback_query so Telegram clears the
    *  spinner next to the button the user tapped. Pass a `text` to
    *  flash a tiny toast on the user's device (≤200 chars). Returns
@@ -1156,6 +1174,8 @@ export class TelegramBot {
           if (u.callback_query) {
             const cq = u.callback_query;
             if (!this.isOwnerAllowed(cq.from.id)) {
+              // DEC-TG — a decision-card tap from someone else is the rehearsal's «refused» case; name it there too.
+              if ((cq.data ?? '').startsWith('dec:')) debug.log('decisions.telegram', 'tap-refused', { platform: 'telegram', gate: 'owner-allowlist' }, { level: 'warn' });
               debug.log('telegram.owner-gate', 'refused', {
                 kind: 'callback', reason: this.allowedUsers.size === 0 ? 'empty-allowlist' : 'not-allowed', userId: cq.from.id,
               });
@@ -1425,6 +1445,9 @@ export class TelegramBot {
               ...reply, mimeType: 'video/mp4', caption: `현장 영상 · ${event} · ${result.seconds}초`,
             });
             if (!sent) throw new Error('sendDocument failed');
+            if (result.feed?.started) {
+              await this.sendMessage(ctx.chatId, `인스타 피드 초안을 만드는 중 · ${event} — 1분쯤 뒤 앱 «게시 대기»에서 고치고 «최종 게시»를 누르면 됩니다(누르기 전엔 아무 데도 안 올라갑니다).`, reply);
+            }
           } else {
             await this.sendMessage(ctx.chatId, `현장 영상 실패 · ${event} · ${result.error ?? 'render failed'}`, reply);
           }
@@ -2840,6 +2863,17 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
   // poll loop requests `callback_query` from the first getUpdates —
   // in-turn approval taps then arrive without a mid-turn delay.
   botRef.ensureSurfaceHitl();
+  // DEC-TG(대표 10-02) — decision cards on the MAIN bot only (other channel pollers carry other tokens). The ticker
+  // itself sends only while this bot polls, so a send-only nexus bot never duplicates the standalone poller's cards.
+  if (opts.userConfig.raw?.decisions === undefined || (opts.userConfig.raw.decisions as { cards?: unknown }).cards !== false) {
+    const mainToken = resolveChannelBotToken('telegram', opts.userConfig)?.token;
+    if (mainToken && botToken === mainToken) {
+      const bot = botRef;
+      void import('./decisions/telegram-decision-cards.js')
+        .then(({ attachTelegramDecisionCards }) => { attachTelegramDecisionCards(bot, opts.userConfig); })
+        .catch((err: unknown) => log(`[telegram] decision cards not attached: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
   return botRef;
 }
 

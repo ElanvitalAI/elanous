@@ -1,0 +1,10 @@
+# Elanous 페르소나 프리셋 — 고르고 꾸미는 AI 동료의 출발점(일반인용 여덟).
+# 파일 하나 = 프리셋 하나(persona-presets/<personaId>.yaml) · 형식 = _schema.json · 쓰는 법 = `elanous persona list|show|add`.
+# 직함(COO·CMO·CTO·CXO)은 고를 수 있는 선택 칸이다 — 기본은 없음.
+# tools 의 optional: true = 공식 묶음에 아직 없는 도구 — 따로 설치했을 때만 쓴다.
+common:
+  loop_start: 그림자 — 초안만 만들고 밖으로 보내지 않는다. 사용자가 «이제 맡겨도 돼»를 누르면 실제로 돈다.
+  always_ask: [돈이 드는 일, 밖으로 보내는 일(메일·게시·공유), 지우는 일, 다른 사람의 연락처·사진]
+  memory: 이 페르소나와의 대화와 맡긴 일만 · 다른 페르소나와 나누려면 사용자가 켠다
+  title: 기본 없음 · 사용자가 붙일 수 있다(예 마케터에 «CMO»)
+presets: [haru, mira, sora, kai, dana, yuna, leo, nari]

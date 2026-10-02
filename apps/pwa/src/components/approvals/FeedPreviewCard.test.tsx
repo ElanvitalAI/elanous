@@ -31,7 +31,9 @@ test('preview is a generic feed card: profile line, cover + included slides with
   await act(async () => { tree = create(<FeedPreviewCard item={feedItem} api={api} onDecided={() => {}} confirm={() => true} />); });
   expect(text()).toContain('Elanous');
   expect(text()).toContain('elanous.ai');
-  expect(text()).toContain('브릴스 코스닥 상장');
+  // The cover's words live in the rendered image — the card does not draw them again.
+  expect(tree!.root.findAll((n) => typeof n.type === 'string' && n.children.includes('브릴스 코스닥 상장'))).toHaveLength(0);
+  expect(tree!.root.findAll((n) => n.props['data-cover-pending'] !== undefined)).toHaveLength(0);
   const dots = () => tree!.root.findAll((n) => typeof n.type === 'string' && n.props['data-dot'] !== undefined).map((n) => n.props['data-dot']);
   expect(dots()).toEqual(['on', 'off', 'off', 'off']);
   await act(async () => { tree!.root.findByProps({ 'aria-label': '다음 장' }).props.onClick(); });
@@ -40,7 +42,8 @@ test('preview is a generic feed card: profile line, cover + included slides with
   expect(text()).not.toContain('상장 기념식 현장을 담았습니다.');
   await act(async () => { button('더 보기').props.onClick(); });
   expect(text()).toContain('상장 기념식 현장을 담았습니다.');
-  expect(text()).toContain('#코스닥 #상장');
+  expect(text()).toContain('#코스닥');
+  expect(text()).toContain('#상장');
   expect(text()).toContain('한국거래소');
   expect(text()).not.toMatch(/instagram|인스타/i);
 });
@@ -77,6 +80,8 @@ test('«최종 게시» approves only after the confirm, saving unsaved edits fi
   await act(async () => { button('편집').props.onClick(); });
   const cover = tree!.root.findAllByType('input').find((i) => i.props.value === '브릴스 코스닥 상장')!;
   await act(async () => { cover.props.onChange({ target: { value: '상장 첫날' } }); });
+  expect(tree!.root.findAll((n) => typeof n.type === 'string' && n.props['data-cover-pending'] !== undefined)).toHaveLength(1);
+  expect(text()).toContain('게시 때 커버를 다시 그립니다');
   await act(async () => { button('최종 게시').props.onClick(); });
   expect(asked).toEqual([FINAL_POST_CONFIRM]);
   expect(calls.filter((c) => !c.startsWith('media'))).toEqual([]);
@@ -84,4 +89,19 @@ test('«최종 게시» approves only after the confirm, saving unsaved edits fi
   await act(async () => { button('최종 게시').props.onClick(); });
   expect(calls.filter((c) => !c.startsWith('media'))).toEqual(['save', 'decide approved']);
   expect(decided).toBe(1);
+});
+
+test('TXT2 — an unpaired «수정 저장» names the save action and links to the connect-token field', async () => {
+  const { GraphApprovalsApiError } = await import('@/lib/graph-approvals-api');
+  const { api } = fakeApi();
+  api.saveFeedDraft = async () => { throw new GraphApprovalsApiError(403, 'pairing-required'); };
+  await act(async () => { tree = create(<FeedPreviewCard item={feedItem} api={api} onDecided={() => {}} confirm={() => true} />); });
+  await act(async () => { button('편집').props.onClick(); });
+  const hook = tree!.root.findAllByType('input').find((i) => i.props.value === '오늘 현장에서')!;
+  await act(async () => { hook.props.onChange({ target: { value: '바뀜' } }); });
+  await act(async () => { button('수정 저장').props.onClick(); });
+  expect(text()).toContain('초안을 저장하려면 이 기기를 데몬에 연결해야 합니다');
+  expect(text()).not.toContain('승인하려면');
+  const link = tree!.root.findAll((n) => n.props['data-connect-token-link'] !== undefined && typeof n.type === 'string')[0]!;
+  expect(link.props.href).toBe('/app/settings/#bearer-token');
 });

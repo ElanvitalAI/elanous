@@ -9,8 +9,8 @@ export const SLOW_AFTER_MS = 8_000;
 /** Status text for the loading panel — pure so the wording and the slow hint are testable. */
 export function loadingStatus(elapsedMs: number, view: 'open' | 'merged', target: number | null): { title: string; clock: string; hint: string | null } {
   const title = view === 'merged'
-    ? 'GitHub 에서 승인해 머지된 PR 을 읽고 있습니다'
-    : target ? `GitHub 에서 승인 대기 PR 과 #${target} 카드를 읽고 있습니다` : 'GitHub 에서 승인 대기 PR 을 읽고 있습니다';
+    ? 'GitHub 에서 반영된 코드 변경을 읽고 있습니다'
+    : target ? `GitHub 에서 승인을 기다리는 코드 변경과 #${target} 카드를 읽고 있습니다` : 'GitHub 에서 승인을 기다리는 코드 변경을 읽고 있습니다';
   const clock = `${(Math.max(0, elapsedMs) / 1000).toFixed(1)}초`;
   const hint = elapsedMs >= SLOW_AFTER_MS ? '평소(2~5초)보다 오래 걸립니다 — GitHub 응답을 기다리는 중이며 멈추지 않았습니다.' : null;
   return { title, clock, hint };

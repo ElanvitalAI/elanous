@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
-import { buildUserConfig, type UserConfig as MainUserConfig } from '../src/user-config.js';
+import { buildUserConfig, skillSetDir, type UserConfig as MainUserConfig } from '../src/user-config.js';
 import { SKILLS_STEP_COMMAND, UNATTENDED_SETUP_COMMAND } from '../src/onboarding/entry-hints.js';
 import {
   checkSetupStatus,
@@ -139,6 +139,7 @@ describe('Q.1 · checkSetupStatus', () => {
 
   test('setup-capable hints preserve interactive commands and add the unattended answer-file command', () => {
     const cfg = makeMainCfg();
+    cfg.skills.activeSet = 'custom'; // EN5 — dirs are read only for a custom set (as the loader does)
     cfg.skills.dirs = ['/missing/skills'];
     const result = checkSetupStatus({
       cfg,
@@ -170,6 +171,7 @@ describe('Q.1 · checkSetupStatus', () => {
 
   test('rendered incomplete checklist exposes unattended setup only for setup-capable items', () => {
     const cfg = makeMainCfg();
+    cfg.skills.activeSet = 'custom'; // EN5 — dirs are read only for a custom set (as the loader does)
     cfg.skills.dirs = ['/missing/skills'];
     const result = checkSetupStatus({
       cfg,
@@ -205,6 +207,7 @@ describe('Q.1 · checkSetupStatus', () => {
 
   test('missing skill dir → skill-dirs fail with missing detail', () => {
     const cfg = makeMainCfg();
+    cfg.skills.activeSet = 'custom'; // EN5 — dirs are read only for a custom set (as the loader does)
     cfg.skills.dirs = ['/missing/skills'];
     const result = checkSetupStatus({
       cfg,
@@ -222,6 +225,7 @@ describe('Q.1 · checkSetupStatus', () => {
 
   test('one of two skill dirs exists → skill-dirs passes with missing detail', () => {
     const cfg = makeMainCfg();
+    cfg.skills.activeSet = 'custom'; // EN5 — dirs are read only for a custom set (as the loader does)
     cfg.skills.dirs = ['/existing/skills', '/missing/skills'];
     const result = checkSetupStatus({
       cfg,
@@ -237,6 +241,7 @@ describe('Q.1 · checkSetupStatus', () => {
 
   test('all skill dirs exist → skill-dirs passes without missing-dir hint', () => {
     const cfg = makeMainCfg();
+    cfg.skills.activeSet = 'custom'; // EN5 — dirs are read only for a custom set (as the loader does)
     cfg.skills.dirs = ['/existing/skills'];
     const result = checkSetupStatus({
       cfg,
@@ -249,13 +254,14 @@ describe('Q.1 · checkSetupStatus', () => {
     expect(skillDirs?.hint).toBe('');
   });
 
-  test('skill.dirs=[] → skill-dirs fails without detail', () => {
+  test('skill.dirs=[] → the checklist names the fallback the loader really reads (EN5 · was «no detail» while the loader read ~/.claude/skills)', () => {
     const cfg = makeMainCfg();
+    cfg.skills.activeSet = 'custom';
     cfg.skills.dirs = [];
-    const result = checkSetupStatus({ cfg, nexusCfg: makeNexusCfg(), pwaBuilt: false });
+    const result = checkSetupStatus({ cfg, nexusCfg: makeNexusCfg(), pwaBuilt: false, exists: () => false });
     const skillDirs = result.recommended.find((item) => item.id === 'skill-dirs');
     expect(skillDirs?.passed).toBe(false);
-    expect(skillDirs?.detail).toBeUndefined();
+    expect(skillDirs?.detail).toBe(`1 dir · 0 exist · missing: ${skillSetDir('claudecode')}`);
   });
 
   test('renderSetupStatus → ✗ / ✓ / ○ 글자가 sink 에 들어감', () => {

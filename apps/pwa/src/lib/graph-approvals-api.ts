@@ -15,7 +15,8 @@ export interface FeedDraft {
   revision: number;
   updatedBy: string;
   brand?: { name?: string; handle?: string; avatar?: string | null };
-  cover: { text: string; sub: string; image?: string };
+  /** `rendered*` = what MK's graph already drew into the cover image (the card must not draw it again). */
+  cover: { text: string; sub: string; image?: string; renderedText?: string; renderedSub?: string };
   slides: FeedSlide[];
   caption: { hook: string; body: string };
   hashtags: string[];
@@ -50,10 +51,19 @@ export class GraphApprovalsApiError extends Error {
   }
 }
 
-export function graphApprovalErrorText(error: unknown): string {
+export type GraphApprovalAction = 'list' | 'decide' | 'save';
+const ACTION_WORD: Record<GraphApprovalAction, string> = { list: '목록을 보려면', decide: '승인하려면', save: '초안을 저장하려면' };
+/** Where the «연결 토큰» field lives — the settings panel focuses it when opened with this hash. */
+export const CONNECT_TOKEN_SETTINGS_HREF = '/app/settings/#bearer-token';
+
+/** 401/403 — this device is not paired with the daemon; the UI should offer the settings link. */
+export function needsConnectToken(error: unknown): boolean {
+  return error instanceof GraphApprovalsApiError && (error.status === 401 || error.status === 403);
+}
+
+export function graphApprovalErrorText(error: unknown, action: GraphApprovalAction = 'decide'): string {
   if (error instanceof GraphApprovalsApiError) {
-    if (error.status === 401) return '소유자 인증이 필요합니다. 설정에서 연결 토큰을 확인해 주세요.';
-    if (error.status === 403) return '이 기기에서 승인하려면 페어링이 필요합니다. 설정에서 연결 토큰을 넣어 주세요.';
+    if (error.status === 401 || error.status === 403) return `${ACTION_WORD[action]} 이 기기를 데몬에 연결해야 합니다 — 설정 › 데몬 연결 › 연결 토큰 칸에 토큰을 넣어 주세요.`;
     if (error.status === 404) return '이 실행을 찾지 못했습니다. 목록을 다시 확인해 주세요.';
     if (error.status === 409) return '이미 결정된 실행입니다. 목록을 다시 확인해 주세요.';
     if (error.status === 400) return '결정 내용을 확인한 뒤 다시 시도해 주세요.';

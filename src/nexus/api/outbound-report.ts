@@ -44,6 +44,13 @@ function json(body: unknown, status: number): Response {
   });
 }
 
+/** The daemon's own sendOutbound path (OB8) — what POST /v1/outbound does, without the HTTP self-call. */
+export async function routeOutboundInProcess(text: string, kind: string): Promise<boolean> {
+  const result = await routeOutbound(getUserConfig(), { text, markdown: false, kind });
+  if (result.delivered) recordOutboundEvent(text, kind);
+  return result.delivered;
+}
+
 /** POST /v1/outbound — fan one message out to the routed channels. */
 export async function handleOutboundReport(req: Request, metaApi: MetaApiOpts): Promise<Response> {
   if (!checkAuth(req, metaApi)) return json({ error: 'unauthorized' }, 401);

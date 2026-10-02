@@ -53,3 +53,19 @@ export function codexPolicyAllowsCredits(policy: CodexQuotaPolicy): boolean {
 export function codexPolicyAllowsFallback(policy: CodexQuotaPolicy): boolean {
   return policy !== 'within-quota';
 }
+
+/** POL1 — the one line a harness launch prints about the codex quota policy it will use, and a loud warning when a
+ *  test universe disagrees with production (10-01: work-tree launches resolved «fallback» and leaked to grok). */
+export function describeLaunchQuotaPolicy(input: {
+  current: ResolvedCodexQuotaPolicy;
+  universe: { kind: 'prod' | 'test'; root: string };
+  production?: ResolvedCodexQuotaPolicy;
+}): { line: string; warning?: string } {
+  const { current, universe, production } = input;
+  const line = `[pod] codex 한도 정책 = ${current.policy}(${CODEX_QUOTA_POLICY_LABEL[current.policy]}) · 출처 ${current.source} · 우주 ${universe.kind} ${universe.root}`;
+  if (universe.kind === 'test' && production && production.policy !== current.policy) {
+    return { line, warning: `⚠️ 이 시험 우주의 한도 정책(${current.policy})이 운영(${production.policy})과 다르다 — 운영과 같게 하려면: bun bin/elanous.mjs config sync-test` };
+  }
+  return { line };
+}
+

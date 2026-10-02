@@ -2,7 +2,8 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, re
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { debug } from '../../debug/log.js';
-import { sendOutbound } from '../../domains/outbound-alert.js';
+import { routeOutbound } from '../outbound/router.js';
+import { getUserConfig } from '../../user-config.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { jsonResponse } from './json-response.js';
 
@@ -22,7 +23,10 @@ interface ConsultRequest {
 export interface ConsultRequestsDeps {
   root?: () => string;
   now?: () => string;
-  send?: typeof sendOutbound;
+  /** Owner alert. Default = the daemon's own in-process router (the same one `/v1/outbound` uses).
+   *  ⛔ Never `sendOutbound` here: it is a synchronous curl to this very daemon's `/v1/outbound`, so inside the
+   *  daemon it blocks the event loop until it times out (~25 s · `unreachable`) and the alert is lost (CS1 · 10-01). */
+  send?: (text: string, kind: string) => unknown;
 }
 
 function file(root: string): string {
@@ -107,11 +111,18 @@ export async function handleConsultRequests(req: Request, deps: ConsultRequestsD
     return jsonResponse({ error: 'journal-unavailable' }, 503);
   }
   debug.log('consult.request', 'accepted', { receiptId: entry.receiptId });
-  try {
-    (deps.send ?? sendOutbound)(
-      `📮 상담 문의 ${entry.receiptId} · ${entry.name}(${entry.kind === 'personal' ? '개인' : (entry.org ?? '회사')}) · 관심 ${entry.interest}\n앱에서 보기`,
-      'alert',
-    );
-  } catch { /* the local receipt remains accepted if delivery is unavailable */ }
+  const alert = `📮 상담 문의 ${entry.receiptId} · ${entry.name}(${entry.kind === 'personal' ? '개인' : (entry.org ?? '회사')}) · 관심 ${entry.interest}\n앱에서 보기`;
+  // Fire and forget — the receipt is already on disk; the answer must not wait for the channel.
+  void Promise.resolve()
+    .then(() => (deps.send ?? notifyInProcess)(alert, 'alert'))
+    .catch((error: unknown) => { debug.log('consult.request', 'notify-failed', { receiptId: entry.receiptId, reason: error instanceof Error ? error.message : String(error) }); });
   return jsonResponse({ receiptId: entry.receiptId, receivedAt: entry.receivedAt }, 202);
+}
+
+async function notifyInProcess(text: string, kind: string): Promise<void> {
+  const result = await routeOutbound(getUserConfig(), { text, markdown: false, kind });
+  debug.log('consult.request', result.delivered ? 'notified' : 'notify-failed', {
+    delivered: result.delivered,
+    channels: result.channels.map((channel) => `${channel.type}:${channel.ok ? 'ok' : 'fail'}`),
+  });
 }

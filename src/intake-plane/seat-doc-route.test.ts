@@ -7,6 +7,56 @@ async function settled(): Promise<void> {
   await new Promise<void>(resolve => setTimeout(resolve, 0));
 }
 
+describe('EV12d — no fitting graph: the seat answers itself', () => {
+  const noGraph = { status: 'failed' as const, summary: 'CMO: 요청에 맞는 설치된 실행 그래프가 없습니다', results: [],
+    seats: [{ seat: 'CMO', title: '리허설 준비 상황', status: 'failed' as const, graphId: '', reason: 'CMO: 요청에 맞는 설치된 실행 그래프가 없습니다' }] };
+
+  test('the reply is the seat answer in the same channel, not «문서 요청 실패»', async () => {
+    const deliveries: unknown[][] = [];
+    const asked: string[][] = [];
+    await submitSeatDocRequest({ text: '@CMO 오늘 리허설 준비 상황 알려줘', reportTo, deps: {
+      submitExec: async () => ({ id: 'exec-77d8' }),
+      getExec: async () => noGraph as never,
+      seatAnswer: async (seat, question) => { asked.push([seat, question]); return { title: 'CMO', text: '리허설 준비: EV10 🟢 · EV12 🟡(디스코드 답 확인 중)' }; },
+      sendOutbound: (...args) => { deliveries.push(args); return true; },
+    } });
+    await settled();
+    expect(asked).toEqual([['CMO', '오늘 리허설 준비 상황 알려줘']]);
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]![0]).toContain('CMO 답 (접수번호 exec-77d8)');
+    expect(deliveries[0]![0]).toContain('리허설 준비: EV10 🟢');
+    expect(deliveries[0]![0]).not.toContain('문서 요청 실패');
+    expect(deliveries[0]!.slice(1)).toEqual(['report', reportTo]);
+  });
+
+  test('when the seat answer fails or is empty, the old failure reply still goes out', async () => {
+    for (const seatAnswer of [async () => { throw new Error('llm down'); }, async () => null]) {
+      const deliveries: unknown[][] = [];
+      await submitSeatDocRequest({ text: '@CMO 상황 알려줘', reportTo, deps: {
+        submitExec: async () => ({ id: 'exec-x' }), getExec: async () => noGraph as never, seatAnswer,
+        sendOutbound: (...args) => { deliveries.push(args); return true; },
+      } });
+      await settled();
+      expect(deliveries).toHaveLength(1);
+      expect(deliveries[0]![0]).toContain('문서 요청 실패 — CMO: 요청에 맞는 설치된 실행 그래프가 없습니다');
+    }
+  });
+
+  test('other failures (a graph that ran and failed) never trigger the seat answer', async () => {
+    let called = 0;
+    const deliveries: unknown[][] = [];
+    await submitSeatDocRequest({ text: '@CMO 메모', reportTo, deps: {
+      submitExec: async () => ({ id: 'exec-y' }),
+      getExec: async () => ({ status: 'failed', summary: '그래프 실행 실패', results: [], seats: [{ seat: 'CMO', title: 't', status: 'failed', graphId: 'doc-draft', reason: '노드 실패' }] }) as never,
+      seatAnswer: async () => { called += 1; return { title: 'CMO', text: 'x' }; },
+      sendOutbound: (...args) => { deliveries.push(args); return true; },
+    } });
+    await settled();
+    expect(called).toBe(0);
+    expect(deliveries[0]![0]).toContain('문서 요청 실패 — 그래프 실행 실패');
+  });
+});
+
 describe('seat document route', () => {
   test('requires a seat address and document language; code language wins', () => {
     for (const body of ['전략', '한 장', '원페이저', '기획', '보도자료', '글', '메모', '초안', 'one-pager', 'strategy', 'post', 'memo', 'draft']) {

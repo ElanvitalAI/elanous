@@ -13,7 +13,7 @@ export function classifyAcpFailure(reason: string | undefined): AcpFailureKind {
 /** 승인 탭(🅞 #21591)과 같은 문면 — 원인 한 문장 ⊕ 할 일. */
 export const ACP_AUTH_MESSAGE = '이 기기에 소유자 토큰이 없어 터미널에 연결하지 못했습니다 — 설정에서 토큰을 붙이면 바로 연결됩니다.';
 /** 어디서 토큰을 얻나(대표 2026-09-28: 안내가 이걸 말하지 않았다). 값은 화면에 절대 싣지 않는다 — 명령만. */
-export const ACP_AUTH_HOWTO = '토큰 얻기: 이미 연결된 기기의 설정 › Connect token 에서 만들거나, 데몬 기계에서 pbcopy < ~/.elanous/acp-token → 이 기기의 설정 › Daemon › Bearer token 칸에 붙여 넣기';
+export const ACP_AUTH_HOWTO = '토큰 얻기: 이미 연결된 기기의 설정 › 연결 토큰 만들기 에서 만들거나, 데몬 기계에서 pbcopy < ~/.elanous/acp-token → 이 기기의 설정 › 데몬 연결 › 연결 토큰 칸에 붙여 넣기';
 
 /** 다시 붙기 간격 — 1s · 2s · 4s … 최대 30s. 데몬 재시작(수 초)을 넘기되 죽은 데몬을 두드리지 않는다. */
 export function reconnectDelayMs(attempt: number): number {

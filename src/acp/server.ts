@@ -26,6 +26,7 @@
 //
 // Related: src/acp/client.ts (elanous-as-client path — pre-MT5 work).
 
+import { ACP_LOGIN_METHOD_ID, acpAuthMethods } from './auth-methods.js';
 import { AgentSideConnection, ndJsonStream, RequestError } from '@agentclientprotocol/sdk';
 import type {
   InitializeRequest, InitializeResponse,
@@ -1415,14 +1416,13 @@ function wireAcpConnection(
         agentCapabilities: opts.agentBrand !== undefined && opts.agentModel !== undefined
           ? buildAgentDeclaration({ brand: opts.agentBrand, model: opts.agentModel })
           : buildAgentDeclaration(),
-        authMethods: [],
+        authMethods: acpAuthMethods(req.clientCapabilities),
       };
     },
 
-    async authenticate(_req: AuthenticateRequest): Promise<AuthenticateResponse> {
-      // No auth flow — we advertise authMethods: [] so the client
-      // shouldn't call this, but the Agent interface requires the
-      // method to be present.
+    async authenticate(req: AuthenticateRequest): Promise<AuthenticateResponse> {
+      // EN10a — sign-in happens in a terminal (`--acp-server --login`); this only acknowledges the method so the client retries.
+      debug.log('acp.session', 'authenticate', { methodId: req.methodId === ACP_LOGIN_METHOD_ID ? req.methodId : 'other' });
       return {};
     },
 

@@ -10,6 +10,7 @@ import {
   type McpOAuthFetch,
 } from '../src/mcp/mcp-oauth.js';
 import { loadTokens, saveTokens } from '../src/oauth/store.js';
+import { debug } from '../src/debug/log.js';
 
 const ENDPOINT = 'https://mcp.example.test/mcp';
 const RESOURCE = 'https://auth.example.test/resource';
@@ -95,6 +96,7 @@ describe('runMcpLogin', () => {
     let authorizationUrl = '';
     const result = await runMcpLogin({
       serverId: 'remote', out: captured.sink, readConfigFn: config([{ id: 'remote', transport: 'http', url: ENDPOINT }]), fetch: oauthFetch(counts),
+      browserEnv: {}, browserPlatform: 'darwin',
       openBrowser: async (url) => {
         authorizationUrl = url;
         const state = new URL(url).searchParams.get('state')!;
@@ -122,6 +124,34 @@ describe('runMcpLogin', () => {
     expect(mcpOAuthStorePath().startsWith(process.env.ELANOUS_STATE_DIR!)).toBe(false);
   });
 
+  test('SSH Mac and displayless Linux keep authorization URL but never call opener; local Mac calls it once', async () => {
+    for (const [env, platform, why] of [
+      [{ SSH_CONNECTION: 'x' }, 'darwin', '원격(ssh)'],
+      [{}, 'linux', '화면(디스플레이)이 없는 세션'],
+      [{}, 'darwin', null],
+    ] as const) {
+      isolated();
+      const captured = out();
+      const opened: string[] = [];
+      const result = await runMcpLogin({
+        serverId: 'remote', out: captured.sink,
+        readConfigFn: config([{ id: 'remote', transport: 'http', url: ENDPOINT }]),
+        fetch: oauthFetch({ register: 0, token: 0 }), timeoutMs: 10,
+        browserEnv: env, browserPlatform: platform,
+        openBrowser: async url => { opened.push(url); },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(captured.logs.join('\n')).toContain(AUTHORIZE);
+      expect(opened).toHaveLength(why ? 0 : 1);
+      if (why) {
+        expect(captured.logs.join('\n')).toContain(why);
+        const event = debug.events(20).filter(e => e.category === 'browser.open').at(-1);
+        expect(event?.event).toBe('skipped');
+        expect(event?.data).toMatchObject({ reason: platform === 'darwin' ? 'ssh' : 'no-display' });
+      }
+    }
+  });
+
   test('⭐⭐ 기대 state 가 정해지기 «전»에 도착한 콜백도 유실되지 않는다', async () => {
     isolated();
     const captured = out();
@@ -147,6 +177,7 @@ describe('runMcpLogin', () => {
       serverId: 'remote', out: captured.sink,
       readConfigFn: config([{ id: 'remote', transport: 'http', url: ENDPOINT }]),
       fetch: fetchSeam,
+      browserEnv: {}, browserPlatform: 'darwin',
       openBrowser: async () => undefined,
       timeoutMs: 2000,
     });
@@ -164,7 +195,8 @@ describe('runMcpLogin', () => {
       const counts = { register: 0, token: 0 }; let redirect = '';
       const result = await runMcpLogin({
         serverId: 'remote', timeoutMs: 15, out: out().sink, readConfigFn: config([{ id: 'remote', transport: 'http', url: ENDPOINT }]), fetch: oauthFetch(counts),
-        openBrowser: async (url) => {
+        browserEnv: {}, browserPlatform: 'darwin',
+      openBrowser: async (url) => {
           redirect = new URL(url).searchParams.get('redirect_uri')!;
           if (mode === 'mismatch') await fetch(`${redirect}?code=x&state=wrong`);
           if (mode === 'oauth-error') await fetch(`${redirect}?error=access_denied`);
@@ -295,7 +327,8 @@ describe('strict redirect_uri login', () => {
         readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
         fetch: passthrough,
         persistDiscoveryFn: () => ({ written: false }),
-        openBrowser: (url) => finishBrowser(url, seen),
+        browserEnv: {}, browserPlatform: 'darwin',
+      openBrowser: (url) => finishBrowser(url, seen),
       });
       const first = await login();
       const second = await login();
@@ -320,7 +353,8 @@ describe('strict redirect_uri login', () => {
         readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
         fetch: passthrough,
         persistDiscoveryFn: () => ({ written: false }),
-        openBrowser: (url) => finishBrowser(url),
+        browserEnv: {}, browserPlatform: 'darwin',
+      openBrowser: (url) => finishBrowser(url),
       });
       expect(first.exitCode).toBe(0);
       const stored = loadStoredRegistration(auth.base);
@@ -335,7 +369,8 @@ describe('strict redirect_uri login', () => {
         readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
         fetch: passthrough,
         persistDiscoveryFn: () => ({ written: false }),
-        openBrowser: (url) => finishBrowser(url),
+        browserEnv: {}, browserPlatform: 'darwin',
+      openBrowser: (url) => finishBrowser(url),
       });
       const again = loadStoredRegistration(auth.base);
       expect(second.exitCode).toBe(0);
@@ -362,7 +397,8 @@ describe('strict redirect_uri login', () => {
         readConfigFn: config([{ id: 'strict', transport: 'http', url: `${auth.base}/mcp`, enabled: true }]),
         fetch: passthrough,
         persistDiscoveryFn: () => ({ written: false }),
-        openBrowser: (url) => finishBrowser(url),
+        browserEnv: {}, browserPlatform: 'darwin',
+      openBrowser: (url) => finishBrowser(url),
       });
       const stored = loadStoredRegistration(auth.base);
       expect(result.exitCode).toBe(0);

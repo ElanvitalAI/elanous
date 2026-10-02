@@ -5,6 +5,7 @@
 // codex·elanous 자격 파일은 이 Job 에 없다. 격리 관문(호스트 넥서스에 닿으면 종료)은 기존 Job 과 같다.
 // 명령 인자는 셸 문자열로 이어붙이지 않고 `"$@"` 로 따로 인용한다.
 
+import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { getUserConfig } from '../../user-config.js';
@@ -66,6 +67,8 @@ if [ -d "$HOME/outbox" ]; then
 fi`;
 
 export interface PodCommandJobInput {
+  /** POD1 — this launch's own label; cleanup selects by it, never by name alone. */
+  launch?: string;
   name: string;
   namespace: string;
   image: string;
@@ -122,13 +125,13 @@ export function podCommandJobManifest(o: PodCommandJobInput): Record<string, unk
   return {
     apiVersion: 'batch/v1',
     kind: 'Job',
-    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, 'elanous.kind': 'command' } },
+    metadata: { name: o.name, namespace: o.namespace, labels: { 'elanous.substrate': 'pod', 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}) } },
     spec: {
       backoffLimit: 0,
       ttlSecondsAfterFinished: 7200,
       activeDeadlineSeconds: o.deadlineSeconds,
       template: {
-        metadata: { labels: { 'elanous.job': o.name, 'elanous.kind': 'command' } },
+        metadata: { labels: { 'elanous.job': o.name, 'elanous.kind': 'command', ...(o.launch ? { 'elanous.launch': o.launch } : {}) } },
         spec: {
           restartPolicy: 'Never',
           securityContext: { runAsUser: 1000, fsGroup: 1000 },
@@ -166,6 +169,7 @@ export function commandJobSecret(o: {
   skillEnvText: Readonly<Record<string, string>>;
   grokAuth?: string;
   ghToken?: string;
+  launch?: string;
 }): Record<string, unknown> | null {
   const stringData: Record<string, string> = {};
   if (o.grokAuth !== undefined) stringData['grok-auth.json'] = o.grokAuth;
@@ -177,7 +181,7 @@ export function commandJobSecret(o: {
   if (Object.keys(stringData).length === 0) return null;
   return {
     apiVersion: 'v1', kind: 'Secret', type: 'Opaque',
-    metadata: { name: `${o.name}-creds`, namespace: o.namespace, labels: { 'elanous.job': o.name } },
+    metadata: { name: `${o.name}-creds`, namespace: o.namespace, labels: { 'elanous.job': o.name, ...(o.launch ? { 'elanous.launch': o.launch } : {}) } },
     stringData,
   };
 }
@@ -265,7 +269,11 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const image = options.image ?? 'elanous-harness:local';
   const repoUrl = options.repoUrl ?? 'https://github.com/ElanvitalAI/elanous';
   const deadlineSeconds = options.deadlineSeconds ?? POD_COMMAND_DEADLINE_SECONDS;
-  const name = options.name ?? podJobName(`cmd-${Date.now().toString(36)}`);
+  // POD1 (10-01): two launches in the same moment got the same `si-cmd-<time>` and the failing one's cleanup
+  // deleted the other's credentials. The name now has a random tail, and cleanup selects this launch's label.
+  const launch = randomBytes(6).toString('hex');
+  const name = options.name ?? podJobName(`cmd-${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`);
+  const own = `elanous.job=${name},elanous.launch=${launch}`;
   const env = options.env ?? process.env;
   const hostMirror = (options.hostMirror ?? env.ELANOUS_POD_HOST_MIRROR
     ?? (options.configHostMirror ?? (() => getUserConfig().pod?.hostMirror))())?.trim() || undefined;
@@ -293,7 +301,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const currentContext = member || options.kubectl ? null : baseKubectl(['config', 'current-context']);
   const context = member?.context ?? (currentContext?.status === 0 ? currentContext.stdout.trim() : '');
   const kubectl: Kubectl = (args, stdin) => baseKubectl(context ? ['--context', context, ...args] : [...args], stdin);
-  const cleanupSecret = () => { kubectl(['-n', namespace, 'delete', 'secret', `${name}-creds`, '--ignore-not-found']); };
+  const cleanupSecret = () => { kubectl(['-n', namespace, 'delete', 'secret', '-l', own, '--ignore-not-found']); };
   const artifactsDir = `${options.artifactsRoot ?? `${effectiveInstanceRoot()}/pod-artifacts`}/${name}`;
   try {
     if (!context && !options.kubectl) throw new Error('pod command: kubectl context 를 확인할 수 없다');
@@ -328,19 +336,19 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       if (synced?.imageRef) member = { ...member, imageRef: synced.imageRef };
     }
     const ghToken = options.clone ? (options.ghToken ?? defaultGhToken)() : undefined;
-    const secret = commandJobSecret({ name, namespace, skills, skillEnvText, ...(grokAuth !== undefined ? { grokAuth } : {}), ...(ghToken !== undefined ? { ghToken } : {}) });
+    const secret = commandJobSecret({ name, namespace, launch, skills, skillEnvText, ...(grokAuth !== undefined ? { grokAuth } : {}), ...(ghToken !== undefined ? { ghToken } : {}) });
     if (secret) {
       const applied = kubectl(['apply', '-f', '-'], JSON.stringify(secret));
       if (applied.status !== 0) throw new Error(applied.stderr.trim() || 'pod command: Secret 적용 실패');
     }
     const manifest = podCommandJobManifest({
-      name, namespace, image: member?.imageRef ?? image,
+      name, namespace, launch, image: member?.imageRef ?? image,
       ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
       ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(options.memoryLimit ? { memoryLimit: options.memoryLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
     });
-    kubectl(['-n', namespace, 'delete', 'job', name, '--ignore-not-found']);
+    kubectl(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found']);
     const applied = kubectl(['apply', '-f', '-'], JSON.stringify(manifest));
     if (applied.status !== 0) {
       cleanupSecret();

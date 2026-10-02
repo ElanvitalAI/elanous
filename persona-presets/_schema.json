@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elanous.ai/schemas/persona-preset.json",
+  "title": "Elanous persona preset",
+  "description": "정본 = persona-presets/<personaId>.yaml. 도구(tools)는 공식 묶음에 있는 것 · 없는 것은 optional: true(따로 설치했을 때만).",
+  "type": "object",
+  "required": [
+    "personaId",
+    "displayName",
+    "names",
+    "role",
+    "oneLine",
+    "voice",
+    "tasks",
+    "tools",
+    "firstQuestions",
+    "doesNot",
+    "forWhom"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "personaId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,30}$"
+    },
+    "displayName": {
+      "type": "string",
+      "description": "기본 이름 · 한국어 · 영어"
+    },
+    "names": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "string"
+      },
+      "description": "이름 후보(첫째가 기본)"
+    },
+    "role": {
+      "type": "string",
+      "description": "무슨 동료인가 — 비서·마케터… (직함 아님)"
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "선택 직함(COO·CMO·CTO·CXO) — 기본 null"
+    },
+    "oneLine": {
+      "type": "string"
+    },
+    "voice": {
+      "type": "object",
+      "required": [
+        "rule",
+        "examples"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "rule": {
+          "type": "string"
+        },
+        "examples": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "when",
+          "what"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "when": {
+            "type": "string"
+          },
+          "what": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "from"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "from": {
+            "type": "string",
+            "description": "core | 공식 묶음 이름 | plugins/<이름>"
+          },
+          "optional": {
+            "type": "boolean",
+            "description": "공식 묶음에 아직 없는 도구 — 따로 설치했을 때만 쓴다"
+          }
+        }
+      }
+    },
+    "firstQuestions": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 3,
+      "items": {
+        "type": "string"
+      },
+      "description": "고른 직후 처음 묻는 칸"
+    },
+    "askBefore": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "공통 칸 외에 이 페르소나가 꼭 묻는 것"
+    },
+    "doesNot": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "string"
+      }
+    },
+    "forWhom": {
+      "type": "string"
+    }
+  }
+}

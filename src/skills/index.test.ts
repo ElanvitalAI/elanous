@@ -2,7 +2,7 @@ import { describe, expect, test, afterEach } from 'bun:test';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildSkillIndex, getSkillIndex, resetSkillIndex } from './index.js';
+import { buildSkillIndex, skillIndexProblems, getSkillIndex, resetSkillIndex } from './index.js';
 import { resetUserConfig } from '../user-config.js';
 
 // ★ G9 P5a — defaultSkillDirs 단위검증(user-config.defaultskilldirs.test.ts)과 짝을 이뤄, 실제
@@ -61,7 +61,7 @@ describe('buildSkillIndex — G9 P5a dir 스캔 wiring(Goodhart 방지)', () => 
     }
   });
 
-  test('SKILL.md 권한 오류는 삼키지 않고 다시 던진다', () => {
+  test('SKILL.md 권한 오류는 화면을 튕기지 않고 건너뛰되 반드시 기록한다', () => {
     const root = mkdtempSync(join(tmpdir(), 'skill-eacces-'));
     const skillMd = join(root, 'locked-skill', 'SKILL.md');
     try {
@@ -74,7 +74,8 @@ describe('buildSkillIndex — G9 P5a dir 스캔 wiring(Goodhart 방지)', () => 
         denied = true;
       }
       if (denied) {
-        expect(() => buildSkillIndex([root])).toThrow();
+        expect(() => buildSkillIndex([root])).not.toThrow();
+        expect(skillIndexProblems().some((p) => p.name === 'locked-skill' && p.code === 'EACCES')).toBe(true);
       }
     } finally {
       try { chmodSync(skillMd, 0o644); } catch { /* restore for cleanup */ }

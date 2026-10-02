@@ -196,7 +196,7 @@ describe('onboarding wizard', () => {
       '1',
       // Step 3 — Obsidian
       vault,
-      // Step 4 — Telegram: no
+      // Step 4 — 텔레그램: no
       'n',
       // Step 5 — Discord: no
       'n',
@@ -239,7 +239,7 @@ describe('onboarding wizard', () => {
       skillDir1,
       // Step 3 — Obsidian
       vault,
-      // Step 4 — Telegram: yes
+      // Step 4 — 텔레그램: yes
       'y',
       '12345:ABCDEF',     // bot token
       '111, 222, 333',    // allowed users
@@ -405,7 +405,7 @@ describe('onboarding wizard', () => {
       '',          // Skills: default
       '',          // no extra dirs
       '',          // Obsidian: default vault
-      'n',         // Telegram: no
+      'n',         // 텔레그램: no
       'n',         // Discord: no
       '1', // Step 6 — Voice & AI: Smart defaults
     ]);
@@ -460,7 +460,7 @@ describe('onboarding wizard', () => {
       '1',  // Step 2 — Skills: claudecode
       '',   // Step 2 — Skills: no extra directories
       '',   // Step 3 — Obsidian: default vault
-      'n',  // Step 4 — Telegram: disabled
+      'n',  // Step 4 — 텔레그램: disabled
       'n',  // Step 5 — Discord: disabled
       '1',  // Step 6 — Voice & AI: Smart defaults
     ]);
@@ -477,6 +477,7 @@ describe('onboarding wizard', () => {
     const io = scriptedIO(['10', '1', root, 'n', 'n', '1']);
     try {
       await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath, continueHereDeps: {
+        probeTailscale: async () => ({ installed: true, alive: true, magicDnsHost: 'mbp.tailnet-example.ts.net', hostname: 'mbp' }),
         showNexus: async () => ({ status: 'unregistered', urls: {
           pwa: { loopback: 'http://127.0.0.1:31415/app/', tailnet: 'https://machine.ts.net/app/' },
           rest: { loopback: 'http://127.0.0.1:31415/v1/', tailnet: 'https://machine.ts.net/v1/' },
@@ -491,14 +492,17 @@ describe('onboarding wizard', () => {
       expect(new URL(link).searchParams.get('tls')).toBe('1');
       expect(new URL(link).searchParams.get('token')).toBe(token);
       const output = io.outputs.join('\n');
-      expect(output).toContain('Browser: https://machine.ts.net/app/');
-      expect(output).toContain(`Phone: ${link}`);
+      expect(output).toContain('브라우저: https://machine.ts.net/app/');
+      expect(output).toContain('  어디서든(Tailscale): `elanous nexus pwa share enable` → https://mbp.tailnet-example.ts.net/app/');
+      expect(output).toContain(`폰: ${link}`);
       expect(output).toContain('QR IMAGE');
-      expect(io.outputs.filter(line => line.includes(link))).toEqual([`  Phone: ${link}`]);
+      expect(io.outputs.filter(line => line.includes(link))).toEqual([`  폰: ${link}`]);
+      expect(logged).toContainEqual(['onboarding.tailscale', 'probed', { installed: true, alive: true, offered: true }]);
       expect(logged).toContainEqual(['onboarding.continue-here', 'phone-link-issued', { kind: 'tailnet', tls: true, temp: true }]);
       expect(logged).toContainEqual(['onboarding.continue-here', 'shown', { daemonRunning: true, interactive: true, phoneLinkIssued: true, telegramEnabled: false }]);
       expect(JSON.stringify(logged)).not.toContain(token);
       expect(JSON.stringify(logged)).not.toContain('elanous://connect');
+      expect(JSON.stringify(logged)).not.toContain('mbp.tailnet-example.ts.net');
       expect(buildUserConfig(cfgPath).onboarding.completed).toBe(true);
     } finally { logSpy.mockRestore(); }
   });
@@ -509,16 +513,59 @@ describe('onboarding wizard', () => {
     let rendered = 0;
     await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath, continueHereDeps: {
       showNexus: async () => ({ status: 'absent' }),
+      probeTailscale: async () => ({ installed: true, alive: false, hostname: 'mbp' }),
       issueToken: () => { issued++; return { token: 'elt_no_daemon' }; },
       renderQr: () => { rendered++; return 'QR IMAGE'; },
     } });
     const output = io.outputs.join('\n');
-    expect(output).toContain('Start the daemon: `elanous nexus run`');
-    expect(output).toContain('Browser: `elanous nexus show`');
-    expect(output).toContain('Phone: `elanous phone link --temp --ttl 24h`');
+    expect(output).toContain('데몬 켜기: `elanous nexus run`');
+    expect(output).toContain('브라우저: `elanous nexus show`');
+    expect(output).toContain('폰: `elanous phone link --temp --ttl 24h`');
+    expect(output).not.toContain('어디서든(Tailscale)');
     expect(output).not.toContain('elt_no_daemon');
     expect(issued).toBe(0);
     expect(rendered).toBe(0);
+  });
+
+  test('post-save Tailscale offer requires installed, alive and a host', async () => {
+    for (const status of [
+      { installed: false, alive: true, magicDnsHost: 'mbp.tailnet-example.ts.net' },
+      { installed: true, alive: false, magicDnsHost: 'mbp.tailnet-example.ts.net' },
+    ]) {
+      const io = scriptedIO(['10', '1', root, 'n', 'n', '1']);
+      await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath, continueHereDeps: {
+        showNexus: async () => ({ status: 'absent' }),
+        probeTailscale: async () => status,
+      } });
+      expect(io.outputs.join('\n')).not.toContain('어디서든(Tailscale)');
+    }
+  });
+
+  test('post-save Tailscale probe failure or timeout silently omits the offer', async () => {
+    for (const probeTailscale of [
+      async () => { throw new Error('probe failed'); },
+      () => new Promise<never>(() => {}),
+    ]) {
+      const io = scriptedIO(['10', '1', root, 'n', 'n', '1']);
+      await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath, continueHereDeps: {
+        showNexus: async () => ({ status: 'absent' }),
+        probeTailscale,
+      } });
+      const output = io.outputs.join('\n');
+      expect(output).toContain('브라우저: `elanous nexus show`');
+      expect(output).not.toContain('어디서든(Tailscale)');
+      expect(output).not.toContain('probe failed');
+    }
+  }, 10_000);
+
+  test('post-save Tailscale without MagicDNS offers the command but no hostname URL', async () => {
+    const io = scriptedIO(['10', '1', root, 'n', 'n', '1']);
+    await runOnboarding({ grokDeps: NO_SUBSCRIPTION_DETECT, io, path: cfgPath, continueHereDeps: {
+      showNexus: async () => ({ status: 'absent' }),
+      probeTailscale: async () => ({ installed: true, alive: true, hostname: 'mbp' }),
+    } });
+    expect(io.outputs).toContain('  어디서든(Tailscale): `elanous nexus pwa share enable`');
+    expect(io.outputs.join('\n')).not.toContain('https://mbp/');
   });
 
   test('scripted IO captures prompts for debugging', async () => {
@@ -527,7 +574,7 @@ describe('onboarding wizard', () => {
       '1',  // Step 2 — Skills: claudecode
       '',   // Step 2 — Skills: no extra directories
       '',   // Step 3 — Obsidian: default vault
-      'n',  // Step 4 — Telegram: disabled
+      'n',  // Step 4 — 텔레그램: disabled
       'n',  // Step 5 — Discord: disabled
       '1',  // Step 6 — Voice & AI: Smart defaults
     ]);

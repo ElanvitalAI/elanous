@@ -146,6 +146,7 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
         }, env: {} }),
         path: join(root, 'config.json'),
         continueHereDeps: {
+          probeTailscale: async () => ({ installed: true, alive: true, magicDnsHost: 'mbp.tailnet-example.ts.net' }),
           showNexus: async () => ({ status: 'unregistered', urls: {
             pwa: { loopback: 'http://127.0.0.1:31415/app/' },
             rest: { loopback: 'http://127.0.0.1:31415/v1/' },
@@ -157,8 +158,11 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
       });
       expect(config.onboarding.completed).toBe(true);
       const printed = stdout.mock.calls.flat().join('');
-      expect(printed).toContain('Browser: `elanous nexus show`');
-      expect(printed).toContain('Phone: `elanous phone link --temp --ttl 24h`');
+      expect(printed).toContain('브라우저: `elanous nexus show`');
+      expect(printed).toContain('폰: `elanous phone link --temp --ttl 24h`');
+      expect(printed).toContain('  어디서든(Tailscale): `elanous nexus pwa share enable`\n');
+      expect(printed).not.toContain('https://');
+      expect(printed).not.toContain('mbp.tailnet-example.ts.net');
       expect(printed).not.toContain('http://127.0.0.1');
       expect(printed).not.toContain('elt_must-not-appear');
       expect(printed).not.toContain('QR IMAGE');
@@ -410,7 +414,7 @@ describe('onboarding/non-interactive · scripted answer resolution', () => {
       });
 
       expect(cfg.llm.provider).toBe('openai-codex');
-      expect(stdout.mock.calls.flat().join('')).toContain('Phone: `elanous phone link --temp --ttl 24h`');
+      expect(stdout.mock.calls.flat().join('')).toContain('폰: `elanous phone link --temp --ttl 24h`');
       expect(stderr).not.toHaveBeenCalled();
       expect(stdout.mock.calls.flat().join('')).not.toContain('  → skipped.');
       expect(stderr.mock.calls.flat().join('')).not.toContain('  → skipped.');

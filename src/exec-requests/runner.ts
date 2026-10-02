@@ -112,6 +112,23 @@ function syncRun(item: ExecRequest, seat: ExecSeat, state: GraphRunState, root: 
   if (seat.status === 'failed') seat.reason = state.nodes?.at(-1)?.error ?? `그래프 런 ${state.status}`;
 }
 
+const PRIOR_TEXT_LIMIT = 4_000;
+
+/** Earlier seats' outcome as plain context: the last summary and the head of a text/markdown report it wrote. */
+export function withPriorResults(inputs: Record<string, unknown> | undefined, prior: Array<{ seat: ExecSeat; state: GraphRunState }>): Record<string, unknown> {
+  const parts = prior.map(({ seat, state }) => {
+    const outputs = [...(state.nodes ?? [])].reverse().map(node => lastJsonObject(node.output)).filter((o): o is Record<string, unknown> => !!o);
+    const summary = outputs.map(o => o.summary).find((v): v is string => typeof v === 'string');
+    const report = outputs.map(o => o.report).find((v): v is string => typeof v === 'string' && /\.(md|txt)$/i.test(v));
+    let body = '';
+    if (report && existsSync(report)) { try { body = readFileSync(report, 'utf8').slice(0, PRIOR_TEXT_LIMIT); } catch { /* summary is enough */ } }
+    return [`[${seat.seat} · ${seat.title}]`, summary ?? '', body].filter(Boolean).join('\n');
+  });
+  const base = inputs ?? {};
+  const previous = typeof base.context === 'string' && base.context.trim() ? `${base.context.trim()}\n\n` : '';
+  return { ...base, context: `${previous}앞 자리 결과:\n${parts.join('\n\n')}` };
+}
+
 function aggregate(item: ExecRequest): void {
   if (item.status === 'planning' || item.seats.length === 0) return;
   if (item.seats.some(seat => seat.status === 'waiting' || seat.status === 'running')) item.status = 'running';
@@ -195,34 +212,57 @@ export class ExecRequestRunner {
     const plans = await (this.deps.plan ?? ((text: string) => planExecRequest(text, { graphs: async () => graphs })))(item.text);
     const byId = new Map(graphs.map(graph => [graph.id, graph]));
     item.seats = plans.map(plan => ({ seat: plan.seat, title: plan.title, status: plan.reason || !byId.has(plan.graphId) ? 'failed' : 'waiting', graphId: plan.graphId,
-      runId: plan.reason || !byId.has(plan.graphId) ? '' : randomUUID(), inputs: plan.inputs,
+      runId: plan.reason || !byId.has(plan.graphId) ? '' : randomUUID(), inputs: plan.inputs, ...(plan.after?.length ? { after: plan.after } : {}),
       ...(plan.reason || !byId.has(plan.graphId) ? { reason: plan.reason ?? `${plan.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` } : {}) }));
     item.status = 'running';
     debug.log('exec-requests', 'planned', { id, seats: item.seats.map(seat => ({ seat: seat.seat, graphId: seat.graphId, status: seat.status })) });
     this.store.save(item);
-    await Promise.all(item.seats.map(async (seat, index) => {
-      const graph = byId.get(seat.graphId);
-      if (!graph || seat.status === 'failed') return;
-      const starting = this.store.get(id)!;
-      starting.seats[index]!.status = 'running';
-      this.store.save(starting);
-      debug.log('exec-requests', 'started', { id, seat: seat.seat, graphId: seat.graphId, runId: seat.runId });
-      debug.log('exec-requests', 'seat-status', { id, seat: seat.seat, from: 'waiting', to: 'running' });
-      try {
-        const state = await (this.deps.run ?? runGraph)(graph.path, { input: seat.inputs, runId: seat.runId, deps: { root: this.root } });
-        const current = this.store.get(id)!;
-        syncRun(current, current.seats[index]!, state, this.root);
-        aggregate(current);
-        this.store.save(current);
-      } catch (error) {
-        const current = this.store.get(id)!;
-        current.seats[index]!.status = 'failed';
-        current.seats[index]!.reason = error instanceof Error ? error.message : String(error);
-        debug.log('exec-requests', 'seat-status', { id, seat: seat.seat, to: 'failed', reason: current.seats[index]!.reason });
-        aggregate(current);
-        this.store.save(current);
-      }
-    }));
+    // A5b — a seat that needs earlier results waits for them and starts with them in its `context`;
+    // seats with nothing to wait for still run together.
+    const states: Array<Promise<GraphRunState | null>> = [];
+    item.seats.forEach((seat, index) => {
+      states[index] = (async (): Promise<GraphRunState | null> => {
+        const graph = byId.get(seat.graphId);
+        if (!graph || seat.status === 'failed') return null;
+        let inputs = seat.inputs;
+        if (seat.after?.length) {
+          debug.log('exec-requests', 'waiting-on', { id, seat: seat.seat, after: seat.after });
+          const earlier = await Promise.all(seat.after.map(j => states[j] ?? Promise.resolve(null)));
+          const now = this.store.get(id)!;
+          const missing = seat.after.filter((j, k) => !earlier[k] || now.seats[j]?.status === 'failed');
+          if (missing.length) {
+            now.seats[index]!.status = 'failed';
+            now.seats[index]!.reason = `${seat.seat}: 앞 자리(${missing.map(j => now.seats[j]?.seat ?? j).join(', ')}) 결과가 없어 진행하지 않았습니다`;
+            debug.log('exec-requests', 'seat-status', { id, seat: seat.seat, to: 'failed', reason: 'dependency-failed' });
+            aggregate(now); this.store.save(now);
+            return null;
+          }
+          inputs = withPriorResults(seat.inputs, seat.after.map((j, k) => ({ seat: now.seats[j]!, state: earlier[k]! })));
+        }
+        const starting = this.store.get(id)!;
+        starting.seats[index]!.status = 'running';
+        this.store.save(starting);
+        debug.log('exec-requests', 'started', { id, seat: seat.seat, graphId: seat.graphId, runId: seat.runId, ...(seat.after?.length ? { after: seat.after } : {}) });
+        debug.log('exec-requests', 'seat-status', { id, seat: seat.seat, from: 'waiting', to: 'running' });
+        try {
+          const state = await (this.deps.run ?? runGraph)(graph.path, { input: inputs, runId: seat.runId, deps: { root: this.root } });
+          const current = this.store.get(id)!;
+          syncRun(current, current.seats[index]!, state, this.root);
+          aggregate(current);
+          this.store.save(current);
+          return current.seats[index]!.status === 'failed' ? null : state;
+        } catch (error) {
+          const current = this.store.get(id)!;
+          current.seats[index]!.status = 'failed';
+          current.seats[index]!.reason = error instanceof Error ? error.message : String(error);
+          debug.log('exec-requests', 'seat-status', { id, seat: seat.seat, to: 'failed', reason: current.seats[index]!.reason });
+          aggregate(current);
+          this.store.save(current);
+          return null;
+        }
+      })();
+    });
+    await Promise.all(states);
     const finished = this.store.get(id)!;
     aggregate(finished);
     this.store.save(finished);

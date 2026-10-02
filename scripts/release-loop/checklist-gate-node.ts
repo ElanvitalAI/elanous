@@ -7,14 +7,14 @@ export function runChecklistGate(context: GraphContext = readGraphContext()) {
   const data = listChecklist(version);
   const gate = checklistGate(version);
   const counts = summarizeChecklist(data);
-  const summary = `확인표 🟢${counts.green} 🟡${counts.yellow}(이동 ${gate.moved.length} · 알려진 문제 ${gate.knownIssues.length} · 막음 ${gate.blocked.length} · 판정 없음 ${gate.undecided.length}) 🔴${counts.red}${gate.red.length ? ` (${gate.red.join(', ')})` : ''}`;
+  const summary = `확인표 🟢${counts.green} 🟡${counts.yellow}(이동 ${gate.moved.length} · 알려진 문제 ${gate.knownIssues.length} · 막음 ${gate.blocked.length} · 판정 없음 ${gate.undecided.length}) 🔴${counts.red}${gate.red.length ? ` (${gate.red.join(', ')})` : ''}${gate.parity?.length ? ` · ⚠ 짝 경고 ${gate.parity.length}(${gate.parity.map((p) => p.id).join(', ')})` : ''}`;
   if (gate.ok && gate.moved.length) {
     const [major, minor, patch] = version.split('.').map(Number);
     const next = `${major}.${minor}.${patch! + 1}`;
     for (const id of gate.moved) {
       const item = data.items.find((candidate) => candidate.id === id)!;
       if (listChecklist(next).items.some((candidate) => candidate.id === id)) continue;
-      try { addItem(next, { id, title: item.title, ...(item.owner !== undefined ? { owner: item.owner } : {}) }); }
+      try { addItem(next, { id, title: item.title, ...(item.owner !== undefined ? { owner: item.owner } : {}), ...(item.kind !== undefined ? { kind: item.kind } : {}) }); }
       catch (error) {
         if (!listChecklist(next).items.some((candidate) => candidate.id === id)) throw error;
       }

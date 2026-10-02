@@ -763,6 +763,19 @@ export function defaultTelegramCommands(): TgSlashCommand[] {
       },
     },
     {
+      name: 'decisions',
+      description: '열린 결정 목록 — 카드를 다시 보내 여기서 바로 정할 수 있습니다',
+      handler: async (_args, ctx) => {
+        const { telegramDecisionService } = await import('./decisions/telegram-decision-cards.js');
+        const service = telegramDecisionService();
+        if (!service) return '결정 카드가 이 봇에 연결되어 있지 않습니다.';
+        if (!service.isOwner(String(ctx.userId))) return '결정은 소유자만 볼 수 있습니다.';
+        // A group would show every member the cards (and route memos from them) — private chat only (TC review #22660).
+        if (ctx.chatId !== ctx.userId) return '결정은 개인 대화에서만 볼 수 있습니다.';
+        return service.listOpen(String(ctx.chatId));
+      },
+    },
+    {
       name: 'work',
       description: '글을 알맞은 곳(흡수·태스크·하니스)에 넣고 결과를 여기로 답합니다 — /work [absorb|tasks|graph] <글>',
       handler: async (args, ctx) => {

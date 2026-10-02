@@ -116,3 +116,19 @@ test('journal write failure does not accept or notify', async () => {
   expect(response?.status).toBe(503);
   expect(notifications).toEqual([]);
 });
+
+test('CS1 — the receipt answers at once even when the alert channel never answers (no self-call through sendOutbound)', async () => {
+  const { opts, call } = fixture();
+  let started = 0;
+  opts.consultRequests.send = (() => { started += 1; return new Promise(() => {}); }) as never;
+  const t0 = Date.now();
+  const response = await call('/v1/consult-requests', 'POST', valid, 'same-origin');
+  expect(response?.status).toBe(202);
+  expect(Date.now() - t0).toBeLessThan(1_000);
+  await Promise.resolve();
+  expect(started).toBe(1);
+  // sendOutbound is a synchronous curl to this daemon's own /v1/outbound — inside the daemon it blocks
+  // the event loop until it times out (10-01: 25 s · unreachable · alert lost).
+  const source = readFileSync(new URL('./consult-requests.ts', import.meta.url), 'utf8');
+  expect(source).not.toMatch(/import\s*\{[^}]*\bsendOutbound\b/);
+});

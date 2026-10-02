@@ -498,6 +498,23 @@ export class DiscordBot {
     return r?.id ? { id: r.id } : null;
   }
 
+  /** DEC-TG — edit a message's text AND components (an empty list removes the buttons). */
+  async editMessageWithComponents(
+    channelId: string,
+    messageId: string,
+    text: string,
+    components: ReadonlyArray<Record<string, unknown>>,
+  ): Promise<void> {
+    const content = text.length > this.maxChars ? text.slice(0, this.maxChars - 4) + ' …' : text;
+    await this.restCall('PATCH', `/channels/${channelId}/messages/${messageId}`, { content, components });
+  }
+
+  /** DEC-TG — the DM channel id with one user (Discord returns the existing one when it already exists). */
+  async openDmChannel(userId: string): Promise<string | null> {
+    const r = await this.restCall<{ id?: string }>('POST', '/users/@me/channels', { recipient_id: userId });
+    return r?.id ?? null;
+  }
+
   // ── Gateway: connect + run forever ──────────────────────────
 
   /** Connect to the Gateway, identify, and process events until

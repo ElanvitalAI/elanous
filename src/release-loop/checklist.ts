@@ -8,6 +8,8 @@ import { CliUserError } from '../cli/cli-user-error.js';
 
 export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done';
 export type ChecklistDisposition = 'move' | 'known-issue' | 'block';
+/** `screen` = a five-surface feature cell — its evidence carries a `짝:` line (MANUAL-five-surface-parity §A). */
+export type ChecklistKind = 'screen';
 export interface ChecklistItem {
   id: string;
   title: string;
@@ -15,6 +17,7 @@ export interface ChecklistItem {
   owner?: string;
   evidence?: string;
   disposition?: ChecklistDisposition;
+  kind?: ChecklistKind;
   updatedAt: string;
   updatedBy: string;
 }
@@ -110,27 +113,29 @@ function change(data: Checklist, id: string, field: string, from: unknown, to: u
 
 function refresh(data: Checklist): void { data.released = releasedVersion(); data.dev = devVersion(); }
 
-export function addItem(v: string, input: { id: string; title: string; owner?: string }): Checklist {
+export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind }): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
+  if (input.kind !== undefined && input.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen');
   return mutate(v, (data) => {
     if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
     const by = process.env.ELANOUS_TRACK || 'cli';
     const at = new Date().toISOString();
-    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), updatedAt: at, updatedBy: by };
+    const item: ChecklistItem = { id: input.id, title: input.title, status: 'yellow', ...(input.owner !== undefined ? { owner: input.owner } : {}), ...(input.kind !== undefined ? { kind: input.kind } : {}), updatedAt: at, updatedBy: by };
     data.items.push(item);
     change(data, item.id, 'add', null, item, by, at);
     return true;
   });
 }
 
-export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition }, by: string): Checklist {
+export function setItem(v: string, id: string, patch: { status?: ChecklistStatus; evidence?: string; owner?: string; disposition?: ChecklistDisposition; kind?: ChecklistKind }, by: string): Checklist {
   return mutate(v, (data) => {
     const item = data.items.find((i) => i.id === id);
     if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
     if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
-    const fields = (['evidence', 'owner', 'status', 'disposition'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
+    if (patch.kind !== undefined && patch.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen');
+    const fields = (['evidence', 'owner', 'status', 'disposition', 'kind'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
     for (const field of fields) {
@@ -180,11 +185,29 @@ export interface ChecklistGate {
   blocked: string[];
   moved: string[];
   knownIssues: Array<{ id: string; title: string; evidence: string }>;
+  /** Screen cells whose `짝:` line is missing or has an untracked ⏳ — a warning; it never changes `ok`. */
+  parity?: Array<{ id: string; why: string }>;
+}
+
+const PARITY_LINE = /짝:\s*PWA\s*(.+?)\s*·\s*데스크톱\s*(.+?)\s*·\s*폴드\s*(.+?)\s*·\s*아이폰\s*(.+?)\s*·\s*아이패드\s*(.+?)\s*$/m;
+const PARITY_SURFACES = ['PWA', '데스크톱', '폴드', '아이폰', '아이패드'] as const;
+
+/** Why a screen cell's evidence fails the five-surface rule, or null when it passes. */
+export function parityGap(evidence: string | undefined): string | null {
+  if (!evidence || !/짝:/.test(evidence)) return '근거에 짝: 줄이 없다';
+  const match = PARITY_LINE.exec(evidence);
+  if (!match) return '짝: 줄에 다섯 열(PWA · 데스크톱 · 폴드 · 아이폰 · 아이패드)이 다 없다';
+  const untracked = PARITY_SURFACES.filter((_, i) => match[i + 1]!.includes('⏳') && !/\(칸 /.test(match[i + 1]!));
+  return untracked.length ? `⏳ 에 (칸 …) 번호가 없다: ${untracked.join(', ')}` : null;
 }
 
 export function checklistGate(v: string): ChecklistGate {
-  const result: ChecklistGate = { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] };
+  const result: ChecklistGate = { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [], parity: [] };
   for (const item of listChecklist(v).items) {
+    if (item.kind === 'screen') {
+      const why = parityGap(item.evidence);
+      if (why) result.parity!.push({ id: item.id, why });
+    }
     if (item.status === 'red') result.red.push(item.id);
     if (item.status !== 'yellow') continue;
     if (item.disposition === 'block') result.blocked.push(item.id);

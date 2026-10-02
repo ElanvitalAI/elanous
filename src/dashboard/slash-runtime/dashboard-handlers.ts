@@ -1370,8 +1370,8 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     ctx.attachmentRowMap.clear();
     ctx.clearLogSearch();
     ctx.clearLogFilter();
-    ctx.pushDebugLine(ctx.muted('Status cleared'));
-    ctx.chatLines.push(ctx.muted('Status cleared'));
+    ctx.pushDebugLine(ctx.muted('Chat log cleared'));
+    ctx.chatLines.push(ctx.muted('Chat log cleared'));
     ctx.setChatScrollOffset(-1);
   });
 

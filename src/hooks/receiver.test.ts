@@ -74,7 +74,7 @@ test('validated event is 200 with Primary unavailable, deduped, and retried thro
     await waitFor(() => calls === 3 && server.queue.count() === 0);
     expect(success).toBe(1);
     expect(server.queue.lastDelivered()).toBe(new Date(now).toISOString());
-    expect(await (await fetch(new URL('/hooks/health', server.url))).json()).toEqual({ ok: true, queued: 0 });
+    expect(await (await fetch(new URL('/hooks/health', server.url))).json()).toEqual({ ok: true, queued: 0, reportsQueued: 0 });
     const wrong = await fetch(new URL('/hooks/linear', server.url), { method: 'POST', headers: { 'Linear-Signature': '0'.repeat(64) }, body: raw });
     expect(wrong.status).toBe(401);
     const old = JSON.stringify({ type: 'Issue', action: 'create', webhookTimestamp: now - 600_000, data: { id: 'issue-2', title: 'Old task' } });

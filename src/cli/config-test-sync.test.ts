@@ -364,4 +364,23 @@ describe('config promote — 테스트→운영 필드 단위 전파 (ISO-4)', (
     expect(isPromotable('voice.tts.voiceId')).toBe(true);
     expect(isPromotable('logs.retention.maxAgeDays')).toBe(true);
   });
+
+});
+
+describe('POL1 — policy file reaches the test universe', () => {
+  it('copies policy/llm.yaml, folder included, with 0600', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pol1-sync-'));
+    const src = join(dir, 'prod');
+    const testDir = join(dir, 'test');
+    try {
+      mkdirSync(join(src, 'policy'), { recursive: true });
+      writeFileSync(join(src, 'config.json'), JSON.stringify({ llm: { codexQuotaPolicy: 'credits' }, telegram: { enabled: false } }));
+      writeFileSync(join(src, 'policy', 'llm.yaml'), 'credits:\n  codex: use\n');
+      mkdirSync(testDir, { recursive: true });
+      const r = syncTestConfig(testDir, src);
+      expect(r.copied).toContain('policy/llm.yaml');
+      expect(readFileSync(join(testDir, 'policy', 'llm.yaml'), 'utf-8')).toBe('credits:\n  codex: use\n');
+      expect(lstatSync(join(testDir, 'policy', 'llm.yaml')).mode & 0o777).toBe(0o600);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 });

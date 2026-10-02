@@ -23,7 +23,7 @@ import { effectiveInstanceRoot, releaseLedgerRoot } from '../instance/resolve.js
 import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { userConfigPath } from '../user-config.js';
-import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition } from '../release-loop/checklist.js';
+import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
@@ -505,20 +505,21 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     const { version, codenames, json } = context(cmd);
     await checklistOutput(version, codenames, 'status', json);
   });
-  withContext(checklist.command('add <id> <title>').description('칸 추가')).option('--owner <owner>', '담당').action((id: string, title: string, opts: { owner?: string }, cmd: Command) => {
+  withContext(checklist.command('add <id> <title>').description('칸 추가')).option('--owner <owner>', '담당').option('--kind <kind>', 'screen = 다섯 화면 짝 칸')
+    .action((id: string, title: string, opts: { owner?: string; kind?: string }, cmd: Command) => {
     const { version, json } = context(cmd);
-    const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}) });
+    const data = addItem(version, { id, title, ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}) });
     if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 추가`);
   });
   withContext(checklist.command('set <id>').description('칸 상태·근거·담당·처분 갱신'))
     .option('--status <status>', 'green|yellow|red|done').option('--evidence <evidence>', '근거').option('--owner <owner>', '담당')
-    .option('--disposition <disposition>', 'move|known-issue|block')
-    .action((id: string, opts: { status?: string; evidence?: string; owner?: string; disposition?: string }, cmd: Command) => {
+    .option('--disposition <disposition>', 'move|known-issue|block').option('--kind <kind>', 'screen = 다섯 화면 짝 칸')
+    .action((id: string, opts: { status?: string; evidence?: string; owner?: string; disposition?: string; kind?: string }, cmd: Command) => {
       const { version, json } = context(cmd);
       if (opts.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(opts.status)) throw new Error(`잘못된 상태: ${opts.status}`);
       if (opts.disposition !== undefined && !['move', 'known-issue', 'block'].includes(opts.disposition)) throw new Error(`잘못된 처분: ${opts.disposition}`);
-      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined) throw new Error('갱신할 칸을 지정하라');
-      const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}) }, process.env.ELANOUS_TRACK || 'cli');
+      if (opts.status === undefined && opts.evidence === undefined && opts.owner === undefined && opts.disposition === undefined && opts.kind === undefined) throw new Error('갱신할 칸을 지정하라');
+      const data = setItem(version, id, { ...(opts.status !== undefined ? { status: opts.status as ChecklistStatus } : {}), ...(opts.evidence !== undefined ? { evidence: opts.evidence } : {}), ...(opts.owner !== undefined ? { owner: opts.owner } : {}), ...(opts.disposition !== undefined ? { disposition: opts.disposition as ChecklistDisposition } : {}), ...(opts.kind !== undefined ? { kind: opts.kind as ChecklistKind } : {}) }, process.env.ELANOUS_TRACK || 'cli');
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} 갱신`);
     });
   withContext(checklist.command('rm <id>').description('칸 삭제')).action((id: string, _opts: unknown, cmd: Command) => {

@@ -652,12 +652,12 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
       ctx.chatLines.push('a', 'b', 'c');
       const r = await reg.dispatch(name, [], ctx);
       expect(r.kind).toBe('continue');
-      expect(ctx.chatLines).toEqual(['[muted]Status cleared']);
+      expect(ctx.chatLines).toEqual(['[muted]Chat log cleared']);
       expect(state.attachmentClears).toBe(1);
       expect(state.searchClears).toBe(1);
       expect(state.filterClears).toBe(1);
       expect(state.scrollOffset).toBe(-1);
-      expect(state.debugLines).toEqual(['[muted]Status cleared']);
+      expect(state.debugLines).toEqual(['[muted]Chat log cleared']);
     }
   });
 

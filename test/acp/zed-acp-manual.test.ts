@@ -32,6 +32,7 @@ test('manual names every accepted transport and keeps registry listing separate'
   expect(manual).toContain('command -v elanous');
   expect(manual).toContain("Zed's agent panel");
   expect(manual).toContain('0.2.10 E10');
-  expect(manual).toContain('authMethods: []');
+  expect(manual).toContain('`elanous-login`');
+  expect(manual).toContain('--acp-server --login');
   expect(index).toContain('manual/MANUAL-zed-acp.md');
 });

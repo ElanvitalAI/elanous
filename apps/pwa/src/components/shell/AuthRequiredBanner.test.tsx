@@ -67,7 +67,7 @@ test('mounted banner appears only after 401, links to settings and stays dismiss
   await act(async () => { reportAuthRequired('/v1/health'); });
   const banner = host.querySelector('[role="alert"]');
   expect(banner?.textContent).toContain('이 기기는 아직 데몬에 연결되지 않았습니다(인증 필요).');
-  expect(banner?.textContent).toContain('붙여넣으세요');
+  expect(banner?.textContent).toContain('붙여 넣으세요');
   expect(banner?.querySelector('a')?.getAttribute('href')).toBe('/settings');
 
   await act(async () => { (banner?.querySelector('button') as HTMLElement).click(); });
@@ -84,14 +84,15 @@ test('mounted banner appears only after 401, links to settings and stays dismiss
 test('a 401 before mounting shows the one-time notice', async () => {
   reportAuthRequired('/v1/health');
   await mount();
-  expect(host.querySelector('[role="alert"]')?.textContent).toContain('붙여넣으세요');
+  expect(host.querySelector('[role="alert"]')?.textContent).toContain('붙여 넣으세요');
 });
 
 test('banner names settings labels that exist on the settings page', async () => {
   const { readFileSync } = await import('node:fs');
   const read = (name: string) => readFileSync(new URL(`../settings/${name}`, import.meta.url), 'utf8');
   const banner = readFileSync(new URL('./AuthRequiredBanner.tsx', import.meta.url), 'utf8');
-  for (const label of ['Connect token (other devices)', 'Bearer token']) expect(banner).toContain(label);
-  expect(read('ConnectTokenCard.tsx')).toContain('Connect token (other devices)');
-  expect(read('SettingsPanel.tsx')).toContain('Bearer token');
+  for (const label of ['연결 토큰 만들기', '연결 토큰 칸']) expect(banner).toContain(label);
+  expect(read('ConnectTokenCard.tsx')).toContain('연결 토큰 만들기 (다른 기기용)');
+  expect(read('SettingsPanel.tsx')).toContain('>연결 토큰<');
+  expect(read('SettingsPanel.tsx')).toContain('>데몬 연결<');
 });

@@ -31,6 +31,7 @@ import { cn } from '@/lib/utils';
 // 에서 null 반환 → 안전한 graceful no-op.
 import { TopBarWorkspaceStrip } from './TopBarWorkspaceStrip';
 import { TopBarActivityIndicator } from './TopBarActivityIndicator';
+import { ShareCaptureButton } from './ShareCaptureButton';
 import type { ShellActivitySnapshot } from './activity-snapshot';
 
 const WAKE_LOCK_KEY = 'elanous.pwa.wakeLockOn';
@@ -115,6 +116,8 @@ export function TopBar({ onToggleSidebar, sidebarOpen, activity }: Props) {
       {activity && <TopBarActivityIndicator snapshot={activity} />}
 
       <div className="ml-auto flex items-center gap-1">
+        {/* 📷 SC1 공유용 캡처(beta) — 가린 화면을 데몬에 저장 */}
+        <ShareCaptureButton />
         {/* 🎙 voice — icon-only link to root voice page (essential) */}
         <Link
           href="/"

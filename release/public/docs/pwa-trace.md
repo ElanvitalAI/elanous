@@ -1,5 +1,7 @@
 # Trace — follow one run down to the log line
 
+> **Experimental.** This screen is hidden by default. Set the screen role to **Contributor** in Setup (`/setup` → screen role) to show it. It works, but its layout and behaviour may still change.
+
 **Live** is the stage: everything that is happening, at a glance. **Trace** is the workbench next to it. You start from every run on every machine, narrow the view step by step, and end at a single decision and the exact log line behind it — with a command you can paste into a terminal to find that line again.
 
 Trace reads the same data as Live (the log and the harness run records), so it never shows anything elanous did not record. It refreshes every 5 seconds.

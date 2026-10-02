@@ -57,7 +57,7 @@ export function ConnectTokenCard() {
       data-testid="connect-token-card"
       className="space-y-2"
     >
-      <h2 className="text-sm font-medium">Connect token (other devices)</h2>
+      <h2 className="text-sm font-medium">연결 토큰 만들기 (다른 기기용)</h2>
       <div className="rounded-md border border-border bg-card p-3 text-xs space-y-2">
         <p className="text-muted-foreground">
           다른 머신에서 <code className="rounded bg-muted px-1">elanous nexus connect &lt;host&gt;</code> 시

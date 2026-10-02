@@ -21,6 +21,8 @@ export interface ExecPlanItem {
   graphId: string;
   inputs: Record<string, unknown>;
   reason?: string;
+  /** A5b — indexes of earlier items whose results this item needs (it starts after they finish). */
+  after?: number[];
 }
 
 /** 설치된 플러그인의 실행 그래프 — `<state>/plugins/<market>/<name>/<version>/graphs/{recipes.yaml, <id>.yaml}`
@@ -107,7 +109,7 @@ export function seatTitles(path = fileURLToPath(new URL('../../scripts/coord-tra
 }
 
 export async function judgeExecPlan(text: string, graphs: readonly InstalledGraph[], seats: readonly string[]): Promise<unknown> {
-  const prompt = `COO 역할. 요청을 실행 가능한 자리별 그래프로 나눠 맡겨라. JSON 배열만 출력: [{"seat":"자리","title":"할 일","graphId":"설치된 그래프 ID 또는 빈 문자열","inputs":{}}]. 자리 이름은 주어진 목록에서만, 그래프 ID는 설치된 목록에서만 고른다. 맞는 그래프가 없으면 graphId=""로 표시한다. 그래프에 inputKeys 가 있으면 inputs 를 그 키로만 채우되 한 줄에서 알 수 있는 값만 넣는다(모르는 값은 넣지 않는다). 그 그래프가 꼭 받아야 할 값(예: 브랜드 이름 · 사진 파일)을 한 줄에서 얻을 수 없으면 graphId=""로 두고 title 끝에 « — <무엇> 필요»를 적는다. 없는 그래프나 산출을 지어내지 마라. 바깥 게시·발행·광고·결제는 승인 노드를 거치기 전 실행하면 안 된다.\n자리: ${JSON.stringify(seats)}\n실행 가능한 그래프: ${JSON.stringify(graphs.map(({ id, title, description, inputKeys }) => ({ id, title, description, ...(inputKeys ? { inputKeys } : {}) })))}\n한 줄: ${JSON.stringify(text)}`;
+  const prompt = `COO 역할. 요청을 실행 가능한 자리별 그래프로 나눠 맡겨라. JSON 배열만 출력: [{"seat":"자리","title":"할 일","graphId":"설치된 그래프 ID 또는 빈 문자열","inputs":{},"after":[]}]. 앞 항목의 결과가 있어야 할 수 있는 일(예: 점검·조사 «결과로» 쓰는 한 장 · 보고)은 after 에 그 앞 항목 번호(0부터)를 적는다 — 그 항목은 앞 항목이 끝난 뒤 그 결과를 받아 시작한다. 서로 기다릴 필요가 없으면 after 는 빈 배열. 자리 이름은 주어진 목록에서만, 그래프 ID는 설치된 목록에서만 고른다. 맞는 그래프가 없으면 graphId=""로 표시한다. 그래프에 inputKeys 가 있으면 inputs 를 그 키로만 채우되 한 줄에서 알 수 있는 값만 넣는다(모르는 값은 넣지 않는다). 그 그래프가 꼭 받아야 할 값(예: 브랜드 이름 · 사진 파일)을 한 줄에서 얻을 수 없으면 graphId=""로 두고 title 끝에 « — <무엇> 필요»를 적는다. 없는 그래프나 산출을 지어내지 마라. 바깥 게시·발행·광고·결제는 승인 노드를 거치기 전 실행하면 안 된다.\n자리: ${JSON.stringify(seats)}\n실행 가능한 그래프: ${JSON.stringify(graphs.map(({ id, title, description, inputKeys }) => ({ id, title, description, ...(inputKeys ? { inputKeys } : {}) })))}\n한 줄: ${JSON.stringify(text)}`;
   const { streamLLM } = await import('../llm.js');
   const { tierModel } = await import('../llm/model-defaults.js');
   const raw = await streamLLM([{ role: 'user', content: prompt }], () => {}, { model: tierModel('best') });
@@ -124,16 +126,20 @@ export async function planExecRequest(text: string, deps: {
   const raw = await (deps.judge ?? judgeExecPlan)(text, graphs, seats);
   if (!Array.isArray(raw) || raw.length === 0) throw new Error('COO 계획이 비었거나 배열이 아닙니다');
   const known = new Map(graphs.map(graph => [graph.id, graph]));
-  return raw.map((item: unknown) => {
+  return raw.map((item: unknown, index: number) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('COO 계획 항목 형식 오류');
     const row = item as Record<string, unknown>;
     if (typeof row.seat !== 'string' || !seats.includes(row.seat) || typeof row.title !== 'string' || !row.title.trim()
       || typeof row.graphId !== 'string' || !row.inputs || typeof row.inputs !== 'object' || Array.isArray(row.inputs)) {
       throw new Error('COO 계획 항목 형식 오류');
     }
+    const after = Array.isArray(row.after)
+      ? [...new Set(row.after.filter((n): n is number => Number.isInteger(n) && (n as number) >= 0 && (n as number) < index))]
+      : [];
     return {
       seat: row.seat, title: row.title.trim(), graphId: row.graphId,
       inputs: row.inputs as Record<string, unknown>,
+      ...(after.length ? { after } : {}),
       ...(!known.has(row.graphId) ? { reason: `${row.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` } : {}),
     };
   });

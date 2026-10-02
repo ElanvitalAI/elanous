@@ -9,6 +9,12 @@ function date(raw?: string): string | undefined {
   if (!Number.isFinite(parsed.getTime())) throw new Error(`invalid since: ${raw}`);
   return parsed.toISOString();
 }
+/** `+6h` → now + 6 hours; otherwise a UTC ISO timestamp (validated by the ledger). */
+function dueAt(raw: string): string {
+  const hours = /^\+(\d+(?:\.\d+)?)h$/.exec(raw.trim());
+  if (hours) return new Date(Date.now() + Number(hours[1]) * 3600000).toISOString();
+  return raw.trim();
+}
 const kst = (at: string) => new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Seoul', dateStyle: 'short', timeStyle: 'medium' }).format(new Date(at)) + ' KST';
 const version = (e: DecisionEntry['version']) => e ? `released=${e.released ?? '-'} · dev=${e.dev ?? '-'}${e.codename ? ` «${e.codename}»` : ''}` : '판 미상';
 function agent(o?: string): string {
@@ -30,6 +36,7 @@ export function formatDecisionDetail(e: DecisionEntry): string {
     '선택지 | 결과', ...(e.options.length ? e.options.map(o => `${o.key}: ${o.label} | ${o.consequence}`) : ['원문에 선택지 없음 · 확인 필요']),
     'skipped' in e.recommendation ? `권고 생략: ${e.recommendation.reason}` : `권고: ${e.recommendation.option} — ${e.recommendation.why}`,
     `올림: ${e.raisedAt ? kst(e.raisedAt) : '시각 미상'} · ${e.raisedBy.agent} · ${version(e.version)}`,
+    ...(e.dueAt ? [`기한: ${kst(e.dueAt)}`] : []),
     ...(e.importedAt ? [`가져옴: ${kst(e.importedAt)}`] : []),
     ...(e.status === 'decided' ? [`결정: ${e.decidedAt ? kst(e.decidedAt) : '시각 미상'} · ${e.decidedBy?.kind === 'auto' ? `AUTO ${e.decidedBy.agent} (${e.decidedBy.delegation})` : e.decidedBy?.kind === 'human' ? 'human' : '주체 미상'} · ${e.choice ?? '선택 키 미상'} · ${e.versionAtDecision ? version(e.versionAtDecision) : '결정 당시 판 미상'}`,
       ...(e.note ? [`메모: ${e.note}`] : [])] : []),
@@ -48,14 +55,17 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])
     .option('--recommend <key>').option('--why <text>').option('--skip-recommend <reason>')
     .option('--track <track>').option('--agent <agent>').option('--session <id>')
-    .option('--ref <url>', '참조 (반복)', repeat, [] as string[]).option('--json')
-    .action((o: { title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; track?: DecisionTrack; agent?: string; session?: string; ref: string[]; json?: boolean }) => fail(() => {
+    .option('--ref <url>', '참조 (반복)', repeat, [] as string[])
+    .option('--due <when>', '기한 — UTC ISO(2026-10-04T09:00:00Z) 또는 +Nh(지금부터 N시간) · 기한 2시간 전 텔레그램·디스코드로 다시 알린다')
+    .option('--json')
+    .action((o: { due?: string; title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; track?: DecisionTrack; agent?: string; session?: string; ref: string[]; json?: boolean }) => fail(() => {
       if (o.skipRecommend !== undefined && (o.recommend !== undefined || o.why !== undefined)) throw new Error('choose recommendation or skip, not both');
       if (o.skipRecommend === undefined && (!o.recommend || !o.why)) throw new Error('--recommend and --why required, or --skip-recommend <reason>');
       const options: DecisionOption[] = o.option.map(parseOption);
       const entry = new DecisionLedger(config).raise({ title: o.title, category: o.category, scqa: { s: o.s, c: o.c, ...(o.q ? { q: o.q } : {}), ...(o.a ? { a: o.a } : {}) }, options,
         recommendation: o.skipRecommend !== undefined ? { skipped: true, reason: o.skipRecommend } : { option: o.recommend!, why: o.why! },
-        raisedBy: { agent: agent(o.agent), ...(o.track ? { track: o.track } : {}), ...(o.session ? { session: o.session } : {}) }, ...(o.ref.length ? { refs: o.ref } : {}) });
+        raisedBy: { agent: agent(o.agent), ...(o.track ? { track: o.track } : {}), ...(o.session ? { session: o.session } : {}) }, ...(o.ref.length ? { refs: o.ref } : {}),
+        ...(o.due ? { dueAt: dueAt(o.due) } : {}) });
       emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
     }));
   root.command('list').description('결정 목록 (기본 열린 것)')

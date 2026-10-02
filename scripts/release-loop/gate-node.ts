@@ -10,7 +10,7 @@ import { getElanousConfigDirOverride } from '../../src/elanous-config-dir.js';
 import { diffFailures, junitFailures, parseFailures } from './gate-diff';
 import { loadEnvKnownFailures, splitKnownEnv } from './env-known-failures';
 import { baselineFromCutLogs } from './baseline-from-logs';
-import { planShards, readFileDurations } from './shard-plan';
+import { planShards, readFileDurations, readFileMemory } from './shard-plan';
 import { deriveCdpTestPatterns } from '../test-deterministic';
 import { emitNodeResult, readGraphContext } from './node-verdict.js';
 import { runPodCommand, type RunPodCommandOptions, type PodCommandResult } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
@@ -112,10 +112,18 @@ const summaryCount = (output: string, label: string) => Number(lastMatch(output,
 /** bun reads a bare positional as a substring filter (`test` matches every *.test.ts); `./` makes it a path. */
 const asPath = (path: string) => path.startsWith('./') || path.startsWith('/') ? path : `./${path}`;
 export const POD_ISOLATION_MEMORY_LIMIT = '32Gi';
+/** GT1b — a file whose measured peak is at least this runs alone at the isolation limit from the start: one such file
+ *  sank a whole 203-file root shard at 16Gi (0.2.6 shard 12 · `unwired-exports` 9.9 GB) and cost two halving rounds. */
+export const POD_HEAVY_FILE_MB = 4096;
+/** Per-file peak memory, read from the cut tree (absent → no heavy files; the halving path still catches OOM). */
+export const POD_MEMORY_SOURCE = 'docs/measurements/td1-whole-gate-mechanical-2026-10-01.tsv';
 /** Integration tests that the Pod sweep does not run — each is judged by a real run elsewhere at the cut.
  *  0.2.7 run 5 (10-01): `scripts/install.test.ts` (real `bun pm pack` → `bun add` installs, 301 s alone on node-b)
  *  sat in a shard of its own past the 1200 s deadline with no output and stopped the whole gate. Judged on the
  *  mbp at the cut instead (TD1 moves it to the integration line). Keep this list short and explained. */
+/** GT1 — files per retry chunk when a root shard fails (0.2.7: bundles of 54+ files OOMed at 16Gi, smaller passed). */
+export const POD_SHARD_FILE_CAP = 27;
+
 export const POD_SWEEP_INTEGRATION_ONLY: readonly string[] = ['scripts/install.test.ts'];
 const tail40 = (output: string) => output.trimEnd().split(/\r?\n/).slice(-40).join('\n');
 const lastStartedTestFile = (output: string, paths: string[]): string | undefined => {
@@ -208,7 +216,14 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     if (integrationOnly.length) debug.log('release-loop.gate', 'pod-sweep-integration-only', { files: integrationOnly });
     if (!assignable.length) throw new Error('sweep incomplete: no tests ran');
     const durations = pod.durationSource ? readFileDurations(pod.durationSource) : new Map<string, number>();
-    const shards = planShards(assignable, durations, shardCount);
+    const memory = readFileMemory(join(tree, POD_MEMORY_SOURCE));
+    const heavy = new Set(assignable.filter((file) => (memory.get(file) ?? 0) >= POD_HEAVY_FILE_MB));
+    const light = assignable.filter((file) => !heavy.has(file));
+    const shards = [
+      ...(light.length ? planShards(light, durations, shardCount) : []),
+      ...[...heavy].map((file) => ({ files: [file], plannedSeconds: durations.get(file) ?? 0 })),
+    ];
+    if (heavy.size) debug.log('release-loop.gate', 'pod-heavy-alone', { files: [...heavy], thresholdMb: POD_HEAVY_FILE_MB, memoryLimit: POD_ISOLATION_MEMORY_LIMIT });
     const known = assignable.filter((file) => durations.has(file)).length;
     debug.log('release-loop.gate', 'pod-shard-plan', {
       shards: shards.length, known, unknown: assignable.length - known,
@@ -259,7 +274,7 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           pool: pod.pool, poolScheduler, clone: true, source: { kind: 'commit', sha: commit }, deadlineSeconds,
           ...(bunCache ? { bunCache } : {}),
           // 실패 뒤 다시 도는 파일 하나짜리 Job 은 메모리 한도를 올린다 — 16Gi 에선 무거운 한 파일이 혼자서도 OOM 이었다(09-30 `unwired-exports`).
-          ...(paths.length === 1 && depth >= 1 ? { memoryLimit: POD_ISOLATION_MEMORY_LIMIT } : {}),
+          ...(paths.length === 1 && (depth >= 1 || heavy.has(paths[0]!)) ? { memoryLimit: POD_ISOLATION_MEMORY_LIMIT } : {}),
           name: `gate-${randomUUID()}`,
           command: ['bash', '-lc', `mkdir -p "$HOME/outbox"; ${cachePrefix}(cd .. && cd repo && bun install && (cd apps/pwa && bun install) && ${args}) 2>&1 | tee "$HOME/outbox/shard.log"; echo \${PIPESTATUS[0]} > "$HOME/outbox/shard.rc"`],
         });
@@ -350,6 +365,15 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
           ...(lastFile ? { lastFile } : {}),
           ...(reason === 'unattributed' ? { summaryFailures: fails, namedFailures, ...(unattributedDetail ? { detail: unattributedDetail } : {}) } : {}),
         }] };
+        // GT1 — a big shard that failed at the root goes straight to cap-sized chunks instead of halving twice: memory
+        // piles up when one bun process runs many files (0.2.7: only bundles of 54+ OOMed), and each halving round costs
+        // a Pod start, an install and a rerun. A failing chunk then isolates its files (depth 2), as before.
+        if (depth === 0 && paths.length > POD_SHARD_FILE_CAP) {
+          const chunks = Array.from({ length: Math.ceil(paths.length / POD_SHARD_FILE_CAP) }, (_, i) => paths.slice(i * POD_SHARD_FILE_CAP, (i + 1) * POD_SHARD_FILE_CAP));
+          debug.log('release-loop.gate', 'pod-shard-cap-split', { shard, files: paths.length, chunks: chunks.length, cap: POD_SHARD_FILE_CAP, reason });
+          const children = await Promise.all(chunks.map((chunk, i) => runShard(chunk, shard, 2, `${branch}-c${i}`)));
+          return { runs: children.flatMap((child) => child.runs), stalled: children.flatMap((child) => child.stalled) };
+        }
         debug.log('release-loop.gate', 'pod-shard-split', { shard, depth, files: paths, reason });
         const middle = Math.ceil(paths.length / 2);
         const children = await Promise.all([

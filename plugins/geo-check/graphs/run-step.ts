@@ -158,18 +158,42 @@ async function run(step: string): Promise<void> {
     if (!table.length) throw new Error('missing score table');
     const gaps = table.filter(cell => cell.error || !cell.mention || cell.citation === false).map(cell => ({ question: cell.question, engine: cell.engine, error: cell.error ?? null, mention: cell.mention, citation: cell.citation }));
     if (!gaps.length) { output({ suggestions: [] }); return; }
-    try {
-      const raw = parseArray(reply(await invoke(['ask', '--json', `Using ONLY this score table, return a JSON array of 3 to 5 improvement suggestions. Each must have "suggestion" (FAQ question, FAQPage/Organization structured data, comparison document, etc.) and "evidence" containing a question and engine from the missing cells. Evidence cells: ${JSON.stringify(gaps)}. Score table: ${JSON.stringify(table)}`])));
-      if (!Array.isArray(raw) || raw.length < 3 || raw.length > 5) throw new Error('invalid suggestion count');
-      const suggestions = raw.map(item => {
+    // A5c — the model often rewords a question or the engine name; one such item used to fail the whole step,
+    // so the same input passed and failed by turns. Evidence is now picked by id, matched leniently, and a wrong
+    // item is dropped (not fatal). Only «no valid suggestion at all» retries once, with a stricter prompt.
+    const cells = gaps.map((cell, id) => ({ id, ...cell }));
+    const norm = (value: unknown) => text(value).toLowerCase().replace(/["'“”‘’`]/g, '').replace(/\s+/g, ' ').trim();
+    const pick = (evidence: unknown) => {
+      if (typeof evidence === 'number') return cells[evidence];
+      const ev = object(evidence);
+      if (typeof ev.id === 'number' && cells[ev.id]) return cells[ev.id];
+      const q = norm(ev.question), e = norm(ev.engine);
+      const exact = cells.find(cell => norm(cell.question) === q && (!e || norm(cell.engine) === e));
+      if (exact) return exact;
+      const byQuestion = cells.filter(cell => q && (norm(cell.question).includes(q) || q.includes(norm(cell.question))));
+      return byQuestion.length === 1 ? byQuestion[0] : undefined;
+    };
+    const ask = async (strict: boolean) => parseArray(reply(await invoke(['ask', '--json', `Using ONLY this score table, return a JSON array of 3 to 5 improvement suggestions. Each item: {"suggestion": "<FAQ question, FAQPage/Organization structured data, comparison document, etc.>", "evidence": <id of one cell below>}.${strict ? ' The evidence MUST be one of the listed ids as a number. Return only the JSON array.' : ''} Evidence cells (pick by id): ${JSON.stringify(cells)}. Score table: ${JSON.stringify(table)}`])));
+    const collect = (raw: unknown) => {
+      if (!Array.isArray(raw)) return [];
+      const seen = new Set<string>();
+      return raw.slice(0, 5).flatMap(item => {
         const candidate = object(item);
-        const evidence = object(candidate.evidence);
-        const match = gaps.find(cell => cell.question === evidence.question && cell.engine === evidence.engine);
-        if (!text(candidate.suggestion) || !match) throw new Error('suggestion missing valid score evidence');
-        return { suggestion: text(candidate.suggestion), evidence: { question: match.question, engine: match.engine } };
+        const match = pick(candidate.evidence);
+        const suggestion = text(candidate.suggestion);
+        if (!suggestion || !match || seen.has(suggestion)) return [];
+        seen.add(suggestion);
+        return [{ suggestion, evidence: { question: match.question, engine: match.engine } }];
       });
-      output({ suggestions }, 1);
-    } catch (e) { output({ outcome: 'fail', suggestions: [], error: errorLine(e) }, 1, 1); }
+    };
+    let calls = 0;
+    try {
+      calls++;
+      let suggestions = collect(await ask(false));
+      if (!suggestions.length) { calls++; suggestions = collect(await ask(true)); }
+      if (!suggestions.length) throw new Error('suggestion missing valid score evidence');
+      output({ suggestions }, calls);
+    } catch (e) { output({ outcome: 'fail', suggestions: [], error: errorLine(e) }, calls || 1, 1); }
   } else if (step === 'report') {
     const table = rows(object(outputs.score).table);
     const answers = rows(object(outputs.answers).answers);

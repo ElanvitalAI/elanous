@@ -12,7 +12,7 @@ export function AuthRequiredBanner() {
   if (!visible) return null;
   return (
     <div role="alert" data-testid="auth-required-banner" className="flex items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-foreground">
-      <span>이 기기는 아직 데몬에 연결되지 않았습니다(인증 필요). 연결된 기기의 설정 › Connect token (other devices) 에서 토큰을 만들어, 이 기기의 설정 › Daemon › Bearer token 에 붙여넣으세요.</span>
+      <span>이 기기는 아직 데몬에 연결되지 않았습니다(인증 필요). 연결된 기기의 설정 › 연결 토큰 만들기 에서 토큰을 만들어, 이 기기의 설정 › 데몬 연결 › 연결 토큰 칸에 붙여 넣으세요.</span>
       <Link href="/settings" className="shrink-0 font-semibold underline underline-offset-2">/settings</Link>
       <button type="button" aria-label="연결 안내 닫기" onClick={() => { dismissAuthRequired(); setVisible(false); }} className="shrink-0 rounded px-2 py-1 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">닫기</button>
     </div>

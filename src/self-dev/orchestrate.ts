@@ -987,6 +987,23 @@ async function deleteLabelledJobs(runId: string, selectedTargets: readonly { con
   return counts.reduce((sum, count) => sum + count, 0);
 }
 
+/** `self-dev-runs/<runId>/pid.json` — what `harness stop <runId>` reads (start time guards PID reuse).
+ *  HS1: written as soon as the run ID exists, not only when the jobs start — pod planning and image sync can
+ *  take minutes before that, and a stop in that window found «no process» (10-01 · three runs). */
+export function writeRunPidRecord(runId: string, runsDir: string = selfDevRunsDir()): string {
+  const pidPath = join(runsDir, runId, 'pid.json');
+  mkdirSync(join(runsDir, runId), { recursive: true });
+  const temporary = `${pidPath}.${process.pid}.${randomUUID()}.tmp`;
+  const fd = openSync(temporary, 'wx', 0o600);
+  try {
+    try {
+      writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() - Math.floor(process.uptime() * 1000), argv0: process.argv0 }));
+    } finally { closeSync(fd); }
+    renameSync(temporary, pidPath);
+  } catch (error) { unlinkSync(temporary); throw error; }
+  return pidPath;
+}
+
 /**
  * Run N self-dev jobs in parallel under the TOX dispatcher and resolve
  * once every job reaches a terminal status.
@@ -1419,17 +1436,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     signals.on('SIGTERM', onTerm);
     signals.on('SIGINT', onInt);
     try {
-      if (pidPath) {
-        mkdirSync(join(opts.runsDir ?? selfDevRunsDir(), runId!), { recursive: true });
-        const temporary = `${pidPath}.${process.pid}.${randomUUID()}.tmp`;
-        const fd = openSync(temporary, 'wx', 0o600);
-        try {
-          try {
-            writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() - Math.floor(process.uptime() * 1000), argv0: process.argv0 }));
-          } finally { closeSync(fd); }
-          renameSync(temporary, pidPath);
-        } catch (error) { unlinkSync(temporary); throw error; }
-      }
+      if (pidPath) writeRunPidRecord(runId!, opts.runsDir ?? selfDevRunsDir());
     } catch (error) { cleanup(); reject(error); return; }
 
     // Current full result set: resumed-done goals + each running task's

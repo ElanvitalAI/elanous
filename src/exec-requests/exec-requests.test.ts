@@ -474,3 +474,58 @@ test('plugin input keys come from the examples sample and reach the COO prompt c
   expect(plan[0]!.inputs).toEqual({ brand: 'Elanous' });
   rmSync(root, { recursive: true, force: true });
 });
+
+test('A5b — a seat with «after» waits for the earlier seat and starts with its result in context; a failed earlier seat stops it', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'exec-after-'))); roots.push(root);
+  const store = new ExecRequestStore(root);
+  const graphs: InstalledGraph[] = [{ id: 'geo', title: 'GEO', description: 'check', path: '/g/geo.yaml' }, { id: 'doc', title: 'Doc', description: 'draft', path: '/g/doc.yaml' }];
+  const report = join(root, 'geo-report.md');
+  writeFileSync(report, '# GEO check\n브릴스: 1/4 answers mention the brand.');
+  const events: string[] = [];
+  const inputsSeen: Record<string, unknown>[] = [];
+  let geoOk = true;
+  const run = async (path: string, opts: { input?: unknown; runId?: string }) => {
+    const graphId = path.includes('geo') ? 'geo' : 'doc';
+    events.push(`start:${graphId}`);
+    inputsSeen.push((opts.input ?? {}) as Record<string, unknown>);
+    await new Promise((resolve) => setTimeout(resolve, graphId === 'geo' ? 40 : 1));
+    events.push(`end:${graphId}`);
+    const ok = graphId === 'doc' || geoOk;
+    return { graphId, runId: opts.runId!, status: ok ? 'done' : 'failed', path: [], executed: 1, dryRun: false, statePath: join(root, `${graphId}.json`),
+      nodes: [{ nodeId: 'last', ok, exit: ok ? 0 : 1, executed: true, output: JSON.stringify(graphId === 'geo' ? { summary: '브릴스는 4개 중 1개 답에만 나옴', report } : { summary: '한 장 완료' }) }] } as GraphRunState;
+  };
+  const plan = async () => [
+    { seat: 'CTO', title: 'GEO 점검', graphId: 'geo', inputs: {} },
+    { seat: 'CMO', title: '임원 한 장', graphId: 'doc', inputs: { topic: '상장 홍보', context: '행사 직후' }, after: [0] },
+  ];
+  const runner = new ExecRequestRunner({ store, root, graphs: async () => graphs, plan, run: run as never });
+  const first = runner.submit('점검하고 그 결과로 임원 한 장');
+  for (let i = 0; i < 100 && store.get(first.id)?.status !== 'done'; i++) await new Promise((r) => setTimeout(r, 10));
+  expect(events).toEqual(['start:geo', 'end:geo', 'start:doc', 'end:doc']);
+  const docInput = inputsSeen[1]!;
+  expect(docInput.topic).toBe('상장 홍보');
+  expect(String(docInput.context)).toContain('행사 직후');
+  expect(String(docInput.context)).toContain('앞 자리 결과:');
+  expect(String(docInput.context)).toContain('[CTO · GEO 점검]');
+  expect(String(docInput.context)).toContain('브릴스는 4개 중 1개 답에만 나옴');
+  expect(String(docInput.context)).toContain('1/4 answers mention the brand');
+  expect(store.get(first.id)!.seats.map((s) => s.after ?? null)).toEqual([null, [0]]);
+
+  geoOk = false; events.length = 0; inputsSeen.length = 0;
+  const second = runner.submit('다시');
+  for (let i = 0; i < 100 && !['done', 'failed'].includes(store.get(second.id)?.status ?? ''); i++) await new Promise((r) => setTimeout(r, 10));
+  expect(events).toEqual(['start:geo', 'end:geo']);
+  const seats = store.get(second.id)!.seats;
+  expect(seats[1]!.status).toBe('failed');
+  expect(seats[1]!.reason).toContain('앞 자리(CTO) 결과가 없어 진행하지 않았습니다');
+});
+
+test('A5b — the planner keeps only valid earlier indexes in «after»', async () => {
+  const graphs: InstalledGraph[] = [{ id: 'geo', title: 'GEO', description: 'c', path: '/g' }, { id: 'doc', title: 'Doc', description: 'd', path: '/d' }];
+  const plan = await planExecRequest('x', { graphs: async () => graphs, seats: () => ['CTO', 'CMO'], judge: async () => [
+    { seat: 'CTO', title: 'a', graphId: 'geo', inputs: {}, after: [0, 1, -1] },
+    { seat: 'CMO', title: 'b', graphId: 'doc', inputs: {}, after: [0, 0, 1, 5, 'x'] },
+  ] });
+  expect(plan[0]!.after).toBeUndefined();
+  expect(plan[1]!.after).toEqual([0]);
+});

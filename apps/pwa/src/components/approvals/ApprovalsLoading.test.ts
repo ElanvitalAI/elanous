@@ -3,10 +3,10 @@ import { loadingStatus, SLOW_AFTER_MS } from './ApprovalsLoading';
 
 describe('approvals loading status', () => {
   test('names what it waits on and ticks a clock', () => {
-    expect(loadingStatus(0, 'open', null)).toEqual({ title: 'GitHub 에서 승인 대기 PR 을 읽고 있습니다', clock: '0.0초', hint: null });
+    expect(loadingStatus(0, 'open', null)).toEqual({ title: 'GitHub 에서 승인을 기다리는 코드 변경을 읽고 있습니다', clock: '0.0초', hint: null });
     expect(loadingStatus(3_240, 'open', 21449).title).toContain('#21449');
     expect(loadingStatus(3_240, 'open', 21449).clock).toBe('3.2초');
-    expect(loadingStatus(1_000, 'merged', null).title).toContain('머지된');
+    expect(loadingStatus(1_000, 'merged', null).title).toContain('반영된');
   });
 
   test('says it is still alive once it runs long', () => {

@@ -319,11 +319,11 @@ describe('fullScreenIO.print while no question is pending (OB4 · 0.2.6 실물: 
     queueKey('1');
     expect(await promise).toBe('oauth');
     const before = written.length;
-    io.print('    1) Open in any browser: https://example.test/device');
-    io.print('    2) Enter code:          ABCD-EFGH');
+    io.print('    1) 아무 브라우저에서 열기: https://example.test/device');
+    io.print('    2) 코드 입력:             ABCD-EFGH');
     const painted = written.slice(before).join('');
-    expect(painted).toContain('Enter code:          ABCD-EFGH');
-    expect(painted).toContain('Open in any browser');
+    expect(painted).toContain('코드 입력:             ABCD-EFGH');
+    expect(painted).toContain('아무 브라우저에서 열기');
     expect(painted).toContain('Ctrl-C cancel');
   });
 

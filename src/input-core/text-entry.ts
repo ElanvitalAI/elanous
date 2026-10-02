@@ -40,15 +40,23 @@ export function keyEventToTextInsertion(
   return preservePrintableText(ev, name);
 }
 
+/** Hangul Compatibility Jamo (ㄱ…ㅣ · ㅋㅋ · ㅠㅠ). The key parser maps a lone jamo keystroke to the QWERTY key
+ *  on the same position so hotkeys work under the Korean IME — but as TEXT it must stay the jamo the person typed
+ *  (U1 · 2026-10-02: «ㅋㅋㅋ ㅠㅠ» came out as «zzz bb» in the chat input). */
+const COMPAT_JAMO = /^[\u3131-\u318E]$/;
+
 function preservePrintableText(ev: KeyEvent, name: string): string {
+  // The chat composer passes the TUI key (original bytes on `raw`); other composers pass a KeyEvent (`sequence`).
+  const sequence = ev.sequence ?? (ev as { raw?: string }).raw;
+  if (sequence && name.length === 1 && COMPAT_JAMO.test(sequence)) return sequence;
   if (
-    ev.sequence
-    && ev.sequence.length === 1
+    sequence
+    && sequence.length === 1
     && name.length === 1
-    && ev.sequence !== name
-    && ev.sequence.toLowerCase() === name.toLowerCase()
+    && sequence !== name
+    && sequence.toLowerCase() === name.toLowerCase()
   ) {
-    return ev.sequence;
+    return sequence;
   }
   if (name.length === 1) return ev.shift ? name.toUpperCase() : name;
   return name;

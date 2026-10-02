@@ -31,6 +31,7 @@ import { InstallBanner } from '@/components/install-banner';
 import { WorkspaceProvider } from '@/components/workspace/WorkspaceProvider';
 import { SetupModeBanner } from './SetupModeBanner';
 import { AuthRequiredBanner } from './AuthRequiredBanner';
+import { SkillProblemsBanner } from './SkillProblemsBanner';
 import { useNavVisitLog } from './use-nav-visit-log';
 
 const SIDEBAR_KEY = 'elanous.pwa.sidebarOpen';
@@ -81,6 +82,7 @@ export function AppShell({
       <div className="flex h-screen w-full flex-col bg-background text-foreground">
         <AuthRequiredBanner />
         <SetupModeBanner />
+        <SkillProblemsBanner />
         <TopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} />
         <div className="flex flex-1 min-h-0">
           {/* md+ inline sidebar — expanded: w-56 with labels, collapsed:

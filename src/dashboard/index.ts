@@ -725,7 +725,8 @@ import { SELF_IMPLEMENT_TOOL_NAMES } from '../boot/daemon-tools/self-implement-n
 import { FOLD_LIMITS, type FoldMode } from '../log-entry.js';
 import { renderToolCallEvent, renderToolResultVariants } from '../chat/tool-render/index.js';
 import { FoldStack } from '../fold-stack.js';
-import { getSkillIndex, reloadSkillIndex, applySkillFilter } from '../skills/index.js';
+import { getSkillIndex, reloadSkillIndex, applySkillFilter, skillIndexProblems } from '../skills/index.js';
+import { skillRepairNotice } from '../skills/repair.js';
 import type { DetectResult } from '../skills/router.js';
 import { detectUrlRoute } from '../skills/url-router.js';
 import {
@@ -7190,6 +7191,21 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
   // and after each user-initiated skill cursor change.
   const skillView: SkillViewState = createSkillViewState(LOCAL_SKILLS_DIR);
   try { refreshSkills(skillView); refreshSkillFiles(skillView); } catch { /* missing root fine */ }
+  // SK2 — a skill the index could not read is a one-line notice with the repair command, never a crash.
+  try {
+    getSkillIndex();
+    const problems = skillIndexProblems();
+    const notice = skillRepairNotice(problems);
+    if (notice) chatLines.push(C.info(notice));
+    // ER1 — tell operations too (consented · scrubbed · async); a kept unsent report is retried once a day.
+    void import('../error-report/report.js').then(async ({ reportError, retryPendingErrorReport }) => {
+      await retryPendingErrorReport();
+      for (const p of problems.slice(0, 3)) {
+        const outcome = await reportError({ code: 'skill-index', message: `${p.name}: ${p.code ?? ''} ${p.error}`.trim(), surface: 'tui' });
+        if (outcome.sent && outcome.reportId) { chatLines.push(C.muted(`  운영팀에 알렸습니다 (보고 번호 ${outcome.reportId})`)); }
+      }
+    }).catch(() => { /* reporting never breaks the dashboard */ });
+  } catch { /* the notice is advisory */ }
 
   // Scratch visibility (Phase S5). When closed, the workingDir
   // layouts drop the scratch cell so the remaining panes expand

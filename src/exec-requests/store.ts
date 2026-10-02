@@ -12,6 +12,8 @@ export interface ExecSeat {
   runId: string;
   inputs?: Record<string, unknown>;
   reason?: string;
+  /** A5b — indexes of earlier seats this seat waits for. */
+  after?: number[];
 }
 export interface ExecResult {
   seat: string;

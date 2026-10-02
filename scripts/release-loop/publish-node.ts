@@ -17,6 +17,22 @@ export function publicNotes(markdown: string, pages: { pages: Array<{ id: string
   });
 }
 
+/** Polls each release asset until it answers 200 (following redirects). Returns the names still missing. */
+export function waitForAssets(run: CommandRunner, repo: string, tag: string, names: readonly string[], waitSeconds: unknown = 600,
+  sleep: (ms: number) => void = (ms) => Bun.sleepSync(ms)): string[] {
+  if (!repo || names.length === 0) return [];
+  const limit = typeof waitSeconds === 'number' && Number.isFinite(waitSeconds) && waitSeconds >= 0 ? Math.min(waitSeconds, 1800) : 600;
+  let pending = [...names];
+  for (let waited = 0; ; waited += 15) {
+    pending = pending.filter((name) => {
+      const probe = run('curl', ['-sIL', '-o', '/dev/null', '-w', '%{http_code}', '-m', '20', `https://github.com/${repo}/releases/download/${tag}/${name}`]);
+      return probe.stdout.trim() !== '200';
+    });
+    if (pending.length === 0 || waited >= limit) return pending;
+    sleep(15_000);
+  }
+}
+
 export function runPublish(run: CommandRunner = runCommand) {
   const context = readGraphContext();
   const version = context.input.version;
@@ -50,7 +66,13 @@ export function runPublish(run: CommandRunner = runCommand) {
     const result = lastResult(published);
     if (published.status === 1) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `release publish failed: ${result?.error ?? published.stderr.trim()}` };
     if (published.status !== 0 || result?.ok !== true || result.published !== true || result.tag !== `v${version}`) throw new Error(`release publish incomplete or tag mismatch: ${result?.error ?? published.stderr.trim()}`);
-    return { outcome: 'ok' as const, verdict: 'pass' as const, summary: `published v${version}`, tag: `v${version}` };
+    // REL3 — «published» only once every asset downloads. 10-01: the run went on to verify before GitHub served the
+    // assets (release created 13:16Z, assets 13:20Z, run ended 13:15Z) and verify failed on a missing installer.
+    const repo = typeof result.publicRepo === 'string' ? result.publicRepo : '';
+    const names = Array.isArray(result.assets) ? (result.assets as unknown[]).filter((a): a is string => typeof a === 'string').map((a) => a.split('/').at(-1)!) : [];
+    const pending = waitForAssets(run, repo, `v${version}`, names, context.input.assetWaitSeconds);
+    if (pending.length) return { outcome: 'fail' as const, verdict: 'fail' as const, summary: `published v${version} but assets not downloadable yet: ${pending.join(', ')}`, tag: `v${version}` };
+    return { outcome: 'ok' as const, verdict: 'pass' as const, summary: `published v${version} · ${names.length} assets downloadable`, tag: `v${version}` };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 

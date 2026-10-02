@@ -4,7 +4,7 @@
 // 일반 «피드 미리보기» 레이아웃이다 — 특정 서비스의 로고·상표·고유 UI 는 쓰지 않는다.
 // ⛔ 최종 게시 «전»에는 데몬 API(`/v1/graph-approvals/…`) 말고는 아무 데도 보내지 않는다.
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { feedEditOf, graphApprovalErrorText, type FeedDraft, type FeedEdit, type GraphApproval } from '@/lib/graph-approvals-api';
+import { CONNECT_TOKEN_SETTINGS_HREF, feedEditOf, graphApprovalErrorText, needsConnectToken, type FeedDraft, type FeedEdit, type GraphApproval } from '@/lib/graph-approvals-api';
 
 export const FINAL_POST_CONFIRM = '게시할까요? 승인하면 이 초안으로 게시 준비 묶음이 텔레그램으로 갑니다.';
 
@@ -21,11 +21,11 @@ interface Props {
   confirm?: (text: string) => boolean;
 }
 
-type Frame = { image?: string; cover?: { text: string; sub: string }; caption?: string };
+type Frame = { image?: string; isCover?: boolean; caption?: string };
 
 function framesOf(draft: FeedDraft, edit: FeedEdit): Frame[] {
   const frames: Frame[] = [];
-  if (draft.cover.image) frames.push({ image: draft.cover.image, cover: edit.cover });
+  if (draft.cover.image) frames.push({ image: draft.cover.image, isCover: true });
   for (const slide of edit.slides) if (slide.include) frames.push({ image: slide.image, caption: slide.caption });
   return frames;
 }
@@ -41,6 +41,8 @@ export function FeedPreviewCard({ item, api, onDecided, confirm }: Props) {
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
   const [error, setError] = useState('');
+  const [pairing, setPairing] = useState(false);
+  const fail = (err: unknown, action: 'save' | 'decide') => { setError(graphApprovalErrorText(err, action)); setPairing(needsConnectToken(err)); };
   const [media, setMedia] = useState<Record<string, string>>({});
   const touchX = useRef<number | null>(null);
   const ask = confirm ?? ((text: string) => window.confirm(text));
@@ -81,14 +83,14 @@ export function FeedPreviewCard({ item, api, onDecided, confirm }: Props) {
   }
 
   async function save(): Promise<boolean> {
-    setBusy(true); setError(''); setNote('');
+    setBusy(true); setError(''); setPairing(false); setNote('');
     try {
       const result = await api.saveFeedDraft(item.graphId, item.runId, edit);
       setSaved(result.feed);
       setEdit(feedEditOf(result.feed));
       setNote(`저장했어요 · 수정 ${result.feed.revision} · 아직 게시 전입니다`);
       return true;
-    } catch (err) { setError(graphApprovalErrorText(err)); return false; }
+    } catch (err) { fail(err, 'save'); return false; }
     finally { setBusy(false); }
   }
 
@@ -97,7 +99,7 @@ export function FeedPreviewCard({ item, api, onDecided, confirm }: Props) {
     if (dirty && !(await save())) return;
     setBusy(true); setError('');
     try { await api.decide(item.graphId, item.runId, 'approved'); onDecided(); }
-    catch (err) { setError(graphApprovalErrorText(err)); }
+    catch (err) { fail(err, 'decide'); }
     finally { setBusy(false); }
   }
 
@@ -105,13 +107,15 @@ export function FeedPreviewCard({ item, api, onDecided, confirm }: Props) {
     if (!ask('이 게시 초안을 거절할까요?')) return;
     setBusy(true); setError('');
     try { await api.decide(item.graphId, item.runId, 'rejected'); onDecided(); }
-    catch (err) { setError(graphApprovalErrorText(err)); }
+    catch (err) { fail(err, 'decide'); }
     finally { setBusy(false); }
   }
 
   const brand = saved.brand?.name || '브랜드';
   const initial = brand.trim().charAt(0).toUpperCase() || '·';
   const hashtags = edit.hashtags.join(' ');
+  // The cover image already carries the rendered words — only flag a change, never draw them twice.
+  const coverChanged = edit.cover.text !== (saved.cover.renderedText ?? saved.cover.text) || edit.cover.sub !== (saved.cover.renderedSub ?? saved.cover.sub);
 
   return (
     <article aria-label="피드 미리보기" data-feed-revision={saved.revision} className="mx-auto w-full max-w-md overflow-hidden rounded-xl border border-border bg-card text-foreground shadow-sm">
@@ -135,14 +139,8 @@ export function FeedPreviewCard({ item, api, onDecided, confirm }: Props) {
         }}
       >
         {current?.image && media[current.image]
-          ? <img src={media[current.image]} alt={current.caption ?? current.cover?.text ?? ''} className="h-full w-full object-cover" />
+          ? <img src={media[current.image]} alt={current.isCover ? edit.cover.text : current.caption ?? ''} className="h-full w-full object-cover" />
           : <div className="flex h-full w-full items-center justify-center text-sm text-muted-foreground">이미지 불러오는 중</div>}
-        {current?.cover && (current.cover.text || current.cover.sub) && (
-          <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent p-4 text-white">
-            <p className="break-words text-lg font-semibold">{current.cover.text}</p>
-            {current.cover.sub && <p className="break-words text-sm opacity-90">{current.cover.sub}</p>}
-          </div>
-        )}
         {frames.length > 1 && <>
           <button type="button" aria-label="이전 장" disabled={index === 0} onClick={() => go(-1)} className="absolute left-2 top-1/2 -translate-y-1/2 rounded-full bg-black/40 px-2 py-1 text-white disabled:opacity-0">‹</button>
           <button type="button" aria-label="다음 장" disabled={index >= frames.length - 1} onClick={() => go(1)} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-black/40 px-2 py-1 text-white disabled:opacity-0">›</button>
@@ -154,12 +152,17 @@ export function FeedPreviewCard({ item, api, onDecided, confirm }: Props) {
         </div>
       )}
 
+      {coverChanged && (
+        <p data-cover-pending className="mx-3 mb-2 rounded border border-dashed border-border px-2 py-1 text-xs text-muted-foreground">
+          커버 문구 변경 — «{edit.cover.text}{edit.cover.sub ? ` · ${edit.cover.sub}` : ''}» · 게시 때 커버를 다시 그립니다
+        </p>
+      )}
       <div className="space-y-2 px-3 pb-3 text-sm">
         <p className="break-words"><span className="font-semibold">{brand}</span> {edit.caption.hook}</p>
         {edit.caption.body && (more
           ? <p className="whitespace-pre-wrap break-words">{edit.caption.body}</p>
           : <button type="button" onClick={() => setMore(true)} className="text-muted-foreground">더 보기</button>)}
-        {hashtags && <p className="break-words text-primary">{hashtags}</p>}
+        {edit.hashtags.length > 0 && <p className="flex flex-wrap gap-x-1.5 text-primary">{edit.hashtags.map((tag, i) => <span key={`${tag}-${i}`} className="whitespace-nowrap">{tag}</span>)}</p>}
         {edit.location && <p className="text-xs text-muted-foreground">📍 {edit.location}</p>}
       </div>
 
@@ -202,6 +205,7 @@ export function FeedPreviewCard({ item, api, onDecided, confirm }: Props) {
       )}
 
       {(note || error) && <p role={error ? 'alert' : 'status'} className={`px-3 pb-2 text-sm ${error ? 'text-red-600' : 'text-muted-foreground'}`}>{error || note}</p>}
+      {error && pairing && <p className="px-3 pb-2 text-sm"><a href={CONNECT_TOKEN_SETTINGS_HREF} className="font-medium underline" data-connect-token-link>연결 토큰 칸 열기 →</a></p>}
       <footer className="flex flex-wrap gap-2 border-t border-border px-3 py-3">
         <button type="button" disabled={busy} onClick={() => setEditing((v) => !v)} className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50">{editing ? '편집 닫기' : '편집'}</button>
         <button type="button" disabled={busy || !dirty} onClick={() => { void save(); }} className="rounded-lg border px-3 py-2 text-sm disabled:opacity-50">수정 저장</button>

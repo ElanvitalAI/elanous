@@ -113,3 +113,27 @@ test('failed internal feed skips remotes, continues local and records the feed f
     ]);
   });
 });
+
+test('remote hosts see the installer bin dir, and opsRestart restarts the hooks receiver where it runs', () => {
+  withContext({ opsHosts: ['cloud-vm', 'node-b'], opsRestart: true }, () => {
+    const calls: Array<[string, string[]]> = [];
+    const result = runOpsUpgrade((cmd, args) => {
+      calls.push([cmd, args]);
+      const line = args.join(' ');
+      if (line.includes('elanous-hooks.service')) return { status: 0, stdout: args[0] === 'cloud-vm' ? 'active\n' : 'absent\n', stderr: '' };
+      return line.includes('--version') && !line.includes('update') ? { status: 0, stdout: '0.2.7 revised\n', stderr: '' } : good;
+    });
+    expect(result.outcome).toBe('ok');
+    const updates = calls.filter(([, args]) => args.join(' ').includes(' update '));
+    expect(updates.every(([, args]) => args[1]!.startsWith('PATH="$HOME/.local/share/elanous/bin:'))).toBe(true);
+    expect(result.hosts.map((h) => [h.host, (h as { hooks?: string }).hooks])).toEqual([['cloud-vm', 'active'], ['node-b', 'absent']]);
+  });
+});
+
+test('without opsRestart the hooks receiver is not touched', () => {
+  withContext({ opsHosts: ['cloud-vm'] }, () => {
+    const calls: string[] = [];
+    runOpsUpgrade((cmd, args) => { calls.push(args.join(' ')); return args.join(' ').includes('--version') && !args.join(' ').includes('update') ? { status: 0, stdout: '0.2.7 revised\n', stderr: '' } : good; });
+    expect(calls.some((c) => c.includes('elanous-hooks.service'))).toBe(false);
+  });
+});

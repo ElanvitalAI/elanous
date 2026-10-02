@@ -48,6 +48,14 @@ function runtimeFixture(registrySource = registry): Record<string, string> {
   };
 }
 
+// TD1a — the two real-repository checks share one sweep: each sweep builds a whole-repository TypeScript program
+// (13 GB peak with two). The assertions are unchanged.
+let realSweep: ReturnType<typeof sweepF12> | undefined;
+function realRepositorySweep(): ReturnType<typeof sweepF12> {
+  realSweep ??= sweepF12(resolve(import.meta.dir, '..'));
+  return realSweep;
+}
+
 describe('f12 sweep', () => {
   it('classifies only registry runtime IDs reached through dynamic lookup, including aliases and canonical IDs without aliases', async () => {
     const report = await sweepF12(fixture(runtimeFixture()));
@@ -159,7 +167,7 @@ describe('f12 sweep', () => {
   }, 60_000);
 
   it('measures bucket b over apps/pwa on the real repository, and never folds an unreadable scope into zero', async () => {
-    const report = await sweepF12(resolve(import.meta.dir, '..'));
+    const report = await realRepositorySweep();
 
     // ⭐ 이 자가 14차에 결함 열둘이 살던 표면을 «본다» — 안 보면 그 축의 「0」은 거짓이다.
     expect(report.bucketB.scanRoots).toContain('apps/pwa/src');
@@ -175,7 +183,7 @@ describe('f12 sweep', () => {
   }, 180_000);
 
   it('partitions the denominator across every bucket on the real repository, without freezing drifting counts', async () => {
-    const report = await sweepF12(resolve(import.meta.dir, '..'));
+    const report = await realRepositorySweep();
 
     // ⭐ 분모는 «존재»해야 한다 — 퇴화(0)면 이 자는 아무것도 재고 있지 않다.
     expect(report.filesScanned).toBeGreaterThan(100);

@@ -18,6 +18,7 @@ import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { kindRouteTarget } from './telegram-kind-route.js';
 import { debug } from '../debug/log.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
+import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
 // ★ origin 되돌림(대표 2026-07-12) — 미션 알림을 발신 채널(메인 Q&A 봇)로 되돌린다. type-only
 //   import 라 런타임 순환 없음(발송 로직은 이 파일에 self-contained). origin 없으면 report 폴백.
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
@@ -317,9 +318,31 @@ function logDaemonPath(classification: DaemonPathClass, kind: string, extra: Rec
   try { console.error(`[outbound] daemon-path ${classification}`); } catch { /* fail-soft */ }
 }
 
+/** OB8 — the daemon registers its own in-process sender at startup. Inside the daemon, deliver() must never curl
+ *  its own `/v1/outbound`: the curl is synchronous, the event loop that would answer it is the one it blocks, and the
+ *  whole daemon freezes until the curl times out (~25 s · `unreachable`) — the message is lost (CS1 · 10-01). */
+export type InProcessOutbound = (text: string, kind: string) => Promise<boolean>;
+let inProcessOutbound: InProcessOutbound | null = null;
+export function setInProcessOutbound(send: InProcessOutbound | null): void { inProcessOutbound = send; }
+
 /** elanous `/v1/outbound` 우선 → 실패 시 텔레그램 직접. 성공 경로 반환(원장 중복방지용). */
 export function deliver(text: string, kind = 'alert'): 'daemon' | 'direct' | false {
+  // 0) inside the daemon — route in-process, asynchronously; the caller's synchronous answer is «accepted».
+  if (inProcessOutbound && process.env.SEND_VIA_ELANOUS !== '0') {
+    const send = inProcessOutbound;
+    void send(text, kind)
+      .then((ok) => {
+        logDaemonPath(ok ? 'ok' : 'rejected', kind, { inProcess: true });
+        if (!ok && sendTelegramDirect(text, kind)) recordOutbound(text, kind);
+      })
+      .catch((error: unknown) => {
+        logDaemonPath('rejected', kind, { inProcess: true, error: error instanceof Error ? error.message : String(error) });
+        if (sendTelegramDirect(text, kind)) recordOutbound(text, kind);
+      });
+    return 'daemon';
+  }
   // 1) elanous 단일 발송 지점(/v1/outbound) — 데몬이 팬아웃 + 원장 기록.
+  let daemonPath: DaemonPathClass | 'not-found' | 'disabled' = 'disabled';
   if (process.env.SEND_VIA_ELANOUS !== '0') {
     let token = '';
     try { if (existsSync(ACP_TOKEN_PATH)) token = readFileSync(ACP_TOKEN_PATH, 'utf-8').trim(); } catch { /* no token */ }
@@ -330,12 +353,32 @@ export function deliver(text: string, kind = 'alert'): 'daemon' | 'direct' | fal
       : null;
     const classification = classifyDaemonResponse(j);
     if (classification === 'ok') return 'daemon';
+    daemonPath = nexus ? classification : 'not-found';
     const extra: Record<string, unknown> = { hasToken: token.length > 0 };
     if (j && typeof j === 'object' && 'error' in (j as object)) extra.error = (j as { error?: unknown }).error;
     logDaemonPath(classification, kind, extra);
   }
   // 2) fallback: 텔레그램 sendMessage 직접(3900자 분할) — 데몬 미경유라 클라가 원장 기록.
-  return sendTelegramDirect(text, kind) ? 'direct' : false;
+  if (sendTelegramDirect(text, kind)) return 'direct';
+  reportUndeliverable(kind, daemonPath);
+  return false;
+}
+
+/** OB8b — both paths failed: say so loudly, with the universe this process resolved, instead of a silent false.
+ *  The usual cause (10-01 · MK): an ad-hoc `bun -e` or a script from a source tree resolves a cwd-derived test
+ *  universe, so it finds neither the production daemon nor the production bot token. */
+function reportUndeliverable(kind: string, daemonPath: DaemonPathClass | 'not-found' | 'disabled'): void {
+  let root = '?';
+  let universe: 'prod' | 'test' | '?' = '?';
+  try {
+    root = effectiveInstanceRoot();
+    universe = root === prodInstanceRoot() ? 'prod' : 'test';
+  } catch { /* the report still goes out */ }
+  try { debug.log('outbound.send', 'undeliverable', { kind, daemonPath, universe, root }); } catch { /* fail-soft */ }
+  const hint = universe === 'prod'
+    ? '운영 데몬이 떠 있는지 확인: elanous nexus show'
+    : '운영으로 보내려면 설치본 elanous 로 실행하거나 ELANOUS_STATE_DIR=~/.elanous ELANOUS_CONFIG_DIR=~/.elanous 를 준다';
+  try { console.error(`[outbound] ⛔ 못 보냄(${kind}) — 데몬 ${daemonPath} · 직접 발송도 실패(토큰 없음 또는 전송 실패) · 이 프로세스의 우주 ${universe} (${root}) · ${hint}`); } catch { /* fail-soft */ }
 }
 
 /** 텔레그램 raw 발송(토큰·chatId 명시) — spill + 3900자 분할(줄 경계). thread 지원. */

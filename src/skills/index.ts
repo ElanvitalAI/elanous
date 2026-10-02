@@ -93,6 +93,17 @@ export function nameTriggers(name: string): string[] {
   return out;
 }
 
+/** A skill the index could not read — surfaced to the person (startup notice · repair offer), never swallowed. */
+export interface SkillIndexProblem { name: string; dir: string; code: string | null; error: string }
+const skillProblems = new Map<string, SkillIndexProblem>();
+function recordSkillIndexProblem(problem: SkillIndexProblem): void {
+  skillProblems.set(`${problem.dir}\u0000${problem.name}`, problem);
+}
+/** Skills skipped by the most recent index builds (deduped by dir + name). */
+export function skillIndexProblems(): SkillIndexProblem[] {
+  return [...skillProblems.values()];
+}
+
 function makeEntry(name: string, rootDir: string): SkillIndexEntry | null {
   let m: ReturnType<typeof parseSkillMd>;
   try {
@@ -458,9 +469,26 @@ export function buildSkillIndex(
   const out: SkillIndexEntry[] = [];
   const seenNames = new Set<string>();
   for (const dir of dirs) {
+    // Problems reflect the latest build of each dir — a repaired skill must drop off the list (SK2).
+    for (const key of [...skillProblems.keys()]) if (key.startsWith(`${dir}\u0000`)) skillProblems.delete(key);
     const names = listSkillNames(dir);
     for (const name of names) {
-      const entry = makeEntry(name, dir);
+      // One malformed third-party skill must not take down the index (and with it the first screen).
+      let entry: SkillIndexEntry | null;
+      try {
+        entry = makeEntry(name, dir);
+      } catch (err) {
+        // 대표 10-01: a broken skill must never crash the product — and must never vanish silently either (G9 P5a).
+        // It is skipped, recorded in skillIndexProblems() (a startup notice offers to repair it), and logged.
+        const problem: SkillIndexProblem = {
+          name, dir,
+          code: (err as NodeJS.ErrnoException)?.code ?? null,
+          error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+        };
+        recordSkillIndexProblem(problem);
+        debug.log('skills.index', 'skill-skipped', { ...problem }, { level: 'warn' });
+        continue;
+      }
       if (!entry) continue;
       if (seenNames.has(entry.name)) continue; // first-wins dedup
       seenNames.add(entry.name);

@@ -649,7 +649,7 @@ export function SettingsPanel() {
       <EmbeddingVisionTierCard />
 
       <section className="space-y-3">
-        <h2 className="text-sm font-medium">Daemon</h2>
+        <h2 className="text-sm font-medium">데몬 연결</h2>
         <label className="block space-y-1">
           <span className="text-xs text-muted-foreground">Base URL</span>
           <Input
@@ -659,12 +659,12 @@ export function SettingsPanel() {
           />
         </label>
         <label className="block space-y-1">
-          <span className="text-xs text-muted-foreground">Bearer token</span>
+          <span className="text-xs text-muted-foreground">연결 토큰</span>
           <Input
             id="bearer-token"
             type="password"
             value={config.token}
-            placeholder="(optional)"
+            placeholder="다른 기기에서 만든 연결 토큰을 붙여 넣으세요"
             onChange={(e) => setConfig({ token: e.target.value })}
           />
         </label>

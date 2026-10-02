@@ -34,7 +34,7 @@ import { stdin as input, stdout as output } from 'node:process';
 import {
   type UserConfig, type LLMProviderName, type SkillSetName,
   saveUserConfig, markOnboardingComplete, buildUserConfig,
-  skillSetDir, SKILL_SET_NAMES, userConfigPath, urlRoutingDefaults, devRequestRoutingDefaults,
+  skillSetDir, SKILL_SET_NAMES, userConfigPath, urlRoutingDefaults, devRequestRoutingDefaults, defaultSkillDirs, resolveSkillSources,
 } from './user-config.js';
 import {
   GROK_MODEL, OPENAI_MODEL, ANTHROPIC_MODEL, LOCAL_LLM_MODEL, GEMINI_MODEL,
@@ -45,6 +45,7 @@ import { suggestSetupModel } from './model-tier/index.js';
 import { loginWithCodex, CODEX_DEVICE_LOGIN_URL } from './oauth/codex.js';
 import { loginWithCodexBrowser } from './oauth/codex-browser-login.js';
 import { loadTokens } from './oauth/store.js';
+import { browserUnavailableReason } from './oauth/browser-availability.js';
 import { TelegramBot } from './telegram.js';
 import { DiscordBot } from './discord.js';
 import { pickCodexAuthMode, pickCodexModel } from './codex/setup.js';
@@ -61,6 +62,7 @@ import { stepTransition } from './onboarding/transition.js';
 import { unattendedSetupHint } from './onboarding/entry-hints.js';
 import { continueHereLines } from './onboarding/continue-here.js';
 import type { NexusShowResult } from './cli/nexus-show.js';
+import type { TailscaleProbe } from './nexus/onboarding/tailscale-probe.js';
 import type { IssuedTempToken } from './auth/temp-tokens.js';
 import {
   askValidated,
@@ -385,7 +387,11 @@ function assistCodexDeviceLogin(
   const platform = deps.authPlatform ?? process.platform;
   const execute = deps.runAuthCommand ?? runAuthCommand;
   const local = !(deps.isHeadless ?? isHeadlessEnv)(env);
-  if (local) {
+  const unavailable = browserUnavailableReason(env, platform);
+  if (unavailable) {
+    io.print(`  ${unavailable}`);
+    debug.log('browser.open', 'skipped', { reason: unavailable.includes('ssh') ? 'ssh' : 'no-display' });
+  } else if (local) {
     try {
       if (platform === 'darwin') execute('open', [url]);
       else if (platform === 'linux' || platform === 'freebsd' || platform === 'openbsd') execute('xdg-open', [url]);
@@ -582,7 +588,12 @@ async function askLLM(
     if (mode === 'oauth') {
       const env = grokDeps.codexEnv ?? process.env;
       let signedIn = false;
-      if (!(grokDeps.isHeadless ?? isHeadlessEnv)(env)) {
+      const why = browserUnavailableReason(env, grokDeps.authPlatform ?? process.platform);
+      if (why) {
+        io.print(`  ${why}`);
+        debug.log('browser.open', 'skipped', { reason: why.includes('ssh') ? 'ssh' : 'no-display' });
+      }
+      if (!why && !(grokDeps.isHeadless ?? isHeadlessEnv)(env)) {
         // Full-screen IO retains print() messages across redraws. Keep this
         // waiting hint transient so it cannot reappear on the device-code screen.
         if (io.showStep) output.write('  브라우저에서 로그인을 마치세요 — 끝나면 자동으로 이어집니다.\n');
@@ -600,23 +611,23 @@ async function askLLM(
             } catch { /* device code remains available */ }
           }
         }
-        if (signedIn) io.print('  → using your ChatGPT/Codex login.');
+        if (signedIn) io.print('  → ChatGPT/Codex 로그인을 씁니다.');
         else io.print('  브라우저 로그인이 안 됐습니다 — 코드로 이어갑니다');
       }
       if (!signedIn) {
-        io.print('  Launching device-code flow…');
+        io.print('  코드로 로그인합니다…');
         try {
           await (grokDeps.loginWithCodex ?? loginWithCodex)({
             onProgress: (p) => {
               if (p.type === 'user_code') {
                 io.print('');
-                io.print(`    1) Open in any browser: ${p.loginUrl}`);
-                io.print(`    2) Enter code:          ${p.userCode}`);
+                io.print(`    1) 아무 브라우저에서 열기: ${p.loginUrl}`);
+                io.print(`    2) 코드 입력:             ${p.userCode}`);
                 io.print('');
                 assistCodexDeviceLogin(io, p.loginUrl ?? CODEX_DEVICE_LOGIN_URL, p.userCode ?? '', grokDeps);
-                io.print('  Waiting for sign-in…');
+                io.print('  로그인을 기다리는 중…');
               }
-              if (p.type === 'saved') io.print('  Signed in. Tokens saved.');
+              if (p.type === 'saved') io.print('  로그인했습니다. 저장했습니다.');
             },
           });
         } catch (err: any) {
@@ -1316,6 +1327,7 @@ export interface RunWizardOpts {
   /** Post-save connections; injection keeps wizard tests off the real daemon/token store. */
   continueHereDeps?: {
     showNexus?: () => Promise<Pick<NexusShowResult, 'urls' | 'status' | 'instance'>>;
+    probeTailscale?: () => Promise<TailscaleProbe>;
     issueToken?: () => Pick<IssuedTempToken, 'token'>;
     renderQr?: (link: string) => string | undefined;
   };
@@ -1531,9 +1543,28 @@ export async function runOnboarding(opts: RunWizardOpts = {}): Promise<UserConfi
     io.print('');
     io.print('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     io.print(`  ${m.setupComplete}`);
+    // ER1 — first-run consent notice (default on · 대표 10-01): what is sent and how to turn it off.
+    io.print('  오류가 나면 운영팀에 자동으로 알립니다(오류 내용·버전·무작위 설치 ID — 이름·메일 없이). 끄기: elanous config set errorReports.enabled false');
     io.print(`  Provider : ${marked.llm.provider}${marked.llm.model ? ` (${marked.llm.model})` : ''}`);
-    io.print(`  Skills   : ${marked.skills.activeSet} — ${marked.skills.dirs.length} dir(s)`);
-    for (const d of marked.skills.dirs) io.print(`             ${d}`);
+    // EN5 — show what the loader will actually read (resolveSkillSources), not the raw preset fields.
+    const skillSources = resolveSkillSources(marked).filter((source) => source.enabled);
+    io.print(`  Skills   : ${marked.skills.activeSet} — ${skillSources.length} dir(s)`);
+    for (const source of skillSources) io.print(`             ${source.path}${source.kind === 'preset' ? '' : `  (${source.id})`}`);
+    // EN9 — skills the person already has in another agent: one line, one command (registers in place, no copy).
+    try {
+      const { CONNECT_AGENTS, planConnect } = await import('./skills/connect.js');
+      const active = defaultSkillDirs(marked);
+      for (const agent of CONNECT_AGENTS) {
+        const plan = planConnect(agent, active);
+        if (plan.state === 'new') io.print(`  쓰던 스킬 ${plan.skills.length}개 찾음(${agent}) — 가져오려면: elanous connect ${agent}`);
+      }
+    } catch { /* advisory */ }
+    // EN13 — a bot the person already runs elsewhere: one line, one command (values never shown).
+    try {
+      const { channelImportHint } = await import('./channel-import/run.js');
+      const hint = channelImportHint();
+      if (hint) io.print(`  ${hint}`);
+    } catch { /* advisory */ }
     io.print(`  Obsidian : ${marked.obsidian.vault}`);
     io.print(`  Telegram : ${marked.telegram.enabled ? 'enabled' : 'disabled'}`);
     io.print(`  Discord  : ${marked.discord.enabled ? 'enabled' : 'disabled'}`);
@@ -1571,7 +1602,30 @@ export async function runOnboarding(opts: RunWizardOpts = {}): Promise<UserConfi
         }
       } catch { /* No token/link on failure; show the manual command instead. */ }
     }
-    const directions = continueHereLines({ daemonRunning, pwaUrl, phoneLink, telegramEnabled: marked.telegram.enabled, interactive });
+    let tailscale: { host?: string } | undefined;
+    let installed = false;
+    let alive = false;
+    let probeTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const probe = opts.continueHereDeps?.probeTailscale ?? (async () => {
+        const { probeTailscale } = await import('./nexus/onboarding/tailscale-probe.js');
+        return probeTailscale({ timeoutMs: 2000 });
+      });
+      const status = await Promise.race([
+        probe(),
+        new Promise<undefined>(resolve => { probeTimer = setTimeout(() => resolve(undefined), 2000); }),
+      ]);
+      if (status) {
+        installed = status.installed;
+        alive = status.alive;
+        // A bare hostname has no HTTPS certificate — offer the command without an address.
+        if (installed && alive) tailscale = status.magicDnsHost ? { host: status.magicDnsHost } : {};
+      }
+    } catch { /* Tailscale discovery is advisory. */ }
+    finally { if (probeTimer) clearTimeout(probeTimer); }
+    try { debug.log('onboarding.tailscale', 'probed', { installed, alive, offered: !!tailscale }); }
+    catch { /* Logging must not interrupt setup. */ }
+    const directions = continueHereLines({ daemonRunning, pwaUrl, phoneLink, telegramEnabled: marked.telegram.enabled, interactive, tailscale });
     if (io.nonInteractive) {
       for (const line of directions) process.stdout.write(`${line}\n`);
     } else {

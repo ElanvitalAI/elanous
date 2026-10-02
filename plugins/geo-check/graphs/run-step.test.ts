@@ -16,7 +16,7 @@ const graph = parseYaml(readFileSync(graphFile, 'utf8')) as {
 };
 const recipes = parseYaml(readFileSync(join(dir, 'recipes.yaml'), 'utf8')) as Record<string, { command: string }>;
 const fakeSource = `#!/usr/bin/env bun
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
 const [kind, ...args] = process.argv.slice(2);
 if (process.env.GEO_CHECK_CALL_LOG) appendFileSync(process.env.GEO_CHECK_CALL_LOG, JSON.stringify({kind,args,provider:process.env.ELANOUS_LLM_PROVIDER ?? null})+'\\n');
 const question = args.at(-1) || '';
@@ -25,6 +25,7 @@ if (kind !== 'ask') process.exit(2);
 if (process.env.GEO_CHECK_NO_BARE && args.includes('--bare')) { console.error("error: unknown option '--bare'"); process.exit(1); }
 if (process.env.GEO_CHECK_ECHO_CWD) { console.log(JSON.stringify({reply:'cwd='+process.cwd()+' tool='+(process.env.ELANOUS_TOOL_CWD ?? 'none')})); process.exit(0); }
 if (question.includes('Generate exactly 5')) { console.log(JSON.stringify({reply:JSON.stringify(['What is an AI assistant?', 'Which assistant is best?', 'How can I automate?', 'What tools compare?', 'How much does it cost?'])})); process.exit(0); }
+if (question.includes('Using ONLY this score table') && process.env.GEO_CHECK_SUGGEST_REPLIES) { const list = JSON.parse(process.env.GEO_CHECK_SUGGEST_REPLIES); const f = process.env.GEO_CHECK_SUGGEST_COUNTER; let n = 0; try { n = Number(readFileSync(f, 'utf8')) || 0; } catch {} writeFileSync(f, String(n + 1)); console.log(JSON.stringify({reply: JSON.stringify(list[Math.min(n, list.length - 1)])})); process.exit(0); }
 if (question.includes('Using ONLY this score table')) { console.log(JSON.stringify({reply:JSON.stringify([1,2,3].map(n=>({suggestion:'Write FAQ '+n,evidence:{question:'Which assistant is best?',engine:'grok'}})))})); process.exit(0); }
 if (process.env.GEO_CHECK_REPLY) { console.log(JSON.stringify({provider:process.env.ELANOUS_LLM_PROVIDER,reply:process.env.GEO_CHECK_REPLY})); process.exit(0); }
 if (process.env.ELANOUS_LLM_PROVIDER === 'grok' && !process.env.GEO_CHECK_ALL_CITED) { console.error('credential unavailable'); process.exit(1); }
@@ -78,7 +79,7 @@ test('fake CLI receives bare JSON only for answers; questions and suggest retain
     expect(calls[1]).toEqual({ kind: 'ask', args: ['--bare', '--json', 'Which assistant is best?'], provider: 'openai-codex' });
     expect(calls[2]).toEqual({ kind: 'ask', args: ['--bare', '--json', 'Which assistant is best?'], provider: 'grok' });
     expect(calls[3]).toMatchObject({ kind: 'ask', provider: null });
-    expect(calls[3]!.args).toEqual(['--json', 'Using ONLY this score table, return a JSON array of 3 to 5 improvement suggestions. Each must have "suggestion" (FAQ question, FAQPage/Organization structured data, comparison document, etc.) and "evidence" containing a question and engine from the missing cells. Evidence cells: [{"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]. Score table: [{"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]']);
+    expect(calls[3]!.args).toEqual(['--json', 'Using ONLY this score table, return a JSON array of 3 to 5 improvement suggestions. Each item: {"suggestion": "<FAQ question, FAQPage/Organization structured data, comparison document, etc.>", "evidence": <id of one cell below>}. Evidence cells (pick by id): [{"id":0,"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]. Score table: [{"question":"Which assistant is best?","engine":"grok","error":"credential unavailable","mention":false,"citation":false}]']);
     expect(readFileSync(join(dir, 'run-step.ts'), 'utf8')).not.toMatch(/(?:from\s*|import\s*\()['"][^'"]*src\//);
   } finally { f.cleanup(); }
 });
@@ -268,3 +269,35 @@ test('other ask failures are not retried without --bare', async () => {
     expect(readFileSync(callLog, 'utf8').trim().split('\n')).toHaveLength(1);
   } finally { f.cleanup(); }
 });
+
+
+test('A5c — reworded evidence, ids and engine case still match; a bad item is dropped, not fatal; nothing valid retries once strictly', async () => {
+  const f = fixture();
+  try {
+    const table = [
+      { question: 'Which assistant is best?', engine: 'grok', error: 'credential unavailable', mention: false, citation: false },
+      { question: 'How can I automate?', engine: 'openai-codex', mention: false, citation: false },
+    ];
+    const run = (replies: unknown[]) => step('suggest', { brand: 'Elanous' }, { score: { table } }, f.bin, f.root, undefined, {
+      GEO_CHECK_SUGGEST_REPLIES: JSON.stringify(replies), GEO_CHECK_SUGGEST_COUNTER: join(f.root, `counter-${Math.random()}`),
+    });
+    // reworded question · engine case · id · numeric evidence · one hallucinated cell — the last is dropped
+    const mixed = await run([[
+      { suggestion: 'Add an FAQ: best assistant', evidence: { question: '  "Which assistant is best"?? ', engine: 'GROK' } },
+      { suggestion: 'Publish Organization structured data', evidence: { id: 1 } },
+      { suggestion: 'Write a comparison page', evidence: 0 },
+      { suggestion: 'Invented', evidence: { question: 'Not in the table', engine: 'grok' } },
+    ]]);
+    expect(mixed).toMatchObject({ calls: 1, errors: 0 });
+    expect(mixed.suggestions.map((s: any) => [s.suggestion, s.evidence.engine])).toEqual([
+      ['Add an FAQ: best assistant', 'grok'], ['Publish Organization structured data', 'openai-codex'], ['Write a comparison page', 'grok'],
+    ]);
+    // nothing valid the first time → one strict retry succeeds
+    const retried = await run([[{ suggestion: 'x', evidence: { question: 'nope' } }], [{ suggestion: 'Add FAQ', evidence: 1 }]]);
+    expect(retried).toMatchObject({ calls: 2, errors: 0 });
+    expect(retried.suggestions).toEqual([{ suggestion: 'Add FAQ', evidence: { question: 'How can I automate?', engine: 'openai-codex' } }]);
+    // still nothing valid → the honest failure
+    const failed = await run([[{ suggestion: 'x', evidence: 9 }], [{ suggestion: 'y', evidence: { question: 'nope' } }]]);
+    expect(failed).toMatchObject({ outcome: 'fail', calls: 2, errors: 1, error: 'suggestion missing valid score evidence' });
+  } finally { f.cleanup(); }
+}, 30000);
