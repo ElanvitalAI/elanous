@@ -24,7 +24,7 @@ test('release graph CLI dry-run previews automatic route without executing comma
     expect(run.status).toBe(0);
     const output = JSON.parse(run.stdout.trim().split('\n').at(-1)!) as { status: string; path: string[]; executed: number; pending?: { nodeId: string; message: string } };
     expect(output.status).toBe('done');
-    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(output.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(output.pending).toBeUndefined();
     expect(output.executed).toBe(0);
   } finally { rmSync(root, { recursive: true, force: true }); }
@@ -37,7 +37,7 @@ test('graph dry-run previews automatic path without executing commands', async (
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async () => { throw new Error('dry-run executed command'); } }, dryRun: true,
     });
     expect(state.status).toBe('done');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
     expect(state.pending).toBeUndefined();
     expect(state.executed).toBe(0);
     expect(state.nodes.every((node) => !node.executed)).toBe(true);
@@ -56,6 +56,28 @@ test('cutoff routes through checklist-gate before the costly gate', () => {
   expect(graph.edges.find((edge) => edge.from === 'cutoff')?.map).toEqual({ ok: 'checklist-gate', fail: 'failed', error: 'failed' });
   expect(graph.edges.find((edge) => edge.from === 'checklist-gate')?.map).toEqual({ ok: 'gate', fail: 'failed', error: 'failed' });
   expect(recipes['checklist-gate']).toEqual({ command: 'bun scripts/release-loop/checklist-gate-node.ts', timeout_ms: 600000 });
+});
+
+test('public export check routes gate ok before pwa and failure to failed', async () => {
+  const graphPath = join(import.meta.dir, '../../graphs/release/release-loop.yaml');
+  const graph = yaml(readFileSync(graphPath, 'utf8')) as {
+    nodes: Array<{ node_id: string; kind: string; recipe?: string; max_visits: number }>;
+    edges: Array<{ from: string; map: Record<string, string> }>;
+  };
+  const recipes = yaml(readFileSync(join(import.meta.dir, '../../graphs/release/recipes.yaml'), 'utf8')) as Record<string, { command?: string; timeout_ms?: number }>;
+  expect(graph.nodes.find((node) => node.node_id === 'export-check')).toMatchObject({ kind: 'gate', recipe: 'cmd:export-check', max_visits: 1 });
+  expect(graph.edges.find((edge) => edge.from === 'gate')?.map).toEqual({ ok: 'export-check', fail: 'failed', error: 'failed' });
+  expect(graph.edges.find((edge) => edge.from === 'export-check')?.map).toEqual({ ok: 'pwa', fail: 'failed', error: 'failed' });
+  expect(recipes['export-check']).toEqual({ command: 'bun scripts/release-loop/export-check-node.ts', timeout_ms: 1_800_000 });
+  const root = mkdtempSync(join(tmpdir(), 'release-export-failed-'));
+  try {
+    const state = await runGraph(graphPath, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body) => ({
+      exitCode: body.includes('export-check-node.ts') ? 1 : 0,
+      stdout: JSON.stringify(body.includes('export-check-node.ts') ? { outcome: 'fail', verdict: 'fail', summary: 'leak', step: 'export', tail: 'leak' } : { outcome: 'ok', verdict: 'pass', summary: 'fake' }) + '\n', stderr: '',
+    }) } });
+    expect(state.status).toBe('failed');
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'export-check', 'failed']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('release notes-check gates approval with a recipe and failure routes', () => {
@@ -173,9 +195,9 @@ test('real graph commands stop at approval before publish', async () => {
       input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: async (body) => ({ exitCode: body.includes('auto-approve-node.ts') ? 1 : 0, stdout: body.includes('auto-approve-node.ts') ? '{"outcome":"fail","verdict":"fail","summary":"unmeasured"}\n' : '{"outcome":"ok","verdict":"pass","summary":"fake"}\n', stderr: '' }) },
     });
     expect(state.status).toBe('awaiting-approval');
-    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
+    expect(state.path).toEqual(['version-release', 'cutoff', 'checklist-gate', 'gate', 'export-check', 'pwa', 'prepare', 'upgrade', 'tui', 'docs', 'known-issues', 'notes-check', 'auto-approve', 'approve-publish']);
     expect(state.pending?.nodeId).toBe('approve-publish');
-    expect(state.executed).toBe(12);
+    expect(state.executed).toBe(13);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -236,7 +258,7 @@ test('notes-check failure routes to failed without requesting approval or publis
       input: { version: '9.9.9', previousVersion: '0.2.3' },
       deps: { root, runBash: async (body) => {
         commands.push(body);
-        return body.includes('check-node.ts')
+        return body.includes('announce-loop/check-node.ts')
           ? { exitCode: 1, stdout: '{"outcome":"fail","findings":[{"rule":"B11"}]}\n', stderr: '' }
           : { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
       } },
@@ -266,7 +288,7 @@ test('actual docs output reaches the real notes checker and B11 blocks approval'
       input: { version: '9.9.9', previousVersion: '0.2.3' },
       deps: { root, log: (event) => { if (event === 'approval-pending') approvals.push(event); }, runBash: async (body, opts) => {
         commands.push(body);
-        if (!body.includes('docs-node.ts') && !body.includes('check-node.ts')) {
+        if (!body.includes('docs-node.ts') && !body.includes('announce-loop/check-node.ts')) {
           return { exitCode: 0, stdout: '{"outcome":"ok","verdict":"pass"}\n', stderr: '' };
         }
         if (body.includes('docs-node.ts')) {
@@ -312,12 +334,12 @@ test('approval resumes through publish, docs land, verify and dev bump with fake
   try {
     const first = await runGraph(graph, { input: { version: '9.9.9', previousVersion: '0.2.3' }, deps: { root, runBash: fake } });
     expect(first.status).toBe('awaiting-approval');
-    expect(commands).toHaveLength(12);
+    expect(commands).toHaveLength(13);
     decideGraphApproval(first.graphId, first.runId, 'approved', 'fake-approver', root);
     const resumed = await runGraph(graph, { resumeRunId: first.runId, deps: { root, runBash: fake } });
     expect(resumed.status).toBe('done');
     expect(resumed.path.slice(-8)).toEqual(['approve-publish', 'publish', 'npm-publish', 'docs-land', 'verify', 'ops-upgrade', 'version-dev-bump', 'done']);
-    expect(commands).toHaveLength(18);
+    expect(commands).toHaveLength(19);
     expect(commands.at(-6)).toContain('publish-node.ts');
     expect(commands.at(-5)).toContain('npm-publish-node.ts');
     expect(commands.at(-1)).toContain('version-node.ts dev-bump');
@@ -349,7 +371,7 @@ if (tool === 'git') {
     else if (args[1].endsWith(':website/pages.json')) console.log(JSON.stringify({pages:[{id:'using-elanous/tasks-and-intake', source:'release/public/docs/tasks-and-intake.md'}]}));
     else console.log('# 0.2.4\\n\\n[Tasks and intake](tasks-and-intake.md)');
   } else if (args[0] === 'worktree' && args[1] === 'add') {
-    const tree = args.includes('--detach') ? args[3] : args[4];
+    const tree = args.includes('--detach') ? args[args.indexOf('--detach') + 1] : args[4];
     fs.mkdirSync(path.join(tree,'release/public/docs/releases'),{recursive:true});
     fs.mkdirSync(path.join(tree,'website'),{recursive:true});
     fs.writeFileSync(path.join(tree,'website/pages.json'),JSON.stringify({pages:[]}));
@@ -385,7 +407,7 @@ if (tool === 'git') {
     process.env.ELANOUS_STATE_DIR = root;
     const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, RELEASE_WIRING_ROOT: root, ELANOUS_STATE_DIR: root };
     const real = async (body: string, opts: { env?: NodeJS.ProcessEnv }) => {
-      if (body.includes('node-verdict.ts') || body.includes('gate-node.ts')) {
+      if (body.includes('node-verdict.ts') || body.includes('gate-node.ts') || body.includes('export-check-node.ts')) {
         return { exitCode: 0, stdout: JSON.stringify({ outcome: 'ok', verdict: 'pass', summary: 'isolated costly check' }) + '\n', stderr: '' };
       }
       const run = spawnSync(process.execPath, [join(import.meta.dir, '../..', body.slice(4).split(' ')[0]!), ...body.slice(4).split(' ').slice(1)], {

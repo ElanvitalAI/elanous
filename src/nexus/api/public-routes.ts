@@ -39,6 +39,12 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
   {
     method: 'GET',
     match: 'exact',
+    path: '/v1/me',
+    why: 'operator signal only (draw the ops area or not); false unless operator.enabled, no other data',
+  },
+  {
+    method: 'GET',
+    match: 'exact',
     path: '/v1/nexus/connect-info',
     why: 'connect metadata only; auto_token removed in #20782',
   },
@@ -55,6 +61,13 @@ export const PUBLIC_ROUTES: Array<PublicRoute> = [
     path: '/v1/pod/credential/github',
     selfVerified: true,
     why: 'Pod GitHub App credential relay verifies its own run-scoped gh-credential token before minting a repository-scoped installation token',
+  },
+  {
+    method: 'POST',
+    match: 'exact',
+    path: '/v1/setup/claim',
+    selfVerified: true,
+    why: 'one-use setup link is verified by the claim handler without an owner bearer',
   },
   {
     method: 'GET',
@@ -76,7 +89,7 @@ export function isPublicRoute(
 ): boolean {
   for (const route of PUBLIC_ROUTES) {
     if (route.method !== method) continue;
-    if (route.path.startsWith('/v1/setup/') && !ctx.setupMode) continue;
+    if (route.path.startsWith('/v1/setup/') && route.path !== '/v1/setup/claim' && !ctx.setupMode) continue;
     if (route.match === 'exact') {
       if (pathname === route.path) return true;
     } else if (pathname === route.path || pathname.startsWith(route.path)) {

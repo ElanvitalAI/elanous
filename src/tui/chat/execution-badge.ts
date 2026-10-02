@@ -1,7 +1,7 @@
 // ── TUI TRUE-execution badge (self-cognition §1) ──────────────────────
 //
 // Resolves the compact engine/model badge for the dashboard chat
-// completion line — `✔ Streaming (19s · ↓ 200 tokens · 🧠 terra(high))`.
+// completion line — `✔ 완료 (19s · ↓ 200 tokens · 🧠 terra(high))`.
 // The value is the model that ACTUALLY ran this turn (from the route
 // decision recorded in the ACP bridge's getActiveModel), not the config
 // original — so the "config=opus but codex/terra ran" illusion is

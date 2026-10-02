@@ -55,12 +55,12 @@ describe('createTurnStreamFormatter activity labels', () => {
     formatter.onToolCall(call('second', 'SecondTool'));
 
     expect(labels).toEqual([
-      'Streaming FirstTool (1 tools)',
+      'Streaming FirstTool (1 tool)',
       'Streaming SecondTool (2 tools)',
     ]);
     expect(labels[0]).toContain('FirstTool');
     expect(labels[1]).toContain('SecondTool');
-    expect(labels[0]).toContain('1 tools');
+    expect(labels[0]).toContain('1 tool');
     expect(labels[1]).toContain('2 tools');
   });
 
@@ -74,7 +74,7 @@ describe('createTurnStreamFormatter activity labels', () => {
 
     expect(observed).toHaveLength(3);
     for (const { events, labels, name } of observed) {
-      expect(labels).toEqual([`Streaming ${name} (1 tools)`]);
+      expect(labels).toEqual([`Streaming ${name} (1 tool)`]);
       expect(events).toHaveLength(1);
     }
     expect(observed.map(({ events }) => events[0]?.type)).toEqual([

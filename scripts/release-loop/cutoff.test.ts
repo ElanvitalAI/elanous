@@ -148,3 +148,37 @@ test('defers an in-flight goal from another worktree or a relative path absent f
   expect(relativeManifest.in).toEqual([]);
   expect(JSON.parse(readFileSync(join(state, 'release/9.9.9/manifest.json'), 'utf8'))).toEqual(relativeManifest);
 }, 30_000);
+
+test('next.md lines added in range become IN lines tied to their landing; feat commits with no line fail as notes-empty', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-cutoff-nextmd-'));
+  scratch.push(root);
+  const repo = join(root, 'repo');
+  const state = join(root, 'state');
+  mkdirSync(join(repo, 'release/public/docs'), { recursive: true });
+  mkdirSync(state);
+  git(repo, 'init', '-q');
+  git(repo, 'config', 'user.name', 'Test');
+  git(repo, 'config', 'user.email', 'test@example.test');
+  writeFileSync(join(repo, 'release/public/docs/cli.md'), '## `elanous a`\n');
+  writeFileSync(join(repo, 'release/next.md'), '# Next\n\n## Feat\n\n## Fix\n');
+  const baseline = commit(repo, 'baseline');
+  writeFileSync(join(repo, 'release/next.md'), '# Next\n\n## Feat\n\n- feat — Setup offers Tailscale. Documentation: none. Target: next.\n\n## Fix\n');
+  const first = commit(repo, 'setup (#10)');
+  writeFileSync(join(repo, 'release/next.md'), '# Next\n\n## Feat\n\n- feat — Setup offers Tailscale. Documentation: none. Target: next.\n\n## Fix\n\n- No browser over SSH. Documentation: none. Target: next.\n');
+  const second = commit(repo, 'ssh (#11)');
+  const env = { ...process.env, HOME: root, ELANOUS_STATE_DIR: state, ELANOUS_CONFIG_DIR: state, ELANOUS_NEXUS_DIR: state };
+  const run = (cutoff: string) => spawnSync('bun', [resolve(import.meta.dir, 'cutoff.ts'), '--version', '9.9.9', '--baseline', baseline, '--cutoff', cutoff, '--json'], { cwd: repo, encoding: 'utf8', timeout: 60_000, env });
+  const result = run('HEAD');
+  expect(result.status).toBe(0);
+  const json = JSON.parse(result.stdout);
+  expect(json.in.map((entry: { sha: string; kind: string; line: string }) => [entry.sha, entry.kind, entry.line])).toEqual([[first, 'feat', 'Setup offers Tailscale.'], [second, 'fix', 'No browser over SSH.']]);
+  expect(json.fragments).toEqual({ byPr: 0, byNextMd: 2, unlinked: 0, unknown: 0 });
+  expect(json.escalate).toEqual([]);
+
+  writeFileSync(join(repo, 'release/next.md'), '# Next\n\n## Feat\n\n## Fix\n');
+  commit(repo, 'reset notes');
+  writeFileSync(join(repo, 'x.txt'), 'x');
+  commit(repo, 'feat: something without a note');
+  const empty = run('HEAD');
+  expect(JSON.parse(empty.stdout).escalate).toContainEqual({ kind: 'notes-empty', featFixLandings: 1, nextMdLines: 0 });
+}, 60_000);

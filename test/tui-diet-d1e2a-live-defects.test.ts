@@ -13,6 +13,7 @@ import { debug } from '../src/debug/log.js';
 import { createSearchModal } from '../src/chat/search/modal.js';
 import { parseAcpSlash } from '../src/dashboard/chat/acp-chat.js';
 import type { DashboardAcpChat } from '../src/dashboard/chat/acp-chat.js';
+import { createTurnStreamFormatter, type TurnStreamFormatterDeps } from '../src/dashboard/turn-stream-formatter.js';
 import type { Key } from '../src/tui.js';
 
 const identity = (s: string): string => s;
@@ -36,6 +37,29 @@ function backgroundContext(options: { modal?: () => never; rows?: unknown[]; tex
 }
 
 describe('TUI D1e-2a live defects', () => {
+  test('streaming tool progress uses singular for one call and plural for subsequent calls', () => {
+    const progress: string[] = [];
+    const deps: TurnStreamFormatterDeps = {
+      emit: () => {},
+      thinking: { update: label => progress.push(label), updateMetrics: () => {} },
+      termCols: () => 80,
+      wrapOpts: {},
+      formatResponse: () => [],
+      text: identity,
+      muted: identity,
+      ptyCallLine: () => null,
+      ptyResultLine: () => null,
+      renderToolCallEvent: () => [],
+      renderToolResultVariants: () => null,
+      toolRendering: {},
+      brainIcon: '🧠',
+    };
+    const formatter = createTurnStreamFormatter(deps);
+    formatter.onToolCall({ id: 'first', name: 'Read', args: {} });
+    formatter.onToolCall({ id: 'second', name: 'Read', args: {} });
+    expect(progress).toEqual(['Streaming Read (1 tool)', 'Streaming Read (2 tools)']);
+  });
+
   test('/bg survives an unregistered modal lifecycle type with one visible line', async () => {
     const { ctx, chatLines, scrollOffset } = backgroundContext({ modal: () => { throw new Error(missingModal); } });
     const log = spyOn(debug, 'log').mockImplementation(() => {});

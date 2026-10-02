@@ -38,6 +38,8 @@ export const FEATURE_MATURITY = {
     '/design-check': { pwa: 'tool' },
     '/control': { pwa: 'tool' },
     '/scheduler': { pwa: 'ops' },
+    '/ops/release': { pwa: 'ops' },
+    '/ops/checklist': { pwa: 'ops' },
     '/dashboard': { pwa: 'ops' },
     '/bots': { pwa: 'ops' },
     '/botlab': { pwa: 'ops' },

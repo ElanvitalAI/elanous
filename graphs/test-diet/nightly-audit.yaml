@@ -1,0 +1,18 @@
+# TD1b — whole-repository audits run alone; record their results and draft a card on failure.
+graph_id: nightly-audit
+loop:
+  title: 야간 저장소 감사
+  description: 게이트에서 제외한 감사 다섯 파일을 단독으로 재고 원장과 실패 카드 초안을 남긴다
+  trigger:
+    events: [manual]
+version: 1
+entry_node: audit
+terminal_nodes: [done, failed]
+nodes:
+  - { node_id: audit, kind: gate, recipe: 'cmd:audit', max_visits: 1 }
+  - { node_id: record, kind: judge, recipe: 'cmd:record', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: audit, on: outcome, map: { ok: record, fail: record, error: record } }
+  - { from: record, on: outcome, map: { ok: done, fail: failed, error: failed } }

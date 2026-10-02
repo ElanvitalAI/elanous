@@ -108,12 +108,16 @@ export function InstallBanner() {
 
   if (!visible) return null;
 
+  // ⛔ 고정 층(`fixed bottom-0`)으로 띄우지 않는다 — AppShell 세로 띠(`h-screen flex-col`)의 마지막 칸으로
+  //  자리를 차지해, 본문이 그만큼 줄고 채팅 입력칸이 띠 «위»에 남는다(10-02 0.2.9 릴리스 게이트 C2a·C2b 실측:
+  //  1280×800 에서 입력칸 가운데를 누르면 띠의 글이 클릭을 받아 입력이 안 됐다).
+
   return (
     <div
       role="dialog"
       aria-label="Install elanous to home screen"
       data-testid="install-banner"
-      className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-card/95 px-4 py-3 shadow-lg backdrop-blur"
+      className="shrink-0 border-t border-border bg-card/95 px-4 py-3 shadow-lg backdrop-blur"
     >
       <div className="mx-auto flex max-w-2xl items-start gap-3">
         <div className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-primary/30 bg-primary/10 text-primary">

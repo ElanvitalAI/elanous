@@ -301,6 +301,7 @@ import {
 import type { LLMProviderName } from '../../user-config.js';
 import { lookupLlmTierSpec } from '../../model-tier/index.js';
 import { listProviders } from '../../llm.js';
+import { enabledModels, loadCatalog } from '../../intelligence-map/model-catalog.js';
 import { selfOrchestrateRuntime } from '../../self-dev/self-orchestrate-runtime.js';
 import type { ToolRuntime } from '../../tool-runtime/types.js';
 import { getSessionCwd } from '../../session/working-dir.js';
@@ -742,6 +743,7 @@ export interface DashboardSlashContext {
       overviewLines(
         rotation: readonly { label: string; provider: string; model: string; current: boolean }[],
         providers: readonly { available: boolean; name: string; model: string | undefined }[],
+        catalogModelIds?: ReadonlySet<string>,
       ): readonly string[];
     };
     /** 2026-05-05 — open the visual model picker programmatically.
@@ -5281,6 +5283,13 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     const cfgNow = getUserConfig();
     const rot = cfgNow.llm.rotation;
     const curIdx = rot && rot.length > 0 ? currentRotationIndex(cfgNow) : -1;
+    let catalogModelIds: Set<string> | undefined;
+    try {
+      const loaded = loadCatalog();
+      if (loaded.source !== 'fallback') {
+        catalogModelIds = new Set(enabledModels(loaded.catalog).map((model) => model.id));
+      }
+    } catch { /* catalog unreadable: no stale-model verdict */ }
     ctx.chatLines.push(...ctx.provider.slashRuntime.overviewLines(
       (rot ?? []).map((entry, index) => ({
         label: rotationEntryLabel(entry),
@@ -5293,6 +5302,7 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
         name: provider.name,
         model: provider.model,
       })),
+      catalogModelIds,
     ));
     const currentRoute = currentRouteDecision('dashboard');
     if (currentRoute) ctx.chatLines.push(ctx.muted(`  current route: ${formatRouteDecisionSummary(currentRoute)}`));

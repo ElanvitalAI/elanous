@@ -277,7 +277,7 @@ export function ghPrReplier(target: string, run: (args: string[], stdin: string)
 
 /** Post as the automation App (not the machine's personal gh login — that would make 대표 a participant and mail them),
  *  with proxy variables removed (they break gh on the ops host). TC review #22660. */
-async function runGh(args: string[], stdin: string): Promise<number> {
+export async function runGh(args: string[], stdin: string): Promise<number> {
   const env: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !/^(https?|all|no)_proxy$/i.test(k)) env[k] = v;
   try {

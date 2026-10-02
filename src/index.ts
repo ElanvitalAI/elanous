@@ -10114,9 +10114,13 @@ tokenCmd
   .description('Rotate the ACP admin token')
   .option('--grace-ms <ms>', 'Previous-token grace period in milliseconds', (value: string) => Number(value))
   .option('--show-token', 'Print the complete new token')
-  .action(async (opts: { graceMs?: number; showToken?: boolean }) => {
+  .option('--sync-op-proxy', 'Update the configured op proxy bearer over SSH after rotation')
+  .action(async (opts: { graceMs?: number; showToken?: boolean; syncOpProxy?: boolean }) => {
     if (opts.graceMs !== undefined && (!Number.isFinite(opts.graceMs) || opts.graceMs < 0)) {
       throw new Error('--grace-ms must be a non-negative finite number');
+    }
+    if (opts.syncOpProxy && opts.showToken) {
+      throw new Error('--sync-op-proxy cannot be combined with --show-token');
     }
     const [{ rotateAdminToken }, { getElanousConfigDir }] = await Promise.all([
       import('./auth/token-store.js'),
@@ -10128,9 +10132,17 @@ tokenCmd
     });
     if (opts.showToken) {
       console.log(result.newActive);
-      return;
+    } else {
+      console.log(opts.syncOpProxy
+        ? `ACP admin token rotated: length=${result.newActive.length}`
+        : `ACP admin token rotated: length=${result.newActive.length} prefix=${result.newActive.slice(0, 4)}`);
     }
-    console.log(`ACP admin token rotated: length=${result.newActive.length} prefix=${result.newActive.slice(0, 4)}`);
+    const { readOpProxyConfig, finishOpProxyRotation } = await import('./cli/op-proxy-sync.js');
+    finishOpProxyRotation(readOpProxyConfig(), result.newActive, {
+      sync: opts.syncOpProxy === true,
+      tokenFile: `${getElanousConfigDir()}/acp-token`,
+      ...(opts.showToken ? { out: (line: string) => console.error(line) } : {}),
+    });
   });
 
 const acpCmd = program.command('acp').description('Agent Client Protocol — spawn ACP agents (claude-code, codex, gemini)');

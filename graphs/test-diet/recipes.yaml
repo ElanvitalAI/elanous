@@ -4,6 +4,9 @@ pick:
 measure:
   command: 'bun scripts/test-diet/node.ts measure'
   timeout_ms: 14400000
+audit:
+  command: 'bun scripts/test-diet/node.ts audit'
+  timeout_ms: 14400000
 record:
   command: 'bun scripts/test-diet/node.ts record'
   timeout_ms: 300000

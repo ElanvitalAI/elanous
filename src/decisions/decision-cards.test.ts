@@ -15,7 +15,10 @@ const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
 
 const VERSION = { released: '0.2.8', dev: '0.2.9-dev.0' };
-function ledgerAt(now = () => new Date('2026-10-02T03:00:00Z')): DecisionLedger {
+// 시험 시계 하나 — 원장과 카드 서비스가 «같은» 시계를 써야 한다. 서비스가 실제 시계를 쓰면 이 날짜(10-02 12:00 KST)가
+// 지난 순간부터 «기준선 뒤에 올라온 결정»이 아니게 되어 카드가 안 나간다(2026-10-02 12:2x main 실측 · 시한폭탄).
+const TEST_NOW = () => new Date('2026-10-02T03:00:00Z');
+function ledgerAt(now = TEST_NOW): DecisionLedger {
   const dir = mkdtempSync(join(tmpdir(), 'dec-tg-')); dirs.push(dir);
   return new DecisionLedger({ stateDir: dir, now, resolveVersion: () => VERSION as never });
 }
@@ -112,7 +115,7 @@ describe('DEC-TG decision cards', () => {
     const ledger = ledgerAt();
     const e = ledger.raise(base({ category: 'publish' }));
     const tg = new FakeTransport('telegram');
-    const service = new DecisionCardService({ transport: tg, ownerIds: ['111'], ledger });
+    const service = new DecisionCardService({ transport: tg, ownerIds: ['111'], ledger, now: TEST_NOW });
     await service.tick();
     const confirm = await service.tap('111', `dec:${e.id}:a`);
     expect(confirm.kind).toBe('confirm');
@@ -137,7 +140,7 @@ describe('DEC-TG decision cards', () => {
     const ledger = ledgerAt();
     const e = ledger.raise(base());
     const transport = new FakeTransport('telegram');
-    const service = new DecisionCardService({ transport, ownerIds: ['111'], ledger });
+    const service = new DecisionCardService({ transport, ownerIds: ['111'], ledger, now: TEST_NOW });
     let handler: ((q: { id: string; userId: number; chatId?: number; messageId?: number; data: string }) => Promise<void>) | null = null;
     const acks: string[] = []; let captures = 0;
     const bot = {
@@ -166,7 +169,7 @@ describe('DEC-TG decision cards', () => {
     } finally { stop(); }
     // Discord: a guild channel sends nothing; the DM does
     const dc = new FakeTransport('discord');
-    const dcService = new DecisionCardService({ transport: dc, ownerIds: ['999'], ledger });
+    const dcService = new DecisionCardService({ transport: dc, ownerIds: ['999'], ledger, now: TEST_NOW });
     expect(await discordDecisionsCommand(dcService, { userId: '999', channelId: 'guild-ch', isDm: false })).toBe('결정은 개인 대화(DM)에서만 볼 수 있습니다.');
     expect(dc.sent).toHaveLength(0);
     expect(await discordDecisionsCommand(dcService, { userId: '999', channelId: 'dm', isDm: true })).toContain(e.id);
@@ -193,7 +196,7 @@ describe('DEC-TG decision cards', () => {
       respondToInteraction: async (_id: string, _token: string, body: Record<string, unknown>) => { responses.push(body); },
       openDmChannel: async () => 'dm', sendMessageWithComponents: async () => ({ id: '1' }), editMessageWithComponents: async () => undefined, sendMessage: async () => null,
     } as never;
-    const service = new DecisionCardService({ transport: new FakeTransport('discord'), ownerIds: ['999'], ledger });
+    const service = new DecisionCardService({ transport: new FakeTransport('discord'), ownerIds: ['999'], ledger, now: TEST_NOW });
     const button = (user: string, custom: string) => ({ id: 'i', token: 't', type: 3, user: { id: user }, data: { custom_id: custom } });
     expect(await handleDiscordDecisionInteraction(bot, service, { type: 3, data: { custom_id: 'elanous-q:x' } })).toBe(false);
     await handleDiscordDecisionInteraction(bot, service, button('123', `dec:${e.id}:a`));
@@ -220,7 +223,7 @@ describe('DEC-TG decision cards', () => {
       isPolling: () => polling,
     } as never;
     const cfg = { telegram: { allowedUsers: [111] }, raw: {} } as never;
-    const service = new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger });
+    const service = new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW });
     const tickSpy = spyOn(service, 'tick');
     const stop = attachTelegramDecisionCards(bot, cfg, { service, tickMs: 5 });
     await Bun.sleep(25);
@@ -244,7 +247,7 @@ describe('DEC-TG decision cards', () => {
     try {
       const ledger = ledgerAt();
       const e = ledger.raise(base());
-      const service = new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger });
+      const service = new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW });
       await service.tick();
       await service.setNote('111', e.id, '비밀스러운 메모');
       await service.tap('222', `dec:${e.id}:a`);

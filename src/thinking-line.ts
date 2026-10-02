@@ -156,6 +156,14 @@ function renderLine(
   return `${applyColor(glyph, 'claude')} ${C.muted(message + '…')}${tail}`;
 }
 
+function stoppedMessage(message: string, status: ThinkingStatus): string {
+  const taskName = message.replace(/^(?:Streaming|Thinking)(?=\b|…)(?:\s*…)?\s*/, '').trim();
+  const task = taskName ? `${taskName} ` : '';
+  if (status === 'completed') return `${task}완료`;
+  if (status === 'interrupted') return `${task}중단됨`;
+  return `${task}실패`;
+}
+
 export function startThinking(opts: StartThinkingOpts): ThinkingHandle {
   let message = opts.message ?? 'Thinking';
   let messageFactory: ((frame: number) => string) | null = null;
@@ -222,20 +230,19 @@ export function startThinking(opts: StartThinkingOpts): ThinkingHandle {
       if (metrics.engine) detail.push(metrics.engine);
       const tail = detail.length ? '  ' + C.muted('(' + detail.join(' · ') + ')') : '';
       let finalText: string;
-      if (stopOpts?.finalText) {
+      if (stopOpts?.finalText !== undefined) {
         finalText = stopOpts.finalText;
-      } else if (status === 'completed') {
-        // Green tick + verb kept visible (not muted) so it stands out.
-        const currentMessage = messageFactory ? messageFactory(frame) : message;
-        finalText = `${applyColor(FIGURES.TICK, 'success')} ${C.success(currentMessage)}${tail}`;
-      } else if (status === 'interrupted') {
-        const currentMessage = messageFactory ? messageFactory(frame) : message;
-        finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.warning(currentMessage + ' · interrupted')}${tail}`;
       } else {
-        // failed
-        const err = stopOpts?.errorText ? ` — ${stopOpts.errorText}` : '';
         const currentMessage = messageFactory ? messageFactory(frame) : message;
-        finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.error(currentMessage + ' · failed' + err)}${tail}`;
+        const label = stoppedMessage(currentMessage, status);
+        if (status === 'completed') {
+          finalText = `${applyColor(FIGURES.TICK, 'success')} ${C.success(label)}${tail}`;
+        } else if (status === 'interrupted') {
+          finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.warning(label)}${tail}`;
+        } else {
+          const err = stopOpts?.errorText ? ` — ${stopOpts.errorText}` : '';
+          finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.error(label + err)}${tail}`;
+        }
       }
 
       // Freeze at tail if sticky='tail' — the indicator was tracking
@@ -310,18 +317,19 @@ export function startPinnedThinking(opts: StartPinnedThinkingOpts): ThinkingHand
       if (metrics.engine) detail.push(metrics.engine);
       const tail = detail.length ? '  ' + C.muted('(' + detail.join(' · ') + ')') : '';
       let finalText: string;
-      if (stopOpts?.finalText) {
+      if (stopOpts?.finalText !== undefined) {
         finalText = stopOpts.finalText;
-      } else if (status === 'completed') {
-        const currentMessage = messageFactory ? messageFactory(frame) : message;
-        finalText = `${applyColor(FIGURES.TICK, 'success')} ${C.success(currentMessage)}${tail}`;
-      } else if (status === 'interrupted') {
-        const currentMessage = messageFactory ? messageFactory(frame) : message;
-        finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.warning(currentMessage + ' · interrupted')}${tail}`;
       } else {
-        const err = stopOpts?.errorText ? ` — ${stopOpts.errorText}` : '';
         const currentMessage = messageFactory ? messageFactory(frame) : message;
-        finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.error(currentMessage + ' · failed' + err)}${tail}`;
+        const label = stoppedMessage(currentMessage, status);
+        if (status === 'completed') {
+          finalText = `${applyColor(FIGURES.TICK, 'success')} ${C.success(label)}${tail}`;
+        } else if (status === 'interrupted') {
+          finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.warning(label)}${tail}`;
+        } else {
+          const err = stopOpts?.errorText ? ` — ${stopOpts.errorText}` : '';
+          finalText = `${applyColor(FIGURES.CROSS, 'error')} ${C.error(label + err)}${tail}`;
+        }
       }
       opts.target.current = finalText;
       opts.onFrame();

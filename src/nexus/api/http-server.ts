@@ -155,11 +155,14 @@ import {
 import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
 import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
 import { dispatchPersonaRoute } from './personas.js';
+import { handleMe } from './operator.js';
+import { handleOpsApi } from './ops-api.js';
 import { handleRoleJudge } from './role-judge.js';
 import { handleAudioStt } from './audio-stt.js';
 import { handleLlmModels } from './llm-models.js';
 import { handleLlmHostsConfig } from './llm-hosts-config.js';
 import { handleLlmRotationGet, handleLlmRotationNext } from './llm-rotation.js';
+import { handleSetupClaim } from './setup-claim.js';
 import {
   handleLlmProvidersList,
   handleLlmProviderSet,
@@ -312,6 +315,7 @@ import {
   handleVoiceTranscribe,
   checkAuth,
   bearerCredential,
+  setupBearerScopeDenied,
   registerAuthPeerAddress,
   type MetaApiOpts,
 } from './meta-api.js';
@@ -826,6 +830,9 @@ export async function routeRequest(
   registerAuthPeerAddress(req, (server as BunServerLike & {
     requestIP?: (request: Request) => { address: string } | null;
   }).requestIP?.(req)?.address);
+  if (opts.metaApi && setupBearerScopeDenied(req, opts.metaApi)) {
+    return jsonResponse({ error: 'forbidden' }, 403);
+  }
 
   // PR c — try WS upgrade before HTTP routing. On undefined return the
   // bridge has accepted the upgrade (Bun completes the handshake) and
@@ -851,6 +858,12 @@ export async function routeRequest(
   const url = new URL(req.url);
   const { pathname } = url;
   const method = req.method;
+
+  // Operator proxy credentials are distinct from the owner bearer. The ops handler
+  // performs its own operatorSignal gate before reading any run or checklist data.
+  if (pathname === '/v1/ops' || pathname.startsWith('/v1/ops/')) {
+    return handleOpsApi(req, opts.metaApi);
+  }
 
   // Default-deny for every `/v1/` path that is not on PUBLIC_ROUTES.
   // Reuses checkAuth (same-origin exemption + constant-time bearer).
@@ -1520,6 +1533,10 @@ export async function routeRequest(
     if (pathname === '/v1/llm/rotation' && method === 'OPTIONS') {
       return handleLlmRotationGet(req);
     }
+    // The one-use link is verified by the claim handler, not by the owner bearer.
+    if (pathname === '/v1/setup/claim' && (method === 'POST' || method === 'OPTIONS')) {
+      return method === 'OPTIONS' ? corsPreflight('POST, OPTIONS') : handleSetupClaim(req);
+    }
     // PWA `/setup` wizard Phase 1 (2026-05-19) — LLM provider 첫 셋업.
     // POST 는 mutation 블록 안에서 등록 (memory `feedback_post_route_must_be_in_method_block`).
     // GET sibling 은 아래 GET-only 블록에 등록.
@@ -2153,6 +2170,9 @@ export async function routeRequest(
     }
     return jsonResponse({ error: 'static-not-wired' }, 404);
   }
+  // OPS1·OPS2 — whether this caller is an operator (draws the ops area). Answers everyone before any auth gate;
+  // false unless this daemon's config has operator.enabled.
+  if (pathname === '/v1/me' && req.method === 'GET') return handleMe(req, opts.metaApi ?? ({} as MetaApiOpts));
   if (pathname === '/v1/health') {
     return handleHealth(opts.state, opts.registry, {
       bindHost: bind.hostname,

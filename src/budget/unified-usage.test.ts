@@ -2,8 +2,9 @@
 
 import { describe, expect, it } from 'bun:test';
 import { Command } from 'commander';
+import { visibleWidth } from '../tui.js';
 import { grokUsageToSnapshot } from './fetchers/grok.js';
-import { collectUnifiedUsage, formatUnifiedUsage } from './unified-usage.js';
+import { collectUnifiedUsage, formatUnifiedUsage, formatUsageCompact } from './unified-usage.js';
 import { registerUsageCommand } from '../cli/usage-cli.js';
 import { executeUsageSlash } from '../skills/tools/usage-slash.js';
 import { parseGrokBilling } from '../grok/usage.js';
@@ -147,6 +148,140 @@ describe('collectUnifiedUsage — 계정 행 × 크레딧 축 × 구독 축', ()
   });
 });
 
+describe('formatUsageCompact — 계정별 한 줄 TUI 문면', () => {
+  it('주간·월간·일간을 번역하고 상대·기기 지역 시각으로 표기한다', async () => {
+    const nowMs = Date.parse('2026-10-28T12:14:00Z');
+    const report = await collectUnifiedUsage({
+      listCodexAccounts: () => [{ name: 'team', storeKey: 'team' }],
+      loadCodexHome: () => '/tmp/team',
+      fetchCodex: async () => codexSnap(25, 75, { resetsAt: nowMs + 3 * 3_600_000 }),
+      fetchGrok: async () => ({ status: 'ok', usage: parseGrokBilling({
+        creditUsagePercent: 42,
+        currentPeriod: { type: 'USAGE_PERIOD_TYPE_MONTHLY', start: '2026-10-01T00:00:00Z', end: '2026-10-29T19:14:10.427Z' },
+      })! }),
+      resolveGrokCredential: () => GROK_CREDENTIAL,
+    });
+    const lines = formatUsageCompact(report, { width: 160, nowMs });
+    expect(lines).toHaveLength(report.rows.length);
+    expect(lines[0]).toContain('codex team · 남은 75% · 주간 3시간 뒤에 다시 참 · 크레딧 10');
+    const local = new Date('2026-10-29T19:14:10.427Z');
+    const day = ['일', '월', '화', '수', '목', '금', '토'][local.getDay()];
+    expect(lines[1]).toContain(`grok default · 남은 58% · 월간 ${local.getMonth() + 1}/${local.getDate()} (${day}) ${String(local.getHours()).padStart(2, '0')}:${String(local.getMinutes()).padStart(2, '0')}에 다시 참`);
+    expect(lines.join('\n')).not.toMatch(/USAGE_PERIOD_TYPE|T\d\d:\d\d:\d\d|Z/);
+    expect(lines.every((line) => visibleWidth(line) <= 160)).toBe(true);
+    const grokCredits = report.rows[1]!.credits;
+    expect(grokCredits.status).toBe('ok');
+    if (grokCredits.status !== 'ok') throw new Error('expected grok credit axis');
+    const daily = { ...report, rows: [{ ...report.rows[1]!, credits: {
+      ...grokCredits, periodType: 'USAGE_PERIOD_TYPE_DAILY',
+    } }] };
+    expect(formatUsageCompact(daily, { width: 160, nowMs })[0]).toContain('일간');
+  });
+
+  it('크레딧은 큰 수에 쉼표를 찍고 작은 수는 소수 한 자리까지 표기하며 0은 0으로 쓴다', async () => {
+    const nowMs = Date.parse('2026-10-02T10:00:00Z');
+    const report = await collectUnifiedUsage({
+      listCodexAccounts: () => [{ name: 'default', storeKey: 'openai-codex' }],
+      loadCodexHome: () => '/tmp/default',
+      fetchCodex: async () => ({
+        ...codexSnap(89, 11, { resetsAt: nowMs + 3 * 3_600_000 }),
+        credits: { balance: 67226.7008331667, hasCredits: true, unlimited: false },
+      }),
+      resolveGrokCredential: () => null,
+    });
+    const row = report.rows[0]!;
+    if (row.credits.status !== 'ok') throw new Error('expected codex credit axis');
+    const options = { width: 120, nowMs };
+    const withBalance = (balance: number) => ({
+      ...report, rows: [{ ...row, credits: { ...row.credits, balance } }],
+    });
+    const cliReport = { ...report, rows: [{ ...row, credits: { ...row.credits, periodType: 'prepaid-usd' } }] };
+    expect(formatUnifiedUsage(cliReport)).toContain('89% ($67226.7008331667 left)');
+    expect(formatUsageCompact(report, options)).toEqual([
+      'codex default · 남은 11% · 주간 3시간 뒤에 다시 참 · 크레딧 67,227',
+    ]);
+    expect(formatUsageCompact(withBalance(22.3), options)).toEqual([
+      'codex default · 남은 11% · 주간 3시간 뒤에 다시 참 · 크레딧 22.3',
+    ]);
+    expect(formatUsageCompact(withBalance(0), options)).toEqual([
+      'codex default · 남은 11% · 주간 3시간 뒤에 다시 참 · 크레딧 0',
+    ]);
+  });
+
+  it('긴 계정명만 생략하고 숫자를 보존하며 모르는 축은 잔량 모름으로 쓴다', async () => {
+    const report = await collectUnifiedUsage({
+      listCodexAccounts: () => [{ name: '매우긴계정이름'.repeat(30), storeKey: 'team' }, { name: 'unknown', storeKey: 'unknown' }],
+      loadCodexHome: (key) => key,
+      fetchCodex: async ({ codexHome }) => {
+        if (codexHome === 'unknown') throw new Error('secret-token-should-not-leak');
+        return codexSnap(12.5, 87.5, { resetsAt: 0 });
+      },
+      resolveGrokCredential: () => null,
+    });
+    const lines = formatUsageCompact(report, { width: 80, nowMs: Date.parse('2026-10-28T12:14:00Z') });
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('… · 남은 87.5% · 주간 시각 모름 · 크레딧 10');
+    expect(lines[1]).toContain('unknown · 남은 잔량 모름 · 시각 모름');
+    expect(lines.join('\n')).not.toContain('secret-token-should-not-leak');
+    expect(lines.join('\n')).not.toContain('잔량 모름에 다시 참');
+    expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
+    const expired = formatUsageCompact({ ...report, rows: [{ ...report.rows[0]!, subscription: {
+      status: 'available' as const, remainingPercent: 87.5, windowKind: 'weekly' as const,
+      resetsAt: Date.parse('2026-10-27T12:14:00Z'),
+    } }] }, { width: 80, nowMs: Date.parse('2026-10-28T12:14:00Z') });
+    expect(expired[0]).toContain('재조회 필요');
+    expect(expired[0]).not.toContain('다시 참');
+  });
+
+  it('선불에 리셋을 지어내지 않고, 알 수 없는 기간과 제어문자 계정도 한 줄로 제한한다', async () => {
+    const report = await collectUnifiedUsage({
+      listCodexAccounts: () => [{ name: 'team\nnext', storeKey: 'team' }],
+      loadCodexHome: () => '/tmp/team',
+      fetchCodex: async () => codexSnap(40, 60),
+      resolveGrokCredential: () => null,
+      openRouterKey: () => 'test-key',
+      fetchOpenRouterImpl: (async () => new Response(JSON.stringify({ data: { total_credits: 60, total_usage: 1.36 } }))) as unknown as typeof fetch,
+    });
+    const prepaid = formatUsageCompact(report, { width: 160, nowMs: 1 })[1]!;
+    expect(prepaid).toContain('openrouter default · 남은 97.7% · 크레딧 58.6');
+    expect(prepaid).not.toContain('다시 참');
+    const codex = report.rows[0]!;
+    const unknownPeriod = { ...report, rows: [{ ...codex, subscription: { status: 'unavailable' as const, reason: 'query-does-not-supply' as const }, credits: {
+      ...codex.credits, status: 'ok' as const, periodType: 'USAGE_PERIOD_TYPE_YEARLY', usedPercent: 40,
+      periodStart: null, periodEnd: null, monthlyLimit: null, used: null, onDemandCap: null,
+      onDemandUsed: null, prepaidBalance: null, balance: null, hasCredits: null, unlimited: null,
+    } }] };
+    const line = formatUsageCompact(unknownPeriod, { width: 160, nowMs: 1 })[0]!;
+    expect(line).toContain('codex team next · 남은 60% · yearly 시각 모름');
+    expect(line).not.toContain('\n');
+  });
+
+  it('좁은 폭은 실제 셀 폭으로 제한하고 숫자의 일부를 출력하지 않는다', async () => {
+    const report = await collectUnifiedUsage({
+      listCodexAccounts: () => [{ name: '📦계정'.repeat(20), storeKey: 'team' }],
+      loadCodexHome: () => '/tmp/team',
+      fetchCodex: async () => codexSnap(12.5, 87.5),
+      resolveGrokCredential: () => null,
+    });
+    for (const width of [1, 2, 5, 10, 18, 25, 40]) {
+      const [line] = formatUsageCompact(report, { width, nowMs: 1 });
+      expect(visibleWidth(line!)).toBeLessThanOrEqual(width);
+      if (/\d/.test(line!)) expect(line).toContain('87.5%');
+    }
+    const [line] = formatUsageCompact(report, { width: 80, nowMs: 1 });
+    expect(visibleWidth(line!)).toBeLessThanOrEqual(80);
+    expect(line).toContain('87.5%');
+    expect(line).toContain('…');
+    expect(line).not.toMatch(/[\u200d\ufe0f](?=…)/u);
+    const emojiReport = { ...report, rows: [{ ...report.rows[0]!, accountName: '👩‍💻'.repeat(20) }] };
+    for (const width of [60, 61, 62, 63, 64, 65]) {
+      const [emojiLine] = formatUsageCompact(emojiReport, { width, nowMs: 1 });
+      expect(visibleWidth(emojiLine!)).toBeLessThanOrEqual(width);
+      expect(emojiLine).not.toMatch(/👩(?!‍💻)|👩‍(?!💻)/u);
+    }
+  });
+});
+
 describe('grokUsageToSnapshot — 크레딧 사용률을 RateWindow 에 넣지 않는다', () => {
   it('windows 는 비어 있고 credits 만 있다', () => {
     const snap = grokUsageToSnapshot(GROK_OK, 1);
@@ -158,6 +293,16 @@ describe('grokUsageToSnapshot — 크레딧 사용률을 RateWindow 에 넣지 �
 });
 
 describe('formatUnifiedUsage ⊕ CLI 가 같은 문면을 낸다', () => {
+  it('빈 리포트의 기존 CLI 문면을 그대로 유지한다', () => {
+    expect(formatUnifiedUsage({ rows: [], accountCounts: { codex: 0, grok: 0, openrouter: 0 } })).toBe([
+      'usage — 계정마다 한 행 · 크레딧 축과 구독 축은 각각 칸',
+      '  codex  accounts=0  (없음)',
+      '  grok  accounts=0  (없음)',
+      '  openrouter  accounts=0  (없음)',
+      '  provider    account     accounts  credits.usedPercent  credits.window              window-resets-in       reset-credit-expiry                  subscription',
+    ].join('\n'));
+  });
+
   it('유효한 종료 시각과 창 길이에서 종류를 유지한 날짜 범위를 표시하고 구조화 기간을 보존한다', async () => {
     const report = await collectUnifiedUsage({
       listCodexAccounts: () => [{ name: 'default', storeKey: 'openai-codex' }],
@@ -240,7 +385,10 @@ describe('formatUnifiedUsage ⊕ CLI 가 같은 문면을 낸다', () => {
       fetchGrok: async () => grokOk(),
       resolveGrokCredential: () => GROK_CREDENTIAL,
     });
-    expect(slash?.logLines.join('\n')).toBe(expected);
+    expect(slash?.logLines).toEqual([
+      ...formatUsageCompact(report, { width: 120, nowMs: Date.now() }),
+      '자세히: elanous usage',
+    ]);
   });
 });
 

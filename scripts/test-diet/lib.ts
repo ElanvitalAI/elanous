@@ -51,6 +51,7 @@ export function judge(m: Measurement, caught90: number): Judged {
 }
 
 export function ledgerPath(root: string): string { return join(root, 'test-diet', 'ledger.jsonl'); }
+export function nightlyAuditLedgerPath(root: string): string { return join(root, 'test-diet', 'nightly-audit.jsonl'); }
 
 export function lastLedgerLine(root: string): LedgerLine | null {
   const path = ledgerPath(root);

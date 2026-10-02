@@ -115,6 +115,19 @@ const baseDeps: PrLandDeps = {
   runIsolationGate: () => true,
   runExportLeakCheck: () => ({ measured: true, hits: [] }),
   isInteractive: () => false,
+  // Every real gate and lookup is stubbed: unstubbed, they scanned the real repository and called gh, taking ~3 s per
+  // landing test and timing out under gate-pod load (0.2.9 cut · introduced, 13/1 intermittently).
+  runMockModuleRestoreGate: () => true,
+  runModelHardcodeGate: () => true,
+  runDaemonPortGate: () => true,
+  runPublicLeakGate: () => 0,
+  runDocsCliCheck: () => [],
+  runTestInterferenceGate: async () => 0,
+  runAndroidGate: () => true,
+  runIosGate: () => true,
+  listOpenPrs: () => [],
+  sleep: async () => undefined,
+  now: () => NOW_MS,
 };
 
 function unixSeconds(ms: number): number {
@@ -262,7 +275,7 @@ describe('formatOverlapAdvisory preservation', () => {
 
 describe('pr land recent-landing-rate wiring', () => {
   it('emits the recent-landings line beside overlap, records observation, and does not block landing', async () => {
-    const nowSec = unixSeconds(Date.now());
+    const nowSec = unixSeconds(NOW_MS);
     const logOut = [
       landingLine('aaa111bbb222ccc333ddd444eee555fff666aaa', AUTHOR, nowSec * 1000 - 10 * MIN, 'docs(cli): one', 'src/land.ts'),
       landingLine('bbb222ccc333ddd444eee555fff666aaa111bbb', AUTHOR, nowSec * 1000 - 12 * MIN, 'docs(cli): two', 'src/land.ts'),
@@ -319,7 +332,7 @@ describe('pr land recent-landing-rate wiring', () => {
   });
 
   it('stays quiet and non-fatal when git config user.email is empty', async () => {
-    const nowSec = unixSeconds(Date.now());
+    const nowSec = unixSeconds(NOW_MS);
     const logOut = [
       landingLine('aaa111bbb222ccc333ddd444eee555fff666aaa', AUTHOR, nowSec * 1000 - 10 * MIN, 'docs(cli): one', 'src/land.ts'),
       landingLine('bbb222ccc333ddd444eee555fff666aaa111bbb', AUTHOR, nowSec * 1000 - 12 * MIN, 'docs(cli): two', 'src/land.ts'),
@@ -353,7 +366,7 @@ describe('pr land recent-landing-rate wiring', () => {
   });
 
   it('does not mix recent-landings into the overlap HITL path when only the rate fires', async () => {
-    const nowSec = unixSeconds(Date.now());
+    const nowSec = unixSeconds(NOW_MS);
     const logOut = [
       landingLine('aaa111bbb222ccc333ddd444eee555fff666aaa', AUTHOR, nowSec * 1000 - 10 * MIN, 'docs(cli): one', 'docs/other.md'),
       landingLine('bbb222ccc333ddd444eee555fff666aaa111bbb', AUTHOR, nowSec * 1000 - 12 * MIN, 'docs(cli): two', 'docs/other.md'),

@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { createGateRunner, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, type GateRunner } from './gate-node';
+import { createGateRunner, graphGateResult, judgeGate, parseOptions, POD_HEAVY_FILE_MB, POD_MEMORY_SOURCE, POD_SHARD_FILE_CAP, GATE_NIGHTLY_AUDITS, POD_SWEEP_INTEGRATION_ONLY, type GateRunner } from './gate-node';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.js';
 import { debug } from '../../src/debug/log.js';
@@ -1037,7 +1037,7 @@ test('graph pod cache wins over env, and blank graph cache falls back to env', a
   }
 });
 
-test('cut Pod sweep leaves baseline execution on the serial path when the baseline cache is absent', async () => {
+test('with no baseline cache, the baseline is swept on the same Pod pool as the cut (K9b)', async () => {
   const { root, instanceRoot, runner: fixtureRunner, calls } = fake([], [], false);
   const repo = join(root, 'repo');
   mkdirSync(repo);
@@ -1071,7 +1071,7 @@ test('cut Pod sweep leaves baseline execution on the serial path when the baseli
   const result = await judgeGate({ ...options(instanceRoot), repo, pod: { pool: 'pool-test', shards: 1 } }, runner);
   expect(result).toMatchObject({ outcome: 'ok', baselineSource: 'swept' });
   expect(sweptTrees.map((tree) => tree.split('/').at(-1))).toEqual(['cut', 'baseline']);
-  expect(podCalls).toBe(1);
+  expect(podCalls).toBe(2);
   expect(calls.filter((call) => call.startsWith(`add ${BASE}`))).toHaveLength(1);
 });
 
@@ -1186,6 +1186,50 @@ test('the Pod sweep never assigns an integration-only file and logs that it left
     expect(assigned).not.toContain('scripts/install.test.ts');
     expect(assigned.sort()).toEqual(['src/a.test.ts', 'src/b.test.ts']);
     expect(observations).toContainEqual({ category: 'release-loop.gate', event: 'pod-sweep-integration-only', data: { files: ['scripts/install.test.ts'] } });
+  } finally { log.mockRestore(); }
+});
+
+test('five nightly audits are absent from Pod shard plans, logged, and excluded from local group discovery', async () => {
+  expect(POD_SWEEP_INTEGRATION_ONLY).toEqual(['scripts/install.test.ts']);
+  expect(GATE_NIGHTLY_AUDITS).toEqual([
+    'test/f12-sweep.test.ts', 'scripts/unwired-exports.test.ts', 'test/guardian/dispatch-surface-contract.test.ts',
+    'test/pwa-build-typecheck.test.ts', 'test/user-config-mcp.test.ts',
+  ]);
+  const { root } = fixture();
+  const repo = join(root, 'repo');
+  mkdirSync(repo);
+  const files = [...GATE_NIGHTLY_AUDITS, 'src/a.test.ts', 'test/other.test.ts', 'scripts/other.test.ts'];
+  const commands: string[] = [];
+  const events: Array<{ category: string; event: string; data: unknown }> = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
+  try {
+    const runner = createGateRunner(repo, 'test-host', async (cmd, args) => {
+      if (cmd === 'rg') return { rc: 1, output: '' };
+      if (cmd === 'git' && args[0] === 'rev-parse') return { rc: 0, output: CUT };
+      if (cmd === 'git' && args[0] === 'ls-files') return { rc: 0, output: files.join('\n') };
+      if (cmd === 'bun') { commands.push(args.join(' ')); return { rc: 0, output: '1 pass\n0 fail\nRan 1 test across 1 file.\n' }; }
+      throw new Error(`unexpected ${cmd}`);
+    }, async (o) => {
+      commands.push(o.command[2]!);
+      const artifactsDir = join(root, o.name!);
+      mkdirSync(artifactsDir);
+      const count = ['src/a.test.ts', 'test/other.test.ts', 'scripts/other.test.ts'].filter((file) => o.command[2]!.includes(`'./${file}'`)).length;
+      writeFileSync(join(artifactsDir, 'shard.log'), `${count} pass\n0 fail\nRan ${count} tests across ${count} files.\n`);
+      writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
+      return { exitCode: 0, artifactsDir, job: 'fake' };
+    }, new PodPoolScheduler([{ context: 'pool-test', capacity: 1, k3dCluster: 'test' }]));
+    expect((await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 })).rc).toBe(0);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toContain("'./src/a.test.ts'");
+    expect(GATE_NIGHTLY_AUDITS.every((file) => !commands[0]!.includes(`'./${file}'`))).toBe(true);
+    expect(events).toContainEqual({ category: 'release-loop.gate', event: 'pod-sweep-nightly-audit', data: { files: [...GATE_NIGHTLY_AUDITS].sort() } });
+    commands.length = 0;
+    expect((await runner.sweep(repo)).rc).toBe(0);
+    expect(commands).toHaveLength(3);
+    for (const file of GATE_NIGHTLY_AUDITS) {
+      const group = file.startsWith('test/') ? './test' : './scripts';
+      expect(commands.find((cmd) => cmd.includes(group))).toContain(`--path-ignore-patterns ${file}`);
+    }
   } finally { log.mockRestore(); }
 });
 

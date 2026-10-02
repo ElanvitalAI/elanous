@@ -236,7 +236,7 @@ export function createTurnStreamFormatter(
     },
     onToolCall(call: TurnStreamCall): void {
       toolCallCount += 1;
-      deps.thinking.update(`Streaming ${call.name} (${toolCallCount} tools)`);
+      deps.thinking.update(`Streaming ${call.name} (${toolCallCount} ${toolCallCount === 1 ? 'tool' : 'tools'})`);
       const ptyLine = deps.ptyCallLine(call.name, call.args);
       if (ptyLine) {
         nonGenericCallIds.add(call.id);

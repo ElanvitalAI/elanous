@@ -69,6 +69,34 @@ describe('release checklist CLI', () => {
     }
   });
 
+  test('move · retitle · evidence add · history · export CLI 가 SQLite 기록과 JSON 스냅샷을 만든다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-features-cli-'));
+    setElanousConfigDir(dir);
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', ...args], { from: 'user' }); };
+    try {
+      await run('add', 'L13e', '옛 제목', '--version', '0.2.9');
+      await run('set', 'L13e', '--version', '0.2.9', '--status', 'green');
+      await run('retitle', 'L13e', '새 제목', '--version', '0.2.9');
+      await run('evidence', 'add', 'L13e', '#123', '--version', '0.2.9');
+      await run('move', 'L13e', '--from', '0.2.9', '--to', '0.2.10');
+      await run('history', 'L13e', '--json');
+      const rows = JSON.parse(lines.at(-1)!);
+      expect(rows.map((row: { field: string }) => row.field)).toEqual(['add', 'status', 'title', 'evidence.add', 'move']);
+      expect(rows.at(-1)).toMatchObject({ version: '0.2.10', from: '0.2.9', to: '0.2.10' });
+      await run('set', 'L13e', '--version', '0.2.10', '--owner', 'TC');
+      lines.length = 0;
+      await run('history', 'L13e');
+      expect(lines[0]).toMatch(/^L13e · 새 제목 · 담당 TC · 종류 - · 처음 \S+$/);
+      expect(lines[1]).toMatch(/^  근거 0\.2\.10 #123 \(\S+ \S+\)$/);
+      expect(listChecklist('0.2.9').items).toEqual([]);
+      expect(listChecklist('0.2.10').items[0]).toMatchObject({ title: '새 제목', status: 'green', evidence: '#123' });
+      await run('export', '--version', '0.2.10');
+      expect(JSON.parse(readFileSync(join(dir, 'release/0.2.10/checklist.json'), 'utf8'))).toEqual(listChecklist('0.2.10'));
+    } finally { output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  }, 15_000);
+
   test('판 번호가 다른 판의 별칭과 충돌해도 실제 판 번호를 우선한다', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'release-checklist-collision-'));
     setElanousConfigDir(dir);

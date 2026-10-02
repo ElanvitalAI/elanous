@@ -112,6 +112,16 @@ curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/unins
 
 If you run the background service, restart it after an update — see [troubleshooting](troubleshooting.md#the-service-still-runs-the-old-version).
 
+## Error reports
+
+When Elanous hits an error, it sends a short report to the Elanous team so we can fix it. This is on by default, and the first run prints one line that says so and how to turn it off.
+
+- **Sent:** the error code, the message and stack trace (secrets and your home directory removed, file paths cut to the file name), the Elanous version and commit, where it happened (terminal UI, web app, CLI or daemon), your OS and CPU type, whether the background service was running, and a random install ID that is not derived from your machine or account.
+- **Not sent:** your name, email or Telegram user — unless you turn that on yourself (`elanous config set errorReports.identity true` plus `errorReports.email`).
+- **How often:** the same error at most once an hour. If sending fails, one copy is kept and sent again the next time Elanous starts, at most once a day.
+- **Kept:** 30 days, then deleted automatically.
+- **Turn off:** `elanous config set errorReports.enabled false`
+
 ## Known limits
 
 - On Linux, `node-pty` has no prebuilt binary; elanous falls back to Bun's own PTY and nothing breaks. `elanous doctor --fix --yes` rebuilds it when a C++ toolchain is present.

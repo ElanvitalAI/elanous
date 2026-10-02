@@ -4,13 +4,14 @@ import { mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
-import { buildReleaseManifest, type ReleaseLanding } from '../../src/release-loop/manifest.js';
+import { buildReleaseManifest, parseNextMdNotes, type NextMdNote, type ReleaseLanding } from '../../src/release-loop/manifest.js';
 import { readReleaseNotes, releaseNotesDir } from '../../src/release-loop/release-note.js';
 import { queryRunningRuns } from '../../src/self-implement/running-runs.js';
 import { loadFederatedRunLedger } from '../../src/self-implement/run-ledger.js';
 
 const SEED = 'c1cc37478';
 const CLI_DOC = 'release/public/docs/cli.md';
+const NEXT_MD = 'release/next.md';
 
 function git(args: string[], optional = false): string | null {
   const result = spawnSync('git', args, { cwd: process.cwd(), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
@@ -59,6 +60,22 @@ function landingAt(sha: string, title: string): ReleaseLanding {
     ...(pr ? { prNumber: Number(pr[1]) } : {}), changedFiles,
     ...(goalPath ? { goalPath } : {}), ...(releaseTarget ? { releaseTarget } : {}),
   };
+}
+
+/** next.md lines at the cutoff, each tied to the last landing in range whose diff added that exact line. */
+function nextMdNotes(cutoff: string, landings: ReleaseLanding[]): NextMdNote[] {
+  const text = git(['show', `${cutoff}:${NEXT_MD}`], true);
+  if (!text) return [];
+  const addedBy = new Map<string, string>();
+  for (const landing of landings) {
+    if (!landing.changedFiles.includes(NEXT_MD)) continue;
+    const diff = requiredGit(['show', '-m', '--first-parent', '--format=', '-U0', landing.sha, '--', NEXT_MD]);
+    for (const line of diff.split('\n')) if (line.startsWith('+') && !line.startsWith('+++')) addedBy.set(line.slice(1).trim(), landing.sha);
+  }
+  return parseNextMdNotes(text).map((note) => {
+    const sha = note.raw ? addedBy.get(note.raw) : undefined;
+    return { kind: note.kind, line: note.line, ...(sha ? { sha } : {}) };
+  });
 }
 
 function runningGoalPaths(): string[] {
@@ -119,10 +136,11 @@ export function main(args: string[] = process.argv.slice(2)): void {
   const notes = readReleaseNotes(releaseNotesDir(instanceRoot));
   debug.log('release.notes', 'read', { fragments: notes.size, problems: notes.problems });
   const manifest = buildReleaseManifest({
-    version, baseline: { ref: baseline.ref, sha: baselineSha }, cutoff: { sha: cutoff }, landings, notes,
+    version, baseline: { ref: baseline.ref, sha: baselineSha }, cutoff: { sha: cutoff }, landings, notes, nextMd: nextMdNotes(cutoff, landings),
     runningGoalPaths: runningGoalPaths(), publicCommandsBefore: commandsAt(baselineSha), publicCommandsAfter: commandsAt(cutoff),
   });
   const output = { ...manifest, baselineSource: baseline.source };
+  debug.log('release-loop.notes', 'fragments', { version, ...manifest.fragments });
   const directory = join(instanceRoot, 'release', version);
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, 'manifest.json'), JSON.stringify(output, null, 2) + '\n');

@@ -55,7 +55,7 @@ function validate(markdown: string, kind: Kind): string {
   if (!/^# [^\n#]+$/u.test(lines[0] ?? '') || !lines.slice(1).join('').trim()) return 'title or body missing';
   const words = wordCount(markdown);
   if (words < 15 || words > limits[kind]) return `length must be 15–${limits[kind]} words`;
-  if (/\[[^\]]*\]|\{\{[^}]*\}\}|<[^>]+>|(?:TODO|TBD|작성 예정|내용 입력|빈칸)/iu.test(markdown)) return 'unfilled placeholder';
+  if (/\[[^\]]*\](?!\()|\{\{[^}]*\}\}|<[^>]+>|(?:TODO|TBD|작성 예정|내용 입력|빈칸)/iu.test(markdown)) return 'unfilled placeholder';
   if (/(?:게시|발행|발송|전송|결제)(?:\s*완료|했|됐|되었|하였)|\b(?:published|posted|sent|paid)\b/iu.test(markdown)) return 'unverified publication or transaction claim';
   if (kind === 'exec-onepager' && sections.some(section => {
     const match = new RegExp(`^## ${section}[ \\t]*\\r?\\n([\\s\\S]*?)(?=^## |$(?![\\s\\S]))`, 'mu').exec(markdown);

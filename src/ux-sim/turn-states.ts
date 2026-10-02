@@ -69,7 +69,7 @@ export function simLines(spec: TurnSimSpec): string[] {
     case 'idle': return [];
     case 'interrupted':
       return [...head, '  일부 답변이 여기까지 나왔습니다.', '',
-        '  ✘ Streaming · interrupted  (24s · ↓ 34 tokens)'];
+        '  ✘ 중단됨  (24s · ↓ 34 tokens)'];
     case 'streaming-with-subagents': {
       const n = Math.max(1, spec.children ?? 2);
       return [...head, ...Array.from({ length: n }, (_, i) =>

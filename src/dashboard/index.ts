@@ -881,6 +881,10 @@ import { getModelFamily, getModelTier } from '../models/prompts.js';
 import { buildPromptInjection, getPromptBankStore } from '../prompt-bank/index.js';
 import { getInputHistoryStore, inputHistoryDbPath, inputHistoryJsonPath } from '../input-history.js';
 import { inspectActiveProvider } from '../provider-summary.js';
+import { activeCodexAccountView } from '../oauth/codex-account-store.js';
+import { buildDashboardStatusLines } from './dashboard-status-lines.js';
+import { buildFirstScreenBand } from './first-screen-band.js';
+import { runNexusShow, type NexusShowResult } from '../cli/nexus-show.js';
 import {
   workingDirSegment, sessionCwdSegment, modelSegment, gitSegment,
   ctxBarSegment, costSegment, speedSegment, elapsedSegment, cacheSegment,
@@ -2098,6 +2102,35 @@ export function createDashboardLogSearchOpener(deps: {
     modalHandle = deps.display().pushModal(popup.surface);
     deps.draw();
   };
+}
+
+export function renderDashboardFirstScreenBand(input: {
+  readonly history: ReadonlyArray<{ role: string }>;
+  readonly lines: string[];
+  readonly width: number;
+  readonly draw: () => void;
+  readonly observe: (data: { daemon: boolean; hasPwa: boolean; hasTailnet: boolean }) => void;
+  readonly show?: () => Promise<Pick<NexusShowResult, 'status' | 'urls'>>;
+}): Promise<void> {
+  if (input.history.some((message) => message.role !== 'system')) return Promise.resolve();
+  const band = buildFirstScreenBand({ width: input.width, daemon: false });
+  input.lines.unshift(...band);
+  const show = input.show ?? (() => runNexusShow({ format: 'json', out: { log: () => {}, error: () => {} } }));
+  const observe = (data: { daemon: boolean; hasPwa: boolean; hasTailnet: boolean }): void => {
+    try { input.observe(data); } catch { /* observation cannot interrupt the transcript */ }
+  };
+  return Promise.resolve().then(show).then((result) => {
+    const daemon = result.status !== 'absent';
+    const pwa = result.urls?.pwa;
+    const hasPwa = !!pwa;
+    const hasTailnet = !!pwa?.tailnet;
+    observe({ daemon, hasPwa, hasTailnet });
+    if (input.lines[1] !== band[1]) return;
+    input.lines[1] = buildFirstScreenBand({ width: input.width, daemon, pwa })[1]!;
+    try { input.draw(); } catch { /* screen may have closed */ }
+  }).catch(() => {
+    observe({ daemon: false, hasPwa: false, hasTailnet: false });
+  });
 }
 
 export async function showDashboard(opts: ShowDashboardOptions = {}): Promise<DashboardAction> {
@@ -6330,19 +6363,34 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
     draw,
   });
 
-  const getDashboardStatusLines = () => [
-    'Dashboard status',
-    ...buildSessionDashboardStatusLines(resolveSessionSurfaceStatus({ chatModeState })).map(
-      line => `  ${line}`,
-    ),
-    `  view: ${workingDir.view}`,
-    `  focus: ${workingDir.focus}`,
-    `  cwd: ${workingDir.cwd}`,
-    `  preview: ${dockedPreview.sourceMode}`,
-    `  starterClosed: ${closedStarterPanes().length ? closedStarterPanes().map((pane) => paneLabel(pane)).join(', ') : 'none'}`,
-    `  chatOnly: ${effectiveChatOnlyMode() ? 'on' : 'off'}${chatOnlyMode ? ' (manual)' : ''}`,
-    `  acp: ${dashboardAcpChat.isBusy() ? 'busy' : 'idle'}`,
-  ];
+  let daemonAttached = false;
+  const getDashboardStatusLines = () => {
+    const cfg = getUserConfig();
+    const active = inspectActiveProvider(cfg);
+    const reasoningProvider = (['openai-codex', 'openai', 'anthropic', 'gemini', 'grok', 'local', 'openrouter'] as const)
+      .find(provider => active.provider === provider || active.provider === `auto:${provider}`);
+    return buildDashboardStatusLines({
+      provider: active.provider,
+      model: active.model,
+      reasoning: reasoningProvider
+        ? modelSupportsReasoning(reasoningProvider, active.model)
+          ? reasoningLevelLabel(effectiveReasoningLevel(cfg.llm, reasoningProvider, active.model))
+          : '미지원'
+        : undefined,
+      daemonAddress: opts.remote?.url,
+      daemonConnected: daemonAttached,
+      accountName: active.provider === 'openai-codex' || active.provider === 'auto:openai-codex'
+        ? activeCodexAccountView().name : undefined,
+      sessionSurfaceLines: buildSessionDashboardStatusLines(resolveSessionSurfaceStatus({ chatModeState })),
+      view: String(workingDir.view),
+      focus: workingDir.focus,
+      cwd: workingDir.cwd,
+      preview: dockedPreview.sourceMode,
+      starterClosed: closedStarterPanes().length ? closedStarterPanes().map((pane) => paneLabel(pane)).join(', ') : 'none',
+      chatOnly: `${effectiveChatOnlyMode() ? 'on' : 'off'}${chatOnlyMode ? ' (manual)' : ''}`,
+      acp: dashboardAcpChat.isBusy() ? 'busy' : 'idle',
+    });
+  };
 
   bootDashboardSlashExecutor({
     initDashboardSlashExecutor,
@@ -15397,6 +15445,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         ...(opts.remote ? {
           remote: opts.remote,
           onRemoteDisconnect: () => {
+            daemonAttached = false;
             pushChatLine(C.warning('  ⚠ 데몬 연결이 끊겼다 · 입력 중인 글은 그대로다 · 다시 붙으려면 TUI 를 다시 띄워라'));
             draw();
           },
@@ -15610,6 +15659,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         },
     });
     const dashboardAcpSession: DashboardSession = dashboardAcpBootResult.session;
+    daemonAttached = !!opts.remote && dashboardAcpBootResult.mode !== 'in-process';
     // ⭐ `B3` — 턴 중 발화를 «도는 턴»에 넣을 때 쓰는 키.
     try { acpSessionIdRef.current = dashboardAcpSession.currentSessionId ?? null; } catch { /* 없으면 넣지 않는다 */ }
     pushDebugLine(C.muted('[acp-boot] dashboard ACP session ready'));
@@ -15702,6 +15752,13 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
       }
     }
     chatScrollOffset = -1;
+    void renderDashboardFirstScreenBand({
+      history: chat.history,
+      lines: chatLines,
+      width: Math.max(0, termSize().cols - 4),
+      draw: () => draw(),
+      observe: (data) => { try { debug.log('dashboard.first-screen-band', 'resolved', data); } catch { /* observation is best-effort */ } },
+    });
 
     while (true) {
       draw();

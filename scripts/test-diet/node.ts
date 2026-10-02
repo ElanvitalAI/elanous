@@ -1,19 +1,20 @@
 #!/usr/bin/env bun
 // TD2 graph nodes: pick → measure → record. Shadow only — measures alone on a remote host and drafts a card.
-//   bun scripts/test-diet/node.ts pick|measure|record   (inside `elanous graph run graphs/test-diet/test-diet.yaml`)
+//   bun scripts/test-diet/node.ts pick|measure|audit|record (test-diet or nightly-audit graph)
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../../src/debug/log.js';
 import { effectiveInstanceRoot } from '../../src/instance/resolve.js';
-import { appendLedger, costTable, judge, lastLedgerLine, pickRange, writeCardDraft, type Measurement } from './lib.js';
+import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
+import { appendLedger, costTable, judge, lastLedgerLine, nightlyAuditLedgerPath, pickRange, writeCardDraft, type Measurement } from './lib.js';
 
-type Context = { input: Record<string, unknown>; outputs: Record<string, Record<string, unknown>> };
+type Context = { graphId?: string; input: Record<string, unknown>; outputs: Record<string, Record<string, unknown> | null> };
 function context(): Context {
   const at = process.env.ELANOUS_GRAPH_CONTEXT;
   if (!at) throw new Error('ELANOUS_GRAPH_CONTEXT required');
   const raw = JSON.parse(at.trimStart().startsWith('{') ? at : readFileSync(at, 'utf8')) as Partial<Context>;
-  return { input: raw.input ?? {}, outputs: raw.outputs ?? {} };
+  return { graphId: raw.graphId, input: raw.input ?? {}, outputs: raw.outputs ?? {} };
 }
 function emit(result: Record<string, unknown> & { outcome: 'ok' | 'fail' | 'error'; summary: string }): number {
   console.log(JSON.stringify({ verdict: result.outcome === 'ok' ? 'pass' : 'fail', ...result }));
@@ -34,8 +35,8 @@ function pick(ctx: Context): number {
 }
 
 /** One remote run: shallow clone of the mirror, one install, each file alone with its peak memory. */
-function measure(ctx: Context): number {
-  const picked = ctx.outputs.pick?.files;
+function measure(ctx: Context, audit = false): number {
+  const picked = audit ? [...GATE_NIGHTLY_AUDITS] : ctx.outputs.pick?.files;
   if (!Array.isArray(picked) || picked.length === 0) return emit({ outcome: 'fail', summary: 'nothing picked' });
   const host = typeof ctx.input.remote === 'string' ? ctx.input.remote : 'node-b';
   const mirror = typeof ctx.input.mirror === 'string' ? ctx.input.mirror : '~/mirror/elanous-agent.git';
@@ -59,18 +60,58 @@ function measure(ctx: Context): number {
     // A failing file names its first error, so an environment gap (e.g. no Java on the host) is not read as a test defect.
     '  why=""; [ "$rc" -ne 0 ] && why=$(grep -v -E "^\\s*$|^bun test|^ *[0-9]+ \\||^error: *$" "$T/err" | grep -m1 -E "Unable to|Cannot find|not found|ENOENT|EACCES|rror" | tr "\\t" " " | cut -c1-160)',
     '  printf "M\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n" "$f" "$e" "${rss:-}" "$rc" "${pass:-}" "${fail:-}" "$why"',
-    'done',
+    "done <<'TEST_DIET_FILES'", ...picked, 'TEST_DIET_FILES',
   ].join('\n');
-  const run = spawnSync('ssh', ['-o', 'BatchMode=yes', host, 'bash', '-s'], { input: `${script}\n${picked.join('\n')}\n`, encoding: 'utf8', timeout: 4 * 3600_000, maxBuffer: 16 * 1024 * 1024 });
-  // The file list follows the script on stdin; `read` in the loop consumes it.
-  if (run.status !== 0 && !String(run.stdout).includes('\nM\t')) return emit({ outcome: 'error', summary: `remote measure failed (rc=${run.status}): ${String(run.stderr).trim().slice(0, 200)}` });
-  const commit = /^COMMIT (\w+)/m.exec(run.stdout)?.[1] ?? '?';
+  const run = spawnSync('ssh', ['-o', 'BatchMode=yes', host, 'bash', '-s'], { input: `${script}\n`, encoding: 'utf8', timeout: 4 * 3600_000, maxBuffer: 16 * 1024 * 1024 });
+  const remoteError = run.status !== 0 ? `remote measure failed (rc=${run.status ?? 'no exit'}): ${String(run.error ?? run.stderr ?? '').trim().slice(0, 200)}` : undefined;
+  if (!audit && remoteError && !String(run.stdout).includes('\nM\t')) return emit({ outcome: 'error', summary: remoteError });
+  const commit = /^COMMIT (\w+)/m.exec(String(run.stdout))?.[1] ?? '?';
   const measurements: Measurement[] = String(run.stdout).split('\n').filter((l) => l.startsWith('M\t')).map((l) => {
     const [, file, secs, rss, rc, pass, fail, why] = l.split('\t');
     const num = (v: string | undefined) => (v === undefined || v === '' ? null : Number(v));
     return { file: file!, secs: Number(secs), rssMb: num(rss), rc: num(rc), pass: num(pass), fail: num(fail), ...(why ? { reason: why } : {}) };
   });
-  return emit({ outcome: measurements.length ? 'ok' : 'error', summary: `measured ${measurements.length}/${picked.length} on ${host} at ${commit.slice(0, 9)}`, host, commit, measurements });
+  const complete = measurements.length === picked.length && picked.every((file) => measurements.some((m) => m.file === file));
+  const summary = remoteError ?? `measured ${measurements.length}/${picked.length} on ${host} at ${commit.slice(0, 9)}`;
+  return emit({ outcome: audit ? complete && !remoteError ? 'ok' : 'error' : measurements.length ? 'ok' : 'error',
+    summary, host, commit, measurements, ...(remoteError ? { remoteError } : {}) });
+}
+
+function recordNightlyAudit(ctx: Context): number {
+  const m = ctx.outputs.audit;
+  const raw = Array.isArray(m?.measurements) ? m.measurements : [];
+  const measured = new Map<string, Measurement>();
+  for (const item of raw) {
+    if (!item || typeof item !== 'object' || !('file' in item) || typeof item.file !== 'string' || !GATE_NIGHTLY_AUDITS.includes(item.file)) continue;
+    const x = item as Partial<Measurement>;
+    if (measured.has(item.file) || typeof x.secs !== 'number' || !Number.isFinite(x.secs)
+      || (x.rssMb !== null && (typeof x.rssMb !== 'number' || !Number.isFinite(x.rssMb)))
+      || (x.rc !== null && (typeof x.rc !== 'number' || !Number.isInteger(x.rc)))
+      || (x.pass !== null && (typeof x.pass !== 'number' || !Number.isInteger(x.pass)))
+      || (x.fail !== null && (typeof x.fail !== 'number' || !Number.isInteger(x.fail)))) continue;
+    measured.set(item.file, x as Measurement);
+  }
+  const error = typeof m?.remoteError === 'string' ? m.remoteError
+    : m?.outcome === 'error' || m?.outcome === 'fail' || !m
+      ? typeof m?.summary === 'string' ? m.summary : 'audit execution produced no result' : undefined;
+  const results = GATE_NIGHTLY_AUDITS.map((file, index) => {
+    const found = measured.get(file);
+    const measurement: Measurement = found ?? { file, secs: 0, rssMb: null, rc: null, pass: null, fail: null,
+      reason: `not measured: ${typeof m?.summary === 'string' ? m.summary : error ?? 'audit result missing'}` };
+    // Even a complete set of file outputs cannot prove a clean audit when the remote process failed afterward.
+    return judge(error && measured.size === GATE_NIGHTLY_AUDITS.length && index === 0 && found
+      ? { ...found, rc: found.rc === 0 ? null : found.rc, reason: `${error}${found.reason ? `; ${found.reason}` : ''}` } : measurement, 1);
+  });
+  const line = { at: new Date().toISOString(), range: 'nightly-audit', start: 0, end: results.length - 1,
+    next: 0, total: results.length, commit: String(m?.commit ?? '?'), budgetSecs: 0, ...(error ? { error } : {}), results };
+  const root = effectiveInstanceRoot();
+  const path = nightlyAuditLedgerPath(root);
+  mkdirSync(join(root, 'test-diet'), { recursive: true });
+  appendFileSync(path, `${JSON.stringify(line)}\n`);
+  const card = writeCardDraft(root, line);
+  const failing = results.filter((r) => r.verdict === 'failing').length;
+  debug.log('test-diet', 'nightly-audit-recorded', { files: results.length, failing, card: card !== null });
+  return emit({ outcome: failing ? 'fail' : 'ok', summary: `nightly audit ${results.length} · failing ${failing}${card ? ' · card draft' : ''}`, failing, ledger: path, ...(card ? { card } : {}) });
 }
 
 function record(ctx: Context): number {
@@ -95,7 +136,8 @@ if (import.meta.main) {
   const step = process.argv[2];
   try {
     const ctx = context();
-    process.exitCode = step === 'pick' ? pick(ctx) : step === 'measure' ? measure(ctx) : step === 'record' ? record(ctx) : emit({ outcome: 'error', summary: `unknown step: ${step}` });
+    process.exitCode = step === 'pick' ? pick(ctx) : step === 'measure' ? measure(ctx) : step === 'audit' ? measure(ctx, true)
+      : step === 'record' ? (ctx.graphId === 'nightly-audit' || Object.hasOwn(ctx.outputs, 'audit') ? recordNightlyAudit(ctx) : record(ctx)) : emit({ outcome: 'error', summary: `unknown step: ${step}` });
   } catch (error) {
     process.exitCode = emit({ outcome: 'error', summary: error instanceof Error ? error.message : String(error) });
   }

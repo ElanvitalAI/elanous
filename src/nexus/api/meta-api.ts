@@ -16,6 +16,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { matchTempToken } from '../../auth/temp-tokens.js';
+import { matchSetupBearer } from '../../auth/setup-link-tokens.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { extname } from 'node:path';
 
@@ -215,6 +216,8 @@ type AuthReason =
   | 'untrusted-same-origin-peer'
   | 'bearer-match'
   | 'temp-token'
+  | 'setup-bearer'
+  | 'setup-scope-denied'
   | 'no-bearer-configured'
   | 'missing-auth-header'
   | 'bearer-length-mismatch'
@@ -248,8 +251,27 @@ export function registerAuthPeerAddress(req: Request, peerAddress: string | unde
   authPeerAddresses.set(req, peerAddress);
 }
 
+function setupRouteAllowed(req: Request): boolean {
+  const path = new URL(req.url).pathname;
+  if (path.startsWith('/v1/setup/')) return true;
+  return (req.method === 'POST' && path === '/v1/prompt/stream')
+    || (req.method === 'GET' && (
+      /^\/v1\/sessions\/store\/[^/]+$/.test(path) || path === '/v1/chat/events'
+    ));
+}
+
 function decideAuth(req: Request, opts: MetaApiOpts): { ok: boolean; reason: AuthReason } {
   if (opts.noAuth) return { ok: true, reason: 'noauth' };
+  const offered = req.headers.get('authorization');
+  if (offered?.startsWith('Bearer elsb_')) {
+    const owner = decideBearer(req, opts);
+    if (owner.ok) return owner;
+    const bearer = offered.slice('Bearer '.length).trim();
+    if (!matchSetupBearer(bearer)) return { ok: false, reason: 'bearer-mismatch' };
+    return setupRouteAllowed(req)
+      ? { ok: true, reason: 'setup-bearer' }
+      : { ok: false, reason: 'setup-scope-denied' };
+  }
   const peerAddress = authPeerAddresses.get(req);
   if (isSameOriginRequest(req, peerAddress)) return { ok: true, reason: 'same-origin' };
   const peerRejected = req.headers.get('sec-fetch-site') === 'same-origin'
@@ -292,6 +314,10 @@ export function bearerCredential(req: Request, opts: MetaApiOpts): 'noauth' | 'b
 // check — without duplicating security-sensitive code.
 const authDecisions = new WeakMap<Request, { ok: boolean; reason: AuthReason }>();
 
+export function setupBearerScopeDenied(req: Request, opts: MetaApiOpts): boolean {
+  return decideAuth(req, opts).reason === 'setup-scope-denied';
+}
+
 export function checkAuth(req: Request, opts: MetaApiOpts): boolean {
   const decision = decideAuth(req, opts);
   authDecisions.set(req, decision);
@@ -322,6 +348,7 @@ export function checkAuth(req: Request, opts: MetaApiOpts): boolean {
  * intentionally collapse here to avoid exposing token-length information. */
 function authFailureResponse(req: Request, opts: MetaApiOpts): Response {
   const decision = authDecisions.get(req) ?? decideAuth(req, opts);
+  if (decision.reason === 'setup-scope-denied') return jsonResponse({ error: 'forbidden' }, 403);
   return jsonResponse({ error: 'unauthorized', reason: publicAuthFailureReason(decision.reason) }, 401);
 }
 

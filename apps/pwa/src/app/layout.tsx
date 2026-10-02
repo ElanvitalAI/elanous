@@ -3,6 +3,7 @@ import './globals.css';
 import { Geist } from 'next/font/google';
 import { cn } from '@/lib/utils';
 import { DaemonProvider } from '@/components/providers/DaemonProvider';
+import { OperatorRoleDefault } from '@/components/providers/OperatorRoleDefault';
 import { NexusClientProvider } from '@/components/providers/NexusClientProvider';
 import { ThemeProvider } from '@/components/providers/ThemeProvider';
 import { ToastProvider } from '@/components/providers/ToastProvider';
@@ -59,6 +60,7 @@ export default function RootLayout({
         <ServiceWorkerRegister />
         <NewBuildBanner />
         <DaemonProvider>
+          <OperatorRoleDefault />
           <NexusClientProvider>
             <ThemeProvider>
               <TooltipProvider>

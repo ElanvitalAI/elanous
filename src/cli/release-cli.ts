@@ -24,6 +24,7 @@ import { getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { userConfigPath } from '../user-config.js';
 import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarizeChecklist, type ChecklistStatus, type ChecklistDisposition, type ChecklistKind } from '../release-loop/checklist.js';
+import * as features from '../release-loop/feature-store.js';
 import { writeStdoutJson } from './stdout-json.js';
 import { runUnattendedRelease, type UnattendedReleaseDeps } from '../../scripts/release-loop/unattended-release.js';
 import { releaseReadiness } from '../../scripts/release-loop/release-readiness.js';
@@ -492,7 +493,7 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
     .option('--version <v>', '판 또는 별칭(기본: package.json 의 개발판에서 -dev.N 제거)')
     .option('--json', '결과 JSON');
   const context = (cmd: Command) => {
-    const opts = { ...(cmd.parent?.opts() as { version?: string; json?: boolean }), ...(cmd.opts() as { version?: string; json?: boolean }) };
+    const opts = { ...(cmd.parent?.parent?.opts() as { version?: string; json?: boolean }), ...(cmd.parent?.opts() as { version?: string; json?: boolean }), ...(cmd.opts() as { version?: string; json?: boolean }) };
     const codenames = checklistCodenames();
     return { version: checklistVersion(opts.version, codenames), codenames, json: opts.json };
   };
@@ -533,6 +534,45 @@ export function registerReleaseCommands(program: Command, releaseRunDeps: Unatte
       const data = seedFromRoadmap(version, readFileSync(opts.from, 'utf8'));
       if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${version} ${data.items.length}칸`);
     });
+  const actor = () => process.env.ELANOUS_TRACK || 'cli';
+  withContext(checklist.command('move <id>').description('칸을 한 트랜잭션으로 다른 판에 옮긴다'))
+    .requiredOption('--from <v>', '현재 판').requiredOption('--to <v>', '새 판')
+    .action((id: string, opts: { from: string; to: string }, cmd: Command) => {
+      const { codenames, json } = context(cmd);
+      const from = checklistVersion(opts.from, codenames), to = checklistVersion(opts.to, codenames);
+      const data = features.move(id, from, to, actor());
+      if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${id} ${from} → ${to}`);
+    });
+  withContext(checklist.command('retitle <id> <title>').description('칸 제목 수정')).action((id: string, title: string, _opts: unknown, cmd: Command) => {
+    const { version, json } = context(cmd);
+    const snapshot = listChecklist(version);
+    features.retitle(id, title, actor(), snapshot.released, snapshot.dev);
+    if (json) console.log(JSON.stringify(listChecklist(version))); else console.log(`✅ ${id} 제목 수정`);
+  });
+  const evidence = checklist.command('evidence').description('칸의 PR·커밋 근거');
+  withContext(evidence.command('add <id> <ref>').description('근거 참조 추가')).action((id: string, ref: string, _opts: unknown, cmd: Command) => {
+    const { version, json } = context(cmd);
+    const snapshot = listChecklist(version);
+    features.evidenceAdd(id, version, ref, actor(), snapshot.released, snapshot.dev);
+    if (json) console.log(JSON.stringify(features.history(id))); else console.log(`✅ ${id} 근거 ${ref}`);
+  });
+  withContext(checklist.command('history <id>').description('칸의 판 이동·변경 이력')).action((id: string, _opts: unknown, cmd: Command) => {
+    const { json } = context(cmd);
+    const rows = features.history(id);
+    if (json) { console.log(JSON.stringify(rows)); return; }
+    const info = features.details(id);
+    if (info) {
+      console.log(`${info.id} · ${info.title} · 담당 ${info.owner ?? '-'} · 종류 ${info.kind ?? '-'} · 처음 ${info.createdAt}`);
+      for (const ev of info.evidence) console.log(`  근거 ${ev.version} ${ev.ref} (${ev.at} ${ev.by})`);
+    }
+    for (const row of rows) console.log(`${row.at} ${row.version} ${row.by} ${row.field}: ${JSON.stringify(row.from)} → ${JSON.stringify(row.to)}`);
+  });
+  withContext(checklist.command('export').description('SQLite 에서 checklist.json 스냅샷 생성')).action((_opts: unknown, cmd: Command) => {
+    const { version, json } = context(cmd);
+    const snapshot = listChecklist(version);
+    const data = features.exportJson(version, snapshot.released, snapshot.dev);
+    if (json) console.log(JSON.stringify(data)); else console.log(`✅ ${version} checklist.json 내보냄`);
+  });
   release.command('prepare')
     .description('깨끗한 원본 → 공개본 → 공개 저장소 이력 위 커밋 → PWA → 묶음·체크섬 → 로컬 끝까지 (네트워크 쓰기 없음)')
     .requiredOption('--version <x.y.z>', 'package.json 과 같은 버전(먼저 버전 PR 을 착지)')

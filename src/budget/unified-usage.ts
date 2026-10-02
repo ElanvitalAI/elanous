@@ -18,6 +18,7 @@ import { listCodexAccountsInStore } from '../oauth/codex-account-store.js';
 import { loadTokens } from '../oauth/store.js';
 import { envLiteral } from '../platform/env-literal.js';
 import { describeResetCreditExpiry } from './codex-reset-credit-state.js';
+import { visibleWidth } from '../tui.js';
 import { listCodexResetCredits, type CodexResetCreditsResult } from './codex-reset-credits.js';
 import type {
   AccountUsageRow,
@@ -266,6 +267,80 @@ async function collectOpenRouterRows(deps: UnifiedUsageDeps): Promise<AccountUsa
   } catch (err) {
     return [{ ...base, credits: { status: 'error', detail: err instanceof Error ? err.message : String(err) } }];
   }
+}
+
+export function formatUsageCompact(report: UnifiedUsageReport, options: { width: number; nowMs: number }): string[] {
+  return report.rows.map((row) => {
+    const credits = row.credits;
+    const subscription = row.subscription;
+    const remaining = subscription.status === 'available' && Number.isFinite(subscription.remainingPercent)
+      ? subscription.remainingPercent
+      : credits.status === 'ok' && credits.usedPercent !== null && Number.isFinite(credits.usedPercent)
+        ? Math.round((100 - credits.usedPercent) * 10) / 10
+        : null;
+    const period = subscription.status === 'available'
+      ? subscription.windowKind
+      : credits.status === 'ok' ? credits.periodType : null;
+    const reset = subscription.status === 'available' ? subscription.resetsAt
+      : credits.status === 'ok' && credits.periodEnd ? Date.parse(credits.periodEnd) : Number.NaN;
+    const periodLabel = period ? `${formatCompactPeriod(period)} ` : '';
+    const when = period === 'prepaid-usd' ? '' : !isValidEpochMs(reset)
+      ? ` · ${periodLabel}시각 모름`
+      : reset <= options.nowMs
+        ? ` · ${periodLabel}재조회 필요`
+        : ` · ${periodLabel}${formatCompactReset(reset, options.nowMs)}에 다시 참`;
+    const balance = credits.status === 'ok' && credits.balance !== null && Number.isFinite(credits.balance)
+      ? ` · 크레딧 ${new Intl.NumberFormat('en-US', { maximumFractionDigits: credits.balance >= 1_000 ? 0 : 1 }).format(credits.balance)}` : '';
+    const prefix = `${row.provider} `;
+    const name = row.accountName.replace(/[\r\n\t\x00-\x1f\x7f]/g, ' ');
+    const remainingLabel = `남은 ${remaining === null ? '잔량 모름' : `${remaining}%`}`;
+    const width = Number.isFinite(options.width) ? Math.max(0, Math.floor(options.width)) : 120;
+    const suffix = ` · ${remainingLabel}${when}${balance}`;
+    const available = width - visibleWidth(prefix) - visibleWidth(suffix);
+    if (available >= 1) {
+      const account = visibleWidth(name) <= available ? name
+        : available === 1 ? '…' : `${compactSlice(name, available - 1)}…`;
+      return `${prefix}${account}${suffix}`;
+    }
+    // The fixed labels can exceed very narrow widths even with no account name.
+    // Keep the measured value when possible rather than slicing its digits.
+    const essential = `${row.provider} · ${remainingLabel}`;
+    if (visibleWidth(essential) <= width) return essential;
+    if (visibleWidth(remainingLabel) <= width) return remainingLabel;
+    const value = remaining === null ? '잔량 모름' : `${remaining}%`;
+    if (visibleWidth(value) <= width) return value;
+    return width > 0 ? '…' : '';
+  });
+}
+
+function formatCompactPeriod(value: string): string {
+  const period = value.replace(/^USAGE_PERIOD_TYPE_/, '').toLowerCase();
+  switch (period) {
+    case 'weekly': return '주간';
+    case 'monthly': return '월간';
+    case 'daily': return '일간';
+    default: return period;
+  }
+}
+
+function formatCompactReset(reset: number, nowMs: number): string {
+  const remaining = reset - nowMs;
+  if (remaining < 86_400_000) {
+    if (remaining < 3_600_000) return `${Math.ceil(remaining / 60_000)}분 뒤`;
+    return `${Math.ceil(remaining / 3_600_000)}시간 뒤`;
+  }
+  const date = new Date(reset);
+  const weekdays = ['일', '월', '화', '수', '목', '금', '토'];
+  return `${date.getMonth() + 1}/${date.getDate()} (${weekdays[date.getDay()]}) ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function compactSlice(text: string, width: number): string {
+  let result = '';
+  for (const { segment } of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)) {
+    if (visibleWidth(result + segment) > width) break;
+    result += segment;
+  }
+  return result;
 }
 
 export function formatUnifiedUsage(report: UnifiedUsageReport): string {

@@ -50,6 +50,8 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/market',
   '/missions',
   '/morning',
+  '/ops/checklist',
+  '/ops/release',
   '/observatory',
   '/reflection',
   '/scheduler',
@@ -309,7 +311,7 @@ describe('탭 다이어트 — 메뉴 노출 등급', () => {
     SIDEBAR_NAV_ITEMS.filter((item) => (item.visibility ?? 'public') === level).map((item) => item.label);
 
   it('공개 메뉴는 핵심 탭만 — Missions = Autopilot ⊕ Tasks 한 메뉴(09-28 합침 · Tasks 는 주소로 열리고 Missions 가 켜진다)', () => {
-    expect(label('public')).toEqual(['Terminal', 'Chat', 'Intake', 'Approvals', 'Live', 'Trace', 'Missions', 'Design', 'Vault', '마켓', 'Schedules', 'Settings']);
+    expect(label('public')).toEqual(['Terminal', 'Chat', 'Intake', 'Approvals', 'Live', 'Trace', 'Missions', 'Design', 'Obsidian 노트', '마켓', 'Schedules', 'Settings']);
     const missions = SIDEBAR_NAV_ITEMS.find((i) => i.label === 'Missions')!;
     expect(missions.href).toBe('/autopilot');
     expect(missions.activeAlso).toEqual(['/tasks', '/missions']);

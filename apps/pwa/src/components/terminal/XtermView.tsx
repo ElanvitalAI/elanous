@@ -37,12 +37,13 @@ import {
   snapshotKey,
 } from '@/lib/snapshot';
 import { ACP_AUTH_HOWTO, ACP_AUTH_MESSAGE, classifyAcpFailure, reconnectDelayMs } from './acp-failure';
-import { touchScrollLines } from './touch-scroll';
+import { dispatchTouchWheel, touchScrollAction, touchScrollLines, touchWheelLines } from './touch-scroll';
 import { createXtermResizeController } from '@/lib/xterm-resize-controller';
 import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
 import { createTerminalInputSender } from './terminal-input-sender';
 import { registerTerminalInput } from './terminal-input-registry';
 import { shouldClear } from './terminal-clear';
+import { clampFontSize, fontStepKey, isFocusToggleKey, readTermFontSize, writeTermFontSize } from '@/lib/term-focus';
 
 interface Props {
   sessionId: string;
@@ -58,9 +59,15 @@ interface Props {
   onForeignInputActivity?: (info: { peerId: string; bytes: number; timestamp: number }) => void;
 }
 
+/** 새 셸의 «첫 출력»을 기다리는 입력 관문의 상한(ms). */
+export const SHELL_READY_CAP_MS = 2_000;
+
 export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = false, onForeignInputActivity }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
+  // TERM2 집중 모드 — 터미널 표면이 화면 전체를 덮는다(사이드바·머리 줄·독·칩을 하나씩 숨기지 않는다).
+  const hostRef = useRef<HTMLDivElement>(null);
+  const [focusMode, setFocusMode] = useState(false);
   const previousClearRequestRef = useRef<number | undefined>(undefined);
   const clearTerminalIdRef = useRef(terminalId);
   if (clearTerminalIdRef.current !== terminalId) {
@@ -113,7 +120,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       // Falls back to system JetBrains Mono / monospace if bundle is
       // mid-loading — `font-display: swap` makes the swap-in seamless.
       fontFamily: '"JetBrainsMono Nerd Font", "JetBrains Mono", monospace',
-      fontSize: 13,
+      fontSize: readTermFontSize(typeof window === 'undefined' ? null : window.localStorage),
       theme: {
         background: '#0d0c08',
         foreground: '#e9e3d4',
@@ -225,7 +232,10 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       let opened = false;
       openShell = (via) => { if (opened) return; opened = true; debugLog('webterm.shell.ready', { terminalId, via, ms: Date.now() - shellWaitStart }); resolve(); };
     });
-    const shellCap = setTimeout(() => openShell('cap-20s'), 20_000);
+    // TERM4 — 상한 20초 → 2초(대표 10-02 11:5x 폴드8 «바로 안 뜨고 키가 안 먹는다»). 운영 실측: 새 터미널의 관문이
+    //   매번 `cap-20s`(20.0~20.6초)로만 열렸다 — 프롬프트가 붙기 «전»에 이미 찍혀 «첫 출력»이 다시 오지 않는다.
+    //   셸은 프롬프트 전 입력도 버퍼에 받으므로 짧게 열어도 글자를 잃지 않는다.
+    const shellCap = setTimeout(() => openShell(`cap-${SHELL_READY_CAP_MS}ms`), SHELL_READY_CAP_MS);
     void acp.ready.then((daemonSid) => {
       if (!daemonSid) { openShell('no-session'); return; } // handshake failed — silent
       return acp.send('terminal/spawn', {
@@ -377,24 +387,43 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // up with the final container box. Mirrors ghostty's pattern of
     // mailing the resize to the IO thread regardless of whether the
     // grid actually changed (Surface.zig:2466-2481).
-    // 폰 터치 스크롤백 — xterm 6 은 터치 끌기로 스크롤하지 않는다(touch-scroll.ts 머리말).
+    // 폰 터치: 일반 화면은 스크롤백, 대체 화면은 xterm 휠(마우스 추적 / alternate scroll)에 맡긴다.
     const touchHost = ref.current;
-    let touchStart: { y: number; viewportY: number } | null = null;
+    let touchStart: { y: number; viewportY: number; wheelSent: number; bufferType: 'normal' | 'alternate' } | null = null;
     const onTouchStart = (e: TouchEvent) => {
       if (e.touches.length !== 1) { touchStart = null; return; }
-      touchStart = { y: e.touches[0].clientY, viewportY: term.buffer.active.viewportY };
+      touchStart = { y: e.touches[0].clientY, viewportY: term.buffer.active.viewportY, wheelSent: 0, bufferType: term.buffer.active.type };
     };
     const onTouchMove = (e: TouchEvent) => {
       if (!touchStart || e.touches.length !== 1) return;
-      const cellHeight = term.rows > 0 ? (term.element?.querySelector('.xterm-screen')?.getBoundingClientRect().height ?? 0) / term.rows : 0;
-      const lines = touchScrollLines({
-        startY: touchStart.y,
-        currentY: e.touches[0].clientY,
-        cellHeight,
-        startViewportY: touchStart.viewportY,
-        currentViewportY: term.buffer.active.viewportY,
-      });
-      if (lines !== 0) term.scrollLines(lines);
+      const bufferType = term.buffer.active.type;
+      if (bufferType !== touchStart.bufferType) {
+        touchStart = { y: e.touches[0].clientY, viewportY: term.buffer.active.viewportY, wheelSent: 0, bufferType };
+        return;
+      }
+      const screen = term.element?.querySelector('.xterm-screen');
+      const cellHeight = term.rows > 0 ? (screen?.getBoundingClientRect().height ?? 0) / term.rows : 0;
+      if (!(cellHeight > 0)) return;
+      const lines = bufferType === 'alternate'
+        ? touchWheelLines({ startY: touchStart.y, currentY: e.touches[0].clientY, cellHeight, sentSteps: touchStart.wheelSent })
+        : touchScrollLines({
+            startY: touchStart.y,
+            currentY: e.touches[0].clientY,
+            cellHeight,
+            startViewportY: touchStart.viewportY,
+            currentViewportY: term.buffer.active.viewportY,
+          });
+      const action = touchScrollAction({ bufferType, mouseTracking: term.modes.mouseTrackingMode, lines });
+      if (action.kind === 'scrollback') {
+        term.scrollLines(action.lines);
+        debugLog('webterm.touch-scroll', { kind: action.kind, lines: action.lines, bufferType });
+      } else if (action.kind === 'wheel') {
+        const target = term.element;
+        if (!target) return;
+        dispatchTouchWheel(target, action.steps, e.touches[0].clientX, e.touches[0].clientY);
+        touchStart.wheelSent += action.steps;
+        debugLog('webterm.touch-scroll', { kind: action.kind, steps: action.steps, bufferType });
+      }
     };
     const onTouchEnd = () => { touchStart = null; };
     touchHost.addEventListener?.('touchstart', onTouchStart, { passive: true });
@@ -503,9 +532,69 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
   const connectionTarget = terminalId.trim() || '대상 미지정';
   const connectingDurationSeconds = Math.max(0, Math.floor((now - connectingSince) / 1_000));
 
+  // TERM2 — Ctrl/⌘+Shift+F 로 켜고 끈다(BT 키보드). 여러 터미널이면 포커스를 가진 것, 없으면 화면의 첫 터미널.
+  useEffect(() => {
+    if (typeof document === 'undefined') return;
+    const owns = (): boolean => {
+      const host = hostRef.current;
+      if (!host) return false;
+      const active = document.activeElement;
+      if (active && host.contains(active)) return true;
+      const anyFocused = active ? active.closest?.('[data-xterm-host]') : null;
+      return !anyFocused && document.querySelector('[data-xterm-host]') === host;
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (isFocusToggleKey(e) && owns()) {
+        e.preventDefault(); e.stopPropagation();
+        setFocusMode((on) => !on);
+        return;
+      }
+      const step = fontStepKey(e);
+      const term = termRef.current;
+      if (step !== 0 && term && owns()) {
+        e.preventDefault(); e.stopPropagation();
+        const next = clampFontSize((term.options.fontSize ?? 13) + step);
+        term.options.fontSize = next;
+        writeTermFontSize(window.localStorage, next);
+        debugLog('webterm.focus-mode', { event: 'font', size: next });
+      }
+    };
+    document.addEventListener('keydown', onKey, true);
+    return () => document.removeEventListener('keydown', onKey, true);
+  }, []);
+
+  useEffect(() => {
+    debugLog('webterm.focus-mode', { event: focusMode ? 'on' : 'off', terminalId });
+    if (typeof document === 'undefined') return;
+    // 브라우저 전체 화면(폴드 크롬의 주소창까지) — 지원 안 하거나 거부돼도 화면 덮기는 그대로 된다.
+    try {
+      if (focusMode && !document.fullscreenElement) void document.documentElement.requestFullscreen?.().catch(() => {});
+      if (!focusMode && document.fullscreenElement) void document.exitFullscreen?.().catch(() => {});
+    } catch { /* fullscreen is optional */ }
+    if (focusMode) termRef.current?.focus();
+  }, [focusMode, terminalId]);
+
   return (
-    <div className="relative h-full w-full bg-[#0d0c08]">
+    <div
+      ref={hostRef}
+      data-xterm-host
+      data-focus-mode={focusMode ? '1' : undefined}
+      className={focusMode ? 'fixed inset-0 z-[90] h-[100dvh] w-screen bg-[#0d0c08]' : 'relative h-full w-full bg-[#0d0c08]'}
+    >
       <div ref={ref} className="h-full w-full" />
+      <button
+        type="button"
+        data-share-hide
+        onClick={() => setFocusMode((on) => !on)}
+        aria-pressed={focusMode}
+        aria-label={focusMode ? '집중 모드 끄기' : '집중 모드 — 터미널만 크게'}
+        title={focusMode ? '집중 모드 끄기 (Ctrl/⌘+Shift+F)' : '집중 모드 — 터미널만 크게 (Ctrl/⌘+Shift+F · 글자 Ctrl/⌘+Shift+±)'}
+        className={focusMode
+          ? 'absolute bottom-2 right-2 z-40 rounded bg-black/60 px-2 py-1 text-xs text-[#e9e3d4]/70 hover:text-[#e9e3d4]'
+          : 'absolute bottom-2 right-2 z-20 rounded bg-black/60 px-2 py-1 text-xs text-[#e9e3d4]/70 hover:text-[#e9e3d4]'}
+      >
+        {focusMode ? '⤡ 나가기' : '⤢ 집중'}
+      </button>
       {visibleInputError && (
         <div role="alert" className="pointer-events-none absolute bottom-2 left-2 right-2 rounded bg-red-950/95 px-3 py-2 text-sm text-red-100">
           터미널 입력 전송 실패: {visibleInputError.dropped}바이트가 버려졌습니다. 명령이 일부만 실행됐을 수 있습니다. 입력을 확인하고 다시 입력하세요.

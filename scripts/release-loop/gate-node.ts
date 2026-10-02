@@ -125,6 +125,14 @@ export const POD_MEMORY_SOURCE = 'docs/measurements/td1-whole-gate-mechanical-20
 export const POD_SHARD_FILE_CAP = 27;
 
 export const POD_SWEEP_INTEGRATION_ONLY: readonly string[] = ['scripts/install.test.ts'];
+/** Whole-repository audits run alone in the nightly test-diet graph, not in release-gate shards. */
+export const GATE_NIGHTLY_AUDITS: readonly string[] = [
+  'test/f12-sweep.test.ts', // Sweeps the whole repository; 7.8 GB even after TD1a.
+  'scripts/unwired-exports.test.ts', // Compiles and scans all exports; 9.9 GB.
+  'test/guardian/dispatch-surface-contract.test.ts', // Compiles repository-wide dispatch contracts; 8.3 GB.
+  'test/pwa-build-typecheck.test.ts', // Builds and typechecks the whole PWA; 4.2 GB.
+  'test/user-config-mcp.test.ts', // 2.1 GB peak; keep the gate below the 2 GB audit budget.
+];
 const tail40 = (output: string) => output.trimEnd().split(/\r?\n/).slice(-40).join('\n');
 const lastStartedTestFile = (output: string, paths: string[]): string | undefined => {
   let last: string | undefined;
@@ -211,9 +219,11 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
     // CDP 시험은 `test:deterministic` 이 스스로 뺀다 — 조각에 그것만 남으면 bun «시험 없음» exit 1 을 «불완전»으로 읽었다(09-30 G1d 실측 둘).
     // bun 의 탐색은 숨은 디렉터리(`.x/`)를 안 연다 — 사람의 `bun test` 가 한 번도 안 돌리는 빈 픽스처가 조각에 혼자 남아 «Ran 0 tests» 를 «불완전»으로 읽었다(09-30 G1e 5번 조각).
     const assignable = files.filter((file) => !cdpPatterns.includes(file) && !POD_SWEEP_INTEGRATION_ONLY.includes(file)
-      && !file.split('/').some((part) => part.startsWith('.')));
+      && !GATE_NIGHTLY_AUDITS.includes(file) && !file.split('/').some((part) => part.startsWith('.')));
     const integrationOnly = files.filter((file) => POD_SWEEP_INTEGRATION_ONLY.includes(file));
     if (integrationOnly.length) debug.log('release-loop.gate', 'pod-sweep-integration-only', { files: integrationOnly });
+    const nightlyAudits = files.filter((file) => GATE_NIGHTLY_AUDITS.includes(file));
+    if (nightlyAudits.length) debug.log('release-loop.gate', 'pod-sweep-nightly-audit', { files: nightlyAudits });
     if (!assignable.length) throw new Error('sweep incomplete: no tests ran');
     const durations = pod.durationSource ? readFileDurations(pod.durationSource) : new Map<string, number>();
     const memory = readFileMemory(join(tree, POD_MEMORY_SOURCE));
@@ -427,9 +437,10 @@ export function createGateRunner(repo: string, remote?: string, commandOverride?
       const outputs: string[] = [];
       let total = { pass: 0, fail: 0, errors: 0, ran: 0, files: 0 };
       for (const group of groups) {
-        if (!group.paths.length || !files.some((f) => group.paths.some((p) => f === p || f.startsWith(`${p}/`)))) continue;
+        if (!group.paths.length || !files.some((f) => !GATE_NIGHTLY_AUDITS.includes(f) && group.paths.some((p) => f === p || f.startsWith(`${p}/`)))) continue;
         const start = Date.now();
-        const groupIgnores = cdpPatterns.filter((pattern) => group.paths.some((p) => pattern === p || pattern.startsWith(`${p}/`)))
+        const groupIgnores = [...new Set([...cdpPatterns, ...GATE_NIGHTLY_AUDITS])]
+          .filter((pattern) => files.includes(pattern) && group.paths.some((p) => pattern === p || pattern.startsWith(`${p}/`)))
           .flatMap((pattern) => ['--path-ignore-patterns', pattern]);
         const run = await command('bun', ['run', 'test:deterministic', ...groupIgnores, ...group.paths.map(asPath)], tree);
         if (logDir) {
@@ -608,7 +619,10 @@ export async function judgeGate(opts: GateOptions, runner: GateRunner = createGa
     };
     let baseline: SweepFailures | undefined = trusted ? { failures: trusted.failures, errors: trusted.errors ?? [] } : undefined;
     if (!baseline) {
-      const baseRun = await runner.sweep(await getBaseTree(), join(root, 'release', opts.version, 'gate-logs', 'baseline'));
+      // K9b — with no reusable ledger the baseline is swept on the same Pod pool as the cut, not on this host (0.2.6: an
+      // hour of local baseline after a 23-minute Pod cut).
+      const baseRun = await runner.sweep(await getBaseTree(), join(root, 'release', opts.version, 'gate-logs', 'baseline'),
+        opts.pod ? { ...opts.pod, durationSource: join(ledger, 'release', opts.baselineVersion, 'gate-logs', 'cut') } : undefined);
       baseline = failuresOf(baseRun, 'baseline sweep');
     }
     for (const id of [...baseline.failures, ...baseline.errors, ...cut.failures, ...cut.errors]) fileOf(id);

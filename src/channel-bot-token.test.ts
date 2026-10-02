@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from './elanous-config-dir.js';
-import { getSecret, setSecret, useBackend } from './nexus/config/secrets/index.js';
+import { getSecret, setSecret, useBackend, registerBackend, resetBackendRegistry } from './nexus/config/secrets/index.js';
 import { probeChannelBotToken, resolveChannelBotToken, storeChannelBotToken } from './channel-bot-token.js';
 import { defaultTelegramOrigin } from './autopilot/mission-origin.js';
 import { createNexusTelegramTriggerBot } from './nexus/api/telegram-trigger-bot.js';
@@ -39,6 +39,7 @@ afterEach(() => {
     else process.env[name] = previous[i];
   });
   resetUserConfig();
+  resetBackendRegistry();
   resetElanousConfigDir();
   if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
   else process.env.XDG_CONFIG_HOME = previousXdg;
@@ -60,9 +61,32 @@ describe('channel bot credential precedence', () => {
       expect(resolveChannelBotToken(platform, config)).toEqual({ token: 'env', source: 'env' });
     });
     test(`${platform}: plaintext-only fallback`, () => {
-      expect(resolveChannelBotToken(platform, cfg(platform, marker))).toEqual({ token: marker, source: 'plaintext' });
+      expect(resolveChannelBotToken(platform, cfg(platform, marker))).toEqual({ token: marker, source: 'botToken' });
     });
   }
+});
+
+test('stale ref falls back to main channel (or the first), and emits no credential', () => {
+  const config = cfg('telegram', '');
+  config.tabs = { 'telegram:1': { tokenRef: 'ref:secret:missing' } };
+  config.telegram.channels = [
+    { name: 'other', botToken: 'first-token', chatId: 1, interactive: true, roles: [] },
+    { name: 'main', botToken: marker, chatId: 2, interactive: true, roles: [] },
+  ];
+  expect(resolveChannelBotToken('telegram', config)).toEqual({ token: marker, source: 'channels.main' });
+  config.telegram.channels = [config.telegram.channels[0]!];
+  expect(resolveChannelBotToken('telegram', config)).toEqual({ token: 'first-token', source: 'channels.main' });
+});
+
+test('unresolved ref identifies id and secrets path without printing the credential', () => {
+  const config = cfg('telegram', '');
+  config.tabs = { 'telegram:1': { tokenRef: 'ref:secret:missing-id' } };
+  expect(resolveChannelBotToken('telegram', config)).toEqual({ token: '', reason: `ref-id-missing missing-id in ${join(dir, 'secrets.json')}` });
+  expect(resolveChannelBotToken('discord', cfg('discord', ''))).toEqual({ token: '', reason: 'no-source' });
+  registerBackend({ id: 'keychain', get: async () => undefined, set: async () => {}, delete: async () => false,
+    list: async () => [], isAvailable: async () => ({ ok: true }) });
+  useBackend('keychain');
+  expect(resolveChannelBotToken('telegram', config)).toEqual({ token: '', reason: 'backend keychain not sync-readable' });
 });
 
 test('store keeps unrelated keys, removes plaintext, and publishes an atomic secret reference', async () => {
@@ -369,7 +393,29 @@ test('nexus poller wiring passes the resolved token to the trigger bot, preservi
 test('standalone telegram run rejects missing resolved token before polling', async () => {
   writeFileSync(join(dir, 'config.json'), JSON.stringify({ version: 1, global: {}, telegram: { enabled: true, allowedUsers: [] } }));
   resetUserConfig();
-  await expect(startTelegramPollers()).rejects.toThrow(/bot token/);
+  await expect(startTelegramPollers()).rejects.toThrow(/bot token 못 풂 — no-source/);
+});
+
+test('standalone telegram run acquires the main channel token without top-level botToken or secret', async () => {
+  const config = cfg('telegram', '');
+  config.telegram.poller = 'standalone';
+  config.telegram.channels = [{ name: 'main', botToken: marker, chatId: 19, interactive: true, roles: ['qa'] }];
+  config.tabs = { 'telegram:1': { tokenRef: 'ref:secret:missing' } };
+  writeFileSync(join(dir, 'config.json'), JSON.stringify({ version: 1, global: {}, ...config }));
+  resetUserConfig();
+  const seen: string[] = [];
+  const restore = setTelegramPollLockForTesting({
+    acquire: async token => {
+      seen.push(token);
+      return { ok: false, holder: null, path: join(dir, 'not-acquired'), waitedMs: 0 };
+    },
+    retry: async () => ({ ok: false }),
+  });
+  try {
+    const result = await startTelegramPollers();
+    expect(seen).toEqual([marker]);
+    expect(result.started).toHaveLength(0);
+  } finally { restore(); }
 });
 
 test('standalone telegram run selects the secret before trying to acquire its poll lock', async () => {

@@ -431,7 +431,14 @@ export interface SlashCommand {
 
 // Default commands available in the input
 export const SLASH_COMMANDS: SlashCommand[] = [
-  { name: 'directive', aliases: [], description: 'Record a directive as a Linear issue' },
+  { name: 'help',  aliases: ['?'],         description: '명령과 키 보기' },
+  { name: 'resume',    aliases: [],             description: '지난 대화 이어 가기 · /resume <id 앞자리>' },
+  { name: 'model',     aliases: ['m'],           description: '모델 바꾸기 — /model <codex|terra|sol|luna|opus|sonnet|grok> (list + current when no arg). OpenAI 는 Codex(Responses API)만. effort 는 /reasoning.', subcommands: ['codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },
+  { name: 'clear', aliases: ['cls'],       description: '대화 기록 지우기' },
+  { name: 'status', aliases: ['st'], description: '지금 상태 — 모델 · 연결 · 계정' },
+  { name: 'remaining', aliases: [], description: '계정별 남은 사용량' },
+  { name: 'setup', aliases: [], description: '상세 설정 — /setup · /setup reset(다음 실행 때 마법사 다시)', subcommands: ['help', 'reset'] },
+  { name: 'quit',  aliases: ['q', 'exit'], description: '나가기' },
   { name: 'run-skill', aliases: ['rs', 'run'], description: 'Execute a skill via its SKILL.md prompt' },
   { name: 'ad', aliases: [], description: 'Create an advertising plan from a URL, brief, or attached image' },
   // B4 — craft rulebook verdict, same resolution as `elanous repo design-check`
@@ -440,10 +447,8 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'design',    aliases: ['design-check'], description: 'Design rulebooks this repository declares · /design [--declared] · /design pick [number|id] to choose a design direction', subcommands: ['--declared', 'pick'] },
   { name: 'provider',  aliases: ['p'],          description: 'LLM providers — /provider (list) · next (cycle, also Alt+M / pill click) · use <name> · pick (visual picker) · reset', subcommands: ['next', 'use', 'pick', 'picker', 'menu', 'reset', 'list'] },
   { name: 'reasoning', aliases: ['r', 'think'],  description: 'Reasoning level (codex effort + summary, anthropic extended-thinking budget) — /reasoning [off|low|medium|high|xhigh] (cycle when no arg · xhigh 는 모델 상한이 xhigh 이상일 때만 wire 에 실린다, 아니면 high 로 깎인다)', subcommands: ['off', 'low', 'medium', 'high', 'xhigh'] },
-  { name: 'model',     aliases: ['m'],           description: 'Switch active model — /model <codex|terra|sol|luna|opus|sonnet|grok> (list + current when no arg). OpenAI 는 Codex(Responses API)만. effort 는 /reasoning.', subcommands: ['codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },
   { name: 'local',     aliases: ['ll'],         description: 'Local OpenAI-compatible LLM — ping / models / test / use', subcommands: ['ping', 'models', 'test', 'use', 'status'] },
   { name: 'session',   aliases: ['sess'],       description: 'Session resume — list / load / sync / new (handoff from mobile)', subcommands: ['list', 'load', 'sync', 'new'] },
-  { name: 'resume',    aliases: [],             description: 'Pick a past session, or load one by id prefix · /resume <id-prefix>' },
   { name: 'fork',      aliases: [],             description: 'Copy this session into a new one' },
   { name: 'rewind',    aliases: [],             description: 'Rewind — 과거 user 턴 픽커로 되감기 (원본 보존 · 새 세션 분기 · /rewind <n> 숏컷)' },
   // TUI 부활 C-a (2026-07-12): autopilot 미션 TUI 표면 — CLI 동등 단일 창구 소비.
@@ -454,12 +459,8 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'sync',  aliases: ['s'],         description: 'Enter sync mode' },
   { name: 'plugin', aliases: ['plugins'], description: 'Manage plugins', subcommands: ['list', 'activate', 'deactivate', 'reload'] },
   { name: 'widget', aliases: ['widgets'], description: 'Manage widgets', subcommands: ['list', 'reload', 'instances'] },
-  { name: 'clear', aliases: ['cls'],       description: 'Clear chat log' },
   { name: 'log',   aliases: [],             description: 'Chat Log controls — size / clear / filter / search / freeze / solo / turn / fold / help', subcommands: ['size', 'clear', 'filter', 'search', 'freeze', 'solo', 'turn', 'fold', 'help'] },
-  { name: 'help',  aliases: ['?'],         description: 'Show help overlay' },
-  { name: 'setup', aliases: [], description: 'Onboarding wizard guide — /setup (anchor) · /setup reset (re-run wizard on next boot)', subcommands: ['help', 'reset'] },
   { name: 'memory', aliases: ['mem'], description: 'Memory ops — list / show / search / add / delete (see `elanous memory --help`)', subcommands: ['list', 'show', 'search', 'add', 'delete', 'index'] },
-  { name: 'status', aliases: ['st'], description: 'Print the claude-code-style status pills (working dir + git + model)' },
   { name: 'export', aliases: [], description: 'Export this conversation transcript to a markdown file — /export [path] (default ~/temp/elanous-transcript-<stamp>.md)' },
   { name: 'delta', aliases: ['diffs'], description: 'Source delta browser — open the latest turn-scoped file diff popup', subcommands: ['open', 'help'] },
   { name: 'theme', aliases: [], description: 'Theme controls — list / switch / use / reset / preview / export', subcommands: ['list', 'switch', 'use', 'reset', 'preview', 'export'] },
@@ -486,7 +487,6 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'acp',    aliases: [], description: 'ACP chat — stream claude-code / codex / gemini replies into the chat pane (not a VW spawn). /acp codex points at the canonical codex app-server path; /acp cas is a synonym.', subcommands: ['claude', 'codex', 'gemini', 'cas', 'cancel', 'status', 'drop'] },
   { name: 'conv', aliases: [], description: 'Conversation widget/popup host — /conv list · /conv open <session-id> · /conv layout <cascade|tile|stack> · /conv focus <next|prev>.', subcommands: ['list', 'ls', 'open', 'layout', 'focus'] },
   { name: 'handoff', aliases: [], description: 'H5 P3 cross-agent context handoff: /handoff <from_session_id> <to_brand> [--channels r,p,m] [--prompt "prefix"]. Takes source session snapshot (filtered by channels if observer present) and launches target via adapter registry. Brands: codex · claude · claude-code · gemini · elanous.' },
-  { name: 'remaining', aliases: [], description: 'What each account has left' },
   { name: 'agent-room', aliases: [], description: 'H6 P4 VW agent-room — /agent-room <N> <brands...> · /agent-room list · /agent-room close <id> · N ∈ {2,3,4} · brands: codex/claude/gemini/elanous/auto/lll:<m>', subcommands: ['list', 'close', 'preset', 'help'] },
   { name: 'showroom', aliases: ['sr'], description: 'Showroom v2 multi-LLM lane composer — /showroom (default 2-pane) · /showroom <lane1> <lane2> [<lane3> [<lane4>]] · lane = role:provider[:transport] · roles plan/build/exec/review/reflect · pair with /lane and /relay for cross-lane handoffs.', subcommands: ['help'] },
   { name: 'reply',   aliases: [], description: 'H6 P5 AgentReply — /reply <target-session-id> <message...> · send message to a live session, capture the response · flags: --from · --channels r,m · --idle-ms · --timeout-ms', subcommands: ['help'] },
@@ -503,7 +503,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'qc',      aliases: [],          description: 'Quick-control — arm one-shot control mode; next message runs as control, then auto-return to chat.' },
   { name: 'voice-chat', aliases: ['vc'], description: 'Continuous voice chat mode — speak, elanous replies in voice (Phase 4-5). Subcommands: start / stop / cancel / status. Chord: Alt+R toggles enter/exit anywhere.', subcommands: ['start', 'stop', 'cancel', 'status'] },
   { name: 'auto-tts', aliases: ['tts', 'autotts'], description: 'Auto-TTS for chat responses (Phase 2) — speaks LLM replies sentence-by-sentence. Subcommands: on / off / toggle / status.', subcommands: ['on', 'off', 'toggle', 'status'] },
-  { name: 'quit',  aliases: ['q', 'exit'], description: 'Exit application' },
+  { name: 'directive', aliases: [], description: '(운영) 지시를 Linear 이슈로 기록' },
 ];
 
 /** Every user-visible slash spelling, normalized for runtime-catalog comparison. */

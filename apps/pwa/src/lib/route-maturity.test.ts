@@ -38,6 +38,8 @@ describe('PWA route maturity', () => {
     expect(ROUTE_MATURITY['/settings/devices']).toBe('broken');
     expect(ROUTE_MATURITY['/workflows/chat-ui']).toBe('broken');
     expect(ROUTE_MATURITY['/scheduler']).toBe('ops');
+    expect(ROUTE_MATURITY['/ops/release']).toBe('ops');
+    expect(ROUTE_MATURITY['/ops/checklist']).toBe('ops');
     expect(ROUTE_MATURITY['/settings']).toBe('beta');
     expect(ROUTE_MATURITY['/approvals']).toBe('tool');
     expect(ROUTE_MATURITY['/chat']).toBe('stable');

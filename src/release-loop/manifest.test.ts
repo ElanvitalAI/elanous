@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { buildReleaseManifest, type ReleaseManifestInput } from './manifest.js';
+import { buildReleaseManifest, parseNextMdNotes, type ReleaseManifestInput } from './manifest.js';
 import type { ReleaseNoteFragment } from './release-note.js';
 
 describe('buildReleaseManifest', () => {
@@ -76,5 +76,69 @@ describe('buildReleaseManifest', () => {
     expect(result.deferred).toEqual([
       { sha: 'both', reason: 'run-in-flight' },
     ]);
+  });
+});
+
+describe('release/next.md note lines (REL7)', () => {
+  const base = (over: Partial<ReleaseManifestInput>): ReleaseManifestInput => ({
+    version: '9.9.9', baseline: { ref: 'v9.9.8', sha: 'base' }, cutoff: { sha: 'cut' }, landings: [], notes: new Map(),
+    runningGoalPaths: [], publicCommandsBefore: [], publicCommandsAfter: [], ...over,
+  });
+
+  test('parses the kind from the heading or the «- kind — » prefix and drops Documentation/Target fields and later lines', () => {
+    expect(parseNextMdNotes([
+      '# Next', '', '## Internal', '', '- 내부 도구. Documentation: none. Target: next.', '',
+      '## Feat', '', '- feat — Setup offers Tailscale. Documentation: none (setup). Target: next.', '- Seats register intake sources.',
+      '- Deferred thing. Documentation: none. Target: later.', '', '## Fix', '', '- Over SSH no browser opens. Documentation: none. Target: next.',
+    ].join('\n')).map(({ kind, line }) => ({ kind, line }))).toEqual([
+      { kind: 'internal', line: '내부 도구.' },
+      { kind: 'feat', line: 'Setup offers Tailscale.' },
+      { kind: 'feat', line: 'Seats register intake sources.' },
+      { kind: 'fix', line: 'Over SSH no browser opens.' },
+    ]);
+  });
+
+  test('three landings that added next.md lines render those lines; only the rest stay unknown', () => {
+    const result = buildReleaseManifest(base({
+      landings: [
+        { sha: 'a', title: 'A (no PR fragment)', changedFiles: ['release/next.md'], prNumber: 1 },
+        { sha: 'b', title: 'B', changedFiles: ['release/next.md'], prNumber: 2 },
+        { sha: 'c', title: 'C', changedFiles: ['release/next.md'] },
+        { sha: 'd', title: 'D internal', changedFiles: ['src/x.ts'], prNumber: 4 },
+      ],
+      nextMd: [{ kind: 'feat', line: 'One', sha: 'a' }, { kind: 'feat', line: 'Two', sha: 'b' }, { kind: 'fix', line: 'Three', sha: 'c' }],
+    }));
+    expect(result.in.map((entry) => [entry.sha, entry.kind, entry.line])).toEqual([['a', 'feat', 'One'], ['b', 'feat', 'Two'], ['c', 'fix', 'Three'], ['d', 'unknown', 'D internal']]);
+    expect(result.fragments).toEqual({ byPr: 0, byNextMd: 3, unlinked: 0, unknown: 1 });
+    expect(result.escalate).toEqual([]);
+  });
+
+  test('a PR fragment wins over the next.md line of the same landing', () => {
+    const fragment: ReleaseNoteFragment = { pr: 1, line: 'From PR', kind: 'fix', docs: { none: 'x' }, target: 'next', source: 'pr-body' };
+    const result = buildReleaseManifest(base({
+      landings: [{ sha: 'a', title: 'A', changedFiles: ['release/next.md'], prNumber: 1 }],
+      notes: new Map([[1, fragment]]), nextMd: [{ kind: 'feat', line: 'From next.md', sha: 'a' }],
+    }));
+    expect(result.in).toEqual([{ sha: 'a', title: 'A', prNumber: 1, docs: 'n/a', line: 'From PR', kind: 'fix' }]);
+    expect(result.fragments).toEqual({ byPr: 1, byNextMd: 0, unlinked: 0, unknown: 0 });
+  });
+
+  test('a next.md line no landing claims is still IN, counted as unlinked', () => {
+    const result = buildReleaseManifest(base({ landings: [{ sha: 'a', title: 'A', changedFiles: [] }], nextMd: [{ kind: 'feat', line: 'Orphan' }] }));
+    expect(result.in.at(-1)).toEqual({ sha: '', title: 'Orphan', docs: 'n/a', line: 'Orphan', kind: 'feat' });
+    expect(result.fragments?.unlinked).toBe(1);
+  });
+
+  test('feat/fix landings with no user line at all escalate notes-empty', () => {
+    const result = buildReleaseManifest(base({
+      landings: [{ sha: 'a', title: 'feat: one', changedFiles: [] }, { sha: 'b', title: 'fix: two', changedFiles: [] }], nextMd: [],
+    }));
+    expect(result.escalate).toEqual([{ kind: 'notes-empty', featFixLandings: 2, nextMdLines: 0 }]);
+  });
+
+  test('without next.md input the manifest shape is unchanged (no fragments, no notes-empty)', () => {
+    const result = buildReleaseManifest(base({ landings: [{ sha: 'a', title: 'feat: one', changedFiles: [] }] }));
+    expect(result.fragments).toBeUndefined();
+    expect(result.escalate).toEqual([]);
   });
 });

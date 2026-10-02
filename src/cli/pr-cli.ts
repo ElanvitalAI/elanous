@@ -115,6 +115,8 @@ export interface PrLandDeps {
   /** iOS 시험 게이트 심(시험 주입용). */
   runIosGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   isInteractive?: () => boolean;
+  /** Clock for the recent-landings window (test seam · default Date.now). */
+  now?: () => number;
   requestConfirmation?: (opts: ConfirmOpts) => Promise<ConfirmResult>;
   overlapConfirmChannels?: ConfirmChannel[];
   overlapConfirmTimeoutMs?: number;
@@ -822,11 +824,12 @@ function emitRecentLandingRateAdvisory(
   cwd: string,
   commits: readonly { subject: string; authorEmail: string; committedAtMs: number }[] | null,
   out: { log: (message: string) => void },
+  now: () => number = Date.now,
 ): boolean {
   const windowMinutes = RECENT_LANDING_WINDOW_MINUTES;
   const authorEmail = currentAuthorEmail(run, cwd);
   if (!authorEmail || commits === null) {
-    const previous = commits === null ? undefined : previousLandingSummary(commits, Date.now());
+    const previous = commits === null ? undefined : previousLandingSummary(commits, now());
     record('recent-landing-rate', true, {
       recentCount: 0,
       windowMinutes,
@@ -836,7 +839,7 @@ function emitRecentLandingRateAdvisory(
     });
     return false;
   }
-  const nowMs = Date.now();
+  const nowMs = now();
   const recentCount = countRecentLandings(commits, {
     authorEmail,
     nowMs,
@@ -1077,6 +1080,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     cwd,
     collectResolvedBaseLandings(run, cwd, DEFAULT_GRANULARITY_SINCE, base),
     out,
+    deps.now,
   );
 
   // ⛔ local-path / no-remote 는 gh 가 원리상 못 한다. 이미 아는 자리에서 멈춘다.

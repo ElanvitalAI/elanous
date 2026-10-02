@@ -775,6 +775,22 @@ export function defaultTelegramCommands(): TgSlashCommand[] {
         return service.listOpen(String(ctx.chatId));
       },
     },
+    ...(['coo', 'cto', 'cmo', 'cxo'] as const).map((command) => ({
+      name: command,
+      description: `${command.toUpperCase()} 자리에 일을 넘깁니다 — /${command} <할 일> (조율 채널 ⊕ 자리 메시지함)`,
+      handler: async (args: string[], ctx: { chatId: number; userId: number }) => {
+        const [{ handleCeoSeatCommand }, { telegramDecisionOwner }, { runGh }, { getUserConfig }, { openMsgStore }] = await Promise.all([
+          import('./seat-dispatch/ceo-commands.js'), import('./decisions/telegram-decision-cards.js'), import('./decisions/decision-cards.js'),
+          import('./user-config.js'), import('./msg/msg-store.js'),
+        ]);
+        const cfg = getUserConfig();
+        const replyTarget = (cfg.raw?.decisions as { replyGhPr?: unknown } | undefined)?.replyGhPr;
+        return handleCeoSeatCommand(command, args, ctx, {
+          ownerId: telegramDecisionOwner(cfg), replyTarget: typeof replyTarget === 'string' ? replyTarget : null, runGh,
+          append: (message) => { const store = openMsgStore(); try { return store.append(message); } finally { store.close(); } },
+        });
+      },
+    })),
     {
       name: 'work',
       description: '글을 알맞은 곳(흡수·태스크·하니스)에 넣고 결과를 여기로 답합니다 — /work [absorb|tasks|graph] <글>',

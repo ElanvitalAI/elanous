@@ -58,7 +58,7 @@ describe('release checklist ledger', () => {
     ]);
     seedFromRoadmap('0.2.5', markdown);
     expect(listChecklist('0.2.5').items.find((i) => i.id === 'K4')).toMatchObject({ status: 'green', evidence: '#99999' });
-    expect(statSync(join(dir, 'release/0.2.5/checklist.json')).mode & 0o777).toBe(0o600);
+    expect(statSync(join(dir, 'release/features.sqlite')).mode & 0o777).toBe(0o600);
     expect(seedFromRoadmap('0.2.5', '| K99 | 새 칸 | 🟡 대기 |').released).toBe('');
     expect(seedFromRoadmap('0.2.5', '| K98 | 상태 미상 | 대기 |').items.find((i) => i.id === 'K98')?.status).toBe('yellow');
   });
@@ -72,15 +72,38 @@ describe('release checklist ledger', () => {
     const data = listChecklist('9.9.9');
     expect(data.items.map((item) => item.id).sort()).toEqual(['A', 'B', 'C', 'D'].flatMap((actor) => Array.from({ length: 12 }, (_, n) => `${actor}${n}`)).sort());
     expect(data.history.map((entry) => entry.id).sort()).toEqual(data.items.map((item) => item.id).sort());
-    expect(statSync(join(dir, 'release/9.9.9/checklist.json.mutex.sqlite')).mode & 0o777).toBe(0o600);
-  });
+    expect(statSync(join(dir, 'release/features.sqlite')).mode & 0o777).toBe(0o600);
+  }, 15_000);
+
+  test('옛 JSON을 수입한 판은 다른 프로세스의 BEGIN IMMEDIATE 동안에도 listChecklist가 잠금 해제 전 스냅샷을 준다', async () => {
+    const dir = root();
+    const version = '9.9.9';
+    const path = join(dir, 'release', version);
+    mkdirSync(path, { recursive: true });
+    writeFileSync(join(path, 'checklist.json'), JSON.stringify({ version, released: '', dev: devVersion(), items: [
+      { id: 'K1', title: '수입한 칸', status: 'yellow', updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'OP' },
+    ], history: [] }));
+    expect(listChecklist(version).items[0]?.title).toBe('수입한 칸');
+    const lockScript = `import { Database } from 'bun:sqlite'; import { join } from 'node:path'; const db = new Database(join(process.argv[1], 'release/features.sqlite')); db.exec('BEGIN IMMEDIATE'); db.query('UPDATE assignments SET status = ? WHERE feature_id = ? AND version = ?').run('red', 'K1', '9.9.9'); process.stdout.write('locked\\n'); setInterval(() => {}, 1000);`;
+    const holder = Bun.spawn(['bun', '-e', lockScript, dir], { cwd: join(import.meta.dir, '..', '..'), stdout: 'pipe', stderr: 'pipe' });
+    try {
+      const reader = holder.stdout.getReader();
+      const first = await reader.read();
+      expect(new TextDecoder().decode(first.value).trim()).toBe('locked');
+      reader.releaseLock();
+      const snapshot = listChecklist(version);
+      expect(holder.exitCode).toBeNull();
+      expect(snapshot.items).toMatchObject([{ id: 'K1', status: 'yellow', title: '수입한 칸' }]);
+    } finally { holder.kill(); await holder.exited; }
+    expect(listChecklist(version).items[0]?.status).toBe('yellow');
+  }, 8000);
 
   test('살아 있는 작성자의 잠금이 같은 판의 addItem을 막고 종료 뒤 해제된다', async () => {
     const dir = root();
     const cwd = join(import.meta.dir, '..', '..');
-    const lockScript = `import { Database } from 'bun:sqlite'; import { join } from 'node:path'; const db = new Database(join(process.argv[1], 'release/9.9.9/checklist.json.mutex.sqlite'), { create: true }); db.exec('BEGIN IMMEDIATE'); process.stdout.write('locked\\n'); setInterval(() => { if (!db.inTransaction) throw new Error('lock lost'); }, 1000);`;
+    const lockScript = `import { Database } from 'bun:sqlite'; import { join } from 'node:path'; const db = new Database(join(process.argv[1], 'release/features.sqlite'), { create: true }); db.exec('BEGIN IMMEDIATE'); process.stdout.write('locked\\n'); setInterval(() => { if (!db.inTransaction) throw new Error('lock lost'); }, 1000);`;
     const writeScript = `import { setElanousConfigDir } from './src/elanous-config-dir.ts'; import { addItem } from './src/release-loop/checklist.ts'; setElanousConfigDir(process.argv[1]); addItem('9.9.9', { id: 'K1', title: 'recover' }); process.stdout.write('written\\n');`;
-    mkdirSync(join(dir, 'release/9.9.9'), { recursive: true });
+    listChecklist('9.9.9'); // Initialize the WAL database before the competing writer holds its transaction.
     const holder = Bun.spawn(['bun', '-e', lockScript, dir], { cwd, stdout: 'pipe', stderr: 'pipe' });
     let writer: ReturnType<typeof Bun.spawn> | undefined;
     try {
@@ -92,7 +115,7 @@ describe('release checklist ledger', () => {
       writer = Bun.spawn(['bun', '-e', writeScript, dir], { cwd, stdout: 'pipe', stderr: 'pipe' });
       const whileLocked = await Promise.race([writer.exited.then((code) => `exited ${code}`), Bun.sleep(500).then(() => 'waiting')]);
       expect(whileLocked).toBe('waiting');
-      expect(listChecklist('9.9.9').items).toHaveLength(0);
+      expect(listChecklist('9.9.9').items).toEqual([]);
       holder.kill();
       await holder.exited;
       expect(await Promise.race([writer.exited, Bun.sleep(4000).then(() => -1)])).toBe(0);
@@ -149,7 +172,7 @@ describe('release checklist ledger', () => {
       expect(listChecklist('9.9.9').released).toBe('1.0.0');
       expect(listChecklist('9.9.9').history[0]?.released).toBe('0.10.0');
       expect(seen).toContainEqual({ version: '9.9.9', id: 'K1', field: 'status', from: 'yellow', to: 'red', by: 'T' });
-      expect(statSync(join(dir, 'release/9.9.9/checklist.json')).mode & 0o777).toBe(0o600);
+      expect(statSync(join(dir, 'release/features.sqlite')).mode & 0o777).toBe(0o600);
       removeItem('9.9.9', 'K1', 'S');
       expect(listChecklist('9.9.9').history.at(-1)).toMatchObject({ id: 'K1', field: 'remove', by: 'S', released: '1.0.0', dev: devVersion() });
       expect(listChecklist('9.9.9').items).toEqual([]);

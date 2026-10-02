@@ -5,8 +5,10 @@
 // without touching caller code. The legacy module re-exports this
 // backend's accessor functions to preserve backwards compatibility.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync, copyFileSync, unlinkSync, chmodSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
+import { acquireLockSync } from '../../../storage/file-lock.js';
 import { SECRETS_VERSION, type SecretsFile } from '../types.js';
 import { secretsPath } from '../paths.js';
 import type { SecretBackend, SecretBackendAvailability, SyncReadableBackend } from './types.js';
@@ -21,20 +23,47 @@ function readSecretsFile(): SecretsFile {
   try {
     const raw = readFileSync(path, 'utf-8');
     const parsed = JSON.parse(raw) as Partial<SecretsFile>;
-    if (parsed.version !== SECRETS_VERSION) return defaultSecrets();
-    return {
-      version: SECRETS_VERSION,
-      secrets: (parsed.secrets ?? {}) as Record<string, string>,
-    };
-  } catch {
-    return defaultSecrets();
+    if (parsed?.version !== SECRETS_VERSION || !parsed.secrets || typeof parsed.secrets !== 'object'
+      || Array.isArray(parsed.secrets) || Object.values(parsed.secrets).some(value => typeof value !== 'string')) {
+      throw new Error('invalid secrets file version or contents');
+    }
+    return { version: SECRETS_VERSION, secrets: parsed.secrets };
+  } catch (error) {
+    throw new Error(`cannot read secrets file at ${path}`, { cause: error });
   }
 }
 
 function writeSecretsFile(s: SecretsFile): void {
   const path = secretsPath();
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(s, null, 2), { mode: 0o600 });
+  const tmp = `${path}.${randomUUID()}.tmp`;
+  const backupTmp = `${path}.${randomUUID()}.bak.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(s, null, 2), { mode: 0o600, flag: 'wx' });
+    if (existsSync(path)) {
+      copyFileSync(path, backupTmp);
+      chmodSync(backupTmp, 0o600);
+      renameSync(backupTmp, `${path}.bak`);
+    }
+    renameSync(tmp, path);
+  } finally {
+    if (existsSync(tmp)) unlinkSync(tmp);
+    if (existsSync(backupTmp)) unlinkSync(backupTmp);
+  }
+}
+
+function modifySecretsFile(change: (s: SecretsFile) => boolean): boolean {
+  const path = secretsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const release = acquireLockSync(`${path}.lock`);
+  try {
+    const s = readSecretsFile();
+    if (!change(s)) return false;
+    writeSecretsFile(s);
+    return true;
+  } finally {
+    release();
+  }
 }
 
 const syncReadable: SyncReadableBackend = {
@@ -46,16 +75,14 @@ export const fileBackend: SecretBackend = {
   id: 'file',
   async get(id) { return syncReadable.getSync(id); },
   async set(id, value) {
-    const s = readSecretsFile();
-    s.secrets[id] = value;
-    writeSecretsFile(s);
+    modifySecretsFile(s => { s.secrets[id] = value; return true; });
   },
   async delete(id) {
-    const s = readSecretsFile();
-    if (!(id in s.secrets)) return false;
-    delete s.secrets[id];
-    writeSecretsFile(s);
-    return true;
+    return modifySecretsFile(s => {
+      if (!Object.hasOwn(s.secrets, id)) return false;
+      delete s.secrets[id];
+      return true;
+    });
   },
   async list() { return syncReadable.listSync(); },
   async isAvailable(): Promise<SecretBackendAvailability> {
@@ -74,5 +101,16 @@ export function readSecretsFileRaw(): SecretsFile {
 }
 
 export function writeSecretsFileRaw(s: SecretsFile): void {
-  writeSecretsFile(s);
+  if (s.version !== SECRETS_VERSION || !s.secrets || typeof s.secrets !== 'object'
+    || Array.isArray(s.secrets) || Object.values(s.secrets).some(value => typeof value !== 'string')) {
+    throw new Error('invalid secrets file version or contents');
+  }
+  const path = secretsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  const release = acquireLockSync(`${path}.lock`);
+  try {
+    writeSecretsFile(s);
+  } finally {
+    release();
+  }
 }

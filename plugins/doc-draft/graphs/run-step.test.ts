@@ -168,6 +168,20 @@ test('check refuses placeholders, missing one-pager section, false publication, 
   }
 }, 30000);
 
+test('a Markdown link is not an unfilled placeholder (운영 실측 10-02 — [elanous.ai](https://…) 가 오판됐다)', async () => {
+  const linked = good['promo-post'].replace('주최 측 확인 후 추가합니다.', '주최 측 확인 후 추가합니다. 자세한 안내는 [elanous.ai](https://elanous.ai) 에서 볼 수 있습니다.');
+  const f = await graphRun({ kind: 'promo-post', topic: 'Event' }, { DOC_DRAFT_BAD_DRAFT: linked });
+  try {
+    expect(f.state.status).toBe('done');
+    expect(f.state.path).toEqual(['draft', 'check', 'report', 'done']);
+  } finally { f.cleanup(); }
+  const bare = await graphRun({ kind: 'promo-post', topic: 'Event' }, { DOC_DRAFT_BAD_DRAFT: good['promo-post'] + ' [회사 이름]' });
+  try {
+    expect(bare.state.status).toBe('failed');
+    expect(String(bare.state.nodes[1]?.output)).toContain('unfilled placeholder');
+  } finally { bare.cleanup(); }
+}, 30000);
+
 test('ask runs from an empty temporary folder, uses bare JSON with legacy fallback, and never invokes publish/send/pay', async () => {
   const f = fixture();
   const caller = join(f.root, 'caller');

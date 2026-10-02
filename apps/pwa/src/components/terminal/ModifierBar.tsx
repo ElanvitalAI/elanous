@@ -32,6 +32,7 @@ import {
   type ModifierKey,
   type ModifierState,
 } from '@/lib/key-sequences';
+import { isHardwareKeyEvidence, readHardwareKeyboard, writeHardwareKeyboard } from '@/lib/hw-keyboard';
 
 interface Props {
   terminalId: string;
@@ -60,6 +61,27 @@ export function ModifierBar({ terminalId }: Props) {
   const { sessionId } = useDaemon();
   const [ctrl, setCtrl] = useState(false);
   const [alt, setAlt] = useState(false);
+  // TERM4 — 물리(BT) 키보드가 한 번이라도 잡히면 키 줄을 접는다(기기마다 기억 · «⌨ 보조 키»로 다시 편다).
+  const [hwKeyboard, setHwKeyboard] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    setHwKeyboard(readHardwareKeyboard(window.localStorage));
+    const onKey = (e: KeyboardEvent) => {
+      if (!isHardwareKeyEvidence(e, navigator.userAgent)) return;
+      setHwKeyboard((seen) => {
+        if (seen) return seen;
+        writeHardwareKeyboard(window.localStorage, true);
+        debugLog('webterm.modifier-bar.hw-keyboard', { key: e.key.length === 1 ? 'char' : e.key });
+        return true;
+      });
+    };
+    document.addEventListener('keydown', onKey, true);
+    return () => document.removeEventListener('keydown', onKey, true);
+  }, []);
+  const showBar = useCallback(() => {
+    writeHardwareKeyboard(window.localStorage, false);
+    setHwKeyboard(false);
+  }, []);
   // Refs let callbacks stay stable while reading current modifier state.
   const ctrlRef = useRef(false);
   const altRef = useRef(false);
@@ -144,6 +166,16 @@ export function ModifierBar({ terminalId }: Props) {
         ? 'border-amber-400 bg-amber-100 text-amber-900 dark:border-amber-500 dark:bg-amber-900 dark:text-amber-100'
         : 'border-border bg-card text-muted-foreground hover:bg-muted hover:border-primary hover:text-foreground',
     ].join(' ');
+
+  if (hwKeyboard) {
+    return (
+      <div className="flex items-center border-b border-border bg-background/60 px-2 py-0.5" data-testid="modifier-bar-collapsed">
+        <button type="button" onClick={showBar} className="rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:text-foreground" title="물리 키보드가 잡혀 접었다 — 누르면 Esc·Tab·화살표 키 줄을 다시 편다">
+          ⌨ 보조 키
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div

@@ -1,9 +1,7 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { Database } from 'bun:sqlite';
-import { dirname, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as store from './feature-store.js';
 import { debug } from '../debug/log.js';
-import { releaseLedgerRoot } from '../instance/resolve.js';
 import { CliUserError } from '../cli/cli-user-error.js';
 
 export type ChecklistStatus = 'green' | 'yellow' | 'red' | 'done';
@@ -43,75 +41,18 @@ export function devVersion(): string {
   return (JSON.parse(readFileSync(join(import.meta.dir, '..', '..', 'package.json'), 'utf8')) as { version: string }).version;
 }
 
-function releasedVersion(): string {
-  const dir = join(releaseLedgerRoot(), 'release');
-  if (!existsSync(dir)) return '';
-  return readdirSync(dir).filter((v) => /^\d+\.\d+\.\d+$/.test(v) && existsSync(join(dir, v, 'release.json')))
-    .filter((v) => {
-      try { const record = JSON.parse(readFileSync(join(dir, v, 'release.json'), 'utf8')) as { version?: string; publishedAt?: string }; return record.version === v && typeof record.publishedAt === 'string'; }
-      catch { return false; }
-    })
-    .sort((a, b) => {
-      const aa = a.split('.').map(Number), bb = b.split('.').map(Number);
-      return (bb[0]! - aa[0]!) || (bb[1]! - aa[1]!) || (bb[2]! - aa[2]!);
-    })[0] ?? '';
-}
-
-function pathFor(v: string): string {
-  if (!/^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(v)) throw new CliUserError(`체크리스트 판이 아니다: ${v}`);
-  return join(releaseLedgerRoot(), 'release', v, 'checklist.json');
-}
-
 export function listChecklist(v: string): Checklist {
-  const path = pathFor(v);
-  if (existsSync(path)) {
-    const data = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
-    refresh(data);
-    return data;
-  }
-  return { version: v, released: releasedVersion(), dev: devVersion(), items: [], history: [] };
+  return store.list(v);
 }
 
-// SQLite's OS-backed write lock is released when the owning process exits, even without a finally block.
-// Hold it across the JSON read/modify/atomic-rename sequence so writers never use stale snapshots.
 function mutate(v: string, apply: (data: Checklist) => boolean): Checklist {
-  const path = pathFor(v);
-  mkdirSync(dirname(path), { recursive: true });
-  const lock = `${path}.mutex.sqlite`;
-  const db = new Database(lock, { create: true, strict: true });
-  try {
-    chmodSync(lock, 0o600);
-    db.exec('PRAGMA busy_timeout = 10000');
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const data = listChecklist(v);
-      if (apply(data)) save(v, data);
-      db.exec('COMMIT');
-      return data;
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-  } finally { db.close(); }
-}
-
-function save(v: string, data: Checklist): void {
-  const path = pathFor(v);
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-    chmodSync(temp, 0o600);
-    renameSync(temp, path);
-  } finally { if (existsSync(temp)) rmSync(temp); }
+  return store.mutate(v, store.releasedVersion(), devVersion(), apply);
 }
 
 function change(data: Checklist, id: string, field: string, from: unknown, to: unknown, by: string, at: string): void {
   data.history.push({ at, by, id, field, from: from ?? null, to: to ?? null, released: data.released, dev: data.dev });
   debug.log('release-loop.checklist', 'change', { version: data.version, id, field, from: from ?? null, to: to ?? null, by });
 }
-
-function refresh(data: Checklist): void { data.released = releasedVersion(); data.dev = devVersion(); }
 
 export function addItem(v: string, input: { id: string; title: string; owner?: string; kind?: ChecklistKind }): Checklist {
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');

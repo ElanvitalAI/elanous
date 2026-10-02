@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { lastJsonObject } from '../../src/graph-runner/runner.js';
-import { emitNodeResult, readGraphContext } from './node-verdict.js';
+import { cutoffNotesEmpty, emitNodeResult, readGraphContext } from './node-verdict.js';
 
 test('emitted last line is read unchanged by graph runner', () => {
   const lines: string[] = [];
@@ -30,4 +30,11 @@ test('context reads file input and previous outputs', () => {
     writeFileSync(file, JSON.stringify({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: 'a'.repeat(40) } } }));
     expect(readGraphContext({ ELANOUS_GRAPH_CONTEXT: file })).toMatchObject({ input: { version: '0.2.4', previousVersion: '0.2.3' }, outputs: { 'version-release': { commit: 'a'.repeat(40) } } });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('cutoff with a notes-empty escalation is a failed cut; other escalations are not', () => {
+  expect(cutoffNotesEmpty({ escalate: [{ kind: 'notes-empty', featFixLandings: 1, nextMdLines: 0 }] })).toBe(true);
+  expect(cutoffNotesEmpty({ escalate: [{ kind: 'command-removed', command: 'elanous b' }] })).toBe(false);
+  expect(cutoffNotesEmpty({})).toBe(false);
+  expect(cutoffNotesEmpty(undefined)).toBe(false);
 });

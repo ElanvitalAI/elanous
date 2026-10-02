@@ -102,7 +102,9 @@ describe('nexus /v1 default-deny', () => {
       // This server has no setup-mode flag (P24b), so routeRequest passes
       // setupMode:false. The /v1/setup prefix is public only when that flag
       // is true — unauthenticated calls stay denied, which is the contract.
-      if (route.path.startsWith('/v1/setup/')) {
+      // The setup-wizard prefix is public only in setup mode; an exact, self-verified setup route
+      // (POST /v1/setup/claim · one-use link) is public at all times and is checked as selfVerified below.
+      if (route.path.startsWith('/v1/setup/') && route.match === 'prefix') {
         expect(isPublicRoute(route.method, `${route.path}probe`, { setupMode: false })).toBe(false);
         expect(isPublicRoute(route.method, `${route.path}probe`, { setupMode: true })).toBe(true);
         expect(await statusOf(server, `${route.path}probe`, { method: route.method })).toBe(401);

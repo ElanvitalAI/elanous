@@ -1,35 +1,62 @@
 import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { debug } from './debug/log.js';
-import { getSecret, setSecretAsync } from './nexus/config/secrets/index.js';
-import { userConfigPath } from './nexus/config/paths.js';
+import { getSecret, setSecretAsync, currentBackendId } from './nexus/config/secrets/index.js';
+import { userConfigPath, secretsPath } from './nexus/config/paths.js';
 import { isSecretRef, makeSecretRef, secretIdFromRef } from './nexus/config/types.js';
 import { acquireLockAsync } from './storage/file-lock.js';
 import type { UserConfig } from './user-config.js';
 
 export type ChannelBotPlatform = 'telegram' | 'discord';
-export type ChannelBotTokenSource = 'tokenRef' | 'env' | 'plaintext';
+export type ChannelBotTokenSource = 'tokenRef' | 'env' | 'botToken' | 'channels.main';
+export type ChannelBotTokenResolution = { token: string; source: ChannelBotTokenSource; reason?: never }
+  | { token: ''; source?: never; reason: string };
 
 /** The tab reference is read from the same persistent config as the NEXUS switch. */
 export function resolveChannelBotToken(
   platform: ChannelBotPlatform,
   cfg: Pick<UserConfig, 'telegram' | 'discord'> & { tabs?: Record<string, { tokenRef?: unknown }> },
-): { token: string; source: ChannelBotTokenSource } | undefined {
+): ChannelBotTokenResolution {
+  let reason: string | undefined;
   const ref = cfg.tabs?.[`${platform}:1`]?.tokenRef;
   if (isSecretRef(ref)) {
     const id = secretIdFromRef(ref);
-    const token = id ? getSecret(id) : undefined;
-    if (token) return { token, source: 'tokenRef' };
+    if (id) {
+      const backend = currentBackendId();
+      if (backend !== 'file') {
+        reason = `backend ${backend} not sync-readable`;
+      } else {
+        const token = getSecret(id);
+        if (token) {
+          debug.log('channel-bot.token', 'resolved', { kind: platform, source: 'tokenRef' });
+          return { token, source: 'tokenRef' };
+        }
+        reason = `ref-id-missing ${id} in ${secretsPath()}`;
+      }
+    }
   }
   const envName = platform === 'telegram' ? 'ELANOUS_TELEGRAM_BOT_TOKEN' : 'ELANOUS_DISCORD_BOT_TOKEN';
   const envToken = process.env[envName];
-  if (envToken) return { token: envToken, source: 'env' };
+  if (envToken) {
+    debug.log('channel-bot.token', 'resolved', { kind: platform, source: 'env' });
+    return { token: envToken, source: 'env' };
+  }
   const token = cfg[platform]?.botToken;
   if (token) {
-    debug.log('channel-bot.token', 'plaintext-fallback', { platform });
-    return { token, source: 'plaintext' };
+    debug.log('channel-bot.token', 'resolved', { kind: platform, source: 'botToken' });
+    return { token, source: 'botToken' };
   }
-  return undefined;
+  if (platform === 'telegram') {
+    const channels = cfg.telegram?.channels;
+    const channelToken = (channels?.find(c => c.name === 'main') ?? channels?.[0])?.botToken;
+    if (channelToken) {
+      debug.log('channel-bot.token', 'resolved', { kind: platform, source: 'channels.main' });
+      return { token: channelToken, source: 'channels.main' };
+    }
+  }
+  reason ??= 'no-source';
+  debug.log('channel-bot.token', 'unresolved', { kind: platform, reason });
+  return { token: '', reason };
 }
 
 /** Publish the secret before its reference, under the config lock. Other config keys survive unchanged. */

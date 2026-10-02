@@ -192,8 +192,8 @@ describe('TUI OpenAI-compatible streaming E2E', () => {
 
       if (!streamOpen) throw fail('S3 ESC was sent after the SSE stream ended');
       handle.write('\x1b');
-      const s3 = await pollScreen((screen) => screen.includes('· interrupted') && lastPromptLine(screen, 'S3').startsWith('❯ abc'), 5_000, 'S3 interruption with preserved input');
-      if (!s3.includes('· interrupted') || !lastPromptLine(s3, 'S3').startsWith('❯ abc')) throw fail('S3 did not show interruption and the preserved last input line');
+      const s3 = await pollScreen((screen) => screen.includes('중단됨') && lastPromptLine(screen, 'S3').startsWith('❯ abc'), 5_000, 'S3 interruption with preserved input');
+      if (!s3.includes('중단됨') || !lastPromptLine(s3, 'S3').startsWith('❯ abc')) throw fail('S3 did not show interruption and the preserved last input line');
     } finally {
       try { handle?.kill(); } finally {
         cleanupStream();

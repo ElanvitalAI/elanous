@@ -57,6 +57,11 @@ export function errorResult(error: unknown): { outcome: 'error'; verdict: 'fail'
   return { outcome: 'error', verdict: 'fail', summary: error instanceof Error ? error.message : String(error) };
 }
 
+/** A cut whose notes would show users nothing fails the cutoff instead of shipping a «Plus N internal changes.» page. */
+export function cutoffNotesEmpty(data: Record<string, unknown> | undefined): boolean {
+  return Array.isArray(data?.escalate) && (data.escalate as Array<{ kind?: string }>).some((item) => item?.kind === 'notes-empty');
+}
+
 // Existing cutoff/PWA/TUI programs have different output conventions; normalize them at the graph boundary.
 if (import.meta.main) {
   const node = process.argv[2];
@@ -78,7 +83,9 @@ if (import.meta.main) {
     const baseline = data?.baseline as { sha?: string } | undefined;
     const outcome: NodeOutcome = node === 'cutoff' ? run.status === 0 && data?.version === version && (data?.cutoff as { sha?: string } | undefined)?.sha === commit && typeof baseline?.sha === 'string' ? 'ok' : 'error'
       : run.status === 0 && (verdict === 'pass' || verdict === 'flaky') ? 'ok' : run.status === 1 ? 'fail' : 'error';
-    result = { ...data, outcome, verdict: outcome === 'ok' ? verdict === 'flaky' ? 'flaky' : 'pass' : 'fail',
+    if (node === 'cutoff' && outcome === 'ok' && cutoffNotesEmpty(data)) {
+      result = { ...data, outcome: 'fail', verdict: 'fail', summary: 'cutoff notes-empty — 사용자에게 보일 변경 줄이 0이다(release/next.md 와 PR 노트 조각을 확인하라)' };
+    } else result = { ...data, outcome, verdict: outcome === 'ok' ? verdict === 'flaky' ? 'flaky' : 'pass' : 'fail',
       summary: outcome === 'ok' ? `${node} ${verdict === 'flaky' ? 'flaky' : 'pass'}` : `${node} ${data?.error || run.stderr.trim() || data?.verdict || 'failed'} (rc=${run.status})` };
   } catch (error) { result = errorResult(error); }
   process.exitCode = finishNode(node ?? 'unknown', version, result);

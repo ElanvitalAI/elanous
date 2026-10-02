@@ -86,6 +86,7 @@ export const NON_MENU_SIDEBAR_ROUTE_CATEGORIES = [
   'diagnostic-readonly',
   'contact-form',
   'beta-direct-link',
+  'operator-direct-link',
 ];
 
 export type NonMenuSidebarRouteCategory = typeof NON_MENU_SIDEBAR_ROUTE_CATEGORIES[number];
@@ -113,6 +114,10 @@ export const NON_MENU_SIDEBAR_ROUTES: readonly NonMenuSidebarRoute[] = [
   { href: '/morning', category: 'unwired-screen', reason: '부르는 백엔드가 아직 없는 미배선 화면.' },
   // 481c22af2 로 diagnostic-readonly 분류가 생겼다. `/design-check` 는 2026-09-28 탭 다이어트에서
   // 메뉴 «Design» 으로 올라갔다(카드·시안·내 시스템 — 디자인 시스템 공개 결정).
+  // OPS1·OPS2(0.2.9 · 대표 10-02 12:3x) — 데몬 `/v1/ops/*` 가 운영자(`/v1/me` operator)에게만 답한다(외부 설치본 403 → «운영자만» 한 줄).
+  //  메뉴 «운영» 칸은 NAV1(0.2.10)에서 연다 — 이번 판은 주소로 연다.
+  { href: '/ops/release', category: 'operator-direct-link', reason: '운영 › 릴리스 — 판 진행 노드 줄 · 로그 꼬리(OPS1 · 운영자 전용 API).' },
+  { href: '/ops/checklist', category: 'operator-direct-link', reason: '운영 › 판별 피처 — 확인표 칸 목록 · 상태 · 담당 · 근거(OPS2 · 운영자 전용 API).' },
   { href: '/botlab', category: 'diagnostic-readonly', reason: '봇 화면 «벽»을 한 자리에서 보는 읽기 진단 화면(#15390 · 봇 운영자용).' },
 ];
 
@@ -144,7 +149,7 @@ export const SIDEBAR_NAV_ITEMS: readonly SidebarNavItem[] = [
   // wikilink·backlink·태그·그래프). 백엔드 /v1/vault/*. kind=null 직접 진입.
   // 2026-09-28 탭 다이어트 — 디자인 시스템 카드·시안·«URL 로 내 시스템» (메뉴 밖 → 메뉴).
   { href: '/design-check', label: 'Design', hint: '디자인 시스템 고르기 · 시안 · URL 로 내 시스템', icon: Palette, kind: null },
-  { href: '/vault', label: 'Vault', hint: 'Obsidian 노트 (브라우저·에디터·검색·그래프)', icon: BookOpen, kind: null },
+  { href: '/vault', label: 'Obsidian 노트', hint: 'Vault — Obsidian 노트 (브라우저·에디터·검색·그래프)', icon: BookOpen, kind: null },
   { href: '/market', label: '마켓', hint: '플러그인 찾아보기 · 상세 · 설치됨', icon: Store, kind: null },
   // 2026-07-08 부활 — 예약된 모든 잡의 단일 인지 지점(schedule_registry 기반 ·
   // crontab/데몬/workflow trigger 미러 흡수). 투자 크론이 /workflows·/tasks 에

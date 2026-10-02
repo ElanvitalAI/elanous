@@ -1,9 +1,7 @@
-// Slash command: /usage
-//
-// Screen does not compute. It prints the same structured report the
-// `elanous usage` command produces.
+// Slash commands: /usage and /remaining — compact TUI view of the unified report.
 
-import { collectUnifiedUsage, formatUnifiedUsage, type UnifiedUsageDeps } from '../../budget/unified-usage.js';
+import { collectUnifiedUsage, formatUsageCompact, type UnifiedUsageDeps } from '../../budget/unified-usage.js';
+import { visibleWidth } from '../../tui.js';
 import type { SlashExecuteRequest, SlashExecuteResult } from './dashboard-slash.js';
 
 export interface UsageSlashResult extends SlashExecuteResult {
@@ -12,15 +10,18 @@ export interface UsageSlashResult extends SlashExecuteResult {
 }
 
 export async function executeUsageSlash(
-  req: SlashExecuteRequest,
+  req: SlashExecuteRequest & { width?: number },
   deps: UnifiedUsageDeps = {},
 ): Promise<UsageSlashResult | null> {
   if (req.name !== 'usage' && req.name !== 'remaining') return null;
   const report = await collectUnifiedUsage(deps);
+  const width = req.width ?? 120;
+  const hint = ['자세히: elanous usage', 'elanous usage', 'elanous…', '…']
+    .find((text) => visibleWidth(text) <= width) ?? '';
   return {
     ok: true,
     name: req.name,
     args: req.args,
-    logLines: formatUnifiedUsage(report).split('\n').filter((line) => line.length > 0),
+    logLines: [...formatUsageCompact(report, { width, nowMs: Date.now() }), hint],
   };
 }

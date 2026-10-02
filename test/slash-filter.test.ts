@@ -9,6 +9,24 @@ import { describe, it, expect } from 'bun:test';
 import { filterSlashCommands, SLASH_COMMANDS, type SlashCommand } from '../src/chat/index.js';
 
 describe('filterSlashCommands', () => {
+  it('reorders only existing essential commands without changing the order of others', () => {
+    const names = filterSlashCommands('', SLASH_COMMANDS).map(c => c.name);
+    expect(names).not.toContain('new');
+    expect(names.slice(0, 8)).toEqual([
+      'help', 'resume', 'model', 'clear', 'status', 'remaining', 'setup', 'quit',
+    ]);
+    expect(names.slice(8)).toEqual([
+      'run-skill', 'ad', 'design', 'provider', 'reasoning', 'local', 'session', 'fork',
+      'rewind', 'mission', 'resume-turn', 'context', 'paste', 'sync', 'plugin',
+      'widget', 'log', 'memory', 'export', 'delta', 'theme', 'debug', 'rebind',
+      'api-allow', 'prompt', 'history', 'research', 'harness', 'plan', 'chat',
+      'dashboard', 'telegram', 'tablet', 'surface', 'term', 'claude', 'codex',
+      'gemini', 'acp', 'conv', 'handoff', 'agent-room', 'showroom', 'reply',
+      'capture', 'inject', 'relay', 'lane', 'control', 'default', 'qc', 'voice-chat',
+      'auto-tts', 'directive',
+    ]);
+  });
+
   it('returns the input list unchanged for empty text', () => {
     const out = filterSlashCommands('', SLASH_COMMANDS);
     expect(out).toEqual(SLASH_COMMANDS);

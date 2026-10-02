@@ -131,10 +131,16 @@ const { XtermView } = await import('./XtermView');
 
 type Element = { props?: { children?: unknown[]; className?: string; 'aria-live'?: string } };
 
+/** 자식이 하나면 React 는 배열이 아니라 그 값 하나를 준다 — 둘 다 받는다. */
+function childList(value: Element): unknown[] {
+  const raw = value.props?.children;
+  return Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+}
+
 function textOf(value: unknown): string {
   if (typeof value === 'string') return value;
   if (!value || typeof value !== 'object') return '';
-  const children = (value as Element).props?.children ?? [];
+  const children = childList(value as Element);
   return children.map(textOf).join('');
 }
 
@@ -144,7 +150,7 @@ function statusClassOf(value: unknown): string {
   if (typeof elementValue.props?.className === 'string' && elementValue.props.className.includes('absolute right-2 top-2')) {
     return elementValue.props.className;
   }
-  const children = elementValue.props?.children ?? [];
+  const children = childList(elementValue);
   return children.map(statusClassOf).find(Boolean) ?? '';
 }
 
@@ -152,7 +158,7 @@ function liveTextOf(value: unknown): string {
   if (!value || typeof value !== 'object') return '';
   const elementValue = value as Element;
   if (elementValue.props?.['aria-live'] === 'polite') return textOf(elementValue);
-  const children = elementValue.props?.children ?? [];
+  const children = childList(elementValue);
   return children.map(liveTextOf).find(Boolean) ?? '';
 }
 
