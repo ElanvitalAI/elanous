@@ -4457,6 +4457,41 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 
 Source: https://docs.elanous.ai/releases/0-2-8/
 
+When something is in the way, Elanous now tells you why and fixes what it can, right there.
+
+## Install
+
+```bash
+curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash   # one line
+```
+
+or `npm install -g elanous`.
+
+## New
+
+- **Unreadable skills no longer stop the first screen.** If a skill file from another tool can't be read, you see "N skills could not be read". After you confirm, Elanous repairs only what it can and keeps the original.
+- **Clear sign-in where a browser can't open.** Over ssh or on a machine without a screen, Elanous no longer tries to open a browser; it says why and what to do instead. At the machine itself, ChatGPT sign-in opens in the browser directly.
+- **One language.** First-run setup and sign-in text now use one language.
+- **`elanous doctor`** finds local LLMs on this machine, such as Ollama and LM Studio. **`elanous doctor --bundle`** writes one diagnostics file with secrets redacted, which you can send when asking for help.
+- **Bring over what you already use.**
+  - `elanous import` shows the skills and MCP servers it found in agents you already use, such as Claude Code and Codex.
+  - `elanous import --apply` brings them in. Skills stay where they are and are not copied; MCP servers arrive switched off.
+  - `elanous import --undo` reverts the import in one step.
+  - Secrets and sign-ins are not moved.
+  - `elanous connect claude` hooks up the skills of an agent you already use in one step.
+- **Telegram and Discord bots carry over.** First-run setup finds your existing Telegram and Discord bot settings and shows them. It brings them over only if you agree, and token values are never shown.
+- **Decisions in your DMs.** When Elanous needs a person to decide, it asks with button cards in a Telegram or Discord DM. It asks twice before anything that can't be undone.
+- **Web terminal.** Opening a terminal in the web app no longer freezes for a few seconds the first time, and tabs in the background stop refreshing.
+- **Error reports.** When an error happens, Elanous sends only the error, the version and a random install ID to the operators. It sends no name or email.
+  - Reports are deleted automatically after 30 days.
+  - You are told on first run.
+  - One line turns it off: `elanous config set errorReports.enabled false`.
+- **Docs** now mark each screen as stable or experimental. A new guide shows how to put a single HTML page online with Vercel.
+
+## Experimental
+
+- After you upload event photos and the vertical video is made, an Instagram feed draft is prepared on its own and waits in "Pending posts". Nothing is posted until a person taps "Final post".
+
 Plus 92 internal changes.
 
 ---
