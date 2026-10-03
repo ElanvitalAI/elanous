@@ -35,6 +35,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/editor',
   '/exec',
   '/field',
+  '/inside',
   '/intake',
   '/live',
   '/market',
@@ -44,6 +45,7 @@ const CURRENT_BUILT_ROUTE_HREFS: readonly SidebarRouteHref[] = [
   '/ops/release',
   '/ops/seats',
   '/observatory',
+  '/outputs',
   '/reflection',
   '/scheduler',
   '/sessions',
@@ -133,7 +135,7 @@ function expectCompleteRouteAccounting(
 const expectedGroups = [
   ['today', '오늘', true, ['/today', '/approvals', '/intake']],
   ['talk', '대화', true, ['/chat', '/exec']],
-  ['work', '일', true, ['/autopilot', '/scheduler', '/live', '/trace']],
+  ['work', '일', true, ['/autopilot', '/outputs', '/scheduler', '/live', '/trace']],
   ['make', '만들기', true, ['/term', '/editor', '/design-check', '/workspace']],
   ['files', '자료', false, ['/vault', '/field', '/market']],
   ['settings', '설정', false, ['/settings']],
@@ -150,7 +152,7 @@ describe('NAV1a menu', () => {
     }
     expect(Object.fromEntries(SIDEBAR_NAV_ITEMS.map((item) => [item.href, item.label]))).toMatchObject({
       '/today': '오늘', '/approvals': '승인 대기', '/intake': '넣기', '/chat': '채팅', '/exec': 'COO 에게 맡기기',
-      '/autopilot': '미션', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
+      '/autopilot': '미션', '/outputs': '산출물', '/scheduler': '예약', '/live': 'Live', '/trace': 'Trace',
       '/term': '터미널', '/editor': '편집기', '/design-check': '디자인', '/workspace': '여러 탭',
       '/vault': 'Obsidian 노트', '/field': '현장 올리기', '/market': '마켓', '/settings': '설정',
       '/ops/release': '릴리스', '/ops/checklist': '판별 피처', '/bots': '봇',
@@ -202,7 +204,7 @@ describe('NAV1a menu', () => {
     expect(hrefs('general', false)).toEqual(off);
     const on = hrefs('general', true);
     for (const path of ['/exec', '/field', '/trace', '/autopilot', '/vault', '/intake']) expect(on).toContain(path);
-    expect(on).toEqual(['/today', '/intake', '/chat', '/exec', '/autopilot', '/live', '/trace', '/term', '/vault', '/field', '/market', '/settings']);
+    expect(on).toEqual(['/today', '/intake', '/chat', '/exec', '/autopilot', '/outputs', '/live', '/trace', '/term', '/vault', '/field', '/market', '/settings']);
     for (const path of ['/approvals', '/design-check', '/scheduler', '/ops/release', '/morning']) expect(on).not.toContain(path);
     for (const role of ['contributor', 'owner'] as const) expect(hrefs(role, true)).toEqual(hrefs(role));
     expect(hrefs('general', true, true).filter((path) => path.startsWith('/ops/'))).toEqual(['/ops/release', '/ops/checklist', '/ops/seats']);
@@ -259,6 +261,9 @@ describe('NAV1a menu', () => {
     expect(categoryByHref.get('/morning')).toBe('unwired-screen');
     expect(categoryByHref.get('/design-check')).toBeUndefined();
     expect(categoryByHref.get('/botlab')).toBe('diagnostic-readonly');
+    expect(categoryByHref.get('/inside')).toBe('beta-direct-link');
+    expect(NON_MENU_SIDEBAR_ROUTES.find((route) => route.href === '/inside')?.reason.length).toBeGreaterThan(0);
+    expect(SIDEBAR_NAV_ITEMS.some((item) => item.href === '/inside')).toBe(false);
     // OPS3 자리 현황은 NAV1a 운영 칸의 메뉴 항목이다(메뉴 밖 등록 아님).
     expect(categoryByHref.get('/ops/seats')).toBeUndefined();
     expect(SIDEBAR_NAV_ITEMS.some((item) => item.href === '/ops/seats' && item.group === 'ops')).toBe(true);

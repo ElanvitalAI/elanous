@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { acquireSlot, runHostRegate, type HostRegateDeps } from './host-regate.js';
+import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
 
 const HEAD = 'a'.repeat(40);
 const BASE = 'c'.repeat(40);
@@ -26,6 +27,7 @@ function mock(overrides: Partial<HostRegateDeps> = {}) {
       if (call === 'git rev-parse FETCH_HEAD') return { status: 0, stdout: calls.at(-2) === `git fetch origin refs/heads/main` ? BASE : HEAD, stderr: '' };
       if (call === `git merge-base ${BASE} ${HEAD}`) return { status: 0, stdout: MERGE_BASE, stderr: '' };
       if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'src/feature.test.ts\n', stderr: '' };
+      if (call === `git diff --find-renames --name-status -z ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'M\0src/feature.test.ts\0', stderr: '' };
       if (call === 'gh pr view 42 --json state,mergeCommit') return { status: 0, stdout: JSON.stringify({ state: 'MERGED', mergeCommit: { oid: SQUASH } }), stderr: '' };
       if (call === `git rev-parse ${SQUASH}^1`) return { status: 0, stdout: BASE, stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
@@ -63,6 +65,60 @@ describe('host regate: never merge without a measured host pass', () => {
     expect(calls).not.toContain('bun bin/elanous.mjs --test nexus build');
     expect(calls).toContain('git worktree remove --force /temp/regate');
     expect(events).toContain('cleanup');
+  });
+
+  test.each(['scripts/release-loop/publish.ts', 'graphs/release/check.yaml', 'src/release-loop/manifest.ts'])(
+    'host handoff holds %s before any merge and annotates the PR', async (path) => {
+      const original = mock();
+      const command = original.deps.command!;
+      const { deps, calls } = mock({ command: (bin, args, cwd, env) => {
+        const call = `${bin} ${args.join(' ')}`;
+        calls.push(call);
+        if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: `${path}\n`, stderr: '' };
+        if (call === `git diff --find-renames --name-status -z ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: `M\0${path}\0`, stderr: '' };
+        if (call === 'gh label list --search elanous:release-path --json name') return { status: 0, stdout: '[]', stderr: '' };
+        return command(bin, args, cwd, env);
+      } });
+      const result = await runHostRegate(input, deps);
+      expect(result).toMatchObject({ passed: false, failures: [{ step: 'release-path-hold', detail: `OP approval required: ${path}` }] });
+      expect(calls).not.toContain(`gh pr merge 42 --squash --match-head-commit ${HEAD}`);
+      expect(calls).toContain('gh label create elanous:release-path --color D93F0B --description Release path requires OP approval');
+      expect(calls).toContain('gh pr edit 42 --add-label elanous:release-path');
+      expect(calls).toContain(`gh pr comment 42 --body ${releasePathHoldComment(path)}`);
+    },
+  );
+
+  test.each(['scripts/release-loop/publish.ts', 'graphs/release/check.yaml', 'src/release-loop/manifest.ts'])(
+    'rename from %s into an unprotected path cannot bypass host hold', async (path) => {
+      const original = mock().deps.command!;
+      const { deps, calls } = mock({ command: (bin, args, cwd, env) => {
+        const call = `${bin} ${args.join(' ')}`;
+        calls.push(call);
+        if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'src/ordinary.ts\n', stderr: '' };
+        if (call === `git diff --find-renames --name-status -z ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: `R100\0${path}\0src/ordinary.ts\0`, stderr: '' };
+        if (call === 'gh label list --search elanous:release-path --json name') return { status: 0, stdout: '[]', stderr: '' };
+        return original(bin, args, cwd, env);
+      } });
+      const result = await runHostRegate(input, deps);
+      expect(result).toMatchObject({ passed: false, failures: [{ step: 'release-path-hold', detail: `OP approval required: ${path}` }] });
+      expect(calls).not.toContain(`gh pr merge 42 --squash --match-head-commit ${HEAD}`);
+      expect(calls).toContain('gh pr edit 42 --add-label elanous:release-path');
+      expect(calls).toContain(`gh pr comment 42 --body ${releasePathHoldComment(path)}`);
+    },
+  );
+
+  test('verifyOnly measures a release-path PR without auto-merging or applying the hold', async () => {
+    const original = mock();
+    const command = original.deps.command!;
+    const { deps, calls } = mock({ command: (bin, args, cwd, env) => {
+      const call = `${bin} ${args.join(' ')}`;
+      calls.push(call);
+      if (call === `git diff --name-only ${MERGE_BASE} ${HEAD}`) return { status: 0, stdout: 'src/release-loop/release-schedule.ts\n', stderr: '' };
+      return command(bin, args, cwd, env);
+    } });
+    const result = await runHostRegate({ ...input, verifyOnly: true }, deps);
+    expect(result).toMatchObject({ passed: true, status: 'passed' });
+    expect(calls.some((call) => call.startsWith('gh pr merge') || call.startsWith('gh pr edit'))).toBe(false);
   });
 
   test('verifyOnly runs host gates without merging; landing path still merges', async () => {

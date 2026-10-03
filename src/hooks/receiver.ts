@@ -1,8 +1,10 @@
 import { debug } from '../debug/log.js';
 import { readFileSync } from 'node:fs';
-import { userConfigPath } from '../user-config.js';
+import { getUserConfig, parseEventsConfig, userConfigPath, type EventsConfig } from '../user-config.js';
+import { dispatchHook, type HookWake } from './dispatch.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { HookQueue, type QueuedHook } from './queue.js';
+import { recordGithubShadow } from './github-shadow.js';
 import { toExternalTask, verifyWebhook, type HookProvider } from './providers.js';
 import { drainReports, handleReportPost, ReportLimiter, ReportQueue, type ReceivedReport } from './error-report.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
@@ -10,6 +12,7 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 export interface HookSecrets {
   linear?: string;
   asana?: string;
+  github?: string;
   saveAsana?: (secret: string) => Promise<void>;
 }
 export interface HookReceiverOptions {
@@ -20,8 +23,12 @@ export interface HookReceiverOptions {
   now?: () => number;
   root?: string;
   retryBaseMs?: number;
+  events?: EventsConfig;
+  wakeSeat?: HookWake;
   /** ER2 — forward one queued error report to the Primary; default = POST /v1/reports/ingest over the tailnet. */
   forwardReport?: (item: ReceivedReport) => Promise<boolean>;
+  /** GET-only public metadata lookup; failure forces human review. */
+  githubFetch?: typeof fetch;
 }
 
 /** `/v1/tasks` lives on the Primary's nexus API, not on the control plane — so the address is its own setting. */
@@ -31,19 +38,6 @@ export function hooksPrimaryUrl(config: { hooks?: { primaryUrl?: unknown } }): U
   const url = new URL(value);
   if (url.protocol !== 'https:' && url.protocol !== 'http:') throw new Error('hooks.primaryUrl must be http(s)');
   return url;
-}
-
-async function forwardToPrimary(event: QueuedHook): Promise<Response> {
-  const config = JSON.parse(readFileSync(userConfigPath(), 'utf8')) as { hooks?: { primaryTokenRef?: string; primaryUrl?: unknown } };
-  const ref = config.hooks?.primaryTokenRef;
-  if (!ref) throw new Error('primary token reference missing');
-  const token = await getSecretAsync(ref);
-  if (!token) throw new Error('primary token missing');
-  return fetch(new URL('/v1/tasks', hooksPrimaryUrl(config)), {
-    method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`,
-      'x-elanous-trace-id': `${event.provider}:${event.eventId}` },
-    body: JSON.stringify({ ...event.task, eventId: `${event.provider}:${event.eventId}` }), signal: AbortSignal.timeout(10_000),
-  });
 }
 
 async function forwardReportToPrimary(item: ReceivedReport): Promise<boolean> {
@@ -81,7 +75,12 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
     } finally { reportsDraining = false; }
   }
   const now = options.now ?? Date.now;
-  const forward = options.forward ?? forwardToPrimary;
+  const events = options.events ?? getUserConfig().events ?? parseEventsConfig(undefined);
+  // L14: public-repository intake events take the shadow ledger path; every other event keeps the seat dispatch path.
+  const dispatch = options.forward ?? ((event: QueuedHook) => dispatchHook(event, options.root ?? effectiveInstanceRoot(), events, options.wakeSeat).then(() => 204));
+  const forward = (event: QueuedHook) => event.provider === 'github' && event.task.github
+    ? recordGithubShadow(event, options.root ?? effectiveInstanceRoot(), options.githubFetch).then(() => 204)
+    : dispatch(event);
   const attempts = new Map<string, { next: number; failures: number }>();
   const pending = new Set<string>();
   let stopped = false;
@@ -124,7 +123,7 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
       if (request.method === 'POST' && url.pathname === '/v1/reports')
         return handleReportPost(request, { limiter: reportLimiter, queue: reportQueue, ...(options.now ? { now: options.now } : {}),
           log: (event, data) => debug.log('hooks.reports', event, data), wake: () => { reportNextAt = 0; void drainReportQueue(); } });
-      if (request.method !== 'POST' || !/^\/hooks\/(linear|asana)$/.test(url.pathname)) return new Response('Not Found', { status: 404 });
+      if (request.method !== 'POST' || !/^\/hooks\/(linear|asana|github)$/.test(url.pathname)) return new Response('Not Found', { status: 404 });
       const provider = url.pathname.slice('/hooks/'.length) as HookProvider;
       const reject = (reason: string) => {
         debug.log('hooks.receiver', 'rejected', { provider, reason });
@@ -150,13 +149,15 @@ export function startHookReceiver(options: HookReceiverOptions): { url: string; 
           debug.log('hooks.receiver', 'ignored', { provider, kind: verified.ignored });
           return new Response(null, { status: 200 });
         }
-        if (provider === 'linear') {
+        if (provider === 'linear' || provider === 'github') {
           const eventId = verified.eventIds[0]!;
-          queue.enqueue({ provider, eventId, task: toExternalTask(provider, { ...(verified.body as object), eventId }) });
+          const body = verified.body as { type?: string; action: string; githubEvent?: string };
+          const kind = provider === 'linear' ? `${body.type}:${body.action}` : `${body.githubEvent}:${body.action}`;
+          queue.enqueue({ provider, eventId, kind, task: toExternalTask(provider, { ...body, eventId }) });
         } else {
           const body = verified.body as { events: unknown[] };
-          const tasks = body.events.map(event => toExternalTask(provider, { event, task: (event as { task?: unknown }).task }));
-          for (const task of tasks) queue.enqueue({ provider, eventId: task.eventId, task });
+          const tasks = body.events.map(event => ({ event: event as { action?: string }, task: toExternalTask(provider, { event, task: (event as { task?: unknown }).task }) }));
+          for (const { event, task } of tasks) queue.enqueue({ provider, eventId: task.eventId, kind: `task:${event.action ?? 'unknown'}`, task });
         }
         if (!draining) {
           if (timer) clearTimeout(timer);

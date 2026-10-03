@@ -4,7 +4,7 @@
 // Precedence (high → low):
 //   1. `modelTier.voice.stt` (per-surface override · §3.4a.1)
 //   2. `modelTier.preset` (Phase 2 preset catalog · undefined today)
-//   3. `modelTier.persona`-based default (casual & power both ↦ Balanced
+//   3. `modelTier.profile`-based default (casual & power both ↦ Balanced
 //      today; Phase 3 can broaden)
 //   4. DEFAULT_MODEL_TIER ('balanced')
 //
@@ -40,7 +40,7 @@ export type SttTierSource =
   | 'session-override'
   | 'user-config-surface'
   | 'preset'
-  | 'persona'
+  | 'profile'
   | 'default';
 
 export interface ResolvedSttTier extends SttTierSpec {
@@ -83,14 +83,14 @@ export function resolveSttTier(
     };
   }
 
-  // 3. Persona-driven default — casual and power both land on
+  // 3. Profile-driven default — casual and power both land on
   //    Balanced today (PLAN §3.0.3). `custom` keeps the same default
   //    until an override or preset is set.
-  if (modelTier?.persona) {
+  if (modelTier?.profile) {
     return {
       ...STT_TIER_MAP[DEFAULT_MODEL_TIER],
       tier: DEFAULT_MODEL_TIER,
-      source: 'persona',
+      source: 'profile',
     };
   }
 
@@ -108,7 +108,7 @@ export type LlmTierSource =
   | 'session-override'
   | 'user-config-surface'
   | 'preset'
-  | 'persona'
+  | 'profile'
   | 'default';
 
 export interface ResolvedLlmTier extends LlmTierSpec {
@@ -126,7 +126,7 @@ export type TtsTierSource =
   | 'session-override'
   | 'user-config-surface'
   | 'preset'
-  | 'persona'
+  | 'profile'
   | 'default';
 
 export interface ResolvedTtsTier extends TtsTierSpec {
@@ -153,13 +153,13 @@ export function resolveTtsTier(
   if (modelTier?.preset) {
     return { ...TTS_TIER_MAP[DEFAULT_MODEL_TIER], tier: DEFAULT_MODEL_TIER, source: 'preset' };
   }
-  if (modelTier?.persona) {
-    return { ...TTS_TIER_MAP[DEFAULT_MODEL_TIER], tier: DEFAULT_MODEL_TIER, source: 'persona' };
+  if (modelTier?.profile) {
+    return { ...TTS_TIER_MAP[DEFAULT_MODEL_TIER], tier: DEFAULT_MODEL_TIER, source: 'profile' };
   }
   return { ...TTS_TIER_MAP[DEFAULT_MODEL_TIER], tier: DEFAULT_MODEL_TIER, source: 'default' };
 }
 
-/** Resolve LLM tier. Precedence mirrors STT (surface → preset → persona
+/** Resolve LLM tier. Precedence mirrors STT (surface → preset → profile
  *  → default) — diverges only in that the resolver needs the active
  *  `llm.provider` to expand the tier ladder. */
 export function resolveLlmTier(
@@ -196,12 +196,12 @@ export function resolveLlmTier(
       provider,
     };
   }
-  // 3. Persona-driven default.
-  if (modelTier?.persona) {
+  // 3. Profile-driven default.
+  if (modelTier?.profile) {
     return {
       ...lookupLlmTierSpec(provider, DEFAULT_MODEL_TIER),
       tier: DEFAULT_MODEL_TIER,
-      source: 'persona',
+      source: 'profile',
       provider,
     };
   }
@@ -220,7 +220,7 @@ export type EmbeddingTierSource =
   | 'session-override'
   | 'user-config-surface'
   | 'preset'
-  | 'persona'
+  | 'profile'
   | 'default';
 
 export interface ResolvedEmbeddingTier extends EmbeddingTierSpec {
@@ -230,7 +230,7 @@ export interface ResolvedEmbeddingTier extends EmbeddingTierSpec {
 }
 
 /** Resolve the embedding tier. Same precedence chain as LLM: session
- *  override → per-surface (modelTier.embedding) → preset → persona →
+ *  override → per-surface (modelTier.embedding) → preset → profile →
  *  default. The provider is supplied by the caller — typical wiring
  *  reads `cfg.embedding?.provider` (future field) and falls back to
  *  'openai'. */
@@ -273,11 +273,11 @@ export function resolveEmbeddingTier(
       provider,
     };
   }
-  if (modelTier?.persona) {
+  if (modelTier?.profile) {
     return {
       ...lookupEmbeddingTierSpec(provider, DEFAULT_MODEL_TIER),
       tier: DEFAULT_MODEL_TIER,
-      source: 'persona',
+      source: 'profile',
       provider,
     };
   }
@@ -295,7 +295,7 @@ export type VisionTierSource =
   | 'session-override'
   | 'user-config-surface'
   | 'preset'
-  | 'persona'
+  | 'profile'
   | 'default';
 
 export interface ResolvedVisionTier extends VisionTierSpec {
@@ -337,11 +337,11 @@ export function resolveVisionTier(
       provider,
     };
   }
-  if (modelTier?.persona) {
+  if (modelTier?.profile) {
     return {
       ...lookupVisionTierSpec(provider, DEFAULT_MODEL_TIER),
       tier: DEFAULT_MODEL_TIER,
-      source: 'persona',
+      source: 'profile',
       provider,
     };
   }

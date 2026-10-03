@@ -439,29 +439,25 @@ describe('publishMarket', () => {
     } finally { rmSync(outside, { recursive: true, force: true }); }
   }));
 
-  test('repository official packs refuse bundled internal references and still publish clean packs', () => fixture(root => {
+  test('repository official packs publish basics after removing its internal references and refuse remaining unsafe packs', () => fixture(root => {
     const repo = join(import.meta.dir, '../..');
     const pair = generateIndexKeyPair();
     const result = publishMarket({ pluginsDir: join(repo, 'packs'), bundleRoot: repo, outDir: join(root, 'out'),
       market: { name: 'elanous', displayName: 'Elanous' }, key: pair });
     const byName = new Map(result.published.map(item => [item.name, item]));
     expect(result.ok).toBe(false);
-    expect([...byName.keys()].sort()).toEqual(['elanous-hwp', 'video-broll', 'video-explainer']);
+    expect([...byName.keys()].sort()).toEqual(['elanous-basics', 'elanous-essentials', 'elanous-hwp', 'video-broll', 'video-explainer']);
+    expect(byName.get('elanous-basics')?.bundled).toContain('google-workspace');
     expect(byName.get('elanous-hwp')?.bundled).toEqual([]);
     expect(JSON.parse(readFileSync(join(repo, 'packs', 'elanous-basics', '.codex-plugin', 'plugin.json'), 'utf8')).version).toBe('0.1.2');
     expect(byName.get('video-broll')?.bundled).toEqual(['motion-broll', 'graphs/broll-line.yaml']);
-    expect(byName.get('video-explainer')?.bundled).toEqual(['explainer-video']);
+    expect(byName.get('video-explainer')?.bundled).toEqual(['explainer-video', 'graphs/explainer-line.yaml']);
     expect(result.skipped).toContainEqual({ dir: 'elanous-markets', reason: 'paid-not-allowed-in-M0' });
-    expect(result.skipped).toContainEqual({ dir: 'elanous-basics', reason: 'internal-reference', hits: [
-      { file: 'skills/grill-me/SKILL.md', line: 131, marker: 'internal-doc-path' },
-      { file: 'skills/omni-digest/digest.md', line: 127, marker: 'internal-doc-path' },
-      { file: 'skills/omni-digest/digest.md', line: 130, marker: 'internal-doc-path' },
-    ] });
     expect(result.skipped).toContainEqual({ dir: 'elanous-media', reason: 'internal-reference', hits: [
       { file: 'skills/video-builder/SKILL.md', line: 30, marker: 'internal-doc-path' },
       { file: 'skills/video-builder/SKILL.md', line: 220, marker: 'internal-doc-path' },
     ] });
-    expect(existsSync(join(root, 'out', 'elanous-basics'))).toBe(false);
+    expect(existsSync(join(root, 'out', 'elanous-basics'))).toBe(true);
     expect(existsSync(join(root, 'out', 'elanous-media'))).toBe(false);
     const index = JSON.parse(readFileSync(join(root, 'out', 'marketplace.json'), 'utf8'));
     expect(index.plugins.map((item: { name: string }) => item.name)).toEqual(result.published.map(item => item.name));

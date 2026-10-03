@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
+import { ProjectStore } from '../../project/project-store.js';
+import { createSession } from '../../session/index.js';
 
 import { DaemonSessionHistory } from '../../boot/daemon-runtime.js';
 import { surfaceUxFromDispatchCtx } from '../../agent/surface-ux/build.js';
@@ -74,6 +79,72 @@ function feedbackToolSurface(env = feedbackEnvelope, count = 1): DaemonToolSurfa
 function includesFeedbackEnvelope(frames: readonly unknown[]): boolean {
   return frames.some((frame) => JSON.stringify(frame) === JSON.stringify(feedbackEnvelope));
 }
+
+test('project conversation selects tool cwd and attaches AGENTS.md to system context; unassigned stays on default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'project-prompt-'));
+  const oldSession = process.env.ELANOUS_SESSION_ROOT;
+  try {
+    setElanousConfigDir(join(root, 'config'));
+    process.env.ELANOUS_SESSION_ROOT = join(root, 'sessions');
+    const folder = join(root, 'project');
+    mkdirSync(folder);
+    writeFileSync(join(folder, 'AGENTS.md'), 'Use the project conventions.');
+    const project = new ProjectStore(join(root, 'config')).create({ name: 'sample', primaryFolder: folder });
+    const assigned = createSession({ projectId: project.id });
+    const plain = createSession();
+    const observations: Array<{ cwd: string | undefined; system: string }> = [];
+    spyOn(coreTurnModule, 'runCoreTurn').mockImplementation(async (ctx) => {
+      const tool = await ctx.dispatchTool?.('CheckCwd', {});
+      observations.push({ cwd: (tool as { cwd?: string })?.cwd, system: JSON.stringify(ctx.messages) });
+      return { stopReason: 'end_turn', finalText: 'OK' };
+    });
+    const opts = { noAuth: true, history: new DaemonSessionHistory(), toolCwd: root,
+      toolSurface: { kind: 'chat' as const, specs: [], dispatch: async (_name: string, _args: unknown, ctx: DaemonToolDispatchCtx) => ({ cwd: ctx.cwd }) },
+      systemPrompt: 'Base instructions' };
+    for (const sessionId of [assigned.id, plain.id]) {
+      await handlePromptPost(new Request('http://test/v1/prompt', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId, userText: 'check' }),
+      }), opts);
+    }
+    await drainSse(await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: assigned.id, userText: 'stream check' }),
+    }), opts));
+    expect(observations.map(o => o.cwd)).toEqual([folder, root, folder]);
+    expect(observations[0]?.system).toContain('Use the project conventions.');
+    expect(observations[2]?.system).toContain('Use the project conventions.');
+    expect(observations[0]?.system).toContain('Base instructions');
+    expect(observations[1]?.system).toContain('Base instructions');
+    expect(observations[1]?.system).not.toContain('Use the project conventions.');
+    const liveInstructions = join(folder, 'AGENTS.md');
+    writeFileSync(liveInstructions, 'Updated project conventions.');
+    await drainSse(await handlePromptStreamPost(new Request('http://test/v1/prompt/stream', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: assigned.id, userText: 'updated instructions' }),
+    }), opts));
+    expect(observations[3]?.system).toContain('Updated project conventions.');
+    expect(observations[3]?.system).not.toContain('Use the project conventions.');
+  } finally {
+    resetElanousConfigDir();
+    if (oldSession === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = oldSession;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('both prompt endpoints reject JSON null with the existing bad-request response', async () => {
+  const opts = { noAuth: true, history: new DaemonSessionHistory() };
+  for (const [path, handler] of [
+    ['/v1/prompt', handlePromptPost],
+    ['/v1/prompt/stream', handlePromptStreamPost],
+  ] as const) {
+    const response = await handler(new Request(`http://test${path}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: 'null',
+    }), opts);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'bad_request', reason: 'userText or userContent required' });
+  }
+});
 
 describe('POST /v1/prompt/stream feedback event-bus delivery', () => {
   test('publishes the original FeedbackEnvelope to long-lived media subscribers while preserving SSE', async () => {

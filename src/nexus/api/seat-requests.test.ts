@@ -9,6 +9,7 @@ import { NexusEventBus } from './event-bus.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { routeRequest } from './http-server.js';
 import { handleSeatRequests } from './seat-requests.js';
+import { subscribeInsideEvent } from './inside-events.js';
 import type { submitIntakeWork } from '../../intake-plane/submit-intake-work.js';
 import type { CeoCommandDeps } from '../../seat-dispatch/ceo-commands.js';
 import type { MessageEnvelope } from '../../msg/msg-store.js';
@@ -56,6 +57,25 @@ test('HTTP router authenticates and accepts @E; GET returns the receipt and seat
     expect(JSON.parse(readFileSync(join(root, 'seat-requests', 'requests.jsonl'), 'utf8').trim().split('\n').at(-1)!))
       .toMatchObject(list.items[0] as object);
     expect((await call('/v1/health', 'GET', undefined, 'none'))?.status).toBe(200);
+});
+
+test('accepted seat request publishes a sanitized event once, not on an idempotent retry', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'seat-inside-'));
+  roots.push(root);
+  const received: unknown[] = [];
+  const unsubscribe = subscribeInsideEvent(event => received.push(event));
+  const request = () => new Request('http://localhost/v1/seat-requests', {
+    method: 'POST', headers: { 'idempotency-key': 'inside-seat' },
+    body: JSON.stringify({ seat: 'E', text: 'password="never-broadcast"' }),
+  });
+  try {
+    const deps = { root: () => root, now: () => '2026-10-01T00:00:00.000Z',
+      submit: async () => ({ ok: true as const, track: 'graph' as const, acceptanceId: 'inside-seat-receipt' }) };
+    expect((await handleSeatRequests(request(), deps)).status).toBe(202);
+    expect((await handleSeatRequests(request(), deps)).status).toBe(202);
+    expect(received).toEqual([{ kind: 'seat', seat: 'E', receiptId: 'inside-seat-receipt', status: 'queued', ts: '2026-10-01T00:00:00.000Z' }]);
+    expect(JSON.stringify(received)).not.toContain('never-broadcast');
+  } finally { unsubscribe(); }
 });
 
 test('handler submits once through graph intake with PWA reportTo and never queues unknown or empty requests', async () => {

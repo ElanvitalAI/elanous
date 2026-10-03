@@ -138,6 +138,7 @@ interface MissionRow {
   priority: MissionPriority | null;
   task_ids_json: string;   // JSON array of taskId
   goal_slug: string | null;
+  project_id: string | null;
   notes_json: string;      // JSON array of string
   autopilot_json: string | null;  // JSON MissionAutopilot | null (U1)
 }
@@ -309,6 +310,8 @@ export class TaskStore {
     // Mission Fabric 통합 U1 (v3) — tox_missions.autopilot_json:
     // PFC Layer2 자율 메타(apm Mission 흡수). NULL = 일반 Mission.
     this.addColumnIfMissing('tox_missions', 'autopilot_json', 'TEXT');
+    this.addColumnIfMissing('tox_missions', 'project_id', 'TEXT');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_tox_missions_project ON tox_missions(project_id)');
     this.addColumnIfMissing('tox_executions', 'host_id', 'TEXT');
     this.addColumnIfMissing('tox_executions', 'hostname', 'TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_tox_executions_host ON tox_executions(host_id, started_at)');
@@ -587,8 +590,8 @@ export class TaskStore {
         `INSERT OR REPLACE INTO tox_missions (
           id, created_at, updated_at, closed_at, title, description, intent,
           source_json, status, priority, task_ids_json, goal_slug, notes_json,
-          autopilot_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          autopilot_json, project_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         mission.id,
@@ -605,6 +608,7 @@ export class TaskStore {
         mission.goalSlug ?? null,
         JSON.stringify([...mission.notes]),
         mission.autopilot ? JSON.stringify(mission.autopilot) : null,
+        mission.projectId ?? null,
       ));
   }
 
@@ -616,7 +620,7 @@ export class TaskStore {
     return this.rowToMission(row);
   }
 
-  listMissions(opts: { status?: MissionStatus; goalSlug?: string } = {}): Mission[] {
+  listMissions(opts: { status?: MissionStatus; goalSlug?: string; projectId?: string } = {}): Mission[] {
     const where: string[] = [];
     const params: Array<string | number | null> = [];
     if (opts.status !== undefined) {
@@ -626,6 +630,10 @@ export class TaskStore {
     if (opts.goalSlug !== undefined) {
       where.push('goal_slug = ?');
       params.push(opts.goalSlug);
+    }
+    if (opts.projectId !== undefined) {
+      where.push('project_id = ?');
+      params.push(opts.projectId);
     }
     const sql =
       'SELECT * FROM tox_missions' +
@@ -729,6 +737,7 @@ export class TaskStore {
       priority: row.priority ?? undefined,
       taskIds: Object.freeze(JSON.parse(row.task_ids_json) as string[]),
       goalSlug: row.goal_slug ?? undefined,
+      ...(row.project_id != null ? { projectId: row.project_id } : {}),
       notes: Object.freeze(JSON.parse(row.notes_json) as string[]),
       autopilot: row.autopilot_json
         ? (JSON.parse(row.autopilot_json) as Mission['autopilot'])

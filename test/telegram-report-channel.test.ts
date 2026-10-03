@@ -114,15 +114,21 @@ function cfgWith(telegram: Partial<UserConfig['telegram']>): UserConfig {
   return { telegram: { enabled: true, allowedUsers: [], ...telegram } } as unknown as UserConfig;
 }
 
+// OUT1 (#23137): only named finance kinds (report · alert · digest) use the legacy report bot;
+// an unnamed kind is an operations message and goes to the main bot's home chat.
 describe('resolveReportTarget', () => {
-  test('uses the report channel own token when set', () => {
-    const t = resolveReportTarget(cfgWith({ botToken: 'MAIN', reportChannel: { chatId: 5, botToken: 'REPORT' } }));
+  test('a finance kind uses the report channel own token when set', () => {
+    const t = resolveReportTarget(cfgWith({ botToken: 'MAIN', reportChannel: { chatId: 5, botToken: 'REPORT' } }), 'report');
     expect(t).toEqual({ botToken: 'REPORT', chatId: 5 });
   });
 
-  test('falls back to the main bot token when reportChannel has none', () => {
-    const t = resolveReportTarget(cfgWith({ botToken: 'MAIN', reportChannel: { chatId: 7 } }));
-    expect(t).toEqual({ botToken: 'MAIN', chatId: 7 });
+  test('a finance kind never falls back to the main bot when reportChannel has no token of its own', () => {
+    expect(resolveReportTarget(cfgWith({ botToken: 'MAIN', reportChannel: { chatId: 7 } }), 'report')).toBeNull();
+  });
+
+  test('an unnamed kind goes to the main bot home chat, not the report bot', () => {
+    const t = resolveReportTarget(cfgWith({ botToken: 'MAIN', homeChannel: 9, reportChannel: { chatId: 5, botToken: 'REPORT' } }));
+    expect(t).toEqual({ botToken: 'MAIN', chatId: 9 });
   });
 
   test('null when no reportChannel configured', () => {
@@ -145,7 +151,7 @@ describe('sendTelegramReport', () => {
     const ok = await sendTelegramReport(
       cfgWith({ botToken: 'MAIN:tok', reportChannel: { chatId: 1301607555, botToken: 'REPORT:tok' } }),
       'daily digest',
-      { markdown: false, fetchImpl: fetchMock },
+      { markdown: false, fetchImpl: fetchMock, kind: 'report' },
     );
     expect(ok).toBe(true);
     const send = calls.find(c => c.url.includes('/sendMessage'));
@@ -172,7 +178,7 @@ describe('sendTelegramReport', () => {
       await sendTelegramReport(
         cfgWith({ botToken: 'MAIN:tok', reportChannel: { chatId: 1301607555, botToken: 'REPORT:tok' } }),
         alert,
-        { markdown: false, fetchImpl: fetchMock },
+        { markdown: false, fetchImpl: fetchMock, kind: 'alert' },
       );
       // Landed in the REPORT bot's session (botId = token prefix 'REPORT')…
       const sess = findSessionByTelegramChat(1301607555, undefined, 'REPORT');
@@ -204,7 +210,7 @@ describe('/telegram report wire', () => {
 
   test('report subcommand dispatches the exact message once to the report sender', async () => {
     const lines: string[] = [];
-    const cfg = cfgWith({ botToken: 'MAIN:tok', reportChannel: { chatId: 42, botToken: 'REPORT:tok' } });
+    const cfg = cfgWith({ botToken: 'MAIN:tok', homeChannel: 42, reportChannel: { chatId: 7, botToken: 'REPORT:tok' } });
     const sends: Array<{ cfg: UserConfig; text: string }> = [];
     const registry = buildDashboardSlashRegistry();
     const report = {
@@ -245,7 +251,7 @@ describe('sendReportPhoto (URL)', () => {
     const ok = await sendReportPhoto(
       cfgWith({ botToken: 'MAIN:tok', reportChannel: { chatId: 1301607555, botToken: 'REPORT:tok' } }),
       'https://example.test/heat.png',
-      { caption: 'url photo', fetchImpl: fetchMock },
+      { caption: 'url photo', fetchImpl: fetchMock, kind: 'report' },
     );
     expect(ok).toBe(true);
     const send = calls.find(c => c.url.includes('/sendPhoto'));
@@ -269,7 +275,7 @@ describe('sendReportPhotoBuffer', () => {
     const ok = await sendReportPhotoBuffer(
       cfgWith({ botToken: 'MAIN:tok', reportChannel: { chatId: 42, botToken: 'REPORT:tok' } }),
       png,
-      { caption: 'digest png', fetchImpl: fetchMock },
+      { caption: 'digest png', fetchImpl: fetchMock, kind: 'report' },
     );
     expect(ok).toBe(true);
     const send = calls.find(c => c.url.includes('/sendPhoto'));
@@ -293,27 +299,28 @@ describe('purpose kind → channel role (explicit channels)', () => {
     reportChannel: { chatId: 222, botToken: 'CONATUS:tok' },
     channels: [
       { name: 'main', botToken: 'MAIN:tok', chatId: 111, interactive: true, roles: ['qa', 'default', 'system', 'mission'] },
-      { name: 'conatus', botToken: 'CONATUS:tok', chatId: 222, interactive: true, roles: ['investment', 'signal'] },
+      { name: 'conatus', botToken: 'CONATUS:tok', chatId: 222, interactive: true, roles: ['report', 'investment', 'signal'] },
     ],
   };
 
-  test('intake · ops kinds go to the channel with the mapped role; plain report/alert keep the legacy report channel', () => {
+  test('intake · ops · unnamed kinds go to the operations channel; report/alert go to the report-role channel', () => {
     const cfg = buildUserConfig(writeCfg(tg));
-    for (const kind of ['intake', 'ops-report', 'ops-alert', 'ops-health']) expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: 'MAIN:tok', chatId: 111 });
-    for (const kind of [undefined, 'report', 'alert']) expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
+    for (const kind of [undefined, 'intake', 'ops-report', 'ops-alert', 'ops-health']) expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: 'MAIN:tok', chatId: 111 });
+    for (const kind of ['report', 'alert']) expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
   });
 
-  test('telegram.kindRoles overrides the default table (and can send a kind to investment)', () => {
+  test('telegram.kindRoles is parsed, but an override cannot move a kind across the operations/trading bot line (OUT1)', () => {
     const cfg = buildUserConfig(writeCfg({ ...tg, kindRoles: { intake: 'investment', report: 'system', bad: 3 } }));
     expect(cfg.telegram.kindRoles).toEqual({ intake: 'investment', report: 'system' });
-    expect(resolveReportTarget(cfg, 'intake')).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
-    expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: 'MAIN:tok', chatId: 111 });
+    expect(resolveReportTarget(cfg, 'intake')).toEqual({ botToken: 'MAIN:tok', chatId: 111 });
+    expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
   });
 
-  test('without explicit channels a purpose kind keeps the legacy report channel (public configs unchanged)', () => {
+  test('without explicit channels a purpose kind goes to the main home and a finance kind keeps the legacy report channel', () => {
     const { channels: _c, ...legacy } = tg;
-    const cfg = buildUserConfig(writeCfg(legacy));
-    expect(resolveReportTarget(cfg, 'intake')).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
+    const cfg = buildUserConfig(writeCfg({ ...legacy, homeChannel: 111 }));
+    expect(resolveReportTarget(cfg, 'intake')).toEqual({ botToken: 'MAIN:tok', chatId: 111 });
+    expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: 'CONATUS:tok', chatId: 222 });
   });
 
   test('sendTelegramReport with kind posts to the role channel bot', async () => {

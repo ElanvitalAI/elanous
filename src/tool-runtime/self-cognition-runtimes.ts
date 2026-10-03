@@ -11,6 +11,7 @@ export const SELF_COGNITION_TOOL_NAMES = [
   'logs_query',
   'ops_status',
   'memory_recall',
+  'context_now',
 ] as const;
 
 type SelfCognitionToolName = (typeof SELF_COGNITION_TOOL_NAMES)[number];
@@ -23,7 +24,14 @@ function coreTools(): CoreToolsModule {
   return require('../domains/core-tools.js') as CoreToolsModule;
 }
 
+export const CONTEXT_NOW_SPEC: LLMToolSpec = {
+  name: 'context_now',
+  description: '지금 무엇이 돌고 있는지 릴리스 칸·열린 결정·자리 원장·최근 맥락 이벤트의 출처 있는 요약을 읽는다. 원문 대화는 반환하지 않는다.',
+  parameters: { type: 'object', properties: { topic: { type: 'string', description: '칸 id·제목 또는 이벤트 요약에 들어 있는 낱말(선택).' } }, required: [] },
+};
+
 function coreSpec(name: SelfCognitionToolName): LLMToolSpec {
+  if (name === 'context_now') return CONTEXT_NOW_SPEC;
   const spec = coreTools().CORE_TOOL_SPECS.find(candidate => candidate.name === name);
   if (!spec) throw new Error(`Missing core tool spec for self-cognition runtime '${name}'`);
   return spec;
@@ -193,9 +201,11 @@ export const SELF_COGNITION_RUNTIMES: readonly ToolRuntime[] = SELF_COGNITION_TO
   get spec() {
     return coreSpec(name);
   },
-  run: async (args, ctx) => name === 'memory_recall' || name === 'self_recall'
-    ? runRecall(name, args, ctx)
-    : toToolRunResult(await coreTools().buildCoreTools().dispatch(name, args)),
+  run: async (args, ctx) => name === 'context_now'
+    ? (await import('../context-bus/context-now.js')).contextNow({ ...(typeof args.topic === 'string' ? { topic: args.topic } : {}) })
+    : name === 'memory_recall' || name === 'self_recall'
+      ? runRecall(name, args, ctx)
+      : toToolRunResult(await coreTools().buildCoreTools().dispatch(name, args)),
 }));
 
 /** MCP catalog metadata derived from the same name ledger as the runtimes. */

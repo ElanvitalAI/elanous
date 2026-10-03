@@ -50,7 +50,7 @@ import type { SkillTier } from './skills/runner.js';
 import { sharedAgentSkillRoots } from './skills/shared-agent-skill-roots.js';
 import {
   isModelTier,
-  isModelTierPersona,
+  isModelTierProfile,
   type BudgetUserConfig,
   type ModelTier,
   type ModelTierUserConfig,
@@ -450,6 +450,8 @@ export interface SkillSource {
 export interface SkillsConfig {
   activeSet: SkillSetName;
   dirs: string[];
+  /** Gift redemption API origin; defaults to https://elanous.ai. */
+  giftEndpoint?: string;
   /** Include the existing shared ~/.agents/skills directory. Default true; false opts out. */
   includeSharedAgentSkills?: boolean;
   /**
@@ -766,6 +768,7 @@ function skillsDefaults(): SkillsConfig {
   return {
     activeSet: 'claudecode',
     dirs: d ? [d] : [],
+    giftEndpoint: 'https://elanous.ai',
     includeSharedAgentSkills: true,
     allow: [],
     deny: [],
@@ -912,8 +915,8 @@ export interface TelegramConfig {
   /** 누가 Q&A 폴링을 하나 — 기본(없음·`'nexus'`)은 넥서스 데몬, `'standalone'` 이면
    *  넥서스는 폴링하지 않고 `elanous telegram run` 이 맡는다. */
   poller?: 'nexus' | 'standalone';
-  /** 발송 목적(kind) → 채널 역할. 명시 `channels` 가 있을 때만 쓴다 — 표에 없는 kind 는 옛 `reportChannel` 로 간다.
-   *  기본표는 `DEFAULT_KIND_ROLES`(telegram-report.ts) · 여기 값이 덮어쓴다. */
+  /** 레거시 kind→역할 설정(읽기 호환). 선택한 채널의 봇이 kind 정책의
+   *  운영/매매 경계를 지킬 때만 발송 라우팅에 적용한다. */
   kindRoles?: Record<string, string>;
   /** `#현장` 캡션에 행사 슬러그가 없을 때 쓸 기본 행사(예: `marketers-night-2026-10`). 없으면 `field-<로컬 날짜>`. */
   fieldDefaultEvent?: string;
@@ -2023,7 +2026,12 @@ function parseModelTierFieldOrUndefined(v: unknown): ModelTier | undefined {
 function parseModelTierConfig(raw: unknown): ModelTierUserConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
-  const persona = isModelTierPersona(r.persona) ? r.persona : undefined;
+  // Compatibility is read-only: the normalized config and subsequent writes use profile.
+  let profile = isModelTierProfile(r.profile) ? r.profile : undefined;
+  if (r.profile === undefined && r.persona !== undefined) {
+    debug.log('config', 'deprecated-key', { from: 'modelTier.persona', to: 'modelTier.profile' });
+    if (isModelTierProfile(r.persona)) profile = r.persona;
+  }
   const preset = typeof r.preset === 'string' && r.preset.trim().length > 0
     ? r.preset.trim()
     : undefined;
@@ -2057,7 +2065,7 @@ function parseModelTierConfig(raw: unknown): ModelTierUserConfig | undefined {
   const embedding = parseModelTierFieldOrUndefined(r.embedding);
   const vision = parseModelTierFieldOrUndefined(r.vision);
   const out: ModelTierUserConfig = {
-    ...spreadIfDefined('persona', persona),
+    ...spreadIfDefined('profile', profile),
     ...spreadIfDefined('preset', preset),
     ...spreadIfDefined('voice', voice),
     ...spreadIfDefined('llm', llm),
@@ -3429,7 +3437,9 @@ export interface RoleLlmResolveOptions {
  *  ⛔ 아무 override 도 없으면 ③~⑥ 만 타므로 산출이 종전과 «같다»(§4f 불변식 · NL 진입 무변경). */
 export function resolveRoleLlm(role: ModelRole, opts: RoleLlmResolveOptions = {}): RoleLlmResolution {
   const config = opts.config ?? getUserConfig();
-  const globalProvider = resolveActiveProvider(config);
+  // 전역 provider 는 필요할 때만 푼다 — 역할이 provider 를 명시했으면 전역 provider 가 없어도 해석된다.
+  let activeProvider: LLMProviderName | undefined;
+  const globalProvider = (): LLMProviderName => (activeProvider ??= resolveActiveProvider(config));
   // 명시 인자가 있으면 그것이 진실 — 없을 때만 발사 시점에 정해진 값을 읽는다(둘 다 source='flag').
   const flagSpec = (opts.overrides ?? launchRoleLlmOverrides)?.[role];
   const layers: ReadonlyArray<readonly [RoleLlmSpec | undefined, RoleLlmSource]> = [
@@ -3438,7 +3448,7 @@ export function resolveRoleLlm(role: ModelRole, opts: RoleLlmResolveOptions = {}
   ];
   for (const [spec, source] of layers) {
     if (!spec) continue;
-    const provider = spec.provider ?? globalProvider;
+    const provider = spec.provider ?? globalProvider();
     const pinned = spec.model?.trim();
     let resolution: RoleLlmResolution | undefined;
     if (pinned) resolution = { model: pinned, provider, ...(spec.tier ? { tier: spec.tier } : {}), source };
@@ -3447,7 +3457,7 @@ export function resolveRoleLlm(role: ModelRole, opts: RoleLlmResolveOptions = {}
     if (resolution) { observeRoleLlm(role, resolution, spec); return resolution; }
     // 세 칸이 «다 비었으면» 아래 층으로 흘린다 — 빈 칸은 선언이 아니다.
   }
-  const baseline = resolveRoleLlmBaseline(role, config, globalProvider);
+  const baseline = resolveRoleLlmBaseline(role, config, globalProvider());
   if (opts.overrides || launchRoleLlmOverrides || config.roleLlm?.[role]) observeRoleLlm(role, baseline, flagSpec);
   return baseline;
 }
@@ -3463,17 +3473,49 @@ export function resolveRoleModel(role: ModelRole, config: UserConfig = getUserCo
 }
 
 
+export type StewardLoopMode = 'off' | 'shadow' | 'live';
+
 export type SeatLoopMode = 'off' | 'shadow' | 'on';
+
+export interface PersonaLoopConfig { enabled: boolean }
 
 export interface SeatLoopConfig {
   /** No seat actions by default; shadow observes without execution, on permits the seat loop to act. */
   mode: SeatLoopMode;
+  /** Seat-to-seat and human questions default to shadow even when the checklist loop is on. */
+  questions?: 'shadow' | 'on';
   seats?: string[];
   podPool?: string;
   reportPr?: number;
+  /** Parent routing and age limits for checklist stalls; omitted values use findStalls defaults. */
+  stall?: { parents?: Record<string, string>; redMinutes?: number; blockedMinutes?: number };
+}
+
+export type EventSeat = 'OP' | 'TC' | 'MK' | 'UX';
+export interface EventRoute { source: 'linear' | 'asana' | 'github'; kind: string; seat: EventSeat; loop: 'seat' }
+export interface EventsConfig { mode: 'shadow' | 'on'; routes: EventRoute[]; linearAssignees: Record<string, EventSeat> }
+
+export function parseEventsConfig(input: unknown): EventsConfig {
+  const events = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  const routes: EventRoute[] = [];
+  const linearAssignees: Record<string, EventSeat> = Object.create(null);
+  if (events.linearAssignees && typeof events.linearAssignees === 'object' && !Array.isArray(events.linearAssignees)) {
+    for (const [id, seat] of Object.entries(events.linearAssignees)) {
+      if (id.trim() && (seat === 'OP' || seat === 'TC' || seat === 'MK' || seat === 'UX')) linearAssignees[id] = seat;
+    }
+  }
+  if (Array.isArray(events.routes)) for (const value of events.routes) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const route = value as Record<string, unknown>;
+    if ((route.source === 'linear' || route.source === 'asana' || route.source === 'github') && typeof route.kind === 'string' && route.kind.trim()
+      && (route.seat === 'OP' || route.seat === 'TC' || route.seat === 'MK' || route.seat === 'UX') && route.loop === 'seat')
+      routes.push({ source: route.source, kind: route.kind, seat: route.seat, loop: route.loop });
+  }
+  return { mode: events.mode === 'on' ? 'on' : 'shadow', routes, linearAssignees };
 }
 
 export interface UserConfig {
+  events?: EventsConfig;
   /** Explicit HTTPS destination for doctor diagnostics; absent means no upload. */
   diagnostics?: { uploadUrl?: string };
   /** Root CLI help audience; absent or invalid means owner. */
@@ -3482,12 +3524,14 @@ export interface UserConfig {
   hitl?: { executionDeadlineMinutes?: number };
   coo?: { linearProject?: string };
   decisions?: { linearProjection: { enabled: boolean } };
+  /** Per-seat goal and Pod limits; missing or invalid limits use seat-budget defaults. */
+  org?: { budget?: Record<string, { dailyGoals?: number; concurrentPods?: number }> };
   /** Steward and seat loops are parsed independently. An absent seat remains off. */
-  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig };
+  loops?: { steward?: { mode?: StewardLoopMode; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig; persona?: PersonaLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
   harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number };
-  /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
+  /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
   pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number } };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
@@ -3815,7 +3859,7 @@ function defaultConfig(): UserConfig {
     cli: { helpRole: 'owner' },
     coo: { linearProject: '외부 행정·큰 일 (COO)' },
     decisions: { linearProjection: { enabled: false } },
-    loops: { seat: { mode: 'off', seats: ['MK'], podPool: 'pool-node-b@node-b:8' } },
+    loops: { steward: { mode: 'shadow' }, seat: { mode: 'off', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' }, persona: { enabled: false } },
     skillRouter: { ...SR_DEFAULTS },
     llm: { ...LLM_DEFAULTS },
     skills: skillsDefaults(),
@@ -4296,7 +4340,7 @@ function parseStewardTracks(input: unknown): Record<string, string> | undefined 
 }
 
 function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
-  const defaults: SeatLoopConfig = { mode: 'off', seats: ['MK'], podPool: 'pool-node-b@node-b:8' };
+  const defaults: SeatLoopConfig = { mode: 'off', questions: 'shadow', seats: ['MK'], podPool: 'pool-node-b@node-b:8' };
   if (!input || typeof input !== 'object' || Array.isArray(input)) return defaults;
   const seat = (input as Record<string, unknown>).seat;
   if (!seat || typeof seat !== 'object' || Array.isArray(seat)) return defaults;
@@ -4304,20 +4348,35 @@ function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
   const mode = values.mode;
   return {
     mode: mode === 'on' || mode === 'shadow' ? mode : 'off',
+    questions: values.questions === 'on' ? 'on' : 'shadow',
     seats: Array.isArray(values.seats) && values.seats.length > 0
       && values.seats.every((value) => typeof value === 'string' && /^(?:MK|OP|TC|UX)$/.test(value))
       ? [...new Set(values.seats as string[])] : ['MK'],
     podPool: typeof values.podPool === 'string' && values.podPool.trim() ? values.podPool.trim() : defaults.podPool,
     ...(typeof values.reportPr === 'number' && Number.isSafeInteger(values.reportPr) && values.reportPr > 0
       ? { reportPr: values.reportPr } : {}),
+    ...(() => {
+      const stall = values.stall;
+      if (!stall || typeof stall !== 'object' || Array.isArray(stall)) return {};
+      const raw = stall as Record<string, unknown>;
+      const parents = raw.parents && typeof raw.parents === 'object' && !Array.isArray(raw.parents)
+        ? Object.fromEntries(Object.entries(raw.parents).filter(([from, to]) =>
+          /^(?:MK|OP|TC|UX)$/.test(from) && typeof to === 'string' && /^(?:MK|OP|TC|UX)$/.test(to) && from !== to))
+        : undefined;
+      const minutes = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+      return { stall: {
+        ...(parents ? { parents } : {}),
+        ...(minutes(raw.redMinutes) ? { redMinutes: raw.redMinutes } : {}),
+        ...(minutes(raw.blockedMinutes) ? { blockedMinutes: raw.blockedMinutes } : {}),
+      } };
+    })(),
   };
 }
 
 function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return undefined;
-  const value = (input as Record<string, unknown>).steward;
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const s = value as Record<string, unknown>;
+  const loops = input && typeof input === 'object' && !Array.isArray(input) ? input as Record<string, unknown> : {};
+  const value = loops.steward;
+  const s = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const roles: NonNullable<NonNullable<UserConfig['loops']>['steward']>['roles'] = {};
   if (s.roles && typeof s.roles === 'object' && !Array.isArray(s.roles)) {
     for (const [role, entry] of Object.entries(s.roles)) {
@@ -4327,8 +4386,9 @@ function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
     }
   }
   return { steward: {
-    mode: s.mode === 'act' ? 'act' : 'observe',
-    // Absent or invalid launch keys stay absent: launch.ts applies the defaults (shadow · 3 · pool-node-b@node-b:8).
+    mode: s.mode === 'off' || s.mode === 'shadow' || s.mode === 'live' ? s.mode :
+      s.launch === 'off' || s.launch === 'shadow' || s.launch === 'live' ? s.launch : 'shadow',
+    // A valid legacy launch setting remains effective when mode is absent; explicit mode always wins.
     ...(s.launch === 'off' || s.launch === 'shadow' || s.launch === 'live' ? { launch: s.launch } : {}),
     ...(typeof s.maxParallel === 'number' && Number.isSafeInteger(s.maxParallel) && s.maxParallel > 0 ? { maxParallel: s.maxParallel } : {}),
     ...(typeof s.podPool === 'string' && s.podPool.trim() ? { podPool: s.podPool.trim() } : {}),
@@ -4450,8 +4510,22 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const rawNotifications = rawGlobalObj?.notifications ?? rawObj.notifications;
   const autopilotConfig = parseAutopilotConfig(rawObj.autopilot);
   const stewardLoops = parseStewardLoopsConfig(rawObj.loops);
+  const orgRaw = rawObj.org && typeof rawObj.org === 'object' && !Array.isArray(rawObj.org) ? rawObj.org as Record<string, unknown> : {};
+  const budgetRaw = orgRaw.budget && typeof orgRaw.budget === 'object' && !Array.isArray(orgRaw.budget) ? orgRaw.budget as Record<string, unknown> : {};
+  const seatBudgets: NonNullable<NonNullable<UserConfig['org']>['budget']> = Object.create(null);
+  for (const [seat, value] of Object.entries(budgetRaw)) {
+    if (!seat || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const row = value as Record<string, unknown>;
+    const dailyGoals = row.dailyGoals;
+    const concurrentPods = row.concurrentPods;
+    seatBudgets[seat] = {
+      ...(typeof dailyGoals === 'number' && Number.isSafeInteger(dailyGoals) && dailyGoals >= 0 ? { dailyGoals } : {}),
+      ...(typeof concurrentPods === 'number' && Number.isSafeInteger(concurrentPods) && concurrentPods >= 0 ? { concurrentPods } : {}),
+    };
+  }
 
   return {
+    ...(Object.keys(seatBudgets).length ? { org: { budget: seatBudgets } } : {}),
     pod: {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
       ...(typeof legacyPod.hostMirror === 'string' && legacyPod.hostMirror.trim() ? { hostMirror: legacyPod.hostMirror.trim() } : {}),
@@ -4583,6 +4657,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     skills: {
       activeSet: normalizeSkillSet(sk.activeSet),
       dirs: strArray(sk.dirs, skillsDefaults().dirs),
+      giftEndpoint: str(sk.giftEndpoint) ?? 'https://elanous.ai',
       includeSharedAgentSkills: sk.includeSharedAgentSkills !== false,
       ...(() => { const sources = parsePersistedSkillSources(sk.sources, sk.connected); return sources ? { sources } : {}; })(),
       allow: strArray(sk.allow, []),
@@ -5112,7 +5187,9 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     coo: { linearProject: typeof (rawObj.coo as { linearProject?: unknown } | undefined)?.linearProject === 'string' && (rawObj.coo as { linearProject: string }).linearProject.trim()
       ? (rawObj.coo as { linearProject: string }).linearProject.trim() : '외부 행정·큰 일 (COO)' },
     decisions: { linearProjection: { enabled: ((rawObj.decisions as { linearProjection?: { enabled?: unknown } } | undefined)?.linearProjection?.enabled === true) } },
-    loops: { ...(stewardLoops ?? {}), seat: parseSeatLoopsConfig(rawObj.loops) },
+    loops: { ...(stewardLoops ?? {}), seat: parseSeatLoopsConfig(rawObj.loops),
+      persona: { enabled: (rawObj.loops as { persona?: { enabled?: unknown } } | undefined)?.persona?.enabled === true } },
+    events: parseEventsConfig(rawObj.events),
     // M1-1: sparse — undefined when the user hasn't set anything, so
     // resolvers fall through to zero-config defaults.
     ...spreadIfDefined('modelTier', parseModelTierConfig(rawObj.modelTier)),
@@ -5692,6 +5769,8 @@ export function saveUserConfig(
     ? rawRest.autopilot as Record<string, unknown> : {};
   const rawLoops = rawRest.loops && typeof rawRest.loops === 'object' && !Array.isArray(rawRest.loops)
     ? rawRest.loops as Record<string, unknown> : {};
+  const rawSteward = rawLoops.steward && typeof rawLoops.steward === 'object' && !Array.isArray(rawLoops.steward)
+    ? rawLoops.steward as Record<string, unknown> : {};
   if (cfg.loops) delete rawRest.loops;
   if (cfg.pod?.hostMirror) {
     const rawPod = rawRest.pod && typeof rawRest.pod === 'object' && !Array.isArray(rawRest.pod)
@@ -5711,8 +5790,10 @@ export function saveUserConfig(
     ...rawRest,
     ...(cfg.loops ? { loops: {
       ...rawLoops,
+      ...(cfg.loops.steward ? { steward: { ...rawSteward, mode: cfg.loops.steward.mode ?? cfg.loops.steward.launch ?? 'shadow' } } : {}),
       ...(cfg.loops.seat ? { seat: {
         mode: cfg.loops.seat.mode,
+        questions: cfg.loops.seat.questions ?? 'shadow',
         seats: cfg.loops.seat.seats ?? ['MK'],
         podPool: cfg.loops.seat.podPool ?? 'pool-node-b@node-b:8',
         ...(cfg.loops.seat.reportPr === undefined ? {} : { reportPr: cfg.loops.seat.reportPr }),
@@ -5783,6 +5864,7 @@ export function saveUserConfig(
     skills: stripUndef({
       activeSet: cfg.skills.activeSet,
       dirs: [...cfg.skills.dirs],
+      giftEndpoint: cfg.skills.giftEndpoint === 'https://elanous.ai' ? undefined : cfg.skills.giftEndpoint,
       // EN5 — only connected roots are persisted (preset/shared/package are derived). The dev-only `connected` key is not written back.
       sources: cfg.skills.sources && cfg.skills.sources.some((source) => source.kind === 'connected')
         ? cfg.skills.sources.filter((source) => source.kind === 'connected').map(({ id, path, enabled }) => ({ id, path, enabled }))
@@ -6039,7 +6121,7 @@ export function saveUserConfig(
     ...(cfg.tabs && Object.keys(cfg.tabs).length > 0 ? { tabs: cfg.tabs } : {}),
     // M1-2b: sparse — emit only when explicitly set. Keeps Path-A-only
     // users' file clean (no empty modelTier:{} blobs).
-    ...(cfg.modelTier ? { modelTier: cfg.modelTier } : {}),
+    ...(cfg.modelTier ? { modelTier: parseModelTierConfig(cfg.modelTier) } : {}),
     ...(cfg.sessionFabric ? { sessionFabric: cfg.sessionFabric } : {}),
     ...(cfg.nextFluent ? { nextFluent: cfg.nextFluent } : {}),
     ...(cfg.taste ? { taste: cfg.taste } : {}),

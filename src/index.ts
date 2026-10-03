@@ -9,6 +9,7 @@ import { LOGS_SINCE_OPTION, registerLogsCommands } from './cli/logs-cli.js';
 import { registerDocsCommands } from './cli/docs-cli.js';
 import { registerA2ACommands } from './cli/a2a-cli.js';
 import { registerPluginCommands } from './cli/plugin-cli.js';
+import { registerMakeCommand } from './cli/make-cli.js';
 import { registerConnectCommand, registerSkillsCommands } from './cli/skills-cli.js';
 import { registerImportCommand } from './cli/import-cli.js';
 import { registerPersonaCommands } from './cli/persona-cli.js';
@@ -873,8 +874,10 @@ seatCmd.command('loop').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
   .option('--json', 'JSON 출력')
   .action(async (opts: { seat: string; once: boolean; json?: boolean }) => {
     try {
-      const { runSeatLoopOnce } = await import('./seat-loop/seat-loop.js');
-      const result = await runSeatLoopOnce(opts.seat);
+      // V3 F5: without the sink, the seat loop's judgment lines (seat.loop) never reach the log store when cron runs it.
+      await (await import('./domains/standalone-log-sink.js')).registerStandaloneLogSink('seat-loop');
+      const { runSeatLoopTurn } = await import('./seat-loop/seat-loop.js');
+      const result = await runSeatLoopTurn(opts.seat);
       if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
       else console.log(`seat loop ${opts.seat}: ${result.status}${'runId' in result && result.runId ? ` ${result.runId}` : ''}`);
     } catch (error) { console.error(`seat loop: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
@@ -913,6 +916,7 @@ registerCardCommand(program);
 registerLaunchHeadCommands(program);
 registerA2ACommands(program);
 registerPluginCommands(program);
+registerMakeCommand(program);
 registerSkillsCommands(program);
 registerConnectCommand(program);
 registerImportCommand(program);
@@ -3024,6 +3028,24 @@ const harnessOrchestrateCmd = registerHarnessOrchestrateCapabilityOptions(
     await runHarnessOrchestrateExecution(plan, parts);
   });
 
+const contextCmd = program.command('context').description('외부 에이전트 맥락 이벤트');
+contextCmd.command('hooks').description('Claude Code 맥락 훅 설정').command('install')
+  .requiredOption('--print', '설정 조각만 출력하고 설정 파일은 수정하지 않음')
+  .action(async () => {
+    const { claudeHooksSettings } = await import('./context-bus/claude-hooks-install.js');
+    console.log(claudeHooksSettings(REPOSITORY_ROOT));
+  });
+contextCmd.command('emit')
+  .requiredOption('--kind <kind>', 'claimed|done|asked|guide-changed')
+  .requiredOption('--summary <line>', '한 줄 요약')
+  .requiredOption('--source <link>', '출처 링크')
+  .action(async (opts: { kind: string; summary: string; source: string }) => {
+    if (!['claimed', 'done', 'asked', 'guide-changed'].includes(opts.kind)) throw new Error('context emit --kind must be claimed|done|asked|guide-changed');
+    const { recordExternalEvent } = await import('./context-bus/external-events.js');
+    recordExternalEvent({ origin: 'claude-code', kind: opts.kind as import('./context-bus/external-events.js').ContextHookKind,
+      summary: opts.summary, source: opts.source });
+  });
+
 const coordCmd = program.command('coord').description('조율 채널 맥락 원장');
 coordCmd.command('event').command('record')
   .requiredOption('--seat <ID>', '발신 자리')
@@ -3975,11 +3997,12 @@ selfCmd
   .option('--changed', '변경 파일 범위 게이트임을 명시한다')
   .option('--base <ref>', '커밋됐지만 PR 없는 변경의 비교 기준(ref...HEAD)')
   .option('--pr <number>', '열린 PR 번호에서 gh pr view files로 변경 파일을 읽는다')
-  .action((opts: { changed?: boolean; base?: string; pr?: string }) => {
-    if (!opts.changed) { ui.error('self gate requires --changed'); process.exitCode = 2; return; }
+  .option('--shards [number]', '메모리 예산에 맞춰 시험을 별도 프로세스로 분할한다 (기본 2)')
+  .action((opts: { changed?: boolean; base?: string; pr?: string; shards?: string | boolean }) => {
+    if (!opts.changed && opts.shards === undefined) { ui.error('self gate requires --changed or --shards'); process.exitCode = 2; return; }
     try {
       const { runSelfGateCli } = require('./self-implement/gate-cli.js') as typeof import('./self-implement/gate-cli.js');
-      const result = runSelfGateCli(process.cwd(), { base: opts.base, pr: opts.pr });
+      const result = runSelfGateCli(process.cwd(), { base: opts.base, pr: opts.pr, shards: opts.shards === undefined ? undefined : opts.shards === true ? 2 : Number(opts.shards) });
       console.log(result.lines.join('\n'));
       process.exitCode = result.exitCode;
     } catch (error) {
@@ -4011,7 +4034,8 @@ selfCmd
 // runSelfImplement(내부 SelfImplement 툴과 동일 코어)를 감싼다: fork→worktree→헤드리스 goal-loop
 // (+클린빌드 앵커)→gate(bun test)→PR(HITL). PR-open 은 --open-pr(명시 승인)일 때만·기본 fail-closed.
 selfCmd
-  .command('implement <feature...>')
+  .command('implement [feature...]')
+  .option('--feature-file <path>', 'feature 문면을 파일에서 읽는다 (문면을 argv 에 싣지 않음)')
   .description('자율 구현(self-build) — feature 를 격리 worktree 에서 goal-loop + 클린빌드 앵커로 끝까지 구현하고 gate(bun test) 통과까지. --config-dir 의 provider 로 모델 선택(gemma 등). PR-open 은 --open-pr(HITL 명시승인)일 때만. 수분 소요.')
   .option('--base <branch>', 'PR base 브랜치(생략 시 provider 기본)')
   .option('--no-draft', 'non-draft PR (기본 draft)')
@@ -4029,8 +4053,11 @@ selfCmd
   .option('--no-supervise', '⛔ 런 슈퍼바이저를 «끈다»(대표 2026-08-22: ***기본 ON***) — 켜져 있으면 실행이 끝나면 실패를 «트리아지»해서 다시 걸 수 있으면 스스로 재개한다(끝까지). 정지 사유는 converged|needs-human|max-rounds|no-progress 로 각각 «다른 값». 관측=elanous logs --category self-dev.supervisor')
   .option('--supervise-rounds <n>', '슈퍼바이저 재개 라운드 상한 (기본 3 · 끄려면 --no-supervise)')
   .option('--json', '구조화 출력 {stage, ok, branch, worktree, prUrl?, merged?}')
-  .action(async (parts: string[], opts: { base?: string; draft?: boolean; openPr?: boolean; autoMerge?: boolean; autoReview?: boolean; maxWait?: string; json?: boolean; plan?: boolean; enhance?: boolean; ground?: boolean; observeOnly?: boolean }) => {
-    const feature = parts.join(' ').trim();
+  .action(async (parts: string[], opts: { featureFile?: string; base?: string; draft?: boolean; openPr?: boolean; autoMerge?: boolean; autoReview?: boolean; maxWait?: string; json?: boolean; plan?: boolean; enhance?: boolean; ground?: boolean; observeOnly?: boolean }) => {
+    if (opts.featureFile && parts.length > 0) { ui.error('--feature-file 과 위치 인자 feature 는 함께 줄 수 없다'); process.exit(2); }
+    let feature: string;
+    try { feature = (opts.featureFile ? readFileSync(opts.featureFile, 'utf8') : parts.join(' ')).trim(); }
+    catch (error) { ui.error(`--feature-file 읽기 실패: ${String(error)}`); process.exit(2); return; }
     if (!feature) { ui.error('feature 필요: elanous self implement "<무엇을 구현할지>"'); process.exit(2); }
     // Retired entry points must fail before run identity or log-sink setup creates observable execution state.
     if (opts.plan) { ui.error('self implement --plan is retired and rejected'); process.exit(1); return; }
@@ -4128,8 +4155,14 @@ export function setSelfOrchestrateSpawnForTesting(spawn: typeof selfOrchestrateS
   selfOrchestrateSpawnForTesting = spawn;
 }
 
+export function readSelfOrchestrateGoals(parts: string[], goalFiles: readonly string[] = []): { request: string; goals: string[] } {
+  const fileGoals = goalFiles.map((path) => readFileSync(path, 'utf8'));
+  return { request: [...parts, ...fileGoals].join(' '), goals: [...splitOrchestrateGoalTexts(parts), ...fileGoals] };
+}
+
 const selfOrchestrateCmd = selfCmd
   .command('orchestrate [goals...]')
+  .option('--goal-file <path>', '골 문면을 파일에서 읽는다 (반복 가능)', (value: string, acc: string[]) => [...acc, value], [] as string[])
   .description('병렬 self-dev — 여러 goal 을 각자 격리 worktree self-implement 서브프로세스로 동시성캡 병렬 실행. goal 은 `;;` 로 구분(또는 각 인자 1 goal). --concurrency 로 동시 잡 수(기본 2).')
   .option('--concurrency <n>', '동시 실행 잡 수 (기본 2)')
   .option('--auto-merge', '각 잡: 리뷰 clean 시 자동 병합(각 self-implement 에 --auto-merge 전달·리뷰노드 경유)')
@@ -4138,7 +4171,7 @@ const selfOrchestrateCmd = selfCmd
   .option('--base <branch>', '각 잡 PR base 브랜치')
   .option('--decompose', 'S2 — goal 1개를 LLM 으로 의존성 서브-DAG(위상 병렬 + hot-file 직렬)로 분해 후 실행')
   .addOption(new Option('--pod-skill-env', 'pod: 필수 스킬(설정 pod-skills.txt)의 키(.env)를 이 런의 Secret 으로 넘긴다 — 명시 opt-in(유료 크레딧) · 이미지엔 안 들어간다').hideHelp())
-  .addOption(new Option('--pod-pool <spec>', 'pod 풀 — 컨텍스트[@ssh호스트][:상한] 을 쉼표로, 앞이 우선(예 pool-node-b@node-b:12,pool-node-c@node-c:3) · 없으면 ELANOUS_POD_POOL · 그것도 없으면 현재 컨텍스트 하나').hideHelp())
+  .addOption(new Option('--pod-pool <spec>', 'pod 풀 — 컨텍스트[@ssh호스트][:상한][#k3d-레지스트리:포트] 쉼표, 앞이 우선(예 pool-node-b@node-b:12#k3d-elanous-registry:5051,pool-node-c@node-c:3#k3d-elanous-registry:5052) · 없으면 ELANOUS_POD_POOL · 그것도 없으면 현재 컨텍스트 하나').hideHelp())
   .addOption(new Option('--reduce', '끝에 PR 을 연 조각들을 통합 브랜치 하나로 모아(게이트 한 번) PR 하나 — `--open-pr` 과 짝 · `--auto-merge` 와는 함께 못 쓴다(elanous self reduce)').hideHelp())
   .option('--substrate <kind>', '실행 칸: local(기본 · 격리 워크트리) | pod(k8s Job · docker/harness 이미지 · MANUAL-pods-for-elanous-ops-and-dev)')
   .option('--pod-account <name>', 'pod: codex 계정(~/.elanous/auth.json openai-codex:<name> · refresh 제외 사본) · 없으면 브로커가 Job 마다 잔량 많은 계정을 돌려 준다')
@@ -4146,11 +4179,14 @@ const selfOrchestrateCmd = selfCmd
   .option('--pod-pass-env <keys>', 'pod: 호스트 env 에서 Pod 로 넘길 키(쉼표) — 예 OPENROUTER_API_KEY,ANTHROPIC_API_KEY(벤치마크 과금 경로)')
   .option('--bench-arms <spec>', 'pod 벤치마크: 골 1개를 팔마다 «라벨 한 줄만 다르게» 복제해 동시에 — "id=provider[:model][@KEY+KEY];…" (예 codex=openai-codex;or-kimi=openrouter:openrouter/moonshotai/kimi-k3@OPENROUTER_API_KEY) · --auto-merge 거부 · RFC fleet 슈퍼바이저 §A3')
   .option('--help-all', '모든 orchestrate 옵션 표시')
-  .action(function (this: Command, parts: string[], opts: { concurrency?: string; autoMerge?: boolean; autoReview?: boolean; openPr?: boolean; base?: string; teardown?: boolean; resume?: string; board?: boolean; decompose?: boolean; fabricDecompose?: boolean; maxTasks?: string; supervise?: boolean; superviseRounds?: string; json?: boolean }) {
+  .action(function (this: Command, parts: string[], opts: { goalFile?: string[]; concurrency?: string; autoMerge?: boolean; autoReview?: boolean; openPr?: boolean; base?: string; teardown?: boolean; resume?: string; board?: boolean; decompose?: boolean; fabricDecompose?: boolean; maxTasks?: string; supervise?: boolean; superviseRounds?: string; json?: boolean }) {
     return (async () => {
-    // goal 분리: 단일 인자에 `;;` 가 있으면 그걸로 split, 아니면 각 positional = 1 goal.
-    const joined = parts.join(' ');
-    let goalTexts = splitOrchestrateGoalTexts(parts);
+    // 위치 인자는 종전처럼 분리하고 파일 입력은 파일당 한 골이다.
+    let inputGoals: ReturnType<typeof readSelfOrchestrateGoals>;
+    try { inputGoals = readSelfOrchestrateGoals(parts, opts.goalFile); }
+    catch (error) { ui.error(`--goal-file 읽기 실패: ${String(error)}`); process.exit(2); return; }
+    const joined = inputGoals.request;
+    let goalTexts = inputGoals.goals;
     if ((opts as { reduce?: boolean }).reduce && opts.autoMerge) { ui.error('--reduce 는 --auto-merge 와 함께 못 쓴다 — 조각을 하나씩 main 에 병합하는 것과 하나로 모으는 것은 반대다(--open-pr 과 짝)'); process.exit(2); }
     // ☸️ 벤치 팔 — 골 1개를 팔마다 라벨 한 줄만 다르게(A/B 매뉴얼 ②) · pod 전용 · 자동 머지 금지(한 팔이 머지되면 다른 팔의 밑 땅이 바뀐다).
     const benchSpec = (opts as { benchArms?: string }).benchArms;
@@ -6298,7 +6334,7 @@ const selfDevCmd = program
   //   `drive --help` 에도 그대로 보이고 자식이 그것을 계약으로 읽는다.
   //   ⇒ 별칭을 없애지 않는다([[RFC-two-command-convergence-dev-and-pty-2026-07-28]] §6-2 = 층이 다르니
   //     `drive` 는 프리미티브로 **유지**한다) — 대신 **도움말이 그 갈림을 먼저 말하게** 한다.
-  .description('⛔ `drive` 별칭으로 부르면 옵션은 여덟뿐 (--goal · --attach · --max-steps · --poll-ms · --model · --cwd · --worktree · --json) — `--attach <ref>` 는 이미 있는 PTY 를 몬다(생략하면 셸 명령을 새로 띄운다). 나머지는 전부 `dev` 전용이고 `drive` 에서는 거부된다. dev 와 drive 는 한 명령이라 이 도움말을 공유하므로, 아래 목록은 `dev` 기준이다. ⚠️ 실험 — 통합 self-dev 파이프라인 runDevPipeline. --backend self(디폴트·elanous-chat 자체구현)|codex/claude/gemini/grok(외부). --transport pty(디폴트·worktree·--branch 필수)|acp(cwd 세션·U6·capability 미검증). 미배선 조합은 NotYetUnified 명시 거부. ★self 는 무인 완결이 기본(PR 개설→auto-review 라벨→리뷰 clean 시 병합) — 끄려면 --no-open-pr/--no-auto-review/--no-auto-merge. 관측=elanous logs --category dev-pipeline · 상세=docs/manual/MANUAL-frontdoor-selfdev-dogfood-mechanism-2026-07-25.md')
+  .description('⛔ `drive` 별칭으로 부르면 옵션은 아홉뿐 (--goal · --attach · --max-steps · --poll-ms · --model · --cwd · --worktree · --json · --jail-home) — `--attach <ref>` 는 이미 있는 PTY 를 몬다(생략하면 셸 명령을 새로 띄운다). 나머지는 전부 `dev` 전용이고 `drive` 에서는 거부된다. dev 와 drive 는 한 명령이라 이 도움말을 공유하므로, 아래 목록은 `dev` 기준이다. ⚠️ 실험 — 통합 self-dev 파이프라인 runDevPipeline. --backend self(디폴트·elanous-chat 자체구현)|codex/claude/gemini/grok(외부). --transport pty(디폴트·worktree·--branch 필수)|acp(cwd 세션·U6·capability 미검증). 미배선 조합은 NotYetUnified 명시 거부. ★self 는 무인 완결이 기본(PR 개설→auto-review 라벨→리뷰 clean 시 병합) — 끄려면 --no-open-pr/--no-auto-review/--no-auto-merge. 관측=elanous logs --category dev-pipeline · 상세=docs/manual/MANUAL-frontdoor-selfdev-dogfood-mechanism-2026-07-25.md')
   .option('--file <path>', 'input 파일(verbatim 바이트·<text...> 대신)')
   // ⭐ 대표 2026-08-11 — 발사 절차 «넷»을 한 명령으로. ask 파일을 주면 ⑴저작 → ⑵열린 PR ⊕ ⑶도는 런 검사 → ⑷발사.
   //   ⛔ 걸리면 «이름을 대며» 멈춘다(조용히 진행하지 않는다). 우회는 --force-preflight 이고 그 사실이 관측에 남는다.
@@ -6324,6 +6360,7 @@ const selfDevCmd = program
   .option('-n, --max-steps <n>', 'elanous 또는 셸 drive: 최대 제어 스텝(기본 30)')
   .option('-p, --poll-ms <ms>', 'elanous 또는 셸 drive: 제어 스텝 간 폴 간격(ms·0 허용·기본 800)')
   .option('--attach <ref>', 'drive: 이미 있는 PTY 를 몬다(생략하면 셸 명령을 새로 띄운다·pty auto 와 같은 루프)')
+  .option('--jail-home <dir>', 'drive: DRIVE-JAIL — 두뇌 입력에 이 디렉터리 밖 경로가 있으면 PTY 로 보내지 않는다')
   .option('-m, --model <id>', 'elanous 또는 셸 drive: 제어 brain LLM 모델(기본 config)')
   .option('--observe-only', 'elanous: child boot부터 SelfImplement 호출을 기록만 한다')
   .option('--isolated-root <path>', 'elanous: child config/state 격리 루트(설정 실패 시 fail-closed)')
@@ -6620,6 +6657,7 @@ const selfDevCmd = program
           ...(devOpts.worktree === true ? { worktree: true } : {}),
           ...(opts.json === true ? { json: true } : {}),
           attach: devOpts.attach,
+          ...(devOpts.jailHome ? { jailHome: devOpts.jailHome } : {}),
         }, {
           exit: ((code: number): never => {
             completionGuard.conclude();

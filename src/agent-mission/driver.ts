@@ -20,6 +20,8 @@ import { configuredWorktreeRoot } from '../user-config.js';
 import { worktreeHasChanges, commitWorktree, changedFiles } from '../self-implement/seams.js';
 import { streamLLM, type LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { emitPtyDecision, type DecisionInput } from './pty-decision.js';
+import { observeExternalEvent } from '../context-bus/external-events.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { resolvePtyWebAddress } from '../cli/pty-web-address.js';
 import { reemitPtyUsage } from '../budget/pty-usage-reemit.js';
@@ -522,6 +524,8 @@ export interface AgentMissionDeps {
   createWorktree?: typeof createWorktree;
   recordWorktreeProvenance?: typeof recordHarnessWorktreeProvenance;
   runControlLoop?: typeof runPtyControlLoop;
+  /** Capture decisions in tests without replacing the process-wide debug logger. */
+  emitPtyDecision?: typeof emitPtyDecision;
   /** Inject controller responses while keeping the production control loop. */
   controlStream?: StreamLLMFn;
   resolvePtyWebAddress?: typeof resolvePtyWebAddress;
@@ -830,6 +834,7 @@ export interface MissionControlBrainOpts {
   readonly handoffEnabled?: boolean;
   /** Screen-grounded brain summary for the next backend, never the raw PTY screen. */
   readonly onSummary?: (summary: string) => void;
+  readonly onDecision?: (text: string, reply?: { question: string; answer: string }) => void;
 }
 
 /** 기존 5-action mission 판단을 canonical PTY control-loop 결정으로 축소한다. search는 이 경계에서만
@@ -855,7 +860,7 @@ export function createMissionControlBrain(opts: MissionControlBrainOpts): RunSup
  행동(action):
  - "wait": ${backendName} 가 아직 작업 중(도구 실행/생성)이면 대기.
  - "verify": ${backendName} 가 MISSION-COMPLETE/완료를 주장하면 증거 게이트(내가 실행)로 검증. 완료주장 시 이걸 우선.
- - "send": ${backendName} 가 멈추거나 계속 진행이 필요하면 짧고 명확한 지시(text).
+ - "send": ${backendName} 가 멈추거나 계속 진행이 필요하면 짧고 명확한 지시(text). 화면의 질문에 직접 답하는 경우에만 reason 을 Answering question: <화면의 질문 원문> 으로 기록하라. 다른 send 의 reason 은 종전처럼 행동 이유를 적어라.
  - "search": ${backendName} 가 정보/라이브러리/문법/외부자원에 막혔으면 omni-crawl 로 조사(query). ⭐외부 힌트 없이 스스로 판단.
 ${opts.handoffEnabled ? ` - "handoff": 다른 담당자로 넘길 때 to(codex/claude/elanous), mission(다음 지시), carry(diff/summary 선택). carry=summary 면 reason 에 화면에서 확인한 리뷰 지적을 구체적으로 요약하라(다음 backend 에 전달된다). claude 리뷰 뒤 지적은 codex 에 summary 로 되돌려라. elanous 는 증거 게이트와 PR.
  - "ask-human": 화면에 로그인 URL/장치 코드가 보이면 reason, url/code(보이는 것만). 토큰·자격파일을 열지 마라.` : ''}${opts.provision ? `
@@ -873,6 +878,12 @@ ${opts.handoffEnabled ? ` - "handoff": 다른 담당자로 넘길 때 to(codex/c
       history.push(`s${obs.step}:${decision.action}`);
       debug.log('agent-mission', 'brain', { step: obs.step, action: decision.action,
         ...(decision.action === 'ask-human' ? {} : { reason: decision.reason.slice(0, 120) }) });
+      // A '?' on screen alone does not establish that this send answered it. Only an
+      // explicit question citation in the brain's reason can attribute the reply.
+      const citedQuestion = /^Answering question:\s*(.+\?)\s*$/i.exec(decision.reason)?.[1]?.trim();
+      const question = citedQuestion && classifierFrameLines(obs.screen).find((line) => line === citedQuestion);
+      opts.onDecision?.(`step ${obs.step}: ${decision.action}${decision.action === 'ask-human' ? '' : ` — ${decision.reason || decision.text || decision.query || ''}`}`,
+        decision.action === 'send' && decision.text?.trim() && question ? { question, answer: decision.text } : undefined);
       if (decision.reason && decision.action !== 'ask-human') opts.onSummary?.(decision.reason.slice(0, 2000));
       if (decision.action === 'handoff' && decision.to && decision.mission) return { action: 'handoff', to: decision.to, mission: decision.mission, ...(decision.carry ? { carry: decision.carry } : {}) };
       if (decision.action === 'ask-human') return { action: 'ask-human', reason: decision.reason, ...(decision.url ? { url: decision.url } : {}), ...(decision.code ? { code: decision.code } : {}) };
@@ -974,6 +985,7 @@ export function makeMissionObserveStep(deps: {
   bus: ChannelBus;
   ident: { ptyId: string; instance: string; runId?: string };
   now?: () => number;
+  onPublishedFrame?: (obs: ControlObservation) => void;
 }): (obs: ControlObservation, decision: ControlDecision) => Promise<void> {
   const now = deps.now ?? ((): number => Date.now());
   let lastFrameState: FrameState | null = null;
@@ -1008,6 +1020,7 @@ export function makeMissionObserveStep(deps: {
       ...(deps.ident.runId ? { runId: deps.ident.runId } : {}),
       ...(pngRef ? { pngRef } : {}),
     });
+    deps.onPublishedFrame?.(obs);
     // capture 는 원 semantics 유지 — 예외 전파(증거/전사 계약 불변).
     await deps.capture(`s${obs.step}-${decision.action}`);
   };
@@ -1574,9 +1587,19 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   if (deps.isMissionAborted?.()) { offLive(); throw new Error('MISSION_ABORTED'); }
   try { h = spawnPty(ptyOpts); }
   catch (error) { offLive(); throw error; }
-  deps.onPtyStarted?.(h, () => { if (liveTimer) clearInterval(liveTimer); offLive(); });
-  if (deps.isMissionAborted?.()) return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
-    rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' };
+  if (backend.name === 'codex') observeExternalEvent({ origin: 'codex-agent-mission', kind: 'started',
+    summary: 'Codex agent mission started', source: `elanous://agent-mission/${encodeURIComponent(runId)}/${encodeURIComponent(h.id)}` });
+  let contextFinished = false;
+  const finishContext = (ok: boolean): void => {
+    if (contextFinished || backend.name !== 'codex') return;
+    contextFinished = true;
+    observeExternalEvent({ origin: 'codex-agent-mission', kind: 'finished',
+      summary: `Codex agent mission ${ok ? 'completed' : 'failed'}`,
+      source: `elanous://agent-mission/${encodeURIComponent(runId)}/${encodeURIComponent(h.id)}` });
+  };
+  deps.onPtyStarted?.(h, () => { if (liveTimer) clearInterval(liveTimer); offLive(); finishContext(false); });
+  if (deps.isMissionAborted?.()) { finishContext(false); return { ok: false, reason: 'aborted', worktree: wt.path, branch: wt.branch,
+    rounds: 0, evidencePath: null, committed: false, usedOmniCrawl: false, detail: 'aborted' }; }
   const executorRef = buildExecutorPtyRef({
     ptyId: h.id,
     backend: backend.name,
@@ -1588,6 +1611,12 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   const webAddress = (deps.resolvePtyWebAddress ?? resolvePtyWebAddress)(h.id);
   process.stderr.write(`[agent-mission] pty=${h.id} watch=${webAddress.webUrl ?? `(web unavailable: ${webAddress.pwaUnavailableReason ?? 'not-resolved'})`}\n`);
   debug.log('agent-mission', 'pty-link', { id: h.id, webUrl: webAddress.webUrl, webUrlSource: webAddress.webUrlSource });
+
+  const decisionIdentity = { missionId: runId, sessionId: runId, terminalId: h.id, agent: backend.name };
+  const decisionEvent = (event: Omit<DecisionInput, keyof typeof decisionIdentity>): void => {
+    try { (deps.emitPtyDecision ?? emitPtyDecision)({ ...decisionIdentity, ...event } as DecisionInput); }
+    catch { /* Observation must not change mission control or handoff. */ }
+  };
 
   // ⭐P2 arbiter: the child is accessMode='auto' (brain-owned), so the driver —
   // the autonomous brain — must write as 'agent' or the arbiter denies it. This
@@ -1615,6 +1644,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
         : 'AGENT_YIELDED: PTY 제어가 사람에게 이양됨(takeover) — 자율 미션 중단');
     }
     h['write'](s, 'agent');
+    decisionEvent({ step: 'input', text: s === '\r' ? 'Sent Enter' : `Sent ${s.startsWith('\x1b') ? 'key' : 'text'}: ${s.startsWith('\x1b') ? 'navigation' : s}` });
   };
 
   let seq = 0;
@@ -1638,7 +1668,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       if (liveChunks % 20 === 0) debug.log('agent-mission', 'live', { chunks: liveChunks, tail: s.slice(-80).replace(/\s+/g, ' ') });
     }).catch(() => { /* noop */ });
   }, 800);
-  const stopLive = (): void => { if (liveTimer) clearInterval(liveTimer); offLive(); };
+  const stopLive = (ok = false): void => { if (liveTimer) clearInterval(liveTimer); offLive(); if (ok) finishContext(true); };
+  try {
 
   // ready + trust — backend 별 신뢰/권한 프롬프트 처리(codex=1, 이후 백엔드는 자체 handler).
   await (deps.awaitMission ? deps.awaitMission(waitForQuiet(h, 1500, 20000)) : waitForQuiet(h, 1500, 20000));
@@ -1648,7 +1679,11 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   // A trust menu can need more than one key (claude: ↓ to «Yes», then Enter) — answer until it is gone, at most 3 times.
   //   🩸 09-29: one pass sent only ↓, the mission text went into the menu and its Enter confirmed «Yes» instead of
   //   submitting the mission, which then sat unsent in the input box.
-  for (let pass = 0; pass < 3 && backend.handleTrust?.(screen, (s) => drive(s)); pass++) {
+  for (let pass = 0; pass < 3 && backend.handleTrust?.(screen, (s) => {
+    drive(s);
+    // Moving the selection is only input; the trust question is answered when the choice is confirmed.
+    if (s === '\r') decisionEvent({ step: 'answer', text: 'Answered folder trust prompt', detail: { question: 'Trust this folder?', answer: 'Confirm selected choice' } });
+  }); pass++) {
     debug.log('agent-mission', 'trust', { agent: backend.name, action: 'handled', pass });
     const trusted = (async () => { await waitForQuiet(h, 1500, 15000); return capture('trusted'); })();
     screen = await (deps.awaitMission ? deps.awaitMission(trusted) : trusted);
@@ -1761,6 +1796,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   let controllerSummary = deps.previousSummary ?? '';
   let reviewSummary = '';
   let coverageRetries = enhanceActive && checklist.length ? 2 : 0;
+  let pendingAnswer: { text: string; question: string; answer: string } | undefined;
   const search = createMissionSearch({ worktree: wt.path, omniPath });
   const brain = createMissionControlBrain({
     mission: spec.mission,
@@ -1768,6 +1804,10 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     stream: deps.controlStream,
     handoffEnabled: true,
     onSummary: (summary) => { controllerSummary = summary; },
+    onDecision: (text, reply) => {
+      pendingAnswer = reply ? { text: `${reply.answer || 'continue'}\r`, ...reply } : undefined;
+      decisionEvent({ step: 'judge', text });
+    },
     evidenceReady: () => spec.chain && spec.chain.length > 1 ? true : verifyEvidence(wt.path, spec.evidence).ok,
     search: async (query, step) => {
       usedOmni = true;
@@ -1784,9 +1824,13 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   // before asking the LLM — otherwise the mission text is typed into the prompt and the run stalls.
   const trustAwareBrain: RunSupervisor = {
     decide: (obs, signal) => {
+      pendingAnswer = undefined;
       let answer: string | undefined;
       if (backend.handleTrust?.(obs.screen, (bytes) => { answer = bytes; }) && answer !== undefined) {
         debug.log('agent-mission', 'trust', { agent: backend.name, action: 'handled-in-loop', step: obs.step });
+        decisionEvent({ step: 'judge', text: `step ${obs.step}: trust prompt` });
+        // Only the confirming Enter answers the trust question; a navigation key stays an input event.
+        if (answer === '\r') pendingAnswer = { text: answer, question: 'Trust this folder?', answer: 'Confirm selected choice' };
         emitDecision({ kind: 'ROUTE', what: `${backend.name} 폴더 신뢰 화면 → 계속`, reason: '시작 뒤 늦게 뜬 신뢰 확인', purpose: '미션을 이어 간다', target: backend.name, phase: 'implement' });
         return { action: 'input', text: answer };
       }
@@ -1872,6 +1916,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     renderPng: () => h.renderScreenPng(),
     bus,
     ident: { ptyId: h.id, instance: resolveInstanceName(), runId },
+    onPublishedFrame: (obs) => decisionEvent({ step: 'read', text: `step ${obs.step} (${obs.state}): ${classifierFrameLines(obs.screen).at(-1) ?? 'empty screen'}` }),
   });
   debug.log('agent-mission', 'takeover-wait', { id: h.id, maxWaitMs: AGENT_MISSION_TAKEOVER_WAIT_MS });
   const controlRun = runWithControlObserve(
@@ -1879,9 +1924,24 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     (d) => debug.log('agent-mission.observe', 'progress', { surfaceId: d.surfaceId, state: d.state, summary: d.summary, unknownInput: d.unknownInput, frame: d.frameCount, runId: d.runId }),
     () => {
       const handleDeps = controlDepsForHandle(h);
+      const inject = backend.name === 'claude' ? submitSeparately(handleDeps.inject) : handleDeps.inject;
       const pending = (deps.runControlLoop ?? runPtyControlLoop)(trustAwareBrain, {
         ...handleDeps,
-        ...(backend.name === 'claude' ? { inject: submitSeparately(handleDeps.inject) } : {}),
+        inject: (text) => {
+          const reply = pendingAnswer?.text === text ? pendingAnswer : undefined;
+          pendingAnswer = undefined;
+          const accepted = inject(text);
+          if (accepted) {
+            decisionEvent({ step: 'input', text: `Sent ${text.startsWith('\x1b') ? 'key' : 'text'}: ${text.startsWith('\x1b') ? 'navigation' : text}` });
+            if (reply) decisionEvent({ step: 'answer', text: 'Answered agent question', detail: { question: reply.question, answer: reply.answer } });
+          }
+          return accepted;
+        },
+        injectKey: handleDeps.injectKey && ((name, repeat) => {
+          const accepted = handleDeps.injectKey!(name, repeat);
+          if (accepted) decisionEvent({ step: 'input', text: `Pressed ${name}${repeat ? ` ×${repeat}` : ''}`, detail: { keys: name } });
+          return accepted;
+        }),
         ...(deps.isMissionAborted ? {
           controlStance: () => deps.isMissionAborted!() ? 'unknown' as const : probeControlStance(h, 'agent', (e) =>
             debug.log('agent-mission', 'hascontrol-error', { id: h.id, error: (e as Error)?.message ?? String(e) })),
@@ -1903,7 +1963,11 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
           }
         }
       },
-      verifyDone: spec.chain && spec.chain.length > 1 ? async () => ({ ok: true as const }) : verifyDone,
+      verifyDone: spec.chain && spec.chain.length > 1 ? async () => ({ ok: true as const }) : async (obs) => {
+        const verdict = await verifyDone(obs);
+        if (!verdict.ok) decisionEvent({ step: 'recover', text: 'Evidence check requires another attempt', detail: { blocked: verdict.retry, action: 'Retry after fixing evidence' } });
+        return verdict;
+      },
       handoff: async (decision, obs) => {
         try {
           if (spec.chain && decision.to !== spec.chain[1]) throw new Error(`chain order violation: expected ${spec.chain[1] ?? 'completion'}, got ${decision.to}`);
@@ -1916,6 +1980,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       askHuman: async (decision) => {
         try {
           await waitForHumanLogin(decision, handoffOps);
+          decisionEvent({ step: 'answer', text: 'Human login question resolved', detail: { question: decision.reason, answer: 'Login completed' } });
         } catch (error) {
           transitionFailure = error instanceof Error ? error.message : String(error);
           throw error;
@@ -1954,7 +2019,9 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
   }
   // A gate/PR handoff only counts as success when the control loop itself did not end in error.
   if (gatedHandoff && control.termination.kind !== 'error') {
-    stopLive();
+    // The gate hands off a branch, not a file: record what is known instead of mislabeling the worktree directory.
+    decisionEvent({ step: 'done', text: 'Mission handoff gate completed', detail: { result: { kind: 'text', ref: `branch ${wt.branch}` } } });
+    stopLive(true);
     try { h.kill(); } catch { /* noop */ }
     return { ok: true, worktree: wt.path, branch: wt.branch, rounds: control.steps, evidencePath: wt.path, committed: true, usedOmniCrawl: usedOmni,
       ...(handoffPrSkipped ? { pr: 'skipped' as const, reason: 'origin-not-github' as const } : {}),
@@ -1985,6 +2052,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
       maxFallbackDescents: runtimeFallback.maxDescents,
     });
     if (nextBackend && !deps.isMissionAborted?.()) {
+      decisionEvent({ step: 'recover', text: `Switching ${backend.name} to ${nextBackend.name}`, detail: { blocked: control.termination.message, action: `Retry with ${nextBackend.name}` } });
       const nextStep: FallbackStep = nextBackend.name === 'grok' ? 'grok' : 'codex-rotate';
       stopLive();
       if (h.pid) await (deps.terminateProcessTree ?? terminateMissionProcessTree)(h.pid);
@@ -2019,7 +2087,8 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     debug.log('agent-mission', 'commit', { ok: c.ok, out: c.out.slice(0, 120) });
   }
   debug.log('agent-mission', 'result', { ok: finalEv.ok, rounds: round, evidencePath, committed, usedOmni });
-  stopLive();
+  decisionEvent({ step: 'done', text: finalEv.ok ? 'Mission evidence accepted' : 'Mission ended without sufficient evidence', detail: { result: { kind: evidencePath ? 'file' : 'text', ref: evidencePath ?? (control.termination.kind === 'error' ? control.termination.message : 'evidence unavailable') } } });
+  stopLive(finalEv.ok);
   if (h.pid) await terminateMissionProcessTree(h.pid);
   try { h.kill(); } catch { /* noop */ }
 
@@ -2029,6 +2098,7 @@ async function runAgentMissionBody(spec: AgentMissionSpec, deps: AgentMissionDep
     ptyId: h.id, webUrl: webAddress.webUrl,
     detail: done ? '완료(증거 충족)' : (finalEv.ok ? '증거 충족(루프 종료)' : '미완(증거 부족)'),
   };
+  } finally { stopLive(); finishContext(false); }
 }
 
 /** @deprecated codex 특정 이름 — runAgentMission 을 쓰라(codex 는 기본 backend). */

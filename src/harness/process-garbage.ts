@@ -12,7 +12,9 @@ export interface GarbageProcess extends Pick<GarbageProcessRow, 'pid' | 'ppid' |
 
 const TEST_PATH = /elanous|repo\.worktrees|self-impl|\.elanous-test|gate-baseline/i;
 const TEST_DAEMON = /(?:^|[\s/])daemon\.ts(?:\s|$)/;
-const TEST_RUNNER = /\bbun\s+test\b|\bgate(?:[-\s]baseline|\b)/i;
+const TEST_RUNNER = /^(?:\S*\/)?bun\s+test(?:\s|$)/i;
+// Only the command itself counts — `bun [run|x] <…gate…>`; goal text later in argv must not (PROC1).
+const GATE_RUNNER = /^(?:\S*\/)?bun\s+(?:(?:run|x)\s+)?\S*gate(?:[-\s]baseline|\b)/i;
 const NEXUS_RUN = /\bnexus\s+run\b/;
 const TEST_MARKER = /\.elanous-test|(?:^|\s)--test(?:\s|$)/;
 
@@ -20,7 +22,7 @@ const TEST_MARKER = /\.elanous-test|(?:^|\s)--test(?:\s|$)/;
 export function isGarbageProcessTarget(command: string): boolean {
   return command.includes('elanous.mjs')
     || (TEST_DAEMON.test(command) && /elanous-nexus-|\.elanous-test/.test(command))
-    || (TEST_RUNNER.test(command) && TEST_PATH.test(command));
+    || ((TEST_RUNNER.test(command) || GATE_RUNNER.test(command)) && TEST_PATH.test(command));
 }
 
 export function classifyGarbage(
@@ -36,7 +38,7 @@ export function classifyGarbage(
     const reason: GarbageProcess['reason'] = TEST_DAEMON.test(row.command)
       && /elanous-nexus-|\.elanous-test/.test(row.command)
       ? 'orphan-test-daemon'
-      : TEST_RUNNER.test(row.command) && TEST_PATH.test(row.command)
+      : (TEST_RUNNER.test(row.command) || GATE_RUNNER.test(row.command)) && TEST_PATH.test(row.command)
         ? 'orphan-test-runner'
         : 'orphan-elanous';
     garbage.push({ pid: row.pid, ppid: row.ppid, elapsedSeconds: row.elapsedSeconds, command: row.command, reason });

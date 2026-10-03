@@ -11,6 +11,7 @@ const EXECUTION_EXECUTOR_MODULE: string = './execution-executor.js';
 const HAS_TRADING_ADDON = existsSync(join(import.meta.dir, 'execution-executor.ts'));
 import { buildHarnessSeams, classifyHeft, adversarialThreshold, ADVERSARIAL_AUTO_STEPS, postPrReview } from './harness-seams.js';
 import { runStagedHarness, type StagedHarnessSeams } from './staged-harness.js';
+import { releasePathHoldComment } from '../self-dev/release-path-guard.js';
 import { realWorktreeSeams as fakeSeams } from './harness-test-seams.js';
 
 describe('buildHarnessSeams — 실 인프라 배선(fake)', () => {
@@ -397,6 +398,68 @@ describe('buildHarnessSeams — 실 인프라 배선(fake)', () => {
     const d = await s.deploy({ objective: 'my feat', summary: 's' });
     expect(d.kind).toBe('pr');
     expect(d.ref).toBe('https://pr/harness/my-feat');
+  });
+
+  test.each(['scripts/release-loop/publish.ts', 'graphs/release/check.yaml', 'src/release-loop/manifest.ts'])(
+    'staged harness holds %s before auto-review can opt in', async (path) => {
+      const operations: string[] = [];
+      const log = spyOn(debug, 'log').mockImplementation(() => {});
+      try {
+        const s = buildHarnessSeams({ authorizeDeploy: () => true, autoReview: true, seams: fakeSeams({
+          openPr: async ({ labels }) => { expect(labels).toBeUndefined(); operations.push('open'); return { url: 'https://pr/7', number: 7 }; },
+          readPrFiles: async () => { operations.push('inspect'); return [path]; },
+          addPrLabel: async ({ label }) => { operations.push(`label:${label}`); },
+          postPrComment: async ({ body }) => { operations.push(`comment:${body}`); },
+        }) });
+        await s.plan({ objective: 'safe ordinary change' });
+        await s.execute({ objective: 'safe ordinary change', steps: [], round: 1 });
+        const result = await s.deploy({ objective: 'safe ordinary change', summary: 'done' });
+        expect(result.kind).toBe('pr');
+        expect(operations).toEqual(['open', 'inspect', 'label:elanous:release-path', `comment:${releasePathHoldComment(path)}`]);
+        expect(log).toHaveBeenCalledWith('self-dev.merge', 'release-path-hold', expect.objectContaining({ path }));
+      } finally { log.mockRestore(); }
+    },
+  );
+
+  test('staged harness does not opt in to auto-review when PR paths cannot be read', async () => {
+    const labels: string[] = [];
+    const s = buildHarnessSeams({ authorizeDeploy: () => true, autoReview: true, seams: fakeSeams({
+      readPrFiles: async () => { throw new Error('PR files unavailable'); },
+      addPrLabel: async ({ label }) => { labels.push(label); },
+    }) });
+    await s.plan({ objective: 'safe ordinary change' });
+    await s.execute({ objective: 'safe ordinary change', steps: [], round: 1 });
+    expect((await s.deploy({ objective: 'safe ordinary change', summary: 'done' })).kind).toBe('pr');
+    expect(labels).toEqual([]);
+  });
+
+  test('staged harness activates eligible ordinary PR auto-review after inspection', async () => {
+    const events: string[] = [];
+    const s = buildHarnessSeams({ authorizeDeploy: () => true, autoReview: true, seams: fakeSeams({
+      reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true, diffTruncated: false }),
+      openPr: async ({ labels }) => { expect(labels).toBeUndefined(); events.push('open'); return { url: 'https://pr/7', number: 7 }; },
+      readPrFiles: async () => { events.push('inspect'); return ['src/ordinary.ts']; },
+      addPrLabel: async ({ label }) => { events.push(`label:${label}`); },
+    }) });
+    await s.plan({ objective: 'safe ordinary change' });
+    await s.execute({ objective: 'safe ordinary change', steps: [], round: 1 });
+    await s.deploy({ objective: 'safe ordinary change', summary: 'done', verdict: 'pass' });
+    expect(events).toEqual(['open', 'inspect', 'label:auto-review']);
+  });
+
+  test('staged harness keeps ordinary PR behavior without release-path annotations', async () => {
+    const operations: string[] = [];
+    const s = buildHarnessSeams({ authorizeDeploy: () => true, autoReview: true, seams: fakeSeams({
+      openPr: async () => { operations.push('open'); return { url: 'https://pr/7', number: 7 }; },
+      readPrFiles: async () => { operations.push('inspect'); return ['src/ordinary.ts']; },
+      addPrLabel: async ({ label }) => { operations.push(`label:${label}`); },
+      postPrComment: async ({ body }) => { if (body.includes('OP approval required')) operations.push('hold-comment'); },
+    }) });
+    await s.plan({ objective: 'safe ordinary change' });
+    await s.execute({ objective: 'safe ordinary change', steps: [], round: 1 });
+    const result = await s.deploy({ objective: 'safe ordinary change', summary: 'done' });
+    expect(result.kind).toBe('pr');
+    expect(operations).toEqual(['open', 'inspect']);
   });
 
   test('auto-review decision emits redacted, bounded risk evidence without changing eligibility', async () => {

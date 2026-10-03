@@ -1,14 +1,12 @@
 // Archon-port T2.1 (2026-05-08) — DAG executor.
 //
-// Sequential topological execution. Each ready node runs to completion
-// before the next is dispatched. Parallelism is intentionally deferred
-// (Archon's executor.ts is 800+ LOC partly because of parallel
-// dispatch + fan-out — elanous's MVP runs strictly sequential).
+// Ready nodes overlap up to workflow.concurrency (default 1 = one at a time); lifecycle events retain
+// their wire shape and node_done follows actual completion order.
+// Failed nodes may route their output to an on_error handler. Subworkflow nodes invoke the same executor
+// recursively, with an independent run id and full child execution.
 //
-// Yields events as it goes — caller (CLI / SSE / tests) decides
-// rendering. Stops on the first node that fails AND has no
-// `trigger_rule: all_done` consumer (Archon parity: `all_done`
-// downstream nodes always run regardless of upstream ok).
+// Yields events as it goes — caller (CLI / SSE / tests) decides rendering. A failure with no on_error
+// route and no `trigger_rule: all_done` consumer ends the run (Archon parity).
 
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
@@ -32,6 +30,7 @@ import {
   isPromptNode,
   isSetNode,
   isShowroomNode,
+  isSubworkflowNode,
   isTaskNode,
   isSkillNode,
   isSwitchNode,
@@ -61,6 +60,7 @@ import { executeFilterNode } from './nodes/filter.js';
 import { executeTemplateNode } from './nodes/template.js';
 import { executeHttpRequestNode } from './nodes/http.js';
 import { executeShowroomNode } from './nodes/showroom.js';
+import { executeSubworkflowNode } from './nodes/subworkflow.js';
 import { executeScheduleTriggerNode, executeWebhookTriggerNode, executeDiscordTriggerNode, executeTelegramTriggerNode, executeManualTriggerNode, executeChatTriggerNode } from './nodes/triggers.js';
 import { executePluginKindNode, isPluginKindNode } from './plugin-kind-node.js';
 import type {
@@ -80,6 +80,7 @@ export async function* runWorkflow(
   deps: WorkflowDeps,
 ): AsyncGenerator<WorkflowEvent, Record<string, NodeOutput>, unknown> {
   const runId = opts.runId ?? generateRunId();
+  const mode = opts.mode ?? (opts.onlyNode ? 'only' : opts.fromNode ? 'from' : 'full');
   // Persistence (Caveat #4 follow-up): when `runDir` is set OR neither
   // override is supplied, we own the run dir and persist node outputs +
   // a final run.json. When only `artifactsDir` is overridden (the
@@ -97,10 +98,11 @@ export async function* runWorkflow(
       workflowName: opts.workflow.name,
       arguments: opts.arguments,
       startedAt,
+      mode,
     });
   }
 
-  yield { type: 'workflow_start', workflow: opts.workflow.name, runId };
+  yield { type: 'workflow_start', workflow: opts.workflow.name, runId, mode };
 
   let order: string[];
   try {
@@ -110,14 +112,151 @@ export async function* runWorkflow(
       type: 'workflow_failed',
       error: err instanceof Error ? err.message : String(err),
       partial: {},
+      mode,
     };
     return {};
   }
 
-  const outputs: Record<string, NodeOutput> = {};
   const nodeById = new Map(opts.workflow.nodes.map(n => [n.id, n] as const));
+  const startIndex = opts.fromNode ? order.indexOf(opts.fromNode) : 0;
+  const outputs: Record<string, NodeOutput> = {};
+  if (startIndex < 0 || (opts.onlyNode && !nodeById.has(opts.onlyNode))) {
+    yield { type: 'workflow_failed', error: 'unknown selected node', partial: outputs, mode };
+    return outputs;
+  }
+  if (opts.fromNode) {
+    const upstream = order.slice(0, startIndex);
+    if (!opts.previousOutputs || upstream.some(id => opts.previousOutputs?.[id] === undefined)) {
+      const error = 'source run missing upstream outputs';
+      if (shouldPersist && runDir) persistRunFinal(runDir, {
+        runId, workflowName: opts.workflow.name, arguments: opts.arguments,
+        startedAt, mode, ok: false, error, outputs, completedAt: Date.now(),
+      });
+      yield { type: 'workflow_failed', error, partial: outputs, mode };
+      return outputs;
+    }
+    for (const id of upstream) outputs[id] = opts.previousOutputs[id]!;
+  }
+  const selectedOrder = opts.onlyNode ? [opts.onlyNode] : order.slice(startIndex);
 
-  for (const id of order) {
+  // Keep the original serial path for workflows that do not opt in. Its
+  // start/done/skip sequence and gate failures are part of the CLI/SSE contract.
+  if ((opts.workflow.concurrency ?? 1) > 1 || selectedOrder.some(id => nodeById.get(id)?.on_error || opts.workflow.nodes.some(n => n.on_error === id))) {
+    const concurrency = Math.max(1, Math.min(8, opts.workflow.concurrency ?? 1));
+    const pending = new Set(selectedOrder);
+    const settled = new Set(order.slice(0, startIndex));
+    const active = new Set<string>();
+    const completed: Array<{ id: string; result: NodeOutput }> = [];
+    let wakeCompletion: (() => void) | undefined;
+    let failure: string | undefined;
+
+    while (pending.size || active.size || completed.length) {
+      if (completed.length) {
+        const { id, result } = completed.shift()!;
+        active.delete(id);
+        settled.add(id);
+        outputs[id] = result;
+        if (shouldPersist && runDir) persistNodeOutput(runDir, id, result);
+        yield { type: 'node_done', nodeId: id, result, mode, ...(result.childRunId ? { childRunId: result.childRunId } : {}) };
+        if (!result.ok && !failure) {
+          const node = nodeById.get(id)!;
+          const handler = !opts.onlyNode && node.on_error && selectedOrder.includes(node.on_error) ? node.on_error : undefined;
+          const hasAllDone = selectedOrder.some(rid => pending.has(rid) && nodeById.get(rid)?.trigger_rule === 'all_done'
+            && dependsOnFailure(rid, id, nodeById));
+          if (!handler && !hasAllDone) {
+            failure = `node '${id}' failed: ${result.error ?? '(no error message)'}`;
+          }
+        }
+        continue;
+      }
+      for (const id of selectedOrder) {
+        if (completed.length || active.size >= concurrency || failure) break;
+        if (!pending.has(id)) continue;
+        const node = nodeById.get(id)!;
+        const sources = opts.onlyNode ? [] : opts.workflow.nodes.filter(n => n.on_error === id).map(n => n.id);
+        const prerequisites = [...(node.depends_on ?? []), ...sources];
+        if (!opts.onlyNode && !prerequisites.every(dep => settled.has(dep))) continue;
+        pending.delete(id);
+        const failedSources = sources.filter(source => outputs[source] && !outputs[source]!.ok);
+        if (sources.length && !failedSources.length) {
+          settled.add(id);
+          yield { type: 'node_skipped', nodeId: id, reason: 'on_error source did not fail', mode };
+          continue;
+        }
+        if (opts.dryRun && isTriggerVariant(node)) {
+          settled.add(id);
+          yield { type: 'node_skipped', nodeId: id, reason: 'dry-run', mode };
+          continue;
+        }
+        const skipReason = opts.onlyNode ? null : shouldSkip(node, outputs, failedSources);
+        if (skipReason) {
+          settled.add(id);
+          yield { type: 'node_skipped', nodeId: id, reason: skipReason, mode };
+          continue;
+        }
+        const toolPolicy: ToolPolicy = {
+          ...(node.allowed_tools ? { allow: node.allowed_tools } : {}),
+          ...(node.denied_tools ? { deny: node.denied_tools } : {}),
+        };
+        const ctx: NodeExecContext = {
+          arguments: opts.arguments, artifactsDir, outputs: { ...outputs },
+          resolvedProvider: node.provider ?? opts.workflow.provider,
+          resolvedModel: node.model ?? opts.workflow.model, toolPolicy,
+          ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
+          ...(opts.screen !== undefined ? { screen: opts.screen } : {}),
+          ...(opts.onTokenChunk !== undefined
+            ? { onTokenChunk: (chunk: string) => opts.onTokenChunk!(id, chunk) } : {}),
+        };
+        let childRunId: string | undefined;
+        try { childRunId = isSubworkflowNode(node) && !(!opts.ignorePins && readWorkflowPin(opts.workflow.name, id) !== null) ? generateRunId() : undefined; }
+        catch { childRunId = undefined; }
+        yield { type: 'node_start', nodeId: id, nodeType: variantOf(node), mode, ...(childRunId ? { childRunId } : {}) };
+        active.add(id);
+        const finish = (result: NodeOutput) => {
+          completed.push({ id, result });
+          wakeCompletion?.();
+          wakeCompletion = undefined;
+        };
+        // W8 must-fix: a rejected node is still a completed (failed) node — otherwise it stays active and the run never ends.
+        void executeWorkflowNode(node, ctx, opts, deps, childRunId).then(finish,
+          (err: unknown) => finish({ ok: false, output: '', error: err instanceof Error ? err.message : String(err), durationMs: 0 }));
+      }
+      if (!active.size) {
+        if (!pending.size || failure) break;
+        failure = `workflow has unresolved nodes: ${[...pending].join(', ')}`;
+        break;
+      }
+      if (!completed.length) await new Promise<void>(resolve => { wakeCompletion = resolve; });
+    }
+    if (!failure) {
+      const unhandled = selectedOrder.find(id => {
+        const node = nodeById.get(id)!;
+        if (!outputs[id] || outputs[id]!.ok) return false;
+        const handledByError = !opts.onlyNode && node.on_error && selectedOrder.includes(node.on_error)
+          && outputs[node.on_error]?.ok === true;
+        const handledByAllDone = selectedOrder.some(next => nodeById.get(next)?.trigger_rule === 'all_done'
+          && dependsOnFailure(next, id, nodeById) && outputs[next]?.ok === true);
+        return !handledByError && !handledByAllDone;
+      });
+      if (unhandled) failure = `node '${unhandled}' failed: ${outputs[unhandled]!.error ?? '(no error message)'}`;
+    }
+    if (failure) {
+      if (shouldPersist && runDir) persistRunFinal(runDir, {
+        runId, workflowName: opts.workflow.name, arguments: opts.arguments,
+        startedAt, mode, ok: false, error: failure, outputs, completedAt: Date.now(),
+      });
+      yield { type: 'workflow_failed', error: failure, partial: outputs, mode };
+      return outputs;
+    }
+    if (shouldPersist && runDir) persistRunFinal(runDir, {
+      runId, workflowName: opts.workflow.name, arguments: opts.arguments,
+      startedAt, mode, ok: true, outputs, completedAt: Date.now(),
+    });
+    yield { type: 'workflow_done', outputs, mode };
+    return outputs;
+  }
+
+  for (const id of selectedOrder) {
     const node = nodeById.get(id);
     if (!node) continue;
 
@@ -128,13 +267,13 @@ export async function* runWorkflow(
     // usual; manualTrigger / chatTrigger are also covered by the
     // variant family check.
     if (opts.dryRun && isTriggerVariant(node)) {
-      yield { type: 'node_skipped', nodeId: id, reason: 'dry-run' };
+      yield { type: 'node_skipped', nodeId: id, reason: 'dry-run', mode };
       continue;
     }
 
-    const skipReason = shouldSkip(node, outputs);
+    const skipReason = opts.onlyNode ? null : shouldSkip(node, outputs);
     if (skipReason) {
-      yield { type: 'node_skipped', nodeId: id, reason: skipReason };
+      yield { type: 'node_skipped', nodeId: id, reason: skipReason, mode };
       continue;
     }
 
@@ -163,18 +302,35 @@ export async function* runWorkflow(
         : {}),
     };
 
+    const hasPin = !opts.ignorePins && readWorkflowPin(opts.workflow.name, id) !== null;
+    if (mode === 'test' && (isExternalSideEffectNode(node) || Boolean(node.judgment))
+      && !hasPin) {
+      const blocked: NodeOutput = { ok: false, output: '', error: 'pin required', durationMs: 0 };
+      outputs[id] = blocked;
+      if (shouldPersist && runDir) persistNodeOutput(runDir, id, blocked);
+      yield { type: 'node_start', nodeId: id, nodeType: variantOf(node), mode };
+      yield { type: 'node_done', nodeId: id, result: blocked, mode };
+      if (shouldPersist && runDir) persistRunFinal(runDir, {
+        runId, workflowName: opts.workflow.name, arguments: opts.arguments,
+        startedAt, mode, ok: false, error: `node '${id}' failed: pin required`,
+        outputs, completedAt: Date.now(),
+      });
+      yield { type: 'workflow_failed', error: `node '${id}' failed: pin required`, partial: outputs, mode };
+      return outputs;
+    }
+
     // RFC #2161 Phase 3 — capability requirements gate. When a node
     // declares `requires`, verify the resolved (provider, model) pair
     // satisfies every clause before we burn an LLM/bash call. Phase 5
     // tightens this by layering Live Registry (apiKey/health) on top.
-    if (node.requires) {
+    if (node.requires && !hasPin) {
       const reason = checkModelRequires(
         ctx.resolvedProvider,
         ctx.resolvedModel,
         node.requires,
       );
       if (reason) {
-        yield { type: 'node_start', nodeId: id, nodeType: variantOf(node) };
+        yield { type: 'node_start', nodeId: id, nodeType: variantOf(node), mode };
         const startedAt = Date.now();
         const blocked: NodeOutput = {
           ok: false,
@@ -184,11 +340,11 @@ export async function* runWorkflow(
         };
         outputs[id] = blocked;
         if (shouldPersist && runDir) persistNodeOutput(runDir, id, blocked);
-        yield { type: 'node_done', nodeId: id, result: blocked };
-        const remaining = order.slice(order.indexOf(id) + 1);
+        yield { type: 'node_done', nodeId: id, result: blocked, mode };
+        const remaining = selectedOrder.slice(selectedOrder.indexOf(id) + 1);
         const hasAllDone = remaining.some((rid) => {
           const rn = nodeById.get(rid);
-          return rn?.trigger_rule === 'all_done';
+          return rn?.trigger_rule === 'all_done' && dependsOnFailure(rid, id, nodeById);
         });
         if (!hasAllDone) {
           if (shouldPersist && runDir) {
@@ -197,6 +353,7 @@ export async function* runWorkflow(
               workflowName: opts.workflow.name,
               arguments: opts.arguments,
               startedAt,
+              mode,
               ok: false,
               error: `node '${id}' blocked: ${reason}`,
               outputs,
@@ -207,6 +364,7 @@ export async function* runWorkflow(
             type: 'workflow_failed',
             error: `node '${id}' blocked: ${reason}`,
             partial: outputs,
+            mode,
           };
           return outputs;
         }
@@ -214,14 +372,14 @@ export async function* runWorkflow(
       }
     }
 
-    if (node.judgment) {
+    if (node.judgment && !hasPin) {
       const reason = validateJudgmentContract(node)
         ?? (node.observes?.includes('screen') && ctx.screen === undefined
           ? 'screen observation is not wired in this run'
           : null)
         ?? (!deps.runJudgment ? 'deps.runJudgment is not wired in this runtime' : null);
       if (reason) {
-        yield { type: 'node_start', nodeId: id, nodeType: variantOf(node) };
+        yield { type: 'node_start', nodeId: id, nodeType: variantOf(node), mode };
         const nodeStartedAt = Date.now();
         const blocked: NodeOutput = {
           ok: false,
@@ -231,9 +389,10 @@ export async function* runWorkflow(
         };
         outputs[id] = blocked;
         if (shouldPersist && runDir) persistNodeOutput(runDir, id, blocked);
-        yield { type: 'node_done', nodeId: id, result: blocked };
-        const remaining = order.slice(order.indexOf(id) + 1);
-        const hasAllDone = remaining.some((rid) => nodeById.get(rid)?.trigger_rule === 'all_done');
+        yield { type: 'node_done', nodeId: id, result: blocked, mode };
+        const remaining = selectedOrder.slice(selectedOrder.indexOf(id) + 1);
+        const hasAllDone = remaining.some((rid) => nodeById.get(rid)?.trigger_rule === 'all_done'
+          && dependsOnFailure(rid, id, nodeById));
         if (!hasAllDone) {
           if (shouldPersist && runDir) {
             persistRunFinal(runDir, {
@@ -241,6 +400,7 @@ export async function* runWorkflow(
               workflowName: opts.workflow.name,
               arguments: opts.arguments,
               startedAt,
+              mode,
               ok: false,
               error: `node '${id}' blocked: ${reason}`,
               outputs,
@@ -251,6 +411,7 @@ export async function* runWorkflow(
             type: 'workflow_failed',
             error: `node '${id}' blocked: ${reason}`,
             partial: outputs,
+            mode,
           };
           return outputs;
         }
@@ -258,23 +419,25 @@ export async function* runWorkflow(
       }
     }
 
-    yield { type: 'node_start', nodeId: id, nodeType: variantOf(node) };
-    const result = node.judgment
-      ? await executeJudgmentNode(node, ctx, deps, opts.workflow.name, opts.judgmentContext)
-      : await dispatchNode(node, ctx, deps, opts.workflow.name);
+    const childRunId = isSubworkflowNode(node) && !hasPin ? generateRunId() : undefined;
+    yield { type: 'node_start', nodeId: id, nodeType: variantOf(node), mode,
+      ...(childRunId ? { childRunId } : {}) };
+    const result = isSubworkflowNode(node) && childRunId
+      ? await executeSubworkflowNode(node, ctx, deps, opts, childRunId)
+      : node.judgment && !hasPin
+        ? await executeJudgmentNode(node, ctx, deps, opts.workflow.name, opts.judgmentContext)
+        : await dispatchNode(node, ctx, deps, opts.workflow.name, opts.ignorePins);
     outputs[id] = result;
     if (shouldPersist && runDir) persistNodeOutput(runDir, id, result);
-    yield { type: 'node_done', nodeId: id, result };
+    yield { type: 'node_done', nodeId: id, result, mode,
+      ...(result.childRunId ? { childRunId: result.childRunId } : {}) };
 
-    // Stop on the first failed node UNLESS some downstream node has
-    // `trigger_rule: all_done` (which means it explicitly wants to
-    // run after failures). Cheaper than a full DAG re-walk:
-    // any-downstream-all_done in the remaining order.
+    // A failed node can continue only if a dependent all_done node will consume it.
     if (!result.ok) {
-      const remaining = order.slice(order.indexOf(id) + 1);
+      const remaining = selectedOrder.slice(selectedOrder.indexOf(id) + 1);
       const hasAllDone = remaining.some(rid => {
         const rn = nodeById.get(rid);
-        return rn?.trigger_rule === 'all_done';
+        return rn?.trigger_rule === 'all_done' && dependsOnFailure(rid, id, nodeById);
       });
       if (!hasAllDone) {
         if (shouldPersist && runDir) {
@@ -283,6 +446,7 @@ export async function* runWorkflow(
             workflowName: opts.workflow.name,
             arguments: opts.arguments,
             startedAt,
+            mode,
             ok: false,
             error: `node '${id}' failed: ${result.error ?? '(no error message)'}`,
             outputs,
@@ -293,10 +457,32 @@ export async function* runWorkflow(
           type: 'workflow_failed',
           error: `node '${id}' failed: ${result.error ?? '(no error message)'}`,
           partial: outputs,
+          mode,
         };
         return outputs;
       }
     }
+  }
+
+  // W8 must-fix: the serial path re-checks failures at the end like the parallel path — a failure whose all_done
+  // consumer was skipped (e.g. `when: false`) must not end as workflow_done.
+  const unhandled = selectedOrder.find(id => {
+    const node = nodeById.get(id);
+    if (!node || !outputs[id] || outputs[id]!.ok) return false;
+    const handledByError = !opts.onlyNode && node.on_error && selectedOrder.includes(node.on_error)
+      && outputs[node.on_error]?.ok === true;
+    const handledByAllDone = selectedOrder.some(next => nodeById.get(next)?.trigger_rule === 'all_done'
+      && dependsOnFailure(next, id, nodeById) && outputs[next]?.ok === true);
+    return !handledByError && !handledByAllDone;
+  });
+  if (unhandled) {
+    const error = `node '${unhandled}' failed: ${outputs[unhandled]!.error ?? '(no error message)'}`;
+    if (shouldPersist && runDir) persistRunFinal(runDir, {
+      runId, workflowName: opts.workflow.name, arguments: opts.arguments,
+      startedAt, mode, ok: false, error, outputs, completedAt: Date.now(),
+    });
+    yield { type: 'workflow_failed', error, partial: outputs, mode };
+    return outputs;
   }
 
   if (shouldPersist && runDir) {
@@ -305,13 +491,47 @@ export async function* runWorkflow(
       workflowName: opts.workflow.name,
       arguments: opts.arguments,
       startedAt,
+      mode,
       ok: true,
       outputs,
       completedAt: Date.now(),
     });
   }
-  yield { type: 'workflow_done', outputs };
+  yield { type: 'workflow_done', outputs, mode };
   return outputs;
+}
+
+async function executeWorkflowNode(
+  node: DagNode,
+  ctx: NodeExecContext,
+  opts: RunWorkflowOpts,
+  deps: WorkflowDeps,
+  childRunId?: string,
+): Promise<NodeOutput> {
+  const startedAt = Date.now();
+  // W8 must-fix: every step (pin read included) is inside the try — a throw becomes a failed result, never a stuck active node.
+  try {
+    const hasPin = !opts.ignorePins && readWorkflowPin(opts.workflow.name, node.id) !== null;
+    if (opts.mode === 'test' && (isExternalSideEffectNode(node) || Boolean(node.judgment)) && !hasPin) {
+      return { ok: false, output: '', error: 'pin required', durationMs: 0 };
+    }
+    if (node.requires && !hasPin) {
+      const reason = checkModelRequires(ctx.resolvedProvider, ctx.resolvedModel, node.requires);
+      if (reason) return { ok: false, output: '', error: `requires unmet — ${reason}`, durationMs: Date.now() - startedAt };
+    }
+    if (node.judgment && !hasPin) {
+      const reason = validateJudgmentContract(node)
+        ?? (node.observes?.includes('screen') && ctx.screen === undefined ? 'screen observation is not wired in this run' : null)
+        ?? (!deps.runJudgment ? 'deps.runJudgment is not wired in this runtime' : null);
+      if (reason) return { ok: false, output: '', error: `judgment contract unmet — ${reason}`, durationMs: Date.now() - startedAt };
+    }
+    if (isSubworkflowNode(node) && childRunId) return await executeSubworkflowNode(node, ctx, deps, opts, childRunId);
+    return node.judgment && !hasPin
+      ? await executeJudgmentNode(node, ctx, deps, opts.workflow.name, opts.judgmentContext)
+      : await dispatchNode(node, ctx, deps, opts.workflow.name, opts.ignorePins);
+  } catch (err) {
+    return { ok: false, output: '', error: err instanceof Error ? err.message : String(err), durationMs: Date.now() - startedAt };
+  }
 }
 
 /** Simpler convenience: run-to-completion + collect events. */
@@ -335,7 +555,13 @@ export async function runWorkflowToCompletion(
   return { outputs, events, ok };
 }
 
-function shouldSkip(node: DagNode, outputs: Record<string, NodeOutput>): string | null {
+function dependsOnFailure(id: string, failedId: string, nodeById: Map<string, DagNode>, visited = new Set<string>()): boolean {
+  if (visited.has(id)) return false;
+  visited.add(id);
+  return (nodeById.get(id)?.depends_on ?? []).some(dep => dep === failedId || dependsOnFailure(dep, failedId, nodeById, visited));
+}
+
+function shouldSkip(node: DagNode, outputs: Record<string, NodeOutput>, errorSources: readonly string[] = []): string | null {
   // trigger_rule check on depends_on
   const deps = node.depends_on ?? [];
   if (deps.length > 0) {
@@ -343,9 +569,9 @@ function shouldSkip(node: DagNode, outputs: Record<string, NodeOutput>): string 
     const depResults = deps.map(d => outputs[d]).filter((o): o is NodeOutput => !!o);
     if (rule === 'all_success') {
       if (depResults.length !== deps.length) return `dep missing (rule=all_success)`;
-      if (depResults.some(r => !r.ok)) return `dep failed (rule=all_success)`;
+      if (deps.some(d => !outputs[d]?.ok && !errorSources.includes(d))) return `dep failed (rule=all_success)`;
     } else if (rule === 'one_success') {
-      if (!depResults.some(r => r.ok)) return `no successful dep (rule=one_success)`;
+      if (!depResults.some(r => r.ok) && !errorSources.length) return `no successful dep (rule=one_success)`;
     } else if (rule === 'all_done') {
       if (depResults.length !== deps.length) return `dep not finished (rule=all_done)`;
     }
@@ -430,13 +656,14 @@ async function dispatchNode(
   ctx: NodeExecContext,
   deps: WorkflowDeps,
   workflowName: string,
+  ignorePins = false,
 ): Promise<NodeOutput> {
   // M4-4.2 (FU8 PR #1 · 2026-05-12) — pin executor seam. When a pin
   // exists for `<workflowName>/<node.id>` in the `.pins.json` side-
   // file, return the pinned value as the node output and skip the
   // real LLM / HTTP / bash call. Lets workflow authors freeze a
   // specific node's response for fast iteration on downstream nodes.
-  const pinned = readWorkflowPin(workflowName, node.id);
+  const pinned = ignorePins ? null : readWorkflowPin(workflowName, node.id);
   if (pinned !== null) {
     const output = pinned.value;
     // Fire the same 3-sink emit fan-out as the dispatch reference
@@ -464,7 +691,7 @@ async function dispatchNode(
     } catch { /* best-effort */ }
     return { ok: true, output, durationMs: 0 };
   }
-  // Plugin kinds are dispatched before the core 22. A node without `kind`
+  // Plugin kinds are dispatched before body-key core variants. A node without `kind`
   // never enters this branch, so the core chain below is unchanged.
   if (isPluginKindNode(node)) return executePluginKindNode(node, ctx, deps);
   if (isPromptNode(node)) return executePromptNode(node, ctx, deps);
@@ -501,11 +728,13 @@ async function dispatchNode(
   };
 }
 
-/** Surface-unification §D3 (2026-05-11) — `dryRun` covers every trigger
- *  variant (Schedule · Webhook · HTTP · Discord · Telegram · Manual ·
- *  Chat). HTTP is not strictly a trigger, but in dry-run we typically
- *  want to skip external IO too — callers that need real HTTP results
- *  during dry-run can leave dryRun=false and run normally. */
+/** Calls that may mutate state outside the workflow during test runs. */
+function isExternalSideEffectNode(node: DagNode): boolean {
+  return isPluginKindNode(node) || isSubworkflowNode(node) || isBashNode(node) || isSkillNode(node)
+    || isCftNode(node) || isApprovalNode(node) || isTaskNode(node)
+    || isHttpRequestNode(node) || isIterationNode(node);
+}
+
 function isTriggerVariant(node: DagNode): boolean {
   return (
     isScheduleTriggerNode(node)
@@ -524,7 +753,7 @@ function variantOf(node: DagNode): string {
     isSwitchNode, isIterationNode, isClassifyNode, isExtractNode, isSetNode,
     isFilterNode, isTemplateNode, isHttpRequestNode, isShowroomNode, isTaskNode,
     isScheduleTriggerNode, isWebhookTriggerNode, isDiscordTriggerNode,
-    isTelegramTriggerNode, isManualTriggerNode, isChatTriggerNode,
+    isTelegramTriggerNode, isManualTriggerNode, isChatTriggerNode, isSubworkflowNode,
   ];
   const index = guards.findIndex((guard) => guard(node));
   return index < 0 ? 'unknown' : WORKFLOW_CORE_KINDS[index]!;
@@ -574,6 +803,7 @@ interface RunHeader {
   workflowName: string;
   arguments: string;
   startedAt: number;
+  mode?: RunWorkflowOpts['mode'];
 }
 
 interface RunFinal extends RunHeader {

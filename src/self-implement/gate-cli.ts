@@ -15,16 +15,19 @@ import { resolveGateScope } from './gate-scope.js';
 import { debug } from '../debug/log.js';
 import { buildDocumentGuardianIndex, formatDocumentGuardians } from './document-guardian-index.js';
 import { buildImporterTestIndex, isTestPath, type ImporterTestIndex } from './importer-test-index.js';
+import { buildRouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { gitChangedFiles, observeGateBaselineLocation } from './seams.js';
 import {
   collectBaseLandingCommits,
   overlapWithCurrentChanges,
 } from '../cli/pr-granularity.js';
 import { listWorktrees } from '../git-fs/worktree.js';
+import { runShardedGateTests } from '../self-dev/shard-run.js';
 
 interface SelfGateCliOptions {
   base?: string;
   pr?: string;
+  shards?: number;
 }
 
 interface ProcessResult {
@@ -74,6 +77,7 @@ interface SelfGateCliDeps {
   readFile?: (path: string) => string | undefined;
   runTests?: (cwd: string, files: readonly string[]) => ProcessResult;
   runBaseline?: (cwd: string, files: readonly string[], baseRef: string) => BaselineProcessResult;
+  runShards?: typeof runShardedGateTests;
   runIsolationGate?: (out: GateOutput) => number;
   runMockModuleRestoreGate?: (out: GateOutput) => number;
   /** 모델 이름 하드코딩 래칫(🅕 #20521) — `pr land` 만 물고 하니스 무인 병합은 안 물면 위반이 main 에 들어가 남의 착지를 막는다(🅣 2026-09-25). */
@@ -571,11 +575,16 @@ function logGateCliBaseline(cwd: string, payload: GateCliBaselinePayload): void 
 
 export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, deps: SelfGateCliDeps = {}): SelfGateCliResult {
   if (options.base && options.pr) throw new Error('use either --base <ref> or --pr <number>, not both');
+  if (options.shards !== undefined && (!Number.isSafeInteger(options.shards) || options.shards < 1)) throw new Error('invalid --shards count');
   const selection = (deps.changedFiles ?? ((dir, input) => defaultChangedFiles(dir, input, deps.runCommand)))(cwd, options);
   const exists = deps.exists ?? ((path) => existsSync(`${cwd}/${path}`));
   const importerIndex = buildGateImporterTestIndex(selection.files, cwd, deps.runCommand);
   const lookupFailed = importerIndex && 'lookupFailed' in importerIndex ? importerIndex.lookupFailed : undefined;
-  const scope = resolveGateScope(selection.files, exists, importerIndex && !('lookupFailed' in importerIndex) ? importerIndex : undefined);
+  const availableIndex = importerIndex && !('lookupFailed' in importerIndex) ? importerIndex : undefined;
+  const routeIndex = availableIndex?.testPaths
+    ? buildRouteConsumerTestIndex(cwd, availableIndex.testPaths, selection.files, selection.baseRef) : null;
+  const scope = resolveGateScope(selection.files, exists, availableIndex,
+    { routeConsumerTestIndex: routeIndex ?? undefined });
   const testFiles = [...(scope.testArgs ?? [])];
   const unrunImporterTotal = lookupFailed ? null : (scope.importerTestsNotRun?.total ?? 0);
   const importerLookupFailed = Boolean(lookupFailed);
@@ -601,6 +610,9 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     // 🚨 러너 우주 «밖» — 형제들과 같은 정책으로 «말만» 한다(`OBS-T418`).
     formatUnrunnableChangeKinds(selection.files),
     formatUnrunImporterTests(scope.importerTestsNotRun, lookupFailed),
+    `caller tests: ${lookupFailed ? `lookup failed (${lookupFailed})` : scope.callerTests.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ') || (routeIndex?.lookupFailures.length ? 'route lookup incomplete' : '(none)')}`,
+    ...(routeIndex?.lookupFailures.length ? [`⚠️ caller route base lookup failed — unmeasured: ${routeIndex.lookupFailures.map(({ source, reason }) => `${source} (${reason})`).join(', ')}`] : []),
+    ...(scope.callerTestsOverflow.length ? [`⚠️ caller test cap exceeded — not run: ${scope.callerTestsOverflow.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ')}`] : []),
     changedTestCountNote(cwd, selection.files, selection.baseRef, deps.runCommand, deps.readFile),
   ];
   if (options.pr) {
@@ -627,6 +639,33 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
     return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+  }
+
+  if (options.shards !== undefined) {
+    const sharded = (deps.runShards ?? runShardedGateTests)(cwd, testFiles, selection.baseRef, options.shards);
+    lines.push(`shards: ${sharded.shards.length} (${sharded.shards.map((shard) => `${shard.id}=${shard.files.join(',')}`).join('; ')})`);
+    for (const attempt of sharded.attempts) lines.push(`shard attempt: ${attempt.shardId} #${attempt.attempt}`);
+    const { aggregate } = sharded;
+    if (aggregate.status === 'unmeasured') lines.push(`shards: unmeasured (${aggregate.retryShardIds.join(', ') || sharded.reason || 'no complete JUnit'})`);
+    else if (aggregate.report) {
+      const report = aggregate.report;
+      logGateCliBaseline(cwd, {
+        introduced: report.introduced, preexisting: report.preexisting, unknown: report.unknown,
+        preconditionUnmet: report.preconditionUnmet, timedOut: report.timedOut,
+        timeoutPassedAtBase: report.timeoutPassedAtBase, failures: report.failures.slice(0, 20),
+        baselineFiles: report.files, baselineStatus: report.baselineStatus, unrunImporterTotal, lookupFailed: importerLookupFailed,
+      });
+      lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
+    } else {
+      lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
+      logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
+    }
+    const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
+    return {
+      exitCode: aggregate.status !== 'passed' || !policyPassed || !androidPassed || !iosPassed || !pwaPassed ? 1 : 0,
+      lines, changedFiles: selection.files, testFiles, unverified: scope.unverified,
+      documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests,
+    };
   }
 
   const test = (deps.runTests ?? ((dir, files) => (deps.runCommand ?? defaultRunCommand)('bun', ['test', ...files], dir)))(cwd, testFiles);

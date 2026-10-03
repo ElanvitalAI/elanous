@@ -10,8 +10,8 @@
  *   bun scripts/ci-public-leak-gate.ts --changed-files a b …    # 그 파일들만 검사
  *   bun scripts/ci-public-leak-gate.ts --update                 # 기준선 재스냅샷(치운 뒤)
  *
- * ⛔ 이 게이트는 아직 `pr land` 에 «배선하지 않았다» — 다른 트랙의 주석 관례(대표 표기 기호 등)가 매일 늘어 배선 즉시 착지가 막힌다.
- *    배선은 조율 채널 합의 뒤(2026-09-24 🅢).
+ * `pr land` 는 변경 파일을 PR 트리에서 스캔하고 기준선은 base ref 에서 읽어 방향을 경고 전용으로 표시한다.
+ * 단독 CLI 의 기본 기준선은 현재 트리의 파일이며, 증가는 exit 1 이다.
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
@@ -57,6 +57,19 @@ export function renderBaseline(counts: ReadonlyMap<string, number>): string {
 
 export interface LeakGrowth { readonly marker: string; readonly file: string; readonly allowed: number; readonly now: number }
 
+/** 기준선과 현재 트리의 모든 차이(사라진 표지 포함). */
+export function findLeakChanges(current: ReadonlyMap<string, number>, baseline: ReadonlyMap<string, number>, only?: ReadonlySet<string>): LeakGrowth[] {
+  const out: LeakGrowth[] = [];
+  for (const key of new Set([...baseline.keys(), ...current.keys()])) {
+    const [marker, file] = key.split('\t') as [string, string];
+    if (only && !only.has(file)) continue;
+    const allowed = baseline.get(key) ?? 0;
+    const now = current.get(key) ?? 0;
+    if (now !== allowed) out.push({ marker, file, allowed, now });
+  }
+  return out.sort((a, b) => a.file.localeCompare(b.file) || a.marker.localeCompare(b.marker));
+}
+
 /** 기준선보다 «늘어난» (표지, 파일). `only` 가 있으면 그 파일만 본다. */
 export function findGrowth(current: ReadonlyMap<string, number>, baseline: ReadonlyMap<string, number>, only?: ReadonlySet<string>): LeakGrowth[] {
   const out: LeakGrowth[] = [];
@@ -81,6 +94,8 @@ export interface PublicLeakGateIo {
   readonly args?: readonly string[];
   readonly root?: string;
   readonly scan?: () => LeakHit[];
+  /** Read the baseline from the landing base commit, not the PR's working tree. */
+  readonly baselineRef?: string;
   readonly log?: (s: string) => void;
   readonly error?: (s: string) => void;
 }
@@ -100,14 +115,34 @@ export function runPublicLeakGate(io: PublicLeakGateIo = {}): number {
     log(`[public-leak-gate] baseline updated — ${[...current.values()].reduce((a, n) => a + n, 0)} hits · ${current.size} entries`);
     return 0;
   }
-  if (!existsSync(baselinePath)) { error(`[public-leak-gate] FAIL — 기준선이 없다: ${BASELINE_REL} (--update 로 만든다)`); return 2; }
-  const growth = findGrowth(current, parseBaseline(readFileSync(baselinePath, 'utf8')), only);
+  let baselineText: string;
+  if (io.baselineRef) {
+    const shown = spawnSync('git', ['-C', root, 'show', `${io.baselineRef}:${BASELINE_REL}`], { encoding: 'utf8', maxBuffer: 1 << 28 });
+    if (shown.status !== 0) { error(`[public-leak-gate] FAIL — ${io.baselineRef} 기준선을 못 읽었다: ${BASELINE_REL}`); return 2; }
+    baselineText = shown.stdout;
+  } else {
+    if (!existsSync(baselinePath)) { error(`[public-leak-gate] FAIL — 기준선이 없다: ${BASELINE_REL} (--update 로 만든다)`); return 2; }
+    baselineText = readFileSync(baselinePath, 'utf8');
+  }
+  const baseline = parseBaseline(baselineText);
+  const growth = findGrowth(current, baseline, only);
   const scope = only ? `변경 파일 ${only.size}개` : '전체';
-  if (growth.length === 0) { log(`[public-leak-gate] PASS — 유출이 늘지 않았다 (${scope})`); return 0; }
-  error(`[public-leak-gate] FAIL — 유출이 늘었다 (${scope} · ${growth.length}곳):`);
-  for (const g of growth) error(`  ${g.file}  ${g.marker}  ${g.allowed} → ${g.now}`);
-  error('  확인: bun scripts/public-export.ts --leak-check --path <파일> --all');
-  return 1;
+  if (growth.length > 0) {
+    error(`[public-leak-gate] FAIL — 유출이 늘었다 (${scope} · ${growth.length}곳):`);
+    for (const g of growth) error(`  ${g.file}  ${g.marker}  ${g.allowed} → ${g.now}`);
+    error('  확인: bun scripts/public-export.ts --leak-check --path <파일> --all');
+    return 1;
+  }
+  if (io.baselineRef) {
+    const shrunk = findLeakChanges(current, baseline, only).filter((change) => change.now < change.allowed);
+    if (shrunk.length > 0) {
+      log(`[public-leak-gate] SHRANK — 유출이 줄었다 · 기준선 --update 권장 (${scope} · ${shrunk.length}곳):`);
+      for (const g of shrunk) log(`  ${g.file}  ${g.marker}  ${g.allowed} → ${g.now}`);
+      return 3;
+    }
+  }
+  log(`[public-leak-gate] PASS — 유출이 늘지 않았다 (${scope})`);
+  return 0;
 }
 
 if (import.meta.main) process.exit(runPublicLeakGate());

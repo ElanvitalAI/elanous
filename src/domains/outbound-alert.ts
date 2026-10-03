@@ -210,7 +210,7 @@ export function flushDeferred(path = DEFERRED_PATH): number {
   ].join('\n');
   observeFlush(items.length, lagMin, [...new Set(items.map(i => i.kind))]);
   let delivered = 0;
-  // origin 없는 finance 는 기존 report 묶음. 운영 보류분은 별도로 묶어 운영 봇 경계를 유지한다.
+  // origin 없는 매매 알림만 report 묶음. 그 외는 kind 별로 운영 봇 경계를 유지한다.
   const noOrigin = items.filter(i => !i.origin);
   const tradingBatch = noOrigin.filter(i => !isOperationalKind(i.kind));
   if (tradingBatch.length && deliver(fmt(tradingBatch), 'report')) delivered += tradingBatch.length;
@@ -420,6 +420,11 @@ export function sendTelegramDirect(
       const target = kindRouteTarget(cfg, kind);
       if (target) return sendRaw(target.botToken, String(target.chatId), text);
     } catch { /* unavailable channel routing: fall through */ }
+    // A declared table is authoritative: missing roles cannot escape to an env bot.
+    if (cfg.telegram.channels?.length) {
+      logKindRouteFallback(kind, 'none', false);
+      return false;
+    }
   }
   if (isOperationalKind(kind)) {
     let home: ReturnType<typeof mainHomeTarget> = null;

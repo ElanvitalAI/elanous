@@ -2,6 +2,18 @@
 // (2026-09-28 실측: 휠은 L2980→L2951 로 올라가는데 터치 제스처는 390·1280 모두 0줄).
 // ⛔ 이미 스스로 스크롤된 만큼은 빼고 «모자란 만큼만» 민다 — 네이티브 스크롤이 도는 환경에서 두 번 밀지 않는다.
 
+import { buildKeySequence } from '@/lib/key-sequences';
+
+/** A deliberate history tap, distinct from the existing touch-drag wheel gesture. */
+export function historyAction(input: {
+  bufferType: 'normal' | 'alternate';
+  mouseTracking: string;
+}): { kind: 'scroll-pages'; pages: -1 } | { kind: 'send'; data: string } {
+  return input.bufferType === 'alternate'
+    ? { kind: 'send', data: '\x02[' + buildKeySequence('pageup') }
+    : { kind: 'scroll-pages', pages: -1 };
+}
+
 export type TouchScrollAction =
   | { kind: 'scrollback'; lines: number }
   | { kind: 'wheel'; steps: number }

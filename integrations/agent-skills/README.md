@@ -36,9 +36,9 @@ Files only. Nothing here is published: ClawHub, a GitHub skills tap and a Homebr
 
 ### B. Homebrew tap
 1. Create the public repository `ElanvitalAI/homebrew-tap` (outward · owner approval).
-2. Copy `integrations/homebrew/elanous.rb` to `Formula/elanous.rb` and push.
+2. After the npm release, run `bun scripts/homebrew-formula-bump.ts --version <published-v>` before copying `integrations/homebrew/elanous.rb` to `Formula/elanous.rb` and pushing.
 3. On a clean macOS machine (no Elanous installed): `brew install elanvitalai/tap/elanous` → `brew test elanous` → `elanous --version`.
-4. Every release: bump `url` and `sha256` together (`curl -sL https://registry.npmjs.org/elanous/-/elanous-<v>.tgz | shasum -a 256`). 0.2.8 is due 10-02 07:15 — bump before the first publish.
+4. Every later npm release: bump both formula lines with the same script (`--dry-run` previews the two lines without writing). Do not publish the tap without owner approval; verify with step B3 on a clean machine.
 
 ### C. After publishing
 - Add «Homebrew» and «ClawHub / Hermes» lines to the install section of elanous.ai and the public docs — only after B3 and A4 pass.

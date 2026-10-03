@@ -16,6 +16,7 @@ export type {
   WorkflowDeps,
   WorkflowEntry,
   WorkflowEvent,
+  WorkflowRunMode,
   WorkflowSource,
 } from './types.js';
 

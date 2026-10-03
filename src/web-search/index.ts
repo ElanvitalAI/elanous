@@ -10,6 +10,8 @@ import { buildFirecrawlWebSearchProvider } from './firecrawl.js';
 import { buildTavilyWebSearchProvider } from './tavily.js';
 import { buildFreeWebSearchProvider } from './free.js';
 import { isTavilySearchEnabled } from '../user-config.js';
+import { debug } from '../debug/log.js';
+import { wantsXSearch } from './x-intent.js';
 import {
   type WebSearchProvider,
   type WebSearchQuery,
@@ -66,9 +68,14 @@ export async function searchWeb(
   q: WebSearchQuery,
   opts: { providerId?: string; signal?: AbortSignal } = {},
 ): Promise<WebSearchResult> {
+  const xIntent = !opts.providerId && wantsXSearch(q.query);
   const candidates = opts.providerId
     ? providers.filter(p => p.id === opts.providerId)
     : providers.filter(p => p.available());
+  if (xIntent) {
+    const grokIndex = candidates.findIndex(p => p.id === 'grok');
+    if (grokIndex > 0) candidates.unshift(...candidates.splice(grokIndex, 1));
+  }
   if (candidates.length === 0) {
     throw new WebSearchUnavailableError(
       providers.map(p => p.id),
@@ -82,7 +89,27 @@ export async function searchWeb(
     if (!provider.available()) continue;
     tried.push(provider.id);
     try {
-      return await provider.search(q, opts.signal);
+      const result = await provider.search(q, opts.signal);
+      if (!xIntent) return result;
+      if (provider.id === 'grok') {
+        const isXUrl = (raw: string): boolean => {
+          try {
+            const url = new URL(raw);
+            return url.protocol === 'https:' && ['x.com', 'www.x.com'].includes(url.hostname.toLowerCase());
+          } catch { return false; }
+        };
+        const hasXSource = result.hits.some(hit => hit.xSearchSource === true && isXUrl(hit.url));
+        if (hasXSource) {
+          debug.log('web-search.route', 'x-intent', { provider: provider.id, xIntent, fallback: false });
+          return { ...result, xSearch: 'grok' };
+        }
+        debug.log('web-search.route', 'x-intent', { provider: provider.id, xIntent, fallback: true });
+        const safeResult = { ...result };
+        delete safeResult.note;
+        return { ...safeResult, hits: result.hits.filter(hit => !isXUrl(hit.url)), xSearch: 'unavailable' };
+      }
+      debug.log('web-search.route', 'x-intent', { provider: provider.id, xIntent, fallback: true });
+      return { ...result, xSearch: 'unavailable' };
     } catch (err: any) {
       reasons.push(err?.message ?? String(err));
     }

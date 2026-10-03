@@ -2,7 +2,7 @@
 # 로컬 플릿 노드 셋업 — 원격 맥 한 대를 «Pod 풀 ⊕ 시험 샤딩» 노드로 (MANUAL-local-fleet-node-setup).
 #   bash scripts/fleet/node-setup.sh <호스트> [--check]
 #   <호스트>  ssh 로 닿는 이름(예: node-b · node-c) — 이 맥에서 `ssh -o BatchMode=yes <호스트> true` 가 돼야 한다.
-#   --check  아무것도 바꾸지 않고 상태만 본다(단계마다 ✓ · ✗ · → 할 일).
+#   --check  영구 설정을 바꾸지 않고 상태만 본다(단계마다 ✓ · ✗ · → 할 일). DNS 점검용 Pod 는 잠깐 만들었다 지운다.
 # ⭐ 단계마다 «이미 돼 있으면 건너뛴다» — 몇 번 돌려도 같은 결과(재현 가능한 셋업).
 # ⛔ 원격의 다른 컨테이너·앱은 건드리지 않는다. 이 맥의 ~/.kube/config 는 바꾸기 전에 백업한다.
 set -u
@@ -62,7 +62,7 @@ REGISTRY="${ELANOUS_FLEET_REGISTRY:-elanous-registry}"; REG_PORT="${ELANOUS_FLEE
 # ⛔ 레지스트리는 노드의 «루프백»에만 연다 — 🩸 2026-09-26: `0.0.0.0:5050` 이라 tailnet 의 누구든 인증 없이 목록·푸시가 됐다
 #   (Pod 는 커밋 태그로 pull 하므로 그 태그를 덮으면 곧 공급망 위험). 노드 안 빌드는 localhost 로 푸시하고, 클러스터는 docker 내부 이름으로 받는다.
 REG_BIND="$(R "docker port k3d-$REGISTRY 5000/tcp" 2>/dev/null | head -1)"
-if [ -n "$REG_BIND" ] && [ "${REG_BIND#127.0.0.1:}" != "$REG_BIND" ]; then ok "레지스트리 k3d-$REGISTRY :$REG_PORT (루프백)"
+if [ -n "$REG_BIND" ] && [ "${REG_BIND#127.0.0.1:}" != "$REG_BIND" ]; then REG_PORT="${REG_BIND##*:}"; ok "레지스트리 k3d-$REGISTRY :$REG_PORT (루프백)"
 elif [ -n "$REG_BIND" ] && [ $CHECK = 1 ]; then bad "레지스트리 k3d-$REGISTRY 가 $REG_BIND 에 열려 있다 — 루프백으로 다시 만들어야 한다"
 elif [ -n "$REG_BIND" ]; then R "k3d registry delete $REGISTRY >/dev/null 2>&1; k3d registry create $REGISTRY --port 127.0.0.1:$REG_PORT >/tmp/fleet-registry.log 2>&1 && (docker network connect k3d-$CLUSTER k3d-$REGISTRY 2>/dev/null || true)" && ok "레지스트리 k3d-$REGISTRY 를 루프백으로 다시 만들었다(이미지는 다음 동기화에서 다시 푸시)" || { bad "레지스트리 재생성 실패 — 원격 /tmp/fleet-registry.log"; exit 1; }
 elif [ $CHECK = 1 ]; then todo "레지스트리 k3d-$REGISTRY :$REG_PORT 생성(루프백)"
@@ -157,10 +157,27 @@ apply_base() {
 }
 apply_base
 # 9. 판 대조 — k3s · 노드 준비
+# DNS: coredns Ready 와 격리 네임스페이스 Pod 안에서 서비스 이름 풀이를 각각 확인한다.
+DNS_READY="$(kubectl --context "$CTX" --request-timeout=10s -n kube-system get deployment coredns -o jsonpath='{.status.readyReplicas}/{.spec.replicas}' 2>/dev/null)"
+DNS_NAME="elanous-dns-check-$$"
+if [[ "$DNS_READY" =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]] && [ "${DNS_READY%/*}" = "${DNS_READY#*/}" ]; then
+  DNS_MANIFEST="$(printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"%s","namespace":"elanous-test"},"spec":{"restartPolicy":"Never","activeDeadlineSeconds":40,"automountServiceAccountToken":false,"containers":[{"name":"dns","image":"busybox:1.36","command":["nslookup","kubernetes.default.svc.cluster.local"],"resources":{"requests":{"cpu":"10m","memory":"16Mi"},"limits":{"cpu":"100m","memory":"64Mi"}}}]}}' "$DNS_NAME")"
+  if ! printf '%s' "$DNS_MANIFEST" | kubectl --context "$CTX" --request-timeout=10s create -f - >/dev/null 2>&1; then bad "dns 점검 Pod 생성 실패 (DNS 미측정)"
+  else
+    kubectl --context "$CTX" --request-timeout=10s -n elanous-test wait --for=jsonpath='{.status.phase}=Succeeded' "pod/$DNS_NAME" --timeout=30s >/dev/null 2>&1
+    DNS_STATE="$(kubectl --context "$CTX" --request-timeout=10s -n elanous-test get "pod/$DNS_NAME" -o jsonpath='{.status.phase}:{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null)"
+    DNS_LOG="$(kubectl --context "$CTX" --request-timeout=10s -n elanous-test logs "pod/$DNS_NAME" 2>/dev/null)"
+    if [[ "$DNS_STATE" = Succeeded:* ]] && [[ "$DNS_LOG" =~ Name:[[:space:]]*kubernetes\.default\.svc\.cluster\.local ]] && [[ "$DNS_LOG" =~ Address(es)?':'[[:space:]]*[^[:space:]]+ ]]; then ok "dns (coredns Ready ⊕ Pod 이름 풀이)"
+    elif [[ "$DNS_STATE" = *:ImagePullBackOff || "$DNS_STATE" = *:ErrImagePull || "$DNS_STATE" = *:InvalidImageName ]]; then bad "dns 점검 이미지 확보 실패 (DNS 미측정)"
+    elif [[ "$DNS_STATE" = Failed:* ]] && [[ "$DNS_LOG" =~ (can.t.resolve|server.can.t.find|connection.timed.out|no.servers.could.be.reached|NXDOMAIN|SERVFAIL) ]] || [[ "$DNS_STATE" = Succeeded:* ]]; then bad "dns (Pod 이름 풀이 실패)"
+    else bad "dns 점검 Pod 실행 실패 (DNS 미측정: ${DNS_STATE:-응답 없음})"; fi
+  fi
+else bad "dns (coredns Ready 아님: ${DNS_READY:-응답 없음})"; fi
+kubectl --context "$CTX" --request-timeout=10s -n elanous-test delete "pod/$DNS_NAME" --ignore-not-found=true --wait=false >/dev/null 2>&1
 v="$(kubectl --context "$CTX" --request-timeout=10s get nodes -o jsonpath='{.items[0].status.nodeInfo.kubeletVersion}' 2>/dev/null)"
 want="${K3S_IMAGE##*:}"; want="${want/-k3s/+k3s}"
 [ "$v" = "$want" ] && ok "k3s $v" || bad "k3s ${v:-응답 없음} ≠ 기대 $want"
 echo
 if [ $FAIL = 0 ] && [ $TODO -gt 0 ]; then echo "→ $HOST 할 일 $TODO — --check 없이 다시 돌리면 채운다"; exit 2
-elif [ $FAIL = 0 ]; then echo "✓ $HOST 준비됨 — 풀에 넣기: ELANOUS_POD_POOL='…,$CTX@$HOST:<상한>'"; else echo "✗ $HOST 미완 — 위 ✗ 를 먼저"; fi
+elif [ $FAIL = 0 ]; then echo "✓ $HOST 준비됨 — 풀에 넣기: ELANOUS_POD_POOL='…,$CTX@$HOST:<상한>#k3d-$REGISTRY:$REG_PORT'"; else echo "✗ $HOST 미완 — 위 ✗ 를 먼저"; fi
 exit $FAIL

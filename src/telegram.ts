@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import { buildTurnOutputTextBlocks } from './input/turn-output-block.js';
 import { selectTurnOutputTextForSink } from './input/turn-output-sink-registry.js';
 import { debug } from './debug/log.js';
+import { botAudienceFor, filterBotCommands, readBotAudience } from './maturity/bot-command-maturity.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { TelegramVoiceAdapter } from './voice/channel-adapters/telegram-voice-adapter.js';
 import { createTelegramSurfaceHitl, type TelegramSurfaceHitl } from './hitl/telegram-surface-hitl.js';
@@ -67,6 +68,7 @@ import { runUrlRoute } from './skills/url-route-exec.js';
 import { recordRoutedLinkAbsorbed } from './intake-plane/link-ledger.js';
 import { classifyFrontInput } from './intake-plane/front-classifier.js';
 import { handleTelegramSeatWork, type TelegramSeatWorkDeps } from './intake-plane/telegram-seat-work.js';
+import { deliverSeatAnswers } from './seat-dispatch/seat-ask.js';
 import { effectiveInstanceRoot } from './instance/resolve.js';
 import { getElanousConfigDir } from './elanous-config-dir.js';
 import { defaultFieldEvent, FieldUploadError, parseFieldCaption, resolveFieldMime, saveFieldMedia } from './field/field-media.js';
@@ -338,6 +340,7 @@ export class TelegramBot {
   private readonly fieldReel?: FieldReelOptions;
   private readonly cardFollowupDeps: Pick<CardPhotoDeps, 'runGraph' | 'rootDir' | 'ocrText'>;
   private readonly seatWorkDeps: TelegramSeatWorkDeps;
+  private seatAskTimer: ReturnType<typeof setInterval> | null = null;
   /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
   private readonly fieldGroups = new Map<string, {
     event: string; mode?: 'instant'; at: number; chatId: number; threadId?: number; replyTo: number; count: number;
@@ -373,7 +376,15 @@ export class TelegramBot {
     this.fieldRootDir = opts.fieldRootDir ?? getElanousConfigDir;
     this.fieldReel = opts.fieldReel;
     this.cardFollowupDeps = opts.cardFollowupDeps ?? {};
-    this.seatWorkDeps = opts.seatWorkDeps ?? {};
+    this.seatWorkDeps = { ...opts.seatWorkDeps, askDeps: { ...opts.seatWorkDeps?.askDeps,
+      channel: 'telegram', botId: this.botId,
+      send: opts.seatWorkDeps?.askDeps?.send ?? (async (origin, text) => {
+        if (origin.channel !== 'telegram') throw new Error('seat ask belongs to another surface');
+        const posted = await this.sendMessage(Number(origin.chatId), text, { replyTo: origin.messageId, threadId: origin.threadId });
+        if (!posted) throw new Error('Telegram seat ask reply was not posted');
+      }),
+    } };
+
     if (opts.onTriggerTap) {
       // Assign through `as unknown` to bypass `readonly` + private —
       // the tap is set once at construction and never reassigned.
@@ -1120,6 +1131,9 @@ export class TelegramBot {
   async start(): Promise<void> {
     this.running = true;
     this.log(`telegram bot starting (allowlist size ${this.allowedUsers.size})`);
+    this.seatAskTimer = setInterval(() => {
+      void deliverSeatAnswers(this.seatWorkDeps.askDeps!).catch((error) => this.log(`seat ask delivery failed: ${String(error)}`));
+    }, 10_000);
     if (this.allowedUsers.size === 0) this.log('telegram.owner-gate empty-allowlist');
 
     // Publish the slash-command menu to Telegram. Clients pick up the
@@ -1128,9 +1142,16 @@ export class TelegramBot {
     // still processes `/commands` via the incoming-message dispatch
     // path, users just don't get the autocomplete.
     if (this.slashCommands.length > 0) {
+      const audience = this.slashContext
+        ? readBotAudience((this.slashContext.userConfig.raw?.telegram as { commandAudience?: unknown } | undefined)?.commandAudience)
+        : botAudienceFor('telegram');
+      const commands = filterBotCommands('telegram', this.slashCommands, audience);
+      debug.log('telegram.command', 'menu-filtered', {
+        total: this.slashCommands.length, shown: commands.length, ...audience,
+      });
       try {
         const result = await this.apiCall<unknown>('setMyCommands', {
-          commands: toTelegramBotCommands(this.slashCommands),
+          commands: toTelegramBotCommands(commands),
         });
         debug.log('telegram.command', 'published', { success: true, result });
         this.log(`telegram: setMyCommands published (${String(result)})`);
@@ -1151,6 +1172,7 @@ export class TelegramBot {
     const CONFLICT_BACKOFF_CAP = 60_000;
     while (this.running) {
       try {
+        await deliverSeatAnswers(this.seatWorkDeps.askDeps!);
         const wantCallbackQuery = this.callbackHandlers.size > 0;
         const wantReaction = this.reactionHandlers.size > 0;
         // allowed_updates 는 명시한 것만 받으므로 등록된 핸들러 종류만 추가(비파괴 — 핸들러
@@ -1292,7 +1314,11 @@ export class TelegramBot {
     this.log('telegram bot stopped');
   }
 
-  stop(): void { this.running = false; }
+  stop(): void {
+    this.running = false;
+    if (this.seatAskTimer) clearInterval(this.seatAskTimer);
+    this.seatAskTimer = null;
+  }
 
   /** Download + normalize this message's attachments into the shape
    *  the ACP content-blocks module consumes. Called lazily by slash

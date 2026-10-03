@@ -11,7 +11,8 @@ test('core catalog shares the parser vocabulary, is idempotent and graph-scoped'
   registerCoreKinds();
   expect(listNodeKinds('harness').filter((kind) => kind.core).map((kind) => kind.kind)).toEqual([...HARNESS_CORE_KINDS]);
   expect(listNodeKinds('workflow').filter((kind) => kind.core).map((kind) => kind.kind)).toEqual([...WORKFLOW_NODE_VARIANT_KEYS]);
-  expect(WORKFLOW_CORE_KINDS).toHaveLength(22);
+  expect(WORKFLOW_CORE_KINDS).toHaveLength(23);
+  expect(WORKFLOW_CORE_KINDS).toContain('subworkflow');
   expect(HARNESS_CORE_KINDS).toHaveLength(7);
   expect(listNodeKinds('workflow').filter((entry) => entry.core).every((entry) => entry.description.length > 0)).toBe(true);
   expect(hasNodeKind('workflow', 'hitl')).toBe(false);

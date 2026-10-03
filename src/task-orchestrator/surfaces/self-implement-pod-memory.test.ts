@@ -47,3 +47,18 @@ describe('Pod 메모리 등급 — standard | high', () => {
     expect(seen?.ELANOUS_POD_MEMORY_TIER).toBe('high');
   });
 });
+
+describe('POD7 lite tier — explicit only', () => {
+  const plain = '대상 경로: docs/x.md\n조사 결과를 문서로 쓴다';
+  test('lite only by option or a standalone goal line; a skill mention alone never picks lite', () => {
+    expect(podMemoryLimitFor(`${plain}\nPod 메모리: lite\n`, {})).toEqual({ limit: '2Gi', tier: 'lite', source: 'goal-line' });
+    expect(podMemoryLimitFor(plain, { ELANOUS_POD_MEMORY_TIER: 'lite' })).toEqual({ limit: '2Gi', tier: 'lite', source: 'option' });
+    expect(podMemoryLimitFor(`${plain}\n/omni-crawl 로 조사한다`, {})).toEqual({ limit: '16Gi', tier: 'standard', source: 'default' });
+    expect(podMemoryLimitFor(`${plain}\nPod 메모리: lite\n`, { ELANOUS_POD_MEMORY_LITE: '1Gi' }).limit).toBe('1Gi');
+  });
+  test('an OOM retry target (high) is larger than lite, so POD9 retries a lite OOM', () => {
+    const lite = podMemoryLimitFor(`${plain}\nPod 메모리: lite\n`, {}).limit;
+    const high = podMemoryLimitFor(plain, { ELANOUS_POD_MEMORY_TIER: 'high' }).limit;
+    expect(parseFloat(lite)).toBeLessThan(parseFloat(high));
+  });
+});

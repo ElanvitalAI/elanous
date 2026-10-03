@@ -4,11 +4,11 @@ import { registerOpsCommands } from './cli/ops-cli.js';
 import { setUserConfigOverlay } from './user-config.js';
 import * as podDispatch from './harness/harness-pod-dispatch.js';
 import { registerPublishCommands } from './cli/publish-cli.js';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, setCodexAccountLogSinkModuleForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
+import { assembleAskLaunchPolicy, buildCodexAccountImportGuidance, buildHarnessOrchestratePlan, executeDevPipelineInvocation, filterDashboardArgs, formatReviewStatsPercentage, formatSelfSendCandidateDisplay, runHarnessBrowserAction, runHarnessOrchestrateExecution, runSchedule, scheduleCreatePlan, readSelfOrchestrateGoals, setCodexAccountLogSinkModuleForTesting, type HarnessOrchestrateExecutionDeps, type ScheduleDispatch } from './index.js';
 import { selectFabricDecomposer } from './self-dev/self-orchestrate-runtime.js';
 import { debug } from './debug/log.js';
 import { LogStore, logsDbPath } from './mss/logging/log-store.js';
@@ -379,7 +379,7 @@ describe('root command help dispatch', () => {
     const help = invoke('self', 'implement', '--help');
     const devPlanHelp = invoke('dev', '--plan', '--help');
     const indexSource = readFileSync(new URL('./index.ts', import.meta.url), 'utf8');
-    const action = indexSource.slice(indexSource.indexOf(".command('implement <feature...>')"), indexSource.indexOf('// self orchestrate'));
+    const action = indexSource.slice(indexSource.indexOf(".command('implement [feature...]')"), indexSource.indexOf('// self orchestrate'));
 
     expect(rejected.exitCode).not.toBe(0);
     expect(`${decode(rejected.stdout)}${decode(rejected.stderr)}`).toContain('--plan');
@@ -2711,11 +2711,12 @@ describe('self orchestrate CLI help tiers', () => {
     '--pod-pool', '--pod-skill-env', '--reduce',
     // 2026-09-27 pod 원천 표면이 더한 하나 — `--help-all` 에만 보인다.
     '--pod-source',
+    '--goal-file',
   ]);
 
   test('option contract set itself does not silently shrink', () => {
     // ⛔ 위 집합을 줄이면 `toEqual` 이 여전히 통과하므로 계약이 «조용히» 좁아진다. 수를 못 박는다.
-    expect(existingOptionNames.size).toBe(23);
+    expect(existingOptionNames.size).toBe(24);
   });
 
   function help(...args: string[]): string {
@@ -2796,7 +2797,7 @@ describe('dev CLI help tiers', () => {
     '--file', '--ask', '--substrate', '--pod-pool', '--say', '--force-preflight', '--allow-no-evidence',
     '--allow-superseded-goal', '--allow-goal-lint-errors', '--backend', '--transport',
     '--branch', '--base', '--plan', '--implement', '--elanous', '--hold', '--goal',
-    '--max-steps', '--poll-ms', '--ready-timeout-ms', '--model', '--observe-only', '--isolated-root', '--cwd',
+    '--max-steps', '--poll-ms', '--ready-timeout-ms', '--model', '--observe-only', '--isolated-root', '--jail-home', '--cwd',
     '--worktree', '--no-open-pr', '--no-auto-merge', '--no-auto-review', '--no-draft',
     '--no-supervise', '--child-llm-provider', '--child-llm-model', '--child-llm-effort', '--correlation', '--target', '--context',
     '--context-text', '--evidence', '--doc-dir', '--doc-glob', '--test-path', '--max-rounds',
@@ -2808,7 +2809,7 @@ describe('dev CLI help tiers', () => {
   ]);
 
   test('option contract set itself only shrinks for the intentional retirements including graph authority', () => {
-    expect(existingOptionNames.size).toBe(50);
+    expect(existingOptionNames.size).toBe(51);
   });
 
   function help(...args: string[]): string {
@@ -3324,6 +3325,62 @@ describe('dev CLI help tiers', () => {
 
     expect(() => assertExistingOptions(primary, extendedWithoutForce)).toThrow(/force-preflight/);
   }, 30_000);
+});
+
+describe('file-backed self CLI entrances', () => {
+  test('self implement CLI reads --feature-file and passes its contents to the implementation core', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'implement-feature-cli-'));
+    const featurePath = join(dir, 'feature.md');
+    const feature = 'Implement unique-file-feature; 판정 신호: bun test x';
+    await writeFile(featurePath, feature);
+    const core = await import('./self-implement/self-implement-cli.js');
+    const standalone = await import('./harness/standalone-run-context.js');
+    const seen: string[] = [];
+    const actual = core.runSelfImplementCliCommand;
+    const implement = spyOn(core, 'runSelfImplementCliCommand').mockImplementation((value, opts) => actual(value, opts, {
+      executeReroute: async (spec) => {
+        seen.push('text' in spec.input ? spec.input.text : '');
+        return { result: { runId: 'run-feature-test', stage: 'completed', ok: true } as never, exitCode: 0 };
+      },
+    }));
+    const setup = spyOn(standalone, 'enterStandaloneHarnessRun').mockImplementation(async () => undefined as never);
+    const exit = spyOn(process, 'exit').mockImplementation((() => { throw new Error('IMPLEMENT_EXIT'); }) as never);
+    try {
+      const { program } = await import('./index.js');
+      await expect(program.parseAsync(['node', 'elanous', 'self', 'implement', '--feature-file', featurePath, '--json', '--no-supervise']))
+        .rejects.toThrow('IMPLEMENT_EXIT');
+      expect(seen).toEqual([feature]);
+    } finally {
+      exit.mockRestore();
+      setup.mockRestore();
+      implement.mockRestore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('goal-file reads two goals without swallowing positional goals; feature-file accepts a path', async () => {
+    const { program } = require('./index.js') as typeof import('./index.js');
+    const self = program.commands.find((command) => command.name() === 'self')!;
+    const orchestrate = self.commands.find((command) => command.name() === 'orchestrate')!;
+    const implement = self.commands.find((command) => command.name() === 'implement')!;
+    expect(orchestrate.parseOptions(['positional goal', '--goal-file', 'a.md', '--goal-file', 'b.md']).operands).toEqual(['positional goal']);
+    expect(orchestrate.opts().goalFile).toEqual(['a.md', 'b.md']);
+    expect(implement.parseOptions(['--feature-file', 'feature.txt']).operands).toEqual([]);
+    expect(implement.opts().featureFile).toBe('feature.txt');
+    const dir = mkdtempSync(join(tmpdir(), 'orchestrate-input-'));
+    try {
+      const a = join(dir, 'a.md');
+      const b = join(dir, 'b.md');
+      writeFileSync(a, 'first;;goal');
+      writeFileSync(b, 'second goal');
+      expect(readSelfOrchestrateGoals(['positional goal'], [a, b])).toEqual({
+        request: 'positional goal first;;goal second goal',
+        goals: ['positional goal', 'first;;goal', 'second goal'],
+      });
+      expect(readSelfOrchestrateGoals(['positional goal'])).toEqual({ request: 'positional goal', goals: ['positional goal'] });
+      expect(() => readSelfOrchestrateGoals([], [join(dir, 'missing.md')])).toThrow();
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
 });
 
 describe('orchestrate CLI entrances wiring', () => {

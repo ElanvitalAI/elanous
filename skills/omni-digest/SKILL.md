@@ -20,12 +20,20 @@ category: digest
 # 요약기 = Grok(XAI_API_KEY 필수 · src/summarize.ts requireEnv). X 수집 BEARER_TOKEN·S3·OCR 은 선택(없으면 그 갈래만 빠진다).
 requires: [xai]
 boundary: core
-boundary_reason: 대표 2026-09-27 «omni-digest 는 배포판 필수» — 요약에 LLM 이 필요한 것은 제품 전제(elanous 는 LLM 자격 없이 일을 못 한다 · xai 행 boundary_note «THE FLOOR»). 후속 = 요약기를 Grok 고정에서 elanous 공급자 체인으로
+boundary_reason: 공식 결정 2026-09-27 «omni-digest 는 배포판 필수» — 요약에 LLM 이 필요한 것은 제품 전제(elanous 는 LLM 자격 없이 일을 못 한다 · xai 행 boundary_note «THE FLOOR»). 후속 = 요약기를 Grok 고정에서 elanous 공급자 체인으로
 ---
 
 # OmniDigest
 
 **모든 콘텐츠** → 자동 감지 → 요약 → 다중 타겟 출력 + 다이어그램.
+
+## 무료로 쓰는 길 (키 없이)
+
+본문 텍스트를 키 없는 Jina Reader 또는 로컬 파일 텍스트 추출로 확보하고, 로컬 `whisper`(영상 음성)나 로컬 OCR(이미지)이 있다면 이를 이용합니다. 얻은 텍스트를 읽고 에이전트에게 직접 요약을 요청합니다. 이 수동 경로는 API 키 없이 가능하지만, 아래 `scripts/main.ts`의 자동 요약은 현재 `XAI_API_KEY`를 요구하므로 키 없이 자동 실행되는 것으로 안내하지 않습니다.
+
+## 내 키로 쓰는 길
+
+자동 요약을 사용하려면 자신의 `XAI_API_KEY`를 실행 환경변수로 설정합니다. X 포스트 수집에는 추가로 `BEARER_TOKEN`, 이미지 OCR에는 `UPSTAGE_API_KEY` 또는 `OCR_API_KEY`를 사용할 수 있습니다. 키 값이나 자격 파일은 이 스킬 문서·사본에 넣지 않습니다.
 
 ## 트리거
 
@@ -69,8 +77,10 @@ URL (X, YouTube, 웹, GitHub) 또는 파일 (PDF, DOCX, 이미지) + 요약/정�
 
 ## 실행
 
+이 스킬 폴더에서 실행합니다.
+
 ```bash
-npx tsx ~/.claude/skills/omni-digest/scripts/main.ts "<INPUT>" --message "<의도>" --print
+npx tsx scripts/main.ts "<INPUT>" --message "<의도>" --print
 ```
 
 ### 예시
@@ -109,9 +119,9 @@ npx tsx scripts/main.ts "photo.png" --print
 
 ## 환경변수
 
-`.env` 하나로 관리. youtube-master/grok `.env` 자동 상속.
+필요한 환경변수 이름만 아래에 안내합니다. 값과 자격 파일은 이 팩에 포함하지 않습니다.
 
-필수: `XAI_API_KEY`, `BEARER_TOKEN` (X용)
+자동 요약: `XAI_API_KEY`. X 포스트 수집 시: `BEARER_TOKEN`.
 선택: `OBSIDIAN_VAULT_ROOT`, `UPSTAGE_API_KEY`, `OCR_API_KEY`, `AWS_S3_BUCKET`(X 첨부 이미지·영상 프레임 «시각 흡수» — 공개 읽기 버킷 ⊕ `aws` CLI 자격 · 없으면 그 갈래만 건너뛴다 · 기본값 없음)
 
 ## 흡수한 기능
@@ -156,7 +166,7 @@ X API media.variants → 최저 비트레이트 MP4 → ffmpeg 오디오 추출 
 | `OMNI_DIGEST_MEDIA_MAX_MS` | `1200000` (20분) | 이보다 긴 영상은 전사 생략 |
 | `OMNI_DIGEST_WHISPER_MODEL` | `small` | 로컬 whisper 모델 |
 | `OMNI_DIGEST_STT_LANG` | `en` | 기본 전사 언어 |
-| `YOUTUBE_MASTER_ROOT` | `~/.claude/skills/youtube-master` | 폴백 STT 스킬 경로 |
+| `YOUTUBE_MASTER_ROOT` | 설치한 형제 `youtube-master` 스킬 폴더 | 폴백 STT 스킬 경로 |
 
 > **주의**: `--media-lang`을 실제 음성과 다르게 주면 엔진이 번역하거나 오전사한다.
 > 한국어 영상에 기본값 `en`이 걸리지 않도록, 한국어 콘텐츠는 `--media-lang ko`를 명시할 것.
@@ -177,7 +187,7 @@ X API media.variants → 최저 비트레이트 MP4 → ffmpeg 오디오 추출 
 
 ### OCR (photo-intake-ocr 흡수)
 - Upstage Document OCR (TypeScript 네이티브 포팅)
-  - API 키: env → ~/.cache/upstage_api_key → ~/.zshrc 순 탐색
+  - API 키: 실행 환경의 `UPSTAGE_API_KEY` 사용 권장
   - 한국어+영어 혼합 문서 지원
 - OCR.space 자동 폴백
 - PDF → pdftotext 실패 시 OCR 자동 전환
@@ -246,15 +256,13 @@ npm i -g @steipete/summarize
 ### summarize CLI 설정 (선택)
 
 ```bash
-# ~/.summarize/config.json 에서 기본 모델/언어 등 설정 가능
 summarize --help
 ```
 
 ## 설치
 
 ```bash
-cd ~/.claude/skills/omni-digest
+cd <installed-skill-folder>
 npm install
-cp .env.example .env
 npx tsx scripts/main.ts --self-test
 ```

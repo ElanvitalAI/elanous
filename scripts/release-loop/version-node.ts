@@ -49,9 +49,9 @@ function fetchMain(repo: string): void {
   }
 }
 
-function versionAt(repo: string): string {
-  const pkg = JSON.parse(git(repo, 'show', 'origin/main:package.json')) as { version?: unknown };
-  if (typeof pkg.version !== 'string') throw new Error('origin/main package.json has no version');
+function versionAt(repo: string, ref = 'origin/main'): string {
+  const pkg = JSON.parse(git(repo, 'show', `${ref}:package.json`)) as { version?: unknown };
+  if (typeof pkg.version !== 'string') throw new Error(`${ref} package.json has no version`);
   return pkg.version;
 }
 
@@ -64,13 +64,49 @@ function shippedNextMdLines(repo: string, cut: string | undefined): { lines: Set
   return { lines: new Set(shown.stdout.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('- '))) };
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string): Output {
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string, cutCommit?: string): Output {
   const target = kind === 'release' ? releaseVersion : nextDevVersion(releaseVersion);
   const source = kind === 'release' ? `${releaseVersion}-dev.N` : releaseVersion;
   fetchMain(repo);
+  if (kind === 'release' && cutCommit !== undefined) {
+    if (!/^[0-9a-f]{7,40}$/i.test(cutCommit)) throw new Error(`invalid cut commit SHA: ${cutCommit}`);
+    const local = spawnSync('git', ['rev-parse', '--verify', `${cutCommit}^{commit}`], { cwd: repo, encoding: 'utf8' });
+    let chosen = local.status === 0 ? local.stdout.trim() : '';
+    const onMain = chosen ? spawnSync('git', ['merge-base', '--is-ancestor', chosen, 'origin/main'], { cwd: repo }) : null;
+    if (onMain && onMain.status !== 0 && onMain.status !== 1) throw new Error(`git merge-base failed: ${onMain.error || onMain.stderr || 'unknown'}`);
+    if (onMain?.status !== 0) {
+      const remote = git(repo, 'ls-remote', '--heads', 'origin', `refs/heads/release/${releaseVersion}`);
+      const branchTip = remote.split(/\s+/)[0];
+      if (!chosen && branchTip?.toLowerCase().startsWith(cutCommit.toLowerCase())) {
+        git(repo, 'fetch', 'origin', `refs/heads/release/${releaseVersion}`);
+        chosen = git(repo, 'rev-parse', '--verify', `${cutCommit}^{commit}`);
+      }
+      if (!chosen) chosen = git(repo, 'rev-parse', '--verify', `${cutCommit}^{commit}`);
+      if (branchTip !== chosen) {
+        throw new Error(`cut commit ${chosen} is neither an ancestor of origin/main nor the tip of release/${releaseVersion}`);
+      }
+    }
+    const current = versionAt(repo, chosen);
+    if (current !== target) throw new Error(`cut commit ${chosen} package.json version ${current} is not ${target}`);
+    debug.log('release-loop.cut', 'chosen', { version: releaseVersion, source: 'cut-commit', commit: chosen });
+    return { outcome: 'ok', kind, version: target, commit: chosen, pr: null };
+  }
   const current = versionAt(repo);
   const before = git(repo, 'rev-parse', 'origin/main');
-  if (current === target) return { outcome: 'ok', kind, version: target, commit: before, pr: null };
+  if (current === target) {
+    if (kind === 'release') debug.log('release-loop.cut', 'chosen', { version: releaseVersion, source: 'main', commit: before });
+    return { outcome: 'ok', kind, version: target, commit: before, pr: null };
+  }
+  // An older chosen cut may finish after main has already advanced to the next stable release.
+  // Keep that newer main untouched; a -dev.N mismatch is not evidence of a later release.
+  if (kind === 'dev-bump' && /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.test(current)) {
+    const mainParts = current.split('.').map(BigInt);
+    const nextParts = target.slice(0, -'-dev.0'.length).split('.').map(BigInt);
+    const firstDifference = mainParts.findIndex((part, index) => part !== nextParts[index]);
+    if (firstDifference === -1 || mainParts[firstDifference]! > nextParts[firstDifference]!) {
+      return { outcome: 'ok', kind, version: current, commit: before, pr: null };
+    }
+  }
   if (kind === 'release' ? !new RegExp(`^${releaseVersion.replaceAll('.', '\\.')}\\-dev\\.(0|[1-9][0-9]*)$`).test(current) : current !== source) {
     throw new Error(`origin/main version ${current} is not ${source} (target ${target})`);
   }
@@ -84,6 +120,13 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string)
     const old = `"version": "${current}"`;
     if (!text.includes(old)) throw new Error(`package.json version field not found: ${current}`);
     writeFileSync(path, text.replace(old, `"version": "${target}"`));
+    const serverPath = join(worktree, 'server.json');
+    if (existsSync(serverPath)) {
+      const server = JSON.parse(readFileSync(serverPath, 'utf8')) as { version: string; packages: Array<{ version: string }> };
+      server.version = target;
+      server.packages[0]!.version = target;
+      writeFileSync(serverPath, `${JSON.stringify(server, null, 2)}\n`);
+    }
     const lockPath = join(worktree, 'bun.lock');
     const lock = readFileSync(lockPath, 'utf8');
     const root = /"workspaces"\s*:\s*\{\s*""\s*:\s*\{([\s\S]*?)(?=\s*"(?:dependencies|devDependencies|optionalDependencies)"\s*:)/.exec(lock);
@@ -143,6 +186,7 @@ function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string)
     const commit = git(repo, 'rev-parse', 'origin/main');
     if (versionAt(repo) !== target || commit === before) throw new Error(`origin/main did not advance to ${target} after merge`);
     const output: Output = { outcome: 'ok', kind, version: target, commit, pr: pr ? Number(pr[1]) : null };
+    if (kind === 'release') debug.log('release-loop.cut', 'chosen', { version: releaseVersion, source: 'main', commit });
     git(repo, 'worktree', 'remove', '--force', worktree);
     rmSync(temp, { recursive: true, force: true });
     return output;
@@ -156,27 +200,34 @@ function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Out
   let kind: Kind | null = null;
   let version: string | null = null;
   let cut: string | undefined;
+  let cutCommit: string | undefined;
   try {
-    if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] [--cut <sha>] --json');
+    if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] [--cut <sha>] [--cut-commit <sha>] --json');
     kind = args[0];
     for (let i = 1; i < args.length; i++) {
       if (args[i] === '--json') continue;
       if (args[i] === '--version' && args[i + 1]) { version = args[++i]!; continue; }
       if (args[i] === '--cut' && args[i + 1]) { cut = args[++i]!; continue; }
+      if (args[i] === '--cut-commit' && args[i + 1]) { cutCommit = args[++i]!; continue; }
       throw new Error(`unknown or incomplete argument: ${args[i]}`);
     }
     if (process.env.ELANOUS_GRAPH_CONTEXT) {
       const location = process.env.ELANOUS_GRAPH_CONTEXT;
       const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
-        input?: { version?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
+        input?: { version?: unknown; cutCommit?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
       if (!version && typeof context.input?.version === 'string') version = context.input.version;
+      if (kind === 'release' && cutCommit === undefined && context.input?.cutCommit !== undefined) {
+        if (typeof context.input.cutCommit !== 'string') throw new Error('cutCommit must be a commit SHA');
+        cutCommit = context.input.cutCommit;
+      }
       // The cut = the commit version-release landed (what cutoff and the gate measured).
-      const cutCommit = context.outputs?.['version-release']?.commit;
-      if (!cut && typeof cutCommit === 'string' && cutCommit) cut = cutCommit;
+      const releasedCommit = context.outputs?.['version-release']?.commit;
+      if (!cut && typeof releasedCommit === 'string' && releasedCommit) cut = releasedCommit;
     }
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
-    return landing(resolve(repo), kind, version, cut);
+    if (kind === 'dev-bump' && cutCommit !== undefined) throw new Error('--cut-commit is only valid for release');
+    return landing(resolve(repo), kind, version, cut, cutCommit);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const worktree = /\[worktree: ([^\]]+)\]$/.exec(message)?.[1];

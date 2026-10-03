@@ -25,6 +25,7 @@ import { createRepositoryReferencedFileReader, type ReferencedFileReader } from 
 import { parseGoalDocumentClarifications } from '../self-implement/goal-author-clarification.js';
 import { requiredEvidenceFromGoal } from '../self-implement/off-diff-evidence.js';
 import { debug } from '../debug/log.js';
+import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from './release-path-guard.js';
 import { runGitCommand } from '../git-fs/runner.js';
 import type { GitRunResult } from '../git-fs/retry.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE, observeGitResidue, type GitResidueObservation } from '../git-fs/worktree.js';
@@ -135,6 +136,8 @@ export interface DevShellDriveOpts {
   pollMs?: number;
   model?: string;
   cwd?: string;
+  /** DRIVE-JAIL boundary — inputs naming paths outside it are not sent to the PTY. */
+  jailHome?: string;
 }
 
 /** staged harness(plan-staged) 실행 옵션 — `harness run` front door의 무손실 재라우팅용.
@@ -1852,6 +1855,24 @@ async function observeDevTaskDispatch(spec: DevPipelineSpec, plan: ResolvedDevPl
   }
 }
 
+async function inspectReleasePathBeforeMerge(seams: SelfImplementSeams, number: number, cwd: string): Promise<string | undefined> {
+  if (!seams.readPrFiles) throw new Error('release-path inspection unavailable — automatic merge refused');
+  const files = await seams.readPrFiles({ number, cwd });
+  if (!Array.isArray(files) || !files.every((path) => typeof path === 'string')) throw new Error('invalid PR file list — automatic merge refused');
+  const path = releasePathHold(files);
+  if (!path) return undefined;
+  debug.log('self-dev.merge', 'release-path-hold', { number, path, label: RELEASE_PATH_LABEL });
+  try {
+    if (!seams.addPrLabel) throw new Error('addPrLabel seam unavailable');
+    await seams.addPrLabel({ number, label: RELEASE_PATH_LABEL, cwd });
+  } catch (error) { debug.log('self-dev.merge', 'release-path-annotation-failed', { number, path, action: 'label', error: String(error) }); }
+  try {
+    if (!seams.postPrComment) throw new Error('postPrComment seam unavailable');
+    await seams.postPrComment({ number, body: releasePathHoldComment(path), cwd });
+  } catch (error) { debug.log('self-dev.merge', 'release-path-annotation-failed', { number, path, action: 'comment', error: String(error) }); }
+  return path;
+}
+
 async function runDevPipelineDispatch(
   spec: DevPipelineSpec,
   deps: DevPipelineDeps,
@@ -2071,7 +2092,22 @@ async function runDevPipelineDispatch(
     const defaultSeams = deps.buildSelfImplementSeams
       ? await deps.buildSelfImplementSeams(plan)
       : await buildDefaultSelfImplementSeams(plan, { progress: deps.progress });
-    const seams = deps.approver ? { ...defaultSeams, approvePr: deps.approver } : defaultSeams;
+    const assembledSeams = deps.approver ? { ...defaultSeams, approvePr: deps.approver } : defaultSeams;
+    // Guard even injected runSelfImplement implementations: do not trust a dispatched merge to
+    // have used orchestrator's own PR-path check before requesting mergePr.
+    const seams: SelfImplementSeams = {
+      ...assembledSeams,
+      ...(assembledSeams.mergePr ? { mergePr: async (input) => {
+        let path: string | undefined;
+        try { path = await inspectReleasePathBeforeMerge(assembledSeams, input.number, input.cwd); }
+        catch (error) {
+          debug.log('self-dev.merge', 'release-path-inspection-failed', { number: input.number, error: String(error) });
+          return { merged: false, detail: `automatic merge refused: ${String(error)}` };
+        }
+        if (path) return { merged: false, detail: `OP approval required: ${path}` };
+        return assembledSeams.mergePr!(input);
+      } } : {}),
+    };
     // ⭐ 대표 지시(2026-09-08) — ***걸음을 「위」로 흘린다.***
     //   🩸 그 전까지 런 슈퍼바이저가 받는 것은 «시도의 요약 판정»뿐이었고(stage·stopReason·분류 …)
     //     「어느 노드를 몇 번 밟았나」는 ***런 안에서 끝났다***(`onNodeEntry` 는 있는데 호출부 0).

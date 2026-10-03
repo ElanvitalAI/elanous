@@ -26,7 +26,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { debugLog } from '@/lib/debug';
-import { sendToTerminal } from './terminal-input-registry';
+import { getTerminalHistoryView, sendToTerminal, subscribeTerminalHistoryView } from './terminal-input-registry';
+import { historyAction } from './touch-scroll';
 import {
   buildKeySequence,
   type ModifierKey,
@@ -59,6 +60,19 @@ const MODIFIER_AUTO_RELEASE_MS = 5000;
 
 export function ModifierBar({ terminalId }: Props) {
   const { sessionId } = useDaemon();
+  const [historyView, setHistoryView] = useState(() => getTerminalHistoryView(terminalId));
+  useEffect(() => {
+    const update = () => setHistoryView(getTerminalHistoryView(terminalId));
+    update();
+    return subscribeTerminalHistoryView(update);
+  }, [terminalId]);
+  const showHistory = useCallback(() => {
+    const view = getTerminalHistoryView(terminalId);
+    if (!view) return;
+    const action = historyAction({ bufferType: view.buffer.active.type, mouseTracking: view.modes.mouseTrackingMode });
+    if (action.kind === 'scroll-pages') view.scrollPages(action.pages);
+    else if (sessionId) sendToTerminal(terminalId, action.data);
+  }, [terminalId, sessionId]);
   const [ctrl, setCtrl] = useState(false);
   const [alt, setAlt] = useState(false);
   // TERM4 — 물리(BT) 키보드가 한 번이라도 잡히면 키 줄을 접는다(기기마다 기억 · «⌨ 보조 키»로 다시 편다).
@@ -198,6 +212,17 @@ export function ModifierBar({ terminalId }: Props) {
           {btn.label}
         </button>
       ))}
+      <button
+        type="button"
+        className={navButtonClass('wide')}
+        onClick={showHistory}
+        disabled={!historyView || !sessionId}
+        aria-label="과거 내용 보기"
+        title="과거 내용 보기 — 한 쪽 위로"
+        data-testid="modbar-history"
+      >
+        ⇡ 기록
+      </button>
       <span className="mx-1 text-[10px] text-muted-foreground/60" aria-hidden>·</span>
       <button
         type="button"

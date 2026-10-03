@@ -1,10 +1,10 @@
 import { afterEach, expect, test } from 'bun:test';
 import { Command } from 'commander';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { registerGraphCommands } from './graph-cli.js';
-import { graphRunAlive, listGraphRuns, runGraph } from './runner.js';
+import { graphRunAlive, listGraphRuns, manageGraphRun, runGraph } from './runner.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); process.exitCode = 0; });
@@ -287,6 +287,191 @@ test('runs resume rejects an ambiguous prefix without changing any ledger', asyn
   expect(result.exit).toBe(1);
   expect(result.err.join('\n')).toContain('ambiguous run id: same');
   expect([one, two].map((file) => readFileSync(file, 'utf8'))).toEqual(before);
+});
+
+test('an orphan running node stops as failed and resumes from that node without replaying predecessors', async () => {
+  const base = root();
+  const graph = join(base, 'graph.yaml');
+  const marker = join(base, 'marker');
+  const ready = join(base, 'ready');
+  writeFileSync(join(base, 'recipes.yaml'), `first:\n  command: "printf a >> '${marker}'"\nsecond:\n  command: "test -f '${ready}' && printf b >> '${marker}'"\n`);
+  writeFileSync(graph, `graph_id: orphan-loop\nversion: 1\nentry_node: first\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 1 }\n  - { node_id: second, kind: agent, recipe: 'cmd:second', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - { from: first, to: second }\n  - { from: second, on: outcome, map: { ok: done, fail: failed } }\n`);
+  const first = await runGraph(graph, { runId: 'orphan-run', deps: { root: base, runBash: async (body) => ({ exitCode: 0, stdout: body.includes('printf a') ? 'a' : 'b', stderr: '' }) } });
+  const state = JSON.parse(readFileSync(first.statePath, 'utf8'));
+  state.status = 'running';
+  state.finishedAt = undefined;
+  state.path = ['first', 'second'];
+  state.nodes = [{ nodeId: 'first', ok: true, exit: 0, executed: true, output: 'a' }];
+  state.executed = 1;
+  state.pid = 4321;
+  state.pidStartedAt = '2026-10-03T00:00:00.000Z';
+  writeFileSync(first.statePath, JSON.stringify(state));
+  mkdirSync(`${first.statePath}.resume.lock`);
+  mkdirSync(`${first.statePath}.write.lock`);
+  writeFileSync(join(`${first.statePath}.write.lock`, 'owner.json'), JSON.stringify({ pid: 4321, started: Date.parse(state.pidStartedAt) }));
+  const stopped = await cli(base, ['runs', 'stop', 'orphan'], () => null);
+  expect(stopped.exit).toBe(0);
+  expect(stopped.out).toContain('orphan-loop orphan-run: failed');
+  expect(existsSync(`${first.statePath}.resume.lock`)).toBe(false);
+  expect(existsSync(`${first.statePath}.write.lock`)).toBe(false);
+  expect(JSON.parse(readFileSync(first.statePath, 'utf8'))).toMatchObject({ status: 'failed', nodes: [{ nodeId: 'first', ok: true }, { nodeId: 'second', ok: false }] });
+  writeFileSync(ready, 'yes');
+  const resumed = await cli(base, ['runs', 'resume', 'orphan', '--from', 'second', '--json']);
+  expect(resumed.exit).toBe(0);
+  expect(JSON.parse(resumed.out[0]!)).toMatchObject({ status: 'done', path: ['first', 'second', 'done'], resume: { from: 'second', previousStatus: 'failed' } });
+  expect(readFileSync(marker, 'utf8')).toBe('b');
+});
+
+test('stop verifies ownership and destroy removes only owned artifacts', async () => {
+  const base = root();
+  const file = save(base, 'g', 'owned', new Date().toISOString(), { status: 'running', pid: 42, pidStartedAt: '2026-10-03T00:00:00.000Z' });
+  mkdirSync(`${file}.resume.lock`);
+  const signaled: number[] = [];
+  manageGraphRun('g', 'owned', 'stop', base, () => Date.parse('2026-10-03T00:00:00.000Z'), (pid) => { signaled.push(pid); });
+  expect(signaled).toEqual([42]);
+  expect(JSON.parse(readFileSync(file, 'utf8')).status).toBe('failed');
+  writeFileSync(`${file}.1.decision.json`, JSON.stringify({ nodeId: 'first', decision: 'approved', decidedAt: new Date().toISOString() }));
+  mkdirSync(`${file}.graph`);
+  mkdirSync(`${file}.contexts`);
+  const unrelated = join(base, 'graph-runs', 'g', 'owned-other.json');
+  writeFileSync(unrelated, 'not a graph run');
+  expect((await cli(base, ['runs', 'destroy', 'owned'])).exit).toBe(0);
+  expect(existsSync(file)).toBe(false);
+  expect(existsSync(`${file}.graph`)).toBe(false);
+  expect(existsSync(`${file}.contexts`)).toBe(false);
+  expect(existsSync(`${file}.1.decision.json`)).toBe(false);
+  expect(readFileSync(unrelated, 'utf8')).toBe('not a graph run');
+  const unknown = save(base, 'g', 'unknown', new Date().toISOString(), { status: 'running' });
+  expect((await cli(base, ['runs', 'stop', 'unknown'])).exit).toBe(1);
+  expect(JSON.parse(readFileSync(unknown, 'utf8')).status).toBe('running');
+  expect((await cli(base, ['runs', 'destroy', 'unknown'])).exit).toBe(1);
+  const external = join(base, 'external');
+  writeFileSync(external, 'safe');
+  symlinkSync(external, `${unknown}.contexts`);
+  expect(() => manageGraphRun('g', 'unknown', 'destroy', base, () => null)).toThrow('symlink');
+  expect(readFileSync(external, 'utf8')).toBe('safe');
+});
+
+test('ESRCH after runner verification still removes resume lock and permits destroy', () => {
+  const base = root();
+  const file = save(base, 'g', 'exited', new Date().toISOString(), { status: 'running', pid: 501, pidStartedAt: '2026-10-03T00:00:00.000Z' });
+  mkdirSync(`${file}.resume.lock`);
+  const state = manageGraphRun('g', 'exited', 'stop', base, () => Date.parse('2026-10-03T00:00:00.000Z'), () => {
+    throw Object.assign(new Error('already exited'), { code: 'ESRCH' });
+  });
+  expect(state.status).toBe('failed');
+  expect(existsSync(`${file}.resume.lock`)).toBe(false);
+  manageGraphRun('g', 'exited', 'destroy', base, () => null);
+  expect(existsSync(file)).toBe(false);
+});
+
+test('ESRCH after active node verification still fails the orphan and clears its resume lock', () => {
+  const base = root();
+  const started = '2026-10-03T00:00:00.000Z';
+  const file = save(base, 'g', 'exited-node', new Date().toISOString(), { status: 'running', path: ['first'], nodes: [], executed: 0,
+    pid: 501, pidStartedAt: started, activeNode: { nodeId: 'first', pid: 502, pidStartedAt: started } });
+  mkdirSync(`${file}.resume.lock`);
+  const signaled: number[] = [];
+  manageGraphRun('g', 'exited-node', 'stop', base, () => Date.parse(started), (pid) => {
+    signaled.push(pid);
+    if (pid === 502) throw Object.assign(new Error('already exited'), { code: 'ESRCH' });
+  });
+  expect(signaled).toEqual([502, 501]);
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ status: 'failed', nodes: [{ nodeId: 'first', ok: false }] });
+  expect(existsSync(`${file}.resume.lock`)).toBe(false);
+});
+
+test('legacy ownerless lock after crash is reclaimed; nonempty unknown locks are preserved', () => {
+  const base = root();
+  const file = save(base, 'g', 'legacy-lock', new Date().toISOString(), { status: 'running', pid: 123, pidStartedAt: '2026-10-03T00:00:00.000Z' });
+  const lock = `${file}.write.lock`;
+  mkdirSync(lock);
+  writeFileSync(join(lock, 'unexpected'), 'leave intact');
+  utimesSync(lock, new Date(0), new Date(0));
+  expect(() => manageGraphRun('g', 'legacy-lock', 'stop', base, () => null)).toThrow();
+  expect(JSON.parse(readFileSync(file, 'utf8')).status).toBe('running');
+  expect(readFileSync(join(lock, 'unexpected'), 'utf8')).toBe('leave intact');
+  rmSync(join(lock, 'unexpected'));
+  utimesSync(lock, new Date(0), new Date(0));
+  expect(manageGraphRun('g', 'legacy-lock', 'stop', base, () => null).status).toBe('failed');
+  expect(existsSync(lock)).toBe(false);
+});
+
+test('stop signals only verified node and runner pids, never a reused node pid', () => {
+  const base = root();
+  const file = save(base, 'g', 'active', new Date().toISOString(), { status: 'running', path: ['first'], nodes: [], executed: 0, pid: 501, pidStartedAt: '2026-10-03T00:00:00.000Z',
+    activeNode: { nodeId: 'first', pid: 502, pidStartedAt: '2026-10-03T00:00:00.000Z' } });
+  const signaled: number[] = [];
+  const started = Date.parse('2026-10-03T00:00:00.000Z');
+  manageGraphRun('g', 'active', 'stop', base, pid => pid === 501 ? started : started + 60_000, pid => { signaled.push(pid); });
+  expect(signaled).toEqual([501]);
+  expect(JSON.parse(readFileSync(file, 'utf8')).status).toBe('failed');
+});
+
+test('a failed run with a crash-leftover resume lock can be destroyed; a fresh lock still means a resume is starting', () => {
+  const base = root();
+  const file = save(base, 'g', 'left-lock', new Date().toISOString(), { status: 'failed' });
+  const lock = `${file}.resume.lock`;
+  mkdirSync(lock);
+  expect(() => manageGraphRun('g', 'left-lock', 'destroy', base, () => null)).toThrow('being resumed');
+  expect(existsSync(file)).toBe(true);
+  utimesSync(lock, new Date(Date.now() - 120_000), new Date(Date.now() - 120_000));
+  manageGraphRun('g', 'left-lock', 'destroy', base, () => null);
+  expect(existsSync(file)).toBe(false);
+  expect(existsSync(lock)).toBe(false);
+});
+
+test('stop refuses while a live runner has a node child whose start time is not verified yet', () => {
+  const base = root();
+  const started = '2026-10-03T00:00:00.000Z';
+  const file = save(base, 'g', 'pending-node', new Date().toISOString(), { status: 'running', path: ['first'], nodes: [], executed: 0,
+    pid: 501, pidStartedAt: started, activeNode: { nodeId: 'first', pid: 502, pidStartedAt: 'unverified' } });
+  const signaled: number[] = [];
+  expect(() => manageGraphRun('g', 'pending-node', 'stop', base, () => Date.parse(started), pid => { signaled.push(pid); })).toThrow('not verified yet');
+  expect(signaled).toEqual([]);
+  expect(JSON.parse(readFileSync(file, 'utf8')).status).toBe('running');
+  // Runner gone (reboot): fold to failed without signaling the unverifiable node pid.
+  const state = manageGraphRun('g', 'pending-node', 'stop', base, () => null, pid => { signaled.push(pid); });
+  expect(state.status).toBe('failed');
+  expect(signaled).toEqual([]);
+});
+
+test('destroy refuses a claim belonging to a different visit without removing the ledger or artifacts', () => {
+  const base = root();
+  const file = save(base, 'g', 'guarded', new Date().toISOString());
+  const claim = `${file}.1.decision.json`;
+  writeFileSync(claim, JSON.stringify({ nodeId: 'other', decision: 'approved', decidedAt: new Date().toISOString() }));
+  expect(() => manageGraphRun('g', 'guarded', 'destroy', base, () => null)).toThrow('invalid graph run decision claim');
+  expect(existsSync(file)).toBe(true);
+  expect(existsSync(claim)).toBe(true);
+});
+
+test('real command execution records its node pid while running and clears it on completion', async () => {
+  const base = root();
+  const graph = join(base, 'graph.yaml');
+  writeFileSync(join(base, 'recipes.yaml'), 'first:\n  command: "sleep 0.2"\n');
+  writeFileSync(graph, `graph_id: live-node\nversion: 1\nentry_node: first\nterminal_nodes: [done, failed]\nnodes:\n  - { node_id: first, kind: agent, recipe: 'cmd:first', max_visits: 1 }\n  - { node_id: done, kind: gate, max_visits: 1 }\n  - { node_id: failed, kind: gate, max_visits: 1 }\nedges:\n  - { from: first, on: outcome, map: { ok: done, fail: failed } }\n`);
+  const pending = runGraph(graph, { runId: 'live-pid', deps: { root: base } });
+  const file = join(base, 'graph-runs', 'live-node', 'live-pid.json');
+  let recorded: { activeNode?: { pid: number; nodeId: string } } | undefined;
+  for (let i = 0; i < 100; i++) {
+    if (existsSync(file)) recorded = JSON.parse(readFileSync(file, 'utf8'));
+    if (recorded?.activeNode) break;
+    await Bun.sleep(10);
+  }
+  expect(recorded?.activeNode).toMatchObject({ nodeId: 'first', pid: expect.any(Number) });
+  const done = await pending;
+  expect(done.status).toBe('done');
+  expect(JSON.parse(readFileSync(file, 'utf8')).activeNode).toBeUndefined();
+});
+
+test('a running ledger without a recorded path can be stopped after a crash before the entry node', async () => {
+  const base = root();
+  const file = save(base, 'g', 'early', new Date().toISOString(), { status: 'running', path: [], nodes: [], executed: 0,
+    pid: 123, pidStartedAt: '2026-10-03T00:00:00.000Z' });
+  const result = await cli(base, ['runs', 'stop', 'early'], () => null);
+  expect(result.exit).toBe(0);
+  expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ status: 'failed', path: [], nodes: [] });
 });
 
 test('old graph status remains the latest-run command', async () => {

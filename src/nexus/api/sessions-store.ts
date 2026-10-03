@@ -18,11 +18,9 @@ import {
   isHarnessSessionOrigin,
   type SessionMeta,
 } from '../../session/index.js';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { getProject } from '../../project/project-store.js';
-import { sessionRoot } from '../../session/index.js';
+import { sessionRoot, updateSessionMeta } from '../../session/index.js';
+import { debug } from '../../debug/log.js';
 import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { jsonResponse } from './http-server.js';
 
@@ -181,43 +179,24 @@ export async function handleSessionsStorePatch(req: Request, id: string, opts: M
     return jsonResponse({ ok: false, error: 'invalid_project_id' }, 400);
   }
   const projectId = (body as { projectId: unknown }).projectId;
-  if (projectId !== null && (typeof projectId !== 'string' || !getProject(projectId))) {
+  if (projectId !== null && typeof projectId !== 'string') {
     return jsonResponse({ ok: false, error: 'invalid_project_id' }, 400);
   }
+  // 모양은 맞는데 없는 프로젝트 = 찾을 수 없음(404) — 요청 형식 오류(400)와 가른다(IA1b).
+  if (projectId !== null && !getProject(projectId)) {
+    return jsonResponse({ ok: false, error: 'project-not-found' }, 404);
+  }
 
-  const root = sessionRoot();
-  const lock = join(root, '.index.lock');
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    try { mkdirSync(lock); break; }
-    catch {
-      if (!existsSync(lock)) continue;
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > 30_000) { rmdirSync(lock); continue; }
-      } catch { continue; }
-      if (Date.now() >= deadline) throw new Error(`timed out acquiring lock ${lock}`);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
-  try {
-    const path = join(root, 'index.json');
-    const entries = JSON.parse(readFileSync(path, 'utf8')) as SessionMeta[];
-    const pos = entries.findIndex((meta) => meta.id === id);
-    if (pos < 0) return jsonResponse({ ok: false, error: 'not_found' }, 404);
-    const meta = { ...entries[pos] };
-    if (projectId === null) delete meta.projectId;
-    else meta.projectId = projectId;
-    entries[pos] = meta;
-    const temp = `${path}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
-    writeFileSync(temp, JSON.stringify(entries, null, 2) + '\n', 'utf8');
-    renameSync(temp, path);
-    return jsonResponse({ ok: true, meta }, 200);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return jsonResponse({ ok: false, error: 'not_found' }, 404);
-    throw error;
-  } finally {
-    rmdirSync(lock);
-  }
+  let previous: string | null = null;
+  // 잠금 안에서 최신 목록 위에 고친다 — 동시 appendMessage 가 이 projectId 를 덮지 않는다.
+  const meta = updateSessionMeta(id, (m) => {
+    previous = m.projectId ?? null;
+    if (projectId === null) delete m.projectId;
+    else m.projectId = projectId;
+  }, sessionRoot());
+  if (!meta) return jsonResponse({ ok: false, error: 'not_found' }, 404);
+  debug.log('project', 'assign', { sessionId: id, projectId, previous });
+  return jsonResponse({ ok: true, meta }, 200);
 }
 
 /** DELETE /v1/sessions/store/:id — on-disk 세션 삭제(index.json + <id>.jsonl 제거).

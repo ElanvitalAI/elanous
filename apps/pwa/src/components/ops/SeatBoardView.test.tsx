@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { SeatBoardContent } from './SeatBoardView';
-import type { OpsSeats } from '@/lib/ops-api';
+import { getSeats, type OpsSeats } from '@/lib/ops-api';
+import type { DaemonClient } from '@/lib/daemon-client';
 
 const seats: OpsSeats = {
   date: '2026-10-02',
@@ -13,6 +14,22 @@ const seats: OpsSeats = {
   ],
 };
 const ready = { kind: 'ready' as const, data: seats };
+
+test('API 는 하위 자리 칸을 검증하고 옛 데몬 응답은 받아들인다', async () => {
+  const read = (payload: unknown) => getSeats({ fetchResponse: async () => new Response(JSON.stringify(payload), { status: 200 }) } as unknown as DaemonClient);
+  const withSubs = { ...seats, seats: seats.seats.map((seat) => seat.seat === 'TC' ? { ...seat, subSeats: [
+    { id: 'TC/rel', title: '릴리스', open: 2, landed: 1, blocked: [{ id: 'REL7', title: '차단' }] },
+  ] } : seat) };
+  expect(await read(withSubs)).toEqual({ kind: 'ready', data: withSubs });
+  expect(await read(seats)).toEqual({ kind: 'ready', data: seats });
+  expect(await read({ ...seats, seats: [{ ...seats.seats[2]!, subSeats: null }] })).toMatchObject({ kind: 'ready' });
+  expect(await read({ ...seats, seats: [{ ...seats.seats[2]!, subSeats: [{ id: 'TC/rel', title: '릴리스', open: null, landed: null, blocked: null }] }] })).toMatchObject({ kind: 'ready' });
+  for (const bad of [{ ...withSubs.seats[2]!, subSeats: [{ id: 'TC/rel', title: '릴리스', open: -1, landed: 0, blocked: [] }] },
+    { ...withSubs.seats[2]!, subSeats: [{ id: 'TC/rel', title: '릴리스', open: 'unknown', landed: 0, blocked: [] }] },
+    { ...withSubs.seats[2]!, subSeats: [{ id: 'TC/rel', title: '릴리스', open: 0, landed: 0, blocked: [{ id: 1, title: '차단' }] }] }]) {
+    expect(await read({ ...withSubs, seats: [bad] })).toEqual({ kind: 'error', status: 200 });
+  }
+});
 
 describe('SeatBoardContent', () => {
   test('four cards order, unknown counts, and status bar remain distinct from zero', () => {
@@ -31,6 +48,30 @@ describe('SeatBoardContent', () => {
     expect(html).toContain('결정 대기 <strong class="text-3xl text-muted-foreground">못 읽음</strong>');
     expect(html).toContain('마지막 갱신');
     expect(html).toContain('min-[1440px]:grid-cols-4');
+  });
+  test('헌장 하위 자리 줄과 막힘 id 를 보이고 옛 데몬은 트리를 숨긴다', () => {
+    const withSubs: OpsSeats = { ...seats, seats: seats.seats.map((seat) => seat.seat === 'TC' ? { ...seat, subSeats: [
+      { id: 'TC/rel', title: '릴리스·인프라 운영 하위 자리', open: 2, landed: 1, blocked: [{ id: 'REL7', title: '막힘' }, { id: 'REL8', title: '다른 막힘' }] },
+      { id: 'TC/docs', title: '문서·GitHub 공개', open: 0, landed: 0, blocked: [] },
+    ] } : seat) };
+    const html = renderToStaticMarkup(<SeatBoardContent result={{ kind: 'ready', data: withSubs }} refreshedAt={null} />);
+    expect(html).toContain('aria-label="하위 자리"');
+    expect(html).toContain('└ TC/rel 릴리스·인프라 운영 하위 자리 · 열린 칸 2 · 오늘 착지 1 · 막힘 2 · REL7, REL8');
+    expect(html).toContain('└ TC/docs 문서·GitHub 공개 · 열린 칸 0 · 오늘 착지 0 · 막힘 0');
+    expect(renderToStaticMarkup(<SeatBoardContent result={ready} refreshedAt={null} />)).not.toContain('aria-label="하위 자리"');
+    const publicHtml = renderToStaticMarkup(<SeatBoardContent result={{ kind: 'ready', data: withSubs }} refreshedAt={null} publicCapture />);
+    expect(publicHtml).not.toContain('REL7');
+    expect(publicHtml).not.toContain('REL8');
+    expect(publicHtml).toContain('└ TC/rel 릴리스·인프라 운영 하위 자리 · 열린 칸 2 · 오늘 착지 1 · 막힘 2');
+  });
+  test('출처별 하위 자리 미확인은 숫자 0 대신 못 읽음으로 렌더한다', () => {
+    const unknown: OpsSeats = { ...seats, seats: seats.seats.map((seat) => seat.seat === 'TC' ? { ...seat,
+      subSeats: [{ id: 'TC/rel', title: '릴리스', open: null, landed: null, blocked: null },
+        { id: 'TC/docs', title: '문서', open: 0, landed: null, blocked: [] }],
+    } : seat) };
+    const html = renderToStaticMarkup(<SeatBoardContent result={{ kind: 'ready', data: unknown }} refreshedAt={null} />);
+    expect(html).toContain('└ TC/rel 릴리스 · 열린 칸 못 읽음 · 오늘 착지 못 읽음 · 막힘 못 읽음');
+    expect(html).toContain('└ TC/docs 문서 · 열린 칸 0 · 오늘 착지 못 읽음 · 막힘 0');
   });
   test('public mode keeps safe lines and counts but drops forbidden lines and identifiers', () => {
     const privateSeats: OpsSeats = { ...seats, seats: seats.seats.map((seat) => seat.seat === 'UX' ? {

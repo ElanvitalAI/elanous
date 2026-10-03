@@ -26,8 +26,8 @@ describe('explicitTurnTier', () => {
     expect(explicitTurnTier(cfg({ llm: 'budget' }), sessionId)?.source).toBe('user-config-surface');
   });
 
-  test('preset, persona and default do not change the existing turn model', () => {
-    for (const tier of [undefined, { preset: 'some-preset' }, { persona: 'power' }]) {
+  test('preset, profile and default do not change the existing turn model', () => {
+    for (const tier of [undefined, { preset: 'some-preset' }, { profile: 'power' }]) {
       expect(explicitTurnTier(cfg(tier), sessionId)).toBeUndefined();
     }
   });

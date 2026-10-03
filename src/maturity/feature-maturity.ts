@@ -22,6 +22,7 @@ export const FEATURE_MATURITY = {
     '/editor': { pwa: 'beta' },
     '/intake': { pwa: 'beta' },
     '/trace': { pwa: 'beta' },
+    '/inside': { pwa: 'beta' },
     '/board': { pwa: 'beta' },
     '/autopilot': { pwa: 'beta' },
     '/missions/[id]': { pwa: 'beta' },
@@ -31,6 +32,7 @@ export const FEATURE_MATURITY = {
     '/vault': { pwa: 'beta' },
     '/observatory': { pwa: 'beta' },
     '/exec': { pwa: 'beta' },
+    '/outputs': { pwa: 'beta' },
     '/field': { pwa: 'beta' },
     '/showroom': { pwa: 'beta' },
     '/workflows': { pwa: 'beta' },
@@ -55,11 +57,11 @@ export const FEATURE_MATURITY = {
     pty: 'beta', pr: 'beta', repo: 'beta', role: 'beta', machine: 'beta',
     where: 'stable', shadow: 'beta', llm: 'beta', storage: 'beta', leader: 'beta',
     pod: 'beta', browser: 'beta', questions: 'beta', usage: 'stable', live: 'beta',
-    research: 'beta', release: 'beta', seat: 'beta', coord: 'beta', 'model-watch': 'beta', doctor: 'stable',
+    research: 'beta', release: 'beta', seat: 'beta', coord: 'beta', context: 'beta', 'model-watch': 'beta', doctor: 'stable',
     control: 'beta', resources: 'beta', hooks: 'beta', setup: 'stable', start: 'stable',
     grounding: 'beta', graph: 'beta', loop: 'stable', card: 'stable', 'launch-head': 'beta',
-    a2a: 'beta', plugin: 'stable', skills: 'beta', connect: 'beta', import: 'beta',
-    persona: 'beta', market: 'beta', directive: 'stable', connector: 'beta', storyboard: 'beta',
+    a2a: 'beta', plugin: 'stable', make: 'beta', skills: 'beta', connect: 'beta', import: 'beta',
+    persona: 'beta', 'team-set': 'beta', market: 'beta', directive: 'stable', connector: 'beta', storyboard: 'beta',
     python: 'beta', 'self-update': 'stable', 'measure-fabric-arc-ab': 'beta', mcp: 'beta',
     relay: 'beta', 'telegram-test': 'beta', telegram: 'beta', 'discord-test': 'beta',
     sync: 'beta', status: 'beta', git: 'beta', gh: 'beta', repro: 'system',
@@ -86,6 +88,7 @@ export const FEATURE_MATURITY = {
     model: 'stable',
     clear: 'stable',
     status: 'stable',
+    now: 'beta', // CTX2 «지금 무엇이 돌고 있나» (#23379)
     remaining: 'stable',
     setup: 'stable',
     quit: 'stable',
@@ -144,7 +147,26 @@ export const FEATURE_MATURITY = {
     'auto-tts': 'beta',
     directive: 'ops',
   },
-} as const satisfies { pwaRoute: Record<string, SurfaceMaturity>; cliRoot: Record<string, Maturity>; tuiSlash: Record<string, Maturity> };
+  telegramCommand: {
+    help: 'stable', status: 'stable', new: 'stable', clear: 'stable', reset: 'stable',
+    ping: 'stable', provider: 'stable', sessions: 'stable', fork: 'stable', resume: 'stable',
+    decisions: 'stable', work: 'stable', cancel: 'stable',
+    skills: 'beta', skill: 'beta', digest: 'beta', intake: 'beta', ad: 'beta',
+    taste: 'beta', missions: 'beta', attach: 'beta', detach: 'beta', now: 'beta', project: 'beta',
+    brain: 'tool', cc: 'tool', cdx: 'tool', gem: 'tool', local: 'tool',
+    harness: 'ops',
+    // Existing commands outside the CXO four-grade menu list are owner-only.
+    cc_clear: 'system', coo: 'system', cto: 'system', cmo: 'system', cxo: 'system', mission_del: 'system',
+    bots: 'system', bot: 'system', screen: 'system', chart: 'system', routines: 'system', botsay: 'system',
+  },
+  discordCommand: {
+    status: 'stable', sessions: 'stable', new: 'stable', fork: 'stable',
+    persona: 'beta', poll: 'beta', attach: 'beta',
+    brain: 'tool', cc: 'tool', cdx: 'tool', gem: 'tool',
+    relay: 'ops', showroom: 'ops', bots: 'ops', bot: 'ops', screen: 'ops', chart: 'ops',
+    routines: 'ops', botsay: 'ops', 'voice-join': 'ops', 'voice-leave': 'ops', 'voice-status': 'ops',
+  },
+} as const satisfies { pwaRoute: Record<string, SurfaceMaturity>; cliRoot: Record<string, Maturity>; tuiSlash: Record<string, Maturity>; telegramCommand: Record<string, Maturity>; discordCommand: Record<string, Maturity> };
 
 /** Unregistered routes and surfaces are not implicitly mature. Desktop shares the PWA implementation. */
 export function maturityOn(route: string, surface: Surface): Maturity | undefined {

@@ -122,7 +122,7 @@ export function SessionsDeckPanel() {
     >
       <header className="flex items-start justify-between gap-2">
         <div>
-          <h1 className="font-heading text-lg font-medium">세션 카드 데크</h1>
+          <h1 className="font-heading text-lg font-medium">대화 카드 데크</h1>
           <p className="text-xs text-muted-foreground">
             ←/→/↑/↓ 스와이프로 거절·승인·잠시 멈춤·펼치기 결정.
           </p>
@@ -131,7 +131,7 @@ export function SessionsDeckPanel() {
           type="button"
           variant="ghost"
           size="sm"
-          aria-label="refresh sessions"
+          aria-label="대화 새로고침"
           onClick={() => void fetchActive()}
           disabled={loading}
         >
@@ -148,13 +148,13 @@ export function SessionsDeckPanel() {
       <CardSweepView sessions={sessions} onDecision={onDecision} />
 
       <footer className="mt-2 flex items-center justify-between text-[10px] text-muted-foreground">
-        <span>{sessions.length} 세션 · {loading ? 'loading…' : 'live'}</span>
+        <span>{sessions.length} 대화 · {loading ? 'loading…' : 'live'}</span>
         <label className="flex items-center gap-1">
           <input
             type="checkbox"
             checked={includeStale}
             onChange={(e) => setIncludeStale(e.target.checked)}
-            aria-label="include stale sessions"
+            aria-label="오래된 대화 포함"
           />
           24시간 이전도 표시
         </label>

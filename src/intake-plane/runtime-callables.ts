@@ -305,7 +305,14 @@ export function buildRealIntakeCallables(
   };
 
   const decompose: DecomposeMemoCallable = (args) => promptCallable(args);
-  const categorize: CategorizeCallable = (args) => promptCallable(args);
+  const categorize: CategorizeCallable = async (args) => {
+    const text = await streamLLM([{ role: 'user', content: args.prompt }], () => {}, {
+      ...(args.provider ? { provider: providers[args.provider] } : {}),
+      ...(args.model ? { model: args.model } : {}),
+      ...(args.signal ? { signal: args.signal } : {}), usageRole: 'classify',
+    });
+    return { text, modelId: args.model };
+  };
   const align: AlignCallable = (args) => promptCallable(args);
 
   /** Synth callable — wraps R3 `synthWorkflowFromIntent`. Hands it a

@@ -20,7 +20,7 @@ const PLACEHOLDER = /\{\{([^{}]*)\}\}/g;
 const INPUT_REF = /^inputs\.([A-Za-z_][A-Za-z0-9_]*)$/;
 
 export function isPluginKindNode(node: DagNode): node is PluginKindNode {
-  return typeof (node as PluginKindNode).kind === 'string';
+  return typeof (node as PluginKindNode).kind === 'string' && node.kind !== 'subworkflow';
 }
 
 export function pluginKindRunName(run: NodeKindRun): 'bash' | 'http' | 'skill' | 'mcp' {

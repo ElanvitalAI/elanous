@@ -125,6 +125,9 @@ export interface LogQuery {
   /** event/data/category LIKE 부분 일치. */
   grep?: string;
   sessionId?: string;
+  /** Trace ownership: explicit row projectId takes precedence over session ownership. */
+  projectId?: string;
+  projectSessionIds?: readonly string[];
   sinceMs?: number;
   untilMs?: number;
   /** 증분 커서 — id > afterId 를 오름차순으로(SSE 드레인). */
@@ -397,6 +400,18 @@ export class LogStore {
       params.push(needle, needle, needle);
     }
     if (q.sessionId) { where.push('session_id = ?'); params.push(q.sessionId); }
+    if (q.projectId !== undefined) {
+      const sessionIds = [...new Set(q.projectSessionIds ?? [])];
+      // An explicit project tag wins, even if the row's session belongs to another project.
+      // Guard JSON extraction so malformed and absent payloads cannot match by accident.
+      const tagged = "CASE WHEN json_valid(data) THEN json_extract(data, '$.projectId') ELSE NULL END";
+      const session = "CASE WHEN json_valid(data) THEN json_extract(data, '$.sessionId') ELSE NULL END";
+      const untagged = "CASE WHEN json_valid(data) THEN json_type(data, '$.projectId') IS NULL ELSE 1 END";
+      where.push(`(${tagged} = ? OR (${untagged} AND (${sessionIds.length
+        ? `session_id IN (${sessionIds.map(() => '?').join(',')}) OR ${session} IN (${sessionIds.map(() => '?').join(',')})`
+        : '0'})))`);
+      params.push(q.projectId, ...sessionIds, ...sessionIds);
+    }
     if (q.sinceMs !== undefined) { where.push('ts_ms >= ?'); params.push(q.sinceMs); }
     if (q.untilMs !== undefined) { where.push('ts_ms <= ?'); params.push(q.untilMs); }
     if (q.afterId !== undefined) { where.push('id > ?'); params.push(q.afterId); }

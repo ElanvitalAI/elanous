@@ -262,12 +262,14 @@ describe('harness CLI sink hook', () => {
       '--correlation',
       '--goal-type',
       '--force-preflight',
+      '--force-gate',
       '--child-llm-provider',
       '--child-llm-model',
       '--child-llm-effort',
       '--substrate',
       '--pod-pool',
       '--pod-memory',
+      '--after',
       '--source',
     ]);
   });
@@ -351,12 +353,14 @@ describe('harness CLI sink hook', () => {
       '--correlation',
       '--goal-type',
       '--force-preflight',
+      '--force-gate',
       '--child-llm-provider',
       '--child-llm-model',
       '--child-llm-effort',
       '--substrate',
       '--pod-pool',
       '--pod-memory',
+      '--after',
       '--source',
     ]);
   });

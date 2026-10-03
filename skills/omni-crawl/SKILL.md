@@ -2,7 +2,7 @@
 name: omni-crawl
 description: >
   통합 «문서» 검색/크롤링 스킬 (2026-09-02 재편 — 여론 축은 social-pulse 로 분리).
-  일반 웹/뉴스 검색은 Tavily 1순위(대표 2026-09-10 기본 ON · DuckDuckGo 는 **폴백 전용**으로 강등),
+  일반 웹/뉴스 검색은 Tavily 1순위(공식 결정 2026-09-10 기본 ON · DuckDuckGo 는 **폴백 전용**으로 강등),
   크롤/스크랩/추출은 Firecrawl REST v2(풀본문·maxAge 캐시), 개발 아티팩트(README·문서·이슈·PR)는
   Firecrawl Developer Index(`--engine fc-dev` — 매칭 패시지를 직접 반환해 스크랩 콜 절감).
   --mode deep 딥리서치 (다각도 검색 + 풀스크랩 + 커뮤니티 합성 · 기술 주제면 fc-dev 자동 가세 —
@@ -32,7 +32,7 @@ requires: []
 
 | 역할 | 1순위 (유료·기본) | 폴백 | 근거 (실측) |
 |------|-------|------|-------------|
-| **일반 웹 검색** | **tavily** | firecrawl → 🆓 ddg | 대표 2026-09-10 기본 ON. ⚙️ `OMNI_CRAWL_TAVILY=0` 이면 ddg 1순위로 역전 |
+| **일반 웹 검색** | **tavily** | firecrawl → 🆓 ddg | 공식 결정 2026-09-10 기본 ON. ⚙️ `OMNI_CRAWL_TAVILY=0` 이면 ddg 1순위로 역전 |
 | **뉴스** | tavily-news + fc-news(qdr 필터) | 🆓 ddg | ⚙️ 스위치 OFF 면 fc-news 단독 |
 | **크롤/스크랩/PDF/추출** | firecrawl REST v2 | **jina 무료** | 풀본문·maxAge 캐시(기본 2일·500% 가속) |
 | **개발 아티팩트(문서·이슈·PR)** | **fc-dev** (Developer Index) | ddg | 패시지 직반환 — 블로그보다 «정의한» 원문이 강한 답 |
@@ -44,13 +44,21 @@ requires: []
 ### 💸 비용 원칙 (2026-07-10 무료 티어 추가)
 
 > **품질 동일 시 무료, 아니면 유료 우선.** 유료(firecrawl/grok/apify)가 **1순위·기본**.
-> ⚙️ **tavily 가 1순위** — 대표 2026-09-10: 2026-08-06 엔 고정비 때문에 ddg 를 1순위로 뒀는데,
+> ⚙️ **tavily 가 1순위** — 공식 결정 2026-09-10: 2026-08-06 엔 고정비 때문에 ddg 를 1순위로 뒀는데,
 > **DDG HTML 이 차단되면 웹 검색 축이 통째로 0건**이 되고 폴백조차 안 걸리는 구멍이 있었다(실측).
 > 무료는 «돈 떨어졌을 때의 안전망»이지 1순위가 아니다 — 기본 ON, `OMNI_CRAWL_TAVILY=0` 으로 역전 가능.
 > ⛔ ***「콜당 싸다」와 「늘 켜 둔다」는 다른 축이다.*** `--engine tavily` 명시 호출은 스위치와 무관하게 돈다.
 > 무료(ddg 검색·jina 스크랩·capture)는 **① 유료 키 없음 ② 유료 0건 공백 ③ `--free` 명시
 > ④ deep 스크랩 실패분 보충** 일 때만 자동 강등. "돈 떨어지면 죽는" 구조를 메우는 안전망.
 > deer-flow(무료 DDG+Jina 기본, 유료 선택) 아키텍처에서 이식 — omni-crawl은 유료 우선으로 반전.
+
+## 무료로 쓰는 길 (키 없이)
+
+이 스킬 폴더에서 `npx tsx scripts/main.ts "<검색어>" --free --print`로 DDG 검색을 사용합니다. URL 본문은 키 없는 Jina Reader 또는 로컬 HTML 추출을 사용할 수 있습니다. `--free`는 유료 엔진을 피하려는 명시적 선택이며, 검색 서비스 접속이 막히면 결과가 없을 수 있습니다.
+
+## 내 키로 쓰는 길
+
+유료 검색·스크랩은 자신의 `TAVILY_KEY`(Tavily)와 `FIRECRAWL_API_KEY`(Firecrawl)를 실행 환경에 설정합니다. 선택 엔진은 `XAI_API_KEY`(Grok), `APIFY_TOKEN`(Apify)를 사용합니다. 설정할 때 값이나 자격 파일은 이 스킬 문서·사본에 넣지 않습니다.
 
 ## 엔진
 
@@ -82,8 +90,10 @@ requires: []
 
 ## 실행
 
+이 스킬 폴더에서 실행합니다.
+
 ```bash
-npx tsx ~/.claude/skills/omni-crawl/scripts/main.ts "<검색어>" [OPTIONS]
+npx tsx scripts/main.ts "<검색어>" [OPTIONS]
 ```
 
 ### 예시
@@ -144,10 +154,10 @@ npx tsx scripts/main.ts "https://news.samsung.com" --engine fc-crawl --print
 - **무료 티어** (`src/free.ts`, 2026-07-10): DDG HTML 검색 + Jina Reader(keyless) 마크다운 +
   로컬 readability 폴백 (dep-free = 순수 fetch+regex). 유료 공백/키없음/`--free`/deep 실패분에만 발동.
 - **web_capture** (`src/capture.ts`, 2026-07-10): headless Chrome `--screenshot` 셸아웃 →
-  Dia CDP(9222) 폴백. PNG 아티팩트를 `~/.omni-crawl/captures` 에 저장.
+  Dia CDP(9222) 폴백. PNG 아티팩트는 로컬 캡처 디렉토리에 저장.
 - **REST 직결** (2026-07-06): firecrawl CLI shell-out 제거 — 크론/데몬 최소 PATH 즉사,
   launchctl 키 증발, 콜당 146ms 스폰, execSync 이벤트루프 블로킹(병렬성 파괴)이
-  간헐 고장의 근본원인이었음(실측). 키는 스킬 `.env` 자립. fc-agent만 CLI 잔존(대화형 전용).
+  간헐 고장의 근본원인이었음(실측). 키는 실행 환경에서 전달. fc-agent만 CLI 잔존(대화형 전용).
 - **Developer Index** (`fc-dev`, 2026-09-02 배선): `POST /v2/search/developer`. 다른 v2
   엔드포인트와 **봉투가 다르다** — 파라미터는 `limit` 이 아니라 **`k`**(`limit` 보내면 400),
   응답은 `data` 가 아니라 **`results`** (실측 2026-08-31). `id` 접두사가 곧 종류
@@ -161,7 +171,7 @@ npx tsx scripts/main.ts "https://news.samsung.com" --engine fc-crawl --print
   떼어낼 덩어리가 아니었고, `--mode deep` 이 ddg+firecrawl+grok 을 한 파이프라인에서 합성하므로
   프로세스 경계를 넣으면 위 «REST 직결» 항목이 기록한 고장을 재현한다. `--engine grok-*` 호출 계약은 불변.
 - **폴백 체인**: tavily ↔ firecrawl → (최후) 🆓 ddg · scrape 실패 → waitFor 재시도 → 🆓 jina.
-  대표 2026-09-10: `wantedWeb` 에 ddg 를 포함시켜 **ddg 1순위였을 때 0건이면 유료로 «승격» 보충**되게 했다
+  공식 결정 2026-09-10: `wantedWeb` 에 ddg 를 포함시켜 **ddg 1순위였을 때 0건이면 유료로 «승격» 보충**되게 했다
   (종전엔 ddg 가 축 계산에서 빠져 보충이 아예 안 걸렸다).
 - **URL dedup**: 엔진 간 중복 제거. deep 모드는 풀본문 우선 생존.
 - **비용 가시성**: 결과에 `비용: firecrawl ~5cr` 표시. `--health`가 잔량 보고.
@@ -216,18 +226,18 @@ omni-digest --content "<크롤결과>" --format rich-cards --print
 
 ## 환경변수
 
-`.env` 하나로 관리 (스킬 자립 — 셸/launchctl 비의존). grok/omni-digest `.env` 자동 상속.
+실행 환경의 변수 이름을 아래 표에서 확인합니다. 자격 파일은 이 팩에 포함하지 않습니다.
 
 | 변수 | 용도 | 필수 |
 |------|------|------|
 | `TAVILY_KEY` | Tavily 검색/추출 | tavily 사용 시 |
-| `OMNI_CRAWL_TAVILY` | ⚙️ **tavily 상시사용 스위치**(`1` 이면 ON · **기본 OFF** · 대표 2026-08-06 고정비) | 선택 |
-| `FIRECRAWL_API_KEY` | Firecrawl REST (2026-07-06부터 .env 자립) | firecrawl 사용 시 |
+| `OMNI_CRAWL_TAVILY` | ⚙️ tavily 상시사용 스위치 (기본 ON · `0` 이면 OFF, ddg 우선) | 선택 |
+| `FIRECRAWL_API_KEY` | Firecrawl REST | firecrawl 사용 시 |
 | `XAI_API_KEY` | Grok 검색 | Grok 사용 시 |
 | `APIFY_TOKEN` | Apify tweet-scraper | Apify 사용 시 |
 | `JINA_API_KEY` | Jina Reader rate-limit 상향 (무료 티어는 키 없이도 동작) | 선택 |
 | `OMNI_CRAWL_CHROME` | headless Chrome 바이너리 경로 (기본 자동 탐지) | 선택 |
-| `OMNI_CRAWL_CAPTURE_DIR` | 스크린샷 저장 경로 (기본 `~/.omni-crawl/captures`) | 선택 |
+| `OMNI_CRAWL_CAPTURE_DIR` | 스크린샷 저장 디렉토리 (기본 자동 선택) | 선택 |
 | `OMNI_CRAWL_CDP_PORT` | Dia/Chrome CDP 폴백 포트 (기본 9222) | 선택 |
 | `OBSIDIAN_VAULT_ROOT` | Obsidian 볼트 경로 (자동 저장 대상) | 저장 시 |
 | `OMNI_CRAWL_SAVE_SUBDIR` | 볼트 내 저장 서브디렉토리 (기본: `00. Inbox/05. Crawl`) | 선택 |

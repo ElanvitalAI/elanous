@@ -73,6 +73,7 @@ export function publishWorkflowRunEvent(
   const detail: Record<string, unknown> = {
     runId: ctx.runId,
     workflowName: ctx.workflowName,
+    ...(evt.mode !== undefined ? { mode: evt.mode } : {}),
   };
   if (evt.type === 'node_start' || evt.type === 'node_skipped' || evt.type === 'node_done') {
     detail.nodeId = evt.nodeId;

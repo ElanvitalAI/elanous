@@ -31,7 +31,7 @@ const CHAT_CORE = [
   'SelfImplement', 'AskUserQuestion', 'AcpSessionCreate', 'AcpSessionSend', 'AcpSessionClose',
   'AcpSessionList', 'AcpSessionResume', 'AcpSessionSpawnSub', 'AcpSessionStartBackground',
   'AcpSessionStatus', 'AcpSessionCancel', 'AcpSessionJoin', 'AcpPlanThenExecute',
-  'schedule_manage', 'session_manage', 'memory_recall', 'fact_check', 'self_recall',
+  'schedule_manage', 'session_manage', 'memory_recall', 'fact_check', 'self_recall', 'context_now',
   'autopilot_missions', 'ops_status', 'se_build', 'logs_query', 'mission_decide', 'coo_admin',
   // SYNC1 ① #23007 — owner-only read tools; names are listed, dispatch refuses without a server-verified owner (like release_change).
   'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'elanous_skills_list', 'skill_exec',

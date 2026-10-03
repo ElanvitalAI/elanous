@@ -437,6 +437,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: 'model',     aliases: ['m'],           description: '모델 바꾸기 — /model <codex|terra|sol|luna|opus|sonnet|grok> (list + current when no arg). OpenAI 는 Codex(Responses API)만. effort 는 /reasoning.', subcommands: ['codex', 'terra', 'sol', 'luna', 'opus', 'sonnet', 'grok'] },
   { name: 'clear', aliases: ['cls'],       description: '대화 기록 지우기' },
   { name: 'status', aliases: ['st'], description: '지금 상태 — 모델 · 연결 · 계정' },
+  { name: 'now', aliases: [], description: '현재 맥락과 출처 표 — /now [주제]' },
   { name: 'remaining', aliases: [], description: '계정별 남은 사용량' },
   { name: 'setup', aliases: [], description: '상세 설정 — /setup · /setup reset(다음 실행 때 마법사 다시)', subcommands: ['help', 'reset'] },
   { name: 'quit',  aliases: ['q', 'exit'], description: '나가기' },

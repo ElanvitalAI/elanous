@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { countByMarkerAndFile, findGrowth, parseBaseline, renderBaseline, runPublicLeakGate } from './ci-public-leak-gate.js';
+import { countByMarkerAndFile, findGrowth, findLeakChanges, parseBaseline, renderBaseline, runPublicLeakGate } from './ci-public-leak-gate.js';
 import type { LeakHit } from './public-export.js';
 
 const hit = (marker: string, file: string): LeakHit => ({ marker, file, line: 1, text: '' });
@@ -44,6 +45,38 @@ describe('ci-public-leak-gate', () => {
     expect(io(['--changed-files', 'src/a.ts']).rc).toBe(0);   // 늘어난 파일이 변경 목록 밖
     hits = [];
     expect(io([]).rc).toBe(0);
+  });
+
+  test('a base-ref baseline reports removals including entries absent from the PR scan; growth still wins', () => {
+    const root = rootWithScripts();
+    const git = (...args: string[]) => {
+      const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+    };
+    try {
+      git('init', '-q', '-b', 'main');
+      git('config', 'user.email', 'test@example.com');
+      git('config', 'user.name', 'Test');
+      writeFileSync(join(root, 'scripts/public-leak-baseline.txt'), renderBaseline(new Map([['ceo-mark\tsrc/a.ts', 2]])));
+      git('add', '.');
+      git('commit', '-qm', 'baseline');
+      writeFileSync(join(root, 'scripts/public-leak-baseline.txt'), renderBaseline(new Map()));
+      const run = (hits: LeakHit[]) => {
+        const c = capture();
+        const rc = runPublicLeakGate({ root, args: ['--changed-files', 'src/a.ts'], baselineRef: 'main', scan: () => hits, log: c.log, error: c.error });
+        return { rc, lines: c.out };
+      };
+      expect(findLeakChanges(new Map(), new Map([['ceo-mark\tsrc/a.ts', 2]]))).toEqual([{ marker: 'ceo-mark', file: 'src/a.ts', allowed: 2, now: 0 }]);
+      expect(run([])).toEqual({ rc: 3, lines: [
+        '[public-leak-gate] SHRANK — 유출이 줄었다 · 기준선 --update 권장 (변경 파일 1개 · 1곳):',
+        '  src/a.ts  ceo-mark  2 → 0',
+      ] });
+      const mixed = run([hit('ceo-mark', 'src/b.ts'), hit('ceo-mark', 'src/b.ts')]);
+      expect(mixed.rc).toBe(3); // 다른 파일의 증가/감소는 변경 범위 밖
+      const grown = run([hit('ceo-mark', 'src/a.ts'), hit('ceo-mark', 'src/a.ts'), hit('ceo-mark', 'src/a.ts')]);
+      expect(grown.rc).toBe(1);
+      expect(grown.lines).toContain('  src/a.ts  ceo-mark  2 → 3');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('a missing baseline is «cannot judge» (rc 2), not a pass', () => {

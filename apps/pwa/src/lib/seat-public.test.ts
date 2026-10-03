@@ -23,6 +23,8 @@ describe('seatNowLine and the crown marker (10-02 harvest review)', () => {
       .toBe('(대표 «메인이 뒤처져 있다») — 각자 작업 트리를 main 최신으로');
     expect(seatNowLine('**[UX]** 2026-10-02 15:45 KST → TC OP · PCH-2b 경계 나눔 제안')).toBe('PCH-2b 경계 나눔 제안');
     expect(seatNowLine('그냥 한 줄')).toBe('그냥 한 줄');
+    // 10-03 live: the dash and kind word after the recipients were left on the board.
+    expect(seatNowLine('**[UX]** 2026-10-03 19:20 KST → OP — 보고 · 정시 · 쏜 수 38')).toBe('정시 · 쏜 수 38');
   });
 
   test('a line carrying the crown marker is not public-safe', () => {

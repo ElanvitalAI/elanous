@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
+import type { OutputKind } from './default-outputs.js';
 
 export type SeatStatus = 'waiting' | 'running' | 'done' | 'failed';
 export interface ExecSeat {
@@ -10,6 +11,8 @@ export interface ExecSeat {
   status: SeatStatus;
   graphId: string;
   runId: string;
+  /** Requested output category, distinct from the result file MIME kind. */
+  output?: OutputKind;
   inputs?: Record<string, unknown>;
   reason?: string;
   /** A5b — indexes of earlier seats this seat waits for. */

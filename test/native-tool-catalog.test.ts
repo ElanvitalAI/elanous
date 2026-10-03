@@ -325,9 +325,10 @@ describe('nativeToolCatalog — metadata invariants', () => {
       expect(host).not.toContain('plugin');
     }
 
-    expect(nativeToolCatalog).toHaveLength(182);
+    expect(nativeToolCatalog).toHaveLength(183);
     expect([...distribution.entries()].sort()).toEqual([
-      ['mcp', 16],
+      // CTX2 #23185 — context_now(맥락 한 문 · READ-ONLY 자기관측)가 MCP 에 더해졌다.
+      ['mcp', 17],
       ['skill', 33],
       ['skill,tui', 90],
       // 🆕 AskUserQuestion — 챗에서 띄운 자식이 사람에게 «되물을» 수 있어야 한다(2026-09-08).

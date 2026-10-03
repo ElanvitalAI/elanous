@@ -37,6 +37,11 @@ describe('buildKeySequence — plain (no modifiers)', () => {
   test('Left arrow → ESC [ D', () => {
     expect(buildKeySequence('left')).toBe('\x1b[D');
   });
+
+  test('Page Up and Page Down → VT sequences', () => {
+    expect(buildKeySequence('pageup')).toBe('\x1b[5~');
+    expect(buildKeySequence('pagedown')).toBe('\x1b[6~');
+  });
 });
 
 describe('buildKeySequence — with Ctrl', () => {
@@ -105,6 +110,11 @@ describe('buildKeySequence — with Ctrl+Alt', () => {
   test('Ctrl+Alt+Esc → ESC ESC (Alt wins; Ctrl ignored on Esc)', () => {
     expect(buildKeySequence('esc', { ctrl: true, alt: true })).toBe('\x1b\x1b');
   });
+});
+
+test('Page keys retain CSI Ctrl/Alt modifiers', () => {
+  expect(buildKeySequence('pageup', { ctrl: true, alt: false })).toBe('\x1b[5;5~');
+  expect(buildKeySequence('pagedown', { ctrl: false, alt: true })).toBe('\x1b[6;3~');
 });
 
 describe('isModifierToggleKey', () => {

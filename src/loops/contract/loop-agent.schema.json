@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elanous.ai/schemas/loop-agent/1.0.0",
+  "title": "Loop agent manifest v1 (design contract; not an execution graph)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "version", "kind", "role", "graph", "cadence", "posture", "resolution", "grounding", "memory", "neighbors", "spawn", "hitl", "budget", "observability"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" },
+    "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "kind": { "enum": ["orchestrator", "seat", "function", "external"] },
+    "role": { "type": "string", "minLength": 1 },
+    "graph": { "type": "string", "pattern": "^graphs/[a-zA-Z0-9/_-]+\\.yaml$" },
+    "orchestration": { "type": "object", "additionalProperties": false, "required": ["windows"], "properties": {
+      "windows": { "type": "array", "minItems": 1, "items": { "type": "object", "additionalProperties": false,
+        "required": ["at", "delegateTo", "fromLedger"], "properties": {
+          "at": { "type": "string", "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9]$" },
+          "delegateTo": { "type": "array", "minItems": 1, "uniqueItems": true,
+            "items": { "enum": ["op-seat", "cmo-seat", "tc-seat", "ux-seat"] } },
+          "fromLedger": { "type": "string", "minLength": 1 }
+        }
+      } }
+    } },
+    "cadence": {
+      "description": "Each DEFCON profile specifies a tick interval in minutes; existing cron remains authoritative until migration.",
+      "type": "object", "additionalProperties": false,
+      "required": ["timezone", "byDefcon"],
+      "properties": {
+        "timezone": { "type": "string", "minLength": 1 },
+        "byDefcon": { "type": "array", "minItems": 5, "maxItems": 5, "prefixItems": [
+          { "$ref": "#/$defs/cadence5" }, { "$ref": "#/$defs/cadence4" }, { "$ref": "#/$defs/cadence3" }, { "$ref": "#/$defs/cadence2" }, { "$ref": "#/$defs/cadence1" }
+        ] }
+      }
+    },
+    "posture": {
+      "type": "object", "additionalProperties": false,
+      "required": ["default", "levels", "raiseOn", "lowerOn", "hysteresis"],
+      "properties": {
+        "default": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "levels": { "type": "array", "minItems": 5, "maxItems": 5, "prefixItems": [
+          { "$ref": "#/$defs/posture5" }, { "$ref": "#/$defs/posture4" }, { "$ref": "#/$defs/posture3" }, { "$ref": "#/$defs/posture2" }, { "$ref": "#/$defs/posture1" }
+        ] },
+        "raiseOn": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/signal" } },
+        "lowerOn": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/signal" } },
+        "hysteresis": { "type": "object", "additionalProperties": false, "required": ["minDwellMinutes", "clearTicks"], "properties": {
+          "minDwellMinutes": { "type": "integer", "minimum": 1 }, "clearTicks": { "type": "integer", "minimum": 2 }
+        } }
+      }
+    },
+    "resolution": {
+      "description": "Local depth rises L0→L3; the posture profile bounds it, independently of DEFCON direction.",
+      "type": "object", "additionalProperties": false, "required": ["default", "steps", "raiseOn", "lowerOn"],
+      "properties": {
+        "default": { "enum": ["L0", "L1", "L2", "L3"] },
+        "steps": { "type": "array", "minItems": 4, "maxItems": 4, "prefixItems": [
+          { "$ref": "#/$defs/resolution0" }, { "$ref": "#/$defs/resolution1" }, { "$ref": "#/$defs/resolution2" }, { "$ref": "#/$defs/resolution3" }
+        ] },
+        "raiseOn": { "$ref": "#/$defs/signal" }, "lowerOn": { "$ref": "#/$defs/signal" }
+      }
+    },
+    "grounding": { "type": "array", "uniqueItems": true, "items": { "enum": ["omni-crawl", "omni-digest", "aside-repl", "social-pulse"] } },
+    "memory": { "type": "object", "additionalProperties": false, "required": ["local", "promotesTo", "retention"], "properties": {
+      "local": { "type": "object", "additionalProperties": false, "required": ["ledger", "working"], "properties": {
+        "ledger": { "type": "string", "minLength": 1 }, "working": { "type": "string", "minLength": 1 }
+      } },
+      "promotesTo": { "type": "array", "uniqueItems": true, "items": { "enum": ["self-recall", "decisions", "checklist"] } },
+      "retention": { "type": "object", "additionalProperties": false, "required": ["workingDays", "ledgerDays"], "properties": {
+        "workingDays": { "type": "integer", "minimum": 1 }, "ledgerDays": { "type": "integer", "minimum": 1 }
+      } }
+    } },
+    "neighbors": { "type": "array", "items": { "$ref": "#/$defs/neighbor" } },
+    "spawn": { "type": "object", "additionalProperties": false, "required": ["allowed", "max", "reap"], "properties": {
+      "allowed": { "type": "array", "uniqueItems": true, "items": { "enum": ["agent", "harness"] } },
+      "max": { "type": "integer", "minimum": 0 },
+      "reap": { "type": "object", "additionalProperties": false, "required": ["afterMinutes", "onExit"], "properties": {
+        "afterMinutes": { "type": "integer", "minimum": 1 }, "onExit": { "enum": ["reconcile", "escalate"] }
+      } }
+    } },
+    "hitl": { "type": "object", "additionalProperties": false, "required": ["ladder"], "properties": {
+      "ladder": { "const": ["self-heal", "neighbor", "orchestrator", "human"] }
+    } },
+    "budget": { "$ref": "#/$defs/budget" },
+    "observability": { "type": "object", "additionalProperties": false, "required": ["category", "events"], "properties": {
+      "category": { "type": "string", "pattern": "^loop\\.[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" },
+      "events": { "type": "array", "uniqueItems": true, "minItems": 1, "items": { "enum": ["tick", "posture-change", "resolution-change", "grounding", "heartbeat", "absent", "exchange", "spawn", "reap", "promote", "hitl"] } }
+    } }
+  },
+  "allOf": [{ "if": { "properties": { "kind": { "const": "orchestrator" } }, "required": ["kind"] }, "then": { "properties": { "orchestration": true }, "required": ["orchestration"] }, "else": { "not": { "required": ["orchestration"] } } }],
+  "$defs": {
+    "budget": { "type": "object", "additionalProperties": false, "required": ["maxTokens", "maxToolCalls", "maxCostUsd"], "properties": {
+      "maxTokens": { "type": "integer", "minimum": 1 }, "maxToolCalls": { "type": "integer", "minimum": 1 }, "maxCostUsd": { "type": "number", "exclusiveMinimum": 0 }
+    } },
+    "groundingCall": { "type": "object", "additionalProperties": false, "required": ["tool", "budget"], "properties": {
+      "tool": { "enum": ["omni-crawl", "omni-digest", "aside-repl", "social-pulse"] },
+      "budget": { "$ref": "#/$defs/budget" }
+    } },
+    "resolutionStep": { "type": "object", "additionalProperties": false, "required": ["level", "grounding", "budget"], "properties": {
+      "level": { "enum": ["L0", "L1", "L2", "L3"] },
+      "grounding": { "type": "array", "items": { "$ref": "#/$defs/groundingCall" } },
+      "budget": { "$ref": "#/$defs/budget" }
+    } },
+    "resolution0": { "allOf": [{ "$ref": "#/$defs/resolutionStep" }, { "type": "object", "properties": { "level": { "const": "L0" } } }] },
+    "resolution1": { "allOf": [{ "$ref": "#/$defs/resolutionStep" }, { "type": "object", "properties": { "level": { "const": "L1" } } }] },
+    "resolution2": { "allOf": [{ "$ref": "#/$defs/resolutionStep" }, { "type": "object", "properties": { "level": { "const": "L2" } } }] },
+    "resolution3": { "allOf": [{ "$ref": "#/$defs/resolutionStep" }, { "type": "object", "properties": { "level": { "const": "L3" } } }] },
+    "signal": { "type": "object", "additionalProperties": false, "required": ["event", "afterTicks"], "properties": {
+      "event": { "type": "string", "minLength": 1 }, "afterTicks": { "type": "integer", "minimum": 1 }
+    } },
+    "cadenceStep": { "type": "object", "additionalProperties": false, "required": ["defcon", "everyMinutes"], "properties": {
+      "defcon": { "type": "integer", "minimum": 1, "maximum": 5 }, "everyMinutes": { "type": "integer", "minimum": 1 }
+    } },
+    "cadence5": { "allOf": [{ "$ref": "#/$defs/cadenceStep" }, { "type": "object", "properties": { "defcon": { "const": 5 } } }] },
+    "cadence4": { "allOf": [{ "$ref": "#/$defs/cadenceStep" }, { "type": "object", "properties": { "defcon": { "const": 4 } } }] },
+    "cadence3": { "allOf": [{ "$ref": "#/$defs/cadenceStep" }, { "type": "object", "properties": { "defcon": { "const": 3 } } }] },
+    "cadence2": { "allOf": [{ "$ref": "#/$defs/cadenceStep" }, { "type": "object", "properties": { "defcon": { "const": 2 } } }] },
+    "cadence1": { "allOf": [{ "$ref": "#/$defs/cadenceStep" }, { "type": "object", "properties": { "defcon": { "const": 1 } } }] },
+    "postureStep": { "type": "object", "additionalProperties": false, "required": ["defcon", "minResolution", "maxResolution", "budget"], "properties": {
+      "defcon": { "type": "integer", "minimum": 1, "maximum": 5 }, "minResolution": { "enum": ["L0", "L1", "L2", "L3"] },
+      "maxResolution": { "enum": ["L0", "L1", "L2", "L3"] }, "budget": { "$ref": "#/$defs/budget" }
+    } },
+    "posture5": { "allOf": [{ "$ref": "#/$defs/postureStep" }, { "type": "object", "properties": { "defcon": { "const": 5 } } }] },
+    "posture4": { "allOf": [{ "$ref": "#/$defs/postureStep" }, { "type": "object", "properties": { "defcon": { "const": 4 } } }] },
+    "posture3": { "allOf": [{ "$ref": "#/$defs/postureStep" }, { "type": "object", "properties": { "defcon": { "const": 3 } } }] },
+    "posture2": { "allOf": [{ "$ref": "#/$defs/postureStep" }, { "type": "object", "properties": { "defcon": { "const": 2 } } }] },
+    "posture1": { "allOf": [{ "$ref": "#/$defs/postureStep" }, { "type": "object", "properties": { "defcon": { "const": 1 } } }] },
+    "neighbor": { "type": "object", "additionalProperties": false, "required": ["id", "exchange", "heartbeat", "onAbsent"], "properties": {
+      "id": { "type": "string", "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$" },
+      "exchange": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["status", "request", "decision", "blocked"] } },
+      "heartbeat": { "type": "object", "additionalProperties": false, "required": ["everyMinutes", "missedTicks"], "properties": {
+        "everyMinutes": { "type": "integer", "minimum": 1 }, "missedTicks": { "type": "integer", "minimum": 1 }
+      } },
+      "onAbsent": { "type": "object", "additionalProperties": false, "required": ["action", "delegateTo"], "properties": {
+        "action": { "enum": ["delegate", "defer", "escalate"] },
+        "delegateTo": { "type": "string", "minLength": 1 }
+      } }
+    } }
+  }
+}

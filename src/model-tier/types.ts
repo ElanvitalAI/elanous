@@ -61,15 +61,15 @@ export function modelTierRank(t: ModelTier): number {
  *  adds `llm` and `tts`. Embedding / vision land in Phase 3. */
 export type ModelTierSurface = 'stt' | 'llm' | 'tts';
 
-// ── Persona ────────────────────────────────────────────────────────
+// ── Model tier profile ─────────────────────────────────────────────
 
-/** Zero-config baseline (§3.0 of the PLAN) — two-persona framework.
+/** Zero-config baseline (§3.0 of the PLAN) — model tier profiles.
  *  - `casual`: never touches settings; surfaces minimal UI.
  *  - `power`: opens slider / picker / preset etc.
  *  - `custom`: preset or per-surface overrides decide. */
-export type ModelTierPersona = 'casual' | 'power' | 'custom';
+export type ModelTierProfile = 'casual' | 'power' | 'custom';
 
-export function isModelTierPersona(v: unknown): v is ModelTierPersona {
+export function isModelTierProfile(v: unknown): v is ModelTierProfile {
   return v === 'casual' || v === 'power' || v === 'custom';
 }
 
@@ -112,9 +112,9 @@ export function isTtsVoiceContext(v: unknown): v is TtsVoiceContext {
 
 /** Root `modelTier` sub-tree of UserConfig. Sparse — every field is
  *  optional so the resolver can fall through (surface override → preset
- *  → persona → default). */
+ *  → profile → default). */
 export interface ModelTierUserConfig {
-  persona?: ModelTierPersona;
+  profile?: ModelTierProfile;
   preset?: string;
   voice?: ModelTierVoiceConfig;
   llm?: ModelTier;

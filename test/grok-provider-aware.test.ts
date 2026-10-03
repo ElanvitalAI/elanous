@@ -9,8 +9,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isAnalyzerAvailable, isGrokAvailable } from '../src/grok';
-import { anyProviderAvailable } from '../src/llm';
+import { anyProviderAvailable, decideProviderForConfig } from '../src/llm';
+import { DEFAULT_FALLBACK_CHAIN, normalizeFallbackChain } from '../src/oauth/fallback-chain';
 import { saveTokens } from '../src/oauth/store';
+import { _resetKeyCacheForTests } from '../src/config';
 import { saveUserConfig, buildUserConfig, resetUserConfig } from '../src/user-config';
 
 const saved: Record<string, string | undefined> = {};
@@ -20,14 +22,20 @@ let cfgPath: string;
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'grok-provider-'));
   cfgPath = join(root, 'elanous', 'config.json');
-  for (const k of ['XAI_API_KEY', 'GROK_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'LOCAL_LLM_URL']) {
+  for (const k of [
+    'XAI_API_KEY', 'GROK_API_KEY', 'GROK_CODE_XAI_API_KEY', 'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY', 'OPENROUTER_API_KEY',
+    'LOCAL_LLM_URL', 'ELANOUS_LLM_PROVIDER', 'ELANOUS_ESCALATE_PROVIDER',
+    'XDG_CONFIG_HOME', 'CODEX_HOME', 'HOME', 'ELANOUS_KEY_CACHE_DIR',
+  ]) {
     saved[k] = process.env[k];
     delete process.env[k];
   }
-  saved.XDG_CONFIG_HOME = process.env.XDG_CONFIG_HOME;
-  saved.CODEX_HOME = process.env.CODEX_HOME;
   process.env.XDG_CONFIG_HOME = root;
   process.env.CODEX_HOME = join(root, 'codex-home');
+  process.env.HOME = root;
+  process.env.ELANOUS_KEY_CACHE_DIR = join(root, 'key-cache');
+  _resetKeyCacheForTests();
   resetUserConfig();
 });
 afterEach(() => {
@@ -36,6 +44,7 @@ afterEach(() => {
     else process.env[k] = v;
   }
   rmSync(root, { recursive: true, force: true });
+  _resetKeyCacheForTests();
   resetUserConfig();
 });
 
@@ -54,16 +63,11 @@ describe('isAnalyzerAvailable — back-compat alias isGrokAvailable', () => {
   });
 
   test('true when codex OAuth tokens on file (no env var)', () => {
-    // Need to bootstrap a config.json with provider=openai-codex so
-    // the analyzer knows to look for codex tokens.
-    const cfg = buildUserConfig(cfgPath);
-    cfg.llm.provider = 'openai-codex';
-    saveUserConfig(cfg, cfgPath);
     saveTokens('openai-codex', {
       accessToken: 'A', refreshToken: 'R', expiresAt: Date.now() + 3600_000,
     }, { authMode: 'chatgpt', mirrorCodex: false });
-    resetUserConfig();
     expect(isAnalyzerAvailable()).toBe(true);
+    expect(decideProviderForConfig(buildUserConfig(cfgPath)).provider).toBe('auto:openai-codex');
   });
 });
 
@@ -75,6 +79,18 @@ describe('anyProviderAvailable', () => {
   test('true when env provider is set even if config says provider=auto', () => {
     process.env.XAI_API_KEY = 'xai-env';
     expect(anyProviderAvailable()).toBe(true);
+  });
+
+  test('auto prefers codex OAuth over other available providers and keeps the configured fallback order', () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-ant';
+    saveTokens('openai-codex', {
+      accessToken: 'A', refreshToken: 'R', expiresAt: Date.now() + 3600_000,
+    }, { authMode: 'chatgpt', mirrorCodex: false });
+    const cfg = buildUserConfig(cfgPath);
+    expect(cfg.llm.provider).toBe('auto');
+    expect(normalizeFallbackChain(cfg.llm.fallbackChain).chain).toEqual(DEFAULT_FALLBACK_CHAIN);
+    expect(DEFAULT_FALLBACK_CHAIN).toEqual(['codex-rotate', 'grok']);
+    expect(decideProviderForConfig(cfg).provider).toBe('auto:openai-codex');
   });
 
   test('true when config.provider=openai-codex + OAuth tokens, no env', () => {

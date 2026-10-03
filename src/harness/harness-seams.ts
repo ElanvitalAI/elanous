@@ -23,6 +23,7 @@ import { buildReviewSeam, gateEvidenceNote, reviewResultToCritiqueLike, type Gat
 import { buildExecuteProgressJudge } from './execute-progress-judge.js';
 import type { StagedHarnessSeams } from './staged-harness.js';
 import { debug } from '../debug/log.js';
+import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { setEventLoopActivity } from '../debug/event-loop-watchdog.js';
 import { nestInfo } from '../agent/nest-depth.js';
 import { originObservationFields } from '../agent/origin-observation.js';
@@ -721,10 +722,43 @@ export function buildHarnessSeams(deps: HarnessSeamsDeps): StagedHarnessSeams {
         suppressedRiskHits: eligibility?.suppressedRiskHits.length ?? 0,
         ...(declineReasons ? { reasons: declineReasons } : {}),
       });
-      const pr = await deps.seams.openPr({ title, body, head: branch, ...(deps.base ? { base: deps.base } : {}), draft: true, ...(labels ? { labels } : {}), cwd });
-      // ★ 리뷰 반영(#5338) — 라벨 관측은 openPr 성공 후 PR 번호와 함께(생성 실패 시 거짓 운영 증거 방지).
-      if (labels) observe('auto-review-labeled', { branch, number: pr.number, label: AUTO_REVIEW_LABEL });
-      observe('deployed-pr', { number: pr.number, url: pr.url, autoReview: !!labels });
+      const pr = await deps.seams.openPr({ title, body, head: branch, ...(deps.base ? { base: deps.base } : {}), draft: true, cwd });
+      let holdPath: string | undefined;
+      let inspectionError: string | undefined;
+      try {
+        if (!deps.seams.readPrFiles) throw new Error('readPrFiles seam unavailable');
+        const prFiles = await deps.seams.readPrFiles({ number: pr.number, cwd });
+        if (!Array.isArray(prFiles) || !prFiles.every((path) => typeof path === 'string')) throw new Error('invalid PR file list');
+        holdPath = releasePathHold(prFiles);
+      } catch (error) { inspectionError = String(error); }
+      if (holdPath) {
+        const protectedPath = holdPath;
+        const prCwd = cwd;
+        debug.log('self-dev.merge', 'release-path-hold', { number: pr.number, path: protectedPath, label: RELEASE_PATH_LABEL });
+        for (const [action, annotate] of [
+          ['add-label', deps.seams.addPrLabel && (() => deps.seams.addPrLabel!({ number: pr.number, label: RELEASE_PATH_LABEL, cwd: prCwd }))],
+          ['comment', deps.seams.postPrComment && (() => deps.seams.postPrComment!({ number: pr.number, body: releasePathHoldComment(protectedPath), cwd: prCwd }))],
+        ] as const) {
+          if (!annotate) { observe('release-path-annotation-failed', { number: pr.number, action, error: 'annotation seam unavailable' }); continue; }
+          try { await annotate(); } catch (error) { observe('release-path-annotation-failed', { number: pr.number, action, error: String(error) }); }
+        }
+        observe('deployed-pr', { number: pr.number, url: pr.url, autoReview: false, mergeReason: 'release-path-hold' });
+      } else if (inspectionError) {
+        observe('release-path-inspection-failed', { number: pr.number, error: inspectionError });
+        observe('deployed-pr', { number: pr.number, url: pr.url, autoReview: false, mergeReason: 'release-path-inspection-failed' });
+      } else {
+        let autoReviewLabeled = false;
+        if (labels?.includes(AUTO_REVIEW_LABEL)) {
+          if (deps.seams.addPrLabel) {
+            try {
+              await deps.seams.addPrLabel({ number: pr.number, label: AUTO_REVIEW_LABEL, cwd });
+              autoReviewLabeled = true;
+              observe('auto-review-labeled', { branch, number: pr.number, label: AUTO_REVIEW_LABEL });
+            } catch (error) { observe('auto-review-label-failed', { number: pr.number, error: String(error) }); }
+          } else observe('auto-review-label-failed', { number: pr.number, error: 'addPrLabel seam unavailable' });
+        }
+        observe('deployed-pr', { number: pr.number, url: pr.url, autoReview: autoReviewLabeled });
+      }
       // B(대표 2026-07-21): post-PR 자율 리뷰 — 리뷰기가 PR 에 커멘트(fail-soft). 게이트가 놓친 품질 블로커 표면화.
       await postPrReview(cwd, pr.number, objective, deps.llmReview, deps.spawnSyncFn ?? spawnSync, deps.goalDocument);
       return { ok: true, ref: pr.url, kind: 'pr' };

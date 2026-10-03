@@ -960,7 +960,7 @@ export function SettingsPanel() {
                 {/* Bindings list — token → sessionId mapping. */}
                 <div className="space-y-1.5">
                   <div className="flex items-center justify-between">
-                    <span className="font-medium">Bindings (token → session)</span>
+                    <span className="font-medium">연결 (토큰 → 대화)</span>
                     <span className="text-[10px] text-muted-foreground">
                       {(pushcut.bindings?.length ?? 0)} active
                     </span>
@@ -1123,7 +1123,7 @@ export function SettingsPanel() {
       )}
 
       <section className="space-y-3">
-        <h2 className="text-sm font-medium">Session</h2>
+        <h2 className="text-sm font-medium">대화</h2>
         <div className="rounded-md border border-border bg-card px-3 py-2 font-mono text-xs">
           {sessionId || '(no session yet)'}
         </div>

@@ -5,7 +5,7 @@
 // XDG_CONFIG_HOME so the test never touches the user's real config.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -47,6 +47,14 @@ async function asJson(res: Response): Promise<Record<string, unknown>> {
 }
 
 describe('M1-2b · GET /v1/config/model-tier', () => {
+  test('legacy on-disk key is read and emitted as profile', async () => {
+    mkdirSync(join(userConfigPath(), '..'), { recursive: true });
+    writeFileSync(userConfigPath(), JSON.stringify({ modelTier: { persona: 'power' } }));
+    const res = handleModelTierGet();
+    expect(res.status).toBe(200);
+    expect((await asJson(res)).modelTier).toEqual({ profile: 'power' });
+  });
+
   test('empty user-config → empty body', async () => {
     const res = handleModelTierGet();
     expect(res.status).toBe(200);
@@ -70,6 +78,23 @@ describe('M1-2b · PUT /v1/config/model-tier', () => {
     const getRes = handleModelTierGet();
     const getBody = await asJson(getRes);
     expect(getBody.modelTier).toEqual({ voice: { stt: 'best' } });
+  });
+
+  test('accepts legacy request but echoes and persists only model tier profile', async () => {
+    const res = await handleModelTierPut(putRequest({ modelTier: { persona: 'power' } }));
+    expect(res.status).toBe(200);
+    expect((await asJson(res)).modelTier).toEqual({ profile: 'power' });
+    const raw = JSON.parse(readFileSync(userConfigPath(), 'utf8')) as { modelTier: unknown };
+    expect(raw.modelTier).toEqual({ profile: 'power' });
+    expect((await asJson(handleModelTierGet())).modelTier).toEqual({ profile: 'power' });
+  });
+
+  test('new request profile wins over legacy key; rejects invalid profile', async () => {
+    const res = await handleModelTierPut(putRequest({ modelTier: { persona: 'power', profile: 'casual' } }));
+    expect(res.status).toBe(200);
+    expect((await asJson(res)).modelTier).toEqual({ profile: 'casual' });
+    const invalid = await handleModelTierPut(putRequest({ modelTier: { persona: 'power', profile: 'invalid' } }));
+    expect(invalid.status).toBe(400);
   });
 
   test('writes budget.monthlyUsdCap with sparse semantics', async () => {

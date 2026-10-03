@@ -56,7 +56,7 @@ interface Props {
   disableStackTransform?: boolean;
 }
 
-const DEFAULT_EMPTY = '활성 세션 없음 · 새 대화를 시작하세요';
+const DEFAULT_EMPTY = '진행 중인 대화 없음 · 새 대화를 시작하세요';
 
 export function CardSweepView({
   sessions,
@@ -130,7 +130,7 @@ export function CardSweepView({
       data-top-index={topIndex}
       className="relative h-72 select-none touch-none"
       role="region"
-      aria-label="session card deck · 좌우 = 거절/승인 · 위 = 잠시 멈춤 · 아래 = 펼치기"
+      aria-label="대화 카드 데크 · 좌우 = 거절/승인 · 위 = 잠시 멈춤 · 아래 = 펼치기"
       tabIndex={0}
     >
       {visible.map((s, i) => (

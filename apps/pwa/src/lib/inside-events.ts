@@ -1,5 +1,51 @@
 import type { DaemonClient } from './daemon-client';
 import { subscribeSharedEventSource } from './shared-event-source';
+import { parseDecision, type PtyDecision } from '../components/inside/pty-decisions';
+
+export function subscribePtyDecisions(client: Pick<DaemonClient, 'logsStreamUrl'>, onEvent: (event: PtyDecision) => void): () => void {
+  const url = client.logsStreamUrl({ exactCategory: 'pty.decision' });
+  if (!url) return () => {};
+  return subscribeSharedEventSource(url, { events: { log: message => {
+    let frame: unknown;
+    try { frame = JSON.parse(message.data); } catch { return; }
+    if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return;
+    const record = frame as Record<string, unknown>;
+    if (record.category !== 'pty.decision') return;
+    const event = parseDecision(record.data);
+    if (event && record.event === event.step) onEvent(event);
+  } } });
+}
+
+export interface WizardStepEvent {
+  ts: string;
+  wizardId: string;
+  step: 'request' | 'research' | 'draft' | 'validate' | 'install' | 'done';
+  text: string;
+  detail?: unknown;
+}
+
+export function fromWizardLogFrame(json: unknown): WizardStepEvent | null {
+  let frame: unknown = json;
+  if (typeof frame === 'string') {
+    try { frame = JSON.parse(frame); } catch { return null; }
+  }
+  if (!frame || typeof frame !== 'object' || Array.isArray(frame)) return null;
+  const record = frame as Record<string, unknown>;
+  if (record.category !== 'wizard.step' || record.event !== 'wizard.step' || !record.data || typeof record.data !== 'object' || Array.isArray(record.data)) return null;
+  const data = record.data as Record<string, unknown>;
+  if (typeof data.ts !== 'string' || !Number.isFinite(Date.parse(data.ts)) || typeof data.wizardId !== 'string' || !data.wizardId ||
+    !['request', 'research', 'draft', 'validate', 'install', 'done'].includes(data.step as string) || typeof data.text !== 'string') return null;
+  return { ts: data.ts, wizardId: data.wizardId, step: data.step as WizardStepEvent['step'], text: data.text, ...(data.detail === undefined ? {} : { detail: data.detail }) };
+}
+
+export function subscribeWizardSteps(client: Pick<DaemonClient, 'logsStreamUrl'>, onEvent: (event: WizardStepEvent) => void): () => void {
+  const url = client.logsStreamUrl({ exactCategory: 'wizard.step' });
+  if (!url) return () => {};
+  return subscribeSharedEventSource(url, { events: { log: message => {
+    const event = fromWizardLogFrame(message.data);
+    if (event) onEvent(event);
+  } } });
+}
 
 export interface InsideEvent {
   kind: 'node';

@@ -66,12 +66,12 @@ describe('PWA slash-command boundary', () => {
   it('keeps the meta handlers, their slash equivalents and their outcomes', async () => {
     const cap = captureMetaLog();
     try {
-      expect(META_COMMANDS.map(({ name }) => name)).toEqual(['help', 'session', 'fork', 'budget', 'history', 'clear', 'sessions', 'resume', 'model', 'reasoning', 'provider']);
+      expect(META_COMMANDS.map(({ name }) => name)).toEqual(['help', 'session', 'fork', 'rewind', 'undo', 'budget', 'history', 'clear', 'sessions', 'resume', 'model', 'reasoning', 'provider']);
       expect(Object.keys(META_HANDLERS)).toEqual(META_COMMANDS.map(({ name }) => `:${name}`));
       for (const name of ['help', 'session', 'budget', 'history', 'clear']) {
         expect(await dispatchMeta(`/${name}`, ctx)).toEqual(await dispatchMeta(`:${name}`, ctx));
       }
-      const forked = await dispatchMeta('/fork', ctx);
+      const forked = await dispatchMeta(':fork', ctx);
       expect(forked?.newSessionId).toBeTruthy();
       expect(forked?.text).toContain('forked → new session');
       expect(cap.seen).toHaveLength(11);
@@ -79,12 +79,87 @@ describe('PWA slash-command boundary', () => {
     } finally { cap.restore(); }
   });
 
+  it('forks the persisted session, truncates by user turns and only switches on success', async () => {
+    const calls: Array<{ path: string; init?: RequestInit }> = [];
+    const events: Array<{ event: string; data: unknown }> = [];
+    const original = console.debug;
+    console.debug = ((line: string, data: unknown) => {
+      const event = line.match(/webterm\.chat\.fork/);
+      if (event) events.push({ event: event[0], data });
+    }) as typeof console.debug;
+    const messages = [
+      { role: 'user' }, { role: 'assistant' }, { role: 'meta' },
+      { role: 'user' }, { role: 'system' }, { role: 'user' },
+    ] as ChatMessage[];
+    const client = { fetchJson: async (path: string, init?: RequestInit) => {
+      calls.push({ path, init });
+      return { ok: true, id: `branch-${calls.length}` };
+    } } as unknown as DaemonClient;
+    const forkCtx = { ...ctx, client, messages };
+    try {
+      expect(await dispatchMeta('/fork', forkCtx)).toEqual({ text: 'forked → new session branch-1', newSessionId: 'branch-1' });
+      expect(await dispatchMeta('/rewind 2', forkCtx)).toEqual({ text: '2개 사용자 턴 이전으로 분기했습니다 → branch-2', newSessionId: 'branch-2' });
+      expect(await dispatchMeta('/undo', forkCtx)).toEqual({ text: '1개 사용자 턴 이전으로 분기했습니다 → branch-3', newSessionId: 'branch-3' });
+      expect(calls.map(({ init }) => init)).toEqual([
+        { method: 'POST' },
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"beforeUser":2}' },
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"beforeUser":3}' },
+      ]);
+      expect(calls.map(({ path }) => path)).toEqual(Array(3).fill('/v1/sessions/store/test-session/fork'));
+      expect(events.map(({ data }) => data)).toEqual([
+        { command: 'fork', outcome: 'forked', sessionId: 'test-session', newSessionId: 'branch-1' },
+        { command: 'rewind', outcome: 'forked', sessionId: 'test-session', newSessionId: 'branch-2', beforeUser: 2 },
+        { command: 'undo', outcome: 'forked', sessionId: 'test-session', newSessionId: 'branch-3', beforeUser: 3 },
+      ]);
+    } finally { console.debug = original; }
+  });
+
+  it('rejects invalid counts and store failures without switching sessions', async () => {
+    const events: Array<{ command: string; outcome: string; sessionId: string }> = [];
+    const original = console.debug;
+    console.debug = ((line: string, data: { command: string; outcome: string; sessionId: string }) => {
+      if (line.includes('webterm.chat.fork')) events.push(data);
+    }) as typeof console.debug;
+    try {
+      const calls: string[] = [];
+      const client = { fetchJson: async (path: string) => {
+        calls.push(path);
+        throw new Error('HTTP 503: unavailable\nprivate details');
+      } } as unknown as DaemonClient;
+      const local = { ...ctx, client, messages: [{ role: 'user' }, { role: 'assistant' }] as ChatMessage[] };
+      for (const line of ['/rewind', '/rewind 0', '/rewind -1', '/rewind 1.5', '/rewind x', '/rewind 1 2', '/rewind 9007199254740993']) {
+        expect((await dispatchMeta(line, local))?.newSessionId).toBeUndefined();
+      }
+      expect((await dispatchMeta('/rewind 2', local))?.newSessionId).toBeUndefined();
+      expect((await dispatchMeta('/undo extra', local))?.newSessionId).toBeUndefined();
+      expect(calls).toEqual([]);
+      expect(await dispatchMeta('/fork', local)).toEqual({ text: '대화 분기 실패 — HTTP 503: unavailable' });
+      expect(await dispatchMeta('/undo', local)).toEqual({ text: '대화 분기 실패 — HTTP 503: unavailable' });
+      expect(calls).toHaveLength(2);
+      const missing = { ...local, client: { fetchJson: async () => { throw new Error('HTTP 404: missing'); } } as unknown as DaemonClient };
+      expect((await dispatchMeta('/undo', missing))?.newSessionId).toBeUndefined();
+      expect((await dispatchMeta('/undo', missing))?.text).toBe('저장된 대화가 없어 되돌릴 수 없습니다');
+      const empty = { ...local, messages: [] };
+      expect((await dispatchMeta('/undo', empty))?.newSessionId).toBeUndefined();
+      const fresh = await dispatchMeta('/fork', missing);
+      expect(fresh?.newSessionId).toBeTruthy();
+      expect(fresh?.newSessionId).not.toBe(ctx.sessionId);
+      expect(fresh?.text).toContain('forked → new session');
+      expect(events.map(({ outcome }) => outcome)).toEqual([
+        'invalid', 'invalid', 'invalid', 'invalid', 'invalid', 'invalid',
+        'out-of-range', 'out-of-range', 'invalid', 'error', 'error',
+        'empty', 'empty', 'out-of-range', 'empty',
+      ]);
+      expect(events.every(({ sessionId }) => sessionId === 'test-session')).toBe(true);
+    } finally { console.debug = original; }
+  });
+
   it('shows Korean help for /help and :help while preserving release scenario C2a/C2b', async () => {
     const colon = (await dispatchMeta(':help', ctx))?.text;
     expect((await dispatchMeta('/help', ctx))?.text).toBe(colon);
     expect(colon?.split('\n')).toEqual([
       '메타 명령(:이름 또는 /이름) (Meta commands):',
-      ...META_COMMANDS.map(({ name, description }) => `  ${['sessions', 'resume', 'model', 'reasoning', 'provider'].includes(name) ? '/' : ':'}${name.padEnd(16)}${description}`),
+      ...META_COMMANDS.map(({ name, description }) => `  ${['rewind', 'undo', 'sessions', 'resume', 'model', 'reasoning', 'provider'].includes(name) ? '/' : ':'}${name.padEnd(16)}${description}`),
     ]);
     for (const description of META_COMMANDS.map(({ description }) => description)) {
       expect(description).toMatch(/[가-힣]/);

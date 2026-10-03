@@ -25,6 +25,7 @@ import type {
 } from './enrich.js';
 import { summariseContext } from './enrich.js';
 import { buildResponseFormatHeader } from './prompt-format.js';
+import { judge } from '../llm/judge-layer.js';
 
 // ──────────────────── Closed sets ──────────────────────────────────────
 
@@ -69,7 +70,7 @@ export interface CategorizeResult {
 }
 
 export interface CategorizeCallable {
-  (args: { prompt: string; signal?: AbortSignal }): Promise<{
+  (args: { prompt: string; signal?: AbortSignal; provider?: string; model?: string }): Promise<{
     text: string;
     promptTokens?: number;
     completionTokens?: number;
@@ -219,26 +220,6 @@ export function buildCategorizePrompt(decomposition: EnrichedDecomposition): str
 
 // ──────────────────── Parse + coerce ──────────────────────────────────
 
-function extractJsonBlock(text: string): unknown | null {
-  const trimmed = text.trim();
-  const fence = trimmed.match(/```(?:json)?\n([\s\S]*?)```/);
-  const candidate = fence ? fence[1]! : trimmed;
-  try {
-    return JSON.parse(candidate);
-  } catch {
-    const open = candidate.indexOf('{');
-    const close = candidate.lastIndexOf('}');
-    if (open >= 0 && close > open) {
-      try {
-        return JSON.parse(candidate.slice(open, close + 1));
-      } catch {
-        return null;
-      }
-    }
-    return null;
-  }
-}
-
 function coerceConfidence(v: unknown): 'high' | 'medium' | 'low' {
   if (v === 'high' || v === 'medium' || v === 'low') return v;
   return 'medium';
@@ -306,27 +287,18 @@ export async function categorizeDecomposition(
 
   const prompt = buildCategorizePrompt(decomposition);
 
-  let raw;
-  try {
-    raw = await opts.callable({ prompt, signal: opts.signal });
-  } catch (err) {
+  const decision = await judge({
+    site: 'intake.categorize', prompt, signal: opts.signal,
+    call: ({ prompt, signal, provider, model }) => opts.callable({ prompt, signal, provider, model }),
+    schema: (parsed) => coerceCategorizations(parsed, validKeys),
+  });
+  if (!decision.ok) {
     if (opts.strict) {
-      throw new CategorizeError(
-        'LLM_CALL_FAILED',
-        err instanceof Error ? err.message : String(err),
-      );
-    }
-    return {
-      categorizations: Object.fromEntries(tasks.map((t) => [t.key, fallbackRow(t.key)])),
-      fallback: true,
-    };
-  }
-
-  const parsed = extractJsonBlock(raw.text);
-  const coerced = parsed ? coerceCategorizations(parsed, validKeys) : null;
-  if (coerced === null) {
-    if (opts.strict) {
-      throw new CategorizeError('PARSE_FAILED', 'no usable categorizations', raw.text);
+      if (decision.reason === 'call') {
+        throw new CategorizeError('LLM_CALL_FAILED',
+          decision.error instanceof Error ? decision.error.message : String(decision.error));
+      }
+      throw new CategorizeError('PARSE_FAILED', 'no usable categorizations', decision.rawText);
     }
     return {
       categorizations: Object.fromEntries(tasks.map((t) => [t.key, fallbackRow(t.key)])),
@@ -336,7 +308,7 @@ export async function categorizeDecomposition(
 
   // Backfill any missing tasks with the fallback shape so callers can
   // index by key without null checks.
-  const filled: Record<string, TaskCategorization> = { ...coerced };
+  const filled: Record<string, TaskCategorization> = { ...decision.value };
   for (const t of tasks) {
     if (!filled[t.key]) filled[t.key] = fallbackRow(t.key);
   }
@@ -344,10 +316,10 @@ export async function categorizeDecomposition(
     categorizations: filled,
     fallback: false,
     usage: {
-      promptTokens: raw.promptTokens,
-      completionTokens: raw.completionTokens,
-      costUsd: raw.costUsd,
-      modelId: raw.modelId,
+      promptTokens: decision.reply.promptTokens,
+      completionTokens: decision.reply.completionTokens,
+      costUsd: decision.reply.costUsd,
+      modelId: decision.reply.modelId,
     },
   };
 }

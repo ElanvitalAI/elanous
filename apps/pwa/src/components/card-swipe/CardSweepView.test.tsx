@@ -29,7 +29,7 @@ describe('CardSweepView · empty state', () => {
   test('no sessions → empty placeholder', () => {
     const html = renderToStaticMarkup(<CardSweepView sessions={[]} onDecision={() => {}} />);
     expect(html).toContain('data-testid="card-sweep-empty"');
-    expect(html).toContain('활성 세션 없음');
+    expect(html).toContain('진행 중인 대화 없음');
   });
 
   test('emptyText prop overrides default', () => {

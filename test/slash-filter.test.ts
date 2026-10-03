@@ -82,10 +82,10 @@ describe('filterSlashCommands', () => {
     const names = filterSlashCommands('', SLASH_COMMANDS).map(c => c.name);
     expect(names).not.toContain('new');
     expect(names.slice(0, 8)).toEqual([
-      'help', 'resume', 'model', 'clear', 'status', 'remaining', 'setup', 'quit',
+      'help', 'resume', 'model', 'clear', 'status', 'now', 'remaining', 'setup',
     ]);
     expect(names.slice(8)).toEqual([
-      'run-skill', 'ad', 'design', 'provider', 'reasoning', 'local', 'session', 'fork',
+      'quit', 'run-skill', 'ad', 'design', 'provider', 'reasoning', 'local', 'session', 'fork',
       'rewind', 'mission', 'resume-turn', 'context', 'paste', 'sync', 'plugin',
       'widget', 'log', 'memory', 'export', 'delta', 'theme', 'debug', 'rebind',
       'api-allow', 'prompt', 'history', 'research', 'harness', 'plan', 'chat',

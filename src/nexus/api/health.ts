@@ -128,6 +128,8 @@ export function handleHealth(
     universeRoot: safeUniverseRoot(),
     testUniverse: safeTestUniverse(),
     bindHost: safeBindHost(bind),
+    // W4 — POST /v1/workflows/:name/run understands onlyNode · fromNode+fromRunId · mode (PWA enables its run-mode buttons on this).
+    workflowRunModes: true as const,
     ...(setup?.mode === true
       ? { setupMode: true as const, setupMissing: setup.missing }
       : {}),

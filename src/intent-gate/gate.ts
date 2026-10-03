@@ -21,8 +21,10 @@
 
 import { TaskStore } from '../task-orchestrator/store.js';
 import { createMission, listMissions, normalizeMissionSource, generateMissionSlug, type MissionSource } from '../autopilot/mission-registry.js';
-import { triageGoal, defaultTriageClassify, type TriageCallable } from '../autopilot/triage.js';
-import { resolveDomain, defaultDomainClassify, type DomainClassify } from '../autopilot/domain/resolve.js';
+import { triageGoal, isExecutionModel, type TriageCallable } from '../autopilot/triage.js';
+import { resolveDomain, buildDomainPrompt, type DomainClassify } from '../autopilot/domain/resolve.js';
+import { judge } from '../llm/judge-layer.js';
+import type { ResolveRoleProviderFn, StreamLlmFn } from '../intake-plane/runtime-callables.js';
 import { isDomain } from '../autopilot/domain/types.js';
 import { autoDecomposeMission, shouldPhaseDecompose } from '../autopilot/mission-engine.js';
 import { saveMissionOrigin, type MissionOrigin } from '../autopilot/mission-origin.js';
@@ -54,12 +56,14 @@ export interface SubmitIntentInput {
   origin?: MissionOrigin;
   /** id title 생성 seam(테스트 격리·luna 우회). 없으면 generateMissionSlug(luna) 디폴트. */
   slugFn?: (goal: string) => Promise<string>;
-  /** ★ triage 분류 seam(테스트 격리·luna 우회·2026-07-16). 없으면 defaultTriageClassify(luna) —
+  /** ★ triage 분류 seam(테스트 격리·luna 우회·2026-07-16). 없으면 classify 역할 judge —
    *  단 NODE_ENV=test 는 미주입(휴리스틱 baseline)으로 실 LLM 호출 방지. */
   triageClassify?: TriageCallable;
-  /** ★ 도메인 분류 seam(테스트 격리·luna 우회·2026-07-20). 없으면 defaultDomainClassify(luna) —
+  /** ★ 도메인 분류 seam(테스트 격리·luna 우회·2026-07-20). 없으면 classify 역할 judge —
    *  단 NODE_ENV=test 는 미주입(키워드 baseline)으로 실 LLM 호출 방지. */
   domainClassify?: DomainClassify;
+  /** Injectable transport for testing the production judge path without network access. */
+  judgeDeps?: { streamLLM: StreamLlmFn; resolveRoleProvider: ResolveRoleProviderFn };
 }
 
 export type SubmitIntentResult =
@@ -132,14 +136,30 @@ export async function submitIntent(input: SubmitIntentInput): Promise<SubmitInte
     // 도메인 맥락 해소(§3.8·D5) — 키워드가 모호하면 최근 미션 도메인으로 기울인다
     // ("반도체 조사"→최근 투자 활동이면 investment). high 면 키워드 그대로.
     const recentDomains = listMissions(store, { limit: 8 }).map((r) => r.domain).filter(isDomain);
-    // ★ triage(luna 주도·tier semantic 판정) + 도메인 해소 + LLM(luna) slug 를 병렬로(hot-path 무증가).
-    //   triageClassify 미주입 & test 면 휴리스틱 baseline(실 LLM 우회). 운영은 defaultTriageClassify(luna).
+    // ★ triage(classify 역할·tier semantic 판정) + 도메인 해소 + LLM slug 를 병렬로(hot-path 무증가).
+    //   triageClassify 미주입 & test 면 휴리스틱 baseline(실 LLM 우회).
     const triageClassify = input.triageClassify
-      ?? (process.env.NODE_ENV === 'test' ? undefined : defaultTriageClassify);
-    // ★ 도메인도 luna 승격(2026-07-20) — 키워드는 주제 vs 행위유형을 못 갈라 "요약 기능 구현" 을
-    //   business(리서치·PR없음)로 오라우팅. luna 가 semantic 판정(강앵커 high 는 키워드 신뢰).
+      ?? (process.env.NODE_ENV === 'test' && !input.judgeDeps ? undefined : async (prompt: string) => {
+        const decision = await judge({ site: 'intent.triage', prompt, ...input.judgeDeps, schema: (value) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+          const row = value as Record<string, unknown>;
+          if (!isExecutionModel(row.executionModel) || (row.tier !== 'light' && row.tier !== 'heavy') ||
+            (row.rationale !== undefined && typeof row.rationale !== 'string')) return null;
+          return row;
+        } });
+        return decision.ok ? JSON.stringify(decision.value) : '';
+      });
+    // ★ 도메인도 의미 판정(2026-07-20) — 키워드는 주제 vs 행위유형을 못 갈라 "요약 기능 구현" 을
+    //   business(리서치·PR없음)로 오라우팅. judge 가 semantic 판정(강앵커 high 는 키워드 신뢰).
     const domainClassify = input.domainClassify
-      ?? (process.env.NODE_ENV === 'test' ? undefined : defaultDomainClassify);
+      ?? (process.env.NODE_ENV === 'test' && !input.judgeDeps ? undefined : async (goal, ctx) => {
+        const decision = await judge({ site: 'intent.domain', prompt: buildDomainPrompt(goal, ctx), ...input.judgeDeps, schema: (value) => {
+          if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+          const domain = (value as Record<string, unknown>).domain;
+          return isDomain(domain) ? domain : null;
+        } });
+        return decision.ok ? decision.value : null;
+      });
     const [resolved, slug, triage] = await Promise.all([
       resolveDomain(marker.goal, { recentDomains, classify: domainClassify }),
       (input.slugFn ?? generateMissionSlug)(marker.goal),

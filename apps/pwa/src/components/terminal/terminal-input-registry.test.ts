@@ -1,6 +1,26 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import * as debug from '@/lib/debug';
-import { registerTerminalInput, sendToTerminal } from './terminal-input-registry';
+import { getTerminalHistoryView, registerTerminalHistoryView, registerTerminalInput, sendToTerminal, subscribeTerminalHistoryView, type TerminalHistoryView } from './terminal-input-registry';
+
+test('history view registration replaces and cleans up only its own handle', () => {
+  const first = {} as TerminalHistoryView;
+  const second = {} as TerminalHistoryView;
+  const updates: Array<TerminalHistoryView | null> = [];
+  const offListener = subscribeTerminalHistoryView(() => updates.push(getTerminalHistoryView('registry-history')));
+  const offFirst = registerTerminalHistoryView('registry-history', first);
+  const offSecond = registerTerminalHistoryView('registry-history', second);
+  try {
+    offFirst();
+    expect(getTerminalHistoryView('registry-history')).toBe(second);
+    expect(updates).toEqual([first, second]);
+  } finally {
+    offSecond();
+    offFirst();
+    offListener();
+  }
+  expect(getTerminalHistoryView('registry-history')).toBeNull();
+  expect(updates).toEqual([first, second, null]);
+});
 
 describe('terminal input registry', () => {
   test('routes data to the registered terminal only', () => {

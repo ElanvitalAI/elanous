@@ -24,6 +24,7 @@ export interface WebtermTabOpts {
   id?: string;          // default: 'webterm:1'
   label?: string;
   cwd?: string;
+  sessionId?: string;
 }
 
 export const WEBTERM_KIND: TabKind = 'webterm';
@@ -34,7 +35,7 @@ export function createWebtermTabSpec(opts: WebtermTabOpts = {}): TabSpec {
     id,
     kind: WEBTERM_KIND,
     label: opts.label ?? id,
-    ...(opts.cwd ? { meta: { cwd: opts.cwd } } : {}),
+    ...(opts.cwd || opts.sessionId ? { meta: { ...(opts.cwd ? { cwd: opts.cwd } : {}), ...(opts.sessionId ? { sessionId: opts.sessionId } : {}) } } : {}),
   };
 }
 

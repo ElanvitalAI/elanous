@@ -116,16 +116,16 @@ describe('M2-1 · resolveLlmTier · precedence', () => {
     expect(r.model).toBe('gpt-4o-mini');
   });
 
-  test('persona alone → default tier · source=persona', () => {
-    const r = resolveLlmTier({ persona: 'power' }, 'gemini');
+  test('profile alone → default tier · source=profile', () => {
+    const r = resolveLlmTier({ profile: 'power' }, 'gemini');
     expect(r.tier).toBe('balanced');
-    expect(r.source).toBe('persona');
+    expect(r.source).toBe('profile');
     expect(r.model).toBe(lookupLlmTierSpec('gemini', 'balanced').model);   // 이름은 사다리에서 파생
   });
 
-  test('per-surface override wins over persona + preset', () => {
+  test('per-surface override wins over profile + preset', () => {
     const r = resolveLlmTier(
-      { llm: 'loaded', persona: 'casual', preset: 'meeting' },
+      { llm: 'loaded', profile: 'casual', preset: 'meeting' },
       'anthropic',
     );
     expect(r.tier).toBe('loaded');

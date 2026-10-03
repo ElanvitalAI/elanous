@@ -453,6 +453,33 @@ function writeIndex(entries: SessionMeta[], root: string = sessionRoot(), remove
   });
 }
 
+/** 세션 메타 하나를 잠금 «안에서» 디스크의 최신 목록 위에 고쳐 쓴다(IA1b).
+ *  `appendMessage` 가 잠금 밖에서 읽은 목록을 통째로 쓰면, 그 사이 다른 프로세스가 바꾼
+ *  같은 세션의 `projectId`·`messageCount` 를 옛 값으로 덮었다. 없는 id 면 `null`. */
+export function updateSessionMeta(
+  id: string,
+  mutate: (meta: SessionMeta) => void,
+  root: string = sessionRoot(),
+  opts: { bubble?: boolean } = {},
+): SessionMeta | null {
+  ensureRoots(root);
+  const p = indexPath(root);
+  return withDirLock(join(root, '.index.lock'), INDEX_LOCK_TIMEOUT_MS, () => {
+    const idx = readIndex(root);
+    const pos = idx.findIndex((m) => m.id === id);
+    if (pos < 0) return null;
+    const meta = { ...idx[pos] };
+    mutate(meta);
+    idx.splice(pos, 1);
+    if (opts.bubble) idx.unshift(meta);
+    else idx.splice(pos, 0, meta);
+    const tmp = `${p}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`;
+    writeFileSync(tmp, JSON.stringify(idx, null, 2) + '\n', 'utf-8');
+    renameSync(tmp, p);
+    return meta;
+  });
+}
+
 // ── Tier 1 Phase 3 — listener primitive ──────────────────────────────
 //
 // Channel-agnostic subscribe API the daemon-mirror module (PR 2) hooks
@@ -633,20 +660,16 @@ export function appendMessage(id: string, msg: SerializedMessage, root: string =
   const line = JSON.stringify(enriched) + '\n';
   appendFileSync(file, line, 'utf-8');
 
-  const idx = readIndex(root);
-  const pos = idx.findIndex(m => m.id === id);
-  if (pos < 0) throw new Error(`session missing from index: ${id}`);
-  const meta = idx[pos];
-  meta.updatedAt = msg.ts || new Date().toISOString();
-  meta.messageCount = meta.messageCount + 1;
-  // Auto-title on first user message.
-  if (meta.title === '(new session)' && msg.role === 'user' && msg.content) {
-    meta.title = msg.content.replace(/\s+/g, ' ').slice(0, 60).trim() || '(empty)';
-  }
   // Bubble to front of index so listSessions returns newest-first.
-  idx.splice(pos, 1);
-  idx.unshift(meta);
-  writeIndex(idx, root);
+  const meta = updateSessionMeta(id, (m) => {
+    m.updatedAt = msg.ts || new Date().toISOString();
+    m.messageCount = m.messageCount + 1;
+    // Auto-title on first user message.
+    if (m.title === '(new session)' && msg.role === 'user' && msg.content) {
+      m.title = msg.content.replace(/\s+/g, ' ').slice(0, 60).trim() || '(empty)';
+    }
+  }, root, { bubble: true });
+  if (!meta) throw new Error(`session missing from index: ${id}`);
   // Tier 1 Phase 3 — fire AFTER on-disk write + index update.
   // Listeners (daemon-mirror) read the just-appended message + meta
   // from a consistent state.

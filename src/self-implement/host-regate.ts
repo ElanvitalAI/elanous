@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { releaseGitDiffPaths, releasePathHold, releasePathHoldShouldPost, releasePathHoldComment, releasePathHoldCommentsArgs, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { detectTestInterference, parseFailureCount, runBunTest } from '../../scripts/detect-test-interference.js';
 import { runTestInterferenceGate } from '../../scripts/ci-test-interference-gate.js';
 
@@ -158,6 +159,26 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
       base = run('git', ['merge-base', baseCommit, input.headCommit], worktree);
       files = run('git', ['diff', '--name-only', base, input.headCommit], worktree).split('\n').filter(Boolean);
       if (!files.length) throw new Error('changed files unavailable');
+      if (!input.verifyOnly) {
+        // --name-only lists only the destination of a rename. Inspect both sides without
+        // changing the gate's existing changed-file list or its test selection.
+        const guardPaths = releaseGitDiffPaths(run('git', ['diff', '--find-renames', '--name-status', '-z', base, input.headCommit], worktree));
+        const heldPath = releasePathHold(guardPaths);
+        if (heldPath) {
+          debug.log('self-dev.merge', 'release-path-hold', { number: input.prNumber, path: heldPath, label: RELEASE_PATH_LABEL, surface: 'host-regate' });
+          try {
+            const existing: unknown = JSON.parse(run('gh', ['label', 'list', '--search', RELEASE_PATH_LABEL, '--json', 'name'], input.repoRoot));
+            if (!Array.isArray(existing)) throw new Error('invalid label list');
+            if (!existing.some((item: unknown) => !!item && typeof item === 'object' && 'name' in item && item.name === RELEASE_PATH_LABEL)) {
+              run('gh', ['label', 'create', RELEASE_PATH_LABEL, '--color', 'D93F0B', '--description', 'Release path requires OP approval'], input.repoRoot);
+            }
+            run('gh', ['pr', 'edit', String(input.prNumber), '--add-label', RELEASE_PATH_LABEL], input.repoRoot);
+          } catch (error) { debug.log('self-dev.merge', 'release-path-annotation-failed', { number: input.prNumber, action: 'label', error: String(error) }); }
+          try { if (releasePathHoldShouldPost(() => JSON.parse(run('gh', releasePathHoldCommentsArgs(input.prNumber), input.repoRoot)))) run('gh', ['pr', 'comment', String(input.prNumber), '--body', releasePathHoldComment(heldPath)], input.repoRoot); }
+          catch (error) { debug.log('self-dev.merge', 'release-path-annotation-failed', { number: input.prNumber, action: 'comment', error: String(error) }); }
+          return result('failed', 'release-path-hold', `OP approval required: ${heldPath}`);
+        }
+      }
       // Materialize the proposed merge of this exact PR head into the observed base.
       // A clean head checkout cannot expose integration breaks introduced by the base.
       try { run('git', ['merge', '--no-ff', '--no-commit', input.headCommit], worktree); }
@@ -234,7 +255,7 @@ export async function runHostRegate(input: HostRegateInput, deps: HostRegateDeps
     catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'cleanup', detail: String(e) }); }
     try { release?.(); }
     catch (e) { log('unmeasured', { pr: input.prNumber, files, os: process.platform, failedStep: 'lock', detail: String(e) }); }
-    if (failures.length) {
+    if (failures.length && failures[0]?.step !== 'release-path-hold') {
       const { step, detail } = failures[0]!;
       const body = `호스트 재게이트 실패(${process.platform}): ${step} — ${detail.replace(/\s+/g, ' ').slice(0, 180)}`;
       try { run('gh', ['pr', 'comment', String(input.prNumber), '--body', body], input.repoRoot); }

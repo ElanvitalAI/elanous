@@ -4,6 +4,13 @@
 //   number→name 변환 ④resize 인자 순서 swap(gotcha). registry 는 **주입 seam** 으로 스텁
 //   (mock.module 은 프로세스 전역 오염 → 타 테스트 getPty 파괴하므로 금지).
 import { test, expect, describe } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createWebtermTabSpec } from '../kinds/webterm.js';
+import { ProjectStore } from '../../project/project-store.js';
+import { createSession } from '../../session/index.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
 import {
   resolveWebtermCwd,
   createRegistryBackend, signalNumberToName, terminatePty,
@@ -174,6 +181,36 @@ describe('createRegistryBackend — 공유 registry 버스 어댑트 (P0b)', () 
 describe('resolveWebtermCwd — 격리 웹 터미널이 사람 트리에서 열리지 않는다', () => {
   const prod = { kind: 'prod' as const, root: '/home/u/.elanous' };
   const iso = { kind: 'test' as const, root: '/iso/root' };
+  test('webterm 생성이 대화 sessionId 를 보존하고 기존 cwd 메타는 그대로 둔다', () => {
+    expect(createWebtermTabSpec({ sessionId: 'chat-1' }).meta).toEqual({ sessionId: 'chat-1' });
+    expect(createWebtermTabSpec({ sessionId: 'chat-1', cwd: '/explicit' }).meta)
+      .toEqual({ sessionId: 'chat-1', cwd: '/explicit' });
+    expect(createWebtermTabSpec().meta).toBeUndefined();
+  });
+  test('프로젝트 대화의 새 터미널은 프로젝트 폴더, 명시적 탭 cwd 는 우선', () => {
+    const root = mkdtempSync(join(tmpdir(), 'webterm-project-'));
+    const previous = process.env.ELANOUS_SESSION_ROOT;
+    try {
+      setElanousConfigDir(join(root, 'config'));
+      process.env.ELANOUS_SESSION_ROOT = join(root, 'sessions');
+      const folder = join(root, 'project');
+      mkdirSync(folder);
+      const project = new ProjectStore(join(root, 'config')).create({ name: 'sample', primaryFolder: folder });
+      const assigned = createSession({ projectId: project.id });
+      const plain = createSession();
+      const tab = createWebtermTabSpec({ sessionId: assigned.id });
+      expect(resolveWebtermCwd({ sessionId: (tab.meta as { sessionId: string }).sessionId, toolCwd: '/tool', instance: iso, processCwd: '/human' }))
+        .toEqual({ cwd: folder, source: 'project' });
+      expect(resolveWebtermCwd({ sessionId: assigned.id, tabCwd: '/tab', instance: iso, processCwd: '/human' }))
+        .toEqual({ cwd: '/tab', source: 'tab' });
+      expect(resolveWebtermCwd({ sessionId: plain.id, toolCwd: '/tool', instance: iso, processCwd: '/human' }))
+        .toEqual({ cwd: '/tool', source: 'tool-cwd' });
+    } finally {
+      resetElanousConfigDir();
+      if (previous === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   test('탭 cwd 가 이긴다', () => {
     expect(resolveWebtermCwd({ tabCwd: '/tab', toolCwd: '/tool', instance: iso, processCwd: '/human' })).toEqual({ cwd: '/tab', source: 'tab' });
   });

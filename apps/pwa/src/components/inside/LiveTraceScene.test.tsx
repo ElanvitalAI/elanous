@@ -11,8 +11,11 @@ const event = fromLogFrame({
   data: { graphId: 'demo-graph', runId: 'abcdef123456', nodeId: 'alpha', phase: 'start' },
 })!;
 const at = Date.parse(event.ts);
-const render = (state: Parameters<typeof LiveTraceView>[0]['state'], now = at, receivedAt = at) =>
-  renderToStaticMarkup(<LiveTraceView state={state} now={now} receivedAt={receivedAt} />);
+const settlement = (nodeId: string, phase: 'ok' | 'fail', receivedAt: number, ts = new Date(receivedAt).toISOString()) =>
+  ({ nodeId, phase, receivedAt, ts });
+const render = (state: Parameters<typeof LiveTraceView>[0]['state'], now = at, receivedAt = at,
+  lastSettlement?: Parameters<typeof LiveTraceView>[0]['lastSettlement']) =>
+  renderToStaticMarkup(<LiveTraceView state={state} now={now} receivedAt={receivedAt} lastSettlement={lastSettlement} />);
 
 describe('LiveTraceView', () => {
   test('shows the initial idle message and inert recording placeholder', () => {
@@ -21,6 +24,18 @@ describe('LiveTraceView', () => {
     expect(html).toContain('녹화 보기');
     expect(html).toContain('disabled');
     expect(html).toContain('text-lg');
+  });
+
+  test('shows the wizard step on the inside trace alongside an idle graph', () => {
+    const html = renderToStaticMarkup(<LiveTraceView state={EMPTY_RUNS} now={at} receivedAt={at}
+      wizardSteps={[
+        { wizardId: 'w1', ts: event.ts, step: 'request', text: '요청' },
+        { wizardId: 'w1', ts: event.ts, step: 'research', text: '3건 조사' },
+      ]} />);
+    expect(html).toContain('플러그인 마법사 흐름');
+    expect(html).toContain('마법사 request · 요청');
+    expect(html).toContain('마법사 research · 3건 조사');
+    expect(html.indexOf('마법사 request')).toBeLessThan(html.indexOf('마법사 research'));
   });
 
   test('shows header, elapsed time, arrival order and running pulse then green ok', () => {
@@ -39,6 +54,7 @@ describe('LiveTraceView', () => {
     expect(html).toContain('alpha · ok');
     expect(html.indexOf('alpha · ok')).toBeLessThan(html.indexOf('beta · 진행 중'));
     expect(html).toContain('flex-wrap');
+    expect(render(complete, at + 20_000, at + 2_000)).not.toContain('완료 ·');
   });
 
   test('renders a failed node red, retries ↻1, and replaces the current run', () => {
@@ -65,8 +81,43 @@ describe('LiveTraceView', () => {
       data: { graphId: event.graphId, runId: event.runId, nodeId: event.nodeId, phase: 'ok' },
     })!;
     const waiting = reduceRuns(active, finished);
-    expect(render(waiting, at + 2_000)).toContain('bg-muted');
-    expect(render(waiting, at + 2_000)).toContain('대기');
+    expect(render(waiting, at + 2_000, at + 1_000, settlement('alpha', 'ok', at + 1_000))).toContain('다음 단계 준비 중');
+    expect(render(waiting, at + 2_000, at + 1_000)).not.toContain('>대기<');
+  });
+
+  test('settled a ok · b ok · done ok shows completion after 15 seconds without a new start', () => {
+    let state = reduceRuns(EMPTY_RUNS, event);
+    for (const [nodeId, phase, seconds] of [
+      ['alpha', 'ok', 1], ['beta', 'start', 2], ['beta', 'ok', 3], ['done', 'start', 4], ['done', 'ok', 5],
+    ] as const) state = reduceRuns(state, { ...event, nodeId, phase, ts: new Date(at + seconds * 1000).toISOString() });
+    const ended = settlement('done', 'ok', at + 5_000);
+    expect(render(state, at + 19_999, at + 5_000, ended)).toContain('다음 단계 준비 중');
+    const html = render(state, at + 20_000, at + 5_000, ended);
+    expect(html).toContain('완료 · 5초');
+    expect(html).not.toContain('다음 단계 준비 중');
+    expect(html).not.toContain('>대기<');
+    expect(html).toContain('done · ok');
+    expect(render(state, at + 59_999, at + 5_000, ended)).toContain('완료 ·');
+    const restarted = reduceRuns(state, { ...event, nodeId: 'next', ts: new Date(at + 20_001).toISOString() });
+    expect(render(restarted, at + 20_002, at + 20_001)).not.toContain('완료 ·');
+  });
+
+  test('omitting the actual last settlement never invents a completion or duration', () => {
+    const finished = reduceRuns(reduceRuns(EMPTY_RUNS, event), { ...event, phase: 'ok', ts: new Date(at + 1_000).toISOString() });
+    const html = render(finished, at + 20_000, at + 1_000);
+    expect(html).not.toContain('완료 ·');
+    expect(html).not.toContain('다음 단계 준비 중');
+  });
+
+  test('a failed final node reports its name once the quiet window expires', () => {
+    const active = reduceRuns(EMPTY_RUNS, event);
+    const succeeded = reduceRuns(active, { ...event, phase: 'ok', ts: new Date(at + 500).toISOString() });
+    const failed = reduceRuns(succeeded, { ...event, nodeId: 'broken', phase: 'fail', ts: new Date(at + 1_000).toISOString() });
+    const html = render(failed, at + 16_000, at + 1_000, settlement('broken', 'fail', at + 1_000));
+    expect(html).toContain('실패 · broken');
+    expect(html).not.toContain('다음 단계 준비 중');
+    expect(html).not.toContain('완료 ·');
+    expect(html).not.toContain('>대기<');
   });
 });
 
@@ -115,6 +166,90 @@ describe('LiveTraceScene connection lifecycle', () => {
       expect(JSON.stringify(root!.toJSON())).not.toContain('alpha');
     } finally {
       if (root) act(() => { root!.unmount(); });
+      globalThis.setInterval = originalInterval;
+      now.mockRestore();
+    }
+  });
+
+  test('alpha start → beta start → beta ok → alpha fail ends as failure, not registration-order success', () => {
+    let clock = at;
+    const now = spyOn(Date, 'now').mockImplementation(() => clock);
+    const originalInterval = globalThis.setInterval;
+    let tick: (() => void) | undefined;
+    globalThis.setInterval = ((fn: () => void) => { tick = fn; return 1 as unknown as ReturnType<typeof setInterval>; }) as typeof setInterval;
+    class FakeEventSource {
+      static source: FakeEventSource;
+      listeners = new Map<string, (message: { data: string }) => void>();
+      constructor(_url: string) { FakeEventSource.source = this; }
+      addEventListener(name: string, fn: (message: { data: string }) => void) { this.listeners.set(name, fn); }
+      close() {}
+      log(nodeId: string, phase: 'start' | 'ok' | 'fail') { this.listeners.get('log')?.({ data: JSON.stringify({
+        category: 'graph.run', event: 'node', ts: new Date(clock).toISOString(),
+        data: { graphId: event.graphId, runId: event.runId, nodeId, phase },
+      }) }); }
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const value = { client: { logsStreamUrl: () => '/stream' }, config: { baseUrl: '/stream', token: '', provider: '' } } as unknown as ComponentProps<typeof DaemonContext.Provider>['value'];
+    let root: ReturnType<typeof create> | undefined;
+    try {
+      act(() => { root = create(<DaemonContext.Provider value={value}><LiveTraceScene /></DaemonContext.Provider>); });
+      act(() => FakeEventSource.source.log('alpha', 'start'));
+      clock += 1_000;
+      act(() => FakeEventSource.source.log('beta', 'start'));
+      clock += 1_000;
+      act(() => FakeEventSource.source.log('beta', 'ok'));
+      clock += 1_000;
+      act(() => FakeEventSource.source.log('alpha', 'fail'));
+      clock += 15_000;
+      act(() => tick!());
+      const html = JSON.stringify(root!.toJSON());
+      expect(html).toContain('실패 · alpha');
+      expect(html).not.toContain('완료 ·');
+      expect(html).not.toContain('다음 단계 준비 중');
+    } finally {
+      if (root) act(() => root!.unmount());
+      globalThis.setInterval = originalInterval;
+      now.mockRestore();
+    }
+  });
+
+  test('a duplicate settled frame does not restart the 15-second completion window', () => {
+    let clock = at;
+    const now = spyOn(Date, 'now').mockImplementation(() => clock);
+    const originalInterval = globalThis.setInterval;
+    let tick: (() => void) | undefined;
+    globalThis.setInterval = ((fn: () => void) => {
+      tick = fn;
+      return 1 as unknown as ReturnType<typeof setInterval>;
+    }) as typeof setInterval;
+    class FakeEventSource {
+      static source: FakeEventSource;
+      listeners = new Map<string, (message: { data: string }) => void>();
+      constructor(_url: string) { FakeEventSource.source = this; }
+      addEventListener(name: string, fn: (message: { data: string }) => void) { this.listeners.set(name, fn); }
+      close() {}
+      log(phase: 'start' | 'ok') { this.listeners.get('log')?.({ data: JSON.stringify({
+        category: 'graph.run', event: 'node', ts: new Date(clock).toISOString(),
+        data: { graphId: event.graphId, runId: event.runId, nodeId: event.nodeId, phase },
+      }) }); }
+    }
+    globalThis.EventSource = FakeEventSource as unknown as typeof EventSource;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const value = { client: { logsStreamUrl: () => '/stream' }, config: { baseUrl: '/stream', token: '', provider: '' } } as unknown as ComponentProps<typeof DaemonContext.Provider>['value'];
+    let root: ReturnType<typeof create> | undefined;
+    try {
+      act(() => { root = create(<DaemonContext.Provider value={value}><LiveTraceScene /></DaemonContext.Provider>); });
+      act(() => FakeEventSource.source.log('start'));
+      clock += 1_000;
+      act(() => FakeEventSource.source.log('ok'));
+      clock += 14_000;
+      act(() => FakeEventSource.source.log('ok'));
+      clock += 1_000;
+      act(() => tick!());
+      expect(JSON.stringify(root!.toJSON())).toContain('완료 ·');
+    } finally {
+      if (root) act(() => root!.unmount());
       globalThis.setInterval = originalInterval;
       now.mockRestore();
     }

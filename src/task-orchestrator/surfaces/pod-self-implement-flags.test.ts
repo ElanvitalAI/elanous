@@ -12,7 +12,8 @@ describe('Pod → self implement flag contract', () => {
   test('every flag the Pod passes to `self implement` is registered on that command', () => {
     const pod = src('task-orchestrator/surfaces/self-implement-pod.ts');
     const index = src('index.ts');
-    const start = index.indexOf(".command('implement <feature...>')");
+    // `[feature...]` since PROC1: the feature may come from --feature-file instead of argv.
+    const start = index.indexOf(".command('implement [feature...]')");
     expect(start).toBeGreaterThan(0);
     const block = index.slice(start, index.indexOf('.action(', start));
     const argsStart = pod.indexOf('const args = [');

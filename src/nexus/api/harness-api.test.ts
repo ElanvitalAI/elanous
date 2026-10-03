@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { GoalRunRecord } from '../../self-implement/goal-run-store.js';
 import { readReportOrigin } from '../../self-implement/report-origin.js';
 import { LogStore } from '../../mss/logging/log-store.js';
+import { subscribeInsideEvent } from './inside-events.js';
 import {
   handleHarnessRunScreenGet,
   handleHarnessAskPost,
@@ -89,6 +90,26 @@ describe('harness API handlers', () => {
     const nullBody = await handleHarnessAskPost(request('/v1/harness/ask', null), {}, {});
     expect(nullBody.status).toBe(400);
     expect((await nullBody.json() as { error: string }).error).toContain('usage: POST /v1/harness/ask');
+  });
+
+  test('harness ask lifecycle publishes ordered masked events while preserving its accepted response', async () => {
+    const received: unknown[] = [];
+    const unsubscribe = subscribeInsideEvent(event => received.push(event));
+    try {
+      const response = await handleHarnessAskPost(request('/v1/harness/ask', { text: 'password="private"' }), {}, {
+        createAcceptanceId: () => 'inside-harness-ask',
+        runAskLaunchFlow: async () => ({ kind: 'launch', goalFile: '/tmp/GOAL.md' }) as never,
+        launchDevGoalFileDetached: async () => {},
+        log: () => {},
+      });
+      expect(response.status).toBe(202);
+      expect(await response.json()).toMatchObject({ accepted: true, acceptanceId: 'inside-harness-ask' });
+      await Bun.sleep(0);
+      expect((received as Array<{ kind: string; event: string }>).map(event => `${event.kind}:${event.event}`)).toEqual([
+        'harness-run:ask-accepted', 'harness-run:ask-flow-settled', 'harness-run:ask-launch-started', 'harness-run:ask-launch-settled',
+      ]);
+      expect(JSON.stringify(received)).not.toContain('private');
+    } finally { unsubscribe(); }
   });
 
   test('ask forwards a valid origin only in the detached launch environment; ignores unknown shapes', async () => {

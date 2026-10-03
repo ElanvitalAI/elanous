@@ -7,10 +7,12 @@
 // having to detect "is this empty?".
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildUserConfig } from '../src/user-config.js';
+import { buildUserConfig, saveUserConfig } from '../src/user-config.js';
+import { resolveSttTier } from '../src/model-tier/tier-resolver.js';
+import { debug } from '../src/debug/log.js';
 
 let root: string;
 let cfgPath: string;
@@ -43,12 +45,41 @@ describe('M1-1 · UserConfig.modelTier sparse parse', () => {
     expect(cfg.modelTier).toBeUndefined();
   });
 
-  test('persona only → modelTier.persona set, voice undefined', () => {
-    writeFile({ modelTier: { persona: 'power' } });
+  test('legacy key alone resolves identically, logs one deprecation and saves only profile', () => {
+    const logs: Array<{ category: string; event: string; data: unknown }> = [];
+    const originalLog = debug.log;
+    debug.log = ((category: string, event: string, data: unknown) => {
+      if (category === 'config' && event === 'deprecated-key') logs.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      writeFile({ modelTier: { persona: 'power' } });
+      const cfg = buildUserConfig(cfgPath);
+      expect(cfg.modelTier).toEqual({ profile: 'power' });
+      expect(resolveSttTier(cfg.modelTier)).toMatchObject({ tier: 'balanced', source: 'profile' });
+      expect(logs).toEqual([{ category: 'config', event: 'deprecated-key', data: {
+        from: 'modelTier.persona', to: 'modelTier.profile',
+      } }]);
+      saveUserConfig(cfg, cfgPath);
+      expect(logs).toHaveLength(1);
+      const saved = JSON.parse(readFileSync(cfgPath, 'utf8')) as { modelTier: Record<string, unknown> };
+      expect(saved.modelTier).toEqual({ profile: 'power' });
+    } finally {
+      debug.log = originalLog;
+    }
+  });
+
+  test('new profile wins when both keys exist, without a deprecation warning', () => {
+    writeFile({ modelTier: { persona: 'power', profile: 'custom' } });
     const cfg = buildUserConfig(cfgPath);
-    expect(cfg.modelTier?.persona).toBe('power');
-    expect(cfg.modelTier?.voice).toBeUndefined();
-    expect(cfg.modelTier?.llm).toBeUndefined();
+    expect(cfg.modelTier).toEqual({ profile: 'custom' });
+    expect(resolveSttTier(cfg.modelTier).source).toBe('profile');
+  });
+
+  test('new profile parses, invalid profile does not fall back to legacy', () => {
+    writeFile({ modelTier: { profile: 'casual' } });
+    expect(buildUserConfig(cfgPath).modelTier).toEqual({ profile: 'casual' });
+    writeFile({ modelTier: { profile: 'ultra', persona: 'power' } });
+    expect(buildUserConfig(cfgPath).modelTier).toBeUndefined();
   });
 
   test('voice.stt = "best" parses · sibling fields stay sparse', () => {
@@ -66,7 +97,7 @@ describe('M1-1 · UserConfig.modelTier sparse parse', () => {
     expect(cfg.modelTier?.llm).toBeUndefined();
   });
 
-  test('invalid persona value → field dropped', () => {
+  test('invalid legacy profile value → field dropped', () => {
     writeFile({ modelTier: { persona: 'ultra' } });
     const cfg = buildUserConfig(cfgPath);
     expect(cfg.modelTier).toBeUndefined();

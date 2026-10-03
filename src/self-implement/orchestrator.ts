@@ -67,6 +67,7 @@ import { decideLineageSupersede, lineageSupersedeCloseComment, type LineageSuper
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { enqueueControlMemo, readSoftStopRequestStatus, type SoftStopRequestRead } from '../harness/control-inbox.js';
 import { debug } from '../debug/log.js';
+import { releasePathHold, releasePathHoldComment, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { reworkDecision } from './decision-events.js';
 import type { LogSink } from '../mss/logging/sink.js';
@@ -93,10 +94,10 @@ import { originObservationFields } from '../agent/origin-observation.js';
 import { getHarnessSpace, normalizeSpaceId, resolveRunIdentity } from '../harness/harness-space.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
-import { harnessReleaseNote, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment } from '../release-loop/release-note.js';
+import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment, type ReleaseNoteSection } from '../release-loop/release-note.js';
 import { plannedSelfImplBranch } from '../harness/worktree-branch-prefix.js';
 export { slugifyFeature } from '../harness/worktree-branch-prefix.js';
-import { resolveAutoReviewLabels } from './context-capsule.js';
+import { AUTO_REVIEW_LABEL, resolveAutoReviewLabels } from './context-capsule.js';
 import { GOAL_TYPES, extractVerbatimOriginalAsk, leadingGoalMetadata, parseAskFile, parseGoalType, type GoalType } from './goal-author.js';
 import { resolveAdaptiveMaxReworkDecision, resolveEscalateTier, resolveEscalateTarget, buildReworkFeature, failIndicator, isRepeatedUnverifiedOnlyGateFailure, unverifiedRepeatKey, appendReworkHistory, truncateReworkHistoryByItem, applyReworkBudgetDecision, parseContractConflictRelaxation, parseReworkBudgetDecision, resolveReworkBudgetCarry, stripReworkBudgetHeaders, countConsecutiveMustFixIds, mergeReworkNotes, resolveReworkKind, type ReworkPlanRevision, type ReworkNotePart } from './rework-policy.js';
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
@@ -178,6 +179,8 @@ import type { EscalateTier } from './rework-policy.js';
 import type { ClassifyShadowCallLLM } from './classify-shadow.js';
 import { hasModuleLoadFailure, type GateTestFailure } from './gate-baseline.js';
 import { commitWorktree, defaultBranchRef } from './seams.js';
+import { detectUncommittedWork } from './uncommitted-work.js';
+import { spawnSync } from 'node:child_process';
 import { blockedDraftDisposition } from './blocked-draft-policy.js';
 import { formatLlmMergeOutcome } from '../autopilot/build/llm-conflict-merge.js';
 import { FOUND_CITED_PATH_REFUTATION_QUOTE, MISSING_CITED_PATH_REFUTATION_QUOTE, MUST_FIX_REFUTATION_ACKNOWLEDGEMENT_WITH_REASON, REFUTATION_QUOTE_GRAMMAR, observeMustFixCitedPaths, parseMustFixRefutationAcknowledgement, parseMustFixRefutations, renderMustFixCitedPathFacts, snapshotMustFixFindings, stableMustFixId, type ReflectEvidenceFacts, type ReflectGateFacts, type MustFixCitedPathFact, type MustFixFinding, type MustFixRecurrenceHistory, type MustFixRefutation, type MustFixRefutationKind } from './reflect-mustfix.js';
@@ -935,6 +938,10 @@ export interface SelfImplementSeams {
    *  PR 直前 main-싱크 전에 impl 변경을 먼저 커밋). 기본=commitWorktree. 미주입 시 G2 pre-PR 싱크 skip(fail-safe).
    *  [[ROADMAP-elanous-is-all-pty-unified-autonomy-2026-07-21]] G2. */
   commitWork?: (cwd: string, message: string) => void;
+  /** Observe a finished child's uncommitted work before classifying a missing diff. */
+  detectUncommittedWork?: typeof detectUncommittedWork;
+  /** Commit only the measured, eligible target paths. An injected seam preserves the same path boundary. */
+  commitFinishedChildWork?: (cwd: string, paths: readonly string[], message: string) => { ok: boolean; out: string };
   /** --ground 코드베이스 prepass seam. cwd는 구현 대상 worktree이며 실패는 goal-loop를 막지 않는다. */
   groundGoal?: (goalText: string, deps: { cwd: string }) => Promise<string>;
   /** ③ 구현 — cwd(worktree)에서 코딩 에이전트 구동(P1: 헤드리스 elanous spawn·goal-loop 아밍).
@@ -1010,6 +1017,8 @@ export interface SelfImplementSeams {
   openPr: (opts: { title: string; body: string; head: string; base?: string; draft?: boolean; labels?: string[]; cwd: string }) => Promise<{ url: string; number: number }>;
   /** PR 생성 뒤 런의 라운드 대화를 게시한다. 실패는 PR 개설을 되돌리지 않는다. */
   postPrComment?: (opts: { number: number; body: string; cwd: string }) => Promise<void>;
+  addPrLabel?: (opts: { number: number; label: string; cwd: string }) => Promise<void>;
+  readPrFiles?: (opts: { number: number; cwd: string }) => Promise<string[]>;
   /** PR의 base/head SHA와 관측된 PR base를 한 응답에서 고정한다. 미주입·실패·빈 SHA면 검사 대상을 증명할 수 없어 fail-closed로 PR을 열어 둔다. */
   readPrCommitShas?: (opts: { number: number; cwd: string }) => Promise<{ baseCommit: string; headCommit: string; baseRefName?: string }>;
   /** 고정한 base/head SHA 쌍의 unified diff. 가변 PR 조회를 다시 사용하면 ABA head 변경에 안전하지 않으므로 두 SHA는 필수 입력이다. */
@@ -1948,6 +1957,8 @@ export interface SelfImplementOptions {
   onNodeEntry?: (node: PipelineNodeId, round: number) => void;
   /** 시험이 런치 오버레이를 빼 «지금 YAML 예산»을 읽게 할 때 쓴다. 생략하면 디스크 오버레이다. */
   graphOverlays?: readonly GraphOverlaySpec[];
+  /** Validated, run-local graph variant injected at launch; rejected plans never start the pipeline. */
+  graphVariantPlan?: import('./graph-variant.js').GraphVariantPlan;
   /** ★ K run-identity — 이 self-implement 호출의 per-run join anchor. 미지정 시 상속(env)→canonical mint.
    *  리워크 라운드 전부가 이 값을 공유한다(`elanous self run <runId>` 가 호출 전체를 조인). */
   runId?: string;
@@ -2510,8 +2521,40 @@ function goalDocumentForReleaseNote(goalFile?: string): string {
   catch { return ''; }
 }
 
+function shardReleaseNote(feature: string): ReleaseNoteSection | undefined {
+  const matches = [...feature.matchAll(/^## Shard identity\r?\n([^\r\n]+)/gm)];
+  const identity = matches.at(-1)?.[1];
+  if (!identity) return undefined;
+  try {
+    const value: unknown = JSON.parse(identity);
+    if (!value || typeof value !== 'object' || !('releaseNote' in value)) return undefined;
+    const note = (value as { releaseNote: unknown }).releaseNote;
+    if (!note || typeof note !== 'object' || Array.isArray(note)) return undefined;
+    const candidate = note as Record<string, unknown>;
+    if (typeof candidate.line !== 'string' || typeof candidate.kind !== 'string'
+      || typeof candidate.target !== 'string' || !candidate.docs || typeof candidate.docs !== 'object') return undefined;
+    const doc = candidate.docs as Record<string, unknown>;
+    if (typeof doc.path !== 'string' && typeof doc.none !== 'string') return undefined;
+    const section = `## 릴리스 노트\n- 한 줄: ${candidate.line}\n- 종류: ${candidate.kind}\n- 문서: ${typeof doc.path === 'string' ? doc.path : `없음(${doc.none})`}\n- 대상: ${candidate.target}\n`;
+    return parseReleaseNoteSection(section).fragment;
+  } catch { return undefined; }
+}
+
+function releaseNoteForRun(goalFile: string | undefined, feature: string): ReleaseNoteSection {
+  const note = goalFile ? undefined : shardReleaseNote(feature);
+  if (note) return note;
+  const shard = !goalFile && feature.includes('## Shard identity');
+  return harnessReleaseNote(goalDocumentForReleaseNote(goalFile), prTitle(feature), shard);
+}
+
+/** GATE-CALLERS (OP 10-03): caller tests that exceeded the gate cap must stay visible in the PR body even when the gate log is cut. */
+export function gateNotRunSection(gateLog?: string): string[] {
+  const lines = (gateLog ?? '').split('\n').filter((line) => line.startsWith('⚠️ caller test cap exceeded'));
+  return lines.length ? ['', '## Gate · 안 돈 소비자 시험(상한 초과)', ...lines.map((line) => `- ${line.replace(/^⚠️ caller test cap exceeded — not run: /, '')}`)] : [];
+}
+
 function prBody(feature: string, implSummary: string, gateLog?: string, review?: SelfImplementReview, reviewIntent?: string, autoReviewDeclineReasons?: readonly string[], evidence?: string, goalFile?: string, planRevision?: ReworkPlanRevision, releaseNote?: ReturnType<typeof harnessReleaseNote>): string {
-  const note = releaseNote ?? harnessReleaseNote(goalDocumentForReleaseNote(goalFile), prTitle(feature));
+  const note = releaseNote ?? releaseNoteForRun(goalFile, feature);
   const relaxation = planRevision?.relaxation
     ? ['', '## 감독 수용 기준 완화', `- 대상: ${planRevision.relaxation.target}`, `- 이전: ${planRevision.relaxation.expected}`, `- 완화: ${planRevision.relaxation.replacement}`, `- 이유: ${planRevision.reason}`, `- 적용: ${planRevision.application?.status ?? 'failed'}${planRevision.application?.detail ? ` (${planRevision.application.detail})` : ''}`, ...(planRevision.disposition ? [`- 충돌 처분: ${planRevision.disposition}`] : [])]
     : [];
@@ -2530,6 +2573,7 @@ function prBody(feature: string, implSummary: string, gateLog?: string, review?:
     ...(review ? ['', `## 내부 리뷰 — ${review.verdict}`, review.summary.trim().slice(0, 1500),
       ...(review.shouldFix.length ? ['', '**should-fix (비블로킹):**', ...review.shouldFix.slice(0, 8).map((f) => `- ${f}`)] : [])] : []),
     ...(autoReviewDeclineReasons?.length ? ['', '## Auto-review label not applied', 'The requested auto-review label was declined by the autonomy gate:', ...autoReviewDeclineReasons.map((reason) => `- ${reason}`)] : []),
+    ...gateNotRunSection(gateLog),
     ...(gateLog ? ['', '## Gate', '```', gateLog.trim().slice(0, 3000), '```'] : []),
     ...relaxation,
     '',
@@ -4453,6 +4497,51 @@ async function runSelfImplementInner(
   // ⛔⭐ `let` 인 이유는 ③ «다이나믹»이다 — 라운드마다 runtime 오버레이가 «앞을 보는 것»만 바꾼다.
   //   ⛔ 지난 노드를 재정의하지 않는다(RFC §6: 그러면 원장을 사후에 해석할 수 없다).
   let graphTemplate = graphDecision.template;
+  let variantSpec: import('./graph-yaml.js').GraphTemplateSpec | undefined;
+  if (opts.graphVariantPlan !== undefined) {
+    const { GRAPH_SPECS, specToTemplate } = await import('./graph-templates.js');
+    const { graphVersionHash } = await import('./graph-yaml.js');
+    const { applyGraphOverlays } = await import('./graph-overlay-yaml.js');
+    const { createGraphVariant } = await import('./graph-variant.js');
+    const { runLedgerPath } = await import('./run-ledger.js');
+    const { stringify } = await import('yaml');
+    const baseSpec = GRAPH_SPECS[graphTemplate.graphId];
+    const variantRunId = identity?.runId ?? opts.runId;
+    if (!baseSpec || !variantRunId || graphDecision.rejections.length) {
+      throw new Error('graph variant rejected: missing graph specification, run identity, or valid launch overlay');
+    }
+    const launch = graphDecision.appliedIds.length
+      ? applyGraphOverlays(baseSpec, graphOverlays.filter(overlay => graphDecision.appliedIds.includes(overlay.overlayId)))
+      : undefined;
+    if (launch && !launch.ok) throw new Error(`graph variant rejected: ${JSON.stringify(launch.rejections)}`);
+    const sourceSpec = launch?.ok ? launch.template : baseSpec;
+    const variant = createGraphVariant({ template: sourceSpec, goal: `g_${variantRunId.replace(/[^a-z0-9_-]/gi, '_')}`, plan: opts.graphVariantPlan });
+    if (!variant.ok) throw new Error(`graph variant rejected: ${JSON.stringify(variant.rejections)}`);
+    variantSpec = variant.template;
+    graphTemplate = { ...specToTemplate(variantSpec), version: graphVersionHash(variantSpec) };
+    const { runLedgerDir } = await import('./run-ledger.js');
+    const graphFile = `${runLedgerPath(variantRunId)}.graph.yaml`;
+    mkdirSync(runLedgerDir(), { recursive: true });
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(graphFile, stringify({
+      graph_id: variantSpec.graphId, version: variantSpec.version,
+      entry_node: variantSpec.entryNode, terminal_nodes: variantSpec.terminalNodes,
+      ...(variantSpec.runContract ? { run_contract: variantSpec.runContract } : {}),
+      nodes: variantSpec.nodes.map(n => ({
+        node_id: n.nodeId, kind: n.kind, recipe: n.recipe, max_visits: n.maxVisits,
+        ...(n.progress ? { progress: n.progress } : {}), ...(n.phases ? { phases: n.phases } : {}),
+        ...(n.terminalStages ? { terminal_stages: n.terminalStages } : {}),
+        ...(n.fanOut ? { fan_out: n.fanOut } : {}), ...(n.contract ? { contract: n.contract } : {}),
+      })),
+      edges: variantSpec.edges.map(e => ({
+        from: e.from, ...(e.to === undefined ? { on: e.on, map: e.map } : { to: e.to }),
+        ...(e.fallback ? { fallback: e.fallback } : {}),
+        ...(e.observed === undefined ? {} : { observed: e.observed }),
+      })),
+    }), { flag: 'wx' });
+    observe('graph-variant-applied', { graphId: variant.template.graphId, overlayId: variant.overlay.overlayId,
+      graphFile, patches: variant.patches });
+  }
   /** 단계 이름 → 그 템플릿의 노드 이름. */
   const node = (stage: PipelineNodeId): PipelineNodeId => nodeNameForStage(stage, graphTemplate) as PipelineNodeId;
   // ⛔⭐ 맥락이 정해진 «직후» 관측기에 심는다 — 이 줄이 없으면 걸음은 YAML 을 따르고 «신원은 안 따른다».
@@ -4485,6 +4574,7 @@ async function runSelfImplementInner(
       overlays: graphOverlays,
       state: runtimeOverlayState,
       stage: 'runtime',
+      ...(variantSpec ? { specs: { [variantSpec.graphId]: variantSpec } } : {}),
     });
     if (decision.appliedIds.length > 0) graphTemplate = decision.template;
     // ⛔⭐ 승격이 켜져 있으면 «언제나» 낸다 — 후보가 0이어도 낸다.
@@ -5171,6 +5261,9 @@ async function runSelfImplementInner(
     cachedQuotaExhaustionAssessment ??= readQuotaExhausted(s.inspectCodexRotation, runProviderName);
     return cachedQuotaExhaustionAssessment;
   };
+  let finishedChildCommitMissing = false;
+  let finishedChildCommitFailure: string | undefined;
+  let finishedChildCommitted = false;
   const classifyUnfinishedRun = (stage: SelfImplementStage, verdict?: ReworkBudgetVerdict, decomposition?: TerminalDecomposition): AbandonedClassificationResult => {
     const quotaExhaustionAssessment = quotaExhaustionAssessmentForRun();
     const worktree = unfinishedWorktreeObservation(wt.path);
@@ -5183,7 +5276,7 @@ async function runSelfImplementInner(
       ...(hasCurrentProviderError() && providerErrorCategory() ? { providerErrorCategory: providerErrorCategory() } : {}),
       worktreePorcelain: worktree.worktreePorcelain,
       ...(worktree.gitResidue ? { gitResidue: worktree.gitResidue } : {}),
-      ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}),
+      ...(!finishedChildCommitMissing && !finishedChildCommitted && impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}),
       ...(verdict ? { supervisorVerdict: verdict } : lastSupervisorVerdict ? { supervisorVerdict: lastSupervisorVerdict } : {}),
       ...(hasMultipleStructuredTerminalPieces(decomposition ?? terminalDecomposition) ? { goalCauseObserved: true } : {}),
       stage,
@@ -5502,8 +5595,12 @@ async function runSelfImplementInner(
       return { decision };
     }
     const followUpMustFix = `\n\n## Follow-up must-fix (${decision.unresolvedMustFix.length})\n${decision.unresolvedMustFix.map((finding) => `- ${finding}`).join('\n')}`;
+    const releaseNote = releaseNoteForRun(opts.goalFile, opts.feature);
+    // openPr's default seam delegates to PrManager.upsertPr, which stages, commits,
+    // and pushes this worktree after the note is written and before creating the PR.
+    addNextMdReleaseNote(wt.path, releaseNote);
     const preparedPrBody = preparePrBody(
-      `${prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, undefined, harvestedForPr(), opts.goalFile, lastPlanRevision)}${followUpMustFix}`,
+      `${prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, undefined, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote)}${followUpMustFix}`,
       s.persistPrBodyArtifact,
       'self-implement-review-budget-pr',
       followUpMustFix,
@@ -6160,6 +6257,76 @@ async function runSelfImplementInner(
     // ⭐ 성공 경로에서도 닫는다 — 이 호출은 끝났고, 이후 자식이 늦게 보내는 입력은
     //   「이 라운드의 재투입」이 아니다(다음 라운드는 자기 콜백을 새로 만든다).
     closeSupervisorInput();
+    // A finished child can leave edits without a commit. Measure them before any
+    // diff/no-changes classification, and commit only paths declared in the goal.
+    finishedChildCommitMissing = false;
+    finishedChildCommitFailure = undefined;
+    finishedChildCommitted = false;
+    if (impl.ok) {
+      const work = (s.detectUncommittedWork ?? detectUncommittedWork)(wt.path);
+      if (work.status === 'unavailable') {
+        // Fail closed when the branch already carries commits: a PR could open without knowing whether the
+        // goal's changes were committed (HARV1 review round 3). With no commits, the no-changes path decides.
+        let branchFiles: readonly string[] | undefined;
+        try { branchFiles = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { branchFiles = undefined; }
+        // Only a run that would open a PR needs the block — worktree-only completion opens none.
+        // A path that isn't a git worktree at all (no .git) has nothing to open a PR from — only real worktrees block.
+        const blocks = opts.completion !== 'worktree-only' && existsSync(join(wt.path, '.git'))
+          && (branchFiles === undefined || branchFiles.length > 0);
+        if (blocks) {
+          finishedChildCommitMissing = true;
+          finishedChildCommitFailure = `working tree status unavailable: ${work.reason ?? 'unknown'}`;
+        }
+        observe('finished-child-commit', { round, status: 'unavailable', reason: work.reason, blocked: blocks }, { level: 'warn' });
+      } else if (work.status === 'changes') {
+        let goalDocument: string | undefined;
+        if (opts.goalFile) {
+          try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* no declared scope */ }
+        }
+        const declared = goalDocument === undefined ? undefined : declaredPathsFromGoalDocumentText(goalDocument);
+        const targets = declared?.readable
+          ? declared.paths
+          : inferHotPaths(targetScopedGoalText(opts.feature));
+        const eligible = [...new Set([...work.trackedChanges, ...work.untrackedFiles])]
+          .filter((path) => !harnessSeededPaths.includes(path)
+            && targets.some((target) => changedFileIsInsideDeclaredTarget(path, target)));
+        if (eligible.length) {
+          const message = `self-implement: ${prTitle(opts.feature)}`;
+          let outcome: { ok: boolean; out: string };
+          try {
+            outcome = (s.commitFinishedChildWork ?? ((cwd, paths, title) => {
+              const env = { ...process.env };
+              for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
+              const childName = `elanous child ${runId}`;
+              const childEmail = `child+${runId.replace(/[^a-zA-Z0-9-]/g, '')}@elanous.local`;
+              env.GIT_AUTHOR_NAME = childName;
+              env.GIT_AUTHOR_EMAIL = childEmail;
+              env.GIT_COMMITTER_NAME = childName;
+              env.GIT_COMMITTER_EMAIL = childEmail;
+              const git = (args: string[]) => spawnSync('git', ['--no-optional-locks', ...args], {
+                cwd, env, encoding: 'utf8', timeout: 20_000,
+              });
+              const staged = git(['add', '-A', '--', ...paths]);
+              if (staged.status !== 0) return { ok: false, out: staged.stderr || staged.stdout || staged.error?.message || 'git add failed' };
+              // --only commits these paths even when unrelated edits were staged before the child finished.
+              const commit = git(['commit', '-m', title, '--only', '--', ...paths]);
+              return { ok: commit.status === 0, out: commit.stderr || commit.stdout || commit.error?.message || '' };
+            }))(wt.path, eligible, message);
+          } catch (error) {
+            outcome = { ok: false, out: safeErrorDescription(error) };
+          }
+          finishedChildCommitMissing = !outcome.ok;
+          finishedChildCommitFailure = outcome.ok ? undefined : outcome.out;
+          finishedChildCommitted = outcome.ok;
+          observe('finished-child-commit', {
+            round, status: outcome.ok ? 'committed' : 'commit-missing', paths: eligible,
+            ...(outcome.ok ? {} : { reason: outcome.out.slice(0, 500) }),
+          }, outcome.ok ? {} : { level: 'warn' });
+        } else {
+          observe('finished-child-commit', { round, status: 'out-of-scope' });
+        }
+      }
+    }
     // ⭐ S3 — 자식 요약에서 diff 밖 이행 주장을 분류한다(자식 반환 계약은 그대로 둔다).
     //   ⛔ 버린 것을 **세어서** 남긴다 — 조용히 버리면 관측값이 항상 0이 되어 거짓 초록이 된다.
     // ★ I-9/RUN-T6 — 꼬리 2000자가 아니라 **수확본**에서 판다. 자식이 먼저 돌린 tsc·뮤테이션 출력이
@@ -6242,9 +6409,10 @@ async function runSelfImplementInner(
       orphanResult: offDiffEvidence.orphanResult,
       ...harvestObs,
     }, { compact: { stringMax: Math.max(MAX_HARVESTED_EVIDENCE_CHARS, harvestObs.harvestedEvidence?.length ?? 0) } });
-    observe('implemented', { ok: impl.ok, round, ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}) });
+    if (impl.ok) completionDisposition = finishedChildCommitMissing || finishedChildCommitted ? undefined : impl.completionDisposition;
+    const effectiveDisposition = impl.ok ? completionDisposition : impl.completionDisposition;
+    observe('implemented', { ok: impl.ok, round, ...(effectiveDisposition ? { completionDisposition: effectiveDisposition } : {}) });
     progress('implemented', impl.ok ? (round === 0 ? '구현 완료' : `rework ${round} 완료`) : impl.completionDisposition ? '변경 없이 완료 검증' : '구현 실패(worktree 보존)');
-    if (impl.ok) completionDisposition = impl.completionDisposition;
     if (!impl.ok) {
       finalizeSupervisorDeliveries('next-round-implement-not-ok');
       const abort = buildImplementAbortRecord(impl.summary, impl.terminalStatus);
@@ -6269,6 +6437,13 @@ async function runSelfImplementInner(
         ...(abort.terminalStatus ? { terminalStatus: abort.terminalStatus } : {}),
       });
       return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: impl.summary };
+    }
+
+    if (finishedChildCommitMissing) {
+      finalizeSupervisorDeliveries('finished-child-commit-missing');
+      const detail = `finished child changes could not be committed: ${finishedChildCommitFailure ?? 'commit failed'}`;
+      progress('aborted', detail);
+      return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, detail };
     }
 
     // Measure the existing declared-target boundary after implementation, before gate/PR.
@@ -7073,7 +7248,10 @@ async function runSelfImplementInner(
     ...(prEvidenceDecision.reason ? { reason: prEvidenceDecision.reason } : {}),
     ...(prEvidenceDecision.body ? { bodyChars: prEvidenceDecision.body.length } : {}),
   });
-  const releaseNote = harnessReleaseNote(goalDocumentForReleaseNote(opts.goalFile), prTitle(opts.feature));
+  const releaseNote = releaseNoteForRun(opts.goalFile, opts.feature);
+  // openPr's default seam delegates to PrManager.upsertPr, which stages, commits,
+  // and pushes this worktree after the note is written and before creating the PR.
+  addNextMdReleaseNote(wt.path, releaseNote);
   const preparedPrBody = preparePrBody(
     [
       prBody(opts.feature, impl.summary, gate.log, review, reviewIntent, declineReasons, harvestedForPr(), opts.goalFile, lastPlanRevision, releaseNote),
@@ -7090,7 +7268,8 @@ async function runSelfImplementInner(
       head: wt.branch,
       ...(opts.base ? { base: opts.base } : {}),
       draft: canAuto ? false : (opts.draft ?? true),
-      ...(labels ? { labels } : {}),
+      // The review poller must not see this PR before its actual paths have been inspected.
+      ...(labels?.length ? { labels: labels.filter((label) => label !== AUTO_REVIEW_LABEL) } : {}),
       cwd: wt.path,
     }), T.pr, 'pr');
   } catch (error) {
@@ -7115,6 +7294,60 @@ async function runSelfImplementInner(
     ...(preparedPrBody.truncated ? { prBodyTruncated: true, prBodyOriginalChars: preparedPrBody.originalChars } : {}),
   });
   await flushPrComments(pr);
+
+  // Inspect the opened PR itself: the goal text and the pre-sync worktree can differ from its final file list.
+  let releaseHoldPath: string | undefined;
+  let releasePathInspectionError: string | undefined;
+  if (s.readPrFiles) {
+    try {
+      const files = await withStepTimeout(s.readPrFiles({ number: pr.number, cwd: wt.path }), T.pr, 'pr');
+      if (!Array.isArray(files) || !files.every((path) => typeof path === 'string')) throw new Error('invalid PR file list');
+      releaseHoldPath = releasePathHold(files);
+    } catch (error) {
+      releasePathInspectionError = safeErrorDescription(error);
+    }
+  } else if (canAuto || labels?.includes(AUTO_REVIEW_LABEL)) {
+    releasePathInspectionError = 'readPrFiles seam unavailable';
+  }
+  if (releaseHoldPath) {
+    debug.log('self-dev.merge', 'release-path-hold', { number: pr.number, path: releaseHoldPath, label: RELEASE_PATH_LABEL });
+    canAuto = false;
+    mergeSkipReason = mergeReason = 'release-path-hold';
+    // Suppress the independent auto-review poller as well as this immediate merge path.
+    // No merge is attempted even when an annotation fails; each failure is observable for OP repair.
+    for (const [action, annotate] of [
+      ['add-label', s.addPrLabel && (() => s.addPrLabel!({ number: pr.number, label: RELEASE_PATH_LABEL, cwd: wt.path }))],
+      ['comment', s.postPrComment && (() => s.postPrComment!({ number: pr.number, body: releasePathHoldComment(releaseHoldPath), cwd: wt.path }))],
+    ] as const) {
+      if (!annotate) {
+        observe('release-path-annotation-failed', { number: pr.number, path: releaseHoldPath, action, error: 'annotation seam unavailable' }, { level: 'error' });
+        continue;
+      }
+      try { await annotate(); }
+      catch (error) {
+        observe('release-path-annotation-failed', { number: pr.number, path: releaseHoldPath, action, error: safeErrorDescription(error) }, { level: 'error' });
+      }
+    }
+    recordMergeDecision();
+    progress('pr-opened', `OP 승인 대기 (#${pr.number}): ${releaseHoldPath}`);
+    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, prUrl: pr.url, prNumber: pr.number, detail: `OP approval required: ${releaseHoldPath}` };
+  }
+  if (!releasePathInspectionError && labels?.includes(AUTO_REVIEW_LABEL)) {
+    try {
+      if (!s.addPrLabel) throw new Error('addPrLabel seam unavailable');
+      await s.addPrLabel({ number: pr.number, label: AUTO_REVIEW_LABEL, cwd: wt.path });
+    } catch (error) {
+      observe('auto-review-label-failed', { number: pr.number, error: safeErrorDescription(error) }, { level: 'warn' });
+    }
+  }
+  if (releasePathInspectionError && (canAuto || labels?.includes(AUTO_REVIEW_LABEL))) {
+    observe('release-path-inspection-failed', { number: pr.number, error: releasePathInspectionError }, { level: 'error' });
+    canAuto = false;
+    mergeSkipReason = mergeReason = 'release-path-inspection-failed';
+    recordMergeDecision();
+    progress('pr-opened', `OP 승인 대기 (#${pr.number}): PR 경로 조회 실패`);
+    return { ok: true, stage: 'pr-opened', node: 'open-pr', ...resolveRunOutcome({ termination: 'completed' }), ...decisionSignalResult, ...preservedCompletionResult, ...(completionStatus ? { completionStatus } : {}), sessionId, worktreePath: wt.path, branch: wt.branch, gate, ...(review ? { review } : {}), mergeReason, prUrl: pr.url, prNumber: pr.number };
+  }
 
   if (canAuto && (s.mergePr || opts.mergeByHost)) {
     let docsMarkdownDeletions: number | undefined;

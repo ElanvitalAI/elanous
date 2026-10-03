@@ -7,6 +7,7 @@ import { defaultGraphsDir } from '../self-implement/graph-templates.js';
 import { getElanousConfigDir } from '../elanous-config-dir.js';
 import type { ExecAttachment } from './store.js';
 import { debug } from '../debug/log.js';
+import { OUTPUT_KINDS, pickDefaultOutput, type OutputKind } from './default-outputs.js';
 
 export interface InstalledGraph {
   id: string;
@@ -21,6 +22,8 @@ export interface ExecPlanItem {
   title: string;
   graphId: string;
   inputs: Record<string, unknown>;
+  /** Planner fills this for every returned row; older injected plan fixtures may omit it. */
+  output?: OutputKind;
   reason?: string;
   /** A5b — indexes of earlier items whose results this item needs (it starts after they finish). */
   after?: number[];
@@ -147,7 +150,7 @@ export function latestFieldFolder(configRoot = getElanousConfigDir()): string | 
 
 export function execPlanPrompt(text: string, graphs: readonly InstalledGraph[], seats: readonly string[], attachments: readonly ExecAttachment[] = [], fieldFolder: string | null = latestFieldFolder()): string {
   const supplied = attachments.map(({ name, path }) => `첨부: ${name} (${/\.(?:png|jpe?g|webp|gif|heic)$/i.test(name) ? '이미지' : '파일'}) — ${path}`).join('\n');
-  return `COO 역할. 요청을 실행 가능한 자리별 그래프로 나눠 맡겨라. JSON 배열만 출력: [{"seat":"자리","title":"할 일","graphId":"설치된 그래프 ID 또는 빈 문자열","inputs":{},"after":[]}]. 앞 항목의 결과가 있어야 할 수 있는 일(예: 점검·조사 «결과로» 쓰는 한 장 · 보고)은 after 에 그 앞 항목 번호(0부터)를 적는다 — 그 항목은 앞 항목이 끝난 뒤 그 결과를 받아 시작한다. 서로 기다릴 필요가 없으면 after 는 빈 배열. 자리 이름은 주어진 목록에서만, 그래프 ID는 설치된 목록에서만 고른다. 맞는 그래프가 없으면 graphId=""로 표시한다. 그래프에 inputKeys 가 있으면 inputs 를 그 키로만 채우되 한 줄과 아래 알려진 값에서 얻을 수 있는 값만 넣는다(모르는 값은 넣지 않는다). image/photo/file 입력에는 알맞은 첨부 경로를 쓸 수 있다. folder 입력에는 첨부가 없거나 첨부 사진이 그 현장 폴더 안에 있을 때만 오늘 현장 폴더를 쓸 수 있다. 다른 현장 사진이나 출처를 모르는 업로드 사진이 있으면 폴더를 추측하지 마라. 그 그래프가 꼭 받아야 할 값(예: 브랜드 이름 · 사진 파일)을 알 수 없으면 graphId=""로 두고 title 끝에 « — <무엇> 필요»를 적는다. 단순히 묻는 말에는 없는 그래프를 지어내지 말고 graphId=""로 표시한다. 없는 그래프나 산출을 지어내지 마라. 바깥 게시·발행·광고·결제는 승인 노드를 거치기 전 실행하면 안 된다.\n자리: ${JSON.stringify(seats)}\n실행 가능한 그래프: ${JSON.stringify(graphs.map(({ id, title, description, inputKeys }) => ({ id, title, description, ...(inputKeys ? { inputKeys } : {}) })))}\n${fieldFolder ? `알려진 값: 오늘 현장 폴더 = ${fieldFolder}\n` : ''}${supplied ? `${supplied}\n` : ''}한 줄: ${JSON.stringify(text)}`;
+  return `COO 역할. 요청을 실행 가능한 자리별 그래프로 나눠 맡겨라. JSON 배열만 출력: [{"seat":"자리","title":"할 일","graphId":"설치된 그래프 ID 또는 빈 문자열","inputs":{},"after":[]}]. 각 행에는 선택 칸 "output":"report|slides|research|post|video|answer"를 쓸 수 있다: ${Object.entries(OUTPUT_KINDS).map(([kind, entry]) => `${entry.guidance} = ${kind}${entry.fileName ? ` (${entry.fileName})` : ''}`).join(', ')}; 그 외 일은 report로 둔다. 앞 항목의 결과가 있어야 할 수 있는 일(예: 점검·조사 «결과로» 쓰는 한 장 · 보고)은 after 에 그 앞 항목 번호(0부터)를 적는다 — 그 항목은 앞 항목이 끝난 뒤 그 결과를 받아 시작한다. 서로 기다릴 필요가 없으면 after 는 빈 배열. 자리 이름은 주어진 목록에서만, 그래프 ID는 설치된 목록에서만 고른다. 맞는 그래프가 없으면 graphId=""로 표시한다. 그래프에 inputKeys 가 있으면 inputs 를 그 키로만 채우되 한 줄과 아래 알려진 값에서 얻을 수 있는 값만 넣는다(모르는 값은 넣지 않는다). image/photo/file 입력에는 알맞은 첨부 경로를 쓸 수 있다. folder 입력에는 첨부가 없거나 첨부 사진이 그 현장 폴더 안에 있을 때만 오늘 현장 폴더를 쓸 수 있다. 다른 현장 사진이나 출처를 모르는 업로드 사진이 있으면 폴더를 추측하지 마라. 그 그래프가 꼭 받아야 할 값(예: 브랜드 이름 · 사진 파일)을 알 수 없으면 graphId=""로 두고 title 끝에 « — <무엇> 필요»를 적는다. 단순히 묻는 말에는 없는 그래프를 지어내지 말고 graphId=""로 표시한다. 없는 그래프나 산출을 지어내지 마라. 바깥 게시·발행·광고·결제는 승인 노드를 거치기 전 실행하면 안 된다.\n자리: ${JSON.stringify(seats)}\n실행 가능한 그래프: ${JSON.stringify(graphs.map(({ id, title, description, inputKeys }) => ({ id, title, description, ...(inputKeys ? { inputKeys } : {}) })))}\n${fieldFolder ? `알려진 값: 오늘 현장 폴더 = ${fieldFolder}\n` : ''}${supplied ? `${supplied}\n` : ''}한 줄: ${JSON.stringify(text)}`;
 }
 
 export async function judgeExecPlan(text: string, graphs: readonly InstalledGraph[], seats: readonly string[], attachments: readonly ExecAttachment[] = [], fieldFolder: string | null = latestFieldFolder()): Promise<unknown> {
@@ -183,6 +186,11 @@ export async function planExecRequest(text: string, deps: {
       ? [...new Set(row.after.filter((n): n is number => Number.isInteger(n) && (n as number) >= 0 && (n as number) < index))]
       : [];
     const graph = known.get(row.graphId);
+    const modelOutput = typeof row.output === 'string' && Object.hasOwn(OUTPUT_KINDS, row.output)
+      ? row.output as OutputKind : undefined;
+    const picked = modelOutput ?? pickDefaultOutput(row.title).kind;
+    const output = picked === 'video' && !graph ? 'report' : picked;
+    debug.log('exec.plan', 'default-output', { kind: output, source: modelOutput === output ? 'model' : 'rule' });
     const inputs = { ...row.inputs as Record<string, unknown> };
     let folderReason: string | undefined;
     if (graph) {
@@ -206,7 +214,7 @@ export async function planExecRequest(text: string, deps: {
       }
     }
     return {
-      seat: row.seat, title: row.title.trim(), graphId: row.graphId, inputs,
+      seat: row.seat, title: row.title.trim(), graphId: row.graphId, inputs, output,
       ...(after.length ? { after } : {}),
       ...(!graph ? { reason: `${row.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` } : folderReason ? { reason: folderReason } : {}),
     };

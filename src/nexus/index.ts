@@ -1949,10 +1949,12 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
     const tab = registry.get(tabId);
     if (!tab || tab.spec.kind !== 'webterm') return;
     const cwdMeta = (tab.spec.meta as { cwd?: string } | undefined)?.cwd;
+    const projectSessionId = (tab.spec.meta as { sessionId?: string } | undefined)?.sessionId;
     const backendFactory = effectiveWebtermSpawn
       ? () => {
           const decided = resolveWebtermCwd({
             ...(cwdMeta ? { tabCwd: cwdMeta } : {}),
+            ...(projectSessionId ? { sessionId: projectSessionId } : {}),
             ...(runtimeToolCwd ? { toolCwd: runtimeToolCwd } : {}),
             instance: resolveCurrentInstance(),
             processCwd: process.cwd(),

@@ -6,3 +6,6 @@ deploy-pages-dry:
   timeout_ms: 600000   # deploy-pages 도 안에서 build-public 을 돈다
 publish-approval:
   approval: "공개 발행을 승인하시겠습니까?"
+secret-exposure-scan:
+  command: 'bun "$ELANOUS_GRAPH_DIR/../../src/guardian/secret-exposure-scan.ts"'
+  timeout_ms: 120000

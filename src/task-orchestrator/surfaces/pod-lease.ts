@@ -1,13 +1,22 @@
 import type { PodPoolMember, PoolKubectl } from './pod-pool.js';
+import { debug } from '../../debug/log.js';
 import { spawnSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { dlopen } from 'bun:ffi';
+import { hostLeaseBaseDir } from '../../pod-lease/host-lease.js';
+
+/** Persisted on a Job admitted through the host lease; the file lease is released after apply. */
+export const POD_HOST_LEASE_ANNOTATION = 'elanous.dev/host-lease-admitted';
 
 // `get pods --all-namespaces -o json` on a busy cluster is several MB — the default spawnSync
 // buffer fails with ENOBUFS (10-03 node-b measured). Same proxy stripping as the Pod launch kubectl.
 const LEASE_KUBECTL_MAX_BUFFER = 256 * 1024 * 1024;
-export function leaseKubectl(args: readonly string[]): { status: number | null; stdout: string; stderr: string } {
+export function leaseKubectl(args: readonly string[], input?: string): { status: number | null; stdout: string; stderr: string } {
   const env = { ...process.env };
   for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[k];
-  const r = spawnSync('kubectl', [...args], { encoding: 'utf8', env, timeout: 120_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
+  const r = spawnSync('kubectl', [...args], { encoding: 'utf8', input, env, timeout: 120_000, maxBuffer: LEASE_KUBECTL_MAX_BUFFER });
   return { status: r.status, stdout: r.stdout ?? '', stderr: (r.stderr ?? '') + (r.error ? String(r.error) : '') };
 }
 
@@ -16,6 +25,8 @@ export interface PodLeaseMember {
   capacity: number;
   running: number | null;
   pending: number | null;
+  /** Running harness Pods whose Jobs predate host lease admission. */
+  unleasedRunning: number | null;
   memoryLimitBytes: number | null;
   /** All-node allocatable memory, before existing reservations. */
   allocatableMemoryBytes: number | null;
@@ -35,10 +46,14 @@ export interface PoolLeaseRecommendation {
   reason: string | null;
   capacitySlots: number | null;
   memorySlots: number | null;
+  /** POD7 — the same memory headroom counted in lite goals (2Gi) · observation only: `recommended` stays on the standard size. */
+  liteMemorySlots?: number | null;
   placeableSlots: number | null;
   accountSlots: number | null;
   running: number | null;
   pending: number | null;
+  /** Absent only for injected legacy status fixtures; real measurements always report a number or null. */
+  unleasedRunning?: number | null;
 }
 
 /** Kubernetes quantity to bytes (memory) or millicores (CPU). */
@@ -110,12 +125,114 @@ function runningLimit(spec: Record<string, unknown>): number | null {
   return total;
 }
 
-/** Read only: each cluster probe is kubectl get. Missing reservations cannot become zero. */
-export function measurePoolLease(members: readonly PodPoolMember[], deps: { kubectl?: PoolKubectl } = {}): PoolLeaseMeasure {
+/** A short-lived Pod proves cluster DNS from inside the same namespace as harness Jobs. Image pull failures are not DNS failures. */
+export type PoolDnsProbe = 'ready' | 'dns' | 'image' | 'unknown';
+const DNS_CACHE_MS = 10 * 60_000;
+const DNS_LOCK_WAIT_MS = 6 * 60_000;
+// flock is released by the kernel on process exit, including a crash before any cache write.
+// The lock file is never unlinked: unlinking it would let waiters lock different inodes.
+const dnsFlock = process.platform === 'linux' || process.platform === 'darwin'
+  ? dlopen(process.platform === 'linux' ? 'libc.so.6' : 'libSystem.B.dylib', {
+    flock: { args: ['int', 'int'], returns: 'int' },
+  }).symbols.flock : null;
+
+/** The cache and lock are shared by CLI processes, keyed by context rather than pool composition. */
+export function probePoolDns(context: string, kubectl: PoolKubectl = leaseKubectl, options: { dir?: string; now?: () => number } = {}): PoolDnsProbe {
+  const dir = options.dir ?? hostLeaseBaseDir();
+  const now = options.now ?? Date.now;
+  const key = createHash('sha256').update(context).digest('hex');
+  const cache = join(dir, `dns-${key}.cache`);
+  const outcome = join(dir, `dns-${key}.outcome`);
+  const lock = join(dir, `dns-${key}.flock`);
+  const readRecord = (path: string): Record<string, unknown> | null => {
+    try { return object(JSON.parse(readFileSync(path, 'utf8'))); }
+    catch { return null; }
+  };
+  const cached = (): boolean => {
+    const record = readRecord(cache);
+    return record?.result === 'ready' && typeof record.at === 'number' &&
+      now() >= record.at && now() - record.at < DNS_CACHE_MS;
+  };
+  if (cached()) return 'ready';
+  const previous = readRecord(outcome);
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return 'unknown'; }
+  if (!dnsFlock) return 'unknown';
+  let fd: number;
+  try { fd = openSync(lock, 'a', 0o600); } catch { return 'unknown'; }
+  const deadline = Date.now() + DNS_LOCK_WAIT_MS;
+  let held = false;
+  try {
+    const sharedFailure = (): PoolDnsProbe | null => {
+      const record = readRecord(outcome);
+      // Only a caller that started before this generation was written can reuse it.
+      if (record?.generation !== undefined && record.generation !== previous?.generation &&
+          ['dns', 'image', 'unknown'].includes(String(record.result))) return record.result as PoolDnsProbe;
+      return null;
+    };
+    while (!held) {
+      if (cached()) return 'ready';
+      const shared = sharedFailure();
+      if (shared) return shared;
+      if (dnsFlock(fd, 2 | 4) === 0) { held = true; break; } // LOCK_EX | LOCK_NB
+      if (Date.now() >= deadline) return 'unknown';
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+    }
+    if (cached()) return 'ready';
+    const shared = sharedFailure();
+    if (shared) return shared;
+    const result = runPoolDnsProbe(context, kubectl);
+    const destination = result === 'ready' ? cache : outcome;
+    const temp = `${destination}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temp, JSON.stringify({ result, at: now(), generation: randomUUID() }), { mode: 0o600 });
+      renameSync(temp, destination);
+    } catch { try { rmSync(temp, { force: true }); } catch { /* best-effort cleanup */ } }
+    return result;
+  } finally {
+    if (held) dnsFlock(fd, 8); // LOCK_UN
+    closeSync(fd);
+  }
+}
+
+function runPoolDnsProbe(context: string, kubectl: PoolKubectl): PoolDnsProbe {
+  const name = `elanous-dns-${randomUUID().slice(0, 12)}`;
+  const base = ['--context', context, '--request-timeout=10s'];
+  try {
+    const core = kubectl([...base, '-n', 'kube-system', 'get', 'deployment', 'coredns', '-o', 'json']);
+    if (core.status !== 0) return 'unknown';
+    const deployment = object(JSON.parse(core.stdout));
+    const spec = object(deployment?.spec);
+    const status = object(deployment?.status);
+    if (typeof spec?.replicas !== 'number' || spec.replicas < 1 || status?.readyReplicas !== spec.replicas) return 'dns';
+    const manifest = JSON.stringify({ apiVersion: 'v1', kind: 'Pod', metadata: { name, namespace: 'elanous-test', labels: { 'elanous.probe': 'dns' } }, spec: {
+      restartPolicy: 'Never', activeDeadlineSeconds: 40, automountServiceAccountToken: false,
+      containers: [{ name: 'dns', image: 'busybox:1.36', command: ['nslookup', 'kubernetes.default.svc.cluster.local'], resources: { requests: { cpu: '10m', memory: '16Mi' }, limits: { cpu: '100m', memory: '64Mi' } } }],
+    } });
+    if (kubectl([...base, 'create', '-f', '-'], manifest).status !== 0) return 'unknown';
+    const waited = kubectl([...base, '-n', 'elanous-test', 'wait', '--for=jsonpath={.status.phase}=Succeeded', `pod/${name}`, '--timeout=30s']);
+    const pod = kubectl([...base, '-n', 'elanous-test', 'get', `pod/${name}`, '-o', 'json']);
+    if (pod.status !== 0) return 'unknown';
+    const state = object(JSON.parse(pod.stdout));
+    const phase = object(state?.status)?.phase;
+    const statuses = object(state?.status)?.containerStatuses;
+    if (Array.isArray(statuses) && statuses.some((c) =>
+      ['ErrImagePull', 'ImagePullBackOff', 'InvalidImageName'].includes(String(object(object(object(c)?.state)?.waiting)?.reason)))) return 'image';
+    if (phase !== 'Succeeded' && phase !== 'Failed') return 'unknown';
+    if (waited.status !== 0 && phase !== 'Failed') return 'unknown';
+    const log = kubectl([...base, '-n', 'elanous-test', 'logs', `pod/${name}`]);
+    if (log.status !== 0) return 'unknown';
+    if (phase === 'Failed') return /can't resolve|server can't find|connection timed out|no servers could be reached|NXDOMAIN|SERVFAIL/iu.test(log.stdout) ? 'dns' : 'unknown';
+    return /\bName:\s*kubernetes\.default\.svc\.cluster\.local\b/u.test(log.stdout) && /\bAddress(?:es)?:\s*\S+/u.test(log.stdout) ? 'ready' : 'dns';
+  } catch { return 'unknown'; }
+  finally { try { kubectl([...base, '-n', 'elanous-test', 'delete', `pod/${name}`, '--ignore-not-found=true', '--wait=false']); } catch { /* best-effort cleanup */ } }
+}
+
+/** Each cluster reads resource reservations; DNS requires a bounded disposable Pod. */
+export function measurePoolLease(members: readonly PodPoolMember[], deps: { kubectl?: PoolKubectl; dns?: (context: string) => PoolDnsProbe } = {}): PoolLeaseMeasure {
   const kubectl = deps.kubectl ?? leaseKubectl;
   return { members: members.map((member) => {
     const base = ['--context', member.context, '--request-timeout=10s'];
-    const result: PodLeaseMember = { context: member.context, capacity: member.capacity, running: null, pending: null, memoryLimitBytes: null, allocatableMemoryBytes: null, allocatableCpuMillicores: null, availableMemoryByNodeBytes: null, reason: null };
+    const result: PodLeaseMember = { context: member.context, capacity: member.capacity, running: null, pending: null, unleasedRunning: null, memoryLimitBytes: null, allocatableMemoryBytes: null, allocatableCpuMillicores: null, availableMemoryByNodeBytes: null, reason: null };
     try {
       const nodes = kubectl([...base, 'get', 'nodes', '-o', 'json']);
       const jobs = kubectl([...base, '-n', 'elanous-test', 'get', 'jobs', '-l', 'elanous.substrate=pod', '-o', 'json']);
@@ -165,6 +282,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
       if (!podItems) reasons.push(`cluster pods: ${pods.status === 0 ? 'invalid response' : pods.stderr.trim().split('\n').pop() || `rc=${pods.status}`}`);
       if (podItems && jobItems) {
         const jobNames = new Set<string>();
+        const leasedJobs = new Set<string>();
         let jobsValid = true;
         for (const job of jobItems) {
           const meta = object(job.metadata);
@@ -172,9 +290,10 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           if (object(meta.labels)?.['elanous.substrate'] !== 'pod') continue;
           if (typeof meta.name !== 'string' || !meta.name) { jobsValid = false; continue; }
           jobNames.add(meta.name);
+          if (object(meta.annotations)?.[POD_HOST_LEASE_ANNOTATION] === 'true') leasedJobs.add(meta.name);
         }
         if (!jobsValid) reasons.push('cluster jobs: missing name/labels');
-        let running = 0, pending = 0, limits = 0, limitsValid = true, reservationsValid = nodeItems !== null && nodeNames.size === nodeItems.length;
+        let running = 0, pending = 0, unleasedRunning = 0, limits = 0, limitsValid = true, reservationsValid = nodeItems !== null && nodeNames.size === nodeItems.length;
         let unknownPhase = false;
         const seenPods = new Set<string>();
         for (const pod of podItems) {
@@ -190,7 +309,7 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
             if (seenPods.has(identity)) { reservationsValid = false; continue; }
             seenPods.add(identity);
           } else reservationsValid = false;
-          const harness = metadata?.namespace === 'elanous-test' &&
+          const harness = metadata?.namespace === 'elanous-test' && labels?.['elanous.probe'] !== 'dns' &&
             (labels?.['elanous.substrate'] === 'pod' || jobNames.has(String(labels?.['elanous.job'] ?? '')));
           const spec = object(pod.spec);
           let limit: number | null = null;
@@ -198,6 +317,8 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
             if (phase === 'Pending') pending++;
             else {
               running++;
+              const jobName = labels?.['elanous.job'] ?? labels?.['job-name'];
+              if (typeof jobName !== 'string' || !leasedJobs.has(jobName)) unleasedRunning++;
               limit = spec ? runningLimit(spec) : null;
               if (limit === null) limitsValid = false;
               else limits += limit;
@@ -212,15 +333,21 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
           if (nodeFree.has(nodeName)) nodeFree.set(nodeName, nodeFree.get(nodeName)! - Math.max(requested, limit ?? 0));
         }
         if (unknownPhase) reasons.push('cluster pods: missing/Unknown phase');
-        if (jobsValid && !unknownPhase) { result.running = running; result.pending = pending; }
+        if (jobsValid && !unknownPhase) { result.running = running; result.pending = pending; result.unleasedRunning = unleasedRunning; }
         if (limitsValid && jobsValid && !unknownPhase) result.memoryLimitBytes = limits;
         else if (!limitsValid) reasons.push('cluster pods: Running Pod memory limit missing/invalid');
         if (reservationsValid && limitsValid && jobsValid && !unknownPhase) result.availableMemoryByNodeBytes = [...nodeFree.values()];
         else if (!reservationsValid && !unknownPhase) reasons.push('cluster reservations: node assignment or memory request/limit missing/invalid');
       }
       result.reason = reasons.length ? reasons.join('; ').slice(0, 240) : null;
+      if (nodeItems?.length && jobItems && podItems) {
+        let dnsState: PoolDnsProbe = 'unknown';
+        try { dnsState = (deps.dns ?? ((context) => probePoolDns(context, kubectl)))(member.context); } catch { /* probe could not be measured */ }
+        if (dnsState === 'dns') { result.capacity = 0; result.availableMemoryByNodeBytes = []; result.reason = 'dns'; }
+        else if (dnsState !== 'ready') { result.availableMemoryByNodeBytes = null; result.reason = `측정 불가: dns probe ${dnsState}`; }
+      }
     } catch (error) {
-      result.running = null; result.pending = null; result.memoryLimitBytes = null;
+      result.running = null; result.pending = null; result.unleasedRunning = null; result.memoryLimitBytes = null;
       result.allocatableMemoryBytes = null; result.allocatableCpuMillicores = null; result.availableMemoryByNodeBytes = null;
       result.reason = `cluster: ${error instanceof Error ? error.message : String(error)}`.split('\n')[0]!.slice(0, 240);
     }
@@ -229,32 +356,42 @@ export function measurePoolLease(members: readonly PodPoolMember[], deps: { kube
 }
 
 /** Per-node memory and per-member slots cannot be exchanged across nodes/clusters. */
-export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capacity: number; perGoalMemory?: string; accounts: number; perAccount: number }): PoolLeaseRecommendation {
-  const empty: PoolLeaseRecommendation = { recommended: null, limitedBy: null, reason: null, capacitySlots: null, memorySlots: null, placeableSlots: null, accountSlots: null, running: null, pending: null };
+export function recommendConcurrency(measure: PoolLeaseMeasure, options: { capacity: number; perGoalMemory?: string; liteGoalMemory?: string; accounts: number; perAccount: number }): PoolLeaseRecommendation {
+  const empty: PoolLeaseRecommendation = { recommended: null, limitedBy: null, reason: null, capacitySlots: null, memorySlots: null, liteMemorySlots: null, placeableSlots: null, accountSlots: null, running: null, pending: null, unleasedRunning: null };
   const goalBytes = quantity(options.perGoalMemory ?? '16Gi', 'memory');
   if (goalBytes === null || goalBytes <= 0) return { ...empty, reason: '측정 불가: perGoalMemory' };
-  if (!measure.members.length || measure.members.some((m) => m.running === null || m.pending === null || m.allocatableMemoryBytes === null || m.memoryLimitBytes === null || m.allocatableCpuMillicores === null || m.availableMemoryByNodeBytes === null)) {
+  if (!measure.members.length || measure.members.some((m) => m.running === null || m.pending === null || m.unleasedRunning === null || m.allocatableMemoryBytes === null || m.memoryLimitBytes === null || m.allocatableCpuMillicores === null || m.availableMemoryByNodeBytes === null)) {
     return { ...empty, reason: `측정 불가: cluster${measure.members.map((m) => m.reason ? ` ${m.context}: ${m.reason}` : '').join('')}` };
   }
   if (!Number.isSafeInteger(options.capacity) || options.capacity < 0) return { ...empty, reason: '측정 불가: capacity' };
   const running = measure.members.reduce((sum, m) => sum + m.running!, 0);
   const pending = measure.members.reduce((sum, m) => sum + m.pending!, 0);
-  const capacitySlots = Math.max(0, Math.min(options.capacity - running - pending,
-    measure.members.reduce((sum, m) => sum + Math.max(0, m.capacity - m.running! - m.pending!), 0)));
+  const unleasedRunning = measure.members.reduce((sum, m) => sum + m.unleasedRunning!, 0);
+  // Pool-wide free = sum of per-member free slots: a member over its cap counts as full, never negative,
+  // so it cannot zero another member's free slot (and its unleased Pods only consume its own free slots).
+  const memberFree = measure.members.map((m) => Math.max(0, m.capacity - m.running! - m.pending!));
+  const eligibleUnleasedRunning = measure.members.reduce((sum, m, i) => sum + (m.reason === 'dns' ? 0 : Math.min(m.unleasedRunning!, memberFree[i]!)), 0);
+  const eligibleOccupied = measure.members.reduce((sum, m) => sum + (m.reason === 'dns' ? 0 : Math.min(m.capacity, m.running! + m.pending!)), 0);
+  const capacitySlots = Math.max(0, Math.min(options.capacity - eligibleOccupied,
+    memberFree.reduce((sum, free) => sum + free, 0)));
   const memberMemorySlots = measure.members.map((m) => m.availableMemoryByNodeBytes!.reduce(
     (sum, bytes) => sum + Math.max(0, Math.floor(bytes / goalBytes)), 0));
   // Preserve the requested allocatable-minus-harness-limit metric. The node-local
   // placement bound additionally accounts for every namespace's reservations.
-  const memorySlots = measure.members.reduce((sum, m) => sum + Math.max(0,
-    Math.floor((m.allocatableMemoryBytes! - m.memoryLimitBytes!) / goalBytes)), 0);
+  const memorySlots = measure.members.reduce((sum, m) => sum + (m.reason === 'dns' ? 0 : Math.max(0,
+    Math.floor((m.allocatableMemoryBytes! - m.memoryLimitBytes!) / goalBytes))), 0);
   const placeableSlots = measure.members.reduce((sum, m, i) => sum + Math.min(
     Math.max(0, m.capacity - m.running! - m.pending!), memberMemorySlots[i]!,
   ), 0);
   // Account count is not a concurrency limit (same IP · own accounts, 10-03 decision) — observed only, never a bound.
   const accountSlots = [options.accounts, options.perAccount].every((n) => Number.isSafeInteger(n) && n >= 0)
     ? Math.max(0, options.accounts * options.perAccount - running) : null;
+  const liteBytes = quantity(options.liteGoalMemory ?? '2Gi', 'memory');
+  const liteMemorySlots = liteBytes === null || liteBytes <= 0 ? null : measure.members.reduce((sum, m) => sum + (m.reason === 'dns' ? 0 : Math.max(0,
+    Math.floor((m.allocatableMemoryBytes! - m.memoryLimitBytes!) / liteBytes))), 0);
   const memoryBound = Math.min(memorySlots, placeableSlots);
-  const recommended = Math.min(capacitySlots, memoryBound);
-  const limitedBy = recommended === memoryBound && memoryBound < capacitySlots ? 'memory' : 'capacity';
-  return { recommended, limitedBy, reason: null, capacitySlots, memorySlots, placeableSlots, accountSlots, running, pending };
+  const recommended = Math.max(0, Math.min(capacitySlots, memoryBound) - eligibleUnleasedRunning);
+  const limitedBy = memoryBound < capacitySlots ? 'memory' : 'capacity';
+  if (unleasedRunning > 0) debug.log('pod-lease', 'unleased', { unleasedRunning, running, recommended });
+  return { recommended, limitedBy, reason: measure.members.some((m) => m.reason === 'dns') ? 'dns' : null, capacitySlots, memorySlots, liteMemorySlots, placeableSlots, accountSlots, running, pending, unleasedRunning };
 }

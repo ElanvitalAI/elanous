@@ -1,0 +1,100 @@
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { debug } from '../debug/log.js';
+import { extractVerbatimOriginalAsk } from '../self-implement/goal-author.js';
+import { loadRunLedger } from '../self-implement/run-ledger.js';
+import { queryRunningRuns, type QueriedRunningRunsResult } from '../self-implement/running-runs.js';
+import type { BudgetDecision } from '../self-implement/budget-gate.js';
+
+export type ActiveRunsForGoal = readonly string[] | 'unknown';
+
+/** Match an un-authored CLI request to the verbatim ask recorded in an authored run. */
+export function launchRequestId(text: string): string {
+  return `request-${createHash('sha256').update(text).digest('hex').slice(0, 32)}`;
+}
+
+export interface ActiveRunsForGoalDeps {
+  queryRuns?: () => QueriedRunningRunsResult;
+  loadLedger?: typeof loadRunLedger;
+  readGoalDocument?: (path: string) => string;
+}
+
+/** Only a live process with an exact goal ID or verbatim authored ask is a duplicate. Incomplete observation is not absence. */
+export function activeRunsForGoal(goalId: string, deps: ActiveRunsForGoalDeps = {}): ActiveRunsForGoal {
+  try {
+    const observation = (deps.queryRuns ?? (() => queryRunningRuns({ includeTest: true, caller: 'execution-loop.launch-gate', noCache: true })))();
+    const loadLedger = deps.loadLedger ?? loadRunLedger;
+    const readGoalDocument = deps.readGoalDocument ?? ((path: string) => readFileSync(path, 'utf8'));
+    let unknown = observation.completeness !== 'complete' || observation.pty.unreadable.length > 0;
+    const active = new Set<string>();
+    for (const run of observation.entries) {
+      if (run.status === 'ended-unclosed') continue;
+      if (run.ledgerDirectories.length === 0) { unknown = true; continue; }
+      let identified = false;
+      for (const directory of run.ledgerDirectories) {
+        try {
+          const ledger = loadLedger(run.runId, directory);
+          if (ledger === null) { unknown = true; continue; }
+          const ids = new Set(ledger.flatMap((entry) => entry.goalId ? [entry.goalId] : []));
+          if (ids.size !== 1) { unknown = true; continue; }
+          identified = true;
+          let matches = ids.has(goalId);
+          if (!matches && goalId.startsWith('request-') && run.status === 'running' && run.ptyRefs.length > 0) {
+            const document = ledger.find((entry) => entry.event === 'start')?.data.goalFile;
+            if (typeof document === 'string') {
+              try {
+                const ask = extractVerbatimOriginalAsk(readGoalDocument(document));
+                matches = ask?.range !== undefined && launchRequestId(ask.ask) === goalId;
+              } catch { unknown = true; }
+            }
+          }
+          if (matches) {
+            if (run.status === 'running' && run.ptyRefs.length > 0) active.add(run.runId);
+            else unknown = true;
+          }
+        } catch { unknown = true; }
+      }
+      if (!identified) unknown = true;
+    }
+    // Positive evidence wins even if a different process or store is unreadable.
+    return active.size > 0 ? [...active].sort() : unknown ? 'unknown' : [];
+  } catch {
+    return 'unknown';
+  }
+}
+
+export interface PreLaunchGateInput {
+  goalId: string;
+  budget?: BudgetDecision | 'unknown';
+  forceLaunch?: boolean;
+}
+
+export interface PreLaunchGateDeps extends ActiveRunsForGoalDeps {
+  activeRuns?: (goalId: string) => ActiveRunsForGoal;
+}
+
+export interface PreLaunchGateDecision {
+  action: 'proceed' | 'blocked-duplicate' | 'blocked-budget' | 'wait-reset';
+  sameGoalActiveRuns: ActiveRunsForGoal;
+  budget: BudgetDecision | 'unknown';
+  reason: string;
+}
+
+/** Force bypasses only a duplicate observation, never an exhausted budget. */
+export function preLaunchGate(input: PreLaunchGateInput, deps: PreLaunchGateDeps = {}): PreLaunchGateDecision {
+  const decision = decidePreLaunch(input, deps);
+  debug.log('execution-loop.launch-gate', 'decision', { goalId: input.goalId, action: decision.action, sameGoalActiveRuns: decision.sameGoalActiveRuns, budget: decision.budget === 'unknown' ? 'unknown' : decision.budget.action, forceLaunch: input.forceLaunch === true, reason: decision.reason });
+  return decision;
+}
+
+function decidePreLaunch(input: PreLaunchGateInput, deps: PreLaunchGateDeps): PreLaunchGateDecision {
+  const sameGoalActiveRuns = (deps.activeRuns ?? ((goalId) => activeRunsForGoal(goalId, deps)))(input.goalId);
+  const budget = input.budget ?? 'unknown';
+  if (budget !== 'unknown' && (budget.action === 'stop' || budget.action === 'wait-reset')) {
+    return { action: budget.action === 'stop' ? 'blocked-budget' : 'wait-reset', sameGoalActiveRuns, budget, reason: budget.reasons.join(' · ') || `budget: ${budget.action}` };
+  }
+  if (sameGoalActiveRuns !== 'unknown' && sameGoalActiveRuns.length > 0 && !input.forceLaunch) {
+    return { action: 'blocked-duplicate', sameGoalActiveRuns, budget, reason: `same-goal active runs: ${sameGoalActiveRuns.join(', ')}` };
+  }
+  return { action: 'proceed', sameGoalActiveRuns, budget, reason: sameGoalActiveRuns === 'unknown' ? 'active runs unknown' : input.forceLaunch && sameGoalActiveRuns.length > 0 ? 'duplicate overridden by force-launch' : 'no confirmed duplicate' };
+}

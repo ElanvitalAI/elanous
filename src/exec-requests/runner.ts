@@ -9,6 +9,12 @@ import { installedGraphs, planExecRequest, type ExecPlanItem, type InstalledGrap
 import { ExecRequestStore, type ExecAttachment, type ExecRequest, type ExecResult, type ExecSeat } from './store.js';
 import { answerAsSeat } from '../intake-plane/seat-answer.js';
 import { redactSecrets } from '../task-cards/card-store.js';
+import { recordOutput } from '../outputs/ledger.js';
+import type { OutputKind } from './default-outputs.js';
+
+function recordResult(result: ExecResult, id: string, root: string, kind: OutputKind | 'file'): void {
+  recordOutput({ source: 'exec', sourceId: id, seat: result.seat, title: result.title, url: result.url, kind }, root);
+}
 
 export interface ExecRunnerDeps {
   store?: ExecRequestStore;
@@ -137,14 +143,19 @@ function syncRun(item: ExecRequest, seat: ExecSeat, state: GraphRunState, root: 
     for (const entry of entries) {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
       const result = resultOf(entry as Record<string, unknown>, seat, item.id, root);
-      if (result && !item.results.some(existing => existing.seat === result.seat && existing.url === result.url)) item.results.push(result);
+      if (result && !item.results.some(existing => existing.seat === result.seat && existing.url === result.url)) {
+        item.results.push(result);
+        recordResult(result, item.id, root, seat.output ?? 'file');
+      }
     }
   }
   if (seat.status === 'done' && !item.results.some(existing => existing.seat === seat.seat)) {
     const file = textResultFile(seat, state, root);
     const result = file ? resultOf({ file, title: seat.title }, seat, item.id, root) : null;
-    if (result) item.results.push(result);
-    else {
+    if (result) {
+      item.results.push(result);
+      recordResult(result, item.id, root, seat.output ?? 'file');
+    } else {
       const keys = [...new Set((state.nodes ?? []).flatMap(node => Object.keys(lastJsonObject(node.output) ?? {})))];
       debug.log('exec.result', 'none', { seat: seat.seat, graphId: seat.graphId, keys });
     }
@@ -288,7 +299,7 @@ export class ExecRequestRunner {
             reason: plan.reason ?? `${plan.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` });
           continue;
         }
-        const seat: ExecSeat = { seat: plan.seat, title: plan.title, status: 'done', graphId: 'seat-answer', runId: randomUUID() };
+        const seat: ExecSeat = { seat: plan.seat, title: plan.title, status: 'done', graphId: 'seat-answer', runId: randomUUID(), ...(plan.output ? { output: plan.output } : {}) };
         const dir = join(this.root, 'graph-runs', seat.graphId);
         const statePath = join(dir, `${seat.runId}.json`);
         const artifactDir = join(dir, `${seat.runId}.json.artifacts`);
@@ -299,7 +310,10 @@ export class ExecRequestRunner {
         writeFileSync(statePath, JSON.stringify(state), { mode: 0o600 });
         item.seats.push(seat);
         const result = resultOf({ file, title: answered.title }, seat, id, this.root);
-        if (result) item.results.push(result);
+        if (result) {
+          item.results.push(result);
+          recordResult(result, item.id, this.root, seat.output ?? 'file');
+        }
       }
       item.status = 'running';
       aggregate(item);
@@ -307,7 +321,7 @@ export class ExecRequestRunner {
       return;
     }
     item.seats = plans.map(plan => ({ seat: plan.seat, title: plan.title, status: plan.reason || !byId.has(plan.graphId) ? 'failed' : 'waiting', graphId: plan.graphId,
-      runId: plan.reason || !byId.has(plan.graphId) ? '' : randomUUID(), inputs: plan.inputs, ...(plan.after?.length ? { after: plan.after } : {}),
+      runId: plan.reason || !byId.has(plan.graphId) ? '' : randomUUID(), inputs: plan.inputs, ...(plan.output ? { output: plan.output } : {}), ...(plan.after?.length ? { after: plan.after } : {}),
       ...(plan.reason || !byId.has(plan.graphId) ? { reason: plan.reason ?? `${plan.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` } : {}) }));
     item.status = 'running';
     debug.log('exec-requests', 'planned', { id, seats: item.seats.map(seat => ({ seat: seat.seat, graphId: seat.graphId, status: seat.status })) });

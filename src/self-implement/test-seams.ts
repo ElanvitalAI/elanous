@@ -32,6 +32,7 @@ export function seams(over: Partial<SelfImplementSeams> & { gateResults?: boolea
     defaultBranchRef: () => 'origin/main',
     mergeMain: async () => ({ status: 'up-to-date' }),
     openPr: async ({ head }) => ({ url: `https://pr/${head}`, number: 7 }),
+    readPrFiles: async () => ['src/ordinary.ts'],
     readPrDiff: async () => '',
     readPrCommitShas: async () => ({ baseCommit: 'base-sha', headCommit: 'checked-head-sha' }),
     approvePr: async () => true,

@@ -1,8 +1,10 @@
 import { execFileSync } from 'node:child_process';
+import { dlopen, FFIType } from 'bun:ffi';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { constants as osConstants } from 'node:os';
-import { resolve } from 'node:path';
+import { resolve, sep } from 'node:path';
+import { findGitDir } from '../git-fs/locate.js';
 import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
 import { loadSelfDevRun } from '../self-dev/run-store.js';
 import { normalizeRunId } from './harness-space.js';
@@ -20,8 +22,10 @@ import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import { runDraftSweep, type DraftSweepAdapters, type DraftSweepResult, type SweepDraft, type SweepMergedPr } from '../self-dev/draft-sweep.js';
 import { debug } from '../debug/log.js';
 import { dispatchTask, type DispatchTaskInput, type DispatchTaskDeps } from '../execution-loop/dispatch-task.js';
+import { launchRequestId, preLaunchGate, type PreLaunchGateDeps } from '../execution-loop/launch-gate.js';
 import { PR_LABELS } from '../github/pr-labels.js';
-import { decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
+import { CODEX_PROVIDER, GROK_PROVIDER, decideBudget, readBudgetInputsLive, type BudgetDecision, type BudgetInputs } from '../self-implement/budget-gate.js';
+import { DEFAULT_FALLBACK_CHAIN } from '../oauth/fallback-chain.js';
 import { installDeliverableVerifyCliCommand, type InstallDeliverableVerifyCliDeps } from './deliverable-verify-cli.js';
 import { getUserConfig } from '../user-config.js';
 import { installHarnessCliSinkHook } from './harness-cli-sink.js';
@@ -92,6 +96,7 @@ export interface HarnessAskSayOptions {
   target?: string;
   yes?: boolean;
   forcePreflight?: boolean;
+  forceGate?: boolean;
   autoMerge?: boolean;
   mergeByHost?: boolean;
   observeOnly?: boolean;
@@ -249,12 +254,14 @@ function registerHarnessAskSayOptions(command: Command): Command {
     .option('--correlation <id>', '요청과 런을 잇는 불투명 correlation 값')
     .addOption(new Option('--goal-type <type>', `골 종류 (${GOAL_TYPES.join('|')})`).choices([...GOAL_TYPES]))
     .option('--force-preflight', '전제 검사 막힘을 명시 요청으로 우회(관측에 남음)')
+    .option('--force-gate', '같은 골 실행 중 막힘을 명시 요청으로 우회(관측에 남음; 예산 막힘은 우회 불가)')
     .option('--child-llm-provider <id>', 'self: 구현 자식 LLM provider(--child-llm-model과 함께)')
     .option('--child-llm-model <id>', 'self: 구현 자식 LLM model(--child-llm-provider와 함께)')
     .option('--child-llm-effort <level>', 'self: 구현 자식 추론 노력 minimal|low|medium|high|xhigh|max — 모델 상한을 넘으면 «거부»한다(--child-llm-provider와 함께)')
     .addOption(new Option('--substrate <kind>', '실행 칸 — local(설정 없을 때 기본 · 이 기계) | pod(k8s Pod · 같은 그래프가 원격에서 돈다)').choices(['local', 'pod']))
     .option('--pod-pool <spec>', 'pod: 풀 — 인자 > ELANOUS_POD_POOL > harness.podPool > 기존 pod.pool > 현재 컨텍스트')
-    .addOption(new Option('--pod-memory <tier>', 'pod: 메모리 등급 — standard(16Gi) | high(32Gi) · 없으면 골 문면 `Pod 메모리: high` 줄 · 그것도 없으면 골이 apps/pwa/ 를 담을 때 high').choices(['standard', 'high']))
+    .addOption(new Option('--pod-memory <tier>', 'pod: 메모리 등급 — lite(2Gi · 문서·조사·네트워크 스킬 골 · OOM 이면 high 로 한 번 재시도) | standard(16Gi) | high(32Gi) · 없으면 골 문면 `Pod 메모리: <등급>` 한 줄 · 그것도 없으면 골이 apps/pwa/ 를 담을 때 high').choices(['lite', 'standard', 'high']))
+    .option('--after <goal-or-pr>', 'pod: 선행 — 이 골 ID(16자) 또는 PR(#N) 이 병합될 때까지 Pod 발사가 큐에서 이유와 함께 기다린다(병합 없이 닫히면 blocked) · 골 문면 `선행: #N` 한 줄과 같다 · 대상 파일만 겹치면 선행이 아니다(경고만)')
     .option('--source <spec>', 'pod: 원천 — commit:<40자 sha> | pr:<정수> | worktree:<경로> | files:<경로>[,<경로>…] · `--substrate pod` 와 함께');
 }
 
@@ -320,7 +327,7 @@ function assertHarnessChildLlmModel(opts: HarnessAskSayChildLlmOptions): void {
 }
 
 /** Shared post-parse gate: validate child model before any ask/say early return (including `--dry-run`). */
-type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string };
+type HarnessSubstrateOpts = { substrate?: 'local' | 'pod'; podPool?: string; podMemory?: string; after?: string; autoMerge?: boolean; base?: string; json?: boolean; target?: string; source?: string };
 function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubstrate {
   const resolved = resolveHarnessSubstrate({ flag: opts, config: getUserConfig(), env: process.env });
   debug.log('harness.substrate', 'resolved', resolved);
@@ -525,6 +532,11 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
     process.exitCode = 2;
     return;
   }
+  if (o.after !== undefined && !/^(?:#?[1-9]\d*|[a-f0-9]{16})$/.test(o.after.trim())) {
+    console.error(`--after 는 PR 번호(#N) 또는 골 ID(16자 16진수)여야 한다: ${o.after}`);
+    process.exitCode = 2;
+    return;
+  }
   warnRecentIncidentBurst();
   let dispatchRecorded = false;
   try {
@@ -544,7 +556,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
   let output = '';
   let runId: string | undefined;
-  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) },
+  const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.after ? { after: o.after } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) },
     { onOutput: (text) => {
       runId ??= harnessPodRunId(output + text);
       output = (output + text).slice(-16_000);
@@ -557,6 +569,52 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   }
 }
 
+const LAUNCH_BUDGET_PROVIDER: Readonly<Record<string, string>> = { 'codex-rotate': CODEX_PROVIDER, grok: GROK_PROVIDER };
+
+/**
+ * L6 발사 관문의 예산 입력 보정 — 발사 우주의 config 에 체인이 없으면(작업 트리 = 시험 우주) 막지 않고
+ * 코드 기본 체인으로 판단한다. `--child-llm-provider` 를 명시했으면 그것이 체인이다(예산 판정 밖 provider 는 통과).
+ */
+export function harnessLaunchBudgetDecision(
+  inputs: BudgetInputs,
+  opts: { readonly childLlmProvider?: string; readonly childLlmModel?: string } = {},
+): { readonly decision: BudgetDecision; readonly warning?: string } {
+  const explicit = opts.childLlmProvider?.trim();
+  if (explicit) {
+    if (explicit !== CODEX_PROVIDER && explicit !== GROK_PROVIDER) {
+      return {
+        decision: { action: 'proceed', provider: explicit, ...(opts.childLlmModel ? { model: opts.childLlmModel } : {}), reasons: [`${explicit}: 명시 provider — 예산 판정 밖`] },
+        warning: `budget: ${explicit} is outside the budget gate — launched as requested`,
+      };
+    }
+    const chain = [{ provider: explicit, ...(opts.childLlmModel ? { model: opts.childLlmModel } : {}) }];
+    return { decision: decideBudget({ ...inputs, preference: { ...inputs.preference, chain } }) };
+  }
+  if (inputs.preference.chain.length > 0) return { decision: decideBudget(inputs) };
+  const chain = DEFAULT_FALLBACK_CHAIN.map((step) => ({ provider: LAUNCH_BUDGET_PROVIDER[step] ?? step }));
+  return {
+    decision: decideBudget({ ...inputs, preference: { ...inputs.preference, chain } }),
+    warning: `budget: no chain in this universe's config — judged with the code default ${DEFAULT_FALLBACK_CHAIN.join(',')}`,
+  };
+}
+
+async function readHarnessLaunchBudget(
+  opts: { readonly childLlmProvider?: string; readonly childLlmModel?: string } = {},
+): Promise<BudgetDecision | 'unknown'> {
+  try {
+    const { decision, warning } = harnessLaunchBudgetDecision(await readBudgetInputsLive(), opts);
+    if (warning) {
+      console.error(`⚠️ launch gate: ${warning}`);
+      try { debug.log('execution-loop.launch-gate', 'budget-chain-defaulted', { warning, action: decision.action, provider: decision.provider }); } catch { /* observation is fail-soft */ }
+    }
+    return decision;
+  }
+  catch (error) {
+    try { debug.log('execution-loop.launch-gate', 'budget-unavailable', { reason: String(error) }); } catch { /* observation is fail-soft */ }
+    return 'unknown';
+  }
+}
+
 async function dispatchHarnessAskSay(
   opts: HarnessAskSayChildLlmOptions & HarnessDryRunOpts,
   dryRunPreview: {
@@ -566,6 +624,7 @@ async function dispatchHarnessAskSay(
     readonly goalPath?: string;
   },
   dispatch: (resolved: ResolvedHarnessSubstrate) => Promise<void>,
+  gate: PreLaunchGateDeps & { readBudget?: () => Promise<BudgetDecision | 'unknown'> } = {},
 ): Promise<void> {
   await runInjectedHarnessHandler(async () => {
     assertHarnessChildLlmModel(opts);
@@ -574,6 +633,35 @@ async function dispatchHarnessAskSay(
       printHarnessLaunchDryRun(dryRunPreview);
       return;
     }
+    // Without a GoalId, match the request to a live run's exact verbatim original ask; still check budget.
+    let identity = dryRunPreview.input;
+    let goalId: string | null = null;
+    if (dryRunPreview.goalPath) {
+      try {
+        identity = readFileSync(dryRunPreview.goalPath, 'utf8');
+        goalId = parseGoalId(identity);
+      } catch { /* The launch handler owns file-read errors. */ }
+    }
+    goalId ??= launchRequestId(identity);
+    // Under bun test with no injected gate deps, skip the live reads (≈5 s of codex rotation + run scans) —
+    // CLI wiring tests time out on them. Gate tests inject deps and still run the gate (0.2.11 gate 10-03).
+    if (process.env.NODE_ENV === 'test' && Object.keys(gate).length === 0) {
+      try { debug.log('execution-loop.launch-gate', 'skipped-test-env', { goalId }); } catch { /* observation is fail-soft */ }
+      await dispatch(resolved);
+      return;
+    }
+    const budget = await (gate.readBudget ?? (() => readHarnessLaunchBudget(opts)))();
+    const decision = preLaunchGate({ goalId, budget, forceLaunch: opts.forceGate === true }, gate);
+    if (decision.action !== 'proceed') {
+      console.error(`❌ launch gate: ${decision.action} — ${decision.reason.split(/\r?\n/, 1)[0]}`);
+      process.exitCode = 3;
+      return;
+    }
+    const warnings = [
+      ...(decision.sameGoalActiveRuns === 'unknown' ? ['active runs unknown'] : []),
+      ...(decision.budget === 'unknown' ? ['budget unknown'] : decision.budget.action === 'next-provider' ? [decision.budget.reasons.join(' · ') || 'next-provider'] : []),
+    ];
+    if (warnings.length > 0) console.error(`⚠️ launch gate: ${warnings.join(' · ').split(/\r?\n/, 1)[0]}`);
     await dispatch(resolved);
   });
 }
@@ -707,6 +795,8 @@ export const HARNESS_PROCESS_LAST_ACTIVITY_SCOPE_LINE =
 
 export interface HarnessProcessLedgerEntry {
   readonly timestamp?: string;
+  readonly event?: string;
+  readonly data?: Record<string, unknown>;
 }
 
 export type HarnessProcessLedgerLookup = (
@@ -741,6 +831,9 @@ export interface HarnessProcessObservationDeps {
   listWorktrees?: () => HarnessWorktreeListObservation | readonly string[];
   observeLaunchdPids?: () => HarnessLaunchdPidObservation;
   lookupLedger?: HarnessProcessLedgerLookup;
+  openProcessHandle?: (pid: number) => HarnessProcessSignalHandle;
+  readStartTime?: (pid: number) => string;
+  repositoryRoot?: string;
   nowMs?: number;
   thresholds?: HarnessProcessClassificationThresholds;
   write?: (text: string) => void;
@@ -1714,6 +1807,140 @@ function installHarnessBudgetCommand(harnessCmd: Command): Command {
     });
 }
 
+export interface HarnessProcessSignalHandle {
+  signal(signal: NodeJS.Signals): void;
+  close(): void;
+}
+
+// macOS has no pidfd: bind to the process by its microsecond start time (libproc PROC_PIDTBSDINFO) and
+// re-read it immediately before signalling — a reused pid within the same microsecond is not distinguishable, anything else is.
+function readDarwinStartMicros(pid: number): bigint | null {
+  const libproc = dlopen('/usr/lib/libproc.dylib', {
+    proc_pidinfo: { args: [FFIType.i32, FFIType.i32, FFIType.u64, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+  });
+  try {
+    const buf = new Uint8Array(136); // sizeof(struct proc_bsdinfo)
+    const n = libproc.symbols.proc_pidinfo(pid, 3 /* PROC_PIDTBSDINFO */, 0n, buf, buf.length);
+    if (n !== buf.length) return null;
+    const view = new DataView(buf.buffer);
+    if (view.getUint32(12, true) !== pid) return null; // pbi_pid
+    return view.getBigUint64(120, true) * 1_000_000n + view.getBigUint64(128, true); // pbi_start_tvsec · pbi_start_tvusec
+  } finally { libproc.close(); }
+}
+
+function openDarwinProcessHandle(pid: number): HarnessProcessSignalHandle {
+  const start = readDarwinStartMicros(pid);
+  if (start === null) throw new Error('proc_pidinfo failed');
+  let closed = false;
+  return {
+    signal(signal) {
+      if (closed) throw new Error('process handle already closed');
+      if (signal !== 'SIGTERM') throw new Error('only SIGTERM is supported');
+      if (readDarwinStartMicros(pid) !== start) throw new Error('pid no longer names the same process');
+      process.kill(pid, 'SIGTERM');
+    },
+    close() { closed = true; },
+  };
+}
+
+export function openHarnessProcessHandle(pid: number): HarnessProcessSignalHandle {
+  if (process.platform === 'darwin') return openDarwinProcessHandle(pid);
+  if (process.platform !== 'linux' || !['x64', 'arm64'].includes(process.arch)) {
+    throw new Error('pid-bound signaling unavailable on this platform');
+  }
+  const libc = dlopen('libc.so.6', {
+    syscall: { args: [FFIType.i64, FFIType.i64, FFIType.i64, FFIType.i64, FFIType.i64], returns: FFIType.i64 },
+    close: { args: [FFIType.i32], returns: FFIType.i32 },
+  });
+  const fd = Number(libc.symbols.syscall(434, pid, 0, 0, 0)); // pidfd_open
+  if (fd < 0) {
+    libc.close();
+    throw new Error('pidfd_open failed');
+  }
+  let closed = false;
+  return {
+    signal(signal) {
+      if (closed) throw new Error('pidfd already closed');
+      if (signal !== 'SIGTERM' || libc.symbols.syscall(424, fd, osConstants.signals.SIGTERM, 0, 0) !== 0n) {
+        throw new Error('pidfd_send_signal failed');
+      }
+    },
+    close() {
+      if (closed) return;
+      closed = true;
+      libc.symbols.close(fd);
+      libc.close();
+    },
+  };
+}
+
+export function killHarnessProcess(
+  pid: number,
+  force: boolean,
+  deps: HarnessProcessObservationDeps = {},
+): { outcome: 'sent' | 'refused'; owned: boolean; runState: string; reason: string } {
+  const refuse = (reason: string, owned = false, runState = 'unknown') => ({ outcome: 'refused' as const, owned, runState, reason });
+  let result: ReturnType<typeof refuse> | { outcome: 'sent'; owned: true; runState: string; reason: string };
+  let handle: HarnessProcessSignalHandle | undefined;
+  let handleFailure: string | undefined;
+  if (Number.isSafeInteger(pid) && pid > 1) {
+    try { handle = (deps.openProcessHandle ?? openHarnessProcessHandle)(pid); }
+    catch (error) { handleFailure = observationFailureReason(error); }
+  }
+  try {
+    const root = deps.repositoryRoot ?? findGitDir(process.cwd())?.root;
+  const listed = normalizeProcessListObservation(deps.listProcesses?.() ?? defaultListHarnessProcesses());
+  const row = listed.status === 'ok' ? listed.records.find((record) => record.pid === pid) : undefined;
+  const prefix = root ? `${resolve(root)}${sep}` : '';
+  const entry = prefix ? `${prefix}bin/elanous.mjs` : '';
+  const argv = row?.command ?? '';
+  const entryIndex = entry && [
+    `bun ${entry} `, `${process.execPath} ${entry} `,
+    `bun bin/elanous.mjs `,
+  ].find((start) => argv.startsWith(start));
+  const fromRepo = Boolean(entryIndex && (entryIndex !== 'bun bin/elanous.mjs ' || row?.cwd && resolve(row.cwd) === resolve(root!)));
+  if (!Number.isSafeInteger(pid) || pid <= 1) result = refuse('invalid pid');
+  else if (listed.status !== 'ok') result = refuse('process observation incomplete');
+  else if (!row) result = refuse('pid not found in harness process population');
+  else if (!fromRepo || !/\belanous\.mjs\s+(?:(?:--test|--config-dir\s+\S+)\s+)?(?:self\s+(?:orchestrate|implement)|harness\s+(?:ask|say))\b/.test(row.command)) result = refuse('not a harness process from this repository');
+  else if (!handle) result = refuse(`pid-bound signaling unavailable: ${handleFailure ?? 'unknown failure'}`);
+  else {
+    let startTime: string | undefined;
+    try {
+      startTime = (deps.readStartTime ?? ((target) => execFileSync('ps', ['-p', String(target), '-o', 'lstart='], { encoding: 'utf8', timeout: 2_000 }).trim()))(pid);
+    } catch { /* unavailable is not a timestamp */ }
+    if (!startTime || !Number.isFinite(Date.parse(startTime))) result = refuse('process start time unreadable');
+    else {
+      const ownership = row.ownership ?? readProcessOwnership(pid);
+      const runId = ownership.status === 'observed' ? ownership.runId : undefined;
+      if (!runId) result = refuse('owning run unconfirmed');
+      else {
+        let ledger: readonly HarnessProcessLedgerEntry[] | null = null;
+        try { ledger = (deps.lookupLedger ?? defaultLookupHarnessProcessLedger)(runId, ownership.status === 'observed' ? ownership.stateDir : undefined); }
+        catch { /* fail closed */ }
+        const last = [...(ledger ?? [])].reverse().find((entry) => entry.event === 'run-status');
+        const runState = typeof last?.data?.runStatus === 'string' ? last.data.runStatus : 'unknown';
+        if (!ledger || !last) result = refuse('owning run ledger unavailable', true, runState);
+        else if (!['running', 'completed', 'failed', 'cancelled', 'abandoned'].includes(runState)) result = refuse('owning run status unconfirmed', true, runState);
+        else if (runState === 'running' && !force) result = refuse('owning run is not terminal (use --force)', true, runState);
+        else {
+          try {
+            const currentStart = (deps.readStartTime ?? ((target) => execFileSync('ps', ['-p', String(target), '-o', 'lstart='], { encoding: 'utf8', timeout: 2_000 }).trim()))(pid);
+            if (currentStart !== startTime) result = refuse('pid start time changed', true, runState);
+            else {
+              handle.signal('SIGTERM');
+              result = { outcome: 'sent', owned: true, runState, reason: 'SIGTERM sent' };
+            }
+          } catch (error) { result = refuse(`SIGTERM failed: ${observationFailureReason(error)}`, true, runState); }
+        }
+      }
+    }
+  }
+  debug.log('harness.processes', 'kill', { pid, ...result });
+  return result;
+  } finally { handle?.close(); }
+}
+
 function installHarnessProcessObservationCommand(
   harnessCmd: Command,
   deps: HarnessProcessObservationDeps = {},
@@ -1721,8 +1948,18 @@ function installHarnessProcessObservationCommand(
   const write = deps.write ?? ((text: string) => { console.log(text); });
   return harnessCmd
     .command('processes')
-    .description('이 저장소가 띄운 OS 프로세스를 읽기 전용으로 분류한다. 자원을 먹는 무리와 오래 떠 있는 무리를 가른다. 죽이지 않는다.')
-    .action(() => {
+    .description('기본 읽기 전용 분류. --kill <pid> 는 소유 런 확인 후 단일 PID 에만 SIGTERM 한다.')
+    .option('--kill <pid>', '소유 런을 확인한 뒤 지정한 PID 하나만 SIGTERM')
+    .option('--force', '소유 런이 진행 중이어도 지정한 PID 하나를 종료')
+    .action((opts: { kill?: string; force?: boolean }) => {
+      if (opts.kill !== undefined) {
+        const pid = Number(opts.kill);
+        const result = killHarnessProcess(pid, opts.force === true, deps);
+        write(`pid=${opts.kill} ${result.outcome}: ${result.reason}`);
+        if (result.outcome === 'refused') process.exitCode = 1;
+        return;
+      }
+      if (opts.force) { write('--force requires --kill <pid>'); process.exitCode = 2; return; }
       const records = deps.listProcesses?.() ?? defaultListHarnessProcesses();
       const worktrees = deps.listWorktrees?.() ?? defaultListHarnessWorktreePaths();
       const launchd = deps.observeLaunchdPids?.() ?? observeHarnessLaunchdPids();
@@ -1749,6 +1986,7 @@ export interface HarnessCliCommandDeps {
   say?: HarnessSayHandler;
   /** Observe-only Pod host dispatch seam. */
   podDispatchTask?: (input: DispatchTaskInput, deps?: DispatchTaskDeps) => ReturnType<typeof dispatchTask>;
+  launchGate?: PreLaunchGateDeps & { readBudget?: () => Promise<BudgetDecision | 'unknown'> };
   plan?: HarnessPlanHandler;
   /** ⭐ `plan` 주입이 «없을 때» 가는 기본 분기. 시험이 이 자리로 «CLI 의 기본 배선»을 문다
    *  (⛔ 주입된 `plan` 이 파일을 스스로 만들면 그 시험은 배선을 «못 답한다» — 무인 리뷰 GOODHART 지적). */
@@ -1819,6 +2057,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             }
             return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-ask', goalPath, resolved.pool!, deps.podDispatchTask) : ask(goalPath, normalizeHarnessAskSayOptions(opts));
           },
+          deps.launchGate,
         );
       });
   }
@@ -1843,6 +2082,7 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
             }
             return resolved.substrate === 'pod' ? onPod(opts, 'cli-harness-say', sentence.join(' '), resolved.pool!, deps.podDispatchTask) : say(sentence, normalizeHarnessAskSayOptions(opts));
           },
+          deps.launchGate,
         );
       });
   }

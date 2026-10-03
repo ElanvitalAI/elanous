@@ -20,10 +20,10 @@ describe('M1-5 · askVoiceAI · smart defaults (recommended)', () => {
 });
 
 describe('M1-5 · askVoiceAI · preset (Phase 2 placeholder)', () => {
-  test('mode=2 → persona=power tag · phase 2 notice printed', async () => {
+  test('mode=2 → profile=power tag · phase 2 notice printed', async () => {
     const io = scriptedIO(['2']);
     const answer = await askVoiceAI(io);
-    expect(answer.modelTier).toEqual({ persona: 'power' });
+    expect(answer.modelTier).toEqual({ profile: 'power' });
     expect(answer.budget).toBeUndefined();
     const log = io.outputs.join('\n');
     expect(log).toContain('Preset catalog ships in Phase 2');
@@ -36,7 +36,7 @@ describe('M1-5 · askVoiceAI · customize per surface', () => {
     const io = scriptedIO(['3', '4', '']);
     const answer = await askVoiceAI(io);
     expect(answer.modelTier).toEqual({
-      persona: 'custom',
+      profile: 'custom',
       voice: { stt: 'best' },
     });
     expect(answer.budget).toBeUndefined();
@@ -49,7 +49,7 @@ describe('M1-5 · askVoiceAI · customize per surface', () => {
     const io = scriptedIO(['3', '5', '25']);
     const answer = await askVoiceAI(io);
     expect(answer.modelTier?.voice?.stt).toBe('loaded');
-    expect(answer.modelTier?.persona).toBe('custom');
+    expect(answer.modelTier?.profile).toBe('custom');
     expect(answer.budget).toEqual({ monthlyUsdCap: 25 });
   });
 

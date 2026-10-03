@@ -264,6 +264,8 @@ export interface Mission {
 
   /** Optional bind to an existing goal (S2 auto-research / PFC). */
   goalSlug?: string;
+  /** Project association; absent on legacy and unassigned missions. */
+  projectId?: string;
 
   /** Free-form notes (append-only). */
   notes: readonly string[];
@@ -296,6 +298,7 @@ export interface MissionInit {
   priority?: MissionPriority;
   taskIds?: readonly string[];
   goalSlug?: string;
+  projectId?: string;
   notes?: readonly string[];
   /** Cascade-zyu Z0 — see {@link Mission.showroomSessionId}. */
   showroomSessionId?: string;
@@ -370,6 +373,7 @@ export function createMission(
     priority: init.priority,
     taskIds: Object.freeze([...(init.taskIds ?? [])]),
     goalSlug: init.goalSlug,
+    ...(init.projectId !== undefined ? { projectId: init.projectId } : {}),
     notes: Object.freeze([...(init.notes ?? [])]),
     showroomSessionId: init.showroomSessionId,
     autopilot: init.autopilot ? { ...init.autopilot } : undefined,
@@ -471,6 +475,7 @@ export function serializeMission(m: Mission): Record<string, unknown> {
     priority: m.priority,
     taskIds: [...m.taskIds],
     goalSlug: m.goalSlug,
+    ...(m.projectId !== undefined ? { projectId: m.projectId } : {}),
     notes: [...m.notes],
     showroomSessionId: m.showroomSessionId,
   };

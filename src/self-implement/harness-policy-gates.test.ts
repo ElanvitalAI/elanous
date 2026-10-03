@@ -26,7 +26,7 @@ test('actual isolation gate rejects an alias hardcode in changed src/x.ts and ac
   expect(bad.failures[0]?.lines.join('\n')).toContain('src/x.ts');
 
   writeFileSync(join(cwd, 'src/x.ts'), "import { elanousStateRoot } from './state-paths.js';\nexport function storage() { return join(elanousStateRoot(), 'storage'); }\n");
-  expect(runHarnessPolicyGates({ cwd, changedFiles: ['src/x.ts'], gates: { 'daemon-port-gate': () => 0 } })).toEqual({ passed: true, failures: [] });
+  expect(runHarnessPolicyGates({ cwd, changedFiles: ['src/x.ts'], gates: { 'daemon-port-gate': () => 0, 'public-export-leak': () => 0 } })).toEqual({ passed: true, failures: [] });
 });
 
 test('without scripts, no source gate is invoked', () => {
@@ -52,8 +52,9 @@ test('passes the same changed-files argv and cwd to all three runners; collects 
     'mock-module-restore-gate': run('mock-module-restore-gate', 1),
     'model-hardcode-gate': run('model-hardcode-gate', 1),
     'daemon-port-gate': run('daemon-port-gate', 0),
+    'public-export-leak': run('public-export-leak', 0),
   } });
-  expect(received).toEqual(Array.from({ length: 4 }, () => ({ cwd, args: ['--changed-files', 'src/x.ts', 'scripts/y.ts'] })));
+  expect(received).toEqual(Array.from({ length: 5 }, () => ({ cwd, args: ['--changed-files', 'src/x.ts', 'scripts/y.ts'] })));
   expect(result).toMatchObject({ passed: false, failures: [
     { gate: 'mock-module-restore-gate', lines: [expect.stringContaining('src/x.ts'), expect.stringContaining('violation detected')] },
     { gate: 'model-hardcode-gate', lines: [expect.stringContaining('src/x.ts'), expect.stringContaining('violation detected')] },
@@ -67,6 +68,7 @@ test('injected daemon-port-gate failure is named; a passing one leaves the other
     'mock-module-restore-gate': () => 0,
     'model-hardcode-gate': () => 0,
     'daemon-port-gate': (out) => { out.error('src/zz-probe.ts:1'); return 1; },
+    'public-export-leak': () => 0,
   } });
   expect(failing.passed).toBe(false);
   expect(failing.failures.map((failure) => failure.gate)).toEqual(['daemon-port-gate']);
@@ -77,6 +79,7 @@ test('injected daemon-port-gate failure is named; a passing one leaves the other
     'mock-module-restore-gate': (out) => { out.error('mock-module-restore-gate: src/x.ts'); return 1; },
     'model-hardcode-gate': () => 0,
     'daemon-port-gate': () => 0,
+    'public-export-leak': () => 0,
   } });
   expect(passing).toMatchObject({ passed: false, failures: [
     { gate: 'mock-module-restore-gate', lines: [expect.stringContaining('src/x.ts'), expect.stringContaining('violation detected')] },
@@ -90,6 +93,7 @@ test('runner exception is a named measurement failure, not a pass', () => {
     'mock-module-restore-gate': () => 0,
     'model-hardcode-gate': () => 0,
     'daemon-port-gate': () => 0,
+    'public-export-leak': () => 0,
   } });
   expect(result).toEqual({ passed: false, failures: [{ gate: 'isolation-gate', lines: [expect.stringContaining('scan unavailable')] }] });
 });
@@ -100,16 +104,16 @@ test('LEAK1: public-export-leak runs with the same changed files and its failure
   let seen: string[] = [];
   const result = runHarnessPolicyGates({ cwd, changedFiles: ['src/a.test.ts'], gates: {
     'isolation-gate': pass, 'mock-module-restore-gate': pass, 'model-hardcode-gate': pass, 'daemon-port-gate': pass,
-    'public-export-leak': (out) => { seen = out.args; out.error('   src/a.test.ts:3  ceo-mark'); return 1; },
+    'public-export-leak': (out) => { seen = out.args; out.error('   src/a.test.ts:3 · ceo-mark'); return 1; },
   } });
   expect(seen).toEqual(['--changed-files', 'src/a.test.ts']);
-  expect(result).toMatchObject({ passed: false, failures: [{ gate: 'public-export-leak', lines: [expect.stringContaining('src/a.test.ts:3  ceo-mark'), expect.stringContaining('violation detected')] }] });
+  expect(result).toMatchObject({ passed: false, failures: [{ gate: 'public-export-leak', lines: [expect.stringContaining('src/a.test.ts:3 · ceo-mark'), expect.stringContaining('violation detected')] }] });
 });
 
-test('LEAK1: the real public-export-leak gate does not fail a tree it cannot measure', () => {
+test('LEAK1: the real public-export-leak gate blocks a tree it cannot measure', () => {
   const cwd = fixture();
   const pass = () => 0;
   expect(runHarnessPolicyGates({ cwd, changedFiles: ['src/x.ts'], gates: {
     'isolation-gate': pass, 'mock-module-restore-gate': pass, 'model-hardcode-gate': pass, 'daemon-port-gate': pass,
-  } })).toEqual({ passed: true, failures: [] });
+  } })).toMatchObject({ passed: false, failures: [{ gate: 'public-export-leak', lines: [expect.stringContaining('못 쟀다 — 막는다'), expect.stringContaining('violation detected')] }] });
 });

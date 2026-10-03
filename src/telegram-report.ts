@@ -11,7 +11,7 @@
 // the report channel while interactive Q&A stays on the main bot.
 
 import { TelegramBot } from './telegram.js';
-import { isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './domains/telegram-kind-route.js';
+import { isTradingKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './domains/telegram-kind-route.js';
 export { DEFAULT_KIND_ROLES, roleForKind } from './domains/telegram-kind-route.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { UserConfig } from './user-config.js';
@@ -51,22 +51,27 @@ export interface ReportTarget {
   chatId: number;
 }
 
-/** Explicit role channels win. Without a role channel, operational kinds use the main bot's
- *  home when the legacy report channel uses another bot; same-bot reports and trading kinds
- *  keep the legacy report destination. Returns null when no safe target is configured. */
+/** An exact role channel wins. A configured channels table cannot silently fall through
+ *  to the legacy report bot or a channel with a different role. Without that table, only
+ *  named finance kinds can use the legacy trading report channel. */
 export function resolveReportTarget(cfg: UserConfig, kind?: string): ReportTarget | null {
-  const routed = kindRouteTarget(cfg, kind);
-  if (routed) return routed;
+  if (cfg.telegram.channels?.length) {
+    const routed = kindRouteTarget(cfg, kind);
+    if (routed) return routed;
+    logKindRouteFallback(kind, 'none', false);
+    return null;
+  }
   const rc = cfg.telegram.reportChannel;
   const mainToken = resolveChannelBotToken('telegram', cfg).token;
   const sameBot = !!mainToken && !!rc && (rc.botToken ?? mainToken) === mainToken;
-  if (isOperationalKind(kind) && !sameBot) {
+  if (!isTradingKind(kind)) {
     const home = mainHomeTarget(cfg);
     logKindRouteFallback(kind, home ? 'main-home' : 'none', sameBot);
     return home;
   }
-  const botToken = rc?.botToken ?? mainToken;
-  const target = rc && Number.isFinite(rc.chatId) && botToken ? { botToken, chatId: rc.chatId } : null;
+  const botToken = rc?.botToken;
+  const target = rc && Number.isFinite(rc.chatId) && botToken && botToken !== mainToken
+    ? { botToken, chatId: rc.chatId } : null;
   logKindRouteFallback(kind, target ? 'report-channel' : 'none', sameBot);
   return target;
 }
@@ -81,10 +86,9 @@ export interface SendReportOpts {
   kind?: string;
 }
 
-/** Send a report to the configured report channel. Returns false (a
- *  no-op, never throws) when no report channel is configured, so callers
- *  can fire-and-forget without gating on config. Throws only on an actual
- *  Telegram API failure once a target exists. */
+/** Send a report to its kind's exact-role channel (or the safe legacy target).
+ *  Returns false when no safe target exists; throws only on an actual
+ *  Telegram API failure after a target has been selected. */
 export async function sendTelegramReport(
   cfg: UserConfig,
   text: string,
@@ -110,9 +114,9 @@ export async function sendTelegramReport(
 export async function sendReportPhoto(
   cfg: UserConfig,
   photoUrl: string,
-  opts: { caption?: string; fetchImpl?: typeof fetch } = {},
+  opts: { caption?: string; fetchImpl?: typeof fetch; kind?: string } = {},
 ): Promise<boolean> {
-  const target = resolveReportTarget(cfg);
+  const target = resolveReportTarget(cfg, opts.kind);
   if (!target || !photoUrl) return false;
   const bot = new TelegramBot({
     token: target.botToken,
@@ -131,9 +135,9 @@ export async function sendReportPhoto(
 export async function sendReportPhotoBuffer(
   cfg: UserConfig,
   png: Buffer,
-  opts: { caption?: string; fetchImpl?: typeof fetch } = {},
+  opts: { caption?: string; fetchImpl?: typeof fetch; kind?: string } = {},
 ): Promise<boolean> {
-  const target = resolveReportTarget(cfg);
+  const target = resolveReportTarget(cfg, opts.kind);
   if (!target || !png) return false;
   const bot = new TelegramBot({
     token: target.botToken,

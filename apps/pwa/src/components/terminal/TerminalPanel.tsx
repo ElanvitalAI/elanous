@@ -9,8 +9,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { XtermView } from './XtermView';
-import { PtyLiveView } from './PtyLiveView';
+import { XtermViewLazy as XtermView } from './XtermView.lazy';
+import { PtyLiveViewLazy as PtyLiveView } from './PtyLiveView.lazy';
 import { PtyWall } from './PtyWall';
 import { wallFromSearch } from './pty-wall';
 import { TerminalTabs, type InitialTerminalState } from './TerminalTabs';

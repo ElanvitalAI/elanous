@@ -5,6 +5,8 @@ import ReactMarkdown from 'react-markdown';
 import { MARKDOWN_REMARK_PLUGINS } from '@/lib/markdown-render';
 import { extractElanousCards } from '@/lib/elanous-card';
 import { ElanousCard } from './ElanousCard';
+import { ContextSourcesCard } from './ContextSourcesCard';
+import { HarnessAskCard } from './HarnessAskCard';
 import { cn } from '@/lib/utils';
 import type { ChatBlock, ChatMessage as ChatMessageT } from '@/lib/chat-runtime';
 import { CollapsibleCodeBlock } from '@/components/agent/CollapsibleCodeBlock';
@@ -121,6 +123,9 @@ function BlocksBody({ blocks, showCards }: { blocks: ChatBlock[]; showCards: boo
   return (
     <div className="flex flex-col gap-2">
       {blocks.map((block, idx) => {
+        if (block.kind === 'harness_ask') {
+          return <HarnessAskCard key={`${block.acceptanceId}-${idx}`} acceptanceId={block.acceptanceId} />;
+        }
         if (block.kind === 'text') {
           return <CardTextBody key={idx} text={block.text} showCards={showCards} />;
         }
@@ -137,7 +142,12 @@ function BlocksBody({ blocks, showCards }: { blocks: ChatBlock[]; showCards: boo
           );
         }
         if (block.kind === 'tool_use') {
-          return <ToolPill key={`${block.id}-${idx}`} block={block} />;
+          return (
+            <div key={`${block.id}-${idx}`}>
+              <ToolPill block={block} />
+              <ContextSourcesCard sources={block.sources} />
+            </div>
+          );
         }
         if (block.kind === 'mcp_app') {
           return <McpAppBlock key={`${block.toolId}-${idx}`} block={block} />;
@@ -190,6 +200,8 @@ export function ChatMessageView({ message }: Props) {
     return (
       <div className="px-2 py-1 text-[11px] text-muted-foreground italic">
         <pre className="whitespace-pre-wrap font-mono text-[11px]">{message.text}</pre>
+        {message.blocks?.some((block) => block.kind === 'harness_ask') &&
+          <BlocksBody blocks={message.blocks} showCards={false} />}
       </div>
     );
   }

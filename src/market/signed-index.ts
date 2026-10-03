@@ -91,6 +91,10 @@ function invalidIndex(value: unknown): string | null {
   return null;
 }
 
+export function validateMarketplaceIndex(value: unknown): string | null {
+  return invalidIndex(value);
+}
+
 export function verifyIndex(input: {
   marketplaceBytes: Uint8Array;
   signatureText: string;

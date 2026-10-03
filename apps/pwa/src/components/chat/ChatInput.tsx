@@ -29,6 +29,21 @@ import { SeatPicker } from './SeatPicker';
 
 const INPUT_PERSIST_DEBOUNCE_MS = 300;
 const EMPTY_ATTACHMENTS: AttachmentMeta[] = [];
+const SEAT_ASK_CLIENT_KEY = 'elanous.seat-ask.client';
+let seatAskClientFallback: string | null = null;
+
+function seatAskClientIdForBrowser(): string {
+  let id: string | null = null;
+  try { id = window.sessionStorage.getItem(SEAT_ASK_CLIENT_KEY); } catch { /* cookie fallback */ }
+  try {
+    id ??= /(?:^|; )elanous\.seat-ask\.client=([a-f0-9-]{36})(?:;|$)/i.exec(document.cookie)?.[1] ?? null;
+  } catch { /* keep the in-memory identifier for remounts */ }
+  id ??= seatAskClientFallback ?? crypto.randomUUID();
+  seatAskClientFallback = id;
+  try { window.sessionStorage.setItem(SEAT_ASK_CLIENT_KEY, id); } catch { /* cookie fallback */ }
+  try { document.cookie = `${SEAT_ASK_CLIENT_KEY}=${id}; Path=/; SameSite=Lax; Max-Age=2592000`; } catch { /* remount still uses memory */ }
+  return id;
+}
 
 // PWA Phase 1·E+H (RESEARCH-ios-companion-tui-parity-2026-05-17 · Phase 1b)
 // — TUI src/chat/input-edit-key.ts:36-48 의 PWA 등가. localStorage 에
@@ -193,6 +208,40 @@ export function ChatInput({
   const [seats, setSeats] = useState<SeatSummary[]>([]);
   const [selectedSeat, setSelectedSeat] = useState<string | null>(null);
   const [seatReceipts, setSeatReceipts] = useState<SeatRequestReceipt[]>([]);
+  const [seatAskMessages, setSeatAskMessages] = useState<Array<{ id: string; text: string }>>([]);
+  const seatAskClientId = useRef<string | null>(null);
+  if (!seatAskClientId.current && typeof window !== 'undefined') seatAskClientId.current = seatAskClientIdForBrowser();
+  useEffect(() => {
+    if (typeof client?.listSeatAskAnswers !== 'function') return () => {};
+    let active = true;
+    if (!seatAskClientId.current) return () => { active = false; };
+    let fetching = false;
+    try {
+      const saved = JSON.parse(window.sessionStorage.getItem('elanous.seat-ask.messages') ?? '[]') as Array<{ id: string; text: string }>;
+      if (saved.length) setSeatAskMessages((previous) => [...previous.filter(({ id }) => !saved.some((item) => item.id === id)), ...saved]);
+    } catch { /* browsing without session storage still permits server polling */ }
+    const refresh = async () => {
+      if (fetching) return;
+      fetching = true;
+      try {
+        const { items } = await client.listSeatAskAnswers(seatAskClientId.current!);
+        if (!active || !items.length) return;
+        const incoming = items.map(({ id, text }) => ({ id, text }));
+        setSeatAskMessages((previous) => [...previous, ...incoming.filter(({ id }) => !previous.some((entry) => entry.id === id))]);
+        // Do not ACK unless the answer survives a remount; without storage, server polling retains it.
+        try {
+          const previous = JSON.parse(window.sessionStorage.getItem('elanous.seat-ask.messages') ?? '[]') as Array<{ id: string; text: string }>;
+          const next = [...previous, ...incoming.filter(({ id }) => !previous.some((entry) => entry.id === id))];
+          window.sessionStorage.setItem('elanous.seat-ask.messages', JSON.stringify(next));
+          if (active) await client.acknowledgeSeatAskAnswers(seatAskClientId.current!, items.map(({ id }) => id));
+        } catch { /* answer remains displayed and available on the server */ }
+      } catch { /* retry on the next poll */ }
+      finally { fetching = false; }
+    };
+    const timer = setInterval(refresh, 10_000);
+    refresh();
+    return () => { active = false; clearInterval(timer); };
+  }, [client]);
   const [seatError, setSeatError] = useState('');
   const [seatPending, setSeatPending] = useState(false);
   const retryRef = useRef<{ seat?: string; text: string; attachments: AttachmentMeta[]; key: string } | null>(null);
@@ -370,6 +419,13 @@ export function ChatInput({
     setSeatPending(true);
     setSeatError('');
     try {
+      if (/^\s*CTO\s*에게\s*물어봐\s*[:：]\s*\S/i.test(request.text)) {
+        const result = await client.submitSeatAsk(request.text, seatAskClientId.current!);
+        setSeatAskMessages((previous) => [...previous, { id: crypto.randomUUID(), text: result.reply }]);
+        setValue('');
+        clearSnapshot(persistKey);
+        return;
+      }
       const receipt = await client.submitSeatRequest({ seat: request.seat, text: request.text,
         ...(request.attachments.length ? { attachments: request.attachments } : {}),
       }, request.key);
@@ -403,9 +459,14 @@ export function ChatInput({
   };
   const submit = (): void => submitText(value);
   const submitText = (text: string): void => {
-    const trimmed = text.trim();
-    const addressed = /^@\S+\s+[\s\S]*\S$/.test(text.trimEnd());
     if (disabled || seatPending) return;
+    const trimmed = text.trim();
+    if (/^CTO\s*에게\s*물어봐\s*[:：]\s*\S/i.test(trimmed)) {
+      if (attachments.length) { setSeatError('질문에는 첨부를 넣을 수 없습니다'); return; }
+      void sendSeatRequest({ seat: 'TC', text: trimmed, attachments: [], key: crypto.randomUUID() });
+      return;
+    }
+    const addressed = /^@\S+\s+[\s\S]*\S$/.test(text.trimEnd());
     if ((addressed || selectedSeat) && attachments.length > 4) {
       setSeatError('자리 요청 첨부는 4개까지');
       return;
@@ -697,6 +758,7 @@ export function ChatInput({
       {seatReceipts.map((receipt) => <div key={receipt.receiptId} role="status" className="mb-2 rounded-md border border-border bg-card px-3 py-2 text-sm">
         📨 {seats.find((seat) => seat.id === receipt.seat)?.title ?? receipt.seat} 접수 {receipt.receiptId} · 방금 · 받음{receipt.attachments ? ` · 첨부 ${receipt.attachments}` : ''}{receipt.channel ? ` · 채널 ${receipt.channel}` : ''}
       </div>)}
+      {seatAskMessages.map((message) => <p key={message.id} role="status" className="mb-2 rounded-md border border-border px-3 py-2 text-sm">{message.text}</p>)}
       {seatError && <p role="alert" className="mb-2 text-sm text-destructive">{seatError}</p>}
       <SeatPicker seats={seats} selected={selectedSeat} onSelect={(seat) => { setSelectedSeat(seat); setSeatError(''); }} disabled={disabled || seatPending} />
       {/* PWA Phase 4·F — reverse history search overlay (priority 최상위). */}

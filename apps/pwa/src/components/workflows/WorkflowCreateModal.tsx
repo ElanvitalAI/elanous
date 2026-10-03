@@ -1,8 +1,9 @@
 // Surface-unification ROADMAP §F2 (2026-05-11) — "+ New" workflow
-// modal. 3 entry modes:
+// modal. Entry modes:
 //   - Template: card grid of starter templates (F1 catalog)
 //   - Blank: minimal manual-trigger scaffold
 //   - AI: hands off to the existing WorkflowNLPrompt (Synth flow)
+//   - File: import a local YAML draft
 //
 // Apply path: every mode returns YAML to the caller (parent loads it
 // into the editor draft via the existing `creatingNew` flow).
@@ -12,11 +13,12 @@
 
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
 import { FileText, Sparkles, FilePlus, X, Loader2 } from 'lucide-react';
 import type { WorkflowTemplateEntry, WorkflowTemplateList } from '@/nexus/client';
+import { checkImportFile } from './workflow-file';
 
 interface WorkflowCreateModalProps {
   /** Called with the YAML the user picked. Caller flips into
@@ -43,11 +45,35 @@ nodes:
     depends_on: [start]
 `;
 
-type Mode = 'template' | 'blank' | 'ai';
+type Mode = 'template' | 'blank' | 'ai' | 'file';
 
 export function WorkflowCreateModal({ onApply, onOpenAI, onClose }: WorkflowCreateModalProps) {
   const [mode, setMode] = useState<Mode>('template');
+  const [fileError, setFileError] = useState<string | null>(null);
+  const fileSelection = useRef(0);
   const client = useNexusClient();
+
+  useEffect(() => () => { fileSelection.current++; }, []);
+
+  const handleFile = async (file: File | undefined) => {
+    if (!file) return;
+    const selection = ++fileSelection.current;
+    setFileError(null);
+    try {
+      // Check size before reading, so oversized files never need to enter memory.
+      const sizeCheck = checkImportFile({ name: file.name, size: file.size, text: 'pending' });
+      if (!sizeCheck.ok) { setFileError(sizeCheck.reason); return; }
+      const text = await file.text();
+      if (selection !== fileSelection.current) return;
+      const result = checkImportFile({ name: file.name, size: file.size, text });
+      if (!result.ok) { setFileError(result.reason); return; }
+      onApply(result.yaml, result.suggestedName);
+      close();
+    } catch {
+      if (selection === fileSelection.current) setFileError('파일을 읽지 못했습니다. 다시 선택해 주세요.');
+    }
+  };
+  const close = () => { fileSelection.current++; onClose(); };
   const query = useQuery<WorkflowTemplateList>({
     queryKey: ['nexus', 'workflow-templates'],
     queryFn: () => client.getWorkflowTemplates(),
@@ -59,7 +85,7 @@ export function WorkflowCreateModal({ onApply, onOpenAI, onClose }: WorkflowCrea
       role="dialog"
       aria-modal="true"
       className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 backdrop-blur-sm px-3 py-3 sm:items-center"
-      onClick={onClose}
+      onClick={close}
     >
       <div
         className="flex max-h-[85vh] w-full max-w-3xl flex-col gap-2 rounded-t-2xl border border-border bg-surface-elevated shadow-xl sm:rounded-lg"
@@ -69,7 +95,7 @@ export function WorkflowCreateModal({ onApply, onOpenAI, onClose }: WorkflowCrea
           <h2 className="text-sm font-semibold">New workflow</h2>
           <button
             type="button"
-            onClick={onClose}
+            onClick={close}
             className="rounded p-1 text-text-tertiary hover:bg-surface"
             aria-label="Close"
           >
@@ -78,15 +104,19 @@ export function WorkflowCreateModal({ onApply, onOpenAI, onClose }: WorkflowCrea
         </header>
 
         <nav className="flex items-center gap-1 border-b border-border px-2">
-          <TabButton active={mode === 'template'} onClick={() => setMode('template')} icon={<FileText className="h-3 w-3" />}>
+          <TabButton active={mode === 'template'} onClick={() => { fileSelection.current++; setMode('template'); }} icon={<FileText className="h-3 w-3" />}>
             Template
           </TabButton>
-          <TabButton active={mode === 'blank'} onClick={() => setMode('blank')} icon={<FilePlus className="h-3 w-3" />}>
+          <TabButton active={mode === 'blank'} onClick={() => { fileSelection.current++; setMode('blank'); }} icon={<FilePlus className="h-3 w-3" />}>
             Blank
+          </TabButton>
+          <TabButton active={mode === 'file'} onClick={() => setMode('file')} icon={<FileText className="h-3 w-3" />}>
+            파일
           </TabButton>
           <TabButton
             active={mode === 'ai'}
             onClick={() => {
+              fileSelection.current++;
               setMode('ai');
               onOpenAI();
             }}
@@ -102,7 +132,7 @@ export function WorkflowCreateModal({ onApply, onOpenAI, onClose }: WorkflowCrea
               query={query}
               onPick={(t) => {
                 onApply(t.yaml, t.id);
-                onClose();
+                close();
               }}
             />
           )}
@@ -110,9 +140,22 @@ export function WorkflowCreateModal({ onApply, onOpenAI, onClose }: WorkflowCrea
             <BlankPanel
               onCreate={() => {
                 onApply(BLANK_YAML, 'my-workflow');
-                onClose();
+                close();
               }}
             />
+          )}
+          {mode === 'file' && (
+            <div className="flex flex-col gap-2 px-3 py-4">
+              <label htmlFor="workflow-import-file" className="text-[12px] text-text-secondary">YAML 파일 가져오기 (최대 256KB)</label>
+              <input
+                id="workflow-import-file"
+                type="file"
+                accept=".yaml,.yml"
+                onChange={(e) => void handleFile(e.currentTarget.files?.[0])}
+                className="max-w-full text-xs text-text-primary"
+              />
+              {fileError && <p role="alert" className="text-[11px] text-error">{fileError}</p>}
+            </div>
           )}
           {mode === 'ai' && (
             <div className="px-3 py-4 text-[12px] text-text-tertiary">

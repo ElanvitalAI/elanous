@@ -26,6 +26,8 @@ const MISSION_TOOL_SET_2026_07_17 = [
   'WebFetch', 'WebSearch', 'Grep', 'Glob', 'ListDir',
   // Active 자기인지(2026-07-17 추가).
   'self_recall', 'logs_query', 'ops_status', 'memory_recall',
+  // CTX2 #23185 — 맥락 한 문(READ-ONLY).
+  'context_now',
 ] as const;
 
 describe('mission tool-set 재현성 가드 (RFC P5)', () => {

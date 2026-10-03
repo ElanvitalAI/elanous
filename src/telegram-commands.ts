@@ -44,6 +44,9 @@ import { readDaemonSessionHistory } from './telegram/daemon-history-reader.js';
 import { renderTelegramReplayPreviewHtml } from './telegram/replay-preview.js';
 import { classifyIntake } from './ad-pipeline/intake.js';
 import { createAdPipelineDeps, runAdPipeline } from './ad-pipeline/run.js';
+import { projectCommand } from './telegram-project-command.js';
+import { telegramNowSlash } from './context-bus/context-now-surfaces.js';
+import type { ContextNowDeps } from './context-bus/context-now.js';
 
 /** How many prior user/assistant turns to pass into `executeSkill` as
  *  the `## Recent conversation` block. Mirrors the dashboard default
@@ -291,7 +294,7 @@ function dropChatSessionReply(ctx: TgIncoming): string {
 /** Build the default command set for a Telegram bot wired via
  *  botFromConfig. Returns the array rather than mutating globals so
  *  tests can construct a variant set with stubbed handlers. */
-export function defaultTelegramCommands(): TgSlashCommand[] {
+export function defaultTelegramCommands(nowDeps?: ContextNowDeps): TgSlashCommand[] {
   return [
     {
       name: 'help',
@@ -303,6 +306,11 @@ export function defaultTelegramCommands(): TgSlashCommand[] {
         }
         return lines.join('\n');
       },
+    },
+    {
+      name: 'now',
+      description: 'Show current release, decisions, seats and context: /now [topic]',
+      handler: async (args) => telegramNowSlash(args, nowDeps),
     },
     {
       name: 'status',
@@ -581,6 +589,7 @@ export function defaultTelegramCommands(): TgSlashCommand[] {
         return lines.join('\n');
       },
     },
+    projectCommand(),
     {
       name: 'fork',
       description: 'Fork the current chat session (or /fork <prefix>) and continue HERE on the fork · time-travel: /fork before:N',

@@ -26,10 +26,10 @@ afterEach(() => {
   setPtyAdapterForTesting(null);
 });
 
-function mockAdapter(writes: string[], onKill: () => void, onExit?: (emit: (event: { exitCode: number | null; signal?: number }) => void) => void) {
+function mockAdapter(writes: string[], onKill: () => void, onExit?: (emit: (event: { exitCode: number | null; signal?: number }) => void) => void, output?: string) {
   return {
     pid: 3, write: (s: string) => { writes.push(s); }, kill: onKill, resize: () => {},
-    onData: () => ({ dispose() {} }), onExit: (callback: (event: { exitCode: number | null; signal?: number }) => void) => {
+    onData: (callback: (data: string) => void) => { if (output) queueMicrotask(() => callback(output)); return { dispose() {} }; }, onExit: (callback: (event: { exitCode: number | null; signal?: number }) => void) => {
       onExit?.(callback);
       return { dispose() {} };
     },
@@ -49,14 +49,30 @@ describe('runPtyAttachDrive (existing PTY control-axis handler)', () => {
     const events: Array<{ event: string; data: Record<string, unknown> }> = [];
     const result = await runPtyAttachDrive('target', { goal: 'finish', maxSteps: 3, pollMs: 0, stream: async () => '{"action":"done","reason":"done"}', out: () => {} }, {
       listPty: () => [target], getPty: (id) => id === target.id ? target : undefined,
-      controlDepsForHandle: (h) => { received = h; return { observe: async () => '', input: async () => {} } as never; },
+      controlDepsForHandle: (h) => { received = h; return { observe: async () => '7 pass', inject: () => true, input: async () => {} } as never; },
       createBrain: () => ({}) as never,
       runControlLoop: async () => ({ termination: { kind: 'success' }, steps: 1 }) as never,
       log: (event, data) => { events.push({ event, data }); },
     });
     expect(result).toEqual({ exitCode: 0, message: 'pty auto: pty_target success' });
     expect(received).toBe(target);
-    expect(events).toEqual([{ event: 'attach-start', data: { id: 'pty_target', ref: 'target', goal: 'finish' } }, { event: 'attach-finish', data: { id: 'pty_target', termination: 'success', steps: 1 } }]);
+    expect(events).toEqual([{ event: 'attach-start', data: { id: 'pty_target', ref: 'target', goal: 'finish' } }, { event: 'attach-finish', data: { id: 'pty_target', termination: 'success', steps: 1 } },
+      { event: 'attach-verdict', data: { id: 'pty_target', kind: 'success', reason: 'final PTY screen has success evidence' } }]);
+  });
+
+  test.each([
+    ['bash: build-tool: command not found', 'done-but-failed'],
+    ['all set', 'success-unverified'],
+  ])('brain «done» with final screen %p is not a success (DRIVE-OK · 10-03 X1)', async (screen, kind) => {
+    const target = handle();
+    const result = await runPtyAttachDrive('target', { goal: 'finish', maxSteps: 3, pollMs: 0, out: () => {} }, {
+      listPty: () => [target], getPty: (id) => id === target.id ? target : undefined,
+      controlDepsForHandle: () => ({ observe: async () => screen, inject: () => true }) as never,
+      createBrain: () => ({}) as never,
+      runControlLoop: async () => ({ termination: { kind: 'success' }, steps: 1 }) as never,
+      log: () => {},
+    });
+    expect(result).toEqual({ exitCode: 1, message: `pty auto: pty_target ${kind}` });
   });
 
   test('falls back to an alive remote manifest PTY with the default human actor', async () => {
@@ -66,7 +82,7 @@ describe('runPtyAttachDrive (existing PTY control-axis handler)', () => {
       listPty: () => [], getPty: () => undefined,
       listPtyManifestRows: () => [{ id: 'pty_remote1', kind: 'pty', alive: true }] as never,
       controlDepsForHandle: () => ({}) as never,
-      controlDepsForRemoteRef: (id, opts) => { remoteCall = [id, opts]; return { observe: async () => '', inject: () => true, controlStance: () => 'owned', isAlive: () => true }; },
+      controlDepsForRemoteRef: (id, opts) => { remoteCall = [id, opts]; return { observe: async () => 'build successful', inject: () => true, controlStance: () => 'owned', isAlive: () => true }; },
       createBrain: () => ({}) as never,
       runControlLoop: async (_brain, deps) => { loopDeps = deps; return { termination: { kind: 'success' }, steps: 1 } as never; }, log: () => {},
     });
@@ -327,11 +343,22 @@ describe('runPtyDrive (elanous drive 핸들러)', () => {
     expect(attached).toEqual({ goal: 'finish', maxSteps: 9, pollMs: 3, model: 'brain' });
   });
 
+  test('X1 shape: brain says done but the final screen shows a failure → exit 1 (DRIVE-OK)', async () => {
+    const lines: string[] = [];
+    setPtyAdapterForTesting(() => mockAdapter([], () => {}, undefined, 'bash: openclaw: command not found\r\n'));
+    const r = await runPtyDrive({
+      command: 'bash', goal: 'install', stream: async () => '{"action":"done","reason":"설치 완료"}',
+      out: (s) => { lines.push(s); }, maxSteps: 2, pollMs: 0,
+    });
+    expect(r.exitCode).toBe(1);
+    expect(lines.join('')).toContain('verdict: done-but-failed');
+  });
+
   test('default shell path remains bash -c and cleans up', async () => {
     const writes: string[] = [];
     let killed = false;
     let spawned: { cmd?: string; args?: string[] } | undefined;
-    setPtyAdapterForTesting((opts) => { spawned = opts; return mockAdapter(writes, () => { killed = true; }); });
+    setPtyAdapterForTesting((opts) => { spawned = opts; return mockAdapter(writes, () => { killed = true; }, undefined, '7 pass\r\n'); });
     const script = ['{"action":"input","text":"777\\r"}', '{"action":"done","reason":"완료"}'];
     let i = 0;
     const r = await runPtyDrive({

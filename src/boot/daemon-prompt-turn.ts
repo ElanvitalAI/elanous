@@ -116,6 +116,8 @@ export async function runDaemonPromptTurn(opts: {
    *  `--tool-cwd` / `ELANOUS_TOOL_CWD` to keep `/v1/prompt` and ACP WS
    *  on the same path-guard boundary. */
   toolCwd?: string;
+  /** Per-turn project instructions; unlike the base system preamble these must survive subsequent turns. */
+  projectInstructions?: string;
   /** Phase 4 (WT-A-3b) — external abort signal. When provided and
    *  fired, the internal AbortController fans the abort through to
    *  `runCoreTurn` (LLM stream + tool dispatch). Callers without an
@@ -285,6 +287,9 @@ export async function runDaemonPromptTurn(opts: {
       );
   if (fast && !isFirstTurn) {
     messages.unshift({ role: 'system', content: fastPathGuidance });
+  }
+  if (!isFirstTurn && opts.projectInstructions) {
+    messages.unshift({ role: 'system', content: opts.projectInstructions });
   }
   const result = await runCoreTurn({
     sessionId: request.sessionId,

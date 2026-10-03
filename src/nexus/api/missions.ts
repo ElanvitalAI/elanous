@@ -20,6 +20,7 @@
  * Query params (list):
  *   status=<MissionStatus>   filter by status (active / planning / ...)
  *   goalSlug=<slug>          filter by goal binding
+ *   projectId=<id>          filter by project association
  *
  * Cross-ref:
  *   src/task-orchestrator/store.ts (listMissions · getMission ·
@@ -53,6 +54,7 @@ export interface MissionCardWire {
   status: MissionStatus;
   priority: Mission['priority'];
   goalSlug: string | null;
+  projectId?: string;
   taskCount: number;
   /** Counts so the PWA mission lane shows progress at a glance. */
   taskStatusCounts: Record<string, number>;
@@ -85,6 +87,7 @@ export function summarise(mission: Mission, tasks: readonly Task[]): MissionCard
     status: mission.status,
     priority: mission.priority,
     goalSlug: mission.goalSlug ?? null,
+    ...(mission.projectId !== undefined ? { projectId: mission.projectId } : {}),
     taskCount: tasks.length,
     taskStatusCounts,
     surfaceKindCounts,
@@ -103,9 +106,11 @@ export function handleMissionsList(
   const url = new URL(req.url);
   const statusParam = url.searchParams.get('status');
   const goalSlug = url.searchParams.get('goalSlug') ?? undefined;
-  const filter: { status?: MissionStatus; goalSlug?: string } = {};
+  const projectId = url.searchParams.get('projectId') ?? undefined;
+  const filter: { status?: MissionStatus; goalSlug?: string; projectId?: string } = {};
   if (statusParam && isMissionStatus(statusParam)) filter.status = statusParam;
   if (goalSlug) filter.goalSlug = goalSlug;
+  if (projectId !== undefined) filter.projectId = projectId;
 
   const store = new TaskStore();
   try {

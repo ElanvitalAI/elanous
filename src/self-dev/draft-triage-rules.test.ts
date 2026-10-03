@@ -23,13 +23,28 @@ describe('decideDraft', () => {
   });
   it('keeps recent ended runs and indeterminate runs', () => {
     expect(decideDraft({ ...base, ageHours: 3 })).toEqual({ action: 'keep', reason: 'recent' });
-    expect(decideDraft({ ...base, runStatus: undefined })).toEqual({ action: 'keep', reason: 'unobserved' });
+    expect(decideDraft({ ...base, runStatus: undefined, ageHours: 3 })).toEqual({ action: 'keep', reason: 'unobserved' });
     expect(decideDraft({ ...base, runStatus: 'unknown' })).toEqual({ action: 'close', reason: 'stale-ended-run' });
+  });
+  it('closes unobserved merged goal ids and exact titles before checking age', () => {
+    expect(decideDraft({ ...base, runStatus: undefined, ageHours: 3, mergedTwins: [
+      { number: 20, title: 'other', branch: 'self-impl/y-goalid-a1b2c3-new' },
+    ] })).toEqual({ action: 'close', reason: 'superseded-by #20' });
+    expect(decideDraft({ ...base, runStatus: undefined, ageHours: 3, mergedTwins: [
+      { number: 21, title: 'same goal', branch: 'other' },
+    ] })).toEqual({ action: 'close', reason: 'superseded-by #21' });
+  });
+  it('closes unobserved non-live drafts at the 24h idle boundary, not 3h', () => {
+    expect(decideDraft({ ...base, runStatus: undefined, ageHours: 25 })).toEqual({ action: 'close', reason: 'stale-unobserved' });
+    expect(decideDraft({ ...base, runStatus: undefined, ageHours: 24 })).toEqual({ action: 'close', reason: 'stale-unobserved' });
+    expect(decideDraft({ ...base, runStatus: undefined, ageHours: NaN })).toEqual({ action: 'keep', reason: 'unobserved' });
+    expect(decideDraft({ ...base, runStatus: undefined, ageHours: 3 })).toEqual({ action: 'keep', reason: 'unobserved' });
   });
   it('keeps human approval drafts even when stale or superseded', () => {
     expect(decideDraft({ ...base, draft: { ...base.draft, labels: ['elanous:idea-approval'] }, mergedTwins: [{ number: 2, title: 'same goal', branch: 'other' }] })).toEqual({ action: 'keep', reason: 'label:elanous:idea-approval' });
-    for (const label of ['elanous:keep']) {
-      expect(decideDraft({ ...base, draft: { ...base.draft, labels: [label] }, ageHours: 100 })).toEqual({ action: 'keep', reason: `label:${label}` });
+    for (const label of ['elanous:keep', 'elanous:release-hold', 'elanous:release-path']) {
+      expect(decideDraft({ ...base, runStatus: undefined, draft: { ...base.draft, labels: [label] }, ageHours: 100,
+        mergedTwins: [{ number: 2, title: 'same goal', branch: 'other' }] })).toEqual({ action: 'keep', reason: `label:${label}` });
     }
     // Origin labels carry no protection.
     expect(decideDraft({ ...base, draft: { ...base.draft, labels: ['elanous:from-harness'] }, ageHours: 100 }).action).toBe('close');

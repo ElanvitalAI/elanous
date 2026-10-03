@@ -98,7 +98,7 @@ export function TailscaleSecurityBanner({ statusOverride }: Props = {}): React.R
         type="button"
         onClick={onDismiss}
         aria-label="dismiss banner"
-        title="이 세션 동안 숨기기"
+        title="이 창을 닫을 때까지 숨기기"
         className="rounded p-0.5 text-amber-700 hover:bg-amber-100 dark:text-amber-200 dark:hover:bg-amber-900/40"
       >
         <X className="h-3.5 w-3.5" />

@@ -58,11 +58,13 @@ import { childRunContextEnv, childProviderKeyEnv, childLlmSelectionEnv, type Chi
 import { childToolProfile } from '../agent/tool-profile.js';
 import { escalationAllowedForProvider } from './rework-policy.js';
 import { getUserConfig, resolveActiveProvider, resolveRoleLlm } from '../user-config.js';
+import { goalDifficultySignals, classifyGoalDifficulty, resolveImplementDifficulty } from '../llm/difficulty.js';
 import { childNestEnv } from '../agent/nest-depth.js';
 import { childPtyIdentityEnv } from '../agent/pty-identity.js';
 import { elanousTuiSpawnOptions } from './elanous-tui-spawn.js';
 import { describeGrokCredentialFreshness, readGrokTokenFreshness, type GrokCredentialFreshnessSnapshot } from '../acp/grok-auth.js';
 import { debug } from '../debug/log.js';
+import { observeExternalEvent } from '../context-bus/external-events.js';
 import { sendOutbound } from '../domains/outbound-alert.js';
 import { formatPtyLinkMessage, readReportOrigin } from './report-origin.js';
 import { DETACHED_PROGRESS_FRAME_PREFIX, decodeDetachedProgressFrame } from '../harness/dispatch-detached.js';
@@ -920,6 +922,8 @@ export interface HeadlessGoalLoopPtyOptions {
   cwd: string;
   /** 이미 featurePrompt() 적용된 프롬프트(범위제한·클린빌드 앵커 포함). */
   featurePrompt: string;
+  /** Original goal document before the execution prompt is decorated. */
+  goalDocument?: string;
   configDir?: string;
   /** ★ K run-identity — 이 실행이 속한 per-run join anchor. 미지정 시 상속(env) → 없으면 canonical mint
    *  (`perCallRunId`). 호출자(runSelfImplement)가 지정하면 **리워크 라운드가 하나의 runId 를 공유**해
@@ -1164,14 +1168,25 @@ export interface HeadlessGoalLoopPtyResult {
   ptyId: string;
 }
 
+export function pickImplementRoleForGoal(document: string): ReturnType<typeof resolveRoleLlm> | undefined {
+  try {
+    const role = resolveRoleLlm('implement');
+    const signals = goalDifficultySignals(document);
+    const level = classifyGoalDifficulty(signals);
+    const picked = resolveImplementDifficulty(role, level);
+    try { debug.log('llm.difficulty', 'pick', { level, tier: picked.tier ?? null, signals }); } catch { /* observation is fail-soft */ }
+    return picked;
+  } catch { return undefined; }
+}
+
 export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): Promise<HeadlessGoalLoopPtyResult> {
   const childLlm = opts.childLlm;
   if (childLlm && (typeof childLlm.provider !== 'string' || typeof childLlm.model !== 'string' || !childLlm.provider.trim() || !childLlm.model.trim())) {
     throw new Error('childLlm.provider and childLlm.model must both be non-empty');
   }
-  // ⭐ B14 — 역할 `implement` 해석(명시 자식 LLM · 런 단위 모델이 없을 때만). 실패하면 종전(주 모델 상속)으로.
+  // ⭐ B14 — 명시 자식 LLM · 런 단위 모델이 없을 때 골 난이도에 따라 역할 `implement` 기본 등급을 고른다.
   const implementRole = !childLlm && !process.env.ELANOUS_LLM_MODEL?.trim()
-    ? (() => { try { return resolveRoleLlm('implement'); } catch { return undefined; } })()
+    ? pickImplementRoleForGoal(opts.goalDocument ?? opts.featurePrompt)
     : undefined;
   // ⭐ B9 — 승급 판정에 쓸 «유효 provider»: 명시 자식 → 역할 → 런 env → config(auto 는 실제 결정으로).
   const effectiveChildProvider = childLlm?.provider ?? implementRole?.provider ?? process.env.ELANOUS_LLM_PROVIDER?.trim()
@@ -1202,6 +1217,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
   const controlInboxDir = resolveControlInboxDir(space.id);
   const { key: screenKey } = resolveHarnessScreenKey(space.id, opts.cwd);
   const executionId = mintPtyId('self');
+  const contextSource = `elanous://harness/${encodeURIComponent(runId)}/${encodeURIComponent(executionId)}`;
   const boundaryRequestsEnv = harnessBoundaryRequestsEnv(executionId);
   const boundaryResponsesEnv = harnessBoundaryResponsesEnv(executionId);
   const boundaryRequestsPath = boundaryRequestsEnv.ELANOUS_HARNESS_BOUNDARY_REQUESTS ?? '';
@@ -1213,6 +1229,8 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
   const emitDone = (data: Record<string, unknown>): void => {
     if (doneEmitted) return;
     doneEmitted = true;
+    if (spawned) observeExternalEvent({ origin: 'harness-child', kind: 'finished',
+      summary: `Harness child finished: ${String(data.exitReason ?? 'unknown').slice(0, 60)}`, source: contextSource });
     debug.log('self-implement', 'headless.done', {
       ptyId: executionId,
       runId,
@@ -1326,7 +1344,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
       ...(space ? harnessSpaceEnv(space.kind, space.id, runId) : {}),   // 자식 goal-loop 자기인지(#4948 프리앰블) + ★K runId 명시 전파(captured-env 경계)
       ...harnessBoundaryEnv(opts.cwd),   // ★ #4 명시 쓰기 경계 — worktree(cwd) 전파 → 자식 부팅 시 결정론 경계 활성(정본 오염 봉쇄)
       ...(opts.documentReferences?.length ? { ELANOUS_DOCUMENT_REFERENCES: JSON.stringify(opts.documentReferences) } : {}),
-      // ⭐ BACKLOG B14 (대표 2026-09-25) — 명시 자식 LLM 도 런 단위 모델(`ELANOUS_LLM_MODEL`)도 없으면 역할 `implement`(better)로 고른다.
+      // ⭐ B14/E2 — 명시 자식 LLM·런 단위 모델이 없으면 골 난이도를 적용한 구현 역할 모델을 릴레이한다.
       ...childLlmSelectionEnv(childLlm ?? (implementRole ? { provider: implementRole.provider, model: implementRole.model, source: 'config' } : undefined)),
       // 결정 2026-09-23 — 명시 childLlm 은 «같은 provider» 사다리 안에서만 한 칸 승급한다(없으면 승급 안 함).
       //   미지정 경로는 기존 티어(codex sol 등)를 그대로 쓴다.
@@ -1351,6 +1369,7 @@ export async function runHeadlessGoalLoopPty(opts: HeadlessGoalLoopPtyOptions): 
     },
     });
     spawned = true;
+    observeExternalEvent({ origin: 'harness-child', kind: 'started', summary: 'Harness child started', source: contextSource });
     phase = 'initialization';
   const ptyId = h.id;
   // ⭐⭐ M5 — 그 판정을 «런 슈퍼바이저 레코드»로 올린다. 종전엔 경계 판정이 자기 로그에만 남아

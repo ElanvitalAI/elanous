@@ -5,6 +5,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { Mic, MicOff, MoreHorizontal } from 'lucide-react';
 import { useCompactMode } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
+import { SeatsNowStrip } from './SeatsNowStrip';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
 import { ChatQueueChips } from './ChatQueueChips';
@@ -528,7 +529,9 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       if (meta.text === '__CLEAR__') {
         setMessages([]);
       } else {
-        append(newMetaMessage(meta.text));
+        const message = newMetaMessage(meta.text);
+        if (meta.harnessAsk) message.blocks = [{ kind: 'harness_ask', acceptanceId: meta.harnessAsk.acceptanceId }];
+        append(message);
       }
       if (meta.newSessionId) {
         sessionGenerationRef.current++;
@@ -1073,6 +1076,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           <div className="flex items-center gap-2">{voiceButton}</div>
         </div>
       )}
+      <SeatsNowStrip />
       {/* PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M4 — HUD strip.
           Empty-state renders nothing, so this row is invisible until the
           daemon mirror (M3) pushes its first segment. */}
@@ -1089,7 +1093,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
             data-elanous-turn-busy-banner=""
           >
             <div>
-              <p className="font-medium">This session is busy</p>
+              <p className="font-medium">이 대화는 지금 응답 중입니다</p>
               <p className="text-muted-foreground">{turnBusyBanner.message}</p>
               <p className="mt-1 text-xs text-muted-foreground">
                 {turnBusyBanner.holder
@@ -1101,7 +1105,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
               type="button"
               onClick={() => setTurnBusyBanner(null)}
               className="rounded px-2 py-1 text-xs text-muted-foreground hover:bg-amber-500/10 hover:text-foreground"
-              aria-label="Dismiss busy-session notice"
+              aria-label="응답 중 알림 닫기"
             >
               Dismiss
             </button>

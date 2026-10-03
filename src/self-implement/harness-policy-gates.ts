@@ -28,7 +28,7 @@ export function runHarnessPolicyGates(input: {
     ['mock-module-restore-gate', input.gates?.['mock-module-restore-gate'] ?? runMockModuleRestoreGate],
     ['model-hardcode-gate', input.gates?.['model-hardcode-gate'] ?? runModelHardcodeGate],
     ['daemon-port-gate', input.gates?.['daemon-port-gate'] ?? ((out) => runDaemonPortGate({ log: out.log, error: out.error, cwd: out.cwd, args: [] }))],
-    // LEAK1 — the check release prepare fails on, before the harness lands (0.2.7: a mark in a test title).
+    // LEAK1 — the same pre-export check as pr land; an unmeasured result is a nonzero failure, not a pass.
     ['public-export-leak', input.gates?.['public-export-leak'] ?? runPublicExportLeakGate],
   ];
   const failures: Array<{ gate: GateName; lines: string[] }> = [];

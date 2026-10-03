@@ -9,8 +9,9 @@ import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { redactSecrets } from '../task-cards/card-store.js';
 import { directiveHash } from './directive.js';
 import { notifyOutcome, type OutcomeNotifyDeps } from './outcome-notify.js';
-import { recordTriageOnCards, recordLaunchOnCard, recordOutcomeOnCard, recordHitlOnCard, type StewardCardDeps } from './steward-cards.js';
+import { recordIntakeOnCards, recordTriageOnCards, recordLaunchOnCard, recordOutcomeOnCard, recordHitlOnCard, type StewardCardDeps } from './steward-cards.js';
 import { planLaunches, launch, collectOutcomes, raiseHitl, readLaunchLedger, saveLaunchLedger, type LaunchDeps } from './launch.js';
+import { listFabricExecutionCandidates } from '../self-dev/fabric-plan-core.js';
 import { InvalidWorkingBackwardsDraft, recordWorkingBackwardsOnCards } from './working-backwards.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { triageWithinBudget } from './triage-budget.js';
@@ -32,7 +33,7 @@ export interface TriageDecision {
 }
 export interface ScheduledDecision extends TriageDecision { disposition: 'now' | 'wait' | 'hitl' }
 export interface StewardSettings {
-  mode?: 'observe' | 'act'; linearTeam?: string;
+  mode?: 'off' | 'shadow' | 'live'; linearTeam?: string;
   roles?: Record<string, { maxConcurrent?: number }>;
   budget?: number;
   tracks?: Record<string, string>;
@@ -52,18 +53,28 @@ export interface StewardDeps {
   cardStore?: StewardCardDeps['store'];
   warn?: (message: string) => void;
   ask?: StewardAsk;
-  launchSettings?: Pick<StewardSettings, 'launch' | 'maxParallel' | 'podPool'>;
+  launchSettings?: Pick<StewardSettings, 'mode' | 'launch' | 'maxParallel' | 'podPool'>;
   launchCommand?: LaunchDeps['command'];
   spawnLaunch?: LaunchDeps['spawn'];
+  launchGate?: LaunchDeps['gate'];
   outcomeNotify?: Pick<OutcomeNotifyDeps, 'document' | 'message' | 'worktreeCommand' | 'loadOrigin' | 'loadOrigins'>;
   /** Internal command boundary: the current sync has already claimed this pid. */
   stageOwnedByCommand?: boolean;
 }
 
 export function stewardSettings(): StewardSettings {
-  return getUserConfig().loops?.steward ?? {};
+  return getUserConfig().loops?.steward ?? { mode: 'shadow' };
 }
 
+function effectiveStewardMode(settings: StewardSettings): 'off' | 'shadow' | 'live' {
+  return settings.mode ?? settings.launch ?? 'shadow';
+}
+
+function resolvedStewardSettings(override?: StewardDeps['launchSettings']): StewardSettings {
+  const settings = { ...stewardSettings(), ...override };
+  if (override?.launch !== undefined && override.mode === undefined) settings.mode = override.launch;
+  return { ...settings, mode: effectiveStewardMode(settings) };
+}
 
 function parseJudgment(issue: TriageIssue, raw: unknown, tracks?: Record<string, string>): TriageDecision {
   const value = typeof raw === 'string' ? JSON.parse(raw) as unknown : raw;
@@ -247,10 +258,10 @@ function readState(path: string): { issues: Record<string, string>; digestDay?: 
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { issues: {} }; throw error; }
 }
 
-/** Each command node invokes one stage. Only the launch setting permits spawn; merge and approval remain with the harness and human. */
+/** Each command node invokes one stage. Live launch still requires the launch gate; merge and approval remain with the harness and human. */
 export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'report', deps: StewardDeps = {}): Promise<void> {
-  const settings = { ...stewardSettings(), ...deps.launchSettings };
-  if ((settings.mode ?? 'observe') !== 'observe') throw new Error('steward act mode is out of scope');
+  const settings = resolvedStewardSettings(deps.launchSettings);
+  if (settings.mode === 'off') return;
   const root = deps.root ?? effectiveInstanceRoot();
   if (stage === 'sync' && !deps.stageOwnedByCommand) {
     return withStageSlot(root, async () => {
@@ -272,7 +283,25 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
   if (!key) throw new Error('connector.linear.apiKey missing');
   if (stage === 'sync') {
     const events = await fetchLinearIssues({ apiKey: key, teamKey: settings.linearTeam ?? 'ELA', fetch: fetchFn });
-    writeFileSync(snapshot, JSON.stringify(events.map(e => ({ identifier: e.identifier, ref: e.ref, title: e.title, body: e.body }))));
+    const issues = events.map(e => ({ identifier: e.identifier, ref: e.ref, title: e.title, body: e.body }));
+    writeFileSync(snapshot, JSON.stringify(issues));
+    const cardIssues = issues.filter((issue): issue is TriageIssue => typeof issue.identifier === 'string');
+    if (cardIssues.length) {
+      const observeCardFailure = (error: unknown, issue?: string): void => {
+        const message = `steward sync: card write failed${issue ? ` (${issue})` : ''}: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
+        try { debug.log('steward.cards', 'write-failed', { error: message }); } catch { /* observation must not fail sync */ }
+        try { (deps.warn ?? console.warn)(message); } catch { /* observation must not fail sync */ }
+      };
+      try {
+        const store = deps.cardStore ?? new CardStore(root);
+        try {
+          for (const issue of cardIssues) {
+            try { recordIntakeOnCards(store, [issue], deps.now); }
+            catch (error) { observeCardFailure(error, issue.identifier); }
+          }
+        } finally { if (!deps.cardStore) store.close(); }
+      } catch (error) { observeCardFailure(error); }
+    }
   } else if (stage === 'triage') {
     const issues = JSON.parse(readFileSync(snapshot, 'utf8')) as TriageIssue[];
     const judge = deps.judge;
@@ -341,10 +370,12 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
     }
     writeFileSync(schedule, JSON.stringify(rows));
     const ledger = readLaunchLedger(root);
-    const launchDeps: LaunchDeps = { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch };
+    const launchDeps: LaunchDeps = { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch, gate: deps.launchGate };
     const cardDeps = { root, store: deps.cardStore, now: deps.now };
     collectOutcomes(ledger, launchDeps);
     const plan = planLaunches(rows, issues, ledger, settings);
+    // Keep fabric candidates distinct from Linear launches until a fabric executor is wired.
+    writeFileSync(join(dir, 'fabric-candidates.json'), JSON.stringify(listFabricExecutionCandidates(root)));
     for (const { issue, row } of plan.hitl) {
       const entry = raiseHitl(issue, row, launchDeps);
       recordHitlOnCard(issue, entry, cardDeps);
@@ -391,7 +422,7 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       const issue = issues.find(item => item.identifier === outcome.issue) ??
         { identifier: outcome.issue, title: outcome.title, ref: '', body: '' };
       recordOutcomeOnCard(issue, outcome, { root, store: deps.cardStore, now: deps.now });
-      notifyOutcome(outcome, { root, ledger, shadow: settings.launch !== 'live', ...deps.outcomeNotify });
+      notifyOutcome(outcome, { root, ledger, shadow: settings.mode !== 'live', ...deps.outcomeNotify });
       const prefix = ['telegram', 'pwa', 'tui', 'cli'].includes(outcome.source) ? `${outcome.source} · ` : '';
       await (deps.sendDigest ?? sendStewardDigest)(`${prefix}${issue.title} · PR ${outcome.prNumber ?? '없음'} · ${outcome.status}`);
       outcome.reported = true;
@@ -399,11 +430,11 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
     }
     const justCollected = new Set(outcomes.map(outcome => outcome.issue));
     for (const outcome of Object.values(ledger.launches)) {
-      if ((settings.launch !== 'live' && outcome.status === 'shadow' && !outcome.notified) ||
-          (settings.launch === 'live' && !justCollected.has(outcome.issue) && outcome.reported && outcome.notified !== 'shadow') ||
+      if ((settings.mode !== 'live' && outcome.status === 'shadow' && !outcome.notified) ||
+          (settings.mode === 'live' && !justCollected.has(outcome.issue) && outcome.reported && outcome.notified !== 'shadow') ||
           // A finished run whose PR waits for merge still owes the wish's chat its PR link (once; failures retry).
-          (settings.launch === 'live' && outcome.awaitingMerge === true && !outcome.reported && outcome.notified !== 'sent')) {
-        notifyOutcome(outcome, { root, ledger, shadow: settings.launch !== 'live', ...deps.outcomeNotify });
+          (settings.mode === 'live' && outcome.awaitingMerge === true && !outcome.reported && outcome.notified !== 'sent')) {
+        notifyOutcome(outcome, { root, ledger, shadow: settings.mode !== 'live', ...deps.outcomeNotify });
       }
     }
     const day = at.slice(0, 10);
@@ -455,6 +486,7 @@ async function withStageSlot<T>(root: string, run: () => Promise<T>, onBusy?: ()
 
 /** The command-node boundary records both normal exits and an unclosed stage from a killed process. */
 export async function runStewardStageCommand(stage: StewardStage, deps: StewardCommandDeps = {}): Promise<0 | 1> {
+  if (resolvedStewardSettings(deps.launchSettings).mode === 'off') return 0;
   const root = deps.root ?? effectiveInstanceRoot();
   if (stage !== 'sync' && existsSync(skippedPath(root))) return 0;
   return withStageSlot(root, async () => {

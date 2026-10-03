@@ -7,8 +7,9 @@
  *    매니페스트가 실은 런 계약(`ELANOUS_RUN_CONTRACT`)으로 자기가 Pod 인 줄 안다(graph-run-contract.ts).
  */
 import { spawn } from 'node:child_process';
-import { readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, relative, resolve, sep } from 'node:path';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { selfDevRunsDir } from '../self-dev/run-store.js';
 import { findGitDir } from '../git-fs/locate.js';
 import { debug } from '../debug/log.js';
 import { ELANOUS_ENTRY_SCRIPT } from '../self-implement/seams.js';
@@ -23,6 +24,8 @@ export interface HarnessPodDispatchInput {
   readonly dispatchRecorded?: boolean;
   /** Pod 메모리 등급(standard|high) — 오케스트레이터 환경 `ELANOUS_POD_MEMORY_TIER` 로 Job 까지 간다. */
   readonly podMemory?: string;
+  /** L7c — Pod queue predecessor (goal ID or PR) — `ELANOUS_POD_AFTER` carries it to every Pod Job admission. */
+  readonly after?: string;
   readonly autoMerge?: boolean;
   readonly base?: string;
   readonly json?: boolean;
@@ -30,16 +33,9 @@ export interface HarnessPodDispatchInput {
   readonly source?: string;
 }
 
-/** 오케스트레이터가 `;;` 로 골을 나누므로 한 골 안의 `;;` 는 풀어 둔다(한 발 = 한 골). */
-export function podGoalText(input: HarnessPodDispatchInput, readFile: (path: string) => string = (p) => readFileSync(p, 'utf8')): string {
-  // 오케스트레이터에는 내용도 보내고, 저장소 안의 ask 는 별도로 Secret 을 통해 Pod 클론에 심는다.
-  const text = input.entrance === 'cli-harness-ask' ? readFile(input.input) : input.input;
-  return text.replace(/;;/gu, '; ;');
-}
-
-export function podOrchestrateArgs(input: HarnessPodDispatchInput, goal: string): string[] {
+export function podOrchestrateArgs(input: HarnessPodDispatchInput, goalFile: string): string[] {
   return [
-    ELANOUS_ENTRY_SCRIPT, 'self', 'orchestrate', goal,
+    ELANOUS_ENTRY_SCRIPT, 'self', 'orchestrate', '--goal-file', goalFile,
     '--substrate', 'pod',
     ...(input.podPool ? ['--pod-pool', input.podPool] : []),
     // 하니스 기본(자동 병합)을 따른다 · 끄면 PR 까지 — 어느 쪽이든 Pod 가 사라져도 결과가 남는다.
@@ -66,13 +62,30 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
       return 2;
     }
   }
-  const goal = podGoalText(input, deps.readFile ?? ((p) => readFileSync(resolve(cwd, p), 'utf8')));
-  const args = podOrchestrateArgs(input, goal);
+  let tempDir: string | undefined;
+  let goalFile: string;
+  let goalChars: number;
+  if (input.entrance === 'cli-harness-ask') {
+    goalFile = resolve(cwd, input.input);
+    goalChars = (deps.readFile ?? ((p) => readFileSync(p, 'utf8')))(goalFile).length;
+  } else {
+    const goal = input.input;
+    const runsDir = selfDevRunsDir();
+    mkdirSync(runsDir, { recursive: true });
+    tempDir = mkdtempSync(join(runsDir, 'pod-goal-'));
+    goalFile = join(tempDir, 'goal.txt');
+    writeFileSync(goalFile, goal, { mode: 0o600 });
+    goalChars = goal.length;
+  }
+  const args = podOrchestrateArgs(input, goalFile);
+  debug.log('harness.substrate', 'goal-file', { entrance: input.entrance, mode: tempDir ? 'temp' : 'path' });
   const env = { ...process.env };
   delete env.ELANOUS_POD_GOAL_DOC;
   delete env.ELANOUS_DISPATCH_RECORDED;
   if (input.dispatchRecorded) env.ELANOUS_DISPATCH_RECORDED = '1';
   if (input.podMemory) env.ELANOUS_POD_MEMORY_TIER = input.podMemory;
+  delete env.ELANOUS_POD_AFTER;
+  if (input.after) env.ELANOUS_POD_AFTER = input.after;
   if (input.entrance === 'cli-harness-ask') {
     const root = findGitDir(cwd)?.root;
     const path = resolve(cwd, input.input);
@@ -84,8 +97,8 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     }
   }
   debug.log('harness.substrate', 'dispatch-pod', {
-    entrance: input.entrance, podPool: input.podPool ?? null, podMemory: input.podMemory ?? null, autoMerge: input.autoMerge !== false,
-    goalChars: goal.length, ...(input.entrance === 'cli-harness-ask' ? { goalPath: input.input } : {}),
+    entrance: input.entrance, podPool: input.podPool ?? null, podMemory: input.podMemory ?? null, after: input.after ?? null, autoMerge: input.autoMerge !== false,
+    goalChars, ...(input.entrance === 'cli-harness-ask' ? { goalPath: input.input } : {}),
   });
   const run = deps.run ?? ((cmd: string, a: readonly string[], childEnv: NodeJS.ProcessEnv) => new Promise<number>((resolveStatus) => {
     const child = (deps.spawnChild ?? spawn)(cmd, [...a], { stdio: deps.onOutput ? ['inherit', 'pipe', 'inherit'] : 'inherit', env: childEnv });
@@ -104,13 +117,20 @@ export function dispatchHarnessOnPod(input: HarnessPodDispatchInput, deps: PodDi
     child.once('error', () => { cleanup(); resolveStatus(1); });
     child.once('close', (code, signal) => { cleanup(); resolveStatus(code ?? ((signal ?? forwarded) === 'SIGINT' ? 130 : 143)); });
   }));
-  const status = run(process.execPath, args, env);
-  if (typeof status === 'number' || status === null) {
-    debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status });
-    return status ?? 1;
+  const cleanup = () => { if (tempDir) rmSync(tempDir, { recursive: true, force: true }); };
+  try {
+    const status = run(process.execPath, args, env);
+    if (typeof status === 'number' || status === null) {
+      cleanup();
+      debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status });
+      return status ?? 1;
+    }
+    return status.then((code) => {
+      debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status: code });
+      return code;
+    }).finally(cleanup);
+  } catch (error) {
+    cleanup();
+    throw error;
   }
-  return status.then((code) => {
-    debug.log('harness.substrate', 'dispatch-pod-exit', { entrance: input.entrance, status: code });
-    return code;
-  });
 }

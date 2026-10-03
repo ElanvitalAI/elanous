@@ -24,7 +24,7 @@ export interface LoopEntry {
   description: string | null;
   file: string;
   trigger: { cron: string | null; events: string[] };
-  jobs: Array<{ id: string; cron: string | null; enabled: boolean }>;
+  jobs: Array<{ id: string; cron: string | null; enabled: boolean; entryScript?: boolean }>;
   enabled: boolean;
   lastRun: LoopRun | null;
   nextRun: string | null;
@@ -61,6 +61,14 @@ export function graphJobMatches(command: string | null, file: string, root: stri
     if (resolve(root, arg) === file || (isAbsolute(arg) && resolve(arg) === file)) return true;
   }
   return false;
+}
+
+/** `cron_entry` identifies the script actually launched by cron, not text in another command's arguments. */
+function cronEntryMatches(command: string | null, entry: string): boolean {
+  if (!command) return false;
+  const invocation = command.match(/^(?:cd\s+\S+\s*&&\s*)?(?:(?:\S*\/)?(?:bun|node)\s+\S*cron-run\.ts\s+--schedule-id\s+\S+\s+--shell\s+)?(?:(?:\S*\/)?(?:bash|zsh|sh)\s+)?(['"]?)([^\s'";&|]+\.sh)\1(?=\s|$|[;&|])/);
+  const script = invocation?.[2];
+  return !!script && (script === entry || script.endsWith(`/${entry}`));
 }
 
 function recentRuns(id: string, stateRoot: string, count = 5): LoopRun[] {
@@ -130,11 +138,15 @@ export function listLoops(opts: LoopRegistryOptions = {}): LoopEntry[] {
     const trigger = header?.trigger && typeof header.trigger === 'object' && !Array.isArray(header.trigger) ? header.trigger as Record<string, unknown> : null;
     const declaredCron = typeof trigger?.cron === 'string' ? trigger.cron : null;
     const events = Array.isArray(trigger?.events) ? trigger.events.filter((e): e is string => typeof e === 'string') : [];
-    const matched = rows.filter(row => graphJobMatches(row.command, file, root, doc.graph_id as string) && row.source === 'crontab' && row.run_via === 'crontab' && row.disabled_reason !== 'vanished');
+    const cronEntry = typeof doc.cron_entry === 'string' && doc.cron_entry.length ? doc.cron_entry : null;
+    const entryRows = cronEntry ? rows.filter(row => cronEntryMatches(row.command, cronEntry) && row.source === 'crontab' && row.run_via === 'crontab' && row.disabled_reason !== 'vanished') : [];
+    const matched = rows.filter(row => (graphJobMatches(row.command, file, root, doc.graph_id as string) || entryRows.includes(row)) && row.source === 'crontab' && row.run_via === 'crontab' && row.disabled_reason !== 'vanished');
+    if (entryRows.length) debug.log('loops.registry', 'cron-entry-match', { id: doc.graph_id, jobs: entryRows.map(row => row.id) });
     if (!declaredCron && !events.length && !matched.length) continue;
     if (!/^[a-zA-Z0-9][\w.-]*$/.test(doc.graph_id)) throw new Error(`unsafe loop graph_id: ${doc.graph_id}`);
     if (loops.some(loop => loop.id === doc.graph_id)) throw new Error(`duplicate loop graph_id: ${doc.graph_id}`);
-    const jobs = matched.map(row => ({ id: row.id, cron: row.cron, enabled: !!row.enabled }));
+    const jobs = matched.map(row => ({ id: row.id, cron: row.cron, enabled: !!row.enabled,
+      ...(entryRows.includes(row) ? { entryScript: true } : {}) }));
     const active = matched.filter(row => !!row.enabled && !!row.cron);
     const next = active.map(row => nextLoopFire(row.cron!, opts.now ?? new Date())).filter((v): v is string => v !== null).sort()[0] ?? null;
     const entry: LoopEntry = { id: doc.graph_id, title: typeof header?.title === 'string' ? header.title : doc.graph_id,
@@ -169,10 +181,12 @@ export async function setLoopEnabled(id: string, enabled: boolean, yes = false, 
   const action = enabled ? 'start' : 'stop';
   if (!loop.jobs.length && (!enabled || !loop.trigger.cron)) throw new Error(`loop ${id} has no cron job to ${action}`);
   const pending = loop.jobs.filter(job => job.enabled !== enabled);
-  if (!pending.length && loop.jobs.length) return { action, id, changed: false, enabled: loop.enabled };
+  const entryScript = loop.jobs.some(job => job.entryScript);
+  const entryLabel = entryScript ? { entryScript: true } : {};
+  if (!pending.length && loop.jobs.length) return { action, id, changed: false, enabled: loop.enabled, ...entryLabel };
   const changes = loop.jobs.length ? pending.map(job => ({ action: enabled ? 'enable' : 'disable', id: job.id })) :
     [{ action: 'create', cron: loop.trigger.cron, command: loopCronCommand(id, loop.file, resolve(opts.root ?? defaultLoopRoot())) }];
-  if (!yes) return { action, id, dryRun: true, changes, note: 'Apply with --yes (crontab backup).' };
+  if (!yes) return { action, id, dryRun: true, changes, ...entryLabel, note: 'Apply with --yes (crontab backup).' };
   const dispatch = opts.scheduleAction ?? (async (kind: 'create' | 'enable' | 'disable', args: Record<string, unknown>) => {
     const { dispatchScheduleManage } = await import('../domains/schedule-manage-tool.js');
     return dispatchScheduleManage({ action: kind, ...args });
@@ -186,7 +200,7 @@ export async function setLoopEnabled(id: string, enabled: boolean, yes = false, 
   }
   debug.log('loops.registry', action, { id, changes });
   emitDecision({ kind: 'ROUTE', what: `루프 ${enabled ? '켬' : '끔'}: ${id}`, reason: enabled ? '사용자 요청으로 예약 발화 활성화' : '사용자 요청으로 예약 발화 일시 중지', purpose: '루프 라이프사이클 제어', target: id });
-  return { action, id, changed: true, results };
+  return { action, id, changed: true, results, ...entryLabel };
 }
 
 export async function runLoop(id: string, dryRun = false, opts: LoopRegistryOptions = {}): Promise<GraphRunState> {

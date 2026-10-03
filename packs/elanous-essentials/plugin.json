@@ -1,0 +1,24 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "elanous-essentials",
+  "version": "0.1.0",
+  "description": "New elanous-essentials plugin bundles five everyday skills (YouTube notes, web research, link digests, diagrams, lecture notes) that work free or with your own keys.",
+  "extensions": {
+    "ai.elanous": {
+      "bundle": ["skills/youtube-master", "skills/omni-crawl", "skills/omni-digest", "skills/diagram-master", "skills/lecture-note-digitizer"],
+      "capabilities": ["fs:workdir", "proc:bun", "net:*", "secret:youtube", "secret:supadata", "secret:xai", "secret:tavily", "secret:firecrawl", "secret:gemini", "secret:upstage"],
+      "connectors": [
+        { "id": "youtube", "kind": "api-key", "userConfig": [{ "key": "YOUTUBE_API_KEY", "label": "YouTube API key (optional)", "secret": true, "env": "YOUTUBE_API_KEY" }] },
+        { "id": "supadata", "kind": "api-key", "userConfig": [{ "key": "SUPADATA_API_KEY", "label": "Supadata API key (optional)", "secret": true, "env": "SUPADATA_API_KEY" }] },
+        { "id": "xai", "kind": "api-key", "userConfig": [{ "key": "XAI_API_KEY", "label": "xAI API key (optional)", "secret": true, "env": "XAI_API_KEY" }] },
+        { "id": "tavily", "kind": "api-key", "userConfig": [{ "key": "TAVILY_KEY", "label": "Tavily API key (optional)", "secret": true, "env": "TAVILY_KEY" }] },
+        { "id": "firecrawl", "kind": "api-key", "userConfig": [{ "key": "FIRECRAWL_API_KEY", "label": "Firecrawl API key (optional)", "secret": true, "env": "FIRECRAWL_API_KEY" }] },
+        { "id": "gemini", "kind": "api-key", "userConfig": [{ "key": "GEMINI_API_KEY", "label": "Gemini API key (optional)", "secret": true, "env": "GEMINI_API_KEY" }] },
+        { "id": "upstage", "kind": "api-key", "userConfig": [{ "key": "UPSTAGE_API_KEY", "label": "Upstage OCR API key (optional)", "secret": true, "env": "UPSTAGE_API_KEY" }] }
+      ],
+      "pricing": { "model": "free" },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

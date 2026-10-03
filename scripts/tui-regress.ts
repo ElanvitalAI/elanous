@@ -42,7 +42,7 @@ async function runCheck(check: TuiCheck): Promise<Verdict> {
       else snaps[step.as] = await handle.renderScreen();
     }
     // TUI_REGRESS_DUMP=<id> prints that check's screens (to see why a verdict failed).
-    if (process.env.TUI_REGRESS_DUMP === check.id) for (const [k, v] of Object.entries(snaps)) console.log(`--- ${check.id}:${k}\n${v.split('\n').filter((l) => l.trim()).join('\n')}`);
+    if (!json && process.env.TUI_REGRESS_DUMP === check.id) for (const [k, v] of Object.entries(snaps)) console.log(`--- ${check.id}:${k}\n${v.split('\n').filter((l) => l.trim()).join('\n')}`);
     return check.judge(snaps);
   } catch (error) {
     return { ok: false, reason: `실행 오류: ${String(error).slice(0, 120)}` };
@@ -67,5 +67,5 @@ for (const check of checks) {
 }
 const fail = results.filter((r) => !r.ok).length;
 if (json) console.log(JSON.stringify({ results, pass: results.length - fail, fail }));
-console.log(`tui-regress: pass ${results.length - fail} · fail ${fail}`);
+else console.log(`tui-regress: pass ${results.length - fail} · fail ${fail}`);
 process.exit(fail ? 1 : 0);

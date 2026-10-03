@@ -1,20 +1,15 @@
 import { describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { debug } from '../debug/log.js';
-import { dispatchHarnessOnPod, podGoalText, podOrchestrateArgs } from './harness-pod-dispatch.js';
+import { dispatchHarnessOnPod, podOrchestrateArgs } from './harness-pod-dispatch.js';
 
 describe('harness say/ask --substrate pod', () => {
-  test('ask ships the goal document CONTENT (a pod cannot see this machine\'s untracked goal file)', () => {
-    const text = podGoalText({ entrance: 'cli-harness-ask', input: 'docs/goals/ASK-x.md' }, (p) => `# goal from ${p}\nbody;;tail`);
-    expect(text).toBe('# goal from docs/goals/ASK-x.md\nbody; ;tail');   // `;;` 는 오케스트레이터의 골 구분자 — 한 발 = 한 골
-  });
-
   test('routes to the one pod path (orchestrate --substrate pod), keeping the harness completion default', () => {
     const args = podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'x', podPool: 'pool-node-b@node-b:4' }, 'x');
-    expect(args.slice(1, 4)).toEqual(['self', 'orchestrate', 'x']);
+    expect(args.slice(1, 5)).toEqual(['self', 'orchestrate', '--goal-file', 'x']);
     expect(args).toContain('--substrate');
     expect(args[args.indexOf('--substrate') + 1]).toBe('pod');
     expect(args[args.indexOf('--pod-pool') + 1]).toBe('pool-node-b@node-b:4');
@@ -69,6 +64,40 @@ describe('harness say/ask --substrate pod', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  test('ask passes only its document path; say writes private goal text for the duration of the child', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-goal-path-'));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      execFileSync('git', ['init', '-q', root]);
+      const goal = join(root, 'goal.md');
+      writeFileSync(goal, '판정 신호: bun test');
+      const ask = dispatchHarnessOnPod({ entrance: 'cli-harness-ask', input: goal }, {
+        cwd: root, run: (_cmd, args) => {
+          expect(args).toContain(goal);
+          expect(args.join(' ')).not.toContain('판정 신호');
+          return 0;
+        },
+      });
+      expect(ask).toBe(0);
+      let tempFile = '';
+      const sayGoal = '판정 신호: bun test ;; preserve the separator';
+      const say = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: sayGoal }, {
+        cwd: root, run: (_cmd, args) => {
+          expect(args.join(' ')).not.toContain('판정 신호');
+          tempFile = args[args.indexOf('--goal-file') + 1]!;
+          expect(readFileSync(tempFile, 'utf8')).toBe(sayGoal);
+          expect(execFileSync(process.execPath, ['-e', 'process.stdout.write(require("node:fs").readFileSync(process.argv.at(-1), "utf8"))', tempFile], { encoding: 'utf8' })).toBe(sayGoal);
+          expect(statSync(tempFile).mode & 0o777).toBe(0o600);
+          return 0;
+        },
+      });
+      expect(say).toBe(0);
+      expect(() => statSync(tempFile)).toThrow();
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'goal-file', { entrance: 'cli-harness-ask', mode: 'path' });
+      expect(log).toHaveBeenCalledWith('harness.substrate', 'goal-file', { entrance: 'cli-harness-say', mode: 'temp' });
+    } finally { log.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('real spawned orchestrator stdout reaches the CLI observer without changing its exit status', async () => {
     const output: string[] = [];
     const stdout = spyOn(process.stdout, 'write').mockImplementation(() => true);
@@ -92,6 +121,21 @@ describe('harness say/ask --substrate pod', () => {
     expect(podOrchestrateArgs(input, 'fix it')).toEqual(podOrchestrateArgs({ entrance: 'cli-harness-say', input: 'fix it' }, 'fix it'));
   });
 
+  test('--after travels as ELANOUS_POD_AFTER and a stale host value never leaks into an unrelated launch', () => {
+    const previous = process.env.ELANOUS_POD_AFTER;
+    process.env.ELANOUS_POD_AFTER = '#999';
+    try {
+      const seen: Array<string | undefined> = [];
+      const run = (_cmd: string, _args: readonly string[], env: NodeJS.ProcessEnv) => { seen.push(env.ELANOUS_POD_AFTER); return 0; };
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'fix it', after: '#123' }, { run })).toBe(0);
+      expect(dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'fix it' }, { run })).toBe(0);
+      expect(seen).toEqual(['#123', undefined]);
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_POD_AFTER;
+      else process.env.ELANOUS_POD_AFTER = previous;
+    }
+  });
+
   test('unrecorded dispatch never inherits a stale host marker', () => {
     const previous = process.env.ELANOUS_DISPATCH_RECORDED;
     process.env.ELANOUS_DISPATCH_RECORDED = '1';
@@ -113,6 +157,7 @@ describe('harness say/ask --substrate pod', () => {
     const seen: string[][] = [];
     const status = dispatchHarnessOnPod({ entrance: 'cli-harness-say', input: 'fix it' }, { run: (_c, a) => { seen.push([...a]); return 3; } });
     expect(status).toBe(3);
-    expect(seen[0]).toContain('fix it');
+    expect(seen[0]).not.toContain('fix it');
+    expect(seen[0]).toContain('--goal-file');
   });
 });

@@ -3,10 +3,85 @@ import { debug } from '../debug/log.js';
 import { handleTelegramSeatWork } from './telegram-seat-work.js';
 import { TelegramBot } from '../telegram.js';
 import type { UserConfig } from '../user-config.js';
+import type { PersonaProfile } from '../persona/types.js';
+import type { PersonaSource } from '../persona/mention-parser.js';
 
 const MSG = { chatId: -123, messageId: 456 };
 const OWNER = { chatId: 111, userId: 111, messageId: 456 };
 const config = { raw: { decisions: { telegramOwnerId: 111 } }, telegram: { allowedUsers: [111] } } as unknown as UserConfig;
+const sage: PersonaProfile = { personaId: 'sage', displayName: 'Sage', systemPrompt: '차분히 답하라.', mentionPatterns: ['@mentor'] };
+const personaProfiles: PersonaProfile[] = [sage, { personaId: 'cmo', displayName: 'CMO Persona' }, { personaId: 'mira', displayName: 'Mira' }];
+const personaSource: PersonaSource = { list: () => personaProfiles, get: (id) => personaProfiles.find((p) => p.personaId === id) };
+
+describe('Telegram persona address', () => {
+  test('owner private @sage and mentionPatterns use the persona prompt, not seat intake or dispatch', async () => {
+    const prompts: string[] = [];
+    const deps = { config, personaSource,
+      personaAnswerDeps: { complete: async (prompt: string) => { prompts.push(prompt); return '조언입니다.'; } },
+      submit: async () => { throw Error('should not submit'); },
+      answer: async () => { throw Error('should not answer seat'); },
+      dispatch: async () => { throw Error('should not dispatch'); },
+    } as never;
+    expect(await handleTelegramSeatWork('@sage 오늘 할 일', OWNER, deps)).toBe('@Sage\n조언입니다.');
+    expect(prompts[0]?.startsWith('차분히 답하라.\n')).toBe(true);
+    expect(prompts[0]).toContain('오늘 할 일');
+    expect(await handleTelegramSeatWork('@mentor 조언', OWNER, deps)).toBe('@Sage\n조언입니다.');
+    expect(await handleTelegramSeatWork('@mIrA 조언', OWNER, deps)).toBe('@Mira\n조언입니다.');
+    expect(prompts).toHaveLength(3);
+  });
+
+  test('seat title and colliding personaId still take seat answer path, never persona completion', async () => {
+    const seats: unknown[] = [];
+    let personaCalls = 0;
+    const deps = { config, personaSource,
+      personaAnswer: async () => { personaCalls++; return 'persona'; },
+      answer: async (seat: string) => { seats.push(seat); return { title: 'CMO', text: '자리 답' }; },
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    expect(await handleTelegramSeatWork('@cmo 오늘 진행 상황?', OWNER, deps)).toBe('자리 답');
+    expect(await handleTelegramSeatWork('@MK 오늘 진행 상황?', OWNER, deps)).toBe('자리 답');
+    expect(seats).toEqual(['cmo', 'MK']);
+    expect(personaCalls).toBe(0);
+  });
+
+  test('mixed and multiple personas reject without answering, dispatching, or intake, with a reason-only event', async () => {
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'persona.address') events.push({ event, data });
+    }) as typeof debug.log);
+    const deps = { config, personaSource,
+      personaAnswer: async () => { throw Error('should not answer'); },
+      answer: async () => { throw Error('should not answer seat'); },
+      dispatch: async () => { throw Error('should not dispatch'); },
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    try {
+      expect(await handleTelegramSeatWork('@sage,@cmo private-question', OWNER, deps)).toBe('페르소나는 한 번에 하나만 부를 수 있습니다');
+      expect(await handleTelegramSeatWork('@sage,@mira private-question', OWNER, deps)).toBe('페르소나는 한 번에 하나만 부를 수 있습니다');
+      expect(events).toEqual([{ event: 'rejected', data: { reason: 'mixed' } }, { event: 'rejected', data: { reason: 'mixed' } }]);
+      expect(JSON.stringify(events)).not.toContain('private-question');
+    } finally { log.mockRestore(); }
+  });
+
+  test('non-owner and unknown names keep the original seat clarification; only owner persona resolution is observed', async () => {
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'persona.address') events.push({ event, data });
+    }) as typeof debug.log);
+    const deps = { config, personaSource,
+      personaAnswer: async () => '@Sage\n답',
+      submit: async () => { throw Error('should not submit'); },
+    } as never;
+    const rejected = '어느 좌석을 말씀하시나요? @sage은(는) 등록된 좌석이 아닙니다. 좌석을 확인해 다시 보내 주세요.';
+    try {
+      expect(await handleTelegramSeatWork('@sage 질문', { ...OWNER, userId: 222, chatId: 222 }, deps)).toBe(rejected);
+      expect(await handleTelegramSeatWork('@sage 질문', { ...OWNER, chatId: -123 }, deps)).toBe(rejected);
+      expect(await handleTelegramSeatWork('@nobody 질문', OWNER, deps)).toBe(rejected.replace('@sage', '@nobody'));
+      expect(await handleTelegramSeatWork('@sage 질문', OWNER, deps)).toBe('@Sage\n답');
+      expect(events).toEqual([{ event: 'resolved', data: { name: 'sage', personaId: 'sage' } }]);
+    } finally { log.mockRestore(); }
+  });
+});
 
 describe('Telegram owner intent', () => {
   test('question answers once; empty answer falls back to one graph intake', async () => {
@@ -178,6 +253,35 @@ describe('Telegram addressed seat work', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  test('gateway sends the owner persona answer back in the same private Telegram chat', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    let bot: TelegramBot;
+    let polls = 0;
+    bot = new TelegramBot({ token: '123:test', allowedUsers: [111], perChatGapMs: 0,
+      onMessage: async () => { throw Error('should not enter ordinary chat'); },
+      seatWorkDeps: { config, personaSource,
+        personaAnswerDeps: { complete: async (prompt) => {
+          expect(prompt.startsWith('차분히 답하라.\n')).toBe(true);
+          return '조언입니다.';
+        } },
+        submit: async () => { throw Error('should not submit'); },
+      },
+      fetchImpl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+        const method = String(url).split('/').at(-1);
+        if (method === 'getUpdates') {
+          if (++polls > 1) { bot.stop(); return Response.json({ ok: true, result: [] }); }
+          return Response.json({ ok: true, result: [{ update_id: 1,
+            message: { message_id: 456, from: { id: 111 }, chat: { id: 111, type: 'private' }, text: '@sage 오늘 할 일' },
+          }] });
+        }
+        if (method === 'sendMessage') sent.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return Response.json({ ok: true, result: { message_id: 9 } });
+      }) as typeof fetch,
+    });
+    await bot.start();
+    expect(sent).toContainEqual({ chat_id: 111, text: '@Sage\n조언입니다.', reply_to_message_id: 456 });
   });
 
   test('gateway forwards owner identity to seat intent and offers unaddressed DM task only when configured', async () => {

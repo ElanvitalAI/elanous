@@ -45,6 +45,7 @@ test('resume target persists, rejects path-like question IDs, and leaves legacy 
   expect(JSON.parse(legacyLine).entry).not.toHaveProperty('resume');
   const raised = store.raise({ ...base, resume: { questionId: 'auq:mk8f00:abc12', runId: 'run-1' } });
   expect(raised.resume).toEqual({ questionId: 'auq:mk8f00:abc12', runId: 'run-1' });
+  expect(store.raise({ ...base, resume: { questionId: 'execution:run-1:00000000-0000-4000-8000-000000000001', runId: 'run-1' } }).resume?.runId).toBe('run-1');
   expect(store.show(raised.id).resume).toEqual(raised.resume);
   expect(store.show(legacy.id).resume).toBeUndefined();
   const reopened = ledger(join(store.path, '..', '..'));
@@ -55,8 +56,8 @@ test('resume target persists, rejects path-like question IDs, and leaves legacy 
   for (const questionId of ['../escape', 'auq:../escape:abc12', 'auq:abc/def:abc12', 'auq:abc\\def:abc12', 'auq:abc:def12/..', 'auq:abc:xyz0!', 'auq:abc:xyz09\n', '']) {
     expect(() => store.raise({ ...base, resume: { questionId } })).toThrow('invalid resume questionId');
   }
-  expect(store.list({ status: 'all' })).toHaveLength(3);
-  expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(3);
+  expect(store.list({ status: 'all' })).toHaveLength(4);
+  expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(4);
 });
 
 test('AUTO requires delegation; invalid SCQA, one option and skipped recommendation require rejection', () => {
@@ -304,6 +305,36 @@ test('resume target writes the selected key and label for the waiting question o
   } finally { spy.mockRestore(); }
 });
 
+test('execution answer uses the option label required by the waiting harness run', () => {
+  const stateDir = root();
+  const id = 'execution:run-x:00000000-0000-4000-8000-000000000001';
+  writePendingQuestion(createPendingQuestion(id, { runId: 'run-x', questions: [{ id: 'scope_choice', header: 'Scope', question: 'Choose.',
+    options: [{ label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' }] }] }, undefined, {},
+  { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+  const store = ledger(stateDir);
+  const entry = store.raise({ ...base, resume: { questionId: id, runId: 'run-x' } });
+  expect(store.decideWithDelivery(entry.id, 'b', { kind: 'human' }).delivery).toEqual({ ok: true, questionId: id });
+  expect(readPendingQuestionAnswer(id, { root: () => stateDir })).toEqual({ ok: true, answer: {
+    id, result: { answers: { scope_choice: 'Hold' } },
+  } });
+});
+
+test('a decision cannot deliver to another run or after the pending deadline', () => {
+  const stateDir = root();
+  const store = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions });
+  const id = 'auq:abc:12345';
+  const request: AskUserQuestionRequest = { runId: 'other-run', questions: [{ id: 'scope_choice', header: 'Scope', question: 'Choose.',
+    options: [{ label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' }] }] };
+  writePendingQuestion(createPendingQuestion(id, request, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2026-10-01T01:01:00.000Z' }), { root: () => stateDir });
+  const entry = store.raise({ ...base, resume: { questionId: id, runId: 'my-run' } });
+  expect(store.decideWithDelivery(entry.id, 'b', { kind: 'human' }).delivery).toMatchObject({ ok: false, reason: 'pending question run differs from decision' });
+  expect(readPendingQuestionAnswer(id, { root: () => stateDir })).toEqual({ ok: true, answer: null });
+  writePendingQuestion(createPendingQuestion(id, { ...request, runId: 'my-run' }, undefined, {},
+    { surface: 'file', delivery: 'file', expiresAt: '2026-10-01T00:59:00.000Z' }), { root: () => stateDir });
+  expect(() => store.retryAnswer(entry.id)).toThrow('answer delivery failed');
+  expect(readPendingQuestionAnswer(id, { root: () => stateDir })).toEqual({ ok: true, answer: null });
+});
+
 test('default answer writer stores a resolver-readable answer under the pending question id', () => {
   const stateDir = root();
   const request: AskUserQuestionRequest = { questions: [{ id: 'scope_choice', header: 'Scope', question: 'Choose.',
@@ -464,4 +495,14 @@ test('legacy raised events without resume still list and decide; unsafe question
     expect(() => store.raise({ ...base, resume: { questionId } })).toThrow('invalid resume questionId');
   }
   expect(store.list({ status: 'all' })).toHaveLength(1);
+});
+
+test('raise and auto-decide accept seat names (OP·MK·TC·UX) as track while old letters keep working', () => {
+  const store = ledger();
+  const bySeat = store.raise({ ...base, raisedBy: { agent: 'claude', track: 'OP' } });
+  expect(bySeat.raisedBy.track).toBe('OP');
+  const decided = store.decide(bySeat.id, 'b', { kind: 'auto', agent: 'claude', track: 'TC', delegation: 'seat delegation' });
+  expect(decided.decidedBy).toEqual({ kind: 'auto', agent: 'claude', track: 'TC', delegation: 'seat delegation' });
+  expect(store.raise({ ...base, raisedBy: { agent: 'codex', track: 'S' } }).raisedBy.track).toBe('S');
+  expect(() => store.raise({ ...base, raisedBy: { agent: 'codex', track: 'XX' as never } })).toThrow('invalid track');
 });

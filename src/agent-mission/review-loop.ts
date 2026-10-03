@@ -11,6 +11,7 @@ import { runGitCommand } from '../git-fs/runner.js';
 import * as llm from '../llm.js';
 import type { LLMMessage } from '../llm.js';
 import { debug } from '../debug/log.js';
+import { releasePathHold, releasePathHoldShouldPost, releasePathHoldComment, releasePathHoldCommentsArgs, releasePrFilePaths, RELEASE_PATH_LABEL } from '../self-dev/release-path-guard.js';
 import { runAgentMission, resolveBackend, type AgentMissionResult, type EvidenceMode } from './driver.js';
 import { judgeWithAcp, prepareJudgeDiff } from './acp-judge.js';
 import { verifyMergeAndMaybeRevert } from './merge-safety.js';
@@ -112,6 +113,31 @@ export interface ReviewLoopResult {
 function gh(args: string[]): string {
   // env: process.env — 최소 PATH(cron)에서도 ensure-bin-path 보강 PATH 로 gh 를 찾도록 명시 전달.
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 60000, maxBuffer: 20 * 1024 * 1024, env: process.env });
+}
+
+/** Check every page of the PR file list immediately before an unattended review-loop merge. */
+function holdReleasePathBeforeReviewMerge(pr: string, runGh: (args: string[]) => string): boolean {
+  let paths: string[];
+  try {
+    paths = releasePrFilePaths(JSON.parse(runGh(['api', '--paginate', '--slurp', '--method', 'GET', '-f', 'per_page=100', `repos/{owner}/{repo}/pulls/${pr}/files`])));
+  } catch (error) {
+    debug.log('self-dev.merge', 'release-path-inspection-failed', { pr, error: String(error) });
+    return true;
+  }
+  const path = releasePathHold(paths);
+  if (!path) return false;
+  debug.log('self-dev.merge', 'release-path-hold', { pr, path, label: RELEASE_PATH_LABEL, surface: 'review-loop' });
+  try {
+    const names: unknown = JSON.parse(runGh(['label', 'list', '--search', RELEASE_PATH_LABEL, '--json', 'name']));
+    if (!Array.isArray(names)) throw new Error('invalid label list');
+    if (!names.some((item: unknown) => !!item && typeof item === 'object' && 'name' in item && item.name === RELEASE_PATH_LABEL)) {
+      runGh(['label', 'create', RELEASE_PATH_LABEL, '--color', 'D93F0B', '--description', 'Release path requires OP approval']);
+    }
+    runGh(['pr', 'edit', pr, '--add-label', RELEASE_PATH_LABEL]);
+  } catch (error) { debug.log('self-dev.merge', 'release-path-annotation-failed', { pr, action: 'label', error: String(error) }); }
+  try { if (releasePathHoldShouldPost(() => JSON.parse(runGh(releasePathHoldCommentsArgs(pr))))) runGh(['pr', 'comment', pr, '--body', releasePathHoldComment(path)]); }
+  catch (error) { debug.log('self-dev.merge', 'release-path-annotation-failed', { pr, action: 'comment', error: String(error) }); }
+  return true;
 }
 
 /** ★ G10 안전봉투 — 자율머지 직후 회귀검증(verifyMerge 시). 회귀면 revert PR 이 이미 생성됨(알림 포함) →
@@ -233,6 +259,7 @@ export async function judgeAndFinalize(
 
   if (j.verdict === 'merge') {
     if (opts.autoMerge) {
+      if (holdReleasePathBeforeReviewMerge(pr, runGh)) return { pr, branch, verdict: 'reinforce', asks, action: 'parked', reworkOk: true, pushed: lastPushed, rounds: round, detail: 'OP approval required: release-path hold or PR file inspection unavailable' };
       const approve = opts.approve ?? approvePr;
       const recordReviewOutcome = opts.recordReviewOutcome ?? recordOutcome;
       approve(pr, `2차 ACP 최종심판 MERGE (round ${round})`);
@@ -480,6 +507,9 @@ export async function runReviewLoop(pr: string, opts: ReviewLoopOpts = {}): Prom
   if (cls.verdict === 'ok') {
     // light: 1차 clean 으로 충분 → approve + 머지. heavy: 1차 ok 여도 2차 심판 머스트.
     if (!effectiveFinalJudge) {
+      if ((opts.autoMergeOnOk || opts.autoMerge) && holdReleasePathBeforeReviewMerge(pr, runGh)) {
+        return { pr, branch, verdict: 'ok', asks: [], action: 'parked', detail: 'OP approval required: release-path hold or PR file inspection unavailable' };
+      }
       approve(pr, `소작업(light)·1차 리뷰 clean`);
       let merged = false;
       if (opts.autoMergeOnOk || opts.autoMerge) {

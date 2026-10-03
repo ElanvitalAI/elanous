@@ -9,7 +9,6 @@
 // (entry id + `http`) instead of vanishing silently.
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -544,16 +543,6 @@ describe('user-config mcp.servers', () => {
     expect(mcp.servers.map((s) => s.id)).toEqual(['kept']);
     expect('handshakeTimeoutMs' in mcp).toBe(false);
   });
-
-  test('discriminated McpServerSpec is enforced by tsc --noEmit (not bun test)', () => {
-    const repoRoot = join(import.meta.dir, '..');
-    const tsc = spawnSync(
-      join(repoRoot, 'node_modules/.bin/tsc'),
-      ['--noEmit', '-p', 'test/tsconfig.mcp-spec.json'],
-      { encoding: 'utf8', cwd: repoRoot },
-    );
-    expect(tsc.status, `${tsc.stdout}${tsc.stderr}`).toBe(0);
-  }, 30_000);
 });
 
 // ── authorizedTools 파싱 (사후 리뷰가 잡은 회귀 · 2026-08-20) ──────

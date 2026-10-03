@@ -152,6 +152,22 @@ describe('plugin installation', () => {
     expect(explicit).toEqual([[]]);
   });
 
+  test('research drafts cannot be installed until the explicit draft marker is removed', async () => {
+    const root = fixture();
+    const pkg = packageAt(join(root, 'source'));
+    const manifestPath = join(pkg, 'plugin.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    manifest.extensions = { 'ai.elanous': { researchDraft: true } };
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    await expect(installPlugin(pkg, { root, yes: true })).rejects.toMatchObject({
+      reason: 'io', message: expect.stringContaining('research draft only'),
+    });
+    expect(listInstalledPlugins(root)).toEqual([]);
+    delete manifest.extensions['ai.elanous'].researchDraft;
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    expect((await installPlugin(pkg, { root, yes: true })).name).toBe('sample-plugin');
+  });
+
   test('denied consent, duplicate name and symlink never install an artifact', async () => {
     const root = fixture();
     const pkg = packageAt(join(root, 'source'));

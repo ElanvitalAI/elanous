@@ -9,6 +9,7 @@ import { checkAuth, type MetaApiOpts } from './meta-api.js';
 import { jsonResponse } from './json-response.js';
 import { runLedgerDir, runLedgerPath } from '../../self-implement/run-ledger.js';
 import { scanStoresForRun } from './trace-run-scan.js';
+import { listSessions } from '../../session/index.js';
 
 export type TraceLevel = 'L0' | 'L1' | 'L2' | 'L3';
 export interface TraceEvent {
@@ -17,6 +18,7 @@ export interface TraceEvent {
   universe: string;
   machine?: string;
   runId?: string;
+  projectId?: string;
   parentRunId?: string;
   phase?: string;
   shard?: string;
@@ -83,6 +85,7 @@ function eventFor(row: LogStoreRow): TraceEvent {
     id: evidenceRef(universe, row.id), ts: row.ts, universe,
     ...(machine ? { machine } : {}),
     ...(runId ? { runId } : {}),
+    ...(text(data.projectId) ? { projectId: text(data.projectId) } : {}),
     ...(text(data.parentRunId) ? { parentRunId: text(data.parentRunId) } : {}),
     ...(text(data.phase) ? { phase: text(data.phase) } : {}),
     ...(text(data.shard) ? { shard: text(data.shard) } : {}),
@@ -259,11 +262,15 @@ function options(url: URL): { level: TraceLevel; limit: number; from?: number; t
   if (from === null || to === null || (from !== undefined && to !== undefined && from > to)) return { level, limit: n, error: 'invalid time range' };
   return { level, limit: Math.min(n, TRACE_LIMIT), ...(from !== undefined ? { from } : {}), ...(to !== undefined ? { to } : {}) };
 }
-function matches(row: LogStoreRow, url: URL): boolean {
+function matches(row: LogStoreRow, url: URL, projectSessions?: ReadonlySet<string>): boolean {
   const data = dataFor(row);
   const runId = url.searchParams.get('runId');
   const universe = url.searchParams.get('universe');
   const kind = url.searchParams.get('kind');
+  const projectId = url.searchParams.get('projectId');
+  if (projectId !== null && (Object.hasOwn(data, 'projectId')
+    ? data.projectId !== projectId
+    : !projectSessions?.has(row.session_id ?? '') && !projectSessions?.has(text(data.sessionId) ?? ''))) return false;
   const q = url.searchParams.get('q')?.toLowerCase();
   if (runId && data.runId !== runId && data.run_id !== runId) return false;
   if (universe && row.instance !== universe) return false;
@@ -295,6 +302,8 @@ function findRunUniverse(runId: string, selected: readonly string[], deps: Trace
 export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {}): Response {
   if (!checkAuth(req, opts)) return jsonResponse({ error: 'unauthorized' }, 401);
   const url = new URL(req.url);
+  const projectId = url.searchParams.get('projectId');
+  const projectSessions = projectId === null ? undefined : new Set(listSessions({ projectId }).map(session => session.id));
   const parsed = options(url);
   if (parsed.error) return jsonResponse({ ok: false, error: 'bad_request', reason: parsed.error }, 400);
   const names = storeNames(url, deps);
@@ -315,7 +324,8 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
       for (const entry of stores) {
         if (!entry.store) { failures.push({ name: entry.name, reason: entry.error ?? 'log-store-unavailable' }); continue; }
         try {
-          const page = entry.store.aggregateRuns({ sinceMs: parsed.from, untilMs: parsed.to }, RUN_LIMIT);
+          const page = entry.store.aggregateRuns({ sinceMs: parsed.from, untilMs: parsed.to,
+            ...(projectId !== null ? { projectId, projectSessionIds: [...projectSessions!] } : {}) }, RUN_LIMIT);
           if (page.length >= RUN_LIMIT) runLimitReached = true;
           runs.push(...page.map((run) => ({ ...run, universe: entry.name })));
           opened++;
@@ -334,7 +344,8 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
     for (const entry of stores) {
       if (!entry.store) { failures.push({ name: entry.name, reason: entry.error ?? 'log-store-unavailable' }); continue; }
       try {
-        const query: LogQuery = { sinceMs: parsed.from, untilMs: parsed.to, limit: TRACE_LIMIT + 1 };
+        const query: LogQuery = { sinceMs: parsed.from, untilMs: parsed.to, limit: TRACE_LIMIT + 1,
+          ...(projectId !== null ? { projectId, projectSessionIds: [...projectSessions!] } : {}) };
         const search = url.searchParams.get('q');
         if (search) query.grep = search;
         // Restrict a run before paging; other JSON-only filters still apply to the bounded window.
@@ -349,7 +360,7 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
     const runId = url.searchParams.get('runId');
     let resolution: { universe?: string; checked: number; truncated?: boolean; unresolved?: boolean } | undefined;
     let resolvedFrom: 'ledger' | 'log-scan' | undefined;
-    if ((parsed.level === 'L2' || parsed.level === 'L3') && runId && !rows.some((row) => matches(row, url)) && !requestedUniverse) {
+    if ((parsed.level === 'L2' || parsed.level === 'L3') && runId && !rows.some((row) => matches(row, url, projectSessions)) && !requestedUniverse) {
       // A store with no log db at all («has no log store yet» — e.g. the daemon's own tree-derived universe) cannot
       // hold the run, so it must not block the ledger lookup. A store that exists but failed to open/read still does:
       // «could not read» is never answered as «not there». The reply keeps `failedStores` either way.
@@ -379,7 +390,8 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
         if (!entry?.store) return jsonResponse({ ok: false, error: 'log-store-unavailable', failedStores: [{ name, reason: entry?.error ?? 'log-store-unavailable' }] }, 503);
         stores.push(entry);
         try {
-          const query: LogQuery = { sinceMs: parsed.from, untilMs: parsed.to, limit: TRACE_LIMIT + 1 };
+          const query: LogQuery = { sinceMs: parsed.from, untilMs: parsed.to, limit: TRACE_LIMIT + 1,
+            ...(projectId !== null ? { projectId, projectSessionIds: [...projectSessions!] } : {}) };
           const search = url.searchParams.get('q');
           if (search) query.grep = search;
           const page = entry.store.queryTraceRun(runId, query);
@@ -388,7 +400,7 @@ export function handleTrace(req: Request, opts: MetaApiOpts, deps: TraceDeps = {
         } catch (e) { return jsonResponse({ ok: false, error: 'log-store-unavailable', failedStores: [{ name, reason: e instanceof Error ? e.message : String(e) }] }, 503); }
       }
     }
-    const filtered = rows.filter((row) => matches(row, url)).sort(sortRows);
+    const filtered = rows.filter((row) => matches(row, url, projectSessions)).sort(sortRows);
     const trace = buildTrace(filtered.slice(0, parsed.limit), parsed.level, filtered.length > parsed.limit || candidateLimitReached || failures.length > 0 || resolution?.truncated === true);
     try { (deps.queryLog ?? ((details) => debug.log('logs.trace', 'query', details)))({ stores: names, level: parsed.level, count: trace.events.length, truncated: trace.truncated, mode: 'rows', runs: trace.nodes.filter((node) => node.level === 'L1' && node.count > 0).length }); } catch { /* query logging must not block reads */ }
     return jsonResponse({ ok: true, ...trace, stores: names, registeredStores: registeredStoreCount(deps), ...(resolution ? resolution.universe ? { resolvedFrom, runUniverse: resolution.universe, ...(resolvedFrom === 'log-scan' ? { checked: resolution.checked } : {}) } : { runUniverse: resolution.truncated || resolution.unresolved ? 'unresolved' as const : 'not-found' as const, checked: resolution.checked } : {}), ...(failures.length ? { failedStores: failures } : {}) }, 200);

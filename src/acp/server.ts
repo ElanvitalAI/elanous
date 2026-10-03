@@ -241,6 +241,8 @@ export interface AcpServerOptions {
   /** ACP standalone entry: require session cwd or an explicit boot default. */
   requireSessionToolCwd?: boolean;
   bootToolCwd?: string;
+  /** Optional PTY factory for the web terminal; production uses PreviewTerminal. */
+  createWebTerminal?: (opts: ConstructorParameters<typeof import('../preview/terminal.js').PreviewTerminal>[0]) => import('../preview/terminal.js').PreviewTerminal;
   /** Test seam for exercising stdio EOF with controlled byte streams. */
   stdioInput?: ReadableStream<Uint8Array>;
   stdioOutput?: WritableStream<Uint8Array>;
@@ -2190,7 +2192,8 @@ function wireAcpConnection(
           throw new Error('terminal/spawn: sessionId required');
         }
         const tid = resolveAcpTerminalId(p.terminalId);
-        const cwd = typeof p.cwd === 'string' && p.cwd.length > 0 ? p.cwd : process.cwd();
+        const cwd = typeof p.cwd === 'string' && p.cwd.length > 0 ? p.cwd
+          : (await import('../project/session-context.js')).resolveSessionProjectContext(p.sessionId)?.cwd ?? process.cwd();
         const cols = typeof p.cols === 'number' && p.cols > 0 ? p.cols : 80;
         const rows = typeof p.rows === 'number' && p.rows > 0 ? p.rows : 24;
 
@@ -2234,7 +2237,7 @@ function wireAcpConnection(
         }
 
         const { PreviewTerminal } = await import('../preview/terminal.js');
-        const pt = new PreviewTerminal({
+        const pt = (opts.createWebTerminal ?? ((terminalOpts) => new PreviewTerminal(terminalOpts)))({
           cols, rows, cwd,
           // Web-terminal child shell renders inside the PWA's xterm.js,
           // which implements the xterm-256color terminfo. When the daemon

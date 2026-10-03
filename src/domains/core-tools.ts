@@ -15,7 +15,7 @@ import { existsSync } from 'node:fs';
 import { Database } from 'bun:sqlite';
 import type { LLMToolSpec } from '../llm.js';
 import { debug } from '../debug/log.js';
-import { runRecall, type RecallSearch } from '../tool-runtime/self-cognition-runtimes.js';
+import { runRecall, CONTEXT_NOW_SPEC, type RecallSearch } from '../tool-runtime/self-cognition-runtimes.js';
 import type { ToolRuntimeContext } from '../tool-runtime/types.js';
 import { SCHEDULE_MANAGE_SPEC, dispatchScheduleManage } from './schedule-manage-tool.js';
 import { SESSION_MANAGE_SPEC, dispatchSessionQuery } from './session-query-tool.js';
@@ -114,6 +114,7 @@ const CORE_TOOL_HANDLERS: Record<string, (args: Record<string, unknown>, onParti
   schedule_manage: dispatchScheduleManage,
   session_manage: (args) => dispatchSessionQuery(args), // 대화 세션 검색·열람·목록·삭제(내용/ID/텔레그램)
   memory_recall: dispatchMemoryRecall,
+  context_now: async (args) => (await import('../context-bus/context-now.js')).contextNow({ ...(typeof args.topic === 'string' ? { topic: args.topic } : {}) }),
   fact_check: dispatchFactCheck, // 팩트체크 캐스케이드(내부 발송원장→외부 X/레딧/웹)·도메인 무관 코어
   self_recall: dispatchSelfRecall, // self-awareness(elanous 구현 이력)·도메인 무관 코어
   autopilot_missions: dispatchAutopilotMissions, // 오토파일럿 계보 조회(AL3)·도메인 무관 코어
@@ -141,7 +142,7 @@ const SELF_RECALL_BUDGET_SPEC: LLMToolSpec = {
     },
   },
 };
-export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC];
+export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, CONTEXT_NOW_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC];
 
 export interface CoreTools {
   specs: LLMToolSpec[];

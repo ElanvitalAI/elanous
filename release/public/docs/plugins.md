@@ -6,12 +6,13 @@ A plugin is a folder of skills — and, for elanous, graphs — that you install
 
 | Pack | What it adds | Price |
 |---|---|---|
-| `elanous-basics` | Research and everyday skills: web search and crawling (`omni-crawl`), link digests (`omni-digest`), project onboarding (`project-onboarding`), a grilling interviewer (`grill-me`), photo OCR intake (`photo-intake-ocr`) | Free |
+| `elanous-basics` | Research and everyday skills: web search and crawling (`omni-crawl`), link digests (`omni-digest`), project onboarding (`project-onboarding`), a grilling interviewer (`grill-me`), photo OCR intake (`photo-intake-ocr`), Gmail and Calendar for your own account, plus Drive and Sheets reads (`google-workspace`) | Free |
 | `elanous-media` | Video skills: building videos (`video-builder`) and word-timed motion B-roll (`motion-broll`) | Free |
 | `video-broll` | The first plugin with a graph: cut word-timed motion B-roll into a talking-head video (align words → plan density → author clips with a coding agent → composite → check) | Free |
 | `elanous-hwp` | Korean HWP/HWPX documents: read to Markdown (`hwp-read`), write from templates (`hwp-write`), fill existing forms (`hwp-fill`), plus `to-md`/`from-md` step kinds for graphs | Free |
 | `job-coach` | Career coaching from an interview: job candidates matched to Korea's NCS competency units, researched courses and a report — a personal mode and an enterprise HRD mode | Free |
 | `elanous-markets` | Market research and asset analysis skills | Listed only — not published yet |
+| [`elanous-essentials`](essential-skills.md) | Five essential skills: `youtube-master`, `omni-crawl`, `omni-digest`, `diagram-master`, `lecture-note-digitizer` — [read the guide](essential-skills.md) | Listed only — not published yet |
 
 Some skills need a key for an outside service (for example `omni-digest` uses xAI, `photo-intake-ocr` uses Upstage, `job-coach` uses a public-data NCS service key). The pack lists these as `secret:<service>` capabilities so you see them before you install, and asks for them as connection settings — see [Connection settings](#connection-settings) below.
 

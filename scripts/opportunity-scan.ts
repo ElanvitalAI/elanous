@@ -54,7 +54,7 @@ const report = parts.join('\n');
 if (dry) {
   console.log(report);
 } else {
-  const sent = await sendTelegramReport(cfg, report, { markdown: true });
+  const sent = await sendTelegramReport(cfg, report, { markdown: true, kind: 'report' });
   console.error(sent
     ? '[opportunity-scan] sent to report channel ✓'
     : '[opportunity-scan] no report channel — printing:\n' + report);

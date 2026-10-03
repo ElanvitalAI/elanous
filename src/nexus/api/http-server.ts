@@ -21,6 +21,7 @@ import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-sou
 import { spawnSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 import { createProject, listProjects } from '../../project/project-store.js';
+import { handleOutputsGet, type OutputsDeps } from './outputs-route.js';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
 import { ensureAuthToken } from '../../auth/acp-token.js';
 import type { NexusState } from '../state/state.js';
@@ -42,6 +43,7 @@ import { OPENAI_RELAY_PATH, tryHandleOpenAiRelay } from './openai-relay.js';
 import { handleHealth, type HealthSetupContext } from './health.js';
 import { handleTabsList, handleTabDetail, handleNexusSnapshot } from './tabs.js';
 import { handleSseEvents } from './events.js';
+import { handleInsideEvents, INSIDE_EVENTS_PATH, startInsideEventRelay } from './inside-events.js';
 import { dispatchIntentPredictionRoute } from './intent-prediction.js';
 import { handleNotificationAction } from './notification-action.js';
 import { handleUserIntentEmit, handleUserIntentBatch } from './user-intents.js';
@@ -157,6 +159,7 @@ import {
 } from './vault-api.js';
 import { handleBuildsGet, parseBuildsPath } from './builds-api.js';
 import { handleHarnessAskPost, handleHarnessAskStatusGet, handleHarnessRunEventsGet, handleHarnessRunScreenGet, handleHarnessRunsGet, handleHarnessStopPost } from './harness-api.js';
+import { handleFabricPlans, type FabricPlansRouteOpts } from './fabric-plans.js';
 import { dispatchPersonaRoute } from './personas.js';
 import { handleMe } from './operator.js';
 import { handleOpsApi } from './ops-api.js';
@@ -178,6 +181,7 @@ import { handleChannelBotsGet, handleChannelBotSet } from './setup-channel-bot.j
 import { handleLlmRoutePredict } from './llm-route-predict.js';
 import type { MissionRouter } from '../../llm/mission-router.js';
 import { handleContextFetchUrl } from './context-url.js';
+import { contextNow } from '../../context-bus/context-now.js';
 import type { IntentPredictionService } from '../../intent-prediction/index.js';
 import type { NotificationActionLoopback } from '../../web-push/notification-action-loopback.js';
 import { handlePlatforms } from './platforms.js';
@@ -461,8 +465,11 @@ export function probeNexusHttpPort(
 export type NexusWsBridgeInit = Omit<WsBridgeOpts, 'hostname' | 'port'>;
 
 export interface NexusHttpServerOpts {
+  /** Optional fabric-plan ledger and decomposition seam; production uses the instance root and existing fabric decomposer. */
+  fabricPlans?: FabricPlansRouteOpts;
   /** Optional installer state root for isolated API consumers and tests. */
   pluginStateRoot?: string;
+  outputs?: OutputsDeps;
   execRequests?: ExecRequestRunner;
   seatRequests?: SeatRequestsDeps;
   consultRequests?: ConsultRequestsDeps;
@@ -790,11 +797,13 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
   }
 
   const url = `http://${hostname}:${resolvedPort}`;
+  const stopInsideRelay = startInsideEventRelay();
   return {
     port: resolvedPort,
     hostname,
     url,
     stop() {
+      stopInsideRelay();
       try { server!.stop(true); } catch { /* idempotent */ }
       setInProcessOutbound(null);
     },
@@ -982,6 +991,11 @@ export async function routeRequest(
       const { handleDistIpa } = await import('./dist.js');
       return handleDistIpa(req, filename);
     }
+  }
+
+  if (pathname === INSIDE_EVENTS_PATH) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleInsideEvents(req);
   }
 
   if (pathname === LIVE_SHIPPED_PATH) {
@@ -1312,9 +1326,19 @@ export async function routeRequest(
     return handleGraphsValidatePost(req, opts.metaApi);
   }
 
+  if (pathname === '/v1/fabric/decompose' || pathname.startsWith('/v1/fabric/plans/')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleFabricPlans(req, opts.fabricPlans);
+  }
+
   if (pathname === '/v1/projects' && (method === 'GET' || method === 'POST')) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req);
+  }
+
+  if (method === 'GET' && pathname === '/v1/outputs') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleOutputsGet(req, opts.outputs);
   }
 
   if (pathname === '/v1/config/chat-fast-path' && (method === 'GET' || method === 'PUT')) {
@@ -1326,6 +1350,14 @@ export async function routeRequest(
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
     return (opts.usageHandler ?? handleUsageGet)();
+  }
+
+  // SK2 (PWA) list — GET must be routed before the non-GET block below; the original route sat inside it,
+  // so the PWA banner's GET always fell through to «not-found» (found by the DEMO-RUNa rehearsal · 10-03).
+  if (method === 'GET' && pathname === '/v1/skills/problems') {
+    if (!opts.metaApi) return jsonResponse({ error: 'meta-api-not-wired' }, 503);
+    const { handleSkillProblems } = await import('./skill-problems.js');
+    return handleSkillProblems(req, opts.metaApi);
   }
 
   // Mutation routes (PR ι) — POST/PATCH/DELETE on /v1/nexus/tabs[/:id[/action]].
@@ -2774,6 +2806,10 @@ export async function routeRequest(
   if (pathname === '/v1/personas' || pathname.startsWith('/v1/personas/')) {
     const result = await dispatchPersonaRoute(req, pathname);
     if (result) return result;
+  }
+  if (pathname === '/v1/context/now') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return jsonResponse(contextNow({ ...(url.searchParams.has('topic') ? { topic: url.searchParams.get('topic') ?? '' } : {}) }));
   }
   // §6.3 (2026-05-09) — context URL fetch (showroom).
   // POST /v1/context/fetch-url

@@ -217,7 +217,7 @@ describe('TerminalPanel · live PTY selection without a shell tab', () => {
     const tabPropsBefore = harness.find((element) => typeof element.props.onTabsChange === 'function').props;
     click(harness.find((element) => element.props.className === 'w-full text-left'));
     await harness.settle();
-    const { PtyLiveView } = await import('./PtyLiveView');
+    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
     const live = harness.findAll((element) => element.type === PtyLiveView);
     expect(live).toHaveLength(1);
     expect(live[0]!.props.terminal).toEqual(FOREIGN);
@@ -239,7 +239,7 @@ describe('TerminalPanel · URL PTY selection', () => {
     await renderPanel({ initialPtyId: FOREIGN.id, onPtySelection: (terminal: DaemonTerminalSummary) => selected.push(terminal.id) });
 
     expect(listOptions).toContainEqual({ all: true, includeTest: true });
-    const { PtyLiveView } = await import('./PtyLiveView');
+    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
     expect(harness.find((element) => element.type === PtyLiveView).props.terminal).toEqual(FOREIGN);
     expect(calls).toEqual([{ endpoint: 'scrollback', id: FOREIGN.id, options: { sourceRoot: '/roots/prod/pty/manifest.db' } }]);
     expect(selected).toEqual([]);
@@ -296,7 +296,7 @@ describe('TerminalPanel · URL PTY selection', () => {
     click(harness.find((element) => element.props.className === 'w-full text-left'));
     await harness.settle();
     expect(selected).toEqual([FOREIGN]);
-    const { PtyLiveView } = await import('./PtyLiveView');
+    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
     expect(harness.findAll((element) => element.type === PtyLiveView)).toHaveLength(1);
   });
 });
@@ -314,7 +314,7 @@ describe('TerminalPanel · PTY-list and shell tabs', () => {
     expect(harness.textOf(rows[0]!)).toContain(LOCAL.id);
     click(rows[0]!);
     await harness.settle();
-    const { PtyLiveView } = await import('./PtyLiveView');
+    const { PtyLiveViewLazy: PtyLiveView } = await import('./PtyLiveView.lazy');
     expect(harness.find((element) => element.type === PtyLiveView).props.terminal).toEqual(newest);
     expect(selected).toEqual([newest]);
     expect(harness.find((element) => typeof element.props.onTabsChange === 'function').props.activeId).toBe(tabsBefore);

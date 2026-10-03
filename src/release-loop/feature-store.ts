@@ -278,10 +278,12 @@ function importLegacyAll(): void {
   } finally { db.close(); }
 }
 
-export function list(version: string, released = releasedVersion(), dev = devVersion()): Checklist {
+/** `root` reads another ledger (no legacy JSON import there); omitted = the default ledger as before. */
+export function list(version: string, released?: string, dev = devVersion(), root?: string): Checklist {
   validateVersion(version);
-  importJson(version);
-  const db = open();
+  if (root === undefined) importJson(version);
+  released ??= releasedVersion(root);
+  const db = open(root);
   try { return readTransaction(db, () => snapshot(db, version, released, dev)); } finally { db.close(); }
 }
 

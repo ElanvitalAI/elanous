@@ -46,6 +46,15 @@ function SeatCard({ seat, role, publicCapture, identifiers }: { seat?: OpsSeat; 
         <span key={key} aria-label={`${key} ${checklist[key]}`}>{['🟢', '🟡', '🔴', '✅'][i]} {checklist[key]}</span>)}</>
         : <span className="text-muted-foreground">못 읽음</span>}
     </section>
+    {seat?.subSeats && seat.subSeats.length > 0 && <ul aria-label="하위 자리" className="space-y-1 border-t pt-3">
+      {seat.subSeats.map((sub) => {
+        const text = `└ ${sub.id} ${sub.title} · 열린 칸 ${numberOrUnreadable(sub.open)} · 오늘 착지 ${numberOrUnreadable(sub.landed)} · 막힘 ${numberOrUnreadable(sub.blocked?.length ?? null)}`;
+        const detail = sub.blocked?.length ? ` · ${sub.blocked.map((item) => item.id).join(', ')}` : '';
+        const lines = publicCapture ? visibleLines(text, true, identifiers) : [text];
+        const details = publicCapture ? visibleLines(detail, true, identifiers) : [detail];
+        return lines.map((line, index) => <li key={`${sub.id}-${index}`} className="break-words">{line}{details.join('')}</li>);
+      })}
+    </ul>}
   </article>;
 }
 
@@ -57,6 +66,7 @@ export function SeatBoardContent({ result, refreshedAt, publicCapture = false }:
   const identifiers = seats.flatMap((entry) => [
     ...(entry.landed ?? []).flatMap((item) => [String(item.pr), ...(item.checklistId ? [item.checklistId] : [])]),
     ...(entry.blocked ?? []).map((item) => item.id),
+    ...(entry.subSeats ?? []).flatMap((sub) => (sub.blocked ?? []).map((item) => item.id)),
   ]);
   const total = (field: 'landed' | 'blocked' | 'pendingDecisions') => {
     if (result?.kind !== 'ready' || ORDER.some(({ seat }) => !seats.find((entry) => entry.seat === seat) || seats.find((entry) => entry.seat === seat)?.[field] === null)) return '못 읽음';

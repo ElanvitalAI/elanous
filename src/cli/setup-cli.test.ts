@@ -1,5 +1,8 @@
 import { describe, expect, test, spyOn } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { detectSkillCliAuth, type SkillCli } from '../onboarding/cli-auth-status.js';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Command } from 'commander';
@@ -12,7 +15,7 @@ const ELANOUS_AUTH = JSON.stringify({ version: 1, providers: { 'openai-codex': {
 const CODEX_AUTH = JSON.stringify({ tokens: { access_token: 'access', refresh_token: 'refresh' } });
 const config = (provider?: string, fastPath = true) => ({ llm: { provider }, chat: { fastPath } }) as UserConfig;
 
-type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number };
+type SetupState = { elanous?: boolean; provider?: string; codex?: boolean; externalReady?: boolean; elanousAuth?: string; codexAuth?: string; answer?: string; recommendationAnswer?: string; nonInteractive?: boolean; yes?: boolean; stdinTty?: boolean; runtimeProvider?: string; fastPath?: boolean; doctorFixExitCode?: number; cliPath?: string; deniedSkills?: string[] };
 
 async function runSetup(state: SetupState = {}) {
   const output: string[] = [];
@@ -23,6 +26,7 @@ async function runSetup(state: SetupState = {}) {
   let doctorCalls = 0;
   const doctorFixCalls: string[][] = [];
   let currentProvider = state.provider;
+  let deniedSkills = state.deniedSkills ?? ['github', 'google-workspace', '1password', 'himalaya'];
   const files = new Map<string, string>();
   if (state.elanous) files.set('/home/fake/.elanous/auth.json', state.elanousAuth ?? ELANOUS_AUTH);
   if (state.codex) files.set('/home/fake/.codex/auth.json', state.codexAuth ?? CODEX_AUTH);
@@ -35,8 +39,9 @@ async function runSetup(state: SetupState = {}) {
       if (value === undefined) throw new Error(`missing fake file: ${path}`);
       return value;
     },
-    getUserConfig: () => config(currentProvider, state.fastPath),
-    saveUserConfig: (next) => { writes.push(next); currentProvider = next.llm.provider; },
+    getUserConfig: () => ({ ...config(currentProvider, state.fastPath), skills: { ...config(currentProvider, state.fastPath).skills, deny: deniedSkills } }),
+    saveUserConfig: (next) => { writes.push(next); currentProvider = next.llm.provider; deniedSkills = next.skills.deny ?? []; },
+    detectSkillCliAuth: () => detectSkillCliAuth({ path: state.cliPath ?? '' }),
     runDoctor: () => {
       doctorCalls += 1;
       return {
@@ -53,7 +58,7 @@ async function runSetup(state: SetupState = {}) {
     resolveRuntimeProvider: () => state.runtimeProvider,
   });
   await program.parseAsync(['node', 'elanous', 'setup', ...(state.nonInteractive === false ? [] : ['--non-interactive']), ...(state.yes ? ['--yes'] : [])]);
-  return { text: output.join('\n'), output, errors, exitCodes, writes, prompts, doctorCalls, doctorFixCalls };
+  return { text: output.join('\n'), output, errors, exitCodes, writes, prompts, doctorCalls, doctorFixCalls, deniedSkills };
 }
 
 function section(text: string, heading: string, nextHeading?: string): string {
@@ -196,6 +201,93 @@ describe('setup Claude Code CLI', () => {
 });
 
 describe('setup CLI', () => {
+  test('fake PATH status commands gate CLI skills, preserve public GitHub reads and existing skill choices', async () => {
+    const path = mkdtempSync(join(tmpdir(), 'setup-clis-'));
+    const calls = join(path, 'calls');
+    try {
+      const bodies: Partial<Record<SkillCli, string>> = {
+        gh: `exit 1`,
+        gws: `printf '%s\\n' '{"token_valid":true}'`,
+        op: `exit 1`,
+        himalaya: `exit 0`,
+      };
+      for (const [cli, body] of Object.entries(bodies)) {
+        const file = join(path, cli);
+        writeFileSync(file, `#!/bin/sh\nprintf '%s\\n' "${cli} $*" >> '${calls}'\n${body}\n`);
+        chmodSync(file, 0o700);
+      }
+      const previous = ['my-private-skill', 'google-workspace'];
+      const report = await runSetup({ cliPath: path, deniedSkills: previous, provider: 'openai-codex' });
+      expect(report.deniedSkills).toEqual(previous);
+      expect(report.writes).toEqual([]);
+      expect(report.text).toContain('gh: found=yes / enabled=no / skipped (not authenticated)');
+      expect(report.text).toContain('gws: found=yes / enabled=no / skipped (not enabled; run setup to apply)');
+      expect(report.text).toContain('op: found=yes / enabled=no / skipped (not authenticated)');
+      expect(report.text).toContain('himalaya: found=yes / enabled=yes / enabled');
+      expect(report.text).toContain('public GitHub repository reads remain available without login');
+
+      const applied = await runSetup({ cliPath: path, deniedSkills: previous, provider: 'openai-codex', nonInteractive: false, yes: true });
+      expect(applied.deniedSkills).toEqual(['my-private-skill', 'github', '1password']);
+      expect(applied.writes).toHaveLength(1);
+      expect(applied.text).toContain('gws: found=yes / enabled=yes / enabled');
+      expect(applied.text).toContain('gh: found=yes / enabled=no / skipped (not authenticated)');
+      expect(applied.deniedSkills).not.toContain('omni-digest');
+      expect(applied.text).not.toContain('skipped (SECRET');
+      expect(readFileSync(calls, 'utf8').trim().split('\n')).toEqual([
+        'gh auth status', 'gws auth status', 'op whoami', 'himalaya account check',
+        'gh auth status', 'gws auth status', 'op whoami', 'himalaya account check',
+        'gh auth status', 'gws auth status', 'op whoami', 'himalaya account check',
+      ]);
+      const again = await runSetup({ cliPath: path, deniedSkills: applied.deniedSkills, provider: 'openai-codex', nonInteractive: false, yes: true });
+      expect(again.writes).toEqual([]);
+      writeFileSync(join(path, 'gh'), `#!/bin/sh\nprintf '%s\\n' "gh $*" >> '${calls}'\nexit 0\n`);
+      chmodSync(join(path, 'gh'), 0o700);
+      const loggedIn = await runSetup({ cliPath: path, deniedSkills: applied.deniedSkills, provider: 'openai-codex', nonInteractive: false, yes: true });
+      expect(loggedIn.deniedSkills).not.toContain('github');
+      expect(loggedIn.text).toContain('gh: found=yes / enabled=yes / enabled');
+    } finally { rmSync(path, { recursive: true, force: true }); }
+  });
+
+  test('user allowlist remains in charge of enabled status', async () => {
+    const path = mkdtempSync(join(tmpdir(), 'setup-allow-path-'));
+    try {
+      const file = join(path, 'gws');
+      writeFileSync(file, '#!/bin/sh\nprintf \'{"token_valid":true}\\n\'\n');
+      chmodSync(file, 0o700);
+      const output: string[] = [];
+      const saved: UserConfig[] = [];
+      const program = new Command();
+      const cfg = { ...config('openai-codex'), skills: { allow: ['my-private-skill'], deny: ['google-workspace'] } } as UserConfig;
+      registerSetupCommand(program, {
+        runDoctor: () => ({ ok: true, credentials: [], externalCommands: [] }),
+        homeDir: () => '/missing', exists: () => false,
+        resolveRuntimeProvider: () => 'openai-codex',
+        getUserConfig: () => cfg, saveUserConfig: (next) => saved.push(next),
+        detectSkillCliAuth: () => detectSkillCliAuth({ path }),
+        runDoctorFix: async () => 0,
+        isStdinTty: () => false, out: { log: (line) => output.push(line) },
+        setExitCode: () => {},
+      });
+      await program.parseAsync(['node', 'elanous', 'setup', '--yes']);
+      expect(saved).toHaveLength(1);
+      expect(saved[0]!.skills.allow).toEqual(['my-private-skill']);
+      expect(saved[0]!.skills.deny).toContain('google-workspace');
+      expect(output.join('\n')).toContain('gws: found=yes / enabled=no / skipped (excluded by skills.allow)');
+    } finally { rmSync(path, { recursive: true, force: true }); }
+  });
+
+  test('missing CLIs report skipped without changing public repository skill visibility', async () => {
+    const path = mkdtempSync(join(tmpdir(), 'setup-empty-path-'));
+    try {
+      const report = await runSetup({ cliPath: path, provider: 'openai-codex' });
+      for (const cli of ['gh', 'gws', 'op', 'himalaya']) {
+        expect(report.text).toContain(`${cli}: found=no / enabled=no / skipped (not on PATH)`);
+      }
+      expect(report.writes).toEqual([]);
+      expect(report.text).toContain('public GitHub repository reads remain available without login');
+    } finally { rmSync(path, { recursive: true, force: true }); }
+  });
+
   test('setup completion prints the two recommendations with the current fastPath in both modes', async () => {
     for (const fastPath of [true, false]) {
       for (const nonInteractive of [true, false]) {

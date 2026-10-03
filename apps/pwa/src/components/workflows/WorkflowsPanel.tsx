@@ -14,11 +14,14 @@
 'use client';
 
 import { newWorkflowNameProblem, withWorkflowName, workflowSaveErrorText } from './workflow-save';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { exportFileName } from './workflow-file';
+import { phonePaneFor, type PhonePane } from './phone-pane';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
   GitBranch,
   Play,
   Save,
+  Download,
   Trash2,
   AlertCircle,
   CheckCircle2,
@@ -47,15 +50,18 @@ import {
   usePendingApprovals,
   useWorkflowEvents,
 } from '@/nexus/hooks/use-workflows';
-import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
+import { useNexusClient, useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
 import type {
   GraphKindEntry,
   WorkflowSummary,
   WorkflowRunEvent,
 } from '@/nexus/client';
 import { WorkflowGraph } from './WorkflowGraph';
+import { WorkflowCreateModal } from './WorkflowCreateModal';
 import { WorkflowNLPrompt } from './WorkflowNLPrompt';
 import { WorkflowNodeEditor } from './WorkflowNodeEditor';
+import { NodeRunPanel } from './NodeRunPanel';
+import { ChatPreviewPanel } from './ChatPreviewPanel';
 import {
   definitionToYaml,
   deleteNode as defDeleteNode,
@@ -67,26 +73,28 @@ import { RunsListPanel } from './RunsListPanel';
 import { ApprovalModal } from './ApprovalModal';
 import { LEFT_RAIL_WIDTH_PX, RIGHT_RAIL_WIDTH_PX, usePanelLayout } from './usePanelLayout';
 
+const PHONE_QUERY = '(max-width: 639px)';
+
+function subscribePhoneWidth(onChange: () => void): () => void {
+  if (typeof window === 'undefined' || !window.matchMedia) return () => {};
+  const media = window.matchMedia(PHONE_QUERY);
+  media.addEventListener('change', onChange);
+  return () => media.removeEventListener('change', onChange);
+}
+
+function getPhoneWidth(): boolean {
+  return typeof window !== 'undefined' && !!window.matchMedia?.(PHONE_QUERY).matches;
+}
+
+function usePhoneWidth(): boolean {
+  return useSyncExternalStore(subscribePhoneWidth, getPhoneWidth, () => false);
+}
+
 const SOURCE_LABEL: Record<WorkflowSummary['source'], string> = {
   project: 'Project',
   global: 'Global',
   builtin: 'Built-in',
 };
-
-const NEW_WORKFLOW_TEMPLATE = `name: my-workflow
-description: |
-  Use when: …
-  Triggers: …
-  Does: …
-  NOT for: …
-
-provider: claude
-model: sonnet
-
-nodes:
-  - id: first
-    bash: echo hello
-`;
 
 export function WorkflowsPanel({ palette }: { palette?: GraphKindEntry[] } = {}) {
   // SSG safety (Archon-port follow-up · 2026-05-08): the static export
@@ -121,12 +129,19 @@ function WorkflowsUnconfigured() {
 }
 
 function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
+  const nexusClientForCredentials = useNexusClient();
   const list = useWorkflows();
   const [selectedName, setSelectedName] = useState<string | null>(null);
+  const isPhone = usePhoneWidth();
+  const [requestedPhonePane, setRequestedPhonePane] = useState<PhonePane | null>(null);
+  const phonePane = phonePaneFor(requestedPhonePane, selectedName);
+  const [previewWorkflow, setPreviewWorkflow] = useState<string | null>(null);
   const [draftYaml, setDraftYaml] = useState<string>('');
+  const [draftForName, setDraftForName] = useState<string | null>(null);
   const [args, setArgs] = useState<string>('');
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [creatingNew, setCreatingNew] = useState(false);
+  const [showCreateModal, setShowCreateModal] = useState(false);
   const [newName, setNewName] = useState('');
   const [saveError, setSaveError] = useState<string | null>(null);
   // Keep the YAML subview available for raw edits; open the existing graph editor first.
@@ -220,10 +235,11 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   // When the active workflow detail loads, hydrate the draft.
   useEffect(() => {
     if (creatingNew) return;
-    if (detail.data?.yaml !== undefined) {
+    if (detail.data?.yaml !== undefined && detail.data.name === selectedName) {
       setDraftYaml(detail.data.yaml);
+      setDraftForName(selectedName);
     }
-  }, [detail.data?.yaml, creatingNew]);
+  }, [detail.data?.yaml, detail.data?.name, creatingNew, selectedName]);
 
   // Debounced live validation — fires 600ms after the last edit.
   // Caveat #5 follow-up (2026-05-08): in-flight requests are aborted
@@ -273,6 +289,9 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
     () => (draftYaml.trim() ? safeParseWorkflowYaml(draftYaml) : null),
     [draftYaml],
   );
+  const hasChatTrigger = !!parsedForGraph?.nodes.some((node) =>
+    node.chatTrigger !== null && typeof node.chatTrigger === 'object' && !Array.isArray(node.chatTrigger),
+  );
   const nodeIssues = useMemo(() => {
     if (!parsedForGraph || issues.length === 0) return undefined;
     return groupIssuesByNodeId(issues, parsedForGraph).byNodeId;
@@ -284,19 +303,42 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   }, [parsedForGraph]);
 
   const handleSelect = (name: string) => {
+    setPreviewWorkflow(null);
+    setDraftForName(null);
     setSelectedName(name);
+    setRequestedPhonePane('canvas');
+    setShowRunsList(false);
     setCreatingNew(false);
     setActiveRunId(null);
     setSelectedNodeId(null);
   };
 
-  const handleNew = () => {
+  const handleNew = (yaml: string, suggestedName?: string) => {
+    setPreviewWorkflow(null);
+    setDraftForName(null);
     setCreatingNew(true);
+    setRequestedPhonePane('canvas');
     setSelectedName(null);
-    setNewName('');
-    setDraftYaml(NEW_WORKFLOW_TEMPLATE);
+    setNewName(suggestedName ?? '');
+    setDraftYaml(yaml);
     setActiveRunId(null);
     setSelectedNodeId(null);
+    setShowRunsList(false);
+    setSaveError(null);
+  };
+
+  const handleExport = () => {
+    if (!draftYaml.trim()) return;
+    const url = URL.createObjectURL(new Blob([draftYaml], { type: 'application/x-yaml' }));
+    try {
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = exportFileName(creatingNew ? newName : selectedName ?? '');
+      document.body.appendChild(link);
+      try { link.click(); } finally { link.remove(); }
+    } finally {
+      URL.revokeObjectURL(url);
+    }
   };
 
   const handleSave = async () => {
@@ -318,6 +360,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
       });
       setCreatingNew(false);
       setSelectedName(targetName);
+      setDraftForName(targetName);
     } catch (err) {
       setSaveError(workflowSaveErrorText(err));
     }
@@ -340,6 +383,9 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
     try {
       await remove.mutateAsync({ name: selectedName, scope });
       setSelectedName(null);
+      setRequestedPhonePane('list');
+      setPreviewWorkflow(null);
+      setDraftForName(null);
       setDraftYaml('');
     } catch {
       // surfaces in badge
@@ -361,8 +407,9 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
   // canvas-only toggle (N shortcut). Persisted to localStorage so the
   // user's preferred layout survives a reload.
   const layout = usePanelLayout();
-  const showLeft = !layout.canvasOnly;
-  const showRight = !layout.canvasOnly;
+  const showLeft = isPhone ? phonePane === 'list' : !layout.canvasOnly;
+  const showRight = isPhone ? phonePane === 'run' : !layout.canvasOnly;
+  const showCenter = !isPhone || phonePane === 'canvas';
   const leftWidth = layout.leftCollapsed ? LEFT_RAIL_WIDTH_PX : layout.leftWidthPx;
   const rightWidth = layout.rightCollapsed ? RIGHT_RAIL_WIDTH_PX : layout.rightWidthPx;
 
@@ -427,34 +474,38 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
           </span>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={layout.toggleLeft}
-            title={layout.leftCollapsed ? 'Show workflow list' : 'Collapse workflow list'}
-            className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-tertiary hover:bg-surface-elevated"
-          >
-            {layout.leftCollapsed ? <PanelLeftOpen className="h-3 w-3" /> : <PanelLeftClose className="h-3 w-3" />}
-          </button>
-          <button
-            type="button"
-            onClick={layout.toggleCanvasOnly}
-            title={layout.canvasOnly ? 'Exit canvas-only (Cmd+\\)' : 'Canvas-only mode (Cmd+\\)'}
-            className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] transition-colors ${
-              layout.canvasOnly
-                ? 'border-accent/50 bg-accent/15 text-accent'
-                : 'border-border text-text-tertiary hover:bg-surface-elevated'
-            }`}
-          >
-            {layout.canvasOnly ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
-          </button>
-          <button
-            type="button"
-            onClick={layout.toggleRight}
-            title={layout.rightCollapsed ? 'Show run panel' : 'Collapse run panel'}
-            className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-tertiary hover:bg-surface-elevated"
-          >
-            {layout.rightCollapsed ? <PanelRightOpen className="h-3 w-3" /> : <PanelRightClose className="h-3 w-3" />}
-          </button>
+          {!isPhone && (
+            <>
+              <button
+                type="button"
+                onClick={layout.toggleLeft}
+                title={layout.leftCollapsed ? 'Show workflow list' : 'Collapse workflow list'}
+                className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-tertiary hover:bg-surface-elevated"
+              >
+                {layout.leftCollapsed ? <PanelLeftOpen className="h-3 w-3" /> : <PanelLeftClose className="h-3 w-3" />}
+              </button>
+              <button
+                type="button"
+                onClick={layout.toggleCanvasOnly}
+                title={layout.canvasOnly ? 'Exit canvas-only (Cmd+\\)' : 'Canvas-only mode (Cmd+\\)'}
+                className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] transition-colors ${
+                  layout.canvasOnly
+                    ? 'border-accent/50 bg-accent/15 text-accent'
+                    : 'border-border text-text-tertiary hover:bg-surface-elevated'
+                }`}
+              >
+                {layout.canvasOnly ? <Minimize2 className="h-3 w-3" /> : <Maximize2 className="h-3 w-3" />}
+              </button>
+              <button
+                type="button"
+                onClick={layout.toggleRight}
+                title={layout.rightCollapsed ? 'Show run panel' : 'Collapse run panel'}
+                className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-tertiary hover:bg-surface-elevated"
+              >
+                {layout.rightCollapsed ? <PanelRightOpen className="h-3 w-3" /> : <PanelRightClose className="h-3 w-3" />}
+              </button>
+            </>
+          )}
           {pendingCount > 0 && (
             <button
               type="button"
@@ -473,7 +524,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
           )}
           <button
             type="button"
-            onClick={() => setShowRunsList((s) => !s)}
+            onClick={() => { setShowRunsList((s) => !s); if (isPhone) setRequestedPhonePane('canvas'); }}
             className={`flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] transition-colors ${
               showRunsList
                 ? 'border-primary/40 bg-primary/15 text-primary'
@@ -498,7 +549,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
           </button>
           <button
             type="button"
-            onClick={handleNew}
+            onClick={() => setShowCreateModal(true)}
             className="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-accent-hover transition-colors"
           >
             + New
@@ -506,14 +557,31 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
         </div>
       </header>
 
+      {isPhone && (
+        <nav aria-label="편집기 칸" role="tablist" className="flex border-b border-border">
+          {([['list', '목록'], ['canvas', '캔버스'], ['run', '실행']] as const).map(([pane, label]) => (
+            <button
+              key={pane}
+              type="button"
+              role="tab"
+              aria-selected={phonePane === pane}
+              onClick={() => { setRequestedPhonePane(pane); if (pane === 'canvas') setShowRunsList(false); }}
+              className={`min-w-0 flex-1 px-2 py-2 text-xs font-medium ${phonePane === pane ? 'border-b-2 border-accent text-text-primary' : 'text-text-tertiary'}`}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+      )}
+
       <div className="flex flex-1 overflow-hidden">
         {/* Left: list (collapsed → narrow rail with vertical chevron) */}
         {showLeft && (
           <aside
-            style={{ width: leftWidth }}
-            className="shrink-0 overflow-y-auto border-r border-border"
+            style={isPhone ? undefined : { width: leftWidth }}
+            className={`shrink-0 overflow-y-auto border-r border-border ${isPhone ? 'w-full min-w-0' : ''}`}
           >
-            {layout.leftCollapsed ? (
+            {!isPhone && layout.leftCollapsed ? (
               <button
                 type="button"
                 onClick={layout.toggleLeft}
@@ -537,7 +605,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
         )}
 
         {/* Drag-resize divider between left + center */}
-        {showLeft && !layout.leftCollapsed && (
+        {!isPhone && showLeft && !layout.leftCollapsed && (
           <div
             role="separator"
             aria-orientation="vertical"
@@ -550,12 +618,15 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
         )}
 
         {/* Center: editor OR Runs list (§5.2 toggle via header) */}
+        {showCenter && (
         <section className="flex flex-1 flex-col overflow-hidden min-w-0">
           {showRunsList ? (
             <RunsListPanel
               selectedRunId={activeRunId}
               onSelect={(runId, workflowName) => {
                 setActiveRunId(runId);
+                setPreviewWorkflow(null);
+                setDraftForName(null);
                 // Also load the run's workflow into the editor so the
                 // user lands somewhere coherent when toggling back to
                 // Editor view. No-op when the workflow has been
@@ -564,6 +635,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
                 setSelectedName(workflowName);
                 setCreatingNew(false);
                 setShowRunsList(false);
+                if (isPhone) setRequestedPhonePane('run');
               }}
             />
           ) : (
@@ -579,6 +651,8 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
                   // Generation produced a fresh workflow → flip into
                   // creatingNew so Save → PUT writes a new file.
                   setCreatingNew(true);
+                  setPreviewWorkflow(null);
+                  setDraftForName(null);
                   setSelectedName(null);
                   setNewName(result.definition.name);
                   setActiveRunId(null);
@@ -613,6 +687,15 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
                 <EditorModeToggle mode={editorMode} onChange={setEditorMode} />
               </div>
               <div className="flex items-center gap-2">
+                {draftForName === selectedName && detail.data?.name === selectedName && hasChatTrigger && (
+                  <button
+                    type="button"
+                    onClick={() => { setPreviewWorkflow(selectedName); if (isPhone) setRequestedPhonePane('run'); else if (layout.rightCollapsed) layout.toggleRight(); }}
+                    className="rounded-md border border-border px-2 py-1 text-xs text-text-primary hover:bg-surface-elevated"
+                  >
+                    대화 미리보기
+                  </button>
+                )}
                 <ValidationBadge status={validationStatus} />
               </div>
             </div>
@@ -625,7 +708,7 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
                   yaml={draftYaml}
                   editable={!isReadonly}
                   onChangeYaml={setDraftYaml}
-                  onNodeClick={isReadonly ? undefined : (id) => setSelectedNodeId(id)}
+                  onNodeClick={(id) => setSelectedNodeId(id)}
                   nodeStatuses={nodeStatuses}
                   nodeIssues={nodeIssues}
                   cycleNodeIds={cycleNodeIds}
@@ -634,23 +717,33 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
                   onRun={selectedName && !creatingNew ? handleRun : undefined}
                 />
               </div>
-              {selectedNodeId && !isReadonly && (() => {
-                const parsedDef = safeParseWorkflowYaml(draftYaml);
-                if (!parsedDef) return null;
-                return (
-                  <WorkflowNodeEditor
-                    definition={parsedDef}
-                    nodeId={selectedNodeId}
-                    palette={palette}
-                    onChange={(nextDef) => setDraftYaml(definitionToYaml(nextDef))}
-                    onClose={() => setSelectedNodeId(null)}
-                    onDelete={() => {
-                      setDraftYaml(definitionToYaml(defDeleteNode(parsedDef, selectedNodeId)));
-                      setSelectedNodeId(null);
-                    }}
-                  />
-                );
-              })()}
+              {selectedNodeId && parsedForGraph?.nodes.some((node) => node.id === selectedNodeId) && (
+                <div className="max-h-[50%] shrink-0 overflow-y-auto border-t border-border">
+                  {!isReadonly && (
+                    <WorkflowNodeEditor
+                      definition={parsedForGraph}
+                      nodeId={selectedNodeId}
+                      palette={palette}
+                      credentialsClient={nexusClientForCredentials}
+                      onChange={(nextDef) => setDraftYaml(definitionToYaml(nextDef))}
+                      onClose={() => setSelectedNodeId(null)}
+                      onDelete={() => {
+                        setDraftYaml(definitionToYaml(defDeleteNode(parsedForGraph, selectedNodeId)));
+                        setSelectedNodeId(null);
+                      }}
+                    />
+                  )}
+                  {selectedName && !creatingNew && (
+                    <NodeRunPanel
+                      key={`${selectedName}:${selectedNodeId}`}
+                      workflowName={selectedName}
+                      nodeId={selectedNodeId}
+                      events={runDetail.data?.events ?? []}
+                      readOnly={isReadonly}
+                    />
+                  )}
+                </div>
+              )}
             </div>
           ) : (
             <textarea
@@ -721,6 +814,15 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
             )}
             <button
               type="button"
+              onClick={handleExport}
+              disabled={!draftYaml.trim()}
+              className="flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[11px] text-text-primary hover:bg-surface-elevated disabled:opacity-50"
+            >
+              <Download className="h-3 w-3" />
+              내보내기
+            </button>
+            <button
+              type="button"
               onClick={handleSave}
               disabled={(!selectedName && !creatingNew) || isReadonly || save.isPending}
               className="flex items-center gap-1 rounded-md bg-primary px-3 py-1 text-[11px] font-medium text-primary-foreground hover:bg-accent-hover disabled:opacity-50"
@@ -732,9 +834,10 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
           </>
           )}
         </section>
+        )}
 
         {/* Drag-resize divider between center + right */}
-        {showRight && !layout.rightCollapsed && (
+        {!isPhone && showRight && !layout.rightCollapsed && (
           <div
             role="separator"
             aria-orientation="vertical"
@@ -749,10 +852,10 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
         {/* Right: run panel (collapsed → narrow rail) */}
         {showRight && (
           <aside
-            style={{ width: rightWidth }}
-            className="flex shrink-0 flex-col overflow-hidden border-l border-border"
+            style={isPhone ? undefined : { width: rightWidth }}
+            className={`flex shrink-0 flex-col overflow-hidden border-l border-border ${isPhone ? 'w-full min-w-0' : ''}`}
           >
-            {layout.rightCollapsed ? (
+            {!isPhone && layout.rightCollapsed ? (
               <button
                 type="button"
                 onClick={layout.toggleRight}
@@ -761,6 +864,8 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
               >
                 <PanelRightOpen className="h-4 w-4" />
               </button>
+            ) : previewWorkflow && previewWorkflow === selectedName && draftForName === selectedName && detail.data?.name === selectedName && hasChatTrigger && !creatingNew ? (
+              <ChatPreviewPanel key={previewWorkflow} workflow={previewWorkflow} onClose={() => setPreviewWorkflow(null)} />
             ) : (
               <>
                 <div className="border-b border-border px-3 py-2">
@@ -802,6 +907,13 @@ function WorkflowsPanelInner({ palette }: { palette?: GraphKindEntry[] }) {
           </aside>
         )}
       </div>
+      {showCreateModal && (
+        <WorkflowCreateModal
+          onApply={handleNew}
+          onOpenAI={() => { setShowCreateModal(false); setShowRunsList(false); setShowNLPrompt(true); }}
+          onClose={() => setShowCreateModal(false)}
+        />
+      )}
       {activeApproval && !approvalDismissed.has(activeApproval.runId) && (
         <ApprovalModal
           runId={activeApproval.runId}

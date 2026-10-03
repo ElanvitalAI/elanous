@@ -1,11 +1,12 @@
-import { CLAIM_IDLE_HOURS, PR_LABELS } from '../github/pr-labels.js';
+import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
+import { debug } from '../debug/log.js';
 import { decideDraft, type DraftTriagePr } from './draft-triage-rules.js';
 
 export interface SweepDraft extends DraftTriagePr {
   readonly title: string;
   readonly labels: readonly string[];
   readonly createdAt: string;
-  /** Last PR update (push, label, comment). Missing ⇒ running claim stays untouched; other drafts use legacy triage. */
+  /** Last PR update (push, label, comment). Missing ⇒ no idle-based close; merged twins can still close. */
   readonly updatedAt?: string;
   readonly runId?: string | null;
 }
@@ -18,7 +19,7 @@ export interface DraftSweepAdapters {
   /** Each call returns one complete page; a rejection must not be mistaken for an empty page. */
   listDrafts(page: number, perPage: number, repository: string): Promise<readonly SweepDraft[]>;
   listMerged(page: number, perPage: number, repository: string): Promise<readonly SweepMergedPr[]>;
-  /** Undefined means no run assessment; it does not authorize a close. */
+  /** Undefined means no run assessment; a merged twin or 24h idle draft can still authorize a close. */
   getRunStatus(draft: SweepDraft, repository: string): Promise<string | undefined>;
   /** Undefined means liveness could not be established. */
   listLiveBranches(repository: string): Promise<ReadonlySet<string> | undefined>;
@@ -51,6 +52,7 @@ export interface DraftSweepResult {
   apply: boolean;
   complete: boolean;
   entries: DraftSweepEntry[];
+  counts: Record<string, number>;
   /** Drafts whose run could not be observed from here (kept, or closed by the idle rule). */
   unobserved?: number;
   /** Closes decided this tick (at most DRAFT_SWEEP_CLOSE_CAP). */
@@ -73,11 +75,8 @@ const stalledLabel = label('close', 'stalled');
 const supersededLabel = label('close', 'superseded');
 const approvalLabel = PR_LABELS.find((entry) => entry.axis === 'state' && entry.sweep.action === 'none')?.name;
 const keepLabel = PR_LABELS.find((entry) => entry.sweep.action === 'exclude')?.name;
+const releaseHoldLabel = PR_LABELS.find((entry) => entry.axis === 'addon' && entry.sweep.action === 'none')?.name;
 const PAGE_SIZE = 100;
-/** 🅢 2026-09-28 (lead decision, channel #20798 04:1x): a run the sweeper cannot see is closed as stalled only when its branch
- *  is not in a host worktree and the draft has been idle this long. A Pod lives at most POD_JOB_DEADLINE_SECONDS (3h), so a
- *  draft idle for 48h cannot belong to a running Pod — the «not in a running Pod» condition follows from the idle time. */
-export const UNOBSERVED_IDLE_CLOSE_HOURS = 48;
 /** At most this many closes per tick, so a wrong rule cannot close everything at once. */
 export const DRAFT_SWEEP_CLOSE_CAP = 10;
 
@@ -94,7 +93,16 @@ async function collectPages<T>(fetch: (page: number, perPage: number) => Promise
 
 /** A failed inventory or liveness lookup is never treated as proof that a draft can be closed. */
 export async function runDraftSweep({ repository, adapters, apply = false, now = new Date() }: DraftSweepOptions): Promise<DraftSweepResult> {
-  const result: DraftSweepResult = { repository, apply, complete: false, entries: [] };
+  const result: DraftSweepResult = { repository, apply, complete: false, entries: [], counts: {} };
+  const record = (entry: DraftSweepEntry): void => {
+    result.entries.push(entry);
+    result.counts[entry.reason] = (result.counts[entry.reason] ?? 0) + 1;
+    debug.log('drafts.cleanup', 'decided', { number: entry.number, action: entry.action, reason: entry.reason });
+  };
+  const finish = (): DraftSweepResult => {
+    debug.log('drafts.cleanup', 'summary', result.counts);
+    return result;
+  };
   let drafts: SweepDraft[];
   let merged: SweepMergedPr[];
   let liveBranches: ReadonlySet<string> | undefined;
@@ -109,7 +117,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       || merged.some((pr) => !Number.isInteger(pr.number) || !pr.branch)) throw new Error('Invalid PR inventory');
   } catch (error) {
     result.error = String(error);
-    return result;
+    return finish();
   }
   let statuses: Map<number, string | undefined>;
   try {
@@ -117,7 +125,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     for (const draft of drafts) statuses.set(draft.number, await adapters.getRunStatus(draft, repository));
   } catch (error) {
     result.error = String(error);
-    return result;
+    return finish();
   }
   result.complete = true;
   let closes = 0;
@@ -128,39 +136,41 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     const runStatus = statuses.get(draft.number);
     const states = stateLabels.filter((state) => draft.labels.includes(state.name));
     const contradiction = states.length > 1 || draft.labels.includes(approvalLabel ?? '');
-    if (!contradiction && draft.labels.includes(keepLabel ?? '')) {
-      result.entries.push({ number: draft.number, action: 'keep', reason: `label:${keepLabel}`, applied: false });
+    if (draft.labels.includes(releaseHoldLabel ?? '') || (!contradiction && draft.labels.includes(keepLabel ?? ''))) {
+      const held = draft.labels.includes(keepLabel ?? '') ? keepLabel : releaseHoldLabel;
+      record({ number: draft.number, action: 'keep', reason: `label:${held}`, applied: false });
       continue;
     }
     const isClaimed = !contradiction && draft.labels.includes(runningLabel);
     const ageHours = (now.getTime() - Date.parse(draft.createdAt)) / 3_600_000;
+    const idleHours = typeof draft.updatedAt === 'string' && Number.isFinite(Date.parse(draft.updatedAt))
+      ? (now.getTime() - Date.parse(draft.updatedAt)) / 3_600_000 : NaN;
     // An unobserved claim may still have a merged twin: liveness/holds retain their priority,
     // but a superseded draft must not be hidden by the six-hour claim window.
-    const mergedDecision = isClaimed ? decideDraft({ draft, runStatus: runStatus ?? 'ended-unclosed', mergedTwins: merged, liveBranches, ageHours }) : undefined;
+    const mergedDecision = isClaimed ? decideDraft({ draft, runStatus, mergedTwins: merged, liveBranches, ageHours: idleHours }) : undefined;
     const supersededClaim = mergedDecision?.reason.startsWith('superseded-by #') === true;
     // Without an observed update time, neither expiration nor a fallback to creation time can authorize mutation —
     // but a merged twin does not need the update time, so superseded keeps its priority over the unobserved claim.
     if (isClaimed && !supersededClaim && (typeof draft.updatedAt !== 'string' || !Number.isFinite(Date.parse(draft.updatedAt)))) {
-      result.entries.push({ number: draft.number, action: 'keep', reason: 'claim-update-unobserved', applied: false });
+      record({ number: draft.number, action: 'keep', reason: 'claim-update-unobserved', applied: false });
       continue;
     }
-    const claimIdleHours = draft.updatedAt === undefined ? NaN : (now.getTime() - Date.parse(draft.updatedAt)) / 3_600_000;
-    if (isClaimed && !supersededClaim && Number.isFinite(claimIdleHours) && claimIdleHours < CLAIM_IDLE_HOURS) {
+    if (isClaimed && !supersededClaim && Number.isFinite(idleHours) && idleHours < CLAIM_IDLE_HOURS) {
       claimed += 1;
-      result.entries.push({ number: draft.number, action: 'keep', reason: `label:running(<${CLAIM_IDLE_HOURS}h)`, applied: false });
+      record({ number: draft.number, action: 'keep', reason: `label:running(<${CLAIM_IDLE_HOURS}h)`, applied: false });
       continue;
     }
-    if (isClaimed && !supersededClaim && Number.isFinite(claimIdleHours) && claimIdleHours >= CLAIM_IDLE_HOURS) {
+    if (isClaimed && !supersededClaim && Number.isFinite(idleHours) && idleHours >= CLAIM_IDLE_HOURS) {
       claimExpired += 1;
       if (runStatus === 'running' || runStatus === 'probable-running' || liveBranches.has(draft.branch)) {
-        result.entries.push({ number: draft.number, action: 'keep', reason: 'claim-expired-but-live', applied: false });
+        record({ number: draft.number, action: 'keep', reason: 'claim-expired-but-live', applied: false });
         continue;
       }
       const action = closes >= DRAFT_SWEEP_CLOSE_CAP ? 'keep' : 'close';
       if (action === 'close') closes += 1;
       const entry: DraftSweepEntry = { number: draft.number, action, reason: action === 'close' ? 'claim-expired' : 'close-cap',
         ...(action === 'close' ? { statusLabel: stalledLabel } : {}), applied: false };
-      result.entries.push(entry);
+      record(entry);
       if (!apply || action !== 'close') continue;
       let labelsChanged = false;
       try {
@@ -178,17 +188,12 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
     }
     // Unlabelled non-harness drafts are outside the sweeper's jurisdiction.
     if (!contradiction && !states.length && !draft.branch.startsWith('self-impl/')) {
-      result.entries.push({ number: draft.number, action: 'keep', reason: 'outside-harness', applied: false });
+      record({ number: draft.number, action: 'keep', reason: 'outside-harness', applied: false });
       continue;
     }
-    let decision = supersededClaim ? mergedDecision! : decideDraft({ draft, runStatus, mergedTwins: merged, liveBranches, ageHours });
-    if (decision.reason === 'unobserved') {
-      unobserved += 1;
-      const idleHours = (now.getTime() - Date.parse(draft.updatedAt ?? draft.createdAt)) / 3_600_000;
-      if (!liveBranches.has(draft.branch) && Number.isFinite(idleHours) && idleHours >= UNOBSERVED_IDLE_CLOSE_HOURS) {
-        decision = { action: 'close', reason: 'unobserved-idle' };
-      }
-    }
+    let decision = supersededClaim ? mergedDecision! : decideDraft({ draft, runStatus, mergedTwins: merged, liveBranches,
+      ageHours: runStatus ? ageHours : idleHours });
+    if (!runStatus && (decision.reason === 'unobserved' || decision.reason === 'stale-unobserved')) unobserved += 1;
     if (!contradiction && decision.action === 'close') {
       if (closes >= DRAFT_SWEEP_CLOSE_CAP) decision = { action: 'keep', reason: 'close-cap' };
       else closes += 1;
@@ -202,7 +207,7 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
       ? decision.reason.startsWith('superseded-by #') ? supersededLabel : stalledLabel
       : isLive ? (states.length ? runningLabel : undefined) : runStatus && (states[0]?.name === runningLabel || states.length === 0) ? stalledLabel : undefined;
     const entry: DraftSweepEntry = { number: draft.number, action, reason, ...(target ? { statusLabel: target } : {}), applied: false };
-    result.entries.push(entry);
+    record(entry);
     if (!apply || action === 'report') continue;
     let labelsChanged = false;
     try {
@@ -213,8 +218,8 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
         labelsChanged = true;
       }
       if (action === 'close') {
-        await adapters.closeDraft(repository, draft.number, decision.reason === 'unobserved-idle'
-          ? `Draft sweep: run unobserved — no run record reachable here, no host worktree for this branch, idle ≥${UNOBSERVED_IDLE_CLOSE_HOURS}h. Closed as stalled. Branch preserved; reopen to restore.`
+        await adapters.closeDraft(repository, draft.number, decision.reason === 'stale-unobserved'
+          ? `Draft sweep: run unobserved — no run record reachable here, no host worktree for this branch, idle ≥${STALLED_DRAFT_HOURS}h. Closed as stalled. Branch preserved; reopen to restore.`
           : `Draft sweep: ${decision.reason}. Branch preserved.`);
       }
       entry.applied = labelsChanged || action === 'close';
@@ -227,5 +232,5 @@ export async function runDraftSweep({ repository, adapters, apply = false, now =
   result.closed = closes;
   result.claimed = claimed;
   result.claimExpired = claimExpired;
-  return result;
+  return finish();
 }

@@ -81,6 +81,7 @@ import { createPwaConfirmChannel, createPwaQuestionChannel } from './hitl-pwa-ch
 import type { NexusEventBus } from './event-bus.js';
 import { jsonResponse } from './http-server.js';
 import { defaultChatEventBus } from './chat-event-bus.js';
+import { resolveSessionProjectContext } from '../../project/session-context.js';
 
 const MIME_BY_EXT: Record<string, string> = {
   '.png': 'image/png',
@@ -803,13 +804,18 @@ export async function handlePromptPost(
 ): Promise<Response> {
   if (!checkAuth(req, opts)) return authFailureResponse(req, opts);
   if (!opts.history) return jsonResponse({ error: RUNTIME_NOT_WIRED }, 503);
-  let body: DaemonPromptBody;
+  let rawBody: unknown;
   try {
-    body = (await req.json()) as DaemonPromptBody;
+    rawBody = await req.json();
   } catch {
     return badRequest('invalid JSON body');
   }
-  const parsed = parseDaemonPromptBody(body, opts.systemPrompt);
+  if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+    return badRequest('userText or userContent required');
+  }
+  const body = rawBody as DaemonPromptBody;
+  const projectContext = resolveSessionProjectContext(typeof body.sessionId === 'string' ? body.sessionId : undefined);
+  const parsed = parseDaemonPromptBody(body, projectContext?.instructions ? [opts.systemPrompt, projectContext.instructions].filter(Boolean).join('\n\n') : opts.systemPrompt);
   if (!parsed.ok) return badRequest(parsed.reason);
   const submit = createDaemonPromptTurnSubmit({
     kind: 'submit-turn',
@@ -843,7 +849,8 @@ export async function handlePromptPost(
         ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
         ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
         ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
-        ...(opts.toolCwd ? { toolCwd: opts.toolCwd } : {}),
+        ...(projectContext?.cwd || opts.toolCwd ? { toolCwd: projectContext?.cwd ?? opts.toolCwd } : {}),
+        ...(projectContext?.instructions ? { projectInstructions: projectContext.instructions } : {}),
         dispatchToolErrorMessage: 'NEXUS prompt runtime has no tool surface (start nexus with `--tools readonly|webterm`)',
         });
       },
@@ -930,13 +937,18 @@ export async function handlePromptStreamPost(
 ): Promise<Response> {
   if (!checkAuth(req, opts)) return authFailureResponse(req, opts);
   if (!opts.history) return jsonResponse({ error: RUNTIME_NOT_WIRED }, 503);
-  let body: DaemonPromptBody;
+  let rawBody: unknown;
   try {
-    body = (await req.json()) as DaemonPromptBody;
+    rawBody = await req.json();
   } catch {
     return badRequest('invalid JSON body');
   }
-  const parsed = parseDaemonPromptBody(body, opts.systemPrompt);
+  if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+    return badRequest('userText or userContent required');
+  }
+  const body = rawBody as DaemonPromptBody;
+  const projectContext = resolveSessionProjectContext(typeof body.sessionId === 'string' ? body.sessionId : undefined);
+  const parsed = parseDaemonPromptBody(body, projectContext?.instructions ? [opts.systemPrompt, projectContext.instructions].filter(Boolean).join('\n\n') : opts.systemPrompt);
   if (!parsed.ok) return badRequest(parsed.reason);
   // M6 PR 1 (PLAN-rich-dev-feedback-multi-surface · 2026-05-13) — opt-in
   // debug-tap. PWA `/chat?debug-tap=on` propagates the query down to
@@ -1201,7 +1213,8 @@ export async function handlePromptStreamPost(
                 ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
                 ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
                 ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
-                ...(opts.toolCwd ? { toolCwd: opts.toolCwd } : {}),
+                ...(projectContext?.cwd || opts.toolCwd ? { toolCwd: projectContext?.cwd ?? opts.toolCwd } : {}),
+                ...(projectContext?.instructions ? { projectInstructions: projectContext.instructions } : {}),
                 signal: turnAbortController.signal,
                 onTextDelta: dualEmitTextDelta,
                 onImageBlock: dualEmitImageBlock,

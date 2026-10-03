@@ -43,6 +43,7 @@ export function renderCardText(e: DecisionEntry, extra: { note?: string; confirm
     '',
     `상황: ${e.scqa.s}`,
     `문제: ${e.scqa.c}`,
+    ...(e.pendingQuestion ? ['', `대기 질문 전문:\n${e.pendingQuestion}`] : []),
     ...(e.scqa.q ? [`질문: ${e.scqa.q}`] : []),
     ...(e.scqa.a ? [`제안: ${e.scqa.a}`] : []),
     '',
@@ -180,7 +181,8 @@ export class DecisionCardService {
             const entry = this.ledger.raise({
               title: question.question.split(/\r?\n/, 1)[0]!.slice(0, 120),
               category: question.impact === 'critical' ? 'irreversible' : 'scope',
-              scqa: { s: question.question, c: question.question },
+              scqa: { s: Array.from(question.question.split(/\r?\n/, 1)[0]!).slice(0, 200).join(''), c: 'The requesting run is waiting for this choice.' },
+              pendingQuestion: question.question,
               options: question.options.map((option, index) => ({ key: keys[index]!, label: option.label, consequence: option.description })),
               recommendation: recommended !== undefined && Number.isInteger(recommended) && recommended >= 0 && recommended < question.options.length
                 ? { option: keys[recommended]!, why: '런이 추천' } : { skipped: true, reason: '추천 없음' },
@@ -251,9 +253,12 @@ export class DecisionCardService {
       return { kind: 'confirm', view: renderCard(entry, { confirm: parsed.key, ...(card?.note ? { note: card.note } : {}) }), toast: '되돌릴 수 없는 결정 — 한 번 더 확인해 주세요' };
     }
     let decided: DecisionEntry;
+    let answerDelivery: ReturnType<DecisionLedger['decideWithDelivery']>['delivery'] = null;
     try {
       // Same ledger method the CLI `decide` uses — one record path.
-      decided = this.ledger.decide(entry.id, parsed.key, { kind: 'human' }, card?.note);
+      const recorded = this.ledger.decideWithDelivery(entry.id, parsed.key, { kind: 'human' }, card?.note);
+      decided = recorded.entry;
+      answerDelivery = recorded.delivery;
     } catch (error) {
       debug.log('decisions.telegram', 'decide-failed', { platform, id: entry.id, reason: error instanceof Error ? error.message.slice(0, 80) : 'unknown' }, { level: 'warn' });
       try { const now = this.ledger.show(entry.id); if (now.status !== 'open') return { kind: 'closed', view: renderCard(now), toast: '이미 정해진 결정입니다' }; } catch { /* fall through */ }
@@ -269,7 +274,9 @@ export class DecisionCardService {
     await this.opts.replyToRaiser?.(decided, platform).catch((error: unknown) => {
       debug.log('decisions.telegram', 'reply-failed', { platform, id: decided.id, reason: error instanceof Error ? error.message.slice(0, 80) : 'unknown' }, { level: 'warn' });
     });
-    return { kind: 'decided', view, toast: `결정했습니다: ${decided.choice?.toUpperCase()}` };
+    return { kind: 'decided', view, toast: answerDelivery && !answerDelivery.ok
+      ? `결정은 기록됐지만 런 답 전달 실패 — decisions retry-answer ${decided.id}`
+      : `결정했습니다: ${decided.choice?.toUpperCase()}` };
   }
 
   /** Store a memo typed after «메모 달기»; the card shows it and the eventual decision carries it. */

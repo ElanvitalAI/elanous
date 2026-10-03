@@ -29,6 +29,10 @@
 //      → 유도 결과는 **반드시 존재하는 파일**이어야 한다.
 
 import { importerTestsNotInRunSet, type ImporterTestIndex } from './importer-test-index.js';
+import type { RouteConsumerTestIndex } from './route-consumer-test-index.js';
+
+export const GATE_CALLER_TEST_LIMIT = 30;
+export type GateCallerReason = 'import' | 'route';
 
 /** 테스트 파일 판정(기존 `seams.ts` 정규식과 동일 — 어휘 분기 금지). */
 const TEST_RE = /\.(test|spec)\.[cm]?[tj]sx?$/;
@@ -258,6 +262,10 @@ interface GateScopeDecision {
     readonly truncated: boolean;
     readonly unresolvedRelativeSpecifiers: number;
   } | null;
+  /** Selected reverse-dependent tests and why they were pulled into the gate. */
+  readonly callerTests: readonly { readonly file: string; readonly reasons: readonly GateCallerReason[] }[];
+  /** Caller tests exceeding the cap, retained in full for warning and diagnosis. */
+  readonly callerTestsOverflow: readonly { readonly file: string; readonly reasons: readonly GateCallerReason[] }[];
 }
 
 /**
@@ -274,7 +282,7 @@ export function resolveGateScope(
   changed: readonly string[],
   exists: (path: string) => boolean,
   importerTestIndex?: ImporterTestIndex,
-  opts?: { mode?: GateScopeMode; isDeleted?: (path: string) => boolean },
+  opts?: { mode?: GateScopeMode; isDeleted?: (path: string) => boolean; routeConsumerTestIndex?: RouteConsumerTestIndex },
 ): GateScopeDecision {
   // ⚠️ **실존 검증(리뷰 must-fix 4R)** — `gitChangedFiles` 는 `git diff --name-only HEAD` 라
   //   **삭제·rename 前 경로도 포함**한다. 그걸 그대로 `testArgs` 로 넘기면 필터가 아무것도 매치하지
@@ -328,15 +336,36 @@ export function resolveGateScope(
   const observationFor = (runSet: readonly string[]) => importerTestIndex
     ? importerTestsNotInRunSet(importerTestIndex, userChanged, runSet)
     : null;
-  const base = { sourceFiles, documentPaths, ignoredOutsideSrc, missingTestFiles, elanousRuntimeArtifacts,
+  const conventional = deriveRelatedTests(userChanged, exists);
+  const alreadySelected = new Set([...testFiles, ...conventional]);
+  const callers = new Map<string, Set<GateCallerReason>>();
+  for (const source of userChanged) {
+    for (const [reason, tests] of [
+      ['import', importerTestIndex?.testsBySource.get(source) ?? []],
+      ['route', opts?.routeConsumerTestIndex?.testsBySource.get(source) ?? []],
+    ] as const) {
+      for (const test of tests) {
+        if (!exists(test) || alreadySelected.has(test)) continue;
+        const reasons = callers.get(test) ?? new Set<GateCallerReason>();
+        reasons.add(reason);
+        callers.set(test, reasons);
+      }
+    }
+  }
+  const candidates = [...callers].sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+    .map(([file, reasons]) => ({ file, reasons: [...reasons] }));
+  const callerTests = candidates.slice(0, GATE_CALLER_TEST_LIMIT);
+  const callerTestsOverflow = candidates.slice(GATE_CALLER_TEST_LIMIT);
+  const runWithCallers = (tests: readonly string[]) => [...new Set([...tests, ...callerTests.map(({ file }) => file)])];
+  const base = { sourceFiles, documentPaths, ignoredOutsideSrc, missingTestFiles, elanousRuntimeArtifacts, callerTests, callerTestsOverflow,
     unverified: [] as readonly string[], derived: [] as readonly string[], pulledInRelatedTests: [] as readonly string[] };
   const withDocumentNonContribution = (runSet: readonly string[]) => ({
     documentsWithoutDerivedTests: documentsWithoutDerivedTestsFor(runSet),
   });
 
   if (testFiles.length > 0) {
-    const allRelatedTests = deriveRelatedTests(userChanged, exists);
-    const runSet = [...new Set([...testFiles, ...allRelatedTests])];
+    const allRelatedTests = conventional;
+    const runSet = runWithCallers([...testFiles, ...allRelatedTests]);
     // 편집된 테스트만 돌렸다면 빠졌을 것들 — 이 목록이 비어있지 않다는 것은 합집합이 실제로 구제했다는 뜻이다.
     const pulledInRelatedTests = allRelatedTests.filter((f) => !testFiles.includes(f));
     return { ...base, ...withDocumentNonContribution(runSet), testArgs: runSet, unverified: unverifiedFor(runSet), pulledInRelatedTests, importerTestsNotRun: observationFor(runSet), skipTestStep: false, reason: 'changed-tests' };
@@ -348,9 +377,10 @@ export function resolveGateScope(
   if (nonDoc.length === 0) {
     return { ...base, ...withDocumentNonContribution([]), importerTestsNotRun: observationFor([]), skipTestStep: true, reason: 'docs-only' };
   }
-  const derived = deriveRelatedTests(userChanged, exists);
-  if (derived.length > 0) {
-    return { ...base, ...withDocumentNonContribution(derived), derived, testArgs: derived, unverified: unverifiedFor(derived), importerTestsNotRun: observationFor(derived), skipTestStep: false, reason: 'derived' };
+  const derived = conventional;
+  const runSet = runWithCallers(derived);
+  if (runSet.length > 0) {
+    return { ...base, ...withDocumentNonContribution(runSet), derived, testArgs: runSet, unverified: unverifiedFor(runSet), importerTestsNotRun: observationFor(runSet), skipTestStep: false, reason: 'derived' };
   }
   // 실행 집합이 비었으므로 비문서 전부가 미검증이다.
   return { ...base, ...withDocumentNonContribution([]), unverified: unverifiedFor([]), importerTestsNotRun: observationFor([]), skipTestStep: true, reason: 'no-related-tests' };

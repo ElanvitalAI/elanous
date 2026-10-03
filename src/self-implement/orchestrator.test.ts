@@ -6387,6 +6387,7 @@ function revSeams(opts: {
       };
     },
     openPr: async ({ head, draft }) => { (openPrCalls as { head: string; draft?: boolean }[]).push({ head, draft }); return { url: `https://pr/${head}`, number: 9 }; },
+    readPrFiles: async () => ['src/ordinary.ts'],
     readPrDiff: async () => '',
     readPrCommitShas: async () => ({ baseCommit: 'base-sha', headCommit: 'checked-head-sha' }),
     mergePr: async () => ({ merged: opts.merged ?? true }),
@@ -8074,6 +8075,7 @@ describe('runSelfImplement — G2 PR-直前 main-싱크', () => {
     try {
       const s = g2Seams({ mergeStatus: 'merged', gateResults: [true, true], order });
       s.mergePr = async () => { order.push('mergePr'); return { merged: true }; };
+      s.readPrFiles = async () => ['src/ordinary.ts'];
       s.readPrDiff = async () => '';
       s.readPrCommitShas = async () => ({ baseCommit: 'base-sha', headCommit: 'checked-head-sha' });
       s.reviewDiff = async () => ({

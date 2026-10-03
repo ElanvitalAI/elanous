@@ -1,4 +1,30 @@
 import { debugLog } from '@/lib/debug';
+import type { Terminal } from '@xterm/xterm';
+
+export type TerminalHistoryView = Pick<Terminal, 'buffer' | 'modes' | 'scrollPages'>;
+
+const views = new Map<string, { view: TerminalHistoryView }>();
+const viewListeners = new Set<() => void>();
+
+export function registerTerminalHistoryView(terminalId: string, view: TerminalHistoryView): () => void {
+  const registration = { view };
+  views.set(terminalId, registration);
+  viewListeners.forEach((listener) => listener());
+  return () => {
+    if (views.get(terminalId) !== registration) return;
+    views.delete(terminalId);
+    viewListeners.forEach((listener) => listener());
+  };
+}
+
+export function getTerminalHistoryView(terminalId: string): TerminalHistoryView | null {
+  return views.get(terminalId)?.view ?? null;
+}
+
+export function subscribeTerminalHistoryView(listener: () => void): () => void {
+  viewListeners.add(listener);
+  return () => { viewListeners.delete(listener); };
+}
 
 type TerminalInput = (data: string) => void;
 

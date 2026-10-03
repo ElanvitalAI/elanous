@@ -18,7 +18,8 @@
  *
  * Cf. PLAN-parallel-self-dev-orchestrator-2026-07-21.
  */
-import { lstatSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { selfDevRunsDir } from '../../self-dev/run-store.js';
 import { debug } from '../../debug/log.js';
 import { join, resolve } from 'node:path';
 import { findGitDir } from '../../git-fs/locate.js';
@@ -94,6 +95,8 @@ export interface SelfImplementDisposition {
 export interface SelfImplementJobSpawn {
   (input: {
     feature: string;
+    /** Predecessor goal ID or PR number; Pod admission waits until it is merged. */
+    after?: string | number;
     base?: string;
     autoMerge?: boolean;
     /** G8 — attach `auto-review` opt-in label → `--auto-review`. */
@@ -196,6 +199,7 @@ export function createSelfImplementAdapter(opts: SelfImplementAdapterOptions) {
     try {
       const res = opts.spawn({
         feature: surface.feature,
+        ...(surface.after !== undefined ? { after: surface.after } : {}),
         ...(surface.base !== undefined ? { base: surface.base } : {}),
         ...(surface.autoMerge !== undefined ? { autoMerge: surface.autoMerge } : {}),
         ...(surface.autoReview !== undefined ? { autoReview: surface.autoReview } : {}),
@@ -316,7 +320,13 @@ export function defaultSelfImplementSpawn(): SelfImplementJobSpawn {
     const { bin, source: binSource } = resolveSpawnElanousBin();
     // `--json` so the child prints its SelfImplementResult on the last
     // line → we parse the real disposition (stage / prUrl / merged).
-    const args = [bin, 'self', 'implement', input.feature, '--json'];
+    const runsDir = selfDevRunsDir();
+    mkdirSync(runsDir, { recursive: true });
+    const featureDir = mkdtempSync(join(runsDir, 'feature-'));
+    const featureFile = join(featureDir, 'feature.txt');
+    try { writeFileSync(featureFile, input.feature, { mode: 0o600 }); }
+    catch (error) { rmSync(featureDir, { recursive: true, force: true }); throw error; }
+    const args = [bin, 'self', 'implement', '--feature-file', featureFile, '--json'];
     if (input.base) args.push('--base', input.base);
     if (input.autoMerge) args.push('--auto-merge');
     if (input.autoReview) args.push('--auto-review');
@@ -348,6 +358,7 @@ export function defaultSelfImplementSpawn(): SelfImplementJobSpawn {
           stdio: ['ignore', 'pipe', 'pipe'],
         });
       } catch (err) {
+        rmSync(featureDir, { recursive: true, force: true });
         resolve({
           exitCode: null,
           output: '',
@@ -364,10 +375,12 @@ export function defaultSelfImplementSpawn(): SelfImplementJobSpawn {
       child.stdout?.on('data', (d: Buffer) => { out += d.toString(); });
       child.stderr?.on('data', (d: Buffer) => { out += d.toString(); });
       child.on('error', (e: Error) => {
+        rmSync(featureDir, { recursive: true, force: true });
         input.signal?.removeEventListener('abort', onAbort);
         resolve({ exitCode: null, output: out, error: { code: 'SELF_IMPL_SPAWN_FAILED', message: String(e?.message ?? e) } });
       });
       child.on('exit', (code: number | null) => {
+        rmSync(featureDir, { recursive: true, force: true });
         input.signal?.removeEventListener('abort', onAbort);
         const disposition = parseSelfImplementJson(out);
         resolve({ exitCode: code, output: out, ...(disposition ? { disposition } : {}) });

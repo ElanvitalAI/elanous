@@ -5,6 +5,7 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, renameSync, mkdir
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
+import { recordOutput } from '../../src/outputs/ledger.js';
 
 export type FeedSlide = { image: string; source: string; caption: string; include: boolean; renderedCaption?: string /* `N/M:caption` as last drawn */ };
 export type FeedDraft = {
@@ -55,6 +56,9 @@ export function writeDraft(folder: string, draft: FeedDraft): void {
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(draft, null, 2) + '\n');
   renameSync(tmp, path);
+  if (draft.updatedBy === 'graph' && draft.revision === 1) {
+    recordOutput({ source: 'field-feed', sourceId: basename(folder), kind: 'post', title: draft.event.title, path });
+  }
 }
 
 /** Field uploads are named `20261002T193012Z-<device>-<name>` (capture time, UTC) — same order as the reel. */

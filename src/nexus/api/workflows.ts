@@ -40,8 +40,12 @@ import {
   parseWorkflowYaml,
   runWorkflow,
   saveWorkflow,
+  topoSort,
   type WorkflowDeps,
   type WorkflowEvent,
+  type WorkflowRunMode,
+  type NodeOutput,
+  type RunWorkflowOpts,
 } from '../../workflow-runtime/index.js';
 import { buildRunCft, buildRunSkill } from '../../workflow-runtime/deps-bridge.js';
 import {
@@ -59,6 +63,7 @@ import { runApprovalAcrossChannels } from './workflow-approval-multi-channel.js'
 interface RunRecord {
   runId: string;
   workflowName: string;
+  mode: WorkflowRunMode;
   startedAt: number;
   events: WorkflowEvent[];
   /** Settled state: undefined while running, true on workflow_done,
@@ -384,10 +389,51 @@ export async function handleWorkflowRunStart(
   // so the PWA "▶ Run now" button runs the dependent chain straight
   // through. Default false preserves the production wire.
   const dryRun: boolean = Boolean(body && typeof body === 'object' && (body as { dryRun?: unknown }).dryRun === true);
+  const input = body && typeof body === 'object' ? body as Record<string, unknown> : {};
+  const { onlyNode, fromNode, fromRunId } = input;
+  if ('usePins' in input || (onlyNode !== undefined && (fromNode !== undefined || fromRunId !== undefined))
+    || (onlyNode !== undefined && (typeof onlyNode !== 'string' || !onlyNode.trim()))
+    || (fromNode !== undefined && (typeof fromNode !== 'string' || !fromNode.trim()))
+    || (fromRunId !== undefined && (typeof fromRunId !== 'string' || !fromRunId.trim()))
+    || (fromNode === undefined) !== (fromRunId === undefined)
+    || (input.mode !== undefined && input.mode !== 'test')) {
+    return jsonResponse({ error: 'bad_request', reason: 'invalid run selection' }, 400);
+  }
+  if ((onlyNode && !entry.definition.nodes.some(n => n.id === onlyNode))
+    || (fromNode && !entry.definition.nodes.some(n => n.id === fromNode))) {
+    return jsonResponse({ error: 'bad_request', reason: 'unknown selected node' }, 400);
+  }
+  let previousOutputs: Record<string, NodeOutput> | undefined;
+  if (typeof fromRunId === 'string') {
+    const previous = RUN_REGISTRY.get(fromRunId);
+    if (previous) {
+      if (previous.workflowName !== name || previous.ok === undefined) {
+        return jsonResponse({ error: 'bad_request', reason: 'source run must be settled for this workflow' }, 400);
+      }
+      const terminal = previous.events.find(e => e.type === 'workflow_done' || e.type === 'workflow_failed');
+      previousOutputs = terminal?.type === 'workflow_done' ? terminal.outputs
+        : terminal?.type === 'workflow_failed' ? terminal.partial : {};
+    } else {
+      const disk = readRunOutputSnapshot(fromRunId);
+      if (!disk || disk.workflowName !== name || (disk.status !== 'done' && disk.status !== 'failed')) {
+        return jsonResponse({ error: 'bad_request', reason: 'source run must be settled for this workflow' }, 400);
+      }
+      previousOutputs = disk.outputs;
+    }
+    let order: string[];
+    try { order = topoSort(entry.definition.nodes); }
+    catch { return jsonResponse({ error: 'bad_request', reason: 'invalid workflow topology' }, 400); }
+    const upstream = order.slice(0, order.indexOf(fromNode as string));
+    if (upstream.some(id => previousOutputs?.[id] === undefined)) {
+      return jsonResponse({ error: 'bad_request', reason: 'source run missing upstream outputs' }, 400);
+    }
+  }
+  const mode: WorkflowRunMode = input.mode === 'test' ? 'test' : onlyNode ? 'only' : fromNode ? 'from' : 'full';
   const runId = `wf-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const record: RunRecord = {
     runId,
     workflowName: name,
+    mode,
     startedAt: Date.now(),
     events: [],
     ok: undefined,
@@ -400,10 +446,14 @@ export async function handleWorkflowRunStart(
   void (async () => {
     const deps = buildDefaultWorkflowDeps({ runId });
     try {
-      for await (const evt of runWorkflow(
-        { workflow: entry.definition, arguments: args, runId, dryRun },
-        deps,
-      )) {
+      const runOpts: RunWorkflowOpts = {
+        workflow: entry.definition, arguments: args, runId, dryRun, mode,
+        ...(typeof onlyNode === 'string' ? { onlyNode } : {}),
+        ...(typeof fromNode === 'string' ? { fromNode } : {}),
+        ...(previousOutputs ? { previousOutputs } : {}),
+      };
+      for await (const runtimeEvent of runWorkflow(runOpts, deps)) {
+        const evt = { ...runtimeEvent, mode };
         record.events.push(evt);
         // §15.8(b) — fan into NexusEventBus → PWA invalidates queries
         // on push instead of polling. No-op when bus is unwired
@@ -423,13 +473,14 @@ export async function handleWorkflowRunStart(
         type: 'workflow_failed' as const,
         error: err instanceof Error ? err.message : String(err),
         partial: {},
+        mode,
       };
       record.events.push(failEvt);
       publishWorkflowRunEvent({ runId, workflowName: name }, failEvt);
     }
   })();
 
-  return jsonResponse({ ok: true, runId }, 202);
+  return jsonResponse({ ok: true, runId, mode }, 202);
 }
 
 export function handleWorkflowRunGet(
@@ -444,6 +495,7 @@ export function handleWorkflowRunGet(
       {
         runId: rec.runId,
         workflowName: rec.workflowName,
+        mode: rec.mode,
         startedAt: rec.startedAt,
         ok: rec.ok,
         events: rec.events,
@@ -597,6 +649,21 @@ interface DiskRunSummary {
  *  enough that abandoned runs don't pollute the list across sessions. */
 const STALE_RUNNING_AFTER_MS = 30 * 60 * 1000;
 
+function readRunOutputSnapshot(runId: string): {
+  workflowName: string;
+  status: string;
+  outputs: Record<string, NodeOutput>;
+} | null {
+  if (!/^wf-[A-Za-z0-9-]+$/.test(runId) || runId.includes('..')) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(join(workflowsRunsRoot(), runId, 'run.json'), 'utf-8')) as {
+      workflowName?: string; status?: string; outputs?: Record<string, NodeOutput>;
+    };
+    if (!parsed.workflowName || !parsed.status || !parsed.outputs || typeof parsed.outputs !== 'object') return null;
+    return { workflowName: parsed.workflowName, status: parsed.status, outputs: parsed.outputs };
+  } catch { return null; }
+}
+
 /** Read `<root>/<runId>/run.json` and translate into the same shape as
  *  GET /runs/<id> serves from memory. Returns null when the file is
  *  missing or unreadable. Events are reconstructed minimally from the
@@ -608,6 +675,7 @@ function loadRunFromDisk(runId: string): {
   ok: boolean | undefined;
   events: WorkflowEvent[];
   outputs: Record<string, unknown>;
+  mode?: WorkflowRunMode;
 } | null {
   if (!runId || runId.includes('/') || runId.includes('..')) return null;
   const root = workflowsRunsRoot();
@@ -623,6 +691,7 @@ function loadRunFromDisk(runId: string): {
       completedAt?: number;
       ok?: boolean;
       status?: string;
+      mode?: WorkflowRunMode;
       outputs?: Record<string, { output?: unknown }>;
     };
     if (!parsed.runId || !parsed.workflowName) return null;
@@ -634,7 +703,8 @@ function loadRunFromDisk(runId: string): {
     // so a polling client still sees the node_done sequence even
     // though the live run.json doesn't store events.
     const events: WorkflowEvent[] = [];
-    events.push({ type: 'workflow_start', workflow: parsed.workflowName, runId: parsed.runId });
+    events.push({ type: 'workflow_start', workflow: parsed.workflowName, runId: parsed.runId,
+      ...(parsed.mode !== undefined ? { mode: parsed.mode } : {}) });
     const nodesDir = join(runDir, 'nodes');
     // Iterate `parsed.outputs` keys instead of `readdirSync(nodesDir)`
     // so the reconstructed node_done sequence is in execution order
@@ -673,6 +743,7 @@ function loadRunFromDisk(runId: string): {
       events.push({
         type: 'node_done',
         nodeId,
+        ...(parsed.mode !== undefined ? { mode: parsed.mode } : {}),
         result: {
           ok: nodeData.ok,
           output: nodeData.output ?? '',
@@ -684,6 +755,7 @@ function loadRunFromDisk(runId: string): {
     if (parsed.status === 'done') {
       events.push({
         type: 'workflow_done',
+        ...(parsed.mode !== undefined ? { mode: parsed.mode } : {}),
         outputs: Object.fromEntries(
           Object.entries(parsed.outputs ?? {}).map(([k, v]) => [
             k,
@@ -694,6 +766,7 @@ function loadRunFromDisk(runId: string): {
     } else if (parsed.status === 'failed') {
       events.push({
         type: 'workflow_failed',
+        ...(parsed.mode !== undefined ? { mode: parsed.mode } : {}),
         error: 'failed (see node events)',
         partial: Object.fromEntries(
           Object.entries(parsed.outputs ?? {}).map(([k, v]) => [
@@ -706,6 +779,7 @@ function loadRunFromDisk(runId: string): {
     return {
       runId: parsed.runId,
       workflowName: parsed.workflowName,
+      ...(parsed.mode !== undefined ? { mode: parsed.mode } : {}),
       startedAt: parsed.startedAt ?? 0,
       ok: parsed.status === 'done' ? true : parsed.status === 'failed' ? false : undefined,
       events,

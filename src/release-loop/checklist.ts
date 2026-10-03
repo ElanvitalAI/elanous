@@ -68,8 +68,8 @@ function decodeClaimHistory(data: Checklist): Checklist {
   return { ...data, history: data.history.map(decodeClaimHistoryEntry) };
 }
 
-export function listChecklist(v: string): Checklist {
-  return decodeClaimHistory(store.list(v));
+export function listChecklist(v: string, root?: string): Checklist {
+  return decodeClaimHistory(root === undefined ? store.list(v) : store.list(v, undefined, undefined, root));
 }
 
 /** Status events in the requested window; other ledger fields never become status changes. */

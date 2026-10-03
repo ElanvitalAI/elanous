@@ -23,6 +23,8 @@ export interface DaemonWebSearchArgs {
 export interface DaemonWebSearchResult {
   query: string;
   providerName: string;
+  /** Absent for ordinary searches; signals whether X sources were actually cited. */
+  xSearch?: 'grok' | 'unavailable';
   hits: Array<{
     url: string;
     title: string;
@@ -90,6 +92,7 @@ export async function dispatchWebSearch(
     return {
       query,
       providerName: result.providerName,
+      ...(result.xSearch ? { xSearch: result.xSearch } : {}),
       hits: result.hits.map((h) => ({
         url: h.url,
         title: h.title,

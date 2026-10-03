@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { emitDecision, isLiveDetailOn, liveDetailPath, readLiveDetail, resetLiveDetailCacheForTesting, selectLiveDetail, writeLiveDetail } from './detail-switch.js';
 import { handleLiveDetail } from '../nexus/api/live-detail.js';
+import { handleInsideEvents, subscribeInsideEvent } from '../nexus/api/inside-events.js';
 import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 
 const dirs: string[] = [];
@@ -139,6 +140,31 @@ test('넥서스 끝점 — 소유자만 · POST 로 켜고 GET 으로 본다 · 
   expect(bad.status).toBe(400);
   const badScope = await handleLiveDetail(new Request(url, { method: 'POST', headers: { authorization: 'Bearer ok' }, body: JSON.stringify({ scope: '../etc' }) }), deps);
   expect(badScope.status).toBe(400);
+});
+
+test('active PTY decision arrives on the shared inside publisher with secrets masked', () => {
+  const path = tmp();
+  writeLiveDetail({ ttlMin: 30 }, { path, now: 0 });
+  const received: unknown[] = [];
+  const unsubscribe = subscribeInsideEvent(event => received.push(event));
+  try {
+    expect(emitDecision({ kind: 'ROUTE', what: 'choose', reason: 'password="private"', purpose: 'test', target: 'pty', runId: 'pty-run' }, { path, now: 1_000 })).toBe(true);
+    expect(received).toMatchObject([{ kind: 'pty.decision', decisionKind: 'ROUTE', runId: 'pty-run', reason: 'password="[REDACTED]"' }]);
+  } finally { unsubscribe(); }
+});
+
+test('emitted PTY decision is delivered as a masked SSE frame', async () => {
+  const path = tmp();
+  writeLiveDetail({ ttlMin: 30 }, { path, now: 0 });
+  const reader = handleInsideEvents(new Request('http://localhost/v1/inside/events')).body!.getReader();
+  try {
+    expect(new TextDecoder().decode((await reader.read()).value)).toBe(': inside events stream\n\n');
+    expect(emitDecision({ kind: 'VERIFY', what: 'pty check', reason: 'Authorization: Basic dXNlcjpwYXNz', purpose: 'test', target: 'shell', runId: 'pty-sse' }, { path, now: 1_000 })).toBe(true);
+    const frame = new TextDecoder().decode((await reader.read()).value);
+    expect(frame).toStartWith('event: pty.decision\ndata: ');
+    expect(frame).not.toContain('dXNlcjpwYXNz');
+    expect(JSON.parse(frame.split('data: ')[1]!)).toMatchObject({ kind: 'pty.decision', decisionKind: 'VERIFY', runId: 'pty-sse' });
+  } finally { await reader.cancel(); }
 });
 
 test('같은 판단이 5초 안에 두 번 오면 한 번만 낸다', () => {

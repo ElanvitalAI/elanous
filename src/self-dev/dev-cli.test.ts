@@ -1296,8 +1296,9 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
     const events = await observeRunExit('start-draft-triage-absent-run-stays-unknown', async () => {
       devCli.startDraftTriage('current', {
         queryAbandonedDraftPrs: () => [
-          { runId: 'r1', number: 1, url: pr(1), openedAtMs: 1 },
-          { runId: 'r2', number: 2, url: pr(2), openedAtMs: 2 },
+          // DRAFT1 closes unobserved drafts older than a day — keep r2 fresh so this case stays «unobserved».
+          { runId: 'r1', number: 1, url: pr(1), openedAtMs: Date.now() - 60_000 },
+          { runId: 'r2', number: 2, url: pr(2), openedAtMs: Date.now() - 60_000 },
         ] as never,
         queryRunningRuns: () => ({ entries: [{ runId: 'r1', status: 'ended-unclosed' }] }) as never,
         queryTerminalDraftTriages: () => new Set(),
@@ -3223,6 +3224,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       approvePr: async () => true,
       readPrCommitShas: async () => ({ baseCommit: 'base', headCommit: 'head', baseRefName: 'actual-retargeted-base' }),
       readPrDiff: async () => '',
+      readPrFiles: async () => ['src/x.ts'],
       mergePr: async () => ({ merged: true }),
       mergeMain: async () => ({ status: 'up-to-date', resolvedFiles: [] }),
       postMergeCleanup: { enabled: false } as SelfImplementSeams['postMergeCleanup'],
@@ -3247,6 +3249,7 @@ describe('buildDevCliSpec — 옵션 축 라우팅(T7)', () => {
       approvePr: async () => true,
       readPrCommitShas: async () => ({ baseCommit: 'base', headCommit: 'head' }),
       readPrDiff: async () => '',
+      readPrFiles: async () => ['src/x.ts'],
       mergePr: async () => ({ merged: true }),
       mergeMain: async () => ({ status: 'up-to-date', resolvedFiles: [] }),
       postMergeCleanup: { enabled: false } as SelfImplementSeams['postMergeCleanup'],
@@ -3957,8 +3960,8 @@ describe('drive 별칭 거부 — 금지만 있고 길이 없는 형태를 막�
     expect(message).toMatch(/계약으로 읽지 마라/);
   });
 
-  it('허용 옵션 여덟은 통과한다 (거부가 넓어지지 않았다)', () => {
-    expect(() => devCli.assertDriveAliasOptions(['goal', 'maxSteps', 'pollMs', 'model', 'cwd', 'worktree', 'json', 'attach'])).not.toThrow();
+  it('허용 옵션 아홉은 통과한다 (거부가 넓어지지 않았다 · DRIVE-JAIL --jail-home)', () => {
+    expect(() => devCli.assertDriveAliasOptions(['goal', 'maxSteps', 'pollMs', 'model', 'cwd', 'worktree', 'json', 'attach', 'jailHome'])).not.toThrow();
     expect(() => devCli.assertDriveAliasOptions([])).not.toThrow();
   });
 
@@ -4178,10 +4181,10 @@ describe('drive --help 실물 — 계약 갈림이 맨 앞에 온다', () => {
     const firstDescriptionLine = lines.slice(usageAt + 1).find((l) => l.trim().length > 0);
     expect(firstDescriptionLine).toBeDefined();
     expect(firstDescriptionLine!).toContain('drive');
-    expect(firstDescriptionLine!).toContain('여덟뿐');
+    expect(firstDescriptionLine!).toContain('아홉뿐');
     expect(firstDescriptionLine!).toContain('--attach');
     // ⊕ 상대 순서도 함께 유지한다 — 두 토큰의 존재를 먼저 확인해 -1 비교의 허위 통과를 막는다.
-    const driveContractAt = out.indexOf('drive` 별칭으로 부르면 옵션은 여덟뿐');
+    const driveContractAt = out.indexOf('drive` 별칭으로 부르면 옵션은 아홉뿐');
     const unifiedDescriptionAt = out.indexOf('실험 — 통합 self-dev');
     expect(driveContractAt).toBeGreaterThanOrEqual(0);
     expect(unifiedDescriptionAt).toBeGreaterThanOrEqual(0);

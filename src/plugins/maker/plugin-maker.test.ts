@@ -1,9 +1,12 @@
-import { afterEach, expect, test } from 'bun:test';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
+import { afterEach, expect, spyOn, test } from 'bun:test';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makePlugin, validatePluginDir } from './plugin-maker.js';
+import { debug } from '../../debug/log.js';
+import { fromWizardLogFrame } from '../../../apps/pwa/src/lib/inside-events.js';
 import { listInstalledPlugins } from '../install/plugin-install.js';
+import { parse as parseYaml } from 'yaml';
 
 const dirs: string[] = [];
 const previous = process.env.ELANOUS_STATE_DIR;
@@ -26,6 +29,11 @@ function twoNodesFor(dir: string, name: string): void {
     .replace('map: { ok: done, fail: failed } }', 'map: { ok: second, fail: failed } }\n  - { from: second, on: outcome, map: { ok: done, fail: failed } }'));
   writeFileSync(join(dir, 'graphs', 'recipes.yaml'), 'main:\n  command: \'bun "$ELANOUS_GRAPH_DIR/run-step.ts" main\'\n  timeout_ms: 120000\nsecond:\n  command: \'bun "$ELANOUS_GRAPH_DIR/run-step.ts" second\'\n  timeout_ms: 120000\n');
   writeFileSync(join(dir, 'examples', 'input.json'), '{"phrase":"hello"}\n');
+  writeFileSync(join(dir, 'graphs', 'run-step.ts'), "import { readFileSync } from 'node:fs';\nconst context = JSON.parse(readFileSync(process.env.ELANOUS_GRAPH_CONTEXT!, 'utf8'));\nconsole.log(JSON.stringify({ outcome: 'ok', input: context.input }));\n");
+  const manifestPath = join(dir, 'plugin.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  delete manifest.extensions['ai.elanous'].researchDraft;
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
 }
 
 function twoNodes(dir: string): void { twoNodesFor(dir, 'sample'); }
@@ -42,6 +50,223 @@ test('fake codex writes two nodes; installed graph runs real runner with example
   expect(result.timings).toEqual({ scaffold: expect.any(Number), write: expect.any(Number), validate: expect.any(Number), install: expect.any(Number), run: expect.any(Number) });
   expect(result.graph).toContain(join('plugins', 'local', 'sample', '0.1.0', 'graphs', 'sample.yaml'));
   expect(listInstalledPlugins(root).map(item => item.name)).toEqual(['sample']);
+});
+
+test('long request slug fits the generated wizard file name', async () => {
+  const root = temp();
+  const result = await makePlugin({ request: 'a'.repeat(32), parentDir: join(root, 'plugins-local'),
+    deps: { codex: async dir => { twoNodesFor(dir, 'a'.repeat(31)); } } });
+  expect(result.status).toBe('installed');
+  expect(result.plugin).toBe('a'.repeat(31));
+  expect(listInstalledPlugins(root).map(item => item.name)).toEqual(['a'.repeat(31)]);
+});
+
+test('generated research graph remains uninstalled when codex leaves draft steps unimplemented', async () => {
+  const root = temp();
+  const result = await makePlugin({ request: 'weather research', name: 'weather-research',
+    parentDir: join(root, 'plugins-local'), deps: { codex: async dir => {
+      twoNodesFor(dir, 'weather-research');
+      const file = join(dir, 'plugin.json');
+      const manifest = JSON.parse(readFileSync(file, 'utf8'));
+      manifest.extensions['ai.elanous'].researchDraft = true;
+      writeFileSync(file, JSON.stringify(manifest));
+      writeFileSync(join(dir, 'graphs', 'run-step.ts'), `console.log(JSON.stringify({ outcome: 'fail', error: 'Weather backend offline' }));\nprocess.exitCode = 1;\n`);
+    } } });
+  expect(result.status).toBe('failed');
+  expect(result.errors).toContain('research graph validation failed: failed');
+  expect(result.timings.repair).toEqual(expect.any(Number));
+  expect(listInstalledPlugins(root)).toEqual([]);
+  expect(JSON.parse(readFileSync(join(result.dir, 'plugin.json'), 'utf8')).extensions['ai.elanous'].researchDraft).toBe(true);
+});
+
+test('failed graph steps cannot install even if codex removes the researchDraft flag', async () => {
+  const root = temp();
+  const result = await makePlugin({ request: 'weather research', name: 'failed-weather',
+    parentDir: join(root, 'plugins-local'), deps: { codex: async dir => {
+      twoNodesFor(dir, 'failed-weather');
+      writeFileSync(join(dir, 'graphs', 'run-step.ts'), `console.log(JSON.stringify({ outcome: 'fail', error: 'Weather backend offline' }));\n`);
+    } } });
+  expect(result.status).toBe('failed');
+  expect(result.errors).toContain('research graph validation failed: failed');
+  expect(result.timings.repair).toEqual(expect.any(Number));
+  expect(listInstalledPlugins(root)).toEqual([]);
+  expect(JSON.parse(readFileSync(join(result.dir, 'plugin.json'), 'utf8')).extensions['ai.elanous'].researchDraft).toBe(true);
+});
+
+test('draft-file plugin make validates definitions but does not install an unimplemented graph', async () => {
+  const root = temp();
+  const draftFile = join(root, 'research-draft.json');
+  writeFileSync(draftFile, JSON.stringify({ description: 'Research the weather',
+    connectors: [{ id: 'weather', credentials: [{ name: 'WEATHER_API_KEY' }] }],
+    skill: { description: 'Weather researcher', instructions: 'Check the forecast.', requires: ['openai'] },
+  }));
+  const result = await makePlugin({ request: 'weather research', name: 'weather-research', draftFile,
+    parentDir: join(root, 'plugins-local'), deps: { codex: async () => { throw new Error('draft must not invoke codex'); } } });
+  expect(result.status).toBe('draft');
+  expect(result.errors).toEqual([]);
+  expect(result.timings.install).toBe(0);
+  expect(result.timings.repair).toBeUndefined();
+  const manifest = JSON.parse(readFileSync(join(result.dir, 'plugin.json'), 'utf8'));
+  expect(manifest.extensions['ai.elanous'].connectors).toEqual([
+    { id: 'weather', fields: [{ name: 'WEATHER_API_KEY', secret: true }] },
+  ]);
+  const skill = readFileSync(join(result.dir, 'skills', 'weather-research', 'SKILL.md'), 'utf8');
+  expect(parseYaml(skill.split('---')[1]!)).toMatchObject({ requires: ['openai'] });
+  expect(listInstalledPlugins(root)).toEqual([]);
+});
+
+test('invalid research draft cannot reach installation or codex repair', async () => {
+  const root = temp();
+  const draftFile = join(root, 'research-draft.json');
+  writeFileSync(draftFile, JSON.stringify({ description: 'Research the weather',
+    skill: { description: 'Weather', instructions: 'Check the forecast.', requires: ['invented-resource'] },
+  }));
+  const result = await makePlugin({ request: 'weather research', name: 'weather-research', draftFile,
+    parentDir: join(root, 'plugins-local'), deps: { codex: async () => { throw new Error('draft must not invoke codex'); } } });
+  expect(result.status).toBe('failed');
+  expect(result.errors.join(' ')).toContain('existing resource ids');
+  expect(listInstalledPlugins(root)).toEqual([]);
+});
+
+test('one-line request collects cited connector, skill and graph draft before existing make, with ordered wizard steps', async () => {
+  const root = temp();
+  const steps: string[] = [];
+  const eventIds: string[] = [];
+  const logged: string[] = [];
+  const inside: string[] = [];
+  const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'wizard.step' && event === 'wizard.step') {
+      logged.push((data as { step: string }).step);
+      const parsed = fromWizardLogFrame({ category, event, data });
+      if (parsed) inside.push(parsed.step);
+    }
+  });
+  let prompt = '';
+  try {
+    const result = await makePlugin({ request: 'Sync tickets using Acme API skill', name: 'ticket-sync', parentDir: join(root, 'plugins-local'), deps: {
+      webSearch: async query => {
+        expect(query).toBe('Sync tickets using Acme API skill');
+        return { sources: [
+          { source: 'omni-crawl', url: 'https://api.acme.example/docs', title: 'Acme API integration', snippet: 'Use ACME_API_KEY for tickets' },
+          { source: 'omni-crawl', url: 'https://api.acme.example/skills', title: 'Ticket skill workflow', snippet: 'Skill to process tickets' },
+        ] };
+      },
+      memorySearch: async () => [{ source: 'aside', url: 'aside:ticket-note', title: 'Ticket note', snippet: 'Report after sync' }],
+      onEvent: event => { steps.push(event.step); eventIds.push(event.wizardId); expect(event.ts).toEqual(expect.any(String)); expect(event.wizardId).toEqual(expect.any(String)); },
+      codex: async (dir, text) => {
+        prompt = text;
+        expect(JSON.parse(readFileSync(join(dir, 'plugin.json'), 'utf8')).extensions['ai.elanous'].connectors)
+          .toEqual([{ id: 'api-acme-example', fields: [{ name: 'ACME_API_KEY', secret: true }] }]);
+        expect(existsSync(join(dir, 'skills', 'ticket-sync', 'SKILL.md'))).toBe(true);
+        twoNodesFor(dir, 'ticket-sync');
+      },
+    } });
+    expect(result.status).toBe('installed');
+    expect(steps).toEqual(['request', 'research', 'draft', 'validate', 'install', 'done']);
+    expect(new Set(eventIds).size).toBe(1);
+    expect(result.draft.connectors[0]).toMatchObject({ name: 'api.acme.example', missingCredentials: ['ACME_API_KEY'], evidence: ['https://api.acme.example/docs'] });
+    expect(result.draft.skills[0]?.evidence).toContain('https://api.acme.example/skills');
+    expect(result.draft.graph.nodes).toEqual(['process', 'fetch', 'report']);
+    expect(result.draft.graph.evidence).toContain('aside:ticket-note');
+    expect(prompt).toContain(JSON.stringify(result.draft, null, 2));
+    const manifest = JSON.parse(readFileSync(join(result.dir, 'plugin.json'), 'utf8'));
+    expect(manifest.extensions['ai.elanous'].connectors).toEqual([
+      { id: 'api-acme-example', fields: [{ name: 'ACME_API_KEY', secret: true }] },
+    ]);
+    expect(manifest.extensions['ai.elanous'].researchDraft).toBeUndefined();
+    const installed = listInstalledPlugins(root)[0]!;
+    expect(JSON.parse(readFileSync(join(installed.path, 'plugin.json'), 'utf8')).extensions['ai.elanous'].connectors)
+      .toEqual(manifest.extensions['ai.elanous'].connectors);
+    expect(parseYaml(readFileSync(join(installed.path, 'skills', 'ticket-sync', 'SKILL.md'), 'utf8').split('---')[1]!))
+      .toMatchObject({ name: 'ticket-sync', requires: [] });
+    expect(await validatePluginDir(installed.path)).toEqual([]);
+    expect(logged).toEqual(steps);
+    expect(inside).toEqual(steps);
+  } finally { log.mockRestore(); }
+});
+
+test('malformed research URLs are excluded with reasons while the existing make continues', async () => {
+  const root = temp();
+  const events: Array<{ step: string; text: string; detail?: unknown }> = [];
+  let prompt = '';
+  const result = await makePlugin({ request: 'Sync tickets via API', name: 'bad-link', parentDir: join(root, 'plugins-local'), deps: {
+    webSearch: async () => ({ sources: [
+      { source: 'omni-crawl', url: 'https://', title: 'Broken API connector', snippet: 'Use BROKEN_API_KEY' },
+      { source: 'omni-crawl', url: 'https://valid.example/skill', title: 'Ticket skill workflow', snippet: 'process and report' },
+    ] }),
+    memorySearch: async () => [],
+    onEvent: event => events.push(event),
+    codex: async (dir, text) => { prompt = text; twoNodesFor(dir, 'bad-link'); },
+  } });
+  expect(result.status).toBe('installed');
+  expect(result.draft.research.sources.map(source => source.url)).toEqual(['https://valid.example/skill']);
+  expect(result.draft.research.unavailable.join(' ')).toContain('잘못된 출처 URL: https://');
+  expect(result.draft.connectors[0]?.evidence).not.toContain('https://');
+  expect(result.draft.graph.evidence).toEqual(['https://valid.example/skill']);
+  expect(events.find(event => event.step === 'research')?.detail).toMatchObject({ unavailable: expect.arrayContaining([expect.stringContaining('잘못된 출처 URL')]) });
+  expect(prompt).toContain(JSON.stringify(result.draft, null, 2));
+  expect(events.map(event => event.step)).toEqual(['request', 'research', 'draft', 'validate', 'install', 'done']);
+});
+
+test('aside CLI searches local memory and passes its cited results into the existing make input', async () => {
+  const root = temp();
+  const bin = join(root, 'fake-aside');
+  const argsFile = join(root, 'aside-args.json');
+  writeFileSync(bin, `#!/usr/bin/env bun
+import { writeFileSync } from 'node:fs';
+writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));
+console.log(JSON.stringify({ sources: [
+  { title: 'Ticket API connector', url: 'aside:notes/ticket-api', snippet: 'API uses TICKET_API_KEY for sync' },
+  { title: 'Ticket skill workflow graph', url: 'aside:notes/ticket-flow', snippet: 'Skill workflow: collect, process, report' }
+] }));
+`);
+  chmodSync(bin, 0o755);
+  let prompt = '';
+  const result = await makePlugin({ request: 'Sync tickets via API', name: 'aside-wired', parentDir: join(root, 'plugins-local'), deps: {
+    asideBin: bin,
+    webSearch: async () => ({ sources: [] }),
+    codex: async (dir, text) => { prompt = text; twoNodesFor(dir, 'aside-wired'); },
+  } });
+  expect(result.status).toBe('installed');
+  expect(JSON.parse(readFileSync(argsFile, 'utf8'))).toEqual(['exec', '--effort', 'low', expect.stringContaining('Sync tickets via API')]);
+  expect(result.draft.research.sources.map(source => source.source)).toEqual(['aside', 'aside']);
+  expect(result.draft.connectors[0]).toMatchObject({ name: 'Ticket API connector', missingCredentials: ['TICKET_API_KEY'], evidence: ['aside:notes/ticket-api'] });
+  expect(result.draft.skills[0]).toMatchObject({ name: 'Ticket skill workflow graph', evidence: ['aside:notes/ticket-flow'] });
+  expect(result.draft.graph.evidence).toContain('aside:notes/ticket-flow');
+  expect(prompt).toContain(JSON.stringify(result.draft, null, 2));
+});
+
+test('absent aside records its reason and still calls make', async () => {
+  const root = temp();
+  let calls = 0;
+  const result = await makePlugin({ request: 'Local tickets', name: 'aside-absent', parentDir: join(root, 'plugins-local'), deps: {
+    asideBin: join(root, 'missing-aside'),
+    webSearch: async () => ({ sources: [] }),
+    codex: async dir => { calls++; twoNodesFor(dir, 'aside-absent'); },
+  } });
+  expect(result.status).toBe('installed');
+  expect(calls).toBe(1);
+  expect(result.draft.research.unavailable.join(' ')).toContain('aside:');
+  expect(result.draft.research.unavailable.join(' ')).toContain('ENOENT');
+});
+
+test('research unavailable preserves make and emits the reason instead of blocking', async () => {
+  const root = temp();
+  const events: Array<{ step: string; text: string }> = [];
+  let calls = 0;
+  const result = await makePlugin({ request: 'simple plugin', name: 'no-research', parentDir: join(root, 'plugins-local'), deps: {
+    webSearch: () => { throw new Error('web offline'); },
+    memorySearch: async () => { throw new Error('aside offline'); },
+    onEvent: event => events.push(event),
+    codex: async dir => { calls++; twoNodesFor(dir, 'no-research'); },
+  } });
+  expect(result.status).toBe('installed');
+  expect(calls).toBe(1);
+  expect(result.draft.research.unavailable.join(' ')).toContain('web offline');
+  expect(result.draft.research.unavailable.join(' ')).toContain('aside offline');
+  expect(JSON.parse(readFileSync(join(result.dir, 'plugin.json'), 'utf8')).extensions['ai.elanous'].connectors).toEqual([]);
+  expect(events.find(event => event.step === 'research')?.text).toContain('조사 없음 ·');
+  expect(events.map(event => event.step)).toEqual(['request', 'research', 'draft', 'validate', 'install', 'done']);
 });
 
 test('missing cmd:score is reported and repaired exactly once', async () => {
@@ -177,6 +402,7 @@ test('six execution nodes are accepted at the upper boundary', async () => {
       const graph = join(dir, 'graphs', 'upper-bound.yaml');
       const text = readFileSync(graph, 'utf8');
       writeFileSync(graph, text.replace('  - { node_id: done,', Array.from({ length: 5 }, (_, i) => `  - { node_id: extra${i}, kind: agent, recipe: 'cmd:main', max_visits: 1 }`).join('\n') + '\n  - { node_id: done,'));
+      writeFileSync(join(dir, 'graphs', 'run-step.ts'), "console.log(JSON.stringify({ outcome: 'ok' }));\n");
     },
   } });
   expect(result.status).toBe('installed');

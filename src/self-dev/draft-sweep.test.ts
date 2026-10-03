@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'bun:test';
+import { describe, expect, it, spyOn } from 'bun:test';
 import { CLAIM_IDLE_HOURS, PR_LABELS, STALLED_DRAFT_HOURS } from '../github/pr-labels.js';
 import { DRAFT_SWEEP_CLOSE_CAP, runDraftSweep, type DraftSweepAdapters, type SweepDraft, type SweepMergedPr } from './draft-sweep.js';
+import { debug } from '../debug/log.js';
 
 const state = (name: string) => PR_LABELS.find((entry) => entry.axis === 'state' && entry.name.endsWith(name))!.name;
 const running = state('running');
@@ -105,6 +106,7 @@ describe('runDraftSweep', () => {
       { number: 2, action: 'report', reason: 'approval-label-on-draft', applied: false },
     ]);
     expect(fixture.calls.filter((call) => call.startsWith('label:') || call.startsWith('close:'))).toEqual([]);
+    expect(result.counts).toEqual({ 'conflicting-state-labels': 1, 'approval-label-on-draft': 1 });
   });
 
   it('reports partial application when labels succeed but closing fails', async () => {
@@ -121,7 +123,7 @@ describe('runDraftSweep', () => {
   });
 
   it('fails closed on incomplete pages, missing liveness or run assessments, and failed mutation', async () => {
-    // Recently updated: an unobserved run is kept unless idle 48h (the idle rule has its own tests).
+    // Recently updated: an unobserved run is kept unless idle 24h (the idle rule has its own tests).
     const fixture = make([draft(1, { updatedAt: '2026-09-29T23:00:00Z' })]);
     fixture.adapters.listMerged = async () => { throw new Error('page 2 unavailable'); };
     expect((await sweep(fixture.adapters, true)).complete).toBe(false);
@@ -134,7 +136,7 @@ describe('runDraftSweep', () => {
     expect((await sweep(fixture.adapters, true)).entries[0]).toMatchObject({ action: 'keep' });
     fixture.adapters.getRunStatus = async () => { throw new Error('run lookup denied'); };
     const unavailable = await sweep(fixture.adapters, true);
-    expect(unavailable).toMatchObject({ complete: false, entries: [], error: 'Error: run lookup denied' });
+    expect(unavailable).toMatchObject({ complete: false, entries: [], counts: {}, error: 'Error: run lookup denied' });
     fixture.adapters.getRunStatus = async (pr) => fixture.statuses.get(pr.number);
     fixture.statuses.set(1, 'ended-unclosed');
     // Check the pre-existing failed-mutation path on a non-claim draft.
@@ -152,7 +154,7 @@ describe('runDraftSweep', () => {
 describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', () => {
   const idle = (hours: number) => new Date(now.getTime() - hours * 3_600_000).toISOString();
 
-  it('closes an unobserved draft only when no host worktree holds its branch and it has been idle 48h', async () => {
+  it('closes an unobserved draft only when no live branch holds it and last update is at least 24h old', async () => {
     const fixture = make([
       draft(1, { labels: [stalled], updatedAt: idle(50) }),
       draft(2, { labels: [stalled], updatedAt: idle(10), createdAt: idle(60) }),
@@ -162,7 +164,7 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     fixture.setLive(new Set([draft(3).branch]));
     const result = await sweep(fixture.adapters, true);
     expect(result.entries.map((entry) => [entry.number, entry.action, entry.reason])).toEqual([
-      [1, 'close', 'unobserved-idle'], [2, 'keep', 'unobserved'], [3, 'keep', 'live'],
+      [1, 'close', 'stale-unobserved'], [2, 'keep', 'unobserved'], [3, 'keep', 'live'],
     ]);
     expect(result.entries[0]!.statusLabel).toBe(stalled);
     expect(fixture.calls.find((call) => call.startsWith('close:1:'))).toContain('run unobserved');
@@ -229,6 +231,58 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(1);
   });
 
+  it('classifies unobserved same-goal and same-title twins before stale drafts and records decisions and counts', async () => {
+    const rows = [
+      draft(61, { labels: [stalled], updatedAt: idle(3), branch: 'self-impl/one-goalid-aabb-run' }),
+      draft(62, { labels: [stalled], updatedAt: idle(3) }),
+      draft(63, { labels: [stalled], updatedAt: idle(25) }),
+      draft(64, { labels: [stalled], updatedAt: idle(3) }),
+      draft(65, { labels: [keep], updatedAt: idle(25) }),
+      draft(66, { labels: [stalled], updatedAt: idle(25) }),
+    ];
+    const fixture = make(rows, [
+      { number: 161, title: 'different', branch: 'self-impl/two-goalid-aabb-run' },
+      { number: 162, title: rows[1]!.title, branch: 'merged/title' },
+      { number: 165, title: rows[4]!.title, branch: 'merged/held' },
+      { number: 166, title: rows[5]!.title, branch: 'merged/live' },
+    ]);
+    for (const row of rows) fixture.statuses.set(row.number, undefined);
+    fixture.setLive(new Set([rows[5]!.branch]));
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const result = await sweep(fixture.adapters);
+      expect(result.entries.map(({ action, reason }) => [action, reason])).toEqual([
+        ['close', 'superseded-by #161'], ['close', 'superseded-by #162'],
+        ['close', 'stale-unobserved'], ['keep', 'unobserved'], ['keep', `label:${keep}`], ['keep', 'live'],
+      ]);
+      expect(result.counts).toEqual({ 'superseded-by #161': 1, 'superseded-by #162': 1,
+        'stale-unobserved': 1, unobserved: 1, [`label:${keep}`]: 1, live: 1 });
+      expect(log.mock.calls.filter(([category, event]) => category === 'drafts.cleanup' && event === 'decided')
+        .map(([, , data]) => data)).toEqual(result.entries.map(({ number, action, reason }) => ({ number, action, reason })));
+      expect(log).toHaveBeenCalledWith('drafts.cleanup', 'summary', result.counts);
+      expect(fixture.calls.some((call) => call.startsWith('label:') || call.startsWith('close:'))).toBe(false);
+    } finally { log.mockRestore(); }
+  });
+
+  it('closes a 25h unobserved non-claim draft only in apply mode via injected adapters', async () => {
+    const fixture = make([draft(67, { labels: [stalled], updatedAt: idle(25) })]);
+    fixture.statuses.set(67, undefined);
+    const shadow = await sweep(fixture.adapters);
+    expect(shadow.entries[0]).toMatchObject({ action: 'close', reason: 'stale-unobserved', applied: false });
+    expect(fixture.calls.some((call) => call.startsWith('close:'))).toBe(false);
+    const live = await sweep(fixture.adapters, true);
+    expect(live.entries[0]).toMatchObject({ action: 'close', reason: 'stale-unobserved', applied: true });
+    expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(1);
+  });
+
+  it('preserves a missing last-update timestamp despite an old creation time', async () => {
+    const fixture = make([draft(68, { labels: [stalled], createdAt: idle(100), updatedAt: undefined })]);
+    fixture.statuses.set(68, undefined);
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[0]).toMatchObject({ action: 'keep', reason: 'unobserved', applied: false });
+    expect(fixture.calls.some((call) => call.startsWith('close:'))).toBe(false);
+  });
+
   it('closes a running draft without updatedAt as superseded when a merged twin exists (superseded outranks the unobserved claim)', async () => {
     const pr = draft(36, { updatedAt: undefined, createdAt: idle(100) });
     const fixture = make([pr], [{ number: 136, title: pr.title, branch: 'merged/36' }]);
@@ -269,10 +323,17 @@ describe('runDraftSweep — unobserved runs (🅢 lead decision 2026-09-28)', ()
     expect(fixture.calls.filter((call) => call.startsWith('close:'))).toHaveLength(DRAFT_SWEEP_CLOSE_CAP);
   });
 
-  it('never closes a keep- or approval-labelled draft, however idle and unobserved', async () => {
-    const fixture = make([draft(4, { labels: [keep], updatedAt: idle(500) }), draft(5, { labels: [approval], updatedAt: idle(500) })]);
-    for (const n of [4, 5]) fixture.statuses.set(n, undefined);
-    await sweep(fixture.adapters, true);
+  it('never closes a keep-, approval- or release-hold-labelled draft, however idle and unobserved', async () => {
+    const hold = PR_LABELS.find((entry) => entry.axis === 'addon' && entry.sweep.action === 'none')!.name;
+    const fixture = make([draft(4, { labels: [keep], updatedAt: idle(500) }), draft(5, { labels: [approval], updatedAt: idle(500) }),
+      draft(6, { labels: [hold, stalled], updatedAt: idle(500) }),
+      draft(7, { labels: [hold, approval], updatedAt: idle(500) })], [
+      { number: 107, title: 'Goal 7', branch: 'merged/seven' },
+    ]);
+    for (const n of [4, 5, 6, 7]) fixture.statuses.set(n, undefined);
+    const result = await sweep(fixture.adapters, true);
+    expect(result.entries[2]).toMatchObject({ action: 'keep', reason: `label:${hold}` });
+    expect(result.entries[3]).toMatchObject({ action: 'keep', reason: `label:${hold}` });
     expect(fixture.calls.some((call) => call.startsWith('close:'))).toBe(false);
   });
 

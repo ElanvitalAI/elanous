@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { EMPTY_RUNS, fromLogFrame, reduceRuns, subscribeInsideEvents } from './inside-events';
+import { EMPTY_RUNS, fromLogFrame, fromWizardLogFrame, reduceRuns, subscribeInsideEvents, subscribePtyDecisions, subscribeWizardSteps } from './inside-events';
 import { _setEventSourceFactoryForTest } from './shared-event-source';
 
 const frame = (data: Record<string, unknown>, overrides: Record<string, unknown> = {}) => ({
@@ -27,6 +27,58 @@ const useFake = () => _setEventSourceFactoryForTest((url) => new FakeEventSource
 afterEach(() => {
   _setEventSourceFactoryForTest(null);
   FakeEventSource.instances = [];
+});
+
+test('wizard.step frames reach the inside flow in order, ignoring malformed events', () => {
+  useFake();
+  const received: string[] = [];
+  const unsubscribe = subscribeWizardSteps({ logsStreamUrl: params => {
+    expect(params).toEqual({ exactCategory: 'wizard.step' });
+    return '/v1/logs/stream?exactCategory=wizard.step';
+  } }, event => received.push(event.step));
+  const source = FakeEventSource.instances[0];
+  for (const step of ['request', 'research', 'draft', 'validate', 'install', 'done']) {
+    source.emit('log', { data: JSON.stringify({ category: 'wizard.step', event: 'wizard.step', data: { ts: '2026-10-03T00:00:00Z', wizardId: 'wizard-1', step, text: step } }) });
+  }
+  expect(received).toEqual(['request', 'research', 'draft', 'validate', 'install', 'done']);
+  expect(fromWizardLogFrame({ category: 'wizard.step', event: 'wizard.step', data: { wizardId: 'w', step: 'unknown', text: 'bad', ts: '2026-10-03T00:00:00Z' } })).toBeNull();
+  unsubscribe();
+  source.emit('log', { data: JSON.stringify({ category: 'wizard.step', event: 'wizard.step', data: { ts: '2026-10-03T00:00:00Z', wizardId: 'w', step: 'done', text: 'done' } }) });
+  expect(received).toHaveLength(6);
+});
+
+test('pty.decision subscribes by exact category, forwards valid data once, rejects malformed frames and unsubscribes', () => {
+  useFake();
+  const received: unknown[] = [];
+  const decision = { ts: '2026-10-03T08:35:00Z', missionId: 'mission-1', seq: 1, sessionId: 'session-1', terminalId: 'terminal-1', agent: 'codex', step: 'read', text: '읽기' };
+  const unsubscribe = subscribePtyDecisions({ logsStreamUrl: params => {
+    expect(params).toEqual({ exactCategory: 'pty.decision' });
+    return '/v1/logs/stream?exactCategory=pty.decision';
+  } }, event => received.push(event));
+  const source = FakeEventSource.instances[0];
+  expect(source.url).toBe('/v1/logs/stream?exactCategory=pty.decision');
+  source.emit('log', { data: '{broken' });
+  source.emit('log', { data: JSON.stringify({ category: 'wizard.step', event: 'read', data: decision }) });
+  source.emit('log', { data: JSON.stringify({ category: 'pty.decision', event: 'judge', data: decision }) });
+  source.emit('log', { data: JSON.stringify({ category: 'pty.decision', event: 'read', data: { ...decision, seq: '1' } }) });
+  source.emit('log', { data: JSON.stringify({ category: 'pty.decision', event: 'read', data: null }) });
+  expect(received).toHaveLength(0);
+  source.emit('log', { data: JSON.stringify({ category: 'pty.decision', event: 'read', data: decision }) });
+  expect(received).toEqual([decision]);
+  unsubscribe();
+  expect(source.closed).toBe(true);
+  source.emit('log', { data: JSON.stringify({ category: 'pty.decision', event: 'read', data: decision }) });
+  expect(received).toHaveLength(1);
+});
+
+test('pty.decision has a no-op unsubscribe and opens no connection when the URL is absent', () => {
+  useFake();
+  const unsubscribe = subscribePtyDecisions({ logsStreamUrl: params => {
+    expect(params).toEqual({ exactCategory: 'pty.decision' });
+    return null;
+  } }, () => { throw Error('unexpected'); });
+  expect(FakeEventSource.instances).toHaveLength(0);
+  unsubscribe();
 });
 
 describe('inside log frame', () => {

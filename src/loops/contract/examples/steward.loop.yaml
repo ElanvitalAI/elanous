@@ -1,0 +1,50 @@
+id: steward
+version: 1.0.0
+kind: function
+role: steward-intake-triage-schedule-report
+graph: graphs/steward/steward.yaml
+cadence:
+  timezone: Asia/Seoul
+  byDefcon:
+    - {defcon: 5, everyMinutes: 15}
+    - {defcon: 4, everyMinutes: 15}
+    - {defcon: 3, everyMinutes: 10}
+    - {defcon: 2, everyMinutes: 5}
+    - {defcon: 1, everyMinutes: 2}
+posture:
+  default: 5
+  levels:
+    - {defcon: 5, minResolution: L0, maxResolution: L2, budget: &normal {maxTokens: 5000, maxToolCalls: 5, maxCostUsd: 0.3}}
+    - {defcon: 4, minResolution: L0, maxResolution: L2, budget: *normal}
+    - {defcon: 3, minResolution: L1, maxResolution: L3, budget: &urgent {maxTokens: 10000, maxToolCalls: 10, maxCostUsd: 0.6}}
+    - {defcon: 2, minResolution: L1, maxResolution: L3, budget: *urgent}
+    - {defcon: 1, minResolution: L1, maxResolution: L3, budget: *urgent}
+  raiseOn: [{event: directive-urgent-or-stalled-task, afterTicks: 1}]
+  lowerOn: [{event: backlog-reconciled, afterTicks: 2}]
+  hysteresis: {minDwellMinutes: 30, clearTicks: 2}
+resolution:
+  default: L0
+  steps:
+    - {level: L0, grounding: [], budget: &scan {maxTokens: 1200, maxToolCalls: 2, maxCostUsd: 0.1}}
+    - {level: L1, grounding: [{tool: omni-digest, budget: *scan}], budget: *normal}
+    - {level: L2, grounding: [{tool: omni-crawl, budget: *normal}], budget: *urgent}
+    - {level: L3, grounding: [{tool: aside-repl, budget: *normal}], budget: *urgent}
+  raiseOn: {event: unknown-owner-or-failed-reconcile, afterTicks: 1}
+  lowerOn: {event: ledger-reconciled, afterTicks: 2}
+grounding: [omni-digest, omni-crawl, aside-repl]
+memory:
+  local: {ledger: loop/steward/events, working: loop/steward/context}
+  promotesTo: [self-recall, decisions, checklist]
+  retention: {workingDays: 7, ledgerDays: 90}
+neighbors:
+  - {id: orchestrator, exchange: [status, request, decision, blocked], heartbeat: {everyMinutes: 120, missedTicks: 2}, onAbsent: {action: escalate, delegateTo: human}}
+  - {id: op-seat, exchange: [status, request, blocked], heartbeat: {everyMinutes: 120, missedTicks: 2}, onAbsent: {action: defer, delegateTo: orchestrator}}
+spawn:
+  allowed: [agent, harness]
+  max: 2
+  reap: {afterMinutes: 120, onExit: reconcile}
+hitl: {ladder: [self-heal, neighbor, orchestrator, human]}
+budget: *urgent
+observability:
+  category: loop.steward
+  events: [tick, posture-change, resolution-change, grounding, heartbeat, absent, exchange, spawn, reap, promote, hitl]

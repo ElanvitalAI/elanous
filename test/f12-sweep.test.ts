@@ -13,7 +13,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 function fixture(files: Record<string, string>): string {
   const root = mkdtempSync(join(tmpdir(), 'f12-sweep-'));
   roots.push(root);
-  writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'ESNext', moduleResolution: 'bundler', strict: true }, include: ['src/**/*.ts', 'test/**/*.ts'] }));
+  writeFileSync(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { target: 'ES2022', module: 'ESNext', moduleResolution: 'bundler', strict: true }, include: ['src/**/*.ts', 'test/**/*.ts', 'scripts/**/*.ts', 'apps/pwa/src/**/*.ts'] }));
   for (const [file, content] of Object.entries(files)) {
     const target = join(root, file);
     mkdirSync(resolve(target, '..'), { recursive: true });
@@ -51,8 +51,8 @@ function runtimeFixture(registrySource = registry): Record<string, string> {
   };
 }
 
-// TD1a — the two real-repository checks share one sweep: each sweep builds a whole-repository TypeScript program
-// (13 GB peak with two). The assertions are unchanged.
+// Only the nightly audit runs the whole-repository sweep; gate cases use small fixed trees.
+const nightly = process.env.ELANOUS_NIGHTLY_AUDIT === '1' ? it : it.skip;
 let realSweep: ReturnType<typeof sweepF12> | undefined;
 function realRepositorySweep(): ReturnType<typeof sweepF12> {
   realSweep ??= sweepF12(resolve(import.meta.dir, '..'));
@@ -66,6 +66,14 @@ describe('f12 sweep', () => {
     expect(report.bucketD.map((item) => item.name)).not.toContain('registeredOnly');
     expect(report.bucketA.map((item) => item.name).sort()).toEqual(['OrphanEnum', 'orphanFunction']);
     expect(report.bucketA.find((item) => item.name === 'OrphanEnum')?.kind).toBe('enum');
+    expect(report.filesScanned).toBeGreaterThan(0);
+    expect(report.exportsScanned).toBeGreaterThan(0);
+    expect(report.referencedElsewhere + report.referencedOnlyFromTests + report.unreferencedTypeOnly.length + report.bucketA.length + report.bucketD.length).toBe(report.exportsScanned);
+    const aKeys = new Set(report.bucketA.map((s) => `${s.file}#${s.name}`));
+    expect(report.bucketD.filter((s) => aKeys.has(`${s.file}#${s.name}`))).toEqual([]);
+    expect(report.unreferencedTypeOnly.every((s) => s.kind === 'interface' || s.kind === 'type')).toBe(true);
+    expect(report.bucketA.every((s) => s.kind !== 'interface' && s.kind !== 'type')).toBe(true);
+    expect(report.elapsedSeconds).toBeGreaterThanOrEqual(0);
   });
 
   it('does not mistake unrelated findNativeTool and registry.get calls for alias resolution', async () => {
@@ -78,6 +86,21 @@ describe('f12 sweep', () => {
     const report = await sweepF12(fixture(runtimeFixture(unrelatedRegistry)));
     expect(report.bucketD).toHaveLength(0);
     expect(report.bucketA.map((item) => item.name).sort()).toEqual(['OrphanEnum', 'orphanFunction']);
+  });
+
+  it('keeps all expected bucket b scopes measured in a small fixture', async () => {
+    const report = await sweepF12(fixture({
+      'src/constant.ts': 'export const DELIMITER = "__";',
+      'scripts/copy.ts': 'export const copy = "__";',
+      'test/copy.test.ts': 'export const copy = "__";',
+      'apps/pwa/src/copy.ts': 'export const copy = "__";',
+    }));
+    expect(report.bucketB.scanRoots).toEqual(['src', 'scripts', 'test', 'apps/pwa/src']);
+    expect(report.bucketB.unavailableScopes).toEqual([]);
+    expect(report.bucketB.filesScanned).toBeGreaterThan(report.filesScanned);
+    expect(report.bucketB.literalsScanned).toBeGreaterThan(0);
+    expect(report.bucketB.constantsScanned).toBeGreaterThan(0);
+    expect(report.bucketB.sites.every((site) => site.constFile !== site.file)).toBe(true);
   });
 
   it('prints the denominator first, reports enum counts, explicit B/C boundaries, and elapsed seconds last', async () => {
@@ -169,7 +192,7 @@ describe('f12 sweep', () => {
     expect(line).toContain('[test-only]=every bypassing site is in a test file');
   }, 60_000);
 
-  it('measures bucket b over apps/pwa on the real repository, and never folds an unreadable scope into zero', async () => {
+  nightly('measures bucket b over apps/pwa on the real repository, and never folds an unreadable scope into zero', async () => {
     const report = await realRepositorySweep();
 
     // ⭐ 이 자가 14차에 결함 열둘이 살던 표면을 «본다» — 안 보면 그 축의 「0」은 거짓이다.
@@ -185,7 +208,7 @@ describe('f12 sweep', () => {
     expect(report.bucketB.sites.every((site) => site.constFile !== site.file)).toBe(true);
   }, 180_000);
 
-  it('partitions the denominator across every bucket on the real repository, without freezing drifting counts', async () => {
+  nightly('partitions the denominator across every bucket on the real repository, without freezing drifting counts', async () => {
     const report = await realRepositorySweep();
 
     // ⭐ 분모는 «존재»해야 한다 — 퇴화(0)면 이 자는 아무것도 재고 있지 않다.

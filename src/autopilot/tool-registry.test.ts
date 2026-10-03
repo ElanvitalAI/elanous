@@ -47,7 +47,9 @@ describe('getAutopilotToolRegistry', () => {
     expect(names).toContain('ops_status');
     expect(names).toContain('memory_recall');
     expect(names).toContain('logs_query');
-    expect(tools).toHaveLength(23);
+    // CTX2 #23185: context_now 가 자기관측 원장에 더해졌다(맥락 한 문).
+    expect(names).toContain('context_now');
+    expect(tools).toHaveLength(24);
   });
 
   test('WebFetch dispatch routes to dispatchWebFetch (invalid URL → throw)', async () => {

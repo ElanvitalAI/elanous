@@ -1,12 +1,12 @@
 // PS1 — 프리셋 → 내 페르소나. 실제 persona-presets/ 여덟 개 전부가 런타임 로더를 통과하고, CLI 가 만든 파일을 레지스트리가 싣는다.
 import { afterEach, describe, expect, spyOn, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { parsePersonaYaml } from './loader.js';
 import { PersonaRegistry } from './registry.js';
-import { choosePersonaId, findPreset, loadPresetIndex, loadPresets, presetToProfileYaml } from './presets.js';
+import { choosePersonaId, clonePreset, editPersona, findPreset, loadPresetIndex, loadPresets, presetToProfileYaml } from './presets.js';
 import { registerPersonaCommands } from '../cli/persona-cli.js';
 
 const dirs: string[] = [];
@@ -47,6 +47,46 @@ describe('PS1 persona presets → my persona', () => {
     expect(choosePersonaId(mira, 'Hana Kim', new Set())).toBe('hana-kim');
     expect(choosePersonaId(mira, '하나', new Set())).toBe('mira');
     expect(choosePersonaId(mira, undefined, new Set(['mira', 'mira-2']))).toBe('mira-3');
+  });
+
+  test('edit validates schema, rejects missing and duplicate names, and preserves provenance on atomic replacement', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'persona-edit-')); dirs.push(dir);
+    const original = presetToProfileYaml(presets[0]!, common, { personaId: 'trial', name: 'Trial' });
+    const path = join(dir, 'trial.yaml');
+    writeFileSync(path, original);
+    expect(() => editPersona('absent', { description: 'x' }, { dir })).toThrow('persona not found');
+    expect(() => editPersona('Trial', { mysterious: 'x' }, { dir })).toThrow('unknown persona schema key');
+    expect(() => editPersona('Trial', { brand: 'invalid' }, { dir })).toThrow('invalid persona');
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    const clone = clonePreset(presets[0]!, 'Another', { dir });
+    expect(() => editPersona('Trial', { displayName: 'Another · ' + presets[0]!.role }, { dir })).toThrow('already exists');
+    const updated = editPersona('Trial', { description: 'Edited description' }, { dir });
+    expect(updated.personaId).toBe('trial');
+    expect(parsePersonaYaml(readFileSync(path, 'utf8'), path).ok).toBe(true);
+    expect(readFileSync(path, 'utf8')).toContain('preset:');
+    expect(readFileSync(path, 'utf8')).toContain('Edited description');
+    expect(existsSync(clone.path)).toBe(true);
+    expect(readdirSync(dir).every((file) => file.endsWith('.yaml'))).toBe(true);
+  });
+
+  test('dry-run edit and clone validate without creating or changing files', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'persona-dry-')); dirs.push(dir);
+    const path = join(dir, 'existing.yaml');
+    const original = presetToProfileYaml(presets[0]!, common, { personaId: 'existing', name: 'Existing' });
+    writeFileSync(path, original);
+    const edit = editPersona('existing', { description: 'Preview' }, { dir, dryRun: true });
+    expect(edit.yaml).toContain('Preview');
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    expect(() => editPersona('existing', { models: { primary: 123 } }, { dir, dryRun: true })).toThrow('invalid persona');
+    const clone = clonePreset('mira', 'Preview Clone', { dir, dryRun: true });
+    expect(clone.dryRun).toBe(true);
+    expect(existsSync(clone.path)).toBe(false);
+    expect(() => clonePreset('mira', 'Existing · ' + presets[0]!.role, { dir })).toThrow('already exists');
+    expect(() => clonePreset('missing-preset', 'Unique', { dir })).toThrow('preset not found');
+    const absent = join(dir, 'new-store');
+    expect(clonePreset('mira', 'Unused Persona', { dir: absent, dryRun: true }).dryRun).toBe(true);
+    expect(existsSync(absent)).toBe(false);
+    expect(readdirSync(dir)).toEqual(['existing.yaml']);
   });
 
   test('CLI: add writes one file the persona registry loads; show reads it back; a second add gets a new id', async () => {

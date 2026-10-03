@@ -1,36 +1,67 @@
+import { randomUUID } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { elanousStateRoot } from '../../autopilot/state-paths.js';
-import { debug } from '../../debug/log.js';
+import { debug, redactSecretText, redactSecrets } from '../../debug/log.js';
+import { dispatchOmniSearch } from '../../skills/tools/omni-search.js';
 import { runGraph } from '../../graph-runner/runner.js';
 import { parseGraphTemplateYaml } from '../../self-implement/graph-yaml.js';
 import { installPlugin } from '../install/plugin-install.js';
+import { generateWizardFiles, type WizardResearchDraft } from './wizard-generate.js';
+import { bundleInstalledWizardPlugin, type MarketBundleResult } from './market-bundle.js';
 
 const CAPABILITIES = ['fs:workdir', 'proc:bun', 'proc:elanous'];
 const isRecord = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
 
+export interface WizardStepEvent {
+  ts: string;
+  wizardId: string;
+  step: 'request' | 'research' | 'draft' | 'validate' | 'install' | 'done';
+  text: string;
+  detail?: unknown;
+}
+
+export interface ResearchSource { title: string; url: string; snippet: string; source: 'omni-crawl' | 'aside' }
+export interface PluginDraft {
+  connectors: Array<{ name: string; use: string; evidence: string[]; missingCredentials: string[] }>;
+  skills: Array<{ name: string; use: string; evidence: string[] }>;
+  graph: { use: string; nodes: string[]; evidence: string[] };
+  research: { sources: ResearchSource[]; unavailable: string[] };
+}
+
 export interface MakePluginDeps {
   codex: (dir: string, prompt: string) => Promise<void>;
   install?: typeof installPlugin;
+  bundle?: typeof bundleInstalledWizardPlugin;
   runGraph?: typeof runGraph;
+  webSearch?: (query: string) => Promise<{ sources: ResearchSource[]; errors?: string[] }>;
+  memorySearch?: (query: string) => Promise<ResearchSource[]>;
+  asideBin?: string;
+  onEvent?: (event: WizardStepEvent) => void;
 }
 export interface MakePluginOptions {
   request: string;
+  draftFile?: string;
   name?: string;
   parentDir?: string;
   run?: boolean;
+  /** Optional local output directory for a reviewable, unpublished market bundle. */
+  marketBundleDir?: string;
   input?: unknown;
   deps?: MakePluginDeps;
 }
 export interface MakePluginResult {
-  status: 'installed' | 'ran' | 'failed';
+  status: 'draft' | 'installed' | 'ran' | 'failed';
   dir: string;
   plugin: string;
   graph: string;
   errors: string[];
   runStatus?: Awaited<ReturnType<typeof runGraph>>['status'];
+  marketBundle?: MarketBundleResult;
+  draft: PluginDraft;
   timings: { scaffold: number; write: number; validate: number; repair?: number; install: number; run?: number };
 }
 
@@ -172,8 +203,136 @@ export async function validatePluginDir(dir: string): Promise<string[]> {
   return errors;
 }
 
-export async function makePlugin({ request, name, parentDir, run, input, deps }: MakePluginOptions): Promise<MakePluginResult> {
-  const slug = (name ?? request).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32).replace(/-$/, '') || `plugin-${Date.now()}`;
+async function searchWebForPlugin(query: string): Promise<{ sources: ResearchSource[]; errors?: string[] }> {
+  const sources: ResearchSource[] = [];
+  const errors: string[] = [];
+  try {
+    const found = await dispatchOmniSearch({ query, limit: 5 }, { onSource: hit => {
+      sources.push({ title: hit.title, url: hit.url, snippet: hit.snippet ?? '', source: 'omni-crawl' });
+    } });
+    errors.push(...Object.entries(found.metadata.perEngine).flatMap(([engine, status]) => status.error ? [`${engine}: ${status.error}`] : []));
+    if (!Object.keys(found.metadata.perEngine).length) errors.push('omni-crawl: 검색 제공자 없음');
+  } catch (error) { errors.push(`웹 검색: ${String(error)}`); }
+  try {
+    const script = resolve(dirname(import.meta.path), '../../../skills/omni-crawl/scripts/main.ts');
+    if (existsSync(script)) {
+      const stdout = await new Promise<string>((resolveOutput, rejectOutput) => {
+        const child = spawn(process.execPath, [script, query, '--engine', 'firecrawl', '--json', '--no-save'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        let output = '';
+        const timer = setTimeout(() => { child.kill(); rejectOutput(new Error('크롤 시간 초과')); }, 20_000);
+        child.stdout.setEncoding('utf8');
+        child.stdout.on('data', (chunk: string) => { output += chunk; if (output.length > 1_000_000) child.kill(); });
+        child.on('error', error => { clearTimeout(timer); rejectOutput(error); });
+        child.on('close', code => {
+          clearTimeout(timer);
+          if (code !== 0) rejectOutput(new Error(`크롤 종료 코드 ${code}`));
+          else resolveOutput(output);
+        });
+      });
+      const match = stdout.match(/---BEGIN_OMNI_CRAWL_JSON---\s*([\s\S]*?)\s*---END_OMNI_CRAWL_JSON---/);
+      if (!match) throw new Error('크롤 JSON 결과 없음');
+      const payload: unknown = JSON.parse(match[1]);
+      const results = isRecord(payload) && Array.isArray(payload.results) ? payload.results : [];
+      let count = 0;
+      for (const result of results) {
+        if (!isRecord(result) || !Array.isArray(result.items)) continue;
+        for (const item of result.items) {
+          if (!isRecord(item) || typeof item.url !== 'string' || !/^https?:\/\//.test(item.url)) continue;
+          count++;
+          const source = sources.find(source => source.url === item.url);
+          const text = typeof item.text === 'string' ? item.text.slice(0, 1800) : '';
+          if (source) source.snippet = text || source.snippet;
+          else sources.push({ title: typeof item.title === 'string' ? item.title : item.url, url: item.url, snippet: text, source: 'omni-crawl' });
+        }
+      }
+      if (!count) errors.push('omni-crawl: 크롤 결과 없음 또는 검색 실패');
+    } else errors.push('omni-crawl: 실행 스크립트 없음');
+  } catch (error) { errors.push(`omni-crawl: ${String(error)}`); }
+  return { sources, errors };
+}
+
+async function searchLocalMemory(query: string, bin = 'aside'): Promise<ResearchSource[]> {
+  const prompt = `Search your local memory for the following plugin request (do not search the web): ${JSON.stringify(query)}. Return ONLY JSON: {"sources":[{"title":"note title","url":"local note URI or path","snippet":"relevant excerpt"}]}. Include at most 5 actual matching notes with their real reference URI or path; if none, return {"sources":[]}. Do not invent notes or references.`;
+  const stdout = await new Promise<string>((resolveOutput, rejectOutput) => {
+    const child = spawn(bin, ['exec', '--effort', 'low', prompt], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let errorOutput = '';
+    let finished = false;
+    const finish = (error?: Error): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (error) rejectOutput(error);
+      else resolveOutput(output);
+    };
+    const timer = setTimeout(() => { child.kill(); finish(new Error('검색 시간 초과')); }, 20_000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => {
+      output += chunk;
+      if (output.length > 100_000) { child.kill(); finish(new Error('검색 결과 크기 초과')); }
+    });
+    child.stderr.on('data', (chunk: string) => { errorOutput = (errorOutput + chunk).slice(-500); });
+    child.on('error', error => finish(error));
+    child.on('close', code => finish(code === 0 ? undefined : new Error(`검색 종료 코드 ${code}: ${errorOutput.trim()}`)));
+  });
+  const parsed: unknown = JSON.parse(stdout.trim());
+  if (!isRecord(parsed) || !Array.isArray(parsed.sources)) throw new Error('검색 결과 JSON 에 sources 배열 없음');
+  return parsed.sources.slice(0, 5).filter((source): source is Record<string, string> =>
+    isRecord(source) && typeof source.title === 'string' && typeof source.url === 'string' && !!source.url.trim() && typeof source.snippet === 'string')
+    .map(source => ({ title: source.title.slice(0, 200), url: source.url.slice(0, 1000), snippet: source.snippet.slice(0, 800), source: 'aside' }));
+}
+
+function validResearchSource(source: ResearchSource): boolean {
+  if (!source.url.trim()) return false;
+  if (source.source === 'aside' && !/^https?:\/\//i.test(source.url)) return true;
+  try {
+    const url = new URL(source.url);
+    return (url.protocol === 'https:' || url.protocol === 'http:') && !!url.hostname;
+  } catch { return false; }
+}
+
+function wizardDraftFromResearch(request: string, draft: PluginDraft): WizardResearchDraft {
+  const used = new Set<string>();
+  const connectors = draft.connectors.filter(connector => connector.name !== '미확인').map(connector => {
+    const base = connector.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24).replace(/-$/, '') || 'connector';
+    let id = base;
+    for (let index = 2; used.has(id); index++) id = `${base}-${index}`;
+    used.add(id);
+    return { id, credentials: connector.missingCredentials
+      .filter(name => /^[A-Za-z_][A-Za-z0-9_-]*$/.test(name))
+      .map(name => ({ name })) };
+  });
+  const citedSkills = draft.skills.filter(skill => skill.name !== '미확인');
+  return { description: request, connectors,
+    skill: { description: request, instructions: request + (citedSkills.length
+      ? `\n\nResearch sources:\n${citedSkills.map(skill => skill.evidence.join(', ')).join('\n')}` : ''), requires: [] } };
+}
+
+function buildDraft(request: string, sources: ResearchSource[], unavailable: string[]): PluginDraft {
+  const evidence = [...new Set(sources.map(source => source.url).filter(Boolean))];
+  const connectors = sources.filter(source => /api|oauth|webhook|integration|connector|연동|인증/i.test(`${source.title} ${source.snippet}`))
+    .slice(0, 3).map(source => {
+    const name = /^https?:\/\//.test(source.url) ? new URL(source.url).hostname : source.title;
+    const fields = [...new Set((`${source.title} ${source.snippet}`.match(/\b[A-Z][A-Z0-9_]*(?:API_KEY|TOKEN|CLIENT_ID|CLIENT_SECRET)\b/g) ?? []))];
+    return { name, use: source.title, evidence: [source.url], missingCredentials: fields.length ? fields : ['자격 확인 필요'] };
+  });
+  const skills = sources.filter(source => /skill|스킬|workflow|작업/i.test(`${source.title} ${source.snippet}`))
+    .slice(0, 3).map(source => ({ name: source.title, use: source.snippet.slice(0, 200) || request, evidence: [source.url] }));
+  const graphSource = sources.find(source => /graph|workflow|pipeline|그래프|흐름/i.test(`${source.title} ${source.snippet}`));
+  const graphNodes = [...new Set((graphSource?.snippet.match(/\b(?:fetch|collect|extract|transform|process|analy[sz]e|report|publish)\b|수집|가공|분석|보고|발행/gi) ?? [])
+    .map(node => node.toLowerCase()))].slice(0, 3);
+  if (graphNodes.length < 2) graphNodes.push(...['fetch', 'process', 'report'].filter(node => !graphNodes.includes(node)).slice(0, 3 - graphNodes.length));
+  return {
+    connectors: connectors.length ? connectors : [{ name: '미확인', use: `요청에 필요한 커넥터 조사: ${request}`, evidence, missingCredentials: ['자격 확인 필요'] }],
+    skills: skills.length ? skills : [{ name: '미확인', use: `요청에 필요한 스킬 조사: ${request}`, evidence }],
+    graph: { use: request, nodes: graphNodes, evidence },
+    research: { sources, unavailable },
+  };
+}
+
+export async function makePlugin({ request, draftFile, name, parentDir, run, marketBundleDir, input, deps }: MakePluginOptions): Promise<MakePluginResult> {
+  const slug = (name ?? request).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 31).replace(/-$/, '') || `plugin-${Date.now()}`;
   if (!request.trim() || !/^[a-z0-9][a-z0-9-]{1,39}$/.test(slug)) throw new Error(`invalid plugin request or name: ${slug}`);
   if (name !== undefined && !/^[a-z0-9][a-z0-9-]{1,31}$/.test(name)) throw new Error(`invalid --name slug: ${name}`);
   const root = elanousStateRoot();
@@ -182,26 +341,108 @@ export async function makePlugin({ request, name, parentDir, run, input, deps }:
   const dir = join(parent, slug);
   if (existsSync(dir)) throw new Error(`plugin directory already exists: ${dir}`);
   const timings: MakePluginResult['timings'] = { scaffold: 0, write: 0, validate: 0, install: 0 };
-  const result: MakePluginResult = { status: 'failed', dir, plugin: slug, graph: join(dir, 'graphs', `${slug}.yaml`), errors: [], timings };
+  const wizardId = randomUUID();
+  const result: MakePluginResult = { status: 'failed', dir, plugin: slug, graph: join(dir, 'graphs', `${slug}.yaml`), errors: [], timings,
+    draft: buildDraft(request, [], []) };
+  const emit = (stage: WizardStepEvent['step'], text: string, detail?: unknown): void => {
+    const event: WizardStepEvent = { ts: new Date().toISOString(), wizardId, step: stage, text: redactSecretText(text.slice(0, 500)),
+      ...(detail === undefined ? {} : { detail: redactSecrets(detail) }) };
+    try { debug.log('wizard.step', 'wizard.step', event); } catch { /* Logging cannot stop make. */ }
+    try { deps?.onEvent?.(event); } catch { /* An observation sink must not stop installation. */ }
+  };
   const step = async (stage: keyof MakePluginResult['timings'], action: () => void | Promise<void>): Promise<void> => {
     const start = performance.now();
     try { await action(); }
     finally { const ms = Math.round(performance.now() - start); timings[stage] = ms; debug.log('plugin.maker', stage, { ms, errors: result.errors }); }
   };
   try {
-    await step('scaffold', () => { mkdirSync(parent, { recursive: true }); mkdirSync(dir); scaffold(dir, slug, request); });
+    emit('request', request);
+    const settled = await Promise.allSettled([
+      Promise.resolve().then(() => (deps?.webSearch ?? (process.env.NODE_ENV === 'test' ? async () => ({ sources: [], errors: ['omni-crawl: 시험 모드'] }) : searchWebForPlugin))(request)),
+      Promise.resolve().then(() => (deps?.memorySearch ?? (process.env.NODE_ENV === 'test' && !deps?.asideBin ? async () => [] : (query: string) => searchLocalMemory(query, deps?.asideBin)))(request)),
+    ]);
+    const unavailable: string[] = [];
+    const sources: ResearchSource[] = [];
+    if (settled[0].status === 'fulfilled') {
+      sources.push(...settled[0].value.sources);
+      unavailable.push(...(settled[0].value.errors ?? []));
+      if (!settled[0].value.sources.length) unavailable.push('omni-crawl: 검색 결과 없음');
+    } else unavailable.push(`omni-crawl: ${String(settled[0].reason)}`);
+    if (settled[1].status === 'fulfilled') {
+      sources.push(...settled[1].value);
+      if (!settled[1].value.length) unavailable.push('aside: 검색 결과 없음');
+    } else unavailable.push(`aside: ${String(settled[1].reason)}`);
+    for (let i = sources.length - 1; i >= 0; i--) {
+      if (!validResearchSource(sources[i])) {
+        unavailable.push(`${sources[i].source}: 잘못된 출처 URL: ${sources[i].url}`);
+        sources.splice(i, 1);
+      }
+    }
+    emit('research', sources.length ? `${sources.length}건 조사` : `조사 없음 · ${unavailable.join('; ')}`, { sources, unavailable });
+    result.draft = buildDraft(request, sources, unavailable);
+    emit('draft', '커넥터·스킬·그래프 초안', result.draft);
+    await step('scaffold', () => { mkdirSync(parent, { recursive: true }); mkdirSync(dir); if (draftFile === undefined) scaffold(dir, slug, request); });
     const codex = deps?.codex ?? codexWrite;
     const prompt = `요청 원문:\n${request}\n\n이 폴더의 뼈대를 수정해 작동하는 로컬 그래프 플러그인을 작성하라. plugin.json extensions["ai.elanous"].graphs 와 capabilities 는 유지하고, graphs/<id>.yaml 은 entry_node, terminal_nodes: [done, failed], nodes 의 recipe: 'cmd:<id>', edges 의 on: outcome, map: { ok, fail } 을 써라. graphs/recipes.yaml 에 모든 cmd:<id> 의 command: 'bun "$ELANOUS_GRAPH_DIR/run-step.ts" <id>' 와 timeout_ms 를 선언하라. graphs/run-step.ts 의 각 단계 stdout 마지막 줄은 JSON {outcome, ...} 이며 이전 출력은 ELANOUS_GRAPH_CONTEXT JSON 의 outputs 에 있다. src/ import 금지. 엘라누스 기능은 CLI elanous ask --json 또는 elanous research --json 로만 사용. 아무것도 보내지 말 것. 실행 노드는 2~6개. examples/input.json 에 실제로 돌릴 입력을 넣을 것. 폴더 밖에는 쓰지 말 것.`;
-    await step('write', () => codex(dir, prompt));
-    await step('validate', async () => { result.errors = await validatePluginDir(dir); });
-    if (result.errors.length) {
-      await step('repair', () => codex(dir, `${prompt}\n\n아래 오류를 모두 수리하라:\n${result.errors.join('\n')}`));
-      await step('validate', async () => { result.errors = await validatePluginDir(dir); });
+    const researchedPrompt = `${prompt}\n\n조사 기반 초안 (확인되지 않은 자격을 지어내지 말 것):\n${JSON.stringify(result.draft, null, 2)}`;
+    if (draftFile !== undefined) {
+      await step('write', () => {
+        const draft = JSON.parse(readFileSync(resolve(draftFile), 'utf8')) as WizardResearchDraft;
+        generateWizardFiles(dir, slug, draft);
+      });
+    } else {
+      await step('write', async () => {
+        generateWizardFiles(dir, slug, wizardDraftFromResearch(request, result.draft));
+        await codex(dir, `${researchedPrompt}\n\n생성된 커넥터 선언과 skills/${slug}/SKILL.md 를 보존하고, researchDraft 그래프의 실패 단계는 실제 요청 처리로 구현하라. 설치 전에 실행 예제로 그래프를 검증하며, 실패하면 플러그인을 설치하지 않는다.`);
+      });
+    }
+    emit('validate', '플러그인 검사 시작');
+    const validate = async (): Promise<void> => {
+      if (draftFile === undefined) {
+        const manifestPath = join(dir, 'plugin.json');
+        const raw: unknown = JSON.parse(readFileSync(manifestPath, 'utf8'));
+        const extension = isRecord(raw) && isRecord(raw.extensions) ? raw.extensions['ai.elanous'] : undefined;
+        if (isRecord(extension)) {
+          extension.researchDraft = true;
+          writeFileSync(manifestPath, JSON.stringify(raw, null, 2) + '\n');
+        }
+      }
+      result.errors = await validatePluginDir(dir);
+      if (draftFile === undefined && !result.errors.length) {
+        const probeRoot = mkdtempSync(join(tmpdir(), 'elanous-wizard-probe-'));
+        try {
+          const example = JSON.parse(readFileSync(join(dir, 'examples', 'input.json'), 'utf8')) as unknown;
+          const probe = await runGraph(result.graph, { input: example, deps: { root: probeRoot } });
+          if (probe.status !== 'done' || probe.nodes.some(node => !node.ok)) {
+            result.errors.push(`research graph validation failed: ${probe.status}`);
+          }
+        } finally { rmSync(probeRoot, { recursive: true, force: true }); }
+        if (!result.errors.length) {
+          const manifestPath = join(dir, 'plugin.json');
+          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { extensions: { 'ai.elanous': { researchDraft?: boolean } } };
+          delete manifest.extensions['ai.elanous'].researchDraft;
+          writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+        }
+      }
+    };
+    await step('validate', validate);
+    if (result.errors.length && draftFile === undefined) {
+      await step('repair', () => codex(dir, `${researchedPrompt}\n\n아래 오류를 모두 수리하라:\n${result.errors.join('\n')}`));
+      await step('validate', validate);
     }
     if (result.errors.length) return result;
+    if (draftFile !== undefined) {
+      result.status = run ? 'failed' : 'draft';
+      if (run) result.errors.push('research draft only: implement graph steps before --run; no plugin was installed');
+      return result;
+    }
     let installedPath = '';
+    emit('install', '플러그인 설치 시작');
     await step('install', async () => { installedPath = (await (deps?.install ?? installPlugin)(dir, { yes: true, root })).path; });
     result.status = 'installed';
+    if (marketBundleDir !== undefined) {
+      result.marketBundle = (deps?.bundle ?? bundleInstalledWizardPlugin)(installedPath, marketBundleDir);
+    }
     const graph = JSON.parse(readFileSync(join(dir, 'plugin.json'), 'utf8')).extensions['ai.elanous'].graphs[0] as string;
     result.graph = resolve(installedPath, graph);
     if (run) {
@@ -215,6 +456,8 @@ export async function makePlugin({ request, name, parentDir, run, input, deps }:
   } catch (error) {
     result.status = 'failed';
     result.errors.push(error instanceof Error ? error.message : String(error));
+  } finally {
+    emit('done', result.status, { errors: result.errors });
   }
   return result;
 }

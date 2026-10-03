@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { checkPodPool, parsePodPool, PodPoolScheduler, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type RemoteRun } from './pod-pool.js';
+import { checkPodPool, genericConfigPodPool, parsePodPool, PodPoolScheduler, resolvePodPoolSpec, syncPoolImage, syncPoolImages, type RemoteRun } from './pod-pool.js';
 import { podSelfImplementSpawn, type Kubectl } from './self-implement-pod.js';
 
 describe('pod pool — priority ⊕ per-node capacity', () => {
@@ -14,11 +14,30 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(() => parsePodPool('bad node')).toThrow('못 읽는 노드');
   });
 
+  test('two registry addresses stay attached to their members through lookup and build', async () => {
+    const members = parsePodPool('pool-node-b@node-b:2#k3d-elanous-registry:5051,pool-node-c@node-c:2#k3d-elanous-registry:5052');
+    const lookups: string[] = [];
+    const builds: string[] = [];
+    const run: RemoteRun = (host, cmd) => {
+      if (cmd.includes('/tags/list')) { lookups.push(`${host} ${cmd}`); return { status: 0, stdout: '{"tags":["abc123"]}', stderr: '' }; }
+      if (cmd.includes('docker inspect k3d-')) return { status: 0, stdout: '', stderr: '' };
+      return { status: 0, stdout: 'abc123', stderr: '' };
+    };
+    const result = await syncPoolImages(members, 'img', 'abc123', { run, remoteBuild: async (host, _cluster, registry) => { builds.push(`${host} ${registry}`); return { ok: true, detail: 'built' }; }, localSkillsDigest: 'different' });
+    expect(lookups).toContain('node-b curl -fsS --max-time 5 http://localhost:5051/v2/elanous-harness/tags/list 2>/dev/null');
+    expect(lookups).toContain('node-c curl -fsS --max-time 5 http://localhost:5052/v2/elanous-harness/tags/list 2>/dev/null');
+    expect(builds.sort()).toEqual(['node-c k3d-elanous-registry:5052', 'node-b k3d-elanous-registry:5051']);
+    expect(result.get('pool-node-b')?.imageRef).toBe('k3d-elanous-registry:5051/elanous-harness:abc123');
+    expect(result.get('pool-node-c')?.imageRef).toBe('k3d-elanous-registry:5052/elanous-harness:abc123');
+    expect(parsePodPool('pool-node-b@node-b:2')[0]?.registry).toBeUndefined();
+    expect(() => parsePodPool('pool-node-b@node-b:2#k3d-elanous-registry:65536')).toThrow('65535');
+  });
+
   test('explicit spec wins over env; neither → null (single current context)', () => {
     expect(resolvePodPoolSpec('a:1', { ELANOUS_POD_POOL: 'b:1' }, () => 'c:1')).toBe('a:1');
     expect(resolvePodPoolSpec(undefined, { ELANOUS_POD_POOL: 'b:1' }, () => undefined)).toBe('b:1');
     expect(resolvePodPoolSpec(undefined, {}, () => undefined)).toBeNull();
-    expect(resolvePodPoolSpec(undefined, {}, () => 'pool-node-b@node-b:4')).toBe('pool-node-b@node-b:4');   // 설정 pod.pool — «--substrate pod 만» 으로 분배
+    expect(resolvePodPoolSpec(undefined, {}, () => 'pool-node-b@node-b:4')).toBe('pool-node-b@node-b:4');   // configured harness pool — «--substrate pod 만» 으로 분배
     expect(resolvePodPoolSpec(undefined, { ELANOUS_POD_POOL: 'b:1' }, () => 'c:1')).toBe('b:1');
   });
 
@@ -56,7 +75,7 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
       if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
       return { status: 0, stdout: '', stderr: '' };
     };
-    const pool = new PodPoolScheduler(parsePodPool('pool-node-b@node-b:1'));
+    const pool = new PodPoolScheduler(parsePodPool('pool-node-b@node-b:1'), { status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null, capacitySlots: 1, memorySlots: 1, placeableSlots: 1, running: 0, pending: 0 }) });
     const spawn = podSelfImplementSpawn({
       kubectl, pool, pollMs: 1, imageCommit: null, sleep: async () => {},
       credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }),
@@ -66,6 +85,278 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(calls.length).toBeGreaterThan(3);
     expect(calls.every((c) => c[0] === '--context' && c[1] === 'pool-node-b')).toBe(true);
     expect(pool.snapshot()).toEqual({ 'pool-node-b': 0 });
+  });
+
+  test('three pooled Job launches share FIFO admission: N=2 holds the third goal', async () => {
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), {
+      status: () => ({ recommended: 2, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 3, memorySlots: 3, placeableSlots: 3, running: 0, pending: 0 }),
+    });
+    const applied: string[] = [];
+    const completed = new Set<string>();
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input) {
+        const object = JSON.parse(input) as { kind: string; metadata: { name: string } };
+        if (object.kind === 'Job') applied.push(object.metadata.name);
+      }
+      if (args.some((a) => a.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.includes('get') && args.includes('job') && args.includes('jsonpath={.status.conditions[*].type}')) {
+        return { status: 0, stdout: completed.has(args[args.indexOf('job') + 1]!) ? 'Complete' : '', stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const spawn = podSelfImplementSpawn({ pool, kubectl, env: {}, repoUrl: 'not-a-github-repository',
+      credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }), pollMs: 2 });
+    const controllers = ['ask', 'say', 'self'].map(() => new AbortController());
+    const jobs = ['ask', 'say', 'self'].map((spaceId, i) => spawn({ spaceId, feature: spaceId, signal: controllers[i]!.signal } as Parameters<typeof spawn>[0]));
+    const waitUntil = async (predicate: () => boolean) => {
+      for (let i = 0; i < 100 && !predicate(); i++) await Bun.sleep(5);
+      expect(predicate()).toBe(true);
+    };
+    try {
+      await waitUntil(() => applied.length === 2);
+      expect(applied[0]).toContain('ask');
+      expect(applied[1]).toContain('say');
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1, recommended: 2 });
+      await Bun.sleep(10);
+      expect(applied).toHaveLength(2);
+      completed.add(applied[0]!);
+      await jobs[0]!.done;
+      await waitUntil(() => applied.length === 3);
+      expect(applied[2]).toContain('self');
+      completed.add(applied[1]!);
+      completed.add(applied[2]!);
+      await Promise.all(jobs.slice(1).map((job) => job.done));
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 0 });
+      expect(pool.snapshot()).toEqual({ fake: 0 });
+    } finally {
+      controllers.forEach((controller) => controller.abort());
+      for (const name of applied) completed.add(name);
+      await Promise.all(jobs.map((job) => job.done));
+    }
+  });
+
+  test('pool admission forwards after goal ID and PR number to the dependency gate before reserving a free slot', async () => {
+    let merged = false;
+    const checked: Array<string | number> = [];
+    const pool = new PodPoolScheduler(parsePodPool('fake:2'), {
+      status: () => ({ recommended: 2, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 2, memorySlots: 2, placeableSlots: 2, running: 0, pending: 0 }),
+      dependencyMerged: (after) => { checked.push(after); return merged; },
+      pollMs: 2,
+    });
+    const controller = new AbortController();
+    const first = pool.acquireAdmission(controller.signal, 'goal-before');
+    const second = pool.acquireAdmission(controller.signal, 123);
+    try {
+      await Bun.sleep(10);
+      expect(checked).toContain('goal-before');
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 2, recommended: 2 });
+      merged = true;
+      const releaseFirst = await first;
+      const releaseSecond = await second;
+      expect(checked).toContain(123);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 0 });
+      releaseFirst(); releaseSecond();
+    } finally { controller.abort(); }
+  });
+
+  test('Pod Job launch waits for its predecessor even with free pool capacity', async () => {
+    let merged = false;
+    const checked: Array<string | number> = [];
+    const pool = new PodPoolScheduler(parsePodPool('fake:2'), {
+      status: () => ({ recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 2, memorySlots: 2, placeableSlots: 2, running: 0, pending: 0 }),
+      dependencyMerged: (after) => { checked.push(after); return merged; },
+      pollMs: 2,
+    });
+    const applied: string[] = [];
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input) {
+        const object = JSON.parse(input) as { kind: string; metadata: { name: string } };
+        if (object.kind === 'Job') applied.push(object.metadata.name);
+      }
+      if (args.some((arg) => arg.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.includes('jsonpath={.status.conditions[*].type}')) return { status: 0, stdout: 'Complete', stderr: '' };
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const spawn = podSelfImplementSpawn({ pool, kubectl, env: {}, repoUrl: 'not-a-github-repository',
+      credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }), pollMs: 2 });
+    const controller = new AbortController();
+    const job = spawn({ spaceId: 'dependent', feature: 'dependent', after: 123, signal: controller.signal });
+    try {
+      await Bun.sleep(10);
+      expect(checked).toContain(123);
+      expect(applied).toEqual([]);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1 });
+      merged = true;
+      const done = await job.done;
+      expect(done.exitCode).toBe(0);
+      expect(applied).toHaveLength(1);
+    } finally { controller.abort(); await job.done; }
+  });
+
+  test('a stale free-slot measurement never admits a third Job before a release', async () => {
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({ recommended: 2,
+      accountSlots: 100, limitedBy: 'capacity', reason: null, capacitySlots: 3, memorySlots: 3,
+      placeableSlots: 3, running: 0, pending: 0 }), pollMs: 2 });
+    const first = await pool.acquireAdmission();
+    const second = await pool.acquireAdmission();
+    const controller = new AbortController();
+    const third = pool.acquireAdmission(controller.signal).catch((error: Error) => error.message);
+    try {
+      await Bun.sleep(12);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
+    } finally {
+      controller.abort();
+      await third;
+      first(); second();
+    }
+  });
+
+  test('unknown/failed lease reads preserve two active permits across recovery before Jobs become visible', async () => {
+    let unavailable: 'null' | 'throw' | null = null;
+    const pool = new PodPoolScheduler(parsePodPool('fake:4'), { status: () => {
+      if (unavailable === 'throw') throw new Error('lease temporarily unavailable');
+      return { recommended: unavailable === 'null' ? null : 2, accountSlots: 99,
+        limitedBy: 'capacity', reason: null, capacitySlots: 4, memorySlots: 4,
+        placeableSlots: 4, running: 0, pending: 0 };
+    }, pollMs: 2 });
+    const first = await pool.acquireAdmission();
+    const second = await pool.acquireAdmission();
+    const controller = new AbortController();
+    const third = pool.acquireAdmission(controller.signal).catch((error: Error) => error.message);
+    try {
+      for (const outage of ['null', 'throw'] as const) {
+        unavailable = outage;
+        await Bun.sleep(12);
+        expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
+        unavailable = null;
+        await Bun.sleep(12);
+        expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1, recommended: 2 });
+      }
+    } finally {
+      controller.abort();
+      expect(await third).toBe('pod lease admission aborted');
+      first(); second();
+    }
+  });
+
+  test('a 2→0 recommendation cannot reopen the queued third launch on release', async () => {
+    let free = 2;
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({ recommended: free,
+      accountSlots: 100, limitedBy: 'capacity', reason: null, capacitySlots: 3, memorySlots: 3,
+      placeableSlots: 3, running: 0, pending: 0 }), pollMs: 2 });
+    const first = await pool.acquireAdmission();
+    const second = await pool.acquireAdmission();
+    const controller = new AbortController();
+    let thirdAdmitted = false;
+    const third = pool.acquireAdmission(controller.signal).then((release) => {
+      thirdAdmitted = true;
+      return release;
+    }, (error: Error) => error.message);
+    try {
+      free = 0;
+      await Bun.sleep(12);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
+      first();
+      await Bun.sleep(12);
+      expect(thirdAdmitted).toBe(false);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 1, queued: 1 });
+      free = 1;
+      const thirdRelease = await third;
+      expect(typeof thirdRelease).toBe('function');
+      if (typeof thirdRelease === 'function') thirdRelease();
+    } finally {
+      controller.abort();
+      const pending = await third;
+      if (typeof pending === 'function') pending();
+      first(); second();
+    }
+  });
+
+  test('measured free slots stay at N=2 until the first local Job is visible', async () => {
+    let visible = 0;
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({ recommended: 2,
+      accountSlots: 0, limitedBy: 'capacity', reason: null, capacitySlots: 3, memorySlots: 3,
+      placeableSlots: 3, running: visible, pending: 0 }), pollMs: 2 });
+    const first = await pool.acquireAdmission();
+    const second = await pool.acquireAdmission();
+    const controller = new AbortController();
+    const third = pool.acquireAdmission(controller.signal).catch((error: Error) => error.message);
+    try {
+      await Bun.sleep(8);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
+      visible = 1;
+      await Bun.sleep(8);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
+    } finally {
+      controller.abort();
+      await third;
+      first(); second();
+    }
+  });
+
+  test('default status reads the lease on the configured pool, not the current context', async () => {
+    const calls: string[][] = [];
+    const kubectl = (args: readonly string[]) => {
+      calls.push([...args]);
+      if (args.includes('nodes')) return { status: 0, stdout: JSON.stringify({ items: [{ metadata: { name: 'n' }, status: { allocatable: { memory: '64Gi', cpu: '4' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }), stderr: '' };
+      return { status: 0, stdout: JSON.stringify({ items: [] }), stderr: '' };
+    };
+    const pool = new PodPoolScheduler(parsePodPool('configured:2'), { kubectl, dns: () => 'ready' });
+    const release = await pool.acquireAdmission();
+    expect(calls).toHaveLength(3);
+    expect(calls.every((args) => args.slice(0, 2).join(' ') === '--context configured')).toBe(true);
+    release();
+  });
+
+  test('a measured rise in free slots admits the oldest queued goal without a local release', async () => {
+    let free = 0;
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({ recommended: free,
+      accountSlots: 0, limitedBy: 'capacity', reason: null, capacitySlots: 3, memorySlots: 3,
+      placeableSlots: 3, running: 0, pending: 0 }), pollMs: 2 });
+    const controller = new AbortController();
+    const first = pool.acquireAdmission(controller.signal);
+    try {
+      await Bun.sleep(8);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1 });
+      free = 1;
+      const release = await first;
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 1, queued: 0 });
+      release();
+    } finally { controller.abort(); }
+  });
+
+  test('after a lease read fails, a later healthy recommendation reopens the FIFO queue', async () => {
+    let unavailable = true;
+    const pool = new PodPoolScheduler(parsePodPool('fake:2'), { status: () => {
+      if (unavailable) throw new Error('read failed');
+      return { recommended: 1, accountSlots: 0, limitedBy: 'capacity', reason: null,
+        capacitySlots: 2, memorySlots: 2, placeableSlots: 2, running: 0, pending: 0 };
+    }, pollMs: 2 });
+    const controller = new AbortController();
+    const waiting = pool.acquireAdmission(controller.signal);
+    try {
+      await Bun.sleep(8);
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1 });
+      unavailable = false;
+      const release = await waiting;
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 1, queued: 0 });
+      release();
+    } finally { controller.abort(); }
+  });
+
+  test('unknown measured lease does not bypass admission with pool capacity', async () => {
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({ recommended: null,
+      accountSlots: 100, limitedBy: null, reason: 'unknown', capacitySlots: 3, memorySlots: null,
+      placeableSlots: null, running: null, pending: null }), pollMs: 5 });
+    const controller = new AbortController();
+    const acquired = pool.acquireAdmission(controller.signal).catch((error: Error) => error.message);
+    await Bun.sleep(10);
+    expect(pool.admissionSnapshot()).toMatchObject({ active: 0, queued: 1, recommended: 0 });
+    controller.abort();
+    expect(await acquired).toBe('pod lease admission aborted');
   });
 
   test('remote nodes sync in parallel via node-side build; a failed build falls back to shipping', async () => {
@@ -221,4 +512,9 @@ describe('pod pool — priority ⊕ per-node capacity', () => {
     expect(matched.get('pool-node-b')?.action).toBe('shipped');
     expect(saves).toBe(1);
   });
+});
+
+test('generic Pod path keeps pod.pool — harness.podPool does not leak into it', () => {
+  expect(genericConfigPodPool({ pod: { pool: 'generic:2' }, harness: { podPool: 'harness:20' } })).toBe('generic:2');
+  expect(genericConfigPodPool({ harness: { podPool: 'harness:20' } })).toBeUndefined();
 });

@@ -19,6 +19,8 @@ import {
   runSelfGateCli, formatUnrunnableChangeKinds,
 } from './gate-cli.js';
 import type { BaselineProcessResult } from './gate-baseline.js';
+import type { ShardRunResult } from '../self-dev/shard-run.js';
+import { aggregateGateTestShards } from '../self-dev/shard-aggregate.js';
 
 const baseline = (output: string, status: BaselineProcessResult['status'] = 'test-fail'): BaselineProcessResult => ({ status, output, log: 'baseline' });
 const fail = (name: string) => ({ status: 1, stdout: `test/a.test.ts:\n(fail) ${name}\n1 fail\n`, stderr: '' });
@@ -87,6 +89,56 @@ function scriptedCommand(entries: Array<[string, string[], CommandResult]>): (co
 }
 
 describe('runSelfGateCli', () => {
+  test('--shards dispatches selected tests and preserves the single gate verdict and policy gates', () => {
+    const files = Array.from({ length: 6 }, (_, i) => `src/f${i}.test.ts`);
+    const observed: string[][] = [];
+    const sharded: ShardRunResult = {
+      shards: [
+        { id: 'shard-1', files: files.slice(0, 3), plannedRssMb: 100, plannedSeconds: 1 },
+        { id: 'shard-2', files: files.slice(3), plannedRssMb: 100, plannedSeconds: 1 },
+      ],
+      attempts: [],
+      aggregate: { status: 'unmeasured', retryShardIds: ['shard-2'] },
+    };
+    const run = (value: ShardRunResult) => runSelfGateCli('/repo', { shards: 2 }, {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runTests: () => { throw new Error('unsharded runner must not run'); },
+      runShards: (cwd, selected, ref, count) => {
+        observed.push([cwd, ref, String(count), ...selected]);
+        return value;
+      },
+      runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+      runModelHardcodeGate: () => 0, runDaemonPortGate: () => 0,
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    const unmeasured = run(sharded);
+    expect(unmeasured.exitCode).toBe(1);
+    expect(unmeasured.lines.join('\n')).toContain('shards: unmeasured (shard-2)');
+    const passed = run({ ...sharded, aggregate: { status: 'passed', retryShardIds: [] } });
+    expect(passed.exitCode).toBe(0);
+    expect(passed.lines).toContain('tests: pass (6 files)');
+    expect(observed).toEqual(Array.from({ length: 2 }, () => ['/repo', 'HEAD', '2', ...files]));
+    expect(() => runSelfGateCli('/repo', { shards: 0 })).toThrow('invalid --shards count');
+  });
+
+  test('--shards reports one introduced/preexisting judgment and blocks only the introduced failure', () => {
+    const files = ['src/a.test.ts', 'src/b.test.ts'];
+    const shards = files.map((file, i) => ({ id: `shard-${i + 1}`, files: [file], plannedRssMb: 10, plannedSeconds: 1 }));
+    const junit = (file: string, fail: boolean) => `<testsuite file="${file}" tests="1"><testcase name="test">${fail ? '<failure message="red"/>' : ''}</testcase></testsuite>`;
+    const attempts = shards.map((shard, i) => ({ shardId: shard.id, attempt: 1,
+      currentJUnit: junit(shard.files[0]!, true), baselineJUnit: junit(shard.files[0]!, i === 0),
+      currentExitCode: 1, baselineExitCode: i === 0 ? 1 : 0 }));
+    const result = runSelfGateCli('/repo', { shards: 2 }, {
+      changedFiles: () => ({ files, baseRef: 'HEAD' }), exists: () => true,
+      runShards: () => ({ shards, attempts, aggregate: aggregateGateTestShards(shards, attempts) }),
+      runAndroidGate: () => 0, runIosGate: () => 0, runPwaGate: () => 0,
+    });
+    expect(result.exitCode).toBe(1);
+    expect(result.lines.join('\n')).toContain('[gate-baseline] introduced=1, preexisting=1, unknown=0');
+    expect(result.lines.join('\n')).toContain('shard attempt: shard-1 #1');
+    expect(result.lines.join('\n')).toContain('shard attempt: shard-2 #1');
+  });
+
   test('default bun test command uses an isolated deterministic environment and cleans it', () => {
     process.env.ANTHROPIC_API_KEY = 'parent-secret';
     process.env.ELANOUS_CONFIG_DIR = '/parent/config';
@@ -279,7 +331,25 @@ describe('runSelfGateCli', () => {
     expect(result.lines).toContain('documents without derived tests: AGENTS.md');
   });
 
-  test('reports actual importers without changing the resolved run set', () => {
+  test('runs reverse importer tests that exist beside conventional tests', () => {
+    const fixture = fixtureRepository({
+      'src/service.ts': 'export const service = 1;\n',
+      'src/service.test.ts': "import './service.js';\n",
+      'test/consumer.test.ts': "import '../src/service.js';\n",
+    });
+    try {
+      const ran: string[][] = [];
+      const result = runSelfGateCli(fixture.cwd, {}, {
+        changedFiles: () => ({ files: ['src/service.ts'], baseRef: 'HEAD' }),
+        runTests: (_cwd, files) => { ran.push([...files]); return ok(); },
+      });
+      expect(ran).toEqual([['src/service.test.ts', 'test/consumer.test.ts']]);
+      expect(result.lines).toContain('caller tests: test/consumer.test.ts (import)');
+      expect(result.lines).toContain('unrun importer tests: 0; unresolved relative specifiers: 0');
+    } finally { fixture.dispose(); }
+  });
+
+  test('keeps importer observation explicit when a candidate is not an existing runnable file', () => {
     const fixture = fixtureRepository({
       'src/self-implement/goal-author.ts': 'export class GoalAuthor {}\n',
       'src/self-implement/goal-author.test.ts': "import { GoalAuthor } from './goal-author.js';\nvoid GoalAuthor;\n",
@@ -424,6 +494,8 @@ describe('runSelfGateCli', () => {
     expect(result.testFiles).toEqual(['src/a.test.ts']);
     expect(result.unverified).toEqual([]);
     expect(result.lines).toContain('unrun importer tests: lookup failed (grep unavailable)');
+    expect(result.lines).toContain('caller tests: lookup failed (grep unavailable)');
+    expect(result.lines).not.toContain('caller tests: (none)');
   });
 
   test('distinguishes worktree admission not checked, checked clean, and checked unrelated changes', () => {

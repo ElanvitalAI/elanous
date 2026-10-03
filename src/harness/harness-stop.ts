@@ -14,6 +14,7 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { selfDevRunsDir } from '../self-dev/run-store.js';
+import { launchBindingRunIds, launchRegistryDir, readLaunchBinding } from './launch-registry.js';
 import { loadRunLedger, resolveFederatedRunLedgerDirectories, runLedgerDir } from '../self-implement/run-ledger.js';
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -173,6 +174,16 @@ export function readPidRecordFrom(runsDir: string, runId: string): PidRecord | n
   }
 }
 
+/** The launching universe's pid.json when the binding names it, else the binding's own pid — both still pass the start-time check. */
+export function pidRecordFromLaunchBinding(runId: string, registryDir = launchRegistryDir()): PidRecord | null {
+  const binding = readLaunchBinding(runId, registryDir);
+  if (!binding) return null;
+  const fromRunsDir = binding.runsDir ? readPidRecordFrom(binding.runsDir, runId) : null;
+  if (fromRunsDir) return fromRunsDir;
+  debug.log('harness.stop', 'pid-from-launch-binding', { runId, pid: binding.pid });
+  return { pid: binding.pid, startedAt: binding.startedAt, ...(binding.argv0 ? { argv0: binding.argv0 } : {}) };
+}
+
 /** macOS·Linux 공통 — `ps -o lstart=` 는 로컬 시각 문자열(초 단위)이다. */
 export function psProcessStartMs(pid: number): number | null {
   const r = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 });
@@ -183,7 +194,8 @@ export function psProcessStartMs(pid: number): number | null {
   return Number.isFinite(ms) ? ms : null;
 }
 
-export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {}): HarnessStopDeps {
+export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {}, opts: { launchRegistryDir?: string } = {}): HarnessStopDeps {
+  const registry = opts.launchRegistryDir ?? launchRegistryDir();
   const env = { ...process.env };
   for (const key of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy']) delete env[key];
   const kubectl = (args: readonly string[]) => {
@@ -191,12 +203,19 @@ export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {})
     return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? String(r.error ?? '') };
   };
   return {
-    readPidRecord: (runId) => readPidRecordFrom(selfDevRunsDir(), runId),
+    // This universe first; then the host-wide launch binding, so a run launched from another worktree is still found.
+    readPidRecord: (runId) => readPidRecordFrom(selfDevRunsDir(), runId) ?? pidRecordFromLaunchBinding(runId, registry),
     runIdCandidates: (given) => {
       const ledgerDirs = new Set([runLedgerDir(), ...resolveFederatedRunLedgerDirectories({})]);
-      return stopRunIdCandidates(given, [...ledgerDirs], selfDevRunsDir());
+      const found = new Set(stopRunIdCandidates(given, [...ledgerDirs], selfDevRunsDir()));
+      for (const id of launchBindingRunIds(registry)) if (id.startsWith(given) && FULL_RUN_ID.test(id)) found.add(id);
+      return [...found].sort();
     },
-    readGoalPath: stopGoalPathFromLedger,
+    readGoalPath: (runId) => {
+      let fromLedger: string | null = null;
+      try { fromLedger = stopGoalPathFromLedger(runId); } catch { fromLedger = null; }
+      return fromLedger ?? readLaunchBinding(runId, registry)?.goalPath ?? null;
+    },
     scanProcesses: scanStopProcessTable,
     processStartMs: psProcessStartMs,
     kill: (pid, signal) => { process.kill(pid, signal); },

@@ -1,0 +1,183 @@
+{
+  "generatedAt": "2026-10-03T03:04:51Z",
+  "commit": "43515e8c37",
+  "window": {
+    "from": "2026-10-02T03:04:51Z",
+    "to": "2026-10-03T03:04:51Z"
+  },
+  "stages": [
+    {
+      "id": "author",
+      "label": "골 저작",
+      "auto": 17,
+      "human": null,
+      "unknown": null,
+      "basis": "auto = 한 줄 요청에서 하니스가 스스로 저작한 골 수(harness.author goal-id-assigned · 전 인스턴스·시험 포함 · 창 안). 손으로 쓴 골 파일은 가를 수 없다 — 골 파일 입력 사건(dev-pipeline manual-goal-evidence-requirement · 창 안 22건)이 저작된 골에도 똑같이 나서 human 은 미측정.",
+      "command": "bun scripts/tech1-public-measure.ts stages.author --since 2026-10-02T03:04:51Z --until 2026-10-03T03:04:51Z"
+    },
+    {
+      "id": "clarify",
+      "label": "요청 명확화",
+      "auto": 15,
+      "human": 13,
+      "unknown": 6,
+      "basis": "auto = 사람에게 묻지 않고 풀린 질문(hitl.execution auto-recommended 11 ⊕ assumed 0 ⊕ 골 저작 self-answered 4) · human = 담당자에게 올라간 질문(hitl.execution asked 13) · unknown = 골 저작 중 풀리지 않은 질문(6). 전 인스턴스·시험 포함 · 창 안.",
+      "command": "bun scripts/tech1-public-measure.ts stages.clarify --since 2026-10-02T03:04:51Z --until 2026-10-03T03:04:51Z"
+    },
+    {
+      "id": "ledger",
+      "label": "원장",
+      "auto": 157,
+      "human": null,
+      "unknown": null,
+      "basis": "auto = Pod 에서 실행 원장이 자동으로 이어 쓰인 런 수(self-implement.pod ledger-live-appended · 157런 · 7,100회). 원장을 손으로 고치는 일은 사건을 남기지 않아 human 은 0 이 아니라 미측정.",
+      "command": "bun scripts/tech1-public-measure.ts stages.ledger --since 2026-10-02T03:04:51Z --until 2026-10-03T03:04:51Z"
+    },
+    {
+      "id": "heal",
+      "label": "수복",
+      "auto": 21,
+      "human": 0,
+      "unknown": null,
+      "basis": "auto = 리뷰 지적을 받아 하니스가 스스로 돈 재작업 회차(self-dev.rework repeat-count · 회차마다 1) · human = 담당자에게 올린 에스컬레이션(self-dev.hitl escalation). 전 인스턴스·시험 포함 · 창 안.",
+      "command": "bun scripts/tech1-public-measure.ts stages.heal --since 2026-10-02T03:04:51Z --until 2026-10-03T03:04:51Z"
+    }
+  ],
+  "loop-agents": {
+    "loops": 12
+  },
+  "graph": {
+    "templates": 7
+  },
+  "pty": {
+    "missions": 0
+  },
+  "mission-fabric": {
+    "missions": null
+  },
+  "observability": {
+    "events": 307432
+  },
+  "sections": [
+    {
+      "id": "harness",
+      "items": [
+        {
+          "id": "tox-core",
+          "label": "작업 오케스트레이터 코어",
+          "value": 31,
+          "unit": "modules",
+          "basis": "현재 소스 파일 목록에서 이름에 test가 없는 파일 수; 실행 건수가 아니다.",
+          "command": "ls src/task-orchestrator/*.ts | rg -vc test",
+          "doc": null
+        },
+        {
+          "id": "tox-surfaces",
+          "label": "작업 표면",
+          "value": 29,
+          "unit": "modules",
+          "basis": "현재 소스 파일 목록에서 이름에 test가 없는 파일 수; 실행 건수가 아니다.",
+          "command": "ls src/task-orchestrator/surfaces/*.ts | rg -vc test",
+          "doc": null
+        },
+        {
+          "id": "harness-modules",
+          "label": "하니스 모듈",
+          "value": 75,
+          "unit": "modules",
+          "basis": "현재 소스 파일 목록에서 .test.ts를 제외한 파일 수.",
+          "command": "ls src/harness/*.ts | rg -vc '\\.test\\.ts'",
+          "doc": null
+        },
+        {
+          "id": "orchestrator-lines",
+          "label": "실행기 크기",
+          "value": 7225,
+          "unit": "lines",
+          "basis": "단일 파일의 물리적 행 수.",
+          "command": "wc -l src/self-implement/orchestrator.ts",
+          "doc": null
+        },
+        {
+          "id": "author-tags",
+          "label": "저작 검사 태그",
+          "value": 25,
+          "unit": "tags",
+          "basis": "태그 문자열의 고유 종류; 발화율이 아니다.",
+          "command": "bun scripts/tech1-public-measure.ts harness.author-tags",
+          "doc": null
+        }
+      ]
+    },
+    {
+      "id": "loop-agents",
+      "items": [
+        {
+          "id": "loops",
+          "label": "발견된 루프",
+          "value": 12,
+          "unit": "definitions",
+          "basis": "루프 정의 수(카탈로그 · 실행 건수가 아니다): 12. 같은 시각 운영 인스턴스에서도 정의 12 · 켜짐 2.",
+          "command": "bun scripts/tech1-public-measure.ts loop-agents.loops",
+          "doc": "release/public/docs/loop-agents.md"
+        }
+      ]
+    },
+    {
+      "id": "graph",
+      "items": [
+        {
+          "id": "templates",
+          "label": "그래프 템플릿",
+          "value": 7,
+          "unit": "templates",
+          "basis": "템플릿 로더의 키 수; 같은 측정에서 issues=4, 유효성 통과 수와 다르다.",
+          "command": "bun scripts/tech1-public-measure.ts graph.templates",
+          "doc": "release/public/docs/graph-engineering.md"
+        }
+      ]
+    },
+    {
+      "id": "pty",
+      "items": [
+        {
+          "id": "missions",
+          "label": "PTY 미션",
+          "value": 0,
+          "unit": "missions",
+          "basis": "창 안에 행이 있는 외부 에이전트 PTY 미션(agent-mission) 수 — 등록된 로그 스토어 675개 전수: 0. 계측된 범주이고 마지막 행이 2026-09-29 라 창 안 0 은 실제 0 이다.",
+          "command": "bun scripts/tech1-public-measure.ts pty.missions --since 2026-10-02T03:04:51Z --until 2026-10-03T03:04:51Z",
+          "doc": "release/public/docs/pty-intelligence.md"
+        }
+      ]
+    },
+    {
+      "id": "mission-fabric",
+      "items": [
+        {
+          "id": "missions",
+          "label": "미션 패브릭 미션",
+          "value": null,
+          "unit": "missions",
+          "basis": "0 이 아니라 미측정: mission-loop.composite·harness.mission 은 창 안 행이 675개 스토어 전수에서 0 이지만, 매일 도는 미션 판정 크론은 콘솔 줄만 쓰고 로그 범주를 남기지 않아 그 미션들은 셀 사건이 없다.",
+          "command": null,
+          "doc": null
+        }
+      ]
+    },
+    {
+      "id": "observability",
+      "items": [
+        {
+          "id": "events",
+          "label": "관측 이벤트",
+          "value": 307432,
+          "unit": "events",
+          "basis": "창 안 운영 인스턴스의 로그 행 수(시험 인스턴스 제외) · 10만 행 쪽 상한을 넘겨 페이지로 셌다. 보존 기간을 넘은 오래된 행은 이미 정리됐을 수 있어 같은 창을 다시 재면 조금 낮게 나올 수 있다.",
+          "command": "bun scripts/tech1-public-measure.ts observability.events --since 2026-10-02T03:04:51Z --until 2026-10-03T03:04:51Z",
+          "doc": null
+        }
+      ]
+    }
+  ]
+}

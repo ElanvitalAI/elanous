@@ -14,6 +14,7 @@ import { insertGoalRunRecord, loadGoalRunRecordsByRunId } from '../src/self-impl
 import { PIPELINE_EDGES_BY_NODE, type PipelineNodeId } from '../src/self-implement/pipeline-shape.js';
 import { getUserConfig } from '../src/user-config.js';
 import { seams as sharedTestSeams } from '../src/self-implement/test-seams.js';
+import { releasePrFilePaths } from '../src/self-dev/release-path-guard.js';
 
 /** 전 단계 통과하는 기본 fake seam. 개별 테스트가 필요한 부분만 override. */
 function okSeams(over: Partial<SelfImplementSeams> = {}): SelfImplementSeams {
@@ -28,6 +29,7 @@ function okSeams(over: Partial<SelfImplementSeams> = {}): SelfImplementSeams {
     reviewBaselineObservationSource: async () => '',
     judgmentCallLLM: async ({ prompt }) => prompt.match(/BUDGET:\s*(EXTEND|SUFFICIENT|UNCONVERGEABLE)/)?.[1] ?? 'EXTEND',
     openPr: async ({ head }) => ({ url: `https://gh/pr/1?head=${head}`, number: 1 }),
+    readPrFiles: async () => ['src/ordinary.ts'],
     approvePr: async () => true, // fail-closed 이므로 happy path 는 명시 승인 필요
     defaultBranchRef: () => 'origin/main',
     // UNCONVERGEABLE 종료가 라이브 분해기(최대 T.decomposition)를 기다리지 않게 결정론 seam 으로 끊는다.
@@ -352,6 +354,28 @@ describe('runSelfImplement — 파이프라인 시퀀싱', () => {
       if (previous === undefined) delete process.env.ELANOUS_STATE_DIR; else process.env.ELANOUS_STATE_DIR = previous;
       rmSync(stateDir, { recursive: true, force: true });
     }
+  });
+
+  it('holds a PR whose protected file was renamed outside the release subtree', async () => {
+    let merges = 0;
+    const labels: string[] = [];
+    const comments: string[] = [];
+    const path = 'scripts/release-loop/publish.ts';
+    const result = await runSelfImplement({ feature: 'release rename', autoMerge: true,
+      seams: okSeams({
+        reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true,
+          diffTruncated: false, diffShownChars: 10, diffTotalChars: 10, diffOmittedFiles: 0 }),
+        readPrFiles: async () => releasePrFilePaths([[{ filename: 'src/ordinary.ts', status: 'renamed', previous_filename: path }]]),
+        addPrLabel: async ({ label }) => { labels.push(label); },
+        postPrComment: async ({ body }) => { comments.push(body); },
+        mergePr: async () => { merges++; return { merged: true }; },
+      }),
+    });
+    expect(result.stage).toBe('pr-opened');
+    expect(result.mergeReason).toBe('release-path-hold');
+    expect(merges).toBe(0);
+    expect(labels).toEqual(['elanous:release-path']);
+    expect(comments).toContain(`OP approval required: automatic merge held because this PR changes ${path}.`);
   });
 
   it('uses the injected ledger writer for the inner merged observer', async () => {

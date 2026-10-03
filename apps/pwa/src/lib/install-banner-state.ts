@@ -70,10 +70,19 @@ export function clearDismiss(): void {
   try { ls.removeItem(DISMISS_KEY); } catch { /* ignore */ }
 }
 
+export function quietFor(url: string, stored: string | null): boolean {
+  const location = new URL(url);
+  if (location.searchParams.get('capture') === 'public') return true;
+  const path = location.pathname.replace(/\/+$/, '');
+  if (path !== '/inside' && path !== '/app/inside') return false;
+  const demo = location.searchParams.get('demo');
+  return demo !== null ? demo === '1' : stored === '1';
+}
+
 export interface ShouldShowDecision {
   show: boolean;
   /** Why we suppressed (when show=false). Useful for debug.log + tests. */
-  reason: 'show' | 'standalone' | 'recently-dismissed' | 'unsupported';
+  reason: 'show' | 'quiet' | 'standalone' | 'recently-dismissed' | 'unsupported';
 }
 
 export function shouldShow(opts: {
@@ -81,7 +90,9 @@ export function shouldShow(opts: {
   standalone: boolean;
   platform: InstallPlatform;
   dismissedAt: number | null;
+  quiet?: boolean;
 }): ShouldShowDecision {
+  if (opts.quiet) return { show: false, reason: 'quiet' };
   if (opts.standalone) return { show: false, reason: 'standalone' };
   if (opts.platform === 'unsupported') return { show: false, reason: 'unsupported' };
   if (opts.dismissedAt !== null && opts.now - opts.dismissedAt < RESHOW_MS) {

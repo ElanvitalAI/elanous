@@ -229,6 +229,7 @@ function cleanupSeams(over: Partial<SelfImplementSeams['postMergeCleanup']> = {}
     reviewDiff: async () => ({ verdict: 'pass', mustFix: [], shouldFix: [], summary: 'clean', reviewed: true, diffTruncated: false, diffShownChars: 1, diffTotalChars: 1, diffOmittedFiles: 0 }),
     readPrCommitShas: async () => ({ baseCommit: 'base', headCommit: 'head' }),
     readPrDiff: async () => 'diff --git a/x b/x\n',
+    readPrFiles: async () => ['x'],
     mergePr: async () => ({ merged: true }),
     postMergeCleanup: {
       enabled: true,

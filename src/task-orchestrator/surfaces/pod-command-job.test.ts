@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import {
   commandJobSecret,
   podCommandJobManifest,
+  podCommandImageFor,
   podCommandScript,
   podCommandSecretKeys,
   podCommandTargetCommit,
@@ -172,6 +173,60 @@ describe('pod command job manifest', () => {
 });
 
 describe('runPodCommand', () => {
+  test('lite only when the caller says so: network-skill commands with --lite get the lite image and 2Gi; skills alone never switch', async () => {
+    const variants = [
+      { skills: ['omni-crawl'], lite: true, expected: 'elanous-harness-lite:local', memory: '2Gi' },
+      { skills: ['omni-digest', 'omni-crawl'], lite: true, expected: 'elanous-harness-lite:local', memory: '2Gi' },
+      // POD7 must-fix: a network skill named without --lite may still need ffmpeg/browser — keep full.
+      { skills: ['omni-crawl'], lite: false, expected: 'elanous-harness:local', memory: '16Gi' },
+      { skills: ['youtube-master'], lite: false, expected: 'elanous-harness:local', memory: '16Gi' },
+      { skills: [], lite: false, expected: 'elanous-harness:local', memory: '16Gi' },
+    ];
+    for (const [i, variant] of variants.entries()) {
+      const applied: Record<string, any>[] = [];
+      const result = await runPodCommand({ command: ['true'], skills: variant.skills, ...(variant.lite ? { lite: true } : {}),
+        kubectl: (args, input) => {
+          if (input) applied.push(JSON.parse(input));
+          if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+          return { status: 0, stdout: '0', stderr: '' };
+        }, imageCommit: null, name: `network-image-${i}`, env: {}, configHostMirror: () => undefined,
+        readSkillEnv: () => ({}), artifactsRoot: '/tmp/pod-command-image-test',
+      });
+      const job = applied.find((body) => body.kind === 'Job')!;
+      expect(podCommandImageFor(variant.skills, false, variant.lite)).toBe(variant.expected);
+      expect(result.image).toBe(variant.expected);
+      expect(job.spec.template.spec.initContainers[0].image).toBe(variant.expected);
+      expect(job.spec.template.spec.containers[0].image).toBe(variant.expected);
+      expect(job.spec.template.spec.containers[0].resources.limits.memory).toBe(variant.memory);
+    }
+  });
+
+  test('a --lite request that does not fit is refused with the reason, never widened silently', () => {
+    expect(() => podCommandImageFor(['omni-crawl', 'youtube-master'], false, true)).toThrow('벗어난 스킬: youtube-master');
+    expect(() => podCommandImageFor([], false, true)).toThrow('--skill 이 없다');
+    expect(() => podCommandImageFor(['omni-crawl'], true, true)).toThrow('clone 없는 명령만');
+  });
+
+  test('a registry sync forwards the selected lite image into the Job, with registry pull policy', async () => {
+    const member: PodPoolMember = { context: 'pool-node-b', sshHost: 'node-b', capacity: 1, k3dCluster: 'elanous-pool', registry: 'k3d-elanous-registry:5051' };
+    let syncedImage = '';
+    let applied: Record<string, any> | undefined;
+    const imageRef = 'k3d-elanous-registry:5051/elanous-harness-lite:abcdef123456';
+    const result = await runPodCommand({ command: ['true'], skills: ['omni-digest'], lite: true, poolScheduler: new PodPoolScheduler([member]),
+      kubectl: (args, input) => {
+        if (input) { const body = JSON.parse(input); if (body.kind === 'Job') applied = body; }
+        if (args.some((arg) => arg.includes('.status.conditions'))) return { status: 0, stdout: 'Complete', stderr: '' };
+        return { status: 0, stdout: '0', stderr: '' };
+      }, syncImages: async (_members, image) => { syncedImage = image; return new Map([[member.context, { ok: true, action: 'built', detail: 'ready', ms: 1, imageRef }]]); },
+      imageCommit: 'abcdef1234567890', name: 'network-registry', env: {}, configHostMirror: () => undefined,
+      readSkillEnv: () => ({}), artifactsRoot: '/tmp/pod-command-image-test',
+    });
+    expect(syncedImage).toBe('elanous-harness-lite:local');
+    expect(result.image).toBe(imageRef);
+    expect(applied!.spec.template.spec.initContainers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
+    expect(applied!.spec.template.spec.containers[0]).toMatchObject({ image: imageRef, imagePullPolicy: 'IfNotPresent' });
+  });
+
   test('clone command passes the commit source through to the Job script', async () => {
     const inputs: string[] = [];
     const source = { kind: 'commit' as const, sha: 'a'.repeat(40) };

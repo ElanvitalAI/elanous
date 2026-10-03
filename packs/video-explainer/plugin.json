@@ -1,12 +1,13 @@
 {
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "video-explainer",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Make a narrated «N things at once» explainer video from a list of facts: script, word-timed voice-over, line-art diagrams and a checked render.",
   "extensions": {
     "ai.elanous": {
-      "bundle": ["skills/explainer-video"],
+      "bundle": ["skills/explainer-video", { "from": "graphs/video/explainer-line.yaml", "as": "graphs/explainer-line.yaml" }],
       "nodes": ["./nodes/explainer.yaml", "./nodes/field-reel.yaml"],
+      "graphs": ["graphs/explainer-line.yaml"],
       "capabilities": ["fs:workdir", "proc:node", "proc:bun", "proc:npx", "proc:ffmpeg", "net:api.elevenlabs.io", "net:cdn.jsdelivr.net", "secret:elevenlabs"],
       "connectors": [
         { "id": "elevenlabs", "kind": "api-key", "userConfig": [{ "key": "ELEVENLABS_API_KEY", "label": "ElevenLabs API key (optional — without it a draft system voice is used on macOS)", "secret": true, "env": "ELEVENLABS_API_KEY" }] }

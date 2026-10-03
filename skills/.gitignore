@@ -11,6 +11,7 @@
 *.sqlite
 *.sqlite3
 *.lock
+!diagram-master/references/uv.lock
 data/
 __pycache__/
 *.pyc

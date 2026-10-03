@@ -132,6 +132,7 @@ describe('/v1/health daemon SHA', () => {
       universeRoot: expect.any(String),
       testUniverse: expect.anything(),
       bindHost: 'unknown',
+      workflowRunModes: true,
     });
     expect(first.testUniverse === true || first.testUniverse === false || first.testUniverse === 'unknown').toBe(true);
   });
@@ -316,5 +317,13 @@ describe('/v1/health setup mode', () => {
     expectLegacyPayload(on, state);
     expectLegacyPayload(off, state);
     expectLegacyPayload(absent, state);
+  });
+});
+
+describe('/v1/health workflow run modes', () => {
+  test('advertises workflow run modes so the PWA enables only-node / from-node buttons (W4)', async () => {
+    const state = createNexusState({ nexusVersion: 'test', phase: 'health' });
+    const body = await healthBody(handleHealth(state, new TabRegistry(state)));
+    expect(body.workflowRunModes).toBe(true);
   });
 });

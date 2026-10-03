@@ -60,6 +60,70 @@ test('a wrapper cron counts as the loop only when it declares the graph id in a 
   expect(daily?.jobs.map(j => j.cron)).toEqual(['0 7 * * *']);
 });
 
+test('intake cron entry script is counted once and start toggles that job instead of creating a second line', async () => {
+  const f = fixture();
+  mkdirSync(join(f.root, 'graphs', 'intake'));
+  writeFileSync(join(f.root, 'graphs', 'intake', 'intake-daily.yaml'),
+    readFileSync(join(import.meta.dir, '..', '..', 'graphs', 'intake', 'intake-daily.yaml')));
+  const line = '0 7 * * * zsh $HOME/.claude/skills/yt-vault/scripts/intake-cron.sh';
+  const db = openSchedulesDb(join(f.root, 'intake.db'));
+  const refresh = (cron: string) => {
+    inventoryCrontab(db, { crontab: cron + '\n' });
+    opts.schedules = listSchedules(db);
+  };
+  const actions: string[] = [];
+  const opts: LoopRegistryOptions = { ...f.opts, schedules: [], scheduleAction: async (action, args) => {
+    actions.push(action);
+    expect(args.id).toBe(opts.schedules?.find(row => row.command?.includes('intake-cron.sh'))?.id);
+    refresh(action === 'disable' ? `# ${line}` : line);
+    return { changed: true };
+  } };
+  try {
+    refresh(line);
+    const intake = listLoops(opts).find(l => l.id === 'intake-daily');
+    expect(intake).toMatchObject({ enabled: true, jobs: [{ enabled: true, entryScript: true, cron: '0 7 * * *' }] });
+    expect(intake?.jobs).toHaveLength(1);
+    const jobId = intake!.jobs[0]!.id;
+    expect(listLoops(opts).find(l => l.id === 'daily')?.jobs).toHaveLength(0);
+    expect(await setLoopEnabled('intake-daily', true, false, opts)).toMatchObject({ changed: false, entryScript: true });
+    expect(await setLoopEnabled('intake-daily', false, false, opts)).toMatchObject({ dryRun: true, entryScript: true,
+      changes: [{ action: 'disable', id: jobId }] });
+    expect(await setLoopEnabled('intake-daily', false, true, opts)).toMatchObject({ changed: true, entryScript: true });
+    expect(listLoops(opts).find(l => l.id === 'intake-daily')).toMatchObject({ enabled: false, jobs: [{ enabled: false, entryScript: true }] });
+    const preview = await setLoopEnabled('intake-daily', true, false, opts) as { changes: Array<{ action: string; id: string }> };
+    expect(preview.changes).toEqual([{ action: 'enable', id: jobId }]);
+    expect(preview.changes.filter(change => change.action === 'create')).toHaveLength(0);
+    expect(await setLoopEnabled('intake-daily', true, true, opts)).toMatchObject({ changed: true, entryScript: true });
+    expect(actions).toEqual(['disable', 'enable']);
+    expect(listLoops(opts).find(l => l.id === 'intake-daily')?.jobs).toHaveLength(1);
+    refresh(`${line} && bun bin/elanous.mjs graph run graphs/intake/intake-daily.yaml`);
+    expect(listLoops(opts).find(l => l.id === 'intake-daily')?.jobs).toHaveLength(1);
+  } finally { db.close(); }
+});
+
+test('cron_entry only matches the executed script, not a similarly named script or a mention', async () => {
+  const f = fixture();
+  mkdirSync(join(f.root, 'graphs', 'intake'));
+  writeFileSync(join(f.root, 'graphs', 'intake', 'intake-daily.yaml'),
+    readFileSync(join(import.meta.dir, '..', '..', 'graphs', 'intake', 'intake-daily.yaml')));
+  const db = openSchedulesDb(join(f.root, 'entry-decoys.db'));
+  try {
+    inventoryCrontab(db, { crontab: [
+      '0 7 * * * zsh $HOME/scripts/intake-cron.sh.bak',
+      '0 8 * * * echo intake-cron.sh',
+      '0 9 * * * zsh $HOME/scripts/other.sh intake-cron.sh',
+      '0 10 * * * zsh $HOME/scripts/other.sh # intake-cron.sh',
+    ].join('\n') + '\n' });
+    const opts = { ...f.opts, schedules: listSchedules(db) };
+    const intake = listLoops(opts).find(l => l.id === 'intake-daily');
+    expect(intake).toMatchObject({ enabled: false, jobs: [] });
+    expect(await setLoopEnabled('intake-daily', true, false, opts)).toMatchObject({
+      dryRun: true, changes: [{ action: 'create' }],
+    });
+    expect(listLoops(opts).find(l => l.id === 'daily')?.jobs).toHaveLength(0);
+  } finally { db.close(); }
+});
+
 test('start plans absent cron, --yes registers; stop disables and start restores without deletion', async () => {
   const f = fixture();
   let line = '';

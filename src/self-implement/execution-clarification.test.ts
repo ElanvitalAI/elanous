@@ -9,6 +9,9 @@ import { buildUserConfig } from '../user-config.js';
 import type { ClarificationCandidate } from '../hitl/clarification-policy.js';
 import type { PendingQuestion } from '../ask-user-question/pending-questions.js';
 import { askAtExecution } from './execution-clarification.js';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
+import { DecisionCardService, type CardView } from '../decisions/decision-cards.js';
+import { readPendingQuestionAnswer, writePendingQuestion, removePendingQuestion, removePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
 import { runSelfImplement } from './orchestrator.js';
 import { seams } from './test-seams.js';
 import { mapStageToRunStatus } from './run-status-mapping.js';
@@ -89,6 +92,52 @@ describe('askAtExecution', () => {
       { runId: ctx.runId, questionId: 'pending-execution-1', impact: 'high' },
       { runId: ctx.runId, questionId: 'pending-execution-1', impact: 'high' },
     ]);
+  });
+
+  test('a pending run receives the decision card answer from the shared ledger and resumes with the chosen option', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'hitl-card-run-'));
+    let now = start;
+    clock = spyOn(Date, 'now').mockImplementation(() => now);
+    log = spyOn(debug, 'log').mockImplementation(() => {});
+    const runId = 'run-card-1';
+    const longQuestion = 'Choose scope ' + 'carefully '.repeat(26) + '\n\nThe release must retain all previous behavior.\nReason: the owner must see this before deciding.';
+    const questionId = 'execution:run-card-1:00000000-0000-4000-8000-000000000001';
+    const ledger = new DecisionLedger({ stateDir: root, now: () => new Date(now), resolveVersion: () => ({}) as never });
+    const sent: CardView[] = [];
+    const cards = new DecisionCardService({ ledger, ownerIds: ['owner'], now: () => new Date(now),
+      transport: { platform: 'telegram', ownerChats: async () => ['owner'], send: async (_chat, view) => { sent.push(view); return { chat: 'owner', message: '1' }; }, edit: async () => {}, notify: async () => {} },
+    });
+    try {
+      await cards.tick();
+      let ticked = false;
+      const wait = askAtExecution({ ...candidate('high'), prompt: longQuestion }, { runId, config: { hitl: { executionDeadlineMinutes: 5 } } }, {
+        createId: () => questionId,
+        resolverDeps: {
+          write: pending => writePendingQuestion(pending, { root: () => root }),
+          readAnswer: id => readPendingQuestionAnswer(id, { root: () => root }),
+          remove: id => removePendingQuestion(id, { root: () => root }),
+          removeAnswer: id => removePendingQuestionAnswer(id, { root: () => root }),
+          sleep: async () => {
+            if (!ticked) {
+              ticked = true;
+              expect((await cards.tick()).sent).toBe(1);
+              const entry = ledger.list()[0]!;
+              expect(entry.resume).toEqual({ questionId, runId });
+              const originalQuestion = `${longQuestion}\n\nRecommended: a. Scope changes implementation.`;
+              expect(entry.pendingQuestion).toBe(originalQuestion);
+              expect(entry.scqa.s).not.toBe(entry.scqa.c);
+              expect(sent[0]?.text).toContain(originalQuestion);
+              expect(sent).toHaveLength(1);
+              expect(ledger.decideWithDelivery(entry.id, 'b', { kind: 'human' }).delivery).toEqual({ ok: true, questionId });
+            }
+            now += 100;
+          },
+        },
+      });
+      expect(await wait).toEqual({ choice: 'b', by: 'owner' });
+      expect(ledger.list({ status: 'decided' })[0]?.resume?.runId).toBe(runId);
+      expect(readPendingQuestionAnswer(questionId, { root: () => root })).toEqual({ ok: true, answer: null });
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   test('high impact expires and auto-recommends', async () => {
@@ -191,6 +240,57 @@ describe('askAtExecution', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  test('the harness run continues to its gate after its own decision card is answered', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'execution-card-gate-'));
+    const goalFile = join(directory, 'goal.txt');
+    writeFileSync(goalFile, ['## PROBLEM', 'Original ask (verbatim, unmodified):', '```',
+      '대상 경로: src/inside.ts', 'Implement the change.', '```', '',
+    ].join('\n'));
+    const runId = 'run-card-gate';
+    const questionId = 'execution:run-card-gate:00000000-0000-4000-8000-000000000002';
+    let now = start;
+    clock = spyOn(Date, 'now').mockImplementation(() => now);
+    const ledger = new DecisionLedger({ stateDir: directory, now: () => new Date(now), resolveVersion: () => ({}) as never });
+    const cards = new DecisionCardService({ ledger, ownerIds: ['owner'], now: () => new Date(now), transport: {
+      platform: 'discord', ownerChats: async () => ['owner'], send: async () => ({ chat: 'owner', message: '1' }),
+      edit: async () => {}, notify: async () => {},
+    } });
+    let gateCalls = 0;
+    try {
+      await cards.tick();
+      let answered = false;
+      const result = await runSelfImplement({ runId, feature: 'implement scoped change', goalFile, memory: false,
+        writeGoalExecutionRecord: () => {}, writeGoalRunRecord: () => {},
+        seams: seams({
+          changedFilesForGateRoute: () => ['src/outside.ts'],
+          writeRunLedger: () => {},
+          askExecutionClarification: (candidate, context, deps) => askAtExecution(candidate, context, {
+            ...deps, createId: () => questionId,
+            resolverDeps: {
+              write: question => writePendingQuestion(question, { root: () => directory }),
+              readAnswer: id => readPendingQuestionAnswer(id, { root: () => directory }),
+              remove: id => removePendingQuestion(id, { root: () => directory }),
+              removeAnswer: id => removePendingQuestionAnswer(id, { root: () => directory }),
+              sleep: async () => {
+                now += 100;
+                if (answered) return;
+                answered = true;
+                expect((await cards.tick()).sent).toBe(1);
+                const entry = ledger.list()[0]!;
+                expect(entry.resume).toEqual({ questionId, runId });
+                expect((await cards.tap('owner', `dec:${entry.id}:b`)).kind).toBe('decided');
+              },
+            },
+          }),
+          gate: async () => { gateCalls++; return { passed: true, log: 'ok' }; },
+        }),
+      });
+      expect(result).toMatchObject({ ok: true, stage: 'pr-opened' });
+      expect(gateCalls).toBe(1);
+      expect(ledger.list({ status: 'decided' })[0]?.resume?.runId).toBe(runId);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   test('a real out-of-scope worktree edit triggers a stored question and blocks gate and PR without consent', async () => {

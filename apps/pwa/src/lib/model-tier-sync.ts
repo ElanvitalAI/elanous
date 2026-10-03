@@ -56,7 +56,7 @@ interface ModelTierUserConfigWire {
   llm?: ModelTierWire;
   embedding?: ModelTierWire;
   vision?: ModelTierWire;
-  persona?: 'casual' | 'power' | 'custom';
+  profile?: 'casual' | 'power' | 'custom';
   /** M2-3 — preset id ("meeting" · "medical_dictation" · ...). The
    *  preset's tier values get expanded into the sibling slots at
    *  apply time, but the id stays for the "Active preset" banner. */

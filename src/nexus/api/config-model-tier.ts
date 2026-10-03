@@ -39,7 +39,7 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 import {
   isModelTier,
-  isModelTierPersona,
+  isModelTierProfile,
   type BudgetUserConfig,
   type ModelTier,
   type ModelTierUserConfig,
@@ -74,9 +74,10 @@ function normalizeModelTier(v: unknown): ModelTierUserConfig | undefined | 'inva
   if (!v || typeof v !== 'object' || Array.isArray(v)) return 'invalid';
   const r = v as Record<string, unknown>;
   const out: ModelTierUserConfig = {};
-  if (r.persona !== undefined) {
-    if (!isModelTierPersona(r.persona)) return 'invalid';
-    out.persona = r.persona;
+  const profile = r.profile === undefined ? r.persona : r.profile;
+  if (profile !== undefined) {
+    if (!isModelTierProfile(profile)) return 'invalid';
+    out.profile = profile;
   }
   if (r.preset !== undefined) {
     if (typeof r.preset !== 'string' || r.preset.trim().length === 0) return 'invalid';

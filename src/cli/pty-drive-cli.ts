@@ -8,6 +8,7 @@ import type { StreamLLMFn } from '../autopilot/llm-control-brain.js';
 import { establishElanousTuiIsolation, elanousTuiSpawnOptions, type ElanousTuiIsolation } from '../self-implement/elanous-tui-spawn.js';
 import { resolveObserveOnlyDecision } from '../self-implement/observe-only.js';
 import { getUserConfig } from '../user-config.js';
+import { verdictForFinalPtyScreen } from './pty-drive-verdict.js';
 import { debug } from '../debug/log.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
 import { resolveControlInboxDir } from '../harness/control-inbox.js';
@@ -19,6 +20,7 @@ import { resolvePtyRef } from '../pty-shell/pty-ref.js';
 import { parsePtyWriteActor } from '../pty-shell/pty-write-arbiter.js';
 import { controlDepsForHandle, controlDepsForRemoteRef, runPtyControlLoop } from '../autopilot/pty-control-loop.js';
 import { createLlmControlBrain } from '../autopilot/llm-control-brain.js';
+import { withDriveJail } from './drive-input-jail.js';
 
 /** `pty list` 한 줄의 상태 컬럼 위치 — `<id>\t<kind>\t<nickname>\t<scope>\t<state>\t<extra…>`.
  *  ⚠️⛔ **회귀 테스트의 fixture 는 실측 형식의 *스냅샷*이지 형식 변경 감지기가 아니다**(리뷰 지적 · 과장 정정) —
@@ -166,6 +168,8 @@ export interface PtyDriveOpts {
   readonly maxSteps?: number;
   readonly pollMs?: number;
   readonly model?: string;
+  /** DRIVE-JAIL: brain inputs naming paths outside this directory are not sent to the PTY. */
+  readonly jailHome?: string;
   /** Enable the child SelfImplement observation-only override at boot. */
   readonly observeOnly?: boolean;
   readonly cwd?: string;
@@ -213,6 +217,8 @@ const liveAttachDriveDeps: PtyAttachDriveDeps = {
 
 export interface PtyAttachDriveOpts {
   readonly goal: string;
+  /** DRIVE-JAIL: brain inputs naming paths outside this directory are not sent to the PTY. */
+  readonly jailHome?: string;
   readonly maxSteps?: number;
   readonly pollMs?: number;
   readonly model?: string;
@@ -250,8 +256,11 @@ export async function runPtyAttachDrive(ref: string, opts: PtyAttachDriveOpts, d
     ...(opts.stream ? { stream: opts.stream } : {}),
     onDecision: (decision) => out(decision.action === 'input' ? `  → input (${decision.text.length} chars)\n` : decision.action === 'done' ? `  → done (${decision.reason})\n` : '  · wait\n'),
   });
+  const controlDeps = withDriveJail(handle ? deps.controlDepsForHandle(handle) : deps.controlDepsForRemoteRef?.(id, { actor }) ?? (() => { throw new Error('pty auto: remote control dependencies unavailable'); })(), opts.jailHome, (event, data) => deps.log(event, data));
+  const inputHistory: string[] = [];
   const result = await deps.runControlLoop(brain, {
-    ...(handle ? deps.controlDepsForHandle(handle) : deps.controlDepsForRemoteRef?.(id, { actor }) ?? (() => { throw new Error('pty auto: remote control dependencies unavailable'); })()),
+    ...controlDeps,
+    inject: (text: string) => { inputHistory.push(text); return controlDeps.inject(text); },
     subjectPtyId: id,
     canReceiveInput: true,
   }, {
@@ -260,7 +269,14 @@ export async function runPtyAttachDrive(ref: string, opts: PtyAttachDriveOpts, d
   });
   deps.log('attach-finish', { id, termination: result.termination.kind, steps: result.steps });
   out(`\n▸ ${result.termination.kind} (${result.steps} steps)\n`);
-  return { exitCode: result.termination.kind === 'success' ? 0 : 1, message: `pty auto: ${id} ${result.termination.kind}` };
+  if (result.termination.kind !== 'success') return { exitCode: 1, message: `pty auto: ${id} ${result.termination.kind}` };
+  // DRIVE-OK: «done» from the brain still has to show on the final screen.
+  let screen = '';
+  try { screen = String(await controlDeps.observe()); } catch { /* unreadable → unverified */ }
+  const verdict = verdictForFinalPtyScreen({ screen, inputHistory, exitCode: null });
+  out(`▸ verdict: ${verdict.kind} — ${verdict.reason}\n`);
+  deps.log('attach-verdict', { id, kind: verdict.kind, reason: verdict.reason.slice(0, 200) });
+  return { exitCode: verdict.kind === 'success' ? 0 : 1, message: `pty auto: ${id} ${verdict.kind}` };
 }
 
 export type PtyAttachDriveRunner = (start: () => Promise<{ readonly exitCode: number; readonly message: string }>) => Promise<void>;
@@ -273,14 +289,15 @@ export function registerPtyAttachDriveCommand(pty: Command, run: PtyAttachDriveR
     .option('--poll-ms <ms>', 'screen polling interval in milliseconds', '800')
     .option('--model <model>', 'LLM model override')
     .option('--actor <who>', 'remote input actor (human or agent)', 'human')
+    .option('--jail-home <dir>', 'DRIVE-JAIL: do not send inputs naming paths outside this directory')
     .description('Drive an existing agent-owned PTY without spawning a terminal')
-    .action((ref: string, opts: { goal: string; maxSteps: string; pollMs: string; model?: string; actor?: string }) => run(async () => {
+    .action((ref: string, opts: { goal: string; maxSteps: string; pollMs: string; model?: string; actor?: string; jailHome?: string }) => run(async () => {
       const maxSteps = Number(opts.maxSteps);
       const pollMs = Number(opts.pollMs);
       const actor = parsePtyWriteActor(opts.actor);
       if (!actor) return { exitCode: 2, message: 'pty auto: --actor must be human or agent' };
       return Number.isInteger(maxSteps) && maxSteps >= 1 && Number.isInteger(pollMs) && pollMs >= 0
-        ? runPtyAttachDrive(ref, { goal: opts.goal, maxSteps, pollMs, actor, ...(opts.model ? { model: opts.model } : {}) }, deps)
+        ? runPtyAttachDrive(ref, { goal: opts.goal, maxSteps, pollMs, actor, ...(opts.model ? { model: opts.model } : {}), ...(opts.jailHome ? { jailHome: opts.jailHome } : {}) }, deps)
         : { exitCode: 2, message: 'pty auto: --max-steps must be an integer >= 1 and --poll-ms must be an integer >= 0' };
     }));
 }
@@ -299,6 +316,8 @@ export interface DriveCliOpts {
   json?: boolean;
   /** Existing PTY ref. Absent = spawn a new shell PTY (the default). */
   attach?: string;
+  /** DRIVE-JAIL boundary directory. */
+  jailHome?: string;
 }
 
 export interface DriveCliDeps {
@@ -357,6 +376,7 @@ export async function runDriveCliCommand(command: string | undefined, opts: Driv
       attached = await runAttach(attach, {
         goal: opts.goal, maxSteps, pollMs,
         ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.jailHome ? { jailHome: opts.jailHome } : {}),
       });
     } catch (err) {
       writeError(`drive: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -379,6 +399,7 @@ export async function runDriveCliCommand(command: string | undefined, opts: Driv
       command, goal: opts.goal, maxSteps, pollMs,
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
+      ...(opts.jailHome ? { jailHome: opts.jailHome } : {}),
     }));
   } catch (err) {
     writeError(`drive: ${err instanceof Error ? err.message : String(err)}\n`);
@@ -827,7 +848,10 @@ async function runPtyDriveInner(opts: PtyDriveOpts): Promise<{ exitCode: number 
       writeScreen(screenKey, await h!.renderScreen(), process.env);
       delivered = true;
     } : undefined;
-    const deps = controlDepsForHandle(h);
+    const rawDeps = withDriveJail(controlDepsForHandle(h), opts.jailHome, (event, data) => debug.log('pty.drive', event, data));
+    // DRIVE-OK: keep what we typed so the final verdict can tell child output from echoed input.
+    const inputHistory: string[] = [];
+    const deps = { ...rawDeps, inject: (text: string) => { inputHistory.push(text); return rawDeps.inject(text); } };
     const autoAssist = opts.elanous ? getUserConfig().tools.selfImplement.autoAssist : undefined;
     const observe = opts.elanous ? async () => {
       const frame = await deps.observe();
@@ -851,12 +875,22 @@ async function runPtyDriveInner(opts: PtyDriveOpts): Promise<{ exitCode: number 
     if (screen.trim()) out(`▸ 최종 화면:\n${screen}\n`);
     const childExit = h.exitCode;
     const alive = h.isAlive();
-    const exitCode = childExit !== null
+    // DRIVE-OK (10-03 X1: every step failed yet drive said ok): the brain's «done» is not proof —
+    // judge the final screen. Plain drives take the verdict as the exit; elanous-TUI drives only observe it.
+    const verdict = result.termination.kind === 'success' ? verdictForFinalPtyScreen({ screen, inputHistory, exitCode: childExit }) : null;
+    if (verdict) {
+      out(`▸ verdict: ${verdict.kind} — ${verdict.reason}\n`);
+      debug.log('pty.drive', 'verdict', { kind: verdict.kind, reason: verdict.reason.slice(0, 200), enforced: !opts.elanous });
+    }
+    const verdictFails = !!verdict && !opts.elanous && verdict.kind !== 'success';
+    const baseExit = childExit !== null
       ? childExit
       : alive
         ? result.termination.kind === 'success' ? 0 : 1
         : null;
-    debug.log('pty.drive', 'exit-resolve', { alive, childExit, exitCode, termination: result.termination.kind });
+    // The verdict only withholds a success: nonzero and unknown (null) exits keep their meaning.
+    const exitCode = baseExit === 0 && verdictFails ? 1 : baseExit;
+    debug.log('pty.drive', 'exit-resolve', { alive, childExit, exitCode, termination: result.termination.kind, ...(verdict ? { verdict: verdict.kind } : {}) });
     if (exitCode === null) out('▸ child exited without an exit code; reporting failure at the process boundary (exit 1)\n');
     return { exitCode };
   } finally {

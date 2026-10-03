@@ -69,7 +69,7 @@ function errorText(error: unknown): string {
 }
 
 /** Core graphs offer clone-to-edit. Mine graphs edit the document tree and save through PUT. */
-export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEntry[] } = {}) {
+export function RunGraphView({ palette: sharedPalette, initialGraphId }: { palette?: GraphKindEntry[]; initialGraphId?: string } = {}) {
   const client = useNexusClient();
   const queries = useQueryClient();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -96,7 +96,7 @@ export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEn
     graph: 'harness' as const, kind: entry, plugin: null, description: '', schema: {}, core: true,
   }));
   const selectedKind = palette.some((entry) => entry.kind === kind) ? kind : (palette[0]?.kind ?? kind);
-  const selected = selectedId ?? list.data?.graphs[0]?.id ?? null;
+  const selected = selectedId ?? list.data?.graphs.find((graph) => graph.id === initialGraphId)?.id ?? list.data?.graphs[0]?.id ?? null;
   const summary = list.data?.graphs.find((graph) => graph.id === selected);
   const detail = useQuery({
     queryKey: ['run-graph', selected],

@@ -1192,16 +1192,15 @@ test('the Pod sweep never assigns an integration-only file and logs that it left
   } finally { log.mockRestore(); }
 });
 
-test('five nightly audits are absent from Pod shard plans, logged, and excluded from local group discovery', async () => {
+test('nightly audit files keep their fixture cases in Pod and local gate sweeps', async () => {
   expect(POD_SWEEP_INTEGRATION_ONLY).toEqual(['scripts/install.test.ts']);
   expect(GATE_NIGHTLY_AUDITS).toEqual([
-    'test/f12-sweep.test.ts', 'scripts/unwired-exports.test.ts', 'test/guardian/dispatch-surface-contract.test.ts',
-    'test/pwa-build-typecheck.test.ts', 'test/user-config-mcp.test.ts',
+    'test/f12-sweep.test.ts', 'scripts/unwired-exports.test.ts', 'test/pwa-build-typecheck.test.ts',
   ]);
   const { root } = fixture();
   const repo = join(root, 'repo');
   mkdirSync(repo);
-  const files = [...GATE_NIGHTLY_AUDITS, 'src/a.test.ts', 'test/other.test.ts', 'scripts/other.test.ts'];
+  const files = [...GATE_NIGHTLY_AUDITS, 'test/guardian/dispatch-surface-contract.test.ts', 'test/user-config-mcp.test.ts', 'src/a.test.ts', 'test/other.test.ts', 'scripts/other.test.ts'];
   const commands: string[] = [];
   const events: Array<{ category: string; event: string; data: unknown }> = [];
   const log = spyOn(debug, 'log').mockImplementation((category, event, data) => { events.push({ category, event, data }); });
@@ -1216,7 +1215,7 @@ test('five nightly audits are absent from Pod shard plans, logged, and excluded 
       commands.push(o.command[2]!);
       const artifactsDir = join(root, o.name!);
       mkdirSync(artifactsDir);
-      const count = ['src/a.test.ts', 'test/other.test.ts', 'scripts/other.test.ts'].filter((file) => o.command[2]!.includes(`'./${file}'`)).length;
+      const count = files.filter((file) => o.command[2]!.includes(`'./${file}'`)).length;
       writeFileSync(join(artifactsDir, 'shard.log'), `${count} pass\n0 fail\nRan ${count} tests across ${count} files.\n`);
       writeFileSync(join(artifactsDir, 'shard.rc'), '0\n');
       return { exitCode: 0, artifactsDir, job: 'fake' };
@@ -1224,14 +1223,14 @@ test('five nightly audits are absent from Pod shard plans, logged, and excluded 
     expect((await runner.sweep(repo, undefined, { pool: 'pool-test', shards: 1 })).rc).toBe(0);
     expect(commands).toHaveLength(1);
     expect(commands[0]).toContain("'./src/a.test.ts'");
-    expect(GATE_NIGHTLY_AUDITS.every((file) => !commands[0]!.includes(`'./${file}'`))).toBe(true);
-    expect(events).toContainEqual({ category: 'release-loop.gate', event: 'pod-sweep-nightly-audit', data: { files: [...GATE_NIGHTLY_AUDITS].sort() } });
+    expect(files.every((file) => commands[0]!.includes(`'./${file}'`))).toBe(true);
+    expect(events.some((event) => event.event === 'pod-sweep-nightly-audit')).toBe(false);
     commands.length = 0;
     expect((await runner.sweep(repo)).rc).toBe(0);
     expect(commands).toHaveLength(3);
-    for (const file of GATE_NIGHTLY_AUDITS) {
+    for (const file of files.filter((path) => path.startsWith('test/') || path.startsWith('scripts/'))) {
       const group = file.startsWith('test/') ? './test' : './scripts';
-      expect(commands.find((cmd) => cmd.includes(group))).toContain(`--path-ignore-patterns ${file}`);
+      expect(commands.find((cmd) => cmd.includes(group))).not.toContain(`--path-ignore-patterns ${file}`);
     }
   } finally { log.mockRestore(); }
 });

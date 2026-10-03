@@ -97,6 +97,8 @@ export interface DevCliOpts {
   pollMs?: string;
   model?: string;
   attach?: string;
+  /** drive: DRIVE-JAIL boundary directory. */
+  jailHome?: string;
   observeOnly?: boolean;
   cols?: string;
   rows?: string;
@@ -1748,7 +1750,7 @@ export function assertDevCliPathOptions(
   if (foreign.length > 0) throw new DevPipelineError(formatForeignDevOptions(path, foreign));
 }
 
-const DRIVE_ALIAS_OPTIONS = new Set(['goal', 'maxSteps', 'pollMs', 'model', 'cwd', 'worktree', 'json', 'attach']);
+const DRIVE_ALIAS_OPTIONS = new Set(['goal', 'maxSteps', 'pollMs', 'model', 'cwd', 'worktree', 'json', 'attach', 'jailHome']);
 const DRIVE_ALIAS_ALLOWED_FLAGS = [...DRIVE_ALIAS_OPTIONS].map(toCliFlag).join(' · ');
 
 export function assertDriveAliasOptions(explicitOptionNames: readonly string[]): void {
@@ -1947,6 +1949,7 @@ export function buildDevCliSpec(
         ...(opts.pollMs !== undefined ? { pollMs: parseNonNegativeInt(opts.pollMs, '--poll-ms') } : {}),
         ...(opts.model ? { model: opts.model } : {}),
         ...(opts.cwd ? { cwd: opts.cwd } : {}),
+        ...(opts.jailHome ? { jailHome: opts.jailHome } : {}),
       },
     };
   }

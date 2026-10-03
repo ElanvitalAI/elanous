@@ -109,10 +109,10 @@ describe('M2-2 · resolveTtsTier', () => {
     expect(r.source).toBe('preset');
   });
 
-  test('persona alone → default tier · source=persona', () => {
-    const r = resolveTtsTier({ persona: 'casual' });
+  test('profile alone → default tier · source=profile', () => {
+    const r = resolveTtsTier({ profile: 'casual' });
     expect(r.tier).toBe('balanced');
-    expect(r.source).toBe('persona');
+    expect(r.source).toBe('profile');
   });
 
   test('budget tier → macos-say', () => {

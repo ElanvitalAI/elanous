@@ -9,6 +9,11 @@ import { join } from 'node:path';
 
 import { buildNexusWsBridgeAuth, runNexus } from './index.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
+import { ProjectStore } from '../project/project-store.js';
+import { createSession } from '../session/index.js';
+import { handleCreateTab } from './api/tabs-mutations.js';
+import { createRegistryBackend } from './webterm/pty.js';
+import type { StartOpts } from '../pty-shell/registry.js';
 import { setTestStateRoot } from './paths.js';
 import type { PwaShareDeps, PwaShareResult } from '../cli/pwa-share.js';
 import type { ShareMountResult } from '../cli/share-auto-mount.js';
@@ -18,6 +23,51 @@ const CONFIGURED_TOKEN = 'configured-token-xxxxxxxxxxxxxxxxxxxx';
 /** ⛔ 이 파일이 만든 임시 디렉토리를 걷는다 — 반복 실행에서 /tmp 가 샌다. */
 const tempDirs: string[] = [];
 afterAll(() => { for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true }); });
+
+test('NEXUS boot starts a webterm tab in the associated conversation project folder', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'nexus-webterm-project-'));
+  const previous = process.env.ELANOUS_SESSION_ROOT;
+  let nexus: Awaited<ReturnType<typeof runNexus>>;
+  try {
+    setElanousConfigDir(root);
+    setTestStateRoot(root);
+    process.env.ELANOUS_SESSION_ROOT = join(root, 'sessions');
+    const folder = join(root, 'project');
+    mkdirSync(folder);
+    const project = new ProjectStore(root).create({ name: 'sample', primaryFolder: folder });
+    const assigned = createSession({ projectId: project.id });
+    const plain = createSession();
+    const observed: StartOpts[] = [];
+    nexus = await runNexus({ detachForTesting: true, skipHttpServer: true, skipRuntimeApi: true,
+      skipSupervisor: true, mcpEnabled: false, skipRestoreFromPending: true, toolCwd: root,
+      cleanGhostTailscaleServeFn: async () => {}, webtermSpawn: (opts) => createRegistryBackend(opts, {
+        startPty: (spawn) => {
+          observed.push(spawn);
+          return { id: `pty-${observed.length}` } as ReturnType<typeof import('../pty-shell/registry.js').startPty>;
+        },
+        onPtyEvent: () => () => {},
+      }),
+    });
+    if (!nexus) throw new Error('NEXUS failed to start');
+    const supervisor = { startTab: async () => {} } as unknown as import('./supervisor/index.js').Supervisor;
+    const create = async (id: string, sessionId: string, cwd?: string) => {
+      const response = await handleCreateTab(new Request('http://localhost/v1/nexus/tabs', {
+        method: 'POST', body: JSON.stringify({ kind: 'webterm', id, sessionId, kindOpts: cwd ? { cwd } : {} }),
+      }), { state: nexus!.state, registry: nexus!.registry, supervisor });
+      expect(response.status).toBe(201);
+    };
+    await create('webterm:project', assigned.id);
+    await create('webterm:plain', plain.id);
+    await create('webterm:explicit', assigned.id, root);
+    expect(observed.map(spawn => spawn.workdir)).toEqual([folder, root, root]);
+  } finally {
+    nexus?.release();
+    resetElanousConfigDir();
+    setTestStateRoot(null);
+    if (previous === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 describe('Nexus wsBridgeOpts auth wiring', () => {
   test('configured-auth: bearerToken present → createAuthVerifier is passed as wsAuthVerifier', () => {

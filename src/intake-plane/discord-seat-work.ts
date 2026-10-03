@@ -3,6 +3,7 @@ import { discordDecisionOwner } from '../decisions/discord-decision-cards.js';
 import { canonicalSeatId } from '../msg/msg-store.js';
 import { dispatchCeoTask, type CeoCommandDeps } from '../seat-dispatch/ceo-commands.js';
 import { ceoTaskDeps, classifyCeoIntent } from '../seat-dispatch/ceo-intent.js';
+import { askSeat, parseSeatAsk, type SeatAskDeps } from '../seat-dispatch/seat-ask.js';
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
 import { getUserConfig, type UserConfig } from '../user-config.js';
 import { answerAsSeat } from './seat-answer.js';
@@ -25,6 +26,7 @@ export interface DiscordSeatWorkDeps extends SubmitIntakeWorkDeps {
   answer?: typeof answerAsSeat;
   dispatch?: typeof dispatchCeoTask;
   commandDeps?: CeoCommandDeps;
+  askDeps?: SeatAskDeps;
 }
 
 /** Addressed work preserves graph intake except for one owner's private seat request. */
@@ -44,6 +46,14 @@ export async function handleDiscordSeatWork(
     debug.log('seat.dispatch', 'intent', { seat, intent: 'task', via: 'discord', outcome: result.channel });
     return result.reply;
   };
+  if (parseSeatAsk(text)) {
+    const auth = owner();
+    if (!auth) return null;
+    if (!deps.askDeps) throw new Error('seat ask delivery unavailable');
+    return askSeat(text, { channel: 'discord', channelId: msg.channelId, messageId: msg.messageId,
+      ...(msg.threadId ? { threadId: msg.threadId } : {}) },
+    deps.commandDeps ?? ceoTaskDeps(auth.cfg, auth.id), deps.askDeps);
+  }
   const address = parseSeatAddress(text);
   if (!address) {
     if (!text.trim() || /^\s*[/@＠]/.test(text)) return null;

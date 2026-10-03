@@ -34,6 +34,9 @@ function alteredNamespaceRuleFixture(): string {
   });
 }
 
+// The two real-repository audits run only on the nightly test-diet graph.
+const nightly = process.env.ELANOUS_NIGHTLY_AUDIT === '1' ? test : test.skip;
+
 describe('unwired exports', () => {
   test('separates production, test-only, uncalled, type-only, function-value, external, and barrel callers by TypeScript symbols', async () => {
     const root = fixture({
@@ -235,7 +238,7 @@ describe('unwired exports', () => {
     ]);
   });
 
-  test('classifies oauth resolveRunFallback as production-called through agent-mission static require', async () => {
+  nightly('classifies oauth resolveRunFallback as production-called through agent-mission static require', async () => {
     const report = await sweepUnwiredExports('src/oauth', resolve(import.meta.dir, '..'));
     expect(names(report.unwired)).not.toContain('resolveRunFallback');
   }, 60_000);
@@ -261,7 +264,7 @@ describe('unwired exports', () => {
     expect(stdout).not.toContain('scanned: files=0');
   }, 60_000);
 
-  test('reports ad pipeline output helpers and exits zero as a report-only CLI', async () => {
+  nightly('reports ad pipeline output helpers and exits zero as a report-only CLI', async () => {
     const script = resolve(import.meta.dir, 'unwired-exports.ts');
     const run = Bun.spawnSync(['bun', 'run', script, 'src/ad-pipeline'], { cwd: resolve(import.meta.dir, '..'), stdout: 'pipe', stderr: 'pipe' });
     const stdout = new TextDecoder().decode(run.stdout);

@@ -27,6 +27,21 @@ describe('classifyGarbage', () => {
     ]);
   });
 
+  test('goal text inside orchestrator arguments is not a test runner', () => {
+    const command = 'bun bin/elanous.mjs self orchestrate --goal-file x.md "판정 신호: bun test /tmp/elanous"';
+    expect(classifyGarbage([row(44, command)]).garbage).toMatchObject([{ pid: 44, reason: 'orphan-elanous' }]);
+    expect(classifyGarbage([row(45, runner)]).garbage).toMatchObject([{ pid: 45, reason: 'orphan-test-runner' }]);
+  });
+
+  test('gate runners keep being classified — `bun run gate-baseline …` and `bun scripts/…gate….ts` (PROC1 round 3)', () => {
+    expect(classifyGarbage([row(46, 'bun run gate-baseline /tmp/repo.worktrees/x')]).garbage).toMatchObject([{ pid: 46, reason: 'orphan-test-runner' }]);
+    expect(classifyGarbage([row(47, '/Users/me/.bun/bin/bun gate-baseline /tmp/repo.worktrees/y')]).garbage).toMatchObject([{ pid: 47, reason: 'orphan-test-runner' }]);
+    expect(classifyGarbage([row(48, 'bun scripts/ci-gate.ts /tmp/repo.worktrees/z')]).garbage).toMatchObject([{ pid: 48, reason: 'orphan-test-runner' }]);
+    // The same words inside goal text in an orchestrator's argv are not a gate runner.
+    expect(classifyGarbage([row(49, 'bun bin/elanous.mjs self orchestrate "관측 = bun run gate-baseline /tmp/repo.worktrees/q"')]).garbage)
+      .toMatchObject([{ pid: 49, reason: 'orphan-elanous' }]);
+  });
+
   test('three hours is inclusive by default; a thirty-minute orphan or living child is not garbage', () => {
     expect(classifyGarbage([
       row(1, daemon, { elapsedSeconds: 1800 }),

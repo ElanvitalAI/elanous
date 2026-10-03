@@ -26,6 +26,7 @@ import type {
   ShowroomNode,
   TaskNode,
   SkillNode,
+  SubworkflowNode,
   SwitchNode,
   TelegramTriggerNode,
   TemplateNode,
@@ -37,6 +38,11 @@ import type {
 import { normalizeProviderId } from '../registry/normalize.js';
 import { buildWarnings, type ValidationWarning } from './validation-warnings.js';
 import { getNodeKind, WORKFLOW_CORE_KINDS } from '../graph-kinds/registry.js';
+import { findWorkflow } from './discovery.js';
+
+// Discovery parses workflows through this validator. Nested parses validate
+// shapes; the outer validation walks the references with one call stack.
+let resolvingSubworkflowReferences = false;
 
 /** ⛔ 노드 변종의 SSOT — 도움말·문서가 이 배열에서 «파생»한다.
  *  손으로 목록을 옮겨 적으면 늙는다(2026-09-22 실측: `elanous wf --help` 가 13종만 말했고
@@ -144,6 +150,10 @@ export function validateWorkflow(raw: unknown): ValidationResult {
   if (interactive !== undefined && typeof interactive !== 'boolean') {
     push('interactive', "'interactive' must be a boolean");
   }
+  const concurrency = raw['concurrency'];
+  if (concurrency !== undefined && (!Number.isInteger(concurrency) || (concurrency as number) < 1 || (concurrency as number) > 8)) {
+    push('concurrency', "'concurrency' must be an integer from 1 to 8");
+  }
 
   // M4-3.2 (FU8 PR #8 · 2026-05-12) — optional provenance metadata
   // stamped on intake-generated workflows. Validated softly: when
@@ -219,6 +229,10 @@ export function validateWorkflow(raw: unknown): ValidationResult {
     const when = node['when'];
     if (when !== undefined && typeof when !== 'string') {
       push(`${path}.when`, "'when' must be a string expression");
+    }
+
+    if (node['on_error'] !== undefined && (typeof node['on_error'] !== 'string' || !node['on_error'].trim())) {
+      push(`${path}.on_error`, "'on_error' must be a non-empty node id");
     }
 
     const triggerRule = node['trigger_rule'];
@@ -305,14 +319,26 @@ export function validateWorkflow(raw: unknown): ValidationResult {
 
     // Plugin kind — `{ id, kind: '<plugin>:<kind>', inputs, depends_on? }`.
     // Checked before the core variant keys so a registered kind is not
-    // reported as "must declare exactly one of" the 22 core shapes.
+    // reported as "must declare exactly one of" the body-key core shapes.
     if (node['kind'] !== undefined) {
       const kind = node['kind'];
       if (typeof kind !== 'string' || !kind.trim()) {
         push(`${path}.kind`, "'kind' must be a non-empty string");
         continue;
       }
-      const alsoCore = WORKFLOW_NODE_VARIANT_KEYS.filter(k => node[k] !== undefined);
+      if (kind === 'subworkflow') {
+        if (typeof node['workflow'] !== 'string' || !KEBAB_RE.test(node['workflow'])) {
+          push(`${path}.workflow`, "'workflow' must be a kebab-case workflow name");
+        }
+        if (!isObject(node['inputs']) || Object.values(node['inputs']).some(v => typeof v !== 'string')) {
+          push(`${path}.inputs`, "'inputs' must be an object of string expressions");
+        }
+        const alsoCore = WORKFLOW_NODE_VARIANT_KEYS.filter(k => node[k] !== undefined);
+        if (alsoCore.length) push(path, `node declares kind 'subworkflow' and a core variant (${alsoCore.join(', ')}) — pick one`);
+        if (issues.every(iss => !iss.path.startsWith(path))) nodes.push(node as unknown as SubworkflowNode);
+        continue;
+      }
+      const alsoCore = WORKFLOW_NODE_VARIANT_KEYS.filter(k => k !== 'subworkflow' && node[k] !== undefined);
       if (alsoCore.length > 0) {
         push(path, `node declares kind '${kind}' and a core variant (${alsoCore.join(', ')}) — pick one`);
         continue;
@@ -340,11 +366,16 @@ export function validateWorkflow(raw: unknown): ValidationResult {
       continue;
     }
 
+    if (node['subworkflow'] !== undefined) {
+      push(`${path}.subworkflow`, "subworkflow nodes require { kind: subworkflow, workflow, inputs }");
+      continue;
+    }
+
     // Variant detection — exactly one of the variant keys must be
     // present. Mirrors Archon dag-node.ts:7 superRefine pattern.
     // (Node-catalog N1.1/1.2/1.3 — if/switch/iteration. N2.1/2.2 —
     //  classify/extract · LLM-driven · 2026-05-11)
-    const variantKeys = WORKFLOW_NODE_VARIANT_KEYS;
+    const variantKeys = WORKFLOW_NODE_VARIANT_KEYS.filter(k => k !== 'subworkflow');
     const presentKeys = variantKeys.filter(k => node[k] !== undefined);
     if (presentKeys.length === 0) {
       push(path, `node must declare exactly one of: ${variantKeys.join(', ')}`);
@@ -876,6 +907,9 @@ export function validateWorkflow(raw: unknown): ValidationResult {
 
   // Cross-node: depends_on references must resolve.
   for (const node of nodes) {
+    if (node.on_error && !seenIds.has(node.on_error)) {
+      issues.push({ path: `nodes.${node.id}.on_error`, message: `unknown on_error target '${node.on_error}'` });
+    }
     if (node.depends_on) {
       for (const dep of node.depends_on) {
         if (!seenIds.has(dep)) {
@@ -894,6 +928,40 @@ export function validateWorkflow(raw: unknown): ValidationResult {
     }
   }
 
+  if (issues.length === 0) {
+    try {
+      topoSort(nodes);
+    } catch (err) {
+      issues.push({ path: 'nodes', message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  if (!resolvingSubworkflowReferences && typeof name === 'string' && nodes.some(isSubworkflowNode)) {
+    resolvingSubworkflowReferences = true;
+    try {
+      const definitions = new Map<string, WorkflowDefinition>();
+      const visit = (current: DagNode[], ancestors: string[]): void => {
+        for (const node of current) {
+          if (!isSubworkflowNode(node)) continue;
+          const ref = node.workflow;
+          if (ancestors.includes(ref)) {
+            push(`nodes.${node.id}.workflow`, `subworkflow cycle: ${[...ancestors, ref].join(' -> ')}`);
+            continue;
+          }
+          if (!definitions.has(ref)) {
+            const target = findWorkflow(ref)?.definition;
+            if (target) definitions.set(ref, target);
+          }
+          const target = definitions.get(ref);
+          if (target) visit(target.nodes, [...ancestors, ref]);
+        }
+      };
+      visit(nodes, [name]);
+    } finally {
+      resolvingSubworkflowReferences = false;
+    }
+  }
+
   if (issues.length > 0) {
     return { ok: false, issues, warnings: [] };
   }
@@ -905,6 +973,7 @@ export function validateWorkflow(raw: unknown): ValidationResult {
     ...(typeof provider === 'string' ? { provider } : {}),
     ...(typeof model === 'string' ? { model } : {}),
     ...(typeof interactive === 'boolean' ? { interactive } : {}),
+    ...(typeof concurrency === 'number' ? { concurrency } : {}),
     // M4-3.2 (FU8 PR #8 · 2026-05-12) — surface validated `_meta`
     // on the parsed definition. Pulled through only when the field
     // is a non-null object so consumers can `if (def._meta?.missionId)`
@@ -952,6 +1021,10 @@ export function topoSort(nodes: readonly DagNode[]): string[] {
     for (const dep of n.depends_on ?? []) {
       incoming.get(n.id)!.add(dep);
       if (outgoing.has(dep)) outgoing.get(dep)!.add(n.id);
+    }
+    if (n.on_error) {
+      incoming.get(n.on_error)?.add(n.id);
+      outgoing.get(n.id)?.add(n.on_error);
     }
   }
   const ready: string[] = [];
@@ -1056,5 +1129,7 @@ export const isChatTriggerNode = (n: DagNode): n is ChatTriggerNode =>
   typeof (n as ChatTriggerNode).chatTrigger === 'object'
   && (n as ChatTriggerNode).chatTrigger !== null
   && typeof ((n as ChatTriggerNode).chatTrigger as { path?: unknown }).path === 'string';
+export const isSubworkflowNode = (n: DagNode): n is SubworkflowNode =>
+  n.kind === 'subworkflow';
 export const isPluginKindNode = (n: DagNode): n is PluginKindNode =>
-  typeof (n as PluginKindNode).kind === 'string';
+  typeof (n as PluginKindNode).kind === 'string' && n.kind !== 'subworkflow';

@@ -266,4 +266,6 @@ export const AUTOPILOT_TOOL_IDS = [
   'memory_recall',
   'ops_status',
   'self_recall',
+  // CTX2 #23185 — 맥락 한 문(READ-ONLY 자기관측 원장에 더해졌다).
+  'context_now',
 ] as const;

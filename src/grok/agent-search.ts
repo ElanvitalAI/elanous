@@ -71,6 +71,8 @@ export interface GrokAgentSearchResult {
   /** Deduped source URLs, in first-seen order (annotations first, then
    *  raw search_call sources). */
   citations: GrokCitation[];
+  /** URLs supplied by an actual x_search_call (not merely web citations). */
+  xSearchSources?: string[];
   /** Set when ok=false — a short diagnostic ('missing-api-key',
    *  'grok responses 4xx: …', 'threw: …'). */
   error?: string;
@@ -151,6 +153,7 @@ export function parseResponsesOutput(body: { output?: unknown[] } | null): GrokA
   const output = Array.isArray(body?.output) ? body!.output! : [];
   let text = '';
   const citations: GrokCitation[] = [];
+  const xSearchSources = new Set<string>();
   const seen = new Set<string>();
   const addCite = (url?: unknown, title?: unknown): void => {
     if (typeof url !== 'string' || !url || seen.has(url)) return;
@@ -179,9 +182,12 @@ export function parseResponsesOutput(body: { output?: unknown[] } | null): GrokA
     if ((item?.type === 'web_search_call' || item?.type === 'x_search_call')) {
       const action = item.action as Record<string, unknown> | undefined;
       const sources = Array.isArray(action?.sources) ? action!.sources as Array<Record<string, unknown>> : [];
-      for (const s of sources) addCite(s?.url, s?.title);
+      for (const s of sources) {
+        addCite(s?.url, s?.title);
+        if (item.type === 'x_search_call' && typeof s?.url === 'string') xSearchSources.add(s.url);
+      }
     }
   }
 
-  return { ok: true, status: 200, text: text.trim(), citations };
+  return { ok: true, status: 200, text: text.trim(), citations, xSearchSources: [...xSearchSources] };
 }

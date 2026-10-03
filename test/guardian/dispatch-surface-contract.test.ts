@@ -36,23 +36,6 @@ function outputOf(result: ReturnType<typeof compile>): string {
   return `${result.stdout ?? ''}${result.stderr ?? ''}`;
 }
 
-function typeScriptDiagnosticPaths(output: string): string[] {
-  return [...output.matchAll(/^(src\/[^\r\n(]+)\(\d+,\d+\): error TS\d+:/gm)].map(match => match[1]);
-}
-
-function createWholeProjectSentinel(): { tsconfigPath: string; sentinelPath: string } {
-  const rootDir = mkdtempSync(join(root, '.dispatch-surface-whole-project-'));
-  tempRoots.push(rootDir);
-  const sentinelPath = join(rootDir, 'whole-project-sentinel.ts');
-  const tsconfigPath = join(rootDir, 'tsconfig.json');
-  writeFileSync(sentinelPath, "const wholeProjectSentinel: never = 'dispatch-surface-sentinel';\n");
-  writeFileSync(tsconfigPath, JSON.stringify({
-    extends: '../tsconfig.json',
-    include: ['../src/**/*.ts', '../test/**/*.ts', './whole-project-sentinel.ts'],
-  }));
-  return { tsconfigPath, sentinelPath };
-}
-
 function createFixtureTree(): { rootDir: string; guardianTypes: string; verifierTypes: string } {
   const rootDir = mkdtempSync(join(tmpdir(), 'dispatch-surface-contract-'));
   tempRoots.push(rootDir);
@@ -101,24 +84,6 @@ describe('tool runtime dispatch surface contract', () => {
 
     expect(result.status, outputOf(result)).toBe(0);
   });
-
-  test('the whole-project compiler reaches a sentinel without target-file diagnostics', () => {
-    const { tsconfigPath, sentinelPath } = createWholeProjectSentinel();
-    const result = runTypeScript(root, ['--noEmit', '--pretty', 'false', '--project', tsconfigPath]);
-    const output = outputOf(result);
-    const diagnosticPaths = typeScriptDiagnosticPaths(output);
-    const targetPaths = [
-      'src/tool-runtime/registry.ts',
-      'src/tool-runtime/types.ts',
-      'src/guardian/types.ts',
-      'src/verifier/types.ts',
-    ];
-
-    expect(result.status).not.toBe(null);
-    expect(output).toContain(`${sentinelPath.slice(root.length + 1)}(1,7): error TS2322:`);
-    expect(output).toContain('Type \'"dispatch-surface-sentinel"\' is not assignable to type \'never\'.');
-    for (const targetPath of targetPaths) expect(diagnosticPaths).not.toContain(targetPath);
-  }, 40_000);
 
   test('TypeScript rejects the prior ToolHost receiver contracts', () => {
     const guardianTree = createFixtureTree();

@@ -207,7 +207,7 @@ describe('ledger and card draft', () => {
       expect(result.ledger).toBe(nightlyAuditLedgerPath(root));
       const lines = readFileSync(result.ledger, 'utf8').trim().split('\n');
       expect(lines).toHaveLength(1);
-      expect(JSON.parse(lines[0]!).results).toHaveLength(5);
+      expect(JSON.parse(lines[0]!).results).toHaveLength(GATE_NIGHTLY_AUDITS.length);
       expect(existsSync(result.card)).toBe(true);
       expect(readFileSync(result.card, 'utf8')).toContain(`\`${GATE_NIGHTLY_AUDITS[0]}\` | failing`);
     } finally { rmSync(root, { recursive: true, force: true }); }
@@ -225,7 +225,7 @@ describe('ledger and card draft', () => {
       // replacing only that binary with a compatible timed-command fixture on Linux.
       writeFileSync(join(bin, 'ssh'), `#!/bin/sh\ncat > "$TEST_CAPTURED"\nsed -e "s|/usr/bin/time -l|$TEST_TIME|g" -e 's|$HOME/.bun/bin:||g' "$TEST_CAPTURED" | bash\n`);
       writeFileSync(join(bin, 'git'), `#!/bin/sh\ncase "$1" in\n  clone) for target do :; done; mkdir -p "$target/apps/pwa" ;;\n  rev-parse) echo abc ;;\n  *) exit 2 ;;\nesac\n`);
-      writeFileSync(join(bin, 'bun'), `#!/bin/sh\ncase "$1" in\n  install) exit 0 ;;\n  run) printf '%s\\n' "$3" >> "$TEST_EXECUTIONS"; if [ "$3" = "./test/f12-sweep.test.ts" ]; then echo '1 fail' >&2; exit 1; fi; echo '1 pass' >&2 ;;\n  *) exit 2 ;;\nesac\n`);
+      writeFileSync(join(bin, 'bun'), `#!/bin/sh\ncase "$1" in\n  install) exit 0 ;;\n  run) [ "$ELANOUS_NIGHTLY_AUDIT" = 1 ] || exit 3; printf '%s\\n' "$3" >> "$TEST_EXECUTIONS"; if [ "$3" = "./test/f12-sweep.test.ts" ]; then echo '1 fail' >&2; exit 1; fi; echo '1 pass' >&2 ;;\n  *) exit 2 ;;\nesac\n`);
       writeFileSync(fixture, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$TEST_TIMED"\nif [ "$1" = "timeout" ]; then shift 3; fi\n"$@"\nrc=$?\necho '104857600 maximum resident set size' >&2\nexit "$rc"\n`);
       for (const path of [join(bin, 'ssh'), join(bin, 'git'), join(bin, 'bun'), fixture]) chmodSync(path, 0o700);
       const repo = join(import.meta.dir, '../..');
@@ -239,7 +239,7 @@ describe('ledger and card draft', () => {
       expect(readFileSync(executions, 'utf8').trim().split('\n')).toEqual(selected);
       expect(readFileSync(timed, 'utf8').trim().split('\n').map((line) => line.split(' ').at(-1))).toEqual(selected);
       expect(result.measurements.map((m) => m.file)).toEqual([...GATE_NIGHTLY_AUDITS]);
-      expect(result.measurements.map((m) => m.rc)).toEqual([1, 0, 0, 0, 0]);
+      expect(result.measurements.map((m) => m.rc)).toEqual(GATE_NIGHTLY_AUDITS.map((_, i) => i === 0 ? 1 : 0));
       expect(result.measurements.every((m) => m.rssMb === 100)).toBe(true);
       const record = spawnSync(process.execPath, [join(import.meta.dir, 'node.ts'), 'record'], {
         cwd: repo, encoding: 'utf8', env: { ...env, ELANOUS_GRAPH_CONTEXT: JSON.stringify({ graphId: 'nightly-audit', input: {}, outputs: { audit: result } }) },
@@ -249,13 +249,13 @@ describe('ledger and card draft', () => {
       expect(lines).toHaveLength(1);
       const ledger = JSON.parse(lines[0]!) as { results: Array<{ file: string; rc: number; verdict: string }> };
       expect(ledger.results.map((r) => r.file)).toEqual([...GATE_NIGHTLY_AUDITS]);
-      expect(ledger.results.map((r) => r.rc)).toEqual([1, 0, 0, 0, 0]);
+      expect(ledger.results.map((r) => r.rc)).toEqual(GATE_NIGHTLY_AUDITS.map((_, i) => i === 0 ? 1 : 0));
       const card = (JSON.parse(record.stdout.trim()) as { card: string }).card;
       expect(readFileSync(card, 'utf8')).toContain(`\`${GATE_NIGHTLY_AUDITS[0]}\` | failing`);
       expect(readdirSync(join(root, 'test-diet/cards'))).toHaveLength(1);
       const script = readFileSync(captured, 'utf8');
       expect(script).toContain('/usr/bin/time -l');
-      expect(script).toContain('300 bun run scripts/test-deterministic.ts "./$f"');
+      expect(script).toContain('300 env ELANOUS_NIGHTLY_AUDIT=1 bun run scripts/test-deterministic.ts "./$f"');
       expect(script).toContain(`done <<'TEST_DIET_FILES'\n${GATE_NIGHTLY_AUDITS.join('\n')}\nTEST_DIET_FILES`);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -271,7 +271,7 @@ describe('ledger and card draft', () => {
       });
       expect(run.status).toBe(1);
       const result = JSON.parse(run.stdout.trim()) as { outcome: string; failing: number; card: string };
-      expect(result).toMatchObject({ outcome: 'fail', failing: 4 });
+      expect(result).toMatchObject({ outcome: 'fail', failing: GATE_NIGHTLY_AUDITS.length - 1 });
       const lines = readFileSync(nightlyAuditLedgerPath(root), 'utf8').trim().split('\n');
       expect(lines).toHaveLength(1);
       const recorded = JSON.parse(lines[0]!) as { results: Array<{ file: string; rc: number | null; reason?: string; verdict: string }> };
@@ -281,7 +281,7 @@ describe('ledger and card draft', () => {
       expect(readFileSync(result.card, 'utf8')).toContain(`\`${GATE_NIGHTLY_AUDITS[1]}\` | failing`);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
-  test('remote audit transport error with no measurements still records all five as failing', () => {
+  test('remote audit transport error with no measurements records each audit as failing', () => {
     const root = mkdtempSync(join(tmpdir(), 'nightly-remote-error-'));
     try {
       const bin = join(root, 'bin');
@@ -301,14 +301,14 @@ describe('ledger and card draft', () => {
       });
       expect(recorded.status).toBe(1);
       const result = JSON.parse(recorded.stdout.trim()) as { failing: number; card: string };
-      expect(result.failing).toBe(5);
+      expect(result.failing).toBe(GATE_NIGHTLY_AUDITS.length);
       const lines = readFileSync(nightlyAuditLedgerPath(root), 'utf8').trim().split('\n');
       expect(lines).toHaveLength(1);
       expect((JSON.parse(lines[0]!) as { results: Array<{ reason: string; rc: number | null }> }).results.every((r) => r.rc === null && r.reason.includes('connection refused'))).toBe(true);
       expect(readFileSync(result.card, 'utf8')).toContain('connection refused');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
-  test('remote abort after the first timed file preserves that result and reports the other four as unmeasured', () => {
+  test('remote abort after the first timed file preserves that result and reports the remaining audits as unmeasured', () => {
     const root = mkdtempSync(join(tmpdir(), 'nightly-remote-partial-'));
     try {
       const bin = join(root, 'bin');
@@ -366,7 +366,7 @@ describe('ledger and card draft', () => {
       expect(audit.status).toBe(2);
       const output = JSON.parse(audit.stdout.trim()) as { outcome: string; remoteError: string; measurements: unknown[] };
       expect(output.outcome).toBe('error');
-      expect(output.measurements).toHaveLength(5);
+      expect(output.measurements).toHaveLength(GATE_NIGHTLY_AUDITS.length);
       expect(output.remoteError).toContain('transport disconnected');
       const record = spawnSync('bun', [join(import.meta.dir, 'node.ts'), 'record'], {
         cwd: repo, encoding: 'utf8', env: { ...process.env, ELANOUS_STATE_DIR: root, ELANOUS_GRAPH_CONTEXT: JSON.stringify({ graphId: 'nightly-audit', input: {}, outputs: { audit: output } }) },

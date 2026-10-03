@@ -154,12 +154,12 @@ export async function askVoiceAI(
 
   if (mode === 'preset') {
     // Phase 2 catalog isn't shipped yet; the wizard records the intent
-    // by keeping the user on Smart defaults but tagging persona='power'
+    // by keeping the user on Smart defaults but tagging profile='power'
     // so the auto-suggest hint in PWA opens the preset card directly.
     io.print('  (Preset catalog ships in Phase 2 · for now Smart defaults stay active.)');
     io.print('  elanous has noted your preference — preset hints will appear when ready.');
     return {
-      modelTier: { persona: 'power' },
+      modelTier: { profile: 'power' },
     };
   }
 
@@ -175,7 +175,7 @@ export async function askVoiceAI(
 
   const answer: VoiceAIAnswer = {
     modelTier: {
-      persona: 'custom',
+      profile: 'custom',
       voice: { stt: tier as ModelTier },
     },
   };

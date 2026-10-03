@@ -14,11 +14,11 @@ import { chromeAvailable } from '../src/capture.js';
 import { runRegisteredEngine, type EngineCtx } from '../src/registry.js';
 import { renderMarkdown, saveMarkdown, renderSourcesSection } from '../src/render.js';
 import type { CrawlResult, CrawlItem, SearchEngine } from '../src/types.js';
-import { writeStdoutJson } from '../../../src/cli/stdout-json.ts';
+import { writeStdoutJson } from '../../../src/cli/stdout-json.js';
 
 initEnv();
 
-/** ⛔⭐ tavily 를 **상시 경로**에 쓸 것인가 (대표 2026-09-10 · **기본 ON**).
+/** ⛔⭐ tavily 를 **상시 경로**에 쓸 것인가 (공식 결정 2026-09-10 · **기본 ON**).
  *
  *  이력: 2026-08-06 엔 비용(deep 1회당 advanced ×3 ≈ 6cr 고정비) 때문에 기본 OFF 로 두고
  *  무료 ddg 를 1순위로 삼았다. 그러나 **DDG HTML 차단 시 웹 검색 축이 통째로 0건**이 되고,
@@ -173,7 +173,7 @@ async function runDeep(query: string): Promise<CrawlResult[]> {
   const results: CrawlResult[] = [];
 
   // 1) 다각도 검색 + grok-community 동시 발사
-  // ⛔⭐ 2026-08-06 (대표) — tavily 각도 검색은 **기본 OFF**(deep 1회당 advanced ×3 ≈ 6cr 고정비).
+  // ⛔⭐ 2026-08-06 (공식 결정) — tavily 각도 검색은 **기본 OFF**(deep 1회당 advanced ×3 ≈ 6cr 고정비).
   //    켜기: `.env` 또는 셸에 `OMNI_CRAWL_TAVILY=1`. 끄면 아래 `!gotTavily` 분기가 **이미 있는**
   //    ddg 무료 각도 검색을 대신 돌린다(별도 배선 불필요).
   const searchTasks: Array<Promise<CrawlResult | null>> = [
@@ -259,7 +259,7 @@ async function runDeep(query: string): Promise<CrawlResult[]> {
 // 원칙: 유료(tavily/firecrawl)가 1순위·기본. 유료가 공백/미가용일 때만 무료(ddg)로 강등.
 // "품질 동일 시 무료, 아니면 유료 우선" — 무료는 돈 떨어졌을 때의 안전망.
 async function applyWebFallback(engines: SearchEngine[], results: CrawlResult[], query: string): Promise<CrawlResult[]> {
-  // ⛔ ddg 도 «웹 검색 축»으로 센다(대표 2026-09-10). 종전엔 ddg 가 빠져 있어서
+  // ⛔ ddg 도 «웹 검색 축»으로 센다(공식 결정 2026-09-10). 종전엔 ddg 가 빠져 있어서
   //    ddg 1순위로 돌던 시절 DDG 가 0건이면 **보충이 아예 안 걸렸다** — 그 구멍을 막는다.
   const wantedWeb = engines.some(e => e === 'tavily' || e === 'tavily-news' || e === 'firecrawl' || e === 'fc-news' || e === 'ddg');
   if (!wantedWeb) return results;
@@ -393,7 +393,7 @@ async function runHealth(): Promise<boolean> {
       },
     },
     {
-      // 대표 2026-09-10: ddg 는 **폴백 전용**(1순위 아님)이므로 실패해도 전체 판정을 깨지 않는다.
+      // 공식 결정 2026-09-10: ddg 는 **폴백 전용**(1순위 아님)이므로 실패해도 전체 판정을 깨지 않는다.
       //   DDG HTML 차단은 상시 발생하는 정상 상태 — 유료 축이 살아 있으면 검색은 계속 돈다.
       name: 'ddg-free', tier: 'fallback', run: async () => {
         const t0 = Date.now();
@@ -439,7 +439,7 @@ function runSelfTest() {
   console.log('=== omni-crawl self-test ===\n');
   let passed = 0, failed = 0;
 
-  // ⛔ 기대값은 **tavily 스위치를 따라간다**(대표 2026-08-06 기본 OFF). 스위치를 뒤집고도
+  // ⛔ 기대값은 **tavily 스위치를 따라간다**(공식 결정 2026-08-06 기본 OFF). 스위치를 뒤집고도
   //    자기테스트를 안 고쳐 3건이 상시 FAIL 로 남아 있었다 — 신호가 죽어 있던 자리다.
   const WEB = (process.env.OMNI_CRAWL_TAVILY ?? '').trim() !== '0' ? 'tavily' : 'ddg';
   const NEWS = WEB === 'tavily' ? ['tavily-news', 'fc-news'] : ['fc-news'];

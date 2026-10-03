@@ -21,6 +21,7 @@
 //   ⏳ Mention parser → persona LLM dispatch wire
 
 import { debug } from '../debug/log.js';
+import { botAudienceFor, gateDiscordSchemas } from '../maturity/bot-command-maturity.js';
 import type { DiscordBot } from '../discord.js';
 import {
   loadLayeredPersonaDirs,
@@ -204,7 +205,10 @@ export async function wireSprint21Runtime(opts: WireSprint21Opts): Promise<Sprin
   // 6. Slash command registration
   const cmdRest = makeCommandRest({ token: opts.token, fetchImpl: opts.fetchImpl });
   async function registerSlashCommands(): Promise<number> {
-    const schemas = router.schemas();
+    const allSchemas = router.schemas();
+    const audience = botAudienceFor('discord');
+    const { schemas, hidden } = gateDiscordSchemas(allSchemas, audience);
+    debug.log('discord.command', 'menu-filtered', { total: allSchemas.length, shown: schemas.length - hidden, ...audience });
     if (opts.devGuildId) {
       const out = await cmdRest.bulkOverwriteGuild(opts.appId, opts.devGuildId, schemas);
       log(`[sprint21-wire] registered ${out.length} slash commands to guild ${opts.devGuildId}`);

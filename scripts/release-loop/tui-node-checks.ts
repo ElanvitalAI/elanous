@@ -27,3 +27,45 @@ export function tuiChecks(s: TuiScreens, readyLimitMs = 60_000): TuiCheck[] {
 export function tuiVerdict(checks: readonly TuiCheck[]): 'pass' | 'fail' {
   return checks.every((c) => c.pass) ? 'pass' : 'fail';
 }
+
+export type TuiRegress = {
+  pass: number;
+  fail: number;
+  results: Array<{ id: string; title: string; ok: boolean; reason: string }>;
+} | { unmeasured: string };
+
+export function validatedTuiRegress(data: unknown): TuiRegress {
+  const invalid = { unmeasured: 'tui.regress 결과 없음' };
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return invalid;
+  const value = data as Record<string, unknown>;
+  if (typeof value.unmeasured === 'string' && value.unmeasured.trim()) return { unmeasured: value.unmeasured };
+  if (!Array.isArray(value.results) || value.results.length !== 7
+    || !Number.isInteger(value.pass) || !Number.isInteger(value.fail)
+    || (value.pass as number) < 0 || (value.fail as number) < 0
+    || (value.pass as number) + (value.fail as number) !== 7
+    || value.results.some((r: unknown) => !r || typeof r !== 'object'
+      || typeof (r as Record<string, unknown>).id !== 'string'
+      || !/^R[1-7]$/.test((r as Record<string, unknown>).id as string)
+      || typeof (r as Record<string, unknown>).title !== 'string'
+      || typeof (r as Record<string, unknown>).ok !== 'boolean'
+      || typeof (r as Record<string, unknown>).reason !== 'string')
+    || value.pass !== value.results.filter((r: { ok: boolean }) => r.ok).length
+    || value.fail !== value.results.filter((r: { ok: boolean }) => !r.ok).length
+    || new Set(value.results.map((r: { id: string }) => r.id)).size !== 7) return invalid;
+  return value as { pass: number; fail: number; results: Array<{ id: string; title: string; ok: boolean; reason: string }> };
+}
+
+export function parseTuiRegress(stdout: string): TuiRegress {
+  const lines = stdout.trim().split('\n');
+  if (lines.length !== 1) return { unmeasured: 'JSON 한 줄이 아니다' };
+  try { return validatedTuiRegress(JSON.parse(lines[0]!)); }
+  catch { return { unmeasured: 'JSON 결과를 읽을 수 없다' }; }
+}
+
+export function regressWarning(regress: TuiRegress): { level: 'ok' | 'warn' | 'unmeasured'; line: string } {
+  if ('unmeasured' in regress) return { level: 'unmeasured', line: `tui-regress: unmeasured — ${regress.unmeasured}` };
+  const failed = regress.results.filter((result) => !result.ok).map((result) => result.id);
+  return failed.length
+    ? { level: 'warn', line: `tui-regress: warn — ${failed.join(', ')}` }
+    : { level: 'ok', line: `tui-regress: ok — ${regress.pass} pass · 0 fail` };
+}

@@ -13,8 +13,7 @@ import { appendFileSync } from 'node:fs';
 import { SignalPool } from '../src/domains/signal-pool.js';
 import { runDigest, runCommunityBuzzDigest } from '../src/domains/signal-router.js';
 import { sendOutbound } from '../src/domains/outbound-alert.js';
-import { sendReportPhotoBuffer } from '../src/telegram-report.js';
-import { getUserConfig } from '../src/user-config.js';
+import { createDigestPhotoSender } from './signal-digest-photo.js';
 import { ensureCronNodePath } from '../src/domains/cron-path.js';
 import { unknownCronFlag } from '../src/domains/cron-flag-contract.js';
 
@@ -35,14 +34,10 @@ function log(msg: string): void {
   try { appendFileSync(LOG, line + '\n'); } catch { /* fail-soft */ }
 }
 
-async function sendDigestPhoto(png: Buffer, opts?: { caption?: string }): Promise<boolean> {
-  return sendReportPhotoBuffer(getUserConfig(), png, opts);
-}
-
 async function main(): Promise<void> {
   const pool = new SignalPool();
   try {
-    const d = await runDigest(pool, LIVE ? { send: sendOutbound, sendPhoto: sendDigestPhoto } : {});
+    const d = await runDigest(pool, LIVE ? { send: sendOutbound, sendPhoto: createDigestPhotoSender() } : {});
     log(`[${d.mode}] 다이제스트 대기 ${d.count} · 발송 ${d.sent}`);
     if (!LIVE && d.count > 0) {
       log(`  ▶ [digest shadow]\n${d.preview}`);

@@ -580,6 +580,26 @@ export class DaemonClient {
     return this.fetchJson<SeatRequestsResponse>(`/v1/seat-requests${suffix}`);
   }
 
+  async listSeatAskAnswers(clientId: string): Promise<{ items: Array<{ id: string; text: string; status: 'answered' | 'expired' }> }> {
+    return this.fetchJson('/v1/seat-requests?answers=1', { headers: { 'x-seat-ask-client': clientId } });
+  }
+
+  async acknowledgeSeatAskAnswers(clientId: string, ids: string[]): Promise<void> {
+    await this.fetchJson('/v1/seat-requests?answers=ack', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-seat-ask-client': clientId },
+      body: JSON.stringify({ ids }),
+    });
+  }
+
+  async submitSeatAsk(text: string, clientId: string): Promise<{ reply: string }> {
+    const response = await this.fetchResponse('/v1/seat-requests', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-seat-ask-client': clientId },
+      body: JSON.stringify({ seat: 'TC', text }),
+    });
+    if (!response.ok) throw new Error(`seat ask ${response.status}`);
+    return response.json() as Promise<{ reply: string }>;
+  }
+
   async submitSeatRequest(request: { seat?: string; text: string; attachments?: AttachmentMeta[] }, idempotencyKey: string): Promise<SeatRequestReceipt> {
     const path = '/v1/seat-requests';
     const { seat, text, attachments } = request;

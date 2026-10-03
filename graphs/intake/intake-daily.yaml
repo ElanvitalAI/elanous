@@ -1,7 +1,8 @@
 # 정기 흡수 한 판 — RFC-regular-external-intake-and-normalization-pipeline §5.1 (1판: cmd 노드만).
 # 입력원 하나가 실패해도 판은 끝까지 간다(수집 노드의 fail 도 다음 노드로) — 각 단계가 «못 모음»을 로그에 남긴다.
-# 몸 = yt-vault 의 scripts/intake-daily.sh <step> · 크론이 `elanous graph run graphs/intake/intake-daily.yaml` 로 부른다.
+# 몸 = yt-vault 의 scripts/intake-daily.sh <step> · 크론 입구 스크립트 intake-cron.sh 가 그래프를 부른다.
 graph_id: intake-daily
+cron_entry: intake-cron.sh
 loop:
   title: 정기 흡수
   description: 외부 지식을 매일 수집·흡수한다

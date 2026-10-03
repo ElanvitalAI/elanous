@@ -19,6 +19,7 @@
 
 import { getGrokApiKey } from '../config.js';
 import { grokAgentSearch, GROK_SEARCH_MODEL } from '../grok/agent-search.js';
+import { wantsXSearch } from './x-intent.js';
 import type { WebSearchHit, WebSearchProvider, WebSearchResult } from './provider.js';
 
 const DEFAULT_LIMIT = 5;
@@ -52,10 +53,15 @@ export function buildGrokWebSearchProvider(): WebSearchProvider {
 
       if (!r.ok) throw new Error(r.error ?? 'grok search failed');
 
-      const hits: WebSearchHit[] = r.citations.slice(0, limit).map(c => ({
+      const xSourceUrls = new Set(r.xSearchSources ?? []);
+      const citations = wantsXSearch(q.query)
+        ? [...r.citations.filter(c => xSourceUrls.has(c.url)), ...r.citations.filter(c => !xSourceUrls.has(c.url))]
+        : r.citations;
+      const hits: WebSearchHit[] = citations.slice(0, limit).map(c => ({
         url: c.url,
         title: c.title ?? c.url,
         snippet: '',
+        ...(xSourceUrls.has(c.url) ? { xSearchSource: true } : {}),
       }));
 
       const note = r.text.length > 0 ? r.text.slice(0, 1500) : undefined;

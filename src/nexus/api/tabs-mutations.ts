@@ -78,6 +78,8 @@ interface CreateTabBody {
   kind?: string;
   id?: string;
   label?: string;
+  /** Conversation owning a newly created webterm. */
+  sessionId?: string;
   /** Kind-specific factory opts (passed through to the factory). */
   kindOpts?: Record<string, unknown>;
   /** When true (default), supervisor.startTab is called immediately
@@ -95,7 +97,7 @@ function buildTabSpec(body: CreateTabBody, id: string): { spec: TabSpec; reason?
     case 'chat':
       return { spec: createChatTabSpec(opts as Parameters<typeof createChatTabSpec>[0]) };
     case 'webterm':
-      return { spec: createWebtermTabSpec(opts as Parameters<typeof createWebtermTabSpec>[0]) };
+      return { spec: createWebtermTabSpec({ ...opts, sessionId: body.sessionId ?? opts.sessionId } as Parameters<typeof createWebtermTabSpec>[0]) };
     case 'daemon':
       return { spec: createDaemonTabSpec(opts as Parameters<typeof createDaemonTabSpec>[0]) };
     case 'pwa-host':

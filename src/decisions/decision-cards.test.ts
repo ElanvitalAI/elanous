@@ -285,9 +285,28 @@ describe('HITL1 H3 card bridge — pending questions become decision cards', () 
     expect(open[0]).toMatchObject({ category: 'scope', raisedBy: { agent: 'harness' }, resume: { questionId: 'auq:h3:abcde', runId: 'run-x' },
       recommendation: { option: 'b' } });
     expect(open[0]!.options.map((o) => o.key)).toEqual(['a', 'b', 'c']);
+    expect(open[0]!.scqa.c).not.toBe(open[0]!.scqa.s);
+    expect(open[0]!.scqa.s).toBe('Widen the release scope?');
+    expect(open[0]!.pendingQuestion).toBe('Widen the release scope?\n\nRecommended: Keep.');
+    expect(tg.sent[0]?.view.text).toContain('Widen the release scope?\n\nRecommended: Keep.');
     expect(tg.sent).toHaveLength(1);
     await service.tick();
     expect(ledger.list({ status: 'all' })).toHaveLength(1);
+    expect(tg.sent).toHaveLength(1);
+  });
+
+  test('legacy pending question without a runId (any surface) still becomes a card — resume carries no runId', async () => {
+    const ledger = ledgerAt();
+    const tg = new FakeTransport('telegram');
+    const legacy = () => {
+      const result = pending({ impact: 'high', id: 'auq:legacy:abcde' })();
+      const { runId: _runId, ...record } = result.questions[0]!;
+      return { ...result, questions: [{ ...record, surface: 'tui' as const }] };
+    };
+    await new DecisionCardService({ transport: tg, ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: legacy as never }).tick();
+    const open = ledger.list({ status: 'open' });
+    expect(open).toHaveLength(1);
+    expect(open[0]!.resume).toEqual({ questionId: 'auq:legacy:abcde' });
     expect(tg.sent).toHaveLength(1);
   });
 
@@ -300,6 +319,17 @@ describe('HITL1 H3 card bridge — pending questions become decision cards', () 
       await new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: pending(over) as never }).tick();
       expect(ledger.list({ status: 'all' })).toHaveLength(0);
     }
+  });
+
+  test('a card tap reports a durable decision whose answer cannot reach a missing pending run', async () => {
+    const ledger = ledgerAt();
+    const transport = new FakeTransport('telegram');
+    const service = new DecisionCardService({ transport, ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: pending({ impact: 'high' }) as never });
+    await service.tick();
+    const entry = ledger.list()[0]!;
+    const result = await service.tap('111', `dec:${entry.id}:b`);
+    expect(result).toMatchObject({ kind: 'decided', toast: expect.stringContaining('retry-answer') });
+    expect(ledger.show(entry.id)).toMatchObject({ status: 'decided', choice: 'b' });
   });
 
   test('a question already tied to a decided card is not raised again', async () => {

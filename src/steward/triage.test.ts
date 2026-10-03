@@ -30,6 +30,63 @@ test('steward config parses alert threshold and ignores invalid thresholds', () 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('off mode skips the stage command before locking or creating state; shadow cannot spawn even with legacy live launch', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-mode-'));
+  try {
+    expect(await runStewardStageCommand('sync', { root, launchSettings: { mode: 'off' }, runStage: () => { throw new Error('off ran'); } })).toBe(0);
+    expect(existsSync(join(root, 'steward'))).toBe(false);
+    const dir = join(root, 'steward');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0]]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: 'ELA-1', rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
+    await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { mode: 'shadow', launch: 'live' },
+      launchCommand: () => { throw new Error('shadow ran command'); }, spawnLaunch: () => { throw new Error('shadow spawned'); } });
+    expect(readLaunchLedger(root).launches['ELA-1']?.status).toBe('shadow');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('legacy live launch override still runs the stage and launches only after its gates pass', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-legacy-live-'));
+  const dir = join(root, 'steward');
+  try {
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0]]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: 'ELA-1', rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
+    let gateCalls = 0;
+    let spawnCalls = 0;
+    await runStewardStage('schedule', { root, getSecret: async () => 'key', launchSettings: { launch: 'live' },
+      launchCommand: () => ({ exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }),
+      launchGate: (_goalId, budget) => { gateCalls++; return { action: 'proceed', sameGoalActiveRuns: [], budget, reason: 'no confirmed duplicate' }; },
+      spawnLaunch: () => { spawnCalls++; return { pid: 99999999 }; },
+    });
+    expect([gateCalls, spawnCalls, readLaunchLedger(root).launches['ELA-1']?.status]).toEqual([1, 1, 'launched']);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('legacy launch off skips stages without recording plans or HITL, while explicit shadow keeps both', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-legacy-off-'));
+  const dir = join(root, 'steward');
+  try {
+    expect(await runStewardStageCommand('sync', { root, launchSettings: { launch: 'off' }, runStage: () => { throw new Error('legacy off ran'); } })).toBe(0);
+    expect(existsSync(dir)).toBe(false);
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([issues[0], issues[1]]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([
+      { issue: 'ELA-1', rung: 4, dependsOn: [], priority: 1, why: 'build' },
+      { issue: 'ELA-2', rung: 'hitl', hitlReason: 'money', dependsOn: [], priority: 2, why: 'approve' },
+    ]));
+    const deps = { root, getSecret: async () => 'key', launchCommand: () => { throw new Error('legacy off ran command'); },
+      spawnLaunch: () => { throw new Error('legacy off spawned'); } };
+    await runStewardStage('schedule', { ...deps, launchSettings: { launch: 'off' } });
+    expect(existsSync(join(dir, 'schedule.json'))).toBe(false);
+    expect(existsSync(join(dir, 'launches.json'))).toBe(false);
+    await runStewardStage('schedule', { ...deps, launchSettings: { launch: 'off', mode: 'shadow' } });
+    expect(existsSync(join(dir, 'schedule.json'))).toBe(true);
+    expect(readLaunchLedger(root).launches['ELA-1']?.status).toBe('shadow');
+    expect(readLaunchLedger(root).hitl['ELA-2']).toMatchObject({ raised: false });
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('command records failure and failed alert delivery preserves stage exit code', async () => {
   const root = mkdtempSync(join(tmpdir(), 'steward-alert-command-'));
   const now = () => new Date('2026-10-01T00:00:00.000Z');
@@ -203,24 +260,28 @@ test('command accounts for killed stage at next start even if next stage succeed
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('steward config parses team, observe mode and role caps', () => {
+test('steward config parses team, shadow mode and role caps', () => {
   const root = mkdtempSync(join(tmpdir(), 'steward-config-'));
   const path = join(root, 'config.json');
   try {
-    writeFileSync(path, JSON.stringify({ loops: { steward: { linearTeam: 'ELA', mode: 'observe', budget: 3, roles: { builder: { maxConcurrent: 2 } } } } }));
-    expect(buildUserConfig(path).loops?.steward).toEqual({ linearTeam: 'ELA', mode: 'observe', budget: 3, roles: { builder: { maxConcurrent: 2 } } });
+    writeFileSync(path, JSON.stringify({ loops: { steward: { linearTeam: 'ELA', mode: 'shadow', budget: 3, roles: { builder: { maxConcurrent: 2 } } } } }));
+    expect(buildUserConfig(path).loops?.steward).toEqual({ linearTeam: 'ELA', mode: 'shadow', budget: 3, roles: { builder: { maxConcurrent: 2 } } });
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-test('steward launch config validates live/off and parallel/pool overrides without changing observe mode', () => {
+test('steward launch config preserves legacy live without mode, while missing mode and launch default to shadow', () => {
   const dir = mkdtempSync(join(tmpdir(), 'steward-launch-config-'));
   const path = join(dir, 'config.json');
   try {
     writeFileSync(path, JSON.stringify({ loops: { steward: { launch: 'live', maxParallel: 5, podPool: 'team@host:4' } } }));
-    expect(buildUserConfig(path).loops?.steward).toMatchObject({ mode: 'observe', launch: 'live', maxParallel: 5, podPool: 'team@host:4' });
+    expect(buildUserConfig(path).loops?.steward).toMatchObject({ mode: 'live', launch: 'live', maxParallel: 5, podPool: 'team@host:4' });
+    writeFileSync(path, JSON.stringify({ loops: { steward: {} } }));
+    expect(buildUserConfig(path).loops?.steward?.mode).toBe('shadow');
     writeFileSync(path, JSON.stringify({ loops: { steward: { launch: 'off', maxParallel: -1, podPool: '' } } }));
     const off = buildUserConfig(path).loops?.steward;
-    expect(off).toMatchObject({ mode: 'observe', launch: 'off' });
+    expect(off).toMatchObject({ mode: 'off', launch: 'off' });
+    writeFileSync(path, JSON.stringify({ loops: { steward: { mode: 'shadow', launch: 'off' } } }));
+    expect(buildUserConfig(path).loops?.steward).toMatchObject({ mode: 'shadow', launch: 'off' });
     // Invalid overrides stay absent; launch.ts applies maxParallel 3 · pool-node-b@node-b:8.
     expect(off?.maxParallel).toBeUndefined();
     expect(off?.podPool).toBeUndefined();
@@ -386,7 +447,8 @@ test('schedule → report: live pod runs yield one landing digest with source, t
     if (query.includes('commentCreate(')) return Response.json({ data: { commentCreate: { success: true } } });
     throw new Error(`unexpected query: ${query}`);
   }) as typeof fetch;
-  const deps = { root, getSecret: async () => 'key', fetch: fetchFn, launchSettings: { launch: 'live' as const },
+  const deps = { root, getSecret: async () => 'key', fetch: fetchFn, launchSettings: { mode: 'live' as const },
+    launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
     spawnLaunch: (args: string[], log: string) => { calls.push(args); writeFileSync(log, `starting ${runId}`); return { pid: 99999999 }; },
     launchCommand: (args: string[]) => args.includes('budget') ? { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }
       : { exitCode: 0, stdout: [{ event: 'pr-opened', data: { number: 77 } }, { event: 'merged', data: { number: 77, merged: true } }, { event: 'run-status', data: { runStatus: 'completed' } }].map(event => JSON.stringify(event)).join('\n') },
@@ -424,7 +486,8 @@ test('report waits for a completed run with an open PR, then sends its merge onc
     if (query.includes('commentCreate(')) return Response.json({ data: { commentCreate: { success: true } } });
     throw new Error(`unexpected query: ${query}`);
   }) as typeof fetch;
-  const deps = { root, getSecret: async () => 'key', fetch: fetchFn, launchSettings: { launch: 'live' as const },
+  const deps = { root, getSecret: async () => 'key', fetch: fetchFn, launchSettings: { mode: 'live' as const },
+    launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
     launchCommand: () => ({ exitCode: 0, stdout: events.map(event => JSON.stringify(event)).join('\n') }),
     sendDigest: async (text: string) => { messages.push(text); } };
   try {
@@ -458,7 +521,8 @@ test('landing still reaches its card and requester after the issue leaves the cu
   const messages: string[] = [];
   let spawned = 0;
   const one = { ...issues[0]!, title: 'Departed request', body: 'Build it\n출처: tui' };
-  const deps = { root, getSecret: async () => 'key', launchSettings: { launch: 'live' as const },
+  const deps = { root, getSecret: async () => 'key', launchSettings: { mode: 'live' as const },
+    launchGate: () => ({ action: 'proceed' as const, sameGoalActiveRuns: [], budget: { action: 'proceed' as const, reasons: [] }, reason: 'no confirmed duplicate' }),
     spawnLaunch: (_args: string[], log: string) => { spawned++; writeFileSync(log, `started ${runId}`); return { pid: 99999999 }; },
     launchCommand: (args: string[]) => args.includes('budget') ? { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }
       : { exitCode: 0, stdout: '{"event":"merged","data":{"number":88,"merged":true}}' },

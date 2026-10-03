@@ -3,7 +3,8 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, openSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { harnessReleaseNote, parseReleaseNoteSection, readReleaseNotes, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment } from './release-note.js';
+import { addNextMdReleaseNote, harnessReleaseNote, parseReleaseNoteSection, readReleaseNotes, releaseNotesDir, renderReleaseNoteSection, writeReleaseNote, type ReleaseNoteFragment } from './release-note.js';
+import { debug } from '../debug/log.js';
 
 const scratch: string[] = [];
 afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -77,12 +78,76 @@ test('harness release note falls back for absent or invalid goal sections', () =
   expect(harnessReleaseNote('', '작업 제목')).toEqual(fallback);
   expect(harnessReleaseNote('## 목표\n릴리스 노트가 없는 골', '작업 제목')).toEqual(fallback);
   expect(harnessReleaseNote('## 릴리스 노트\n- 한 줄: 사용자 변화\n- 종류: bugfix\n- 문서: 없음(이유)\n- 대상: later\n', '작업 제목')).toEqual(fallback);
-  expect(harnessReleaseNote(renderReleaseNoteSection(fragment), '작업 제목')).toEqual(fallback);
+  expect(harnessReleaseNote(renderReleaseNoteSection(fragment), '작업 제목')).toEqual({ line: fragment.line, kind: fragment.kind, docs: fragment.docs, target: fragment.target });
   expect(harnessReleaseNote(`## 목표\n릴리스 노트가 없는 골\n## 검증\n${renderReleaseNoteSection(fragment)}`, '작업 제목')).toEqual(fallback);
   expect(harnessReleaseNote(`## 목표\n### 세부 목표\n릴리스 노트가 없는 골\n## 검증\n${renderReleaseNoteSection(fragment)}`, '작업 제목')).toEqual(fallback);
   expect(harnessReleaseNote(`## 목표\n릴리스 노트가 없는 골\n## 검증\n### 릴리스 노트\n${renderReleaseNoteSection(fragment)}`, '작업 제목')).toEqual(fallback);
-  expect(harnessReleaseNote(`\`\`\`md\n## 목표\n\`\`\`\n${renderReleaseNoteSection(fragment)}`, '작업 제목')).toEqual(fallback);
+  expect(harnessReleaseNote(`\`\`\`md\n## 목표\n\`\`\`\n${renderReleaseNoteSection(fragment)}`, '작업 제목')).toEqual({ line: fragment.line, kind: fragment.kind, docs: fragment.docs, target: fragment.target });
   expect(parseReleaseNoteSection(renderReleaseNoteSection(fallback)).fragment).toEqual(fallback);
+});
+
+test('a current goal uses the last unfenced release note; legacy goal boundaries remain authoritative', () => {
+  const first = renderReleaseNoteSection({ ...fragment, line: 'old' });
+  const last = renderReleaseNoteSection(fragment);
+  const document = `# Current\n## Situation\n\`\`\`md\n${first}\`\`\`\n## Answer (요청)\n${first}\n${last}`;
+  expect(harnessReleaseNote(document, 'fallback')).toEqual({ line: fragment.line, kind: fragment.kind, docs: fragment.docs, target: fragment.target });
+  expect(harnessReleaseNote(`${last}\n## 목표\n## 검증\n${last}`, 'fallback').kind).toBe('internal');
+});
+
+test('missing and invalid goal sections emit one observable fallback with shard identity', () => {
+  const records: Array<{ reason: string; shard: boolean }> = [];
+  const off = debug.registerSink({ name: 'release-note-fallback-test', emit: (record) => {
+    if (record.category === 'release-note' && record.event === 'harness-fallback') records.push(record.data as { reason: string; shard: boolean });
+  } });
+  try {
+    expect(harnessReleaseNote('# Goal\n## Situation\nnone', 'title', true).kind).toBe('internal');
+    expect(harnessReleaseNote('## 릴리스 노트\n- 종류: bugfix', 'title').kind).toBe('internal');
+    expect(records).toEqual([expect.objectContaining({ reason: 'missing', shard: true }), expect.objectContaining({ reason: 'invalid', shard: false })]);
+  } finally { off(); }
+});
+
+test('next.md places a user note in its section only once, and skips internal and later', () => {
+  const root = mkdtempSync(join(tmpdir(), 'next-md-note-'));
+  scratch.push(root);
+  mkdirSync(join(root, 'release'));
+  const path = join(root, 'release', 'next.md');
+  writeFileSync(path, '# Next\n\n## Feat\n\n## Fix\n\n- existing\n');
+  const note = { line: 'An improvement', kind: 'feat' as const, docs: { path: 'docs/feature.md' }, target: 'next' as const };
+  expect(addNextMdReleaseNote(root, note)).toBe(true);
+  expect(addNextMdReleaseNote(root, note)).toBe(false);
+  expect(readFileSync(path, 'utf8')).toContain('## Feat\n\n- feat — An improvement. Documentation: docs/feature.md. Target: next.\n');
+  expect(readFileSync(path, 'utf8').match(/- feat — An improvement/g)).toHaveLength(1);
+  expect(addNextMdReleaseNote(root, { ...note, kind: 'security', line: 'security — Patched access', docs: { none: '내부' } })).toBe(true);
+  expect(readFileSync(path, 'utf8')).toContain('## Fix\n\n- existing\n\n## Security\n\n- security — Patched access. Documentation: none. Target: next.');
+  const unchanged = readFileSync(path, 'utf8');
+  expect(addNextMdReleaseNote(root, { ...note, kind: 'internal' })).toBe(false);
+  expect(addNextMdReleaseNote(root, { ...note, target: 'later' })).toBe(false);
+  expect(readFileSync(path, 'utf8')).toBe(unchanged);
+  // Same sentence but different documentation: next.md must end up matching the PR body's note (round 3 must-fix).
+  writeFileSync(path, '# Next\n\n## Feat\n\n- feat — An improvement. Documentation: none (evidence from human). Target: next.\n\n## Fix\n');
+  expect(addNextMdReleaseNote(root, note)).toBe(true);
+  expect(readFileSync(path, 'utf8').match(/An improvement/g)).toHaveLength(1);
+  expect(readFileSync(path, 'utf8')).toContain('- feat — An improvement. Documentation: docs/feature.md. Target: next.');
+  expect(readFileSync(path, 'utf8')).not.toContain('evidence from human');
+  const other = { ...note, line: 'An improvement.' };
+  expect(addNextMdReleaseNote(root, other)).toBe(false);
+  expect(readFileSync(path, 'utf8').match(/An improvement/g)).toHaveLength(1);
+  // Changing only the documentation updates in place — still one line, now naming the new document.
+  expect(addNextMdReleaseNote(root, { ...note, docs: { path: 'docs/other.md' } })).toBe(true);
+  expect(readFileSync(path, 'utf8').match(/An improvement/g)).toHaveLength(1);
+  expect(readFileSync(path, 'utf8')).toContain('Documentation: docs/other.md. Target: next.');
+});
+
+test('missing next.md throws for public next notes, but internal and later remain unchanged', () => {
+  const root = mkdtempSync(join(tmpdir(), 'next-md-missing-'));
+  scratch.push(root);
+  const note = { line: 'Visible change', kind: 'feat' as const, docs: { path: 'docs/feature.md' }, target: 'next' as const };
+  for (const kind of ['feat', 'fix', 'security'] as const) {
+    expect(() => addNextMdReleaseNote(root, { ...note, kind })).toThrow('ENOENT');
+  }
+  expect(addNextMdReleaseNote(root, { ...note, kind: 'internal' })).toBe(false);
+  expect(addNextMdReleaseNote(root, { ...note, target: 'later' })).toBe(false);
+  expect(existsSync(join(root, 'release', 'next.md'))).toBe(false);
 });
 
 test('mergeSha survives JSON ledger round trip but never enters the four-field PR section', () => {

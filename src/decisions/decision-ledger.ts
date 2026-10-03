@@ -7,7 +7,8 @@ import { createVersionResolver, type VersionOptions, type Versions } from '../di
 import { getUserConfig } from '../user-config.js';
 
 export type DecisionCategory = 'secret' | 'publish' | 'money' | 'security' | 'scope' | 'irreversible' | 'other';
-export type DecisionTrack = 'S' | 'T' | 'F' | 'O';
+/** Old track letters (S·T·F·O) stay readable; seat names (OP·MK·TC·UX) are the current identities. */
+export type DecisionTrack = 'S' | 'T' | 'F' | 'O' | 'OP' | 'MK' | 'TC' | 'UX';
 export interface DecisionOption { key: string; label: string; consequence: string }
 export type Recommendation = { option: string; why: string } | { skipped: true; reason: string };
 export type DecisionActor = { kind: 'human' } | { kind: 'auto'; agent: string; track?: DecisionTrack; delegation: string };
@@ -17,13 +18,15 @@ export interface DecisionEntry {
   raisedBy: { agent: string; track?: DecisionTrack; session?: string }; version?: Versions;
   status: 'open' | 'decided' | 'withdrawn'; refs?: string[];
   resume?: { questionId: string; runId?: string };
+  /** Original pending question, including its newlines; SCQA fields are short summaries. */
+  pendingQuestion?: string;
   /** DEC-TG — optional deadline (UTC). Cards remind the owner two hours before it. */
   dueAt?: string;
   decidedAt?: string; decidedBy?: DecisionActor; choice?: string; note?: string; versionAtDecision?: Versions;
   withdrawnAt?: string; withdrawReason?: string;
   history: Array<{ type: 'raised' | 'options-added' | 'decided' | 'withdrawn'; at?: string; by: string; version?: Versions; choice?: string; reason?: string }>;
 }
-export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt' | 'resume'> & { raisedAt?: string };
+export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt' | 'resume' | 'pendingQuestion'> & { raisedAt?: string };
 type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
 export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer }
 
@@ -38,7 +41,7 @@ export class DecisionAnswerDeliveryError extends Error {
   }
 }
 const CATEGORIES: readonly string[] = ['secret', 'publish', 'money', 'security', 'scope', 'irreversible', 'other'];
-const TRACKS: readonly string[] = ['S', 'T', 'F', 'O'];
+const TRACKS: readonly string[] = ['S', 'T', 'F', 'O', 'OP', 'MK', 'TC', 'UX'];
 
 function required(value: string, name: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`);
@@ -86,10 +89,12 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
     ? { skipped: true as const, reason: safe(single(input.recommendation.reason, 'skip reason')) }
     : { option: input.recommendation.option, why: safe(single(input.recommendation.why, 'recommendation why')) };
   if ('option' in recommendation && !options.some(o => o.key === recommendation.option)) throw new Error('recommended option not found');
-  if (input.resume && !/^auq:[0-9a-z]+:[0-9a-z]{5}(?![\s\S])/.test(input.resume.questionId)) throw new Error('invalid resume questionId');
+  if (input.resume && !/^(?:auq:[0-9a-z]+:[0-9a-z]{5}|execution:[A-Za-z0-9_-]+:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![\s\S])/.test(input.resume.questionId)) throw new Error('invalid resume questionId');
   const resume = input.resume ? { questionId: input.resume.questionId,
     ...(input.resume.runId === undefined ? {} : { runId: single(input.resume.runId, 'resume runId') }) } : undefined;
+  if (input.pendingQuestion !== undefined) required(input.pendingQuestion, 'pending question');
   return { ...input, title, scqa: { s, c, ...(q ? { q } : {}), ...(a ? { a } : {}) }, options, recommendation,
+    ...(input.pendingQuestion === undefined ? {} : { pendingQuestion: safe(input.pendingQuestion) }),
     ...(resume ? { resume } : {}),
     raisedBy: { agent: safe(single(input.raisedBy.agent, 'agent')), ...(input.raisedBy.track ? { track: input.raisedBy.track } : {}), ...(input.raisedBy.session ? { session: safe(single(input.raisedBy.session, 'session')) } : {}) },
     ...(input.refs ? { refs: input.refs.map(r => safe(single(r, 'ref'))) } : {}),
@@ -263,13 +268,16 @@ export class DecisionLedger {
       if (!pending.ok) throw new Error(pending.error);
       const target = pending.questions.find(item => item.id === questionId);
       if (!target || target.questions.length !== 1 || !target.questions[0]?.id) throw new Error('pending question target not found or ambiguous');
+      if (questionId.startsWith('execution:') && (!runId || target.runId !== runId || !questionId.startsWith(`execution:${runId}:`))) throw new Error('pending question run differs from decision');
+      if (!questionId.startsWith('execution:') && runId !== undefined && target.runId !== undefined && target.runId !== runId) throw new Error('pending question run differs from decision');
+      if (target.expiresAt && Date.parse(target.expiresAt) <= this.now().getTime()) throw new Error('pending question expired');
       const question = target.questions[0];
       if (question.options.length !== entry.options.length || question.options.some((option, index) =>
         entry.options[index]?.key !== String.fromCharCode(97 + index) || entry.options[index]?.label !== option.label)) {
         throw new Error('pending question options differ from decision');
       }
       const answerKey = question.id;
-      const answer = { id: questionId, result: { answers: { [answerKey]: `${entry.choice}) ${label}` },
+      const answer = { id: questionId, result: { answers: { [answerKey]: questionId.startsWith('execution:') ? label : `${entry.choice}) ${label}` },
         ...(entry.note ? { otherText: { [answerKey]: entry.note } } : {}) } };
       const existing = readPendingQuestionAnswer(questionId, deps);
       if (!existing.ok) throw new Error('existing answer unreadable');

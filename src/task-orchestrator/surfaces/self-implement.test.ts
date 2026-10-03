@@ -27,7 +27,7 @@ async function assertDefaultSpawnBin(cwd: string, expectedBin: string, expectedB
   const shimDir = mkdtempSync(join(tmpdir(), 'self-implement-bun-shim-'));
   const capturePath = join(shimDir, 'spawn.txt');
   const bunShim = join(shimDir, 'bun');
-  writeFileSync(bunShim, '#!/bin/sh\nprintf "%s\\n%s\\n" "$PWD" "$1" > "$ELANOUS_TEST_SPAWN_CAPTURE"\n');
+  writeFileSync(bunShim, '#!/bin/sh\nprintf "%s\\n%s\\n%s\\n%s\\n" "$PWD" "$1" "$4" "$(cat "$5")" > "$ELANOUS_TEST_SPAWN_CAPTURE"\n');
   chmodSync(bunShim, 0o755);
   const launches: Array<{ bin: unknown; binSource: unknown }> = [];
   const logSpy = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data?: Record<string, unknown>) => {
@@ -42,7 +42,9 @@ async function assertDefaultSpawnBin(cwd: string, expectedBin: string, expectedB
     process.chdir(cwd);
     const { done } = defaultSelfImplementSpawn()({ feature: 'verify bin root', spaceId: 'test-space' });
     await done;
-    expect(readFileSync(capturePath, 'utf8').trim().split('\n')).toEqual([realpathSync(cwd), expectedBin]);
+    const [spawnCwd, entry, option, path] = readFileSync(capturePath, 'utf8').trim().split('\n');
+    expect([spawnCwd, entry, option]).toEqual([realpathSync(cwd), expectedBin, '--feature-file']);
+    expect(path).toBe('verify bin root');
     expect(launches).toEqual([{ bin: expectedBin, binSource: expectedBinSource }]);
   } finally {
     process.chdir(originalCwd);
@@ -171,6 +173,20 @@ describe('self-implement surface adapter (S1 · parallel self-dev)', () => {
     expect(seen!.draft).toBe(false);
     // space id is derived from the task id → distinct per job.
     expect(seen!.spaceId).toContain(task.id.replace('task:', ''));
+  });
+
+  test('a task surface forwards its after goal ID or PR number to the Pod spawn input', async () => {
+    const seen: Array<string | number | undefined> = [];
+    const spawn: SelfImplementJobSpawn = (input) => {
+      seen.push(input.after);
+      return { address: 'self-impl:after', done: Promise.resolve({ exitCode: 0, output: '' }) };
+    };
+    const adapter = createSelfImplementAdapter({ spawn });
+    for (const after of ['goal-before', 123]) {
+      await (await adapter(makeTask('dependent', { after }), {})).promise;
+    }
+    await (await adapter(makeTask('independent'), {})).promise;
+    expect(seen).toEqual(['goal-before', 123, undefined]);
   });
 
   test('production spawn falls back to this elanous bin outside a git repository', async () => {

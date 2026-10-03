@@ -2,11 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { debug } from '../debug/log.js';
+import { publishInsideEvent } from '../nexus/api/inside-events.js';
 import { redactSecrets } from '../task-cards/card-store.js';
+import { preLaunchGate, type PreLaunchGateDecision } from '../execution-loop/launch-gate.js';
+import type { BudgetDecision } from '../self-implement/budget-gate.js';
 import type { ScheduledDecision, StewardSettings, TriageIssue } from './triage.js';
 
 /** `completed` = the run finished without a merge (a non-code artifact, or nothing to deliver) — never reported as a failure. */
-export type LaunchStatus = 'shadow' | 'launched' | 'skipped-budget' | 'failed' | 'running' | 'merged' | 'completed';
+export type LaunchStatus = 'shadow' | 'launched' | 'skipped-budget' | 'blocked-duplicate' | 'blocked-location' | 'failed' | 'running' | 'merged' | 'completed';
 export interface LaunchEntry {
   issue: string;
   title: string;
@@ -40,12 +43,14 @@ export interface LaunchDeps {
   /** Injected command boundary; the production adapter runs only argv, never a shell. */
   command?: (args: string[]) => { exitCode: number; stdout: string; stderr?: string };
   spawn?: (args: string[], log: string) => { pid: number };
+  gate?: (goalId: string, budget: BudgetDecision | 'unknown') => PreLaunchGateDecision;
 }
 
 const RUN_ID = /\brun-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
 const DEFAULT_POOL = 'pool-node-b@node-b:8';
 // `harness budget --json` outcomes: proceed | next-provider | wait-reset | stop. next-provider still runs (the harness switches provider itself).
 const BUDGET_PROCEED: readonly string[] = ['proceed', 'next-provider'];
+const launchMode = (settings: StewardSettings): 'off' | 'shadow' | 'live' => settings.mode ?? settings.launch ?? 'shadow';
 const cli = (args: string[]) => ['bun', 'bin/elanous.mjs', ...(process.env.NODE_ENV === 'test' ? ['--test'] : []), ...args];
 const sourceOf = (issue: TriageIssue): string => /^출처: (telegram|pwa|tui|cli)$/m.exec(issue.body)?.[1] ?? `linear:${issue.identifier}`;
 const promptOf = (issue: TriageIssue): string => `${issue.title}\n${issue.body.slice(0, 1500)}`;
@@ -83,10 +88,10 @@ export function planLaunches(rows: ScheduledDecision[], issues: TriageIssue[], l
     const issue = byId.get(row.issue);
     if (!issue) continue;
     if (row.rung === 'hitl' || row.hitlReason || row.disposition === 'hitl') {
-      if (settings.launch !== 'off' && (!ledger.hitl[row.issue] || settings.launch === 'live' && !ledger.hitl[row.issue].attempted)) hitl.push({ issue, row });
+      if (launchMode(settings) !== 'off' && (!ledger.hitl[row.issue] || launchMode(settings) === 'live' && !ledger.hitl[row.issue].attempted)) hitl.push({ issue, row });
       continue;
     }
-    if ((settings.launch ?? 'shadow') === 'off' || row.disposition !== 'now' || row.rung !== 4 || (ledger.launches[row.issue] && ledger.launches[row.issue].status !== 'skipped-budget' && !(settings.launch === 'live' && ledger.launches[row.issue].status === 'shadow')) || launches.length >= available) continue;
+    if (launchMode(settings) === 'off' || row.disposition !== 'now' || row.rung !== 4 || (ledger.launches[row.issue] && !['skipped-budget', 'blocked-duplicate', 'blocked-location'].includes(ledger.launches[row.issue].status) && !(launchMode(settings) === 'live' && ledger.launches[row.issue].status === 'shadow')) || launches.length >= available) continue;
     const args = argvFor(issue, settings);
     launches.push({ issue, row, source: sourceOf(issue), command: args.map(arg => JSON.stringify(arg)).join(' ') });
   }
@@ -118,37 +123,46 @@ function lastJson(stdout: string): Record<string, unknown> {
 /** One issue is reserved before any side effect; budget skips are retriable, never counted as a launch. */
 export function launch(item: LaunchItem, deps: LaunchDeps): LaunchEntry {
   const { ledger, settings, root } = deps;
-  if (item.row.rung !== 4 || item.row.hitlReason || item.row.disposition !== 'now' || (ledger.launches[item.issue.identifier] && ledger.launches[item.issue.identifier].status !== 'skipped-budget' && !(settings.launch === 'live' && ledger.launches[item.issue.identifier].status === 'shadow'))) throw new Error('steward launch is not eligible');
-  if (settings.launch === 'off') throw new Error('steward launch is off');
+  if (item.row.rung !== 4 || item.row.hitlReason || item.row.disposition !== 'now' || (ledger.launches[item.issue.identifier] && !['skipped-budget', 'blocked-duplicate', 'blocked-location'].includes(ledger.launches[item.issue.identifier].status) && !(launchMode(settings) === 'live' && ledger.launches[item.issue.identifier].status === 'shadow'))) throw new Error('steward launch is not eligible');
+  if (launchMode(settings) === 'off') throw new Error('steward launch is off');
   const key = item.issue.identifier;
   const entry: LaunchEntry = { issue: key, title: redactSecrets(item.issue.title), source: item.source, command: redactSecrets(item.command), status: 'shadow' };
-  if (settings.launch !== 'live') {
+  if (launchMode(settings) !== 'live') {
     ledger.launches[key] = entry;
     saveLaunchLedger(root, ledger);
     debug.log('steward.launch', 'shadow', { issue: key, command: entry.command });
+    publishInsideEvent({ kind: 'steward', issue: key, status: entry.status });
     return entry;
   }
   const command = deps.command ?? runCommand;
-  try {
-    const budget = command(cli(['harness', 'budget', '--json']));
-    const decision = budget.exitCode === 0 ? lastJson(budget.stdout) : {};
-    if (!BUDGET_PROCEED.includes(String(decision.outcome))) {
-      entry.status = 'skipped-budget';
-      entry.reason = redactSecrets(budget.exitCode === 0 ? JSON.stringify(decision.reasons ?? ['budget unavailable']) : budget.stderr ?? 'budget unavailable');
-      // A budget skip may be reconsidered on the next cycle, but the reason remains observable now.
-      ledger.launches[key] = entry;
-      saveLaunchLedger(root, ledger);
-      debug.log('steward.launch', 'skipped-budget', { issue: key, reason: entry.reason });
-      return entry;
-    }
-  } catch (error) {
-    entry.status = 'skipped-budget';
-    entry.reason = redactSecrets(String(error));
+  const blocked = (status: LaunchStatus, reason: string): LaunchEntry => {
+    entry.status = status;
+    entry.reason = redactSecrets(reason);
     ledger.launches[key] = entry;
     saveLaunchLedger(root, ledger);
-    debug.log('steward.launch', 'skipped-budget', { issue: key, reason: entry.reason });
+    debug.log('steward.launch', status, { issue: key, reason: entry.reason });
+    publishInsideEvent({ kind: 'steward', issue: key, status: entry.status, reason: entry.reason });
     return entry;
+  };
+  // L6: a launch must remain on the isolated Pod pool, never fall back to the host or another substrate.
+  if (!/^[a-zA-Z0-9_-]+(?:@[a-zA-Z0-9._-]+(?::[1-9][0-9]*)?)?$/.test(settings.podPool ?? DEFAULT_POOL))
+    return blocked('blocked-location', 'invalid steward pod pool');
+  let budget: BudgetDecision | 'unknown' = 'unknown';
+  try {
+    const result = command(cli(['harness', 'budget', '--json']));
+    const decision = result.exitCode === 0 ? lastJson(result.stdout) : {};
+    if (!BUDGET_PROCEED.includes(String(decision.outcome)))
+      return blocked('skipped-budget', result.exitCode === 0 ? JSON.stringify(decision.reasons ?? ['budget unavailable']) : result.stderr ?? 'budget unavailable');
+    budget = { action: decision.outcome as 'proceed' | 'next-provider', reasons: Array.isArray(decision.reasons) ? decision.reasons.map(String) : [] };
+  } catch (error) {
+    return blocked('skipped-budget', String(error));
   }
+  // L6: the shared gate checks active same-goal runs and the budget decision immediately before spawn.
+  let gate: PreLaunchGateDecision;
+  try { gate = (deps.gate ?? ((goalId, decision) => preLaunchGate({ goalId, budget: decision })))(`linear:${key}`, budget); }
+  catch (error) { return blocked('blocked-duplicate', `launch gate unavailable: ${String(error)}`); }
+  if (gate.action !== 'proceed' || gate.sameGoalActiveRuns === 'unknown')
+    return blocked(gate.action === 'blocked-budget' || gate.action === 'wait-reset' ? 'skipped-budget' : 'blocked-duplicate', gate.sameGoalActiveRuns === 'unknown' ? 'active runs unknown' : gate.reason);
   entry.status = 'launched';
   entry.log = join(root, 'steward', 'launch', `${key.replace(/[^a-zA-Z0-9_-]/g, '_')}.log`);
   mkdirSync(join(root, 'steward', 'launch'), { recursive: true });
@@ -166,15 +180,16 @@ export function launch(item: LaunchItem, deps: LaunchDeps): LaunchEntry {
   }
   saveLaunchLedger(root, ledger);
   debug.log('steward.launch', 'launched', { issue: key, runId: entry.runId, pid: entry.pid, status: entry.status });
+  publishInsideEvent({ kind: 'steward', issue: key, status: entry.status, ...(entry.runId ? { runId: entry.runId } : {}) });
   return entry;
 }
 
 export function raiseHitl(issue: TriageIssue, row: ScheduledDecision, deps: LaunchDeps): HitlEntry {
   const old = deps.ledger.hitl[issue.identifier];
-  if (old && (old.attempted || deps.settings.launch !== 'live')) return old;
+  if (old && (old.attempted || launchMode(deps.settings) !== 'live')) return old;
   const entry: HitlEntry = old ?? { issue: issue.identifier, reason: redactSecrets(row.hitlReason ?? row.why), raised: false };
   deps.ledger.hitl[issue.identifier] = entry;
-  if (deps.settings.launch !== 'live') {
+  if (launchMode(deps.settings) !== 'live') {
     saveLaunchLedger(deps.root, deps.ledger);
     return entry;
   }
@@ -199,10 +214,10 @@ function alive(pid: number | undefined): boolean {
 }
 
 export function collectOutcomes(ledger: LaunchLedger, deps: LaunchDeps): LaunchEntry[] {
-  if (deps.settings.launch !== 'live') return [];
+  if (launchMode(deps.settings) !== 'live') return [];
   const done: LaunchEntry[] = [];
   for (const entry of Object.values(ledger.launches)) {
-    if (entry.reported || entry.status === 'shadow' || entry.status === 'skipped-budget') continue;
+    if (entry.reported || entry.status === 'shadow' || entry.status === 'skipped-budget' || entry.status === 'blocked-duplicate' || entry.status === 'blocked-location') continue;
     if (!entry.runId && entry.log) {
       try { entry.runId = readFileSync(entry.log, 'utf8').match(RUN_ID)?.[0]; } catch { /* Wait for log. */ }
     }
@@ -244,6 +259,7 @@ export function collectOutcomes(ledger: LaunchLedger, deps: LaunchDeps): LaunchE
     if (entry.status === 'running') continue;
     done.push(entry);
     debug.log('steward.launch', 'outcome', { issue: entry.issue, status: entry.status, runId: entry.runId, prNumber: entry.prNumber });
+    publishInsideEvent({ kind: 'steward', issue: entry.issue, status: entry.status, ...(entry.runId ? { runId: entry.runId } : {}) });
   }
   saveLaunchLedger(deps.root, ledger);
   return done;

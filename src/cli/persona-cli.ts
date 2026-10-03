@@ -1,4 +1,4 @@
-// PS1 — `elanous persona list|add|show`: 프리셋(persona-presets/)을 보고, 골라서 «내 페르소나»를 만들고, 만든 것을 본다.
+// `elanous persona list|add|edit|show`: 프리셋을 보고, 내 페르소나를 만들고 꾸민다.
 // 만든 페르소나는 기존 페르소나 저장소(resolveStatePersonaDir · Discord·PWA 가 읽는 곳)의 `<id>.yaml` 한 파일이다.
 import type { Command } from 'commander';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -7,7 +7,8 @@ import { parse as parseYaml } from 'yaml';
 import { debug } from '../debug/log.js';
 import { parsePersonaYaml } from '../persona/loader.js';
 import { resolveRepositoryPersonaDir, resolveStatePersonaDir } from '../persona/global-registry.js';
-import { choosePersonaId, describePreset, findPreset, loadPresetIndex, loadPresets, presetToProfileYaml } from '../persona/presets.js';
+import { choosePersonaId, clonePreset, describePreset, editPersona, findPreset, loadPresetIndex, loadPresets, presetToProfileYaml } from '../persona/presets.js';
+import { addTeamSet, listTeamSets, removeTeamSet } from '../persona/team-set.js';
 
 interface StoredPersona { personaId: string; displayName: string; description?: string; preset?: string; title?: string; path: string }
 
@@ -36,8 +37,52 @@ function takenIds(stateDir: string): Set<string> {
   return ids;
 }
 
+function mapping(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function setEdit(edits: Record<string, unknown>, assignment: string): void {
+  const equals = assignment.indexOf('=');
+  if (equals < 1) throw new Error(`--set requires key=value: ${assignment}`);
+  const key = assignment.slice(0, equals);
+  const parts = key.split('.');
+  if (parts.some((part) => !part || ['__proto__', 'prototype', 'constructor'].includes(part))) {
+    throw new Error(`invalid --set key: ${key}`);
+  }
+  const value: unknown = parseYaml(assignment.slice(equals + 1));
+  let target = edits;
+  for (const part of parts.slice(0, -1)) {
+    if (!Object.hasOwn(target, part)) target[part] = {};
+    if (!mapping(target[part])) throw new Error(`--set key conflicts with a scalar: ${key}`);
+    target = target[part];
+  }
+  target[parts.at(-1)!] = value;
+}
+
+function editOptions(fromFile: string | undefined, assignments: readonly string[]): Record<string, unknown> {
+  const parsed: unknown = fromFile ? parseYaml(readFileSync(fromFile, 'utf8')) : {};
+  if (!mapping(parsed)) throw new Error('--from-file must contain a YAML mapping');
+  const edits = { ...parsed };
+  for (const assignment of assignments) setEdit(edits, assignment);
+  return edits;
+}
+
 export function registerPersonaCommands(program: Command): void {
-  const persona = program.command('persona').description('Persona presets — AI coworkers you pick and customise (list · add · show)');
+  const team = program.command('team-set').description('Install, remove and list persona team sets');
+  team.command('add <file>').description('Install a YAML team set').action((file: string) => {
+    try { const result = addTeamSet(file); console.log(`Installed team-set ${result['team-set']}`); }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  });
+  team.command('remove <name>').description('Remove an installed team set').action((name: string) => {
+    try { removeTeamSet(name); console.log(`Removed team-set ${name}`); }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  });
+  team.command('list').description('List installed team sets').action(() => {
+    try { for (const item of listTeamSets()) console.log(`${item['team-set']}  ${item.members.map((member) => `${member.persona} (${member.title})`).join(', ')}`); }
+    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+  });
+
+  const persona = program.command('persona').description('Persona presets — AI coworkers you pick and customise (list · add · edit · show)');
 
   persona.command('list')
     .description('List the persona presets, then the personas you have made')
@@ -63,14 +108,32 @@ export function registerPersonaCommands(program: Command): void {
   persona.command('add <preset>')
     .description('Make your own persona from a preset (id, name or role) — the preset file is not changed')
     .option('--name <name>', 'What to call it (default: the preset’s first name)')
+    .option('--as <name>', 'Clone this preset under a new, unique name')
     .option('--title <title>', 'Optional title, e.g. CMO')
     .option('--json', 'JSON output')
-    .action((query: string, opts: { name?: string; title?: string; json?: boolean }) => {
+    .action((query: string, opts: { name?: string; as?: string; title?: string; json?: boolean }) => {
       const presets = loadPresets();
       const preset = findPreset(presets, query);
       if (!preset) {
         console.error(`프리셋 «${query}» 을 찾지 못했습니다. 있는 것: ${presets.map((p) => p.personaId).join(', ')}`);
         process.exitCode = 1;
+        return;
+      }
+      if (opts.as !== undefined) {
+        try {
+          if (opts.name !== undefined || opts.title !== undefined) throw new Error('--as cannot be combined with --name or --title');
+          const result = clonePreset(preset, opts.as);
+          debug.log('persona.cli', 'cloned', { preset: preset.personaId, personaId: result.personaId });
+          if (opts.json) console.log(JSON.stringify({ personaId: result.personaId, displayName: result.displayName, preset: preset.personaId, path: result.path }, null, 2));
+          else {
+            console.log(`만들었습니다 — ${result.displayName} (id ${result.personaId} · 프리셋 ${preset.personaId})`);
+            console.log(`  처음 묻는 것: ${preset.firstQuestions.join(' / ')}`);
+            console.log(`  보기: elanous persona show ${result.personaId}`);
+          }
+        } catch (err) {
+          console.error(err instanceof Error ? err.message : String(err));
+          process.exitCode = 1;
+        }
         return;
       }
       const dir = resolveStatePersonaDir();
@@ -87,6 +150,29 @@ export function registerPersonaCommands(program: Command): void {
       console.log(`만들었습니다 — ${check.profile.displayName} (id ${personaId} · 프리셋 ${preset.personaId})`);
       console.log(`  처음 묻는 것: ${preset.firstQuestions.join(' / ')}`);
       console.log(`  보기: elanous persona show ${personaId}`);
+    });
+
+  persona.command('edit <name>')
+    .description('Edit a saved persona (schema fields only; the preset source is not changed)')
+    .option('--set <key=value>', 'Set a field (repeatable; YAML values)', (value: string, values: string[]) => [...values, value], [] as string[])
+    .option('--from-file <path>', 'Load edits from a YAML mapping')
+    .option('--dry-run', 'Validate and preview without writing')
+    .option('--json', 'JSON output')
+    .action((name: string, opts: { set: string[]; fromFile?: string; dryRun?: boolean; json?: boolean }) => {
+      try {
+        if (!opts.fromFile && !opts.set.length) throw new Error('persona edit requires --set or --from-file');
+        const result = editPersona(name, editOptions(opts.fromFile, opts.set), { dryRun: opts.dryRun });
+        debug.log('persona.cli', opts.dryRun ? 'edit-dry-run' : 'edited', { personaId: result.personaId });
+        if (opts.json) console.log(JSON.stringify(result, null, 2));
+        else {
+          console.log(`${opts.dryRun ? '미리 보기' : '수정했습니다'} — ${result.displayName} (id ${result.personaId})`);
+          console.log(result.yaml);
+          console.log(`  파일: ${result.path}`);
+        }
+      } catch (err) {
+        console.error(err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+      }
     });
 
   persona.command('show <name>')

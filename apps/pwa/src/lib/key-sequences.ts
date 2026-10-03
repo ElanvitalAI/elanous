@@ -1,13 +1,13 @@
 // WT-X-1 — ANSI escape sequence builder for the mobile modifier bar.
 //
 // Pure functions only — no React, no globals. Given a logical key
-// (Esc / Tab / arrow) plus an optional modifier state (Ctrl / Alt),
+// (Esc / Tab / arrow / Page Up / Page Down) plus an optional modifier state (Ctrl / Alt),
 // produce the byte sequence iPad PWA users expect when typing on a
 // physical keyboard.
 //
 // Why a separate module: keeping the sequence map declarative makes
 // it trivial to (1) unit-test against the xterm/VT220 reference,
-// (2) extend with F-keys / Page Up/Down later (BACKLOG v2), and
+// (2) extend with F-keys later, and
 // (3) reuse from any future caller (voice macro · skill · ⌘K
 // palette) without dragging the React component along.
 //
@@ -17,7 +17,7 @@
 //   2 = Shift · 3 = Alt · 4 = Shift+Alt · 5 = Ctrl ·
 //   6 = Shift+Ctrl · 7 = Alt+Ctrl · 8 = Shift+Alt+Ctrl
 
-export type ModifierKey = 'esc' | 'tab' | 'up' | 'down' | 'left' | 'right';
+export type ModifierKey = 'esc' | 'tab' | 'up' | 'down' | 'left' | 'right' | 'pageup' | 'pagedown';
 
 export interface ModifierState {
   ctrl: boolean;
@@ -57,7 +57,8 @@ const ARROW_FINAL: Record<'up' | 'down' | 'left' | 'right', string> = {
  *    has no standard mapping; passthrough as plain Esc).
  *  - Tab: `\x09` plain · `\x1b\x09` with Alt · Ctrl ignored (Ctrl+Tab
  *    is browser-reserved; Ctrl+I is just Tab itself anyway).
- *  - Arrows: `\x1b[A/B/C/D` plain · `\x1b[1;<mod>A/B/C/D` with any
+	 *  - Page Up/Down: `\x1b[5~` / `\x1b[6~` plain · CSI modifier when active.
+	 *  - Arrows: `\x1b[A/B/C/D` plain · `\x1b[1;<mod>A/B/C/D` with any
  *    modifier (Ctrl=5, Alt=3, Ctrl+Alt=7).
  */
 export function buildKeySequence(key: ModifierKey, modifiers: ModifierState = NO_MODIFIERS): string {
@@ -68,6 +69,12 @@ export function buildKeySequence(key: ModifierKey, modifiers: ModifierState = NO
       return modifiers.alt ? '\x1b\x1b' : '\x1b';
     case 'tab':
       return modifiers.alt ? '\x1b\x09' : '\x09';
+    case 'pageup':
+    case 'pagedown': {
+      const number = key === 'pageup' ? 5 : 6;
+      const mod = csiModifier(modifiers);
+      return mod === null ? `\x1b[${number}~` : `\x1b[${number};${mod}~`;
+    }
     case 'up':
     case 'down':
     case 'left':

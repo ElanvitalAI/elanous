@@ -3,8 +3,9 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { writeStdoutJson } from '../cli/stdout-json.js';
+import type { GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { debug } from '../debug/log.js';
-import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, runGraph, type GraphRunState } from './runner.js';
+import { decideGraphApproval, graphRunAlive, lastJsonObject, latestGraphRun, listGraphRuns, manageGraphRun, runGraph, type GraphRunState } from './runner.js';
 
 function findGraphFile(graphId: string): string | undefined {
   const roots = [resolve('graphs'), resolve(import.meta.dir, '../../graphs')];
@@ -53,6 +54,43 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
         if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;
       } catch (error) {
         console.error(`graph run: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+    });
+  graph.command('variant <template>')
+    .description('Validate and run a graph variant, preserving the resulting graph beside its run ledger')
+    .requiredOption('--plan <json>', 'JSON variant plan (maxVisits, routes, or growth)')
+    .option('--dry-run', 'Walk the variant without executing commands')
+    .option('--run', 'Execute the validated variant')
+    .option('--json', 'Print run state as JSON')
+    .action(async (file: string, opts: { plan: string; dryRun?: boolean; run?: boolean; json?: boolean }) => {
+      try {
+        if (opts.dryRun === opts.run) throw new Error('choose exactly one of --dry-run or --run');
+        let plan: unknown;
+        try { plan = JSON.parse(opts.plan); } catch { throw new Error('--plan must be a JSON object'); }
+        if (!plan || typeof plan !== 'object' || Array.isArray(plan) ||
+          Object.keys(plan).some(key => !['maxVisits', 'routes', 'growth'].includes(key)) ||
+          (plan as Record<string, unknown>).maxVisits !== undefined &&
+            (typeof (plan as Record<string, unknown>).maxVisits !== 'object' || (plan as Record<string, unknown>).maxVisits === null || Array.isArray((plan as Record<string, unknown>).maxVisits)) ||
+          (plan as Record<string, unknown>).routes !== undefined && (!Array.isArray((plan as Record<string, unknown>).routes) ||
+            !(plan as { routes: unknown[] }).routes.every(route => route !== null && typeof route === 'object' && !Array.isArray(route) &&
+              typeof (route as Record<string, unknown>).from === 'string' && typeof (route as Record<string, unknown>).to === 'string' &&
+              typeof (route as Record<string, unknown>).outcome === 'string')) ||
+          (plan as Record<string, unknown>).growth !== undefined &&
+            (!(plan as Record<string, unknown>).growth || typeof (plan as Record<string, unknown>).growth !== 'object' ||
+              Array.isArray((plan as Record<string, unknown>).growth) ||
+              !(plan as { growth: Record<string, unknown> }).growth.node ||
+              typeof (plan as { growth: Record<string, unknown> }).growth.from !== 'string' ||
+              typeof (plan as { growth: Record<string, unknown> }).growth.outcome !== 'string')) {
+          throw new Error('--plan must be a JSON variant plan');
+        }
+        await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
+        const state = await runGraph(file, { dryRun: opts.dryRun, variant: { goal: 'g_graph_variant', plan: plan as GraphVariantPlan }, deps: { root: runsDeps.root } });
+        if (opts.json) await writeStdoutJson(JSON.stringify(state) + '\n');
+        else console.log(`${state.graphId} ${state.runId}: ${state.status} (${state.path.join(' → ')}, executed: ${state.executed})`);
+        if (state.status !== 'done' && state.status !== 'awaiting-approval') process.exitCode = 1;
+      } catch (error) {
+        console.error(`graph variant: ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;
       }
     });
@@ -139,6 +177,28 @@ export function registerGraphCommands(program: Command, runsDeps: { root?: strin
         process.exitCode = 1;
       }
     });
+  for (const action of ['stop', 'destroy'] as const) {
+    runs.command(`${action} <run_id>`)
+      .description(action === 'stop' ? 'Fail a running or orphaned run so it can be resumed' : 'Stop and delete a run and its owned artifacts')
+      .action(async (runId: string) => {
+        try {
+          // Without the sink the stop/destroy observation lines never reach the log store (only `graph run` had it).
+          await (await import('../domains/standalone-log-sink.js')).registerStandaloneLogSink('graph');
+          if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId) || runId === '.' || runId === '..') throw new Error(`invalid run id: ${runId}`);
+          const { runs: all, unreadable } = listGraphRuns(runsDeps.root);
+          const exact = all.filter(state => state.runId === runId);
+          const matches = exact.length ? exact : all.filter(state => state.runId.startsWith(runId));
+          if (matches.length !== 1) throw new Error(matches.length ? `ambiguous run id: ${runId}\n${matches.map(state => `${state.graphId}/${state.runId}`).join('\n')}` : `no run: ${runId}`);
+          const saved = matches[0]!;
+          const state = manageGraphRun(saved.graphId, saved.runId, action, runsDeps.root, runsDeps.processStartMs);
+          console.log(`${state.graphId} ${state.runId}: ${action === 'stop' ? state.status : 'destroyed'}`);
+          warning(unreadable);
+        } catch (error) {
+          console.error(`graph runs ${action}: ${error instanceof Error ? error.message : String(error)}`);
+          process.exitCode = 1;
+        }
+      });
+  }
   runs.command('resume <run_id>')
     .option('--from <node_id>', 'Restart at this node on the saved path')
     .option('--use-current-graph', 'Use the installed graph and enforce the original hash')

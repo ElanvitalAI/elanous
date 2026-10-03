@@ -1,5 +1,19 @@
 import { describe, expect, test } from 'bun:test';
-import { dispatchTouchWheel, touchScrollAction, touchScrollLines, touchWheelLines } from './touch-scroll';
+import { dispatchTouchWheel, historyAction, touchScrollAction, touchScrollLines, touchWheelLines } from './touch-scroll';
+
+test('history tap chooses tmux copy mode + Page Up in alternate buffer, regardless of mouse tracking', () => {
+  for (const mouseTracking of ['none', 'any', 'x10']) {
+    expect(historyAction({ bufferType: 'alternate', mouseTracking }))
+      .toEqual({ kind: 'send', data: '\x02[\x1b[5~' });
+  }
+});
+
+test('history tap scrolls a page locally in normal buffer', () => {
+  for (const mouseTracking of ['none', 'any']) {
+    expect(historyAction({ bufferType: 'normal', mouseTracking }))
+      .toEqual({ kind: 'scroll-pages', pages: -1 });
+  }
+});
 
 describe('touchScrollLines — 손가락 끌기 → 스크롤백 줄 수', () => {
   const base = { startY: 300, cellHeight: 15, startViewportY: 2960, currentViewportY: 2960 };

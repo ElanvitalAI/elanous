@@ -73,7 +73,23 @@ export function registerConnectCommand(program: Command): void {
 }
 
 export function registerSkillsCommands(program: Command): void {
-  const skills = program.command('skills').description('Check and repair installed skills');
+  const skills = program.command('skills').description('Check, install and repair skills');
+  skills.command('install <pack>')
+    .description('Install a gift skill pack from a code')
+    .option('--code <code>', 'Gift code')
+    .option('--email <address>', 'Email for gift delivery')
+    .option('--agree', 'Agree to email collection and retention')
+    .option('--endpoint <url>', 'Gift API origin (overrides skills.giftEndpoint)')
+    .option('--json', 'Print the install result as JSON')
+    .action(async (pack: string, opts: { code?: string; email?: string; agree?: boolean; endpoint?: string; json?: boolean }) => {
+      const { getUserConfig } = await import('../user-config.js');
+      const { installGiftPack } = await import('../skills/gift-install.js');
+      const result = await installGiftPack({ pack, code: opts.code, email: opts.email, agree: opts.agree,
+        endpoint: opts.endpoint ?? getUserConfig().skills.giftEndpoint });
+      if (opts.json) console.log(JSON.stringify(result));
+      else console.log(result.message);
+      if (!result.ok) process.exitCode = 1;
+    });
   skills.command('sources')
     .description('List every skill folder elanous reads, in order (preset · shared · connected · package)')
     .option('--json', 'JSON output')

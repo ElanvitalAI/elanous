@@ -922,7 +922,7 @@ test('dashboard catalog and registry stay synchronized except for the recorded d
   for (const name of registered) {
     if (!registeredOnly.has(name)) expect(listed).toContain(name);
   }
-  for (const name of ['harness', 'status', 'st']) {
+  for (const name of ['harness', 'status', 'st', 'now']) {
     expect(listed).toContain(name);
     expect(registered).toContain(name);
   }

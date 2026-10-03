@@ -6,6 +6,7 @@ const IMPORTER_TEST_DISPLAY_LIMIT = 20;
 
 export interface ImporterTestIndex {
   readonly testsBySource: ReadonlyMap<string, readonly string[]>;
+  readonly testPaths?: readonly string[];
   readonly unresolvedRelativeSpecifiers: number;
 }
 
@@ -105,7 +106,7 @@ export function buildImporterTestIndex(cwd: string, testPaths: readonly string[]
       testsBySource.set(source, importers);
     }
   }
-  return { testsBySource, unresolvedRelativeSpecifiers };
+  return { testsBySource, testPaths, unresolvedRelativeSpecifiers };
 }
 
 export function importerTestsNotInRunSet(

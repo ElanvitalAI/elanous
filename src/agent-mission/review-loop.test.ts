@@ -82,6 +82,48 @@ describe('review-loop 분류 실패와 심판 범위 관측', () => {
     return '';
   };
 
+  test('light clean review of a release PR does not approve or auto-merge', async () => {
+    const calls: string[] = [];
+    const path = 'graphs/release/loop.yaml';
+    const result = await runReviewLoop('5550', {
+      runGh: (args) => {
+        calls.push(args.join(' '));
+        if (args[0] === 'api') return JSON.stringify([[{ filename: path }]]);
+        if (args[0] === 'label' && args[1] === 'list') return '[]';
+        if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(source()) : reviewLoopFiles;
+        return '';
+      },
+      classify: async () => ({ verdict: 'ok', asks: [], reason: 'clean', classificationSource: 'llm' }),
+      autoMergeOnOk: true,
+      approve: () => { throw new Error('approval forbidden'); },
+    });
+    expect(result.action).toBe('parked');
+    expect(calls).toContain(`pr comment 5550 --body OP approval required: automatic merge held because this PR changes ${path}.`);
+    expect(calls.some((call) => call.startsWith('pr merge'))).toBe(false);
+  });
+
+  test.each(['scripts/release-loop/publish.ts', 'graphs/release/loop.yaml', 'src/release-loop/manifest.ts'])(
+    'light clean review holds a rename from %s even though the destination is unprotected', async (path) => {
+      const calls: string[] = [];
+      const result = await runReviewLoop('5550', {
+        runGh: (args) => {
+          calls.push(args.join(' '));
+          if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/ordinary.ts', status: 'renamed', previous_filename: path }]]);
+          if (args[0] === 'label' && args[1] === 'list') return '[]';
+          if (args[1] === 'view') return args.includes('reviews,comments,headRefName,title,body') ? JSON.stringify(source()) : reviewLoopFiles;
+          return '';
+        },
+        classify: async () => ({ verdict: 'ok', asks: [], reason: 'clean', classificationSource: 'llm' }),
+        autoMergeOnOk: true,
+        approve: () => { throw new Error('approval forbidden'); },
+      });
+      expect(result.action).toBe('parked');
+      expect(calls.some((call) => call.startsWith('pr merge'))).toBe(false);
+      expect(calls).toContain('pr edit 5550 --add-label elanous:release-path');
+      expect(calls).toContain(`pr comment 5550 --body OP approval required: automatic merge held because this PR changes ${path}.`);
+    },
+  );
+
   test('runReviewLoop의 classified 관측은 실패 사유와 failure source를 전달한다', async () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     const comments: string[] = [];
@@ -147,6 +189,29 @@ describe('review-loop 분류 실패와 심판 범위 관측', () => {
     }
   });
 
+  test.each(['scripts/release-loop/publish.ts', 'graphs/release/loop.yaml', 'src/release-loop/manifest.ts'])(
+    '2차 심판 자동 병합도 %s 변경 PR은 승인 대기로 보낸다', async (path) => {
+      const calls: string[] = [];
+      const result = await judgeAndFinalize('100', 'branch', [], {
+        autoMerge: true,
+        runGh: (args) => {
+          calls.push(args.join(' '));
+          if (args[0] === 'api') return JSON.stringify([[{ filename: path }]]);
+          if (args[0] === 'label' && args[1] === 'list') return '[]';
+          return '';
+        },
+        approve: () => { throw new Error('approval forbidden'); },
+        judge: async (): Promise<AcpJudgeResult> => ({ verdict: 'merge', asks: [], reason: 'clean', raw: '' }),
+      }, '', '/tmp', 1, false, 'light', [path]);
+      expect('rework' in result).toBe(false);
+      if ('rework' in result) throw new Error('expected final result');
+      expect(result.action).toBe('parked');
+      expect(calls).not.toContain('pr merge 100 --squash');
+      expect(calls).toContain('pr edit 100 --add-label elanous:release-path');
+      expect(calls).toContain(`pr comment 100 --body OP approval required: automatic merge held because this PR changes ${path}.`);
+    },
+  );
+
   test.each([
     ['자동 merge', 'merge', true, 'merged'],
     ['거절', 'reject', false, 'parked'],
@@ -158,6 +223,7 @@ describe('review-loop 분류 실패와 심판 범위 관측', () => {
     const result = await judgeAndFinalize('100', 'branch', ['ask'], {
       autoMerge,
       runGh: (args) => {
+        if (args[0] === 'api') return JSON.stringify([[{ filename: 'src/example.ts' }]]);
         if (args[1] === 'diff') return 'diff';
         if (args[1] === 'comment') comments.push(args[args.indexOf('--body') + 1]!);
         return '';

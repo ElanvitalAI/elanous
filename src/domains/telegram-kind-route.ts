@@ -1,22 +1,27 @@
 // 발송 목적(kind) → 텔레그램 채널 역할 · 대상. 가벼운 모듈(telegram.ts 를 import 하지 않는다 — outbound-alert 순환 방지).
-// 표에 없는 kind 는 undefined → 부르는 쪽이 폴백을 판정한다(투자 알림은 옛 reportChannel 유지).
+// 명시적으로 매매 kind 인 경우만 trading; 나머지는 system. 역할 채널이 없으면 다른 역할로 폴백하지 않는다.
 import type { UserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
 import { debug } from '../debug/log.js';
-import { channelForRole, resolveTelegramChannels } from './telegram-channels.js';
+import { resolveTelegramChannels } from './telegram-channels.js';
 
 export const DEFAULT_KIND_ROLES: Readonly<Record<string, string>> = {
+  report: 'report', alert: 'report', digest: 'report',
   intake: 'system', 'ops-report': 'system', 'ops-alert': 'system', 'ops-health': 'system',
-  regression: 'system', 'agent-mission': 'system',
+  regression: 'system', 'agent-mission': 'system', brief: 'system', 'op-report': 'system',
 };
 
-/** No channel mapping for an operational kind may cross into a different bot. */
+/** Only named finance delivery kinds can use the trading/report bot. */
+export function isTradingKind(kind?: string): boolean {
+  return kind === 'report' || kind === 'alert' || kind === 'digest';
+}
+
 export function isOperationalKind(kind?: string): boolean {
-  return kind?.startsWith('ops-') ?? false;
+  return !isTradingKind(kind);
 }
 
 export function mainHomeTarget(cfg: UserConfig): { botToken: string; chatId: number } | null {
-  const botToken = resolveChannelBotToken('telegram', cfg).token;
+  const botToken = operationsBotToken(cfg);
   const chatId = cfg.telegram.homeChannel ?? cfg.telegram.allowedUsers[0];
   return botToken && chatId != null && Number.isFinite(chatId) ? { botToken, chatId } : null;
 }
@@ -25,15 +30,48 @@ export function logKindRouteFallback(kind: string | undefined, to: 'report-chann
   try { debug.log('telegram.kind-route', 'fallback', { kind, to, sameBot }); } catch { /* logging must not prevent delivery */ }
 }
 
-export function roleForKind(cfg: UserConfig, kind?: string): string | undefined {
-  if (!kind) return undefined;
-  return cfg.telegram.kindRoles?.[kind] ?? DEFAULT_KIND_ROLES[kind];
+function operationsBotToken(cfg: UserConfig): string | undefined {
+  const main = resolveChannelBotToken('telegram', cfg);
+  const channels = cfg.telegram.channels?.length ? resolveTelegramChannels(cfg.telegram) : [];
+  const tradingTokens = new Set(channels.filter(c => c.roles.includes('report')).map(c => c.botToken));
+  // The report (trading) bot is never the operations bot — with or without a channels table (review must-fix · OUT1).
+  if (cfg.telegram.reportChannel?.botToken) tradingTokens.add(cfg.telegram.reportChannel.botToken);
+  if (main.source !== 'channels.main') return main.token && !tradingTokens.has(main.token) ? main.token : undefined;
+  // channels.main may mean "first channel", which can be the trading bot.
+  // Only a named operations channel (or the named main channel) with an
+  // operational role establishes identity; array order and role alone do not.
+  const tokens = new Set(channels
+    .filter(c => (c.name === 'ops' && c.roles.includes('system'))
+      || (c.name === 'main' && c.roles.some(r => r === 'system' || r === 'qa' || r === 'default')))
+    .filter(c => !tradingTokens.has(c.botToken))
+    .map(c => c.botToken));
+  return tokens.size === 1 ? tokens.values().next().value : undefined;
 }
 
-/** The channel for a purpose kind — only with explicit `telegram.channels` and a mapped role. */
+function isAllowedBot(cfg: UserConfig, kind: string | undefined, token: string): boolean {
+  const mainToken = operationsBotToken(cfg);
+  if (!mainToken) return false;
+  if (!isTradingKind(kind)) return token === mainToken;
+  const reportToken = cfg.telegram.reportChannel?.botToken;
+  return token !== mainToken && (!reportToken || token === reportToken);
+}
+
+export function roleForKind(cfg: UserConfig, kind?: string): string {
+  const fallback = isTradingKind(kind) ? 'report' : 'system';
+  if (!kind || !cfg.telegram.channels?.length) return fallback;
+  const override = cfg.telegram.kindRoles?.[kind];
+  if (!override) return fallback;
+  const channel = resolveTelegramChannels(cfg.telegram)
+    .find(c => c.roles.includes(override) && isAllowedBot(cfg, kind, c.botToken));
+  return channel ? override : fallback;
+}
+
+/** Exact role only: channelForRole's default/first fallback can cross bot boundaries. */
 export function kindRouteTarget(cfg: UserConfig, kind?: string): { botToken: string; chatId: number } | null {
+  if (!cfg.telegram.channels?.length) return null;
   const role = roleForKind(cfg, kind);
-  if (!role || !cfg.telegram.channels?.length) return null;
-  const ch = channelForRole(resolveTelegramChannels(cfg.telegram), role);
-  return ch?.botToken && Number.isFinite(ch.chatId) ? { botToken: ch.botToken, chatId: ch.chatId } : null;
+  const ch = resolveTelegramChannels(cfg.telegram)
+    .find(c => c.roles.includes(role) && isAllowedBot(cfg, kind, c.botToken));
+  if (!ch || !Number.isFinite(ch.chatId)) return null;
+  return { botToken: ch.botToken, chatId: ch.chatId };
 }

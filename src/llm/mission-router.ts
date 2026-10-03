@@ -5,10 +5,9 @@
 // mission. Tier 1 is a pure heuristic — Korean + English regex over
 // the input plus attachment + length signals. No I/O, no network.
 //
-// Tier 2 (local LLM grammar-constrained classifier · P1-3) and Tier 3
-// (cloud LLM · deferred) plug into this same `MissionRouter` interface
-// via composition — the predict() implementation is replaced at
-// factory time, the public surface stays stable so consumers
+// Tier 2 (injected LLM classifier · P1-3) uses the classify-role judge layer.
+// Tier 3 (cloud LLM · deferred) can plug into this same `MissionRouter` interface;
+// the public surface stays stable so consumers
 // (`elanous/route/predict` envelope · iOS chip · …) don't churn.
 //
 // Default mission → provider map mirrors the ROADMAP §3.1 table:
@@ -22,6 +21,8 @@
 // User overrides via `~/.elanous/config.json` `llm.missionRouting` (P1-2)
 // flow through MissionRoutingConfig — pass the user-config slice into
 // createMissionRouter({ config }) at boot.
+
+import { judge } from './judge-layer.js';
 
 export type MissionKind = 'plan' | 'build' | 'review' | 'research' | 'quick' | 'vision';
 
@@ -211,7 +212,7 @@ function resolveEntry(
   return { provider: DEFAULT_PROVIDER[mission], model: DEFAULT_MODEL[mission] };
 }
 
-/** Tier 2 seam — local LLM classifier (P1-3). When confidence from
+/** Tier 2 seam — injected LLM classifier (P1-3). When confidence from
  *  Tier 1 drops below TIER2_THRESHOLD the router calls this client
  *  to refine the mission with a grammar-constrained 1-token
  *  prediction. Implementations are pluggable — the substrate today
@@ -219,14 +220,18 @@ function resolveEntry(
  *  src/background-reasoning/local-llm-process.ts; a future PR wires
  *  the qwen-2.5 grammar path through.
  *
- *  Contract: respond with one of the 6 MissionKind strings + a
- *  confidence in [0, 1]. Throw on unrecoverable error; the router
+ *  Contract: classify with the supplied classify-role provider/model,
+ *  respond with one of the 6 MissionKind strings + a confidence in [0, 1].
+ *  Throw on unrecoverable error; the router
  *  swallows and falls back to Tier 1. */
 export interface MissionLocalLLMClient {
   classify(input: {
     text: string;
     attachments?: ReadonlyArray<MissionAttachment>;
-  }): Promise<{ mission: MissionKind; confidence: number }>;
+    /** The classify-role selection the client must use. */
+    provider: string;
+    model: string;
+  }): Promise<{ mission: MissionKind; confidence: number; /** The model actually used — must equal the requested one or the decision is discarded. */ model?: string }>;
 }
 
 export const TIER2_CONFIDENCE_THRESHOLD = 0.6;
@@ -320,18 +325,27 @@ export function createMissionRouter(opts?: {
           confidence = cached.confidence;
           tier = 2;
         } else {
-          try {
-            const refined = await localLLM.classify({
-              text: input.text ?? '',
-              attachments: input.attachments,
-            });
-            cache.set(key, refined, now());
-            mission = refined.mission;
-            confidence = refined.confidence;
+          const decision = await judge({
+            site: 'llm.mission-router', prompt: JSON.stringify({ text: input.text ?? '', attachments: input.attachments ?? [] }),
+            call: async ({ provider, model }) => {
+              const refined = await localLLM.classify({ text: input.text ?? '', attachments: input.attachments, provider, model });
+              // Enforce the classify-role model: a client that ignored it (or can't say) doesn't get to decide.
+              return { text: refined.model === model && model ? JSON.stringify(refined) : 'null', modelId: refined.model };
+            },
+            schema: (value) => {
+              if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+              const row = value as Record<string, unknown>;
+              if (typeof row.mission !== 'string' || !Object.hasOwn(DEFAULT_PROVIDER, row.mission) ||
+                  typeof row.confidence !== 'number' || !Number.isFinite(row.confidence) ||
+                  row.confidence < 0 || row.confidence > 1) return null;
+              return { mission: row.mission as MissionKind, confidence: row.confidence };
+            },
+          });
+          if (decision.ok) {
+            cache.set(key, decision.value, now());
+            mission = decision.value.mission;
+            confidence = decision.value.confidence;
             tier = 2;
-          } catch {
-            // Swallow · keep Tier 1 result. classifier hiccup
-            // shouldn't stall the input chip.
           }
         }
       }

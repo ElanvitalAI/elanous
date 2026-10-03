@@ -7,14 +7,14 @@
 
 import { randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { getUserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { collectPodArtifacts } from './pod-artifact-return.js';
 import { podBunCacheVolume } from './pod-bun-cache.js';
 import { type PodPoolMember, PodPoolScheduler, resolvePodPoolSpec, parsePodPool, checkPodPool, syncPoolImages, type PoolKubectl } from './pod-pool.js';
-import { readSkillEnvFiles } from './pod-skills.js';
+import { podSkillsDigest, readSkillEnvFiles, resolvePodSkills } from './pod-skills.js';
 import { podSourceScript, type PodSource } from './pod-source-receive.js';
 import {
   POD_CHILD_REQUESTS,
@@ -29,6 +29,24 @@ import {
 
 /** CLI `--deadline` 생략 시 — 기존 Pod Job 수명 상한과 같다. */
 export const POD_COMMAND_DEADLINE_SECONDS = POD_JOB_DEADLINE_SECONDS;
+
+export const POD_NETWORK_SKILLS = ['omni-crawl', 'omni-digest'] as const;
+export const POD_LITE_IMAGE = 'elanous-harness-lite:local';
+
+export const POD_LITE_MEMORY_LIMIT = '2Gi';
+
+/** POD7 must-fix: the skill list alone can't tell a network-only job from one that needs ffmpeg/browser — so lite is
+ *  only ever chosen when the caller says so (`lite`), and then only for network skills without a clone. Anything we
+ *  can't judge keeps the full image. A lite request that doesn't fit is refused with the reason, not silently widened. */
+export function podCommandImageFor(skills: readonly string[], clone: boolean, lite = false): string {
+  if (!lite) return 'elanous-harness:local';
+  if (clone) throw new Error('pod command: --lite 는 clone 없는 명령만 받는다(lite 이미지는 git·빌드 도구가 적다)');
+  const outside = skills.filter((skill) => !(POD_NETWORK_SKILLS as readonly string[]).includes(skill));
+  if (skills.length === 0 || outside.length > 0) {
+    throw new Error(`pod command: --lite 는 네트워크 스킬(${POD_NETWORK_SKILLS.join('·')})만 받는다${outside.length ? ` — 벗어난 스킬: ${outside.join(', ')}` : ' — --skill 이 없다'}`);
+  }
+  return POD_LITE_IMAGE;
+}
 
 const COMMAND_LOG_CHARS = 80;
 
@@ -212,8 +230,10 @@ export interface RunPodCommandOptions {
   clone?: boolean;
   hostMirror?: string;
   bunCache?: string;
-  /** 컨테이너 메모리 한도(기본 16Gi). */
+  /** 컨테이너 메모리 한도(기본 16Gi · lite 면 2Gi). */
   memoryLimit?: string;
+  /** POD7: 호출부가 «네트워크 스킬만 쓰는 명령»이라고 말할 때만 lite 이미지 ⊕ 2Gi. */
+  lite?: boolean;
   source?: PodSource;
   ghToken?: () => string;
   deadlineSeconds?: number;
@@ -266,7 +286,8 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
   const baseKubectl = options.kubectl ?? defaultKubectl;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const namespace = options.namespace ?? 'elanous-test';
-  const image = options.image ?? 'elanous-harness:local';
+  const image = options.image ?? podCommandImageFor(skills, options.clone === true, options.lite === true);
+  const memoryLimit = options.memoryLimit ?? (image === POD_LITE_IMAGE ? POD_LITE_MEMORY_LIMIT : undefined);
   const repoUrl = options.repoUrl ?? 'https://github.com/ElanvitalAI/elanous';
   const deadlineSeconds = options.deadlineSeconds ?? POD_COMMAND_DEADLINE_SECONDS;
   // POD1 (10-01): two launches in the same moment got the same `si-cmd-<time>` and the failing one's cleanup
@@ -328,8 +349,9 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
           localImageCommit: () => podImageFreshness({ image }).imageCommit,
         });
     if (pool && member) {
-      const { podSkillsDigest, resolvePodSkills } = await import('./pod-skills.js');
-      const localSkillsDigest = options.kubectl ? null : podSkillsDigest(resolvePodSkills(env).skills).digest;
+      const localSkillsDigest = options.kubectl ? null : image === POD_LITE_IMAGE
+        ? podSkillsDigest(POD_NETWORK_SKILLS, resolve(import.meta.dir, '../../../skills')).digest
+        : podSkillsDigest(resolvePodSkills(env).skills).digest;
       const syncs = await (options.syncImages ?? syncPoolImages)([member], image, imageCommit, { localSkillsDigest });
       const synced = syncs.get(member.context);
       if (synced && !synced.ok) throw new Error(`pod command: 이미지 판을 못 맞췄다: ${synced.detail}`);
@@ -345,7 +367,7 @@ export async function runPodCommand(options: RunPodCommandOptions): Promise<PodC
       name, namespace, launch, image: member?.imageRef ?? image,
       ...(member?.imageRef ? { imagePullPolicy: 'IfNotPresent' as const } : {}),
       repoUrl, command, skills, ...(llm ? { llm } : {}), ...(options.clone ? { clone: true } : {}),
-      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(options.memoryLimit ? { memoryLimit: options.memoryLimit } : {}), deadlineSeconds,
+      ...(options.source ? { source: options.source } : {}), ...(hostMirror ? { hostMirror } : {}), ...(bunCache ? { bunCache } : {}), ...(memoryLimit ? { memoryLimit } : {}), deadlineSeconds,
       ...(options.runId ? { runId: options.runId } : {}),
     });
     kubectl(['-n', namespace, 'delete', 'job', '-l', own, '--ignore-not-found']);

@@ -21,7 +21,8 @@ import { spawn, execFileSync } from 'node:child_process';
 import { emitDecision } from '../live/detail-switch.js';
 import { parentUnlandedProgressLine } from './run-supervisor.js';
 import { mkdirSync, openSync, writeFileSync, closeSync, renameSync, unlinkSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { goalPathFromArgv, launchRegistryDir, removeLaunchBinding, writeLaunchBinding } from '../harness/launch-registry.js';
 import { availableParallelism, cpus } from 'node:os';
 import { selfDevRunsDir } from './run-store.js';
 import { HARNESS_RUN_ID_ENV, normalizeRunId } from '../harness/harness-space.js';
@@ -56,6 +57,7 @@ import {
 } from '../task-orchestrator/surfaces/self-implement.js';
 import { collectOrchestrateUnionDiff, type UnionDiffFileReader } from './orchestrate-union-diff.js';
 import { debug } from '../debug/log.js';
+import { parseGoalReleaseNoteSection, type ReleaseNoteSection } from '../release-loop/release-note.js';
 import { readHarnessScreen, readHarnessScreenTail, resolveHarnessScreenKey } from '../harness/harness-screen.js';
 import {
   dedupWorkingMemory,
@@ -101,6 +103,7 @@ export type JobKindRegistry = Readonly<Partial<Record<JobKind, JobKindDefinition
 interface SelfDevShardIdentity {
   orchestrationId: string;
   parentRequest?: string;
+  releaseNote?: ReleaseNoteSection;
   shardId: string;
   totalShards: number;
   position: number;
@@ -199,6 +202,8 @@ export interface SelfDevGoal {
   goalType?: SelfDevGoalType;
   /** Feature/goal text → `elanous self implement <feature>` for dev jobs. */
   feature: string;
+  /** Pod lease predecessor goal ID or PR number. */
+  after?: string | number;
   base?: string;
   autoMerge?: boolean;
   /** G8 — attach `auto-review` opt-in label on PR (subject to eligibility self-assessment). */
@@ -890,6 +895,8 @@ export interface OrchestrateSelfDevOptions {
   runId?: string;
   /** Override the run directory root for isolated tests. */
   runsDir?: string;
+  /** Host-wide run → process binding for `harness stop` across worktrees · `null` = do not write · default: write only when `runsDir` is not overridden. */
+  launchRegistryDir?: string | null;
   /** Signal source and kubectl seams for isolated lifecycle tests. */
   signalSource?: Pick<NodeJS.Process, 'on' | 'off'>;
   /** Pod context/namespace pairs chosen by the caller that launched the Jobs. */
@@ -990,7 +997,7 @@ async function deleteLabelledJobs(runId: string, selectedTargets: readonly { con
 /** `self-dev-runs/<runId>/pid.json` — what `harness stop <runId>` reads (start time guards PID reuse).
  *  HS1: written as soon as the run ID exists, not only when the jobs start — pod planning and image sync can
  *  take minutes before that, and a stop in that window found «no process» (10-01 · three runs). */
-export function writeRunPidRecord(runId: string, runsDir: string = selfDevRunsDir()): string {
+export function writeRunPidRecord(runId: string, runsDir: string = selfDevRunsDir(), registryDir: string | null = launchRegistryDir()): string {
   const pidPath = join(runsDir, runId, 'pid.json');
   mkdirSync(join(runsDir, runId), { recursive: true });
   const temporary = `${pidPath}.${process.pid}.${randomUUID()}.tmp`;
@@ -1001,6 +1008,13 @@ export function writeRunPidRecord(runId: string, runsDir: string = selfDevRunsDi
     } finally { closeSync(fd); }
     renameSync(temporary, pidPath);
   } catch (error) { unlinkSync(temporary); throw error; }
+  // A stop from another worktree/universe cannot see this pid.json — leave the same binding in the host-wide registry.
+  if (registryDir !== null) {
+    const cwd = process.cwd();
+    const goalPath = goalPathFromArgv(process.argv, cwd);
+    writeLaunchBinding(runId, { pid: process.pid, startedAt: Date.now() - Math.floor(process.uptime() * 1000), argv0: process.argv0,
+      cwd, ...(goalPath ? { goalPath } : {}), runsDir: resolve(runsDir) }, registryDir);
+  }
   return pidPath;
 }
 
@@ -1013,6 +1027,8 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
   const runId = opts.runId ?? process.env[HARNESS_RUN_ID_ENV];
   if (runId && runId !== normalizeRunId(runId)) throw new Error(`invalid self-dev run ID: ${runId}`);
   const pidPath = runId ? join(opts.runsDir ?? selfDevRunsDir(), runId, 'pid.json') : undefined;
+  // Only the real run directory gets a host-wide binding by default — an overridden runsDir is an isolated test.
+  const registryDir = opts.launchRegistryDir !== undefined ? opts.launchRegistryDir : opts.runsDir === undefined ? launchRegistryDir() : null;
   const graph = new TaskGraph();
   const bus = new TaskEventBus();
   const registry = new SurfaceRegistry();
@@ -1186,6 +1202,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     surface: (goal) => ({
       kind: 'self-implement',
       feature: goal.feature,
+      ...(goal.after !== undefined ? { after: goal.after } : {}),
       ...(goal.base !== undefined ? { base: goal.base } : {}),
       ...(goal.autoMerge !== undefined ? { autoMerge: goal.autoMerge } : {}),
       ...(goal.autoReview !== undefined ? { autoReview: goal.autoReview } : {}),
@@ -1307,6 +1324,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
   });
 
   if (opts.goals.length > 0) {
+    const releaseNote = opts.parentRequest === undefined ? undefined : parseGoalReleaseNoteSection(opts.parentRequest).fragment;
     const orchestrationId = randomUUID();
     const shards = opts.goals.map((goal, index) => ({
       goal,
@@ -1320,6 +1338,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       const identity: SelfDevShardIdentity = {
         orchestrationId,
         ...(opts.parentRequest === undefined ? {} : { parentRequest: opts.parentRequest }),
+        ...(releaseNote ? { releaseNote } : {}),
         shardId: shard.shardId,
         totalShards: shards.length,
         position: shard.position,
@@ -1328,7 +1347,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
           .filter((sibling) => sibling !== shard)
           .map(({ shardId, summary }) => ({ shardId, summary })),
       };
-        const task = graph.getTask(taskId);
+      const task = graph.getTask(taskId);
       if (task?.surface.kind === 'self-implement') {
         graph.updateTask(taskId, {
           surface: { ...task.surface, feature: shardIdentityFeature(shard.goal.feature, identity) },
@@ -1401,6 +1420,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
         catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') debug.log('self-dev.orchestrate', 'pid-cleanup-failed', { pidPath, error: String(error) }, { level: 'warn' });
         }
+        if (registryDir !== null) removeLaunchBinding(runId!, registryDir);
       }
     };
     const cancel = (signal: NodeJS.Signals): void => {
@@ -1436,7 +1456,7 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
     signals.on('SIGTERM', onTerm);
     signals.on('SIGINT', onInt);
     try {
-      if (pidPath) writeRunPidRecord(runId!, opts.runsDir ?? selfDevRunsDir());
+      if (pidPath) writeRunPidRecord(runId!, opts.runsDir ?? selfDevRunsDir(), registryDir);
     } catch (error) { cleanup(); reject(error); return; }
 
     // Current full result set: resumed-done goals + each running task's
@@ -1488,6 +1508,18 @@ export function orchestrateSelfDev(opts: OrchestrateSelfDevOptions): Promise<Sel
       if (settled) return;
       settled = true;
       const out = buildResults();
+      for (const result of out) {
+        try {
+          debug.log('self-implement.result', 'final', {
+            runId: result.runId ?? null,
+            taskId: result.taskId,
+            stage: result.stage ?? null,
+            mergeReason: result.mergeReason ?? null,
+            failureClassification: result.failureClassification ?? null,
+            prNumber: result.prNumber ?? null,
+          });
+        } catch { /* terminal observation must not change the result */ }
+      }
       // S3 — teardown (opt-in): remove each job's worktree (fail-soft),
       // preserving any job that opened a PR (branch/worktree still needed).
       if (opts.teardown === true && !cancelling) {

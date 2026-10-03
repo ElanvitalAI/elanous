@@ -1,6 +1,6 @@
 /** Content fetchers: Web (firecrawl → Jina fallback), GitHub (gh CLI), Local files */
 
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -135,11 +135,38 @@ export async function fetchWebContent(url: string, preferSummarize = false): Pro
   return fetchWithJina(url);
 }
 
-/* ── GitHub: gh CLI ── */
+/* ── GitHub: gh CLI / unauthenticated public reads ── */
+
+function fetchPublicGitHub(url: string): string {
+  return execFileSync('curl', ['--fail', '--silent', '--show-error', '--location', '--max-time', '15', url], {
+    encoding: 'utf8', timeout: 20_000, maxBuffer: 2 * 1024 * 1024,
+  });
+}
 
 export function fetchGitHubRepo(owner: string, repo: string): { title: string; content: string } {
   console.log(`  GitHub 레포 ${owner}/${repo}...`);
-  const meta = JSON.parse(execSync(`gh repo view ${owner}/${repo} --json name,description,primaryLanguage,stargazerCount,forkCount,updatedAt`, { encoding: 'utf-8', timeout: 30_000 }));
+  let meta: { name: string; description?: string; language?: string; stargazers_count?: number; forks_count?: number; primaryLanguage?: { name: string }; stargazerCount?: number; forkCount?: number };
+  let publicRead = false;
+  try {
+    meta = JSON.parse(execSync(`gh repo view ${owner}/${repo} --json name,description,primaryLanguage,stargazerCount,forkCount,updatedAt`, { encoding: 'utf-8', timeout: 30_000, stdio: ['ignore', 'pipe', 'ignore'] }));
+  } catch {
+    meta = JSON.parse(fetchPublicGitHub(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`));
+    publicRead = true;
+  }
+  if (publicRead) {
+    let readme = '';
+    try {
+      const file = JSON.parse(fetchPublicGitHub(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/readme`)) as { download_url?: string };
+      if (file.download_url?.startsWith('https://raw.githubusercontent.com/')) readme = fetchPublicGitHub(file.download_url);
+    } catch {}
+    let commits = '';
+    try {
+      const entries = JSON.parse(fetchPublicGitHub(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits?per_page=10`)) as Array<{ commit: { message: string; author: { date: string } } }>;
+      commits = entries.map(({ commit }) => `- ${commit.message.split('\n')[0]} (${commit.author.date.slice(0, 10)})`).join('\n');
+    } catch {}
+    const content = [`# ${meta.name}`, meta.description ? `> ${meta.description}` : '', '', `- Language: ${meta.language || 'N/A'}`, `- Stars: ${meta.stargazers_count || 0} | Forks: ${meta.forks_count || 0}`, commits ? `## Recent Commits\n${commits}` : '', readme ? `## README\n${readme}` : ''].filter(Boolean).join('\n');
+    return { title: `${owner}/${repo}`, content };
+  }
   let readme = ''; try { readme = execSync(`gh api repos/${owner}/${repo}/readme --header "Accept: application/vnd.github.raw" 2>/dev/null`, { encoding: 'utf-8', timeout: 15_000 }); } catch {}
   let commits = ''; try { commits = execSync(`gh api repos/${owner}/${repo}/commits?per_page=10 --jq '.[] | "- \\(.commit.message | split("\\n") | .[0]) (\\(.commit.author.date | .[0:10]))"'`, { encoding: 'utf-8', timeout: 15_000 }); } catch {}
   const content = [`# ${meta.name}`, meta.description ? `> ${meta.description}` : '', '', `- Language: ${meta.primaryLanguage?.name || 'N/A'}`, `- Stars: ${meta.stargazerCount || 0} | Forks: ${meta.forkCount || 0}`, commits ? `## Recent Commits\n${commits}` : '', readme ? `## README\n${readme}` : ''].filter(Boolean).join('\n');

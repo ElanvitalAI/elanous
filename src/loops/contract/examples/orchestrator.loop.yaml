@@ -1,0 +1,57 @@
+id: orchestrator
+version: 1.0.0
+kind: orchestrator
+role: docs/roles/OP.md
+graph: graphs/operate-loop.yaml
+orchestration:
+  windows:
+    - {at: '08:00', delegateTo: [op-seat, cmo-seat, tc-seat, ux-seat], fromLedger: release/checklist-and-seat-requests}
+    - {at: '12:00', delegateTo: [op-seat, cmo-seat, tc-seat, ux-seat], fromLedger: seat-loop/status-and-decisions}
+    - {at: '18:00', delegateTo: [op-seat, cmo-seat, tc-seat, ux-seat], fromLedger: release/landings-and-blockers}
+cadence:
+  timezone: Asia/Seoul
+  byDefcon:
+    - {defcon: 5, everyMinutes: 120}
+    - {defcon: 4, everyMinutes: 60}
+    - {defcon: 3, everyMinutes: 30}
+    - {defcon: 2, everyMinutes: 15}
+    - {defcon: 1, everyMinutes: 5}
+posture:
+  default: 5
+  levels:
+    - {defcon: 5, minResolution: L0, maxResolution: L2, budget: &normal {maxTokens: 8000, maxToolCalls: 8, maxCostUsd: 0.5}}
+    - {defcon: 4, minResolution: L0, maxResolution: L2, budget: *normal}
+    - {defcon: 3, minResolution: L1, maxResolution: L3, budget: &urgent {maxTokens: 16000, maxToolCalls: 16, maxCostUsd: 1}}
+    - {defcon: 2, minResolution: L1, maxResolution: L3, budget: *urgent}
+    - {defcon: 1, minResolution: L1, maxResolution: L3, budget: *urgent}
+  raiseOn: [{event: release-red-or-neighbor-blocked, afterTicks: 1}]
+  lowerOn: [{event: all-seats-clear, afterTicks: 2}]
+  hysteresis: {minDwellMinutes: 60, clearTicks: 2}
+resolution:
+  default: L0
+  steps:
+    - {level: L0, grounding: [], budget: &scan {maxTokens: 2000, maxToolCalls: 2, maxCostUsd: 0.1}}
+    - {level: L1, grounding: [{tool: omni-digest, budget: *scan}], budget: *normal}
+    - {level: L2, grounding: [{tool: omni-crawl, budget: *normal}, {tool: aside-repl, budget: *scan}], budget: *urgent}
+    - {level: L3, grounding: [{tool: social-pulse, budget: *scan}, {tool: omni-crawl, budget: *normal}], budget: *urgent}
+  raiseOn: {event: new-anomaly-or-unknown, afterTicks: 1}
+  lowerOn: {event: evidence-stable, afterTicks: 2}
+grounding: [omni-digest, omni-crawl, aside-repl, social-pulse]
+memory:
+  local: {ledger: loop/orchestrator/events, working: loop/orchestrator/context}
+  promotesTo: [self-recall, decisions, checklist]
+  retention: {workingDays: 7, ledgerDays: 90}
+neighbors:
+  - {id: op-seat, exchange: [status, request, decision, blocked], heartbeat: {everyMinutes: 120, missedTicks: 2}, onAbsent: {action: delegate, delegateTo: steward}}
+  - {id: cmo-seat, exchange: [status, request, blocked], heartbeat: {everyMinutes: 120, missedTicks: 2}, onAbsent: {action: defer, delegateTo: orchestrator}}
+  - {id: tc-seat, exchange: [status, request, blocked], heartbeat: {everyMinutes: 120, missedTicks: 2}, onAbsent: {action: escalate, delegateTo: orchestrator}}
+  - {id: ux-seat, exchange: [status, request, blocked], heartbeat: {everyMinutes: 120, missedTicks: 2}, onAbsent: {action: defer, delegateTo: orchestrator}}
+spawn:
+  allowed: [agent, harness]
+  max: 4
+  reap: {afterMinutes: 120, onExit: reconcile}
+hitl: {ladder: [self-heal, neighbor, orchestrator, human]}
+budget: *urgent
+observability:
+  category: loop.orchestrator
+  events: [tick, posture-change, resolution-change, grounding, heartbeat, absent, exchange, spawn, reap, promote, hitl]

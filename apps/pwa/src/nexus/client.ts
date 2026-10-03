@@ -35,6 +35,16 @@ export class NexusApiError extends Error {
   }
 }
 
+export class MissingUpstreamError extends NexusApiError {
+  readonly nodes: string[];
+
+  constructor(path: string, body: { error: 'missing-upstream'; nodes: string[] }) {
+    super(400, path, body);
+    this.name = 'MissingUpstreamError';
+    this.nodes = body.nodes;
+  }
+}
+
 export class NexusTimeoutError extends Error {
   constructor(public readonly path: string, public readonly timeoutMs: number) {
     super(`NEXUS 가 ${timeoutMs / 1000}초 안에 답하지 않았습니다 (${path}) — 방금 켰다면 잠시 뒤 다시 시도하세요.`);
@@ -56,7 +66,7 @@ function stringify(body: unknown): string {
 export type ModelTierWire = 'budget' | 'balanced' | 'better' | 'best' | 'loaded';
 
 export interface ModelTierUserConfigWire {
-  persona?: 'casual' | 'power' | 'custom';
+  profile?: 'casual' | 'power' | 'custom';
   preset?: string;
   voice?: { stt?: ModelTierWire; tts?: ModelTierWire };
   llm?: ModelTierWire;
@@ -147,6 +157,9 @@ export interface NexusClient {
   // ---- workflows (Archon-port T2.3) ----
   getWorkflows(): Promise<{ workflows: WorkflowSummary[] }>;
   getWorkflow(name: string): Promise<WorkflowDetail>;
+  getWorkflowPins(name: string): Promise<WorkflowPinsResponse>;
+  putWorkflowPin(name: string, nodeId: string, value: unknown, note?: string): Promise<WorkflowPinResponse>;
+  deleteWorkflowPin(name: string, nodeId: string): Promise<{ workflow: string; removed: number }>;
   saveWorkflow(name: string, body: SaveWorkflowBody): Promise<{ ok: true; path: string; scope: string }>;
   deleteWorkflow(name: string, opts?: { scope?: 'project' | 'global' }): Promise<{ ok: true; path: string; scope: string }>;
   validateWorkflow(yaml: string, opts?: { signal?: AbortSignal }): Promise<ValidateWorkflowResponse>;
@@ -164,7 +177,7 @@ export interface NexusClient {
   /** Surface-unification §F2 (2026-05-11) — starter workflow templates
    *  (raw YAML + parsed metadata) for the "+ New" picker. */
   getWorkflowTemplates(opts?: { signal?: AbortSignal }): Promise<WorkflowTemplateList>;
-  runWorkflow(name: string, args: string, opts?: { dryRun?: boolean }): Promise<WorkflowRunStartResponse>;
+  runWorkflow(name: string, args: string, opts?: { dryRun?: boolean; onlyNode?: string; fromNode?: string; fromRunId?: string }): Promise<WorkflowRunStartResponse>;
   getWorkflowRun(runId: string): Promise<WorkflowRunDetail>;
   getWorkflowRuns(): Promise<{ runs: WorkflowRunSummary[] }>;
   /** D4 · §6.4 SSE — URL for the workflow yaml fs.watch event stream.
@@ -380,6 +393,23 @@ export interface WorkflowDetail {
   };
 }
 
+export interface WorkflowPinEntry {
+  nodeId: string;
+  value: unknown;
+  updatedAt: string;
+  note?: string;
+}
+
+export interface WorkflowPinsResponse {
+  workflow: string;
+  pins: Record<string, WorkflowPinEntry>;
+}
+
+export interface WorkflowPinResponse {
+  workflow: string;
+  pin: WorkflowPinEntry;
+}
+
 export interface SaveWorkflowBody {
   yaml: string;
   scope?: 'project' | 'global';
@@ -474,6 +504,8 @@ export interface WorkflowTemplateList {
 export interface WorkflowRunStartResponse {
   ok: true;
   runId: string;
+  /** Server (#23131): 'only' = onlyNode · 'from' = fromNode⊕fromRunId · 'full' = the whole workflow. */
+  mode?: 'only' | 'from' | 'full';
 }
 
 export interface WorkflowRunEvent {
@@ -490,6 +522,8 @@ export interface WorkflowRunEvent {
 export interface WorkflowRunDetail {
   runId: string;
   workflowName: string;
+  /** Server (#23131): 'only' = a single-node test run (not a valid «retry from» source) · 'from' · 'full'. */
+  mode?: 'only' | 'from' | 'full';
   startedAt: number;
   ok: boolean | undefined;
   events: WorkflowRunEvent[];
@@ -1088,7 +1122,14 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
           // reaches the outer timeout/caller-cancellation handler.
           if (!(err instanceof SyntaxError)) throw err;
         }
-        if (!res.ok) throw new NexusApiError(res.status, path, parsed);
+        if (!res.ok) {
+          if (res.status === 400 && path.startsWith('/v1/workflows/') && path.endsWith('/run')
+            && parsed && typeof parsed === 'object' && 'error' in parsed && parsed.error === 'missing-upstream'
+            && 'nodes' in parsed && Array.isArray(parsed.nodes) && parsed.nodes.every((node) => typeof node === 'string')) {
+            throw new MissingUpstreamError(path, parsed as { error: 'missing-upstream'; nodes: string[] });
+          }
+          throw new NexusApiError(res.status, path, parsed);
+        }
         return parsed as T;
       } catch (err) {
         if (!timedOut || !(err instanceof Error) || err.name !== 'AbortError') throw err;
@@ -1203,6 +1244,12 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
     // ---- workflows (Archon-port T2.3) ----
     getWorkflows: () => request('GET', '/v1/workflows'),
     getWorkflow: (name) => request('GET', `/v1/workflows/${encodeURIComponent(name)}`),
+    getWorkflowPins: (name) => request('GET', `/v1/workflows/${encodeURIComponent(name)}/pins`),
+    putWorkflowPin: (name, nodeId, value, note) => request('PUT', `/v1/workflows/${encodeURIComponent(name)}/pins/${encodeURIComponent(nodeId)}`, {
+      value,
+      ...(note !== undefined ? { note } : {}),
+    }),
+    deleteWorkflowPin: (name, nodeId) => request('DELETE', `/v1/workflows/${encodeURIComponent(name)}/pins/${encodeURIComponent(nodeId)}`),
     saveWorkflow: (name, body) => request('PUT', `/v1/workflows/${encodeURIComponent(name)}`, body),
     deleteWorkflow: (name, dopts) => {
       const q = dopts?.scope ? `?scope=${encodeURIComponent(dopts.scope)}` : '';
@@ -1217,6 +1264,9 @@ export function createNexusClient(opts: NexusClientOpts): NexusClient {
       request('POST', `/v1/workflows/${encodeURIComponent(name)}/run`, {
         arguments: args,
         ...(runOpts?.dryRun ? { dryRun: true } : {}),
+        ...(runOpts?.onlyNode !== undefined ? { onlyNode: runOpts.onlyNode } : {}),
+        ...(runOpts?.fromNode !== undefined ? { fromNode: runOpts.fromNode } : {}),
+        ...(runOpts?.fromRunId !== undefined ? { fromRunId: runOpts.fromRunId } : {}),
       }),
     getWorkflowRun: (runId) => request('GET', `/v1/workflows/runs/${encodeURIComponent(runId)}`),
     getWorkflowRuns: () => request('GET', '/v1/workflows/runs'),

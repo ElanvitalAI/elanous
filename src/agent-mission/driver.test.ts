@@ -17,6 +17,8 @@ import { decideInterventionStep } from '../self-implement/intervention-step.js';
 import type { PtyControlDeps, RunSupervisor } from '../autopilot/pty-control-loop.js';
 import type { AgentMissionSpec, AgentMissionDeps } from './driver.js';
 import { planMissionResources, type ResourcePlan } from './resource-ladder.js';
+import { listCoordEvents } from '../context-bus/coord-events.js';
+import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { generateIndexKeyPair, signIndex, type MarketplaceIndex } from '../market/signed-index.js';
 import { OFFICIAL_INDEX_KEYS } from '../market/official-keys.js';
 
@@ -77,6 +79,19 @@ describe('pre-mission resource ladder on PTY dispatch', () => {
       return { result, events, writes, calls, installs, prompt: existsSync(join(dir, '.mission-prompt.md')) ? readFileSync(join(dir, '.mission-prompt.md'), 'utf8') : null };
     } finally { rmSync(dir, { recursive: true, force: true }); }
   };
+
+  test('codex PTY start and finish are in coord events without the mission prompt', async () => {
+    const since = new Date().toISOString();
+    const { result } = await launch({ mission: 'PRIVATE MISSION PROMPT', resources: 'off' });
+    expect(result.ok).toBe(true);
+    const db = openSurfaceEventsDb();
+    try {
+      const rows = listCoordEvents({ since, seat: 'codex-agent-mission' }, { db });
+      expect(rows.map((row) => row.kind)).toEqual(['started', 'finished']);
+      expect(JSON.stringify(rows)).not.toContain('PRIVATE MISSION PROMPT');
+      expect(rows[0]?.refs.source).toStartWith('elanous://agent-mission/');
+    } finally { db.close(); }
+  });
 
   test('official suggestion installs before mission and appends only resource names; backend stays selected', async () => {
     const { result, events, calls, installs, prompt } = await launch({ backendExplicit: 'codex' });

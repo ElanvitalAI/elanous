@@ -1,6 +1,6 @@
 import { describe, expect, it, spyOn } from 'bun:test';
 import type { SpawnSyncOptions } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -11,6 +11,7 @@ import { setGitCommandRunnerForTesting } from '../../src/git-fs/runner.js';
 import { parseNumstat, parsePorcelainStatus, registerPrCommands, runPrGranularity, runPrLand, decideOverlapLanding, overlapDecisionFromConfirm, publicLeakWarning, exportLeakBlock, runPrLandExportLeakCheck, docsCliWarning, publicDocPaths, OVERLAP_DECISION_PROMPT, createOverlapConfirmChannel, formatCommitMessageFallbackNotice, formatLandReasonNotice, codePointLength, branchLineageSlug, findSiblingPrs } from '../../src/cli/pr-cli.js';
 import type { ConfirmOpts, ConfirmResult } from '../../src/hitl/confirm.js';
 import { LANDING_HISTORY_META_MARK, TOP_PREFIX_COUNT_LIMIT } from '../../src/cli/pr-granularity.js';
+import { renderBaseline } from '../../scripts/ci-public-leak-gate.js';
 import type { CmdRunner, FindPrForBranchOutcome, MergePrOutcome, PrManager, UpsertPrInput, UpsertPrOutcome } from '../../src/autopilot/pr-manager.js';
 import type { FederatedUnfinishedRunLedgerEntry, FederatedUnfinishedRunLedgerQuery } from '../../src/self-implement/run-ledger.js';
 import type { RunningRunsResult } from '../../src/self-implement/running-runs.js';
@@ -586,6 +587,50 @@ describe('elanous pr land', () => {
     const line = sink.logs.find((message) => message.includes('sibling-prs'));
     expect(line).toContain('#201');
     expect(line).toContain('self-impl/x-2222bbbb');
+  });
+
+  it('public leak warning reads the main baseline and PR tree in that order, even when the PR updated its baseline', async () => {
+    for (const [mainCount, prCount] of [[2, 0], [0, 2]] as const) {
+      const cwd = mkdtempSync(join(tmpdir(), 'pr-land-leak-direction-'));
+      try {
+        git(cwd, 'init', '-q', '-b', 'main');
+        git(cwd, 'config', 'user.email', 'test@example.com');
+        git(cwd, 'config', 'user.name', 'Test');
+        git(cwd, 'remote', 'add', 'origin', 'https://github.com/example/repo.git');
+        mkdirSync(join(cwd, 'scripts'));
+        mkdirSync(join(cwd, 'release'));
+        writeFileSync(join(cwd, 'release/public-export.yaml'), 'include: ["scripts/x.sh"]\nexclude: []\nreplace: {}\n');
+        const baseline = (count: number) => renderBaseline(new Map(count ? [['ceo-mark\tscripts/x.sh', count]] : []));
+        writeFileSync(join(cwd, 'scripts/x.sh'), Array.from({ length: mainCount }, () => 'echo "\u{1F451}"').join('\n') + '\n');
+        writeFileSync(join(cwd, 'scripts/public-leak-baseline.txt'), baseline(mainCount));
+        git(cwd, 'add', '.');
+        git(cwd, 'commit', '-qm', 'main baseline');
+        git(cwd, 'update-ref', 'refs/remotes/origin/main', git(cwd, 'rev-parse', 'HEAD'));
+        git(cwd, 'checkout', '-qb', 'feat/land');
+        writeFileSync(join(cwd, 'scripts/x.sh'), Array.from({ length: prCount }, () => 'echo "\u{1F451}"').join('\n') + '\n');
+        writeFileSync(join(cwd, 'scripts/public-leak-baseline.txt'), baseline(prCount));
+        const sink = output();
+        const run: CmdRunner = (cmd, args, options) => {
+          const result = spawnSync(cmd, args, { ...options, encoding: 'utf8' });
+          return { ok: result.status === 0, out: result.stdout ?? '' };
+        };
+        expect(git(cwd, 'show', 'main:scripts/public-leak-baseline.txt')).toContain(`# total=${mainCount}`);
+        expect(readFileSync(join(cwd, 'scripts/public-leak-baseline.txt'), 'utf8')).toContain(`# total=${prCount}`);
+        expect(await runPrLand({ cwd, dryRun: true }, {
+          ...baseDeps, runPublicLeakGate: undefined, run, manager: fakeManager().manager, out: sink.out,
+        })).toBe(0);
+        const lines = sink.logs.filter((line) => line.includes('public-leak-gate') || line.includes('scripts/x.sh  ceo-mark'));
+        if (mainCount > prCount) {
+          expect(lines).toContain('✓ public-leak-gate(경고 전용): 공개 유출이 줄었다 · 기준선 --update 권장 — scripts/x.sh  ceo-mark  2 → 0');
+          expect(lines.filter((line) => line.startsWith('⚠ public-leak-gate'))).toHaveLength(0);
+        } else {
+          expect(lines).toContain('⚠ public-leak-gate(경고 전용 · 착지는 막지 않는다): 공개 유출이 늘었다 —');
+          expect(lines).toContain('   scripts/x.sh  ceo-mark  0 → 2');
+        }
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    }
   });
 
   // 🆕 2026-09-24 — 공개 유출 래칫은 «경고 전용»: 늘었어도 막지 않고 늘어난 줄을 보여 준다 · 못 쟀으면 그렇게 말한다.
@@ -2523,23 +2568,69 @@ describe('public-export-leak at landing (LEAK1)', () => {
   it('a changed file that would leak after the export transforms stops the landing', () => {
     const o = io();
     expect(exportLeakBlock(['src/a.test.ts'], () => ({ measured: true, hits: [hit] }), false, o.out)).toBe(false);
-    expect(o.error.join('\n')).toContain('src/a.test.ts:3  ceo-mark');
+    expect(o.error.join('\n')).toContain('src/a.test.ts:3 · ceo-mark');
     expect(o.error.join('\n')).toContain('--allow-public-leak');
   });
 
-  it('--allow-public-leak lands with a warning; no hits and «could not measure» both land', () => {
+  it('--allow-public-leak with a reason warns; clean files land; unmeasured public files block', () => {
     const allowed = io();
     expect(exportLeakBlock(['src/a.test.ts'], () => ({ measured: true, hits: [hit] }), true, allowed.out)).toBe(true);
     expect(allowed.error).toEqual([]);
-    expect(allowed.log.join('\n')).toContain('src/a.test.ts:3  ceo-mark');
+    expect(allowed.log.join('\n')).toContain('src/a.test.ts:3 · ceo-mark');
     const clean = io();
     expect(exportLeakBlock(['src/a.ts'], () => ({ measured: true, hits: [] }), false, clean.out)).toBe(true);
     expect(clean.log[0]).toContain('✓ public-export-leak');
     const unmeasured = io();
-    expect(exportLeakBlock(['src/a.ts'], () => { throw new Error('boom'); }, false, unmeasured.out)).toBe(true);
-    expect(unmeasured.log[0]).toContain('못 쟀다(boom)');
+    expect(exportLeakBlock(['src/a.ts'], () => { throw new Error('boom'); }, false, unmeasured.out)).toBe(false);
+    expect(unmeasured.error[0]).toContain('못 쟀다 — 막는다');
+    expect(unmeasured.error[0]).toContain('bun scripts/public-export.ts --leak-check --json --all --files');
+    const timeout = io();
+    expect(exportLeakBlock(['scripts/x.sh'], () => ({ measured: false, hits: [], detail: 'timeout' }), false, timeout.out)).toBe(false);
+    expect(timeout.error[0]).toContain('못 쟀다 — 막는다');
     const none = io();
     expect(exportLeakBlock([], () => { throw new Error('must not run'); }, false, none.out)).toBe(true);
+  });
+
+  it('allows only a documented hit line or its preceding comment, and logs paths/rules without source text', () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'pr-leak-allow-'));
+    const logged = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      mkdirSync(join(cwd, 'scripts'));
+      mkdirSync(join(cwd, 'release'));
+      writeFileSync(join(cwd, 'release/public-export.yaml'), 'include: ["scripts/**"]\nexclude: ["scripts/hidden.sh"]\nreplace: {}\n');
+      writeFileSync(join(cwd, 'scripts/x.sh'), '# public-export-allow: 시험 픽스처 — 공개본에 실려도 무해\necho secret\n');
+      const o = io();
+      const marker = { file: 'scripts/x.sh', line: 2, marker: 'ceo-mark' };
+      expect(exportLeakBlock(['scripts/x.sh'], () => ({ measured: true, hits: [marker] }), false, o.out, cwd)).toBe(true);
+      expect(logged).toHaveBeenCalledWith('pr.land', 'leak-gate', { blocked: false, hits: [{ file: 'scripts/x.sh', marker: 'ceo-mark' }], measured: true, allowed: 1 });
+      expect(JSON.stringify(logged.mock.calls)).not.toContain('시험 픽스처');
+      writeFileSync(join(cwd, 'scripts/x.sh'), '# public-export-allow: \necho secret\n');
+      const empty = io();
+      expect(exportLeakBlock(['scripts/x.sh'], () => ({ measured: true, hits: [marker] }), false, empty.out, cwd)).toBe(false);
+      expect(empty.error.join('\n')).toContain('scripts/x.sh:2 · ceo-mark · 사유 없음');
+      writeFileSync(join(cwd, 'scripts/x.sh'), 'echo secret # public-export-allow: harmless fixture\n');
+      expect(exportLeakBlock(['scripts/x.sh'], () => ({ measured: true, hits: [{ ...marker, line: 1 }] }), false, io().out, cwd)).toBe(true);
+      const unmeasured = io();
+      expect(exportLeakBlock(['scripts/hidden.sh'], () => ({ measured: false, hits: [], detail: 'timeout' }), false, unmeasured.out, cwd)).toBe(true);
+      expect(unmeasured.log.join('\n')).toContain('공개 대상 변경 없음');
+      const skill = io();
+      expect(exportLeakBlock(['skills/new/SKILL.md'], () => ({ measured: true, hits: [{ file: 'skills/new/SKILL.md', line: 1, marker: 'skill-boundary' }] }), false, skill.out, cwd)).toBe(false);
+      expect(skill.error.join('\n')).toContain('skills/new/SKILL.md:1 · skill-boundary');
+      const oldBoundary = io();
+      expect(exportLeakBlock(['scripts/x.sh'], () => ({ measured: true, hits: [{ file: 'skills/old/SKILL.md', line: 1, marker: 'skill-boundary' }] }), false, oldBoundary.out, cwd)).toBe(true);
+      const oldLeak = io();
+      expect(exportLeakBlock(['scripts/x.sh'], () => ({ measured: true, hits: [] }), false, oldLeak.out, cwd)).toBe(true);
+    } finally { logged.mockRestore(); rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it('requires --land-reason for the whole-PR override before any landing side effects', async () => {
+    const o = io();
+    const manager = fakeManager();
+    expect(await runPrLand({ allowPublicLeak: true }, { ...baseDeps, out: o.out, manager: manager.manager })).toBe(1);
+    expect(o.error.join('\n')).toContain('--land-reason');
+    expect(manager.calls).toEqual([]);
+    const valid = io();
+    expect(await runPrLand({ allowPublicLeak: true, landReason: 'known fixture', dryRun: true }, { ...baseDeps, out: valid.out, manager: manager.manager })).toBe(0);
   });
 
   it('runPrLand returns 1 before upsert when the check finds a leak', async () => {
@@ -2556,9 +2647,55 @@ describe('public-export-leak at landing (LEAK1)', () => {
     expect(calls).not.toContain('merge');
   });
 
-  it('the real check measures this repository (a clean exported file has no hits)', () => {
-    const r = runPrLandExportLeakCheck(['src/cli/pr-cli.ts'], process.cwd());
-    expect(r).toEqual({ measured: true, hits: [] });
+  it('real exporter and landing gate detect a changed public leak even with a pre-existing skill boundary', async () => {
+    const cwd = mkdtempSync(join(process.cwd(), '.pr-land-real-export-'));
+    try {
+      for (const dir of ['scripts', 'release', 'skills/old', 'catalog', 'src/video-pipeline', 'src/util', 'src/cli']) mkdirSync(join(cwd, dir), { recursive: true });
+      for (const file of ['scripts/public-export.ts', 'scripts/skill-boundary.ts', 'scripts/open-core-boundary.ts', 'src/util/spawn-sync-output.ts', 'src/cli/stdout-json.ts']) {
+        copyFileSync(join(process.cwd(), file), join(cwd, file));
+      }
+      writeFileSync(join(cwd, 'release/public-export.yaml'), 'include: ["scripts/**", "skills/**"]\nexclude: []\nreplace: {}\nskills: core\n');
+      writeFileSync(join(cwd, 'catalog/resources.yaml'), 'resources: []\n');
+      writeFileSync(join(cwd, 'src/video-pipeline/capabilities.ts'), 'export const capabilities = [];\n');
+      writeFileSync(join(cwd, 'skills/old/SKILL.md'), '---\nname: old\n---\n');
+      writeFileSync(join(cwd, 'scripts/x.sh'), 'echo "clean"\n');
+      git(cwd, 'init', '-q');
+      git(cwd, 'config', 'user.email', 'test@example.com');
+      git(cwd, 'config', 'user.name', 'Test');
+      git(cwd, 'add', '.');
+      git(cwd, 'commit', '-qm', 'baseline boundary');
+      writeFileSync(join(cwd, 'scripts/x.sh'), 'echo "\u{1F451}"\n');
+      const changed = git(cwd, 'diff', '--name-only', 'HEAD').split('\n');
+      expect(changed).toEqual(['scripts/x.sh']);
+      const check = runPrLandExportLeakCheck(changed, cwd);
+      expect(check).toMatchObject({ measured: true });
+      expect(check.hits).toContainEqual(expect.objectContaining({ file: 'skills/old/SKILL.md', line: 1, marker: 'skill-boundary' }));
+      expect(check.hits).toContainEqual(expect.objectContaining({ file: 'scripts/x.sh', line: 1, marker: 'ceo-mark' }));
+      const sink = io();
+      expect(exportLeakBlock(changed, () => check, false, sink.out, cwd)).toBe(false);
+      expect(sink.error.join('\n')).toContain('scripts/x.sh:1 · ceo-mark');
+      const manager = fakeManager();
+      const landing = io();
+      expect(await runPrLand({ cwd }, {
+        ...baseDeps,
+        manager: manager.manager,
+        out: landing.out,
+        run: (cmd, args, options) => {
+          if (cmd === 'git' && args.join(' ') === statusArgs) return { ok: true, out: ' M scripts/x.sh\0' };
+          if (cmd === 'git' && args[0] === 'diff' && args.includes('--name-only')) return { ok: true, out: 'scripts/x.sh\n' };
+          return baseLookupRun(cmd, args);
+        },
+        runExportLeakCheck: runPrLandExportLeakCheck,
+      })).toBe(1);
+      expect(landing.error.join('\n')).toContain('scripts/x.sh:1 · ceo-mark');
+      expect(manager.calls).not.toContain('upsert');
+      expect(manager.calls).not.toContain('merge');
+      writeFileSync(join(cwd, 'scripts/x.sh'), 'echo "clean"\n');
+      const clean = runPrLandExportLeakCheck(['scripts/x.sh'], cwd);
+      expect(clean.measured).toBe(true);
+      expect(clean.hits.every((hit) => hit.marker === 'skill-boundary')).toBe(true);
+      expect(exportLeakBlock(['scripts/x.sh'], () => clean, false, io().out, cwd)).toBe(true);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   }, 180_000);
 });
 

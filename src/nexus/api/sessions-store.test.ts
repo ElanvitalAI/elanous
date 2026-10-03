@@ -141,7 +141,10 @@ describe('PATCH /v1/sessions/store/:id — project only', () => {
     const original = loadSession(session.id, root)!;
     const project = createProject({ name: 'Test' });
     expect((await patch(session.id, { projectId: project.id }, false)).status).toBe(401);
-    expect((await patch(session.id, { projectId: 'missing' })).status).toBe(400);
+    const missing = await patch(session.id, { projectId: 'missing' });
+    expect(missing.status).toBe(404);
+    expect(await missing.json()).toEqual({ ok: false, error: 'project-not-found' });
+    expect((await patch(session.id, { projectId: 42 })).status).toBe(400);
     expect((await patch('absent', { projectId: project.id })).status).toBe(404);
     expect((await patch(session.id, { projectId: project.id, title: 'Changed' })).status).toBe(400);
     expect((await patch(session.id, { title: 'Changed' })).status).toBe(400);

@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interactive SVG Diagram</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* === Color Palette (from color-palette.md) === */
+    :root {
+      --c-primary-fill: #3b82f6;
+      --c-primary-stroke: #1e3a5f;
+      --c-secondary-fill: #60a5fa;
+      --c-tertiary-fill: #93c5fd;
+      --c-start-fill: #fed7aa;
+      --c-start-stroke: #c2410c;
+      --c-success-fill: #a7f3d0;
+      --c-success-stroke: #047857;
+      --c-warning-fill: #fee2e2;
+      --c-warning-stroke: #dc2626;
+      --c-decision-fill: #fef3c7;
+      --c-decision-stroke: #b45309;
+      --c-ai-fill: #ddd6fe;
+      --c-ai-stroke: #6d28d9;
+      --c-error-fill: #fecaca;
+      --c-error-stroke: #b91c1c;
+      --c-text-title: #1e40af;
+      --c-text-subtitle: #3b82f6;
+      --c-text-body: #64748b;
+      --c-text-on-light: #374151;
+      --c-text-on-dark: #ffffff;
+      --c-evidence-bg: #1e293b;
+      --c-evidence-border: #334155;
+      --c-evidence-text: #22c55e;
+      --c-glow-primary: rgba(59, 130, 246, 0.4);
+      --c-focus-ring: #3b82f6;
+      --c-fade-opacity: 0.3;
+      --c-bg: #ffffff;
+      --c-bg-toolbar: #f8fafc;
+    }
+
+    /* === Base Styles === */
+    body {
+      background: var(--c-bg);
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    }
+
+    #diagram-container {
+      width: 100%;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    #diagram {
+      width: 100%;
+      height: auto;
+    }
+
+    /* === Interactive States === */
+    .interactive-node {
+      cursor: pointer;
+      transition: filter 0.3s ease, opacity 0.3s ease;
+    }
+
+    .interactive-node:hover .node-bg {
+      filter: brightness(1.1) drop-shadow(0 0 8px var(--c-glow-primary));
+    }
+
+    .interactive-node:focus {
+      outline: 2px solid var(--c-focus-ring);
+      outline-offset: 2px;
+    }
+
+    .interactive-node:focus:not(:focus-visible) {
+      outline: none;
+    }
+
+    .evidence-artifact {
+      cursor: pointer;
+      transition: filter 0.3s ease;
+    }
+
+    .evidence-artifact:hover .evidence-bg {
+      filter: brightness(1.2);
+    }
+
+    /* === Animations === */
+    @keyframes pulse {
+      0%, 100% { filter: drop-shadow(0 0 0px rgba(194, 65, 12, 0)); }
+      50% { filter: drop-shadow(0 0 12px rgba(194, 65, 12, 0.4)); }
+    }
+    .pulse-animation { animation: pulse 2s ease-in-out infinite; }
+
+    @keyframes dash-flow {
+      to { stroke-dashoffset: -24; }
+    }
+    .flow-animated {
+      stroke-dasharray: 8 4;
+      animation: dash-flow 2s linear infinite;
+    }
+
+    @keyframes fade-in {
+      from { opacity: 0; transform: translateY(10px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* === Layer Toggle === */
+    .layer-btn {
+      transition: background-color 0.2s ease, color 0.2s ease;
+    }
+
+    .layer-btn.active {
+      background-color: #dbeafe;
+      color: #1e40af;
+    }
+
+    /* === Responsive === */
+    @media (max-width: 768px) {
+      #diagram-container { padding: 0.5rem; }
+      #detail-panel { width: 100% !important; }
+    }
+  </style>
+</head>
+<body class="bg-white min-h-screen flex flex-col items-center justify-center p-4 md:p-8">
+
+  <!-- Toolbar -->
+  <div class="flex flex-wrap gap-2 mb-4 justify-center">
+    <!-- Layer toggle -->
+    <button class="layer-btn active px-3 py-1.5 rounded-lg text-sm font-medium" data-layer="summary" onclick="setLayer('summary')">Summary</button>
+    <button class="layer-btn px-3 py-1.5 rounded-lg text-sm font-medium bg-gray-100 text-gray-500" data-layer="detail" onclick="setLayer('detail')">Full Detail</button>
+    <button class="layer-btn px-3 py-1.5 rounded-lg text-sm font-medium bg-gray-100 text-gray-500" data-layer="code" onclick="setLayer('code')">Code View</button>
+    <div class="w-px bg-gray-200 mx-1"></div>
+    <!-- Export -->
+    <button onclick="exportPNG()" class="px-3 py-1.5 bg-slate-800 text-white rounded-lg text-sm hover:bg-slate-700">PNG</button>
+    <button onclick="exportSVG()" class="px-3 py-1.5 bg-slate-800 text-white rounded-lg text-sm hover:bg-slate-700">SVG</button>
+  </div>
+
+  <!-- Diagram Container -->
+  <div id="diagram-container" class="relative">
+    <svg id="diagram" viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Interactive SVG Diagram">
+      <defs>
+        <!-- Arrowhead markers -->
+        <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="var(--c-primary-stroke)" />
+        </marker>
+        <marker id="arrowhead-success" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="var(--c-success-stroke)" />
+        </marker>
+        <marker id="arrowhead-warning" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="var(--c-warning-stroke)" />
+        </marker>
+      </defs>
+
+      <!-- ===== SECTION 1: Title ===== -->
+      <text x="40" y="50" fill="var(--c-text-title)" font-size="28" font-weight="700" font-family="Inter, system-ui, sans-serif">
+        Diagram Title Here
+      </text>
+      <text x="40" y="78" fill="var(--c-text-body)" font-size="14" font-family="Inter, system-ui, sans-serif">
+        Subtitle or description
+      </text>
+
+      <!-- ===== SECTION 2+: Add diagram sections here ===== -->
+      <!-- Use <g id="section-xxx" data-layer="summary"> for layer-aware sections -->
+
+      <!-- Tooltip (hidden by default) -->
+      <g id="tooltip" style="display:none; pointer-events:none;">
+        <rect x="0" y="0" width="200" height="36" rx="6" ry="6" fill="#1e293b" stroke="#334155" stroke-width="1" opacity="0.95" />
+        <text x="10" y="23" fill="#f1f5f9" font-size="13" font-family="Inter, system-ui, sans-serif" id="tooltip-text">Tooltip</text>
+      </g>
+    </svg>
+  </div>
+
+  <!-- Detail Panel (slide-in from right) -->
+  <div id="detail-panel" class="fixed right-0 top-0 h-full w-96 bg-white shadow-2xl transform translate-x-full transition-transform duration-300 z-50 overflow-y-auto border-l border-gray-200">
+    <div class="p-6">
+      <button id="detail-close" class="absolute top-4 right-4 text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>
+      <h2 id="detail-title" class="text-xl font-bold text-blue-900 mb-4"></h2>
+      <div id="detail-content" class="text-gray-600 text-sm leading-relaxed"></div>
+    </div>
+  </div>
+
+  <!-- Modal Overlay -->
+  <div id="modal-overlay" class="fixed inset-0 bg-black/50 hidden z-50 flex items-center justify-center p-8">
+    <div class="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[80vh] overflow-y-auto">
+      <div class="p-6">
+        <div class="flex justify-between items-center mb-4">
+          <h3 id="modal-title" class="text-lg font-bold text-slate-800"></h3>
+          <button id="modal-close" class="text-gray-400 hover:text-gray-600 text-2xl leading-none">&times;</button>
+        </div>
+        <div id="modal-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // === Render Ready Signal (for Playwright validation) ===
+    window.__diagramReady = false;
+    window.__renderComplete = false;
+
+    const svg = document.getElementById('diagram');
+
+    // === Tooltip ===
+    function showTooltip(evt, text) {
+      const tooltip = document.getElementById('tooltip');
+      const tooltipText = document.getElementById('tooltip-text');
+      tooltipText.textContent = text;
+      const bbox = tooltipText.getBBox();
+      tooltip.querySelector('rect').setAttribute('width', bbox.width + 20);
+
+      const pt = svg.createSVGPoint();
+      pt.x = evt.clientX;
+      pt.y = evt.clientY;
+      const svgPt = pt.matrixTransform(svg.getScreenCTM().inverse());
+      tooltip.setAttribute('transform', `translate(${svgPt.x + 12}, ${svgPt.y - 45})`);
+      tooltip.style.display = '';
+    }
+
+    function hideTooltip() {
+      document.getElementById('tooltip').style.display = 'none';
+    }
+
+    // === Detail Panel ===
+    function showDetail(title, contentHtml) {
+      document.getElementById('detail-title').textContent = title;
+      document.getElementById('detail-content').innerHTML = contentHtml;
+      document.getElementById('detail-panel').classList.remove('translate-x-full');
+    }
+
+    document.getElementById('detail-close').addEventListener('click', () => {
+      document.getElementById('detail-panel').classList.add('translate-x-full');
+    });
+
+    // === Modal ===
+    function showModal(title, bodyHtml) {
+      document.getElementById('modal-title').textContent = title;
+      document.getElementById('modal-body').innerHTML = bodyHtml;
+      document.getElementById('modal-overlay').classList.remove('hidden');
+    }
+
+    document.getElementById('modal-close').addEventListener('click', () => {
+      document.getElementById('modal-overlay').classList.add('hidden');
+    });
+
+    document.getElementById('modal-overlay').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) {
+        document.getElementById('modal-overlay').classList.add('hidden');
+      }
+    });
+
+    // === Keyboard: Escape to close ===
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        document.getElementById('detail-panel').classList.add('translate-x-full');
+        document.getElementById('modal-overlay').classList.add('hidden');
+      }
+    });
+
+    // === Keyboard navigation for interactive elements ===
+    document.querySelectorAll('[data-interactive="true"]').forEach(el => {
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          el.click();
+        }
+      });
+    });
+
+    // === Layer Toggle ===
+    function setLayer(layer) {
+      document.querySelectorAll('.layer-btn').forEach(btn => {
+        if (btn.dataset.layer === layer) {
+          btn.classList.add('active');
+          btn.classList.remove('bg-gray-100', 'text-gray-500');
+        } else {
+          btn.classList.remove('active');
+          btn.classList.add('bg-gray-100', 'text-gray-500');
+        }
+      });
+
+      document.querySelectorAll('svg [data-layer]').forEach(el => {
+        const layers = el.dataset.layer.split(',');
+        el.style.display = layers.includes(layer) ? '' : 'none';
+      });
+    }
+
+    // === Export PNG ===
+    function exportPNG() {
+      const svgEl = document.getElementById('diagram');
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const data = new XMLSerializer().serializeToString(svgEl);
+      const img = new Image();
+      const blob = new Blob([data], { type: 'image/svg+xml;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      img.onload = () => {
+        canvas.width = img.width * 2;
+        canvas.height = img.height * 2;
+        ctx.scale(2, 2);
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        const a = document.createElement('a');
+        a.download = 'diagram.png';
+        a.href = canvas.toDataURL('image/png');
+        a.click();
+      };
+      img.src = url;
+    }
+
+    // === Export SVG ===
+    function exportSVG() {
+      const svgEl = document.getElementById('diagram');
+      const data = new XMLSerializer().serializeToString(svgEl);
+      const blob = new Blob([data], { type: 'image/svg+xml' });
+      const a = document.createElement('a');
+      a.download = 'diagram.svg';
+      a.href = URL.createObjectURL(blob);
+      a.click();
+    }
+
+    // === Copy Code ===
+    function copyCode(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        // Visual feedback handled by caller
+      });
+    }
+
+    // === Signal ready ===
+    window.__diagramReady = true;
+    window.__renderComplete = true;
+  </script>
+</body>
+</html>

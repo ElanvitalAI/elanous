@@ -2,8 +2,8 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordHitlOnCard, recordLaunchOnCard, recordOutcomeOnCard, recordTriageOnCards, type StewardCardStore } from './steward-cards.js';
-import { scheduleTriage, triageIssues, type ScheduledDecision, type TriageIssue } from './triage.js';
+import { recordHitlOnCard, recordIntakeOnCards, recordLaunchOnCard, recordOutcomeOnCard, recordTriageOnCards, type StewardCardStore } from './steward-cards.js';
+import { runStewardStage, scheduleTriage, triageIssues, type ScheduledDecision, type TriageIssue } from './triage.js';
 import { CardStore, foldSections, type TaskCard } from '../task-cards/card-store.js';
 
 const issues: TriageIssue[] = [
@@ -37,6 +37,121 @@ function fakeStore(): StewardCardStore & { cards: TaskCard[] } {
     close() {},
   };
 }
+
+test('intake alone creates one card per identifier, preserves an existing intake and leaves triage to judgment', () => {
+  const store = fakeStore();
+  const now = () => new Date('2026-09-28T00:00:00Z');
+  recordIntakeOnCards(store, [issues[0]!, issues[0]!], now);
+  const before = structuredClone(store.cards[0]);
+  recordIntakeOnCards(store, [{ ...issues[0]!, title: 'Changed', body: '출처: pwa' }], now);
+  expect(store.cards).toHaveLength(1);
+  expect(store.cards[0]).toEqual(before);
+  expect(store.cards[0]!.goalId).toBe('linear:ELA-1');
+  expect(store.cards[0]!.sections.map(section => section.key)).toEqual(['intake:ELA-1']);
+  recordTriageOnCards(decisions.slice(0, 1), issues, { store, now });
+  expect(store.cards).toHaveLength(1);
+  expect(store.cards[0]!.sections[0]).toEqual(before!.sections[0]);
+  expect(store.cards[0]!.sections.map(section => section.key.split(':')[0])).toEqual(['intake', 'triage']);
+});
+
+test('sync with fake Linear fetch writes intake before triage and retries without duplicate cards', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-sync-intake-'));
+  let calls = 0;
+  const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+    expect((init?.headers as Record<string, string>).Authorization).toBe('k');
+    calls++;
+    return Response.json({ data: { issues: { nodes: [{ id: 'one', identifier: 'ELA-1', title: 'Build', description: 'source detail', url: '', priority: 2, updatedAt: '2026-09-28T00:00:00Z', state: { type: 'started' } }], pageInfo: { hasNextPage: false, endCursor: null } } } });
+  }) as typeof fetch;
+  const deps = { root, fetch: fetchFn, getSecret: async () => 'k', now: () => new Date('2026-09-28T00:00:00Z') };
+  try {
+    await runStewardStage('sync', deps);
+    await runStewardStage('sync', deps);
+    const store = new CardStore(root);
+    try {
+      const cards = store.listCards();
+      expect(cards).toHaveLength(1);
+      expect(cards[0]!.goalId).toBe('linear:ELA-1');
+      expect(cards[0]!.sections.map(section => section.key)).toEqual(['intake:ELA-1']);
+      expect(JSON.parse(cards[0]!.sections[0]!.content)).toEqual({ summary: 'Build', source: 'linear:ELA-1', at: '2026-09-28T00:00:00.000Z' });
+    } finally { store.close(); }
+    expect(calls).toBe(2);
+    await runStewardStage('triage', { ...deps, judge: async () => ({ rung: 4, dependsOn: [], priority: 1, why: 'fake judgment' }), decide: () => true });
+    const afterTriage = new CardStore(root);
+    try {
+      expect(afterTriage.listCards()).toHaveLength(1);
+      expect(afterTriage.listCards()[0]!.sections.map(section => section.key)).toEqual(['intake:ELA-1']);
+    } finally { afterTriage.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('failed Linear polling creates no card and failed card write warns without failing sync', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-sync-failures-'));
+  const fetchFn = (async (_url: string | URL | Request, _init?: RequestInit): Promise<Response> => { throw new Error('poll unavailable'); }) as typeof fetch;
+  const warnings: string[] = [];
+  try {
+    await expect(runStewardStage('sync', { root, fetch: fetchFn, getSecret: async () => 'k' })).rejects.toThrow('Linear GraphQL request failed');
+    const store = new CardStore(root);
+    try { expect(store.listCards()).toHaveLength(0); }
+    finally { store.close(); }
+    const failingStore = { ...fakeStore(), createCard: () => { throw new Error('write unavailable'); } } as StewardCardStore;
+    const successFetch = (async (_url: string | URL | Request, _init?: RequestInit) => Response.json({ data: { issues: { nodes: [{ id: 'one', identifier: 'ELA-1', title: 'Build', description: '', url: '', priority: 2, updatedAt: '2026-09-28T00:00:00Z', state: { type: 'started' } }], pageInfo: { hasNextPage: false, endCursor: null } } } })) as typeof fetch;
+    await runStewardStage('sync', { root, fetch: successFetch, getSecret: async () => 'k', cardStore: failingStore, warn: text => { warnings.push(text); } });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('steward sync: card write failed (ELA-1): write unavailable');
+    const after = new CardStore(root);
+    try { expect(after.listCards()).toHaveLength(0); }
+    finally { after.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('sync isolates either createCard or appendSection failure per issue and retries the missing intake', async () => {
+  for (const failingOperation of ['createCard', 'appendSection'] as const) {
+    const root = mkdtempSync(join(tmpdir(), 'steward-sync-partial-'));
+    const store = new CardStore(root);
+    const warnings: string[] = [];
+    let failFirst = true;
+    let fetchCalls = 0;
+    const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+      expect((init?.headers as Record<string, string>).Authorization).toBe('k');
+      fetchCalls++;
+      return Response.json({ data: { issues: { nodes: [
+        { id: 'one', identifier: 'ELA-1', title: 'Build', description: '', url: '', priority: 2, updatedAt: '2026-09-28T00:00:00Z', state: { type: 'started' } },
+        { id: 'two', identifier: 'ELA-2', title: 'Review', description: '', url: '', priority: 2, updatedAt: '2026-09-28T00:00:00Z', state: { type: 'started' } },
+      ], pageInfo: { hasNextPage: false, endCursor: null } } } });
+    }) as typeof fetch;
+    const cardStore: StewardCardStore = {
+      createCard(input) {
+        if (failingOperation === 'createCard' && input.goalId === 'linear:ELA-1' && failFirst) {
+          failFirst = false;
+          throw new Error('create unavailable');
+        }
+        return store.createCard(input);
+      },
+      appendSection(id, input) {
+        if (failingOperation === 'appendSection' && input.key === 'intake:ELA-1' && failFirst) {
+          failFirst = false;
+          throw new Error('append unavailable');
+        }
+        return store.appendSection(id, input);
+      },
+      close() {},
+    };
+    try {
+      const deps = { root, fetch: fetchFn, getSecret: async () => 'k', cardStore, warn: (text: string) => { warnings.push(text); } };
+      await runStewardStage('sync', deps);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(`steward sync: card write failed (ELA-1): ${failingOperation === 'createCard' ? 'create' : 'append'} unavailable`);
+      expect(store.listCards().find(card => card.goalId === 'linear:ELA-2')?.sections.map(section => section.key)).toEqual(['intake:ELA-2']);
+      await runStewardStage('sync', deps);
+      const cards = store.listCards();
+      expect(cards).toHaveLength(2);
+      expect(cards.map(card => card.goalId).sort()).toEqual(['linear:ELA-1', 'linear:ELA-2']);
+      for (const card of cards) expect(card.sections.map(section => section.key)).toEqual([`intake:${card.goalId.slice('linear:'.length)}`]);
+      expect(warnings).toHaveLength(1);
+      expect(fetchCalls).toBe(2);
+    } finally { store.close(); rmSync(root, { recursive: true, force: true }); }
+  }
+});
 
 test('three judgments create three cards, two steward-owned sections each; retries keep their count and HITL status', () => {
   const store = fakeStore();

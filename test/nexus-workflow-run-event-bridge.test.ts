@@ -44,6 +44,13 @@ describe('publishWorkflowRunEvent (§15.8(b))', () => {
       runId: 'wf-test-001',
       workflowName: 'demo',
     });
+    expect(events[0]!.detail).not.toHaveProperty('mode');
+  });
+
+  it('publishes the known runtime mode without guessing missing ones', () => {
+    const events = collect('workflow.run.');
+    publishWorkflowRunEvent(ctx, { type: 'workflow_start', workflow: 'demo', runId: ctx.runId, mode: 'test' });
+    expect(events[0]!.detail).toMatchObject({ mode: 'test' });
   });
 
   it('maps node_start → workflow.run.node-started with nodeId', () => {

@@ -53,6 +53,7 @@ import {
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 import { elanousSelfAccessPrompt } from '../agent/self-ambient.js';
 import { createToolCwdResolver, type ToolCwdResolver } from './tool-cwd.js';
+import { resolveSessionProjectContext } from '../project/session-context.js';
 import { debug } from '../debug/log.js';
 
 /** C4 (2026-07-12) — arm the non-detached-PTY kill ONCE per turn signal.
@@ -579,7 +580,9 @@ export function createDaemonRunTurn(
     // moved this out of an inline closure to fix the user-message
     // persistence bug uniformly across all daemon paths.
     getMessages: ({ sessionId, userText, promptBlocks, promptMeta }) => {
-      const baseSystemPrompt = composeDaemonSystemPrompt(opts.systemPrompt, promptMeta, sessionId);
+      const projectInstructions = resolveSessionProjectContext(sessionId)?.instructions;
+      const baseSystemPrompt = [composeDaemonSystemPrompt(opts.systemPrompt, promptMeta, sessionId), projectInstructions]
+        .filter(Boolean).join('\n\n');
       // Image-pipeline followup #4 (2026-05-05) — append daemon webterm
       // context (current ACP sessionId + active terminal summary) to
       // the system prompt when the webterm surface is active. Helper
@@ -720,8 +723,11 @@ export function createDaemonRunTurn(
         });
         debugBridge.activate();
       }
-      if (opts.acpSessionCwd) {
-        const resolver = createToolCwdResolver({ tools: opts.tools ?? 'none', toolCwd: turnCtx.cwd });
+      const projectCwd = resolveSessionProjectContext(turnCtx.sessionId)?.cwd;
+      if (projectCwd || opts.acpSessionCwd) {
+        // An ACP session's explicit cwd wins; the project folder is only the default when none was given (IA3 review).
+        const explicitCwd = opts.acpSessionCwd && turnCtx.cwd ? turnCtx.cwd : undefined;
+        const resolver = createToolCwdResolver({ tools: opts.tools ?? 'none', toolCwd: explicitCwd ?? projectCwd ?? turnCtx.cwd });
         await turnToolCwd.run(resolver, () => inner(turnCtx));
       } else {
         await inner(turnCtx);

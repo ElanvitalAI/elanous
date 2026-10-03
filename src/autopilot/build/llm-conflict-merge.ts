@@ -9,6 +9,17 @@ import { join } from 'node:path';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { runGitCommand } from '../../git-fs/runner.js';
 import { countTestDeclarations } from '../../self-implement/test-declarations.js';
+import { NEXT_MD_PATH, resolveNextMdConflict } from '../../release-loop/next-md-merge.js';
+
+function deterministicNextMd(git: MergeGitSeam, worktreePath: string, file: string): string | null {
+  try {
+    const resolved = resolveNextMdConflict(git.readIndexStage(worktreePath, 1, file), git.readIndexStage(worktreePath, 2, file), git.readIndexStage(worktreePath, 3, file));
+    void import('../../debug/log.js').then(({ debug }) => debug.log('self-dev.merge', 'next-md-deterministic', { resolved: resolved !== null })).catch(() => {});
+    return resolved;
+  } catch {
+    return null; // a stage is missing (added/deleted on one side) — the usual resolver decides
+  }
+}
 
 /** 충돌 마커가 남아있나(LLM 이 해결 못 함 판별). ours/base/theirs 3-way 마커 모두. 순수. */
 export function hasConflictMarkers(s: string): boolean {
@@ -130,8 +141,8 @@ export interface MergeGitSeam {
   merge: (wt: string, mergeTarget: string) => { ok: boolean; conflict: boolean; stdout: string; errorDetail?: string };
   /** 충돌(unmerged) 파일 목록(worktree 상대 경로). */
   conflictedFiles: (wt: string) => string[];
-  /** Reads an unmerged index stage (2=ours, 3=theirs) for a conflicted file. */
-  readIndexStage: (wt: string, stage: 2 | 3, file: string) => string;
+  /** Reads an unmerged index stage (1=base, 2=ours, 3=theirs) for a conflicted file. */
+  readIndexStage: (wt: string, stage: 1 | 2 | 3, file: string) => string;
   readFile: (absPath: string) => string;
   writeFile: (absPath: string, content: string) => void;
   /** 해결된 파일 스테이징. */
@@ -193,7 +204,9 @@ export async function mergeMainWithLlmResolve(
     let merged: string;
     try {
       conflicted = git.readFile(abs);
-      merged = await resolve(f, conflicted);
+      // release/next.md: concurrent landings each append a line — keep both without asking the LLM (REL7c).
+      const deterministic = f === NEXT_MD_PATH ? deterministicNextMd(git, worktreePath, f) : null;
+      merged = deterministic ?? await resolve(f, conflicted);
     } catch {
       git.abort(worktreePath); // LLM 예외 → base 유지
       return measuredOutcome({ status: 'conflict-unresolved', resolvedFiles });

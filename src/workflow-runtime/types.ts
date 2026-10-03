@@ -25,17 +25,22 @@ export interface NodeOutput {
   error?: string;
   /** Wall-clock duration in ms. */
   durationMs: number;
+  /** Run id of the workflow called by a subworkflow node, including failures. */
+  childRunId?: string;
 }
 
 /** Lifecycle event streamed during workflow execution. Consumers
  *  (PWA SSE, CLI, tests) listen and render. */
-export type WorkflowEvent =
+export type WorkflowRunMode = 'full' | 'only' | 'from' | 'test';
+
+export type WorkflowEvent = (
   | { type: 'workflow_start'; workflow: string; runId: string }
-  | { type: 'node_start'; nodeId: string; nodeType: string }
+  | { type: 'node_start'; nodeId: string; nodeType: string; childRunId?: string }
   | { type: 'node_skipped'; nodeId: string; reason: string }
-  | { type: 'node_done'; nodeId: string; result: NodeOutput }
+  | { type: 'node_done'; nodeId: string; result: NodeOutput; childRunId?: string }
   | { type: 'workflow_done'; outputs: Record<string, NodeOutput> }
-  | { type: 'workflow_failed'; error: string; partial: Record<string, NodeOutput> };
+  | { type: 'workflow_failed'; error: string; partial: Record<string, NodeOutput> }
+) & { mode?: WorkflowRunMode };
 
 /** Trigger rule semantics for a node with multiple `depends_on` edges:
  *  - all_success: every dep must have ok=true (strict — Archon default)
@@ -49,6 +54,8 @@ export interface DagNodeBase {
   depends_on?: string[];
   when?: string;
   trigger_rule?: TriggerRule;
+  /** Run this node on failure; the failed NodeOutput is available as $<id>.output / $<id>.error. */
+  on_error?: string;
   model?: string;
   provider?: string;
   /** ToolPolicy (T1.1). Same wire format as skill manifest. */
@@ -478,6 +485,14 @@ export interface WorkflowTaskResult {
   error?: string;
 }
 
+/** Invoke a discovered workflow as one node. */
+export interface SubworkflowNode extends DagNodeBase {
+  kind: 'subworkflow';
+  workflow: string;
+  /** Input name → expression interpolated against the parent's outputs. */
+  inputs: Record<string, string>;
+}
+
 /** Plugin node. `kind` is `<plugin>:<kind>` registered in the graph-kinds registry.
  *  The body lives on the registry entry's `run`, not on the node. */
 export interface PluginKindNode extends DagNodeBase {
@@ -508,6 +523,7 @@ export type DagNode =
   | (TelegramTriggerNode & { kind?: undefined })
   | (ManualTriggerNode & { kind?: undefined })
   | (ChatTriggerNode & { kind?: undefined })
+  | SubworkflowNode
   | PluginKindNode;
 
 /** M4-3.2 (FU8 PR #8 · 2026-05-12) — provenance metadata stamped on
@@ -539,6 +555,8 @@ export interface WorkflowDefinition {
   provider?: string;
   model?: string;
   interactive?: boolean;
+  /** Maximum simultaneous nodes (1 by default, at most 8). */
+  concurrency?: number;
   nodes: DagNode[];
   /** M4-3.2 — optional provenance block. See `WorkflowMeta`. */
   _meta?: WorkflowMeta;
@@ -614,6 +632,19 @@ export interface RunWorkflowOpts {
   judgmentContext?: Omit<JudgmentContext, 'goal' | 'outcome' | 'lifecycle' | 'screen'>;
   /** Override the runId (default: `wf-<unix-ms>-<rnd6>`). */
   runId?: string;
+  /** Execute just this node, without running its upstream dependencies. */
+  onlyNode?: string;
+  /** Resume at this node using node results from a completed prior run. */
+  fromNode?: string;
+  previousOutputs?: Record<string, NodeOutput>;
+  /** Active workflow names, propagated only to child runs for cycle protection. */
+  workflowStack?: string[];
+  /** Maximum number of nested workflow calls (default 5). */
+  maxSubworkflowDepth?: number;
+  /** Child runs ignore pins so only the parent editor's pins are applied. */
+  ignorePins?: boolean;
+  /** Test blocks unpinned external side-effect nodes. */
+  mode?: WorkflowRunMode;
   /** Surface-unification §D3 (2026-05-11) — when true, every trigger
    *  node is emitted as `node_skipped` (reason='dry-run') instead of
    *  being executed. Lets the PWA "▶ Run now (skip triggers)" button

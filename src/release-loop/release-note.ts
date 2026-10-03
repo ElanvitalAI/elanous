@@ -1,6 +1,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
+import { debug } from '../debug/log.js';
 
 export interface ReleaseNoteFragment {
   pr: number;
@@ -12,7 +13,8 @@ export interface ReleaseNoteFragment {
   mergeSha?: string;
 }
 
-type Section = Omit<ReleaseNoteFragment, 'pr' | 'source' | 'mergeSha'>;
+export type ReleaseNoteSection = Omit<ReleaseNoteFragment, 'pr' | 'source' | 'mergeSha'>;
+type Section = ReleaseNoteSection;
 
 /** Blank out fenced code blocks (``` / ~~~) line-for-line so example headings and fields inside them are never read as the real section. */
 function blankFencedCode(text: string): string {
@@ -69,10 +71,10 @@ export function renderReleaseNoteSection(fragment: Section): string {
   return `## 릴리스 노트\n- 한 줄: ${fragment.line}\n- 종류: ${fragment.kind}\n- 문서: ${'path' in fragment.docs ? fragment.docs.path : `없음(${fragment.docs.none})`}\n- 대상: ${fragment.target}\n`;
 }
 
-export function harnessReleaseNote(goalDocument: string, title: string): Section {
+export function parseGoalReleaseNoteSection(goalDocument: string): ReturnType<typeof parseReleaseNoteSection> & { hasSection: boolean } {
   const document = blankFencedCode(goalDocument);
   const goal = /^ {0,3}## 목표[ \t]*\r?$/m.exec(document);
-  let section = '';
+  let section = goal ? '' : document;
   if (goal) {
     const rest = document.slice(goal.index + goal[0].length);
     let end = rest.length;
@@ -84,12 +86,65 @@ export function harnessReleaseNote(goalDocument: string, title: string): Section
     }
     section = rest.slice(0, end);
   }
-  return parseReleaseNoteSection(section).fragment ?? {
+  return {
+    ...parseReleaseNoteSection(section),
+    hasSection: /(?:^|\n)## 릴리스 노트[ \t]*\r?(?:\n|$)/.test(section),
+  };
+}
+
+export function harnessReleaseNote(goalDocument: string, title: string, shard = false): Section {
+  const parsed = parseGoalReleaseNoteSection(goalDocument);
+  if (parsed.fragment) return parsed.fragment;
+  debug.log('release-note', 'harness-fallback', {
+    reason: parsed.hasSection ? 'invalid' : 'missing',
+    shard,
+  });
+  return {
     line: title,
     kind: 'internal',
     docs: { none: '하니스 자동 생성' },
     target: 'next',
   };
+}
+
+/** Only the worktree's release notes enter the public cut. Keep repeats byte-for-byte idempotent. */
+export function addNextMdReleaseNote(worktreePath: string, note: Section): boolean {
+  if (note.target !== 'next' || note.kind === 'internal') return false;
+  const path = join(worktreePath, 'release', 'next.md');
+  // Public next notes require the worktree's cut source; ENOENT must stop PR creation.
+  const text = readFileSync(path, 'utf8');
+  const sentence = note.line.trim();
+  const prefixed = sentence.startsWith(`${note.kind} — `) ? sentence : `${note.kind} — ${sentence}`;
+  const item = `- ${prefixed.replace(/\.$/, '')}. Documentation: ${'path' in note.docs ? note.docs.path : 'none'}. Target: next.`;
+  const lines = text.split('\n');
+  const sameSentence = (line: string) => line.replace(/\r$/, '')
+    .replace(/\. Documentation:.*$/, '').replace(/\.$/, '') === `- ${prefixed.replace(/\.$/, '')}`;
+  const existing = lines.findIndex(sameSentence);
+  if (existing >= 0) {
+    if (lines[existing]!.replace(/\r$/, '') === item) return false;
+    // Same sentence, different documentation: the PR body is the source — make next.md say the same thing.
+    lines[existing] = item;
+    writeFileSync(path, lines.join('\n'));
+    debug.log('release-note', 'next-md-updated', { kind: note.kind, docs: 'path' in note.docs ? 'path' : 'none' });
+    return true;
+  }
+  const heading = `## ${note.kind === 'feat' ? 'Feat' : note.kind === 'fix' ? 'Fix' : 'Security'}`;
+  let index = lines.findIndex((line) => line.trimEnd() === heading);
+  if (index < 0) {
+    const fix = lines.findIndex((line) => line.trimEnd() === '## Fix');
+    if (fix < 0) throw new Error(`release/next.md has no ## Fix section: ${path}`);
+    index = fix + 1;
+    while (index < lines.length && !/^##\s/.test(lines[index]!)) index++;
+    lines.splice(index, 0, heading, '');
+    index++;
+  }
+  index++;
+  while (index < lines.length && !/^##\s/.test(lines[index]!)) index++;
+  while (index > 0 && lines[index - 1] === '') index--;
+  if (index === lines.findIndex((line) => line.trimEnd() === heading) + 1) lines.splice(index++, 0, '');
+  lines.splice(index, 0, item);
+  writeFileSync(path, lines.join('\n'));
+  return true;
 }
 
 export function releaseNotesDir(instanceRoot: string): string {

@@ -3,6 +3,7 @@
 import { debug, redactSecretText } from '../../debug/log.js';
 import { parseOwner, type ChecklistItem } from '../../release-loop/checklist.js';
 import { canonicalSeatId } from '../../msg/msg-store.js';
+import { listSubSeatCharters, type SubSeatCharter } from './sub-seat-charters.js';
 
 export const SEATS = [
   { seat: 'OP', role: 'COO' }, { seat: 'TC', role: 'CTO' }, { seat: 'MK', role: 'CMO' }, { seat: 'UX', role: 'CXO' },
@@ -26,6 +27,7 @@ export interface SeatsSources {
   checklist(): { current: ChecklistItem[]; all: ChecklistItem[] } | null;
   /** `raisedBy.agent` of every open decision. */
   openDecisionRaisers(): string[] | null;
+  charters?(): SubSeatCharter[] | null;
 }
 
 export interface SeatRow {
@@ -36,6 +38,7 @@ export interface SeatRow {
   blocked: Array<{ id: string; title: string; status: 'red' }> | null;
   pendingDecisions: number | null;
   checklist: { green: number; yellow: number; red: number; done: number } | null;
+  subSeats: Array<{ id: string; title: string; open: number | null; landed: number | null; blocked: Array<{ id: string; title: string }> | null }> | null;
 }
 
 function seatOf(value: string | undefined): string | null {
@@ -65,16 +68,37 @@ export async function buildSeatsBoard(date: string, sources: SeatsSources): Prom
   try { checklist = sources.checklist(); } catch { checklist = null; }
   let raisers: string[] | null = null;
   try { raisers = sources.openDecisionRaisers(); } catch { raisers = null; }
+  let charters: SubSeatCharter[] | null = null;
+  try {
+    if (sources.charters) charters = sources.charters();
+    else {
+      let unreadable = false;
+      const listed = listSubSeatCharters(undefined, () => { unreadable = true; });
+      charters = unreadable ? null : listed;
+    }
+  } catch { charters = null; }
 
   const owners = new Map<string, string>();
   for (const item of checklist?.all ?? []) { const seat = seatOf(item.owner); if (seat) owners.set(item.id, seat); }
   const ids = [...owners.keys()];
   const landedBySeat = new Map<string, NonNullable<SeatRow['landed']>>();
+  const landedBySub = new Map<string, number>();
+  const subOwner = (owner: string | undefined, charter: SubSeatCharter): boolean => {
+    if (!owner) return false;
+    try { const parsed = parseOwner(owner); return owner === charter.id && parsed.seat === charter.seat && parsed.sub === charter.sub; }
+    catch { return false; }
+  };
+  const subOwners = new Map(checklist?.all.flatMap((item) => {
+    const charter = charters?.find((candidate) => subOwner(item.owner, candidate));
+    return charter ? [[item.id, charter.id] as const] : [];
+  }) ?? []);
   for (const pr of merged ?? []) {
     const id = checklistIdOf(pr, ids);
     const seat = id ? owners.get(id) : undefined;
     if (!seat) continue; // ⛔ not by commit author — every seat lands through the same account.
     landedBySeat.set(seat, [...(landedBySeat.get(seat) ?? []), { pr: pr.number, title: clip(pr.title, 80), at: pr.mergedAt, checklistId: id }]);
+    const sub = id ? subOwners.get(id) : undefined;
+    if (sub) landedBySub.set(sub, (landedBySub.get(sub) ?? 0) + 1);
   }
 
   const seats = SEATS.map(({ seat, role }): SeatRow => {
@@ -91,6 +115,15 @@ export async function buildSeatsBoard(date: string, sources: SeatsSources): Prom
         green: mine.filter((i) => i.status === 'green').length, yellow: mine.filter((i) => i.status === 'yellow').length,
         red: mine.filter((i) => i.status === 'red').length, done: mine.filter((i) => i.status === 'done').length,
       } : null,
+      subSeats: charters?.filter((charter) => charter.seat === seat).map((charter) => {
+        const items = checklist?.current.filter((item) => subOwner(item.owner, charter));
+        return {
+          id: charter.id, title: clip(charter.title, 80),
+          open: items ? items.filter((item) => item.status !== 'done').length : null,
+          landed: merged !== null && checklist !== null ? landedBySub.get(charter.id) ?? 0 : null,
+          blocked: items ? items.filter((item) => item.status === 'red').map((item) => ({ id: item.id, title: clip(item.title, 80) })) : null,
+        };
+      }) ?? null,
     };
   });
   debug.log('ops.seats', 'built', {

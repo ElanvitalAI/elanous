@@ -1,16 +1,20 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { getElanousConfigDir, getElanousConfigDirOverride } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
+import { publishInsideEvent } from '../nexus/api/inside-events.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { listInstalledPlugins } from '../plugins/install/plugin-install.js';
 import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentials.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { loadNodeCatalog } from '../self-implement/graph-catalog.js';
-import { parseGraphTemplateYaml, type GraphEdgeSpec, type GraphNodeSpec } from '../self-implement/graph-yaml.js';
+import { proposeGrowth, type GraphGrowth, type GrowthProposer, type GrowthRecipeEffect } from './graph-grow.js';
+import { createLLMGrowthProposer } from './graph-grow-llm.js';
+import { parseGraphTemplateYaml, type GraphEdgeSpec, type GraphNodeSpec, type GraphTemplateSpec } from '../self-implement/graph-yaml.js';
+import { createGraphVariant, type GraphVariantPlan } from '../self-implement/graph-variant.js';
 import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import type { BashNode, NodeExecContext, WorkflowDeps } from '../workflow-runtime/types.js';
@@ -24,6 +28,8 @@ export interface GraphRunState {
   finishedAt?: string;
   pid?: number;
   pidStartedAt?: string;
+  activeNode?: { nodeId: string; pid: number; pidStartedAt: string };
+  stoppedAt?: string;
   status: 'running' | 'done' | 'failed' | 'budget-exceeded' | 'awaiting-approval';
   path: string[];
   nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string }>;
@@ -34,6 +40,10 @@ export interface GraphRunState {
   sourceHash?: string;
   graphSnapshot?: { graphSha: string; recipesSha: string };
   graphPath?: string;
+  variant?: { overlayId: string; goal: string; plan: GraphVariantPlan };
+  growth?: GraphGrowth[];
+  growthRejections?: Array<{ from: string; outcome: string; reason: string }>;
+  growthPark?: { from: string; outcome: string; reason: string };
   resume?: { from: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current' };
   executed: number;
   dryRun: boolean;
@@ -43,12 +53,13 @@ export interface GraphRunState {
 export interface GraphRunOptions {
   input?: unknown;
   dryRun?: boolean;
+  variant?: { goal: string; plan: GraphVariantPlan };
   runId?: string;
   resumeRunId?: string;
   resumeGraphId?: string;
   fromNodeId?: string;
   useCurrentGraph?: boolean;
-  deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void; processStartMs?: (pid: number) => number | null };
+  deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void; processStartMs?: (pid: number) => number | null; growthProposer?: GrowthProposer; growthLLM?: (prompt: string) => Promise<string>; classifyGrowthRecipe?: (node: GraphNodeSpec, resolved: { command?: string; approval?: string }) => GrowthRecipeEffect };
 }
 
 function safeSegment(value: string): string {
@@ -115,15 +126,32 @@ function recipesFor(path: string, recipeSource: string): Record<string, Recipe> 
   return recipes;
 }
 
-const realRunBash: BashRun = (body, opts) => new Promise((resolve, reject) => {
-  execFile('/bin/bash', ['-c', body], { cwd: opts.cwd, env: opts.env, timeout: opts.timeoutMs, signal: opts.signal, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
-    if (error && typeof (error as NodeJS.ErrnoException).code !== 'number') {
-      reject(error);
-      return;
+function realRunBash(onSpawn: (pid: number) => boolean): BashRun {
+  return (body, opts) => new Promise((resolve, reject) => {
+    let unverified: ReturnType<typeof setTimeout> | undefined;
+    const child = execFile('/bin/bash', ['-c', body], { cwd: opts.cwd, env: opts.env, timeout: opts.timeoutMs, signal: opts.signal, maxBuffer: 10 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (unverified) clearTimeout(unverified);
+      if (error && typeof (error as NodeJS.ErrnoException).code !== 'number') {
+        reject(error);
+        return;
+      }
+      resolve({ stdout, stderr, exitCode: error ? (error as unknown as { code: number }).code : 0 });
+    });
+    if (child.pid) {
+      try {
+        if (!onSpawn(child.pid)) {
+          // A process can exit before ps observes it. A completed child is safe to report;
+          // an unverified child still running must not be left without a tracked PID.
+          unverified = setTimeout(() => {
+            if (child.exitCode !== null || child.signalCode !== null) return;
+            child.kill('SIGTERM');
+            reject(new Error(`cannot verify node process start: ${child.pid}`));
+          }, 500);
+        }
+      } catch (error) { child.kill('SIGTERM'); reject(error); }
     }
-    resolve({ stdout, stderr, exitCode: error ? (error as unknown as { code: number }).code : 0 });
   });
-});
+}
 
 function graphRunPath(graphId: string, runId: string, root: string): string {
   return join(root, 'graph-runs', safeSegment(graphId), `${safeSegment(runId)}.json`);
@@ -164,11 +192,77 @@ function persistGraphRun(state: GraphRunState): void {
   renameSync(temporary, state.statePath);
 }
 
+/** A synchronous, per-ledger critical section shared by runner writes and stop/destroy. */
+function withRunWriteLock<T>(file: string, work: () => T): T {
+  mkdirSync(dirname(file), { recursive: true });
+  const lock = `${file}.write.lock`;
+  const staged = `${lock}.${randomUUID()}.staged`;
+  mkdirSync(staged);
+  const until = Date.now() + 5_000;
+  let acquired = false;
+  try {
+    writeFileSync(join(staged, 'owner.json'), JSON.stringify({ pid: process.pid, started: Date.now() - process.uptime() * 1_000 }), { flag: 'wx' });
+    while (!acquired) {
+      try {
+        // Unlike mkdir(lock) followed by a write, publication exposes an already complete owner.
+        symlinkSync(staged, lock, 'dir');
+        acquired = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        let owner: { pid: number; started: number } | undefined;
+        try { owner = JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8')); } catch { /* legacy unowned directory */ }
+        const ownerStart = owner && Number.isSafeInteger(owner.pid) && Number.isFinite(owner.started) ? psProcessStartMs(owner.pid) : undefined;
+        let stale = ownerStart !== undefined && (ownerStart === null || Math.abs(ownerStart - owner!.started) > START_TOLERANCE_MS);
+        if (!owner && !lstatSync(lock).isSymbolicLink()) {
+          // Legacy mkdir-before-owner crash: do not evict a writer still publishing its owner.
+          stale = Date.now() - statSync(lock).mtimeMs >= 5_000;
+        }
+        if (stale) {
+          try {
+            if (lstatSync(lock).isSymbolicLink()) {
+              const target = readlinkSync(lock);
+              if (!target.startsWith(`${lock}.`) || !target.endsWith('.staged')) throw new Error('invalid graph run write lock');
+              unlinkSync(lock);
+              rmSync(target, { recursive: true, force: true });
+            } else {
+              if (owner) unlinkSync(join(lock, 'owner.json'));
+              rmdirSync(lock);
+            }
+          } catch (cause) {
+            if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause;
+          }
+          continue;
+        }
+        if (Date.now() >= until) throw new Error(`graph run write lock is held: ${file}`);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+    }
+    return work();
+  } finally {
+    if (acquired && existsSync(lock) && lstatSync(lock).isSymbolicLink() && readlinkSync(lock) === staged) unlinkSync(lock);
+    rmSync(staged, { recursive: true, force: true });
+  }
+}
+
+function persistOwnedRun(state: GraphRunState, expected: Pick<GraphRunState, 'pid' | 'pidStartedAt' | 'stoppedAt'>, allowRestart = false): void {
+  withRunWriteLock(state.statePath, () => {
+    let disk: GraphRunState;
+    try { disk = JSON.parse(readFileSync(state.statePath, 'utf8')) as GraphRunState; }
+    catch (cause) { throw new Error(`run was removed or unreadable: ${state.graphId}/${state.runId}`, { cause }); }
+    if (disk.graphId !== state.graphId || disk.runId !== state.runId || disk.pid !== expected.pid ||
+        disk.pidStartedAt !== expected.pidStartedAt || disk.stoppedAt !== expected.stoppedAt ||
+        (disk.stoppedAt !== undefined && !allowRestart)) {
+      throw new Error(`run was stopped or ownership changed: ${state.graphId}/${state.runId}`);
+    }
+    persistGraphRun(state);
+  });
+}
+
 export interface ExpectedGraphApprovalVisit { nodeId: string; visit: number }
 
 export function decideGraphApproval(graphId: string, runId: string, decision: 'approved' | 'rejected', by?: string, root = effectiveInstanceRoot(), expected?: ExpectedGraphApprovalVisit): GraphRunState {
   const state = readGraphRun(graphId, runId, root);
-  if (state.status !== 'awaiting-approval' || !state.pending || state.pending.decision ||
+  if (state.status !== 'awaiting-approval' || !state.pending || state.growthPark || state.pending.decision ||
       (expected && (state.dryRun || state.pending.nodeId !== expected.nodeId || state.path.at(-1) !== expected.nodeId ||
         !Number.isSafeInteger(expected.visit) || expected.visit < 1 ||
         state.path.filter(node => node === expected.nodeId).length !== expected.visit))) {
@@ -208,6 +302,22 @@ export function lastJsonObject(stdout: unknown): Record<string, unknown> | undef
   }
 }
 
+/** Reconstruct the run-local edges from the ledger without rewriting the YAML snapshot. */
+function withGrowth(graph: GraphTemplateSpec, growth: readonly GraphGrowth[]): GraphTemplateSpec {
+  return growth.reduce<GraphTemplateSpec>((current, item) => {
+    const edge = current.edges.find((candidate) => candidate.from === item.undo.removeOutcome.from);
+    if (!edge || !edge.map || !item.node || item.undo.removeNode !== item.node.nodeId ||
+        current.nodes.some((node) => node.nodeId === item.node.nodeId) ||
+        Object.hasOwn(edge.map, item.undo.removeOutcome.outcome) ||
+        !item.edges.some((added) => added.from === edge.from && added.map?.[item.undo.removeOutcome.outcome] === item.node.nodeId)) {
+      throw new Error('invalid saved graph growth');
+    }
+    return { ...current, nodes: [...current.nodes, item.node], edges: current.edges.map((candidate) => candidate === edge
+      ? { ...edge, map: { ...edge.map, [item.undo.removeOutcome.outcome]: item.node.nodeId } } : candidate)
+      .concat(item.undo.removeEdge ? [item.undo.removeEdge] : []) };
+  }, graph);
+}
+
 /** 이름 붙은 결과: 산출의 `outcome` 이 그 간선 map 의 키면 그 목적지 — 아니면 종전 ok/fail(exit) → fallback. */
 function nextNode(edges: readonly GraphEdgeSpec[], nodeId: string, exitOutcome: 'ok' | 'fail', namedOutcome?: string): string | undefined {
   const edge = edges.find((e) => e.from === nodeId);
@@ -222,6 +332,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.resumeRunId && options.runId) throw new Error('runId and resumeRunId cannot be combined');
   if (options.fromNodeId && !options.resumeRunId) throw new Error('--from requires --resume');
   if (options.useCurrentGraph && !options.resumeRunId) throw new Error('--use-current-graph requires --resume');
+  if (options.variant && options.resumeRunId) throw new Error('variant cannot be combined with --resume');
   const root = options.deps?.root ?? effectiveInstanceRoot();
   const matchingRuns = options.resumeRunId && !options.resumeGraphId
     ? listGraphRuns(root).runs.filter((run) => run.runId === options.resumeRunId && run.graphPath === resolve(path)) : [];
@@ -250,7 +361,22 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   }
   const parsed = parseGraphTemplateYaml(stringifyYaml(document), path);
   if (!parsed.template || parsed.errors.length) throw new Error(parsed.errors.map((e) => `${e.path}: ${e.message}`).join('\n'));
-  const graph = parsed.template;
+  let graph = parsed.template;
+  const variant = options.variant ? createGraphVariant({ template: graph, ...options.variant }) : undefined;
+  if (variant && !variant.ok) throw new Error(`graph variant rejected: ${JSON.stringify(variant.rejections)}`);
+  if (variant?.ok) graph = variant.template;
+  const variantSource = variant?.ok ? stringifyYaml({ ...document,
+    nodes: graph.nodes.map((node, index) => ({
+      ...((document.nodes as Record<string, unknown>[])[index] ?? {}), node_id: node.nodeId, kind: node.kind,
+      recipe: node.recipe, max_visits: node.maxVisits,
+      ...(node.contract ? { contract: node.contract } : {}),
+    })),
+    edges: graph.edges.map((edge, index) => ({
+      ...((document.edges as Record<string, unknown>[])[index] ?? {}), from: edge.from,
+      ...(edge.to === undefined ? { on: edge.on, map: edge.map } : { to: edge.to }),
+      ...(edge.fallback ? { fallback: edge.fallback } : {}),
+    })),
+  }) : source;
   const pluginRoot = elanousStateRoot();
   const graphFile = graphMode === 'snapshot' && !existsSync(path) ? resolve(path) : realpathSync(path);
   const installed = listInstalledPlugins(pluginRoot);
@@ -276,7 +402,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const recipes = recipesFor(path, recipeSource);
   const catalogRoles = new Set(loadNodeCatalog().roles.keys());
   // Bind a human decision to the exact graph and recipe contents, not just its id or approval prompt.
-  const approvalSourceHash = createHash('sha256').update(source).update('\0').update(recipeSource).digest('hex');
+  const approvalSourceHash = createHash('sha256').update(variantSource).update('\0').update(recipeSource).digest('hex');
   // Resolve all commands before executing any node; an unknown recipe must never produce a partial publication.
   for (const node of graph.nodes) {
     if (node.recipe === 'none') continue;
@@ -307,12 +433,17 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   const state: GraphRunState = options.resumeRunId
     ? readGraphRun(graphId, runId, root)
     : { graphId, runId, startedAt: new Date().toISOString(), ...runnerOwner, status: 'running', path: [], nodes: [], sourceHash: approvalSourceHash,
-      graphSnapshot: { graphSha: createHash('sha256').update(source).digest('hex'), recipesSha: createHash('sha256').update(recipeSource).digest('hex') },
-      graphPath: resolve(path), ...(options.input === undefined ? {} : { input: options.input }), executed: 0, dryRun: options.dryRun === true, statePath };
+      graphSnapshot: { graphSha: createHash('sha256').update(variantSource).digest('hex'), recipesSha: createHash('sha256').update(recipeSource).digest('hex') },
+      graphPath: resolve(path), ...(variant?.ok ? { variant: { overlayId: variant.overlay.overlayId, ...options.variant! } } : {}),
+      ...(options.input === undefined ? {} : { input: options.input }), executed: 0, dryRun: options.dryRun === true, statePath };
   if (options.resumeRunId && graphMode === 'snapshot' && state.sourceHash && state.sourceHash !== approvalSourceHash) {
     throw new Error('graph snapshot changed since run started');
   }
   if (options.resumeRunId && options.dryRun !== undefined && options.dryRun !== state.dryRun) throw new Error('cannot change dryRun when resuming');
+  if (options.resumeRunId && state.growth?.length && graphMode === 'current' && state.sourceHash !== approvalSourceHash) {
+    throw new Error('graph or recipes changed since grown run');
+  }
+  if (state.growth?.length) graph = withGrowth(graph, state.growth);
   if (options.fromNodeId) {
     if (state.status !== 'failed' || state.pending || state.dryRun) throw new Error('--from requires a failed, non-dry run without pending approval');
     if (graphMode === 'current' && (!state.sourceHash || state.sourceHash !== approvalSourceHash)) throw new Error('graph or recipes changed since failed run');
@@ -353,10 +484,14 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     state.nodes = state.nodes.slice(0, from);
     state.executed = state.nodes.filter((node) => node.executed).length;
     state.status = 'running';
+    delete state.stoppedAt;
     Object.assign(state, runnerOwner);
     state.resume = { from: options.fromNodeId, at: new Date().toISOString(), previousStatus: 'failed', graph: graphMode };
     // Persist the restart boundary before executing it, so previous outputs remain durable.
-    persistGraphRun(state);
+    persistOwnedRun(state, saved!, true);
+  }
+  if (options.resumeRunId && state.growthPark) {
+    throw new Error(`growth is parked for human confirmation: ${graphId}/${runId}`);
   }
   if (options.resumeRunId && state.status === 'running' && state.pending) {
     throw new Error(`run is not awaiting approval: ${graphId}/${runId}`);
@@ -377,12 +512,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const previousStatus = state.status;
     Object.assign(state, runnerOwner);
     state.resume = { from: state.pending?.nodeId ?? state.path.at(-1) ?? graph.entryNode, at: new Date().toISOString(), previousStatus, graph: graphMode };
-    persistGraphRun(state);
+    persistOwnedRun(state, saved!);
   }
   if (options.resumeRunId) debug.log('graph.runs', 'resume', { graphId, runId, from: state.resume?.from, graph: graphMode });
   const persist = () => {
     if (state.status === 'done' || state.status === 'failed' || state.status === 'budget-exceeded') state.finishedAt ??= new Date().toISOString();
-    persistGraphRun(state);
+    persistOwnedRun(state, runnerOwner);
   };
   const log = options.deps?.log ?? ((event: string, data: Record<string, unknown>) => debug.log('graph.runner', event, data));
   const visits = new Map<string, number>();
@@ -399,15 +534,16 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       throw error;
     }
     mkdirSync(`${statePath}.graph`);
-    writeFileSync(join(`${statePath}.graph`, 'graph.yaml'), source, { flag: 'wx' });
+    writeFileSync(join(`${statePath}.graph`, 'graph.yaml'), variantSource, { flag: 'wx' });
     writeFileSync(join(`${statePath}.graph`, 'recipes.yaml'), recipeSource, { flag: 'wx' });
   }
   while (current !== undefined) {
     const node = graph.nodes.find((n) => n.nodeId === current);
     if (!node) throw new Error(`undeclared node: ${current}`);
     const resumingPending = state.pending?.nodeId === current;
-    const completed = [...state.nodes].reverse().find((recorded) => recorded.nodeId === current && recorded.executed);
-    const resumingCompleted = options.resumeRunId !== undefined && !options.fromNodeId && !!completed && state.path.at(-1) === current && !resumingPending;
+    const completed = state.nodes.at(-1);
+    const resumingCompleted = options.resumeRunId !== undefined && !options.fromNodeId && completed?.nodeId === current &&
+      state.path.at(-1) === current && !resumingPending;
     if (!resumingPending && !resumingCompleted && (visits.get(current) ?? 0) >= node.maxVisits) {
       state.status = 'budget-exceeded';
       log('budget-exceeded', { graphId, runId, nodeId: current });
@@ -447,6 +583,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const startedAt = performance.now();
     console.error(`[graph] ${current} start (0.00s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: 'start', dryRun: state.dryRun });
+    publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: 'start' });
     log('node-start', { graphId, runId, nodeId: current, visit: visits.get(current), dryRun: state.dryRun });
     persist();
     let ok = approval && !state.dryRun ? state.pending?.decision === 'approved' : true;
@@ -464,9 +601,27 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       const redactCredentials = (text: string) => Object.values(credentials).filter(value => value.length > 0)
         .reduce((safe, value) => safe.replaceAll(value, '[REDACTED]'), text);
       const runBash: BashRun = async (body, opts) => {
-        const result = await (options.deps?.runBash ?? realRunBash)(body, opts);
-        code = result.exitCode;
-        return { ...result, stdout: redactCredentials(result.stdout), stderr: redactCredentials(result.stderr) };
+        const execute = options.deps?.runBash ?? realRunBash((pid) => {
+          // Publish the child before its start time is known, so a concurrent stop refuses instead of failing
+          // the ledger while an untracked node keeps working (REL8b review round 3).
+          state.activeNode = { nodeId: current!, pid, pidStartedAt: UNVERIFIED_NODE_START };
+          persist();
+          const started = (options.deps?.processStartMs ?? psProcessStartMs)(pid);
+          if (started === null) return false;
+          state.activeNode = { nodeId: current!, pid, pidStartedAt: new Date(started).toISOString() };
+          persist();
+          return true;
+        });
+        try {
+          const result = await execute(body, opts);
+          code = result.exitCode;
+          return { ...result, stdout: redactCredentials(result.stdout), stderr: redactCredentials(result.stderr) };
+        } finally {
+          if (state.activeNode?.nodeId === current) {
+            delete state.activeNode;
+            persist();
+          }
+        }
       };
       if (owner) debug.log('plugin.credentials', 'injected', { plugin: owner.name, fields: credentialFields, count: credentialFields.length });
       const env = { ...process.env };
@@ -511,6 +666,8 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     const seconds = Number(((performance.now() - startedAt) / 1000).toFixed(2));
     console.error(`[graph] ${current} ${ok ? 'ok' : 'fail'} (${seconds.toFixed(2)}s)`);
     debug.log('graph.run', 'node', { graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds, exit });
+    publishInsideEvent({ kind: 'node', graphId, runId, nodeId: current, phase: ok ? 'ok' : 'fail', seconds });
+    publishInsideEvent({ kind: 'verdict', graphId, runId, nodeId: current, verdict: ok ? 'ok' : 'fail', ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }) });
     log('node-end', { graphId, runId, nodeId: current, ok, exit, ...(namedOutcome === undefined ? {} : { outcome: namedOutcome }), dryRun: state.dryRun });
     persist();
     if (graph.terminalNodes.includes(current)) {
@@ -518,7 +675,42 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       persist();
       break;
     }
+    const fromNodeId = current;
+    const edge = graph.edges.find((candidate) => candidate.from === current);
+    if (document.grow === 'on' && !state.dryRun && namedOutcome !== undefined &&
+        edge?.on === 'outcome' && edge.map && !Object.hasOwn(edge.map, namedOutcome) &&
+        !state.growth?.some((item) => item.undo.removeOutcome.from === current && item.undo.removeOutcome.outcome === namedOutcome) &&
+        !state.growthRejections?.some((item) => item.from === current && item.outcome === namedOutcome)) {
+      const result = (state.growth?.length ?? 0) >= 3 ? { ok: false as const, reason: 'growth limit 3 reached' }
+        : await proposeGrowth({ graph, nodeId: current, outcome: namedOutcome, runId, output: state.nodes.at(-1)?.output },
+          options.deps?.growthProposer ?? createLLMGrowthProposer(options.deps?.growthLLM), (candidate) => {
+            const resolved = resolveNodeRecipe(candidate, recipes, catalogRoles);
+            if (resolved.approval || (!resolved.command && candidate.recipe !== 'none')) return 'unknown';
+            return options.deps?.classifyGrowthRecipe?.(candidate, { command: resolved.command?.command }) ?? 'unknown';
+          });
+      if (result.ok) {
+        graph = result.graph;
+        state.growth ??= [];
+        state.growth.push(result.growth);
+        persist();
+        log('edge-added', { graphId, runId, from: current, outcome: namedOutcome, to: result.growth.node.nodeId });
+        debug.log('graph.run', 'edge-added', { graphId, runId, from: current, outcome: namedOutcome, to: result.growth.node.nodeId });
+        publishInsideEvent({ kind: 'edge-added', graphId, runId, from: current, outcome: namedOutcome, to: result.growth.node.nodeId });
+      } else {
+        state.growthRejections ??= [];
+        state.growthRejections.push({ from: current, outcome: namedOutcome, reason: result.reason });
+        if (result.park) {
+          state.status = 'awaiting-approval';
+          state.pending = { nodeId: current, message: result.reason, since: new Date().toISOString() };
+          state.growthPark = { from: current, outcome: namedOutcome, reason: result.reason };
+          persist();
+          break;
+        }
+      }
+      persist();
+    }
     current = nextNode(graph.edges, current, state.dryRun ? 'ok' : ok ? 'ok' : 'fail', state.dryRun ? undefined : namedOutcome);
+    if (current !== undefined) publishInsideEvent({ kind: 'edge', graphId, runId, from: fromNodeId, to: current });
     if (current === undefined) {
       state.status = 'failed';
       persist();
@@ -526,11 +718,111 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   }
   return state;
   } finally {
-    if (options.resumeRunId) rmdirSync(resumeLock);
+    if (options.resumeRunId && existsSync(resumeLock)) rmdirSync(resumeLock);
   }
 }
 
 export type GraphRunAlive = boolean | 'unknown';
+
+/** activeNode.pidStartedAt while the node child is spawned but its start time is not read yet — stop must not pass it. */
+const UNVERIFIED_NODE_START = 'unverified';
+/** A failed run's empty resume lock younger than this may belong to a resume that has not persisted «running» yet. */
+const RESUME_LOCK_GRACE_MS = 60_000;
+
+function runArtifacts(state: GraphRunState): string[] {
+  const file = state.statePath;
+  const claims = readdirSync(dirname(file))
+    .filter(name => name.startsWith(`${state.runId}.json.`) && /^\d+\.decision\.json$/.test(name.slice(`${state.runId}.json.`.length)))
+    .map(name => join(dirname(file), name));
+  for (const claim of claims) {
+    if (lstatSync(claim).isSymbolicLink()) throw new Error('graph run artifact is a symlink');
+    let value: unknown;
+    try { value = JSON.parse(readFileSync(claim, 'utf8')); }
+    catch { throw new Error(`invalid graph run decision claim: ${claim}`); }
+    const visit = Number(claim.slice(`${file}.`.length, -'.decision.json'.length));
+    if (!isDecisionClaim(value) || !Number.isSafeInteger(visit) || visit < 1 ||
+        (value as { nodeId: string }).nodeId !== state.path[visit - 1]) {
+      throw new Error(`invalid graph run decision claim: ${claim}`);
+    }
+  }
+  return [file, `${file}.graph`, `${file}.contexts`, ...claims];
+}
+
+/** Manage only an identity-checked ledger in this instance, never a caller-supplied path. */
+export function manageGraphRun(graphId: string, runId: string, action: 'stop' | 'destroy',
+  root = effectiveInstanceRoot(), processStartMs: (pid: number) => number | null = psProcessStartMs,
+  signal: (pid: number) => void = (pid) => process.kill(pid, 'SIGTERM')): GraphRunState {
+  const file = graphRunPath(safeSegment(graphId), safeSegment(runId), root);
+  return withRunWriteLock(file, () => {
+  if (lstatSync(join(root, 'graph-runs')).isSymbolicLink() || lstatSync(dirname(file)).isSymbolicLink() || lstatSync(file).isSymbolicLink()) throw new Error('graph run path is a symlink');
+  const state = readGraphRun(graphId, runId, root);
+  if (state.statePath !== file || !Array.isArray(state.path) || !Array.isArray(state.nodes) ||
+      !Number.isSafeInteger(state.executed) || state.executed < 0 || (state.status === 'running' && state.pending)) {
+    throw new Error(`invalid run state: ${graphId}/${runId}`);
+  }
+  for (const path of runArtifacts(state)) {
+    try { if (lstatSync(path).isSymbolicLink()) throw new Error('graph run artifact is a symlink'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
+  const live = graphRunAlive(state, processStartMs);
+  if (action === 'stop' && state.status !== 'running') throw new Error(`run is not running: ${graphId}/${runId}`);
+  const lock = `${file}.resume.lock`;
+  if (existsSync(lock) && (!lstatSync(lock).isDirectory() || readdirSync(lock).length > 0)) throw new Error('invalid resume lock');
+  if (existsSync(lock) && state.status !== 'running') {
+    // A resume persists «running» right after taking the lock; an older empty lock on a finished run is a crash leftover.
+    const ageMs = Date.now() - statSync(lock).mtimeMs;
+    if (ageMs < RESUME_LOCK_GRACE_MS) throw new Error(`run is being resumed: ${graphId}/${runId}`);
+    rmdirSync(lock);
+    debug.log('graph.runs', 'stale-resume-lock-cleared', { graphId, runId, ageMs: Math.round(ageMs), status: state.status });
+  }
+  if (state.status === 'running') {
+    if (live === 'unknown') throw new Error(`cannot verify run owner: ${graphId}/${runId}`);
+    if (live && state.pid === process.pid) throw new Error('cannot stop the current graph runner');
+    const node = state.activeNode;
+    if (node && (node.nodeId !== state.path.at(-1) || state.path.length !== state.nodes.length + 1)) throw new Error('active node does not match saved path');
+    if (state.path.length !== state.nodes.length && state.path.length !== state.nodes.length + 1) {
+      throw new Error('saved run path and node records do not match');
+    }
+    if (state.path.some((nodeId, i) => state.nodes[i] && state.nodes[i]?.nodeId !== nodeId) ||
+        state.executed !== state.nodes.filter(record => record.executed).length) throw new Error('saved run path and node records do not match');
+    if (node?.pidStartedAt === UNVERIFIED_NODE_START) {
+      // While the runner lives it will either verify this child or kill it; retry stop after that.
+      if (live) throw new Error(`node process start is not verified yet — retry stop: ${graphId}/${runId}`);
+      // Runner gone (e.g. reboot): the pid may be reused, so never signal an identity we could not verify.
+      debug.log('graph.runs', 'unverified-node-not-signaled', { graphId, runId, nodeId: node.nodeId, pid: node.pid });
+    } else if (node) {
+      const nodeAlive = graphRunAlive({ ...state, pid: node.pid, pidStartedAt: node.pidStartedAt }, processStartMs);
+      if (nodeAlive === 'unknown') throw new Error('cannot verify node process owner');
+      if (nodeAlive && node.pid === process.pid) throw new Error('cannot stop the current process');
+      if (nodeAlive && node.pid !== state.pid) {
+        try { signal(node.pid); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      }
+    }
+    if (state.path.length === state.nodes.length + 1) {
+      state.nodes.push({ nodeId: state.path.at(-1)!, ok: false, exit: null, executed: false, error: 'stopped before node completed' });
+    }
+    state.status = 'failed';
+    state.finishedAt = new Date().toISOString();
+    state.stoppedAt = state.finishedAt;
+    delete state.activeNode;
+    persistGraphRun(state);
+    try {
+      if (live) signal(state.pid!);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+    } finally {
+      // The failed ledger is durable even if its runner vanished between verification and signaling.
+      if (existsSync(lock)) rmdirSync(lock);
+    }
+  } else if (existsSync(lock)) rmdirSync(lock);
+  if (action === 'destroy') {
+    for (const path of runArtifacts(state)) rmSync(path, { recursive: true, force: true });
+  }
+  debug.log('graph.runs', action, { graphId, runId, previousAlive: live, status: state.status });
+  return state;
+  });
+}
 
 export function graphRunAlive(state: GraphRunState, processStartMs: (pid: number) => number | null = psProcessStartMs): GraphRunAlive {
   if (state.pid === undefined) return 'unknown';

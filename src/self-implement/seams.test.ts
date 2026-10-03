@@ -2619,7 +2619,23 @@ describe('defaultSeams — docs-only gate scope', () => {
     expect(opts.testArgs).toBeUndefined();
   });
 
-  test('실물 seam은 관례 밖 importer를 관측하지만 실행 범위에는 추가하지 않는다', async () => {
+  test('서버 파일만 바뀌어도 PWA 경로 소비 시험을 실행하고 이유를 gate.scope에 남긴다', async () => {
+    const pwa = 'apps/pwa/chrome/inside-events.test.ts';
+    mkdirSync(join(repo, 'apps/pwa/chrome'), { recursive: true });
+    writeFileSync(join(repo, pwa), "fetch('/v1/inside/events');\n");
+    git(repo, 'add', '-A');
+    git(repo, 'commit', '-m', 'PWA route consumer');
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const opts = await gate({ 'src/nexus/api/inside-events.ts': "export const INSIDE_EVENTS_PATH = '/v1/inside/events';\n" });
+      expect(opts.testArgs).toEqual([pwa]);
+      expect(log).toHaveBeenCalledWith('self-implement', 'gate.scope', expect.objectContaining({
+        callerTests: [{ file: pwa, reasons: ['route'] }], callerTestsOverflow: [],
+      }), expect.anything());
+    } finally { log.mockRestore(); }
+  });
+
+  test('실물 seam은 관례 밖 importer를 실행 집합에 추가한다', async () => {
     mkdirSync(join(repo, 'test'), { recursive: true });
     writeFileSync(join(repo, 'test', 'off-convention.test.ts'), "import '../src/x.js';\n");
     git(repo, 'add', '-A');
@@ -2627,22 +2643,23 @@ describe('defaultSeams — docs-only gate scope', () => {
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
       const opts = await gate({ 'src/x.ts': 'export const x = 1;' }, undefined, 'run-gate-scope-join');
-      expect(opts.steps).toEqual(['cli-smoke']);
-      expect(opts.testArgs).toBeUndefined();
+      expect(opts.steps).toBeUndefined();
+      expect(opts.testArgs).toEqual(['test/off-convention.test.ts']);
       expect(result).toMatchObject({
-        scopeReason: 'no-related-tests',
-        importerTestsNotRun: { total: 1, files: ['test/off-convention.test.ts'], truncated: false },
+        scopeReason: 'derived',
+        importerTestsNotRun: { total: 0, files: [], truncated: false },
       });
       expect(log).toHaveBeenCalledWith('self-implement', 'gate.scope', expect.objectContaining({
         runId: 'run-gate-scope-join',
-        importerTestsNotRun: ['test/off-convention.test.ts'], importerTestsNotRunCount: 1, importerTestsNotRunTruncated: false,
+        callerTests: [{ file: 'test/off-convention.test.ts', reasons: ['import'] }],
+        importerTestsNotRun: [], importerTestsNotRunCount: 0, importerTestsNotRunTruncated: false,
       }), expect.anything());
     } finally {
       log.mockRestore();
     }
   });
 
-  test('실물 seam은 src 밖 변경의 관례 밖 importer도 관측하지만 실행 범위에는 추가하지 않는다', async () => {
+  test('실물 seam은 src 밖 변경의 관례 밖 importer도 실행 집합에 넣는다', async () => {
     mkdirSync(join(repo, 'scripts'), { recursive: true });
     mkdirSync(join(repo, 'test'), { recursive: true });
     writeFileSync(join(repo, 'test', 'script-importer.test.ts'), "import '../scripts/x.js';\n");
@@ -2650,11 +2667,11 @@ describe('defaultSeams — docs-only gate scope', () => {
     git(repo, 'commit', '-m', 'script importer');
 
     const opts = await gate({ 'scripts/x.ts': 'export const x = 1;' });
-    expect(opts.steps).toEqual(['cli-smoke']);
-    expect(opts.testArgs).toBeUndefined();
+    expect(opts.steps).toBeUndefined();
+    expect(opts.testArgs).toEqual(['test/script-importer.test.ts']);
     expect(result).toMatchObject({
-      scopeReason: 'no-related-tests',
-      importerTestsNotRun: { total: 1, files: ['test/script-importer.test.ts'], truncated: false },
+      scopeReason: 'derived',
+      importerTestsNotRun: { total: 0, files: [], truncated: false },
     });
   });
 
@@ -2692,17 +2709,17 @@ describe('defaultSeams — docs-only gate scope', () => {
     }
   });
 
-  test('.js importer는 .tsx 변경의 관례 밖 테스트로 관측하지만 실행하지 않는다', async () => {
+  test('.js importer는 .tsx 변경의 관례 밖 테스트로 실행한다', async () => {
     mkdirSync(join(repo, 'test'), { recursive: true });
     writeFileSync(join(repo, 'test', 'tsx-importer.test.ts'), "import '../src/view.js';\n");
     git(repo, 'add', '-A');
     git(repo, 'commit', '-m', 'tsx importer');
     const opts = await gate({ 'src/view.tsx': 'export const View = () => null;' });
-    expect(opts.steps).toEqual(['cli-smoke']);
-    expect(opts.testArgs).toBeUndefined();
+    expect(opts.steps).toBeUndefined();
+    expect(opts.testArgs).toEqual(['test/tsx-importer.test.ts']);
     expect(result).toMatchObject({
-      scopeReason: 'no-related-tests',
-      importerTestsNotRun: { total: 1, files: ['test/tsx-importer.test.ts'], truncated: false },
+      scopeReason: 'derived',
+      importerTestsNotRun: { total: 0, files: [], truncated: false },
     });
   });
 
@@ -2711,9 +2728,10 @@ describe('defaultSeams — docs-only gate scope', () => {
     writeFileSync(join(repo, 'test', 'jsx-importer.test.ts'), "import '../src/widget.js';\n");
     git(repo, 'add', '-A');
     git(repo, 'commit', '-m', 'jsx importer');
-    await gate({ 'src/widget.jsx': 'export const Widget = () => null;' });
+    const opts = await gate({ 'src/widget.jsx': 'export const Widget = () => null;' });
+    expect(opts.testArgs).toEqual(['test/jsx-importer.test.ts']);
     expect(result).toMatchObject({
-      importerTestsNotRun: { total: 1, files: ['test/jsx-importer.test.ts'], truncated: false },
+      importerTestsNotRun: { total: 0, files: [], truncated: false },
     });
   });
 

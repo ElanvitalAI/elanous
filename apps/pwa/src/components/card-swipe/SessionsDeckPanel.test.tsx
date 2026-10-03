@@ -31,7 +31,7 @@ describe('SessionsDeckPanel · render contract', () => {
       </DaemonContext.Provider>,
     );
     expect(html).toContain('data-testid="sessions-deck-panel"');
-    expect(html).toContain('세션 카드 데크');
+    expect(html).toContain('대화 카드 데크');
     // CardSweepView 가 빈 상태로 렌더 (no sessions yet)
     expect(html).toContain('data-testid="card-sweep-empty"');
     expect(html).toContain('스와이프');

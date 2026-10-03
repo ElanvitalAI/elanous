@@ -764,7 +764,7 @@ export function classifyBaselineProcess(result: ProcessResult, budget?: { timeou
   };
 }
 
-function withBaselineWorktree<T>(cwd: string, baseRef: string, run: (baselineDir: string) => T): T | BaselineProcessResult {
+export function withBaselineWorktree<T>(cwd: string, baseRef: string, run: (baselineDir: string) => T): T | BaselineProcessResult {
   const baselineDir = mkdtempSync(join(tmpdir(), 'elanous-gate-baseline-'));
   let attached = false;
   try {

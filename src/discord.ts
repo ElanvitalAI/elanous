@@ -23,6 +23,7 @@
 import { markdownToTelegramHtml as _unusedMarkdownFn } from './telegram-format.js'; // eslint-disable-line @typescript-eslint/no-unused-vars
 import { debug } from './debug/log.js';
 import { getUserConfig } from './user-config.js';
+import { deliverSeatAnswers } from './seat-dispatch/seat-ask.js';
 import { handleDiscordSeatWork, type DiscordSeatWorkDeps } from './intake-plane/discord-seat-work.js';
 import { parseSeatAddress } from './seat-address/seat-address.js';
 
@@ -226,6 +227,7 @@ export class DiscordBot {
   private ws: WebSocket | null = null;
   private running = false;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private seatAskTimer: ReturnType<typeof setInterval> | null = null;
   private lastHeartbeatAck = true;
   private lastSeq: number | null = null;
 
@@ -246,7 +248,15 @@ export class DiscordBot {
     this.onInteraction = opts.onInteraction ?? null;
     this.onReaction = opts.onReaction ?? null;
     this.onTriggerTap = opts.onTriggerTap ?? null;
-    this.seatWorkDeps = opts.seatWorkDeps ?? {};
+    this.seatWorkDeps = { ...opts.seatWorkDeps, askDeps: {
+      ...opts.seatWorkDeps?.askDeps,
+      channel: 'discord',
+      send: opts.seatWorkDeps?.askDeps?.send ?? (async (origin, text) => {
+        if (origin.channel !== 'discord') throw new Error('seat ask belongs to another surface');
+        const posted = await this.sendMessage(origin.threadId ?? origin.channelId, text);
+        if (!posted) throw new Error('Discord seat ask reply was not posted');
+      }),
+    } };
   }
 
   /** Send a raw payload on the gateway WebSocket. Voice adapter uses
@@ -523,8 +533,12 @@ export class DiscordBot {
   async start(): Promise<void> {
     this.running = true;
     this.log(`discord bot starting (allowlist size ${this.allowedUsers.size})`);
+    this.seatAskTimer = setInterval(() => {
+      void deliverSeatAnswers(this.seatWorkDeps.askDeps!).catch((error) => this.log(`seat ask delivery failed: ${String(error)}`));
+    }, 10_000);
     while (this.running) {
       try {
+        await deliverSeatAnswers(this.seatWorkDeps.askDeps!);
         await this.runConnection();
       } catch (err: any) {
         this.log(`gateway error: ${err?.message ?? String(err)}`);
@@ -538,6 +552,8 @@ export class DiscordBot {
 
   stop(): void {
     this.running = false;
+    if (this.seatAskTimer) clearInterval(this.seatAskTimer);
+    this.seatAskTimer = null;
     if (this.ws) {
       try { this.ws.close(1000, 'client stop'); } catch { /* ignore */ }
       this.ws = null;

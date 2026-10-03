@@ -86,10 +86,10 @@ describe('M3-2 · resolveEmbeddingTier', () => {
     expect(r.source).toBe('preset');
   });
 
-  test('persona-only → default tier · source=persona', () => {
-    const r = resolveEmbeddingTier({ persona: 'power' }, 'local');
+  test('profile-only → default tier · source=profile', () => {
+    const r = resolveEmbeddingTier({ profile: 'power' }, 'local');
     expect(r.tier).toBe('balanced');
-    expect(r.source).toBe('persona');
+    expect(r.source).toBe('profile');
   });
 
   test('cohere loaded → reranker pass', () => {

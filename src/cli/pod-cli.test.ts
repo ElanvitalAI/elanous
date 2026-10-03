@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { POD_COMMAND_DEADLINE_SECONDS, registerPodCommands } from './pod-cli.js';
+import { POD_HOST_LEASE_ANNOTATION } from '../task-orchestrator/surfaces/pod-lease.js';
 import type { RunPodCommandOptions } from '../task-orchestrator/surfaces/pod-command-job.js';
 
 function capture() {
@@ -29,13 +30,13 @@ describe('elanous pod lease status', () => {
   }));
   const kubectl = (args: readonly string[]) => ({ status: 0, stderr: '', stdout: args.includes('nodes')
     ? JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '263471132Ki', cpu: '32' }, conditions: [{ type: 'Ready', status: 'True' }] } }] })
-    : args.includes('jobs') ? JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' } } }] })
+    : args.includes('jobs') ? JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' }, annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true' } } }] })
       : JSON.stringify({ items: pods }) });
   const runStatus = async (json: boolean) => {
     const cap = capture();
     const program = new Command();
     program.exitOverride();
-    registerPodCommands(program, { io: cap.io, kubectl, accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
+    registerPodCommands(program, { io: cap.io, kubectl, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
     await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
     return cap;
   };
@@ -52,12 +53,63 @@ describe('elanous pod lease status', () => {
     expect(data.placeableSlots).toBe(1);
     expect(table.lines.join('\n')).toContain(`배치 가능 ${data.placeableSlots} 칸`);
   });
-  test('explicit pool spec wins; all kubectl probes are reads', async () => {
+  test('two Running legacy Jobs without host leases are separate and deducted from recommended N', async () => {
+    const legacyPods = Array.from({ length: 2 }, (_, i) => ({
+      metadata: { namespace: 'elanous-test', name: `legacy-${i}`, labels: { 'elanous.job': `legacy-job-${i}` } },
+      status: { phase: 'Running' },
+      spec: { nodeName: 'node-1', containers: [{ resources: { limits: { memory: '1Gi' }, requests: { memory: '1Gi' } } }] },
+    }));
+    const legacyKubectl = (args: readonly string[]) => args.includes('jobs')
+      ? { status: 0, stderr: '', stdout: JSON.stringify({ items: [
+        { metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' }, annotations: { [POD_HOST_LEASE_ANNOTATION]: 'true' } } },
+        ...legacyPods.map((_, i) => ({ metadata: { name: `legacy-job-${i}`, labels: { 'elanous.substrate': 'pod' } } })),
+      ] }) }
+      : args.includes('pods') ? { status: 0, stderr: '', stdout: JSON.stringify({ items: [...pods, ...legacyPods] }) }
+        : { status: 0, stderr: '', stdout: JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '1024Gi', cpu: '32' }, conditions: [{ type: 'Ready', status: 'True' }] } }] }) };
+    const render = async (json: boolean) => {
+      const cap = capture(); const program = new Command(); program.exitOverride();
+      registerPodCommands(program, { io: cap.io, kubectl: legacyKubectl, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
+      await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
+      expect(cap.code()).toBe(0);
+      return cap.lines.join('\n');
+    };
+    const data = JSON.parse(await render(true));
+    expect(data).toMatchObject({ running: 12, pending: 0, unleasedRunning: 2, capacitySlots: 8, placeableSlots: 8, recommended: 6 });
+    expect(data.members[0]).toMatchObject({ running: 12, unleasedRunning: 2 });
+    const table = await render(false);
+    expect(table).toContain('임대 없는 실행 2');
+    expect(table).toContain('권장 지금 6 개 더 (limitedBy=capacity)');
+    expect(table).toContain('권장 수에서 건강한 멤버의 임대 없는 실행 차감');
+  });
+  test('no --pool reports configured harness.podPool rather than current context', async () => {
     const calls: string[][] = [];
     const cap = capture(); const program = new Command(); program.exitOverride();
     registerPodCommands(program, {
-      io: cap.io, accounts: () => 10, perAccount: () => 4,
-      poolSpec: (explicit) => explicit ?? 'wrong:2',
+      io: cap.io, dns: () => 'ready', accounts: () => 10, perAccount: () => 4,
+      harnessPool: () => 'node-b:20',
+      kubectl: (args) => {
+        calls.push([...args]);
+        if (args.includes('current-context')) return { status: 0, stdout: 'local-context', stderr: '' };
+        return kubectl(args);
+      },
+    });
+    await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
+    expect(cap.code()).toBe(0);
+    expect(JSON.parse(cap.lines[0]!)).toMatchObject({ pool: 'node-b:20', members: [{ context: 'node-b', capacity: 20 }] });
+    expect(calls).toHaveLength(3);
+    expect(calls.every((args) => args[0] === '--context' && args[1] === 'node-b')).toBe(true);
+    const table = capture(); const tableProgram = new Command(); tableProgram.exitOverride();
+    registerPodCommands(tableProgram, { io: table.io, kubectl, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, harnessPool: () => 'node-b:20' });
+    await tableProgram.parseAsync(['pod', 'lease', 'status'], { from: 'user' });
+    expect(table.code()).toBe(0);
+    expect(table.lines[0]).toBe('풀: node-b:20');
+  });
+  test('explicit pool spec wins; resource probes are reads', async () => {
+    const calls: string[][] = [];
+    const cap = capture(); const program = new Command(); program.exitOverride();
+    registerPodCommands(program, {
+      io: cap.io, dns: () => 'ready', accounts: () => 10, perAccount: () => 4,
+      harnessPool: () => 'wrong:2',
       kubectl: (args) => { calls.push([...args]); return kubectl(args); },
     });
     await program.parseAsync(['pod', 'lease', 'status', '--pool', 'node-b:20', '--json'], { from: 'user' });
@@ -73,7 +125,7 @@ describe('elanous pod lease status', () => {
       ? { status: 0, stderr: '', stdout: JSON.stringify({ items: [foreign, ...pods] }) } : kubectl(args);
     const render = async (json: boolean) => {
       const cap = capture(); const program = new Command(); program.exitOverride();
-      registerPodCommands(program, { io: cap.io, kubectl: occupied, accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
+      registerPodCommands(program, { io: cap.io, kubectl: occupied, dns: () => 'ready', accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
       await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
       expect(cap.code()).toBe(0);
       return cap.lines.join('\n');
@@ -84,12 +136,44 @@ describe('elanous pod lease status', () => {
   });
   test('account read failure is unknown, not zero accounts — and does not block the recommendation (accounts are observed only)', async () => {
     const cap = capture(); const program = new Command(); program.exitOverride();
-    registerPodCommands(program, { io: cap.io, kubectl, poolSpec: () => 'node-b:20', accounts: () => { throw new Error('store locked'); } });
+    registerPodCommands(program, { io: cap.io, kubectl, dns: () => 'ready', poolSpec: () => 'node-b:20', accounts: () => { throw new Error('store locked'); } });
     await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
     expect(cap.code()).toBe(0);
     const out = JSON.parse(cap.lines[0]!);
     expect(out).toMatchObject({ accounts: null, accountSlots: null });
     expect(out.recommended).not.toBeNull();
+  });
+  test('a DNS-broken member has zero slots and reason dns in JSON and the table', async () => {
+    const render = async (json: boolean) => {
+      const cap = capture(); const program = new Command(); program.exitOverride();
+      registerPodCommands(program, { io: cap.io, kubectl, dns: (context) => context === 'good' ? 'ready' : 'dns', accounts: () => 1, poolSpec: () => 'bad:2,good:2' });
+      await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
+      expect(cap.code()).toBe(0);
+      return cap.lines.join('\n');
+    };
+    const data = JSON.parse(await render(true));
+    expect(data.members.map((m: { capacity: number; reason: string | null }) => [m.capacity, m.reason])).toEqual([[0, 'dns'], [2, null]]);
+    expect(data).toMatchObject({ recommended: 0, reason: 'dns' });
+    expect(await render(false)).toContain('bad | 0 | 10 | 0');
+    expect(await render(false)).toContain('(dns)');
+  });
+  test('DNS-broken member reports its unleased Running Job without deducting healthy capacity', async () => {
+    const badPod = { ...pods[0]!, metadata: { ...pods[0]!.metadata, name: 'legacy-bad' } };
+    const memberKubectl = (args: readonly string[]) => args.includes('jobs')
+      ? { status: 0, stderr: '', stdout: JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' } } }] }) }
+      : args.includes('pods') ? { status: 0, stderr: '', stdout: JSON.stringify({ items: args[1] === 'bad' ? [badPod] : [] }) } : kubectl(args);
+    const render = async (json: boolean) => {
+      const cap = capture(); const program = new Command(); program.exitOverride();
+      registerPodCommands(program, { io: cap.io, kubectl: memberKubectl, dns: (context) => context === 'bad' ? 'dns' : 'ready', accounts: () => 1, poolSpec: () => 'bad:2,good:2' });
+      await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
+      expect(cap.code()).toBe(0);
+      return cap.lines.join('\n');
+    };
+    expect(JSON.parse(await render(true))).toMatchObject({ recommended: 2, unleasedRunning: 1, members: [{ reason: 'dns', unleasedRunning: 1 }, { reason: null, unleasedRunning: 0 }] });
+    const table = await render(false);
+    expect(table).toContain('권장 지금 2 개 더');
+    expect(table).toContain('임대 없는 실행 1');
+    expect(table).toContain('권장 수에서 건강한 멤버의 임대 없는 실행 차감');
   });
   test('unreachable cluster exits 0 and says unknown (not zero)', async () => {
     const cap = capture(); const program = new Command(); program.exitOverride();

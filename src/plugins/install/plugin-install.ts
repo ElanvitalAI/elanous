@@ -314,6 +314,20 @@ export async function installPlugin(spec: string, opts: InstallOptions = {}): Pr
     const source = marketSpec(spec, opts)
       ? await fetchedMarketSource(spec, join(stage, 'package'), opts)
       : resolvePluginSource(spec, join(stage, 'package'), opts);
+    const stagedManifest = join(stage, 'package', 'plugin.json');
+    if (existsSync(stagedManifest)) {
+      const rawManifest: unknown = JSON.parse(readFileSync(stagedManifest, 'utf8'));
+      if (rawManifest && typeof rawManifest === 'object' && !Array.isArray(rawManifest)) {
+        const rawExtensions = (rawManifest as Record<string, unknown>).extensions;
+        if (rawExtensions && typeof rawExtensions === 'object' && !Array.isArray(rawExtensions)) {
+          const elanous = (rawExtensions as Record<string, unknown>)['ai.elanous'];
+          if (elanous && typeof elanous === 'object' && !Array.isArray(elanous) &&
+            (elanous as Record<string, unknown>).researchDraft === true) {
+            fail('io', 'research draft only: implement and validate graph steps before installation');
+          }
+        }
+      }
+    }
     const manifest: PluginManifest = loadPluginManifestFromDir(join(stage, 'package'), { id: source.expectedName ?? basename(spec) }).manifest;
     if (!NAME.test(manifest.id) || !VERSION.test(manifest.version)) fail('io', 'invalid plugin name or version');
     if (source.expectedName && (manifest.id !== source.expectedName || manifest.version !== source.expectedVersion)) fail('conflict', 'market name or version differs from manifest');

@@ -44,6 +44,8 @@ export interface WebSearchHit {
   score?: number;
   /** Unix ms timestamp of the page if the provider knows it. */
   publishedAt?: number;
+  /** Whether this URL came from an actual Grok x_search_call. */
+  xSearchSource?: boolean;
   /** Pass-through metadata (provider-specific). Callers shouldn't
    *  depend on specific keys. */
   metadata?: Record<string, unknown>;
@@ -54,6 +56,8 @@ export interface WebSearchResult {
   /** Which provider served this result. Included so the tool
    *  renderer can show "via grok" etc. */
   providerName: string;
+  /** X-intent outcome; 'grok' requires an x_search_call with an x.com hit. Absent for ordinary or explicitly routed searches. */
+  xSearch?: 'grok' | 'unavailable';
   /** Wall-clock ms the call took. Zero on cached results. */
   durationMs: number;
   /** Provider-level note the model might find useful (e.g., "rate

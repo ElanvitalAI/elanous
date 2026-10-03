@@ -245,11 +245,54 @@ test('credentials CLI sets, reads stdin, unsets and never prints values', async 
   }
 }, 20_000);
 
-test('plugin make help exposes name, dir, run, input and json', async () => {
+test('plugin make help exposes name, dir, draft-file, run, input and json', async () => {
   const result = await cli(temp(), ['make', '--help']);
   expect(result.code).toBe(0);
-  for (const flag of ['--name', '--dir', '--run', '--input', '--json']) expect(result.output).toContain(flag);
+  for (const flag of ['--name', '--dir', '--draft-file', '--run', '--input', '--json']) expect(result.output).toContain(flag);
 });
+
+test('plugin make --draft-file creates a non-installed research draft without credential values', async () => {
+  const root = temp();
+  const draftFile = join(root, 'research-draft.json');
+  writeFileSync(draftFile, JSON.stringify({ description: 'Research the weather',
+    connectors: [{ id: 'weather', credentials: [{ name: 'WEATHER_API_KEY' }] }],
+    skill: { description: 'Weather researcher', instructions: 'Check the forecast.', requires: ['openai'] },
+  }));
+  const result = await cli(root, ['make', 'weather research', '--name', 'weather-research', '--draft-file', draftFile, '--json']);
+  expect(result.code).toBe(0);
+  const draft = JSON.parse(result.output);
+  expect(draft).toMatchObject({ status: 'draft', plugin: 'weather-research', errors: [], timings: { install: 0 } });
+  expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
+  const manifest = JSON.parse(readFileSync(join(draft.dir, 'plugin.json'), 'utf8'));
+  expect(manifest.extensions['ai.elanous'].connectors).toEqual([
+    { id: 'weather', fields: [{ name: 'WEATHER_API_KEY', secret: true }] },
+  ]);
+  expect(manifest.extensions['ai.elanous'].researchDraft).toBe(true);
+  const add = await cli(root, ['add', draft.dir, '--yes', '--json']);
+  expect(add.code).toBe(1);
+  expect(JSON.parse(add.output.trim().split('\n').at(-1)!)).toMatchObject({ event: 'failed', cause: expect.stringContaining('research draft only') });
+  expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
+});
+
+test('real make --draft-file --run --json refuses unimplemented processing instead of reporting success or echoing input', async () => {
+  const root = temp();
+  const draftFile = join(root, 'research-draft.json');
+  writeFileSync(draftFile, JSON.stringify({ description: 'Research the weather',
+    connectors: [{ id: 'weather', credentials: [{ name: 'WEATHER_API_KEY' }] }],
+    skill: { description: 'Weather researcher', instructions: 'Check the forecast.', requires: ['openai'] },
+  }));
+  const input = { city: 'Seoul', question: 'What is the forecast?' };
+  const result = await cli(root, ['make', 'weather research', '--name', 'weather-research', '--draft-file', draftFile,
+    '--run', '--input', JSON.stringify(input), '--json']);
+  expect(result.code).toBe(1);
+  const response = JSON.parse(result.output);
+  expect(response).toMatchObject({ status: 'failed', errors: [expect.stringContaining('research draft only')], timings: { install: 0 } });
+  expect(response.runStatus).toBeUndefined();
+  expect(response).not.toHaveProperty('input');
+  expect(result.output).not.toContain('Seoul');
+  expect(JSON.parse((await cli(root, ['list', '--json'])).output)).toEqual([]);
+  expect(readFileSync(join(response.dir, 'graphs', 'run-step.ts'), 'utf8')).toContain("outcome: 'fail'");
+}, 20_000);
 
 test('plugin make rejects an existing --name before invoking codex and reports JSON failure', async () => {
   const root = temp();

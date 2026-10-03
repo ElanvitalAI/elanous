@@ -12,12 +12,13 @@
 
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background,
   BackgroundVariant,
   Controls,
   Handle,
+  MiniMap,
   Position,
   ReactFlow,
   addEdge as rfAddEdge,
@@ -31,6 +32,7 @@ import {
   type NodeChange,
   type NodeProps,
   type NodeTypes,
+  type ReactFlowInstance,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import './node-status.css';
@@ -52,12 +54,16 @@ import {
   setNodePosition,
 } from './workflow-graph-mutations';
 import { useKeyboardShortcuts, type ShortcutBinding } from './useKeyboardShortcuts';
+import { useGraphHistory } from './use-graph-history';
+import { copyNodes, pasteNodes, type GraphClipboard } from './graph-clipboard';
 import {
   getDeliveryIcon,
   STATUS_TONE,
   type NodeStatusEntry,
 } from './run-status-helpers';
 import { nodeStatusClass } from './node-status-class';
+import { DRAG_MIME, addNodeAt, decodeDrag, encodeDrag } from './graph-drop';
+import { addNote, loadNotes, removeNote, saveNotes, updateNote, type GraphNote } from './graph-notes';
 import type { ValidationIssue } from './validation-helpers';
 import type { GraphKindEntry } from '@/nexus/client';
 
@@ -149,6 +155,30 @@ const VARIANT_COLOR: Record<NodeVariant, string> = {
   unknown: '#9ca3af',    // gray
 };
 
+/** W3c — the minimap only earns its space once the graph is big enough to get lost in. */
+export const MINIMAP_MIN_NODES = 10;
+export function showMiniMap(nodeCount: number): boolean {
+  return nodeCount >= MINIMAP_MIN_NODES;
+}
+
+export function showEmptyCanvas(workflowNodeCount: number, noteCount: number): boolean {
+  return workflowNodeCount === 0 && noteCount === 0;
+}
+
+/** W3c — the palette entry carried by a drag, or null when it is not ours / not offered by this palette. */
+export function droppedEntry(
+  event: { dataTransfer: { types: ArrayLike<string> | Iterable<string>; getData: (format: string) => string } },
+  palette: GraphKindEntry[] | undefined,
+): GraphKindEntry | null {
+  if (!Array.from(event.dataTransfer.types as Iterable<string>).includes(DRAG_MIME)) return null;
+  const entry = decodeDrag(event.dataTransfer.getData(DRAG_MIME));
+  if (!entry) return null;
+  const offered = palette
+    ? palette.some((item) => item.kind === entry.kind && item.core === entry.core)
+    : entry.core;
+  return offered ? entry : null;
+}
+
 export function WorkflowGraph({
   palette,
   yaml,
@@ -165,11 +195,50 @@ export function WorkflowGraph({
 }: WorkflowGraphProps) {
   const [parsed, setParsed] = useState<WorkflowDefinitionLike | null>(definition ?? null);
   const [parseError, setParseError] = useState(false);
+  // A ref, not state: storing the instance in state re-rendered on every init and looped (W3c harvest).
+  const flowRef = useRef<ReactFlowInstance | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const [storedNotes, setStoredNotes] = useState<{ name: string | null; items: GraphNote[] }>(() => ({
+    name: definition?.name ?? null,
+    items: definition?.name ? loadNotes(definition.name) : [],
+  }));
+  const currentNotes = useRef(storedNotes);
+  const workflowName = parsed?.name ?? null;
+  const notes = storedNotes.name === workflowName ? storedNotes.items : [];
+
+  useEffect(() => {
+    if (!workflowName) return;
+    if (currentNotes.current.name === workflowName) return;
+    const loaded = { name: workflowName, items: loadNotes(workflowName) };
+    currentNotes.current = loaded;
+    setStoredNotes(loaded);
+  }, [workflowName]);
+
+  const changeNotes = useCallback((change: (current: GraphNote[]) => GraphNote[]) => {
+    if (!editable || !workflowName) return;
+    const next = change(currentNotes.current.name === workflowName ? currentNotes.current.items : loadNotes(workflowName));
+    currentNotes.current = { name: workflowName, items: next };
+    saveNotes(workflowName, next);
+    setStoredNotes(currentNotes.current);
+  }, [editable, workflowName]);
+  const onAddNote = useCallback(() => {
+    if (!editable || !workflowName) return;
+    const bounds = canvasRef.current?.getBoundingClientRect();
+    const flow = flowRef.current;
+    const center = bounds
+      ? { x: bounds.left + bounds.width / 2, y: bounds.top + bounds.height / 2 }
+      : { x: 100, y: 60 };
+    const position = flow?.screenToFlowPosition(center)
+      ?? (bounds ? { x: bounds.width / 2, y: bounds.height / 2 } : center);
+    changeNotes((current) => addNote(current, { x: position.x - 100, y: position.y - 60 }));
+  }, [changeNotes, editable, workflowName]);
   // Tier E3.3 (2026-05-11) — set of currently-selected node ids,
   // sourced from ReactFlow's `onSelectionChange`. Drives the
   // multi-select pan-into-view fitView trigger + the Cmd+D duplicate /
   // F2 rename shortcuts (which target the first selected node).
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const { record, undo, redo, canUndo, canRedo } = useGraphHistory();
+  const clipboard = useRef<GraphClipboard | null>(null);
 
   useEffect(() => {
     if (definition) {
@@ -207,17 +276,41 @@ export function WorkflowGraph({
       const currentDef = safeParseWorkflowYaml(yaml) ?? parsed;
       if (!currentDef) return;
       const next = mut(currentDef);
-      setParsed(next);
       try {
         const nextYaml = definitionToYaml(next);
+        if (nextYaml === yaml) return;
+        record(yaml);
+        setParsed(next);
         onChangeYaml(nextYaml);
       } catch {
         // serialization failed — silently keep current YAML so the
         // user doesn't lose their edits
       }
     },
-    [onChangeYaml, parsed, yaml],
+    [onChangeYaml, parsed, record, yaml],
   );
+
+  const restoreYaml = useCallback((previous: string | null) => {
+    if (previous === null || !onChangeYaml) return;
+    setParsed(safeParseWorkflowYaml(previous));
+    onChangeYaml(previous);
+  }, [onChangeYaml]);
+  const onUndo = useCallback(() => {
+    if (onChangeYaml) restoreYaml(undo(yaml));
+  }, [onChangeYaml, restoreYaml, undo, yaml]);
+  const onRedo = useCallback(() => {
+    if (onChangeYaml) restoreYaml(redo(yaml));
+  }, [onChangeYaml, restoreYaml, redo, yaml]);
+  const onCopy = useCallback(() => {
+    const currentDef = safeParseWorkflowYaml(yaml) ?? parsed;
+    if (!currentDef) return;
+    const copied = copyNodes(currentDef, selectedIds);
+    if (copied) clipboard.current = copied;
+  }, [yaml, parsed, selectedIds]);
+  const onPaste = useCallback(() => {
+    if (!clipboard.current || !onChangeYaml) return;
+    mutate((def) => pasteNodes(def, clipboard.current!));
+  }, [mutate, onChangeYaml]);
 
   const layout = useMemo(() => {
     if (!parsed) return null;
@@ -229,8 +322,7 @@ export function WorkflowGraph({
   }, [parsed]);
 
   const nodes: Node[] = useMemo(() => {
-    if (!layout) return [];
-    return layout.nodes.map((n) => {
+    const workflowNodes: Node[] = (layout?.nodes ?? []).map((n) => {
       const inCycle = cycleNodeIds?.has(n.id) ?? false;
       const issues = nodeIssues?.[n.id];
       const statusEntry = nodeStatuses?.[n.id];
@@ -258,10 +350,24 @@ export function WorkflowGraph({
         },
       } satisfies Node;
     });
-  }, [layout, nodeStatuses, nodeIssues, cycleNodeIds]);
+    return [...workflowNodes, ...notes.map((note) => ({
+      id: `annotation:${note.id}`,
+      type: 'note',
+      position: { x: note.x, y: note.y },
+      data: {
+        text: note.text,
+        editable: editable === true,
+        onTextChange: (text: string) => changeNotes((current) => updateNote(current, note.id, { text })),
+        onRemove: () => changeNotes((current) => removeNote(current, note.id)),
+      },
+      draggable: editable === true,
+      selectable: false,
+      style: { padding: 0, border: 0, background: 'transparent', width: 200 },
+    } satisfies Node))];
+  }, [layout, nodeStatuses, nodeIssues, cycleNodeIds, notes, editable, changeNotes]);
 
   // Tier E4.2 (2026-05-11) — register the custom node type once.
-  const nodeTypes: NodeTypes = useMemo(() => ({ workflow: WorkflowNodeView }), []);
+  const nodeTypes: NodeTypes = useMemo(() => ({ workflow: WorkflowNodeView, note: NoteNodeView }), []);
 
   const edges: Edge[] = useMemo(() => {
     if (!layout) return [];
@@ -302,10 +408,15 @@ export function WorkflowGraph({
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       if (!editable) return;
+      const noteIds = new Map(notes.map((note) => [`annotation:${note.id}`, note.id]));
       const removed = changes.filter((ch) => ch.type === 'remove');
-      if (removed.length > 0) {
-        mutate((def) => removed.reduce((d, ch) => defDeleteNode(d, (ch as { id: string }).id), def));
-        return;
+      const removedNotes = removed.map((ch) => noteIds.get(ch.id)).filter((id): id is string => id !== undefined);
+      if (removedNotes.length > 0) {
+        changeNotes((current) => removedNotes.reduce((items, id) => removeNote(items, id), current));
+      }
+      const removedWorkflow = removed.filter((ch) => !ch.id.startsWith('annotation:'));
+      if (removedWorkflow.length > 0) {
+        mutate((def) => removedWorkflow.reduce((d, ch) => defDeleteNode(d, ch.id), def));
       }
       // ROADMAP W3 — persist drag-stopped positions to `_meta.layout`.
       // ReactFlow emits `position` changes continuously while dragging
@@ -318,12 +429,17 @@ export function WorkflowGraph({
           && (ch as { dragging?: boolean }).dragging === false
           && (ch as { position?: unknown }).position !== undefined,
       );
-      if (settled.length === 0) return;
-      mutate((def) =>
-        settled.reduce((d, ch) => setNodePosition(d, ch.id, ch.position), def),
-      );
+      const notePositions = settled.filter((ch) => noteIds.has(ch.id));
+      if (notePositions.length > 0) {
+        changeNotes((current) => notePositions.reduce((items, ch) =>
+          updateNote(items, noteIds.get(ch.id)!, { x: ch.position.x, y: ch.position.y }), current));
+      }
+      const workflowPositions = settled.filter((ch) => !ch.id.startsWith('annotation:'));
+      if (workflowPositions.length > 0) {
+        mutate((def) => workflowPositions.reduce((d, ch) => setNodePosition(d, ch.id, ch.position), def));
+      }
     },
-    [editable, mutate],
+    [editable, mutate, notes, changeNotes],
   );
   const onEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
@@ -373,6 +489,12 @@ export function WorkflowGraph({
   const shortcuts: ShortcutBinding[] = useMemo(() => {
     if (!editable) return [];
     const bindings: ShortcutBinding[] = [];
+    bindings.push(
+      { key: 'z', metaOrCtrl: true, shift: false, handler: onUndo },
+      { key: 'z', metaOrCtrl: true, shift: true, handler: onRedo },
+      { key: 'c', metaOrCtrl: true, handler: onCopy },
+      { key: 'v', metaOrCtrl: true, handler: onPaste },
+    );
     // N — open the NodeCreator panel (Tier E4.3).
     bindings.push({
       key: 'n',
@@ -422,7 +544,7 @@ export function WorkflowGraph({
       });
     }
     return bindings;
-  }, [editable, mutate, onChangeYaml, onNodeClick, onRun, selectedIds]);
+  }, [editable, mutate, onCopy, onNodeClick, onPaste, onRedo, onRun, onUndo, selectedIds]);
   useKeyboardShortcuts(shortcuts, { enabled: editable === true });
 
   if (parseError) {
@@ -439,28 +561,45 @@ export function WorkflowGraph({
       </div>
     );
   }
-  if (nodes.length === 0) {
-    // Empty-state copy depends on whether the palette is available
-    // in this view. In editable mode the user can add a node from
-    // the floating palette in the top-left; in read-only (built-in)
-    // they have to fork the YAML.
+  if (showEmptyCanvas(layout?.nodes.length ?? 0, notes.length)) {
+    // Only an entirely empty canvas skips React Flow; notes on a node-free workflow need the canvas to edit them.
+    // The empty panel itself takes a palette drop and places the first node at the origin.
     return (
-      <div className="relative flex h-full items-center justify-center text-[11px] text-text-tertiary">
-        {editable && <NodePalette palette={palette} onAdd={onAddPaletteNode} />}
+      <div
+        ref={canvasRef}
+        className="relative flex h-full items-center justify-center text-[11px] text-text-tertiary"
+        onDragOver={(event) => {
+          if (editable && Array.from(event.dataTransfer.types).includes(DRAG_MIME)) {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'copy';
+          }
+        }}
+        onDrop={(event) => {
+          if (!editable) return;
+          const entry = droppedEntry(event, palette);
+          if (!entry) return;
+          event.preventDefault();
+          mutate((def) => addNodeAt(def, entry, { x: 0, y: 0 }).def);
+        }}
+      >
+        {editable && <NodePalette palette={palette} editable={editable === true} onAdd={onAddPaletteNode} />}
+        {editable && <GraphHistoryControls canUndo={canUndo} canRedo={canRedo} onUndo={onUndo} onRedo={onRedo} />}
+        {editable && <AddNoteButton onAdd={onAddNote} />}
         {editable
           ? 'No nodes yet — pick a variant from the palette.'
           : 'No nodes yet — switch to YAML view to add one.'}
       </div>
     );
   }
-
   return (
-    <div className="relative h-full w-full">
-      {editable && <NodePalette palette={palette} onAdd={onAddPaletteNode} />}
+    <div ref={canvasRef} className="relative h-full w-full">
+      {editable && <NodePalette palette={palette} editable={editable === true} onAdd={onAddPaletteNode} />}
+      {editable && <GraphHistoryControls canUndo={canUndo} canRedo={canRedo} onUndo={onUndo} onRedo={onRedo} />}
       {editable && (
-        <TidyUpButton
-          onTidy={() => mutate((def) => defClearLayout(def))}
-        />
+        <>
+          <AddNoteButton onAdd={onAddNote} />
+          <TidyUpButton onTidy={() => mutate((def) => defClearLayout(def))} />
+        </>
       )}
       {editable && nodeCreatorOpen && (
         <NodeCreatorPanel
@@ -479,11 +618,27 @@ export function WorkflowGraph({
         onConnect={editable ? onConnect : undefined}
         onNodesChange={editable ? onNodesChange : undefined}
         onEdgesChange={editable ? onEdgesChange : undefined}
-        onNodeClick={onNodeClick ? (_evt, node) => onNodeClick(node.id) : undefined}
+        onInit={(instance) => { flowRef.current = instance; }}
+        onDragOver={(event) => {
+          if (editable && Array.from(event.dataTransfer.types).includes(DRAG_MIME)) {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'copy';
+          }
+        }}
+        onDrop={(event) => {
+          const flow = flowRef.current;
+          if (!editable || !flow) return;
+          const entry = droppedEntry(event, palette);
+          if (!entry) return;
+          event.preventDefault();
+          const position = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+          mutate((def) => addNodeAt(def, entry, position).def);
+        }}
+        onNodeClick={onNodeClick ? (_evt, node) => { if (node.type !== 'note') onNodeClick(node.id); } : undefined}
         // Tier E3.3 (2026-05-11) — track selection so power-user
         // shortcuts (Cmd+D / F2) target the right node and the
         // SelectionPanController can pan multiple nodes into view.
-        onSelectionChange={({ nodes: sel }) => setSelectedIds(sel.map((n) => n.id))}
+        onSelectionChange={({ nodes: sel }) => setSelectedIds(sel.filter((n) => n.type !== 'note').map((n) => n.id))}
         proOptions={{ hideAttribution: true }}
         // Ergonomic-port Tier E2.1 (2026-05-11) — custom connection
         // line that fades in over ~300ms. Keeps a stray click from
@@ -493,6 +648,7 @@ export function WorkflowGraph({
       >
         <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
         <Controls showInteractive={false} />
+        {showMiniMap(nodes.length) && <MiniMap position="bottom-right" pannable zoomable bgColor="#16171c" maskColor="rgba(12, 12, 14, 0.6)" nodeColor="#7188a5" />}
         {focusNodeId !== undefined && (
           <FocusController focusNodeId={focusNodeId ?? null} focusNonce={focusNonce ?? 0} />
         )}
@@ -502,9 +658,63 @@ export function WorkflowGraph({
   );
 }
 
+function AddNoteButton({ onAdd }: { onAdd: () => void }) {
+  return (
+    <button type="button" onClick={onAdd} title="메모 추가"
+      className="absolute right-20 top-3 z-10 rounded-md border border-amber-500 bg-amber-100 px-2 py-1 text-[10px] text-amber-950 shadow-md hover:bg-amber-200">
+      메모 추가
+    </button>
+  );
+}
+
+type NoteNodeData = {
+  text: string;
+  editable: boolean;
+  onTextChange: (text: string) => void;
+  onRemove: () => void;
+};
+
+function NoteNodeView({ data }: NodeProps) {
+  const note = data as NoteNodeData;
+  return (
+    <div className="rounded-md border border-amber-400 bg-amber-100 p-2 text-amber-950 shadow-md">
+      <div className="flex items-center justify-between pb-1 text-[10px] font-semibold">
+        <span>메모</span>
+        {note.editable && <button type="button" onClick={note.onRemove} title="메모 지우기" aria-label="메모 지우기" className="nodrag text-amber-900">×</button>}
+      </div>
+      {note.editable ? (
+        <textarea aria-label="메모 내용" value={note.text} onChange={(event) => note.onTextChange(event.target.value)}
+          className="nodrag nowheel block min-h-20 w-full resize-y rounded bg-amber-50 p-1 text-xs text-amber-950 outline-amber-600" />
+      ) : <div className="min-h-20 whitespace-pre-wrap break-words text-xs">{note.text}</div>}
+    </div>
+  );
+}
+
+function GraphHistoryControls({
+  canUndo, canRedo, onUndo, onRedo,
+}: {
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+}) {
+  return (
+    <div className="absolute right-3 top-12 z-10 flex gap-1">
+      <button type="button" onClick={onUndo} disabled={!canUndo} title="Undo (Cmd/Ctrl+Z)"
+        className="rounded border border-border bg-surface-elevated px-2 py-1 text-[10px] text-text-tertiary disabled:opacity-50">
+        Undo
+      </button>
+      <button type="button" onClick={onRedo} disabled={!canRedo} title="Redo (Cmd/Ctrl+Shift+Z)"
+        className="rounded border border-border bg-surface-elevated px-2 py-1 text-[10px] text-text-tertiary disabled:opacity-50">
+        Redo
+      </button>
+    </div>
+  );
+}
+
 /** Floating palette of variant buttons. Click → add a new node of
  *  that variant via the consumer's mutate callback. */
-function NodePalette({ palette, onAdd }: { palette?: GraphKindEntry[]; onAdd: (entry: GraphKindEntry) => void }) {
+function NodePalette({ palette, editable, onAdd }: { palette?: GraphKindEntry[]; editable: boolean; onAdd: (entry: GraphKindEntry) => void }) {
   const variants: { v: NodeVariant; label: string }[] = [
     { v: 'prompt', label: '+ prompt' },
     { v: 'bash', label: '+ bash' },
@@ -532,6 +742,12 @@ function NodePalette({ palette, onAdd }: { palette?: GraphKindEntry[]; onAdd: (e
         <button
           key={entry.kind}
           type="button"
+          draggable={editable}
+          onDragStart={(event) => {
+            if (!editable) { event.preventDefault(); return; }
+            event.dataTransfer.setData(DRAG_MIME, encodeDrag(entry));
+            event.dataTransfer.effectAllowed = 'copy';
+          }}
           onClick={() => onAdd(entry)}
           className="rounded px-2 py-0.5 text-left text-[10px] text-text-tertiary transition-colors hover:bg-surface hover:text-text-primary"
           style={{ minWidth: 80 }}

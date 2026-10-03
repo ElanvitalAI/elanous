@@ -1,4 +1,6 @@
 import type { Command } from 'commander';
+import { join, resolve } from 'node:path';
+import { scanWishFolder } from '../intake-plane/wish-folder.js';
 import { CardStore, type TaskCard } from './card-store.js';
 
 export interface CardCliDeps {
@@ -20,7 +22,7 @@ function formatCard(card: TaskCard): string {
   return lines.join('\n') + '\n';
 }
 
-/** Register read-only card inspection commands without changing other task commands. */
+/** Register card inspection and Wish note import commands. */
 export function registerCardCommand(program: Command, deps: CardCliDeps = {}): Command {
   const createStore = deps.createStore ?? (() => new CardStore());
   const write = deps.write ?? ((text: string) => { process.stdout.write(text); });
@@ -57,6 +59,28 @@ export function registerCardCommand(program: Command, deps: CardCliDeps = {}): C
         }
       } finally {
         store.close();
+      }
+    });
+
+  card.command('wish-scan')
+    .description('Create task cards from Obsidian Wish notes')
+    .option('--dir <path>', 'Wish folder path')
+    .option('--json', 'Output JSON')
+    .action((options: { dir?: string; json?: boolean }) => {
+      const dir = resolve(options.dir ?? join(process.env.OBSIDIAN_VAULT_ROOT ?? '', '00. Inbox', '00. Wish'));
+      let store: CardStore | undefined;
+      try {
+        const result = scanWishFolder({ dir, store: (store = createStore()) });
+        write(options.json ? `${JSON.stringify(result)}\n` : `추가 ${result.added} · 갱신 ${result.updated} · 건너뜀 ${result.skipped}\n`);
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('Wish 폴더를 찾지 못했습니다: ')) {
+          process.stderr.write(`${error.message}\n`);
+          process.exitCode = 2;
+          return;
+        }
+        throw error;
+      } finally {
+        store?.close();
       }
     });
 

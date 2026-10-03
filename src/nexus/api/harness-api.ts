@@ -19,6 +19,7 @@ import { resolveHarnessTarget } from '../../self-implement/harness-target-option
 import { queryRunningRuns, type RunningRunsResult } from '../../self-implement/running-runs.js';
 import { getDefaultLogStore, type LogStore } from '../../mss/logging/log-store.js';
 import { createSeqTracker, makeEnvelope, type FeedbackEnvelope } from '../../feedback/envelope.js';
+import { publishInsideEvent } from './inside-events.js';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' };
 const ASK_USAGE = 'usage: POST /v1/harness/ask with JSON body {"text":"<ask>"} — optional "target":"<path>" (홈 안의 git repo·디렉터리·파일)';
@@ -248,7 +249,10 @@ export async function handleHarnessAskPost(req: Request, _metaApi: HarnessMetaAp
   }
 
   const acceptanceId = deps.createAcceptanceId?.() ?? crypto.randomUUID();
-  const log = deps.log ?? ((event, data) => debug.log('harness-http', event, data));
+  const log = (event: string, data: Record<string, unknown>) => {
+    (deps.log ?? ((name: string, payload: Record<string, unknown>) => debug.log('harness-http', name, payload)))(event, data);
+    publishInsideEvent({ ...data, kind: 'harness-run', event });
+  };
   const suppliedOrigin = (body as { origin?: unknown }).origin;
   const origin = suppliedOrigin === undefined ? null
     : readReportOrigin({ [REPORT_ORIGIN_ENV]: JSON.stringify(suppliedOrigin) });

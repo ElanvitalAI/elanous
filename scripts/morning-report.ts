@@ -31,7 +31,7 @@ const report = await composeMorningReport(new Date(), { narrate, heatmapImageUrl
 if (dry) {
   console.log(report);
 } else {
-  const sent = await sendTelegramReport(cfg, report, { markdown: true });
+  const sent = await sendTelegramReport(cfg, report, { markdown: true, kind: 'report' });
   console.error(sent
     ? '[morning-report] sent to report channel ✓'
     : '[morning-report] no report channel configured — skipped');
@@ -39,7 +39,7 @@ if (dry) {
   // 히트맵 이미지 첨부(위에서 캡처한 URL 재사용). fail-soft.
   if (heatmapImageUrl) {
     try {
-      const ok = await sendReportPhoto(cfg, heatmapImageUrl, { caption: '🗺️ S&P 500 히트맵 (finviz)' });
+      const ok = await sendReportPhoto(cfg, heatmapImageUrl, { caption: '🗺️ S&P 500 히트맵 (finviz)', kind: 'report' });
       console.error(ok ? '[morning-report] heatmap image sent ✓' : '[morning-report] heatmap: no report channel');
     } catch (e) { console.error(`[morning-report] heatmap image error: ${e instanceof Error ? e.message : String(e)}`); }
   }

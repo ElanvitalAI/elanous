@@ -10,7 +10,10 @@ export function seatNowLine(text: string): string {
   const stripped = text
     .replace(/^\s*\*\*\[[A-Za-z]{1,4}\]\*\*\s*/, '')
     .replace(/^(?:\{\{TS\}\}|\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:KST)?)\s*/, '')
-    .replace(/^→\s*(?:(?:[A-Z]{2,4}|전원|전체)(?=[\s·,(]|$)[\s·,]*)+/u, '');
+    .replace(/^→\s*(?:(?:[A-Z]{2,4}|전원|전체)(?=[\s·,(]|$)[\s·,]*)+/u, '')
+    // `→ OP — 보고 · …`: the dash and kind word after the recipients are header too (10-03 board showed «— 보고 · …»).
+    .replace(/^—\s*/, '')
+    .replace(/^(?:보고|요청|정정|결정|사고|안내)\s*·\s*/, '');
   return (stripped.trim() || text.trim()).replace(/\*\*/g, '');
 }
 

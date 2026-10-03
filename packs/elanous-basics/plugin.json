@@ -1,12 +1,12 @@
 {
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "elanous-basics",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Official elanous essentials for research, onboarding and everyday productivity.",
   "extensions": {
     "ai.elanous": {
-      "bundle": ["skills/omni-crawl", "skills/omni-digest", "skills/project-onboarding", "skills/grill-me", "skills/photo-intake-ocr"],
-      "capabilities": ["fs:workdir", "proc:bun", "net:*", "secret:xai", "secret:upstage", "secret:firecrawl"],
+      "bundle": ["skills/omni-crawl", "skills/omni-digest", "skills/project-onboarding", "skills/grill-me", "skills/photo-intake-ocr", "skills/google-workspace"],
+      "capabilities": ["fs:workdir", "proc:bun", "proc:bash", "net:*", "secret:xai", "secret:upstage", "secret:firecrawl"],
       "connectors": [
         { "id": "xai", "kind": "api-key", "userConfig": [{ "key": "XAI_API_KEY", "label": "xAI API key", "secret": true, "env": "XAI_API_KEY" }] },
         { "id": "upstage", "kind": "api-key", "userConfig": [{ "key": "UPSTAGE_API_KEY", "label": "Upstage API key", "secret": true, "env": "UPSTAGE_API_KEY" }] },

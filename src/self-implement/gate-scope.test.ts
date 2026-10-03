@@ -107,7 +107,8 @@ describe('elanous 런타임 산출물 분리와 출력 관측', () => {
     expect(before.unverified).toEqual(['test/dashboard-acp-boot-localdaemon.test.ts', 'src/voice/channel-adapters/telegram-voice-adapter.ts']);
     // 색인이 있어도 그 시험이 «실행 집합에 없으면» 커버가 아니다.
     const notRun = resolveGateScope(['src/voice/channel-adapters/telegram-voice-adapter.ts', 'test/dashboard-acp-boot.test.ts'], exists, index);
-    expect(notRun.unverified).toContain('src/voice/channel-adapters/telegram-voice-adapter.ts');
+    expect(notRun.testArgs).toContain('test/voice-telegram-voice-adapter.test.ts');
+    expect(notRun.unverified).toEqual([]);
   });
 
   test('산출물만 변경돼도 버리지 않고 unverified 0과 산출물 수를 따로 출력한다', () => {
@@ -211,17 +212,19 @@ describe('resolveGateScope — 5경로 · 풀 폴백 없음', () => {
     expect(s.testArgs).toBeUndefined();
   });
 
-  test('주입한 importer 색인은 실행 범위를 바꾸지 않고 실행되지 않은 관례 밖 테스트를 관측한다', () => {
+  test('주입한 importer 색인은 관례 밖 테스트도 실행 집합에 넣는다', () => {
     const changed = ['src/a.ts'];
     const baseline = resolveGateScope(changed, has('src/a.test.ts'));
     const index = { testsBySource: new Map([['src/a.ts', ['test/off-convention.test.ts']]]), unresolvedRelativeSpecifiers: 2 };
-    const observed = resolveGateScope(changed, has('src/a.test.ts'), index);
+    const observed = resolveGateScope(changed, has('src/a.test.ts', 'test/off-convention.test.ts'), index);
 
     expect(observed.importerTestsNotRun).toEqual({
-      total: 1, files: ['test/off-convention.test.ts'], truncated: false, unresolvedRelativeSpecifiers: 2,
+      total: 0, files: [], truncated: false, unresolvedRelativeSpecifiers: 2,
     });
     expect(resolveGateScope(changed, has('src/a.test.ts')).importerTestsNotRun).toBeNull();
-    expect(observed.testArgs).toEqual(baseline.testArgs);
+    expect(baseline.testArgs).toEqual(['src/a.test.ts']);
+    expect(observed.testArgs).toEqual(['src/a.test.ts', 'test/off-convention.test.ts']);
+    expect(observed.callerTests).toEqual([{ file: 'test/off-convention.test.ts', reasons: ['import'] }]);
     expect(observed.skipTestStep).toBe(baseline.skipTestStep);
     expect(observed.reason).toBe(baseline.reason);
   });
@@ -239,17 +242,18 @@ describe('resolveGateScope — 5경로 · 풀 폴백 없음', () => {
       writeFileSync(join(cwd, 'test/goal-author-runtime.test.ts'), "import '../src/tool-runtime/goal-author-runtime.js';\n");
       const index = buildImporterTestIndex(cwd, ['test/goal-author-runtime.test.ts'], [...changed, collision]);
       const baseline = resolveGateScope(changed, () => false);
-      const observed = resolveGateScope(changed, () => false, index ?? undefined);
+      const observed = resolveGateScope(changed, has('test/goal-author-runtime.test.ts'), index ?? undefined);
 
       expect(index?.testsBySource.get(changed[0])).toEqual(['test/goal-author-runtime.test.ts']);
       expect(index?.testsBySource.get(collision)).toBeUndefined();
       expect(observed.importerTestsNotRun).toMatchObject({
-        total: 1, files: ['test/goal-author-runtime.test.ts'], truncated: false,
+        total: 0, files: [], truncated: false,
       });
       expect(observed.derived).toEqual(baseline.derived);
-      expect(observed.testArgs).toEqual(baseline.testArgs);
-      expect(observed.skipTestStep).toBe(baseline.skipTestStep);
-      expect(observed.reason).toBe(baseline.reason);
+      expect(observed.testArgs).toEqual(['test/goal-author-runtime.test.ts']);
+      expect(observed.callerTests).toEqual([{ file: 'test/goal-author-runtime.test.ts', reasons: ['import'] }]);
+      expect(observed.skipTestStep).toBe(false);
+      expect(observed.reason).toBe('derived');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -258,10 +262,11 @@ describe('resolveGateScope — 5경로 · 풀 폴백 없음', () => {
   test('importer 관측 목록은 상한·총수·절단 여부를 함께 보존한다', () => {
     const importers = Array.from({ length: 21 }, (_, index) => `test/off-${index}.test.ts`);
     const index = { testsBySource: new Map([['src/a.ts', importers]]), unresolvedRelativeSpecifiers: 0 };
-    const s = resolveGateScope(['src/a.ts'], none, index);
+    const s = resolveGateScope(['src/a.ts'], has(...importers), index);
 
-    expect(s.importerTestsNotRun).toMatchObject({ total: 21, truncated: true, unresolvedRelativeSpecifiers: 0 });
-    expect(s.importerTestsNotRun?.files).toHaveLength(20);
+    expect(s.testArgs).toHaveLength(21);
+    expect(s.importerTestsNotRun).toMatchObject({ total: 0, truncated: false, unresolvedRelativeSpecifiers: 0 });
+    expect(s.callerTests).toHaveLength(21);
   });
 });
 

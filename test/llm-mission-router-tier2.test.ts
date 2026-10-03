@@ -23,7 +23,8 @@ function makeCounted(handler: (i: { text: string }) => Promise<{ mission: Missio
   const client: MissionLocalLLMClient = {
     async classify(input) {
       n += 1;
-      return handler(input);
+      // A conforming client reports the classify-role model it was told to use (the router discards anything else).
+      return { ...(await handler(input)), model: input.model };
     },
   };
   return { client, count: () => n };

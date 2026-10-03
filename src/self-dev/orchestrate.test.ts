@@ -10,6 +10,68 @@ import { decideNextRun } from './run-supervisor.js';
 import type { SelfImplementJobSpawn, SelfImplementJobDone } from '../task-orchestrator/surfaces/self-implement.js';
 import type { LogRecord } from '../mss/logging/record.js';
 
+test('terminal results emit one metadata-only observation per merged, review-budget PR and failed run', async () => {
+  const records: LogRecord[] = [];
+  const off = debug.registerSink({ name: 'self-implement-result-test', emit: (record) => {
+    if (record.category === 'self-implement.result' && record.event === 'final') records.push(record);
+  } });
+  const secret = 'PRIVATE_RESULT_BODY_DO_NOT_LOG';
+  const dispositions = [
+    { stage: 'merged', merged: true, runId: 'run-merged', prNumber: 11 },
+    { stage: 'pr-opened', mergeReason: 'review-budget-follow-up-required', runId: 'run-review', prNumber: 12 },
+    { stage: 'gate-failed', failureClassification: 'run-deadline-exceeded' as const, runId: 'run-failed' },
+  ];
+  try {
+    const results = await orchestrateSelfDev({
+      goals: dispositions.map((_, i) => ({ feature: `result-${i}: ${secret}` })),
+      concurrency: 3,
+      spawn: (input) => {
+        const i = Number(input.feature.match(/^result-(\d+)/)?.[1]);
+        return { address: input.spaceId, done: Promise.resolve({
+          exitCode: i === 2 ? 1 : 0,
+          output: secret,
+          disposition: dispositions[i],
+        }) };
+      },
+    });
+    expect(results).toHaveLength(3);
+    expect(records).toHaveLength(3);
+    for (let i = 0; i < dispositions.length; i++) {
+      expect(results[i]).toMatchObject({
+        runId: dispositions[i]!.runId,
+        stage: dispositions[i]!.stage,
+        status: i === 2 ? 'failed' : 'done',
+      });
+      expect(records[i]?.data).toMatchObject({
+        runId: dispositions[i]!.runId,
+        taskId: results[i]!.taskId,
+        stage: dispositions[i]!.stage,
+        mergeReason: 'mergeReason' in dispositions[i]! ? dispositions[i]!.mergeReason : null,
+        failureClassification: 'failureClassification' in dispositions[i]! ? dispositions[i]!.failureClassification : null,
+        prNumber: 'prNumber' in dispositions[i]! ? dispositions[i]!.prNumber : null,
+      });
+      expect(JSON.stringify(records[i])).not.toContain(secret);
+    }
+  } finally { off(); }
+});
+
+test('orchestrated goal carries after through task surface and adapter into Pod spawn', async () => {
+  const seen: Array<string | number | undefined> = [];
+  const results = await orchestrateSelfDev({
+    goals: [{ feature: 'goal with prerequisite', after: 'previous-goal' }, { feature: 'goal after PR', after: 123 }, { feature: 'independent' }],
+    concurrency: 3,
+    spawn: (input) => {
+      seen.push(input.after);
+      return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '' }) };
+    },
+  });
+  expect(results).toHaveLength(3);
+  expect(seen).toHaveLength(3);
+  expect(seen).toContain('previous-goal');
+  expect(seen).toContain(123);
+  expect(seen).toContain(undefined);
+});
+
 function withoutShardIdentity(feature: string): string {
   return feature.replace(/\n\n## Shard identity\n[^\n]*/, '');
 }
@@ -826,6 +888,51 @@ describe('orchestrateSelfDev — multi-shard identity context', () => {
       'gamma owns the focused tests',
     ]);
     expect(beta.siblings[0]!.summary.length).toBeLessThanOrEqual(240);
+  });
+
+  test('carries one parsed goal release note into every shard identity', async () => {
+    const received: string[] = [];
+    const parentRequest = '# Goal\n## Situation\nwork\n## 릴리스 노트\n- 한 줄: New public action\n- 종류: feat\n- 문서: 없음(사용 설명)\n- 대상: next\n';
+    await orchestrateSelfDev({
+      parentRequest, goals: [{ feature: 'first shard' }, { feature: 'second shard' }],
+      spawn: (input) => { received.push(input.feature); return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '' }) }; },
+    });
+    expect(received).toHaveLength(2);
+    for (const feature of received) {
+      const identity = JSON.parse(feature.split('## Shard identity\n')[1]!) as { releaseNote: unknown };
+      expect(identity.releaseNote).toEqual({ line: 'New public action', kind: 'feat', docs: { none: '사용 설명' }, target: 'next' });
+    }
+  });
+
+  test('legacy goal boundary excludes release notes outside ## 목표 from shard identity', async () => {
+    const received: string[] = [];
+    const outside = '## 릴리스 노트\n- 한 줄: Outside goal\n- 종류: feat\n- 문서: 없음(예시)\n- 대상: next\n';
+    await orchestrateSelfDev({
+      parentRequest: `${outside}\n## 목표\nwork\n## 검증\n${outside}`,
+      goals: [{ feature: 'first shard' }, { feature: 'second shard' }],
+      spawn: (input) => { received.push(input.feature); return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '' }) }; },
+    });
+    expect(received).toHaveLength(2);
+    for (const feature of received) {
+      const identity = JSON.parse(feature.split('## Shard identity\n')[1]!) as { releaseNote?: unknown };
+      expect(identity.releaseNote).toBeUndefined();
+    }
+  });
+
+  test('legacy goal boundary carries only the inside release note to each shard', async () => {
+    const received: string[] = [];
+    const outside = '## 릴리스 노트\n- 한 줄: Outside goal\n- 종류: feat\n- 문서: 없음(예시)\n- 대상: next\n';
+    const inside = '## 릴리스 노트\n- 한 줄: Inside goal\n- 종류: fix\n- 문서: docs/fix.md\n- 대상: next\n';
+    await orchestrateSelfDev({
+      parentRequest: `${outside}\n## 목표\nwork\n${inside}\n## 검증\n${outside}`,
+      goals: [{ feature: 'first shard' }, { feature: 'second shard' }],
+      spawn: (input) => { received.push(input.feature); return { address: input.spaceId, done: Promise.resolve({ exitCode: 0, output: '' }) }; },
+    });
+    expect(received).toHaveLength(2);
+    for (const feature of received) {
+      const identity = JSON.parse(feature.split('## Shard identity\n')[1]!) as { releaseNote?: unknown };
+      expect(identity.releaseNote).toEqual({ line: 'Inside goal', kind: 'fix', docs: { path: 'docs/fix.md' }, target: 'next' });
+    }
   });
 
   test('groups a no-parentRequest { goals, concurrency } fan-out in the run ledger identity', async () => {

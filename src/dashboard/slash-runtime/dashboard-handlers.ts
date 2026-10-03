@@ -272,6 +272,8 @@
 // `../index.ts`) instead of importing the type — keeps this module free
 // of circular dependency on dashboard/index.ts.
 
+import { tuiNowSlash } from '../../context-bus/context-now-surfaces.js';
+import type { ContextNowDeps } from '../../context-bus/context-now.js';
 import { runRebindCommand } from '../../input-core/index.js';
 // B4 (TUI half) — /design reuses the CLI's own resolution so the three
 // surfaces (CLI, PWA panel, this) cannot answer differently.
@@ -1358,8 +1360,12 @@ function emitReplyToChat(ctx: Pick<DashboardSlashContext, 'pushChatLine'>, line:
   ctx.pushChatLine(line);
 }
 
-export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn> {
+export function buildDashboardSlashRegistry(nowDeps?: ContextNowDeps): SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn> {
   const registry = new SlashCommandRegistry<DashboardSlashContext, DashboardSlashReturn>();
+
+  registry.register(['now'], (args, ctx) => {
+    for (const line of tuiNowSlash(args, nowDeps)) ctx.pushChatLine(line);
+  });
 
   // ── B-1.a pilot ────────────────────────────────────────────────────
   registry.register(['quit', 'q', 'exit'], (_args, ctx) => {

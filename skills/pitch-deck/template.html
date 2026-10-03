@@ -12,8 +12,8 @@
   .slide { display: none; width: min(100%, calc((100svh - 8rem) * 16 / 9)); aspect-ratio: 16 / 9; padding: clamp(1.4rem, 5vw, 5rem); background: #0c0c0e; border: 1px solid #f2f1ee; flex-direction: column; justify-content: space-between; overflow: hidden; }
   .slide.active { display: flex; }
   .eyebrow, .marker { color: #e95047; font-size: clamp(.8rem, 1.3vw, 1rem); font-weight: 650; letter-spacing: .08em; }
-  h1, h2 { max-width: 20ch; font-size: clamp(2rem, 4.4vw, 4.9rem); line-height: 1.15; letter-spacing: -.045em; margin: .4em 0; text-wrap: balance; }
-  p, li { max-width: 54ch; font-size: clamp(1rem, 1.7vw, 1.6rem); line-height: 1.55; }
+  h1, h2 { max-width: 20ch; font-size: clamp(2rem, 4.4vw, 4.9rem); line-height: 1.15; letter-spacing: -.045em; margin: .4em 0; text-wrap: balance; word-break: keep-all; overflow-wrap: anywhere; }
+  p, li { max-width: 54ch; font-size: clamp(1rem, 1.7vw, 1.6rem); line-height: 1.55; word-break: keep-all; overflow-wrap: anywhere; }
   ul { padding-left: 1.2em; }
   .accent { color: #e95047; }
   .screen-slot { border: 1px dashed #e95047; padding: .6rem 1rem; color: #f2f1ee; font-size: clamp(.9rem, 1.4vw, 1.2rem); }

@@ -1,12 +1,14 @@
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { UserConfig } from '../user-config.js';
 import { debug } from '../debug/log.js';
-import { resolveReportTarget, sendTelegramReport } from '../telegram-report.js';
+import { resolveReportTarget, sendReportPhoto, sendReportPhotoBuffer, sendTelegramReport } from '../telegram-report.js';
 import { flushDeferred, sendTelegramDirect, setInProcessOutbound } from './outbound-alert.js';
-import { DEFAULT_KIND_ROLES } from './telegram-kind-route.js';
+import { DEFAULT_KIND_ROLES, roleForKind } from './telegram-kind-route.js';
+import { routeOutbound } from '../nexus/outbound/router.js';
 
 const main = 'MAIN:token-not-real';
 const trading = 'TRADING:token-not-real';
@@ -37,9 +39,18 @@ test('plain trading report stays on reportChannel', () => {
   fallback('report', 'report-channel', false);
 });
 
-test('ops-alert with the same report bot stays on reportChannel', () => {
-  expect(resolveReportTarget(config(main), 'ops-alert')).toEqual({ botToken: main, chatId: 202 });
-  fallback('ops-alert', 'report-channel', true);
+test('legacy trading report needs a distinct, explicit report bot', () => {
+  const cfg = config(main);
+  for (const kind of ['report', 'alert', 'digest']) expect(resolveReportTarget(cfg, kind)).toBeNull();
+  cfg.telegram.reportChannel = { chatId: 202 };
+  for (const kind of ['report', 'alert', 'digest']) expect(resolveReportTarget(cfg, kind)).toBeNull();
+});
+
+test('report channel explicitly on the main token is ambiguous (could be the trading bot) — ops-alert fails closed; a report channel without its own token keeps ops on the main home', () => {
+  // OUT1 review must-fix: an explicit report token equal to the main token cannot prove the main bot is the operations bot.
+  expect(resolveReportTarget(config(main), 'ops-alert')).toBeNull();
+  const single = { telegram: { enabled: true, botToken: main, homeChannel: 101, allowedUsers: [102], reportChannel: { chatId: 202 } } } as UserConfig;
+  expect(resolveReportTarget(single, 'ops-alert')).toEqual({ botToken: main, chatId: 101 });
 });
 
 test('explicit system channel wins for operational and mission kinds without fallback', () => {
@@ -75,6 +86,216 @@ test('report sender posts ops kind to the main bot/home, never the trading bot',
   expect(await sendTelegramReport(config(), 'ops', { kind: 'ops-report', markdown: false, fetchImpl })).toBe(true);
   expect(calls).toEqual([{ url: `https://api.telegram.org/bot${main}/sendMessage`, chatId: 101, text: 'ops' }]);
   fallback('ops-report', 'main-home', false);
+});
+
+test('each kind resolves to its own bot; an absent exact role fails closed', () => {
+  const cfg = config();
+  cfg.telegram.channels = [
+    { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system', 'default'] },
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+  ];
+  for (const kind of ['ops-report', 'ops-alert', 'op-report', 'brief', 'intake', 'regression', 'agent-mission', 'new-kind', undefined]) {
+    expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: main, chatId: 303 });
+  }
+  for (const kind of ['report', 'alert', 'digest']) {
+    expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: trading, chatId: 404 });
+  }
+  cfg.telegram.kindRoles = {
+    'new-kind': 'report', report: 'system', alert: 'system', digest: 'system',
+  };
+  expect(resolveReportTarget(cfg, 'new-kind')).toEqual({ botToken: main, chatId: 303 });
+  for (const kind of ['report', 'alert', 'digest']) {
+    expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: trading, chatId: 404 });
+  }
+  cfg.telegram.channels = [cfg.telegram.channels[1]!];
+  expect(resolveReportTarget(cfg, 'new-kind')).toBeNull();
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+  expect(resolveReportTarget(cfg, undefined)).toBeNull();
+  cfg.telegram.channels = [{ name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system', 'default'] }];
+  expect(resolveReportTarget(cfg, 'report')).toBeNull();
+  cfg.telegram.channels = [{ name: 'mislabelled-trade', botToken: main, chatId: 303, interactive: false, roles: ['report'] }];
+  for (const kind of ['report', 'alert', 'digest']) expect(resolveReportTarget(cfg, kind)).toBeNull();
+  delete cfg.telegram.reportChannel;
+  for (const kind of ['report', 'alert', 'digest']) expect(resolveReportTarget(cfg, kind)).toBeNull();
+  cfg.telegram.reportChannel = { botToken: trading, chatId: 202 };
+  cfg.telegram.channels = [
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+    { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+  ];
+  expect(resolveReportTarget(cfg, 'brief')).toEqual({ botToken: main, chatId: 303 });
+  cfg.telegram.channels = [{ name: 'malformed-ops', botToken: trading, chatId: 404, interactive: false, roles: ['system'] }];
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+  delete cfg.telegram.reportChannel;
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+});
+
+test('safe kindRoles select alternate channels on the correct bot; unsafe overrides cannot cross the bot boundary', () => {
+  const cfg = config();
+  cfg.telegram.channels = [
+    { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+    { name: 'ops-brief', botToken: main, chatId: 305, interactive: false, roles: ['briefing'] },
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+    { name: 'trade-alert', botToken: trading, chatId: 405, interactive: false, roles: ['trade-alert'] },
+  ];
+  cfg.telegram.kindRoles = { brief: 'briefing', 'new-kind': 'briefing', alert: 'trade-alert' };
+  expect(roleForKind(cfg, 'brief')).toBe('briefing');
+  expect(resolveReportTarget(cfg, 'brief')).toEqual({ botToken: main, chatId: 305 });
+  expect(resolveReportTarget(cfg, 'new-kind')).toEqual({ botToken: main, chatId: 305 });
+  expect(resolveReportTarget(cfg, 'alert')).toEqual({ botToken: trading, chatId: 405 });
+  cfg.telegram.kindRoles = { brief: 'report', 'new-kind': 'trade-alert', report: 'system', alert: 'briefing' };
+  expect(roleForKind(cfg, 'brief')).toBe('system');
+  expect(resolveReportTarget(cfg, 'brief')).toEqual({ botToken: main, chatId: 303 });
+  expect(resolveReportTarget(cfg, 'new-kind')).toEqual({ botToken: main, chatId: 303 });
+  expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: trading, chatId: 404 });
+  expect(resolveReportTarget(cfg, 'alert')).toEqual({ botToken: trading, chatId: 404 });
+  cfg.telegram.channels = [
+    { name: 'mislabelled-trade', botToken: main, chatId: 303, interactive: true, roles: ['report', 'trade-alert'] },
+  ];
+  delete cfg.telegram.reportChannel;
+  for (const kind of ['report', 'alert', 'digest']) expect(resolveReportTarget(cfg, kind)).toBeNull();
+  cfg.telegram.channels = [
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+    { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+  ];
+  delete cfg.telegram.botToken;
+  expect(resolveReportTarget(cfg, 'brief')).toEqual({ botToken: main, chatId: 303 });
+  expect(resolveReportTarget(cfg, 'report')).toEqual({ botToken: trading, chatId: 404 });
+});
+
+test('explicit ops channel without botToken routes operational kinds and photos with injected fetch', async () => {
+  const cfg = config();
+  delete cfg.telegram.botToken;
+  cfg.telegram.channels = [
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+    { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+  ];
+  const calls: Array<{ url: string; chatId: number }> = [];
+  const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const body = init?.body;
+    calls.push({ url: String(url), chatId: body instanceof FormData
+      ? Number(body.get('chat_id')) : JSON.parse(String(body)).chat_id });
+    return Response.json({ ok: true, result: { message_id: 1 } });
+  }) as typeof fetch;
+  for (const kind of ['ops-report', 'op-report', 'brief', 'unknown-kind']) {
+    expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: main, chatId: 303 });
+    expect(await sendTelegramReport(cfg, kind, { kind, markdown: false, fetchImpl })).toBe(true);
+  }
+  expect(await sendReportPhoto(cfg, 'https://example.invalid/image.png', { fetchImpl })).toBe(true);
+  expect(await sendReportPhotoBuffer(cfg, Buffer.from('png'), { fetchImpl })).toBe(true);
+  for (const kind of ['report', 'alert', 'digest']) {
+    expect(resolveReportTarget(cfg, kind)).toEqual({ botToken: trading, chatId: 404 });
+    expect(await sendTelegramReport(cfg, kind, { kind, markdown: false, fetchImpl })).toBe(true);
+  }
+  expect(calls).toEqual([
+    ...Array(4).fill({ url: `https://api.telegram.org/bot${main}/sendMessage`, chatId: 303 }),
+    ...Array(2).fill({ url: `https://api.telegram.org/bot${main}/sendPhoto`, chatId: 303 }),
+    ...Array(3).fill({ url: `https://api.telegram.org/bot${trading}/sendMessage`, chatId: 404 }),
+  ]);
+  const direct: Array<[string, string]> = [];
+  expect(sendTelegramDirect('brief', 'brief', {
+    config: cfg,
+    sendRaw: (token, chatId) => { direct.push([token, String(chatId)]); return true; },
+    legacyEnv: () => { throw new Error('conatus must not be read'); },
+  })).toBe(true);
+  expect(direct).toEqual([[main, '303']]);
+});
+
+test('channel identity ambiguity and a report-token ops impostor fail closed without botToken', () => {
+  const cfg = config();
+  delete cfg.telegram.botToken;
+  cfg.telegram.channels = [
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+    { name: 'ops', botToken: trading, chatId: 303, interactive: true, roles: ['system'] },
+  ];
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+  cfg.telegram.channels[1] = { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] };
+  cfg.telegram.channels.push({ name: 'main', botToken: 'OTHER:token-not-real', chatId: 505, interactive: true, roles: ['qa'] });
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+  cfg.telegram.channels = [{ name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['system', 'report'] }];
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+  cfg.telegram.channels = [
+    { name: 'ops', botToken: trading, chatId: 303, interactive: true, roles: ['system'] },
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+  ];
+  delete cfg.telegram.reportChannel;
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+  cfg.telegram.channels = [{ name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] }];
+  cfg.telegram.botToken = trading;
+  expect(resolveReportTarget(cfg, 'brief')).toBeNull();
+});
+
+test('role overrides choose the first safe matching channel even if an earlier channel misuses the role', () => {
+  const cfg = config();
+  cfg.telegram.channels = [
+    { name: 'wrong-brief', botToken: trading, chatId: 404, interactive: false, roles: ['briefing'] },
+    { name: 'ops-brief', botToken: main, chatId: 305, interactive: true, roles: ['briefing'] },
+    { name: 'wrong-trade', botToken: main, chatId: 303, interactive: true, roles: ['trade-alert'] },
+    { name: 'trade-alert', botToken: trading, chatId: 405, interactive: false, roles: ['trade-alert'] },
+  ];
+  cfg.telegram.kindRoles = { brief: 'briefing', alert: 'trade-alert' };
+  expect(resolveReportTarget(cfg, 'brief')).toEqual({ botToken: main, chatId: 305 });
+  expect(resolveReportTarget(cfg, 'alert')).toEqual({ botToken: trading, chatId: 405 });
+});
+
+test('report, photo and buffer use the same kind policy with injected fetch only', async () => {
+  const cfg = config();
+  cfg.telegram.channels = [
+    { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+  ];
+  const calls: Array<{ url: string; chatId: number }> = [];
+  const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    const body = init?.body;
+    const chatId = body instanceof FormData ? Number(body.get('chat_id')) : JSON.parse(String(body)).chat_id;
+    calls.push({ url: String(url), chatId });
+    return Response.json({ ok: true, result: { message_id: 1 } });
+  }) as typeof fetch;
+  expect(await sendTelegramReport(cfg, 'brief', { kind: 'brief', markdown: false, fetchImpl })).toBe(true);
+  expect(await sendTelegramReport(cfg, 'trade', { kind: 'report', markdown: false, fetchImpl })).toBe(true);
+  expect(await sendReportPhoto(cfg, 'https://example.invalid/image.png', { fetchImpl })).toBe(true);
+  expect(await sendReportPhotoBuffer(cfg, Buffer.from('png'), { fetchImpl })).toBe(true);
+  expect(await sendReportPhoto(cfg, 'https://example.invalid/image.png', { kind: 'report', fetchImpl })).toBe(true);
+  expect(await sendReportPhotoBuffer(cfg, Buffer.from('png'), { kind: 'digest', fetchImpl })).toBe(true);
+  expect(calls).toEqual([
+    { url: `https://api.telegram.org/bot${main}/sendMessage`, chatId: 303 },
+    { url: `https://api.telegram.org/bot${trading}/sendMessage`, chatId: 404 },
+    { url: `https://api.telegram.org/bot${main}/sendPhoto`, chatId: 303 },
+    { url: `https://api.telegram.org/bot${main}/sendPhoto`, chatId: 303 },
+    { url: `https://api.telegram.org/bot${trading}/sendPhoto`, chatId: 404 },
+    { url: `https://api.telegram.org/bot${trading}/sendPhoto`, chatId: 404 },
+  ]);
+  cfg.telegram.channels = [{ name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] }];
+  calls.length = 0;
+  expect(await sendTelegramReport(cfg, 'unknown', { kind: 'new-kind', fetchImpl })).toBe(false);
+  expect(await sendReportPhoto(cfg, 'https://example.invalid/image.png', { fetchImpl })).toBe(false);
+  expect(await sendReportPhotoBuffer(cfg, Buffer.from('png'), { fetchImpl })).toBe(false);
+  expect(calls).toEqual([]);
+});
+
+test('outbound router passes its kind through the real Telegram sender, without a network call', async () => {
+  const cfg = config();
+  cfg.telegram.channels = [
+    { name: 'ops', botToken: main, chatId: 303, interactive: true, roles: ['system'] },
+    { name: 'trade', botToken: trading, chatId: 404, interactive: false, roles: ['report'] },
+  ];
+  const db = new Database(':memory:');
+  const calls: string[] = [];
+  const fetchImpl = (async (url: RequestInfo | URL) => {
+    calls.push(String(url));
+    return Response.json({ ok: true, result: { message_id: 1 } });
+  }) as typeof fetch;
+  try {
+    for (const kind of ['ops-report', 'op-report', 'brief', 'unlisted', 'report']) {
+      const result = await routeOutbound(cfg, { kind, text: `test-${kind}`, markdown: false }, {
+        fetchImpl, deliveryDb: db, dedup: false, spill: text => ({ text, spilled: false }),
+      });
+      expect(result.delivered).toBe(true);
+    }
+    expect(calls).toEqual([
+      ...Array(4).fill(`https://api.telegram.org/bot${main}/sendMessage`),
+      `https://api.telegram.org/bot${trading}/sendMessage`,
+    ]);
+  } finally { db.close(); }
 });
 
 test('direct ops-alert ignores both trading envs even without a daemon; sends to main home', () => {
@@ -127,6 +348,35 @@ test('direct mapped ops kind sends to the explicit system channel', () => {
   expect(log.mock.calls.filter(([category]) => category === 'telegram.kind-route')).toHaveLength(0);
 });
 
+test('direct fallback cannot send unlisted kind to either a trading channel or the conatus env', () => {
+  const cfg = config();
+  cfg.telegram.channels = [{ name: 'trading', botToken: trading, chatId: 202, interactive: false, roles: ['report', 'default'] }];
+  for (const kind of ['brief', 'op-report', 'not-listed', undefined]) {
+    expect(sendTelegramDirect('text', kind, {
+      config: cfg,
+      legacyEnv: () => { throw new Error('conatus must not be read'); },
+      sendRaw: () => { throw new Error('must not send'); },
+    })).toBe(false);
+    log.mockClear();
+  }
+});
+
+test('direct unknown kind with unavailable config never reads trading env', () => {
+  const cfg = config();
+  delete cfg.telegram.botToken;
+  cfg.telegram.allowedUsers = [];
+  delete cfg.telegram.homeChannel;
+  const error = spyOn(console, 'error').mockImplementation(() => undefined);
+  try {
+    expect(sendTelegramDirect('briefing', 'brief', {
+      config: cfg,
+      legacyEnv: () => { throw new Error('conatus must not be read'); },
+      sendRaw: () => { throw new Error('must not send'); },
+    })).toBe(false);
+    expect(error).toHaveBeenCalled();
+  } finally { error.mockRestore(); }
+});
+
 test('direct trading report preserves the legacy conatus-env fallback', () => {
   const calls: string[] = [];
   expect(sendTelegramDirect('trade', 'report', {
@@ -145,13 +395,14 @@ test('deferred operational and trading notifications remain in separate delivery
   writeFileSync(path, [
     { ts: new Date().toISOString(), kind: 'ops-report', text: 'operations' },
     { ts: new Date().toISOString(), kind: 'alert', text: 'trading' },
+    { ts: new Date().toISOString(), kind: 'brief', text: 'briefing' },
   ].map(item => JSON.stringify(item)).join('\n') + '\n');
   const previous = process.env.SEND_VIA_ELANOUS;
   process.env.SEND_VIA_ELANOUS = '1';
   setInProcessOutbound(async (_text, kind) => { kinds.push(kind); return true; });
   try {
-    expect(flushDeferred(path)).toBe(2);
-    expect(kinds).toEqual(['report', 'ops-report']);
+    expect(flushDeferred(path)).toBe(3);
+    expect(kinds).toEqual(['report', 'ops-report', 'brief']);
   } finally {
     setInProcessOutbound(null);
     if (previous === undefined) delete process.env.SEND_VIA_ELANOUS;
@@ -171,4 +422,36 @@ test('operational scripts send only operational kinds at their sendOutbound call
     const kinds = [...source.matchAll(/sendOutbound\([^;\n]*?,\s*'(ops-report|ops-alert|report|alert)'\)/g)].map(m => m[1]);
     expect(kinds).toEqual(expected);
   }
+});
+
+test('without a channels table, a main token equal to the report (trading) bot token is not an operations bot — operational kinds stop, nothing is sent', async () => {
+  const cfg = { telegram: { enabled: true, botToken: trading, homeChannel: 101, allowedUsers: [102], reportChannel: { botToken: trading, chatId: 202 } } } as UserConfig;
+  let sent = 0;
+  const fetchImpl = (async (_url: RequestInfo | URL, _init?: RequestInit) => { sent++; return Response.json({ ok: true, result: { message_id: 1 } }); }) as typeof fetch;
+  for (const kind of ['brief', 'ops-report', 'ops-alert', 'intake', undefined]) {
+    expect(resolveReportTarget(cfg, kind)).toBeNull();
+    expect(await sendTelegramReport(cfg, 'x', { kind, markdown: false, fetchImpl })).toBe(false);
+  }
+  expect(sent).toBe(0);
+  // a trading kind still has no distinct report bot here → also not sent
+  expect(await sendTelegramReport(cfg, 'x', { kind: 'report', markdown: false, fetchImpl })).toBe(false);
+  expect(sent).toBe(0);
+});
+
+test('without a channels table, distinct tokens: every operational kind goes to the main bot home, every trading kind to the report bot', async () => {
+  const calls: Array<{ url: string; chatId: number }> = [];
+  const fetchImpl = (async (url: RequestInfo | URL, init?: RequestInit) => {
+    calls.push({ url: String(url), chatId: JSON.parse(String(init?.body)).chat_id });
+    return Response.json({ ok: true, result: { message_id: 1 } });
+  }) as typeof fetch;
+  for (const kind of Object.keys(DEFAULT_KIND_ROLES)) {
+    calls.length = 0;
+    expect(await sendTelegramReport(config(), 'x', { kind, markdown: false, fetchImpl })).toBe(true);
+    const trading_ = ['report', 'alert', 'digest'].includes(kind);
+    expect(calls).toEqual([{ url: `https://api.telegram.org/bot${trading_ ? trading : main}/sendMessage`, chatId: trading_ ? 202 : 101 }]);
+  }
+  // a kind missing from every table is operational — main home, never the trading bot
+  calls.length = 0;
+  expect(await sendTelegramReport(config(), 'x', { kind: 'not-in-any-table', markdown: false, fetchImpl })).toBe(true);
+  expect(calls[0]?.url).toBe(`https://api.telegram.org/bot${main}/sendMessage`);
 });

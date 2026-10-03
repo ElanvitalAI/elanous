@@ -3,6 +3,8 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { unknownCronFlag } from '../src/domains/cron-flag-contract.js';
 import { auditCronFlags } from './cron-flag-audit.js';
+import { createDigestPhotoSender } from './signal-digest-photo.js';
+import type { UserConfig } from '../src/user-config.js';
 
 // Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
 setDefaultTimeout(60_000);
@@ -46,16 +48,24 @@ describe('signal digest cycle flags', () => {
     expect(source).toContain(guard);
     expect(source.indexOf(guard)).toBeLessThan(source.indexOf('ensureCronNodePath();'));
     expect(source.indexOf(guard)).toBeLessThan(source.indexOf('new SignalPool()'));
-    expect(source.indexOf(guard)).toBeLessThan(source.indexOf('runDigest(pool, LIVE ? { send: sendOutbound, sendPhoto: sendDigestPhoto }'));
+    expect(source.indexOf(guard)).toBeLessThan(source.indexOf('runDigest(pool, LIVE ? { send: sendOutbound, sendPhoto: createDigestPhotoSender() }'));
     expect(source).toContain("const LIVE = process.argv.includes('--live');");
-    expect(source).toContain('runDigest(pool, LIVE ? { send: sendOutbound, sendPhoto: sendDigestPhoto } : {})');
+    expect(source).toContain('runDigest(pool, LIVE ? { send: sendOutbound, sendPhoto: createDigestPhotoSender() } : {})');
     expect(source).not.toContain('runDigest(pool, LIVE ? { send: sendOutbound } : {})');
-    expect(source).toContain('sendReportPhotoBuffer');
-    expect(source).toContain('sendPhoto: sendDigestPhoto');
-    expect(source).toContain('async function sendDigestPhoto(png: Buffer, opts?: { caption?: string }): Promise<boolean> {');
-    expect(source).toContain('return sendReportPhotoBuffer(getUserConfig(), png, opts);');
     expect(source).not.toContain('if (import.meta.main)');
     expect(source).not.toMatch(/export\s+function/);
+  });
+
+  it('passes digest kind from the live photo callback to the injected sender', async () => {
+    const cfg = { telegram: { enabled: true } } as UserConfig;
+    const png = Buffer.from('png');
+    const calls: Array<{ config: UserConfig; png: Buffer; opts: { caption?: string; kind?: string } | undefined }> = [];
+    const callback = createDigestPhotoSender(() => cfg, async (config, image, opts) => {
+      calls.push({ config, png: image, opts });
+      return true;
+    });
+    expect(await callback(png, { caption: 'chart' })).toBe(true);
+    expect(calls).toEqual([{ config: cfg, png, opts: { caption: 'chart', kind: 'digest' } }]);
   });
 
   it('is recognized as guarded by the cron flag audit', () => {

@@ -195,3 +195,8 @@ test('dev --ask on a Pod keeps --no-auto-merge (and only then sends autoMerge fa
     .toEqual({ entrance: 'cli-harness-ask', input: 'docs/goals/g.md', podPool: 'pool-node-b@node-b:8', base: 'main', autoMerge: false });
   expect(devAskPodDispatchInput({}, 'g.md', 'p')).toEqual({ entrance: 'cli-harness-ask', input: 'g.md', podPool: 'p' });
 });
+
+test('harness path prefers harness.podPool over pod.pool', () => {
+  expect(resolveHarnessSubstrate({ config: { harness: { substrate: 'pod', podPool: 'harness:20' }, pod: { pool: 'generic:2' } } as Pick<UserConfig, 'harness' | 'pod'>, env: {}, currentContext: () => 'ctx' }).pool).toBe('harness:20');
+  expect(resolveHarnessSubstrate({ config: { harness: { substrate: 'pod' }, pod: { pool: 'generic:2' } } as Pick<UserConfig, 'harness' | 'pod'>, env: {}, currentContext: () => 'ctx' }).pool).toBe('generic:2');
+});

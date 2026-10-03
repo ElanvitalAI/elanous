@@ -11,7 +11,7 @@ test('a run that has only written its early pid record is found by harness stop 
   const runsDir = mkdtempSync(join(tmpdir(), 'hs1-runs-'));
   const runId = 'run-hs1-early-0001';
   const module = join(import.meta.dir, 'orchestrate.ts');
-  const child = Bun.spawn(['bun', '-e', `import(${JSON.stringify(module)}).then((m) => { m.writeRunPidRecord(${JSON.stringify(runId)}, ${JSON.stringify(runsDir)}); console.log('ready'); setInterval(() => {}, 1000); })`],
+  const child = Bun.spawn(['bun', '-e', `import(${JSON.stringify(module)}).then((m) => { m.writeRunPidRecord(${JSON.stringify(runId)}, ${JSON.stringify(runsDir)}, null); console.log('ready'); setInterval(() => {}, 1000); })`],
     { stdout: 'pipe', stderr: 'pipe' });
   try {
     const reader = child.stdout.getReader();

@@ -18,6 +18,7 @@ import type { ShootRunOptions } from '../ad-pipeline/shoot-run.js';
 import type { QcThresholds } from '../ad-pipeline/qc.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { suggestProjectForFolder } from '../project/project-store.js';
+import { createProjectSuggester } from '../project/project-suggestion.js';
 
 const dashboardDefaultShootRunOptions: Required<Pick<ShootRunOptions, 'pollIntervalMs' | 'maxPollsPerJob' | 'submitStaggerMs'>> = {
   pollIntervalMs: 3_000,
@@ -15791,12 +15792,16 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         chatLines.push(C.muted(`    ${resume.turns} turns restored. Next turn continues this conversation.`));
       }
     }
+    // 제안은 세션 작업 폴더 기준 — 시작 폴더 한 번이 아니라 폴더가 바뀔 때마다 다시 계산한다(IA1 리뷰 must-fix).
+    const nextProjectSuggestion = createProjectSuggester(suggestProjectForFolder);
+    const pushProjectSuggestion = (folder: string): void => {
+      const project = nextProjectSuggestion(folder);
+      if (project) chatLines.push(C.muted(`  Project suggestion: ${project.name} (${project.id})`));
+    };
     if (dashboardAcpBootResult.mode !== 'resumed' && !chat.history.some((message) => message.role !== 'system')) {
-      try {
-        const project = suggestProjectForFolder(process.cwd());
-        if (project) chatLines.push(C.muted(`  Project suggestion: ${project.name} (${project.id})`));
-      } catch { /* suggestions must not interrupt the dashboard conversation */ }
+      pushProjectSuggestion(getSessionCwd());
     }
+    subscribeSessionCwd((state) => { pushProjectSuggestion(state.cwd); });
     chatScrollOffset = -1;
     void renderDashboardFirstScreenBand({
       history: chat.history,

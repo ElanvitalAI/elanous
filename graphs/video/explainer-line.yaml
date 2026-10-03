@@ -1,7 +1,7 @@
 # «N가지 한 번에 정리» explainer: facts → script → timed VO → composition → checked render → measured QC.
 # Engine = skills/explainer-video (vo.ts · build.mjs). Render/snapshot/check = the existing hyperframes-render recipe.
-# ⚠️ Recipes explainer-script / explainer-vo / explainer-build / explainer-qc are declared here and not yet coded
-#    (src/video-pipeline/recipes) — a walk stops at the first of them as «unknown recipe». Until then the skill runs these steps.
+# Recipes explainer-script / explainer-vo / explainer-build / explainer-qc are implemented in
+# src/video-pipeline/recipes/explainer.ts; the graph routes their outcomes through render and QC.
 graph_id: explainer-line
 version: 1
 entry_node: script

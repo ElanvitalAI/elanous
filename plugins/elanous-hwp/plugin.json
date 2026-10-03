@@ -1,0 +1,16 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "elanous-hwp",
+  "version": "0.1.0",
+  "main": "./plugin.ts",
+  "description": "Convert HWPX documents to Markdown and write minimal HWPX from Markdown; legacy HWP is not supported.",
+  "extensions": {
+    "ai.elanous": {
+      "capabilities": ["fs:workdir", "proc:bun"],
+      "connectors": [],
+      "pricing": { "model": "free" },
+      "trust": "official",
+      "category": "Productivity"
+    }
+  }
+}

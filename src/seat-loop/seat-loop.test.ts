@@ -1,10 +1,21 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { execFile } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { gatherSeatInputs, pickNext, planAction, runSeatLoopOnce, seatLedgerPath, type SeatDeps } from './seat-loop.js';
+import { debug } from '../debug/log.js';
+import * as runningRunsModule from '../self-implement/running-runs.js';
+import { dispatchHook } from '../hooks/dispatch.js';
+import { openMsgStore } from '../msg/msg-store.js';
+import * as checklistModule from '../release-loop/checklist.js';
+import type { Checklist } from '../release-loop/checklist.js';
+import { buildUserConfig, parseEventsConfig } from '../user-config.js';
+import { PersonaRegistry } from '../persona/registry.js';
+import { writePersonaTodos } from '../persona/persona-todo.js';
+import { alreadyHandled, gatherSeatInputs, personaShadowLedgerPath, pickNext, planAction, runSeatLoopOnce, runSeatLoopTurn, seatLedgerPath, type SeatDeps } from './seat-loop.js';
+// The owner mark is assembled at runtime so the public export carries no literal (LEAK1).
+const CEO = '\u{1F451}';
 
 const now = new Date('2026-10-02T23:20:00Z');
 const fixture = () => {
@@ -17,9 +28,11 @@ const fixture = () => {
   // Tests stand in for the release ledger DB with per-version JSON fixtures under the temp root.
   const checklistItems = (version: string) => {
     const raw = read(join(root, 'release', version, 'checklist.json'));
-    return raw ? (JSON.parse(raw) as { items: Array<{ id: string; title: string; status: string; owner?: string }> }).items : [];
+    return raw ? (JSON.parse(raw) as { items: Array<{ id: string; title: string; status: string; owner?: string; evidence?: string }> }).items : [];
   };
-  const deps: SeatDeps = { root, repo: root, now: () => now, read, versions: () => ['0.2.10', '0.2.9'], checklistItems };
+  // Every fixture version is open (cut far ahead) unless a test passes its own schedules.
+  const schedules = () => ['0.2.5', '0.2.9', '0.2.10', '0.2.11', '0.2.12'].map((version) => ({ version, cutAt: '2099-01-01T00:00:00Z' }));
+  const deps: SeatDeps = { root, repo: root, now: () => now, read, versions: () => ['0.2.10', '0.2.9'], checklistItems, schedules };
   return { root, deps, close: () => rmSync(root, { recursive: true, force: true }) };
 };
 const checklist = (f: ReturnType<typeof fixture>, version: string, items: unknown[]) => {
@@ -28,6 +41,459 @@ const checklist = (f: ReturnType<typeof fixture>, version: string, items: unknow
   writeFileSync(join(dir, 'checklist.json'), JSON.stringify({ items }));
 };
 const entries = (f: ReturnType<typeof fixture>) => f.deps.read!(seatLedgerPath('TC', f.root, now)).trim().split('\n').map((v) => JSON.parse(v));
+
+test('persona opt-in shadows two independent next todos after an unchanged TC seat turn', async () => {
+  const f = fixture();
+  try {
+    const personaDir = join(f.root, 'personas');
+    mkdirSync(personaDir);
+    const profile = (id: string) => `personaId: ${id}\ndisplayName: ${id}\nsystemPrompt: You are ${id}.\n`;
+    writeFileSync(join(personaDir, 'alice.yaml'), profile('alice'));
+    writeFileSync(join(personaDir, 'bob.yaml'), profile('bob'));
+    writePersonaTodos(personaDir, 'alice', [
+      { id: 'done', title: 'Finished', status: 'done', createdAt: '2026-09-01T00:00:00Z' },
+      { id: 'later', title: 'Later', status: 'open', createdAt: '2026-10-02T00:00:00Z' },
+      { id: 'first', title: 'First', status: 'open', createdAt: '2026-10-01T00:00:00Z' },
+    ]);
+    writePersonaTodos(personaDir, 'bob', [
+      { id: 'bob-first', title: 'Bob first', status: 'open', createdAt: '2026-10-01T00:00:00Z' },
+    ]);
+    checklist(f, '0.2.9', [{ id: 'TC1', owner: 'TC', title: '자리 그대로', status: 'yellow' }]);
+    const calls: string[][] = [];
+    const configPath = join(f.root, 'config.json');
+    writeFileSync(configPath, JSON.stringify({ loops: { seat: { mode: 'shadow', seats: ['TC'] }, persona: { enabled: true } } }));
+    expect(buildUserConfig(configPath).loops?.persona).toEqual({ enabled: true });
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'shadow', seats: ['TC'] }, personaConfig: buildUserConfig(configPath).loops?.persona,
+      run: async (args) => { calls.push(args); throw Error('shadow may not run'); } };
+    const seat = await runSeatLoopTurn('TC', deps);
+    expect(seat).toMatchObject({ seat: 'TC', status: 'shadow', item: { id: 'TC1' }, action: 'harness' });
+    expect(entries(f)).toHaveLength(1);
+    expect(calls).toEqual([]);
+    for (const [id, todoId] of [['alice', 'first'], ['bob', 'bob-first']]) {
+      const rows = readFileSync(personaShadowLedgerPath(id!, f.root, now), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(rows).toEqual([{ personaId: id, ts: now.toISOString(), status: 'shadow', todo: expect.objectContaining({ id: todoId }) }]);
+    }
+    expect(readFileSync(join(f.root, 'personas', 'alice.todo.jsonl'), 'utf8')).toContain('"status":"open"');
+  } finally { f.close(); }
+});
+
+test('persona disabled by default or explicitly false writes zero lines and preserves the seat result', async () => {
+  const f = fixture();
+  try {
+    const registry = new PersonaRegistry();
+    const personaDir = join(f.root, 'personas');
+    mkdirSync(personaDir);
+    writeFileSync(join(personaDir, 'alice.yaml'), 'personaId: alice\ndisplayName: Alice\nsystemPrompt: Alice.\n');
+    await registry.loadDir(personaDir);
+    writePersonaTodos(personaDir, 'alice', [{ id: 'work', title: 'Work', status: 'open', createdAt: now.toISOString() }]);
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'off' }, personaRegistry: registry,
+      read: () => { throw Error('seat off read'); } };
+    expect(buildUserConfig(join(f.root, 'missing.json')).loops?.persona).toEqual({ enabled: false });
+    writeFileSync(join(f.root, 'config.json'), JSON.stringify({ loops: { persona: { enabled: false } } }));
+    expect(await runSeatLoopTurn('TC', { ...deps, personaConfig: buildUserConfig(join(f.root, 'config.json')).loops?.persona })).toEqual({ seat: 'TC', status: 'skipped-off' });
+    expect(existsSync(personaShadowLedgerPath('alice', f.root, now))).toBe(false);
+    expect(await runSeatLoopTurn('TC', { ...deps, personaConfig: buildUserConfig(join(f.root, 'missing.json')).loops?.persona })).toEqual({ seat: 'TC', status: 'skipped-off' });
+    expect(existsSync(personaShadowLedgerPath('alice', f.root, now))).toBe(false);
+  } finally { f.close(); }
+});
+
+test('persona shadow failure is observed without changing a completed seat turn', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const registry = new PersonaRegistry();
+    const dir = join(f.root, 'personas');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'alice.yaml'), 'personaId: alice\ndisplayName: Alice\nsystemPrompt: Alice.\n');
+    await registry.loadDir(dir);
+    const result = await runSeatLoopTurn('TC', { ...f.deps, config: { mode: 'shadow', seats: ['TC'] },
+      personaConfig: { enabled: true }, personaRegistry: registry, appendPersona: () => { throw Error('ledger unavailable'); } });
+    expect(result).toMatchObject({ seat: 'TC', status: 'skipped-empty' });
+    expect(entries(f)).toHaveLength(1);
+    expect(spy.mock.calls.some(([category, event, data]) => category === 'seat.loop' && event === 'persona-shadow-error'
+      && String((data as { error?: string }).error).includes('ledger unavailable'))).toBe(true);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('end of live seat turns sends one mailbox message per stall even after 30 seconds, including emoji IDs', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const old = new Date(now.getTime() - 45 * 60_000).toISOString();
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'R1🚦', title: 'blocked deployment', status: 'red', owner: 'TC', updatedAt: old, updatedBy: 'TC' }] };
+    let clock = now;
+    const deps: SeatDeps = { ...f.deps, now: () => clock, config: { mode: 'on', seats: ['TC'] },
+      versions: () => [], schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }], stallChecklist: () => snapshot };
+    await runSeatLoopOnce('TC', deps);
+    await runSeatLoopOnce('TC', deps); // Same-clock retry also covers the emoji ID's exact key.
+    clock = new Date(clock.getTime() + 30_000);
+    await runSeatLoopOnce('TC', deps);
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      const messages = store.listByRecipient('OP');
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ from: 'TC', to: 'OP', kind: 'stall-escalation' });
+      expect(messages[0]!.body).toContain('R1🚦');
+    } finally { store.close(); }
+    const events = spy.mock.calls.filter(([category, event]) => category === 'org.stall' && event === 'escalate');
+    expect(events).toHaveLength(1);
+    expect(events[0]?.[2]).toMatchObject({ item: 'R1🚦', from: 'TC', to: 'OP', stalledMin: 45 });
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('a stall crossing its age threshold during a turn escalates at the end of that turn', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'R-turn', title: 'threshold crossed during execution', status: 'red', owner: 'TC',
+        updatedAt: new Date(now.getTime() - 29 * 60_000).toISOString(), updatedBy: 'TC' }] };
+    checklist(f, '0.2.9', [snapshot.items[0]]);
+    let clock = now;
+    const result = await runSeatLoopOnce('TC', { ...f.deps, now: () => clock,
+      config: { mode: 'on', seats: ['TC'] },
+      schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }], stallChecklist: () => snapshot,
+      run: async () => { clock = new Date(clock.getTime() + 2 * 60_000); return '{"outcome":"wait-reset"}'; } });
+    expect(result.status).toBe('skipped-budget');
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.listByRecipient('OP')).toMatchObject([{ from: 'TC', to: 'OP', kind: 'stall-escalation' }]); }
+    finally { store.close(); }
+    expect(spy.mock.calls.find(([category, event]) => category === 'org.stall' && event === 'escalate')?.[2])
+      .toMatchObject({ item: 'R-turn', from: 'TC', to: 'OP', stalledMin: 31 });
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('default stall checklist reads the same ledger root as the schedules (deps.root)', async () => {
+  const f = fixture();
+  const roots: Array<string | undefined> = [];
+  const listSpy = spyOn(checklistModule, 'listChecklist').mockImplementation((version: string, root?: string) => {
+    roots.push(root);
+    return { version, released: '0.2.8', dev: version, history: [], items: [] };
+  });
+  try {
+    await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'shadow', seats: ['TC'] }, versions: () => [], schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }] });
+    expect(roots).toContain(f.root);
+  } finally { listSpy.mockRestore(); f.close(); }
+});
+
+test('shadow seat turn observes a stalled item without sending a mailbox message', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'R2', title: 'waiting', status: 'red', owner: 'TC',
+        updatedAt: new Date(now.getTime() - 35 * 60_000).toISOString(), updatedBy: 'TC' }] };
+    await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'shadow', seats: ['TC'] }, versions: () => [], schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }], stallChecklist: () => snapshot });
+    // The webhook card input (E1) may open the mailbox in any mode; what must not exist is a stall message.
+    const db = join(f.root, 'msg', 'messages.db');
+    if (existsSync(db)) {
+      const mailbox = openMsgStore(db);
+      try { expect(['OP', 'COO', 'TC', 'UX', 'MK'].flatMap((to) => mailbox.listByRecipient(to)).filter((m) => m.kind === 'stall-escalation')).toEqual([]); }
+      finally { mailbox.close(); }
+    }
+    expect(spy.mock.calls.find(([category, event]) => category === 'org.stall' && event === 'escalate')?.[2])
+      .toMatchObject({ item: 'R2', from: 'TC', to: 'OP', stalledMin: 35, mode: 'shadow' });
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('a blocked sub-seat cell uses configured parent and age limit after a budget-skipped turn', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    checklist(f, '0.2.9', [{ id: 'B1', owner: 'TC', title: 'implementation', status: 'yellow' }]);
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'B1', title: 'blocked by upstream', status: 'yellow', disposition: 'block', owner: 'TC/rel',
+        updatedAt: new Date(now.getTime() - 12 * 60_000).toISOString(), updatedBy: 'TC' }] };
+    const calls: string[][] = [];
+    const result = await runSeatLoopOnce('TC', { ...f.deps,
+      config: { mode: 'on', seats: ['TC'], stall: { parents: { TC: 'UX' }, blockedMinutes: 10 } },
+      schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }], stallChecklist: () => snapshot,
+      run: async (args) => { calls.push(args); return '{"outcome":"wait-reset"}'; } });
+    expect(result.status).toBe('skipped-budget');
+    expect(calls.map((args) => args[1])).toEqual(['budget']);
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.listByRecipient('UX')).toMatchObject([{ from: 'TC', to: 'UX', kind: 'stall-escalation' }]); }
+    finally { store.close(); }
+    expect(spy.mock.calls.find(([category, event]) => category === 'org.stall' && event === 'escalate')?.[2])
+      .toMatchObject({ item: 'B1', from: 'TC', to: 'UX', stalledMin: 12, reason: 'blocked' });
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('a failed checklist read does not block another release and the caller sees the unsent escalation', async () => {
+  const f = fixture();
+  try {
+    const snapshot: Checklist = { version: '0.2.10', released: '0.2.8', dev: '0.2.10', history: [],
+      items: [{ id: 'R-good', title: 'red', status: 'red', owner: 'TC',
+        updatedAt: new Date(now.getTime() - 45 * 60_000).toISOString(), updatedBy: 'TC' }] };
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, versions: () => [],
+      schedules: () => ['0.2.9', '0.2.10'].map((version) => ({ version, cutAt: '2099-01-01T00:00:00Z' })),
+      stallChecklist: (version) => { if (version === '0.2.9') throw Error('read failed'); return snapshot; } };
+    await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('stall checklist 0.2.9: Error: read failed');
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.listByRecipient('OP')).toMatchObject([{ from: 'TC', to: 'OP', body: expect.stringContaining('R-good') }]); }
+    finally { store.close(); }
+  } finally { f.close(); }
+});
+
+test('a failed mailbox save does not block another item or release and remains retryable', async () => {
+  const f = fixture();
+  try {
+    const old = new Date(now.getTime() - 45 * 60_000).toISOString();
+    const snapshot = (version: string, ids: string[]): Checklist => ({ version, released: '0.2.8', dev: version, history: [],
+      items: ids.map((id) => ({ id, title: id, status: 'red', owner: 'TC', updatedAt: old, updatedBy: 'TC' })) });
+    let fail = true;
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, versions: () => [],
+      schedules: () => ['0.2.9', '0.2.10'].map((version) => ({ version, cutAt: '2099-01-01T00:00:00Z' })),
+      stallChecklist: (version) => snapshot(version, version === '0.2.9' ? ['R-bad', 'R-sibling'] : ['R-next']),
+      stallDelivery: (message, key, root) => {
+        if (fail && message.body.includes('R-bad')) throw Error('save failed');
+        const store = openMsgStore(join(root, 'msg', 'messages.db'));
+        try {
+          store.db.exec('BEGIN IMMEDIATE');
+          store.db.exec('CREATE TABLE IF NOT EXISTS seat_stall_deliveries (key TEXT PRIMARY KEY)');
+          const inserted = store.db.query('INSERT OR IGNORE INTO seat_stall_deliveries (key) VALUES (?)').run(key);
+          if (inserted.changes) store.append(message);
+          store.db.exec('COMMIT');
+          return inserted.changes !== 0;
+        } finally { store.close(); }
+      } };
+    await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('stall escalation 0.2.9/R-bad: Error: save failed');
+    let store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.listByRecipient('OP').map((row) => row.body)).toEqual([
+      expect.stringContaining('R-sibling'), expect.stringContaining('R-next')]); }
+    finally { store.close(); }
+    fail = false;
+    await runSeatLoopOnce('TC', deps);
+    store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try {
+      const bodies = store.listByRecipient('OP').map((row) => row.body);
+      expect(bodies).toHaveLength(3);
+      expect(bodies.filter((body) => body.includes('R-bad'))).toHaveLength(1);
+    } finally { store.close(); }
+  } finally { f.close(); }
+});
+
+test('seat action failure and unsent escalation both reach the caller', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: 'implement', status: 'yellow' }]);
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'R-failed', title: 'red', status: 'red', owner: 'TC',
+        updatedAt: new Date(now.getTime() - 45 * 60_000).toISOString(), updatedBy: 'TC' }] };
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] },
+      schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }], stallChecklist: () => snapshot,
+      stallDelivery: () => { throw Error('mailbox unavailable'); },
+      run: async (args) => args[1] === 'budget' ? '{"outcome":"proceed"}' : Promise.reject(Error('harness unavailable')) };
+    try {
+      await runSeatLoopOnce('TC', deps);
+      throw Error('expected both failures');
+    } catch (error) {
+      expect(error).toBeInstanceOf(AggregateError);
+      expect((error as AggregateError).errors).toHaveLength(2);
+      expect(String((error as AggregateError).errors[0])).toContain('harness unavailable');
+      expect(String((error as AggregateError).errors[1])).toContain('stall escalation 0.2.9/R-failed');
+    }
+    expect(entries(f).map((entry) => entry.status)).toEqual(['attempting', 'outcome-unknown']);
+  } finally { f.close(); }
+});
+
+test('closed and shipped releases are not escalated', async () => {
+  const f = fixture();
+  try {
+    const snapshot: Checklist = { version: '0.2.9', released: '0.2.8', dev: '0.2.9', history: [],
+      items: [{ id: 'R1', title: 'old', status: 'red', owner: 'TC',
+        updatedAt: new Date(now.getTime() - 45 * 60_000).toISOString(), updatedBy: 'TC' }] };
+    checklist(f, '0.2.9', [snapshot.items[0]]);
+    checklist(f, '0.2.10', [snapshot.items[0]]);
+    writeFileSync(join(f.root, 'release', '0.2.9', 'release.json'), JSON.stringify({ version: '0.2.9', publishedAt: now.toISOString() }));
+    await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, versions: () => [],
+      schedules: () => [{ version: '0.2.9', cutAt: '2099-01-01T00:00:00Z' }, { version: '0.2.10', cutAt: '2026-10-02T00:00:00Z' }],
+      stallChecklist: () => snapshot });
+    // The webhook card input (E1) may open the mailbox in any mode; what must not exist is a stall message.
+    const db = join(f.root, 'msg', 'messages.db');
+    if (existsSync(db)) {
+      const mailbox = openMsgStore(db);
+      try { expect(['OP', 'COO', 'TC', 'UX', 'MK'].flatMap((to) => mailbox.listByRecipient(to)).filter((m) => m.kind === 'stall-escalation')).toEqual([]); }
+      finally { mailbox.close(); }
+    }
+  } finally { f.close(); }
+});
+
+test('OP shadow: release readiness, unassigned cell and pending delegation each write one judgment; no action even in on mode', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    checklist(f, '0.2.9', [
+      { id: 'R1', owner: 'TC', title: '막힌 칸', status: 'red' },
+      { id: 'Y1', owner: 'MK', title: '미결 처분', status: 'yellow' },
+      { id: 'U1', title: '담당 빈 칸', status: 'yellow' },
+    ]);
+    checklist(f, '0.2.10', [{ id: 'X1', title: '닫힌 판', status: 'red' }]);
+    mkdirSync(join(f.root, 'decisions'), { recursive: true });
+    const decision = (id: string, status: 'open' | 'decided', category: 'scope' | 'money', dueAt: string) =>
+      ({ type: 'raised', entry: { id, title: `${id} 결정`, category, dueAt, status, raisedAt: now.toISOString(), history: [] } });
+    writeFileSync(join(f.root, 'decisions', 'decisions.jsonl'), [
+      decision('D-later', 'open', 'money', '2026-10-05T00:00:00Z'),
+      decision('D-first', 'open', 'scope', '2026-10-04T00:00:00Z'),
+      decision('D-closed', 'decided', 'scope', '2026-10-03T00:00:00Z'),
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    let calls = 0;
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['OP'] },
+      schedules: () => [{ version: '0.2.9', cutAt: '2026-10-04T00:00:00Z', landBy: '2026-10-05T00:00:00Z' }, { version: '0.2.10', cutAt: '2026-10-02T00:00:00Z' }],
+      run: async () => { calls++; throw Error('OP executed'); } };
+    const result = await runSeatLoopOnce('OP', deps);
+    expect(result.status).toBe('shadow');
+    const path = seatLedgerPath('OP', f.root, now);
+    const rows = readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(3);
+    expect(rows.map((row) => row.candidate)).toEqual([
+      { kind: 'release-readiness', version: '0.2.9', verdict: 'not-ready', cutAt: '2026-10-04T00:00:00Z', landBy: '2026-10-05T00:00:00Z', red: ['R1'], undecided: ['U1', 'Y1'], blocked: [] },
+      { kind: 'unassigned-cell', version: '0.2.9', id: 'U1', title: '담당 빈 칸', status: 'yellow', verdict: 'assign' },
+      { kind: 'decision-delegation', id: 'D-first', title: 'D-first 결정', category: 'scope', dueAt: '2026-10-04T00:00:00Z', verdict: 'review-delegation' },
+    ]);
+    expect(rows.every((row) => row.status === 'shadow' && row.action === undefined)).toBe(true);
+    expect(spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'op-judgment-shadow')).toHaveLength(3);
+    await runSeatLoopOnce('OP', deps);
+    expect(readFileSync(path, 'utf8').trim().split('\n')).toHaveLength(3);
+    expect(calls).toBe(0);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('OP shadow: only open releases count, and an empty source is not mistaken for ready or delegated', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'OLD', title: 'old', status: 'red' }]);
+    let calls = 0;
+    const result = await runSeatLoopOnce('OP', { ...f.deps, config: { mode: 'shadow', seats: ['OP'] },
+      schedules: () => [{ version: '0.2.9', cutAt: '2026-10-02T00:00:00Z' }],
+      run: async () => { calls++; return ''; } });
+    expect(result.status).toBe('shadow');
+    const rows = readFileSync(seatLedgerPath('OP', f.root, now), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows.map((row) => row.candidate)).toEqual([
+      { kind: 'release-readiness', version: null, verdict: 'no-open-release', red: [], undecided: [], blocked: [] },
+      { kind: 'unassigned-cell', version: null, id: null, verdict: 'none' },
+      { kind: 'decision-delegation', id: null, verdict: 'none' },
+    ]);
+    expect(calls).toBe(0);
+  } finally { f.close(); }
+});
+
+test('OP shadow: an open release with an absent or empty checklist is not ready in ledger or log', async () => {
+  for (const collected of [false, true]) {
+    const f = fixture();
+    const spy = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      if (collected) checklist(f, '0.2.9', []);
+      let calls = 0;
+      await runSeatLoopOnce('OP', { ...f.deps, config: { mode: 'on', seats: ['OP'] },
+        schedules: () => [{ version: '0.2.9', cutAt: '2026-10-05T00:00:00Z' }],
+        pendingDecisions: () => [], run: async () => { calls++; throw Error('action'); } });
+      const rows = readFileSync(seatLedgerPath('OP', f.root, now), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(rows).toHaveLength(3);
+      expect(rows[0]).toMatchObject({ status: 'shadow', candidate: { kind: 'release-readiness', version: '0.2.9', verdict: 'not-ready', red: [], undecided: [], blocked: [] } });
+      const judgments = spy.mock.calls.filter(([category, event]) => category === 'seat.loop' && event === 'op-judgment-shadow');
+      expect(judgments).toHaveLength(3);
+      expect(judgments[0]?.[2]).toMatchObject({ candidate: { kind: 'release-readiness', verdict: 'not-ready' } });
+      expect(calls).toBe(0);
+    } finally { spy.mockRestore(); f.close(); }
+  }
+});
+
+test('OP shadow: an unknown checklist status cannot make an open release ready', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const items = [
+      { id: 'G1', title: 'green', status: 'green' },
+      { id: 'D1', title: 'done', status: 'done' },
+      { id: 'M1', title: 'moved', status: 'yellow', disposition: 'move' },
+      { id: 'U1', title: 'unrecognized', status: 'pending' },
+    ];
+    let calls = 0;
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['OP'] },
+      schedules: () => [{ version: '0.2.9', cutAt: '2026-10-05T00:00:00Z' }],
+      checklistItems: () => items, pendingDecisions: () => [],
+      run: async () => { calls++; throw Error('action'); } };
+    await runSeatLoopOnce('OP', deps);
+    const path = seatLedgerPath('OP', f.root, now);
+    let rows = readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(3);
+    expect(rows[0].candidate).toMatchObject({ kind: 'release-readiness', verdict: 'not-ready', red: [], undecided: [], blocked: [] });
+    expect(spy.mock.calls.find(([category, event, data]) => category === 'seat.loop' && event === 'op-judgment-shadow' && (data as { candidate?: { kind?: string } }).candidate?.kind === 'release-readiness')?.[2])
+      .toMatchObject({ candidate: { verdict: 'not-ready' } });
+    expect(calls).toBe(0);
+    items.pop();
+    await runSeatLoopOnce('OP', deps);
+    rows = readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(4);
+    expect(rows[3].candidate).toMatchObject({ kind: 'release-readiness', verdict: 'ready' });
+    expect(calls).toBe(0);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('OP shadow: green release is ready; deadlines take precedence over undated cards', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'G1', owner: 'TC', title: 'ready', status: 'green' }]);
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'shadow', seats: ['OP'] },
+      schedules: () => [{ version: '0.2.9', cutAt: '2026-10-05T00:00:00Z' }],
+      pendingDecisions: () => [
+        { id: 'D-undated', title: 'undated', category: 'other' },
+        { id: 'D-urgent', title: 'urgent', category: 'scope', dueAt: '2026-10-04T00:00:00Z' },
+      ] };
+    await runSeatLoopOnce('OP', deps);
+    const rows = readFileSync(seatLedgerPath('OP', f.root, now), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows[0].candidate).toMatchObject({ verdict: 'ready', red: [], undecided: [], blocked: [] });
+    expect(rows[2].candidate).toMatchObject({ id: 'D-urgent', dueAt: '2026-10-04T00:00:00Z' });
+  } finally { f.close(); }
+});
+
+test('OP shadow: shipped versions are excluded and changed judgments append only the affected line', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'OLD', title: 'published', status: 'red' }]);
+    writeFileSync(join(f.root, 'release', '0.2.9', 'release.json'), JSON.stringify({ version: '0.2.9', publishedAt: '2026-10-02T00:00:00Z' }));
+    checklist(f, '0.2.10', [{ id: 'NEW', title: 'unassigned', status: 'yellow' }]);
+    const state: { status: string; owner?: string } = { status: 'yellow' };
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'shadow', seats: ['OP'] },
+      schedules: () => [{ version: '0.2.9', cutAt: '2026-10-05T00:00:00Z' }, { version: '0.2.10', cutAt: '2026-10-06T00:00:00Z' }],
+      checklistItems: (version) => version === '0.2.9' ? [{ id: 'OLD', title: 'published', status: 'red' }] : [{ id: 'NEW', title: 'unassigned', ...state }] };
+    await runSeatLoopOnce('OP', deps);
+    const path = seatLedgerPath('OP', f.root, now);
+    let rows = readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows[0].candidate).toMatchObject({ version: '0.2.10', red: [], undecided: ['NEW'] });
+    expect(rows[1].candidate).toMatchObject({ version: '0.2.10', id: 'NEW' });
+    state.owner = 'TC';
+    await runSeatLoopOnce('OP', deps);
+    rows = readFileSync(path, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    expect(rows).toHaveLength(4);
+    expect(rows[3].candidate).toEqual({ kind: 'unassigned-cell', version: null, id: null, verdict: 'none' });
+  } finally { f.close(); }
+});
+
+test('OP shadow: unreadable schedules do not produce invented judgments or call actions', async () => {
+  const f = fixture();
+  try {
+    let calls = 0;
+    await expect(runSeatLoopOnce('OP', { ...f.deps, config: { mode: 'on', seats: ['OP'] },
+      schedules: () => { throw Error('unreadable schedules'); },
+      run: async () => { calls++; return ''; } })).rejects.toThrow('unreadable schedules');
+    expect(existsSync(seatLedgerPath('OP', f.root, now))).toBe(false);
+    expect(calls).toBe(0);
+  } finally { f.close(); }
+});
+
+test('OP off reads no release or decision source and writes no judgment', async () => {
+  const f = fixture();
+  try {
+    const result = await runSeatLoopOnce('OP', { ...f.deps, config: { mode: 'off', seats: ['OP'] },
+      schedules: () => { throw Error('read schedules'); }, pendingDecisions: () => { throw Error('read decisions'); },
+      run: async () => { throw Error('action'); } });
+    expect(result).toEqual({ seat: 'OP', status: 'skipped-off' });
+    expect(existsSync(seatLedgerPath('OP', f.root, now))).toBe(false);
+  } finally { f.close(); }
+});
 
 test('shadow: TC 칸 둘, 이른 판 먼저 · 실행 0 · 날짜 원장 한 줄', async () => {
   const f = fixture();
@@ -43,6 +509,140 @@ test('shadow: TC 칸 둘, 이른 판 먼저 · 실행 0 · 날짜 원장 한 줄
     expect(calls).toBe(0);
     expect(seatLedgerPath('TC', f.root, now)).toContain('2026-10-03.jsonl');
   } finally { f.close(); }
+});
+
+test('shipped 0.2.5 cells are skipped; current 0.2.11 precedes 0.2.12', async () => {
+  const f = fixture();
+  const skipped: unknown[] = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'seat.loop' && event === 'skip-shipped-version') skipped.push(data);
+  });
+  try {
+    checklist(f, '0.2.5', [
+      { id: 'K9', owner: 'TC', title: 'shipped TC', status: 'yellow' },
+      { id: 'M1', owner: 'MK', title: 'shipped MK', status: 'red' },
+      { id: 'K8', owner: 'TC', title: 'done', status: 'done' },
+    ]);
+    writeFileSync(join(f.root, 'release', '0.2.5', 'release.json'), JSON.stringify({ version: '0.2.5', publishedAt: '2026-09-30T00:00:00Z' }));
+    checklist(f, '0.2.11', [{ id: 'K11', owner: 'TC', title: 'current', status: 'red' }]);
+    checklist(f, '0.2.12', [{ id: 'K12', owner: 'TC', title: 'next', status: 'yellow' }]);
+    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.12', '0.2.5', '0.2.11'], config: { mode: 'shadow', seats: ['TC'] } };
+    const inputs = await gatherSeatInputs('TC', deps);
+    expect(inputs.checklist.map((item) => [item.version, item.id])).toEqual([['0.2.11', 'K11'], ['0.2.12', 'K12']]);
+    expect(inputs.checklist.filter((item) => item.version === '0.2.5')).toHaveLength(0);
+    expect(pickNext(inputs, [])).toMatchObject({ id: 'K11', version: '0.2.11' });
+    expect(pickNext(inputs, [{ seat: 'TC', at: now.toISOString(), status: 'launched', item: inputs.checklist[0] }])).toMatchObject({ id: 'K12', version: '0.2.12' });
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('shadow');
+    expect(entries(f)[0].item).toMatchObject({ id: 'K11', version: '0.2.11' });
+    expect(skipped).toContainEqual({ version: '0.2.5', cells: 1 });
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('a shadowed K9 moved from 0.2.11 to 0.2.12 is skipped unless its evidence or title changes', async () => {
+  const f = fixture();
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const old = { id: 'K9', owner: 'TC', title: 'carry K9', status: 'yellow', evidence: 'same evidence' };
+    checklist(f, '0.2.11', [old]);
+    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.11', '0.2.12'], config: { mode: 'shadow', seats: ['TC'] } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('shadow');
+    checklist(f, '0.2.11', []);
+    checklist(f, '0.2.12', [old, { id: 'Z10', owner: 'TC', title: 'next', status: 'yellow' }]);
+    const inputs = await gatherSeatInputs('TC', deps);
+    const ledger = entries(f);
+    expect(alreadyHandled(inputs.checklist[0]!, ledger)).toBe(true);
+    expect(pickNext(inputs, ledger, { shadow: true })?.id).toBe('Z10');
+    expect(spy.mock.calls).toContainEqual(['seat.loop', 'skip-handled', { id: 'K9' }]);
+    expect((await runSeatLoopOnce('TC', deps) as { item?: { id: string } }).item?.id).toBe('Z10');
+    checklist(f, '0.2.12', [{ ...old, evidence: 'changed evidence' }]);
+    const changed = await gatherSeatInputs('TC', deps);
+    expect(alreadyHandled(changed.checklist[0]!, entries(f))).toBe(false);
+    expect(pickNext(changed, entries(f), { shadow: true })?.id).toBe('K9');
+    expect((await runSeatLoopOnce('TC', deps) as { item?: { id: string } }).item?.id).toBe('K9');
+    checklist(f, '0.2.12', [{ ...old, title: 'retitled K9' }]);
+    const retitled = await gatherSeatInputs('TC', deps);
+    expect(alreadyHandled(retitled.checklist[0]!, entries(f))).toBe(false);
+    expect(pickNext(retitled, entries(f), { shadow: true })?.id).toBe('K9');
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('alreadyHandled only matches the same seat, recent shadow or launch, id, title and evidence hash', () => {
+  const item = { source: 'checklist' as const, id: 'K9', version: '0.2.12', title: 'carry', text: 'carry',
+    seat: 'TC', evidenceHash: 'hash', asOf: now.toISOString() };
+  const row = { seat: 'TC', at: now.toISOString(), status: 'launched' as const, item: { ...item, version: '0.2.11' } };
+  expect(alreadyHandled(item, [row])).toBe(true);
+  expect(alreadyHandled(item, [{ ...row, status: 'shadow' }])).toBe(true);
+  expect(alreadyHandled(item, [{ ...row, seat: 'MK' }])).toBe(false);
+  expect(alreadyHandled(item, [{ ...row, item: { ...row.item, id: 'other' } }])).toBe(false);
+  expect(alreadyHandled(item, [{ ...row, status: 'skipped-budget' }])).toBe(false);
+  expect(alreadyHandled(item, [{ ...row, at: new Date(now.getTime() - 7 * 86400_000).toISOString() }])).toBe(true);
+  expect(alreadyHandled(item, [{ ...row, at: new Date(now.getTime() - 8 * 86400_000).toISOString() }])).toBe(false);
+  expect(alreadyHandled(item, [{ ...row, item: { ...row.item, evidenceHash: 'other' } }])).toBe(false);
+  expect(alreadyHandled(item, [{ ...row, item: { ...row.item, title: 'other' } }])).toBe(false);
+  expect(alreadyHandled(item, [{ ...row, item: { ...row.item, evidenceHash: undefined } }])).toBe(false);
+  expect(alreadyHandled({ ...item, evidenceHash: undefined }, [{ ...row, item: { ...row.item, evidenceHash: undefined } }])).toBe(false);
+});
+
+test('later shipped versions exclude every older version and count only eligible seat cells', async () => {
+  const f = fixture();
+  const skipped: unknown[] = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'seat.loop' && event === 'skip-shipped-version') skipped.push(data);
+  });
+  try {
+    checklist(f, '0.2.5', [{ id: 'K9', owner: 'TC', title: 'old', status: 'yellow' }]);
+    checklist(f, '0.2.11', [{ id: 'K11', owner: 'TC', title: 'released', status: 'red' }]);
+    checklist(f, '0.2.12', [{ id: 'K12', owner: 'TC', title: 'unreleased', status: 'yellow' }]);
+    writeFileSync(join(f.root, 'release', '0.2.11', 'release.json'), JSON.stringify({ version: '0.2.11', publishedAt: '2026-10-03T00:00:00Z' }));
+    expect((await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.12', '0.2.11', '0.2.5'] })).checklist.map((item) => item.id)).toEqual(['K12']);
+    expect(skipped).toEqual([{ version: '0.2.5', cells: 1 }, { version: '0.2.11', cells: 1 }]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('unreadable published-version ledger keeps the former version order and warns once', async () => {
+  const f = fixture();
+  const warnings: string[] = [];
+  const spy = spyOn(console, 'warn').mockImplementation((message) => { warnings.push(String(message)); });
+  try {
+    writeFileSync(join(f.root, 'release'), 'not a directory');
+    const deps: SeatDeps = { ...f.deps, versions: () => ['0.2.12', '0.2.5', '0.2.11'], checklistItems: (version) => [
+      { id: `K${version}`, owner: 'TC', title: version, status: 'yellow' },
+    ] };
+    const inputs = await gatherSeatInputs('TC', deps);
+    expect(inputs.checklist.map((item) => item.version)).toEqual(['0.2.5', '0.2.11', '0.2.12']);
+    expect(pickNext(inputs, [])?.version).toBe('0.2.5');
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('seat loop: cannot read published versions; retaining previous order');
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('only versions whose cut is still ahead are open — a cut version is skipped', async () => {
+  const f = fixture();
+  const skipped: unknown[] = [];
+  const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+    if (category === 'seat.loop' && event === 'skip-closed-version') skipped.push(data);
+  });
+  try {
+    checklist(f, '0.2.10', [{ id: 'K10', owner: 'TC', title: 'cut already', status: 'yellow' }]);
+    checklist(f, '0.2.11', [{ id: 'K11', owner: 'TC', title: 'cut tomorrow', status: 'red' }]);
+    const schedules = () => [{ version: '0.2.10', cutAt: '2026-10-02T22:00:00Z' }, { version: '0.2.11', cutAt: '2026-10-03T23:00:00Z' }];
+    const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.10', '0.2.11', '0.2.12'], schedules });
+    expect(inputs.checklist.map((item) => item.id)).toEqual(['K11']);
+    expect(skipped).toEqual([{ seat: 'TC', version: '0.2.10' }, { seat: 'TC', version: '0.2.12' }]);
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('unreadable schedules pick no checklist cell (fail closed) and warn once', async () => {
+  const f = fixture();
+  const warnings: string[] = [];
+  const spy = spyOn(console, 'warn').mockImplementation((message) => { warnings.push(String(message)); });
+  try {
+    checklist(f, '0.2.11', [{ id: 'K11', owner: 'TC', title: 'current', status: 'red' }]);
+    const inputs = await gatherSeatInputs('TC', { ...f.deps, versions: () => ['0.2.11'], schedules: () => { throw new Error('ledger locked'); } });
+    expect(inputs.checklist).toEqual([]);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('cannot read release schedules');
+  } finally { spy.mockRestore(); f.close(); }
 });
 
 test('role excerpt is at most 4,000 characters', async () => {
@@ -99,6 +699,156 @@ test('forbidden 게시 문면은 decision, on 에서 하니스 0 · 재상정 0'
   } finally { f.close(); }
 });
 
+test('plan table separates publication, preparation and physical measurement across item text and evidence', () => {
+  const spy = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    const cases = [
+      { title: '마켓에 게시', kind: 'decision', reason: '게시' },
+      { title: '레지스트리에 등록', kind: 'decision', reason: '레지스트리에 등록' },
+      { title: '사이트 운영 반영', kind: 'decision', reason: '사이트 운영 반영' },
+      { title: 'SNS에 업로드', kind: 'decision', reason: 'SNS에 업로드' },
+      { title: '공개 발행', kind: 'decision', reason: '공개 발행' },
+      { title: '마켓 게시 준비', kind: 'harness', reason: '마켓 게시 준비' },
+      { title: '레지스트리 등록용 코드', kind: 'harness', reason: '레지스트리 등록용 코드' },
+      { title: 'SNS 게시 초안', kind: 'harness', reason: 'SNS 게시 초안' },
+      { title: '사람 기기 실측 대기', kind: 'wait', reason: '사람 기기 실측' },
+      { title: '실물 측정', kind: 'wait', reason: '실물 측정' },
+      { title: '\u{1F451} 확인 대기 후 공개 발행', kind: 'wait', reason: '\u{1F451} 확인 대기' },
+    ] as const;
+    for (const { title, kind, reason } of cases) {
+      const planned = planAction({ source: 'checklist', id: 'K', title, text: title }, 'MK');
+      expect(planned.kind).toBe(kind);
+      expect(planned.reason).toBe(reason);
+      expect(spy.mock.calls.at(-1)).toEqual(['seat.loop', 'plan', { kind, reason }]);
+    }
+    expect(planAction({ source: 'request', id: 'r', title: '작업', text: '게시 준비' }, 'MK').kind).toBe('harness');
+    expect(planAction({ source: 'checklist', id: 'K', title: '점검', text: '점검', evidence: '\u{1F451} 확인 대기' }, 'MK'))
+      .toMatchObject({ kind: 'wait', reason: '\u{1F451} 확인 대기' });
+    expect(planAction({ source: 'checklist', id: 'K', title: '실물 측정 대기', text: '실물 측정 대기', evidence: '실측 완료' }, 'MK').kind)
+      .toBe('harness');
+    expect(planAction({ source: 'request', id: 'r', title: '작업', text: '배포' }, 'MK'))
+      .toMatchObject({ kind: 'decision', reason: '배포' });
+    expect(planAction({ source: 'request', id: 'r', title: '작업', text: '구현' }, 'MK'))
+      .toMatchObject({ kind: 'harness', text: '[MK 자리 · 자리 요청 r · 역할 docs/roles/MK.md] 작업' });
+    expect(planAction({ source: 'request', id: 'r', title: '삭제', text: '삭제' }, 'MK'))
+      .toMatchObject({ kind: 'decision', reason: '삭제' });
+    expect(planAction({ source: 'request', id: 'r', title: '구현', text: '구현', evidence: '기존 배포 기록' }, 'MK'))
+      .toMatchObject({ kind: 'harness', text: '[MK 자리 · 자리 요청 r · 역할 docs/roles/MK.md] 구현' });
+    expect(planAction({ source: 'request', id: 'r', title: '검토', text: '검토', evidence: 'SNS에 게시' }, 'MK'))
+      .toMatchObject({ kind: 'decision', reason: 'SNS에 게시' });
+    expect(planAction({ source: 'request', id: 'r', title: '마켓에 게시', text: '마켓에 게시', evidence: '마켓 게시 준비 완료' }, 'MK').kind)
+      .toBe('decision');
+    for (const text of ['마켓 게시 준비 후 마켓에 게시', '삭제 후 게시 준비', '마켓 게시 준비 후 배포', '마켓 게시 준비 후 SNS에 업로드']) {
+      expect(planAction({ source: 'request', id: 'r', title: text, text }, 'MK').kind).toBe('decision');
+    }
+    expect(planAction({ source: 'request', id: 'r', title: '마켓 게시 준비', text: '마켓 게시 준비' }, 'MK').kind).toBe('harness');
+  } finally { spy.mockRestore(); }
+});
+
+test('preparation with destination particles stays harness, but a separate publishing instruction is a decision', () => {
+  for (const title of ['마켓에 게시 준비', 'SNS에 게시 초안', '마켓에 게시 준비 조사', 'SNS에 게시 초안 조사']) {
+    expect(planAction({ source: 'checklist', id: 'K', title, text: title }).kind).toBe('harness');
+  }
+  for (const title of ['마켓에 게시 준비 후 마켓에 게시', 'SNS에 게시 초안 작성 후 SNS에 게시']) {
+    expect(planAction({ source: 'request', id: 'r', title, text: title }).kind).toBe('decision');
+  }
+});
+
+test('measurement completion cannot resolve a separate royal confirmation wait', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: `실물 측정 대기 및 ${CEO} 확인 대기`, status: 'yellow', evidence: `실측 완료 · ${CEO} 확인 대기` }]);
+    const calls: string[][] = [];
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => { calls.push(args); throw Error('pending confirmation must not execute'); } });
+    expect(result).toMatchObject({ status: 'wait', action: 'wait', reason: `${CEO} 확인 대기` });
+    expect(calls).toEqual([]);
+    expect(planAction({ source: 'request', id: 'r', title: `${CEO} 확인 대기`, text: `${CEO} 확인 대기`, evidence: '실측 완료' }).kind).toBe('wait');
+    expect(planAction({ source: 'request', id: 'r', title: '실측 대기', text: '실측 대기', evidence: `${CEO} 확인 완료` }).kind).toBe('wait');
+    expect(planAction({ source: 'request', id: 'r', title: `실측 대기 · ${CEO} 확인 대기`, text: `실측 대기 · ${CEO} 확인 대기`, evidence: `실측 완료 · ${CEO} 확인 완료` }).kind).toBe('harness');
+  } finally { f.close(); }
+});
+
+test('on: mixed preparation and publication raises a decision without launching harness work', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '마켓 게시 준비 후 마켓에 게시', status: 'yellow' }]);
+    const calls: string[][] = [];
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => {
+      calls.push(args);
+      return args[1] === 'budget' ? '{"outcome":"proceed"}' : '{"id":"dec-mixed"}';
+    } });
+    expect(result).toMatchObject({ status: 'hitl', action: 'decision' });
+    expect(calls.map((args) => args.slice(0, 2))).toEqual([['harness', 'budget'], ['decisions', 'raise']]);
+    expect(entries(f).at(-1)).toMatchObject({ status: 'hitl', action: 'decision' });
+  } finally { f.close(); }
+});
+
+test('request evidence reaches the plan without changing ordinary request fields', async () => {
+  const f = fixture();
+  try {
+    writeFileSync(join(f.root, 'seat-requests', 'requests.jsonl'),
+      JSON.stringify({ key: 'req-1', seat: 'MK', text: '확인', evidence: '\u{1F451} 확인 대기', status: 'pending', queuedAt: '2026-10-02T09:00:00.000Z' }) + '\n');
+    const inputs = await gatherSeatInputs('MK', f.deps);
+    expect(inputs.requests[0]).toMatchObject({ id: 'req-1', title: '확인', text: '확인', evidence: '\u{1F451} 확인 대기', createdAt: '2026-10-02T09:00:00.000Z' });
+    expect(planAction(inputs.requests[0]!, 'MK')).toMatchObject({ kind: 'wait', reason: '\u{1F451} 확인 대기' });
+  } finally { f.close(); }
+});
+
+test('on: measurement evidence waits with a reason and makes no budget, decision or harness call', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '기기 검증', status: 'yellow', evidence: '실물 측정 대기 · 사람 기기' }]);
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => { calls.push(args); throw Error('wait must not execute'); } };
+    const inputs = await gatherSeatInputs('TC', deps);
+    expect(inputs.checklist[0]?.evidence).toBe('실물 측정 대기 · 사람 기기');
+    const result = await runSeatLoopOnce('TC', deps);
+    expect(result).toMatchObject({ status: 'wait', action: 'wait', reason: '실물 측정', item: { evidence: '실물 측정 대기 · 사람 기기' } });
+    expect(entries(f)).toHaveLength(1);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    expect(calls).toEqual([]);
+  } finally { f.close(); }
+});
+
+test('on: wait rechecks changed measurement evidence and then launches only once', async () => {
+  const f = fixture();
+  try {
+    let evidence = '실물 측정 대기';
+    let status = 'yellow';
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] },
+      checklistItems: () => [{ id: 'K2', owner: 'TC', title: '기기 검증', status, evidence }],
+      versions: () => ['0.2.9'],
+      run: async (args) => { calls.push(args); return args[1] === 'budget' ? '{"outcome":"proceed"}' : '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]'; } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('wait');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    expect(calls).toEqual([]);
+    status = 'red';
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('wait');
+    expect(calls).toEqual([]);
+    evidence = '실물 측정 완료';
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    expect(calls.map((args) => args[1])).toEqual(['budget', 'say']);
+    expect(entries(f).map((entry) => entry.status)).toEqual(['wait', 'skipped-empty', 'wait', 'attempting', 'launched', 'skipped-empty']);
+  } finally { f.close(); }
+});
+
+test('on: publication preparation uses harness even when it names a prohibited publishing verb', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '마켓 게시 준비', status: 'yellow' }]);
+    const calls: string[][] = [];
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => {
+      calls.push(args);
+      return args[1] === 'budget' ? '{"outcome":"proceed"}' : '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]';
+    } });
+    expect(result.status).toBe('launched');
+    expect(calls.map((args) => args[1])).toEqual(['budget', 'say']);
+    expect(entries(f).at(-1)).toMatchObject({ status: 'launched', action: 'harness', reason: '마켓 게시 준비' });
+  } finally { f.close(); }
+});
+
 test('decision raise without a receipt is not recorded as hitl', async () => {
   const f = fixture();
   try {
@@ -108,6 +858,160 @@ test('decision raise without a receipt is not recorded as hitl', async () => {
     await expect(runSeatLoopOnce('TC', deps)).rejects.toThrow('no decision id');
     expect(entries(f).map((entry) => entry.status)).toEqual(['attempting', 'outcome-unknown']);
     expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+  } finally { f.close(); }
+});
+
+test('seat quota denies a launch, records skipped-budget, and escalates exactly one line to its parent', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
+    const calls: string[][] = [];
+    const raised: Array<{ parent: string; line: string }> = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] },
+      budgetConfig: { org: { budget: { TC: { dailyGoals: 0 } } } }, running: () => [],
+      escalate: async (parent, line) => { raised.push({ parent, line }); },
+      run: async (args) => { calls.push(args); return '{"outcome":"proceed"}'; } };
+    const result = await runSeatLoopOnce('TC', deps);
+    expect(result).toMatchObject({ status: 'skipped-budget', reason: 'TC daily goals budget reached (0/0)' });
+    expect(entries(f)).toHaveLength(1);
+    expect(entries(f)[0]).toMatchObject({ status: 'skipped-budget', action: 'skipped-budget', reason: 'TC daily goals budget reached (0/0)' });
+    expect(calls).toEqual([['harness', 'budget', '--json']]);
+    expect(raised).toEqual([{ parent: 'OP', line: '[TC → OP] K2: TC daily goals budget reached (0/0)' }]);
+    await runSeatLoopOnce('TC', deps);
+    expect(raised).toHaveLength(1);
+    expect(calls.filter((args) => args[1] === 'say')).toHaveLength(0);
+  } finally { f.close(); }
+});
+
+test('default denial reaches the parent seat inbox through the message store', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
+    const calls: string[][] = [];
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] },
+      budgetConfig: { org: { budget: { TC: { dailyGoals: 0 } } } }, running: () => [],
+      run: async (args) => { calls.push(args); return '{"outcome":"proceed"}'; } });
+    expect(result.status).toBe('skipped-budget');
+    expect(calls).toEqual([['harness', 'budget', '--json']]);
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.listByRecipient('OP')).toMatchObject([{ from: 'TC', to: 'OP', kind: 'seat-budget-escalation', body: '[TC → OP] K2: TC daily goals budget reached (0/0)' }]); }
+    finally { store.close(); }
+  } finally { f.close(); }
+});
+
+test('running Pod quota denies launch without mislabelling an unknown substrate', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
+    const calls: string[][] = [];
+    const raised: string[] = [];
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] },
+      running: () => [{ seat: 'TC', substrate: 'pod' }, { seat: 'TC' }],
+      escalate: async (_parent, line) => { raised.push(line); },
+      run: async (args) => { calls.push(args); return '{"outcome":"proceed"}'; } });
+    expect(result).toMatchObject({ status: 'skipped-budget', reason: 'TC concurrent Pods budget cannot be verified (1 confirmed, 1 unknown; limit 2)' });
+    expect(calls).toHaveLength(1);
+    expect(raised).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+// TC harvest #23272 — through the DEFAULT observation path (no deps.running): a Pod launched yesterday and still
+// running counts against today's concurrent budget; uncertain liveness is «cannot verify», never a confirmed Pod.
+const queried = (statusById: Record<string, string>) => spyOn(runningRunsModule, 'queryRunningRuns').mockImplementation(((options: { runIds?: readonly string[] }) => ({
+  completeness: 'complete', pty: { unreadable: [] },
+  entries: (options.runIds ?? []).filter((id) => statusById[id]).map((runId) => ({ runId, status: statusById[runId] })),
+})) as never);
+const launchedYesterday = (f: ReturnType<typeof fixture>, runIds: string[]) => {
+  const yesterday = new Date(now.getTime() - 24 * 3600_000);
+  const path = seatLedgerPath('TC', f.root, yesterday);
+  mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+  writeFileSync(path, runIds.map((runId, i) => JSON.stringify({ seat: 'TC', at: yesterday.toISOString(), status: 'launched', runId,
+    item: { source: 'request', id: `y-${i}`, title: 'yesterday', text: 'yesterday' } })).join('\n') + '\n');
+};
+
+test('default observation counts Pods launched yesterday that are still running', async () => {
+  const f = fixture();
+  const spy = queried({ 'run-y1': 'running', 'run-y2': 'running' });
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
+    launchedYesterday(f, ['run-y1', 'run-y2']);
+    const calls: string[][] = [];
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, escalate: async () => {},
+      run: async (args) => { calls.push(args); return '{"outcome":"proceed"}'; } });
+    expect(result).toMatchObject({ status: 'skipped-budget', reason: 'TC concurrent Pods budget reached (2/2)' });
+    expect(calls.some((args) => args[0] === 'harness' && args[1] === 'say')).toBe(false);
+    expect(spy.mock.calls[0]?.[0]).toMatchObject({ runIds: ['run-y1', 'run-y2'] });
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('default observation keeps uncertain liveness unknown instead of a confirmed Pod', async () => {
+  const f = fixture();
+  const spy = queried({ 'run-y1': 'running', 'run-y2': 'probable-running' });
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
+    launchedYesterday(f, ['run-y1', 'run-y2']);
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, escalate: async () => {},
+      run: async () => '{"outcome":"proceed"}' });
+    expect(result).toMatchObject({ status: 'skipped-budget', reason: 'TC concurrent Pods budget cannot be verified (1 confirmed, 1 unknown; limit 2)' });
+  } finally { spy.mockRestore(); f.close(); }
+});
+
+test('a failed budget escalation is retried on the next turn; a delivered one is not repeated', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
+    let attempts = 0;
+    const delivered: string[] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, budgetConfig: { org: { budget: { TC: { dailyGoals: 0 } } } }, running: () => [],
+      escalate: async (_parent, line) => { attempts += 1; if (attempts === 1) throw new Error('inbox down'); delivered.push(line); },
+      run: async () => '{"outcome":"proceed"}' };
+    expect(await runSeatLoopOnce('TC', deps)).toMatchObject({ status: 'skipped-budget', escalated: false });
+    expect(await runSeatLoopOnce('TC', deps)).toMatchObject({ status: 'skipped-budget', escalated: true });
+    await runSeatLoopOnce('TC', deps);
+    expect(attempts).toBe(2);
+    expect(delivered).toHaveLength(1);
+  } finally { f.close(); }
+});
+
+test('quota counts only successful launches today, and refuses the seventh before harness say', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
+    const path = seatLedgerPath('TC', f.root, now);
+    mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(path, Array.from({ length: 6 }, (_, i) => JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'launched', item: { source: 'request', id: `prior-${i}`, title: 'earlier', text: 'earlier' } })).join('\n') + '\n');
+    const calls: string[][] = [];
+    const denied = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, running: () => [],
+      escalate: async () => {}, run: async (args) => { calls.push(args); return '{"outcome":"proceed"}'; } });
+    expect(denied).toMatchObject({ status: 'skipped-budget', reason: 'TC daily goals budget reached (6/6)' });
+    expect(calls).toEqual([['harness', 'budget', '--json']]);
+    expect(entries(f).at(-1)).toMatchObject({ status: 'skipped-budget', action: 'skipped-budget' });
+  } finally { f.close(); }
+});
+
+test('consumed hook work card does not enter the next seat input, even after another event arrives', async () => {
+  const f = fixture();
+  try {
+    const config = parseEventsConfig({ mode: 'on', routes: [{ source: 'linear', kind: 'Issue:create', seat: 'TC', loop: 'seat' }] });
+    const event = (id: string) => ({ provider: 'linear' as const, eventId: id, kind: 'Issue:create',
+      task: { eventId: id, title: `Implement ${id}`, external: { provider: 'linear' as const, ref: id } } });
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) =>
+      args[1] === 'budget' ? '{"outcome":"proceed"}' : '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]' };
+    await dispatchHook(event('first'), f.root, config, async () => {});
+    const firstInput = await gatherSeatInputs('TC', deps);
+    expect(firstInput.requests.map(item => item.title)).toEqual([expect.stringContaining('Implement first')]);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
+    const store = openMsgStore(join(f.root, 'msg', 'messages.db'));
+    try { expect(store.db.query('SELECT woken FROM hook_work_cards').all()).toEqual([{ woken: 1 }]); }
+    finally { store.close(); }
+    expect((await gatherSeatInputs('TC', deps)).requests).toEqual([]);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    await dispatchHook(event('second'), f.root, config, async () => {});
+    const nextInput = await gatherSeatInputs('TC', deps);
+    expect(nextInput.requests.map(item => item.title)).toEqual([expect.stringContaining('Implement second')]);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
+    expect(entries(f).filter(entry => entry.status === 'launched').map(entry => entry.item.title))
+      .toEqual([expect.stringContaining('Implement first'), expect.stringContaining('Implement second')]);
   } finally { f.close(); }
 });
 
@@ -283,10 +1187,89 @@ test('a launch on a previous KST date remains handled on the next day', async ()
     checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
     const yesterday = new Date('2026-10-02T10:00:00Z');
     const path = seatLedgerPath('TC', f.root, yesterday);
+    const original = (await gatherSeatInputs('TC', f.deps)).checklist[0]!;
     mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
-    writeFileSync(path, JSON.stringify({ seat: 'TC', at: yesterday.toISOString(), status: 'launched', item: { source: 'checklist', version: '0.2.9', id: 'K2', title: '구현', text: '구현' }, runId: 'run-12345678-1234-1234-1234-123456789abc' }) + '\n');
-    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async () => { throw Error('launched again'); } });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: yesterday.toISOString(), status: 'launched', item: original, runId: 'run-12345678-1234-1234-1234-123456789abc' }) + '\n');
+    let calls = 0;
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async () => { calls++; throw Error('launched again'); } });
     expect(result.status).toBe('skipped-empty');
+    expect(calls).toBe(0);
+    const moved = (await gatherSeatInputs('TC', f.deps)).checklist[0]!;
+    const legacy = { seat: 'TC', at: yesterday.toISOString(), status: 'launched' as const,
+      item: { source: 'checklist' as const, version: '0.2.9', id: 'K2', title: '구현', text: '구현' } };
+    expect(alreadyHandled({ ...moved, version: '0.2.12' }, [legacy])).toBe(false);
+    expect(pickNext({ requests: [], checklist: [{ ...moved, version: '0.2.12' }], role: '' }, [legacy])?.id).toBe('K2');
+  } finally { f.close(); }
+});
+
+test('a launched cell is skipped until its evidence or title changes in the same version', async () => {
+  const f = fixture();
+  try {
+    const cell = { id: 'K2', owner: 'TC', title: '구현', evidence: 'initial', status: 'yellow' };
+    checklist(f, '0.2.9', [cell]);
+    const calls: string[][] = [];
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) => {
+      calls.push(args);
+      return args[1] === 'budget' ? '{"outcome":"proceed"}' : '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]';
+    } };
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('skipped-empty');
+    checklist(f, '0.2.9', [{ ...cell, evidence: 'revised' }]);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
+    checklist(f, '0.2.9', [{ ...cell, title: '새 구현', evidence: 'revised' }]);
+    expect((await runSeatLoopOnce('TC', deps)).status).toBe('launched');
+    expect(calls.filter((args) => args[1] === 'say')).toHaveLength(3);
+  } finally { f.close(); }
+});
+
+test('an attempt without a launched receipt still prevents a changed cell from retrying', async () => {
+  const f = fixture();
+  try {
+    const old = { id: 'K2', owner: 'TC', title: '구현', evidence: 'initial', status: 'yellow' };
+    checklist(f, '0.2.9', [old]);
+    const original = (await gatherSeatInputs('TC', f.deps)).checklist[0]!;
+    const path = seatLedgerPath('TC', f.root, now);
+    mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: now.toISOString(), status: 'attempting', item: original }) + '\n');
+    checklist(f, '0.2.9', [{ ...old, evidence: 'revised' }]);
+    let calls = 0;
+    const result = await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'on', seats: ['TC'] },
+      run: async () => { calls++; throw Error('duplicate call'); } });
+    expect(result.status).toBe('skipped-empty');
+    expect(calls).toBe(0);
+  } finally { f.close(); }
+});
+
+test('a legacy launch without an evidence hash cannot prove the same-title cell has unchanged evidence', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', evidence: 'new evidence', status: 'yellow' }]);
+    const previous = new Date('2026-10-02T10:00:00Z');
+    const path = seatLedgerPath('TC', f.root, previous);
+    mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: previous.toISOString(), status: 'launched',
+      item: { source: 'checklist', version: '0.2.9', id: 'K2', title: '구현', text: '구현' } }) + '\n');
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'shadow', seats: ['TC'] } };
+    expect((await runSeatLoopOnce('TC', deps) as { item?: { id: string; evidenceHash?: string } }).item)
+      .toMatchObject({ id: 'K2', evidenceHash: expect.any(String) });
+  } finally { f.close(); }
+});
+
+test('a legacy launch without an evidence hash cannot hide a retitled cell in the same version', async () => {
+  const f = fixture();
+  try {
+    checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: 'new title', status: 'yellow' }]);
+    const previous = new Date('2026-10-02T10:00:00Z');
+    const path = seatLedgerPath('TC', f.root, previous);
+    mkdirSync(join(f.root, 'seat-loop', 'TC'), { recursive: true });
+    writeFileSync(path, JSON.stringify({ seat: 'TC', at: previous.toISOString(), status: 'launched',
+      item: { source: 'checklist', version: '0.2.9', id: 'K2', title: 'old title', text: 'old title' } }) + '\n');
+    const deps: SeatDeps = { ...f.deps, config: { mode: 'shadow', seats: ['TC'] } };
+    const inputs = await gatherSeatInputs('TC', deps);
+    expect(alreadyHandled(inputs.checklist[0]!, [{ seat: 'TC', at: previous.toISOString(), status: 'launched',
+      item: { source: 'checklist', version: '0.2.9', id: 'K2', title: 'old title', text: 'old title' } }])).toBe(false);
+    expect((await runSeatLoopOnce('TC', deps) as { item?: { id: string; title: string } }).item)
+      .toMatchObject({ id: 'K2', title: 'new title' });
   } finally { f.close(); }
 });
 
@@ -310,14 +1293,14 @@ test('V3 shadow day: each loop walks to the next item, planned door recorded, st
   } finally { f.close(); }
 });
 
-test('a shadowed item is still launched once the seat is switched on', async () => {
+test('a shadowed unchanged cell remains handled after switching the seat on', async () => {
   const f = fixture();
   try {
     checklist(f, '0.2.9', [{ id: 'K2', owner: 'TC', title: '구현', status: 'yellow' }]);
     await runSeatLoopOnce('TC', { ...f.deps, config: { mode: 'shadow', seats: ['TC'] } });
     const on: SeatDeps = { ...f.deps, config: { mode: 'on', seats: ['TC'] }, run: async (args) =>
       args[1] === 'budget' ? '{"outcome":"proceed"}' : '[{"status":"done","runId":"run-12345678-1234-1234-1234-123456789abc"}]' };
-    expect((await runSeatLoopOnce('TC', on)).status).toBe('launched');
+    expect((await runSeatLoopOnce('TC', on)).status).toBe('skipped-empty');
   } finally { f.close(); }
 });
 

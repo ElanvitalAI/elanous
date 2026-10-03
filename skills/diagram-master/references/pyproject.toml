@@ -1,0 +1,16 @@
+[project]
+name = "diagram-master"
+version = "2.0.0"
+description = "Diagram Master - unified renderer for all diagram engines"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.9",
+    "numpy>=1.26",
+    "pillow>=10.0",
+    "google-generativeai>=0.8",
+    "playwright>=1.40.0",
+    "pymupdf>=1.27.2.2",
+]
+
+[tool.uv]
+package = false

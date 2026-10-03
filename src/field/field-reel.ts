@@ -7,6 +7,7 @@ import { debug } from '../debug/log.js';
 import { mergeCapturedPath } from '../shell-env-bootstrap.js';
 import { listFieldMedia } from './field-media.js';
 import { startFieldFeed, type FieldFeedStart } from './field-feed-auto.js';
+import { recordOutput } from '../outputs/ledger.js';
 
 export interface FieldReelResult { ok: boolean; file?: string; seconds: number; error?: string; feed?: FieldFeedStart }
 export type FieldReelRunner = (dir: string, opts: { title: string; sub: string; mode?: 'standard' | 'instant' }) => Promise<FieldReelResult>;
@@ -137,6 +138,7 @@ async function render(dir: string, job: Job): Promise<void> {
   // 현재 렌더의 수신자 스냅샷. 렌더 중 업로드의 수신자는 다음 렌더로 넘긴다.
   const callbacks = job.callbacks;
   const renderOpts = job.opts;
+  let reelTitle = renderOpts.title || event;
   job.callbacks = new Map();
   writeStatus(dir, { state: 'rendering', items, startedAt });
   mkdirSync(join(dir, 'reel'), { recursive: true }); // 실행기 계약 — 산출 폴더는 있다(reel.sh 는 스스로 다시 만든다)
@@ -148,8 +150,9 @@ async function render(dir: string, job: Job): Promise<void> {
     let titleLines: string[] = [];
     try { titleLines = readFileSync(join(dir, 'title.txt'), 'utf8').split(/\r?\n/); }
     catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+    reelTitle = titleLines[0]?.trim() || renderOpts.title || event;
     result = await (renderOpts.runner ?? defaultFieldReelRunner)(dir, {
-      title: titleLines[0]?.trim() || renderOpts.title || event,
+      title: reelTitle,
       sub: titleLines[1]?.trim() || renderOpts.sub || sub,
       ...(renderOpts.mode ? { mode: renderOpts.mode } : {}),
     });
@@ -163,6 +166,7 @@ async function render(dir: string, job: Job): Promise<void> {
   writeStatus(dir, { state: result.ok ? 'done' : 'failed', items, startedAt, finishedAt,
     seconds: result.seconds, ...(result.ok ? { file: result.file } : { error: result.error ?? 'render failed' }) });
   debug.log('field.reel', result.ok ? 'done' : 'failed', { event, items, seconds: result.seconds });
+  if (result.ok && result.file) recordOutput({ source: 'field-reel', sourceId: event, kind: 'video', title: reelTitle, path: result.file });
   if (result.ok) {
     // EV10b: 엔진이 timeline.json 에 남긴 비전 호출 수·성공·«현장 N» 강등·걸린 ms — codex 잔량과 겹치므로 관측한다(OP 10-01).
     let cardsCache: 'hit' | 'miss' | 'n/a' = 'n/a';

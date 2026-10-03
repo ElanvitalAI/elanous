@@ -6,12 +6,14 @@ import { resolveAttachmentPath } from '../../boot/attachment-store.js';
 import { runGh } from '../../decisions/decision-cards.js';
 import { openMsgStore, canonicalSeatId } from '../../msg/msg-store.js';
 import { dispatchCeoTask, type CeoCommandDeps } from '../../seat-dispatch/ceo-commands.js';
+import { acknowledgeSeatAnswers, askSeat, deliverSeatAnswers, parseSeatAsk, type SeatAskDeps } from '../../seat-dispatch/seat-ask.js';
 import { getUserConfig } from '../../user-config.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { submitIntakeWork } from '../../intake-plane/submit-intake-work.js';
 import { parseSeatAddress, resolveSeat } from '../../seat-address/seat-address.js';
 import trackData from '../../../scripts/coord-tracks.json';
 import { jsonResponse } from './json-response.js';
+import { publishInsideEvent } from './inside-events.js';
 
 export const SEAT_REQUESTS_PATH = '/v1/seat-requests';
 
@@ -50,6 +52,7 @@ export interface SeatRequestsDeps {
   resolveAttachment?: typeof resolveAttachmentPath;
   dispatch?: typeof dispatchCeoTask;
   ceoDeps?: () => CeoCommandDeps;
+  askDeps?: SeatAskDeps;
 }
 
 const seats = trackData.tracks.filter((entry): entry is typeof entry & { title: string } => 'title' in entry)
@@ -189,6 +192,18 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   const path = file((deps.root ?? effectiveInstanceRoot)());
   if (req.method === 'GET') {
     const params = new URL(req.url).searchParams;
+    if (params.get('answers') === '1') {
+      const clientId = req.headers.get('x-seat-ask-client');
+      if (!clientId || !/^[a-f0-9-]{36}$/i.test(clientId)) return jsonResponse({ error: 'bad_request' }, 400);
+      const base = deps.askDeps;
+      const messages: Array<{ id: string; text: string; status: 'answered' | 'expired' }> = [];
+      await deliverSeatAnswers({ ...base, channel: 'pwa', clientId, send: async (origin, text) => {
+        if (origin.channel !== 'pwa' || origin.clientId !== clientId) return;
+        const match = /\(([^)]+)\)/.exec(text);
+        if (match) messages.push({ id: match[1]!, text, status: text.startsWith('CTO 답변') ? 'answered' : 'expired' });
+      } });
+      return jsonResponse({ items: messages });
+    }
     const requestedSeat = params.get('seat');
     const seat = requestedSeat ? requestSeat(requestedSeat) : undefined;
     if (requestedSeat && !seat) return unknownSeat();
@@ -203,6 +218,19 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
     } catch { return unavailable(); }
   }
   if (req.method !== 'POST') return jsonResponse({ error: 'method-not-allowed' }, 405);
+
+  if (new URL(req.url).searchParams.get('answers') === 'ack') {
+    const clientId = req.headers.get('x-seat-ask-client');
+    if (!clientId || !/^[a-f0-9-]{36}$/i.test(clientId)) return jsonResponse({ error: 'bad_request' }, 400);
+    let body: unknown;
+    try { body = await req.json(); } catch { return jsonResponse({ error: 'bad_request' }, 400); }
+    const ids = (body as { ids?: unknown } | null)?.ids;
+    if (!Array.isArray(ids) || ids.length > 100 || ids.some((id) => typeof id !== 'string' || !/^[a-f0-9-]{36}$/i.test(id))) {
+      return jsonResponse({ error: 'bad_request' }, 400);
+    }
+    acknowledgeSeatAnswers(clientId, ids as string[], deps.askDeps?.open);
+    return jsonResponse({ ok: true });
+  }
 
   let body: unknown;
   try { body = await req.json(); }
@@ -219,10 +247,22 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   const prefix = parsed ? `@${parsed.seats.join(',')}` : '';
   const firstAddress = parsed && input.text.startsWith(prefix)
     && (input.text.length === prefix.length || /[ \t\r\n]/.test(input.text[prefix.length]!)) ? parsed : null;
-  const address = input.seat ?? (firstAddress?.seats.length === 1 ? firstAddress.seats[0] : undefined);
+  const address = input.seat ?? (firstAddress?.seats.length === 1 ? firstAddress.seats[0] : undefined)
+    ?? (parseSeatAsk(input.text) ? 'TC' : undefined);
   const seat = address ? requestSeat(address) : undefined;
   if (!seat) return unknownSeat();
-  const text = input.seat === undefined ? firstAddress!.body.trim() : input.text.trim();
+  const text = input.seat === undefined ? (firstAddress?.body ?? input.text).trim() : input.text.trim();
+  if (canonicalSeatIdSafe(seat.id) === 'TC' && parseSeatAsk(text)) {
+    if (input.attachments !== undefined) return jsonResponse({ error: 'attachments-unsupported' }, 400);
+    const clientId = req.headers.get('x-seat-ask-client');
+    if (!clientId || !/^[a-f0-9-]{36}$/i.test(clientId)) return jsonResponse({ error: 'bad_request' }, 400);
+    let ask: string;
+    try {
+      ask = await askSeat(text, { channel: 'pwa', clientId }, (deps.ceoDeps ?? defaultCeoDeps)(),
+        deps.askDeps ?? { channel: 'pwa', send: async () => { throw new Error('PWA seat ask requires polling'); } });
+    } catch { return unavailable(); }
+    return jsonResponse({ reply: ask }, 202);
+  }
   if (!text) {
     debug.log('seat-address.pwa', 'rejected', { reason: 'empty-text', seat: seat.id });
     return jsonResponse({ error: 'bad_request' }, 400);
@@ -304,6 +344,7 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
       };
       try { persistOutcome(path, item, deps.append ?? append); }
       catch { return unavailable(); }
+      publishInsideEvent({ kind: 'seat', seat: item.seat, receiptId: item.receiptId, status: item.status, ts: item.queuedAt });
       return receipt(item);
     }
     let result: Awaited<ReturnType<typeof submitIntakeWork>>;
@@ -325,6 +366,7 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
     try { persistOutcome(path, item, deps.append ?? append); }
     catch { return unavailable(); }
     debug.log('seat-address.pwa', 'enqueued', { seat: seat.id, receiptId: item.receiptId });
+    publishInsideEvent({ kind: 'seat', seat: item.seat, receiptId: item.receiptId, status: item.status, ts: item.queuedAt });
     return receipt(item);
   })();
   inFlight.set(lock, { payload, task });

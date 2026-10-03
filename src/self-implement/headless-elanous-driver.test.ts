@@ -4,6 +4,8 @@ import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFil
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { listCoordEvents } from '../context-bus/coord-events.js';
+import { openSurfaceEventsDb } from '../domains/surface-events.js';
 import { harnessScreenPath } from '../harness/harness-screen.js';
 import { controlInboxPath, drainControlInbox, enqueueControlMemo } from '../harness/control-inbox.js';
 import { encodeDetachedProgressFrame } from '../harness/dispatch-detached.js';
@@ -145,6 +147,23 @@ async function captureScreenKey(
     log.mockRestore();
   }
 }
+
+test('harness child PTY start and finish share the coord events journal, without the feature prompt', async () => {
+  const since = new Date().toISOString();
+  const result = await runHeadlessGoalLoopPty({
+    binRoot: '/tmp/repo', cwd: '/tmp/worktree', featurePrompt: 'PRIVATE FEATURE PROMPT',
+    maxWaitSec: 1, maxHardWaitSec: 1, pollMs: 1, activityGraceSec: 100,
+    ptyAvailable: () => true, spawn: onePollPty('self_context_bus'),
+  });
+  expect(result.ok).toBe(true);
+  const db = openSurfaceEventsDb();
+  try {
+    const rows = listCoordEvents({ since, seat: 'harness-child' }, { db });
+    expect(rows.map((row) => row.kind)).toEqual(['started', 'finished']);
+    expect(rows[0]?.refs.source).toStartWith('elanous://harness/');
+    expect(JSON.stringify(rows)).not.toContain('PRIVATE FEATURE PROMPT');
+  } finally { db.close(); }
+});
 
 describe('headless control inbox handoff', () => {
   test.each(['tui', 'goal-loop'] as const)('preserves the inherited absolute inbox through a nested %s spawn and drains it once', async (driver) => {

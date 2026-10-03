@@ -28,6 +28,7 @@ export interface OpsSeat {
   blocked: Array<{ id: string; title: string; status: 'red' }> | null;
   pendingDecisions: number | null;
   checklist: { green: number; yellow: number; red: number; done: number } | null;
+  subSeats?: Array<{ id: string; title: string; open: number | null; landed: number | null; blocked: Array<{ id: string; title: string }> | null }> | null;
 }
 export interface OpsSeats { date: string; seats: OpsSeat[] }
 
@@ -78,6 +79,12 @@ function checklist(value: unknown): value is OpsChecklist {
 }
 
 const count = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 0;
+function subSeat(value: unknown): boolean {
+  return record(value) && string(value.id) && string(value.title)
+    && (value.open === null || count(value.open)) && (value.landed === null || count(value.landed))
+    && (value.blocked === null || (Array.isArray(value.blocked) && value.blocked.every((row: unknown) =>
+      record(row) && string(row.id) && string(row.title))));
+}
 function seat(value: unknown): value is OpsSeat {
   return record(value) && ['OP', 'MK', 'TC', 'UX'].includes(value.seat as string)
     && (value.role === undefined || string(value.role))
@@ -87,7 +94,8 @@ function seat(value: unknown): value is OpsSeat {
     && (value.blocked === null || (Array.isArray(value.blocked) && value.blocked.every((row: unknown) =>
       record(row) && string(row.id) && string(row.title) && row.status === 'red')))
     && (value.pendingDecisions === null || count(value.pendingDecisions))
-    && (value.checklist === null || (record(value.checklist) && (['green', 'yellow', 'red', 'done'] as const).every((key) => count((value.checklist as Record<string, unknown>)[key]))));
+    && (value.checklist === null || (record(value.checklist) && (['green', 'yellow', 'red', 'done'] as const).every((key) => count((value.checklist as Record<string, unknown>)[key]))))
+    && (value.subSeats === undefined || value.subSeats === null || (Array.isArray(value.subSeats) && value.subSeats.every(subSeat)));
 }
 
 async function get<T>(client: DaemonClient, path: string, parse: (value: unknown) => T | null): Promise<OpsResult<T>> {

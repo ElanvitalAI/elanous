@@ -39,6 +39,7 @@ import { writeScopedTypecheckConfig } from './scoped-typecheck-config.js';
 // ⭐ 게이트 스코프 근본 수리(2026-07-26) — 풀 `bun test` 폴백 제거 + 연관 테스트 유도(순수).
 import { resolveGateScope } from './gate-scope.js';
 import { buildImporterTestIndex, isTestPath } from './importer-test-index.js';
+import { buildRouteConsumerTestIndex } from './route-consumer-test-index.js';
 import { countTestDeclarations } from './test-declarations.js';
 import {
   allowsBaselineOnlyFailure,
@@ -75,6 +76,7 @@ import { tscEnv, assessTypecheckExecution, classifyTypecheckErrors, diffTypechec
 import { nestCapReached, childNestEnv, nestInfo } from '../agent/nest-depth.js';
 import { harnessBoundaryEnv, harnessBoundaryRequestsEnv, harnessBoundaryResponsesEnv, harnessSpaceEnv, getHarnessSpace, normalizeSpaceId, getHarnessRunId, resolveRunIdentity } from '../harness/harness-space.js';
 import { debug } from '../debug/log.js';
+import { RELEASE_PATH_HOLD_MARKER, RELEASE_PATH_LABEL, releasePathHoldShouldPost, releasePathHoldCommentsArgs, releasePrFilePaths } from '../self-dev/release-path-guard.js';
 import { emitDecision } from '../live/detail-switch.js';
 import { gateDecision, reviewDecision, mergeDecision } from './decision-events.js';
 import { LogStore } from '../mss/logging/log-store.js';
@@ -85,7 +87,9 @@ import { countReflectFactConflicts, type MustFixRefutation, type ReflectEvidence
 import { isSupervisorDecisionSection, splitGoalSections, supervisorGoalDigest } from './goal-digest.js';
 import type { SupervisionReworkSource } from './supervision-vocabulary.js';
 import type { ReworkBudgetVerdict } from './run-outcome.js';
-import { runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
+import { pickImplementRoleForGoal, runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
+import { childLlmSelectionEnv } from '../agent/run-context.js';
+import { observeExternalEvent } from '../context-bus/external-events.js';
 import { buildLlmHitlRelay, SIDE_EFFECT_RE } from '../harness/llm-hitl-relay.js';
 import { dispatchAskUserQuestion } from '../ask-user-question/tool.js';
 import { parseQuestionRequest } from '../ask-user-question/types.js';
@@ -1641,7 +1645,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       if ((o.ptyAvailable ?? ptyAvailable)()) {
         try {
           const res = await (o.runHeadlessGoalLoopPty ?? runHeadlessGoalLoopPty)({
-            binRoot, cwd, featurePrompt: prompt, maxWaitSec, brain,
+            binRoot, cwd, featurePrompt: prompt, goalDocument: feature, maxWaitSec, brain,
             ...(activityGraceSec !== undefined ? { activityGraceSec, activityGraceSource: 'caller' as const } : {}),
             autoStop: getUserConfig().tools.selfImplement.autoStop,
             autoAssist: getUserConfig().tools.selfImplement.autoAssist,
@@ -1698,9 +1702,14 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
       // 폴백 — PTY 불가/cap 초과/에러. 기존 헤드리스 spawnSync 경로 보존(블로킹이지만 견고).
       const args = [`${binRoot}/bin/elanous.mjs`, 'dev', '--implement'];
       const executionId = randomUUID();
+      const fallbackImplementRole = !childLlm && !process.env.ELANOUS_LLM_MODEL?.trim()
+        ? pickImplementRoleForGoal(feature) : undefined;
       if (o.configDir) args.push('--config-dir', o.configDir);
       args.push(prompt);
-      const r = runSpawnSync('bun', args, {
+      const fallbackSource = `elanous://harness/${encodeURIComponent(runId ?? 'unknown')}/${encodeURIComponent(executionId)}`;
+      observeExternalEvent({ origin: 'harness-child', kind: 'started', summary: 'Harness child started (fallback)', source: fallbackSource });
+      let r: ReturnType<typeof runSpawnSync>;
+      try { r = runSpawnSync('bun', args, {
         cwd, encoding: 'utf8', timeout: maxWaitSec * 1000, maxBuffer: 32 * 1024 * 1024,
         stdio: ['ignore', 'pipe', 'pipe'],
         ...(executionSignal ? { signal: executionSignal } : {}),   // /cancel 또는 구현 timeout → 자식 SIGTERM(고아 방지)
@@ -1716,6 +1725,9 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           //   ⇒ 실물: 쿼터 신호가 갱신 안 되는 우주를 봐서 전 계정 unknown ⇒ 회전이 100% 계정 선택 ⇒ 429(4회).
           ...(o.stateDir && o.stateDirSource ? { ELANOUS_STATE_DIR_SOURCE: o.stateDirSource } : {}),
           ...childNestEnv(),
+          ...childLlmSelectionEnv(childLlm ?? (fallbackImplementRole
+            ? { provider: fallbackImplementRole.provider, model: fallbackImplementRole.model, source: 'config' }
+            : undefined)),
           ...((): Record<string, string> => {
             const sp = getHarnessSpace() ?? { inHarness: true as const, kind: 'self-implement' as const, id: normalizeSpaceId(basename(cwd)), runId: getHarnessRunId() };
             // ★ K run-identity 공백 방어 — driver 와 동일 계약(호출자 > 상속 > canonical mint). 빈 runId 는
@@ -1727,7 +1739,12 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           ...harnessBoundaryResponsesEnv(executionId),
           ...harnessPolicyEnv(),
         },
-      });
+      }); } catch (error) {
+        observeExternalEvent({ origin: 'harness-child', kind: 'finished', summary: 'Harness child failed (fallback)', source: fallbackSource });
+        throw error;
+      }
+      observeExternalEvent({ origin: 'harness-child', kind: 'finished',
+        summary: `Harness child finished (fallback): ${r.status ?? 'unknown'}`, source: fallbackSource });
       const transcript = `${r.stdout ?? ''}${r.stderr ?? ''}`;
       const errCode = (r.error as { code?: string } | undefined)?.code;
       const timedOut = errCode === 'ETIMEDOUT' || r.signal === 'SIGTERM';
@@ -1807,9 +1824,11 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         trackedFiles.filter(isTestPath),
         [...new Set([...trackedFiles, ...changedAll, ...observationChangedFiles])].filter((file) => /\.(?:[cm]?[jt]sx?)$/.test(file)),
       );
+      const routeConsumerTestIndex = buildRouteConsumerTestIndex(cwd, trackedFiles.filter(isTestPath), changedAll, comparisonBase ?? 'HEAD');
       // 워크트리에 없는 변경 경로 = 지운 파일 — 미검증으로 세지 않는다(gate-scope `isDeleted` · 2026-09-26 run-7dd4cce6).
       const isDeleted = (path: string): boolean => !isFile(path);
-      const scope = resolveGateScope(changedAll, isFile, importerTestIndex ?? undefined, postsync ? { mode: 'postsync', isDeleted } : { isDeleted });
+      const scopeOpts = { isDeleted, routeConsumerTestIndex: routeConsumerTestIndex ?? undefined };
+      const scope = resolveGateScope(changedAll, isFile, importerTestIndex ?? undefined, postsync ? { ...scopeOpts, mode: 'postsync' } : scopeOpts);
       const comparisonFailureReason = observationChanges.comparisonBaseStatus === 'unavailable'
         ? 'comparison-base-unavailable'
         : observationChanges.comparisonBaseStatus === 'comparison-failed'
@@ -1817,10 +1836,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           : undefined;
       const unmeasuredPostsync = postsync && !comparisonFailureReason && scope.reason === 'unmeasured';
       const scopeReason = comparisonFailureReason ?? scope.reason;
-      const observationScope = resolveGateScope(observationChangedFiles, isFile, importerTestIndex ?? undefined);
-      const observedChangedTestFiles = observationScope.reason === 'changed-tests'
-        ? (observationScope.testArgs ?? []).filter((file) => !observationScope.pulledInRelatedTests.includes(file))
-        : [];
+      const observedChangedTestFiles = [...new Set(observationChangedFiles.filter((file) => isTestPath(file) && isFile(file)))];
       // This reads the merge-base without executing base tests. Its static declaration count is
       // observational: dynamic generation and renamed helpers can make it incomplete.
       const declarationDecline = testDeclarationDecline(cwd, comparisonBase, observedChangedTestFiles);
@@ -1863,6 +1879,9 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         documentPaths: scope.documentPaths.slice(0, 8), documentPathCount: scope.documentPaths.length,
         documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests.slice(0, 8),
         documentsWithoutDerivedTestCount: scope.documentsWithoutDerivedTests.length,
+        callerTests: scope.callerTests,
+        callerTestsOverflow: scope.callerTestsOverflow,
+        routeBaseLookupFailures: routeConsumerTestIndex.lookupFailures,
         pulledInRelatedTests: scope.pulledInRelatedTests.slice(0, 8),
         pulledInRelatedTestCount: scope.pulledInRelatedTests.length,
         importerTestIndexAvailable: importerTestIndex !== null,
@@ -1871,7 +1890,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         importerTestsNotRunTruncated: scope.importerTestsNotRun?.truncated ?? null,
         unresolvedRelativeImportSpecifiers: scope.importerTestsNotRun?.unresolvedRelativeSpecifiers ?? null,
       // ⚠️ 커버 안 된 변경이 있으면 **테스트가 돌았어도** warn — debug 는 운영 로그에서 필터링된다(리뷰 should-fix).
-      }, { level: scope.reason === 'no-related-tests' || scope.missingTestFiles > 0 || scope.unverified.length > 0 ? 'warn' : 'debug' });
+      }, { level: scope.reason === 'no-related-tests' || scope.missingTestFiles > 0 || scope.unverified.length > 0 || scope.callerTestsOverflow.length > 0 || routeConsumerTestIndex.lookupFailures.length > 0 ? 'warn' : 'debug' });
       try { emitDecision(gateDecision({ runId: ctx?.runId, reason: scopeReason, testStepSkipped })); } catch { /* observation must not change the gate result */ }
       // `defaultSeams.gate` owns the changed-file list and runs before the test-step skip,
       // so platform-only changes remain measured even when gate-scope has no Bun filters.
@@ -2174,6 +2193,12 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
           + `${scope.pulledInRelatedTests.slice(0, 8).join(', ')}`
           + `\n(편집된 테스트만 돌렸다면 이것들이 빠졌다)`
         : '';
+      const callerOverflowNote = scope.callerTestsOverflow.length > 0
+        ? `\n\n[gate-scope] ⚠️ caller test cap exceeded — not run: ${scope.callerTestsOverflow.map(({ file, reasons }) => `${file} (${reasons.join('+')})`).join(', ')}`
+        : '';
+      const routeLookupNote = routeConsumerTestIndex.lookupFailures.length > 0
+        ? `\n\n[gate-scope] ⚠️ caller route base lookup failed — unmeasured: ${routeConsumerTestIndex.lookupFailures.map(({ source, reason }) => `${source} (${reason})`).join(', ')}`
+        : '';
       const scopeNote = testStepSkipped
         ? `\n\n[gate-scope] ${scope.reason} — test 스텝을 건너뛰었다(변경파일 tsc 만 검증). `
           + (scope.reason === 'no-related-tests'
@@ -2204,7 +2229,7 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
         : '';
       return {
         passed: gatePassed,
-        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}`,
+        log: `${baseLog}${policyFailureLog}${dependencyFailureLog}${dependencyUnmeasuredNote}${comparisonFailureLog}${baselineNote}${verifyByBreakingNote}${scopeNote}${uncoveredNote}${pulledInRelatedTestsNote}${callerOverflowNote}${routeLookupNote}`,
         testStepExecuted: !testStepSkipped && testStep !== undefined && !testStep.skipped,
         scopeReason,
         comparisonBaseStatus: observationChanges.comparisonBaseStatus,
@@ -2349,9 +2374,45 @@ export function defaultSeams(o: DefaultSeamsOptions = {}): SelfImplementSeams {
     postPrComment: async ({ number, body, cwd }) => {
       // Round comments go out as the GitHub App like the PR itself — a personal `gh` login made the owner a
       // participant and mailed them on merge (#22089).
+      if (body.startsWith(RELEASE_PATH_HOLD_MARKER)) {
+        // Several merge surfaces may hold the same PR; post the release-path hold comment once.
+        let history: unknown;
+        try {
+          history = JSON.parse((await execFileAsync('gh', releasePathHoldCommentsArgs(number), {
+            cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env),
+          })).stdout);
+        } catch { history = undefined; }
+        if (!releasePathHoldShouldPost(() => history)) return;
+      }
       await execFileAsync('gh', ['pr', 'comment', String(number), '--body', body], {
         cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env),
       });
+    },
+
+    addPrLabel: async ({ number, label, cwd }) => {
+      if (label === RELEASE_PATH_LABEL) {
+        const existing = await execFileAsync('gh', ['label', 'list', '--search', label, '--json', 'name'], {
+          cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, env: ghAutomationEnv(process.env),
+        });
+        const names: unknown = JSON.parse(existing.stdout);
+        if (!Array.isArray(names)) throw new Error('gh label list returned an invalid list');
+        if (!names.some((item: unknown) => !!item && typeof item === 'object' && 'name' in item && item.name === label)) {
+          await execFileAsync('gh', ['label', 'create', label, '--color', 'D93F0B', '--description', 'Release path requires OP approval'], {
+            cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, env: ghAutomationEnv(process.env),
+          });
+        }
+      }
+      await execFileAsync('gh', ['pr', 'edit', String(number), '--add-label', label], {
+        cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, env: ghAutomationEnv(process.env),
+      });
+    },
+    readPrFiles: async ({ number, cwd }) => {
+      // Paginate the PR file API: a single `gh pr view --json files` can omit files after the first page.
+      const { stdout } = await execFileAsync('gh', [
+        'api', '--paginate', '--slurp', '--method', 'GET', '-f', 'per_page=100',
+        `repos/{owner}/{repo}/pulls/${number}/files`,
+      ], { cwd, encoding: 'utf8', timeout: GIT_TIMEOUT, maxBuffer: 64 * 1024 * 1024, env: ghAutomationEnv(process.env) });
+      return releasePrFilePaths(JSON.parse(stdout));
     },
 
     ...(o.approvePr ? { approvePr: o.approvePr } : {}),

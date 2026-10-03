@@ -268,6 +268,8 @@ export type TaskSurface =
       kind: 'self-implement';
       /** Feature/goal text passed to `elanous self implement <feature>`. */
       feature: string;
+      /** Pod queue predecessor goal ID or PR number. */
+      after?: string | number;
       /** Optional base ref (branch/tag) — maps to `--base`. */
       base?: string;
       /** Auto-merge on review-clean — maps to `--auto-merge`. */

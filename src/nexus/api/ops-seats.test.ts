@@ -25,6 +25,7 @@ const sources = (over: Partial<SeatsSources> = {}): SeatsSources => ({
   ],
   checklist: () => ({ current: [item('OPS1', 'UX', 'green'), item('HS1', 'TC', 'red', 'stop leaves job'), item('REL7b', 'O', 'red')], all: [item('OPS1', 'UX', 'green'), item('REL7', 'TC', 'green'), item('HS1', 'TC', 'red')] }),
   openDecisionRaisers: () => ['TC', 'O', 'MK'],
+  charters: () => [],
   ...over,
 });
 
@@ -36,7 +37,7 @@ test('contract: one row per seat with now, landed by checklist owner (not author
   expect(ux).toEqual({
     seat: 'UX', role: 'CXO', channelSource: 'unknown', now: { text: '**[UX]** 2026-10-02 12:38 KST → OP · first line', at: '2026-10-02T03:38:00Z' },
     landed: [{ pr: 22741, title: 'OPS1·OPS2 화면', at: '2026-10-02T03:30:00Z', checklistId: 'OPS1' }],
-    blocked: [], pendingDecisions: 0, checklist: { green: 1, yellow: 0, red: 0, done: 0 },
+    blocked: [], pendingDecisions: 0, checklist: { green: 1, yellow: 0, red: 0, done: 0 }, subSeats: [],
   });
   const tc = board.seats.find((row) => row.seat === 'TC')!;
   expect(tc.landed).toEqual([{ pr: 22734, title: 'notes (REL7)', at: '2026-10-02T03:10:00Z', checklistId: 'REL7' }]);
@@ -45,7 +46,7 @@ test('contract: one row per seat with now, landed by checklist owner (not author
   expect(board.seats.find((row) => row.seat === 'OP')!.now).toBeNull();
 });
 
-test('하위 자리의 빨강 칸과 연결 PR 은 상위 자리 행에 합쳐지고 응답 모양은 그대로다', async () => {
+test('하위 자리의 빨강 칸과 연결 PR 은 상위 자리 행에 합쳐지고 기존 칸 값은 유지된다', async () => {
   const board = await buildSeatsBoard('2026-10-02', sources({ checklist: () => ({
     current: [item('REL7', 'TC/rel', 'red'), item('DOC1', 'TC/docs', 'yellow'), item('HS1', 'TC', 'green')],
     all: [item('REL7', 'TC/rel', 'red'), item('DOC1', 'TC/docs', 'yellow'), item('HS1', 'TC', 'green')],
@@ -54,7 +55,63 @@ test('하위 자리의 빨강 칸과 연결 PR 은 상위 자리 행에 합쳐�
   expect(tc.blocked).toEqual([{ id: 'REL7', title: 'REL7', status: 'red' }]);
   expect(tc.checklist).toEqual({ green: 1, yellow: 1, red: 1, done: 0 });
   expect(tc.landed).toEqual([{ pr: 22734, title: 'notes (REL7)', at: '2026-10-02T03:10:00Z', checklistId: 'REL7' }]);
-  expect(Object.keys(tc).sort()).toEqual(['blocked', 'channelSource', 'checklist', 'landed', 'now', 'pendingDecisions', 'role', 'seat'].sort());
+  expect(Object.keys(tc).sort()).toEqual(['blocked', 'channelSource', 'checklist', 'landed', 'now', 'pendingDecisions', 'role', 'seat', 'subSeats'].sort());
+});
+
+test('헌장 하위 칸의 열린 수·착지 PR·빨강과 상위 자리 합계 보존', async () => {
+  const checklist = () => ({
+    current: [item('REL7', 'TC/rel', 'red', '릴리스 차단'), item('REL8', 'TC/rel', 'yellow'),
+      item('REL9', 'TC/rel', 'done'), item('HS1', 'TC', 'green')],
+    all: [item('REL7', 'TC/rel', 'red'), item('REL8', 'TC/rel', 'yellow'), item('REL9', 'TC/rel', 'done'), item('HS1', 'TC', 'green')],
+  });
+  const old = (await buildSeatsBoard('2026-10-02', sources({ checklist, charters: () => [] }))).seats.find((row) => row.seat === 'TC')!;
+  const withSubs = (await buildSeatsBoard('2026-10-02', sources({ checklist, charters: () => [
+    { id: 'TC/rel', seat: 'TC', sub: 'rel', title: '릴리스·인프라 운영 하위 자리' },
+    { id: 'TC/docs', seat: 'TC', sub: 'docs', title: '문서·GitHub 공개' },
+  ] }))).seats.find((row) => row.seat === 'TC')!;
+  expect(withSubs.subSeats).toEqual([
+    { id: 'TC/rel', title: '릴리스·인프라 운영 하위 자리', open: 2, landed: 1, blocked: [{ id: 'REL7', title: '릴리스 차단' }] },
+    { id: 'TC/docs', title: '문서·GitHub 공개', open: 0, landed: 0, blocked: [] },
+  ]);
+  for (const key of ['now', 'landed', 'blocked', 'pendingDecisions', 'checklist'] as const) expect(withSubs[key]).toEqual(old[key]);
+  const unreadable = (await buildSeatsBoard('2026-10-02', sources({ checklist, charters: () => null }))).seats.find((row) => row.seat === 'TC')!;
+  expect(unreadable.subSeats).toBeNull();
+  for (const key of ['now', 'landed', 'blocked', 'pendingDecisions', 'checklist'] as const) expect(unreadable[key]).toEqual(old[key]);
+});
+
+test('하위 자리 owner 는 seat/sub 로 정확히 대조하고 다른 하위 칸은 섞지 않는다', async () => {
+  const board = await buildSeatsBoard('2026-10-02', sources({
+    charters: () => [
+      { id: 'TC/rel', seat: 'TC', sub: 'rel', title: '릴리스' },
+      { id: 'TC/docs', seat: 'TC', sub: 'docs', title: '문서' },
+    ],
+    checklist: () => ({
+      current: [item('REL7', 'TC/rel', 'red'), item('DOC1', 'TC/docs', 'red'), item('BAD1', 'TC/rel/extra', 'red')],
+      all: [item('REL7', 'TC/rel', 'red'), item('DOC1', 'TC/docs', 'red'), item('BAD1', 'TC/rel/extra', 'red')],
+    }),
+  }));
+  expect(board.seats.find((row) => row.seat === 'TC')!.subSeats).toEqual([
+    { id: 'TC/rel', title: '릴리스', open: 1, landed: 1, blocked: [{ id: 'REL7', title: 'REL7' }] },
+    { id: 'TC/docs', title: '문서', open: 1, landed: 0, blocked: [{ id: 'DOC1', title: 'DOC1' }] },
+  ]);
+  const mismatched = await buildSeatsBoard('2026-10-02', sources({
+    charters: () => [{ id: 'TC/rel', seat: 'TC', sub: 'docs', title: '서로 다른 하위 이름' }],
+    checklist: () => ({ current: [item('REL7', 'TC/rel', 'red')], all: [item('REL7', 'TC/rel', 'red')] }),
+  }));
+  expect(mismatched.seats.find((row) => row.seat === 'TC')!.subSeats).toEqual([
+    { id: 'TC/rel', title: '서로 다른 하위 이름', open: 0, landed: 0, blocked: [] },
+  ]);
+});
+
+test('헌장은 읽혀도 체크리스트·병합 PR 출처 실패는 하위 자리에서 못 읽음으로 구분한다', async () => {
+  const charters = () => [{ id: 'TC/rel', seat: 'TC', sub: 'rel', title: '릴리스' }];
+  const noChecklist = (await buildSeatsBoard('2026-10-02', sources({ charters, checklist: () => null }))).seats[1]!;
+  expect(noChecklist.subSeats).toEqual([{ id: 'TC/rel', title: '릴리스', open: null, landed: null, blocked: null }]);
+  expect(noChecklist.landed).toBeNull();
+  expect(noChecklist.blocked).toBeNull();
+  const noPrs = (await buildSeatsBoard('2026-10-02', sources({ charters, merged: async () => { throw new Error('gh down'); } }))).seats[1]!;
+  expect(noPrs.subSeats).toEqual([{ id: 'TC/rel', title: '릴리스', open: 0, landed: null, blocked: [] }]);
+  expect(noPrs.landed).toBeNull();
 });
 
 test('잘못 저장된 하위 owner 는 TC 칸·연결 PR 에 포함하지 않고 기존 짧은 자리 별칭은 보존한다', async () => {

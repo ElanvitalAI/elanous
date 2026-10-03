@@ -12,12 +12,14 @@
 // Dismiss is sticky for 7 days (install-banner-state.ts) and the banner
 // stays hidden when the app is already running standalone.
 
-import { useEffect, useState } from 'react';
+import { Suspense, useEffect, useRef, useState } from 'react';
+import { usePathname, useSearchParams } from 'next/navigation';
 import { Download, Share, X } from 'lucide-react';
 import { debugLog } from '@/lib/debug';
 import {
   detectPlatform,
   isStandalone,
+  quietFor,
   readDismissAt,
   recordDismiss,
   shouldShow,
@@ -30,26 +32,44 @@ interface BeforeInstallPromptEvent extends Event {
 }
 
 export function InstallBanner() {
+  return <Suspense fallback={null}><InstallBannerContent /></Suspense>;
+}
+
+function InstallBannerContent() {
   const [visible, setVisible] = useState(false);
   const [platform, setPlatform] = useState<InstallPlatform>('unsupported');
   const [installEvent, setInstallEvent] = useState<BeforeInstallPromptEvent | null>(null);
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const capture = searchParams?.get('capture');
+  const demo = searchParams?.get('demo');
+  const installed = useRef(false);
+  const currentPlatform = useRef<InstallPlatform>('unsupported');
+
+  const decide = (currentPlatform: InstallPlatform) => {
+    let stored: string | null = null;
+    try { stored = window.localStorage.getItem('elanous.inside.demo'); } catch { /* storage unavailable */ }
+    const decision = shouldShow({
+      now: Date.now(),
+      standalone: isStandalone(),
+      platform: currentPlatform,
+      dismissedAt: readDismissAt(),
+      // A stubbed window (shell tests) may have no location; without a URL there is nothing to quiet.
+      quiet: window.location?.href ? quietFor(window.location.href, stored) : false,
+    });
+    setVisible(decision.show && !installed.current);
+    return decision;
+  };
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    let captured: BeforeInstallPromptEvent | null = null;
     const onPrompt = (ev: Event): void => {
       ev.preventDefault();
-      captured = ev as BeforeInstallPromptEvent;
-      setInstallEvent(captured);
-      setPlatform('beforeInstallPromptCapable');
-      const decision = shouldShow({
-        now: Date.now(),
-        standalone: isStandalone(),
-        platform: 'beforeInstallPromptCapable',
-        dismissedAt: readDismissAt(),
-      });
-      if (decision.show) setVisible(true);
+      setInstallEvent(ev as BeforeInstallPromptEvent);
+      currentPlatform.current = 'beforeInstallPromptCapable';
+      setPlatform(currentPlatform.current);
+      const decision = decide(currentPlatform.current);
       debugLog('pwa.install-banner.beforeinstallprompt', { decision });
     };
 
@@ -57,30 +77,33 @@ export function InstallBanner() {
 
     // Initial decision for iOS Safari (no event to wait for).
     const initialPlatform = detectPlatform(navigator.userAgent, false);
+    currentPlatform.current = initialPlatform;
     setPlatform(initialPlatform);
-    const initialDecision = shouldShow({
-      now: Date.now(),
-      standalone: isStandalone(),
-      platform: initialPlatform,
-      dismissedAt: readDismissAt(),
-    });
-    if (initialDecision.show) setVisible(true);
+    const initialDecision = decide(initialPlatform);
     debugLog('pwa.install-banner.mount', {
       platform: initialPlatform,
       decision: initialDecision,
     });
 
     const onAppInstalled = (): void => {
+      installed.current = true;
       setVisible(false);
       debugLog('pwa.install-banner.appinstalled');
     };
+    const onDemo = (): void => { decide(currentPlatform.current); };
     window.addEventListener('appinstalled', onAppInstalled);
+    window.addEventListener('elanous:inside-demo', onDemo);
 
     return () => {
       window.removeEventListener('beforeinstallprompt', onPrompt as EventListener);
       window.removeEventListener('appinstalled', onAppInstalled);
+      window.removeEventListener('elanous:inside-demo', onDemo);
     };
   }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') decide(currentPlatform.current);
+  }, [pathname, capture, demo]);
 
   const dismiss = (): void => {
     setVisible(false);

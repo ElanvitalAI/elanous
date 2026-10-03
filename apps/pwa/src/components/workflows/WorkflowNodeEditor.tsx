@@ -31,7 +31,9 @@ import { TelegramTriggerEditor } from './triggers/TelegramTriggerEditor';
 import { ManualTriggerEditor } from './triggers/ManualTriggerEditor';
 import { ChatTriggerEditor } from './triggers/ChatTriggerEditor';
 import { SchemaForm, type SchemaValue } from './SchemaForm';
-import type { GraphKindEntry } from '@/nexus/client';
+import { ExpressionInput } from './ExpressionInput';
+import type { GraphKindEntry, NexusClient } from '@/nexus/client';
+import { PluginCredentialsField } from './PluginCredentialsField';
 
 interface WorkflowNodeEditorProps {
   /** Parsed workflow definition the form pulls the current node from. */
@@ -52,9 +54,19 @@ interface WorkflowNodeEditorProps {
   /** Server vocabulary (`GET /v1/graph/kinds?graph=workflow`). A plugin
    *  kind that carries a `schema` gets a generated form for `inputs`. */
   palette?: GraphKindEntry[];
+  /** W7 — when the node's kind comes from a plugin, its credential status/inputs show under the form. */
+  credentialsClient?: Pick<NexusClient, 'getPluginCredentials' | 'putPluginCredentials'>;
 }
 
 const AUTO_SAVE_DEBOUNCE_MS = 500;
+
+/** The node fields the form drafts, as one comparable string. A parent render that re-parses the YAML hands us a
+ *  new node object with the same content; only a content change (another node, a YAML-view edit) may refill drafts. */
+function draftedFields(node: Record<string, unknown> | null): string {
+  if (!node) return '';
+  const pick = ['id', 'bash', 'prompt', 'skill', 'arguments', 'cft', 'approval', 'when', 'depends_on'];
+  return JSON.stringify(pick.map((key) => node[key] ?? null));
+}
 
 export function WorkflowNodeEditor({
   definition,
@@ -64,6 +76,7 @@ export function WorkflowNodeEditor({
   onClose,
   onDelete,
   palette,
+  credentialsClient,
 }: WorkflowNodeEditorProps) {
   const node = useMemo(
     () => (definition.nodes ?? []).find((n) => n.id === nodeId) ?? null,
@@ -90,9 +103,17 @@ export function WorkflowNodeEditor({
   const [draftWhen, setDraftWhen] = useState<string>(typeof node?.['when'] === 'string' ? (node['when'] as string) : '');
   const [draftDeps, setDraftDeps] = useState<string[]>(Array.isArray(node?.['depends_on']) ? [...(node!['depends_on'] as string[])] : []);
 
-  // Rehydrate every state when the selected node changes.
+  // Rehydrate every state when the selected node changes — by content, not object identity (W5b harvest: a
+  // re-render with a stale-but-new node object, or our own lagging commit, clobbered in-progress typing).
+  const syncedRef = useRef<{ id: string; fields: string } | null>(null);
+  const committedRef = useRef<string | null>(null);
   useEffect(() => {
     if (!node) return;
+    const fields = draftedFields(node as Record<string, unknown>);
+    const synced = syncedRef.current;
+    if (synced && synced.id === nodeId && synced.fields === fields) return;
+    syncedRef.current = { id: nodeId, fields };
+    if (synced && synced.id === nodeId && committedRef.current === fields) return;
     setDraftId(node.id);
     setDraftBash(typeof node['bash'] === 'string' ? (node['bash'] as string) : '');
     setDraftPrompt(typeof node['prompt'] === 'string' ? (node['prompt'] as string) : '');
@@ -112,6 +133,10 @@ export function WorkflowNodeEditor({
   // Plugin node `inputs` — schema form (0.2.5 K3). Local draft + debounced
   // commit like the other fields; compared by JSON so the parent → node →
   // draft round trip never re-commits (no render loop).
+  const kindPlugin = useMemo(() => {
+    const kind = typeof node?.['kind'] === 'string' ? (node['kind'] as string) : null;
+    return kind ? palette?.find((e) => e.kind === kind)?.plugin ?? null : null;
+  }, [node, palette]);
   const kindSchema = useMemo(() => {
     const kind = typeof node?.['kind'] === 'string' ? (node['kind'] as string) : null;
     return kind ? palette?.find((e) => e.kind === kind && e.schema)?.schema ?? null : null;
@@ -173,7 +198,10 @@ export function WorkflowNodeEditor({
       const patch = buildPatch();
       if (Object.keys(patch).length === 0) return;
       const nextDef = editNode(definition, nodeId, patch);
-      if (nextDef !== definition) onChange(nextDef);
+      if (nextDef === definition) return;
+      const sent = (nextDef.nodes ?? []).find((n) => n.id === (typeof patch.id === 'string' ? patch.id : nodeId)) ?? null;
+      committedRef.current = draftedFields(sent as Record<string, unknown> | null);
+      onChange(nextDef);
     }, AUTO_SAVE_DEBOUNCE_MS);
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
@@ -293,7 +321,10 @@ export function WorkflowNodeEditor({
           />
         </Field>
         <Field label="when (gating expression)">
-          <input
+          <ExpressionInput
+            key={`${nodeId}:when`}
+            definition={definition}
+            nodeId={nodeId}
             value={draftWhen}
             onChange={(e) => setDraftWhen(e.target.value)}
             placeholder={`e.g. "$prev.output == 'ok'"`}
@@ -304,9 +335,18 @@ export function WorkflowNodeEditor({
         {kindSchema && (
           <SchemaForm schema={kindSchema} value={draftInputs} onChange={setDraftInputs} />
         )}
+        {kindPlugin && credentialsClient && (
+          <Field label="자격" full>
+            <PluginCredentialsField plugin={kindPlugin} client={credentialsClient} />
+          </Field>
+        )}
         {variant === 'bash' && (
           <Field label="bash" full>
-            <textarea
+            <ExpressionInput
+              key={`${nodeId}:bash`}
+              definition={definition}
+              nodeId={nodeId}
+              multiline
               value={draftBash}
               onChange={(e) => setDraftBash(e.target.value)}
               rows={4}
@@ -317,7 +357,11 @@ export function WorkflowNodeEditor({
         )}
         {variant === 'prompt' && (
           <Field label="prompt" full>
-            <textarea
+            <ExpressionInput
+              key={`${nodeId}:prompt`}
+              definition={definition}
+              nodeId={nodeId}
+              multiline
               value={draftPrompt}
               onChange={(e) => setDraftPrompt(e.target.value)}
               rows={4}
@@ -345,7 +389,11 @@ export function WorkflowNodeEditor({
               )}
             </Field>
             <Field label="arguments" full>
-              <textarea
+              <ExpressionInput
+                key={`${nodeId}:arguments`}
+                definition={definition}
+                nodeId={nodeId}
+                multiline
                 value={draftArgs}
                 onChange={(e) => setDraftArgs(e.target.value)}
                 rows={3}

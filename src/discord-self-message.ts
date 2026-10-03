@@ -61,6 +61,9 @@ import { executionFooter } from './telegram-exec-footer.js';
 import { debug } from './debug/log.js';
 import { makeChunkProducer } from './session/streaming/chunk-producer.js';
 import { getUserConfig } from './user-config.js';
+import { detectCard, runCardFollowup, NotACardError } from './card-followup/core.js';
+import { localOcrText } from './telegram-card-followup.js';
+import type { runGraph } from './graph-runner/runner.js';
 
 const SLASH_FOCUS_TURNS_DEFAULT = 8;
 
@@ -135,6 +138,7 @@ export interface DiscordSelfMessageDeps {
    *  (legacy). */
   questionChannelFor?: (channelId: string) => import('./hitl/question.js').QuestionChannel;
   log?: (msg: string) => void;
+  cardFollowupDeps?: { ocrText?: (path: string) => Promise<string | null>; runGraph?: typeof runGraph; rootDir?: () => string };
 }
 
 /** Compose the full discord self+interweave onMessage handler. */
@@ -352,6 +356,34 @@ export function buildDiscordSelfOnMessage(deps: DiscordSelfMessageDeps): DcMessa
     // Voice text commands pass the guild gate for the voice adapter's
     // sake — never route them into the LLM turn (legacy behavior).
     if (/^\/voice-(join|leave|status)\b/.test(ctx.text.trim())) return undefined;
+    if (!ctx.text.trim() && ctx.attachments.length === 1 && ctx.attachments[0]!.contentType?.startsWith('image/')) {
+      const photo = ctx.attachments[0]!;
+      if (detectCard({ width: photo.width, height: photo.height, ocrText: null }).decision !== 'skip') {
+        const bot = deps.getBot();
+        if (bot) {
+          let imagePath: string;
+          let ocrText: string | null;
+          try {
+            imagePath = (await bot.downloadAttachment(photo)).localPath;
+            ocrText = await (deps.cardFollowupDeps?.ocrText ?? localOcrText)(imagePath);
+          } catch {
+            return '명함을 읽지 못했습니다';
+          }
+          if (detectCard({ width: photo.width, height: photo.height, ocrText }).decision === 'card') {
+            try {
+              const result = await runCardFollowup({ imagePath, ocrText,
+                ...(deps.cardFollowupDeps?.runGraph ? { runGraph: deps.cardFollowupDeps.runGraph } : {}),
+                ...(deps.cardFollowupDeps?.rootDir ? { rootDir: deps.cardFollowupDeps.rootDir() } : {}),
+              });
+              for (const reply of result.replies) await bot.sendMessage(ctx.channelId, reply);
+              return streamer ? '명함 정리를 완료했습니다.' : undefined;
+            } catch (error) {
+              if (!(error instanceof NotACardError)) return '명함을 읽지 못했습니다';
+            }
+          }
+        }
+      }
+    }
     // S1 session commands (!sessions·!new·!attach) — before delegation
     // and self-turn routing, mirroring telegram's command precedence.
     const sessionReply = handleSessionCommand(ctx);

@@ -54,7 +54,7 @@ function measure(ctx: Context, audit = false): number {
     'while IFS= read -r f; do',
     '  [ -n "$f" ] || continue',
     '  s=$(date +%s)',
-    '  if [ -n "$TO" ]; then /usr/bin/time -l "$TO" -k 10 300 bun run scripts/test-deterministic.ts "./$f" > "$T/out" 2> "$T/err"; else /usr/bin/time -l bun run scripts/test-deterministic.ts "./$f" > "$T/out" 2> "$T/err"; fi',
+    `  if [ -n "$TO" ]; then /usr/bin/time -l "$TO" -k 10 300 ${audit ? 'env ELANOUS_NIGHTLY_AUDIT=1 ' : ''}bun run scripts/test-deterministic.ts "./$f" > "$T/out" 2> "$T/err"; else /usr/bin/time -l ${audit ? 'env ELANOUS_NIGHTLY_AUDIT=1 ' : ''}bun run scripts/test-deterministic.ts "./$f" > "$T/out" 2> "$T/err"; fi`,
     '  rc=$?; e=$(( $(date +%s) - s ))',
     '  rss=$(awk \'/maximum resident set size/ {printf "%d", $1/1048576}\' "$T/err")',
     // bun test prints its summary on stderr — read both streams.

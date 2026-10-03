@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { ORIGINAL_ASK_MARKER } from '../self-implement/goal-author.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +9,9 @@ import { resolveHarnessTarget } from '../self-implement/harness-target-options.j
 import { debug } from '../debug/log.js';
 import { LogStore } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
+import { runSelfOrchestrateCliCommand } from '../self-dev/orchestrate-cli.js';
+import { parsePodPool, PodPoolScheduler } from '../task-orchestrator/surfaces/pod-pool.js';
+import { podSelfImplementSpawn, type Kubectl } from '../task-orchestrator/surfaces/self-implement-pod.js';
 import { Command } from 'commander';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
 import {
@@ -21,6 +26,7 @@ import {
   defaultLookupHarnessProcessLedger,
   formatHarnessProcessElapsed,
   installHarnessCliCommand,
+  killHarnessProcess,
   githubDraftSweepAdapters,
   draftSweepRunStatus,
   observeHarnessLaunchdPids,
@@ -42,6 +48,7 @@ import {
   type HarnessProcessListObservation,
   type HarnessProcessRecord,
   type HarnessWorktreeListObservation,
+  openHarnessProcessHandle,
 } from './harness-cli-command.js';
 
 const MEASURED_LAUNCHCTL_LIST = [
@@ -86,6 +93,9 @@ describe('harness CLI command', () => {
     missionLoop?: Parameters<typeof installHarnessCliCommand>[1]['missionLoop'],
     draftSweep?: Parameters<typeof installHarnessCliCommand>[1]['draftSweep'],
     podDispatchTask?: Parameters<typeof installHarnessCliCommand>[1]['podDispatchTask'],
+    launchGate: NonNullable<Parameters<typeof installHarnessCliCommand>[1]['launchGate']> = {
+      readBudget: async () => ({ action: 'proceed', reasons: ['within budget'] }), activeRuns: () => [],
+    },
   ) {
     const program = new Command().exitOverride();
     const harness = installHarnessCliCommand(program, {
@@ -99,6 +109,7 @@ describe('harness CLI command', () => {
       missionLoop,
       draftSweep,
       podDispatchTask,
+      launchGate,
     });
     return { program, harness };
   }
@@ -159,6 +170,98 @@ describe('harness CLI command', () => {
     });
     return captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'processes']));
   }
+
+  test('processes --kill checks repository, owning run and terminal status before sending one SIGTERM', async () => {
+    const root = '/tmp/owned-elanous-repo';
+    const signals: Array<[number, string]> = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const record = processFixture({ pid: 541, elapsedSeconds: 12,
+      command: `bun ${root}/bin/elanous.mjs self orchestrate --goal-file x.md`,
+      ownership: { status: 'observed', runId: 'run-a' } });
+    const deps = {
+      repositoryRoot: root, listProcesses: () => [record], readStartTime: () => 'Thu Oct  2 22:49:07 2026',
+      lookupLedger: () => [{ event: 'run-status', data: { runStatus: 'running' }, timestamp: new Date().toISOString() }],
+      openProcessHandle: (pid: number) => ({ signal: (signal: NodeJS.Signals) => { signals.push([pid, signal]); }, close: () => {} }),
+    };
+    try {
+      expect(killHarnessProcess(542, false, deps).outcome).toBe('refused');
+      expect(killHarnessProcess(541, false, { ...deps, repositoryRoot: '/tmp/other-repo' }).outcome).toBe('refused');
+      expect(killHarnessProcess(541, false, { ...deps, listProcesses: () => [{ ...record, command: `bun /tmp/other-repo/bin/elanous.mjs self orchestrate --goal-file ${root}/goal.md` }] }).outcome).toBe('refused');
+      expect(killHarnessProcess(541, false, { ...deps, listProcesses: () => [{ ...record, command: 'bun bin/elanous.mjs self orchestrate --goal-file x.md', cwd: root }] }).runState).toBe('running');
+      expect(killHarnessProcess(541, false, { ...deps, listProcesses: () => [{ ...record, command: 'bun bin/elanous.mjs self orchestrate --goal-file x.md', cwd: '/tmp/other-repo' }] }).outcome).toBe('refused');
+      expect(killHarnessProcess(541, false, { ...deps, readStartTime: () => '' }).reason).toBe('process start time unreadable');
+      expect(killHarnessProcess(541, false, deps)).toMatchObject({ outcome: 'refused', owned: true, runState: 'running' });
+      for (const status of ['unknown', 'future-state', '']) {
+        expect(killHarnessProcess(541, true, { ...deps, lookupLedger: () => [
+          { event: 'run-status', data: { runStatus: status } },
+        ] })).toMatchObject({ outcome: 'refused', owned: true, reason: 'owning run status unconfirmed' });
+      }
+      expect(killHarnessProcess(541, true, { ...deps, lookupLedger: () => [
+        { event: 'run-status', data: {} },
+      ] })).toMatchObject({ outcome: 'refused', reason: 'owning run status unconfirmed' });
+      expect(signals).toEqual([]);
+      let reads = 0;
+      expect(killHarnessProcess(541, true, { ...deps, readStartTime: () => (++reads === 1 ? 'Thu Oct  2 22:49:07 2026' : 'Thu Oct  2 22:49:08 2026') }).reason).toBe('pid start time changed');
+      expect(signals).toEqual([]);
+      const terminal = { ...deps, lookupLedger: () => [{ event: 'run-status', data: { runStatus: 'completed' } }] };
+      const { program } = install(undefined, undefined, undefined, { ...terminal, write: () => {} });
+      await program.parseAsync(['node', 'elanous', 'harness', 'processes', '--kill', '541']);
+      expect(signals).toEqual([[541, 'SIGTERM']]);
+      expect(log).toHaveBeenCalledWith('harness.processes', 'kill', expect.objectContaining({ pid: 541, owned: true, runState: 'completed', outcome: 'sent' }));
+      expect(killHarnessProcess(541, true, deps).outcome).toBe('sent');
+      expect(signals).toHaveLength(2);
+    } finally { log.mockRestore(); }
+  });
+
+  test('processes --kill signals only its pinned handle even when the PID is reused in the same second', () => {
+    const root = '/tmp/owned-elanous-repo';
+    const pid = 541;
+    let currentIdentity = 'original';
+    const signaled: string[] = [];
+    const closed: string[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    const deps = {
+      repositoryRoot: root,
+      listProcesses: () => [processFixture({ pid, command: `bun ${root}/bin/elanous.mjs self orchestrate --goal-file goal.md`,
+        ownership: { status: 'observed' as const, runId: 'run-a' } })],
+      openProcessHandle: () => {
+        const capturedIdentity = currentIdentity;
+        return { signal: () => { signaled.push(capturedIdentity); }, close: () => { closed.push(capturedIdentity); } };
+      },
+      readStartTime: () => { currentIdentity = 'replacement'; return 'Thu Oct  2 22:49:07 2026'; },
+      lookupLedger: () => [{ event: 'run-status', data: { runStatus: 'completed' } }],
+    };
+    try {
+      expect(killHarnessProcess(pid, false, deps).outcome).toBe('sent');
+      expect(signaled).toEqual(['original']);
+      expect(closed).toEqual(['original']);
+      expect(killHarnessProcess(pid, false, { ...deps, openProcessHandle: () => { throw new Error('pidfd unsupported'); } }))
+        .toMatchObject({ outcome: 'refused', reason: 'pid-bound signaling unavailable: pidfd unsupported' });
+      expect(signaled).toEqual(['original']);
+    } finally { log.mockRestore(); }
+  });
+
+  test('Linux pidfd delivers SIGTERM to the checked child, not via a later PID lookup', async () => {
+    if (process.platform !== 'linux' || !['x64', 'arm64'].includes(process.arch)) return;
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+      const pid = child.pid!;
+      const root = '/tmp/owned-elanous-repo';
+      const exit = new Promise<{ signal: NodeJS.Signals | null }>((resolve) => {
+        child.once('exit', (_code, signal) => resolve({ signal }));
+      });
+      expect(killHarnessProcess(pid, false, {
+        repositoryRoot: root,
+        listProcesses: () => [processFixture({ pid, command: `bun ${root}/bin/elanous.mjs self orchestrate --goal-file goal.md`,
+          ownership: { status: 'observed', runId: 'run-a' } })],
+        readStartTime: () => 'Thu Oct  2 22:49:07 2026',
+        lookupLedger: () => [{ event: 'run-status', data: { runStatus: 'completed' } }],
+      })).toMatchObject({ outcome: 'sent', owned: true });
+      expect(await exit).toEqual({ signal: 'SIGTERM' });
+    } finally { child.kill(); log.mockRestore(); }
+  });
 
   test('draft sweep is installed by default; dry-run and apply pass repository and actions through the CLI', async () => {
     const labels: unknown[] = [];
@@ -526,6 +629,126 @@ describe('harness CLI command', () => {
     } finally { process.exitCode = prior; }
   });
 
+  test('launch gate blocks same-goal say and exhausted budget before either local or Pod dispatch; force bypasses only duplicate', async () => {
+    const calls: string[] = [];
+    const observed: string[] = [];
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'execution-loop.launch-gate' && event === 'decision') events.push(data);
+    }) as typeof debug.log);
+    let budget: 'proceed' | 'stop' | 'wait-reset' = 'proceed';
+    const gate = {
+      activeRuns: (id: string) => { observed.push(id); return ['run-active']; },
+      readBudget: async () => ({ action: budget, reasons: ['limit reached'] }),
+    };
+    const { program, harness } = install(async () => { calls.push('ask'); }, async () => { calls.push('say'); },
+      undefined, undefined, undefined, undefined, undefined, undefined, gate);
+    const pod = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation(() => 0);
+    const goal = join(tmpdir(), `launch-gate-${crypto.randomUUID()}.md`);
+    writeFileSync(goal, '# Goal\n- GoalId: 1234567890abcdef\n\nbody');
+    const previousExit = process.exitCode;
+    try {
+      for (const name of ['ask', 'say']) {
+        expect(harness.commands.find((command) => command.name() === name)!.options.map((option) => option.long)).toContain('--force-gate');
+      }
+      process.exitCode = 0;
+      const duplicate = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'repeat', 'this']));
+      expect(duplicate).toEqual(['❌ launch gate: blocked-duplicate — same-goal active runs: run-active']);
+      expect(process.exitCode).toBe(3);
+      expect(calls).toEqual([]);
+      expect(observed).toEqual([`request-${createHash('sha256').update('repeat this').digest('hex').slice(0, 32)}`]);
+      process.exitCode = 0;
+      const podDuplicate = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(podDuplicate).toEqual(['❌ launch gate: blocked-duplicate — same-goal active runs: run-active']);
+      expect(process.exitCode).toBe(3);
+      expect(pod).toHaveBeenCalledTimes(0);
+      process.exitCode = 0;
+      await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'repeat', 'this', '--force-preflight']));
+      expect(process.exitCode).toBe(3);
+      expect(calls).toEqual([]);
+      process.exitCode = 0;
+      const forced = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'repeat', 'this', '--force-gate']));
+      expect(forced).toEqual([]);
+      expect(calls).toEqual(['say']);
+      expect(events).toContainEqual(expect.objectContaining({ action: 'proceed', forceLaunch: true }));
+      budget = 'stop';
+      process.exitCode = 0;
+      const denied = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--force-gate']));
+      expect(denied).toEqual(['❌ launch gate: blocked-budget — limit reached']);
+      expect(process.exitCode).toBe(3);
+      expect(calls).toEqual(['say']);
+      expect(pod).toHaveBeenCalledTimes(0);
+      expect(observed.at(-1)).toBe('1234567890abcdef');
+      process.exitCode = 0;
+      const noIdGoal = join(tmpdir(), `launch-no-id-${crypto.randomUUID()}.md`);
+      writeFileSync(noIdGoal, '# Goal without id\n');
+      try {
+        const noId = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', noIdGoal]));
+        expect(noId).toEqual(['❌ launch gate: blocked-budget — limit reached']);
+        expect(process.exitCode).toBe(3);
+        expect(calls).toEqual(['say']);
+      } finally { rmSync(noIdGoal, { force: true }); }
+      budget = 'wait-reset';
+      process.exitCode = 0;
+      const reset = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'repeat', 'this', '--force-gate']));
+      expect(reset).toEqual(['❌ launch gate: wait-reset — limit reached']);
+      expect(process.exitCode).toBe(3);
+      expect(calls).toEqual(['say']);
+    } finally { process.exitCode = previousExit ?? 0; pod.mockRestore(); log.mockRestore(); rmSync(goal, { force: true }); }
+  });
+
+  test('say refuses a live authored run whose original request exactly matches before dispatch', async () => {
+    const ask = 'repeat this';
+    const goal = join(tmpdir(), `launch-authored-${crypto.randomUUID()}.md`);
+    writeFileSync(goal, `# Authored goal\n- GoalId: abcdef0123456789\n${ORIGINAL_ASK_MARKER}\n\`\`\`text\n${ask}\n\`\`\`\n`);
+    let dispatched = 0;
+    const gate: NonNullable<Parameters<typeof installHarnessCliCommand>[1]['launchGate']> = {
+      readBudget: async () => ({ action: 'proceed', reasons: [] }),
+      queryRuns: () => ({ completeness: 'complete', pty: { unreadable: [] }, entries: [{
+        runId: 'run-live', status: 'running', ledgerDirectories: ['/ledger'], ptyRefs: [{ id: 'pty-live', instance: 'test', kind: 'test' }],
+      }] }) as unknown as ReturnType<NonNullable<NonNullable<Parameters<typeof installHarnessCliCommand>[1]['launchGate']>['queryRuns']>>,
+      loadLedger: () => [{ runId: 'run-live', event: 'start', goalId: 'abcdef0123456789', data: { goalFile: goal } }],
+    };
+    const { program } = install(undefined, async () => { dispatched++; },
+      undefined, undefined, undefined, undefined, undefined, undefined, gate);
+    const previousExit = process.exitCode;
+    try {
+      process.exitCode = 0;
+      const errors = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'repeat', 'this']));
+      expect(errors).toEqual(['❌ launch gate: blocked-duplicate — same-goal active runs: run-live']);
+      expect(process.exitCode).toBe(3);
+      expect(dispatched).toBe(0);
+    } finally { process.exitCode = previousExit ?? 0; rmSync(goal, { force: true }); }
+  });
+
+  test('launch gate warnings permit ask/say dispatch and dry-run performs no budget or run lookup', async () => {
+    const calls: unknown[] = [];
+    const observed: string[] = [];
+    const gate = {
+      activeRuns: (id: string) => { observed.push(id); return 'unknown' as const; },
+      readBudget: async () => ({ action: 'next-provider' as const, reasons: ['first exhausted', 'fallback ready'] }),
+    };
+    const { program } = install(async (path) => { calls.push(['ask', path]); }, async (words) => { calls.push(['say', words]); },
+      undefined, undefined, undefined, undefined, undefined, undefined, gate);
+    const goal = join(tmpdir(), `launch-warning-${crypto.randomUUID()}.md`);
+    const previousExit = process.exitCode;
+    process.exitCode = 0;
+    writeFileSync(goal, '# Goal\n- GoalId: 1234567890abcdef\n\nbody');
+    try {
+      await captureLog(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--dry-run']));
+      expect(observed).toEqual([]);
+      expect(calls).toEqual([]);
+      const askWarnings = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', goal]));
+      const sayWarnings = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'say', 'new', 'goal']));
+      expect(askWarnings).toEqual(['⚠️ launch gate: active runs unknown · first exhausted · fallback ready']);
+      expect(sayWarnings).toEqual(askWarnings);
+      expect(calls).toEqual([['ask', goal], ['say', ['new', 'goal']]]);
+      expect(observed[0]).toBe('1234567890abcdef');
+      expect(observed).toHaveLength(2);
+      expect(process.exitCode).toBe(0);
+    } finally { process.exitCode = previousExit; rmSync(goal, { force: true }); }
+  });
+
   test('ask keeps its default options without graph authority forwarding', async () => {
     const received: unknown[] = [];
     const { program } = install(async (_goalPath, options) => { received.push(options); });
@@ -691,6 +914,95 @@ describe('harness CLI command', () => {
       rmSync(goal, { force: true });
     }
   });
+
+  test('real harness ask/say entrances forward the pool to self orchestration; N=2 holds a third kubectl Job apply', async () => {
+    const goal = join(tmpdir(), `pod-admission-${crypto.randomUUID()}.md`);
+    writeFileSync(goal, 'First distinct goal');
+    const pool = new PodPoolScheduler(parsePodPool('fake:3'), { status: () => ({
+      recommended: 2, accountSlots: 99, limitedBy: 'capacity', reason: null,
+      capacitySlots: 3, memorySlots: 3, placeableSlots: 3, running: 0, pending: 0,
+    }), pollMs: 2 });
+    const applied: string[] = [];
+    const completed = new Set<string>();
+    const kubectl: Kubectl = (args, input) => {
+      if (args.includes('apply') && input) {
+        const object = JSON.parse(input) as { kind: string; metadata: { name: string } };
+        if (object.kind === 'Job') applied.push(object.metadata.name);
+      }
+      if (args.some((arg) => arg.startsWith('jsonpath={.metadata.uid} '))) return { status: 1, stdout: '', stderr: 'NotFound' };
+      if (args.includes('job') && args.includes('jsonpath={.status.conditions[*].type}')) {
+        return { status: 0, stdout: completed.has(args[args.indexOf('job') + 1]!) ? 'Complete' : '', stderr: '' };
+      }
+      return { status: 0, stdout: '', stderr: '' };
+    };
+    const spawn = podSelfImplementSpawn({ pool, kubectl, env: {}, repoUrl: 'not-a-github-repository',
+      credentials: () => ({ elanousAuth: '{}', codexAuth: '{}', ghToken: 't' }), pollMs: 2 });
+    const controllers = [new AbortController(), new AbortController(), new AbortController()];
+    const jobs: ReturnType<typeof spawn>[] = [];
+    const forwarded: string[] = [];
+    const receivedGoals: string[] = [];
+    const runs: ReturnType<typeof runSelfOrchestrateCliCommand>[] = [];
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation((input) => {
+      // PROC1: the goal travels as a file path, never as argv text.
+      const goalText = input.entrance === 'cli-harness-ask' ? readFileSync(input.input, 'utf8') : input.input;
+      const args = podDispatch.podOrchestrateArgs(input, '/goal-file.md');
+      forwarded.push(args[args.indexOf('--pod-pool') + 1]!);
+      expect(args).not.toContain(goalText);
+      receivedGoals.push(goalText);
+      const index = runs.length;
+      runs.push(runSelfOrchestrateCliCommand({ goals: [{ feature: goalText }], concurrency: 1,
+        runtime: { spawn: (jobInput) => {
+          const job = spawn({ ...jobInput, spaceId: `goal-${index}`, signal: controllers[index]!.signal });
+          jobs.push(job);
+          return job;
+        } },
+      }));
+      return 0;
+    });
+    const { program } = install(async () => {}, async () => {});
+    const previousExit = process.exitCode;
+    const waitUntil = async (predicate: () => boolean) => {
+      for (let i = 0; i < 100 && !predicate(); i++) await Bun.sleep(5);
+      expect(predicate()).toBe(true);
+    };
+    try {
+      process.exitCode = 0;
+      await program.parseAsync(['node', 'elanous', 'harness', 'ask', goal, '--substrate', 'pod', '--pod-pool', 'fake:3']);
+      await program.parseAsync(['node', 'elanous', 'harness', 'say', 'Second distinct goal', '--substrate', 'pod', '--pod-pool', 'fake:3']);
+      expect(forwarded).toEqual(['fake:3', 'fake:3']);
+      expect(receivedGoals).toEqual(['First distinct goal', 'Second distinct goal']);
+      const third = runSelfOrchestrateCliCommand({
+        goals: [{ feature: 'Third distinct goal' }], concurrency: 1, runtime: { spawn: (input) => {
+          const job = spawn({ ...input, signal: controllers[2]!.signal });
+          jobs.push(job);
+          return job;
+        } },
+      });
+      await waitUntil(() => applied.length === 2 && pool.admissionSnapshot().queued === 1);
+      expect(applied[0]).toContain('goal-0');
+      expect(applied[1]).toContain('goal-1');
+      expect(pool.admissionSnapshot()).toMatchObject({ active: 2, queued: 1 });
+      await Bun.sleep(10);
+      expect(applied).toHaveLength(2);
+      completed.add(applied[0]!);
+      await jobs[0]!.done;
+      await waitUntil(() => applied.length === 3);
+      expect(applied[2]).not.toContain('goal-0');
+      expect(applied[2]).not.toContain('goal-1');
+      completed.add(applied[1]!);
+      completed.add(applied[2]!);
+      await Promise.all(jobs.slice(1).map((job) => job.done));
+      expect((await third).ok).toBe(true);
+      expect((await Promise.all(runs)).every((result) => result.ok)).toBe(true);
+    } finally {
+      dispatch.mockRestore();
+      controllers.forEach((controller) => controller.abort());
+      for (const name of applied) completed.add(name);
+      await Promise.all(jobs.map((job) => job.done));
+      process.exitCode = previousExit;
+      rmSync(goal, { force: true });
+    }
+  }, 20_000);
 
   test('Pod ask with an unreadable goal still reaches Pod dispatch without falsely claiming a host recording', async () => {
     const missing = join(tmpdir(), `pod-observe-missing-${crypto.randomUUID()}.md`);
@@ -2305,4 +2617,18 @@ test('draft sweep gh calls pass env: process.env (cron minimal PATH — Bun reso
   const calls = [...source.matchAll(/execFileSync\('gh',[\s\S]*?\)\s*[;.)]/g)].map((m) => m[0]);
   expect(calls.length).toBeGreaterThan(0);
   expect(calls.filter((call) => !call.includes('env: process.env'))).toEqual([]);
+});
+
+
+test.skipIf(process.platform !== 'darwin')('macOS pid-bound handle: SIGTERM reaches the same process; a gone pid is refused (PROC1 · no pidfd on darwin)', async () => {
+  const child = spawn('sleep', ['30']);
+  await new Promise((done) => setTimeout(done, 150));
+  const handle = openHarnessProcessHandle(child.pid!);
+  const exited = new Promise((done) => child.once('exit', (_code, signal) => done(signal)));
+  handle.signal('SIGTERM');
+  handle.close();
+  expect(await exited).toBe('SIGTERM');
+  // The process is gone: a fresh handle cannot be bound and a stale one must not signal.
+  expect(() => openHarnessProcessHandle(child.pid!)).toThrow();
+  expect(() => handle.signal('SIGTERM')).toThrow();
 });

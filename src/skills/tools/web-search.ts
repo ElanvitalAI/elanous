@@ -101,7 +101,10 @@ export async function dispatchWebSearch(args: Record<string, unknown>, ctx: { si
   });
 
   const notePrefix = result.note ? `\n\n${result.note}\n` : '';
-  const output = [header, notePrefix.trim(), ...hitLines].filter(Boolean).join('\n\n');
+  const xStatus = result.xSearch === 'unavailable'
+    ? 'X search unavailable: these results do not establish reactions on X; do not cite them as X posts.'
+    : '';
+  const output = [header, xStatus, notePrefix.trim(), ...hitLines].filter(Boolean).join('\n\n');
 
   return {
     output,

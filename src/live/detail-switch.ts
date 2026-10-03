@@ -13,6 +13,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { debug } from '../debug/log.js';
+import { publishInsideEvent } from '../nexus/api/inside-events.js';
 import { prodInstanceRoot } from '../instance/resolve.js';
 
 export const LIVE_DETAIL_DEFAULT_TTL_MIN = 30;
@@ -170,6 +171,10 @@ export function emitDecision(event: DecisionEvent, opts: DetailReadOptions = {})
     ...(parentRunId ? { parentRunId } : {}),
     ...(shard ? { shard } : {}),
   });
+  publishInsideEvent({ kind: 'pty.decision', decisionKind: event.kind, what: event.what,
+    reason: event.reason, purpose: event.purpose, target: event.target,
+    ...(runId ? { runId } : {}), ...(event.phase ? { phase: event.phase } : {}),
+    ...(parentRunId ? { parentRunId } : {}), ...(shard ? { shard } : {}) });
   return true;
 }
 

@@ -33,9 +33,9 @@ export function emitNodeResult<T extends Record<string, unknown>>(result: T & { 
 }
 
 export interface CommandResult { status: number | null; stdout: string; stderr: string }
-export type CommandRunner = (command: string, args: string[], cwd?: string) => CommandResult;
-export const runCommand: CommandRunner = (command, args, cwd) => {
-  const result = spawnSync(command, args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+export type CommandRunner = (command: string, args: string[], cwd?: string, timeoutMs?: number) => CommandResult;
+export const runCommand: CommandRunner = (command, args, cwd, timeoutMs) => {
+  const result = spawnSync(command, args, { cwd, timeout: timeoutMs, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr || (result.error ? String(result.error) : '') };
 };
 

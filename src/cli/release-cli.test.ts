@@ -1,6 +1,7 @@
 import { describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { listChecklist, devVersion } from '../release-loop/checklist.js';
@@ -60,7 +61,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'run']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'cut-branch', 'run']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
@@ -239,6 +240,67 @@ describe('release run CLI', () => {
       expect([checklistCalls, graphCalls]).toEqual([0, 0]);
       expect(process.exitCode ?? 0).toBe(0);
     } finally { process.exitCode = before ?? 0; write.mockRestore(); error.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('cut-branch CLI previews a temporary remote then pushes the picked release tip', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-cut-cli-git-'));
+    const repo = join(dir, 'repo');
+    const remote = join(dir, 'remote.git');
+    const git = (cwd: string, ...args: string[]) => {
+      const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+      expect(result.status).toBe(0);
+      return result.stdout.trim();
+    };
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const previous = process.cwd();
+    try {
+      git(dir, 'init', '--bare', '-q', remote);
+      git(dir, 'init', '-q', '-b', 'main', repo);
+      git(repo, 'config', 'user.name', 'Fixture');
+      git(repo, 'config', 'user.email', 'fixture@example.invalid');
+      git(repo, 'remote', 'add', 'origin', remote);
+      writeFileSync(join(repo, 'package.json'), '{"version":"0.2.4"}\n');
+      git(repo, 'add', 'package.json');
+      git(repo, 'commit', '-q', '-m', 'cut');
+      const base = git(repo, 'rev-parse', 'HEAD');
+      writeFileSync(join(repo, 'fix.txt'), 'fix\n');
+      git(repo, 'add', 'fix.txt');
+      git(repo, 'commit', '-q', '-m', 'fix');
+      const pick = git(repo, 'rev-parse', 'HEAD');
+      git(repo, 'push', '-q', '-u', 'origin', 'main');
+      process.chdir(repo);
+      const cli = new Command(); registerReleaseCommands(cli);
+      await cli.parseAsync(['release', 'cut-branch', '--version', '0.2.4', '--base', base, '--pick', pick, '--dry-run'], { from: 'user' });
+      expect(lines).toEqual([`release/0.2.4: ${base} + ${pick} (dry-run)`]);
+      expect(git(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/0.2.4')).toBe('');
+      lines.length = 0;
+      await cli.parseAsync(['release', 'cut-branch', '--version', '0.2.4', '--base', base, '--pick', pick], { from: 'user' });
+      const tip = git(repo, 'ls-remote', '--heads', 'origin', 'refs/heads/release/0.2.4').split('\t')[0];
+      expect(tip).toMatch(/^[0-9a-f]{40}$/);
+      expect(lines).toEqual([`release/0.2.4: ${base} + ${pick}`, `release/0.2.4 → ${tip}`]);
+    } finally { process.chdir(previous); output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('--cut-commit reaches graph input in both normal and --if-ready runs, while the default stays unchanged', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-cut-cli-'));
+    mkdirSync(join(dir, 'release', '0.2.3'), { recursive: true });
+    writeFileSync(join(dir, 'release', '0.2.3', 'release.json'), JSON.stringify({ version: '0.2.3', publishedAt: 'now' }));
+    const inputs: unknown[] = [];
+    const previous = process.exitCode;
+    const output = spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const cli = new Command(); registerReleaseCommands(cli, { ledgerRoot: dir, config: { gatePodPool: 'pool' },
+        checklist: () => ({ ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] }),
+        graph: async (_path, opts) => { inputs.push(opts.input); return { status: 'done' } as never; } });
+      for (const flags of [[], ['--cut-commit', 'a'.repeat(40)], ['--if-ready', '--cut-commit', 'b'.repeat(40)]])
+        await cli.parseAsync(['release', 'run', '--version', '0.2.4', ...flags], { from: 'user' });
+      expect(inputs).toEqual([
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool' },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', cutCommit: 'a'.repeat(40) },
+        { version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', cutCommit: 'b'.repeat(40) },
+      ]);
+    } finally { output.mockRestore(); process.exitCode = previous ?? 0; rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('--dry-run --if-ready preserves the input preview without checking readiness, running the graph or writing a lock', async () => {

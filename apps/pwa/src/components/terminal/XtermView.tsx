@@ -41,7 +41,7 @@ import { dispatchTouchWheel, touchScrollAction, touchScrollLines, touchWheelLine
 import { createXtermResizeController } from '@/lib/xterm-resize-controller';
 import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
 import { createTerminalInputSender } from './terminal-input-sender';
-import { registerTerminalInput } from './terminal-input-registry';
+import { registerTerminalHistoryView, registerTerminalInput } from './terminal-input-registry';
 import { shouldClear } from './terminal-clear';
 import { clampFontSize, fontStepKey, isFocusToggleKey, readTermFocusStartDisabled, readTermFontSize, writeTermFocusStartDisabled, writeTermFontSize } from '@/lib/term-focus';
 import { useCompactMode } from '@/lib/compact-mode';
@@ -360,6 +360,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     });
     confirmInputSession = inputSender.confirmSession;
     const unregisterInput = readOnly ? null : registerTerminalInput(terminalId, inputSender.push);
+    const unregisterHistoryView = readOnly ? null : registerTerminalHistoryView(terminalId, term);
 
     // WT-A-2a — keyboard input writeback. xterm.js `onData` emits the
     // standard terminal byte sequence for every key (modifyOtherKeys
@@ -487,6 +488,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       touchHost.removeEventListener?.('touchstart', onTouchStart);
       touchHost.removeEventListener?.('touchmove', onTouchMove);
       touchHost.removeEventListener?.('touchend', onTouchEnd);
+      unregisterHistoryView?.();
       unregisterInput?.();
       inputSender.dispose();
       clearTimeout(shellCap);

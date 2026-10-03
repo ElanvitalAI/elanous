@@ -1,0 +1,19 @@
+graph_id: draft-cleanup
+loop:
+  title: Draft PR 정리
+  description: 하니스 draft 정리 제안을 기본으로 하고 live 입력일 때만 적용한다
+  trigger:
+    cron: '17 9,21 * * *'
+    events: [manual]
+version: 1
+entry_node: classify
+terminal_nodes: [done, failed]
+runner_inputs: [mode]
+nodes:
+  - { node_id: classify, kind: judge, recipe: 'cmd:classify', max_visits: 1 }
+  - { node_id: apply, kind: gate, recipe: 'cmd:apply', max_visits: 1 }
+  - { node_id: done, kind: gate, max_visits: 1 }
+  - { node_id: failed, kind: gate, max_visits: 1 }
+edges:
+  - { from: classify, on: outcome, map: { shadow: done, live: apply, fail: failed, error: failed } }
+  - { from: apply, on: outcome, map: { ok: done, fail: failed, error: failed } }

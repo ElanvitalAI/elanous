@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState } from 'react';
 import type { DaemonClient, DaemonTerminalSummary } from '@/lib/daemon-client';
 import { maskRowsForPublic } from '@/lib/live-public';
 import type { LogRow } from '@/nexus/client';
-import { PtyLiveView } from './PtyLiveView';
+import { PtyLiveViewLazy as PtyLiveView } from './PtyLiveView.lazy';
 import { agentLabel, defaultWall, intentsFor, type DecisionRow } from './pty-wall';
 
 const KIND_TEXT: Record<string, string> = { PLAN: 'text-sky-400', ROUTE: 'text-violet-400', VERIFY: 'text-amber-400', HEAL: 'text-emerald-400', ESCALATE: 'text-rose-400', SHIP: 'text-green-400' };

@@ -1,6 +1,6 @@
 // M1-1 (PLAN-friction-free-model-selection-ux-2026-05-12 · Phase 1) —
 // Resolver precedence tests. Verifies surface-override > preset >
-// persona > default.
+// profile > default.
 
 import { describe, expect, test } from 'bun:test';
 import { resolveSttTier, DEFAULT_MODEL_TIER } from '../../src/model-tier/index.js';
@@ -20,10 +20,10 @@ describe('M1-1 · resolveSttTier', () => {
     expect(r.source).toBe('default');
   });
 
-  test('persona alone → balanced default · source = "persona"', () => {
-    const r = resolveSttTier({ persona: 'casual' });
+  test('profile alone → balanced default · source = "profile"', () => {
+    const r = resolveSttTier({ profile: 'casual' });
     expect(r.tier).toBe(DEFAULT_MODEL_TIER);
-    expect(r.source).toBe('persona');
+    expect(r.source).toBe('profile');
   });
 
   test('preset alone → default tier · source = "preset" (Phase 2 catalog stub)', () => {
@@ -32,9 +32,9 @@ describe('M1-1 · resolveSttTier', () => {
     expect(r.source).toBe('preset');
   });
 
-  test('surface override wins over preset + persona', () => {
+  test('surface override wins over preset + profile', () => {
     const r = resolveSttTier({
-      persona: 'power',
+      profile: 'power',
       preset: 'casual_chat',
       voice: { stt: 'best' },
     });

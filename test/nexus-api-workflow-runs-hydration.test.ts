@@ -6,7 +6,7 @@
 // disk newest-first.
 
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -16,6 +16,7 @@ import {
   handleWorkflowRunsList,
 } from '../src/nexus/api/workflows.js';
 import type { MetaApiOpts } from '../src/nexus/api/meta-api.js';
+import { runWorkflowToCompletion, type NodeOutput, type WorkflowDefinition } from '../src/workflow-runtime/index.js';
 
 const opts: MetaApiOpts = { noAuth: true };
 
@@ -68,6 +69,57 @@ function seedRun(runId: string, body: {
   }
 }
 
+describe('runWorkflow — resume output validation without the REST handler', () => {
+  const workflow: WorkflowDefinition = {
+    name: 'resume-guard', description: 'resume guard',
+    nodes: [
+      { id: 'a', set: { fields: { value: 'first' } } },
+      { id: 'b', set: { fields: { value: 'second' } }, depends_on: ['a'] },
+      { id: 'c', set: { fields: { value: 'third' } }, depends_on: ['b'] },
+    ],
+  };
+  const deps = {
+    callLLM: async () => '',
+    runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+  };
+
+  it('fails instead of emitting workflow_done when previousOutputs is absent or missing an upstream node', async () => {
+    const incomplete: Array<Record<string, NodeOutput> | undefined> = [
+      undefined, {}, { a: { ok: true, output: 'first', durationMs: 0 } },
+    ];
+    for (const [index, previousOutputs] of incomplete.entries()) {
+      const runDir = join(tmpHome, `resume-${index}`);
+      const result = await runWorkflowToCompletion({
+        workflow, arguments: '', fromNode: 'c', mode: 'from',
+        ...(previousOutputs ? { previousOutputs } : {}),
+        runDir,
+      }, deps);
+      expect(result.ok).toBe(false);
+      expect(result.outputs).toEqual({});
+      expect(result.events.map(event => event.type)).toEqual(['workflow_start', 'workflow_failed']);
+      expect(result.events[1]).toEqual({
+        type: 'workflow_failed', error: 'source run missing upstream outputs', partial: {}, mode: 'from',
+      });
+      const persisted = JSON.parse(readFileSync(join(runDir, 'run.json'), 'utf8'));
+      expect(persisted.status).toBe('failed');
+      expect(persisted.error).toBe('source run missing upstream outputs');
+    }
+  });
+
+  it('resumes when all upstream outputs are present', async () => {
+    const result = await runWorkflowToCompletion({
+      workflow, arguments: '', fromNode: 'c', mode: 'from', artifactsDir: tmpHome,
+      previousOutputs: {
+        a: { ok: true, output: 'first', durationMs: 0 },
+        b: { ok: true, output: 'second', durationMs: 0 },
+      },
+    }, deps);
+    expect(result.ok).toBe(true);
+    expect(result.events.filter(event => event.type === 'node_start').map(event => event.nodeId)).toEqual(['c']);
+    expect(Object.keys(result.outputs)).toEqual(['a', 'b', 'c']);
+  });
+});
+
 describe('GET /v1/workflows/runs/<id> — disk fallback (Caveat #2)', () => {
   it('returns the run when only on disk (cache miss)', async () => {
     seedRun('wf-disk-001', {
@@ -97,6 +149,8 @@ describe('GET /v1/workflows/runs/<id> — disk fallback (Caveat #2)', () => {
     expect(body.events[0]?.type).toBe('workflow_start');
     expect(body.events.some(e => e.type === 'node_done' && e.nodeId === 'echo')).toBe(true);
     expect(body.events[body.events.length - 1]?.type).toBe('workflow_done');
+    expect(body).not.toHaveProperty('mode');
+    expect(body.events.every(event => !('mode' in event))).toBe(true);
   });
 
   it('returns 404 when neither memory nor disk has the runId', () => {

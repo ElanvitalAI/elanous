@@ -29,6 +29,7 @@ await restoreModuleMocksAfterAll([
   '@/voice/use-voice-controller',
   '@/voice/voice-phase-styles',
   '@/components/terminal/XtermView',
+  '@/components/terminal/XtermView.lazy',
   '@/components/terminal/TuiMirrorView',
   '@/components/terminal/TerminalControls',
   '@/components/terminal/ModifierBar',
@@ -65,6 +66,8 @@ mock.module('@/voice/use-voice-controller', () => ({
 mock.module('@/voice/voice-phase-styles', () => ({ VOICE_DOT_COLOR: { idle: '' }, VOICE_PHASE_LABEL: { idle: '' } }));
 
 mock.module('@/components/terminal/XtermView', () => ({ XtermView: stub('xterm-view') }));
+// TerminalPanel renders the lazy boundary (TERM1); stand it in with the same stub so the SSR contract still counts panes.
+mock.module('@/components/terminal/XtermView.lazy', () => ({ XtermViewLazy: stub('xterm-view') }));
 mock.module('@/components/terminal/TuiMirrorView', () => ({ TuiMirrorView: stub('tui-mirror-view') }));
 mock.module('@/components/terminal/TerminalControls', () => ({ TerminalControls: stub('terminal-controls') }));
 mock.module('@/components/terminal/ModifierBar', () => ({ ModifierBar: stub('modifier-bar') }));

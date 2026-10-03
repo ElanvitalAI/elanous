@@ -24,6 +24,7 @@ export interface ReleaseLoopConfig {
 export interface ReleaseRunInput extends ReleaseLoopConfig {
   version: string;
   previousVersion: string;
+  cutCommit?: string;
   gatePodPool: string;
 }
 
@@ -67,7 +68,7 @@ export function releaseLoopConfig(configPath = getElanousConfigDirOverride() ? j
   return raw.release?.loop ?? {};
 }
 
-export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDeps = {}): ReleaseRunInput {
+export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDeps = {}, cutCommit?: string): ReleaseRunInput {
   const config = deps.config ?? releaseLoopConfig(deps.configPath);
   const pool = config.gatePodPool;
   if (typeof pool !== 'string' || !pool.trim()) throw new Error('release.loop.gatePodPool is required before graph execution');
@@ -75,16 +76,17 @@ export function buildReleaseRunInput(version: string, deps: UnattendedReleaseDep
   return {
     ...config,
     version, previousVersion,
+    ...(cutCommit !== undefined ? { cutCommit } : {}),
     gatePodPool: pool.trim(),
   };
 }
 
 /** Fail closed at the entry boundary, before any graph node can change a release. */
 export async function runUnattendedRelease(
-  opts: { version: string; dryRun?: boolean },
+  opts: { version: string; dryRun?: boolean; cutCommit?: string },
   deps: UnattendedReleaseDeps = {},
 ): Promise<{ input: ReleaseRunInput; dryRun: boolean; state?: GraphRunState }> {
-  const input = buildReleaseRunInput(opts.version, deps);
+  const input = buildReleaseRunInput(opts.version, deps, opts.cutCommit);
   if (opts.dryRun) return { input, dryRun: true };
   const gate = (deps.checklist ?? checklistGate)(opts.version);
   if (!gate.ok) throw new Error(`release checklist blocked: ${[...gate.red, ...gate.undecided, ...gate.blocked].join(', ')}`);

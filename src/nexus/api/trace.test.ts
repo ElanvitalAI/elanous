@@ -8,6 +8,7 @@ import { LogStore, resolveLogInstanceName, type LogStoreRow } from '../../mss/lo
 import type { LogInstanceView } from '../../mss/logging/instance-registry.js';
 import type { MetaApiOpts } from './meta-api.js';
 import { buildRunTrace, buildTrace, handleTrace, handleTraceEvidence } from './trace.js';
+import { createSession } from '../../session/index.js';
 import { handleLogsQuery } from './log-fabric.js';
 import { routeRequest, type NexusHttpServerOpts } from './http-server.js';
 
@@ -95,6 +96,113 @@ describe('buildRunTrace — run projection', () => {
 });
 
 describe('authenticated trace and evidence', () => {
+  it('resolves a project filter through persisted session ownership as well as tagged rows', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'project-trace-'));
+    const previous = process.env.ELANOUS_SESSION_ROOT;
+    const store = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    try {
+      process.env.ELANOUS_SESSION_ROOT = root;
+      const assigned = createSession({ projectId: 'alpha' });
+      const plain = createSession();
+      store.insertBatch([assigned.id, plain.id, assigned.id].map((sessionId, i) => ({ rec: {
+        ts: new Date(Date.parse(ts) + i * 1000).toISOString(), category: 'decision', event: 'VERIFY', session_id: sessionId,
+        data: { runId: `run-${i}`, ...(i === 2 ? { projectId: 'beta' } : {}) },
+      }, surface: 'nexus' })));
+      const body = await handleTrace(req('/v1/trace?level=L1&projectId=alpha'), open, { store: () => store, queryLog: () => {} }).json() as { events: unknown[]; nodes: Array<{ id: string }> };
+      expect(body.events).toEqual([]);
+      expect(body.nodes.filter(n => n.id.startsWith('run:')).map(n => n.id)).toEqual([`run:${store.instance}:run-0`]);
+    } finally {
+      store.close();
+      if (previous === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+  it('filters project-tagged rows at L1 and leaves unfiltered run aggregation intact', async () => {
+    const store = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    try {
+      store.insertBatch(['alpha', 'beta', undefined].map((projectId, i) => ({
+        rec: { ts: new Date(Date.parse(ts) + i * 1000).toISOString(), category: 'decision', event: 'VERIFY',
+          data: { runId: `run-${i}`, ...(projectId ? { projectId } : {}) } }, surface: 'nexus',
+      })));
+      const deps = { store: () => store, queryLog: () => {} };
+      const filtered = await handleTrace(req('/v1/trace?level=L1&projectId=alpha'), open, deps).json() as { events: unknown[]; nodes: Array<{ id: string }> };
+      expect(filtered.events).toEqual([]);
+      expect(filtered.nodes.filter(n => n.id.startsWith('run:')).map(n => n.id)).toEqual([`run:${store.instance}:run-0`]);
+      const unfiltered = await handleTrace(req('/v1/trace?level=L1'), open, deps).json() as { events: unknown[]; nodes: Array<{ id: string }> };
+      expect(unfiltered.events).toEqual([]);
+      expect(unfiltered.nodes.filter(n => n.id.startsWith('run:'))).toHaveLength(3);
+    } finally { store.close(); }
+  });
+  it('project L0/L1 uses the complete run aggregation, not the newest row page', async () => {
+    const store = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    try {
+      const base = Date.parse(ts);
+      store.insertBatch([{ rec: { ts, category: 'decision', event: 'VERIFY', data: { runId: 'old-project', projectId: 'alpha', parentRunId: 'parent' } }, surface: 'nexus' }]);
+      store.insertBatch(Array.from({ length: 1100 }, (_, i) => ({ rec: {
+        ts: new Date(base + (i + 1) * 1000).toISOString(), category: 'decision', event: 'VERIFY',
+        data: { runId: 'new-other', projectId: 'beta' },
+      }, surface: 'nexus' })));
+      const observed: unknown[] = [];
+      const deps = { store: () => store, queryLog: (details: unknown) => observed.push(details) };
+      const l1 = await handleTrace(req('/v1/trace?level=L1&projectId=alpha'), open, deps).json() as {
+        events: unknown[]; nodes: Array<{ id: string; count: number; firstTs?: string }>;
+        edges: Array<{ source: string; target: string; kind: string }>;
+        truncated: boolean; facets: { universe: Record<string, number> };
+      };
+      expect(l1.events).toEqual([]);
+      expect(l1.nodes.find(n => n.id === `run:${store.instance}:old-project`)).toMatchObject({ count: 1, firstTs: ts });
+      expect(l1.nodes.some(n => n.id === `run:${store.instance}:new-other`)).toBe(false);
+      expect(l1.edges).toContainEqual({ source: `run:${store.instance}:parent`, target: `run:${store.instance}:old-project`, kind: 'parent' });
+      expect(l1.facets.universe).toEqual({ [store.instance]: 1 });
+      expect(l1.truncated).toBe(false);
+      const l0 = await handleTrace(req('/v1/trace?level=L0&projectId=alpha'), open, deps).json() as { events: unknown[]; nodes: Array<{ count: number }> };
+      expect(l0.events).toEqual([]);
+      expect(l0.nodes).toMatchObject([{ count: 1 }]);
+      expect(observed).toContainEqual({ stores: [store.instance], level: 'L1', count: 0, truncated: false, mode: 'runs', runs: 1 });
+    } finally { store.close(); }
+  });
+
+  it('pages L2/L3 after project ownership filtering, including older tagged and session-owned events', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'project-trace-page-'));
+    const previous = process.env.ELANOUS_SESSION_ROOT;
+    const store = new LogStore(':memory:', { instance: resolveLogInstanceName() });
+    try {
+      process.env.ELANOUS_SESSION_ROOT = root;
+      const session = createSession({ projectId: 'alpha' });
+      store.insertBatch([
+        { rec: { ts, category: 'decision', event: 'VERIFY', data: { runId: 'shared', projectId: 'alpha', what: 'tagged' } }, surface: 'nexus' },
+        { rec: { ts: new Date(Date.parse(ts) + 1000).toISOString(), category: 'decision', event: 'VERIFY', data: { runId: 'shared', sessionId: session.id, what: 'session-owned' } }, surface: 'nexus' },
+        { rec: { ts: new Date(Date.parse(ts) + 2000).toISOString(), category: 'decision', event: 'VERIFY', data: { runId: 'shared', sessionId: session.id, projectId: 'beta', what: 'explicit-other' } }, surface: 'nexus' },
+      ]);
+      store.insertBatch(Array.from({ length: 1002 }, (_, i) => ({ rec: {
+        ts: new Date(Date.parse(ts) + (i + 3) * 1000).toISOString(), category: 'decision', event: 'VERIFY',
+        data: { runId: 'shared', projectId: 'beta', what: 'newer-other' },
+      }, surface: 'nexus' })));
+      const deps = { store: () => store, queryLog: () => {} };
+      for (const level of ['L2', 'L3'] as const) {
+        const body = await handleTrace(req(`/v1/trace?level=${level}&runId=shared&projectId=alpha&limit=1`), open, deps).json() as {
+          events: Array<{ what: string; projectId?: string }>; truncated: boolean;
+        };
+        expect(body.events.map(event => event.what)).toEqual(['session-owned']);
+        expect(body.truncated).toBe(true);
+        const all = await handleTrace(req(`/v1/trace?level=${level}&runId=shared&projectId=alpha&limit=2`), open, deps).json() as {
+          events: Array<{ what: string; projectId?: string }>; truncated: boolean;
+        };
+        expect(all.events.map(event => event.what)).toEqual(['session-owned', 'tagged']);
+        expect(all.truncated).toBe(false);
+      }
+      const noRun = await handleTrace(req('/v1/trace?level=L3&projectId=alpha&limit=2'), open, deps).json() as {
+        events: Array<{ what: string }>; truncated: boolean;
+      };
+      expect(noRun.events.map(event => event.what)).toEqual(['session-owned', 'tagged']);
+      expect(noRun.truncated).toBe(false);
+    } finally {
+      store.close();
+      if (previous === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('includes quiet older runs outside the newest 1000 rows at L1 without truncating, while L3 keeps the row page', async () => {
     const store = new LogStore(':memory:', { instance: resolveLogInstanceName() });
     const base = Date.parse(ts);

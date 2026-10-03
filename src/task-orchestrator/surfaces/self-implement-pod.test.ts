@@ -506,6 +506,9 @@ test('the host detail switch reaches only matching Pod runs before expiry withou
     const baseline = podJobManifest({ name: job.metadata.name, namespace: 'elanous-test', image: 'elanous-harness:local', repoUrl: 'https://github.com/ElanvitalAI/elanous', args: ['--open-pr', '--no-supervise'], passEnv: [], deadlineSeconds: POD_JOB_DEADLINE_SECONDS, runId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID').value, parentRunId: parent, hostId: child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_HOST_ID')?.value });
     const preserved = structuredClone(job);
     preserved.spec.template.spec.containers[0].env = child.env.filter((entry: { name: string }) => entry.name !== 'ELANOUS_LIVE_DETAIL_UNTIL');
+    // POD9 execution identity annotations are launch-specific; the rest must match the baseline manifest.
+    expect(preserved.metadata.annotations?.['elanous.dev/attempt']).toBe('1');
+    delete preserved.metadata.annotations;
     expect(preserved).toEqual(baseline);
     expect(secret.stringData['env-ELANOUS_LIVE_DETAIL_UNTIL']).toBeUndefined();
     return detailEnv;
@@ -556,6 +559,16 @@ test('a host-recorded dispatch marker reaches the actual Pod Job without alterin
 describe('pod memory evidence', () => {
   const lines = [1, 2, 3, 4, 5].map((n) => `ELANOUS_MEM ${1700000000 + n} ${n * 1073741824} ${n * 1048576}:node 512:bun`);
 
+  async function waitForChildArgv(pid: number, comm: string, secret: string): Promise<void> {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const probe = Bun.spawnSync(['/bin/ps', '-p', String(pid), '-o', 'comm=,args=']);
+      const argv = probe.stdout.toString();
+      if (probe.exitCode === 0 && argv.trimStart().startsWith(`${comm} `) && argv.includes(secret)) return;
+      await Bun.sleep(20);
+    }
+    throw new Error(`child ${comm} argv was not observable before sampling`);
+  }
+
   test('sampler follows setup, precedes both harness routes, redacts argv and leaves exit unchanged', () => {
     for (const goalDoc of [undefined, 'GOAL.md']) {
       const manifest = podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60, ...(goalDoc ? { goalDoc } : {}) }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } };
@@ -600,7 +613,7 @@ describe('pod memory evidence', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
-  test('real child argv is redacted inside the generated sampler before it crosses the Pod boundary', () => {
+  test('real child argv is redacted inside the generated sampler before it crosses the Pod boundary', async () => {
     const script = (podJobManifest({ name: 'j', namespace: 'n', image: 'i', repoUrl: 'r', args: [], passEnv: [], deadlineSeconds: 60 }) as { spec: { template: { spec: { containers: Array<{ args: string[] }> } } } }).spec.template.spec.containers[0]!.args[0]!;
     const sampler = script.split('\n').find((line) => line.startsWith('(while :; do { mem='))!;
     const root = mkdtempSync(join(tmpdir(), 'pod-mem-argv-'));
@@ -614,6 +627,7 @@ describe('pod memory evidence', () => {
       const command = `sleep 30 --api_key short-secret --api-key ${token} GITHUB_TOKEN=${gh} --password pass-short --secret secret-short --token token-short Bearer bearer-short SERVICE_KEY=key-short SERVICE_SECRET=secret-value SERVICE_PASSWORD=password-value ${hex}`;
       const child = Bun.spawn(['bash', '-c', `exec -a ${JSON.stringify(command)} /bin/sleep 30`], { stdout: 'ignore', stderr: 'ignore' });
       try {
+        await waitForChildArgv(child.pid, 'sleep', 'short-secret');
         const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
         expect(run.exitCode).toBe(0);
         const raw = run.stdout.toString();
@@ -643,7 +657,7 @@ describe('pod memory evidence', () => {
       chmodSync(join(root, 'ps'), 0o755);
       const child = Bun.spawn(['/bin/bash', '-c', 'sleep 30 & wait', 'bun', '--api_key', secret], { stdout: 'ignore', stderr: 'ignore' });
       try {
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await waitForChildArgv(child.pid, 'bash', secret);
         const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
         expect(run.exitCode).toBe(0);
         const raw = run.stdout.toString();
@@ -665,7 +679,7 @@ describe('pod memory evidence', () => {
       chmodSync(join(root, 'ps'), 0o755);
       const child = Bun.spawn(['/bin/bash', '-c', 'while :; do sleep 1; done # short secret'], { stdout: 'ignore', stderr: 'ignore' });
       try {
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await waitForChildArgv(child.pid, 'bash', 'short secret');
         const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
         expect(run.exitCode).toBe(0);
         expect(parseMemSamples(run.stdout.toString())[0]?.top[0]).toMatchObject({ name: 'bash', cmd: '<redacted>' });
@@ -683,7 +697,7 @@ describe('pod memory evidence', () => {
       chmodSync(join(root, 'ps'), 0o755);
       const child = Bun.spawn(['/bin/bash', '-c', 'while :; do sleep 1; done # short secret'], { argv0: 'sleep', stdout: 'ignore', stderr: 'ignore' });
       try {
-        await new Promise((resolve) => setTimeout(resolve, 50));
+        await waitForChildArgv(child.pid, 'bash', 'short secret');
         const run = Bun.spawnSync(['sh', '-c', `${sampler.replace('sleep 15 || break', 'break')}\nwait "$mem_sampler_pid"`], { env: { ...process.env, PATH: `${root}:${process.env.PATH}`, PS_TARGET_PID: String(child.pid) } });
         expect(run.exitCode).toBe(0);
         expect(parseMemSamples(run.stdout.toString())[0]?.top[0]).toMatchObject({ name: 'bash', cmd: '<redacted>' });
@@ -789,7 +803,7 @@ describe('pod memory evidence', () => {
       expect(events[0]).toMatchObject({ event: 'oom-evidence', data: { job: podJobName('mem-oom'), memoryLimit: '32Gi', samples: parseMemSamples(jobLogs).slice(-3), logShape: { lines: 1, bytes: 6 } } });
       expect(events[0]!.data).not.toHaveProperty('logTail');
       expect((events[0]!.data.samples as unknown[])).toHaveLength(3);
-      const missing = await podSelfImplementSpawn({ kubectl: k('Failed', 'normal'), credentials: CREDS })({ feature: 'x', spaceId: 'mem-missing' }).done;
+      const missing = await podSelfImplementSpawn({ kubectl: k('Failed', 'normal'), credentials: CREDS, env: { ELANOUS_POD_MEMORY_TIER: 'high', ELANOUS_POD_MEMORY_HIGH: '16Gi' } })({ feature: 'x', spaceId: 'mem-missing' }).done;
       expect(missing.error?.message).toContain('마지막 샘플: 샘플 없음');
       expect(events[1]).toMatchObject({ event: 'oom-evidence', data: { job: podJobName('mem-missing'), memoryLimit: '16Gi', samples: [], logShape: { lines: 1, bytes: 6 } } });
       const success = await podSelfImplementSpawn({ kubectl: k('Complete', `${jobLogs}{"stage":"merged","ok":true}\n`), credentials: CREDS })({ feature: 'x', spaceId: 'mem-success' }).done;
@@ -799,11 +813,11 @@ describe('pod memory evidence', () => {
         const response = k('Failed', jobLogs)(args);
         return args.includes('logs') && args.includes('--tail=400') ? { status: 1, stdout: '', stderr: 'pod-logs-missing' } : response;
       };
-      await podSelfImplementSpawn({ kubectl: unavailable, credentials: CREDS })({ feature: 'x', spaceId: 'mem-unavailable' }).done;
+      await podSelfImplementSpawn({ kubectl: unavailable, credentials: CREDS, env: { ELANOUS_POD_MEMORY_TIER: 'high' } })({ feature: 'x', spaceId: 'mem-unavailable' }).done;
       expect(events[3]).toMatchObject({ event: 'oom-evidence', data: { logShape: null, logTailReason: 'pod-logs-missing' } });
       // 자식이 일반 출력에 비밀을 찍어도 oom-evidence 에는 그 문자열이 «어디에도» 없다.
       const secretLogs = `starting\nexport TOKEN="short secret"\nELANOUS_MEM 42 9 1:node\nlast line`;
-      await podSelfImplementSpawn({ kubectl: k('Failed', secretLogs), credentials: CREDS })({ feature: 'x', spaceId: 'mem-secret-log' }).done;
+      await podSelfImplementSpawn({ kubectl: k('Failed', secretLogs), credentials: CREDS, env: { ELANOUS_POD_MEMORY_TIER: 'high' } })({ feature: 'x', spaceId: 'mem-secret-log' }).done;
       expect(events[4]).toMatchObject({ event: 'oom-evidence', data: { logShape: { lines: 2 } } });
       expect(JSON.stringify(events[4]!.data)).not.toContain('short secret');
       expect(JSON.stringify(events[4]!.data)).not.toContain('last line');
@@ -917,6 +931,16 @@ describe('podSelfImplementSpawn', () => {
     const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, hostRegate: async () => ({ passed: false, failures: [{ step: 'test-interference', detail: 'combined fail' }], os: process.platform }) })({ feature: 'fail', spaceId: 'pod-regate-fail', autoMerge: true }).done;
     expect(r.disposition).toMatchObject({ stage: 'host-regate-failed', merged: false, ok: false });
     expect(r.exitCode).toBe(1);
+  });
+
+  test('release-path host hold leaves the PR open for OP rather than reporting a regate failure', async () => {
+    const headCommit = 'b'.repeat(40);
+    const { k } = fakeKubectl(['Complete'], JSON.stringify({ stage: 'merge-ready', ok: true, prNumber: 8, checkedHeadCommit: headCommit }));
+    const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, hostRegate: async () => ({
+      passed: false, failures: [{ step: 'release-path-hold', detail: 'OP approval required: src/release/publish.ts' }], os: process.platform,
+    }) })({ feature: 'release hold', spaceId: 'pod-release-hold', autoMerge: true }).done;
+    expect(r.disposition).toMatchObject({ stage: 'pr-opened', merged: false, ok: true });
+    expect(r.exitCode).toBe(0);
   });
 
   test('merge-ready without a checked head: no regate, no merge, one failure comment on the PR', async () => {
@@ -1609,10 +1633,11 @@ describe('podSelfImplementSpawn', () => {
       };
       try {
         const job = podJobName(`termination-${c.id}`);
-        const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_MEMORY: '24Gi' } })({ feature: 'x', spaceId: `termination-${c.id}` }).done;
-        expect(calls.filter((args) => args.includes('get') && args.includes('pods'))).toHaveLength(1);
-        expect(calls.find((args) => args.includes('get') && args.includes('pods'))).toEqual(expect.arrayContaining(['-n', 'elanous-test', '-l', `job-name=${job}`]));
-        expect(calls.find((args) => args.includes('get') && args.includes('pods'))!.join(' ')).toContain('containerStatuses[?(@.name=="child")]');
+        const r = await podSelfImplementSpawn({ kubectl: k, credentials: CREDS, env: { ELANOUS_POD_MEMORY_TIER: 'high', ELANOUS_POD_MEMORY_HIGH: '24Gi' } })({ feature: 'x', spaceId: `termination-${c.id}` }).done;
+        const childPodQueries = calls.filter((args) => args.includes('get') && args.includes('pods') && args.includes(`job-name=${job}`));
+        expect(childPodQueries).toHaveLength(1);
+        expect(childPodQueries[0]).toEqual(expect.arrayContaining(['-n', 'elanous-test', '-l', `job-name=${job}`]));
+        expect(childPodQueries[0]!.join(' ')).toContain('containerStatuses[?(@.name=="child")]');
         expect(r.exitCode).toBe(1);
         expect(r.error?.code).toBe(c.code);
         expect(r.error?.message).toContain(c.fragment);
@@ -2930,6 +2955,9 @@ fi
       const actualRunId = child.env.find((entry: { name: string }) => entry.name === 'ELANOUS_RUN_ID').value;
       const expectedHumanJob = JSON.parse(previousHumanJob.replaceAll('RUN_ID_PLACEHOLDER', actualRunId));
       expectedHumanJob.spec.template.spec.containers[0].env.splice(6, 0, { name: 'ELANOUS_HOST_ID', value: 'frozen-human-host' });
+      // POD9 adds the execution identity annotations (attempt 1 on a first launch).
+      expect(job.metadata.annotations?.['elanous.dev/attempt']).toBe('1');
+      expectedHumanJob.metadata.annotations = job.metadata.annotations;
       expect(JSON.stringify(job)).toBe(JSON.stringify(expectedHumanJob));
       expect(child.args[0]).toContain('export GH_TOKEN="$(cat /creds/gh-token)"');
       expect(human.calls.filter((call) => call.args.includes('exec') && call.args.includes('--with-token'))).toHaveLength(0);

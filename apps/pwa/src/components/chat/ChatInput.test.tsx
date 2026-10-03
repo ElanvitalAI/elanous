@@ -28,6 +28,84 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const CHAT_INPUT_SRC = readFileSync(join(HERE, 'ChatInput.tsx'), 'utf8');
 
 describe('ChatInput · seat requests', () => {
+  test('storage failure still displays replies and recovers the same browser id after remount', async () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    const originalCrypto = Object.getOwnPropertyDescriptor(globalThis, 'crypto');
+    let cookie = '';
+    let nextId = 0;
+    const ids: string[] = [];
+    const acked: string[] = [];
+    const storage = { getItem: () => { throw Error('disabled'); }, setItem: () => { throw Error('disabled'); } };
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: {
+      sessionStorage: storage, addEventListener() {}, removeEventListener() {},
+    } });
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: {
+      get cookie() { return cookie; }, set cookie(value: string) { cookie = value; },
+    } });
+    Object.defineProperty(globalThis, 'crypto', { configurable: true, value: {
+      randomUUID: () => `a0000000-0000-4000-8000-${String(++nextId).padStart(12, '0')}`,
+    } });
+    const client = {
+      listSeatRequests: async () => ({ items: [], seats: [] }),
+      listSeatAskAnswers: async (id: string) => {
+        ids.push(id);
+        return { items: [{ id: 'answer-1', text: 'CTO 답변: 완료' }] };
+      },
+      acknowledgeSeatAskAnswers: async (id: string) => { acked.push(id); },
+    };
+    const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' },
+      sessionId: '', setSessionId: () => {}, setConfig: () => {} };
+    let tree: ReturnType<typeof create> | undefined;
+    const mount = async () => { await act(async () => {
+      tree = create(<DaemonContext.Provider value={daemon}><ChatInput onSubmit={() => {}} /></DaemonContext.Provider>);
+    }); };
+    try {
+      await mount();
+      expect(tree!.root.findAllByProps({ role: 'status' }).some((node) => node.children.join('').includes('CTO 답변: 완료'))).toBe(true);
+      await act(async () => { tree!.unmount(); });
+      tree = undefined;
+      await mount();
+      expect(ids).toEqual([ids[0], ids[0]]);
+      expect(acked).toEqual([]);
+      expect(tree!.root.findAllByProps({ role: 'status' }).some((node) => node.children.join('').includes('CTO 답변: 완료'))).toBe(true);
+    } finally {
+      if (tree) await act(async () => { tree!.unmount(); });
+      if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+      else delete (globalThis as { window?: Window }).window;
+      if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument);
+      else delete (globalThis as { document?: Document }).document;
+      if (originalCrypto) Object.defineProperty(globalThis, 'crypto', originalCrypto);
+      else delete (globalThis as { crypto?: Crypto }).crypto;
+    }
+  });
+  test('CTO ask obeys disabled and in-flight submit gates', async () => {
+    const calls: string[] = [];
+    let finish!: (reply: { reply: string }) => void;
+    const client = {
+      listSeatRequests: async () => ({ items: [], seats: [] }),
+      submitSeatAsk: (text: string) => { calls.push(text); return new Promise<{ reply: string }>((resolve) => { finish = resolve; }); },
+    };
+    const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' },
+      sessionId: '', setSessionId: () => {}, setConfig: () => {} };
+    let tree!: ReturnType<typeof create>;
+    const view = (disabled: boolean) => <DaemonContext.Provider value={daemon}>
+      <ChatInput onSubmit={() => {}} disabled={disabled} />
+    </DaemonContext.Provider>;
+    await act(async () => { tree = create(view(true)); });
+    try {
+      await act(async () => { tree.root.findByType('textarea').props.onChange({ target: { value: 'CTO 에게 물어봐: 상태?' } }); });
+      const enter = async () => { await act(async () => { tree.root.findByType('textarea').props.onKeyDown({ key: 'Enter', shiftKey: false, preventDefault() {} }); }); };
+      await enter();
+      expect(calls).toHaveLength(0);
+      await act(async () => { tree.update(view(false)); });
+      await enter();
+      expect(calls).toHaveLength(1);
+      await enter();
+      expect(calls).toHaveLength(1);
+      await act(async () => { finish({ reply: '기다립니다' }); });
+    } finally { await act(async () => { tree.unmount(); }); }
+  });
   test('daemon client sends authenticated GET/POST with the request key and surfaces server errors', async () => {
     const original = globalThis.fetch;
     const calls: Array<{ url: string; init: RequestInit }> = [];

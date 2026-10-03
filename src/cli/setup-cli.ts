@@ -5,6 +5,7 @@ import { Command } from 'commander';
 import { formatDoctorReport, registerDoctorCommand, runDoctor, type DoctorOptions, type DoctorReport } from './doctor-cli.js';
 import { applyClaudePluginSetup, planClaudePluginSetup } from './claude-plugin-setup.js';
 import { recommendedSetup } from './setup-recommend.js';
+import { detectSkillCliAuth, type CliAuthStatus } from '../onboarding/cli-auth-status.js';
 import { debug } from '../debug/log.js';
 import { getUserConfig, saveUserConfig, type UserConfig } from '../user-config.js';
 
@@ -22,6 +23,7 @@ type SetupStep = {
 export interface SetupCliDeps extends DoctorOptions {
   runDoctor?: (options: DoctorOptions) => DoctorReport;
   runDoctorFix?: (args: readonly string[]) => Promise<number>;
+  detectSkillCliAuth?: typeof detectSkillCliAuth;
   readFile?: (path: string) => string;
   exists?: (path: string) => boolean;
   homeDir?: () => string;
@@ -142,10 +144,46 @@ export function formatSetupReport(doctor: DoctorReport, steps: SetupStep[], nonI
   ].join('\n');
 }
 
+const CLI_SKILLS = {
+  gh: 'github', gws: 'google-workspace', op: '1password', himalaya: 'himalaya',
+} as const;
+
+function formatCliSkillStatus(status: CliAuthStatus, enabled: boolean, reason?: string): string {
+  return `${status.cli}: found=${status.found ? 'yes' : 'no'} / enabled=${enabled ? 'yes' : 'no'} / ${enabled ? 'enabled' : `skipped (${reason ?? status.skippedReason ?? 'not authenticated'})`}`;
+}
+
+function reportCliSkills(deps: SetupCliDeps, apply: boolean): string[] {
+  const statuses = (deps.detectSkillCliAuth ?? detectSkillCliAuth)();
+  const config = (deps.getUserConfig ?? getUserConfig)();
+  const deny = new Set(config.skills.deny ?? []);
+  const allow = config.skills.allow ?? [];
+  let changed = false;
+  const lines = statuses.map((status) => {
+    const skill = CLI_SKILLS[status.cli];
+    const allowed = allow.length === 0 || allow.some((name) => name.toLowerCase() === skill);
+    if (apply) {
+      if (status.authenticated && allowed && deny.has(skill)) { deny.delete(skill); changed = true; }
+      if (!status.authenticated && !deny.has(skill)) { deny.add(skill); changed = true; }
+    }
+    const enabled = status.authenticated && allowed && !deny.has(skill);
+    return formatCliSkillStatus(status, enabled,
+      status.authenticated && !allowed ? 'excluded by skills.allow' :
+        status.authenticated && !apply && deny.has(skill) ? 'not enabled; run setup to apply' : undefined);
+  });
+  if (apply && changed) (deps.saveUserConfig ?? saveUserConfig)({
+    ...config, skills: { ...config.skills, deny: [...deny] },
+  });
+  return lines;
+}
+
 export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}): void {
   const out = deps.out ?? { log: (value: string) => console.log(value), error: (value: string) => console.error(value) };
   const setExitCode = deps.setExitCode ?? ((code: number) => { process.exitCode = code; });
   const doctorRunner = deps.runDoctor ?? runDoctor;
+  const showCliSkills = (apply: boolean) => {
+    out.log('Setup: CLI skills (public GitHub repository reads remain available without login)');
+    for (const line of reportCliSkills(deps, apply)) out.log(line);
+  };
   const isStdinTty = deps.isStdinTty ?? (() => process.stdin.isTTY === true);
   const prompt = deps.prompt ?? (async (message: string) => {
     const { createInterface } = await import('node:readline/promises');
@@ -161,6 +199,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
       const doctor = doctorRunner(deps);
       if (opts.nonInteractive) {
         out.log(formatSetupReport(doctor, setupSteps(deps), true));
+        showCliSkills(false);
         for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
         setExitCode(0);
         return;
@@ -183,6 +222,7 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
         }
       }
       out.log(formatSetupReport(doctor, steps, false));
+      showCliSkills(false);
       for (const line of recommendedSetup((deps.getUserConfig ?? getUserConfig)())) out.log(line);
       const accepted = opts.yes || (isStdinTty() && /^(?:y|yes)?$/i.test((await prompt('추천대로 켤까요? [Y/n] '))?.trim() ?? 'n'));
       if (accepted) {
@@ -197,7 +237,9 @@ export function registerSetupCommand(program: Command, deps: SetupCliDeps = {}):
           await doctorProgram.parseAsync([...args], { from: 'user' });
           return exitCode;
         });
-        setExitCode(await runDoctorFix(['doctor', '--fix', '--yes']));
+        const fixCode = await runDoctorFix(['doctor', '--fix', '--yes']);
+        showCliSkills(true);
+        setExitCode(fixCode);
         return;
       }
       setExitCode(0);

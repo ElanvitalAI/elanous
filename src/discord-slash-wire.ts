@@ -21,6 +21,7 @@ import { makeCommandRest } from './discord/slash-registry.js';
 import { normalizeInteractionPayload } from './discord/slash-router.js';
 import type { SlashCommandSchema } from './discord/slash-types.js';
 import { debug } from './debug/log.js';
+import { gateDiscordSchemas, readBotAudience } from './maturity/bot-command-maturity.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 
 const REST_BASE = 'https://discord.com/api/v10';
@@ -121,8 +122,11 @@ export function buildDiscordSlashWire(deps: DiscordSlashWireDeps): DiscordSlashW
     if (!app.id) { log('[slash] application id unresolved — skip'); return; }
     const guilds = await (await fetchImpl(`${REST_BASE}/users/@me/guilds`, auth)).json() as Array<{ id: string }>;
     const rest = makeCommandRest({ token, ...(deps.__fetchImpl ? { fetchImpl: deps.__fetchImpl } : {}) });
+    const audience = readBotAudience((deps.userConfig.raw?.discord as { commandAudience?: unknown } | undefined)?.commandAudience);
+    const { schemas, hidden } = gateDiscordSchemas(ELANOUS_SLASH_COMMANDS, audience);
+    debug.log('discord.command', 'menu-filtered', { total: ELANOUS_SLASH_COMMANDS.length, shown: schemas.length - hidden, ...audience });
     for (const g of Array.isArray(guilds) ? guilds : []) {
-      const registered = await rest.bulkOverwriteGuild(app.id, g.id, [...ELANOUS_SLASH_COMMANDS]);
+      const registered = await rest.bulkOverwriteGuild(app.id, g.id, schemas);
       log(`[slash] registered ${registered.length} commands in guild ${g.id}`);
     }
   }

@@ -6,7 +6,7 @@
  *
  * Steps: temp worktree at <sha> → `scripts/tui-sim.ts start --test` (that commit's code, the
  * repo's `.elanous-test` config so no first-run wizard) → first screen → `/help` → Esc → dump PNG
- * → stop, clean, remove worktree. Never touches the production daemon or ~/.elanous.
+ * → stop, clean → run seven PTY regression checks → remove worktree. Never touches the production daemon or ~/.elanous.
  * macOS only (the TUI PTY checks run on the mbp). One retry of the whole session → «flaky».
  *
  * Exit: 0 = pass or flaky · 1 = fail · 2 = could not run (not macOS, worktree).
@@ -15,7 +15,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { copyFileSync, existsSync, mkdtempSync, openSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { tuiChecks, tuiVerdict, type TuiCheck } from './tui-node-checks';
+import { parseTuiRegress, regressWarning, tuiChecks, tuiVerdict, type TuiCheck, type TuiRegress } from './tui-node-checks';
 
 const log = (msg: string) => process.stderr.write(`[tui-node] ${msg}\n`);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -64,6 +64,27 @@ async function session(worktree: string, stateDir: string, id: string, work: str
   }
 }
 
+export function measureTuiRegress(worktree: string, runner: typeof spawnSync = spawnSync): TuiRegress {
+  try {
+    const measured = runner('bun', ['scripts/tui-regress.ts', '--json'], {
+      cwd: worktree, encoding: 'utf8', timeout: 180_000, maxBuffer: 16 * 1024 * 1024,
+    });
+    if (measured.error) return { unmeasured: measured.error.message };
+    if (measured.status !== 0 && measured.status !== 1) {
+      return { unmeasured: `실행 종료 코드 ${measured.status ?? measured.signal ?? '없음'}: ${(measured.stderr ?? '').trim().slice(0, 200)}` };
+    }
+    return parseTuiRegress(measured.stdout ?? '');
+  } catch (error) {
+    return { unmeasured: String(error) };
+  }
+}
+
+export function tuiNodeOutput(commit: string, attempts: Array<{ checks: TuiCheck[]; png?: string }>, regress: TuiRegress, failure?: string) {
+  const last = attempts.at(-1);
+  const verdict = !last ? 'error' : tuiVerdict(last.checks) === 'fail' ? 'fail' : attempts.length > 1 ? 'flaky' : 'pass';
+  return { verdict, commit, attempts: attempts.length, checks: last?.checks ?? [], png: last?.png, regress, ...(failure ? { error: failure } : {}) };
+}
+
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const commit = argv[argv.indexOf('--commit') + 1] ?? '';
@@ -77,9 +98,12 @@ async function main(): Promise<number> {
   const worktree = join(work, 'tree');
   let attempts: Array<{ checks: TuiCheck[]; png?: string }> = [];
   let failure: string | undefined;
+  let regress: TuiRegress = { unmeasured: 'worktree를 만들지 못했다' };
+  let worktreeReady = false;
   try {
     const add = spawnSync('git', ['worktree', 'add', '--detach', worktree, commit], { cwd: repo, encoding: 'utf8' });
     if (add.status !== 0) throw new Error(`worktree add failed: ${(add.stderr ?? '').trim()}`);
+    worktreeReady = true;
     symlinkSync(join(repo, 'node_modules'), join(worktree, 'node_modules'));
     if (!existsSync(join(stateDir, 'config.json'))) log(`⚠ ${stateDir}/config.json missing — the TUI may open the first-run wizard`);
     const id = `rl-${commit.slice(0, 8)}-${Date.now().toString(36)}`;
@@ -94,20 +118,20 @@ async function main(): Promise<number> {
     log(`could not run: ${failure}`);
     attempts = [];
   } finally {
+    if (worktreeReady) regress = measureTuiRegress(worktree);
     spawnSync('git', ['worktree', 'remove', '--force', worktree], { cwd: repo });
   }
 
-  const last = attempts.at(-1);
-  const verdict = !last ? 'error' : tuiVerdict(last.checks) === 'fail' ? 'fail' : attempts.length > 1 ? 'flaky' : 'pass';
-  const out = { verdict, commit, attempts: attempts.length, checks: last?.checks ?? [], png: last?.png, ...(failure ? { error: failure } : {}) };
+  const out = tuiNodeOutput(commit, attempts, regress, failure);
   if (json) console.log(JSON.stringify(out));
   else {
-    console.log(`tui-node: ${verdict} · ${commit.slice(0, 10)} · attempts ${attempts.length}`);
+    console.log(`tui-node: ${out.verdict} · ${commit.slice(0, 10)} · attempts ${attempts.length}`);
     for (const c of out.checks) console.log(`  ${c.pass ? '✓' : '✗'} ${c.id} — ${c.detail}`);
     if (out.png) console.log(`  screen: ${out.png}`);
+    console.log(`  ${regressWarning(regress).line}`);
     if (failure) console.log(`  error: ${failure}`);
   }
-  return verdict === 'error' ? 2 : verdict === 'fail' ? 1 : 0;
+  return out.verdict === 'error' ? 2 : out.verdict === 'fail' ? 1 : 0;
 }
 
-process.exit(await main());
+if (import.meta.main) process.exit(await main());

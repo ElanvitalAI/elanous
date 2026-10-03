@@ -2,7 +2,7 @@ import { createRequire } from 'node:module';
 import { afterAll, afterEach, expect, spyOn, test } from 'bun:test';
 import * as daemonProvider from '@/components/providers/DaemonProvider';
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
-import { registerTerminalInput } from './terminal-input-registry';
+import { registerTerminalHistoryView, registerTerminalInput, type TerminalHistoryView } from './terminal-input-registry';
 import { ModifierBar } from './ModifierBar';
 
 const harness = createReactHookHarness(createRequire(import.meta.url)('react'));
@@ -37,6 +37,44 @@ test('modifier keys route the built sequence through the registered terminal and
     expect(received).toEqual(['\x1b[1;7C', '\x1b[C']);
   } finally {
     unregister();
+  }
+});
+
+test('history button is disabled without a registered xterm and carries its accessible name', () => {
+  harness.render(() => ModifierBar({ terminalId: 'modbar-absent' }));
+  const button = harness.find((element) => element.props['data-testid'] === 'modbar-history');
+  expect(button.props.disabled).toBe(true);
+  expect(button.props['aria-label']).toBe('과거 내용 보기');
+  expect(harness.textOf(button)).toBe('⇡ 기록');
+});
+
+test('history button reads the current buffer on every tap and routes to xterm or its input sender', () => {
+  const received: string[] = [];
+  const pages: number[] = [];
+  let bufferType: 'normal' | 'alternate' = 'normal';
+  const view = {
+    buffer: { get active() { return { type: bufferType }; } },
+    modes: { mouseTrackingMode: 'none' },
+    scrollPages: (count: number) => { pages.push(count); },
+  } as unknown as TerminalHistoryView;
+  const unregisterInput = registerTerminalInput('modbar-history', (data) => received.push(data));
+  try {
+    harness.render(() => ModifierBar({ terminalId: 'modbar-history' }));
+    expect(harness.find((element) => element.props['data-testid'] === 'modbar-history').props.disabled).toBe(true);
+    const unregisterView = registerTerminalHistoryView('modbar-history', view);
+    try {
+      expect(harness.find((element) => element.props['data-testid'] === 'modbar-history').props.disabled).toBe(false);
+      press('modbar-history');
+      bufferType = 'alternate';
+      press('modbar-history');
+      expect(pages).toEqual([-1]);
+      expect(received).toEqual(['\x02[\x1b[5~']);
+    } finally {
+      unregisterView();
+    }
+    expect(harness.find((element) => element.props['data-testid'] === 'modbar-history').props.disabled).toBe(true);
+  } finally {
+    unregisterInput();
   }
 });
 

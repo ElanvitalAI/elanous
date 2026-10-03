@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import type { ExternalTask } from './providers.js';
 
-export interface QueuedHook { provider: ExternalTask['external']['provider']; eventId: string; task: ExternalTask }
+export interface QueuedHook { provider: ExternalTask['external']['provider']; eventId: string; kind?: string; task: ExternalTask }
 
 export class HookQueue {
   readonly directory: string;

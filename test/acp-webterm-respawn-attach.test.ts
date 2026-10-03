@@ -1,4 +1,12 @@
 import { afterEach, expect, test, spyOn } from 'bun:test';
+import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ProjectStore } from '../src/project/project-store.js';
+import { createSession } from '../src/session/index.js';
+import { resetElanousConfigDir, setElanousConfigDir } from '../src/elanous-config-dir.js';
+import type { PreviewTerminalOpts, PreviewRegistryDeps } from '../src/preview/terminal.js';
+import type { StartOpts } from '../src/pty-shell/registry.js';
 import { ClientSideConnection, ndJsonStream } from '@agentclientprotocol/sdk';
 import { PreviewTerminal } from '../src/preview/terminal.js';
 import { runAcpServer } from '../src/acp/server.js';
@@ -15,10 +23,11 @@ afterEach(async () => {
   __resetPreviewTapRegistry();
 });
 
-async function boot() {
+async function boot(createWebTerminal?: (opts: PreviewTerminalOpts) => PreviewTerminal) {
   const bridge = createInProcessAcpBridge();
   const abort = new AbortController();
   const done = runAcpServer({
+    ...(createWebTerminal ? { createWebTerminal } : {}),
     transportFactory: async (onConnection): Promise<AcpTransportServer> => {
       void Promise.resolve(onConnection({
         readable: bridge.a.readable, writable: bridge.a.writable, peerId: 'respawn-test',
@@ -48,6 +57,45 @@ async function boot() {
   const b = (await conn.newSession({ cwd: process.cwd(), mcpServers: [] })).sessionId;
   return { conn, updates, a, b };
 }
+
+test('conversation terminal/spawn forwards the project cwd to the injected PTY backend and preserves explicit cwd', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'acp-project-pty-'));
+  const previous = process.env.ELANOUS_SESSION_ROOT;
+  const starts: StartOpts[] = [];
+  try {
+    setElanousConfigDir(root);
+    process.env.ELANOUS_SESSION_ROOT = join(root, 'sessions');
+    const folder = join(root, 'project');
+    mkdirSync(folder);
+    const project = new ProjectStore(root).create({ name: 'project', primaryFolder: folder });
+    const assigned = createSession({ projectId: project.id });
+    const plain = createSession();
+    const deps: PreviewRegistryDeps = {
+      startPty: (opts) => {
+        starts.push(opts);
+        return { id: `pty-${starts.length}`, write: () => {}, resize: () => {}, kill: () => {} } as unknown as ReturnType<PreviewRegistryDeps['startPty']>;
+      },
+      onPtyEvent: () => () => {},
+      unregisterPty: () => true,
+    };
+    const { conn } = await boot((opts) => new PreviewTerminal(opts, undefined, deps));
+    expect(await conn.extMethod('terminal/spawn', { sessionId: assigned.id, terminalId: 'project-term' }))
+      .toMatchObject({ status: 'spawned' });
+    expect(starts[0]?.workdir).toBe(folder);
+    expect(await conn.extMethod('terminal/spawn', { sessionId: plain.id, terminalId: 'plain-term' }))
+      .toMatchObject({ status: 'spawned' });
+    expect(starts[1]?.workdir).toBe(process.cwd());
+    expect(await conn.extMethod('terminal/spawn', { sessionId: assigned.id, terminalId: 'explicit-term', cwd: root }))
+      .toMatchObject({ status: 'spawned' });
+    expect(starts[2]?.workdir).toBe(root);
+  } finally {
+    await stop?.(); stop = undefined;
+    __resetPreviewTapRegistry();
+    resetElanousConfigDir();
+    if (previous === undefined) delete process.env.ELANOUS_SESSION_ROOT; else process.env.ELANOUS_SESSION_ROOT = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 async function waitFor(predicate: () => boolean) {
   const until = Date.now() + 1000;

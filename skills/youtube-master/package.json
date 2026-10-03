@@ -1,0 +1,13 @@
+{
+  "name": "youtube-master",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "tsx scripts/main.ts",
+    "test": "tsx scripts/main.ts --self-test"
+  },
+  "devDependencies": {
+    "tsx": "^4"
+  }
+}

@@ -79,6 +79,18 @@ WATCH_EXIT_ANNOUNCED=0    # 종료 줄 중복 방지(INT→EXIT 로 trap 이 두
 # 「거의 비었다」로 «의심»할 자수 — 이 아래로 떨어지면 «변경»이 아니라 «의심»으로 말한다.
 BODY_MIN="${CH_BODY_MIN:-100}"
 
+# ⛔⭐ WATCH1(10-03 MK 6시간 실명): 감시자에 고정 토큰(GH_TOKEN·GITHUB_TOKEN — App 토큰은 1시간)을 넣어 띄우면
+#   만료 뒤 조회가 조용히 계속 실패한다. 읽기는 신원이 필요 없다 ⇒ 고정 토큰을 «비우고» keyring gh 인증으로 읽는다.
+#   그 토큰을 꼭 써야 하면 WATCH_KEEP_TOKEN=1 (그때도 경고 줄은 낸다).
+if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+  if [ "${WATCH_KEEP_TOKEN:-}" = "1" ]; then
+    echo "⚠️ [watch] GH_TOKEN/GITHUB_TOKEN 고정 토큰으로 읽는다(WATCH_KEEP_TOKEN=1) — 만료되면 «⛔ 조회 실패» 줄이 뜬다"
+  else
+    echo "⚠️ [watch] GH_TOKEN/GITHUB_TOKEN 이 들어 있어 비웠다 — 읽기는 keyring gh 인증으로(고정 토큰은 만료돼 감시가 눈이 먼다 · WATCH1)"
+    unset GH_TOKEN GITHUB_TOKEN
+  fi
+fi
+
 CMD="ensure"
 TRACK=""
 ADOPT_PID=""

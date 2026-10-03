@@ -15,6 +15,22 @@ export interface StewardCardDeps {
   now?: () => Date;
 }
 
+/** Record the first intake for each polled issue, independently of LLM triage. */
+export function recordIntakeOnCards(store: StewardCardStore, issues: TriageIssue[], now: () => Date = () => new Date()): void {
+  for (const issue of issues) {
+    const card = store.createCard({ goalId: `linear:${issue.identifier}`, title: redactSecrets(issue.title) });
+    const intakeKey = `intake:${issue.identifier}`;
+    if (!card.sections.some(section => section.key === intakeKey)) {
+      const directiveSource = /^출처: (telegram|pwa|tui|cli)$/m.exec(issue.body)?.[1];
+      const directiveTime = /^시각: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)$/m.exec(issue.body)?.[1];
+      store.appendSection(card.id, {
+        key: intakeKey, owner: 'steward',
+        content: JSON.stringify({ summary: redactSecrets(issue.title), source: directiveSource ?? `linear:${issue.identifier}`, at: directiveTime ?? now().toISOString() }),
+      });
+    }
+  }
+}
+
 /** Record observe-only intake and the latest scheduled judgment without launching any work. */
 export function recordTriageOnCards(decisions: ScheduledDecision[], issues: TriageIssue[], deps: StewardCardDeps = {}): void {
   const store = deps.store ?? new CardStore(deps.root);
@@ -23,16 +39,8 @@ export function recordTriageOnCards(decisions: ScheduledDecision[], issues: Tria
     for (const decision of decisions) {
       const issue = byIssue.get(decision.issue);
       if (!issue) throw new Error(`Missing issue ${decision.issue}`);
+      recordIntakeOnCards(store, [issue], deps.now);
       const card = store.createCard({ goalId: `linear:${issue.identifier}`, title: redactSecrets(issue.title) });
-      const intakeKey = `intake:${issue.identifier}`;
-      if (!card.sections.some(section => section.key === intakeKey)) {
-        const directiveSource = /^출처: (telegram|pwa|tui|cli)$/m.exec(issue.body)?.[1];
-        const directiveTime = /^시각: (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)$/m.exec(issue.body)?.[1];
-        store.appendSection(card.id, {
-          key: intakeKey, owner: 'steward',
-          content: JSON.stringify({ summary: redactSecrets(issue.title), source: directiveSource ?? `linear:${issue.identifier}`, at: directiveTime ?? (deps.now ?? (() => new Date()))().toISOString() }),
-        });
-      }
       const { rung, dependsOn, priority, disposition, hitlReason, why, owner } = decision;
       const judgment = { rung, dependsOn, priority, disposition: rung === 'hitl' || hitlReason ? 'hitl' : disposition, hitlReason: hitlReason ?? null, why: redactSecrets(why), ...(owner ? { owner } : {}), ...(decision.capability ? { capability: decision.capability } : {}) };
       const key = `triage:${createHash('sha256').update(JSON.stringify(judgment)).digest('hex')}`;

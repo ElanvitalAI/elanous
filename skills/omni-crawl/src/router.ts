@@ -1,6 +1,6 @@
 import type { SearchEngine, CrawlDecision, RunMode } from './types.js';
 
-/** tavily 상시 사용 스위치(대표 2026-09-10 **기본 ON** · `OMNI_CRAWL_TAVILY=0` 으로 끈다).
+/** tavily 상시 사용 스위치(공식 결정 2026-09-10 **기본 ON** · `OMNI_CRAWL_TAVILY=0` 으로 끈다).
  *
  *  ⛔ 2026-08-06 엔 비용 때문에 기본 OFF(= ddg 1순위)였는데, **DDG HTML 이 차단되면
  *  웹 검색 축이 통째로 0건**이 된다(폴백 체인의 `wantedWeb` 이 ddg 를 세지 않아 보충도 안 걸림).
@@ -24,7 +24,7 @@ export interface RouterInput {
 /**
  * 역할기반 라우팅 (2026-07-06 재편 — 구독 3종 역할 분담):
  *
- *   일반 웹 검색  → tavily        (대표 2026-09-10 기본 ON · ddg 는 폴백 전용 · OMNI_CRAWL_TAVILY=0 로 역전)
+ *   일반 웹 검색  → tavily        (공식 결정 2026-09-10 기본 ON · ddg 는 폴백 전용 · OMNI_CRAWL_TAVILY=0 로 역전)
  *   뉴스          → firecrawl(sources:news)
  *   크롤/스크랩   → firecrawl     (Standard 100k·풀본문·maxAge 캐시)
  *   커뮤니티/여론 → grok          (X/레딧 유일 커버 — 여기만 사용)
@@ -82,7 +82,7 @@ export function decideCrawl(input: RouterInput): CrawlDecision {
       if (/반응|여론|실시간/i.test(text) && engines.length === 0) { engines.push('grok-community'); reasons.push('커뮤니티 검색(grok)'); }
     }
 
-    // ⛔⭐ 기본 웹 검색 엔진은 **스위치가 정한다**(대표 2026-08-06 · 기본 OFF = 무료 ddg).
+    // ⛔⭐ 기본 웹 검색 엔진은 **스위치가 정한다**(공식 결정 2026-08-06 · 기본 OFF = 무료 ddg).
     //   ⚠️ 레지스트리에서 지우지 않았으므로 `--engine tavily` 명시 호출은 스위치와 무관하게 돈다
     //   (asset-attractiveness · research-bridge 의 CLI 계약 보존).
     if (engines.length === 0) { engines = [webEngine()]; reasons.push(`기본: ${webEngine()}`); }

@@ -20,6 +20,7 @@ import { runSelfImplement, type SelfImplementResult, type SelfImplementSeams, ty
 import type { SelfDevJobResult } from './orchestrate.js';
 import type { DevHarnessDispatchArgs } from './dev-pipeline.js';
 import { debug } from '../debug/log.js';
+import { releasePathHoldComment } from './release-path-guard.js';
 import { createRepositoryReferencedFileReader } from '../self-implement/goal-file-reader.js';
 import { loadReviewerContext, reviewerContextArgs } from '../agent-substrate/self-review-cli.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE } from '../git-fs/worktree.js';
@@ -2729,6 +2730,48 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
     }
   });
 
+  it.each(['scripts/release-loop/publish.ts', 'graphs/release/loop.yaml', 'src/release-loop/manifest.ts'])(
+    'dev-pipeline refuses an injected executor merge of %s and annotates its PR', async (path) => {
+      let merged = 0;
+      const labels: string[] = [];
+      const comments: string[] = [];
+      const result = await runDevPipeline(T({ completion: 'auto-merge' }), {
+        runGit: presentRemote,
+        buildSelfImplementSeams: () => ({
+          readPrFiles: async () => [path],
+          addPrLabel: async ({ label }: { label: string }) => { labels.push(label); },
+          postPrComment: async ({ body }: { body: string }) => { comments.push(body); },
+          mergePr: async () => { merged++; return { merged: true }; },
+        } as unknown as SelfImplementSeams),
+        runSelfImplement: async ({ seams }) => {
+          const attempt = await seams.mergePr!({ number: 7, cwd: process.cwd() });
+          expect(attempt.merged).toBe(false);
+          return { ok: true, stage: 'pr-opened' } as SelfImplementResult;
+        },
+      });
+      expect(result.kind).toBe('self');
+      expect(merged).toBe(0);
+      expect(labels).toEqual(['elanous:release-path']);
+      expect(comments).toEqual([releasePathHoldComment(path)]);
+    },
+  );
+
+  it('dev-pipeline preserves the injected executor merge for an ordinary PR', async () => {
+    let merged = 0;
+    await runDevPipeline(T({ completion: 'auto-merge' }), {
+      runGit: presentRemote,
+      buildSelfImplementSeams: () => ({
+        readPrFiles: async () => ['src/ordinary.ts'],
+        mergePr: async () => { merged++; return { merged: true }; },
+      } as unknown as SelfImplementSeams),
+      runSelfImplement: async ({ seams }) => {
+        expect((await seams.mergePr!({ number: 7, cwd: process.cwd() })).merged).toBe(true);
+        return { ok: true, stage: 'merged' } as SelfImplementResult;
+      },
+    });
+    expect(merged).toBe(1);
+  });
+
   it('U4b — self completion:auto-merge 는 배선(autoMerge 전달)·unmanned 는 거부', async () => {
     let opts: SelfImplementOptions | undefined;
     await runDevPipeline(T({ completion: 'auto-merge' }), { runGit: presentRemote, runSelfImplement: async (o) => { opts = o; return selfResult; }, buildSelfImplementSeams: () => ({} as SelfImplementSeams) });
@@ -2895,7 +2938,7 @@ describe('runDevPipeline — 디스패치 라우팅(주입·무실행)', () => {
         toolReviewerRate: 0,
         streamLLM: async (_messages, _onChunk, options) => {
           calls.push({ model: options?.model, provider: options?.provider });
-          options?.onResolvedProvider?.('openai-codex');
+          options?.onResolvedProvider?.('openai-codex', 'unregistered-review-model');
           return 'VERDICT: PASS';
         },
         reviewScopeDiff: async () => 'diff --git a/changed.ts b/changed.ts\n+export const changed = true;\n',

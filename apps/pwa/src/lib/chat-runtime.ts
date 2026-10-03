@@ -4,6 +4,7 @@
  */
 
 import { cardTextFromToolOutput } from './elanous-card';
+import { contextSources, type ContextSource } from '../components/chat/context-sources';
 import type {
   AcpConnection,
   AcpFrame,
@@ -18,11 +19,15 @@ import {
 import type { FeedbackEnvelopeWire } from './feedback-envelope';
 import { parseElanousFeedbackEnvelope } from './elanous-feedback-envelope';
 import { forkSession } from './daemon-session';
+import { forkConversation, userTurns } from './chat-fork';
+import { SessionsStoreApi } from './sessions-store-api';
 import { debugLog } from './debug';
 import { fetchBudgetStatus, type BudgetStatusBody } from './budget-status';
 import type { DaemonHttpConfig } from './model-tier-sync';
 import { handleModelCommand, parseModelCommand } from './chat-model-commands';
 import { handleSessionCommand, parseSessionCommand } from './chat-session-commands';
+import { harnessAskText } from './chat-harness-ask';
+import { submitGraph } from './intake-front-door-api';
 import { isMcpAppHtmlMime } from '../../../../src/tool-runtime/mcp-app-mime';
 import { mcpResultImages, mcpAppResourceUriOf } from '../../../../src/feedback/media';
 
@@ -209,6 +214,7 @@ export function parseMcpAppPayload(rawOutput: unknown, screenUrl: string): McpAp
 }
 
 export type ChatBlock =
+  | { kind: 'harness_ask'; acceptanceId: string }
   | { kind: 'text'; text: string }
   | { kind: 'image'; src: string; mediaType: string; alt?: string }
   | {
@@ -220,6 +226,7 @@ export type ChatBlock =
       readonly endedAt?: number;
       args?: Record<string, unknown>;
       summary?: string;
+      sources?: ContextSource[];
     }
   | {
       kind: 'mcp_app';
@@ -381,6 +388,7 @@ export interface ChatMessage {
 export interface MetaResult {
   text: string; // rendered as a `meta` message
   newSessionId?: string; // if :fork or :session changes id
+  harnessAsk?: { acceptanceId: string };
 }
 
 export interface ChatRuntimeContext {
@@ -419,8 +427,10 @@ export function formatHistoryLines(
 
 export const META_COMMANDS: readonly { name: string; description: string }[] = [
   { name: 'help', description: '이 도움말 보기' },
-  { name: 'session', description: '현재 세션 ID 보기' },
-  { name: 'fork', description: '새 세션 ID 만들기' },
+  { name: 'session', description: '현재 대화 ID 보기' },
+  { name: 'fork', description: '현재 대화를 복사해 새 대화로 분기' },
+  { name: 'rewind', description: 'N개 사용자 턴 이전으로 분기 (/rewind N)' },
+  { name: 'undo', description: '마지막 사용자 턴 이전으로 분기' },
   { name: 'budget', description: '이번 달 지출과 알림 기준 보기' },
   { name: 'history', description: '최근 N개 로컬 대화 요약 (기본 10개, 역할: 앞 80자)' },
   { name: 'clear', description: '로컬 대화 기록 지우기' },
@@ -440,7 +450,7 @@ const HELP_TEXT = [
 // TUI src/chat/index.ts SLASH_COMMANDS names + aliases (not imported into the PWA bundle).
 // Recheck: bun test apps/pwa/src/lib/chat-runtime.meta.test.ts -t 'keeps the local TUI-name snapshot'
 const TUI_SLASH_NAMES = new Set([
-  'help', '?', 'resume', 'clear', 'cls', 'status', 'st',
+  'help', '?', 'resume', 'clear', 'cls', 'status', 'st', 'now',
   'remaining', 'setup', 'quit', 'q', 'exit', 'run-skill', 'rs', 'run',
   'ad', 'design', 'design-check',
   'local', 'll', 'session', 'sess', 'fork', 'rewind', 'mission',
@@ -456,9 +466,60 @@ const TUI_SLASH_NAMES = new Set([
 ]);
 const PWA_MODEL_ALIASES: Readonly<Record<string, string>> = { m: 'model', r: 'reasoning', think: 'reasoning', p: 'provider' };
 const UNSUPPORTED_TUI_SLASH_NAMES = new Set([...TUI_SLASH_NAMES].filter((name) =>
-  !META_COMMANDS.some((command) => command.name === name),
+  name !== 'harness' && !META_COMMANDS.some((command) => command.name === name),
 ));
 const LEGACY_META_SLASH_NAMES = LOCAL_META_NAMES.map((name) => `/${name}`).join(' ');
+
+async function forkFromCommand(
+  command: 'fork' | 'rewind' | 'undo',
+  args: string[],
+  ctx: ChatRuntimeContext,
+): Promise<MetaResult> {
+  const turns = userTurns(ctx.messages ?? []);
+  const fail = (outcome: string, text: string): MetaResult => {
+    debugLog('webterm.chat.fork', { command, outcome, sessionId: ctx.sessionId });
+    return { text };
+  };
+  if (command === 'fork' && args.length > 0) return fail('invalid', '쓰는 법: /fork');
+  if (command === 'undo' && args.length > 0) return fail('invalid', '쓰는 법: /undo');
+  if (command === 'rewind' && (args.length !== 1 || !/^[1-9]\d*$/.test(args[0]!))) {
+    return fail('invalid', '쓰는 법: /rewind N (양의 정수)');
+  }
+  const count = command === 'undo' ? 1 : command === 'rewind' ? Number(args[0]) : 0;
+  if (command !== 'fork' && (!Number.isSafeInteger(count) || count > turns)) {
+    return fail('out-of-range', `되돌릴 사용자 턴이 부족합니다 (${turns}개)`);
+  }
+  const result = await forkConversation(
+    new SessionsStoreApi(ctx.client),
+    ctx.sessionId,
+    command === 'fork' ? {} : { beforeUser: turns - count + 1 },
+  );
+  if (result.kind === 'error') return fail('error', `대화 분기 실패 — ${result.error}`);
+  if (result.kind === 'empty' && command !== 'fork') {
+    return fail('empty', '저장된 대화가 없어 되돌릴 수 없습니다');
+  }
+  const id = result.kind === 'forked' ? result.id : forkSession();
+  debugLog('webterm.chat.fork', {
+    command, outcome: result.kind === 'empty' ? 'empty' : 'forked',
+    sessionId: ctx.sessionId, newSessionId: id,
+    ...(command === 'fork' ? {} : { beforeUser: turns - count + 1 }),
+  });
+  return {
+    text: command === 'fork' ? `forked → new session ${id}` : `${count}개 사용자 턴 이전으로 분기했습니다 → ${id}`,
+    newSessionId: id,
+  };
+}
+
+async function submitHarnessAsk(text: string, ctx: ChatRuntimeContext): Promise<MetaResult> {
+  if (!text) return { text: '무엇을 맡길까요? /harness <한 줄>' };
+  try {
+    const { acceptanceId } = await submitGraph(ctx.client, text);
+    return { text: `하니스 접수 · ${acceptanceId.slice(0, 8)}`, harnessAsk: { acceptanceId } };
+  } catch (error) {
+    const firstLine = (error instanceof Error ? error.message : String(error)).split(/\r?\n/, 1)[0]!.slice(0, 200);
+    return { text: `하니스 접수 실패 — ${firstLine}` };
+  }
+}
 
 export const META_HANDLERS: Record<
   string,
@@ -470,6 +531,8 @@ export const META_HANDLERS: Record<
     const id = forkSession();
     return { text: `forked → new session ${id}`, newSessionId: id };
   },
+  ':rewind': async (args, ctx) => forkFromCommand('rewind', args, ctx),
+  ':undo': async (args, ctx) => forkFromCommand('undo', args, ctx),
   ':budget': async (_args, ctx) => {
     const cfg = ctx.daemon;
     if (!cfg?.baseUrl) return { text: BUDGET_UNREAD_TEXT };
@@ -490,6 +553,11 @@ export const META_HANDLERS: Record<
   ':provider': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('provider', args), ctx) }),
 };
 
+// The existing command catalog is also the legacy help snapshot; keep its enumeration stable.
+Object.defineProperty(META_HANDLERS, ':harness', {
+  value: async (args: string[], ctx: ChatRuntimeContext) => submitHarnessAsk(args.join(' '), ctx),
+});
+
 export function isMetaCommand(line: string): boolean {
   const trimmed = line.trimStart();
   if (trimmed.startsWith(':')) return true;
@@ -503,9 +571,12 @@ export async function dispatchMeta(
   ctx: ChatRuntimeContext,
 ): Promise<MetaResult | null> {
   const trimmed = line.trim();
+  const harnessText = harnessAskText(line);
+  if (harnessText !== null && !trimmed.startsWith('/')) return submitHarnessAsk(harnessText, ctx);
   if (!trimmed.startsWith(':') && !trimmed.startsWith('/')) return null;
   const [entered, ...args] = trimmed.split(/\s+/);
   if (entered.startsWith('/') && !isMetaCommand(line)) return null;
+  if (entered === '/harness' && harnessText === null) return { text: '무엇을 맡길까요? /harness <한 줄>' };
   const slash = entered.startsWith('/');
   const cmd = slash ? `:${entered.slice(1)}` : entered;
   const alias = slash && Object.hasOwn(PWA_MODEL_ALIASES, entered.slice(1))
@@ -515,8 +586,10 @@ export async function dispatchMeta(
   // slash commands use the new parser's available-values response.
   const unknownColonProviderAction = !slash && key === ':provider'
     && args.length > 0 && args[0] !== 'next' && args[0] !== 'use';
-  const handler = !unknownColonProviderAction && Object.hasOwn(META_HANDLERS, key)
-    ? META_HANDLERS[key] : undefined;
+  const handler = slash && key === ':fork'
+    ? (forkArgs: string[], forkCtx: ChatRuntimeContext) => forkFromCommand('fork', forkArgs, forkCtx)
+    : !unknownColonProviderAction && Object.hasOwn(META_HANDLERS, key)
+      ? META_HANDLERS[key] : undefined;
   if (!handler) {
     if (slash) {
       const supportedInTui = UNSUPPORTED_TUI_SLASH_NAMES.has(entered.slice(1));
@@ -696,6 +769,7 @@ export async function runChatTurnStreaming(
           (b) => b.kind === 'tool_use' && b.id === id,
         );
         const status: 'done' | 'error' = ok ? 'done' : 'error';
+        const sources = name === 'context_now' ? contextSources(rawOutput, Date.now()) : null;
         if (idx === -1) {
           // Synthesized pill counts toward the non-text gate so the
           // finalized ChatMessage still attaches `.blocks`.
@@ -708,15 +782,19 @@ export async function runChatTurnStreaming(
             startedAt: Date.now(),
             endedAt: Date.now(),
             ...(summary !== undefined ? { summary } : {}),
+            ...(sources !== null ? { sources } : {}),
           });
         } else {
           const prev = blocks[idx] as Extract<ChatBlock, { kind: 'tool_use' }>;
-          blocks[idx] = {
+          const updated = {
             ...prev,
             status,
             endedAt: Date.now(),
             ...(summary !== undefined ? { summary } : {}),
+            ...(sources !== null ? { sources } : {}),
           };
+          if (sources === null) delete updated.sources;
+          blocks[idx] = updated;
         }
         pushToolCards(blocks, rawOutput);
         if (typeof resourceUri === 'string' && resourceUri.trim().length > 0) {
@@ -935,6 +1013,7 @@ export function runChatTurnObserver(
         (b) => b.kind === 'tool_use' && b.id === id,
       );
       const status: 'done' | 'error' = ok ? 'done' : 'error';
+      const sources = name === 'context_now' ? contextSources(rawOutput, Date.now()) : null;
       if (idx === -1) {
         toolCount += 1;
         blocks.push({
@@ -945,15 +1024,19 @@ export function runChatTurnObserver(
           startedAt: Date.now(),
           endedAt: Date.now(),
           ...(summary !== undefined ? { summary } : {}),
+          ...(sources !== null ? { sources } : {}),
         });
       } else {
         const prev = blocks[idx] as Extract<ChatBlock, { kind: 'tool_use' }>;
-        blocks[idx] = {
+        const updated = {
           ...prev,
           status,
           endedAt: Date.now(),
           ...(summary !== undefined ? { summary } : {}),
+          ...(sources !== null ? { sources } : {}),
         };
+        if (sources === null) delete updated.sources;
+        blocks[idx] = updated;
       }
       pushToolCards(blocks, rawOutput);
       if (typeof resourceUri === 'string' && resourceUri.trim().length > 0) {

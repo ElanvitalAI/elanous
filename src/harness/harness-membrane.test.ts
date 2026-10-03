@@ -409,14 +409,21 @@ describe('runStagedHarnessOnSurface — 통합', () => {
   // ── G9 즉효(2026-07-25) — harness↔무인리뷰 대칭화: deploy 가 저위험 PR 에 auto-review 라벨 부착 ──────
   test('G9 autoReview + 저위험 objective → deploy 가 auto-review 라벨 부착(무인 진입)', async () => {
     let labels: string[] | undefined = ['sentinel'];
+    const added: string[] = [];
     const ux = fakeUx({ confirmAnswer: true });
     const r = await runStagedHarnessOnSurface({
       objective: '순수 유틸 함수 하나와 그 단위 테스트를 추가',
-      seams: fakeSeams({ async openPr(a: { labels?: string[] }) { labels = a.labels; return { url: 'https://pr/x', number: 7 }; } }),
+      // RELGUARD: the auto-review label goes on after the opened PR's files are checked for release paths.
+      seams: fakeSeams({
+        async openPr(a: { labels?: string[] }) { labels = a.labels; return { url: 'https://pr/x', number: 7 }; },
+        async readPrFiles() { return ['src/util.ts']; },
+        async addPrLabel(a: { label: string }) { added.push(a.label); },
+      }),
       ux, autoDrive: 'safe', autoReview: true,
     });
     expect(r.terminal).toBe('pr-opened');
-    expect(labels).toEqual(['auto-review']);   // G8 eligibility 통과 → 라벨
+    expect(labels).toBeUndefined();
+    expect(added).toEqual(['auto-review']);   // G8 eligibility 통과 → 라벨
   });
 
   test('G9 autoReview + 위험 objective(실주문/배포) → 라벨 없음(G8 자기판단 거부·fail-safe)', async () => {

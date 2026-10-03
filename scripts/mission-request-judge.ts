@@ -10,8 +10,13 @@ import { judgeMissionRequests } from '../src/mission-loop/judge.js';
 import { unknownCronFlag } from '../src/domains/cron-flag-contract.js';
 import { ensureCronNodePath } from '../src/domains/cron-path.js';
 import { registerStandaloneLogSink } from '../src/domains/standalone-log-sink.js';
+import { debug } from '../src/debug/log.js';
 
 export type CreateHarnessGoal = (goal: HarnessGoal) => Promise<void> | void;
+
+function logJudge(event: string, data: Record<string, unknown>): void {
+  try { debug.log('mission-fabric.judge', event, data); } catch { /* observation must not change a judgment */ }
+}
 
 /**
  * ⛔ 실패해도 «여기까지 본 것」을 잃지 않는다.
@@ -73,8 +78,23 @@ export async function runMissionRequestJudge(argv: readonly string[], dependenci
   };
   const authorityRoot = resolve(flag('--root') ?? join(dirname(new URL(import.meta.url).pathname), '..'));
   const result = judgeMissionRequests(authorityRoot);
+  logJudge('requests-judged', {
+    authorityRoot: result.authorityRoot, requestCatalog: result.requestCatalog,
+    catalogStatus: result.catalogStatus, requestsScanned: result.requestsScanned,
+    candidateCount: result.judgments.filter(judgment => judgment.status === 'blueprint-candidate').length,
+    invalidCount: result.invalidCount,
+  });
+  for (const judgment of result.judgments) {
+    logJudge('request-decision', {
+      file: judgment.file, status: judgment.status,
+      ...(judgment.status === 'invalid-request' ? { reasons: judgment.reasons } : {}),
+      ...(judgment.status === 'missing-capability' ? { missingCapabilities: judgment.missingCapabilities.map(capability => capability.id) } : {}),
+      ...(judgment.status === 'missing-blueprint' ? { reason: 'missing-blueprint' } : {}),
+    });
+  }
   const lines = [`📍 권위 트리: ${result.authorityRoot}`, `📍 요청 카탈로그: ${result.requestCatalog}`];
   if (result.catalogStatus === 'missing') {
+    logJudge('skipped', { reason: 'request-catalog-missing', requestCatalog: result.requestCatalog });
     const message = '⛔ 요청 카탈로그가 «없다» — 「요청 0건」이 아니라 ***디렉토리 부재***다. root 를 확인하라.';
     throw new MissionRequestJudgeError(message, [...lines, message]);
   }
@@ -91,13 +111,23 @@ export async function runMissionRequestJudge(argv: readonly string[], dependenci
     else lines.push(`✅ ${judgment.file} ⇒ 스키마 통과 · 능력 ${judgment.capabilityCount}개`, '   🟢 블루프린트 «후보» 있음 → 검증 ⑴~⑷');
   }
   lines.push(`📏 훑은 ${result.requestsScanned} · invalid ${result.invalidCount}`);
-  if (!argv.includes('--tick')) return lines;
+  if (!argv.includes('--tick')) {
+    logJudge('skipped', { reason: 'tick-not-requested' });
+    return lines;
+  }
 
   const cycle = dependencies.runCompositeCycle
     ? await dependencies.runCompositeCycle(authorityRoot)
     : await runCompositeCycle(authorityRoot, { createHarnessGoal: dependencies.createHarnessGoal ?? createHarnessGoal });
   lines.push(`🔁 복합 회차 ${cycle.actions.length}건`);
+  if (cycle.actions.length === 0) logJudge('skipped', { reason: 'no-cycle-actions' });
   for (const action of cycle.actions) {
+    logJudge('cycle-decision', {
+      requestId: action.requestId, action: action.action,
+      ...(action.action === 'escalated' || action.action === 'ignored' ? { reason: action.reason } : {}),
+      ...(action.action === 'goal-created' ? { paths: action.goal.paths } : {}),
+      ...(action.action === 'executed' ? { fileDelivery: action.fileDelivery.status } : {}),
+    });
     if (action.action === 'executed') {
       const delivery = action.fileDelivery.status === 'persisted'
         ? `file-delivery persisted · ${action.fileDelivery.path} · ${action.fileDelivery.bytes} bytes`
