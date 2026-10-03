@@ -732,6 +732,149 @@ See also: [Commands you will use](/using-elanous/commands) · [Troubleshooting](
 
 ---
 
+# Drive elanous from your coding agent
+
+Source: https://docs.elanous.ai/using-elanous/drive-from-a-coding-agent/
+
+A coding agent that speaks MCP can drive elanous — the steps below use Claude Code and Codex as examples. Once connected, the agent can check what elanous is running, read its logs, and hand it a change to build. Decisions that need you are answered from the elanous CLI.
+
+This page walks through the whole loop: connect, observe, launch a goal, answer a decision. Every command below was run end to end, first with Claude Code and then with Codex, against a throwaway elanous setup.
+
+## What you get
+
+| From your agent | MCP tool | What it does |
+|---|---|---|
+| "What is elanous running?" | `ops_status` | Snapshot or health check of missions, tasks, loops and schedules (read-only) |
+| "Why did that fail?" | `logs_query` | Recent logs from every surface, filtered by level, category or time window (read-only) |
+| "Build this for me." | `SelfImplement` | Starts the harness: goal → isolated worktree → tests → review → draft pull request |
+| Context about the machine | `ContextBootstrap`, `ContextSessionsList`, `ContextPtysList` | Workspace, sessions and terminals elanous can see |
+
+The server exposes more tools (terminals, tasks, skills). Ask your agent to list them, or use `ContextToolsList`.
+
+## 1. Register the server
+
+elanous ships a stdio MCP server: `elanous mcp serve`.
+
+**Claude Code**
+
+```bash
+claude mcp add elanous -- elanous mcp serve
+```
+
+**Codex** — add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.elanous]
+command = "elanous"
+args = ["mcp", "serve"]
+# Let these elanous tools run without a prompt in `codex exec`.
+default_tools_approval_mode = "approve"
+enabled_tools = ["ops_status", "logs_query", "SelfImplement"]
+```
+
+`codex exec` runs with approvals set to "never". Without `default_tools_approval_mode`, every elanous call fails as "approval required". Keep `enabled_tools` short, so only the tools you mean to allow run unattended.
+
+## 2. Try it safely first
+
+Point the server at a throwaway config and state directory, and turn on observe-only. In observe-only mode, `SelfImplement` records the request and returns, without creating a worktree or a pull request.
+
+```bash
+mkdir -p /tmp/elanous-try/cfg /tmp/elanous-try/state
+export ELANOUS_STATE_DIR=/tmp/elanous-try/state
+elanous --config-dir /tmp/elanous-try/cfg where --json      # "kind" must not be your real setup
+elanous --config-dir /tmp/elanous-try/cfg config set tools.selfImplement.observeOnly true
+```
+
+Then pass that setup to the agent for one run, without changing its saved configuration.
+
+**Claude Code** — a one-off MCP config file (`try-mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "elanous": {
+      "type": "stdio",
+      "command": "elanous",
+      "args": ["--config-dir", "/tmp/elanous-try/cfg", "mcp", "serve"],
+      "env": { "ELANOUS_STATE_DIR": "/tmp/elanous-try/state" }
+    }
+  }
+}
+```
+
+```bash
+claude -p "Call ops_status (snapshot), then SelfImplement with feature 'Add a --json flag to a hello command', then logs_query for the last 10 minutes. Report each result." \
+  --mcp-config try-mcp.json --strict-mcp-config \
+  --allowedTools "mcp__elanous__ops_status,mcp__elanous__SelfImplement,mcp__elanous__logs_query"
+```
+
+**Codex** — override the server for this run only with `-c`:
+
+```bash
+codex exec --skip-git-repo-check -s read-only \
+  -c 'mcp_servers.elanous.command="elanous"' \
+  -c 'mcp_servers.elanous.args=["--config-dir","/tmp/elanous-try/cfg","mcp","serve"]' \
+  -c 'mcp_servers.elanous.env={ELANOUS_STATE_DIR="/tmp/elanous-try/state"}' \
+  -c 'mcp_servers.elanous.default_tools_approval_mode="approve"' \
+  -c 'mcp_servers.elanous.enabled_tools=["ops_status","SelfImplement","logs_query"]' \
+  "Call ops_status (health), then SelfImplement with feature 'Add a --quiet flag to a hello command', then logs_query for the last 10 minutes. Report each result."
+```
+
+What came back in our run:
+
+- `ops_status` answered with a snapshot. Schedule health reflects the machine's real scheduler, even in a throwaway setup.
+- `SelfImplement` returned `ok: true, observed: true`: the request was recorded and nothing was built.
+- `logs_query` returned 0 entries on the very first call, because no daemon had written logs to the fresh state directory yet. Later calls returned entries.
+
+## 3. Launch a real goal
+
+When you are ready, drop the throwaway flags (use your normal setup) and ask your agent in plain words, for example "use the harness to add a --json flag to the status command". The agent calls `SelfImplement`. elanous writes the goal, builds it in its own git worktree, tests and reviews it, and opens a draft pull request. Your working tree is not touched.
+
+Prefer the terminal? The same harness is one command away: `elanous harness say "<sentence>"` (add `--dry-run` to see the plan first). See [The harness](/using-elanous/harness).
+
+## 4. Watch it
+
+Ask the agent again, in plain words:
+
+- "Is anything failing?" → `ops_status` with `action: health`
+- "What happened in the last 30 minutes?" → `logs_query` with `sinceMinutes`, `level` or `category`
+
+## 5. Answer a decision
+
+When elanous needs you (something irreversible, public, or costly), it raises a decision with a short situation, the options and a recommendation. Decisions are handled from the CLI:
+
+```bash
+elanous decisions list                       # open decisions
+elanous decisions show <id>                  # situation, options, recommendation
+elanous decisions decide <id> <option>       # record your answer
+```
+
+You can also raise one yourself, for example from a script your agent runs:
+
+```bash
+elanous decisions raise --title "Ship now or next release?" --category scope \
+  --s "The flag is drafted." --c "Shipping now skips one review round." \
+  --option "a=Ship now:Faster, less review" --option "b=Next release:One more review" \
+  --recommend b --why "Review first" --json
+```
+
+Option keys are single letters (`a`, `b`, …). In our run the decision was raised as open, then `decisions decide <id> b` closed it as decided by a human.
+
+## The other direction: elanous drives the agent
+
+MCP is how your agent drives elanous. ACP is the reverse: elanous starts Claude Code, Codex or Grok as a child agent and drives it. `elanous acp list` shows the backends this build knows; `elanous acp test --backend <id>` sends one prompt as a smoke test.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Codex says the elanous call "required approval" | Set `default_tools_approval_mode = "approve"` and `enabled_tools` for the elanous server |
+| `logs_query` returns nothing | The daemon has not written logs to this state directory yet; start it once (`elanous start`) |
+| `SelfImplement` returns `observed: true` but nothing happens | Observe-only is on: `elanous config set tools.selfImplement.observeOnly false` |
+| `decisions raise` rejects `--option` | Use single-letter keys: `a=Label:Consequence` |
+
+---
+
 # Working backwards
 
 Source: https://docs.elanous.ai/using-elanous/working-backwards/
@@ -1202,12 +1345,13 @@ A plugin is a folder of skills — and, for elanous, graphs — that you install
 
 | Pack | What it adds | Price |
 |---|---|---|
-| `elanous-basics` | Research and everyday skills: web search and crawling (`omni-crawl`), link digests (`omni-digest`), project onboarding (`project-onboarding`), a grilling interviewer (`grill-me`), photo OCR intake (`photo-intake-ocr`) | Free |
+| `elanous-basics` | Research and everyday skills: web search and crawling (`omni-crawl`), link digests (`omni-digest`), project onboarding (`project-onboarding`), a grilling interviewer (`grill-me`), photo OCR intake (`photo-intake-ocr`), Gmail and Calendar for your own account, plus Drive and Sheets reads (`google-workspace`) | Free |
 | `elanous-media` | Video skills: building videos (`video-builder`) and word-timed motion B-roll (`motion-broll`) | Free |
 | `video-broll` | The first plugin with a graph: cut word-timed motion B-roll into a talking-head video (align words → plan density → author clips with a coding agent → composite → check) | Free |
 | `elanous-hwp` | Korean HWP/HWPX documents: read to Markdown (`hwp-read`), write from templates (`hwp-write`), fill existing forms (`hwp-fill`), plus `to-md`/`from-md` step kinds for graphs | Free |
 | `job-coach` | Career coaching from an interview: job candidates matched to Korea's NCS competency units, researched courses and a report — a personal mode and an enterprise HRD mode | Free |
 | `elanous-markets` | Market research and asset analysis skills | Listed only — not published yet |
+| [`elanous-essentials`](/using-elanous/essential-skills) | Five essential skills: `youtube-master`, `omni-crawl`, `omni-digest`, `diagram-master`, `lecture-note-digitizer` — [read the guide](/using-elanous/essential-skills) | Listed only — not published yet |
 
 Some skills need a key for an outside service (for example `omni-digest` uses xAI, `photo-intake-ocr` uses Upstage, `job-coach` uses a public-data NCS service key). The pack lists these as `secret:<service>` capabilities so you see them before you install, and asks for them as connection settings — see [Connection settings](#connection-settings) below.
 
@@ -1275,6 +1419,82 @@ Every marketplace ships `index.sig` next to its `marketplace.json`: an Ed25519 s
 ## For developers
 
 To build and publish your own plugin, see [Build a plugin](/using-elanous/build-a-plugin).
+
+---
+
+# Five essential skills
+
+Source: https://docs.elanous.ai/using-elanous/essential-skills/
+
+The pack is listed but not published to the marketplace yet — the install lines work once it is published.
+
+# Five essential skills
+
+The `elanous-essentials` pack brings together five skills for research, reading, diagrams and study notes. **It is not available from the official marketplace yet.** The commands below are for use *after* publication, not a way to install it today.
+
+## What can I give each skill?
+
+| Skill | What it does | Input | Output |
+|---|---|---|---|
+| `youtube-master` | Turns a YouTube video into a transcript, summary or study note. | YouTube URL and desired depth or format | Transcript, brief/cards/detailed summary or study note in Markdown; optional web page or PDF |
+| `omni-crawl` | Searches and collects source documents across web and news engines. | Keyword, question or site URL | Deduplicated Markdown research results with source links; optional deep report |
+| `omni-digest` | Extracts and summarizes a non-YouTube link or file. | Web or X link, GitHub item, PDF, document or image | Markdown digest in essential, cards or in-depth form; optional diagram or PDF |
+| `diagram-master` | Chooses a suitable diagram engine and checks the result. | Description, data or document | Mermaid, Matplotlib, Excalidraw or SVG diagram; optional AI illustration |
+| `lecture-note-digitizer` | Combines handwritten notes and slides into a readable lecture note. | Notes, slide PDFs or images, and optional summary/transcript | Structured Markdown with diagrams, HTML and PDF |
+
+## Can I use them without API keys?
+
+Yes, but **key-free does not mean every automated script runs without a key**. Use a local agent and its available tools for the manual paths below; your agent's own model access may still have a cost. For current free allowances, consult each provider's pricing page rather than relying on a fixed limit.
+
+| Skill | No API key: available path | Bring your own key: additional path |
+|---|---|---|
+| `youtube-master` | Use public captions, or download audio with `yt-dlp` and transcribe with local `whisper`; ask the agent to summarize the text. The automatic script does **not** promise key-free summaries. | `YOUTUBE_API_KEY` for metadata, `SUPADATA_API_KEY` for captions and `XAI_API_KEY` for automated summaries. Optional `ELEVENLABS_API_KEY`, `OPENAI_API_KEY` or `GEMINI_API_KEY` for cloud transcription. |
+| `omni-crawl` | Search DuckDuckGo with `--free`; use keyless Jina Reader or local text extraction for pages. Search may fail when the service blocks access. | `TAVILY_KEY` and `FIRECRAWL_API_KEY` for search and full-page extraction; optional `XAI_API_KEY` or `APIFY_TOKEN` for other engines and `JINA_API_KEY` for Jina access. |
+| `omni-digest` | Extract text via keyless Jina Reader or local files, optionally transcribe with local `whisper` or run local OCR, then ask the agent to summarize it. The automatic summary script currently needs a key. | `XAI_API_KEY` for automated summaries; optional `BEARER_TOKEN` for X posts, `UPSTAGE_API_KEY` or `OCR_API_KEY` for OCR. |
+| `diagram-master` | Render Mermaid, Matplotlib, Excalidraw or SVG locally; extract an existing diagram from a PDF with local tools. | `GEMINI_API_KEY` (or `GOOGLE_API_KEY` where supported) for AI-generated illustrations only. |
+| `lecture-note-digitizer` | Read local notes and slides, draft Markdown and diagrams with `diagram-master`, and render HTML/PDF locally. | `GEMINI_API_KEY` or `GOOGLE_API_KEY` only if you choose AI illustrations through `diagram-master`; ordinary note/PDF creation needs no skill API key. |
+
+Keys are **optional connectors for the pack**, not bundled credentials. Configure only the services you choose, in your own environment or the installed plugin's [connection settings](/using-elanous/plugins#connection-settings); never paste key values into a skill or a shared document. For a manually obtained skill folder that expects a local `.env`, copy its `.env.example` and supply only the keys that path uses; keep that file private and out of shared packages. You can reuse a private set of keys across your local skill folders without distributing it.
+
+## Which tools do I need on my machine?
+
+Install only the tools for the path you intend to use. These are local tools; uploading a skill to a hosted app does not install them there.
+
+| Skill | Tool | Why | Where to install / command |
+|---|---|---|---|
+| `youtube-master` | Node.js (`npx tsx`) | Run its scripts | [Node.js LTS](https://nodejs.org/) |
+| `youtube-master` | `yt-dlp`, `ffmpeg` | Captionless audio download and processing | `brew install yt-dlp ffmpeg`; alternatively `pipx install yt-dlp` and [ffmpeg.org](https://ffmpeg.org/) |
+| `youtube-master` | Optional local `whisper` | Transcribe downloaded audio without a cloud key | `pipx install openai-whisper` |
+| `omni-crawl` | Node.js (`npx tsx`); optional Chrome | Run scripts; local page screenshots | [Node.js LTS](https://nodejs.org/); [Chrome](https://www.google.com/chrome/) |
+| `omni-digest` | Node.js (`npx tsx`); `ffmpeg` for video | Run scripts; extract video audio | [Node.js LTS](https://nodejs.org/); `brew install ffmpeg` or [ffmpeg.org](https://ffmpeg.org/) |
+| `omni-digest` | Optional `pdftotext`, `whisper` | Text PDFs; offline video transcription | `brew install poppler`; `pipx install openai-whisper` |
+| `diagram-master` | `uv` and Python | Local rendering | [uv installer](https://docs.astral.sh/uv/); from the installed skill's `references` folder run `uv sync` |
+| `lecture-note-digitizer` | `uv`, Python, Playwright Chromium and `diagram-master` | Diagram rendering and HTML-to-PDF conversion | [uv installer](https://docs.astral.sh/uv/); `uv run playwright install chromium`; `diagram-master` is in this pack |
+
+## How do I get the pack?
+
+**Not yet:** the official marketplace has not published `elanous-essentials`. Once it is published, use the same marketplace syntax as [Plugins](/using-elanous/plugins):
+
+```bash
+elanous plugin add elanous-essentials@elanous
+```
+
+For Codex, register the official marketplace first and then install:
+
+```bash
+codex plugin marketplace add ElanvitalAI/elanous-plugins
+codex plugin add elanous-essentials@elanous
+```
+
+Do not interpret these future install lines as a currently working download. The installed skill folders contain `SKILL.md` and any scripts the skill needs.
+
+## How do I use them in my agent?
+
+- **Claude Code:** After the pack is available, put a skill folder in `.claude/skills/<skill>/` for one project or `~/.claude/skills/<skill>/` for all projects, then ask in plain English, for example, “Summarize this YouTube link as a study note.” Claude Code reads the matching skill. Install the local tools for that skill and provide your own keys only for the keyed paths.
+- **Codex CLI:** After publication, install with the Codex commands above. The plugin's skills appear as `elanous-essentials:<skill>`; ask in plain English or name the skill. For a manually obtained skill folder, Codex also reads `~/.agents/skills/<skill>/`. The ChatGPT browser does not load local skill folders; use the Codex CLI instead.
+- **Claude desktop or web app:** You may upload a custom skill as a `.zip`, but it runs in Claude's sandbox, not on your computer. A skill that needs local tools such as `ffmpeg`, `uv` or Chrome, access to your files, or your own API keys belongs in **Claude Code** instead. An uploaded skill is not the same as installing this unpublished marketplace pack.
+
+To use the same manually obtained skill across local agents, place copies in each agent's skill directory and restart the agent. This describes folder usage, **not** an alternative claim that the unpublished marketplace pack is already downloadable.
 
 ---
 
@@ -4452,6 +4672,45 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.11
+
+Source: https://docs.elanous.ai/releases/0-2-11/
+
+## Behavior changes
+
+- Add a bounded context journal for Claude Code hooks, Codex agent missions, and harness child lifecycle events.
+- Workflow runs now support single-node execution, resuming from prior runs, and pin-required test mode.
+- Decision-card answers now resume the waiting harness run, while deadlines retain safe fallback behavior.
+- two programs writing to the same conversation at once no longer lose messages from its count or undo its project assignment; assigning a conversation to a project that does not exist now answers «not found» (404), and the dashboard suggests a project from the session folder whenever it changes.
+- The INSIDE2 live-event SSE endpoint (`GET /v1/inside/events`) streams graph, harness, seat, steward, and PTY decision updates with secret values masked.
+- Steward live mode launches eligible goals only after pre-launch duplicate, budget and location checks, while money, publishing and security decisions still require human approval.
+- Add a rate-limited diagnostics intake endpoint that stores doctor bundles in private S3 and returns a support code.
+- The elanous-basics plugin now includes a Google Workspace skill for your own Gmail and Calendar, plus Drive and Sheets reads.
+- A new elanous-essentials pack bundles five everyday skills — YouTube digests, web search and crawling, link digests, diagrams and lecture-note digitizing — each with a free path and a bring-your-own-key path.
+- `elanous harness stop <run>` now finds and stops a run that was launched from another worktree: the run is bound to its process in a per-user host registry, and the stop still checks the process start time before any signal.
+- Pod pool members can use separate registry ports, and lease checks exclude members whose in-Pod DNS lookup fails.
+- Setup automatically enables skills for signed-in `gh`, `gws`, `op`, and `himalaya` CLIs, skips unavailable or signed-out CLIs, and keeps public GitHub repository reads available without signing in.
+- Plugin make now researches the web and Aside local memory before drafting a connector, skill, and graph, and continues when research is unavailable.
+- workflows can run independent nodes in parallel (`concurrency`, default 1) and route a failed node to an `on_error` handler instead of stopping.
+- Condense a day of context events and decisions into source-linked, project-and-seat memory with correction, conflict and retirement signals.
+- Install, list and remove YAML team sets of titled personas with validated handoffs.
+- Pods have a lite tier (2 GiB) you opt into: `elanous pod run --lite` runs network-skill commands (omni-crawl, omni-digest) on a small image, and `--pod-memory lite` or a `Pod 메모리: lite` goal line gives a harness goal 2 GiB; a lite run that runs out of memory retries once on the high tier, and `pod lease status` shows lite slots.
+- `elanous graph variant <template> --plan <json> --dry-run|--run` validates a variant, saves its graph beside the run ledger, and executes the validated wiring.
+- The harness gate runs up to 30 reverse-import and HTTP-route consumer tests, including PWA tests for removed routes, and warns with the full overflow list.
+- `elanous make "<one-line request>"` classifies the request and routes it to the existing plugin maker or workflow builder, asking which to use when classification fails.
+- Isolate provider availability tests from host credentials and verify Codex-first selection with the default fallback chain.
+- Plugin make can prepare a leak-checked official-market bundle after local installation, with an optional configured signature and no publishing.
+- `elanous skills install essential --code <CODE> --email <address> --agree` installs the essential skill pack from a gift code — nothing is sent without `--agree`, existing skill folders are never overwritten, and an oversized or mismatched download is refused.
+- Asking how X reacts to something now searches X itself, so the answer cites x.com posts.
+- Delegated work now picks a default output for each task — a report, slides, a research doc or a post draft — instead of ending in a chat answer, and what was produced is recorded in one outputs list.
+- Cache successful per-member DNS checks for ten minutes under a host lock and exclude labeled DNS probe Pods from goal counts.
+- the harness launch gate no longer blocks every launch when the launch universe's config has no model chain: it judges with the built-in default chain and prints a warning, and an explicit `--child-llm-provider` counts as the chain.
+- classification calls no longer fail when no global LLM provider is configured: a role that names its own provider resolves without one, and an injected classifier transport still runs (marked unresolved).
+
+Plus 206 internal changes.
 
 ---
 

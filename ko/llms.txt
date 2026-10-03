@@ -19,12 +19,14 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 
 - [Commands you will use](https://docs.elanous.ai/using-elanous/commands/): The handful of commands that cover daily use.
 - [The harness](https://docs.elanous.ai/using-elanous/harness/): say, ask and goal documents.
+- [Drive elanous from your coding agent](https://docs.elanous.ai/using-elanous/drive-from-a-coding-agent/): Connect over MCP, check what is running, launch a goal and answer a decision — from another coding agent.
 - [Working backwards](https://docs.elanous.ai/using-elanous/working-backwards/): Write the finished result first, then turn it into a goal the harness can prove.
 - [PTY intelligence](https://docs.elanous.ai/using-elanous/pty-intelligence/): elanous drives terminals and coding agents from inside their own screens.
 - [Tasks and intake](https://docs.elanous.ai/using-elanous/tasks-and-intake/): Anything you send becomes tasks — Telegram, the web app, links, YouTube, Linear — run by the harness or an agent.
 - [Loop agents](https://docs.elanous.ai/using-elanous/loop-agents/): Work that repeats runs as loop agents you can list, start and stop.
 - [Build a loop agent](https://docs.elanous.ai/using-elanous/build-a-loop-agent/): Write your own loop agent as a graph.
 - [Plugins](https://docs.elanous.ai/using-elanous/plugins/): Skills and graphs install as plugins from a signed marketplace.
+- [Five essential skills](https://docs.elanous.ai/using-elanous/essential-skills/): What each skill does, key-free and own-key paths, tools and agent usage; the pack is listed but not published yet.
 - [Build a plugin](https://docs.elanous.ai/using-elanous/build-a-plugin/): Package and publish your own plugin.
 - [Sessions](https://docs.elanous.ai/using-elanous/sessions/): Conversation history, resume, and one-shot chat.
 - [Design systems](https://docs.elanous.ai/using-elanous/design/): Choose one of 52 bundled design systems for a web project, check pages against it with design-lint and design-gate, and optionally draw full previews with OpenDesign.
@@ -72,6 +74,7 @@ Full text of every page: https://docs.elanous.ai/llms-full.txt
 ## Releases
 
 - [0.2.4](https://docs.elanous.ai/releases/0-2-4/): PTY intelligence stage two: elanous works inside Codex and Claude Code, installs a plugin from an agent's own menu, and passes one mission along several agents.
+- [0.2.11](https://docs.elanous.ai/releases/0-2-11/): Changes in 0.2.11.
 - [0.2.10](https://docs.elanous.ai/releases/0-2-10/): Changes in 0.2.10.
 - [0.2.9](https://docs.elanous.ai/releases/0-2-9/): Changes in 0.2.9.
 - [0.2.8](https://docs.elanous.ai/releases/0-2-8/): Changes in 0.2.8.
