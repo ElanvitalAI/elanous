@@ -19,6 +19,7 @@ import type { ModalSurface } from '../display/modal-stack.js';
 import type { ContentBlock } from '../llm.js';
 import { debug } from '../debug/log.js';
 import { matchTextInputGlobalAction } from './global-actions.js';
+import { CTRL_C_ARM_MS, resolveCtrlCInInput } from './ctrl-c-in-input.js';
 import { isTextInputQuitChord } from './input-quit-chord.js';
 // P5 — leader-chord pass-through from input focus. chat.ts swallows
 // plain letters into its textarea buffer, so the resolver never sees
@@ -896,6 +897,10 @@ export async function textInput(opts: {
   let lastReportedLines = -1;
   let lineIdx = 0;   // current line
   let colIdx = lines[0]!.length;  // cursor at end of initial text
+  let ctrlCArmedAt: number | null = null;
+  let ctrlCHintTimer: ReturnType<typeof setTimeout> | null = null;
+  let ctrlCHint: string | null = null;
+  let ctrlCHintPainted = false;
 
   // KX2 — picker selection / navigation / async fetch caches live in
   // the shared state machine (chat-picker-state.ts). textInput keeps
@@ -1172,6 +1177,14 @@ export async function textInput(opts: {
       }
     }
     prevDrawnLines = visibleLines;
+
+    if (ctrlCHint) {
+      writeTerminal(ansi.moveTo(row + 2, col) + '\x1b[2K' + C.muted(truncate(ctrlCHint, width)));
+      ctrlCHintPainted = true;
+    } else if (ctrlCHintPainted) {
+      writeTerminal(ansi.moveTo(row + 2, col) + '\x1b[2K');
+      ctrlCHintPainted = false;
+    }
 
     // Cursor — its buffer line is `lineIdx`; its screen row is the
     // bottom-anchored offset within the visible window. Critically,
@@ -1468,6 +1481,11 @@ export async function textInput(opts: {
       process.exit(0);
     }
 
+    if (!(key.ctrl && (key.name === 'c' || key.name === 'ㅊ') && !key.shift && !key.alt)) {
+      ctrlCArmedAt = null;
+      ctrlCHint = null;
+    }
+
     // A bracketed-paste envelope is one atomic event. Handle it before
     // host routing so embedded newlines cannot reach a submit handler.
     if (key.name === 'paste') {
@@ -1568,6 +1586,40 @@ export async function textInput(opts: {
           drawAll();
         }
       }
+      continue;
+    }
+
+    if (key.ctrl && (key.name === 'c' || key.name === 'ㅊ') && !key.shift && !key.alt) {
+      const text = lines.join('\n');
+      const result = resolveCtrlCInInput({ text, now: Date.now(), armedAt: ctrlCArmedAt });
+      debug.log('chat.input', 'ctrl-c', { action: result.action, length: text.length });
+      ctrlCArmedAt = result.armedAt;
+      ctrlCHint = result.hint;
+      if (ctrlCHintTimer) clearTimeout(ctrlCHintTimer);
+      ctrlCHintTimer = null;
+      if (result.action === 'arm-exit') {
+        // U1a — the hint promises «one more press exits» only while that is true.
+        const armedAt = result.armedAt;
+        ctrlCHintTimer = setTimeout(() => {
+          ctrlCHintTimer = null;
+          if (ctrlCArmedAt !== armedAt) return;
+          ctrlCArmedAt = null;
+          ctrlCHint = null;
+          drawAll();
+        }, CTRL_C_ARM_MS + 50);
+        ctrlCHintTimer.unref?.();
+      }
+      if (result.action === 'exit') return submitBufferResult('/quit');
+      if (result.action === 'clear-input') {
+        lines = [''];
+        lineIdx = 0;
+        colIdx = 0;
+        historyIdx = -1;
+        savedCurrentInput = '';
+        onUserBufferEdit();
+        await picker.refresh(bufView());
+      }
+      drawAll();
       continue;
     }
 

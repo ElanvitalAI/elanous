@@ -1,6 +1,7 @@
 'use client';
 
 import { usePwaRole, writePwaRole, type PwaRole } from '@/lib/pwa-role';
+import { useShowBeta } from '@/lib/show-beta';
 
 const OPTIONS: readonly { role: PwaRole; label: string; description: string }[] = [
   { role: 'owner', label: '오너', description: '모든 화면과 운영 화면을 봅니다.' },
@@ -10,6 +11,7 @@ const OPTIONS: readonly { role: PwaRole; label: string; description: string }[] 
 
 export function PwaRolePicker() {
   const selected = usePwaRole();
+  const { showBeta, setShowBeta } = useShowBeta();
   return (
     <section aria-label="화면 역할" className="rounded-lg border border-border bg-card p-4">
       <h2 className="text-base font-semibold">화면 역할</h2>
@@ -28,6 +30,12 @@ export function PwaRolePicker() {
           </button>
         ))}
       </div>
+      {selected === 'general' && (
+        <label className="mt-4 flex items-center justify-between gap-3 border-t border-border pt-4 text-sm">
+          <span>실험 기능 켜기</span>
+          <input type="checkbox" role="switch" checked={showBeta} onChange={(event) => setShowBeta(event.currentTarget.checked)} className="h-5 w-5 accent-primary" />
+        </label>
+      )}
     </section>
   );
 }

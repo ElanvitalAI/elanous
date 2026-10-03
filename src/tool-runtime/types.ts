@@ -91,8 +91,12 @@ export interface ToolRuntimeContext {
   sessionId?: string;
   /** Session that originated this execution when it was delegated through another runtime session. */
   originSessionId?: string;
+  /** Server-verified owner principal. Never derive this from session source, tool args, or a client-declared origin. */
+  verifiedOwner?: { id: string };
   /** Server-assigned provenance; omitted on existing owner tool paths. */
   requestOrigin?: RequestOrigin;
+  /** Confirm through the originating chat's channels, not another user's global channel. */
+  confirmChannels?: import('../hitl/confirm.js').ConfirmChannel[];
 }
 
 /** Output shape the LLM layer expects back. Most tools produce

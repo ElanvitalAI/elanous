@@ -1,9 +1,12 @@
-import { afterEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { runDocs } from './docs-node.js';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const scratch: string[] = [];
 afterEach(() => { for (const dir of scratch.splice(0)) rmSync(dir, { recursive: true, force: true }); });

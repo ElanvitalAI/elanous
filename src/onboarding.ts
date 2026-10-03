@@ -1656,6 +1656,10 @@ export function needsOnboarding(cfg: UserConfig): boolean {
   return !cfg.onboarding.completed;
 }
 
+export function needsFirstRun(cfg: UserConfig): boolean {
+  return !cfg.onboarding.completed && cfg.onboarding.ready !== true;
+}
+
 /** γ (2026-04-28) · per-step wizard. Runs ONE of the 5 steps,
  *  preserving every other field. Used by:
  *

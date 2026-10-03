@@ -1,4 +1,4 @@
-import { expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, expect, spyOn, test } from 'bun:test';
 import { debug } from './debug/log.js';
 import { PROVIDERS, streamLLM, streamLLMWithTools, type LLMProvider } from './llm.js';
 
@@ -165,6 +165,10 @@ test('streamLLMWithTools preserves compatible provider/model pairs before stream
 
 // 🩸 2026-09-25 — 도구 루프 조립부가 reasoning 꺼진 adaptive 모델(claude-sonnet-5)에 temperature 를 보내 400.
 import { anthropicTemperatureField } from './llm.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
+
 test('anthropic temperature field: adaptive models never get temperature, even with thinking off', () => {
   expect(anthropicTemperatureField('claude-sonnet-5', false, undefined)).toEqual({});
   expect(anthropicTemperatureField('claude-opus-5', false, 0.7)).toEqual({});

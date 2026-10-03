@@ -1,7 +1,7 @@
 // P4 (2026-05-10) — pwa-registry unit coverage.
 
 import { spawnSync } from 'node:child_process';
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +16,9 @@ import {
   type PwaRegistryEntry,
   type PwaRegistryObservationArgs,
 } from '../src/cli/pwa-registry.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function tmpRegistry(): { path: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), 'pwa-registry-test-'));

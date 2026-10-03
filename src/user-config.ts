@@ -917,6 +917,8 @@ export interface TelegramConfig {
   kindRoles?: Record<string, string>;
   /** `#현장` 캡션에 행사 슬러그가 없을 때 쓸 기본 행사(예: `marketers-night-2026-10`). 없으면 `field-<로컬 날짜>`. */
   fieldDefaultEvent?: string;
+  /** `#현장` 영상의 기본 렌더 모드. 미지정 시 standard, 캡션의 `즉석`/`instant` 가 우선. */
+  fieldReelMode?: 'standard' | 'instant';
 }
 
 const TELEGRAM_DEFAULTS: TelegramConfig = { enabled: false, allowedUsers: [] };
@@ -982,6 +984,7 @@ const DISCORD_DEFAULTS: DiscordConfig = { enabled: false, allowedUsers: [] };
 
 export interface OnboardingConfig {
   webFirst?: boolean;
+  ready?: boolean;
   completed: boolean;
   completedAt?: string;
   version: number;
@@ -1474,6 +1477,7 @@ export function parseErrorReportsConfig(raw: unknown): ErrorReportsConfig | unde
 }
 
 export interface ChatConfig {
+  factQuestion: { maxToolTurns: number };
   /** Short questions may receive a tool-free first reply. Default true. */
   fastPath: boolean;
   conciseness: ChatConcisenessConfig;
@@ -1502,6 +1506,7 @@ const CHAT_CONCISENESS_DEFAULTS: ChatConcisenessConfig = {
 };
 
 export const CHAT_DEFAULTS: ChatConfig = {
+  factQuestion: { maxToolTurns: 6 },
   fastPath: true,
   conciseness: { ...CHAT_CONCISENESS_DEFAULTS },
   toolOutput: {
@@ -1682,6 +1687,8 @@ export interface AcpHopCapConfig {
 
 export interface AcpConfig {
   hopCap: AcpHopCapConfig;
+  /** ACP client permission response deadline (positive integer milliseconds). */
+  toolApproval: { timeoutMs: number };
   /** ACP PR reviewer and final judge backend. Absent defers to DEFAULT_REVIEW_BACKEND. */
   reviewBackend?: string;
   /** Rework agent backend. Absent defers to the driver default (codex). */
@@ -1707,7 +1714,17 @@ export interface AcpConfig {
   scrubBillingEnv: boolean;
 }
 
-const ACP_DEFAULTS: AcpConfig = { hopCap: {}, scrubBillingEnv: true };
+const ACP_DEFAULTS: AcpConfig = { hopCap: {}, toolApproval: { timeoutMs: 60_000 }, scrubBillingEnv: true };
+
+function acpApprovalTimeoutMs(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647
+    ? value : undefined;
+}
+
+function acpApprovalTimeoutEnv(): number | undefined {
+  const raw = process.env.ELANOUS_ACP_TOOL_APPROVAL_TIMEOUT_MS;
+  return raw !== undefined && /^\d+$/.test(raw) ? acpApprovalTimeoutMs(Number(raw)) : undefined;
+}
 
 // ── Plan mode config (Coding Pipeline P4 followup) ───────────────────
 //
@@ -1910,6 +1927,17 @@ function parseOpenDesignConfig(raw: unknown): OpenDesignConfig | undefined {
   if (typeof r.url === 'string' && r.url.trim()) out.url = r.url.trim();
   if (typeof r.tokenFile === 'string' && r.tokenFile.trim()) out.tokenFile = r.tokenFile.trim();
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+export function parseDiagnosticsConfig(raw: unknown): UserConfig['diagnostics'] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = (raw as Record<string, unknown>).uploadUrl;
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password) return undefined;
+    return { uploadUrl: url.href };
+  } catch { return undefined; }
 }
 
 function parseDesignConfig(raw: unknown): DesignConfig | undefined {
@@ -3440,16 +3468,27 @@ export type SeatLoopMode = 'off' | 'shadow' | 'on';
 export interface SeatLoopConfig {
   /** No seat actions by default; shadow observes without execution, on permits the seat loop to act. */
   mode: SeatLoopMode;
+  seats?: string[];
+  podPool?: string;
+  reportPr?: number;
 }
 
 export interface UserConfig {
+  /** Explicit HTTPS destination for doctor diagnostics; absent means no upload. */
+  diagnostics?: { uploadUrl?: string };
+  /** Root CLI help audience; absent or invalid means owner. */
+  cli?: { helpRole?: 'owner' | 'contributor' | 'general' };
+  /** Execution-phase HITL answer deadline; absent means 30 minutes. */
+  hitl?: { executionDeadlineMinutes?: number };
+  coo?: { linearProject?: string };
+  decisions?: { linearProjection: { enabled: boolean } };
   /** Steward and seat loops are parsed independently. An absent seat remains off. */
-  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number }; seat?: SeatLoopConfig };
+  loops?: { steward?: { mode?: 'observe' | 'act'; linearTeam?: string; roles?: Record<string, { maxConcurrent?: number }>; budget?: number; tracks?: Record<string, string>; alertAfterFailures?: number; launch?: 'off' | 'shadow' | 'live'; maxParallel?: number; podPool?: string }; seat?: SeatLoopConfig };
   /** 🔐 Pod 의 Grok API 키 과금은 명시 opt-in 만. 생략·잘못된 값은 false.
    *  budgetGate 와 같은 `harness` 객체다 — 중복 선언이면 뒤 타입이 앞을 지운다. */
-  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string };
+  harness?: { pod?: { grokApiKeyOptIn: boolean }; budgetGate?: HarnessBudgetGateConfig; defaultRepo?: string; substrate?: 'local' | 'pod'; podPool?: string; worktreeAddTimeoutSec?: number };
   /** ☸️ Pod 실행 칸 — `pool` = 기존 기본 풀(`컨텍스트[@ssh호스트][:상한]` 쉼표 · 앞이 우선). harness 실행은 인자·ELANOUS_POD_POOL·harness.podPool 다음으로 읽는다. */
-  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string };
+  pod?: { pool?: string; /** 호스트 Git 미러 디렉터리 — Pod Job 에 읽기 전용으로 마운트한다. */ hostMirror?: string; /** 원격 그라운딩 엔드포인트(호스트 nexus · tailnet 주소) — Pod 가 토큰으로 «질의→인용»만 묻는다(P13). */ groundingUrl?: string; /** 읽기 전용 Pod lease 권장에 쓰는 계정별 동시 수. */ lease?: { perAccount?: number } };
   skillRouter: SkillRouterConfig;
   llm: LLMConfig;
   skills: SkillsConfig;
@@ -3773,7 +3812,10 @@ function parseRoleLlmConfig(raw: unknown): RoleLlmConfig | undefined {
 
 function defaultConfig(): UserConfig {
   return {
-    loops: { seat: { mode: 'off' } },
+    cli: { helpRole: 'owner' },
+    coo: { linearProject: '외부 행정·큰 일 (COO)' },
+    decisions: { linearProjection: { enabled: false } },
+    loops: { seat: { mode: 'off', seats: ['MK'], podPool: 'pool-node-b@node-b:8' } },
     skillRouter: { ...SR_DEFAULTS },
     llm: { ...LLM_DEFAULTS },
     skills: skillsDefaults(),
@@ -3786,6 +3828,7 @@ function defaultConfig(): UserConfig {
     logs: { retention: { ...LOGS_DEFAULTS.retention } },
     shell: { ...SHELL_DEFAULTS },
     chat: {
+      factQuestion: { ...CHAT_DEFAULTS.factQuestion },
       fastPath: CHAT_DEFAULTS.fastPath,
       conciseness: { ...CHAT_CONCISENESS_DEFAULTS },
       toolOutput: { ...CHAT_DEFAULTS.toolOutput },
@@ -3823,7 +3866,7 @@ function defaultConfig(): UserConfig {
       iulForegroundOnStartup: false,
       order: [...VW_ORDER_DEFAULT],
     },
-    acp: { hopCap: { ...ACP_DEFAULTS.hopCap }, scrubBillingEnv: ACP_DEFAULTS.scrubBillingEnv },
+    acp: { hopCap: { ...ACP_DEFAULTS.hopCap }, toolApproval: { timeoutMs: acpApprovalTimeoutEnv() ?? ACP_DEFAULTS.toolApproval.timeoutMs }, scrubBillingEnv: ACP_DEFAULTS.scrubBillingEnv },
     lsp: cloneLspDefaults(),
     plan: { ...PLAN_DEFAULTS },
     goals: { ...GOALS_DEFAULTS },
@@ -4253,11 +4296,21 @@ function parseStewardTracks(input: unknown): Record<string, string> | undefined 
 }
 
 function parseSeatLoopsConfig(input: unknown): SeatLoopConfig {
-  if (!input || typeof input !== 'object' || Array.isArray(input)) return { mode: 'off' };
+  const defaults: SeatLoopConfig = { mode: 'off', seats: ['MK'], podPool: 'pool-node-b@node-b:8' };
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return defaults;
   const seat = (input as Record<string, unknown>).seat;
-  if (!seat || typeof seat !== 'object' || Array.isArray(seat)) return { mode: 'off' };
-  const mode = (seat as Record<string, unknown>).mode;
-  return { mode: mode === 'on' || mode === 'shadow' ? mode : 'off' };
+  if (!seat || typeof seat !== 'object' || Array.isArray(seat)) return defaults;
+  const values = seat as Record<string, unknown>;
+  const mode = values.mode;
+  return {
+    mode: mode === 'on' || mode === 'shadow' ? mode : 'off',
+    seats: Array.isArray(values.seats) && values.seats.length > 0
+      && values.seats.every((value) => typeof value === 'string' && /^(?:MK|OP|TC|UX)$/.test(value))
+      ? [...new Set(values.seats as string[])] : ['MK'],
+    podPool: typeof values.podPool === 'string' && values.podPool.trim() ? values.podPool.trim() : defaults.podPool,
+    ...(typeof values.reportPr === 'number' && Number.isSafeInteger(values.reportPr) && values.reportPr > 0
+      ? { reportPr: values.reportPr } : {}),
+  };
 }
 
 function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
@@ -4275,12 +4328,21 @@ function parseStewardLoopsConfig(input: unknown): UserConfig['loops'] {
   }
   return { steward: {
     mode: s.mode === 'act' ? 'act' : 'observe',
+    // Absent or invalid launch keys stay absent: launch.ts applies the defaults (shadow · 3 · pool-node-b@node-b:8).
+    ...(s.launch === 'off' || s.launch === 'shadow' || s.launch === 'live' ? { launch: s.launch } : {}),
+    ...(typeof s.maxParallel === 'number' && Number.isSafeInteger(s.maxParallel) && s.maxParallel > 0 ? { maxParallel: s.maxParallel } : {}),
+    ...(typeof s.podPool === 'string' && s.podPool.trim() ? { podPool: s.podPool.trim() } : {}),
     ...(typeof s.linearTeam === 'string' && s.linearTeam.trim() ? { linearTeam: s.linearTeam.trim() } : {}),
     ...(Object.keys(roles).length ? { roles } : {}),
     ...(typeof s.budget === 'number' && Number.isFinite(s.budget) && s.budget >= 0 ? { budget: s.budget } : {}),
     ...(typeof s.alertAfterFailures === 'number' && Number.isSafeInteger(s.alertAfterFailures) && s.alertAfterFailures > 0 ? { alertAfterFailures: s.alertAfterFailures } : {}),
     ...(parseStewardTracks(s.tracks) ? { tracks: parseStewardTracks(s.tracks)! } : {}),
   } };
+}
+
+export function parseCliHelpRole(raw: unknown): NonNullable<UserConfig['cli']>['helpRole'] {
+  const cli = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  return cli.helpRole === 'general' || cli.helpRole === 'contributor' ? cli.helpRole : 'owner';
 }
 
 export function buildUserConfig(path: string = defaultPath()): UserConfig {
@@ -4338,6 +4400,8 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const logsRaw = (rawObj.logs ?? {}) as Record<string, unknown>;
   const sh = (rawObj.shell ?? {}) as Record<string, unknown>;
   const chat = (rawObj.chat ?? {}) as Record<string, unknown>;
+  const chatFactQuestion = (chat.factQuestion && typeof chat.factQuestion === 'object' && !Array.isArray(chat.factQuestion))
+    ? chat.factQuestion as Record<string, unknown> : {};
   const chatConciseness = (chat.conciseness ?? {}) as Record<string, unknown>;
   const chatToolOutput = (chat.toolOutput ?? {}) as Record<string, unknown>;
   const chatAutoCompact = (chat.autoCompact ?? {}) as Record<string, unknown>;
@@ -4370,6 +4434,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
   const vw = (rawObj.vw ?? {}) as Record<string, unknown>;
   const acp = (rawObj.acp ?? {}) as Record<string, unknown>;
   const acpHopCap = (acp.hopCap ?? {}) as Record<string, unknown>;
+  const acpToolApproval = (acp.toolApproval ?? {}) as Record<string, unknown>;
   const lspRaw = (rawObj.lsp ?? {}) as Record<string, unknown>;
 
   // RFC #2161 (PLAN-config-unification-elanous-root) — `elanous nexus config
@@ -4391,11 +4456,20 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ...(typeof legacyPod.pool === 'string' && legacyPod.pool.trim() ? { pool: legacyPod.pool.trim() } : {}),
       ...(typeof legacyPod.hostMirror === 'string' && legacyPod.hostMirror.trim() ? { hostMirror: legacyPod.hostMirror.trim() } : {}),
       ...(typeof legacyPod.groundingUrl === 'string' ? { groundingUrl: legacyPod.groundingUrl } : {}),
+      lease: { perAccount: (() => {
+        const lease = legacyPod.lease && typeof legacyPod.lease === 'object' && !Array.isArray(legacyPod.lease)
+          ? (legacyPod.lease as Record<string, unknown>) : {};
+        return typeof lease.perAccount === 'number' && Number.isSafeInteger(lease.perAccount) && lease.perAccount > 0
+          ? lease.perAccount : 4;
+      })() },
     },
     harness: {
       pod: { grokApiKeyOptIn: harnessPod.grokApiKeyOptIn === true },
       ...(harness.substrate === 'local' || harness.substrate === 'pod' ? { substrate: harness.substrate } : {}),
       ...(typeof harness.podPool === 'string' && harness.podPool.trim() ? { podPool: harness.podPool.trim() } : {}),
+      ...(typeof harness.worktreeAddTimeoutSec === 'number' && Number.isSafeInteger(harness.worktreeAddTimeoutSec)
+        && harness.worktreeAddTimeoutSec > 0 && harness.worktreeAddTimeoutSec <= 2_147_483
+        ? { worktreeAddTimeoutSec: harness.worktreeAddTimeoutSec } : {}),
       ...(typeof harness.defaultRepo === 'string' && isAbsolute(harness.defaultRepo)
         ? { defaultRepo: harness.defaultRepo } : {}),
       budgetGate: parseHarnessBudgetGate(
@@ -4533,6 +4607,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
       ...(tg.poller === 'standalone' || tg.poller === 'nexus' ? { poller: tg.poller } : {}),
       ...(normalizeKindRoles(tg.kindRoles) ? { kindRoles: normalizeKindRoles(tg.kindRoles)! } : {}),
       ...(str(tg.fieldDefaultEvent) ? { fieldDefaultEvent: str(tg.fieldDefaultEvent)! } : {}),
+      ...(tg.fieldReelMode === 'instant' || tg.fieldReelMode === 'standard' ? { fieldReelMode: tg.fieldReelMode } : {}),
     },
     discord: {
       enabled: dc.enabled === true,
@@ -4593,6 +4668,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     },
     onboarding: {
       ...(typeof ob2.webFirst === 'boolean' ? { webFirst: ob2.webFirst } : {}),
+      ...(typeof ob2.ready === 'boolean' ? { ready: ob2.ready } : {}),
       completed: ob2.completed === true,
       completedAt: str(ob2.completedAt),
       version: typeof ob2.version === 'number' ? ob2.version : 0,
@@ -4640,6 +4716,11 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     },
     ...((): { errorReports?: ErrorReportsConfig } => { const er = parseErrorReportsConfig(rawObj.errorReports); return er ? { errorReports: er } : {}; })(),
     chat: {
+      factQuestion: {
+        maxToolTurns: typeof chatFactQuestion.maxToolTurns === 'number'
+          && Number.isSafeInteger(chatFactQuestion.maxToolTurns) && chatFactQuestion.maxToolTurns > 0
+          ? chatFactQuestion.maxToolTurns : CHAT_DEFAULTS.factQuestion.maxToolTurns,
+      },
       fastPath: chat.fastPath === false || chat.fastPath === 'false' ? false : CHAT_DEFAULTS.fastPath,
       conciseness: {
         enabled: chatConciseness.enabled === false ? false : CHAT_CONCISENESS_DEFAULTS.enabled,
@@ -4999,6 +5080,10 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     })(),
     acp: {
       hopCap: parseHopCap(acpHopCap),
+      toolApproval: {
+        timeoutMs: acpApprovalTimeoutMs(acpToolApproval.timeoutMs)
+          ?? acpApprovalTimeoutEnv() ?? ACP_DEFAULTS.toolApproval.timeoutMs,
+      },
       ...(typeof acp.reviewBackend === 'string' && acp.reviewBackend.trim()
         ? { reviewBackend: acp.reviewBackend.trim() }
         : {}),
@@ -5019,6 +5104,14 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     goals: parseGoalsConfig(rawObj.goals),
     registry: parseRegistryConfig(rawObj.registry),
     tools: parseToolsConfig(rawObj.tools),
+    ...(rawObj.hitl && typeof rawObj.hitl === 'object' && !Array.isArray(rawObj.hitl)
+      && typeof (rawObj.hitl as Record<string, unknown>).executionDeadlineMinutes === 'number'
+      ? { hitl: { executionDeadlineMinutes: (rawObj.hitl as { executionDeadlineMinutes: number }).executionDeadlineMinutes } }
+      : {}),
+    cli: { helpRole: parseCliHelpRole(rawObj.cli) },
+    coo: { linearProject: typeof (rawObj.coo as { linearProject?: unknown } | undefined)?.linearProject === 'string' && (rawObj.coo as { linearProject: string }).linearProject.trim()
+      ? (rawObj.coo as { linearProject: string }).linearProject.trim() : '외부 행정·큰 일 (COO)' },
+    decisions: { linearProjection: { enabled: ((rawObj.decisions as { linearProjection?: { enabled?: unknown } } | undefined)?.linearProjection?.enabled === true) } },
     loops: { ...(stewardLoops ?? {}), seat: parseSeatLoopsConfig(rawObj.loops) },
     // M1-1: sparse — undefined when the user hasn't set anything, so
     // resolvers fall through to zero-config defaults.
@@ -5028,6 +5121,7 @@ export function buildUserConfig(path: string = defaultPath()): UserConfig {
     ...spreadIfDefined('taste', parseTasteConfig(rawObj.taste)),
     ...spreadIfDefined('webSearch', parseWebSearchConfig(rawObj.webSearch)),
     ...spreadIfDefined('design', parseDesignConfig(rawObj.design)),
+    diagnostics: parseDiagnosticsConfig(rawObj.diagnostics),
     ...spreadIfDefined('budget', parseBudgetConfig(rawObj.budget)),
     ...spreadIfDefined('smartDefaults', parseSmartDefaultsConfig(rawObj.smartDefaults)),
     ...spreadIfDefined('roleModels', parseRoleModelConfig(rawObj.roleModels)),
@@ -5590,6 +5684,7 @@ export function saveUserConfig(
   delete rawRest.budget;
   delete rawRest.smartDefaults;
   delete rawRest.grounding;
+  delete rawRest.diagnostics;
   const rawHarness = rawRest.harness && typeof rawRest.harness === 'object' && !Array.isArray(rawRest.harness)
     ? rawRest.harness as Record<string, unknown> : {};
   delete rawRest.harness;
@@ -5616,7 +5711,12 @@ export function saveUserConfig(
     ...rawRest,
     ...(cfg.loops ? { loops: {
       ...rawLoops,
-      ...(cfg.loops.seat ? { seat: { mode: cfg.loops.seat.mode } } : {}),
+      ...(cfg.loops.seat ? { seat: {
+        mode: cfg.loops.seat.mode,
+        seats: cfg.loops.seat.seats ?? ['MK'],
+        podPool: cfg.loops.seat.podPool ?? 'pool-node-b@node-b:8',
+        ...(cfg.loops.seat.reportPr === undefined ? {} : { reportPr: cfg.loops.seat.reportPr }),
+      } } : {}),
     } } : {}),
     ...(cfg.autopilot ? { autopilot: {
       ...rawAutopilot,
@@ -5739,6 +5839,7 @@ export function saveUserConfig(
       //   「직렬화 드롭」으로 조용히 사라졌다 — 운영 전환 스위치를 켤 방법이 없었다(07-22 botUsername 과 같은 모양).
       poller: cfg.telegram.poller,
       fieldDefaultEvent: cfg.telegram.fieldDefaultEvent,
+      fieldReelMode: cfg.telegram.fieldReelMode,
     }),
     discord: stripUndef({
       enabled: cfg.discord.enabled,
@@ -5773,6 +5874,7 @@ export function saveUserConfig(
     }),
     onboarding: stripUndef({
       webFirst: cfg.onboarding.webFirst,
+      ready: cfg.onboarding.ready,
       completed: cfg.onboarding.completed,
       completedAt: cfg.onboarding.completedAt,
       version: cfg.onboarding.version,
@@ -5855,6 +5957,10 @@ export function saveUserConfig(
         : undefined,
       slashMaxTurns: cfg.acp.slashMaxTurns,
       editApproval: cfg.acp.editApproval ? true : undefined,
+      toolApproval: acpApprovalTimeoutMs(
+        (cfg.raw?.acp as { toolApproval?: { timeoutMs?: unknown } } | undefined)?.toolApproval?.timeoutMs,
+      ) !== undefined || cfg.acp.toolApproval.timeoutMs !== (acpApprovalTimeoutEnv() ?? ACP_DEFAULTS.toolApproval.timeoutMs)
+        ? { timeoutMs: cfg.acp.toolApproval.timeoutMs } : undefined,
       scrubBillingEnv: cfg.acp.scrubBillingEnv === false ? false : undefined,
     }),
     lsp: stripUndef({
@@ -5939,6 +6045,7 @@ export function saveUserConfig(
     ...(cfg.taste ? { taste: cfg.taste } : {}),
     ...(cfg.webSearch ? { webSearch: cfg.webSearch } : {}),
     ...(cfg.design ? { design: cfg.design } : {}),
+    ...(cfg.diagnostics?.uploadUrl ? { diagnostics: parseDiagnosticsConfig(cfg.diagnostics) } : {}),
     ...(cfg.budget ? { budget: cfg.budget } : {}),
     ...(cfg.smartDefaults ? { smartDefaults: cfg.smartDefaults } : {}),
     ...(cfg.grounding && cfg.grounding.sources.length > 0

@@ -9,13 +9,16 @@
 // the user's real ~/.elanous/config.json is untouched. (Legacy
 // ELANOUS_DAEMON_DIR env was removed in PR #2534.)
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import {
   mkdirSync, mkdtempSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 let daemonDir: string;
 let cfgPath: string;

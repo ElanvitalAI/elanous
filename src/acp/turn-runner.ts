@@ -40,6 +40,11 @@ import { unsafeBrandSessionUri } from '../mss/uri/brand.js';
 import { debug } from '../debug/log.js';
 import type { AgentStatusStore } from '../agent-status/store.js';
 import type { AcpPermissionApprover, AcpQuestionApprover } from './client.js';
+import {
+  CODEX_APPROVAL_OPT_ONCE,
+  CODEX_APPROVAL_OPT_REJECT,
+  CODEX_APPROVAL_QUESTION_ID,
+} from './codex-approval-adapter.js';
 import type { ConfirmChannel } from '../hitl/confirm.js';
 import type { QuestionChannel } from '../hitl/question.js';
 import {
@@ -69,6 +74,7 @@ import { getUserConfig } from '../user-config.js';
 // ACP `cancelled`), matching the pre-existing default-deny posture for
 // unattended turns — so nothing hangs when a surface opts out.
 const turnHitlChannels = new Map<string, ConfirmChannel[]>();
+const turnPermissionApprovers = new Map<string, AcpPermissionApprover>();
 /** Parallel registry for multi-option question channels (same keying
  *  as `turnHitlChannels`). Present ⇒ the question approver fans out
  *  real N-option prompts; absent ⇒ it falls back to yes/no collapse
@@ -81,6 +87,8 @@ const turnHitlQuestionChannels = new Map<string, QuestionChannel[]>();
 const HITL_TURN_TIMEOUT_MS = 120_000;
 
 const surfacePermissionApprover: AcpPermissionApprover = async (req) => {
+  const turnApprover = turnPermissionApprovers.get(req.sessionId);
+  if (turnApprover) return turnApprover(req);
   // Autonomous by default: edit/command PERMISSIONS auto-approve. Asking the
   // human to approve every write defeats delegation (the interactive-editor
   // paradigm ACP inherited doesn't fit autonomous telegram delegation).
@@ -102,7 +110,31 @@ const surfacePermissionApprover: AcpPermissionApprover = async (req) => {
   return answer;
 };
 
+/** PCH-2b — answer codex's 3-way approval question with a yes/no permission
+ *  approver. Returns null when the request is not that question. */
+export async function answerCodexApprovalQuestion(
+  req: Parameters<AcpQuestionApprover>[0],
+  approver: AcpPermissionApprover,
+): Promise<Awaited<ReturnType<AcpQuestionApprover>> | null> {
+  const q = req.questions[0];
+  if (req.questions.length !== 1 || q?.id !== CODEX_APPROVAL_QUESTION_ID) return null;
+  const approved = await approver({
+    backendId: req.backendId,
+    sessionId: req.sessionId,
+    title: q.question,
+    options: [],
+  });
+  return { answers: { [q.id]: approved ? CODEX_APPROVAL_OPT_ONCE : CODEX_APPROVAL_OPT_REJECT } };
+}
+
 const surfaceQuestionApprover: AcpQuestionApprover = async (req) => {
+  // PCH-2b — an ACP server turn answers codex's approval question through its
+  // own client (yes/no), not the messenger HITL channels.
+  const turnApprover = turnPermissionApprovers.get(req.sessionId);
+  if (turnApprover) {
+    const answered = await answerCodexApprovalQuestion(req, turnApprover);
+    if (answered) return answered;
+  }
   const channels = turnHitlChannels.get(req.sessionId);
   if (!channels || channels.length === 0) return { answers: {}, cancelled: true };
   // When the surface provided real multi-option QuestionChannels, fan
@@ -306,6 +338,8 @@ export interface RunAcpTurnOpts {
   cwd?: string;
   /** Session-scoped Codex app-server configuration arguments. */
   codexArgs?: readonly string[];
+  /** ACP server turn's permission request, routed through its client rather than the messenger HITL channel. */
+  permissionApprover?: AcpPermissionApprover;
   /** Soft focus budget (tool-turns) for a TARGETED slash invocation
    *  (`/cc`·/cdx·/gem). When set, a tight-budget directive is prepended
    *  to the prompt so the sub-agent stays focused (minimize re-reads /
@@ -663,6 +697,7 @@ export async function runAcpTurn(opts: RunAcpTurnOpts): Promise<RunAcpTurnResult
   // session id (== the `req.sessionId` seen in requestPermission).
   const hasHitl = !!opts.hitlConfirmChannels && opts.hitlConfirmChannels.length > 0;
   if (hasHitl) turnHitlChannels.set(sessionId, opts.hitlConfirmChannels!);
+  if (opts.permissionApprover) turnPermissionApprovers.set(sessionId, opts.permissionApprover);
   const hasHitlQuestions = !!opts.hitlQuestionChannels && opts.hitlQuestionChannels.length > 0;
   if (hasHitlQuestions) turnHitlQuestionChannels.set(sessionId, opts.hitlQuestionChannels!);
 
@@ -784,6 +819,7 @@ export async function runAcpTurn(opts: RunAcpTurnOpts): Promise<RunAcpTurnResult
   } finally {
     inFlightTurns.delete(key);
     if (hasHitl) turnHitlChannels.delete(sessionId);
+    if (opts.permissionApprover) turnPermissionApprovers.delete(sessionId);
     if (hasHitlQuestions) turnHitlQuestionChannels.delete(sessionId);
   }
 }

@@ -9,7 +9,7 @@
 // the pattern; we trim the hook-based fallback (sandboxed envs)
 // because elanous's primary surface runs native git.
 
-import { spawnSync, execFileSync } from 'node:child_process';
+import { spawnSync, execFileSync, type SpawnSyncReturns } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync, rmSync, symlinkSync, lstatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -17,8 +17,33 @@ import { findGitDir } from './locate.js';
 import { isTransientGitError } from './retry.js';
 import { runGitCommand } from './runner.js';
 import { debug } from '../debug/log.js';
+import { getUserConfig } from '../user-config.js';
 
 const GIT_TIMEOUT_MS = 30_000;
+const WORKTREE_ADD_TIMEOUT_MS = 5 * 60_000;
+
+export interface WorktreeAddDeps {
+  spawn?: (command: string, args: string[], options: { cwd: string; encoding: 'utf8'; timeout: number; maxBuffer: number }) => SpawnSyncReturns<string>;
+}
+
+function worktreeAddTimeoutMs(): number {
+  const seconds = getUserConfig().harness?.worktreeAddTimeoutSec;
+  return typeof seconds === 'number' && Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 2_147_483
+    ? seconds * 1000 : WORKTREE_ADD_TIMEOUT_MS;
+}
+
+function worktreeAddFailureLines(stderr: string): { lastProgress: string | null; details: string[] } {
+  let lastProgress: string | null = null;
+  const details: string[] = [];
+  for (const line of stderr.split(/[\r\n]+/).map((value) => value.trim()).filter(Boolean)) {
+    if (/^(?:Updating files|Checking out files|Receiving objects|Resolving deltas):\s*\d+%/.test(line)) {
+      lastProgress = line;
+    } else if (!/^Preparing worktree\b/.test(line)) {
+      details.push(line);
+    }
+  }
+  return { lastProgress, details: details.slice(-3) };
+}
 
 /** Git metadata left by an interrupted operation in one checkout. */
 /** ⚠️ 공개인 이유(무인 리뷰 질의) — `GitResidueObservation.residues` 의 **원소 타입**이라,
@@ -618,7 +643,7 @@ function worktreeHoldingBranch(repoRoot: string, branch: string): string | null 
   return null;
 }
 
-export function createWorktree(opts: CreateWorktreeOpts): CreateWorktreeResult {
+export function createWorktree(opts: CreateWorktreeOpts, deps: WorktreeAddDeps = {}): CreateWorktreeResult {
   const { repoRoot, branch, worktreeRoot } = opts;
   validateBranchName(branch);
   const branchHolder = worktreeHoldingBranch(repoRoot, branch);
@@ -684,25 +709,39 @@ export function createWorktree(opts: CreateWorktreeOpts): CreateWorktreeResult {
   // ★ 병렬 안전 재시도(2026-07-21) — 동시 worktree add 가 git 락에서 경쟁하면 즉시 실패 → 락/일시적
   //   에러면 백오프 재시도(패자가 승자의 락 해제를 기다렸다 성공). non-transient 는 재시도 없이 throw.
   const MAX_ATTEMPTS = 6;
-  let res!: ReturnType<typeof spawnSync>;
+  const addTimeoutMs = worktreeAddTimeoutMs();
+  const addSpawn = deps.spawn ?? spawnSync;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    res = spawnSync(
+    const res = addSpawn(
       'git',
       ['worktree', 'add', branchFlag, branch, wtPath, baseCheckout],
-      { cwd: repoRoot, encoding: 'utf8', timeout: GIT_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
+      { cwd: repoRoot, encoding: 'utf8', timeout: addTimeoutMs, maxBuffer: 4 * 1024 * 1024 },
     );
     if (res.status === 0) break;
     const err = (res.stderr || res.stdout || '').toString();
+    const { lastProgress, details } = worktreeAddFailureLines(err);
+    const timedOut = (res.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+    if (timedOut) {
+      debug.log('git-fs.worktree', 'add.failed', { reason: 'timeout', ms: addTimeoutMs, signal: res.signal ?? null, lastProgress }, { level: 'warn' });
+      throw new Error(`git worktree add timed out after ${addTimeoutMs / 1000}s (${res.signal ?? 'none'}) — ${[...details, ...(lastProgress ? [`checkout was at «${lastProgress}»`] : [])].join(' | ') || `git exited ${res.status}`}`);
+    }
+    if (res.signal) {
+      debug.log('git-fs.worktree', 'add.failed', { reason: 'error', ms: addTimeoutMs, signal: res.signal, lastProgress }, { level: 'warn' });
+      throw new Error(`git worktree add failed (${res.signal}) — ${details.join(' | ') || lastProgress || `git exited ${res.status}`}`);
+    }
     const blockingPath = blockingWorktreePath(err);
     if (blockingPath) {
+      debug.log('git-fs.worktree', 'add.failed', { reason: 'error', ms: addTimeoutMs, signal: res.signal ?? null, lastProgress }, { level: 'warn' });
       debug.log('git-fs.worktree', 'add.branch-held', { attempt, branch, blockingPath }, { level: 'warn' });
       throw new Error(`git worktree add failed — branch ${branch} is already used by worktree at ${blockingPath}`);
     }
     if (isUnbornHeadError(err)) {
+      debug.log('git-fs.worktree', 'add.failed', { reason: 'error', ms: addTimeoutMs, signal: res.signal ?? null, lastProgress }, { level: 'warn' });
       throw new Error('git worktree add failed — this repository has no commits yet; create the first commit with: git commit --allow-empty -m "Initial commit"');
     }
     if (!isTransientGitError(err) || attempt === MAX_ATTEMPTS) {
-      throw new Error(`git worktree add failed — ${err.trim() || `git exited ${res.status}`}`);
+      debug.log('git-fs.worktree', 'add.failed', { reason: 'error', ms: addTimeoutMs, signal: res.signal ?? null, lastProgress }, { level: 'warn' });
+      throw new Error(`git worktree add failed — ${details.join(' | ') || lastProgress || `git exited ${res.status}`}`);
     }
     debug.log('git-fs.worktree', 'add.retry', { attempt, branch, err: err.trim().slice(0, 120) });
     sleepSyncMs(80 * attempt);   // 선형 백오프(80·160·240…ms)

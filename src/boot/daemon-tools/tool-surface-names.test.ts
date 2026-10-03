@@ -15,6 +15,7 @@ import type { UserConfig } from '../../user-config.js';
 import { debug } from '../../debug/log.js';
 import { buildFinanceTools } from '../../domains/finance-tools.js';
 import { toolSurface } from './index.js';
+import * as ptyRegistry from '../../pty-shell/registry.js';
 import { ptyAvailable } from '../../pty-shell/registry.js';
 import { isDevHarnessModelSurfaceEnabled } from '../../skills/tools/dev-harness.js';
 
@@ -27,16 +28,22 @@ const READONLY = ['Read', 'Grep', 'WebSearch', 'Plan', 'MarkStepDone'];
 const CHAT_CORE = [
   ...READONLY,
   'Edit', 'Write', 'Bash', 'delegate_code_agent',
+  'SelfImplement', 'AskUserQuestion', 'AcpSessionCreate', 'AcpSessionSend', 'AcpSessionClose',
+  'AcpSessionList', 'AcpSessionResume', 'AcpSessionSpawnSub', 'AcpSessionStartBackground',
+  'AcpSessionStatus', 'AcpSessionCancel', 'AcpSessionJoin', 'AcpPlanThenExecute',
   'schedule_manage', 'session_manage', 'memory_recall', 'fact_check', 'self_recall',
-  'autopilot_missions', 'ops_status', 'se_build', 'logs_query', 'mission_decide', 'elanous_skills_list', 'skill_exec',
+  'autopilot_missions', 'ops_status', 'se_build', 'logs_query', 'mission_decide', 'coo_admin',
+  // SYNC1 ① #23007 — owner-only read tools; names are listed, dispatch refuses without a server-verified owner (like release_change).
+  'release_status', 'release_change', 'ops_seats', 'decisions_pending', 'elanous_skills_list', 'skill_exec',
 ];
+const CHAT_PTY_EXTRA = ['ElanousHold', 'PtyControl'];
 // webterm 이 chat 위에 항상 더하는 것(pty 무관) — 자율tool 3종(nest-cap off 전제) + 웹터미널/카메라.
 const WEBTERM_ALWAYS_EXTRA = [
   // ⭐ 2026-08-27 (#13417) — 자율(ACP) 턴이 브라우저를 «읽기»로 몰 수 있게 데몬 표면이 담는다.
   //    ⛔ BrowserOpen · BrowserScreenshot · BrowserClose 는 safety:['process'] 라 «담지 않는다».
   //    근거·머리말 = src/tool-surface.ts · src/boot/daemon-tools/index.ts
   'BrowserNavigate', 'BrowserRead',
-  'SelfImplement', ...(isDevHarnessModelSurfaceEnabled() ? ['RunDevHarness'] : []), 'SolveMission',
+  ...(isDevHarnessModelSurfaceEnabled() ? ['RunDevHarness'] : []), 'SolveMission',
   'WebTerminalList', 'WebTerminalSnapshot', 'WebTerminalInput', 'WebTerminalScreenshot',
   'LiveCameraFrame',
 ];
@@ -86,8 +93,16 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
     expect(toolSurface('readonly', financeOff).specs.map((s) => s.name)).toEqual(READONLY);
   });
 
-  test("'chat' 서피스(finance off) = readonly + Edit/Write/Bash/delegate + L2 core (결정적)", () => {
-    expect(toolSurface('chat', financeOff).specs.map((s) => s.name)).toEqual(CHAT_CORE);
+  test("'chat' 서피스(finance off) = readonly + Edit/Write/Bash/delegate + L2 core (PTY 가용·불가 각각 정확히)", () => {
+    for (const available of [false, true]) {
+      const pty = spyOn(ptyRegistry, 'ptyAvailable').mockReturnValue(available);
+      try {
+        const names = toolSurface('chat', financeOff).specs.map((s) => s.name);
+        expect(names).toEqual([...CHAT_CORE, ...(available ? CHAT_PTY_EXTRA : [])]);
+      } finally {
+        pty.mockRestore();
+      }
+    }
   });
 
   test("'chat' finance 게이트 — off 는 finance_ 없음 / on 은 finance_quote 노출(Phase 0 게이팅)", () => {
@@ -100,13 +115,14 @@ describe('daemon toolSurface — Phase 3 골든룰(이름배열 diff=0·서피�
       ...CHAT_CORE.slice(0, -2),
       ...buildFinanceTools().specs.map((spec) => spec.name),
       'elanous_skills_list', 'skill_exec',
+      ...off.slice(CHAT_CORE.length),
     ]);
   });
 
   test("'webterm' ⊇ 'chat' + 자율tool/웹터미널 (+ pty 가용 시 PtyShell·헤드리스)", () => {
     const chat = toolSurface('chat', financeOff).specs.map((s) => s.name);
     const wt = toolSurface('webterm', financeOff).specs.map((s) => s.name);
-    // chat 전체를 순서 보존 접두로 포함.
+    // webterm includes the entire chat catalog as its ordered prefix.
     expect(wt.slice(0, chat.length)).toEqual(chat);
     for (const n of WEBTERM_ALWAYS_EXTRA) expect(wt).toContain(n);
     const extra = wt.filter((n) => !chat.includes(n));

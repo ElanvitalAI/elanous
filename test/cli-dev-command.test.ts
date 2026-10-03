@@ -1,12 +1,15 @@
 // U4 — `elanous dev` 실험 엔트리 실행수준 통합(subprocess). Commander 등록·옵션 검증·종료코드 회귀.
 //   self dispatch는 실제 worktree spawn을 피하고, shell-drive 성공 경로는 짧은 실제 자식으로 검증한다.
 
-import { afterAll, beforeAll, describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, afterAll, beforeAll, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, realpathSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { snapshotWorktreeRoot, sweepNewEmptyWorktreeRoots } from './helpers/worktree-root-leak.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // ⛔ 이 파일은 `elanous dev` 를 «자식 프로세스»로 돌리므로, 그 자식이 만든 인스턴스 뿌리를
 //   fixture 의 cleanup 이 «원리상» 못 잡는다(부모에게 그 경로가 없다).

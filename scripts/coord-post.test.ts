@@ -1,10 +1,88 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { openSurfaceEventsDb } from '../src/domains/surface-events.js';
+import { listCoordEvents, parseCoordHeader } from '../src/context-bus/coord-events.js';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, test } from 'bun:test';
 
 const script = resolve(import.meta.dir, 'coord-post.sh');
+
+test('successful send records one event with the comment URL; failure and dry-run record none', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'coord-ledger-'));
+  const file = join(dir, 'body.md');
+  const bin = join(dir, 'bin');
+  await mkdir(bin);
+  await writeFile(file, '**[TC]** {{TS}} → UX · 요청 · K6 · 기한 06:30\n비밀-문자열-예시\n');
+  const stub = join(bin, 'bun');
+  const url = 'https://github.com/o/r/issues/1#issuecomment-42';
+  await writeFile(stub, `#!/bin/sh\ncase "$*" in\n  *"gh pr comment"*) echo '${url}'; exit "\${GH_RC:-0}" ;;\nesac\nexec '${process.execPath}' "$@"\n`);
+  await chmod(stub, 0o755);
+  const env = { ...process.env, CH_PR: '99999999', COORD_ID: 'TC', ELANOUS_STATE_DIR: dir,
+    ELANOUS_CONFIG_DIR: join(dir, 'config'), PATH: `${bin}:${process.env.PATH ?? ''}` };
+  const send = (override: Record<string, string> = {}) => spawnSync('bash', [script, file], {
+    cwd: resolve(import.meta.dir, '..'), encoding: 'utf8', env: { ...env, ...override },
+  });
+  expect(send({ GH_RC: '1' }).status).toBe(1);
+  expect(send({ COORD_DRY_RUN: '1' }).status).toBe(0);
+  const dbPath = join(dir, 'surface_events.db');
+  expect(existsSync(dbPath)).toBe(false);
+  const first = send();
+  expect(first.status).toBe(0);
+  expect(first.stderr).not.toContain('맥락 원장 기록 실패');
+  const db = openSurfaceEventsDb(dbPath);
+  try {
+    const rows = listCoordEvents({ since: '2020-01-01T00:00:00Z' }, { db });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.refs).toMatchObject({ seat: 'TC', recipients: ['UX'], kind: '요청', slot: 'K6', deadline: '기한 06:30', url });
+    expect(JSON.stringify(rows)).not.toContain('비밀-문자열-예시');
+  } finally { db.close(); }
+  expect(send().status).toBe(0);
+  const check = openSurfaceEventsDb(dbPath);
+  try { expect(listCoordEvents({ since: '2020-01-01T00:00:00Z' }, { db: check })).toHaveLength(1); }
+  finally { check.close(); }
+});
+
+test('ledger failure warns once without turning successful send into failure', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'coord-ledger-fail-'));
+  const file = join(dir, 'body.md');
+  const bin = join(dir, 'bin');
+  await mkdir(bin);
+  await writeFile(file, '**[TC]** {{TS}} → UX · 보고 · K6\n');
+  await mkdir(join(dir, 'surface_events.db')); // SQLite cannot open a directory as its database.
+  await writeFile(join(bin, 'bun'), `#!/bin/sh\ncase "$*" in\n *"gh pr comment"*) echo 'https://github.com/o/r/issues/1#issuecomment-90'; exit 0 ;;\nesac\nexec '${process.execPath}' "$@"\n`);
+  await chmod(join(bin, 'bun'), 0o755);
+  const result = spawnSync('bash', [script, file], { cwd: resolve(import.meta.dir, '..'), encoding: 'utf8',
+    env: { ...process.env, CH_PR: '99999999', COORD_ID: 'TC', ELANOUS_STATE_DIR: dir,
+      ELANOUS_CONFIG_DIR: join(dir, 'config'), PATH: `${bin}:${process.env.PATH ?? ''}` } });
+  expect(result.status).toBe(0);
+  expect(result.stderr.match(/⚠️ 맥락 원장 기록 실패\(발신은 됐다\)/g)).toHaveLength(1);
+});
+
+test('five headers: shell warning decisions agree with the TypeScript ordered envelope parser', async () => {
+  const cases: Array<{ first: string; recipients: string[]; kind: string | null; slot: string | null; deadline: string | null; warnings: string[] }> = [
+    { first: '**[MK]** {{TS}} → TC · UX · 요청 · K6 · 기한 06:30', recipients: ['TC', 'UX'], kind: '요청', slot: 'K6', deadline: '기한 06:30', warnings: [] },
+    { first: '**[MK]** {{TS}} → OP — 무엇', recipients: ['OP'], kind: null, slot: null, deadline: null, warnings: ['글 종류'] },
+    { first: '**[MK]** {{TS}} → TC · 보고 · 결정 D1', recipients: ['TC'], kind: '보고', slot: '결정 D1', deadline: null, warnings: [] },
+    { first: '**[MK]** {{TS}} → TC · K6 · 보고 · -', recipients: ['TC'], kind: null, slot: '보고', deadline: null, warnings: ['글 종류'] },
+    { first: '**[MK]** {{TS}} · 보고 · K6 → TC', recipients: [], kind: null, slot: null, deadline: null, warnings: ['글 종류', '받는 이'] },
+  ];
+  for (const c of cases) {
+    const parsed = parseCoordHeader('MK', c.first);
+    expect(parsed).toMatchObject({ recipients: c.recipients, kind: c.kind, slot: c.slot, deadline: c.deadline });
+    const result = await runPost(`${c.first}\n본문\n`, { COORD_ID: 'MK', COORD_DRY_RUN: '1' }, 0);
+    expect(result.status).toBe(0);
+    for (const warning of ['글 종류', '받는 이']) {
+      const present = warning === '글 종류'
+        ? result.stderr.includes('글 종류(요청·결정·사고·보고·정정)가 없다')
+        : result.stderr.includes('⚠️ 받는 이가 없다');
+      expect({ first: c.first, warning, present }).toMatchObject({
+        first: c.first, warning, present: c.warnings.includes(warning),
+      });
+    }
+  }
+});
 
 // ── 조율 채널 발신의 «신원 관문» ─────────────────────────────────────────────
 //
@@ -35,6 +113,156 @@ async function runPost(
     cwd: resolve(import.meta.dir, '..'),
   });
 }
+
+describe('coord-post.sh — 봉투 v2 경고는 발신을 막지 않는다', () => {
+  const send = (first: string) => runPost(`${first}\n본문\n`, { COORD_ID: 'MK' }, 0);
+
+  test('완전한 요청 봉투는 새 경고 없이 발신한다', async () => {
+    const r = await send('**[MK]** {{TS}} → TC · 요청 · K6 · 기한 12:40');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('발신 성공');
+    expect(r.stderr).not.toContain('⚠️ 받는 이가 없다');
+    expect(r.stderr).not.toContain('⚠️ 첫 줄에 칸');
+    expect(r.stderr).not.toContain('⚠️ 요청·결정에는 기한을 적는다');
+    expect(r.stderr).not.toContain('⚠️ «전원»은 사고·정정·대표 지시에만');
+  });
+
+  test('옛 형식도 종류 경고만 내고 같은 rc 로 발신한다', async () => {
+    const r = await send('**[MK]** {{TS}} → OP · 무엇');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('글 종류(요청·결정·사고·보고·정정)가 없다');
+    expect(r.stderr).not.toContain('받는 이가 없다');
+    expect(r.stderr).not.toContain('첫 줄에 칸');
+    expect(r.stderr).not.toContain('기한을 적는다');
+    expect(r.stderr).not.toContain('«전원»은 사고·정정');
+  });
+
+  test('첫 줄에 받는 이가 없으면 경고하지만 발신한다', async () => {
+    const r = await send('**[MK]** {{TS}} · 보고 · K6');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('⚠️ 받는 이가 없다(→ TC · UX 꼴)');
+  });
+
+  test('요청에 기한이 없으면 경고하지만 발신한다', async () => {
+    const r = await send('**[MK]** {{TS}} → TC · 요청 · K6');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('⚠️ 요청·결정에는 기한을 적는다');
+  });
+
+  test('종류 뒤에 놓인 화살표는 받는 이가 아니지만 발신한다', async () => {
+    const r = await send('**[MK]** {{TS}} · 보고 · K6 → TC');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('⚠️ 받는 이가 없다(→ TC · UX 꼴)');
+  });
+
+  test('종류는 받는 이 바로 다음 필드만 본다 — 칸의 «결정» 낱말이나 뒤쪽 종류 낱말로 고르지 않는다 (round 3 must-fix)', async () => {
+    const report = await send('**[MK]** {{TS}} → TC · 보고 · 결정 D1');
+    expect(report.status).toBe(0);
+    expect(report.stderr).not.toContain('기한을 적는다');
+    expect(report.stderr).not.toContain('칸(확인표');
+    expect(report.stderr).not.toContain('받는 이가 없다');
+    const misplaced = await send('**[MK]** {{TS}} → TC · K6 · 보고 · -');
+    expect(misplaced.status).toBe(0);
+    expect(misplaced.stderr).not.toContain('받는 이가 없다');
+    expect(misplaced.stderr).toContain('글 종류(요청·결정·사고·보고·정정)가 없다');
+    const two = await send('**[MK]** {{TS}} → TC · UX · 요청 · K6 · 기한 12:40');
+    expect(two.status).toBe(0);
+    expect(two.stderr).not.toContain('⚠️');
+  });
+
+  test('요청의 칸 누락과 빈 기한은 경고하지만 발신한다', async () => {
+    const missingSlot = await send('**[MK]** {{TS}} → TC · 요청 · 기한 12:40');
+    expect(missingSlot.status).toBe(0);
+    expect(missingSlot.stderr).toContain('⚠️ 첫 줄에 칸(확인표·결정 id 또는 -)이 없다');
+    const emptyDeadline = await send('**[MK]** {{TS}} → TC · 요청 · K6 · 기한 ');
+    expect(emptyDeadline.status).toBe(0);
+    expect(emptyDeadline.stderr).toContain('⚠️ 요청·결정에는 기한을 적는다');
+  });
+
+  test('공백뿐인 칸은 빈 칸으로 경고하지만 발신한다', async () => {
+    const r = await send('**[MK]** {{TS}} → TC · 요청 ·   · 기한 12:40');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('⚠️ 첫 줄에 칸(확인표·결정 id 또는 -)이 없다');
+  });
+
+  test('종류·칸 뒤가 아닌 기한은 기한 필드로 세지 않고 발신한다', async () => {
+    const r = await send('**[MK]** {{TS}} 기한 12:40 → TC · 요청 · K6');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('⚠️ 요청·결정에는 기한을 적는다');
+    expect(r.stderr).not.toContain('⚠️ 첫 줄에 칸');
+  });
+
+  test('보고 봉투의 칸에 결정이 들어가도 요청·결정 기한 규칙을 적용하지 않는다', async () => {
+    const r = await send('**[MK]** {{TS}} → TC · 보고 · 결정 D1');
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('발신 성공');
+    expect(r.stderr).not.toContain('⚠️ 첫 줄에 칸');
+    expect(r.stderr).not.toContain('⚠️ 요청·결정에는 기한을 적는다');
+    expect(r.stderr).not.toContain('글 종류(요청·결정·사고·보고·정정)가 없다');
+  });
+
+  test('전원 보고는 경고하지만 발신한다', async () => {
+    for (const first of [
+      '**[MK]** {{TS}} → 전원 · 보고 · K6',
+      '**[MK]** {{TS}} → 전원 · 보고 · 사고 D1',
+    ]) {
+      const r = await send(first);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('⚠️ «전원»은 사고·정정·대표 지시에만');
+    }
+  });
+
+  test('복수 받는 이 TC · UX 도 받는 이가 있는 봉투다', async () => {
+    const r = await send('**[MK]** {{TS}} → TC · UX · 요청 · K6 · 기한 12:40');
+    expect(r.status).toBe(0);
+    expect(r.stderr).not.toContain('받는 이가 없다');
+    expect(r.stderr).not.toContain('기한을 적는다');
+  });
+
+  test('전원 사고·정정·대표 지시는 전원 경고 없이 발신한다', async () => {
+    for (const first of [
+      '**[MK]** {{TS}} → 전원 · 사고 · -',
+      '**[MK]** {{TS}} → 전원 · 정정 · -',
+      '**[MK]** {{TS}} → 전원 · 보고 · - · \u{1F451} 지시 전달',
+    ]) {
+      const r = await send(first);
+      expect(r.status).toBe(0);
+      expect(r.stderr).not.toContain('«전원»은 사고·정정');
+      expect(r.stderr).not.toContain('받는 이가 없다');
+    }
+  });
+
+  test('알 수 없는 받는 이 또는 본문에만 있는 받는 이는 첫 줄 받는 이가 아니다', async () => {
+    for (const first of [
+      '**[MK]** {{TS}} → ZZ · 보고 · K6',
+      '**[MK]** {{TS}} · 보고 · K6 → ZZ',
+    ]) {
+      const r = await runPost(`${first}\n→ TC\n`, { COORD_ID: 'MK' }, 0);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('⚠️ 받는 이가 없다(→ TC · UX 꼴)');
+    }
+  });
+
+  test('결정의 기한은 첫 줄에서 검사하고 📌안내는 신원 접두 뒤에 허용한다', async () => {
+    const r = await runPost('**[MK]** 📌안내 {{TS}} → OP · 결정 · D1\n기한 12:40\n', { COORD_ID: 'MK' }, 0);
+    expect(r.status).toBe(0);
+    expect(r.stderr).toContain('⚠️ 요청·결정에는 기한을 적는다');
+    expect(r.stderr).not.toContain('받는 이가 없다');
+    const complete = await send('**[MK]** 📌안내 {{TS}} → OP · 결정 · D1 · 기한 12:40');
+    expect(complete.status).toBe(0);
+    expect(complete.stderr).not.toContain('⚠️ 받는 이가 없다');
+    expect(complete.stderr).not.toContain('⚠️ 요청·결정에는 기한을 적는다');
+  });
+
+  test('받는 이 id 는 정본을 사용하고 옛 alias 는 받는 이로 세지 않는다', async () => {
+    const id = await send('**[MK]** {{TS}} → E · 보고 · -');
+    expect(id.status).toBe(0);
+    expect(id.stderr).not.toContain('받는 이가 없다');
+    const alias = await send('**[MK]** {{TS}} → O · 보고 · -');
+    expect(alias.status).toBe(0);
+    expect(alias.stderr).toContain('⚠️ 받는 이가 없다(→ TC · UX 꼴)');
+  });
+});
 
 describe('coord-post.sh — 신원 관문', () => {
   test('⛔ 남의 신원으로는 «발신하지 않는다» (rc=5)', async () => {
@@ -293,6 +521,7 @@ describe('coord-post.sh — GraphQL 한도면 REST 로 한 번 물러선다', ()
     expect(r.stderr).toContain('발신 성공 · REST 폴백');
     expect(log).toContain('gh api -X POST repos/{owner}/{repo}/issues/99999999/comments');
     expect(log).toMatch(/-F body=@\S+/);
+    expect(log).toContain('coord event record --seat S --header **[S]** 내 신원 --url https://github.com/o/r/pull/1#issuecomment-1');
   });
 
   test('⛔ rate limit → REST 도 실패면 실패로 끝난다', async () => {

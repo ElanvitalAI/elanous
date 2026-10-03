@@ -33,6 +33,7 @@ import type {
 } from '../index.js';
 import { filterSlashCommands } from '../index.js';
 import { filterInputMatches } from '../../input/query-match.js';
+import { readTuiSlashAudience, slashMaturity, slashVisibleFor } from '../../maturity/tui-slash-maturity.js';
 
 /** Read-only snapshot of the textInput buffer handed to state on
  *  every public call. The state machine never mutates it; it only
@@ -234,8 +235,11 @@ export function createPickerState(deps: PickerDeps): PickerState {
   let currentAtItems: AtCandidate[] = [];
   let currentSkillItems: SkillCandidate[] = [];
 
-  const filteredSlash = (buf: PickerBufferView): SlashCommand[] =>
-    filterSlashCommands((buf.lines[0] ?? '').slice(1), deps.commands);
+  const filteredSlash = (buf: PickerBufferView): SlashCommand[] => {
+    const { role, showBeta } = readTuiSlashAudience();
+    return filterSlashCommands((buf.lines[0] ?? '').slice(1), deps.commands)
+      .filter((cmd) => (role === 'owner' && slashMaturity(cmd.name) === undefined) || slashVisibleFor(cmd.name, role, { showBeta }));
+  };
 
   const refreshArgs = async (buf: PickerBufferView): Promise<ArgSuggestion[]> => {
     const ctx = parseArgContext(buf, deps.commands);

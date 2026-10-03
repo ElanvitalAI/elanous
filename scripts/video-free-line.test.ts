@@ -2,13 +2,16 @@
  * 🟢 무료 라인 시험 — ⛔ ***「돌았다」를 종료코드만으로 믿지 않는다.***
  *   이 파일은 «산출물»을 직접 잰다(프레임 수 · 규격 · 자막이 픽셀에 있나).
  */
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { koreanCaptionFont } from '../src/video-pipeline/recipes/free-line.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');

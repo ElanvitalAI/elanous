@@ -3,6 +3,16 @@
 // - 켜기/끄기 = Ctrl+Shift+F (맥 ⌘+Shift+F) — BT 키보드에서 된다. Esc 는 터미널(vim·tmux)이 써서 빼앗지 않는다.
 // - 켜져 있을 때 글자 크기 = Ctrl/⌘+Shift+«=» 키우기 · Ctrl/⌘+Shift+«-» 줄이기 · 기기마다 기억.
 
+export const TERM_FOCUS_DISABLED_KEY = 'elanous.pwa.termFocusStartDisabled';
+
+export function readTermFocusStartDisabled(storage: StorageLike | null | undefined): boolean {
+  try { return storage?.getItem(TERM_FOCUS_DISABLED_KEY) === '1'; } catch { return false; }
+}
+
+export function writeTermFocusStartDisabled(storage: StorageLike | null | undefined): void {
+  try { storage?.setItem(TERM_FOCUS_DISABLED_KEY, '1'); } catch { /* The current focus choice still applies. */ }
+}
+
 export const TERM_FONT_KEY = 'elanous.pwa.termFontSize';
 export const TERM_FONT_DEFAULT = 13;
 export const TERM_FONT_MIN = 9;

@@ -1,4 +1,4 @@
-export type RunStatus = 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'completed' | 'failed' | 'cancelled' | 'parked';
 /** ⭐ `crashed` — ***잡히지 않은 예외로 죽어 종결을 스스로 못 적은*** 런 (2026-08-11 · 🅣⊕🅢 어휘 합의).
  *  ⛔ `aborted`(스스로 중단을 «판정»했다)와 다른 값이다 — 이쪽은 «판정할 겨를이 없었다».
  *  📏 왜 생겼나: 실측 미완 57 중 ≈38 이 어느 원장에도 종결이 없었고, 멈춘 자리가 전부 「노드 안」이었다. */
@@ -20,7 +20,8 @@ export type SelfImplementStage =
   | 'aborted'
   | 'timed-out'
   | 'pr-declined'
-  | 'soft-stopped';
+  | 'soft-stopped'
+  | 'parked';
 
 const STAGE_OUTCOMES = {
   merged: { runStatus: 'completed' },
@@ -34,9 +35,10 @@ const STAGE_OUTCOMES = {
   'timed-out': { runStatus: 'failed', failureKind: 'timed-out' },
   'pr-declined': { runStatus: 'cancelled' },
   'soft-stopped': { runStatus: 'cancelled' },
+  parked: { runStatus: 'parked' },
 } satisfies Record<SelfImplementStage, MappedRunOutcome>;
 
-const RUN_STATUSES = new Set<RunStatus>(['completed', 'failed', 'cancelled']);
+const RUN_STATUSES = new Set<RunStatus>(['completed', 'failed', 'cancelled', 'parked']);
 
 /** Runtime guard for the run-status payload produced by observeRunOutcome. */
 export function isRunStatus(value: unknown): value is RunStatus {

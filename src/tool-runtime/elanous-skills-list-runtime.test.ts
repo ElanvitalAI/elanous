@@ -3,7 +3,7 @@
 // + failure modes. Uses an isolated tmp `skillsDir` so the test never
 // touches the real ~/.elanous/skills.
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -15,6 +15,9 @@ import {
 } from './elanous-skills-list-runtime.js';
 import { defaultSkillDirs, resetUserConfig } from '../user-config.js';
 import { SKILLS_LIST_DESCRIPTION } from '../onboarding/entry-hints.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 let workdir: string;
 let skillsDir: string;

@@ -17,13 +17,16 @@
 // 🧩 ⇒ ***「무엇을 던지게 하나」가 「무엇을 무나」를 정한다.*** 관측 «전달»을 던지게 하면
 //   전달만 물고, 관측 «조회»를 던지게 해야 조회가 물린다.
 
-import { describe, expect, mock, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, mock, test } from 'bun:test';
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join as joinPath } from 'node:path';
 
 import type { DaemonToolDispatchCtx } from '../src/boot/daemon-tools/types.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const CHILD_ENV = 'ELANOUS_DAEMON_TOOLS_BOUNDARY_FAILSOFT_CHILD';
 

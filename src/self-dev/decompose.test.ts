@@ -5,6 +5,7 @@ import { deriveSelfDevArcsFromGrouping } from './arc-classify.js';
 import {
   buildSelfDevDecomposePrompt,
   parseSelfDevDecomposition,
+  foldRegistrationOnlyGoals,
   decomposeSelfDevGoal,
   FabricDecompositionRejectedError,
   inferHotPaths,
@@ -128,6 +129,124 @@ describe('parseSelfDevDecomposition', () => {
       expect(goal.goalType).toBeUndefined();
       expect('goalType' in goal).toBe(false);
       expect(goal.kind).toBeUndefined();
+    }
+  });
+});
+
+describe('foldRegistrationOnlyGoals', () => {
+  test('folds a route into its handler with unioned paths and one path-only event', async () => {
+    const events: Array<{ category: string; event: string; data: unknown }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((category, event, data) => {
+      events.push({ category, event, data });
+    }) as typeof debug.log;
+    try {
+      const result = await decomposeSelfDevGoal('add a handler', { llm: async () => JSON.stringify({ subtasks: [
+        { id: 'a', feature: 'Implement handler', hotPaths: ['src/nexus/api/foo.ts'] },
+        { id: 'b', feature: 'Register route', hotPaths: ['src/nexus/api/http-server.ts'], dependsOn: ['a'] },
+      ] }) });
+      expect(result.goals).toEqual([{ id: 'a', feature: 'Implement handler\nAlso register: Register route', hotPaths: ['src/nexus/api/foo.ts', 'src/nexus/api/http-server.ts'] }]);
+      expect(events.filter(({ event }) => event === 'fold-registration')).toEqual([{
+        category: 'self-dev.decompose', event: 'fold-registration',
+        data: { from: 'b', into: 'a', files: ['src/nexus/api/http-server.ts'] },
+      }]);
+      expect(events.find(({ event }) => event === 'decomposition')?.data).toMatchObject({ foldedRegistration: 1 });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
+    }
+  });
+
+  test('rewires a downstream dependency and removes self references and duplicates', () => {
+    expect(foldRegistrationOnlyGoals([
+      { id: 'a', feature: 'Handler', hotPaths: ['src/nexus/api/foo.ts'], dependsOn: ['b'] },
+      { id: 'b', feature: 'Route', hotPaths: ['src/nexus/api/http-server.ts'], dependsOn: ['a'] },
+      { id: 'c', feature: 'Consumer', dependsOn: ['b', 'a'] },
+    ])).toEqual([
+      { id: 'a', feature: 'Handler\nAlso register: Route', hotPaths: ['src/nexus/api/foo.ts', 'src/nexus/api/http-server.ts'] },
+      { id: 'c', feature: 'Consumer', dependsOn: ['a'] },
+    ]);
+  });
+
+  test.each([
+    ['non-registration path', ['src/index.ts', 'src/nexus/api/bar.ts'], ['a']],
+    ['no dependency', ['src/index.ts'], []],
+    ['multiple dependencies', ['src/telegram-commands.ts'], ['a', 'd']],
+    ['unknown dependency', ['graphs/operate-loop.yaml'], ['absent']],
+    ['empty paths', [], ['a']],
+    ['non-yaml graph path', ['graphs/operate-loop.yml'], ['a']],
+    ['nested non-graph path', ['other/graphs/operate-loop.yaml'], ['a']],
+  ])('does not fold %s', async (_reason, hotPaths, dependsOn) => {
+    const subtasks = [
+      { id: 'a', feature: 'Handler', hotPaths: ['src/nexus/api/foo.ts'] },
+      { id: 'b', feature: 'Registration', hotPaths, dependsOn },
+      { id: 'd', feature: 'Second dependency', hotPaths: ['src/other.ts'] },
+    ];
+    const result = await decomposeSelfDevGoal('ordinary decomposition', {
+      llm: async () => JSON.stringify({ subtasks }),
+    });
+    expect(result.goals.map((goal) => goal.id)).toEqual(['a', 'b', 'd']);
+    expect(result.goals[1]?.hotPaths).toEqual(hotPaths.length ? hotPaths : undefined);
+    expect(result.goals[1]?.feature).toBe('Registration');
+    expect(result.goals[1]?.dependsOn).toEqual(dependsOn.filter((id) => id !== 'absent').length
+      ? dependsOn.filter((id) => id !== 'absent') : undefined);
+    expect(foldRegistrationOnlyGoals(subtasks)).toEqual(subtasks);
+  });
+
+  test('folds the allowlisted CLI, Telegram, and nested graph registrations', () => {
+    for (const path of ['src/index.ts', 'src/telegram-commands.ts', 'graphs/operate-loop.yaml', 'graphs/nested/recipe.yaml']) {
+      expect(foldRegistrationOnlyGoals([
+        { id: 'a', feature: 'Definition', hotPaths: ['src/definition.ts'] },
+        { id: 'b', feature: 'Registration', hotPaths: [path], dependsOn: ['a'] },
+      ])).toEqual([{ id: 'a', feature: 'Definition\nAlso register: Registration', hotPaths: ['src/definition.ts', path] }]);
+    }
+  });
+
+  test('folds chained registrations until no registration-only dependent remains', () => {
+    expect(foldRegistrationOnlyGoals([
+      { id: 'a', feature: 'Handler', hotPaths: ['src/nexus/api/foo.ts'] },
+      { id: 'b', feature: 'Route', hotPaths: ['src/nexus/api/http-server.ts'], dependsOn: ['a'] },
+      { id: 'c', feature: 'CLI', hotPaths: ['src/index.ts'], dependsOn: ['b'] },
+      { id: 'd', feature: 'Consumer', dependsOn: ['c'] },
+    ])).toEqual([
+      { id: 'a', feature: 'Handler\nAlso register: Route\nAlso register: CLI', hotPaths: ['src/nexus/api/foo.ts', 'src/nexus/api/http-server.ts', 'src/index.ts'] },
+      { id: 'd', feature: 'Consumer', dependsOn: ['a'] },
+    ]);
+  });
+
+  test('preserves ordinary decomposition unchanged', () => {
+    const goals = parseSelfDevDecomposition(JSON.stringify({ subtasks: [
+      { id: 'a', feature: 'Implement handler', hotPaths: ['src/nexus/api/foo.ts'] },
+      { id: 'b', feature: 'Implement service', hotPaths: ['src/nexus/api/bar.ts'], dependsOn: ['a'] },
+    ] }));
+    expect(foldRegistrationOnlyGoals(goals)).toEqual(goals);
+  });
+
+  test('explicit Fabric output is folded before final observation', async () => {
+    const events: Array<{ event: string; data: unknown }> = [];
+    const original = debug.log;
+    (debug as { log: typeof debug.log }).log = ((_category, event, data) => {
+      events.push({ event, data });
+    }) as typeof debug.log;
+    try {
+      const result = await decomposeSelfDevGoal('fabric request', {
+        decomposer: 'fabric',
+        fabric: {
+          context: { goal: 'unused', groundingContext: 'grounded context' },
+          resolve: async () => 'unused',
+          decompose: async () => ({
+            status: 'decomposed',
+            goals: [
+              { id: 'a', feature: 'Handler', hotPaths: ['src/nexus/api/foo.ts'] },
+              { id: 'b', feature: 'Route', hotPaths: ['src/nexus/api/http-server.ts'], dependsOn: ['a'] },
+            ],
+            decompositions: [], rfc: {} as never, omittedGoalCount: 0, budgetSkippedArcCount: 0, budgetLimited: false,
+          }),
+        },
+      });
+      expect(result.goals).toEqual([{ id: 'a', feature: 'Handler\nAlso register: Route', hotPaths: ['src/nexus/api/foo.ts', 'src/nexus/api/http-server.ts'] }]);
+      expect(events.find(({ event }) => event === 'decomposition')?.data).toMatchObject({ foldedRegistration: 1 });
+    } finally {
+      (debug as { log: typeof debug.log }).log = original;
     }
   });
 });

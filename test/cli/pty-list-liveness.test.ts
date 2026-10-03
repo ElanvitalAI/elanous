@@ -1,7 +1,10 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repo = process.cwd();
 

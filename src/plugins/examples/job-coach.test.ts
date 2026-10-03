@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -8,6 +8,9 @@ import { handleRequest, tools } from '../../../plugins/job-coach/connectors/ncs/
 import { courseLinks } from '../../../plugins/job-coach/graphs/course-links.js';
 import { judgeGaps } from '../../../plugins/job-coach/graphs/gap-judge.js';
 import { runGraph } from '../../graph-runner/runner.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const root = resolve(import.meta.dir, '../../../plugins/job-coach');
 const manifest = JSON.parse(readFileSync(join(root, 'plugin.json'), 'utf8'));

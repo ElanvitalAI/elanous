@@ -4,10 +4,13 @@
 // touches the production daemon's state while still reusing the prod
 // config. Guards the wiring in the 5 path functions.
 
-import { describe, test, expect, afterEach } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const ORIG = process.env.ELANOUS_STATE_DIR;
 const ORIG_SESS = process.env.ELANOUS_SESSION_ROOT;

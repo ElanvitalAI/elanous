@@ -219,19 +219,22 @@ function uniqueName(dir: string, name: string, size: number, taken: Set<string>)
 
 export const FIELD_CAPTION_TAG = '#현장';
 
-/** 캡션에 독립 토큰 `#현장` 이 있으면 `{ event? }`, 없으면 null.
- *  `#현장 <slug>` — 바로 다음 토큰을 소문자로 바꿔 슬러그 규칙에 맞으면 행사 이름, 아니면 기본 행사. */
-export function parseFieldCaption(caption: string | undefined | null): { event?: string; text?: string } | null {
+/** 캡션에 독립 토큰 `#현장` 이 있으면 `{ event?, mode?, text? }`, 없으면 null.
+ *  `#현장 <slug>` — 모드 토큰을 건너뛴 바로 다음 토큰을 소문자로 바꿔 슬러그 규칙에 맞으면 행사 이름, 아니면 기본 행사. */
+export function parseFieldCaption(caption: string | undefined | null): { event?: string; mode?: 'instant'; text?: string } | null {
   if (!caption) return null;
   const tokens = caption.trim().split(/\s+/);
   const at = tokens.indexOf(FIELD_CAPTION_TAG);
   if (at < 0) return null;
-  const next = tokens[at + 1]?.toLowerCase();
+  const isInstant = (token: string) => token === '즉석' || token.toLowerCase() === 'instant';
+  const mode = tokens.some(isInstant) ? 'instant' : undefined;
+  const eventAt = at + 1 + (tokens[at + 1] && isInstant(tokens[at + 1]) ? 1 : 0);
+  const next = tokens[eventAt]?.toLowerCase();
   const hasEvent = !!next && isFieldSlug(next);
-  // 태그·행사 이름을 뺀 나머지가 «글»(자막) — 태그 앞에 쓴 글도 같이.
-  const rest = tokens.filter((_, i) => i !== at && !(hasEvent && i === at + 1)).join(' ');
+  // 태그·행사 이름·모드를 뺀 나머지가 «글»(자막) — 태그 앞에 쓴 글도 같이.
+  const rest = tokens.filter((token, i) => i !== at && !(hasEvent && i === eventAt) && !isInstant(token)).join(' ');
   const text = normalizeFieldCaption(rest);
-  return { ...(hasEvent ? { event: next } : {}), ...(text ? { text } : {}) };
+  return { ...(hasEvent ? { event: next } : {}), ...(mode ? { mode } : {}), ...(text ? { text } : {}) };
 }
 
 export const FIELD_CAPTIONS_FILE = 'captions.txt';

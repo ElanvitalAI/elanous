@@ -5,6 +5,8 @@ graph_id: field-feed
 loop:
   title: 현장 피드
   description: 현장 사진에서 릴스·캐러셀·캡션을 만들어 게시 대기열에 올리고, 사람이 승인하면 게시 준비 묶음을 보낸다
+  exec_request: true
+  inputs: [folder]
   trigger:
     events: [manual]
 version: 1

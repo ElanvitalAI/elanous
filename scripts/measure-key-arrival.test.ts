@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -22,6 +22,9 @@ import {
   type ElanousCommandResult,
   type ElanousCommandRunner,
 } from './measure-key-arrival.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 type OptionalKeys<T> = {
   [K in keyof T]-?: {} extends Pick<T, K> ? K : never;

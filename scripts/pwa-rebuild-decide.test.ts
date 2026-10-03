@@ -1,8 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { decidePwaRebuild, formatPwaRebuildDecision, main } from './pwa-rebuild-decide.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const past = new Date('2026-01-01T00:00:00.000Z');
 const future = new Date('2026-01-02T00:00:00.000Z');

@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,9 @@ import { spawnSync } from 'node:child_process';
 import { Command } from 'commander';
 import { MsgStore } from '../msg/msg-store.js';
 import { registerMsgCommands } from './msg-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });

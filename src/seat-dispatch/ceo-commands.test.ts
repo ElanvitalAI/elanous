@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import type { MessageEnvelope } from '../msg/msg-store.js';
-import { handleCeoSeatCommand, type CeoCommandDeps } from './ceo-commands.js';
+import { dispatchCeoTask, handleCeoSeatCommand, type CeoCommandDeps } from './ceo-commands.js';
 
 const OWNER = '111';
 function harness(over: Partial<CeoCommandDeps> = {}) {
@@ -22,6 +22,47 @@ test('owner in a private chat: one channel line, one ceo-task message, «받음�
   expect(reply).toBe('받음 — TC에 전했습니다.');
   expect(gh).toEqual([{ args: ['pr', 'comment', '20798', '--repo', 'acme/repo', '--body-file', '-'], stdin: '**[대표]** 2026-10-02 12:30 KST → TC · 결제 화면 오타 고쳐 줘' }]);
   expect(stored).toEqual([{ from: 'CEO', to: 'TC', body: '결제 화면 오타 고쳐 줘', kind: 'ceo-task' }]);
+});
+
+test('dispatchCeoTask routes a non-Telegram request through the same seat store and channel', async () => {
+  const { deps, gh, stored } = harness({ ownerId: null });
+  const result = await dispatchCeoTask('MK', '  홍보   문구  검토  ', deps);
+  expect(result).toEqual({ reply: '받음 — MK에 전했습니다.', channel: 'posted' });
+  expect(stored).toEqual([{ from: 'CEO', to: 'MK', body: '홍보 문구 검토', kind: 'ceo-task' }]);
+  expect(gh).toEqual([{ args: ['pr', 'comment', '20798', '--repo', 'acme/repo', '--body-file', '-'], stdin: '**[대표]** 2026-10-02 12:30 KST → MK · 홍보 문구 검토' }]);
+});
+
+test('Discord seat dispatch uses the existing inbox and coordination channel path', async () => {
+  const { deps, gh, stored } = harness();
+  const result = await dispatchCeoTask('TC', '결제 화면 오타 고쳐 줘', deps, { via: 'discord' });
+  expect(result).toEqual({ reply: '받음 — TC에 전했습니다.', channel: 'posted' });
+  expect(stored).toEqual([{ from: 'CEO', to: 'TC', body: '결제 화면 오타 고쳐 줘', kind: 'ceo-task' }]);
+  expect(gh).toEqual([{ args: ['pr', 'comment', '20798', '--repo', 'acme/repo', '--body-file', '-'], stdin: '**[대표]** 2026-10-02 12:30 KST → TC · 결제 화면 오타 고쳐 줘' }]);
+});
+
+test('dispatchCeoTask rejects whitespace-only requests before writing', async () => {
+  const { deps, gh, stored } = harness();
+  const result = await dispatchCeoTask('OP', '  \t  ', deps);
+  expect(result.reply).toBe('할 일을 입력해 주세요.');
+  expect(stored).toEqual([]);
+  expect(gh).toEqual([]);
+});
+
+test('PWA dispatch includes attachment paths only in the seat inbox and not the channel', async () => {
+  const { deps, gh, stored } = harness();
+  const result = await dispatchCeoTask('OP', '현장 사진 보고 공지 초안', deps,
+    { attachments: [{ name: '현장.jpg', path: '/tmp/seat/att-1.jpg' }], via: 'pwa' });
+  expect(result).toEqual({ reply: '받음 — OP에 전했습니다.', channel: 'posted' });
+  expect(stored).toEqual([{ from: 'CEO', to: 'OP', kind: 'ceo-task', body: '현장 사진 보고 공지 초안\n첨부: 현장.jpg — /tmp/seat/att-1.jpg' }]);
+  expect(gh.map(({ stdin }) => stdin)).toEqual(['**[대표]** 2026-10-02 12:30 KST → OP · 현장 사진 보고 공지 초안 · 첨부 1 (PWA)']);
+});
+
+test('PWA channel failure leaves the seat message intact and returns a structured reason', async () => {
+  const { deps, stored } = harness({ runGh: async () => 1 });
+  expect(await dispatchCeoTask('TC', '확인', deps, { via: 'pwa' })).toEqual({
+    reply: '받음 — TC 메시지함에는 넣었습니다. 다만 조율 채널에 못 남겼습니다(gh 종료 코드 1).', channel: 'failed', channelError: 'gh 종료 코드 1',
+  });
+  expect(stored).toEqual([{ from: 'CEO', to: 'TC', body: '확인', kind: 'ceo-task' }]);
 });
 
 test('owner in a group is refused and nothing is written', async () => {
@@ -63,4 +104,22 @@ test('missing reply target is said in the reply instead of hidden', async () => 
   expect(await handleCeoSeatCommand('coo', ['x'], { chatId: 111, userId: 111 }, deps)).toContain('decisions.replyGhPr 미설정');
   expect(gh).toEqual([]);
   expect(stored).toHaveLength(1);
+});
+
+test('dispatchCeoTask with a ref already in the seat inbox delivers nothing again and reports the channel as unknown', async () => {
+  const gh: string[] = [];
+  const stored: MessageEnvelope[] = [];
+  const deps: CeoCommandDeps = {
+    ownerId: null, replyTarget: 'acme/repo#20798',
+    runGh: async (_args, stdin) => { gh.push(stdin); return 0; },
+    append: (message) => { stored.push(message); },
+    hasMessage: (seat, ref) => stored.some((m) => m.to === seat && m.body.endsWith(`\n요청: ${ref}`)),
+  };
+  const first = await dispatchCeoTask('OP', '공지 초안', deps, { via: 'pwa', ref: 'pwa:r-1' });
+  expect(first.channel).toBe('posted');
+  expect(stored).toEqual([{ from: 'CEO', to: 'OP', body: '공지 초안\n요청: pwa:r-1', kind: 'ceo-task' }]);
+  const retry = await dispatchCeoTask('OP', '공지 초안', deps, { via: 'pwa', ref: 'pwa:r-1' });
+  expect(retry.channel).toBe('unknown');
+  expect(stored).toHaveLength(1);
+  expect(gh).toHaveLength(1);
 });

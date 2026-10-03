@@ -1,6 +1,8 @@
 import { expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
-import { addDirective, directiveHash } from './directive.js';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { addDirective, directiveHash, loadDirectiveOrigin, loadDirectiveOrigins } from './directive.js';
 
 function fakeLinear() {
   const calls: Array<{ query: string; variables: Record<string, any>; headers: Record<string, string> }> = [];
@@ -34,6 +36,34 @@ test('directive creates a Linear issue then repeats as a comment, without leakin
   expect(created.description).toContain('2026-09-28T00:00:00.000Z');
   expect(JSON.stringify(fake.calls.map(c => c.variables))).not.toContain('private-token');
   expect(fake.calls.every(c => c.headers.Authorization === 'private-token')).toBe(true);
+});
+
+test('Telegram directive origin is stored per created and repeated issue, never in Linear or as a token', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-directive-origin-'));
+  const fake = fakeLinear();
+  const deps = { root, fetch: fake.fetch, getSecret: async () => 'key', team: 'ELA' };
+  try {
+    await addDirective('Build this', { source: 'telegram', origin: { chatId: 11, botId: '123', threadId: 3 } }, deps);
+    const path = join(root, 'steward', 'origins', 'ELA-1.json');
+    expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ channel: 'telegram', chatId: 11, botId: '123', threadId: 3 });
+    expect(readFileSync(path, 'utf8')).not.toContain('SECRET');
+    await addDirective('Build this', { source: 'telegram', origin: { chatId: 22, botId: '456:SECRET' } }, deps);
+    expect(readFileSync(path, 'utf8')).not.toContain('SECRET');
+    expect(loadDirectiveOrigins(root, 'ELA-1')).toEqual([
+      { channel: 'telegram', chatId: 11, botId: '123', threadId: 3 },
+      { channel: 'telegram', chatId: 22 },
+    ]);
+    await addDirective('Build this', { source: 'telegram', origin: { chatId: 22, botId: '456' } }, deps);
+    await addDirective('Build this', { source: 'telegram', origin: { chatId: 11, botId: '123', threadId: 3 } }, deps);
+    expect(loadDirectiveOrigins(root, 'ELA-1')).toEqual([
+      { channel: 'telegram', chatId: 11, botId: '123', threadId: 3 },
+      { channel: 'telegram', chatId: 22 },
+      { channel: 'telegram', chatId: 22, botId: '456' },
+    ]);
+    expect(loadDirectiveOrigin(root, 'ELA-1')).toMatchObject({ chatId: 11, botId: '123' });
+    expect(JSON.stringify(fake.calls.map(call => call.variables))).not.toContain('chatId');
+    expect(JSON.stringify(fake.calls.map(call => call.variables))).not.toContain('SECRET');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test('22 supplied directive summaries each dry-run without network access', async () => {

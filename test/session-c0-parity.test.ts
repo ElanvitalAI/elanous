@@ -1,12 +1,15 @@
 // C0 (2026-07-16) — cutover parity 하니스. 옛 배달 대상(바인딩) vs 새 fan-out 대상(구독자)
 // 대조 + 내용 유실 감지. green(수신자 일치+내용 정상)=flip 안전 신호.
 
-import { describe, test, expect } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSession, listSessions, type SessionMeta } from '../src/session/index.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function meta(bindings: SessionMeta['bindings']): SessionMeta {
   return { id: 's1', createdAt: '', updatedAt: '', title: '', provider: '', model: '', messageCount: 0, source: 'cli', bindings } as SessionMeta;

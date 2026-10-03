@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { parseGoalDocumentClarifications } from '../src/self-implement/goal-author-clarification.js';
 import { GoalRunStore } from '../src/self-implement/goal-run-store.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const temporaryDirectories: string[] = [];
 

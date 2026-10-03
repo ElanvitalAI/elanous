@@ -1,6 +1,11 @@
 import type { Command } from 'commander';
 import * as ui from '../ui.js';
 import { writeStdoutJson } from './stdout-json.js';
+import type { OpsNowResult } from '../ops-now/ops-now-refresh.js';
+
+export function opsNowExitCode(outcome: OpsNowResult['outcome']): number {
+  return outcome === 'channel-unreadable' || outcome === 'summarize-failed' ? 2 : 0;
+}
 
 export function registerOpsCommands(program: Command): void {
 const opsCmd = program.command('ops')
@@ -172,6 +177,21 @@ async function runOpsBuild(buildId: string | undefined, opts: OpsBuildOpts): Pro
   for (const l of snap.logTail) console.log(`  ${l}`);
   process.exit(0);
 }
+
+opsCmd.command('now-refresh').description('채널 📌안내로 ops-now 고정 기억 갱신(1회)')
+  .option('--once', '한 번 실행(기본)')
+  .option('--dry-run', '기억을 쓰지 않고 새 본문 출력')
+  .option('--json', '결과를 JSON으로 출력')
+  .action(async (o: { dryRun?: boolean; json?: boolean }) => {
+    const { refreshOpsNow } = await import('../ops-now/ops-now-refresh.js');
+    const result = await refreshOpsNow({ dryRun: o.dryRun === true });
+    if (o.json) await writeStdoutJson(JSON.stringify(result, null, 2) + '\n');
+    else {
+      console.log(`ops-now: ${result.outcome} · 안내 ${result.notices}개`);
+      if (o.dryRun && result.body !== undefined) console.log(result.body);
+    }
+    process.exitCode = opsNowExitCode(result.outcome);
+  });
 
 opsCmd.command('status').description('현재 상태 종합(미션·태스크·루프·오케스트레이션·스케줄) · --all-instances 로 fleet 전체 종합(미션/태스크/loops/스케줄/오케스트레이션) · -r/--remote 로 원격 GET 조립')
   .option('--json').option('--all-instances', '등록 인스턴스 전체 종합(미션/태스크/loops/스케줄/오케스트레이션 · fleet · read-only · §10)')

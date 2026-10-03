@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 
 import { matchTextInputGlobalAction } from '../src/chat/global-actions.js';
+import { textInput } from '../src/chat/index.js';
 import type { Key } from '../src/tui.js';
 
 function key(name: string, mods: Partial<Key> = {}): Key {
@@ -25,6 +26,33 @@ describe('matchTextInputGlobalAction', () => {
     expect(matchTextInputGlobalAction(key('z', { ctrl: true, shift: true }), {
       allowToggleLogZoom: false,
     })).toBeNull();
+  });
+
+  test('input consumes Ctrl+C before the global dispatcher, including Korean IME', async () => {
+    const chunks: string[] = [];
+    const oldWrite = process.stdout.write;
+    let globalDispatches = 0;
+    const keys = [key('c', { ctrl: true }), key('ㅊ', { ctrl: true })];
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      chunks.push(String(chunk));
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      const result = await textInput({
+        row: 3, col: 1, width: 80,
+        host: { dispatchGlobalAction: () => { globalDispatches++; } },
+        readKey: async () => {
+          const next = keys.shift();
+          if (!next) throw new Error('Ctrl+C was not handled by the input loop');
+          return next;
+        },
+      });
+      expect(result).toEqual({ text: '/quit', submitted: true });
+      expect(chunks.join('')).toContain('한 번 더 누르면 나갑니다 · /quit');
+      expect(globalDispatches).toBe(0);
+    } finally {
+      process.stdout.write = oldWrite;
+    }
   });
 
   test('includes copy-last-block only when requested', () => {

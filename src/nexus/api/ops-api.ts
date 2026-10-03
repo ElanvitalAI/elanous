@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { debug, redactSecretText } from '../../debug/log.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { listChecklist } from '../../release-loop/checklist.js';
+import { getSchedule } from '../../release-loop/release-schedule.js';
 import { jsonResponse } from './json-response.js';
 import { operatorSignal } from './operator.js';
 import { createSeatsCache, todayKst } from './ops-seats.js';
@@ -90,7 +91,15 @@ export function handleOpsApi(req: Request, metaApi: MetaApiOpts | undefined): Re
   const version = url.searchParams.get('version');
   if (pathname === '/v1/ops/checklist') {
     if (!version || !VERSION.test(version)) return jsonResponse({ error: 'invalid-version' }, 400);
-    return served(jsonResponse(listChecklist(version)));
+    // OPS2 header «컷 · 착지 마감»: the version's row in the release schedule (REL9a), or null when none is set.
+    let schedule: { cutAt: string; landBy: string | null } | null = null;
+    try {
+      const row = getSchedule(version);
+      schedule = row ? { cutAt: row.cutAt, landBy: row.landBy ?? null } : null;
+    } catch (error) {
+      debug.log('ops.api', 'schedule-unreadable', { version, reason: error instanceof Error ? error.message.slice(0, 80) : 'unknown' }, { level: 'warn' });
+    }
+    return served(jsonResponse({ ...listChecklist(version), schedule }));
   }
   if (pathname === '/v1/ops/release/runs') {
     if (version !== null && !VERSION.test(version)) return jsonResponse({ error: 'invalid-version' }, 400);

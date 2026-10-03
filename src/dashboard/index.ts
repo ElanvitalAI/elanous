@@ -17,6 +17,7 @@ import type { CommandRunner } from '../ad-pipeline/higgsfield-backend.js';
 import type { ShootRunOptions } from '../ad-pipeline/shoot-run.js';
 import type { QcThresholds } from '../ad-pipeline/qc.js';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { suggestProjectForFolder } from '../project/project-store.js';
 
 const dashboardDefaultShootRunOptions: Required<Pick<ShootRunOptions, 'pollIntervalMs' | 'maxPollsPerJob' | 'submitStaggerMs'>> = {
   pollIntervalMs: 3_000,
@@ -425,7 +426,6 @@ import {
   renderTurnTypeaheadEcho,
 } from '../chat/turn-typeahead.js';
 import { dispatchStreamingTurnTypeaheadSubmission } from './input/streaming-turn-typeahead.js';
-import { wireDashboardTurnTypeaheadEcho } from './turn-typeahead-echo.js';
 import { composeVertical, type LayoutZone } from '../layout/composer.js';
 import type { CoreTurnDispatchTool } from '../core-turn/index.js';
 // streamGrok kept as back-compat shim in chat.ts — not imported here
@@ -2654,6 +2654,41 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         after: chatLines.length,
       });
     }
+    chatScrollOffset = -1;
+  };
+  const liveTypeaheadEchoes: { at: number; lines: string[] }[] = [];
+  const restoreLiveTypeaheadEchoes = (): void => {
+    let after = 0;
+    for (const echo of liveTypeaheadEchoes) {
+      let found = -1;
+      for (let i = after; i <= chatLines.length - echo.lines.length; i++) {
+        if (echo.lines.every((line, offset) => chatLines[i + offset] === line)) {
+          found = i;
+          break;
+        }
+      }
+      if (found < 0) {
+        found = Math.max(after, Math.min(echo.at, chatLines.length));
+        chatLines.splice(found, 0, ...echo.lines);
+      }
+      echo.at = found;
+      after = found + echo.lines.length;
+    }
+  };
+  const echoSubmittedUserText = (text: string, opts?: { live?: boolean }): void => {
+    const echoStart = chatLines.length;
+    chatLines.push('');
+    if (opts?.live) chatLines.push(C.muted('  ↳ 이어서'));
+    const echoWrapCols = Math.max(20, termSize().cols - 6);
+    const echoRows = wrapAnsiByWidth(`❯ ${text}`, echoWrapCols);
+    if (echoRows.length === 0) {
+      chatLines.push(C.accent('❯ '));
+    } else {
+      echoRows.forEach((row, i) => {
+        chatLines.push(C.accent(i === 0 ? row : `  ${row}`));
+      });
+    }
+    if (opts?.live) liveTypeaheadEchoes.push({ at: echoStart, lines: chatLines.slice(echoStart) });
     chatScrollOffset = -1;
   };
   const pushDebugLine = (line: string): void => {
@@ -6907,7 +6942,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             turnTypeaheadRef.state = r.state;
             if (r.submissionDisposition) {
               debug.log('dashboard.turn-typeahead', 'submission-classified', {
-                text: r.immediateSubmission ?? turnTypeaheadRef.state.queuedSubmissions.at(-1),
+                length: (r.immediateSubmission ?? turnTypeaheadRef.state.queuedSubmissions.at(-1))?.length ?? 0,
                 disposition: r.submissionDisposition,
               });
               // ⭐⭐⭐ `B3`(2026-08-19 · 대표 지시 ②) — FIFO 로 «턴 종료 후» 나가던 것을,
@@ -6934,6 +6969,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
                     // 배수된 만큼을 앞에서부터 떨어낸다(FIFO · 순서 보존).
                     const remaining = turnTypeaheadRef.state.queuedSubmissions.slice(drained.length);
                     turnTypeaheadRef.state = { ...turnTypeaheadRef.state, queuedSubmissions: remaining };
+                    for (const text of drained) {
+                      echoSubmittedUserText(text, { live: true });
+                      debug.log('dashboard.turn-typeahead', 'echoed', { path: 'live', length: text.length });
+                    }
+                    if (drained.length > 0) draw();
                     debug.log('dashboard.turn-typeahead', 'drained-into-live-turn', {
                       drained: drained.length, remaining: remaining.length,
                     });
@@ -15751,6 +15791,12 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
         chatLines.push(C.muted(`    ${resume.turns} turns restored. Next turn continues this conversation.`));
       }
     }
+    if (dashboardAcpBootResult.mode !== 'resumed' && !chat.history.some((message) => message.role !== 'system')) {
+      try {
+        const project = suggestProjectForFolder(process.cwd());
+        if (project) chatLines.push(C.muted(`  Project suggestion: ${project.name} (${project.id})`));
+      } catch { /* suggestions must not interrupt the dashboard conversation */ }
+    }
     chatScrollOffset = -1;
     void renderDashboardFirstScreenBand({
       history: chat.history,
@@ -16820,8 +16866,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           lastTurnFinalStatus = undefined;
           turnTypeaheadRef.state = drained.state;
           nextInitial = drained.nextInitial;
-          const turnTypeaheadEcho = wireDashboardTurnTypeaheadEcho(drained);
-          if (turnTypeaheadEcho) chatLines.push(C.muted(turnTypeaheadEcho));
+          const queuedTurnEndText = drained.injectEnter ? drained.nextInitial : undefined;
           if (interrupted && queuedBeforeDrain > 0) {
             debug.log('dashboard.turn-typeahead', 'restored-after-interrupt', { count: queuedBeforeDrain });
           }
@@ -18655,25 +18700,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
           // pattern. Without this draw(), the echo sits in the chatLines
           // array but doesn't paint until after the skill router's
           // classifier LLM call returns (~1-2s of visual silence).
-          chatLines.push('');
-          // Wrap the echoed user message to the log width so long input
-          // soft-wraps onto continuation rows instead of being truncated
-          // with a `\u2026+N` marker by the log-pane renderer (which keeps a
-          // strict 1-line-per-row invariant and only truncates lines that
-          // weren't pre-wrapped). termCols-6 leaves room for the log
-          // pane's 2-col left margin plus the 2-col hanging indent on
-          // continuation rows; the \u276f marker stays on the first row only.
-          const echoWrapCols = Math.max(20, termSize().cols - 6);
-          const echoRows = wrapAnsiByWidth(`\u276f ${tok.text}`, echoWrapCols);
-          if (echoRows.length === 0) {
-            chatLines.push(C.accent('\u276f '));
-          } else {
-            echoRows.forEach((row, i) => {
-              chatLines.push(C.accent(i === 0 ? row : `  ${row}`));
-            });
+          echoSubmittedUserText(tok.text);
+          if (queuedTurnEndText !== undefined && input.text === queuedTurnEndText) {
+            debug.log('dashboard.turn-typeahead', 'echoed', { path: 'turn-end', length: queuedTurnEndText.length });
           }
           renderAttachmentSummary(tok.added);
-          chatScrollOffset = -1;
           draw();
 
           // Start the animated thinking indicator BEFORE the router so
@@ -19031,6 +19062,7 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
             createTurnStreamRuntime: (initialAssistantStart) => {
               latestTurnUsage = undefined;
               createDashboardTurnStreamRuntimeEscBoundary(escAbortToolState);
+              liveTypeaheadEchoes.length = 0;
               const toolRendering = {
                 ...getUserConfig().chat.rendering.tool,
                 expandHint: false,
@@ -19070,6 +19102,11 @@ Mode- and sync-specific instructions are injected per-turn when relevant — do 
               });
               return {
                 ...turnStreamRuntime,
+                onText: (chunk, accumulated) => {
+                  turnStreamRuntime.onText(chunk, accumulated);
+                  restoreLiveTypeaheadEchoes();
+                  draw();
+                },
                 onToolCall: (call) => {
                   const toolCall = call as DashboardTurnStreamCall;
                   trackEscAbortToolCall(escAbortToolState, toolCall);

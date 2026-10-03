@@ -210,6 +210,23 @@ export function capturedEnvAvailable(): boolean {
   return captured && cached !== null;
 }
 
+/** Append login-shell PATH entries to the target without replacing its existing environment. */
+export function mergeCapturedPath(target: NodeJS.ProcessEnv = process.env, opts: { capture?: boolean } = {}): number {
+  // capture: 아직 캡처 전이면 여기서 한 번 캡처한다(호출부가 getCapturedEnv 를 직접 부르지 않게 — identity-env 래칫).
+  const capturedPath = opts.capture || capturedEnvAvailable() ? getCapturedEnv().PATH : undefined;
+  const seen = new Set((target.PATH ?? '').split(':'));
+  const missing: string[] = [];
+  for (const entry of capturedPath?.split(':') ?? []) {
+    if (!entry || seen.has(entry)) continue;
+    missing.push(entry);
+    seen.add(entry);
+  }
+  if (missing.length) target.PATH = target.PATH ? `${target.PATH}:${missing.join(':')}` : missing.join(':');
+  const added = missing.length;
+  debug.log('shell.envbootstrap.capture', 'path-merged', { added });
+  return added;
+}
+
 /** Reset cache — test seam. */
 export function resetCapturedEnvForTesting(): void {
   cached = null;

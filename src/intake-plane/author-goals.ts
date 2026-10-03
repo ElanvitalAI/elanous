@@ -2,7 +2,8 @@
  * intake check → 골 저작 연결. 판정 「없음」마다 기존 골 중복을 먼저 보고, 없으면 골 저작기로 골 문서를 쓰고 lint 한 뒤 멈춘다.
  * 하니스는 발사하지 않는다. 골: 내부 문서 `ASK-intake-check-authors-goals-for-gaps-2026-09-24`
  */
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { CardStore, taskCardsDir } from '../task-cards/card-store.js';
 import { join, relative } from 'node:path';
 import { debug } from '../debug/log.js';
 import { resolveGoalDocumentsDir } from '../self-implement/goal-documents-dir.js';
@@ -42,7 +43,22 @@ function defaultGoalDocs(root: string): { path: string; text: string }[] {
     .map((name) => ({ path: relative(root, join(dir, name)), text: readFileSync(join(dir, name), 'utf8') }));
 }
 
-function authorAsk(item: IntakeCheckItem): string {
+function prfaqSignals(sourceRef: string | undefined, root: string): { source: string; signals: string[] } | undefined {
+  if (!sourceRef?.startsWith('linear:') || !existsSync(taskCardsDir(root))) return undefined;
+  const store = new CardStore(root);
+  try {
+    const cards = store.listCards();
+    const matches = cards.filter(row => row.goalId === sourceRef);
+    const card = matches.length === 1 ? matches[0] : undefined;
+    const section = [...(card?.sections ?? [])].reverse().find(row => row.key.startsWith('prfaq:'));
+    if (!section) return undefined;
+    const criteria = section.content.split('⑧ 판정 기준')[1]?.split('⑨')[0] ?? '';
+    const signals = criteria.split('\n').map(line => line.trim().replace(/^-\s*/, '')).filter(line => /^판정 신호: 조건 = .+; 관측 = .+; 기대 = .+\.$/.test(line)).slice(0, 2);
+    return signals.length ? { source: `${card!.goalId} / ${section.key}`, signals } : undefined;
+  } finally { store.close(); }
+}
+
+function authorAsk(item: IntakeCheckItem, evidence?: { source: string; signals: string[] }): string {
   // The first line leads the ask and `제목:` is the title the author forwards (parseAskProseTitle), so both are the fact.
   return [
     item.fact,
@@ -52,7 +68,21 @@ function authorAsk(item: IntakeCheckItem): string {
     '백틱 이름은 대조에 쓴 검색 표지일 뿐이다 — 그 문자열이 저장소에 생기는 것을 판정 신호로 삼지 말고, 사실이 말하는 동작을 판정 신호로 쓴다.',
     `대조 결과: ${item.current}`,
     ...(item.quotes.length > 0 ? [`출처 인용: ${item.quotes.join(' / ')}`] : []),
+    ...(evidence ? [`아래 판정 신호를 골 문서 ## 판정 신호에 원문 그대로 인용하라. 출처: 카드 ${evidence.source}`, ...evidence.signals] : []),
   ].join('\n');
+}
+
+function appendPrfaqSignals(document: string, evidence: { source: string; signals: string[] }): string {
+  const section = /^## 판정 신호\s*$/m.exec(document);
+  if (!section) throw new Error('Authored goal has no ## 판정 신호 section');
+  const start = section.index + section[0].length;
+  const end = document.slice(start).search(/^## /m);
+  const boundary = end < 0 ? document.length : start + end;
+  const block = document.slice(start, boundary);
+  const missing = evidence.signals.filter(signal => !block.includes(signal));
+  const source = block.includes(`출처: 카드 ${evidence.source}`) ? '' : `출처: 카드 ${evidence.source}\n`;
+  if (!missing.length && !source) return document;
+  return document.slice(0, boundary) + `\n${source}${missing.map(signal => `- ${signal}`).join('\n')}\n` + document.slice(boundary);
 }
 
 export async function authorIntakeGoals(
@@ -84,8 +114,11 @@ export async function authorIntakeGoals(
     }
     authored++;
     try {
-      const written = await deps.author(authorAsk(item), `intake check: ${opts.source}`);
-      const lintErrors = deps.lintErrors(written.document);
+      const evidence = prfaqSignals(item.sourceRef, deps.root);
+      const written = await deps.author(authorAsk(item, evidence), `intake check: ${opts.source}`);
+      const document = evidence ? appendPrfaqSignals(written.document, evidence) : written.document;
+      if (document !== written.document) writeFileSync(join(deps.root, written.path), document);
+      const lintErrors = deps.lintErrors(document);
       outcomes.push({ fact: item.fact, status: 'authored', goalPath: written.path, lintErrors });
     } catch (error) {
       outcomes.push({ fact: item.fact, status: 'author-failed', reason: error instanceof Error ? error.message : String(error) });

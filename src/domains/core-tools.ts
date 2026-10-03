@@ -28,6 +28,9 @@ import { OPS_STATUS_SPEC, dispatchOpsStatus } from './ops-status-tool.js';
 import { SE_BUILD_SPEC, dispatchSeBuild } from './se-build-tool.js';
 import { LOGS_QUERY_SPEC, dispatchLogsQuery } from './logs-tool.js';
 import { MISSION_DECIDE_SPEC, dispatchMissionDecide } from '../autopilot/mission-decide-tool.js';
+import { COO_ADMIN_SPEC, dispatchCooAdmin } from './coo-admin-tool.js';
+import { RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, dispatchReleaseStatus, dispatchReleaseChange } from './release-tool.js';
+import { OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC, dispatchOpsSeats, dispatchDecisionsPending } from './ops-facts-tool.js';
 
 /** memory_recall — 크로스서피스 기억(자기 발송 원장 회상). 도메인 무관(domain 필터는 옵션).
  *  finance-tools 에서 L2 로 이관(2026-07-08). */
@@ -118,6 +121,8 @@ const CORE_TOOL_HANDLERS: Record<string, (args: Record<string, unknown>, onParti
   se_build: dispatchSeBuild, // SE 격리 빌드 관측(빌드 안 뭐 하나·로그 tail·worktree diff)·코어
   logs_query: dispatchLogsQuery, // 크로스서피스 디버그 로그 조회(logs.db·LF3)·READ-ONLY 코어
   mission_decide: dispatchMissionDecide, // 미션 결정 기록(re-ground·defer·boundary…)·3박자 주입·코어
+  coo_admin: (args) => dispatchCooAdmin(args),
+  release_status: async (args) => dispatchReleaseStatus(args),
 };
 
 /** Worker-side search entry: dispatch must not re-enter its own budget wrapper. */
@@ -136,7 +141,7 @@ const SELF_RECALL_BUDGET_SPEC: LLMToolSpec = {
     },
   },
 };
-export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC];
+export const CORE_TOOL_SPECS: LLMToolSpec[] = [SCHEDULE_MANAGE_SPEC, SESSION_MANAGE_SPEC, MEMORY_RECALL_SPEC, FACT_CHECK_SPEC, SELF_RECALL_BUDGET_SPEC, AUTOPILOT_MISSION_SPEC, OPS_STATUS_SPEC, SE_BUILD_SPEC, LOGS_QUERY_SPEC, MISSION_DECIDE_SPEC, COO_ADMIN_SPEC, RELEASE_STATUS_SPEC, RELEASE_CHANGE_SPEC, OPS_SEATS_SPEC, DECISIONS_PENDING_SPEC];
 
 export interface CoreTools {
   specs: LLMToolSpec[];
@@ -153,11 +158,14 @@ export function buildCoreTools(recallSearch?: RecallSearch): CoreTools {
     names,
     dispatch: async (name, args, onPartial, context) => {
       const h = CORE_TOOL_HANDLERS[name];
-      if (!h) return { error: `unknown core tool: ${name}` };
+      if (!h && name !== 'release_change' && name !== 'ops_seats' && name !== 'decisions_pending') return { error: `unknown core tool: ${name}` };
+      if (name === 'release_change') return dispatchReleaseChange(args, context);
+      if (name === 'ops_seats') return dispatchOpsSeats(args, context);
+      if (name === 'decisions_pending') return dispatchDecisionsPending(context);
       if (name === 'memory_recall' || name === 'self_recall') {
         return runRecall(name, args, context ?? { surface: 'skill' }, recallSearch, onPartial);
       }
-      return h(args, onPartial);
+      return h!(args, onPartial);
     },
   };
 }

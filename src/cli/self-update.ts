@@ -343,6 +343,14 @@ function pruneReleaseVersions(plan: { current: string; previous: string; keep: n
   return { removed, kept };
 }
 
+/** The build identity of an install.json — version, version folder and commit; empty when it cannot be read. */
+function installedBuild(metadata: unknown): string {
+  if (typeof metadata !== 'object' || metadata === null) return '';
+  const { version, versionDir, commit } = metadata as { version?: unknown; versionDir?: unknown; commit?: unknown };
+  if (typeof version !== 'string' || !version || typeof versionDir !== 'string' || !versionDir) return '';
+  return JSON.stringify([version, versionDir, typeof commit === 'string' ? commit : '']);
+}
+
 /** A release update never packs the checkout: the downloaded installer verifies its own release tarball. */
 export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps: ReleaseUpdateDeps = {}): Promise<SelfUpdateResult> {
   const out = deps.out ?? console;
@@ -390,8 +398,10 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
     return fail(1, `설치기 다운로드 실패 (${url}): ${String(error)}`);
   }
   let previous = '';
+  let previousBuild = '';
   try {
     const metadata: unknown = JSON.parse(readFileSync(join(prefix, 'install.json'), 'utf8'));
+    previousBuild = installedBuild(metadata);
     if (typeof metadata === 'object' && metadata !== null && 'versionDir' in metadata && typeof metadata.versionDir === 'string') {
       const dir = metadata.versionDir;
       if (/^versions\/[a-zA-Z0-9._-]+$/.test(dir) && !dir.includes('..')) previous = basename(dir);
@@ -421,6 +431,10 @@ export async function runReleaseUpdate(options: ReleaseUpdateOptions = {}, deps:
       prune = { removed: [], kept: [], skipped: `정리 실패: ${String(error)}` };
     }
     if (!options.restart) return finish({ exitCode: 0, installedVersion, decision: null, restarted: false, prune, reason: '--restart 없음: 재시작하지 않음' });
+    // REL6: the same build again (version · folder · commit unchanged) leaves the running daemon as it is.
+    if (previousBuild && previousBuild === installedBuild(metadata)) {
+      return finish({ exitCode: 0, installedVersion, decision: null, restarted: false, prune, reason: `already at ${installedVersion} · restart skipped` });
+    }
     const os = deps.os ?? platform();
     const command = os === 'darwin' ? 'launchctl' : os === 'linux' ? 'systemctl' : null;
     if (!command) return finish({ exitCode: 1, installedVersion, decision: null, restarted: false, prune, reason: `지원하지 않는 플랫폼: ${os}` });

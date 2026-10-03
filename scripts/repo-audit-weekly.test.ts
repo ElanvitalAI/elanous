@@ -1,6 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { AUDITORS, extractKeyNumbers, runWeeklyAudit, selfCheck, type AuditName } from './repo-audit-weekly.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const SCRIPT = new URL('./repo-audit-weekly.ts', import.meta.url).pathname;
 const ROOT = new URL('..', import.meta.url).pathname;

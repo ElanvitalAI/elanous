@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -8,6 +8,9 @@ import { getElanousConfigDirOverride, resetElanousConfigDir, setElanousConfigDir
 import { RemotesStore, type RemoteEntry } from './remotes.js';
 import { runMcpCall, runMcpList } from './mcp-call.js';
 import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const BIN = resolve(REPO_ROOT, 'bin/elanous.mjs');

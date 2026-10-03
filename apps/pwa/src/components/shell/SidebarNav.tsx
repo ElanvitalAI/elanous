@@ -3,27 +3,17 @@
 import { Suspense, useEffect, useState, type ReactNode } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { X } from 'lucide-react';
+import { ChevronDown, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { usePwaRole } from '@/lib/pwa-role';
-import { visibleForRole } from '@/lib/route-maturity';
-import { NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, SIDEBAR_NAV_ITEMS, visibleNavGroups } from './sidebar-nav-items';
+import { useOperator } from '@/lib/use-operator';
+import { routeMaturity, visibleForRole } from '@/lib/route-maturity';
+import { useShowBeta } from '@/lib/show-beta';
+import { NAV_SHOW_HIDDEN_KEY, NAV_SHOW_LABS_KEY, NAV_GROUPS, SIDEBAR_NAV_ITEMS, visibleNavGroups, type NavGroupId } from './sidebar-nav-items';
 import { NAV_PREFS_EVENT, readFlag } from './nav-visibility-prefs';
 import { SidebarWorkflowInvoker } from './SidebarWorkflowInvoker';
 import { ShowroomSidebarSection } from './ShowroomSidebarSection';
 
-// 2026-05-06 — sidebar nav workspace 통합 (BACKLOG-webterm-followups §4).
-// Sidebar 클릭 시 single-page (/chat · /term 등) 으로 가는 대신 workspace 의
-// activateOrAdd / openPicker 로 라우팅. /workspace?intent=<kind> 로 push 한 뒤
-// /workspace/page.tsx 가 query 보고 처리. /chat /term /voice 등 single-page
-// route 는 deep link 용으로 보존 (URL 직접 입력 시 그대로 동작).
-//
-// 2026-05-07 — 사용자 dogfood feedback: 사용 빈도 순으로 재배치
-// (Terminal 최상단 → Chat → Voice → 나머지). compact 모드의 tooltip
-// 도 한국어 + 짧은 hint 가 같이 노출되어 첫 사용자가 아이콘만으로
-// 망설임 없이 진입할 수 있도록 정리. NAV_ITEMS 표는 별도 pure module
-// (sidebar-nav-items.ts) 로 추출 — Next App Router 훅에 의존 안 하는
-// 단위 테스트 가능.
 const NAV_ITEMS = SIDEBAR_NAV_ITEMS;
 
 // usePathname() with basePath:'/app' + trailingSlash:true returns
@@ -54,13 +44,26 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
   const router = useRouter();
   const current = normalizePath(pathname ?? '/');
   const role = usePwaRole();
-  // Workspace intent is only used for roles whose menus include the beta workspace.
-  // General users follow stable direct links; typed addresses keep working for everyone.
+  const { showBeta } = useShowBeta();
+  const operator = useOperator();
+  const [collapsed, setCollapsed] = useState<NavGroupId[]>([]);
+  useEffect(() => {
+    try {
+      const saved: unknown = JSON.parse(window.localStorage.getItem('elanous.nav.collapsedGroups') ?? '[]');
+      if (Array.isArray(saved)) setCollapsed(NAV_GROUPS.filter((group) => saved.includes(group.id)).map((group) => group.id));
+    } catch { /* Storage may be unavailable. */ }
+  }, []);
+  const toggleGroup = (id: NavGroupId) => {
+    const next = collapsed.includes(id) ? collapsed.filter((value) => value !== id) : [...collapsed, id];
+    setCollapsed(next);
+    try { window.localStorage.setItem('elanous.nav.collapsedGroups', JSON.stringify(next)); } catch { /* Storage may be unavailable. */ }
+  };
+  // General users follow direct links; typed beta addresses remain available even without menu opt-in.
   const handleNavClick = (
     item: typeof NAV_ITEMS[number],
     e: React.MouseEvent<HTMLAnchorElement>,
   ): void => {
-    if (item.kind === null || role === 'general') return; // General users stay on the selected stable destination.
+    if (item.kind === null || role === 'general') return; // General users stay on the selected direct destination.
     // Cmd/Ctrl-click → 새 탭에서 single-page route 직접 열림 (browser default).
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     e.preventDefault();
@@ -76,17 +79,16 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
     window.addEventListener('storage', read);
     return () => { window.removeEventListener(NAV_PREFS_EVENT, read); window.removeEventListener('storage', read); };
   }, []);
-  const groups = visibleNavGroups(NAV_ITEMS, prefs, role);
+  const groups = visibleNavGroups(NAV_ITEMS, prefs, role, operator, { showBeta });
   const renderItem = (item: typeof NAV_ITEMS[number]) => {
-    // Voice ('/') matches only an exact '/'. Other routes match
-    // exact OR any nested path so that future child routes
-    // (e.g. /intake/<id>) keep the parent highlighted.
+    // Highlight nested routes and the shared Missions/Editor destinations.
     const active =
       item.href === '/'
         ? current === '/'
         : current === item.href || current.startsWith(item.href + '/')
           || (item.activeAlso ?? []).some((p) => current === p || current.startsWith(p + '/'));
     const Icon = item.icon;
+    const experimental = role === 'general' && showBeta && item.href !== '/settings' && routeMaturity(item.href) === 'beta';
     return (
       <li key={item.href} className="group/nav relative">
         <Link
@@ -97,8 +99,8 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
             if (e.defaultPrevented) return;
             onNavigate?.();
           }}
-          title={compact ? `${item.label} — ${item.hint}` : item.hint}
-          aria-label={`${item.label} — ${item.hint}`}
+          title={compact ? `${item.label}${experimental ? ' · 실험' : ''} — ${item.hint}` : item.hint}
+          aria-label={`${item.label}${experimental ? ' · 실험' : ''} — ${item.hint}`}
           className={cn(
             'flex items-center rounded-md text-sm transition-colors',
             compact ? 'justify-center px-1.5 py-2' : 'gap-3 px-3 py-2',
@@ -114,6 +116,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
             )}
           />
           {!compact && item.label}
+          {!compact && experimental && <span className="rounded border border-primary/40 px-1 text-[10px] text-primary">실험</span>}
           {!compact && active && (
             <span
               className="ml-auto h-1.5 w-1.5 rounded-full bg-primary"
@@ -132,6 +135,7 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
             className="pointer-events-none absolute left-full top-1/2 z-50 ml-2 -translate-y-1/2 whitespace-nowrap rounded-md border border-border bg-popover px-2 py-1 text-[11px] text-popover-foreground opacity-0 shadow-md transition-opacity group-hover/nav:opacity-100 [@media(pointer:coarse)]:hidden"
           >
             <span className="font-medium">{item.label}</span>
+            {experimental && <span className="ml-1 text-primary">실험</span>}
             <span className="ml-1 text-muted-foreground">— {item.hint}</span>
           </span>
         )}
@@ -156,9 +160,40 @@ export function SidebarNav({ onNavigate, onClose, compact = false }: Props = {})
           </button>
         </div>
       )}
-      <ul className={cn('flex-1 space-y-1', compact ? 'px-1 py-2' : 'px-2 py-3')}>
-        {groups.main.map(renderItem)}
-      </ul>
+      <div className={cn('flex-1 space-y-2', compact ? 'px-1 py-2' : 'px-2 py-3')}>
+        {NAV_GROUPS.map((group) => {
+          const items = groups.main.filter((item) => item.group === group.id);
+          if (items.length === 0) return null;
+          const Icon = group.icon;
+          const first = items[0]!;
+          return (
+            <section key={group.id} aria-label={group.label}>
+              {!compact && items.length === 1 ? (
+                <ul>{renderItem(first)}</ul>
+              ) : compact ? (
+                <Link href={first.href as never}
+                  title={`${group.label}${role === 'general' && showBeta && first.href !== '/settings' && routeMaturity(first.href) === 'beta' ? ' · 실험' : ''}`}
+                  aria-label={`${group.label}${role === 'general' && showBeta && first.href !== '/settings' && routeMaturity(first.href) === 'beta' ? ' · 실험' : ''}`}
+                  onClick={() => onNavigate?.()}
+                  className="relative flex justify-center rounded-md px-1.5 py-2 text-sidebar-foreground/70 hover:bg-sidebar-accent">
+                  <Icon className="h-4 w-4" />
+                  {role === 'general' && showBeta && first.href !== '/settings' && routeMaturity(first.href) === 'beta' && <span aria-hidden className="absolute -right-1 -top-1 rounded bg-primary px-0.5 text-[8px] text-primary-foreground">실험</span>}
+                </Link>
+              ) : (
+                <>
+                  <button type="button" onClick={() => toggleGroup(group.id)} aria-expanded={!collapsed.includes(group.id)}
+                    aria-controls={`nav-group-${group.id}`}
+                    className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-xs font-semibold text-sidebar-foreground/80 hover:bg-sidebar-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                    <Icon className="h-4 w-4" />{group.label}
+                    <ChevronDown aria-hidden className={cn('ml-auto h-3.5 w-3.5 transition-transform', collapsed.includes(group.id) && '-rotate-90')} />
+                  </button>
+                  {!collapsed.includes(group.id) && <ul id={`nav-group-${group.id}`} className="ml-3 space-y-1 border-l border-sidebar-border pl-2">{items.map(renderItem)}</ul>}
+                </>
+              )}
+            </section>
+          );
+        })}
+      </div>
       {groups.labs.length > 0 && (
         <NavGroup label="Labs" compact={compact}>{groups.labs.map(renderItem)}</NavGroup>
       )}

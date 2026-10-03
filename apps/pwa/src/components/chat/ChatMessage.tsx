@@ -3,6 +3,8 @@
 import { useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { MARKDOWN_REMARK_PLUGINS } from '@/lib/markdown-render';
+import { extractElanousCards } from '@/lib/elanous-card';
+import { ElanousCard } from './ElanousCard';
 import { cn } from '@/lib/utils';
 import type { ChatBlock, ChatMessage as ChatMessageT } from '@/lib/chat-runtime';
 import { CollapsibleCodeBlock } from '@/components/agent/CollapsibleCodeBlock';
@@ -19,6 +21,18 @@ const MARKDOWN_COMPONENTS = { pre: CollapsibleCodeBlock };
 
 interface Props {
   message: ChatMessageT;
+}
+
+/** REL9p — cards only in daemon-side messages; a user's own text is shown exactly as typed. */
+function CardTextBody({ text, showCards }: { text: string; showCards: boolean }) {
+  if (!showCards) return <MarkdownBody text={text} />;
+  const extracted = extractElanousCards(text);
+  return (
+    <>
+      {extracted.text.trim() && <MarkdownBody text={extracted.text} />}
+      {extracted.cards.map((card, index) => <ElanousCard key={index} card={card} />)}
+    </>
+  );
 }
 
 function MarkdownBody({ text }: { text: string }) {
@@ -103,12 +117,12 @@ function ToolPill({
 /** Phase B-2/B-3 (PWA chat streaming · 2026-05-06) — multimodal block
  *  renderer. text → markdown; image → inline `<img>`; tool_use →
  *  status pill with optional args expand. */
-function BlocksBody({ blocks }: { blocks: ChatBlock[] }) {
+function BlocksBody({ blocks, showCards }: { blocks: ChatBlock[]; showCards: boolean }) {
   return (
     <div className="flex flex-col gap-2">
       {blocks.map((block, idx) => {
         if (block.kind === 'text') {
-          return <MarkdownBody key={idx} text={block.text} />;
+          return <CardTextBody key={idx} text={block.text} showCards={showCards} />;
         }
         if (block.kind === 'image') {
           return (
@@ -228,8 +242,8 @@ export function ChatMessageView({ message }: Props) {
         )}
       >
         {useBlocks
-          ? <BlocksBody blocks={message.blocks!} />
-          : <MarkdownBody text={message.text} />}
+          ? <BlocksBody blocks={message.blocks!} showCards={!isUser} />
+          : <CardTextBody text={message.text} showCards={!isUser} />}
         <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
           <span>{time}</span>
           {/* ⭐ 어느 터미널과의 대화인가 — 웹터미널 Dock 만 채운다. 없으면 안 그린다.

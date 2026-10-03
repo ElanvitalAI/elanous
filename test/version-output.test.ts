@@ -1,7 +1,10 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(240_000);
 
 const repo = join(import.meta.dir, '..');
 const cli = join(repo, 'bin/elanous.mjs');

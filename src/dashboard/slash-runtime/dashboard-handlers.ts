@@ -3995,6 +3995,13 @@ export function buildDashboardSlashRegistry(): SlashCommandRegistry<DashboardSla
     }
 
     if (seSub === 'new' || seSub === 'clear') {
+      if (seSub === 'new') {
+        try {
+          const { suggestProjectForFolder } = await import('../../project/project-store.js');
+          const project = suggestProjectForFolder(process.cwd());
+          if (project) ctx.chatLines.push(ctx.muted(`  Project suggestion: ${project.name} (${project.id})`));
+        } catch { /* suggestions must not interrupt a new conversation */ }
+      }
       // Clear the in-memory history and detach if attached. Doesn't
       // delete any session files — those stay on disk for
       // /session list to enumerate.

@@ -10,6 +10,7 @@ export interface SessionStoreCard {
   source: string;          // 'cli' | 'telegram'
   origin?: string;         // 'cli' | 'pwa' | 'tg' | 'dc' — 세밀 라벨(PWA 챗 구분)
   sourceKind?: string;
+  projectId?: string;
   createdAt: string;
   updatedAt: string;
   messageCount: number;

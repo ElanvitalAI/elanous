@@ -37,8 +37,48 @@ function firstObject(raw: string): Data {
 async function cli(bin: string, args: string[]): Promise<string> {
   const child = Bun.spawn([bin, ...args], { stdout: 'pipe', stderr: 'pipe', env: process.env });
   const [stdout, stderr, status] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-  if (status !== 0) throw new Error(`${args[0]} 실패: ${(stderr || stdout).slice(0, 200)}`);
+  if (status !== 0) throw new Error(`${args[0]} 실패: ${(stderr || stdout).slice(0, 200)}`, { cause: `${stderr}\n${stdout}` });
   return stdout;
+}
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
+
+function transientAskReason(error: unknown): string | null {
+  const message = error instanceof Error ? `${error.message}\n${String(error.cause ?? '')}` : String(error);
+  if (/socket connection was closed/i.test(message)) return 'socket';
+  if (/\bECONNRESET\b/i.test(message)) return 'ECONNRESET';
+  if (/\bETIMEDOUT\b/i.test(message)) return 'ETIMEDOUT';
+  if (/\bEPIPE\b/i.test(message)) return 'EPIPE';
+  if (/fetch failed/i.test(message)) return 'fetch';
+  const http = /\b(?:HTTP(?:\/[\d.]+)?\s*[:=]?\s*|status(?:\s+code)?\s*[:=]?\s*)(502|503|504|429)\b|\b(502|503|504|429)\s+(?:Bad Gateway|Service Unavailable|Gateway Timeout|Too Many Requests)\b/i.exec(message);
+  return http ? `HTTP${http[1] ?? http[2]}` : null;
+}
+
+export async function askWithRetry(payload: Data, run = cli, wait = sleep): Promise<Data> {
+  const args = ['ask', '--json', JSON.stringify(payload)];
+  let raw: string;
+  let retried = false;
+  try {
+    raw = await run(elanous, args);
+  } catch (error) {
+    const reason = transientAskReason(error);
+    if (!reason) throw error;
+    console.error(`card-followup: ask retry (${reason})`);
+    await wait(3000);
+    retried = true;
+    try {
+      raw = await run(elanous, args);
+    } catch (retryError) {
+      throw new Error(`${retryError instanceof Error ? retryError.message : String(retryError)} · 한 번 다시 했지만 실패`);
+    }
+  }
+  try {
+    const response = JSON.parse(raw) as Data;
+    return firstObject(typeof response.reply === 'string' ? response.reply : JSON.stringify(response));
+  } catch (error) {
+    if (retried) throw new Error(`${error instanceof Error ? error.message : String(error)} · 한 번 다시 했지만 실패`);
+    throw error;
+  }
 }
 
 function absolute(path: string, label: string): string {
@@ -82,13 +122,15 @@ function sources(raw: string): { title: string; url: string; snippet: string }[]
   });
 }
 
+const elanous = process.env.CARD_FOLLOWUP_ELANOUS_BIN || 'elanous';
+
+if (import.meta.main) {
 const contextFile = process.env.ELANOUS_GRAPH_CONTEXT;
 if (!contextFile) throw new Error('ELANOUS_GRAPH_CONTEXT 필요');
 const context = object(JSON.parse(readFileSync(contextFile, 'utf8')));
 const input = object(context.input);
 const outputs = object(context.outputs);
 const step = process.argv[2];
-const elanous = process.env.CARD_FOLLOWUP_ELANOUS_BIN || 'elanous';
 const codex = process.env.CARD_FOLLOWUP_CODEX_BIN || 'codex';
 const result = (data: Data) => console.log(JSON.stringify(data.outcome ? data : { outcome: 'ok', ...data }));
 
@@ -155,11 +197,7 @@ try {
     const read = object(outputs['read-card']);
     const card = object(read.card ?? read);
     const research = object(outputs.research);
-    const ask = async (payload: Data): Promise<Data> => {
-      const response = JSON.parse(await cli(elanous, ['ask', '--json', JSON.stringify(payload)])) as Data;
-      return firstObject(typeof response.reply === 'string' ? response.reply : JSON.stringify(response));
-    };
-    const strategy = await buildStrategy({ card, research, context: text(input.context), offer: text(input.offer), ask });
+    const strategy = await buildStrategy({ card, research, context: text(input.context), offer: text(input.offer), ask: askWithRetry });
     const fallback = dirname(contextFile).endsWith('.json.contexts') ? dirname(contextFile).slice(0, -'.json.contexts'.length) : dirname(contextFile);
     const outDir = input.outDir === undefined ? fallback : absolute(text(input.outDir), 'outDir');
     const crm = input.crm === undefined ? join(outDir, 'crm.csv') : absolute(text(input.crm), 'crm');
@@ -182,10 +220,6 @@ try {
     const marker = /\s*\[S(\d+)\]/g;
     const strip = (value: string) => value.replace(marker, '').trim();
     const sentencesOf = (value: string) => value.split(/(?<=[.!?。！？])\s+|\n+/).map(s => s.trim()).filter(Boolean);
-    const ask = async (payload: Data): Promise<Data> => {
-      const response = JSON.parse(await cli(elanous, ['ask', '--json', JSON.stringify(payload)])) as Data;
-      return firstObject(typeof response.reply === 'string' ? response.reply : JSON.stringify(response));
-    };
     // A Korean meeting note on an English card used to be pasted verbatim into the English mail
     // («Hi Joosung, 마케터의 밤에서 인사.» · 10-01 dry run). Across languages the note is translated, not copied.
     const crossLanguage = language === 'en' && /[가-힣]/.test(contextLine);
@@ -200,7 +234,7 @@ try {
     let accepted: { warnings: string[]; draft: Data; facts: { text: string; url: string }[] } | undefined;
     let lastProblem = '';
     for (let attempt = 0; attempt < 3 && !accepted; attempt++) {
-      const draft = await ask({ task: 'draft', instruction: instruction + feedback, card, context: contextLine, sender: text(input.sender), language, evidence: numbered, approach: { problem: text(approach.problem), proposal: text(approach.proposal), channel: text(approach.channel) } });
+      const draft = await askWithRetry({ task: 'draft', instruction: instruction + feedback, card, context: contextLine, sender: text(input.sender), language, evidence: numbered, approach: { problem: text(approach.problem), proposal: text(approach.proposal), channel: text(approach.channel) } });
       const parts = { subject: text(draft.subject), body: text(draft.body), linkedin: text(draft.linkedin), question: text(draft.question) };
       if (!parts.subject || !parts.body || !parts.linkedin || !parts.question) { lastProblem = '초안 필수 필드 없음'; feedback = ' 이전 응답에 필드가 빠졌다.'; continue; }
       const body = strip(parts.body), linkedin = strip(parts.linkedin);
@@ -218,7 +252,7 @@ try {
       if (badCite) shape.push(`없는 출처 번호: ${badCite.raw}`);
       if (shape.length) { lastProblem = shape.join(' · '); feedback = ` 이전 초안 문제: ${lastProblem}. 모두 고쳐 다시 작성하라.`; continue; }
       // Every sentence is judged against the card, the context and only the evidence it cites — a company name alone is identity, not a claim.
-      const verdict = await ask({
+      const verdict = await askWithRetry({
         task: 'verify',
         instruction: '각 문장에 대해, 받는 사람·그 회사·시장에 관한 사실 주장이 명함 필드, context, 또는 그 문장이 인용한 evidence 로 뒷받침되는지 판정하라. 인사·호칭·명함에 있는 이름/회사/직함 언급·제안·질문·보내는 사람의 의도는 사실 주장이 아니다. JSON 객체만 출력: {"unsupported":[뒷받침 안 되는 문장 번호]}',
         card, context: contextLine,
@@ -273,4 +307,5 @@ try {
   } else throw new Error(`unknown step: ${step}`);
 } catch (error) {
   result({ outcome: 'fail', reason: error instanceof Error ? error.message : String(error) });
+}
 }

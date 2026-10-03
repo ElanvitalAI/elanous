@@ -6,7 +6,7 @@
 // works end-to-end through the socket transport. Real LLM is mocked
 // via a stub runTurn that pushes deterministic chunks.
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, renameSync, rmSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,9 @@ import { bootAcpServer } from '../src/boot/acp-server.js';
 import { connectUnixSocket } from '../src/tui-client/acp-transport-unix-client.js';
 import { DashboardSession } from '../src/tui-client/dashboard-session.js';
 import { waitForSocket } from './helpers/wait-for-socket.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 let tmp: string;
 let sockPath: string;

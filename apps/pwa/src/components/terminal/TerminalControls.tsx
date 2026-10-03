@@ -51,6 +51,7 @@ interface Props {
   onAttached?: (entries: AttachmentMeta[]) => void;
   /** Phase 2 — TUI Alt+V dictation 흡수. STT 결과가 xterm 으로 typing 된다. */
   voice?: TerminalControlsVoiceProps;
+  variant?: 'default' | 'sheet';
 }
 
 interface RecordingActive {
@@ -65,7 +66,7 @@ interface RecordingDone {
   elapsedSec: number;
 }
 
-export function TerminalControls({ terminalId, onClear, onRecordingChange, onAttached, voice }: Props) {
+export function TerminalControls({ terminalId, onClear, onRecordingChange, onAttached, voice, variant = 'default' }: Props) {
   const { client, sessionId, config } = useDaemon();
   const [active, setActive] = useState<RecordingActive | null>(null);
   const [done, setDone] = useState<RecordingDone | null>(null);
@@ -200,7 +201,7 @@ export function TerminalControls({ terminalId, onClear, onRecordingChange, onAtt
   };
 
   return (
-    <div className="flex flex-wrap items-center gap-2 border-b px-2 py-1 text-xs">
+    <div className={variant === 'sheet' ? 'flex flex-wrap items-center gap-2 text-xs' : 'flex flex-wrap items-center gap-2 border-b px-2 py-1 text-xs'}>
       <button
         type="button"
         className="rounded border px-2 py-0.5 hover:bg-accent"

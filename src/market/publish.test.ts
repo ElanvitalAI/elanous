@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
@@ -7,6 +7,9 @@ import { join, relative, resolve } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { publishMarket } from './publish';
 import { generateIndexKeyPair, verifyIndex } from './signed-index';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function fixture(fn: (root: string) => void, local = false): void {
   const root = mkdtempSync(join(local ? import.meta.dir : tmpdir(), 'market-publish-'));

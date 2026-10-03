@@ -1,5 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { Database } from 'bun:sqlite';
 import { releaseLedgerRoot } from '../instance/resolve.js';
@@ -17,8 +17,8 @@ function legacyVersions(): string[] {
   if (!existsSync(root)) return [];
   return readdirSync(root).filter((version) => /^\d+\.\d+\.\d+(?:-(?:rc|alpha|beta)\.\d+)?$/.test(version) && existsSync(jsonPath(version)));
 }
-export function releasedVersion(): string {
-  const root = join(releaseLedgerRoot(), 'release');
+export function releasedVersion(ledgerRoot = releaseLedgerRoot()): string {
+  const root = join(ledgerRoot, 'release');
   if (!existsSync(root)) return '';
   return readdirSync(root).filter((version) => /^\d+\.\d+\.\d+$/.test(version) && existsSync(join(root, version, 'release.json')))
     .filter((version) => {
@@ -30,8 +30,8 @@ export function releasedVersion(): string {
     })[0] ?? '';
 }
 const walWait = new Int32Array(new SharedArrayBuffer(4));
-function open(): Database {
-  const path = join(releaseLedgerRoot(), 'release', 'features.sqlite');
+function open(root = releaseLedgerRoot()): Database {
+  const path = join(root, 'release', 'features.sqlite');
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path, { create: true, strict: true });
   try {
@@ -52,9 +52,59 @@ function open(): Database {
     CREATE TABLE IF NOT EXISTS assignments (feature_id TEXT NOT NULL REFERENCES features(id), version TEXT NOT NULL, status TEXT NOT NULL, disposition TEXT, evidence TEXT, title_override TEXT, owner TEXT, kind TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY(feature_id, version));
     CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, feature_id TEXT NOT NULL, version TEXT NOT NULL, field TEXT NOT NULL, "from" TEXT, "to" TEXT, released TEXT NOT NULL, dev TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS evidence (feature_id TEXT NOT NULL, version TEXT NOT NULL, ref TEXT NOT NULL, at TEXT NOT NULL, by TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS imported_versions (version TEXT PRIMARY KEY);`);
+    CREATE TABLE IF NOT EXISTS imported_versions (version TEXT PRIMARY KEY, json_hash TEXT, imported_at TEXT);`);
+    const columns = db.query('PRAGMA table_info(imported_versions)').all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === 'json_hash')) db.exec('ALTER TABLE imported_versions ADD COLUMN json_hash TEXT');
+    if (!columns.some((column) => column.name === 'imported_at')) db.exec('ALTER TABLE imported_versions ADD COLUMN imported_at TEXT');
+    db.exec('CREATE TABLE IF NOT EXISTS release_schedules (version TEXT PRIMARY KEY, cut_at TEXT NOT NULL, land_by TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL)');
     return db;
   } catch (error) { db.close(); throw error; }
+}
+
+export interface ScheduleRow { version: string; cutAt: string; landBy: string | null; updatedAt: string; updatedBy: string }
+type StoredSchedule = { version: string; cut_at: string; land_by: string | null; updated_at: string; updated_by: string };
+function scheduleRow(row: StoredSchedule): ScheduleRow {
+  return { version: row.version, cutAt: row.cut_at, landBy: row.land_by, updatedAt: row.updated_at, updatedBy: row.updated_by };
+}
+
+export function readSchedule(version: string, root?: string): ScheduleRow | null {
+  validateVersion(version);
+  if (!existsSync(join(root ?? releaseLedgerRoot(), 'release', 'features.sqlite'))) return null;
+  const db = open(root);
+  try {
+    const row = db.query('SELECT * FROM release_schedules WHERE version = ?').get(version) as StoredSchedule | null;
+    return row ? scheduleRow(row) : null;
+  } finally { db.close(); }
+}
+
+export function readSchedules(root?: string): ScheduleRow[] {
+  const db = open(root);
+  try { return (db.query('SELECT * FROM release_schedules ORDER BY version').all() as StoredSchedule[]).map(scheduleRow); }
+  finally { db.close(); }
+}
+
+export function writeSchedule(version: string, patch: { cutAt?: string; landBy?: string }, by: string, root?: string): ScheduleRow {
+  validateVersion(version);
+  const db = open(root);
+  try {
+    return transaction(db, () => {
+      const previous = db.query('SELECT * FROM release_schedules WHERE version = ?').get(version) as StoredSchedule | null;
+      const cutAt = patch.cutAt ?? previous?.cut_at;
+      if (!cutAt) throw new CliUserError('새 판에는 --cut-at 이 필요하다');
+      const landBy = patch.landBy ?? previous?.land_by ?? null;
+      if (previous && previous.cut_at === cutAt && previous.land_by === landBy) return scheduleRow(previous);
+      const at = new Date().toISOString();
+      db.query(`INSERT INTO release_schedules (version, cut_at, land_by, updated_at, updated_by) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(version) DO UPDATE SET cut_at=excluded.cut_at, land_by=excluded.land_by, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
+        .run(version, cutAt, landBy, at, by);
+      for (const [field, from, to] of [
+        ['cut_at', previous?.cut_at ?? null, cutAt], ['land_by', previous?.land_by ?? null, landBy],
+      ] as const) {
+        if (from !== to) record(db, version, { at, by, id: '@version', field, from, to, released: releasedVersion(root), dev: devVersion() });
+      }
+      return { version, cutAt, landBy, updatedAt: at, updatedBy: by };
+    });
+  } finally { db.close(); }
 }
 
 function transaction<T>(db: Database, work: () => T): T {
@@ -105,14 +155,32 @@ function putItem(db: Database, version: string, item: ChecklistItem): void {
     ON CONFLICT(feature_id, version) DO UPDATE SET status=excluded.status, disposition=excluded.disposition, evidence=excluded.evidence, owner=excluded.owner, kind=excluded.kind, updated_at=excluded.updated_at, updated_by=excluded.updated_by`)
     .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, feature && feature.title !== item.title ? item.title : null, item.owner ?? null, item.kind ?? null, item.updatedAt, item.updatedBy);
 }
+function jsonHash(contents: string | Buffer): string { return createHash('sha256').update(contents).digest('hex'); }
+
+/**
+ * When did the ledger take this item away from `version`? A `move` out of it, a `remove` at it, or (carry-forward
+ * without a move event) the item now living in another version. null = never left — a JSON-only item is new.
+ * OP 10-02: without this, an old build's checklist.json re-added items the ledger had moved or removed (duplicates).
+ */
+function ledgerLeftAt(db: Database, id: string, version: string): string | null {
+  const event = db.query(`SELECT MAX(at) AS at FROM events WHERE feature_id = ? AND
+    ((field = 'move' AND "from" = ?) OR (field = 'remove' AND version = ?))`).get(id, JSON.stringify(version), version) as { at: string | null };
+  const elsewhere = db.query('SELECT MAX(updated_at) AS at FROM assignments WHERE feature_id = ? AND version <> ?').get(id, version) as { at: string | null };
+  const times = [event.at, elsewhere.at].filter((t): t is string => typeof t === 'string');
+  return times.length ? times.sort().at(-1)! : null;
+}
+
 function importOnDb(db: Database, version: string): boolean {
-  if (db.query('SELECT 1 FROM imported_versions WHERE version = ?').get(version)) return false;
+  const previous = db.query('SELECT json_hash FROM imported_versions WHERE version = ?').get(version) as { json_hash: string | null } | null;
   const path = jsonPath(version);
   if (!existsSync(path)) {
-    db.query('INSERT INTO imported_versions (version) VALUES (?)').run(version);
+    if (!previous) db.query('INSERT INTO imported_versions (version) VALUES (?)').run(version);
     return false;
   }
-  const data = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
+  const contents = readFileSync(path);
+  const hash = jsonHash(contents);
+  if (previous && previous.json_hash === hash) return false;
+  const data = JSON.parse(contents.toString('utf8')) as Checklist;
   if (data.version !== version) throw new CliUserError(`체크리스트 판 불일치: ${path}`);
   if (!Array.isArray(data.items) || !Array.isArray(data.history)) throw new CliUserError(`잘못된 체크리스트: ${path}`);
   const duplicate = new Set<string>();
@@ -120,25 +188,83 @@ function importOnDb(db: Database, version: string): boolean {
     if (!item.id?.trim() || !item.title?.trim() || duplicate.has(item.id) || !['green', 'yellow', 'red', 'done'].includes(item.status)) throw new CliUserError(`잘못된 체크리스트 칸: ${version} ${item.id}`);
     duplicate.add(item.id);
   }
-  for (const item of data.items) {
-    const existing = db.query('SELECT title FROM features WHERE id = ?').get(item.id) as { title: string } | null;
-    // Keep a legacy per-version title until an explicit retitle unifies the feature identity.
-    if (!existing) putItem(db, version, item);
-    else {
-      db.query('INSERT OR IGNORE INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, item.title === existing.title ? null : item.title, item.owner ?? null, item.kind ?? null, item.updatedAt, item.updatedBy);
+  if (!previous) {
+    for (const item of data.items) {
+      const existing = db.query('SELECT title FROM features WHERE id = ?').get(item.id) as { title: string } | null;
+      // Keep a legacy per-version title until an explicit retitle unifies the feature identity.
+      if (!existing) putItem(db, version, item);
+      else {
+        db.query('INSERT OR IGNORE INTO assignments (feature_id, version, status, disposition, evidence, title_override, owner, kind, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(item.id, version, item.status, item.disposition ?? null, item.evidence ?? null, item.title === existing.title ? null : item.title, item.owner ?? null, item.kind ?? null, item.updatedAt, item.updatedBy);
+      }
     }
+    for (const entry of data.history) record(db, version, entry);
+    db.query('INSERT INTO imported_versions (version, json_hash, imported_at) VALUES (?, ?, ?)').run(version, hash, new Date().toISOString());
+    return true;
   }
-  for (const entry of data.history) record(db, version, entry);
-  db.query('INSERT INTO imported_versions (version) VALUES (?)').run(version);
-  return true;
+
+  const ledger = new Map(items(db, version).map((item) => [item.id, item]));
+  const changed: string[] = [];
+  let added = 0;
+  const ledgerWonIds: string[] = [];
+  const leftIds: string[] = [];
+  for (const item of data.items) {
+    const current = ledger.get(item.id);
+    if (!current) {
+      // Moved or removed in the ledger: only a JSON edit made after that may bring it back.
+      const leftAt = ledgerLeftAt(db, item.id, version);
+      if (leftAt && !(Date.parse(item.updatedAt) > Date.parse(leftAt))) { leftIds.push(item.id); continue; }
+      const feature = db.query('SELECT title FROM features WHERE id = ?').get(item.id) as { title: string } | null;
+      putItem(db, version, item);
+      if (feature && feature.title !== item.title) db.query('UPDATE assignments SET title_override = ? WHERE feature_id = ? AND version = ?').run(item.title, item.id, version);
+      added++;
+      changed.push(item.id);
+      record(db, version, { at: new Date().toISOString(), by: item.updatedBy, id: item.id, field: 'reimport', from: null, to: item, released: data.released, dev: data.dev });
+      continue;
+    }
+    const fields = ['title', 'status', 'evidence', 'owner', 'disposition', 'kind'] as const;
+    const baseEvidence = (db.query('SELECT evidence FROM assignments WHERE feature_id = ? AND version = ?').get(item.id, version) as { evidence: string | null }).evidence ?? undefined;
+    const preserveRefs = item.evidence === baseEvidence || item.evidence === current.evidence;
+    const differs = fields.some((field) => field === 'evidence'
+      ? (!preserveRefs && current.evidence !== item.evidence)
+      : current[field] !== item[field]);
+    if (!differs) continue;
+    if (!(Date.parse(item.updatedAt) > Date.parse(current.updatedAt))) {
+      ledgerWonIds.push(item.id);
+      continue;
+    }
+    const incoming: ChecklistItem = { ...current, status: item.status, updatedAt: item.updatedAt, updatedBy: item.updatedBy };
+    for (const field of fields) {
+      if (field === 'status') continue;
+      if (field === 'evidence' && preserveRefs) continue;
+      if (item[field] === undefined) delete (incoming as unknown as Record<string, unknown>)[field];
+      else (incoming as unknown as Record<string, unknown>)[field] = item[field];
+    }
+    if (!preserveRefs) db.query('DELETE FROM evidence WHERE feature_id = ? AND version = ?').run(item.id, version);
+    const persisted = preserveRefs ? { ...incoming, evidence: baseEvidence } : incoming;
+    putItem(db, version, persisted);
+    if (incoming.title !== current.title) {
+      db.query('UPDATE assignments SET title_override = ? WHERE feature_id = ? AND version = ?')
+        .run(incoming.title === (db.query('SELECT title FROM features WHERE id = ?').get(item.id) as { title: string }).title ? null : incoming.title, item.id, version);
+    }
+    changed.push(item.id);
+    record(db, version, { at: new Date().toISOString(), by: item.updatedBy, id: item.id, field: 'reimport', from: current, to: incoming, released: data.released, dev: data.dev });
+  }
+  db.query('UPDATE imported_versions SET json_hash = ?, imported_at = ? WHERE version = ?').run(hash, new Date().toISOString(), version);
+  const ledgerWon = ledgerWonIds.length;
+  debug.log('release.features', 'reimported', { version, changed: changed.length - added, added, ledgerWon, notReadded: leftIds.length });
+  // Two separate lines: what was taken from the old build's JSON, and where the JSON differs but the ledger is newer
+  // (a conflict a person should know about even though nothing changed in the ledger).
+  if (changed.length) console.error(`⚠ checklist ${version}: 옛 판이 checklist.json 에 쓴 ${changed.length}칸을 다시 들였다(${changed.slice(0, 5).join(', ')})`);
+  if (leftIds.length) console.error(`⚠ checklist ${version}: 원장에서 옮기거나 지운 칸 ${leftIds.length}은 옛 판 checklist.json 에 남아 있어도 다시 넣지 않았다(${leftIds.slice(0, 5).join(', ')})`);
+  if (ledgerWon) console.error(`⚠ checklist ${version}: 옛 판 checklist.json 과 원장이 다르다 — 원장이 더 새로워 원장 값 유지 ${ledgerWon}칸(${ledgerWonIds.slice(0, 5).join(', ')})`);
+  return false;
 }
 export function importJson(version: string): boolean {
   validateVersion(version);
   if (!existsSync(jsonPath(version))) return false;
   const db = open();
   try {
-    if (db.query('SELECT 1 FROM imported_versions WHERE version = ?').get(version)) return false;
     const imported = transaction(db, () => importOnDb(db, version));
     if (imported) debug.log('release.features', 'imported', { version });
     return imported;
@@ -315,13 +441,20 @@ export function exportJson(version: string, released = releasedVersion(), dev = 
   const path = jsonPath(version);
   mkdirSync(dirname(path), { recursive: true });
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const contents = `${JSON.stringify(data, null, 2)}\n`;
   try {
-    writeFileSync(temp, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(temp, contents, { mode: 0o600 });
     chmodSync(temp, 0o600);
     renameSync(temp, path);
   } finally { if (existsSync(temp)) rmSync(temp); }
   const db = open();
-  try { transaction(db, () => { db.query('INSERT OR IGNORE INTO imported_versions (version) VALUES (?)').run(version); }); }
+  try { transaction(db, () => {
+    // Track only our bytes: a legacy replacement after rename must remain detectable.
+    const hash = jsonHash(contents);
+    db.query(`INSERT INTO imported_versions (version, json_hash, imported_at) VALUES (?, ?, ?)
+      ON CONFLICT(version) DO UPDATE SET json_hash = excluded.json_hash, imported_at = excluded.imported_at`)
+      .run(version, hash, new Date().toISOString());
+  }); }
   finally { db.close(); }
   return data;
 }

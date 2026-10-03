@@ -22,9 +22,15 @@ export interface ExecResult {
   url: string;
   sources?: Array<{ title: string; url: string }>;
 }
+export interface ExecAttachment {
+  name: string;
+  path: string;
+}
+
 export interface ExecRequest {
   id: string;
   text: string;
+  attachments?: ExecAttachment[];
   createdAt: string;
   status: 'planning' | 'running' | 'done' | 'failed';
   summary: string;
@@ -39,8 +45,8 @@ export class ExecRequestStore {
   readonly dir: string;
   constructor(configDir = getElanousConfigDir()) { this.dir = join(configDir, 'exec-requests'); }
 
-  create(text: string): ExecRequest {
-    const item: ExecRequest = { id: randomUUID(), text, createdAt: new Date().toISOString(), status: 'planning', summary: '', seats: [], results: [], approvals: [] };
+  create(text: string, attachments?: ExecAttachment[]): ExecRequest {
+    const item: ExecRequest = { id: randomUUID(), text, ...(attachments !== undefined ? { attachments } : {}), createdAt: new Date().toISOString(), status: 'planning', summary: '', seats: [], results: [], approvals: [] };
     this.save(item);
     return item;
   }

@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test';
+import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
 import { isSeatDocRequest, submitSeatDocRequest, type SeatDocDeps } from './seat-doc-route.js';
 
 const reportTo = { channel: 'telegram' as const, chatId: -100123, botId: 'bot-1' };
@@ -62,6 +65,7 @@ describe('seat document route', () => {
     for (const body of ['전략', '한 장', '원페이저', '기획', '보도자료', '글', '메모', '초안', 'one-pager', 'strategy', 'post', 'memo', 'draft']) {
       expect(isSeatDocRequest(`@CMO ${body} 써줘`)).toBe(true);
     }
+    expect(isSeatDocRequest('@CMO PR #81 근거로 보도자료 써줘')).toBe(true);
     expect(isSeatDocRequest('마케팅 전략 한 장')).toBe(false);
     expect(isSeatDocRequest('@not-a-seat 전략 한 장')).toBe(false);
     for (const code of ['구현', '버그', '고쳐', 'fix', 'implement', 'PR']) {
@@ -121,6 +125,240 @@ describe('seat document route', () => {
     expect(deliveries[0]![0]).toContain('https://phone.example.test/app/ (접수번호 exec-1)');
     expect(deliveries[0]![0]).not.toContain('/v1/exec-requests/exec-1/files/');
     expect(deliveries[0]!.slice(1)).toEqual(['report', reportTo]);
+  });
+
+  test('cites verified supplied file, URL and PR figures in delivered document; keeps unsupported figures marked', async () => {
+    const sources = new Map([
+      ['brief.md', '매출 42%'],
+      ['https://example.test/stats', '고객 320명'],
+      ['PR #81', '응답 17건'],
+    ]);
+    const fetched: string[] = [];
+    const delivered: string[] = [];
+    const body = '매출 42%\n고객 320명\n응답 17건\n추정 99건\n공고 https://example.test/2026/10\n누적 42% [출처: https://example.test/2026/10]';
+    await submitSeatDocRequest({ text: '@CMO brief.md https://example.test/stats PR #81 보고서', reportTo, deps: {
+      readSource: async ref => { fetched.push(ref); return sources.get(ref) ?? null; },
+      submitExec: async value => { expect(value).toContain('수치는 삭제하거나 바꾸지 말고 «확인 필요»'); return { id: 'exec-cited' }; },
+      getExec: async () => ({ status: 'done', summary: '완료', results: [
+        { seat: 'CMO', title: 'report.md', kind: 'report', url: '/v1/exec-requests/exec-cited/files/report.md' },
+      ] }),
+      getFile: async () => body,
+      publishFile: content => { delivered.push(content); return 'https://files.example.test/report.md'; },
+      sendOutbound: () => true,
+    } });
+    await settled();
+    expect(fetched).toEqual(['brief.md', 'https://example.test/stats', 'PR #81']);
+    expect(delivered).toEqual(['매출 42% [출처: brief.md]\n고객 320명 [출처: https://example.test/stats]\n응답 17건 [출처: PR #81]\n추정 99건 «확인 필요»\n공고 https://example.test/2026/10\n누적 42% «확인 필요»']);
+  });
+
+  test('a matching figure with the wrong claim subject is not cited', async () => {
+    const delivered: string[] = [];
+    await submitSeatDocRequest({ text: '@CMO brief.md 초안', deps: {
+      readSource: async () => '매출 42%, 이탈률 17%',
+      submitExec: async () => ({ id: 'exec-pair' }),
+      getExec: async () => ({ status: 'done', summary: '완료', results: [
+        { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-pair/files/draft.md' },
+      ] }),
+      getFile: async () => '이탈률 42% [출처: brief.md]\n매출 42%\n이탈률 17%',
+      publishFile: content => { delivered.push(content); return null; },
+      sendOutbound: () => true,
+    } });
+    await settled();
+    expect(delivered).toEqual(['이탈률 42% «확인 필요»\n매출 42% [출처: brief.md]\n이탈률 17% [출처: brief.md]']);
+  });
+
+  test('keeps percent units and particles intact and refuses reversed claim direction', async () => {
+    const published: string[] = [];
+    await submitSeatDocRequest({ text: '@CMO brief.md 초안', deps: {
+      readSource: async () => '매출 42% 감소\n고객 17건 증가',
+      submitExec: async () => ({ id: 'exec-direction' }),
+      getExec: async () => ({ status: 'done', summary: '완료', results: [
+        { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-direction/files/draft.md' },
+      ] }),
+      getFile: async () => '매출 42%가 증가\n매출 42%가 감소\n고객 17건이 증가\n매출 42%가 증가했다가 감소',
+      publishFile: content => { published.push(content); return null; },
+      sendOutbound: () => true,
+    } });
+    await settled();
+    expect(published).toEqual(['매출 42%가 «확인 필요» 증가\n매출 42%가 [출처: brief.md] 감소\n고객 17건이 [출처: brief.md] 증가\n매출 42%가 «확인 필요» 증가했다가 감소']);
+    expect(published[0]).not.toContain('42 «확인 필요»%');
+  });
+
+  test('does not cite negated or forecast claims as observed claims, but cites the same decimal figure', async () => {
+    const published: string[] = [];
+    await submitSeatDocRequest({ text: '@CMO brief.md 초안', deps: {
+      readSource: async () => '매출 42% 증가하지 않았다\n고객 17건 증가 예상\n마진 42.5% 증가\n이익 21% 증가',
+      submitExec: async () => ({ id: 'exec-claim-meaning' }),
+      getExec: async () => ({ status: 'done', summary: '완료', results: [
+        { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-claim-meaning/files/draft.md' },
+      ] }),
+      getFile: async () => '매출 42% 증가\n매출 42% 증가하지 않았다\n고객 17건 증가\n고객 17건 증가 전망\n마진 42.5% 증가\n이익 21% 증가 예상',
+      publishFile: content => { published.push(content); return null; },
+      sendOutbound: () => true,
+    } });
+    await settled();
+    expect(published).toEqual(['매출 42% «확인 필요» 증가\n매출 42% [출처: brief.md] 증가하지 않았다\n고객 17건 «확인 필요» 증가\n고객 17건 [출처: brief.md] 증가 전망\n마진 42.5% [출처: brief.md] 증가\n이익 21% «확인 필요» 증가 예상']);
+  });
+
+  test('does not cite a figure whose range or approximation words differ from the source', async () => {
+    const published: string[] = [];
+    await submitSeatDocRequest({ text: '@CMO brief.md 초안', deps: {
+      readSource: async () => '매출 42%\n고객 300명 이상\n응답 약 17건',
+      submitExec: async () => ({ id: 'exec-claim-range' }),
+      getExec: async () => ({ status: 'done', summary: '완료', results: [
+        { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-claim-range/files/draft.md' },
+      ] }),
+      getFile: async () => '매출 42% 미만\n매출 42%\n고객 300명\n고객 300명 이상\n응답 약 17건\n응답 최대 17건',
+      publishFile: content => { published.push(content); return null; },
+      sendOutbound: () => true,
+    } });
+    await settled();
+    expect(published).toEqual(['매출 42% «확인 필요» 미만\n매출 42% [출처: brief.md]\n고객 300명 «확인 필요»\n고객 300명 [출처: brief.md] 이상\n응답 약 17건 [출처: brief.md]\n응답 최대 17건 «확인 필요»']);
+  });
+
+  test('URL reader stops at 200KB while streaming even without an honest Content-Length', async () => {
+    const originalFetch = globalThis.fetch;
+    try {
+      for (const headers of [new Headers({ 'content-type': 'text/plain' }), new Headers({ 'content-type': 'text/plain', 'content-length': '1' })]) {
+        let pulls = 0;
+        let cancelled = false;
+        const published: string[] = [];
+        globalThis.fetch = (async () => new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            pulls++;
+            controller.enqueue(new Uint8Array(100_001));
+          },
+          cancel() { cancelled = true; },
+        }, { highWaterMark: 0 }), { headers })) as unknown as typeof fetch;
+        await submitSeatDocRequest({ text: '@CMO https://github.com/example/brief.md 초안', deps: {
+          submitExec: async () => ({ id: 'exec-large' }),
+          getExec: async () => ({ status: 'done', summary: '완료', results: [
+            { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-large/files/draft.md' },
+          ] }),
+          getFile: async () => '매출 42%',
+          publishFile: content => { published.push(content); return null; },
+          sendOutbound: () => true,
+        } });
+        await settled();
+        expect(pulls).toBe(2);
+        expect(cancelled).toBe(true);
+        expect(published).toEqual(['매출 42% «확인 필요»']);
+      }
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  test('default source reader rejects outside files and symlinks and never fetches arbitrary URLs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seat-source-'));
+    const outside = join(dir, 'private.md');
+    const link = join(process.cwd(), `seat-source-link-${process.pid}.md`);
+    const fetched: string[] = [];
+    const originalFetch = globalThis.fetch;
+    try {
+      writeFileSync(outside, '매출 42%');
+      symlinkSync(outside, link);
+      globalThis.fetch = (async (input: RequestInfo | URL) => { fetched.push(String(input)); throw new Error('unexpected fetch'); }) as unknown as typeof fetch;
+      const published: string[] = [];
+      await submitSeatDocRequest({ text: `@CMO ${relative(process.cwd(), outside)} ${relative(process.cwd(), link)} http://127.0.0.1/private.md 초안`, deps: {
+        submitExec: async () => ({ id: 'exec-restricted' }),
+        getExec: async () => ({ status: 'done', summary: '완료', results: [
+          { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-restricted/files/draft.md' },
+        ] }),
+        getFile: async () => '매출 42%',
+        publishFile: content => { published.push(content); return null; },
+        sendOutbound: () => true,
+      } });
+      await settled();
+      expect(fetched).toEqual([]);
+      expect(published).toEqual(['매출 42% «확인 필요»']);
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(link, { force: true });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a stalled PR lookup is killed and its figure remains unverified', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seat-gh-'));
+    const gh = join(dir, 'gh');
+    const originalPath = process.env.PATH;
+    const published: string[] = [];
+    try {
+      writeFileSync(gh, '#!/bin/sh\nsleep 30\n');
+      chmodSync(gh, 0o755);
+      process.env.PATH = `${dir}:${originalPath ?? ''}`;
+      const started = Date.now();
+      await submitSeatDocRequest({ text: '@CMO PR #81 초안', deps: {
+        submitExec: async () => ({ id: 'exec-pr-timeout' }),
+        getExec: async () => ({ status: 'done', summary: '완료', results: [
+          { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-pr-timeout/files/draft.md' },
+        ] }),
+        getFile: async () => '매출 42%',
+        publishFile: content => { published.push(content); return null; },
+        sendOutbound: () => true,
+      } });
+      await settled();
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(published).toEqual(['매출 42% «확인 필요»']);
+    } finally {
+      process.env.PATH = originalPath;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 12_000);
+
+  test('default source reader refuses a redirect from an allowed host to an internal address', async () => {
+    const fetched: string[] = [];
+    const originalFetch = globalThis.fetch;
+    const published: string[] = [];
+    try {
+      globalThis.fetch = (async (input: RequestInfo | URL, options?: RequestInit) => {
+        fetched.push(String(input));
+        expect(options?.redirect).toBe('manual');
+        return new Response(null, { status: 302, headers: { location: 'http://127.0.0.1/private.md' } });
+      }) as unknown as typeof fetch;
+      await submitSeatDocRequest({ text: '@CMO https://github.com/example/brief.md 초안', deps: {
+        submitExec: async () => ({ id: 'exec-redirect' }),
+        getExec: async () => ({ status: 'done', summary: '완료', results: [
+          { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-redirect/files/draft.md' },
+        ] }),
+        getFile: async () => '매출 42%',
+        publishFile: content => { published.push(content); return null; },
+        sendOutbound: () => true,
+      } });
+      await settled();
+      expect(fetched).toEqual(['https://github.com/example/brief.md']);
+      expect(published).toEqual(['매출 42% «확인 필요»']);
+    } finally { globalThis.fetch = originalFetch; }
+  });
+
+  test('unavailable or ambiguous supplied evidence never invents a citation or drops a number', async () => {
+    const delivered: string[] = [];
+    await submitSeatDocRequest({ text: '@CMO a.md b.md missing.md 초안', deps: {
+      readSource: async ref => ref === 'missing.md' ? null : '매출 42%\n기타 12건',
+      submitExec: async () => ({ id: 'exec-unknown' }),
+      getExec: async () => ({ status: 'done', summary: '완료', results: [
+        { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-unknown/files/draft.md' },
+      ] }),
+      getFile: async () => '매출 42% [출처: missing.md]\n기타 12건 [출처: a.md]\n미상 70명 «확인 필요»',
+      publishFile: content => { delivered.push(content); return null; },
+      sendOutbound: () => true,
+    } });
+    await settled();
+    expect(delivered).toEqual(['매출 42% «확인 필요»\n기타 12건 «확인 필요»\n미상 70명 «확인 필요»']);
+  });
+
+  test('requests without supplied references keep their existing document bytes', async () => {
+    const published: string[] = [];
+    await submitSeatDocRequest({ text: '@CMO 초안', deps: {
+      submitExec: async value => { expect(value).toBe('@CMO 초안'); return { id: 'exec-plain' }; },
+      getExec: async () => ({ status: 'done', summary: '완료', results: [
+        { seat: 'CMO', title: 'draft.md', kind: 'report', url: '/v1/exec-requests/exec-plain/files/draft.md' },
+      ] }),
+      getFile: async () => '2026년 목표 42건',
+      publishFile: content => { published.push(content); return null; },
+      sendOutbound: () => true,
+    } });
+    await settled();
+    expect(published).toEqual(['2026년 목표 42건']);
   });
 
   test('a failed research still submits and explicitly reports proceeding without research', async () => {

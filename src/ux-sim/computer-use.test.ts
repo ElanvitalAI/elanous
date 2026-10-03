@@ -1,5 +1,5 @@
 // 컴퓨터 유즈 심 계약 — 실제 browser-action 디스패처가 낸 관측만 읽는다.
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import {
   browserActionRowsToTrajectory,
   readBrowserActionTrajectory,
@@ -24,6 +24,10 @@ async function run(scenario: ComputerUseScenario) {
  *    📏 실측 2026-08-28: 안 끄니 걸음마다 127.0.0.1 로 4초씩 기다려 시험이 «타임아웃»했다.
  */
 import { readFileSync as readComputerUseSource } from 'node:fs';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
+
 test('the simulation never reaches the network — it keeps the CDP boundary only', () => {
   const source = readComputerUseSource(new URL('./computer-use.ts', import.meta.url).pathname, 'utf8');
   expect(source).toContain('reclaimOpenedTabs: false');

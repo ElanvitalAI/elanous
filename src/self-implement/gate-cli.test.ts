@@ -801,6 +801,19 @@ describe('runSelfGateCli', () => {
       });
       expect(result.exitCode).toBe(1);
     });
+
+    test('⛔ bun 시험이 «통과»해도 PWA 빌드 게이트가 막으면 exit 1 (GATE-PWA)', () => {
+      const seen: string[][] = [];
+      const result = runSelfGateCli('/repo', {}, {
+        changedFiles: () => ({ files: ['src/maturity/feature-maturity.ts', 'src/a.test.ts'], baseRef: 'HEAD' }),
+        runTests: () => ({ status: 0, stdout: '', stderr: '' }),
+        runIsolationGate: () => 0, runMockModuleRestoreGate: () => 0,
+        runAndroidGate: () => 0, runIosGate: () => 0,
+        runPwaGate: (out) => { seen.push([...(out.args ?? [])]); out.error('[pwa-gate] FAIL — PWA 빌드 실패(rc=1)'); return 1; },
+      });
+      expect(seen[0]).toContain('src/maturity/feature-maturity.ts');
+      expect(result.exitCode).toBe(1);
+    });
   });
 
   describe('policy gates on the skipTestStep path', () => {

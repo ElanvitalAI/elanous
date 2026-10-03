@@ -1,10 +1,13 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { decideTypeAction, type TypeTarget } from './browser-act-type.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const HOSTS = ['news.ycombinator.com'];
 const target = (over: Partial<TypeTarget> = {}): TypeTarget => ({

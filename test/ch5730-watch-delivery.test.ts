@@ -8,11 +8,14 @@
 //
 // ⭐ 네트워크를 «안» 탄다 — `delivery` 하위 명령이 잠금·PID 파일·GitHub 를 무접촉이고
 //    임의 pid 의 fd 1 만 본다. 그래서 이 파일이 결정론 게이트에서 돈다.
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, symlinkSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const SCRIPT = 'scripts/ch5730-watch.sh';
 const children: Array<{ kill: () => void }> = [];

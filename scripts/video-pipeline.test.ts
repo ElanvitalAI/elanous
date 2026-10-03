@@ -2,7 +2,7 @@
 //   이 PR 이 고친 결함은 전부 ***fail-open*** 이었다(승인해 놓고 값을 안 읽는다 · 기대 실패를
 //   못 재는데 통과한다 · 선언에 없는 노드를 ⚠️ 로 넘긴다). 그런 결함은 「초록」으로 안 보인다.
 //   ⇒ 그래서 이 파일은 «빨간 길»을 같이 밟는다 — 종료 코드가 0 이 아닌 경우를 먼저 적는다.
-import { afterAll, describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, afterAll, describe, expect, it } from 'bun:test';
 import { assembleFilmLineState, loadHyperframesProjects } from './video-film-line.js';
 import { parseArgv } from './lib/argv.js';
 import { summarizeTiers } from '../src/video-pipeline/tier-summary.js';
@@ -13,6 +13,9 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');

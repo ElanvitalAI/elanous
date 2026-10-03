@@ -1,4 +1,7 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const size = 128 * 1024;
 const moduleUrl = new URL('./stdout-flush.ts', import.meta.url).href;

@@ -1,8 +1,11 @@
 import { mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { overlapOf, proseFallbackWarning } from './measure-decomposition-overlap.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 describe('measure-decomposition-overlap · overlapOf', () => {
   test('두 조각이 같은 파일을 겨냥하면 그 파일과 «조각 이름»을 낸다', () => {

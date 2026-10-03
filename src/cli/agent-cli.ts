@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 import { getUserConfig, reloadUserConfig } from '../user-config.js';
 import { handleOnboardingRefusal, needsOnboarding, runOnboarding } from '../onboarding.js';
 import { runTurn, ensureCliSession, sessionBudget } from '../session/chat.js';
+import { suggestProjectForFolder } from '../project/project-store.js';
 import { NoLlmProviderAvailableError, noProviderAvailableMessage } from '../llm.js';
 import { resolveSessionId, getActiveSessionId, setActiveSessionId } from '../session/index.js';
 import { getHarnessSpace } from '../harness/harness-space.js';
@@ -433,6 +434,12 @@ export async function runChatTurnCli(opts: {
   }
   const session = ensureCliSession(opts.cfg, resolvedSessionIdHint);
   setActiveSessionId(session.id);
+  if (!opts.json && (!resolvedSessionIdHint || session.id !== resolvedSessionIdHint)) {
+    try {
+      const project = suggestProjectForFolder(process.cwd());
+      if (project) console.log(`Project suggestion: ${project.name} (${project.id})`);
+    } catch { /* suggestions must not interrupt a CLI conversation */ }
+  }
   const harnessSpace = getHarnessSpace();
   // Tag the debug log with this session id so every event in this
   // process attributes correctly. enrichDebugRecord picks up the

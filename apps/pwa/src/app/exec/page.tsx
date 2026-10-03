@@ -1,8 +1,10 @@
 'use client';
 
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
-import type { DaemonClient, ExecRequestDetail, ExecRequestItem, ExecRequestStatus, ExecSeatStatus } from '@/lib/daemon-client';
+import type { ExecRequestDetail, ExecRequestItem, ExecRequestStatus, ExecSeatStatus } from '@/lib/daemon-client';
+import { ExecApprovals } from '@/components/exec/ExecApprovals';
+import { ExecResultView } from '@/components/exec/ExecResultView';
 
 function requestLabel(status: ExecRequestStatus): string {
   switch (status) {
@@ -26,65 +28,6 @@ function firstLine(text: string): string {
   return text.trim().split(/\r?\n/, 1)[0] ?? '';
 }
 
-function resultUrl(url: string, id: string): { url: string; daemonFile: boolean } | null {
-  if (url.startsWith(`/v1/exec-requests/${encodeURIComponent(id)}/files/`)) {
-    return { url, daemonFile: true };
-  }
-  try {
-    const parsed = new URL(url);
-    if ((parsed.protocol === 'https:' || parsed.protocol === 'http:') && !parsed.username && !parsed.password) {
-      return { url: parsed.href, daemonFile: false };
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function ResultLink({ client, id, result }: { client: DaemonClient; id: string; result: ExecRequestDetail['results'][number] }) {
-  const [error, setError] = useState('');
-  const [opening, setOpening] = useState(false);
-  const target = resultUrl(result.url, id);
-  if (!target) return null;
-  const label = result.title || result.kind;
-
-  async function openFile() {
-    if (!target?.daemonFile || opening) return;
-    setOpening(true);
-    setError('');
-    try {
-      const response = await client.fetchResponse(target.url);
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const blobUrl = URL.createObjectURL(await response.blob());
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = decodeURIComponent(target.url.split('/').at(-1) ?? label);
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-    } catch {
-      setError('결과 파일을 열지 못했습니다. 다시 시도해 주세요.');
-    } finally {
-      setOpening(false);
-    }
-  }
-
-  return (
-    <li className="rounded-lg border border-border bg-background px-4 py-3 text-sm">
-      {target.daemonFile ? (
-        <button type="button" onClick={() => void openFile()} disabled={opening} className="font-medium text-primary underline underline-offset-4 disabled:opacity-50">
-          {opening ? '여는 중…' : label}
-        </button>
-      ) : (
-        <a href={target.url} target="_blank" rel="noopener noreferrer" className="font-medium text-primary underline underline-offset-4">{label}</a>
-      )}
-      <span className="ml-2 text-muted-foreground">{result.seat.toUpperCase()}</span>
-      {error && <p role="alert" className="mt-1 text-destructive">{error}</p>}
-    </li>
-  );
-}
-
 export default function ExecPage() {
   const { client } = useDaemon();
   const [text, setText] = useState('');
@@ -96,13 +39,22 @@ export default function ExecPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ExecRequestDetail | null>(null);
   const [detailError, setDetailError] = useState('');
+  const [detailRefresh, setDetailRefresh] = useState(0);
+  const [pendingApprovalCount, setPendingApprovalCount] = useState<number | null>(null);
   const pending = useRef<Map<string, ExecRequestItem>>(new Map());
   const connectionGeneration = useRef(0);
+  const selectedIdRef = useRef(selectedId);
+  selectedIdRef.current = selectedId;
+  const detailInFlight = useRef<string | null>(null);
+  const selectionGeneration = useRef(0);
   const polling = items.some(item => item.status === 'planning' || item.status === 'running');
   const selectedStatus = items.find(item => item.id === selectedId)?.status;
+  const awaitingApproval = detail?.id === selectedId && (pendingApprovalCount === null ? detail.approvals.length > 0 : pendingApprovalCount > 0);
 
   useEffect(() => {
     connectionGeneration.current += 1;
+    selectionGeneration.current += 1;
+    detailInFlight.current = null;
     pending.current = new Map();
     setText('');
     setSending(false);
@@ -110,9 +62,11 @@ export default function ExecPage() {
     setLoaded(false);
     setListError('');
     setSendError('');
-    setSelectedId(null);
+    const requestId = typeof window === 'undefined' ? null : new URLSearchParams(window.location?.search ?? '').get('request');
+    setSelectedId(requestId);
     setDetail(null);
     setDetailError('');
+    setPendingApprovalCount(null);
     return () => { connectionGeneration.current += 1; };
   }, [client]);
 
@@ -141,29 +95,37 @@ export default function ExecPage() {
     return () => { active = false; if (timer) clearInterval(timer); };
   }, [client, polling]);
 
+  const refreshDetail = useCallback(async () => {
+    if (!selectedId) return;
+    const generation = connectionGeneration.current;
+    const selection = selectionGeneration.current;
+    const requestKey = `${generation}:${selection}:${selectedId}`;
+    if (detailInFlight.current === requestKey) return;
+    detailInFlight.current = requestKey;
+    try {
+      const response = await client.getExecRequest(selectedId);
+      if (connectionGeneration.current !== generation || selectionGeneration.current !== selection || selectedIdRef.current !== selectedId) return;
+      setDetail(response);
+      setDetailError('');
+    } catch {
+      if (connectionGeneration.current === generation && selectionGeneration.current === selection && selectedIdRef.current === selectedId) {
+        setDetailError('상세를 읽지 못했습니다. 잠시 뒤 다시 시도해 주세요.');
+      }
+    } finally {
+      if (detailInFlight.current === requestKey) detailInFlight.current = null;
+    }
+  }, [client, selectedId]);
+
   useEffect(() => {
     if (!selectedId) return;
-    let active = true;
-    let inFlight = false;
-    async function refresh() {
-      if (inFlight) return;
-      inFlight = true;
-      try {
-        const response = await client.getExecRequest(selectedId!);
-        if (!active) return;
-        setDetail(response);
-        setDetailError('');
-      } catch {
-        if (active) setDetailError('상세를 읽지 못했습니다. 잠시 뒤 다시 시도해 주세요.');
-      } finally {
-        inFlight = false;
-      }
-    }
-    void refresh();
-    const timer = selectedStatus === 'planning' || selectedStatus === 'running'
-      ? setInterval(() => void refresh(), 5_000) : null;
-    return () => { active = false; if (timer) clearInterval(timer); };
-  }, [client, selectedId, selectedStatus]);
+    void refreshDetail();
+  }, [refreshDetail, detailRefresh]);
+
+  useEffect(() => {
+    if (!selectedId || (selectedStatus !== 'planning' && selectedStatus !== 'running' && !awaitingApproval)) return;
+    const timer = setInterval(() => void refreshDetail(), 5_000);
+    return () => clearInterval(timer);
+  }, [selectedId, selectedStatus, awaitingApproval, refreshDetail]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -212,7 +174,7 @@ export default function ExecPage() {
         <ul className="space-y-2">
           {items.map(item => (
             <li key={item.id}>
-              <button type="button" onClick={() => { if (selectedId === item.id) return; setSelectedId(item.id); setDetail(null); setDetailError(''); }} aria-expanded={selectedId === item.id} className="w-full rounded-xl border border-border bg-card p-4 text-left hover:border-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">
+              <button type="button" onClick={() => { if (selectedId === item.id) return; selectionGeneration.current += 1; setSelectedId(item.id); setDetail(null); setDetailError(''); setPendingApprovalCount(null); }} aria-expanded={selectedId === item.id} className="w-full rounded-xl border border-border bg-card p-4 text-left hover:border-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">
                 <span className="flex items-start justify-between gap-3">
                   <span className="min-w-0 truncate text-sm font-semibold">{firstLine(item.text)}</span>
                   <span className="shrink-0 text-sm font-medium text-primary">{requestLabel(item.status)}</span>
@@ -229,7 +191,7 @@ export default function ExecPage() {
         <section aria-labelledby="exec-detail" className="space-y-5 rounded-xl border border-border bg-card p-5">
           <div className="flex items-start justify-between gap-3">
             <h2 id="exec-detail" className="text-lg font-semibold">맡긴 일 상세</h2>
-            <button type="button" onClick={() => { setSelectedId(null); setDetail(null); }} className="text-sm text-primary underline underline-offset-4">닫기</button>
+            <button type="button" onClick={() => { selectionGeneration.current += 1; setSelectedId(null); setDetail(null); setPendingApprovalCount(null); }} className="text-sm text-primary underline underline-offset-4">닫기</button>
           </div>
           <p className="whitespace-pre-wrap text-sm">{displayedDetail?.text ?? selected?.text}</p>
           <p className="text-sm text-muted-foreground">{requestLabel(displayedDetail?.status ?? selected?.status ?? 'planning')}</p>
@@ -253,9 +215,9 @@ export default function ExecPage() {
               <div className="space-y-2">
                 <h3 className="font-semibold">결과</h3>
                 {displayedDetail.results.length === 0 && <p className="text-sm text-muted-foreground">아직 결과가 없습니다.</p>}
-                <ul className="space-y-2">{displayedDetail.results.map(result => <ResultLink key={result.url} client={client} id={displayedDetail.id} result={result} />)}</ul>
+                <ul className="space-y-2">{displayedDetail.results.map(result => <ExecResultView key={result.url} client={client} id={displayedDetail.id} result={result} />)}</ul>
               </div>
-              {displayedDetail.approvals.length > 0 && <div className="space-y-2"><h3 className="font-semibold">게시 승인</h3><ul className="space-y-1">{displayedDetail.approvals.map(approval => <li key={`${approval.graphId}:${approval.runId}`} className="text-sm">{approval.message}</li>)}</ul></div>}
+              <ExecApprovals key={displayedDetail.id} client={client} approvals={displayedDetail.approvals} onDecided={() => setDetailRefresh(value => value + 1)} onPendingChange={setPendingApprovalCount} />
             </>
           )}
         </section>

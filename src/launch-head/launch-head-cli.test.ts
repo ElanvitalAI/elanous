@@ -1,9 +1,12 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Command } from 'commander';
 import { runCapabilityCheck, runLoadBalance, registerLaunchHeadCommands } from './launch-head-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function ioFor(files: Record<string, string>, env: Record<string, string> = {}) {
   const logs: string[] = [];

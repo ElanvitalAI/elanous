@@ -1,9 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { INVENTORY_REFRESH_COMMAND, auditTestStateWrites, classifyCandidates, classifyStaticIsolation, renderAudit } from '../scripts/audit-test-state-writes';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repo = join(import.meta.dir, '..');
 const inventory = join(repo, 'docs', 'TEST-home-state-write-audit.md');

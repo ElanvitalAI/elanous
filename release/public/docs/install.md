@@ -45,7 +45,9 @@ It installs into `%LOCALAPPDATA%\elanous` (override with `-Prefix PATH` or `ELAN
 
 ## From a bare Linux machine
 
-A bare image may not even have `curl`, so install the basics first:
+A bare image may not even have `curl`, and the one-line installer needs it to download itself.
+If you run the installer as **root** on Debian or Ubuntu, it installs any missing `unzip` and `git` itself (one `apt-get update` and `install`; turn this off with `--no-install-deps`).
+As a regular user it only tells you what is missing, so install the basics first:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y curl ca-certificates unzip git

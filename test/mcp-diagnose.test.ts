@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, utimesSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -9,6 +9,9 @@ import { runMcpDiagnose } from '../src/cli/mcp-diagnose.js';
 import { McpConnectionError } from '../src/mcp/client.js';
 import { mcpOAuthStorePath } from '../src/mcp/mcp-oauth.js';
 import { saveTokens } from '../src/oauth/store.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const SRC_INDEX = join(REPO_ROOT, 'src', 'index.ts');

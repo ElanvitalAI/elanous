@@ -1,6 +1,6 @@
 import type { ChatBlock, ChatMessage } from './chat-runtime';
 // ⛔⭐ 라이브와 «같은» 이미지 추출기를 쓴다 — 새로 쓰면 두 자리가 갈린다(위 `toolTraceBlocks` 머리말).
-import { mcpResultImages } from './chat-runtime';
+import { mcpResultImages, pushToolCards } from './chat-runtime';
 
 /** ⛔⭐⭐⭐ **저장된 세션을 «화면에 그릴» 메시지로 옮긴다.**
  *
@@ -32,6 +32,7 @@ import { mcpResultImages } from './chat-runtime';
 interface StoredSessionMessage {
   readonly role: string;
   readonly content?: unknown;
+  readonly ts?: unknown;
   /** ⭐ `role:'tool'` 일 때 `session/chat.ts` 의 `buildToolTraceMessage` 가 싣는 칸들.
    *  ⛔📏 1차판 타입에는 이 셋이 «없었다» — 그래서 시험이 실제 저장 모양을 넘기자
    *  타입 자가 잡았다(`toolName does not exist`). ***타입이 실제보다 좁았던 것이다.*** */
@@ -100,7 +101,10 @@ function toolTraceBlocks(trace: StoredSessionMessage, id: string): ChatBlock[] {
   let parsed: unknown;
   try { parsed = JSON.parse(String(trace.toolResult ?? '')); } catch { parsed = undefined; }
   const images: ChatBlock[] = mcpResultImages(parsed).map((img) => ({ kind: 'image', ...img }));
-  return [...images, primary];
+  // REL9p — the same card extraction as the live paths (`pushToolCards`); a truncated record just yields no card.
+  const cards: ChatBlock[] = [];
+  pushToolCards(cards, parsed ?? trace.toolResult);
+  return [...images, primary, ...cards];
 }
 
 function toolTraceBlock(trace: StoredSessionMessage, id: string): ChatBlock {
@@ -144,6 +148,23 @@ function toolTraceBlock(trace: StoredSessionMessage, id: string): ChatBlock {
   };
 }
 
+function restoredTimestamp(ts: unknown, fallback: number): number {
+  if (typeof ts !== 'string') return fallback;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(ts);
+  if (!match) return fallback;
+  const [, yearPart, monthPart, dayPart, hourPart, minutePart, secondPart, offsetHourPart, offsetMinutePart] = match;
+  const year = Number(yearPart);
+  const month = Number(monthPart);
+  const day = Number(dayPart);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (day < 1 || daysInMonth === undefined || day > daysInMonth
+    || Number(hourPart) > 23 || Number(minutePart) > 59 || Number(secondPart) > 59
+    || (offsetHourPart !== undefined && (Number(offsetHourPart) > 23 || Number(offsetMinutePart) > 59))) return fallback;
+  const parsed = Date.parse(ts);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
 /** 화면에 그릴 메시지만 남긴다. ⛔ 저장소는 그대로 둔다(위 머리말 참조).
  *
  *  ## ⛔⭐⭐ 「중복 답변」의 정체 — 저장 버그가 «아니었다»
@@ -179,9 +200,11 @@ export function restorableChatMessages(
    *  (19:17:10 / :15 / :21), 답변은 그 «뒤»에 온다(19:17:24). ⇒ 시간순이 살아 있다.
    *  ⭐ 그래서 라이브 화면과 «같은 모양»이 된다 — 답변 말풍선 안, 텍스트 «위»에 툴 줄이 선다. */
   let pendingToolBlocks: ChatBlock[] = [];
+  let pendingToolTimestamp: unknown;
   for (const m of stored) {
     if (m.role === 'tool') {
       // ⛔ 툴 기록은 «자기 말풍선»을 갖지 않는다 — 다음 답변에 선행 블록으로 붙는다.
+      if (pendingToolBlocks.length === 0) pendingToolTimestamp = m.ts;
       // ⭐ 이미지가 여러 장일 수 있어 «여럿»을 받는다. ⛔ 중복 src 는 넣지 않는다(라이브와 동형).
       for (const b of toolTraceBlocks(m, `restore-tool-${pendingToolBlocks.length}-${out.length}`)) {
         if (b.kind === 'image' && pendingToolBlocks.some((p) => p.kind === 'image' && p.src === b.src)) continue;
@@ -199,8 +222,9 @@ export function restorableChatMessages(
       //   ⇒ 그 위젯은 «세션 끝에서 사라지거나» 훨씬 뒤의 «무관한 답변»에 붙는다.
       //   ⇒ 텍스트가 없어도 툴 블록이 있으면 «그것만으로» 말풍선을 세운다.
       if (pendingToolBlocks.length > 0 && role === 'assistant') {
-        out.push({ id: `restore-${out.length}`, role, text: '', blocks: pendingToolBlocks, timestamp: baseTimestamp + out.length });
+        out.push({ id: `restore-${out.length}`, role, text: '', blocks: pendingToolBlocks, timestamp: restoredTimestamp(pendingToolTimestamp, baseTimestamp + out.length) });
         pendingToolBlocks = [];
+        pendingToolTimestamp = undefined;
       }
       continue;
     }
@@ -223,20 +247,23 @@ export function restorableChatMessages(
     const blocks: ChatBlock[] | undefined = pendingToolBlocks.length > 0 && role === 'assistant'
       ? [...pendingToolBlocks, { kind: 'text', text }]
       : undefined;
-    if (blocks !== undefined) pendingToolBlocks = [];
+    const timestamp = restoredTimestamp(blocks !== undefined ? pendingToolTimestamp : m.ts, baseTimestamp + out.length);
+    if (blocks !== undefined) {
+      pendingToolBlocks = [];
+      pendingToolTimestamp = undefined;
+    }
     out.push({
       id: `restore-${out.length}`,
       role,
       text,
       ...(blocks !== undefined ? { blocks } : {}),
-      timestamp: baseTimestamp + out.length,
+      timestamp,
     });
   }
   // ⛔⭐ 마지막 답변 «뒤»에 툴이 끝난 경우(또는 그 턴이 아직 답을 안 낸 경우) 블록이 남는다.
   //   ⇒ 버리지 않는다. 그것을 버리면 ***마지막 턴의 위젯이 영영 안 뜬다***(리뷰 must-fix).
   if (pendingToolBlocks.length > 0) {
-    out.push({ id: `restore-${out.length}`, role: 'assistant', text: '', blocks: pendingToolBlocks, timestamp: baseTimestamp + out.length });
-    pendingToolBlocks = [];
+    out.push({ id: `restore-${out.length}`, role: 'assistant', text: '', blocks: pendingToolBlocks, timestamp: restoredTimestamp(pendingToolTimestamp, baseTimestamp + out.length) });
   }
   return out;
 }

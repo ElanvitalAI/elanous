@@ -4,13 +4,42 @@ import { useEffect, useRef, useState } from 'react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { getOpsChecklist, type ChecklistStatus, type OpsResult, type OpsChecklist } from '@/lib/ops-api';
 
-export function ChecklistContent({ result, version, owner, status, pendingOnly, expandedId, onVersion, onOwner, onStatus, onPending, onExpand }: {
+function localTime(date: Date): string {
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+function cutLabel(cut: Date, now: Date | null): string {
+  const today = now && new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const tomorrow = now && new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime();
+  const day = new Date(cut.getFullYear(), cut.getMonth(), cut.getDate()).getTime();
+  const prefix = day === today ? '오늘' : day === tomorrow ? '내일'
+    : `${String(cut.getMonth() + 1).padStart(2, '0')}/${String(cut.getDate()).padStart(2, '0')} (${['일', '월', '화', '수', '목', '금', '토'][cut.getDay()]})`;
+  return `${prefix} ${localTime(cut)}`;
+}
+
+function ScheduleLine({ schedule, now }: { schedule: OpsChecklist['schedule']; now: number | null }): React.ReactNode {
+  if (!schedule) return <p className="text-sm text-muted-foreground">판 일정 없음</p>;
+  const cut = new Date(schedule.cutAt);
+  const land = schedule.landBy === null ? null : new Date(schedule.landBy);
+  const remaining = land && now !== null ? land.getTime() - now : null;
+  const urgency = remaining !== null && remaining <= 0 ? 'text-red-600'
+    : remaining !== null && remaining <= 3 * 60 * 60 * 1000 ? 'text-orange-600' : 'text-muted-foreground';
+  const minutes = remaining !== null && remaining > 0 ? Math.ceil(remaining / 60_000) : 0;
+  const countdown = `${Math.floor(minutes / 60) ? `${Math.floor(minutes / 60)}시간` : ''}${minutes % 60 ? `${Math.floor(minutes / 60) ? ' ' : ''}${minutes % 60}분` : minutes < 60 ? '0분' : ''}`;
+  return <p aria-label="판 일정" className={`text-sm ${urgency}`}>
+    컷 {cutLabel(cut, now === null ? null : new Date(now))}
+    {land && <> · 착지 마감 {land.toDateString() === cut.toDateString() ? localTime(land) : cutLabel(land, now === null ? null : new Date(now))}{remaining !== null && <> · {remaining <= 0 ? '착지 마감 지남' : `마감까지 ${countdown}`}</>}</>}
+  </p>;
+}
+
+export function ChecklistContent({ result, version, owner, status, pendingOnly, expandedId, onVersion, onOwner, onStatus, onPending, onExpand, now = null }: {
   result: OpsResult<OpsChecklist> | null;
   version: string;
   owner: string;
   status: string;
   pendingOnly: boolean;
   expandedId: string | null;
+  now?: number | null;
   onVersion: (value: string) => void;
   onOwner: (value: string) => void;
   onStatus: (value: string) => void;
@@ -30,6 +59,7 @@ export function ChecklistContent({ result, version, owner, status, pendingOnly, 
     {result === null && <p role="status">칸을 불러오는 중…</p>}
     {result?.kind === 'error' && <p role="alert">칸을 불러오지 못했습니다 ({result.status})</p>}
     {data && <>
+      <ScheduleLine schedule={data.schedule} now={now} />
       <section aria-label="상태별 수" className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         {([['🟢', 'green'], ['🟡', 'yellow'], ['🔴', 'red'], ['✅', 'done']] as const).map(([icon, key]) =>
           <div key={key} className="rounded-md border p-3 text-sm">{icon} {data[key]}</div>)}
@@ -68,6 +98,21 @@ export function ChecklistView(): React.ReactNode {
   const [status, setStatus] = useState('');
   const [pendingOnly, setPendingOnly] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [now, setNow] = useState<number | null>(null);
+  useEffect(() => {
+    if (typeof document === 'undefined' || typeof window === 'undefined') return;
+    let interval: number | undefined;
+    const visibility = () => {
+      if (interval !== undefined) { window.clearInterval(interval); interval = undefined; }
+      if (!document.hidden) {
+        setNow(Date.now());
+        interval = window.setInterval(() => setNow(Date.now()), 60_000);
+      }
+    };
+    visibility();
+    document.addEventListener('visibilitychange', visibility);
+    return () => { if (interval !== undefined) window.clearInterval(interval); document.removeEventListener('visibilitychange', visibility); };
+  }, []);
   const [denied, setDenied] = useState(false);
   const permissionDenied = useRef(false);
   const priorClient = useRef(client);
@@ -90,6 +135,6 @@ export function ChecklistView(): React.ReactNode {
   }, [client, version]);
   if (denied) return <p>운영자만 볼 수 있습니다</p>;
   return <ChecklistContent result={result} version={version} owner={owner} status={status} pendingOnly={pendingOnly}
-    expandedId={expandedId} onVersion={(next) => { setVersion(next); setExpandedId(null); }} onOwner={setOwner} onStatus={setStatus}
+    now={now} expandedId={expandedId} onVersion={(next) => { setVersion(next); setExpandedId(null); }} onOwner={setOwner} onStatus={setStatus}
     onPending={setPendingOnly} onExpand={setExpandedId} />;
 }

@@ -1,8 +1,88 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { debug } from '../debug/log.js';
 import { handleDiscordSeatWork } from './discord-seat-work.js';
 import { DiscordBot } from '../discord.js';
+import type { UserConfig } from '../user-config.js';
 
 const MSG = { channelId: '123', messageId: '456' };
+const OWNER = { ...MSG, userId: '11111', isDm: true };
+const config = { raw: { decisions: { discordOwnerId: '11111' } }, discord: { allowedUsers: ['11111'] } } as unknown as UserConfig;
+
+describe('Discord owner intent', () => {
+  test('one seat question answers; null answer falls back to intake', async () => {
+    const answers: unknown[] = []; const inputs: unknown[] = [];
+    const deps = { config,
+      answer: async (...args: unknown[]) => { answers.push(args); return { title: 'COO', text: '진행 중입니다.' }; },
+      dispatch: async () => { throw Error('should not dispatch'); },
+      submit: async (input: unknown) => { inputs.push(input); return { ok: true as const, track: 'graph' as const, acceptanceId: 'R-1' }; },
+    };
+    expect(await handleDiscordSeatWork('@COO 오늘 행사 준비 어디까지야?', OWNER, deps as never)).toBe('진행 중입니다.');
+    expect(answers).toEqual([['COO', '오늘 행사 준비 어디까지야?']]); expect(inputs).toHaveLength(0);
+    expect(await handleDiscordSeatWork('@COO 오늘 행사 준비 어디까지야?', OWNER, { ...deps, answer: async () => null } as never)).toBe('@COO 접수번호: R-1');
+    expect(inputs).toHaveLength(1);
+  });
+
+  test('task sends canonical seat through discord C2 route', async () => {
+    const calls: unknown[] = [];
+    const reply = await handleDiscordSeatWork('@CTO 결제 화면 오타 고쳐 줘', OWNER, { config,
+      dispatch: async (seat, text, _deps, extra) => { calls.push([seat, text, extra]); return { reply: '받음 — TC에 전했습니다.', channel: 'posted' }; },
+      submit: async () => { throw Error('should not submit'); },
+    });
+    expect(reply).toBe('받음 — TC에 전했습니다.');
+    expect(calls).toEqual([['TC', '결제 화면 오타 고쳐 줘', { via: 'discord' }]]);
+  });
+
+  test('real C2 dispatch writes one CEO message and one channel line', async () => {
+    const messages: unknown[] = []; const lines: string[] = [];
+    const reply = await handleDiscordSeatWork('@CTO 결제 화면 오타 고쳐 줘', OWNER, { config,
+      commandDeps: { ownerId: '11111', replyTarget: 'acme/repo#42', append: (message) => { messages.push(message); },
+        runGh: async (_args, stdin) => { lines.push(stdin); return 0; }, now: () => new Date('2026-10-02T03:30:00Z') },
+      submit: async () => { throw Error('should not submit'); },
+    });
+    expect(reply).toBe('받음 — TC에 전했습니다.');
+    expect(messages).toEqual([{ from: 'CEO', to: 'TC', kind: 'ceo-task', body: '결제 화면 오타 고쳐 줘' }]);
+    expect(lines).toEqual(['**[대표]** 2026-10-02 12:30 KST → TC · 결제 화면 오타 고쳐 줘']);
+  });
+
+  test('intent log contains no request body', async () => {
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'seat.dispatch' && event === 'intent') events.push(data);
+    }) as typeof debug.log);
+    try {
+      expect(await handleDiscordSeatWork('@COO private-request-body 알려줘', OWNER, {
+        config, answer: async () => ({ title: 'COO', text: '답' }),
+      })).toBe('답');
+      expect(events).toEqual([{ seat: 'OP', intent: 'question', via: 'discord', outcome: 'answered' }]);
+      expect(JSON.stringify(events)).not.toContain('private-request-body');
+    } finally { log.mockRestore(); }
+  });
+
+  test('group, non-owner, multiple seats preserve intake', async () => {
+    const inputs: unknown[] = [];
+    const deps = { config,
+      submit: async (input: unknown) => { inputs.push(input); return { ok: true as const, track: 'graph' as const, acceptanceId: 'R-1' }; },
+      answer: async () => { throw Error('should not answer'); }, dispatch: async () => { throw Error('should not dispatch'); },
+    } as never;
+    expect(await handleDiscordSeatWork('@CTO 고쳐 줘', { ...OWNER, isDm: false }, deps)).toContain('접수번호');
+    expect(await handleDiscordSeatWork('@CTO 고쳐 줘', { ...OWNER, userId: '22222' }, deps)).toContain('접수번호');
+    expect(await handleDiscordSeatWork('@COO,CMO 정리해 줘', OWNER, deps)).toContain('접수번호');
+    expect(inputs).toHaveLength(4);
+  });
+
+  test('defaultSeat opt-in alone dispatches unaddressed tasks', async () => {
+    const calls: unknown[] = [];
+    const deps = { config, dispatch: async (seat: string, text: string) => { calls.push([seat, text]); return { reply: '받음 — OP에 전했습니다.', channel: 'posted' as const }; } };
+    expect(await handleDiscordSeatWork('내일 일정 정리해 줘', OWNER, deps)).toBeNull();
+    const enabled = { ...deps, config: { ...config, raw: { ...config.raw, seatDispatch: { defaultSeat: 'COO' } } } } as never;
+    expect(await handleDiscordSeatWork('내일 일정 정리해 줘', OWNER, enabled)).toBe('받음 — OP에 전했습니다.');
+    expect(calls).toEqual([['OP', '내일 일정 정리해 줘']]);
+    expect(await handleDiscordSeatWork('오늘 일정 어디까지야?', OWNER, enabled)).toBeNull();
+    expect(await handleDiscordSeatWork('/coo 고쳐 줘', OWNER, enabled)).toBeNull();
+    expect(await handleDiscordSeatWork('  @CTO 고쳐 줘', OWNER, enabled)).toBeNull();
+    expect(await handleDiscordSeatWork('내일 일정 정리해 줘', { ...OWNER, isDm: false }, enabled)).toBeNull();
+  });
+});
 
 describe('Discord addressed seat work', () => {
   test('leaves unaddressed chat messages untouched without submitting', async () => {
@@ -72,6 +152,31 @@ describe('Discord addressed seat work', () => {
       submit: async () => ({ ok: false, track: 'graph', reason: 'no-acceptance-id\ninternal trace' }),
     });
     expect(reply).toBe('@CMO 접수 실패 — no-acceptance-id');
+  });
+
+  test('gateway sends owner DM questions and default-seat tasks to seat paths, leaving other chat alone', async () => {
+    const sent: string[] = []; const chats: string[] = []; const dispatched: unknown[] = [];
+    const bot = new DiscordBot({ token: 'tok', allowedUsers: ['11111'],
+      onMessage: async ({ text }) => { chats.push(text); return 'chat'; },
+      seatWorkDeps: { config: { ...config, raw: { ...config.raw, seatDispatch: { defaultSeat: 'COO' } } },
+        dispatch: async (seat, text, _deps, extra) => { dispatched.push([seat, text, extra]); return { reply: '받음 — OP에 전했습니다.', channel: 'posted' }; },
+        answer: async () => ({ title: 'COO', text: '진행 중입니다.' }),
+        submit: async () => { throw Error('should not submit'); },
+      },
+      fetchImpl: (async (_url: string, init: RequestInit) => {
+        if (init.method === 'POST') sent.push((JSON.parse(String(init.body)) as { content: string }).content);
+        return { ok: true, status: 200, json: async () => ({ id: 'response' }), text: async () => '' };
+      }) as typeof fetch,
+    });
+    const receive = (id: string, content: string) => (bot as unknown as { handleMessageCreate: (m: Record<string, unknown>) => Promise<void> }).handleMessageCreate({
+      author: { id: '11111' }, id, channel_id: 'dm-1', content,
+    });
+    await receive('1', '@COO 행사 준비 어디까지야?');
+    await receive('2', '내일 일정 정리해 줘');
+    await receive('3', '오늘 일정 어디까지야?');
+    expect(dispatched).toEqual([['OP', '내일 일정 정리해 줘', { via: 'discord' }]]);
+    expect(chats).toEqual(['오늘 일정 어디까지야?']);
+    expect(sent).toContain('진행 중입니다.'); expect(sent).toContain('받음 — OP에 전했습니다.');
   });
 
   test('allowlisted gateway messages reach the intake door and reply in the originating channel', async () => {

@@ -9,7 +9,9 @@ export const HEAVY_MB = 2048;
 
 export interface Measurement { file: string; secs: number; rssMb: number | null; rc: number | null; pass: number | null; fail: number | null; reason?: string }
 export type Verdict = 'keep' | 'failing' | 'review';
-export interface Judged extends Measurement { caught90: number; flags: string[]; verdict: Verdict }
+export type Proposal = 'delete' | 'shrink' | 'rewrite-cheap' | 'move-out-of-gate' | 'investigate';
+export interface Td1Disposition { disposition: string; alternative: string; guards: string; why_slow: string }
+export interface Judged extends Measurement { caught90: number; flags: string[]; verdict: Verdict; proposal?: Proposal | null; basis?: string | null }
 export interface LedgerLine { at: string; range: string; start: number; end: number; next: number; total: number; commit: string; budgetSecs: number; results: Judged[] }
 
 /** `file\tsecs\t…` (TD1 whole-gate TSV) → seconds per file. */
@@ -21,6 +23,33 @@ export function costTable(tsv: string): Map<string, number> {
     if (file && Number.isFinite(n) && n > 0) costs.set(file, n);
   }
   return costs;
+}
+
+/** TD1's human-reviewed dispositions, resolved by column name rather than TSV position. */
+export function td1Dispositions(tsv: string): Map<string, Td1Disposition> {
+  const [header, ...rows] = tsv.trimEnd().split('\n');
+  const columns = header?.replace(/\r$/, '').split('\t') ?? [];
+  const index = (name: string) => columns.indexOf(name);
+  const result = new Map<string, Td1Disposition>();
+  for (const row of rows) {
+    const cells = row.replace(/\r$/, '').split('\t');
+    const get = (name: string) => cells[index(name)] ?? '';
+    if (get('file') && get('disposition')) result.set(get('file'), {
+      disposition: get('disposition'), alternative: get('alternative'), guards: get('guards'), why_slow: get('why_slow'),
+    });
+  }
+  return result;
+}
+
+export function propose(judged: Judged, td1: ReadonlyMap<string, Td1Disposition>): Judged {
+  const reviewed = td1.get(judged.file);
+  if (reviewed) {
+    const proposal = reviewed.disposition === 'keep' ? null : reviewed.disposition as Proposal;
+    return { ...judged, proposal, basis: proposal ? [reviewed.alternative, reviewed.why_slow, reviewed.guards && `guards: ${reviewed.guards}`].filter(Boolean).join(' · ') : null };
+  }
+  if (judged.verdict === 'failing') return { ...judged, proposal: 'investigate', basis: `failing (rc=${judged.rc}) · caught90=${judged.caught90}` };
+  if (judged.verdict === 'review') return { ...judged, proposal: 'shrink', basis: `${judged.flags.join(', ')} · caught90=${judged.caught90}` };
+  return { ...judged, proposal: null, basis: null };
 }
 
 /** Next slice from the cursor until the known cost reaches the budget (at least one file; wraps at the end). */

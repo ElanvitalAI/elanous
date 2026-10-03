@@ -1,6 +1,9 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { diffFailures, junitFailures, parseFailures } from './gate-diff';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const output = `bun test v1.4.2
 src/demo/a.test.ts:

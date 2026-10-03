@@ -22,6 +22,84 @@ function capture() {
   };
 }
 
+describe('elanous pod lease status', () => {
+  const pods = Array.from({ length: 10 }, (_, i) => ({
+    metadata: { namespace: 'elanous-test', name: `harness-${i}`, labels: { 'elanous.job': 'harness-job' } }, status: { phase: 'Running' },
+    spec: { nodeName: 'node-1', containers: [{ resources: { limits: { memory: i < 6 ? '16Gi' : '32Gi' }, requests: { memory: i < 6 ? '16Gi' : '32Gi' } } }] },
+  }));
+  const kubectl = (args: readonly string[]) => ({ status: 0, stderr: '', stdout: args.includes('nodes')
+    ? JSON.stringify({ items: [{ metadata: { name: 'node-1' }, status: { allocatable: { memory: '263471132Ki', cpu: '32' }, conditions: [{ type: 'Ready', status: 'True' }] } }] })
+    : args.includes('jobs') ? JSON.stringify({ items: [{ metadata: { name: 'harness-job', labels: { 'elanous.substrate': 'pod' } } }] })
+      : JSON.stringify({ items: pods }) });
+  const runStatus = async (json: boolean) => {
+    const cap = capture();
+    const program = new Command();
+    program.exitOverride();
+    registerPodCommands(program, { io: cap.io, kubectl, accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
+    await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
+    return cap;
+  };
+  test('--json and table agree on measurements and recommendation', async () => {
+    const json = await runStatus(true);
+    const table = await runStatus(false);
+    const data = JSON.parse(json.lines[0]!);
+    expect(json.code()).toBe(0);
+    expect(table.code()).toBe(0);
+    expect(data.members[0]).toMatchObject({ running: 10, pending: 0, capacity: 20 });
+    expect(data).toMatchObject({ recommended: 1, limitedBy: 'memory', capacitySlots: 10, memorySlots: 1 });
+    expect(table.lines.join('\n')).toContain('권장 지금 1 개 더 (limitedBy=memory)');
+    expect(table.lines.join('\n')).toContain('224.0Gi/251.3Gi');
+    expect(data.placeableSlots).toBe(1);
+    expect(table.lines.join('\n')).toContain(`배치 가능 ${data.placeableSlots} 칸`);
+  });
+  test('explicit pool spec wins; all kubectl probes are reads', async () => {
+    const calls: string[][] = [];
+    const cap = capture(); const program = new Command(); program.exitOverride();
+    registerPodCommands(program, {
+      io: cap.io, accounts: () => 10, perAccount: () => 4,
+      poolSpec: (explicit) => explicit ?? 'wrong:2',
+      kubectl: (args) => { calls.push([...args]); return kubectl(args); },
+    });
+    await program.parseAsync(['pod', 'lease', 'status', '--pool', 'node-b:20', '--json'], { from: 'user' });
+    expect(JSON.parse(cap.lines[0]!).pool).toBe('node-b:20');
+    expect(calls).toHaveLength(3);
+    expect(calls.find((args) => args.includes('pods'))).toContain('--all-namespaces');
+    expect(calls.every((args) => args[0] === '--context' && args[1] === 'node-b' && args[2] === '--request-timeout=10s' && args.includes('get'))).toBe(true);
+  });
+  test('foreign Pod reservation is reflected in both JSON and the table', async () => {
+    const foreign = { metadata: { namespace: 'system', name: 'foreign', labels: {} }, status: { phase: 'Running' },
+      spec: { nodeName: 'node-1', containers: [{ resources: { requests: { memory: '16Gi' } } }] } };
+    const occupied = (args: readonly string[]) => args.includes('pods')
+      ? { status: 0, stderr: '', stdout: JSON.stringify({ items: [foreign, ...pods] }) } : kubectl(args);
+    const render = async (json: boolean) => {
+      const cap = capture(); const program = new Command(); program.exitOverride();
+      registerPodCommands(program, { io: cap.io, kubectl: occupied, accounts: () => 10, perAccount: () => 4, poolSpec: () => 'node-b:20' });
+      await program.parseAsync(['pod', 'lease', 'status', ...(json ? ['--json'] : [])], { from: 'user' });
+      expect(cap.code()).toBe(0);
+      return cap.lines.join('\n');
+    };
+    const data = JSON.parse(await render(true));
+    expect(data).toMatchObject({ recommended: 0, limitedBy: 'memory', running: 10, memorySlots: 1, placeableSlots: 0 });
+    expect(await render(false)).toContain('권장 지금 0 개 더 (limitedBy=memory)');
+  });
+  test('account read failure is unknown, not zero accounts — and does not block the recommendation (accounts are observed only)', async () => {
+    const cap = capture(); const program = new Command(); program.exitOverride();
+    registerPodCommands(program, { io: cap.io, kubectl, poolSpec: () => 'node-b:20', accounts: () => { throw new Error('store locked'); } });
+    await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
+    expect(cap.code()).toBe(0);
+    const out = JSON.parse(cap.lines[0]!);
+    expect(out).toMatchObject({ accounts: null, accountSlots: null });
+    expect(out.recommended).not.toBeNull();
+  });
+  test('unreachable cluster exits 0 and says unknown (not zero)', async () => {
+    const cap = capture(); const program = new Command(); program.exitOverride();
+    registerPodCommands(program, { io: cap.io, accounts: () => 0, poolSpec: () => 'node-b:20', kubectl: () => ({ status: 1, stdout: '', stderr: 'timeout' }) });
+    await program.parseAsync(['pod', 'lease', 'status', '--json'], { from: 'user' });
+    expect(cap.code()).toBe(0);
+    expect(JSON.parse(cap.lines[0]!)).toMatchObject({ recommended: null, reason: expect.stringContaining('측정 불가: cluster') });
+  });
+});
+
 describe('elanous pod run', () => {
   test('도움말은 deadline 생략 시 기존 Pod Job 상한을 적는다', () => {
     const program = new Command();

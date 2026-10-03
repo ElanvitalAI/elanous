@@ -124,6 +124,16 @@ describe('telegram caption grammar', () => {
     expect(parseFieldCaption('#현장 ../etc')).toEqual({ text: '../etc' });
   });
 
+  test('instant is a standalone mode token before or after the event, not a subtitle', () => {
+    expect(parseFieldCaption('#현장 즉석')).toEqual({ mode: 'instant' });
+    expect(parseFieldCaption('#현장 marketers-night 즉석 첫날 부스')).toEqual({ event: 'marketers-night', mode: 'instant', text: '첫날 부스' });
+    expect(parseFieldCaption('instant #현장 marketers-night 첫날')).toEqual({ event: 'marketers-night', mode: 'instant', text: '첫날' });
+    expect(parseFieldCaption('#현장 instant marketers-night 첫날')).toEqual({ event: 'marketers-night', mode: 'instant', text: '첫날' });
+    expect(parseFieldCaption('#현장 marketers-night 첫날')).toEqual({ event: 'marketers-night', text: '첫날' });
+    expect(parseFieldCaption('#현장 instantaneous 첫날')).toEqual({ event: 'instantaneous', text: '첫날' });
+    expect(parseFieldCaption('#현장 즉석판 첫날')).toEqual({ text: '즉석판 첫날' });
+  });
+
   test('defaultFieldEvent prefers a valid config value, else field-<local date>', () => {
     const at = new Date(2026, 9, 3, 23, 59);
     expect(defaultFieldEvent('marketers-night-2026-10', at)).toBe('marketers-night-2026-10');

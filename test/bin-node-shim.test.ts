@@ -1,10 +1,13 @@
 // R6 — npm 설치 입구 `bin/elanous.cjs`: Bun 이 있으면 `bin/elanous.mjs` 로 넘기고, 없으면 안내한다(`--version` 은 스스로 답한다).
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const ROOT = resolve(import.meta.dir, '..');
 const SHIM = join(ROOT, 'bin', 'elanous.cjs');

@@ -1,10 +1,13 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { exportMirrorManifest } from './mirror-export.js';
 import type { GroundingSource } from './sources.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO = join(import.meta.dir, '../..');
 const DEPLOY = join(REPO, 'docker/ref-mirror/deploy.sh');

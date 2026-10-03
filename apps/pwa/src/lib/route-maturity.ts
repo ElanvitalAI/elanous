@@ -22,7 +22,8 @@ export function routeMaturity(href: string): RouteMaturity | undefined {
   return Object.prototype.hasOwnProperty.call(ROUTE_MATURITY, key) ? ROUTE_MATURITY[key] : undefined;
 }
 
-export function visibleForRole(role: PwaRole, href: string): boolean {
+export function visibleForRole(role: PwaRole, href: string, opts?: { showBeta?: boolean }): boolean {
   const route = routeKey(href);
+  if (role === 'general' && opts?.showBeta && routeMaturity(route) === 'beta') return true;
   return visibleOn(route, 'pwa', role);
 }

@@ -1,0 +1,49 @@
+{
+  "description": "Release NL routing: status reads and authorized changes versus explanation-only, administrative, and unrelated requests. This corpus checks tool selection, not ledger mutation or response contents.",
+  "surface": "webterm",
+  "tiers": {
+    "positive-status": "Current release state requires release_status.",
+    "positive-change": "Explicit release checklist mutation requires release_change.",
+    "contrast": "Explanation-only, administrative, and unrelated requests must not trigger release tools.",
+    "release": "Release status and owner change requests should route to release tools."
+  },
+  "items": [
+    {
+      "id": "release-status-01",
+      "tier": "positive-status",
+      "prompt": "이번 릴리스 일정과 체크리스트 상태 알려줘",
+      "accept": ["release_status"]
+    },
+    {
+      "id": "release-status-02",
+      "tier": "positive-status",
+      "prompt": "지금 릴리스 체크리스트에서 빨간 항목이 뭐야?",
+      "accept": ["release_status"]
+    },
+    {
+      "id": "release-change-01",
+      "tier": "positive-change",
+      "prompt": "릴리스 체크리스트의 빌드 검증 항목을 green으로 변경해줘",
+      "accept": ["release_change"]
+    },
+    {
+      "id": "release-contrast-status-01",
+      "tier": "contrast",
+      "prompt": "릴리스 일정과 체크리스트 상태를 확인하는 방법만 설명해줘. 지금 상태는 조회하지 마.",
+      "accept": [],
+      "reject": ["release_status", "release_change"]
+    },
+    {
+      "id": "release-contrast-change-01",
+      "tier": "contrast",
+      "prompt": "릴리스 체크리스트의 빌드 검증 항목을 green으로 바꾸려면 어떤 절차가 필요한지만 설명해줘. 실제로 변경하지 마.",
+      "accept": [],
+      "reject": ["release_status", "release_change"]
+    },
+    { "id": "rel-status", "tier": "release", "prompt": "0.2.10 어디까지 왔어", "accept": ["release_status"], "reject": ["release_change", "coo_admin"] },
+    { "id": "rel-admin", "tier": "contrast", "prompt": "행정 뭐 남았어", "accept": ["coo_admin"], "reject": ["release_status"] },
+    { "id": "rel-change", "tier": "release", "prompt": "0.2.11 에 ○○ 칸 추가해줘", "accept": ["release_change"], "reject": ["release_status"] },
+    { "id": "rel-weather", "tier": "contrast", "prompt": "오늘 날씨 어때", "accept": [], "reject": ["release_status", "release_change"] },
+    { "id": "rel-logs", "tier": "contrast", "prompt": "로그 보여줘", "accept": [], "reject": ["release_status", "release_change"] }
+  ]
+}

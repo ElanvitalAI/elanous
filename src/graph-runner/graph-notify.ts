@@ -2,6 +2,8 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, readdirSy
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { debug } from '../debug/log.js';
+import { applyDecidedApprovals, raiseApprovalCard, type GraphApprovalCardDeps } from './graph-approval-card.js';
 import type { GraphRunState } from './runner.js';
 
 export interface GraphNotificationEvent {
@@ -20,6 +22,7 @@ export interface GraphNotifyOptions {
   graphsDir?: string;
   dryRun?: boolean;
   send?: (message: string, event: GraphNotificationEvent) => Promise<void> | void;
+  approvalCard?: Pick<GraphApprovalCardDeps, 'ledger'>;
 }
 
 type NotificationSetting = boolean | string | { on?: string | string[]; enabled?: boolean };
@@ -177,16 +180,35 @@ export async function notifyGraphEvents(options: GraphNotifyOptions = {}): Promi
     return collectGraphEvents({ root, graphsDir: options.graphsDir }).filter((event) => !sent.has(event.id));
   };
   if (options.dryRun) return collectFresh();
+  const syncApprovals = () => {
+    const deps = { root, ...options.approvalCard };
+    try { applyDecidedApprovals(deps); }
+    catch (error) {
+      debug.log('graph.approval-card', 'skipped', { graphId: undefined, runId: undefined, nodeId: undefined,
+        decisionId: undefined, outcome: undefined, reason: error instanceof Error ? error.message : String(error) });
+    }
+    for (const event of collectGraphEvents({ root, graphsDir: options.graphsDir })) {
+      if (event.kind !== 'approval') continue;
+      try {
+        const state = JSON.parse(readFileSync(join(root, 'graph-runs', event.graphId, `${event.runId}.json`), 'utf8')) as GraphRunState;
+        if (state.pending?.nodeId === event.nodeId) raiseApprovalCard(state, state.pending, deps);
+      } catch (error) {
+        debug.log('graph.approval-card', 'skipped', { graphId: event.graphId, runId: event.runId, nodeId: event.nodeId,
+          decisionId: undefined, outcome: undefined, reason: error instanceof Error ? error.message : String(error) });
+      }
+    }
+  };
   // The former .lock path was a directory; use a separate, stable inode instead of trying to reclaim it.
   const lock = `${ledgerPath}.flock`;
   mkdirSync(join(root, 'graph-runs'), { recursive: true });
   const flock = await loadFlock();
-  if (!flock) return notifyWithExclusiveFile(`${ledgerPath}.owner`, collectFresh, options.send, ledgerPath);
+  if (!flock) return notifyWithExclusiveFile(`${ledgerPath}.owner`, collectFresh, options.send, ledgerPath, syncApprovals);
   const fd = openSync(lock, 'a');
   let acquired = false;
   try {
     if (flock(fd, LOCK_EX_NB) !== 0) throw new Error('graph notification is already running');
     acquired = true;
+    syncApprovals();
     return await sendFresh(collectFresh(), options.send, ledgerPath);
   } finally {
     try {
@@ -209,12 +231,12 @@ async function sendFresh(fresh: GraphNotificationEvent[], sendOption: GraphNotif
 }
 
 /** Platforms without flock (Windows, musl): an exclusive owner file. A crash leaves it behind, and the next run names it instead of double-sending. */
-async function notifyWithExclusiveFile(ownerPath: string, collectFresh: () => GraphNotificationEvent[], send: GraphNotifyOptions['send'], ledgerPath: string): Promise<GraphNotificationEvent[]> {
+async function notifyWithExclusiveFile(ownerPath: string, collectFresh: () => GraphNotificationEvent[], send: GraphNotifyOptions['send'], ledgerPath: string, syncApprovals: () => void): Promise<GraphNotificationEvent[]> {
   try { writeFileSync(ownerPath, String(process.pid), { flag: 'wx' }); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`graph notification is already running (or a crashed run left ${ownerPath} — remove it if no notifier is running)`);
     throw error;
   }
-  try { return await sendFresh(collectFresh(), send, ledgerPath); }
+  try { syncApprovals(); return await sendFresh(collectFresh(), send, ledgerPath); }
   finally { rmSync(ownerPath, { force: true }); }
 }

@@ -4,11 +4,12 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
+import { mergeCapturedPath } from '../shell-env-bootstrap.js';
 import { listFieldMedia } from './field-media.js';
 import { startFieldFeed, type FieldFeedStart } from './field-feed-auto.js';
 
 export interface FieldReelResult { ok: boolean; file?: string; seconds: number; error?: string; feed?: FieldFeedStart }
-export type FieldReelRunner = (dir: string, opts: { title: string; sub: string }) => Promise<FieldReelResult>;
+export type FieldReelRunner = (dir: string, opts: { title: string; sub: string; mode?: 'standard' | 'instant' }) => Promise<FieldReelResult>;
 export interface FieldReelStatus {
   state: 'waiting' | 'rendering' | 'done' | 'failed';
   items: number;
@@ -23,6 +24,7 @@ export interface FieldReelOptions {
   quietMs?: number;
   title?: string;
   sub?: string;
+  mode?: 'standard' | 'instant';
   runner?: FieldReelRunner;
   onDone?: (result: FieldReelResult) => void | Promise<void>;
   /** 같은 수신자가 앨범 항목마다 예약해도 한 렌더당 한 번만 통지한다. */
@@ -96,10 +98,12 @@ export function readFieldReelStatus(dir: string): FieldReelStatus | null {
   }
 }
 
-export const defaultFieldReelRunner: FieldReelRunner = (dir, { title, sub }) => new Promise((finish) => {
+export const defaultFieldReelRunner = (dir: string, { title, sub, mode = 'standard' }: { title: string; sub: string; mode?: 'standard' | 'instant' }, spawnReel: typeof spawn = spawn): Promise<FieldReelResult> => new Promise((finish) => {
   const script = resolve(import.meta.dir, '../../skills/explainer-video/engine/reel.sh');
   const started = Date.now();
-  const child = spawn('zsh', [script, dir, '--title', title, '--sub', sub], { stdio: 'ignore' });
+  const env = { ...process.env };
+  mergeCapturedPath(env, { capture: true });
+  const child = spawnReel('zsh', [script, dir, '--title', title, '--sub', sub, ...(mode === 'instant' ? ['--instant'] : [])], { stdio: 'ignore', env });
   let settled = false;
   const done = (error?: string) => {
     if (settled) return;
@@ -147,6 +151,7 @@ async function render(dir: string, job: Job): Promise<void> {
     result = await (renderOpts.runner ?? defaultFieldReelRunner)(dir, {
       title: titleLines[0]?.trim() || renderOpts.title || event,
       sub: titleLines[1]?.trim() || renderOpts.sub || sub,
+      ...(renderOpts.mode ? { mode: renderOpts.mode } : {}),
     });
   } catch (err) {
     result = { ok: false, seconds: 0, error: err instanceof Error ? err.message : String(err) };
@@ -160,10 +165,15 @@ async function render(dir: string, job: Job): Promise<void> {
   debug.log('field.reel', result.ok ? 'done' : 'failed', { event, items, seconds: result.seconds });
   if (result.ok) {
     // EV10b: 엔진이 timeline.json 에 남긴 비전 호출 수·성공·«현장 N» 강등·걸린 ms — codex 잔량과 겹치므로 관측한다(OP 10-01).
+    let cardsCache: 'hit' | 'miss' | 'n/a' = 'n/a';
     try {
-      const t = JSON.parse(readFileSync(join(dir, 'reel', 'timeline.json'), 'utf8')) as { vision?: Record<string, unknown>; music?: unknown };
+      const t = JSON.parse(readFileSync(join(dir, 'reel', 'timeline.json'), 'utf8')) as { vision?: Record<string, unknown>; music?: unknown; cardsCache?: 'hit' | 'miss' };
       if (t.vision) debug.log('field.reel', 'vision', { event, ...t.vision, music: t.music === true });
+      if (renderOpts.mode === 'instant' && (t.cardsCache === 'hit' || t.cardsCache === 'miss')) cardsCache = t.cardsCache;
     } catch { debug.log('field.reel', 'vision-unread', { event }); }
+    // A custom runner without an explicit mode may render any way — say «unknown» instead of guessing the default.
+    const mode = renderOpts.mode ?? (renderOpts.runner ? 'unknown' : 'standard');
+    debug.log('field.reel', 'rendered', { mode, seconds: result.seconds, cardsCache });
   }
   // 뒤이은 업로드로 다시 렌더할 예정이면(dirty) 피드는 그 마지막 렌더 뒤에 한 번만 띄운다.
   if (result.ok && !job.dirty) result = { ...result, feed: (renderOpts.startFeed ?? ((d: string) => startFieldFeed(d, { enabled: renderOpts.autoFeed })))(dir) };

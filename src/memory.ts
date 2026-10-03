@@ -35,6 +35,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { debug } from './debug/log.js';
 import { estimateTokens } from './tokens.js';
 import { budgetModel } from './llm/model-defaults.js';
+import { getAppliedGlobalTestRoot } from './cli/test-flag.js';
 
 /**
  * 임시 파일 → fsync → rename → 폴더 fsync. rename 만으로는 «원자적»이지만 «내구적»이 아니다.
@@ -86,14 +87,16 @@ export interface MemoryEntry {
    *  Use for core / safety / reference-location facts that must always be
    *  in context. Costs tokens every turn, so keep pinned bodies short. */
   pinned: boolean;
+  /** Optional pinned-memory freshness window; absent memories retain their original injection text. */
+  staleAfterMinutes?: number;
 }
 
 // ── Paths ────────────────────────────────────────────────────────────
 
 export function memoryRoot(): string {
-  const base = process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.trim()
+  const base = getAppliedGlobalTestRoot() ?? (process.env.XDG_DATA_HOME && process.env.XDG_DATA_HOME.trim()
     ? process.env.XDG_DATA_HOME
-    : join(homedir(), '.local', 'share');
+    : join(homedir(), '.local', 'share'));
   return join(base, 'elanous', 'memory');
 }
 
@@ -122,6 +125,12 @@ function parseFrontmatter(raw: string): { fm: Record<string, string>; body: stri
     if (m) fm[m[1]] = m[2].trim();
   }
   return { fm, body };
+}
+
+function parseStaleAfterMinutes(value: string | number | undefined): number | undefined {
+  if (value === undefined || value === '') return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 function renderFrontmatter(fm: Record<string, string>, body: string): string {
@@ -179,6 +188,8 @@ export interface SaveMemoryOpts {
   priority?: number;
   /** Always-inject (bypass keyword gate). Default false — or preserve on update. */
   pinned?: boolean;
+  /** Pinned injection warns after this many minutes; preserved on update. */
+  staleAfterMinutes?: number;
   /** Override the generated id (tests). */
   id?: string;
 }
@@ -195,16 +206,19 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
   let createdAt = now;
   let existingPriority: number | undefined;
   let existingPinned: boolean | undefined;
+  let existingStaleAfterMinutes: number | undefined;
   if (existsSync(path)) {
     try {
       const parsed = parseFrontmatter(readFileSync(path, 'utf-8'));
       if (parsed.fm.created) createdAt = parsed.fm.created;
       if (parsed.fm.priority) existingPriority = parseInt(parsed.fm.priority, 10) || 0;
       if (parsed.fm.pinned) existingPinned = parsed.fm.pinned === 'true';
+      existingStaleAfterMinutes = parseStaleAfterMinutes(parsed.fm['stale-after-minutes']);
     } catch { /* keep new createdAt */ }
   }
   const priority = opts.priority ?? existingPriority ?? 0;
   const pinned = opts.pinned ?? existingPinned ?? false;
+  const staleAfterMinutes = parseStaleAfterMinutes(opts.staleAfterMinutes) ?? existingStaleAfterMinutes;
   const frontmatter: Record<string, string> = {
     name: opts.name,
     description: opts.description,
@@ -214,6 +228,7 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
   };
   if (priority > 0) frontmatter.priority = String(Math.floor(priority));
   if (pinned) frontmatter.pinned = 'true';
+  if (staleAfterMinutes !== undefined) frontmatter['stale-after-minutes'] = String(staleAfterMinutes);
   const raw = renderFrontmatter(frontmatter, opts.body);
   writeFileDurable(path, raw);
 
@@ -232,6 +247,7 @@ export function saveMemory(opts: SaveMemoryOpts, root: string = memoryRoot()): M
     keywords: extractKeywords(`${opts.name} ${opts.description}`),
     priority,
     pinned,
+    staleAfterMinutes,
   };
 }
 
@@ -257,6 +273,7 @@ function parseMemoryFile(path: string): MemoryEntry | null {
     keywords: extractKeywords(`${fm.name} ${fm.description ?? ''}`),
     priority: fm.priority ? (parseInt(fm.priority, 10) || 0) : 0,
     pinned: fm.pinned === 'true',
+    staleAfterMinutes: parseStaleAfterMinutes(fm['stale-after-minutes']),
   };
 }
 
@@ -432,6 +449,17 @@ export function readIndex(root: string = memoryRoot()): string {
 
 // ── Injection heuristic ──────────────────────────────────────────────
 
+function pinnedChunk(e: MemoryEntry): string {
+  const header = `### 📌 [${e.type}] ${e.name}\n\n`;
+  const body = (e.body || '').trim() || e.description;
+  const updated = Date.parse(e.updatedAt);
+  if (e.staleAfterMinutes === undefined || !Number.isFinite(updated)) return header + body;
+  const ageMinutes = (Date.now() - updated) / 60_000;
+  if (ageMinutes <= e.staleAfterMinutes) return header + body;
+  const hours = Math.floor(ageMinutes / 60);
+  return header + `⚠️ 이 기억은 ${hours}시간 전 것이다 — 답하기 전에 원장 도구 release_status(판 일정·칸) · decisions_pending(미결 결정) · ops_seats(자리 현황)로 다시 확인하고, 확인 전에는 «확인 중»이라고 말한다.\n${body}`;
+}
+
 export interface InjectionResult {
   /** Markdown block to prepend to the system prompt (or '' when empty). */
   block: string;
@@ -490,7 +518,7 @@ export function buildMemoryInjection(
   const pinnedMems = listMemories({}, root).filter(m => m.pinned).sort((a, b) => b.priority - a.priority);
   const pinnedParts: string[] = [];
   for (const e of pinnedMems) {
-    const chunk = `### 📌 [${e.type}] ${e.name}\n\n${(e.body || '').trim() || e.description}`;
+    const chunk = pinnedChunk(e);
     const tok = estimateTokens(chunk);
     if (usedTokens + tok > maxTokens) break;
     pinnedParts.push(chunk);
@@ -653,7 +681,7 @@ export async function buildMemoryInjectionLLM(
   const pinnedMems = listMemories({}, root).filter((m) => m.pinned).sort((a, b) => b.priority - a.priority);
   const pinnedParts: string[] = [];
   for (const e of pinnedMems) {
-    const chunk = `### 📌 [${e.type}] ${e.name}\n\n${(e.body || '').trim() || e.description}`;
+    const chunk = pinnedChunk(e);
     const tok = estimateTokens(chunk);
     if (usedTokens + tok > maxTokens) break;
     pinnedParts.push(chunk); injected.push(e.id); usedTokens += tok;

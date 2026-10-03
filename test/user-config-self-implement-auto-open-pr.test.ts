@@ -7,12 +7,15 @@
 //
 // 기본은 **ON**(대표: "오토를 좋아하므로"). 끄려면 명시적 `false`.
 
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { buildUserConfig, findRetiredConfigKeys } from '../src/user-config.js';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO_ROOT = join(import.meta.dir, '..');
 const ENTRY = join(REPO_ROOT, 'src/index.ts');

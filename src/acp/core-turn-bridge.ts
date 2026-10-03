@@ -46,7 +46,11 @@ import { getUserConfig } from '../user-config.js';
 import { getModelFamily } from '../models/prompts.js';
 import { resolveModelContextWindow } from '../models/context-window.js';
 import type { AcpServerOptions, AcpTurnContext } from './server.js';
+import { acpToolDenialResult } from './tool-approval.js';
 import { readOriginSessionMeta } from './origin-session-meta.js';
+import { isFactQuestion } from './fact-question.js';
+
+const FACT_QUESTION_INSTRUCTION = '사실·최신 정보 질문이다. WebSearch 를 1~2회 쓰고 검색 결과(제목·스니펫·URL)로 답하라. 출처 링크를 붙여라. 셸·브라우저·파일 도구는 검색 결과로 부족할 때만. 도구 예산에 닿으면 지금까지 근거로 답하고 끝에 «더 찾아볼까요?»를 붙여라.';
 
 export interface CoreTurnBridgeDeps {
   /** Build the seed message list for this ACP prompt. Implementations
@@ -112,6 +116,28 @@ export interface CoreTurnBridgeDeps {
  *  pegging the event loop. */
 export const DEFAULT_BRIDGE_ABORT_POLL_MS = 50;
 
+/** PCH-2b — ask the ACP client before a write/shell tool runs. A denied,
+ *  cancelled or timed-out tool is not run; the LLM gets a «not run» result. */
+export function acpApprovalGatedDispatch(
+  turnCtx: AcpTurnContext,
+  dispatchTool: CoreTurnDispatchTool,
+  signal: AbortSignal,
+): CoreTurnDispatchTool {
+  const approveTool = turnCtx.approveTool;
+  if (!approveTool) return dispatchTool;
+  return async (name, args, dispatchCtx) => {
+    if (signal.aborted || turnCtx.isAborted()) return acpToolDenialResult(name, 'cancelled');
+    const approval = await approveTool({
+      toolCallId: dispatchCtx?.callId ?? `${name}-${Date.now().toString(36)}`,
+      toolName: name,
+      toolArgs: args,
+    });
+    if (!approval.allowed) return acpToolDenialResult(name, approval.reason);
+    if (signal.aborted || turnCtx.isAborted()) return acpToolDenialResult(name, 'cancelled');
+    return dispatchTool(name, args, dispatchCtx);
+  };
+}
+
 /** Extract the trailing assistant message text from runCoreTurn's
  *  `newMessages` array. emitTurnComplete (src/llm.ts:3835) appends
  *  `{role:'assistant', content:[{type:'text', text:finalAssistantText}]}`
@@ -173,7 +199,23 @@ export function bridgeCoreTurnToAcp(
         }),
       );
       const modelOverride = deps.resolveModel?.({ sessionId: turnCtx.sessionId, userText: turnCtx.userText });
-      const maxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
+      const factQuestion = isFactQuestion(turnCtx.userText);
+      const explicitMaxToolTurns = deps.resolveMaxToolTurns?.({ sessionId: turnCtx.sessionId });
+      const maxToolTurns = explicitMaxToolTurns ?? (factQuestion ? getUserConfig().chat.factQuestion.maxToolTurns : undefined);
+      const turnMessages: LLMMessage[] = factQuestion
+        ? [{ role: 'system', content: FACT_QUESTION_INSTRUCTION }, ...messages]
+        : messages;
+      let toolCallCount = 0;
+      const toolKinds = new Set<string>();
+      const observeToolBudget = () => {
+        try {
+          debug.log('chat.turn', 'tool-budget', {
+            factQuestion, maxToolTurns: maxToolTurns ?? null,
+            count: toolCallCount, kinds: [...toolKinds],
+          });
+        } catch { /* observation cannot interrupt a turn */ }
+      };
+      observeToolBudget();
 
       // 2026-05-03 PM++ — Track streamed text so onTurnComplete can
       // detect runtime-injected synthesis (W5-E/W5-F/W5-G) and surface
@@ -235,17 +277,29 @@ export function bridgeCoreTurnToAcp(
       } catch {
         // Observability must not prevent the turn from reaching its dispatcher.
       }
+      const approvedDispatch = acpApprovalGatedDispatch(turnCtx, deps.dispatchTool, ctrl.signal);
+      const dispatchTool: CoreTurnDispatchTool = factQuestion && maxToolTurns !== undefined && maxToolTurns > 0
+        ? async (name, args, dispatchCtx) => {
+            if (toolCallCount >= maxToolTurns) {
+              return { error: 'Tool budget reached. Answer using the evidence already collected.' };
+            }
+            toolCallCount += 1;
+            toolKinds.add(name);
+            observeToolBudget();
+            return approvedDispatch(name, args, dispatchCtx);
+          }
+        : approvedDispatch;
       await runTurnDispatch({
         sessionId: turnCtx.sessionId,
         ...(originSessionId ? { originSessionId } : {}),
         ...(turnCtx.userText ? { userText: turnCtx.userText } : {}),
-        messages,
+        messages: turnMessages,
         tools,
-        dispatchTool: deps.dispatchTool,
+        dispatchTool,
         signal: ctrl.signal,
         ...(modelOverride !== undefined ? { modelOverride } : {}),
         ...(maxToolTurns !== undefined ? { maxToolTurns } : {}),
-        ...(deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
+        ...((!factQuestion || explicitMaxToolTurns !== undefined) && deps.budgetGrant !== undefined ? { budgetGrant: deps.budgetGrant } : {}),
         callbacks: {
           onText: (delta) => {
             // Fire-and-forget: ACP `push` is async but the core-turn
@@ -262,7 +316,14 @@ export function bridgeCoreTurnToAcp(
           // callers see today. Fire-and-forget for the same reason
           // onText is: callbacks are synchronous, `turnCtx.push*` is
           // async, ordering is preserved by the SDK.
-          onToolCall: (call) => { void turnCtx.pushToolCall(call); },
+          onToolCall: (call) => {
+            if (!factQuestion || maxToolTurns === undefined || maxToolTurns <= 0) {
+              toolCallCount += 1;
+              toolKinds.add(call.name);
+              observeToolBudget();
+            }
+            void turnCtx.pushToolCall(call);
+          },
           onToolResult: (call) => { void turnCtx.pushToolResult(call); },
           onUsage: (usage) => { void turnCtx.pushUsage(usage); },
           // Codex Responses API reasoning summary stream. Currently
@@ -301,26 +362,64 @@ export function bridgeCoreTurnToAcp(
             // re-emit would cause the "displayed then deleted then
             // re-displayed" flicker the user reported.
             const finalAssistantText = extractLastAssistantText(newMessages);
-            const synthesisAlreadyStreamed =
-              finalAssistantText !== null
-              && finalAssistantText.length > 0
+            const budgetReached = factQuestion && maxToolTurns !== undefined
+              && maxToolTurns > 0 && toolCallCount >= maxToolTurns;
+            const followup = '더 찾아볼까요?';
+            const needsFollowup = budgetReached && finalAssistantText !== null
+              && finalAssistantText.trim().length > 0
+              && !finalAssistantText.trimEnd().endsWith(followup);
+            let lastAssistantIndex = -1;
+            for (let i = newMessages.length - 1; i >= 0; i--) {
+              if (newMessages[i]?.role === 'assistant') { lastAssistantIndex = i; break; }
+            }
+            const followupSuffix = `\n${followup}`;
+            const completedMessages: LLMMessage[] = needsFollowup
+              ? newMessages.map((message, index) => {
+                if (index !== lastAssistantIndex) return message;
+                if (typeof message.content === 'string') {
+                  return { ...message, content: message.content + followupSuffix };
+                }
+                if (Array.isArray(message.content)) {
+                  let lastTextIndex = -1;
+                  for (let blockIndex = message.content.length - 1; blockIndex >= 0; blockIndex--) {
+                    if (message.content[blockIndex]?.type === 'text') { lastTextIndex = blockIndex; break; }
+                  }
+                  if (lastTextIndex >= 0) {
+                    return { ...message, content: message.content.map((block, blockIndex) =>
+                      blockIndex === lastTextIndex && block.type === 'text'
+                        ? { ...block, text: block.text + followupSuffix }
+                        : block) };
+                  }
+                }
+                return message;
+              })
+              : newMessages;
+            const visibleFinalText = needsFollowup ? extractLastAssistantText(completedMessages) : finalAssistantText;
+            const originalFinalStreamed = needsFollowup && finalAssistantText !== null
               && streamedTextSum.endsWith(finalAssistantText);
+            const synthesisAlreadyStreamed =
+              visibleFinalText !== null
+              && visibleFinalText.length > 0
+              && streamedTextSum.endsWith(visibleFinalText);
             const needsReSurface =
-              finalAssistantText !== null
-              && finalAssistantText !== streamedTextSum
-              && !synthesisAlreadyStreamed;
-            if (debug.enabled && finalAssistantText !== null) {
+              visibleFinalText !== null
+              && visibleFinalText !== streamedTextSum
+              && !synthesisAlreadyStreamed
+              && !originalFinalStreamed;
+            if (debug.enabled && visibleFinalText !== null) {
               debug.log('llm.synthesis-surface', 'acp-bridge.surface-final-text', {
                 streamedChars: streamedTextSum.length,
-                finalChars: finalAssistantText.length,
-                delta: finalAssistantText.length - streamedTextSum.length,
+                finalChars: visibleFinalText.length,
+                delta: visibleFinalText.length - streamedTextSum.length,
                 startsWithStreamed: streamedTextSum.length > 0
-                  && finalAssistantText.startsWith(streamedTextSum),
+                  && visibleFinalText.startsWith(streamedTextSum),
                 endsWithStreamedTail: synthesisAlreadyStreamed,
                 needsReSurface,
               });
             }
-            if (needsReSurface) {
+            if (originalFinalStreamed) {
+              void turnCtx.push(followupSuffix);
+            } else if (needsReSurface) {
               // Emit a clear-then-replace pair so clients that follow
               // the empty-chunk-as-clear convention (dashboard plain
               // chat) reset their per-round buffer before receiving
@@ -329,12 +428,12 @@ export function bridgeCoreTurnToAcp(
               // would only have the new finalAssistantText delta to
               // work with anyway).
               void turnCtx.push('');
-              void turnCtx.push(finalAssistantText!);
+              void turnCtx.push(visibleFinalText!);
             }
             if (deps.onTurnComplete) {
               await deps.onTurnComplete({
                 sessionId: turnCtx.sessionId,
-                newMessages,
+                newMessages: completedMessages,
               });
             }
           },

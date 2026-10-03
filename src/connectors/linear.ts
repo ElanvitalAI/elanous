@@ -122,6 +122,152 @@ export async function fetchLinearIssues({ apiKey, teamKey, labelOrPrefix, since,
   return events.sort((a, b) => PRIORITY_RANK[a.priority ?? 'none'] - PRIORITY_RANK[b.priority ?? 'none']);
 }
 
+export interface LinearProjectIssue {
+  identifier: string;
+  title: string;
+  url: string;
+  state: { name: string; type: string };
+  dueDate: string | null;
+  priority: number;
+  assignee: { name: string } | null;
+  updatedAt: string;
+}
+
+type LinearRequestOptions = { apiKey: string; fetch?: typeof fetch };
+
+async function linearRequest<T>({ apiKey, fetch: fetchFn = fetch }: LinearRequestOptions, query: string, variables: Record<string, unknown>): Promise<T> {
+    let response: Response;
+    try {
+      response = await fetchFn('https://api.linear.app/graphql', {
+        method: 'POST', headers: { Authorization: apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, variables }),
+      });
+    } catch (error) {
+      throw new Error(`Linear GraphQL request failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!response.ok) throw new Error(`Linear GraphQL HTTP ${response.status}`);
+    let body: { data?: T; errors?: Array<{ message?: string }> };
+    try { body = await response.json() as typeof body; }
+    catch { throw new Error('Linear GraphQL invalid JSON response'); }
+    if (body.errors?.length) throw new Error(`Linear GraphQL: ${body.errors.map(e => e.message ?? 'unknown error').join('; ')}`);
+    if (!body.data) throw new Error('Linear GraphQL missing data');
+    return body.data;
+}
+
+/** Shared unique name → project id lookup for COO reads and decision writes. */
+export async function resolveLinearProjectId({ apiKey, project, fetch: fetchFn = fetch }: LinearRequestOptions & { project: string }): Promise<string> {
+  const cursors = new Set<string>();
+  let projectId = project;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(project)) {
+    const matches: string[] = [];
+    let after: string | null = null;
+    do {
+      const data: { projects?: { nodes?: Array<{ id: string; name: string }>; pageInfo?: { hasNextPage: boolean; endCursor: string | null } } } = await linearRequest({ apiKey, fetch: fetchFn },
+        `query CooProjects($after: String) { projects(first: 100, after: $after) { nodes { id name } pageInfo { hasNextPage endCursor } } }`, { after });
+      if (!Array.isArray(data.projects?.nodes)) throw new Error('Linear GraphQL missing projects');
+      for (const candidate of data.projects.nodes) if (candidate.name === project) matches.push(candidate.id);
+      const page = data.projects.pageInfo;
+      if (page?.hasNextPage && (!page.endCursor || cursors.has(page.endCursor))) throw new Error('Linear GraphQL pagination cursor missing or repeated');
+      after = page?.hasNextPage ? page.endCursor : null;
+      if (after) cursors.add(after);
+    } while (after);
+    if (matches.length > 1) throw new Error('프로젝트 이름이 여럿과 맞습니다');
+    if (!matches.length) throw new Error('프로젝트 이름과 맞는 항목이 없습니다');
+    projectId = matches[0]!;
+  }
+  return projectId;
+}
+
+/** Read-only project lookup. A name is resolved uniquely before querying its issues. */
+export async function fetchLinearProjectIssues({ apiKey, project, includeDone = false, fetch: fetchFn = fetch }: {
+  apiKey: string; project: string; includeDone?: boolean; fetch?: typeof fetch;
+}): Promise<LinearProjectIssue[] & { truncated: boolean }> {
+  const projectId = await resolveLinearProjectId({ apiKey, project, fetch: fetchFn });
+  const issues: LinearProjectIssue[] = [];
+  const cursors = new Set<string>();
+  let after: string | null = null;
+  do {
+    const stateFilter = includeDone ? '' : ', state: { type: { nin: ["completed", "canceled"] } }';
+    const data: { issues?: { nodes?: LinearProjectIssue[]; pageInfo?: { hasNextPage: boolean; endCursor: string | null } } } = await linearRequest({ apiKey, fetch: fetchFn },
+      `query CooProjectIssues($projectId: ID!, $after: String, $first: Int!) {
+        issues(filter: { project: { id: { eq: $projectId } }${stateFilter} }, first: $first, after: $after) {
+          nodes { identifier title url state { name type } dueDate priority assignee { name } updatedAt }
+          pageInfo { hasNextPage endCursor }
+        }
+      }`, { projectId, after, first: Math.min(100, 250 - issues.length) });
+    if (!Array.isArray(data.issues?.nodes)) throw new Error('Linear GraphQL missing issues');
+    for (const node of data.issues.nodes) {
+      if (!includeDone && (node.state?.type === 'completed' || node.state?.type === 'canceled')) continue;
+      if (issues.length < 250) issues.push(node);
+    }
+    const page = data.issues.pageInfo;
+    if (page?.hasNextPage && (!page.endCursor || cursors.has(page.endCursor))) throw new Error('Linear GraphQL pagination cursor missing or repeated');
+    after = page?.hasNextPage ? page.endCursor : null;
+    if (after) cursors.add(after);
+  } while (after && issues.length < 250);
+  Object.defineProperty(issues, 'truncated', { value: after !== null, enumerable: false });
+  return issues as LinearProjectIssue[] & { truncated: boolean };
+}
+
+/** Find a previously created decision issue after a crash between Linear creation and the local rename. */
+export async function findLinearDecisionIssue({ apiKey, projectId, decisionId, fetch: fetchFn = fetch }: LinearRequestOptions & { projectId: string; decisionId: string }): Promise<string | null> {
+  const cursors = new Set<string>();
+  let after: string | null = null;
+  let match: string | null = null;
+  do {
+    const data: { issues?: { nodes?: Array<{ id: string; description: string | null }>; pageInfo?: { hasNextPage: boolean; endCursor: string | null } } } = await linearRequest({ apiKey, fetch: fetchFn },
+      'query DecisionIssue($projectId: ID!, $decisionId: String!, $after: String) { issues(filter: { project: { id: { eq: $projectId } }, description: { contains: $decisionId } }, first: 100, after: $after) { nodes { id description } pageInfo { hasNextPage endCursor } } }',
+      { projectId, decisionId, after });
+    if (!Array.isArray(data.issues?.nodes)) throw new Error('Linear GraphQL missing issues');
+    for (const node of data.issues.nodes) {
+      if (!node.description?.split('\n').includes(`결정 id: ${decisionId}`)) continue;
+      if (match) throw new Error('Linear decision issue duplicated');
+      match = node.id;
+    }
+    const page = data.issues.pageInfo;
+    if (page?.hasNextPage && (!page.endCursor || cursors.has(page.endCursor))) throw new Error('Linear GraphQL pagination cursor missing or repeated');
+    after = page?.hasNextPage ? page.endCursor : null;
+    if (after) cursors.add(after);
+  } while (after);
+  return match;
+}
+
+/** Create in the COO project; Linear requires a team from that project for issueCreate. */
+export async function createLinearIssue({ apiKey, projectId, title, description, dueDate, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  projectId: string; title: string; description: string; dueDate?: string;
+}): Promise<string> {
+  const data = await linearRequest<{ project?: { teams?: { nodes?: Array<{ id: string }> } } }>({ apiKey, fetch: fetchFn },
+    'query DecisionProjectTeam($id: String!) { project(id: $id) { teams { nodes { id } } } }', { id: projectId });
+  const teams = data.project?.teams?.nodes;
+  if (!teams?.[0]?.id) throw new Error('Linear project has no team');
+  const created = await linearRequest<{ issueCreate?: { success?: boolean; issue?: { id?: string } } }>({ apiKey, fetch: fetchFn },
+    'mutation DecisionIssueCreate($input: IssueCreateInput!) { issueCreate(input: $input) { success issue { id } } }',
+    { input: { teamId: teams[0].id, projectId, title, description, ...(dueDate ? { dueDate } : {}) } });
+  const id = created.issueCreate?.issue?.id;
+  if (!created.issueCreate?.success || !id) throw new Error('Linear issueCreate did not return an issue id');
+  return id;
+}
+
+export async function commentLinearIssue({ apiKey, issueId, body, fetch: fetchFn = fetch }: LinearRequestOptions & { issueId: string; body: string }): Promise<void> {
+  const data = await linearRequest<{ commentCreate?: { success?: boolean; comment?: { id?: string } } }>({ apiKey, fetch: fetchFn },
+    'mutation DecisionComment($input: CommentCreateInput!) { commentCreate(input: $input) { success comment { id } } }',
+    { input: { issueId, body } });
+  if (!data.commentCreate?.success || !data.commentCreate.comment?.id) throw new Error('Linear commentCreate failed');
+}
+
+export async function moveLinearIssueToStateType({ apiKey, issueId, type, fetch: fetchFn = fetch }: LinearRequestOptions & {
+  issueId: string; type: 'completed' | 'canceled';
+}): Promise<void> {
+  const data = await linearRequest<{ issue?: { team?: { states?: { nodes?: Array<{ id: string; type: string }> } } } }>({ apiKey, fetch: fetchFn },
+    'query DecisionIssueStates($id: String!) { issue(id: $id) { team { states { nodes { id type } } } } }', { id: issueId });
+  const state = data.issue?.team?.states?.nodes?.find(node => node.type === type);
+  if (!state?.id) throw new Error(`Linear team workflow state not found: ${type}`);
+  const updated = await linearRequest<{ issueUpdate?: { success?: boolean } }>({ apiKey, fetch: fetchFn },
+    'mutation DecisionIssueClose($id: String!, $input: IssueUpdateInput!) { issueUpdate(id: $id, input: $input) { success } }',
+    { id: issueId, input: { stateId: state.id } });
+  if (!updated.issueUpdate?.success) throw new Error('Linear issueUpdate failed');
+}
+
 export function toTaskRequest(event: ExternalTaskEvent): {
   title: string; description: string; priority: 'high' | 'medium' | 'low';
   external: { provider: 'linear'; ref: string; url?: string; team?: string };

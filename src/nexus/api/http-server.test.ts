@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import type { FeedbackEnvelope } from '../../feedback/envelope.js';
 import { createNexusState } from '../state/state.js';
@@ -17,6 +17,9 @@ import { join } from 'node:path';
 import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import { resetUserConfig } from '../../user-config.js';
 import { useBackend } from '../config/secrets/index.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const envelope: FeedbackEnvelope = {
   envelopeVersion: 1,

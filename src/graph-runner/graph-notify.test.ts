@@ -2,8 +2,17 @@ import { afterEach, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { collectGraphEvents, formatApprovalMessage, notifyGraphEvents, setGraphNotifyFlockForTest } from './graph-notify.js';
+import { collectGraphEvents, formatApprovalMessage, notifyGraphEvents as notifyGraphEventsRaw, setGraphNotifyFlockForTest, type GraphNotifyOptions } from './graph-notify.js';
 import type { GraphRunState } from './runner.js';
+import { DecisionLedger } from '../decisions/decision-ledger.js';
+
+// Approval events now raise decision cards; the real ledger resolves versions from git (seconds per card), so tests pin it.
+function notifyGraphEvents(options: GraphNotifyOptions) {
+  const ledger = options.approvalCard?.ledger ?? (options.root
+    ? new DecisionLedger({ stateDir: options.root, resolveVersion: () => ({ released: null, dev: null, codename: null }) })
+    : undefined);
+  return notifyGraphEventsRaw({ ...options, ...(ledger ? { approvalCard: { ledger } } : {}) });
+}
 
 const roots: string[] = [];
 afterEach(() => { setGraphNotifyFlockForTest(undefined); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -105,6 +114,39 @@ test('sends each fresh event once, appends one JSONL record after each successfu
   expect(await notifyGraphEvents(opts)).toEqual([]);
   expect(delivered).toHaveLength(2);
   expect(readFileSync(statePath, 'utf8')).toBe(before);
+});
+
+test('notify raises an approval card exactly once across ticks while retaining text notification', async () => {
+  const { root, graphsDir, statePath, ledgerPath } = fixture();
+  const ledger = new DecisionLedger({ stateDir: root, resolveVersion: () => ({ released: '0.2.9', dev: '0.2.10', codename: null }) });
+  const delivered: string[] = [];
+  const opts = { root, graphsDir, approvalCard: { ledger }, send: (message: string) => { delivered.push(message); } };
+  await notifyGraphEvents(opts);
+  await notifyGraphEvents(opts);
+  expect(ledger.list({ status: 'all' })).toHaveLength(1);
+  expect(ledger.list()[0]?.refs).toEqual(['graph-approval:notice:run-1:gate:1']);
+  expect(delivered.filter(message => message.includes('Approve: elanous graph approve'))).toHaveLength(1);
+  expect(readFileSync(statePath, 'utf8')).toContain('awaiting-approval');
+  expect(readFileSync(ledgerPath, 'utf8').trim().split('\n')).toHaveLength(2);
+});
+
+test('notify applies a decided card once even after its text has already been sent', async () => {
+  const { root, graphsDir, statePath } = fixture();
+  const ledger = new DecisionLedger({ stateDir: root, resolveVersion: () => ({ released: '0.2.9', dev: '0.2.10', codename: null }) });
+  const opts = { root, graphsDir, approvalCard: { ledger }, send: () => {} };
+  await notifyGraphEvents(opts);
+  ledger.decide(ledger.list()[0]!.id, 'a', { kind: 'human' });
+  expect(await notifyGraphEvents(opts)).toEqual([]);
+  expect(JSON.parse(readFileSync(`${statePath}.3.decision.json`, 'utf8'))).toMatchObject({ decision: 'approved', decidedBy: 'owner:human' });
+});
+
+test('card ledger write failure does not suppress the text notification', async () => {
+  const { root, graphsDir } = fixture();
+  const delivered: string[] = [];
+  const ledger = { list: () => [], raise: () => { throw new Error('ledger unavailable'); } } as unknown as DecisionLedger;
+  const events = await notifyGraphEvents({ root, graphsDir, approvalCard: { ledger }, send: message => { delivered.push(message); } });
+  expect(events).toHaveLength(2);
+  expect(delivered.filter(message => message.includes('Approve: elanous graph approve'))).toHaveLength(1);
 });
 
 test('failure leaves failed and subsequent events unsent; retry sends only unrecorded events', async () => {

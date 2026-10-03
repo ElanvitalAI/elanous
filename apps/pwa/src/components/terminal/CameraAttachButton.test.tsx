@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { toast } from 'sonner';
 import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
@@ -6,6 +6,9 @@ import { createRequire } from 'node:module';
 import { DaemonContext } from '@/components/providers/DaemonProvider';
 import type { AttachmentMeta } from '@/lib/upload-attachment';
 import { CameraAttachButton } from './CameraAttachButton';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const require = createRequire(import.meta.url);
 const react = require('react') as { createElement: (type: unknown, props?: unknown, ...children: unknown[]) => unknown };

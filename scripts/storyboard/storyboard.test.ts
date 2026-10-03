@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
-import { lint, render, type Storyboard } from './storyboard.js';
+import { lint, render, type Storyboard } from '../../src/storyboard/storyboard.js';
 
 const real = parse(readFileSync(join(import.meta.dir, '../../storyboards/site-hero/suseuro-stage.yaml'), 'utf8')) as Storyboard;
 

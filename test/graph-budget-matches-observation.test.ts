@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { loadGraphTemplatesFrom, defaultGraphsDir } from '../src/self-implement/graph-templates.js';
 import { appendRunLedgerEntry } from '../src/self-implement/run-ledger.js';
 import { measureGraphVisitBudgetDrift, renderGraphVisitBudgetDrift } from '../scripts/measure-graph-visit-budget-drift.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const sourceRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const measureScript = join(sourceRoot, 'scripts', 'measure-graph-visit-budget-drift.ts');

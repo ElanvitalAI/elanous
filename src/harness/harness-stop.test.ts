@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { discoverStopProcesses, formatHarnessStop, readPidRecordFrom, stopGoalPathFromLedger, stopHarnessRun, START_TOLERANCE_MS, type HarnessStopDeps } from './harness-stop.js';
+import { AmbiguousHarnessStopRunIdError, discoverStopProcesses, formatHarnessStop, readPidRecordFrom, stopGoalPathFromLedger, stopHarnessRun, stopRunIdCandidates, START_TOLERANCE_MS, type HarnessStopDeps } from './harness-stop.js';
 
 function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; starts: Array<number | null>; contexts?: string[]; jobs?: number; table?: string; scanFailed?: boolean; goalPath?: string | null; cwd?: (pid: number) => string | null }) {
   const signals: Array<[number, NodeJS.Signals]> = [];
@@ -27,6 +28,130 @@ function fakeDeps(o: { record?: { pid: number; startedAt: number } | null; start
 }
 
 describe('harness stop — 소유 확인 뒤에만 신호 · 라벨 Job 만 삭제', () => {
+  test('유일한 원장 접두는 전체 runId 로 풀어 pid 와 Job 라벨에 함께 쓴다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-prefix-'));
+    const ledger = join(dir, 'ledger');
+    const runs = join(dir, 'self-dev-runs');
+    const full = 'run-4ce91e08-0934-45d1-9f1b-f0277e0812bd';
+    try {
+      mkdirSync(ledger);
+      mkdirSync(runs);
+      writeFileSync(join(ledger, `${full}.jsonl`), '');
+      const f = fakeDeps({ record: { pid: 4242, startedAt: 1_000_000 }, starts: [1_000_000, null], jobs: 1 });
+      f.deps.runIdCandidates = (given) => stopRunIdCandidates(given, [ledger], runs);
+      f.deps.readPidRecord = (id) => id === full ? { pid: 4242, startedAt: 1_000_000 } : null;
+      const r = await stopHarnessRun('run-4ce91e08', f.deps);
+      expect(r.runId).toBe(full);
+      expect(formatHarnessStop(r).split('\n')[0]).toBe(`↳ run-4ce91e08 → ${full}(전체)`);
+      expect(f.signals).toEqual([[4242, 'SIGTERM']]);
+      expect(f.kubectlCalls).toEqual([['--context', 'ctx-a', '-n', 'elanous-test', 'delete', 'job', '-l', `elanous.run=${full}`, '--wait=false']]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('같은 접두 원장 둘은 후보를 출력하고 신호·삭제 전에 exit 1 오류로 중단한다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-ambiguous-'));
+    const ledger = join(dir, 'ledger');
+    const runs = join(dir, 'self-dev-runs');
+    const ids = ['run-4ce91e08-0934-45d1-9f1b-f0277e0812bd', 'run-4ce91e08-0934-45d1-9f1b-f0277e0812be'];
+    try {
+      mkdirSync(ledger);
+      mkdirSync(runs);
+      for (const id of ids) writeFileSync(join(ledger, `${id}.jsonl`), '');
+      const f = fakeDeps({ record: { pid: 4242, startedAt: 1_000_000 }, starts: [1_000_000] });
+      f.deps.runIdCandidates = (given) => stopRunIdCandidates(given, [ledger], runs);
+      let error: unknown;
+      try { await stopHarnessRun('run-4ce91e08', f.deps); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(AmbiguousHarnessStopRunIdError);
+      for (const id of ids) expect((error as Error).message).toContain(id);
+      expect((error as Error).message).toContain('더 긴 id 를 주십시오');
+      expect(f.signals).toEqual([]);
+      expect(f.kubectlCalls).toEqual([]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('실제 CLI: 모호한 접두는 exit 1 · 두 후보 출력 · 프로세스 신호와 kubectl 호출 0', async () => {
+    const dir = mkdtempSync(join(process.cwd(), '.stop-cli-'));
+    const bin = join(dir, 'bin');
+    const ledger = join(dir, 'run-ledger');
+    const ids = ['run-4ce91e08-0934-45d1-9f1b-f0277e0812bd', 'run-4ce91e08-0934-45d1-9f1b-f0277e0812be'];
+    const kubectlCalls = join(dir, 'kubectl-calls');
+    const ready = join(dir, 'child-ready');
+    const signalled = join(dir, 'child-signalled');
+    const child = spawn(process.execPath, ['-e', `const fs = require('node:fs'); process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(signalled)}, 'SIGTERM'); process.exit(0); }); fs.writeFileSync(${JSON.stringify(ready)}, 'ready'); setInterval(() => {}, 1000);`], { stdio: 'ignore' });
+    try {
+      for (let n = 0; n < 200 && !existsSync(ready); n++) await Bun.sleep(10);
+      expect(existsSync(ready)).toBe(true);
+      mkdirSync(bin);
+      mkdirSync(ledger);
+      for (const id of ids) writeFileSync(join(ledger, `${id}.jsonl`), '');
+      mkdirSync(join(dir, 'self-dev-runs', ids[0]!), { recursive: true });
+      const ps = spawnSync('ps', ['-o', 'lstart=', '-p', String(child.pid)], { encoding: 'utf8' });
+      expect(ps.status).toBe(0);
+      const startedAt = Date.parse(ps.stdout.trim());
+      expect(Number.isFinite(startedAt)).toBe(true);
+      writeFileSync(join(dir, 'self-dev-runs', ids[0]!, 'pid.json'), JSON.stringify({ pid: child.pid, startedAt }));
+      writeFileSync(join(bin, 'kubectl'), `#!/bin/sh\nprintf '%s\\n' "$*" >> '${kubectlCalls}'\n`, { mode: 0o755 });
+      const result = spawnSync(process.execPath, ['bin/elanous.mjs', `--test=${dir}`, 'harness', 'stop', 'run-4ce91e08', '--context', 'ctx-a'], {
+        cwd: process.cwd(),
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ''}` },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('더 긴 id 를 주십시오');
+      for (const id of ids) expect(result.stderr).toContain(id);
+      expect(existsSync(kubectlCalls)).toBe(false);
+      expect(existsSync(signalled)).toBe(false);
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBeNull();
+      expect(() => process.kill(child.pid!, 0)).not.toThrow();
+    } finally {
+      child.kill('SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test('전체 runId 는 풀지 않고 기존 동작을 유지한다', async () => {
+    const full = 'run-4ce91e08-0934-45d1-9f1b-f0277e0812bd';
+    const f = fakeDeps({ starts: [null] });
+    f.deps.runIdCandidates = () => { throw new Error('full ID must bypass lookup'); };
+    const r = await stopHarnessRun(full, f.deps);
+    expect(r.runId).toBe(full);
+    expect(formatHarnessStop(r).split('\n')[0]).toBe(`harness stop ${full}`);
+    expect(f.kubectlCalls[0]).toContain(`elanous.run=${full}`);
+  });
+
+  test('원장 없는 접두는 받은 id 그대로 Job 라벨로 보낸다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-absent-'));
+    try {
+      const f = fakeDeps({ starts: [null] });
+      f.deps.runIdCandidates = (given) => stopRunIdCandidates(given, [join(dir, 'ledger')], join(dir, 'runs'));
+      const r = await stopHarnessRun('run-4ce91e08', f.deps);
+      expect(r.runId).toBe('run-4ce91e08');
+      expect(f.kubectlCalls[0]).toContain('elanous.run=run-4ce91e08');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('pid.json 디렉터리와 연합 원장도 후보에 합치되 같은 runId 는 중복하지 않는다', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'stop-federated-'));
+    const local = join(dir, 'local');
+    const federated = join(dir, 'federated');
+    const runs = join(dir, 'runs');
+    const id = 'run-4ce91e08-0934-45d1-9f1b-f0277e0812bd';
+    try {
+      mkdirSync(local);
+      mkdirSync(federated);
+      mkdirSync(join(runs, id), { recursive: true });
+      writeFileSync(join(federated, `${id}.jsonl`), '');
+      writeFileSync(join(runs, id, 'pid.json'), '{}');
+      writeFileSync(join(local, 'run-4ce91e08-unrelated.jsonl'), '');
+      expect(stopRunIdCandidates('run-4ce91e08', [local, federated], runs)).toEqual([id]);
+      rmSync(join(federated, `${id}.jsonl`));
+      expect(stopRunIdCandidates('run-4ce91e08', [local, federated], runs)).toEqual([id]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   test('시작 시각이 맞으면 SIGTERM 을 보내고 라벨 선택자로 Job 을 지운다', async () => {
     const f = fakeDeps({ record: { pid: 4242, startedAt: 1_000_000 }, starts: [1_000_900, null], jobs: 2 });
     const r = await stopHarnessRun('run-abc', f.deps);

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -8,6 +8,9 @@ import { LogStore, type LogStoreRow } from '../mss/logging/log-store.js';
 import { writeHarnessScreen } from '../harness/harness-screen.js';
 import { classifyRunScreenMissing, describeMissingRunLedger, formatUnattributableDetail, queryGoalSourceDistribution, queryMergeAttribution, queryRunScreenKey, queryUnfinishedRunLedgers, renderUnfinishedRunLedgers, type RunChainLogStore, type RunLedgerEntry } from './run-ledger.js';
 import { makeRunObserver, observeRunOutcome } from './orchestrator.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // ⛔⭐ 이 파일이 있는 이유 — 골의 «판정 신호»가 테스트로 물리게 한다.
 //    골은 "없는 runId 를 주면 없다고 말하고 종료 코드가 성공이 아니다" 를 판정 신호로 걸었는데,

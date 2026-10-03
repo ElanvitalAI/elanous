@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { setPluginCredentials } from '../plugins/install/plugin-credentials.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -97,6 +98,24 @@ test('installed plugin graphs receive only their own credential environment', as
   }
 });
 
+test('first write and approval resume stamp the runner pid and its process start', async () => {
+  const { graph, root } = approvalFixture();
+  let started = 1_000_000;
+  const deps = { root, processStartMs: () => started, runBash: async () => {
+    const files = join(root, 'graph-runs', 'approval-graph');
+    const initial = JSON.parse(readFileSync(join(files, 'owner-check.json'), 'utf8'));
+    expect(initial).toMatchObject({ pid: process.pid, pidStartedAt: new Date(started).toISOString() });
+    return { stdout: '', stderr: '', exitCode: 0 };
+  } };
+  const first = await runGraph(graph, { runId: 'owner-check', deps });
+  expect(JSON.parse(readFileSync(first.statePath, 'utf8'))).toMatchObject({ pid: process.pid, pidStartedAt: new Date(started).toISOString() });
+  decideGraphApproval(first.graphId, first.runId, 'approved', 'operator', root);
+  started += 10_000;
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, deps });
+  expect(resumed.pid).toBe(process.pid);
+  expect(JSON.parse(readFileSync(first.statePath, 'utf8')).pidStartedAt).toBe(new Date(started).toISOString());
+});
+
 test('two successful commands reach done and persist both outcomes', async () => {
   const { graph, root } = fixture('exit 0');
   const result = await runGraph(graph, { runId: 'success', deps: { root } });
@@ -186,8 +205,89 @@ test('restart refuses nodes outside the failed path or changed graph and leaves 
   }
   await expect(runGraph(graph, { fromNodeId: 'first', deps: { root } })).rejects.toThrow('--from requires --resume');
   writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(root, 'recipes.yaml'), 'utf8').replace('exit 1', 'exit 0'));
-  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', deps: { root } })).rejects.toThrow('graph or recipes changed');
+  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', useCurrentGraph: true, deps: { root } })).rejects.toThrow('graph or recipes changed');
   expect(readFileSync(first.statePath, 'utf8')).toBe(before);
+});
+
+test('new runs preserve exact graph and recipe bytes and resume from that snapshot after installed files change', async () => {
+  const { graph, root } = fixture('printf original');
+  const originalGraph = readFileSync(graph, 'utf8');
+  const recipes = join(root, 'recipes.yaml');
+  const originalRecipes = readFileSync(recipes, 'utf8');
+  const calls: string[] = [];
+  const deps = { root, runBash: async (body: string) => {
+    calls.push(body);
+    return { stdout: body.includes('original') ? 'original' : '', stderr: '', exitCode: calls.length === 2 ? 1 : 0 };
+  } };
+  const first = await runGraph(graph, { deps });
+  const snapshot = `${first.statePath}.graph`;
+  expect(readFileSync(join(snapshot, 'graph.yaml'), 'utf8')).toBe(originalGraph);
+  expect(readFileSync(join(snapshot, 'recipes.yaml'), 'utf8')).toBe(originalRecipes);
+  expect(JSON.parse(readFileSync(first.statePath, 'utf8')).graphSnapshot).toEqual({
+    graphSha: createHash('sha256').update(originalGraph).digest('hex'),
+    recipesSha: createHash('sha256').update(originalRecipes).digest('hex'),
+  });
+  writeFileSync(graph, originalGraph.replace('graph_id: test-graph', 'graph_id: installed-graph'));
+  writeFileSync(recipes, originalRecipes.replace('exit 0', 'exit 7'));
+  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'second', useCurrentGraph: true, deps })).rejects.toThrow('graph or recipes changed since failed run');
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'second', deps });
+  expect(resumed.status).toBe('done');
+  expect(resumed.resume?.graph).toBe('snapshot');
+  expect(resumed.nodes[0]).toEqual(first.nodes[0]);
+  expect(calls).toHaveLength(3);
+});
+
+test('tampered snapshot refuses resume before replaying any command', async () => {
+  const { graph, root } = fixture('exit 1');
+  const first = await runGraph(graph, { deps: { root } });
+  const snapshot = join(`${first.statePath}.graph`, 'recipes.yaml');
+  writeFileSync(snapshot, readFileSync(snapshot, 'utf8').replace('exit 1', 'exit 0'));
+  const before = readFileSync(first.statePath, 'utf8');
+  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', deps: { root } })).rejects.toThrow('graph snapshot changed since run started');
+  expect(readFileSync(first.statePath, 'utf8')).toBe(before);
+});
+
+test('snapshot source hash mismatch refuses --from without truncating the saved failed path', async () => {
+  const { graph, root } = fixture('exit 1');
+  const first = await runGraph(graph, { deps: { root } });
+  expect(first.path).toEqual(['first', 'failed']);
+  const snapshot = join(`${first.statePath}.graph`, 'recipes.yaml');
+  const changed = readFileSync(snapshot, 'utf8').replace('exit 1', 'exit 0');
+  writeFileSync(snapshot, changed);
+  const ledger = JSON.parse(readFileSync(first.statePath, 'utf8'));
+  ledger.graphSnapshot.recipesSha = createHash('sha256').update(changed).digest('hex');
+  writeFileSync(first.statePath, JSON.stringify(ledger));
+  const before = readFileSync(first.statePath, 'utf8');
+  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', deps: { root } }))
+    .rejects.toThrow('graph snapshot changed since run started');
+  expect(readFileSync(first.statePath, 'utf8')).toBe(before);
+});
+
+test('snapshot recipes still run current node scripts after repair', async () => {
+  const { graph, root } = fixture('exit 0');
+  const script = join(root, 'repair.sh');
+  writeFileSync(script, 'exit 1\n');
+  writeFileSync(join(root, 'recipes.yaml'), `first:\n  command: "exit 0"\nsecond:\n  command: "bash '${script}'"\n`);
+  const first = await runGraph(graph, { deps: { root } });
+  expect(first.status).toBe('failed');
+  writeFileSync(script, 'exit 0\n');
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'second', deps: { root } });
+  expect(resumed.status).toBe('done');
+  expect(resumed.nodes[0]).toEqual(first.nodes[0]);
+});
+
+test('a legacy run without snapshot uses current graph and the original hash guard', async () => {
+  const { graph, root } = fixture('exit 1');
+  const first = await runGraph(graph, { deps: { root } });
+  const legacy = JSON.parse(readFileSync(first.statePath, 'utf8'));
+  delete legacy.graphSnapshot;
+  rmSync(`${first.statePath}.graph`, { recursive: true });
+  writeFileSync(first.statePath, JSON.stringify(legacy));
+  writeFileSync(graph, readFileSync(graph, 'utf8') + '\n');
+  await expect(runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', deps: { root } })).rejects.toThrow('graph or recipes changed since failed run');
+  writeFileSync(graph, readFileSync(graph, 'utf8').slice(0, -1));
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, fromNodeId: 'first', deps: { root } });
+  expect(resumed.resume?.graph).toBe('current');
 });
 
 test('failed publication cannot skip or replay approval with --from', async () => {
@@ -419,8 +519,21 @@ test('resuming against a changed approval message refuses to apply an old decisi
   const first = await runGraph(graph, { deps: { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }) } });
   decideGraphApproval(first.graphId, first.runId, 'approved', 'owner', root);
   writeFileSync(join(root, 'recipes.yaml'), readFileSync(join(root, 'recipes.yaml'), 'utf8').replace('Publish now?', 'Publish something else?'));
-  await expect(runGraph(graph, { resumeRunId: first.runId, deps: { root } })).rejects.toThrow('approval source changed since run was paused');
+  await expect(runGraph(graph, { resumeRunId: first.runId, useCurrentGraph: true, deps: { root } })).rejects.toThrow('approval source changed since run was paused');
   expect(JSON.parse(readFileSync(first.statePath, 'utf8')).status).toBe('awaiting-approval');
+});
+
+test('snapshot resume keeps the original approval decision bound after installed recipes change', async () => {
+  const { graph, root } = approvalFixture();
+  const deps = { root, runBash: async () => ({ stdout: '', stderr: '', exitCode: 0 }) };
+  const first = await runGraph(graph, { deps });
+  decideGraphApproval(first.graphId, first.runId, 'approved', 'owner', root);
+  const recipes = join(root, 'recipes.yaml');
+  writeFileSync(recipes, readFileSync(recipes, 'utf8').replace('Publish now?', 'Changed message?'));
+  const resumed = await runGraph(graph, { resumeRunId: first.runId, deps });
+  expect(resumed.status).toBe('done');
+  expect(resumed.resume?.graph).toBe('snapshot');
+  expect(resumed.nodes[1]).toMatchObject({ nodeId: 'gate', ok: true, decidedBy: 'owner' });
 });
 
 test('old approval cannot authorize a changed downstream command or branch with the same graph id and prompt', async () => {
@@ -436,7 +549,7 @@ test('old approval cannot authorize a changed downstream command or branch with 
     writeFileSync(file, mutation === 'command'
       ? before.replace('b:\n  command: "exit 0"', 'b:\n  command: "exit 1"')
       : before.replace('map: { ok: b, fail: failed }', 'map: { ok: failed, fail: b }'));
-    await expect(runGraph(graph, { resumeRunId: first.runId, deps })).rejects.toThrow('approval source changed since run was paused');
+    await expect(runGraph(graph, { resumeRunId: first.runId, useCurrentGraph: true, deps })).rejects.toThrow('approval source changed since run was paused');
     expect(calls).toEqual(['exit 0']);
     expect(JSON.parse(readFileSync(first.statePath, 'utf8'))).toMatchObject({ status: 'awaiting-approval', pending: { nodeId: 'gate' } });
     expect(() => decideGraphApproval(first.graphId, first.runId, 'rejected', 'late', root)).toThrow('not awaiting an undecided approval');

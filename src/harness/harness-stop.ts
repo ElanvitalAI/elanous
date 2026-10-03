@@ -7,15 +7,51 @@
 //
 // ⛔ 불변식: 기록된 시작 시각과 실제 프로세스 시작 시각이 다르면 신호를 보내지 않는다(PID 재사용 방지).
 // ⛔ 불변식: `elanous.run=<runId>` 라벨이 붙은 Job 만 지운다.
+// ⛔ 불변식: 짧은 runId 의 후보가 둘 이상이면 프로세스 신호·Job 삭제 전에 중단한다.
 
-import { readFileSync, readlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { debug } from '../debug/log.js';
 import { selfDevRunsDir } from '../self-dev/run-store.js';
-import { loadRunLedger, runLedgerDir } from '../self-implement/run-ledger.js';
+import { loadRunLedger, resolveFederatedRunLedgerDirectories, runLedgerDir } from '../self-implement/run-ledger.js';
 
 const RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
+const FULL_RUN_ID = /^run-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export class AmbiguousHarnessStopRunIdError extends Error {
+  constructor(given: string, candidates: readonly string[]) {
+    super(`harness stop ${given}: 더 긴 id 를 주십시오\n${candidates.map((id) => `  ${id}`).join('\n')}`);
+    this.name = 'AmbiguousHarnessStopRunIdError';
+  }
+}
+
+/** List names, not ledger bodies: a run may have written its pid.json before its ledger. */
+export function stopRunIdCandidates(given: string, ledgerDirs: readonly string[], runsDir: string): string[] {
+  const found = new Set<string>();
+  for (const dir of ledgerDirs) {
+    let names: string[];
+    try { names = readdirSync(dir); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const name of names) {
+      if (!name.endsWith('.jsonl')) continue;
+      const id = name.slice(0, -'.jsonl'.length);
+      if (FULL_RUN_ID.test(id) && id.startsWith(given)) found.add(id);
+    }
+  }
+  try {
+    for (const entry of readdirSync(runsDir, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name.startsWith(given) && FULL_RUN_ID.test(entry.name)
+        && existsSync(join(runsDir, entry.name, 'pid.json'))) found.add(entry.name);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  return [...found].sort();
+}
 /** `pid.json` 의 `startedAt` 은 `Date.now() − uptime` 근삿값이다 — 이만큼의 차이는 같은 프로세스로 본다. */
 export const START_TOLERANCE_MS = 5_000;
 
@@ -101,6 +137,7 @@ function scanStopProcessTable(runId: string, goalPath: string | null): StopProce
 
 export interface HarnessStopDeps {
   readPidRecord: (runId: string) => PidRecord | null;
+  runIdCandidates?: (given: string) => string[];
   readGoalPath: (runId: string) => string | null;
   scanProcesses: (runId: string, goalPath: string | null) => StopProcessScan;
   /** 살아 있는 프로세스의 시작 시각(ms) · 없으면 null. */
@@ -115,6 +152,7 @@ export interface HarnessStopDeps {
 
 export interface HarnessStopResult {
   runId: string;
+  givenRunId?: string;
   process: 'stopped' | 'killed' | 'absent' | 'owner-mismatch' | 'unmeasured' | 'dry-run';
   pid?: number;
   candidates: StopProcessCandidate[];
@@ -154,6 +192,10 @@ export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {})
   };
   return {
     readPidRecord: (runId) => readPidRecordFrom(selfDevRunsDir(), runId),
+    runIdCandidates: (given) => {
+      const ledgerDirs = new Set([runLedgerDir(), ...resolveFederatedRunLedgerDirectories({})]);
+      return stopRunIdCandidates(given, [...ledgerDirs], selfDevRunsDir());
+    },
     readGoalPath: stopGoalPathFromLedger,
     scanProcesses: scanStopProcessTable,
     processStartMs: psProcessStartMs,
@@ -172,6 +214,13 @@ export function defaultHarnessStopDeps(overrides: Partial<HarnessStopDeps> = {})
 
 export async function stopHarnessRun(runId: string, deps: HarnessStopDeps, contexts?: readonly string[], dryRun = false): Promise<HarnessStopResult> {
   if (!RUN_ID.test(runId)) throw new Error(`invalid run id: ${runId}`);
+  const given = runId;
+  if (!FULL_RUN_ID.test(given)) {
+    const matches = [...new Set(deps.runIdCandidates?.(given) ?? [])].sort();
+    if (matches.length === 1) runId = matches[0]!;
+    debug.log('harness.stop', 'run-id-resolved', { given, resolved: runId, candidates: matches });
+    if (matches.length > 1) throw new AmbiguousHarnessStopRunIdError(given, matches);
+  }
   // ── ⓐ 프로세스 ────────────────────────────────────────────
   let processState: HarnessStopResult['process'] = 'absent';
   const record = deps.readPidRecord(runId);
@@ -235,7 +284,7 @@ export async function stopHarnessRun(runId: string, deps: HarnessStopDeps, conte
     if (r.status === 0) jobsDeleted += r.stdout.split('\n').filter((line) => line.startsWith('job.batch/')).length;
     else debug.log('harness.stop', 'job-delete-failed', { runId, context, error: r.stderr.slice(0, 200) }, { level: 'warn' });
   }
-  const result: HarnessStopResult = { runId, process: processState, ...(record ? { pid: record.pid } : {}), candidates, scanned: scan.status === 'ok', pidRecordFound: record !== null, dryRun, jobsDeleted, contexts: targets };
+  const result: HarnessStopResult = { runId, ...(given !== runId ? { givenRunId: given } : {}), process: processState, ...(record ? { pid: record.pid } : {}), candidates, scanned: scan.status === 'ok', pidRecordFound: record !== null, dryRun, jobsDeleted, contexts: targets };
   debug.log('harness.stop', 'stopped', { runId, process: processState, jobsDeleted, contexts: targets.length });
   return result;
 }
@@ -249,6 +298,7 @@ export function formatHarnessStop(r: HarnessStopResult): string {
     'owner-mismatch': '소유 불일치(건드리지 않음 — PID 가 다른 프로세스로 재사용됐다)',
   };
   return [
+    ...(r.givenRunId ? [`↳ ${r.givenRunId} → ${r.runId}(전체)`] : []),
     `harness stop ${r.runId}`,
     `  프로세스: ${label[r.process]}${r.pid ? ` · pid ${r.pid}` : ''}`,
     ...(!r.scanned && r.process !== 'unmeasured' ? ['  프로세스 표: 못 잼(기록 밖 발사 프로세스는 확인하지 못함)'] : []),

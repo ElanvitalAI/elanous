@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, test } from 'bun:test';
@@ -39,14 +39,14 @@ function requiredFromBash(): string[] {
   return readFileSync(resolve(import.meta.dir, 'install.sh'), 'utf8').match(/REQUIRED_COMMANDS=\(([^)]*)\)/)?.[1].trim().split(/\s+/).sort() ?? [];
 }
 
-function run(args: string[], options: { home?: string; cwd?: string; path?: string; profile?: string; prefix?: string } = {}) {
+function run(args: string[], options: { home?: string; cwd?: string; path?: string; profile?: string; prefix?: string; script?: string; env?: Record<string, string> } = {}) {
   const home = options.home ?? fixture();
   const prefix = options.prefix ?? join(home, 'prefix');
   const profile = options.profile ?? join(home, 'profile.ps1');
-  const result = spawnSync(shell!, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', installer, ...args], {
+  const result = spawnSync(shell!, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', options.script ?? installer, ...args], {
     cwd: options.cwd ?? repoRoot,
     encoding: 'utf8',
-    env: { ...process.env, HOME: home, USERPROFILE: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_POWERSHELL_PROFILE: profile, ...(options.path ? { PATH: options.path } : {}) },
+    env: { ...process.env, HOME: home, USERPROFILE: home, ELANOUS_INSTALL_PREFIX: prefix, ELANOUS_POWERSHELL_PROFILE: profile, ELANOUS_INSTALL_BUN_SCRIPT: '', ELANOUS_INSTALL_NO_USER_PATH: '1', ELANOUS_INSTALL_LANG: 'en', ...(options.path ? { PATH: options.path } : {}), ...options.env },
   });
   return { home, prefix, profile, result };
 }
@@ -61,12 +61,24 @@ function commandStub(directory: string, name: string): void {
   chmodSync(path, 0o755);
 }
 
+function standalonePackage(home: string): string {
+  const packageDir = join(home, 'staging', 'package');
+  mkdirSync(join(packageDir, 'bin'), { recursive: true });
+  writeFileSync(join(packageDir, 'package.json'), JSON.stringify({ name: 'elanous', version: '1.0.0', bin: { elanous: 'bin/elanous.mjs' } }));
+  writeFileSync(join(packageDir, 'bin', 'elanous.mjs'), 'console.log("1.0.0");\n');
+  const archive = join(home, 'elanous.tgz');
+  const packed = spawnSync('tar', ['-czf', archive, '-C', join(home, 'staging'), 'package'], { encoding: 'utf8' });
+  expect(packed.status, packed.stderr).toBe(0);
+  return archive;
+}
+
 describe('scripts/install.ps1', () => {
   test('uses the Bash installer required-command data and it matches the catalog', () => {
     const source = readFileSync(installer, 'utf8');
     expect(source).toContain("Join-Path $scriptDir 'install.sh'");
-    expect(source).toContain('Get-RequiredCommands $(');
+    expect(source).toContain('Get-RequiredCommands $installerPath');
     expect(source).not.toMatch(/\$requiredCommands\s*=\s*@\(/);
+    expect(source).toContain("return @('bun')");
     expect(requiredFromBash()).toEqual(requiredFromCatalog('required'));
     expect(requiredFromBash()).toEqual(['bun', 'git']);
   });
@@ -78,6 +90,7 @@ describe('scripts/install.ps1', () => {
     expect(source).toContain("$markerEnd = '# <<< elanous installer PATH <<<'");
     expect(source).toContain('Add-Content -LiteralPath $profilePath');
     expect(source).toContain('if (-not $NoModifyPath)');
+    expect(source).toContain("[Environment]::SetEnvironmentVariable('Path'");
     expect(source).toContain('ELANOUS_INSTALL_PREFIX');
     expect(source).toContain('Push-Location $repoRoot');
     expect(source).toContain(".Replace(\"'\", \"''\")");
@@ -164,16 +177,103 @@ describe('scripts/install.ps1', () => {
     for (const argument of ['Prefix', 'Source', 'NoModifyPath', 'Help']) expect(result.stdout).toContain(argument);
   });
 
-  executionTest('PowerShell execution: missing git or bun exits nonzero, names the missing command, and leaves isolated prefix and profile untouched', () => {
-    for (const missing of ['git', 'bun']) {
-      const home = fixture();
-      const commandPath = join(home, 'commands');
-      mkdirSync(commandPath);
-      commandStub(commandPath, missing === 'git' ? 'bun' : 'git');
-      const profile = join(home, 'new-profile.ps1');
-      const { prefix, result } = run(['-NoModifyPath'], { home, profile, path: commandPath });
-      expect(result.status, `${missing}: ${result.stderr}`).not.toBe(0);
-      expect(`${result.stdout}${result.stderr}`).toContain(`required command missing: ${missing}`);
+  test('decodes the Korean success template before formatting a Windows path', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain("$installedMessage = Say 'Installed elanous {0} at {1}'");
+    expect(source).toContain('Write-Output ($installedMessage -f $version, $shimPath)');
+    expect(source).not.toMatch(/Say[^\r\n)]*\$shimPath/);
+  });
+
+  test('Bun bootstrap, opt-out, git next step and locale have explicit runtime paths', () => {
+    const source = readFileSync(installer, 'utf8');
+    expect(source).toContain("(Invoke-WebRequest -UseBasicParsing -Uri 'https://bun.sh/install.ps1').Content");
+    expect(source).toContain('ELANOUS_INSTALL_BUN_SCRIPT');
+    expect(source).toContain("$env:PATH = $bunBin + [IO.Path]::PathSeparator + $env:PATH");
+    expect(source).toContain("if ($NoBootstrapBun)");
+    expect(source).toContain('$env:PATH = $bunBin + [IO.Path]::PathSeparator + $pathBeforeBun');
+    expect(source).toContain("Fail \"required command missing: $command\" 127");
+    expect(source).toContain("if ($installLang -eq 'ko')");
+    expect(source).toContain("winget install --id Git.Git -e");
+    expect(source).toContain("$missing = if ($missingGit -and -not $isCheckout) { 'git(next step)' }");
+    expect(source).toContain('bootstrapped: $bootstrapped; missing: $missing');
+  });
+
+  executionTest('PowerShell execution: checkout still requires git before modifying the prefix or profile', () => {
+    const home = fixture();
+    const commandPath = join(home, 'commands');
+    mkdirSync(commandPath);
+    commandStub(commandPath, 'bun');
+    const profile = join(home, 'new-profile.ps1');
+    const { prefix, result } = run(['-NoModifyPath'], { home, profile, path: commandPath });
+    expect(result.status, result.stderr).toBe(127);
+    expect(result.stderr).toContain('required command missing: git');
+    expect(existsSync(prefix)).toBe(false);
+    expect(existsSync(profile)).toBe(false);
+  });
+
+  windowsExecutionTest('standalone with no git or Bun bootstraps once and installs with a Korean path intact', () => {
+    const home = fixture();
+    const isolated = join(home, 'standalone');
+    mkdirSync(isolated);
+    copyFileSync(installer, join(isolated, 'install.ps1'));
+    const source = standalonePackage(home);
+    const bootstrap = join(home, 'bootstrap.ps1');
+    const calls = join(home, 'bootstrap-calls');
+    writeFileSync(bootstrap, `Add-Content -LiteralPath '${calls.replaceAll("'", "''")}' -Value 'called'\nNew-Item -ItemType Directory -Force -Path (Join-Path $HOME '.bun/bin') | Out-Null\nCopy-Item -LiteralPath '${process.execPath.replaceAll("'", "''")}' -Destination (Join-Path $HOME '.bun/bin/bun.exe')\n$env:PATH = Join-Path $HOME 'user-path-only'\n`); // like bun's install.ps1: session PATH reset to the user PATH (WIN2 bare VM 10-02)
+    const prefix = join(home, 'Users', 'new-install');
+    const options = { home, prefix, script: join(isolated, 'install.ps1'), path: join(process.env.SystemRoot!, 'System32'), env: { ELANOUS_INSTALL_BUN_SCRIPT: bootstrap, ELANOUS_INSTALL_LANG: 'ko' } };
+    const first = run(['-NoModifyPath', '-Source', source], options);
+    expect(first.result.status, first.result.stderr).toBe(0);
+    const successLine = first.result.stdout.split(/\r?\n/).find(line => line.includes('elanous 1.0.0'));
+    expect(successLine).toContain(join(prefix, 'bin', 'elanous.cmd'));
+    expect(first.result.stdout).toContain('bootstrapped: bun; missing: git(next step)');
+    expect(first.result.stdout).toContain('winget install --id Git.Git -e');
+    const shim = join(prefix, 'bin', 'elanous.cmd');
+    expect(existsSync(shim)).toBe(true);
+    const version = spawnSync(shim, ['--version'], { shell: true, encoding: 'utf8' });
+    expect(version.status, version.stderr).toBe(0);
+    expect(version.stdout).toContain('1.0.0');
+    expect(readFileSync(calls, 'utf8').trim().split(/\r?\n/)).toHaveLength(1);
+    const second = run(['-NoModifyPath', '-Source', source], options);
+    expect(second.result.status, second.result.stderr).toBe(0);
+    expect(second.result.stdout).toContain('bootstrapped: none; missing: git(next step)');
+    expect(readFileSync(calls, 'utf8').trim().split(/\r?\n/)).toHaveLength(1);
+  }, 120_000);
+
+  windowsExecutionTest('standalone with Bun and no git completes without bootstrapping', () => {
+    const home = fixture();
+    const standalone = join(home, 'standalone');
+    mkdirSync(standalone);
+    copyFileSync(installer, join(standalone, 'install.ps1'));
+    const source = standalonePackage(home);
+    const bootstrap = join(home, 'bootstrap.ps1');
+    const calls = join(home, 'bootstrap-calls');
+    writeFileSync(bootstrap, `Set-Content -LiteralPath '${calls.replaceAll("'", "''")}' -Value 'called'\n`);
+    const bunBin = join(home, '.bun', 'bin');
+    mkdirSync(bunBin, { recursive: true });
+    copyFileSync(process.execPath, join(bunBin, 'bun.exe'));
+    const { prefix, result } = run(['-NoModifyPath', '-Source', source], {
+      home, script: join(standalone, 'install.ps1'), path: join(process.env.SystemRoot!, 'System32'), env: { ELANOUS_INSTALL_BUN_SCRIPT: bootstrap },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('bootstrapped: none; missing: git(next step)');
+    expect(result.stdout).toContain('winget install --id Git.Git -e');
+    expect(existsSync(join(prefix, 'bin', 'elanous.cmd'))).toBe(true);
+    expect(existsSync(calls)).toBe(false);
+  }, 120_000);
+
+  windowsExecutionTest('standalone opt-out and failing Bun bootstrap leave the install untouched', () => {
+    const home = fixture();
+    const standalone = join(home, 'standalone');
+    mkdirSync(standalone);
+    copyFileSync(installer, join(standalone, 'install.ps1'));
+    const bootstrap = join(home, 'bootstrap.ps1');
+    writeFileSync(bootstrap, "throw 'injected bootstrap failure'\n");
+    const options = { home, script: join(standalone, 'install.ps1'), path: join(process.env.SystemRoot!, 'System32'), env: { ELANOUS_INSTALL_BUN_SCRIPT: bootstrap } };
+    for (const args of [['-NoBootstrapBun'], ['--no-bootstrap-bun'], []]) {
+      const { prefix, profile, result } = run(args, options);
+      expect(result.status, result.stderr).toBe(args.length ? 127 : 1);
+      expect(result.stderr).toContain(args.length ? 'irm https://bun.sh/install.ps1 | iex' : 'bun bootstrap failed: injected bootstrap failure');
       expect(existsSync(prefix)).toBe(false);
       expect(existsSync(profile)).toBe(false);
     }

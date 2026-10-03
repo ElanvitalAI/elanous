@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { emitNodeResult } from './node-verdict.js';
@@ -55,7 +55,16 @@ function versionAt(repo: string): string {
   return pkg.version;
 }
 
-function landing(repo: string, kind: Kind, releaseVersion: string): Output {
+/** next.md list lines (trimmed) present at the cut commit, or null when the cut or its next.md cannot be read. */
+function shippedNextMdLines(repo: string, cut: string | undefined): { lines: Set<string> } | { reason: string } {
+  if (!cut) return { reason: 'cut-unknown' };
+  // git-spawn-allow: reads the cut commit's next.md to learn which lines that release already carried.
+  const shown = spawnSync('git', ['show', `${cut}:release/next.md`], { cwd: repo, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+  if (shown.status !== 0 || shown.error) return { reason: 'cut-next-md-unreadable' };
+  return { lines: new Set(shown.stdout.split('\n').map((line) => line.trim()).filter((line) => line.startsWith('- '))) };
+}
+
+function landing(repo: string, kind: Kind, releaseVersion: string, cut?: string): Output {
   const target = kind === 'release' ? releaseVersion : nextDevVersion(releaseVersion);
   const source = kind === 'release' ? `${releaseVersion}-dev.N` : releaseVersion;
   fetchMain(repo);
@@ -85,6 +94,41 @@ function landing(repo: string, kind: Kind, releaseVersion: string): Output {
       writeFileSync(lockPath, lock.replace(root[0], root[0].replace(lockedVersion[0], `"version": "${target}"`)));
     }
     run('bun', ['install', '--frozen-lockfile'], worktree);
+    if (kind === 'dev-bump') {
+      const nextPath = join(worktree, 'release', 'next.md');
+      if (existsSync(nextPath)) {
+        const original = readFileSync(nextPath, 'utf8');
+        // OP 10-02: dev-bump runs on the then-current main, not the cut. Lines landed after the cut are not in this
+        // release and #22745 carries only lines added by the next cut range — so remove only lines the cut carried.
+        const shipped = shippedNextMdLines(repo, cut);
+        if ('reason' in shipped) {
+          console.error(`⚠ next.md 비우기 건너뜀(${shipped.reason}) — 컷 커밋의 next.md 를 못 읽어 «나간 줄»을 증명할 수 없다`);
+          debug.log('release-loop.notes', 'next-md-reset-skipped', { reason: shipped.reason }, { level: 'warn' });
+        }
+        const shippedLines = 'lines' in shipped ? shipped.lines : new Set<string>();
+        let keptAfterCut = 0;
+        let removed = 0;
+        let keptLater = 0;
+        let inSection = false;
+        let droppingItem = false;
+        // Only shipped list items (and their indented continuation lines) go; headings, prose, `###` subheadings and
+        // `Target: later` items stay — the reviewer's «preserve everything but the released lines».
+        const reset = original.split(/(?<=\n)/).filter((line) => {
+          if (/^## /.test(line)) { inSection = true; droppingItem = false; return true; }
+          if (!inSection) return true;
+          if (/^- /.test(line)) {
+            if (/\bTarget:\s*later(?:\.|\s|$)/i.test(line)) { keptLater++; droppingItem = false; return true; }
+            if (!shippedLines.has(line.trim())) { keptAfterCut++; droppingItem = false; return true; }
+            removed++; droppingItem = true; return false;
+          }
+          if (droppingItem && /^[ \t]+\S/.test(line)) return false;
+          droppingItem = false;
+          return true;
+        }).join('');
+        if (reset !== original) writeFileSync(nextPath, reset);
+        debug.log('release-loop.notes', 'next-md-reset', { removed, keptLater, keptAfterCut });
+      }
+    }
     const title = kind === 'release' ? `release: ${target}` : `version: ${target}`;
     const land = spawnSync('bun', ['bin/elanous.mjs', 'pr', 'land', '--commit-message', title, '--title', title, '--body', `Set package.json version to ${target}.`], {
       cwd: worktree, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024,
@@ -111,24 +155,28 @@ function landing(repo: string, kind: Kind, releaseVersion: string): Output {
 function main(args: string[] = process.argv.slice(2), repo = process.cwd()): Output {
   let kind: Kind | null = null;
   let version: string | null = null;
+  let cut: string | undefined;
   try {
-    if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] --json');
+    if (args[0] !== 'release' && args[0] !== 'dev-bump') throw new Error('usage: version-node.ts <release|dev-bump> [--version <v>] [--cut <sha>] --json');
     kind = args[0];
     for (let i = 1; i < args.length; i++) {
       if (args[i] === '--json') continue;
       if (args[i] === '--version' && args[i + 1]) { version = args[++i]!; continue; }
+      if (args[i] === '--cut' && args[i + 1]) { cut = args[++i]!; continue; }
       throw new Error(`unknown or incomplete argument: ${args[i]}`);
     }
-    if (!version) {
-      if (process.env.ELANOUS_GRAPH_CONTEXT) {
-        const location = process.env.ELANOUS_GRAPH_CONTEXT;
-        const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as { input?: { version?: unknown } };
-        if (typeof context.input?.version === 'string') version = context.input.version;
-      }
+    if (process.env.ELANOUS_GRAPH_CONTEXT) {
+      const location = process.env.ELANOUS_GRAPH_CONTEXT;
+      const context = JSON.parse(location.trimStart().startsWith('{') ? location : readFileSync(location, 'utf8')) as {
+        input?: { version?: unknown }; outputs?: Record<string, { commit?: unknown } | undefined> };
+      if (!version && typeof context.input?.version === 'string') version = context.input.version;
+      // The cut = the commit version-release landed (what cutoff and the gate measured).
+      const cutCommit = context.outputs?.['version-release']?.commit;
+      if (!cut && typeof cutCommit === 'string' && cutCommit) cut = cutCommit;
     }
     if (!version) throw new Error('version required (--version or ELANOUS_GRAPH_CONTEXT.input.version)');
     nextDevVersion(version);
-    return landing(resolve(repo), kind, version);
+    return landing(resolve(repo), kind, version, cut);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const worktree = /\[worktree: ([^\]]+)\]$/.exec(message)?.[1];

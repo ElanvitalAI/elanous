@@ -19,6 +19,8 @@ import { setInProcessOutbound } from '../../domains/outbound-alert.js';
 import { getUserConfig } from '../../user-config.js';
 import type { TelegramEvent } from '../../workflow-runtime/triggers/telegram-source.js';
 import { spawnSync } from 'node:child_process';
+import { isAbsolute } from 'node:path';
+import { createProject, listProjects } from '../../project/project-store.js';
 import { compareTokenConstTime } from '../../acp/transport/auth.js';
 import { ensureAuthToken } from '../../auth/acp-token.js';
 import type { NexusState } from '../state/state.js';
@@ -134,6 +136,7 @@ import {
   type ReflectionRouteOpts,
 } from './reflection.js';
 import { handleSignalBoard } from './signal-board-api.js';
+import { handleUsageGet } from './usage-api.js';
 import {
   handleDashboard,
   handleDashboardRefreshLive,
@@ -163,6 +166,7 @@ import { handleLlmModels } from './llm-models.js';
 import { handleLlmHostsConfig } from './llm-hosts-config.js';
 import { handleLlmRotationGet, handleLlmRotationNext } from './llm-rotation.js';
 import { handleSetupClaim } from './setup-claim.js';
+import { handleSetupCodexLoginGet, handleSetupCodexLoginPost } from './setup-codex-login.js';
 import {
   handleLlmProvidersList,
   handleLlmProviderSet,
@@ -278,7 +282,7 @@ import { handleSchedulesActionPost } from './schedules-action.js';
 import { handleSchedulesList, handleScheduleDetail, handleScheduleRuns } from './schedules-read.js';
 import { handleIntakeRunsList } from './intake-runs.js';
 import { handleMissionsList, handleMissionDetail } from './missions.js';
-import { handleSessionsStoreList, handleSessionsStoreGet, handleSessionsStoreFork, handleSessionsStoreDelete } from './sessions-store.js';
+import { handleSessionsStoreList, handleSessionsStoreGet, handleSessionsStoreFork, handleSessionsStoreDelete, handleSessionsStorePatch } from './sessions-store.js';
 import { handleLogsQuery, handleLogsStream, handleLogsLevelGet, handleLogsLevelPost, handleLogsFacets, handleLogsHistogram, handleLogsInstances } from './log-fabric.js';
 import { handleTrace, handleTraceEvidence } from './trace.js';
 import { handleDispatchRunsList } from './dispatch-runs.js';
@@ -465,6 +469,8 @@ export interface NexusHttpServerOpts {
   state: NexusState;
   registry: TabRegistry;
   eventBus: NexusEventBus;
+  /** Test seam for the read-only usage collector; production uses the cached handler. */
+  usageHandler?: () => Promise<Response>;
   /** Supervisor handle — required for the write API (PR ι). When omitted
    *  (skipSupervisor mode), mutation routes return 503. */
   supervisor?: Supervisor;
@@ -793,6 +799,27 @@ export function startNexusHttpServer(opts: NexusHttpServerOpts): NexusHttpServer
       setInProcessOutbound(null);
     },
   };
+}
+
+export function handleProjectsGet(): Response {
+  return jsonResponse({ projects: listProjects() });
+}
+
+export async function handleProjectsPost(req: Request): Promise<Response> {
+  let body: unknown;
+  try { body = await req.json(); }
+  catch { return jsonResponse({ error: 'invalid_json' }, 400); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonResponse({ error: 'invalid_name' }, 400);
+  }
+  const { name, primaryFolder } = body as Record<string, unknown>;
+  if (typeof name !== 'string' || !name.trim() || name.length > 80) {
+    return jsonResponse({ error: 'invalid_name' }, 400);
+  }
+  if (primaryFolder !== undefined && (typeof primaryFolder !== 'string' || !isAbsolute(primaryFolder))) {
+    return jsonResponse({ error: 'invalid_primary_folder' }, 400);
+  }
+  return jsonResponse({ project: createProject({ name, ...(primaryFolder !== undefined ? { primaryFolder } : {}) }) }, 201);
 }
 
 function isPortBusy(err: unknown): boolean {
@@ -1285,9 +1312,20 @@ export async function routeRequest(
     return handleGraphsValidatePost(req, opts.metaApi);
   }
 
+  if (pathname === '/v1/projects' && (method === 'GET' || method === 'POST')) {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return method === 'GET' ? handleProjectsGet() : handleProjectsPost(req);
+  }
+
   if (pathname === '/v1/config/chat-fast-path' && (method === 'GET' || method === 'PUT')) {
     if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
     return handleChatFastPathConfig(req);
+  }
+
+  if (pathname === '/v1/usage') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    if (method !== 'GET') return jsonResponse({ error: 'method-not-allowed' }, 405);
+    return (opts.usageHandler ?? handleUsageGet)();
   }
 
   // Mutation routes (PR ι) — POST/PATCH/DELETE on /v1/nexus/tabs[/:id[/action]].
@@ -1540,6 +1578,11 @@ export async function routeRequest(
     // PWA `/setup` wizard Phase 1 (2026-05-19) — LLM provider 첫 셋업.
     // POST 는 mutation 블록 안에서 등록 (memory `feedback_post_route_must_be_in_method_block`).
     // GET sibling 은 아래 GET-only 블록에 등록.
+    if (pathname === '/v1/setup/codex-login' && (method === 'POST' || method === 'OPTIONS')) {
+      if (method === 'OPTIONS') return corsPreflight('GET, POST, OPTIONS');
+      if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+      return handleSetupCodexLoginPost(req);
+    }
     if (pathname === '/v1/setup/llm-provider' && (method === 'POST' || method === 'OPTIONS')) {
       if (method === 'POST') { if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401); }
       return handleLlmProviderSet(req);
@@ -1903,6 +1946,11 @@ export async function routeRequest(
       if (!opts.metaApi) return jsonResponse({ error: 'meta-api-runtime-not-wired' }, 503);
       const id = decodeURIComponent(pathname.slice('/v1/sessions/store/'.length, -'/fork'.length));
       return handleSessionsStoreFork(req, id, opts.metaApi);
+    }
+    if (pathname.startsWith('/v1/sessions/store/') && !pathname.endsWith('/fork') && method === 'PATCH') {
+      if (!opts.metaApi) return jsonResponse({ error: 'unauthorized' }, 401);
+      const id = decodeURIComponent(pathname.slice('/v1/sessions/store/'.length));
+      return handleSessionsStorePatch(req, id, opts.metaApi);
     }
     // on-disk 세션 삭제(파괴적) — 라이브 세션 관리. /store/:id (fork/transcript 와 구분).
     if (pathname.startsWith('/v1/sessions/store/') && !pathname.endsWith('/fork') && method === 'DELETE') {
@@ -2425,6 +2473,10 @@ export async function routeRequest(
   }
   // PWA `/setup` wizard Phase 1 (2026-05-19) — provider catalog 표시.
   // POST sibling (`/v1/setup/llm-provider`) 는 위 mutation 블록.
+  if (pathname === '/v1/setup/codex-login') {
+    if (!opts.metaApi || !checkAuth(req, opts.metaApi)) return jsonResponse({ error: 'unauthorized' }, 401);
+    return handleSetupCodexLoginGet();
+  }
   if (pathname === '/v1/setup/llm-providers') {
     return handleLlmProvidersList(req);
   }

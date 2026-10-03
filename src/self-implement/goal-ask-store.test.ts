@@ -1,12 +1,15 @@
 import { createHash } from 'node:crypto';
 import { Database } from 'bun:sqlite';
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { sqlNowIso } from '../time/db-window.js';
 import { GoalAskStore, addDocumentMetadataColumns, loadGoalAskRecords, recordGoalAsk, renderGoalAskRecords } from './goal-ask-store.js';
 import { debug } from '../debug/log.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const directories: string[] = [];
 

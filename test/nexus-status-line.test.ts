@@ -7,6 +7,16 @@ import { classifyNexusStatus } from '../src/nexus/status-line.js';
 
 const originalFetch = globalThis.fetch;
 const originalNexusDir = process.env.ELANOUS_NEXUS_DIR;
+const proxyEnvKeys = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'NO_PROXY', 'no_proxy'] as const;
+const originalProxyEnv = Object.fromEntries(proxyEnvKeys.map((key) => [key, process.env[key]]));
+
+function setProxyEnv(proxyUrl: string | undefined): void {
+  for (const key of proxyEnvKeys) {
+    if (key.toLowerCase() === 'no_proxy' || proxyUrl === undefined) delete process.env[key];
+    else process.env[key] = proxyUrl;
+  }
+}
+
 let root = '';
 let output: string[] = [];
 let logSpy: ReturnType<typeof spyOn>;
@@ -40,6 +50,11 @@ beforeEach(() => {
 afterEach(() => {
   logSpy.mockRestore();
   globalThis.fetch = originalFetch;
+  for (const key of proxyEnvKeys) {
+    const value = originalProxyEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   if (originalNexusDir === undefined) delete process.env.ELANOUS_NEXUS_DIR;
   else process.env.ELANOUS_NEXUS_DIR = originalNexusDir;
   rmSync(root, { recursive: true, force: true });
@@ -89,26 +104,25 @@ describe('classifyNexusStatus', () => {
 describe('runNexus status health wiring', () => {
   it('maps a connection refusal through probe and classifier to http health unknown', async () => {
     writeLiveLock();
-    writeRuntime();
-    globalThis.fetch = mock(() => Promise.reject(new TypeError('connection refused'))) as unknown as typeof fetch;
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() });
+    const port = server.port;
+    server.stop(true);
+    writeRuntime('127.0.0.1', port);
 
     await runNexus({ status: true });
-
-    expect(globalThis.fetch).toHaveBeenCalledWith(
-      'http://127.0.0.1:31415/v1/health',
-      expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
     expect(output).toContain('  status    http health unknown (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
     expect(output).toContain('  root      ' + root);
     expect(output).toContain('  lock      ' + join(root, '.lock'));
     expect(output).toContain('  runtime   ' + join(root, 'runtime.json'));
     expect(output).toContain('  version   0.17.0 (phase: test)');
-    expect(output).toContain('  http      http://127.0.0.1:31415');
+    expect(output).toContain('  http      http://127.0.0.1:' + port);
   });
 
   it('reports a failed health probe without a live lock as unknown rather than not running', async () => {
-    writeRuntime();
-    globalThis.fetch = mock(() => Promise.reject(new TypeError('connection refused'))) as unknown as typeof fetch;
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response() });
+    const port = server.port;
+    server.stop(true);
+    writeRuntime('127.0.0.1', port);
 
     await runNexus({ status: true });
 
@@ -118,27 +132,92 @@ describe('runNexus status health wiring', () => {
     expect(output).toContain('  lock      ' + join(root, '.lock'));
     expect(output).toContain('  runtime   ' + join(root, 'runtime.json'));
     expect(output).toContain('  version   0.17.0 (phase: test)');
-    expect(output).toContain('  http      http://127.0.0.1:31415');
+    expect(output).toContain('  http      http://127.0.0.1:' + port);
   });
 
   it('reports a responsive listener without a live lock as a separate state', async () => {
-    writeRuntime();
-    globalThis.fetch = mock(() => Promise.resolve(new Response(null, { status: 204 }))) as unknown as typeof fetch;
-
-    await runNexus({ status: true });
-
-    expect(output).toContain('  status    http responding without live lock');
-    expect(output).toContain('  http      http://127.0.0.1:31415');
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response(null, { status: 204 }) });
+    try {
+      writeRuntime('127.0.0.1', server.port);
+      await runNexus({ status: true });
+      expect(output).toContain('  status    http responding without live lock');
+      expect(output).toContain('  http      http://127.0.0.1:' + server.port);
+    } finally {
+      server.stop(true);
+    }
   });
 
   it('reports a live lock with a non-success health response as http silent', async () => {
     writeLiveLock();
-    writeRuntime();
-    globalThis.fetch = mock(() => Promise.resolve(new Response(null, { status: 503 }))) as unknown as typeof fetch;
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response(null, { status: 503 }) });
+    try {
+      writeRuntime('127.0.0.1', server.port);
+      await runNexus({ status: true });
+      expect(output).toContain('  status    lock alive, http silent (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  for (const host of ['::1', '127.0.0.1', '127.0.0.2', 'localhost'] as const) {
+    it(`probes ${host} directly with HTTP_PROXY and HTTPS_PROXY set`, async () => {
+      let localRequests = 0;
+      let proxyRequests = 0;
+      const proxy = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => {
+        proxyRequests++;
+        return new Response(null, { status: 403 });
+      } });
+      const server = Bun.serve({ hostname: host, port: 0, fetch: () => {
+        localRequests++;
+        return new Response(null, { status: 204 });
+      } });
+      try {
+        setProxyEnv(`http://127.0.0.1:${proxy.port}`);
+        writeLiveLock();
+        writeRuntime(host, server.port);
+        const fetchSpy = spyOn(globalThis, 'fetch');
+        await runNexus({ status: true });
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(localRequests).toBe(1);
+        expect(proxyRequests).toBe(0);
+        expect(output).toContain('  status    alive (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
+      } finally {
+        server.stop(true);
+        proxy.stop(true);
+      }
+    });
+  }
+
+  it('preserves fetch and its proxy settings for a non-loopback runtime address', async () => {
+    setProxyEnv('http://127.0.0.1:9');
+    writeLiveLock();
+    writeRuntime('192.0.2.1', 31415);
+    const proxiedFetch = mock(() => Promise.resolve(new Response(null, { status: 403 })));
+    globalThis.fetch = proxiedFetch as unknown as typeof fetch;
 
     await runNexus({ status: true });
 
+    expect(proxiedFetch).toHaveBeenCalledWith('http://192.0.2.1:31415/v1/health', expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(process.env.HTTP_PROXY).toBe('http://127.0.0.1:9');
     expect(output).toContain('  status    lock alive, http silent (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
+  });
+
+  it('probes a loopback listener without proxy environment variables', async () => {
+    setProxyEnv(undefined);
+    let localRequests = 0;
+    const server = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => {
+      localRequests++;
+      return new Response(null, { status: 204 });
+    } });
+    try {
+      writeLiveLock();
+      writeRuntime('127.0.0.1', server.port);
+      await runNexus({ status: true });
+      expect(localRequests).toBe(1);
+      expect(output).toContain('  status    alive (pid=' + process.pid + ' host=' + hostname() + ' since=2026-08-13T00:00:00.000Z)');
+    } finally {
+      server.stop(true);
+    }
   });
 
   it('probes an IPv6 runtime listener and reports the healthy lock path as alive', async () => {

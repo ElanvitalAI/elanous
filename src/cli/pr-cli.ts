@@ -13,6 +13,7 @@ import { runGate as runChangedTypecheckGate } from '../../scripts/ci-typecheck-c
 import { runIsolationHardcodeGate } from '../../scripts/ci-isolation-hardcode-gate.js';
 import { androidFilesIn, runAndroidUnitTestGate } from '../../scripts/ci-android-unit-tests.js';
 import { iosFilesIn, runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
+import { runPwaBuildGate } from '../../scripts/ci-pwa-build-gate.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
 import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
 import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
@@ -51,6 +52,7 @@ import {
   unionPaths,
 } from './pr-granularity.js';
 import { branchLineageSlug, findSiblingPrs } from './pr-lineage.js';
+import { parseReleaseNoteSection } from '../release-loop/release-note.js';
 
 export { branchLineageSlug, findSiblingPrs };
 
@@ -114,6 +116,7 @@ export interface PrLandDeps {
   runAndroidGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   /** iOS 시험 게이트 심(시험 주입용). */
   runIosGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
+  runPwaGate?: (out: { log: (message: string) => void; error: (message: string) => void }, changedFiles: readonly string[]) => boolean;
   isInteractive?: () => boolean;
   /** Clock for the recent-landings window (test seam · default Date.now). */
   now?: () => number;
@@ -406,13 +409,14 @@ function gateVerdict(
   label: string,
   gate: (out: { log: (message: string) => void; error: (message: string) => void }) => boolean,
   out: { log: (message: string) => void; error: (message: string) => void },
+  failClosed = false,
 ): { ok: boolean; measured: boolean } {
   try {
     return { ok: gate(out), measured: true };
   } catch (error) {
     out.error(`⚠ ${label}: 게이트가 «못 쟀다» — ${error instanceof Error ? error.message : String(error)}`);
-    out.error(`⚠ ${label}: 「위반 없음」이 아니라 「검사 못 함」이다. 이 착지는 통과시키되 게이트를 고쳐라.`);
-    return { ok: true, measured: false };
+    out.error(`⚠ ${label}: 「위반 없음」이 아니라 「검사 못 함」이다. ${failClosed ? '착지를 막는다.' : '이 착지는 통과시키되 게이트를 고쳐라.'}`);
+    return { ok: !failClosed, measured: false };
   }
 }
 
@@ -424,6 +428,21 @@ function liveCurrentBranch(cwd: string): string | undefined {
 
 function record(step: string, ok: boolean, extra: Record<string, unknown> = {}): void {
   debug.log('pr.land', 'step', { step, ok, ...extra });
+}
+
+export function nextMdWarning(body: string, changedFiles: readonly string[], out: { log: (message: string) => void }): void {
+  const section = body.split(/^## 릴리스 노트[ \t]*\r?$/m).at(-1)!;
+  const parsed = parseReleaseNoteSection(body);
+  const hasNote = parsed.fragment !== undefined || parsed.problems.length > 0;
+  const kind = parsed.fragment?.kind ?? (hasNote
+    ? /^[ \t]*- 종류:[ \t]*(feat|fix|security|internal)[ \t]*\r?$/m.exec(section.split(/^#{1,6}[ \t]+/m)[0]!)?.[1]
+    : undefined);
+  const reason = hasNote
+    ? (kind === 'feat' || kind === 'fix' || kind === 'security' ? `release-note:${kind}` : undefined)
+    : (changedFiles.some((file) => /^(?:apps\/pwa\/src\/|src\/cli\/|src\/dashboard\/)/.test(file)) ? 'user-facing-path' : undefined);
+  const warn = !!reason && !changedFiles.includes('release/next.md');
+  record('next-md', true, { warnOnly: true, reason: reason ?? (hasNote ? 'non-user-facing-note' : 'no-user-facing-path') });
+  if (warn) out.log('⚠ next-md: 사용자에게 보이는 변경인데 release/next.md 에 줄이 없습니다 — 공개 노트에서 빠집니다. 「- <kind> — <영어 한 문장>. Documentation: … Target: next.」 한 줄을 더하십시오.');
 }
 
 type PrRemoteCapability = 'github' | 'local-path' | 'no-remote' | 'other';
@@ -1323,6 +1342,7 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
   }
 
   const changedPaths = currentChangePaths(run, cwd, staged, base, out);
+  nextMdWarning(body ?? '', changedPaths, out);
   publicLeakWarning(changedPaths, deps.runPublicLeakGate ?? runPrLandPublicLeakGate, out);
   if (!exportLeakBlock(changedPaths, () => (deps.runExportLeakCheck ?? runPrLandExportLeakCheck)(changedPaths ?? [], cwd), opts.allowPublicLeak === true, out)) return 1;
   if (publicDocPaths(changedPaths, () => true).length > 0) {
@@ -1371,6 +1391,15 @@ export async function runPrLand(opts: PrLandOpts = {}, deps: PrLandDeps = {}): P
     out.log('✓ ios-gate: scripts/ci-ios-unit-tests.ts PASS — iOS 순수-로직 시험이 «실제로 돌았고» 실패 0.');
   }
 
+  // PWA 는 bun test/tsc 밖의 정적 번들이다. 측정 불가도 착지 불가로 판정한다.
+  const pwaGate = gateVerdict('pwa-gate', deps.runPwaGate
+    ? (o) => deps.runPwaGate!(o, changedPaths)
+    : (o) => runPwaBuildGate({ args: ['--changed-files', ...changedPaths], cwd, log: o.log, error: o.error }) === 0, out, true);
+  record('pwa-gate', pwaGate.ok && pwaGate.measured, { measured: pwaGate.measured });
+  if (!pwaGate.ok || !pwaGate.measured) {
+    out.error('✗ pwa-gate: scripts/ci-pwa-build-gate.ts blocked pr land — PWA 빌드 실패 또는 측정 불가.');
+    return 1;
+  }
 
   const overlapFound = emitLandingOverlapAdvisory(run, cwd, base, changedPaths, out);
   const siblingFound = emitSiblingPrAdvisory(

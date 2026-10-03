@@ -1,9 +1,12 @@
-import { test, expect } from 'bun:test';
+import { setDefaultTimeout, test, expect } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const entry = resolve(import.meta.dir, 'publish-internal-dist.ts');
 
@@ -38,6 +41,8 @@ test('two checkout revisions publish verified bot archives; latest switches and 
     expect(second).toMatchObject({ ok: true, version: '0.2.3', out });
     const dir = join(out, 'download', `v0.2.3-${second.commit.slice(0, 12)}`);
     expect(readlinkSync(join(out, 'latest/download'))).toBe(`../download/v0.2.3-${second.commit.slice(0, 12)}`);
+    expect(readlinkSync(join(out, 'download/v0.2.3'))).toBe(`v0.2.3-${second.commit.slice(0, 12)}`);
+    expect(readFileSync(join(out, 'download/v0.2.3/install.sh'), 'utf8')).toContain('echo install');
     const archive = join(dir, 'elanous.tgz');
     const actual = createHash('sha256').update(readFileSync(archive)).digest('hex');
     expect(second.sha256).toBe(actual);
@@ -61,6 +66,7 @@ test('two checkout revisions publish verified bot archives; latest switches and 
     const corrupted = spawnSync('bun', [entry, '--checkout', checkout, '--out', out], { encoding: 'utf8' });
     expect(corrupted.status).toBe(1);
     expect(existsSync(join(out, 'download', `v0.2.3-${first.commit.slice(0, 12)}`))).toBe(false);
+    expect(readlinkSync(join(out, 'download/v0.2.3'))).toBe(`v0.2.3-${second.commit.slice(0, 12)}`);
     rmSync(join(checkout, 'scripts/botlab/bot-canary.ts'));
     const bad = spawnSync('bun', [entry, '--checkout', checkout, '--out', out], { encoding: 'utf8' });
     expect(bad.status).toBe(1);

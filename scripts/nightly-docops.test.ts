@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildStalenessStage, formatNightlyDocOpsCompletion, recordSemanticProposal, stalenessEventName, type SemanticQueueDeps } from './nightly-docops.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const key = 'stable-semantic-key';
 const proposal = { idempotencyKey: key } as ReturnType<typeof import('../src/autopilot/discovery/semantic-supersede.js').buildSemanticSupersedeProposal>;

@@ -837,13 +837,14 @@ export class DiscordBot {
     }
 
     // Addressed work is submitted only by configured owners; ordinary chat keeps its existing path.
-    if (this.allowedUsers.has(author.id) && parseSeatAddress(ctx.text)) {
+    if (this.allowedUsers.has(author.id) && (parseSeatAddress(ctx.text) || (ctx.isDm && ctx.text && !ctx.text.startsWith('/')))) {
       const threadId = typeof m.thread_id === 'string' && m.thread_id ? m.thread_id : undefined;
       const replyChannelId = threadId ?? ctx.channelId;
       try {
         const seatReply = await handleDiscordSeatWork(ctx.text, {
           channelId: replyChannelId,
           messageId: ctx.messageId,
+          userId: ctx.userId, isDm: ctx.isDm,
           ...(threadId ? { threadId } : {}),
         }, this.seatWorkDeps);
         if (seatReply !== null) {

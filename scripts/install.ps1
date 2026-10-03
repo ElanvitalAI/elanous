@@ -3,6 +3,7 @@ param(
   [string] $Prefix,
   [string] $Source,
   [switch] $NoModifyPath,
+  [switch] $NoBootstrapBun,
   [switch] $Help,
   [Parameter(ValueFromRemainingArguments = $true)]
   [string[]] $RemainingArgs
@@ -20,8 +21,8 @@ $ErrorActionPreference = 'Stop'
 
 function Show-Usage {
   @'
-Usage: powershell -File scripts/install.ps1 [-Prefix PATH] [-Source PATH.tgz|URL] [-NoModifyPath] [-Help]
-       powershell -File scripts/install.ps1 [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--help]
+Usage: powershell -File scripts/install.ps1 [-Prefix PATH] [-Source PATH.tgz|URL] [-NoModifyPath] [-NoBootstrapBun] [-Help]
+       powershell -File scripts/install.ps1 [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--no-bootstrap-bun] [--help]
 
 Install elanous into a versioned layout.
   Prefix / --prefix               installation root (default: $ELANOUS_INSTALL_PREFIX or %LOCALAPPDATA%\elanous)
@@ -29,6 +30,7 @@ Install elanous into a versioned layout.
   Source / --source               install a package tarball (local path or http(s) URL; default: $ELANOUS_INSTALL_SOURCE,
                                   else pack the checkout or fetch the verified release when standalone)
   NoModifyPath / --no-modify-path do not append the elanous PATH block to the PowerShell profile
+  NoBootstrapBun / --no-bootstrap-bun fail instead of installing bun when missing
   Help / --help                   show this help
 '@ | Write-Output
 }
@@ -38,11 +40,15 @@ function Fail([string] $Message, [int] $Code) {
   exit $Code
 }
 
+# PowerShell 5.1 parses BOM-less scripts as ANSI. Keep translated messages ASCII in source and decode at runtime.
+function Say([string] $English, [string] $Korean) {
+  if ($installLang -eq 'ko') { return [regex]::Unescape($Korean) }
+  return $English
+}
+
 function Get-RequiredCommands([string] $InstallerPath) {
-  # install.sh is the single source of the required-command list; a non-checkout run (e.g. `irm ... | iex`) has no
-  # install.sh beside it and falls back to the same two names.
-  $fallbackCommands = 'git', 'bun'
-  if (-not $InstallerPath -or -not (Test-Path -LiteralPath $InstallerPath)) { return $fallbackCommands }
+  # A checkout follows install.sh; standalone release installs need bun but not git.
+  if (-not $InstallerPath -or -not (Test-Path -LiteralPath $InstallerPath)) { return @('bun') }
   $content = Get-Content -LiteralPath $InstallerPath -Raw
   $match = [regex]::Match($content, 'REQUIRED_COMMANDS=\(([^)]*)\)')
   if (-not $match.Success) { Fail "could not read REQUIRED_COMMANDS from $InstallerPath" 1 }
@@ -87,11 +93,14 @@ for ($index = 0; $index -lt $RemainingArgs.Count; $index++) {
       $Source = $RemainingArgs[++$index]
     }
     '--no-modify-path' { $NoModifyPath = $true }
+    '--no-bootstrap-bun' { $NoBootstrapBun = $true }
     default { Fail "unknown argument: $($RemainingArgs[$index])" 2 }
   }
 }
 
 if ($Help) { Show-Usage; exit 0 }
+$installLang = if ($env:ELANOUS_INSTALL_LANG) { $env:ELANOUS_INSTALL_LANG } else { [Globalization.CultureInfo]::CurrentUICulture.Name }
+$installLang = if ($installLang -match '^ko(?:-|$)') { 'ko' } else { 'en' }
 if (-not $Prefix) {
   $dataHome = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $HOME 'AppData\Local' }
   $Prefix = if ($env:ELANOUS_INSTALL_PREFIX) { $env:ELANOUS_INSTALL_PREFIX } else { Join-Path $dataHome 'elanous' }
@@ -100,15 +109,46 @@ if (-not $Source -and $env:ELANOUS_INSTALL_SOURCE) { $Source = $env:ELANOUS_INST
 
 $scriptDir = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { $null }
 $repoRoot = if ($scriptDir) { [IO.Path]::GetFullPath((Join-Path $scriptDir '..')) } else { $null }
-$requiredCommands = Get-RequiredCommands $(if ($scriptDir) { Join-Path $scriptDir 'install.sh' } else { $null })
+$installerPath = if ($scriptDir) { Join-Path $scriptDir 'install.sh' } else { $null }
+$requiredCommands = Get-RequiredCommands $installerPath
+$missingGit = -not (Get-Command git -ErrorAction SilentlyContinue)
+$bootstrappedBun = $false
+$bunBin = Join-Path $HOME '.bun\bin'
+if (-not (Get-Command bun -ErrorAction SilentlyContinue) -and (Test-Path -LiteralPath (Join-Path $bunBin 'bun.exe') -PathType Leaf)) {
+  $env:PATH = $bunBin + [IO.Path]::PathSeparator + $env:PATH
+}
+# Preserve checkout required-command enforcement, including git, before changing any installation files.
 foreach ($command in $requiredCommands) {
+  if ($command -eq 'bun') { continue }
   if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { Fail "required command missing: $command" 127 }
+}
+if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+  $bunCommand = 'irm https://bun.sh/install.ps1 | iex'
+  if ($NoBootstrapBun) { Fail "$(Say 'bun is missing; run:' 'bun \uc774 \uc5c6\uc2b5\ub2c8\ub2e4. \uba3c\uc800 \uc2e4\ud589\ud558\uc138\uc694:') $bunCommand" 127 }
+  # Bun's official install.ps1 resets the session PATH to the user PATH only (System32 and tar vanish) - keep ours.
+  $pathBeforeBun = $env:PATH
+  try {
+    $bootstrapScript = if ($env:ELANOUS_INSTALL_BUN_SCRIPT) {
+      Read-Text $env:ELANOUS_INSTALL_BUN_SCRIPT
+    } else {
+      (Invoke-WebRequest -UseBasicParsing -Uri 'https://bun.sh/install.ps1').Content
+    }
+    if (-not $bootstrapScript) { throw 'empty installer response' }
+    & ([scriptblock]::Create([string]$bootstrapScript))
+    if (-not $?) { throw 'installer returned failure' }
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "installer exited with code $LASTEXITCODE" }
+  } catch { Fail "$(Say 'bun bootstrap failed:' 'bun \uc124\uce58 \uc2e4\ud328:') $($_.Exception.Message)" 1 }
+  $env:PATH = $bunBin + [IO.Path]::PathSeparator + $pathBeforeBun
+  if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+    Fail (Say 'bun bootstrap failed: bun not found after installation' 'bun \uc124\uce58 \uc2e4\ud328: \uc124\uce58 \ub4a4\uc5d0\ub3c4 bun \uc744 \ucc3e\uc744 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4') 1
+  }
+  $bootstrappedBun = $true
 }
 $bunPath = (Get-Command bun).Source
 
 # A standalone installer fetches a verified release; explicit sources and checkouts keep their existing paths.
 $isCheckout = $false
-if ($repoRoot -and (Test-Path -LiteralPath (Join-Path $repoRoot 'package.json'))) {
+if ($installerPath -and (Test-Path -LiteralPath $installerPath) -and $repoRoot -and (Test-Path -LiteralPath (Join-Path $repoRoot 'package.json'))) {
   $isCheckout = (Read-Text (Join-Path $repoRoot 'package.json')) -match '"name":\s*"elanous"'
 }
 $releaseDirectory = $null
@@ -247,7 +287,26 @@ try {
   if (-not $NoModifyPath -and -not (Read-Text $profilePath).Contains($markerStart)) {
     Add-Content -LiteralPath $profilePath -Value ("`r`n$markerStart`r`n$pathLine`r`n$markerEnd")
   }
-  Write-Output "Installed elanous $version at $shimPath"
+  # The default execution policy (Restricted) skips $PROFILE in a new window - the user PATH is what a fresh shell sees.
+  if (-not $NoModifyPath -and -not $env:ELANOUS_INSTALL_NO_USER_PATH) {
+    $binDirectory = Join-Path $Prefix 'bin'
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userEntries = @(($userPath -split ';') | Where-Object { $_ })
+    if ($userEntries -notcontains $binDirectory) {
+      [Environment]::SetEnvironmentVariable('Path', (@($binDirectory) + $userEntries) -join ';', 'User')
+    }
+  }
+  $installedMessage = Say 'Installed elanous {0} at {1}' 'elanous {0} \uc744(\ub97c) \uc124\uce58\ud588\uc2b5\ub2c8\ub2e4: {1}'
+  Write-Output ($installedMessage -f $version, $shimPath)
+  $bootstrapped = if ($bootstrappedBun) { 'bun' } else { 'none' }
+  $missing = if ($missingGit -and -not $isCheckout) { 'git(next step)' } else { 'none' }
+  Write-Output "$(Say 'Install summary' '\uc124\uce58 \uc694\uc57d'): bootstrapped: $bootstrapped; missing: $missing"
+  Write-Output (Say 'Next:' '\ub2e4\uc74c:')
+  if (-not $NoModifyPath) { Write-Output (Say '  Open a new PowerShell window to use elanous on PATH.' '  elanous \uc744 PATH \uc5d0\uc11c \uc4f0\ub824\uba74 \uc0c8 PowerShell \ucc3d\uc744 \uc5ec\uc138\uc694.') }
+  else { Write-Output "$(Say '  Run:' '  \uc2e4\ud589:') $shimPath" }
+  if ($missing -ne 'none') {
+    Write-Output "  winget install --id Git.Git -e  # $(Say 'the harness uses git' '\ud558\ub2c8\uc2a4\uac00 git \uc744 \uc0ac\uc6a9\ud569\ub2c8\ub2e4')"
+  }
 } finally {
   Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue
 }

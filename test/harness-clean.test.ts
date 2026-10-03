@@ -1,5 +1,5 @@
 // harness clean — 순수 분류(planHarnessClean) 테스트. 열린 PR 보존·mode 별 remove.
-import { describe, it, expect } from 'bun:test';
+import { setDefaultTimeout, describe, it, expect } from 'bun:test';
 import { mkdirSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve, join, dirname } from 'node:path';
@@ -33,6 +33,9 @@ import {
   upsertPtyManifest,
   type PtyManifestRow,
 } from '../src/pty-shell/pty-manifest.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const wt = (branch: string) => ({ path: `/wt/${branch}`, branch });
 const indexLock = "fatal: Unable to create '/repo/.git/index.lock': File exists";

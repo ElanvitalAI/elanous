@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -9,6 +9,9 @@ import { runCompositeCycle } from '../../src/mission-loop/composite-cycle.js';
 import { debug } from '../../src/debug/log.js';
 import { createHarnessGoal, main, MissionRequestJudgeError, runMissionRequestJudge } from '../../scripts/mission-request-judge.js';
 import type { CapabilityProvider } from '../../src/mission-capabilities/registry.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));

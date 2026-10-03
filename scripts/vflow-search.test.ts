@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const here = dirname(fileURLToPath(import.meta.url));
 const script = join(here, 'vflow-search.ts');

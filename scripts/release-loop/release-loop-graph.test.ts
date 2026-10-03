@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +14,9 @@ import { runDocsLand } from './docs-land-node.js';
 import { runVerify } from './verify-node.js';
 import { runAutoApprove } from './auto-approve-node.js';
 import type { GraphContext } from './node-verdict.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 test('release graph CLI dry-run previews automatic route without executing commands', () => {
   const root = mkdtempSync(join(tmpdir(), 'release-cli-dry-run-'));
@@ -726,7 +729,7 @@ test('pr land creates a missing docs PR before merging it', async () => {
     queryRunningRuns: () => ({ entries: [] }) as never,
     runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true,
     runModelHardcodeGate: () => true, runDaemonPortGate: () => true, runPublicLeakGate: () => 0,
-    runTestInterferenceGate: async () => 0, runAndroidGate: () => true, runIosGate: () => true,
+    runTestInterferenceGate: async () => 0, runAndroidGate: () => true, runIosGate: () => true, runPwaGate: () => true,
     out: { log: (line) => lines.push(line), error: (line) => lines.push(line) },
   });
   expect(code).toBe(0);

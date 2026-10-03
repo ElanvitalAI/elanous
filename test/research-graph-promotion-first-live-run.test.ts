@@ -1,7 +1,10 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const documentPath = `${import.meta.dir}/../docs/RESEARCH-graph-promotion-first-live-run-2026-09-08.md`;
 const runId = 'run-16dbf868-4e60-4547-bdab-15a9e6643bee';

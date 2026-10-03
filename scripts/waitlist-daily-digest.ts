@@ -99,7 +99,7 @@ export async function main(): Promise<void> {
       try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return null; }
     },
     writeState: (s) => { mkdirSync(dirname(statePath), { recursive: true }); writeFileSync(statePath, JSON.stringify(s)); },
-    send: (text) => sendOutbound(text, 'report'),
+    send: (text) => sendOutbound(text, 'ops-report'),
   });
   debug.log('waitlist.digest', 'reported', result);
   console.log(`[waitlist-daily-digest] sent=${result.sent} total=${result.total} fresh=${result.fresh}`);

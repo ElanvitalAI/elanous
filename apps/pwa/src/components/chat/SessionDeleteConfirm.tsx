@@ -34,7 +34,7 @@ export function SessionDeleteConfirm({
 
   if (!open || !session) return null;
 
-  const preview = session.lastMsgPreview ?? `(empty session)`;
+  const preview = session.lastMsgPreview ?? `(빈 대화)`;
 
   return (
     <div
@@ -50,7 +50,7 @@ export function SessionDeleteConfirm({
         <div className="flex items-start gap-3">
           <Trash2 className="mt-0.5 h-5 w-5 shrink-0 text-rose-500" aria-hidden />
           <div className="min-w-0 space-y-2">
-            <h2 className="text-base font-semibold">세션 잊기</h2>
+            <h2 className="text-base font-semibold">대화 지우기</h2>
             <p className="truncate font-mono text-xs text-muted-foreground">
               "{preview}"
             </p>
@@ -63,8 +63,7 @@ export function SessionDeleteConfirm({
               {session.msgCount} 메시지
             </p>
             <p className="text-sm">
-              이 세션을 daemon 에서 영구 삭제합니다. 다른 디바이스 (cli/tg/dc)
-              에서 이 세션을 보고 있으면 unknown_session 으로 빠집니다.
+              이 대화를 영구히 지웁니다. 복구할 수 없습니다. 다른 기기에서 이 대화를 보고 있다면 더 이상 이어갈 수 없습니다.
             </p>
           </div>
         </div>
@@ -83,7 +82,7 @@ export function SessionDeleteConfirm({
             disabled={busy}
             className="rounded-md bg-rose-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-rose-600 disabled:opacity-50"
           >
-            {busy ? '잊는 중…' : '잊기'}
+            {busy ? '지우는 중…' : '지우기'}
           </button>
         </div>
       </div>

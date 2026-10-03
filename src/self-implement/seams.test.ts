@@ -1,5 +1,5 @@
 // self-implement seam — worktreeHasChanges(버그A·self-commit 감지) + featurePrompt(버그B·PR 금지).
-import { test, expect, describe, beforeEach, afterEach, spyOn } from 'bun:test';
+import { setDefaultTimeout, test, expect, describe, beforeEach, afterEach, spyOn } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -4694,6 +4694,10 @@ describe('listOpenDraftsForLineage — 원장과 draft 를 PR «URL» 로 잇는
 import { existsSync as __existsSync } from 'node:fs';
 import { isAbsolute as __isAbsolute } from 'node:path';
 import { ELANOUS_ENTRY_SCRIPT, launchDevGoalFileDetached as __launchDetached } from './seams.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
+
 // 2026-09-26 베어 Ubuntu 26.04 실측: 상대 경로 `bin/elanous.mjs` 로 띄워 사용자 프로젝트(cwd)에서 자식이 즉사했다.
 describe('launchDevGoalFileDetached — 사용자 프로젝트에서도 진입 스크립트를 찾는다', () => {
   test('진입 스크립트는 절대 경로이고 실제로 있다 · cwd 와 무관하다', async () => {

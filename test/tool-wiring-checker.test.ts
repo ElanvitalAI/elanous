@@ -2,10 +2,13 @@
 //    package.json 에 등록돼 있지만 어떤 게이트도 부르지 않아, 카탈로그 필드 개명
 //    (#6928 surface → host)으로 던지기 시작한 뒤 산출이 한 번도 안 나왔다.
 //    ⇒ ⭐ 그래서 「내용이 옳은가」가 아니라 «도는가»를 묶는다. 그 둘은 다른 축이다.
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 

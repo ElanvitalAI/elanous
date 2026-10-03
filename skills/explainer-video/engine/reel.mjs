@@ -12,15 +12,18 @@ import { join, dirname, resolve, extname, basename } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { normalizeCardTitle } from "./stitch.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const argv = process.argv.slice(2);
 const opt = (k, d) => { const i = argv.indexOf(`--${k}`); return i >= 0 ? argv[i + 1] : d; };
 const folder = resolve(argv.find((a, i) => !a.startsWith("--") && !(i > 0 && argv[i - 1].startsWith("--"))) ?? ".");
 const PART = opt("part", "full");
+if (!["full", "body", "intro", "end"].includes(PART)) throw new Error(`unknown reel part: ${PART}`);
+const CARD = PART === "intro" || PART === "end";
 const MAX = Number(opt("max", 60)), MIN = Number(opt("min", 24));
 const W = 1080, H = 1920, PHOTO = 4.2, CLIP_MAX = 5, XF = 0.5;
-const INTRO = PART === "body" ? 0 : 3.0, END = PART === "body" ? 0 : 3.4;
+const INTRO = PART === "body" || PART === "end" ? 0 : 3.0, END = PART === "body" || PART === "intro" ? 0 : 3.4;
 const out = join(folder, "reel"), hf = join(out, "hf"), media = join(hf, "assets", "media");
 mkdirSync(media, { recursive: true }); mkdirSync(join(hf, "assets", "fonts"), { recursive: true });
 const T0 = Date.now(), lap = (s) => console.log(`reel: ${s} · ${((Date.now() - T0) / 1000).toFixed(1)}s`);
@@ -37,18 +40,19 @@ const created = (p) => {
   return Number.isFinite(t) ? t : statSync(p).mtimeMs;
 };
 const probeDur = (p) => Number(run("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", p]).stdout.trim()) || 0;
-const caps = Object.fromEntries((existsSync(join(folder, "captions.txt")) ? readFileSync(join(folder, "captions.txt"), "utf8") : "")
+let TITLE = opt("title", ""), SUB = opt("sub", "");
+const caps = Object.fromEntries((!CARD && existsSync(join(folder, "captions.txt")) ? readFileSync(join(folder, "captions.txt"), "utf8") : "")
   .split("\n").filter((l) => l.includes("|")).map((l) => l.split("|").map((s) => s.trim())));
-let items = readdirSync(folder).filter((f) => [...IMG, ...VID].includes(extname(f).toLowerCase()))
+let items = CARD ? [] : readdirSync(folder).filter((f) => [...IMG, ...VID].includes(extname(f).toLowerCase()))
   .map((f) => ({ f, p: join(folder, f), video: VID.includes(extname(f).toLowerCase()), t: created(join(folder, f)) }))
   .sort((a, b) => a.t - b.t || a.f.localeCompare(b.f));
-if (!items.length) throw new Error(`no photos or clips in ${folder}`);
+if (!CARD && !items.length) throw new Error(`no photos or clips in ${folder}`);
 
 // ── durations: fit into [MIN, MAX] ─────────────────────────────────────────────
 for (const it of items) it.dur = it.video ? Math.min(CLIP_MAX, Math.max(1.5, probeDur(it.p))) : PHOTO;
 const body = () => items.reduce((a, it) => a + it.dur, 0);
 while (INTRO + body() + END > MAX && items.length > 1) items.splice(Math.floor(items.length / 2), 1); // drop from the middle, keep first & last
-if (PART !== "body" && INTRO + body() + END < MIN) { const photos = items.filter((i) => !i.video); const need = MIN - (INTRO + body() + END); for (const p of photos) p.dur += need / Math.max(1, photos.length); }
+if (PART === "full" && INTRO + body() + END < MIN) { const photos = items.filter((i) => !i.video); const need = MIN - (INTRO + body() + END); for (const p of photos) p.dur += need / Math.max(1, photos.length); }
 
 // ── media prep: HEIC → jpg · big photos down to 2160 · a small copy for the vision model · clips re-encoded short & muted ──
 let t = INTRO;
@@ -92,18 +96,17 @@ const oneLine = (s, max) => {
 const CAP_PROMPT = "행사 현장 사진이다. 세로 영상 자막으로 쓸 한국어 한 줄을 출력하라 — 18자 이내 · 마침표 없이 · 보이는 장면만 · 사람 이름·외모 묘사·추측 금지 · 화면 속 글자(행사명·회사명)는 읽히면 써도 된다. 그 한 줄만.";
 const HEAD_PROMPT = "같은 행사에서 찍은 사진들이다. 영상 첫 화면 제목으로 쓸 한국어 행사 이름 한 줄을 출력하라 — 16자 이내 · 화면 속 글자에서 읽히는 행사·회사 이름을 우선 · 읽히지 않으면 장면을 짧게(예: «상장 기념식 현장») · 추측 금지. 그 한 줄만.";
 const slugTitle = (s) => !s || /^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(s);
-let TITLE = opt("title", ""), SUB = opt("sub", "");
 const photos = items.filter((it) => !it.video);
 const VT0 = Date.now();
-const jobs = VISION ? [
+const jobs = VISION && !CARD ? [
   ...photos.filter((it) => !caps[it.f]).map(async (it) => { it.vcap = oneLine(await ask(CAP_PROMPT, [join(out, `v${items.indexOf(it)}.jpg`)]), 22); }),
   ...(PART !== "body" && slugTitle(TITLE) && photos.length ? [(async () => { TITLE = oneLine(await ask(HEAD_PROMPT, photos.slice(0, 3).map((it) => join(out, `v${items.indexOf(it)}.jpg`))), 20) || TITLE; })()] : []),
 ] : [];
 await Promise.all(jobs);
 const visionMs = Date.now() - VT0;
 items.forEach((it, i) => { it.cap = caps[it.f] || it.vcap || (it.video ? "" : `현장 ${i + 1}`); });
-if (slugTitle(TITLE)) TITLE = "현장 스케치";
-if (!SUB) { const d = new Date(items[0].t + 9 * 3600e3); SUB = `${d.getUTCFullYear()}.${String(d.getUTCMonth() + 1).padStart(2, "0")}.${String(d.getUTCDate()).padStart(2, "0")}`; }
+TITLE = normalizeCardTitle(TITLE);
+if (!CARD && !SUB) { const d = new Date(items[0].t + 9 * 3600e3); SUB = `${d.getUTCFullYear()}.${String(d.getUTCMonth() + 1).padStart(2, "0")}.${String(d.getUTCDate()).padStart(2, "0")}`; }
 lap(`vision ${jobs.length ? `${items.filter((i) => i.vcap).length}/${photos.filter((p) => !caps[p.f]).length} captions` : "off"} · title «${TITLE}»`);
 
 // ── assets (same cache as build.mjs) ───────────────────────────────────────────
@@ -119,7 +122,7 @@ for (const [rel, url] of Object.entries(ASSETS)) {
 // ── music: cut to length · fade in/out · level to about -16 LUFS (the whole mix is music) ──
 const BGM = process.env.FIELD_REEL_BGM || join(CACHE, "bgm", "field.wav");
 let music = "";
-if (PART !== "body" && existsSync(BGM)) {
+if (PART === "full" && existsSync(BGM)) {
   const r = run("ffmpeg", ["-v", "error", "-y", "-i", BGM, "-t", String(TOTAL), "-af", `afade=t=in:d=0.4,afade=t=out:st=${f(TOTAL - 1.6)}:d=1.6,loudnorm=I=-16:TP=-1.5:LRA=9`, "-ar", "48000", "-ac", "2", join(media, "bgm.wav")]);
   if (r.status === 0) music = "bgm.wav"; else console.error(`reel: music skipped — ${r.stderr.slice(0, 160)}`);
 }
@@ -165,16 +168,18 @@ const clips = items.map((it, i) => {
   return vis + cap;
 }).join("\n");
 
-const intro = PART === "body" ? "" : `<section class="clip card" data-start="0" data-duration="${INTRO}" data-track-index="6">`
+const intro = PART === "body" || PART === "end" ? "" : `<section class="clip card" data-start="0" data-duration="${INTRO}" data-track-index="6">`
   + `<div class="kick ik">현장 스케치</div>${mark(200, "im")}<h1>${words(TITLE, "it")}</h1><div class="line il"></div><p class="is">${esc(SUB)}</p></section>`;
-const end = PART === "body" ? "" : `<section class="clip card" data-start="${f(t)}" data-duration="${END}" data-track-index="6">`
+const end = PART === "body" || PART === "intro" ? "" : `<section class="clip card" data-start="${f(t)}" data-duration="${END}" data-track-index="6">`
   + `${mark(230, "em")}<h1 class="et">Elanous</h1><p class="et">사진을 올리면, 영상이 됩니다</p><p class="et red">elanous.ai</p></section>`;
-if (PART !== "body") {
+if (PART === "full" || PART === "intro") {
   tw.push(`tl.fromTo(".ik", {opacity:0, letterSpacing:"0.6em"}, {opacity:1, letterSpacing:"0.28em", duration:0.8, ease:"power3.out"}, 0.1);`);
   tw.push(`tl.fromTo(".im", {rotation:-160, scale:0.6, opacity:0}, {rotation:0, scale:1, opacity:1, duration:1.0, ease:"power3.out"}, 0.0);`);
   tw.push(`tl.fromTo(".it", {opacity:0, y:50}, {opacity:1, y:0, duration:0.55, stagger:0.1, ease:"power3.out"}, 0.45);`);
   tw.push(`tl.fromTo(".il", {scaleX:0}, {scaleX:1, duration:0.6, ease:"power3.inOut"}, 0.9);`);
   tw.push(`tl.fromTo(".is", {opacity:0, y:16}, {opacity:1, y:0, duration:0.45, ease:"power3.out"}, 1.15);`);
+}
+if (PART === "full" || PART === "end") {
   tw.push(`tl.fromTo(".em", {rotation:-200, scale:0.5}, {rotation:0, scale:1, duration:1.2, ease:"power3.out"}, ${f(t)});`);
   tw.push(`tl.fromTo(".et", {opacity:0, y:20}, {opacity:1, y:0, duration:0.5, stagger:0.14, ease:"power3.out"}, ${f(t + 0.5)});`);
 }

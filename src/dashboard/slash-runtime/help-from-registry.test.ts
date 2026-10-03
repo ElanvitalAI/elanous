@@ -1,4 +1,7 @@
-import { expect, test } from 'bun:test';
+import { afterEach, expect, test } from 'bun:test';
+import { SLASH_COMMANDS } from '../../chat/index.js';
+import { FEATURE_MATURITY } from '../../maturity/feature-maturity.js';
+import { setUserConfigOverlay } from '../../user-config.js';
 import { buildEssentialHelpLines } from './help-from-registry.js';
 
 const descriptions = [
@@ -9,6 +12,59 @@ const descriptions = [
   { name: 'bordered', description: '┌│╭╰ bordered description' },
   { name: 'odd│name', description: 'Should not become a different slash' },
 ];
+
+afterEach(() => setUserConfigOverlay(null));
+
+test('MAT1c default help audience reads tui config', () => {
+  const names = ['help', 'research', 'debug', 'directive'];
+  const descriptions = SLASH_COMMANDS.filter(({ name }) => names.includes(name));
+  setUserConfigOverlay((config) => ({ ...config, raw: { ...config.raw, tui: { role: 'general', showBeta: true } } }));
+  const lines = buildEssentialHelpLines({ names, descriptions, width: 80 }).join('\n');
+  expect(lines).toContain('/help');
+  expect(lines).toContain('/research');
+  expect(lines).not.toContain('/debug');
+  expect(lines).not.toContain('/directive');
+});
+
+test('MAT1c registered ungraded command appears for owner but not general or contributor', () => {
+  const input = {
+    names: ['ghost'],
+    descriptions: [{ name: 'ghost', description: 'External registered slash' }],
+    width: 80,
+  };
+  for (const role of ['general', 'contributor'] as const) {
+    setUserConfigOverlay((config) => ({ ...config, raw: { ...config.raw, tui: { role } } }));
+    expect(buildEssentialHelpLines(input).join('\n')).not.toContain('/ghost');
+  }
+  expect(buildEssentialHelpLines({ ...input, audience: { role: 'owner', showBeta: false } }))
+    .toContain('/ghost  External registered slash');
+});
+
+test('MAT1c help defaults to owner and filters the same grades for general and contributor', () => {
+  const names = SLASH_COMMANDS.map(({ name }) => name);
+  const descriptions = SLASH_COMMANDS;
+  const render = (audience?: { role: 'owner' | 'contributor' | 'general'; showBeta: boolean }) =>
+    buildEssentialHelpLines({ names, descriptions, width: 110, audience }).join('\n');
+  const listed = (text: string) => SLASH_COMMANDS.filter(({ name }) => new RegExp(`(?:^|\\s)/${name}(?:\\s|\\()`).test(text)).map(({ name }) => name);
+  const owner = render();
+  expect(listed(owner)).toEqual(names);
+  const general = render({ role: 'general', showBeta: false });
+  expect(listed(general)).toEqual(names.filter((name) => FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash] === 'stable'));
+  expect(general).toContain('/help');
+  expect(general).not.toContain('/research');
+  expect(general).not.toContain('/debug');
+  expect(general).not.toContain('/directive');
+  const beta = render({ role: 'general', showBeta: true });
+  expect(listed(beta)).toEqual(names.filter((name) => ['stable', 'beta'].includes(FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash])));
+  expect(beta).toContain('/research');
+  expect(beta).not.toContain('/debug');
+  expect(beta).not.toContain('/directive');
+  const contributor = render({ role: 'contributor', showBeta: false });
+  expect(listed(contributor)).toEqual(names.filter((name) => FEATURE_MATURITY.tuiSlash[name as keyof typeof FEATURE_MATURITY.tuiSlash] !== 'ops'));
+  expect(contributor).toContain('/research');
+  expect(contributor).toContain('/debug');
+  expect(contributor).not.toContain('/directive');
+});
 
 test('lists only registered, described commands in name order and essential keys without borders', () => {
   const names = ['session', 'help', 'model'];
@@ -25,7 +81,7 @@ test('lists only registered, described commands in name order and essential keys
   ]);
   expect(lines.join('\n')).not.toMatch(/[│╭╰┌┐└┘─]/);
 
-  const withGhost = buildEssentialHelpLines({ names: [...names, 'ghost'], descriptions, width: 80 });
+  const withGhost = buildEssentialHelpLines({ names: [...names, 'ghost'], descriptions, width: 80, audience: { role: 'owner', showBeta: false } });
   expect(withGhost).toContain('/ghost  A description alone must not create a command');
   expect(withGhost.join('\n')).not.toMatch(/[│╭╰┌┐└┘─]/);
 
@@ -58,6 +114,49 @@ test('never truncates a slash name into an unregistered command', () => {
     width: 5,
   });
   expect(lines.filter((line) => line.startsWith('/'))).toEqual([]);
+});
+
+test('groups registered aliases under their primary name once, alphabetically', () => {
+  const commands = [
+    { name: 'quit', aliases: ['q', 'exit'], description: 'Leave' },
+    { name: 'model', aliases: ['m'], description: 'Switch active model' },
+  ];
+  const lines = buildEssentialHelpLines({
+    names: ['exit', 'model', 'q', 'm', 'quit', 'model'], descriptions: commands, width: 80,
+  });
+  expect(lines.slice(1, lines.indexOf(''))).toEqual([
+    '/model (m)  Switch active model', '/quit (q, exit)  Leave',
+  ]);
+  expect(lines.join('\n')).not.toContain('/m  ');
+  expect(lines.join('\n')).not.toContain('/exit  ');
+  expect(buildEssentialHelpLines({ names: ['quit', 'q'], descriptions: commands, width: 80 })[1]).toBe('/quit (q)  Leave');
+});
+
+test('strips leading internal markers only in rendered descriptions', () => {
+  const marked = ['H6 P4 · Agent room', 'H5 P3: cross-agent handoff', 'CV-12 — Show flows',
+    'Sprint 7   Build flows', 'Showroom v2 — multi-LLM lanes'];
+  const descriptions = marked.map((description, index) => ({ name: `item${index}`, description }));
+  const lines = buildEssentialHelpLines({ names: descriptions.map(({ name }) => name), descriptions, width: 80 });
+  expect(lines.slice(1, lines.indexOf(''))).toEqual([
+    '/item0  Agent room', '/item1  cross-agent handoff', '/item2  Show flows',
+    '/item3  Build flows', '/item4  multi-LLM lanes',
+  ]);
+  expect(descriptions.map(({ description }) => description)).toEqual(marked);
+});
+
+test('at the 160-column modal content width a long registered label among 60 commands retains 28 description characters', () => {
+  const text = 'The first twenty eight letters of this long command description continue beyond the row';
+  const commands: Array<{ name: string; aliases?: string[]; description: string }> =
+    Array.from({ length: 59 }, (_, index) => ({ name: `item${index}`, description: text }));
+  commands.push({ name: 'long-command-label', aliases: ['alternate'], description: text });
+  const lines = buildEssentialHelpLines({ names: commands.flatMap(({ name, aliases }) => [name, ...(aliases ?? [])]), descriptions: commands, width: 160 });
+  const commandText = lines.slice(1, lines.indexOf('')).join('\n');
+  for (const { name, aliases } of commands) {
+    const label = `/${name}${aliases?.length ? ` (${aliases.join(', ')})` : ''}`;
+    expect(commandText).toContain(`${label}  ${text.slice(0, 28)}`);
+  }
+  expect(lines.every((line) => Bun.stringWidth(line) <= 160)).toBe(true);
+  expect(commandText).toContain('…');
 });
 
 test('truncates long descriptions to terminal columns without splitting a grapheme', () => {

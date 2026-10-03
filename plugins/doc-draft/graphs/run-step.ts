@@ -80,17 +80,24 @@ try {
   if (!topic) throw new Error('topic is required');
   const step = process.argv[2] ?? '';
   if (step === 'draft') {
-    const prompt = `Write ONE ${kind} document in ${text(input.language) || 'ko'} for ${text(input.audience) || 'the intended reader'}. Request: ${topic}. Context (source material, not a claim to invent): ${text(input.context) || '(none)'}. Return Markdown only: one # title line and a substantive body of 15–${limits[typedKind]} whitespace-separated words. Cover every item in the request. ${kind === 'exec-onepager' ? 'Include exactly these four ## sections with substantive content: 요약, 핵심 숫자, 결정 요청, 다음 단계. For unknown numeric figures write “자료 미제공 — 확인 필요” under 핵심 숫자, rather than inventing numbers.' : ''} No empty placeholders or fabricated facts. This is a DRAFT only: never claim it was published, sent, paid for, or approved; do not perform those actions.`;
+    const previousReason = text(object(outputs.check).reason);
+    const previousDraft = text(object(outputs.draft).markdown);
+    const prompt = `Write ONE ${kind} document in ${text(input.language) || 'ko'} for ${text(input.audience) || 'the intended reader'}. Request: ${topic}. Context (source material, not a claim to invent): ${text(input.context) || '(none)'}. Return Markdown only: one # title line and a substantive body of 15–${limits[typedKind]} whitespace-separated words. Cover every item in the request. ${kind === 'exec-onepager' ? 'Include exactly these four ## sections with substantive content: 요약, 핵심 숫자, 결정 요청, 다음 단계. For unknown numeric figures write “자료 미제공 — 확인 필요” under 핵심 숫자, rather than inventing numbers.' : ''} No empty placeholders or fabricated facts. This is a DRAFT only: never claim it was published, sent, paid for, or approved; do not perform those actions.${previousReason ? ` The previous draft failed check for this reason — fix it and rewrite: ${previousReason}. Previous draft: ${previousDraft}` : ''}`;
     const markdown = await ask(prompt);
     console.log(JSON.stringify({ outcome: 'ok', markdown }));
   } else if (step === 'check') {
     const markdown = text(object(outputs.draft).markdown);
     const error = validate(markdown, typedKind);
-    if (error) throw new Error(error);
-    const response = await ask(`Review this draft against the original request. Check length, empty fields, missing requested items, and invented claims (including claims it was published, sent, paid for, or approved). Request: ${topic}. Context: ${text(input.context) || '(none)'}. Draft: ${markdown}. Return ONLY JSON {"ok":true|false,"reason":"..."}. Set ok=false for any missing request item or unverifiable factual claim. A clearly labelled missing number is allowed; do not invent facts.`);
-    const verdict = object(JSON.parse(response.replace(/^```(?:json)?\s*|\s*```$/gi, '').trim()) as unknown);
-    if (verdict.ok !== true) throw new Error(text(verdict.reason) || 'draft review failed');
-    console.log(JSON.stringify({ outcome: 'ok', markdown, words: wordCount(markdown) }));
+    let reason = error;
+    if (!reason) {
+      const response = await ask(`Review this draft against the original request. Check length, empty fields, missing requested items, and invented claims (including claims it was published, sent, paid for, or approved). Request: ${topic}. Context: ${text(input.context) || '(none)'}. Draft: ${markdown}. Return ONLY JSON {"ok":true|false,"reason":"..."}. Set ok=false for any missing request item or unverifiable factual claim. A clearly labelled missing number is allowed; do not invent facts.`);
+      const verdict = object(JSON.parse(response.replace(/^```(?:json)?\s*|\s*```$/gi, '').trim()) as unknown);
+      if (verdict.ok !== true) reason = text(verdict.reason) || 'draft review failed';
+    }
+    if (reason) {
+      const outcome = object(outputs.check).outcome === 'revise' ? 'fail' : 'revise';
+      console.log(JSON.stringify({ outcome, reason, ...(outcome === 'fail' ? { error: reason } : {}) }));
+    } else console.log(JSON.stringify({ outcome: 'ok', markdown, words: wordCount(markdown) }));
   } else if (step === 'report') {
     const checked = object(outputs.check);
     if (checked.outcome !== 'ok') throw new Error('missing checked draft');

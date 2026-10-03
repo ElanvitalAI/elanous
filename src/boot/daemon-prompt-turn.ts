@@ -107,6 +107,8 @@ export async function runDaemonPromptTurn(opts: {
   surfaceResolutionReason?: SurfaceKindResolutionReason;
   /** Optional confirm channels for the triggering chat surface. */
   surfaceHitlChannels?: ConfirmChannel[];
+  /** Server-authenticated human owner for this request; absent for delegated or unverified callers. */
+  verifiedOwner?: { id: string };
   /** Optional structured-question channels for the triggering chat surface. */
   surfaceQuestionChannels?: QuestionChannel[];
   /** CWD for fs-bound tool dispatch (Read / Grep). Defaults to
@@ -226,6 +228,7 @@ export async function runDaemonPromptTurn(opts: {
             ...(request.source?.kind === 'daemon-api' && request.source.route === '/a2a'
               ? { requestOrigin: 'external-agent' as const } : {}),
             ...(request.userText ? { userText: request.userText } : {}),
+            ...(opts.verifiedOwner ? { verifiedOwner: opts.verifiedOwner } : {}),
             ...(opts.surface !== undefined || sourceResolution.surface !== 'unknown' ? { surface } : {}),
             ...(opts.surfaceHitlChannels ? { surfaceHitlChannels: opts.surfaceHitlChannels } : {}),
             ...(opts.surfaceQuestionChannels ? { surfaceQuestionChannels: opts.surfaceQuestionChannels } : {}),

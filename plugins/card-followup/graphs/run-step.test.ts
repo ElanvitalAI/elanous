@@ -1,4 +1,5 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
+import { askWithRetry } from './run-step.js';
 import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { homedir, tmpdir } from 'node:os';
@@ -49,6 +50,112 @@ const n=fs.readFileSync(counter,'utf8').length;
 process.stdout.write(JSON.stringify({reply:JSON.stringify(drafts[Math.min(n,drafts.length)-1])})+'\\n');
 `);
 }
+
+test('ask retries one socket failure, waits 3 seconds and returns the second answer without logging the card', async () => {
+  const calls: string[][] = [];
+  const waits: number[] = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const payload = { task: 'draft', card: { name: 'private card name' } };
+    const answer = await askWithRetry(payload, async (_bin, args) => {
+      calls.push(args);
+      if (calls.length === 1) throw new Error('ask 실패: The socket connection was closed unexpectedly');
+      return JSON.stringify({ reply: '{"subject":"ok"}' });
+    }, async ms => { waits.push(ms); });
+    expect(answer).toEqual({ subject: 'ok' });
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toEqual(['ask', '--json', JSON.stringify(payload)]);
+    expect(calls[1]).toEqual(calls[0]);
+    expect(waits).toEqual([3000]);
+    expect(log).toHaveBeenCalledWith('card-followup: ask retry (socket)');
+    expect(log.mock.calls.flat().join(' ')).not.toContain('private card name');
+  } finally { log.mockRestore(); }
+});
+
+test('ask fails after exactly one retry even when the second socket failure persists', async () => {
+  let calls = 0;
+  const waits: number[] = [];
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    await expect(askWithRetry({}, async () => {
+      calls++;
+      throw new Error('ask 실패: socket connection was closed unexpectedly');
+    }, async ms => { waits.push(ms); })).rejects.toThrow('한 번 다시 했지만 실패');
+    expect(calls).toBe(2);
+    expect(waits).toEqual([3000]);
+    expect(log).toHaveBeenCalledTimes(1);
+  } finally { log.mockRestore(); }
+});
+
+test('ask does not retry non-transient execution failures or JSON parsing failures', async () => {
+  for (const response of [new Error('invalid JSON'), '{invalid JSON']) {
+    let calls = 0;
+    let waits = 0;
+    await expect(askWithRetry({}, async () => {
+      calls++;
+      if (response instanceof Error) throw response;
+      return response;
+    }, async () => { waits++; })).rejects.toThrow();
+    expect(calls).toBe(1);
+    expect(waits).toBe(0);
+  }
+});
+
+test('ask inspects the complete CLI stderr after a truncated exit message', async () => {
+  let calls = 0;
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    expect(await askWithRetry({}, async () => {
+      calls++;
+      if (calls === 1) throw new Error(`ask 실패: ${'x'.repeat(200)}`, { cause: 'stderr: HTTP 503 Service Unavailable' });
+      return JSON.stringify({ reply: '{}' });
+    }, async () => {})).toEqual({});
+    expect(calls).toBe(2);
+    expect(log).toHaveBeenCalledWith('card-followup: ask retry (HTTP503)');
+  } finally { log.mockRestore(); }
+});
+
+test('ask reports a second malformed answer after the one transport retry', async () => {
+  let calls = 0;
+  const log = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    await expect(askWithRetry({}, async () => {
+      calls++;
+      if (calls === 1) throw new Error('ECONNRESET');
+      return '{invalid JSON';
+    }, async () => {})).rejects.toThrow('한 번 다시 했지만 실패');
+    expect(calls).toBe(2);
+  } finally { log.mockRestore(); }
+});
+
+test('ask succeeds on the first call without waiting', async () => {
+  let calls = 0;
+  let waits = 0;
+  expect(await askWithRetry({}, async () => {
+    calls++;
+    return JSON.stringify({ reply: '{"subject":"ok"}' });
+  }, async () => { waits++; })).toEqual({ subject: 'ok' });
+  expect(calls).toBe(1);
+  expect(waits).toBe(0);
+});
+
+test('only documented transport and HTTP statuses trigger one retry', async () => {
+  for (const message of ['ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'fetch failed', 'HTTP 502', 'HTTP 503', 'HTTP 504', 'HTTP 429']) {
+    let calls = 0;
+    let waits = 0;
+    const log = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await askWithRetry({}, async () => {
+        calls++;
+        if (calls === 1) throw new Error(`ask 실패: ${message}`);
+        return JSON.stringify({ reply: '{}' });
+      }, async () => { waits++; });
+      expect(calls, message).toBe(2);
+      expect(waits, message).toBe(1);
+      expect(log).toHaveBeenCalledTimes(1);
+    } finally { log.mockRestore(); }
+  }
+});
 
 test('counterexamples reject bad input and preserve only sourced facts', () => {
   const temp = mkdtempSync(join(tmpdir(), 'card-counter-'));

@@ -15,11 +15,14 @@
 //
 // ⭐ 네트워크를 «안» 탄다 — 가짜 감시자(argv 만 감시자 모양) ⊕ 가짜 조회 자식(`exec -a`)으로
 //    프로세스 «모양»만 세운다. GitHub 도 잠금도 안 건드린다(TMPDIR 격리).
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const SCRIPT = 'scripts/coord-channel-watch.sh';
 // ⛔ 실물 채널(#8328)과 «다른» 번호 — 이 테스트가 사람의 감시자를 보거나 건드리면 안 된다.

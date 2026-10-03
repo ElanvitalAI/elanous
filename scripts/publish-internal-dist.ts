@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { spawnSyncText } from '../src/util/spawn-sync-output.js';
 
@@ -74,10 +74,20 @@ export function publishInternalDist(checkout: string, out: string, keep = 3): { 
     } else {
       renameSync(staging, target);
     }
+    const alias = join(download, `v${pkg.version}`);
+    try {
+      if (!lstatSync(alias).isSymbolicLink()) throw new Error(`version alias is not a symlink: ${alias}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
     mkdirSync(join(out, 'latest'), { recursive: true });
     link = join(out, 'latest', `.download-${process.pid}-${Date.now()}`);
     symlinkSync(`../download/${name}`, link, 'dir');
     renameSync(link, join(out, 'latest', 'download'));
+    link = undefined;
+    link = join(download, `.alias-${process.pid}-${Date.now()}`);
+    symlinkSync(name, link, 'dir');
+    renameSync(link, alias);
     link = undefined;
     const versions = readdirSync(download, { withFileTypes: true })
       .filter((entry) => entry.isDirectory() && /^v[0-9A-Za-z][0-9A-Za-z._-]*-[0-9a-f]{12}$/.test(entry.name))

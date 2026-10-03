@@ -20,6 +20,6 @@ export function renderTreeSyncAlert(tree: string, streak: number, decision: stri
 
 if (import.meta.main) {
   const [tree = '', streak = '0', decision = ''] = process.argv.slice(2);
-  const ok = sendOutbound(renderTreeSyncAlert(tree, Number(streak) || 0, decision), 'alert');
+  const ok = sendOutbound(renderTreeSyncAlert(tree, Number(streak) || 0, decision), 'ops-alert');
   process.exit(ok ? 0 : 1);
 }

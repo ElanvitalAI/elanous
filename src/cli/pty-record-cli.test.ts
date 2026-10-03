@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -7,6 +7,9 @@ import { tmpdir } from 'node:os';
 import type { PreviewTerminal } from '../preview/terminal.js';
 import type { AcpServerHandle } from '../acp/server.js';
 import { registerPtyRecordCommand, runPtyRecord, type PtyRecordDeps } from './pty-record-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function deps(): PtyRecordDeps & { calls: string[] } {
   const calls: string[] = [];

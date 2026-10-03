@@ -202,6 +202,8 @@ export interface SessionMeta {
    *  아님). ~/.elanous 공유 스토어 세션은 전부 'prod'. append 는 이 값을 보존(생성자 귀속).
    *  구 세션엔 부재(tolerant read) — 미상 = 필터 비매치. */
   originInstance?: string;
+  /** Project association, omitted for sessions without an assigned project (including legacy records). */
+  projectId?: string;
   /** For telegram-sourced sessions; undefined for cli. */
   tgChatId?: number;
   tgThreadId?: number;
@@ -383,6 +385,7 @@ export interface CreateSessionOpts {
   tgBotId?: string;
   /** Stable identity for a persona's resident conversation. */
   personaId?: string;
+  projectId?: string;
   title?: string;
   /** 표면 origin(cli/pwa/tg/dc/harness) — source 유니온 밖의 세밀 라벨(PWA 챗 구분용). */
   origin?: string;
@@ -534,6 +537,7 @@ export function createSession(opts: CreateSessionOpts = {}, root: string = sessi
     tgThreadId: opts.tgThreadId,
     ...(opts.tgBotId ? { tgBotId: opts.tgBotId } : {}),
     ...(opts.personaId ? { personaId: opts.personaId } : {}),
+    ...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
     tgSessionKey,
   };
   writeFileSync(sessionFile(id, root), '', 'utf-8');
@@ -575,6 +579,7 @@ export function adoptSession(id: string, opts: CreateSessionOpts = {}, root: str
     sourceKind: opts.sourceKind ?? defaultSessionSourceKind(source),
     ...(opts.forkedFromId ? { forkedFromId: opts.forkedFromId } : {}),
     ...(origin ? { origin } : {}),
+    ...(opts.projectId !== undefined ? { projectId: opts.projectId } : {}),
     originInstance: resolveInstanceName(),
     ...(opts.tgChatId != null ? { tgChatId: opts.tgChatId } : {}),
     ...(opts.tgThreadId != null ? { tgThreadId: opts.tgThreadId } : {}),
@@ -601,6 +606,7 @@ export function forkSessionFromHistory(
     tgThreadId: opts.tgThreadId,
     title: opts.title,
     origin: opts.origin,
+    projectId: opts.projectId,
   }, root);
   for (const msg of opts.messages) {
     const content = typeof msg.content === 'string' ? msg.content : '';
@@ -738,6 +744,8 @@ export interface ListSessionsOpts {
   tgThreadId?: number;
   /** 생성 인스턴스 정확 일치(prod · test:<repo> …). 구 세션(부재)은 비매치. */
   originInstance?: string;
+  /** Project id exact match; sessions without the field do not match. */
+  projectId?: string;
   /** 표면 origin 정확 일치(cli | pwa | tg | dc | harness). */
   origin?: string;
   /** 제외할 origin(들) — 예: ['harness'] 로 하니스 자식 세션을 사용자 대화 목록에서 숨김. */
@@ -774,6 +782,7 @@ export function listSessions(opts: ListSessionsOpts = {}, root: string = session
     idx = idx.filter(m => !m.sourceKind || !opts.excludeSourceKinds!.includes(m.sourceKind));
   }
   if (opts.originInstance) idx = idx.filter(m => m.originInstance === opts.originInstance);
+  if (opts.projectId !== undefined) idx = idx.filter(m => m.projectId === opts.projectId);
   if (opts.origin) idx = idx.filter(m => m.origin === opts.origin);
   if (opts.excludeOrigins && opts.excludeOrigins.length > 0) {
     idx = idx.filter((m) => {

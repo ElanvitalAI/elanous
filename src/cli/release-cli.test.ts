@@ -4,6 +4,8 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { listChecklist, devVersion } from '../release-loop/checklist.js';
+import { CliUserError } from './cli-user-error.js';
+import { getSchedule, setSchedule } from '../release-loop/release-schedule.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
@@ -58,7 +60,7 @@ describe('release checklist CLI', () => {
       expect(listChecklist('9.9.9').items).toHaveLength(0);
       const cmd = new Command(); registerReleaseCommands(cmd);
       const release = cmd.commands.find((c) => c.name() === 'release')!;
-      expect(release.commands.map((c) => c.name())).toEqual(['checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'run']);
+      expect(release.commands.map((c) => c.name())).toEqual(['schedule', 'checklist', 'prepare', 'yank', 'publish', 'tag', 'verify', 'notes', 'run']);
       expect(release.commands.find((c) => c.name() === 'prepare')!.helpInformation()).toContain('네트워크 쓰기 없음');
       expect(release.commands.find((c) => c.name() === 'publish')!.helpInformation()).toContain('--notes-file <file>');
       expect(release.commands.find((c) => c.name() === 'verify')!.helpInformation()).toContain('--public-repo <owner/name>');
@@ -67,6 +69,49 @@ describe('release checklist CLI', () => {
       jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
       if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
     }
+  });
+
+  test('owner 필터는 자리와 하위 자리 경계를 지키고 claim CLI 의 강제 이력이 JSON 에 보인다', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-claim-cli-'));
+    setElanousConfigDir(dir);
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const jsonOutput = spyOn(process.stdout, 'write').mockImplementation(((chunk: string, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => { lines.push(String(chunk).trim()); (typeof encodingOrCallback === 'function' ? encodingOrCallback : callback)?.(); return true; }) as typeof process.stdout.write);
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'checklist', '--version', '9.9.9', ...args], { from: 'user' }); };
+    try {
+      await run('add', 'A', 'release', '--owner', 'TC/rel');
+      await run('add', 'B', 'parent', '--owner', 'TC');
+      await run('add', 'C', 'marketing', '--owner', 'MK');
+      for (const invalid of ['tc/Rel', 'TC/', 'T']) {
+        await expect(run('add', `bad-${invalid}`, 'bad', '--owner', invalid)).rejects.toBeInstanceOf(CliUserError);
+        await expect(run('set', 'A', '--owner', invalid)).rejects.toBeInstanceOf(CliUserError);
+      }
+      expect(listChecklist('9.9.9').items).toHaveLength(3);
+      for (const mode of ['list', 'status']) {
+        await run(mode, '--owner', 'TC', '--json');
+        expect(JSON.parse(lines.at(-1)!)).toMatchObject({ items: [{ id: 'A' }, { id: 'B' }], byOwner: { 'TC/rel': 1, TC: 1 }, bySeat: { TC: 2 }, yellow: 2 });
+        await run(mode, '--owner', 'TC/rel', '--json');
+        expect(JSON.parse(lines.at(-1)!)).toMatchObject({ items: [{ id: 'A' }], bySeat: { TC: 1 }, yellow: 1 });
+      }
+      await run('status', '--json');
+      expect(JSON.parse(lines.at(-1)!).bySeat).toEqual({ TC: 2, MK: 1 });
+      await run('claim', 'B', '--by', 'TC/rel', '--json');
+      expect(JSON.parse(lines.at(-1)!).history.at(-1)).toMatchObject({ field: 'claim', from: 'TC', to: 'TC/rel' });
+      await expect(run('claim', 'A', '--by', 'TC/docs')).rejects.toThrow('지금 주인: TC/rel — --force 로만 바꾼다');
+      await run('claim', 'C', '--by', 'TC/docs', '--force', '--json');
+      expect(JSON.parse(lines.at(-1)!).history.at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/docs', force: true });
+      await run('history', 'C', '--json');
+      expect(JSON.parse(lines.at(-1)!).at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/docs', force: true });
+      await run('set', 'C', '--evidence', 'proof', '--json');
+      expect(JSON.parse(lines.at(-1)!).history.find((entry: { field: string; id: string }) => entry.field === 'claim' && entry.id === 'C')).toMatchObject({ to: 'TC/docs', force: true });
+      await run('status', '--json');
+      expect(JSON.parse(lines.at(-1)!).history.find((entry: { field: string; id: string }) => entry.field === 'claim' && entry.id === 'C')).toMatchObject({ to: 'TC/docs', force: true });
+      await run('evidence', 'add', 'C', '#claim', '--json');
+      expect(JSON.parse(lines.at(-1)!).find((entry: { field: string }) => entry.field === 'claim')).toMatchObject({ to: 'TC/docs', force: true });
+      await run('export', '--json');
+      expect(JSON.parse(lines.at(-1)!).history.find((entry: { field: string; id: string }) => entry.field === 'claim' && entry.id === 'C')).toMatchObject({ to: 'TC/docs', force: true });
+      expect(listChecklist('9.9.9').items.find((item) => item.id === 'C')?.owner).toBe('TC/docs');
+    } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('move · retitle · evidence add · history · export CLI 가 SQLite 기록과 JSON 스냅샷을 만든다', async () => {
@@ -85,7 +130,7 @@ describe('release checklist CLI', () => {
       const rows = JSON.parse(lines.at(-1)!);
       expect(rows.map((row: { field: string }) => row.field)).toEqual(['add', 'status', 'title', 'evidence.add', 'move']);
       expect(rows.at(-1)).toMatchObject({ version: '0.2.10', from: '0.2.9', to: '0.2.10' });
-      await run('set', 'L13e', '--version', '0.2.10', '--owner', 'TC');
+      await run('claim', 'L13e', '--version', '0.2.10', '--by', 'TC');
       lines.length = 0;
       await run('history', 'L13e');
       expect(lines[0]).toMatch(/^L13e · 새 제목 · 담당 TC · 종류 - · 처음 \S+$/);
@@ -133,6 +178,34 @@ describe('release checklist CLI', () => {
       await run('status', '--version', 'graph');
       expect(lines.at(-4)).toContain('0.2.5 (graph)');
     } finally { jsonOutput.mockRestore(); output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
+describe('release schedule CLI', () => {
+  test('set/show/list KST 와 JSON UTC · 재설정 · 오프셋 없는 시각 오류', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-schedule-cli-'));
+    setElanousConfigDir(dir);
+    const oldTrack = process.env.ELANOUS_TRACK;
+    process.env.ELANOUS_TRACK = 'OP';
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const run = async (...args: string[]) => { const cmd = new Command(); registerReleaseCommands(cmd); await cmd.parseAsync(['release', 'schedule', ...args], { from: 'user' }); };
+    try {
+      await run('set', '--version', '0.2.10', '--cut-at', '2026-10-03T08:00+09:00', '--land-by', '2026-10-03T06:30+09:00');
+      expect(lines.at(-1)).toBe('0.2.10 컷 10-03(토) 08:00 KST · 착지 마감 06:30');
+      await run('show', '--version', '0.2.10');
+      expect(lines.at(-1)).toBe(lines.at(-2));
+      await run('show', '--version', '0.2.10', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version: '0.2.10', cutAt: '2026-10-02T23:00:00.000Z', landBy: '2026-10-02T21:30:00.000Z', updatedBy: 'OP' });
+      await run('list', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toHaveLength(1);
+      await run('set', '--version', '0.2.10', '--cut-at', '2026-10-03T09:00+09:00');
+      expect(lines.at(-1)).toBe('0.2.10 컷 10-03(토) 09:00 KST · 착지 마감 06:30');
+      await expect(run('set', '--version', '0.2.10', '--cut-at', '2026-10-03T08:00')).rejects.toThrow('오프셋 필요');
+    } finally {
+      output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+      if (oldTrack === undefined) delete process.env.ELANOUS_TRACK; else process.env.ELANOUS_TRACK = oldTrack;
+    }
   });
 });
 
@@ -222,6 +295,68 @@ describe('release run CLI', () => {
       expect(JSON.parse(lines[0]!.split(' · 입력 ')[1]!)).toEqual({ version: '0.2.4', previousVersion: '0.2.3', gatePodPool: 'pool', gateRemote: 'node-b' });
       expect(process.exitCode ?? 0).toBe(0);
     } finally { process.exitCode = before ?? 0; output.mockRestore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('schedule CLI and --if-ready use the injected run ledger even when the default ledger differs', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-schedule-run-ledger-'));
+    const globalLedger = join(dir, 'global');
+    const runLedger = join(dir, 'run');
+    setElanousConfigDir(globalLedger);
+    const version = '0.2.10';
+    const cutAt = '2099-10-03T08:00+09:00';
+    const lines: string[] = [];
+    const output = spyOn(console, 'log').mockImplementation((line: string) => { lines.push(line); });
+    const before = process.exitCode;
+    let checklistCalls = 0;
+    let graphCalls = 0;
+    try {
+      setSchedule(version, { cutAt: '2000-10-03T08:00+09:00' }, 'global-only');
+      const cli = new Command();
+      registerReleaseCommands(cli, {
+        ledgerRoot: runLedger,
+        checklist: () => { checklistCalls++; throw new Error('gate ran before injected cut'); },
+        graph: async () => { graphCalls++; throw new Error('graph ran before injected cut'); },
+      });
+      const run = async (...args: string[]) => cli.parseAsync(['release', ...args], { from: 'user' });
+      await run('schedule', 'set', '--version', version, '--cut-at', cutAt);
+      expect(lines.at(-1)).toBe('0.2.10 컷 10-03(토) 08:00 KST');
+      await run('schedule', 'show', '--version', version, '--json');
+      expect(JSON.parse(lines.at(-1)!)).toMatchObject({ version, cutAt: '2099-10-02T23:00:00.000Z' });
+      await run('schedule', 'list', '--json');
+      expect(JSON.parse(lines.at(-1)!)).toHaveLength(1);
+      expect(JSON.parse(lines.at(-1)!)[0].cutAt).toBe('2099-10-02T23:00:00.000Z');
+      expect(existsSync(join(runLedger, 'release/features.sqlite'))).toBe(true);
+      expect(getSchedule(version)?.cutAt).toBe('2000-10-02T23:00:00.000Z');
+      expect(getSchedule(version, runLedger)?.cutAt).toBe('2099-10-02T23:00:00.000Z');
+      await run('run', '--version', version, '--if-ready');
+      expect(lines.at(-1)).toBe('· 준비 안 됨 0.2.10 · before-cut · before-cut (10-03(토) 08:00 KST)');
+      expect([checklistCalls, graphCalls]).toEqual([0, 0]);
+      expect(existsSync(join(runLedger, 'release', version, 'run.lock'))).toBe(false);
+      expect(process.exitCode ?? 0).toBe(0);
+    } finally {
+      process.exitCode = before ?? 0; output.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('--if-ready skips a scheduled pre-cut release without creating a lock or running the graph', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'release-run-cut-cli-'));
+    setElanousConfigDir(dir);
+    const output: string[] = [];
+    const write = spyOn(process.stdout, 'write').mockImplementation(((chunk: string, callback?: (error?: Error | null) => void) => { output.push(String(chunk)); callback?.(); return true; }) as typeof process.stdout.write);
+    const before = process.exitCode;
+    let graphCalls = 0;
+    try {
+      setSchedule('0.2.10', { cutAt: '2099-10-03T08:00+09:00' }, 'OP');
+      const cli = new Command(); registerReleaseCommands(cli, { ledgerRoot: dir,
+        checklist: () => { throw new Error('checklist before cut'); },
+        graph: async () => { graphCalls++; throw new Error('graph before cut'); } });
+      process.exitCode = 0;
+      await cli.parseAsync(['release', 'run', '--version', '0.2.10', '--if-ready', '--json'], { from: 'user' });
+      expect(JSON.parse(output[0]!)).toEqual({ skipped: true, reason: 'before-cut', detail: 'before-cut (10-03(토) 08:00 KST)' });
+      expect(graphCalls).toBe(0);
+      expect(existsSync(join(dir, 'release/0.2.10/run.lock'))).toBe(false);
+      expect(process.exitCode).toBe(0);
+    } finally { process.exitCode = before ?? 0; write.mockRestore(); resetElanousConfigDir(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   test('--if-ready skips a blocked checklist with exit 0 and one JSON line; plain run remains exit 1', async () => {

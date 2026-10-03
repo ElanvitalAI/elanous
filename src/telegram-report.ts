@@ -11,7 +11,7 @@
 // the report channel while interactive Q&A stays on the main bot.
 
 import { TelegramBot } from './telegram.js';
-import { kindRouteTarget } from './domains/telegram-kind-route.js';
+import { isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './domains/telegram-kind-route.js';
 export { DEFAULT_KIND_ROLES, roleForKind } from './domains/telegram-kind-route.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import type { UserConfig } from './user-config.js';
@@ -51,18 +51,24 @@ export interface ReportTarget {
   chatId: number;
 }
 
-/** Resolve the send target. With a purpose `kind` that maps to a role and explicit `telegram.channels`,
- *  the channel holding that role wins (fallback: the `default` channel). Otherwise the legacy report
- *  channel: `botToken` falls back to the main Q&A bot token when the report channel is served by the
- *  same bot. Returns null when nothing is configured. */
+/** Explicit role channels win. Without a role channel, operational kinds use the main bot's
+ *  home when the legacy report channel uses another bot; same-bot reports and trading kinds
+ *  keep the legacy report destination. Returns null when no safe target is configured. */
 export function resolveReportTarget(cfg: UserConfig, kind?: string): ReportTarget | null {
   const routed = kindRouteTarget(cfg, kind);
   if (routed) return routed;
   const rc = cfg.telegram.reportChannel;
-  if (!rc || !Number.isFinite(rc.chatId)) return null;
-  const botToken = rc.botToken ?? resolveChannelBotToken('telegram', cfg)?.token;
-  if (!botToken) return null;
-  return { botToken, chatId: rc.chatId };
+  const mainToken = resolveChannelBotToken('telegram', cfg).token;
+  const sameBot = !!mainToken && !!rc && (rc.botToken ?? mainToken) === mainToken;
+  if (isOperationalKind(kind) && !sameBot) {
+    const home = mainHomeTarget(cfg);
+    logKindRouteFallback(kind, home ? 'main-home' : 'none', sameBot);
+    return home;
+  }
+  const botToken = rc?.botToken ?? mainToken;
+  const target = rc && Number.isFinite(rc.chatId) && botToken ? { botToken, chatId: rc.chatId } : null;
+  logKindRouteFallback(kind, target ? 'report-channel' : 'none', sameBot);
+  return target;
 }
 
 export interface SendReportOpts {

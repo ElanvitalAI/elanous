@@ -1,10 +1,13 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, expect, test } from 'bun:test';
 import { chmodSync, closeSync, constants, existsSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dlopen, FFIType } from 'bun:ffi';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { issueIngestToken, listIngestTokens, matchIngestToken, revokeIngestToken } from './ingest-token.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // flock's library differs per platform (the store picks the same way — see LIBC_CANDIDATES).
 const LIBC = process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6';

@@ -1,7 +1,10 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
 import { chooseRung } from './tool-ladder.js';
 import type { EnvProfile } from './env-profile.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const root = join(import.meta.dir, '../..');
 const cli = join(root, 'bin/elanous.mjs');

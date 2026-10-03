@@ -13,7 +13,7 @@ export type PipelineNodeId =
 
 /** Each pipeline node's possible terminal stages. Nodes without a terminal exit use an empty array. */
 export const TERMINAL_STAGES_BY_NODE = {
-  implement: ['aborted', 'timed-out', 'soft-stopped'],
+  implement: ['aborted', 'timed-out', 'soft-stopped', 'parked'],
   gate: [],
   review: ['review-blocked'],
   rework: ['gate-failed', 'review-blocked'],

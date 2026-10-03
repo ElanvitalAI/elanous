@@ -74,15 +74,26 @@ function writeStore(dir: string, tokens: SetupLinkEntry[]): void {
 
 // A persistent inode and an OS advisory lock avoid stale owner files after an abrupt process exit.
 // Never unlink this file: a replacement inode would let two processes hold different locks.
-const libc = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
-  flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
-});
+// Loaded on first use, not at import: libc.so.6 does not exist on Windows and this module sits on the CLI start path (WIN2 10-02).
+type Flock = (fd: number, op: number) => number;
+let flockFn: Flock | null | undefined;
+function osFlock(): Flock | null {
+  if (flockFn !== undefined) return flockFn;
+  if (process.platform === 'win32') return (flockFn = null);
+  const lib = dlopen(process.platform === 'darwin' ? '/usr/lib/libSystem.B.dylib' : 'libc.so.6', {
+    flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+  });
+  return (flockFn = lib.symbols.flock as Flock);
+}
 const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
 
 function withLock<T>(dir: string, fn: () => T): T {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const flock = osFlock();
+  // Windows: no advisory flock and no POSIX modes — the store still writes by atomic rename.
+  if (!flock) return fn();
   const lock = `${storePath(dir)}.lock`;
   const fd = openSync(lock, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
   try {
@@ -92,7 +103,7 @@ function withLock<T>(dir: string, fn: () => T): T {
       throw new Error('setup link lock must be a private regular file (0600)');
     }
     const until = Date.now() + 3000;
-    while (libc.symbols.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+    while (flock(fd, LOCK_EX | LOCK_NB) !== 0) {
       if (Date.now() > until) throw new Error('setup link store is locked — try again');
       Bun.sleepSync(20);
     }
@@ -101,7 +112,7 @@ function withLock<T>(dir: string, fn: () => T): T {
       if (stat.ino !== locked.ino || stat.dev !== locked.dev) throw new Error('setup link lock changed');
       return fn();
     } finally {
-      libc.symbols.flock(fd, LOCK_UN);
+      flock(fd, LOCK_UN);
     }
   } finally {
     closeSync(fd);

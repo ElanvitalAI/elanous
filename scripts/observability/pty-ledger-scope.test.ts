@@ -5,7 +5,7 @@
 //   돌려주는지***는 원리상 못 답한다(이 저장소가 반복해 밟은 「배선은 안 재고 로직만 쟀다」).
 //   ⇒ 여기서는 진짜 디렉터리·진짜 sqlite manifest·진짜 권한 오류·진짜 자식 프로세스로 잰다.
 import { Database } from 'bun:sqlite';
-import { afterAll, describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, afterAll, describe, expect, it } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -14,6 +14,9 @@ import { UNPRIVILEGED_DROP_HINT, resolveUnprivilegedLauncher } from '../lib/unpr
 import { migratePtyManifestSchema } from '../../src/pty-shell/pty-manifest.js';
 import { measureRunLedgerGaps, type RunLedgerGapMeasurement, type RunLedgerGapRoot } from '../../src/self-implement/run-ledger.js';
 import { ledgerIdsAt, resolvePtyLedgerScopeTargets, runPtyLedgerScope, scanPtyLedgerScope, type LedgerEvidenceSummary, type PtyLedgerScopeLegacySummary } from './pty-ledger-scope.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = join(import.meta.dir, '..', '..');
 const temporaryRoots: string[] = [];

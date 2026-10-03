@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { addItem, checklistGate, listChecklist, setItem, summarizeChecklist } from '../../src/release-loop/checklist.js';
 import { resetElanousConfigDir, setElanousConfigDir } from '../../src/elanous-config-dir.js';
 import { runChecklistGate } from './checklist-gate-node.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repo = join(import.meta.dir, '../..');
 

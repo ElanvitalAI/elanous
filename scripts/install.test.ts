@@ -1,9 +1,12 @@
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, symlinkSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { basename, join, resolve } from 'node:path';
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = resolve(import.meta.dir, '..');
 const installer = resolve(import.meta.dir, 'install.sh');
@@ -27,11 +30,25 @@ function setup(dir = fixture()) {
   return { dir, home, prefix, startup };
 }
 
-function run(args: string[], env: ReturnType<typeof setup> = setup(), path = process.env.PATH ?? '', cwd = repoRoot, extra: Record<string, string> = {}) {
+const hostBunCache = process.env.BUN_INSTALL_CACHE_DIR ?? join(process.env.BUN_INSTALL ?? join(homedir(), '.bun'), 'install', 'cache');
+
+/** The host PATH minus any directory that already holds an `eln` — the installer (rightly) refuses to create its own
+ *  `eln` when another one is on PATH, so a developer machine with elanous installed would otherwise fail these tests. */
+function hostPathWithoutEln(path = process.env.PATH ?? ''): string {
+  // bun often lives next to an `eln` (`~/.bun/bin`), so dropping that directory would drop bun too — keep bun through a
+  // private shim directory that holds only a link to the running bun.
+  const shim = mkdtempSync(join(tmpdir(), 'elanous-install-bun-'));
+  symlinkSync(process.execPath, join(shim, 'bun'));
+  return [shim, ...path.split(':').filter((dir) => dir && !existsSync(join(dir, 'eln')))].join(':');
+}
+
+function run(args: string[], env: ReturnType<typeof setup> = setup(), path = hostPathWithoutEln(), cwd = repoRoot, extra: Record<string, string> = {}) {
   const result = spawnSync('/bin/bash', [installer, ...args], {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ELANOUS_INSTALL_LANG: 'en', ...extra },
+    // BUN_INSTALL points at the isolated home: install.sh prepends `${BUN_INSTALL}/bin`, and the host's (~/.bun) may hold an eln.
+    // The package cache stays the host's — the offline install path depends on it.
+    env: { ...process.env, HOME: env.home, XDG_CONFIG_HOME: join(env.home, '.config'), XDG_CACHE_HOME: join(env.home, '.cache'), BUN_INSTALL: join(env.home, '.bun'), BUN_INSTALL_CACHE_DIR: hostBunCache, ELANOUS_INSTALL_PREFIX: env.prefix, ELANOUS_SHELL_STARTUP: env.startup, PATH: path, ELANOUS_INSTALL_LANG: 'en', ...extra },
   });
   return { ...env, result };
 }
@@ -84,7 +101,7 @@ describe('scripts/install.sh', () => {
   test('--help names every supported argument', () => {
     const { result } = run(['--help']);
     expect(result.status).toBe(0);
-    for (const argument of ['--prefix', '--source', '--no-modify-path', '--no-bootstrap-bun', '--help']) expect(result.stdout).toContain(argument);
+    for (const argument of ['--prefix', '--source', '--no-modify-path', '--no-bootstrap-bun', '--no-install-deps', '--help']) expect(result.stdout).toContain(argument);
   });
 
   test('installs a working elanous and records nonempty metadata without leaving its isolated home', () => {
@@ -336,6 +353,79 @@ describe('scripts/install.sh', () => {
       expect(result.stderr.match(/required command missing/g)?.length).toBe(1);
       if (root) expect(result.stderr).not.toContain('sudo ');
     }
+  });
+
+  // The fake PATH contains no host apt/curl/unzip/git: only the stub can make prerequisites appear.
+  function aptPrerequisiteFixture(uid: number, release = 'ID=ubuntu\n', fail = false) {
+    const env = setup();
+    const path = join(env.dir, 'path');
+    mkdirSync(path);
+    const osRelease = join(env.dir, 'os-release');
+    writeFileSync(osRelease, release);
+    const calls = join(env.dir, 'apt-calls');
+    for (const [name, body] of [
+      ['uname', '#!/bin/sh\nprintf "Linux\\n"\n'],
+      ['id', `#!/bin/sh\nprintf '${uid}\\n'\n`],
+      ['apt-get', `#!/bin/sh\nprintf '%s\\n' "$*" >> '${calls}'\n${fail ? 'exit 100' : `for package in "$@"; do\n  case "$package" in curl|unzip|git) printf '#!/bin/sh\\nexit 0\\n' > '${path}/'"$package"; chmod +x '${path}/'"$package" ;; esac\ndone\n`}\n`],
+    ] as Array<[string, string]>) {
+      writeFileSync(join(path, name), body, { mode: 0o755 });
+    }
+    // A successful apt stub must be able to chmod newly created commands in the same PATH.
+    symlinkSync('/bin/chmod', join(path, 'chmod'));
+    const extra = { BUN_INSTALL: join(env.home, '.bun'), ELANOUS_INSTALL_OS_RELEASE_FILE: osRelease };
+    return { env, path, calls, extra };
+  }
+
+  test('root Debian apt installs the missing set once, rechecks it, and advances past the prerequisite gate', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(0);
+    const { result } = run(['--no-modify-path'], env, path, repoRoot, extra);
+    // Fresh images have empty package lists: one update, then one non-interactive install.
+    expect(readFileSync(calls, 'utf8')).toBe('update -qq\ninstall -y -qq curl unzip git\n');
+    expect(result.stderr).toContain('installed: curl unzip git');
+    // Past the prerequisite gate: later steps may still stop (the fake PATH has no real bun/bash), but never on curl/unzip/git.
+    expect(result.stderr).not.toMatch(/required command missing: [^\n]*\b(?:curl|unzip|git)\b/);
+  });
+
+  test('a non-root user never invokes apt even when it is present', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(1000);
+    const { result } = run([], env, path, repoRoot, extra);
+    expect(existsSync(calls)).toBe(false);
+    expect(result.status).toBe(127);
+    expect(result.stderr).toContain('   sudo apt-get install -y curl unzip git');
+  });
+
+  test('--no-install-deps disables apt for root without changing the existing hint', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(0);
+    const { result } = run(['--no-install-deps'], env, path, repoRoot, extra);
+    expect(existsSync(calls)).toBe(false);
+    expect(result.status).toBe(127);
+    expect(result.stderr).toContain('   apt-get install -y curl unzip git');
+  });
+
+  test('root with all prerequisites present does not invoke apt', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(0);
+    for (const name of ['bun', 'git']) writeFileSync(join(path, name), '#!/bin/sh\nexit 42\n', { mode: 0o755 });
+    const { result } = run(['--no-bootstrap-bun'], env, path, repoRoot, extra);
+    expect(existsSync(calls)).toBe(false);
+    expect(result.stderr).not.toContain('required command missing: git');
+  });
+
+  test('apt is not invoked for root on a non-Debian distribution', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(0, 'ID=alpine\n');
+    const { result } = run([], env, path, repoRoot, extra);
+    expect(existsSync(calls)).toBe(false);
+    expect(result.status).toBe(127);
+    expect(result.stderr).toContain("(install the 'curl unzip git' package with your package manager)");
+  });
+
+  test('apt failure stays rc 127 and names manual recovery with the existing hint', () => {
+    const { env, path, calls, extra } = aptPrerequisiteFixture(0, 'ID=ubuntu\n', true);
+    const { result } = run([], env, path, repoRoot, extra);
+    // The failing stub fails at update, so install is never attempted.
+    expect(readFileSync(calls, 'utf8')).toBe('update -qq\n');
+    expect(result.status).toBe(127);
+    expect(result.stderr).toContain('자동 설치 실패 — 아래를 직접 실행하라');
+    expect(result.stderr).toContain('   apt-get install -y curl unzip git');
   });
 
   test('bun bootstrap is pinned to the repository bun version (.bun-version)', () => {

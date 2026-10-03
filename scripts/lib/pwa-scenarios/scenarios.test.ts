@@ -4,7 +4,7 @@ import { runInNewContext } from 'node:vm';
 import { createScenarios, createScenariosWithReplay, selectScenarios, validateBaseUrl } from './scenarios.js';
 import { runScenarios, type PageDriver } from './runner.js';
 
-const ids = ['T1', 'T1b', 'T4a', 'T5', 'C1', 'C2a', 'C2b', 'N1', 'N5a', 'N6a'];
+const ids = ['T1', 'T1b', 'T4a', 'T5', 'T5b', 'C1', 'C2a', 'C2b', 'N1', 'N5a', 'N6a'];
 
 describe('PWA scenario data and port isolation', () => {
   test('C1 is costly, runs only when named, and its question never contains the expected answer', () => {
@@ -147,6 +147,54 @@ describe('PWA scenario data and port isolation', () => {
     const [paneRejected] = await runScenarios(driver, [{ ...t1b, steps: [], hostCheck: [{ ...check, timeoutMs: 0 }] }], 'http://127.0.0.1:31455');
     expect(paneRejected?.pass).toBe(false);
   });
+
+  test('T5b checks the xterm buffer on open and reload, then requires fresh live output', async () => {
+    const t5b = createScenarios().find((item) => item.id === 'T5b')!;
+    const markers = t5b.steps.filter((step) => step.kind === 'type').map((step) => step.text.slice(5));
+    expect(markers).toHaveLength(2);
+    expect(markers[0]).toMatch(/^ELANOUS_T5B_[0-9a-f]{16}$/);
+    expect(markers[1]).not.toBe(markers[0]);
+    expect(t5b.steps.filter((step) => step.kind === 'goto')).toHaveLength(2);
+    expect(t5b.steps.filter((step) => step.kind === 'press')).toEqual([{ kind: 'press', key: 'Enter' }, { kind: 'press', key: 'Enter' }]);
+    const lines = Array.from({ length: 50 }, () => '');
+    let opens = 0;
+    let viewportY = 0;
+    let mode: 'visible' | 'blank' | 'scrollback' | 'no-fresh' = 'visible';
+    const driver: PageDriver = {
+      goto: async () => { opens += 1; viewportY = mode === 'scrollback' && opens === 2 ? 20 : 0; }, click: async () => {},
+      insertText: async (text) => {
+        if (mode === 'blank' || (mode === 'no-fresh' && opens === 2)) return;
+        lines[opens === 1 ? 0 : viewportY + 1] = text;
+      },
+      press: async () => {},
+      evaluate: async (js) => js.includes('__reactFiber') ? true : runInNewContext(js, { document: {
+        querySelector: (css: string) => css === '[data-xterm-host]' ? {
+          getClientRects: () => [1],
+          __elanousTerm: { rows: 3, buffer: { active: {
+            viewportY, length: lines.length,
+            getLine: (row: number) => ({ translateToString: () => lines[row] ?? '' }),
+          } } },
+        } : (css === '.xterm' ? {} : null),
+        querySelectorAll: () => [{ textContent: 'ACP: 연결됨' }],
+      } }),
+      screenshot: async () => Buffer.from('png'), llmCallCursor: async () => 0,
+    };
+    const steps = t5b.steps.map((step) => step.kind === 'waitFor' && step.jsPredicate?.includes('__elanousTerm')
+      ? { ...step, timeoutMs: 0 } : step);
+    const [visible] = await runScenarios(driver, [{ ...t5b, steps }], 'http://127.0.0.1:31455');
+    expect(visible?.failure).toBeUndefined();
+    expect(visible?.pass).toBe(true);
+    mode = 'blank'; opens = 0; lines[0] = '';
+    const [blank] = await runScenarios(driver, [{ ...t5b, steps }], 'http://127.0.0.1:31455');
+    expect(blank?.failure).toContain('Step 7 (waitFor): timed out');
+    mode = 'scrollback'; opens = 0; lines[0] = '';
+    const [scrollbackOnly] = await runScenarios(driver, [{ ...t5b, steps }], 'http://127.0.0.1:31455');
+    expect(scrollbackOnly?.failure).toContain('Step 10 (waitFor): timed out');
+    expect(scrollbackOnly?.evidence.at(-1)).toContain('last=false');
+    mode = 'no-fresh'; opens = 0; lines[0] = ''; lines[1] = '';
+    const [noFreshOutput] = await runScenarios(driver, [{ ...t5b, steps }], 'http://127.0.0.1:31455');
+    expect(noFreshOutput?.failure).toContain('Step 14 (waitFor): timed out');
+  }, 20_000);
 
   test('T5 counts only matching web-registration rows and rejects duplicate shells', async () => {
     const t5 = createScenarios().find((item) => item.id === 'T5')!;

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -12,6 +12,9 @@ import {
   formatUnreadableEvidence,
   main,
 } from './domain-boundary-check.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const scriptPath = join(import.meta.dir, 'domain-boundary-check.ts');
 const catalogWithXai = 'resources:\n  - env: [XAI_API_KEY, GROK_API_KEY]\n';

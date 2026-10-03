@@ -2,7 +2,7 @@
 // Reference: 내부 문서 `_INDEX-claude-code-pipeline-refs` fix F.
 // Mirrors Claude Code's Phase 0 auto-memory pattern.
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -586,6 +586,10 @@ describe('buildUniversalPreamble — project tree integration (W4-B)', () => {
 
 // BACKLOG L2 — 로컬 모델 자식은 «lean» 예산(앵커 8K · 트리 2K). 기본은 그대로(32K · 8K).
 import { projectAnchorMaxChars, projectTreeMaxChars, PROJECT_ANCHOR_LEAN_MAX_CHARS, PROJECT_TREE_LEAN_MAX_CHARS } from '../src/prompt-library/universal-preamble.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
+
 test('prompt budget: default unchanged, lean via ELANOUS_PROMPT_BUDGET=lean (BACKLOG L2)', () => {
   const saved = process.env.ELANOUS_PROMPT_BUDGET;
   try {

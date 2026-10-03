@@ -65,6 +65,8 @@ const baseDeps = {
   queryRunningRuns: () => runningRuns([]), runTypecheckGate: () => true, runIsolationGate: () => true, runMockModuleRestoreGate: () => true, runModelHardcodeGate: () => true, runDaemonPortGate: () => true,
   runPublicLeakGate: () => 0,
   runExportLeakCheck: () => ({ measured: true, hits: [] }),
+  // The PWA gate builds for real when a change reaches the bundle — scripts/ci-pwa-build-gate.test.ts owns its behaviour.
+  runPwaGate: () => true,
   isInteractive: () => false,
 };
 
@@ -298,6 +300,27 @@ describe('elanous pr land', () => {
       logged.mockRestore();
     }
   });
+
+  for (const [label, gate, detail] of [
+    ['fails', () => false, 'PWA 빌드 실패'],
+    ['cannot measure', () => { throw new Error('apps/pwa/node_modules incomplete'); }, '못 쟀다'],
+  ] as const) {
+    it(`blocks the landing when the PWA build gate ${label} (GATE-PWA · fail-closed)`, async () => {
+      const { manager, calls } = fakeManager();
+      const sink = output();
+      const run = (cmd: string, args: readonly string[]) => {
+        if (cmd === 'git' && args.join(' ') === 'remote') return { ok: true, out: 'origin\n' };
+        if (cmd === 'git' && args.join(' ') === 'remote get-url origin') return { ok: true, out: 'https://github.com/example/repo.git\n' };
+        if (cmd === 'git' && args.join(' ') === 'rev-parse --verify --quiet refs/remotes/origin/main') return { ok: true, out: 'remote-sha\n' };
+        if (cmd === 'git' && args.join(' ') === 'rev-list --left-right --count main...refs/remotes/origin/main') return { ok: true, out: '0\t0\n' };
+        return { ok: false, out: '' };
+      };
+      expect(await runPrLand({}, { ...baseDeps, run, manager, out: sink.out, runPwaGate: gate })).toBe(1);
+      expect(sink.errors.join('\n')).toContain('pwa-gate');
+      expect(sink.errors.join('\n')).toContain(detail);
+      expect(calls.some((c) => c.startsWith('merge'))).toBe(false);
+    });
+  }
 
   it('forwards current changed paths to the interference gate, preserves its warning, and continues through merge without writing the repository', async () => {
     const { manager, calls } = fakeManager();
@@ -995,6 +1018,7 @@ describe('elanous pr land', () => {
           manager: fakeManager().manager,
           out: sink.out,
           runAndroidGate: (_out, changedFiles) => { receivedAndroid.push([...changedFiles]); return true; },
+          runPwaGate: () => true,
           runIosGate: (_out, changedFiles) => { receivedIos.push([...changedFiles]); return true; },
         });
 
@@ -1042,6 +1066,7 @@ describe('elanous pr land', () => {
           manager: fakeManager().manager,
           out: sink.out,
           runAndroidGate: (_out, changedFiles) => { receivedAndroid.push([...changedFiles]); return true; },
+          runPwaGate: () => true,
         });
 
         expect(code).toBe(0);

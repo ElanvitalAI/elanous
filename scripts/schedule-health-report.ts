@@ -96,7 +96,7 @@ function main(): void {
       console.log(msg);
       return;
     }
-    const ok = sendOutbound(msg, 'alert');
+    const ok = sendOutbound(msg, 'ops-alert');
     console.log(`[schedule-health] ${mode}: ${ok ? '발송' : '발송 실패'} — 밀림 ${health.stale.length}·실패 ${health.errored.length}`);
   } finally {
     db.close();

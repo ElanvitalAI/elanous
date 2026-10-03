@@ -84,8 +84,8 @@ export function SessionIdChip({
   const idShort = shortSessionId(sessionId);
   const disabled = !sessionId;
   const tooltip = sessionId
-    ? `세션 ID 전체 (${sessionId.length}자): ${sessionId}\n· 클릭하면 자동 복사 — 단축 표시 (앞 8자 + …)\n· 새 세션 fork 시 다른 ID 발급 (crypto.randomUUID v4)`
-    : '세션 미설정';
+    ? `대화 ID 전체 (${sessionId.length}자): ${sessionId}\n· 누르면 자동으로 복사됩니다 — 앞 8자만 표시합니다 (… 표시는 생략됨)\n· 새 대화를 시작하면 다른 ID가 발급됩니다`
+    : '대화가 선택되지 않았습니다';
 
   return (
     <span
@@ -95,7 +95,7 @@ export function SessionIdChip({
       onClick={disabled ? undefined : onClick}
       onKeyDown={disabled ? undefined : onKeyDown}
       title={tooltip}
-      aria-label={sessionId ? `세션 ID ${sessionId} 복사` : '세션 미설정'}
+      aria-label={sessionId ? `대화 ID ${sessionId} 복사` : '대화가 선택되지 않았습니다'}
       data-elanous-session-id={sessionId ?? ''}
       data-elanous-action="session-id-copy"
       className={cn(

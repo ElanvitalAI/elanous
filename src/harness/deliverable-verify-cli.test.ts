@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,9 @@ import { join, resolve } from 'node:path';
 import { Command } from 'commander';
 import type { DeployVerifyResult } from './browser-verify.js';
 import { defaultPortOwnerPid, installDeliverableVerifyCliCommand, launchAndVerifyGoalDeliverable, renderDeliverableVerifyReport, verifyGoalDeliverable } from './deliverable-verify-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const elanousBin = join(repoRoot, 'bin/elanous.mjs');
@@ -414,12 +417,58 @@ describe('actual harness CLI exit-code contract', () => {
     expect(run.output.match(stackFramePattern)?.length ?? 0).toBe(0);
   });
 
+  test('verify-url aside writes reported screenshot bytes and exits zero', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-verify-url-aside-shot-'));
+    const aside = join(root, 'aside');
+    const shot = join(root, 'shot.png');
+    const png = Buffer.from('89504e470d0a1a0a00010203', 'hex');
+    writeFileSync(aside, `#!/bin/sh\nprintf '%s\\n' '{"title":"Page","bodyLength":80,"unloadedImageCount":0,"screenshotBytes":${png.length}}' 'ELANOUS_SHOT_BASE64:${png.toString('base64')}' '[ok | 1ms]'\n`);
+    chmodSync(aside, 0o755);
+    try {
+      const run = runElanousCli(['harness', 'verify-url', 'https://example.com', '--backend', 'aside', '--shot', shot], root, { ...process.env, PATH: root, HOME: root });
+      expect(run.status).toBe(0);
+      expect(readFileSync(shot)).toEqual(png);
+      expect(run.stdout).toContain(`스크린샷: ${png.length} bytes → ${shot}`);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('verify-url aside 0-byte screenshot exits nonzero with finding', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-verify-url-aside-zero-'));
+    const aside = join(root, 'aside');
+    const shot = join(root, 'shot.png');
+    writeFileSync(aside, '#!/bin/sh\nprintf \'%s\\n\' \'{"title":"Page","bodyLength":80,"unloadedImageCount":0,"screenshotBytes":0}\' \'[ok | 1ms]\'\n');
+    chmodSync(aside, 0o755);
+    try {
+      const run = runElanousCli(['harness', 'verify-url', 'https://example.com', '--backend', 'aside', '--shot', shot], root, { ...process.env, PATH: root, HOME: root });
+      expect(run.status).toBe(1);
+      expect(existsSync(shot)).toBe(false);
+      expect(run.stdout).toContain('스크린샷 0바이트 — 렌더 증거 없음');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  test('verify-url --shot write failure reports the reason and exits one for both backends', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-verify-url-write-fail-'));
+    const shot = join(root, 'missing', 'shot.png');
+    const aside = join(root, 'aside');
+    writeFileSync(aside, '#!/bin/sh\nprintf \'%s\\n\' \'{"title":"Page","bodyLength":80,"unloadedImageCount":0,"screenshotBytes":5}\' \'ELANOUS_SHOT_BASE64:aW1hZ2U=\' \'[ok | 1ms]\'\n');
+    chmodSync(aside, 0o755);
+    const server = createMockCdpServer(root);
+    try {
+      for (const args of [['--backend', 'aside'], ['--port', server.port]]) {
+        const run = runElanousCli(['harness', 'verify-url', 'https://example.com', ...args, '--shot', shot], root, { ...process.env, PATH: root, HOME: root });
+        expect(run.status).toBe(1);
+        expect(run.stdout).toContain(`스크린샷을 ${shot} 에 못 썼다 — ENOENT`);
+        expect(existsSync(shot)).toBe(false);
+      }
+    } finally { server.stop(); rmSync(root, { recursive: true, force: true }); }
+  });
+
   test('verify-url aside without its executable reports a non-blocking backend-specific skip', () => {
     const root = mkdtempSync(join(tmpdir(), 'elanous-verify-url-cli-aside-'));
     try {
       // ⛔ PATH 만 비우면 안 된다 — `src/ensure-bin-path.ts` 가 `~/.local/bin` 등을 뒤에 붙여, aside 가 깔린 기계에선
       //   진짜 aside 로 검증이 돈다(2026-09-24 이 맥에서 fail). HOME 도 비워 보강 후보를 없는 자리로 만든다.
-      const run = runElanousCli(['harness', 'verify-url', '--backend', 'aside', 'http://example.test/'], root, { ...process.env, PATH: root, HOME: root });
+      const run = runElanousCli(['harness', 'verify-url', '--backend', 'aside', '--shot', join(root, 'missing.png'), 'http://example.test/'], root, { ...process.env, PATH: root, HOME: root });
 
       expect(run.status).toBe(0);
       expect(run.stdout).toBe('⚠️ aside 실행 파일을 찾을 수 없음 — 검증 skip. aside 부재는 배포 검증을 막지 않습니다.\n');

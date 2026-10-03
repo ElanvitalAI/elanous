@@ -210,6 +210,8 @@ export class DashboardSession {
       transportFactory: pair.transportFactory,
       shutdownSignal: shutdownCtrl.signal,
       runTurn,
+      // PCH-2b — the in-process TUI dispatcher carries its own approval modals.
+      toolApproval: 'off',
       ...(opts.agentName ? { agentName: opts.agentName } : {}),
       ...(opts.agentVersion ? { agentVersion: opts.agentVersion } : {}),
       ...(opts.serverOptions ?? {}),

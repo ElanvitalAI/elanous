@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, expect, test } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
+import type { spawn } from 'node:child_process';
+import { defaultFieldReelRunner } from './field/field-reel.js';
 import { setElanousConfigDir, resetElanousConfigDir } from './elanous-config-dir.js';
 import { resetUserConfig } from './user-config.js';
 import { runTelegramPoller, startTelegramPollers } from './telegram-run.js';
+import { capturedEnvAvailable, resetCapturedEnvForTesting } from './shell-env-bootstrap.js';
 
 let dir: string;
 const previousToken = process.env.ELANOUS_TELEGRAM_BOT_TOKEN;
@@ -15,11 +19,77 @@ beforeEach(() => {
   resetUserConfig();
 });
 afterEach(() => {
+  resetCapturedEnvForTesting();
   resetUserConfig();
   resetElanousConfigDir();
   if (previousToken === undefined) delete process.env.ELANOUS_TELEGRAM_BOT_TOKEN;
   else process.env.ELANOUS_TELEGRAM_BOT_TOKEN = previousToken;
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('poller starts before capture completes; an immediate reel synchronously captures node PATH', async () => {
+  const previousPath = process.env.PATH;
+  const previousShell = process.env.SHELL;
+  const previousSkip = process.env.ELANOUS_SKIP_LOGIN_ENV;
+  const previousTerm = process.env.TERM_PROGRAM;
+  let release!: (value: boolean) => void;
+  const capture = new Promise<boolean>((resolve) => { release = resolve; });
+  let warmCalled = false;
+  let started = false;
+  const shellDir = join(dir, 'login-shell');
+  mkdirSync(shellDir);
+  const shell = join(shellDir, 'sh');
+  writeFileSync(shell, "#!/bin/sh\nprintf 'PATH=/opt/node/bin:/usr/bin\\nHOME=/tmp\\nUSER=test\\nSHELL=/bin/sh\\nLANG=C\\nTOKEN=not-inherited\\n'");
+  chmodSync(shell, 0o755);
+  try {
+    resetCapturedEnvForTesting();
+    process.env.PATH = '/usr/bin:/bin';
+    process.env.SHELL = shell;
+    delete process.env.ELANOUS_SKIP_LOGIN_ENV;
+    delete process.env.TERM_PROGRAM;
+    const poller = runTelegramPoller({
+      warm: () => { warmCalled = true; return capture; },
+      start: async () => {
+        started = true;
+        return { started: [{ channel: { name: 'main', botToken: 'fake:token' }, handle: { stop: async () => {} } }] as never,
+          refusedBotIds: [], late: [] };
+      },
+      wait: async () => {}, registerLogSink: async () => {},
+    });
+    await poller;
+    expect(warmCalled).toBe(true);
+    expect(started).toBe(true);
+    expect(capturedEnvAvailable()).toBe(false);
+    expect(process.env.PATH).toBe('/usr/bin:/bin');
+    let childPath: string | undefined;
+    const fakeSpawn = ((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+      expect(command).toBe('zsh');
+      expect(args[0]).toEndWith('reel.sh');
+      childPath = options.env?.PATH;
+      expect(options.env?.TOKEN).not.toBe('not-inherited');
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('close', 1));
+      return child;
+    }) as unknown as typeof spawn;
+    await defaultFieldReelRunner(dir, { title: 'event', sub: 'date' }, fakeSpawn);
+    expect(capturedEnvAvailable()).toBe(true);
+    expect(childPath).toBe('/usr/bin:/bin:/opt/node/bin');
+    expect(process.env.PATH).toBe('/usr/bin:/bin');
+    release(true);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(process.env.PATH).toBe('/usr/bin:/bin:/opt/node/bin');
+    expect(process.env.TOKEN).not.toBe('not-inherited');
+  } finally {
+    release(false);
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    if (previousShell === undefined) delete process.env.SHELL;
+    else process.env.SHELL = previousShell;
+    if (previousSkip === undefined) delete process.env.ELANOUS_SKIP_LOGIN_ENV;
+    else process.env.ELANOUS_SKIP_LOGIN_ENV = previousSkip;
+    if (previousTerm === undefined) delete process.env.TERM_PROGRAM;
+    else process.env.TERM_PROGRAM = previousTerm;
+  }
 });
 
 test('disabled and unresolved token have distinct startup errors with ref id and path', async () => {

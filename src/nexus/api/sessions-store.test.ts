@@ -8,10 +8,15 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { resetElanousConfigDir, setElanousConfigDir } from '../../elanous-config-dir.js';
+import { createProject } from '../../project/project-store.js';
+import { routeRequest, type NexusHttpServerOpts } from './http-server.js';
+import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { handleSessionsStoreFork, handleSessionsStoreGet, handleSessionsStoreList } from './sessions-store.js';
+import { loadSession } from '../../session/index.js';
 import {
   HARNESS_SESSION_ORIGIN,
   appendMessage,
@@ -101,6 +106,52 @@ describe('handleSessionsStoreFork — beforeUser 파라미터', () => {
   });
 });
 
+describe('PATCH /v1/sessions/store/:id — project only', () => {
+  let root: string;
+  let config: string;
+  let previous: string | undefined;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'session-patch-'));
+    config = mkdtempSync(join(tmpdir(), 'projects-patch-'));
+    previous = process.env.ELANOUS_SESSION_ROOT;
+    process.env.ELANOUS_SESSION_ROOT = root;
+    setElanousConfigDir(config);
+  });
+  afterEach(() => {
+    if (previous === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+    else process.env.ELANOUS_SESSION_ROOT = previous;
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(config, { recursive: true, force: true });
+  });
+  async function patch(id: string, body: unknown, authorized = true): Promise<Response> {
+    const req = new Request(`http://localhost/v1/sessions/store/${id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', ...(authorized ? { authorization: 'Bearer owner' } : {}) },
+      body: JSON.stringify(body),
+    });
+    const response = await routeRequest(req, { metaApi: { noAuth: false, bearerToken: 'owner' } } as NexusHttpServerOpts,
+      {} as never, null, createDevProxyRuntimeRef());
+    if (!response) throw new Error('route missing');
+    return response;
+  }
+  it('assigns and clears only projectId; rejects other fields and unknown project/session and unauthenticated requests', async () => {
+    const session = createSession({ title: 'Keep', origin: 'pwa' }, root);
+    appendMessage(session.id, { role: 'user', content: 'untouched', ts: new Date().toISOString() }, root);
+    const original = loadSession(session.id, root)!;
+    const project = createProject({ name: 'Test' });
+    expect((await patch(session.id, { projectId: project.id }, false)).status).toBe(401);
+    expect((await patch(session.id, { projectId: 'missing' })).status).toBe(400);
+    expect((await patch('absent', { projectId: project.id })).status).toBe(404);
+    expect((await patch(session.id, { projectId: project.id, title: 'Changed' })).status).toBe(400);
+    expect((await patch(session.id, { title: 'Changed' })).status).toBe(400);
+    expect((await patch(session.id, { projectId: project.id })).status).toBe(200);
+    expect(loadSession(session.id, root)).toEqual({ ...original, meta: { ...original.meta, projectId: project.id } });
+    expect((await patch(session.id, { projectId: null })).status).toBe(200);
+    expect(loadSession(session.id, root)).toEqual(original);
+  });
+});
+
 describe('handleSessionsStoreList — harness origin default hide', () => {
   let sessionRoot: string;
   let priorSessionRoot: string | undefined;
@@ -126,13 +177,13 @@ describe('handleSessionsStoreList — harness origin default hide', () => {
     appendMessage(id, { role: 'user', content, ts: new Date().toISOString() }, sessionRoot);
   }
 
-  async function list(query = ''): Promise<{ sessions: Array<{ id: string; origin?: string; sourceKind?: string }>; total: number }> {
+  async function list(query = ''): Promise<{ sessions: Array<{ id: string; origin?: string; sourceKind?: string; projectId?: string }>; total: number }> {
     const res = handleSessionsStoreList(
       new Request(`http://localhost:31415/v1/sessions/store${query}`),
       OPTS,
     );
     expect(res.status).toBe(200);
-    return await res.json() as { sessions: Array<{ id: string; origin?: string; sourceKind?: string }>; total: number };
+    return await res.json() as { sessions: Array<{ id: string; origin?: string; sourceKind?: string; projectId?: string }>; total: number };
   }
 
   it('기본 목록은 하니스 origin 을 숨기고 사람·신분없는 옛 세션은 남긴다', async () => {
@@ -154,6 +205,24 @@ describe('handleSessionsStoreList — harness origin default hide', () => {
     expect(ids).not.toContain(scheduled.id);
     expect(ids).not.toContain(empty.id);
     expect(body.sessions.every((s) => !isHarnessSessionOrigin(s.origin))).toBe(true);
+  });
+
+  it('projectId 쿼리는 세 세션 중 한 개만 고르고, 쿼리 없으면 옛 카드까지 모두 남긴다', async () => {
+    const matching = createSession({ projectId: 'project-a', title: 'matching' }, sessionRoot);
+    const other = createSession({ projectId: 'project-b', title: 'other' }, sessionRoot);
+    const old = createSession({ title: 'legacy' }, sessionRoot);
+    for (const id of [matching.id, other.id, old.id]) addUser(id, 'hello');
+
+    const filtered = await list('?projectId=project-a');
+    expect(filtered.total).toBe(1);
+    expect(filtered.sessions.map((s) => s.id)).toEqual([matching.id]);
+    expect(filtered.sessions[0]?.projectId).toBe('project-a');
+
+    const unfiltered = await list();
+    expect(unfiltered.total).toBe(3);
+    expect(unfiltered.sessions.map((s) => s.id).sort()).toEqual([matching.id, other.id, old.id].sort());
+    expect(unfiltered.sessions.find((s) => s.id === other.id)?.projectId).toBe('project-b');
+    expect(Object.hasOwn(unfiltered.sessions.find((s) => s.id === old.id)!, 'projectId')).toBe(false);
   });
 
   it('includeHarness=1 은 하니스 세션을 포함하고 기본보다 많다', async () => {

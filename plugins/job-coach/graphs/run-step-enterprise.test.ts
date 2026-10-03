@@ -1,8 +1,11 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runGraph, lastJsonObject } from '../../../src/graph-runner/runner.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const headings = ['기업 개요 및 교육 대상', '교육 니즈', '직무·과제 및 NCS', 'AI 적합성', '역량 진단', '교육 로드맵', '교육 명세·운영 경로'];
 async function step(root: string, name: string, input: object, outputs: Record<string, unknown>, path: string[] = []) {

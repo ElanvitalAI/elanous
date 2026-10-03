@@ -79,6 +79,9 @@ export function createScenarios(): Scenario[] {
 export function createScenariosWithReplay(readReplay: typeof readTerminalReplay): Scenario[] {
   const marker = `pwa-scn-${randomBytes(8).toString('hex')}`;
   const t1bMarker = `pwa-scn-${randomBytes(8).toString('hex')}`;
+  const t5bFirst = `ELANOUS_T5B_${randomBytes(8).toString('hex')}`;
+  const t5bSecond = `ELANOUS_T5B_${randomBytes(8).toString('hex')}`;
+  const screenContains = (text: string): string => `(() => { const host = document.querySelector('[data-xterm-host]'); const term = host?.__elanousTerm; if (!term || !host.getClientRects().length) return false; const buffer = term.buffer.active; for (let row = buffer.viewportY; row < buffer.viewportY + term.rows; row++) if (buffer.getLine(row)?.translateToString().includes(${JSON.stringify(text)})) return true; return false; })()`;
   // C1 — the answer (n+1) never appears in the question, so finding it on the page means a model replied.
   const c1Base = 1000 + (randomBytes(2).readUInt16BE(0) % 8000);
   return [
@@ -148,6 +151,23 @@ export function createScenariosWithReplay(readReplay: typeof readTerminalReplay)
           if (!Array.isArray(body.terminals)) throw new Error('invalid terminal list response');
           return body.terminals.filter((row) => row.producer === 'web-registration' && row.id === ids.terminalId).length === 1;
         } }],
+    },
+    {
+      id: 'T5b', surface: 'terminal', path: '/app/term/', title: 'terminal shows output on open and after reload',
+      steps: [
+        { kind: 'goto' }, { kind: 'waitFor', selector: terminal, timeoutMs: 20_000 },
+        { kind: 'waitFor', jsPredicate: `Array.from(document.querySelectorAll(${JSON.stringify(connected)})).some(node => node.textContent?.includes('ACP: 연결됨'))`, timeoutMs: 20_000 },
+        { kind: 'click', selector: terminal }, { kind: 'type', text: `echo ${t5bFirst}` }, { kind: 'press', key: 'Enter' },
+        { kind: 'waitFor', jsPredicate: screenContains(t5bFirst), timeoutMs: 20_000 },
+        { kind: 'goto' }, { kind: 'waitFor', selector: terminal, timeoutMs: 20_000 },
+        { kind: 'waitFor', jsPredicate: screenContains(t5bFirst), timeoutMs: 20_000 },
+        { kind: 'click', selector: terminal }, { kind: 'type', text: `echo ${t5bSecond}` }, { kind: 'press', key: 'Enter' },
+        { kind: 'waitFor', jsPredicate: screenContains(t5bSecond), timeoutMs: 20_000 },
+      ],
+      expect: [
+        { js: screenContains(t5bFirst), expected: 'first marker still visible after reload' },
+        { js: screenContains(t5bSecond), expected: 'new output visible after reload' },
+      ],
     },
     {
       id: 'C1', surface: 'chat', path: '/app/chat/', title: 'first message streams a model reply', costly: true,

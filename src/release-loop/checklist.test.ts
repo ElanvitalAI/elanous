@@ -5,13 +5,28 @@ import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
 import { CliUserError } from '../cli/cli-user-error.js';
-import { addItem, devVersion, listChecklist, removeItem, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
+import { addItem, claimItem, checklistGate, devVersion, listChecklist, ownerMatches, parseOwner, parityGap, removeItem, seedFromRoadmap, setItem, summarize, summarizeChecklist } from './checklist.js';
 
 const roots: string[] = [];
 function root(): string { const dir = mkdtempSync(join(tmpdir(), 'release-checklist-')); roots.push(dir); setElanousConfigDir(dir); return dir; }
 afterEach(() => { resetElanousConfigDir(); for (const dir of roots.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('release checklist ledger', () => {
+  test('짝 판정 문면과 조건을 보존하고 짝 경고만으로 gate ok 를 바꾸지 않는다', () => {
+    root();
+    const valid = '짝: PWA ✅ · 데스크톱 ✅ · 폴드 ✅ · 아이폰 ✅ · 아이패드 ✅';
+    expect(parityGap(undefined)).toBe('근거에 짝: 줄이 없다');
+    expect(parityGap('짝: PWA ✅')).toBe('짝: 줄에 다섯 열(PWA · 데스크톱 · 폴드 · 아이폰 · 아이패드)이 다 없다');
+    expect(parityGap('짝: PWA ⏳ · 데스크톱 ✅ · 폴드 ✅ · 아이폰 ✅ · 아이패드 ✅')).toBe('⏳ 에 (칸 …) 번호가 없다: PWA');
+    expect(parityGap('짝: PWA ⏳ (칸 K2) · 데스크톱 ✅ · 폴드 ✅ · 아이폰 ✅ · 아이패드 ✅')).toBeNull();
+    expect(parityGap(valid)).toBeNull();
+    addItem('9.9.9', { id: 'K1', title: 'screen', kind: 'screen' });
+    setItem('9.9.9', 'K1', { status: 'green' }, 'TC');
+    expect(checklistGate('9.9.9')).toMatchObject({ ok: true, parity: [{ id: 'K1', why: '근거에 짝: 줄이 없다' }] });
+    setItem('9.9.9', 'K1', { evidence: valid }, 'TC');
+    expect(checklistGate('9.9.9')).toMatchObject({ ok: true, parity: [] });
+  });
+
   test('입력 오류 여덟 곳은 문구를 보존하고 이미/없는 칸에만 hint를 제공한다', () => {
     root();
     const expectInputError = (run: () => unknown, message: string, hint?: string) => {
@@ -138,15 +153,100 @@ describe('release checklist ledger', () => {
     expect(summarize('9.9.9')).toMatchObject({ yellow: 0, red: 1, blocked: ['K1'] });
   });
 
-  test('특수 담당자 이름도 독립적으로 집계한다', () => {
-    root();
-    for (const name of ['toString', '__proto__', 'constructor']) addItem('9.9.9', { id: name, title: name, owner: name });
-    const counts = summarize('9.9.9').byOwner;
+  test('옛 담당자 이름도 재검증 없이 독립적으로 집계한다', () => {
+    const dir = root();
+    const version = '9.9.9';
+    mkdirSync(join(dir, 'release', version), { recursive: true });
+    writeFileSync(join(dir, 'release', version, 'checklist.json'), JSON.stringify({ version, released: '', dev: devVersion(), items:
+      ['toString', '__proto__', 'constructor'].map((name) => ({ id: name, title: name, owner: name, status: 'yellow', updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'OP' })), history: [] }));
+    const counts = summarize(version).byOwner;
     expect(Object.getPrototypeOf(counts)).toBeNull();
     expect(counts['toString']).toBe(1);
     expect(counts['__proto__']).toBe(1);
     expect(counts['constructor']).toBe(1);
     expect(JSON.parse(JSON.stringify(counts))).toEqual(JSON.parse('{"toString":1,"__proto__":1,"constructor":1}'));
+  });
+
+  test('새 owner 문법만 검사하고 잘못된 add/set 은 원장을 바꾸지 않으며 옛 owner 는 증거 갱신 때 보존한다', () => {
+    const dir = root();
+    expect(parseOwner('TC')).toEqual({ seat: 'TC' });
+    expect(parseOwner('TC/rel')).toEqual({ seat: 'TC', sub: 'rel' });
+    expect(parseOwner('ABCDEFGH/' + 'a'.repeat(32))).toEqual({ seat: 'ABCDEFGH', sub: 'a'.repeat(32) });
+    for (const invalid of ['tc/Rel', 'TC/', 'T', 'ABCDEFGHI', 'TC/Rel', 'TC/' + 'a'.repeat(33), 'TC\n', 'TC/rel\n']) {
+      expect(() => parseOwner(invalid)).toThrow(CliUserError);
+      expect(() => addItem('9.9.9', { id: invalid, title: 'bad', owner: invalid })).toThrow(CliUserError);
+    }
+    expect(listChecklist('9.9.9').items).toEqual([]);
+    addItem('9.9.9', { id: 'K1', title: 'valid', owner: 'TC/rel' });
+    expect(listChecklist('9.9.9').items[0]?.owner).toBe('TC/rel');
+    const before = listChecklist('9.9.9');
+    expect(() => setItem('9.9.9', 'K1', { owner: 'TC/' }, 'TC')).toThrow(CliUserError);
+    expect(listChecklist('9.9.9')).toEqual(before);
+    expect(() => setItem('9.9.9', 'K1', { owner: 'TC/docs', evidence: 'ignored' }, 'TC')).toThrow('지금 주인: TC/rel — --force 로만 바꾼다');
+    expect(listChecklist('9.9.9')).toEqual(before);
+    mkdirSync(join(dir, 'release', '8.8.8'), { recursive: true });
+    writeFileSync(join(dir, 'release', '8.8.8', 'checklist.json'), JSON.stringify({ version: '8.8.8', released: '', dev: devVersion(), items: [
+      { id: 'OLD', title: 'legacy', status: 'yellow', owner: 'TC·UX', updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'T' },
+    ], history: [] }));
+    setItem('8.8.8', 'OLD', { evidence: 'verified' }, 'TC');
+    expect(listChecklist('8.8.8').items[0]).toMatchObject({ owner: 'TC·UX', evidence: 'verified' });
+  });
+
+  test('옛 잘못된 owner 는 원문 byOwner 에만 남고 자리별 집계·필터에는 들어가지 않는다', () => {
+    const dir = root();
+    const version = '8.8.8';
+    mkdirSync(join(dir, 'release', version), { recursive: true });
+    const owners = ['TC', 'TC/rel', 'TC/', 'TC/rel/extra', 'TC\n', 'TC·UX'];
+    writeFileSync(join(dir, 'release', version, 'checklist.json'), JSON.stringify({ version, released: '', dev: devVersion(), items:
+      owners.map((owner, i) => ({ id: `K${i}`, title: owner, owner, status: 'yellow', updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'OP' })), history: [] }));
+    const snapshot = listChecklist(version);
+    expect(snapshot.items.map((item) => item.owner)).toEqual(owners);
+    expect(summarizeChecklist(snapshot).byOwner).toEqual(Object.fromEntries(owners.map((owner) => [owner, 1])));
+    expect(summarizeChecklist(snapshot).bySeat).toEqual({ TC: 2 });
+    expect(snapshot.items.filter((item) => ownerMatches(item.owner, 'TC')).map((item) => item.id)).toEqual(['K0', 'K1']);
+    expect(snapshot.items.filter((item) => ownerMatches(item.owner, 'TC/rel')).map((item) => item.id)).toEqual(['K1']);
+  });
+
+  test('claim 은 무주인·상위 자리만 양도하고 타인 거부는 원자적이며 강제는 이력과 관측에 남긴다', () => {
+    root();
+    const version = '9.9.9';
+    addItem(version, { id: 'A', title: 'parent', owner: 'TC' });
+    addItem(version, { id: 'B', title: 'sibling', owner: 'TC/rel' });
+    addItem(version, { id: 'C', title: 'other', owner: 'MK' });
+    addItem(version, { id: 'D', title: 'unassigned' });
+    const logs: unknown[] = [];
+    const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'release-loop.checklist' && event === 'claim') logs.push(data);
+    });
+    try {
+      claimItem(version, 'A', 'TC/rel');
+      expect(listChecklist(version).history.at(-1)).toMatchObject({ field: 'claim', from: 'TC', to: 'TC/rel' });
+      const same = listChecklist(version);
+      claimItem(version, 'A', 'TC/rel');
+      expect(listChecklist(version)).toEqual(same);
+      for (const [id, by, current] of [['B', 'TC/docs', 'TC/rel'], ['C', 'TC/rel', 'MK'], ['A', 'TC', 'TC/rel']] as const) {
+        const previous = listChecklist(version);
+        expect(() => claimItem(version, id, by)).toThrow(`지금 주인: ${current} — --force 로만 바꾼다`);
+        expect(listChecklist(version)).toEqual(previous);
+      }
+      const forced = claimItem(version, 'C', 'TC/rel', { force: true });
+      expect(forced.history.at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/rel', force: true });
+      expect(listChecklist(version).items.find((item) => item.id === 'C')?.owner).toBe('TC/rel');
+      expect(listChecklist(version).history.at(-1)).toMatchObject({ field: 'claim', from: 'MK', to: 'TC/rel', force: true });
+      const afterSet = setItem(version, 'C', { evidence: 'verified' }, 'TC');
+      expect(afterSet.history.find((entry) => entry.id === 'C' && entry.field === 'claim')).toMatchObject({ to: 'TC/rel', force: true });
+      const afterAdd = addItem(version, { id: 'E', title: 'later' });
+      expect(afterAdd.history.find((entry) => entry.id === 'C' && entry.field === 'claim')).toMatchObject({ to: 'TC/rel', force: true });
+      removeItem(version, 'E', 'TC');
+      claimItem(version, 'D', 'UX');
+      expect(listChecklist(version).items.find((item) => item.id === 'D')?.owner).toBe('UX');
+      expect(listChecklist(version).history.at(-1)).toMatchObject({ field: 'claim', from: null, to: 'UX' });
+      expect(summarize(version)).toMatchObject({ byOwner: { 'TC/rel': 3, UX: 1 }, bySeat: { TC: 3, UX: 1 } });
+      expect(logs).toContainEqual({ version, id: 'A', from: 'TC', to: 'TC/rel', force: false, outcome: 'claimed' });
+      expect(logs).toContainEqual({ version, id: 'A', from: 'TC/rel', to: 'TC/rel', force: false, outcome: 'same' });
+      expect(logs).toContainEqual({ version, id: 'B', from: 'TC/rel', to: 'TC/docs', force: false, outcome: 'refused' });
+      expect(logs).toContainEqual({ version, id: 'C', from: 'MK', to: 'TC/rel', force: true, outcome: 'claimed' });
+    } finally { spy.mockRestore(); }
   });
 
   test('추가·변경별 역사·삭제, 0600 교체와 공개/개발판 스냅샷', () => {
@@ -159,13 +259,13 @@ describe('release checklist ledger', () => {
     const seen: unknown[] = [];
     const spy = spyOn(debug, 'log').mockImplementation((category, event, data) => { if (category === 'release-loop.checklist' && event === 'change') seen.push(data); });
     try {
-      addItem('9.9.9', { id: 'K1', title: '첫 칸', owner: 'T' });
+      addItem('9.9.9', { id: 'K1', title: '첫 칸', owner: 'TC' });
       expect(() => addItem('9.9.9', { id: 'K1', title: '중복' })).toThrow('이미 있는 칸');
-      setItem('9.9.9', 'K1', { status: 'red', evidence: 'issue', owner: 'S' }, 'T');
-      expect(summarize('9.9.9')).toEqual({ green: 0, yellow: 0, red: 1, done: 0, blocked: ['K1'], byOwner: { S: 1 } });
+      setItem('9.9.9', 'K1', { status: 'red', evidence: 'issue' }, 'T');
+      expect(summarize('9.9.9')).toEqual({ green: 0, yellow: 0, red: 1, done: 0, blocked: ['K1'], byOwner: { TC: 1 }, bySeat: { TC: 1 } });
       const data = listChecklist('9.9.9');
       expect(data).toMatchObject({ released: '0.10.0', dev: devVersion() });
-      expect(data.history.map((h) => h.field)).toEqual(['add', 'evidence', 'owner', 'status']);
+      expect(data.history.map((h) => h.field)).toEqual(['add', 'evidence', 'status']);
       expect(data.history.every((h) => h.released === '0.10.0' && h.dev === devVersion())).toBe(true);
       mkdirSync(join(dir, 'release/1.0.0'), { recursive: true });
       writeFileSync(join(dir, 'release/1.0.0/release.json'), JSON.stringify({ version: '1.0.0', publishedAt: 'now' }));
@@ -173,8 +273,8 @@ describe('release checklist ledger', () => {
       expect(listChecklist('9.9.9').history[0]?.released).toBe('0.10.0');
       expect(seen).toContainEqual({ version: '9.9.9', id: 'K1', field: 'status', from: 'yellow', to: 'red', by: 'T' });
       expect(statSync(join(dir, 'release/features.sqlite')).mode & 0o777).toBe(0o600);
-      removeItem('9.9.9', 'K1', 'S');
-      expect(listChecklist('9.9.9').history.at(-1)).toMatchObject({ id: 'K1', field: 'remove', by: 'S', released: '1.0.0', dev: devVersion() });
+      removeItem('9.9.9', 'K1', 'TC');
+      expect(listChecklist('9.9.9').history.at(-1)).toMatchObject({ id: 'K1', field: 'remove', by: 'TC', released: '1.0.0', dev: devVersion() });
       expect(listChecklist('9.9.9').items).toEqual([]);
     } finally { spy.mockRestore(); }
   });

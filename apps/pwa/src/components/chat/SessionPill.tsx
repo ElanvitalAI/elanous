@@ -174,8 +174,8 @@ export function SessionPill(props: SessionPillProps = {}) {
   //     «새 세션이 히스토리를 갖고 간다»로 읽힌다. 뜻은 «지금 세션에 그대로 남는다»였다.
   //   ⇒ 🔑 그래서 ***「무엇이 되는가」를 앞에, 「지금 것은 어떻게 되는가」를 뒤에*** 적는다.
   const buttonTitle = confirmArmed
-    ? '한 번 더 누르면 새 대화가 시작됩니다 — 지금 대화는 그대로 저장되고 세션 목록에 남습니다'
-    : '새 대화 시작 (두 번 클릭) — 빈 세션에서 새로 시작합니다';
+    ? '한 번 더 누르면 새 대화가 시작됩니다 — 지금 대화는 그대로 저장되고 대화 목록에 남습니다'
+    : '새 대화 시작 (두 번 클릭) — 빈 대화에서 새로 시작합니다';
 
   const previewText = summary?.lastMsgPreview ?? null;
   // ⭐ 메뉴는 «항상» 뜬다 — 아래 「새 대화 시작」 항목이 늘 있기 때문이다.
@@ -189,7 +189,7 @@ export function SessionPill(props: SessionPillProps = {}) {
             자체가 전체 ID 자동 복사 (SessionIdChip 가 처리 · ✓ 피드백
             1.2s). previously preview 가 있을 때 ID 가 hidden 되던 회귀
             fix. ellipsis "…" 로 단축 표시 명시. */}
-        <span className="text-muted-foreground font-mono">sess:</span>
+        <span className="text-muted-foreground font-mono">대화:</span>
         <SessionIdChip sessionId={sid} source="pill" />
 
         {/* Group 2 — origin pill (cli/pwa/tg/dc 출처). 이전 디자인 유지. */}
@@ -224,16 +224,16 @@ export function SessionPill(props: SessionPillProps = {}) {
           </button>
           {confirmArmed ? (
             <span className="text-[10px] text-destructive" aria-live="polite">
-              fork?
+              새 대화?
             </span>
           ) : null}
           {hasMenu && (
             <button
               type="button"
               onClick={() => setMenuOpen((v) => !v)}
-              aria-label="session menu"
+              aria-label="대화 메뉴"
               className="rounded p-0.5 hover:bg-secondary"
-              title="세션 메뉴"
+              title="대화 메뉴"
             >
               <ChevronDown className="h-3 w-3" />
             </button>
@@ -267,7 +267,7 @@ export function SessionPill(props: SessionPillProps = {}) {
             <span>
               새 대화 시작
               <span className="block text-[10px] text-muted-foreground">
-                빈 세션에서 새로 시작합니다 · 지금 대화는 세션 목록에 남습니다
+                빈 대화에서 새로 시작합니다 · 지금 대화는 대화 목록에 남습니다
               </span>
             </span>
           </button>
@@ -282,7 +282,7 @@ export function SessionPill(props: SessionPillProps = {}) {
               className="flex w-full items-center gap-2 px-3 py-1.5 hover:bg-secondary"
             >
               <ListTree className="h-3.5 w-3.5 text-muted-foreground" />
-              다른 세션 attach
+              다른 대화로 전환
             </button>
           )}
           {/* 세션 정보 — full ID + Copy + 메시지 카운트. pill 의 short
@@ -291,7 +291,7 @@ export function SessionPill(props: SessionPillProps = {}) {
           <div className="px-3 py-1.5 text-muted-foreground">
             <div className="flex items-center gap-1.5">
               <Info className="h-3 w-3 shrink-0" />
-              <span className="text-[10px] uppercase tracking-wide">세션 ID</span>
+              <span className="text-[10px] uppercase tracking-wide">대화 ID</span>
             </div>
             <div className="mt-1 flex items-center gap-1.5">
               <span
@@ -305,8 +305,8 @@ export function SessionPill(props: SessionPillProps = {}) {
                 onClick={() => void onDropdownCopy()}
                 disabled={!sid}
                 className="shrink-0 rounded p-1 hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-50"
-                title={dropdownCopied ? '복사됨' : '세션 ID 전체 복사'}
-                aria-label="세션 ID 복사"
+                title={dropdownCopied ? '복사됨' : '대화 ID 전체 복사'}
+                aria-label="대화 ID 복사"
                 data-elanous-action="session-id-copy-dropdown"
               >
                 {dropdownCopied
@@ -332,7 +332,7 @@ export function SessionPill(props: SessionPillProps = {}) {
                 className="flex w-full items-center gap-2 px-3 py-1.5 text-rose-500 hover:bg-rose-500/10"
               >
                 <Trash2 className="h-3.5 w-3.5" />
-                이 세션 잊기
+                이 대화 지우기
               </button>
             </>
           )}

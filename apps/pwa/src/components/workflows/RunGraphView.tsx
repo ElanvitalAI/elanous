@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Background, Controls, Handle, Position, ReactFlow, type NodeProps, type NodeTypes } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useNexusClient } from '@/nexus/hooks/use-nexus-context';
+import { useGraphHistory } from './use-graph-history';
 import { NexusApiError, type GraphKindEntry } from '@/nexus/client';
 import { runGraphToFlow, type RunGraphNodeData } from '@/lib/run-graph-flow';
 import {
@@ -83,6 +84,7 @@ export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEn
   const [saveError, setSaveError] = useState<string | null>(null);
   const [ignoredKeys, setIgnoredKeys] = useState<string[]>([]);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const history = useGraphHistory();
   const list = useQuery({ queryKey: ['run-graphs'], queryFn: () => client.getRunGraphs() });
   const kinds = useQuery({
     queryKey: ['graph-kinds', 'harness'],
@@ -115,6 +117,8 @@ export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEn
     if (!editable || !selected || currentYaml === null || save.isPending) return;
     try {
       const updated = next(currentYaml);
+      if (updated === currentYaml) return;
+      history.record(currentYaml);
       setDraftId(selected);
       setYaml(updated);
       setSaveError(null);
@@ -125,9 +129,21 @@ export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEn
     }
   }
 
+  function restore(direction: 'undo' | 'redo') {
+    if (!editable || !selected || currentYaml === null || save.isPending) return;
+    const restored = history[direction](currentYaml);
+    if (restored === null) return;
+    setDraftId(selected);
+    setYaml(restored);
+    setSaveError(null);
+    setIgnoredKeys([]);
+    setValidationError(null);
+  }
+
   const clone = useMutation({
     mutationFn: () => client.cloneRunGraph(selected!, `${selected}-mine`),
     onSuccess: async (created) => {
+      history.reset();
       setDraftId(null);
       setYaml(null);
       setSaveError(null);
@@ -151,7 +167,9 @@ export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEn
     onSuccess: async (saved) => {
       if (!saved) return;
       setSaveError(null);
+      history.reset();
       setDraftId(null);
+      setYaml(null);
       await queries.invalidateQueries({ queryKey: ['run-graph', saved.id] });
       await queries.invalidateQueries({ queryKey: ['run-graph-yaml', saved.id] });
     },
@@ -168,6 +186,11 @@ export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEn
         <ul>{list.data?.graphs.map((graph) => (
           <li key={graph.id}>
             <button type="button" onClick={() => {
+              if (graph.id !== selected) {
+                history.reset();
+                setDraftId(null);
+                setYaml(null);
+              }
               setSelectedId(graph.id);
               setSaveError(null);
               setValidationError(null);
@@ -192,6 +215,10 @@ export function RunGraphView({ palette: sharedPalette }: { palette?: GraphKindEn
           )}
           {editable && (
             <>
+              <button type="button" onClick={() => restore('undo')} disabled={!history.canUndo || currentYaml === null || save.isPending}
+                className="rounded border border-border px-2 py-1 text-xs">되돌리기</button>
+              <button type="button" onClick={() => restore('redo')} disabled={!history.canRedo || currentYaml === null || save.isPending}
+                className="rounded border border-border px-2 py-1 text-xs">다시 실행</button>
               <label className="text-[10px] text-text-tertiary">kind
                 <select aria-label="노드 kind" value={selectedKind} onChange={(event) => setKind(event.target.value)} className="ml-1 text-xs">
                   {palette.map((entry) => <option key={`${entry.plugin ?? 'core'}:${entry.kind}`} value={entry.kind}>{entry.kind}{entry.plugin ? ` · ${entry.plugin}` : ''}</option>)}

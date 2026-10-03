@@ -48,8 +48,8 @@
 
 set -u
 
-PR_NUM="${CH_PR:-20798}"  # ⛔ 2026-09-27: #16815 가 2,500 상한에 닿아 채널 «5» 로 옮김(🅞 · 벽에 «닿은 뒤» — 미리 못 옮겼다)
-#   📏 이력: #5730(07-28~08-12) → #8328(08-11~08-25) → #12577(08-25~09-10) → #16815(09-10~09-27) → #20798.
+PR_NUM="${CH_PR:-23032}"  # ⛔ 2026-10-03: #20798 가 2,500 상한 → 채널 «6»(OP)  # ⛔ 2026-09-27: #16815 가 2,500 상한에 닿아 채널 «5» 로 옮김(🅞 · 벽에 «닿은 뒤» — 미리 못 옮겼다)
+#   📏 이력: #5730(07-28~08-12) → #8328(08-11~08-25) → #12577(08-25~09-10) → #16815(09-10~09-27) → #20798(09-27~10-03) → #23032.
 #   ***수명이 «2주 안팎»이다 — 세 판이 전부 그랬다.*** 다음 벽은 09-24 언저리.
 #   🩹 발신이 rc=1 이면 먼저 세라: gh api repos/ElanvitalAI/elanous/issues/<n> --jq .comments
 REPO="${CH_REPO:-ElanvitalAI/elanous}"
@@ -418,6 +418,23 @@ FALLBACK_USES=0
 #     「파이프를 통과하면 성패가 사라진다」와 같은 뿌리다.
 FALLBACK_FLAG="${TMPDIR:-/tmp}/ch-watch-fallback-$PR_NUM-$TRACK.$$"
 
+emit_comments() {  # $1=JSONL (line, archive, comment)
+  local out="$1" deferred
+  [ -n "$out" ] || return 0
+  if [ "${COORD_WATCH_SKIP_OTHERS_REPORTS:-}" = "1" ]; then
+    deferred=$(printf '%s\n' "$out" | jq -c 'select(.archive) | .comment') || return 1
+    if [ -n "$deferred" ]; then
+      mkdir -p "$HOME/.elanous/coord" || return 1
+      printf '%s\n' "$deferred" >> "$HOME/.elanous/coord/$SELF_ID-reports.jsonl" || return 1
+    fi
+  fi
+  if [ "${COORD_WATCH_SKIP_OTHERS_REPORTS:-}" = "1" ]; then
+    printf '%s\n' "$out" | jq -r 'select(.archive | not) | .line' || return 1
+  else
+    printf '%s\n' "$out" | jq -r '.line' || return 1
+  fi
+}
+
 fetch_comments() {   # $1=since(ISO8601) → stdout=포맷된 신규 행 · rc=0 성공 / rc=1 두 경로 다 실패
   local since="$1" out fmt
   # 두 경로가 «같은 형태»를 내도록 정규화된 객체 하나만 본다: {id, created_at, login, body}
@@ -426,13 +443,30 @@ fetch_comments() {   # $1=since(ISO8601) → stdout=포맷된 신규 행 · rc=0
   #     그 글은 필터를 «통과»했고 창에도 떴다 — 그런데 다른 글 사이에 섞여 «요청»으로 안 보였다.
   #   🔑 그러므로 결손은 「고르기」가 아니라 ***「고른 뒤 «구분»하지 않은 것」***이다.
   #   ⛔ 표지를 «본문 앞»에 둔다 — 뒤에 두면 BODY_CHARS 절단에 잘려 사라진다.
-  fmt="select(((.body | sub(\"^[[:space:]#]+\"; \"\")) | (startswith(\"**[$SELF_ID]\") or startswith(\"[$SELF_ID]\") or startswith(\"**[$SELF_ALIAS]\") or startswith(\"[$SELF_ALIAS]\"))) | not)
-       | \"[#$PR_NUM 신규 id=\" + (.id|tostring) + \" \" + .created_at + \" @\" + .login + \"]\"
-         + (if ((.body | test(\"$REQ_ADDR\")) or ((.body | test(\"$REQ_MARK\")) and (.body | test(\"부탁드립니다|부탁합니다\")))) then \" 🙋‼️ 나에게 온 «요청»\" else \"\" end)
-         + \" \" + (.body[:$BODY_CHARS] | gsub(\"\n\"; \" ⏎ \"))"
+  fmt=$(cat <<JQ
+select(((.body | sub("^[[:space:]#]+"; "")) | (startswith("**[$SELF_ID]") or startswith("[$SELF_ID]") or startswith("**[$SELF_ALIAS]") or startswith("[$SELF_ALIAS]"))) | not)
+| . as \$comment
+| ((.body | split("\n")[0] | capture("^[[:space:]#]*[*][*][[][^]]+[]][*][*][^\n]*→[[:space:]]*(?<to>[^\n]+?)[[:space:]]*·[[:space:]]*(?<kind>요청|결정|사고|보고|정정)[[:space:]]*·")) // null) as \$envelope
+| (if \$envelope == null then false else
+     (\$envelope.to | split("·") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")))
+     | any(.[]; . == "$SELF_ID" or . == "$SELF_ALIAS" or . == "전원")
+   end) as \$mine
+| ((.body | test("$REQ_ADDR")) or ((.body | test("$REQ_MARK")) and (.body | test("부탁드립니다|부탁합니다")))) as \$legacy_request
+| (\$envelope != null and \$envelope.kind == "보고" and (\$mine | not)) as \$archive
+| {comment: \$comment, archive: \$archive,
+   line: ("[#$PR_NUM 신규 id=" + (.id|tostring) + " " + .created_at + " @" + .login + "]"
+     + (if \$mine and \$envelope.kind == "결정" then " 🙋 나에게 «결정»"
+        elif \$mine and \$envelope.kind == "요청" then " 🙋 나에게 «요청»"
+        else "" end)
+     + (if \$legacy_request then " 🙋‼️ 나에게 온 «요청»" else "" end)
+     + (if \$envelope != null and (\$envelope.kind == "사고" or \$envelope.kind == "정정") then " 🚨"
+        elif \$archive then " 📄 보고" else "" end)
+     + " " + (.body[:$BODY_CHARS] | gsub("\n"; " ⏎ ")))}
+JQ
+)
   if out=$(gh api --paginate "repos/$REPO/issues/$PR_NUM/comments?since=$since" \
              --jq ".[] | {id, created_at, login: .user.login, body} | $fmt" 2>/dev/null); then
-    printf '%s' "$out"; return 0
+    emit_comments "$out"; return $?
   fi
   local owner="${REPO%%/*}" name="${REPO##*/}"
   if out=$(gh api graphql -f query="query{repository(owner:\"$owner\",name:\"$name\"){pullRequest(number:$PR_NUM){comments(last:$COMMENT_FALLBACK_LAST){nodes{databaseId createdAt author{login} body}}}}}" \
@@ -443,7 +477,7 @@ fetch_comments() {   # $1=since(ISO8601) → stdout=포맷된 신규 행 · rc=0
     # ⭐ 폴백이 «쓰였다»는 사실만 남긴다 — 세는 것도 알릴지 정하는 것도 «부모 셸»이 한다.
     #   ⛔ 여기서 세면 서브셸과 함께 사라진다(위 머리말).
     : > "$FALLBACK_FLAG" 2>/dev/null || true
-    printf '%s' "$out"; return 0
+    emit_comments "$out"; return $?
   fi
   return 1
 }

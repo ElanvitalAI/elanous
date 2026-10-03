@@ -1,4 +1,6 @@
 import type { SlashCommand } from '../../chat/index.js';
+import { readTuiSlashAudience, slashMaturity, slashVisibleFor } from '../../maturity/tui-slash-maturity.js';
+import type { Role } from '../../maturity/feature-maturity.js';
 import { visibleWidth } from '../../tui.js';
 
 const ESSENTIAL_KEYS = [
@@ -34,46 +36,59 @@ export function buildEssentialHelpLines({
   names,
   descriptions,
   width,
+  audience = readTuiSlashAudience(),
 }: {
   names: readonly string[];
   descriptions: readonly Pick<SlashCommand, 'name' | 'aliases' | 'description'>[];
   width: number;
+  audience?: { role: Role; showBeta: boolean };
 }): string[] {
-  const descriptionsByName = new Map<string, string>();
-  for (const command of descriptions) {
-    for (const name of [command.name, ...(command.aliases ?? [])]) {
-      descriptionsByName.set(name, command.description);
-    }
-  }
-  const entries = [...new Set(names)]
-    .sort((a, b) => a.localeCompare(b))
-    .flatMap((name) => {
-      // Removing border glyphs from a name would invent a different, unregistered slash.
-      if (/[│╭╮╰╯┌┐└┘─]/.test(name)) return [];
-      const description = descriptionsByName.get(name)?.replace(/\s+/g, ' ').trim();
-      return description ? [{ name, description }] : [];
-    });
-  // Pack alphabetically in reading order across columns; the handler checks
-  // the modal's row budget and uses scrollable chat if the result outgrows it.
-  const longestName = Math.max(22, ...entries.map(({ name }) => visibleWidth(`/${name}  `) + 1));
-  const columns = Math.max(1, Math.min(Math.ceil(entries.length / 20), Math.floor(width / longestName)));
+  const registered = new Set(names);
+  const entries = descriptions
+    .filter((command) => registered.has(command.name) &&
+      ((audience.role === 'owner' && slashMaturity(command.name) === undefined) || slashVisibleFor(command.name, audience.role, { showBeta: audience.showBeta })))
+    .map((command) => {
+      const aliases = [...new Set(command.aliases ?? [])].filter((alias) => registered.has(alias) && alias !== command.name);
+      const label = `/${command.name}${aliases.length ? ` (${aliases.join(', ')})` : ''}`;
+      const description = command.description.replace(/\s+/g, ' ').trim()
+        .replace(/^(?:(?:H\d+\s+P\d+|CV-\d+|Sprint\s+\d+|Showroom\s+v2)(?:\s*[·—:]\s*|\s+))+/i, '')
+        .trim();
+      return { label, name: command.name, description };
+    })
+    .filter(({ label, description }) => description && !/[│╭╮╰╯┌┐└┘─]/.test(label))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  // Reserve the longest label, 28 description characters, and an ellipsis
+  // in each cell. Never trade a missing label for a shorter modal.
+  const widestLabel = Math.max(0, ...entries.map(({ label }) => visibleWidth(label)));
+  const readableCellWidth = widestLabel + 2 + 28 + 1;
+  const columns = entries.length >= 40 && width >= 100
+    ? Math.max(1, Math.floor(width / (readableCellWidth + 1)))
+    : 1;
   const columnWidth = Math.floor(width / columns);
   const commandLines: string[] = [];
   for (let start = 0; start < entries.length; start += columns) {
-    const cells = entries.slice(start, start + columns).map(({ name, description }) => {
+    const cells = entries.slice(start, start + columns).map(({ label, description }) => {
       const cellWidth = columnWidth - (columns > 1 ? 1 : 0);
-      if (visibleWidth(`/${name}  `) > cellWidth) return '';
-      return fitLine(`/${name}  ${description}`, cellWidth);
+      return visibleWidth(`${label}  `) > cellWidth ? '' : fitLine(`${label}  ${description}`, cellWidth);
     });
     commandLines.push(cells.map((cell, index) =>
       index === cells.length - 1 ? cell : cell + ' '.repeat(columnWidth - visibleWidth(cell)),
     ).join('').trimEnd());
   }
-  return [
-    fitLine('Commands', width),
-    ...commandLines,
-    '',
-    fitLine('Keys', width),
-    ...ESSENTIAL_KEYS.map(([key, description]) => fitLine(`${key}  ${description}`, width)),
-  ];
+  const keyItems = ESSENTIAL_KEYS.map(([key, description]) => `${key}  ${description}`);
+  const keyLines: string[] = [];
+  if (entries.length >= 40 && width >= 100) {
+    let keyRow = '';
+    for (const item of keyItems) {
+      if (keyRow && visibleWidth(keyRow) + 2 + visibleWidth(item) > width) {
+        keyLines.push(keyRow);
+        keyRow = '';
+      }
+      keyRow += (keyRow ? '  ' : '') + fitLine(item, width);
+    }
+    if (keyRow) keyLines.push(keyRow);
+  } else {
+    keyLines.push(...keyItems.map((item) => fitLine(item, width)));
+  }
+  return [fitLine('Commands', width), ...commandLines, '', fitLine('Keys', width), ...keyLines];
 }

@@ -15,7 +15,10 @@
 // In PR α `elanous nexus` is opt-in only; `elanous` continues to launch
 // the legacy dashboard.
 
+import { getElanousConfigDir } from '../elanous-config-dir.js';
 import { hostname } from 'node:os';
+import { request as httpRequest } from 'node:http';
+import { isIP } from 'node:net';
 import { resolveToolCwd } from '../boot/tool-cwd.js';
 import { acquireNexusLock, NexusLockError, readNexusLock, findNexusLifecycleState } from './supervisor/lock.js';
 import { classifyNexusStatus, type NexusHttpHealth } from './status-line.js';
@@ -1267,6 +1270,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
   let coordinatorPushWatcher: { stop(): void } | undefined;
   // V2.2-3 (2026-05-12) — NEXUS-hosted Discord workflow trigger bot.
   // Wired below once the workflow daemon is constructed.
+  let webPushDecisionTimer: ReturnType<typeof setInterval> | undefined;
   let workflowDiscordBot: NexusDiscordTriggerBotHandle | undefined;
   // V2.2-4 (2026-05-12) — NEXUS-hosted Telegram workflow trigger bot.
   let workflowTelegramBot: NexusTelegramTriggerBotHandle | undefined;
@@ -2108,7 +2112,9 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
           },
         } : {}),
         voiceAdapter,
-        ...buildNexusWsBridgeAuth(bearerToken),
+        // The verifier reads the token envelope from the same config dir the boot token was written to
+        // (ensureAuthToken) — default ~/.elanous would make an isolated daemon check the production envelope.
+        ...buildNexusWsBridgeAuth(bearerToken, { configDir: getElanousConfigDir() }),
       };
 
       metaApiOpts = {
@@ -2729,6 +2735,28 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
       console.warn(`[nexus] workflow daemon boot skipped: ${msg}`);
     }
 
+    // Decision cards use the same ledger and first-start baseline as the messaging transports.
+    if ((getUserConfig().raw?.decisions as { cards?: unknown } | undefined)?.cards !== false && !isAutonomousRunContext()) {
+      try {
+        const { DecisionCardService } = await import('../decisions/decision-cards.js');
+        const { webPushDecisionTransport } = await import('../decisions/web-push-decision-cards.js');
+        const { listSubscriptions } = await import('../web-push/subscriptions.js');
+        const { DecisionLedger } = await import('../decisions/decision-ledger.js');
+        const ledger = new DecisionLedger();
+        const service = new DecisionCardService({ transport: webPushDecisionTransport(ledger), ownerIds: [], ledger });
+        await service.tick();
+        webPushDecisionTimer = setInterval(() => {
+          void service.tick().catch((error: unknown) => {
+            debug.log('decisions.webpush', 'tick-failed', { reason: error instanceof Error ? error.message.slice(0, 80) : 'unknown' }, { level: 'warn' });
+          });
+        }, 20_000);
+        webPushDecisionTimer.unref();
+        debug.log('decisions.webpush', 'attached', { subscribers: listSubscriptions().length });
+      } catch (error) {
+        debug.log('decisions.webpush', 'attach-failed', { reason: error instanceof Error ? error.message.slice(0, 80) : 'unknown' }, { level: 'warn' });
+      }
+    }
+
     // W7-후속 (2026-05-12) — Outbound substrate boot. Builds the
     // OutboundRouter + iOS push channel + token store from user-config
     // `notifications.apns.*`. The token store is passed to the http
@@ -3339,6 +3367,7 @@ export async function runNexus(opts: RunNexusOptions = {}): Promise<RunNexusHand
         console.warn(`[nexus] continuation scheduler stop failed: ${(err as Error).message}`);
       }
     }
+    if (webPushDecisionTimer) { clearInterval(webPushDecisionTimer); webPushDecisionTimer = undefined; }
     // R5 — stop the dig-goal armer poller (no-op when never armed).
     if (digArmerHandle) { clearInterval(digArmerHandle); digArmerHandle = undefined; }
     if (replayArmerHandle) { clearInterval(replayArmerHandle); replayArmerHandle = undefined; }
@@ -3876,9 +3905,21 @@ async function probeNexusStatusHealth(runtime: NexusRuntimeMeta | null): Promise
     const healthUrl = new URL('http://localhost/v1/health');
     healthUrl.hostname = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
     healthUrl.port = String(runtime.httpPort);
-    const response = await fetch(healthUrl.href, {
-      signal: AbortSignal.timeout(NEXUS_STATUS_HEALTH_TIMEOUT_MS),
-    });
+    const signal = AbortSignal.timeout(NEXUS_STATUS_HEALTH_TIMEOUT_MS);
+    if (healthUrl.hostname === 'localhost' || healthUrl.hostname === '[::1]'
+      || (isIP(healthUrl.hostname) === 4 && healthUrl.hostname.startsWith('127.'))) {
+      // Bun fetch inherits HTTP_PROXY even for loopback; node:http opens a direct socket.
+      const ok = await new Promise<boolean>((resolve, reject) => {
+        const req = httpRequest(healthUrl, { signal }, (response) => {
+          response.resume();
+          resolve(response.statusCode !== undefined && response.statusCode >= 200 && response.statusCode < 300);
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      return ok ? 'responsive' : 'silent';
+    }
+    const response = await fetch(healthUrl.href, { signal });
     return response.ok ? 'responsive' : 'silent';
   } catch {
     // The request could not complete, so retain unknown rather than infer listener silence.

@@ -1,10 +1,13 @@
-import { afterEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { generateIndexKeyPair, signIndex } from '../market/signed-index.js';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const dirs: string[] = [];
 const repo = resolve(import.meta.dir, '../..');

@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ProjectStore } from '../../project/project-store.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../elanous-config-dir.js';
 import type { FoldMode } from '../../log-entry.js';
 import { resolveSurfaceUx } from '../../agent/surface-ux/build.js';
 import { debug } from '../../debug/log.js';
@@ -164,6 +169,35 @@ function createContext(
     },
   } as unknown as DashboardSlashContext;
 }
+
+test('/session new suggests a matching project once without assigning it to a session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'elanous-tui-project-suggestion-'));
+  const lines: string[] = [];
+  const project = new ProjectStore(root).create({ name: 'TUI Workspace', primaryFolder: process.cwd() });
+  const ctx = createContext(lines);
+  let attached: string | null = null;
+  const history = [{ role: 'system', content: 'prompt' }, { role: 'user', content: 'old' }];
+  ctx.getAttachedSessionId = () => attached;
+  ctx.setAttachedSessionId = (id) => { attached = id; };
+  ctx.setAttachedChatId = () => {};
+  ctx.compactSlash = { chatHistory: history } as DashboardSlashContext['compactSlash'];
+  ctx.sessionSlash = { remoteDaemon: () => null } as DashboardSlashContext['sessionSlash'];
+  setElanousConfigDir(root);
+  try {
+    await buildDashboardSlashRegistry().dispatch('session', ['new'], ctx);
+    expect(lines.filter(line => line.includes('Project suggestion: TUI Workspace'))).toHaveLength(1);
+    expect(lines.join('\n')).toContain(project.id);
+    expect(history).toEqual([{ role: 'system', content: 'prompt' }]);
+    expect(attached).toBeNull();
+    expect(new ProjectStore(root).get(project.id)).toEqual(project);
+    lines.length = 0;
+    await buildDashboardSlashRegistry().dispatch('session', ['clear'], ctx);
+    expect(lines.join('\n')).not.toContain('Project suggestion:');
+  } finally {
+    resetElanousConfigDir();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('/dashboard followed by /chat restores the chat layout (no /ui mode axis)', async () => {
   const lines: string[] = [];

@@ -800,7 +800,8 @@ describe('runPwaTest --stop', () => {
     const r = await runPwaTest({
       repoRoot, out, stop: true,
       ...baseSeams,
-      pwaStopFn: async () => {
+      pwaStopFn: async (stopOpts) => {
+        expect(stopOpts.isolatedRoot).toBe(stateDir);
         stopCalls += 1;
         return {
           exitCode: 0, devKilled: false, nexusStopped: true, shareReset: false,
@@ -820,6 +821,18 @@ describe('runPwaTest --stop', () => {
     expect(unmountCalls).toBe(1);
     // Tailscale unmount before daemon stop (URL goes dark first).
     expect(out.logs.some((l) => l.includes('Tailscale Serve OFF'))).toBe(true);
+  });
+
+  test('failed daemon stop retains the state record for diagnosis', async () => {
+    const stateFile = joinPath(repoRoot, '.elanous-test', 'test-state.json');
+    writeFileSync(stateFile, '{"nexusPort":31450}');
+    const r = await runPwaTest({ repoRoot, out: makeOut(), stop: true, ...baseSeams,
+      pwaStopFn: async () => ({ exitCode: 1, devKilled: false, nexusStopped: false, shareReset: false,
+        shareUnmount: { status: 'skipped', reason: 'pwa-port-unknown' } }),
+      tailscaleUnmountFn: async () => ({ ok: true, reason: 'no-state' }),
+    });
+    expect(r.exitCode).toBe(1);
+    expect(readFileSync(stateFile, 'utf8')).toBe('{"nexusPort":31450}');
   });
 
   test('stop succeeds when no Tailscale state is present (idempotent)', async () => {

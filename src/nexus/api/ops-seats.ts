@@ -1,7 +1,7 @@
 // GET /v1/ops/seats?date=YYYY-MM-DD — one row per seat: latest channel line, PRs landed that day, red items, open decisions.
 // A source that could not be read is null, never 0 («못 읽음» ≠ «없음»). Contract: 내부 문서 `DESIGN-ops3-seat-board-and-public-demo-2026-10-02` §1.
 import { debug, redactSecretText } from '../../debug/log.js';
-import type { ChecklistItem } from '../../release-loop/checklist.js';
+import { parseOwner, type ChecklistItem } from '../../release-loop/checklist.js';
 import { canonicalSeatId } from '../../msg/msg-store.js';
 
 export const SEATS = [
@@ -9,11 +9,17 @@ export const SEATS = [
 ] as const;
 export const SEATS_CACHE_MS = 60_000;
 
-export interface ChannelComment { body: string; createdAt: string }
+export interface ChannelComment { body: string; createdAt: string; url?: string }
+export type ChannelSource = 'ledger' | 'github' | 'unreadable' | 'unknown';
+export type ChannelResult = ChannelComment[] | {
+  comments: ChannelComment[];
+  source: 'ledger' | 'github';
+  seatSources?: Partial<Record<(typeof SEATS)[number]['seat'], ChannelSource>>;
+} | null;
 export interface MergedPr { number: number; title: string; body: string; mergedAt: string }
 export interface SeatsSources {
   /** Coordination-channel comments created on `date` (KST) or later; null when unreadable. */
-  channel(date: string): Promise<ChannelComment[] | null>;
+  channel(date: string): Promise<ChannelResult>;
   /** PRs merged on `date` (KST); null when unreadable. */
   merged(date: string): Promise<MergedPr[] | null>;
   /** Checklist items of the version being worked on (counts, red) and of every version known (id → owner). */
@@ -24,6 +30,7 @@ export interface SeatsSources {
 
 export interface SeatRow {
   seat: string; role: string;
+  channelSource: ChannelSource;
   now: { text: string; at: string } | null;
   landed: Array<{ pr: number; title: string; at: string; checklistId: string | null }> | null;
   blocked: Array<{ id: string; title: string; status: 'red' }> | null;
@@ -33,7 +40,7 @@ export interface SeatRow {
 
 function seatOf(value: string | undefined): string | null {
   if (!value) return null;
-  try { return canonicalSeatId(value); } catch { return null; }
+  try { return canonicalSeatId(value.includes('/') ? parseOwner(value).seat : value); } catch { return null; }
 }
 
 const clip = (text: string, max: number) => redactSecretText(text).slice(0, max);
@@ -49,9 +56,11 @@ function checklistIdOf(pr: MergedPr, ids: string[]): string | null {
 }
 
 export async function buildSeatsBoard(date: string, sources: SeatsSources): Promise<{ date: string; seats: SeatRow[] }> {
-  const [channel, merged] = await Promise.all([
+  const [channelResult, merged] = await Promise.all([
     sources.channel(date).catch(() => null), sources.merged(date).catch(() => null),
   ]);
+  const channel = Array.isArray(channelResult) ? channelResult : channelResult?.comments ?? null;
+  const channelSource: ChannelSource = channelResult === null ? 'unreadable' : 'unknown';
   let checklist: ReturnType<SeatsSources['checklist']> = null;
   try { checklist = sources.checklist(); } catch { checklist = null; }
   let raisers: string[] | null = null;
@@ -72,7 +81,8 @@ export async function buildSeatsBoard(date: string, sources: SeatsSources): Prom
     const latest = channel?.filter((c) => c.body.trimStart().startsWith(`**[${seat}]**`)).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
     const mine = checklist?.current.filter((item) => seatOf(item.owner) === seat);
     return {
-      seat, role,
+      seat, role, channelSource: channelResult && !Array.isArray(channelResult)
+        ? channelResult.seatSources?.[seat] ?? channelSource : channelSource,
       now: latest ? { text: clip(latest.body.trimStart().split('\n')[0]!, 120), at: latest.createdAt } : null,
       landed: merged === null || checklist === null ? null : (landedBySeat.get(seat) ?? []).sort((a, b) => a.at.localeCompare(b.at)),
       blocked: mine ? mine.filter((item) => item.status === 'red').map((item) => ({ id: item.id, title: clip(item.title, 80), status: 'red' as const })) : null,

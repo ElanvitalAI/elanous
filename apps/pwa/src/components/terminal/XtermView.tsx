@@ -43,7 +43,8 @@ import { isXtermCapabilityResponse } from '@/lib/xterm-capability-filter';
 import { createTerminalInputSender } from './terminal-input-sender';
 import { registerTerminalInput } from './terminal-input-registry';
 import { shouldClear } from './terminal-clear';
-import { clampFontSize, fontStepKey, isFocusToggleKey, readTermFontSize, writeTermFontSize } from '@/lib/term-focus';
+import { clampFontSize, fontStepKey, isFocusToggleKey, readTermFocusStartDisabled, readTermFontSize, writeTermFocusStartDisabled, writeTermFontSize } from '@/lib/term-focus';
+import { useCompactMode } from '@/lib/compact-mode';
 
 interface Props {
   sessionId: string;
@@ -67,19 +68,37 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
   const termRef = useRef<Terminal | null>(null);
   // TERM2 집중 모드 — 터미널 표면이 화면 전체를 덮는다(사이드바·머리 줄·독·칩을 하나씩 숨기지 않는다).
   const hostRef = useRef<HTMLDivElement>(null);
+  const { compact } = useCompactMode();
   const [focusMode, setFocusMode] = useState(false);
+  const focusModeRef = useRef(focusMode);
+  focusModeRef.current = focusMode;
+  const initialFocusChecked = useRef(false);
+  useEffect(() => {
+    if (initialFocusChecked.current || !compact) return;
+    initialFocusChecked.current = true;
+    if (window.matchMedia?.('(pointer: coarse)').matches) {
+      let storage: Storage | null = null;
+      try { storage = window.localStorage; } catch { /* Default to focus mode when storage is unavailable. */ }
+      if (!readTermFocusStartDisabled(storage)) { focusModeRef.current = true; setFocusMode(true); }
+    }
+  }, [compact]);
+  const toggleFocusMode = () => {
+    const wasFocused = focusModeRef.current;
+    focusModeRef.current = !wasFocused;
+    if (wasFocused) {
+      try { writeTermFocusStartDisabled(window.localStorage); } catch { /* The exit still applies. */ }
+    }
+    setFocusMode(!wasFocused);
+  };
   const previousClearRequestRef = useRef<number | undefined>(undefined);
   const clearTerminalIdRef = useRef(terminalId);
   if (clearTerminalIdRef.current !== terminalId) {
     clearTerminalIdRef.current = terminalId;
     previousClearRequestRef.current = undefined;
   }
-  // Latest sessionId snapshot for use inside the (deps-frozen) effect.
-  // Without this, terminal/input frames after handshake still need the
-  // up-to-date daemon-issued id, but we can't include `sessionId` in
-  // effect deps without retriggering reconnect cycles.
+  // The ACP handshake, not the shared provider prop, owns this view's session.
+  // Other consumers can update the provider with a different connection's id.
   const sessionIdRef = useRef(sessionId);
-  sessionIdRef.current = sessionId;
 
   // WT-M-1 — keep the latest callback in a ref so the effect closure
   // doesn't go stale when the parent re-creates the function. The
@@ -172,6 +191,9 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     term.unicode.activeVersion = '11';
     term.open(ref.current);
     termRef.current = term;
+    // Read-only CDP scenario hook: inspect the rendered xterm buffer, not daemon replay or DOM canvas text.
+    const screenHost = hostRef.current as (HTMLDivElement & { __elanousTerm?: Terminal }) | null;
+    if (screenHost) screenHost.__elanousTerm = term;
     fit.fit();
 
     // BACKLOG #3 — restore prior scrollback before the daemon streams
@@ -192,10 +214,12 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     // onSession callback; we sync it into DaemonProvider so chat /
     // intake / control surfaces share the same session.
     let confirmInputSession: (sid: string) => void = () => {};
+    let sessionAnnounced = false;
     const acp = client.connectAcp({
       ...(sessionId ? { sessionId } : {}),
       onSession: (sid) => {
         if (sid) {
+          sessionAnnounced = true;
           sessionIdRef.current = sid;
           confirmInputSession(sid);
         }
@@ -238,8 +262,14 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     const shellCap = setTimeout(() => openShell(`cap-${SHELL_READY_CAP_MS}ms`), SHELL_READY_CAP_MS);
     void acp.ready.then((daemonSid) => {
       if (!daemonSid) { openShell('no-session'); return; } // handshake failed — silent
+      // A shared ACP transport can already be ready before this view subscribes.
+      // Its ready id is a fallback only: a newer onSession announcement wins.
+      if (!sessionAnnounced) sessionIdRef.current = daemonSid;
+      // The sender's ready listener runs after this callback; confirm once it
+      // has recorded readySessionId, without reverting a newer onSession id.
+      queueMicrotask(() => confirmInputSession(sessionIdRef.current));
       return acp.send('terminal/spawn', {
-        sessionId: daemonSid,
+        sessionId: sessionIdRef.current,
         terminalId,
         cols: term.cols,
         rows: term.rows,
@@ -466,6 +496,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       try { resizeDisposable?.dispose(); } catch { /* swallow */ }
       try { acp.close(); } catch { /* swallow */ }
       if (termRef.current === term) termRef.current = null;
+      if (screenHost?.__elanousTerm === term) delete screenHost.__elanousTerm;
       try { term.dispose(); } catch { /* swallow */ }
       debugLog('webterm.xterm.teardown', { terminalId });
     };
@@ -546,7 +577,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
     const onKey = (e: KeyboardEvent) => {
       if (isFocusToggleKey(e) && owns()) {
         e.preventDefault(); e.stopPropagation();
-        setFocusMode((on) => !on);
+        toggleFocusMode();
         return;
       }
       const step = fontStepKey(e);
@@ -585,7 +616,7 @@ export function XtermView({ sessionId, terminalId, clearRequest = 0, readOnly = 
       <button
         type="button"
         data-share-hide
-        onClick={() => setFocusMode((on) => !on)}
+        onClick={toggleFocusMode}
         aria-pressed={focusMode}
         aria-label={focusMode ? '집중 모드 끄기' : '집중 모드 — 터미널만 크게'}
         title={focusMode ? '집중 모드 끄기 (Ctrl/⌘+Shift+F)' : '집중 모드 — 터미널만 크게 (Ctrl/⌘+Shift+F · 글자 Ctrl/⌘+Shift+±)'}

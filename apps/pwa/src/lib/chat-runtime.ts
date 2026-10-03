@@ -3,6 +3,7 @@
  * when ACP is unavailable, plus local meta-command dispatch.
  */
 
+import { cardTextFromToolOutput } from './elanous-card';
 import type {
   AcpConnection,
   AcpFrame,
@@ -20,6 +21,8 @@ import { forkSession } from './daemon-session';
 import { debugLog } from './debug';
 import { fetchBudgetStatus, type BudgetStatusBody } from './budget-status';
 import type { DaemonHttpConfig } from './model-tier-sync';
+import { handleModelCommand, parseModelCommand } from './chat-model-commands';
+import { handleSessionCommand, parseSessionCommand } from './chat-session-commands';
 import { isMcpAppHtmlMime } from '../../../../src/tool-runtime/mcp-app-mime';
 import { mcpResultImages, mcpAppResourceUriOf } from '../../../../src/feedback/media';
 
@@ -145,6 +148,15 @@ export interface McpAppPayload {
  *  유효한 payload만 기존 블록 누산기로 보낸다. 봉투 모양이지만 깨진 입력은 생각 렌더러에
  *  전달하지 않아 원시 마커가 새지 않는다. */
 const FEEDBACK_ENVELOPE_HEAD = /^\[elanous\/feedback\/[a-zA-Z]+\] /;
+
+/** REL9p — a tool answer's ```elanous-card``` blocks become their own text block (rendered as cards).
+ *  Every place that finishes a tool block calls this, like `mcpResultImages` — the pill never shows output. */
+export function pushToolCards(blocks: ChatBlock[], rawOutput: unknown): boolean {
+  const text = cardTextFromToolOutput(rawOutput);
+  if (!text || blocks.some((b) => b.kind === 'text' && b.text === text)) return false;
+  blocks.push({ kind: 'text', text });
+  return true;
+}
 
 export function parseMcpAppPayload(rawOutput: unknown, screenUrl: string): McpAppPayload | undefined {
   if (!rawOutput || typeof rawOutput !== 'object' || Array.isArray(rawOutput)) return undefined;
@@ -406,18 +418,47 @@ export function formatHistoryLines(
 }
 
 export const META_COMMANDS: readonly { name: string; description: string }[] = [
-  { name: 'help', description: 'Show this help' },
-  { name: 'session', description: 'Show current session id' },
-  { name: 'fork', description: 'Allocate a fresh session id' },
-  { name: 'budget', description: 'Show this month spend and the notify threshold' },
-  { name: 'history', description: 'Summarize the last N local turns (default 10) as role: first 80 chars' },
-  { name: 'clear', description: 'Clear local message buffer' },
+  { name: 'help', description: '이 도움말 보기' },
+  { name: 'session', description: '현재 세션 ID 보기' },
+  { name: 'fork', description: '새 세션 ID 만들기' },
+  { name: 'budget', description: '이번 달 지출과 알림 기준 보기' },
+  { name: 'history', description: '최근 N개 로컬 대화 요약 (기본 10개, 역할: 앞 80자)' },
+  { name: 'clear', description: '로컬 대화 기록 지우기' },
+  { name: 'sessions', description: '최근 대화 목록 보기 (/sessions [N])' },
+  { name: 'resume', description: '대화 이어가기 (/resume <id 앞자리>)' },
+  { name: 'model', description: '모델 티어 보기·바꾸기 (/model <티어|별칭>)' },
+  { name: 'reasoning', description: '추론 단계 보기·설정 안내 (/reasoning <low|medium|high>)' },
+  { name: 'provider', description: '프로바이더 보기·바꾸기 (/provider next|use <이름>)' },
 ];
 
+const LOCAL_META_NAMES = ['help', 'session', 'fork', 'budget', 'history', 'clear'] as const;
 const HELP_TEXT = [
-  'Meta commands (enter :name or /name):',
-  ...META_COMMANDS.map(({ name, description }) => `  :${name.padEnd(16)}${description}`),
+  '메타 명령(:이름 또는 /이름) (Meta commands):',
+  ...META_COMMANDS.map(({ name, description }) => `  ${(LOCAL_META_NAMES as readonly string[]).includes(name) ? ':' : '/'}${name.padEnd(16)}${description}`),
 ].join('\n');
+
+// TUI src/chat/index.ts SLASH_COMMANDS names + aliases (not imported into the PWA bundle).
+// Recheck: bun test apps/pwa/src/lib/chat-runtime.meta.test.ts -t 'keeps the local TUI-name snapshot'
+const TUI_SLASH_NAMES = new Set([
+  'help', '?', 'resume', 'clear', 'cls', 'status', 'st',
+  'remaining', 'setup', 'quit', 'q', 'exit', 'run-skill', 'rs', 'run',
+  'ad', 'design', 'design-check',
+  'local', 'll', 'session', 'sess', 'fork', 'rewind', 'mission',
+  'resume-turn', 'context', 'ctx', 'paste', 'sync', 's', 'plugin',
+  'plugins', 'widget', 'widgets', 'log', 'memory', 'mem', 'export',
+  'delta', 'diffs', 'theme', 'debug', 'rebind', 'api-allow', 'api',
+  'prompt', 'prompts', 'history', 'hist', 'inputs', 'research', 'rsh',
+  'harness', 'plan', 'chat', 'dashboard', 'dash', 'telegram', 'tg',
+  'tablet', 'surface', 'term', 'terminal', 'claude', 'codex', 'gemini',
+  'acp', 'conv', 'handoff', 'agent-room', 'showroom', 'sr', 'reply',
+  'capture', 'inject', 'relay', 'lane', 'control', 'default', 'qc',
+  'voice-chat', 'vc', 'auto-tts', 'tts', 'autotts', 'directive',
+]);
+const PWA_MODEL_ALIASES: Readonly<Record<string, string>> = { m: 'model', r: 'reasoning', think: 'reasoning', p: 'provider' };
+const UNSUPPORTED_TUI_SLASH_NAMES = new Set([...TUI_SLASH_NAMES].filter((name) =>
+  !META_COMMANDS.some((command) => command.name === name),
+));
+const LEGACY_META_SLASH_NAMES = LOCAL_META_NAMES.map((name) => `/${name}`).join(' ');
 
 export const META_HANDLERS: Record<
   string,
@@ -442,14 +483,19 @@ export const META_HANDLERS: Record<
     return { text: formatHistoryLines(ctx.messages ?? [], n) };
   },
   ':clear': async () => ({ text: '__CLEAR__' }), // sentinel; UI clears its buffer
+  ':sessions': async (args, ctx) => handleSessionCommand(parseSessionCommand('sessions', args), ctx),
+  ':resume': async (args, ctx) => handleSessionCommand(parseSessionCommand('resume', args), ctx),
+  ':model': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('model', args), ctx) }),
+  ':reasoning': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('reasoning', args), ctx) }),
+  ':provider': async (args, ctx) => ({ text: await handleModelCommand(parseModelCommand('provider', args), ctx) }),
 };
 
 export function isMetaCommand(line: string): boolean {
   const trimmed = line.trimStart();
   if (trimmed.startsWith(':')) return true;
-  if (!trimmed.startsWith('/')) return false;
-  const [cmd] = trimmed.split(/\s+/);
-  return Object.hasOwn(META_HANDLERS, `:${cmd.slice(1)}`);
+  if (!trimmed.startsWith('/') || trimmed.length < 2 || /\s/.test(trimmed[1]!)) return false;
+  const [entered] = trimmed.split(/\s+/);
+  return !entered.slice(1).includes('/');
 }
 
 export async function dispatchMeta(
@@ -459,11 +505,30 @@ export async function dispatchMeta(
   const trimmed = line.trim();
   if (!trimmed.startsWith(':') && !trimmed.startsWith('/')) return null;
   const [entered, ...args] = trimmed.split(/\s+/);
-  const cmd = entered.startsWith('/') ? `:${entered.slice(1)}` : entered;
-  if (entered.startsWith('/') && !Object.hasOwn(META_HANDLERS, cmd)) return null;
-  debugLog('webterm.chat.meta-command', { cmd });
-  const handler = Object.hasOwn(META_HANDLERS, cmd) ? META_HANDLERS[cmd] : undefined;
-  if (!handler) return { text: `unknown meta command: ${entered}` };
+  if (entered.startsWith('/') && !isMetaCommand(line)) return null;
+  const slash = entered.startsWith('/');
+  const cmd = slash ? `:${entered.slice(1)}` : entered;
+  const alias = slash && Object.hasOwn(PWA_MODEL_ALIASES, entered.slice(1))
+    ? PWA_MODEL_ALIASES[entered.slice(1)] : entered.slice(1);
+  const key = `:${alias}`;
+  // Keep legacy unknown-colon behavior for unrecognized provider subcommands;
+  // slash commands use the new parser's available-values response.
+  const unknownColonProviderAction = !slash && key === ':provider'
+    && args.length > 0 && args[0] !== 'next' && args[0] !== 'use';
+  const handler = !unknownColonProviderAction && Object.hasOwn(META_HANDLERS, key)
+    ? META_HANDLERS[key] : undefined;
+  if (!handler) {
+    if (slash) {
+      const supportedInTui = UNSUPPORTED_TUI_SLASH_NAMES.has(entered.slice(1));
+      debugLog('webterm.chat.meta-command', { cmd, outcome: supportedInTui ? 'unsupported-tui' : 'unknown' });
+      return { text: supportedInTui
+        ? `${entered} 은 PWA 채팅에서 아직 안 됩니다 — 지금 되는 명령: ${LEGACY_META_SLASH_NAMES}`
+        : `모르는 명령입니다: ${entered} — /help 로 목록 보기` };
+    }
+    debugLog('webterm.chat.meta-command', { cmd, outcome: 'unknown' });
+    return { text: `unknown meta command: ${entered}` };
+  }
+  debugLog('webterm.chat.meta-command', { cmd, outcome: 'ok' });
   return handler(args, ctx);
 }
 
@@ -653,6 +718,7 @@ export async function runChatTurnStreaming(
             ...(summary !== undefined ? { summary } : {}),
           };
         }
+        pushToolCards(blocks, rawOutput);
         if (typeof resourceUri === 'string' && resourceUri.trim().length > 0) {
           mcpAppCount += 1;
           const payload = parseMcpAppPayload(rawOutput, resourceUri);
@@ -889,6 +955,7 @@ export function runChatTurnObserver(
           ...(summary !== undefined ? { summary } : {}),
         };
       }
+      pushToolCards(blocks, rawOutput);
       if (typeof resourceUri === 'string' && resourceUri.trim().length > 0) {
         mcpAppCount += 1;
         const payload = parseMcpAppPayload(rawOutput, resourceUri);
@@ -1177,6 +1244,7 @@ export async function runChatTurnAcp(
       //    ⇒ 그래서 앞의 열 조각이 전부 통과하는데도 위젯이 «영영» 안 떴다.
       //  ⛔ 「두 경로가 같은 일을 한다」고 «가정»하지 않는다 — 이 저장소에서 그 가정이 여러 번 틀렸다.
       // ⭐ 결과에 이미지가 있으면 «그려서» 보여 준다 — 링크만 남기지 않는다(대표 2026-08-21).
+      pushToolCards(blocks, update.rawOutput);
       for (const img of mcpResultImages(update.rawOutput)) {
         if (blocks.some((b) => b.kind === 'image' && b.src === img.src)) continue;
         imageCount += 1;

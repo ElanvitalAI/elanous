@@ -78,6 +78,34 @@ describe('recall relevance — priority / pinned / anti-false-recall', () => {
     expect(reloaded.pinned).toBe(true);
   });
 
+  test('stale-after-minutes round-trip and update preserves freshness', () => {
+    const a = saveMemory({ type: 'project', name: 'fresh', description: 'd', body: 'original', pinned: true, staleAfterMinutes: 120 });
+    expect(readFileSync(join(memDir(), a.filename), 'utf8')).toContain('stale-after-minutes: 120');
+    const b = saveMemory({ type: 'project', name: 'fresh', description: 'd', body: 'new', id: a.id });
+    expect(b.staleAfterMinutes).toBe(120);
+    expect(loadMemory(a.id)?.staleAfterMinutes).toBe(120);
+  });
+
+  test('pinned freshness guard in keyword and LLM paths; absent window preserves exact block', async () => {
+    const a = saveMemory({ type: 'project', name: 'ops-now', description: 'd', body: 'body', pinned: true, staleAfterMinutes: 120 });
+    const path = join(memDir(), a.filename);
+    const raw = readFileSync(path, 'utf8');
+    writeFileSync(path, raw.replace(/^updated: .*$/m, `updated: ${new Date(Date.now() - 3 * 3_600_000).toISOString()}`));
+    const old = buildMemoryInjection('unrelated');
+    expect(old.block).toContain('⚠️ 이 기억은 3시간 전 것이다');
+    expect(old.block).toContain('«확인 중»');
+    expect((await buildMemoryInjectionLLM('unrelated', { judge: async () => '[]' })).block).toContain('⚠️ 이 기억은 3시간 전 것이다');
+    writeFileSync(path, raw.replace(/^updated: .*$/m, `updated: ${new Date(Date.now() - 3_600_000).toISOString()}`));
+    expect(buildMemoryInjection('unrelated').block).not.toContain('⚠️ 이 기억은');
+    const noWindow = saveMemory({ type: 'project', name: 'legacy', description: 'd', body: 'legacy body', pinned: true });
+    const legacy = buildMemoryInjection('unrelated');
+    expect(legacy.block).toContain(`### 📌 [project] ${noWindow.name}\n\nlegacy body`);
+    expect(legacy.block).not.toContain(`### 📌 [project] legacy\n\n⚠️`);
+    const legacyOnly = buildMemoryInjection('unrelated', {}, memDir());
+    expect(legacyOnly.block).toContain(`### 📌 [project] legacy\n\nlegacy body`);
+    expect(legacyOnly.block).not.toContain('⚠️ 이 기억은');
+  });
+
   test('update preserves priority/pinned when not re-specified', () => {
     const a = saveMemory({ type: 'reference', name: 'r', description: 'd', body: 'b', priority: 5, pinned: true });
     const b = saveMemory({ type: 'reference', name: 'r', description: 'd2', body: 'b2', id: a.id });
@@ -179,6 +207,13 @@ describe('LLM-judge recall', () => {
     expect(p).toContain('git ref');
     expect(p).toMatch(/reference.*단어가 우연히 겹|우연히 겹/);
   });
+});
+
+test('pinned memory without a freshness window retains the exact legacy injection bytes in both paths', async () => {
+  saveMemory({ type: 'project', name: 'legacy', description: 'd', body: 'legacy body', pinned: true });
+  const expected = `## Memory\n\n## Memory index\n\n${readIndex().trim()}\n\n## Pinned memories\n\n### 📌 [project] legacy\n\nlegacy body`;
+  expect(buildMemoryInjection('unrelated').block).toBe(expected);
+  expect((await buildMemoryInjectionLLM('unrelated', { judge: async () => '[]' })).block).toBe(expected);
 });
 
 describe('listMemories', () => {

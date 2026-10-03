@@ -6,9 +6,10 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
+import { readPendingQuestions } from '../ask-user-question/pending-questions.js';
 import { DecisionLedger, type DecisionEntry } from './decision-ledger.js';
 
-export type CardPlatform = 'telegram' | 'discord';
+export type CardPlatform = 'telegram' | 'discord' | 'webpush';
 export interface CardButton { label: string; data: string }
 export interface CardView { text: string; buttons: CardButton[][] }
 export interface CardRef { chat: string; message: string }
@@ -99,6 +100,7 @@ export interface DecisionCardServiceOptions {
   /** Owner user ids for this platform — taps from anyone else are refused and observed. */
   ownerIds: readonly string[];
   ledger?: DecisionLedger;
+  pendingQuestions?: typeof readPendingQuestions;
   /** Where this platform keeps which card it sent (one file per platform — the two bots may run in different processes). */
   statePath?: string;
   now?: () => Date;
@@ -149,6 +151,52 @@ export class DecisionCardService {
     }
     let dirty = false;
     if (!state.since) { state.since = this.now().toISOString(); dirty = true; debug.log('decisions.telegram', 'baseline', { platform, since: state.since }); }
+    // Same state root as the ledger — the H2 answer writer delivers under the ledger's stateDir, so the questions are read there too.
+    const pending = this.opts.pendingQuestions ? this.opts.pendingQuestions() : readPendingQuestions({ root: () => join(this.ledger.path, '..', '..') });
+    if (pending.ok) {
+      const seen = new Set(all.flatMap(entry => entry.resume ? [entry.resume.questionId] : []));
+      for (const record of pending.questions) {
+        for (const question of record.questions) {
+          const data = { questionId: record.id, runId: record.runId };
+          if (record.expiresAt && record.expiresAt <= this.now().toISOString()) {
+            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: 'expired' });
+            continue;
+          }
+          if (question.impact !== 'high' && question.impact !== 'critical') {
+            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: 'impact' });
+            continue;
+          }
+          if (record.questions.length !== 1 || question.options.length < 2 || question.options.length > 4) {
+            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: 'options' });
+            continue;
+          }
+          if (seen.has(record.id)) {
+            debug.log('hitl.card-bridge', 'dedup', { ...data, decisionId: all.find(entry => entry.resume?.questionId === record.id)?.id, reason: 'already-raised' });
+            continue;
+          }
+          try {
+            const keys = ['a', 'b', 'c', 'd'];
+            const recommended = question.recommendedIndex;
+            const entry = this.ledger.raise({
+              title: question.question.split(/\r?\n/, 1)[0]!.slice(0, 120),
+              category: question.impact === 'critical' ? 'irreversible' : 'scope',
+              scqa: { s: question.question, c: question.question },
+              options: question.options.map((option, index) => ({ key: keys[index]!, label: option.label, consequence: option.description })),
+              recommendation: recommended !== undefined && Number.isInteger(recommended) && recommended >= 0 && recommended < question.options.length
+                ? { option: keys[recommended]!, why: '런이 추천' } : { skipped: true, reason: '추천 없음' },
+              raisedBy: { agent: 'harness' },
+              resume: { questionId: record.id, ...(record.runId === undefined ? {} : { runId: record.runId }) },
+              ...(record.expiresAt ? { dueAt: record.expiresAt } : {}),
+            });
+            seen.add(record.id);
+            all.unshift(entry);
+            debug.log('hitl.card-bridge', 'raised', { ...data, decisionId: entry.id });
+          } catch (error) {
+            debug.log('hitl.card-bridge', 'skipped', { ...data, reason: error instanceof Error ? error.name : 'unknown' });
+          }
+        }
+      }
+    } else debug.log('hitl.card-bridge', 'skipped', { reason: 'pending-unreadable' });
     const chats = await this.opts.transport.ownerChats().catch(() => [] as string[]);
     for (const e of all) {
       const card = state.cards[e.id];

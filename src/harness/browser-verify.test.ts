@@ -380,6 +380,80 @@ describe('verifyDeployedPage (B2)', () => {
     expect(r).toEqual({ ok: true, url: 'https://aside.example/path?quoted="yes"', title: 'Aside page', bodyLength: 88, screenshotBytes: 11, findings: [], unmeasured: ['javascript-errors'] });
   });
 
+  test('aside 스크립트가 PNG를 표지로 돌려주면 바이트를 정확히 한 번 전달한다', async () => {
+    const png = Buffer.from('89504e470d0a1a0a00010203', 'hex');
+    const received: Buffer[] = [];
+    const logs: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'harness.browser-verify' && event === 'aside-shot') logs.push(data);
+    });
+    try {
+      const r = await verifyDeployedPage('https://aside.example/path?secret=1', {
+        backend: 'aside', onScreenshot: (buf) => received.push(buf),
+        runAside: async (_command, args) => {
+          const output: string[] = [];
+          await new Function('openTab', 'closeTab', 'console', `return (async () => { ${args[1]} })()`)(
+            async () => ({ title: async () => 'Page', evaluate: async () => ({ bodyLength: 80, unloadedImageCount: 0, pendingLazyImages: 0 }), screenshot: async () => png }),
+            async () => {}, { log: (line: string) => output.push(line) },
+          );
+          expect(output.some((line) => line === `ELANOUS_SHOT_BASE64:${png.toString('base64')}`)).toBe(true);
+          return { stdout: `${output.join('\n')}\n[ok | 1ms]` };
+        },
+      });
+      expect(r).toMatchObject({ ok: true, screenshotBytes: png.length, findings: [], unmeasured: ['javascript-errors'] });
+      expect(received).toHaveLength(1);
+      expect(received[0]).toEqual(png);
+      expect(logs).toEqual([{ bytes: png.length, written: true, reason: '없음' }]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('aside 저장 콜백이 던지면 aside-shot 관측에 실패 이유만 남긴다', async () => {
+    const logs: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation((category, event, data) => {
+      if (category === 'harness.browser-verify' && event === 'aside-shot') logs.push(data);
+    });
+    try {
+      const r = await verifyDeployedPage('https://aside.example/?private=1', {
+        backend: 'aside', onScreenshot: () => { throw new Error('disk unavailable'); },
+        runAside: async () => ({ stdout: '{"title":"Page","bodyLength":80,"unloadedImageCount":0,"screenshotBytes":5}\nELANOUS_SHOT_BASE64:aW1hZ2U=\n[ok | 1ms]' }),
+      });
+      expect(r.ok).toBe(true);
+      expect(r.unmeasured).toContain('screenshot');
+      expect(logs).toEqual([{ bytes: 5, written: false, reason: '저장 콜백 오류' }]);
+    } finally { log.mockRestore(); }
+  });
+
+  test('aside 0바이트 스크린샷은 렌더 성공이 아니고 screenshot 미측정이다', async () => {
+    let calls = 0;
+    const r = await verifyDeployedPage('https://aside.example', {
+      backend: 'aside', onScreenshot: () => { calls++; },
+      runAside: async () => ({ stdout: '{"title":"Page","bodyLength":80,"unloadedImageCount":0,"screenshotBytes":0}\n[ok | 1ms]' }),
+    });
+    expect(r.ok).toBe(false);
+    expect(r.findings).toContain('스크린샷 0바이트 — 렌더 증거 없음');
+    expect(r.unmeasured).toContain('screenshot');
+    expect(calls).toBe(0);
+  });
+
+  test('aside 8MB 상한을 넘는 그림은 길이만 보고 전달하지 않는다', async () => {
+    let calls = 0;
+    const r = await verifyDeployedPage('https://aside.example', {
+      backend: 'aside', onScreenshot: () => { calls++; },
+      runAside: async (_command, args) => {
+        const output: string[] = [];
+        await new Function('openTab', 'closeTab', 'console', `return (async () => { ${args[1]} })()`)(
+          async () => ({ title: async () => 'Page', evaluate: async () => ({ bodyLength: 80, unloadedImageCount: 0 }), screenshot: async () => Buffer.alloc(8 * 1024 * 1024 + 1) }),
+          async () => {}, { log: (line: string) => output.push(line) },
+        );
+        expect(output.some((line) => line.startsWith('ELANOUS_SHOT_BASE64:'))).toBe(false);
+        return { stdout: `${output.join('\n')}\n[ok | 1ms]` };
+      },
+    });
+    expect(r.screenshotBytes).toBe(8 * 1024 * 1024 + 1);
+    expect(r.unmeasured).toContain('screenshot');
+    expect(calls).toBe(0);
+  });
+
   test('Aside 미실행 문구가 페이지 제목이면 정상 ok 관측으로 유지한다', async () => {
     const url = 'https://aside.example';
     const r = await verifyDeployedPage(url, {

@@ -10,10 +10,13 @@
 //    안 일어나면      → 그 서브커맨드 자신의 산출
 //    두 문면이 «갈린다»는 것을 코드를 깨서 확인한 뒤에 이 시험을 썼다.
 
-import { describe, expect, test, beforeAll, afterAll } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test, beforeAll, afterAll } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const CLI = join(import.meta.dir, '..', 'bin', 'elanous.mjs');
 

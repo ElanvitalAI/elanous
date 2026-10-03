@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  createSession, appendMessage, loadSession, listSessions, deleteSession,
+  createSession, adoptSession, appendMessage, loadSession, listSessions, deleteSession,
   findTelegramSession, resolveSessionId, forkSessionFromHistory,
   getActiveSessionId, setActiveSessionId, clearActiveSessionId,
   defaultSessionSourceKind,
@@ -78,6 +78,36 @@ describe('session CRUD', () => {
     expect(listSessions({ source: 'telegram' }, root).length).toBe(1);
     expect(listSessions({ sourceKind: 'telegram' }, root).length).toBe(1);
     expect(listSessions({ limit: 1 }, root).length).toBe(1);
+  });
+
+  test('projectId persists in the existing index and filters before limit', () => {
+    const old = createSession({ title: 'legacy' }, root);
+    const other = createSession({ projectId: 'other' }, root);
+    const matched = createSession({ projectId: 'project-a' }, root);
+    const newestNonmatch = createSession({ projectId: 'other' }, root);
+    expect(listSessions({ projectId: 'project-a', limit: 1 }, root).map(m => m.id)).toEqual([matched.id]);
+    expect(listSessions({ projectId: 'other' }, root).map(m => m.id)).toEqual([newestNonmatch.id, other.id]);
+    expect(listSessions({ projectId: 'missing' }, root)).toEqual([]);
+    expect(listSessions({}, root).map(m => m.id)).toEqual([newestNonmatch.id, matched.id, other.id, old.id]);
+    expect(loadSession(matched.id, root)?.meta.projectId).toBe('project-a');
+    expect(JSON.parse(readFileSync(join(root, 'index.json'), 'utf-8'))
+      .find((m: { id: string }) => m.id === matched.id).projectId).toBe('project-a');
+    expect(Object.hasOwn(loadSession(old.id, root)!.meta, 'projectId')).toBe(false);
+    expect(Object.hasOwn(JSON.parse(readFileSync(join(root, 'index.json'), 'utf-8'))
+      .find((m: { id: string }) => m.id === old.id), 'projectId')).toBe(false);
+    appendMessage(old.id, { role: 'user', content: 'old record', ts: '2026-04-15T12:00:00Z' }, root);
+    expect(Object.hasOwn(loadSession(old.id, root)!.meta, 'projectId')).toBe(false);
+    expect(Object.hasOwn(JSON.parse(readFileSync(join(root, 'index.json'), 'utf-8'))
+      .find((m: { id: string }) => m.id === old.id), 'projectId')).toBe(false);
+  });
+
+  test('adopt and fork preserve optional projectId without assigning it to untagged sessions', () => {
+    const adopted = adoptSession('adopted-id', { projectId: 'project-a' }, root);
+    expect(loadSession(adopted.id, root)?.meta.projectId).toBe('project-a');
+    expect(adoptSession(adopted.id, { projectId: 'other' }, root).projectId).toBe('project-a');
+    const fork = forkSessionFromHistory({ projectId: 'project-a', messages: [] }, root);
+    expect(fork.meta.projectId).toBe('project-a');
+    expect(Object.hasOwn(createSession({}, root), 'projectId')).toBe(false);
   });
 
   test('deleteSession removes file + index entry', () => {

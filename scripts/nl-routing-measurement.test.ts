@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { selectCorpusItems, corpusFiltersFromEnv, assertGradableItems, assertProbeOutsideCorpus, normalizeCorpusItems, classifyRouting, closedTurnBoundary, logIds, logRowKey, passSummary, positiveInteger, positiveIntegerList, summarizeCorpusRun, toolsForSessionTurn, turnTextBytes, turnStartedAfter, unavailableExpectedToolIds, wilsonInterval } from './lib/nl-routing-measurement.js';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -8,6 +8,9 @@ import { resolveTruncatedTurnWaitMs, runLiveCorpus } from './lib/nl-routing-corp
 import { truncatedTurnsSummary } from './lib/nl-routing-live-summary.js';
 import { main as runCorpusMain, resolveCorpusRunSafety, NL_ROUTING_UNSAFE_RUN_ENV } from './measure-nl-routing-corpus.js';
 import { EVAL_PROMPT_TOOL_SURFACES, type EvalPromptResult } from '../src/eval-prompt-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const CORPUS_RUNNER_PATH = resolve(import.meta.dir, 'measure-nl-routing-corpus.ts');
 const resolveCorpusRunSafetyFromProcessEnv = (surfaceToolNames: readonly string[]) => resolveCorpusRunSafety(process.env, undefined, surfaceToolNames);

@@ -2,7 +2,7 @@ import { expect, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordLaunchOnCard, recordOutcomeOnCard, recordTriageOnCards, type StewardCardStore } from './steward-cards.js';
+import { recordHitlOnCard, recordLaunchOnCard, recordOutcomeOnCard, recordTriageOnCards, type StewardCardStore } from './steward-cards.js';
 import { scheduleTriage, triageIssues, type ScheduledDecision, type TriageIssue } from './triage.js';
 import { CardStore, foldSections, type TaskCard } from '../task-cards/card-store.js';
 
@@ -92,6 +92,42 @@ test('money, public, security and irreversible judgments remain HITL on cards', 
   expect(store.cards).toHaveLength(4);
   expect(store.cards.map(card => JSON.parse(card.sections[1]!.content).hitlReason)).toEqual(['money', 'public', 'security', 'irreversible']);
   expect(store.cards.every(card => JSON.parse(card.sections[1]!.content).disposition === 'hitl')).toBe(true);
+});
+
+test('launch, outcome and HITL sections are steward-owned and idempotent', () => {
+  const store = fakeStore();
+  const entry = { issue: 'ELA-1', title: 'Build', source: 'cli', command: 'would launch', status: 'shadow' as const };
+  recordLaunchOnCard(issues[0]!, entry, { store });
+  recordLaunchOnCard(issues[0]!, entry, { store });
+  recordOutcomeOnCard(issues[0]!, { ...entry, status: 'merged', prNumber: 42 }, { store });
+  recordOutcomeOnCard(issues[0]!, { ...entry, status: 'merged', prNumber: 42 }, { store });
+  recordHitlOnCard(issues[0]!, { issue: 'ELA-1', reason: 'money', raised: false }, { store });
+  recordHitlOnCard(issues[0]!, { issue: 'ELA-1', reason: 'money', raised: false }, { store });
+  expect(store.cards[0]!.sections.map(section => section.key.split(':')[0])).toEqual(['launch', 'outcome', 'hitl']);
+  expect(store.cards[0]!.sections.every(section => section.owner === 'steward')).toBe(true);
+});
+
+test('shadow HITL pending then live raised appends one status transition, not duplicates', () => {
+  const store = fakeStore();
+  const pending = { issue: 'ELA-1', reason: 'security', raised: false };
+  recordHitlOnCard(issues[0]!, pending, { store });
+  recordHitlOnCard(issues[0]!, pending, { store });
+  const raised = { ...pending, attempted: true, raised: true };
+  recordHitlOnCard(issues[0]!, raised, { store });
+  recordHitlOnCard(issues[0]!, raised, { store });
+  expect(store.cards[0]!.sections).toHaveLength(2);
+  expect(store.cards[0]!.sections.map(section => JSON.parse(section.content).raised)).toEqual([false, true]);
+});
+
+test('budget skip then actual launch appends distinct revisions without duplicating either', () => {
+  const store = fakeStore();
+  const entry = { issue: 'ELA-1', title: 'Build', source: 'cli', command: 'say', status: 'skipped-budget' as const, reason: 'quota' };
+  recordLaunchOnCard(issues[0]!, entry, { store });
+  recordLaunchOnCard(issues[0]!, entry, { store });
+  recordLaunchOnCard(issues[0]!, { ...entry, status: 'launched', runId: 'run-test' }, { store });
+  recordLaunchOnCard(issues[0]!, { ...entry, status: 'launched', runId: 'run-test' }, { store });
+  expect(store.cards[0]!.sections).toHaveLength(2);
+  expect(store.cards[0]!.sections.map(section => JSON.parse(section.content).status)).toEqual(['skipped-budget', 'launched']);
 });
 
 test('a forced HITL rung cannot be written as now even from an inconsistent schedule', () => {

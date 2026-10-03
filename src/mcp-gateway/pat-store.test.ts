@@ -1,9 +1,12 @@
-import { afterEach, beforeEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { issueMcpPat, listMcpPats, matchMcpPat, revokeMcpPat } from './pat-store.js';
+
+// Cross-process PAT issuers run six real Bun children; allow gate-pod load headroom.
+setDefaultTimeout(60_000);
 
 let root: string;
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'mcp-pat-')); });

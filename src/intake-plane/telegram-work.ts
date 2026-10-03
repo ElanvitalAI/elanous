@@ -13,6 +13,7 @@ import {
 
 export interface TelegramWorkMessage {
   chatId: number;
+  userId?: number;
   messageId: number;
   botId?: string;
   threadId?: number;

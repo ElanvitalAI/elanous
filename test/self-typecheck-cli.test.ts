@@ -1,9 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // ⛔⭐⭐⭐ 이 파일이 있는 이유 — ***「0개 검사」를 «통과»라 말하면 안 된다.***
 //   근거(2026-08-04 `[S]` 실측 · `MEAS-S42`): `self typecheck` 는 커밋되지 «않은» 변경만 본다

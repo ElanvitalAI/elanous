@@ -111,6 +111,8 @@ function runPath(runId: string, dir: string): string {
   return path;
 }
 
+const loggedAbsentCheckpoints = new Set<string>();
+
 function loadSelfDevRunFromPath(path: string): SelfDevRunState | null {
   const runId = path.slice(path.lastIndexOf(sep) + 1, -'.json'.length);
   try {
@@ -118,7 +120,14 @@ function loadSelfDevRunFromPath(path: string): SelfDevRunState | null {
     if (o && typeof o.runId === 'string' && Array.isArray(o.results)) return o;
     try { debug.log('self-dev.run-store', 'read-failed', { runId, reason: 'invalid checkpoint shape' }); } catch { /* preserve fail-soft reads */ }
   } catch (error) {
-    try { debug.log('self-dev.run-store', 'read-failed', { runId, reason: String(error) }); } catch { /* preserve fail-soft reads */ }
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (!loggedAbsentCheckpoints.has(runId)) {
+        loggedAbsentCheckpoints.add(runId);
+        try { debug.log('self-dev.run-store', 'checkpoint-absent', { runId }); } catch { /* preserve fail-soft reads */ }
+      }
+    } else {
+      try { debug.log('self-dev.run-store', 'read-failed', { runId, reason: String(error) }); } catch { /* preserve fail-soft reads */ }
+    }
   }
   return null;
 }

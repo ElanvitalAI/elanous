@@ -156,6 +156,8 @@ interface SelfDevSubtaskGradeRationale {
 }
 
 export interface SelfDevDecompositionObservation extends SelfDevDecompositionMeta {
+  /** Number of registration-only goals folded into their dependency. */
+  foldedRegistration: number;
   /** Number of retained subtasks whose original feature text grades `too_large`. */
   tooLargeSubtaskCount: number;
   /** Number of retained subtasks whose original feature text grades `too_small`. */
@@ -250,7 +252,7 @@ function observeDecomposerSelection(selection: SelfDevDecomposerSelection, obser
 }
 
 function applyGoalDefaultsAndHotPaths(goals: SelfDevGoal[], defaults: { base?: string; autoMerge?: boolean }): SelfDevGoal[] {
-  return pruneDanglingDependencies(goals.map((goal) => {
+  return goals.map((goal) => {
     const hotPaths = [...new Set([...(goal.hotPaths ?? []), ...inferHotPaths(goal.feature ?? '')])];
     return {
       ...goal,
@@ -258,7 +260,55 @@ function applyGoalDefaultsAndHotPaths(goals: SelfDevGoal[], defaults: { base?: s
       ...(defaults.base !== undefined ? { base: defaults.base } : {}),
       ...(defaults.autoMerge !== undefined ? { autoMerge: defaults.autoMerge } : {}),
     };
-  }));
+  });
+}
+
+const REGISTRATION_FILES = new Set([
+  'src/nexus/api/http-server.ts',
+  'src/index.ts',
+  'src/telegram-commands.ts',
+]);
+
+function isRegistrationFile(path: string): boolean {
+  return REGISTRATION_FILES.has(path) || /^graphs\/(?:[^/]+\/)*[^/]+\.yaml$/.test(path);
+}
+
+/** Fold only registration-only goals into their one retained dependency. */
+export function foldRegistrationOnlyGoals(goals: SelfDevGoal[]): SelfDevGoal[] {
+  let remaining = [...goals];
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const registration of remaining) {
+      const files = registration.hotPaths ?? [];
+      if (files.length === 0 || !files.every(isRegistrationFile) || registration.dependsOn?.length !== 1) continue;
+      const dependencyId = registration.dependsOn[0];
+      const targetIndex = remaining.findIndex((goal) => goal.id === dependencyId && goal !== registration);
+      if (targetIndex < 0) continue;
+      const target = remaining[targetIndex]!;
+      remaining = remaining.filter((goal) => goal !== registration).map((goal) => {
+        if (goal === target) {
+          const dependsOn = goal.dependsOn?.filter((id) => id !== registration.id && id !== goal.id);
+          const { dependsOn: _old, ...rest } = goal;
+          return {
+            ...rest,
+            ...(dependsOn?.length ? { dependsOn } : {}),
+            feature: `${goal.feature}\nAlso register: ${registration.feature}`,
+            hotPaths: [...new Set([...(goal.hotPaths ?? []), ...files])],
+          };
+        }
+        if (!goal.dependsOn?.includes(registration.id!)) return goal;
+        const dependsOn = [...new Set(goal.dependsOn.map((id) => id === registration.id ? target.id! : id))]
+          .filter((id) => id !== goal.id);
+        const { dependsOn: _old, ...rest } = goal;
+        return dependsOn.length ? { ...rest, dependsOn } : rest;
+      });
+      debug.log('self-dev.decompose', 'fold-registration', { from: registration.id, into: target.id, files });
+      changed = true;
+      break;
+    }
+  }
+  return remaining;
 }
 
 function observeDecomposition(
@@ -267,12 +317,14 @@ function observeDecomposition(
   arcClassification?: { arcs: SelfDevArc[]; hintDeviation?: { requested: number; actual: number } },
   observationContext: SelfDevDecompositionObservationContext = {},
   pathGroundingOptions?: DecomposePathGroundingOptions,
+  foldedRegistration = 0,
 ): SelfDevDecomposition {
   const retainedSubtasks = decomposition.outcome === 'decomposed' ? goals : [];
   const gradedSubtasks = retainedSubtasks.map(gradeRetainedSubtask);
   const tooLargeSubtaskCount = gradedSubtasks.filter(({ grade }) => grade.verdict === 'too_large').length;
   const observation: SelfDevDecompositionObservation & { goalId: string | null; runId: string | null } = {
     ...decomposition,
+    foldedRegistration,
     tooLargeSubtaskCount,
     tooSmallSubtaskCount: gradedSubtasks.filter(({ grade }) => grade.verdict === 'too_small').length,
     hasMultipleTooLargeSubtasks: tooLargeSubtaskCount >= 2,
@@ -467,14 +519,15 @@ async function finalizeDecomposition(
   decomposition: SelfDevDecompositionMeta,
   opts: SelfDevDecomposeOptions,
   arcHint: number | undefined,
+  foldedRegistration = 0,
 ): Promise<SelfDevDecomposition> {
-  if (arcHint === undefined || goals.length === 0) return observeDecomposition(goals, decomposition, undefined, opts.observation, opts.pathGrounding);
+  if (arcHint === undefined || goals.length === 0) return observeDecomposition(goals, decomposition, undefined, opts.observation, opts.pathGrounding, foldedRegistration);
   try {
     const arcLlm = opts.arcLlm ?? opts.llm ?? (await defaultDecomposeLlm(opts.model));
     const tasks = goals.map((goal) => ({ id: goal.id ?? '', title: goal.feature ?? '', description: goal.feature, dependsOn: goal.dependsOn }));
     const grouping = parseSelfDevArcGrouping(await arcLlm(buildSelfDevArcClassifyPrompt(feature, tasks, arcHint)));
     const classification = grouping ? deriveSelfDevArcsFromGrouping(tasks, grouping, arcHint) : null;
-    if (!classification) return observeDecomposition(goals, decomposition, undefined, opts.observation, opts.pathGrounding);
+    if (!classification) return observeDecomposition(goals, decomposition, undefined, opts.observation, opts.pathGrounding, foldedRegistration);
     const arcByTask = new Map(classification.arcs.flatMap((arc) => arc.taskIds.map((taskId) => [taskId, arc])));
     const taskIdsForArc = new Map(classification.arcs.map((arc) => [arc.id, arc.taskIds]));
     const orderedGoals = goals.map((goal) => {
@@ -482,9 +535,9 @@ async function finalizeDecomposition(
       const dependsOn = [...new Set([...(goal.dependsOn ?? []), ...arcDependencies])].filter((id) => id !== goal.id);
       return dependsOn.length ? { ...goal, dependsOn } : goal;
     });
-    return observeDecomposition(pruneDanglingDependencies(orderedGoals), decomposition, classification, opts.observation, opts.pathGrounding);
+    return observeDecomposition(pruneDanglingDependencies(orderedGoals), decomposition, classification, opts.observation, opts.pathGrounding, foldedRegistration);
   } catch {
-    return observeDecomposition(goals, decomposition, undefined, opts.observation, opts.pathGrounding);
+    return observeDecomposition(goals, decomposition, undefined, opts.observation, opts.pathGrounding, foldedRegistration);
   }
 }
 
@@ -514,17 +567,18 @@ export async function decomposeSelfDevGoal(
     }
     observeDecomposerSelection('fabric', opts.observation);
     const actualTaskCount = result.goals.length;
-    const goals = actualTaskCount > 0
+    const prepared = actualTaskCount > 0
       ? applyGoalDefaultsAndHotPaths(result.goals.slice(0, hardMaxTasks), defaults)
       : [single];
-    return finalizeDecomposition(feature, goals, {
+    const goals = foldRegistrationOnlyGoals(prepared);
+    return finalizeDecomposition(feature, pruneDanglingDependencies(goals), {
       recommendedMaxTasks: maxTasks,
       actualTaskCount,
       truncatedAtHardMax: actualTaskCount > hardMaxTasks,
       exceededRecommendedMax: actualTaskCount > maxTasks,
       outcome: actualTaskCount === 0 ? 'single-no-subtasks' : 'decomposed',
       omittedGoalCount: result.omittedGoalCount,
-    }, opts, actualTaskCount > 0 ? arcHint : undefined);
+    }, opts, actualTaskCount > 0 ? arcHint : undefined, prepared.length - goals.length);
   }
 
   observeDecomposerSelection('default', opts.observation);
@@ -539,8 +593,9 @@ export async function decomposeSelfDevGoal(
   const actualTaskCount = rawSubtasks.length;
   const decomposition: SelfDevDecompositionMeta = { recommendedMaxTasks: maxTasks, actualTaskCount, truncatedAtHardMax: actualTaskCount > hardMaxTasks, exceededRecommendedMax: actualTaskCount > maxTasks, outcome: actualTaskCount === 0 ? 'single-no-subtasks' : 'decomposed' };
   const parsedGoals = parseSelfDevDecomposition(JSON.stringify({ subtasks: rawSubtasks.slice(0, hardMaxTasks) }), defaults);
-  const goals = parsedGoals.length > 0 ? pruneDanglingDependencies(parsedGoals) : [single];
-  return finalizeDecomposition(feature, goals, decomposition, opts, parsedGoals.length > 0 ? arcHint : undefined);
+  const foldedGoals = foldRegistrationOnlyGoals(parsedGoals);
+  const goals = parsedGoals.length > 0 ? pruneDanglingDependencies(foldedGoals) : [single];
+  return finalizeDecomposition(feature, goals, decomposition, opts, parsedGoals.length > 0 ? arcHint : undefined, parsedGoals.length - foldedGoals.length);
 }
 
 /** Default LLM seam — lazy `streamLLM` wire (kept out of the test path). */

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { lookupLlmTierSpec } from './model-tier/llm-tier-map.js';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +17,9 @@ import {
   saveUserConfig,
 } from './user-config.js';
 import { debug } from './debug/log.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 let root: string;
 let configPath: string;
@@ -85,6 +88,19 @@ afterEach(() => {
   }
   savedEnv.clear();
   rmSync(root, { recursive: true, force: true });
+});
+
+describe('pod lease config', () => {
+  test('perAccount defaults to 4 and accepts only positive safe integers', () => {
+    writeConfig({});
+    expect(buildUserConfig(configPath).pod?.lease?.perAccount).toBe(4);
+    for (const invalid of [0, -1, 2.5, '7', Number.MAX_SAFE_INTEGER + 1]) {
+      writeConfig({ pod: { lease: { perAccount: invalid } } });
+      expect(buildUserConfig(configPath).pod?.lease?.perAccount).toBe(4);
+    }
+    writeConfig({ pod: { lease: { perAccount: 7 } } });
+    expect(buildUserConfig(configPath).pod?.lease?.perAccount).toBe(7);
+  });
 });
 
 describe('pod Grok API key opt-in', () => {

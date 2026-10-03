@@ -1,7 +1,10 @@
-import { beforeAll, describe, expect, mock, test } from 'bun:test';
+import { setDefaultTimeout, beforeAll, describe, expect, mock, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import * as orchestrateCli from '../self-dev/orchestrate-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const calls: string[] = [];
 const outputs = {

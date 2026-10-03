@@ -2,10 +2,13 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { releaseLedgerRoot } from '../../src/instance/resolve.js';
 import { checklistGate, type ChecklistGate } from '../../src/release-loop/checklist.js';
+import { getSchedule, formatKst } from '../../src/release-loop/release-schedule.js';
+import { debug } from '../../src/debug/log.js';
 
 export type ReleaseReadiness =
   | { ready: false; reason: 'already-published'; details: string }
   | { ready: false; reason: 'already-running'; details: string }
+  | { ready: false; reason: 'before-cut'; details: string }
   | { ready: false; reason: 'checklist-blocked'; details: ChecklistGate }
   | { ready: true; reason: 'ready'; details: ChecklistGate };
 
@@ -13,6 +16,7 @@ export interface ReleaseReadinessDeps {
   ledgerRoot?: string;
   checklist?: typeof checklistGate;
   isPidAlive?: (pid: number) => boolean;
+  now?: () => Date;
 }
 
 function readIfPresent(path: string): string | undefined {
@@ -51,6 +55,11 @@ export function releaseReadiness(version: string, deps: ReleaseReadinessDeps = {
     if (typeof pid === 'number' && Number.isSafeInteger(pid) && pid > 0 && (deps.isPidAlive ?? isPidAlive)(pid)) {
       return { ready: false, reason: 'already-running', details: String(pid) };
     }
+  }
+  const schedule = getSchedule(version, deps.ledgerRoot);
+  if (schedule && (deps.now ?? (() => new Date()))().getTime() < Date.parse(schedule.cutAt)) {
+    debug.log('release.schedule', 'before-cut', { version, cutAt: schedule.cutAt, landBy: schedule.landBy });
+    return { ready: false, reason: 'before-cut', details: `before-cut (${formatKst(schedule.cutAt)})` };
   }
   const gate = (deps.checklist ?? checklistGate)(version);
   if (!gate.ok) return { ready: false, reason: 'checklist-blocked', details: gate };

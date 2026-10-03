@@ -79,6 +79,7 @@ import { classifyReviewProviderFailure } from '../self-dev/review-provider-fallb
 import { classifyError } from '../session-runtime/retry-policy.js';
 import { decomposeSelfDevGoal, inferHotPaths, type SelfDevDecomposeOptions } from '../self-dev/decompose.js';
 import { boundaryGlobs, boundaryViolations } from './goal-boundary.js';
+import { askAtExecution, type ExecutionClarificationResult } from './execution-clarification.js';
 import { targetScopedGoalText } from './goal-text-path-scope.js';
 import type { SelfDevGoalType } from '../self-dev/orchestrate.js';
 import { DEFAULT_BRANCH_WORKTREE_BASE, gateGitResidue, observeGitResidue } from '../git-fs/worktree.js';
@@ -967,6 +968,8 @@ export interface SelfImplementSeams {
   /** 변경 파일 목록 — 게이트 «라우터»가 「코드가 바뀌었나」를 판정하는 입력.
    *  ⛔ 미지정이면 실물 `changedFiles(cwd)` 를 쓴다. 못 얻으면 `undefined` 이고, 라우터는 그때 «돌린다»(fail-safe). */
   changedFilesForGateRoute?: (cwd: string) => readonly string[] | undefined;
+  /** An execution choice is made only after a measured change crosses the authored target paths. */
+  askExecutionClarification?: typeof askAtExecution;
   /** ★ ⑤ 내부 리뷰 seam(2026-07-21·review-gated merge) — gate 통과 diff 를 리뷰어(reviewPullRequest·
    *  agent-substrate·staged 하니스와 동일 엔진)가 비평. verdict fail(mustFix) → rework 재주입(A 확장),
    *  clean(pass/warn) → 병합 결정. 미주입 시 리뷰 스킵(gate 통과=바로 결정·종전 동작). */
@@ -1082,7 +1085,7 @@ export const SELF_IMPLEMENT_PROGRESS_STAGES = [
   'gating', 'gated', 'reviewing', 'reviewed', 'awaiting-approval',
   'pr-opening', 'pr-opened', 'merging', 'merged', 'worktree-completed',
   'aborted', 'gate-failed', 'review-blocked', 'merge-conflict', 'pr-declined',
-  'awaiting-clarification',
+  'awaiting-clarification', 'parked',
   // ⭐⭐ 🩸 2026-09-12 — ***「선언한 대상을 «하나도» 안 만들고 끝났다」를 사람 표면에 낸다.***
   //    ⛔ 기존 단계 이름을 «빌려 쓰지 않는다» — `progress()` 는 단계 이름으로 원장 행을 만들므로
   //       빌려 쓰면 그 단계 집계가 오염된다([T] 2026-09-12 · `#17767` 이후 계약).
@@ -6268,6 +6271,39 @@ async function runSelfImplementInner(
       return { ok: false, stage: 'aborted', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch, quotaExhaustionAssessment: quotaExhaustionAssessmentForRun(), ...(impl.completionDisposition ? { completionDisposition: impl.completionDisposition } : {}), ...(pr ? { prUrl: pr.url, prNumber: pr.number } : {}), detail: impl.summary };
     }
 
+    // Measure the existing declared-target boundary after implementation, before gate/PR.
+    // Unknown declaration or changed files cannot justify an invented choice.
+    let gateRouteFiles: readonly string[] | undefined;
+    try { gateRouteFiles = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { gateRouteFiles = undefined; }
+    if (opts.goalFile) {
+      let goalDocument: string | undefined;
+      try { goalDocument = readFileSync(opts.goalFile, 'utf8'); } catch { /* unknown scope */ }
+      const scope = detectDeclaredScopeDiff({ goalDocument, changedFiles: gateRouteFiles?.filter(file => !harnessSeededPaths.includes(file)), nameCap: gateRouteFiles?.length });
+      if (scope.status === 'known' && scope.outsideCount !== null && scope.outsideCount > 0) {
+        const result: ExecutionClarificationResult = await (s.askExecutionClarification ?? askAtExecution)({
+          id: 'execution_scope', decision: 'Changing files outside the authored target paths',
+          prompt: 'Implementation changed files outside the authored target paths. Keep the original scope or expand it?',
+          whyNow: 'Continuing to gate or publish these edits would expand the requested scope.',
+          impact: scope.outsideNames.some(file => {
+            if (existsSync(join(wt.path, file))) return false;
+            const tracked = runGitCommand(wt.path, ['ls-files', '--error-unmatch', '--', file], { encoding: 'utf8', timeout: 20_000 });
+            return tracked.status === 0;
+          }) ? 'critical' : 'high',
+          options: [
+            { label: 'Stay in scope', description: 'Do not accept out-of-scope changes.', recommended: true },
+            { label: 'Expand scope', description: 'Accept the changed files outside the target paths.' },
+          ],
+        }, { runId }, { writeRunLedger: s.writeRunLedger });
+        if ('parked' in result || 'deferred' in result || result.choice !== 'Expand scope') {
+          finalizeSupervisorDeliveries('execution-scope-not-approved');
+          observe('execution-scope-held', { outsideCount: scope.outsideCount, disposition: 'parked' in result ? 'parked' : 'in-scope-only' });
+          if ('parked' in result) progress('parked', `critical 질문 ${result.questionId} 미응답 — 이 런만 대기`);
+          return { ok: false, stage: 'parked' in result ? 'parked' : 'soft-stopped', node: 'implement', ...resolveRunOutcome({ termination: 'abandoned' }), sessionId, worktreePath: wt.path, branch: wt.branch,
+            detail: 'parked' in result ? `critical-unanswered: ${result.questionId}` : 'Out-of-scope edits held in the worktree; gate and publication skipped.' };
+        }
+      }
+    }
+
     // ⛔⭐ 이 템플릿이 `gate` 노드를 «안 가지면» 그 단계는 돌지 않는다.
     //   📌 research-loop 이 그렇다 — 문서만 바뀐 판에는 «변경 파일 범위» 게이트가 돌 시험이 없다.
     //   ⚠️ 꺼진 상태에서는 언제나 implement-loop 이라 참이다 ⇒ 오늘과 «같은» 걸음이다.
@@ -6275,8 +6311,6 @@ async function runSelfImplementInner(
     //     기본이 꺼짐이라 지금 폭발 반경은 0이고, 기본을 켜기 «전»에 이 구멍을 먼저 막아야 한다.
     // ⛔⭐ 라우터가 판정한다 — 값은 «코드»가 낸다(RFC §4.3 ⑵). 「모른다」는 «돌린다» 쪽이다.
     //   🚨 이 줄이 2026-09-08 승격의 구멍 ⓐ 를 닫는다: research 골이 «코드»를 만지면 시험이 돈다.
-    let gateRouteFiles: readonly string[] | undefined;
-    try { gateRouteFiles = (s.changedFilesForGateRoute ?? changedFiles)(wt.path); } catch { gateRouteFiles = undefined; }
     const gateRoute = routeGate(graphTemplate, gateRouteFiles);
     const runsGate = gateRoute.runsGate;
     progress('gating', !runsGate

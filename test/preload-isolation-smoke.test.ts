@@ -6,11 +6,14 @@
 // testFallbackRoot 모듈-레벨 캐시 · src/session/index.ts:73)에 걸리지 않도록 각 테스트가
 // 자기 ELANOUS_STATE_DIR 을 명시 세팅한다. ELANOUS_STATE_DIR 분기가 fallback 분기보다 먼저라
 // 앞 테스트가 남긴 캐시와 무관하게 결정론적. afterEach 로 원복(다른 파일 무회귀).
-import { describe, test, expect, afterEach } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect, afterEach } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO_ROOT = join(import.meta.dir, '..');
 

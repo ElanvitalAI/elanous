@@ -145,6 +145,87 @@ describe('LLM 재현용 자리표시자를 가린다 — 데이터는 그대로 
   });
 });
 
+describe('저장된 메시지 시각 복원', () => {
+  const first = '2026-10-02T19:09:23.000Z';
+  const later = '2026-10-02T21:09:23.000Z';
+  const base = Date.parse(later);
+  const tool = (ts?: unknown) => ({ role: 'tool', content: '⚙️ search', toolName: 'search', ts });
+
+  it('uses each ordinary message ISO timestamp, without sorting by time', () => {
+    const out = restorableChatMessages([
+      { role: 'user', content: 'first', ts: later },
+      { role: 'assistant', content: 'second', ts: first },
+    ], base);
+    expect(out.map((m) => m.text)).toEqual(['first', 'second']);
+    expect(out.map((m) => m.timestamp)).toEqual([Date.parse(later), Date.parse(first)]);
+  });
+
+  it('uses the existing output-index fallback for missing, invalid and non-string ts', () => {
+    const out = restorableChatMessages([
+      { role: 'user', content: 'no ts' },
+      { role: 'assistant', content: 'invalid', ts: 'not-a-date' },
+      { role: 'user', content: 'number', ts: base },
+      { role: 'assistant', content: 'non-ISO', ts: 'October 2, 2026' },
+      { role: 'user', content: 'valid', ts: first },
+    ], base);
+    expect(out.map((m) => m.timestamp)).toEqual([base, base + 1, base + 2, base + 3, Date.parse(first)]);
+    expect(out.map((m) => m.text)).toEqual(['no ts', 'invalid', 'number', 'non-ISO', 'valid']);
+  });
+
+  it('falls back for calendar-invalid ISO dates rather than accepting normalized dates', () => {
+    const out = restorableChatMessages([
+      { role: 'user', content: 'February 30', ts: '2026-02-30T19:09:23.000Z' },
+      { role: 'assistant', content: 'non-leap February 29', ts: '2026-02-29T19:09:23.000Z' },
+      { role: 'user', content: 'leap February 29', ts: '2024-02-29T19:09:23.000Z' },
+      tool('2026-02-30T19:09:23.000Z'), tool(first),
+      { role: 'assistant', content: 'grouped answer', ts: later },
+    ], base);
+    expect(out.map((m) => m.text)).toEqual(['February 30', 'non-leap February 29', 'leap February 29', 'grouped answer']);
+    expect(out.map((m) => m.timestamp)).toEqual([
+      base, base + 1, Date.parse('2024-02-29T19:09:23.000Z'), base + 3,
+    ]);
+  });
+
+  it('uses the FIRST tool trace timestamp for a grouped answer, not its later traces or answer', () => {
+    const out = restorableChatMessages([
+      tool(first), tool(later), { role: 'assistant', content: 'answer', ts: later },
+    ], base);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.blocks!.filter((b) => b.kind === 'tool_use')).toHaveLength(2);
+    expect(out[0]!.timestamp).toBe(Date.parse(first));
+  });
+
+  it('uses the first tool timestamp for an empty answer and a trailing tool-only bubble', () => {
+    const empty = restorableChatMessages([
+      tool(first), tool(later), { role: 'assistant', content: '[tool_use]', ts: later },
+    ], base);
+    expect(empty.map((m) => m.timestamp)).toEqual([Date.parse(first)]);
+    const trailing = restorableChatMessages([
+      { role: 'user', content: 'question', ts: later }, tool(first), tool(later),
+    ], base);
+    expect(trailing.map((m) => m.timestamp)).toEqual([Date.parse(later), Date.parse(first)]);
+  });
+
+  it('keeps a pending group through a user message, then starts a new group after its answer', () => {
+    const out = restorableChatMessages([
+      tool(first), { role: 'user', content: 'interleaved', ts: later },
+      { role: 'assistant', content: 'first answer', ts: later },
+      tool(later), { role: 'assistant', content: 'second answer', ts: first },
+    ], base);
+    expect(out.map((m) => m.text)).toEqual(['interleaved', 'first answer', 'second answer']);
+    expect(out.map((m) => m.timestamp)).toEqual([Date.parse(later), Date.parse(first), Date.parse(later)]);
+  });
+
+  it('falls back for a group whose first trace has no usable ts, even if a later trace has one', () => {
+    const out = restorableChatMessages([
+      { role: 'user', content: 'question' }, tool('invalid'), tool(first),
+      { role: 'assistant', content: 'answer', ts: later }, tool(),
+    ], base);
+    expect(out.map((m) => m.timestamp)).toEqual([base, base + 1, base + 2]);
+    expect(out.map((m) => m.text)).toEqual(['question', 'answer', '']);
+  });
+});
+
 describe('배선 — ChatLayout 이 그 선별을 «실제로» 쓰나', () => {
   it('calls restorableChatMessages instead of filtering inline', () => {
     // ⛔⭐ 위 시험들은 「함수가 옳다」만 본다 — ***아무도 안 부르면 화면은 그대로다.***

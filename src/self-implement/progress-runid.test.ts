@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -40,6 +40,9 @@ import { runHeadlessGoalLoopPty } from './headless-elanous-driver.js';
 import { GOAL_RULES_POLICY } from './goal-author.js';
 import { defaultSeams, reviewScopeDiff } from './seams.js';
 import { runSelfImplement } from './orchestrator.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function git(cwd: string, ...args: string[]): void {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });

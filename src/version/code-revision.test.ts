@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { spawnSync, spawn } from 'node:child_process';
 import { cliVersion, codeRevision, setCodeRevisionRootForTesting, writePackagedRevision, packageVersion } from './code-revision.js';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(360_000);
 
 const PACKED_COMMIT = 'a'.repeat(40);
 const INSTALLED_COMMIT = 'b'.repeat(40);

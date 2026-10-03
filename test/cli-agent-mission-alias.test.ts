@@ -4,12 +4,15 @@
 // (b) CLI surface(subprocess) — canonical 과 alias 가 같은 명령으로 resolve 되는지(cron 하위호환 acceptance).
 //   cli-wf-aliases.test.ts 패턴 재사용(in-process 액션 재실행이 아니라 commander 를 실사용자처럼 구동).
 
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { basename, join, resolve } from 'path';
 import { isLegacyCodexInvocation } from '../src/agent-mission/legacy-alias.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const ENTRY = resolve(import.meta.dir, '..', 'src', 'index.ts');
 

@@ -1,8 +1,11 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { Command } from 'commander';
 import { installHarnessCliCommand } from './harness-cli-command.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = resolve(import.meta.dir, '../..');
 const elanousBin = join(repoRoot, 'bin/elanous.mjs');

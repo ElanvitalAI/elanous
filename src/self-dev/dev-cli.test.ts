@@ -1,5 +1,5 @@
 import { resetFrontVisitCountsForTesting } from './graph-front-nodes.js';
-import { describe, it, expect, spyOn, beforeAll, afterAll } from 'bun:test';
+import { setDefaultTimeout, describe, it, expect, spyOn, beforeAll, afterAll } from 'bun:test';
 import * as devCli from './dev-cli.js';
 
 // 발사 시험은 실시간 `elanous usage`(grok 잔량)를 부르지 않는다 — 캐시가 «모름»이던 종전 동작으로 고정.
@@ -26,6 +26,9 @@ import { buildUserConfig, parseChildLlmPreference, resetUserConfig, setUserConfi
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { readHarnessScreen } from '../harness/harness-screen.js';
 import { queryRunningRuns } from '../self-implement/running-runs.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 /** 오버레이가 raw 만 바꿔도 파싱된 childLlm 을 같이 싣는다. 발사 경로는 raw 를 다시 읽지 않는다. */
 function withParsedChildLlm(config: UserConfig, rawChildLlm: unknown): UserConfig {

@@ -1,6 +1,6 @@
 // market_posture 생산자 사이클 단위테스트 — [외부 구현·claude-code] 아크1 글루(2026-07-16).
 // 순수 조립·dep 주입(regime/capstone/emergency/publish seam) 및 격리된 CLI 로그 경로.
-import { test, expect, describe } from 'bun:test';
+import { setDefaultTimeout, test, expect, describe } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +14,9 @@ import type { PublishResult } from '../src/domains/market-posture-store.js';
 import {
   regimeToThreatDrivers, assembleMarketPostureInput, runMarketPostureCycle,
 } from './market-posture-cycle.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const regime = (over: Partial<RegimeVector> = {}): RegimeVector => ({
   axes: [], composite: 0, regimeLabel: 'NEUTRAL', transition: false, transitionAxes: [],

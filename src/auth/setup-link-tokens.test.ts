@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,6 +7,9 @@ import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-di
 import * as setupLinkTokens from './setup-link-tokens.js';
 import { claimSetupLinkToken, issueSetupLinkToken, matchSetupBearer, SETUP_LINK_TTL_MS } from './setup-link-tokens.js';
 import { issueTempToken, matchTempToken } from './temp-tokens.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 let dir: string;
 const now = Date.parse('2026-01-01T00:00:00Z');

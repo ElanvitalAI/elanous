@@ -89,14 +89,16 @@ describe('ChatInput · seat requests', () => {
     } finally { await act(async () => { tree.unmount(); }); }
   });
 
-  test('rejects an attachment-only send while a seat is selected without draining attachments or sending chat', async () => {
+  test('sends an attachment with selected-seat text, then drains the queue without sending ordinary chat', async () => {
     const chats: string[] = [];
-    const requests: string[] = [];
+    const requests: Array<{ seat?: string; text: string; attachments?: Array<{ id: string }> }> = [];
     const removed: string[] = [];
     const attachment = { id: 'file-1', filename: 'brief.pdf', mediaType: 'application/pdf', size: 20, downloadUrl: '/v1/attachments/file-1' };
     const client = {
       listSeatRequests: async () => ({ items: [], seats: [{ id: 'MK', title: 'CMO' }] }),
-      submitSeatRequest: async ({ text }: { text: string }) => { requests.push(text); return { receiptId: 'R-1', seat: 'MK', queuedAt: 'now' }; },
+      submitSeatRequest: async (request: { seat?: string; text: string; attachments?: Array<{ id: string }> }) => {
+        requests.push(request); return { receiptId: 'R-1', seat: 'MK', queuedAt: 'now', attachments: 1 };
+      },
     };
     const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' },
       sessionId: '', setSessionId: () => {}, setConfig: () => {} };
@@ -105,18 +107,38 @@ describe('ChatInput · seat requests', () => {
       onSubmit={(text) => chats.push(text)} attachments={[attachment]} onRemoveAttachment={(id) => removed.push(id)}
     /></DaemonContext.Provider>); });
     const chip = () => tree.root.findAllByType('button').find((button) => button.props['aria-pressed'] !== undefined)!;
-    const send = async () => { await act(async () => { tree.root.findAllByType('button').at(-1)!.props.onClick(); }); };
     try {
       await act(async () => { chip().props.onClick(); });
-      await send();
-      expect(tree.root.findByProps({ role: 'alert' }).children.join('')).toBe('자리 요청에는 첨부파일을 보낼 수 없습니다');
-      expect(tree.root.findAllByType('li').some((item) => item.findAllByType('span').some((span) => span.children.join('') === 'brief.pdf'))).toBe(true);
-      expect(removed).toEqual([]);
+      await act(async () => { tree.root.findByType('textarea').props.onChange({ target: { value: 'draft' } }); });
+      await act(async () => { tree.root.findAllByType('button').at(-1)!.props.onClick(); });
+      expect(requests).toEqual([{ seat: 'MK', text: 'draft', attachments: [attachment] }]);
+      expect(removed).toEqual(['file-1']);
+      expect(chats).toEqual([]);
+      expect(tree.root.findByProps({ role: 'status' }).children.join('')).toContain('받음 · 첨부 1');
+    } finally { await act(async () => { tree.unmount(); }); }
+  });
+
+  test('does not send an attachment-only selected-seat request as ordinary chat', async () => {
+    const chats: string[] = [];
+    const requests: string[] = [];
+    const client = {
+      listSeatRequests: async () => ({ items: [], seats: [{ id: 'MK', title: 'CMO' }] }),
+      submitSeatRequest: async ({ text }: { text: string }) => { requests.push(text); return { receiptId: 'R-1', seat: 'MK', queuedAt: 'now' }; },
+    };
+    const daemon = { client: client as never, config: { baseUrl: '', token: '', provider: '' },
+      sessionId: '', setSessionId: () => {}, setConfig: () => {} };
+    const attachment = { id: 'file-1', filename: 'brief.pdf', mediaType: 'application/pdf', size: 20, downloadUrl: '/v1/attachments/file-1' };
+    let tree!: ReturnType<typeof create>;
+    await act(async () => { tree = create(<DaemonContext.Provider value={daemon}><ChatInput
+      onSubmit={(text) => chats.push(text)} attachments={[attachment]}
+    /></DaemonContext.Provider>); });
+    try {
+      await act(async () => { tree.root.findAllByType('button').find((button) => button.props['aria-pressed'] !== undefined)!.props.onClick(); });
+      await act(async () => { tree.root.findAllByType('button').at(-1)!.props.onClick(); });
+      expect(tree.root.findByProps({ role: 'alert' }).children.join('')).toBe('자리 요청 내용을 입력해 주세요');
       expect(chats).toEqual([]);
       expect(requests).toEqual([]);
-      await act(async () => { chip().props.onClick(); });
-      await send();
-      expect(chats).toEqual(['']);
+      expect(tree.root.findAllByType('li').some((item) => item.findAllByType('span').some((span) => span.children.join('') === 'brief.pdf'))).toBe(true);
     } finally { await act(async () => { tree.unmount(); }); }
   });
 
@@ -195,7 +217,7 @@ describe('ChatInput · seat requests', () => {
       await act(async () => { tree.root.findAllByType('button').find((button) => button.props['aria-pressed'] === false)!.props.onClick(); });
       await type('draft'); await send();
       expect(calls[0]!.request).toEqual({ seat: 'MK', text: 'draft' });
-      expect(visible().join(' ')).toContain('📨 CMO 접수 R-123 · 방금');
+      expect(visible().join(' ')).toContain('📨 CMO 접수 R-123 · 방금 · 받음');
       await act(async () => { tree.root.findAllByType('button').find((button) => button.props['aria-pressed'] === true)!.props.onClick(); });
       await type('@cmo next task'); await send();
       expect(calls[1]!.request).toEqual({ text: '@cmo next task' });

@@ -1,9 +1,12 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DEFAULT_LIMIT, auditParked, findGoalDocument, parkedItems, parseLimit, selfCheck, targetTests, type ParkedItem } from './parked-still-broken.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function withFixture(run: (fixture: string, goals: string) => void): void {
   const fixture = mkdtempSync(join(tmpdir(), 'parked-still-broken-'));

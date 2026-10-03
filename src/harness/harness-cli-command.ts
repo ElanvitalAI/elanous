@@ -1,7 +1,13 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { constants as osConstants } from 'node:os';
 import { resolve } from 'node:path';
+import { LogStore, logsDbPath } from '../mss/logging/log-store.js';
+import { loadSelfDevRun } from '../self-dev/run-store.js';
+import { normalizeRunId } from './harness-space.js';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
+import { detectBursts, formatIncidentBurstWarning, readRunExits, recentBurst, recordRunExit } from './harness-incidents.js';
 import { Command, Option } from 'commander';
 import { runGitCommand } from '../git-fs/runner.js';
 import { GOAL_TYPES, lintGoalFile, parseGoalId, parseGoalType, tracedPathReferences, type GoalType } from '../self-implement/goal-author.js';
@@ -323,6 +329,191 @@ function resolveLaunchSubstrate(opts: HarnessSubstrateOpts): ResolvedHarnessSubs
   else console.log(head);
   return resolved;
 }
+type PodExit = { status: number | null; signal?: string | null };
+type PodExitReason = 'signal' | 'human-stop' | 'supervisor' | 'no-launch' | 'unknown';
+const STOPPING_SUPERVISOR_VERDICTS = new Set(['UNCONVERGEABLE', 'CONTRACT-CONFLICT']);
+// Ledger events that only exist once the child actually ran — any of them rules out «never reached the Pod».
+const LAUNCH_EVIDENCE_EVENTS = new Set(['job-applied', 'pod-child-run', 'reviewed', 'rework-budget', 'pr-opened']);
+
+/** Keep the run identity seen at launch even if the bounded output tail later drops it. */
+export function harnessPodRunId(output: string): string | undefined {
+  return output.match(/\[self-dev\][^\r\n]*\brun\s+(run-[a-z0-9_-]{8,64})(?=\s|$)/i)?.[1];
+}
+
+/** Classify a missing Pod result from run-scoped evidence, never from a nonzero exit alone. */
+export function classifyHarnessPodExit(
+  exit: PodExit,
+  output: string,
+  deps: {
+    loadLedger?: typeof loadRunLedger;
+    hasJobApplied?: (runId: string | undefined, output: string) => boolean | undefined;
+    supervisorDecision?: (runId: string) => { stopReason?: string; why?: string } | undefined;
+    loadCheckpoint?: typeof loadSelfDevRun;
+    runId?: string;
+  } = {},
+): { lines: string[]; reason: PodExitReason | 'pod-failure' } {
+  let podFailure: string | undefined;
+  let podJobFailed = false;
+  for (const line of output.split('\n').reverse()) {
+    if (!line.trimStart().startsWith('[{') || !line.includes('"error"')) continue;
+    try {
+      const results: unknown = JSON.parse(line);
+      if (!Array.isArray(results)) continue;
+      for (const result of results) {
+        if (!result || typeof result !== 'object') continue;
+        const error = (result as { error?: { code?: string; message?: string } }).error;
+        if (typeof error?.code !== 'string' || typeof error.message !== 'string' || !error.code.startsWith('pod-')) continue;
+        podFailure = error.message;
+        podJobFailed = error.code === 'pod-job-failed';
+        break;
+      }
+    } catch { /* Non-result stdout cannot establish that a Pod child ran. */ }
+    if (podFailure) break;
+  }
+  if (!podFailure) {
+    const summary = output.split('\n').find((line) => /\s❌\sfailed · .* — pod-[\w-]+: /.test(line));
+    podFailure = summary?.split(/\s❌\sfailed · .* — pod-[\w-]+: /)[1];
+    podJobFailed = summary?.includes(' — pod-job-failed: ') ?? false;
+  }
+  // Only the run announced at launch — another run id quoted in the output is not this run (review round 3).
+  const observedRunId = deps.runId ?? harnessPodRunId(output);
+  const runId = observedRunId ? normalizeRunId(observedRunId) : undefined;
+  if (podFailure) {
+    const childError = podJobFailed ? podFailure.split('childError=')[1]?.split('\\n', 1)[0]?.split('\n', 1)[0] : undefined;
+    try { debug.log('harness.pod', 'exit-classified', { runId, reason: 'pod-failure', status: exit.status, signal: exit.signal ?? null }); } catch { /* observation is fail-soft */ }
+    return { reason: 'pod-failure', lines: [podJobFailed && childError && childError !== 'no-result-line'
+      ? `Pod 안 자식이 실패했다 — ${childError}`
+      : `Pod 실행이 실패했다 — ${podFailure.split('\\n', 1)[0]}`] };
+  }
+  let ledger: ReturnType<typeof loadRunLedger> = null;
+  let ledgerReadable = false;
+  if (runId) {
+    try { ledger = (deps.loadLedger ?? loadRunLedger)(runId); ledgerReadable = ledger !== null; } catch { /* unreadable is not absent */ }
+  }
+  const signal = exit.signal ?? (exit.status !== null && exit.status > 128
+    ? Object.entries(osConstants.signals).find(([, number]) => number === exit.status! - 128)?.[0] : undefined);
+  const humanStop = ledger?.some((entry) => entry.event === 'human-stop');
+  // A continuing verdict (EXTEND · SUFFICIENT) is not why the run ended — only stopping verdicts count.
+  const supervisor = [...(ledger ?? [])].reverse().find((entry) =>
+    (entry.event === 'supervisor-decision' || entry.event === 'supervisor-verdict' || entry.event === 'rework-budget')
+      && STOPPING_SUPERVISOR_VERDICTS.has(String(entry.data.supervisorVerdict ?? entry.data.verdict))
+    || entry.event === 'run-status' && entry.data.stage === 'review-blocked');
+  let decision: { stopReason?: string; why?: string } | undefined;
+  if (runId) {
+    try { decision = (deps.supervisorDecision ?? lookupHarnessSupervisorDecision)(runId); } catch { /* unknown */ }
+  }
+  const verdict = decision?.stopReason ?? supervisor?.data.supervisorVerdict ?? supervisor?.data.verdict
+    ?? (supervisor?.event === 'run-status' ? supervisor.data.stage : undefined);
+  const reasonText = decision?.why ?? supervisor?.data.supervisorReason ?? supervisor?.data.reason;
+  const ledgerPrUrl = [...(ledger ?? [])].reverse().find((entry) => entry.event === 'pr-opened'
+    && (typeof entry.data.url === 'string' || typeof entry.data.prUrl === 'string'))?.data;
+  let checkpoint: ReturnType<typeof loadSelfDevRun> = null;
+  if (runId) {
+    try { checkpoint = (deps.loadCheckpoint ?? loadSelfDevRun)(runId); } catch { /* unreadable is not absent */ }
+  }
+  const pr = output.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+\b/)?.[0]
+    ?? (typeof ledgerPrUrl?.url === 'string' ? ledgerPrUrl.url
+      : typeof ledgerPrUrl?.prUrl === 'string' ? ledgerPrUrl.prUrl : undefined)
+    ?? checkpoint?.results.find((result) => result.prUrl)?.prUrl;
+  let reason: PodExitReason;
+  let line: string;
+  if (humanStop) {
+    reason = 'human-stop';
+    line = '사람이 멈춘 런이다';
+  } else if (signal) {
+    reason = 'signal';
+    line = `런이 멈췄다(${signal}) — \`harness stop\` 이나 세션 종료일 수 있다 · 그 전까지 만든 PR 은 남아 있다`;
+  } else if (typeof verdict === 'string' || checkpoint?.supervisorStopReason) {
+    reason = 'supervisor';
+    line = `감독 판정: ${verdict ?? checkpoint?.supervisorStopReason}${typeof reasonText === 'string' && reasonText.trim() ? ` — ${reasonText.trim().split(/\r?\n/, 1)[0]}` : ''}`;
+  } else {
+    let applied: boolean | undefined;
+    try { applied = (deps.hasJobApplied ?? hasHarnessPodJobApplied)(runId, output); } catch { /* unknown */ }
+    const noLaunch = ledgerReadable && !ledger?.some((entry) => LAUNCH_EVIDENCE_EVENTS.has(entry.event))
+      && applied === false && !pr;
+    reason = noLaunch ? 'no-launch' : 'unknown';
+    line = noLaunch
+      ? 'Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라'
+      : 'Pod 실행 여부 또는 종료 이유를 확인하지 못했다';
+  }
+  try { debug.log('harness.pod', 'exit-classified', { runId, reason, status: exit.status, signal: signal ?? null }); } catch { /* observation is fail-soft */ }
+  return { reason, lines: [line, ...(pr ? [`PR 이 남아 있다: ${pr}`] : [])] };
+}
+
+/** The classified status is the same exit handed to the launcher; ledger failure is never an exit failure. */
+export function recordClassifiedHarnessPodExit(runId: string | undefined, reason: string, status: number): void {
+  if (!runId) return;
+  try {
+    const signal = status > 128
+      ? Object.entries(osConstants.signals).find(([, number]) => number === status - 128)?.[0] ?? null : null;
+    recordRunExit({ runId, reason, status, signal, at: new Date().toISOString() }, effectiveInstanceRoot());
+  } catch { /* incident writes cannot change Pod output or exit */ }
+}
+
+/** Every Pod launch entrance (harness ask/say · dev ask --substrate pod) warns once after a recent burst; it never blocks the launch. */
+export function warnRecentIncidentBurst(
+  root: string = effectiveInstanceRoot(), now: Date = new Date(), write: (line: string) => void = (line) => console.error(line),
+): boolean {
+  try {
+    const burst = recentBurst(root, now);
+    if (!burst) return false;
+    write(formatIncidentBurstWarning(burst));
+    try { debug.log('harness.incident', 'burst', { reason: burst.reason, count: burst.count }); } catch { /* observation is fail-soft */ }
+    return true;
+  } catch { return false; /* incident reads cannot block a launch */ }
+}
+
+function lookupHarnessSupervisorDecision(runId: string): { stopReason?: string; why?: string } | undefined {
+  const path = logsDbPath();
+  if (!existsSync(path)) return undefined;
+  const store = LogStore.openReadOnly(path);
+  try {
+    let beforeId: number | undefined;
+    for (;;) {
+      const rows = store.query({ exactCategories: ['self-dev.supervisor'], events: ['decision'], grep: runId,
+        limit: 1_000, ...(beforeId === undefined ? {} : { beforeId }) });
+      for (const row of rows) {
+        try {
+          const data = JSON.parse(row.data ?? '{}') as Record<string, unknown>;
+          if (data.runId !== runId) continue;
+          return data.action === 'stop' && typeof data.stopReason === 'string'
+            ? { stopReason: data.stopReason, ...(typeof data.why === 'string' ? { why: data.why } : {}) }
+            : undefined;
+        } catch { /* Malformed observation is not evidence. */ }
+      }
+      if (rows.length < 1_000) return undefined;
+      beforeId = rows.at(-1)!.id;
+    }
+  } finally { store.close(); }
+}
+
+function hasHarnessPodJobApplied(runId: string | undefined, output: string): boolean | undefined {
+  const job = output.match(/\bsi-[a-z0-9-]+\b/i)?.[0];
+  if (!runId && !job) return undefined;
+  const path = logsDbPath();
+  if (!existsSync(path)) return undefined;
+  const store = LogStore.openReadOnly(path);
+  try {
+    for (const needle of new Set([runId, job].filter((value): value is string => value !== undefined))) {
+      let beforeId: number | undefined;
+      for (;;) {
+        const rows = store.query({ exactCategories: ['self-implement.pod'], events: ['job-applied'],
+          grep: needle, limit: 1_000, ...(beforeId === undefined ? {} : { beforeId }) });
+        if (rows.some((row) => {
+          try {
+            const data = JSON.parse(row.data ?? '{}') as Record<string, unknown>;
+            return (runId !== undefined && data.runId === runId)
+              || (job !== undefined && data.job === job && (runId === undefined || data.runId === undefined || data.runId === runId));
+          } catch { return false; }
+        })) return true;
+        if (rows.length < 1_000) break;
+        beforeId = rows.at(-1)!.id;
+      }
+    }
+    return false;
+  } finally { store.close(); }
+}
+
 /** ⭐ 런 계약의 실행 칸 = pod — 호스트는 그래프를 안 돌리고 Pod 로 보낸다(harness-pod-dispatch.ts). */
 async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-say', input: string, pool: string,
   recordDispatch: (input: DispatchTaskInput, deps?: DispatchTaskDeps) => ReturnType<typeof dispatchTask> = dispatchTask): Promise<void> {
@@ -334,6 +525,7 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
     process.exitCode = 2;
     return;
   }
+  warnRecentIncidentBurst();
   let dispatchRecorded = false;
   try {
     const goalText = entrance === 'cli-harness-ask' ? readFileSync(input, 'utf8') : input;
@@ -351,42 +543,16 @@ async function onPod(opts: unknown, entrance: 'cli-harness-ask' | 'cli-harness-s
   }
   const { dispatchHarnessOnPod } = await import('./harness-pod-dispatch.js');
   let output = '';
+  let runId: string | undefined;
   const status = await dispatchHarnessOnPod({ entrance, input, podPool: pool, ...(dispatchRecorded ? { dispatchRecorded: true } : {}), ...(o.podMemory ? { podMemory: o.podMemory } : {}), ...(o.autoMerge === false ? { autoMerge: false } : {}), ...(o.base ? { base: o.base } : {}), ...(o.json ? { json: true } : {}), ...(o.source ? { source: o.source } : {}) },
-    entrance === 'cli-harness-ask' ? { onOutput: (text) => { output = (output + text).slice(-16_000); } } : {});
+    { onOutput: (text) => {
+      runId ??= harnessPodRunId(output + text);
+      output = (output + text).slice(-16_000);
+    } });
   if (status !== 0) {
-    let childError: string | undefined;
-    let podFailure: string | undefined;
-    let podJobFailed = false;
-    if (entrance === 'cli-harness-ask') {
-      for (const line of output.split('\n').reverse()) {
-        if (!line.trimStart().startsWith('[{') || !line.includes('"error"')) continue;
-        try {
-          const results: unknown = JSON.parse(line);
-          if (!Array.isArray(results)) continue;
-          for (const result of results) {
-            if (!result || typeof result !== 'object') continue;
-            const error = (result as { error?: { code?: string; message?: string } }).error;
-            if (typeof error?.code !== 'string' || typeof error.message !== 'string' || !error.code.startsWith('pod-')) continue;
-            if (error.code === 'pod-job-failed') {
-              podJobFailed = true;
-              childError = error.message.split('childError=')[1]?.split('\n', 1)[0];
-            }
-            podFailure = error.message;
-            break;
-          }
-        } catch { /* Non-result stdout cannot establish that a Pod child ran. */ }
-        if (podFailure) break;
-      }
-      if (!podFailure) {
-        const summary = output.split('\n').find((line) => /\s❌\sfailed · .* — pod-[\w-]+: /.test(line));
-        podFailure = summary?.split(/\s❌\sfailed · .* — pod-[\w-]+: /)[1];
-        podJobFailed = summary?.includes(' — pod-job-failed: ') ?? false;
-        if (podJobFailed) childError = podFailure?.split('childError=')[1]?.split('\n', 1)[0];
-      }
-    }
-    if (podJobFailed && childError && childError !== 'no-result-line') console.error(`Pod 안 자식이 실패했다 — ${childError}`);
-    else if (podFailure) console.error(`Pod 실행이 실패했다 — ${podFailure.split('\n', 1)[0]}`);
-    else console.error('Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라');
+    const classified = classifyHarnessPodExit({ status }, output, { ...(runId ? { runId } : {}) });
+    recordClassifiedHarnessPodExit(runId ?? harnessPodRunId(output), classified.reason, status);
+    for (const line of classified.lines) console.error(line);
     process.exitCode = status;
   }
 }
@@ -1596,6 +1762,36 @@ export function installHarnessCliCommand(program: Command, deps: HarnessCliComma
     .command('harness')
     .description('dev-harness worktree 수명 — 워크트리 생성(worktree add)·조회(worktrees)·정리(clean)·프로세스 관찰(processes)');
   installHarnessCliSinkHook(harnessCmd, deps.registerSink, deps.resolveSurface);
+  harnessCmd.command('incidents').description('최근 하니스 Pod 종료 사고 원장을 읽는다')
+    .option('--since <minutes>', '최근 몇 분의 종료를 볼지 (기본 15분)', '15')
+    .option('--json', '구조화 출력')
+    .action((opts: { since: string; json?: boolean }) => {
+      const since = Number(opts.since);
+      if (!Number.isFinite(since) || since < 0) {
+        console.error('❌ --since 는 0 이상의 분이어야 합니다');
+        process.exitCode = 2;
+        return;
+      }
+      try {
+        const root = effectiveInstanceRoot();
+        const rows = readRunExits(root);
+        if (rows.length === 0) {
+          console.log(opts.json ? JSON.stringify({ rows: [], bursts: [] }) : '기록 없음 — 사고 0 이 아니라 아직 기록이 없다');
+          return;
+        }
+        const now = Date.now();
+        const selected = rows.filter((row) => Date.parse(row.at) >= now - since * 60_000 && Date.parse(row.at) <= now);
+        const bursts = detectBursts(rows).filter((burst) => Date.parse(burst.lastAt) >= now - since * 60_000 && Date.parse(burst.lastAt) <= now);
+        if (opts.json) console.log(JSON.stringify({ rows: selected, bursts }));
+        else {
+          for (const row of selected) console.log(`${row.at} run ${row.runId} · ${row.reason} · status=${row.status} signal=${row.signal ?? '-'}`);
+          for (const burst of bursts) console.log(`${burst.firstAt}–${burst.lastAt} 묶음 ${burst.reason} ×${burst.count} · ${burst.runIds.join(', ')}`);
+        }
+      } catch (error) {
+        console.error(humanErrorLine(error));
+        process.exitCode = 1;
+      }
+    });
   installDeliverableVerifyCliCommand(harnessCmd, deps.deliverableVerify);
   installHarnessProcessObservationCommand(harnessCmd, deps.processObservation);
   installHarnessBudgetCommand(harnessCmd);

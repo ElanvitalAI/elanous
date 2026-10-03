@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { buildUserConfig } from '../user-config.js';
 import { tmpdir } from 'node:os';
@@ -7,6 +7,10 @@ import { scheduleTriage, trackTablePrompt, triageIssues, runStewardStage, runSte
 import { markStageStart, readFailureStreak, writeFailureStreak } from './failure-streak.js';
 import { CardStore } from '../task-cards/card-store.js';
 import { triageInputHash, triageWithinBudget } from './triage-budget.js';
+import { readLaunchLedger } from './launch.js';
+
+// Real Bun subprocesses can exceed Bun's 5 s test default under gate-pod load.
+setDefaultTimeout(60_000);
 
 const issues: TriageIssue[] = [
   { identifier: 'ELA-1', ref: 'one', title: '기반 구축', body: '' },
@@ -208,6 +212,21 @@ test('steward config parses team, observe mode and role caps', () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('steward launch config validates live/off and parallel/pool overrides without changing observe mode', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'steward-launch-config-'));
+  const path = join(dir, 'config.json');
+  try {
+    writeFileSync(path, JSON.stringify({ loops: { steward: { launch: 'live', maxParallel: 5, podPool: 'team@host:4' } } }));
+    expect(buildUserConfig(path).loops?.steward).toMatchObject({ mode: 'observe', launch: 'live', maxParallel: 5, podPool: 'team@host:4' });
+    writeFileSync(path, JSON.stringify({ loops: { steward: { launch: 'off', maxParallel: -1, podPool: '' } } }));
+    const off = buildUserConfig(path).loops?.steward;
+    expect(off).toMatchObject({ mode: 'observe', launch: 'off' });
+    // Invalid overrides stay absent; launch.ts applies maxParallel 3 · pool-node-b@node-b:8.
+    expect(off?.maxParallel).toBeUndefined();
+    expect(off?.podPool).toBeUndefined();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('LLM decisions emit route/escalate and mandatory HITL for paid sale', async () => {
   const events: unknown[] = [];
   const result = await triageIssues(issues, async issue => ({ rung: 4, dependsOn: issue.ref === 'two' ? ['ELA-1'] : [], priority: 2, why: 'needs work' }), event => { events.push(event); return true; });
@@ -345,10 +364,120 @@ test('22 sample directives through fake Linear and observe report create 22 card
     try {
       const cards = store.listCards();
       expect(cards).toHaveLength(22);
-      expect(cards.every(card => card.sections.length === 2 && card.sections[0]?.key.startsWith('intake:') && card.sections[1]?.key.startsWith('triage:'))).toBe(true);
-      expect(cards.filter(card => JSON.parse(card.sections[1]!.content).disposition === 'hitl')).toHaveLength(3);
+      expect(cards.every(card => card.sections.some(section => section.key.startsWith('intake:')) && card.sections.some(section => section.key.startsWith('triage:')))).toBe(true);
+      expect(cards.filter(card => card.sections.some(section => section.key.startsWith('launch:')))).toHaveLength(3);
+      expect(cards.filter(card => card.sections.some(section => section.key.startsWith('hitl:')))).toHaveLength(3);
+      expect(cards.filter(card => card.sections.some(section => section.key.startsWith('triage:') && JSON.parse(section.content).disposition === 'hitl'))).toHaveLength(3);
     } finally { store.close(); }
     expect(calls.filter(query => query.includes('commentCreate('))).toHaveLength(22);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('schedule → report: live pod runs yield one landing digest with source, title and PR, without repeating', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-landing-'));
+  const dir = join(root, 'steward');
+  mkdirSync(dir);
+  const runId = 'run-12345678-1234-1234-1234-123456789abc';
+  const messages: string[] = [];
+  const calls: string[][] = [];
+  const one = [{ ...issues[0]!, title: 'Landing request', body: 'Implement it\n출처: pwa' }];
+  const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const { query } = JSON.parse(String(init?.body)) as { query: string };
+    if (query.includes('commentCreate(')) return Response.json({ data: { commentCreate: { success: true } } });
+    throw new Error(`unexpected query: ${query}`);
+  }) as typeof fetch;
+  const deps = { root, getSecret: async () => 'key', fetch: fetchFn, launchSettings: { launch: 'live' as const },
+    spawnLaunch: (args: string[], log: string) => { calls.push(args); writeFileSync(log, `starting ${runId}`); return { pid: 99999999 }; },
+    launchCommand: (args: string[]) => args.includes('budget') ? { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }
+      : { exitCode: 0, stdout: [{ event: 'pr-opened', data: { number: 77 } }, { event: 'merged', data: { number: 77, merged: true } }, { event: 'run-status', data: { runStatus: 'completed' } }].map(event => JSON.stringify(event)).join('\n') },
+    sendDigest: async (text: string) => { messages.push(text); } };
+  try {
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify(one));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: one[0]!.identifier, rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
+    await runStewardStage('schedule', deps);
+    expect(calls).toHaveLength(1);
+    expect(readLaunchLedger(root).launches['ELA-1']?.runId).toBe(runId);
+    await runStewardStage('report', deps);
+    await runStewardStage('report', deps);
+    expect(messages.filter(text => text.includes('PR 77'))).toEqual(['pwa · Landing request · PR 77 · merged']);
+    const store = new CardStore(root);
+    try {
+      const card = store.listCards()[0]!;
+      expect(card.sections.map(section => section.key.split(':')[0])).toEqual(['launch', 'intake', 'triage', 'outcome']);
+    } finally { store.close(); }
+    expect(readLaunchLedger(root).launches['ELA-1']?.reported).toBe(true);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('report waits for a completed run with an open PR, then sends its merge once', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-delayed-merge-'));
+  const dir = join(root, 'steward');
+  mkdirSync(dir);
+  const messages: string[] = [];
+  const events: Array<{ event: string; data: { number?: number; runStatus?: string; merged?: boolean } }> = [
+    { event: 'pr-opened', data: { number: 91 } },
+    { event: 'run-status', data: { runStatus: 'completed' } },
+  ];
+  const one = { ...issues[0]!, title: 'Delayed landing', body: '출처: telegram' };
+  const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
+    const { query } = JSON.parse(String(init?.body)) as { query: string };
+    if (query.includes('commentCreate(')) return Response.json({ data: { commentCreate: { success: true } } });
+    throw new Error(`unexpected query: ${query}`);
+  }) as typeof fetch;
+  const deps = { root, getSecret: async () => 'key', fetch: fetchFn, launchSettings: { launch: 'live' as const },
+    launchCommand: () => ({ exitCode: 0, stdout: events.map(event => JSON.stringify(event)).join('\n') }),
+    sendDigest: async (text: string) => { messages.push(text); } };
+  try {
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([one]));
+    writeFileSync(join(dir, 'schedule.json'), JSON.stringify([{ issue: one.identifier, rung: 4, dependsOn: [], priority: 1, why: 'build', disposition: 'now' }]));
+    writeFileSync(join(dir, 'launches.json'), JSON.stringify({ launches: { [one.identifier]: {
+      issue: one.identifier, title: one.title, source: 'telegram', command: 'say', status: 'launched', runId: 'run-12345678-1234-1234-1234-123456789abc',
+    } }, hitl: {} }));
+    await runStewardStage('report', deps);
+    await runStewardStage('report', deps);
+    expect(messages.filter(text => text.includes('PR 91'))).toEqual([]);
+    expect(readLaunchLedger(root).launches[one.identifier]).toMatchObject({ status: 'running', awaitingMerge: true });
+    expect(readLaunchLedger(root).launches[one.identifier]?.reported).not.toBe(true);
+    events.push({ event: 'merged', data: { number: 91, merged: true } });
+    await runStewardStage('report', deps);
+    await runStewardStage('report', deps);
+    expect(messages.filter(text => text.includes('PR 91'))).toEqual(['telegram · Delayed landing · PR 91 · merged']);
+    expect(readLaunchLedger(root).launches[one.identifier]).toMatchObject({ status: 'merged', reported: true });
+    const store = new CardStore(root);
+    try {
+      expect(store.listCards()[0]!.sections.filter(section => section.key.startsWith('outcome:'))).toHaveLength(1);
+    } finally { store.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('landing still reaches its card and requester after the issue leaves the current snapshot', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'steward-absent-landing-'));
+  const dir = join(root, 'steward');
+  mkdirSync(dir);
+  const runId = 'run-12345678-1234-1234-1234-123456789abc';
+  const messages: string[] = [];
+  let spawned = 0;
+  const one = { ...issues[0]!, title: 'Departed request', body: 'Build it\n출처: tui' };
+  const deps = { root, getSecret: async () => 'key', launchSettings: { launch: 'live' as const },
+    spawnLaunch: (_args: string[], log: string) => { spawned++; writeFileSync(log, `started ${runId}`); return { pid: 99999999 }; },
+    launchCommand: (args: string[]) => args.includes('budget') ? { exitCode: 0, stdout: '{"outcome":"proceed","reasons":[]}' }
+      : { exitCode: 0, stdout: '{"event":"merged","data":{"number":88,"merged":true}}' },
+    sendDigest: async (text: string) => { messages.push(text); } };
+  try {
+    writeFileSync(join(dir, 'issues.json'), JSON.stringify([one]));
+    writeFileSync(join(dir, 'triage.json'), JSON.stringify([{ issue: one.identifier, rung: 4, dependsOn: [], priority: 1, why: 'build' }]));
+    await runStewardStage('schedule', deps);
+    expect(spawned).toBe(1);
+    writeFileSync(join(dir, 'issues.json'), '[]');
+    await runStewardStage('report', deps);
+    await runStewardStage('report', deps);
+    expect(messages.filter(text => text.includes('PR 88'))).toEqual(['tui · Departed request · PR 88 · merged']);
+    const store = new CardStore(root);
+    try {
+      const card = store.listCards().find(item => item.goalId === 'linear:ELA-1')!;
+      expect(card.sections.map(section => section.key.split(':')[0])).toEqual(['launch', 'outcome']);
+    } finally { store.close(); }
+    expect(readLaunchLedger(root).launches['ELA-1']?.reported).toBe(true);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -512,7 +641,7 @@ test('schedule stage checks completed Linear dependencies read-only before relea
   const fetchFn = (async (_url: string | URL | Request, init?: RequestInit) => {
     const { query } = JSON.parse(String(init?.body)) as { query: string };
     calls.push(query);
-    if (query.includes('identifier:{in:')) return Response.json({ data: { issues: { nodes: [{ identifier: 'ELA-2', state: { type: 'completed' } }], pageInfo: { hasNextPage: false, endCursor: null } } } });
+    if (query.includes('filter:{id:{in:')) return Response.json({ data: { issues: { nodes: [{ identifier: 'ELA-2', state: { type: 'completed' } }], pageInfo: { hasNextPage: false, endCursor: null } } } });
     if (query.includes('issues(')) return Response.json({ data: { issues: { nodes: issues.map(i => ({ id: i.ref, identifier: i.identifier, title: i.title, description: i.body, url: '', priority: 2, updatedAt: '2026-09-28T00:00:00Z', state: { type: 'started' } })), pageInfo: { hasNextPage: false, endCursor: null } } } });
     throw new Error('unexpected mutation');
   }) as typeof fetch;
@@ -521,7 +650,9 @@ test('schedule stage checks completed Linear dependencies read-only before relea
     for (const stage of ['sync', 'triage', 'schedule'] as const) await runStewardStage(stage, deps);
     const rows = JSON.parse(readFileSync(join(root, 'steward', 'schedule.json'), 'utf8')) as Array<{ issue: string; disposition: string }>;
     expect(rows.find(row => row.issue === 'ELA-1')?.disposition).toBe('now');
-    expect(calls.filter(query => query.includes('identifier:{in:'))).toHaveLength(1);
+    expect(calls.filter(query => query.includes('filter:{id:{in:'))).toHaveLength(1);
+    // Linear IssueFilter has no `identifier` field — that query was HTTP 400 in production (10-02).
+    expect(calls.some(query => query.includes('identifier:{in:'))).toBe(false);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -572,7 +703,7 @@ test('observe stages only fetch, judge, schedule and comment; no task spawn', as
     try {
       const cards = store.listCards();
       expect(cards).toHaveLength(2);
-      expect(cards.every(card => card.sections.length === 2 && card.sections.every(section => section.owner === 'steward'))).toBe(true);
+      expect(cards.every(card => card.sections.length >= 2 && card.sections.every(section => section.owner === 'steward'))).toBe(true);
     } finally { store.close(); }
     expect(calls.every(q => q.includes('issues(') || q.includes('commentCreate('))).toBe(true);
     expect(readFileSync(join(root, 'steward', 'schedule.json'), 'utf8')).not.toContain('private-token');

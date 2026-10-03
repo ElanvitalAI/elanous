@@ -14,6 +14,7 @@ let tree: ReactTestRenderer | undefined;
 let requests: Array<{ url: string; init?: RequestInit }> = [];
 let uploads: FieldXHR[] = [];
 let reelState = 'rendering';
+let folderCount = 0;
 
 class FieldXHR {
   upload: { onprogress?: (event: { lengthComputable: boolean; loaded: number; total: number }) => void } = {};
@@ -41,6 +42,7 @@ afterEach(async () => {
   requests = [];
   uploads = [];
   reelState = 'rendering';
+  folderCount = 0;
 });
 
 async function mount() {
@@ -50,6 +52,7 @@ async function mount() {
   globalThis.fetch = (async (url: string, init?: RequestInit) => {
     requests.push({ url, init });
     if (url.endsWith('/v1/field/uploads')) return Response.json({ defaultEvent: 'festival-2026' });
+    if (url.includes('/v1/field/uploads?event=')) return Response.json({ event: new URL(url).searchParams.get('event'), count: folderCount, reel: folderCount ? { status: 'rendering' } : undefined });
     if (url.includes('/v1/field/reel/file')) return new Response(new Blob(['video'], { type: 'video/mp4' }));
     if (url.includes('/v1/field/reel?')) return Response.json({ event: 'festival-2026', state: reelState, items: 2, ...(reelState === 'done' ? { url: '/v1/field/reel/file?event=festival-2026' } : {}) });
     throw new Error(`unexpected request ${url}`);
@@ -76,8 +79,12 @@ async function submit() {
 
 test('daemon default fills the editable event and native media picker accepts multiple images or videos', async () => {
   const root = await mount();
-  expect(requests.map((request) => request.url)).toEqual(['https://nexus.example/v1/field/uploads']);
+  expect(requests.map((request) => request.url)).toEqual([
+    'https://nexus.example/v1/field/uploads',
+    'https://nexus.example/v1/field/uploads?event=festival-2026',
+  ]);
   expect(root.findByProps({ id: 'field-event' }).props.value).toBe('festival-2026');
+  expect(root.findAllByProps({ 'aria-label': '행사 폴더 상태' })).toHaveLength(1);
   const picker = root.findByProps({ id: 'field-files' });
   expect(picker.props.multiple).toBe(true);
   expect(picker.props.accept).toBe('image/*,video/*');
@@ -92,7 +99,7 @@ test('a delayed daemon default never overwrites an event edited before it arrive
   const pending = new Promise<Response>((resolve) => { resolveDefault = resolve; });
   const config = { baseUrl: 'https://nexus.example', token: 'owner-token', provider: '' };
   const client = new DaemonClient(config);
-  globalThis.fetch = (async (_url: string) => pending) as typeof fetch;
+  globalThis.fetch = (async (url: string) => url.endsWith('/v1/field/uploads') ? pending : Response.json({ event: 'edited-event', count: 0 })) as typeof fetch;
   await act(async () => {
     tree = create(<DaemonContext.Provider value={{ client, config, sessionId: '', setConfig: () => {}, setSessionId: () => {} }}><FieldPage /></DaemonContext.Provider>);
   });
@@ -107,9 +114,12 @@ test('invalid slug gives a one-line hint and never posts; a valid edited event i
   await act(async () => { root.findByProps({ id: 'field-event' }).props.onChange({ target: { value: 'Bad/Name' } }); });
   expect(root.findByProps({ id: 'field-slug-error' }).children.join('')).toContain('영문 소문자');
   expect(root.findByType('button').props.disabled).toBe(true);
+  expect(root.findAllByProps({ 'aria-label': '행사 폴더 상태' })).toHaveLength(0);
   await submit();
   expect(uploads).toHaveLength(0);
   await act(async () => { root.findByProps({ id: 'field-event' }).props.onChange({ target: { value: 'event_2' } }); });
+  expect(requests.some((request) => request.url.endsWith('/v1/field/uploads?event=event_2'))).toBe(true);
+  expect(root.findAllByProps({ 'aria-label': '행사 폴더 상태' })).toHaveLength(1);
   await submit();
   expect(uploads).toHaveLength(1);
   expect(uploads[0]!.url).toBe('https://nexus.example/v1/field/uploads?event=event_2&device=pwa');
@@ -129,9 +139,41 @@ test('multipart sends exactly the selected files with the iOS query caption and 
   expect(xhr.body!.getAll('capturedAt')).toEqual(['', '']);
   await act(async () => { xhr.upload.onprogress?.({ lengthComputable: true, loaded: 40, total: 100 }); });
   expect(root.findByType('progress').props.value).toBe(40);
+  folderCount = 2;
   await act(async () => { xhr.finish(); });
-  expect(root.findByProps({ 'aria-label': '올린 결과' }).findByType('p').children.join('')).toContain('폴더에 2개 · 영상 만드는 중');
+  expect(root.findAllByProps({ 'aria-label': '행사 폴더 상태' })).toHaveLength(1);
+  expect(root.findAllByProps({ 'aria-label': '올린 결과' })).toHaveLength(0);
+  expect(root.findByProps({ 'aria-label': '행사 폴더 상태' }).findByType('p').children.join('')).toContain('폴더에 2개 · 영상 만드는 중');
+  expect(requests.filter((request) => request.url.endsWith('/v1/field/uploads?event=festival-2026'))).toHaveLength(2);
   expect(requests.some((request) => request.url.endsWith('/v1/field/reel?event=festival-2026'))).toBe(true);
+});
+
+test('repeated uploads refresh the same event card without adding overlapping results', async () => {
+  const root = await mount();
+  for (const count of [2, 4]) {
+    await select([file(`photo-${count}.jpg`, 'image/jpeg')]);
+    await submit();
+    folderCount = count;
+    await act(async () => { uploads[uploads.length - 1]!.finish(); });
+    const cards = root.findAllByProps({ 'aria-label': '행사 폴더 상태' });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]!.findByType('h2').children).toEqual(['festival-2026']);
+    expect(cards[0]!.findByType('p').children.join('')).toContain(`폴더에 ${count}개`);
+    expect(root.findAllByProps({ 'aria-label': '올린 결과' })).toHaveLength(0);
+  }
+  expect(requests.filter((request) => request.url.endsWith('/v1/field/uploads?event=festival-2026'))).toHaveLength(3);
+});
+
+test('a failed upload preserves the existing folder card without refreshing it', async () => {
+  const root = await mount();
+  await select([file('photo.jpg', 'image/jpeg')]);
+  await submit();
+  uploads[0]!.status = 500;
+  await act(async () => { uploads[0]!.finish(); });
+  expect(root.findAllByProps({ 'aria-label': '행사 폴더 상태' })).toHaveLength(1);
+  expect(root.findByProps({ 'aria-label': '행사 폴더 상태' }).findByType('p').children.join('')).toContain('폴더에 0개');
+  expect(requests.filter((request) => request.url.endsWith('/v1/field/uploads?event=festival-2026'))).toHaveLength(1);
+  expect(root.findByProps({ role: 'alert' }).children.join('')).toContain('올리지 못했습니다');
 });
 
 test('upload result exposes only event and count after validating daemon ok', async () => {
@@ -159,6 +201,7 @@ test('reel done renders an authenticated video blob and releases the URL on unmo
   URL.revokeObjectURL = ((url: string) => { revoked.push(url); }) as typeof URL.revokeObjectURL;
   await select([file('clip.mp4', 'video/mp4'), file('poster.jpg', 'image/jpeg')]);
   await submit();
+  folderCount = 2;
   await act(async () => { uploads[0]!.finish(); });
   reelState = 'done';
   await act(async () => { await new Promise((resolve) => setTimeout(resolve, 5100)); });
@@ -166,7 +209,7 @@ test('reel done renders an authenticated video blob and releases the URL on unmo
   expect(videoRequest?.init?.headers).toEqual({ authorization: 'Bearer owner-token' });
   expect(root.findByType('video').props.src).toBe('blob:field-reel');
   expect(root.findByType('video').props.controls).toBe(true);
-  expect(root.findByProps({ 'aria-label': '올린 결과' }).findByType('p').children.join('')).toContain('영상 완료');
+  expect(root.findByProps({ 'aria-label': '행사 폴더 상태' }).findByType('p').children.join('')).toContain('영상 완료');
   await act(async () => { tree!.unmount(); });
   tree = undefined;
   expect(revoked).toEqual(['blob:field-reel']);

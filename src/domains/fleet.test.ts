@@ -1,12 +1,15 @@
 // elanous fleet — 멀티 인스턴스 뷰 + 스토어 경로 도출 테스트.
 
-import { describe, test, expect } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect } from 'bun:test';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { buildFleetView, instanceStorePaths, ptyEventLogTargets, ptyManifestTargets } from './fleet.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 test('fleet CLI displays a remote host without marking it dead and retains JSON identity', () => {
   const root = mkdtempSync(join(tmpdir(), 'fleet-remote-'));

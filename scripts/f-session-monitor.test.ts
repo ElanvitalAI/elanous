@@ -5,7 +5,7 @@
  *   ⓐ 「0」을 「못 쟀음」과 섞는가          ⓑ probable-running 을 「없다」로 읽는가
  *   ⓒ 남의 트리 런을 내 관문에 세는가       ⓓ 한글 폭 때문에 표가 어긋나는가
  */
-import { describe, expect, test } from "bun:test";
+import { setDefaultTimeout, describe, expect, test } from "bun:test";
 import {
   buildGates,
   errored,
@@ -26,6 +26,9 @@ import {
   type LiveProcView,
   type RunsView,
 } from "./f-session-monitor";
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const runsOf = (running: string[], probable: string[], others: Record<string, number> = {}): RunsView => ({
   myTree: { running, probable },

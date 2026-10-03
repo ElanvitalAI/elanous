@@ -11,6 +11,7 @@ import { credentialStatus, pluginEnv } from '../plugins/install/plugin-credentia
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { loadNodeCatalog } from '../self-implement/graph-catalog.js';
 import { parseGraphTemplateYaml, type GraphEdgeSpec, type GraphNodeSpec } from '../self-implement/graph-yaml.js';
+import { psProcessStartMs, START_TOLERANCE_MS } from '../harness/harness-stop.js';
 import { executeBashNode } from '../workflow-runtime/nodes/bash.js';
 import type { BashNode, NodeExecContext, WorkflowDeps } from '../workflow-runtime/types.js';
 
@@ -21,6 +22,8 @@ export interface GraphRunState {
   runId: string;
   startedAt?: string;
   finishedAt?: string;
+  pid?: number;
+  pidStartedAt?: string;
   status: 'running' | 'done' | 'failed' | 'budget-exceeded' | 'awaiting-approval';
   path: string[];
   nodes: Array<{ nodeId: string; ok: boolean; exit: number | null; executed: boolean; output?: unknown; error?: string; decidedBy?: string; decidedAt?: string }>;
@@ -29,7 +32,9 @@ export interface GraphRunState {
   approvalSourceHash?: string;
   /** Hash of the graph and recipes used for this run; required to safely restart a failed path. */
   sourceHash?: string;
-  resume?: { from: string; at: string; previousStatus: 'failed' };
+  graphSnapshot?: { graphSha: string; recipesSha: string };
+  graphPath?: string;
+  resume?: { from: string; at: string; previousStatus: GraphRunState['status']; graph?: 'snapshot' | 'current' };
   executed: number;
   dryRun: boolean;
   statePath: string;
@@ -40,8 +45,10 @@ export interface GraphRunOptions {
   dryRun?: boolean;
   runId?: string;
   resumeRunId?: string;
+  resumeGraphId?: string;
   fromNodeId?: string;
-  deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void };
+  useCurrentGraph?: boolean;
+  deps?: { root?: string; runBash?: BashRun; log?: (event: string, data: Record<string, unknown>) => void; processStartMs?: (pid: number) => number | null };
 }
 
 function safeSegment(value: string): string {
@@ -157,13 +164,19 @@ function persistGraphRun(state: GraphRunState): void {
   renameSync(temporary, state.statePath);
 }
 
-export function decideGraphApproval(graphId: string, runId: string, decision: 'approved' | 'rejected', by?: string, root = effectiveInstanceRoot()): GraphRunState {
+export interface ExpectedGraphApprovalVisit { nodeId: string; visit: number }
+
+export function decideGraphApproval(graphId: string, runId: string, decision: 'approved' | 'rejected', by?: string, root = effectiveInstanceRoot(), expected?: ExpectedGraphApprovalVisit): GraphRunState {
   const state = readGraphRun(graphId, runId, root);
-  if (state.status !== 'awaiting-approval' || !state.pending || state.pending.decision) {
+  if (state.status !== 'awaiting-approval' || !state.pending || state.pending.decision ||
+      (expected && (state.dryRun || state.pending.nodeId !== expected.nodeId || state.path.at(-1) !== expected.nodeId ||
+        !Number.isSafeInteger(expected.visit) || expected.visit < 1 ||
+        state.path.filter(node => node === expected.nodeId).length !== expected.visit))) {
     throw new Error(`run is not awaiting an undecided approval: ${graphId}/${runId}`);
   }
   if (by !== undefined && !by.trim()) throw new Error('approver name must not be empty');
   const recorded = { nodeId: state.pending.nodeId, decision, ...(by === undefined ? {} : { decidedBy: by }), decidedAt: new Date().toISOString() };
+  // A card can claim only the visit it names; never derive a later visit's claim path from a fresh read.
   const decisionPath = approvalDecisionPath(state);
   const temporary = `${decisionPath}.${randomUUID()}.tmp`;
   writeFileSync(temporary, JSON.stringify(recorded) + '\n', { flag: 'wx' });
@@ -206,7 +219,26 @@ function nextNode(edges: readonly GraphEdgeSpec[], nodeId: string, exitOutcome: 
 }
 
 export async function runGraph(path: string, options: GraphRunOptions = {}): Promise<GraphRunState> {
-  const source = readFileSync(path, 'utf8');
+  if (options.resumeRunId && options.runId) throw new Error('runId and resumeRunId cannot be combined');
+  if (options.fromNodeId && !options.resumeRunId) throw new Error('--from requires --resume');
+  if (options.useCurrentGraph && !options.resumeRunId) throw new Error('--use-current-graph requires --resume');
+  const root = options.deps?.root ?? effectiveInstanceRoot();
+  const matchingRuns = options.resumeRunId && !options.resumeGraphId
+    ? listGraphRuns(root).runs.filter((run) => run.runId === options.resumeRunId && run.graphPath === resolve(path)) : [];
+  if (matchingRuns.length > 1) throw new Error(`ambiguous run id: ${options.resumeRunId}`);
+  const currentSource = options.resumeRunId && (options.resumeGraphId || matchingRuns.length) && !options.useCurrentGraph
+    ? undefined : readFileSync(path, 'utf8');
+  const currentHeader: unknown = options.resumeRunId && !options.resumeGraphId && !matchingRuns.length ? parseYaml(currentSource!) : undefined;
+  const resumeGraphId = options.resumeGraphId ?? matchingRuns[0]?.graphId ?? (currentHeader && typeof currentHeader === 'object' && !Array.isArray(currentHeader)
+    ? (currentHeader as Record<string, unknown>).graph_id : undefined);
+  const saved = options.resumeRunId && typeof resumeGraphId === 'string'
+    ? readGraphRun(safeSegment(resumeGraphId), safeSegment(options.resumeRunId), root) : undefined;
+  if (saved?.graphSnapshot && (!saved.graphPath || resolve(path) !== resolve(saved.graphPath))) {
+    throw new Error('--file cannot change the graph path of a snapshot run (이 런은 시작 때 그래프 사본이 있다 — --file 대신 --use-current-graph)');
+  }
+  const snapshotDir = saved ? `${saved.statePath}.graph` : undefined;
+  const graphMode: 'snapshot' | 'current' = snapshotDir && saved?.graphSnapshot && !options.useCurrentGraph ? 'snapshot' : 'current';
+  const source = graphMode === 'snapshot' ? readFileSync(join(snapshotDir!, 'graph.yaml'), 'utf8') : currentSource ?? readFileSync(path, 'utf8');
   // The shared YAML parser requires a recipe string. A command-less node in
   // this runner is represented internally as `none`, without changing that parser.
   const raw: unknown = parseYaml(source);
@@ -220,7 +252,7 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (!parsed.template || parsed.errors.length) throw new Error(parsed.errors.map((e) => `${e.path}: ${e.message}`).join('\n'));
   const graph = parsed.template;
   const pluginRoot = elanousStateRoot();
-  const graphFile = realpathSync(path);
+  const graphFile = graphMode === 'snapshot' && !existsSync(path) ? resolve(path) : realpathSync(path);
   const installed = listInstalledPlugins(pluginRoot);
   const owner = installed.find(item => {
     const graphsDir = join(item.path, 'graphs');
@@ -235,7 +267,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       throw new Error(`unsupported terminal node: ${terminal} (expected done or failed)`);
     }
   }
-  const recipeSource = readFileSync(join(dirname(path), 'recipes.yaml'), 'utf8');
+  const recipeSource = readFileSync(graphMode === 'snapshot' ? join(snapshotDir!, 'recipes.yaml') : join(dirname(path), 'recipes.yaml'), 'utf8');
+  if (graphMode === 'snapshot' && saved?.graphSnapshot &&
+    (createHash('sha256').update(source).digest('hex') !== saved.graphSnapshot.graphSha ||
+      createHash('sha256').update(recipeSource).digest('hex') !== saved.graphSnapshot.recipesSha)) {
+    throw new Error('graph snapshot changed since run started');
+  }
   const recipes = recipesFor(path, recipeSource);
   const catalogRoles = new Set(loadNodeCatalog().roles.keys());
   // Bind a human decision to the exact graph and recipe contents, not just its id or approval prompt.
@@ -247,10 +284,12 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     if (!resolved.command && !resolved.approval) throw new Error(`unknown command recipe for ${node.nodeId}: ${node.recipe}`);
   }
   const graphId = safeSegment(graph.graphId);
-  if (options.resumeRunId && options.runId) throw new Error('runId and resumeRunId cannot be combined');
-  if (options.fromNodeId && !options.resumeRunId) throw new Error('--from requires --resume');
+  if (saved && graphId !== saved.graphId) {
+    if (options.fromNodeId && graphMode === 'current') throw new Error('graph or recipes changed since failed run');
+    throw new Error(`run identity mismatch: ${saved.graphId}/${saved.runId}`);
+  }
   const runId = safeSegment(options.resumeRunId ?? options.runId ?? randomUUID());
-  const statePath = graphRunPath(graphId, runId, options.deps?.root ?? effectiveInstanceRoot());
+  const statePath = graphRunPath(graphId, runId, root);
   // A resume owns the run from the first state read through its last write and command.
   // Fail closed on a concurrent (or interrupted) owner rather than replaying a command.
   const resumeLock = `${statePath}.resume.lock`;
@@ -263,12 +302,20 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     }
   }
   try {
+  const startMs = (options.deps?.processStartMs ?? psProcessStartMs)(process.pid);
+  const runnerOwner = { pid: process.pid, pidStartedAt: new Date(startMs ?? Date.now() - process.uptime() * 1_000).toISOString() };
   const state: GraphRunState = options.resumeRunId
-    ? readGraphRun(graphId, runId, options.deps?.root ?? effectiveInstanceRoot())
-    : { graphId, runId, startedAt: new Date().toISOString(), status: 'running', path: [], nodes: [], sourceHash: approvalSourceHash, ...(options.input === undefined ? {} : { input: options.input }), executed: 0, dryRun: options.dryRun === true, statePath };
+    ? readGraphRun(graphId, runId, root)
+    : { graphId, runId, startedAt: new Date().toISOString(), ...runnerOwner, status: 'running', path: [], nodes: [], sourceHash: approvalSourceHash,
+      graphSnapshot: { graphSha: createHash('sha256').update(source).digest('hex'), recipesSha: createHash('sha256').update(recipeSource).digest('hex') },
+      graphPath: resolve(path), ...(options.input === undefined ? {} : { input: options.input }), executed: 0, dryRun: options.dryRun === true, statePath };
+  if (options.resumeRunId && graphMode === 'snapshot' && state.sourceHash && state.sourceHash !== approvalSourceHash) {
+    throw new Error('graph snapshot changed since run started');
+  }
+  if (options.resumeRunId && options.dryRun !== undefined && options.dryRun !== state.dryRun) throw new Error('cannot change dryRun when resuming');
   if (options.fromNodeId) {
     if (state.status !== 'failed' || state.pending || state.dryRun) throw new Error('--from requires a failed, non-dry run without pending approval');
-    if (!state.sourceHash || state.sourceHash !== approvalSourceHash) throw new Error('graph or recipes changed since failed run');
+    if (graphMode === 'current' && (!state.sourceHash || state.sourceHash !== approvalSourceHash)) throw new Error('graph or recipes changed since failed run');
     const from = state.path.indexOf(options.fromNodeId);
     if (from < 0 || state.path.lastIndexOf(options.fromNodeId) !== from || graph.terminalNodes.includes(options.fromNodeId)) throw new Error(`--from node is not unique on the saved executable path: ${options.fromNodeId}`);
     if (state.path.length !== state.nodes.length || state.nodes.some((record, i) => record.nodeId !== state.path[i]) ||
@@ -306,10 +353,10 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
     state.nodes = state.nodes.slice(0, from);
     state.executed = state.nodes.filter((node) => node.executed).length;
     state.status = 'running';
-    state.resume = { from: options.fromNodeId, at: new Date().toISOString(), previousStatus: 'failed' };
+    Object.assign(state, runnerOwner);
+    state.resume = { from: options.fromNodeId, at: new Date().toISOString(), previousStatus: 'failed', graph: graphMode };
     // Persist the restart boundary before executing it, so previous outputs remain durable.
     persistGraphRun(state);
-    debug.log('graph.run', 'resume', { graphId, runId, from: options.fromNodeId });
   }
   if (options.resumeRunId && state.status === 'running' && state.pending) {
     throw new Error(`run is not awaiting approval: ${graphId}/${runId}`);
@@ -323,10 +370,16 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   if (options.resumeRunId && (state.graphId !== graphId || state.runId !== runId)) {
     throw new Error(`run is not awaiting approval: ${graphId}/${runId}`);
   }
-  if (options.resumeRunId && options.dryRun !== undefined && options.dryRun !== state.dryRun) throw new Error('cannot change dryRun when resuming');
   if (options.resumeRunId && state.status === 'awaiting-approval' && state.approvalSourceHash !== approvalSourceHash) {
     throw new Error(`approval source changed since run was paused: ${graphId}/${runId}`);
   }
+  if (options.resumeRunId && !options.fromNodeId) {
+    const previousStatus = state.status;
+    Object.assign(state, runnerOwner);
+    state.resume = { from: state.pending?.nodeId ?? state.path.at(-1) ?? graph.entryNode, at: new Date().toISOString(), previousStatus, graph: graphMode };
+    persistGraphRun(state);
+  }
+  if (options.resumeRunId) debug.log('graph.runs', 'resume', { graphId, runId, from: state.resume?.from, graph: graphMode });
   const persist = () => {
     if (state.status === 'done' || state.status === 'failed' || state.status === 'budget-exceeded') state.finishedAt ??= new Date().toISOString();
     persistGraphRun(state);
@@ -345,6 +398,9 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error(`run id already exists: ${graphId}/${runId}`);
       throw error;
     }
+    mkdirSync(`${statePath}.graph`);
+    writeFileSync(join(`${statePath}.graph`, 'graph.yaml'), source, { flag: 'wx' });
+    writeFileSync(join(`${statePath}.graph`, 'recipes.yaml'), recipeSource, { flag: 'wx' });
   }
   while (current !== undefined) {
     const node = graph.nodes.find((n) => n.nodeId === current);
@@ -472,6 +528,76 @@ export async function runGraph(path: string, options: GraphRunOptions = {}): Pro
   } finally {
     if (options.resumeRunId) rmdirSync(resumeLock);
   }
+}
+
+export type GraphRunAlive = boolean | 'unknown';
+
+export function graphRunAlive(state: GraphRunState, processStartMs: (pid: number) => number | null = psProcessStartMs): GraphRunAlive {
+  if (state.pid === undefined) return 'unknown';
+  if (!Number.isSafeInteger(state.pid) || state.pid <= 0 || typeof state.pidStartedAt !== 'string') return false;
+  const recorded = Date.parse(state.pidStartedAt);
+  if (!Number.isFinite(recorded)) return false;
+  try {
+    const actual = processStartMs(state.pid);
+    return actual !== null && Number.isFinite(actual) && Math.abs(actual - recorded) <= START_TOLERANCE_MS;
+  } catch { return false; }
+}
+
+function isDecisionClaim(raw: unknown): boolean {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const value = raw as Record<string, unknown>;
+  return typeof value.nodeId === 'string' && (value.decision === 'approved' || value.decision === 'rejected')
+    && typeof value.decidedAt === 'string' && (value.decidedBy === undefined || typeof value.decidedBy === 'string')
+    && !('graphId' in value) && !('runId' in value);
+}
+
+export function listGraphRuns(root = effectiveInstanceRoot()): { runs: GraphRunState[]; unreadable: number } {
+  const base = join(root, 'graph-runs');
+  let graphs: string[];
+  try { graphs = readdirSync(base); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { runs: [], unreadable: 0 };
+    throw error;
+  }
+  const runs: GraphRunState[] = [];
+  let unreadable = 0;
+  for (const graphId of graphs) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(graphId) || graphId === '.' || graphId === '..') continue;
+    const dir = join(base, graphId);
+    let files: string[];
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+      files = readdirSync(dir);
+    } catch { unreadable++; continue; }
+    for (const file of files) {
+      if (!file.endsWith('.json')) continue;
+      const runId = file.slice(0, -5);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(runId) || runId === '.' || runId === '..') continue;
+      // Decision claims are named <runId>.json.<visit>.decision.json; a run
+      // may itself end in .decision, so check the ledger identity before skipping.
+      const decisionParent = file.match(/^(.*\.json)\.\d+\.decision\.json$/)?.[1];
+      try {
+        const raw: unknown = JSON.parse(readFileSync(join(dir, file), 'utf8'));
+        // Skip only a VALID decision claim (decideGraphApproval writes { nodeId, decision, decidedBy?, decidedAt });
+        // anything else under a claim-like name is judged as a ledger and counts as unreadable when broken.
+        if (decisionParent && isDecisionClaim(raw)) continue;
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
+          (raw as Partial<GraphRunState>).graphId !== graphId || (raw as Partial<GraphRunState>).runId !== runId) {
+          unreadable++;
+          continue;
+        }
+        const state = readGraphRun(graphId, runId, root);
+        if (typeof state.startedAt !== 'string' || !Number.isFinite(Date.parse(state.startedAt)) ||
+          !Array.isArray(state.path) || !state.path.every((node) => typeof node === 'string') ||
+          !Array.isArray(state.nodes) || !state.nodes.every((node) => node && typeof node.nodeId === 'string' && typeof node.ok === 'boolean')) {
+          throw new Error('invalid run state');
+        }
+        runs.push(state);
+      } catch { unreadable++; }
+    }
+  }
+  runs.sort((a, b) => Date.parse(b.startedAt!) - Date.parse(a.startedAt!) || a.graphId.localeCompare(b.graphId) || a.runId.localeCompare(b.runId));
+  return { runs, unreadable };
 }
 
 export function latestGraphRun(graphId: string, root = effectiveInstanceRoot()): GraphRunState | null {

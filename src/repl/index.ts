@@ -21,6 +21,7 @@ import { createInterface, type Interface as ReadlineInterface } from 'node:readl
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve as resolvePath, isAbsolute, basename } from 'node:path';
 import * as ui from '../ui.js';
+import { suggestProjectForFolder } from '../project/project-store.js';
 import { runTurn } from '../session/chat.js';
 import {
   ensureCliSession,
@@ -450,6 +451,12 @@ export async function runRepl(opts: ReplOpts): Promise<number> {
   const session = ensureCliSession(cfg, initialId);
   setActiveSessionId(session.id);
   setAmbientSessionId(session.id);
+  if (!opts.jsonOutput && (!initialId || session.id !== initialId)) {
+    try {
+      const project = suggestProjectForFolder(process.cwd());
+      if (project) ui.info(`Project suggestion: ${project.name} (${project.id})`);
+    } catch { /* suggestions must not interrupt the REPL */ }
+  }
   const sessionIdRef = { current: session.id };
 
   const tools = opts.enableTools ? buildReplTools() : undefined;

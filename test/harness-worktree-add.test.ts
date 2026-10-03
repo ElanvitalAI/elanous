@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -13,6 +13,9 @@ import {
   renderHarnessWorktreeAdd,
 } from '../src/harness/harness-worktree-add.js';
 import { defaultSeams } from '../src/self-implement/seams.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function git(repo: string, ...args: string[]): void {
   const result = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });

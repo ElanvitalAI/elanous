@@ -224,3 +224,56 @@ describe('cli-smoke 게이트 스텝', () => {
     expect(evidence).toContain('⚠️ SKIP cli-smoke');
   });
 });
+
+describe('missing dependencies are installed before measuring (10-02 Pod «commander» resolve failures)', () => {
+  const tree = (withCommander: boolean): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'gate-deps-'));
+    mkdirSync(join(dir, 'bin'));
+    writeFileSync(join(dir, 'bin', 'elanous.mjs'), '');
+    writeFileSync(join(dir, 'bun.lock'), '{}');
+    if (withCommander) {
+      mkdirSync(join(dir, 'node_modules', 'commander'), { recursive: true });
+      writeFileSync(join(dir, 'node_modules', 'commander', 'package.json'), '{}');
+    }
+    return dir;
+  };
+  const recorder = () => {
+    const calls: string[] = [];
+    const runCmd: RunCmd = async (cmd, args) => { calls.push([cmd, ...args].join(' ')); return { code: 0, stdout: '', stderr: '', timedOut: false }; };
+    return { calls, runCmd };
+  };
+
+  test('no node_modules → one frozen install before cli-smoke', async () => {
+    const dir = tree(false);
+    try {
+      const { calls, runCmd } = recorder();
+      const r = await runIntegrityGate(dir, { steps: ['cli-smoke'], runCmd });
+      expect(calls).toEqual(['bun install --frozen-lockfile', 'bun bin/elanous.mjs --help']);
+      expect(r.log).toContain('[deps] INSTALLED');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('commander already resolvable → no install', async () => {
+    const dir = tree(true);
+    try {
+      const { calls, runCmd } = recorder();
+      await runIntegrityGate(dir, { steps: ['cli-smoke'], runCmd });
+      expect(calls).toEqual(['bun bin/elanous.mjs --help']);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('install failure is logged and the steps still run (their failure is the evidence)', async () => {
+    const dir = tree(false);
+    try {
+      const calls: string[] = [];
+      const runCmd: RunCmd = async (cmd, args) => {
+        calls.push([cmd, ...args].join(' '));
+        return args[0] === 'install' ? { code: 1, stdout: '', stderr: 'lockfile had changes', timedOut: false } : { code: 1, stdout: '', stderr: 'boom', timedOut: false };
+      };
+      const r = await runIntegrityGate(dir, { steps: ['cli-smoke'], runCmd });
+      expect(calls).toHaveLength(2);
+      expect(r.log).toContain('[deps] FAIL');
+      expect(r.passed).toBe(false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});

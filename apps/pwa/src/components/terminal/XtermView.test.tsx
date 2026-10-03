@@ -1,9 +1,14 @@
-import { afterAll, describe, expect, mock, test } from 'bun:test';
+import { setDefaultTimeout, afterAll, describe, expect, mock, test } from 'bun:test';
 import { restoreModuleMocksAfterAll } from '@/lib/testing/restore-module-mocks';
 import { createRequire } from 'node:module';
 
 import { createReactHookHarness } from '@/lib/testing/react-hook-harness';
 import { sendToTerminal } from './terminal-input-registry';
+import { COMPACT_MAX_WIDTH } from '@/lib/compact-mode';
+import { TERM_FOCUS_DISABLED_KEY } from '@/lib/term-focus';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 type StateListener = (state: 'CONNECTING' | 'OPEN' | 'FAILED' | 'CLOSED', error?: Error) => void;
 type IntervalCallback = () => void;
@@ -22,10 +27,16 @@ const intervals = new Map<number, IntervalCallback>();
 let onTerminalData: ((data: string) => void) | undefined;
 let sendInput: (data: string, sessionId: string) => Promise<unknown> = async () => ({});
 let onAcpSession: ((sessionId: string) => void) | undefined;
+let onSessionUpdate: ((frame: { params?: unknown }) => void) | undefined;
+let spawnResponse: { status: string; snapshot?: string } = { status: 'attached', snapshot: 'ready' };
 let capabilityResponse = '';
 const terminals: Terminal[] = [];
 const logs: Array<{ event: string; details: unknown }> = [];
 let sends: string[] = [];
+let width = COMPACT_MAX_WIDTH + 1;
+let coarse = false;
+const storage = new Map<string, string>();
+const windowListeners = new Map<string, Set<() => void>>();
 
 // R-TST23 — 이 파일은 전역 `window`·`Date.now` 와 모듈 여럿(React JSX 런타임 포함)을 바꾼다. mock.module 은
 // 프로세스 전역이라, 안 되돌리면 뒤에 도는 파일이 가짜를 받는다(2026-09-27 전 스위트: `IntakeFrontDoor.test.tsx`
@@ -54,6 +65,15 @@ Object.defineProperty(globalThis, 'window', {
       return id;
     },
     clearInterval: (id: number) => intervals.delete(id),
+    get innerWidth() { return width; },
+    matchMedia: (query: string) => ({ matches: query === '(pointer: coarse)' && coarse }),
+    localStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => { storage.set(key, value); },
+      removeItem: (key: string) => { storage.delete(key); },
+    },
+    addEventListener: (kind: string, listener: () => void) => { (windowListeners.get(kind) ?? windowListeners.set(kind, new Set()).get(kind)!).add(listener); },
+    removeEventListener: (kind: string, listener: () => void) => { windowListeners.get(kind)?.delete(listener); },
   },
   configurable: true,
 });
@@ -78,7 +98,8 @@ class Terminal {
   unicode = { activeVersion: '' };
   loadAddon(): void {}
   open(): void {}
-  write(): void {}
+  writes: string[] = [];
+  write(data: string): void { this.writes.push(data); }
   onData(callback: (data: string) => void): { dispose(): void } {
     onTerminalData = callback;
     return { dispose() { onTerminalData = undefined; } };
@@ -93,7 +114,8 @@ mock.module('@xterm/addon-web-links', () => ({ WebLinksAddon: class {} }));
 mock.module('@xterm/addon-unicode11', () => ({ Unicode11Addon: class {} }));
 mock.module('@xterm/addon-serialize', () => ({ SerializeAddon: class { serialize(): string { return ''; } } }));
 mock.module('@/lib/debug', () => ({ debugLog: (event: string, details: unknown) => { logs.push({ event, details }); } }));
-mock.module('@/lib/elanous-term-envelope', () => ({ parseElanousTermEnvelope: () => null }));
+const actualTermEnvelope = await import('@/lib/elanous-term-envelope');
+mock.module('@/lib/elanous-term-envelope', () => actualTermEnvelope);
 mock.module('@/lib/peer-id', () => ({ getPeerId: () => 'peer' }));
 mock.module('@/lib/snapshot', () => ({ loadSnapshot: () => null, saveSnapshot: () => {}, snapshotKey: () => 'snapshot' }));
 mock.module('@/lib/xterm-resize-controller', () => ({ createXtermResizeController: () => ({ dispose: () => {} }) }));
@@ -101,13 +123,17 @@ mock.module('@/lib/xterm-capability-filter', () => ({ isXtermCapabilityResponse:
 
 const acp = {
   ready: Promise.resolve('s1'),
-  on: () => () => {},
+  on: (_kind: string, callback: (frame: { params?: unknown }) => void) => {
+    onSessionUpdate = callback;
+    return () => { if (onSessionUpdate === callback) onSessionUpdate = undefined; };
+  },
   onState: (listener: StateListener) => {
     listeners.add(listener);
     return () => listeners.delete(listener);
   },
   send: (method: string, params: unknown) => {
     sends.push(method);
+    if (method === 'terminal/spawn') return Promise.resolve(spawnResponse);
     if (method !== 'terminal/input') return Promise.resolve({});
     const { data, sessionId } = params as { data: string; sessionId: string };
     return sendInput(data, sessionId);
@@ -164,7 +190,7 @@ function liveTextOf(value: unknown): string {
 
 function render(terminalId = 't1', clearRequest = 0, readOnly = false): unknown {
   harness.render(() => XtermView({ sessionId: 's1', terminalId, clearRequest, readOnly }));
-  return harness.find((element) => element.type === 'div' && element.props.className === 'relative h-full w-full bg-[#0d0c08]');
+  return harness.find((element) => element.props['data-xterm-host'] === true);
 }
 
 function mount(terminalId = 't1'): () => void {
@@ -179,13 +205,95 @@ function resetState(): void {
   now = 0;
   onTerminalData = undefined;
   onAcpSession = undefined;
+  onSessionUpdate = undefined;
+  spawnResponse = { status: 'attached', snapshot: 'ready' };
   sendInput = async () => ({});
   acp.ready = Promise.resolve('s1');
   capabilityResponse = '';
   terminals.length = 0;
   logs.length = 0;
   sends = [];
+  width = COMPACT_MAX_WIDTH + 1;
+  coarse = false;
+  storage.clear();
+  windowListeners.clear();
 }
+
+describe('XtermView compact touch focus start', () => {
+  const host = () => harness.find((item) => item.props['data-xterm-host'] === true);
+
+  test('compact coarse pointer starts focused, exit remembers opt-out for a new mount', () => {
+    resetState();
+    width = COMPACT_MAX_WIDTH;
+    coarse = true;
+    render();
+    expect(host().props['data-focus-mode']).toBe('1');
+    expect(host().props.className).toContain('fixed inset-0');
+    expect(harness.find((item) => item.props['aria-pressed'] === true).props['aria-label']).toBe('집중 모드 끄기');
+    (harness.find((item) => typeof item.props.onClick === 'function' && item.props['aria-pressed'] === true).props.onClick as () => void)();
+    expect(host().props['data-focus-mode']).toBeUndefined();
+    expect(harness.find((item) => item.props['aria-pressed'] === false).props['aria-label']).toBe('집중 모드 — 터미널만 크게');
+    expect(storage.get(TERM_FOCUS_DISABLED_KEY)).toBe('1');
+    harness.unmount();
+    render();
+    expect(host().props['data-focus-mode']).toBeUndefined();
+    harness.unmount();
+    width = COMPACT_MAX_WIDTH + 1;
+    render();
+    expect(host().props['data-focus-mode']).toBeUndefined();
+    harness.unmount();
+  });
+
+  test('manual focus on mouse does not change the next start until the user exits', () => {
+    resetState();
+    width = COMPACT_MAX_WIDTH;
+    render();
+    expect(host().props['data-focus-mode']).toBeUndefined();
+    (harness.find((item) => typeof item.props.onClick === 'function' && item.props['aria-pressed'] === false).props.onClick as () => void)();
+    expect(host().props['data-focus-mode']).toBe('1');
+    expect(storage.has(TERM_FOCUS_DISABLED_KEY)).toBe(false);
+    harness.unmount();
+  });
+
+  test('keyboard focus toggle reads the latest state and remembers exit', () => {
+    resetState();
+    width = COMPACT_MAX_WIDTH;
+    coarse = true;
+    const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    const keys = new Set<(event: KeyboardEvent) => void>();
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: {
+      activeElement: null,
+      querySelector: () => (harness.find((item) => item.props['data-xterm-host'] === true).props.ref as { current: unknown }).current,
+      addEventListener: (name: string, listener: (event: KeyboardEvent) => void) => { if (name === 'keydown') keys.add(listener); },
+      removeEventListener: (name: string, listener: (event: KeyboardEvent) => void) => { if (name === 'keydown') keys.delete(listener); },
+    } });
+    try {
+      render();
+      expect(host().props['data-focus-mode']).toBe('1');
+      const event = { key: 'f', code: 'KeyF', ctrlKey: true, metaKey: false, shiftKey: true, altKey: false, preventDefault() {}, stopPropagation() {} } as KeyboardEvent;
+      for (const listener of keys) listener(event);
+      expect(host().props['data-focus-mode']).toBeUndefined();
+      expect(storage.get(TERM_FOCUS_DISABLED_KEY)).toBe('1');
+    } finally {
+      harness.unmount();
+      if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
+      else delete (globalThis as { document?: unknown }).document;
+    }
+  });
+
+  test('wide touch and compact mouse retain ordinary start', () => {
+    resetState();
+    coarse = true;
+    render();
+    expect(host().props['data-focus-mode']).toBeUndefined();
+    harness.unmount();
+    width = COMPACT_MAX_WIDTH;
+    coarse = false;
+    render();
+    expect(host().props['data-focus-mode']).toBeUndefined();
+    harness.unmount();
+  });
+});
 
 describe('XtermView terminal input routing', () => {
   test('routes external and keyboard input through the same sender for its terminalId', async () => {
@@ -245,6 +353,59 @@ describe('XtermView terminal input routing', () => {
     expect(sendToTerminal('terminal-a', 'after-unmount')).toBe(false);
     await Promise.resolve();
     expect(sent).toEqual(['writable']);
+  });
+});
+
+describe('XtermView terminal replay and output', () => {
+  test('replays the attached viewport and accepts new output only from its adopted session', async () => {
+    resetState();
+    spawnResponse = { status: 'attached', snapshot: 'ELANOUS_T5B_OLD' };
+    let finishHandshake!: (sid: string) => void;
+    acp.ready = new Promise<string>((resolve) => { finishHandshake = resolve; });
+    const cleanup = mount('terminal-a');
+    onAcpSession?.('daemon-session');
+    finishHandshake('s1');
+    await harness.settle();
+    const terminal = terminals[0]!;
+    expect(terminal.writes.some((data) => data.includes('ELANOUS_T5B_OLD'))).toBe(true);
+    const frame = (sessionId: string, data: string) => ({ params: {
+      sessionId,
+      update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: `[elanous/term/terminalOutput] terminal-a\n${JSON.stringify({ terminalId: 'terminal-a', data })}\n<<elanous-term-end terminal-a>>` } },
+    } });
+    const sent: string[] = [];
+    sendInput = async (_data, sid) => { sent.push(sid); return {}; };
+    onTerminalData?.('echo ELANOUS_T5B_NEW\r');
+    await harness.settle();
+    expect(sent).toEqual(['daemon-session']);
+    onSessionUpdate?.(frame('other-session', 'wrong'));
+    onSessionUpdate?.(frame('s1', 'stale-handshake'));
+    onSessionUpdate?.(frame('daemon-session', 'ELANOUS_T5B_NEW'));
+    expect(onSessionUpdate).toBeDefined();
+    expect(logs.filter(({ event }) => event === 'webterm.acp.session.adopted')).toEqual([{
+      event: 'webterm.acp.session.adopted', details: { from: 's1', to: 'daemon-session' },
+    }]);
+    expect(logs.filter(({ event }) => event === 'webterm.ws.frame.in')).toHaveLength(1);
+    expect(terminal.writes).not.toContain('wrong');
+    expect(terminal.writes).not.toContain('stale-handshake');
+    expect(terminal.writes).toContain('ELANOUS_T5B_NEW');
+    cleanup();
+  });
+
+  test('uses the shared ACP ready id when its handshake completed before this view subscribed', async () => {
+    resetState();
+    acp.ready = Promise.resolve('actual-session');
+    const cleanup = mount('terminal-a');
+    await harness.settle();
+    const sent: string[] = [];
+    sendInput = async (_data, sid) => { sent.push(sid); return {}; };
+    onTerminalData?.('echo ELANOUS_T5B_FRESH\r');
+    await harness.settle();
+    expect(sent).toEqual(['actual-session']);
+    onSessionUpdate?.({ params: { sessionId: 'actual-session', update: {
+      sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '[elanous/term/terminalOutput] terminal-a\n{"terminalId":"terminal-a","data":"ELANOUS_T5B_FRESH"}\n<<elanous-term-end terminal-a>>' },
+    } } });
+    expect(terminals[0]?.writes).toContain('ELANOUS_T5B_FRESH');
+    cleanup();
   });
 });
 

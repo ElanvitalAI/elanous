@@ -16,6 +16,8 @@ import {
   dispatchBrowserRead,
 } from '../../tool-runtime/browser-runtime.js';
 import { askUserQuestionRuntime } from '../../tool-runtime/ask-user-question-runtime.js';
+import { buildElanousHoldTool, buildPtyControlTool, dispatchElanousHold, dispatchPtyControl } from '../../tool-runtime/elanous-control-runtimes.js';
+import { ptyAvailable } from '../../pty-shell/registry.js';
 import { dispatchToolByName, listToolRuntimes } from '../../tool-runtime/registry.js';
 import { ACP_SESSION_RUNTIMES } from '../../tool-runtime/acp-session-runtime.js';
 import { ClaudeSubscriptionNotAllowedError } from '../../policy/claude-subscription-guard.js';
@@ -340,6 +342,7 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
     askUserQuestionRuntime.spec,
     ...ACP_SESSION_RUNTIMES.map((runtime) => runtime.spec),
     ...shared.specs, // L2 core + L3 finance(gated) — buildSharedAppTools 단일 출처(전 서피스 공용)
+    ...(ptyAvailable() ? [buildElanousHoldTool(), buildPtyControlTool()] : []),
   ];
 
   /** Shared dispatcher for chat-surface tools. Reused by 'chat' AND
@@ -392,11 +395,16 @@ export function toolSurface(kind: DaemonToolSurfaceKind, cfg?: import('../../use
       // L2 core + L3 finance(gated) — buildSharedAppTools 단일 dispatch · B5: 진행 한 줄(emitFeedback)·세션·호출 id 를 넘긴다.
       return shared.dispatch(name, args, {
         surface: 'tui',
+        ...(ctx.requestOrigin ? { requestOrigin: ctx.requestOrigin } : {}),
+        ...(ctx.verifiedOwner ? { verifiedOwner: ctx.verifiedOwner } : {}),
         ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+        ...(ctx.surfaceHitlChannels ? { confirmChannels: ctx.surfaceHitlChannels } : {}),
         ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}),
         ...(ctx.emitFeedback ? { emitFeedback: ctx.emitFeedback } : {}),
       });
     }
+    if (ptyAvailable() && name === 'ElanousHold') return dispatchElanousHold(args);
+    if (ptyAvailable() && name === 'PtyControl') return dispatchPtyControl(args);
     if (name === 'Bash') {
       // PLAN-ios-rich-dev-feedback-hydrate M3 (2026-05-13) — pass
       // sessionId + emitFeedback so dispatchBash emits tool.progress

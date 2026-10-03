@@ -1,8 +1,33 @@
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { resolveRoleModel } from '../user-config.js';
 import type { HitlReason, Rung, TriageIssue } from './triage.js';
 
 export type StewardAsk = (prompt: string, role: 'classify' | 'planning') => Promise<unknown>;
-export interface ClassifiedIssue { issue: string; rung: Rung; why: string; hitlReason?: HitlReason; duplicateOf?: string }
+export interface ClassifiedIssue { issue: string; rung: Rung; why: string; hitlReason?: HitlReason; duplicateOf?: string; capability?: 'new-capability' | 'existing-capability' }
+export interface CapabilityInventory { graphs: readonly string[]; plugins: readonly string[]; commands: readonly string[] }
+
+/** Read installed names, not promises in documentation. The caller can supply a test-instance root. */
+export function installedCapabilities(root: string = resolve(import.meta.dir, '../..')): CapabilityInventory {
+  const files = (dir: string): string[] => {
+    try { return readdirSync(dir, { withFileTypes: true }).flatMap(entry => entry.isDirectory()
+      ? files(join(dir, entry.name)) : entry.isFile() && /\.ya?ml$/.test(entry.name) ? [join(dir, entry.name)] : []); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []; throw error; }
+  };
+  const graphs = files(join(root, 'graphs')).flatMap(file => {
+    const match = /^graph_id:\s*['"]?([^\s'"#]+)/m.exec(readFileSync(file, 'utf8'));
+    return match ? [match[1]!] : [];
+  });
+  let plugins: string[];
+  try { plugins = readdirSync(join(root, 'plugins'), { withFileTypes: true }).filter(entry => entry.isDirectory() && entry.name !== 'examples').map(entry => entry.name); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; plugins = []; }
+  const help = spawnSync(process.execPath, [join(root, 'bin/elanous.mjs'), '--test', '--help'], { cwd: root, encoding: 'utf8', timeout: 15_000 });
+  // An unconfigured test instance cannot start the CLI. Unknown commands must not be treated as installed.
+  const commands = help.status === 0
+    ? [...help.stdout.matchAll(/^\s{2}(?!-)([\w:-]+)(?:\s|$)/gm)].map(match => match[1]!) : [];
+  return { graphs, plugins, commands };
+}
 export interface IssuePlan { issue: string; priority: number; dependsOn: string[]; owner?: string }
 
 const unsafe: Array<[HitlReason, RegExp]> = [
@@ -42,14 +67,17 @@ export async function askSteward(prompt: string, role: 'classify' | 'planning'):
   return parsed(result);
 }
 
-export async function classifyIssue(issue: TriageIssue, ask: StewardAsk = askSteward): Promise<ClassifiedIssue> {
+export async function classifyIssue(issue: TriageIssue, ask: StewardAsk = askSteward, inventory: CapabilityInventory = installedCapabilities()): Promise<ClassifiedIssue> {
   const candidate = unsafeReason(issue);
-  const response = parsed(await ask(`스튜어드 분류. JSON 객체만: {"rung":0|1|2|3|4|5|"hitl","hitlReason":null,"why":"한 문장"}. 0=이미됨, 1=셸, 2=CLI, 3=조사, 4=하니스 골, 5=외부 에이전트. 돈·공개·보안·비가역은 hitl; 그 외 사람 확인은 other. 확인되지 않은 완료를 추측하지 마라. ${candidate ? `안전 후보 ${candidate}: 이유를 확인하라.` : ''}\n이슈: ${JSON.stringify(issue)}`, 'classify'));
+  const response = parsed(await ask(`스튜어드 분류. JSON 객체만: {"rung":0|1|2|3|4|5|"hitl","hitlReason":null,"why":"한 문장","capability":"new-capability"|"existing-capability"}. 0=이미됨, 1=셸, 2=CLI, 3=조사, 4=하니스 골, 5=외부 에이전트. 돈·공개·보안·비가역은 hitl; 그 외 사람 확인은 other. 새 능력인지 기존 그래프·플러그인·명령으로 되는 일인지 판정하라. 존재만으로 그 기능이 소원을 충족한다고 추측하지 마라. 확인되지 않은 완료를 추측하지 마라. ${candidate ? `안전 후보 ${candidate}: 이유를 확인하라.` : ''}\n설치된 능력: ${JSON.stringify(inventory)}\n이슈: ${JSON.stringify(issue)}`, 'classify'));
   if (![0, 1, 2, 3, 4, 5, 'hitl'].includes(response.rung as Rung) || typeof response.why !== 'string' || !response.why.trim()) throw new Error(`Invalid steward classification: ${issue.identifier}`);
   const reason = candidate ?? (unsafe.some(([name]) => name === response.hitlReason) ? response.hitlReason as HitlReason : undefined)
     ?? (response.rung === 'hitl' ? 'other' : undefined);
+  // A missing or unknown verdict does not block triage; working-backwards drafting is simply skipped for that issue.
+  const capability = response.capability === 'new-capability' || response.capability === 'existing-capability' ? response.capability : undefined;
   return { issue: issue.identifier, rung: reason ? 'hitl' : response.rung as Rung,
-    ...(reason ? { hitlReason: reason } : {}), why: response.why.trim().replace(/\s+/g, ' ') };
+    ...(reason ? { hitlReason: reason } : {}), why: response.why.trim().replace(/\s+/g, ' '),
+    ...(capability ? { capability } : {}) };
 }
 
 /** One request for the current batch, never one request per issue. */

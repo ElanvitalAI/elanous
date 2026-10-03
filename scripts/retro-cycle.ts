@@ -120,11 +120,11 @@ const report = await runRetroCycle({
     const p = join(REPORT_DIR, filename); writeFileSync(p, md);
     // ★ B5: --collect-only 면 발송 억제(회고 리포트 영속·resolution/발굴 입력·발송만 skip).
     if (process.argv.includes('--collect-only')) log(`collect-only — 회고 리포트 영속·발송 skip`);
-    else try { log(`회고 리포트 발송 ${sendOutbound(md, 'report') ? 'OK' : '실패'}`); } catch (e) { log(`발송 오류: ${e instanceof Error ? e.message : String(e)}`); }
+    else try { log(`회고 리포트 발송 ${sendOutbound(md, 'ops-report') ? 'OK' : '실패'}`); } catch (e) { log(`발송 오류: ${e instanceof Error ? e.message : String(e)}`); }
     return p;
   },
   // HITL 승인 요청 — 텔레그램 alert(collect-only 면 로그만).
-  notify: (t) => { log(`[HITL] ${t.replace(/\n/g, ' ')}`); if (!process.argv.includes('--collect-only')) try { sendOutbound(t, 'alert'); } catch { /* fail-soft */ } },
+  notify: (t) => { log(`[HITL] ${t.replace(/\n/g, ' ')}`); if (!process.argv.includes('--collect-only')) try { sendOutbound(t, 'ops-alert'); } catch { /* fail-soft */ } },
 }, period);
 
 log(`retro ${period}: report=${report.reportPath} · 제안=${report.hasProposal ? report.proposalId : '없음'}`);

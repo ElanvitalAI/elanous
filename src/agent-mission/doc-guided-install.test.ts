@@ -1,8 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { extractInstallLines, installFromDocs, type DocInstallDeps } from './doc-guided-install.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const DOC = 'https://miller.readthedocs.io/en/latest/installing-miller/';
 const RESULTS = `omni_search "mlr install" — 2 hits\n- [user answer](https://stackoverflow.com/questions/123/mlr-install)\n- [Miller documentation](${DOC})`;

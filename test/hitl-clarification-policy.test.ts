@@ -37,7 +37,11 @@ describe('progressive clarification policy', () => {
 
     const request = toAskUserQuestionRequest(decision);
     expect(request?.questions).toHaveLength(1);
-    expect(request?.questions[0]).toMatchObject({ id: 'storage_scope', includeOther: true });
+    expect(request?.questions[0]).toMatchObject({ id: 'storage_scope', includeOther: true, impact: 'high', recommendedIndex: 1 });
+    expect(request?.questions[0]?.options).toEqual([
+      { label: 'Session only', description: 'Fast and reversible.' },
+      { label: 'Shared store', description: 'Available to every surface.' },
+    ]);
     expect(request?.questions[0]?.question).toContain('Recommended: Shared store');
   });
 
@@ -116,6 +120,19 @@ describe('progressive clarification policy', () => {
     expect(low.action).toBe('assume');
     expect(invalid.action).toBe('assume');
     expect(invalid.reason).toContain('2–4 options');
+  });
+
+  test('execution observation does not log the recommended choice while intake keeps its fields', () => {
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      const execution = { phase: 'execution' as const, budget: defaultClarificationBudget('execution') };
+      decideAndObserveClarification(candidate(), execution, { consumer: 'self-implement-execution' });
+      decideAndObserveClarification(candidate(), { ...execution, phase: 'intake' }, { consumer: 'test' });
+      expect(log.mock.calls[0]?.[2]).not.toHaveProperty('recommendedOption');
+      expect(log.mock.calls[1]?.[2]).toHaveProperty('recommendedOption', 'Shared store');
+    } finally {
+      log.mockRestore();
+    }
   });
 
   test('observes ask/assume/defer decisions through the elanous debug log', () => {

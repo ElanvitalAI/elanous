@@ -1,9 +1,12 @@
 // `review-model-ab` 의 계약 — ⛔ 「돈을 안 쓴다」가 «기본»인가.
 //
 // 🩸 이 자는 유료 모델을 부른다. 그래서 무는 것은 산출 모양이 아니라 ***「부르지 않았나」***다.
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { lookupLlmTierSpec } from '../src/model-tier/llm-tier-map.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(240_000);
 
 const SCRIPT = new URL('./review-model-ab.ts', import.meta.url).pathname;
 

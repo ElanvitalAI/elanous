@@ -1,12 +1,15 @@
 // harness-screen — 공간 화면 버퍼(X11 forwarding식 릴레이) 테스트
 
-import { describe, test, expect, afterEach } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { writeHarnessScreen, readHarnessScreen, listHarnessScreens, harnessScreenPath, harnessScreenDir, writeHarnessHeartbeat, readHarnessHeartbeat, stripScreenAnsi, detectScreenGoalOutcome, readHarnessScreenTail, resolveHarnessScreenKey } from './harness-screen.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const dirs: string[] = [];
 function tmpEnv(): NodeJS.ProcessEnv {

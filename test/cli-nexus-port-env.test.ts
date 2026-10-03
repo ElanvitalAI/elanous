@@ -12,11 +12,14 @@
 // empty tmp dir the call exits without booting and we get a clean
 // signal that env vars + flags both flow through the action.
 
-import { afterEach, describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const ENTRY = resolve(import.meta.dir, '..', 'src', 'index.ts');
 

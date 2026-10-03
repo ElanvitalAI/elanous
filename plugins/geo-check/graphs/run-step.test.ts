@@ -1,9 +1,12 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { runGraph } from '../../../src/graph-runner/runner.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // The 24-call bound intentionally launches 24 fake CLI processes.
 const slowTest = (name: string, fn: () => Promise<void>) => test(name, fn, 30000);

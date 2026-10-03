@@ -1,8 +1,12 @@
 import { expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { releaseReadiness, type ReleaseReadinessDeps } from './release-readiness.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../../src/elanous-config-dir.js';
+import { setSchedule } from '../../src/release-loop/release-schedule.js';
+import { debug } from '../../src/debug/log.js';
+import { spyOn } from 'bun:test';
 
 const version = '0.2.6';
 const clear = { ok: true, red: [], undecided: [], blocked: [], moved: [], knownIssues: [] };
@@ -35,6 +39,7 @@ test('a prepared record without publishedAt and a live PID prevent the checklist
 
 test('missing lock, dead PID and malformed PID are absent; checklist determines readiness', () => fixture((dir, deps, write) => {
   expect(releaseReadiness(version, deps)).toEqual({ ready: true, reason: 'ready', details: clear });
+  expect(existsSync(join(deps.ledgerRoot!, 'release/features.sqlite'))).toBe(false);
   write('run.lock', { pid: 12345 });
   expect(releaseReadiness(version, { ...deps, isPidAlive: () => false })).toEqual({ ready: true, reason: 'ready', details: clear });
   for (const pid of [0, -1, '12345', 1.5, null]) {
@@ -53,4 +58,26 @@ test('checklist-blocked retains the full gate result after an absent lock', () =
 
 test('version rejects path traversal before reading the ledger', () => fixture((_dir, deps) => {
   expect(() => releaseReadiness('../0.2.6', deps)).toThrow('release version must be x.y.z');
+}));
+
+test('주입 시계가 컷 전이면 before-cut · 정확히 컷 시각이면 기존 체크리스트 판정', () => fixture((_dir, deps) => {
+  setElanousConfigDir(deps.ledgerRoot!);
+  const log = spyOn(debug, 'log').mockImplementation(() => {});
+  try {
+    setSchedule(version, { cutAt: '2026-10-03T08:00+09:00', landBy: '2026-10-03T06:30+09:00' }, 'OP');
+    const early = { ...deps, now: () => new Date('2026-10-02T22:59:00Z'), checklist: () => { throw new Error('gate reached before cut'); } };
+    expect(releaseReadiness(version, early)).toEqual({ ready: false, reason: 'before-cut', details: 'before-cut (10-03(토) 08:00 KST)' });
+    expect(log).toHaveBeenCalledWith('release.schedule', 'before-cut', { version, cutAt: '2026-10-02T23:00:00.000Z', landBy: '2026-10-02T21:30:00.000Z' });
+    expect(releaseReadiness(version, { ...deps, now: () => new Date('2026-10-02T23:00:00Z') })).toEqual({ ready: true, reason: 'ready', details: clear });
+    expect(releaseReadiness(version, { ...deps, now: () => new Date('2026-10-02T23:00:00Z'), checklist: () => blocked })).toEqual({ ready: false, reason: 'checklist-blocked', details: blocked });
+  } finally { log.mockRestore(); resetElanousConfigDir(); }
+}));
+
+test('해당 판 일정이 없으면 다른 판에 컷이 있어도 기존 판정 유지', () => fixture((_dir, deps) => {
+  setElanousConfigDir(deps.ledgerRoot!);
+  try {
+    setSchedule('0.2.7', { cutAt: '2099-10-03T08:00+09:00' }, 'OP');
+    expect(releaseReadiness(version, { ...deps, now: () => new Date('2026-10-02T22:59:00Z') })).toEqual({ ready: true, reason: 'ready', details: clear });
+    expect(releaseReadiness(version, { ...deps, checklist: () => blocked })).toEqual({ ready: false, reason: 'checklist-blocked', details: blocked });
+  } finally { resetElanousConfigDir(); }
 }));

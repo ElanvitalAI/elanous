@@ -39,10 +39,12 @@ describe('PWA route maturity', () => {
     expect(ROUTE_MATURITY['/workflows/chat-ui']).toBe('broken');
     expect(ROUTE_MATURITY['/scheduler']).toBe('ops');
     expect(ROUTE_MATURITY['/ops/release']).toBe('ops');
+    expect(ROUTE_MATURITY['/ops/seats']).toBe('ops');
     expect(ROUTE_MATURITY['/ops/checklist']).toBe('ops');
     expect(ROUTE_MATURITY['/settings']).toBe('beta');
     expect(ROUTE_MATURITY['/approvals']).toBe('tool');
     expect(ROUTE_MATURITY['/chat']).toBe('stable');
+    expect(ROUTE_MATURITY['/today']).toBe('stable');
     for (const item of SIDEBAR_NAV_ITEMS) expect(routeMaturity(item.href)).toBeDefined();
   });
 
@@ -76,6 +78,10 @@ describe('PWA route maturity', () => {
     expect(visibleForRole('contributor', '/share')).toBe(false);
     expect(visibleForRole('general', '/unknown')).toBe(false);
     expect(visibleForRole('general', '/chat')).toBe(true);
+    expect(routeMaturity('/today?view=compact#top')).toBe('stable');
+    expect(visibleForRole('general', '/today')).toBe(true);
+    expect(visibleForRole('contributor', '/today')).toBe(true);
+    expect(visibleForRole('owner', '/today')).toBe(true);
     expect(visibleForRole('contributor', '/editor')).toBe(true);
     expect(visibleForRole('general', '/editor')).toBe(false);
     expect(visibleForRole('owner', '/morning')).toBe(true);
@@ -89,6 +95,22 @@ describe('PWA route maturity', () => {
     expect(visibleForRole('contributor', '/missions/123?view=detail')).toBe(visibleOn('/missions/[id]', 'pwa', 'contributor'));
     expect(routeMaturity('/workflows/chat-ui/')).toBe('broken');
     expect(visibleForRole('contributor', '/workflows/chat-ui')).toBe(false);
+  });
+
+  test('general beta opt-in adds only beta routes without changing other roles or unclassified routes', () => {
+    for (const [path, maturity] of Object.entries(ROUTE_MATURITY)) {
+      const baseline = visibleForRole('general', path);
+      expect(visibleForRole('general', path, { showBeta: false })).toBe(baseline);
+      expect(visibleForRole('general', path, { showBeta: true })).toBe(maturity === 'beta' || baseline);
+      for (const role of ['owner', 'contributor'] as const) {
+        expect(visibleForRole(role, path, { showBeta: true })).toBe(visibleForRole(role, path));
+      }
+    }
+    for (const path of ['/unknown', '/missions/123/extra', '/share', '/morning', '/approvals', '/scheduler']) {
+      expect(visibleForRole('general', path, { showBeta: true })).toBe(false);
+    }
+    expect(visibleForRole('general', '/missions/123?view=detail', { showBeta: true })).toBe(true);
+    expect(visibleForRole('general', '/settings', { showBeta: false })).toBe(true);
   });
 
   test('route lookup preserves exact, normalized, dynamic, and unknown results', () => {

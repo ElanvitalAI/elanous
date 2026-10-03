@@ -1,11 +1,22 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { listChecklist } from '../release-loop/checklist.js';
+import { setElanousConfigDir, resetElanousConfigDir } from '../elanous-config-dir.js';
 import { lookupLlmTierSpec } from '../model-tier/llm-tier-map.js';
 import { clearSessionTierOverride, setSessionTierOverride } from '../model-tier/session-override.js';
 import type { RunTurnOpts, RunTurnResult } from '../session/chat.js';
 import { makeElanousAgentRunTurn } from './monad-agent-turn.js';
 
 const tierSessionId = 'telegram-explicit-tier-test';
-afterEach(() => clearSessionTierOverride(tierSessionId));
+const tempDirs: string[] = [];
+afterEach(() => {
+  clearSessionTierOverride(tierSessionId);
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  delete process.env.ELANOUS_STATE_DIR;
+  resetElanousConfigDir();
+});
 
 const config = {
   llm: { provider: 'fake', model: 'fake-model' },
@@ -66,6 +77,31 @@ describe('shared messenger agent final answer', () => {
     expect(result.text).toContain('Plain answer.');
     expect(result.text).toContain('elanous');
   });
+});
+
+test('telegram messenger passes verified owner and the originating confirmation channel through its real tool dispatch', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-messenger-'));
+  tempDirs.push(root);
+  setElanousConfigDir(root);
+  process.env.ELANOUS_STATE_DIR = root;
+  let asked = 0;
+  const channel = { name: 'telegram', request: async () => { asked++; return true; }, cancel: () => {} };
+  const args = { action: 'add-item', version: '0.2.11', id: 'MESSENGER', title: '텔레그램' };
+  const seen: unknown[] = [];
+  const fake = async (opts: RunTurnOpts): Promise<RunTurnResult> => {
+    seen.push(await opts.dispatchTool!('release_change', args));
+    return { text: 'ok', provider: 'fake', model: 'fake-model', usedTokens: 1, droppedMessages: 0, memoryIds: [], meta: {} as never };
+  };
+  const turn = makeElanousAgentRunTurn(config, 'telegram', fake);
+  await turn({ userConfig: config, sessionId: 'owner-session', userText: '칸 추가',
+    verifiedOwner: { id: 'telegram:123' }, hitlConfirmChannel: channel });
+  expect(asked).toBe(1);
+  expect(seen[0]).toContain('변경했습니다');
+  expect(listChecklist('0.2.11').items[0]?.updatedBy).toBe('telegram:123');
+  await turn({ userConfig: config, sessionId: 'not-owner', userText: '칸 추가', hitlConfirmChannel: channel });
+  expect(seen[1]).toContain('오너');
+  expect(asked).toBe(1);
+  expect(listChecklist('0.2.11').items).toHaveLength(1);
 });
 
 describe('messenger codex model precedence', () => {

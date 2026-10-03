@@ -1,9 +1,12 @@
-import { afterEach, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
 import { runControlServe } from './control-cli.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DEFAULT_CONTROL_PORT, ensureControlTokens } from '../control-plane/server.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const roots: string[] = [];
 const children: Array<ReturnType<typeof Bun.spawn>> = [];

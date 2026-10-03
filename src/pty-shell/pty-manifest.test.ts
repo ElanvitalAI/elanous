@@ -1,12 +1,15 @@
 // 크로스-프로세스 PTY 매니페스트 store 계약 테스트. 격리 tmp ELANOUS_STATE_DIR 로 실제 데이터 무접촉.
 //   upsert/list·snapshot throttle(now 주입)·close(alive=0)·remove. reap 은 owner=process.pid 라 유닛 불가(스킵).
-import { afterAll, beforeEach, test, expect, describe } from 'bun:test';
+import { setDefaultTimeout, afterAll, beforeEach, test, expect, describe } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setGitCommandRunnerForTesting } from '../git-fs/runner.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const previousStateDir = process.env.ELANOUS_STATE_DIR;
 const stateDir = mkdtempSync(join(tmpdir(), 'pty-manifest-'));

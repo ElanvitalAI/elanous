@@ -1,8 +1,11 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { judgeGaps, MAX_GAP_PROMPT_CHARS, type GapUnit } from './gap-judge.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const unit: GapUnit = {
   code: '123456789012', name: '직무 수행', definition: '직무를 수행한다', level: '4',

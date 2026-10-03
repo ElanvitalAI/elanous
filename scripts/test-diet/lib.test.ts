@@ -1,12 +1,17 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { appendLedger, costTable, judge, lastLedgerLine, nightlyAuditLedgerPath, pickRange, writeCardDraft } from './lib.js';
+import { appendLedger, costTable, judge, lastLedgerLine, ledgerPath, nightlyAuditLedgerPath, pickRange, propose, td1Dispositions, writeCardDraft } from './lib.js';
+import { record } from './node.js';
+import { CardStore } from '../../src/task-cards/card-store.js';
 import { GATE_NIGHTLY_AUDITS } from '../release-loop/gate-node.js';
 import { parse as parseYaml } from 'yaml';
 import { runGraph } from '../../src/graph-runner/runner.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const files = ['a.test.ts', 'b.test.ts', 'c.test.ts', 'd.test.ts'];
 const costs = new Map([['a.test.ts', 30], ['b.test.ts', 30], ['c.test.ts', 100], ['d.test.ts', 5]]);
@@ -33,6 +38,108 @@ describe('judge — mechanical, never an action', () => {
   });
   test('a non-zero exit is «failing» and keeps its reason', () => {
     expect(judge({ ...base, rc: 1, reason: 'Unable to locate a Java Runtime.' }, 0)).toMatchObject({ verdict: 'failing', reason: 'Unable to locate a Java Runtime.' });
+  });
+});
+
+describe('TD1 proposals and shadow cards', () => {
+  const base = { file: 'x.test.ts', secs: 5, rssMb: 100, rc: 0, pass: 1, fail: 0 };
+  test('header-based TD1 disposition overrides mechanical verdict and supplies its alternative', () => {
+    const td1 = td1Dispositions('alternative\tdisposition\tfile\twhy_slow\tguards\nuse fixture\tshrink\tx.test.ts\tfull spawn\tsafety\n');
+    expect(td1.get(base.file)).toEqual({ disposition: 'shrink', alternative: 'use fixture', why_slow: 'full spawn', guards: 'safety' });
+    expect(propose(judge(base, 0), td1)).toMatchObject({ proposal: 'shrink', basis: 'use fixture · full spawn · guards: safety' });
+    expect(propose(judge({ ...base, rc: 1 }, 0), new Map()).proposal).toBe('investigate');
+    expect(propose(judge({ ...base, secs: 61 }, 0), new Map())).toMatchObject({ proposal: 'shrink', basis: 'slow · caught90=0' });
+    expect(propose(judge(base, 0), td1Dispositions('file\tdisposition\nx.test.ts\tkeep\n'))).toMatchObject({ proposal: null });
+  });
+
+  test('identical record is idempotent; same-commit remeasurement appends updated card section; card failure preserves ledger', () => {
+    const root = mkdtempSync(join(tmpdir(), 'td-proposals-'));
+    const previous = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    const ctx = { input: {}, outputs: { pick: { start: 0, end: 0, next: 1, total: 1, budgetSecs: 60 },
+      measure: { commit: 'abc', measurements: [{ file: 'src/self-implement/seams.test.ts', secs: 61, rssMb: 100, rc: 0, pass: 1, fail: 0 }] } } };
+    try {
+      const td1 = td1Dispositions('file\tdisposition\talternative\twhy_slow\tguards\nsrc/self-implement/seams.test.ts\tshrink\tuse fixture\tfull spawn\tsafety\n');
+      expect(record(ctx, { td1 })).toBe(0);
+      expect(record(ctx, { td1 })).toBe(0);
+      const store = new CardStore(root);
+      try {
+        const cards = store.listCards();
+        expect(cards).toHaveLength(1);
+        expect(cards[0]).toMatchObject({ goalId: 'test-diet:src/self-implement/seams.test.ts:shrink',
+          sections: [{ owner: 'test-diet' }] });
+        expect(cards[0]!.sections).toHaveLength(1);
+        expect(cards[0]!.sections[0]!.key).toStartWith('test-diet:abc:');
+        expect(JSON.parse(cards[0]!.sections[0]!.content)).toMatchObject({ proposal: 'shrink', basis: 'use fixture · full spawn · guards: safety', guards: 'safety', range: '#0~#0', secs: 61 });
+        const remeasured = { input: {}, outputs: { pick: { ...ctx.outputs.pick, start: 1, end: 1, next: 2, total: 2 },
+          measure: { commit: 'abc', measurements: [{ ...ctx.outputs.measure.measurements[0]!, secs: 92, rssMb: 2100 }] } } };
+        expect(record(remeasured, { td1 })).toBe(0);
+        const updated = store.listCards();
+        expect(updated).toHaveLength(1);
+        expect(updated[0]!.sections).toHaveLength(2);
+        expect(updated[0]!.sections[1]!.key).toStartWith('test-diet:abc:');
+        expect(JSON.parse(updated[0]!.sections[1]!.content)).toMatchObject({ range: '#1~#1', secs: 92, rssMb: 2100, guards: 'safety' });
+      } finally { store.close(); }
+      const failingStore = () => { throw new Error('card offline'); };
+      expect(record(ctx, { td1, createStore: failingStore })).toBe(0);
+      expect(readFileSync(ledgerPath(root), 'utf8').trim().split('\n')).toHaveLength(4);
+      const separate = mkdtempSync(join(tmpdir(), 'td-card-error-'));
+      try {
+        process.env.ELANOUS_STATE_DIR = separate;
+        expect(record(ctx, { td1, createStore: failingStore })).toBe(0);
+        expect(readFileSync(ledgerPath(separate), 'utf8').trim().split('\n')).toHaveLength(1);
+      } finally { rmSync(separate, { recursive: true, force: true }); }
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('keep disposition and keep measurement produce no task card', () => {
+    const root = mkdtempSync(join(tmpdir(), 'td-keep-'));
+    const previous = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    try {
+      const td1 = td1Dispositions('file\tdisposition\talternative\twhy_slow\tguards\nx.test.ts\tkeep\t\t\tsafety\n');
+      const ctx = { input: {}, outputs: { pick: { start: 0, end: 0, next: 1, total: 1, budgetSecs: 60 },
+        measure: { commit: 'abc', measurements: [{ ...base }] } } };
+      expect(record(ctx, { td1 })).toBe(0);
+      const store = new CardStore(root);
+      try { expect(store.listCards()).toHaveLength(0); } finally { store.close(); }
+      expect(JSON.parse(readFileSync(ledgerPath(root), 'utf8').trim()).results[0].proposal).toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('status prints KST daily latest, streak, missing day and supports old lines and no ledger', () => {
+    const root = mkdtempSync(join(tmpdir(), 'td-status-'));
+    const run = (...args: string[]) => spawnSync(process.execPath, [join(import.meta.dir, 'node.ts'), 'status', ...args], {
+      cwd: join(import.meta.dir, '../..'), encoding: 'utf8', env: { ...process.env, ELANOUS_STATE_DIR: root },
+    });
+    try {
+      expect(run().status).toBe(1);
+      expect(run().stdout).toContain('원장 없음 — 한 번도 안 돌았다');
+      const result = judge(base, 0);
+      const line = { at: '2026-10-01T15:10:00.000Z', range: '#0~#0', start: 0, end: 0, next: 1, total: 4, commit: 'abc', budgetSecs: 60, results: [result] };
+      appendLedger(root, line);
+      appendLedger(root, { ...line, at: '2026-10-02T15:10:00.000Z', range: '#1~#1' });
+      appendLedger(root, { ...line, at: '2026-10-02T16:10:00.000Z', range: '#2~#2', results: [{ ...result, proposal: 'shrink', basis: 'slow' }] });
+      appendLedger(root, { ...line, at: '2026-10-03T15:10:00.000Z', range: '#3~#3' });
+      expect(run().stdout).toContain('연속 산출: 3일 (기준 3)');
+      expect(run().stdout).toContain('2026-10-04 · #3~#3 · 1/4');
+      expect(run().stdout).toContain('2026-10-04 · #3~#3 · 1/4 · keep 1/review 0/failing 0 · 제안 0');
+      expect(run().stdout).toContain('2026-10-03 · #2~#2 · 1/4 · keep 1/review 0/failing 0 · 제안 1');
+      expect(run('--json', '--days', '2').stdout).toContain('"consecutive":3,"days":2');
+      writeFileSync(ledgerPath(root), readFileSync(ledgerPath(root), 'utf8').split('\n').filter((row) => !row.includes('2026-10-02T')).join('\n') + '\n');
+      expect(run().stdout).toContain('연속 산출: 1일 (기준 3)');
+      expect(lastLedgerLine(root)?.next).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

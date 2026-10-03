@@ -720,8 +720,11 @@ async function runStop(
     out,
     shareProbeFn: async () => ({ installed: false, alive: false }),
     shareResetFn: async () => ({ exitCode: 0 }),
+    isolatedRoot: layout.stateDir,
   });
 
+  // Keep the record when the daemon did not stop; status must not imply a clean shutdown.
+  if (stopRes.exitCode !== 0) return { exitCode: stopRes.exitCode };
   // Cleanup state files — leave logs/ for post-mortem.
   const stateFile = joinPath(layout.stateDir, 'test-state.json');
   if (existsSync(stateFile)) {

@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
+import { createProject } from '../project/project-store.js';
+import { setElanousConfigDir, getElanousConfigDirOverride, resetElanousConfigDir } from '../elanous-config-dir.js';
+import { createSession, listSessions } from '../session/index.js';
 import { join, resolve } from 'node:path';
 import ts from 'typescript';
 
@@ -42,6 +46,53 @@ function makeProbeRuntime(onRun: (ctxSignal: AbortSignal | undefined) => void): 
     },
   };
 }
+
+test('showDashboard first screen suggests the cwd project without assigning projectId to the session', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'dashboard-project-boot-'));
+  const folder = join(root, 'folder');
+  const configRoot = join(root, 'config');
+  const sessionDir = join(root, 'sessions');
+  const previousConfig = getElanousConfigDirOverride();
+  const previousSessionRoot = process.env.ELANOUS_SESSION_ROOT;
+  const previousCwd = process.cwd();
+  try {
+    const { mkdirSync } = await import('node:fs');
+    mkdirSync(folder);
+    setElanousConfigDir(configRoot);
+    process.env.ELANOUS_SESSION_ROOT = sessionDir;
+    process.chdir(folder);
+    const project = createProject({ name: 'Boot match', primaryFolder: folder });
+    const session = createSession();
+    expect(session.projectId).toBeUndefined();
+    const expected = `Project suggestion: ${project.name} (${project.id})`;
+    const child = spawn(process.execPath, [resolve(import.meta.dir, 'dashboard-boot-fixture.ts')], {
+      cwd: folder,
+      env: { ...process.env, ELANOUS_STATE_DIR: configRoot, ELANOUS_SESSION_ROOT: sessionDir, DASHBOARD_BOOT_SUGGESTION: expected },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk: string) => { output += chunk; });
+    child.stderr.on('data', (chunk: string) => { output += chunk; });
+    const code = await new Promise<number | null>((resolveExit, reject) => {
+      child.on('error', reject);
+      child.on('close', resolveExit);
+    });
+    expect(code).toBe(0);
+    expect(output).toContain(`FIRST_SCREEN_SUGGESTION=${expected}`);
+    const persisted = listSessions({}, sessionDir);
+    expect(persisted.find((entry) => entry.id === session.id)?.projectId).toBeUndefined();
+    expect(persisted.every((entry) => entry.projectId === undefined)).toBe(true);
+  } finally {
+    process.chdir(previousCwd);
+    if (previousConfig !== undefined) setElanousConfigDir(previousConfig);
+    else resetElanousConfigDir();
+    if (previousSessionRoot === undefined) delete process.env.ELANOUS_SESSION_ROOT;
+    else process.env.ELANOUS_SESSION_ROOT = previousSessionRoot;
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 35_000);
 
 describe('dashboard /ad production assembly', () => {
   test('showDashboard wires the CDP grounding collector into its actual ad runtime construction', () => {

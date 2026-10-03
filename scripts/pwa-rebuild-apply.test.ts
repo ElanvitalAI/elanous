@@ -1,6 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { applyPwaRebuild } from './pwa-rebuild-apply.js';
 import type { PwaRebuildDecision } from './pwa-rebuild-decide.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const target = '/tmp/pwa-rebuild-apply-target';
 

@@ -73,11 +73,62 @@ case "$FIRST" in
     exit 5 ;;
 esac
 
-# 봉투 v2(RFC-coordination-cost §2 · C1 · 09-30): 첫 줄에 종류 다섯 중 하나 — 막지 않고 «알린다».
-case "$FIRST" in
-  *요청*|*결정*|*사고*|*보고*|*정정*) ;;
+# 봉투 v2(RFC-coordination-cost §2 · C1): 신원 · (📌안내) · 시각 → 받는 이 · 종류 · 칸 · (기한).
+# 필드를 «순서대로» 읽는다 — 받는 이(정본 id 또는 전원)가 끝난 «바로 다음» 필드만 종류다(칸의 «결정 D1» 같은 글로 종류를 고르지 않는다).
+# 전부 경고만 — 발신은 막지 않는다(옛 형식 하위 호환).
+trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; printf '%s' "${v%"${v##*[![:space:]]}"}"; }
+HEADER=${FIRST#"**[$ID]**"}
+ENVELOPE=""
+case "$HEADER" in *'→'*) case "${HEADER%%→*}" in *' · '*) ;; *) ENVELOPE=$(trim "${HEADER#*→}") ;; esac ;; esac   # → 는 시각 바로 뒤일 때만 봉투
+SEP=$'\x1f'
+FIELDS=()
+[ -n "$ENVELOPE" ] && IFS="$SEP" read -r -a FIELDS <<< "${ENVELOPE// · /$SEP}"
+N=${#FIELDS[@]}
+i=0; RECIPIENT_COUNT=0; RECIPIENT_ALL=0
+while [ "$i" -lt "$N" ]; do
+  F=$(trim "${FIELDS[$i]}")
+  F=${F%% — *}                       # 옛 머리 «→ OP — 무엇» 의 받는 이 부분만
+  TOKS=${F//,/ }
+  OK=1; C=0
+  for T in $TOKS; do
+    if [ "$T" = "전원" ]; then C=$((C + 1)); RECIPIENT_ALL=1
+    else case " $IDS " in *" $T "*) C=$((C + 1)) ;; *) OK=0; break ;; esac
+    fi
+  done
+  [ "$OK" -eq 1 ] && [ "$C" -gt 0 ] || break
+  RECIPIENT_COUNT=$((RECIPIENT_COUNT + C)); i=$((i + 1))
+  case "${FIELDS[$((i - 1))]}" in *' — '*) break ;; esac
+done
+KIND_FIELD=""; SLOT=""; DEADLINE_FIELD=""
+if [ "$i" -lt "$N" ]; then KIND_FIELD=$(trim "${FIELDS[$i]}"); fi
+if [ $((i + 1)) -lt "$N" ]; then SLOT=$(trim "${FIELDS[$((i + 1))]}"); fi
+j=$((i + 1))
+while [ "$j" -lt "$N" ]; do
+  F=$(trim "${FIELDS[$j]}")
+  case "$F" in '기한 '[![:space:]]*) DEADLINE_FIELD=$F ;; esac
+  j=$((j + 1))
+done
+case "$KIND_FIELD" in
+  요청|결정|사고|보고|정정) ;;
   *) echo "⚠️ 첫 줄에 글 종류(요청·결정·사고·보고·정정)가 없다 — 받는 쪽 감시자가 즉시/모아 읽기를 못 가른다(발신은 한다)" >&2 ;;
 esac
+if [ "$RECIPIENT_COUNT" -eq 0 ]; then
+  echo "⚠️ 받는 이가 없다(→ TC · UX 꼴)" >&2
+fi
+case "$KIND_FIELD" in
+  요청|결정|사고|보고|정정)
+    case "$SLOT" in ''|기한|'기한 '*) echo "⚠️ 첫 줄에 칸(확인표·결정 id 또는 -)이 없다" >&2 ;; esac ;;
+esac
+case "$KIND_FIELD" in
+  요청|결정) [ -n "$DEADLINE_FIELD" ] || echo "⚠️ 요청·결정에는 기한을 적는다" >&2 ;;
+esac
+if [ "$RECIPIENT_ALL" -eq 1 ]; then
+  case "$KIND_FIELD" in
+    사고|정정) ;;
+    *) CEO_MARK=$(printf '\360\237\221\221')  # the CEO mark, built from bytes so the public export carries no literal
+       case "$FIRST" in *"$CEO_MARK"*) ;; *) echo "⚠️ «전원»은 사고·정정·대표 지시에만" >&2 ;; esac ;;
+  esac
+fi
 
 TS=$(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M KST')
 TMP=$(mktemp "${TMPDIR:-/tmp}/coord-post.XXXXXX") || { echo "⛔ mktemp 실패 — 발신하지 않는다" >&2; exit 7; }
@@ -167,3 +218,9 @@ if [ "$RC" -ne 0 ]; then
   exit "$RC"
 fi
 echo "[coord-post] 발신 성공$VIA · 채널 #$PR · 신원 [$ID] · 시각 $TS" >&2
+# Only a successfully sent post is recorded; never pass the body or later lines to the ledger.
+POST_URL=$(printf '%s\n' "$POST_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/issues/[0-9]+#issuecomment-[0-9]+|https://github\.com/[^[:space:]]+/pull/[0-9]+#issuecomment-[0-9]+' | head -1 || true)
+if ! bun bin/elanous.mjs coord event record --seat "$ID" --header "$(head -1 "$TMP")" --url "$POST_URL" >/dev/null 2>&1; then
+  echo '⚠️ 맥락 원장 기록 실패(발신은 됐다)' >&2
+fi
+exit 0

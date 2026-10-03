@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { TERM_FONT_DEFAULT, TERM_FONT_KEY, TERM_FONT_MAX, TERM_FONT_MIN, clampFontSize, fontStepKey, isFocusToggleKey, readTermFontSize, writeTermFontSize } from './term-focus';
+import { TERM_FOCUS_DISABLED_KEY, TERM_FONT_DEFAULT, TERM_FONT_KEY, TERM_FONT_MAX, TERM_FONT_MIN, clampFontSize, fontStepKey, isFocusToggleKey, readTermFocusStartDisabled, readTermFontSize, writeTermFocusStartDisabled, writeTermFontSize } from './term-focus';
 
 const k = (over: Partial<KeyboardEvent>) => ({ key: '', code: '', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false, ...over }) as KeyboardEvent;
 
@@ -19,6 +19,19 @@ describe('terminal focus mode keys', () => {
     expect(fontStepKey(k({ key: '+', code: 'NumpadAdd', ctrlKey: true, shiftKey: true }))).toBe(1);
     expect(fontStepKey(k({ key: '=', code: 'Equal', ctrlKey: true }))).toBe(0);
     expect(fontStepKey(k({ key: 'a', code: 'KeyA', ctrlKey: true, shiftKey: true }))).toBe(0);
+  });
+
+  test('focus start opt-out is remembered per device; missing or blocked storage defaults to enabled', () => {
+    const map = new Map<string, string>();
+    const storage = { getItem: (key: string) => map.get(key) ?? null, setItem: (key: string, value: string) => { map.set(key, value); } };
+    expect(readTermFocusStartDisabled(storage)).toBe(false);
+    writeTermFocusStartDisabled(storage);
+    expect(map.get(TERM_FOCUS_DISABLED_KEY)).toBe('1');
+    expect(readTermFocusStartDisabled(storage)).toBe(true);
+    expect(readTermFocusStartDisabled(null)).toBe(false);
+    const broken = { getItem: () => { throw new Error('blocked'); }, setItem: () => { throw new Error('blocked'); } };
+    expect(readTermFocusStartDisabled(broken)).toBe(false);
+    expect(() => writeTermFocusStartDisabled(broken)).not.toThrow();
   });
 
   test('font size is clamped and remembered per device; broken storage falls back to the default', () => {

@@ -1,6 +1,6 @@
 // ── Track I: MCP stdio server tests ──
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import {
   handleMcpRequest,
   createMcpStdioServer,
@@ -20,6 +20,9 @@ import type { ToolRuntime } from '../src/tool-runtime/types';
 import {
   setPtyAdapterForTesting, resetForTesting,
 } from '../src/pty-shell/registry';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function fakePtyAdapter() {
   setPtyAdapterForTesting(() => ({

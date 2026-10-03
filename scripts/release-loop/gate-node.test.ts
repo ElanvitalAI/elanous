@@ -1,4 +1,4 @@
-import { afterEach, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,9 @@ import { releaseLedgerRoot, prodInstanceRoot } from '../../src/instance/resolve.
 import { debug } from '../../src/debug/log.js';
 import type { RunPodCommandOptions } from '../../src/task-orchestrator/surfaces/pod-command-job.js';
 import { PodPoolScheduler } from '../../src/task-orchestrator/surfaces/pod-pool.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const CUT = 'a'.repeat(40), BASE = 'b'.repeat(40);
 const A = 'src/a.test.ts > A', B = 'src/b.test.ts > B', C = 'src/c.test.ts > C', D = 'src/d.test.ts > D';

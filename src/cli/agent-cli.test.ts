@@ -1,10 +1,13 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { handleOnboardingRefusal, OnboardingRefusedError } from '../onboarding.js';
 import { unattendedSetupHint } from '../onboarding/entry-hints.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const root = new URL('../../', import.meta.url).pathname;
 const fixture = new URL('./__fixtures__/agent-help-before/', import.meta.url);
@@ -162,6 +165,52 @@ describe('agent CLI chat-turn errors', () => {
     expect(result.stdout).toBe('');
     expect(result.stderr).toContain('error: unexpected turn failure');
     expect(result.stderr).toContain('at runChatTurnCli (');
+  });
+});
+
+describe('CLI conversation-start project suggestion', () => {
+  test('a matching folder prints one suggestion without assigning the session, while JSON stays one line', () => {
+    const home = mkdtempSync(join(tmpdir(), 'elanous-cli-project-suggestion-'));
+    const folder = join(home, 'workspace');
+    const configDir = join(home, 'state');
+    const projectId = '15b877b0-82df-466a-9c94-374929ad2f7f';
+    mkdirSync(folder);
+    mkdirSync(join(configDir, 'projects'), { recursive: true });
+    writeFileSync(join(configDir, 'projects', `${projectId}.yaml`),
+      `id: ${projectId}\nname: Workspace\nprimaryFolder: ${folder}\ncreatedAt: '2026-01-01T00:00:00.000Z'\n`);
+    const script = `
+      const { runChatTurnCli } = await import(${JSON.stringify(new URL('./agent-cli.ts', import.meta.url).href)});
+      await runChatTurnCli({
+        cfg: { llm: { provider: 'auto', model: '' }, chat: { toolDeny: [] } },
+        userText: 'hello', explicitSessionId: undefined,
+        reuseActive: false, forceNew: true, json: process.env.TEST_JSON === '1',
+        runTurn: async ({ sessionId }) => ({ text: 'reply', provider: 'test', model: 'test',
+          meta: { id: sessionId }, usedTokens: 0, droppedMessages: 0, memoryIds: [] }),
+      });
+    `;
+    try {
+      for (const json of [false, true]) {
+        const result = spawnSync(process.execPath, ['-e', script], {
+          cwd: folder, encoding: 'utf8', timeout: 30_000,
+          env: { ...process.env, HOME: home, ELANOUS_CONFIG_DIR: configDir,
+            ELANOUS_STATE_DIR: join(home, 'state'), TEST_JSON: json ? '1' : '0' },
+        });
+        expect(result.status, result.stderr).toBe(0);
+        if (json) {
+          expect(JSON.parse(result.stdout).reply).toBe('reply');
+          expect(result.stdout.trim().split('\n')).toHaveLength(1);
+          expect(result.stdout).not.toContain('Project suggestion:');
+        } else {
+          expect(result.stdout.split('Project suggestion: Workspace').length - 1).toBe(1);
+          expect(result.stdout).toContain('reply');
+        }
+      }
+      const sessions = JSON.parse(readFileSync(join(home, 'state', 'sessions', 'index.json'), 'utf8')) as Array<Record<string, unknown>>;
+      expect(sessions).toHaveLength(2);
+      for (const session of sessions) expect(session).not.toHaveProperty('projectId');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

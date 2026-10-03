@@ -1,4 +1,4 @@
-import { describe, expect, it, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { LogStore } from '../mss/logging/log-store.js';
@@ -2409,6 +2409,9 @@ describe('resolveLiveRunWindowMinutes — 공백과 «안전 정수»', () => {
 
 // ── 넷째 라운드 must-fix (2026-08-11 · #8153 리뷰) ────────────────────────────
 import { prepareAskLaunch, toPreflightUnfinishedRun } from './launch-preflight.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // ⭐ 73차 — 충돌 문면이 경로마다 「대상」인지 「근거」인지를 «말한다».
 //   📏 왜: `## TRACED PATHS` 는 「바꿀 파일」과 「근거로 읽은 파일」을 섞는다(한 골이 TRACED 8 · 변경 3).

@@ -139,6 +139,46 @@ test('a mine graph validates before saving and warns about ignored keys without 
   queries.clear();
 });
 
+test('mine graph edits consume YAML history through undo, redo and a new branch', async () => {
+  const { queries, client } = fixture();
+  const original = 'graph_id: mine\nnodes: []\n';
+  let savedYaml = '';
+  const mine = {
+    ...client,
+    getRunGraphs: async () => ({ graphs: [{ id: 'mine', source: 'mine', editable: true, nodeCount: 0 }] }),
+    getRunGraph: async () => ({ ...detail, id: 'mine', source: 'mine', editable: true }),
+    getRunGraphYaml: async () => ({ id: 'mine', source: 'mine', editable: true, yaml: original }),
+    putRunGraphYaml: async (_id: string, yaml: string) => {
+      savedYaml = yaml;
+      return { id: 'mine', source: 'mine', editable: true, saved: true };
+    },
+  } as unknown as NexusClient;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(<NexusProvider client={mine} queryClient={queries}><RunGraphView /></NexusProvider>);
+  });
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)); });
+  const button = (label: string) => renderer.root.findAllByType('button').find((item) => item.children.includes(label))!;
+  expect(button('되돌리기').props.disabled).toBe(true);
+  expect(button('다시 실행').props.disabled).toBe(true);
+  await act(async () => button('노드 추가').props.onClick());
+  expect(button('되돌리기').props.disabled).toBe(false);
+  await act(async () => button('되돌리기').props.onClick());
+  expect(button('다시 실행').props.disabled).toBe(false);
+  await act(async () => button('다시 실행').props.onClick());
+  expect(button('다시 실행').props.disabled).toBe(true);
+  await act(async () => button('되돌리기').props.onClick());
+  const nodeId = renderer.root.findAllByType('input').find((item) => item.props['aria-label'] === '노드 id')!;
+  await act(async () => nodeId.props.onChange({ target: { value: 'branch' } }));
+  await act(async () => button('노드 추가').props.onClick());
+  expect(button('다시 실행').props.disabled).toBe(true);
+  await act(async () => button('저장').props.onClick());
+  expect(savedYaml).toContain('node_id: branch');
+  expect(savedYaml).not.toContain('node_id: note');
+  await act(async () => renderer.unmount());
+  queries.clear();
+});
+
 test('valid mine graph saves after validation and keeps ignored-key warning visible', async () => {
   const { queries, client } = fixture();
   const calls: string[] = [];

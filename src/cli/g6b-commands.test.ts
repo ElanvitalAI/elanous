@@ -8,6 +8,8 @@ import { registerPublishCommands } from './publish-cli.js';
 const before = {
   ops: [
     { name: 'ops', flags: [] },
+    // SYNC1 ② (#22883) added `ops now-refresh` after the extraction.
+    { name: 'now-refresh', flags: ['--once', '--dry-run', '--json'] },
     { name: 'status', flags: ['--json', '--all-instances', '--include-test', '-r', '--remote <name>'] },
     { name: 'health', flags: ['--json'] },
     { name: 'timeline', flags: ['--entity-type <t>', '--event <e>', '--since-hours <n>', '--limit <n>', '--json'] },

@@ -1,11 +1,16 @@
 'use client';
 
 import { HideInPublicCapture } from '@/lib/public-capture';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Mic, MicOff } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type ReactNode } from 'react';
+import { Mic, MicOff, MoreHorizontal } from 'lucide-react';
+import { useCompactMode } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { ChatHistory } from './ChatHistory';
 import { ChatInput } from './ChatInput';
+import { ChatQueueChips } from './ChatQueueChips';
+import { clearChatQueue, dequeueChat, enqueueChat, removeChat, type ChatQueueEntry } from '@/lib/chat-queue';
+import { ChatDropOverlay } from './ChatDropOverlay';
+import { nextDropOverlay, type DropOverlayState } from '@/lib/drop-overlay';
 import { SessionPill } from './SessionPill';
 import { ChatHud } from './blocks/ChatHud';
 import { dispatchHudSegmentEnvelope } from '@/lib/chat-runtime';
@@ -32,13 +37,16 @@ import { useVoiceController } from '@/voice/use-voice-controller';
 import { useVoiceTts } from '@/voice/use-voice-tts';
 import { AskQuestionSheet } from '@/components/ask-user-question/AskQuestionSheet';
 import { useAskQuestion } from '@/components/ask-user-question/use-ask-question';
+import { ToolApprovalSheet } from '@/components/tool-approval/ToolApprovalSheet';
+import { useToolApproval } from '@/components/tool-approval/use-tool-approval';
 import type { AcpConnection } from '@/lib/daemon-client';
 import { VOICE_DOT_COLOR, VOICE_PHASE_LABEL } from '@/voice/voice-phase-styles';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import { debugLog, setDebugForwardFallback } from '@/lib/debug';
 import { reduceTurnBusyBanner, type TurnBusyBanner } from '@/lib/turn-busy';
-import type { AttachmentMeta } from '@/lib/upload-attachment';
+import { uploadAttachments, type AttachmentMeta } from '@/lib/upload-attachment';
+import { extractClipboardFiles, extractDroppedFiles, hasDroppedFiles, type ChatFileExtraction } from '@/lib/chat-paste-drop';
 import {
   buildPromptUserContentFromAttachments,
   isImageAttachment,
@@ -56,13 +64,61 @@ export interface ChatLayoutProps {
   /** BACKLOG #3 — workspace tab id forwarded to ChatInput / ChatHistory
    *  for surface snapshot persistence. */
   tabId?: string;
+  /** Compact header's conversation navigation, supplied by the standalone chat panel. */
+  leading?: ReactNode;
 }
 
 export function ChatLayout(props: ChatLayoutProps = {}) {
+  const { compact } = useCompactMode();
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!moreOpen) return;
+    const onPointerDown = (event: PointerEvent): void => {
+      if (!moreRef.current || !moreRef.current.contains(event.target as Node)) setMoreOpen(false);
+    };
+    const onEscape = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') setMoreOpen(false);
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    document.addEventListener('keydown', onEscape);
+    return () => {
+      document.removeEventListener('pointerdown', onPointerDown);
+      document.removeEventListener('keydown', onEscape);
+    };
+  }, [moreOpen]);
+  useEffect(() => { if (!compact) setMoreOpen(false); }, [compact]);
   const { client, config, sessionId, setSessionId } = useDaemon();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [composerPrefill, setComposerPrefill] = useState<{ text: string; id: number }>();
   const [pending, setPending] = useState(false);
+  const [queue, setQueue] = useState<ChatQueueEntry[]>([]);
+  const queueRef = useRef<ChatQueueEntry[]>([]);
+  const queueSessionRef = useRef(sessionId);
+  const currentSessionRef = useRef(sessionId);
+  const adoptedSessionRef = useRef<string | null>(null);
+  const sessionGenerationRef = useRef(0);
+  const nextQueueId = useRef(0);
+  const turnActiveRef = useRef(false);
+  const [turnCompleted, setTurnCompleted] = useState<{ generation: number; sessionId: string | null } | null>(null);
+  // Hide the previous session's chips even in the first committed render.
+  // Only change the queue and its generation after the new session commits.
+  const visibleQueue = queueSessionRef.current !== sessionId && adoptedSessionRef.current !== sessionId ? [] : queue;
+  useLayoutEffect(() => {
+    currentSessionRef.current = sessionId;
+    if (queueSessionRef.current === sessionId) return;
+    if (adoptedSessionRef.current !== sessionId) {
+      sessionGenerationRef.current++;
+      queueRef.current = [];
+      setQueue([]);
+    }
+    queueSessionRef.current = sessionId;
+    adoptedSessionRef.current = null;
+  }, [sessionId]);
+  const updateQueue = (next: ChatQueueEntry[]): void => {
+    queueRef.current = next;
+    setQueue(next);
+  };
   const [turnBusyBanner, setTurnBusyBanner] = useState<TurnBusyBanner | null>(null);
   // Phase B-3 (PWA chat streaming · 2026-05-06) — Stop button + Esc
   // abort wire. Holds the AbortController for the in-flight turn so
@@ -72,6 +128,13 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   // pushes its meta here; submit drains it into the user text and the
   // message body so the LLM sees both the path list and any caption.
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentMeta[]>([]);
+  const [dropOverlay, setDropOverlay] = useState<DropOverlayState>({ visible: false, depth: 0 });
+
+  useEffect(() => {
+    const onDragEnd = (): void => setDropOverlay((state) => nextDropOverlay(state, 'end', false));
+    window.addEventListener('dragend', onDragEnd);
+    return () => window.removeEventListener('dragend', onDragEnd);
+  }, []);
 
   // Phase B-4 follow-up — local turn dedupe ref. The observer
   // (mounted on the same sessionId) sees the same SSE wire that the
@@ -162,7 +225,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
   //   • pendingRef — drops voice transcripts that arrive while a turn
   //     is already streaming (B2 risk mitigation: STT misfire during
   //     LLM thinking should not double-submit).
-  const handleSubmitRef = useRef<(text: string) => Promise<void>>(async () => {});
+  const handleSubmitRef = useRef<(text: string, queued?: boolean) => Promise<void>>(async () => {});
   const pendingRef = useRef(false);
   pendingRef.current = pending;
   // FU PP-V-1 — voice.toggle 의 latest closure 를 보관할 ref. 본 ref
@@ -259,6 +322,58 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     });
   }, []);
 
+  const uploadTransferFiles = async ({ files, tooLarge, tooMany }: ChatFileExtraction): Promise<void> => {
+    if (tooLarge) toast.error(`${tooLarge} files exceed the 20 MB attachment limit`);
+    if (tooMany) toast.error(`${tooMany} files exceed the 10-file attachment limit`);
+    if (files.length === 0) return;
+    if (!config.baseUrl) {
+      toast.error('Daemon URL 미설정 — Settings 에서 입력');
+      return;
+    }
+    const results = await uploadAttachments(files, {
+      baseUrl: config.baseUrl,
+      ...(config.token ? { token: config.token } : {}),
+    });
+    const successes = results.filter((result) => result.ok).map((result) => result.meta);
+    const failures = results.filter((result) => !result.ok);
+    if (successes.length) {
+      handleAttached(successes);
+      toast.success(successes.length === 1 ? `📎 ${successes[0]!.filename}` : `📎 ${successes.length} files attached`);
+    }
+    if (failures.length) {
+      toast.error(failures.length === 1
+        ? `업로드 실패: ${failures[0]!.reason.slice(0, 80)}`
+        : `${failures.length} 파일 업로드 실패`);
+    }
+  };
+
+  const handlePaste = (event: ClipboardEvent<HTMLDivElement>): void => {
+    const extracted = extractClipboardFiles(event.clipboardData, Date.now());
+    if (extracted.files.length === 0 && extracted.tooLarge === 0 && extracted.tooMany === 0) return;
+    event.preventDefault();
+    void uploadTransferFiles(extracted);
+  };
+
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>): void => {
+    setDropOverlay((state) => nextDropOverlay(state, 'enter', hasDroppedFiles(event.dataTransfer)));
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>): void => {
+    setDropOverlay((state) => nextDropOverlay(state, 'leave', hasDroppedFiles(event.dataTransfer)));
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>): void => {
+    if (hasDroppedFiles(event.dataTransfer)) event.preventDefault();
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>): void => {
+    setDropOverlay((state) => nextDropOverlay(state, 'drop', hasDroppedFiles(event.dataTransfer)));
+    const extracted = extractDroppedFiles(event.dataTransfer);
+    if (extracted.files.length === 0 && extracted.tooLarge === 0 && extracted.tooMany === 0) return;
+    event.preventDefault();
+    void uploadTransferFiles(extracted);
+  };
+
   // Service Worker Phase 2 — when /share/ redirects to /chat?shared=1
   // it has already uploaded files to the daemon and stashed the
   // resulting AttachmentMeta[] under SHARE_ATTACHMENTS_KEY. Drain it
@@ -333,7 +448,7 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     setMessages((prev) => [...prev, msg]);
   };
 
-  const handleSubmit = async (text: string): Promise<void> => {
+  const executeTurn = async (text: string, queued = false): Promise<void> => {
     setTurnBusyBanner((previous) => reduceTurnBusyBanner(previous, { kind: 'turn-begin' }));
     debugLog('webterm.chat.input', {
       len: text.length,
@@ -349,8 +464,8 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     // working. When the model can't take vision input (Q3=B), the user
     // sees a toast + the queue is drained (skip) — they can switch to
     // a vision model and re-attach.
-    const attached = pendingAttachments;
-    setPendingAttachments([]);
+    const attached = queued ? [] : pendingAttachments;
+    if (!queued) setPendingAttachments([]);
     const imageAttachments = attached.filter(isImageAttachment);
     const nonImageAttachments = attached.filter((e) => !isImageAttachment(e));
     const visionCapable = isProviderUserMessageVisionCapable(config.provider);
@@ -415,7 +530,13 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       } else {
         append(newMetaMessage(meta.text));
       }
-      if (meta.newSessionId) setSessionId(meta.newSessionId);
+      if (meta.newSessionId) {
+        sessionGenerationRef.current++;
+        updateQueue(clearChatQueue());
+        queueSessionRef.current = meta.newSessionId;
+        currentSessionRef.current = meta.newSessionId;
+        setSessionId(meta.newSessionId);
+      }
       return;
     }
 
@@ -515,7 +636,11 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       setMessages((prev) =>
         prev.map((m) => (m.id === placeholderId ? message : m)),
       );
-      if (newSessionId) setSessionId(newSessionId);
+      if (newSessionId && newSessionId !== sessionId && currentSessionRef.current === sessionId) {
+        adoptedSessionRef.current = newSessionId;
+        currentSessionRef.current = newSessionId;
+        setSessionId(newSessionId);
+      }
       // Phase 5 — turn 종료 시 buffer 잔여 텍스트를 마지막 sentence
       // 로 flush. 사용자가 마지막 한 문장을 못 듣고 끊기는 회귀 회피.
       voiceTts.flush();
@@ -557,6 +682,47 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
       localTurnInFlightRef.current = false;
     }
   };
+  const handleSubmit = async (text: string, queued = false): Promise<void> => {
+    if (turnActiveRef.current || (!queued && queueRef.current.length > 0)) {
+      if (!queued && (pendingAttachments.length > 0 || /^[\s]*[:/]/.test(text))) {
+        toast.info('답이 끝난 뒤 보내 주세요');
+        setComposerPrefill((previous) => ({ text, id: (previous?.id ?? 0) + 1 }));
+        return;
+      }
+      const result = enqueueChat(queueRef.current, { id: ++nextQueueId.current, text });
+      if (result.error) {
+        toast.info(result.error);
+        setComposerPrefill((previous) => ({ text, id: (previous?.id ?? 0) + 1 }));
+      } else {
+        updateQueue(result.queue);
+      }
+      return;
+    }
+    turnActiveRef.current = true;
+    const turnGeneration = sessionGenerationRef.current;
+    const turnSessionId = currentSessionRef.current;
+    try {
+      await executeTurn(text, queued);
+    } finally {
+      turnActiveRef.current = false;
+      if (turnGeneration !== sessionGenerationRef.current) {
+        debugLog('webterm.chat.queue.session-changed', { turnSessionId, currentSessionId: currentSessionRef.current });
+      }
+      setTurnCompleted({ generation: sessionGenerationRef.current, sessionId: currentSessionRef.current });
+    }
+  };
+
+  // One completion starts at most one next turn; the lock also covers the render gap before pending updates.
+  useEffect(() => {
+    if (turnActiveRef.current || queueRef.current.length === 0 ||
+        !turnCompleted || turnCompleted.generation !== sessionGenerationRef.current ||
+        turnCompleted.sessionId !== sessionId) return;
+    const { entry, queue: remaining } = dequeueChat(queueRef.current);
+    if (!entry) return;
+    updateQueue(remaining);
+    void handleSubmitRef.current(entry.text, true);
+  }, [turnCompleted]);
+
   // Phase 1 (voice 일원화) — sync the latest handleSubmit reference
   // into the long-lived ref the voice controller's onTranscript reads.
   // Runs every render to track the closure of pending / messages /
@@ -741,6 +907,9 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
               previous: sessionId,
               issued,
             });
+            if (currentSessionRef.current !== sessionId) return;
+            adoptedSessionRef.current = issued;
+            currentSessionRef.current = issued;
             props.onSessionAdopt?.(issued);
             setSessionId(issued);
           }
@@ -830,57 +999,80 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
     },
   });
 
+  const toolApproval = useToolApproval({ acp: acpForAsk, sessionId });
+
+  const voiceButton = (
+    <button
+      type="button"
+      onClick={() => void voice.toggle()}
+      disabled={!voiceConfigured}
+      title={
+        !voiceConfigured
+          ? 'daemon URL 미설정 — Settings 에서 Base URL 입력'
+          : voice.errorMsg ?? VOICE_PHASE_LABEL[voice.phase]
+      }
+      data-elanous-action="chat-voice-toggle"
+      className={cn(
+        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
+        voice.active
+          ? 'border-rose-500/40 bg-rose-500/10 text-rose-600 hover:bg-rose-500/20'
+          : 'border-border bg-background text-foreground hover:bg-muted',
+        !voiceConfigured && 'cursor-not-allowed opacity-50',
+      )}
+    >
+      <span
+        className={cn(
+          'h-2 w-2 rounded-full',
+          VOICE_DOT_COLOR[voice.phase],
+          (voice.phase === 'listening' || voice.phase === 'speaking') && 'animate-pulse',
+        )}
+        aria-hidden
+      />
+      {voice.active ? <Mic className="h-3.5 w-3.5" /> : <MicOff className="h-3.5 w-3.5" />}
+      <span className="hidden sm:inline">{VOICE_PHASE_LABEL[voice.phase]}</span>
+    </button>
+  );
+
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-4 py-2">
-        <div className="flex items-center gap-2">
-          <SessionPill
-            sessionId={sessionId}
-            {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})}
-            {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
-          />
-          <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
-          {/* FU PP-V-2 (2026-05-07) — month-to-date STT/TTS USD pill.
-              voice cost 노출 위치는 BudgetPill 옆이 자연 (양쪽 모두
-              월 누적 비용). daemon URL 미설정 시 자동 hidden. */}
-          <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
-        </div>
-        <div className="flex items-center gap-2">
-          {/* Phase 1 (voice 일원화) — header mic toggle (large).
-              Mirrors the small mic in ChatInput; pressing either drives
-              the same voice controller. Daemon URL not configured →
-              disabled w/ tooltip. */}
-          <button
-            type="button"
-            onClick={() => void voice.toggle()}
-            disabled={!voiceConfigured}
-            title={
-              !voiceConfigured
-                ? 'daemon URL 미설정 — Settings 에서 Base URL 입력'
-                : voice.errorMsg ?? VOICE_PHASE_LABEL[voice.phase]
-            }
-            data-elanous-action="chat-voice-toggle"
-            className={cn(
-              'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition-colors',
-              voice.active
-                ? 'border-rose-500/40 bg-rose-500/10 text-rose-600 hover:bg-rose-500/20'
-                : 'border-border bg-background text-foreground hover:bg-muted',
-              !voiceConfigured && 'cursor-not-allowed opacity-50',
-            )}
-          >
-            <span
-              className={cn(
-                'h-2 w-2 rounded-full',
-                VOICE_DOT_COLOR[voice.phase],
-                (voice.phase === 'listening' || voice.phase === 'speaking') && 'animate-pulse',
-              )}
-              aria-hidden
+    <div className="relative flex h-full flex-col" onPaste={handlePaste} onDragEnter={handleDragEnter} onDragLeave={handleDragLeave} onDragOver={handleDragOver} onDrop={handleDrop}>
+      {dropOverlay.visible && <ChatDropOverlay />}
+      {compact ? (
+        <div data-elanous-chat-compact-header="" className="flex h-11 max-h-11 min-w-0 shrink-0 items-center gap-2 border-b border-border bg-background px-3 whitespace-nowrap">
+          {props.leading && <div className="shrink-0">{props.leading}</div>}
+          <div className="min-w-0 flex-1 [&>div]:min-w-0 [&>div]:max-w-full [&>div>div:first-child]:min-w-0 [&>div>div:first-child]:max-w-full [&>div>div:first-child]:overflow-hidden [&>div>div:first-child>span:last-child]:shrink-0 [&>div>div:first-child_span]:min-w-0 [&>div>div:first-child_span]:truncate [&>div>div[role=menu]]:max-w-[calc(100vw-4rem)]">
+            <SessionPill
+              sessionId={sessionId}
+              {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})}
+              {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
             />
-            {voice.active ? <Mic className="h-3.5 w-3.5" /> : <MicOff className="h-3.5 w-3.5" />}
-            <span className="hidden sm:inline">{VOICE_PHASE_LABEL[voice.phase]}</span>
-          </button>
+          </div>
+          <div ref={moreRef} className="relative shrink-0">
+            <button type="button" aria-label="채팅 더보기" aria-expanded={moreOpen} aria-controls="chat-header-more" onClick={() => setMoreOpen((open) => !open)} className="inline-flex h-8 w-8 items-center justify-center rounded-lg hover:bg-muted">
+              <MoreHorizontal className="h-5 w-5" aria-hidden="true" />
+            </button>
+            {moreOpen && (
+              <div id="chat-header-more" className="absolute right-0 top-full z-50 mt-1 flex max-w-[calc(100vw-1.5rem)] flex-col gap-2 rounded-lg border border-border bg-popover p-3 shadow-lg">
+                <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
+                <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
+                {voiceButton}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-border bg-background px-4 py-2">
+          <div className="flex items-center gap-2">
+            <SessionPill
+              sessionId={sessionId}
+              {...(props.onAttachRequest ? { onAttachRequest: props.onAttachRequest } : {})}
+              {...(props.onForgetRequest ? { onForgetRequest: props.onForgetRequest } : {})}
+            />
+            <HideInPublicCapture><BudgetPill /></HideInPublicCapture>
+            <HideInPublicCapture><VoiceCostPill /></HideInPublicCapture>
+          </div>
+          <div className="flex items-center gap-2">{voiceButton}</div>
+        </div>
+      )}
       {/* PLAN-chat-hud-multi-surface-port-2026-05-13 §4 M4 — HUD strip.
           Empty-state renders nothing, so this row is invisible until the
           daemon mirror (M3) pushes its first segment. */}
@@ -947,10 +1139,14 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
           </button>
         </div>
       )}
+      <ChatQueueChips
+        queue={visibleQueue}
+        onRemove={(id) => updateQueue(removeChat(queueRef.current, id))}
+        onClear={() => updateQueue(clearChatQueue())}
+      />
       <ChatInput
         onSubmit={handleSubmit}
         prefill={composerPrefill}
-        disabled={pending}
         attachments={pendingAttachments}
         onAttached={handleAttached}
         onRemoveAttachment={handleRemoveAttachment}
@@ -1029,6 +1225,12 @@ export function ChatLayout(props: ChatLayoutProps = {}) {
         onSubmit={askQuestion.submit}
         onCancel={askQuestion.cancel}
         onChatAboutThis={askQuestion.chatAboutThis}
+      />
+      <ToolApprovalSheet
+        request={toolApproval.pendingRequest}
+        receivedAt={toolApproval.receivedAt}
+        onChoose={toolApproval.choose}
+        onCancel={toolApproval.cancel}
       />
     </div>
   );

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { harnessScreenPath, writeHarnessScreen } from './harness-screen.js';
 import { SELF_SEND_RECENT_FRAME_WINDOW_MS, formatSelfSendCandidateDisplay } from '../index.js';
 import { CONTROL_MEMO_FRAME_PREFIX, cleanupStaleControlInbox, controlInboxPath, decodeControlMemoFrame, drainControlInbox, drainSoftStopControlInbox, encodeControlMemoFrame, enqueueControlMemo, enqueueSoftStop, inspectControlInbox, readSoftStopRequest, resolveControlInboxDir } from './control-inbox.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = join(import.meta.dir, '../..');
 

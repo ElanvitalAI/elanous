@@ -20,9 +20,21 @@ export interface OpsChecklistItem {
   updatedAt: string;
   evidence?: string;
 }
+export interface OpsSeat {
+  seat: 'OP' | 'MK' | 'TC' | 'UX';
+  role?: string;
+  now: { text: string; at: string } | null;
+  landed: Array<{ pr: number; title: string; at: string; checklistId: string | null }> | null;
+  blocked: Array<{ id: string; title: string; status: 'red' }> | null;
+  pendingDecisions: number | null;
+  checklist: { green: number; yellow: number; red: number; done: number } | null;
+}
+export interface OpsSeats { date: string; seats: OpsSeat[] }
+
 export interface OpsChecklist {
   version: string;
   codename?: string;
+  schedule?: { cutAt: string; landBy: string | null } | null;
   items: OpsChecklistItem[];
   green: number;
   yellow: number;
@@ -37,6 +49,10 @@ function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 function string(value: unknown): value is string { return typeof value === 'string'; }
+function utcIso(value: unknown): value is string {
+  return string(value) && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(value)
+    && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 19) === value.slice(0, 19);
+}
 function node(value: unknown): value is ReleaseNode {
   return record(value) && string(value.nodeId) && (value.ok === null || typeof value.ok === 'boolean') && string(value.summary);
 }
@@ -61,6 +77,19 @@ function checklist(value: unknown): value is OpsChecklist {
     && (value.history === undefined || Array.isArray(value.history));
 }
 
+const count = (value: unknown): value is number => Number.isInteger(value) && (value as number) >= 0;
+function seat(value: unknown): value is OpsSeat {
+  return record(value) && ['OP', 'MK', 'TC', 'UX'].includes(value.seat as string)
+    && (value.role === undefined || string(value.role))
+    && (value.now === null || (record(value.now) && string(value.now.text) && string(value.now.at)))
+    && (value.landed === null || (Array.isArray(value.landed) && value.landed.every((row: unknown) =>
+      record(row) && count(row.pr) && string(row.title) && string(row.at) && (row.checklistId === null || string(row.checklistId)))))
+    && (value.blocked === null || (Array.isArray(value.blocked) && value.blocked.every((row: unknown) =>
+      record(row) && string(row.id) && string(row.title) && row.status === 'red')))
+    && (value.pendingDecisions === null || count(value.pendingDecisions))
+    && (value.checklist === null || (record(value.checklist) && (['green', 'yellow', 'red', 'done'] as const).every((key) => count((value.checklist as Record<string, unknown>)[key]))));
+}
+
 async function get<T>(client: DaemonClient, path: string, parse: (value: unknown) => T | null): Promise<OpsResult<T>> {
   try {
     const response = await client.fetchResponse(path, { method: 'GET' });
@@ -71,6 +100,12 @@ async function get<T>(client: DaemonClient, path: string, parse: (value: unknown
   } catch {
     return { kind: 'error', status: 0 };
   }
+}
+
+export function getSeats(client: DaemonClient, date?: string): Promise<OpsResult<OpsSeats>> {
+  return get(client, `/v1/ops/seats${date ? `?date=${encodeURIComponent(date)}` : ''}`,
+    (value) => record(value) && string(value.date) && Array.isArray(value.seats) && value.seats.every(seat)
+      && new Set(value.seats.map((row: OpsSeat) => row.seat)).size === value.seats.length ? { date: value.date, seats: value.seats } : null);
 }
 
 export function getReleaseRuns(client: DaemonClient, version?: string): Promise<OpsResult<ReleaseRun[]>> {
@@ -88,6 +123,9 @@ export function getOpsChecklist(client: DaemonClient, version: string): Promise<
     for (const entry of value.items) if (entry.status in counts) counts[entry.status as keyof typeof counts]++;
     return {
       version: value.version, ...(value.codename !== undefined ? { codename: value.codename } : {}),
+      schedule: record(value.schedule) && utcIso(value.schedule.cutAt)
+        && (value.schedule.landBy === null || utcIso(value.schedule.landBy))
+        ? { cutAt: value.schedule.cutAt, landBy: value.schedule.landBy } : null,
       items: value.items,
       green: value.green ?? counts.green, yellow: value.yellow ?? counts.yellow,
       red: value.red ?? counts.red, done: value.done ?? counts.done,

@@ -13,6 +13,7 @@
 // behaviour exactly.
 
 import type { HitlDelivery } from '../hitl/types.js';
+import type { ClarificationImpact } from '../hitl/clarification-policy.js';
 export type { HitlDelivery };
 
 export interface QuestionOption {
@@ -37,6 +38,9 @@ export interface Question {
   question: string;
   /** 2–4 pre-defined choices. */
   options: QuestionOption[];
+  impact?: ClarificationImpact;
+  /** Zero-based position in options; an out-of-range value is ignored. */
+  recommendedIndex?: number;
   /** When true, user can pick more than one option; Space toggles,
    *  Enter submits. Default false. */
   multiSelect?: boolean;
@@ -49,6 +53,7 @@ export interface Question {
 
 export interface AskUserQuestionRequest {
   questions: Question[];   // 1–3
+  runId?: string;
   /** AXON F4 — optional routing hint. When set, callers with HITL
    *  resolvers can fan the prompt out to Telegram/Discord/etc;
    *  omitted (or `'modal'` / `'terminal'`) keeps the existing TUI
@@ -165,6 +170,9 @@ export function parseQuestionRequest(
       header,
       question,
       options,
+      ...(item.impact === 'low' || item.impact === 'medium' || item.impact === 'high' || item.impact === 'critical' ? { impact: item.impact } : {}),
+      ...(typeof item.recommendedIndex === 'number' && Number.isInteger(item.recommendedIndex)
+        && item.recommendedIndex >= 0 && item.recommendedIndex < options.length ? { recommendedIndex: item.recommendedIndex } : {}),
       multiSelect: item.multiSelect === true,
       includeOther: item.includeOther !== false,  // default true
     });
@@ -186,5 +194,6 @@ export function parseQuestionRequest(
 
   const req: AskUserQuestionRequest = { questions: parsed };
   if (delivery !== undefined) req.delivery = delivery;
+  if (typeof raw.runId === 'string') req.runId = raw.runId;
   return { ok: true, req };
 }

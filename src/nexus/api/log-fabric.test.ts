@@ -4,7 +4,7 @@
  * store 는 :memory: 주입(deps.store) — 실 ~/.elanous 미접촉. 레벨 POST 는
  * setLevel/persistLevel spy 주입으로 전역 debug 싱글톤/실 config 미접촉.
  */
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,6 +21,9 @@ import {
   parseLogQuery,
 } from './log-fabric.js';
 import type { MetaApiOpts } from './meta-api.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const OPTS: MetaApiOpts = { noAuth: true } as MetaApiOpts;
 

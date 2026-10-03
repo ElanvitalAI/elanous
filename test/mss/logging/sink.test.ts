@@ -5,13 +5,16 @@
 // extension point is exercised by `test/debug-log.test.ts` and the
 // M2.2 Phase A2 `StderrSink` tests.
 
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
-import { FileSink, MirrorSink, RingSink, type LogSink } from '../../../src/mss/logging/sink.ts';
-import type { LogRecord } from '../../../src/mss/logging/record.ts';
+import { FileSink, MirrorSink, RingSink, type LogSink } from '../../../src/mss/logging/sink.js';
+import type { LogRecord } from '../../../src/mss/logging/record.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function mkRec(overrides: Partial<LogRecord> = {}): LogRecord {
   return {

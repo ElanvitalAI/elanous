@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -19,6 +19,9 @@ import { readRemoteFlag } from './remote-resolve.js';
 import { TaskStore } from '../task-orchestrator/store.js';
 import { createMission } from '../task-orchestrator/mission.js';
 import { createTask } from '../task-orchestrator/types.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const BIN = resolve(REPO_ROOT, 'bin/elanous.mjs');

@@ -71,6 +71,7 @@ import { effectiveInstanceRoot } from './instance/resolve.js';
 import { getElanousConfigDir } from './elanous-config-dir.js';
 import { defaultFieldEvent, FieldUploadError, parseFieldCaption, resolveFieldMime, saveFieldMedia } from './field/field-media.js';
 import { scheduleFieldReel, type FieldReelOptions } from './field/field-reel.js';
+import { maybeHandleCardPhoto, type CardPhotoDeps } from './telegram-card-followup.js';
 
 export type TgAttachmentKind = 'photo' | 'voice' | 'audio' | 'document';
 
@@ -216,6 +217,8 @@ export interface TelegramBotOpts {
   fieldRootDir?: () => string;
   /** 시험에서는 실제 렌더 대신 가짜 실행기를 주입한다. */
   fieldReel?: FieldReelOptions;
+  /** Test seam for the business-card graph and its private run root. */
+  cardFollowupDeps?: Pick<CardPhotoDeps, 'runGraph' | 'rootDir' | 'ocrText'>;
 }
 
 /** Surface-unification v2 (FU-2) — Telegram trigger event passed to
@@ -333,10 +336,11 @@ export class TelegramBot {
   private readonly fieldDefaultEventOpt?: string;
   private readonly fieldRootDir: () => string;
   private readonly fieldReel?: FieldReelOptions;
+  private readonly cardFollowupDeps: Pick<CardPhotoDeps, 'runGraph' | 'rootDir' | 'ocrText'>;
   private readonly seatWorkDeps: TelegramSeatWorkDeps;
   /** 앨범 id → `#현장` 행사 · 답장 디바운스. 태그된 앨범만 들어온다. */
   private readonly fieldGroups = new Map<string, {
-    event: string; at: number; chatId: number; threadId?: number; replyTo: number; count: number;
+    event: string; mode?: 'instant'; at: number; chatId: number; threadId?: number; replyTo: number; count: number;
     timer?: ReturnType<typeof setTimeout>;
   }>();
 
@@ -368,6 +372,7 @@ export class TelegramBot {
     this.fieldDefaultEventOpt = opts.fieldDefaultEvent;
     this.fieldRootDir = opts.fieldRootDir ?? getElanousConfigDir;
     this.fieldReel = opts.fieldReel;
+    this.cardFollowupDeps = opts.cardFollowupDeps ?? {};
     this.seatWorkDeps = opts.seatWorkDeps ?? {};
     if (opts.onTriggerTap) {
       // Assign through `as unknown` to bypass `readonly` + private —
@@ -376,7 +381,7 @@ export class TelegramBot {
     }
   }
 
-  private isOwnerAllowed(userId: number): boolean {
+  isOwnerAllowed(userId: number): boolean {
     return this.allowedUsers.size > 0 && this.allowedUsers.has(userId);
   }
 
@@ -1415,6 +1420,10 @@ export class TelegramBot {
       ? tag.event ?? defaultFieldEvent(
         this.fieldDefaultEventOpt ?? this.slashContext?.userConfig?.telegram?.fieldDefaultEvent, new Date(now))
       : group!.event;
+    const captionMode = tag?.mode ?? group?.mode;
+    const configMode = this.slashContext?.userConfig?.telegram?.fieldReelMode;
+    const mode = captionMode ?? configMode ?? 'standard';
+    const source = captionMode ? 'caption' : configMode ? 'config' : 'default';
 
     let count: number | null = null;
     let failure: string | null = null;
@@ -1435,14 +1444,16 @@ export class TelegramBot {
       // 글(자막)은 캡션이 달린 항목에만 있다 — 앨범이면 첫 장에만 붙는다(MK 2026-09-30).
       const saved = saveFieldMedia(inputs, { rootDir: this.fieldRootDir(), event, device: 'telegram', ...(tag?.text ? { caption: tag.text } : {}) });
       count = saved.count;
+      debug.log('telegram.field', 'reel-mode', { event, mode, source });
       scheduleFieldReel(saved.dir, {
         ...this.fieldReel,
+        mode,
         notificationKey: `telegram:${this.botId}:${ctx.chatId}:${ctx.threadId ?? ''}:${ctx.mediaGroupId ?? ctx.messageId}`,
         onDone: async (result) => {
           const reply = { replyTo: ctx.messageId, threadId: ctx.threadId };
           if (result.ok && result.file) {
             const sent = await this.sendDocument(ctx.chatId, readFileSync(result.file), 'reel-9x16.mp4', {
-              ...reply, mimeType: 'video/mp4', caption: `현장 영상 · ${event} · ${result.seconds}초`,
+              ...reply, mimeType: 'video/mp4', caption: `현장 영상 · ${event} · ${result.seconds}초${mode === 'instant' ? ' (즉석판)' : ''}`,
             });
             if (!sent) throw new Error('sendDocument failed');
             if (result.feed?.started) {
@@ -1469,7 +1480,8 @@ export class TelegramBot {
       return true;
     }
     // 앨범은 항목마다 답하지 않는다 — 마지막 항목 뒤 한 번(디바운스)만 최신 수로 답한다.
-    const entry = group ?? { event, at: now, chatId: ctx.chatId, threadId: ctx.threadId, replyTo: ctx.messageId, count: 0 };
+    const entry = group ?? { event, mode: tag?.mode, at: now, chatId: ctx.chatId, threadId: ctx.threadId, replyTo: ctx.messageId, count: 0 };
+    if (group && tag?.mode) group.mode = tag.mode;
     entry.at = now;
     entry.count = count!;
     if (entry.timer) clearTimeout(entry.timer);
@@ -1490,10 +1502,18 @@ export class TelegramBot {
     }
     // 현장 업로드 — `#현장` 캡션(또는 태그된 앨범의 나머지)의 사진·영상은 LLM 대신 현장 폴더로.
     if (await this.tryHandleFieldUpload(ctx)) return;
-    if (ctx.text.startsWith('@')) {
+    if (await maybeHandleCardPhoto(ctx, {
+      isOwner: (userId) => this.isOwnerAllowed(userId),
+      isFieldAlbum: (id) => this.fieldGroups.has(id),
+      downloadFile: (fileId, dir) => this.downloadFile(fileId, dir),
+      sendMessage: (chatId, text, opts) => this.sendMessage(chatId, text, opts),
+      sendDocument: (chatId, body, filename, opts) => this.sendDocument(chatId, body, filename, opts),
+      ...this.cardFollowupDeps,
+    })) return;
+    if (ctx.text.startsWith('@') || (ctx.isDm && ctx.text && !ctx.text.startsWith('/'))) {
       const reply = await handleTelegramSeatWork(ctx.text, {
-        chatId: ctx.chatId, messageId: ctx.messageId, threadId: ctx.threadId, botId: ctx.botId,
-      }, this.seatWorkDeps);
+        chatId: ctx.chatId, userId: ctx.userId, messageId: ctx.messageId, threadId: ctx.threadId, botId: ctx.botId,
+      }, { ...this.seatWorkDeps, config: this.seatWorkDeps.config ?? this.slashContext?.userConfig });
       if (reply !== null) {
         await this.sendMessage(ctx.chatId, reply, { replyTo: ctx.messageId, threadId: ctx.threadId });
         return;
@@ -1529,7 +1549,7 @@ export class TelegramBot {
       try {
         const { addDirective } = await import('./steward/directive.js');
         const text = ctx.text.startsWith('지시:') ? ctx.text.slice('지시:'.length) : ctx.text.slice('/directive '.length);
-        const result = await addDirective(text, { source: 'telegram' });
+        const result = await addDirective(text, { source: 'telegram', origin: { chatId: ctx.chatId, botId: ctx.botId, threadId: ctx.threadId } });
         await this.sendMessage(ctx.chatId, `${result.issue}: ${result.status}`, { replyTo: ctx.messageId, threadId: ctx.threadId });
       } catch {
         await this.sendMessage(ctx.chatId, '지시 등록 실패 — Linear 연결과 자격을 확인하세요.', { replyTo: ctx.messageId, threadId: ctx.threadId });
@@ -2746,6 +2766,7 @@ export function botFromConfig(opts: BotFromConfigOpts): TelegramBot {
         // (makeTelegramAgentRunTurn) threads it into `delegate_code_agent`
         // so a delegated sub-agent's approval prompt lands back here.
         hitlConfirmChannel: botRef.hitlConfirmChannelForChat(ctx.chatId, ctx.threadId),
+        ...(botRef.isOwnerAllowed(ctx.userId) ? { verifiedOwner: { id: `telegram:${ctx.userId}` } } : {}),
         hitlQuestionChannel: botRef.hitlQuestionChannelForChat(ctx.chatId, ctx.threadId),
         // P1.4 — surface file spill bound to THIS chat so the NL
         // `delegate_code_agent` path spills big diffs/stdout back here.

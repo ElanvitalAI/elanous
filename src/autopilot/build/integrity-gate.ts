@@ -255,6 +255,7 @@ const STEP_CMDS: Record<GateStepName, { cmd: string; args: string[]; timeoutMs: 
   'cli-smoke': { cmd: 'bun', args: ['bin/elanous.mjs', '--help'], timeoutMs: 60_000 },
 };
 
+const DEPENDENCY_INSTALL_TIMEOUT_MS = 300_000;
 const MAX_LOGGED_TEST_FILTERS = 6;
 
 /** Platform runners own Kotlin/Swift execution; Bun must never receive their paths as test filters. */
@@ -289,6 +290,17 @@ export async function runIntegrityGate(
   const runCmd = opts.runCmd ?? createRunCmd();
   const results: GateStep[] = [];
   const logs: string[] = [];
+  // A Pod worktree has no node_modules unless the child happened to install them (the Pod clone has none to link), and Bun
+  // then auto-installs at import time — «Unexpected while resolving package 'commander'» failed cli-smoke as an
+  // «environment deficiency» three times on 10-02 (#22849 · #22919). Install from the lockfile before measuring instead.
+  if (steps.length > 0 && existsSync(join(cwd, 'bin', 'elanous.mjs')) && existsSync(join(cwd, 'bun.lock'))
+      && !existsSync(join(cwd, 'node_modules', 'commander', 'package.json'))) {
+    const install = await runCmd('bun', ['install', '--frozen-lockfile'], cwd, DEPENDENCY_INSTALL_TIMEOUT_MS);
+    const installed = install.code === 0 && !install.timedOut;
+    debug.log('gate.deps', 'install', { installed, code: install.code, timedOut: install.timedOut });
+    const tail = (install.stderr || install.stdout).split('\n').filter(Boolean).slice(-2).join(' | ').slice(0, 200);
+    logs.push(`[deps] ${installed ? 'INSTALLED' : 'FAIL'} bun install --frozen-lockfile — node_modules/commander was missing${installed ? '' : `: ${tail}`}`);
+  }
   let passed = true;
   let testPassCount: number | undefined;
   let sawPassCountRegression = false;

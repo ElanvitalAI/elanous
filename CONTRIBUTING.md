@@ -15,8 +15,8 @@ Thank you for helping.
 ```bash
 bun install
 bun bin/elanous.mjs doctor      # what is configured, what is missing
-bun test <path>               # tests for the files you changed
-bun run scripts/ci-typecheck-changed.ts
+bun test <path>                 # tests for the files you changed
+bun run scripts/ci-typecheck-changed.ts   # type errors in the files you changed
 ```
 
 See `AGENTS.md` for the working agreement that both humans and coding agents follow.

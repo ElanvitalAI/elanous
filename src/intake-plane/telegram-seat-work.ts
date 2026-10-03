@@ -1,5 +1,11 @@
 import { debug } from '../debug/log.js';
+import { telegramDecisionOwner } from '../decisions/telegram-decision-cards.js';
+import { canonicalSeatId } from '../msg/msg-store.js';
+import { dispatchCeoTask, type CeoCommandDeps } from '../seat-dispatch/ceo-commands.js';
+import { ceoTaskDeps, classifyCeoIntent } from '../seat-dispatch/ceo-intent.js';
 import { parseSeatAddress, resolveSeat } from '../seat-address/seat-address.js';
+import { getUserConfig, type UserConfig } from '../user-config.js';
+import { answerAsSeat } from './seat-answer.js';
 import {
   submitIntakeWork,
   type SubmitIntakeWorkDeps,
@@ -8,15 +14,39 @@ import type { TelegramWorkMessage } from './telegram-work.js';
 
 export interface TelegramSeatWorkDeps extends SubmitIntakeWorkDeps {
   submit?: typeof submitIntakeWork;
+  config?: UserConfig;
+  answer?: typeof answerAsSeat;
+  dispatch?: typeof dispatchCeoTask;
+  commandDeps?: CeoCommandDeps;
 }
 
-/** Addressed Telegram work goes through graph intake, not the chat turn. */
+/** Addressed work preserves graph intake except for one owner's private seat request. */
 export async function handleTelegramSeatWork(
   text: string,
   msg: TelegramWorkMessage,
   deps: TelegramSeatWorkDeps = {},
 ): Promise<string | null> {
-  if (!text.startsWith('@')) return null;
+  const owner = (): { cfg: UserConfig; id: string } | null => {
+    if (msg.userId === undefined || String(msg.chatId) !== String(msg.userId)) return null;
+    const cfg = deps.config ?? getUserConfig();
+    const id = telegramDecisionOwner(cfg);
+    return id && id === String(msg.userId) ? { cfg, id } : null;
+  };
+  const sendTask = async (seat: string, body: string, cfg: UserConfig, id: string): Promise<string> => {
+    const result = await (deps.dispatch ?? dispatchCeoTask)(seat, body, deps.commandDeps ?? ceoTaskDeps(cfg, id), { via: 'telegram' });
+    debug.log('seat.dispatch', 'intent', { seat, intent: 'task', via: 'telegram', outcome: result.channel });
+    return result.reply;
+  };
+  if (!text.startsWith('@')) {
+    if (!text.trim() || /^\s*[/@＠]/.test(text)) return null;
+    const auth = owner();
+    const configured = (auth?.cfg.raw?.seatDispatch as { defaultSeat?: unknown } | undefined)?.defaultSeat;
+    if (typeof configured !== 'string' || classifyCeoIntent(text) !== 'task') return null;
+    const seat = resolveSeat(configured);
+    if (!seat) return null;
+    const id = canonicalSeatId(seat.id);
+    return ['OP', 'TC', 'MK', 'UX'].includes(id) ? sendTask(id, text, auth!.cfg, auth!.id) : null;
+  }
   const address = parseSeatAddress(text);
   if (!address) return null;
 
@@ -32,6 +62,18 @@ export async function handleTelegramSeatWork(
   if (!body) {
     debug.log('seat-address.telegram', 'rejected', { seats: names, reason: 'empty-body' });
     return '어떤 일을 맡길까요? 좌석 주소 뒤에 요청 내용을 적어 다시 보내 주세요.';
+  }
+
+  if (seats.length === 1 && seats[0]?.seat) {
+    const auth = owner();
+    const seatId = canonicalSeatId(seats[0].seat.id);
+    if (auth && ['OP', 'TC', 'MK', 'UX'].includes(seatId)) {
+      const intent = classifyCeoIntent(body);
+      if (intent === 'task') return sendTask(seatId, body, auth.cfg, auth.id);
+      const answer = await (deps.answer ?? answerAsSeat)(seats[0].name, body);
+      debug.log('seat.dispatch', 'intent', { seat: seatId, intent, via: 'telegram', outcome: answer ? 'answered' : 'intake' });
+      if (answer) return answer.text;
+    }
   }
 
   const reportTo = {

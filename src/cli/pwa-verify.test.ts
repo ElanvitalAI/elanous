@@ -1,10 +1,13 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import type { Dirent } from 'node:fs';
 import { join } from 'node:path';
 
 import { runPwaVerify, type PwaVerifyOpts } from './pwa-verify.js';
 import type { StalenessVerdict } from './pwa-staleness.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const FRESH: StalenessVerdict = { stale: false, reason: 'fresh', sourceMtime: 1, outMtime: 2 };
 const STALE: StalenessVerdict = { stale: true, reason: 'source-newer', sourceMtime: 2, outMtime: 1 };

@@ -8,9 +8,13 @@ import { debug, redactSecretText } from '../debug/log.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { redactSecrets } from '../task-cards/card-store.js';
 import { directiveHash } from './directive.js';
-import { recordTriageOnCards, type StewardCardDeps } from './steward-cards.js';
+import { notifyOutcome, type OutcomeNotifyDeps } from './outcome-notify.js';
+import { recordTriageOnCards, recordLaunchOnCard, recordOutcomeOnCard, recordHitlOnCard, type StewardCardDeps } from './steward-cards.js';
+import { planLaunches, launch, collectOutcomes, raiseHitl, readLaunchLedger, saveLaunchLedger, type LaunchDeps } from './launch.js';
+import { InvalidWorkingBackwardsDraft, recordWorkingBackwardsOnCards } from './working-backwards.js';
+import { CardStore } from '../task-cards/card-store.js';
 import { triageWithinBudget } from './triage-budget.js';
-import { askSteward, classifyIssue, planIssues, ruleJudgment, unsafeReason, type ClassifiedIssue, type StewardAsk } from './triage-plan.js';
+import { askSteward, classifyIssue, installedCapabilities, planIssues, ruleJudgment, unsafeReason, type ClassifiedIssue, type StewardAsk } from './triage-plan.js';
 import { failureAlertText, markStageStart, markStageEnd, readFailureStreak, shouldAlert, writeFailureStreak, type FailureStreak, type StewardStage } from './failure-streak.js';
 
 export type Rung = 0 | 1 | 2 | 3 | 4 | 5 | 'hitl';
@@ -24,6 +28,7 @@ export interface TriageDecision {
   owner?: string;
   /** Carried from a previous triage without a current judgment; scheduling must not route it. */
   deferred?: true;
+  capability?: ClassifiedIssue['capability'];
 }
 export interface ScheduledDecision extends TriageDecision { disposition: 'now' | 'wait' | 'hitl' }
 export interface StewardSettings {
@@ -32,6 +37,9 @@ export interface StewardSettings {
   budget?: number;
   tracks?: Record<string, string>;
   alertAfterFailures?: number;
+  launch?: 'off' | 'shadow' | 'live';
+  maxParallel?: number;
+  podPool?: string;
 }
 export interface StewardDeps {
   fetch?: typeof fetch;
@@ -44,6 +52,10 @@ export interface StewardDeps {
   cardStore?: StewardCardDeps['store'];
   warn?: (message: string) => void;
   ask?: StewardAsk;
+  launchSettings?: Pick<StewardSettings, 'launch' | 'maxParallel' | 'podPool'>;
+  launchCommand?: LaunchDeps['command'];
+  spawnLaunch?: LaunchDeps['spawn'];
+  outcomeNotify?: Pick<OutcomeNotifyDeps, 'document' | 'message' | 'worktreeCommand' | 'loadOrigin' | 'loadOrigins'>;
   /** Internal command boundary: the current sync has already claimed this pid. */
   stageOwnedByCommand?: boolean;
 }
@@ -89,6 +101,8 @@ export async function triageIssues(issues: TriageIssue[], judge?: NonNullable<St
   const classified: ClassifiedIssue[] = [];
   const classifiedIds = new Set<string>();
   const counts = { rule: 0, classify: 0, planning: 0 };
+  // Inventory is shared by every classification in this batch; do not spawn --help per issue.
+  let inventory: ReturnType<typeof installedCapabilities> | undefined;
   const signal = (result: TriageDecision): void => {
     decide({ kind: result.rung === 'hitl' ? 'ESCALATE' : 'ROUTE', what: result.issue, reason: result.why,
       purpose: 'steward triage', target: result.owner ? `${result.rung} · ${result.owner}` : String(result.rung), refs: { issue: result.issue } });
@@ -99,7 +113,7 @@ export async function triageIssues(issues: TriageIssue[], judge?: NonNullable<St
       const byRule = ruleJudgment(issue, observedIssues ?? issues);
       if (byRule) { counts.rule++; return { ...byRule, dependsOn: [], priority: 0 }; }
       counts.classify++;
-      const row = await classifyIssue(issue, ask);
+      const row = await classifyIssue(issue, ask, inventory ??= installedCapabilities());
       return { ...row, dependsOn: [], priority: 0 };
     } catch (error) {
       try { debug.log('steward.stage', 'judgment-invalid', { issue: issue.identifier, reason: redactSecrets(String(error)) }); } catch { /* fail-soft */ }
@@ -111,6 +125,7 @@ export async function triageIssues(issues: TriageIssue[], judge?: NonNullable<St
         result.why !== 'triage judgment timed out — human review' &&
         result.why !== 'triage deferred — deadline') {
       classified.push({ issue: result.issue, rung: result.rung, why: result.why,
+        ...(result.capability ? { capability: result.capability } : {}),
         ...(result.hitlReason ? { hitlReason: result.hitlReason } : {}) });
       classifiedIds.add(result.issue);
     } else signal(result);
@@ -232,9 +247,9 @@ function readState(path: string): { issues: Record<string, string>; digestDay?: 
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { issues: {} }; throw error; }
 }
 
-/** Each command node invokes one stage. No stage can spawn, launch, merge or approve. */
+/** Each command node invokes one stage. Only the launch setting permits spawn; merge and approval remain with the harness and human. */
 export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'report', deps: StewardDeps = {}): Promise<void> {
-  const settings = stewardSettings();
+  const settings = { ...stewardSettings(), ...deps.launchSettings };
   if ((settings.mode ?? 'observe') !== 'observe') throw new Error('steward act mode is out of scope');
   const root = deps.root ?? effectiveInstanceRoot();
   if (stage === 'sync' && !deps.stageOwnedByCommand) {
@@ -286,7 +301,8 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
         let cursor: string | null = null;
         do {
           const data: { issues: { nodes: Array<{ identifier: string; state?: { type: string } }>; pageInfo: { hasNextPage: boolean; endCursor: string | null } } } = await linear(key,
-            'query($ids:[String!]!,$after:String){issues(filter:{identifier:{in:$ids}},first:250,after:$after){nodes{identifier state{type}} pageInfo{hasNextPage endCursor}}}',
+            // IssueFilter has no `identifier` field (HTTP 400 GRAPHQL_VALIDATION_FAILED · 10-02 measured); `id` accepts identifiers like ELA-1.
+            'query($ids:[ID!]!,$after:String){issues(filter:{id:{in:$ids}},first:250,after:$after){nodes{identifier state{type}} pageInfo{hasNextPage endCursor}}}',
             { ids: batch, after: cursor }, fetchFn);
           if (!Array.isArray(data.issues?.nodes) || !data.issues.pageInfo ||
               (data.issues.pageInfo.hasNextPage && (!data.issues.pageInfo.endCursor || data.issues.pageInfo.endCursor === cursor))) {
@@ -297,7 +313,46 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
         } while (cursor);
       }
     }
-    writeFileSync(schedule, JSON.stringify(scheduleTriage(decisions, settings, {}, completed)));
+    let rows = scheduleTriage(decisions, settings, {}, completed);
+    const issues = existsSync(snapshot) ? JSON.parse(readFileSync(snapshot, 'utf8')) as TriageIssue[] : [];
+    // L2 — a new-capability wish gets its PR/FAQ and manual drafts on the card before any launch is recorded.
+    // Only new-capability rows: triage sections are written first so the card reads intake → triage → prfaq → manual → launch;
+    // the report stage repeats both calls idempotently. A wish whose draft is invalid goes to hitl on its own —
+    // the other rows (and the shadow ledger) still proceed this tick.
+    {
+      const present = new Set(issues.map(issue => issue.identifier));
+      const wishes = rows.filter(row => present.has(row.issue) && row.capability === 'new-capability' && row.rung !== 'hitl');
+      const store = wishes.length ? deps.cardStore ?? new CardStore(root) : undefined;
+      const invalid = new Set<string>();
+      if (store) try {
+        recordTriageOnCards(wishes, issues, { root, store, now: deps.now });
+        for (const wish of wishes) {
+          try { await recordWorkingBackwardsOnCards([wish], issues, store, deps.ask ?? askSteward); }
+          catch (error) {
+            if (!(error instanceof InvalidWorkingBackwardsDraft)) throw error;
+            invalid.add(wish.issue);
+            debug.log('steward.stage', 'draft-invalid', { issue: wish.issue });
+          }
+        }
+      } finally { if (!deps.cardStore) store.close(); }
+      if (invalid.size) rows = rows.map(row => invalid.has(row.issue)
+        ? { ...row, rung: 'hitl' as const, disposition: 'hitl' as const, hitlReason: 'other' as const, why: 'working-backwards draft invalid' }
+        : row);
+    }
+    writeFileSync(schedule, JSON.stringify(rows));
+    const ledger = readLaunchLedger(root);
+    const launchDeps: LaunchDeps = { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch };
+    const cardDeps = { root, store: deps.cardStore, now: deps.now };
+    collectOutcomes(ledger, launchDeps);
+    const plan = planLaunches(rows, issues, ledger, settings);
+    for (const { issue, row } of plan.hitl) {
+      const entry = raiseHitl(issue, row, launchDeps);
+      recordHitlOnCard(issue, entry, cardDeps);
+    }
+    for (const item of plan.launches) {
+      const entry = launch(item, launchDeps);
+      recordLaunchOnCard(item.issue, entry, cardDeps);
+    }
   } else {
     const rows = JSON.parse(readFileSync(schedule, 'utf8')) as ScheduledDecision[];
     const path = reportPath(root);
@@ -305,15 +360,23 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
     const at = (deps.now ?? (() => new Date()))().toISOString();
     const issues = JSON.parse(readFileSync(snapshot, 'utf8')) as TriageIssue[];
     try {
-      recordTriageOnCards(rows, issues, { root, store: deps.cardStore, now: deps.now });
+      const present = new Set(issues.map(issue => issue.identifier));
+      const known = rows.filter(row => present.has(row.issue));
+      const store = deps.cardStore ?? new CardStore(root);
+      try {
+        recordTriageOnCards(known, issues, { root, store, now: deps.now });
+        // Rows without a capability verdict (legacy, injected or unjudged) proceed; only drafting is skipped for them.
+        await recordWorkingBackwardsOnCards(known, issues, store, deps.ask ?? askSteward);
+      } finally { if (!deps.cardStore) store.close(); }
     } catch (error) {
       const message = `steward report: card write failed: ${redactSecrets(error instanceof Error ? error.message : String(error))}`;
       debug.log('steward.cards', 'write-failed', { error: message });
       (deps.warn ?? console.warn)(message);
+      if (error instanceof InvalidWorkingBackwardsDraft) throw error;
     }
     for (const row of rows) {
       const issue = issues.find(item => item.identifier === row.issue);
-      if (!issue) throw new Error(`Missing issue ${row.issue}`);
+      if (!issue) continue;
       const body = `스튜어드 observe · ${row.disposition} · rung ${row.rung} · 우선순위 ${row.priority} · 의존 ${row.dependsOn.join(', ') || '없음'}${row.duplicateOf ? ` · 중복 ${row.duplicateOf}` : ''} · ${row.why}${row.hitlReason ? ` · HITL ${row.hitlReason}` : ''}`;
       const hash = directiveHash(body);
       if (state.issues[row.issue] === hash) continue;
@@ -321,6 +384,27 @@ export async function runStewardStage(stage: 'sync' | 'triage' | 'schedule' | 'r
       if (!result.commentCreate?.success) throw new Error(`Linear comment failed: ${row.issue}`);
       state.issues[row.issue] = hash;
       writeFileSync(path, JSON.stringify(state));
+    }
+    const ledger = readLaunchLedger(root);
+    const outcomes = collectOutcomes(ledger, { root, settings, ledger, command: deps.launchCommand, spawn: deps.spawnLaunch });
+    for (const outcome of outcomes) {
+      const issue = issues.find(item => item.identifier === outcome.issue) ??
+        { identifier: outcome.issue, title: outcome.title, ref: '', body: '' };
+      recordOutcomeOnCard(issue, outcome, { root, store: deps.cardStore, now: deps.now });
+      notifyOutcome(outcome, { root, ledger, shadow: settings.launch !== 'live', ...deps.outcomeNotify });
+      const prefix = ['telegram', 'pwa', 'tui', 'cli'].includes(outcome.source) ? `${outcome.source} · ` : '';
+      await (deps.sendDigest ?? sendStewardDigest)(`${prefix}${issue.title} · PR ${outcome.prNumber ?? '없음'} · ${outcome.status}`);
+      outcome.reported = true;
+      saveLaunchLedger(root, ledger);
+    }
+    const justCollected = new Set(outcomes.map(outcome => outcome.issue));
+    for (const outcome of Object.values(ledger.launches)) {
+      if ((settings.launch !== 'live' && outcome.status === 'shadow' && !outcome.notified) ||
+          (settings.launch === 'live' && !justCollected.has(outcome.issue) && outcome.reported && outcome.notified !== 'shadow') ||
+          // A finished run whose PR waits for merge still owes the wish's chat its PR link (once; failures retry).
+          (settings.launch === 'live' && outcome.awaitingMerge === true && !outcome.reported && outcome.notified !== 'sent')) {
+        notifyOutcome(outcome, { root, ledger, shadow: settings.launch !== 'live', ...deps.outcomeNotify });
+      }
     }
     const day = at.slice(0, 10);
     if (state.digestDay !== day) {

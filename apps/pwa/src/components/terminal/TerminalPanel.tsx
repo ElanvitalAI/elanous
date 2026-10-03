@@ -14,6 +14,8 @@ import { PtyLiveView } from './PtyLiveView';
 import { PtyWall } from './PtyWall';
 import { wallFromSearch } from './pty-wall';
 import { TerminalTabs, type InitialTerminalState } from './TerminalTabs';
+import { CompactTerminalBar } from './CompactTerminalBar';
+import { useCompactMode } from '@/lib/compact-mode';
 import { initialTerminalNotice } from './initial-terminal-notice';
 import { TuiMirrorView } from './TuiMirrorView';
 import { TerminalControls } from './TerminalControls';
@@ -168,6 +170,7 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
   // see it; iPad / iPhone get it for free. Hybrid devices (Surface,
   // ChromeOS tablet mode) toggle as the user docks/undocks.
   const { isCoarsePointer } = usePointerCapability();
+  const { compact } = useCompactMode();
   const [terminalId, setTerminalId] = useState<string | null>(null);
   const [clearRequests, setClearRequests] = useState<Readonly<Record<string, number>>>({});
   const [tabIds, setTabIds] = useState<readonly string[]>([]);
@@ -642,9 +645,38 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
     });
   };
 
+  const modeButtons = <>
+    <button type="button" aria-pressed={panelState.buttons[0].selected}
+      onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('terminal'); }}
+      className={`rounded px-2 py-1 text-xs ${panelState.buttons[0].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}>터미널</button>
+    <button type="button" aria-pressed={panelState.buttons[1].selected}
+      onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('observe'); }}
+      className={`rounded px-2 py-1 text-xs ${panelState.buttons[1].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
+      title="자기신고하는 elanous 대시보드 TUI 를 라이브로 관측(읽기 전용)">🖥 TUI 관측 {panelState.buttons[1].selected ? 'ON' : 'OFF'}</button>
+    <button type="button" aria-pressed={panelState.buttons[2].selected}
+      onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('pty-list'); }}
+      className={`rounded px-2 py-1 text-xs ${panelState.buttons[2].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}>PTY 목록</button>
+    <button type="button" aria-pressed={wall !== null} onClick={() => setWall((w) => (w === null ? [] : null))}
+      className={`rounded px-2 py-1 text-xs ${wall !== null ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
+      data-elanous-action="pty-wall">▦ 나란히</button>
+  </>;
+  const controls = terminalId && <TerminalControls
+    terminalId={terminalId}
+    onClear={() => setClearRequests((current) => ({ ...current, [terminalId]: (current[terminalId] ?? 0) + 1 }))}
+    onRecordingChange={setRecording}
+    onAttached={handleAttached}
+    voice={controlsVoiceProp}
+    variant={compact ? 'sheet' : 'default'}
+  />;
+
   return (
     <div className="flex h-full flex-col">
       <TerminalTabs
+        variant={compact ? 'sheet' : 'default'}
+        renderSheet={({ tabs, status, onSwitch, onAdd, actions }) => <CompactTerminalBar activeId={terminalId} tabs={tabs} status={status} onSwitch={onSwitch} onAdd={onAdd} actions={actions}>
+          {modeButtons}
+          {controls}
+        </CompactTerminalBar>}
         activeId={terminalId}
         onActiveChange={(id) => { onActiveChange(id); setLivePty(null); setLiveDismissed(true); setPanelView('terminal'); }}
         onInitialTerminalState={handleInitialTerminalState}
@@ -666,56 +698,15 @@ export function TerminalPanel({ initialPtyId = null, onPtySelection }: TerminalP
       {/* Phase 2 — single banner above the toolbar covers all 3 mic
           entry points (dock header / ChatInput / TerminalControls). */}
       <TailscaleSecurityBanner />
-      {/* Subtabs keep the existing terminal and TUI observation surfaces
-          while adding the daemon's PTY registry as a read-only list. */}
-      <div className={panelsMinimized ? 'hidden' : 'flex items-center gap-2 border-b border-zinc-800 px-3 py-1'}>
-        <button
-          type="button"
-          aria-pressed={panelState.buttons[0].selected}
-          onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('terminal'); }}
-          className={`rounded px-2 py-1 text-xs ${panelState.buttons[0].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
-        >
-          터미널
-        </button>
-        <button
-          type="button"
-          aria-pressed={panelState.buttons[1].selected}
-          onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('observe'); }}
-          className={`rounded px-2 py-1 text-xs ${panelState.buttons[1].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
-          title="자기신고하는 elanous 대시보드 TUI 를 라이브로 관측(읽기 전용)"
-        >
-          🖥 TUI 관측 {panelState.buttons[1].selected ? 'ON' : 'OFF'}
-        </button>
-        <button
-          type="button"
-          aria-pressed={panelState.buttons[2].selected}
-          onClick={() => { setLivePty(null); setLiveDismissed(true); selectPanelView('pty-list'); }}
-          className={`rounded px-2 py-1 text-xs ${panelState.buttons[2].selected ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
-        >
-          PTY 목록
-        </button>
-        <button
-          type="button"
-          aria-pressed={wall !== null}
-          onClick={() => setWall((w) => (w === null ? [] : null))}
-          className={`rounded px-2 py-1 text-xs ${wall !== null ? 'bg-emerald-700 text-white' : 'bg-zinc-800 text-zinc-300 hover:bg-zinc-700'}`}
-          data-elanous-action="pty-wall"
-        >
-          ▦ 나란히
-        </button>
-      </div>
+      {!compact && <div className={panelsMinimized ? 'hidden' : 'flex items-center gap-2 border-b border-zinc-800 px-3 py-1'}>{modeButtons}</div>}
       {terminalId ? <div className={panelsMinimized || panelView !== 'terminal' || livePty !== null || (initialPtyId && !liveDismissed) ? 'hidden' : 'contents'}>
-        <MultiDeviceIndicator
-          foreignActivityTick={foreignActivityTick}
-          onPeerCountChange={setPeerCount}
-        />
-        <TerminalControls
-          terminalId={terminalId}
-          onClear={() => setClearRequests((current) => ({ ...current, [terminalId]: (current[terminalId] ?? 0) + 1 }))}
-          onRecordingChange={setRecording}
-          onAttached={handleAttached}
-          voice={controlsVoiceProp}
-        />
+        {compact ? <div className="hidden"><MultiDeviceIndicator foreignActivityTick={foreignActivityTick} onPeerCountChange={setPeerCount} /></div> : (
+          <MultiDeviceIndicator
+            foreignActivityTick={foreignActivityTick}
+            onPeerCountChange={setPeerCount}
+          />
+        )}
+        {!compact && controls}
         {isCoarsePointer && <ModifierBar terminalId={terminalId} />}
         <TerminalDropZone onAttached={handleAttached} />
       </div> : null}

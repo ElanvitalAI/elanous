@@ -1,5 +1,8 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { resolve } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = resolve(import.meta.dir, '..');
 const agentTool = resolve(repoRoot, 'src/skills/tools/agent.ts');

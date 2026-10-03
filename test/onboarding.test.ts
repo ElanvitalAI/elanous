@@ -8,13 +8,16 @@
 //   4. markOnboardingComplete fires (onboarding.completed = true).
 //   5. Telegram can be skipped cleanly.
 
-import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdtempSync, rmSync, mkdirSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runOnboarding, runOnboardingStep, scriptedIO, needsOnboarding, resetOnboardingMarker, shouldRefuseInteractiveOnboarding } from '../src/onboarding';
 import { CODEX_MODELS } from '../src/codex/models';
 import { buildUserConfig, resetUserConfig } from '../src/user-config';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // Onboarding now detects real subscription logins (OB1); scripted tests pin «nothing detected».
 const NO_SUBSCRIPTION_DETECT = { detectProviders: async () => [], hasCodexCliLogin: () => false };

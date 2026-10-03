@@ -1,10 +1,11 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, readdirSync, statSync, type Dirent } from 'node:fs';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { defaultGraphsDir } from '../self-implement/graph-templates.js';
-import { handleGraphsGet } from '../nexus/api/graphs-api.js';
+import { getElanousConfigDir } from '../elanous-config-dir.js';
+import type { ExecAttachment } from './store.js';
 import { debug } from '../debug/log.js';
 
 export interface InstalledGraph {
@@ -12,7 +13,7 @@ export interface InstalledGraph {
   title: string;
   description: string;
   path: string;
-  /** 플러그인 그래프가 받는 입력 키(`examples/*.json` 표본에서) — COO 가 inputs 를 채울 수 있게. */
+  /** 코어 loop.inputs 또는 플러그인 examples/*.json 표본의 입력 키. */
   inputKeys?: string[];
 }
 export interface ExecPlanItem {
@@ -83,24 +84,41 @@ export async function installedGraphs(coreDir = defaultGraphsDir(), mineDir = jo
 }
 
 async function coreAndMineGraphs(coreDir: string, mineDir: string): Promise<InstalledGraph[]> {
-  const catalog = handleGraphsGet('/v1/graphs', coreDir, { coreDir, mineDir });
-  if (!catalog.ok) throw new Error('installed graph catalog unavailable');
-  const { graphs } = await catalog.json() as { graphs: Array<{ id: string; source: 'core' | 'mine' }> };
-  return graphs.flatMap(({ id, source }) => {
-    const dir = source === 'core' ? coreDir : mineDir;
-    if (!/^[a-z0-9-]+$/.test(id) || !existsSync(join(dir, 'recipes.yaml'))) return [];
-    let names: string[];
-    try { names = readdirSync(dir).filter(name => /\.ya?ml$/.test(name)); }
-    catch { return []; }
-    for (const name of names) {
-      const path = join(dir, name);
-      try {
-        const doc = parseYaml(readFileSync(path, 'utf8')) as { graph_id?: string; loop?: { title?: string; description?: string } };
-        if (doc?.graph_id === id) return [{ id, title: doc.loop?.title ?? id, description: doc.loop?.description ?? '', path }];
-      } catch { /* A malformed file is not an executable graph. */ }
+  const graphs: InstalledGraph[] = [];
+  const seen = new Set<string>();
+  const scan = (dir: string, core: boolean): void => {
+    let entries: Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    if (!core || dir === coreDir || entries.some(entry => entry.isFile() && entry.name === 'recipes.yaml')) {
+      for (const entry of entries) {
+        if (!entry.isFile() || !/\.ya?ml$/.test(entry.name) || entry.name === 'recipes.yaml') continue;
+        const path = join(dir, entry.name);
+        try {
+          const doc = parseYaml(readFileSync(path, 'utf8')) as {
+            graph_id?: unknown;
+            loop?: { title?: string; description?: string; exec_request?: unknown; inputs?: unknown };
+          } | null;
+          const id = doc?.graph_id;
+          if (typeof id !== 'string' || !/^[a-z0-9-]+$/.test(id) || seen.has(id)) continue;
+          if (core && doc?.loop?.exec_request !== true) continue;
+          const inputs = doc?.loop?.inputs;
+          const inputKeys = core && Array.isArray(inputs)
+            ? inputs.filter((key): key is string => typeof key === 'string')
+            : core && inputs && typeof inputs === 'object' ? Object.keys(inputs) : undefined;
+          graphs.push({ id, title: doc?.loop?.title ?? id, description: doc?.loop?.description ?? '', path,
+            ...(inputKeys ? { inputKeys } : {}) });
+          seen.add(id);
+        } catch { /* A malformed file is not an executable graph. */ }
+      }
     }
-    return [];
-  });
+    if (core) for (const entry of entries) {
+      if (entry.isDirectory() && !entry.name.startsWith('.')) scan(join(dir, entry.name), true);
+    }
+  };
+  scan(coreDir, true);
+  scan(mineDir, false);
+  return graphs;
 }
 
 export function seatTitles(path = fileURLToPath(new URL('../../scripts/coord-tracks.json', import.meta.url))): string[] {
@@ -108,8 +126,32 @@ export function seatTitles(path = fileURLToPath(new URL('../../scripts/coord-tra
   return data.tracks.flatMap(track => track.title ? [track.title] : []);
 }
 
-export async function judgeExecPlan(text: string, graphs: readonly InstalledGraph[], seats: readonly string[]): Promise<unknown> {
-  const prompt = `COO 역할. 요청을 실행 가능한 자리별 그래프로 나눠 맡겨라. JSON 배열만 출력: [{"seat":"자리","title":"할 일","graphId":"설치된 그래프 ID 또는 빈 문자열","inputs":{},"after":[]}]. 앞 항목의 결과가 있어야 할 수 있는 일(예: 점검·조사 «결과로» 쓰는 한 장 · 보고)은 after 에 그 앞 항목 번호(0부터)를 적는다 — 그 항목은 앞 항목이 끝난 뒤 그 결과를 받아 시작한다. 서로 기다릴 필요가 없으면 after 는 빈 배열. 자리 이름은 주어진 목록에서만, 그래프 ID는 설치된 목록에서만 고른다. 맞는 그래프가 없으면 graphId=""로 표시한다. 그래프에 inputKeys 가 있으면 inputs 를 그 키로만 채우되 한 줄에서 알 수 있는 값만 넣는다(모르는 값은 넣지 않는다). 그 그래프가 꼭 받아야 할 값(예: 브랜드 이름 · 사진 파일)을 한 줄에서 얻을 수 없으면 graphId=""로 두고 title 끝에 « — <무엇> 필요»를 적는다. 없는 그래프나 산출을 지어내지 마라. 바깥 게시·발행·광고·결제는 승인 노드를 거치기 전 실행하면 안 된다.\n자리: ${JSON.stringify(seats)}\n실행 가능한 그래프: ${JSON.stringify(graphs.map(({ id, title, description, inputKeys }) => ({ id, title, description, ...(inputKeys ? { inputKeys } : {}) })))}\n한 줄: ${JSON.stringify(text)}`;
+export function latestFieldFolder(configRoot = getElanousConfigDir()): string | null {
+  const root = join(configRoot, 'field');
+  let latest: { path: string; time: number } | null = null;
+  try {
+    for (const event of readdirSync(root, { withFileTypes: true })) {
+      if (!event.isDirectory() || event.name.startsWith('.')) continue;
+      const path = join(root, event.name);
+      try {
+        const photos = readdirSync(path, { withFileTypes: true }).filter(file => file.isFile() && /\.(?:png|jpe?g|webp|heic)$/i.test(file.name));
+        for (const photo of photos) {
+          const time = statSync(join(path, photo.name)).mtimeMs;
+          if (!latest || time > latest.time || (time === latest.time && path.localeCompare(latest.path) > 0)) latest = { path, time };
+        }
+      } catch { /* Unreadable event does not supply photos. */ }
+    }
+  } catch { /* No field directory. */ }
+  return latest?.path ?? null;
+}
+
+export function execPlanPrompt(text: string, graphs: readonly InstalledGraph[], seats: readonly string[], attachments: readonly ExecAttachment[] = [], fieldFolder: string | null = latestFieldFolder()): string {
+  const supplied = attachments.map(({ name, path }) => `첨부: ${name} (${/\.(?:png|jpe?g|webp|gif|heic)$/i.test(name) ? '이미지' : '파일'}) — ${path}`).join('\n');
+  return `COO 역할. 요청을 실행 가능한 자리별 그래프로 나눠 맡겨라. JSON 배열만 출력: [{"seat":"자리","title":"할 일","graphId":"설치된 그래프 ID 또는 빈 문자열","inputs":{},"after":[]}]. 앞 항목의 결과가 있어야 할 수 있는 일(예: 점검·조사 «결과로» 쓰는 한 장 · 보고)은 after 에 그 앞 항목 번호(0부터)를 적는다 — 그 항목은 앞 항목이 끝난 뒤 그 결과를 받아 시작한다. 서로 기다릴 필요가 없으면 after 는 빈 배열. 자리 이름은 주어진 목록에서만, 그래프 ID는 설치된 목록에서만 고른다. 맞는 그래프가 없으면 graphId=""로 표시한다. 그래프에 inputKeys 가 있으면 inputs 를 그 키로만 채우되 한 줄과 아래 알려진 값에서 얻을 수 있는 값만 넣는다(모르는 값은 넣지 않는다). image/photo/file 입력에는 알맞은 첨부 경로를 쓸 수 있다. folder 입력에는 첨부가 없거나 첨부 사진이 그 현장 폴더 안에 있을 때만 오늘 현장 폴더를 쓸 수 있다. 다른 현장 사진이나 출처를 모르는 업로드 사진이 있으면 폴더를 추측하지 마라. 그 그래프가 꼭 받아야 할 값(예: 브랜드 이름 · 사진 파일)을 알 수 없으면 graphId=""로 두고 title 끝에 « — <무엇> 필요»를 적는다. 단순히 묻는 말에는 없는 그래프를 지어내지 말고 graphId=""로 표시한다. 없는 그래프나 산출을 지어내지 마라. 바깥 게시·발행·광고·결제는 승인 노드를 거치기 전 실행하면 안 된다.\n자리: ${JSON.stringify(seats)}\n실행 가능한 그래프: ${JSON.stringify(graphs.map(({ id, title, description, inputKeys }) => ({ id, title, description, ...(inputKeys ? { inputKeys } : {}) })))}\n${fieldFolder ? `알려진 값: 오늘 현장 폴더 = ${fieldFolder}\n` : ''}${supplied ? `${supplied}\n` : ''}한 줄: ${JSON.stringify(text)}`;
+}
+
+export async function judgeExecPlan(text: string, graphs: readonly InstalledGraph[], seats: readonly string[], attachments: readonly ExecAttachment[] = [], fieldFolder: string | null = latestFieldFolder()): Promise<unknown> {
+  const prompt = execPlanPrompt(text, graphs, seats, attachments, fieldFolder);
   const { streamLLM } = await import('../llm.js');
   const { tierModel } = await import('../llm/model-defaults.js');
   const raw = await streamLLM([{ role: 'user', content: prompt }], () => {}, { model: tierModel('best') });
@@ -120,13 +162,17 @@ export async function planExecRequest(text: string, deps: {
   graphs?: () => Promise<InstalledGraph[]>;
   seats?: () => string[];
   judge?: typeof judgeExecPlan;
+  attachments?: readonly ExecAttachment[];
+  fieldFolder?: () => string | null;
 } = {}): Promise<ExecPlanItem[]> {
   const graphs = await (deps.graphs ?? installedGraphs)();
   const seats = (deps.seats ?? seatTitles)();
-  const raw = await (deps.judge ?? judgeExecPlan)(text, graphs, seats);
+  const attachments = deps.attachments ?? [];
+  const fieldFolder = (deps.fieldFolder ?? latestFieldFolder)();
+  const raw = await (deps.judge ?? judgeExecPlan)(text, graphs, seats, attachments, fieldFolder);
   if (!Array.isArray(raw) || raw.length === 0) throw new Error('COO 계획이 비었거나 배열이 아닙니다');
   const known = new Map(graphs.map(graph => [graph.id, graph]));
-  return raw.map((item: unknown, index: number) => {
+  const plans: ExecPlanItem[] = raw.map((item: unknown, index: number) => {
     if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('COO 계획 항목 형식 오류');
     const row = item as Record<string, unknown>;
     if (typeof row.seat !== 'string' || !seats.includes(row.seat) || typeof row.title !== 'string' || !row.title.trim()
@@ -136,11 +182,35 @@ export async function planExecRequest(text: string, deps: {
     const after = Array.isArray(row.after)
       ? [...new Set(row.after.filter((n): n is number => Number.isInteger(n) && (n as number) >= 0 && (n as number) < index))]
       : [];
+    const graph = known.get(row.graphId);
+    const inputs = { ...row.inputs as Record<string, unknown> };
+    let folderReason: string | undefined;
+    if (graph) {
+      for (const key of graph.inputKeys ?? []) {
+        if (key === 'folder') {
+          // A folder input must contain every attached photo — never guess it from «the latest event» (review r1).
+          const photos = attachments.filter(a => /\.(?:png|jpe?g|webp|gif|heic)$/i.test(a.name)).map(a => resolve(a.path));
+          const holds = (folder: string) => photos.every(photo => photo.startsWith(`${resolve(folder)}${sep}`));
+          const given = typeof inputs.folder === 'string' ? inputs.folder : undefined;
+          if (given !== undefined) {
+            if (!holds(given)) { delete inputs.folder; folderReason = `${row.seat}: folder 필요 — 첨부 사진이 그 현장 폴더 안에 없습니다`; }
+          } else if (fieldFolder && holds(fieldFolder)) inputs.folder = fieldFolder;
+          else if (photos.length) folderReason = `${row.seat}: folder 필요 — 첨부 사진의 현장 폴더를 알 수 없습니다`;
+          continue;
+        }
+        if (inputs[key] !== undefined) continue;
+        if (['image', 'photo', 'file'].includes(key)) {
+          const attachment = attachments.find(a => key === 'file' || /\.(?:png|jpe?g|webp|gif|heic)$/i.test(a.name));
+          if (attachment) inputs[key] = attachment.path;
+        }
+      }
+    }
     return {
-      seat: row.seat, title: row.title.trim(), graphId: row.graphId,
-      inputs: row.inputs as Record<string, unknown>,
+      seat: row.seat, title: row.title.trim(), graphId: row.graphId, inputs,
       ...(after.length ? { after } : {}),
-      ...(!known.has(row.graphId) ? { reason: `${row.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` } : {}),
+      ...(!graph ? { reason: `${row.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` } : folderReason ? { reason: folderReason } : {}),
     };
   });
+  for (const plan of plans) debug.log('exec.planner', 'select', { seat: plan.seat, chosen: plan.graphId, candidates: graphs.slice(0, 10).map(graph => graph.id) });
+  return plans;
 }

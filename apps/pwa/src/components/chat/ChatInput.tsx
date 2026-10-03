@@ -24,6 +24,7 @@ import { ElanousProviderChip } from '@/components/chat/ElanousProviderChip';
 import { useMissionRouter } from '@/lib/use-mission-router';
 import { DEFAULT_CHAT_ROUTING, getChatRouting, subscribeChatRouting } from '@/lib/chat-routing-storage';
 import { SeatRequestError, type SeatRequestReceipt, type SeatSummary } from '@/lib/daemon-client';
+import { debugLog } from '@/lib/debug';
 import { SeatPicker } from './SeatPicker';
 
 const INPUT_PERSIST_DEBOUNCE_MS = 300;
@@ -194,7 +195,7 @@ export function ChatInput({
   const [seatReceipts, setSeatReceipts] = useState<SeatRequestReceipt[]>([]);
   const [seatError, setSeatError] = useState('');
   const [seatPending, setSeatPending] = useState(false);
-  const retryRef = useRef<{ seat?: string; text: string; key: string } | null>(null);
+  const retryRef = useRef<{ seat?: string; text: string; attachments: AttachmentMeta[]; key: string } | null>(null);
   useEffect(() => {
     let active = true;
     // 자리 문을 모르는 클라이언트(옛 판·다른 화면의 가짜 클라이언트)면 칩 없이 채팅만 — 던지면 입력칸 전체가 멈춘다.
@@ -365,13 +366,17 @@ export function ChatInput({
     };
   }, [value, persistKey]);
 
-  const sendSeatRequest = async (request: { seat?: string; text: string; key: string }): Promise<void> => {
+  const sendSeatRequest = async (request: { seat?: string; text: string; attachments: AttachmentMeta[]; key: string }): Promise<void> => {
     setSeatPending(true);
     setSeatError('');
     try {
-      const receipt = await client.submitSeatRequest({ seat: request.seat, text: request.text }, request.key);
+      const receipt = await client.submitSeatRequest({ seat: request.seat, text: request.text,
+        ...(request.attachments.length ? { attachments: request.attachments } : {}),
+      }, request.key);
+      debugLog('pwa.seat-request.sent', { seat: receipt.seat, attachments: request.attachments.length });
       setSeatReceipts((previous) => [...previous, receipt]);
       retryRef.current = null;
+      for (const attachment of request.attachments) onRemoveAttachment?.(attachment.id);
       setValue('');
       clearSnapshot(persistKey);
     } catch (error) {
@@ -385,6 +390,10 @@ export function ChatInput({
           retryRef.current = null;
         }
         setSeatError(`그 자리를 찾지 못했습니다 — ${error.seats.map((seat) => seat.title).join(', ')}`);
+      } else if (error instanceof SeatRequestError && error.code === 'attachments-unsupported') {
+        setSeatError('이 자리는 첨부를 받지 않습니다');
+      } else if (error instanceof SeatRequestError && error.code === 'unknown-attachment') {
+        setSeatError('첨부가 만료됐습니다 — 다시 올려 주세요');
       } else {
         setSeatError('접수하지 못했습니다 — 잠시 뒤 다시');
       }
@@ -397,16 +406,22 @@ export function ChatInput({
     const trimmed = text.trim();
     const addressed = /^@\S+\s+[\s\S]*\S$/.test(text.trimEnd());
     if (disabled || seatPending) return;
-    if ((addressed || selectedSeat) && attachments.length) {
-      setSeatError('자리 요청에는 첨부파일을 보낼 수 없습니다');
+    if ((addressed || selectedSeat) && attachments.length > 4) {
+      setSeatError('자리 요청 첨부는 4개까지');
+      return;
+    }
+    if (selectedSeat && !trimmed && attachments.length) {
+      setSeatError('자리 요청 내용을 입력해 주세요');
       return;
     }
     if ((addressed || selectedSeat) && trimmed) {
       const request = addressed
-        ? { text: trimmed, key: crypto.randomUUID() }
-        : { seat: selectedSeat!, text: trimmed, key: crypto.randomUUID() };
+        ? { text: trimmed, attachments: [...attachments], key: crypto.randomUUID() }
+        : { seat: selectedSeat!, text: trimmed, attachments: [...attachments], key: crypto.randomUUID() };
       const retry = retryRef.current;
-      const same = retry && retry.seat === request.seat && retry.text === request.text;
+      const same = retry && retry.seat === request.seat && retry.text === request.text
+        && retry.attachments.length === request.attachments.length
+        && retry.attachments.every((attachment, index) => attachment.id === request.attachments[index]?.id);
       void sendSeatRequest(same ? retry : request);
       return;
     }
@@ -680,7 +695,7 @@ export function ChatInput({
   return (
     <div className="border-t border-border bg-background p-3">
       {seatReceipts.map((receipt) => <div key={receipt.receiptId} role="status" className="mb-2 rounded-md border border-border bg-card px-3 py-2 text-sm">
-        📨 {seats.find((seat) => seat.id === receipt.seat)?.title ?? receipt.seat} 접수 {receipt.receiptId} · 방금
+        📨 {seats.find((seat) => seat.id === receipt.seat)?.title ?? receipt.seat} 접수 {receipt.receiptId} · 방금 · 받음{receipt.attachments ? ` · 첨부 ${receipt.attachments}` : ''}{receipt.channel ? ` · 채널 ${receipt.channel}` : ''}
       </div>)}
       {seatError && <p role="alert" className="mb-2 text-sm text-destructive">{seatError}</p>}
       <SeatPicker seats={seats} selected={selectedSeat} onSelect={(seat) => { setSelectedSeat(seat); setSeatError(''); }} disabled={disabled || seatPending} />

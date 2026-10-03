@@ -19,6 +19,7 @@ import {
   setInProcessOutbound,
 } from './outbound-alert.js';
 import type { MissionOrigin } from '../autopilot/mission-origin.js';
+import { setUserConfigOverlay } from '../user-config.js';
 
 const TOUCHED_ENV = [
   FLUSH_LAG_WARN_MIN_ENV,
@@ -308,12 +309,16 @@ describe('sendOutbound outcome ledger', () => {
     expectOutcome('failed', text, kind);
   });
 
-  test('direct fallback success records one sent after daemon rejection', () => {
+  test('direct fallback success records one sent after daemon rejection to main home', () => {
     daemonBody = JSON.stringify({ error: 'unauthorized' });
-    expect(sendOutbound(text, kind)).toBe(true);
-    expect(outboundUrls).toHaveLength(1);
-    expect(telegramUrls).toHaveLength(1);
-    expectOutcome('sent', text, kind);
+    setUserConfigOverlay(cfg => ({ ...cfg, telegram: { ...cfg.telegram, botToken: 'main-test:token', homeChannel: 12345 } }));
+    try {
+      expect(sendOutbound(text, kind)).toBe(true);
+      expect(outboundUrls).toHaveLength(1);
+      expect(telegramUrls).toEqual(['https://api.telegram.org/botmain-test:token/sendMessage']);
+      expect(new URLSearchParams(telegramBodies[0]).get('chat_id')).toBe('12345');
+      expectOutcome('sent', text, kind);
+    } finally { setUserConfigOverlay(null); }
   });
 
   test('origin success records one sent without report fanout', () => {

@@ -138,7 +138,7 @@ test('run summary reads the last JSON object from multi-line node output', async
   expect(runs[0]?.nodes[0]?.summary).toBe('completed sk-***');
 });
 
-test('enabled owner bearer serves checklist unchanged from listChecklist', async () => {
+test('enabled owner bearer serves the listChecklist data plus the version schedule (null when unset)', async () => {
   const { dir, send } = fixture(true);
   const folder = join(dir, 'release', '0.2.9');
   mkdirSync(folder, { recursive: true });
@@ -150,7 +150,7 @@ test('enabled owner bearer serves checklist unchanged from listChecklist', async
   expect(response?.status).toBe(200);
   const body = await response?.json() as { items: Array<{ id: string }> };
   expect(body.items).toContainEqual(item);
-  expect(body).toEqual(expected);
+  expect(body as unknown).toEqual({ ...expected, schedule: null });
   expect((await send('/v1/ops/checklist?version=../../secrets', { authorization: `Bearer ${OWNER}` }))?.status).toBe(400);
 });
 
@@ -213,4 +213,15 @@ test('seats: refused without the operator signal, 400 on a bad date, and served 
     expect(board.date).toBe('2026-10-02');
     expect(board.seats.map((row) => [row.seat, row.now, row.pendingDecisions])).toEqual([['OP', null, 0], ['TC', null, 0], ['MK', null, 0], ['UX', null, 0]]);
   } finally { setSeatsCacheForTest(null); }
+});
+
+test('checklist carries the version schedule (cut · land-by) or null when none is set', async () => {
+  const { setSchedule } = await import('../../release-loop/release-schedule.js');
+  const { send } = fixture(true);
+  const headers = { 'x-elanous-operator': SECRET };
+  const before = await (await send('/v1/ops/checklist?version=0.2.10', headers))!.json() as { schedule: unknown };
+  expect(before.schedule).toBeNull();
+  setSchedule('0.2.10', { cutAt: '2026-10-03T08:00+09:00', landBy: '2026-10-03T06:30+09:00' }, 'test');
+  const after = await (await send('/v1/ops/checklist?version=0.2.10', headers))!.json() as { schedule: { cutAt: string; landBy: string | null } };
+  expect(after.schedule).toEqual({ cutAt: '2026-10-02T23:00:00.000Z', landBy: '2026-10-02T21:30:00.000Z' });
 });

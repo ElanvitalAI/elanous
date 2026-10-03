@@ -7,6 +7,7 @@ import { runModelHardcodeGate } from '../../scripts/ci-model-hardcode-gate.js';
 import { runDaemonPortGate } from '../../scripts/ci-daemon-port-gate.js';
 import { runAndroidUnitTestGate } from '../../scripts/ci-android-unit-tests.js';
 import { runIosUnitTestGate } from '../../scripts/ci-ios-unit-tests.js';
+import { runPwaBuildGate } from '../../scripts/ci-pwa-build-gate.js';
 import { runMockModuleRestoreGate } from '../../scripts/ci-mock-module-restore-gate.js';
 import { parseReviewDepthFromFilesJson } from '../agent-mission/review-depth.js';
 import { buildGateBaselineReport, calculateGateTestCountChange, formatGateBaselineNote, formatGateTestCountNote, isGateTestFile, runGateBaseline, type BaselineProcessResult, type BaselineProcessStatus, type GateTestFailure } from './gate-baseline.js';
@@ -83,6 +84,7 @@ interface SelfGateCliDeps {
   runAndroidGate?: (out: GateOutput) => number;
   /** iOS 순수-로직 시험 게이트 심(시험 주입용). */
   runIosGate?: (out: GateOutput) => number;
+  runPwaGate?: (out: GateOutput) => number;
   listPrWorktrees?: (cwd: string) => PrWorktreeListEntry[] | { lookupFailed: string };
   inspectWorktreeDirtiness?: (path: string) => { dirty: boolean } | { lookupFailed: string };
 }
@@ -619,11 +621,12 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   const androidPassed = runAdditionalGate('android-gate', deps.runAndroidGate ?? runAndroidUnitTestGate, selection.files, cwd, lines);
   // 🍎 iOS 축 — 안드로이드와 «같은 자리»에 둔다(skipTestStep 앞). Swift 만 바뀐 PR 도 여기서 조기 리턴한다.
   const iosPassed = runAdditionalGate('ios-gate', deps.runIosGate ?? runIosUnitTestGate, selection.files, cwd, lines);
+  const pwaPassed = runAdditionalGate('pwa-gate', deps.runPwaGate ?? runPwaBuildGate, selection.files, cwd, lines);
 
   if (scope.skipTestStep) {
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: androidPassed && iosPassed && policyPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: androidPassed && iosPassed && pwaPassed && policyPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles: [], unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
   }
 
   const test = (deps.runTests ?? ((dir, files) => (deps.runCommand ?? defaultRunCommand)('bun', ['test', ...files], dir)))(cwd, testFiles);
@@ -632,7 +635,7 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
     lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, `tests: pass (${testFiles.length} files)`));
     const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
     logGateCliBaseline(cwd, { ...ZERO_GATE_BASELINE, unrunImporterTotal, lookupFailed: importerLookupFailed });
-    return { exitCode: policyPassed && androidPassed && iosPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
+    return { exitCode: policyPassed && androidPassed && iosPassed && pwaPassed ? 0 : 1, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
   }
 
   if (worktreeLog.includes('deterministic environment setup failed')) lines.push(worktreeLog);
@@ -653,6 +656,6 @@ export function runSelfGateCli(cwd: string, options: SelfGateCliOptions = {}, de
   });
   lines.push(formatPartialObservationNote(unrunImporterTotal ?? 0, formatGateBaselineNote(report, unrunImporterTotal ?? 0)));
   const policyPassed = runPolicyGates(selection.files, cwd, lines, deps);
-  const exitCode = !androidPassed || !iosPassed || !policyPassed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
+  const exitCode = !androidPassed || !iosPassed || !pwaPassed || !policyPassed || report.introduced > 0 || report.unknown > 0 || report.preconditionUnmet > 0 ? 1 : 0;
   return { exitCode, lines, changedFiles: selection.files, testFiles, unverified: scope.unverified, documentPaths: scope.documentPaths, documentsWithoutDerivedTests: scope.documentsWithoutDerivedTests };
 }

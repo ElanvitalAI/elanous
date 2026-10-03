@@ -1,4 +1,4 @@
-import { test, expect, describe } from 'bun:test';
+import { setDefaultTimeout, test, expect, describe } from 'bun:test';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1097,6 +1097,10 @@ describe('cronRepoRoot', () => {
 
 // 🆕 2026-09-24 R3 — 설치본 current 로 cd 하는 줄도 정규.
 import { installedCronRoot, scheduleHealth as scheduleHealthR3, buildCronLine as buildCronLineR3 } from './schedule-registry.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
+
 describe('schedule health — installed current path is canonical too', () => {
   const now = new Date('2026-09-24T08:00:00Z');
   const row = (raw: string) => ({ id: 'a', name: 'a', cron: '*/5 * * * *', command: 'scripts/x.ts', raw, run_via: 'elanous', enabled: 1, last_run: now.toISOString(), last_status: 'ok' }) as never;

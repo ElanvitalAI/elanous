@@ -1,8 +1,11 @@
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { unknownCronFlag } from '../src/domains/cron-flag-contract.js';
 import { auditCronFlags } from './cron-flag-audit.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const script = new URL('./signal-router-cycle.ts', import.meta.url).pathname;
 const scriptPath = 'scripts/signal-router-cycle.ts';

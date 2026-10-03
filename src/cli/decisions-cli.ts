@@ -1,4 +1,5 @@
 import type { Command } from 'commander';
+import { projectDecisionsToLinear } from '../decisions/decision-linear-projection.js';
 import { DecisionLedger, importDecisionMarkdown, type DecisionCategory, type DecisionLedgerOptions, type DecisionOption, type DecisionTrack, type DecisionEntry } from '../decisions/decision-ledger.js';
 
 const repeat = (value: string, values: string[]) => [...values, value];
@@ -49,22 +50,31 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
   const root = program.command('decisions').description('대표 결정 원장 · 로컬 전용');
   const emit = (value: unknown, json?: boolean, text?: string) => out.log(json ? JSON.stringify(value) : text ?? JSON.stringify(value));
   const fail = (action: () => void) => { try { action(); } catch (e) { throw new Error(`decisions: ${e instanceof Error ? e.message : String(e)}`); } };
+  root.command('linear-sync').description('열린 결정을 COO Linear 프로젝트에 투영하고 닫힌 결정을 동기화한다')
+    .option('--dry-run').option('--json')
+    .action(async (o: { dryRun?: boolean; json?: boolean }) => {
+      const result = await projectDecisionsToLinear({ stateDir: config.stateDir, dryRun: o.dryRun });
+      emit(result, o.json, result.reason ?? `생성 ${result.created} · 닫음 ${result.closed} · 건너뜀 ${result.skipped} · 실패 ${result.failed}${result.plan?.length ? `\n${result.plan.map(p => `${p.action} ${p.decisionId}${p.issue ? ` ${p.issue}` : ''}`).join('\n')}` : ''}`);
+    });
   root.command('raise').description('SCQA·선택지와 권고로 결정 항목을 올린다')
     .requiredOption('--title <text>').requiredOption('--category <category>')
     .requiredOption('--s <text>').requiredOption('--c <text>').option('--q <text>').option('--a <text>')
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])
     .option('--recommend <key>').option('--why <text>').option('--skip-recommend <reason>')
     .option('--track <track>').option('--agent <agent>').option('--session <id>')
+    .option('--resume-question <qid>').option('--run <runId>')
     .option('--ref <url>', '참조 (반복)', repeat, [] as string[])
     .option('--due <when>', '기한 — UTC ISO(2026-10-04T09:00:00Z) 또는 +Nh(지금부터 N시간) · 기한 2시간 전 텔레그램·디스코드로 다시 알린다')
     .option('--json')
-    .action((o: { due?: string; title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; track?: DecisionTrack; agent?: string; session?: string; ref: string[]; json?: boolean }) => fail(() => {
+    .action((o: { due?: string; title: string; category: DecisionCategory; s: string; c: string; q?: string; a?: string; option: string[]; recommend?: string; why?: string; skipRecommend?: string; track?: DecisionTrack; agent?: string; session?: string; resumeQuestion?: string; run?: string; ref: string[]; json?: boolean }) => fail(() => {
+      if (o.run !== undefined && o.resumeQuestion === undefined) throw new Error('--run requires --resume-question');
       if (o.skipRecommend !== undefined && (o.recommend !== undefined || o.why !== undefined)) throw new Error('choose recommendation or skip, not both');
       if (o.skipRecommend === undefined && (!o.recommend || !o.why)) throw new Error('--recommend and --why required, or --skip-recommend <reason>');
       const options: DecisionOption[] = o.option.map(parseOption);
       const entry = new DecisionLedger(config).raise({ title: o.title, category: o.category, scqa: { s: o.s, c: o.c, ...(o.q ? { q: o.q } : {}), ...(o.a ? { a: o.a } : {}) }, options,
         recommendation: o.skipRecommend !== undefined ? { skipped: true, reason: o.skipRecommend } : { option: o.recommend!, why: o.why! },
         raisedBy: { agent: agent(o.agent), ...(o.track ? { track: o.track } : {}), ...(o.session ? { session: o.session } : {}) }, ...(o.ref.length ? { refs: o.ref } : {}),
+        ...(o.resumeQuestion !== undefined ? { resume: { questionId: o.resumeQuestion, ...(o.run !== undefined ? { runId: o.run } : {}) } } : {}),
         ...(o.due ? { dueAt: dueAt(o.due) } : {}) });
       emit(entry, o.json, `올림: ${formatDecisionRow(entry)}`);
     }));
@@ -83,8 +93,20 @@ export function registerDecisionsCommands(program: Command, config: DecisionLedg
       if (o.auto && !o.delegation?.trim()) throw new Error('--auto requires --delegation');
       if (!o.auto && (o.delegation || o.track || o.agent)) throw new Error('delegation/track/agent require --auto');
       const by = o.auto ? { kind: 'auto' as const, agent: agent(o.agent), delegation: o.delegation!, ...(o.track ? { track: o.track } : {}) } : { kind: 'human' as const };
-      const entry = new DecisionLedger(config).decide(id, choice, by, o.note);
-      emit(entry, o.json, `결정: ${formatDecisionDetail(entry)}`);
+      const { entry, delivery } = new DecisionLedger(config).decideWithDelivery(id, choice, by, o.note);
+      if (delivery && !delivery.ok) {
+        // The decision is recorded; only the answer to the waiting run failed — say so and how to retry, never «success».
+        const hint = `⚠ 답 전달 실패(${delivery.questionId} · ${delivery.reason}) — 결정은 기록됐다 · 다시: elanous decisions retry-answer ${entry.id}`;
+        emit({ ...entry, delivery }, o.json, `결정: ${formatDecisionDetail(entry)}\n${hint}`);
+        process.exitCode = 3;
+        return;
+      }
+      emit(delivery ? { ...entry, delivery } : entry, o.json, `결정: ${formatDecisionDetail(entry)}`);
+    }));
+  root.command('retry-answer <id>').description('기록된 결정의 대기 질문 답 전달만 재시도한다').option('--json')
+    .action((id: string, o: { json?: boolean }) => fail(() => {
+      const entry = new DecisionLedger(config).retryAnswer(id);
+      emit(entry, o.json, `답 전달: ${entry.id} → ${entry.resume?.questionId}`);
     }));
   root.command('add-options <id>').description('선택지가 미기재된 과거 항목에 확인된 선택지를 추가')
     .requiredOption('--option <key=label:consequence>', '선택지 (두 번 이상)', repeat, [] as string[])

@@ -3,16 +3,13 @@ import { join } from 'node:path';
 
 import { elanousStateRoot } from '../autopilot/state-paths.js';
 import { ASK_USER_QUESTION_DELIVERY_VALUES } from './types.js';
-import type { AskUserQuestionRequest, AskUserQuestionResult, HitlDelivery, QuestionOption } from './types.js';
+import type { AskUserQuestionRequest, AskUserQuestionResult, HitlDelivery, Question, QuestionOption } from './types.js';
 
-interface PendingQuestion {
+export interface PendingQuestion {
   id: string;
   sessionId?: string;
-  questions: Array<{
-    id: string;
-    question: string;
-    options: QuestionOption[];
-  }>;
+  runId?: string;
+  questions: Array<Pick<Question, 'id' | 'question' | 'options' | 'impact' | 'recommendedIndex'>>;
   startedAt: string;
   expiresAt?: string;
   surface: 'tui' | 'file';
@@ -86,6 +83,7 @@ function isPendingQuestion(value: unknown): value is PendingQuestion {
   const pending = value as Record<string, unknown>;
   return typeof pending.id === 'string'
     && (pending.sessionId === undefined || typeof pending.sessionId === 'string')
+    && (pending.runId === undefined || typeof pending.runId === 'string')
     && Array.isArray(pending.questions)
     && pending.questions.every((question) => {
       if (question === null || typeof question !== 'object' || Array.isArray(question)) return false;
@@ -93,7 +91,10 @@ function isPendingQuestion(value: unknown): value is PendingQuestion {
       return typeof record.id === 'string'
         && typeof record.question === 'string'
         && Array.isArray(record.options)
-        && record.options.every(isQuestionOption);
+        && record.options.every(isQuestionOption)
+        && (record.impact === undefined || record.impact === 'low' || record.impact === 'medium' || record.impact === 'high' || record.impact === 'critical')
+        && (record.recommendedIndex === undefined || (typeof record.recommendedIndex === 'number'
+          && Number.isInteger(record.recommendedIndex)));
     })
     && isIsoTimestamp(pending.startedAt)
     && (pending.surface === 'tui' || pending.surface === 'file')
@@ -111,7 +112,15 @@ function isPendingQuestion(value: unknown): value is PendingQuestion {
 function parsePendingQuestion(contents: string, file: string): PendingQuestion {
   const value: unknown = JSON.parse(contents);
   if (!isPendingQuestion(value)) throw new Error(`Invalid pending question record: ${file}`);
-  return value;
+  return {
+    ...value,
+    questions: value.questions.map((question) => ({
+      ...question,
+      ...(question.recommendedIndex !== undefined
+        && (question.recommendedIndex < 0 || question.recommendedIndex >= question.options.length)
+        ? { recommendedIndex: undefined } : {}),
+    })),
+  };
 }
 
 export function isAskUserQuestionResult(value: unknown): value is AskUserQuestionResult {
@@ -176,7 +185,13 @@ export function createPendingQuestion(
   return {
     id,
     ...(sessionId === undefined ? {} : { sessionId }),
-    questions: request.questions.map(({ id, question, options }) => ({ id, question, options })),
+    ...(request.runId === undefined ? {} : { runId: request.runId }),
+    questions: request.questions.map(({ id, question, options, impact, recommendedIndex }) => ({
+      id, question, options,
+      ...(impact === undefined ? {} : { impact }),
+      ...(recommendedIndex !== undefined && Number.isInteger(recommendedIndex) && recommendedIndex >= 0 && recommendedIndex < options.length
+        ? { recommendedIndex } : {}),
+    })),
     startedAt: (deps.now ?? (() => new Date()))().toISOString(),
     ...(presentation.expiresAt === undefined ? {} : { expiresAt: presentation.expiresAt }),
     surface: presentation.surface,

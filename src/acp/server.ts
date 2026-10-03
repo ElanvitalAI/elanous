@@ -101,6 +101,8 @@ import { readOriginSessionMeta } from './origin-session-meta.js';
 import type { CodexPlugin } from './codex-plugins.js';
 import { flattenMcpServersToCodexConfig } from './codex-approval-adapter.js';
 import { runAcpTurn } from './turn-runner.js';
+import type { AcpPermissionApprovalRequest } from './client.js';
+import { createAcpSessionApprovalPolicy, type AcpToolApprovalResult } from './tool-approval.js';
 import { projectPwaToolResult, type ToolResultMeta } from '../nexus/api/meta-api.js';
 import type { LlmBrand } from '../llm-vision-capability.js';
 import {
@@ -233,6 +235,9 @@ export interface AcpServerOptions {
    *  receives the user message text and a push() for streaming back
    *  assistant chunks. When omitted, the server echoes the prompt. */
   runTurn?: (ctx: AcpTurnContext) => Promise<void>;
+  /** PCH-2b — ask the client before write/shell tools run ('ask', default).
+   *  'off' keeps the host's own approvals (the in-process TUI dashboard). */
+  toolApproval?: 'ask' | 'off';
   /** ACP standalone entry: require session cwd or an explicit boot default. */
   requireSessionToolCwd?: boolean;
   bootToolCwd?: string;
@@ -850,6 +855,8 @@ export interface AcpTurnContext {
     toolArgs?: Record<string, unknown>;
     timeoutMs?: number;
   }) => Promise<AcpApprovalDecision>;
+  /** The session-scoped gate used by core-turn tool dispatchers. */
+  approveTool?: (req: Parameters<AcpTurnContext['requestApproval']>[0]) => Promise<AcpToolApprovalResult>;
 }
 
 /** F1 — Phase 3 · resolved decision from `AcpTurnContext.requestApproval`.
@@ -865,6 +872,14 @@ export type AcpApprovalDecision =
 /** F1 — default approval timeout. 60s matches hermes'
  *  `_PERMISSION_DEFAULT_TIMEOUT_S`; overrideable per call. */
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 60_000;
+
+export {
+  acpToolDenialResult,
+  createAcpSessionApprovalPolicy,
+  requiresAcpToolApproval,
+  type AcpToolApprovalResult,
+  type AcpToolDenialReason,
+} from './tool-approval.js';
 
 /** ACP streaming Phase E (PLAN-pwa-webterm-voice-control v1.2 · 2026-05-07) —
  *  module-level handle to the broadcaster owned by the active runAcpServer
@@ -991,6 +1006,7 @@ interface AcpServerContext {
   /** One skip diagnostic per session, cleared when its last peer leaves. */
   plainEnvelopeLogged: Set<string>;
   dualRole: DualRoleManager;
+  approvalPolicy: ReturnType<typeof createAcpSessionApprovalPolicy>;
   /** Mints the unique suffix of a new session id. Injected so tests can
    *  pin it deterministically — production wires `mintAcpSessionToken`. */
   nextSessionToken: () => string;
@@ -1054,7 +1070,7 @@ function wireAcpConnection(
   stream: ReturnType<typeof ndJsonStream>,
   ctx: AcpServerContext,
 ): AgentSideConnection {
-  const { sessions, sessionPeers, awarePeers, plainEnvelopeLogged, dualRole, opts } = ctx;
+  const { sessions, sessionPeers, awarePeers, plainEnvelopeLogged, dualRole, approvalPolicy, opts } = ctx;
   // 2026-05-13 (M2 of AskUserQuestion cross-surface) — bound connection
   // widened to expose `extMethod` + `extNotification` (SDK's elanous
   // extension escape hatch). pushAskRequest / pushAskCancel route through
@@ -1771,7 +1787,9 @@ function wireAcpConnection(
         );
       };
       const requestApproval: AcpTurnContext['requestApproval'] = async (approvalReq) => {
-        const timeoutMs = approvalReq.timeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS;
+        const timeoutMs = approvalReq.timeoutMs
+          ?? (await import('../user-config.js')).getUserConfig().acp.toolApproval?.timeoutMs
+          ?? DEFAULT_APPROVAL_TIMEOUT_MS;
         const optionBase = `${approvalReq.toolCallId}-`;
         const options = [
           { optionId: `${optionBase}allow-once`, name: 'Allow once', kind: 'allow_once' as const },
@@ -1787,6 +1805,8 @@ function wireAcpConnection(
           },
           options,
         });
+        // A late rejection after the timeout won the race must not go unhandled.
+        permissionPromise.catch(() => undefined);
         let timer: ReturnType<typeof setTimeout> | null = null;
         const timeoutPromise = new Promise<'timeout'>((resolve) => {
           timer = setTimeout(() => resolve('timeout'), timeoutMs);
@@ -1972,6 +1992,7 @@ function wireAcpConnection(
         }
       }
 
+      const rejectedThisTurn = new Set<string>();
       const turnCtx: AcpTurnContext = {
         sessionId: req.sessionId,
         cwd: s.cwd,
@@ -1987,6 +2008,10 @@ function wireAcpConnection(
         pushSessionUpdate,
         pushUsage,
         requestApproval,
+        ...(opts.toolApproval !== 'off'
+          ? { approveTool: (approvalReq: Parameters<AcpTurnContext['requestApproval']>[0]) =>
+              approvalPolicy.resolve(req.sessionId, approvalReq, requestApproval, rejectedThisTurn) }
+          : {}),
       };
 
       // RC — intercept hook runs first. Lets the host treat the
@@ -2020,6 +2045,20 @@ function wireAcpConnection(
             chatId: req.sessionId,
             cwd: s.cwd,
             codexArgs: s.codexArgs,
+            ...(turnCtx.approveTool ? {
+              // PCH-2b — codex asks this turn's ACP client instead of auto-approving.
+              permissionApprover: async (approvalReq: AcpPermissionApprovalRequest) => {
+                if (s.aborted) return false;
+                const decision = await turnCtx.approveTool!({
+                  toolCallId: `codex-${randomBytes(6).toString('hex')}`,
+                  // «codex exec» · «codex network» · «codex mcp» — allow-always is per kind.
+                  toolName: /^codex [a-z]+/.exec(approvalReq.title)?.[0] ?? `codex ${approvalReq.kind ?? 'action'}`,
+                  ...(approvalReq.rawInput && typeof approvalReq.rawInput === 'object' && !Array.isArray(approvalReq.rawInput)
+                    ? { toolArgs: approvalReq.rawInput as Record<string, unknown> } : {}),
+                });
+                return decision.allowed && !s.aborted;
+              },
+            } : {}),
             streamer: { edit: (text) => { void push(text); } },
           });
         } else if (opts.runTurn) {
@@ -2169,8 +2208,8 @@ function wireAcpConnection(
         const adopted = matches.find((match) => match.pt.isAlive);
         const existing = sameSession?.isAlive ? sameSession : adopted?.pt;
         if (existing) {
+          registerPreviewTerminalForWebTap(existing, p.sessionId, tid, handle);
           if (existing !== sameSession && adopted) {
-            registerPreviewTerminalForWebTap(existing, p.sessionId, tid, handle);
             debug.log('webterm.acp', 'spawn.adopt', {
               terminalId: tid, fromSessions: adopted.sessionIds, toSession: p.sessionId,
             });
@@ -2207,10 +2246,10 @@ function wireAcpConnection(
           // appear duplicated. Pinning TERM to xterm-256color matches
           // the actual rendering surface and makes the redraws idempotent.
           termName: 'xterm-256color',
-          // ★ P0b-2 (실행 substrate 통합·기본 off) — 이 진짜 PWA/iOS 라이브 셸을 공유 registry 버스로
-          //   흡수(정체성·크로스서피스 goto·3-스택 통합). 라이브 렌더(yazi/마우스/커서/alt-screen) 검증이
-          //   기기 왕복을 요하므로 per-run env 로만 켠다(대표가 별도 부팅해 수습). 미설정=기존 dup-fd(무회귀).
-          useRegistry: process.env.ELANOUS_PREVIEW_TERMINAL_REGISTRY === '1',
+          // The shared PTY bus delivers output to PreviewTerminal's headless
+          // renderer and ACP taps. The direct /dev/fd duplicate can observe
+          // shell exit without ever reading its prompt (black web terminal).
+          useRegistry: true,
           ...(typeof p.shell === 'string' && p.shell.length > 0 ? { shell: p.shell } : {}),
           onExit: () => {
             void import('../web-terminal/preview-tap-registry.js')
@@ -3343,6 +3382,7 @@ function wireAcpConnection(
       if (remaining === 0) {
         sessionPeers.delete(sid);
         plainEnvelopeLogged.delete(sid);
+        approvalPolicy.clearSession(sid);
       }
       if (debug.enabled) {
         debug.log('acp.peer.unregister', sid, { remainingPeers: remaining });
@@ -3487,6 +3527,7 @@ export async function runAcpServer(opts: AcpServerOptions = {}): Promise<void> {
     awarePeers,
     plainEnvelopeLogged,
     dualRole,
+    approvalPolicy: createAcpSessionApprovalPolicy(),
     nextSessionToken: mintAcpSessionToken,
     agentName: opts.agentName ?? 'elanous-agent',
     agentVersion: opts.agentVersion ?? readPkgVersion(),

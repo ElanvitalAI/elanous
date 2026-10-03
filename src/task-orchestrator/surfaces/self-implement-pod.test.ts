@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../../debug/log.js';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { gunzipSync, gzipSync } from 'node:zlib';
@@ -2264,6 +2264,10 @@ describe('pod run-origin env (RFC run-origin §A3)', () => {
 
 // P2·P3·P4 (2026-09-26 Pod 실물 미션에서 나온 셋).
 import { join as pjoin } from 'node:path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
+
 describe('pod remote continuity', () => {
   const jwt = (expSec: number) => `h.${Buffer.from(JSON.stringify({ exp: expSec })).toString('base64url')}.s`;
   test('P4: the elanous copy carries the checked codex token, never a stale store token or any refresh token', () => {

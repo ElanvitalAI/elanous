@@ -182,3 +182,28 @@ test('next.md lines added in range become IN lines tied to their landing; feat c
   const empty = run('HEAD');
   expect(JSON.parse(empty.stdout).escalate).toContainEqual({ kind: 'notes-empty', featFixLandings: 1, nextMdLines: 0 });
 }, 60_000);
+
+test('next.md lines already present at the baseline shipped earlier and are not carried into this release', () => {
+  const root = mkdtempSync(join(tmpdir(), 'release-cutoff-nextmd-carry-'));
+  scratch.push(root);
+  const repo = join(root, 'repo');
+  const state = join(root, 'state');
+  mkdirSync(join(repo, 'release/public/docs'), { recursive: true });
+  mkdirSync(state);
+  git(repo, 'init', '-q');
+  git(repo, 'config', 'user.name', 'Test');
+  git(repo, 'config', 'user.email', 'test@example.test');
+  writeFileSync(join(repo, 'release/public/docs/cli.md'), '## `elanous a`\n');
+  writeFileSync(join(repo, 'release/next.md'), '# Next\n\n## Feat\n\n- feat — Shipped last time. Documentation: none. Target: next.\n\n## Fix\n');
+  const baseline = commit(repo, 'previous release');
+  writeFileSync(join(repo, 'release/next.md'), '# Next\n\n## Feat\n\n- feat — Shipped last time. Documentation: none. Target: next.\n- feat — New this time. Documentation: none. Target: next.\n\n## Fix\n');
+  const sha = commit(repo, 'new (#12)');
+  const result = spawnSync('bun', [resolve(import.meta.dir, 'cutoff.ts'), '--version', '9.9.9', '--baseline', baseline, '--cutoff', 'HEAD', '--json'], {
+    cwd: repo, encoding: 'utf8', timeout: 60_000,
+    env: { ...process.env, HOME: root, ELANOUS_STATE_DIR: state, ELANOUS_CONFIG_DIR: state, ELANOUS_NEXUS_DIR: state },
+  });
+  expect(result.status).toBe(0);
+  const json = JSON.parse(result.stdout);
+  expect(json.in.filter((entry: { kind: string }) => entry.kind === 'feat').map((entry: { sha: string; line: string }) => [entry.sha, entry.line])).toEqual([[sha, 'New this time.']]);
+  expect(json.fragments).toEqual({ byPr: 0, byNextMd: 1, unlinked: 0, unknown: 0 });
+}, 60_000);

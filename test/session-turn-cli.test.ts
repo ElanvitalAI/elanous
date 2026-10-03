@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +8,9 @@ import { startNexusHttpServer, type NexusHttpServer } from '../src/nexus/api/htt
 import { NexusEventBus } from '../src/nexus/api/event-bus.js';
 import { createNexusState } from '../src/nexus/state/state.js';
 import { TabRegistry } from '../src/nexus/state/tab-registry.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = join(import.meta.dir, '..');
 const token = 'session-turn-test-token';

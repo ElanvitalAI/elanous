@@ -621,3 +621,21 @@ describe('pending AskUserQuestion observation', () => {
     expect(JSON.parse(json[0]!)).toMatchObject({ ok: true, questions: [{ id: 'json-wait', waitingMs: 1500 }] });
   });
 });
+
+test('HITL1 H3: impact, recommended index and runId round-trip; an out-of-range index is dropped', async () => {
+  const pq = await import('../../src/ask-user-question/pending-questions.js');
+  const root = mkdtempSync(join(tmpdir(), 'pq-h3-'));
+  try {
+    const options = [{ label: 'Keep', description: 'k' }, { label: 'Widen', description: 'w' }];
+    const question = pq.createPendingQuestion('auq:h3:abcde', { runId: 'run-x', questions: [{ id: 'scope', header: 'Scope', question: 'Widen?', options, impact: 'high', recommendedIndex: 1 }] },
+      undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T00:00:00.000Z' });
+    pq.writePendingQuestion(question, { root: () => root });
+    const read = pq.readPendingQuestions({ root: () => root });
+    expect(read.ok).toBe(true);
+    if (!read.ok) return;
+    expect(read.questions[0]).toMatchObject({ runId: 'run-x', questions: [{ impact: 'high', recommendedIndex: 1 }] });
+    const bad = pq.createPendingQuestion('auq:h3:fghij', { questions: [{ id: 'scope', header: 'Scope', question: 'Widen?', options, recommendedIndex: 5 }] },
+      undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T00:00:00.000Z' });
+    expect(bad.questions[0]).not.toHaveProperty('recommendedIndex');
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

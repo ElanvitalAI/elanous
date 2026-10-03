@@ -25,7 +25,7 @@ function log(s: string): void {
 
 const results = runRepoWatchCycle({
   // 흡수 제안 리포트 발송(report 채널 · 야간무음 게이트 · fail-soft).
-  notify: (report) => { try { log(`발송 ${sendOutbound(report, 'report') ? 'OK' : '실패'}`); } catch (e) { log(`발송 오류: ${e instanceof Error ? e.message : String(e)}`); } },
+  notify: (report) => { try { log(`발송 ${sendOutbound(report, 'ops-report') ? 'OK' : '실패'}`); } catch (e) { log(`발송 오류: ${e instanceof Error ? e.message : String(e)}`); } },
   // 자율행동 회상 기록(loop=autopilot).
   record: (input) => { recordAutonomousActionSafe({ loop: 'autopilot', ...input }); },
 });

@@ -182,7 +182,7 @@ export function decideAndObserveClarification(
     impact: candidate.impact,
     action: decision.action,
     reason: decision.reason,
-    recommendedOption: decision.recommendedOption,
+    ...(context.phase === 'execution' ? {} : { recommendedOption: decision.recommendedOption }),
     budgetUsed: context.budget.used,
     budgetLimit: context.budget.limit,
   });
@@ -210,6 +210,8 @@ export function toAskUserQuestionRequest(decision: ClarificationDecision): AskUs
     header: 'Direction',
     question: `${candidate.prompt}\n\nRecommended: ${decision.recommendedOption}. ${candidate.whyNow}`,
     options: candidate.options.map(({ recommended: _recommended, ...option }) => option),
+    impact: candidate.impact,
+    recommendedIndex: candidate.options.findIndex(option => option.recommended),
     includeOther: true,
   };
   return { questions: [question] };

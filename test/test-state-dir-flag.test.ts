@@ -298,6 +298,59 @@ describe('setTestStateRoot / nexusRootDir · state-only override', () => {
     expect(nexusRootDir()).toBe(join(getElanousConfigDir(), 'nexus'));
   });
 
+  it('boots an isolated config without reading a missing operating home config', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-isolated-no-prod-config-'));
+    const home = join(root, 'home');
+    const isolated = join(root, '.elanous-test');
+    mkdirSync(home);
+    try {
+      const source = join(process.cwd(), 'src/cli/test-state-dir-flag.ts');
+      const configPaths = join(process.cwd(), 'src/nexus/config/paths.ts');
+      const result = spawnSync('bun', ['-e', [
+        `import { applyIsolatedRoot } from ${JSON.stringify(source)};`,
+        `import { userConfigPath } from ${JSON.stringify(configPaths)};`,
+        `applyIsolatedRoot(${JSON.stringify(isolated)});`,
+        'console.log(userConfigPath());',
+      ].join('\n')], {
+        cwd: process.cwd(), encoding: 'utf8',
+        env: { ...process.env, HOME: home, NODE_ENV: 'production' },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).not.toContain('config 분기 실패');
+      expect(result.stdout.trim()).toBe(join(isolated, 'config.json'));
+      expect(existsSync(join(home, '.elanous', 'config.json'))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the existing test-safe config copy when an operating config exists', () => {
+    const root = mkdtempSync(join(tmpdir(), 'elanous-isolated-with-prod-config-'));
+    const home = join(root, 'home');
+    const prod = join(home, '.elanous');
+    const isolated = join(root, '.elanous-test');
+    mkdirSync(prod, { recursive: true });
+    const original = JSON.stringify({ telegram: { enabled: true, botToken: 'PROD-TOKEN' }, discord: { enabled: true } });
+    writeFileSync(join(prod, 'config.json'), original);
+    try {
+      const source = join(process.cwd(), 'src/cli/test-state-dir-flag.ts');
+      const result = spawnSync('bun', ['-e', [
+        `import { applyIsolatedRoot } from ${JSON.stringify(source)};`,
+        `applyIsolatedRoot(${JSON.stringify(isolated)});`,
+      ].join('\n')], {
+        cwd: process.cwd(), encoding: 'utf8',
+        env: { ...process.env, HOME: home, NODE_ENV: 'production' },
+      });
+      expect(result.status).toBe(0);
+      expect(existsSync(join(isolated, 'config.json'))).toBe(true);
+      expect(JSON.parse(require('node:fs').readFileSync(join(isolated, 'config.json'), 'utf8')).discord.enabled).toBe(false);
+      expect(require('node:fs').readFileSync(join(isolated, 'config.json'), 'utf8')).not.toContain('PROD-TOKEN');
+      expect(require('node:fs').readFileSync(join(prod, 'config.json'), 'utf8')).toBe(original);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('global --test status finds and stop terminates a live isolated daemon', async () => {
     const repo = mkdtempSync(join(tmpdir(), 'elanous-nexus-cli-'));
     const testRoot = join(realpathSync(repo), '.elanous-test');
@@ -335,7 +388,7 @@ describe('setTestStateRoot / nexusRootDir · state-only override', () => {
       });
       expect(status.status).toBe(0);
       expect(status.stdout).toContain(`root      ${join(testRoot, 'nexus')}`);
-      expect(status.stdout).toContain(`status    lock alive, http silent (pid=${lock.pid}`);
+      expect(status.stdout).toContain(`status    alive (pid=${lock.pid}`);
 
       const stop = spawnSync('bun', [elanousBin, '--test', 'nexus', 'stop'], {
         cwd: repo,

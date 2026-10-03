@@ -10,10 +10,11 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { LogRow } from '@/nexus/client';
-import { clockTime, DECISION_KINDS, foldForRole, LIVE_STAGES, LIVE_STAGE_LABEL, type DecisionKind, type DecisionLine, type LiveBoardData, type LiveRun } from '@/lib/live-signals';
+import { clockTime, decisionKind, DECISION_KINDS, foldForRole, LIVE_STAGES, LIVE_STAGE_LABEL, type DecisionKind, type DecisionLine, type LiveBoardData, type LiveRun } from '@/lib/live-signals';
 import type { PwaRole } from '@/lib/pwa-role';
 import { buildJudgmentGraph, newDecisionKeys, stepForces, type GraphNode, type JudgmentGraph } from '@/lib/live-graph';
 import { gateTally, histogram, modelSiteHeatmap, modelTicker, planPieces, podDispatches, runEventKinds, runSpans, runUniverses, stageLoad, stageRetries, usageCandles, usageRequests, type UsageReq } from '@/lib/live-v5';
+import { publicDecisionText, publicEventLabel, publicNodeLabel, publicRunLabel, publicUniverseLabel, publicSiteLabel, publicModelLabel } from '@/lib/stage-public';
 
 export const KIND_COLOR: Record<DecisionKind, string> = {
   PLAN: '#38bdf8',
@@ -61,7 +62,7 @@ export interface LiveMaxStageProps {
   sourceLabel?: string;
   /** SHIPPED 가 어디서 왔나 — `github`(병합 PR 수) · `log`(판단 이벤트 · 옛 데몬). */
   shippedSource?: 'github' | 'log';
-  /** 공개 캡처 — 과금 환산 칸을 숨기고 아래 띠에 표시한다(가림 자체는 줄 단계에서). */
+  /** 공개 캡처 — 원본 줄을 보존하면서 화면에 싣는 표지와 과금 환산 칸을 가린다. */
   publicCapture?: boolean;
   /** 무대를 열면 리플레이 한 바퀴(기본 켬 · 시험은 끈다). */
   autoReplay?: boolean;
@@ -102,6 +103,24 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
   };
 
   const reqs = useMemo(() => usageRequests(rows), [rows]);
+  const eventLabels = useMemo(() => {
+    const labels = new Map<DecisionLine, string>();
+    const emittedKinds = new Set(rows.filter((row) => row.category === 'harness.decision').map(decisionKind).filter((kind): kind is DecisionKind => kind !== null));
+    const byEvent = new Map<string, string[]>();
+    for (const row of [...rows].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts))) {
+      const kind = decisionKind(row);
+      if (!kind || (row.category !== 'harness.decision' && emittedKinds.has(kind))) continue;
+      const key = `${row.ts}|${kind}`;
+      const matches = byEvent.get(key) ?? [];
+      matches.push(row.category === 'harness.decision' ? publicDecisionText(kind) : publicEventLabel(row.category, row.event));
+      byEvent.set(key, matches);
+    }
+    for (const line of board.stream) {
+      labels.set(line, byEvent.get(`${line.ts}|${line.kind}`)?.pop() ?? publicDecisionText(line.kind));
+    }
+    return labels;
+  }, [board.stream, rows]);
+  const streamLabel = (line: DecisionLine) => eventLabels.get(line) ?? publicDecisionText(line.kind);
   const derived = useMemo(() => {
     const now = Date.now();
     const windowMs = windowMinutes * 60_000;
@@ -125,6 +144,14 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
       retries: stageRetries(rows),
     };
   }, [reqs, rows, board, windowMinutes]);
+  const stableRunIds = useRef<string[]>([]);
+  for (const run of board.snapshot.runs) if (!stableRunIds.current.includes(run.runId)) stableRunIds.current.push(run.runId);
+  for (const line of board.stream) if (line.runId && !stableRunIds.current.includes(line.runId)) stableRunIds.current.push(line.runId);
+  const runLabel = (id: string) => {
+    if (!stableRunIds.current.includes(id)) stableRunIds.current.push(id);
+    return publicRunLabel(id, stableRunIds.current.indexOf(id));
+  };
+  const graphRunIds = stableRunIds;
   const modelColor = useMemo(() => {
     const m = new Map<string, string>();
     derived.ticker.forEach((t, i) => m.set(t.model, MODEL_PALETTE[i % MODEL_PALETTE.length]!));
@@ -337,8 +364,8 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
         if (!LABELED.has(n.kind)) continue;
         const c = P(n.id)!;
         ctx.fillStyle = n.kind === 'harness' ? '#eef2ff' : n.kind === 'phase' ? 'rgba(199,210,254,.65)' : 'rgba(226,232,240,.82)';
-        ctx.font = n.kind === 'harness' ? '600 12px ui-monospace, SFMono-Regular, monospace' : '10px ui-monospace, SFMono-Regular, monospace';
-        const label = n.kind === 'harness' ? 'ELANOUS HARNESS' : n.kind === 'phase' ? n.label : n.label.toUpperCase();
+        ctx.font = publicCapture ? '600 14px ui-monospace, SFMono-Regular, monospace' : n.kind === 'harness' ? '600 12px ui-monospace, SFMono-Regular, monospace' : '10px ui-monospace, SFMono-Regular, monospace';
+        const label = publicCapture ? (n.kind === 'model' ? publicModelLabel(n.label) : publicNodeLabel(n, graphRunIds.current)) : n.kind === 'harness' ? 'ELANOUS HARNESS' : n.kind === 'phase' ? n.label : n.label.toUpperCase();
         ctx.fillText(label, c.x + RADIUS[n.kind] + 4, c.y + 3);
       }
       if (!reduce) raf = requestAnimationFrame(draw);
@@ -354,7 +381,7 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
     canvas.addEventListener('click', click);
     return () => { cancelAnimationFrame(raf); canvas.removeEventListener('click', click); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onSelectRun]);
+  }, [onSelectRun, publicCapture]);
 
   const g = board.gauges;
   const best = bestRun(board);
@@ -371,24 +398,24 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
       {/* ① 위 띠 A — 워드마크 · LIVE · 판단 요약 흐름 · 시계 */}
       <div className="flex items-center gap-3 rounded-md border border-indigo-400/10 bg-slate-950/60 px-2 py-1">
         <span className="shrink-0 text-xl tracking-tight text-slate-50" style={{ fontFamily: 'Georgia, "Times New Roman", serif' }}>Elanous</span>
-        <span className="hidden shrink-0 font-mono text-[11px] sm:inline lg:text-[10.5px] tracking-[.18em] text-indigo-200/80">× HARNESS · 판단</span>
-        <Badge tone="live">● LIVE</Badge>
+        <span className={`hidden shrink-0 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} sm:inline ${publicCapture ? 'text-sm' : 'lg:text-[10.5px]'} tracking-[.18em] text-indigo-200/80`}>× HARNESS · 판단</span>
+        <Badge publicCapture={publicCapture} tone="live">● LIVE</Badge>
         <div className="min-w-0 flex-1">
-          <Ticker ariaLabel="판단 띠" bare items={board.stream.slice(0, 16).map((s, i) => (
-            <span key={`${s.ts}-${i}`} className="mx-4 whitespace-nowrap"><span style={{ color: KIND_COLOR[s.kind] }}>▸ {s.kind}</span> <span className="text-slate-300">{s.what}</span>{s.target && <span className="text-slate-500"> → {s.target}</span>}</span>
+          <Ticker publicCapture={publicCapture} ariaLabel="판단 띠" bare items={board.stream.slice(0, 16).map((s, i) => (
+            <span key={`${s.ts}-${i}`} className={publicCapture ? 'mx-4 whitespace-normal' : 'mx-4 whitespace-nowrap'}><span style={{ color: KIND_COLOR[s.kind] }}>▸ {publicCapture ? '판단' : s.kind}</span> <span className="text-slate-300">{publicCapture ? streamLabel(s) : s.what}</span>{!publicCapture && s.target && <span className="text-slate-500"> → {s.target}</span>}</span>
           ))} />
         </div>
         <span className="shrink-0 font-mono text-lg tabular-nums text-slate-200" suppressHydrationWarning>{clock}</span>
       </div>
       {/* ② 위 띠 B — 모델별 요청 ▲▼ · 런 · 병합 */}
-      <Ticker ariaLabel="모델 띠" slow items={[
+      <Ticker publicCapture={publicCapture} ariaLabel="모델 띠" slow items={[
         <span key="live" className="mx-4 whitespace-nowrap"><span className="text-rose-300">● LIVE RUNS</span> {g.live}</span>,
         <span key="ship" className="mx-4 whitespace-nowrap"><span className="text-emerald-300">SHIPPED</span> {g.shipped}</span>,
         <span key="dpm" className="mx-4 whitespace-nowrap"><span className="text-indigo-300">DECISIONS/MIN</span> {g.decisionsPerMin}</span>,
         <span key="burn" className="mx-4 whitespace-nowrap"><span className="text-indigo-300">BURN/MIN</span> {compact(g.burnTokensPerMin)}</span>,
         ...derived.ticker.map((t) => (
-          <span key={t.model} className="mx-4 whitespace-nowrap">
-            <span style={{ color: modelColor(t.model) }}>{t.model.toUpperCase()}</span>{' '}
+          <span key={t.model} className={publicCapture ? 'mx-4 whitespace-normal' : 'mx-4 whitespace-nowrap'}>
+            <span style={{ color: modelColor(t.model) }}>{publicCapture ? publicModelLabel(t.model) : t.model.toUpperCase()}</span>{' '}
             <span className={t.delta > 0 ? 'text-emerald-300' : t.delta < 0 ? 'text-rose-300' : 'text-slate-400'}>{t.delta > 0 ? '▲' : t.delta < 0 ? '▼' : '■'}</span>{' '}
             {t.count} req · {compact(t.tokens)} tok
           </span>
@@ -397,49 +424,49 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
 
       {/* ③④⑤ 영웅 셋 */}
       <div className="grid grid-cols-12 gap-1.5">
-        <Panel className="col-span-12 lg:col-span-4" title="SHIPPED · 병합된 PR" stat={`${shippedSource === 'github' ? 'GITHUB' : 'LOG'} · ${windowMinutes >= 60 ? `${windowMinutes / 60}H` : `${windowMinutes}M`}`}>
+        <Panel publicCapture={publicCapture} className="col-span-12 lg:col-span-4" title="SHIPPED · 병합된 PR" stat={`${shippedSource === 'github' ? 'GITHUB' : 'LOG'} · ${windowMinutes >= 60 ? `${windowMinutes / 60}H` : `${windowMinutes}M`}`}>
           <div className="flex items-end gap-3">
             <Big value={g.shipped} accent={KIND_COLOR.SHIP} />
             <div className="mb-3 flex flex-col gap-1">
-              <Badge tone="ok">MERGED</Badge>
-              {g.selfHealRuns > 0 && <Badge tone="heal">SELF-HEALED</Badge>}
-              {board.snapshot.counters.blocked > 0 && <Badge tone="bad">BLOCKED {board.snapshot.counters.blocked}</Badge>}
+              <Badge publicCapture={publicCapture} tone="ok">MERGED</Badge>
+              {g.selfHealRuns > 0 && <Badge publicCapture={publicCapture} tone="heal">SELF-HEALED</Badge>}
+              {board.snapshot.counters.blocked > 0 && <Badge publicCapture={publicCapture} tone="bad">BLOCKED {board.snapshot.counters.blocked}</Badge>}
             </div>
           </div>
           <div className="mt-1 grid grid-cols-3 gap-2 border-t border-indigo-400/10 pt-2">
-            <Small label="SELF-HEAL" value={g.selfHealRate === null ? '—' : `${g.selfHealRate}%`} color={KIND_COLOR.HEAL} />
-            <Small label="RUNS" value={String(board.snapshot.runs.length)} color="#c7d2fe" />
-            <Small label="DECISIONS" value={String(g.decisions)} color={KIND_COLOR.PLAN} />
+            <Small publicCapture={publicCapture} label="SELF-HEAL" value={g.selfHealRate === null ? '—' : `${g.selfHealRate}%`} color={KIND_COLOR.HEAL} />
+            <Small publicCapture={publicCapture} label="RUNS" value={String(board.snapshot.runs.length)} color="#c7d2fe" />
+            <Small publicCapture={publicCapture} label="DECISIONS" value={String(g.decisions)} color={KIND_COLOR.PLAN} />
           </div>
         </Panel>
-        <Panel className="col-span-12 lg:col-span-4" title={best?.why === 'merged' ? 'BEST RUN · 오늘 최고의 런' : 'NOW · 지금 런'} stat={cycleRun ? `R ${board.rounds[cycleRun.runId] ?? 0}/3` : '—'}>
+        <Panel publicCapture={publicCapture} className="col-span-12 lg:col-span-4" title={best?.why === 'merged' ? 'BEST RUN · 오늘 최고의 런' : 'NOW · 지금 런'} stat={cycleRun ? `R ${board.rounds[cycleRun.runId] ?? 0}/3` : '—'}>
           {cycleRun ? (
             <button type="button" className="block w-full text-left" onClick={() => onSelectRun?.(cycleRun.runId)} data-live-v5-best>
               <div className="flex items-center gap-2">
-                <span className="font-mono text-[11px] text-slate-400">{role === 'owner' ? cycleRun.runId : '런'}</span>
-                {best?.why === 'merged' ? <Badge tone="ok">VERIFIED · MERGED{cycleRun.pr ? ` #${cycleRun.pr}` : ''}</Badge> : <Badge tone="live">IN FLIGHT</Badge>}
+                <span className={`font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} text-slate-400`}>{publicCapture ? runLabel(cycleRun.runId) : role === 'owner' ? cycleRun.runId : '런'}</span>
+                {best?.why === 'merged' ? <Badge publicCapture={publicCapture} tone="ok">VERIFIED · MERGED{cycleRun.pr ? (publicCapture ? ' PR' : ` #${cycleRun.pr}`) : ''}</Badge> : <Badge publicCapture={publicCapture} tone="live">IN FLIGHT</Badge>}
               </div>
               <div className="mt-1 flex items-baseline gap-3">
-                <span className="font-mono text-6xl font-semibold tabular-nums text-indigo-100" style={{ textShadow: '0 0 24px #818cf888' }}>{cycleRun.pr ? `#${cycleRun.pr}` : cycleRun.current ? LIVE_STAGE_LABEL[cycleRun.current] : '—'}</span>
-                <span className="font-mono text-xs text-slate-400">{cycleRun.events} signals · 라운드 {board.rounds[cycleRun.runId] ?? 0}</span>
+                <span className="font-mono text-6xl font-semibold tabular-nums text-indigo-100" style={{ textShadow: '0 0 24px #818cf888' }}>{cycleRun.pr ? (publicCapture ? 'PR' : `#${cycleRun.pr}`) : cycleRun.current ? LIVE_STAGE_LABEL[cycleRun.current] : '—'}</span>
+                <span className={`font-mono ${publicCapture ? 'text-sm' : 'text-xs'} text-slate-400`}>{cycleRun.events} signals · 라운드 {board.rounds[cycleRun.runId] ?? 0}</span>
               </div>
               <div className="mt-2 flex flex-wrap gap-1">
                 {bestChips.map((s) => {
                   const tone = cycleRun.stages[s];
-                  return <Badge key={s} tone={tone === 'bad' ? 'bad' : tone === 'ok' ? 'ok' : 'dim'}>{LIVE_STAGE_LABEL[s]}{tone === 'ok' ? ' ✓' : tone === 'bad' ? ' ✗' : ''}</Badge>;
+                  return <Badge publicCapture={publicCapture} key={s} tone={tone === 'bad' ? 'bad' : tone === 'ok' ? 'ok' : 'dim'}>{LIVE_STAGE_LABEL[s]}{tone === 'ok' ? ' ✓' : tone === 'bad' ? ' ✗' : ''}</Badge>;
                 })}
               </div>
             </button>
-          ) : <p className="py-6 text-xs text-slate-500">이 창에 런 신호가 없다 — ▶ REPLAY 로 최근 판단을 본다.</p>}
+          ) : <p className={`py-6 ${publicCapture ? 'text-sm' : 'text-xs'} text-slate-500`}>이 창에 런 신호가 없다 — ▶ REPLAY 로 최근 판단을 본다.</p>}
         </Panel>
-        <Panel className="col-span-12 lg:col-span-4" title={`LLM · ${derived.bucketMin}분 봉 ⊕ 요청 창`} stat={`${reqs.length} REQ · ${compact(reqTokens)} TOK`}>
+        <Panel publicCapture={publicCapture} className="col-span-12 lg:col-span-4" title={`LLM · ${derived.bucketMin}분 봉 ⊕ 요청 창`} stat={`${reqs.length} REQ · ${compact(reqTokens)} TOK`}>
           <div className="grid grid-cols-5 gap-2">
-            <Candles candles={derived.candles} color={modelColor} unit={`/${derived.bucketMin}M`} className="col-span-3" />
-            <ul className="col-span-2 h-28 space-y-0.5 overflow-hidden font-mono text-[11px] lg:text-[10px]" data-live-v5-book>
+            <Candles publicCapture={publicCapture} candles={derived.candles} color={modelColor} unit={`/${derived.bucketMin}M`} className="col-span-3" />
+            <ul className={`col-span-2 ${publicCapture ? 'min-h-28' : 'h-28'} space-y-0.5 ${publicCapture ? 'overflow-visible' : 'overflow-hidden'} font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'}`} data-live-v5-book>
               {reqs.slice(0, 10).map((r, i) => (
-                <li key={`${r.ts}-${i}`} className={`relative flex justify-between gap-1 overflow-hidden px-1 ${i === 0 ? 'live-line-in' : ''}`}>
+                <li key={`${r.ts}-${i}`} className={`relative flex justify-between gap-1 ${publicCapture ? 'overflow-visible' : 'overflow-hidden'} px-1 ${i === 0 ? 'live-line-in' : ''}`}>
                   <span className="absolute inset-y-0 right-0 opacity-20" style={{ width: `${((r.input + r.output) / topBook) * 100}%`, background: modelColor(r.model) }} />
-                  <span className="relative truncate" style={{ color: modelColor(r.model) }}>{r.model}</span>
+                  <span className={publicCapture ? "relative whitespace-normal break-words" : "relative truncate"} style={{ color: modelColor(r.model) }}>{publicCapture ? publicModelLabel(r.model) : r.model}</span>
                   <span className="relative tabular-nums text-slate-300">{compact(r.input + r.output)}</span>
                 </li>
               ))}
@@ -450,20 +477,20 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
       </div>
 
       {/* ⑥ 실행 사이클 */}
-      <Panel title="EXECUTION CYCLE · 하니스 한 바퀴" stat={`${cycleRun ? `ROUND ${board.rounds[cycleRun.runId] ?? 0}/3 · ` : ''}NEXT ${nextIn}S`}>
+      <Panel publicCapture={publicCapture} title="EXECUTION CYCLE · 하니스 한 바퀴" stat={`${cycleRun ? `ROUND ${board.rounds[cycleRun.runId] ?? 0}/3 · ` : ''}NEXT ${nextIn}S`}>
         <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-6">
           {LIVE_STAGES.map((s, i) => {
             const hot = cycleRun ? cycleRun.current === s : derived.load.busiest === s;
             const tone = cycleRun?.stages[s];
             return (
               <div key={s} data-live-v5-stage={s} data-hot={hot ? '1' : undefined} className={`rounded-md border px-3 py-2 ${hot ? 'live-v5-hot' : ''}`} style={hot ? { borderColor: '#a78bfa', boxShadow: '0 0 18px #a78bfa66, inset 0 0 18px #a78bfa33', background: 'rgba(124,58,237,.28)' } : { borderColor: 'rgba(99,102,241,.18)', background: 'rgba(2,6,23,.55)' }}>
-                <div className="flex justify-between font-mono text-[11px] lg:text-[10px] text-slate-400">
+                <div className={`flex justify-between font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'} text-slate-400`}>
                   <span>{String(i + 1).padStart(2, '0')}</span>
                   {tone && <span style={{ color: TONE_COLOR[tone] }}>{tone === 'ok' ? '✓' : tone === 'bad' ? '✗' : '●'}</span>}
                 </div>
                 <div className="flex items-baseline justify-between">
                   <span className={hot ? 'text-sm font-semibold text-white' : 'text-sm text-slate-300'}>{LIVE_STAGE_LABEL[s]}</span>
-                  <span className="font-mono text-xs tabular-nums text-slate-400" title="지금 이 단계에 있는 런">{derived.load.counts[s]}</span>
+                  <span className={`font-mono ${publicCapture ? 'text-sm' : 'text-xs'} tabular-nums text-slate-400`} title="지금 이 단계에 있는 런">{derived.load.counts[s]}</span>
                 </div>
               </div>
             );
@@ -473,61 +500,61 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
 
       {/* ⑦ 판단 그래프 ⊕ ⑧ 통계 상자 */}
       <div className="grid grid-cols-12 gap-1.5">
-        <Panel className="relative col-span-12 xl:col-span-10" title="JUDGMENT GRAPH · FORCE" stat={`NODES ${graphSize.nodes} · EDGES ${graphSize.edges}`} bodyClass="p-0" hot>
+        <Panel publicCapture={publicCapture} className="relative col-span-12 xl:col-span-10" title="JUDGMENT GRAPH · FORCE" stat={`NODES ${graphSize.nodes} · EDGES ${graphSize.edges}`} bodyClass="p-0" hot>
           <canvas ref={canvasRef} className="h-[370px] w-full bg-[radial-gradient(ellipse_at_center,rgba(79,70,229,.26),rgba(2,6,23,.96)_70%)]" aria-label="판단 그래프" />
-          <div className="pointer-events-none absolute left-3 top-9 flex flex-col gap-0.5 rounded-md bg-slate-950/60 p-2 font-mono text-[11px] lg:text-[10px]">
-            {kindCounts.map(({ k, n }) => <span key={k} style={{ color: KIND_COLOR[k] }}>● {k} <span className="text-slate-400">{n}</span></span>)}
+          <div className={`pointer-events-none absolute left-3 top-9 flex flex-col gap-0.5 rounded-md bg-slate-950/60 p-2 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'}`}>
+            {kindCounts.map(({ k, n }) => <span key={k} style={{ color: KIND_COLOR[k] }}>● {publicCapture ? publicDecisionText(k) : k} <span className="text-slate-400">{n}</span></span>)}
           </div>
           <button
             type="button"
             onClick={replay}
             disabled={replaying || board.stream.length === 0}
             data-elanous-action="live-replay"
-            className="absolute bottom-3 right-3 rounded-full border border-indigo-400/40 bg-slate-950/70 px-3 py-1 font-mono text-[11px] lg:text-[10px] text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40"
+            className={`absolute bottom-3 right-3 rounded-full border border-indigo-400/40 bg-slate-950/70 px-3 py-1 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'} text-indigo-200 hover:bg-indigo-500/20 disabled:opacity-40`}
             title="이 창의 판단을 옛것부터 빨리 감기(최근 40)"
           >
             {replaying ? `REPLAY · ${queueRef.current.length}` : '▶ REPLAY'}
           </button>
-          {card && <DecisionCard item={card.item} folding={card.folding} role={role} />}
+          {card && <DecisionCard item={card.item} folding={card.folding} role={role} publicCapture={publicCapture} runLabel={runLabel} />}
         </Panel>
-        <Panel className="col-span-12 xl:col-span-2" title="STATS" stat={`${nextIn}S`}>
+        <Panel publicCapture={publicCapture} className="col-span-12 xl:col-span-2" title="STATS" stat={`${nextIn}S`}>
           <dl className="grid grid-cols-2 gap-x-2 gap-y-1.5 font-mono" data-live-v5-stats>
-            <Stat label="PATHS" value={board.stream.reduce((s, d) => s + (d.paths ?? 0), 0) || '—'} />
-            <Stat label="CONV" value={board.convergence.length ? `${board.convergence.filter((c) => c.points.at(-1)?.asks === 0).length}/${board.convergence.length}` : '—'} />
-            <Stat label="ROUNDS AVG" value={rounds.length ? (rounds.reduce((a, b) => a + b, 0) / rounds.length).toFixed(1) : '—'} />
-            <Stat label="DECISIONS/MIN" value={g.decisionsPerMin} />
-            <Stat label="SIGNALS" value={rows.length} />
-            <Stat label="LLM REQ" value={reqs.length} />
-            {publicCapture ? <Stat label="MODELS" value={derived.ticker.length} /> : <Stat label="API ≈ USD" value={`$${apiUsd.toFixed(2)}`} />}
-            <Stat label="NEXT POLL" value={`${nextIn}s`} />
+            <Stat publicCapture={publicCapture} label="PATHS" value={board.stream.reduce((s, d) => s + (d.paths ?? 0), 0) || '—'} />
+            <Stat publicCapture={publicCapture} label="CONV" value={board.convergence.length ? `${board.convergence.filter((c) => c.points.at(-1)?.asks === 0).length}/${board.convergence.length}` : '—'} />
+            <Stat publicCapture={publicCapture} label="ROUNDS AVG" value={rounds.length ? (rounds.reduce((a, b) => a + b, 0) / rounds.length).toFixed(1) : '—'} />
+            <Stat publicCapture={publicCapture} label="DECISIONS/MIN" value={g.decisionsPerMin} />
+            <Stat publicCapture={publicCapture} label="SIGNALS" value={rows.length} />
+            <Stat publicCapture={publicCapture} label="LLM REQ" value={reqs.length} />
+            {publicCapture ? <Stat publicCapture={publicCapture} label="MODELS" value={derived.ticker.length} /> : <Stat publicCapture={publicCapture} label="API ≈ USD" value={`$${apiUsd.toFixed(2)}`} />}
+            <Stat publicCapture={publicCapture} label="NEXT POLL" value={`${nextIn}s`} />
           </dl>
         </Panel>
       </div>
 
       {/* ⑨ 히트맵 · ⑩ 분포 · ⑪ 수렴 ⊕ 게이트 · ⑫ 실행 로그(한 화면 1920×1080 에 들어가게 아래 줄 넷째 칸으로) */}
       <div className="grid grid-cols-12 gap-1.5">
-        <Panel className="col-span-12 md:col-span-6 xl:col-span-3" title="MODEL × SITE · 요청 수" stat={`MAX ${derived.heat.max}`}>
-          <Heat heat={derived.heat} color={modelColor} />
+        <Panel publicCapture={publicCapture} className="col-span-12 md:col-span-6 xl:col-span-3" title="MODEL × SITE · 요청 수" stat={`MAX ${derived.heat.max}`}>
+          <Heat heat={derived.heat} color={modelColor} publicCapture={publicCapture} />
         </Panel>
-        <Panel className="col-span-12 md:col-span-6 xl:col-span-3" title="DISTRIBUTION · 런 소요 ⊕ 요청 토큰" stat={`${derived.spans} RUNS · ${reqs.length} REQ`}>
+        <Panel publicCapture={publicCapture} className="col-span-12 md:col-span-6 xl:col-span-3" title="DISTRIBUTION · 런 소요 ⊕ 요청 토큰" stat={`${derived.spans} RUNS · ${reqs.length} REQ`}>
           <div className="grid grid-cols-2 gap-2">
-            <Hist hist={derived.hist} label={(v) => `${v.toFixed(0)}분`} />
-            <Hist hist={derived.tokHist} label={(v) => compact(10 ** v)} />
+            <Hist publicCapture={publicCapture} hist={derived.hist} label={(v) => `${v.toFixed(0)}분`} />
+            <Hist publicCapture={publicCapture} hist={derived.tokHist} label={(v) => compact(10 ** v)} />
           </div>
         </Panel>
-        <Panel className="col-span-12 md:col-span-6 xl:col-span-3" title="CONVERGENCE · must-fix ⊕ GATE" stat={`${board.convergence.length} PR`}>
+        <Panel publicCapture={publicCapture} className="col-span-12 md:col-span-6 xl:col-span-3" title="CONVERGENCE · must-fix ⊕ GATE" stat={`${board.convergence.length} PR`}>
           <div className="grid grid-cols-3 gap-2">
-            <div className="col-span-2"><Convergence series={board.convergence} /></div>
-            <GateBars pass={derived.gate.pass} fail={derived.gate.fail} verdicts={board.snapshot.reviewVerdicts} />
+            <div className="col-span-2"><Convergence publicCapture={publicCapture} series={board.convergence} /></div>
+            <GateBars publicCapture={publicCapture} pass={derived.gate.pass} fail={derived.gate.fail} verdicts={board.snapshot.reviewVerdicts} />
           </div>
         </Panel>
-        <Panel className="col-span-12 md:col-span-6 xl:col-span-3" title="EXECUTION LOG · LIVE" stat={`${board.stream.length}`} bodyClass="px-2 py-1">
-          <ul className="h-[124px] space-y-0.5 overflow-hidden font-mono text-[11px] lg:text-[10.5px]" data-live-max-stream>
+        <Panel publicCapture={publicCapture} className="col-span-12 md:col-span-6 xl:col-span-3" title="EXECUTION LOG · LIVE" stat={`${board.stream.length}`} bodyClass="px-2 py-1">
+          <ul className={`${publicCapture ? 'min-h-[124px]' : 'h-[124px]'} space-y-0.5 ${publicCapture ? 'overflow-visible' : 'overflow-hidden'} font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10.5px]'}`} data-live-max-stream>
             {board.stream.slice(0, 9).map((s, i) => (
               <li key={`${s.ts}-${i}`} className={`flex gap-1.5 ${i === 0 ? 'live-line-in' : ''}`} style={s.kind === 'SHIP' ? { textShadow: `0 0 10px ${KIND_COLOR.SHIP}` } : undefined}>
                 <span className="shrink-0 text-slate-500" title={s.ts}>{clockTime(s.ts)}</span>
-                <span className="w-14 shrink-0 rounded px-1 text-center" style={{ color: KIND_COLOR[s.kind], background: `${KIND_COLOR[s.kind]}1f` }}>{s.kind}</span>
-                <span className="truncate">{s.what}{s.target && <span className="text-slate-500"> → {s.target}</span>}</span>
+                <span className="w-14 shrink-0 rounded px-1 text-center" style={{ color: KIND_COLOR[s.kind], background: `${KIND_COLOR[s.kind]}1f` }}>{publicCapture ? '판단' : s.kind}</span>
+                <span className={publicCapture ? "whitespace-normal break-words" : "truncate"}>{publicCapture ? streamLabel(s) : s.what}{!publicCapture && s.target && <span className="text-slate-500"> → {s.target}</span>}</span>
               </li>
             ))}
             {board.stream.length === 0 && <li className="text-slate-500">이 창에 판단 신호가 없다.</li>}
@@ -536,9 +563,9 @@ export function LiveMaxStage({ board, rows = NO_ROWS, windowMinutes = 60, source
       </div>
 
       {/* ⑬ 아래 띠 */}
-      <div className="flex flex-wrap gap-x-6 gap-y-1 rounded-md border border-indigo-400/10 bg-slate-950/60 px-3 py-1 font-mono text-[11px] lg:text-[10px] text-slate-400">
+      <div className={`flex flex-wrap gap-x-6 gap-y-1 rounded-md border border-indigo-400/10 bg-slate-950/60 px-3 py-1 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'} text-slate-400`}>
         <span>STACK <span className="text-slate-200">elanous-core</span></span>
-        <span>SOURCE <span className="text-slate-200">{sourceLabel}</span></span>
+        <span>SOURCE <span className="text-slate-200">{publicCapture ? publicUniverseLabel(sourceLabel) : sourceLabel}</span></span>
         <span>SIGNALS <span className="text-slate-200">{rows.length}</span></span>
         <span>LLM <span className="text-slate-200">{reqs.length} req</span></span>
         <span>EMITTED <span className="text-slate-200">{board.emitted}</span></span>
@@ -554,15 +581,15 @@ function compact(n: number): string {
 }
 
 /** 칸 — 머리 `▸ 대문자 모노` ⊕ 오른쪽 위 작은 수. `hot` 이면 «지금» 칸(보라 광채 테두리 · 화면에 한두 칸만). */
-function Panel({ title, stat, children, className = '', bodyClass = 'p-2.5', hot = false }: { title: string; stat?: string; children: React.ReactNode; className?: string; bodyClass?: string; hot?: boolean }) {
+function Panel({ title, stat, children, className = '', bodyClass = 'p-2.5', hot = false, publicCapture }: { title: string; stat?: string; children: React.ReactNode; className?: string; bodyClass?: string; hot?: boolean; publicCapture: boolean }) {
   return (
     <section
-      className={`overflow-hidden rounded-lg border bg-slate-950/70 ${className}`}
+      className={`${publicCapture ? 'overflow-visible' : 'overflow-hidden'} rounded-lg border bg-slate-950/70 ${className}`}
       style={hot ? { borderColor: 'rgba(167,139,250,.7)', boxShadow: '0 0 22px #a78bfa33' } : { borderColor: 'rgba(99,102,241,.16)' }}
       aria-label={title}
       data-live-v5-panel={title}
     >
-      <header className="flex items-center justify-between border-b border-indigo-400/10 px-2.5 py-1 font-mono text-[11px] lg:text-[10.5px] tracking-[.08em] text-slate-400">
+      <header className={`flex items-center justify-between border-b border-indigo-400/10 px-2.5 py-1 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10.5px]'} tracking-[.08em] text-slate-400`}>
         <span>▸ {title}</span>
         {stat && <span className="tabular-nums text-slate-300">{stat}</span>}
       </header>
@@ -571,37 +598,37 @@ function Panel({ title, stat, children, className = '', bodyClass = 'p-2.5', hot
   );
 }
 
-function Badge({ tone, children }: { tone: 'live' | 'ok' | 'bad' | 'heal' | 'dim'; children: React.ReactNode }) {
+function Badge({ tone, children, publicCapture }: { tone: 'live' | 'ok' | 'bad' | 'heal' | 'dim'; children: React.ReactNode; publicCapture: boolean }) {
   const c = tone === 'ok' ? KIND_COLOR.SHIP : tone === 'bad' ? KIND_COLOR.ESCALATE : tone === 'heal' ? KIND_COLOR.HEAL : tone === 'dim' ? '#a5b4fc' : '#f0abfc';
   return (
-    <span className={`inline-block whitespace-nowrap rounded px-1.5 py-0.5 font-mono text-[11px] lg:text-[10px] font-semibold tracking-wider ${tone === 'live' ? 'live-v5-blink' : ''}`} style={{ color: c, background: `${c}22`, boxShadow: `inset 0 0 0 1px ${c}66` }}>
+    <span className={`inline-block ${publicCapture ? 'whitespace-normal' : 'whitespace-nowrap'} rounded px-1.5 py-0.5 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'} font-semibold tracking-wider ${tone === 'live' ? 'live-v5-blink' : ''}`} style={{ color: c, background: `${c}22`, boxShadow: `inset 0 0 0 1px ${c}66` }}>
       {children}
     </span>
   );
 }
 
-function Small({ label, value, color }: { label: string; value: string; color: string }) {
+function Small({ label, value, color, publicCapture }: { label: string; value: string; color: string; publicCapture: boolean }) {
   return (
     <div>
-      <div className="font-mono text-[11px] lg:text-[9.5px] tracking-widest text-slate-500">{label}</div>
+      <div className={`font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[9.5px]'} tracking-widest text-slate-500`}>{label}</div>
       <div className="font-mono text-3xl font-semibold tabular-nums" style={{ color, textShadow: `0 0 14px ${color}55` }}>{value}</div>
     </div>
   );
 }
 
-function Stat({ label, value }: { label: string; value: string | number }) {
+function Stat({ label, value, publicCapture }: { label: string; value: string | number; publicCapture: boolean }) {
   return (
     <div className="border-b border-indigo-400/10 pb-1">
-      <dt className="text-[11px] lg:text-[9.5px] tracking-widest text-slate-500">{label}</dt>
+      <dt className={`${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[9.5px]'} tracking-widest text-slate-500`}>{label}</dt>
       <dd className="text-lg font-semibold tabular-nums text-indigo-100">{value}</dd>
     </div>
   );
 }
 
 /** 흐르는 띠 — 같은 목록을 두 번 이어 붙여 끊김 없이 흐른다(`prefers-reduced-motion` 이면 멈춘다). */
-function Ticker({ items, ariaLabel, slow = false, bare = false }: { items: React.ReactNode[]; ariaLabel: string; slow?: boolean; bare?: boolean }) {
+function Ticker({ items, ariaLabel, slow = false, bare = false, publicCapture }: { items: React.ReactNode[]; ariaLabel: string; slow?: boolean; bare?: boolean; publicCapture: boolean }) {
   return (
-    <div className={`relative overflow-hidden font-mono text-[11px] ${bare ? '' : 'rounded-md border border-indigo-400/10 bg-slate-950/60 py-1'}`} aria-label={ariaLabel}>
+    <div className={`relative overflow-hidden font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${bare ? '' : 'rounded-md border border-indigo-400/10 bg-slate-950/60 py-1'}`} aria-label={ariaLabel}>
       {items.length === 0 ? <span className="px-3 text-slate-500">—</span> : (
         <div className="live-v5-marquee flex w-max" style={{ animationDuration: `${Math.max(30, items.length * (slow ? 9 : 6))}s` }}>
           <div className="flex">{items}</div>
@@ -640,11 +667,11 @@ function Big({ value, accent }: { value: number; accent: string }) {
 }
 
 /** 분당 봉 — 막대 = 요청 수, 모델 색으로 쌓는다. */
-function Candles({ candles, color, unit, className = '' }: { candles: ReturnType<typeof usageCandles>; color: (m: string) => string; unit: string; className?: string }) {
+function Candles({ candles, color, unit, className = '', publicCapture }: { candles: ReturnType<typeof usageCandles>; color: (m: string) => string; unit: string; className?: string; publicCapture: boolean }) {
   const top = Math.max(1, ...candles.map((c) => c.count));
   const W = 240; const H = 120; const bw = W / candles.length;
-  return (
-    <svg viewBox={`0 0 ${W} ${H}`} className={`h-28 w-full ${className}`} data-live-v5-candles aria-label="분당 LLM 요청">
+  const chart = (
+    <svg viewBox={`0 0 ${W} ${H}`} className={publicCapture ? 'h-28 w-full' : `h-28 w-full ${className}`} data-live-v5-candles aria-label="분당 LLM 요청">
       {[0.25, 0.5, 0.75].map((f) => <line key={f} x1={0} x2={W} y1={H * f} y2={H * f} stroke="#1e293b" strokeDasharray="2 3" />)}
       {candles.map((c, i) => {
         let y = H;
@@ -654,21 +681,23 @@ function Candles({ candles, color, unit, className = '' }: { candles: ReturnType
           return <rect key={`${i}-${m}`} x={i * bw + 1} y={y} width={Math.max(1, bw - 2)} height={h} fill={color(m)} opacity={0.85} />;
         });
       })}
-      <text x={W - 2} y={10} fill="#64748b" fontSize={8} fontFamily="monospace" textAnchor="end">{top}{unit}</text>
+      {!publicCapture && <text x={W - 2} y={10} fill="#64748b" fontSize={8} fontFamily="monospace" textAnchor="end">{top}{unit}</text>}
     </svg>
   );
+  if (!publicCapture) return chart;
+  return <div className={className}>{chart}<span className="block break-words font-mono text-sm text-slate-400">{top}{unit}</span></div>;
 }
 
-function Heat({ heat, color }: { heat: ReturnType<typeof modelSiteHeatmap>; color: (m: string) => string }) {
-  if (heat.models.length === 0) return <p className="py-6 text-xs text-slate-500">이 창에 요청이 없다.</p>;
+function Heat({ heat, color, publicCapture }: { heat: ReturnType<typeof modelSiteHeatmap>; color: (m: string) => string; publicCapture: boolean }) {
+  if (heat.models.length === 0) return <p className={`py-6 ${publicCapture ? 'text-sm' : 'text-xs'} text-slate-500`}>이 창에 요청이 없다.</p>;
   const level = (n: number) => (n === 0 ? 0 : Math.min(5, Math.ceil((n / Math.max(1, heat.max)) * 5)));
   return (
-    <table className="w-full border-separate border-spacing-0.5 font-mono text-[11px] lg:text-[10px]" data-live-v5-heat>
-      <thead><tr><th />{heat.sites.map((s) => <th key={s} className="max-w-16 truncate font-normal text-slate-500">{s}</th>)}</tr></thead>
+    <table className={`w-full border-separate border-spacing-0.5 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'}`} data-live-v5-heat>
+      <thead><tr><th />{heat.sites.map((s) => <th key={s} className={publicCapture ? "max-w-16 whitespace-normal break-words font-normal text-slate-500" : "max-w-16 truncate font-normal text-slate-500"}>{publicCapture ? publicSiteLabel(s) : s}</th>)}</tr></thead>
       <tbody>
         {heat.models.map((m) => (
           <tr key={m}>
-            <td className="max-w-24 truncate pr-1" style={{ color: color(m) }}>{m}</td>
+            <td className={publicCapture ? "max-w-24 whitespace-normal break-words pr-1" : "max-w-24 truncate pr-1"} style={{ color: color(m) }}>{publicCapture ? publicModelLabel(m) : m}</td>
             {heat.sites.map((s) => {
               const n = heat.cells[`${m}|${s}`] ?? 0;
               const lv = level(n);
@@ -685,7 +714,7 @@ function Heat({ heat, color }: { heat: ReturnType<typeof modelSiteHeatmap>; colo
   );
 }
 
-function Hist({ hist, label }: { hist: ReturnType<typeof histogram>; label: (v: number) => string }) {
+function Hist({ hist, label, publicCapture }: { hist: ReturnType<typeof histogram>; label: (v: number) => string; publicCapture: boolean }) {
   const W = 200; const H = 90; const bw = W / hist.bins.length;
   return (
     <div>
@@ -703,7 +732,7 @@ function Hist({ hist, label }: { hist: ReturnType<typeof histogram>; label: (v: 
         })}
         <line x1={0} x2={W} y1={H - 0.5} y2={H - 0.5} stroke="#334155" />
       </svg>
-      <div className="flex justify-between font-mono text-[11px] lg:text-[9.5px] text-slate-500">
+      <div className={`flex justify-between font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[9.5px]'} text-slate-500`}>
         <span>{hist.max ? label(hist.lo) : '—'}</span>
         <span>{hist.max ? label(hist.hi) : ''}</span>
       </div>
@@ -711,15 +740,15 @@ function Hist({ hist, label }: { hist: ReturnType<typeof histogram>; label: (v: 
   );
 }
 
-function GateBars({ pass, fail, verdicts }: { pass: number; fail: number; verdicts: Array<{ name: string; count: number }> }) {
+function GateBars({ pass, fail, verdicts, publicCapture }: { pass: number; fail: number; verdicts: Array<{ name: string; count: number }>; publicCapture: boolean }) {
   const items = [{ name: 'GATE ✓', count: pass, c: KIND_COLOR.SHIP }, { name: 'GATE ✗', count: fail, c: KIND_COLOR.ESCALATE },
     ...verdicts.slice(0, 3).map((v) => ({ name: v.name.toUpperCase(), count: v.count, c: KIND_COLOR.VERIFY }))];
   const top = Math.max(1, ...items.map((i) => i.count));
   return (
-    <ul className="space-y-1 font-mono text-[11px] lg:text-[9.5px]" data-live-v5-gate>
+    <ul className={`space-y-1 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[9.5px]'}`} data-live-v5-gate>
       {items.map((i) => (
         <li key={i.name}>
-          <div className="flex justify-between text-slate-400"><span className="truncate">{i.name}</span><span className="tabular-nums text-slate-200">{i.count}</span></div>
+          <div className="flex justify-between text-slate-400"><span className={publicCapture ? 'whitespace-normal break-words' : 'truncate'}>{i.name}</span><span className="tabular-nums text-slate-200">{i.count}</span></div>
           <div className="h-1.5 rounded-full bg-slate-800"><div className="h-1.5 rounded-full" style={{ width: `${(i.count / top) * 100}%`, background: i.c, boxShadow: `0 0 8px ${i.c}88` }} /></div>
         </li>
       ))}
@@ -728,41 +757,41 @@ function GateBars({ pass, fail, verdicts }: { pass: number; fail: number; verdic
 }
 
 /** 판단 카드 — 세 칸(무엇·왜·어디로). 접히면 작아지며 사라지고 그 순간 입자가 날아간다. */
-function DecisionCard({ item, folding, role }: { item: DecisionCardItem; folding: boolean; role: PwaRole }) {
+function DecisionCard({ item, folding, role, publicCapture, runLabel }: { item: DecisionCardItem; folding: boolean; role: PwaRole; publicCapture: boolean; runLabel: (id: string) => string }) {
   const { line } = item;
   const color = KIND_COLOR[line.kind];
   return (
     <div
       data-live-decision-card={line.kind}
       className="pointer-events-none absolute left-1/2 top-12 w-[min(92%,580px)] rounded-xl border bg-slate-950/85 p-3 backdrop-blur transition-all duration-200"
-      style={{ borderColor: `${color}88`, boxShadow: `0 0 32px ${color}55`, opacity: folding ? 0 : 1, transform: `translateX(-50%) scale(${folding ? 0.6 : 1})` }}
+      style={{ borderColor: `${color}88`, boxShadow: `0 0 32px ${color}55`, opacity: folding ? 0 : 1, transform: `translateX(-50%) scale(${folding && !publicCapture ? 0.6 : 1})` }}
     >
-      <div className="mb-2 flex items-center gap-2 font-mono text-[11px] lg:text-[10px]">
+      <div className={`mb-2 flex items-center gap-2 font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[10px]'}`}>
         <span style={{ color }}>● {line.kind}</span>
         <span className="text-slate-500">{clockTime(line.ts)}</span>
-        {role === 'owner' && line.runId && <span className="text-slate-500">{line.runId.replace(/^run-/, '').slice(0, 8)}</span>}
+        {(publicCapture || role === 'owner') && line.runId && <span className="text-slate-500">{publicCapture ? runLabel(line.runId) : line.runId.replace(/^run-/, '').slice(0, 8)}</span>}
         {line.paths ? <span className="ml-auto text-slate-400">PATHS {line.paths}</span> : null}
       </div>
-      <div className="grid grid-cols-3 gap-2 text-[11px] leading-snug">
-        <Cell label="무엇 · WHAT" value={line.what} strong />
-        <Cell label="왜 · WHY" value={foldForRole(line.why, role) ?? line.purpose} />
-        <Cell label="어디로 · TO" value={line.target} accent={color} />
+      <div className={`grid grid-cols-3 gap-2 ${publicCapture ? 'text-sm' : 'text-[11px]'} leading-snug`}>
+        <Cell publicCapture={publicCapture} label="무엇 · WHAT" value={publicCapture ? publicDecisionText(line.kind) : line.what} strong />
+        <Cell publicCapture={publicCapture} label="왜 · WHY" value={publicCapture ? publicDecisionText(line.kind) : foldForRole(line.why, role) ?? line.purpose} />
+        <Cell publicCapture={publicCapture} label="어디로 · TO" value={publicCapture ? (line.target ? publicDecisionText(line.kind) : null) : line.target} accent={color} />
       </div>
     </div>
   );
 }
 
-function Cell({ label, value, strong = false, accent }: { label: string; value: string | null; strong?: boolean; accent?: string }) {
+function Cell({ label, value, strong = false, accent, publicCapture }: { label: string; value: string | null; strong?: boolean; accent?: string; publicCapture: boolean }) {
   return (
     <div className="min-w-0">
-      <div className="font-mono text-[11px] lg:text-[9px] tracking-widest text-slate-500">{label}</div>
-      <div className={strong ? 'line-clamp-3 font-medium text-slate-100' : 'line-clamp-3 text-slate-300'} style={accent && value ? { color: accent } : undefined}>{value ?? '—'}</div>
+      <div className={`font-mono ${publicCapture ? 'text-sm' : 'text-[11px]'} ${publicCapture ? 'text-sm' : 'lg:text-[9px]'} tracking-widest text-slate-500`}>{label}</div>
+      <div className={strong ? `${publicCapture ? 'break-words' : 'line-clamp-3'} font-medium text-slate-100` : `${publicCapture ? 'break-words' : 'line-clamp-3'} text-slate-300`} style={accent && value ? { color: accent } : undefined}>{value ?? '—'}</div>
     </div>
   );
 }
 
 /** 수렴(§0b ⑤) — PR 마다 라운드별 must-fix. 0 에 닿으면 초록. */
-function Convergence({ series }: { series: LiveBoardData['convergence'] }) {
+function Convergence({ series, publicCapture }: { series: LiveBoardData['convergence']; publicCapture: boolean }) {
   const top = Math.max(1, ...series.flatMap((s) => s.points.map((p) => p.asks)));
   const rounds = Math.max(3, ...series.flatMap((s) => s.points.map((p) => p.round)));
   const W = 200; const H = 100;
@@ -772,18 +801,20 @@ function Convergence({ series }: { series: LiveBoardData['convergence'] }) {
   const ticks = Array.from({ length: rounds }, (_, i) => i + 1);
   return (
     <div data-live-convergence>
-      {series.length === 0 ? <div className="py-8 text-center text-[11px] text-slate-500">이 창에 리뷰 라운드가 없다.</div> : (
+      {series.length === 0 ? <div className={`py-8 text-center ${publicCapture ? 'text-sm' : 'text-[11px]'} text-slate-500`}>이 창에 리뷰 라운드가 없다.</div> : (
         <svg viewBox={`0 0 ${W} ${H}`} className="h-24 w-full">
           <line x1={L} y1={H - B} x2={W - R} y2={H - B} stroke="#334155" />
           <line x1={L} y1={T} x2={L} y2={H - B} stroke="#334155" />
           {ticks.map((t) => (
             <g key={t}>
               <line x1={x(t)} y1={T} x2={x(t)} y2={H - B} stroke="#1e293b" strokeDasharray="2 3" />
-              <text x={x(t)} y={H - 4} fill="#64748b" fontSize={8} fontFamily="monospace" textAnchor="middle">R{t}</text>
+              {!publicCapture && <text x={x(t)} y={H - 4} fill="#64748b" fontSize={8} fontFamily="monospace" textAnchor="middle">R{t}</text>}
             </g>
           ))}
-          <text x={L - 3} y={y(top) + 3} fill="#64748b" fontSize={8} fontFamily="monospace" textAnchor="end">{top}</text>
-          <text x={L - 3} y={y(0) + 3} fill={KIND_COLOR.SHIP} fontSize={8} fontFamily="monospace" textAnchor="end">0</text>
+          {!publicCapture && <>
+            <text x={L - 3} y={y(top) + 3} fill="#64748b" fontSize={8} fontFamily="monospace" textAnchor="end">{top}</text>
+            <text x={L - 3} y={y(0) + 3} fill={KIND_COLOR.SHIP} fontSize={8} fontFamily="monospace" textAnchor="end">0</text>
+          </>}
           {series.slice(0, 6).map((s, i) => {
             const last = s.points.at(-1)!;
             const c = last.asks === 0 ? KIND_COLOR.SHIP : ['#818cf8', '#fbbf24', '#38bdf8', '#f0abfc', '#fb7185'][i % 5]!;
@@ -791,11 +822,21 @@ function Convergence({ series }: { series: LiveBoardData['convergence'] }) {
               <g key={s.pr}>
                 <polyline fill="none" stroke={c} strokeWidth={1.6} points={s.points.map((p) => `${x(p.round)},${y(p.asks)}`).join(' ')} />
                 {s.points.map((p) => <circle key={p.round} cx={x(p.round)} cy={y(p.asks)} r={2.5} fill={c} />)}
-                <text x={x(last.round) + 4} y={y(last.asks) - 3} fill={c} fontSize={8} fontFamily="monospace">#{s.pr} {last.asks}</text>
+                {!publicCapture && <text x={x(last.round) + 4} y={y(last.asks) - 3} fill={c} fontSize={8} fontFamily="monospace">#{s.pr} {last.asks}</text>}
               </g>
             );
           })}
         </svg>
+      )}
+      {publicCapture && series.length > 0 && (
+        <div className="flex flex-wrap items-start justify-between gap-1 font-mono text-sm text-slate-400" data-live-convergence-labels>
+          <span className="flex flex-col"><span>{top}</span><span className="text-emerald-300">0</span></span>
+          <span className="flex flex-wrap gap-x-2">{ticks.map((t) => <span key={t}>R{t}</span>)}</span>
+          <span className="flex flex-col break-words">{series.slice(0, 6).map((s, i) => {
+            const last = s.points.at(-1)!;
+            return <span key={s.pr} style={{ color: last.asks === 0 ? KIND_COLOR.SHIP : ['#818cf8', '#fbbf24', '#38bdf8', '#f0abfc', '#fb7185'][i % 5]! }}>#{s.pr} {last.asks}</span>;
+          })}</span>
+        </div>
       )}
     </div>
   );

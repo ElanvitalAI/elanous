@@ -1,6 +1,7 @@
 import { closeSync, existsSync, fstatSync, ftruncateSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, unlinkSync, writeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { elanousStateRoot } from '../autopilot/state-paths.js';
+import { readPendingQuestionAnswer, readPendingQuestions, writePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
 import { debug, redactSecretText } from '../debug/log.js';
 import { createVersionResolver, type VersionOptions, type Versions } from '../directives/version-at.js';
 import { getUserConfig } from '../user-config.js';
@@ -15,15 +16,27 @@ export interface DecisionEntry {
   options: DecisionOption[]; recommendation: Recommendation; raisedAt?: string; importedAt?: string;
   raisedBy: { agent: string; track?: DecisionTrack; session?: string }; version?: Versions;
   status: 'open' | 'decided' | 'withdrawn'; refs?: string[];
+  resume?: { questionId: string; runId?: string };
   /** DEC-TG — optional deadline (UTC). Cards remind the owner two hours before it. */
   dueAt?: string;
   decidedAt?: string; decidedBy?: DecisionActor; choice?: string; note?: string; versionAtDecision?: Versions;
   withdrawnAt?: string; withdrawReason?: string;
   history: Array<{ type: 'raised' | 'options-added' | 'decided' | 'withdrawn'; at?: string; by: string; version?: Versions; choice?: string; reason?: string }>;
 }
-export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt'> & { raisedAt?: string };
+export type RaiseInput = Pick<DecisionEntry, 'title' | 'category' | 'scqa' | 'options' | 'recommendation' | 'raisedBy' | 'refs' | 'dueAt' | 'resume'> & { raisedAt?: string };
 type Event = { type: 'raised'; entry: DecisionEntry } | { type: 'options-added'; id: string; at: string; options: DecisionOption[]; by: string } | { type: 'decided'; id: string; at?: string; by: DecisionActor; choice?: string; version?: Versions; note?: string } | { type: 'withdrawn'; id: string; at: string; reason: string; version: Versions };
-export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions }
+export interface DecisionLedgerOptions extends VersionOptions { stateDir?: string; now?: () => Date; resolveVersion?: (at: string) => Versions; writeAnswer?: typeof writePendingQuestionAnswer }
+
+/** null = the decision resumes no run; otherwise whether the answer file was written (or already matched). */
+export type AnswerDelivery = null | { ok: true; questionId: string } | { ok: false; questionId: string; reason: string };
+
+/** The decision is durable even when delivery fails; retryAnswer(id) only retries delivery. */
+export class DecisionAnswerDeliveryError extends Error {
+  constructor(readonly decisionId: string, readonly questionId: string) {
+    super(`decision ${decisionId} recorded but answer delivery failed for ${questionId}; retry with decisions retry-answer ${decisionId}`);
+    this.name = 'DecisionAnswerDeliveryError';
+  }
+}
 const CATEGORIES: readonly string[] = ['secret', 'publish', 'money', 'security', 'scope', 'irreversible', 'other'];
 const TRACKS: readonly string[] = ['S', 'T', 'F', 'O'];
 
@@ -73,7 +86,11 @@ function validate(input: RaiseInput, historical = false): RaiseInput {
     ? { skipped: true as const, reason: safe(single(input.recommendation.reason, 'skip reason')) }
     : { option: input.recommendation.option, why: safe(single(input.recommendation.why, 'recommendation why')) };
   if ('option' in recommendation && !options.some(o => o.key === recommendation.option)) throw new Error('recommended option not found');
+  if (input.resume && !/^auq:[0-9a-z]+:[0-9a-z]{5}(?![\s\S])/.test(input.resume.questionId)) throw new Error('invalid resume questionId');
+  const resume = input.resume ? { questionId: input.resume.questionId,
+    ...(input.resume.runId === undefined ? {} : { runId: single(input.resume.runId, 'resume runId') }) } : undefined;
   return { ...input, title, scqa: { s, c, ...(q ? { q } : {}), ...(a ? { a } : {}) }, options, recommendation,
+    ...(resume ? { resume } : {}),
     raisedBy: { agent: safe(single(input.raisedBy.agent, 'agent')), ...(input.raisedBy.track ? { track: input.raisedBy.track } : {}), ...(input.raisedBy.session ? { session: safe(single(input.raisedBy.session, 'session')) } : {}) },
     ...(input.refs ? { refs: input.refs.map(r => safe(single(r, 'ref'))) } : {}),
     ...(input.dueAt ? { dueAt: utc(input.dueAt) } : {}) };
@@ -83,12 +100,16 @@ export class DecisionLedger {
   readonly path: string;
   private readonly lockPath: string;
   private readonly now: () => Date;
+  private readonly writeAnswer: typeof writePendingQuestionAnswer;
+  private readonly stateDir: string;
   private versionResolver?: (at: string) => Versions;
   private readonly versionOptions: DecisionLedgerOptions;
   constructor(options: DecisionLedgerOptions = {}) {
-    this.path = join(options.stateDir ?? elanousStateRoot(), 'decisions', 'decisions.jsonl');
+    this.stateDir = options.stateDir ?? elanousStateRoot();
+    this.path = join(this.stateDir, 'decisions', 'decisions.jsonl');
     this.lockPath = `${this.path}.lock`;
     this.now = options.now ?? (() => new Date());
+    this.writeAnswer = options.writeAnswer ?? writePendingQuestionAnswer;
     this.versionOptions = options;
     this.versionResolver = options.resolveVersion;
   }
@@ -196,7 +217,14 @@ export class DecisionLedger {
       return entry;
     });
   }
+  /** Record the decision and say whether its answer reached the waiting run (null = the decision resumes nothing). */
+  decideWithDelivery(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery } {
+    return this.decideLocked(id, choice, by, note, decidedAt);
+  }
   decide(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): DecisionEntry {
+    return this.decideLocked(id, choice, by, note, decidedAt).entry;
+  }
+  private decideLocked(id: string, choice: string, by: DecisionActor, note?: string, decidedAt?: string): { entry: DecisionEntry; delivery: AnswerDelivery } {
     if (!by || (by.kind !== 'human' && by.kind !== 'auto')) throw new Error('decidedBy is required');
     if (by.kind === 'auto') {
       single(by.delegation, 'delegation'); single(by.agent, 'agent');
@@ -211,8 +239,51 @@ export class DecisionLedger {
       if (old.raisedAt && at < old.raisedAt) throw new Error('decision before raise');
       this.append({ type: 'decided', id, at, by, choice, version: this.version(at), ...(note ? { note: safe(single(note, 'note')) } : {}) });
       debug.log('decisions', 'decided', { id, category: old.category, by: by.kind });
-      return this.show(id);
+      const decided = this.show(id);
+      return { entry: decided, delivery: this.deliverAnswer(decided) };
     });
+  }
+  /** Retry delivery of the recorded choice without adding another decided event or changing its actor/note. */
+  retryAnswer(id: string): DecisionEntry {
+    return this.locked(() => {
+      const entry = this.show(id);
+      if (entry.status !== 'decided' || !entry.resume || !entry.choice || !entry.decidedBy) throw new Error(`decision has no recorded resume answer: ${id}`);
+      this.deliverAnswer(entry, true);
+      return entry;
+    });
+  }
+  private deliverAnswer(entry: DecisionEntry, throwOnFailure = false): AnswerDelivery {
+    if (!entry.resume) return null;
+    const { questionId, runId } = entry.resume;
+    try {
+      const label = entry.options.find(option => option.key === entry.choice)?.label;
+      if (!label || !entry.choice) throw new Error('recorded choice not found');
+      const deps = { root: () => this.stateDir };
+      const pending = readPendingQuestions(deps);
+      if (!pending.ok) throw new Error(pending.error);
+      const target = pending.questions.find(item => item.id === questionId);
+      if (!target || target.questions.length !== 1 || !target.questions[0]?.id) throw new Error('pending question target not found or ambiguous');
+      const question = target.questions[0];
+      if (question.options.length !== entry.options.length || question.options.some((option, index) =>
+        entry.options[index]?.key !== String.fromCharCode(97 + index) || entry.options[index]?.label !== option.label)) {
+        throw new Error('pending question options differ from decision');
+      }
+      const answerKey = question.id;
+      const answer = { id: questionId, result: { answers: { [answerKey]: `${entry.choice}) ${label}` },
+        ...(entry.note ? { otherText: { [answerKey]: entry.note } } : {}) } };
+      const existing = readPendingQuestionAnswer(questionId, deps);
+      if (!existing.ok) throw new Error('existing answer unreadable');
+      if (existing.answer) {
+        if (JSON.stringify(existing.answer) !== JSON.stringify(answer)) throw new Error('pending question already answered differently');
+      } else this.writeAnswer(answer, deps);
+      debug.log('hitl.card-bridge', 'answered', { decisionId: entry.id, questionId, runId, via: entry.decidedBy?.kind });
+      return { ok: true, questionId };
+    } catch (error) {
+      const reason = error instanceof Error ? (error as NodeJS.ErrnoException).code ?? error.name : typeof error;
+      debug.log('hitl.card-bridge', 'answer-write-failed', { decisionId: entry.id, questionId, reason });
+      if (throwOnFailure) throw new DecisionAnswerDeliveryError(entry.id, questionId);
+      return { ok: false, questionId, reason: error instanceof Error ? error.message.slice(0, 120) : String(reason) };
+    }
   }
   /** Import an open historical request with known alternatives and an unknown original time. */
   importOpen(input: RaiseInput): DecisionEntry {

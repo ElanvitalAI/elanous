@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { stringify } from 'yaml';
@@ -9,6 +9,9 @@ import { machineConfigPath } from '../roles/machine-name.js';
 import { loadMachineLedger, machineLedgerPath, machineMarkdownPath, renderLedgerMarkdown } from '../machines/machine-ledger.js';
 import { readMachineProfile } from '../roles/machine-profile.js';
 import { registerMachineCommands } from './machine-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 test('registered --test machine render --check uses the checked-in YAML and generated Markdown', () => {
   const root = mkdtempSync(join(tmpdir(), 'machine-render-process-'));

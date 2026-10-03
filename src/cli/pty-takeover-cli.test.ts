@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { Command } from 'commander';
 import { Database } from 'bun:sqlite';
 import { spawnSync } from 'node:child_process';
@@ -12,6 +12,9 @@ import { PTY_MANIFEST_CLOSED_TTL_MS, reapDeadPtyManifestAt, setPtyManifestDbPath
 import { enqueueControlMemo } from '../harness/control-inbox.js';
 import type { PtyEventRow } from '../pty-shell/pty-event-log.js';
 import type { PtyControlResult } from '../pty-shell/pty-control-ipc.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function row(overrides: Partial<PtyManifestRow> = {}): PtyManifestRow {
   return {

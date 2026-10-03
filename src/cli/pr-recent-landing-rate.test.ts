@@ -124,6 +124,7 @@ const baseDeps: PrLandDeps = {
   runDocsCliCheck: () => [],
   runTestInterferenceGate: async () => 0,
   runAndroidGate: () => true,
+  runPwaGate: () => true,
   runIosGate: () => true,
   listOpenPrs: () => [],
   sleep: async () => undefined,

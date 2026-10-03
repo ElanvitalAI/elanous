@@ -8,10 +8,13 @@
 //      ① 설명 **원문 길이** 상한(불어나면 실패)
 //      ② 상세로 가는 **매뉴얼 경로**가 help 에 실제로 노출되는가(위임처가 없으면 축약은 정보 손실이다)
 
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO = join(import.meta.dir, '..');
 const MANUAL = 'docs/manual/MANUAL-frontdoor-selfdev-dogfood-mechanism-2026-07-25.md';

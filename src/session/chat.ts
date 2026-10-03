@@ -109,6 +109,8 @@ export interface RunTurnOpts {
    *  delegated coding agent's approval prompts back to the originating
    *  chat via `delegate_code_agent`. */
   hitlConfirmChannel?: import('../hitl/confirm.js').ConfirmChannel;
+  /** Verified by the hosting bot from the inbound user id against its server-side owner allowlist. */
+  verifiedOwner?: { id: string };
   /** Paired multi-option question channel (Telegram sets this). Surface
    *  runTurnImpls thread it into `delegate_code_agent` so a delegated
    *  agent's structured questions render as option buttons in the

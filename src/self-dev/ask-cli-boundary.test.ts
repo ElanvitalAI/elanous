@@ -10,12 +10,15 @@
  *
  * ⚠️ 비용 규율: 여기서 «저작(≈107초)까지 가는» 경우는 안 돈다. 인자 층에서 갈리는 것만 문다.
  */
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { isObviouslyLongAskPath } from '../index.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const REPO = resolve(import.meta.dir, '..', '..');
 const BIN = resolve(REPO, 'bin', 'elanous.mjs');

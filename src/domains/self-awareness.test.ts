@@ -1,5 +1,5 @@
 // Self-awareness memory (P1) 단위테스트 — 인메모리 db + mock embed(무네트워크).
-import { describe, test, expect } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,9 @@ import { openSurfaceEventsDb, recordEvent, queryEvents } from './surface-events.
 import { debug } from '../debug/log.js';
 import { openKnowledgeDb, ingestDocsDir, SELF_DOC_PATTERN } from './knowledge.js';
 import type { EmbedFn } from './knowledge.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function surfaceDb(): Database {
   return openSurfaceEventsDb(':memory:');

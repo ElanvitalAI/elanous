@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -7,6 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { GOAL_TYPES } from '../src/self-implement/goal-author.js';
 import {
   inspectNarrowedTestSignalWarnings, inspectAbsenceCountSignalWarnings, inspectUnportedIsolatedDaemonWarnings, inspectConditionObservationPairWarnings, inspectAskMarkers, inspectAskMarkersInRoot, inspectConsumerPathWarning, inspectDecisionObservations, inspectDecisionSignalKinds, inspectDecisionSignalObservations, inspectWrappedMarkerWarnings, bunTestFileLaunchesRepositoryExecutable, formatAxis, formatAxisObservations } from './ask-marker-check.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const script = fileURLToPath(new URL('./ask-marker-check.ts', import.meta.url));
 const repositoryRoot = resolve(fileURLToPath(new URL('..', import.meta.url)));

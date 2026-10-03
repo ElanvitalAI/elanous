@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import {
   applyTurnTypeaheadKey,
   renderTurnTypeaheadQueueRow,
@@ -170,6 +171,28 @@ describe('drainedIntoTurn — 라이브 턴 배수 문장', () => {
     const result = drainedIntoTurn(state, ['첫째', '둘째']);
     expect(result.state).toEqual({ buffer: '', queuedSubmissions: ['셋째'] });
     expect(result.sentence).toBe('⏳ 턴 안 2건 · "첫째" · "둘째" · 라이브 턴으로 전송');
+  });
+});
+
+describe('queued speech is delivered only once', () => {
+  test('dashboard live drain removes its FIFO prefix before the turn-end handoff', () => {
+    const dashboard = readFileSync(new URL('../dashboard/index.ts', import.meta.url), 'utf8');
+    const callback = dashboard.slice(dashboard.indexOf('enqueuePendingUserInput(sid, queuedText, (drained) => {'));
+    const body = callback.slice(0, callback.indexOf("debug.log('dashboard.turn-typeahead', 'drained-into-live-turn'"));
+    expect(body).toContain('queuedSubmissions.slice(drained.length)');
+    expect(body.indexOf('queuedSubmissions.slice(drained.length)')).toBeLessThan(body.indexOf('echoSubmittedUserText(text, { live: true })'));
+    expect(dashboard).toContain('drainTurnTypeaheadOnce(turnTypeaheadRef.state, nextInitial, { interrupted })');
+  });
+
+  test('live-drained items cannot be handed off again at turn end; remaining items retain FIFO order', () => {
+    const entered = ['Q2MARK 라고만 답해', 'Q3MARK 라고만 답해', 'Q4MARK 라고만 답해'];
+    const state = { buffer: 'unsent draft', queuedSubmissions: entered };
+    const live = drainedIntoTurn(state, entered.slice(0, 2));
+    expect(live.state.queuedSubmissions).toEqual([entered[2]]);
+    const next = dequeueTurnTypeaheadHandoff(live.state);
+    expect(next.handoff).toEqual({ kind: 'submit', text: entered[2] });
+    expect(dequeueTurnTypeaheadHandoff(next.state).handoff)
+      .toEqual({ kind: 'prefill', text: 'unsent draft' });
   });
 });
 

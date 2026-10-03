@@ -207,12 +207,12 @@ export function SessionPicker({
         if (attached) onPick({ kind: 'jumpToTab', tabId: attached.tabId });
         else onPick({ kind: 'existing', sessionId: resolved.id });
       } else if (resolved.kind === 'none') {
-        setResolveNote(`'${q}' 로 시작하는 세션이 없습니다.`);
+        setResolveNote(`'${q}'로 시작하는 대화가 없습니다.`);
       } else {
-        setResolveNote(`prefix 모호 — ${resolved.count}개 일치. 더 길게 입력하세요.`);
+        setResolveNote(`${resolved.count}개의 대화가 일치합니다. ID를 더 길게 입력하세요.`);
       }
     } catch (e) {
-      setResolveNote(`resolve 실패: ${e instanceof Error ? e.message : String(e)}`);
+      setResolveNote(`대화를 찾지 못했습니다: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setResolveBusy(false);
     }
@@ -234,7 +234,7 @@ export function SessionPicker({
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="채팅 세션 선택"
+        aria-label="대화 선택"
         className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
         onClick={onClose}
       >
@@ -243,7 +243,7 @@ export function SessionPicker({
           className="flex max-h-[min(640px,90vh)] w-[min(640px,calc(100vw-2rem))] flex-col rounded-lg border border-border bg-card shadow-lg"
         >
           <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-4 py-3">
-            <h2 className="text-base font-semibold">채팅 세션</h2>
+            <h2 className="text-base font-semibold">대화 선택</h2>
             <button
               type="button"
               aria-label="close"
@@ -262,7 +262,7 @@ export function SessionPicker({
             >
               <Plus className="h-5 w-5 text-primary" />
               <div className="flex-1">
-                <div className="text-sm font-medium">새 세션 시작</div>
+                <div className="text-sm font-medium">새 대화 시작</div>
                 <div className="text-xs text-muted-foreground">비어있는 새 채팅을 엽니다 (⌘N)</div>
               </div>
             </button>
@@ -275,7 +275,7 @@ export function SessionPicker({
                 ref={searchRef}
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="검색 — preview text · id · [pwa]/[cli]/[tg]/[dc]"
+                placeholder="대화 검색 — 내용 · ID · [pwa]/[cli]/[tg]/[dc]"
                 className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground/60"
               />
               {query && (
@@ -296,8 +296,8 @@ export function SessionPicker({
               <div className="px-4 py-12 text-center">
                 <p className="text-sm text-muted-foreground">
                   {sessions.length === 0 && !query.trim()
-                    ? '아직 채팅 세션이 없습니다. 위 "+ 새 세션 시작" 으로 첫 채팅을 시작하세요.'
-                    : '검색과 일치하는 세션 없음.'}
+                    ? '아직 대화가 없습니다. 위의 "새 대화 시작"으로 첫 대화를 시작하세요.'
+                    : '검색과 일치하는 대화가 없습니다.'}
                 </p>
                 {query.trim().length >= 4 && (
                   <button
@@ -306,13 +306,13 @@ export function SessionPicker({
                     onClick={() => void resolvePrefix()}
                     className="mt-3 rounded-md border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs text-violet-300 hover:bg-violet-500/15 disabled:opacity-50"
                   >
-                    {resolveBusy ? 'resolve 중…' : `⑂ id prefix '${query.trim()}' 로 이어가기 (Enter)`}
+                    {resolveBusy ? '찾는 중…' : `ID '${query.trim()}'로 대화 이어가기 (Enter)`}
                   </button>
                 )}
                 {resolveNote && <p className="mt-2 text-xs text-amber-400">{resolveNote}</p>}
                 {sessions.length === 0 && !query.trim() && (
                   <p className="mt-2 text-xs text-muted-foreground">
-                    다른 디바이스 (cli / telegram / discord) 에서 세션을 시작하면 여기에 자동으로 나타납니다.
+                    다른 기기(CLI / Telegram / Discord)에서 대화를 시작하면 여기에 자동으로 나타납니다.
                   </p>
                 )}
               </div>
@@ -339,11 +339,11 @@ export function SessionPicker({
                         >
                           <div className="flex w-full items-center gap-2">
                             <span className="truncate text-sm font-medium">
-                              {s.lastMsgPreview ?? <span className="text-muted-foreground italic">(empty session)</span>}
+                              {s.lastMsgPreview ?? <span className="text-muted-foreground italic">(빈 대화)</span>}
                             </span>
                             {attached && (
                               <span className="ml-auto shrink-0 rounded-full bg-primary/15 px-2 py-0.5 text-[10px] font-medium text-primary">
-                                ✓ open in {attached.label}
+                                ✓ {attached.label}에서 열림
                               </span>
                             )}
                           </div>
@@ -369,7 +369,7 @@ export function SessionPicker({
                         </button>
                         <button
                           type="button"
-                          aria-label={`forget ${s.id}`}
+                          aria-label={`대화 ${s.id} 지우기`}
                           onClick={(e) => {
                             e.stopPropagation();
                             setConfirm(s);
@@ -392,9 +392,9 @@ export function SessionPicker({
           <div className="shrink-0 border-t border-border bg-muted/30 px-4 py-2 text-[10px] text-muted-foreground">
             <span className="mr-3">↑↓ 이동</span>
             <span className="mr-3">Enter 선택</span>
-            <span className="mr-3">⌘N 새 세션</span>
+            <span className="mr-3">⌘N 새 대화</span>
             <span className="mr-3">⌘F 검색</span>
-            <span>Del 잊기</span>
+            <span>Del 지우기</span>
           </div>
         </div>
       </div>

@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { loadEnvelope, rotateAdminToken } from '../auth/token-store.js';
 import { getElanousConfigDir, resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { finishOpProxyRotation, readOpProxyConfig, syncOpProxyToken, type OpProxyConfig } from './op-proxy-sync.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const proxy: OpProxyConfig = { host: 'cloud-vm', bearerFile: '/etc/caddy/op-bearer.env', restart: 'caddy' };
 const token = 'secret-active-token';

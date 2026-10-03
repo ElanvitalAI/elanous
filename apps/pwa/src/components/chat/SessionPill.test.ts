@@ -6,7 +6,14 @@
 // 않게 lock.
 
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test';
-import { copyToClipboard, shortSessionId } from './SessionPill';
+import { createElement } from 'react';
+import { act, create, type ReactTestRenderer } from 'react-test-renderer';
+import { DaemonContext } from '@/components/providers/DaemonProvider';
+import { _resetSessionsServiceSingletonForTest } from '@/lib/sessions-service';
+import { SessionDeleteConfirm } from './SessionDeleteConfirm';
+import { SessionIdChip } from './SessionIdChip';
+import { SessionPicker } from './SessionPicker';
+import { SessionPill, copyToClipboard, shortSessionId, type SessionPillProps } from './SessionPill';
 
 describe('shortSessionId — pill display 의 short ID + 단축 cue', () => {
   it('full UUID 의 첫 8자 + ellipsis 반환 (단축 visual cue)', () => {
@@ -79,5 +86,121 @@ describe('copyToClipboard — clipboard API wrapper', () => {
       },
     };
     expect(await copyToClipboard('sess-xyz')).toBe(false);
+  });
+});
+
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+const currentId = '8a7c3f2b-9d4e-4f1a-b2c3-1234567890ab';
+const currentSession = {
+  id: currentId,
+  msgCount: 2,
+  lastMsgPreview: '오늘의 이야기',
+  lastTurnAt: new Date().toISOString(),
+  origin: 'pwa' as const,
+};
+
+function renderedText(tree: ReactTestRenderer): string {
+  return JSON.stringify(tree.toJSON());
+}
+
+describe('대화 화면 문면과 기존 동작', () => {
+  let tree: ReactTestRenderer | undefined;
+  let selected: string[];
+  let requests: number;
+  let forgotten: string[];
+  const client = {
+    fetchJson: async () => {
+      requests += 1;
+      return { sessions: [currentSession] };
+    },
+    sessionStoreEventsUrl: () => '',
+  };
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const originalStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const documentStub = new EventTarget();
+  const daemon = {
+    client: client as never,
+    config: { baseUrl: '', token: '', provider: '' },
+    sessionId: currentId,
+    setSessionId: (id: string) => selected.push(id),
+    setConfig: () => {},
+  };
+
+  beforeEach(() => {
+    selected = [];
+    forgotten = [];
+    requests = 0;
+    Object.defineProperty(globalThis, 'document', { configurable: true, value: documentStub });
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: new EventTarget() });
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: { setItem: () => {}, getItem: () => null } });
+  });
+  afterEach(async () => {
+    if (tree) await act(async () => tree!.unmount());
+    tree = undefined;
+    _resetSessionsServiceSingletonForTest();
+    if (originalDocument) Object.defineProperty(globalThis, 'document', originalDocument);
+    else delete (globalThis as { document?: Document }).document;
+    if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+    else delete (globalThis as { window?: Window }).window;
+    if (originalStorage) Object.defineProperty(globalThis, 'localStorage', originalStorage);
+    else delete (globalThis as { localStorage?: Storage }).localStorage;
+  });
+
+  it('pill 메뉴의 새 대화·전환·지우기 문면은 대화 용어이고 콜백과 ID는 유지된다', async () => {
+    await act(async () => { tree = create(
+      createElement(DaemonContext.Provider, { value: daemon },
+        createElement<SessionPillProps>(SessionPill, { onAttachRequest: () => { forgotten.push('attach'); }, onForgetRequest: () => { forgotten.push('forget'); } })),
+    ); });
+    const buttons = () => tree!.root.findAllByType('button');
+    expect(buttons().find((b) => b.props['aria-label'] === '대화 메뉴')).toBeDefined();
+    await act(async () => buttons().find((b) => b.props['aria-label'] === '대화 메뉴')!.props.onClick());
+    expect(renderedText(tree!)).toContain('다른 대화로 전환');
+    expect(renderedText(tree!)).toContain('이 대화 지우기');
+    expect(renderedText(tree!)).toContain('대화 ID');
+    expect(renderedText(tree!)).toContain('새 대화 시작 (두 번 클릭)');
+    expect(renderedText(tree!)).not.toContain('세션');
+    await act(async () => buttons().find((b) => b.children.includes('다른 대화로 전환'))!.props.onClick());
+    expect(forgotten).toEqual(['attach']);
+    await act(async () => buttons().find((b) => b.props['aria-label'] === '대화 메뉴')!.props.onClick());
+    await act(async () => buttons().find((b) => b.children.includes('이 대화 지우기'))!.props.onClick());
+    expect(forgotten).toEqual(['attach', 'forget']);
+    await act(async () => buttons().find((b) => b.props['aria-label'] === '대화 메뉴')!.props.onClick());
+    await act(async () => buttons().find((b) => b.findAllByType('span').some((s) => s.children.includes('새 대화 시작')))!.props.onClick());
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).not.toBe(currentId);
+  });
+
+  it('picker의 새 대화·기존 대화 전환·지우기 버튼과 빈 상태 문면', async () => {
+    const picked: unknown[] = [];
+    await act(async () => { tree = create(
+      createElement(DaemonContext.Provider, { value: daemon },
+        createElement(SessionPicker, { open: true, onClose: () => {}, onPick: (pick) => { picked.push(pick); }, attachedSessions: new Map() })),
+    ); });
+    expect(requests).toBeGreaterThan(0);
+    expect(renderedText(tree!)).toContain('새 대화 시작');
+    expect(renderedText(tree!)).not.toContain('세션');
+    const buttons = () => tree!.root.findAllByType('button');
+    await act(async () => buttons().find((b) => b.findAllByType('div').some((d) => d.children.includes('새 대화 시작')))!.props.onClick());
+    expect(picked).toMatchObject([{ kind: 'new', sessionId: expect.any(String) }]);
+    await act(async () => buttons().find((b) => b.props.className?.includes('flex min-w-0 flex-1 flex-col'))!.props.onClick());
+    expect(picked[1]).toEqual({ kind: 'existing', sessionId: currentId });
+    await act(async () => buttons().find((b) => b.props['aria-label'] === `대화 ${currentId} 지우기`)!.props.onClick({ stopPropagation: () => {} }));
+    expect(renderedText(tree!)).toContain('대화 지우기');
+    expect(renderedText(tree!)).not.toContain('세션');
+  });
+
+  it('ID 칩과 삭제 확인창은 대화로 안내하고 동일 ID·확인 콜백을 유지한다', async () => {
+    let confirms = 0;
+    await act(async () => { tree = create(createElement('div', null,
+      createElement(SessionIdChip, { sessionId: currentId }),
+      createElement(SessionDeleteConfirm, { open: true, session: currentSession, onCancel: () => {}, onConfirm: () => { confirms++; } }),
+    )); });
+    expect(tree!.root.findByProps({ 'data-elanous-session-id': currentId }).props['aria-label']).toBe(`대화 ID ${currentId} 복사`);
+    expect(renderedText(tree!)).toContain('대화 지우기');
+    expect(renderedText(tree!)).not.toContain('세션');
+    await act(async () => tree!.root.findAllByType('button').find((b) => b.children.includes('지우기'))!.props.onClick());
+    expect(confirms).toBe(1);
   });
 });

@@ -1,10 +1,13 @@
-import { expect, test } from 'bun:test';
+import { setDefaultTimeout, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 import { loadMachineLedger, machineLedgerPath, machineMarkdownPath, renderLedgerMarkdown, setMachineField, validateMachineLedger } from './machine-ledger.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const fixture = () => ({ title: 'Machine ledger', policy: ['YAML only'], machines: [{ id: 'mbp', name: 'mbp', specs: 'M5', locationStatus: 'office', role: 'work', duties: 'build' }], devices: [{ id: 'phone', name: 'Phone', status: 'active', purpose: 'demo' }], rules: ['no secrets'], changes: ['initial'] });
 

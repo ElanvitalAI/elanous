@@ -28,6 +28,7 @@ export interface ChecklistHistory {
   to: unknown;
   released: string;
   dev: string;
+  force?: true;
 }
 export interface Checklist {
   version: string;
@@ -41,12 +42,44 @@ export function devVersion(): string {
   return (JSON.parse(readFileSync(join(import.meta.dir, '..', '..', 'package.json'), 'utf8')) as { version: string }).version;
 }
 
+export function parseOwner(value: string): { seat: string; sub?: string } {
+  const match = /^([A-Z]{2,8})(?:\/([a-z][a-z0-9-]{0,31}))?$/.exec(value);
+  if (!match || match[0] !== value) throw new CliUserError(`잘못된 담당: ${value}`, 'TC 또는 TC/rel');
+  return match[2] ? { seat: match[1]!, sub: match[2] } : { seat: match[1]! };
+}
+
+export function ownerMatches(owner: string | undefined, filter: string): boolean {
+  if (owner === undefined) return false;
+  try {
+    const parsed = parseOwner(owner);
+    const requested = parseOwner(filter);
+    return parsed.seat === requested.seat && (requested.sub === undefined || parsed.sub === requested.sub);
+  } catch { return false; }
+}
+
+// The ledger event schema has no force column; decode its claim target for every checklist snapshot.
+export function decodeClaimHistoryEntry<T extends ChecklistHistory>(entry: T): T {
+  if (entry.field !== 'claim' || !entry.to || typeof entry.to !== 'object') return entry;
+  const target = entry.to as { owner?: unknown; force?: unknown };
+  return typeof target.owner === 'string' && target.force === true ? { ...entry, to: target.owner, force: true } as T : entry;
+}
+
+function decodeClaimHistory(data: Checklist): Checklist {
+  return { ...data, history: data.history.map(decodeClaimHistoryEntry) };
+}
+
 export function listChecklist(v: string): Checklist {
-  return store.list(v);
+  return decodeClaimHistory(store.list(v));
+}
+
+/** Status events in the requested window; other ledger fields never become status changes. */
+export function statusChangesSince(history: readonly ChecklistHistory[], sinceIso: string): ChecklistHistory[] {
+  const since = Date.parse(sinceIso);
+  return history.filter((entry) => entry.field === 'status' && Date.parse(entry.at) >= since);
 }
 
 function mutate(v: string, apply: (data: Checklist) => boolean): Checklist {
-  return store.mutate(v, store.releasedVersion(), devVersion(), apply);
+  return decodeClaimHistory(store.mutate(v, store.releasedVersion(), devVersion(), apply));
 }
 
 function change(data: Checklist, id: string, field: string, from: unknown, to: unknown, by: string, at: string): void {
@@ -58,6 +91,7 @@ export function addItem(v: string, input: { id: string; title: string; owner?: s
   if (!input.id.trim()) throw new CliUserError('칸 id 가 비었다');
   if (!input.title.trim()) throw new CliUserError('칸 제목이 비었다');
   if (input.kind !== undefined && input.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${input.kind}`, 'screen');
+  if (input.owner !== undefined) parseOwner(input.owner);
   return mutate(v, (data) => {
     if (data.items.some((item) => item.id === input.id)) throw new CliUserError(`이미 있는 칸: ${input.id}`, 'set <id> 로 고친다');
     const by = process.env.ELANOUS_TRACK || 'cli';
@@ -76,6 +110,12 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
     if (patch.status !== undefined && !['green', 'yellow', 'red', 'done'].includes(patch.status)) throw new CliUserError(`잘못된 상태: ${patch.status}`);
     if (patch.disposition !== undefined && !['move', 'known-issue', 'block'].includes(patch.disposition)) throw new CliUserError(`잘못된 처분: ${patch.disposition}`);
     if (patch.kind !== undefined && patch.kind !== 'screen') throw new CliUserError(`잘못된 종류: ${patch.kind}`, 'screen');
+    if (patch.owner !== undefined) {
+      parseOwner(patch.owner);
+      if (item.owner && patch.owner !== item.owner) {
+        throw new CliUserError(`지금 주인: ${item.owner} — --force 로만 바꾼다`, 'release checklist claim <id> --by <자리> --force');
+      }
+    }
     const fields = (['evidence', 'owner', 'status', 'disposition', 'kind'] as const).filter((field) => patch[field] !== undefined && patch[field] !== item[field]);
     if (fields.length === 0) return false;
     const at = new Date().toISOString();
@@ -89,6 +129,34 @@ export function setItem(v: string, id: string, patch: { status?: ChecklistStatus
     }
     return true;
   });
+}
+
+export function claimItem(v: string, id: string, by: string, options: { force?: boolean } = {}): Checklist {
+  const requested = parseOwner(by);
+  let outcome: 'claimed' | 'same' | 'refused' = 'refused';
+  let from: string | null = null;
+  try {
+    const result = mutate(v, (data) => {
+      const item = data.items.find((i) => i.id === id);
+      if (!item) throw new CliUserError(`없는 칸: ${id}`, 'list 로 칸 목록을 본다');
+      from = item.owner ?? null;
+      if (from === by) { outcome = 'same'; return false; }
+      if (from && !options.force && !(from === requested.seat && requested.sub)) {
+        throw new CliUserError(`지금 주인: ${from} — --force 로만 바꾼다`);
+      }
+      const at = new Date().toISOString();
+      item.owner = by;
+      item.updatedAt = at;
+      item.updatedBy = by;
+      data.history.push({ at, by, id, field: 'claim', from, to: options.force ? { owner: by, force: true } : by,
+        released: data.released, dev: data.dev });
+      outcome = 'claimed';
+      return true;
+    });
+    return result;
+  } finally {
+    debug.log('release-loop.checklist', 'claim', { version: v, id, from, to: by, force: options.force === true, outcome });
+  }
 }
 
 export function removeItem(v: string, id: string, by: string): Checklist {
@@ -106,15 +174,21 @@ export function summarize(v: string): ChecklistSummary {
   return summarizeChecklist(listChecklist(v));
 }
 
-export interface ChecklistSummary { green: number; yellow: number; red: number; done: number; blocked: string[]; byOwner: Record<string, number> }
+export interface ChecklistSummary { green: number; yellow: number; red: number; done: number; blocked: string[]; byOwner: Record<string, number>; bySeat: Record<string, number> }
 
 export function summarizeChecklist(data: Checklist): ChecklistSummary {
-  const summary = { green: 0, yellow: 0, red: 0, done: 0, blocked: [] as string[], byOwner: Object.create(null) as Record<string, number> };
+  const summary = { green: 0, yellow: 0, red: 0, done: 0, blocked: [] as string[], byOwner: Object.create(null) as Record<string, number>, bySeat: Object.create(null) as Record<string, number> };
   for (const item of data.items) {
     summary[item.status]++;
     if (item.status === 'red') summary.blocked.push(item.id);
     const owner = item.owner ?? 'unassigned';
     summary.byOwner[owner] = (summary.byOwner[owner] ?? 0) + 1;
+    if (item.owner !== undefined) {
+      try {
+        const { seat } = parseOwner(item.owner);
+        summary.bySeat[seat] = (summary.bySeat[seat] ?? 0) + 1;
+      } catch { /* Preserve legacy owner in byOwner without assigning it to a seat. */ }
+    }
   }
   return summary;
 }

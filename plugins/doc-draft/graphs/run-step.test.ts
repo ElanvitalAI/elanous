@@ -33,11 +33,12 @@ if (process.env.DOC_DRAFT_KEEP_NEUTRAL && !prompt.startsWith('Review this draft'
 }
 if (process.env.DOC_DRAFT_FAIL_ASK) { console.error('ask unavailable'); process.exit(1); }
 if (prompt.startsWith('Review this draft')) {
-  console.log(JSON.stringify({reply:JSON.stringify({ok: !process.env.DOC_DRAFT_REJECT,reason:'requested item missing'})}));
+  const reviews = process.env.DOC_DRAFT_CALL_LOG ? (await Bun.file(process.env.DOC_DRAFT_CALL_LOG).text()).split('\\n').filter(line => line.includes('Review this draft')).length : 1;
+  console.log(JSON.stringify({reply:JSON.stringify({ok: !process.env.DOC_DRAFT_REJECT && !(process.env.DOC_DRAFT_REJECT_ONCE && reviews === 1),reason:'requested item missing'})}));
 } else {
   const kind = prompt.match(/Write ONE (exec-onepager|promo-post|memo) document/)?.[1];
   const samples = ${JSON.stringify(good)};
-  console.log(JSON.stringify({reply:process.env.DOC_DRAFT_BAD_DRAFT || samples[kind]}));
+  console.log(JSON.stringify({reply:(process.env.DOC_DRAFT_BAD_DRAFT_ONCE && !prompt.includes('The previous draft failed check') ? process.env.DOC_DRAFT_BAD_DRAFT_ONCE : process.env.DOC_DRAFT_BAD_DRAFT || samples[kind])}));
 }
 `;
 function fixture() {
@@ -67,7 +68,7 @@ async function graphRun(input: Record<string, unknown>, extraEnv: Record<string,
   }
 }
 
-test('metadata exposes planner keys and draft-only graph with single-visit recipes', () => {
+test('metadata exposes planner keys and draft-only graph with one revision', () => {
   const plugin = JSON.parse(readFileSync(join(dir, '../plugin.json'), 'utf8')) as Record<string, any>;
   expect(plugin.description).toBe('Drafts one document from a request — executive one-pager, promo or event post, memo. Drafts only; never published.');
   expect(plugin.extensions['ai.elanous'].graphs).toEqual(['./graphs/doc-draft.yaml']);
@@ -76,9 +77,9 @@ test('metadata exposes planner keys and draft-only graph with single-visit recip
   const steps = ['draft', 'check', 'report'];
   expect(graph.nodes.map(n => n.node_id)).toEqual([...steps, 'done', 'failed']);
   for (const [index, name] of steps.entries()) {
-    expect(graph.nodes[index]).toMatchObject({ recipe: `cmd:${name}`, max_visits: 1 });
+    expect(graph.nodes[index]).toMatchObject({ recipe: `cmd:${name}`, max_visits: name === 'report' ? 1 : 2 });
     expect(recipes[name]?.command).toBe(`bun "$ELANOUS_GRAPH_DIR/run-step.ts" ${name}`);
-    expect(graph.edges[index]).toMatchObject({ from: name, map: { ok: steps[index + 1] ?? 'done', fail: 'failed' } });
+    expect(graph.edges[index]).toMatchObject({ from: name, map: { ok: steps[index + 1] ?? 'done', ...(name === 'check' ? { revise: 'draft' } : {}), fail: 'failed' } });
   }
   expect(graph.nodes.slice(3).every(node => node.max_visits === 1)).toBe(true);
 });
@@ -161,11 +162,107 @@ test('check refuses placeholders, missing one-pager section, false publication, 
     const f = await graphRun({ kind: 'exec-onepager', topic: 'Report event readiness' }, { DOC_DRAFT_BAD_DRAFT: draft, ...extraEnv });
     try {
       expect(f.state.status).toBe('failed');
-      expect(f.state.path).toEqual(['draft', 'check', 'failed']);
-      expect(String(f.state.nodes[1]?.output)).toContain('"outcome":"fail"');
+      expect(f.state.path).toEqual(['draft', 'check', 'draft', 'check', 'failed']);
+      expect(JSON.parse(String(f.state.nodes[1]?.output))).toMatchObject({ outcome: 'revise', reason: expect.any(String) });
+      expect(JSON.parse(String(f.state.nodes[3]?.output))).toMatchObject({ outcome: 'fail', reason: expect.any(String) });
       expect(existsSync(join(f.root, 'graph-runs', 'doc-draft', f.state.runId, 'draft.md'))).toBe(false);
     } finally { f.cleanup(); }
   }
+}, 30000);
+
+test('first check rejection revises with reason and prior draft, then passes and reports only the corrected draft', async () => {
+  const f = fixture();
+  const log = join(f.root, 'calls.jsonl');
+  const outDir = join(f.root, 'out');
+  const bad = good['exec-onepager'].replace('## 핵심 숫자', '## 기타');
+  const previous = process.env.DOC_DRAFT_ELANOUS_BIN;
+  process.env.DOC_DRAFT_ELANOUS_BIN = f.bin;
+  process.env.DOC_DRAFT_CALL_LOG = log;
+  process.env.DOC_DRAFT_BAD_DRAFT_ONCE = bad;
+  try {
+    const state = await runGraph(graphFile, { input: { kind: 'exec-onepager', topic: 'Report event readiness', outDir }, deps: { root: f.root } });
+    expect(state.status).toBe('done');
+    expect(state.path).toEqual(['draft', 'check', 'draft', 'check', 'report', 'done']);
+    const firstCheck = JSON.parse(String(state.nodes[1]?.output)) as Record<string, unknown>;
+    expect(firstCheck).toEqual({ outcome: 'revise', reason: 'one-pager section missing or empty' });
+    expect(JSON.stringify(firstCheck)).not.toContain(bad);
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { args: string[] });
+    const drafts = calls.filter(call => call.args.at(-1)?.startsWith('Write ONE'));
+    expect(drafts).toHaveLength(2);
+    expect(drafts[1]?.args.at(-1)).toContain(firstCheck.reason as string);
+    expect(drafts[1]?.args.at(-1)).toContain(bad);
+    expect(JSON.parse(String(state.nodes[3]?.output))).toMatchObject({ outcome: 'ok', markdown: good['exec-onepager'] });
+    expect(readFileSync(join(outDir, 'draft.md'), 'utf8')).toBe(good['exec-onepager'] + '\n');
+  } finally {
+    if (previous === undefined) delete process.env.DOC_DRAFT_ELANOUS_BIN;
+    else process.env.DOC_DRAFT_ELANOUS_BIN = previous;
+    delete process.env.DOC_DRAFT_CALL_LOG;
+    delete process.env.DOC_DRAFT_BAD_DRAFT_ONCE;
+    f.cleanup();
+  }
+}, 30000);
+
+test('LLM check rejection revises once and passes on the second review', async () => {
+  const f = fixture();
+  const log = join(f.root, 'calls.jsonl');
+  const previous = process.env.DOC_DRAFT_ELANOUS_BIN;
+  process.env.DOC_DRAFT_ELANOUS_BIN = f.bin;
+  process.env.DOC_DRAFT_CALL_LOG = log;
+  process.env.DOC_DRAFT_REJECT_ONCE = '1';
+  try {
+    const state = await runGraph(graphFile, { input: { kind: 'memo', topic: 'Meeting' }, deps: { root: f.root } });
+    expect(state.status).toBe('done');
+    expect(state.path).toEqual(['draft', 'check', 'draft', 'check', 'report', 'done']);
+    expect(JSON.parse(String(state.nodes[1]?.output))).toEqual({ outcome: 'revise', reason: 'requested item missing' });
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { args: string[] });
+    expect(calls.filter(call => call.args.at(-1)?.startsWith('Review this draft'))).toHaveLength(2);
+    expect(calls.filter(call => call.args.at(-1)?.startsWith('Write ONE'))[1]?.args.at(-1)).toContain('requested item missing');
+    expect(JSON.parse(String(state.nodes[3]?.output))).toMatchObject({ outcome: 'ok', markdown: good.memo });
+  } finally {
+    if (previous === undefined) delete process.env.DOC_DRAFT_ELANOUS_BIN;
+    else process.env.DOC_DRAFT_ELANOUS_BIN = previous;
+    delete process.env.DOC_DRAFT_CALL_LOG;
+    delete process.env.DOC_DRAFT_REJECT_ONCE;
+    f.cleanup();
+  }
+}, 30000);
+
+test('LLM check rejection revises once, and the final failure carries the latest reason', async () => {
+  const f = fixture();
+  const log = join(f.root, 'calls.jsonl');
+  const previous = process.env.DOC_DRAFT_ELANOUS_BIN;
+  process.env.DOC_DRAFT_ELANOUS_BIN = f.bin;
+  process.env.DOC_DRAFT_CALL_LOG = log;
+  process.env.DOC_DRAFT_REJECT = '1';
+  try {
+    const state = await runGraph(graphFile, { input: { kind: 'memo', topic: 'Meeting' }, deps: { root: f.root } });
+    expect(state.status).toBe('failed');
+    expect(state.path).toEqual(['draft', 'check', 'draft', 'check', 'failed']);
+    expect(JSON.parse(String(state.nodes[1]?.output))).toEqual({ outcome: 'revise', reason: 'requested item missing' });
+    expect(JSON.parse(String(state.nodes[3]?.output))).toEqual({ outcome: 'fail', reason: 'requested item missing', error: 'requested item missing' });
+    expect(readFileSync(log, 'utf8').trim().split('\n').filter(line => line.includes('Review this draft'))).toHaveLength(2);
+    expect(existsSync(join(f.root, 'graph-runs', 'doc-draft', state.runId, 'draft.md'))).toBe(false);
+  } finally {
+    if (previous === undefined) delete process.env.DOC_DRAFT_ELANOUS_BIN;
+    else process.env.DOC_DRAFT_ELANOUS_BIN = previous;
+    delete process.env.DOC_DRAFT_CALL_LOG;
+    delete process.env.DOC_DRAFT_REJECT;
+    f.cleanup();
+  }
+}, 30000);
+
+test('second check failure reports its own reason rather than the first check reason', async () => {
+  const bad = good['exec-onepager'].replace('## 핵심 숫자', '## 기타');
+  const f = await graphRun({ kind: 'exec-onepager', topic: 'Report event readiness' }, {
+    DOC_DRAFT_BAD_DRAFT_ONCE: bad, DOC_DRAFT_REJECT: '1',
+  });
+  try {
+    expect(f.state.status).toBe('failed');
+    expect(f.state.path).toEqual(['draft', 'check', 'draft', 'check', 'failed']);
+    expect(JSON.parse(String(f.state.nodes[1]?.output))).toEqual({ outcome: 'revise', reason: 'one-pager section missing or empty' });
+    expect(JSON.parse(String(f.state.nodes[3]?.output))).toEqual({ outcome: 'fail', reason: 'requested item missing', error: 'requested item missing' });
+    expect(existsSync(join(f.root, 'graph-runs', 'doc-draft', f.state.runId, 'draft.md'))).toBe(false);
+  } finally { f.cleanup(); }
 }, 30000);
 
 test('a Markdown link is not an unfilled placeholder (운영 실측 10-02 — [elanous.ai](https://…) 가 오판됐다)', async () => {

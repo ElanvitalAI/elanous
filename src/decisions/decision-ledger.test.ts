@@ -1,4 +1,7 @@
-import { test, expect } from 'bun:test';
+import type { AskUserQuestionRequest } from '../ask-user-question/types.js';
+import { createPendingQuestion, readPendingQuestionAnswer, writePendingQuestion, writePendingQuestionAnswer } from '../ask-user-question/pending-questions.js';
+import { debug } from '../debug/log.js';
+import { setDefaultTimeout, test, expect, spyOn } from 'bun:test';
 import { mkdtempSync, readFileSync, mkdirSync, writeFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -6,6 +9,9 @@ import { spawnSync } from 'node:child_process';
 import { createVersionResolver } from '../directives/version-at.js';
 import { DecisionLedger, importDecisionMarkdown, type RaiseInput } from './decision-ledger.js';
 import { formatDecisionDetail } from '../cli/decisions-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const root = () => mkdtempSync(join(tmpdir(), 'decisions-test-'));
 const base: RaiseInput = { title: 'Publish?', category: 'publish', scqa: { s: 'Draft ready.', c: 'Publishing is irreversible.' },
@@ -30,6 +36,27 @@ test('raise, open listing, human decision, chronological versions and append-onl
   expect(store.list({ status: 'all', since: '2026-10-01' })).toHaveLength(0);
   expect(readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line) as { type: string }).map(e => e.type)).toEqual(['raised', 'decided']);
   expect(() => store.withdraw(raised.id, 'late')).toThrow('already closed');
+});
+
+test('resume target persists, rejects path-like question IDs, and leaves legacy entries readable', () => {
+  const store = ledger();
+  const legacy = store.raise(base);
+  const legacyLine = readFileSync(store.path, 'utf8').trim();
+  expect(JSON.parse(legacyLine).entry).not.toHaveProperty('resume');
+  const raised = store.raise({ ...base, resume: { questionId: 'auq:mk8f00:abc12', runId: 'run-1' } });
+  expect(raised.resume).toEqual({ questionId: 'auq:mk8f00:abc12', runId: 'run-1' });
+  expect(store.show(raised.id).resume).toEqual(raised.resume);
+  expect(store.show(legacy.id).resume).toBeUndefined();
+  const reopened = ledger(join(store.path, '..', '..'));
+  expect(reopened.show(legacy.id).resume).toBeUndefined();
+  expect(reopened.show(raised.id).resume).toEqual(raised.resume);
+  const withoutRun = store.raise({ ...base, resume: { questionId: 'auq:abc:xyz09' } });
+  expect(reopened.show(withoutRun.id).resume).toEqual({ questionId: 'auq:abc:xyz09' });
+  for (const questionId of ['../escape', 'auq:../escape:abc12', 'auq:abc/def:abc12', 'auq:abc\\def:abc12', 'auq:abc:def12/..', 'auq:abc:xyz0!', 'auq:abc:xyz09\n', '']) {
+    expect(() => store.raise({ ...base, resume: { questionId } })).toThrow('invalid resume questionId');
+  }
+  expect(store.list({ status: 'all' })).toHaveLength(3);
+  expect(readFileSync(store.path, 'utf8').trim().split('\n')).toHaveLength(3);
 });
 
 test('AUTO requires delegation; invalid SCQA, one option and skipped recommendation require rejection', () => {
@@ -252,4 +279,189 @@ test('incomplete historical item with source options is resumed without inventin
   expect(store.show(pending.id).choice).toBe('b');
   expect(store.show(pending.id).decidedAt).toBeUndefined();
   expect(importDecisionMarkdown(store, source).existing).toContain('C4');
+});
+
+test('resume target writes the selected key and label for the waiting question once, with safe observation', () => {
+  const stateDir = root();
+  const calls: Parameters<typeof writePendingQuestionAnswer>[0][] = [];
+  const store = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions,
+    writeAnswer: (answer, deps) => { calls.push(answer); expect(deps?.root?.()).toBe(stateDir); } });
+  const logs: unknown[][] = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+  try {
+    writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'scope_choice', header: 'Scope', question: 'Choose.', options: [
+      { label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' },
+    ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+    const raised = store.raise({ ...base, resume: { questionId: 'auq:q1:abcde', runId: 'run-x' } });
+    expect(store.show(raised.id).resume).toEqual({ questionId: 'auq:q1:abcde', runId: 'run-x' });
+    const decided = store.decide(raised.id, 'a', { kind: 'human' }, 'Private memo');
+    expect(decided.status).toBe('decided');
+    expect(calls).toEqual([{ id: 'auq:q1:abcde', result: { answers: { scope_choice: 'a) Publish' }, otherText: { scope_choice: 'Private memo' } } }]);
+    expect(logs.filter(line => line[0] === 'hitl.card-bridge')).toEqual([['hitl.card-bridge', 'answered',
+      { decisionId: raised.id, questionId: 'auq:q1:abcde', runId: 'run-x', via: 'human' }]]);
+    expect(JSON.stringify(logs)).not.toContain('Private memo');
+    expect(JSON.stringify(logs)).not.toContain('Publish');
+  } finally { spy.mockRestore(); }
+});
+
+test('default answer writer stores a resolver-readable answer under the pending question id', () => {
+  const stateDir = root();
+  const request: AskUserQuestionRequest = { questions: [{ id: 'scope_choice', header: 'Scope', question: 'Choose.',
+    options: [{ label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' }] }] };
+  writePendingQuestion(createPendingQuestion('auq:abc:12345', request, undefined, {},
+    { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+  const store = ledger(stateDir);
+  const raised = store.raise({ ...base, resume: { questionId: 'auq:abc:12345' } });
+  store.decide(raised.id, 'b', { kind: 'auto', agent: 'codex', delegation: 'owner' });
+  expect(readPendingQuestionAnswer('auq:abc:12345', { root: () => stateDir })).toEqual({ ok: true, answer: {
+    id: 'auq:abc:12345', result: { answers: { scope_choice: 'b) Hold' } },
+  } });
+});
+
+test('missing pending target records a failure, never writes a fabricated answer key', () => {
+  const stateDir = root();
+  const calls: unknown[] = [];
+  const store = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions,
+    writeAnswer: answer => { calls.push(answer); } });
+  const logs: unknown[][] = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+  try {
+    const entry = store.raise({ ...base, resume: { questionId: 'auq:q1:abcde' } });
+    expect(store.decide(entry.id, 'a', { kind: 'human' }).status).toBe('decided');
+    expect(store.show(entry.id).status).toBe('decided');
+    expect(calls).toEqual([]);
+    expect(logs.filter(line => line[0] === 'hitl.card-bridge')).toEqual([['hitl.card-bridge', 'answer-write-failed',
+      { decisionId: entry.id, questionId: 'auq:q1:abcde', reason: 'Error' }]]);
+    expect(readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line).type)).toEqual(['raised', 'decided']);
+    writePendingQuestion(createPendingQuestion('other-q', { questions: [{ id: 'actual_key', header: 'Scope', question: 'Choose.', options: [
+      { label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' },
+    ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+    const second = store.raise({ ...base, resume: { questionId: 'auq:q1:abcde' } });
+    expect(store.decide(second.id, 'b', { kind: 'human' }).status).toBe('decided');
+    expect(calls).toEqual([]);
+    writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'actual_key', header: 'Scope', question: 'Choose.', options: [
+      { label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' },
+    ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+    expect(store.retryAnswer(second.id).choice).toBe('b');
+    expect(calls).toEqual([{ id: 'auq:q1:abcde', result: { answers: { actual_key: 'b) Hold' } } }]);
+    expect(readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line).type)).toEqual(['raised', 'decided', 'raised', 'decided']);
+    expect(logs.filter(line => line[0] === 'hitl.card-bridge').map(line => line[1])).toEqual(['answer-write-failed', 'answer-write-failed', 'answered']);
+  } finally { spy.mockRestore(); }
+});
+
+test('answer delivery rejects reordered, re-keyed and changed-label pending options before writing', () => {
+  for (const { options, cardOptions } of [
+    { options: [{ label: 'Hold', description: 'Later' }, { label: 'Publish', description: 'Now' }], cardOptions: base.options },
+    { options: [{ label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' }], cardOptions: [base.options[1]!, base.options[0]!] },
+    { options: [{ label: 'Hold', description: 'Now' }, { label: 'Hold', description: 'Later' }], cardOptions: base.options },
+    { options: [{ label: 'Publish', description: 'Now' }, { label: 'Wait', description: 'Later' }], cardOptions: base.options },
+  ]) {
+    const stateDir = root();
+    const calls: unknown[] = [];
+    const store = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions,
+      writeAnswer: answer => { calls.push(answer); } });
+    const logs: unknown[][] = [];
+    const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+    try {
+      writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'choice', header: 'Scope', question: 'Choose.', options }] },
+        undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+      const entry = store.raise({ ...base, options: cardOptions, resume: { questionId: 'auq:q1:abcde' } });
+      expect(store.decide(entry.id, 'a', { kind: 'human' }).status).toBe('decided');
+      expect(store.show(entry.id).status).toBe('decided');
+      expect(calls).toEqual([]);
+      expect(readPendingQuestionAnswer('auq:q1:abcde', { root: () => stateDir })).toEqual({ ok: true, answer: null });
+      expect(logs.filter(line => line[0] === 'hitl.card-bridge')).toEqual([['hitl.card-bridge', 'answer-write-failed',
+        { decisionId: entry.id, questionId: 'auq:q1:abcde', reason: 'Error' }]]);
+      writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'choice', header: 'Scope', question: 'Choose.',
+        options: cardOptions.map(option => ({ label: option.label, description: option.consequence })),
+      }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+      if (cardOptions[0]!.key !== 'a') {
+        expect(() => store.retryAnswer(entry.id)).toThrow('answer delivery failed');
+        expect(calls).toEqual([]);
+      } else {
+        store.retryAnswer(entry.id);
+        expect(calls).toEqual([{ id: 'auq:q1:abcde', result: { answers: { choice: `a) ${cardOptions[0]!.label}` } } }]);
+      }
+    } finally { spy.mockRestore(); }
+  }
+});
+
+test('no resume writes nothing; answer writer failure does not roll back decided event', () => {
+  const stateDir = root();
+  const calls: string[] = [];
+  const store = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions,
+    writeAnswer: answer => { calls.push(answer.id); throw new Error('disk unavailable'); } });
+  const logs: unknown[][] = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+  try {
+    store.decide(store.raise(base).id, 'a', { kind: 'human' });
+    expect(calls).toEqual([]);
+    writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'choice', header: 'Scope', question: 'Choose.', options: [
+      { label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' },
+    ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+    const entry = store.raise({ ...base, resume: { questionId: 'auq:q1:abcde' } });
+    expect(store.decide(entry.id, 'b', { kind: 'auto', agent: 'codex', delegation: 'owner' }).status).toBe('decided');
+    expect(calls).toEqual(['auq:q1:abcde']);
+    expect(() => store.retryAnswer(entry.id)).toThrow('answer delivery failed');
+    expect(calls).toEqual(['auq:q1:abcde', 'auq:q1:abcde']);
+    expect(store.show(entry.id).status).toBe('decided');
+    expect(readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line).type)).toEqual(['raised', 'decided', 'raised', 'decided']);
+    expect(logs.filter(line => line[0] === 'hitl.card-bridge')).toEqual(Array(2).fill(null).map(() => ['hitl.card-bridge', 'answer-write-failed',
+      { decisionId: entry.id, questionId: 'auq:q1:abcde', reason: 'Error' }]));
+  } finally { spy.mockRestore(); }
+});
+
+test('transient writer failure is visible, retry uses the durable original choice, actor and memo without another event', () => {
+  const stateDir = root();
+  let available = false;
+  const calls: unknown[] = [];
+  const store = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions,
+    writeAnswer: (answer, deps) => { if (!available) throw new Error('disk unavailable'); calls.push(answer); writePendingQuestionAnswer(answer, deps); } });
+  writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'choice', header: 'Scope', question: 'Choose.', options: [
+    { label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' },
+  ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+  const entry = store.raise({ ...base, resume: { questionId: 'auq:q1:abcde' } });
+  expect(store.decide(entry.id, 'b', { kind: 'auto', agent: 'codex', delegation: 'owner' }, 'Use later').status).toBe('decided');
+  expect(store.show(entry.id)).toMatchObject({ status: 'decided', choice: 'b', note: 'Use later', decidedBy: { kind: 'auto' } });
+  available = true;
+  expect(store.retryAnswer(entry.id).status).toBe('decided');
+  expect(calls).toEqual([{ id: 'auq:q1:abcde', result: { answers: { choice: 'b) Hold' }, otherText: { choice: 'Use later' } } }]);
+  expect(store.retryAnswer(entry.id).status).toBe('decided');
+  expect(calls).toHaveLength(1);
+  expect(readFileSync(store.path, 'utf8').trim().split('\n').map(line => JSON.parse(line).type)).toEqual(['raised', 'decided']);
+  expect(() => store.retryAnswer('missing')).toThrow('decision not found');
+  expect(() => store.retryAnswer(store.raise(base).id)).toThrow('no recorded resume answer');
+});
+
+test('writer error cannot put the option label or memo text into failure observation', () => {
+  const stateDir = root();
+  const store = new DecisionLedger({ stateDir, now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions,
+    writeAnswer: () => { throw new Error('could not write Publish / Private memo'); } });
+  const logs: unknown[][] = [];
+  const spy = spyOn(debug, 'log').mockImplementation(((...args: unknown[]) => { logs.push(args); }) as typeof debug.log);
+  try {
+    writePendingQuestion(createPendingQuestion('auq:q1:abcde', { questions: [{ id: 'choice', header: 'Scope', question: 'Choose.', options: [
+      { label: 'Publish', description: 'Now' }, { label: 'Hold', description: 'Later' },
+    ] }] }, undefined, {}, { surface: 'file', delivery: 'file', expiresAt: '2099-10-01T01:00:00.000Z' }), { root: () => stateDir });
+    const entry = store.raise({ ...base, resume: { questionId: 'auq:q1:abcde' } });
+    expect(store.decide(entry.id, 'a', { kind: 'human' }, 'Private memo').status).toBe('decided');
+    expect(store.show(entry.id).status).toBe('decided');
+    expect(logs.filter(line => line[0] === 'hitl.card-bridge')).toEqual([['hitl.card-bridge', 'answer-write-failed',
+      { decisionId: entry.id, questionId: 'auq:q1:abcde', reason: 'Error' }]]);
+    expect(JSON.stringify(logs)).not.toContain('Private memo');
+    expect(JSON.stringify(logs)).not.toContain('Publish');
+  } finally { spy.mockRestore(); }
+});
+
+test('legacy raised events without resume still list and decide; unsafe question ids are rejected', () => {
+  const store = ledger();
+  const raised = store.raise(base);
+  expect(JSON.parse(readFileSync(store.path, 'utf8').split('\n')[0]!).entry).not.toHaveProperty('resume');
+  const reopened = new DecisionLedger({ stateDir: join(store.path, '..', '..'), now: () => new Date('2026-10-01T01:00:00Z'), resolveVersion: versions });
+  expect(reopened.list()).toHaveLength(1);
+  expect(reopened.decide(raised.id, 'a', { kind: 'human' }).status).toBe('decided');
+  for (const questionId of ['../x', 'x/y', 'x\\y', '..', '', 'a%2Fb']) {
+    expect(() => store.raise({ ...base, resume: { questionId } })).toThrow('invalid resume questionId');
+  }
+  expect(store.list({ status: 'all' })).toHaveLength(1);
 });

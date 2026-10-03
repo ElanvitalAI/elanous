@@ -45,6 +45,30 @@ test('installed graph catalog only exposes runnable YAML with its declared title
   expect(graphs.some(graph => graph.id === 'plan-loop')).toBe(false);
 });
 
+test('core exec-request catalog discovers root and nested recipe-backed graphs, while mine stays unfiltered', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'exec-core-discovery-')));
+  roots.push(root);
+  const core = join(root, 'core');
+  const mine = join(root, 'mine');
+  mkdirSync(join(core, 'field'), { recursive: true });
+  mkdirSync(join(core, 'without-recipes'));
+  mkdirSync(mine);
+  writeFileSync(join(core, 'field', 'recipes.yaml'), '{}');
+  writeFileSync(join(core, 'root.yaml'), 'graph_id: root-exec\nloop:\n  title: Root\n  description: Root description\n  exec_request: true\n  inputs: [topic, audience]\n');
+  writeFileSync(join(core, 'field', 'nested.yml'), 'graph_id: field-exec\nloop:\n  title: Field\n  description: Field description\n  exec_request: true\n  inputs:\n    photo: required\n    caption: optional\n');
+  writeFileSync(join(core, 'field', 'disabled.yaml'), 'graph_id: disabled\nloop:\n  exec_request: false\n');
+  writeFileSync(join(core, 'field', 'undeclared.yaml'), 'graph_id: undeclared\nloop:\n  title: No opt-in\n');
+  writeFileSync(join(core, 'field', 'string.yaml'), 'graph_id: string-flag\nloop:\n  exec_request: "true"\n');
+  writeFileSync(join(core, 'without-recipes', 'unbacked.yaml'), 'graph_id: unbacked\nloop:\n  exec_request: true\n');
+  writeFileSync(join(mine, 'mine.yaml'), 'graph_id: mine-graph\nloop:\n  title: Mine\n  exec_request: false\n');
+  const graphs = await installedGraphs(core, mine);
+  expect(graphs).toEqual([
+    { id: 'root-exec', title: 'Root', description: 'Root description', path: join(core, 'root.yaml'), inputKeys: ['topic', 'audience'] },
+    { id: 'field-exec', title: 'Field', description: 'Field description', path: join(core, 'field', 'nested.yml'), inputKeys: ['photo', 'caption'] },
+    { id: 'mine-graph', title: 'Mine', description: '', path: join(mine, 'mine.yaml') },
+  ]);
+});
+
 test('persistent request changes waiting → running → done from real run states and serves only run-owned artifacts', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'exec-requests-')));
   roots.push(root);

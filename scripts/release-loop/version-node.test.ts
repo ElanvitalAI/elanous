@@ -1,9 +1,12 @@
-import { afterEach, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { chmodSync, copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { nextDevVersion } from './version-node';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const scratch: string[] = [];
 afterEach(() => { for (const path of scratch.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -18,11 +21,19 @@ const args = process.argv.slice(2);
 fs.appendFileSync(path.join(root, 'calls'), 'git ' + args.join(' ') + '\\n');
 if (args[0] === 'show' && args[1] === 'origin/main:package.json') console.log(JSON.stringify({name:'fixture',version:state.version}));
 else if (args[0] === 'rev-parse' && args[1] === 'origin/main') console.log(state.sha);
+else if (args[0] === 'show' && args[1] === (state.cutSha || 'cut-sha') + ':release/next.md') {
+  if (state.cutNextMd === undefined) { console.error('fatal: path not in cut'); process.exit(128); }
+  process.stdout.write(state.cutNextMd);
+}
 else if (args[0] === 'worktree' && args[1] === 'add') {
   const tree = args[4];
   fs.mkdirSync(tree, {recursive:true});
   fs.writeFileSync(path.join(tree, 'package.json'), JSON.stringify({name:'fixture',version:state.version}, null, 2) + '\\n');
   fs.writeFileSync(path.join(tree, 'bun.lock'), JSON.stringify({workspaces:{'':{name:'fixture',version:state.version,dependencies:{}}}}));
+  if (state.nextMd !== undefined) {
+    fs.mkdirSync(path.join(tree, 'release'), {recursive:true});
+    fs.writeFileSync(path.join(tree, 'release', 'next.md'), state.nextMd);
+  }
 } else if (args[0] === 'worktree' && args[1] === 'remove') {
   fs.rmSync(args[3], {recursive:true,force:true});
 } else if (args[0] === 'fetch' && args[1] === 'origin' && args[2] === 'main') {
@@ -50,6 +61,8 @@ if (args[0] === 'install' && args[1] === '--frozen-lockfile') {
   console.log('installed');
 } else if (args[0] === 'bin/elanous.mjs' && args[1] === 'pr' && args[2] === 'land') {
   const version = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')).version;
+  const nextPath = path.join(process.cwd(), 'release', 'next.md');
+  state.landedNextMd = fs.existsSync(nextPath) ? fs.readFileSync(nextPath, 'utf8') : null;
   if (state.land === 'fail') { console.error('merge rejected'); process.exit(1); }
   if (state.land === 'no-marker') { console.log('nothing merged'); process.exit(0); }
   if (state.land !== 'no-advance') {
@@ -77,7 +90,7 @@ function fixture(version: string, land = 'ok', install = 'ok') {
     const result = spawnSync(process.execPath, [resolve(import.meta.dir, 'version-node.ts'), ...args], {
       cwd: root, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, VERSION_NODE_TEST_ROOT: root },
     });
-    return { status: result.status, output: JSON.parse(result.stdout.trim().split('\n').at(-1)!), calls: readFileSync(join(root, 'calls'), 'utf8') };
+    return { status: result.status, output: JSON.parse(result.stdout.trim().split('\n').at(-1)!), calls: readFileSync(join(root, 'calls'), 'utf8'), stderr: result.stderr };
   };
   return { root, run };
 }
@@ -221,6 +234,53 @@ test('dev-bump computes next patch from graph context, lands, then becomes idemp
   }
 });
 
+test('dev-bump removes released lines but keeps Target: later and the next.md skeleton in the landing', () => {
+  const { root, run } = fixture('0.2.4');
+  const nextMd = '# Next\n\nDescription of upcoming changes.\n\n## Feat\n\n- shipped. Documentation: none. Target: next.\n- future. Documentation: none. Target: later.\n\n## Fix\n\n- fixed. Documentation: none. Target: next.\n\nDocumentation: none.\n';
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, nextMd, cutNextMd: nextMd }));
+  const { status } = run('dev-bump', '--version', '0.2.4', '--cut', 'cut-sha', '--json');
+  expect(status).toBe(0);
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd)
+    .toBe('# Next\n\nDescription of upcoming changes.\n\n## Feat\n\n- future. Documentation: none. Target: later.\n\n## Fix\n\n\nDocumentation: none.\n');
+});
+
+test('dev-bump keeps section prose and ### subheadings; only shipped list items (and their continuation lines) go', () => {
+  const { root, run } = fixture('0.2.4');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state,
+    nextMd: '# Next\n\nTop description.\n\n## Feat\n\nOld section prose.\n### Old subsection\n- shipped. Target: next.\n  continued shipped detail.\n- future. Target: later.\n  continued later detail.\n',
+    cutNextMd: '# Next\n\n## Feat\n\n- shipped. Target: next.\n',
+  }));
+  expect(run('dev-bump', '--version', '0.2.4', '--cut', 'cut-sha', '--json').status).toBe(0);
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd)
+    .toBe('# Next\n\nTop description.\n\n## Feat\n\nOld section prose.\n### Old subsection\n- future. Target: later.\n  continued later detail.\n');
+});
+
+test('dev-bump preserves a standalone Target: later line', () => {
+  const { root, run } = fixture('0.2.4');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, nextMd: '# Next\n\n## Feat\nTarget: later\n- shipped. Target: next.\n', cutNextMd: '- shipped. Target: next.\n' }));
+  expect(run('dev-bump', '--version', '0.2.4', '--cut', 'cut-sha', '--json').status).toBe(0);
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd).toBe('# Next\n\n## Feat\nTarget: later\n');
+});
+
+test('dev-bump with no next.md lands without creating the file', () => {
+  const { root, run } = fixture('0.2.4');
+  const { status } = run('dev-bump', '--version', '0.2.4', '--json');
+  expect(status).toBe(0);
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd).toBeNull();
+});
+
+test('release does not reset next.md', () => {
+  const { root, run } = fixture('0.2.4-dev.0');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  const nextMd = '# Next\n\n## Feat\n\n- shipped. Target: next.\n';
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, nextMd }));
+  expect(run('release', '--version', '0.2.4', '--json').status).toBe(0);
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd).toBe(nextMd);
+});
+
 test('merge marker without an advanced origin/main is an error and retains the worktree', () => {
   const { run } = fixture('0.2.4-dev.0', 'no-advance');
   const { status, output, calls } = run('release', '--version', '0.2.4', '--json');
@@ -249,3 +309,37 @@ for (const land of ['fail', 'no-marker']) {
     }
   });
 }
+
+test('dev-bump keeps next.md lines that landed after the cut (OP 10-02 must-fix) and removes only lines the cut carried', () => {
+  const { root, run } = fixture('0.2.4');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state,
+    cutNextMd: '# Next\n\n## Feat\n\n- shipped in the cut. Target: next.\n',
+    nextMd: '# Next\n\n## Feat\n\n- shipped in the cut. Target: next.\n- landed after the cut. Target: next.\n',
+  }));
+  expect(run('dev-bump', '--version', '0.2.4', '--cut', 'cut-sha', '--json').status).toBe(0);
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd)
+    .toBe('# Next\n\n## Feat\n\n- landed after the cut. Target: next.\n');
+});
+
+test('dev-bump without a known cut removes nothing from next.md and warns', () => {
+  const { root, run } = fixture('0.2.4');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  const nextMd = '# Next\n\n## Feat\n\n- shipped. Target: next.\n';
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, nextMd, cutNextMd: nextMd }));
+  const result = run('dev-bump', '--version', '0.2.4', '--json');
+  expect(result.status).toBe(0);
+  expect(result.stderr).toContain('next.md 비우기 건너뜀(cut-unknown)');
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd).toBe(nextMd);
+});
+
+test('dev-bump with a cut whose next.md cannot be read removes nothing and warns', () => {
+  const { root, run } = fixture('0.2.4');
+  const state = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+  const nextMd = '# Next\n\n## Feat\n\n- shipped. Target: next.\n';
+  writeFileSync(join(root, 'state.json'), JSON.stringify({ ...state, nextMd }));
+  const result = run('dev-bump', '--version', '0.2.4', '--cut', 'cut-sha', '--json');
+  expect(result.status).toBe(0);
+  expect(result.stderr).toContain('next.md 비우기 건너뜀(cut-next-md-unreadable)');
+  expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).landedNextMd).toBe(nextMd);
+});

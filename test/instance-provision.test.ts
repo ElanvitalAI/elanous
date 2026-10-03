@@ -9,7 +9,7 @@
 //   ① 물질화(provisionDerivedUniverse) — 자식이 태어날 우주에 config 를 미리 깐다
 //   ② fail-fast(runOnboarding) — 그래도 빈 우주면 즉시·읽히는 에러로 죽는다(무한 대기 금지)
 
-import { describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import * as os from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +18,9 @@ import { setGitCommandRunnerForTesting } from '../src/git-fs/runner.js';
 import { provisionDerivedUniverse } from '../src/instance/provision.js';
 import { setTreeDerivedTestForTesting } from '../src/instance/resolve.js';
 import { spawnSyncText } from '../src/util/spawn-sync-output.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 /** macOS aliases /var → /private/var; run() has already removed the temp tree, so normalise the string (no filesystem lookup). */
 const realPath = (p: string | null | undefined): string => String(p).replace(/^\/private(?=\/var\/)/, '');

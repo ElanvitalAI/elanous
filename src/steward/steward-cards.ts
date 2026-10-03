@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { CardStore, redactSecrets, type AppendSectionInput, type CreateCardInput, type TaskCard } from '../task-cards/card-store.js';
 import type { ScheduledDecision, TriageIssue } from './triage.js';
+import type { HitlEntry } from './launch.js';
 
 export interface StewardCardStore {
   createCard(input: CreateCardInput): TaskCard;
@@ -33,7 +34,7 @@ export function recordTriageOnCards(decisions: ScheduledDecision[], issues: Tria
         });
       }
       const { rung, dependsOn, priority, disposition, hitlReason, why, owner } = decision;
-      const judgment = { rung, dependsOn, priority, disposition: rung === 'hitl' || hitlReason ? 'hitl' : disposition, hitlReason: hitlReason ?? null, why: redactSecrets(why), ...(owner ? { owner } : {}) };
+      const judgment = { rung, dependsOn, priority, disposition: rung === 'hitl' || hitlReason ? 'hitl' : disposition, hitlReason: hitlReason ?? null, why: redactSecrets(why), ...(owner ? { owner } : {}), ...(decision.capability ? { capability: decision.capability } : {}) };
       const key = `triage:${createHash('sha256').update(JSON.stringify(judgment)).digest('hex')}`;
       if (!card.sections.some(section => section.key === key)) {
         store.appendSection(card.id, { key, owner: 'steward', content: JSON.stringify(judgment) });
@@ -44,7 +45,7 @@ export function recordTriageOnCards(decisions: ScheduledDecision[], issues: Tria
   }
 }
 
-function recordOnCard(section: 'launch' | 'outcome', issue: Pick<TriageIssue, 'identifier' | 'title'>, value: object, deps: StewardCardDeps): void {
+function recordOnCard(section: 'launch' | 'outcome' | 'hitl', issue: Pick<TriageIssue, 'identifier' | 'title'>, value: object, deps: StewardCardDeps): void {
   const store = deps.store ?? new CardStore(deps.root);
   try {
     const content = redactSecrets(JSON.stringify(value));
@@ -66,4 +67,9 @@ export function recordLaunchOnCard(issue: Pick<TriageIssue, 'identifier' | 'titl
 /** Append an outcome revision to the issue card without replacing earlier sections. */
 export function recordOutcomeOnCard(issue: Pick<TriageIssue, 'identifier' | 'title'>, outcome: object, deps: StewardCardDeps = {}): void {
   recordOnCard('outcome', issue, outcome, deps);
+}
+
+/** Append a HITL handoff revision (pending → raised/unavailable) to the issue card. */
+export function recordHitlOnCard(issue: Pick<TriageIssue, 'identifier' | 'title'>, entry: HitlEntry, deps: StewardCardDeps = {}): void {
+  recordOnCard('hitl', issue, entry, deps);
 }

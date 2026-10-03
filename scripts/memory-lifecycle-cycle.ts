@@ -79,7 +79,7 @@ async function main(): Promise<void> {
           if (proposals.length) {
             const body = proposals.map((p, i) => `${i + 1}. ${p.label} (강도 ${p.score.toFixed(2)})\n   ${p.rationale}`).join('\n\n');
             const msg = `💡 taste 제안 ${proposals.length}건 — 반복 관심에서 창발한 미션 후보입니다.\n(제안일 뿐 미션 생성 아님 · 승인/기각: \`/taste approve <테마>\` · \`/taste reject <테마>\`)\n\n${body}`;
-            try { sendOutbound(msg, 'report'); } catch (e) { log(`taste 제안 발송 오류: ${e instanceof Error ? e.message : String(e)}`); }
+            try { sendOutbound(msg, 'ops-report'); } catch (e) { log(`taste 제안 발송 오류: ${e instanceof Error ? e.message : String(e)}`); }
             log(`taste 제안 표면화: ${proposals.length}건`);
           }
         }
@@ -101,7 +101,7 @@ async function main(): Promise<void> {
     const changed = (report.recaps?.promoted ?? 0) + (report.consolidate?.consolidated ?? 0)
       + (report.archive?.archived ?? 0) + (report.prunedEvents ?? 0);
     if (changed > 0) {
-      try { sendOutbound(`🧠 기억 회고(새벽) — ${summary}`, 'report'); } catch (e) { log(`발송 오류: ${e instanceof Error ? e.message : String(e)}`); }
+      try { sendOutbound(`🧠 기억 회고(새벽) — ${summary}`, 'ops-report'); } catch (e) { log(`발송 오류: ${e instanceof Error ? e.message : String(e)}`); }
     }
 
     // 자율행동 회상 로깅(autopilot P0.2) — 회고 루프도 자율행동.

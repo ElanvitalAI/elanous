@@ -41,6 +41,25 @@ const newer = {
   seats: [{ seat: 'COO', title: '검토', status: 'failed' }, { seat: 'CMO', title: '작성', status: 'done' }], resultCount: 1,
 };
 
+test('request query opens its matching detail from the today link', async () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { location: { search: '?request=newer' } } as Window & typeof globalThis;
+  const calls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    calls.push(url);
+    if (url.endsWith('/newer')) return json({ ...newer, summary: '오늘 상세', results: [], approvals: [] });
+    return json({ items: [older, newer] });
+  }) as typeof fetch;
+  try {
+    const root = await mount();
+    expect(root.findByProps({ id: 'exec-detail' }).children).toEqual(['맡긴 일 상세']);
+    expect(root.findAllByType('p').some(p => p.children.join('') === '오늘 상세')).toBe(true);
+    expect(calls).toContain('https://nexus.example/v1/exec-requests/newer');
+  } finally {
+    globalThis.window = originalWindow;
+  }
+});
+
 test('one-line POST accepts only 202, immediately shows planning card and rejects a duplicate send', async () => {
   const calls: Array<{ url: string; init?: RequestInit }> = [];
   let resolvePost: ((value: Response) => void) | undefined;
@@ -114,6 +133,31 @@ test('reclicking completed or failed cards keeps detail; switching cards fetches
   }
 });
 
+test('returning to a completed request starts a new detail read and discards the first delayed response', async () => {
+  let resolveFirst: ((value: Response) => void) | undefined;
+  let readsOfOlder = 0;
+  globalThis.fetch = ((url: string) => {
+    if (url.endsWith('/older')) {
+      readsOfOlder += 1;
+      if (readsOfOlder === 1) return new Promise<Response>(resolve => { resolveFirst = resolve; });
+      return Promise.resolve(json({ ...older, summary: '최신 상세', results: [], approvals: [] }));
+    }
+    if (url.endsWith('/newer')) return Promise.resolve(json({ ...newer, summary: '다른 상세', results: [], approvals: [] }));
+    return Promise.resolve(json({ items: [older, newer] }));
+  }) as typeof fetch;
+  const root = await mount();
+  const card = (label: string) => root.findAllByProps({ 'aria-expanded': false }).find(button => button.findAllByType('span')[1]?.children.join('') === label)!;
+  await act(async () => { card('지난 요청').props.onClick(); });
+  expect(readsOfOlder).toBe(1);
+  await act(async () => { card('오늘 요청').props.onClick(); });
+  await act(async () => { card('지난 요청').props.onClick(); });
+  expect(readsOfOlder).toBe(2);
+  expect(root.findAllByType('p').some(p => p.children.join('') === '최신 상세')).toBe(true);
+  await act(async () => { resolveFirst!(json({ ...older, summary: '오래된 상세', results: [], approvals: [] })); });
+  expect(root.findAllByType('p').some(p => p.children.join('') === '최신 상세')).toBe(true);
+  expect(root.findAllByType('p').some(p => p.children.join('') === '오래된 상세')).toBe(false);
+});
+
 test('authenticated result file is fetched through daemon client; unrelated remote result stays a link', async () => {
   const client = new DaemonClient({ baseUrl: 'https://nexus.example', token: 'owner-token', provider: '' });
   const fetches: Array<{ url: string; init?: RequestInit }> = [];
@@ -128,13 +172,13 @@ test('authenticated result file is fetched through daemon client; unrelated remo
   }) as typeof fetch;
   const originalCreate = URL.createObjectURL;
   const originalRevoke = URL.revokeObjectURL;
-  const originalDocument = globalThis.document;
+  const originalWindow = globalThis.window;
   const originalTimeout = globalThis.setTimeout;
-  const clicks: string[] = [];
+  const tab = { opener: {} as unknown, closed: false, location: { replace(url: string) { expect(url).toBe('blob:result'); } }, close() {} };
   URL.createObjectURL = () => 'blob:result';
   URL.revokeObjectURL = () => {};
   globalThis.setTimeout = (() => 1) as unknown as typeof setTimeout;
-  globalThis.document = { body: { appendChild() {} }, createElement: () => ({ href: '', download: '', click() { clicks.push(this.href); }, remove() {} }) } as unknown as Document;
+  globalThis.window = { open: () => tab } as unknown as Window & typeof globalThis;
   try {
     await act(async () => {
       tree = create(<DaemonContext.Provider value={{ client, config: { baseUrl: 'https://nexus.example', token: 'owner-token', provider: '' }, sessionId: '', setConfig: () => {}, setSessionId: () => {} }}><ExecPage /></DaemonContext.Provider>);
@@ -147,12 +191,12 @@ test('authenticated result file is fetched through daemon client; unrelated remo
       url: 'https://nexus.example/v1/exec-requests/one/files/file.pdf',
       init: { headers: { authorization: 'Bearer owner-token' } },
     });
-    expect(clicks).toEqual(['blob:result']);
+    expect(tab.opener).toBe(null);
   } finally {
     URL.createObjectURL = originalCreate;
     URL.revokeObjectURL = originalRevoke;
     globalThis.setTimeout = originalTimeout;
-    globalThis.document = originalDocument;
+    globalThis.window = originalWindow;
   }
 });
 
@@ -167,7 +211,7 @@ test('active requests poll list and selected detail every five seconds, then sto
     return id;
   }) as unknown as typeof setInterval;
   globalThis.clearInterval = ((id: number) => { timers.delete(id); }) as unknown as typeof clearInterval;
-  let status = 'running';
+  let status = 'planning';
   const calls: string[] = [];
   globalThis.fetch = (async (url: string) => {
     calls.push(url);
@@ -180,10 +224,98 @@ test('active requests poll list and selected detail every five seconds, then sto
     expect([...timers.values()].map(timer => timer.delay)).toEqual([5_000, 5_000]);
     await act(async () => { for (const timer of [...timers.values()]) timer.callback(); });
     expect(calls.filter(url => url.endsWith('/active'))).toHaveLength(2);
+    status = 'running';
+    await act(async () => { for (const timer of [...timers.values()]) timer.callback(); });
+    expect(calls.filter(url => url.endsWith('/active'))).toHaveLength(3);
+    expect(timers.size).toBe(2);
     status = 'done';
     await act(async () => { for (const timer of [...timers.values()]) timer.callback(); });
     expect(root.findByProps({ 'aria-expanded': true }).findAllByType('span')[2]!.children.join('')).toBe('완료');
     expect(timers.size).toBe(0);
+  } finally {
+    globalThis.setInterval = originalInterval;
+    globalThis.clearInterval = originalClear;
+  }
+});
+
+test('a completed request polls only while a matching approval is pending, including before the first list resolves', async () => {
+  const originalInterval = globalThis.setInterval;
+  const originalClear = globalThis.clearInterval;
+  const timers = new Map<number, { callback: () => void; delay: number }>();
+  let nextTimer = 0;
+  globalThis.setInterval = ((callback: () => void, delay: number) => {
+    const id = ++nextTimer;
+    timers.set(id, { callback, delay });
+    return id;
+  }) as unknown as typeof setInterval;
+  globalThis.clearInterval = ((id: number) => { timers.delete(id); }) as unknown as typeof clearInterval;
+  let resolveList: ((value: Response) => void) | undefined;
+  let withResult = false;
+  let detailCalls = 0;
+  globalThis.fetch = ((url: string, init?: RequestInit) => {
+    if (url.endsWith('/finished')) {
+      detailCalls += 1;
+      return Promise.resolve(json({ id: 'finished', text: '일', createdAt: '2026-10-01', status: 'done', summary: '', seats: [],
+        results: withResult ? [{ seat: 'COO', kind: 'report', title: '늦게 온 보고서', url: 'https://example.com/report' }] : [],
+        approvals: [{ graphId: 'graph', runId: 'run', message: '게시 확인' }] }));
+    }
+    if (init?.method === 'POST') return Promise.resolve(json({ graphId: 'graph', runId: 'run', decision: 'approved' }));
+    if (url.endsWith('/v1/graph-approvals')) return resolveList
+      ? Promise.resolve(json({ items: [] }))
+      : new Promise<Response>(resolve => { resolveList = resolve; });
+    return Promise.resolve(json({ items: [{ id: 'finished', text: '일', createdAt: '2026-10-01', status: 'done', seats: [], resultCount: 0 }] }));
+  }) as typeof fetch;
+  try {
+    const root = await mount();
+    await act(async () => { root.findByProps({ 'aria-expanded': false }).props.onClick(); });
+    expect([...timers.values()].map(timer => timer.delay)).toEqual([5_000]);
+    withResult = true;
+    await act(async () => { for (const timer of [...timers.values()]) timer.callback(); });
+    expect(detailCalls).toBe(2);
+    expect(root.findByType('a').props.href).toBe('https://example.com/report');
+    await act(async () => { resolveList!(json({ items: [{ graphId: 'graph', runId: 'run' }] })); });
+    expect(timers.size).toBe(1);
+    await act(async () => { for (const timer of [...timers.values()]) timer.callback(); });
+    expect(detailCalls).toBe(3);
+    await act(async () => { root.findAllByType('button').find(button => button.children.join('') === '승인')!.props.onClick(); });
+    expect(timers.size).toBe(0);
+    await act(async () => { for (const timer of [...timers.values()]) timer.callback(); });
+    expect(detailCalls).toBe(4);
+  } finally {
+    globalThis.setInterval = originalInterval;
+    globalThis.clearInterval = originalClear;
+  }
+});
+
+test('a completed request with historical approvals stops polling once the pending list is empty', async () => {
+  const originalInterval = globalThis.setInterval;
+  const originalClear = globalThis.clearInterval;
+  const timers = new Map<number, () => void>();
+  let nextTimer = 0;
+  globalThis.setInterval = ((callback: () => void, delay: number) => {
+    expect(delay).toBe(5_000);
+    const id = ++nextTimer;
+    timers.set(id, callback);
+    return id;
+  }) as unknown as typeof setInterval;
+  globalThis.clearInterval = ((id: number) => { timers.delete(id); }) as unknown as typeof clearInterval;
+  let detailCalls = 0;
+  globalThis.fetch = (async (url: string) => {
+    if (url.endsWith('/finished')) {
+      detailCalls += 1;
+      return json({ id: 'finished', text: '일', createdAt: '2026-10-01', status: 'done', summary: '', seats: [], results: [],
+        approvals: [{ graphId: 'graph', runId: 'run', message: '이미 결정한 게시' }] });
+    }
+    if (url.endsWith('/v1/graph-approvals')) return json({ items: [] });
+    return json({ items: [{ id: 'finished', text: '일', createdAt: '2026-10-01', status: 'done', seats: [], resultCount: 0 }] });
+  }) as typeof fetch;
+  try {
+    const root = await mount();
+    await act(async () => { root.findByProps({ 'aria-expanded': false }).props.onClick(); });
+    expect(detailCalls).toBe(1);
+    expect(timers.size).toBe(0);
+    await act(async () => { for (const callback of [...timers.values()]) callback(); });
+    expect(detailCalls).toBe(1);
   } finally {
     globalThis.setInterval = originalInterval;
     globalThis.clearInterval = originalClear;

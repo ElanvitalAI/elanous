@@ -1,9 +1,12 @@
-import { afterEach, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, expect, spyOn, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { delimiter, join } from 'node:path';
 import { debug } from '../debug/log.js';
 import type { DoctorFixDeps } from '../cli/doctor-fix.js';
 import { runFirstRunDoctor } from './first-run-doctor.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const originalPath = process.env.PATH;
 afterEach(() => {

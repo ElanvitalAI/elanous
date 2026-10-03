@@ -102,7 +102,7 @@ nodes:
     # 📏 2026-09-09 실측(런 79·중앙값 2.0·관측 최대 10·초과 런 9) — 초과 런의 완주율이 이내 런과 «같아» 병리가 아니다.
     #    ⛔ 이 수를 인용하지 말고 `bun scripts/measure-graph-visit-budget-drift.ts` 로 그때 다시 재라.
     progress: [implementing, implemented]
-    terminal_stages: [aborted, timed-out, soft-stopped]  # 📏 #20101 이 코드 상수(pipeline-shape.ts:16)에 더했고 선언은 안 따라왔다 — graph-yaml.test.ts 가 잡았다(2026-09-26)
+    terminal_stages: [aborted, timed-out, soft-stopped, parked]  # parked = H4 critical 미응답(2026-10-02) · 📏 #20101 이 코드 상수(pipeline-shape.ts:16)에 더했고 선언은 안 따라왔다 — graph-yaml.test.ts 가 잡았다(2026-09-26)
     contract:                          # 원문 §「노드별 모델·스킬·도구 권한 제한」의 세 칸
       inputs: [goal, worktree]
       tools: worktree-write            # 격리된 작업 공간

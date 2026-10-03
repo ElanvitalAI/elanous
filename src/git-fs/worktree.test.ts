@@ -2,21 +2,127 @@
 // 재실행/재구현 시 안정 브랜치명(se/…-<phaseHex>)이 이전 세대에서 고아로 남아도
 // SE 격리가 하드 실패("branch already exists") 대신 흡수해야 한다(dogfood: KGS 즉사).
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, lstatSync, chmodSync, readFileSync, realpathSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { createWorktree, gateWorktreeReuse, isUnbornHeadError, linkWorktreeDependencies, worktreeParentDir, worktreeDirName, observeGitResidue, gateGitResidue, removeWorktree, syncBaseWithRemote, DEFAULT_BRANCH_WORKTREE_BASE, DEFAULT_WORKTREE_DEPENDENCY_PATHS, type GitRunner, type WorktreeReuseExpectation } from './worktree.js';
+import { createWorktree, gateWorktreeReuse, isUnbornHeadError, linkWorktreeDependencies, worktreeParentDir, worktreeDirName, observeGitResidue, gateGitResidue, removeWorktree, syncBaseWithRemote, DEFAULT_BRANCH_WORKTREE_BASE, DEFAULT_WORKTREE_DEPENDENCY_PATHS, type GitRunner, type WorktreeAddDeps, type WorktreeReuseExpectation } from './worktree.js';
 import { recordHarnessWorktreeProvenance } from '../harness/harness-worktree-add.js';
 import { isTransientGitError } from './retry.js';
 import { setGitCommandRunnerForTesting } from './runner.js';
 import { debug } from '../debug/log.js';
+import { buildUserConfig, resetUserConfig } from '../user-config.js';
 import { reviewScopeDiff } from '../self-implement/seams.js';
 
 function git(repo: string, ...args: string[]): void {
   const r = spawnSync('git', args, { cwd: repo, encoding: 'utf8' });
   if (r.status !== 0) throw new Error(`git ${args.join(' ')} — ${r.stderr}`);
 }
+
+describe('createWorktree — add timeout and stderr diagnostics', () => {
+  let tmp: string, repo: string;
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'wt-add-timeout-'));
+    repo = join(tmp, 'repo');
+    git(tmp, 'init', '-q', 'repo');
+    git(repo, 'config', 'user.email', 't@t.t');
+    git(repo, 'config', 'user.name', 't');
+    git(repo, 'commit', '--allow-empty', '-qm', 'init');
+  });
+  afterEach(() => { rmSync(tmp, { recursive: true, force: true }); });
+
+  const failed = (stderr: string, extra: Partial<SpawnSyncReturns<string>> = {}): SpawnSyncReturns<string> => ({
+    pid: 0, output: [], stdout: '', stderr, status: 128, signal: null, ...extra,
+  });
+  const run = (result: SpawnSyncReturns<string>) => {
+    const calls: number[] = [];
+    const spawn: NonNullable<WorktreeAddDeps['spawn']> = (_command, _args, options) => {
+      calls.push(options.timeout);
+      return result;
+    };
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      let message = '';
+      try {
+        createWorktree({ repoRoot: repo, worktreeRoot: tmp, branch: 'se/timeout' }, {
+          spawn,
+        });
+      } catch (error) { message = (error as Error).message; }
+      const failureLog = log.mock.calls.find(([, event]) => event === 'add.failed');
+      return { message, calls, failureLog };
+    } finally { log.mockRestore(); }
+  };
+
+  test('ETIMEDOUT and SIGTERM report elapsed limit and last progress without retry', () => {
+    const result = run(failed('Preparing worktree\rUpdating files: 93% (20913/22487)\r', {
+      status: null, signal: 'SIGTERM', error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }),
+    }));
+    expect(result.message).toContain('git worktree add timed out after 300s (SIGTERM)');
+    expect(result.message).toContain('checkout was at «Updating files: 93% (20913/22487)»');
+    expect(result.calls).toEqual([300_000]);
+    expect(result.failureLog).toEqual(['git-fs.worktree', 'add.failed',
+      { reason: 'timeout', ms: 300_000, signal: 'SIGTERM', lastProgress: 'Updating files: 93% (20913/22487)' }, { level: 'warn' }]);
+  });
+
+  test('ETIMEDOUT without signal bypasses lock retry', () => {
+    const result = run(failed('fatal: cannot lock ref\rUpdating files: 92%\r', {
+      status: null, error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }),
+    }));
+    expect(result.message).toContain('timed out after 300s (none)');
+    expect(result.calls).toEqual([300_000]);
+    expect(result.failureLog?.[2]).toMatchObject({ reason: 'timeout', signal: null });
+  });
+
+  test('SIGTERM without ETIMEDOUT is a signal failure, not a timeout or retryable lock error', () => {
+    const result = run(failed('fatal: cannot lock ref\rUpdating files: 92%\r', {
+      status: null, signal: 'SIGTERM',
+    }));
+    expect(result.message).toContain('git worktree add failed (SIGTERM) — fatal: cannot lock ref');
+    expect(result.message).not.toContain('timed out');
+    expect(result.calls).toEqual([300_000]);
+    expect(result.failureLog?.[2]).toMatchObject({ reason: 'error', signal: 'SIGTERM', lastProgress: 'Updating files: 92%' });
+  });
+
+  test('ordinary fatal checked-out error stays visible', () => {
+    const result = run(failed("fatal: 'x' is already checked out at /tmp/elsewhere\n"));
+    expect(result.message).toContain("fatal: 'x' is already checked out at /tmp/elsewhere");
+    expect(result.calls).toEqual([300_000]);
+  });
+
+  test('fatal after progress keeps last three meaningful lines, not progress', () => {
+    const result = run(failed('Preparing worktree\rUpdating files: 92%\rfatal: first\nfatal: second\nfatal: unable to write files\n'));
+    expect(result.message).toContain('fatal: first | fatal: second | fatal: unable to write files');
+    expect(result.message).not.toContain('Updating files: 92%');
+    expect(result.failureLog?.[2]).toMatchObject({ reason: 'error', ms: 300_000, signal: null, lastProgress: 'Updating files: 92%' });
+    const timeout = run(failed('Updating files: 92%\rfatal: unable to write files\n', {
+      status: null, signal: 'SIGTERM', error: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }),
+    }));
+    expect(timeout.message).toContain('fatal: unable to write files');
+    expect(timeout.message).toContain('checkout was at «Updating files: 92%»');
+  });
+
+  test('harness.worktreeAddTimeoutSec: 600 parses and applies to add', () => {
+    const configFile = join(tmp, 'config.json');
+    writeFileSync(configFile, JSON.stringify({ harness: { worktreeAddTimeoutSec: 600 } }));
+    const seconds = buildUserConfig(configFile).harness?.worktreeAddTimeoutSec;
+    expect(seconds).toBe(600);
+    writeFileSync(configFile, JSON.stringify({ harness: { worktreeAddTimeoutSec: -1 } }));
+    expect(buildUserConfig(configFile).harness?.worktreeAddTimeoutSec).toBeUndefined();
+    const previousConfigHome = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = tmp;
+    mkdirSync(join(tmp, 'elanous'));
+    writeFileSync(join(tmp, 'elanous', 'config.json'), JSON.stringify({ harness: { worktreeAddTimeoutSec: 600 } }));
+    resetUserConfig();
+    try {
+      const add = run(failed('fatal: no space'));
+      expect(add.calls).toEqual([600_000]);
+    } finally {
+      if (previousConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = previousConfigHome;
+      resetUserConfig();
+    }
+  });
+});
 
 describe('createWorktree — resetExisting 견고화', () => {
   let tmp: string, repo: string;

@@ -4,11 +4,14 @@
 // the same way real users do (rather than re-running the in-process
 // action handlers, which already have coverage in cli-workflow.test.ts).
 
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'child_process';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { join, resolve } from 'path';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const ENTRY = resolve(import.meta.dir, '..', 'src', 'index.ts');
 

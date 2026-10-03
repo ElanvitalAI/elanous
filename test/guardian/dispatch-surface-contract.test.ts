@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const tempRoots: string[] = [];
@@ -63,6 +66,8 @@ function createFixtureTree(): { rootDir: string; guardianTypes: string; verifier
   mkdirSync(join(rootDir, 'src', 'feedback'), { recursive: true });
   writeFileSync(join(rootDir, 'src', 'feedback', 'envelope.ts'), 'export interface FeedbackEnvelope {}\n');
   writeFileSync(join(rootDir, 'src', 'llm.ts'), 'export interface LLMToolSpec {}\n');
+  mkdirSync(join(rootDir, 'src', 'hitl'), { recursive: true });
+  writeFileSync(join(rootDir, 'src', 'hitl', 'confirm.ts'), 'export interface ConfirmChannel {}\n');
   mkdirSync(join(rootDir, 'src', 'policy'), { recursive: true });
   writeFileSync(join(rootDir, 'src', 'policy', 'claude-subscription-guard.ts'), `${requestOrigin}\n`);
   mkdirSync(join(rootDir, 'src', 'plugins', 'core'), { recursive: true });

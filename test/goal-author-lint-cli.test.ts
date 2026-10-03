@@ -1,9 +1,12 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ERROR_REQUIRED_BLOCKS, REQUIRED_BLOCKS } from '../src/self-implement/goal-author.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const directories: string[] = [];
 const canonicalGoal = (scopeBoundary = 'short', evidence = '- [proof] present'): string => `## PROBLEM

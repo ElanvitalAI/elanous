@@ -1,10 +1,12 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, test, spyOn } from 'bun:test';
+import { createHash } from 'node:crypto';
+import { debug } from '../debug/log.js';
 import { Database } from 'bun:sqlite';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
-import { addItem, checklistGate, listChecklist, removeItem, setItem, summarizeChecklist, type Checklist } from './checklist.js';
+import { addItem, checklistGate, claimItem, listChecklist, removeItem, setItem, summarizeChecklist, type Checklist } from './checklist.js';
 import * as features from './feature-store.js';
 
 let dir: string;
@@ -34,6 +36,161 @@ test('네 판 JSON 들이기: 집계와 노랑 처분·parity 게이트가 그�
   const db = new Database(join(dir, 'release/features.sqlite'));
   expect(db.query('PRAGMA journal_mode').get()).toEqual({ journal_mode: 'wal' });
   db.close();
+});
+
+test('JSON 새 시각의 칸만 reimport: 값·이력·경고·관측과 원장 전용 칸 보존', () => {
+  setup(); fixture('0.2.9');
+  features.list('0.2.9');
+  const dbPath = join(dir, 'release/features.sqlite');
+  const db = new Database(dbPath);
+  const path = join(dir, 'release/0.2.9/checklist.json');
+  const oldHash = createHash('sha256').update(readFileSync(path)).digest('hex');
+  expect(db.query('SELECT json_hash, imported_at FROM imported_versions WHERE version = ?').get('0.2.9')).toEqual({ json_hash: oldHash, imported_at: expect.any(String) });
+  db.close();
+  const alone = { id: 'LEDGER', title: '원장 전용', status: 'green' as const, updatedAt: '2026-10-02T00:00:00Z', updatedBy: 'TC' };
+  features.add('0.2.9', alone);
+  const changed = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
+  changed.items[0] = { ...changed.items[0]!, status: 'green', owner: 'TC', kind: 'screen', evidence: '#456', disposition: 'known-issue', updatedAt: '2026-10-03T00:00:00Z', updatedBy: 'legacy' };
+  changed.items[1] = { ...changed.items[1]!, title: '오래된 제목', status: 'green', updatedAt: '2026-09-30T00:00:00Z' };
+  changed.items.push({ id: 'NEW', title: '새 칸', status: 'green', updatedAt: '2026-10-03T00:00:00Z', updatedBy: 'legacy' });
+  writeFileSync(path, JSON.stringify(changed));
+  const warning = spyOn(console, 'error').mockImplementation(() => {});
+  const log = spyOn(debug, 'log');
+  try {
+    const result = features.list('0.2.9', '', '');
+    expect(result.items.find((item) => item.id === 'L13e')).toMatchObject({ status: 'green', owner: 'TC', kind: 'screen', evidence: '#456', disposition: 'known-issue' });
+    expect(result.items.find((item) => item.id === 'X0.2.9')).toMatchObject({ title: '화면', status: 'red' });
+    expect(result.history.filter((entry) => entry.id === 'X0.2.9' && entry.field === 'reimport')).toHaveLength(0);
+    expect(result.items.find((item) => item.id === 'LEDGER')).toEqual(alone);
+    expect(result.items.find((item) => item.id === 'NEW')?.status).toBe('green');
+    expect(features.details('L13e')).toMatchObject({ owner: 'TC', kind: 'screen' });
+    expect(result.history.filter((entry) => entry.field === 'reimport')).toMatchObject([
+      { id: 'L13e', by: 'legacy', from: { status: 'yellow', evidence: '#123', owner: 'OP', disposition: 'move' }, to: { status: 'green', evidence: '#456', owner: 'TC', disposition: 'known-issue', kind: 'screen' } },
+      { id: 'NEW', by: 'legacy', from: null, to: { status: 'green' } },
+    ]);
+    expect(warning).toHaveBeenCalledTimes(2);
+    expect(warning.mock.calls.map((call) => call[0])).toEqual(['⚠ checklist 0.2.9: 옛 판이 checklist.json 에 쓴 2칸을 다시 들였다(L13e, NEW)',
+      '⚠ checklist 0.2.9: 옛 판 checklist.json 과 원장이 다르다 — 원장이 더 새로워 원장 값 유지 1칸(X0.2.9)']);
+    expect(log).toHaveBeenCalledWith('release.features', 'reimported', { version: '0.2.9', changed: 1, added: 1, ledgerWon: 1, notReadded: 0 });
+    const db = new Database(dbPath);
+    expect(db.query('SELECT json_hash, imported_at FROM imported_versions WHERE version = ?').get('0.2.9')).toEqual({ json_hash: createHash('sha256').update(readFileSync(path)).digest('hex'), imported_at: expect.any(String) });
+    db.close();
+    features.list('0.2.9');
+    expect(warning).toHaveBeenCalledTimes(2);
+  } finally { warning.mockRestore(); log.mockRestore(); }
+});
+
+test('같은 시각에는 원장이 이기고, 다른 칸만 새로워지면 기존 근거 참조를 보존한다', () => {
+  setup(); fixture('0.2.9');
+  features.list('0.2.9');
+  features.evidenceAdd('L13e', '0.2.9', '#ref', 'TC');
+  const path = join(dir, 'release/0.2.9/checklist.json');
+  const data = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
+  const before = features.list('0.2.9').items[0]!;
+  data.items[0] = { ...data.items[0]!, status: 'green', updatedAt: before.updatedAt };
+  writeFileSync(path, JSON.stringify(data));
+  const warning = spyOn(console, 'error').mockImplementation(() => {});
+  const log = spyOn(debug, 'log');
+  try {
+    expect(features.list('0.2.9').items[0]).toMatchObject({ status: 'yellow', evidence: '#123\n#ref' });
+    expect(warning).toHaveBeenCalledTimes(1);
+    expect(warning.mock.calls[0]?.[0]).toBe('⚠ checklist 0.2.9: 옛 판 checklist.json 과 원장이 다르다 — 원장이 더 새로워 원장 값 유지 1칸(L13e)');
+    expect(log).toHaveBeenCalledWith('release.features', 'reimported', { version: '0.2.9', changed: 0, added: 0, ledgerWon: 1, notReadded: 0 });
+    features.list('0.2.9');
+    expect(warning).toHaveBeenCalledTimes(1);
+    data.items[0] = { ...data.items[0]!, owner: 'TC', status: 'yellow', updatedAt: '2099-10-03T00:00:00Z', updatedBy: 'legacy' };
+    writeFileSync(path, JSON.stringify(data));
+    expect(features.list('0.2.9').items[0]).toMatchObject({ owner: 'TC', evidence: '#123\n#ref' });
+    expect(features.history('L13e').filter((row) => row.field === 'reimport')).toMatchObject([{ from: { evidence: '#123\n#ref' }, to: { evidence: '#123\n#ref', owner: 'TC' } }]);
+    expect(warning).toHaveBeenCalledTimes(2);
+  } finally { warning.mockRestore(); log.mockRestore(); }
+});
+
+test('제목만 바뀌거나 상태와 함께 바뀐 새 JSON 제목을 한 번만 재수입하고 판별 해시를 갱신한다', () => {
+  setup(); fixture('0.2.9'); fixture('0.2.10');
+  features.list('0.2.9'); features.list('0.2.10');
+  const path = join(dir, 'release/0.2.9/checklist.json');
+  const data = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
+  data.items[0] = { ...data.items[0]!, title: '옛 판 새 제목', updatedAt: '2026-10-03T00:00:00Z', updatedBy: 'legacy' };
+  data.items[1] = { ...data.items[1]!, title: '상태와 새 제목', status: 'green', updatedAt: '2026-10-03T00:00:00Z', updatedBy: 'legacy' };
+  writeFileSync(path, JSON.stringify(data));
+  const warning = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const result = features.list('0.2.9');
+    expect(result.items[0]).toMatchObject({ title: '옛 판 새 제목', status: 'yellow' });
+    expect(result.items[1]).toMatchObject({ title: '상태와 새 제목', status: 'green' });
+    expect(features.list('0.2.9').items[0]?.title).toBe('옛 판 새 제목');
+    expect(result.history.filter((entry) => entry.field === 'reimport')).toMatchObject([
+      { id: 'L13e', by: 'legacy', from: { title: '같은 제목' }, to: { title: '옛 판 새 제목' } },
+      { id: 'X0.2.9', by: 'legacy', from: { title: '화면', status: 'red' }, to: { title: '상태와 새 제목', status: 'green' } },
+    ]);
+    expect(features.list('0.2.10').items[0]?.title).toBe('같은 제목');
+    const db = new Database(join(dir, 'release/features.sqlite'));
+    expect(db.query('SELECT json_hash FROM imported_versions WHERE version = ?').get('0.2.9')).toEqual({ json_hash: createHash('sha256').update(readFileSync(path)).digest('hex') });
+    db.close();
+    features.list('0.2.9');
+    expect(warning).toHaveBeenCalledTimes(1);
+  } finally { warning.mockRestore(); }
+});
+
+test('exportJson 의 자체 해시는 다음 list 에서 다시 들이지 않는다', () => {
+  setup(); fixture('0.2.9');
+  features.list('0.2.9');
+  const warning = spyOn(console, 'error').mockImplementation(() => {});
+  const log = spyOn(debug, 'log');
+  try {
+    features.exportJson('0.2.9');
+    const path = join(dir, 'release/0.2.9/checklist.json');
+    const db = new Database(join(dir, 'release/features.sqlite'));
+    expect(db.query('SELECT json_hash FROM imported_versions WHERE version = ?').get('0.2.9')).toEqual({ json_hash: createHash('sha256').update(readFileSync(path)).digest('hex') });
+    db.close();
+    features.list('0.2.9');
+    expect(warning).not.toHaveBeenCalled();
+    expect(log.mock.calls.filter((call) => call[1] === 'reimported')).toHaveLength(0);
+  } finally { warning.mockRestore(); log.mockRestore(); }
+});
+
+test('열 없는 기존 imported_versions 행도 마이그레이션하고 새 JSON 과 비교한다', () => {
+  setup();
+  const path = join(dir, 'release/0.2.9/checklist.json');
+  fixture('0.2.9');
+  const folder = join(dir, 'release');
+  const db = new Database(join(folder, 'features.sqlite'));
+  db.exec(`CREATE TABLE features (id TEXT PRIMARY KEY, title TEXT NOT NULL, owner TEXT, kind TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE assignments (feature_id TEXT NOT NULL REFERENCES features(id), version TEXT NOT NULL, status TEXT NOT NULL, disposition TEXT, evidence TEXT, title_override TEXT, owner TEXT, kind TEXT, updated_at TEXT NOT NULL, updated_by TEXT NOT NULL, PRIMARY KEY(feature_id, version));
+    CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, by TEXT NOT NULL, feature_id TEXT NOT NULL, version TEXT NOT NULL, field TEXT NOT NULL, "from" TEXT, "to" TEXT, released TEXT NOT NULL, dev TEXT NOT NULL);
+    CREATE TABLE evidence (feature_id TEXT NOT NULL, version TEXT NOT NULL, ref TEXT NOT NULL, at TEXT NOT NULL, by TEXT NOT NULL);
+    CREATE TABLE imported_versions (version TEXT PRIMARY KEY);
+    INSERT INTO imported_versions VALUES ('0.2.9');
+    INSERT INTO features VALUES ('L13e', '같은 제목', 'OP', NULL, '2026-10-02T00:00:00Z');
+    INSERT INTO assignments VALUES ('L13e', '0.2.9', 'green', NULL, NULL, NULL, 'OP', NULL, '2026-10-02T00:00:00Z', 'TC');`);
+  db.close();
+  const warning = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const result = features.list('0.2.9');
+    expect(result.items.find((item) => item.id === 'L13e')?.status).toBe('green');
+    expect(result.items.find((item) => item.id === 'X0.2.9')?.status).toBe('red');
+    const migrated = new Database(join(folder, 'features.sqlite'));
+    expect(migrated.query('SELECT json_hash, imported_at FROM imported_versions').get()).toEqual({ json_hash: createHash('sha256').update(readFileSync(path)).digest('hex'), imported_at: expect.any(String) });
+    migrated.close();
+    expect(warning).toHaveBeenCalledTimes(2);
+  } finally { warning.mockRestore(); }
+});
+
+test('mutate 도 바뀐 JSON 을 먼저 들인 뒤 상태를 수정한다', () => {
+  setup(); fixture('0.2.9');
+  features.list('0.2.9');
+  const path = join(dir, 'release/0.2.9/checklist.json');
+  const data = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
+  data.items[0] = { ...data.items[0]!, status: 'green', updatedAt: '2026-10-03T00:00:00Z', updatedBy: 'legacy' };
+  writeFileSync(path, JSON.stringify(data));
+  const warning = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const result = features.set('0.2.9', 'L13e', { evidence: '#new' }, 'TC');
+    expect(result.items[0]).toMatchObject({ status: 'green', evidence: '#new' });
+    expect(result.history.some((entry) => entry.field === 'reimport' && entry.id === 'L13e')).toBe(true);
+    expect(warning).toHaveBeenCalledTimes(1);
+  } finally { warning.mockRestore(); }
 });
 
 test('서로 다른 판의 옛 제목은 수입 전후 그대로이고 retitle 은 한 정체성으로 합친다', () => {
@@ -80,9 +237,11 @@ test('새 판에 먼저 쓴 칸은 나중에 생긴 오래된 JSON 이 덮지 �
   setup();
   const item = { id: 'L13e', title: 'DB 칸', status: 'green' as const, updatedAt: '2026-10-02T00:00:00Z', updatedBy: 'OP' };
   features.add('0.2.10', item);
+  expect(listChecklist('0.2.10').items).toEqual([item]);
   const old = fixture('0.2.10');
   expect(features.importJson('0.2.10')).toBe(false);
-  expect(listChecklist('0.2.10').items).toEqual([item]);
+  expect(listChecklist('0.2.10').items.find((entry) => entry.id === item.id)).toEqual(item);
+  expect(listChecklist('0.2.10').items.find((entry) => entry.id === 'X0.2.10')).toEqual(old.items[1]);
   expect(summarizeChecklist(old).red).toBe(1);
 });
 
@@ -211,7 +370,30 @@ test('제목 변경은 상태와 이전 이력을 보존하며 빈 제목 거부
 
 test('setItem 으로 바꾼 owner·kind 가 features 표에도 반영되어 details 와 체크리스트가 같은 값을 낸다', () => {
   setup(); fixture('0.2.9');
-  setItem('0.2.9', 'L13e', { owner: 'TC', kind: 'screen' }, 'OP');
+  // ORG2 (#23061): changing an existing owner goes through claim --force; set only adds kind here.
+  claimItem('0.2.9', 'L13e', 'TC', { force: true });
+  setItem('0.2.9', 'L13e', { kind: 'screen' }, 'OP');
   expect(listChecklist('0.2.9').items.find((item) => item.id === 'L13e')).toMatchObject({ owner: 'TC', kind: 'screen' });
   expect(features.details('L13e')).toMatchObject({ owner: 'TC', kind: 'screen' });
+});
+
+test('옛 판 JSON 재조정은 원장에서 옮기거나 지운 칸을 되살리지 않고, 기록 없는 새 칸만 들인다', () => {
+  setup(); fixture('0.2.9');
+  features.list('0.2.9');
+  features.move('X0.2.9', '0.2.9', '0.2.10', 'OP');
+  features.remove('0.2.9', 'L13e', 'OP');
+  // The old build rewrites 0.2.9 from its stale copy (moved/removed items still listed, not edited since) plus one new item.
+  const path = join(dir, 'release/0.2.9/checklist.json');
+  const stale = JSON.parse(readFileSync(path, 'utf8')) as Checklist;
+  stale.items.push({ id: 'FRESH', title: '새 칸', status: 'yellow', updatedAt: '2026-10-01T00:00:00Z', updatedBy: 'legacy' });
+  writeFileSync(path, JSON.stringify(stale));
+  const warning = spyOn(console, 'error').mockImplementation(() => {});
+  try {
+    const result = features.list('0.2.9', '', '');
+    expect(result.items.map((item) => item.id).sort()).toEqual(['FRESH']);
+    expect(features.list('0.2.10', '', '').items.map((item) => item.id)).toEqual(['X0.2.9']);
+    const lines = warning.mock.calls.map((call) => String(call[0]));
+    expect(lines).toContain('⚠ checklist 0.2.9: 원장에서 옮기거나 지운 칸 2은 옛 판 checklist.json 에 남아 있어도 다시 넣지 않았다(L13e, X0.2.9)');
+    expect(lines).toContain('⚠ checklist 0.2.9: 옛 판이 checklist.json 에 쓴 1칸을 다시 들였다(FRESH)');
+  } finally { warning.mockRestore(); }
 });

@@ -22,6 +22,8 @@ import { IMAGE_LOAD_STATE_SOURCE } from './image-load-state.js';
 const execFileAsync = promisify(execFile);
 // Longer than aside's own ~10 s daemon auth-challenge timeout, so «Aside isn't running» reaches stderr before we kill it (10-01 live).
 const DEFAULT_ASIDE_TIMEOUT_MS = 30_000;
+const ASIDE_SHOT_MAX_BYTES = 8 * 1024 * 1024;
+const ASIDE_SHOT_MARKER = 'ELANOUS_SHOT_BASE64:';
 // Observed load events and complete page content arrive within this window; timeout remains non-blocking.
 const CDP_LOAD_WAIT_TIMEOUT_MS = 3_000;
 
@@ -188,6 +190,7 @@ function buildAsideScript(url: string): string {
     `    const state = await page.evaluate(() => { const imageCounts = ${IMAGE_COUNTS_EXPRESSION}; return { bodyLength: document.body?.innerText.length ?? 0, unloadedImageCount: imageCounts.broken, pendingLazyImages: imageCounts.pendingLazy }; });`,
     '    const screenshot = await page.screenshot({ fullPage: true });',
     '    console.log(JSON.stringify({ title, ...state, screenshotBytes: screenshot?.length ?? 0 }));',
+    `    if (screenshot?.length > 0 && screenshot.length <= ${ASIDE_SHOT_MAX_BYTES}) console.log('${ASIDE_SHOT_MARKER}' + Buffer.from(screenshot).toString('base64'));`,
     '  } finally { try { await closeTab(page); } catch {} }',
     '})();',
   ].join('\n');
@@ -223,6 +226,18 @@ function parseAsideObservation(stdout: string): { title: string; bodyLength: num
   throw new Error('aside observation output missing JSON');
 }
 
+function decodeAsideScreenshot(stdout: string, screenshotBytes: number): Buffer | undefined {
+  if (screenshotBytes === 0 || screenshotBytes > ASIDE_SHOT_MAX_BYTES) return undefined;
+  const lines = stripScreenAnsi(stdout).split(/\r?\n/);
+  const shots = lines.filter((line) => line.startsWith(ASIDE_SHOT_MARKER));
+  if (shots.length !== 1) return undefined;
+  const encoded = shots[0]!.slice(ASIDE_SHOT_MARKER.length);
+  if (encoded.length > Math.ceil(ASIDE_SHOT_MAX_BYTES / 3) * 4 || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) return undefined;
+  const buf = Buffer.from(encoded, 'base64');
+  if (buf.length !== screenshotBytes || buf.toString('base64') !== encoded) return undefined;
+  return buf;
+}
+
 function asideErrorResult(url: string, error: unknown, kind?: AsideRunStatus['kind']): DeployVerifyResult {
   const message = error instanceof Error ? error.message : String(error);
   const errorFinding = finding('aside-error', `aside 검증 오류: ${message.slice(0, 120)}${kind ? ` (${kind})` : ''}`, 'confirmed');
@@ -240,7 +255,7 @@ async function verifyAsidePage(url: string, deps: DeployVerifyDeps): Promise<Dep
     const script = await readFile(scriptPath, 'utf8');
     const runAside = deps.runAside ?? (async (command, args, options) => {
       try {
-        const result = await execFileAsync(command, args, { ...options, encoding: 'utf8' });
+        const result = await execFileAsync(command, args, { ...options, encoding: 'utf8', maxBuffer: Math.ceil(ASIDE_SHOT_MAX_BYTES / 3) * 4 + 1024 * 1024 });
         return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 };
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw error;
@@ -273,12 +288,20 @@ async function verifyAsidePage(url: string, deps: DeployVerifyDeps): Promise<Dep
     if (status.kind === 'repl-error') return asideErrorResult(url, new Error('aside repl reported error'), status.kind);
     if (status.kind === 'no-marker') return asideErrorResult(url, new Error('aside observation output missing completion marker'), status.kind);
     const state = parseAsideObservation(observation.stdout);
+    const screenshot = decodeAsideScreenshot(observation.stdout, state.screenshotBytes);
+    let shotReason = state.screenshotBytes === 0 ? '스크린샷 0바이트' : state.screenshotBytes > ASIDE_SHOT_MAX_BYTES ? '8MB 상한 초과' : screenshot ? undefined : '스크린샷 데이터 없음 또는 불일치';
+    if (screenshot && deps.onScreenshot) {
+      try { deps.onScreenshot(screenshot); }
+      catch (error) { shotReason = (error as NodeJS.ErrnoException)?.code ?? '저장 콜백 오류'; }
+    }
+    observe('aside-shot', { bytes: state.screenshotBytes, written: !!screenshot && !shotReason && !!deps.onScreenshot, reason: shotReason ?? (deps.onScreenshot ? '없음' : '저장 요청 없음') });
     const structuredFindings: DeployVerifyFinding[] = [];
+    if (state.screenshotBytes === 0) structuredFindings.push(finding('aside-error', '스크린샷 0바이트 — 렌더 증거 없음', 'confirmed'));
     if (state.bodyLength < minBody) structuredFindings.push(finding('empty-body', `페이지 본문이 비어있음(len=${state.bodyLength}·렌더 실패 의심)`, 'suspected'));
     if (state.unloadedImageCount) structuredFindings.push(finding('unloaded-image', `로드되지 못한 그림 ${state.unloadedImageCount}개`, 'confirmed'));
     if (!state.title.trim()) structuredFindings.push(finding('empty-title', '문서 제목이 비어있음', 'confirmed'));
     const findings = structuredFindings.map(({ message }) => message);
-    const result: DeployVerifyResult = { ok: findings.length === 0, url, title: state.title, bodyLength: state.bodyLength, screenshotBytes: state.screenshotBytes, findings, unmeasured: ['javascript-errors'], ...(state.pendingLazyImages ? { pendingLazyImages: state.pendingLazyImages } : {}), ...(structuredFindings.length ? { structuredFindings } : {}) };
+    const result: DeployVerifyResult = { ok: findings.length === 0, url, title: state.title, bodyLength: state.bodyLength, screenshotBytes: state.screenshotBytes, findings, unmeasured: shotReason && (state.screenshotBytes === 0 || state.screenshotBytes > ASIDE_SHOT_MAX_BYTES || !!deps.onScreenshot) ? ['javascript-errors', 'screenshot'] : ['javascript-errors'], ...(state.pendingLazyImages ? { pendingLazyImages: state.pendingLazyImages } : {}), ...(structuredFindings.length ? { structuredFindings } : {}) };
     observe('verified-aside', { url: url.slice(0, 80), ok: result.ok, bodyLength: state.bodyLength, bytes: state.screenshotBytes, findings: findings.length, unmeasured: result.unmeasured });
     return result;
   } catch (error) {

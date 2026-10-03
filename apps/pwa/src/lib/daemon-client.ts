@@ -16,6 +16,7 @@
 import { reportAuthRequired } from './auth-required';
 import { buildAcpWsUrl, buildVoiceWsUrl, type DaemonConfig } from './daemon-config';
 import { debugLog } from './debug';
+import type { AttachmentMeta } from './upload-attachment';
 import {
   isFeedbackEnvelopeWire,
   type FeedbackEnvelopeWire,
@@ -92,7 +93,7 @@ export interface SeatRequestsResponse {
   items: SeatRequestItem[];
   seats: SeatSummary[];
 }
-export interface SeatRequestReceipt { receiptId: string; seat: string; queuedAt: string }
+export interface SeatRequestReceipt { receiptId: string; seat: string; queuedAt: string; attachments?: number; channel?: string }
 
 export interface FieldUploadResult {
   event: string;
@@ -136,8 +137,10 @@ export interface ExecRequestDetail extends Omit<ExecRequestItem, 'resultCount'> 
   approvals: Array<{ graphId: string; runId: string; message: string }>;
 }
 
+export type SeatRequestErrorCode = 'unknown-seat' | 'unknown-attachment' | 'attachments-unsupported' | (string & {});
+
 export class SeatRequestError extends Error {
-  constructor(public readonly status: number, public readonly code: string, public readonly seats: SeatSummary[] = []) {
+  constructor(public readonly status: number, public readonly code: SeatRequestErrorCode, public readonly seats: SeatSummary[] = []) {
     super(code);
   }
 }
@@ -399,6 +402,12 @@ export type DaemonTerminalRenameResult =
   | { status: 'success'; id: string; name: string }
   | { status: 'invalid-name' | 'unknown-pty' | 'denied' | 'failed' | 'owner-unreachable' };
 
+export type CodexLoginStatus =
+  | { state: 'idle' }
+  | { state: 'pending'; mode: 'browser' | 'device'; authorizeUrl?: string; userCode?: string; verificationUrl?: string }
+  | { state: 'ok'; mode: 'browser' | 'device' }
+  | { state: 'error'; mode: 'browser' | 'device'; error: string };
+
 export class DaemonClient {
   private readonly acpConnections = new Map<string, AcpConnectionImpl>();
 
@@ -464,6 +473,16 @@ export class DaemonClient {
       throw new Error(String(msg));
     }
     return body as T;
+  }
+
+  getCodexLogin(): Promise<CodexLoginStatus> {
+    return this.fetchJson<CodexLoginStatus>('/v1/setup/codex-login');
+  }
+
+  startCodexLogin(mode: 'browser' | 'device'): Promise<CodexLoginStatus> {
+    return this.fetchJson<CodexLoginStatus>('/v1/setup/codex-login', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode }),
+    });
   }
 
   async health(): Promise<{ ok: boolean }> {
@@ -561,12 +580,17 @@ export class DaemonClient {
     return this.fetchJson<SeatRequestsResponse>(`/v1/seat-requests${suffix}`);
   }
 
-  async submitSeatRequest(request: { seat?: string; text: string }, idempotencyKey: string): Promise<SeatRequestReceipt> {
+  async submitSeatRequest(request: { seat?: string; text: string; attachments?: AttachmentMeta[] }, idempotencyKey: string): Promise<SeatRequestReceipt> {
     const path = '/v1/seat-requests';
+    const { seat, text, attachments } = request;
     const response = await this.fetchResponse(path, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'Idempotency-Key': idempotencyKey },
-      body: JSON.stringify(request),
+      body: JSON.stringify({ ...(seat !== undefined ? { seat } : {}), text,
+        ...(attachments?.length ? { attachments: attachments.map(({ id, filename, mediaType, size }) => ({
+          id, name: filename, mediaType, bytes: size,
+        })) } : {}),
+      }),
     });
     const body = await response.json() as SeatRequestReceipt | { error?: string; seats?: SeatSummary[] };
     if (!response.ok) {

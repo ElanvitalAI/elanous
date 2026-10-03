@@ -1,8 +1,29 @@
 #!/usr/bin/env bun
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { join, isAbsolute } from 'node:path';
+import { debug } from '../../src/debug/log.js';
 import { errorResult, finishNode, lastResult, nodeOutput, readGraphContext, runCommand, type CommandResult, type CommandRunner } from './node-verdict.js';
 
-interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string }
+interface HostResult { host: string; ok: boolean; before: string; after: string; error?: string; skipped?: string; hooks?: string; restart?: 'no-service' }
+interface OpsUpgradeDeps { exists?: (path: string) => boolean; installSource?: () => string | null }
+
+function localInstallSource(): string | null {
+  try {
+    const data: unknown = JSON.parse(readFileSync(join(homedir(), '.local/share/elanous/install.json'), 'utf8'));
+    return data && typeof data === 'object' && 'source' in data && typeof data.source === 'string' ? data.source : null;
+  } catch { return null; }
+}
+
+function installedMatches(installed: unknown, version: string, checkout: boolean): boolean {
+  return installed === version || checkout && typeof installed === 'string'
+    && installed.startsWith(`${version}-`) && /^[0-9a-f]{12}$/.test(installed.slice(version.length + 1));
+}
+
+function missingService(data: Record<string, unknown> | undefined): boolean {
+  return typeof data?.reason === 'string'
+    && /^재시작 실패:\s*(?:Could not find service\s+"?com\.elanous\.nexus\b|(?:Failed to restart elanous-nexus\.service:\s*)?Unit elanous-nexus(?:\.service)? not found\b)/i.test(data.reason);
+}
 
 function firstLine(text: string): string { return text.trim().split(/\r?\n/)[0]?.trim() ?? ''; }
 
@@ -15,7 +36,7 @@ function reason(result: CommandResult): string {
 
 function quote(value: string): string { return `'${value.replaceAll("'", "'\\''")}'`; }
 
-export function runOpsUpgrade(run: CommandRunner = runCommand) {
+export function runOpsUpgrade(run: CommandRunner = runCommand, deps: OpsUpgradeDeps = {}) {
   const context = readGraphContext();
   const hosts = context.input.opsHosts;
   if (hosts === undefined || (Array.isArray(hosts) && hosts.length === 0)) {
@@ -27,9 +48,12 @@ export function runOpsUpgrade(run: CommandRunner = runCommand) {
   if (nodeOutput(context, 'publish', 'tag') !== `v${version}`) throw new Error('published tag/version mismatch');
   const internalDist = context.input.internalDist;
   if (internalDist !== undefined && (typeof internalDist !== 'string' || !internalDist.trim())) throw new Error('input.internalDist must be a path string');
-  const feedPath = typeof internalDist === 'string' && internalDist.startsWith('~/') ? `${homedir()}/${internalDist.slice(2)}` : internalDist;
+  const defaultFeed = join(homedir(), '.local/share/elanous-ops/internal-dist');
+  const feedPath = typeof internalDist === 'string'
+    ? internalDist.startsWith('~/') ? `${homedir()}/${internalDist.slice(2)}` : internalDist
+    : (deps.exists ?? existsSync)(defaultFeed) ? defaultFeed : undefined;
   let feedError = '';
-  if (typeof feedPath === 'string') {
+  if (feedPath !== undefined) {
     try {
       const feed = run('bun', ['scripts/publish-internal-dist.ts', '--checkout', process.cwd(), '--out', feedPath]);
       const data = lastResult(feed);
@@ -38,8 +62,15 @@ export function runOpsUpgrade(run: CommandRunner = runCommand) {
   }
   const results: HostResult[] = [];
   for (const host of hosts as string[]) {
+    const source = host === 'local' ? (deps.installSource ?? localInstallSource)() : null;
+    const checkout = host === 'local' && source !== null && isAbsolute(source);
+    const path = checkout ? 'checkout' as const : 'release' as const;
+    const record = (result: HostResult) => {
+      results.push(result);
+      debug.log('release-loop.ops-upgrade', 'host', { host, path, restart: result.restart ?? (context.input.opsRestart === true ? result.ok ? 'ok' : 'failed' : 'skipped'), ok: result.ok });
+    };
     if (host !== 'local' && feedError) {
-      results.push({ host, ok: false, before: '', after: '', skipped: '내부 피드 발행 실패', error: feedError });
+      record({ host, ok: false, before: '', after: '', skipped: '내부 피드 발행 실패', error: feedError });
       continue;
     }
     const command = (args: string[]): CommandResult => host === 'local'
@@ -51,22 +82,46 @@ export function runOpsUpgrade(run: CommandRunner = runCommand) {
     try {
       const previous = command(['--version']);
       if (previous.status === 0) before = firstLine(previous.stdout);
-      const updated = command(['update', '--version', version, '--json', ...(context.input.opsRestart === true ? ['--restart'] : [])]);
+      if (checkout) {
+        const git = (args: string[]) => run('git', args, source!);
+        const dirty = git(['status', '--porcelain', '--untracked-files=all']);
+        if (dirty.status !== 0 || dirty.stdout.trim()) {
+          record({ host, ok: false, before, after, error: dirty.status === 0 ? '체크아웃 변경 있음' : `체크아웃 상태 확인 실패: ${reason(dirty)}` });
+          continue;
+        }
+        const fetched = git(['fetch', '--tags']);
+        if (fetched.status !== 0) {
+          record({ host, ok: false, before, after, error: `태그 가져오기 실패: ${reason(fetched)}` });
+          continue;
+        }
+        const tag = git(['rev-parse', '--verify', `refs/tags/v${version}^{commit}`]);
+        if (tag.status !== 0 || !tag.stdout.trim()) {
+          record({ host, ok: false, before, after, error: `태그 없음: v${version}` });
+          continue;
+        }
+        const moved = git(['checkout', '--detach', `v${version}`]);
+        if (moved.status !== 0) {
+          record({ host, ok: false, before, after, error: `체크아웃 전환 실패: ${reason(moved)}` });
+          continue;
+        }
+      }
+      const updated = command(['update', ...(checkout || host !== 'local' && feedPath !== undefined ? [] : ['--version', version]), '--json', ...(context.input.opsRestart === true ? ['--restart'] : [])]);
       const updateResult = lastResult(updated);
-      if (updated.status !== 0 || updateResult?.exitCode !== 0 || updateResult.installedVersion !== version) {
-        const error = updated.status === 0 && updateResult?.exitCode === 0
-          ? `설치판 불일치 (기대 ${version}, 실제 ${String(updateResult.installedVersion)})` : reason(updated);
-        results.push({ host, ok: false, before, after, error });
+      const noService = host !== 'local' && context.input.opsRestart === true && updateResult?.exitCode === 1 && missingService(updateResult);
+      if ((!noService && (updated.status !== 0 || updateResult?.exitCode !== 0)) || !installedMatches(updateResult?.installedVersion, version, checkout)) {
+        const error = (updated.status === 0 && updateResult?.exitCode === 0 || noService)
+          ? `설치판 불일치 (기대 ${version}, 실제 ${String(updateResult?.installedVersion)})` : reason(updated);
+        record({ host, ok: false, before, after, error });
         continue;
       }
       const current = command(['--version']);
       if (current.status !== 0) {
-        results.push({ host, ok: false, before, after, error: reason(current) });
+        record({ host, ok: false, before, after, error: reason(current) });
         continue;
       }
       after = firstLine(current.stdout);
-      if (after.split(/\s+/)[0] !== version) {
-        results.push({ host, ok: false, before, after, error: `올렸는데 판이 그대로 (기대 ${version}, 실제 ${after || '없음'})` });
+      if (!installedMatches(after.split(/\s+/)[0], version, checkout)) {
+        record({ host, ok: false, before, after, error: `올렸는데 판이 그대로 (기대 ${version}, 실제 ${after || '없음'})` });
         continue;
       }
       // The webhook receiver (`elanous hooks serve`, a user systemd unit on the bot VM) keeps the old code until it
@@ -76,16 +131,17 @@ export function runOpsUpgrade(run: CommandRunner = runCommand) {
         const restarted = run('ssh', [host, 'systemctl --user try-restart elanous-hooks.service 2>/dev/null && systemctl --user is-active elanous-hooks.service 2>/dev/null || echo absent']);
         hooks = firstLine(restarted.stdout) || 'absent';
       }
-      results.push({ host, ok: true, before, after, ...(hooks ? { hooks } : {}) });
+      record({ host, ok: true, before, after, ...(hooks ? { hooks } : {}), ...(noService ? { restart: 'no-service' as const } : {}) });
     } catch (error) {
-      results.push({ host, ok: false, before, after, error: firstLine(String(error)) });
+      record({ host, ok: false, before, after, error: firstLine(String(error)) });
     }
   }
   const failures = results.filter((result) => !result.ok);
   return { outcome: failures.length || feedError ? 'fail' as const : 'ok' as const,
     verdict: failures.length || feedError ? 'fail' as const : 'pass' as const,
     summary: failures.length ? `운영 판올림 실패: ${failures.map(({ host, error }) => `${host}: ${error}`).join('; ')}${feedError && !failures.some((item) => item.skipped) ? `; ${feedError}` : ''}`
-      : feedError || `운영 판올림 ${version} · ${results.length}대 확인`, hosts: results };
+      : feedError || `운영 판올림 ${version} · ${results.length}대 확인`,
+    feed: feedError ? 'failed' as const : feedPath === undefined ? 'skipped-no-path' as const : 'published' as const, hosts: results };
 }
 
 if (import.meta.main) {

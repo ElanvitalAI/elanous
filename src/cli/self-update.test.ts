@@ -83,6 +83,23 @@ describe('runReleaseUpdate — release installer', () => {
     } finally { f.cleanup(); }
   });
 
+  test('the same build again skips the restart; a new build still restarts', async () => {
+    for (const [after, restarts] of [[{ version: '0.2.0', versionDir: 'versions/0.2.0', commit: 'a' }, false], [{ version: '0.2.0', versionDir: 'versions/0.2.0-0123456789ab', commit: 'b' }, true]] as const) {
+      const f = setup();
+      try {
+        writeFileSync(join(f.prefix, 'install.json'), JSON.stringify({ version: '0.2.0', versionDir: 'versions/0.2.0', commit: 'a' }));
+        const result = await runReleaseUpdate({ version: '0.2.0', restart: true }, { ...f.deps, run: (command, args, cwd, input, env) => {
+          f.calls.push({ command, args, cwd, input, env });
+          if (command === 'bash') writeFileSync(join(f.prefix, 'install.json'), JSON.stringify(after));
+          return { status: 0, stderr: '' };
+        } });
+        expect(result).toMatchObject({ exitCode: 0, installedVersion: '0.2.0', restarted: restarts });
+        expect(f.calls.map((call) => call.command)).toEqual(restarts ? ['bash', 'launchctl'] : ['bash']);
+        if (!restarts) expect(result.reason).toBe('already at 0.2.0 · restart skipped');
+      } finally { f.cleanup(); }
+    }
+  });
+
   test('requested prerelease mismatch fails before service restart', async () => {
     const f = setup();
     try {

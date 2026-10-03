@@ -1,12 +1,18 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
-import { isValidFieldReelFile, readFieldReelStatus, scheduleFieldReel, type FieldReelRunner } from './field-reel.js';
+import { spawnSync, type spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { defaultFieldReelRunner, isValidFieldReelFile, readFieldReelStatus, scheduleFieldReel, type FieldReelRunner } from './field-reel.js';
+import { resetCapturedEnvForTesting, setCapturedEnvForTesting } from '../shell-env-bootstrap.js';
+import { debug } from '../debug/log.js';
 
 const dirs: string[] = [];
-afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => {
+  resetCapturedEnvForTesting();
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'field-reel-'));
   dirs.push(dir);
@@ -41,6 +47,60 @@ function output(dir: string) {
   writeFileSync(file, rendered.stdout);
   return file;
 }
+
+test('default runner passes only captured PATH entries to the reel child, not captured secrets', async () => {
+  const dir = fixture();
+  const previous = process.env.PATH;
+  try {
+    process.env.PATH = '/usr/bin:/bin';
+    setCapturedEnvForTesting({ PATH: '/opt/x/bin:/usr/bin', TOKEN: 'captured-secret', HTTP_PROXY: 'captured-proxy' });
+    let passedEnv: NodeJS.ProcessEnv | undefined;
+    const fakeSpawn = ((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+      expect(command).toBe('zsh');
+      expect(args).toContain('--title');
+      passedEnv = options.env;
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('close', 1));
+      return child;
+    }) as unknown as typeof spawn;
+    const result = await defaultFieldReelRunner(dir, { title: 'event', sub: 'date' }, fakeSpawn);
+    expect(result.ok).toBe(false);
+    expect(passedEnv?.PATH).toBe('/usr/bin:/bin:/opt/x/bin');
+    expect(passedEnv?.TOKEN).not.toBe('captured-secret');
+    expect(passedEnv?.HTTP_PROXY).not.toBe('captured-proxy');
+    expect(process.env.PATH).toBe('/usr/bin:/bin');
+  } finally {
+    if (previous === undefined) delete process.env.PATH;
+    else process.env.PATH = previous;
+  }
+});
+
+test('default runner preserves standard arguments and adds --instant only for instant mode', async () => {
+  const dir = fixture();
+  const calls: string[][] = [];
+  const fakeSpawn = ((_command: string, args: string[]) => {
+    calls.push(args);
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit('close', 1));
+    return child;
+  }) as unknown as typeof spawn;
+  await defaultFieldReelRunner(dir, { title: 'event', sub: 'date' }, fakeSpawn);
+  await defaultFieldReelRunner(dir, { title: 'event', sub: 'date', mode: 'instant' }, fakeSpawn);
+  expect(calls[0]!.slice(1)).toEqual([dir, '--title', 'event', '--sub', 'date']);
+  expect(calls[1]!.slice(1)).toEqual([dir, '--title', 'event', '--sub', 'date', '--instant']);
+});
+
+test('scheduled instant mode reaches the runner', async () => {
+  const dir = fixture();
+  media(dir, 0);
+  let mode: string | undefined;
+  scheduleFieldReel(dir, { quietMs: 10, mode: 'instant', runner: async (folder, opts) => {
+    mode = opts.mode;
+    return { ok: true, file: output(folder), seconds: 1 };
+  }, startFeed: () => ({ started: false }) });
+  await until(() => readFieldReelStatus(dir)?.state === 'done');
+  expect(mode).toBe('instant');
+});
 
 test('three uploads inside quiet window render once; status waiting → rendering → done and one callback', async () => {
   const dir = fixture();
@@ -215,4 +275,22 @@ test('EV10e — a successful render starts the feed once; the callback sees it; 
   await until(() => seenBad.length === 1);
   expect(seenBad).toEqual([undefined]);
   expect(starts).toEqual([dir]);
+});
+
+test('rendered log says mode unknown for a custom runner without an explicit mode, and the requested mode otherwise', async () => {
+  const spy = spyOn(debug, 'log');
+  try {
+    const modes = async (opts: { mode?: 'standard' | 'instant' }) => {
+      spy.mockClear();
+      const dir = fixture();
+      media(dir, 1);
+      const done: unknown[] = [];
+      scheduleFieldReel(dir, { quietMs: 10, ...opts, runner: async (folder) => ({ ok: true, file: output(folder), seconds: 1 }), autoFeed: false, onDone: (r) => { done.push(r); } });
+      await until(() => done.length === 1);
+      return spy.mock.calls.filter((c) => c[0] === 'field.reel' && c[1] === 'rendered').map((c) => (c[2] as { mode: string }).mode);
+    };
+    expect(await modes({})).toEqual(['unknown']);
+    expect(await modes({ mode: 'instant' })).toEqual(['instant']);
+    expect(await modes({ mode: 'standard' })).toEqual(['standard']);
+  } finally { spy.mockRestore(); }
 });

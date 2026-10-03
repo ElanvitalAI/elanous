@@ -9,11 +9,14 @@
 // 테스트의 관심사가 아니라 **사전-abort 신호**로 즉시 내린다(싱크 초기화는 boot 최선두라
 // abort 여부와 무관하게 실행된다 — 그 순서 자체도 아래에서 단언).
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bootAcpServer } from '../src/boot/acp-server.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 let tmp: string;
 let sockPath: string;
@@ -81,12 +84,12 @@ describe('bootAcpServer — logs.db 싱크', () => {
       emit: (rec) => { seen.push({ category: rec.category, event: rec.event, data: rec.data }); },
     });
     const wasEnabled = debug.enabled;
-    if (!wasEnabled) debug.setEnabled?.(true);
+    if (!wasEnabled) (debug as { setEnabled?: (on: boolean) => void }).setEnabled?.(true);
     try {
       await bootOnce(async () => { throw new Error('logs.db 잠김'); });
     } finally {
       off?.();
-      if (!wasEnabled) debug.setEnabled?.(false);
+      if (!wasEnabled) (debug as { setEnabled?: (on: boolean) => void }).setEnabled?.(false);
     }
     const hit = seen.find((r) => r.category === 'acp.boot' && r.event === 'log-sink-failed');
     expect(hit).toBeDefined();

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { Command } from 'commander';
 import { registerOpsCommands } from './cli/ops-cli.js';
 import { setUserConfigOverlay } from './user-config.js';
@@ -15,6 +15,9 @@ import { LogStore, logsDbPath } from './mss/logging/log-store.js';
 import { _resetGlobalPersonaRegistryForTest, setGlobalPersonaRegistryDir } from './persona/global-registry.js';
 import { addSelfDevRunParticipant, checkpointDependenciesForRun, loadSelfDevRun, saveSelfDevRun, type SelfDevRunState } from './self-dev/run-store.js';
 import { registerMcpClients } from './nexus/boot/register-mcp-clients.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 afterEach(() => {
   process.exitCode = 0;
@@ -1085,7 +1088,7 @@ describe('harness ask production entry wiring', () => {
       });
       await program.parseAsync(['node', 'elanous', 'dev', '--ask', askPath, '--base', 'feature/base']);
       expect(dispatch).toHaveBeenCalledTimes(1);
-      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: askPath, podPool: 'pool-node-b@node-b:8', base: 'feature/base' });
+      expect(dispatch).toHaveBeenCalledWith({ entrance: 'cli-harness-ask', input: askPath, podPool: 'pool-node-b@node-b:8', base: 'feature/base' }, expect.objectContaining({ onOutput: expect.any(Function) }));
       expect(exit).toHaveBeenCalledWith(0);
     } finally {
       setDevLaunchControlTestSeams(undefined);
@@ -1097,6 +1100,55 @@ describe('harness ask production entry wiring', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  test('dev --ask Pod dispatch classifies a human stop after one oversized output chunk through the run ledger', async () => {
+    const { program, setDevLaunchControlTestSeams } = await import('./index.js');
+    const dir = await mkdtemp(join(tmpdir(), 'dev-ask-pod-stop-'));
+    const askPath = join(dir, 'ask.txt');
+    const stateDir = join(dir, 'state');
+    const runId = `run-${crypto.randomUUID()}`;
+    const previousPool = process.env.ELANOUS_POD_POOL;
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    await writeFile(askPath, '# goal\n## PROBLEM\nReport the stopped run.\n## WHAT TO BUILD\nClassify the exit.\n## ACCEPTANCE CRITERIA\n- [ ] Human stop is reported.\n## REQUIRED EVIDENCE\n- [test] Check the dispatch.\n## TRACED PATHS\n- src/index.ts\n## SCOPE BOUNDARY\n- Boundary decision: No real Pod.\n## 답하지 못하는 것\n- Pod availability unmeasured.\n## 불변식\n- The run keeps its identity.\n## 판정 신호\n- Human stop is reported.\n');
+    mkdirSync(join(stateDir, 'run-ledger'), { recursive: true });
+    writeFileSync(join(stateDir, 'run-ledger', `${runId}.jsonl`),
+      `${JSON.stringify({ runId, event: 'human-stop', data: {} })}\n`);
+    process.env.ELANOUS_STATE_DIR = stateDir;
+    delete process.env.ELANOUS_POD_POOL;
+    setUserConfigOverlay((cfg) => ({ ...cfg, harness: { ...cfg.harness, substrate: 'pod', podPool: 'pool-node-b@node-b:8' } }));
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation((_input, deps) => {
+      deps?.onOutput?.(`[self-dev] 1 goal 병렬 실행 · run ${runId}\n${'x'.repeat(17_000)}`);
+      return 1;
+    });
+    const errors: string[] = [];
+    const error = spyOn(console, 'error').mockImplementation((line: unknown) => { errors.push(String(line)); });
+    const exit = spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    try {
+      setDevLaunchControlTestSeams({
+        runAskLaunchFlow: (async () => ({ kind: 'launch', goalFile: askPath })) as never,
+      });
+      await program.parseAsync(['node', 'elanous', 'dev', '--ask', askPath, '--substrate', 'pod', '--pod-pool', 'pool-node-b@node-b:8']);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalledWith(
+        { entrance: 'cli-harness-ask', input: askPath, podPool: 'pool-node-b@node-b:8' },
+        expect.objectContaining({ onOutput: expect.any(Function) }),
+      );
+      expect(errors).toContain('사람이 멈춘 런이다');
+      expect(errors.join('\n')).not.toContain('Pod 실행에 닿지 못했다');
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      setDevLaunchControlTestSeams(undefined);
+      dispatch.mockRestore();
+      error.mockRestore();
+      exit.mockRestore();
+      setUserConfigOverlay(null);
+      if (previousPool === undefined) delete process.env.ELANOUS_POD_POOL;
+      else process.env.ELANOUS_POD_POOL = previousPool;
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test('dev command executes promoted pieces at the pipeline boundary, forwards a chained base, and preserves the initial base without opts', async () => {
     const { program, setDevLaunchControlTestSeams } = await import('./index.js');
@@ -3636,6 +3688,7 @@ describe('harness orchestrate canonical entrance capability', () => {
     'deliverable-verify',
     // 🧹 draft PR 정리 — `harness drafts`(installHarnessDraftSweepCommand).
     'drafts',
+    'incidents',
     'map',
     'mission',
     'orchestrate',

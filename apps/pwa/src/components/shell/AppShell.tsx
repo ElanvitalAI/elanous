@@ -24,7 +24,10 @@
 
 import { useEffect, useState } from 'react';
 import { SidebarNav } from './SidebarNav';
-import { TopBar } from './TopBar';
+import { TopBar, useTopBarWakeLock } from './TopBar';
+import { CompactTopBar } from './CompactTopBar';
+import { MobileBottomTabs } from './MobileBottomTabs';
+import { useCompactMode } from '@/lib/compact-mode';
 import type { ShellActivitySnapshot } from './activity-snapshot';
 import { useShellActivity } from './use-shell-activity';
 import { InstallBanner } from '@/components/install-banner';
@@ -44,6 +47,8 @@ export function AppShell({
   activity?: ShellActivitySnapshot;
 }) {
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const { compact, setWide } = useCompactMode();
+  const wakeControl = useTopBarWakeLock();
   const polled = useShellActivity();
   const activity = activityOverride ?? polled;
   // 탭 방문 계측 — `elanous logs --category pwa.nav.visit`(트리아지 P1 · 탭의 «의미»를 수로).
@@ -83,7 +88,9 @@ export function AppShell({
         <AuthRequiredBanner />
         <SetupModeBanner />
         <SkillProblemsBanner />
-        <TopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} />
+        {compact
+          ? <CompactTopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} setWide={setWide} wakeControl={wakeControl} />
+          : <TopBar onToggleSidebar={toggleSidebar} sidebarOpen={sidebarOpen} activity={activity} onCompactView={() => setWide(false)} wakeControl={wakeControl} />}
         <div className="flex flex-1 min-h-0">
           {/* md+ inline sidebar — expanded: w-56 with labels, collapsed:
               w-10 icon-only rail (U-6b) so navigation stays one tap away
@@ -108,7 +115,9 @@ export function AppShell({
                 className="fixed inset-0 z-30 bg-black/40 md:hidden"
                 onClick={closeSidebar}
               />
-              <aside className="fixed left-0 top-9 z-40 h-[calc(100vh-2.25rem)] w-56 border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:hidden">
+              <aside className={compact
+                ? 'fixed left-0 top-10 z-40 h-[calc(100vh-2.5rem)] w-56 border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:hidden'
+                : 'fixed left-0 top-9 z-40 h-[calc(100vh-2.25rem)] w-56 border-r border-sidebar-border bg-sidebar text-sidebar-foreground md:hidden'}>
                 <SidebarNav onNavigate={closeSidebar} onClose={closeSidebar} />
               </aside>
             </>
@@ -117,6 +126,7 @@ export function AppShell({
           <main className="flex-1 overflow-auto min-w-0">{children}</main>
         </div>
         <InstallBanner />
+        {compact && <MobileBottomTabs />}
       </div>
     </WorkspaceProvider>
   );

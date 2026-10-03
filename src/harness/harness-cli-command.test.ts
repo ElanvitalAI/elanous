@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, spyOn, test } from 'bun:test';
 import { resolveHarnessTarget } from '../self-implement/harness-target-options.js';
 import { debug } from '../debug/log.js';
+import { LogStore } from '../mss/logging/log-store.js';
 import * as podDispatch from './harness-pod-dispatch.js';
 import { Command } from 'commander';
 import { DevPipelineError } from '../self-dev/dev-pipeline.js';
@@ -15,6 +16,8 @@ import {
   associateHarnessProcessWorktree,
   buildHarnessProcessReport,
   classifyHarnessProcess,
+  classifyHarnessPodExit,
+  harnessPodRunId,
   defaultLookupHarnessProcessLedger,
   formatHarnessProcessElapsed,
   installHarnessCliCommand,
@@ -680,6 +683,7 @@ describe('harness CLI command', () => {
       expect(records[1]).toMatchObject({ goalId: expect.stringMatching(/^request-[0-9a-f]{32}$/), goalText: 'write goal', targetPaths: [], spec: { input: { text: 'write goal' } } });
       expect(calls.map((entry) => (entry as string[])[0])).toEqual(['host', 'pod', 'host', 'pod']);
       expect(dispatch.mock.calls[1]?.[0]).toEqual({ entrance: 'cli-harness-say', input: 'write goal', podPool: 'pool-test:1' });
+      expect(dispatch.mock.calls[1]?.[1]).toEqual(expect.objectContaining({ onOutput: expect.any(Function) }));
       expect(process.exitCode).toBe(0);
     } finally {
       dispatch.mockRestore();
@@ -705,6 +709,200 @@ describe('harness CLI command', () => {
     } finally {
       dispatch.mockRestore();
       process.exitCode = exit;
+    }
+  });
+
+  test('missing Pod result distinguishes signal, human stop, last supervisor verdict, PR, and absent launch', () => {
+    const runId = 'run-12345678-1234-1234-1234-123456789abc';
+    const pr = 'https://github.com/example/repo/pull/42';
+    const entry = (event: string, data: Record<string, unknown> = {}) => ({ runId, event, data });
+    const ledger = (entries: NonNullable<ReturnType<typeof import('../self-implement/run-ledger.js').loadRunLedger>>) => ({
+      runId, loadLedger: () => entries, hasJobApplied: () => false, supervisorDecision: () => undefined,
+      loadCheckpoint: () => null,
+    });
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
+      expect(harnessPodRunId(`prefix\n[self-dev] 1 goal 병렬 실행 · run ${runId}\n`)).toBe(runId);
+      expect(harnessPodRunId('no run')).toBeUndefined();
+      expect(harnessPodRunId('[self-dev] 1 goal 병렬 실행 · run run-12345678')).toBe('run-12345678');
+      let tail = '';
+      let rememberedRunId: string | undefined;
+      for (const chunk of [`[self-dev] 1 goal 병렬 실행 · run ${runId}\n`, 'x'.repeat(17_000)]) {
+        tail = (tail + chunk).slice(-16_000);
+        rememberedRunId ??= harnessPodRunId(tail);
+      }
+      expect(tail).not.toContain(runId);
+      expect(classifyHarnessPodExit({ status: 1 }, tail, {
+        ...ledger([entry('human-stop')]), runId: rememberedRunId,
+      }).lines).toEqual(['사람이 멈춘 런이다']);
+      expect(classifyHarnessPodExit({ status: null, signal: 'SIGTERM' }, '', ledger([])).lines[0])
+        .toStartWith('런이 멈췄다(SIGTERM)');
+      expect(classifyHarnessPodExit({ status: 143 }, '', ledger([])).lines[0])
+        .toStartWith('런이 멈췄다(SIGTERM)');
+      // harness stop records human-stop and then signals — the recorded stop is the more specific reason.
+      expect(classifyHarnessPodExit({ status: null, signal: 'SIGTERM' }, '', ledger([
+        entry('human-stop'), entry('pr-opened', { url: pr }),
+      ])).lines).toEqual(['사람이 멈춘 런이다', `PR 이 남아 있다: ${pr}`]);
+      expect(classifyHarnessPodExit({ status: 1 }, '', ledger([entry('human-stop')])).lines)
+        .toEqual(['사람이 멈춘 런이다']);
+      // Round 3: a run id merely quoted in the output is another run — never read its ledger.
+      const quoted: string[] = [];
+      expect(classifyHarnessPodExit({ status: 1 }, 'started run-0f5f7c5f', {
+        loadLedger: (id) => { quoted.push(id); return id === 'run-0f5f7c5f' ? [entry('human-stop')] : null; },
+        hasJobApplied: () => false, supervisorDecision: () => undefined, loadCheckpoint: () => null,
+      }).lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(quoted).toEqual([]);
+      expect(classifyHarnessPodExit({ status: 1 }, '', ledger([
+        entry('rework-budget', { verdict: 'converged', reason: '기존 판정' }), entry('human-stop'),
+      ])).lines).toEqual(['사람이 멈춘 런이다']);
+      expect(classifyHarnessPodExit({ status: 1 }, '', ledger([
+        entry('rework-budget', { verdict: 'CONTRACT-CONFLICT', reason: 'first' }),
+        entry('rework-budget', { verdict: 'UNCONVERGEABLE', reason: '수렴 안 함\nsecond' }),
+        entry('pr-opened', { url: pr }),
+      ])).lines).toEqual(['감독 판정: UNCONVERGEABLE — 수렴 안 함', `PR 이 남아 있다: ${pr}`]);
+      // Round 3: a continuing verdict is not why the run ended.
+      for (const verdict of ['EXTEND', 'SUFFICIENT']) {
+        const continuing = classifyHarnessPodExit({ status: 1 }, '', ledger([
+          entry('rework-budget', { verdict: 'UNCONVERGEABLE', reason: '옛 판정' }),
+          entry('rework-budget', { verdict, reason: '계속' }),
+        ]));
+        expect(continuing.reason).toBe('supervisor');
+        expect(continuing.lines).toEqual(['감독 판정: UNCONVERGEABLE — 옛 판정']);
+        const onlyContinuing = classifyHarnessPodExit({ status: 1 }, '', ledger([entry('rework-budget', { verdict, reason: '계속' })]));
+        expect(onlyContinuing.reason).toBe('unknown');
+        expect(onlyContinuing.lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      }
+      expect(classifyHarnessPodExit({ status: 1 }, '', ledger([
+        entry('run-status', { stage: 'review-blocked', supervisorReason: 'HITL 승인 필요' }),
+      ])).lines).toEqual(['감독 판정: review-blocked — HITL 승인 필요']);
+      expect(classifyHarnessPodExit({ status: 1 }, 'started run-0f5f7c5f', {
+        ...ledger([]), runId: undefined, loadLedger: (id) => id === 'run-0f5f7c5f' ? [
+          { runId: id, event: 'pr-opened', data: { url: pr } },
+        ] : null,
+      }).lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(classifyHarnessPodExit({ status: 1 }, '', {
+        ...ledger([]), supervisorDecision: () => ({ stopReason: 'needs-human', why: '승인 대기' }),
+      }).lines).toEqual(['감독 판정: needs-human — 승인 대기']);
+      expect(classifyHarnessPodExit({ status: 1 }, '', {
+        ...ledger([]), loadCheckpoint: () => ({
+          runId, createdAt: 1, updatedAt: 2, supervisorStopReason: 'needs-human',
+          results: [{ prUrl: pr } as never],
+        }),
+      }).lines).toEqual(['감독 판정: needs-human', `PR 이 남아 있다: ${pr}`]);
+      expect(classifyHarnessPodExit({ status: 1 }, '', {
+        ...ledger([entry('rework-budget', { verdict: 'EXTEND', reason: '과거 판정' })]),
+        supervisorDecision: () => ({ stopReason: 'converged', why: '완주' }),
+      }).lines).toEqual(['감독 판정: converged — 완주']);
+      expect(classifyHarnessPodExit({ status: 1 }, `created ${pr}`, ledger([])).lines)
+        .toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다', `PR 이 남아 있다: ${pr}`]);
+      expect(classifyHarnessPodExit({ status: 1 }, '', ledger([entry('job-applied')])).lines)
+        .toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(classifyHarnessPodExit({ status: 1 }, '', ledger([entry('job-applied')])).reason).toBe('unknown');
+      expect(classifyHarnessPodExit({ status: 1 }, '', {
+        ...ledger([entry('job-applied')]), hasJobApplied: () => true,
+      }).lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(classifyHarnessPodExit({ status: 1 }, '', ledger([entry('pod-child-run', { job: 'si-x' })])).lines)
+        .toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      const noLaunch = classifyHarnessPodExit({ status: 1 }, '', ledger([]));
+      expect(noLaunch.lines)
+        .toEqual(['Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라']);
+      expect(noLaunch.reason).toBe('no-launch');
+      expect(classifyHarnessPodExit({ status: 1 }, '', {
+        loadLedger: () => { throw new Error('runId should not be invented'); },
+        hasJobApplied: () => false, supervisorDecision: () => undefined, loadCheckpoint: () => null,
+      }).lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(classifyHarnessPodExit({ status: 1 }, `[${JSON.stringify({ error: { code: 'pod-job-failed', message: 'childError=child failed\\nlog' } })}]`, ledger([])).lines)
+        .toEqual(['Pod 안 자식이 실패했다 — child failed']);
+      expect(classifyHarnessPodExit({ status: 1 }, '', { ...ledger([]), hasJobApplied: () => true }).lines)
+        .toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(classifyHarnessPodExit({ status: 1 }, '', { ...ledger([]), hasJobApplied: () => undefined }).lines)
+        .toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified',
+        { runId, reason: 'unknown', status: 1, signal: null });
+      expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified',
+        { runId, reason: 'pod-failure', status: 1, signal: null });
+      expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified',
+        { runId, reason: 'signal', status: null, signal: 'SIGTERM' });
+      expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified',
+        { runId, reason: 'human-stop', status: 1, signal: null });
+      expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified',
+        { runId, reason: 'supervisor', status: 1, signal: null });
+      expect(log).toHaveBeenCalledWith('harness.pod', 'exit-classified',
+        { runId, reason: 'no-launch', status: 1, signal: null });
+    } finally { log.mockRestore(); }
+  });
+
+  test('an unreadable or missing ledger never proves a Pod launch was absent', () => {
+    for (const loadLedger of [
+      () => { throw new Error('unreadable ledger'); },
+      () => null,
+    ]) {
+      const result = classifyHarnessPodExit({ status: 1 }, 'started run-0f5f7c5f', {
+        loadLedger,
+        hasJobApplied: () => false,
+        supervisorDecision: () => undefined,
+        loadCheckpoint: () => null,
+      });
+      expect(result.lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      expect(result.reason).toBe('unknown');
+    }
+  });
+
+  test('job-applied lookup checks runId even when output names another si job', () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-exit-'));
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    process.env.ELANOUS_STATE_DIR = root;
+    const store = new LogStore(join(root, 'logs', 'logs.db'));
+    const runId = 'run-0f5f7c5f';
+    try {
+      store.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'self-implement.pod', event: 'job-applied',
+        data: { runId, job: 'si-actual' } }, surface: 'cli' }]);
+      const result = classifyHarnessPodExit({ status: 1 }, `started ${runId} si-stale`, {
+        loadLedger: () => [], supervisorDecision: () => undefined, loadCheckpoint: () => null,
+      });
+      expect(result.lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+      const runIdOnly = 'run-4e6ba007';
+      store.insertBatch([{ rec: { ts: new Date().toISOString(), category: 'self-implement.pod', event: 'job-applied',
+        data: { runId: runIdOnly } }, surface: 'cli' }]);
+      expect(classifyHarnessPodExit({ status: 1 }, `started ${runIdOnly} si-stale`, {
+        loadLedger: () => [], supervisorDecision: () => undefined, loadCheckpoint: () => null,
+      }).lines).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
+    } finally {
+      store.close();
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('ask and say retain runId from a single oversized output chunk before bounding the tail', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pod-run-id-'));
+    const previousState = process.env.ELANOUS_STATE_DIR;
+    const runId = `run-${crypto.randomUUID()}`;
+    mkdirSync(join(root, 'run-ledger'));
+    writeFileSync(join(root, 'run-ledger', `${runId}.jsonl`),
+      `${JSON.stringify({ runId, event: 'human-stop', data: {} })}\n`);
+    process.env.ELANOUS_STATE_DIR = root;
+    const dispatch = spyOn(podDispatch, 'dispatchHarnessOnPod').mockImplementation((_input, deps) => {
+      deps?.onOutput?.(`[self-dev] 1 goal 병렬 실행 · run ${runId}\n${'x'.repeat(17_000)}`);
+      return 1;
+    });
+    const previousExit = process.exitCode;
+    try {
+      for (const args of [['ask', '/tmp/goal.md'], ['say', 'write', 'goal']]) {
+        process.exitCode = 0;
+        const errors = await captureError(() => install(async () => {}, async () => {}).program.parseAsync([
+          'node', 'elanous', 'harness', ...args, '--substrate', 'pod', '--pod-pool', 'pool-test:1',
+        ]));
+        expect(errors).toEqual(['사람이 멈춘 런이다']);
+        expect(process.exitCode).toBe(1);
+      }
+    } finally {
+      dispatch.mockRestore();
+      process.exitCode = previousExit;
+      if (previousState === undefined) delete process.env.ELANOUS_STATE_DIR;
+      else process.env.ELANOUS_STATE_DIR = previousState;
+      rmSync(root, { recursive: true, force: true });
     }
   });
 
@@ -753,8 +951,14 @@ describe('harness CLI command', () => {
       dispatch.mockImplementation(() => 1);
       process.exitCode = 0;
       const launch = await captureError(() => program.parseAsync(['node', 'elanous', 'harness', 'ask', '/tmp/goal.md', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
-      expect(launch).toEqual(['Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라']);
+      expect(launch).toEqual(['Pod 실행 여부 또는 종료 이유를 확인하지 못했다']);
       expect(process.exitCode).toBe(1);
+      dispatch.mockImplementation(() => 143);
+      process.exitCode = 0;
+      const { program: sayProgram } = install(async () => {}, async () => {}, undefined, undefined, undefined, undefined, undefined, record);
+      const stopped = await captureError(() => sayProgram.parseAsync(['node', 'elanous', 'harness', 'say', 'write', 'goal', '--substrate', 'pod', '--pod-pool', 'pool-test:1']));
+      expect(stopped).toEqual(['런이 멈췄다(SIGTERM) — `harness stop` 이나 세션 종료일 수 있다 · 그 전까지 만든 PR 은 남아 있다']);
+      expect(process.exitCode).toBe(143);
     } finally { dispatch.mockRestore(); process.exitCode = previousExit; }
   });
 

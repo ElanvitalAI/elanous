@@ -147,6 +147,10 @@ export interface MetaApiOpts {
    *  compared constant-time against the `Authorization: Bearer …`
    *  header. */
   bearerToken?: string;
+  /** Server-side human identity verification, independent of the shared bearer credential.
+   *  Never derive this result from request body, claimed source, or bearer possession alone.
+   *  Without a verifier, prompt tool mutations remain unavailable. */
+  resolveVerifiedOwner?: (req: Request) => { id: string } | undefined;
   /** Convenience for Tailscale-only / dogfood-loopback mode. */
   noAuth?: boolean;
   // ── PR k · runtime DI for the lifted endpoints ─────────────────
@@ -788,6 +792,11 @@ function notFound(payload: Record<string, unknown> = {}): Response {
 
 // ── /v1/prompt ────────────────────────────────────────────────────
 
+export function promptVerifiedOwner(req: Request, opts: MetaApiOpts): { id: string } | undefined {
+  const owner = opts.resolveVerifiedOwner?.(req);
+  return typeof owner?.id === 'string' && owner.id.trim() ? { id: owner.id.trim() } : undefined;
+}
+
 export async function handlePromptPost(
   req: Request,
   opts: MetaApiOpts,
@@ -831,6 +840,7 @@ export async function handlePromptPost(
         surface: surfaceResolution.surface,
         surfaceResolutionReason: surfaceResolution.reason,
         ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
+        ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
         ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
         ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
         ...(opts.toolCwd ? { toolCwd: opts.toolCwd } : {}),
@@ -1188,6 +1198,7 @@ export async function handlePromptStreamPost(
                 surface: surfaceResolution.surface,
                 surfaceResolutionReason: surfaceResolution.reason,
                 ...(parsed.value.userContent ? { promptBlocks: parsed.value.userContent } : {}),
+                ...((owner) => owner ? { verifiedOwner: owner } : {})(promptVerifiedOwner(req, opts)),
                 ...(resolvePromptHitlChannels(typeof body.sessionId === 'string' ? body.sessionId : '', opts) ?? {}),
                 ...(effectiveSurface ? { toolSurface: effectiveSurface } : {}),
                 ...(opts.toolCwd ? { toolCwd: opts.toolCwd } : {}),

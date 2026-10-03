@@ -2,8 +2,89 @@ import { describe, expect, spyOn, test } from 'bun:test';
 import { debug } from '../debug/log.js';
 import { handleTelegramSeatWork } from './telegram-seat-work.js';
 import { TelegramBot } from '../telegram.js';
+import type { UserConfig } from '../user-config.js';
 
 const MSG = { chatId: -123, messageId: 456 };
+const OWNER = { chatId: 111, userId: 111, messageId: 456 };
+const config = { raw: { decisions: { telegramOwnerId: 111 } }, telegram: { allowedUsers: [111] } } as unknown as UserConfig;
+
+describe('Telegram owner intent', () => {
+  test('question answers once; empty answer falls back to one graph intake', async () => {
+    const answers: unknown[] = []; const dispatched: unknown[] = []; const submitted: unknown[] = [];
+    const deps = {
+      config: config as UserConfig,
+      answer: async (...args: unknown[]) => { answers.push(args); return { title: 'COO', text: '진행 중입니다.' }; },
+      dispatch: async (...args: unknown[]) => { dispatched.push(args); return { reply: '받음', channel: 'posted' as const }; },
+      submit: async (input: unknown) => { submitted.push(input); return { ok: true as const, track: 'graph' as const, acceptanceId: 'R-1' }; },
+    };
+    expect(await handleTelegramSeatWork('@COO 오늘 행사 준비 어디까지야?', OWNER, deps as never)).toBe('진행 중입니다.');
+    expect(answers).toEqual([[ 'COO', '오늘 행사 준비 어디까지야?' ]]);
+    expect(dispatched).toHaveLength(0); expect(submitted).toHaveLength(0);
+    expect(await handleTelegramSeatWork('@COO 오늘 행사 준비 어디까지야?', OWNER, { ...deps, answer: async () => null } as never)).toBe('@COO 접수번호: R-1');
+    expect(submitted).toHaveLength(1);
+  });
+
+  test('task dispatches canonical seat via telegram and returns its reply', async () => {
+    const calls: unknown[] = [];
+    const reply = await handleTelegramSeatWork('@CTO 결제 화면 오타 고쳐 줘', OWNER, {
+      config,
+      dispatch: async (seat, text, _deps, extra) => { calls.push([seat, text, extra]); return { reply: '받음 — TC에 전했습니다.', channel: 'posted' }; },
+      submit: async () => { throw Error('should not submit'); },
+      answer: async () => { throw Error('should not answer'); },
+    });
+    expect(reply).toBe('받음 — TC에 전했습니다.');
+    expect(calls).toEqual([['TC', '결제 화면 오타 고쳐 줘', { via: 'telegram' }]]);
+  });
+
+  test('real C2 dispatch writes one CEO message and one coordination line without intake', async () => {
+    const messages: unknown[] = []; const lines: string[] = [];
+    const reply = await handleTelegramSeatWork('@CTO 결제 화면 오타 고쳐 줘', OWNER, {
+      config, commandDeps: { ownerId: '111', replyTarget: 'acme/repo#42', append: (message) => { messages.push(message); },
+        runGh: async (_args, stdin) => { lines.push(stdin); return 0; }, now: () => new Date('2026-10-02T03:30:00Z') },
+      submit: async () => { throw Error('should not submit'); },
+    });
+    expect(reply).toBe('받음 — TC에 전했습니다.');
+    expect(messages).toEqual([{ from: 'CEO', to: 'TC', kind: 'ceo-task', body: '결제 화면 오타 고쳐 줘' }]);
+    expect(lines).toEqual(['**[대표]** 2026-10-02 12:30 KST → TC · 결제 화면 오타 고쳐 줘']);
+  });
+
+  test('intent observation exposes only seat, intent, via and outcome', async () => {
+    const events: unknown[] = [];
+    const log = spyOn(debug, 'log').mockImplementation(((category: string, event: string, data: unknown) => {
+      if (category === 'seat.dispatch' && event === 'intent') events.push(data);
+    }) as typeof debug.log);
+    try {
+      expect(await handleTelegramSeatWork('@COO private-request-body 알려줘', OWNER, {
+        config, answer: async () => ({ title: 'COO', text: '답' }),
+      })).toBe('답');
+      expect(events).toEqual([{ seat: 'OP', intent: 'question', via: 'telegram', outcome: 'answered' }]);
+      expect(JSON.stringify(events)).not.toContain('private-request-body');
+    } finally { log.mockRestore(); }
+  });
+
+  test('group, non-owner, and multiple seats retain graph intake', async () => {
+    const inputs: unknown[] = [];
+    const deps = { config, submit: async (input: unknown) => { inputs.push(input); return { ok: true as const, track: 'graph' as const, acceptanceId: 'R-1' }; },
+      dispatch: async () => { throw Error('should not dispatch'); }, answer: async () => { throw Error('should not answer'); } } as never;
+    expect(await handleTelegramSeatWork('@CTO 고쳐 줘', { ...OWNER, chatId: -123 }, deps)).toContain('접수번호');
+    expect(await handleTelegramSeatWork('@CTO 고쳐 줘', { ...OWNER, chatId: 222, userId: 222 }, deps)).toContain('접수번호');
+    expect(await handleTelegramSeatWork('@COO,CMO 정리해 줘', OWNER, deps)).toContain('접수번호');
+    expect(inputs).toHaveLength(4);
+  });
+
+  test('unaddressed task only dispatches with defaultSeat enabled; questions and commands remain chat', async () => {
+    const calls: unknown[] = [];
+    const deps = { config, dispatch: async (seat: string, text: string) => { calls.push([seat, text]); return { reply: '받음 — OP에 전했습니다.', channel: 'posted' as const }; } };
+    expect(await handleTelegramSeatWork('내일 일정 정리해 줘', OWNER, deps)).toBeNull();
+    const enabled = { ...deps, config: { ...config, raw: { ...config.raw, seatDispatch: { defaultSeat: 'COO' } } } } as never;
+    expect(await handleTelegramSeatWork('내일 일정 정리해 줘', OWNER, enabled)).toBe('받음 — OP에 전했습니다.');
+    expect(calls).toEqual([['OP', '내일 일정 정리해 줘']]);
+    expect(await handleTelegramSeatWork('오늘 일정 어디까지야?', OWNER, enabled)).toBeNull();
+    expect(await handleTelegramSeatWork('/cto 고쳐 줘', OWNER, enabled)).toBeNull();
+    expect(await handleTelegramSeatWork('  @CTO 고쳐 줘', OWNER, enabled)).toBeNull();
+    expect(await handleTelegramSeatWork('내일 일정 정리해 줘', { ...OWNER, chatId: -123 }, enabled)).toBeNull();
+  });
+});
 
 describe('Telegram addressed seat work', () => {
   test('leaves unaddressed messages untouched without submitting', async () => {
@@ -97,6 +178,36 @@ describe('Telegram addressed seat work', () => {
     } finally {
       log.mockRestore();
     }
+  });
+
+  test('gateway forwards owner identity to seat intent and offers unaddressed DM task only when configured', async () => {
+    const sent: string[] = []; const chats: string[] = []; const dispatched: unknown[] = [];
+    let bot: TelegramBot; let polls = 0;
+    bot = new TelegramBot({ token: '123:test', allowedUsers: [111], perChatGapMs: 0,
+      onMessage: async ({ text }) => { chats.push(text); },
+      seatWorkDeps: { config: { ...config, raw: { ...config.raw, seatDispatch: { defaultSeat: 'COO' } } },
+        dispatch: async (seat, text, _deps, extra) => { dispatched.push([seat, text, extra]); return { reply: '받음 — OP에 전했습니다.', channel: 'posted' }; },
+        answer: async () => ({ title: 'COO', text: '진행 중입니다.' }),
+        submit: async () => { throw Error('should not submit'); },
+      },
+      fetchImpl: (async (url: RequestInfo | URL, init?: RequestInit) => {
+        const method = String(url).split('/').at(-1);
+        if (method === 'getUpdates') {
+          if (++polls > 1) { bot.stop(); return Response.json({ ok: true, result: [] }); }
+          return Response.json({ ok: true, result: [
+            { update_id: 1, message: { message_id: 1, from: { id: 111 }, chat: { id: 111, type: 'private' }, text: '@COO 행사 준비 어디까지야?' } },
+            { update_id: 2, message: { message_id: 2, from: { id: 111 }, chat: { id: 111, type: 'private' }, text: '내일 일정 정리해 줘' } },
+            { update_id: 3, message: { message_id: 3, from: { id: 111 }, chat: { id: 111, type: 'private' }, text: '오늘 일정 어디까지야?' } },
+          ] });
+        }
+        if (method === 'sendMessage') sent.push((JSON.parse(String(init?.body)) as { text: string }).text);
+        return Response.json({ ok: true, result: { message_id: 9 } });
+      }) as typeof fetch,
+    });
+    await bot.start();
+    expect(dispatched).toEqual([['OP', '내일 일정 정리해 줘', { via: 'telegram' }]]);
+    expect(chats).toEqual(['오늘 일정 어디까지야?']);
+    expect(sent).toContain('진행 중입니다.'); expect(sent).toContain('받음 — OP에 전했습니다.');
   });
 
   test('gateway accepts only owner seat messages, replies in the same chat/thread, and preserves ordinary chat', async () => {

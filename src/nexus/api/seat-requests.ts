@@ -1,7 +1,12 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { debug } from '../../debug/log.js';
+import { resolveAttachmentPath } from '../../boot/attachment-store.js';
+import { runGh } from '../../decisions/decision-cards.js';
+import { openMsgStore, canonicalSeatId } from '../../msg/msg-store.js';
+import { dispatchCeoTask, type CeoCommandDeps } from '../../seat-dispatch/ceo-commands.js';
+import { getUserConfig } from '../../user-config.js';
 import { effectiveInstanceRoot } from '../../instance/resolve.js';
 import { submitIntakeWork } from '../../intake-plane/submit-intake-work.js';
 import { parseSeatAddress, resolveSeat } from '../../seat-address/seat-address.js';
@@ -16,6 +21,9 @@ interface SeatRequestItem {
   text: string;
   queuedAt: string;
   status: 'queued';
+  attachments?: string[];
+  channel?: 'posted' | 'failed' | 'unknown';
+  channelError?: string;
 }
 
 interface PendingRequest {
@@ -25,6 +33,7 @@ interface PendingRequest {
   text: string;
   queuedAt: string;
   ref: string;
+  attachments?: string[];
 }
 
 interface RejectedRequest extends Omit<PendingRequest, 'status'> {
@@ -38,10 +47,17 @@ export interface SeatRequestsDeps {
   submit?: typeof submitIntakeWork;
   now?: () => string;
   append?: (path: string, entry: RecordEntry) => void;
+  resolveAttachment?: typeof resolveAttachmentPath;
+  dispatch?: typeof dispatchCeoTask;
+  ceoDeps?: () => CeoCommandDeps;
 }
 
 const seats = trackData.tracks.filter((entry): entry is typeof entry & { title: string } => 'title' in entry)
   .map(({ id, title }) => ({ id, title }));
+
+function requestSeat(address: string) {
+  return resolveSeat(address) ?? trackData.tracks.find((entry) => entry.id.toLowerCase() === address.replace(/^@/, '').toLowerCase());
+}
 const inFlight = new Map<string, { payload: string; task: Promise<Response> }>();
 
 function unknownSeat(): Response {
@@ -140,7 +156,28 @@ function persistOutcome(path: string, entry: RecordEntry, write: typeof append):
 }
 
 function receipt(item: SeatRequestItem): Response {
-  return jsonResponse({ receiptId: item.receiptId, seat: item.seat, queuedAt: item.queuedAt }, 202);
+  return jsonResponse({ receiptId: item.receiptId, seat: item.seat, queuedAt: item.queuedAt,
+    // Only a CEO-seat dispatch knows whether the channel line went out; anything else is reported as unknown.
+    attachments: item.attachments?.length ?? 0, channel: item.channel ?? 'unknown',
+    ...(item.channelError ? { channelError: item.channelError } : {}) }, 202);
+}
+
+function defaultCeoDeps(): CeoCommandDeps {
+  const cfg = getUserConfig();
+  const replyTarget = (cfg.raw?.decisions as { replyGhPr?: unknown } | undefined)?.replyGhPr;
+  return { ownerId: null, replyTarget: typeof replyTarget === 'string' ? replyTarget : null, runGh,
+    append: (message) => { const store = openMsgStore(); try { return store.append(message); } finally { store.close(); } },
+    hasMessage: (seat, ref) => {
+      const store = openMsgStore();
+      try {
+        return store.db.query("SELECT 1 FROM msg_messages WHERE recipient = ? AND kind = 'ceo-task' AND body LIKE ? LIMIT 1")
+          .get(seat, `%\n요청: ${ref}`) !== null;
+      } finally { store.close(); }
+    } };
+}
+
+function canonicalSeatIdSafe(id: string): string {
+  try { return canonicalSeatId(id); } catch { return id; }
 }
 
 function unavailable(): Response {
@@ -153,7 +190,7 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   if (req.method === 'GET') {
     const params = new URL(req.url).searchParams;
     const requestedSeat = params.get('seat');
-    const seat = requestedSeat ? resolveSeat(requestedSeat) : undefined;
+    const seat = requestedSeat ? requestSeat(requestedSeat) : undefined;
     if (requestedSeat && !seat) return unknownSeat();
     const rawLimit = params.get('limit');
     const limit = rawLimit === null ? 20 : Number(rawLimit);
@@ -183,18 +220,30 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
   const firstAddress = parsed && input.text.startsWith(prefix)
     && (input.text.length === prefix.length || /[ \t\r\n]/.test(input.text[prefix.length]!)) ? parsed : null;
   const address = input.seat ?? (firstAddress?.seats.length === 1 ? firstAddress.seats[0] : undefined);
-  const seat = address ? resolveSeat(address) : undefined;
+  const seat = address ? requestSeat(address) : undefined;
   if (!seat) return unknownSeat();
   const text = input.seat === undefined ? firstAddress!.body.trim() : input.text.trim();
   if (!text) {
     debug.log('seat-address.pwa', 'rejected', { reason: 'empty-text', seat: seat.id });
     return jsonResponse({ error: 'bad_request' }, 400);
   }
+  if (input.attachments !== undefined && (!Array.isArray(input.attachments) || input.attachments.length > 4
+    || input.attachments.some((attachment: unknown) => !attachment || typeof attachment !== 'object' || Array.isArray(attachment)
+      || typeof (attachment as { id?: unknown }).id !== 'string' || !(attachment as { id: string }).id.trim()))) {
+    debug.log('seat.dispatch', 'refused', { seat: seat.id, reason: 'invalid-attachments' });
+    return jsonResponse({ error: 'bad_request' }, 400);
+  }
+  const attachmentIds = (input.attachments as Array<{ id: string }> | undefined)?.map(({ id }) => id) ?? [];
+  // Intake (non-CEO seats) carries text only — refuse attachments there instead of accepting and dropping them.
+  if (attachmentIds.length && !['OP', 'TC', 'MK', 'UX'].includes(canonicalSeatIdSafe(seat.id))) {
+    debug.log('seat.dispatch', 'refused', { seat: seat.id, reason: 'attachments-unsupported' });
+    return jsonResponse({ error: 'attachments-unsupported', seat: seat.id }, 400);
+  }
   debug.log('seat-address.pwa', 'parsed', { seat: seat.id, textLength: text.length });
   const now = (deps.now ?? (() => new Date().toISOString()))();
   const header = req.headers.get('idempotency-key');
   if (header !== null && (!header.trim() || header.length > 200)) return jsonResponse({ error: 'bad_request' }, 400);
-  const payload = `${seat.id}\0${text}`;
+  const payload = JSON.stringify([seat.id, text, attachmentIds]);
   const key = header === null ? createHash('sha256').update(randomUUID()).digest('hex')
     : createHash('sha256').update(`client\0${header}`).digest('hex');
   const lock = `${path}\0${key}`;
@@ -213,11 +262,23 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
     try { existing = records(path).get(key); }
     catch { return unavailable(); }
     if (existing) {
-      if (existing.seat !== seat.id || existing.text !== text) return jsonResponse({ error: 'idempotency-conflict' }, 409);
+      if (existing.seat !== seat.id || existing.text !== text
+        || JSON.stringify(existing.attachments ?? []) !== JSON.stringify(attachmentIds)) return jsonResponse({ error: 'idempotency-conflict' }, 409);
       if (existing.status === 'queued') return receipt(existing);
     }
+    const attachments: Array<{ name: string; path: string }> = [];
+    for (const id of attachmentIds) {
+      const resolved = (deps.resolveAttachment ?? resolveAttachmentPath)(id);
+      if (!resolved) {
+        debug.log('seat.dispatch', 'refused', { seat: seat.id, reason: 'unknown-attachment' });
+        return jsonResponse({ error: 'unknown-attachment', id }, 400);
+      }
+      const metadata = (input.attachments as Array<{ name?: unknown }>)[attachments.length];
+      attachments.push({ name: typeof metadata?.name === 'string' && metadata.name.trim() ? metadata.name : basename(resolved), path: resolved });
+    }
     const intent: PendingRequest = existing?.status === 'pending'
-      ? existing : { key, seat: seat.id, text, queuedAt: now, status: 'pending', ref: `pwa:${randomUUID()}` };
+      ? existing : { key, seat: seat.id, text, queuedAt: now, status: 'pending', ref: `pwa:${randomUUID()}`,
+        ...(attachmentIds.length ? { attachments: attachmentIds } : {}) };
     if (existing?.status !== 'pending') {
       try {
         (deps.append ?? append)(path, intent);
@@ -226,6 +287,24 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
           if (existsSync(sidecar)) unlinkSync(sidecar);
         }
       } catch { return unavailable(); }
+    }
+    const ceoSeat = canonicalSeatId(seat.id);
+    if (['OP', 'TC', 'MK', 'UX'].includes(ceoSeat)) {
+      let result: Awaited<ReturnType<typeof dispatchCeoTask>>;
+      try {
+        result = await (deps.dispatch ?? dispatchCeoTask)(ceoSeat, text, (deps.ceoDeps ?? defaultCeoDeps)(), { attachments, via: 'pwa', ref: intent.ref });
+      } catch {
+        debug.log('seat.dispatch', 'refused', { seat: seat.id, reason: 'dispatch-failed' });
+        return unavailable();
+      }
+      const item: RecordEntry & SeatRequestItem = {
+        key, receiptId: intent.ref, seat: seat.id, text, queuedAt: intent.queuedAt, status: 'queued',
+        ...(attachmentIds.length ? { attachments: attachmentIds } : {}), channel: result.channel,
+        ...(result.channelError ? { channelError: result.channelError } : {}),
+      };
+      try { persistOutcome(path, item, deps.append ?? append); }
+      catch { return unavailable(); }
+      return receipt(item);
     }
     let result: Awaited<ReturnType<typeof submitIntakeWork>>;
     try {
@@ -241,7 +320,8 @@ export async function handleSeatRequests(req: Request, deps: SeatRequestsDeps = 
       catch { return unavailable(); }
       return unavailable();
     }
-    const item: RecordEntry & SeatRequestItem = { key, receiptId: result.acceptanceId, seat: seat.id, text, queuedAt: intent.queuedAt, status: 'queued' };
+    const item: RecordEntry & SeatRequestItem = { key, receiptId: result.acceptanceId, seat: seat.id, text, queuedAt: intent.queuedAt,
+      status: 'queued', ...(attachmentIds.length ? { attachments: attachmentIds } : {}) };
     try { persistOutcome(path, item, deps.append ?? append); }
     catch { return unavailable(); }
     debug.log('seat-address.pwa', 'enqueued', { seat: seat.id, receiptId: item.receiptId });

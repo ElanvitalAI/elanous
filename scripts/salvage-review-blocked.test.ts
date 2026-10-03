@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, it } from 'bun:test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
@@ -19,6 +19,9 @@ import {
   type CmdResult,
   type CmdRunner,
 } from './salvage-review-blocked.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const ok = (out = ''): CmdResult => ({ ok: true, rc: 0, out, err: '' });
 const fail = (err: string, out = '', rc = 1): CmdResult => ({ ok: false, rc, out, err });

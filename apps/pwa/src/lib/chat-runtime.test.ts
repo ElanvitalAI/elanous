@@ -1032,7 +1032,7 @@ describe(':budget · :history · :help', () => {
     expect(result?.text).toContain(':fork');
     expect(result?.text).not.toContain(':provider');
     expect(result?.text).toContain(':clear');
-    expect(result?.text).toContain(':name or /name');
+    expect(result?.text).toContain('메타 명령(:이름 또는 /이름) (Meta commands)');
   });
 
   it(':session · :clear preserve local replies and :provider is unknown', async () => {
@@ -1045,13 +1045,13 @@ describe(':budget · :history · :help', () => {
     expect(forked?.text).toContain('forked → new session');
   });
 
-  it('dispatches /help locally without consuming unknown slash prompts', async () => {
+  it('dispatches /help locally and explains unsupported TUI commands without prompting', async () => {
     const ctx = ctxWith();
     expect((await dispatchMeta('/help', ctx))?.text).toContain(':help');
     expect((await dispatchMeta('/clear', ctx))?.text).toBe('__CLEAR__');
-    expect(await dispatchMeta('/run-skill test', ctx)).toBeNull();
+    expect((await dispatchMeta('/run-skill test', ctx))?.text).toBe('/run-skill 은 PWA 채팅에서 아직 안 됩니다 — 지금 되는 명령: /help /session /fork /budget /history /clear');
     expect(isMetaCommand('/help')).toBe(true);
-    expect(isMetaCommand('/run-skill test')).toBe(false);
+    expect(isMetaCommand('/run-skill test')).toBe(true);
   });
 
   it('offers exactly the same names in the menu as the meta handlers', () => {

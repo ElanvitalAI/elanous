@@ -26,6 +26,7 @@ import { buildAutonomousToolSpecs, dispatchAutonomousTool, isAutonomousTool, del
 import { isToolSearchCall, routeToolSearch } from '../skills/tools/tool-search-route.js';
 import { financeEnabled, financeAgentSystemPrompt, marketClock } from '../domains/finance.js';
 import { buildFinanceTools } from '../domains/finance-tools.js';
+import { dispatchReleaseChange } from '../domains/release-tool.js';
 import { surfaceEventsDbPath, openSurfaceEventsDb, recentSentDigest, recordInboundTurn } from '../domains/surface-events.js';
 import { elanousSelfAccessPrompt, elanousSelfAmbientParts } from './self-ambient.js';
 import { localRefGroundingAmbient } from './ref-grounding.js';
@@ -186,6 +187,13 @@ export function makeElanousAgentRunTurn(cfg: UserConfig, surface: SessionSource,
               setActiveDelegation(delegationChatKey('dc', opts.dcChannel.channelId), slashKey);
             }
           },
+        });
+      }
+      if (name === 'release_change') {
+        return dispatchReleaseChange(args, {
+          surface: 'chat', sessionId: opts.sessionId,
+          ...(opts.verifiedOwner ? { verifiedOwner: opts.verifiedOwner } : {}),
+          ...(surfaceChannels ? { confirmChannels: surfaceChannels } : {}),
         });
       }
       // Thread the turn's abort signal so a long in-flight Bash is killed by

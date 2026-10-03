@@ -11,7 +11,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: bash scripts/install.sh [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--no-bootstrap-bun] [--no-setup] [--yes] [--allow-downgrade] [--help]
+Usage: bash scripts/install.sh [--prefix PATH] [--source PATH.tgz|URL] [--no-modify-path] [--no-bootstrap-bun] [--no-install-deps] [--no-setup] [--yes] [--allow-downgrade] [--help]
        curl -fsSL https://github.com/ElanvitalAI/elanous/releases/latest/download/install.sh | bash
 
 Install elanous without contacting a package registry.
@@ -23,6 +23,7 @@ Install elanous without contacting a package registry.
                       (or set $ELANOUS_INSTALL_SOURCE; without either, fetch the verified latest release)
   --no-modify-path    do not append the elanous PATH block to a shell startup file
   --no-bootstrap-bun  fail instead of installing bun with its official installer when bun is missing
+  --no-install-deps  do not install missing prerequisites with apt even when running as root
   --no-setup          do not start first-time setup in this window after installing (interactive terminals only)
   --yes               do not ask before updating an existing installation
   --allow-downgrade   allow installing a version older than the one already installed
@@ -38,6 +39,7 @@ PREFIX="${ELANOUS_INSTALL_PREFIX:-${XDG_DATA_HOME:-${HOME:?HOME is required}/.lo
 SOURCE="${ELANOUS_INSTALL_SOURCE:-}"
 MODIFY_PATH=1
 BOOTSTRAP_BUN=1
+INSTALL_DEPS=1
 RUN_SETUP=1
 ASSUME_YES=0
 ALLOW_DOWNGRADE=0
@@ -53,6 +55,7 @@ while [ "$#" -gt 0 ]; do
       SOURCE="$2"; shift 2 ;;
     --no-modify-path) MODIFY_PATH=0; shift ;;
     --no-bootstrap-bun) BOOTSTRAP_BUN=0; shift ;;
+    --no-install-deps) INSTALL_DEPS=0; shift ;;
     --no-setup) RUN_SETUP=0; shift ;;
     --yes|-y) ASSUME_YES=1; shift ;;
     --allow-downgrade) ALLOW_DOWNGRADE=1; shift ;;
@@ -91,8 +94,8 @@ if ! command -v bun >/dev/null 2>&1 && [ -x "${BUN_INSTALL:-$HOME/.bun}/bin/bun"
   export PATH="${BUN_INSTALL:-$HOME/.bun}/bin:$PATH"
 fi
 # Match doctor-distro.ts families when a required command is absent; do not source os-release as shell code.
-required_command_hint() {
-  local package="$1" id='' id_like='' version='' key value family='unknown' like
+required_command_family() {
+  local id='' id_like='' version='' key value family='unknown' like
   if [ "$(uname -s)" = 'Darwin' ]; then
     family='darwin'
   elif [ "$(uname -s)" = 'Linux' ] && [ -r "${ELANOUS_INSTALL_OS_RELEASE_FILE:-/etc/os-release}" ]; then
@@ -121,6 +124,12 @@ required_command_hint() {
       fi
     fi
   fi
+  printf '%s' "$family"
+}
+
+required_command_hint() {
+  local package="$1" family
+  family="$(required_command_family)"
   if [ "$package" = 'bun' ] && [ "$family" != 'unknown' ]; then
     echo '   curl -fsSL https://bun.sh/install | bash' >&2
     return
@@ -138,16 +147,33 @@ required_command_hint() {
 SUDO='sudo '
 [ "$(id -u 2>/dev/null)" = 0 ] && SUDO=''
 
-# 빠진 선행 명령을 «한 번에» 모아 한 줄로 댄다.
-# 🩸 09-25 베어 ubuntu:24.04 실측: unzip 으로 멈추고, 깔고 다시 돌리면 git 으로 또 멈췄다(세 판).
-# 패키지 매니저 권한은 사람 몫이라 대신 깔지 않는다. bun 은 여기서 세지 않는다(없으면 아래에서 공식 설치기로 깐다).
-MISSING=()
-if ! command -v bun >/dev/null 2>&1 && [ "$BOOTSTRAP_BUN" -eq 1 ]; then
-  command -v curl >/dev/null 2>&1 || MISSING+=(curl)
-  command -v unzip >/dev/null 2>&1 || MISSING+=(unzip)   # bun 공식 설치기가 쓴다
+# 빠진 선행 명령을 «한 번에» 모아 한 줄로 댄다. bun 은 여기서 세지 않는다(없으면 아래에서 공식 설치기로 깐다).
+missing_prerequisites() {
+  MISSING=()
+  if ! command -v bun >/dev/null 2>&1 && [ "$BOOTSTRAP_BUN" -eq 1 ]; then
+    command -v curl >/dev/null 2>&1 || MISSING+=(curl)
+    command -v unzip >/dev/null 2>&1 || MISSING+=(unzip)   # bun 공식 설치기가 쓴다
+  fi
+  command -v git >/dev/null 2>&1 || MISSING+=(git)
+}
+missing_prerequisites
+INSTALLED_DEPS=''
+DEPS_INSTALL_FAILED=0
+if [ "${#MISSING[@]}" -gt 0 ] && [ "$INSTALL_DEPS" -eq 1 ] && [ "$SUDO" = '' ] &&
+   command -v apt-get >/dev/null 2>&1 && [ "$(required_command_family)" = debian ]; then
+  DEPS_TO_INSTALL=("${MISSING[@]}")
+  # Fresh container images ship with empty package lists — refresh once, then install without prompts.
+  if DEBIAN_FRONTEND=noninteractive apt-get update -qq >&2 &&
+     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${DEPS_TO_INSTALL[@]}" >&2; then
+    INSTALLED_DEPS="${DEPS_TO_INSTALL[*]}"
+    echo "installed: $INSTALLED_DEPS" >&2
+    missing_prerequisites
+  else
+    DEPS_INSTALL_FAILED=1
+    echo '⛔ 자동 설치 실패 — 아래를 직접 실행하라 (automatic install failed — run the command below yourself):' >&2
+  fi
 fi
-command -v git >/dev/null 2>&1 || MISSING+=(git)
-if [ "${#MISSING[@]}" -gt 0 ]; then
+if [ "${#MISSING[@]}" -gt 0 ] || [ "$DEPS_INSTALL_FAILED" -eq 1 ]; then
   echo "⛔ required command missing: ${MISSING[*]}. Install it, then rerun this script:" >&2
   required_command_hint "${MISSING[*]}"
   exit 127
@@ -429,6 +455,7 @@ if [ "$MODIFY_PATH" -eq 1 ] && [ -n "${LOGIN_STARTUP:-}" ] && ! grep -Fqx "$MARK
 fi
 
 echo "$(t "Installed elanous $VERSION at $PREFIX/bin/elanous" "elanous $VERSION 을(를) 설치했습니다: $PREFIX/bin/elanous")"
+[ -z "$INSTALLED_DEPS" ] || echo "installed: $INSTALLED_DEPS"
 
 # ── 다음 걸음 (2026-09-23 · Phase 3 「사람 손」) ─────────────────────────
 # ⛔ 설치가 끝나도 «무엇을 더 쳐야 하나»를 안 말하면, 빠뜨린 손이 나중에 «다른 원인의 얼굴»로 나타난다

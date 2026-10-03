@@ -1,6 +1,7 @@
 import { test, expect, describe, spyOn, beforeEach, afterEach } from 'bun:test';
 import { resetElanousConfigDir, setElanousConfigDir } from '../elanous-config-dir.js';
 import { debug } from '../debug/log.js';
+import { failureReason } from '../domains/repeated-failure.js';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -38,19 +39,38 @@ describe('self-dev run-store (S3 persistence)', () => {
     expect(loaded?.results[0]).toMatchObject({ feature: 'A', status: 'done', prUrl: 'https://x/1' });
   });
 
-  test('read failures report the run ID and reason while preserving null', () => {
+  test('missing checkpoint is null and logs a non-failure event only once per run ID', () => {
     const dir = tmp();
     const log = spyOn(debug, 'log').mockImplementation(() => {});
     try {
-      expect(loadSelfDevRun('absent', dir)).toBeNull();
+      expect(loadSelfDevRun('absent-checkpoint-ops-h1', dir)).toBeNull();
+      expect(loadSelfDevRun('absent-checkpoint-ops-h1', dir)).toBeNull();
+      const events = log.mock.calls.filter(([category]) => category === 'self-dev.run-store');
+      expect(events.filter(([, event]) => event === 'read-failed')).toHaveLength(0);
+      expect(events.filter(([, event]) => event === 'checkpoint-absent')).toEqual([
+        ['self-dev.run-store', 'checkpoint-absent', { runId: 'absent-checkpoint-ops-h1' }],
+      ]);
+      expect(failureReason({ category: 'self-dev.run-store', event: 'checkpoint-absent', data: '{"runId":"r"}' })).toBeNull();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  test('corrupt JSON, invalid shape, and non-ENOENT read errors remain read-failed and null', () => {
+    const dir = tmp();
+    const log = spyOn(debug, 'log').mockImplementation(() => {});
+    try {
       writeFileSync(join(dir, 'broken.json'), '{not-json', 'utf8');
       expect(loadSelfDevRun('broken', dir)).toBeNull();
-      expect(log).toHaveBeenCalledWith('self-dev.run-store', 'read-failed', expect.objectContaining({
-        runId: 'broken', reason: expect.stringContaining('SyntaxError'),
-      }));
-      expect(log).toHaveBeenCalledWith('self-dev.run-store', 'read-failed', expect.objectContaining({
-        runId: 'absent', reason: expect.stringContaining('ENOENT'),
-      }));
+      writeFileSync(join(dir, 'shape.json'), JSON.stringify({ runId: 'x' }), 'utf8');
+      expect(loadSelfDevRun('shape', dir)).toBeNull();
+      mkdirSync(join(dir, 'not-a-file.json'));
+      expect(loadSelfDevRun('not-a-file', dir)).toBeNull();
+      const failures = log.mock.calls.filter(([category, event]) => category === 'self-dev.run-store' && event === 'read-failed');
+      expect(failures).toHaveLength(3);
+      expect(failures[0]?.[2]).toMatchObject({ runId: 'broken', reason: expect.stringContaining('SyntaxError') });
+      expect(failures[1]?.[2]).toEqual({ runId: 'shape', reason: 'invalid checkpoint shape' });
+      expect(failures[2]?.[2]).toMatchObject({ runId: 'not-a-file', reason: expect.stringContaining('EISDIR') });
     } finally {
       log.mockRestore();
     }

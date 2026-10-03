@@ -140,14 +140,14 @@ function SessionRow({ api, s, onForked, onDeleted }: { api: SessionsStoreApi; s:
     finally { setBusy(null); }
   }, [api, s.id, onForked, openSession]);
 
-  const openInChat = useCallback(() => openSession(s.id, '이 세션으로 이어갑니다'), [openSession, s.id]);
+  const openInChat = useCallback(() => openSession(s.id, '이 대화로 이어갑니다'), [openSession, s.id]);
 
   const del = useCallback(async () => {
-    if (!window.confirm(`이 세션을 삭제할까요? 복구할 수 없습니다.\n\n"${s.title || s.id.slice(0, 8)}"`)) return;
+    if (!window.confirm(`이 대화를 지울까요? 복구할 수 없습니다.\n\n"${s.title || s.id.slice(0, 8)}"`)) return;
     setBusy('delete');
     try {
       const r = await api.delete(s.id);
-      if (r.ok) { toast.success('세션 삭제됨'); onDeleted(); }
+      if (r.ok) { toast.success('대화를 지웠습니다'); onDeleted(); }
       else toast.error(`삭제 실패: ${r.error ?? '알 수 없음'}`);
     } catch (e) { toast.error(`삭제 실패: ${e instanceof Error ? e.message : String(e)}`); }
     finally { setBusy(null); }
@@ -172,7 +172,7 @@ function SessionRow({ api, s, onForked, onDeleted }: { api: SessionsStoreApi; s:
           <Button size="sm" variant="ghost" disabled={!!busy} onClick={() => void copy()}>{busy === 'copy' ? '…' : '복사'}</Button>
           <Button size="sm" variant="ghost" disabled={!!busy} onClick={() => openInChat()}>이어가기</Button>
           <Button size="sm" variant="outline" disabled={!!busy} onClick={() => void fork()}>{busy === 'fork' ? '…' : 'Fork'}</Button>
-          <Button size="sm" variant="ghost" disabled={!!busy} onClick={() => void del()} className="text-rose-400 hover:text-rose-300" title="세션 삭제(복구 불가)">{busy === 'delete' ? '…' : '삭제'}</Button>
+          <Button size="sm" variant="ghost" disabled={!!busy} onClick={() => void del()} className="text-rose-400 hover:text-rose-300" title="대화 지우기(복구 불가)">{busy === 'delete' ? '…' : '삭제'}</Button>
         </div>
       </div>
       {open && (
@@ -279,7 +279,7 @@ export function SessionsListPanel() {
     <div className="mx-auto max-w-3xl space-y-3 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h1 className="text-lg font-semibold">대화 세션 <span className="text-sm font-normal text-muted-foreground">CLI · 텔레그램</span></h1>
+          <h1 className="text-lg font-semibold">대화 목록 <span className="text-sm font-normal text-muted-foreground">CLI · 텔레그램</span></h1>
           <p className="text-xs text-muted-foreground">
             {sessions
               ? (filtered && filtered.length !== sessions.length
@@ -292,7 +292,7 @@ export function SessionsListPanel() {
         <div className="flex items-center gap-2">
           <label className="flex items-center gap-1 text-xs text-muted-foreground">
             <input type="checkbox" checked={includeEmpty} onChange={(e) => setIncludeEmpty(e.target.checked)} />
-            빈 세션
+            빈 대화
           </label>
           <Button size="sm" variant="outline" disabled={busy} onClick={() => void load()}>{busy ? '…' : '새로고침'}</Button>
         </div>
@@ -303,8 +303,8 @@ export function SessionsListPanel() {
           type="search"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="세션 검색 (제목·내용·id)"
-          aria-label="세션 검색"
+          placeholder="대화 검색 (제목·내용·id)"
+          aria-label="대화 검색"
           className="min-w-[180px] flex-1 rounded-md border border-border bg-background/60 px-2.5 py-1.5 text-sm outline-none ring-primary/30 focus:ring-2"
         />
         <div className="flex items-center gap-1">
@@ -326,12 +326,12 @@ export function SessionsListPanel() {
       {err && <p className="text-xs text-rose-400">{err}</p>}
       {sessions && sessions.length === 0 && (
         <p className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-          세션이 없습니다. 텔레그램/CLI 에서 대화하면 여기에 나타납니다.
+          대화가 없습니다. 텔레그램이나 CLI에서 대화를 시작하면 여기에 나타납니다.
         </p>
       )}
       {filtered && sessions && sessions.length > 0 && filtered.length === 0 && (
         <p className="rounded-lg border border-dashed border-border p-6 text-center text-sm text-muted-foreground">
-          {query || kindFilter !== 'all' ? '검색·필터 결과가 없습니다.' : '세션이 없습니다.'}
+          {query || kindFilter !== 'all' ? '검색·필터 결과가 없습니다.' : '대화가 없습니다.'}
         </p>
       )}
       {filtered && filtered.length > 0 && (

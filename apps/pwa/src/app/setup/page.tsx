@@ -20,6 +20,8 @@ import type {
 } from '@/nexus/client';
 import { useOptionalNexusClient } from '@/nexus/hooks/use-nexus-context';
 import { cn } from '@/lib/utils';
+import { DaemonClient, type CodexLoginStatus } from '@/lib/daemon-client';
+import { loadDaemonConfig } from '@/lib/daemon-config';
 
 type LoadState =
   | { status: 'idle' }
@@ -45,6 +47,17 @@ function buildValidation(provider: string) {
   return prefix ? { prefix, minLength: 16 } : { minLength: 16 };
 }
 
+const CODEX_ERROR_TEXT: Record<string, string> = {
+  timeout: '5분 안에 로그인이 끝나지 않았습니다. 다시 시도해 주세요.',
+  'authorization-denied': '로그인이 거절되었습니다. 다시 시도해 주세요.',
+  'browser-unavailable': '브라우저 로그인을 시작하지 못했습니다. 기기 코드로 해 보세요.',
+  'port-unavailable': '로그인 응답을 받을 자리(포트 1455)가 이미 쓰이고 있습니다. 기기 코드로 해 보세요.',
+  'token-exchange': '로그인은 됐지만 토큰을 받지 못했습니다. 다시 시도해 주세요.',
+  'device-code-failed': '기기 코드를 받지 못했습니다. 네트워크를 확인하고 다시 시도해 주세요.',
+  'device-poll-failed': '로그인 확인 중 연결이 끊겼습니다. 다시 시도해 주세요.',
+  'config-save-failed': '로그인은 됐지만 설정을 저장하지 못했습니다. 다시 시도해 주세요.',
+};
+
 export default function SetupPage() {
   const router = useRouter();
   const client = useOptionalNexusClient();
@@ -56,6 +69,85 @@ export default function SetupPage() {
   const [selected, setSelected] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState('');
   const [submit, setSubmit] = useState<SubmitState>({ status: 'idle' });
+  const [codex, setCodex] = useState<CodexLoginStatus>({ state: 'idle' });
+  const [codexMode, setCodexMode] = useState<'browser' | 'device'>('device');
+  // The browser login calls back to localhost:1455 on the daemon's machine — only usable when this page is on that machine.
+  const [codexLocal, setCodexLocal] = useState(false);
+  const [codexError, setCodexError] = useState('');
+  const [copyHint, setCopyHint] = useState('');
+  const [startingCodex, setStartingCodex] = useState(false);
+  const loginClient = useMemo(() => mounted ? new DaemonClient(loadDaemonConfig()) : null, [mounted]);
+
+  useEffect(() => {
+    if (!mounted) return;
+    const local = ['127.0.0.1', 'localhost'].includes(window.location.hostname);
+    setCodexLocal(local);
+    setCodexMode(local ? 'browser' : 'device');
+  }, [mounted]);
+
+  useEffect(() => {
+    if (!loginClient) return;
+    let active = true;
+    let pending = false;
+    const refreshLogin = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const next = await loginClient.getCodexLogin();
+        if (!active) return;
+        setCodex(next);
+        if (next.state !== 'idle') setSelected((current) => current ?? 'openai-codex');
+        if (next.state === 'ok') router.push('/setup/done');
+        if (next.state === 'error') setCodexError(next.error);
+        else setCodexError('');
+      } catch (err) {
+        if (active) setCodexError(err instanceof Error ? err.message : String(err));
+      } finally {
+        pending = false;
+      }
+    };
+    void refreshLogin();
+    const timer = window.setInterval(() => { void refreshLogin(); }, 2000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [loginClient, router]);
+
+  const copyCode = useCallback(async (code: string) => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(code);
+      setCopyHint('코드를 복사했습니다.');
+    } catch {
+      setCopyHint('복사할 수 없습니다. 위 코드를 직접 선택해 복사해주세요.');
+    }
+  }, []);
+
+  const startCodex = useCallback(async (modeOverride?: 'browser' | 'device') => {
+    const mode = modeOverride ?? codexMode;
+    if (!loginClient || startingCodex) return;
+    if (modeOverride) setCodexMode(modeOverride);
+    setStartingCodex(true);
+    setCodexError('');
+    setCopyHint('');
+    // Open in the click gesture so popup blockers do not prevent login.
+    const tab = mode === 'browser' ? window.open('', '_blank') : null;
+    try {
+      const next = await loginClient.startCodexLogin(mode);
+      setCodex(next);
+      if (next.state === 'pending' && next.mode === 'browser' && next.authorizeUrl) {
+        if (tab) tab.location.href = next.authorizeUrl;
+        else setCodexError('새 탭이 차단되었습니다. 아래 로그인 링크를 직접 열어 계속해주세요.');
+      } else {
+        tab?.close();
+      }
+      if (next.state === 'ok') router.push('/setup/done');
+      if (next.state === 'error') setCodexError(next.error);
+    } catch (err) {
+      tab?.close();
+      setCodexError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setStartingCodex(false);
+    }
+  }, [loginClient, startingCodex, codexMode, router]);
 
   useEffect(() => { setMounted(true); }, []);
 
@@ -95,8 +187,6 @@ export default function SetupPage() {
     if (selectedOption.flow === 'apiKey') {
       return validateApiKey(apiKey, buildValidation(selectedOption.provider)).ok;
     }
-    // codex / local — submit forwards to TUI hint (button still allowed
-    // so the user can land on the 422 + see the hint).
     return false;
   }, [selectedOption, apiKey, submit.status]);
 
@@ -184,7 +274,45 @@ export default function SetupPage() {
       />
 
       {selectedOption ? (
-        <SelectedProviderPanel
+        selectedOption.flow === 'codex' ? (
+          <section id="selected-provider" className="flex flex-col gap-4 rounded border border-border bg-card p-4">
+            <h3 className="text-base font-semibold">{selectedOption.label}</h3>
+            {codex.state === 'ok' ? <p role="status">연결됨</p> : null}
+            {codex.state === 'pending' ? (
+              codex.mode === 'browser' ? (
+                <div role="status" className="flex flex-col gap-2">
+                  <p>로그인을 마치면 이 화면이 다음으로 넘어갑니다.</p>
+                  {codex.authorizeUrl ? (
+                    <a href={codex.authorizeUrl} target="_blank" rel="noopener noreferrer" className="underline">ChatGPT 로그인 링크 열기</a>
+                  ) : null}
+                  <p className="text-sm text-muted-foreground">새 탭이 열리지 않았다면 위 링크를 직접 여세요.</p>
+                  <Button type="button" variant="outline" disabled={startingCodex} onClick={() => { void startCodex('device'); }}>기기 코드로 바꾸기</Button>
+                </div>
+              ) : (
+                <div role="status" className="flex flex-col gap-3">
+                  <p>아래 코드를 입력해 ChatGPT 에 로그인해주세요.</p>
+                  <strong className="text-3xl tracking-widest" data-testid="codex-user-code">{codex.userCode ?? '코드 준비 중…'}</strong>
+                  {codex.userCode ? <Button type="button" variant="outline" onClick={() => { void copyCode(codex.userCode!); }}>복사</Button> : null}
+                  {copyHint ? <p role="status" aria-live="polite">{copyHint}</p> : null}
+                  {codex.verificationUrl ? <a href={codex.verificationUrl} target="_blank" rel="noopener noreferrer" className="underline">{codex.verificationUrl}</a> : null}
+                </div>
+              )
+            ) : null}
+            {codexError ? <p role="alert" className="text-sm text-destructive">{CODEX_ERROR_TEXT[codexError] ?? codexError}</p> : null}
+            {codex.state !== 'pending' && codex.state !== 'ok' ? (
+              <div className="flex flex-wrap gap-2">
+                <Button type="button" disabled={startingCodex} onClick={() => { void startCodex(); }}>
+                  {codex.state === 'error' ? '다시 시도' : 'ChatGPT 로 로그인'}
+                </Button>
+                {codexLocal && (codex.state === 'error' || codexError) ? (
+                  <Button type="button" variant="outline" onClick={() => { setCodexMode(codexMode === 'browser' ? 'device' : 'browser'); setCodexError(''); }}>
+                    다른 방식으로 ({codexMode === 'browser' ? '기기 코드' : '브라우저'})
+                  </Button>
+                ) : null}
+              </div>
+            ) : null}
+          </section>
+        ) : <SelectedProviderPanel
           provider={selectedOption}
           apiKey={apiKey}
           onApiKeyChange={setApiKey}
@@ -317,7 +445,7 @@ function SelectedProviderPanel({
 }: SelectedProviderPanelProps) {
   const isApiKeyFlow = provider.flow === 'apiKey';
   const isAutoFlow = provider.flow === 'auto';
-  const isInteractiveFlow = provider.flow === 'codex' || provider.flow === 'local';
+  const isInteractiveFlow = provider.flow === 'local';
 
   return (
     <section id="selected-provider" className="flex flex-col gap-4 rounded border border-border bg-card p-4">
@@ -346,7 +474,7 @@ function SelectedProviderPanel({
 
       {isInteractiveFlow ? (
         <p className="rounded bg-yellow-500/10 px-3 py-2 text-xs text-yellow-700 dark:text-yellow-400">
-          {provider.flow === 'codex' ? 'OAuth' : 'Local runtime probe'} 흐름은
+          Local runtime probe 흐름은
           PWA 에서 직접 처리할 수 없어요. 터미널에서{' '}
           <span className="font-mono">elanous setup llm</span> 을 실행해주세요.
         </p>

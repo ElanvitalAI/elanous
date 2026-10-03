@@ -28,7 +28,7 @@
 //   - The X removes a local tab only. Explicit termination is a separate
 //     confirmed control that calls `terminal/destroy`.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Maximize2, MessagesSquare, Minimize2, Users } from 'lucide-react';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import type { AcpConnectionState, DaemonTerminalControlResult } from '@/lib/daemon-client';
@@ -68,6 +68,14 @@ interface Props {
   onTabsChange?: (tabs: readonly string[]) => void;
   /** A direct PTY link observes an existing owner; never mint a shell while it is open. */
   suspendInitialSpawn?: boolean;
+  variant?: 'default' | 'sheet';
+  renderSheet?: (model: {
+    tabs: readonly string[];
+    status: 'connected' | 'connecting' | 'disconnected';
+    onSwitch: (id: string) => void;
+    onAdd: () => void;
+    actions: ReactNode;
+  }) => ReactNode;
 }
 
 interface DaemonListEntry {
@@ -410,6 +418,8 @@ export function TerminalTabs({
   tabIntent = null,
   onTabsChange,
   suspendInitialSpawn = false,
+  variant = 'default',
+  renderSheet,
 }: Props) {
   const { client, sessionId } = useDaemon();
   const [tabs, setTabs] = useState<string[]>(loadTabIds);
@@ -891,6 +901,38 @@ export function TerminalTabs({
     debugLog('webterm.tabs.clean-unknown', { removed: cleanable.length, remaining: next.length });
     setTabs(next);
   }, [cleanable, persist, tabs]);
+
+  if (variant === 'sheet' && renderSheet) {
+    const info = activeId ? daemonInfo.get(activeId) : undefined;
+    const connectionStatus = !sessionId || acpRef.current?.state === 'FAILED' || acpRef.current?.state === 'CLOSED' || info?.isAlive === false
+      ? 'disconnected' as const
+      : acpRef.current?.state === 'OPEN'
+        ? 'connected' as const : 'connecting' as const;
+    return renderSheet({
+      tabs,
+      status: connectionStatus,
+      onSwitch,
+      onAdd: () => { void onAdd(); },
+      actions: <div className="flex flex-col gap-2 text-xs" aria-label="터미널 탭 동작">
+        {tabs.map((id) => {
+          const tabInfo = daemonInfo.get(id);
+          const action = terminalControlAction(tabInfo);
+          return <div key={id} className="flex flex-wrap items-center gap-2">
+            <span className="min-w-0 flex-1 truncate">{terminalChipLabel(id).text}</span>
+            <button type="button" onClick={() => onClose(id)} aria-label={`remove ${id} locally`}>× 탭 빼기</button>
+            {action && <button type="button" disabled={terminalControls.has(id) && !terminalControls.get(id)?.message} onClick={() => void onControlTerminal(id, action)} aria-label={`${action} ${id}`}>{terminalControlLabel(action)}</button>}
+            <button type="button" onClick={() => void onTerminate(id, tabInfo?.ownerRunUsage)} aria-label={`terminate ${id}`}>끝내기</button>
+          </div>;
+        })}
+        {cleanable.length > 0 && <button type="button" onClick={onCleanUnknown}>정리 {cleanable.length}</button>}
+        {[...terminalControls.values()].filter((control) => control.message).map((control, index) => <p key={`${control.action}-${index}`} role="status">{control.message}</p>)}
+        {onToggleChatDock && <button type="button" onClick={onToggleChatDock}>{chatDockOpen ? 'terminal chat dock 숨기기' : 'terminal chat dock 보이기'}</button>}
+        {onToggleMinimize && <button type="button" onClick={onToggleMinimize}>{minimized ? '패널 펼치기' : '패널 접기'}</button>}
+        {recording && <span>REC</span>}{peerCount > 1 && <span>{peerCount} devices</span>}
+        <span title="터미널 PTY 는 데몬에 상주 — 연결이 끊겨도 유지되고 재접속 시 이어집니다">{status}</span>
+      </div>,
+    });
+  }
 
   return (
     <div className="flex items-center gap-1 border-b bg-background/50 px-2 py-1 text-xs">

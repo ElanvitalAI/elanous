@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -27,6 +27,9 @@ import {
   observeBrowserCycle,
   type BrowserObserveMcpRequest,
 } from './browser-observe-cycle.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // 2026-08-24 실측 snapshot(page, {interactive:true}).tree — HTML 이 아닌 접근성 개요.
 const ACTUAL_ELANOUS_PWA_TREE = `# note: interactive (clickable / focusable) elements only.

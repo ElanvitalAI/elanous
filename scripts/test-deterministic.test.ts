@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -19,6 +19,9 @@ import {
   type ShutdownSignal,
   type SignalTarget,
 } from './test-deterministic.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const source = readFileSync('scripts/test-deterministic.ts', 'utf8');
 const script = join(import.meta.dir, 'test-deterministic.ts');
@@ -191,7 +194,6 @@ function writeProbeTest(directory: string): string {
   writeFileSync(file, `
 import { test } from 'bun:test';
 import { writeFileSync } from 'node:fs';
-
 test('deterministic runner probe', async () => {
   const path = process.env.DETERMINISTIC_RUNNER_PROBE_PATH;
   if (path) {

@@ -1,10 +1,13 @@
-import { describe, expect, it } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { appendRunLedgerEntry, loadRunLedger, queryUnfinishedRunLedgers, runLedgerPath, type RunLedgerEntry } from './run-ledger.js';
 import { applyLedgerCompaction, OWNERLESS_LOCK_STALE_MS, planLedgerCompaction, readRunLedgerSummaries, restoreArchivedRunLedger, withRunLedgerLock } from './run-ledger-compact.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const id = (tail: string) => `run-00000000-0000-4000-8000-00000000${tail}`;
 const old = '2026-09-24T00:00:00.000Z';

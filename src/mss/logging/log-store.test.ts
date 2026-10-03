@@ -4,7 +4,7 @@
  * 전부 `:memory:` DB — 실 ~/.elanous/logs 미접촉. 기본 싱글톤은 NODE_ENV=test
  * 에서 null 이므로(오염 가드) 여기서는 명시 인스턴스만 쓴다.
  */
-import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
+import { setDefaultTimeout, afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -28,6 +28,9 @@ import { debug } from '../../debug/log.js';
 import { resetNestBootObservationForTest } from '../../agent/nest-depth.js';
 import * as nestDepth from '../../agent/nest-depth.js';
 import { prodInstanceRoot, resetEffectiveInstanceRoot, setTreeDerivedTestForTesting } from '../../instance/resolve.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 function rec(over: Partial<LogRecord> = {}): LogRecord {
   return {

@@ -15468,8 +15468,8 @@ describe('detectDeclaredScopeDiff — 선언한 대상 밖 변경', () => {
   });
 });
 
-describe('declared-scope-diff 관측 착지 — 완주·중단 판정은 그대로, 산출에 값이 실린다', () => {
-  test('이 착지 이전과 같은 입력의 완주 런은 pr-opened/completed 이고 관측에 대상 밖 변경이 실린다', async () => {
+describe('declared-scope-diff 관측 착지 — 대상 밖 변경은 명시 승인 후 완주하고 산출에 값이 실린다', () => {
+  test('대표가 대상 밖 변경을 허용한 완주 런은 pr-opened/completed 이고 관측에 대상 밖 변경이 실린다', async () => {
     const root = mkdtempSync(join(tmpdir(), 'scope-diff-complete-'));
     const repo = join(root, 'repo');
     const goalFile = join(root, 'GOAL-scope-diff.txt');
@@ -15499,6 +15499,7 @@ describe('declared-scope-diff 관측 착지 — 완주·중단 판정은 그대�
             writeFileSync(join(cwd, 'src', 'outside.ts'), 'export const leaked = true;\n');
             return { ok: true, summary: 'impl' };
           },
+          askExecutionClarification: async () => ({ choice: 'Expand scope', by: 'owner' }),
           createWorktree: async () => ({ path: repo, branch: 'se/scope-diff-complete', resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
           commitWork: (cwd, message) => { spawnSync('git', ['add', '-A'], { cwd }); spawnSync('git', ['commit', '-qm', message], { cwd }); },
           mergeMain: async () => ({ status: 'up-to-date' }),
@@ -15580,6 +15581,7 @@ describe('declared-scope-diff 관측 착지 — 완주·중단 판정은 그대�
             writeFileSync(join(cwd, 'note.md'), 'outside and not a boundary\n');
             return { ok: true, summary: 'impl' };
           },
+          askExecutionClarification: async () => ({ choice: 'Expand scope', by: 'owner' }),
           createWorktree: async () => ({ path: repo, branch: 'se/scope-diff-boundary', resolvedBase: 'a'.repeat(40), invokedHead: 'a'.repeat(40) }),
           commitWork: (cwd, message) => { spawnSync('git', ['add', '-A'], { cwd }); spawnSync('git', ['commit', '-qm', message], { cwd }); },
           mergeMain: async () => ({ status: 'up-to-date' }),

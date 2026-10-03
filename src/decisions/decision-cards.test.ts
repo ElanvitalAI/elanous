@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { debug } from '../debug/log.js';
 import { DecisionLedger, type DecisionEntry, type RaiseInput } from './decision-ledger.js';
-import { DecisionCardService, parseTap, raiserReplyText, renderCard, type CardRef, type CardTransport, type CardView } from './decision-cards.js';
+import { DecisionCardService, parseTap, raiserReplyText, renderCard, type CardPlatform, type CardRef, type CardTransport, type CardView } from './decision-cards.js';
 import { handleDiscordDecisionInteraction, discordComponents, discordDecisionsCommand } from './discord-decision-cards.js';
 import { defaultTelegramCommands } from '../telegram-commands.js';
 import { attachTelegramDecisionCards } from './telegram-decision-cards.js';
@@ -48,7 +48,7 @@ describe('DEC-TG decision cards', () => {
     const yn = ledger.raise(base({ title: '행사 폰 공유 캡처 켜기', options: [{ key: 'y', label: '예', consequence: '켠다' }, { key: 'n', label: '아니오', consequence: '끈다' }], recommendation: { option: 'y', why: '시연' } }));
     const irrev = ledger.raise(base({ title: '광고비 집행 30만원', category: 'money', options: [{ key: 'a', label: '집행', consequence: '돈이 나간다' }, { key: 'b', label: '보류', consequence: '다음 주' }], recommendation: { option: 'b', why: '데이터 먼저' } }));
     const replies: string[] = [];
-    const replyToRaiser = async (e: DecisionEntry, via: 'telegram' | 'discord') => { replies.push(raiserReplyText(e, via)); };
+    const replyToRaiser = async (e: DecisionEntry, via: CardPlatform) => { replies.push(raiserReplyText(e, via)); };
     const tg = new FakeTransport('telegram');
     const dc = new FakeTransport('discord');
     // The baseline is the first start; decisions raised at or after it are pushed, older ones only via /decisions.
@@ -257,5 +257,56 @@ describe('DEC-TG decision cards', () => {
     expect(ours.map((l) => JSON.parse(l)[1])).toEqual(expect.arrayContaining(['card-sent', 'memo-set', 'tap-refused', 'decided']));
     expect(ours.join('\n')).not.toContain('비밀스러운');
     expect(ours.join('\n')).not.toContain('스스로 안');
+  });
+});
+
+describe('HITL1 H3 card bridge — pending questions become decision cards', () => {
+  const pending = (over: { impact?: 'low' | 'medium' | 'high' | 'critical'; options?: number; recommendedIndex?: number; expiresAt?: string; id?: string } = {}) => () => ({
+    ok: true as const,
+    questions: [{
+      id: over.id ?? 'auq:h3:abcde', runId: 'run-x', startedAt: '2026-10-02T02:55:00.000Z', surface: 'file' as const, delivery: 'file' as const,
+      ...(over.expiresAt ? { expiresAt: over.expiresAt } : {}),
+      questions: [{
+        id: 'scope', question: 'Widen the release scope?\n\nRecommended: Keep.',
+        options: Array.from({ length: over.options ?? 3 }, (_, i) => ({ label: `opt${i}`, description: `d${i}` })),
+        ...(over.impact ? { impact: over.impact } : {}),
+        ...(over.recommendedIndex !== undefined ? { recommendedIndex: over.recommendedIndex } : {}),
+      }],
+    }],
+  });
+
+  test('high impact · 3 options · recommended b → one decision with resume, one card; a second tick dedups', async () => {
+    const ledger = ledgerAt();
+    const tg = new FakeTransport('telegram');
+    const service = new DecisionCardService({ transport: tg, ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: pending({ impact: 'high', recommendedIndex: 1 }) as never });
+    await service.tick();
+    const open = ledger.list({ status: 'open' });
+    expect(open).toHaveLength(1);
+    expect(open[0]).toMatchObject({ category: 'scope', raisedBy: { agent: 'harness' }, resume: { questionId: 'auq:h3:abcde', runId: 'run-x' },
+      recommendation: { option: 'b' } });
+    expect(open[0]!.options.map((o) => o.key)).toEqual(['a', 'b', 'c']);
+    expect(tg.sent).toHaveLength(1);
+    await service.tick();
+    expect(ledger.list({ status: 'all' })).toHaveLength(1);
+    expect(tg.sent).toHaveLength(1);
+  });
+
+  test('critical becomes an irreversible decision; low, missing impact, 5 options and expired questions raise nothing', async () => {
+    const critical = ledgerAt();
+    await new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger: critical, now: TEST_NOW, pendingQuestions: pending({ impact: 'critical' }) as never }).tick();
+    expect(critical.list({ status: 'open' })[0]).toMatchObject({ category: 'irreversible', recommendation: { skipped: true } });
+    for (const over of [{ impact: 'low' as const }, {}, { impact: 'high' as const, options: 5 }, { impact: 'high' as const, expiresAt: '2026-10-02T02:59:00.000Z' }]) {
+      const ledger = ledgerAt();
+      await new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: pending(over) as never }).tick();
+      expect(ledger.list({ status: 'all' })).toHaveLength(0);
+    }
+  });
+
+  test('a question already tied to a decided card is not raised again', async () => {
+    const ledger = ledgerAt();
+    const raised = ledger.raise(base({ resume: { questionId: 'auq:h3:abcde' } }));
+    ledger.decide(raised.id, 'a', { kind: 'human' });
+    await new DecisionCardService({ transport: new FakeTransport('telegram'), ownerIds: ['111'], ledger, now: TEST_NOW, pendingQuestions: pending({ impact: 'high' }) as never }).tick();
+    expect(ledger.list({ status: 'all' })).toHaveLength(1);
   });
 });

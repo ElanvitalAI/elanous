@@ -20,6 +20,7 @@
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { Copy, Menu, Mic, Settings as SettingsIcon, Sun, X } from 'lucide-react';
+import { COMPACT_MAX_WIDTH } from '@/lib/compact-mode';
 import { useDaemon } from '@/components/providers/DaemonProvider';
 import { useTheme, THEMES, type ThemeName } from '@/components/providers/ThemeProvider';
 import { toast } from 'sonner';
@@ -36,40 +37,58 @@ import type { ShellActivitySnapshot } from './activity-snapshot';
 
 const WAKE_LOCK_KEY = 'elanous.pwa.wakeLockOn';
 
-interface Props {
-  onToggleSidebar: () => void;
-  sidebarOpen: boolean;
-  activity?: ShellActivitySnapshot;
+export interface TopBarWakeLock {
+  on: boolean;
+  status: ReturnType<typeof useWakeLock>;
+  toggle: () => void;
 }
 
-export function TopBar({ onToggleSidebar, sidebarOpen, activity }: Props) {
-  const { sessionId, config } = useDaemon();
-  const { theme, setTheme } = useTheme();
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [wakeLockOn, setWakeLockOn] = useState(false);
-  const popoverRef = useRef<HTMLDivElement | null>(null);
-  const wakeLock = useWakeLock(wakeLockOn);
-
-  // Restore wake-lock preference on mount.
+export function useTopBarWakeLock(enabled = true): TopBarWakeLock {
+  const [on, setOn] = useState(false);
+  const status = useWakeLock(enabled && on);
   useEffect(() => {
-    if (typeof window === 'undefined') return;
-    if (window.localStorage.getItem(WAKE_LOCK_KEY) === '1') setWakeLockOn(true);
-  }, []);
-
-  const toggleWakeLock = (): void => {
-    setWakeLockOn((prev) => {
+    if (!enabled) return;
+    try { if (window.localStorage.getItem(WAKE_LOCK_KEY) === '1') setOn(true); } catch { /* Storage is optional. */ }
+  }, [enabled]);
+  const toggle = (): void => {
+    setOn((prev) => {
       const next = !prev;
-      if (typeof window !== 'undefined') {
-        window.localStorage.setItem(WAKE_LOCK_KEY, next ? '1' : '0');
-      }
+      try { window.localStorage.setItem(WAKE_LOCK_KEY, next ? '1' : '0'); } catch { /* Keep the current choice. */ }
       debugLog('pwa.topbar.wake-lock.toggle', { next });
       return next;
     });
   };
+  return { on, status, toggle };
+}
+
+interface Props {
+  onToggleSidebar: () => void;
+  sidebarOpen: boolean;
+  activity?: ShellActivitySnapshot;
+  onCompactView?: () => void;
+  sheetMode?: boolean;
+  wakeControl?: TopBarWakeLock;
+}
+
+export function TopBar({ onToggleSidebar, sidebarOpen, activity, onCompactView, sheetMode = false, wakeControl }: Props) {
+  const { sessionId, config } = useDaemon();
+  const { theme, setTheme } = useTheme();
+  const [settingsOpen, setSettingsOpen] = useState(sheetMode);
+  const [narrowViewport, setNarrowViewport] = useState(false);
+  const localWakeControl = useTopBarWakeLock(!wakeControl);
+  const { on: wakeLockOn, status: wakeLock, toggle: toggleWakeLock } = wakeControl ?? localWakeControl;
+  useEffect(() => {
+    if (!onCompactView) return;
+    const measure = () => setNarrowViewport(window.innerWidth <= COMPACT_MAX_WIDTH);
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [onCompactView]);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
 
   // Click-outside dismissal for the settings popover.
   useEffect(() => {
-    if (!settingsOpen) return undefined;
+    if (!settingsOpen || sheetMode) return undefined;
     const onDocClick = (ev: MouseEvent): void => {
       if (!popoverRef.current) return;
       if (popoverRef.current.contains(ev.target as Node)) return;
@@ -77,7 +96,7 @@ export function TopBar({ onToggleSidebar, sidebarOpen, activity }: Props) {
     };
     document.addEventListener('mousedown', onDocClick);
     return () => document.removeEventListener('mousedown', onDocClick);
-  }, [settingsOpen]);
+  }, [settingsOpen, sheetMode]);
 
   const copySession = async (): Promise<void> => {
     if (!sessionId) return;
@@ -92,10 +111,10 @@ export function TopBar({ onToggleSidebar, sidebarOpen, activity }: Props) {
   };
 
   return (
-    <header className="flex h-9 shrink-0 items-center gap-1 border-b border-border bg-background px-2 text-xs">
+    <header className={sheetMode ? 'flex flex-col gap-2 text-xs' : 'flex h-9 shrink-0 items-center gap-1 border-b border-border bg-background px-2 text-xs'}>
       {/* ☰ sidebar toggle — discoverability: p-2 hit target + visible
           label so first-time users find it. Stays inside h-9 strip. */}
-      <button
+      {!sheetMode && <button
         type="button"
         onClick={onToggleSidebar}
         aria-label={sidebarOpen ? 'close menu' : 'open menu'}
@@ -106,16 +125,21 @@ export function TopBar({ onToggleSidebar, sidebarOpen, activity }: Props) {
         <span className="hidden text-[11px] font-medium leading-none sm:inline">
           {sidebarOpen ? '닫기' : '메뉴'}
         </span>
-      </button>
+      </button>}
 
       {/* 2026-05-07 dogfood feedback — workspace 탭 strip 을 TopBar
           안 inline 으로 mount. provider 가 AppShell 위에 있어 모든 route
           에서 동일 state. 빈 워크스페이스 (탭 0개) 일 때는 자체 hidden
           → 첫 진입 사용자가 메뉴 + 아이콘만 보게 정리. */}
-      <TopBarWorkspaceStrip />
+      {sheetMode ? <div className="w-full"><TopBarWorkspaceStrip /></div> : <TopBarWorkspaceStrip />}
       {activity && <TopBarActivityIndicator snapshot={activity} />}
 
-      <div className="ml-auto flex items-center gap-1">
+      <div className={sheetMode ? 'flex flex-wrap items-center gap-2' : 'ml-auto flex items-center gap-1'}>
+        {onCompactView && narrowViewport && (
+          <button type="button" onClick={onCompactView} className="rounded-md px-2 py-1 text-muted-foreground hover:bg-accent hover:text-foreground">
+            간소하게 보기
+          </button>
+        )}
         {/* 📷 SC1 공유용 캡처(beta) — 가린 화면을 데몬에 저장 */}
         <ShareCaptureButton />
         {/* 🎙 voice — icon-only link to root voice page (essential) */}
@@ -130,21 +154,23 @@ export function TopBar({ onToggleSidebar, sidebarOpen, activity }: Props) {
         </Link>
 
         {/* ⚙️ settings popover — absorbs theme + session + provider */}
-        <div ref={popoverRef} className="relative">
+        <div ref={popoverRef} className={sheetMode ? 'w-full' : 'relative'}>
           <button
             type="button"
             onClick={() => setSettingsOpen((v) => !v)}
+            aria-expanded={sheetMode ? settingsOpen : undefined}
             aria-label="settings"
             title={`session ${sessionId ? sessionId.slice(0, 8) : '—'} · theme ${theme}`}
             className={cn(
-              'rounded-md p-1.5 hover:bg-accent',
+              'rounded-md p-1.5 hover:bg-accent', sheetMode && 'flex items-center',
               settingsOpen ? 'bg-accent text-foreground' : 'text-muted-foreground hover:text-foreground',
             )}
           >
             <SettingsIcon className="h-4 w-4" />
+            {sheetMode && <span className="ml-1">설정</span>}
           </button>
           {settingsOpen && (
-            <div className="absolute right-0 top-full z-50 mt-1 min-w-[240px] rounded-md border border-border bg-popover p-2 shadow-md">
+            <div className={sheetMode ? 'w-full rounded-md border border-border bg-popover p-2' : 'absolute right-0 top-full z-50 mt-1 min-w-[240px] rounded-md border border-border bg-popover p-2 shadow-md'}>
               {/* Session row */}
               <div className="mb-2 border-b border-border pb-2">
                 <div className="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">

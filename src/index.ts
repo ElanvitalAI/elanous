@@ -96,6 +96,7 @@ applyTestFlagFromArgv();
 applyConfigDirFlagFromArgv();
 
 import { Command, Option } from 'commander';
+import { filterCliRootHelp } from './maturity/cli-maturity.js';
 import type { AdPipelinePlan, AdPipelineResult } from './ad-pipeline/run.js';
 import type { AcpPermissionApprover } from './acp/client.js';
 import { runGitCommand } from './git-fs/runner.js';
@@ -122,7 +123,7 @@ import { DEFAULT_REVIEW_BACKEND } from './agent-substrate/acp-reviewer.js';
 import type { ReviewResult } from './agent-substrate/pr-reviewer.js';
 import type { ReviewVerdict } from './agent-mission/review-loop.js';
 import type { SyncMode } from './types.js';
-import { runOnboarding, runOnboardingStep, runOnboardingNonInteractive, needsOnboarding, handleOnboardingRefusal, type OnboardingStepId } from './onboarding.js';
+import { runOnboarding, runOnboardingStep, runOnboardingNonInteractive, needsOnboarding, needsFirstRun, handleOnboardingRefusal, type OnboardingStepId } from './onboarding.js';
 import {
   getUserConfig, reloadUserConfig, userConfigPath, saveUserConfig,
   backupUserConfig, backupConfigPath, addRotationEntry, type RotationEntry,
@@ -137,6 +138,7 @@ import {
 } from './session/index.js';
 import { requestSessionTurnControl } from './session/session-turn-control.js';
 import { ensureCliSession, sessionBudget } from './session/chat.js';
+import { suggestProjectForFolder } from './project/project-store.js';
 import { botFromConfig, TelegramBot } from './telegram.js';
 import { acquireTelegramLock, TelegramLockError, defaultLockPath, safeReadLock } from './telegram-lock.js';
 import { basename, join as _joinPath, resolve } from 'node:path';
@@ -865,6 +867,29 @@ registerUsageCommand(program);
 registerLiveCommands(program);
 registerResearchCommand(program);
 registerReleaseCommands(program);
+const seatCmd = program.command('seat').description('분배된 자리의 하루 루프와 보고');
+seatCmd.command('loop').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
+  .requiredOption('--once', '한 번 실행')
+  .option('--json', 'JSON 출력')
+  .action(async (opts: { seat: string; once: boolean; json?: boolean }) => {
+    try {
+      const { runSeatLoopOnce } = await import('./seat-loop/seat-loop.js');
+      const result = await runSeatLoopOnce(opts.seat);
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+      else console.log(`seat loop ${opts.seat}: ${result.status}${'runId' in result && result.runId ? ` ${result.runId}` : ''}`);
+    } catch (error) { console.error(`seat loop: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
+seatCmd.command('report').requiredOption('--seat <SEAT>', 'MK|OP|TC|UX')
+  .option('--post', '설정된 채널에 게시')
+  .option('--json', 'JSON 출력')
+  .action(async (opts: { seat: string; post?: boolean; json?: boolean }) => {
+    try {
+      const { seatReport } = await import('./seat-loop/seat-report.js');
+      const result = await seatReport(opts.seat, { post: opts.post });
+      if (opts.json) await writeStdoutJson(`${JSON.stringify(result)}\n`);
+      else console.log(result.body);
+    } catch (error) { console.error(`seat report: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
+  });
 registerModelWatchCommand(program);
 registerDoctorCommand(program);
 // runCli() → main() → program.parseAsync() dispatches control serve and resources where|list.
@@ -986,6 +1011,18 @@ linearCmd.command('set-key').description('Read Linear API key from stdin and sto
     catch { console.error('connector.linear.apiKey: could not save key'); process.exitCode = 1; }
   });
 
+const storyboardCmd = program.command('storyboard').description('스토리보드 정본 검사 · MD 생성');
+storyboardCmd.command('lint').description('스토리보드 검사').argument('[files...]').option('--json', 'JSON 출력')
+  .action(async (paths: string[], opts: { json?: boolean }) => {
+    const { runStoryboard } = await import('./cli/storyboard-cli.js');
+    process.exitCode = runStoryboard('lint', paths, opts.json);
+  });
+storyboardCmd.command('render').description('스토리보드 검사 후 MD 생성').argument('[files...]')
+  .action(async (paths: string[]) => {
+    const { runStoryboard } = await import('./cli/storyboard-cli.js');
+    process.exitCode = runStoryboard('render', paths);
+  });
+
 const pythonCmd = program.command('python').description('elanous 가 쓰는 파이썬(해석 · 점검 · elanous venv 셋업) — RFC-doctor-fix-build-toolchain-and-python-by-distro');
 pythonCmd.command('where').description('어느 파이썬을 쓰나(ELANOUS_PYTHON > elanous venv > pyenv .python-version > PATH)').option('--json').option('--path', '경로만 한 줄(스크립트·스킬용)').action(async (o: { json?: boolean; path?: boolean }) => {
   const { runPythonWhere } = await import('./cli/python-cli.js'); process.exitCode = runPythonWhere(console, o.json, o.path);
@@ -1050,7 +1087,8 @@ program
   .option(
     '--test',
     '격리 테스트 인스턴스로 실행 — cwd 의 git 트리(worktree 포함)에서 `<트리>/.elanous-test` 를 루트로 잡고 state·config 두 축을 함께 격리한다. config 사본이 없으면 자동 물질화. `--test=<dir>` 로 루트 직접 지정 가능(값 문법은 `=` 형태 하나 — 모호함 없음). ELANOUS_STATE_DIR/--config-dir 을 손으로 줄 필요가 없다.',
-  );
+  )
+  .option('--help-all', '시스템 명령을 제외한 모든 최상위 명령 표시');
 program.addHelpText('after', acpServerHelpText());
 
 program
@@ -2120,13 +2158,13 @@ harnessCmd
   .option('--json', 'JSON 출력')
   .option('--dry-run', '프로세스 후보만 보고 신호·Pod Job 삭제는 하지 않는다')
   .action(async (runId: string, opts: { context?: string[]; json?: boolean; dryRun?: boolean }) => {
-    const { stopHarnessRun, defaultHarnessStopDeps, formatHarnessStop } = await import('./harness/harness-stop.js');
+    const { stopHarnessRun, defaultHarnessStopDeps, formatHarnessStop, AmbiguousHarnessStopRunIdError } = await import('./harness/harness-stop.js');
     try {
       const result = await stopHarnessRun(runId, defaultHarnessStopDeps(), opts.context, opts.dryRun === true);
       process.stdout.write(`${opts.json ? JSON.stringify(result) : formatHarnessStop(result)}\n`);
     } catch (error) {
       process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-      process.exitCode = 2;
+      process.exitCode = error instanceof AmbiguousHarnessStopRunIdError ? 1 : 2;
     }
   });
 harnessCmd
@@ -2556,11 +2594,18 @@ harnessCmd
       const { verifyDeployedPage, formatVerifyUrlReport } = await import('./harness/browser-verify.js');
       const { writeFileSync } = await import('node:fs');
       let shotWritten = false;
+      let shotWriteError: string | undefined;
       const r = await verifyDeployedPage(url, {
         backend: opts.backend,
         ...(opts.port ? { port: Number(opts.port) } : {}),
         // ⛔ 「썼다」를 «셋»으로 — 안 시켰다 / 썼다 / 못 썼다. 뭉치면 없는 파일을 있다고 말한다.
-        ...(opts.shot ? { onScreenshot: (b: Buffer) => { writeFileSync(opts.shot!, b); shotWritten = true; } } : {}),
+        ...(opts.shot ? { onScreenshot: (b: Buffer) => {
+          try { writeFileSync(opts.shot!, b); shotWritten = true; }
+          catch (error) {
+            shotWriteError = error instanceof Error ? error.message : String(error);
+            if (opts.backend === 'aside') throw error;
+          }
+        } } : {}),
       });
       if (r.skipped === 'no-cdp') {
         console.log(`⚠️ CDP 엔드포인트 없음(9222) — 검증 skip. browser-debug 스킬로 브라우저를 9222 에 먼저 띄우세요.`);
@@ -2571,8 +2616,11 @@ harnessCmd
         return;
       }
       const L = formatVerifyUrlReport(url, r, opts.shot === undefined ? undefined : { path: opts.shot, written: shotWritten });
+      if (opts.shot && !shotWritten && !r.skipped) {
+        L.push(`  - 스크린샷을 ${opts.shot} 에 못 썼다 — ${shotWriteError ?? (r.unmeasured?.includes('screenshot') ? '스크린샷을 못 쟀다' : '스크린샷 데이터가 오지 않았다')}`);
+      }
       console.log(L.join('\n'));
-      if (!r.ok) process.exitCode = 1;
+      if (!r.ok || (opts.shot && !shotWritten && !r.skipped)) process.exitCode = 1;
     } catch (e: any) {
       ui.error(`harness verify-url 실패: ${String(e?.message ?? e).slice(0, 200)}`);
       process.exitCode = 1;
@@ -2974,6 +3022,28 @@ const harnessOrchestrateCmd = registerHarnessOrchestrateCapabilityOptions(
       return;
     }
     await runHarnessOrchestrateExecution(plan, parts);
+  });
+
+const coordCmd = program.command('coord').description('조율 채널 맥락 원장');
+coordCmd.command('event').command('record')
+  .requiredOption('--seat <ID>', '발신 자리')
+  .requiredOption('--header <line>', '채널 글 첫 줄')
+  .option('--url <url>', '채널 코멘트 URL')
+  .action(async (opts: { seat: string; header: string; url?: string }) => {
+    const { parseCoordHeader, recordCoordEvent } = await import('./context-bus/coord-events.js');
+    recordCoordEvent({ ...parseCoordHeader(opts.seat, opts.header), url: opts.url || null });
+  });
+coordCmd.command('events')
+  .option('--since <ISO|2h>', '조회 시작', '2h')
+  .option('--seat <ID>', '발신 자리')
+  .option('--json', 'JSON 출력')
+  .action(async (opts: { since: string; seat?: string; json?: boolean }) => {
+    const { listCoordEvents } = await import('./context-bus/coord-events.js');
+    const relative = /^(\d+)h$/.exec(opts.since);
+    const since = relative ? new Date(Date.now() - Number(relative[1]) * 3_600_000).toISOString() : new Date(opts.since).toISOString();
+    const rows = listCoordEvents({ since, ...(opts.seat ? { seat: opts.seat } : {}) });
+    if (opts.json) await writeStdoutJson(JSON.stringify(rows) + '\n');
+    else for (const row of rows) console.log(`${row.at} [${row.refs.seat}] ${row.text}`);
   });
 
 const selfCmd = program.command('self').description('Self-awareness memory — 외부 도구(Claude Code/Codex)가 구현/변경 이력을 elanous 기억에 주입·회상');
@@ -6498,8 +6568,21 @@ const selfDevCmd = program
       if (devAskSubstrate?.substrate === 'pod') {
         const { dispatchHarnessOnPod } = await import('./harness/harness-pod-dispatch.js');
         const { devAskPodDispatchInput } = await import('./harness/harness-substrate-default.js');
-        const status = await dispatchHarnessOnPod(devAskPodDispatchInput(opts, askAuthoredFile!, devAskSubstrate.pool!));
-        if (status !== 0) console.error('Pod 실행에 닿지 못했다 — 풀·컨텍스트·SSH 연결을 확인하거나 `--substrate local` 로 명시하라');
+        const { classifyHarnessPodExit, harnessPodRunId, recordClassifiedHarnessPodExit, warnRecentIncidentBurst } = await import('./harness/harness-cli-command.js');
+        warnRecentIncidentBurst();
+        let podOutput = '';
+        let podRunId: string | undefined;
+        const status = await dispatchHarnessOnPod(devAskPodDispatchInput(opts, askAuthoredFile!, devAskSubstrate.pool!), {
+          onOutput: (text) => {
+            podRunId ??= harnessPodRunId(podOutput + text);
+            podOutput = (podOutput + text).slice(-16_000);
+          },
+        });
+        if (status !== 0) {
+          const classified = classifyHarnessPodExit({ status }, podOutput, { ...(podRunId ? { runId: podRunId } : {}) });
+          recordClassifiedHarnessPodExit(podRunId ?? harnessPodRunId(podOutput), classified.reason, status);
+          for (const line of classified.lines) console.error(line);
+        }
         completionGuard.conclude();
         process.exit(status);
       }
@@ -7499,6 +7582,10 @@ sessionCmd
     const s = ensureCliSession(cfg);
     setActiveSessionId(s.id);
     ui.info(`Created session ${s.id.slice(0, 8)} (marked active).`);
+    try {
+      const project = suggestProjectForFolder(process.cwd());
+      if (project) ui.info(`Project suggestion: ${project.name} (${project.id})`);
+    } catch { /* suggestions must not interrupt session creation */ }
   });
 
 sessionCmd
@@ -7929,7 +8016,7 @@ sessionCmd
   });
 
 async function runFirstSetupForCli(cfg: ReturnType<typeof getUserConfig>, announceFallback = false): Promise<boolean> {
-  if (cfg.onboarding.webFirst === true) {
+  if (cfg.onboarding.webFirst !== false) {
     const { runWebFirstSetup } = await import('./onboarding/web-first.js');
     if (await runWebFirstSetup({ config: cfg }) === 'link-shown') return false;
     if (announceFallback) ui.info('No config yet — launching setup wizard first.');
@@ -7972,7 +8059,7 @@ program
     if (opts.tools) announceChatToolsCompatibility();
     const cfg = getUserConfig();
     if (needsOnboarding(cfg)) {
-      if (cfg.onboarding.webFirst !== true) ui.info('No config yet — launching setup wizard first.');
+      if (cfg.onboarding.webFirst === false) ui.info('No config yet — launching setup wizard first.');
       if (!await runFirstSetupForCli(cfg, true)) return;
     }
     const refreshed = reloadUserConfig();
@@ -8039,7 +8126,7 @@ program
     }
     const cfg = getUserConfig();
     if (needsOnboarding(cfg)) {
-      if (cfg.onboarding.webFirst !== true) ui.info('No config yet — launching setup wizard first.');
+      if (cfg.onboarding.webFirst === false) ui.info('No config yet — launching setup wizard first.');
       if (!await runFirstSetupForCli(cfg, true)) return;
     }
     const refreshed = reloadUserConfig();
@@ -9281,24 +9368,50 @@ const nexusRunCmd = nexusCmd
         process.once('exit', () => releaseTestPort(resolvedPort, process.pid));
       }
       const { runNexus } = await import('./nexus/index.js');
-      await runNexus({
-        headless: true,
-        tools: toolsKind ?? 'webterm',
-        autoMountShare: !bgChild,
-        // bg-launch child reads `--watch` from forwardArgs (set by
-        // runPwaStart). External !TTY launches (launchd / Docker /
-        // nohup) get watch only when the user explicitly didn't disable
-        // it — service-manager production posture stays watch-off.
-        ...((bgChild ? opts.watch === true : watchOn) ? { pwaWatch: true } : {}),
-        ...(opts.mcp === false ? { mcpEnabled: false } : {}),
-        ...(opts.auth === false ? { noAuth: true } : {}),
-        ...(opts.force ? { force: true } : {}),
-        ...(opts.dispatch ? { dispatch: true } : {}),
-        ...(opts.toolCwd ? { toolCwd: opts.toolCwd } : {}),
-        ...(opts.historyDir ? { historyDir: opts.historyDir } : {}),
-        ...(resolvedHttpHost ? { httpHost: resolvedHttpHost } : {}),
-        ...(resolvedPort !== undefined ? { httpStartPort: resolvedPort } : {}),
-      });
+      // Only isolated daemons force exit after SIGINT cleanup; production and
+      // SIGTERM keep their existing service-manager lifecycle contracts.
+      const isolatedDaemon = (await import('./instance/current.js')).resolveCurrentInstance().kind === 'test';
+      let stoppedBySigint = false;
+      let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+      const onStop = () => {
+        if (!isolatedDaemon) return;
+        stoppedBySigint = true;
+        cleanupTimer = setTimeout(() => {
+          console.error('elanous nexus: SIGINT cleanup exceeded 8s; exiting');
+          process.exit(1);
+        }, 8_000);
+      };
+      if (isolatedDaemon) process.once('SIGINT', onStop);
+      try {
+        await runNexus({
+          headless: true,
+          tools: toolsKind ?? 'webterm',
+          autoMountShare: !bgChild,
+          // bg-launch child reads `--watch` from forwardArgs (set by
+          // runPwaStart). External !TTY launches (launchd / Docker /
+          // nohup) get watch only when the user explicitly didn't disable
+          // it — service-manager production posture stays watch-off.
+          ...((bgChild ? opts.watch === true : watchOn) ? { pwaWatch: true } : {}),
+          ...(opts.mcp === false ? { mcpEnabled: false } : {}),
+          ...(opts.auth === false ? { noAuth: true } : {}),
+          ...(opts.force ? { force: true } : {}),
+          ...(opts.dispatch ? { dispatch: true } : {}),
+          ...(opts.toolCwd ? { toolCwd: opts.toolCwd } : {}),
+          ...(opts.historyDir ? { historyDir: opts.historyDir } : {}),
+          ...(resolvedHttpHost ? { httpHost: resolvedHttpHost } : {}),
+          ...(resolvedPort !== undefined ? { httpStartPort: resolvedPort } : {}),
+        });
+      } catch (error) {
+        if (stoppedBySigint) {
+          console.error(`elanous nexus: SIGINT cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+          process.exit(1);
+        }
+        throw error;
+      } finally {
+        process.removeListener('SIGINT', onStop);
+        if (cleanupTimer) clearTimeout(cleanupTimer);
+      }
+      if (stoppedBySigint) process.exit(0);
       return;
     }
 
@@ -10739,18 +10852,24 @@ async function main(): Promise<void> {
       program.error(`error: unknown command '${firstCommand}'`);
       return;
     }
-    await program.parseAsync(['node', 'elanous', ...args]);
+    const showAll = args[0] === '--help-all';
+    const role = getUserConfig().cli?.helpRole ?? 'owner';
+    const { shown, hidden } = filterCliRootHelp(program.commands, role, showAll);
+    debug.log('cli.maturity', 'help-filtered', { role, shown, hidden });
+    await program.parseAsync(['node', 'elanous', ...(showAll ? ['--help'] : args)]);
     return;
   }
 
-  // First-run: trigger the onboarding wizard before dropping into the
-  // dashboard so we don't need to handle half-configured state in the
-  // TUI chrome. Subsequent launches skip straight to the dashboard.
-  // (Bare `elanous` always lands on the dashboard now, so the wizard just
-  // gates on config completeness — no entry-mode branch.)
+  // Bare entry only requires an LLM; detailed setup stays behind `eln setup`.
+  const firstRunStartedAt = Date.now();
   const cfg = getUserConfig();
-  if (needsOnboarding(cfg)) {
-    if (!await runFirstSetupForCli(cfg)) return;
+  if (needsFirstRun(cfg)) {
+    if (cfg.onboarding.webFirst !== false) {
+      const { runWebFirstSetup } = await import('./onboarding/web-first.js');
+      if (await runWebFirstSetup({ config: cfg, startedAt: firstRunStartedAt }) === 'link-shown') return;
+    }
+    const { runFirstRun } = await import('./onboarding/first-run.js');
+    if ((await runFirstRun({ config: cfg })).outcome !== 'ready') return;
   }
 
   // Active-provider banner so users know WHICH model/auth is about to

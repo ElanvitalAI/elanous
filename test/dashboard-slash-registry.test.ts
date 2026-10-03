@@ -661,11 +661,11 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     }
   });
 
-  test('help / ? → showHelpModal without waiting for a key', async () => {
+  test('help / ? → scrollable chat at 160×40 when readable lines exceed the modal', async () => {
     const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
     const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
     try {
-      Object.defineProperty(process.stdout, 'rows', { configurable: true, value: 50 });
+      Object.defineProperty(process.stdout, 'rows', { configurable: true, value: 40 });
       Object.defineProperty(process.stdout, 'columns', { configurable: true, value: 160 });
       const reg = buildDashboardSlashRegistry();
       for (const name of ['help', '?'] as const) {
@@ -673,13 +673,18 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
         const r = await reg.dispatch(name, [], ctx);
         expect(r.kind).toBe('continue');
         expect(state.helpCalls).toEqual([]);
-        expect(state.helpModalCalls).toHaveLength(1);
-        const lines = state.helpModalCalls[0]!.lines;
+        expect(state.helpModalCalls).toHaveLength(0);
+        const lines = ctx.chatLines;
         expect(lines.length).toBeGreaterThan(0);
         expect(lines.join('\n')).not.toContain('Focus left pane');
         expect(lines.join('\n')).not.toContain('Focus right pane');
-        expect(lines.join('\n')).toContain('/session  ');
+        expect(lines.join('\n')).toContain('/session (sess)  ');
+        expect(lines.join('\n')).toContain('/model (m)  ');
+        expect(lines.join('\n')).toContain('/quit (q, exit)  ');
         expect(lines.join('\n')).toContain('Ctrl+W');
+        const modalContentRows = Math.max(Math.min(6, Math.max(3, 40 - 2)), Math.min(40 - 4, Math.floor(40 * 0.7))) - 2;
+        expect(lines.length).toBeGreaterThan(modalContentRows);
+        expect(lines[0]).toContain('scroll the chat log');
         expect(lines.join('\n')).not.toMatch(/[│╭╰┌┐└┘─]/);
       }
     } finally {
@@ -690,43 +695,55 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
     }
   });
 
-  test('real registry /help paint shows last registered described command and last key', async () => {
+  test('real registry /help output preserves last described command and last key', async () => {
     const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
     const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
     try {
-      for (const [cols, rows] of [[160, 50], [220, 60]] as const) {
+      for (const [cols, rows] of [[160, 40], [220, 60]] as const) {
         Object.defineProperty(process.stdout, 'columns', { configurable: true, value: cols });
         Object.defineProperty(process.stdout, 'rows', { configurable: true, value: rows });
         const registry = buildDashboardSlashRegistry();
         const { ctx, state } = makeFakeCtx();
         await registry.dispatch('help', [], ctx);
-        expect(state.helpModalCalls).toHaveLength(1);
-        const allLines = state.helpModalCalls[0]!.lines;
-        const expectedNames = registry.names().filter((name) => SLASH_COMMANDS.some(
-          (command) => command.name === name || command.aliases?.includes(name),
-        ));
-        const lastName = [...expectedNames].sort().at(-1)!;
-        const commandText = allLines.slice(1, allLines.indexOf('')).join('\n');
-        expect(commandText).toContain(`/${lastName}  `);
+        expect(state.helpModalCalls).toHaveLength(cols === 160 ? 0 : 1);
+        const allLines = state.helpModalCalls.length ? state.helpModalCalls[0]!.lines : ctx.chatLines;
+        const registered = new Set(registry.names());
+        const expectedCommands = SLASH_COMMANDS.filter((command) => registered.has(command.name));
+        const commandText = allLines.slice(allLines.indexOf('Commands') + 1, allLines.indexOf('')).join('\n');
+        const labels = expectedCommands.map((command) => {
+          const aliases = (command.aliases ?? []).filter((alias) => registered.has(alias));
+          return `/${command.name}${aliases.length ? ` (${aliases.join(', ')})` : ''}  `;
+        });
+        for (const label of labels) expect(commandText).toContain(label.trimEnd());
+        const lastLabel = labels.at(-1)!;
+        expect(commandText).toContain(lastLabel);
+        expect(commandText).not.toMatch(/(?:H\d+ P\d+|CV-\d+|Sprint \d+|Showroom v2)/);
+        expect(commandText).toContain('/handoff  cross-agent');
+        expect(commandText).toContain('/showroom  multi-LLM');
         expect(allLines.join('\n')).not.toContain('Focus left pane');
         expect(allLines.join('\n')).not.toContain('Focus right pane');
-        expect(allLines.join('\n')).toContain('/session  ');
+        expect(allLines.join('\n')).toContain('/session (sess)  ');
         expect(allLines.join('\n')).toContain('Ctrl+W');
         expect(allLines.join('\n')).not.toMatch(/[│╭╰┌┐└┘─]/);
-        const coordinator = new DisplayCoordinator({ frameMs: 0 });
-        const modal = showTransientTerminalModal({
-          title: 'Dashboard help', lines: [...allLines],
-          coordinator, termCols: cols, termRows: rows, ttlMs: 0, group: 'dashboard-help-test',
-        });
-        try {
-          expect(allLines.length).toBeLessThanOrEqual(modal.bounds.height - 2);
-          const paint = (coordinator.surface(modal.id) as unknown as { paint: () => string }).paint();
-          expect(paint.match(/┌/g)).toHaveLength(1);
-          expect(paint).toContain('┘');
-          expect(paint).toContain(`/${lastName}  `);
-          expect(paint).toContain('Ctrl+↑  ');
-        } finally {
-          modal.dispose();
+        if (state.helpModalCalls.length) {
+          const coordinator = new DisplayCoordinator({ frameMs: 0 });
+          const modal = showTransientTerminalModal({
+            title: 'Dashboard help', lines: [...allLines],
+            coordinator, termCols: cols, termRows: rows, ttlMs: 0, group: 'dashboard-help-test',
+          });
+          try {
+            expect(allLines.length).toBeLessThanOrEqual(modal.bounds.height - 2);
+            const paint = (coordinator.surface(modal.id) as unknown as { paint: () => string }).paint();
+            expect(paint.match(/┌/g)).toHaveLength(1);
+            expect(paint).toContain('┘');
+            expect(paint).toContain(lastLabel);
+            expect(paint).toContain('Ctrl+↑  ');
+          } finally {
+            modal.dispose();
+          }
+        } else {
+          expect(ctx.chatLines[0]).toContain('scroll the chat log');
+          expect(ctx.chatLines.at(-1)).toContain('Ctrl+↑  ');
         }
       }
     } finally {
@@ -734,6 +751,36 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
       else Reflect.deleteProperty(process.stdout, 'columns');
       if (priorRows) Object.defineProperty(process.stdout, 'rows', priorRows);
       else Reflect.deleteProperty(process.stdout, 'rows');
+    }
+  });
+
+  test('help at 160×40 keeps a long registered label and 28 description characters with 40+ commands', async () => {
+    const priorRows = Object.getOwnPropertyDescriptor(process.stdout, 'rows');
+    const priorColumns = Object.getOwnPropertyDescriptor(process.stdout, 'columns');
+    const name = 'long-registered-help-command';
+    const alias = 'long-help-alias';
+    const description = 'The first twenty eight letters of this long command description continue beyond the row';
+    const command = { name, aliases: [alias], description };
+    SLASH_COMMANDS.push(command);
+    try {
+      Object.defineProperty(process.stdout, 'rows', { configurable: true, value: 40 });
+      Object.defineProperty(process.stdout, 'columns', { configurable: true, value: 160 });
+      const registry = buildDashboardSlashRegistry();
+      registry.register([name, alias], () => {});
+      expect(SLASH_COMMANDS.filter((item) => registry.has(item.name)).length).toBeGreaterThanOrEqual(40);
+      const { ctx, state } = makeFakeCtx();
+      await registry.dispatch('help', [], ctx);
+      const lines = state.helpModalCalls.length ? state.helpModalCalls[0]!.lines : ctx.chatLines;
+      expect(lines.join('\n')).toContain(`/${name} (${alias})  ${description.slice(0, 28)}`);
+      expect(state.helpModalCalls).toHaveLength(0);
+      expect(ctx.chatLines.at(-1)).toContain('Ctrl+↑  ');
+      expect(state.scrollOffset).toBe(-1);
+    } finally {
+      SLASH_COMMANDS.splice(SLASH_COMMANDS.indexOf(command), 1);
+      if (priorRows) Object.defineProperty(process.stdout, 'rows', priorRows);
+      else Reflect.deleteProperty(process.stdout, 'rows');
+      if (priorColumns) Object.defineProperty(process.stdout, 'columns', priorColumns);
+      else Reflect.deleteProperty(process.stdout, 'columns');
     }
   });
 
@@ -748,7 +795,7 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
         const { ctx, state } = makeFakeCtx();
         await registry.dispatch('help', [], ctx);
         expect(state.helpModalCalls).toHaveLength(0);
-        expect(ctx.chatLines.join('\n')).toContain('/session  ');
+        expect(ctx.chatLines.join('\n')).toContain('/session (sess)  ');
         expect(ctx.chatLines.at(-1)).toContain('Ctrl+↑  ');
         expect(state.scrollOffset).toBe(-1);
       }
@@ -763,13 +810,21 @@ describe('buildDashboardSlashRegistry — pilot handlers', () => {
   test('help command section equals the described registrations', () => {
     const registry = buildDashboardSlashRegistry();
     const names = registry.names();
-    const described = new Set(displayedSlashCommandNames());
+    const registered = new Set(names);
     const lines = buildEssentialHelpLines({ names, descriptions: SLASH_COMMANDS, width: 220 });
     const commandLines = lines.slice(1, lines.indexOf(''));
-    const orderedNames = commandLines.join('\n').match(/\/[\w?-]+  /g)?.map((entry) => entry.slice(1, -2));
-    expect(orderedNames).toEqual(
-      [...new Set(names)].filter((name) => described.has(name)).sort(),
-    );
+    const text = commandLines.join('\n');
+    const orderedCommands = SLASH_COMMANDS.filter(({ name }) => registered.has(name))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    let previousPosition = -1;
+    for (const command of orderedCommands) {
+      const aliases = (command.aliases ?? []).filter((alias) => registered.has(alias));
+      const label = `/${command.name}${aliases.length ? ` (${aliases.join(', ')})` : ''}  `;
+      expect(text.split(label).length - 1).toBe(1);
+      const position = text.indexOf(label);
+      expect(position).toBeGreaterThan(previousPosition);
+      previousPosition = position;
+    }
     expect(commandLines.length).toBeGreaterThan(0);
   });
 

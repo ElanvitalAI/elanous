@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,6 +10,9 @@ import { cardGoalId } from './dispatch-task.js';
 import type { DecisionEvent } from '../live/detail-switch.js';
 import type { SelfImplementResult, SelfImplementSeams } from '../self-implement/orchestrator.js';
 import { dispatchTask, type DispatchTaskDeps, type DispatchTaskInput } from './dispatch-task.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const spec: DevPipelineSpec = { input: { text: 'Implement feature' }, humanReadableOutput: false };
 const input: DispatchTaskInput = { goalId: 'goal-one', title: 'Implement feature', goalText: 'Implement feature', targetPaths: ['src/a.ts'], spec };

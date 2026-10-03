@@ -1,6 +1,9 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 // Captured from the pre-move src/index.ts Commander tree (flags preserve declaration order).
 // #21723 added logs --top-failures/--threshold after the extraction snapshot; keep the exact flag-order guard.

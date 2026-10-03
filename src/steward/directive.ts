@@ -1,10 +1,15 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { getSecretAsync } from '../nexus/config/secrets/index.js';
 import { getUserConfig } from '../user-config.js';
 
 export type DirectiveSource = 'telegram' | 'pwa' | 'tui' | 'cli';
 export interface DirectiveIssue { id: string; identifier: string; title: string; description?: string | null }
+export interface DirectiveOrigin { chatId: number; botId?: string; threadId?: number }
 export interface DirectiveDeps {
+  root?: string;
   fetch?: typeof fetch;
   getSecret?: (id: string) => Promise<string | undefined>;
   team?: string;
@@ -31,8 +36,50 @@ async function graphql<T>(key: string, query: string, variables: Record<string, 
   return payload.data;
 }
 
+function originPath(root: string, identifier: string): string {
+  if (!/^[a-zA-Z0-9_-]+$/.test(identifier)) throw new Error('Invalid directive identifier');
+  return join(root, 'steward', 'origins', `${identifier}.json`);
+}
+
+type TelegramOrigin = import('../autopilot/mission-origin.js').MissionOrigin & { channel: 'telegram'; chatId: number };
+
+function validOrigin(value: unknown): value is TelegramOrigin {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const origin = value as Record<string, unknown>;
+  return origin.channel === 'telegram' && Number.isSafeInteger(origin.chatId) &&
+    (origin.botId === undefined || typeof origin.botId === 'string' && /^\d+$/.test(origin.botId)) &&
+    (origin.threadId === undefined || Number.isSafeInteger(origin.threadId));
+}
+
+export function loadDirectiveOrigins(root: string, identifier: string): TelegramOrigin[] {
+  try {
+    const value: unknown = JSON.parse(readFileSync(originPath(root, identifier), 'utf8'));
+    const origins = Array.isArray(value) ? value : [value];
+    return origins.filter(validOrigin);
+  } catch { return []; }
+}
+
+export function saveDirectiveOrigin(root: string, identifier: string, origin: DirectiveOrigin): void {
+  if (!Number.isSafeInteger(origin.chatId) || origin.threadId !== undefined && !Number.isSafeInteger(origin.threadId)) throw new Error('Invalid directive origin');
+  const path = originPath(root, identifier);
+  const next: TelegramOrigin = { channel: 'telegram', chatId: origin.chatId,
+    ...(origin.botId && /^\d+$/.test(origin.botId) ? { botId: origin.botId } : {}),
+    ...(origin.threadId !== undefined ? { threadId: origin.threadId } : {}) };
+  const origins = loadDirectiveOrigins(root, identifier);
+  if (origins.some(item => JSON.stringify(item) === JSON.stringify(next))) return;
+  origins.push(next);
+  mkdirSync(join(root, 'steward', 'origins'), { recursive: true });
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  writeFileSync(temp, JSON.stringify(origins.length === 1 ? next : origins));
+  renameSync(temp, path);
+}
+
+export function loadDirectiveOrigin(root: string, identifier: string): TelegramOrigin | null {
+  return loadDirectiveOrigins(root, identifier)[0] ?? null;
+}
+
 /** The same entry point is used by the CLI and conversational surfaces. */
-export async function addDirective(text: string, options: { source?: DirectiveSource; dryRun?: boolean } = {}, deps: DirectiveDeps = {}): Promise<{ status: 'created' | 'repeated' | 'dry-run'; issue?: string; hash: string }> {
+export async function addDirective(text: string, options: { source?: DirectiveSource; dryRun?: boolean; origin?: DirectiveOrigin } = {}, deps: DirectiveDeps = {}): Promise<{ status: 'created' | 'repeated' | 'dry-run'; issue?: string; hash: string }> {
   const original = text.trim();
   if (!original) throw new Error('directive text is required');
   const source = options.source ?? 'cli';
@@ -74,6 +121,7 @@ export async function addDirective(text: string, options: { source?: DirectiveSo
       'mutation($input:CommentCreateInput!){commentCreate(input:$input){success}}',
       { input: { issueId: duplicate.id, body: `다시 말함 · ${source} · ${at}\n\n${original}` } });
     if (!result.commentCreate?.success) throw new Error('Linear comment creation failed');
+    if (source === 'telegram' && options.origin) saveDirectiveOrigin(deps.root ?? effectiveInstanceRoot(), duplicate.identifier, options.origin);
     return { status: 'repeated', issue: duplicate.identifier, hash };
   }
   const labels = await request<{ issueLabels: { nodes: Array<{ id: string; name: string }> } }>(
@@ -90,6 +138,7 @@ export async function addDirective(text: string, options: { source?: DirectiveSo
     'mutation($input:IssueCreateInput!){issueCreate(input:$input){success issue{id identifier title}}}',
     { input: { teamId, title: original.slice(0, 240), description: `${original}\n\n출처: ${source}\n시각: ${at}\n[directive-hash:${hash}]`, labelIds: [labelId], priority: 0 } });
   if (!created.issueCreate?.success || !created.issueCreate.issue?.identifier) throw new Error('Linear issue creation failed');
+  if (source === 'telegram' && options.origin) saveDirectiveOrigin(deps.root ?? effectiveInstanceRoot(), created.issueCreate.issue.identifier, options.origin);
   return { status: 'created', issue: created.issueCreate.issue.identifier, hash };
 }
 

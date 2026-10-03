@@ -32,6 +32,7 @@ describe('feature maturity across surfaces', () => {
       expect(maturityOn(route, 'pwa')).toBe(grade.pwa);
     }
     expect(maturityOn('/chat', 'pwa')).toBe('stable');
+    expect(maturityOn('/today', 'pwa')).toBe('stable');
     expect(maturityOn('/settings', 'pwa')).toBe('beta');
     expect(maturityOn('/approvals', 'pwa')).toBe('tool');
     expect(maturityOn('/scheduler', 'pwa')).toBe('ops');
@@ -46,6 +47,9 @@ describe('feature maturity across surfaces', () => {
         expect(visibleOn(route, 'desktop', role)).toBe(visibleOn(route, 'pwa', role));
       }
     }
+    expect(maturityOn('/today', 'desktop')).toBe('stable');
+    expect(visibleOn('/today', 'pwa', 'general')).toBe(true);
+    expect(visibleOn('/today', 'desktop', 'general')).toBe(true);
     expect(visibleOn('/settings', 'desktop', 'general')).toBe(true);
     expect(visibleOn('/share', 'desktop', 'general')).toBe(false);
     expect(visibleOn('/share', 'desktop', 'owner')).toBe(true);

@@ -26,6 +26,7 @@ import {
 import { SurfaceRegistry } from '../src/task-orchestrator/surface-registry.ts';
 import type { TaskSurface } from '../src/task-orchestrator/types.ts';
 import { setIntakeStoreForTest } from '../src/intake-plane/runtime.ts';
+import { createIntakeStore } from '../src/intake-plane/store.ts';
 import { setDaemonInputHostForTesting } from '../src/voice/daemon-input-host-singleton';
 import { setDaemonSttProviderForTesting } from '../src/voice/voice-rest-handler';
 import { setDaemonTtsProviderForTesting } from '../src/voice/voice-tts-singleton';
@@ -1263,6 +1264,8 @@ describe('TelegramBot', () => {
   });
 
   test('/intake answer shorthand resolves the latest clarify intake in telegram flow', async () => {
+    // The default intake archive directory is chosen at module import time, before per-test env isolation.
+    setIntakeStoreForTest(createIntakeStore({ archiveDir: join(root, 'intake') }));
     const updates = [
       { update_id: 1, message: { message_id: 1, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: '/intake ====' } },
       { update_id: 2, message: { message_id: 2, from: { id: 42 }, chat: { id: 42, type: 'private' }, text: '/intake answer keep this in backlog' } },
@@ -1444,7 +1447,7 @@ describe('botFromConfig end-to-end', () => {
         userConfig: cfg,
         fetchImpl,
         telegramBotOpts: FAST_TG_OPTS,
-        runTurnImpl: async () => ({ text: 'should not run' }),
+        runTurnImpl: async () => { throw new Error('should not run'); },
       });
       await bot.start();
     } finally {

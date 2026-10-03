@@ -12,10 +12,13 @@
 // 분할 → 주입된 ToolSearch → 데몬 dispatch → SelfImplement 스키마 하이드레이션.
 // 한 고리라도 끊기면 여기서 잡힌다(부분 수리가 "unknown tool" 로 악화되는 것도 포함).
 
-import { describe, test, expect } from 'bun:test';
+import { setDefaultTimeout, describe, test, expect } from 'bun:test';
 import { toolSurface } from './index.js';
 import { splitDeferredToolSpecs } from '../../session-runtime/tier-flip.js';
 import type { DaemonToolDispatchCtx } from './types.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const ctx = (): DaemonToolDispatchCtx => ({
   cwd: process.cwd(),

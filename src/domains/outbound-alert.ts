@@ -13,9 +13,9 @@ import { conatusEnv } from './conatus-env.js';
 import { spillLongContent } from '../storage/content-spill.js';
 import { openSurfaceEventsDb, recordEvent } from './surface-events.js';
 import { latestUserIntentTs } from '../user-intent/index.js';
-import { getUserConfig } from '../user-config.js';
+import { getUserConfig, type UserConfig } from '../user-config.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
-import { kindRouteTarget } from './telegram-kind-route.js';
+import { isOperationalKind, kindRouteTarget, logKindRouteFallback, mainHomeTarget } from './telegram-kind-route.js';
 import { debug } from '../debug/log.js';
 import { resolveDaemonEndpoint } from '../nexus/daemon-endpoint.js';
 import { effectiveInstanceRoot, prodInstanceRoot } from '../instance/resolve.js';
@@ -210,9 +210,14 @@ export function flushDeferred(path = DEFERRED_PATH): number {
   ].join('\n');
   observeFlush(items.length, lagMin, [...new Set(items.map(i => i.kind))]);
   let delivered = 0;
-  // origin 없는 것 = report 묶음(기존 동작·finance/크론 알림).
+  // origin 없는 finance 는 기존 report 묶음. 운영 보류분은 별도로 묶어 운영 봇 경계를 유지한다.
   const noOrigin = items.filter(i => !i.origin);
-  if (noOrigin.length && deliver(fmt(noOrigin), 'report')) delivered += noOrigin.length;
+  const tradingBatch = noOrigin.filter(i => !isOperationalKind(i.kind));
+  if (tradingBatch.length && deliver(fmt(tradingBatch), 'report')) delivered += tradingBatch.length;
+  for (const kind of new Set(noOrigin.filter(i => isOperationalKind(i.kind)).map(i => i.kind))) {
+    const batch = noOrigin.filter(i => i.kind === kind);
+    if (deliver(fmt(batch), kind)) delivered += batch.length;
+  }
   // origin 있는 것 = 발신 채널·스레드별로 묶어 서로 다른 수신자에게 섞이지 않게 발송.
   const groups = new Map<string, { origin: MissionOrigin; list: Item[] }>();
   for (const it of items) {
@@ -402,20 +407,43 @@ function sendTelegramRaw(token: string, chatId: string | number, text: string, t
   return ok;
 }
 
-/** 텔레그램 직접 발송(TELEGRAM_BOT_TOKEN/CHAT_ID — env 우선, 없으면 CONATUS/.env). report 폴백. */
-function sendTelegramDirect(text: string, kind?: string): boolean {
-  // A purpose kind with a channel role (intake · ops-*) goes to that channel even when the daemon is down.
-  try {
-    const target = kindRouteTarget(getUserConfig(), kind);
-    if (target) return sendTelegramRaw(target.botToken, String(target.chatId), text);
-  } catch { /* fall through to the legacy direct path */ }
+/** 텔레그램 직접 발송. 운영 kind 는 메인 봇/홈 밖의 env 로 내려가지 않는다. */
+export function sendTelegramDirect(
+  text: string, kind?: string,
+  deps: { config?: UserConfig; sendRaw?: typeof sendTelegramRaw; legacyEnv?: typeof conatusEnv } = {},
+): boolean {
+  const sendRaw = deps.sendRaw ?? sendTelegramRaw;
+  let cfg: UserConfig | undefined;
+  try { cfg = deps.config ?? getUserConfig(); } catch { /* unavailable config: operational delivery still fails closed */ }
+  if (cfg) {
+    try {
+      const target = kindRouteTarget(cfg, kind);
+      if (target) return sendRaw(target.botToken, String(target.chatId), text);
+    } catch { /* unavailable channel routing: fall through */ }
+  }
+  if (isOperationalKind(kind)) {
+    let home: ReturnType<typeof mainHomeTarget> = null;
+    let mainToken = '';
+    try {
+      if (cfg) {
+        mainToken = resolveChannelBotToken('telegram', cfg).token;
+        home = mainHomeTarget(cfg);
+      }
+    } catch { /* unavailable main bot */ }
+    const rcToken = cfg?.telegram.reportChannel?.botToken;
+    logKindRouteFallback(kind, home ? 'main-home' : 'none', !!mainToken && !!cfg?.telegram.reportChannel && (!rcToken || rcToken === mainToken));
+    if (home) return sendRaw(home.botToken, String(home.chatId), text);
+    console.error('[outbound] 운영 kind 메인 봇/홈 미설정 — 콘솔 출력\n' + text);
+    return false;
+  }
   let tok = process.env.TELEGRAM_BOT_TOKEN || '';
   let chat = process.env.TELEGRAM_CHAT_ID || '';
   if (!tok || !chat) {
-    const env = conatusEnv();
+    const env = (deps.legacyEnv ?? conatusEnv)();
     tok = tok || env.TELEGRAM_BOT_TOKEN || '';
     chat = chat || env.TELEGRAM_CHAT_ID || '';
   }
+  logKindRouteFallback(kind, tok && chat ? 'conatus-env' : 'none', false);
   if (!tok || !chat) { console.error('[outbound] 토큰/chat 미설정 — 콘솔 출력\n' + text); return false; }
-  return sendTelegramRaw(tok, chat, text);
+  return sendRaw(tok, chat, text);
 }

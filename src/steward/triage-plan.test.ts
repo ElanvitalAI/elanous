@@ -20,7 +20,7 @@ test('100 new issues classify in eight slots then make exactly one planning call
       await new Promise(resolve => setTimeout(resolve, 1));
       clock += 5_000 / 8;
       active--;
-      return { rung: 4, why: 'work' };
+      return { rung: 4, why: 'work', capability: 'existing-capability' };
     }
     clock += 10_000;
     return { plans: issues.map((item, n) => ({ issue: item.identifier, priority: n, dependsOn: [], owner: null })) };
@@ -50,7 +50,7 @@ test('normalized duplicate uses no classify calls, while sensitive content is co
     calls.push(role);
     return role === 'planning'
       ? { plans: [{ issue: 'ELA-0', priority: 0, dependsOn: [], owner: null }, { issue: 'ELA-2', priority: 2, dependsOn: [], owner: null }] }
-      : { rung: 2, why: 'check payment', hitlReason: 'money' };
+      : { rung: 2, why: 'check payment', hitlReason: 'money', capability: 'existing-capability' };
   };
   const rows = await triageIssues([first, duplicate, { ...issue(2), body: '결제 승인' }], undefined, () => true, undefined, [], ask);
   expect(rows[1]).toMatchObject({ rung: 0, duplicateOf: 'ELA-0' });
@@ -66,7 +66,7 @@ test('same normalized title: a different ref with the same body is a duplicate; 
   const calls: string[] = [];
   const rows = await triageIssues(batch, undefined, () => true, undefined, [], async (_prompt, role) => {
     calls.push(role);
-    return role === 'classify' ? { rung: 4, why: 'distinct work' }
+    return role === 'classify' ? { rung: 4, why: 'distinct work', capability: 'existing-capability' }
       : { plans: [{ issue: 'ELA-0', priority: 0, dependsOn: [], owner: null }, { issue: 'ELA-2', priority: 1, dependsOn: [], owner: null }] };
   });
   expect(rows.map(row => [row.rung, row.duplicateOf])).toEqual([[4, undefined], [0, 'ELA-0'], [4, undefined]]);
@@ -77,7 +77,7 @@ test('security key mentions are HITL candidates and classification confirms the 
   for (const title of ['API 키 검토', 'access token review']) {
     const candidate = { ...issue(9), title };
     expect(unsafeReason(candidate)).toBe('security');
-    const result = await classifyIssue(candidate, async () => ({ rung: 2, why: 'inspect key handling' }));
+    const result = await classifyIssue(candidate, async () => ({ rung: 2, why: 'inspect key handling', capability: 'existing-capability' }));
     expect(result).toMatchObject({ rung: 'hitl', hitlReason: 'security' });
   }
 });
@@ -88,7 +88,7 @@ test('planning only receives newly classified issues and may depend on reused is
   const calls: string[] = [];
   const rows = await triageIssues(issues, undefined, () => true, undefined, [prior], async (prompt, role) => {
     calls.push(role);
-    if (role === 'classify') return { rung: 4, why: 'new' };
+    if (role === 'classify') return { rung: 4, why: 'new', capability: 'new-capability' };
     expect(prompt).toContain('ELA-0');
     return { plans: [{ issue: 'ELA-1', priority: 2, dependsOn: ['ELA-0'], owner: null }] };
   });
@@ -101,7 +101,7 @@ test('planning is skipped on empty batch and rejects omitted issues', async () =
   const ask: StewardAsk = async () => { throw new Error('must not call'); };
   expect(await planIssues([], ask)).toEqual([]);
   await expect(planIssues([{ issue: 'ELA-1', rung: 4, why: 'ok' }], async () => ({ plans: [] }))).rejects.toThrow('Invalid steward plan');
-  expect(await classifyIssue(issue(1), async () => ({ rung: 1, why: 'shell' }))).toMatchObject({ rung: 1, why: 'shell' });
+  expect(await classifyIssue(issue(1), async () => ({ rung: 1, why: 'shell', capability: 'existing-capability' }))).toMatchObject({ rung: 1, why: 'shell', capability: 'existing-capability' });
 });
 
 test('classification finishing after its timeout cannot enter the frozen planning batch', async () => {
@@ -120,7 +120,7 @@ test('classification finishing after its timeout cannot enter the frozen plannin
           latePromptSeen();
           return new Promise(resolve => { finishLate = resolve; });
         }
-        return { rung: 4, why: 'on time' };
+        return { rung: 4, why: 'on time', capability: 'existing-capability' };
       }
       planningCalls++;
       expect(prompt).toContain('ELA-1');

@@ -1,7 +1,10 @@
-import { describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, describe, expect, test } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import { ptyAvailable } from './pty-shell/registry.js';
 import { nativeToolCatalog, listNativeToolsForHost } from './native-tool-catalog.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 test('virtual-window control and context tools are absent while essential tools remain', () => {
   const names = new Set(nativeToolCatalog.flatMap(tool => [tool.id, tool.displayName, ...tool.aliases]));

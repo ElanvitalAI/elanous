@@ -103,6 +103,12 @@ export interface CodexApprovalAdapter {
   onMcpToolCall(req: CodexMcpToolCallRequest): Promise<CodexApprovalDecision>;
 }
 
+/** The 3-way approval question's id and labels — exported so a surface that
+ *  answers approvals by yes/no (an ACP turn's client) can recognise it. */
+export const CODEX_APPROVAL_QUESTION_ID = 'codex_approval';
+export const CODEX_APPROVAL_OPT_ONCE = 'Allow once';
+export const CODEX_APPROVAL_OPT_REJECT = 'Reject';
+
 /** Build a CodexApprovalAdapter. Intentionally minimal in Phase 3.A —
  *  the handlers degrade gracefully when no approver is attached, and
  *  the Phase 3.B app-server client will hook these methods up with real
@@ -131,10 +137,10 @@ export function createCodexApprovalAdapter(
   // multi-option question path is used. "Allow for session" maps to codex
   // `acceptForSession` so the sub-agent stops re-prompting for the rest of
   // the run.
-  const OPT_ONCE = 'Allow once';
+  const OPT_ONCE = CODEX_APPROVAL_OPT_ONCE;
   const OPT_SESSION = 'Allow for session';
-  const OPT_REJECT = 'Reject';
-  const APPROVAL_QID = 'codex_approval';
+  const OPT_REJECT = CODEX_APPROVAL_OPT_REJECT;
+  const APPROVAL_QID = CODEX_APPROVAL_QUESTION_ID;
 
   /** Ask the user via the MULTI-OPTION question channel: Allow once /
    *  Allow for session / Reject. Returns the scoped decision. Only called

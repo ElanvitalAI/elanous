@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>피치덱 — 회사명</title>
+<style>
+  :root { color-scheme: dark; font-family: Geist, "G sans", "Noto Sans KR", system-ui, sans-serif; background: #0c0c0e; color: #f2f1ee; }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  main { min-height: 100svh; display: grid; place-items: center; padding: 4rem 1rem; }
+  .slide { display: none; width: min(100%, calc((100svh - 8rem) * 16 / 9)); aspect-ratio: 16 / 9; padding: clamp(1.4rem, 5vw, 5rem); background: #0c0c0e; border: 1px solid #f2f1ee; flex-direction: column; justify-content: space-between; overflow: hidden; }
+  .slide.active { display: flex; }
+  .eyebrow, .marker { color: #e95047; font-size: clamp(.8rem, 1.3vw, 1rem); font-weight: 650; letter-spacing: .08em; }
+  h1, h2 { max-width: 20ch; font-size: clamp(2rem, 4.4vw, 4.9rem); line-height: 1.15; letter-spacing: -.045em; margin: .4em 0; text-wrap: balance; }
+  p, li { max-width: 54ch; font-size: clamp(1rem, 1.7vw, 1.6rem); line-height: 1.55; }
+  ul { padding-left: 1.2em; }
+  .accent { color: #e95047; }
+  .screen-slot { border: 1px dashed #e95047; padding: .6rem 1rem; color: #f2f1ee; font-size: clamp(.9rem, 1.4vw, 1.2rem); }
+  .foot { display: flex; justify-content: space-between; align-items: end; gap: 1rem; color: #f2f1ee; font-size: .85rem; }
+  nav { position: fixed; bottom: 1rem; right: 1rem; display: flex; align-items: center; gap: .7rem; background: #0c0c0e; padding: .4rem; }
+  button { background: #0c0c0e; color: #f2f1ee; border: 1px solid #e95047; padding: .6rem .9rem; font: inherit; cursor: pointer; }
+  button:focus-visible { outline: 3px solid #e95047; outline-offset: 3px; }
+  button:disabled { opacity: .42; cursor: not-allowed; }
+  @media print {
+    @page { size: 16in 9in; margin: 0; }
+    body { width: 16in; }
+    :root { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+    main { display: block; padding: 0; min-height: 0; }
+    .slide, .slide.active { display: flex; width: 16in; height: 9in; aspect-ratio: auto; border: 0; break-after: page; page-break-after: always; }
+    .slide:last-child { break-after: auto; page-break-after: auto; }
+    nav { display: none; }
+  }
+</style>
+</head>
+<body>
+<main id="deck" aria-label="피치덱">
+  <section class="slide active" data-claim="T1" aria-label="정의" aria-hidden="false">
+    <span class="eyebrow">브랜드 · 정의</span>
+    <div><h1>한 줄로 무엇을 하는지 말합니다.</h1><p>검증 가능한 회사 한 줄 정의를 여기에 넣습니다.</p></div>
+    <div class="foot"><span>출처: SOURCES · T1</span><span class="marker">회사명</span></div>
+  </section>
+  <section class="slide" data-claim="T2" aria-label="계획" aria-hidden="true">
+    <span class="eyebrow">계획 · 순서와 시기는 바뀔 수 있습니다</span>
+    <div><h2>다음 걸음은 검증하며 정합니다.</h2><p>이 칸은 현재 제공 기능이 아니라 앞으로의 계획입니다.</p></div>
+    <div class="foot"><span>출처: SOURCES · T2</span><span class="marker">계획</span></div>
+  </section>
+</main>
+<nav aria-label="슬라이드 이동"><button id="prev" type="button" aria-label="이전 장">← 이전</button><output id="position" aria-live="polite"></output><button id="next" type="button" aria-label="다음 장">다음 →</button></nav>
+<script>
+(() => {
+  const slides = [...document.querySelectorAll('section.slide')];
+  const prev = document.getElementById('prev');
+  const next = document.getElementById('next');
+  const position = document.getElementById('position');
+  let current = 0;
+  function show(index) {
+    current = Math.max(0, Math.min(slides.length - 1, index));
+    slides.forEach((slide, i) => {
+      slide.classList.toggle('active', i === current);
+      slide.setAttribute('aria-hidden', String(i !== current));
+    });
+    prev.disabled = current === 0;
+    next.disabled = current === slides.length - 1;
+    position.textContent = `${current + 1} / ${slides.length}`;
+  }
+  prev.addEventListener('click', () => show(current - 1));
+  next.addEventListener('click', () => show(current + 1));
+  document.addEventListener('keydown', event => {
+    if (event.target instanceof Element && event.target.closest('button, a, input, textarea, select, [contenteditable="true"]')) return;
+    if (['ArrowRight', 'ArrowDown', ' ', 'PageDown'].includes(event.key)) { event.preventDefault(); show(current + 1); }
+    if (['ArrowLeft', 'ArrowUp', 'PageUp'].includes(event.key)) { event.preventDefault(); show(current - 1); }
+    if (event.key === 'Home') show(0);
+    if (event.key === 'End') show(slides.length - 1);
+  });
+  show(0);
+})();
+</script>
+</body>
+</html>

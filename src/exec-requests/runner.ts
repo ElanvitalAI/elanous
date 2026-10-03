@@ -1,16 +1,20 @@
-import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { debug } from '../debug/log.js';
+import { notifyExecRequestTransition } from '../web-push/notify-exec-request.js';
 import { effectiveInstanceRoot } from '../instance/resolve.js';
 import { lastJsonObject, runGraph, type GraphRunState } from '../graph-runner/runner.js';
 import { installedGraphs, planExecRequest, type ExecPlanItem, type InstalledGraph } from './planner.js';
-import { ExecRequestStore, type ExecRequest, type ExecResult, type ExecSeat } from './store.js';
+import { ExecRequestStore, type ExecAttachment, type ExecRequest, type ExecResult, type ExecSeat } from './store.js';
+import { answerAsSeat } from '../intake-plane/seat-answer.js';
+import { redactSecrets } from '../task-cards/card-store.js';
 
 export interface ExecRunnerDeps {
   store?: ExecRequestStore;
   graphs?: () => Promise<InstalledGraph[]>;
-  plan?: (text: string) => Promise<ExecPlanItem[]>;
+  plan?: (text: string, attachments?: readonly ExecAttachment[]) => Promise<ExecPlanItem[]>;
+  answer?: typeof answerAsSeat;
   run?: typeof runGraph;
   root?: string;
 }
@@ -38,7 +42,11 @@ function safeFile(path: string, root: string, graphId: string, runId: string): s
       ? realpathSync(artifactsDir) : null;
     const inRunDirectory = realArtifactsDir === join(base, `${runId}.json.artifacts`)
       && real.startsWith(`${realArtifactsDir}${sep}`);
-    if ((!local && !inRunDirectory) || !statSync(real).isFile()) return null;
+    // EXEC2 — plugin graphs (doc-draft · geo-check) write into `<graphId>/<runId>/`; that directory is this run's own too.
+    const runDir = join(allowed, runId);
+    const realRunDir = existsSync(runDir) && statSync(runDir).isDirectory() ? realpathSync(runDir) : null;
+    const inOwnRunDir = realRunDir === join(base, runId) && real.startsWith(`${realRunDir}${sep}`);
+    if ((!local && !inRunDirectory && !inOwnRunDir) || !statSync(real).isFile()) return null;
     return real;
   } catch { return null; }
 }
@@ -56,8 +64,32 @@ function fileName(path: string, runId: string): string {
   return `${runId}--${digest}--${basename(path)}`;
 }
 
+/** EXEC2 — `report` is how geo-check names its file; treat it like `file`/`path`. */
+function fileCandidate(output: Record<string, unknown>): string | null {
+  if (typeof output.file === 'string') return output.file;
+  if (typeof output.path === 'string') return output.path;
+  if (typeof output.report === 'string' && /\.(md|txt|pdf)$/i.test(output.report)) return output.report;
+  return null;
+}
+
+const TEXT_RESULT_LIMIT = 200_000;
+const TEXT_RESULT_NAME = 'result.md';
+
+/** EXEC2 — a done seat whose graph only answered in text gets that text as a run artifact (redacted), so the result is viewable. */
+function textResultFile(seat: ExecSeat, state: GraphRunState, root: string): string | null {
+  const outputs = [...(state.nodes ?? [])].reverse().map(node => lastJsonObject(node.output)).filter((o): o is Record<string, unknown> => !!o);
+  const text = outputs.map(o => o.markdown ?? o.text).find((v): v is string => typeof v === 'string' && v.trim().length > 0);
+  if (!text || !SEGMENT.test(seat.graphId) || !SEGMENT.test(seat.runId)) return null;
+  const dir = join(root, 'graph-runs', seat.graphId, `${seat.runId}.json.artifacts`);
+  const path = join(dir, TEXT_RESULT_NAME);
+  try {
+    if (!existsSync(path)) { mkdirSync(dir, { recursive: true }); writeFileSync(path, redactSecrets(text.slice(0, TEXT_RESULT_LIMIT)), { mode: 0o600 }); }
+    return path;
+  } catch { return null; }
+}
+
 function resultOf(output: Record<string, unknown>, seat: ExecSeat, id: string, root: string): ExecResult | null {
-  const candidate = typeof output.file === 'string' ? output.file : typeof output.path === 'string' ? output.path : null;
+  const candidate = fileCandidate(output);
   let url: string;
   let kind: ExecResult['kind'];
   let name: string;
@@ -95,6 +127,7 @@ function syncRun(item: ExecRequest, seat: ExecSeat, state: GraphRunState, root: 
   if (state.status === 'awaiting-approval' && state.pending && !state.pending.decision && !existsSync(claim)) {
     if (!item.approvals.some(a => a.graphId === seat.graphId && a.runId === seat.runId)) {
       item.approvals.push({ graphId: seat.graphId, runId: seat.runId, message: state.pending.message });
+      notifyTransition(item, item.status, item.approvals.length);
     }
   } else item.approvals = item.approvals.filter(a => a.graphId !== seat.graphId || a.runId !== seat.runId);
   for (const node of state.nodes ?? []) {
@@ -107,9 +140,28 @@ function syncRun(item: ExecRequest, seat: ExecSeat, state: GraphRunState, root: 
       if (result && !item.results.some(existing => existing.seat === result.seat && existing.url === result.url)) item.results.push(result);
     }
   }
+  if (seat.status === 'done' && !item.results.some(existing => existing.seat === seat.seat)) {
+    const file = textResultFile(seat, state, root);
+    const result = file ? resultOf({ file, title: seat.title }, seat, item.id, root) : null;
+    if (result) item.results.push(result);
+    else {
+      const keys = [...new Set((state.nodes ?? []).flatMap(node => Object.keys(lastJsonObject(node.output) ?? {})))];
+      debug.log('exec.result', 'none', { seat: seat.seat, graphId: seat.graphId, keys });
+    }
+  }
   const summary = [...(state.nodes ?? [])].reverse().map(node => lastJsonObject(node.output)?.summary).find(value => typeof value === 'string');
   if (typeof summary === 'string') item.summary = summary;
-  if (seat.status === 'failed') seat.reason = state.nodes?.at(-1)?.error ?? `그래프 런 ${state.status}`;
+  if (seat.status === 'failed') seat.reason = failureReason(state);
+}
+
+/** EXEC2 — the failing node's own error (e.g. doc-draft `check` {outcome:'fail', error}) beats the terminal gate's empty one. */
+function failureReason(state: GraphRunState): string {
+  for (const node of [...(state.nodes ?? [])].reverse()) {
+    if (typeof node.error === 'string' && node.error) return node.error;
+    const output = lastJsonObject(node.output);
+    if (output && typeof output.error === 'string' && output.error) return redactSecrets(output.error);
+  }
+  return `그래프 런 ${state.status}`;
 }
 
 const PRIOR_TEXT_LIMIT = 4_000;
@@ -129,8 +181,14 @@ export function withPriorResults(inputs: Record<string, unknown> | undefined, pr
   return { ...base, context: `${previous}앞 자리 결과:\n${parts.join('\n\n')}` };
 }
 
+function notifyTransition(item: ExecRequest, from: ExecRequest['status'], pendingApprovals: number): void {
+  void notifyExecRequestTransition({ id: item.id, text: item.text, from, to: item.status,
+    summary: item.summary, pendingApprovals }).catch(() => { /* Push never interrupts execution. */ });
+}
+
 function aggregate(item: ExecRequest): void {
   if (item.status === 'planning' || item.seats.length === 0) return;
+  const previous = item.status;
   if (item.seats.some(seat => seat.status === 'waiting' || seat.status === 'running')) item.status = 'running';
   else item.status = item.seats.some(seat => seat.status === 'failed') ? 'failed' : 'done';
   // 실패면 요약은 «실패 사유»가 이긴다 — 먼저 끝난 자리의 산출 설명이 남아 있어도 덮는다(혼합 결과에서 성공처럼 보이지 않게).
@@ -138,6 +196,7 @@ function aggregate(item: ExecRequest): void {
     const reasons = item.seats.filter(seat => seat.status === 'failed').map(seat => seat.reason ?? `${seat.seat}: 그래프 실행 실패`);
     if (reasons.length > 0) item.summary = reasons.join('; ');
   }
+  if (previous !== item.status && (item.status === 'done' || item.status === 'failed')) notifyTransition(item, previous, item.approvals.length);
 }
 
 export class ExecRequestRunner {
@@ -156,10 +215,12 @@ export class ExecRequestRunner {
       if (item.status === 'planning') {
         item.status = 'failed';
         item.summary = '데몬 재시작으로 COO 계획이 중단됐습니다';
+        notifyTransition(item, 'planning', item.approvals.length);
       } else {
         if (item.seats.length === 0) {
           item.status = 'failed';
           item.summary = '데몬 재시작으로 자리 배정이 중단됐습니다';
+          notifyTransition(item, 'running', item.approvals.length);
         }
         for (const seat of item.seats) {
           if (seat.status === 'done' || seat.status === 'failed') continue;
@@ -192,14 +253,16 @@ export class ExecRequestRunner {
     }
   }
 
-  submit(text: string): ExecRequest {
-    const item = this.store.create(text);
+  submit(text: string, attachments?: ExecAttachment[]): ExecRequest {
+    const item = this.store.create(text, attachments);
     void this.execute(item.id).catch(error => {
       const current = this.store.get(item.id);
       if (!current) return;
+      const previous = current.status;
       current.status = 'failed';
       current.summary = error instanceof Error ? error.message : String(error);
       this.store.save(current);
+      if (previous !== current.status) notifyTransition(current, previous, current.approvals.length);
       debug.log('exec-requests', 'failed', { id: item.id, reason: current.summary });
     });
     return item;
@@ -209,8 +272,40 @@ export class ExecRequestRunner {
     const item = this.store.get(id);
     if (!item) return;
     const graphs = await (this.deps.graphs ?? installedGraphs)();
-    const plans = await (this.deps.plan ?? ((text: string) => planExecRequest(text, { graphs: async () => graphs })))(item.text);
+    const plans = await (this.deps.plan ?? ((text: string, attachments?: readonly ExecAttachment[]) => planExecRequest(text, { graphs: async () => graphs, attachments })))(item.text, item.attachments);
     const byId = new Map(graphs.map(graph => [graph.id, graph]));
+    // Every clause must be a question — «상황 알려줘? 카드 만들어줘» carries a work item (review r1).
+    const clauses = [...item.text.trim().matchAll(/([^?？.!。\n]+)([?？]?)/g)].map(m => ({ body: m[1]!.trim(), asked: m[2] !== '' })).filter(c => c.body);
+    const isQuestion = clauses.length > 0 && clauses.every(c => c.asked
+      || /(?:알려\s*줘|알려\s*주세요|보여\s*줘|보여\s*주세요|어떻게|무엇|뭐|어떤|언제|누구|질문|인가요|나요|습니까)$/.test(c.body));
+    if (isQuestion && plans.length > 0 && plans.every(plan => !plan.graphId
+      && !/\s—\s.+\s필요\s*$/.test(plan.title) && !/\s—\s.+\s필요\s*$/.test(plan.reason ?? '')
+      && !/(?:초안|작성|제작|생성|게시|분석|전략|메일|보고서)/.test(plan.title)) && !(item.attachments?.length)) {
+      for (const plan of plans) {
+        const answered = await (this.deps.answer ?? answerAsSeat)(plan.seat, item.text);
+        if (!answered) {
+          item.seats.push({ seat: plan.seat, title: plan.title, status: 'failed', graphId: '', runId: '',
+            reason: plan.reason ?? `${plan.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` });
+          continue;
+        }
+        const seat: ExecSeat = { seat: plan.seat, title: plan.title, status: 'done', graphId: 'seat-answer', runId: randomUUID() };
+        const dir = join(this.root, 'graph-runs', seat.graphId);
+        const statePath = join(dir, `${seat.runId}.json`);
+        const artifactDir = join(dir, `${seat.runId}.json.artifacts`);
+        mkdirSync(artifactDir, { recursive: true });
+        const file = join(artifactDir, TEXT_RESULT_NAME);
+        writeFileSync(file, redactSecrets(answered.text.slice(0, TEXT_RESULT_LIMIT)), { mode: 0o600 });
+        const state: GraphRunState = { graphId: seat.graphId, runId: seat.runId, status: 'done', path: [], executed: 0, dryRun: false, statePath, nodes: [] };
+        writeFileSync(statePath, JSON.stringify(state), { mode: 0o600 });
+        item.seats.push(seat);
+        const result = resultOf({ file, title: answered.title }, seat, id, this.root);
+        if (result) item.results.push(result);
+      }
+      item.status = 'running';
+      aggregate(item);
+      this.store.save(item);
+      return;
+    }
     item.seats = plans.map(plan => ({ seat: plan.seat, title: plan.title, status: plan.reason || !byId.has(plan.graphId) ? 'failed' : 'waiting', graphId: plan.graphId,
       runId: plan.reason || !byId.has(plan.graphId) ? '' : randomUUID(), inputs: plan.inputs, ...(plan.after?.length ? { after: plan.after } : {}),
       ...(plan.reason || !byId.has(plan.graphId) ? { reason: plan.reason ?? `${plan.seat}: 요청에 맞는 설치된 실행 그래프가 없습니다` } : {}) }));
@@ -366,12 +461,14 @@ export class ExecRequestRunner {
         for (const entry of Array.isArray(output.artifacts) ? output.artifacts : [output]) {
           if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
           const artifact = entry as Record<string, unknown>;
-          const candidate = typeof artifact.file === 'string' ? artifact.file : artifact.path;
+          const candidate = fileCandidate(artifact);
           if (typeof candidate !== 'string') continue;
           const path = safeFile(candidate, this.root, seat.graphId, seat.runId);
           if (path && fileName(path, seat.runId) === name) return path;
         }
       }
+      const text = safeFile(join(this.root, 'graph-runs', seat.graphId, `${seat.runId}.json.artifacts`, TEXT_RESULT_NAME), this.root, seat.graphId, seat.runId);
+      if (text && fileName(text, seat.runId) === name) return text;
     } catch { return null; }
     return null;
   }

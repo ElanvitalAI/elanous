@@ -71,7 +71,8 @@ export function applyTestStateDirFlagFromArgv(): string | undefined {
  *  뒤에만 있어 사람이 부를 입구가 없었고, 그래서 문서 174곳에 수동 주문이 화석으로 남았다.
  *
  *  하는 일: nexus state root ⊕ ELANOUS_STATE_DIR ⊕ config-dir 을 **한 뿌리로** 세우고,
- *  config 사본이 없으면 물질화하며, config 경로가 test 루트 밖이면 **기동을 거부**한다. */
+ *  운영 config 가 있으면 test-safe 사본을 물질화하고, 없으면 격리 기본값을 사용하며,
+ *  config 경로가 test 루트 밖이면 **기동을 거부**한다. */
 export function applyIsolatedRoot(dir: string): void {
   const { setTestStateRoot } = require('../nexus/paths.js') as typeof import('../nexus/paths.js');
   setTestStateRoot(dir);
@@ -98,7 +99,7 @@ export function applyIsolatedRoot(dir: string): void {
       }
       cfgDir.setElanousConfigDir(dir);
     }
-    // config 사본 보장 — 없으면 운영에서 물질화(최초 무마찰), 있으면 drift 경고만
+    // config 사본이 없고 운영 원본이 있으면 물질화하고, 있으면 drift 경고만
     // (자동 덮어쓰기 금지 — 명시적 sync 원칙). 유닛 테스트(NODE_ENV=test)는
     // 실 운영 config/secrets 를 temp 로 복사하지 않도록 sync 스킵.
     if (process.env.NODE_ENV !== 'test') {
@@ -106,8 +107,14 @@ export function applyIsolatedRoot(dir: string): void {
       const { existsSync } = require('node:fs') as typeof import('node:fs');
       const { join } = require('node:path') as typeof import('node:path');
       if (!existsSync(join(dir, 'config.json'))) {
-        const r = sync.syncTestConfig(dir);
-        console.error(`[test-isolation] 운영 config 물질화 → ${r.testConfigPath} (telegram=${r.telegramMode})`);
+        // A fresh build/test environment may have no operating config to copy.
+        // Keep the isolated config root and use the ordinary safe defaults there.
+        if (existsSync(join(sync.prodConfigDir(), 'config.json'))) {
+          const r = sync.syncTestConfig(dir);
+          console.error(`[test-isolation] 운영 config 물질화 → ${r.testConfigPath} (telegram=${r.telegramMode})`);
+        } else {
+          console.error(`[test-isolation] 운영 config 없음 — ${dir} 의 기본 설정 사용`);
+        }
       } else if (sync.isTestConfigStale(dir)) {
         console.error(`[test-isolation] ⚠️ 운영 config 가 테스트 사본보다 최신 — 'elanous config sync-test' 로 갱신 권장`);
       }

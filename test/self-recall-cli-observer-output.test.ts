@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { renderTaskNotificationsXml } from '../src/agent/task-notification.js';
 import { SELF_DOMAIN, injectUtterance, recallSelfEvents } from '../src/domains/self-awareness.js';
 import { openSurfaceEventsDb, recordEvent } from '../src/domains/surface-events.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const repoRoot = join(import.meta.dir, '..');
 const roots: string[] = [];

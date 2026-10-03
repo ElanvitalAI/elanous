@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { setDefaultTimeout, afterEach, describe, expect, test } from 'bun:test';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -21,6 +21,9 @@ import { runDevPipeline, type DevPipelineSpec } from '../self-dev/dev-pipeline.j
 import { buildDevCliSpec } from '../self-dev/dev-cli.js';
 import type { SelfImplementSeams } from './orchestrator.js';
 import { runRepositoryPublic, runRepositoryPublish } from '../cli/repo-cli.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const directories: string[] = [];
 const createHomeDirectory = (prefix: string) => {

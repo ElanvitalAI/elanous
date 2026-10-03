@@ -91,7 +91,11 @@ The reference is used only for its structure (header, chapter cards, a diagram t
 
 ```bash
 zsh $SKILL/engine/reel.sh <folder> --title "마케터의 밤" --sub "2026.10.02 · 서울"
+zsh $SKILL/engine/reel.sh --warm-cards --title "마케터의 밤" --sub "2026.10.02 · 서울"  # 행사 전 카드 미리 굽기
+zsh $SKILL/engine/reel.sh <folder> --title "마케터의 밤" --sub "2026.10.02 · 서울" --instant  # 사진 구간만 렌더
 ```
+
+즉석판 카드 캐시: `~/.cache/elanous-explainer/cards/<sha256(JSON 배열 [title, sub, 1080, 1920, 카드판번호]) 앞 16자>/{intro,end}.mp4` (`EXPLAINER_CACHE`로 루트 변경 가능).
 
 - **Input**: a folder of phone photos (jpg · png · heic) and short clips (mp4 · mov). The default upload folder is `~/.elanous/field/<event>/`.
 - **Order**: by capture time (`mdls` creation date), then by file name.

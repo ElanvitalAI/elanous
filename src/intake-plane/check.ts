@@ -63,6 +63,8 @@ export interface IntakeCheckEvidence {
 
 export interface IntakeCheckItem {
   readonly fact: string;
+  /** Source identity preserved from the supplied fact for card-backed goal evidence. */
+  readonly sourceRef?: string;
   readonly originalClaims?: readonly string[];
   readonly quotes: readonly string[];
   readonly verdict: IntakeCheckVerdict;
@@ -1415,6 +1417,7 @@ export function runIntakeCheck(
     const item: IntakeCheckItem = {
       ...judged,
       quotes: [quote],
+      ...(fact.sourceRef ? { sourceRef: fact.sourceRef } : {}),
       ...(fact.originalClaim ? { originalClaims: [fact.originalClaim] } : {}),
     };
     merged.set(key, item);

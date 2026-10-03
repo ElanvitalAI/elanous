@@ -38,6 +38,7 @@ import { describeModes, formatModeLine, type DoctorMode } from './doctor-modes.j
 import { formatDoctorLocalLlm, probeDoctorLocalLlm, type DoctorLocalLlm } from './doctor-local-llm.js';
 import type { LlmInventory } from '../llm/local-manager/types.js';
 import { buildDoctorBundle } from './doctor-bundle.js';
+import { uploadDoctorBundle } from './doctor-bundle-upload.js';
 
 function defaultCheckPythonEnv(): { status: 'ok' | 'fixable' | 'manual'; evidence: string; remedy?: string } {
   const c = checkPythonEnv(false);
@@ -193,6 +194,9 @@ export interface DoctorCliDeps extends DoctorOptions, Pick<DoctorFixDeps, 'home'
   adviceInteractive?: boolean;
   /** Local-manager inventory seam; default calls getInventory(). */
   localLlmInventory?: () => Promise<LlmInventory>;
+  /** Inject the upload transport and consent for isolated CLI tests. */
+  uploadFetch?: typeof globalThis.fetch;
+  confirmBundleUpload?: (message: string) => Promise<boolean>;
 }
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -1217,15 +1221,21 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
     .option('--json', 'structured output')
     .option('--credentials', 'show per-credential details in human-readable output')
     .option('--bundle', 'write a redacted diagnostics archive for support')
+    .option('--upload', 'send the bundle to diagnostics.uploadUrl after consent (requires --bundle)')
     .option('--out <dir>', 'output directory for --bundle')
     .option('--fix', 'show repairs; git installation asks on a TTY (other repairs require --yes)')
     .option('--advise', 'ask the configured LLM to rank catalog repairs (read-only advice)')
-    .option('--yes', 'apply planned doctor repairs (requires --fix)')
+    .option('--yes', 'apply planned doctor repairs (--fix), or confirm bundle upload (--bundle --upload)')
     .option('--sudo', 'also run the planned sudo install lines — only where `sudo -n true` works (requires --fix --yes)')
     .option('--restart', 'restart the nexus service when it runs a different version than this installed copy, then verify it (requires --fix --yes · interrupts bots, terminals and running turns)')
-    .action(async (opts: { json?: boolean; credentials?: boolean; bundle?: boolean; out?: string; fix?: boolean; advise?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
+    .action(async (opts: { json?: boolean; credentials?: boolean; bundle?: boolean; upload?: boolean; out?: string; fix?: boolean; advise?: boolean; yes?: boolean; sudo?: boolean; restart?: boolean }) => {
+      if (opts.upload && !opts.bundle) {
+        err.error('--upload requires --bundle');
+        setExitCode(1);
+        return;
+      }
       if (opts.bundle) {
-        if (opts.fix || opts.advise || opts.yes || opts.sudo || opts.restart) {
+        if (opts.fix || opts.advise || opts.sudo || opts.restart || (opts.yes && !opts.upload)) {
           err.error('--bundle cannot be combined with repair or advice options');
           setExitCode(1);
           return;
@@ -1235,7 +1245,31 @@ export function registerDoctorCommand(program: Command, deps: DoctorCliDeps = {}
           const doctorReport = runDoctor(deps);
           if (doctorReport.ok) doctorReport.localLlm = await probeDoctorLocalLlm(deps.localLlmInventory);
           const result = buildDoctorBundle({ outDir: opts.out ?? process.cwd(), doctorOptions: deps, doctorReport });
-          out.log(opts.json ? JSON.stringify(result) : [`Diagnostics: ${result.path} (${result.bytes} bytes)`, 'Contents:', ...result.files.map((file) => `  ${file}`)].join('\n'));
+          if (opts.upload) {
+            let uploadUrl: string | undefined;
+            try { uploadUrl = (deps.userConfig ?? (deps.getUserConfig ?? getUserConfig)()).diagnostics?.uploadUrl; }
+            catch {
+              const reason = '설정을 읽을 수 없습니다';
+              debug.log('doctor.bundle', 'upload-failed', { bytes: result.bytes, reason: 'config-read-failed' });
+              if (opts.json) out.log(JSON.stringify({ path: result.path, uploaded: false, reason }));
+              else err.error(`업로드 실패 (${reason}) — 파일: ${result.path} — 다시 시도해 주세요.`);
+              setExitCode(1);
+              return;
+            }
+            const uploaded = await uploadDoctorBundle({
+              ...result,
+              uploadUrl,
+              yes: opts.yes,
+              announce: (contents) => { if (opts.json) err.error(contents); else out.log(contents); },
+              confirm: deps.confirmBundleUpload ?? ((message) => confirmDoctorAdvice(message, opts.json === true)),
+              fetch: deps.uploadFetch ?? globalThis.fetch,
+            });
+            if (opts.json) out.log(JSON.stringify({ path: uploaded.path, uploaded: uploaded.uploaded, ...(uploaded.code ? { code: uploaded.code } : {}), ...(uploaded.reason ? { reason: uploaded.reason } : {}) }));
+            else out.log(uploaded.message);
+            if (uploaded.exitCode) setExitCode(uploaded.exitCode);
+          } else {
+            out.log(opts.json ? JSON.stringify(result) : [`Diagnostics: ${result.path} (${result.bytes} bytes)`, 'Contents:', ...result.files.map((file) => `  ${file}`)].join('\n'));
+          }
         } catch {
           err.error('Could not create diagnostics archive.');
           setExitCode(1);

@@ -137,6 +137,26 @@ describe('user-config defaults', () => {
     expect(saved.acp).not.toHaveProperty('binaryPaths');
   });
 
+  test('ACP approval timeout resolves config before env before default, without saving an implicit timeout', () => {
+    setEnv({ ELANOUS_ACP_TOOL_APPROVAL_TIMEOUT_MS: '2500' });
+    write({ acp: { binaryPaths: { codex: '/opt/bin/codex-acp' }, toolApproval: { timeoutMs: 1500 } } });
+    const configured = buildUserConfig(cfgPath);
+    expect(configured.acp.toolApproval.timeoutMs).toBe(1500);
+    saveUserConfig(configured, cfgPath);
+    expect(JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf-8')).acp).toEqual({
+      hopCap: {}, binaryPaths: { codex: '/opt/bin/codex-acp' }, toolApproval: { timeoutMs: 1500 },
+    });
+    write({ acp: { binaryPaths: { codex: '/opt/bin/codex-acp' } } });
+    const fromEnv = buildUserConfig(cfgPath);
+    expect(fromEnv.acp.toolApproval.timeoutMs).toBe(2500);
+    saveUserConfig(fromEnv, cfgPath);
+    expect(JSON.parse(require('node:fs').readFileSync(cfgPath, 'utf-8')).acp).toEqual({
+      hopCap: {}, binaryPaths: { codex: '/opt/bin/codex-acp' },
+    });
+    setEnv({ ELANOUS_ACP_TOOL_APPROVAL_TIMEOUT_MS: undefined });
+    expect(buildUserConfig(cfgPath).acp.toolApproval.timeoutMs).toBe(60_000);
+  });
+
   test('intake ambientCapture is user-config only and preserves known modes', () => {
     write({ intake: { telegram: { ambientCapture: 'suggest' }, discord: { ambientCapture: 'capture' } } });
     const c = buildUserConfig(cfgPath);

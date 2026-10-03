@@ -62,20 +62,30 @@ function landingAt(sha: string, title: string): ReleaseLanding {
   };
 }
 
-/** next.md lines at the cutoff, each tied to the last landing in range whose diff added that exact line. */
-function nextMdNotes(cutoff: string, landings: ReleaseLanding[]): NextMdNote[] {
+/**
+ * next.md lines added between the baseline and the cutoff, each tied to the last landing in range whose diff added that
+ * exact line. Lines already in the file at the baseline shipped with an earlier release and are left out (REL7b).
+ */
+function nextMdNotes(baseline: string, cutoff: string, landings: ReleaseLanding[]): { notes: NextMdNote[]; carried: number } {
   const text = git(['show', `${cutoff}:${NEXT_MD}`], true);
-  if (!text) return [];
+  if (!text) return { notes: [], carried: 0 };
+  const inRange = new Set(addedLines(requiredGit(['diff', '-U0', baseline, cutoff, '--', NEXT_MD])));
   const addedBy = new Map<string, string>();
   for (const landing of landings) {
     if (!landing.changedFiles.includes(NEXT_MD)) continue;
     const diff = requiredGit(['show', '-m', '--first-parent', '--format=', '-U0', landing.sha, '--', NEXT_MD]);
-    for (const line of diff.split('\n')) if (line.startsWith('+') && !line.startsWith('+++')) addedBy.set(line.slice(1).trim(), landing.sha);
+    for (const line of addedLines(diff)) addedBy.set(line, landing.sha);
   }
-  return parseNextMdNotes(text).map((note) => {
-    const sha = note.raw ? addedBy.get(note.raw) : undefined;
+  const all = parseNextMdNotes(text);
+  const notes = all.filter((note) => note.raw !== undefined && inRange.has(note.raw)).map((note) => {
+    const sha = addedBy.get(note.raw!);
     return { kind: note.kind, line: note.line, ...(sha ? { sha } : {}) };
   });
+  return { notes, carried: all.length - notes.length };
+}
+
+function addedLines(diff: string): string[] {
+  return diff.split('\n').filter((line) => line.startsWith('+') && !line.startsWith('+++')).map((line) => line.slice(1).trim());
 }
 
 function runningGoalPaths(): string[] {
@@ -135,12 +145,13 @@ export function main(args: string[] = process.argv.slice(2)): void {
   const instanceRoot = effectiveInstanceRoot();
   const notes = readReleaseNotes(releaseNotesDir(instanceRoot));
   debug.log('release.notes', 'read', { fragments: notes.size, problems: notes.problems });
+  const nextMd = nextMdNotes(baselineSha, cutoff, landings);
   const manifest = buildReleaseManifest({
-    version, baseline: { ref: baseline.ref, sha: baselineSha }, cutoff: { sha: cutoff }, landings, notes, nextMd: nextMdNotes(cutoff, landings),
+    version, baseline: { ref: baseline.ref, sha: baselineSha }, cutoff: { sha: cutoff }, landings, notes, nextMd: nextMd.notes,
     runningGoalPaths: runningGoalPaths(), publicCommandsBefore: commandsAt(baselineSha), publicCommandsAfter: commandsAt(cutoff),
   });
   const output = { ...manifest, baselineSource: baseline.source };
-  debug.log('release-loop.notes', 'fragments', { version, ...manifest.fragments });
+  debug.log('release-loop.notes', 'fragments', { version, ...manifest.fragments, carriedFromEarlier: nextMd.carried });
   const directory = join(instanceRoot, 'release', version);
   mkdirSync(directory, { recursive: true });
   writeFileSync(join(directory, 'manifest.json'), JSON.stringify(output, null, 2) + '\n');

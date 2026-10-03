@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from 'bun:test';
-import { mkdtempSync, realpathSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, realpathSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -10,6 +10,7 @@ import { routeRequest } from './http-server.js';
 import { createDevProxyRuntimeRef } from './admin-dev-proxy.js';
 import { ExecRequestStore } from '../../exec-requests/store.js';
 import { ExecRequestRunner } from '../../exec-requests/runner.js';
+import { handleExecRequests } from './exec-requests.js';
 import type { GraphRunState } from '../../graph-runner/runner.js';
 
 const roots: string[] = [];
@@ -18,6 +19,49 @@ const wait = async (condition: () => boolean) => {
   for (let i = 0; i < 100; i++) { if (condition()) return; await Bun.sleep(5); }
   throw new Error('background graph run did not finish');
 };
+
+test('POST attachments persist from upload and field folders, rejecting missing and escaped paths before creating a request', async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'exec-attachments-')));
+  roots.push(root);
+  const upload = join(root, 'uploads');
+  const field = join(root, 'field', 'event');
+  const outside = join(root, 'other');
+  for (const dir of [upload, field, outside]) mkdirSync(dir, { recursive: true });
+  const photo = join(upload, 'photo.png');
+  const note = join(field, 'note.txt');
+  const secret = join(outside, 'secret.txt');
+  writeFileSync(photo, 'photo'); writeFileSync(note, 'field'); writeFileSync(secret, 'secret');
+  writeFileSync(join(root, 'uploads-fake.txt'), 'sibling');
+  symlinkSync(secret, join(upload, 'escape.txt'));
+  const store = new ExecRequestStore(root);
+  const runner = new ExecRequestRunner({ store, root, graphs: async () => [], plan: async () => [] });
+  const post = (attachments?: unknown) => handleExecRequests(new Request('http://localhost/v1/exec-requests', {
+    method: 'POST', body: JSON.stringify({ text: '확인', ...(attachments === undefined ? {} : { attachments }) }),
+  }), runner, upload, join(root, 'field'));
+
+  for (const invalid of [secret, join(upload, 'escape.txt'), join(upload, '..', 'other', 'secret.txt'),
+    join(upload, 'missing.txt'), field, join(root, 'uploads-fake.txt'), 'photo.png']) {
+    const before = store.list().length;
+    const response = await post([{ name: 'okay', path: photo }, { name: 'bad', path: invalid }]);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: 'attachment-outside' });
+    expect(store.list()).toHaveLength(before);
+  }
+  expect((await post([{ name: 'bad' }])).status).toBe(400);
+  expect((await post({ name: 'bad', path: photo })).status).toBe(400);
+  expect(store.list()).toHaveLength(0);
+
+  const accepted = await post([{ name: '촬영', path: photo }, { name: '메모', path: note }]);
+  expect(accepted.status).toBe(202);
+  const { id } = await accepted.json() as { id: string };
+  const expected = [{ name: '촬영', path: realpathSync(photo) }, { name: '메모', path: realpathSync(note) }];
+  expect(new ExecRequestStore(root).get(id)?.attachments).toEqual(expected);
+  const detail = await handleExecRequests(new Request(`http://localhost/v1/exec-requests/${id}`), runner, upload, join(root, 'field'));
+  expect((await detail.json() as { attachments: unknown }).attachments).toEqual(expected);
+  const without = await post();
+  const plain = await without.json() as { id: string };
+  expect(new ExecRequestStore(root).get(plain.id)?.attachments).toBeUndefined();
+});
 
 test('HTTP owner contract: 202 planning, recent list, detail results, bearer-only bytes, and anonymous 401', async () => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'exec-api-')));

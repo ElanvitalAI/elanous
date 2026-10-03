@@ -18,6 +18,7 @@ import { effectiveInstanceRoot } from './instance/resolve.js';
 import { getUserConfig } from './user-config.js';
 import { resolveChannelBotToken } from './channel-bot-token.js';
 import { forwardTelegramDispatch } from './telegram-dispatch-forward.js';
+import { mergeCapturedPath, warmCapturedEnv } from './shell-env-bootstrap.js';
 import type { NexusTelegramQaPollerWireHandle } from './nexus/index.js';
 
 export interface TelegramRunResult {
@@ -138,7 +139,13 @@ export async function runTelegramPoller(deps: {
   alert?: (text: string, kind: string) => boolean;
   wait?: () => Promise<void>;
   registerLogSink?: () => Promise<void>;
+  warm?: () => Promise<boolean>;
 } = {}): Promise<void> {
+  void (deps.warm ?? warmCapturedEnv)().then((ok) => {
+    if (ok) mergeCapturedPath();
+  }).catch((error) => {
+    debug.log('shell.envbootstrap.capture', 'warm-failed', { error: String(error) });
+  });
   try {
     if (deps.registerLogSink) await deps.registerLogSink();
     else {

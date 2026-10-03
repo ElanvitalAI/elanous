@@ -6,7 +6,7 @@
  *   2. 미지 필드 보존 (정규화 저장이 필드를 떨어뜨리는 사고 클래스 회피)
  *   3. 부속 복사는 허용 목록만 — 무장류/푸시 자격은 목록에 없어야 한다
  */
-import { describe, expect, it, spyOn } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it, spyOn } from 'bun:test';
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,6 +23,9 @@ import {
   testSyncExcludedSecretIds,
 } from './config-test-sync.js';
 import { resolveChannelBotToken } from '../channel-bot-token.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 const PROD_RAW = {
   telegram: {

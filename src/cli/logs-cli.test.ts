@@ -2,7 +2,7 @@
  * elanous logs CLI — 파서/포맷 계약 (통합 로그 패브릭 LF3 · 2026-07-13).
  * DB/네트워크 미접촉 — 순수 함수만.
  */
-import { describe, expect, it, spyOn } from 'bun:test';
+import { setDefaultTimeout, describe, expect, it, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -22,6 +22,9 @@ import { setElanousConfigDir, getElanousConfigDirOverride, resetElanousConfigDir
 import { setResolveDaemonEndpointForTest } from '../nexus/daemon-endpoint.js';
 import { program } from '../index.js';
 import { HARNESS_SPACE_KINDS } from '../harness/harness-space.js';
+
+// Real Bun/CLI subprocesses can exceed Bun's 5 s test default under gate-pod load (spawn limit plus headroom).
+setDefaultTimeout(60_000);
 
 describe('logs --top-failures', () => {
   it('uses the selected store and time window; default mode still renders individual lines', async () => {

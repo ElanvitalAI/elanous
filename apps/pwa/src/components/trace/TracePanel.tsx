@@ -21,6 +21,7 @@ import { TraceGraph } from './TraceGraph';
 import { RunTimeline, StageGantt } from './TraceTimeline';
 import { ResearchFan } from './ResearchFan';
 import { ResearchStage } from './ResearchStage';
+import { tracePublicCapture } from './capture-mode';
 import { LiveMaxStage } from '@/components/live/LiveMaxStage';
 import { buildLiveBoard } from '@/lib/live-signals';
 import { researchSessions } from '@/lib/research-fan';
@@ -58,7 +59,13 @@ function TracePanelInner() {
   // 주소 `?present=stage|research` 로도. v5 교체 조건 ①(«발표» 1920 이 v5 옆에서 밀도 같거나 높음)을 재는 판이다.
   const [present, setPresent] = useState<'stage' | 'research' | null>(null);
   const [pair, setPair] = useState(false);
-  useEffect(() => { const p = new URLSearchParams(window.location.search).get('present'); if (p === 'stage' || p === 'research') setPresent(p); }, []);
+  const [captureMode, setCaptureMode] = useState<string | null>(null);
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setCaptureMode(params.get('capture'));
+    const p = params.get('present');
+    if (p === 'stage' || p === 'research') setPresent(p);
+  }, []);
   const searchRef = useRef<HTMLInputElement | null>(null);
   // URL ↔ 렌즈 — 마운트 뒤에 읽고(정적 export · #418), 바뀔 때마다 주소에 쓴다(링크 공유).
   const hydrated = useRef(false);
@@ -74,10 +81,10 @@ function TracePanelInner() {
   }, [lens]);
 
   const { logs, runs } = useLiveSignals({ store, windowMinutes: lens.windowMin });
-  // «공개 캡처»(`?capture=public` · 🅢 09-28) — Live 와 같은 가림을 Trace 에도. 녹화(T2·T3) 전에 켠다.
-  //   창 줄은 그리기 «전»에 가리고, 서버에서 오는 판단 사슬·L4 원문은 같은 계정 별칭으로 가린다(PublicMask 컨텍스트).
-  const [publicCapture, setPublicCapture] = useState(false);
-  useEffect(() => { if (new URLSearchParams(window.location.search).get('capture') === 'public') setPublicCapture(true); }, []);
+  // 공개 캡처는 주소에서 명시하거나 발표 무대를 열 때 기본으로 켠다. 일반 Trace 는 명시한 경우에만 가린다.
+  // 창 줄은 그리기 «전»에 가리고, 서버 판단 사슬·L4 원문도 같은 계정 별칭으로 가린다(PublicMask 컨텍스트).
+  const publicCapture = tracePublicCapture(captureMode, null);
+  const stagePublicCapture = tracePublicCapture(captureMode, present);
   const rawRows = logs.data?.logs ?? NO_ROWS;
   const publicNames = useMemo(() => (publicCapture ? accountNames(rawRows) : null), [publicCapture, rawRows]);
   const rows = useMemo(() => (publicCapture ? maskRowsForPublic(rawRows) : rawRows), [publicCapture, rawRows]);
@@ -139,12 +146,12 @@ function TracePanelInner() {
       {present === 'research' && <ResearchStage sessions={allResearch} pair={pair} onPair={setPair} onClose={() => setPresent(null)} />}
       {present === 'stage' && (
         <div className="fixed inset-0 z-50 overflow-auto bg-[#020617] p-2" data-trace-present-stage>
-          <div className="mb-1 flex items-center gap-2 px-1 font-mono text-[11px] text-slate-400">
+          <div className={`mb-1 flex items-center gap-2 px-1 font-mono ${stagePublicCapture ? 'text-sm' : 'text-[11px]'} text-slate-400`}>
             <span>TRACE · 발표</span>
-            <span className="truncate text-indigo-200">{crumbs(lens).map((c) => c.label).join(' › ') || '전체'}</span>
+            <span className="truncate text-indigo-200">{stagePublicCapture ? '공개 무대' : crumbs(lens).map((c) => c.label).join(' › ') || '전체'}</span>
             <button type="button" onClick={() => setPresent(null)} className="ml-auto rounded-full border border-slate-600 px-3 py-0.5 text-slate-300 hover:bg-slate-800">닫기(Esc)</button>
           </div>
-          <PresentStage model={model} lens={lens} ledger={runs.data?.entries ?? []} now={now} store={store} publicCapture={publicCapture} />
+          <PresentStage model={model} lens={lens} ledger={runs.data?.entries ?? []} now={now} store={store} publicCapture={stagePublicCapture} rowsAlreadyMasked={publicCapture} />
         </div>
       )}
       <header className="flex flex-wrap items-center gap-2">
@@ -408,11 +415,12 @@ function DecisionDetail({ runId, universe, store, index, model, onIndex }: { run
 }
 
 /** v5 무대 문법(LiveMaxStage 공유) — 렌즈에 남은 런의 줄만 먹인다. 두 탭이 같은 무대 부품을 쓰니 교체가 싸다(🅢 11:0x). */
-function PresentStage({ model, lens, ledger, now, store, publicCapture = false }: { model: ReturnType<typeof buildTraceModel>; lens: TraceLens; ledger: Parameters<typeof buildLiveBoard>[1]; now: number; store: string; publicCapture?: boolean }) {
-  const rows = useMemo(() => lensRows(model, lens), [model, lens]);
+function PresentStage({ model, lens, ledger, now, store, publicCapture, rowsAlreadyMasked }: { model: ReturnType<typeof buildTraceModel>; lens: TraceLens; ledger: Parameters<typeof buildLiveBoard>[1]; now: number; store: string; publicCapture: boolean; rowsAlreadyMasked: boolean }) {
+  const lensSourceRows = useMemo(() => lensRows(model, lens), [model, lens]);
+  const rows = useMemo(() => (publicCapture && !rowsAlreadyMasked ? maskRowsForPublic(lensSourceRows) : lensSourceRows), [publicCapture, rowsAlreadyMasked, lensSourceRows]);
   // 렌즈가 «전체»면 SHIPPED 는 Live 와 같은 자(GitHub 병합 수)로 — v5 교체 조건 ③ «같은 창·우주에서 수 일치».
   // 좁혔으면 그 런들의 병합(로그의 SHIP)만 센다 — GitHub 수는 렌즈를 모른다.
-  const whole = rows === model.rows;
+  const whole = lensSourceRows === model.rows;
   const client = useNexusClient();
   const shipped = useQuery({ queryKey: ['trace', 'shipped', lens.windowMin], queryFn: () => client.getLiveShipped(`${lens.windowMin}m`), refetchInterval: 60_000, enabled: whole });
   const board = useMemo(() => {
