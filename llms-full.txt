@@ -84,7 +84,9 @@ It installs into `%LOCALAPPDATA%\elanous` (override with `-Prefix PATH` or `ELAN
 
 ## From a bare Linux machine
 
-A bare image may not even have `curl`, so install the basics first:
+A bare image may not even have `curl`, and the one-line installer needs it to download itself.
+If you run the installer as **root** on Debian or Ubuntu, it installs any missing `unzip` and `git` itself (one `apt-get update` and `install`; turn this off with `--no-install-deps`).
+As a regular user it only tells you what is missing, so install the basics first:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y curl ca-certificates unzip git
@@ -4450,6 +4452,64 @@ PTY intelligence reaches stage two: elanous works inside Codex and Claude Code, 
 - The web app's Terminal shows each driven terminal side by side with a strip of what elanous just did and why; you can take over with the keyboard or mouse.
 
 - On a credit policy, the hourly limit alert adds up the credits across your Codex accounts and their combined burn rate, and says when they will run out.
+
+---
+
+# 0.2.10
+
+Source: https://docs.elanous.ai/releases/0-2-10/
+
+## Behavior changes
+
+- Tools started from the Telegram bot (such as event video) find node and Homebrew even when the bot runs as a background service.
+- `elanous harness stop` accepts the short run id shown in output and stops that run's pod jobs too.
+- Release checklist entries written by an older build to checklist.json are picked up again instead of being ignored.
+- Creating a worktree for a large repository no longer times out after 30 seconds, and a timeout is reported clearly instead of ending at a progress line.
+- `elanous harness stop` finds a run's launcher process even when the orchestrator record is missing, and says what it looked at instead of reporting «no process».
+- `elanous update --restart` no longer restarts the service when the same build is already installed.
+- Windows: elanous no longer crashes on start (a Linux-only library was loaded at import), and the PowerShell installer keeps the system PATH after installing Bun and adds elanous to the user PATH so a new window finds it.
+- Send a business card photo to the Telegram bot and get a summary, an approach strategy and a follow-up draft back in the same chat (nothing is sent); a photo without a caption starts this only when the photo looks like a business card, and a keyword like «business card», «strategy» or «email draft» starts it right away and picks just that part.
+- `elanous seat loop --seat <SEAT> --once` picks a seat's next assigned item and records what it would do (shadow by default · off unless configured), and `elanous seat report` summarises the day.
+- Operational reports (schedule health, retros, memory review, repo watch) no longer fall through to a different bot's chat when no channel is mapped for them.
+- Ask elanous where the release stands or tell it to add an item or move a release date; changes ask you once before they are made.
+- In web app chat, an approval sheet appears before a write or shell tool runs: allow once, always allow for this session, or deny; with no answer in 60 seconds nothing runs.
+- Drag a file onto the web app chat to see a «drop here to attach» overlay, and paste a screenshot to attach it.
+- The web app menu is grouped into Today · Chats · Work · Create · Library · Settings.
+- An unknown `/command` in web app chat is no longer sent to the model; you are told it is unknown or not yet supported in the web app.
+- Reopening or reattaching the web terminal no longer leaves a black screen; earlier output and new output both show.
+- In the terminal chat box, Ctrl+C clears what you typed, and pressing it twice on an empty box exits.
+- When a pod run ends, the harness says why (stopped, supervisor verdict, left a PR) instead of claiming it never reached the pod.
+- The steward can launch scheduled harness goals on pods in parallel under a budget gate, raising human decisions for money, publishing or security, and reporting each landing back — shadow mode first.
+- Web app chat shows your conversations in a list on the left with «+ New chat» and search; on a phone the list opens as a drawer.
+- The first time you run `eln`, it starts the engine and shows a browser setup link (and opens the browser when a display is available); `elanous setup --terminal` keeps setup in the terminal.
+- «Assign to COO» in the web app: approve or hold a posting right in the request, play result videos and images in place, and see each result's sources.
+- «Field upload» in the web app shows the event folder's count and finished reel as soon as it opens (including uploads from other devices), shows why a reel failed, and says up front which picked files are left out (over 20, over 100 MB, or over 250 MB in total).
+- The web app sends a push notification when a request you assigned finishes, fails, or waits for your approval; tapping it opens that request.
+- Reopening an earlier web chat shows each message at the time it was sent, not the time you opened it.
+- On narrow screens (phones, a folded Fold) the web app's top bar shrinks to one line with the rest under «⋯», and the web terminal opens full screen on touch devices.
+- On narrow screens the web terminal's three toolbar rows shrink to one line (terminal name · connection dot · «⋯» with every action).
+- When an assigned document draft fails its check, elanous rewrites it once with the reviewer's note before giving up.
+- On phones and a folded Fold, the web app has bottom tabs (Today · Chats · Work · Create · More).
+- An assigned task that finished now shows its result in the web app even when the graph wrote its file in its own run folder or only answered in text, and a failed task shows the step's actual reason.
+- On first run, if a phone is on the same Wi-Fi, elanous also prints a one-time link (and a QR code when available) to continue setup from the phone, and over SSH it prints the one `ssh -L` line to open setup from your own computer.
+- A request sent to the Telegram bot as a directive now gets its result back in the same chat when the work finishes: the produced file, or a link and one-line summary.
+- Settings has a «Try experimental features» switch; turn it on to see features still in beta, marked `실험` (experimental).
+- Add `즉석` (or `instant`) after `#현장` in a Telegram caption to get the quicker field reel that reuses pre-made intro and end cards; `telegram.fieldReelMode` sets the default.
+- In the web first-run setup you can sign in with your ChatGPT subscription right there — in the browser on the same computer, or with a device code from a phone — without going back to the terminal.
+- The web app now says `대화` (conversation) instead of `세션` (session) in the conversation picker, its ID pill and the delete dialog, and the delete dialog says plainly that it cannot be undone.
+- In web app chat you can keep typing while a reply streams; your next messages queue as chips and send in order.
+- Assigned tasks can now use event photos and the field feed, take attached files, and a plain question is answered by the seat instead of failing with «no installed graph fits».
+- The one-line installer no longer stops on a fresh root Ubuntu (WSL, containers) for want of unzip, curl or git: as root with apt it installs them itself (`--no-install-deps` to opt out); other users still get the one-line hint.
+- In the terminal app, messages you type while a reply is streaming now appear in the chat log when they are sent, in order.
+- In web app chat, once you deny a write or shell tool the assistant stops asking for the same tool again in that reply, and the approval wait time can be set with acp.toolApproval.timeoutMs.
+- In chat, a short fact question is answered from a web search with sources, instead of opening the shell and browser and running out of time.
+- `elanous nexus status` no longer sends its local health check through an HTTP proxy, so it reports a running daemon correctly on machines with a proxy set.
+- In web app chat, `/sessions` lists your recent conversations and `/resume <first characters>` picks one up again.
+- In web app chat, `/model <tier>` shows or sets the model tier (unknown values are not saved), and `/provider` and `/reasoning` point you to the matching settings.
+- The web app's Today screen shows approvals waiting for you, your five most recent requests and your five most recent conversations.
+- Web app chat can group conversations into projects: pick a project from the switcher, or create your first one when you have none.
+
+Plus 184 internal changes.
 
 ---
 
